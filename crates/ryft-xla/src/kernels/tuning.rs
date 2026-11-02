@@ -1,6 +1,6 @@
 //! Bounded schedule measurements using whole-invocation completion and the existing auxiliary disk cache.
 //!
-//! Samples measure host submission through [`ReferenceExecution::await`], including dispatch and synchronization.
+//! Samples measure host submission through [`StatefulExecution::await`], including dispatch and synchronization.
 //! They are not device timestamps. Preparation and warmup are excluded from samples but included in the deadline.
 //! Cancellation and deadlines are cooperative: submitted work is always awaited, and its buffers must remain owned
 //! by the runner until completion. Share one [`KernelTuner`] for a device to serialize measurements; other processes
@@ -11,7 +11,7 @@ use std::sync::atomic::{AtomicBool, Ordering};
 use std::sync::{Arc, Mutex, TryLockError};
 use std::time::{Duration, Instant};
 
-use ryft_core::{DiskCache, ReferenceExecution};
+use ryft_core::{DiskCache, StatefulExecution};
 use ryft_kernels::{KernelCompiler, KernelExtension, KernelSchedule, VerifiedKernel};
 use serde::{Deserialize, Serialize};
 use thiserror::Error;
@@ -206,7 +206,7 @@ pub trait KernelTuningRunner {
     fn prepare(&mut self, schedule: &KernelSchedule) -> Result<(), KernelTuningError>;
 
     /// Submits one equivalent invocation with its actual completion and error chain.
-    fn execute(&mut self) -> ReferenceExecution<(), KernelTuningError>;
+    fn execute(&mut self) -> StatefulExecution<(), KernelTuningError>;
 }
 
 /// Private persistence record, decoded only through request-aware validation.
@@ -534,8 +534,8 @@ mod tests {
             self.schedules.push(schedule.clone());
             Ok(())
         }
-        fn execute(&mut self) -> ReferenceExecution<(), KernelTuningError> {
-            ReferenceExecution::pending(
+        fn execute(&mut self) -> StatefulExecution<(), KernelTuningError> {
+            StatefulExecution::pending(
                 Ok(()),
                 ReferenceCompletion::new(Completion(self.completed.clone())),
                 |message| KernelTuningError::Invalid { message: message.to_string() },
@@ -718,7 +718,7 @@ mod tests {
                 std::thread::sleep(Duration::from_millis(20));
                 Ok(())
             }
-            fn execute(&mut self) -> ReferenceExecution<(), KernelTuningError> {
+            fn execute(&mut self) -> StatefulExecution<(), KernelTuningError> {
                 panic!("expired preparation must not submit work")
             }
         }
@@ -738,8 +738,8 @@ mod tests {
             fn prepare(&mut self, _schedule: &KernelSchedule) -> Result<(), KernelTuningError> {
                 Ok(())
             }
-            fn execute(&mut self) -> ReferenceExecution<(), KernelTuningError> {
-                ReferenceExecution::pending(
+            fn execute(&mut self) -> StatefulExecution<(), KernelTuningError> {
+                StatefulExecution::pending(
                     Ok(()),
                     ReferenceCompletion::ready(Err("execution failed".into())),
                     |message| KernelTuningError::Invalid { message: message.to_string() },
@@ -771,9 +771,9 @@ mod tests {
             fn prepare(&mut self, _schedule: &KernelSchedule) -> Result<(), KernelTuningError> {
                 Ok(())
             }
-            fn execute(&mut self) -> ReferenceExecution<(), KernelTuningError> {
+            fn execute(&mut self) -> StatefulExecution<(), KernelTuningError> {
                 self.cancelled.store(true, Ordering::Release);
-                ReferenceExecution::pending(
+                StatefulExecution::pending(
                     Ok(()),
                     ReferenceCompletion::new(Completion(self.completed.clone())),
                     |message| KernelTuningError::Invalid { message: message.to_string() },
@@ -803,8 +803,8 @@ mod tests {
                 self.release.recv().unwrap();
                 Ok(())
             }
-            fn execute(&mut self) -> ReferenceExecution<(), KernelTuningError> {
-                ReferenceExecution::ready(Ok(()))
+            fn execute(&mut self) -> StatefulExecution<(), KernelTuningError> {
+                StatefulExecution::ready(Ok(()))
             }
         }
         let tuner = KernelTuner::new(None);

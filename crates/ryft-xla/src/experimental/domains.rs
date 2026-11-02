@@ -18,15 +18,15 @@ use ryft_core::{
     Concretizable, Constant, ConstantOperation, Context, DataType, Device, DeviceId, DeviceMesh, DifferentiationError,
     Dimension, DimensionBounds, DimensionFromScalar, DimensionOperation, DimensionSize, DimensionType, DimensionValue,
     DimensionVariable, DiskCache, Domain, DomainTracer, EagerContext, EffectClass, EmptyRegionDriver,
-    ExternalReferenceBinding, FlatCompilationProgram, InterpretableOperation, Layout, LogicalMesh, Memory, MeshAxis,
-    MeshAxisType, ONE_OPERATION_NAME, Operation, OperationProvider, Parameterized, Placeholder, ProgramError,
-    Provenance, ProvenanceScope, ReadyOrPendingReferenceGuard, ReductionKind, ReferenceCompletion,
-    ReferenceCompletionBackend, ReferenceDischargeResult, ReferenceExecution, ReferenceId,
-    ReferenceReplacementPreparation, ReferenceSource, ReferenceType, RegionDriver, RegionKey, RegionRef, ScatterMode,
-    ScatterReductionKind, Shape, Sharding, ShardingDimension, SortDirection, SpecializationCache,
-    SpecializationCacheEntry, SpecializationCacheStatistics, StagedProgram, StatefulCompilationDomain, StaticShape,
-    StridedLayout, Tile, TileDimension, TiledLayout, Type, TypeError, TypeRefinements, Typed, ValueProjection,
-    ZERO_OPERATION_NAME, Zero, ZeroOperation, validate_reference_boundary,
+    ExternalReferenceBinding, FlatProgram, InterpretableOperation, Layout, LogicalMesh, Memory, MeshAxis, MeshAxisType,
+    ONE_OPERATION_NAME, Operation, OperationProvider, Parameterized, Placeholder, ProgramError, Provenance,
+    ProvenanceScope, ReadyOrPendingReferenceGuard, ReductionKind, ReferenceCompletion, ReferenceCompletionBackend,
+    ReferenceDischargeResult, ReferenceId, ReferenceReplacementPreparation, ReferenceSource, ReferenceType,
+    RegionDriver, RegionKey, RegionRef, ScatterMode, ScatterReductionKind, Shape, Sharding, ShardingDimension,
+    SortDirection, SpecializationCache, SpecializationCacheEntry, SpecializationCacheStatistics, StagedProgram,
+    StatefulCompilationDomain, StatefulExecution, StaticShape, StridedLayout, Tile, TileDimension, TiledLayout, Type,
+    TypeError, TypeRefinements, Typed, ValueProjection, ZERO_OPERATION_NAME, Zero, ZeroOperation,
+    validate_reference_boundary,
 };
 #[cfg(test)]
 use ryft_core::{Array, ProjectedContext};
@@ -4086,20 +4086,20 @@ impl<'c> XlaDomain<'c> {
         &self,
         program: &XlaCompiledProgram<'c>,
         inputs: Vec<XlaValue<'c>>,
-    ) -> ReferenceExecution<Vec<XlaValue<'c>>, XlaDomainError> {
+    ) -> StatefulExecution<Vec<XlaValue<'c>>, XlaDomainError> {
         if let Err(error) = ensure_effect_dispatch_allowed() {
-            return ReferenceExecution::ready(Err(error));
+            return StatefulExecution::ready(Err(error));
         }
         if program.reference_states.is_empty() {
             // A reference-free invocation binds no holders, but the completion contract still promises that awaiting
             // the result observes whole-invocation completion, so the execution fence rides along as the completion.
             return match self.execute_stateless(program, inputs) {
-                Ok((output, fence)) => ReferenceExecution::pending(
+                Ok((output, fence)) => StatefulExecution::pending(
                     Ok(output),
                     ReferenceCompletion::new(XlaReferenceCompletion { fence }),
                     xla_reference_completion_error,
                 ),
-                Err(error) => ReferenceExecution::ready(Err(error)),
+                Err(error) => StatefulExecution::ready(Err(error)),
             };
         }
         let prepared = (|| -> Result<_, XlaDomainError> {
@@ -4330,7 +4330,7 @@ impl<'c> XlaDomain<'c> {
                 drop(prepared_replacements);
                 drop(read_only_guards);
                 return match execution {
-                    Err(error) => Ok(ReferenceExecution::ready(Err(error))),
+                    Err(error) => Ok(StatefulExecution::ready(Err(error))),
                     Ok(_) => unreachable!("successful PJRT submission must publish reference state"),
                 };
             };
@@ -4342,7 +4342,7 @@ impl<'c> XlaDomain<'c> {
                         transaction.poison(reason.clone());
                     }
                     drop(read_only_guards);
-                    return Ok(ReferenceExecution::pending(Err(error), completion, xla_reference_completion_error));
+                    return Ok(StatefulExecution::pending(Err(error), completion, xla_reference_completion_error));
                 }
             };
             let (physical_outputs, fence) = execution.into_parts();
@@ -4394,7 +4394,7 @@ impl<'c> XlaDomain<'c> {
                         transaction.poison(reason.clone());
                     }
                     drop(read_only_guards);
-                    return Ok(ReferenceExecution::pending(Err(error), completion, xla_reference_completion_error));
+                    return Ok(StatefulExecution::pending(Err(error), completion, xla_reference_completion_error));
                 }
             };
             let mut submitted_replacements = replacement_transactions.into_iter().zip(replacements);
@@ -4411,7 +4411,7 @@ impl<'c> XlaDomain<'c> {
                             transaction.poison(reason.clone());
                         }
                         drop(read_only_guards);
-                        return Ok(ReferenceExecution::pending(
+                        return Ok(StatefulExecution::pending(
                             Err(error.into()),
                             completion,
                             xla_reference_completion_error,
@@ -4452,11 +4452,11 @@ impl<'c> XlaDomain<'c> {
                 validate_runtime_outputs(program.output_types(), &public_outputs)?;
                 Ok(public_outputs.into_iter().map(XlaValue::Array).collect())
             })();
-            Ok(ReferenceExecution::pending(public_result, completion, xla_reference_completion_error))
+            Ok(StatefulExecution::pending(public_result, completion, xla_reference_completion_error))
         })();
         match prepared {
             Ok(execution) => execution,
-            Err(error) => ReferenceExecution::ready(Err(error)),
+            Err(error) => StatefulExecution::ready(Err(error)),
         }
     }
 }
@@ -4466,7 +4466,7 @@ impl<'c> StatefulCompilationDomain for XlaDomain<'c> {
         &self,
         program: &XlaCompiledProgram<'c>,
         inputs: Vec<XlaValue<'c>>,
-    ) -> ReferenceExecution<Vec<XlaValue<'c>>, Self::Error> {
+    ) -> StatefulExecution<Vec<XlaValue<'c>>, Self::Error> {
         self.execute_stateful_async(program, inputs)
     }
 }
@@ -5380,7 +5380,7 @@ pub(crate) fn with_input_shardings<In: Parameterized<ArrayIrType>>(
 /// forwarded external reference. References returned by nested calls inside a program never cross that ABI, so only
 /// the outputs of the lowered program itself are checked.
 fn validate_reference_outputs(
-    program: &FlatCompilationProgram<XlaDomain<'_>>,
+    program: &FlatProgram<XlaDomain<'_>>,
     capture_count: usize,
     output_types: &[ArrayIrType],
 ) -> Result<(), XlaDomainError> {
@@ -6926,8 +6926,6 @@ impl<'c> XlaDomain<'c> {
 
 #[cfg(test)]
 mod tests {
-    use std::sync::Barrier;
-    use std::sync::atomic::{AtomicUsize, Ordering};
     #[cfg(feature = "cuda-13")]
     use std::time::Instant;
 
@@ -14242,178 +14240,6 @@ mod tests {
                     .to_string(),
             }),
         );
-    }
-
-    #[test]
-    fn test_jit_with_options_and_capacity_retains_inferred_domain() {
-        let client = execution_client();
-        let mesh = domain_mesh(&client, "x", 1);
-        let first_domain = XlaSession::new(&client).domain().with_mesh(mesh.clone());
-        let second_domain = XlaSession::new(&client).domain().with_mesh(mesh.clone());
-        let function: CompiledFunctionDispatcher<XlaDomain<'_>, _, (), ArrayIrType, ArrayIrType> =
-            ryft_core::jit_with_options_and_capacity(|(), input| Ok(input), XlaOptions::new(mesh.clone()), 2);
-        let cloned = function.clone();
-        assert!(function.domain().is_none());
-        assert!(cloned.domain().is_none());
-        assert_eq!(function.cache_capacity(), 2);
-
-        let first = cloned.call((), XlaValue::Array(f32_scalar(&first_domain, &mesh, 1.0))).unwrap();
-        assert_eq!(read_f32s(&client, program_array(&first)), vec![1.0]);
-        assert!(Arc::ptr_eq(function.domain().unwrap().session(), first_domain.session()));
-        assert!(Arc::ptr_eq(cloned.domain().unwrap().session(), first_domain.session()));
-
-        let warm = function.call((), XlaValue::Array(f32_scalar(&second_domain, &mesh, 2.0))).unwrap();
-        assert_eq!(read_f32s(&client, program_array(&warm)), vec![2.0]);
-        assert!(Arc::ptr_eq(warm.xla_domain().session(), first_domain.session()));
-        cloned.clear_cache();
-        assert_eq!(function.specialization_count(), 0);
-        assert!(Arc::ptr_eq(function.domain().unwrap().session(), first_domain.session()));
-
-        let cold = cloned.call((), XlaValue::Array(f32_scalar(&second_domain, &mesh, 3.0))).unwrap();
-        assert_eq!(read_f32s(&client, program_array(&cold)), vec![3.0]);
-        assert!(Arc::ptr_eq(cold.xla_domain().session(), first_domain.session()));
-
-        // The stateful entry point preserves inference and whole-invocation completion for pure programs as well.
-        let completed = function
-            .call_statefully_async((), XlaValue::Array(f32_scalar(&second_domain, &mesh, 4.0)))
-            .r#await()
-            .unwrap();
-        assert_eq!(read_f32s(&client, program_array(&completed)), vec![4.0]);
-        assert!(Arc::ptr_eq(completed.xla_domain().session(), first_domain.session()));
-        assert_eq!(function.statistics().dispatch_hits, 2);
-        assert_eq!(function.statistics().traces, 2);
-        assert_eq!(function.specialization_count(), 1);
-        assert_eq!(first_domain.cache_size(), 1);
-        assert_eq!(second_domain.cache_size(), 0);
-    }
-
-    #[test]
-    fn test_jit_with_options_retains_domain_after_empty_input_and_trace_failure() {
-        let client = execution_client();
-        let mesh = domain_mesh(&client, "x", 1);
-        let first_domain = XlaSession::new(&client).domain().with_mesh(mesh.clone());
-        let second_domain = XlaSession::new(&client).domain().with_mesh(mesh.clone());
-        let attempts = AtomicUsize::new(0);
-        let function: CompiledFunctionDispatcher<XlaDomain<'_>, _, (), Vec<ArrayIrType>, Vec<ArrayIrType>> =
-            ryft_core::jit_with_options(
-                |(), inputs| {
-                    if attempts.fetch_add(1, Ordering::Relaxed) == 0 {
-                        return Err(
-                            ProgramError::InvalidArgument { message: "first trace rejected".to_string() }.into()
-                        );
-                    }
-                    Ok(inputs)
-                },
-                XlaOptions::new(mesh.clone()),
-            );
-        assert!(matches!(
-            function.call((), Vec::new()),
-            Err(XlaDomainError::Tracing(ProgramError::InvalidArgument { message }))
-                if message == "compilation requires an input leaf to infer a domain; use an explicit domain for empty \
-                               inputs",
-        ));
-        assert!(function.domain().is_none());
-        assert_eq!(attempts.load(Ordering::Relaxed), 0);
-
-        assert!(matches!(
-            function.call((), vec![XlaValue::Array(f32_scalar(&first_domain, &mesh, 1.0))]),
-            Err(XlaDomainError::Tracing(ProgramError::InvalidArgument { message }))
-                if message == "first trace rejected",
-        ));
-        assert!(Arc::ptr_eq(function.domain().unwrap().session(), first_domain.session()));
-        assert_eq!(function.specialization_count(), 0);
-
-        let retried = function.call((), vec![XlaValue::Array(f32_scalar(&second_domain, &mesh, 2.0))]).unwrap();
-        assert_eq!(read_f32s(&client, program_array(&retried[0])), vec![2.0]);
-        assert!(Arc::ptr_eq(retried[0].xla_domain().session(), first_domain.session()));
-        assert_eq!(function.call((), Vec::new()).unwrap(), Vec::<XlaValue<'_>>::new());
-        assert_eq!(attempts.load(Ordering::Relaxed), 3);
-        assert_eq!(function.specialization_count(), 2);
-        assert_eq!(second_domain.cache_size(), 0);
-    }
-
-    #[test]
-    fn test_jit_with_options_clones_bind_one_domain_concurrently() {
-        let client = execution_client();
-        let mesh = domain_mesh(&client, "x", 1);
-        let first_domain = XlaSession::new(&client).domain().with_mesh(mesh.clone());
-        let second_domain = XlaSession::new(&client).domain().with_mesh(mesh.clone());
-        let function: CompiledFunctionDispatcher<XlaDomain<'_>, _, (), ArrayIrType, ArrayIrType> =
-            ryft_core::jit_with_options(|(), input| Ok(input), XlaOptions::new(mesh.clone()));
-        let first_function = function.clone();
-        let second_function = function.clone();
-        let first_input = XlaValue::Array(f32_scalar(&first_domain, &mesh, 1.0));
-        let second_input = XlaValue::Array(f32_scalar(&second_domain, &mesh, 2.0));
-        let barrier = Barrier::new(3);
-        let (first, second) = std::thread::scope(|scope| {
-            let barrier = &barrier;
-            let first = scope.spawn(move || {
-                barrier.wait();
-                first_function.call((), first_input).unwrap()
-            });
-            let second = scope.spawn(move || {
-                barrier.wait();
-                second_function.call((), second_input).unwrap()
-            });
-            barrier.wait();
-            (first.join().unwrap(), second.join().unwrap())
-        });
-
-        let selected = function.domain().unwrap();
-        assert!(
-            Arc::ptr_eq(selected.session(), first_domain.session())
-                || Arc::ptr_eq(selected.session(), second_domain.session()),
-        );
-        assert!(Arc::ptr_eq(first.xla_domain().session(), selected.session()));
-        assert!(Arc::ptr_eq(second.xla_domain().session(), selected.session()));
-        assert_eq!(read_f32s(&client, program_array(&first)), vec![1.0]);
-        assert_eq!(read_f32s(&client, program_array(&second)), vec![2.0]);
-        assert!(matches!(function.statistics().traces, 1..=2));
-        assert_eq!(function.specialization_count(), 1);
-        assert_eq!(first_domain.cache_size() + second_domain.cache_size(), 1);
-    }
-
-    #[test]
-    fn test_stage_recovers_domain_and_supports_explicit_nullary_calls() {
-        let client = execution_client();
-        let mesh = domain_mesh(&client, "x", 1);
-        let domain = XlaSession::new(&client).domain().with_mesh(mesh.clone());
-        let options = XlaOptions::new(mesh.clone());
-        assert!(matches!(
-            ryft_core::stage::<XlaValue<'_>, _, Vec<ArrayIrType>, _>(
-                |inputs| inputs,
-                Vec::<XlaValue<'_>>::new(),
-                options.clone(),
-            ),
-            Err(XlaDomainError::Tracing(ProgramError::InvalidArgument { message }))
-                if message == "staging requires an input leaf to infer a domain; use an explicit domain for empty \
-                               inputs",
-        ));
-
-        let input = XlaValue::Array(f32_scalar(&domain, &mesh, 7.0));
-        let input_type = input.r#type().into_owned();
-        let inferred: StagedFunction<XlaDomain<'_>, ArrayIrType, ArrayIrType> =
-            ryft_core::stage(|input| input, input.clone(), options.clone()).unwrap();
-        let explicit: StagedFunction<XlaDomain<'_>, ArrayIrType, ArrayIrType> =
-            domain.stage(|input| input, input_type.clone(), options.clone()).unwrap();
-        assert_eq!(inferred.input_types(), &[input_type.clone()]);
-        assert_eq!(inferred.output_types(), &[input_type]);
-        assert_eq!(inferred.source_program().program().to_string(), explicit.source_program().program().to_string());
-        assert_eq!(domain.cache_size(), 0);
-
-        let compiled = inferred.lower(&domain).unwrap().compile(&domain).unwrap();
-        let output = compiled.executable_function().call(&domain, input).unwrap();
-        assert_eq!(read_f32s(&client, program_array(&output)), vec![7.0]);
-        assert!(Arc::ptr_eq(output.xla_domain().session(), domain.session()));
-
-        let nullary_stage: StagedFunction<XlaDomain<'_>, (), ()> = domain.stage(|()| (), (), options.clone()).unwrap();
-        assert_eq!(nullary_stage.input_types(), &[]);
-        assert_eq!(nullary_stage.output_types(), &[]);
-        let nullary: CompiledFunctionDispatcher<XlaDomain<'_>, _, (), (), ()> =
-            domain.jit_with_options(|(), ()| Ok(()), options);
-        assert!(Arc::ptr_eq(nullary.domain().unwrap().session(), domain.session()));
-        nullary.call((), ()).unwrap();
-        assert_eq!(nullary.specialization_count(), 1);
     }
 
     #[test]

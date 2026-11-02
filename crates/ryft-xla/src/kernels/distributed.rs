@@ -16,7 +16,7 @@
 //! multi-process mesh. CPU needs no cross-host PJRT extension for this route; CUDA/ROCm extension presence does not
 //! change its transport or imply native collective qualification. External references and observable I/O are rejected.
 //!
-//! [`DistributedKernel::call_async`] returns the existing [`ReferenceExecution`]. Preflight and host transfers block
+//! [`DistributedKernel::call_async`] returns the existing [`StatefulExecution`]. Preflight and host transfers block
 //! before submission; its completion retains the existing native fence and runtime. Awaiting completes the distributed
 //! readiness barrier. No background worker advances that barrier, and readiness queries only report cached terminal
 //! results. Blocking [`DistributedKernel::call`] delegates to this same path.
@@ -32,7 +32,7 @@ use std::sync::{Arc, Mutex, TryLockError};
 use std::time::{Duration, Instant};
 
 use ryft_core::{
-    ArrayAddressing, Device, DeviceMesh, ReferenceCompletion, ReferenceCompletionBackend, ReferenceExecution, Typed,
+    ArrayAddressing, Device, DeviceMesh, ReferenceCompletion, ReferenceCompletionBackend, StatefulExecution, Typed,
 };
 use ryft_pjrt::{Client, Execution, ExecutionFence, KeyValueStore};
 use serde::{Deserialize, Serialize};
@@ -357,7 +357,7 @@ impl<'r, 'c> DistributedKernel<'r, 'c> {
     }
 
     /// Starts a call after bounded host preflight and transfers, returning a pending native completion.
-    /// Outputs remain private inside the existing `ReferenceExecution` until all participants complete successfully.
+    /// Outputs remain private inside the existing `StatefulExecution` until all participants complete successfully.
     /// A later call first awaits this call. Dropping the coordinator and all completion handles drains native work
     /// and reports abandonment; dropping only the returned handle does not cancel work retained by the coordinator.
     pub fn call_async(
@@ -365,7 +365,7 @@ impl<'r, 'c> DistributedKernel<'r, 'c> {
         inputs: Vec<XlaArray<'c>>,
         sources: &[usize],
         cancelled: Arc<AtomicBool>,
-    ) -> Result<ReferenceExecution<Vec<XlaArray<'c>>, DistributedKernelError>, DistributedKernelError> {
+    ) -> Result<StatefulExecution<Vec<XlaArray<'c>>, DistributedKernelError>, DistributedKernelError> {
         if let Some(previous) = self.previous.take() {
             previous.r#await().map_err(|message| DistributedKernelError::Completion { message })?;
         }
@@ -394,7 +394,7 @@ impl<'r, 'c> DistributedKernel<'r, 'c> {
             terminal: Mutex::new(None),
         });
         self.previous = Some(completion.clone());
-        Ok(ReferenceExecution::pending(Ok(outputs), completion, |message| DistributedKernelError::Completion {
+        Ok(StatefulExecution::pending(Ok(outputs), completion, |message| DistributedKernelError::Completion {
             message,
         }))
     }
@@ -633,7 +633,7 @@ impl KernelCoordination {
     }
 }
 
-/// Existing native completion plus owned host coordination; outputs remain in `ReferenceExecution`.
+/// Existing native completion plus owned host coordination; outputs remain in `StatefulExecution`.
 struct KernelCompletion {
     /// Coordination ownership retained independently of the public output handle.
     coordination: Arc<KernelCoordination>,

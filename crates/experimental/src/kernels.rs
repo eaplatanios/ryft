@@ -1711,7 +1711,7 @@ mod tuning {
     use pretty_assertions::assert_eq;
     use ryft_core::{
         ArrayIrType, CompilationTracer, Device, DeviceMesh, ExecutableFunction, LogicalMesh, MeshAxis, MeshAxisType,
-        ReferenceExecution, StagedFunction, StatefulCompilationDomain,
+        StagedFunction, StatefulCompilationDomain, StatefulExecution,
     };
     use ryft_kernels::{KernelCompiler, KernelSchedule, VerifiedKernel};
     use ryft_xla::kernels::{
@@ -1770,7 +1770,7 @@ mod tuning {
             Ok(())
         }
 
-        fn execute(&mut self) -> ReferenceExecution<(), KernelTuningError> {
+        fn execute(&mut self) -> StatefulExecution<(), KernelTuningError> {
             let result = (|| {
                 let outputs = self
                     .executable
@@ -1802,7 +1802,7 @@ mod tuning {
                 Ok(())
             })();
             // Every native invocation and readback has really completed before this ready wrapper is returned.
-            ReferenceExecution::ready(result)
+            StatefulExecution::ready(result)
         }
     }
 

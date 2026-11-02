@@ -12,7 +12,7 @@
 //! [`jitted_statefully`] and [`compile_statefully`] expose the heterogeneous boundary used by external array
 //! references. Asynchronous stateful calls atomically publish read leases and pending mutation generations immediately
 //! after submission, commit hidden final states without holding host mutexes through device execution, and return a
-//! [`ReferenceExecution`] that reports completion failures. The blocking stateful surface is a thin await of that
+//! [`StatefulExecution`] that reports completion failures. The blocking stateful surface is a thin await of that
 //! protocol.
 //!
 //! # External Reference ABI
@@ -64,7 +64,7 @@
 //!
 //! Captured references use the same protocol after capture lifting and cannot also appear as public arguments. Calls
 //! that use the same mutable reference dependency-chain their generations; read-only calls publish leases and may
-//! overlap. Dropping [`ReferenceExecution`] does not cancel work. Awaiting it reports whole-invocation failure. A
+//! overlap. Dropping [`StatefulExecution`] does not cancel work. Awaiting it reports whole-invocation failure. A
 //! failure between submission handoff and hidden-state replacement commit poisons the complete affected mutation
 //! group, so later reference access cannot silently observe stale state. Poisoning is terminal there because no buffer
 //! can be proven current after that boundary, and recovery requires constructing a new reference from independently
@@ -88,8 +88,8 @@ use ryft_core::{
     ArrayIrType, ArrayType, CapturingContext, ClosedProgram, Compile, CompiledFunction,
     CompiledFunctionDispatcher as CoreCompiledFunctionDispatcher, Constant, Context, DeviceMesh, DifferentiableType,
     DomainTracingContext, ExecutableFunction, ForwardModeDifferentiate, JitCacheStatistics, Parameterized,
-    ParameterizedFamily, ProgramError, ProjectedContext, ProjectedValue, ReferenceExecution, ReverseModeDifferentiate,
-    StagedFunction, Tracer, Typed, Value, ValueProjection,
+    ParameterizedFamily, ProgramError, ProjectedContext, ProjectedValue, ReverseModeDifferentiate, StagedFunction,
+    StatefulExecution, Tracer, Typed, Value, ValueProjection,
 };
 use ryft_pjrt::Execution;
 
@@ -457,7 +457,7 @@ where
 
     /// Returns the completion-bearing stateful call shape for one retained specialization.
     ///
-    /// The returned [`ReferenceExecution`] may already carry reconstructed public outputs backed by pending device
+    /// The returned [`StatefulExecution`] may already carry reconstructed public outputs backed by pending device
     /// values; awaiting it observes whole-invocation completion, including asynchronous execution errors that would
     /// otherwise surface only when the affected reference is next accessed. Dropping the result never cancels
     /// submitted work.
@@ -465,7 +465,7 @@ where
         &self,
         static_parameters: Static,
         inputs: In::To<XlaStatefulValue<'c>>,
-    ) -> ReferenceExecution<Out::To<XlaStatefulValue<'c>>, XlaDomainError>
+    ) -> StatefulExecution<Out::To<XlaStatefulValue<'c>>, XlaDomainError>
     where
         XlaOptions: Clone,
         F: Fn(
@@ -607,7 +607,7 @@ where
         &self,
         domain: &XlaDomain<'c>,
         inputs: In::To<XlaStatefulValue<'c>>,
-    ) -> ReferenceExecution<Out::To<XlaStatefulValue<'c>>, XlaDomainError> {
+    ) -> StatefulExecution<Out::To<XlaStatefulValue<'c>>, XlaDomainError> {
         self.function.executable_function().call_statefully_async(domain, inputs)
     }
 
