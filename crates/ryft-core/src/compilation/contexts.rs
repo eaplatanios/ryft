@@ -342,16 +342,13 @@ where
     domain.stage(function, input_types, options)
 }
 
-// TODO(eaplatanios): Review from here onwards.
-
-/// Constructs a retained dispatcher for `function` with default options and cache capacity, inferring its domain on the
-/// first nonempty call.
-///
-/// `function` is fallible so that it can reject its inputs while it is traced, and an infallible function returns its
-/// outputs wrapped in [`Ok`]. Staging, lowering, and compilation happen on the first call for each specialization.
-/// The first input leaf supplies the fixed domain through [`Value::domain`], even if that first call later fails.
-/// Use [`Compile::jit`] to select a domain explicitly or support a nullary function. Refer to
-/// [`CompiledFunctionDispatcher`] for shared domain selection and dispatch semantics.
+/// Constructs a retained Just-In-Time (JIT) compilation dispatcher for `function` with default options and cache
+/// capacity, inferring its domain on the first nonempty call. `function` is fallible so that it can reject its inputs
+/// while it is traced, and an infallible function returns its outputs wrapped in [`Ok`]. Staging, lowering, and
+/// compilation happen on the first call for each specialization. The first input leaf supplies the fixed domain
+/// through [`Value::domain`], even if that first call later fails. Use [`Compile::jit`] to select a domain explicitly
+/// or support a nullary function. Refer to [`CompiledFunctionDispatcher`] for shared domain selection and dispatch
+/// semantics.
 #[inline]
 pub fn jit<C, Static, Input, Output, F>(function: F) -> CompiledFunctionDispatcher<C, F, Static, Input, Output>
 where
@@ -370,14 +367,13 @@ where
     jit_with_options(function, C::Options::default())
 }
 
-/// Constructs a retained dispatcher for `function` with explicit options and the default cache capacity, inferring its
-/// domain on the first nonempty call.
-///
-/// `function` is fallible so that it can reject its inputs while it is traced, and an infallible function returns its
-/// outputs wrapped in [`Ok`]. Staging, lowering, and compilation happen on the first call for each specialization.
-/// The first input leaf supplies the fixed domain through [`Value::domain`], even if that first call later fails.
-/// Use [`Compile::jit_with_options`] to select a domain explicitly or support a nullary function. Refer to
-/// [`CompiledFunctionDispatcher`] for shared domain selection and dispatch semantics.
+/// Constructs a retained Just-In-Time (JIT) compilation dispatcher for `function` with explicit options and the default
+/// cache capacity, inferring its domain on the first nonempty call. `function` is fallible so that it can reject its
+/// inputs while it is traced, and an infallible function returns its outputs wrapped in [`Ok`]. Staging, lowering, and
+/// compilation happen on the first call for each specialization. The first input leaf supplies the fixed domain through
+/// [`Value::domain`], even if that first call later fails. Use [`Compile::jit_with_options`] to select a domain
+/// explicitly or support a nullary function. Refer to [`CompiledFunctionDispatcher`] for shared domain selection
+/// and dispatch semantics.
 #[inline]
 pub fn jit_with_options<C, Static, Input, Output, F>(
     function: F,
@@ -399,13 +395,12 @@ where
     jit_with_options_and_capacity(function, options, DEFAULT_JIT_CACHE_CAPACITY)
 }
 
-/// Constructs a retained dispatcher for `function` with explicit options that retains at most `capacity` compiled
-/// specializations and infers its domain on the first nonempty call.
-///
-/// `function` is fallible so that it can reject its inputs while it is traced, and an infallible function returns its
-/// outputs wrapped in [`Ok`]. Staging, lowering, and compilation happen on the first call for each specialization.
-/// The first input leaf supplies the fixed domain through [`Value::domain`], even if that first call later fails.
-/// Use [`Compile::jit_with_options_and_capacity`] to select a domain explicitly or support a nullary function.
+/// Constructs a retained Just-In-Time (JIT) compilation dispatcher for `function` with explicit options that retains at
+/// most `capacity` compiled specializations and infers its domain on the first nonempty call. `function` is fallible so
+/// that it can reject its inputs while it is traced, and an infallible function returns its outputs wrapped in [`Ok`].
+/// Staging, lowering, and compilation happen on the first call for each specialization. The first input leaf supplies
+/// the fixed domain through [`Value::domain`], even if that first call later fails. Use
+/// [`Compile::jit_with_options_and_capacity`] to select a domain explicitly or support a nullary function.
 /// Refer to [`CompiledFunctionDispatcher`] for shared domain selection and dispatch semantics.
 #[inline]
 pub fn jit_with_options_and_capacity<C, Static, Input, Output, F>(
@@ -428,6 +423,8 @@ where
 {
     CompiledFunctionDispatcher::inferred(function, options, capacity)
 }
+
+// TODO(eaplatanios): Review from here onwards.
 
 #[cfg(test)]
 mod tests {
