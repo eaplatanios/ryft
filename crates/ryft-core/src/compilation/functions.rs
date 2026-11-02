@@ -943,20 +943,18 @@ impl<Static, Structure, Key> SpecializationKey<Static, Structure, Key> {
     }
 }
 
-// TODO(eaplatanios): Review from here onwards.
-
-/// Retained JIT dispatcher that caches compiled specializations of one Rust closure.
+/// Retained Just-In-Time (JIT) compilation dispatcher that caches compiled specializations of one Rust closure.
 ///
 /// Unlike [`CompiledFunction`], which represents one executable that is already specialized, a
-/// `CompiledFunctionDispatcher` holds no program of its own. It is a retained dispatcher over a Rust closure that
-/// produces one program, and one function around that program, per specialization from explicit static host
-/// parameters and dynamic runtime inputs. Its first call for a specialization stages, lowers, and requests
-/// compilation, and later calls with the same static values, input parameter structure, and dispatch key dispatch
-/// directly to the retained executable. Domain dispatch signatures may normalize distinct runtime signatures to the
-/// same staged signature, which can produce harmless duplicate dispatch specializations.
+/// [`CompiledFunctionDispatcher`] holds no program of its own. It is a retained dispatcher over a Rust closure that
+/// produces one program, and one function around that program, per specialization from explicit static host parameters
+/// and dynamic runtime inputs. Its first call for a specialization stages, lowers, and requests compilation, and later
+/// calls with the same static values, input parameter structure, and dispatch key dispatch directly to the retained
+/// executable. Domain dispatch signatures may normalize distinct runtime signatures to the same staged signature,
+/// which can produce harmless duplicate dispatch specializations.
 ///
-/// [`Compile::jit`](crate::Compile::jit) selects the domain explicitly. The global [`jit`](crate::jit) instead recovers
-/// it from the first leaf of the first nonempty call. That first attempt binds the domain even if staging or
+/// [`Compile::jit`](crate::Compile::jit) selects the domain explicitly. The global [`jit`](crate::jit) instead
+/// recovers it from the first leaf of the first non-empty call. That first attempt binds the domain even if staging or
 /// compilation later fails. All clones, later calls, and specializations use the selected domain, including after cache
 /// clearing. Concurrent first calls atomically select one domain and all use that same selection. The dispatcher does
 /// not recover a domain from the inputs of later calls, so inputs that originate in another domain still execute on the
@@ -965,8 +963,8 @@ impl<Static, Structure, Key> SpecializationKey<Static, Structure, Key> {
 ///
 /// Tracing executes Rust host code only on a specialization miss. Host side effects inside `function` therefore run
 /// once per retained specialization rather than once per runtime call, and observable work for every call must be
-/// represented by staged effectful operations. Static values with high cardinality can cause repeated tracing and LRU
-/// eviction, so arrays and frequently changing data should remain dynamic inputs.
+/// represented by staged effectful operations. Static values with high cardinality can cause repeated tracing and
+/// Least Recently Used (LRU) eviction, so arrays and frequently changing data should remain dynamic inputs.
 ///
 /// Every runtime input is specialized at its own type by default, and eager values are typed exactly (e.g., an eager
 /// array by its static shape and an eager first-class dimension by its extent), so each distinct extent gets its own
@@ -974,18 +972,17 @@ impl<Static, Structure, Key> SpecializationKey<Static, Structure, Key> {
 /// (e.g., `dimension<n ∈ [1, 9)>` for a dimension input), so that one specialization serves every runtime input whose
 /// type refines them.
 ///
-/// The dispatcher identity only namespaces its specialization cache, which is local to the process. For domains that
-/// cache compiled programs, executable correctness and reuse still depend on
-/// [`CompilationCacheDomain::compilation_key`](super::contexts::CompilationCacheDomain::compilation_key), which
-/// receives the complete lowering.
+/// The dispatcher identity only namespaces its specialization cache, which is local to the process.
+/// For domains that cache compiled programs, executable correctness and reuse still depend on
+/// [`CompilationCacheDomain::compilation_key`](super::contexts::CompilationCacheDomain::compilation_key),
+/// which receives the complete lowering.
 ///
 /// Cloned handles share one specialization cache, and the dispatcher is usable from multiple threads whenever the
 /// domain, closure, static parameters, and domain artifact types are thread-safe, because [`Send`] and [`Sync`] derive
-/// structurally from those field types. Recursive dispatch on one thread of the specialization currently being
-/// produced is rejected with an error. Concurrent cold misses for one specialization on different threads instead
-/// deliberately duplicate the frontend work, because staging and lowering are cheap and inserts are idempotent, while
-/// the shared [`CompilationContext`](super::caching::CompilationContext) of the domain still coordinates the expensive
-/// backend compilation.
+/// structurally from those field types. Recursive dispatch on one thread of the specialization currently being produced
+/// is rejected with an error. Concurrent cold misses for one specialization on different threads instead deliberately
+/// duplicate the frontend work, because staging and lowering are cheap and inserts are idempotent, while the shared
+/// [`CompilationContext`](crate::CompilationContext) of the domain still coordinates the expensive backend compilation.
 ///
 /// # Retained JIT Lifecycle
 ///
@@ -1002,7 +999,7 @@ impl<Static, Structure, Key> SpecializationKey<Static, Structure, Key> {
 ///   staged -.->|"&lt;code&gt;call&lt;/code&gt; inside an outer trace"| nested["Nested Call Operation"]
 ///   lowered --> compilation_context["Shared &lt;code&gt;CompilationContext&lt;/code&gt;"]
 ///   compilation_context -->|"restore or compile"| compiled["&lt;code&gt;CompiledFunction&lt;/code&gt;"]
-///   compiled -->|"&lt;code&gt;into_executable_function&lt;/code&gt;"| executable
+///   compiled -->|"&lt;code&gt;into_executable&lt;/code&gt;"| executable
 ///   executable -->|"insert after cold production"| frontend_cache
 ///   executable -->|"call"| outputs["Structured Runtime Outputs"]
 /// ```
@@ -1014,14 +1011,18 @@ pub struct CompiledFunctionDispatcher<
     C: CompilationDomain<Type: Eq + Hash>,
     F,
     Static: Clone + Debug + Eq + Hash,
-    Input: Parameterized<C::Type, Family: ParameterizedFamily<C::Constant>>,
-    Output: Parameterized<C::Type, Family: ParameterizedFamily<C::Constant>>,
+    Input: Parameterized<C::Type>,
+    Output: Parameterized<C::Type>,
 > where
+    Input::Family: ParameterizedFamily<C::Constant>,
     Input::ParameterStructure: Eq + Hash,
+    Output::Family: ParameterizedFamily<C::Constant>,
 {
     /// State shared by every clone of this dispatcher.
     state: Arc<CompiledFunctionDispatcherState<C, F, Static, Input, Output>>,
 }
+
+// TODO(eaplatanios): Review from here onwards.
 
 impl<C, F, Static: Clone + Debug + Eq + Hash, Input, Output> Clone
     for CompiledFunctionDispatcher<C, F, Static, Input, Output>
@@ -1054,7 +1055,7 @@ where
         Self::from_domain(DispatcherDomain::Explicit(domain.clone()), function, options, capacity)
     }
 
-    /// Creates a dispatcher that selects its domain from its first nonempty invocation.
+    /// Creates a dispatcher that selects its domain from its first non-empty invocation.
     pub(crate) fn inferred(function: F, options: C::Options, capacity: usize) -> Self
     where
         C::Value: Value<Domain = C>,
@@ -1115,7 +1116,7 @@ where
     }
 
     /// Returns the compilation domain used by this dispatcher, or [`None`] while a global dispatcher's domain has
-    /// not yet been recovered from a nonempty call.
+    /// not yet been recovered from a non-empty call.
     #[inline]
     pub fn domain(&self) -> Option<&C> {
         match &self.state.domain {
@@ -2569,7 +2570,7 @@ pub(crate) mod tests {
 
     #[test]
     fn test_compiled_function_dispatcher_call_with_inferred_domain_and_empty_inputs() {
-        // Empty inputs carry no domain, so they fail before tracing until a nonempty call selects one.
+        // Empty inputs carry no domain, so they fail before tracing until a non-empty call selects one.
         let domain = CarriedDomain::new();
         let traces = AtomicUsize::new(0);
         let function: CompiledFunctionDispatcher<CarriedDomain, _, (), Vec<ArrayType>, Vec<ArrayType>> =
@@ -2719,7 +2720,7 @@ pub(crate) mod tests {
 
     #[test]
     fn test_compiled_function_dispatcher_call_retains_inferred_domain_after_tracing_failure() {
-        // The first nonempty call selects the domain before tracing, so a failed trace still fixes it for retries.
+        // The first non-empty call selects the domain before tracing, so a failed trace still fixes it for retries.
         let first_domain = CarriedDomain::new();
         let second_domain = CarriedDomain::new();
         let attempts = AtomicUsize::new(0);
