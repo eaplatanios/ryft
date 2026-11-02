@@ -33,15 +33,19 @@
 //!
 //! # Entry Points
 //!
-//!   - Use [`jit`], [`jit_with_options`], or [`jit_with_options_and_capacity`] for a retained JIT dispatcher over a
-//!     fallible closure, which returns its outputs wrapped in [`Ok`] when it cannot fail. A
-//!     [`CompiledFunctionDispatcher`] specializes on explicit static host parameters, the dynamic input's parameter
-//!     structure, and the domain's runtime-derived dispatch key. Its first call for a specialization stages, lowers,
-//!     and requests compilation; warm calls dispatch directly to the retained executable.
-//!   - Use [`stage`] for ordinary capture-free staging. Use [`StagedFunction::stage`] when fallibility, runtime
-//!     captures, or symbolic capture references are needed. Then continue with [`StagedFunction::lower`] and
-//!     [`LoweredFunction::compile`]. [`StagedProgram::stage`] exposes the underlying flat staging primitive and
-//!     returns an owned [`StagedProgram`] for direct backend use.
+//!   - Use [`stage`] for ordinary capture-free staging from runtime input values, recovering the domain from the first
+//!     input leaf and deriving the abstract input types. Use [`Compile::stage`] on an explicit domain for abstract
+//!     input types or empty inputs, and [`StagedFunction::stage`] when fallibility, runtime captures, or symbolic
+//!     capture references are needed. Then continue with [`StagedFunction::lower`] and [`LoweredFunction::compile`].
+//!     [`StagedProgram::stage`] exposes the underlying flat staging primitive and returns an owned [`StagedProgram`]
+//!     for direct backend use.
+//!   - Use [`jit`], [`jit_with_options`], or [`jit_with_options_and_capacity`] for a retained JIT dispatcher that
+//!     infers its domain from the first nonempty runtime call. Use [`Compile::jit`] and its variants on an explicit
+//!     domain to bind it when the dispatcher is constructed. The closure is fallible during tracing and returns its
+//!     outputs wrapped in [`Ok`] when it cannot fail. A [`CompiledFunctionDispatcher`] specializes on explicit static
+//!     host parameters, the dynamic input's parameter structure, and the domain's runtime-derived dispatch key. Its
+//!     first call for a specialization stages, lowers, and requests compilation; warm calls dispatch directly to the
+//!     retained executable.
 //!   - Execute an [`ExecutableFunction`] through [`ExecutableFunction::call`]. Domains with transactional
 //!     external state implement [`StatefulCompilationDomain`], and their executable functions are invoked through
 //!     [`ExecutableFunction::call_statefully`] or [`ExecutableFunction::call_statefully_async`] instead. Retained
@@ -162,10 +166,13 @@ pub use caching::{
     CompilationCacheLevel, CompilationCacheOutcome, CompilationCacheStatistics, CompilationContext, CompilationEvent,
     CompilationMissReason, DiskCache,
 };
-pub use contexts::{AnalyzableCompilationDomain, CompilationCacheDomain, CompilationDomain, StatefulCompilationDomain};
+pub use contexts::{
+    AnalyzableCompilationDomain, CompilationCacheDomain, CompilationDomain, Compile, StatefulCompilationDomain, jit,
+    jit_with_options, jit_with_options_and_capacity, stage,
+};
 pub use exchange::{CompilationArtifactExchange, CompilationArtifactExchangePolicy, CompilationExchangeError};
 pub use functions::{
     CompilationTracer, CompiledCallOperation, CompiledFunction, CompiledFunctionDispatcher, ExecutableFunction,
     FlatCompilationProgram, FunctionSpecializationKey, JitCacheStatistics, LoweredFunction, ReferenceExecution,
-    StagedFunction, StagedProgram, jit, jit_with_options, jit_with_options_and_capacity, stage,
+    StagedFunction, StagedProgram,
 };

@@ -1740,8 +1740,8 @@ mod tests {
 
     use crate::arrays::{Array, ArrayOperation, ArrayType, DataType};
     use crate::captures::CaptureReference;
-    use crate::compilation::contexts::CompilationDomain;
-    use crate::compilation::functions::{CompilationTracer, StagedFunction, StagedProgram, stage};
+    use crate::compilation::contexts::{CompilationDomain, Compile};
+    use crate::compilation::functions::{CompilationTracer, StagedFunction, StagedProgram};
     use crate::contexts::Domain;
     use crate::programs::ProgramError;
 
@@ -2287,8 +2287,9 @@ mod tests {
     fn test_compilation_context_compile() {
         let context = CompilationContext::<TestDomain>::new();
         let domain = TestDomain::default();
-        let staged: StagedFunction<TestDomain, ArrayType, ArrayType> =
-            stage(&domain, |input: CompilationTracer<TestDomain>| input, ArrayType::scalar(DataType::F32), ()).unwrap();
+        let staged: StagedFunction<TestDomain, ArrayType, ArrayType> = domain
+            .stage(|input: CompilationTracer<TestDomain>| input, ArrayType::scalar(DataType::F32), ())
+            .unwrap();
         let lowered = staged.lower(&domain).unwrap();
 
         // The producer runs only on the first request, and the second request is served by the in-memory tier.
