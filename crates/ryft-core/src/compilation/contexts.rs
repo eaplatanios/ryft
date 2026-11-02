@@ -188,8 +188,6 @@ pub trait AnalyzableCompilationDomain: CompilationDomain {
         Self: Sized;
 }
 
-// TODO(eaplatanios): Review from here onwards.
-
 /// Typed staging and retained compilation through an explicit [`CompilationDomain`]. Retained dispatchers bind to
 /// this domain when they are constructed. The global [`stage`] and [`jit`] functions infer their domain from runtime
 /// input values instead.
@@ -220,47 +218,49 @@ pub trait Compile: CompilationDomain {
         StagedFunction::stage(self, |_, _, inputs| Ok(function(inputs)), Vec::new(), input_types, options)
     }
 
-    /// Constructs a retained dispatcher for `function` through this domain with default options and cache capacity.
-    /// The function is fallible during tracing, and an infallible function returns its outputs wrapped in [`Ok`].
-    /// Staging, lowering, and compilation happen on the first call for each specialization. Refer to
-    /// [`CompiledFunctionDispatcher`] for the dispatch semantics.
+    /// Constructs a retained Just-In-Time (JIT) compilation dispatcher for `function` through this domain with default
+    /// options and cache capacity. The function is fallible during tracing, and an infallible function returns its
+    /// outputs wrapped in [`Ok`]. Staging, lowering, and compilation happen on the first call for each specialization.
+    /// Refer to [`CompiledFunctionDispatcher`] for the dispatch semantics.
     #[inline]
-    fn jit<F, Static, Input, Output>(&self, function: F) -> CompiledFunctionDispatcher<Self, F, Static, Input, Output>
+    fn jit<Static, Input, Output, F>(&self, function: F) -> CompiledFunctionDispatcher<Self, F, Static, Input, Output>
     where
         Self::Type: Eq + Hash,
         Self::Options: Default,
-        F: Fn(Static, Input::To<CompilationTracer<Self>>) -> Result<Output::To<CompilationTracer<Self>>, Self::Error>,
         Static: Clone + Debug + Eq + Hash,
         Input: Parameterized<Self::Type>,
         Input::Family: ParameterizedFamily<Self::Constant> + ParameterizedFamily<CompilationTracer<Self>>,
         Input::ParameterStructure: Eq + Hash,
         Output: Parameterized<Self::Type>,
         Output::Family: ParameterizedFamily<Self::Constant> + ParameterizedFamily<CompilationTracer<Self>>,
+        F: Fn(Static, Input::To<CompilationTracer<Self>>) -> Result<Output::To<CompilationTracer<Self>>, Self::Error>,
         DomainTracingContext<Self, Self::Value>:
             StagingContext<Type = Self::Type, Constant = Self::Constant, Operation = Self::Operation>,
     {
         self.jit_with_options(function, Self::Options::default())
     }
 
+    // TODO(eaplatanios): Review from here onwards.
+
     /// Constructs a retained dispatcher for `function` through this domain with explicit options and default cache
     /// capacity. The function is fallible during tracing, and an infallible function returns its outputs wrapped in
     /// [`Ok`]. Staging, lowering, and compilation happen on the first call for each specialization. Refer to
     /// [`CompiledFunctionDispatcher`] for the dispatch semantics.
     #[inline]
-    fn jit_with_options<F, Static, Input, Output>(
+    fn jit_with_options<Static, Input, Output, F>(
         &self,
         function: F,
         options: Self::Options,
     ) -> CompiledFunctionDispatcher<Self, F, Static, Input, Output>
     where
         Self::Type: Eq + Hash,
-        F: Fn(Static, Input::To<CompilationTracer<Self>>) -> Result<Output::To<CompilationTracer<Self>>, Self::Error>,
         Static: Clone + Debug + Eq + Hash,
         Input: Parameterized<Self::Type>,
         Input::Family: ParameterizedFamily<Self::Constant> + ParameterizedFamily<CompilationTracer<Self>>,
         Input::ParameterStructure: Eq + Hash,
         Output: Parameterized<Self::Type>,
         Output::Family: ParameterizedFamily<Self::Constant> + ParameterizedFamily<CompilationTracer<Self>>,
+        F: Fn(Static, Input::To<CompilationTracer<Self>>) -> Result<Output::To<CompilationTracer<Self>>, Self::Error>,
         DomainTracingContext<Self, Self::Value>:
             StagingContext<Type = Self::Type, Constant = Self::Constant, Operation = Self::Operation>,
     {
@@ -272,7 +272,7 @@ pub trait Compile: CompilationDomain {
     /// its outputs wrapped in [`Ok`]. Staging, lowering, and compilation happen on the first call for each
     /// specialization. Refer to [`CompiledFunctionDispatcher`] for the dispatch semantics.
     #[inline]
-    fn jit_with_options_and_capacity<F, Static, Input, Output>(
+    fn jit_with_options_and_capacity<Static, Input, Output, F>(
         &self,
         function: F,
         options: Self::Options,
@@ -280,13 +280,13 @@ pub trait Compile: CompilationDomain {
     ) -> CompiledFunctionDispatcher<Self, F, Static, Input, Output>
     where
         Self::Type: Eq + Hash,
-        F: Fn(Static, Input::To<CompilationTracer<Self>>) -> Result<Output::To<CompilationTracer<Self>>, Self::Error>,
         Static: Clone + Debug + Eq + Hash,
         Input: Parameterized<Self::Type>,
         Input::Family: ParameterizedFamily<Self::Constant> + ParameterizedFamily<CompilationTracer<Self>>,
         Input::ParameterStructure: Eq + Hash,
         Output: Parameterized<Self::Type>,
         Output::Family: ParameterizedFamily<Self::Constant> + ParameterizedFamily<CompilationTracer<Self>>,
+        F: Fn(Static, Input::To<CompilationTracer<Self>>) -> Result<Output::To<CompilationTracer<Self>>, Self::Error>,
         DomainTracingContext<Self, Self::Value>:
             StagingContext<Type = Self::Type, Constant = Self::Constant, Operation = Self::Operation>,
     {
@@ -354,18 +354,18 @@ where
 /// Use [`Compile::jit`] to select a domain explicitly or support a nullary function. Refer to
 /// [`CompiledFunctionDispatcher`] for shared domain selection and dispatch semantics.
 #[inline]
-pub fn jit<C, F, Static, Input, Output>(function: F) -> CompiledFunctionDispatcher<C, F, Static, Input, Output>
+pub fn jit<C, Static, Input, Output, F>(function: F) -> CompiledFunctionDispatcher<C, F, Static, Input, Output>
 where
     C: CompilationDomain<Options: Default>,
     C::Type: Eq + Hash,
     C::Value: Value<Domain = C>,
-    F: Fn(Static, Input::To<CompilationTracer<C>>) -> Result<Output::To<CompilationTracer<C>>, C::Error>,
     Static: Clone + Debug + Eq + Hash,
     Input: Parameterized<C::Type>,
     Input::Family: ParameterizedFamily<C::Constant> + ParameterizedFamily<CompilationTracer<C>>,
     Input::ParameterStructure: Eq + Hash,
     Output: Parameterized<C::Type>,
     Output::Family: ParameterizedFamily<C::Constant> + ParameterizedFamily<CompilationTracer<C>>,
+    F: Fn(Static, Input::To<CompilationTracer<C>>) -> Result<Output::To<CompilationTracer<C>>, C::Error>,
     DomainTracingContext<C, C::Value>: StagingContext<Type = C::Type, Constant = C::Constant, Operation = C::Operation>,
 {
     jit_with_options(function, C::Options::default())
@@ -380,7 +380,7 @@ where
 /// Use [`Compile::jit_with_options`] to select a domain explicitly or support a nullary function. Refer to
 /// [`CompiledFunctionDispatcher`] for shared domain selection and dispatch semantics.
 #[inline]
-pub fn jit_with_options<C, F, Static, Input, Output>(
+pub fn jit_with_options<C, Static, Input, Output, F>(
     function: F,
     options: C::Options,
 ) -> CompiledFunctionDispatcher<C, F, Static, Input, Output>
@@ -388,13 +388,13 @@ where
     C: CompilationDomain,
     C::Type: Eq + Hash,
     C::Value: Value<Domain = C>,
-    F: Fn(Static, Input::To<CompilationTracer<C>>) -> Result<Output::To<CompilationTracer<C>>, C::Error>,
     Static: Clone + Debug + Eq + Hash,
     Input: Parameterized<C::Type>,
     Input::Family: ParameterizedFamily<C::Constant> + ParameterizedFamily<CompilationTracer<C>>,
     Input::ParameterStructure: Eq + Hash,
     Output: Parameterized<C::Type>,
     Output::Family: ParameterizedFamily<C::Constant> + ParameterizedFamily<CompilationTracer<C>>,
+    F: Fn(Static, Input::To<CompilationTracer<C>>) -> Result<Output::To<CompilationTracer<C>>, C::Error>,
     DomainTracingContext<C, C::Value>: StagingContext<Type = C::Type, Constant = C::Constant, Operation = C::Operation>,
 {
     jit_with_options_and_capacity(function, options, DEFAULT_JIT_CACHE_CAPACITY)
@@ -408,7 +408,8 @@ where
 /// The first input leaf supplies the fixed domain through [`Value::domain`], even if that first call later fails.
 /// Use [`Compile::jit_with_options_and_capacity`] to select a domain explicitly or support a nullary function.
 /// Refer to [`CompiledFunctionDispatcher`] for shared domain selection and dispatch semantics.
-pub fn jit_with_options_and_capacity<C, F, Static, Input, Output>(
+#[inline]
+pub fn jit_with_options_and_capacity<C, Static, Input, Output, F>(
     function: F,
     options: C::Options,
     capacity: usize,
@@ -417,13 +418,13 @@ where
     C: CompilationDomain,
     C::Type: Eq + Hash,
     C::Value: Value<Domain = C>,
-    F: Fn(Static, Input::To<CompilationTracer<C>>) -> Result<Output::To<CompilationTracer<C>>, C::Error>,
     Static: Clone + Debug + Eq + Hash,
     Input: Parameterized<C::Type>,
     Input::Family: ParameterizedFamily<C::Constant> + ParameterizedFamily<CompilationTracer<C>>,
     Input::ParameterStructure: Eq + Hash,
     Output: Parameterized<C::Type>,
     Output::Family: ParameterizedFamily<C::Constant> + ParameterizedFamily<CompilationTracer<C>>,
+    F: Fn(Static, Input::To<CompilationTracer<C>>) -> Result<Output::To<CompilationTracer<C>>, C::Error>,
     DomainTracingContext<C, C::Value>: StagingContext<Type = C::Type, Constant = C::Constant, Operation = C::Operation>,
 {
     CompiledFunctionDispatcher::inferred(function, options, capacity)
