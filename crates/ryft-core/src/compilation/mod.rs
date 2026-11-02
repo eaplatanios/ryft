@@ -65,7 +65,7 @@
 //! without any host wait, read-only calls may overlap, and calls involving independent allocations do not acquire a
 //! global lock.
 //!
-//! [`ReferenceExecution`] owns whole-invocation completion. Its blocking `r#await` observes execution failure before
+//! [`StatefulExecution`] owns whole-invocation completion. Its blocking `r#await` observes execution failure before
 //! returning the reconstructed public output, while dropping it never cancels submitted work. A failure before
 //! submission leaves every reference unchanged. After submission, a failure that makes the final state ambiguous
 //! poisons the complete affected mutation group; later reference access reports that stored cause. Read-only
@@ -174,5 +174,5 @@ pub use contexts::{
 pub use exchange::{CompilationArtifactExchange, CompilationArtifactExchangePolicy, CompilationExchangeError};
 pub use functions::{
     CompilationTracer, CompiledCallOperation, CompiledFunction, CompiledFunctionDispatcher, ExecutableFunction,
-    FunctionSpecializationKey, JitCacheStatistics, LoweredFunction, ReferenceExecution, StagedFunction, StagedProgram,
+    FunctionSpecializationKey, JitCacheStatistics, LoweredFunction, StagedFunction, StagedProgram, StatefulExecution,
 };

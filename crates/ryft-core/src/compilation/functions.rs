@@ -254,73 +254,6 @@ impl<C: CompilationDomain> StagedProgram<C> {
     }
 }
 
-/// Completion-bearing result of one externally stateful compiled invocation.
-///
-/// The public result may be reconstructed immediately from pending backend values, but [`Self::await`] always observes
-/// the whole invocation completion before exposing that result. Completion includes every predecessor dependency of
-/// the references used by the invocation, not only the most recently submitted backend event. Dropping this wrapper
-/// never cancels submitted work or rolls reference state back, so callers that need to observe asynchronous failure
-/// must await it. A backend may also record a failure that happens after submission on the affected mutated
-/// references, so that later accesses report the same cause for their poisoned state.
-#[must_use = "stateful execution errors are observed by awaiting this completion"]
-pub struct ReferenceExecution<Output, Error> {
-    /// Public output or reconstruction failure prepared after submission.
-    result: Result<Output, Error>,
-
-    /// Whole-invocation completion and its backend error conversion, absent only for already-completed results.
-    completion: Option<(ReferenceCompletion, fn(Arc<str>) -> Error)>,
-}
-
-impl<Output, Error> ReferenceExecution<Output, Error> {
-    /// Creates an already-completed stateful invocation result, which returns `result` without waiting when awaited.
-    /// Backends use it when a stateful call finishes synchronously or fails before submitting any work.
-    ///
-    /// A backend must not use this function once work that reads or replaces a
-    /// [`Reference`](crate::programs::Reference) has been submitted, because the result would then hide the completion
-    /// of that work and any asynchronous failure that it reports. Use [`Self::pending`] for submitted work instead.
-    #[inline]
-    pub fn ready(result: Result<Output, Error>) -> Self {
-        Self { result, completion: None }
-    }
-
-    /// Creates a submitted invocation whose public result is already reconstructed but whose execution remains
-    /// pending. Completion failure takes precedence over `result` because it may invalidate every pending output.
-    ///
-    /// Backends must pass a `completion` that covers the whole invocation, which usually means
-    /// [`ReferenceCompletion::joined`] over the submitted work and the completions that the invocation's references
-    /// already depended on. A completion that only tracks the latest backend event would let awaiting the result
-    /// return before an earlier reference write has finished or reported its failure.
-    ///
-    /// # Parameters
-    ///
-    ///   - `result`: Public output or reconstruction failure prepared right after submission.
-    ///   - `completion`: Whole-invocation completion, including every cumulative reference predecessor dependency.
-    ///   - `completion_error`: Converts a backend completion failure message into the domain error type. It is applied
-    ///     only when the completion itself fails, and its result then replaces `result`.
-    pub fn pending(
-        result: Result<Output, Error>,
-        completion: ReferenceCompletion,
-        completion_error: fn(Arc<str>) -> Error,
-    ) -> Self {
-        Self { result, completion: Some((completion, completion_error)) }
-    }
-
-    /// Waits for the whole execution and its cumulative dependencies, then returns the public output.
-    pub fn r#await(self) -> Result<Output, Error> {
-        if let Some((completion, completion_error)) = self.completion
-            && let Err(error) = completion.r#await()
-        {
-            return Err(completion_error(error));
-        }
-        self.result
-    }
-
-    /// Applies `function` to the public output of this invocation without changing its completion.
-    fn and_then<T>(self, function: impl FnOnce(Output) -> Result<T, Error>) -> ReferenceExecution<T, Error> {
-        ReferenceExecution { result: self.result.and_then(function), completion: self.completion }
-    }
-}
-
 /// Operation-family capability for representing a call to a staged program.
 ///
 /// The call operation carries only metadata. Its callee is a flat program, whose captures have been lifted into
@@ -944,13 +877,13 @@ where
         &self,
         domain: &C,
         inputs: Input::To<C::Value>,
-    ) -> ReferenceExecution<Output::To<C::Value>, C::Error>
+    ) -> StatefulExecution<Output::To<C::Value>, C::Error>
     where
         C: StatefulCompilationDomain,
     {
         let inputs = match self.prepare_inputs(inputs) {
             Ok(inputs) => inputs,
-            Err(error) => return ReferenceExecution::ready(Err(error.into())),
+            Err(error) => return StatefulExecution::ready(Err(error.into())),
         };
         domain
             .execute_statefully(self.compiled_program(), inputs)
@@ -1075,132 +1008,6 @@ where
     }
 }
 
-/// Snapshot of the dispatch activity of one retained [`CompiledFunctionDispatcher`].
-#[derive(Copy, Clone, Debug, Default, PartialEq, Eq)]
-pub struct JitCacheStatistics {
-    /// Calls served by an already compiled specialization.
-    pub dispatch_hits: u64,
-
-    /// Calls for which no compiled specialization was retained.
-    pub dispatch_misses: u64,
-
-    /// Closure traces performed after dispatch misses.
-    pub traces: u64,
-
-    /// Backend lowerings performed after new traces.
-    pub lowerings: u64,
-
-    /// Compilation requests made to the domain after lowering.
-    pub compilation_requests: u64,
-
-    /// Total host duration spent flattening inputs and deriving their dispatch key and effective signature.
-    pub input_abstractification_duration: Duration,
-
-    /// Total host duration spent looking up retained specializations.
-    pub dispatch_duration: Duration,
-
-    /// Total host duration spent tracing specialization misses.
-    pub tracing_duration: Duration,
-
-    /// Total host duration spent lowering newly traced specializations.
-    pub lowering_duration: Duration,
-}
-
-/// Lock-free counters underlying [`JitCacheStatistics`]. Durations accumulate in nanoseconds.
-#[derive(Default)]
-struct JitCacheStatisticsAccumulator {
-    /// Counter underlying [`JitCacheStatistics::dispatch_hits`].
-    dispatch_hits: AtomicU64,
-
-    /// Counter underlying [`JitCacheStatistics::dispatch_misses`].
-    dispatch_misses: AtomicU64,
-
-    /// Counter underlying [`JitCacheStatistics::traces`].
-    traces: AtomicU64,
-
-    /// Counter underlying [`JitCacheStatistics::lowerings`].
-    lowerings: AtomicU64,
-
-    /// Counter underlying [`JitCacheStatistics::compilation_requests`].
-    compilation_requests: AtomicU64,
-
-    /// Nanoseconds underlying [`JitCacheStatistics::input_abstractification_duration`].
-    input_abstractification_nanoseconds: AtomicU64,
-
-    /// Nanoseconds underlying [`JitCacheStatistics::dispatch_duration`].
-    dispatch_nanoseconds: AtomicU64,
-
-    /// Nanoseconds underlying [`JitCacheStatistics::tracing_duration`].
-    tracing_nanoseconds: AtomicU64,
-
-    /// Nanoseconds underlying [`JitCacheStatistics::lowering_duration`].
-    lowering_nanoseconds: AtomicU64,
-}
-
-impl JitCacheStatisticsAccumulator {
-    /// Returns a snapshot of the counters. The counters are read independently, so a snapshot taken during concurrent
-    /// calls need not correspond to a single point in time.
-    fn snapshot(&self) -> JitCacheStatistics {
-        JitCacheStatistics {
-            dispatch_hits: self.dispatch_hits.load(Ordering::Relaxed),
-            dispatch_misses: self.dispatch_misses.load(Ordering::Relaxed),
-            traces: self.traces.load(Ordering::Relaxed),
-            lowerings: self.lowerings.load(Ordering::Relaxed),
-            compilation_requests: self.compilation_requests.load(Ordering::Relaxed),
-            input_abstractification_duration: Duration::from_nanos(
-                self.input_abstractification_nanoseconds.load(Ordering::Relaxed),
-            ),
-            dispatch_duration: Duration::from_nanos(self.dispatch_nanoseconds.load(Ordering::Relaxed)),
-            tracing_duration: Duration::from_nanos(self.tracing_nanoseconds.load(Ordering::Relaxed)),
-            lowering_duration: Duration::from_nanos(self.lowering_nanoseconds.load(Ordering::Relaxed)),
-        }
-    }
-
-    /// Resets every counter to zero.
-    fn clear(&self) {
-        self.dispatch_hits.store(0, Ordering::Relaxed);
-        self.dispatch_misses.store(0, Ordering::Relaxed);
-        self.traces.store(0, Ordering::Relaxed);
-        self.lowerings.store(0, Ordering::Relaxed);
-        self.compilation_requests.store(0, Ordering::Relaxed);
-        self.input_abstractification_nanoseconds.store(0, Ordering::Relaxed);
-        self.dispatch_nanoseconds.store(0, Ordering::Relaxed);
-        self.tracing_nanoseconds.store(0, Ordering::Relaxed);
-        self.lowering_nanoseconds.store(0, Ordering::Relaxed);
-    }
-}
-
-/// Default number of compiled specializations retained by one [`CompiledFunctionDispatcher`].
-pub(crate) const DEFAULT_JIT_CACHE_CAPACITY: usize = 256;
-
-/// Type-level source universe for retained JIT specialization.
-///
-/// The owning [`CompiledFunctionDispatcherState`] fixes the closure identity, lexical captures, domain instance, and
-/// immutable compilation options. This token stores none of them and only makes the key and artifact families of the
-/// descriptor coherent at the type level. If any of those owner semantics becomes variable per call, it must enter the
-/// transform inputs instead.
-struct JitCompilationSource<C, StaticParameters, Input, Output>(
-    PhantomData<fn() -> (C, StaticParameters, Input, Output)>,
-);
-
-/// Transform descriptor for the executable specializations retained by one [`CompiledFunctionDispatcher`].
-struct JitCompilationTransform;
-
-impl<C, StaticParameters, Input, Output> Transform<JitCompilationSource<C, StaticParameters, Input, Output>>
-    for JitCompilationTransform
-where
-    C: CompilationDomain,
-    StaticParameters: Clone + Eq + Hash,
-    Input: Parameterized<C::Type>,
-    Input::ParameterStructure: Eq + Hash,
-    Output: Parameterized<C::Type>,
-{
-    type Arguments = FunctionSpecializationKey<StaticParameters, Input::ParameterStructure, C::DispatchKey>;
-    type Artifact = ExecutableFunction<C, Input, Output>;
-
-    const DEFAULT_CACHE_CAPACITY: usize = DEFAULT_JIT_CACHE_CAPACITY;
-}
-
 /// Retained JIT dispatcher that caches compiled specializations of one Rust closure.
 ///
 /// Unlike [`CompiledFunction`], which represents one executable that is already specialized, a
@@ -1277,61 +1084,6 @@ pub struct CompiledFunctionDispatcher<
 {
     /// State shared by every clone of this dispatcher.
     state: Arc<CompiledFunctionDispatcherState<C, F, Static, Input, Output>>,
-}
-
-/// Shared state of a [`CompiledFunctionDispatcher`].
-struct CompiledFunctionDispatcherState<
-    C: CompilationDomain<Type: Eq + Hash>,
-    F,
-    Static: Clone + Debug + Eq + Hash,
-    Input: Parameterized<C::Type, Family: ParameterizedFamily<C::Constant>>,
-    Output: Parameterized<C::Type, Family: ParameterizedFamily<C::Constant>>,
-> where
-    Input::ParameterStructure: Eq + Hash,
-{
-    /// Compilation domain that stages, lowers, compiles, and executes every specialization.
-    domain: DispatcherDomain<C>,
-
-    /// Rust closure traced once per specialization.
-    function: F,
-
-    /// Compilation options fixed for every specialization.
-    options: C::Options,
-
-    /// Declared staged input types, or [`None`] when every input is staged at its own type.
-    staged_input_types: Option<StagedInputTypes<C::Type, Input::ParameterStructure>>,
-
-    /// Bounded LRU cache of compiled specializations.
-    specializations: TransformCache<JitCompilationTransform, JitCompilationSource<C, Static, Input, Output>>,
-
-    /// Dispatch activity counters.
-    statistics: JitCacheStatisticsAccumulator,
-}
-
-/// Explicit or lazily recovered domain shared by one dispatcher's specializations and clones.
-enum DispatcherDomain<C: CompilationDomain> {
-    /// Domain selected when the dispatcher was constructed.
-    Explicit(C),
-
-    /// Domain recovered once from a runtime input, with the recovery function available only for compatible values.
-    Inferred {
-        /// Domain selected atomically by the first call with an input leaf.
-        domain: OnceLock<C>,
-
-        /// Recovers the compilation domain carried by one runtime input.
-        from_input: fn(&C::Value) -> C,
-    },
-}
-
-/// Staged input types declared for a [`CompiledFunctionDispatcher`] (refer to
-/// [`CompiledFunctionDispatcher::with_staged_input_types`]), stored flattened so that the dispatcher needs no
-/// `Option`-leaved instantiation of its input family outside of the functions that declare and return them.
-struct StagedInputTypes<T, Structure> {
-    /// Parameter structure of the declared inputs.
-    structure: Structure,
-
-    /// Declared staged type of each flattened input, or [`None`] for an input that is staged at its own type.
-    types: Vec<Option<T>>,
 }
 
 impl<C, F, Static: Clone + Debug + Eq + Hash, Input, Output> Clone
@@ -1521,7 +1273,7 @@ where
         &self,
         static_parameters: Static,
         inputs: Input::To<C::Value>,
-    ) -> ReferenceExecution<Output::To<C::Value>, C::Error>
+    ) -> StatefulExecution<Output::To<C::Value>, C::Error>
     where
         C: StatefulCompilationDomain,
         C::Options: Clone,
@@ -1543,7 +1295,7 @@ where
     {
         let (domain, executable) = match self.specialization(static_parameters, &inputs) {
             Ok(specialization) => specialization,
-            Err(error) => return ReferenceExecution::ready(Err(error)),
+            Err(error) => return StatefulExecution::ready(Err(error)),
         };
         executable.call_statefully_async(domain, inputs)
     }
@@ -1731,6 +1483,254 @@ where
         }
         Ok(input_types)
     }
+}
+
+/// Shared state of a [`CompiledFunctionDispatcher`].
+struct CompiledFunctionDispatcherState<
+    C: CompilationDomain<Type: Eq + Hash>,
+    F,
+    Static: Clone + Debug + Eq + Hash,
+    Input: Parameterized<C::Type, Family: ParameterizedFamily<C::Constant>>,
+    Output: Parameterized<C::Type, Family: ParameterizedFamily<C::Constant>>,
+> where
+    Input::ParameterStructure: Eq + Hash,
+{
+    /// Compilation domain that stages, lowers, compiles, and executes every specialization.
+    domain: DispatcherDomain<C>,
+
+    /// Rust closure traced once per specialization.
+    function: F,
+
+    /// Compilation options fixed for every specialization.
+    options: C::Options,
+
+    /// Declared staged input types, or [`None`] when every input is staged at its own type.
+    staged_input_types: Option<StagedInputTypes<C::Type, Input::ParameterStructure>>,
+
+    /// Bounded LRU cache of compiled specializations.
+    specializations: TransformCache<JitCompilationTransform, JitCompilationSource<C, Static, Input, Output>>,
+
+    /// Dispatch activity counters.
+    statistics: JitCacheStatisticsAccumulator,
+}
+
+/// Explicit or lazily recovered domain shared by one dispatcher's specializations and clones.
+enum DispatcherDomain<C: CompilationDomain> {
+    /// Domain selected when the dispatcher was constructed.
+    Explicit(C),
+
+    /// Domain recovered once from a runtime input, with the recovery function available only for compatible values.
+    Inferred {
+        /// Domain selected atomically by the first call with an input leaf.
+        domain: OnceLock<C>,
+
+        /// Recovers the compilation domain carried by one runtime input.
+        from_input: fn(&C::Value) -> C,
+    },
+}
+
+/// Staged input types declared for a [`CompiledFunctionDispatcher`] (refer to
+/// [`CompiledFunctionDispatcher::with_staged_input_types`]), stored flattened so that the dispatcher needs no
+/// `Option`-leaved instantiation of its input family outside of the functions that declare and return them.
+struct StagedInputTypes<T, Structure> {
+    /// Parameter structure of the declared inputs.
+    structure: Structure,
+
+    /// Declared staged type of each flattened input, or [`None`] for an input that is staged at its own type.
+    types: Vec<Option<T>>,
+}
+
+/// Completion-bearing result of one externally stateful compiled invocation.
+///
+/// The public result may be reconstructed immediately from pending backend values, but [`Self::await`] always observes
+/// the whole invocation completion before exposing that result. Completion includes every predecessor dependency of
+/// the references used by the invocation, not only the most recently submitted backend event. Dropping this wrapper
+/// never cancels submitted work or rolls reference state back, so callers that need to observe asynchronous failure
+/// must await it. A backend may also record a failure that happens after submission on the affected mutated
+/// references, so that later accesses report the same cause for their poisoned state.
+#[must_use = "stateful execution errors are observed by awaiting this completion"]
+pub struct StatefulExecution<Output, Error> {
+    /// Public output or reconstruction failure prepared after submission.
+    result: Result<Output, Error>,
+
+    /// Whole-invocation completion and its backend error conversion, absent only for already-completed results.
+    completion: Option<(ReferenceCompletion, fn(Arc<str>) -> Error)>,
+}
+
+impl<Output, Error> StatefulExecution<Output, Error> {
+    /// Creates an already-completed stateful invocation result, which returns `result` without waiting when awaited.
+    /// Backends use it when a stateful call finishes synchronously or fails before submitting any work.
+    ///
+    /// A backend must not use this function once work that reads or replaces a
+    /// [`Reference`](crate::programs::Reference) has been submitted, because the result would then hide the completion
+    /// of that work and any asynchronous failure that it reports. Use [`Self::pending`] for submitted work instead.
+    #[inline]
+    pub fn ready(result: Result<Output, Error>) -> Self {
+        Self { result, completion: None }
+    }
+
+    /// Creates a submitted invocation whose public result is already reconstructed but whose execution remains
+    /// pending. Completion failure takes precedence over `result` because it may invalidate every pending output.
+    ///
+    /// Backends must pass a `completion` that covers the whole invocation, which usually means
+    /// [`ReferenceCompletion::joined`] over the submitted work and the completions that the invocation's references
+    /// already depended on. A completion that only tracks the latest backend event would let awaiting the result
+    /// return before an earlier reference write has finished or reported its failure.
+    ///
+    /// # Parameters
+    ///
+    ///   - `result`: Public output or reconstruction failure prepared right after submission.
+    ///   - `completion`: Whole-invocation completion, including every cumulative reference predecessor dependency.
+    ///   - `completion_error`: Converts a backend completion failure message into the domain error type. It is applied
+    ///     only when the completion itself fails, and its result then replaces `result`.
+    pub fn pending(
+        result: Result<Output, Error>,
+        completion: ReferenceCompletion,
+        completion_error: fn(Arc<str>) -> Error,
+    ) -> Self {
+        Self { result, completion: Some((completion, completion_error)) }
+    }
+
+    /// Waits for the whole execution and its cumulative dependencies, then returns the public output.
+    pub fn r#await(self) -> Result<Output, Error> {
+        if let Some((completion, completion_error)) = self.completion
+            && let Err(error) = completion.r#await()
+        {
+            return Err(completion_error(error));
+        }
+        self.result
+    }
+
+    /// Applies `function` to the public output of this invocation without changing its completion.
+    fn and_then<T>(self, function: impl FnOnce(Output) -> Result<T, Error>) -> StatefulExecution<T, Error> {
+        StatefulExecution { result: self.result.and_then(function), completion: self.completion }
+    }
+}
+
+/// Snapshot of the dispatch activity of one retained [`CompiledFunctionDispatcher`].
+#[derive(Copy, Clone, Debug, Default, PartialEq, Eq)]
+pub struct JitCacheStatistics {
+    /// Calls served by an already compiled specialization.
+    pub dispatch_hits: u64,
+
+    /// Calls for which no compiled specialization was retained.
+    pub dispatch_misses: u64,
+
+    /// Closure traces performed after dispatch misses.
+    pub traces: u64,
+
+    /// Backend lowerings performed after new traces.
+    pub lowerings: u64,
+
+    /// Compilation requests made to the domain after lowering.
+    pub compilation_requests: u64,
+
+    /// Total host duration spent flattening inputs and deriving their dispatch key and effective signature.
+    pub input_abstractification_duration: Duration,
+
+    /// Total host duration spent looking up retained specializations.
+    pub dispatch_duration: Duration,
+
+    /// Total host duration spent tracing specialization misses.
+    pub tracing_duration: Duration,
+
+    /// Total host duration spent lowering newly traced specializations.
+    pub lowering_duration: Duration,
+}
+
+/// Lock-free counters underlying [`JitCacheStatistics`]. Durations accumulate in nanoseconds.
+#[derive(Default)]
+struct JitCacheStatisticsAccumulator {
+    /// Counter underlying [`JitCacheStatistics::dispatch_hits`].
+    dispatch_hits: AtomicU64,
+
+    /// Counter underlying [`JitCacheStatistics::dispatch_misses`].
+    dispatch_misses: AtomicU64,
+
+    /// Counter underlying [`JitCacheStatistics::traces`].
+    traces: AtomicU64,
+
+    /// Counter underlying [`JitCacheStatistics::lowerings`].
+    lowerings: AtomicU64,
+
+    /// Counter underlying [`JitCacheStatistics::compilation_requests`].
+    compilation_requests: AtomicU64,
+
+    /// Nanoseconds underlying [`JitCacheStatistics::input_abstractification_duration`].
+    input_abstractification_nanoseconds: AtomicU64,
+
+    /// Nanoseconds underlying [`JitCacheStatistics::dispatch_duration`].
+    dispatch_nanoseconds: AtomicU64,
+
+    /// Nanoseconds underlying [`JitCacheStatistics::tracing_duration`].
+    tracing_nanoseconds: AtomicU64,
+
+    /// Nanoseconds underlying [`JitCacheStatistics::lowering_duration`].
+    lowering_nanoseconds: AtomicU64,
+}
+
+impl JitCacheStatisticsAccumulator {
+    /// Returns a snapshot of the counters. The counters are read independently, so a snapshot taken during concurrent
+    /// calls need not correspond to a single point in time.
+    fn snapshot(&self) -> JitCacheStatistics {
+        JitCacheStatistics {
+            dispatch_hits: self.dispatch_hits.load(Ordering::Relaxed),
+            dispatch_misses: self.dispatch_misses.load(Ordering::Relaxed),
+            traces: self.traces.load(Ordering::Relaxed),
+            lowerings: self.lowerings.load(Ordering::Relaxed),
+            compilation_requests: self.compilation_requests.load(Ordering::Relaxed),
+            input_abstractification_duration: Duration::from_nanos(
+                self.input_abstractification_nanoseconds.load(Ordering::Relaxed),
+            ),
+            dispatch_duration: Duration::from_nanos(self.dispatch_nanoseconds.load(Ordering::Relaxed)),
+            tracing_duration: Duration::from_nanos(self.tracing_nanoseconds.load(Ordering::Relaxed)),
+            lowering_duration: Duration::from_nanos(self.lowering_nanoseconds.load(Ordering::Relaxed)),
+        }
+    }
+
+    /// Resets every counter to zero.
+    fn clear(&self) {
+        self.dispatch_hits.store(0, Ordering::Relaxed);
+        self.dispatch_misses.store(0, Ordering::Relaxed);
+        self.traces.store(0, Ordering::Relaxed);
+        self.lowerings.store(0, Ordering::Relaxed);
+        self.compilation_requests.store(0, Ordering::Relaxed);
+        self.input_abstractification_nanoseconds.store(0, Ordering::Relaxed);
+        self.dispatch_nanoseconds.store(0, Ordering::Relaxed);
+        self.tracing_nanoseconds.store(0, Ordering::Relaxed);
+        self.lowering_nanoseconds.store(0, Ordering::Relaxed);
+    }
+}
+
+/// Default number of compiled specializations retained by one [`CompiledFunctionDispatcher`].
+pub(crate) const DEFAULT_JIT_CACHE_CAPACITY: usize = 256;
+
+/// Type-level source universe for retained JIT specialization.
+///
+/// The owning [`CompiledFunctionDispatcherState`] fixes the closure identity, lexical captures, domain instance, and
+/// immutable compilation options. This token stores none of them and only makes the key and artifact families of the
+/// descriptor coherent at the type level. If any of those owner semantics becomes variable per call, it must enter the
+/// transform inputs instead.
+struct JitCompilationSource<C, StaticParameters, Input, Output>(
+    PhantomData<fn() -> (C, StaticParameters, Input, Output)>,
+);
+
+/// Transform descriptor for the executable specializations retained by one [`CompiledFunctionDispatcher`].
+struct JitCompilationTransform;
+
+impl<C, StaticParameters, Input, Output> Transform<JitCompilationSource<C, StaticParameters, Input, Output>>
+    for JitCompilationTransform
+where
+    C: CompilationDomain,
+    StaticParameters: Clone + Eq + Hash,
+    Input: Parameterized<C::Type>,
+    Input::ParameterStructure: Eq + Hash,
+    Output: Parameterized<C::Type>,
+{
+    type Arguments = FunctionSpecializationKey<StaticParameters, Input::ParameterStructure, C::DispatchKey>;
+    type Artifact = ExecutableFunction<C, Input, Output>;
+
+    const DEFAULT_CACHE_CAPACITY: usize = DEFAULT_JIT_CACHE_CAPACITY;
 }
 
 #[cfg(test)]
@@ -2076,8 +2076,8 @@ pub(crate) mod tests {
             &self,
             program: &Self::CompiledProgram,
             inputs: Vec<CarriedArray>,
-        ) -> ReferenceExecution<Vec<CarriedArray>, ProgramError> {
-            ReferenceExecution::ready(self.execute(program, inputs))
+        ) -> StatefulExecution<Vec<CarriedArray>, ProgramError> {
+            StatefulExecution::ready(self.execute(program, inputs))
         }
     }
 
@@ -2236,38 +2236,6 @@ pub(crate) mod tests {
             TestOptions::default(),
         );
         assert!(matches!(result, Err(ProgramError::EscapedProgramBuilder)));
-    }
-
-    #[test]
-    fn test_reference_execution_ready() {
-        // A ready execution carries no completion at all, so awaiting it just yields the stored result.
-        let execution: ReferenceExecution<u32, ProgramError> = ReferenceExecution::ready(Ok(7));
-        assert_eq!(execution.r#await(), Ok(7));
-
-        let execution: ReferenceExecution<u32, ProgramError> =
-            ReferenceExecution::ready(Err(ProgramError::MalformedProgram("specialization failed".to_string())));
-        let expected = Err(ProgramError::MalformedProgram("specialization failed".to_string()));
-        assert_eq!(execution.r#await(), expected);
-    }
-
-    #[test]
-    fn test_reference_execution_pending() {
-        // A successful completion never rewrites the reconstructed public output.
-        let execution: ReferenceExecution<u32, ProgramError> =
-            ReferenceExecution::pending(Ok(11), ReferenceCompletion::ready(Ok(())), reference_completion_error);
-        assert_eq!(execution.r#await(), Ok(11));
-    }
-
-    #[test]
-    fn test_reference_execution_await_prioritizes_completion_failure() {
-        // A completion failure may invalidate every pending output, so it replaces the reconstruction error.
-        let execution: ReferenceExecution<(), ProgramError> = ReferenceExecution::pending(
-            Err(ProgramError::MalformedProgram("public reconstruction failed".to_string())),
-            ReferenceCompletion::ready(Err("execution failed".into())),
-            reference_completion_error,
-        );
-        let expected = Err(ProgramError::InvalidArgument { message: "execution failed".to_string() });
-        assert_eq!(execution.r#await(), expected);
     }
 
     #[test]
@@ -2434,22 +2402,6 @@ pub(crate) mod tests {
             executable.inputs_with_captures(vec![Array::scalar(1.0).unwrap()]),
             vec![Array::scalar(7.0).unwrap(), Array::scalar(1.0).unwrap()],
         );
-    }
-
-    #[test]
-    fn test_jit_compilation_transform() {
-        type Source = JitCompilationSource<TestDomain, usize, Vec<ArrayType>, Vec<ArrayType>>;
-        type Arguments = FunctionSpecializationKey<usize, Vec<Placeholder>, Arc<[ArrayType]>>;
-        type Artifact = ExecutableFunction<TestDomain, Vec<ArrayType>, Vec<ArrayType>>;
-
-        fn assert_contract<T, S>()
-        where
-            T: Transform<S, Arguments = Arguments, Artifact = Artifact>,
-        {
-        }
-
-        assert_contract::<JitCompilationTransform, Source>();
-        assert_eq!(<JitCompilationTransform as Transform<Source>>::DEFAULT_CACHE_CAPACITY, DEFAULT_JIT_CACHE_CAPACITY,);
     }
 
     #[test]
@@ -3149,5 +3101,53 @@ pub(crate) mod tests {
                 Ok(if negate { input.unary(NegOperation::new()) } else { input })
             });
         assert_dispatcher_send_and_sync(&function);
+    }
+
+    #[test]
+    fn test_stateful_execution_ready() {
+        // A ready execution carries no completion at all, so awaiting it just yields the stored result.
+        let execution: StatefulExecution<u32, ProgramError> = StatefulExecution::ready(Ok(7));
+        assert_eq!(execution.r#await(), Ok(7));
+
+        let execution: StatefulExecution<u32, ProgramError> =
+            StatefulExecution::ready(Err(ProgramError::MalformedProgram("specialization failed".to_string())));
+        let expected = Err(ProgramError::MalformedProgram("specialization failed".to_string()));
+        assert_eq!(execution.r#await(), expected);
+    }
+
+    #[test]
+    fn test_stateful_execution_pending() {
+        // A successful completion never rewrites the reconstructed public output.
+        let execution: StatefulExecution<u32, ProgramError> =
+            StatefulExecution::pending(Ok(11), ReferenceCompletion::ready(Ok(())), reference_completion_error);
+        assert_eq!(execution.r#await(), Ok(11));
+    }
+
+    #[test]
+    fn test_stateful_execution_await_prioritizes_completion_failure() {
+        // A completion failure may invalidate every pending output, so it replaces the reconstruction error.
+        let execution: StatefulExecution<(), ProgramError> = StatefulExecution::pending(
+            Err(ProgramError::MalformedProgram("public reconstruction failed".to_string())),
+            ReferenceCompletion::ready(Err("execution failed".into())),
+            reference_completion_error,
+        );
+        let expected = Err(ProgramError::InvalidArgument { message: "execution failed".to_string() });
+        assert_eq!(execution.r#await(), expected);
+    }
+
+    #[test]
+    fn test_jit_compilation_transform() {
+        type Source = JitCompilationSource<TestDomain, usize, Vec<ArrayType>, Vec<ArrayType>>;
+        type Arguments = FunctionSpecializationKey<usize, Vec<Placeholder>, Arc<[ArrayType]>>;
+        type Artifact = ExecutableFunction<TestDomain, Vec<ArrayType>, Vec<ArrayType>>;
+
+        fn assert_contract<T, S>()
+        where
+            T: Transform<S, Arguments = Arguments, Artifact = Artifact>,
+        {
+        }
+
+        assert_contract::<JitCompilationTransform, Source>();
+        assert_eq!(<JitCompilationTransform as Transform<Source>>::DEFAULT_CACHE_CAPACITY, DEFAULT_JIT_CACHE_CAPACITY,);
     }
 }

@@ -4,8 +4,8 @@ use std::sync::Arc;
 
 use crate::captures::CaptureConstant;
 use crate::compilation::functions::{
-    CompilationTracer, CompiledFunctionDispatcher, DEFAULT_JIT_CACHE_CAPACITY, ExecutableFunction, ReferenceExecution,
-    StagedFunction, StagedProgram,
+    CompilationTracer, CompiledFunctionDispatcher, DEFAULT_JIT_CACHE_CAPACITY, ExecutableFunction, StagedFunction,
+    StagedProgram, StatefulExecution,
 };
 use crate::contexts::{Domain, StagingContext};
 use crate::parameters::{Parameterized, ParameterizedFamily};
@@ -113,7 +113,7 @@ pub trait StatefulCompilationDomain: CompilationDomain {
         &self,
         program: &Self::CompiledProgram,
         inputs: Vec<Self::Value>,
-    ) -> ReferenceExecution<Vec<Self::Value>, Self::Error>;
+    ) -> StatefulExecution<Vec<Self::Value>, Self::Error>;
 }
 
 /// Optional capability for caching backend-compiled programs in a [`CompilationContext`](crate::CompilationContext).
