@@ -85,7 +85,7 @@
 //!      transformations. Pure runtime execution uses [`ExecutableFunction::execute`]; transactional external state uses
 //!      [`ExecutableFunction::execute_statefully`].
 //!   4. [`ExecutableFunction`] retains only the executable, captures, signatures, and output structure. Use
-//!      [`CompiledFunction::into_executable_function`] when transform metadata is no longer needed. This runtime-only
+//!      [`CompiledFunction::into_executable`] when transform metadata is no longer needed. This runtime-only
 //!      handle gains [`Send`] and [`Sync`] structurally whenever its backend fields do.
 //!
 //! # Captures and Nested Calls

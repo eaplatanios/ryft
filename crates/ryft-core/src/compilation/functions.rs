@@ -681,16 +681,17 @@ impl<C: CompilationDomain, Input: Parameterized<C::Type>, Output: Parameterized<
         Output::To<C::Value>:
             Parameterized<C::Value, Family = Output::Family, ParameterStructure = Output::ParameterStructure>,
     {
-        let inputs = self.prepare_inputs(inputs)?;
-        let outputs = domain.execute(self.compiled_program(), inputs)?;
-        self.reconstruct_outputs(outputs).map_err(C::Error::from)
+        let inputs = inputs.into_parameters().collect::<Vec<_>>();
+        self.validate_input_count(inputs.len())?;
+        let outputs = domain.execute(self.compiled_program(), self.inputs_with_captures(inputs))?;
+        Ok(Output::To::<C::Value>::from_parameters(self.state.output_structure.clone(), outputs)
+            .map_err(ProgramError::from)?)
     }
 
     /// Submits this function on structured runtime `inputs` through the stateful `domain` and returns a
     /// [`StatefulExecution`] tracking completion of the whole invocation. Submission happens before this function
     /// returns. Await the result to observe execution failures. Dropping it does not cancel submitted work. Reference
     /// state publication follows [`StatefulCompilationDomain::execute_statefully`].
-    #[inline]
     pub fn execute_statefully(
         &self,
         domain: &C,
@@ -704,13 +705,16 @@ impl<C: CompilationDomain, Input: Parameterized<C::Type>, Output: Parameterized<
         Output::To<C::Value>:
             Parameterized<C::Value, Family = Output::Family, ParameterStructure = Output::ParameterStructure>,
     {
-        let inputs = match self.prepare_inputs(inputs) {
-            Ok(inputs) => inputs,
-            Err(error) => return StatefulExecution::ready(Err(error.into())),
-        };
+        let inputs = inputs.into_parameters().collect::<Vec<_>>();
+        if let Err(error) = self.validate_input_count(inputs.len()) {
+            return StatefulExecution::ready(Err(error.into()));
+        }
         domain
-            .execute_statefully(self.compiled_program(), inputs)
-            .and_then(|outputs| self.reconstruct_outputs(outputs).map_err(C::Error::from))
+            .execute_statefully(self.compiled_program(), self.inputs_with_captures(inputs))
+            .and_then(|outputs| {
+                Ok(Output::To::<C::Value>::from_parameters(self.state.output_structure.clone(), outputs)
+                    .map_err(ProgramError::from)?)
+            })
     }
 
     /// Executes this function on the structured runtime `inputs` through the stateful `domain` and waits for the whole
@@ -732,14 +736,12 @@ impl<C: CompilationDomain, Input: Parameterized<C::Type>, Output: Parameterized<
         self.execute_statefully(domain, inputs).r#await()
     }
 
-    // TODO(eaplatanios): Review from here onwards.
-
-    /// Validates that `inputs` matches the declared flat public input arity, excluding hidden captures.
-    pub fn validate_flat_input_count(&self, inputs: &[C::Value]) -> Result<(), ProgramError> {
-        if inputs.len() != self.state.input_types.len() {
+    /// Validates that `input_count` matches the number of flat public inputs, excluding hidden captures.
+    pub fn validate_input_count(&self, input_count: usize) -> Result<(), ProgramError> {
+        if input_count != self.state.input_types.len() {
             return Err(ProgramError::InvalidInputCount {
                 expected: self.state.input_types.len(),
-                actual: inputs.len(),
+                actual: input_count,
             });
         }
         Ok(())
@@ -755,28 +757,6 @@ impl<C: CompilationDomain, Input: Parameterized<C::Type>, Output: Parameterized<
         let mut inputs_with_captures = self.state.captures.to_vec();
         inputs_with_captures.extend(inputs);
         inputs_with_captures
-    }
-
-    /// Reconstructs structured runtime outputs from the executable's flat `outputs` using the retained output
-    /// parameter structure.
-    pub fn reconstruct_outputs(&self, outputs: Vec<C::Value>) -> Result<Output::To<C::Value>, ProgramError>
-    where
-        Output::Family: ParameterizedFamily<C::Value>,
-        Output::To<C::Value>:
-            Parameterized<C::Value, Family = Output::Family, ParameterStructure = Output::ParameterStructure>,
-    {
-        Output::To::<C::Value>::from_parameters(self.state.output_structure.clone(), outputs).map_err(Into::into)
-    }
-
-    /// Flattens the structured runtime `inputs`, validates their count, and prepends the runtime captures to them.
-    fn prepare_inputs(&self, inputs: Input::To<C::Value>) -> Result<Vec<C::Value>, ProgramError>
-    where
-        Input::Family: ParameterizedFamily<C::Value>,
-        Input::To<C::Value>: Parameterized<C::Value>,
-    {
-        let inputs = inputs.into_parameters().collect::<Vec<_>>();
-        self.validate_flat_input_count(&inputs)?;
-        Ok(self.inputs_with_captures(inputs))
     }
 }
 
@@ -810,33 +790,19 @@ struct ExecutableFunctionState<C: CompilationDomain, Input: Parameterized<C::Typ
     input: PhantomData<fn(Input)>,
 }
 
-/// Compiled executable plus the staged and lowered metadata required to invoke it safely.
-///
-/// The compiled program of the backend is the artifact this function carries, while the captures, structured
-/// signatures, and options carried with it are what make the handle callable as well as transformable.
+/// Compiled executable plus the staged and lowered metadata required to invoke it safely. The compiled program of the
+/// backend is the artifact this function carries, while the captures, structured signatures, and options carried with
+/// it are what make the handle callable as well as transformable.
 pub struct CompiledFunction<
     C: CompilationDomain,
     Input: Parameterized<C::Type, Family: ParameterizedFamily<C::Constant>>,
     Output: Parameterized<C::Type, Family: ParameterizedFamily<C::Constant>>,
 > {
-    /// Runtime-only executable handle.
-    executable_function: ExecutableFunction<C, Input, Output>,
+    /// Runtime-only executable function handle.
+    executable: ExecutableFunction<C, Input, Output>,
 
     /// Lowered function retaining source metadata and options.
     lowered: LoweredFunction<C, Input, Output>,
-}
-
-impl<C, Input, Output> Clone for CompiledFunction<C, Input, Output>
-where
-    C: CompilationDomain,
-    Input: Parameterized<C::Type>,
-    Input::Family: ParameterizedFamily<C::Constant>,
-    Output: Parameterized<C::Type>,
-    Output::Family: ParameterizedFamily<C::Constant>,
-{
-    fn clone(&self) -> Self {
-        Self { executable_function: self.executable_function.clone(), lowered: self.lowered.clone() }
-    }
 }
 
 impl<C, Input, Output> CompiledFunction<C, Input, Output>
@@ -847,7 +813,7 @@ where
     Output: Parameterized<C::Type>,
     Output::Family: ParameterizedFamily<C::Constant>,
 {
-    /// Assembles a compiled function from backend-validated parts.
+    /// Assembles a [`CompiledFunction`] from the provided backend-validated parts.
     fn from_parts(
         lowered: LoweredFunction<C, Input, Output>,
         program: Arc<C::CompiledProgram>,
@@ -863,25 +829,25 @@ where
                 input: PhantomData,
             }),
         };
-        Self { executable_function, lowered }
+        Self { executable: executable_function, lowered }
     }
 
     /// Returns the shared backend executable.
     #[inline]
     pub fn compiled_program(&self) -> &C::CompiledProgram {
-        self.executable_function.compiled_program()
+        self.executable.compiled_program()
     }
 
-    /// Returns the runtime-only handle, which omits staged and lowered transform metadata.
+    /// Returns the runtime-only executable function handle, which omits staged and lowered transform metadata.
     #[inline]
-    pub fn executable_function(&self) -> &ExecutableFunction<C, Input, Output> {
-        &self.executable_function
+    pub fn executable(&self) -> &ExecutableFunction<C, Input, Output> {
+        &self.executable
     }
 
-    /// Consumes this transformable handle and returns its runtime-only executable state.
+    /// Consumes this transformable handle and returns its underlying runtime-only executable function.
     #[inline]
-    pub fn into_executable_function(self) -> ExecutableFunction<C, Input, Output> {
-        self.executable_function
+    pub fn into_executable(self) -> ExecutableFunction<C, Input, Output> {
+        self.executable
     }
 
     /// Returns the lowering from which this executable was compiled.
@@ -907,7 +873,21 @@ where
     /// Returns the effective flat output types produced by the executable.
     #[inline]
     pub fn output_types(&self) -> &[C::Type] {
-        self.executable_function.output_types()
+        self.executable.output_types()
+    }
+}
+
+impl<C, Input, Output> Clone for CompiledFunction<C, Input, Output>
+where
+    C: CompilationDomain,
+    Input: Parameterized<C::Type>,
+    Input::Family: ParameterizedFamily<C::Constant>,
+    Output: Parameterized<C::Type>,
+    Output::Family: ParameterizedFamily<C::Constant>,
+{
+    #[inline]
+    fn clone(&self) -> Self {
+        Self { executable: self.executable.clone(), lowered: self.lowered.clone() }
     }
 }
 
@@ -962,6 +942,8 @@ impl<Static, Structure, Key> SpecializationKey<Static, Structure, Key> {
         &self.input_structure
     }
 }
+
+// TODO(eaplatanios): Review from here onwards.
 
 /// Retained JIT dispatcher that caches compiled specializations of one Rust closure.
 ///
@@ -1363,7 +1345,7 @@ where
         let lowered = lowered?;
         statistics.compilation_requests.fetch_add(1, Ordering::Relaxed);
         let compiled = lowered.compile(domain)?;
-        Ok((domain, producer.insert(compiled.into_executable_function())))
+        Ok((domain, producer.insert(compiled.into_executable())))
     }
 
     /// Resolves this dispatcher's domain before producing or executing any specialization.
@@ -2169,7 +2151,7 @@ pub(crate) mod tests {
                 lambda %0:f64[] .
                 in (%0)"},
         );
-        let executable = staged.lower(&domain).unwrap().compile(&domain).unwrap().into_executable_function();
+        let executable = staged.lower(&domain).unwrap().compile(&domain).unwrap().into_executable();
         assert_eq!(
             executable.execute(&domain, (vec![Vec::new(), Vec::new()], Array::scalar(3.0).unwrap())).unwrap(),
             (vec![Vec::new(), Vec::new(), Vec::new()], Array::scalar(3.0).unwrap()),
@@ -2194,11 +2176,11 @@ pub(crate) mod tests {
         let second = staged.lower(&domain).unwrap().compile(&domain).unwrap();
 
         assert_eq!(
-            first.executable_function().execute(&domain, Array::scalar(2.0).unwrap()).unwrap(),
+            first.executable().execute(&domain, Array::scalar(2.0).unwrap()).unwrap(),
             Array::scalar(-2.0).unwrap()
         );
         assert_eq!(
-            second.executable_function().execute(&domain, Array::scalar(4.0).unwrap()).unwrap(),
+            second.executable().execute(&domain, Array::scalar(4.0).unwrap()).unwrap(),
             Array::scalar(-4.0).unwrap()
         );
         assert_eq!(domain.compilation_count(), 1);
@@ -2208,8 +2190,8 @@ pub(crate) mod tests {
     #[test]
     fn test_executable_function_with_compiled_program() {
         let domain = TestDomain::new();
-        let identity = compile_from_one_call_site(&domain, false).into_executable_function();
-        let negate = compile_from_one_call_site(&domain, true).into_executable_function();
+        let identity = compile_from_one_call_site(&domain, false).into_executable();
+        let negate = compile_from_one_call_site(&domain, true).into_executable();
         let replaced = identity.with_compiled_program(
             Arc::new(TestCompiledProgram {
                 program: negate.compiled_program().program.clone(),
@@ -2231,7 +2213,7 @@ pub(crate) mod tests {
         assert_send_and_sync::<ExecutableFunction<TestDomain, ArrayType, ArrayType>>();
 
         let domain = TestDomain::new();
-        let executable = compile_from_one_call_site(&domain, true).into_executable_function();
+        let executable = compile_from_one_call_site(&domain, true).into_executable();
         let second = executable.clone();
         let first_domain = domain.clone();
         let second_domain = domain.clone();
@@ -2256,7 +2238,7 @@ pub(crate) mod tests {
         .unwrap();
         let compiled = staged.lower(&domain).unwrap().compile(&domain).unwrap();
 
-        assert_eq!(compiled.executable_function().execute(&domain, ()).unwrap(), Array::scalar(7.0).unwrap());
+        assert_eq!(compiled.executable().execute(&domain, ()).unwrap(), Array::scalar(7.0).unwrap());
         assert_eq!(compiled.source_program().captures(), &[Array::scalar(7.0).unwrap()]);
         assert!(compiled.staged().input_types().is_empty());
         assert_eq!(compiled.lowered().output_types(), &[ArrayType::scalar(DataType::F64)]);
@@ -2294,18 +2276,15 @@ pub(crate) mod tests {
         )
         .unwrap();
         let compiled = staged.lower(&domain).unwrap().compile(&domain).unwrap();
-        let executable = compiled.into_executable_function();
+        let executable = compiled.into_executable();
 
         // The runtime handle outlives the transform metadata and still supplies its captures on every call.
         assert_eq!(executable.captures(), &[Array::scalar(7.0).unwrap()]);
         assert!(executable.input_types().is_empty());
         assert_eq!(executable.output_types(), &[ArrayType::scalar(DataType::F64)]);
         assert_eq!(executable.execute(&domain, ()).unwrap(), Array::scalar(7.0).unwrap());
-        assert_eq!(executable.validate_flat_input_count(&[]), Ok(()));
-        assert_eq!(
-            executable.validate_flat_input_count(&[Array::scalar(1.0).unwrap()]),
-            Err(ProgramError::InvalidInputCount { expected: 0, actual: 1 }),
-        );
+        assert_eq!(executable.validate_input_count(0), Ok(()));
+        assert_eq!(executable.validate_input_count(1), Err(ProgramError::InvalidInputCount { expected: 0, actual: 1 }),);
         assert_eq!(
             executable.inputs_with_captures(vec![Array::scalar(1.0).unwrap()]),
             vec![Array::scalar(7.0).unwrap(), Array::scalar(1.0).unwrap()],

@@ -473,13 +473,10 @@ mod tests {
         let identity = compile_from_one_call_site(&domain, false);
         let negate = compile_from_one_call_site(&domain, true);
         assert_eq!(
-            identity.executable_function().execute(&domain, Array::scalar(3.0).unwrap()),
+            identity.executable().execute(&domain, Array::scalar(3.0).unwrap()),
             Ok(Array::scalar(3.0).unwrap())
         );
-        assert_eq!(
-            negate.executable_function().execute(&domain, Array::scalar(3.0).unwrap()),
-            Ok(Array::scalar(-3.0).unwrap())
-        );
+        assert_eq!(negate.executable().execute(&domain, Array::scalar(3.0).unwrap()), Ok(Array::scalar(-3.0).unwrap()));
         assert_eq!(domain.compilation_count(), 2);
     }
 
@@ -559,7 +556,7 @@ mod tests {
         // The staged function runs on fresh tracers and is compiled through the domain recovered from its inputs.
         assert_eq!(domain.compilation_count(), 0);
         let compiled = staged.lower(&domain).unwrap().compile(&domain).unwrap();
-        assert_eq!(compiled.executable_function().execute(&domain, domain.scalar(3.0)), Ok(domain.scalar(-3.0)));
+        assert_eq!(compiled.executable().execute(&domain, domain.scalar(3.0)), Ok(domain.scalar(-3.0)));
         assert_eq!(domain.compilation_count(), 1);
     }
 
