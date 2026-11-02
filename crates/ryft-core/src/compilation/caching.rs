@@ -1796,12 +1796,7 @@ mod tests {
             Ok((Arc::new(TestCompiledProgram(0)), program.clone()))
         }
 
-        fn execute(
-            &self,
-            _program: &Self::CompiledProgram,
-            _input_types: &[ArrayType],
-            _arguments: Vec<Array>,
-        ) -> Result<Vec<Array>, Self::Error> {
+        fn execute(&self, _program: &Self::CompiledProgram, _inputs: Vec<Array>) -> Result<Vec<Array>, Self::Error> {
             Ok(Vec::new())
         }
     }

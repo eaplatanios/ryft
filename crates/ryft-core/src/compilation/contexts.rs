@@ -16,7 +16,7 @@ use crate::programs::ProgramError;
 ///      [`StagedFunction::lower`](crate::StagedFunction::lower).
 ///   3. [`Self::compile`] compiles a [`Self::LoweredProgram`] into a [`Self::CompiledProgram`], typically through
 ///      [`LoweredFunction::compile`](crate::LoweredFunction::compile).
-///   4. [`Self::execute`] executes a [`Self::CompiledProgram`] on flat runtime arguments, typically through
+///   4. [`Self::execute`] executes a [`Self::CompiledProgram`] on flat runtime inputs, typically through
 ///      [`ExecutableFunction::call`].
 ///
 /// Core owns staging and everything that depends on the structured input and output types of a function. It traces
@@ -80,20 +80,19 @@ pub trait CompilationDomain: Domain<Constant: CaptureConstant> + Clone {
         program: &Self::LoweredProgram,
     ) -> Result<(Arc<Self::CompiledProgram>, Vec<Self::Type>), Self::Error>;
 
-    /// Executes a compiled program on flat runtime `arguments` and returns its flat outputs. Callers typically use
-    /// [`ExecutableFunction::call`] rather than calling this function directly.
+    /// Executes a compiled program on flat runtime `inputs` and returns its flat outputs. Callers typically use
+    /// [`ExecutableFunction::call`] rather than calling this function directly. The backend retains any declaration
+    /// metadata it needs in [`Self::CompiledProgram`] and validates inputs according to its execution contract.
     ///
     /// # Parameters
     ///
     ///   - `program`: Compiled program to execute.
-    ///   - `input_types`: Flat declared public input types of the compiled function, excluding captures.
-    ///   - `arguments`: Runtime captures of the compiled function followed by exactly one public input per entry
-    ///     of `input_types`, in the `[captures..., public inputs...]` order of lifted programs.
+    ///   - `inputs`: Runtime captures of the compiled function followed by its public inputs, in the
+    ///     `[captures..., public inputs...]` order of lifted programs.
     fn execute(
         &self,
         program: &Self::CompiledProgram,
-        input_types: &[Self::Type],
-        arguments: Vec<Self::Value>,
+        inputs: Vec<Self::Value>,
     ) -> Result<Vec<Self::Value>, Self::Error>;
 }
 
@@ -110,8 +109,7 @@ pub trait StatefulCompilationDomain: CompilationDomain {
     fn execute_statefully_async(
         &self,
         program: &Self::CompiledProgram,
-        input_types: &[Self::Type],
-        arguments: Vec<Self::Value>,
+        inputs: Vec<Self::Value>,
     ) -> ReferenceExecution<Vec<Self::Value>, Self::Error>;
 }
 

@@ -839,7 +839,7 @@ impl<C: CompilationDomain, Input: Parameterized<C::Type>, Output: Parameterized<
     /// an equivalent executable, such as one deserialized from a persistent cache or recompiled with profile guidance.
     ///
     /// This function does not check compatibility, so the caller must establish it first. `program` must accept the
-    /// same `[captures..., public inputs...]` arguments as the current program, and `output_types` must be its
+    /// same `[captures..., public inputs...]` inputs as the current program, and `output_types` must be its
     /// effective flat output types, with one entry per leaf of the retained output structure. A backend that breaks
     /// these invariants produces a function whose calls fail or return values of unexpected types. The existing
     /// function and its clones are unaffected, because this creates new shared state.
@@ -902,15 +902,15 @@ impl<C: CompilationDomain, Input: Parameterized<C::Type>, Output: Parameterized<
         Ok(())
     }
 
-    /// Prepends the retained runtime captures to the flat public `inputs`, producing the complete flat argument
+    /// Prepends the retained runtime captures to the flat public `inputs`, producing the complete flat input
     /// list in the `[captures..., public inputs...]` order every execution expects.
-    pub fn arguments_with_captures(&self, inputs: Vec<C::Value>) -> Vec<C::Value> {
+    pub fn inputs_with_captures(&self, inputs: Vec<C::Value>) -> Vec<C::Value> {
         if self.state.captures.is_empty() {
             return inputs;
         }
-        let mut arguments = self.state.captures.to_vec();
-        arguments.extend(inputs);
-        arguments
+        let mut runtime_inputs = self.state.captures.to_vec();
+        runtime_inputs.extend(inputs);
+        runtime_inputs
     }
 }
 
@@ -943,8 +943,8 @@ where
     /// Functions that bind external mutable references must be executed through [`Self::call_statefully`] or
     /// [`Self::call_statefully_async`] instead.
     pub fn call(&self, domain: &C, inputs: Input::To<C::Value>) -> Result<Output::To<C::Value>, C::Error> {
-        let arguments = self.arguments(inputs)?;
-        let outputs = domain.execute(self.compiled_program(), self.input_types(), arguments)?;
+        let inputs = self.prepare_inputs(inputs)?;
+        let outputs = domain.execute(self.compiled_program(), inputs)?;
         self.reconstruct_outputs(outputs).map_err(C::Error::from)
     }
 
@@ -961,12 +961,12 @@ where
     where
         C: StatefulCompilationDomain,
     {
-        let arguments = match self.arguments(inputs) {
-            Ok(arguments) => arguments,
+        let inputs = match self.prepare_inputs(inputs) {
+            Ok(inputs) => inputs,
             Err(error) => return ReferenceExecution::ready(Err(error.into())),
         };
         domain
-            .execute_statefully_async(self.compiled_program(), self.input_types(), arguments)
+            .execute_statefully_async(self.compiled_program(), inputs)
             .and_then(|outputs| self.reconstruct_outputs(outputs).map_err(C::Error::from))
     }
 
@@ -980,10 +980,10 @@ where
     }
 
     /// Flattens the structured runtime `inputs`, validates their count, and prepends the runtime captures to them.
-    fn arguments(&self, inputs: Input::To<C::Value>) -> Result<Vec<C::Value>, ProgramError> {
+    fn prepare_inputs(&self, inputs: Input::To<C::Value>) -> Result<Vec<C::Value>, ProgramError> {
         let inputs = inputs.into_parameters().collect::<Vec<_>>();
         self.validate_flat_input_count(&inputs)?;
-        Ok(self.arguments_with_captures(inputs))
+        Ok(self.inputs_with_captures(inputs))
     }
 }
 
@@ -1191,7 +1191,7 @@ const DEFAULT_JIT_CACHE_CAPACITY: usize = 256;
 /// The owning [`CompiledFunctionDispatcherState`] fixes the closure identity, lexical captures, domain instance, and
 /// immutable compilation options. This token stores none of them and only makes the key and artifact families of the
 /// descriptor coherent at the type level. If any of those owner semantics becomes variable per call, it must enter the
-/// transform arguments instead.
+/// transform inputs instead.
 struct JitCompilationSource<C, StaticParameters, Input, Output>(
     PhantomData<fn() -> (C, StaticParameters, Input, Output)>,
 );
@@ -1900,13 +1900,9 @@ mod tests {
             Ok((program, output_types))
         }
 
-        fn execute(
-            &self,
-            program: &Self::CompiledProgram,
-            input_types: &[ArrayType],
-            arguments: Vec<Array>,
-        ) -> Result<Vec<Array>, Self::Error> {
-            let inputs = &arguments[arguments.len() - input_types.len()..];
+        fn execute(&self, program: &Self::CompiledProgram, inputs: Vec<Array>) -> Result<Vec<Array>, Self::Error> {
+            let input_types = program.program.input_types();
+            check_count!("input", inputs, input_types.len(), ProgramError);
             for (declared, actual) in input_types.iter().zip(inputs.iter().map(Typed::r#type)) {
                 if !declared.is_refined_by(actual.as_ref()) {
                     return Err(ProgramError::InvalidArgument {
@@ -1915,7 +1911,7 @@ mod tests {
                 }
             }
             program.program.interpret_with(
-                arguments,
+                inputs,
                 |_, capture| {
                     Err(ProgramError::MalformedProgram(format!(
                         "lifted test program retained capture {}",
@@ -2017,11 +2013,10 @@ mod tests {
         fn execute(
             &self,
             program: &Self::CompiledProgram,
-            _input_types: &[ArrayIrType],
-            arguments: Vec<ArrayIrValue<Array>>,
+            inputs: Vec<ArrayIrValue<Array>>,
         ) -> Result<Vec<ArrayIrValue<Array>>, ProgramError> {
             program.interpret_with(
-                arguments,
+                inputs,
                 |_, capture| {
                     Err(ProgramError::MalformedProgram(format!(
                         "retained-JIT test program retained capture {}",
@@ -2347,7 +2342,7 @@ mod tests {
             Err(ProgramError::InvalidInputCount { expected: 0, actual: 1 }),
         );
         assert_eq!(
-            executable.arguments_with_captures(vec![Array::scalar(1.0).unwrap()]),
+            executable.inputs_with_captures(vec![Array::scalar(1.0).unwrap()]),
             vec![Array::scalar(7.0).unwrap(), Array::scalar(1.0).unwrap()],
         );
     }
@@ -2670,7 +2665,7 @@ mod tests {
     #[test]
     fn test_compiled_function_dispatcher_call_flattens_map_inputs_deterministically() {
         // Map-like containers flatten in key order, so two runtime maps with the same keys must produce one
-        // specialization regardless of construction order, and replay must bind flat arguments to the same leaves.
+        // specialization regardless of construction order, and replay must bind flat inputs to the same leaves.
         let domain = TestDomain::new();
         let function: CompiledFunctionDispatcher<TestDomain, _, (), BTreeMap<&'static str, ArrayType>, ArrayType> =
             jit(&domain, |(), inputs: BTreeMap<&'static str, CompilationTracer<TestDomain>>| {
