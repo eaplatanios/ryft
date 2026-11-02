@@ -128,8 +128,9 @@
 //!
 //! [`CompilationContext`] is the backend-artifact cache shared by every compilation using the same domain handle, and
 //! it resolves the domain's [`CompilationCacheDomain::CacheKey`] through memory, same-key single-flight coordination,
-//! optional persistent storage, optional distributed exchange, and finally backend compilation. Refer to
-//! [`CompilationContext`] for the rendered tier diagram.
+//! optional persistent storage, optional distributed exchange, and finally backend compilation. Backends own their
+//! contexts, so users configure these tiers when they construct a backend handle. Refer to [`CompilationContext`] for
+//! the rendered tier diagram and an example that configures every tier.
 //!
 //! Misses for the same key are single flight, while different keys may compile concurrently. [`DiskCache`] provides
 //! optional checksummed persistent storage, and [`CompilationArtifactExchange`] optionally shares serialized artifacts

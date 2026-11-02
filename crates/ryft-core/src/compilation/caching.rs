@@ -1,13 +1,3 @@
-//! Shared caching of compiled programs.
-//!
-//! [`CompilationContext`] is the cache of compiled programs that caching backends (i.e., [`CompilationCacheDomain`]s)
-//! share across compilations. It keeps an in-memory LRU tier, coordinates misses for the same key so that each program
-//! is restored or compiled once, and resolves the remaining misses through the optional persistent tier and
-//! distributed artifact exchange before it falls back to backend compilation. [`DiskCache`] implements the persistent
-//! tier, while [`CompilationCacheStatistics`] and [`CompilationEvent`]s report the activity of every tier.
-
-// TODO(eaplatanios): Review this module.
-
 use std::collections::hash_map::Entry;
 use std::collections::{HashMap, VecDeque};
 use std::fs::{self, File};
@@ -32,19 +22,20 @@ use crate::compilation::exchange::{
 use crate::compilation::functions::accumulate_duration;
 use crate::programs::ProgramError;
 
-/// Default capacity of the in-memory tier of a [`CompilationContext`]. Use [`CompilationContext::with_capacity`] when
-/// a workload needs a different bound.
+/// Default capacity of the in-memory cache tier of a [`CompilationContext`]. Use [`CompilationContext::with_capacity`]
+/// when a workload needs a different bound.
 const DEFAULT_CACHE_CAPACITY: usize = 8192;
 
-/// Default number of structured compilation events retained for diagnostics.
+/// Default number of structured compilation events retained for diagnostics, which disables retention until
+/// [`CompilationContext::with_event_capacity`] enables it.
 const DEFAULT_EVENT_CAPACITY: usize = 0;
 
-/// Cache tier or lifecycle phase that produced a [`CompilationEvent`].
-///
-/// Events are emitted only by [`CompilationContext`], so the variants cover exactly the tiers that the shared cache of
-/// compiled programs coordinates.
+// TODO(eaplatanios): Review from here onwards.
+
+/// Cache tier that produced a [`CompilationEvent`]. Only [`CompilationContext`] emits events, so the variants cover
+/// exactly the tiers that it coordinates, with backend compilation as the final tier.
 #[derive(Copy, Clone, Debug, PartialEq, Eq)]
-pub enum CompilationCacheLevel {
+pub enum CompilationCacheTier {
     /// In-memory cache of compiled programs, local to the process.
     Memory,
 
@@ -58,7 +49,7 @@ pub enum CompilationCacheLevel {
     Backend,
 }
 
-/// Outcome of one compilation lifecycle or cache operation.
+/// Outcome of one cache tier operation reported by a [`CompilationEvent`].
 #[derive(Copy, Clone, Debug, PartialEq, Eq)]
 pub enum CompilationCacheOutcome {
     /// A reusable entry was found.
@@ -108,11 +99,13 @@ pub enum CompilationMissReason {
     ProducerFailed,
 }
 
-/// Structured diagnostic event for one compilation lifecycle or cache operation.
+/// Structured diagnostic event for one cache tier operation of a [`CompilationContext`]. Contexts retain recent events
+/// when configured via [`CompilationContext::with_event_capacity`] and report every event to the hook installed via
+/// [`CompilationContext::with_event_reporter`].
 #[derive(Copy, Clone, Debug, PartialEq, Eq)]
 pub struct CompilationEvent {
-    /// Lifecycle phase or cache tier that emitted this event.
-    pub level: CompilationCacheLevel,
+    /// Cache tier that emitted this event.
+    pub tier: CompilationCacheTier,
 
     /// Result of the operation.
     pub outcome: CompilationCacheOutcome,
@@ -124,25 +117,31 @@ pub struct CompilationEvent {
     pub miss_reason: Option<CompilationMissReason>,
 }
 
-/// Snapshot of the activity of one [`CompilationContext`].
+/// Snapshot of the activity of one [`CompilationContext`] across its memory, persistent, exchange, and backend
+/// compilation tiers. The statistics accumulate from construction or from the latest
+/// [`CompilationContext::clear_statistics`] call and are unaffected by [`CompilationContext::clear_cache`]. Each
+/// field is read independently, so a snapshot taken during concurrent compilations need not correspond to a single
+/// point in time.
+///
+/// Every attempt of a lookup counts as exactly one of [`Self::memory_hits`], [`Self::waits`], and [`Self::misses`], and
+/// a waiter whose producer fails retries and counts again. Durations are host durations summed over all threads, so
+/// concurrent compilations can make them exceed the elapsed wall-clock time.
 #[derive(Copy, Clone, Debug, Default, PartialEq, Eq)]
 pub struct CompilationCacheStatistics {
     /// Lookups served directly by the in-memory LRU cache.
     pub memory_hits: u64,
 
-    /// Lookups restored from a validated persistent cache entry.
-    pub persistent_hits: u64,
+    /// Same key lookups that waited for an in-flight producer.
+    pub waits: u64,
 
     /// Lookups that became the single producer for a missing key.
     pub misses: u64,
 
-    /// Backend producer closures invoked after every cache tier missed.
-    pub compilations: u64,
+    /// Lookups restored from a validated persistent cache entry.
+    pub persistent_hits: u64,
 
-    /// Same key lookups that waited for an in-flight producer.
-    pub waits: u64,
-
-    /// Persistent read, write, serialization, or deserialization failures degraded to misses.
+    /// Persistent read, write, serialization, and deserialization failures, none of which fails a
+    /// compilation.
     pub persistent_errors: u64,
 
     /// Lookups restored from a distributed artifact exchange.
@@ -157,17 +156,20 @@ pub struct CompilationCacheStatistics {
     /// Distributed exchange, serialization, or deserialization failures.
     pub exchange_errors: u64,
 
-    /// Distributed waits that completed without an artifact before their deadline.
+    /// Exchange preflights and follower waits that reached their deadline or ended without an artifact.
     pub exchange_timeouts: u64,
 
     /// Distributed misses or failures that fell back to local compilation.
     pub exchange_fallbacks: u64,
 
-    /// Total host duration spent in persistent lookups and deserialization.
-    pub persistent_lookup_duration: Duration,
+    /// Backend producer closures invoked after every cache tier missed.
+    pub compilations: u64,
 
     /// Total host duration spent in in-memory lookups and same key waits.
     pub memory_lookup_duration: Duration,
+
+    /// Total host duration spent in persistent lookups and deserialization.
+    pub persistent_lookup_duration: Duration,
 
     /// Total host duration spent in exchange preflights, waits, receptions, and deserialization.
     pub exchange_duration: Duration,
@@ -182,17 +184,14 @@ struct CompilationCacheStatisticsAccumulator {
     /// Counter underlying [`CompilationCacheStatistics::memory_hits`].
     memory_hits: AtomicU64,
 
-    /// Counter underlying [`CompilationCacheStatistics::persistent_hits`].
-    persistent_hits: AtomicU64,
+    /// Counter underlying [`CompilationCacheStatistics::waits`].
+    waits: AtomicU64,
 
     /// Counter underlying [`CompilationCacheStatistics::misses`].
     misses: AtomicU64,
 
-    /// Counter underlying [`CompilationCacheStatistics::compilations`].
-    compilations: AtomicU64,
-
-    /// Counter underlying [`CompilationCacheStatistics::waits`].
-    waits: AtomicU64,
+    /// Counter underlying [`CompilationCacheStatistics::persistent_hits`].
+    persistent_hits: AtomicU64,
 
     /// Counter underlying [`CompilationCacheStatistics::persistent_errors`].
     persistent_errors: AtomicU64,
@@ -215,11 +214,14 @@ struct CompilationCacheStatisticsAccumulator {
     /// Counter underlying [`CompilationCacheStatistics::exchange_fallbacks`].
     exchange_fallbacks: AtomicU64,
 
-    /// Nanoseconds underlying [`CompilationCacheStatistics::persistent_lookup_duration`].
-    persistent_lookup_nanoseconds: AtomicU64,
+    /// Counter underlying [`CompilationCacheStatistics::compilations`].
+    compilations: AtomicU64,
 
     /// Nanoseconds underlying [`CompilationCacheStatistics::memory_lookup_duration`].
     memory_lookup_nanoseconds: AtomicU64,
+
+    /// Nanoseconds underlying [`CompilationCacheStatistics::persistent_lookup_duration`].
+    persistent_lookup_nanoseconds: AtomicU64,
 
     /// Nanoseconds underlying [`CompilationCacheStatistics::exchange_duration`].
     exchange_nanoseconds: AtomicU64,
@@ -229,15 +231,13 @@ struct CompilationCacheStatisticsAccumulator {
 }
 
 impl CompilationCacheStatisticsAccumulator {
-    /// Returns a snapshot of the counters. The counters are read independently, so a snapshot taken during concurrent
-    /// compilations need not correspond to a single point in time.
+    /// Returns a snapshot of the counters (refer to [`CompilationCacheStatistics`] for its consistency guarantees).
     fn snapshot(&self) -> CompilationCacheStatistics {
         CompilationCacheStatistics {
             memory_hits: self.memory_hits.load(Ordering::Relaxed),
-            persistent_hits: self.persistent_hits.load(Ordering::Relaxed),
-            misses: self.misses.load(Ordering::Relaxed),
-            compilations: self.compilations.load(Ordering::Relaxed),
             waits: self.waits.load(Ordering::Relaxed),
+            misses: self.misses.load(Ordering::Relaxed),
+            persistent_hits: self.persistent_hits.load(Ordering::Relaxed),
             persistent_errors: self.persistent_errors.load(Ordering::Relaxed),
             exchange_hits: self.exchange_hits.load(Ordering::Relaxed),
             exchange_waits: self.exchange_waits.load(Ordering::Relaxed),
@@ -245,10 +245,11 @@ impl CompilationCacheStatisticsAccumulator {
             exchange_errors: self.exchange_errors.load(Ordering::Relaxed),
             exchange_timeouts: self.exchange_timeouts.load(Ordering::Relaxed),
             exchange_fallbacks: self.exchange_fallbacks.load(Ordering::Relaxed),
+            compilations: self.compilations.load(Ordering::Relaxed),
+            memory_lookup_duration: Duration::from_nanos(self.memory_lookup_nanoseconds.load(Ordering::Relaxed)),
             persistent_lookup_duration: Duration::from_nanos(
                 self.persistent_lookup_nanoseconds.load(Ordering::Relaxed),
             ),
-            memory_lookup_duration: Duration::from_nanos(self.memory_lookup_nanoseconds.load(Ordering::Relaxed)),
             exchange_duration: Duration::from_nanos(self.exchange_nanoseconds.load(Ordering::Relaxed)),
             compilation_duration: Duration::from_nanos(self.compilation_nanoseconds.load(Ordering::Relaxed)),
         }
@@ -257,10 +258,9 @@ impl CompilationCacheStatisticsAccumulator {
     /// Resets every counter to zero.
     fn clear(&self) {
         self.memory_hits.store(0, Ordering::Relaxed);
-        self.persistent_hits.store(0, Ordering::Relaxed);
-        self.misses.store(0, Ordering::Relaxed);
-        self.compilations.store(0, Ordering::Relaxed);
         self.waits.store(0, Ordering::Relaxed);
+        self.misses.store(0, Ordering::Relaxed);
+        self.persistent_hits.store(0, Ordering::Relaxed);
         self.persistent_errors.store(0, Ordering::Relaxed);
         self.exchange_hits.store(0, Ordering::Relaxed);
         self.exchange_waits.store(0, Ordering::Relaxed);
@@ -268,8 +268,9 @@ impl CompilationCacheStatisticsAccumulator {
         self.exchange_errors.store(0, Ordering::Relaxed);
         self.exchange_timeouts.store(0, Ordering::Relaxed);
         self.exchange_fallbacks.store(0, Ordering::Relaxed);
-        self.persistent_lookup_nanoseconds.store(0, Ordering::Relaxed);
+        self.compilations.store(0, Ordering::Relaxed);
         self.memory_lookup_nanoseconds.store(0, Ordering::Relaxed);
+        self.persistent_lookup_nanoseconds.store(0, Ordering::Relaxed);
         self.exchange_nanoseconds.store(0, Ordering::Relaxed);
         self.compilation_nanoseconds.store(0, Ordering::Relaxed);
     }
@@ -323,103 +324,6 @@ impl<P> InFlightCompilation<P> {
     }
 }
 
-/// Artifact exchange that participates in one compilation, together with the persistent key that addresses the
-/// exchanged artifact.
-#[derive(Copy, Clone)]
-struct ActiveExchange<'o> {
-    /// Exchange transport.
-    exchange: &'o dyn CompilationArtifactExchange,
-
-    /// Stable persistent key bytes that address the exchanged artifact.
-    key: &'o [u8],
-
-    /// Follower deadline of the configured exchange policy.
-    timeout: Duration,
-}
-
-impl ActiveExchange<'_> {
-    /// Returns whether this process is the exchange leader, which compiles and publishes artifacts.
-    fn is_leader(self) -> bool {
-        self.exchange.process_index() == 0
-    }
-}
-
-/// Process-local cache of compiled programs, generic over the [`CompilationCacheDomain`] backend.
-///
-/// Construct one [`CompilationContext`] per backend handle at program start and reuse it across compilation requests
-/// and any backend-specific helpers that look up entries in the cache.
-///
-/// The cache is keyed by the structural [`CompilationCacheDomain::CacheKey`] of the domain. Equality of keys, rather
-/// than equality of their hashes, guarantees that distinct programs never collide. On a hit, the cached program is
-/// returned without invoking the producer closure. On a miss, the producer runs and its result is inserted.
-///
-/// The in-memory tier uses LRU eviction with a default capacity of `8192` entries, which
-/// [`CompilationContext::with_capacity`] overrides.
-///
-/// An optional [`DiskCache`] tier is configured via [`CompilationContext::with_disk_cache`]. When present, the disk
-/// tier is consulted between the in-memory tier and the producer closure. The cache uses
-/// [`CompilationCacheDomain::serialize_program`] and [`CompilationCacheDomain::deserialize_program`] to persist and
-/// restore programs, and any error from either function is treated as a cache miss for that entry. An optional
-/// [`CompilationArtifactExchange`] may provide the next serialized tier according to the configured
-/// [`CompilationArtifactExchangePolicy`].
-///
-/// # Cache Resolution
-///
-/// ```mermaid
-/// %%{init: {"themeCSS": ".nodeLabel code { white-space: nowrap !important; }"}}%%
-/// flowchart TD
-///   request["Compile Request and Domain Cache Key"] --> memory["1. In-Memory LRU"]
-///   memory -->|"hit"| shared["Shared Compiled Program in &lt;code&gt;Arc&lt;/code&gt;"]
-///   memory -->|"miss"| flight["2. Same-Key Single-Flight Election"]
-///   flight -->|"another producer"| wait["Wait and Retry Memory Lookup"]
-///   wait --> memory
-///   publish["Publish Successful Artifact"]
-///   flight -->|"elected producer"| disk["3. Optional Persistent Disk Cache"]
-///   disk -->|"hit and deserialize"| publish
-///   disk -->|"miss or disabled"| exchange["4. Optional Distributed Artifact Exchange"]
-///   exchange -->|"hit and deserialize"| publish
-///   exchange -->|"miss or unavailable"| backend["5. Backend Compilation"]
-///   backend --> publish
-///   publish --> memory_insert["Insert into In-Memory LRU"]
-///   memory_insert --> shared
-///   publish -.->|"best-effort serialization"| disk_store["Store in Persistent Disk Cache"]
-///   publish -.->|"policy-controlled publication"| exchange_store["Publish through Artifact Exchange"]
-/// ```
-///
-/// Misses for the same key coordinate one backend producer, while requests for different keys remain concurrent.
-/// Every successful source publishes to memory, while persistent writes are best effort and exchange publication is
-/// controlled by the configured policy.
-#[cfg_attr(doc, ryft_macros::mermaid)]
-pub struct CompilationContext<C: CompilationCacheDomain> {
-    /// In-memory LRU cache keyed by the structural [`CompilationCacheDomain::CacheKey`] of the domain.
-    programs: Mutex<LruCache<C::CacheKey, Arc<C::CompiledProgram>>>,
-
-    /// Producer coordination for each key. Entries exist only while a cache miss is being restored or compiled, so
-    /// unrelated keys never wait for the backend work of one another.
-    in_flight: Mutex<HashMap<C::CacheKey, Arc<InFlightCompilation<C::CompiledProgram>>>>,
-
-    /// Optional disk-backed persistent tier.
-    disk_cache: Option<DiskCache>,
-
-    /// Optional exchange for sharing serialized programs across processes.
-    artifact_exchange: Option<Arc<dyn CompilationArtifactExchange>>,
-
-    /// Distributed exchange behavior, which is disabled by default to preserve local compilation semantics.
-    artifact_exchange_policy: CompilationArtifactExchangePolicy,
-
-    /// Lock-free counters used for verification and operational observability.
-    statistics: CompilationCacheStatisticsAccumulator,
-
-    /// Bounded history of structured events used for diagnostics without a logging dependency.
-    recent_events: Mutex<VecDeque<CompilationEvent>>,
-
-    /// Maximum number of entries retained in `recent_events`, where zero disables retention.
-    event_capacity: usize,
-
-    /// Optional reporting hook invoked after an event is retained.
-    event_reporter: Option<Arc<dyn Fn(&CompilationEvent) + Send + Sync>>,
-}
-
 /// Elected producer for one missing cache key.
 ///
 /// Dropping a producer without calling [`Self::finish`] (e.g., when compilation fails or panics) removes its in-flight
@@ -467,6 +371,142 @@ impl<C: CompilationCacheDomain> Drop for InFlightProducer<'_, C> {
     }
 }
 
+/// Artifact exchange that participates in one compilation, together with the persistent key that addresses the
+/// exchanged artifact.
+#[derive(Copy, Clone)]
+struct ActiveExchange<'o> {
+    /// Exchange transport.
+    exchange: &'o dyn CompilationArtifactExchange,
+
+    /// Stable persistent key bytes that address the exchanged artifact.
+    key: &'o [u8],
+
+    /// Follower deadline of the configured exchange policy.
+    timeout: Duration,
+}
+
+impl ActiveExchange<'_> {
+    /// Returns whether this process is the exchange leader, which compiles and publishes artifacts.
+    fn is_leader(self) -> bool {
+        self.exchange.process_index() == 0
+    }
+}
+
+/// Process-local cache of compiled programs, generic over the [`CompilationCacheDomain`] backend.
+///
+/// Construct one [`CompilationContext`] per backend handle at program start and reuse it across compilations and any
+/// backend-specific helpers that look up entries in the cache.
+///
+/// The cache is keyed by the structural [`CompilationCacheDomain::CacheKey`] of the domain. Equality of keys, rather
+/// than equality of their hashes, guarantees that distinct programs never collide. On a hit, the cached program is
+/// returned without invoking the producer closure. On a miss, the remaining tiers restore the program or the producer
+/// compiles it, and the result is inserted.
+///
+/// The in-memory tier uses LRU eviction with a default capacity of `8192` entries, which
+/// [`CompilationContext::with_capacity`] overrides.
+///
+/// An optional [`DiskCache`] tier is attached via [`CompilationContext::with_disk_cache`] or
+/// [`CompilationContext::with_disk_cache_from_env`]. When present, the disk tier is consulted between the in-memory
+/// tier and the producer closure. The cache uses [`CompilationCacheDomain::serialize_program`] and
+/// [`CompilationCacheDomain::deserialize_program`] to persist and restore programs, and it records failures of either
+/// function and of the disk itself without failing the compilation. An optional [`CompilationArtifactExchange`] may
+/// provide the next serialized tier according to the configured [`CompilationArtifactExchangePolicy`].
+///
+/// # Cache Resolution
+///
+/// ```mermaid
+/// %%{init: {"themeCSS": ".nodeLabel code { white-space: nowrap !important; }"}}%%
+/// flowchart TD
+///   request["Domain Cache Key"] --> memory["1. In-Memory LRU"]
+///   memory -->|"hit"| shared["Shared Compiled Program in &lt;code&gt;Arc&lt;/code&gt;"]
+///   memory -->|"miss"| flight["2. Same-Key Single-Flight Election"]
+///   flight -->|"another producer"| wait["Wait and Retry Memory Lookup"]
+///   wait --> memory
+///   publish["Publish Successful Artifact"]
+///   flight -->|"elected producer"| disk["3. Optional Persistent Disk Cache"]
+///   disk -->|"hit and deserialize"| publish
+///   disk -->|"miss or disabled"| exchange["4. Optional Distributed Artifact Exchange"]
+///   exchange -->|"hit and deserialize"| publish
+///   exchange -->|"miss or unavailable"| backend["5. Backend Compilation"]
+///   backend --> publish
+///   publish --> memory_insert["Insert into In-Memory LRU"]
+///   memory_insert --> shared
+///   publish -.->|"best-effort serialization"| disk_store["Store in Persistent Disk Cache"]
+///   publish -.->|"policy-controlled publication"| exchange_store["Publish through Artifact Exchange"]
+/// ```
+///
+/// Misses for the same key coordinate one backend producer, while requests for different keys remain concurrent.
+/// Every successful source publishes to memory, while persistent writes are best effort and exchange publication is
+/// controlled by the configured policy.
+///
+/// # Example
+///
+/// Backends own their context (e.g., one per XLA session), so users configure these tiers when they construct a
+/// backend handle. The following function configures every tier of a context for any caching domain. It bounds the
+/// in-memory tier, persists only compilations that take at least ten seconds in a disk cache capped at 10 GiB, and
+/// prefers artifacts that the exchange leader publishes while still allowing followers to compile locally after a
+/// miss. It also retains the most recent events for diagnostics.
+///
+/// ```
+/// use std::path::Path;
+/// use std::sync::Arc;
+/// use std::time::Duration;
+///
+/// use ryft_core::{
+///     CompilationArtifactExchange, CompilationArtifactExchangePolicy, CompilationCacheDomain, CompilationContext,
+///     DiskCache,
+/// };
+///
+/// fn compilation_context<C: CompilationCacheDomain>(
+///     directory: &Path,
+///     exchange: Arc<dyn CompilationArtifactExchange>,
+/// ) -> std::io::Result<CompilationContext<C>> {
+///     let disk_cache = DiskCache::with_max_bytes(directory, 10 << 30)?
+///         .with_write_thresholds(Duration::from_secs(10), 0);
+///     let policy = CompilationArtifactExchangePolicy::PreferSharing {
+///         timeout: Duration::from_secs(60),
+///         fallback_to_local_compile: true,
+///     };
+///     Ok(CompilationContext::with_capacity(1024)
+///         .with_disk_cache(disk_cache)
+///         .with_artifact_exchange(exchange, policy)
+///         .with_event_capacity(64))
+/// }
+/// ```
+///
+/// Contexts never read the environment on their own. Use [`CompilationContext::with_disk_cache_from_env`] to opt into
+/// the disk cache that the [`DiskCache::ENV_VAR`] and [`DiskCache::MAX_BYTES_ENV_VAR`] environment variables configure.
+#[cfg_attr(doc, ryft_macros::mermaid)]
+pub struct CompilationContext<C: CompilationCacheDomain> {
+    /// In-memory LRU cache keyed by the structural [`CompilationCacheDomain::CacheKey`] of the domain.
+    programs: Mutex<LruCache<C::CacheKey, Arc<C::CompiledProgram>>>,
+
+    /// Producer coordination for each key. Entries exist only while a cache miss is being restored or compiled, so
+    /// unrelated keys never wait for the backend work of one another.
+    in_flight: Mutex<HashMap<C::CacheKey, Arc<InFlightCompilation<C::CompiledProgram>>>>,
+
+    /// Optional disk-backed persistent tier.
+    disk_cache: Option<DiskCache>,
+
+    /// Optional exchange for sharing serialized programs across processes.
+    artifact_exchange: Option<Arc<dyn CompilationArtifactExchange>>,
+
+    /// Distributed exchange behavior, which is disabled by default to preserve local compilation semantics.
+    artifact_exchange_policy: CompilationArtifactExchangePolicy,
+
+    /// Lock-free counters used for verification and operational observability.
+    statistics: CompilationCacheStatisticsAccumulator,
+
+    /// Bounded history of structured events used for diagnostics without a logging dependency.
+    recent_events: Mutex<VecDeque<CompilationEvent>>,
+
+    /// Maximum number of entries retained in `recent_events`, where zero disables retention.
+    event_capacity: usize,
+
+    /// Optional reporting hook invoked after an event is retained.
+    event_reporter: Option<Arc<dyn Fn(&CompilationEvent) + Send + Sync>>,
+}
+
 impl<C: CompilationCacheDomain> CompilationContext<C> {
     /// Creates a [`CompilationContext`] with the default cache capacity and no persistent or exchange tiers.
     #[inline]
@@ -491,23 +531,13 @@ impl<C: CompilationCacheDomain> CompilationContext<C> {
         }
     }
 
-    /// Attaches a [`DiskCache`] rooted at `directory` as a persistent tier behind the in-memory tier of this context.
-    /// On a memory miss, [`Self::get_or_compile`] consults the disk before invoking the supplied producer. Domains that
-    /// explicitly support persistence can then serialize sufficiently expensive compilations so that future processes
-    /// restart warm.
-    ///
-    /// # Errors
-    ///
-    /// Returns an [`std::io::Error`] only when the directory itself cannot be opened or created. Later persistent read,
-    /// write, or codec errors are recorded in [`Self::statistics`] and degrade to the in-memory path.
-    pub fn with_disk_cache(mut self, directory: impl Into<PathBuf>) -> std::io::Result<Self> {
-        self.disk_cache = Some(DiskCache::open(directory)?);
-        Ok(self)
-    }
-
-    /// Attaches an already configured [`DiskCache`], including any custom capacity or write thresholds.
+    /// Attaches `disk_cache` as a persistent tier behind the in-memory tier of this context, with its size cap and
+    /// write thresholds. On a memory miss, [`Self::get_or_compile`] consults the disk before invoking the supplied
+    /// producer. Domains that explicitly support persistence can then serialize sufficiently expensive compilations so
+    /// that future processes restart warm. Persistent read, write, and codec errors are recorded in
+    /// [`Self::statistics`] and degrade to the in-memory path.
     #[inline]
-    pub fn with_configured_disk_cache(mut self, disk_cache: DiskCache) -> Self {
+    pub fn with_disk_cache(mut self, disk_cache: DiskCache) -> Self {
         self.disk_cache = Some(disk_cache);
         self
     }
@@ -541,19 +571,17 @@ impl<C: CompilationCacheDomain> CompilationContext<C> {
         self
     }
 
-    /// Configures the number of structured events retained by [`Self::recent_events`].
-    ///
-    /// A zero capacity disables retention while leaving an installed reporter active.
+    /// Configures the number of structured events retained by [`Self::recent_events`]. A zero capacity disables
+    /// retention while leaving an installed reporter active. Events retained before this call are discarded.
     pub fn with_event_capacity(mut self, capacity: usize) -> Self {
         self.event_capacity = capacity;
         self.recent_events = Mutex::new(VecDeque::with_capacity(capacity));
         self
     }
 
-    /// Installs a reporting hook invoked for every structured compilation event.
-    ///
-    /// The hook runs without holding any internal cache or event buffer lock. It should return promptly so that it
-    /// does not add latency to compilations.
+    /// Installs a reporting hook invoked for every structured compilation event. The hook runs without holding any
+    /// internal cache or event buffer lock, and it should return promptly so that it does not add latency to
+    /// compilations.
     pub fn with_event_reporter(mut self, reporter: Arc<dyn Fn(&CompilationEvent) + Send + Sync>) -> Self {
         self.event_reporter = Some(reporter);
         self
@@ -577,12 +605,11 @@ impl<C: CompilationCacheDomain> CompilationContext<C> {
         self.artifact_exchange_policy
     }
 
-    /// Returns the number of compiled programs currently cached in the in-memory tier.
-    ///
-    /// This is mostly useful for telemetry and for tests that confirm that repeated compilations of the same
-    /// structural signature reuse the cached program instead of recompiling it.
+    /// Returns the number of compiled programs currently cached in the in-memory tier. This is mostly useful for
+    /// telemetry and for tests that confirm that repeated compilations of one cache key reuse the cached program
+    /// instead of recompiling it.
     #[inline]
-    pub fn cache_size(&self) -> usize {
+    pub fn program_count(&self) -> usize {
         self.programs.lock().expect("compilation cache mutex should not be poisoned").len()
     }
 
@@ -602,7 +629,8 @@ impl<C: CompilationCacheDomain> CompilationContext<C> {
             .collect()
     }
 
-    /// Removes every entry from the in-memory tier.
+    /// Removes every entry from the in-memory tier. Persistent entries, in-flight compilations, statistics, and
+    /// retained events are unaffected.
     #[inline]
     pub fn clear_cache(&self) {
         self.programs.lock().expect("compilation cache mutex should not be poisoned").clear();
@@ -622,16 +650,20 @@ impl<C: CompilationCacheDomain> CompilationContext<C> {
 
     /// Compiles `program` through the shared cache tiers. This function derives the exact structural key of `program`
     /// through [`CompilationCacheDomain::compilation_key`] and resolves it through [`Self::get_or_compile`], with
-    /// `produce` as the backend producer that is invoked only when every cache tier misses. Backends that need a
-    /// different policy can call [`Self::get_or_compile`] directly.
-    pub fn compile<Produce>(
+    /// `produce` as the backend producer that is invoked only when every cache tier misses. Backends that construct
+    /// cache keys differently can call [`Self::get_or_compile`] directly.
+    ///
+    /// # Errors
+    ///
+    /// Returns the errors of [`CompilationCacheDomain::compilation_key`] and every error of [`Self::get_or_compile`].
+    pub fn compile<F>(
         &self,
         domain: &C,
         program: &C::LoweredProgram,
-        produce: Produce,
+        produce: F,
     ) -> Result<Arc<C::CompiledProgram>, C::Error>
     where
-        Produce: FnOnce(&C::LoweredProgram) -> Result<C::CompiledProgram, C::Error>,
+        F: FnOnce(&C::LoweredProgram) -> Result<C::CompiledProgram, C::Error>,
     {
         let cache_key = domain.compilation_key(program)?;
         self.get_or_compile(domain, cache_key, || produce(program))
@@ -649,18 +681,28 @@ impl<C: CompilationCacheDomain> CompilationContext<C> {
     /// Persistent caching is consulted only when both a [`DiskCache`] is attached and
     /// [`CompilationCacheDomain::persistent_cache_key`] returns stable key bytes. Persistent I/O and codec failures are
     /// counted and degraded to misses.
-    pub fn get_or_compile<F: FnOnce() -> Result<C::CompiledProgram, C::Error>>(
+    ///
+    /// # Errors
+    ///
+    /// Returns the error of `produce` when this caller is the elected producer. When the artifact exchange policy
+    /// requires sharing, it also returns the exchange failures that prevent this process from obtaining or publishing
+    /// an artifact, including deserialization errors of received artifacts. Persistent tier failures never fail this
+    /// function.
+    pub fn get_or_compile<F>(
         &self,
         domain: &C,
         cache_key: C::CacheKey,
         produce: F,
-    ) -> Result<Arc<C::CompiledProgram>, C::Error> {
+    ) -> Result<Arc<C::CompiledProgram>, C::Error>
+    where
+        F: FnOnce() -> Result<C::CompiledProgram, C::Error>,
+    {
         loop {
             let lookup_start = Instant::now();
             if let Some(program) = self.cached_program(&cache_key) {
                 self.statistics.memory_hits.fetch_add(1, Ordering::Relaxed);
                 self.record_tier(
-                    CompilationCacheLevel::Memory,
+                    CompilationCacheTier::Memory,
                     CompilationCacheOutcome::Hit,
                     None,
                     lookup_start.elapsed(),
@@ -686,7 +728,7 @@ impl<C: CompilationCacheDomain> CompilationContext<C> {
                 let wait_start = Instant::now();
                 if let Some(program) = in_flight.wait() {
                     self.record_tier(
-                        CompilationCacheLevel::Memory,
+                        CompilationCacheTier::Memory,
                         CompilationCacheOutcome::Wait,
                         None,
                         wait_start.elapsed(),
@@ -705,7 +747,7 @@ impl<C: CompilationCacheDomain> CompilationContext<C> {
                 in_flight.finish(InFlightState::Ready(Arc::clone(&program)));
                 self.statistics.memory_hits.fetch_add(1, Ordering::Relaxed);
                 self.record_tier(
-                    CompilationCacheLevel::Memory,
+                    CompilationCacheTier::Memory,
                     CompilationCacheOutcome::Hit,
                     None,
                     lookup_start.elapsed(),
@@ -716,7 +758,7 @@ impl<C: CompilationCacheDomain> CompilationContext<C> {
 
             self.statistics.misses.fetch_add(1, Ordering::Relaxed);
             self.record_tier(
-                CompilationCacheLevel::Memory,
+                CompilationCacheTier::Memory,
                 CompilationCacheOutcome::Miss,
                 Some(CompilationMissReason::NotFound),
                 lookup_start.elapsed(),
@@ -737,12 +779,17 @@ impl<C: CompilationCacheDomain> CompilationContext<C> {
 
     /// Resolves a memory miss through the persistent tier, the artifact exchange, and finally backend compilation,
     /// publishing the result through `producer`.
-    fn restore_or_compile<F: FnOnce() -> Result<C::CompiledProgram, C::Error>>(
+    fn restore_or_compile<F>(
         &self,
         domain: &C,
         producer: InFlightProducer<'_, C>,
         produce: F,
-    ) -> Result<Arc<C::CompiledProgram>, C::Error> {
+    ) -> Result<Arc<C::CompiledProgram>, C::Error>
+    where
+        F: FnOnce() -> Result<C::CompiledProgram, C::Error>,
+    {
+        // A disabled policy has no deadline and a single process has no peers, so neither activates the exchange. The
+        // persistent key is derived only when the persistent tier or the exchange can use it.
         let configured_exchange = self
             .artifact_exchange
             .as_deref()
@@ -755,13 +802,14 @@ impl<C: CompilationCacheDomain> CompilationContext<C> {
             .disk_cache
             .as_ref()
             .zip(persistent_key.as_deref())
-            .map(|(disk_cache, key)| (disk_cache, CacheDigest::from_bytes(key)));
+            .map(|(disk_cache, key)| (disk_cache, CacheDigest::from_key(key)));
 
+        // The persistent key addresses artifacts across processes, so the exchange cannot participate without it.
         let exchange = match (configured_exchange, persistent_key.as_deref()) {
             (None, _) => None,
             (Some(_), None) => {
                 self.record_event(CompilationEvent {
-                    level: CompilationCacheLevel::Exchange,
+                    tier: CompilationCacheTier::Exchange,
                     outcome: CompilationCacheOutcome::Skipped,
                     duration: Duration::ZERO,
                     miss_reason: Some(CompilationMissReason::Unsupported),
@@ -775,6 +823,7 @@ impl<C: CompilationCacheDomain> CompilationContext<C> {
             }
         };
 
+        // A leader that restores a program from disk still publishes it, because its followers wait for that artifact.
         if let Some((disk_cache, digest)) = &persistent
             && let Some((program, bytes)) = self.restore_from_disk(domain, disk_cache, digest)
         {
@@ -856,7 +905,7 @@ impl<C: CompilationCacheDomain> CompilationContext<C> {
             | CompilationCacheOutcome::Skipped => {}
         }
         self.record_tier(
-            CompilationCacheLevel::Persistent,
+            CompilationCacheTier::Persistent,
             outcome,
             miss_reason,
             lookup_start.elapsed(),
@@ -913,7 +962,7 @@ impl<C: CompilationCacheDomain> CompilationContext<C> {
             Ok(Some(program)) => {
                 self.statistics.exchange_hits.fetch_add(1, Ordering::Relaxed);
                 self.record_tier(
-                    CompilationCacheLevel::Exchange,
+                    CompilationCacheTier::Exchange,
                     CompilationCacheOutcome::Hit,
                     None,
                     exchange_start.elapsed(),
@@ -936,7 +985,7 @@ impl<C: CompilationCacheDomain> CompilationContext<C> {
                 // directly when the policy does not permit a fallback.
                 self.statistics.exchange_errors.fetch_add(1, Ordering::Relaxed);
                 self.record_tier(
-                    CompilationCacheLevel::Exchange,
+                    CompilationCacheTier::Exchange,
                     CompilationCacheOutcome::Failed,
                     Some(CompilationMissReason::DeserializationFailed),
                     exchange_start.elapsed(),
@@ -961,7 +1010,7 @@ impl<C: CompilationCacheDomain> CompilationContext<C> {
             Ok(()) => {
                 self.statistics.exchange_publishes.fetch_add(1, Ordering::Relaxed);
                 self.record_event(CompilationEvent {
-                    level: CompilationCacheLevel::Exchange,
+                    tier: CompilationCacheTier::Exchange,
                     outcome: CompilationCacheOutcome::Succeeded,
                     duration: publish_start.elapsed(),
                     miss_reason: None,
@@ -971,7 +1020,7 @@ impl<C: CompilationCacheDomain> CompilationContext<C> {
             Err(error) => {
                 self.statistics.exchange_errors.fetch_add(1, Ordering::Relaxed);
                 self.record_event(CompilationEvent {
-                    level: CompilationCacheLevel::Exchange,
+                    tier: CompilationCacheTier::Exchange,
                     outcome: CompilationCacheOutcome::Failed,
                     duration: publish_start.elapsed(),
                     miss_reason: Some(CompilationMissReason::WriteFailed),
@@ -982,10 +1031,9 @@ impl<C: CompilationCacheDomain> CompilationContext<C> {
     }
 
     /// Publishes a terminal failure through the exchange leader when it cannot publish an artifact, so that followers
-    /// stop waiting for it instead of running into their deadline.
-    ///
-    /// `reason` explains why no artifact is published. Failures to publish the failure itself are recorded but never
-    /// replace the original failure.
+    /// stop waiting for it instead of running into their deadline. `reason` classifies the failure in the recorded
+    /// event, and `message` describes it to the followers. Failures to publish the failure itself are recorded but
+    /// never replace the original failure.
     fn publish_failure_to_exchange(&self, exchange: ActiveExchange<'_>, reason: CompilationMissReason, message: &str) {
         let publish_start = Instant::now();
         let outcome = match exchange.exchange.publish_failure(exchange.key, message) {
@@ -996,7 +1044,7 @@ impl<C: CompilationCacheDomain> CompilationContext<C> {
             }
         };
         self.record_event(CompilationEvent {
-            level: CompilationCacheLevel::Exchange,
+            tier: CompilationCacheTier::Exchange,
             outcome,
             duration: publish_start.elapsed(),
             miss_reason: Some(reason),
@@ -1008,25 +1056,28 @@ impl<C: CompilationCacheDomain> CompilationContext<C> {
     /// The persistent tier is written only by the exchange leader (or by every process when no exchange is active),
     /// and only when the compilation meets the write thresholds of the [`DiskCache`]. The exchange leader publishes
     /// the serialized program, or a terminal failure whenever it cannot, so that followers stop waiting.
-    fn compile_and_publish<F: FnOnce() -> Result<C::CompiledProgram, C::Error>>(
+    fn compile_and_publish<F>(
         &self,
         domain: &C,
         producer: InFlightProducer<'_, C>,
         persistent: Option<(&DiskCache, CacheDigest)>,
         exchange: Option<ActiveExchange<'_>>,
         produce: F,
-    ) -> Result<Arc<C::CompiledProgram>, C::Error> {
+    ) -> Result<Arc<C::CompiledProgram>, C::Error>
+    where
+        F: FnOnce() -> Result<C::CompiledProgram, C::Error>,
+    {
         let leader_exchange = exchange.filter(|exchange| exchange.is_leader());
         self.statistics.compilations.fetch_add(1, Ordering::Relaxed);
-        let compile_start = Instant::now();
+        let compilation_start = Instant::now();
         let program = match produce() {
             Ok(program) => program,
             Err(error) => {
                 self.record_tier(
-                    CompilationCacheLevel::Backend,
+                    CompilationCacheTier::Backend,
                     CompilationCacheOutcome::Failed,
                     Some(CompilationMissReason::ProducerFailed),
-                    compile_start.elapsed(),
+                    compilation_start.elapsed(),
                     &self.statistics.compilation_nanoseconds,
                 );
                 if let Some(exchange) = leader_exchange {
@@ -1039,17 +1090,18 @@ impl<C: CompilationCacheDomain> CompilationContext<C> {
                 return Err(error);
             }
         };
-        let compile_duration = compile_start.elapsed();
+        let compilation_duration = compilation_start.elapsed();
         self.record_tier(
-            CompilationCacheLevel::Backend,
+            CompilationCacheTier::Backend,
             CompilationCacheOutcome::Succeeded,
             None,
-            compile_duration,
+            compilation_duration,
             &self.statistics.compilation_nanoseconds,
         );
 
+        // Serialization is skipped entirely when neither the persistent tier nor the exchange would consume its bytes.
         let persistent = persistent.filter(|(disk_cache, _)| {
-            exchange.is_none_or(ActiveExchange::is_leader) && disk_cache.should_serialize(compile_duration)
+            exchange.is_none_or(ActiveExchange::is_leader) && disk_cache.should_serialize(compilation_duration)
         });
         if persistent.is_none() && leader_exchange.is_none() {
             return Ok(producer.finish(program));
@@ -1059,12 +1111,12 @@ impl<C: CompilationCacheDomain> CompilationContext<C> {
         match domain.serialize_program(&program) {
             Ok(Some(bytes)) => {
                 if let Some((disk_cache, digest)) = &persistent
-                    && disk_cache.should_persist(compile_duration, bytes.len())
+                    && disk_cache.should_persist(compilation_duration, bytes.len())
                     && disk_cache.put(digest, bytes.as_slice()).is_err()
                 {
                     self.statistics.persistent_errors.fetch_add(1, Ordering::Relaxed);
                     self.record_event(CompilationEvent {
-                        level: CompilationCacheLevel::Persistent,
+                        tier: CompilationCacheTier::Persistent,
                         outcome: CompilationCacheOutcome::Failed,
                         duration: serialization_start.elapsed(),
                         miss_reason: Some(CompilationMissReason::WriteFailed),
@@ -1078,7 +1130,7 @@ impl<C: CompilationCacheDomain> CompilationContext<C> {
                 let duration = serialization_start.elapsed();
                 if persistent.is_some() {
                     self.record_event(CompilationEvent {
-                        level: CompilationCacheLevel::Persistent,
+                        tier: CompilationCacheTier::Persistent,
                         outcome: CompilationCacheOutcome::Skipped,
                         duration,
                         miss_reason: Some(CompilationMissReason::Unsupported),
@@ -1087,7 +1139,7 @@ impl<C: CompilationCacheDomain> CompilationContext<C> {
                 if let Some(exchange) = leader_exchange {
                     let message = "domain does not support compiled program serialization";
                     self.record_event(CompilationEvent {
-                        level: CompilationCacheLevel::Exchange,
+                        tier: CompilationCacheTier::Exchange,
                         outcome: CompilationCacheOutcome::Skipped,
                         duration,
                         miss_reason: Some(CompilationMissReason::Unsupported),
@@ -1101,7 +1153,7 @@ impl<C: CompilationCacheDomain> CompilationContext<C> {
                 if persistent.is_some() {
                     self.statistics.persistent_errors.fetch_add(1, Ordering::Relaxed);
                     self.record_event(CompilationEvent {
-                        level: CompilationCacheLevel::Persistent,
+                        tier: CompilationCacheTier::Persistent,
                         outcome: CompilationCacheOutcome::Failed,
                         duration,
                         miss_reason: Some(CompilationMissReason::WriteFailed),
@@ -1110,7 +1162,7 @@ impl<C: CompilationCacheDomain> CompilationContext<C> {
                 if let Some(exchange) = leader_exchange {
                     self.statistics.exchange_errors.fetch_add(1, Ordering::Relaxed);
                     self.record_event(CompilationEvent {
-                        level: CompilationCacheLevel::Exchange,
+                        tier: CompilationCacheTier::Exchange,
                         outcome: CompilationCacheOutcome::Failed,
                         duration,
                         miss_reason: Some(CompilationMissReason::WriteFailed),
@@ -1150,7 +1202,7 @@ impl<C: CompilationCacheDomain> CompilationContext<C> {
     ) -> Result<(), C::Error> {
         counter.fetch_add(1, Ordering::Relaxed);
         self.record_tier(
-            CompilationCacheLevel::Exchange,
+            CompilationCacheTier::Exchange,
             outcome,
             Some(miss_reason),
             start.elapsed(),
@@ -1176,14 +1228,14 @@ impl<C: CompilationCacheDomain> CompilationContext<C> {
     /// Accumulates `duration` into `duration_counter` and records one structured event for the operation.
     fn record_tier(
         &self,
-        level: CompilationCacheLevel,
+        tier: CompilationCacheTier,
         outcome: CompilationCacheOutcome,
         miss_reason: Option<CompilationMissReason>,
         duration: Duration,
         duration_counter: &AtomicU64,
     ) {
         accumulate_duration(duration, duration_counter);
-        self.record_event(CompilationEvent { level, outcome, duration, miss_reason });
+        self.record_event(CompilationEvent { tier, outcome, duration, miss_reason });
     }
 
     /// Retains `event` when event retention is enabled and then reports it to the installed reporter, if any. The
@@ -1232,7 +1284,11 @@ impl<C: CompilationCacheDomain> Default for CompilationContext<C> {
     }
 }
 
-/// Magic bytes that open every entry envelope.
+/// Magic bytes that open every uncompressed entry envelope, which identify files that this cache wrote apart from other
+/// gzip compressed files in its directory. The envelope header has a fixed layout, so the magic value has a fixed
+/// width, and eight bytes is the conventional width of a file signature (e.g., that of PNG files) that makes accidental
+/// matches negligible. `RYFTCACHE` is therefore truncated to `RYFTCACH`. Changes to the envelope layout increment
+/// [`ENTRY_FORMAT_VERSION`] instead of changing this value.
 const ENTRY_MAGIC: &[u8; 8] = b"RYFTCACH";
 
 /// Version of the entry envelope format.
@@ -1257,19 +1313,21 @@ const AUXILIARY_EXTENSION: &str = "metadata";
 const MAXIMUM_TEMPORARY_FILE_ATTEMPTS: usize = 256;
 
 /// Default minimum compilation duration required before a newly compiled program is persisted.
-const DEFAULT_MINIMUM_COMPILE_DURATION: Duration = Duration::from_secs(1);
+const DEFAULT_MINIMUM_COMPILATION_DURATION: Duration = Duration::from_secs(1);
 
 /// Default minimum serialized payload size required before a newly compiled program is persisted.
 const DEFAULT_MINIMUM_ENTRY_SIZE: usize = 0;
 
 /// Directory-backed persistent cache of serialized compiled programs.
 ///
-/// A [`DiskCache`] persists serialized compiled programs across processes, similar to JAX's persistent compilation
-/// cache. When attached to a [`CompilationContext`], it serves as a second tier below the in-memory LRU cache. On a
-/// memory miss, the context first checks the disk for a serialized executable that matches the persistent cache key and
-/// deserializes it if found. Otherwise, it compiles the program and writes the serialized executable back to disk.
+/// A [`DiskCache`] persists serialized compiled programs across processes, similar to JAX's
+/// [persistent compilation cache](https://docs.jax.dev/en/latest/persistent_compilation_cache.html). When attached to a
+/// [`CompilationContext`], it serves as a second tier below the in-memory LRU cache. On a memory miss, the context
+/// first checks the disk for a serialized program that matches the persistent cache key and deserializes it if found.
+/// Otherwise, it compiles the program and writes the serialized program back to disk when the compilation meets the
+/// write thresholds configured via [`DiskCache::with_write_thresholds`].
 ///
-/// Entries are stored gzip-compressed as `<directory>/<sha256>.executable`. A backend opts into this tier by providing
+/// Entries are stored gzip compressed as `<directory>/<sha256>.executable`. A backend opts into this tier by providing
 /// stable canonical bytes for the complete persistent cache key, and the filename is the SHA-256 digest of those
 /// bytes. The compressed entry is a versioned envelope that repeats the key digest and records the payload length and
 /// SHA-256 checksum, all of which are validated before backend deserialization. Backends may also store auxiliary
@@ -1280,18 +1338,19 @@ const DEFAULT_MINIMUM_ENTRY_SIZE: usize = 0;
 /// validation failures are returned to the [`CompilationContext`], which records each failure and degrades it to a
 /// cache miss.
 ///
-/// When constructed via [`DiskCache::with_capacity`] or with the [`DiskCache::MAX_BYTES_ENV_VAR`] environment variable
+/// When constructed via [`DiskCache::with_max_bytes`] or with the [`DiskCache::MAX_BYTES_ENV_VAR`] environment variable
 /// set, the cache evicts the least recently written entries after each write to keep its footprint on disk under the
 /// configured cap. Caches opened via [`DiskCache::open`] have no cap.
 ///
-/// Wire one into a [`CompilationContext`] via [`CompilationContext::with_disk_cache`],
-/// [`CompilationContext::with_configured_disk_cache`], or [`CompilationContext::with_disk_cache_from_env`].
+/// Wire one into a [`CompilationContext`] via [`CompilationContext::with_disk_cache`] or
+/// [`CompilationContext::with_disk_cache_from_env`].
 pub struct DiskCache {
     /// Filesystem directory holding the cached entries.
     directory: PathBuf,
 
-    /// Candidate suffix for temporary filenames. Exclusive file creation resolves collisions with independently opened
-    /// caches and with stale files left by an earlier process that had the same process identifier.
+    /// Counter that produces candidate suffixes for temporary filenames. Exclusive file creation resolves collisions
+    /// with independently opened caches and with stale files left by an earlier process that had the same process
+    /// identifier.
     write_counter: AtomicU64,
 
     /// Optional cap on the size of the cached entries on disk, in bytes. [`None`] disables eviction entirely. When set,
@@ -1300,7 +1359,7 @@ pub struct DiskCache {
     max_bytes: Option<u64>,
 
     /// Minimum compilation duration required before a newly compiled program is persisted.
-    minimum_compile_duration: Duration,
+    minimum_compilation_duration: Duration,
 
     /// Minimum serialized backend payload size required before it is persisted.
     minimum_entry_size: usize,
@@ -1314,10 +1373,12 @@ impl DiskCache {
     /// bytes. It must hold an unsigned 64-bit integer when set, and eviction is disabled when it is absent.
     pub const MAX_BYTES_ENV_VAR: &str = "RYFT_COMPILATION_CACHE_MAX_BYTES";
 
-    /// Opens a [`DiskCache`] rooted at `directory`, creating the directory and any missing parents if necessary.
-    /// Returns an error if `directory` already exists as a non-directory or cannot be created.
+    /// Opens a [`DiskCache`] rooted at `directory`, creating the directory and any missing parents if necessary. The
+    /// resulting cache has no size cap. Use [`Self::with_max_bytes`] to bound its footprint on disk.
     ///
-    /// The resulting cache has no size cap. Use [`Self::with_capacity`] to bound its footprint on disk.
+    /// # Errors
+    ///
+    /// Returns an error if `directory` already exists as a non-directory or cannot be created.
     pub fn open(directory: impl Into<PathBuf>) -> std::io::Result<Self> {
         Self::open_with_max_bytes(directory, None)
     }
@@ -1327,16 +1388,23 @@ impl DiskCache {
     ///
     /// The most recently written entry is always preserved, even if it alone exceeds `max_bytes`, so that callers
     /// always observe their own writes on the immediately following read.
-    pub fn with_capacity(directory: impl Into<PathBuf>, max_bytes: u64) -> std::io::Result<Self> {
+    ///
+    /// # Errors
+    ///
+    /// Returns the same errors as [`Self::open`].
+    pub fn with_max_bytes(directory: impl Into<PathBuf>, max_bytes: u64) -> std::io::Result<Self> {
         Self::open_with_max_bytes(directory, Some(max_bytes))
     }
 
     /// Opens the [`DiskCache`] configured by the [`RYFT_COMPILATION_CACHE_DIR`](Self::ENV_VAR) environment variable.
-    /// Returns `Ok(Some(cache))` when the variable is set and points to a directory that can be read or created, and
-    /// `Ok(None)` when it is unset. Invalid capacity configuration and filesystem failures are returned explicitly.
+    /// Returns `Ok(Some(cache))` when the variable is set and `Ok(None)` when it is unset. When
+    /// [`RYFT_COMPILATION_CACHE_MAX_BYTES`](Self::MAX_BYTES_ENV_VAR) is also set, the resulting cache is capped as if
+    /// it were opened via [`Self::with_max_bytes`].
     ///
-    /// When [`RYFT_COMPILATION_CACHE_MAX_BYTES`](Self::MAX_BYTES_ENV_VAR) is also set, the resulting cache is capped
-    /// as if it were opened via [`Self::with_capacity`].
+    /// # Errors
+    ///
+    /// Returns an [`std::io::ErrorKind::InvalidInput`] error when the size cap variable does not hold an unsigned
+    /// 64-bit integer, and the errors of [`Self::open`] when the directory cannot be opened.
     pub fn from_env() -> std::io::Result<Option<Self>> {
         let Some(directory) = std::env::var_os(Self::ENV_VAR) else {
             return Ok(None);
@@ -1367,7 +1435,7 @@ impl DiskCache {
             directory,
             write_counter: AtomicU64::new(0),
             max_bytes,
-            minimum_compile_duration: DEFAULT_MINIMUM_COMPILE_DURATION,
+            minimum_compilation_duration: DEFAULT_MINIMUM_COMPILATION_DURATION,
             minimum_entry_size: DEFAULT_MINIMUM_ENTRY_SIZE,
         })
     }
@@ -1375,8 +1443,8 @@ impl DiskCache {
     /// Configures the minimum compilation duration and serialized payload size required before a newly compiled
     /// program is written. Reads are unaffected, so an existing validated entry is always eligible for reuse.
     #[inline]
-    pub fn with_write_thresholds(mut self, minimum_compile_duration: Duration, minimum_entry_size: usize) -> Self {
-        self.minimum_compile_duration = minimum_compile_duration;
+    pub fn with_write_thresholds(mut self, minimum_compilation_duration: Duration, minimum_entry_size: usize) -> Self {
+        self.minimum_compilation_duration = minimum_compilation_duration;
         self.minimum_entry_size = minimum_entry_size;
         self
     }
@@ -1395,6 +1463,10 @@ impl DiskCache {
 
     /// Returns the total size, in bytes, of every executable and auxiliary entry in the cache directory, which is
     /// zero for a missing or empty directory.
+    ///
+    /// # Errors
+    ///
+    /// Returns the errors of reading the directory and the metadata of its entries, other than a missing directory.
     pub fn cache_size_bytes(&self) -> std::io::Result<u64> {
         let entries = match fs::read_dir(&self.directory) {
             Ok(entries) => entries,
@@ -1438,7 +1510,7 @@ impl DiskCache {
 
     /// Reads and validates the cached serialized payload for `digest`. A missing entry is a cache miss, while
     /// filesystem, decompression, envelope, and checksum failures are returned explicitly.
-    pub(crate) fn get(&self, digest: &CacheDigest) -> std::io::Result<Option<Vec<u8>>> {
+    fn get(&self, digest: &CacheDigest) -> std::io::Result<Option<Vec<u8>>> {
         Self::read_entry(&self.entry_path(digest), digest, None)
     }
 
@@ -1448,32 +1520,32 @@ impl DiskCache {
     ///
     /// Returns any write, synchronization, rename, cleanup, or eviction failure explicitly. The compilation context
     /// records such failures before degrading to an in-memory result.
-    pub(crate) fn put(&self, digest: &CacheDigest, data: &[u8]) -> std::io::Result<()> {
+    fn put(&self, digest: &CacheDigest, data: &[u8]) -> std::io::Result<()> {
         self.write_entry(&self.entry_path(digest), digest, EXECUTABLE_EXTENSION, data)
     }
 
-    /// Returns whether a compilation that took `compile_duration` may be persisted, which is checked before backend
+    /// Returns whether a compilation that took `compilation_duration` may be persisted, which is checked before backend
     /// serialization so that cheap compilations are never serialized.
     #[inline]
-    pub(crate) fn should_serialize(&self, compile_duration: Duration) -> bool {
-        compile_duration >= self.minimum_compile_duration
+    fn should_serialize(&self, compilation_duration: Duration) -> bool {
+        compilation_duration >= self.minimum_compilation_duration
     }
 
-    /// Returns whether a newly compiled program that took `compile_duration` and serialized to `entry_size` bytes
+    /// Returns whether a newly compiled program that took `compilation_duration` and serialized to `entry_size` bytes
     /// meets the write policy of this cache.
     #[inline]
-    pub(crate) fn should_persist(&self, compile_duration: Duration, entry_size: usize) -> bool {
-        self.should_serialize(compile_duration) && entry_size >= self.minimum_entry_size
+    fn should_persist(&self, compilation_duration: Duration, entry_size: usize) -> bool {
+        self.should_serialize(compilation_duration) && entry_size >= self.minimum_entry_size
     }
 
     /// Returns the filesystem path of the executable entry for `digest`.
     fn entry_path(&self, digest: &CacheDigest) -> PathBuf {
-        self.directory.join(format!("{}.{EXECUTABLE_EXTENSION}", digest.as_hex()))
+        self.directory.join(format!("{}.{EXECUTABLE_EXTENSION}", digest.to_hex()))
     }
 
     /// Returns the filesystem path of the auxiliary entry for `digest`.
     fn auxiliary_entry_path(&self, digest: &CacheDigest) -> PathBuf {
-        self.directory.join(format!("{}.{AUXILIARY_EXTENSION}", digest.as_hex()))
+        self.directory.join(format!("{}.{AUXILIARY_EXTENSION}", digest.to_hex()))
     }
 
     /// Returns whether `path` names an executable or auxiliary entry, as opposed to a temporary or unrelated file.
@@ -1559,7 +1631,7 @@ impl DiskCache {
     fn temporary_entry(&self, digest: &CacheDigest, extension: &str) -> std::io::Result<(PathBuf, File)> {
         for _ in 0..MAXIMUM_TEMPORARY_FILE_ATTEMPTS {
             let counter = self.write_counter.fetch_add(1, Ordering::Relaxed);
-            let path = self.directory.join(format!("{}.{extension}.tmp.{}.{counter}", digest.as_hex(), process::id()));
+            let path = self.directory.join(format!("{}.{extension}.tmp.{}.{counter}", digest.to_hex(), process::id()));
             match File::options().write(true).create_new(true).open(&path) {
                 Ok(file) => return Ok((path, file)),
                 Err(error) if error.kind() == std::io::ErrorKind::AlreadyExists => continue,
@@ -1622,14 +1694,6 @@ impl DiskCache {
             }
         }
         Ok(evicted)
-    }
-
-    /// Returns the uncompressed envelope that stores `payload` under `digest`.
-    #[cfg(test)]
-    fn encode_envelope(digest: &CacheDigest, payload: &[u8]) -> Vec<u8> {
-        let mut envelope = Vec::with_capacity(ENTRY_HEADER_LENGTH + payload.len());
-        Self::write_envelope(&mut envelope, digest, payload).unwrap();
-        envelope
     }
 
     /// Writes the uncompressed envelope that stores `payload` under `digest` to `writer`.
@@ -1697,14 +1761,14 @@ impl DiskCache {
 
 /// SHA-256 digest of a stable persistent cache key provided by a compilation domain.
 #[derive(Copy, Clone, Debug, PartialEq, Eq)]
-pub(crate) struct CacheDigest {
+struct CacheDigest {
     /// Raw digest bytes.
     bytes: [u8; SHA256_LENGTH],
 }
 
 impl CacheDigest {
     /// Hashes the stable canonical persistent key bytes provided by a compilation domain.
-    pub(crate) fn from_bytes(key: &[u8]) -> Self {
+    fn from_key(key: &[u8]) -> Self {
         Self { bytes: Sha256::digest(key).into() }
     }
 
@@ -1715,7 +1779,7 @@ impl CacheDigest {
     }
 
     /// Returns the lowercase hexadecimal encoding of this digest, which is suitable for filenames.
-    fn as_hex(&self) -> String {
+    fn to_hex(&self) -> String {
         self.bytes.iter().map(|byte| format!("{byte:02x}")).collect()
     }
 }
@@ -1895,6 +1959,13 @@ mod tests {
         }
     }
 
+    /// Returns the uncompressed envelope that stores `payload` under `digest`.
+    fn encode_envelope(digest: &CacheDigest, payload: &[u8]) -> Vec<u8> {
+        let mut envelope = Vec::with_capacity(ENTRY_HEADER_LENGTH + payload.len());
+        DiskCache::write_envelope(&mut envelope, digest, payload).unwrap();
+        envelope
+    }
+
     #[test]
     fn test_compilation_context_with_capacity() {
         let context = CompilationContext::<TestDomain>::with_capacity(1);
@@ -1911,25 +1982,25 @@ mod tests {
 
         // The second key evicts the first one, which is then compiled again.
         assert_eq!(producer_calls.load(Ordering::Relaxed), 3);
-        assert_eq!(context.cache_size(), 1);
+        assert_eq!(context.program_count(), 1);
 
         // A zero capacity is clamped to one entry.
         let context = CompilationContext::<TestDomain>::with_capacity(0);
         context.get_or_compile(&domain, 1, || Ok(TestCompiledProgram(1))).unwrap();
-        assert_eq!(context.cache_size(), 1);
+        assert_eq!(context.program_count(), 1);
     }
 
     #[test]
-    fn test_compilation_context_with_configured_disk_cache() {
+    fn test_compilation_context_with_disk_cache() {
         let directory = tempfile::tempdir().unwrap();
         let domain = TestDomain::persistent();
         let disk_cache = DiskCache::open(directory.path()).unwrap().with_write_thresholds(Duration::ZERO, 0);
-        let first_context = CompilationContext::<TestDomain>::new().with_configured_disk_cache(disk_cache);
+        let first_context = CompilationContext::<TestDomain>::new().with_disk_cache(disk_cache);
         first_context.get_or_compile(&domain, 3, || Ok(TestCompiledProgram(17))).unwrap();
         assert_eq!(first_context.disk_cache().unwrap().directory(), directory.path());
 
         let disk_cache = DiskCache::open(directory.path()).unwrap().with_write_thresholds(Duration::ZERO, 0);
-        let second_context = CompilationContext::<TestDomain>::new().with_configured_disk_cache(disk_cache);
+        let second_context = CompilationContext::<TestDomain>::new().with_disk_cache(disk_cache);
         let restored = second_context
             .get_or_compile(&domain, 3, || -> Result<TestCompiledProgram, ProgramError> {
                 panic!("persistent hit must not invoke producer")
@@ -1942,10 +2013,10 @@ mod tests {
     }
 
     #[test]
-    fn test_compilation_context_with_configured_disk_cache_unsupported_domain() {
+    fn test_compilation_context_with_disk_cache_unsupported_domain() {
         let directory = tempfile::tempdir().unwrap();
-        let context = CompilationContext::<TestDomain>::new()
-            .with_configured_disk_cache(DiskCache::open(directory.path()).unwrap());
+        let context =
+            CompilationContext::<TestDomain>::new().with_disk_cache(DiskCache::open(directory.path()).unwrap());
         context.get_or_compile(&TestDomain::default(), 1, || Ok(TestCompiledProgram(1))).unwrap();
 
         assert_eq!(std::fs::read_dir(directory.path()).unwrap().count(), 0);
@@ -1953,10 +2024,10 @@ mod tests {
     }
 
     #[test]
-    fn test_compilation_context_with_configured_disk_cache_default_write_thresholds() {
+    fn test_compilation_context_with_disk_cache_default_write_thresholds() {
         let directory = tempfile::tempdir().unwrap();
-        let context = CompilationContext::<TestDomain>::new()
-            .with_configured_disk_cache(DiskCache::open(directory.path()).unwrap());
+        let context =
+            CompilationContext::<TestDomain>::new().with_disk_cache(DiskCache::open(directory.path()).unwrap());
         context.get_or_compile(&TestDomain::persistent(), 1, || Ok(TestCompiledProgram(1))).unwrap();
 
         // A fast compilation is below the default minimum compilation duration, so it is never serialized.
@@ -1964,12 +2035,10 @@ mod tests {
     }
 
     #[test]
-    fn test_compilation_context_with_configured_disk_cache_serialization_failure() {
+    fn test_compilation_context_with_disk_cache_serialization_failure() {
         let directory = tempfile::tempdir().unwrap();
         let disk_cache = DiskCache::open(directory.path()).unwrap().with_write_thresholds(Duration::ZERO, 0);
-        let context = CompilationContext::<TestDomain>::new()
-            .with_configured_disk_cache(disk_cache)
-            .with_event_capacity(8);
+        let context = CompilationContext::<TestDomain>::new().with_disk_cache(disk_cache).with_event_capacity(8);
         let domain = TestDomain { persistent: true, serialization_fails: true };
 
         // Serialization failures degrade to an in-memory result and are recorded as persistent write failures.
@@ -1978,7 +2047,7 @@ mod tests {
         assert_eq!(std::fs::read_dir(directory.path()).unwrap().count(), 0);
         assert_eq!(context.statistics().persistent_errors, 1);
         let last_event = context.recent_events().pop().unwrap();
-        assert_eq!(last_event.level, CompilationCacheLevel::Persistent);
+        assert_eq!(last_event.tier, CompilationCacheTier::Persistent);
         assert_eq!(last_event.outcome, CompilationCacheOutcome::Failed);
         assert_eq!(last_event.miss_reason, Some(CompilationMissReason::WriteFailed));
     }
@@ -2021,7 +2090,7 @@ mod tests {
         let domain = TestDomain::persistent();
         let seed_cache = DiskCache::open(directory.path()).unwrap().with_write_thresholds(Duration::ZERO, 0);
         CompilationContext::<TestDomain>::new()
-            .with_configured_disk_cache(seed_cache)
+            .with_disk_cache(seed_cache)
             .get_or_compile(&domain, 8, || Ok(TestCompiledProgram(53)))
             .unwrap();
 
@@ -2040,7 +2109,7 @@ mod tests {
 
         let leader_cache = DiskCache::open(directory.path()).unwrap().with_write_thresholds(Duration::ZERO, 0);
         let leader_context = CompilationContext::<TestDomain>::new()
-            .with_configured_disk_cache(leader_cache)
+            .with_disk_cache(leader_cache)
             .with_artifact_exchange(Arc::new(TestExchange::new(0, state)), policy);
         let leader = leader_context
             .get_or_compile(&domain, 8, || -> Result<TestCompiledProgram, ProgramError> {
@@ -2230,9 +2299,9 @@ mod tests {
         // The memory miss of the first lookup is evicted by the two later events.
         let events = context.recent_events();
         assert_eq!(events.len(), 2);
-        assert_eq!(events[0].level, CompilationCacheLevel::Backend);
+        assert_eq!(events[0].tier, CompilationCacheTier::Backend);
         assert_eq!(events[0].outcome, CompilationCacheOutcome::Succeeded);
-        assert_eq!(events[1].level, CompilationCacheLevel::Memory);
+        assert_eq!(events[1].tier, CompilationCacheTier::Memory);
         assert_eq!(events[1].outcome, CompilationCacheOutcome::Hit);
 
         context.clear_events();
@@ -2253,10 +2322,10 @@ mod tests {
         assert_eq!(context.recent_events(), Vec::new());
         let reported = reported.lock().unwrap();
         assert_eq!(
-            reported.iter().map(|event| (event.level, event.outcome)).collect::<Vec<_>>(),
+            reported.iter().map(|event| (event.tier, event.outcome)).collect::<Vec<_>>(),
             vec![
-                (CompilationCacheLevel::Memory, CompilationCacheOutcome::Miss),
-                (CompilationCacheLevel::Backend, CompilationCacheOutcome::Succeeded),
+                (CompilationCacheTier::Memory, CompilationCacheOutcome::Miss),
+                (CompilationCacheTier::Backend, CompilationCacheOutcome::Succeeded),
             ],
         );
     }
@@ -2266,10 +2335,10 @@ mod tests {
         let context = CompilationContext::<TestDomain>::new();
         let domain = TestDomain::default();
         context.get_or_compile(&domain, 1, || Ok(TestCompiledProgram(1))).unwrap();
-        assert_eq!(context.cache_size(), 1);
+        assert_eq!(context.program_count(), 1);
 
         context.clear_cache();
-        assert_eq!(context.cache_size(), 0);
+        assert_eq!(context.program_count(), 0);
         assert_eq!(context.statistics().compilations, 1);
 
         context.clear_statistics();
@@ -2452,13 +2521,13 @@ mod tests {
     }
 
     #[test]
-    fn test_disk_cache_with_capacity() {
+    fn test_disk_cache_with_max_bytes() {
         let directory = tempfile::tempdir().unwrap();
-        let cache = DiskCache::with_capacity(directory.path(), 64).unwrap();
+        let cache = DiskCache::with_max_bytes(directory.path(), 64).unwrap();
         assert_eq!(cache.max_bytes(), Some(64));
 
         // The most recently written entry is preserved even when it alone exceeds the cap.
-        let digest = CacheDigest::from_bytes(b"oversized");
+        let digest = CacheDigest::from_key(b"oversized");
         let payload = vec![0u8; 16 * 1024];
         cache.put(&digest, &payload).unwrap();
         assert_eq!(cache.get(&digest).unwrap(), Some(payload));
@@ -2527,7 +2596,7 @@ mod tests {
         let first_path = uncapped.auxiliary_entry_path(&DiskCache::auxiliary_digest("adaptive-profile", b"first"));
         let first_size = fs::metadata(&first_path).unwrap().len();
 
-        let cache = DiskCache::with_capacity(directory.path(), first_size).unwrap();
+        let cache = DiskCache::with_max_bytes(directory.path(), first_size).unwrap();
         cache.put_auxiliary("adaptive-profile", b"second", &[2; 256]).unwrap();
 
         assert_eq!(cache.get_auxiliary("adaptive-profile", b"first").unwrap(), None);
@@ -2540,20 +2609,20 @@ mod tests {
     fn test_disk_cache_get() {
         let directory = tempfile::tempdir().unwrap();
         let cache = DiskCache::open(directory.path()).unwrap();
-        let digest = CacheDigest::from_bytes(b"stable-key");
+        let digest = CacheDigest::from_key(b"stable-key");
         let data = b"hello compiled bytes".to_vec();
 
         assert_eq!(cache.get(&digest).unwrap(), None);
         cache.put(&digest, &data).unwrap();
         assert_eq!(cache.get(&digest).unwrap(), Some(data));
-        assert_eq!(cache.get(&CacheDigest::from_bytes(b"missing")).unwrap(), None);
+        assert_eq!(cache.get(&CacheDigest::from_key(b"missing")).unwrap(), None);
     }
 
     #[test]
     fn test_disk_cache_put_compresses_entries() {
         let directory = tempfile::tempdir().unwrap();
         let cache = DiskCache::open(directory.path()).unwrap();
-        let digest = CacheDigest::from_bytes(b"compressible");
+        let digest = CacheDigest::from_key(b"compressible");
         let payload = vec![0u8; 64 * 1024];
         cache.put(&digest, &payload).unwrap();
 
@@ -2571,7 +2640,7 @@ mod tests {
         let directory = tempfile::tempdir().unwrap();
         let first = DiskCache::open(directory.path()).unwrap();
         let second = DiskCache::open(directory.path()).unwrap();
-        let digest = CacheDigest::from_bytes(b"same-key");
+        let digest = CacheDigest::from_key(b"same-key");
         let barrier = Barrier::new(2);
         let first_payload = vec![17u8; 32 * 1024];
         let second_payload = vec![93u8; 48 * 1024];
@@ -2603,7 +2672,7 @@ mod tests {
         let directory = tempfile::tempdir().unwrap();
         let first = DiskCache::open(directory.path()).unwrap();
         let second = DiskCache::open(directory.path()).unwrap();
-        let digest = CacheDigest::from_bytes(b"same-key");
+        let digest = CacheDigest::from_key(b"same-key");
         let barrier = Barrier::new(2);
 
         // Both caches begin with counter zero. Holding both files open together prevents either writer from reusing a
@@ -2643,7 +2712,7 @@ mod tests {
         let cache = DiskCache::open(directory.path()).unwrap();
         let payloads: Vec<Vec<u8>> =
             (0..3).map(|entry| (0..256).map(|byte| (entry * 31 + byte) as u8).collect()).collect();
-        let digests: Vec<CacheDigest> = (0..3).map(|index| CacheDigest::from_bytes(&[index])).collect();
+        let digests: Vec<CacheDigest> = (0..3).map(|index| CacheDigest::from_key(&[index])).collect();
         for index in 0..3 {
             cache.put(&digests[index], &payloads[index]).unwrap();
             let file = File::options().write(true).open(cache.entry_path(&digests[index])).unwrap();
@@ -2665,16 +2734,16 @@ mod tests {
 
     #[test]
     fn test_disk_cache_decode_envelope() {
-        let digest = CacheDigest::from_bytes(b"key");
-        let envelope = DiskCache::encode_envelope(&digest, b"compiled");
+        let digest = CacheDigest::from_key(b"key");
+        let envelope = encode_envelope(&digest, b"compiled");
         assert_eq!(envelope.len(), ENTRY_HEADER_LENGTH + b"compiled".len());
         assert_eq!(DiskCache::decode_envelope(&digest, &envelope).unwrap(), b"compiled");
     }
 
     #[test]
     fn test_disk_cache_decode_envelope_rejects_malformed_envelopes() {
-        let digest = CacheDigest::from_bytes(b"key");
-        let envelope = DiskCache::encode_envelope(&digest, b"compiled");
+        let digest = CacheDigest::from_key(b"key");
+        let envelope = encode_envelope(&digest, b"compiled");
 
         let error = DiskCache::decode_envelope(&digest, &envelope[..ENTRY_HEADER_LENGTH - 1]).unwrap_err();
         assert_eq!(error.kind(), std::io::ErrorKind::InvalidData);
@@ -2692,7 +2761,7 @@ mod tests {
         assert_eq!(error.kind(), std::io::ErrorKind::InvalidData);
         assert_eq!(error.to_string(), "persistent cache entry uses unsupported format version 2");
 
-        let other_key = DiskCache::encode_envelope(&CacheDigest::from_bytes(b"other"), b"compiled");
+        let other_key = encode_envelope(&CacheDigest::from_key(b"other"), b"compiled");
         let error = DiskCache::decode_envelope(&digest, &other_key).unwrap_err();
         assert_eq!(error.kind(), std::io::ErrorKind::InvalidData);
         assert_eq!(error.to_string(), "persistent cache entry key digest does not match its requested key");
@@ -2709,10 +2778,10 @@ mod tests {
     }
 
     #[test]
-    fn test_cache_digest_from_bytes() {
-        let digest = CacheDigest::from_bytes(b"abc");
-        assert_eq!(digest.as_hex(), "ba7816bf8f01cfea414140de5dae2223b00361a396177a9cb410ff61f20015ad");
-        assert_eq!(digest, CacheDigest::from_bytes(b"abc"));
-        assert_ne!(digest, CacheDigest::from_bytes(b"abd"));
+    fn test_cache_digest_from_key() {
+        let digest = CacheDigest::from_key(b"abc");
+        assert_eq!(digest.to_hex(), "ba7816bf8f01cfea414140de5dae2223b00361a396177a9cb410ff61f20015ad");
+        assert_eq!(digest, CacheDigest::from_key(b"abc"));
+        assert_ne!(digest, CacheDigest::from_key(b"abd"));
     }
 }
