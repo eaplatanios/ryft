@@ -330,12 +330,9 @@ where
         Ok(LoweredFunction { program: Arc::new(lowered_program), staged: self.clone(), output_types })
     }
 
-    // TODO(eaplatanios): Review from here onwards.
-
-    /// Stages a call to this function into the active context recovered from `inputs`.
-    ///
-    /// For nullary functions use [`Self::call_in_context`], because no input value exists from which to recover the
-    /// active context.
+    /// Stages a call to this function into the active context recovered from `inputs`. For nullary functions use
+    /// [`Self::call_in_context`], because no input value exists from which to recover the active context.
+    #[inline]
     pub fn call<V>(&self, inputs: Input::To<V>) -> Result<Output::To<V>, ProgramError>
     where
         C::Operation: StagedCallOperation<C::Constant>,
@@ -356,16 +353,16 @@ where
         self.call_in_context(&context, inputs)
     }
 
-    /// Stages a call to this function through an explicitly supplied active `context`.
-    pub fn call_in_context<Caller, V>(
+    /// Stages a call to this function through the provided `context`.
+    pub fn call_in_context<V, CallerContext>(
         &self,
-        context: &Caller,
+        context: &CallerContext,
         inputs: Input::To<V>,
     ) -> Result<Output::To<V>, ProgramError>
     where
         C::Operation: StagedCallOperation<C::Constant>,
         V: Value<Type = C::Type>,
-        Caller: Context<Type = C::Type, Value = V, Constant = C::Constant, Operation = C::Operation>
+        CallerContext: Context<Type = C::Type, Value = V, Constant = C::Constant, Operation = C::Operation>
             + CapturingContext<Capture = C::Value>
             + Constant<V, C::Constant>,
         Input: Parameterized<C::Type, Family: ParameterizedFamily<V>>,
@@ -395,8 +392,12 @@ where
         Output::To::<V>::from_parameters(self.state.output_structure.clone(), outputs).map_err(Into::into)
     }
 
-    /// Binds this staged function using capture references already registered in an enclosing capture table.
-    pub fn call_with_flat_capture_references<V>(
+    /// Stages a call with flat `inputs` and returns flat outputs, using `capture_references` already registered in
+    /// the caller's capture table in this function's capture order. The first input supplies the active context. Use
+    /// [`Self::call_flat_with_capture_references_in_context`] when `inputs` is empty, because capture references carry
+    /// slot indices and types rather than a context.
+    #[inline]
+    pub fn call_flat_with_capture_references<V>(
         &self,
         capture_references: &[C::Constant],
         inputs: Vec<V>,
@@ -410,23 +411,22 @@ where
             .first()
             .map(|input| input.domain())
             .ok_or(ProgramError::InvalidInputCount { expected: 1, actual: 0 })?;
-        self.call_with_flat_capture_references_in_context(&context, capture_references, inputs)
+        self.call_flat_with_capture_references_in_context(&context, capture_references, inputs)
     }
 
-    /// Binds this staged function through `context` using already-registered flat capture references.
-    ///
-    /// Unlike [`Self::call_with_flat_capture_references`], this form also supports nullary and capture-only calls,
-    /// because it does not need a public input from which to recover the active context.
-    pub fn call_with_flat_capture_references_in_context<Caller, V>(
+    /// Stages a call through `context` with flat `inputs` and outputs, reusing `capture_references` already registered
+    /// in that context's capture table in this function's capture order. Explicit context selection supports empty
+    /// `inputs`, including nullary and capture-only calls.
+    pub fn call_flat_with_capture_references_in_context<V, CallerContext>(
         &self,
-        context: &Caller,
+        context: &CallerContext,
         capture_references: &[C::Constant],
         inputs: Vec<V>,
     ) -> Result<Vec<V>, ProgramError>
     where
         C::Operation: StagedCallOperation<C::Constant>,
         V: Value<Type = C::Type>,
-        Caller: Context<Type = C::Type, Value = V, Constant = C::Constant, Operation = C::Operation>
+        CallerContext: Context<Type = C::Type, Value = V, Constant = C::Constant, Operation = C::Operation>
             + Constant<V, C::Constant>,
     {
         // Capture-reference indices belong to the caller's capture table and may differ from the source program's
@@ -511,6 +511,8 @@ struct StagedFunctionState<
     /// Output parameter structure used to reconstruct structured values.
     output_structure: Output::ParameterStructure,
 }
+
+// TODO(eaplatanios): Review from here onwards.
 
 /// Backend lowering of a [`StagedFunction`], ready for executable compilation.
 ///
