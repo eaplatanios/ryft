@@ -23,11 +23,11 @@ use std::time::{Duration, Instant};
 
 use ryft_core::compilation::AnalyzableCompilationDomain;
 use ryft_core::{
-    ArrayIrType, ArrayType, CompiledFunction, Context, DataType, Device, DeviceMesh, Dimension, DomainTracer,
-    DomainTracingContext, Dot, DotDimensionNumbers, DotsSavable, LogicalMesh, Memory, MeshAxis, MeshAxisType,
-    NothingSavable, OffloadDotsWithNoBatchDimensions, ProgramError, Reduce, ReductionKind,
+    ArrayIrType, ArrayType, Compile, CompiledFunction, Context, DataType, Device, DeviceMesh, Dimension,
+    DomainTracer, DomainTracingContext, Dot, DotDimensionNumbers, DotsSavable, LogicalMesh, Memory, MeshAxis,
+    MeshAxisType, NothingSavable, OffloadDotsWithNoBatchDimensions, ProgramError, Reduce, ReductionKind,
     RematerializationOptimizationBarrier, ResidualPolicy, ScanOperation, Shape, Sharding, StagedFunction, Tanh, Typed,
-    Value, ValueProjection, differentiate_at, rematerialize, stage,
+    Value, ValueProjection, differentiate_at, rematerialize,
 };
 use ryft_pjrt::{Client, ClientOptions, CpuClientOptions, load_cpu_plugin};
 use ryft_xla::experimental::ops::XlaOperation;
@@ -234,8 +234,7 @@ where
     F: Fn(Tracer<'c>, Tracer<'c>, Tracer<'c>) -> Result<Tracer<'c>, ProgramError>,
 {
     let hidden_type = array_type(&[model.batch_size, model.width]);
-    stage(
-        domain,
+    domain.stage(
         |(hidden, up, down)| {
             // The hidden state is differentiated too, so that every input belongs to the differentiated function, and
             // its gradient is discarded.

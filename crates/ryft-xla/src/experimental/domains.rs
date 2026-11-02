@@ -6926,6 +6926,8 @@ impl<'c> XlaDomain<'c> {
 
 #[cfg(test)]
 mod tests {
+    use std::sync::Barrier;
+    use std::sync::atomic::{AtomicUsize, Ordering};
     #[cfg(feature = "cuda-13")]
     use std::time::Instant;
 
@@ -6942,11 +6944,11 @@ mod tests {
         ArrayIrOperation, ArrayOperation, ArrayReferenceTransform, ArrayReferenceTransformIndex, ArraySliceAxis,
         Assert, AssertOperation, Atan2Operation, AtomId, AttachedRegions, AxisIndexOperation, BatchAxis,
         BatchableOperation, BatchingContext, CaptureReference, Cast, CastOperation, CollectiveOptions,
-        CompareOperation, ComparisonDirection, CompilationTracer, CompiledFunctionDispatcher, CompositeJvpRule,
-        CompositeOperation, ConcatenateOperation, ConditionOperation, ConstantOperation, ConvertElementTypeOperation,
-        CotangentDestinationKind, CumulativeKind, CumulativeOperation, CustomCallOperation, Dimension,
-        DimensionAddOperation, DimensionDivOperation, DimensionFromScalarOperation, DimensionMulOperation,
-        DimensionRemOperation, DimensionSize, DimensionSizeOperation, DimensionSubOperation,
+        CompareOperation, ComparisonDirection, CompilationTracer, Compile, CompiledFunctionDispatcher,
+        CompositeJvpRule, CompositeOperation, ConcatenateOperation, ConditionOperation, ConstantOperation,
+        ConvertElementTypeOperation, CotangentDestinationKind, CumulativeKind, CumulativeOperation,
+        CustomCallOperation, Dimension, DimensionAddOperation, DimensionDivOperation, DimensionFromScalarOperation,
+        DimensionMulOperation, DimensionRemOperation, DimensionSize, DimensionSizeOperation, DimensionSubOperation,
         DimensionToScalarOperation, DivOperation, DomainTracingContext, DotDimensionNumbers, DotOperation,
         DynamicArrayExtentBatchingPolicy, DynamicBroadcastOperation, DynamicGather, DynamicReshape,
         DynamicReshapeOperation, DynamicScatter, DynamicSlice, DynamicSliceOperation, DynamicSliceWithDimensions,
@@ -6961,7 +6963,7 @@ mod tests {
         ScaledDotOperation, ScanOperation, Scatter, ScatterDimensionNumbers, ScatterMode, ScatterOperation,
         ScatterOptions, SelectOperation, ShardMap, ShardMapOperation, Sharding, ShardingDimension, SliceOperation,
         SortDirection, SortOperation, StagedFunction, StagingContext, StaticShape, SubOperation, TracingContext, Value,
-        WhileOperation, ZeroOperation, batch, jit_with_options, shard_map,
+        WhileOperation, ZeroOperation, batch, shard_map,
     };
     use ryft_pjrt::{ClientOptions, CpuClientOptions, load_cpu_plugin};
     #[cfg(feature = "cuda-13")]
@@ -10580,9 +10582,8 @@ mod tests {
         let scalar_i64 = replicated_scalar_type(&mesh, DataType::I64);
         let scalar_f32 = replicated_scalar_type(&mesh, DataType::F32);
         let extent = DimensionVariable::new("data_extent", DimensionBounds::new(1, Some(8)).unwrap());
-        let function: CompiledFunctionDispatcher<XlaDomain<'_>, _, (), Vec<ArrayIrType>, ArrayIrType> =
-            jit_with_options(
-                &domain,
+        let function: CompiledFunctionDispatcher<XlaDomain<'_>, _, (), Vec<ArrayIrType>, ArrayIrType> = domain
+            .jit_with_options(
                 move |(), inputs| trace_data_derived(extent.clone(), inputs),
                 XlaOptions::new(mesh.clone()),
             );
@@ -12074,7 +12075,7 @@ mod tests {
         let scalar_f32 = replicated_scalar_type(&mesh, DataType::F32);
         let extent = DimensionVariable::new("extent", DimensionBounds::new(1, Some(5)).unwrap());
         let function: CompiledFunctionDispatcher<XlaDomain<'_>, _, (), Vec<ArrayIrType>, ArrayIrType> =
-            jit_with_options(&domain, move |(), inputs| trace(extent.clone(), inputs), XlaOptions::new(mesh.clone()));
+            domain.jit_with_options(move |(), inputs| trace(extent.clone(), inputs), XlaOptions::new(mesh.clone()));
 
         let call = |size: i64| {
             let size =
@@ -13166,11 +13167,11 @@ mod tests {
             .unwrap();
         let mesh = domain_mesh(&client, "x", 1);
         let domain = XlaSession::new(&client).domain().with_mesh(mesh.clone());
-        let function: CompiledFunctionDispatcher<XlaDomain<'_>, _, (), ArrayIrType, ArrayIrType> = jit_with_options(
-            &domain,
-            |(), input| trace(input),
-            XlaOptions::new(mesh.clone()).with_input_bound_bucketing(XlaInputBoundBucketing::PowerOfTwo),
-        );
+        let function: CompiledFunctionDispatcher<XlaDomain<'_>, _, (), ArrayIrType, ArrayIrType> = domain
+            .jit_with_options(
+                |(), input| trace(input),
+                XlaOptions::new(mesh.clone()).with_input_bound_bucketing(XlaInputBoundBucketing::PowerOfTwo),
+            );
         let call = |values: &[f32]| {
             let input = f32_vector(&domain, &mesh, values);
             function.call((), XlaValue::Array(input)).unwrap()
@@ -14241,6 +14242,178 @@ mod tests {
                     .to_string(),
             }),
         );
+    }
+
+    #[test]
+    fn test_jit_with_options_and_capacity_retains_inferred_domain() {
+        let client = execution_client();
+        let mesh = domain_mesh(&client, "x", 1);
+        let first_domain = XlaSession::new(&client).domain().with_mesh(mesh.clone());
+        let second_domain = XlaSession::new(&client).domain().with_mesh(mesh.clone());
+        let function: CompiledFunctionDispatcher<XlaDomain<'_>, _, (), ArrayIrType, ArrayIrType> =
+            ryft_core::jit_with_options_and_capacity(|(), input| Ok(input), XlaOptions::new(mesh.clone()), 2);
+        let cloned = function.clone();
+        assert!(function.domain().is_none());
+        assert!(cloned.domain().is_none());
+        assert_eq!(function.cache_capacity(), 2);
+
+        let first = cloned.call((), XlaValue::Array(f32_scalar(&first_domain, &mesh, 1.0))).unwrap();
+        assert_eq!(read_f32s(&client, program_array(&first)), vec![1.0]);
+        assert!(Arc::ptr_eq(function.domain().unwrap().session(), first_domain.session()));
+        assert!(Arc::ptr_eq(cloned.domain().unwrap().session(), first_domain.session()));
+
+        let warm = function.call((), XlaValue::Array(f32_scalar(&second_domain, &mesh, 2.0))).unwrap();
+        assert_eq!(read_f32s(&client, program_array(&warm)), vec![2.0]);
+        assert!(Arc::ptr_eq(warm.xla_domain().session(), first_domain.session()));
+        cloned.clear_cache();
+        assert_eq!(function.specialization_count(), 0);
+        assert!(Arc::ptr_eq(function.domain().unwrap().session(), first_domain.session()));
+
+        let cold = cloned.call((), XlaValue::Array(f32_scalar(&second_domain, &mesh, 3.0))).unwrap();
+        assert_eq!(read_f32s(&client, program_array(&cold)), vec![3.0]);
+        assert!(Arc::ptr_eq(cold.xla_domain().session(), first_domain.session()));
+
+        // The stateful entry point preserves inference and whole-invocation completion for pure programs as well.
+        let completed = function
+            .call_statefully_async((), XlaValue::Array(f32_scalar(&second_domain, &mesh, 4.0)))
+            .r#await()
+            .unwrap();
+        assert_eq!(read_f32s(&client, program_array(&completed)), vec![4.0]);
+        assert!(Arc::ptr_eq(completed.xla_domain().session(), first_domain.session()));
+        assert_eq!(function.statistics().dispatch_hits, 2);
+        assert_eq!(function.statistics().traces, 2);
+        assert_eq!(function.specialization_count(), 1);
+        assert_eq!(first_domain.cache_size(), 1);
+        assert_eq!(second_domain.cache_size(), 0);
+    }
+
+    #[test]
+    fn test_jit_with_options_retains_domain_after_empty_input_and_trace_failure() {
+        let client = execution_client();
+        let mesh = domain_mesh(&client, "x", 1);
+        let first_domain = XlaSession::new(&client).domain().with_mesh(mesh.clone());
+        let second_domain = XlaSession::new(&client).domain().with_mesh(mesh.clone());
+        let attempts = AtomicUsize::new(0);
+        let function: CompiledFunctionDispatcher<XlaDomain<'_>, _, (), Vec<ArrayIrType>, Vec<ArrayIrType>> =
+            ryft_core::jit_with_options(
+                |(), inputs| {
+                    if attempts.fetch_add(1, Ordering::Relaxed) == 0 {
+                        return Err(
+                            ProgramError::InvalidArgument { message: "first trace rejected".to_string() }.into()
+                        );
+                    }
+                    Ok(inputs)
+                },
+                XlaOptions::new(mesh.clone()),
+            );
+        assert!(matches!(
+            function.call((), Vec::new()),
+            Err(XlaDomainError::Tracing(ProgramError::InvalidArgument { message }))
+                if message == "compilation requires an input leaf to infer a domain; use an explicit domain for empty \
+                               inputs",
+        ));
+        assert!(function.domain().is_none());
+        assert_eq!(attempts.load(Ordering::Relaxed), 0);
+
+        assert!(matches!(
+            function.call((), vec![XlaValue::Array(f32_scalar(&first_domain, &mesh, 1.0))]),
+            Err(XlaDomainError::Tracing(ProgramError::InvalidArgument { message }))
+                if message == "first trace rejected",
+        ));
+        assert!(Arc::ptr_eq(function.domain().unwrap().session(), first_domain.session()));
+        assert_eq!(function.specialization_count(), 0);
+
+        let retried = function.call((), vec![XlaValue::Array(f32_scalar(&second_domain, &mesh, 2.0))]).unwrap();
+        assert_eq!(read_f32s(&client, program_array(&retried[0])), vec![2.0]);
+        assert!(Arc::ptr_eq(retried[0].xla_domain().session(), first_domain.session()));
+        assert_eq!(function.call((), Vec::new()).unwrap(), Vec::<XlaValue<'_>>::new());
+        assert_eq!(attempts.load(Ordering::Relaxed), 3);
+        assert_eq!(function.specialization_count(), 2);
+        assert_eq!(second_domain.cache_size(), 0);
+    }
+
+    #[test]
+    fn test_jit_with_options_clones_bind_one_domain_concurrently() {
+        let client = execution_client();
+        let mesh = domain_mesh(&client, "x", 1);
+        let first_domain = XlaSession::new(&client).domain().with_mesh(mesh.clone());
+        let second_domain = XlaSession::new(&client).domain().with_mesh(mesh.clone());
+        let function: CompiledFunctionDispatcher<XlaDomain<'_>, _, (), ArrayIrType, ArrayIrType> =
+            ryft_core::jit_with_options(|(), input| Ok(input), XlaOptions::new(mesh.clone()));
+        let first_function = function.clone();
+        let second_function = function.clone();
+        let first_input = XlaValue::Array(f32_scalar(&first_domain, &mesh, 1.0));
+        let second_input = XlaValue::Array(f32_scalar(&second_domain, &mesh, 2.0));
+        let barrier = Barrier::new(3);
+        let (first, second) = std::thread::scope(|scope| {
+            let barrier = &barrier;
+            let first = scope.spawn(move || {
+                barrier.wait();
+                first_function.call((), first_input).unwrap()
+            });
+            let second = scope.spawn(move || {
+                barrier.wait();
+                second_function.call((), second_input).unwrap()
+            });
+            barrier.wait();
+            (first.join().unwrap(), second.join().unwrap())
+        });
+
+        let selected = function.domain().unwrap();
+        assert!(
+            Arc::ptr_eq(selected.session(), first_domain.session())
+                || Arc::ptr_eq(selected.session(), second_domain.session()),
+        );
+        assert!(Arc::ptr_eq(first.xla_domain().session(), selected.session()));
+        assert!(Arc::ptr_eq(second.xla_domain().session(), selected.session()));
+        assert_eq!(read_f32s(&client, program_array(&first)), vec![1.0]);
+        assert_eq!(read_f32s(&client, program_array(&second)), vec![2.0]);
+        assert!(matches!(function.statistics().traces, 1..=2));
+        assert_eq!(function.specialization_count(), 1);
+        assert_eq!(first_domain.cache_size() + second_domain.cache_size(), 1);
+    }
+
+    #[test]
+    fn test_stage_recovers_domain_and_supports_explicit_nullary_calls() {
+        let client = execution_client();
+        let mesh = domain_mesh(&client, "x", 1);
+        let domain = XlaSession::new(&client).domain().with_mesh(mesh.clone());
+        let options = XlaOptions::new(mesh.clone());
+        assert!(matches!(
+            ryft_core::stage::<XlaValue<'_>, _, Vec<ArrayIrType>, _>(
+                |inputs| inputs,
+                Vec::<XlaValue<'_>>::new(),
+                options.clone(),
+            ),
+            Err(XlaDomainError::Tracing(ProgramError::InvalidArgument { message }))
+                if message == "staging requires an input leaf to infer a domain; use an explicit domain for empty \
+                               inputs",
+        ));
+
+        let input = XlaValue::Array(f32_scalar(&domain, &mesh, 7.0));
+        let input_type = input.r#type().into_owned();
+        let inferred: StagedFunction<XlaDomain<'_>, ArrayIrType, ArrayIrType> =
+            ryft_core::stage(|input| input, input.clone(), options.clone()).unwrap();
+        let explicit: StagedFunction<XlaDomain<'_>, ArrayIrType, ArrayIrType> =
+            domain.stage(|input| input, input_type.clone(), options.clone()).unwrap();
+        assert_eq!(inferred.input_types(), &[input_type.clone()]);
+        assert_eq!(inferred.output_types(), &[input_type]);
+        assert_eq!(inferred.source_program().program().to_string(), explicit.source_program().program().to_string());
+        assert_eq!(domain.cache_size(), 0);
+
+        let compiled = inferred.lower(&domain).unwrap().compile(&domain).unwrap();
+        let output = compiled.executable_function().call(&domain, input).unwrap();
+        assert_eq!(read_f32s(&client, program_array(&output)), vec![7.0]);
+        assert!(Arc::ptr_eq(output.xla_domain().session(), domain.session()));
+
+        let nullary_stage: StagedFunction<XlaDomain<'_>, (), ()> = domain.stage(|()| (), (), options.clone()).unwrap();
+        assert_eq!(nullary_stage.input_types(), &[]);
+        assert_eq!(nullary_stage.output_types(), &[]);
+        let nullary: CompiledFunctionDispatcher<XlaDomain<'_>, _, (), (), ()> =
+            domain.jit_with_options(|(), ()| Ok(()), options);
+        assert!(Arc::ptr_eq(nullary.domain().unwrap().session(), domain.session()));
+        nullary.call((), ()).unwrap();
+        assert_eq!(nullary.specialization_count(), 1);
     }
 
     #[test]

@@ -85,11 +85,11 @@ use std::hash::Hash;
 use std::sync::{Arc, Mutex};
 
 use ryft_core::{
-    ArrayIrType, ArrayType, CapturingContext, ClosedProgram, CompiledFunction,
+    ArrayIrType, ArrayType, CapturingContext, ClosedProgram, Compile, CompiledFunction,
     CompiledFunctionDispatcher as CoreCompiledFunctionDispatcher, Constant, Context, DeviceMesh, DifferentiableType,
     DomainTracingContext, ExecutableFunction, ForwardModeDifferentiate, JitCacheStatistics, Parameterized,
     ParameterizedFamily, ProgramError, ProjectedContext, ProjectedValue, ReferenceExecution, ReverseModeDifferentiate,
-    StagedFunction, Tracer, Typed, Value, ValueProjection, jit_with_options as core_jit_with_options,
+    StagedFunction, Tracer, Typed, Value, ValueProjection,
 };
 use ryft_pjrt::Execution;
 
@@ -325,7 +325,7 @@ where
         let outputs = function(static_parameters, project_tracers::<In>(inputs)?)?;
         lift_tracers::<Out>(outputs)
     };
-    JittedXlaFunction { function: core_jit_with_options(domain, function, options) }
+    JittedXlaFunction { function: domain.jit_with_options(function, options) }
 }
 
 /// Constructs a retained dispatcher for `function` on `mesh` with otherwise default options.
@@ -512,7 +512,7 @@ where
             Family: ParameterizedFamily<XlaConstant> + ParameterizedFamily<XlaStatefulCompileTracer<'c>>,
         >,
 {
-    StatefulJittedXlaFunction { function: core_jit_with_options(domain, function, options) }
+    StatefulJittedXlaFunction { function: domain.jit_with_options(function, options) }
 }
 
 /// Constructs a retained stateful dispatcher for a heterogeneous XLA `function` on `mesh` with otherwise default

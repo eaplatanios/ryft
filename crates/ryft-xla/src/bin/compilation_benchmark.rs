@@ -6,8 +6,8 @@ use std::process::Command;
 use std::time::{Duration, Instant};
 
 use ryft_core::{
-    ArrayIrType, ArrayType, CompiledFunction, DataType, Device, DeviceMesh, Dimension, DiskCache, JitCacheStatistics,
-    LogicalMesh, MeshAxis, MeshAxisType, Shape, Sharding, Sin, StagedFunction, ValueProjection, stage,
+    ArrayIrType, ArrayType, Compile, CompiledFunction, DataType, Device, DeviceMesh, Dimension, DiskCache,
+    JitCacheStatistics, LogicalMesh, MeshAxis, MeshAxisType, Shape, Sharding, Sin, StagedFunction, ValueProjection,
 };
 use ryft_pjrt::{Client, ClientOptions, CpuClientOptions, load_cpu_plugin};
 use ryft_xla::{
@@ -177,8 +177,7 @@ fn stage_workload<'c>(
     mesh: &DeviceMesh,
     r#type: ArrayType,
 ) -> Result<BenchmarkStagedFunction<'c>, Box<dyn std::error::Error>> {
-    Ok(stage(
-        domain,
+    Ok(domain.stage(
         |input| {
             let input = ValueProjection::<ArrayType>::into_projected(input).unwrap();
             (input.clone() * input.clone() + input).sin().unwrap().into_value()
