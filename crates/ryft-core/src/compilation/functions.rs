@@ -786,7 +786,7 @@ struct ExecutableFunctionState<C: CompilationDomain, Input: Parameterized<C::Typ
     /// Output parameter structure used to reconstruct structured runtime values.
     output_structure: Output::ParameterStructure,
 
-    /// Structured input type marker.
+    /// [`PhantomData`] marker tying this state to its structured input type.
     input: PhantomData<fn(Input)>,
 }
 
