@@ -236,24 +236,40 @@ When upgrading the OpenXLA commit used by this crate, treat it as a cross-crate 
       registration-only objects, including the PJRT CPU compiler.
 2. Rebuild and publish precompiled `ryft-xla-sys` artifacts using `.github/workflows/build_ryft_xla_sys.yaml`.
     - Make sure your OpenXLA upgrade changes are committed and pushed to a branch before triggering the workflow.
+    - Create and push `ryft-xla-sys-<XLA_COMMIT>` at that exact build commit. The workflow checks this tag before
+      starting native builds and records the build commit and run in the release. Pre-creating the tag also avoids
+      relying on the workflow token to create tags for commits that change workflow files. Do not move an existing
+      published tag without explicit approval.
     - Trigger the GitHub workflow that builds `ryft-xla-sys` on the branch that contains your changes:
       ```bash
       gh workflow run build_ryft_xla_sys.yaml --repo eaplatanios/ryft --ref <branch-name>
       ```
-    - You can use the following command to monitor the run until completion:
+    - You can use the following command to check the run status periodically:
       ```bash
-      gh run watch <run-id> --repo eaplatanios/ryft --exit-status
+      gh run view <run-id> --repo eaplatanios/ryft --json status,conclusion
       ```
       This workflow can take a couple of hours because it builds multiple platform-specific artifacts.
-    - If needed, download the produced artifacts locally for checksum verification:
+    - After successful publication, download the finalized release assets for checksum verification:
       ```bash
-      gh run download <run-id> --repo eaplatanios/ryft --dir /tmp/ryft-xla-sys-artifacts
+      gh release download ryft-xla-sys-<XLA_COMMIT> \
+        --repo eaplatanios/ryft \
+        --pattern '*.tar.gz' \
+        --dir /tmp/ryft-xla-sys-release
       ```
     - Confirm that the release tag follows the expected format (`ryft-xla-sys-<XLA_COMMIT>`), and then compute
-      the updated SHA-256 checksum for each artifact using this command from within the directory containing the
-      downloaded artifacts:
+      the updated SHA-256 checksum for every downloaded asset from its final bytes:
       ```bash
-      shasum -a 256 '*.tar.gz
+      shasum -a 256 /tmp/ryft-xla-sys-release/*.tar.gz
+      ```
+      Compare final bytes with any workflow artifacts used for earlier checks. Intermediate hashes must not replace
+      finalized release checksums.
+    - For Rust-only consumer fixes after publication, reuse the four-platform consumer matrix against the existing
+      release without rebuilding or replacing native artifacts. Its release tag comes from the checked-out XLA pin:
+      ```bash
+      gh workflow run build_ryft_xla_sys.yaml \
+        --repo eaplatanios/ryft \
+        --ref <branch-name> \
+        -f verify_published_only=true
       ```
     - After the workflow publishes release artifacts for the new `XLA_COMMIT`, update these functions in `build.rs`:
         - `BuildConfiguration::precompiled_artifact_name`
