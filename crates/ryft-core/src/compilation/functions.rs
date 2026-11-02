@@ -24,8 +24,6 @@ use crate::tracing::{DomainTracingContext, Tracer};
 /// Tracer used while staging a compiled function in the operation universe of `C`.
 pub type CompilationTracer<C> = Tracer<DomainTracingContext<C, <C as Domain>::Value>>;
 
-// TODO(eaplatanios): Review from here onwards.
-
 /// Cache key identifying one specialization of a retained function. Cache reuse is authorized only when all
 /// three of the following components agree:
 ///
@@ -71,23 +69,28 @@ impl<P, I, K> FunctionSpecializationKey<P, I, K> {
     }
 
     /// Returns the static parameters (i.e., the host values declared static) for the keyed specialization.
+    /// Refer to the documentation of [`FunctionSpecializationKey`] for more information.
     #[inline]
     pub fn static_parameters(&self) -> &P {
         &self.static_parameters
     }
 
     /// Returns the parameter structure of the dynamic input for the keyed specialization.
+    /// Refer to the documentation of [`FunctionSpecializationKey`] for more information.
     #[inline]
     pub fn input_structure(&self) -> &I {
         &self.input_structure
     }
 
-    /// Returns the owner-defined dispatch key for the dynamic input.
+    /// Returns the owner-defined dispatch key for the dynamic inputs.
+    /// Refer to the documentation of [`FunctionSpecializationKey`] for more information.
     #[inline]
     pub fn dispatch_key(&self) -> &K {
         &self.dispatch_key
     }
 }
+
+// TODO(eaplatanios): Review from here onwards.
 
 /// Owned flat staging artifact constructed by [`Self::stage`] and borrowed by [`CompilationDomain::lower`].
 ///
