@@ -1,9 +1,15 @@
 name: Build `ryft-xla-sys` Binaries
 
-on: workflow_dispatch
+on:
+  workflow_dispatch:
+    inputs:
+      verify_published_only:
+        description: Verify published archives without rebuilding or publishing native artifacts
+        type: boolean
+        default: false
 
 concurrency:
-  group: ${{ github.workflow }}-${{ github.ref }}
+  group: ${{ github.workflow }}-${{ github.ref }}-${{ inputs.verify_published_only && 'verify-published' || 'build' }}
   cancel-in-progress: true
 
 permissions:
@@ -15,7 +21,36 @@ env:
   CARGO_INCREMENTAL: "0"
 
 jobs:
+  validate-release-tag:
+    if: ${{ !inputs.verify_published_only }}
+    runs-on: ubuntu-latest
+    permissions:
+      contents: read
+    steps:
+      - uses: actions/checkout@v6
+        with:
+          ref: ${{ github.sha }}
+      - name: Verify Release Tag Points to Build Source
+        shell: bash
+        env:
+          GH_TOKEN: ${{ github.token }}
+        run: |
+          XLA_COMMIT_ID=$(sed -n 's/^XLA_COMMIT = "\([0-9a-f]\{40\}\)"$/\1/p' crates/ryft-xla-sys/WORKSPACE)
+          [[ "$XLA_COMMIT_ID" =~ ^[0-9a-f]{40}$ ]] || { echo "invalid XLA commit identifier"; exit 1; }
+          RELEASE_TAG="ryft-xla-sys-$XLA_COMMIT_ID"
+          if ! gh api "repos/$GITHUB_REPOSITORY/git/ref/tags/$RELEASE_TAG" --silent; then
+            echo "::error::Create and push $RELEASE_TAG at $GITHUB_SHA before native publication."
+            exit 1
+          fi
+          TAG_SHA=$(gh api "repos/$GITHUB_REPOSITORY/commits/$RELEASE_TAG" --jq '.sha')
+          if [[ "$TAG_SHA" != "$GITHUB_SHA" ]]; then
+            echo "::error::$RELEASE_TAG points to $TAG_SHA, but this build uses $GITHUB_SHA."
+            exit 1
+          fi
+
   build:
+    if: ${{ !inputs.verify_published_only }}
+    needs: ["validate-release-tag"]
     name: Build [${{ matrix.config.os }}-${{ matrix.config.architecture }}-${{ matrix.config.device }}]
     runs-on: ${{ matrix.config.runner }}
     strategy:
@@ -224,74 +259,6 @@ jobs:
           cp bazel-bin/ryft-xla-sys-archive.tar.gz $OUTPUT
           echo "library=$OUTPUT" >> $GITHUB_OUTPUT
 
-      - name: Diagnose Windows LLVM Source Paths
-        if: ${{ failure() && matrix.config.os == 'windows' && steps.build_ryft_xla_sys_library.outcome == 'failure' }}
-        working-directory: ./ryft/crates/ryft-xla-sys
-        shell: python {0}
-        run: |
-          import hashlib
-          import os
-          from pathlib import Path
-
-          try:
-              execution_root = Path("bazel-out").resolve(strict=True).parent
-              output_base = execution_root.parent.parent
-          except (OSError, RuntimeError) as error:
-              print(f"Cannot resolve bazel-out: {error}")
-              output_base = Path("C:/_bazel")
-              execution_root = output_base / "execroot/ryft-xla-sys"
-
-          print(f"Output base: {output_base}\nExecution root: {execution_root}")
-          for directory in (
-              output_base / "external/llvm-raw",
-              output_base / "external/llvm-project",
-              output_base / "external/llvm-project/llvm/lib",
-              execution_root / "external/llvm-project",
-          ):
-              try:
-                  metadata = directory.lstat()
-                  tag = getattr(metadata, "st_reparse_tag", 0)
-                  print(f"{directory}: reparse_tag={tag:#x}")
-                  if directory.is_symlink() or tag:
-                      print(f"  target: {os.readlink(directory)}")
-                  print(f"  resolved: {directory.resolve(strict=True)}")
-              except (OSError, RuntimeError) as error:
-                  print(f"{directory}: {error}")
-
-          def read_source(path):
-              """Reports source readability and a digest without printing its contents."""
-              try:
-                  data = path.read_bytes()
-                  print(f"{path}: {len(data)} bytes, sha256={hashlib.sha256(data).hexdigest()}")
-              except OSError as error:
-                  print(f"{path}: {error}")
-
-          source = "llvm/lib/Demangle/DLangDemangle.cpp"
-          for root in (
-              output_base / "external/llvm-raw",
-              output_base / "external/llvm-project",
-              execution_root / "external/llvm-project",
-          ):
-              read_source(root / source)
-          try:
-              os.chdir(execution_root)
-              print(f"Compiler working directory: {Path.cwd()}")
-              read_source(Path("external/llvm-project") / source)
-          except OSError as error:
-              print(f"Cannot enter compiler working directory: {error}")
-
-          pattern = "*/bin/external/llvm-project/llvm/_objs/Demangle/DLangDemangle.obj.params"
-          parameters = sorted((execution_root / "bazel-out").glob(pattern))
-          if not parameters:
-              print("No DLangDemangle compiler response files found")
-          for path in parameters:
-              try:
-                  data = path.read_bytes()
-                  encoding = "utf-16" if data.startswith((b"\xff\xfe", b"\xfe\xff")) else "utf-8-sig"
-                  print(f"{path}:\n{data.decode(encoding, errors='replace')}")
-              except OSError as error:
-                  print(f"{path}: {error}")
-
       # Retain the exact built headers for binding regeneration even when a subsequent compatibility check fails.
       # Publication still depends on every build and test job succeeding.
       - name: Upload `ryft-xla-sys` Library
@@ -399,6 +366,7 @@ jobs:
 
   release:
     name: Release
+    if: ${{ !inputs.verify_published_only }}
     needs: ["build"]
     runs-on: ubuntu-latest
     steps:
@@ -408,11 +376,18 @@ jobs:
         uses: softprops/action-gh-release@v2
         with:
           tag_name: ryft-xla-sys-${{ needs.build.outputs.xla_commit_id }}
+          target_commitish: ${{ github.sha }}
+          body: |
+            Native build source: ${{ github.sha }}
+            Build and publication run: ${{ github.server_url }}/${{ github.repository }}/actions/runs/${{ github.run_id }}
           files: "*.tar.gz/*.tar.gz"
 
   verify-release:
     name: Verify Published Consumer [${{ matrix.config.os }}-${{ matrix.config.architecture }}]
+    if: ${{ !cancelled() && (inputs.verify_published_only || (needs.build.result == 'success' && needs.release.result == 'success')) }}
     needs: ["build", "release"]
+    permissions:
+      contents: read
     runs-on: ${{ matrix.config.runner }}
     strategy:
       fail-fast: false
@@ -445,9 +420,11 @@ jobs:
         shell: bash
         env:
           GH_TOKEN: ${{ github.token }}
-          RELEASE_TAG: ryft-xla-sys-${{ needs.build.outputs.xla_commit_id }}
           ARCHIVE_NAME: ryft-xla-sys-${{ matrix.config.os }}-${{ matrix.config.architecture }}-cpu.tar.gz
         run: |
+          XLA_COMMIT_ID=$(sed -n 's/^XLA_COMMIT = "\([0-9a-f]\{40\}\)"$/\1/p' crates/ryft-xla-sys/WORKSPACE)
+          [[ "$XLA_COMMIT_ID" =~ ^[0-9a-f]{40}$ ]] || { echo "invalid XLA commit identifier"; exit 1; }
+          RELEASE_TAG="ryft-xla-sys-$XLA_COMMIT_ID"
           gh release download "$RELEASE_TAG" --repo "$GITHUB_REPOSITORY" --pattern "$ARCHIVE_NAME" --dir native-release
           echo "RYFT_XLA_SYS_ARCHIVE=$GITHUB_WORKSPACE/native-release/$ARCHIVE_NAME" >> "$GITHUB_ENV"
 

@@ -6,7 +6,7 @@ use std::sync::OnceLock;
 
 use prost::Message;
 
-use crate::protos::{CpuTopology, GpuTopology, Shape};
+use crate::protos::Shape;
 use crate::{
     Api, BufferType, Client, DeviceDescription, Error, Layout, MemoryKindId, NamedValue, Plugin, Value,
     hash_map_from_c_api, invoke_pjrt_api_error_fn, slice_from_c_api, str_from_c_api,
@@ -193,12 +193,11 @@ impl Topology<'_> {
         })
     }
 
-    /// Serializes this [`Topology`] to a Protobuf message.
-    pub fn proto(&self) -> Result<TopologyProto, Error> {
+    /// Serializes this [`Topology`] to its complete Protobuf representation, including platform metadata and the
+    /// opaque platform-specific `google.protobuf.Any` payload.
+    pub fn proto(&self) -> Result<crate::protos::Topology, Error> {
         // It would be nice to be able to get this directly without having to go through `Topology::serialize` first,
-        // but unfortunately, the PJRT C API does not provide the necessary hooks for doing that. Also, ideally this
-        // would return a `Topology`, but unfortunately, the PJRT C API does not provide the necessary hooks for doing
-        // that either.
+        // but the PJRT C API does not provide a direct Protobuf accessor.
         self.serialize()?.proto()
     }
 
@@ -344,12 +343,12 @@ impl SerializedTopology {
         unsafe { slice_from_c_api(self.data as *const _, self.data_size) }
     }
 
-    /// Returns the Protobuf message that corresponds to this [`SerializedTopology`].
-    pub fn proto(&self) -> Result<TopologyProto, Error> {
-        CpuTopology::decode(self.data())
-            .map(TopologyProto::CpuTopology)
-            .or_else(|_| GpuTopology::decode(self.data()).map(TopologyProto::GpuTopology))
-            .map_err(|_| Error::unimplemented("topology Protobuf decoding is not implemented for this platform"))
+    /// Returns the complete Protobuf representation of this [`SerializedTopology`], preserving its platform metadata
+    /// and opaque platform-specific `google.protobuf.Any` payload. The result can be passed directly to
+    /// [`Client::topology_from_proto`] or [`Plugin::topology_from_proto`].
+    pub fn proto(&self) -> Result<crate::protos::Topology, Error> {
+        crate::protos::Topology::decode(self.data())
+            .map_err(|error| Error::invalid_argument(format!("failed to decode topology Protobuf: {error}")))
     }
 }
 
@@ -376,19 +375,6 @@ impl Drop for SerializedTopology {
             unsafe { deleter(self.handle) };
         }
     }
-}
-
-/// Protobuf message that represents a [`Topology`]. Note that the actual Protobuf representation of [`Topology`]s
-/// is platform-specific. This enum only supports known topology Protobuf message types.
-///
-/// Note that this indirection when it comes to Protobuf serialization of [`Topology`]s exists because the PJRT
-/// C API does not expose a Protobuf serialization function and the serialization function it does expose returns
-/// just the platform-specific portion of the overall [`Topology`](crate::protos::Topology) Protobuf message.
-#[allow(clippy::large_enum_variant)]
-#[derive(Clone, Debug, PartialEq)]
-pub enum TopologyProto {
-    CpuTopology(CpuTopology),
-    GpuTopology(GpuTopology),
 }
 
 #[allow(dead_code, non_camel_case_types, non_snake_case, non_upper_case_globals)]
@@ -728,8 +714,14 @@ pub(crate) mod ffi {
 mod tests {
     use std::collections::HashMap;
 
+    use pretty_assertions::assert_eq;
+    use prost::Message;
+
+    use crate::protos::{CpuTargetMachineOptions, CpuTopology, CpuTopologyDevice, GpuTopology};
     use crate::tests::{TestPlatform, test_for_each_platform};
     use crate::{Error, Topology};
+
+    use super::SerializedTopology;
 
     #[test]
     fn test_client_topology() {
@@ -750,7 +742,10 @@ mod tests {
                     _ => {
                         let serialized_topology = topology.serialize().unwrap();
                         assert!(!serialized_topology.data().is_empty());
-                        assert!(serialized_topology.proto().is_ok());
+                        let proto = serialized_topology.proto().unwrap();
+                        assert_eq!(proto.platform_name.as_str(), platform_name.as_ref());
+                        assert_eq!(proto.platform_version.as_str(), topology.platform_version().unwrap().as_ref());
+                        assert_eq!(topology.proto(), Ok(proto.clone()));
                         let deserialized = client.deserialize_topology(serialized_topology.data());
                         match platform {
                             TestPlatform::Cpu | TestPlatform::Cuda12 | TestPlatform::Cuda13 | TestPlatform::Rocm10 => {
@@ -765,6 +760,9 @@ mod tests {
                                     assert!(deserialized.attribute("device_memory_bytes_limit").is_ok());
                                 }
                                 assert_eq!(deserialized.fingerprint(), fingerprint);
+                                let deserialized_proto = client.topology_from_proto(proto).unwrap();
+                                assert_eq!(deserialized_proto.platform_name(), topology.platform_name());
+                                assert_eq!(deserialized_proto.fingerprint(), fingerprint);
                             }
                             _ => assert!(deserialized.is_err()),
                         }
@@ -833,5 +831,106 @@ mod tests {
                 _ => assert!(topology.is_ok()),
             }
         });
+    }
+
+    #[test]
+    fn test_serialized_topology_proto_cpu() {
+        // The nested CPU device ID uses a non-UTF-8 varint. Treating the envelope as a GPU topology incorrectly
+        // interprets this opaque payload as a string and rejects an otherwise valid topology.
+        let data = b"\x08\x80\x01\x12\x03cpu\x1a\x01v\x4a\x3e\
+                     \x0a\x28type.googleapis.com/xla.CpuTopologyProto\
+                     \x12\x12\x0a\x05\x10\x02\x18\x80\x01\x2a\x09\x0a\x01t\x12\x01c\x1a\x01f";
+        let serialized = SerializedTopology {
+            handle: std::ptr::null_mut(),
+            deleter: None,
+            data: data.as_ptr().cast(),
+            data_size: data.len(),
+        };
+        let proto = serialized.proto().unwrap();
+        assert_eq!(proto.platform_id, 128);
+        assert_eq!(proto.platform_name, "cpu");
+        assert_eq!(proto.platform_version, "v");
+        assert!(!proto.is_subslice_topology);
+        let payload = proto.platform_specific_topology.unwrap();
+        assert_eq!(payload.type_url, "type.googleapis.com/xla.CpuTopologyProto");
+        assert_eq!(
+            CpuTopology::decode(payload.value.as_slice()),
+            Ok(CpuTopology {
+                cpu_devices: vec![CpuTopologyDevice { process_index: 2, local_hardware_id: 128 }],
+                target_machine_options: Some(CpuTargetMachineOptions {
+                    triple: "t".to_string(),
+                    cpu: "c".to_string(),
+                    features: "f".to_string(),
+                }),
+            }),
+        );
+    }
+
+    #[test]
+    fn test_serialized_topology_proto_gpu() {
+        let data = b"\x08\x80\x01\x12\x04cuda\x1a\x01v\x4a\x37\
+                     \x0a\x28type.googleapis.com/xla.GpuTopologyProto\
+                     \x12\x0b\x1a\x03gpu\x20\x01\x28\x02\x30\x03";
+        let serialized = SerializedTopology {
+            handle: std::ptr::null_mut(),
+            deleter: None,
+            data: data.as_ptr().cast(),
+            data_size: data.len(),
+        };
+        let proto = serialized.proto().unwrap();
+        assert_eq!(proto.platform_id, 128);
+        assert_eq!(proto.platform_name, "cuda");
+        assert_eq!(proto.platform_version, "v");
+        assert!(!proto.is_subslice_topology);
+        let payload = proto.platform_specific_topology.unwrap();
+        assert_eq!(payload.type_url, "type.googleapis.com/xla.GpuTopologyProto");
+        assert_eq!(
+            GpuTopology::decode(payload.value.as_slice()),
+            Ok(GpuTopology {
+                platform_version: "gpu".to_string(),
+                num_partitions: 1,
+                num_hosts_per_partition: 2,
+                num_devices_per_host: 3,
+                ..Default::default()
+            }),
+        );
+    }
+
+    #[test]
+    fn test_serialized_topology_proto_unknown_platform() {
+        let data = b"\x08\x80\x01\x12\x03tpu\x1a\x01v\x4a\x31\
+                     \x0a\x2ctype.googleapis.com/xla.UnknownTopologyProto\x12\x01\xff";
+        let serialized = SerializedTopology {
+            handle: std::ptr::null_mut(),
+            deleter: None,
+            data: data.as_ptr().cast(),
+            data_size: data.len(),
+        };
+        let proto = serialized.proto().unwrap();
+        assert_eq!(proto.platform_id, 128);
+        assert_eq!(proto.platform_name, "tpu");
+        assert_eq!(proto.platform_version, "v");
+        assert!(!proto.is_subslice_topology);
+        let payload = proto.platform_specific_topology.unwrap();
+        assert_eq!(payload.type_url, "type.googleapis.com/xla.UnknownTopologyProto");
+        assert_eq!(payload.value, vec![0xff]);
+    }
+
+    #[test]
+    fn test_serialized_topology_proto_invalid_data() {
+        let data = [0u8];
+        let serialized = SerializedTopology {
+            handle: std::ptr::null_mut(),
+            deleter: None,
+            data: data.as_ptr().cast(),
+            data_size: data.len(),
+        };
+        assert!(matches!(
+            serialized.proto(),
+            Err(Error::InvalidArgument { message, .. })
+                if message == "failed to decode topology Protobuf: \
+                               failed to decode Protobuf message: \
+                               invalid tag value: 0",
+        ));
     }
 }

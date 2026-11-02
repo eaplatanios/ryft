@@ -101,6 +101,9 @@ and this project adheres to [Semantic Versioning](https://semver.org/).
   allocations, avoiding fence allocations and callback registrations for already completed successful executions,
   and allocating event waker storage only when a pending event is polled.
 - Changed `Memory` equality to fall back to memory-kind strings when a PJRT plugin does not implement memory kind IDs.
+- Corrected `Topology::proto` and `SerializedTopology::proto` to return the complete `protos::Topology` envelope,
+  preserving platform metadata and its opaque `Any` payload. Removed the obsolete `TopologyProto` enum and the
+  platform-specific decoder guessing that rejected valid CPU topologies or silently misidentified them as GPU data.
 - Switched to using `Error::MissingFunction` instead of `Error::Unimplemented` for PJRT dispatch failures,
   distinguishing unavailable functions from native calls that return an unimplemented status.
 - Error buffers now pass their layout through the new `device_layout` field.
