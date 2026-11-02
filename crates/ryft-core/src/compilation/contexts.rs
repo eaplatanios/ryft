@@ -294,13 +294,10 @@ pub trait Compile: CompilationDomain {
 
 impl<C: CompilationDomain> Compile for C {}
 
-// TODO(eaplatanios): Review from here onwards.
-
-/// Stages an infallible capture-free function using the domain and abstract types of runtime `inputs`.
-///
-/// The inputs are used only to recover their domain and signature, and the function runs on fresh symbolic tracers.
-/// The first input leaf supplies the domain through [`Value::domain`]. Use [`Compile::stage`] for abstract input types
-/// or inputs with no leaves, and [`StagedFunction::stage`] for fallible functions or explicit runtime captures.
+/// Stages an infallible capture-free function using the domain and abstract types of runtime `inputs`. The inputs are
+/// used only to recover their domain and signature, and the function runs on fresh symbolic tracers. The first input
+/// leaf supplies the domain through [`Value::domain`]. Use [`Compile::stage`] for abstract input types or inputs with
+/// no leaves, and [`StagedFunction::stage`] for fallible functions or explicit runtime captures.
 ///
 /// # Errors
 ///
@@ -344,6 +341,8 @@ where
     .map_err(ProgramError::from)?;
     domain.stage(function, input_types, options)
 }
+
+// TODO(eaplatanios): Review from here onwards.
 
 /// Constructs a retained dispatcher for `function` with default options and cache capacity, inferring its domain on the
 /// first nonempty call.
