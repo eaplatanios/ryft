@@ -25,9 +25,11 @@
 //! compilation options. A _function_ adds the Rust input and output container structures needed for typed calls and
 //! carries the resulting backend artifacts through the lifecycle. Every lifecycle handle below is therefore a function,
 //! and [`CompiledFunctionDispatcher`] is a retained dispatcher over a Rust closure that produces one program per
-//! specialization. The `*Program` names inside the domain contracts (i.e., [`CompilationDomain::LoweredProgram`],
-//! [`CompilationDomain::CompiledProgram`], and [`FlatCompilationProgram`]) name the backend and IR artifacts that
-//! those functions carry.
+//! specialization. In this module, every `*Program` name denotes a flat artifact without container structures.
+//! Besides [`StagedProgram`], which core produces by staging, these are [`FlatCompilationProgram`] (i.e., the source
+//! program of a staged program with its captures lifted into leading inputs, which backends lower and nested calls
+//! embed) and the backend-owned [`CompilationDomain::LoweredProgram`] and [`CompilationDomain::CompiledProgram`] that
+//! lowering and compilation produce. The lifecycle handles carry these artifacts from one phase to the next.
 //!
 //! # Entry Points
 //!

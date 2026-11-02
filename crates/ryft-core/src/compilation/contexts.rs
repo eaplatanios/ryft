@@ -16,7 +16,7 @@ use crate::programs::ProgramError;
 ///      [`StagedFunction::lower`](crate::StagedFunction::lower).
 ///   3. [`Self::compile`] compiles a [`Self::LoweredProgram`] into a [`Self::CompiledProgram`], typically through
 ///      [`LoweredFunction::compile`](crate::LoweredFunction::compile).
-///   4. [`Self::execute`] executes a compiled function on runtime inputs, typically through
+///   4. [`Self::execute`] executes a [`Self::CompiledProgram`] on flat runtime arguments, typically through
 ///      [`ExecutableFunction::call`].
 ///
 /// Core owns staging and everything that depends on the structured input and output types of a function. It traces
@@ -58,13 +58,11 @@ pub trait CompilationDomain: Domain<Constant: CaptureConstant> + Clone {
         options: &Self::Options,
     ) -> Result<(Self::DispatchKey, Arc<[Self::Type]>), Self::Error>;
 
-    // TODO(eaplatanios): Review from here onwards.
-
-    /// Lowers `staged` into the program representation of this backend (i.e., [`Self::LoweredProgram`]) and returns it
-    /// together with its effective flat output types. Callers typically use
-    /// [`StagedFunction::lower`](super::functions::StagedFunction::lower) rather than calling this function directly.
-    /// The lowered program must capture every option, compiler, target, and topology property that affects compilation,
-    /// because caching backends derive the identity of compiled programs from the lowered program alone.
+    /// Lowers `staged` into the lowered program representation of this backend and returns it together with its
+    /// effective flat output types. Callers typically use [`StagedFunction::lower`](crate::StagedFunction::lower)
+    /// rather than calling this function directly. The lowered program must capture every option, compiler, target,
+    /// and topology property that affects compilation, because caching backends derive the identity of compiled
+    /// programs from the lowered program alone.
     ///
     /// # Parameters
     ///
@@ -72,26 +70,25 @@ pub trait CompilationDomain: Domain<Constant: CaptureConstant> + Clone {
     ///     source program with captures lifted into leading inputs.
     fn lower(&self, staged: &StagedProgram<Self>) -> Result<(Self::LoweredProgram, Vec<Self::Type>), Self::Error>;
 
-    /// Compiles a lowered program into an executable program of this backend (i.e., [`Self::CompiledProgram`]) and
-    /// returns it together with its effective flat output types. Callers use
-    /// [`LoweredFunction::compile`](super::functions::LoweredFunction::compile) rather than calling this function
-    /// directly, which also checks that the returned output types refine the lowered ones.
-    /// Caching backends usually implement this function via
-    /// [`CompilationContext::compile`](super::caching::CompilationContext::compile).
+    /// Compiles a lowered program into an executable program of this backend and returns it together with its effective
+    /// flat output types. Callers use [`LoweredFunction::compile`](crate::LoweredFunction::compile) rather than calling
+    /// this function directly, which also checks that the returned output types refine the lowered ones. Caching
+    /// backends usually implement this function via
+    /// [`CompilationContext::compile`](crate::CompilationContext::compile).
     fn compile(
         &self,
         program: &Self::LoweredProgram,
     ) -> Result<(Arc<Self::CompiledProgram>, Vec<Self::Type>), Self::Error>;
 
-    /// Executes a compiled program on flat runtime `arguments` and returns its flat outputs. Callers use
+    /// Executes a compiled program on flat runtime `arguments` and returns its flat outputs. Callers typically use
     /// [`ExecutableFunction::call`] rather than calling this function directly.
     ///
     /// # Parameters
     ///
     ///   - `program`: Compiled program to execute.
     ///   - `input_types`: Flat declared public input types of the compiled function, excluding captures.
-    ///   - `arguments`: Runtime captures of the compiled function followed by exactly one public input per entry of
-    ///     `input_types`, in the `[captures..., public inputs...]` order of lifted programs.
+    ///   - `arguments`: Runtime captures of the compiled function followed by exactly one public input per entry
+    ///     of `input_types`, in the `[captures..., public inputs...]` order of lifted programs.
     fn execute(
         &self,
         program: &Self::CompiledProgram,
@@ -100,10 +97,11 @@ pub trait CompilationDomain: Domain<Constant: CaptureConstant> + Clone {
     ) -> Result<Vec<Self::Value>, Self::Error>;
 }
 
-/// Optional execution capability for compiled functions that bind external mutable references.
-///
-/// Implementations must keep hidden state results out of the outputs that they return and preserve their reference
-/// transaction guarantees even when the public output has no leaves or fails reconstruction.
+// TODO(eaplatanios): Review from here onwards.
+
+/// Optional execution capability for compiled functions that bind external mutable references. Implementations must
+/// keep hidden state results out of the outputs that they return and preserve their reference transaction guarantees
+/// even when the public output has no leaves or fails reconstruction.
 pub trait StatefulCompilationDomain: CompilationDomain {
     /// Executes a compiled program that binds external mutable references and returns its flat outputs together with
     /// the completion of the whole invocation, without waiting for that completion. The parameters are the same as for
@@ -117,8 +115,7 @@ pub trait StatefulCompilationDomain: CompilationDomain {
     ) -> ReferenceExecution<Vec<Self::Value>, Self::Error>;
 }
 
-/// Optional capability for caching backend-compiled programs in a
-/// [`CompilationContext`](super::caching::CompilationContext).
+/// Optional capability for caching backend-compiled programs in a [`CompilationContext`](crate::CompilationContext).
 ///
 /// Cache identity is derived from the lowered program alone. [`CompilationDomain::lower`] folds every option, compiler,
 /// target, and topology property that affects compilation into [`CompilationDomain::LoweredProgram`], so key equality
