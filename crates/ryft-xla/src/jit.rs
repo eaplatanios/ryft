@@ -1230,7 +1230,7 @@ where
                 let (output, pullback) = context.vjp(
                     move |inputs, ()| {
                         let mut outputs =
-                            staged.call_with_flat_capture_references(capture_references.as_slice(), inputs)?;
+                            staged.call_flat_with_capture_references(capture_references.as_slice(), inputs)?;
                         if outputs.len() != 1 {
                             return Err(ProgramError::InvalidOutputCount { expected: 1, actual: outputs.len() });
                         }
@@ -1355,7 +1355,7 @@ where
                     .context()
                     .clone();
                 let (primal_outputs, tangent_outputs) = context.jvp(
-                    move |inputs, ()| staged.call_with_flat_capture_references(capture_references.as_slice(), inputs),
+                    move |inputs, ()| staged.call_flat_with_capture_references(capture_references.as_slice(), inputs),
                     primals,
                     tangents,
                     (),
@@ -3124,6 +3124,68 @@ mod tests {
                 if reason == "output 0 is a reference allocated inside the program and cannot be returned through the \
                               stateful XLA ABI, which has no protocol to turn a backend array into a host reference",
         ));
+    }
+
+    #[test]
+    fn test_staged_function_explicit_context_calls_without_input_leaves() {
+        let client = execution_client();
+        let mesh = single_device_mesh(&client);
+        let domain = XlaSession::new(&client).domain();
+        let array_type = ArrayType::scalar(DataType::F32);
+        let capture = XlaValue::Array(
+            XlaArray::from_host_buffer(&domain, array_type.clone(), mesh.clone(), 7f32.to_ne_bytes().as_slice())
+                .unwrap(),
+        );
+        let inner = StagedFunction::<XlaDomain<'_>, (), ArrayIrType>::stage(
+            |_, mut captures, ()| Ok(captures.remove(0)),
+            vec![capture.clone()],
+            (),
+            XlaOptions::new(mesh.clone()),
+        )
+        .unwrap();
+        assert_eq!(
+            inner.lifted_program().unwrap().to_string(),
+            indoc! {"
+                lambda %0:f32[][sharding={mesh<['x'=1:auto]>, []}] .
+                in (%0)"},
+        );
+
+        let outer = StagedFunction::<XlaDomain<'_>, ArrayIrType, (ArrayIrType, ArrayIrType)>::stage(
+            |capture_references, _, input| {
+                // Capture metadata cannot recover the enclosing trace when the callee has no public input leaves.
+                assert!(matches!(
+                    inner.call::<XlaStatefulCompileTracer<'_>>(()),
+                    Err(ProgramError::InvalidInputCount { expected: 1, actual: 0 }),
+                ));
+                assert!(matches!(
+                    inner.call_flat_with_capture_references::<XlaStatefulCompileTracer<'_>>(
+                        &capture_references,
+                        Vec::new(),
+                    ),
+                    Err(ProgramError::InvalidInputCount { expected: 1, actual: 0 }),
+                ));
+                let context = input.context();
+                let typed = inner.call_in_context(context, ())?;
+                let mut flat =
+                    inner.call_flat_with_capture_references_in_context(context, &capture_references, Vec::new())?;
+                Ok((typed, flat.remove(0)))
+            },
+            vec![capture],
+            ArrayIrType::Array(array_type.clone()),
+            XlaOptions::new(mesh.clone()),
+        )
+        .unwrap();
+        let compiled = outer.lower(&domain).unwrap().compile(&domain).unwrap();
+        let input = XlaValue::Array(
+            XlaArray::from_host_buffer(&domain, array_type, mesh, 1f32.to_ne_bytes().as_slice()).unwrap(),
+        );
+        let (XlaValue::Array(typed), XlaValue::Array(flat)) =
+            compiled.executable_function().call(&domain, input).unwrap()
+        else {
+            panic!("capture-only calls must return arrays");
+        };
+        assert_eq!(read_f32_array(&client, &typed), vec![7.0]);
+        assert_eq!(read_f32_array(&client, &flat), vec![7.0]);
     }
 
     #[test]
