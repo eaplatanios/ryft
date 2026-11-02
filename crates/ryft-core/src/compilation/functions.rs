@@ -1436,17 +1436,17 @@ where
     }
 }
 
-// TODO(eaplatanios): Review from here onwards.
-
 /// Shared state of a [`CompiledFunctionDispatcher`].
 struct CompiledFunctionDispatcherState<
     C: CompilationDomain<Type: Eq + Hash>,
     Static: Clone + Debug + Eq + Hash,
-    Input: Parameterized<C::Type, Family: ParameterizedFamily<C::Constant>>,
-    Output: Parameterized<C::Type, Family: ParameterizedFamily<C::Constant>>,
+    Input: Parameterized<C::Type>,
+    Output: Parameterized<C::Type>,
     F,
 > where
+    Input::Family: ParameterizedFamily<C::Constant>,
     Input::ParameterStructure: Eq + Hash,
+    Output::Family: ParameterizedFamily<C::Constant>,
 {
     /// Compilation domain that stages, lowers, compiles, and executes every specialization.
     domain: DispatcherDomain<C>,
@@ -1460,7 +1460,7 @@ struct CompiledFunctionDispatcherState<
     /// Declared staged input types, or [`None`] when every input is staged at its own type.
     staged_input_types: Option<StagedInputTypes<C::Type, Input::ParameterStructure>>,
 
-    /// Bounded LRU cache of compiled specializations.
+    /// Bounded Least Recently Used (LRU) cache of compiled specializations.
     specializations: SpecializationCache<
         SpecializationKey<Static, Input::ParameterStructure, C::DispatchKey>,
         ExecutableFunction<C, Input, Output>,
@@ -1470,7 +1470,7 @@ struct CompiledFunctionDispatcherState<
     statistics: DispatcherStatisticsAccumulator,
 }
 
-/// Explicit or lazily recovered domain shared by one dispatcher's specializations and clones.
+/// Explicit or lazily recovered [`CompilationDomain`] shared by one dispatcher's specializations and clones.
 enum DispatcherDomain<C: CompilationDomain> {
     /// Domain selected when the dispatcher was constructed.
     Explicit(C),
@@ -1480,14 +1480,14 @@ enum DispatcherDomain<C: CompilationDomain> {
         /// Domain selected atomically by the first call with an input leaf.
         domain: OnceLock<C>,
 
-        /// Recovers the compilation domain carried by one runtime input.
+        /// Recovers the compilation domain carried by a runtime input.
         from_input: fn(&C::Value) -> C,
     },
 }
 
-/// Staged input types declared for a [`CompiledFunctionDispatcher`] (refer to
-/// [`CompiledFunctionDispatcher::with_staged_input_types`]), stored flattened so that the dispatcher needs no
-/// `Option`-leaved instantiation of its input family outside of the functions that declare and return them.
+/// Staged input types declared for a [`CompiledFunctionDispatcher`], stored flattened so that the dispatcher needs no
+/// `Option`-leaved instantiation of its input family outside of the functions that declare and return them. Refer to
+/// the documentation of [`CompiledFunctionDispatcher::with_staged_input_types`] for more information.
 struct StagedInputTypes<T, Structure> {
     /// Parameter structure of the declared inputs.
     structure: Structure,
@@ -1496,14 +1496,13 @@ struct StagedInputTypes<T, Structure> {
     types: Vec<Option<T>>,
 }
 
-/// Completion-bearing result of one externally stateful compiled invocation.
-///
-/// The public result may be reconstructed immediately from pending backend values, but [`Self::await`] always observes
-/// the whole invocation completion before exposing that result. Completion includes every predecessor dependency of
-/// the references used by the invocation, not only the most recently submitted backend event. Dropping this wrapper
-/// never cancels submitted work or rolls reference state back, so callers that need to observe asynchronous failure
-/// must await it. A backend may also record a failure that happens after submission on the affected mutated
-/// references, so that later accesses report the same cause for their poisoned state.
+/// Completion-bearing result of one externally stateful [`CompiledFunction`] invocation. The public result may be
+/// reconstructed immediately from pending backend values, but [`Self::await`] always observes the whole invocation
+/// completion before exposing that result. Completion includes every predecessor dependency of the references used by
+/// the invocation, not only the most recently submitted backend event. Dropping this wrapper never cancels submitted
+/// work or rolls reference state back, so callers that need to observe asynchronous failure must await it. A backend
+/// may also record a failure that happens after submission on the affected mutated references, so that later accesses
+/// report the same cause for their poisoned state.
 #[must_use = "stateful execution errors are observed by awaiting this completion"]
 pub struct StatefulExecution<Output, Error> {
     /// Public output or reconstruction failure prepared after submission.
@@ -1515,23 +1514,21 @@ pub struct StatefulExecution<Output, Error> {
 
 impl<Output, Error> StatefulExecution<Output, Error> {
     /// Creates an already-completed stateful invocation result, which returns `result` without waiting when awaited.
-    /// Backends use it when a stateful call finishes synchronously or fails before submitting any work.
-    ///
-    /// A backend must not use this function once work that reads or replaces a
-    /// [`Reference`](crate::programs::Reference) has been submitted, because the result would then hide the completion
-    /// of that work and any asynchronous failure that it reports. Use [`Self::pending`] for submitted work instead.
+    /// Backends use it when a stateful call finishes synchronously or fails before submitting any work. A backend must
+    /// not use this function once work that reads or replaces a [`Reference`](crate::Reference) has been submitted,
+    /// because the result would then hide the completion of that work and any asynchronous failure that it reports.
+    /// Use [`Self::pending`] for submitted work instead.
     #[inline]
     pub fn ready(result: Result<Output, Error>) -> Self {
         Self { result, completion: None }
     }
 
-    /// Creates a submitted invocation whose public result is already reconstructed but whose execution remains
-    /// pending. Completion failure takes precedence over `result` because it may invalidate every pending output.
-    ///
-    /// Backends must pass a `completion` that covers the whole invocation, which usually means
-    /// [`ReferenceCompletion::joined`] over the submitted work and the completions that the invocation's references
-    /// already depended on. A completion that only tracks the latest backend event would let awaiting the result
-    /// return before an earlier reference write has finished or reported its failure.
+    /// Creates a submitted invocation whose public result is already reconstructed but whose execution remains pending.
+    /// Completion failure takes precedence over `result` because it may invalidate every pending output. Backends must
+    /// pass a `completion` that covers the whole invocation, which usually means [`ReferenceCompletion::joined`] over
+    /// the submitted work and the completions that the invocation's references already depended on. A completion that
+    /// only tracks the latest backend event would let awaiting the result return before an earlier reference write
+    /// has finished or reported its failure.
     ///
     /// # Parameters
     ///
@@ -1539,6 +1536,7 @@ impl<Output, Error> StatefulExecution<Output, Error> {
     ///   - `completion`: Whole-invocation completion, including every cumulative reference predecessor dependency.
     ///   - `completion_error`: Converts a backend completion failure message into the domain error type. It is applied
     ///     only when the completion itself fails, and its result then replaces `result`.
+    #[inline]
     pub fn pending(
         result: Result<Output, Error>,
         completion: ReferenceCompletion,
@@ -1547,7 +1545,8 @@ impl<Output, Error> StatefulExecution<Output, Error> {
         Self { result, completion: Some((completion, completion_error)) }
     }
 
-    /// Waits for the whole execution and its cumulative dependencies, then returns the public output.
+    /// Waits for the whole execution and its cumulative dependencies, and returns the final output.
+    #[inline]
     pub fn r#await(self) -> Result<Output, Error> {
         if let Some((completion, completion_error)) = self.completion
             && let Err(error) = completion.r#await()
@@ -1557,11 +1556,14 @@ impl<Output, Error> StatefulExecution<Output, Error> {
         self.result
     }
 
-    /// Applies `function` to the public output of this invocation without changing its completion.
-    fn and_then<T>(self, function: impl FnOnce(Output) -> Result<T, Error>) -> StatefulExecution<T, Error> {
+    /// Applies `function` to the output of this invocation without changing its completion status.
+    #[inline]
+    pub fn and_then<T>(self, function: impl FnOnce(Output) -> Result<T, Error>) -> StatefulExecution<T, Error> {
         StatefulExecution { result: self.result.and_then(function), completion: self.completion }
     }
 }
+
+// TODO(eaplatanios): Review from here onwards.
 
 /// Snapshot of the frontend activity of one retained [`CompiledFunctionDispatcher`], covering dispatch key derivation,
 /// specialization lookup, tracing, lowering, and compilation requests. The statistics accumulate from construction or
