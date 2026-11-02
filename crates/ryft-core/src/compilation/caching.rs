@@ -124,7 +124,10 @@ pub enum CompilationEventKind {
 
     /// Waited for an in-flight producer, which shared its program. Waits whose producer fails retry without emitting
     /// this event.
-    MemoryWait,
+    MemoryWait {
+        /// Whether the shared program can serve the waiting request.
+        outcome: CompilationLookupOutcome,
+    },
 
     /// Checked compatibility before using a distributed artifact exchange.
     ExchangePreflight {
@@ -188,8 +191,10 @@ pub struct CompilationEvent {
 /// point in time.
 ///
 /// Every attempt of a lookup counts as exactly one of [`Self::memory_hits`], [`Self::waits`], and [`Self::misses`], and
-/// a waiter whose producer fails retries and counts again. Durations are host durations summed over all threads, so
-/// concurrent compilations can make them exceed the elapsed wall-clock time.
+/// a waiter whose producer fails retries and counts again. A memory hit or wait whose program
+/// [`CompilationCacheDomain::validate_cached_program`] rejects still counts, although it fails the compilation.
+/// Durations are host durations summed over all threads, so concurrent compilations can make them exceed the elapsed
+/// wall-clock time.
 #[derive(Copy, Clone, Debug, Default, PartialEq, Eq)]
 pub struct CompilationCacheStatistics {
     /// Lookups served directly by the in-memory LRU cache.
@@ -225,7 +230,7 @@ pub struct CompilationCacheStatistics {
     /// Distributed misses or failures that fell back to local compilation.
     pub exchange_fallbacks: u64,
 
-    /// Backend producer closures invoked when no reusable program was available.
+    /// Uncached backend compilations invoked when no reusable program was available.
     pub compilations: u64,
 
     /// Total host duration spent in in-memory lookups and same key waits.
@@ -237,7 +242,7 @@ pub struct CompilationCacheStatistics {
     /// Total host duration spent in exchange preflights, waits, receptions, and deserialization.
     pub exchange_duration: Duration,
 
-    /// Total host duration spent in backend producer closures.
+    /// Total host duration spent in uncached backend compilations.
     pub compilation_duration: Duration,
 }
 
@@ -462,15 +467,16 @@ impl ActiveExchange<'_> {
 ///
 /// The cache is keyed by the structural [`CompilationCacheDomain::CacheKey`] of the domain. Equality of keys, rather
 /// than equality of their hashes, guarantees that distinct programs never collide. On a hit, the cached program is
-/// returned without invoking the producer closure. On a miss, persistent storage or artifact exchange restores the
-/// program, or the producer compiles it, and the result is inserted.
+/// returned without compiling anything. On a miss, persistent storage or artifact exchange restores the program, or
+/// [`CompilationCacheDomain::compile_uncached`] compiles it, and the result is inserted. Every program that a request
+/// does not compile itself must pass [`CompilationCacheDomain::validate_cached_program`] for that request.
 ///
 /// The in-memory tier uses LRU eviction with a default capacity of `8192` entries, which
 /// [`CompilationContext::with_capacity`] overrides.
 ///
 /// An optional [`DiskCache`] tier is attached via [`CompilationContext::with_disk_cache`] or
 /// [`CompilationContext::with_disk_cache_from_env`]. When present, the disk tier is consulted between the in-memory
-/// tier and the producer closure. The cache uses [`CompilationCacheDomain::serialize_program`] and
+/// tier and backend compilation. The cache uses [`CompilationCacheDomain::serialize_program`] and
 /// [`CompilationCacheDomain::deserialize_program`] to persist and restore programs, and it records failures of either
 /// function and of the disk itself without failing the compilation. An optional [`CompilationArtifactExchange`] may
 /// provide a serialized program from the leader after local cache misses, according to the configured
@@ -481,17 +487,20 @@ impl ActiveExchange<'_> {
 /// ```mermaid
 /// %%{init: {"themeCSS": ".nodeLabel code { white-space: nowrap !important; }"}}%%
 /// flowchart TD
-///   request["Domain Cache Key"] --> memory["1. In-Memory LRU"]
-///   memory -->|"hit"| shared["Shared Compiled Program in &lt;code&gt;Arc&lt;/code&gt;"]
+///   request["Lowered Program and Domain Cache Key"] --> memory["1. In-Memory LRU"]
+///   memory -->|"hit"| validate["Validate Against the Request"]
+///   validate -->|"accepted"| shared["Shared Compiled Program in &lt;code&gt;Arc&lt;/code&gt;"]
+///   validate -.->|"rejected"| error["Return the Validation Error"]
 ///   memory -->|"miss"| flight["2. Same-Key Single-Flight Election"]
-///   flight -->|"another producer"| wait["Wait and Retry Memory Lookup"]
-///   wait --> memory
+///   flight -->|"another producer"| wait["Wait for the Producer"]
+///   wait -->|"shared program"| validate
+///   wait -->|"producer failed"| memory
 ///   publish["Publish Successful Artifact"]
 ///   flight -->|"elected producer"| disk["3. Optional Persistent Disk Cache"]
-///   disk -->|"hit and deserialize"| publish
-///   disk -->|"miss or disabled"| exchange["4. Optional Distributed Artifact Exchange"]
-///   exchange -->|"hit and deserialize"| publish
-///   exchange -->|"miss or unavailable"| backend["5. Backend Compilation"]
+///   disk -->|"hit, deserialize, and validate"| publish
+///   disk -->|"miss, disabled, or rejected"| exchange["4. Optional Distributed Artifact Exchange"]
+///   exchange -->|"hit, deserialize, and validate"| publish
+///   exchange -->|"miss, unavailable, or rejected"| backend["5. Uncached Backend Compilation"]
 ///   backend --> publish
 ///   publish --> memory_insert["Insert into In-Memory LRU"]
 ///   memory_insert --> shared
@@ -596,10 +605,10 @@ impl<C: CompilationCacheDomain> CompilationContext<C> {
     }
 
     /// Attaches `disk_cache` as a persistent tier behind the in-memory tier of this context, with its size cap and
-    /// write thresholds. On a memory miss, [`Self::get_or_compile`] consults the disk before invoking the supplied
-    /// producer. Domains that explicitly support persistence can then serialize sufficiently expensive compilations so
-    /// that future processes restart warm. Persistent read, write, and codec errors are recorded in
-    /// [`Self::statistics`] and degrade to the in-memory path.
+    /// write thresholds. On a memory miss, [`Self::compile`] consults the disk before compiling the program. Domains
+    /// that explicitly support persistence can then serialize sufficiently expensive compilations so that future
+    /// processes restart warm. Persistent read, write, and codec errors are recorded in [`Self::statistics`] and
+    /// degrade to the in-memory path.
     #[inline]
     pub fn with_disk_cache(mut self, disk_cache: DiskCache) -> Self {
         self.disk_cache = Some(disk_cache);
@@ -712,28 +721,11 @@ impl<C: CompilationCacheDomain> CompilationContext<C> {
         self.recent_events.lock().expect("compilation event mutex should not be poisoned").clear();
     }
 
-    /// Compiles `program` through the shared cache. This function derives the exact structural key of `program`
-    /// through [`CompilationCacheDomain::compilation_key`] and resolves it through [`Self::get_or_compile`], with
-    /// `produce` as the backend producer invoked when no cached or exchanged program is available. Backends that
-    /// construct cache keys differently can call [`Self::get_or_compile`] directly.
-    ///
-    /// # Errors
-    ///
-    /// Returns the errors of [`CompilationCacheDomain::compilation_key`] and every error of [`Self::get_or_compile`].
-    pub fn compile<F>(
-        &self,
-        domain: &C,
-        program: &C::LoweredProgram,
-        produce: F,
-    ) -> Result<Arc<C::CompiledProgram>, C::Error>
-    where
-        F: FnOnce(&C::LoweredProgram) -> Result<C::CompiledProgram, C::Error>,
-    {
-        let cache_key = domain.compilation_key(program)?;
-        self.get_or_compile(domain, cache_key, || produce(program))
-    }
-
-    /// Returns a shared cached program for `cache_key`, restoring or producing it when absent.
+    /// Compiles `program` through the shared cache and returns the shared compiled program. This function derives the
+    /// exact structural key of `program` through [`CompilationCacheDomain::compilation_key`] and resolves it through
+    /// the in-memory tier, the persistent tier, and the artifact exchange, in that order, before it falls back to
+    /// [`CompilationCacheDomain::compile_uncached`]. Every program that it does not compile for this request must pass
+    /// [`CompilationCacheDomain::validate_cached_program`] first.
     ///
     /// On a hit, the entry is moved to the most recently used position. On a miss, the new entry is inserted, and the
     /// least recently used entry is evicted if the cache is at capacity.
@@ -743,19 +735,30 @@ impl<C: CompilationCacheDomain> CompilationContext<C> {
     /// only to that caller, and waiters retry through a new producer election.
     ///
     /// Persistent caching is consulted only when both a [`DiskCache`] is attached and
-    /// [`CompilationCacheDomain::persistent_cache_key`] returns stable key bytes. Persistent I/O and codec failures are
-    /// counted and degraded to misses.
+    /// [`CompilationCacheDomain::persistent_cache_key`] returns stable key bytes. Persistent I/O and codec failures, as
+    /// well as persistent artifacts that the domain rejects, are counted and degraded to misses.
     ///
     /// # Errors
     ///
-    /// Returns the error of `produce` when this caller is the elected producer. When the artifact exchange policy
-    /// requires sharing, it also returns the exchange failures that prevent this process from obtaining or publishing
-    /// an artifact, including deserialization errors of received artifacts. Persistent tier failures never fail this
-    /// function.
-    pub fn get_or_compile<F>(
+    /// Returns the errors of [`CompilationCacheDomain::compilation_key`] and of
+    /// [`CompilationCacheDomain::compile_uncached`] when this caller compiles the program. It also returns the error of
+    /// [`CompilationCacheDomain::validate_cached_program`] when the domain rejects a program from the in-memory tier or
+    /// from another producer. When the artifact exchange policy requires sharing, it also returns the exchange failures
+    /// that prevent this process from obtaining or publishing an artifact, including deserialization errors of
+    /// received artifacts. Persistent tier failures never fail this function.
+    pub fn compile(&self, domain: &C, program: &C::LoweredProgram) -> Result<Arc<C::CompiledProgram>, C::Error> {
+        let cache_key = domain.compilation_key(program)?;
+        self.get_or_compile(domain, cache_key, Some(program), || domain.compile_uncached(program))
+    }
+
+    /// Resolves `cache_key` like [`Self::compile`], with `produce` in place of
+    /// [`CompilationCacheDomain::compile_uncached`]. Programs that this function does not produce are validated
+    /// against `program` when it is provided, and accepted unchecked otherwise.
+    fn get_or_compile<F>(
         &self,
         domain: &C,
         cache_key: C::CacheKey,
+        program: Option<&C::LoweredProgram>,
         produce: F,
     ) -> Result<Arc<C::CompiledProgram>, C::Error>
     where
@@ -763,17 +766,9 @@ impl<C: CompilationCacheDomain> CompilationContext<C> {
     {
         loop {
             let lookup_start = Instant::now();
-            if let Some(program) = self.cached_program(&cache_key) {
+            if let Some(cached) = self.cached_program(&cache_key) {
                 self.statistics.memory_hits.fetch_add(1, Ordering::Relaxed);
-                self.record_duration(
-                    CompilationEventKind::CacheLookup {
-                        tier: CompilationCacheTier::Memory,
-                        outcome: CompilationLookupOutcome::Hit,
-                    },
-                    lookup_start.elapsed(),
-                    &self.statistics.memory_lookup_nanoseconds,
-                );
-                return Ok(program);
+                return self.accept_memory_hit(domain, program, cached, lookup_start);
             }
 
             let (in_flight, is_producer) = {
@@ -791,34 +786,33 @@ impl<C: CompilationCacheDomain> CompilationContext<C> {
             if !is_producer {
                 self.statistics.waits.fetch_add(1, Ordering::Relaxed);
                 let wait_start = Instant::now();
-                if let Some(program) = in_flight.wait() {
-                    self.record_duration(
-                        CompilationEventKind::MemoryWait,
-                        wait_start.elapsed(),
-                        &self.statistics.memory_lookup_nanoseconds,
-                    );
-                    return Ok(program);
-                }
-                accumulate_duration(wait_start.elapsed(), &self.statistics.memory_lookup_nanoseconds);
-                continue;
+                let Some(shared) = in_flight.wait() else {
+                    accumulate_duration(wait_start.elapsed(), &self.statistics.memory_lookup_nanoseconds);
+                    continue;
+                };
+                // Another producer compiled the shared program for its own request, so it is validated like a hit.
+                let validation = program.map_or(Ok(()), |program| domain.validate_cached_program(program, &shared));
+                let outcome = match validation {
+                    Ok(()) => CompilationLookupOutcome::Hit,
+                    Err(_) => CompilationLookupOutcome::Failed(CompilationEventReason::Incompatible),
+                };
+                self.record_duration(
+                    CompilationEventKind::MemoryWait { outcome },
+                    wait_start.elapsed(),
+                    &self.statistics.memory_lookup_nanoseconds,
+                );
+                return validation.map(|()| shared);
             }
 
             // A prior producer can insert the program after the first lookup above and remove its in-flight marker
             // before this caller elects itself. Checking again after the election closes that narrow handoff window,
-            // which would otherwise trigger a duplicate compilation.
-            if let Some(program) = self.cached_program(&cache_key) {
+            // which would otherwise trigger a duplicate compilation. The waiters of this election validate the program
+            // against their own requests.
+            if let Some(cached) = self.cached_program(&cache_key) {
                 self.in_flight.lock().expect("in-flight cache mutex should not be poisoned").remove(&cache_key);
-                in_flight.finish(InFlightState::Ready(Arc::clone(&program)));
+                in_flight.finish(InFlightState::Ready(Arc::clone(&cached)));
                 self.statistics.memory_hits.fetch_add(1, Ordering::Relaxed);
-                self.record_duration(
-                    CompilationEventKind::CacheLookup {
-                        tier: CompilationCacheTier::Memory,
-                        outcome: CompilationLookupOutcome::Hit,
-                    },
-                    lookup_start.elapsed(),
-                    &self.statistics.memory_lookup_nanoseconds,
-                );
-                return Ok(program);
+                return self.accept_memory_hit(domain, program, cached, lookup_start);
             }
 
             self.statistics.misses.fetch_add(1, Ordering::Relaxed);
@@ -830,8 +824,36 @@ impl<C: CompilationCacheDomain> CompilationContext<C> {
                 lookup_start.elapsed(),
                 &self.statistics.memory_lookup_nanoseconds,
             );
-            return self.restore_or_compile(domain, InFlightProducer::new(self, cache_key, in_flight), produce);
+            return self.restore_or_compile(
+                domain,
+                program,
+                InFlightProducer::new(self, cache_key, in_flight),
+                produce,
+            );
         }
+    }
+
+    /// Validates the `cached` in-memory program against the requesting `program`, if any, and records the lookup that
+    /// started at `lookup_start`. A rejection fails the compilation, because equal exact keys must mean interchangeable
+    /// programs.
+    fn accept_memory_hit(
+        &self,
+        domain: &C,
+        program: Option<&C::LoweredProgram>,
+        cached: Arc<C::CompiledProgram>,
+        lookup_start: Instant,
+    ) -> Result<Arc<C::CompiledProgram>, C::Error> {
+        let validation = program.map_or(Ok(()), |program| domain.validate_cached_program(program, &cached));
+        let outcome = match validation {
+            Ok(()) => CompilationLookupOutcome::Hit,
+            Err(_) => CompilationLookupOutcome::Failed(CompilationEventReason::Incompatible),
+        };
+        self.record_duration(
+            CompilationEventKind::CacheLookup { tier: CompilationCacheTier::Memory, outcome },
+            lookup_start.elapsed(),
+            &self.statistics.memory_lookup_nanoseconds,
+        );
+        validation.map(|()| cached)
     }
 
     /// Returns the program cached in the in-memory tier for `cache_key`, marking it as most recently used.
@@ -848,6 +870,7 @@ impl<C: CompilationCacheDomain> CompilationContext<C> {
     fn restore_or_compile<F>(
         &self,
         domain: &C,
+        program: Option<&C::LoweredProgram>,
         producer: InFlightProducer<'_, C>,
         produce: F,
     ) -> Result<Arc<C::CompiledProgram>, C::Error>
@@ -891,21 +914,21 @@ impl<C: CompilationCacheDomain> CompilationContext<C> {
 
         // A leader that restores a program from disk still publishes it, because its followers wait for that artifact.
         if let Some((disk_cache, digest)) = &persistent
-            && let Some((program, bytes)) = self.restore_from_disk(domain, disk_cache, digest)
+            && let Some((restored, bytes)) = self.restore_from_disk(domain, program, disk_cache, digest)
         {
             if let Some(exchange) = exchange
                 && exchange.is_leader()
             {
                 self.publish_to_exchange(exchange, bytes.as_slice())?;
             }
-            return Ok(producer.finish(program));
+            return Ok(producer.finish(restored));
         }
 
         if let Some(exchange) = exchange
             && !exchange.is_leader()
-            && let Some(program) = self.receive_from_exchange(domain, exchange)?
+            && let Some(received) = self.receive_from_exchange(domain, program, exchange)?
         {
-            return Ok(producer.finish(program));
+            return Ok(producer.finish(received));
         }
 
         self.compile_and_publish(domain, producer, persistent, exchange, produce)
@@ -946,18 +969,24 @@ impl<C: CompilationCacheDomain> CompilationContext<C> {
     }
 
     /// Restores a compiled program from the persistent tier, returning its serialized payload alongside it so that an
-    /// exchange leader can publish it without serializing it again. Every outcome other than a hit is recorded and
-    /// degraded to [`None`].
+    /// exchange leader can publish it without serializing it again. Every outcome other than a hit, including a
+    /// restored program that the domain rejects for the requesting `program`, is recorded and degraded to [`None`].
     fn restore_from_disk(
         &self,
         domain: &C,
+        program: Option<&C::LoweredProgram>,
         disk_cache: &DiskCache,
         digest: &CacheDigest,
     ) -> Option<(C::CompiledProgram, Vec<u8>)> {
         let lookup_start = Instant::now();
         let (outcome, restored) = match disk_cache.get(digest) {
             Ok(Some(bytes)) => match domain.deserialize_program(bytes.as_slice()) {
-                Ok(Some(program)) => (CompilationLookupOutcome::Hit, Some((program, bytes))),
+                Ok(Some(restored))
+                    if program.is_some_and(|program| domain.validate_cached_program(program, &restored).is_err()) =>
+                {
+                    (CompilationLookupOutcome::Miss(CompilationEventReason::Incompatible), None)
+                }
+                Ok(Some(restored)) => (CompilationLookupOutcome::Hit, Some((restored, bytes))),
                 Ok(None) => (CompilationLookupOutcome::Miss(CompilationEventReason::Incompatible), None),
                 Err(_) => (CompilationLookupOutcome::Failed(CompilationEventReason::DeserializationFailed), None),
             },
@@ -984,10 +1013,12 @@ impl<C: CompilationCacheDomain> CompilationContext<C> {
     /// Waits on a follower process for the artifact that the exchange leader publishes.
     ///
     /// Returns the restored program on success, and [`None`] when the policy permits falling back to local compilation
-    /// after a miss, timeout, or failure.
+    /// after a miss, timeout, or failure. A received program that the domain rejects for the requesting `program` is
+    /// an incompatible miss.
     fn receive_from_exchange(
         &self,
         domain: &C,
+        program: Option<&C::LoweredProgram>,
         exchange: ActiveExchange<'_>,
     ) -> Result<Option<C::CompiledProgram>, C::Error> {
         self.statistics.exchange_waits.fetch_add(1, Ordering::Relaxed);
@@ -1029,14 +1060,27 @@ impl<C: CompilationCacheDomain> CompilationContext<C> {
             }
         };
         match domain.deserialize_program(bytes.as_slice()) {
-            Ok(Some(program)) => {
+            Ok(Some(received)) => {
+                if let Some(Err(error)) = program.map(|program| domain.validate_cached_program(program, &received)) {
+                    self.record_duration(
+                        CompilationEventKind::ExchangeReceive {
+                            outcome: CompilationLookupOutcome::Miss(CompilationEventReason::Incompatible),
+                        },
+                        exchange_start.elapsed(),
+                        &self.statistics.exchange_nanoseconds,
+                    );
+                    self.require_exchange_or_record_fallback(
+                        format!("received compilation artifact is incompatible: {error}").as_str(),
+                    )?;
+                    return Ok(None);
+                }
                 self.statistics.exchange_hits.fetch_add(1, Ordering::Relaxed);
                 self.record_duration(
                     CompilationEventKind::ExchangeReceive { outcome: CompilationLookupOutcome::Hit },
                     exchange_start.elapsed(),
                     &self.statistics.exchange_nanoseconds,
                 );
-                Ok(Some(program))
+                Ok(Some(received))
             }
             Ok(None) => {
                 self.record_duration(
@@ -1926,6 +1970,25 @@ mod tests {
             Ok(0)
         }
 
+        fn compile_uncached(&self, program: &Vec<ArrayType>) -> Result<TestCompiledProgram, ProgramError> {
+            Ok(TestCompiledProgram(program.len()))
+        }
+
+        // A compiled program serves exactly the lowered programs whose output count it holds.
+        fn validate_cached_program(
+            &self,
+            program: &Vec<ArrayType>,
+            compiled: &TestCompiledProgram,
+        ) -> Result<(), ProgramError> {
+            if compiled.0 == program.len() {
+                Ok(())
+            } else {
+                Err(ProgramError::InvalidArgument {
+                    message: format!("cached program {} cannot serve {} outputs", compiled.0, program.len()),
+                })
+            }
+        }
+
         fn persistent_cache_key(&self, key: &u8) -> Option<Vec<u8>> {
             self.persistent.then(|| vec![*key])
         }
@@ -2054,7 +2117,7 @@ mod tests {
         let producer_calls = AtomicUsize::new(0);
         for key in [1, 2, 1] {
             context
-                .get_or_compile(&domain, key, || {
+                .get_or_compile(&domain, key, None, || {
                     producer_calls.fetch_add(1, Ordering::Relaxed);
                     Ok(TestCompiledProgram(key as usize))
                 })
@@ -2067,7 +2130,7 @@ mod tests {
 
         // A zero capacity is clamped to one entry.
         let context = CompilationContext::<TestDomain>::with_capacity(0);
-        context.get_or_compile(&domain, 1, || Ok(TestCompiledProgram(1))).unwrap();
+        context.get_or_compile(&domain, 1, None, || Ok(TestCompiledProgram(1))).unwrap();
         assert_eq!(context.program_count(), 1);
     }
 
@@ -2077,14 +2140,14 @@ mod tests {
         let domain = TestDomain::persistent();
         let disk_cache = DiskCache::open(directory.path()).unwrap().with_write_thresholds(Duration::ZERO, 0);
         let first_context = CompilationContext::<TestDomain>::new().with_event_capacity(16).with_disk_cache(disk_cache);
-        first_context.get_or_compile(&domain, 3, || Ok(TestCompiledProgram(17))).unwrap();
+        first_context.get_or_compile(&domain, 3, None, || Ok(TestCompiledProgram(17))).unwrap();
         assert_eq!(first_context.disk_cache().unwrap().directory(), directory.path());
 
         let disk_cache = DiskCache::open(directory.path()).unwrap().with_write_thresholds(Duration::ZERO, 0);
         let second_context =
             CompilationContext::<TestDomain>::new().with_event_capacity(16).with_disk_cache(disk_cache);
         let restored = second_context
-            .get_or_compile(&domain, 3, || -> Result<TestCompiledProgram, ProgramError> {
+            .get_or_compile(&domain, 3, None, || -> Result<TestCompiledProgram, ProgramError> {
                 panic!("persistent hit must not invoke producer")
             })
             .unwrap();
@@ -2130,7 +2193,8 @@ mod tests {
         let cache = DiskCache::open(directory.path()).unwrap().with_write_thresholds(Duration::MAX, 0);
         cache.put(&CacheDigest::from_key(&[1]), b"invalid payload").unwrap();
         let context = CompilationContext::<TestDomain>::new().with_disk_cache(cache).with_event_capacity(8);
-        let program = context.get_or_compile(&TestDomain::persistent(), 1, || Ok(TestCompiledProgram(17))).unwrap();
+        let program =
+            context.get_or_compile(&TestDomain::persistent(), 1, None, || Ok(TestCompiledProgram(17))).unwrap();
         assert_eq!(program.0, 17);
         assert_eq!(
             event_kinds(&context),
@@ -2157,7 +2221,7 @@ mod tests {
         cache.put(&CacheDigest::from_key(&[2]), &19usize.to_le_bytes()).unwrap();
         let context = CompilationContext::<TestDomain>::new().with_disk_cache(cache).with_event_capacity(8);
         let domain = TestDomain { persistent: true, deserialization_incompatible: true, ..TestDomain::default() };
-        assert_eq!(context.get_or_compile(&domain, 2, || Ok(TestCompiledProgram(23))).unwrap().0, 23);
+        assert_eq!(context.get_or_compile(&domain, 2, None, || Ok(TestCompiledProgram(23))).unwrap().0, 23);
         assert_eq!(
             event_kinds(&context),
             vec![
@@ -2182,7 +2246,8 @@ mod tests {
         let cache = DiskCache::open(directory.path()).unwrap().with_write_thresholds(Duration::MAX, 0);
         fs::create_dir(cache.entry_path(&CacheDigest::from_key(&[3]))).unwrap();
         let context = CompilationContext::<TestDomain>::new().with_disk_cache(cache).with_event_capacity(8);
-        let program = context.get_or_compile(&TestDomain::persistent(), 3, || Ok(TestCompiledProgram(29))).unwrap();
+        let program =
+            context.get_or_compile(&TestDomain::persistent(), 3, None, || Ok(TestCompiledProgram(29))).unwrap();
         assert_eq!(program.0, 29);
         assert_eq!(
             event_kinds(&context),
@@ -2209,7 +2274,7 @@ mod tests {
         let directory = tempfile::tempdir().unwrap();
         let context =
             CompilationContext::<TestDomain>::new().with_disk_cache(DiskCache::open(directory.path()).unwrap());
-        context.get_or_compile(&TestDomain::default(), 1, || Ok(TestCompiledProgram(1))).unwrap();
+        context.get_or_compile(&TestDomain::default(), 1, None, || Ok(TestCompiledProgram(1))).unwrap();
 
         assert_eq!(std::fs::read_dir(directory.path()).unwrap().count(), 0);
         assert_eq!(context.statistics().persistent_errors, 0);
@@ -2220,7 +2285,7 @@ mod tests {
         let directory = tempfile::tempdir().unwrap();
         let context =
             CompilationContext::<TestDomain>::new().with_disk_cache(DiskCache::open(directory.path()).unwrap());
-        context.get_or_compile(&TestDomain::persistent(), 1, || Ok(TestCompiledProgram(1))).unwrap();
+        context.get_or_compile(&TestDomain::persistent(), 1, None, || Ok(TestCompiledProgram(1))).unwrap();
 
         // A fast compilation is below the default minimum compilation duration, so it is never serialized.
         assert_eq!(std::fs::read_dir(directory.path()).unwrap().count(), 0);
@@ -2232,7 +2297,7 @@ mod tests {
         let directory = tempfile::tempdir().unwrap();
         let disk_cache = DiskCache::open(directory.path()).unwrap().with_write_thresholds(Duration::ZERO, usize::MAX);
         let context = CompilationContext::<TestDomain>::new().with_event_capacity(8).with_disk_cache(disk_cache);
-        context.get_or_compile(&TestDomain::persistent(), 1, || Ok(TestCompiledProgram(1))).unwrap();
+        context.get_or_compile(&TestDomain::persistent(), 1, None, || Ok(TestCompiledProgram(1))).unwrap();
         assert_eq!(std::fs::read_dir(directory.path()).unwrap().count(), 0);
         assert_eq!(context.statistics().persistent_errors, 0);
         assert_eq!(
@@ -2263,7 +2328,7 @@ mod tests {
 
         // Serialization failures degrade to an in-memory result and are recorded separately from persistent write
         // failures.
-        let program = context.get_or_compile(&domain, 1, || Ok(TestCompiledProgram(3))).unwrap();
+        let program = context.get_or_compile(&domain, 1, None, || Ok(TestCompiledProgram(3))).unwrap();
         assert_eq!(program.0, 3);
         assert_eq!(std::fs::read_dir(directory.path()).unwrap().count(), 0);
         assert_eq!(context.statistics().persistent_errors, 1);
@@ -2285,7 +2350,7 @@ mod tests {
 
         // Create the obstruction after the lookup, so only the store fails and compilation still succeeds.
         let program = context
-            .get_or_compile(&TestDomain::persistent(), 1, || {
+            .get_or_compile(&TestDomain::persistent(), 1, None, || {
                 fs::create_dir(&entry_path).unwrap();
                 Ok(TestCompiledProgram(3))
             })
@@ -2322,7 +2387,7 @@ mod tests {
         assert_eq!(follower_context.artifact_exchange_policy(), policy);
         let follower = thread::spawn(move || {
             let program = follower_context
-                .get_or_compile(&TestDomain::persistent(), 7, || -> Result<TestCompiledProgram, ProgramError> {
+                .get_or_compile(&TestDomain::persistent(), 7, None, || -> Result<TestCompiledProgram, ProgramError> {
                     panic!("follower must restore the leader artifact")
                 })
                 .unwrap();
@@ -2332,8 +2397,9 @@ mod tests {
         let leader_context = CompilationContext::<TestDomain>::new()
             .with_event_capacity(16)
             .with_artifact_exchange(Arc::new(TestExchange::new(0, Arc::clone(&state))), policy);
-        let leader =
-            leader_context.get_or_compile(&TestDomain::persistent(), 7, || Ok(TestCompiledProgram(29))).unwrap();
+        let leader = leader_context
+            .get_or_compile(&TestDomain::persistent(), 7, None, || Ok(TestCompiledProgram(29)))
+            .unwrap();
         let (follower_value, follower_statistics, follower_events) = follower.join().unwrap();
 
         assert_eq!(leader.0, 29);
@@ -2380,7 +2446,7 @@ mod tests {
         CompilationContext::<TestDomain>::new()
             .with_event_capacity(16)
             .with_disk_cache(seed_cache)
-            .get_or_compile(&domain, 8, || Ok(TestCompiledProgram(53)))
+            .get_or_compile(&domain, 8, None, || Ok(TestCompiledProgram(53)))
             .unwrap();
 
         let state = Arc::new(TestExchangeState::default());
@@ -2390,7 +2456,7 @@ mod tests {
             .with_artifact_exchange(Arc::new(TestExchange::new(1, Arc::clone(&state))), policy);
         let follower = thread::spawn(move || {
             follower_context
-                .get_or_compile(&TestDomain::persistent(), 8, || -> Result<TestCompiledProgram, ProgramError> {
+                .get_or_compile(&TestDomain::persistent(), 8, None, || -> Result<TestCompiledProgram, ProgramError> {
                     panic!("follower must restore the persistent artifact of the leader")
                 })
                 .unwrap()
@@ -2403,7 +2469,7 @@ mod tests {
             .with_disk_cache(leader_cache)
             .with_artifact_exchange(Arc::new(TestExchange::new(0, state)), policy);
         let leader = leader_context
-            .get_or_compile(&domain, 8, || -> Result<TestCompiledProgram, ProgramError> {
+            .get_or_compile(&domain, 8, None, || -> Result<TestCompiledProgram, ProgramError> {
                 panic!("leader must restore its persistent artifact")
             })
             .unwrap();
@@ -2440,7 +2506,9 @@ mod tests {
             .with_artifact_exchange(Arc::new(TestExchange::new(0, Arc::clone(&state))), policy);
         let producer_error = ProgramError::MalformedProgram("expected test failure".to_string());
         assert_eq!(
-            leader_context.get_or_compile(&TestDomain::persistent(), 9, || Err(producer_error.clone())).err(),
+            leader_context
+                .get_or_compile(&TestDomain::persistent(), 9, None, || Err(producer_error.clone()))
+                .err(),
             Some(producer_error.clone()),
         );
 
@@ -2450,7 +2518,9 @@ mod tests {
             .with_artifact_exchange(Arc::new(TestExchange::new(1, state)), policy);
         let start = Instant::now();
         assert_eq!(
-            follower_context.get_or_compile(&TestDomain::persistent(), 9, || Ok(TestCompiledProgram(59))).err(),
+            follower_context
+                .get_or_compile(&TestDomain::persistent(), 9, None, || Ok(TestCompiledProgram(59)))
+                .err(),
             Some(ProgramError::InvalidArgument {
                 message: format!("compilation artifact exchange requirement was not satisfied: {producer_error}"),
             }),
@@ -2504,7 +2574,7 @@ mod tests {
         let producer_error = ProgramError::MalformedProgram("expected producer failure".to_string());
 
         assert_eq!(
-            context.get_or_compile(&TestDomain::persistent(), 1, || Err(producer_error.clone())).err(),
+            context.get_or_compile(&TestDomain::persistent(), 1, None, || Err(producer_error.clone())).err(),
             Some(producer_error),
         );
         assert_eq!(context.statistics().exchange_errors, 1);
@@ -2541,7 +2611,7 @@ mod tests {
         let domain = TestDomain { persistent: true, serialization_fails: true, ..TestDomain::default() };
 
         // The leader keeps its program when the policy permits a fallback, but still releases its followers.
-        let program = leader_context.get_or_compile(&domain, 10, || Ok(TestCompiledProgram(61))).unwrap();
+        let program = leader_context.get_or_compile(&domain, 10, None, || Ok(TestCompiledProgram(61))).unwrap();
         assert_eq!(program.0, 61);
         assert_eq!(leader_context.statistics().exchange_errors, 1);
         assert_eq!(leader_context.statistics().exchange_fallbacks, 1);
@@ -2588,7 +2658,7 @@ mod tests {
             );
         let domain = TestDomain { persistent: true, serialization_unsupported: true, ..TestDomain::default() };
 
-        assert_eq!(context.get_or_compile(&domain, 1, || Ok(TestCompiledProgram(3))).unwrap().0, 3);
+        assert_eq!(context.get_or_compile(&domain, 1, None, || Ok(TestCompiledProgram(3))).unwrap().0, 3);
         assert_eq!(context.statistics().persistent_errors, 0);
         assert_eq!(context.statistics().exchange_errors, 0);
         assert_eq!(context.statistics().exchange_fallbacks, 1);
@@ -2632,7 +2702,8 @@ mod tests {
             },
         );
 
-        let program = context.get_or_compile(&TestDomain::persistent(), 2, || Ok(TestCompiledProgram(31))).unwrap();
+        let program =
+            context.get_or_compile(&TestDomain::persistent(), 2, None, || Ok(TestCompiledProgram(31))).unwrap();
 
         assert_eq!(program.0, 31);
         assert_eq!(context.statistics().exchange_errors, 1);
@@ -2670,7 +2741,10 @@ mod tests {
                 fallback_to_local_compile: true,
             },
         );
-        assert_eq!(context.get_or_compile(&TestDomain::persistent(), 1, || Ok(TestCompiledProgram(3))).unwrap().0, 3);
+        assert_eq!(
+            context.get_or_compile(&TestDomain::persistent(), 1, None, || Ok(TestCompiledProgram(3))).unwrap().0,
+            3
+        );
         assert_eq!(context.statistics().exchange_errors, 1);
         assert_eq!(context.statistics().exchange_fallbacks, 1);
         assert_eq!(
@@ -2699,7 +2773,7 @@ mod tests {
             },
         );
         let domain = TestDomain { persistent: true, deserialization_incompatible: true, ..TestDomain::default() };
-        assert_eq!(context.get_or_compile(&domain, 1, || Ok(TestCompiledProgram(7))).unwrap().0, 7);
+        assert_eq!(context.get_or_compile(&domain, 1, None, || Ok(TestCompiledProgram(7))).unwrap().0, 7);
         assert_eq!(context.statistics().exchange_errors, 0);
         assert_eq!(context.statistics().exchange_fallbacks, 1);
         assert_eq!(
@@ -2728,7 +2802,7 @@ mod tests {
         );
         assert_eq!(
             context
-                .get_or_compile(&TestDomain::persistent(), 1, || -> Result<TestCompiledProgram, ProgramError> {
+                .get_or_compile(&TestDomain::persistent(), 1, None, || -> Result<TestCompiledProgram, ProgramError> {
                     panic!("required sharing must not compile after deserialization fails")
                 })
                 .err(),
@@ -2763,7 +2837,10 @@ mod tests {
                 fallback_to_local_compile: true,
             },
         );
-        assert_eq!(context.get_or_compile(&TestDomain::persistent(), 1, || Ok(TestCompiledProgram(3))).unwrap().0, 3);
+        assert_eq!(
+            context.get_or_compile(&TestDomain::persistent(), 1, None, || Ok(TestCompiledProgram(3))).unwrap().0,
+            3
+        );
         assert_eq!(context.statistics().exchange_errors, 1);
         assert_eq!(context.statistics().exchange_fallbacks, 1);
         assert_eq!(context.statistics().exchange_publishes, 0);
@@ -2795,7 +2872,7 @@ mod tests {
         );
         let producer_calls = AtomicUsize::new(0);
 
-        let result = context.get_or_compile(&TestDomain::persistent(), 3, || {
+        let result = context.get_or_compile(&TestDomain::persistent(), 3, None, || {
             producer_calls.fetch_add(1, Ordering::Relaxed);
             Ok(TestCompiledProgram(33))
         });
@@ -2835,7 +2912,7 @@ mod tests {
         );
         let start = Instant::now();
 
-        let result = context.get_or_compile(&TestDomain::default(), 4, || Ok(TestCompiledProgram(35)));
+        let result = context.get_or_compile(&TestDomain::default(), 4, None, || Ok(TestCompiledProgram(35)));
 
         assert_eq!(
             result.err(),
@@ -2870,7 +2947,7 @@ mod tests {
         );
         let producer_calls = AtomicUsize::new(0);
 
-        let result = context.get_or_compile(&TestDomain::persistent(), 4, || {
+        let result = context.get_or_compile(&TestDomain::persistent(), 4, None, || {
             producer_calls.fetch_add(1, Ordering::Relaxed);
             Ok(TestCompiledProgram(37))
         });
@@ -2912,7 +2989,8 @@ mod tests {
             },
         );
 
-        let program = context.get_or_compile(&TestDomain::persistent(), 5, || Ok(TestCompiledProgram(41))).unwrap();
+        let program =
+            context.get_or_compile(&TestDomain::persistent(), 5, None, || Ok(TestCompiledProgram(41))).unwrap();
 
         assert_eq!(program.0, 41);
         assert_eq!(context.statistics().exchange_timeouts, 1);
@@ -2939,8 +3017,8 @@ mod tests {
     fn test_compilation_context_with_event_capacity() {
         let context = CompilationContext::<TestDomain>::new().with_event_capacity(2);
         let domain = TestDomain::default();
-        context.get_or_compile(&domain, 1, || Ok(TestCompiledProgram(43))).unwrap();
-        context.get_or_compile(&domain, 1, || Ok(TestCompiledProgram(47))).unwrap();
+        context.get_or_compile(&domain, 1, None, || Ok(TestCompiledProgram(43))).unwrap();
+        context.get_or_compile(&domain, 1, None, || Ok(TestCompiledProgram(47))).unwrap();
 
         // The memory miss of the first lookup is evicted by the two later events.
         let events = context.recent_events();
@@ -2969,7 +3047,7 @@ mod tests {
             CompilationContext::<TestDomain>::new().with_event_reporter(Arc::new(move |event: &CompilationEvent| {
                 reporter_events.lock().unwrap().push(*event)
             }));
-        context.get_or_compile(&TestDomain::default(), 1, || Ok(TestCompiledProgram(43))).unwrap();
+        context.get_or_compile(&TestDomain::default(), 1, None, || Ok(TestCompiledProgram(43))).unwrap();
 
         // The reporter observes every event even though retention is disabled by default.
         assert_eq!(context.recent_events(), Vec::new());
@@ -2990,7 +3068,7 @@ mod tests {
     fn test_compilation_context_clear_cache() {
         let context = CompilationContext::<TestDomain>::new();
         let domain = TestDomain::default();
-        context.get_or_compile(&domain, 1, || Ok(TestCompiledProgram(1))).unwrap();
+        context.get_or_compile(&domain, 1, None, || Ok(TestCompiledProgram(1))).unwrap();
         assert_eq!(context.program_count(), 1);
 
         context.clear_cache();
@@ -3010,12 +3088,204 @@ mod tests {
             .unwrap();
         let lowered = staged.lower(&domain).unwrap();
 
-        // The producer runs only on the first request, and the second request is served by the in-memory tier.
-        let first = context.compile(&domain, lowered.lowered_program(), |_| Ok(TestCompiledProgram(5))).unwrap();
-        let second = context.compile(&domain, lowered.lowered_program(), |_| Ok(TestCompiledProgram(6))).unwrap();
-        assert_eq!(first.as_ref(), &TestCompiledProgram(5));
+        // Only the first request compiles, and the second request is served by the in-memory tier.
+        let first = context.compile(&domain, lowered.lowered_program()).unwrap();
+        let second = context.compile(&domain, lowered.lowered_program()).unwrap();
+        assert_eq!(first.as_ref(), &TestCompiledProgram(1));
         assert!(Arc::ptr_eq(&first, &second));
         assert_eq!(context.statistics().compilations, 1);
+    }
+
+    #[test]
+    fn test_compilation_context_compile_rejects_incompatible_memory_hits() {
+        let context = CompilationContext::<TestDomain>::new().with_event_capacity(8);
+        let domain = TestDomain::default();
+        context.get_or_compile(&domain, 0, None, || Ok(TestCompiledProgram(2))).unwrap();
+        context.clear_events();
+
+        // Equal exact keys must mean interchangeable programs, so a rejected in-memory program fails the compilation.
+        assert_eq!(
+            context.compile(&domain, &vec![ArrayType::scalar(DataType::F32)]),
+            Err(ProgramError::InvalidArgument { message: "cached program 2 cannot serve 1 outputs".to_string() }),
+        );
+        assert_eq!(
+            context.compile(&domain, &vec![ArrayType::scalar(DataType::F32); 2]).unwrap().as_ref(),
+            &TestCompiledProgram(2),
+        );
+        assert_eq!(context.statistics().memory_hits, 2);
+        assert_eq!(context.statistics().compilations, 1);
+        assert_eq!(
+            event_kinds(&context),
+            vec![
+                CompilationEventKind::CacheLookup {
+                    tier: CompilationCacheTier::Memory,
+                    outcome: CompilationLookupOutcome::Failed(CompilationEventReason::Incompatible),
+                },
+                CompilationEventKind::CacheLookup {
+                    tier: CompilationCacheTier::Memory,
+                    outcome: CompilationLookupOutcome::Hit,
+                },
+            ],
+        );
+    }
+
+    #[test]
+    fn test_compilation_context_compile_rejects_incompatible_shared_programs() {
+        let context = Arc::new(CompilationContext::<TestDomain>::new().with_event_capacity(8));
+        let release = Arc::new(AtomicBool::new(false));
+        let producer = {
+            let context = Arc::clone(&context);
+            let release = Arc::clone(&release);
+            thread::spawn(move || {
+                context
+                    .get_or_compile(&TestDomain::default(), 0, None, || {
+                        while !release.load(Ordering::Acquire) {
+                            thread::yield_now();
+                        }
+                        Ok(TestCompiledProgram(2))
+                    })
+                    .unwrap()
+            })
+        };
+        let deadline = Instant::now() + Duration::from_secs(5);
+        while context.statistics().misses == 0 && Instant::now() < deadline {
+            thread::yield_now();
+        }
+        let waiter = {
+            let context = Arc::clone(&context);
+            thread::spawn(move || context.compile(&TestDomain::default(), &vec![ArrayType::scalar(DataType::F32)]))
+        };
+        while context.statistics().waits == 0 && Instant::now() < deadline {
+            thread::yield_now();
+        }
+        release.store(true, Ordering::Release);
+
+        // The producer compiled the shared program for its own request, so the waiter validates it like a hit.
+        assert_eq!(producer.join().unwrap().as_ref(), &TestCompiledProgram(2));
+        assert_eq!(
+            waiter.join().unwrap(),
+            Err(ProgramError::InvalidArgument { message: "cached program 2 cannot serve 1 outputs".to_string() }),
+        );
+        assert_eq!(context.statistics().waits, 1);
+        assert_eq!(
+            event_kinds(&context).last(),
+            Some(&CompilationEventKind::MemoryWait {
+                outcome: CompilationLookupOutcome::Failed(CompilationEventReason::Incompatible),
+            }),
+        );
+    }
+
+    #[test]
+    fn test_compilation_context_compile_recompiles_incompatible_persistent_artifacts() {
+        let directory = tempfile::tempdir().unwrap();
+        let domain = TestDomain::persistent();
+        let disk_cache = || DiskCache::open(directory.path()).unwrap().with_write_thresholds(Duration::ZERO, 0);
+        CompilationContext::<TestDomain>::new()
+            .with_disk_cache(disk_cache())
+            .get_or_compile(&domain, 0, None, || Ok(TestCompiledProgram(2)))
+            .unwrap();
+
+        // A rejected persistent artifact is an incompatible miss, and the fresh compilation replaces it.
+        let context = CompilationContext::<TestDomain>::new().with_event_capacity(8).with_disk_cache(disk_cache());
+        let lowered = vec![ArrayType::scalar(DataType::F32)];
+        assert_eq!(context.compile(&domain, &lowered).unwrap().as_ref(), &TestCompiledProgram(1));
+        assert_eq!(context.statistics().persistent_hits, 0);
+        assert_eq!(context.statistics().persistent_errors, 0);
+        assert_eq!(context.statistics().compilations, 1);
+        assert_eq!(
+            event_kinds(&context),
+            vec![
+                CompilationEventKind::CacheLookup {
+                    tier: CompilationCacheTier::Memory,
+                    outcome: CompilationLookupOutcome::Miss(CompilationEventReason::NotFound),
+                },
+                CompilationEventKind::CacheLookup {
+                    tier: CompilationCacheTier::Persistent,
+                    outcome: CompilationLookupOutcome::Miss(CompilationEventReason::Incompatible),
+                },
+                CompilationEventKind::BackendCompilation { outcome: CompilationOperationOutcome::Succeeded },
+                CompilationEventKind::PersistentStore { outcome: CompilationOperationOutcome::Succeeded },
+            ],
+        );
+
+        let context = CompilationContext::<TestDomain>::new().with_disk_cache(disk_cache());
+        assert_eq!(context.compile(&domain, &lowered).unwrap().as_ref(), &TestCompiledProgram(1));
+        assert_eq!(context.statistics().persistent_hits, 1);
+        assert_eq!(context.statistics().compilations, 0);
+    }
+
+    #[test]
+    fn test_compilation_context_compile_falls_back_from_incompatible_exchange_artifacts() {
+        let follower_context = |policy| {
+            let state = Arc::new(TestExchangeState::default());
+            state.artifacts.lock().unwrap().insert(vec![0], Ok(2usize.to_le_bytes().to_vec()));
+            CompilationContext::<TestDomain>::new()
+                .with_event_capacity(8)
+                .with_artifact_exchange(Arc::new(TestExchange::new(1, state)), policy)
+        };
+        let lowered = vec![ArrayType::scalar(DataType::F32)];
+
+        // A rejected received artifact is an incompatible miss, so a follower that may fall back compiles locally.
+        let context = follower_context(CompilationArtifactExchangePolicy::PreferSharing {
+            timeout: Duration::from_secs(1),
+            fallback_to_local_compile: true,
+        });
+        assert_eq!(context.compile(&TestDomain::persistent(), &lowered).unwrap().as_ref(), &TestCompiledProgram(1));
+        assert_eq!(context.statistics().exchange_hits, 0);
+        assert_eq!(context.statistics().exchange_errors, 0);
+        assert_eq!(context.statistics().exchange_fallbacks, 1);
+        assert_eq!(context.statistics().compilations, 1);
+        assert_eq!(
+            event_kinds(&context),
+            vec![
+                CompilationEventKind::CacheLookup {
+                    tier: CompilationCacheTier::Memory,
+                    outcome: CompilationLookupOutcome::Miss(CompilationEventReason::NotFound),
+                },
+                CompilationEventKind::ExchangePreflight { outcome: CompilationOperationOutcome::Succeeded },
+                CompilationEventKind::ExchangeReceive {
+                    outcome: CompilationLookupOutcome::Miss(CompilationEventReason::Incompatible),
+                },
+                CompilationEventKind::BackendCompilation { outcome: CompilationOperationOutcome::Succeeded },
+            ],
+        );
+
+        // A follower that requires sharing fails instead.
+        let context =
+            follower_context(CompilationArtifactExchangePolicy::RequireSharing { timeout: Duration::from_secs(1) });
+        assert_eq!(
+            context.compile(&TestDomain::persistent(), &lowered),
+            Err(ProgramError::InvalidArgument {
+                message: "compilation artifact exchange requirement was not satisfied: received compilation artifact \
+                    is incompatible: cached program 2 cannot serve 1 outputs"
+                    .to_string(),
+            }),
+        );
+        assert_eq!(context.statistics().compilations, 0);
+    }
+
+    #[test]
+    fn test_compilation_context_compile_publishes_fresh_artifacts_after_incompatible_persistent_artifacts() {
+        let directory = tempfile::tempdir().unwrap();
+        let domain = TestDomain::persistent();
+        let disk_cache = || DiskCache::open(directory.path()).unwrap().with_write_thresholds(Duration::ZERO, 0);
+        CompilationContext::<TestDomain>::new()
+            .with_disk_cache(disk_cache())
+            .get_or_compile(&domain, 0, None, || Ok(TestCompiledProgram(2)))
+            .unwrap();
+
+        // A leader never publishes a persistent artifact that the domain rejects, so followers receive the fresh one.
+        let state = Arc::new(TestExchangeState::default());
+        let context = CompilationContext::<TestDomain>::new().with_disk_cache(disk_cache()).with_artifact_exchange(
+            Arc::new(TestExchange::new(0, Arc::clone(&state))),
+            CompilationArtifactExchangePolicy::RequireSharing { timeout: Duration::from_secs(1) },
+        );
+        assert_eq!(
+            context.compile(&domain, &vec![ArrayType::scalar(DataType::F32)]).unwrap().as_ref(),
+            &TestCompiledProgram(1),
+        );
+        assert_eq!(context.statistics().exchange_publishes, 1);
+        assert_eq!(state.artifacts.lock().unwrap().get(&vec![0]), Some(&Ok(1usize.to_le_bytes().to_vec())));
     }
 
     #[test]
@@ -3025,13 +3295,13 @@ mod tests {
         let producer_calls = AtomicUsize::new(0);
 
         let first = context
-            .get_or_compile(&domain, 1, || {
+            .get_or_compile(&domain, 1, None, || {
                 producer_calls.fetch_add(1, Ordering::Relaxed);
                 Ok(TestCompiledProgram(7))
             })
             .unwrap();
         let second = context
-            .get_or_compile(&domain, 1, || {
+            .get_or_compile(&domain, 1, None, || {
                 producer_calls.fetch_add(1, Ordering::Relaxed);
                 Ok(TestCompiledProgram(8))
             })
@@ -3068,8 +3338,8 @@ mod tests {
 
         // Producer errors are returned to their caller and never cached.
         let error = ProgramError::MalformedProgram("expected test failure".to_string());
-        assert_eq!(context.get_or_compile(&domain, 1, || Err(error.clone())).err(), Some(error));
-        let program = context.get_or_compile(&domain, 1, || Ok(TestCompiledProgram(9))).unwrap();
+        assert_eq!(context.get_or_compile(&domain, 1, None, || Err(error.clone())).err(), Some(error));
+        let program = context.get_or_compile(&domain, 1, None, || Ok(TestCompiledProgram(9))).unwrap();
 
         assert_eq!(program.0, 9);
         assert_eq!(context.statistics().compilations, 2);
@@ -3100,7 +3370,7 @@ mod tests {
 
         let panic = std::panic::catch_unwind(std::panic::AssertUnwindSafe(|| {
             context
-                .get_or_compile(&domain, 1, || -> Result<TestCompiledProgram, ProgramError> {
+                .get_or_compile(&domain, 1, None, || -> Result<TestCompiledProgram, ProgramError> {
                     panic!("expected producer panic")
                 })
                 .unwrap()
@@ -3108,7 +3378,7 @@ mod tests {
         assert!(panic.is_err());
 
         // The panicking producer released its in-flight state, so the next lookup elects a new producer.
-        let program = context.get_or_compile(&domain, 1, || Ok(TestCompiledProgram(13))).unwrap();
+        let program = context.get_or_compile(&domain, 1, None, || Ok(TestCompiledProgram(13))).unwrap();
         assert_eq!(program.0, 13);
     }
 
@@ -3129,7 +3399,7 @@ mod tests {
             threads.push(thread::spawn(move || {
                 start.wait();
                 context
-                    .get_or_compile(&TestDomain::default(), 1, || {
+                    .get_or_compile(&TestDomain::default(), 1, None, || {
                         producer_calls.fetch_add(1, Ordering::Relaxed);
                         while !release.load(Ordering::Acquire) {
                             thread::yield_now();
@@ -3161,7 +3431,10 @@ mod tests {
             },
             CompilationEventKind::BackendCompilation { outcome: CompilationOperationOutcome::Succeeded },
         ];
-        expected.extend(std::iter::repeat_n(CompilationEventKind::MemoryWait, THREAD_COUNT - 1));
+        expected.extend(std::iter::repeat_n(
+            CompilationEventKind::MemoryWait { outcome: CompilationLookupOutcome::Hit },
+            THREAD_COUNT - 1,
+        ));
         assert_eq!(event_kinds(&context), expected);
         let lookup_duration = context
             .recent_events()
@@ -3187,7 +3460,7 @@ mod tests {
             threads.push(thread::spawn(move || {
                 start.wait();
                 context
-                    .get_or_compile(&TestDomain::default(), key, || {
+                    .get_or_compile(&TestDomain::default(), key, None, || {
                         entered_sender.send(key).unwrap();
                         while !release.load(Ordering::Acquire) {
                             thread::yield_now();

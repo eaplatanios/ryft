@@ -586,10 +586,7 @@ where
         let profile = XlaFeedbackDirectedProfile::new(profile).with_version(self.inner.options.profile_version);
         let lowered_program = self.inner.lowered_program.clone().with_feedback_directed_profile(profile);
         let domain = &self.inner.domain;
-        let key = domain.compilation_key(&lowered_program)?;
-        let program = domain
-            .compilation_context()
-            .get_or_compile(domain, key, || domain.compile_xla_program(&lowered_program))?;
+        let program = domain.compilation_context().compile(domain, &lowered_program)?;
         domain.replace_executable_xla_program(&self.inner.baseline, program)
     }
 

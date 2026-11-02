@@ -130,8 +130,33 @@ pub trait CompilationCacheDomain: CompilationDomain {
     /// Exact structural cache key for interchangeable compiled programs.
     type CacheKey: Clone + Eq + Hash + Send + Sync + 'static;
 
-    /// Constructs the exact compilation cache key for `program`.
+    /// Constructs the exact compilation cache key for `program`. Equal keys must mean that compiled programs are
+    /// interchangeable, so that [`Self::validate_cached_program`] can only reject a program from the in-memory tier
+    /// when this function violates that contract.
     fn compilation_key(&self, program: &Self::LoweredProgram) -> Result<Self::CacheKey, Self::Error>;
+
+    /// Compiles `program` without consulting any cache.
+    /// [`CompilationContext::compile`](crate::CompilationContext::compile) invokes this function only when no cached or
+    /// exchanged program can serve `program`, and callers otherwise go through that function so that every compilation
+    /// shares the cache.
+    fn compile_uncached(&self, program: &Self::LoweredProgram) -> Result<Self::CompiledProgram, Self::Error>;
+
+    /// Validates that `compiled`, which a [`CompilationContext`](crate::CompilationContext) resolved from its in-memory
+    /// tier, another producer, persistent storage, or the artifact exchange instead of compiling it for this request,
+    /// can serve the requesting `program`. Backends use it to guard the invocation contract that their calls trust
+    /// (e.g., signatures and donation flags) against colliding or corrupted artifacts. A rejected persistent or
+    /// exchanged artifact is an incompatible miss that falls through to the remaining sources, while a rejected
+    /// in-memory or shared in-flight program fails the compilation with the returned error. The default accepts
+    /// every program.
+    #[inline]
+    fn validate_cached_program(
+        &self,
+        program: &Self::LoweredProgram,
+        compiled: &Self::CompiledProgram,
+    ) -> Result<(), Self::Error> {
+        let _ = (program, compiled);
+        Ok(())
+    }
 
     /// Returns stable canonical bytes for persistent compilation cache identity, or [`None`] when this domain does not
     /// support persistent executable caching. These bytes must remain stable across processes that may share the cache

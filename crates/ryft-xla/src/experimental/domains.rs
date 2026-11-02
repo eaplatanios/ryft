@@ -1600,11 +1600,8 @@ impl<'c> XlaDomain<'c> {
         let lowered = self
             .lower_xla_program(&program, 0, &options)
             .map_err(|error| ProgramError::InvalidArgument { message: error.to_string() })?;
-        let cache_key = self
-            .compilation_key(&lowered)
-            .map_err(|error| ProgramError::InvalidArgument { message: error.to_string() })?;
         self.compilation_context()
-            .get_or_compile(self, cache_key, || self.compile_xla_program(&lowered))
+            .compile(self, &lowered)
             .map_err(|error| ProgramError::InvalidArgument { message: error.to_string() })
     }
 
@@ -3526,8 +3523,11 @@ fn incompatible_xla_invocation_field(
     current: XlaInvocationMetadata<'_>,
     other: XlaInvocationMetadata<'_>,
 ) -> Option<&'static str> {
-    if canonical_boundary_types(current.input_types, current.output_types)
-        != canonical_boundary_types(other.input_types, other.output_types)
+    // Structurally equal boundary types have equal canonical encodings, so only unequal ones pay for encoding both.
+    let equal_boundary_types = current.input_types == other.input_types && current.output_types == other.output_types;
+    if !equal_boundary_types
+        && canonical_boundary_types(current.input_types, current.output_types)
+            != canonical_boundary_types(other.input_types, other.output_types)
     {
         Some("boundary types")
     } else if current.output_count != other.output_count {
@@ -3999,17 +3999,7 @@ impl<'c> CompilationDomain for XlaDomain<'c> {
         &self,
         program: &XlaLoweredProgram,
     ) -> Result<(Arc<XlaCompiledProgram<'c>>, Vec<ArrayIrType>), Self::Error> {
-        let compiled =
-            self.compilation_context().compile(self, program, |program| self.compile_xla_program(program))?;
-        // Fresh compilations copy this metadata verbatim, so this rejects only programs resolved from the in-memory,
-        // persistent, or distributed cache tiers whose invocation contract does not match the requesting lowering
-        // (e.g., a corrupted or colliding persistent entry). The stateful transaction trusts this metadata, so a
-        // mismatch must fail the compile instead of the first call.
-        if let Some(field) = incompatible_xla_invocation_field(program.into(), compiled.as_ref().into()) {
-            return Err(XlaDomainError::InvalidCompilationOptions {
-                reason: format!("cached executable has incompatible {field}"),
-            });
-        }
+        let compiled = self.compilation_context().compile(self, program)?;
         let output_types = compiled.output_types().iter().cloned().map(Into::into).collect();
         Ok((compiled, output_types))
     }
@@ -5274,6 +5264,28 @@ impl<'c> CompilationCacheDomain for XlaDomain<'c> {
     #[inline]
     fn compilation_key(&self, program: &Self::LoweredProgram) -> Result<Self::CacheKey, Self::Error> {
         Self::xla_compilation_key(program)
+    }
+
+    #[inline]
+    fn compile_uncached(&self, program: &Self::LoweredProgram) -> Result<Self::CompiledProgram, Self::Error> {
+        self.compile_xla_program(program)
+    }
+
+    fn validate_cached_program(
+        &self,
+        program: &Self::LoweredProgram,
+        compiled: &Self::CompiledProgram,
+    ) -> Result<(), Self::Error> {
+        // Fresh compilations copy this metadata verbatim, so this rejects only reused programs whose invocation
+        // contract does not match the requesting lowering (e.g., a corrupted or colliding persistent or exchanged
+        // artifact). The stateful transaction trusts this metadata, so a mismatch must be caught before the first
+        // call.
+        match incompatible_xla_invocation_field(program.into(), compiled.into()) {
+            Some(field) => Err(XlaDomainError::InvalidCompilationOptions {
+                reason: format!("cached executable has incompatible {field}"),
+            }),
+            None => Ok(()),
+        }
     }
 
     #[inline]
@@ -13750,9 +13762,10 @@ mod tests {
     }
 
     #[test]
-    fn test_xla_compile_rejects_a_cached_executable_with_a_foreign_invocation_contract() {
+    fn test_xla_compile_rejects_an_exchanged_executable_with_a_foreign_invocation_contract() {
         use ryft_core::{
-            CompilationArtifactExchange, CompilationArtifactExchangePolicy, CompilationExchangeError, Sin,
+            CompilationArtifactExchange, CompilationArtifactExchangePolicy, CompilationCacheDomain,
+            CompilationExchangeError, Sin,
         };
 
         // Follower-side exchange that answers every key with one fixed artifact. This is the reachable stand-in for
@@ -13805,34 +13818,50 @@ mod tests {
             staged.lower(&producer).unwrap().compile(&producer).unwrap();
         let artifact = producer.serialize_program(foreign.compiled_program()).unwrap().unwrap();
 
-        let exchange: Arc<dyn CompilationArtifactExchange> = Arc::new(CollidingArtifactExchange { artifact });
-        let consumer = XlaSession::with_compilation_context(
-            &client,
-            CompilationContext::new().with_artifact_exchange(
-                exchange,
-                CompilationArtifactExchangePolicy::PreferSharing {
-                    timeout: Duration::from_secs(5),
-                    fallback_to_local_compile: true,
-                },
-            ),
-        )
-        .domain();
+        let consumer = |policy| {
+            let exchange: Arc<dyn CompilationArtifactExchange> =
+                Arc::new(CollidingArtifactExchange { artifact: artifact.clone() });
+            XlaSession::with_compilation_context(
+                &client,
+                CompilationContext::new().with_artifact_exchange(exchange, policy),
+            )
+            .domain()
+        };
         let staged =
             crate::jit::stage::<_, ArrayType, ArrayType>(|x| x.sin().unwrap(), input_type, XlaOptions::new(mesh))
                 .unwrap()
                 .into_inner();
-        let lowered = staged.lower(&consumer).unwrap();
 
-        // The resolved executable loads cleanly and reports matching boundary types, so only the compile-time
-        // cross-check against the requesting lowering can catch the foreign invocation contract.
+        // The received executable loads cleanly and reports matching boundary types, so only the validation against
+        // the requesting lowering catches the foreign invocation contract. The executable is then an incompatible
+        // miss, so a follower that may fall back compiles its own executable.
+        let fallback_consumer = consumer(CompilationArtifactExchangePolicy::PreferSharing {
+            timeout: Duration::from_secs(5),
+            fallback_to_local_compile: true,
+        });
+        let lowered = staged.lower(&fallback_consumer).unwrap();
+        let compiled = lowered.compile(&fallback_consumer).unwrap();
+        assert!(
+            fallback_consumer
+                .validate_cached_program(lowered.lowered_program(), compiled.compiled_program())
+                .is_ok()
+        );
+        let statistics = fallback_consumer.compilation_context().statistics();
+        assert_eq!(statistics.exchange_hits, 0);
+        assert_eq!(statistics.exchange_fallbacks, 1);
+        assert_eq!(statistics.compilations, 1);
+
+        // A follower that requires sharing fails instead.
+        let required_consumer =
+            consumer(CompilationArtifactExchangePolicy::RequireSharing { timeout: Duration::from_secs(5) });
         assert!(matches!(
-            lowered.compile(&consumer),
-            Err(XlaDomainError::InvalidCompilationOptions { reason })
-                if reason == "cached executable has incompatible donation flags",
+            staged.lower(&required_consumer).unwrap().compile(&required_consumer),
+            Err(XlaDomainError::Tracing(ProgramError::InvalidArgument { message }))
+                if message == "compilation artifact exchange requirement was not satisfied: received compilation \
+                               artifact is incompatible: invalid compilation options: cached executable has \
+                               incompatible donation flags",
         ));
-        let statistics = consumer.compilation_context().statistics();
-        assert_eq!(statistics.exchange_hits, 1);
-        assert_eq!(statistics.compilations, 0, "a resolved artifact must not fall back to backend compilation");
+        assert_eq!(required_consumer.compilation_context().statistics().compilations, 0);
     }
 
     #[test]
@@ -16575,11 +16604,7 @@ mod tests {
         let program = trace();
         let options = XlaOptions::new(mesh.clone());
         let lowered = domain.lower_xla_program(&program, 0, &options).unwrap();
-        let key = domain.compilation_key(&lowered).unwrap();
-        let compiled = domain
-            .compilation_context()
-            .get_or_compile(&domain, key.clone(), || domain.compile_xla_program(&lowered));
-        let compiled = compiled.unwrap();
+        let compiled = domain.compilation_context().compile(&domain, &lowered).unwrap();
         measure("stage: trace one-instruction program", &mut || {
             trace();
         });
@@ -16589,11 +16614,8 @@ mod tests {
         measure("stage: build compilation key", &mut || {
             domain.compilation_key(&lowered).unwrap();
         });
-        measure("stage: compile-cache lookup (hit)", &mut || {
-            domain
-                .compilation_context()
-                .get_or_compile(&domain, key.clone(), || domain.compile_xla_program(&lowered))
-                .unwrap();
+        measure("stage: cached compilation (hit)", &mut || {
+            domain.compilation_context().compile(&domain, &lowered).unwrap();
         });
         measure("stage: execute", &mut || {
             domain.execute_xla_program(&compiled, vec![input.clone(), input.clone()]).unwrap();

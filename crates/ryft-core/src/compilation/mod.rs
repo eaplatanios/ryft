@@ -145,11 +145,14 @@
 //! signatures, and flat execution. Lowering must fold every compile-relevant option, compiler, target, and topology
 //! property into the lowered artifact, which keeps that artifact self-describing for caching and persistence.
 //!
-//! Implement [`CompilationCacheDomain`] to opt into the shared [`CompilationContext`]: it derives cache identity from
-//! the lowered program alone, and key equality must mean that compiled artifacts are interchangeable. Optional hooks
-//! add persistent keying and executable codecs. Implement [`AnalyzableCompilationDomain`] to expose cost or memory
-//! analysis without recompilation, and implement [`StagedCallOperation`] on the operation family when staged functions
-//! must compose inside other traces.
+//! Implement [`CompilationCacheDomain`] to opt into the shared [`CompilationContext`]: it derives cache identity
+//! from the lowered program alone, and key equality must mean that compiled artifacts are interchangeable.
+//! It also supplies the uncached backend compilation, and its [`CompilationDomain::compile`] delegates to
+//! [`CompilationContext::compile`], so that every compilation resolves through the cache and every reused program
+//! is validated against the requesting lowered program. Optional hooks add that validation, persistent keying,
+//! and executable codecs. Implement [`AnalyzableCompilationDomain`] to expose cost or memory
+//! analysis without recompilation, and implement [`StagedCallOperation`] on the operation
+//! family when staged functions must compose inside other traces.
 //!
 //! Core owns flat staging through the inherent [`StagedProgram::stage`] constructor. It traces exactly the input types
 //! that it receives and invokes the closure exactly once on success. Backends apply options that change input types
@@ -311,15 +314,7 @@ mod tests {
             &self,
             program: &Self::LoweredProgram,
         ) -> Result<(Arc<Self::CompiledProgram>, Vec<ArrayType>), Self::Error> {
-            let program = self.cache.compile(self, program, |program| {
-                self.compilations.fetch_add(1, Ordering::Relaxed);
-                if program.options.fail_compilation {
-                    return Err(ProgramError::InvalidArgument { message: "expected compilation failure".into() });
-                }
-                let output_types =
-                    program.options.compiled_output_types.clone().unwrap_or_else(|| program.output_types.clone());
-                Ok(TestCompiledProgram { program: program.program.clone(), output_types })
-            })?;
+            let program = self.cache.compile(self, program)?;
             let output_types = program.output_types.clone();
             Ok((program, output_types))
         }
@@ -367,6 +362,16 @@ mod tests {
                 format!("{}:{:?}:{:?}", instruction.operation().name(), instruction.inputs(), instruction.outputs(),)
             }));
             Ok(key)
+        }
+
+        fn compile_uncached(&self, program: &TestLoweredProgram) -> Result<TestCompiledProgram, ProgramError> {
+            self.compilations.fetch_add(1, Ordering::Relaxed);
+            if program.options.fail_compilation {
+                return Err(ProgramError::InvalidArgument { message: "expected compilation failure".into() });
+            }
+            let output_types =
+                program.options.compiled_output_types.clone().unwrap_or_else(|| program.output_types.clone());
+            Ok(TestCompiledProgram { program: program.program.clone(), output_types })
         }
     }
 
