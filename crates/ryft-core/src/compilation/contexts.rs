@@ -240,12 +240,10 @@ pub trait Compile: CompilationDomain {
         self.jit_with_options(function, Self::Options::default())
     }
 
-    // TODO(eaplatanios): Review from here onwards.
-
-    /// Constructs a retained dispatcher for `function` through this domain with explicit options and default cache
-    /// capacity. The function is fallible during tracing, and an infallible function returns its outputs wrapped in
-    /// [`Ok`]. Staging, lowering, and compilation happen on the first call for each specialization. Refer to
-    /// [`CompiledFunctionDispatcher`] for the dispatch semantics.
+    /// Constructs a retained Just-In-Time (JIT) compilation dispatcher for `function` through this domain with explicit
+    /// options and default cache capacity. The function is fallible during tracing, and an infallible function returns
+    /// its outputs wrapped in [`Ok`]. Staging, lowering, and compilation happen on the first call for each
+    /// specialization. Refer to [`CompiledFunctionDispatcher`] for the dispatch semantics.
     #[inline]
     fn jit_with_options<Static, Input, Output, F>(
         &self,
@@ -267,10 +265,10 @@ pub trait Compile: CompilationDomain {
         self.jit_with_options_and_capacity(function, options, DEFAULT_JIT_CACHE_CAPACITY)
     }
 
-    /// Constructs a retained dispatcher for `function` through this domain with explicit options that retains at most
-    /// `capacity` compiled specializations. The function is fallible during tracing, and an infallible function returns
-    /// its outputs wrapped in [`Ok`]. Staging, lowering, and compilation happen on the first call for each
-    /// specialization. Refer to [`CompiledFunctionDispatcher`] for the dispatch semantics.
+    /// Constructs a retained Just-In-Time (JIT) compilation dispatcher for `function` through this domain with explicit
+    /// options that retains at most `capacity` compiled specializations. The function is fallible during tracing, and
+    /// an infallible function returns its outputs wrapped in [`Ok`]. Staging, lowering, and compilation happen on the
+    /// first call for each specialization. Refer to [`CompiledFunctionDispatcher`] for the dispatch semantics.
     #[inline]
     fn jit_with_options_and_capacity<Static, Input, Output, F>(
         &self,
@@ -295,6 +293,8 @@ pub trait Compile: CompilationDomain {
 }
 
 impl<C: CompilationDomain> Compile for C {}
+
+// TODO(eaplatanios): Review from here onwards.
 
 /// Stages an infallible capture-free function using the domain and abstract types of runtime `inputs`.
 ///
