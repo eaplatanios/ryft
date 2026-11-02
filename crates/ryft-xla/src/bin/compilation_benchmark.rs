@@ -126,8 +126,8 @@ fn dispatcher_statistics(statistics: DispatcherStatistics) -> Value {
         "traces": statistics.traces,
         "lowerings": statistics.lowerings,
         "compilation_requests": statistics.compilation_requests,
-        "dispatch_key_duration_ns": nanoseconds(statistics.dispatch_key_duration),
-        "dispatch_duration_ns": nanoseconds(statistics.dispatch_duration),
+        "dispatch_preparation_duration_ns": nanoseconds(statistics.dispatch_preparation_duration),
+        "dispatch_lookup_duration_ns": nanoseconds(statistics.dispatch_lookup_duration),
         "tracing_duration_ns": nanoseconds(statistics.tracing_duration),
         "lowering_duration_ns": nanoseconds(statistics.lowering_duration),
     })

@@ -179,3 +179,343 @@ pub use functions::{
     LoweredFunction, StagedFunction, StagedProgram, StatefulExecution,
 };
 pub use operations::StagedCallOperation;
+
+#[cfg(test)]
+mod tests {
+    use std::borrow::Cow;
+    use std::fmt::{Display, Formatter};
+    use std::sync::Arc;
+    use std::sync::atomic::{AtomicUsize, Ordering};
+
+    use crate::arrays::{Array, ArrayOperation, ArrayType, DataType};
+    use crate::captures::CaptureReference;
+    use crate::compilation::caching::CompilationContext;
+    use crate::compilation::contexts::{CompilationCacheDomain, CompilationDomain, Compile, StatefulCompilationDomain};
+    use crate::compilation::functions::{CompiledFunction, StagedProgram, StatefulExecution};
+    use crate::contexts::Domain;
+    use crate::macros::check_count;
+    use crate::operations::NegOperation;
+    use crate::parameters::Parameter;
+    use crate::programs::{FlatProgram, Operation, ProgramError, Type, Typed, Value, ValueDirectDispatch};
+
+    /// Lowered program of [`TestDomain`].
+    #[derive(Clone)]
+    pub(super) struct TestLoweredProgram {
+        /// Lifted flat program, whose captures are leading inputs.
+        pub(super) program: FlatProgram<TestDomain>,
+
+        /// Number of leading inputs that hold lifted captures.
+        pub(super) capture_count: usize,
+
+        /// Lowered output types.
+        pub(super) output_types: Vec<ArrayType>,
+
+        /// Options of the staged program, which compilation consults.
+        pub(super) options: TestOptions,
+    }
+
+    /// Compiled program of [`TestDomain`].
+    pub(super) struct TestCompiledProgram {
+        /// Lifted flat program that execution interprets.
+        pub(super) program: FlatProgram<TestDomain>,
+
+        /// Compiled output types.
+        pub(super) output_types: Vec<ArrayType>,
+    }
+
+    /// Options of [`TestDomain`], which inject staged input types, failures, and output types into the lifecycle.
+    #[derive(Clone, Debug, Default)]
+    pub(super) struct TestOptions {
+        /// Type that replaces every input type in dispatch signatures, if any.
+        pub(super) staged_input_type: Option<ArrayType>,
+
+        /// Whether lowering fails.
+        pub(super) fail_lowering: bool,
+
+        /// Whether compilation fails.
+        pub(super) fail_compilation: bool,
+
+        /// Output types that compilation reports instead of the lowered output types, if any.
+        pub(super) compiled_output_types: Option<Vec<ArrayType>>,
+    }
+
+    /// Compilation domain over [`Array`] values. It compiles through a [`CompilationContext`], so equivalent lowered
+    /// programs compile once, and it executes programs by interpreting every instruction as a negation after checking
+    /// that the runtime inputs refine the declared input types. Clones share their cache and compilation counter.
+    #[derive(Clone)]
+    pub(super) struct TestDomain {
+        /// Compilation cache shared by every clone of this domain.
+        pub(super) cache: Arc<CompilationContext<Self>>,
+
+        /// Number of backend compilations, shared by every clone of this domain.
+        compilations: Arc<AtomicUsize>,
+    }
+
+    impl TestDomain {
+        /// Creates a domain with an empty compilation cache.
+        pub(super) fn new() -> Self {
+            Self { cache: Arc::new(CompilationContext::new()), compilations: Arc::new(AtomicUsize::new(0)) }
+        }
+
+        /// Returns the number of backend compilations performed so far, excluding compilation cache hits.
+        pub(super) fn compilation_count(&self) -> usize {
+            self.compilations.load(Ordering::Relaxed)
+        }
+    }
+
+    impl Domain for TestDomain {
+        type Type = ArrayType;
+        type Value = Array;
+        type Constant = CaptureReference<ArrayType>;
+        type Operation = ArrayOperation<Array>;
+    }
+
+    impl CompilationDomain for TestDomain {
+        type DispatchKey = Arc<[ArrayType]>;
+        type LoweredProgram = TestLoweredProgram;
+        type CompiledProgram = TestCompiledProgram;
+        type Options = TestOptions;
+        type Error = ProgramError;
+
+        fn dispatch_signature(
+            &self,
+            input_types: Vec<ArrayType>,
+            options: &Self::Options,
+        ) -> Result<(Self::DispatchKey, Arc<[ArrayType]>), Self::Error> {
+            let input_types: Arc<[ArrayType]> = match &options.staged_input_type {
+                Some(input_type) => input_types.iter().map(|_| input_type.clone()).collect(),
+                None => input_types.into(),
+            };
+            Ok((input_types.clone(), input_types))
+        }
+
+        fn lower(&self, staged: &StagedProgram<Self>) -> Result<(Self::LoweredProgram, Vec<ArrayType>), Self::Error> {
+            let program = staged.lifted_program()?;
+            let capture_count = staged.source_program().captures().len();
+            let output_types = staged.output_types();
+            let options = staged.options();
+            if options.fail_lowering {
+                return Err(ProgramError::InvalidArgument { message: "expected lowering failure".into() });
+            }
+            let program = TestLoweredProgram {
+                program: program.as_ref().clone(),
+                capture_count,
+                output_types: output_types.to_vec(),
+                options: options.clone(),
+            };
+            Ok((program, output_types.to_vec()))
+        }
+
+        fn compile(
+            &self,
+            program: &Self::LoweredProgram,
+        ) -> Result<(Arc<Self::CompiledProgram>, Vec<ArrayType>), Self::Error> {
+            let program = self.cache.compile(self, program, |program| {
+                self.compilations.fetch_add(1, Ordering::Relaxed);
+                if program.options.fail_compilation {
+                    return Err(ProgramError::InvalidArgument { message: "expected compilation failure".into() });
+                }
+                let output_types =
+                    program.options.compiled_output_types.clone().unwrap_or_else(|| program.output_types.clone());
+                Ok(TestCompiledProgram { program: program.program.clone(), output_types })
+            })?;
+            let output_types = program.output_types.clone();
+            Ok((program, output_types))
+        }
+
+        fn execute(&self, program: &Self::CompiledProgram, inputs: Vec<Array>) -> Result<Vec<Array>, Self::Error> {
+            let input_types = program.program.input_types();
+            check_count!("input", inputs, input_types.len(), ProgramError);
+            for (declared, actual) in input_types.iter().zip(inputs.iter().map(Typed::r#type)) {
+                if !declared.is_refined_by(actual.as_ref()) {
+                    return Err(ProgramError::InvalidArgument {
+                        message: format!("runtime input type {actual} does not refine declared type {declared}"),
+                    });
+                }
+            }
+            program.program.interpret_with(
+                inputs,
+                |_, capture| {
+                    Err(ProgramError::MalformedProgram(format!(
+                        "lifted test program retained capture {}",
+                        capture.index(),
+                    )))
+                },
+                |_, inputs| {
+                    if inputs.len() != 1 {
+                        return Err(ProgramError::InvalidInputCount { expected: 1, actual: inputs.len() });
+                    }
+                    Ok(vec![-inputs[0].clone()])
+                },
+            )
+        }
+    }
+
+    impl CompilationCacheDomain for TestDomain {
+        type CacheKey = Vec<String>;
+
+        fn compilation_key(&self, program: &TestLoweredProgram) -> Result<Vec<String>, ProgramError> {
+            let mut key = vec![
+                format!("captures:{}", program.capture_count),
+                format!("atoms:{:?}", program.program.atoms()),
+                format!("inputs:{:?}", program.program.input_ids()),
+                format!("outputs:{:?}", program.program.output_ids()),
+                format!("options:{:?}", program.options),
+            ];
+            key.extend(program.program.instructions().iter().map(|instruction| {
+                format!("{}:{:?}:{:?}", instruction.operation().name(), instruction.inputs(), instruction.outputs(),)
+            }));
+            Ok(key)
+        }
+    }
+
+    /// Compilation domain whose runtime values carry it, which lets the global entry points recover it from their
+    /// inputs. It lowers and compiles to the lifted program itself, counts compilations, and executes programs by
+    /// interpreting every instruction as a negation, which is the only operation that these tests stage.
+    #[derive(Clone, Debug)]
+    pub(super) struct CarriedDomain {
+        /// Number of backend compilations, shared by every clone of this domain.
+        compilations: Arc<AtomicUsize>,
+    }
+
+    impl CarriedDomain {
+        /// Creates a domain with no backend compilations.
+        pub(super) fn new() -> Self {
+            Self { compilations: Arc::new(AtomicUsize::new(0)) }
+        }
+
+        /// Returns the number of backend compilations performed so far.
+        pub(super) fn compilation_count(&self) -> usize {
+            self.compilations.load(Ordering::Relaxed)
+        }
+
+        /// Returns a rank-zero array with `value` that carries this domain.
+        pub(super) fn scalar(&self, value: f64) -> CarriedArray {
+            CarriedArray { array: Array::scalar(value).unwrap(), domain: self.clone() }
+        }
+    }
+
+    // Clones of one domain share their compilation counter, which identifies the domain instance.
+    impl PartialEq for CarriedDomain {
+        fn eq(&self, other: &Self) -> bool {
+            Arc::ptr_eq(&self.compilations, &other.compilations)
+        }
+    }
+
+    impl Domain for CarriedDomain {
+        type Type = ArrayType;
+        type Value = CarriedArray;
+        type Constant = CaptureReference<ArrayType>;
+        type Operation = ArrayOperation<Array>;
+    }
+
+    impl CompilationDomain for CarriedDomain {
+        type DispatchKey = Arc<[ArrayType]>;
+        type LoweredProgram = FlatProgram<Self>;
+        type CompiledProgram = FlatProgram<Self>;
+        type Options = CarriedOptions;
+        type Error = ProgramError;
+
+        fn dispatch_signature(
+            &self,
+            input_types: Vec<ArrayType>,
+            _options: &CarriedOptions,
+        ) -> Result<(Self::DispatchKey, Arc<[ArrayType]>), ProgramError> {
+            let input_types: Arc<[ArrayType]> = input_types.into();
+            Ok((input_types.clone(), input_types))
+        }
+
+        fn lower(&self, staged: &StagedProgram<Self>) -> Result<(Self::LoweredProgram, Vec<ArrayType>), ProgramError> {
+            Ok((staged.lifted_program()?.as_ref().clone(), staged.output_types().to_vec()))
+        }
+
+        fn compile(
+            &self,
+            program: &Self::LoweredProgram,
+        ) -> Result<(Arc<Self::CompiledProgram>, Vec<ArrayType>), ProgramError> {
+            self.compilations.fetch_add(1, Ordering::Relaxed);
+            Ok((Arc::new(program.clone()), program.output_types()))
+        }
+
+        fn execute(
+            &self,
+            program: &Self::CompiledProgram,
+            inputs: Vec<CarriedArray>,
+        ) -> Result<Vec<CarriedArray>, ProgramError> {
+            let outputs = program.interpret_with(
+                inputs.into_iter().map(|input| input.array).collect(),
+                |_, capture| Err(ProgramError::MalformedProgram(format!("unexpected capture {}", capture.index()))),
+                |_, inputs: &[Array]| Ok(vec![-inputs[0].clone()]),
+            )?;
+            Ok(outputs.into_iter().map(|array| CarriedArray { array, domain: self.clone() }).collect())
+        }
+    }
+
+    impl StatefulCompilationDomain for CarriedDomain {
+        fn execute_statefully(
+            &self,
+            program: &Self::CompiledProgram,
+            inputs: Vec<CarriedArray>,
+        ) -> StatefulExecution<Vec<CarriedArray>, ProgramError> {
+            StatefulExecution::ready(self.execute(program, inputs))
+        }
+    }
+
+    /// Opaque [`CarriedDomain`] options that tests compare to verify that entry points retain them.
+    #[derive(Clone, Debug, Default, PartialEq)]
+    pub(super) struct CarriedOptions {
+        /// Arbitrary marker that distinguishes explicit options from the default ones.
+        pub(super) marker: usize,
+    }
+
+    /// [`Array`] that carries the [`CarriedDomain`] in which it was produced.
+    #[derive(Clone, Debug, PartialEq)]
+    pub(super) struct CarriedArray {
+        /// Array that holds the value.
+        array: Array,
+
+        /// Domain recovered by [`Value::domain`].
+        domain: CarriedDomain,
+    }
+
+    impl Display for CarriedArray {
+        fn fmt(&self, formatter: &mut Formatter<'_>) -> std::fmt::Result {
+            Display::fmt(&self.array, formatter)
+        }
+    }
+
+    impl Parameter for CarriedArray {}
+
+    impl Typed for CarriedArray {
+        type Type = ArrayType;
+
+        fn r#type(&self) -> Cow<'_, ArrayType> {
+            self.array.r#type()
+        }
+    }
+
+    impl Value for CarriedArray {
+        type Dispatch = ValueDirectDispatch;
+        type Domain = CarriedDomain;
+
+        fn domain(&self) -> CarriedDomain {
+            self.domain.clone()
+        }
+    }
+
+    /// Compiles a scalar function that negates its input if `negate` is set, so that functions compiled by different
+    /// calls share one closure type but compute different results.
+    pub(super) fn compile_from_one_call_site(
+        domain: &TestDomain,
+        negate: bool,
+    ) -> CompiledFunction<TestDomain, ArrayType, ArrayType> {
+        let staged = domain
+            .stage(
+                |input| if negate { input.unary(NegOperation::new()) } else { input },
+                ArrayType::scalar(DataType::F64),
+                TestOptions::default(),
+            )
+            .unwrap();
+        staged.lower(&domain).unwrap().compile(&domain).unwrap()
+    }
+}

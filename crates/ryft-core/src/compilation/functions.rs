@@ -1686,20 +1686,21 @@ pub(super) fn accumulate_duration(duration: Duration, counter: &AtomicU64) {
         .unwrap();
 }
 
-// TODO(eaplatanios): Review from here onwards.
-
 #[cfg(test)]
-pub(crate) mod tests {
+mod tests {
     use std::borrow::Cow;
     use std::cell::{Cell, RefCell};
     use std::collections::BTreeMap;
     use std::fmt::{Display, Formatter};
     use std::hash::{Hash, Hasher};
     use std::rc::Rc;
+    use std::sync::Barrier;
     use std::sync::atomic::{AtomicUsize, Ordering};
+    use std::thread;
 
     use indoc::indoc;
     use pretty_assertions::assert_eq;
+    use ryft_macros::Operation;
 
     use crate::arrays::{
         Array, ArrayIrOperation, ArrayIrType, ArrayIrValue, ArrayOperation, ArrayType, DataType, DimensionBounds,
@@ -1708,160 +1709,23 @@ pub(crate) mod tests {
     use crate::captures::CaptureReference;
     use crate::compilation::caching::CompilationContext;
     use crate::compilation::contexts::{CompilationCacheDomain, Compile, jit};
+    use crate::compilation::tests::{
+        CarriedArray, CarriedDomain, CarriedOptions, TestCompiledProgram, TestDomain, TestLoweredProgram, TestOptions,
+        compile_from_one_call_site,
+    };
     use crate::contexts::EagerContext;
     use crate::interpretation::InterpretableOperation;
     use crate::operations::{NegOperation, ZeroOperation};
     use crate::parameters::Parameter;
-    use crate::programs::{EmptyRegionDriver, Operation, Type, TypeError, ValueDirectDispatch};
+    use crate::programs::{
+        EmptyRegionDriver, Operation, RegionInterface, RegionSlot, Type, TypeError, ValueDirectDispatch,
+    };
 
     use super::*;
 
-    #[derive(Clone)]
-    pub(crate) struct TestLoweredProgram {
-        program: FlatProgram<TestDomain>,
-        capture_count: usize,
-        output_types: Vec<ArrayType>,
-        options: TestOptions,
-    }
-
-    pub(crate) struct TestCompiledProgram {
-        program: FlatProgram<TestDomain>,
-        output_types: Vec<ArrayType>,
-    }
-
-    #[derive(Clone, Debug, Default)]
-    pub(crate) struct TestOptions {
-        staged_input_type: Option<ArrayType>,
-        fail_lowering: bool,
-        fail_compilation: bool,
-        compiled_output_types: Option<Vec<ArrayType>>,
-    }
-
-    #[derive(Clone)]
-    pub(crate) struct TestDomain {
-        cache: Arc<CompilationContext<Self>>,
-        compilations: Arc<AtomicUsize>,
-    }
-
-    impl TestDomain {
-        pub(crate) fn new() -> Self {
-            Self { cache: Arc::new(CompilationContext::new()), compilations: Arc::new(AtomicUsize::new(0)) }
-        }
-
-        pub(crate) fn compilation_count(&self) -> usize {
-            self.compilations.load(Ordering::Relaxed)
-        }
-    }
-
-    impl Domain for TestDomain {
-        type Type = ArrayType;
-        type Value = Array;
-        type Constant = CaptureReference<ArrayType>;
-        type Operation = ArrayOperation<Array>;
-    }
-
-    impl CompilationDomain for TestDomain {
-        type DispatchKey = Arc<[ArrayType]>;
-        type LoweredProgram = TestLoweredProgram;
-        type CompiledProgram = TestCompiledProgram;
-        type Options = TestOptions;
-        type Error = ProgramError;
-
-        fn dispatch_signature(
-            &self,
-            input_types: Vec<ArrayType>,
-            options: &Self::Options,
-        ) -> Result<(Self::DispatchKey, Arc<[ArrayType]>), Self::Error> {
-            let input_types: Arc<[ArrayType]> = match &options.staged_input_type {
-                Some(input_type) => input_types.iter().map(|_| input_type.clone()).collect(),
-                None => input_types.into(),
-            };
-            Ok((input_types.clone(), input_types))
-        }
-
-        fn lower(&self, staged: &StagedProgram<Self>) -> Result<(Self::LoweredProgram, Vec<ArrayType>), Self::Error> {
-            let program = staged.lifted_program()?;
-            let capture_count = staged.source_program().captures().len();
-            let output_types = staged.output_types();
-            let options = staged.options();
-            if options.fail_lowering {
-                return Err(ProgramError::InvalidArgument { message: "expected lowering failure".into() });
-            }
-            let program = TestLoweredProgram {
-                program: program.as_ref().clone(),
-                capture_count,
-                output_types: output_types.to_vec(),
-                options: options.clone(),
-            };
-            Ok((program, output_types.to_vec()))
-        }
-
-        fn compile(
-            &self,
-            program: &Self::LoweredProgram,
-        ) -> Result<(Arc<Self::CompiledProgram>, Vec<ArrayType>), Self::Error> {
-            let program = self.cache.compile(self, program, |program| {
-                self.compilations.fetch_add(1, Ordering::Relaxed);
-                if program.options.fail_compilation {
-                    return Err(ProgramError::InvalidArgument { message: "expected compilation failure".into() });
-                }
-                let output_types =
-                    program.options.compiled_output_types.clone().unwrap_or_else(|| program.output_types.clone());
-                Ok(TestCompiledProgram { program: program.program.clone(), output_types })
-            })?;
-            let output_types = program.output_types.clone();
-            Ok((program, output_types))
-        }
-
-        fn execute(&self, program: &Self::CompiledProgram, inputs: Vec<Array>) -> Result<Vec<Array>, Self::Error> {
-            let input_types = program.program.input_types();
-            check_count!("input", inputs, input_types.len(), ProgramError);
-            for (declared, actual) in input_types.iter().zip(inputs.iter().map(Typed::r#type)) {
-                if !declared.is_refined_by(actual.as_ref()) {
-                    return Err(ProgramError::InvalidArgument {
-                        message: format!("runtime input type {actual} does not refine declared type {declared}"),
-                    });
-                }
-            }
-            program.program.interpret_with(
-                inputs,
-                |_, capture| {
-                    Err(ProgramError::MalformedProgram(format!(
-                        "lifted test program retained capture {}",
-                        capture.index(),
-                    )))
-                },
-                |_, inputs| {
-                    if inputs.len() != 1 {
-                        return Err(ProgramError::InvalidInputCount { expected: 1, actual: inputs.len() });
-                    }
-                    Ok(vec![-inputs[0].clone()])
-                },
-            )
-        }
-    }
-
-    impl CompilationCacheDomain for TestDomain {
-        type CacheKey = Vec<String>;
-
-        fn compilation_key(&self, program: &TestLoweredProgram) -> Result<Vec<String>, ProgramError> {
-            let mut key = vec![
-                format!("captures:{}", program.capture_count),
-                format!("atoms:{:?}", program.program.atoms()),
-                format!("inputs:{:?}", program.program.input_ids()),
-                format!("outputs:{:?}", program.program.output_ids()),
-                format!("options:{:?}", program.options),
-            ];
-            key.extend(program.program.instructions().iter().map(|instruction| {
-                format!("{}:{:?}:{:?}", instruction.operation().name(), instruction.inputs(), instruction.outputs(),)
-            }));
-            Ok(key)
-        }
-    }
-
-    /// Minimal array IR compilation domain used to prove the retained-JIT contract over dimension inputs: it
-    /// stages through the ordinary tracing path, "lowers" and "compiles" to the lifted flat program itself, counts
-    /// backend compilations, and executes calls by eager interpretation of the compiled program.
+    /// Compilation domain over array IR values, whose dimension inputs exercise declared staged input types. It lowers
+    /// and compiles to the lifted program itself, counts compilations, and executes programs by interpreting them
+    /// eagerly.
     #[derive(Clone)]
     struct TestArrayIrDomain {
         /// Number of backend compilations performed by this domain.
@@ -1947,151 +1811,101 @@ pub(crate) mod tests {
         }
     }
 
-    /// Compilation domain whose runtime values carry it, which lets the global entry points recover it from their
-    /// inputs. It lowers and compiles to the lifted program itself, counts compilations, and executes programs by
-    /// interpreting every instruction as a negation, which is the only operation that these tests stage.
-    #[derive(Clone, Debug)]
-    pub(crate) struct CarriedDomain {
-        /// Number of backend compilations, shared by every clone of this domain.
-        compilations: Arc<AtomicUsize>,
+    /// Call to a staged function, whose results are the results of its callee.
+    #[derive(Clone, Debug, PartialEq, Eq, Hash)]
+    struct TestCallOperation {
+        /// Number of leading inputs that hold the lifted captures of the callee.
+        capture_count: usize,
     }
 
-    impl CarriedDomain {
-        pub(crate) fn new() -> Self {
-            Self { compilations: Arc::new(AtomicUsize::new(0)) }
-        }
-
-        pub(crate) fn compilation_count(&self) -> usize {
-            self.compilations.load(Ordering::Relaxed)
-        }
-
-        pub(crate) fn scalar(&self, value: f64) -> CarriedArray {
-            CarriedArray { array: Array::scalar(value).unwrap(), domain: self.clone() }
-        }
-    }
-
-    // Clones of one domain share their compilation counter, which identifies the domain instance.
-    impl PartialEq for CarriedDomain {
-        fn eq(&self, other: &Self) -> bool {
-            Arc::ptr_eq(&self.compilations, &other.compilations)
-        }
-    }
-
-    impl Domain for CarriedDomain {
+    impl Operation for TestCallOperation {
         type Type = ArrayType;
-        type Value = CarriedArray;
-        type Constant = CaptureReference<ArrayType>;
-        type Operation = ArrayOperation<Array>;
+
+        fn name(&self) -> &'static str {
+            "call"
+        }
+
+        fn region_slots(&self) -> &'static [RegionSlot] {
+            const { &[RegionSlot::computation("callee")] }
+        }
+
+        fn infer_output_types(
+            &self,
+            _input_types: &[ArrayType],
+            region_interfaces: &[RegionInterface<ArrayType>],
+        ) -> Result<Vec<ArrayType>, TypeError> {
+            Ok(region_interfaces[0].output_types().to_vec())
+        }
     }
 
-    impl CompilationDomain for CarriedDomain {
+    /// Operation family of [`TestCallDomain`], which negates values and calls staged functions.
+    #[derive(Clone, Debug, Operation)]
+    #[ryft(type(ArrayType), constant(CaptureReference<ArrayType>))]
+    enum TestCallFamily {
+        Neg(NegOperation<ArrayType>),
+        Call(TestCallOperation),
+    }
+
+    impl StagedCallOperation<CaptureReference<ArrayType>> for TestCallFamily {
+        fn staged_call(capture_count: usize) -> Self {
+            Self::Call(TestCallOperation { capture_count })
+        }
+    }
+
+    /// Compilation domain over [`Array`] values whose operation family can stage calls to staged functions. The tests
+    /// that use it only stage programs, so it rejects lowering.
+    #[derive(Clone)]
+    struct TestCallDomain;
+
+    impl Domain for TestCallDomain {
+        type Type = ArrayType;
+        type Value = Array;
+        type Constant = CaptureReference<ArrayType>;
+        type Operation = TestCallFamily;
+    }
+
+    impl CompilationDomain for TestCallDomain {
         type DispatchKey = Arc<[ArrayType]>;
-        type LoweredProgram = FlatProgram<Self>;
-        type CompiledProgram = FlatProgram<Self>;
-        type Options = CarriedOptions;
+        type LoweredProgram = ();
+        type CompiledProgram = ();
+        type Options = ();
         type Error = ProgramError;
 
         fn dispatch_signature(
             &self,
             input_types: Vec<ArrayType>,
-            _options: &CarriedOptions,
+            _options: &(),
         ) -> Result<(Self::DispatchKey, Arc<[ArrayType]>), ProgramError> {
             let input_types: Arc<[ArrayType]> = input_types.into();
             Ok((input_types.clone(), input_types))
         }
 
-        fn lower(&self, staged: &StagedProgram<Self>) -> Result<(Self::LoweredProgram, Vec<ArrayType>), ProgramError> {
-            Ok((staged.lifted_program()?.as_ref().clone(), staged.output_types().to_vec()))
+        fn lower(&self, _staged: &StagedProgram<Self>) -> Result<((), Vec<ArrayType>), ProgramError> {
+            Err(ProgramError::UnsupportedOperation { message: "the test call domain does not lower programs".into() })
         }
 
-        fn compile(
-            &self,
-            program: &Self::LoweredProgram,
-        ) -> Result<(Arc<Self::CompiledProgram>, Vec<ArrayType>), ProgramError> {
-            self.compilations.fetch_add(1, Ordering::Relaxed);
-            Ok((Arc::new(program.clone()), program.output_types()))
+        fn compile(&self, _program: &()) -> Result<(Arc<()>, Vec<ArrayType>), ProgramError> {
+            unreachable!("the test call domain never lowers programs")
         }
 
-        fn execute(
-            &self,
-            program: &Self::CompiledProgram,
-            inputs: Vec<CarriedArray>,
-        ) -> Result<Vec<CarriedArray>, ProgramError> {
-            let outputs = program.interpret_with(
-                inputs.into_iter().map(|input| input.array).collect(),
-                |_, capture| Err(ProgramError::MalformedProgram(format!("unexpected capture {}", capture.index()))),
-                |_, inputs: &[Array]| Ok(vec![-inputs[0].clone()]),
-            )?;
-            Ok(outputs.into_iter().map(|array| CarriedArray { array, domain: self.clone() }).collect())
+        fn execute(&self, _program: &(), _inputs: Vec<Array>) -> Result<Vec<Array>, ProgramError> {
+            unreachable!("the test call domain never lowers programs")
         }
     }
 
-    impl StatefulCompilationDomain for CarriedDomain {
-        fn execute_statefully(
-            &self,
-            program: &Self::CompiledProgram,
-            inputs: Vec<CarriedArray>,
-        ) -> StatefulExecution<Vec<CarriedArray>, ProgramError> {
-            StatefulExecution::ready(self.execute(program, inputs))
-        }
+    /// Compiles a function without inputs that returns its only capture, which is `7.0`.
+    fn compile_capture_function(domain: &TestDomain) -> CompiledFunction<TestDomain, (), ArrayType> {
+        let staged: StagedFunction<TestDomain, (), ArrayType> = StagedFunction::stage(
+            |_, mut captures: Vec<CompilationTracer<TestDomain>>, ()| Ok(captures.remove(0)),
+            vec![Array::scalar(7.0).unwrap()],
+            (),
+            TestOptions::default(),
+        )
+        .unwrap();
+        staged.lower(domain).unwrap().compile(domain).unwrap()
     }
 
-    /// Opaque [`CarriedDomain`] options that tests compare to verify that entry points retain them.
-    #[derive(Clone, Debug, Default, PartialEq)]
-    pub(crate) struct CarriedOptions {
-        /// Arbitrary marker that distinguishes explicit options from the default ones.
-        pub(crate) marker: usize,
-    }
-
-    /// [`Array`] that carries the [`CarriedDomain`] in which it was produced.
-    #[derive(Clone, Debug, PartialEq)]
-    pub(crate) struct CarriedArray {
-        /// Array that holds the value.
-        array: Array,
-
-        /// Domain recovered by [`Value::domain`].
-        domain: CarriedDomain,
-    }
-
-    impl Display for CarriedArray {
-        fn fmt(&self, formatter: &mut Formatter<'_>) -> std::fmt::Result {
-            Display::fmt(&self.array, formatter)
-        }
-    }
-
-    impl Parameter for CarriedArray {}
-
-    impl Typed for CarriedArray {
-        type Type = ArrayType;
-
-        fn r#type(&self) -> Cow<'_, ArrayType> {
-            self.array.r#type()
-        }
-    }
-
-    impl Value for CarriedArray {
-        type Dispatch = ValueDirectDispatch;
-        type Domain = CarriedDomain;
-
-        fn domain(&self) -> CarriedDomain {
-            self.domain.clone()
-        }
-    }
-
-    pub(crate) fn compile_from_one_call_site(
-        domain: &TestDomain,
-        negate: bool,
-    ) -> CompiledFunction<TestDomain, ArrayType, ArrayType> {
-        let staged = domain
-            .stage(
-                |input| if negate { input.unary(NegOperation::new()) } else { input },
-                ArrayType::scalar(DataType::F64),
-                TestOptions::default(),
-            )
-            .unwrap();
-        staged.lower(&domain).unwrap().compile(&domain).unwrap()
-    }
-
+    /// Converts a reference completion failure into the error type of the [`StatefulExecution`] tests.
     fn reference_completion_error(reason: Arc<str>) -> ProgramError {
         ProgramError::InvalidArgument { message: reason.to_string() }
     }
@@ -2170,7 +1984,7 @@ pub(crate) mod tests {
     }
 
     #[test]
-    fn test_staged_function_stage_preserves_empty_structures() {
+    fn test_staged_function_stage() {
         let domain = TestDomain::new();
         let input_types = (vec![Vec::new(), Vec::new()], ArrayType::scalar(DataType::F64));
         let staged: StagedFunction<TestDomain, (Vec<Vec<ArrayType>>, ArrayType), (Vec<Vec<ArrayType>>, ArrayType)> =
@@ -2194,6 +2008,193 @@ pub(crate) mod tests {
         assert_eq!(
             executable.execute(&domain, (vec![Vec::new(), Vec::new()], Array::scalar(3.0).unwrap())).unwrap(),
             (vec![Vec::new(), Vec::new(), Vec::new()], Array::scalar(3.0).unwrap()),
+        );
+    }
+
+    #[test]
+    fn test_staged_function_call() {
+        let callee: StagedFunction<TestCallDomain, ArrayType, (ArrayType, ArrayType)> = StagedFunction::stage(
+            |_, mut captures: Vec<CompilationTracer<TestCallDomain>>, input: CompilationTracer<TestCallDomain>| {
+                Ok((captures.remove(0), input.unary(NegOperation::new())))
+            },
+            vec![Array::scalar(7.0).unwrap()],
+            ArrayType::scalar(DataType::F64),
+            (),
+        )
+        .unwrap();
+
+        // The call registers the captures of the callee in the capture table of the caller and passes them as the
+        // leading inputs of the call, before the public inputs.
+        let caller: StagedFunction<TestCallDomain, ArrayType, (ArrayType, ArrayType)> =
+            StagedFunction::stage(|_, _, input| callee.call(input), Vec::new(), ArrayType::scalar(DataType::F64), ())
+                .unwrap();
+        assert_eq!(caller.source_program().captures(), &[Array::scalar(7.0).unwrap()]);
+        assert_eq!(
+            caller.source_program().program().to_string(),
+            indoc! {"
+                lambda %0:f64[] .
+                let %1:f64[] = const capture#0:f64[]
+                    %2:f64[], %3:f64[] = call %1 %0 [
+                        callee={
+                            lambda %0:f64[], %1:f64[] .
+                            let %2:f64[] = neg %1
+                            in (%0, %2)
+                        },
+                    ]
+                in (%2, %3)"},
+        );
+    }
+
+    #[test]
+    fn test_staged_function_call_rejects_empty_inputs() {
+        let callee: StagedFunction<TestCallDomain, (), ArrayType> = StagedFunction::stage(
+            |_, mut captures: Vec<CompilationTracer<TestCallDomain>>, ()| Ok(captures.remove(0)),
+            vec![Array::scalar(7.0).unwrap()],
+            (),
+            (),
+        )
+        .unwrap();
+        let caller = StagedFunction::<TestCallDomain, (), ArrayType>::stage(
+            |_, _, ()| callee.call::<CompilationTracer<TestCallDomain>>(()),
+            Vec::new(),
+            (),
+            (),
+        );
+        assert!(matches!(caller, Err(ProgramError::InvalidInputCount { expected: 1, actual: 0 })));
+    }
+
+    #[test]
+    fn test_staged_function_call_in_context() {
+        // An explicit context supports calls to functions without inputs, from which no context can be recovered.
+        let callee: StagedFunction<TestCallDomain, (), ArrayType> = StagedFunction::stage(
+            |_, mut captures: Vec<CompilationTracer<TestCallDomain>>, ()| Ok(captures.remove(0)),
+            vec![Array::scalar(7.0).unwrap()],
+            (),
+            (),
+        )
+        .unwrap();
+        let caller: StagedFunction<TestCallDomain, ArrayType, ArrayType> = StagedFunction::stage(
+            |_, _, input: CompilationTracer<TestCallDomain>| callee.call_in_context(input.context(), ()),
+            Vec::new(),
+            ArrayType::scalar(DataType::F64),
+            (),
+        )
+        .unwrap();
+        assert_eq!(caller.source_program().captures(), &[Array::scalar(7.0).unwrap()]);
+        assert_eq!(
+            caller.source_program().program().to_string(),
+            indoc! {"
+                lambda %0:f64[] .
+                let %1:f64[] = const capture#0:f64[]
+                    %2:f64[] = call %1 [
+                        callee={
+                            lambda %0:f64[] .
+                            in (%0)
+                        },
+                    ]
+                in (%2)"},
+        );
+    }
+
+    #[test]
+    fn test_staged_function_call_flat_with_capture_references() {
+        let callee: StagedFunction<TestCallDomain, ArrayType, ArrayType> = StagedFunction::stage(
+            |_, mut captures: Vec<CompilationTracer<TestCallDomain>>, _input| Ok(captures.remove(0)),
+            vec![Array::scalar(7.0).unwrap()],
+            ArrayType::scalar(DataType::F64),
+            (),
+        )
+        .unwrap();
+
+        // The call passes the given capture references of the caller in place of the captures of the callee, so the
+        // caller only captures its own value.
+        let caller = StagedProgram::<TestCallDomain>::stage(
+            |references, _, inputs| callee.call_flat_with_capture_references(&references, inputs),
+            vec![Array::scalar(5.0).unwrap()],
+            vec![ArrayType::scalar(DataType::F64)],
+            (),
+        )
+        .unwrap();
+        assert_eq!(caller.source_program().captures(), &[Array::scalar(5.0).unwrap()]);
+        assert_eq!(
+            caller.source_program().program().to_string(),
+            indoc! {"
+                lambda %0:f64[] .
+                let %1:f64[] = const capture#0:f64[]
+                    %2:f64[] = call %1 %0 [
+                        callee={
+                            lambda %0:f64[], %1:f64[] .
+                            in (%0)
+                        },
+                    ]
+                in (%2)"},
+        );
+
+        // The capture references must match the captures of the callee in count and type.
+        assert!(matches!(
+            StagedProgram::<TestCallDomain>::stage(
+                |_, _, inputs| callee.call_flat_with_capture_references(&[], inputs),
+                Vec::new(),
+                vec![ArrayType::scalar(DataType::F64)],
+                (),
+            ),
+            Err(ProgramError::InvalidInputCount { expected: 1, actual: 0 }),
+        ));
+        assert!(matches!(
+            StagedProgram::<TestCallDomain>::stage(
+                |references, _, inputs| callee.call_flat_with_capture_references(&references, inputs),
+                vec![Array::scalar(5i64).unwrap()],
+                vec![ArrayType::scalar(DataType::F64)],
+                (),
+            ),
+            Err(ProgramError::MalformedProgram(message))
+                if message == "capture input #0 has type i64[], but capture #0 has type f64[]",
+        ));
+
+        // Without inputs, no context can be recovered.
+        assert!(matches!(
+            StagedProgram::<TestCallDomain>::stage(
+                |references, _, inputs| callee.call_flat_with_capture_references(&references, inputs),
+                vec![Array::scalar(5.0).unwrap()],
+                Vec::new(),
+                (),
+            ),
+            Err(ProgramError::InvalidInputCount { expected: 1, actual: 0 }),
+        ));
+    }
+
+    #[test]
+    fn test_staged_function_call_flat_with_capture_references_in_context() {
+        // An explicit context supports capture-only calls, which have no inputs from which to recover a context.
+        let callee: StagedFunction<TestCallDomain, (), ArrayType> = StagedFunction::stage(
+            |_, mut captures: Vec<CompilationTracer<TestCallDomain>>, ()| Ok(captures.remove(0)),
+            vec![Array::scalar(7.0).unwrap()],
+            (),
+            (),
+        )
+        .unwrap();
+        let caller = StagedProgram::<TestCallDomain>::stage(
+            |references, captures, _| {
+                callee.call_flat_with_capture_references_in_context(captures[0].context(), &references, Vec::new())
+            },
+            vec![Array::scalar(5.0).unwrap()],
+            Vec::new(),
+            (),
+        )
+        .unwrap();
+        assert_eq!(caller.source_program().captures(), &[Array::scalar(5.0).unwrap()]);
+        assert_eq!(
+            caller.source_program().program().to_string(),
+            indoc! {"
+                lambda  .
+                let %0:f64[] = const capture#0:f64[]
+                    %1:f64[] = call %0 [
+                        callee={
+                            lambda %0:f64[] .
+                            in (%0)
+                        },
+                    ]
+                in (%1)"},
         );
     }
 
@@ -2227,65 +2228,7 @@ pub(crate) mod tests {
     }
 
     #[test]
-    fn test_executable_function_with_compiled_program() {
-        let domain = TestDomain::new();
-        let identity = compile_from_one_call_site(&domain, false).into_executable();
-        let negate = compile_from_one_call_site(&domain, true).into_executable();
-        let replaced = identity.with_compiled_program(
-            Arc::new(TestCompiledProgram {
-                program: negate.compiled_program().program.clone(),
-                output_types: negate.output_types().to_vec(),
-            }),
-            negate.output_types().to_vec(),
-        );
-
-        // The replacement runs the new program with the retained signature, while the original function is unaffected.
-        assert_eq!(replaced.input_types(), identity.input_types());
-        assert_eq!(replaced.execute(&domain, Array::scalar(3.0).unwrap()).unwrap(), Array::scalar(-3.0).unwrap());
-        assert_eq!(identity.execute(&domain, Array::scalar(3.0).unwrap()).unwrap(), Array::scalar(3.0).unwrap());
-    }
-
-    #[test]
-    fn test_executable_function_send_and_sync() {
-        fn assert_send_and_sync<T: Send + Sync>() {}
-
-        assert_send_and_sync::<ExecutableFunction<TestDomain, ArrayType, ArrayType>>();
-
-        let domain = TestDomain::new();
-        let executable = compile_from_one_call_site(&domain, true).into_executable();
-        let second = executable.clone();
-        let first_domain = domain.clone();
-        let second_domain = domain.clone();
-        let first_thread =
-            std::thread::spawn(move || executable.execute(&first_domain, Array::scalar(3.0).unwrap()).unwrap());
-        let second_thread =
-            std::thread::spawn(move || second.execute(&second_domain, Array::scalar(4.0).unwrap()).unwrap());
-
-        assert_eq!(first_thread.join().unwrap(), Array::scalar(-3.0).unwrap());
-        assert_eq!(second_thread.join().unwrap(), Array::scalar(-4.0).unwrap());
-    }
-
-    #[test]
-    fn test_compiled_function() {
-        let domain = TestDomain::new();
-        let staged: StagedFunction<TestDomain, (), ArrayType> = StagedFunction::stage(
-            |_, mut captures: Vec<CompilationTracer<TestDomain>>, ()| Ok(captures.remove(0)),
-            vec![Array::scalar(7.0).unwrap()],
-            (),
-            TestOptions::default(),
-        )
-        .unwrap();
-        let compiled = staged.lower(&domain).unwrap().compile(&domain).unwrap();
-
-        assert_eq!(compiled.executable().execute(&domain, ()).unwrap(), Array::scalar(7.0).unwrap());
-        assert_eq!(compiled.source_program().captures(), &[Array::scalar(7.0).unwrap()]);
-        assert!(compiled.staged().input_types().is_empty());
-        assert_eq!(compiled.lowered().output_types(), &[ArrayType::scalar(DataType::F64)]);
-        assert_eq!(compiled.output_types(), &[ArrayType::scalar(DataType::F64)]);
-    }
-
-    #[test]
-    fn test_lowered_function_compile_validates_output_types() {
+    fn test_lowered_function_compile() {
         let domain = TestDomain::new();
         let compile = |compiled_output_types: Vec<ArrayType>| {
             let options = TestOptions { compiled_output_types: Some(compiled_output_types), ..TestOptions::default() };
@@ -2305,29 +2248,116 @@ pub(crate) mod tests {
     }
 
     #[test]
-    fn test_compiled_function_into_executable_function() {
+    fn test_executable_function_with_compiled_program() {
         let domain = TestDomain::new();
-        let staged: StagedFunction<TestDomain, (), ArrayType> = StagedFunction::stage(
-            |_, mut captures: Vec<CompilationTracer<TestDomain>>, ()| Ok(captures.remove(0)),
-            vec![Array::scalar(7.0).unwrap()],
-            (),
-            TestOptions::default(),
-        )
-        .unwrap();
-        let compiled = staged.lower(&domain).unwrap().compile(&domain).unwrap();
-        let executable = compiled.into_executable();
+        let identity = compile_from_one_call_site(&domain, false).into_executable();
+        let negate = compile_from_one_call_site(&domain, true).into_executable();
+        let replaced = identity.with_compiled_program(
+            Arc::new(TestCompiledProgram {
+                program: negate.compiled_program().program.clone(),
+                output_types: negate.output_types().to_vec(),
+            }),
+            negate.output_types().to_vec(),
+        );
 
-        // The runtime handle outlives the transform metadata and still supplies its captures on every call.
-        assert_eq!(executable.captures(), &[Array::scalar(7.0).unwrap()]);
-        assert!(executable.input_types().is_empty());
-        assert_eq!(executable.output_types(), &[ArrayType::scalar(DataType::F64)]);
-        assert_eq!(executable.execute(&domain, ()).unwrap(), Array::scalar(7.0).unwrap());
+        // The replacement runs the new program with the retained signature, while the original function is unaffected.
+        assert_eq!(replaced.input_types(), identity.input_types());
+        assert_eq!(replaced.execute(&domain, Array::scalar(3.0).unwrap()).unwrap(), Array::scalar(-3.0).unwrap());
+        assert_eq!(identity.execute(&domain, Array::scalar(3.0).unwrap()).unwrap(), Array::scalar(3.0).unwrap());
+    }
+
+    #[test]
+    fn test_executable_function_execute_statefully() {
+        let domain = CarriedDomain::new();
+        let staged: StagedFunction<CarriedDomain, ArrayType, ArrayType> = domain
+            .stage(
+                |input: CompilationTracer<CarriedDomain>| input.unary(NegOperation::new()),
+                ArrayType::scalar(DataType::F64),
+                CarriedOptions::default(),
+            )
+            .unwrap();
+        let executable = staged.lower(&domain).unwrap().compile(&domain).unwrap().into_executable();
+        assert_eq!(executable.execute_statefully(&domain, domain.scalar(2.0)).r#await(), Ok(domain.scalar(-2.0)));
+    }
+
+    #[test]
+    fn test_executable_function_execute_statefully_and_wait() {
+        let domain = CarriedDomain::new();
+        let staged: StagedFunction<CarriedDomain, ArrayType, ArrayType> = domain
+            .stage(
+                |input: CompilationTracer<CarriedDomain>| input.unary(NegOperation::new()),
+                ArrayType::scalar(DataType::F64),
+                CarriedOptions::default(),
+            )
+            .unwrap();
+        let executable = staged.lower(&domain).unwrap().compile(&domain).unwrap().into_executable();
+        assert_eq!(executable.execute_statefully_and_wait(&domain, domain.scalar(2.0)), Ok(domain.scalar(-2.0)));
+    }
+
+    #[test]
+    fn test_executable_function_validate_input_count() {
+        // Hidden captures are not public inputs, so a capture-only function accepts no inputs.
+        let executable = compile_capture_function(&TestDomain::new()).into_executable();
         assert_eq!(executable.validate_input_count(0), Ok(()));
-        assert_eq!(executable.validate_input_count(1), Err(ProgramError::InvalidInputCount { expected: 0, actual: 1 }),);
+        assert_eq!(executable.validate_input_count(1), Err(ProgramError::InvalidInputCount { expected: 0, actual: 1 }));
+    }
+
+    #[test]
+    fn test_executable_function_inputs_with_captures() {
+        let executable = compile_capture_function(&TestDomain::new()).into_executable();
         assert_eq!(
             executable.inputs_with_captures(vec![Array::scalar(1.0).unwrap()]),
             vec![Array::scalar(7.0).unwrap(), Array::scalar(1.0).unwrap()],
         );
+    }
+
+    #[test]
+    fn test_executable_function_send_and_sync() {
+        fn assert_send_and_sync<T: Send + Sync>() {}
+
+        assert_send_and_sync::<ExecutableFunction<TestDomain, ArrayType, ArrayType>>();
+
+        let domain = TestDomain::new();
+        let executable = compile_from_one_call_site(&domain, true).into_executable();
+        let second = executable.clone();
+        let first_domain = domain.clone();
+        let second_domain = domain.clone();
+        let first_thread =
+            thread::spawn(move || executable.execute(&first_domain, Array::scalar(3.0).unwrap()).unwrap());
+        let second_thread = thread::spawn(move || second.execute(&second_domain, Array::scalar(4.0).unwrap()).unwrap());
+
+        assert_eq!(first_thread.join().unwrap(), Array::scalar(-3.0).unwrap());
+        assert_eq!(second_thread.join().unwrap(), Array::scalar(-4.0).unwrap());
+    }
+
+    #[test]
+    fn test_compiled_function() {
+        let domain = TestDomain::new();
+        let compiled = compile_capture_function(&domain);
+        assert_eq!(compiled.executable().execute(&domain, ()).unwrap(), Array::scalar(7.0).unwrap());
+        assert_eq!(compiled.source_program().captures(), &[Array::scalar(7.0).unwrap()]);
+        assert!(compiled.staged().input_types().is_empty());
+        assert_eq!(compiled.lowered().output_types(), &[ArrayType::scalar(DataType::F64)]);
+        assert_eq!(compiled.output_types(), &[ArrayType::scalar(DataType::F64)]);
+    }
+
+    #[test]
+    fn test_compiled_function_into_executable() {
+        // The runtime handle outlives the transform metadata and still supplies its captures on every call.
+        let domain = TestDomain::new();
+        let executable = compile_capture_function(&domain).into_executable();
+        assert_eq!(executable.captures(), &[Array::scalar(7.0).unwrap()]);
+        assert!(executable.input_types().is_empty());
+        assert_eq!(executable.output_types(), &[ArrayType::scalar(DataType::F64)]);
+        assert_eq!(executable.execute(&domain, ()).unwrap(), Array::scalar(7.0).unwrap());
+    }
+
+    #[test]
+    fn test_compiled_function_send_and_sync() {
+        fn assert_send_and_sync<T: Send + Sync>() {}
+
+        // A compiled function owns its lowered function, which owns its staged function, so they are thread-safe too.
+        assert_send_and_sync::<CompiledFunction<TestDomain, ArrayType, ArrayType>>();
     }
 
     #[test]
@@ -2536,6 +2566,40 @@ pub(crate) mod tests {
         assert_eq!(inferred.domain(), Some(&domain));
         inferred.clear_cache();
         assert_eq!(clone.domain(), Some(&domain));
+    }
+
+    #[test]
+    fn test_compiled_function_dispatcher_clear_statistics() {
+        let domain = TestDomain::new();
+        let function: CompiledFunctionDispatcher<TestDomain, (), ArrayType, ArrayType, _> =
+            domain.jit(|(), input: CompilationTracer<TestDomain>| Ok(input));
+        assert_eq!(function.execute((), Array::scalar(1.0).unwrap()), Ok(Array::scalar(1.0).unwrap()));
+
+        // Clearing the statistics through any clone resets them for every clone but retains the specializations.
+        function.clone().clear_statistics();
+        assert_eq!(function.statistics(), DispatcherStatistics::default());
+        assert_eq!(function.execute((), Array::scalar(2.0).unwrap()), Ok(Array::scalar(2.0).unwrap()));
+        let statistics = function.statistics();
+        assert_eq!((statistics.dispatch_hits, statistics.dispatch_misses, statistics.traces), (1, 0, 0));
+    }
+
+    #[test]
+    fn test_compiled_function_dispatcher_clear_cache() {
+        let domain = TestDomain::new();
+        let function: CompiledFunctionDispatcher<TestDomain, (), ArrayType, ArrayType, _> =
+            domain.jit(|(), input: CompilationTracer<TestDomain>| Ok(input));
+        assert_eq!(function.execute((), Array::scalar(1.0).unwrap()), Ok(Array::scalar(1.0).unwrap()));
+
+        // Clearing the cache drops the specializations but keeps the statistics, so the next call produces its
+        // specialization again, and the compilation cache of the domain serves the repeated compilation request.
+        function.clear_cache();
+        assert_eq!(function.specialization_count(), 0);
+        assert_eq!(function.statistics().traces, 1);
+        assert_eq!(function.execute((), Array::scalar(2.0).unwrap()), Ok(Array::scalar(2.0).unwrap()));
+        let statistics = function.statistics();
+        assert_eq!((statistics.dispatch_misses, statistics.traces, statistics.compilation_requests), (2, 2, 2));
+        assert_eq!(function.specialization_count(), 1);
+        assert_eq!(domain.compilation_count(), 1);
     }
 
     #[test]
@@ -2837,7 +2901,8 @@ pub(crate) mod tests {
         assert!(matches!(
             function.execute(true, Array::scalar(1.0).unwrap()),
             Err(ProgramError::InvalidArgument { message })
-                if message == "recursive compilation dispatch requested a specialization that is already being produced",
+                if message == "recursive compilation dispatch requested a specialization that is already being \
+                               produced",
         ));
         assert_eq!(function.specialization_count(), 0);
         assert_eq!(function.statistics().dispatch_misses, 2);
@@ -2850,10 +2915,8 @@ pub(crate) mod tests {
         let closure_recursive = recursive.clone();
         let function: CompiledFunctionDispatcher<TestDomain, bool, ArrayType, ArrayType, _> =
             domain.jit(move |nested, input: CompilationTracer<TestDomain>| {
-                if nested {
-                    if let Some(call) = closure_recursive.borrow().as_ref() {
-                        call()?;
-                    }
+                if nested && let Some(call) = closure_recursive.borrow().as_ref() {
+                    call()?;
                 }
                 Ok(input)
             });
@@ -2891,7 +2954,7 @@ pub(crate) mod tests {
             });
         function.execute(true, Array::scalar(1.0).unwrap()).unwrap();
 
-        std::thread::scope(|scope| {
+        thread::scope(|scope| {
             for index in 0..4 {
                 let function = function.clone();
                 scope.spawn(move || {
@@ -2917,8 +2980,8 @@ pub(crate) mod tests {
                 Ok(if negate { input.unary(NegOperation::new()) } else { input })
             });
 
-        let barrier = std::sync::Barrier::new(2);
-        std::thread::scope(|scope| {
+        let barrier = Barrier::new(2);
+        thread::scope(|scope| {
             for _ in 0..2 {
                 let function = function.clone();
                 let barrier = &barrier;
@@ -2952,8 +3015,8 @@ pub(crate) mod tests {
         let function: CompiledFunctionDispatcher<CarriedDomain, (), ArrayType, ArrayType, _> =
             jit(|(), input: CompilationTracer<CarriedDomain>| Ok(input));
 
-        let barrier = std::sync::Barrier::new(2);
-        let (first_output, second_output) = std::thread::scope(|scope| {
+        let barrier = Barrier::new(2);
+        let (first_output, second_output) = thread::scope(|scope| {
             let first_call = scope.spawn(|| {
                 barrier.wait();
                 function.clone().execute((), first_domain.scalar(1.0))
@@ -2985,7 +3048,7 @@ pub(crate) mod tests {
             jit(|(), input: CompilationTracer<CarriedDomain>| Ok(input.unary(NegOperation::new())));
         assert_eq!(function.execute_statefully((), first_domain.scalar(1.0)).r#await(), Ok(first_domain.scalar(-1.0)));
         assert_eq!(function.domain(), Some(&first_domain));
-        assert_eq!(function.execute_statefully((), second_domain.scalar(2.0)).r#await(), Ok(first_domain.scalar(-2.0)),);
+        assert_eq!(function.execute_statefully((), second_domain.scalar(2.0)).r#await(), Ok(first_domain.scalar(-2.0)));
         assert_eq!(function.statistics().dispatch_hits, 1);
     }
 
@@ -3011,7 +3074,6 @@ pub(crate) mod tests {
         function.execute(true, Array::scalar(2.0).unwrap()).unwrap();
         function.execute(false, Array::scalar(2.0).unwrap()).unwrap();
 
-        assert_eq!(function.cache_capacity(), DEFAULT_JIT_CACHE_CAPACITY);
         assert_eq!(function.invalidate_specializations(&true), 1);
         assert_eq!(function.specialization_count(), 1);
         function.execute(true, Array::scalar(2.0).unwrap()).unwrap();
@@ -3021,23 +3083,15 @@ pub(crate) mod tests {
 
     #[test]
     fn test_compiled_function_dispatcher_send_and_sync() {
-        fn assert_send_and_sync<T: Send + Sync>() {}
-        fn assert_dispatcher_send_and_sync<F: Send + Sync>(
-            _function: &CompiledFunctionDispatcher<TestDomain, bool, ArrayType, ArrayType, F>,
-        ) {
-            assert_send_and_sync::<CompiledFunctionDispatcher<TestDomain, bool, ArrayType, ArrayType, F>>();
-        }
-
-        assert_send_and_sync::<StagedFunction<TestDomain, ArrayType, ArrayType>>();
-        assert_send_and_sync::<LoweredFunction<TestDomain, ArrayType, ArrayType>>();
-        assert_send_and_sync::<CompiledFunction<TestDomain, ArrayType, ArrayType>>();
+        // The dispatcher type names its closure type, which only a value can supply.
+        fn assert_send_and_sync<T: Send + Sync>(_value: &T) {}
 
         let domain = TestDomain::new();
         let function: CompiledFunctionDispatcher<TestDomain, bool, ArrayType, ArrayType, _> =
             domain.jit(|negate, input: CompilationTracer<TestDomain>| {
                 Ok(if negate { input.unary(NegOperation::new()) } else { input })
             });
-        assert_dispatcher_send_and_sync(&function);
+        assert_send_and_sync(&function);
     }
 
     #[test]
@@ -3070,5 +3124,22 @@ pub(crate) mod tests {
         );
         let expected = Err(ProgramError::InvalidArgument { message: "execution failed".to_string() });
         assert_eq!(execution.r#await(), expected);
+    }
+
+    #[test]
+    fn test_stateful_execution_and_then() {
+        let execution: StatefulExecution<u32, ProgramError> = StatefulExecution::ready(Ok(7));
+        assert_eq!(execution.and_then(|output| Ok(output + 1)).r#await(), Ok(8));
+
+        // The mapped execution keeps the completion, whose failure still replaces the mapped output.
+        let execution: StatefulExecution<u32, ProgramError> = StatefulExecution::pending(
+            Ok(7),
+            ReferenceCompletion::ready(Err("execution failed".into())),
+            reference_completion_error,
+        );
+        assert_eq!(
+            execution.and_then(|output| Ok(output + 1)).r#await(),
+            Err(ProgramError::InvalidArgument { message: "execution failed".to_string() }),
+        );
     }
 }

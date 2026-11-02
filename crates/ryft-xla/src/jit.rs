@@ -7489,9 +7489,10 @@ mod tests {
             statistics.compilation_requests,
         );
         println!(
-            "  dispatcher: dispatch_key_ms={:.3} dispatch_ms={:.3} tracing_ms={:.3} lowering_ms={:.3}",
-            statistics.dispatch_key_duration.as_secs_f64() * 1e3,
-            statistics.dispatch_duration.as_secs_f64() * 1e3,
+            "  dispatcher: dispatch_preparation_ms={:.3} dispatch_lookup_ms={:.3} tracing_ms={:.3} \
+             lowering_ms={:.3}",
+            statistics.dispatch_preparation_duration.as_secs_f64() * 1e3,
+            statistics.dispatch_lookup_duration.as_secs_f64() * 1e3,
             statistics.tracing_duration.as_secs_f64() * 1e3,
             statistics.lowering_duration.as_secs_f64() * 1e3,
         );

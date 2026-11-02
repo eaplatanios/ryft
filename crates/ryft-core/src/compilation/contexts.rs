@@ -431,10 +431,10 @@ mod tests {
     use pretty_assertions::assert_eq;
 
     use crate::arrays::{Array, ArrayType, DataType};
-    use crate::compilation::functions::tests::{
+    use crate::compilation::functions::{CompilationTracer, CompiledFunctionDispatcher};
+    use crate::compilation::tests::{
         CarriedArray, CarriedDomain, CarriedOptions, TestDomain, compile_from_one_call_site,
     };
-    use crate::compilation::functions::{CompilationTracer, CompiledFunctionDispatcher};
     use crate::operations::NegOperation;
 
     use super::*;
