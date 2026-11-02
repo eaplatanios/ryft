@@ -608,8 +608,6 @@ pub struct ExecutableFunction<C: CompilationDomain, Input: Parameterized<C::Type
     state: Arc<ExecutableFunctionState<C, Input, Output>>,
 }
 
-// TODO(eaplatanios): Review from here onwards.
-
 impl<C: CompilationDomain, Input: Parameterized<C::Type>, Output: Parameterized<C::Type>>
     ExecutableFunction<C, Input, Output>
 {
@@ -627,6 +625,7 @@ impl<C: CompilationDomain, Input: Parameterized<C::Type>, Output: Parameterized<
     ///
     ///   - `program`: Replacement backend executable.
     ///   - `output_types`: Effective flat output types of `program`.
+    #[inline]
     pub fn with_compiled_program(&self, program: Arc<C::CompiledProgram>, output_types: Vec<C::Type>) -> Self {
         Self {
             state: Arc::new(ExecutableFunctionState {
@@ -670,6 +669,66 @@ impl<C: CompilationDomain, Input: Parameterized<C::Type>, Output: Parameterized<
         &self.state.output_structure
     }
 
+    // TODO(eaplatanios): Review from here onwards.
+
+    /// Executes this function on the structured runtime `inputs` through `domain` and returns its structured outputs.
+    ///
+    /// Functions that bind external mutable references must be executed through [`Self::call_statefully`] or
+    /// [`Self::call_statefully_async`] instead.
+    pub fn call(&self, domain: &C, inputs: Input::To<C::Value>) -> Result<Output::To<C::Value>, C::Error>
+    where
+        Input::Family: ParameterizedFamily<C::Value>,
+        Input::To<C::Value>: Parameterized<C::Value>,
+        Output::Family: ParameterizedFamily<C::Value>,
+        Output::To<C::Value>:
+            Parameterized<C::Value, Family = Output::Family, ParameterStructure = Output::ParameterStructure>,
+    {
+        let inputs = self.prepare_inputs(inputs)?;
+        let outputs = domain.execute(self.compiled_program(), inputs)?;
+        self.reconstruct_outputs(outputs).map_err(C::Error::from)
+    }
+
+    /// Executes this function on the structured runtime `inputs` through the stateful `domain` and returns a result
+    /// that carries the completion of the whole invocation.
+    ///
+    /// The returned completion owns error observation but not cancellation. The semantics of submission and of the
+    /// publication of reference state are defined by [`StatefulCompilationDomain::execute_statefully`].
+    pub fn call_statefully_async(
+        &self,
+        domain: &C,
+        inputs: Input::To<C::Value>,
+    ) -> StatefulExecution<Output::To<C::Value>, C::Error>
+    where
+        C: StatefulCompilationDomain,
+        Input::Family: ParameterizedFamily<C::Value>,
+        Input::To<C::Value>: Parameterized<C::Value>,
+        Output::Family: ParameterizedFamily<C::Value>,
+        Output::To<C::Value>:
+            Parameterized<C::Value, Family = Output::Family, ParameterStructure = Output::ParameterStructure>,
+    {
+        let inputs = match self.prepare_inputs(inputs) {
+            Ok(inputs) => inputs,
+            Err(error) => return StatefulExecution::ready(Err(error.into())),
+        };
+        domain
+            .execute_statefully(self.compiled_program(), inputs)
+            .and_then(|outputs| self.reconstruct_outputs(outputs).map_err(C::Error::from))
+    }
+
+    /// Executes this function on the structured runtime `inputs` through the stateful `domain` and waits for the whole
+    /// invocation to complete, which makes it the blocking form of [`Self::call_statefully_async`].
+    pub fn call_statefully(&self, domain: &C, inputs: Input::To<C::Value>) -> Result<Output::To<C::Value>, C::Error>
+    where
+        C: StatefulCompilationDomain,
+        Input::Family: ParameterizedFamily<C::Value>,
+        Input::To<C::Value>: Parameterized<C::Value>,
+        Output::Family: ParameterizedFamily<C::Value>,
+        Output::To<C::Value>:
+            Parameterized<C::Value, Family = Output::Family, ParameterStructure = Output::ParameterStructure>,
+    {
+        self.call_statefully_async(domain, inputs).r#await()
+    }
+
     /// Validates that `inputs` matches the declared flat public input arity, excluding hidden captures.
     pub fn validate_flat_input_count(&self, inputs: &[C::Value]) -> Result<(), ProgramError> {
         if inputs.len() != self.state.input_types.len() {
@@ -691,75 +750,24 @@ impl<C: CompilationDomain, Input: Parameterized<C::Type>, Output: Parameterized<
         runtime_inputs.extend(inputs);
         runtime_inputs
     }
-}
 
-impl<C, Input, Output> ExecutableFunction<C, Input, Output>
-where
-    C: CompilationDomain,
-    Input: Parameterized<C::Type>,
-    Output: Parameterized<C::Type, Family: ParameterizedFamily<C::Value>>,
-    Output::To<C::Value>:
-        Parameterized<C::Value, Family = Output::Family, ParameterStructure = Output::ParameterStructure>,
-{
     /// Reconstructs structured runtime outputs from the executable's flat `outputs` using the retained output
     /// parameter structure.
-    pub fn reconstruct_outputs(&self, outputs: Vec<C::Value>) -> Result<Output::To<C::Value>, ProgramError> {
+    pub fn reconstruct_outputs(&self, outputs: Vec<C::Value>) -> Result<Output::To<C::Value>, ProgramError>
+    where
+        Output::Family: ParameterizedFamily<C::Value>,
+        Output::To<C::Value>:
+            Parameterized<C::Value, Family = Output::Family, ParameterStructure = Output::ParameterStructure>,
+    {
         Output::To::<C::Value>::from_parameters(self.state.output_structure.clone(), outputs).map_err(Into::into)
-    }
-}
-
-impl<C, Input, Output> ExecutableFunction<C, Input, Output>
-where
-    C: CompilationDomain,
-    Input: Parameterized<C::Type, Family: ParameterizedFamily<C::Value>>,
-    Output: Parameterized<C::Type, Family: ParameterizedFamily<C::Value>>,
-    Input::To<C::Value>: Parameterized<C::Value>,
-    Output::To<C::Value>:
-        Parameterized<C::Value, Family = Output::Family, ParameterStructure = Output::ParameterStructure>,
-{
-    /// Executes this function on the structured runtime `inputs` through `domain` and returns its structured outputs.
-    ///
-    /// Functions that bind external mutable references must be executed through [`Self::call_statefully`] or
-    /// [`Self::call_statefully_async`] instead.
-    pub fn call(&self, domain: &C, inputs: Input::To<C::Value>) -> Result<Output::To<C::Value>, C::Error> {
-        let inputs = self.prepare_inputs(inputs)?;
-        let outputs = domain.execute(self.compiled_program(), inputs)?;
-        self.reconstruct_outputs(outputs).map_err(C::Error::from)
-    }
-
-    /// Executes this function on the structured runtime `inputs` through the stateful `domain` and returns a result
-    /// that carries the completion of the whole invocation.
-    ///
-    /// The returned completion owns error observation but not cancellation. The semantics of submission and of the
-    /// publication of reference state are defined by [`StatefulCompilationDomain::execute_statefully`].
-    pub fn call_statefully_async(
-        &self,
-        domain: &C,
-        inputs: Input::To<C::Value>,
-    ) -> StatefulExecution<Output::To<C::Value>, C::Error>
-    where
-        C: StatefulCompilationDomain,
-    {
-        let inputs = match self.prepare_inputs(inputs) {
-            Ok(inputs) => inputs,
-            Err(error) => return StatefulExecution::ready(Err(error.into())),
-        };
-        domain
-            .execute_statefully(self.compiled_program(), inputs)
-            .and_then(|outputs| self.reconstruct_outputs(outputs).map_err(C::Error::from))
-    }
-
-    /// Executes this function on the structured runtime `inputs` through the stateful `domain` and waits for the whole
-    /// invocation to complete, which makes it the blocking form of [`Self::call_statefully_async`].
-    pub fn call_statefully(&self, domain: &C, inputs: Input::To<C::Value>) -> Result<Output::To<C::Value>, C::Error>
-    where
-        C: StatefulCompilationDomain,
-    {
-        self.call_statefully_async(domain, inputs).r#await()
     }
 
     /// Flattens the structured runtime `inputs`, validates their count, and prepends the runtime captures to them.
-    fn prepare_inputs(&self, inputs: Input::To<C::Value>) -> Result<Vec<C::Value>, ProgramError> {
+    fn prepare_inputs(&self, inputs: Input::To<C::Value>) -> Result<Vec<C::Value>, ProgramError>
+    where
+        Input::Family: ParameterizedFamily<C::Value>,
+        Input::To<C::Value>: Parameterized<C::Value>,
+    {
         let inputs = inputs.into_parameters().collect::<Vec<_>>();
         self.validate_flat_input_count(&inputs)?;
         Ok(self.inputs_with_captures(inputs))
