@@ -746,14 +746,15 @@ impl<C: CompilationDomain, Input: Parameterized<C::Type>, Output: Parameterized<
     }
 
     /// Prepends the retained runtime captures to the flat public `inputs`, producing the complete flat input
-    /// list in the `[captures..., public inputs...]` order every execution expects.
+    /// list in the `[captures..., inputs...]` order every execution expects.
+    #[inline]
     pub fn inputs_with_captures(&self, inputs: Vec<C::Value>) -> Vec<C::Value> {
         if self.state.captures.is_empty() {
             return inputs;
         }
-        let mut runtime_inputs = self.state.captures.to_vec();
-        runtime_inputs.extend(inputs);
-        runtime_inputs
+        let mut inputs_with_captures = self.state.captures.to_vec();
+        inputs_with_captures.extend(inputs);
+        inputs_with_captures
     }
 
     /// Reconstructs structured runtime outputs from the executable's flat `outputs` using the retained output
