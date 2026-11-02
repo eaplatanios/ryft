@@ -13,7 +13,7 @@ use crate::compilation::operations::StagedCallOperation;
 use crate::contexts::{Context, Domain, StagingContext};
 use crate::macros::{check_builders, check_count};
 use crate::operations::Constant;
-use crate::parameters::{ParameterError, Parameterized, ParameterizedFamily, Placeholder};
+use crate::parameters::{Parameterized, ParameterizedFamily, Placeholder};
 use crate::programs::{
     AttachedRegions, FlatProgram, ProgramError, ReferenceCompletion, Type, TypeError, TypeRefinements, Typed, Value,
     validate_reference_boundary,
@@ -295,16 +295,6 @@ where
         &self.state.input_structure
     }
 
-    // TODO(eaplatanios): Review from here onwards.
-
-    /// Reconstructs the structured abstract input signature retained by this function.
-    pub fn input_signature(&self) -> Result<Input, ParameterError>
-    where
-        Input: Parameterized<C::Type, Family: ParameterizedFamily<C::Type, To = Input>, To<C::Type> = Input>,
-    {
-        Input::from_parameters(self.state.input_structure.clone(), self.input_types().iter().cloned())
-    }
-
     /// Returns the output parameter structure retained by this staged function.
     #[inline]
     pub fn output_structure(&self) -> &Output::ParameterStructure {
@@ -316,6 +306,8 @@ where
     pub fn options(&self) -> &C::Options {
         self.state.program.options()
     }
+
+    // TODO(eaplatanios): Review from here onwards.
 
     /// Stages a call to this function into the active context recovered from `inputs`.
     ///
@@ -2153,7 +2145,8 @@ pub(crate) mod tests {
             )
             .unwrap();
 
-        assert_eq!(staged.input_signature().unwrap(), input_types);
+        assert_eq!(staged.input_structure(), &input_types.parameter_structure());
+        assert_eq!(staged.input_types(), &[ArrayType::scalar(DataType::F64)]);
         assert_eq!(
             staged.source_program().program().to_string(),
             indoc! {"

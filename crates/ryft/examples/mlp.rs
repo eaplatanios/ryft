@@ -99,7 +99,9 @@ fn gradient_descent_step<A: ArrayOperations>(
     (model.into() - gradients.into() * learning_rate.clone()).into_inner()
 }
 
-/// Execution context in which [`train`] computes the loss value and the gradient of an MLP over `A`.
+/// Execution context in which [`train`] computes the loss value and the gradient of an MLP over `A`. Like
+/// [`ReverseModeDifferentiate`], it states its partial-evaluation bound as a `where` clause, which is not implied for
+/// users, so generic code bounded by this trait restates it.
 trait TrainingDomain<A: Value>:
     ReverseModeDifferentiate<
         Operation: OperationProvider<
@@ -112,10 +114,13 @@ trait TrainingDomain<A: Value>:
             Operation = Self::Operation,
         > + OperationProvider<Self::Type, OneOperation<Self::Type>, Operation = Self::Operation>,
     > + Zero<A>
+where
+    <PartialEvaluationContext<Self> as Domain>::Operation: DifferentiableOperation<PartialEvaluationContext<Self>>,
 {
 }
 
-impl<A: Value, C> TrainingDomain<A> for C where
+impl<A: Value, C> TrainingDomain<A> for C
+where
     C: ReverseModeDifferentiate<
             Operation: OperationProvider<
                 C::Type,
@@ -126,7 +131,8 @@ impl<A: Value, C> TrainingDomain<A> for C where
                 ReferenceFreezeOperation<<C::Type as ReferenceMemberType>::Referent, C::Type>,
                 Operation = C::Operation,
             > + OperationProvider<C::Type, OneOperation<C::Type>, Operation = C::Operation>,
-        > + Zero<A>
+        > + Zero<A>,
+    <PartialEvaluationContext<C> as Domain>::Operation: DifferentiableOperation<PartialEvaluationContext<C>>,
 {
 }
 
@@ -158,6 +164,7 @@ where
     A: ArrayOperations<Type = C::Type>,
     C: Context<Value = A> + TrainingDomain<A>,
     LinearizationTracer<C>: ArrayOperations,
+    <PartialEvaluationContext<C> as Domain>::Operation: DifferentiableOperation<PartialEvaluationContext<C>>,
     ReadValues: FnMut(&A) -> ExampleResult<Vec<f64>>,
 {
     let mut losses = Vec::with_capacity(STEP_COUNT);
@@ -249,6 +256,7 @@ where
     A: ArrayOperations<Type = C::Type>,
     C: Context<Value = A> + TrainingDomain<A>,
     LinearizationTracer<C>: ArrayOperations,
+    <PartialEvaluationContext<C> as Domain>::Operation: DifferentiableOperation<PartialEvaluationContext<C>>,
     ReadValues: FnMut(&A) -> ExampleResult<Vec<f64>>,
 {
     let model = Mlp {
