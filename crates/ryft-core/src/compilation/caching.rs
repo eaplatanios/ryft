@@ -25,12 +25,11 @@ use flate2::write::GzEncoder;
 use lru::LruCache;
 use sha2::{Digest, Sha256};
 
-use crate::compilation::contexts::{CompilationCacheDomain, CompilationRequest};
+use crate::compilation::contexts::CompilationCacheDomain;
 use crate::compilation::exchange::{
     CompilationArtifactExchange, CompilationArtifactExchangePolicy, CompilationExchangeError,
 };
-use crate::compilation::functions::CompiledFunction;
-use crate::programs::{ProgramError, Type};
+use crate::programs::ProgramError;
 
 /// Default capacity of the in-memory tier of a [`CompilationContext`]. Use [`CompilationContext::with_capacity`] when
 /// a workload needs a different bound.
@@ -628,52 +627,21 @@ impl<C: CompilationCacheDomain> CompilationContext<C> {
         self.recent_events.lock().expect("compilation event mutex should not be poisoned").clear();
     }
 
-    /// Performs the complete cached compilation transition for `request`.
-    ///
-    /// This function owns the orchestration that caching backends share. It derives the exact structural key through
-    /// [`CompilationCacheDomain::compilation_key`], resolves the shared cache tiers through [`Self::get_or_compile`]
-    /// with `produce` as the backend producer, validates that the compiled output types refine the lowered
-    /// declaration, and assembles the compiled artifact. Backends that need a different policy can call
-    /// [`Self::get_or_compile`] directly.
-    ///
-    /// # Parameters
-    ///
-    ///   - `domain`: Compilation domain performing the transition.
-    ///   - `request`: Lowered artifact consumed by the transition.
-    ///   - `produce`: Backend compilation of the lowered program, invoked only when every cache tier misses.
-    ///   - `output_types`: Effective flat output types of a compiled program.
-    pub fn compile_request<Request, Produce, OutputTypes>(
+    /// Compiles `program` through the shared cache tiers. This function derives the exact structural key of `program`
+    /// through [`CompilationCacheDomain::compilation_key`] and resolves it through [`Self::get_or_compile`], with
+    /// `produce` as the backend producer that is invoked only when every cache tier misses. Backends that need a
+    /// different policy can call [`Self::get_or_compile`] directly.
+    pub fn compile<Produce>(
         &self,
         domain: &C,
-        request: Request,
+        program: &C::LoweredProgram,
         produce: Produce,
-        output_types: OutputTypes,
-    ) -> Result<CompiledFunction<C, Request::Input, Request::Output>, C::Error>
+    ) -> Result<Arc<C::CompiledProgram>, C::Error>
     where
-        Request: CompilationRequest<C>,
         Produce: FnOnce(&C::LoweredProgram) -> Result<C::CompiledProgram, C::Error>,
-        OutputTypes: FnOnce(&C::CompiledProgram) -> Vec<C::Type>,
     {
-        let cache_key = domain.compilation_key(request.lowered().lowered_program())?;
-        let program = self.get_or_compile(domain, cache_key, || produce(request.lowered().lowered_program()))?;
-        let compiled_output_types = output_types(program.as_ref());
-        let declared_output_types = request.lowered().output_types();
-        if compiled_output_types.len() != declared_output_types.len() {
-            return Err(ProgramError::InvalidOutputCount {
-                expected: declared_output_types.len(),
-                actual: compiled_output_types.len(),
-            }
-            .into());
-        }
-        for (declared, actual) in declared_output_types.iter().zip(&compiled_output_types) {
-            if !declared.is_refined_by(actual) {
-                return Err(ProgramError::InvalidArgument {
-                    message: format!("output type {actual} does not refine declared type {declared}"),
-                }
-                .into());
-            }
-        }
-        Ok(request.into_compiled(program, compiled_output_types))
+        let cache_key = domain.compilation_key(program)?;
+        self.get_or_compile(domain, cache_key, || produce(program))
     }
 
     /// Returns a shared cached program for `cache_key`, restoring or producing it when absent.
@@ -1772,8 +1740,8 @@ mod tests {
 
     use crate::arrays::{Array, ArrayOperation, ArrayType, DataType};
     use crate::captures::CaptureReference;
-    use crate::compilation::contexts::{CallRequest, CompilationDomain, LoweringRequest};
-    use crate::compilation::functions::{CompilationTracer, LoweredFunction, StagedFunction, stage};
+    use crate::compilation::contexts::CompilationDomain;
+    use crate::compilation::functions::{CompilationTracer, FlatCompilationProgram, StagedFunction, stage};
     use crate::contexts::Domain;
     use crate::programs::ProgramError;
 
@@ -1817,33 +1785,31 @@ mod tests {
             Ok((input_types.clone(), input_types))
         }
 
-        fn lower<Request>(
+        fn lower(
             &self,
-            staged: Request,
-        ) -> Result<LoweredFunction<Self, Request::Input, Request::Output>, Self::Error>
-        where
-            Request: LoweringRequest<Self>,
-        {
-            let output_types = staged.staged().output_types().to_vec();
-            Ok(staged.into_lowered(output_types.clone(), output_types))
+            _program: &FlatCompilationProgram<Self>,
+            _capture_count: usize,
+            _input_types: &[ArrayType],
+            output_types: &[ArrayType],
+            _options: &Self::Options,
+        ) -> Result<(Self::LoweredProgram, Vec<ArrayType>), Self::Error> {
+            Ok((output_types.to_vec(), output_types.to_vec()))
         }
 
-        fn compile<Request>(
+        fn compile(
             &self,
-            lowered: Request,
-        ) -> Result<CompiledFunction<Self, Request::Input, Request::Output>, Self::Error>
-        where
-            Request: CompilationRequest<Self>,
-        {
-            Ok(lowered.into_compiled(Arc::new(TestCompiledProgram(0)), Vec::new()))
+            program: &Self::LoweredProgram,
+        ) -> Result<(Arc<Self::CompiledProgram>, Vec<ArrayType>), Self::Error> {
+            Ok((Arc::new(TestCompiledProgram(0)), program.clone()))
         }
 
-        fn call<Request>(&self, request: Request) -> Result<Request::RuntimeOutput, Self::Error>
-        where
-            Request: CallRequest<Self>,
-        {
-            let executable = request.executable().clone();
-            Request::reconstruct(&executable, Vec::new())
+        fn call(
+            &self,
+            _program: &Self::CompiledProgram,
+            _input_types: &[ArrayType],
+            _arguments: Vec<Array>,
+        ) -> Result<Vec<Array>, Self::Error> {
+            Ok(Vec::new())
         }
     }
 
@@ -2330,36 +2296,19 @@ mod tests {
     }
 
     #[test]
-    fn test_compilation_context_compile_request() {
+    fn test_compilation_context_compile() {
         let context = CompilationContext::<TestDomain>::new();
         let domain = TestDomain::default();
         let staged: StagedFunction<TestDomain, ArrayType, ArrayType> =
             stage(&domain, |input: CompilationTracer<TestDomain>| input, ArrayType::scalar(DataType::F32), ()).unwrap();
-        let lowered = domain.lower(staged).unwrap();
+        let lowered = staged.lower(&domain).unwrap();
 
-        let compiled = context
-            .compile_request(
-                &domain,
-                lowered.clone(),
-                |_| Ok(TestCompiledProgram(5)),
-                |_| vec![ArrayType::scalar(DataType::F32)],
-            )
-            .unwrap();
-        assert_eq!(compiled.compiled_program(), &TestCompiledProgram(5));
-        assert_eq!(compiled.output_types(), &[ArrayType::scalar(DataType::F32)]);
-
-        // The compiled output types must match the lowered declaration in count and refine it.
-        assert!(matches!(
-            context.compile_request(&domain, lowered.clone(), |_| Ok(TestCompiledProgram(5)), |_| Vec::new()),
-            Err(ProgramError::InvalidOutputCount { expected: 1, actual: 0 }),
-        ));
-        assert!(matches!(
-            context.compile_request(&domain, lowered, |_| Ok(TestCompiledProgram(5)), |_| {
-                vec![ArrayType::scalar(DataType::I64)]
-            }),
-            Err(ProgramError::InvalidArgument { message })
-                if message == "output type i64[] does not refine declared type f32[]",
-        ));
+        // The producer runs only on the first request, and the second request is served by the in-memory tier.
+        let first = context.compile(&domain, lowered.lowered_program(), |_| Ok(TestCompiledProgram(5))).unwrap();
+        let second = context.compile(&domain, lowered.lowered_program(), |_| Ok(TestCompiledProgram(6))).unwrap();
+        assert_eq!(first.as_ref(), &TestCompiledProgram(5));
+        assert!(Arc::ptr_eq(&first, &second));
+        assert_eq!(context.statistics().compilations, 1);
     }
 
     #[test]

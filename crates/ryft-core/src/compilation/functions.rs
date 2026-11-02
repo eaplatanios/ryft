@@ -1,11 +1,10 @@
-//! Typed compilation lifecycle handles, backend requests, and retained JIT dispatch.
+//! Typed compilation lifecycle handles and retained JIT dispatch.
 //!
 //! The lifecycle handles ([`StagedFunction`], [`LoweredFunction`], [`CompiledFunction`], and [`ExecutableFunction`])
 //! carry a program through staging, lowering, compilation, and execution together with its runtime captures and
-//! structured signatures. [`StagedFunction`], [`LoweredFunction`], and [`CompilationCall`] implement the request
-//! traits through which a [`CompilationDomain`] completes lowering, compilation, and execution.
-//! [`CompiledFunctionDispatcher`] retains compiled specializations of one Rust closure, and [`jit`] and its variants
-//! construct it.
+//! structured signatures. [`StagedFunction::lower`], [`LoweredFunction::compile`], and [`ExecutableFunction::call`]
+//! advance a handle through the flat functions of its [`CompilationDomain`]. [`CompiledFunctionDispatcher`] retains
+//! compiled specializations of one Rust closure, and [`jit`] and its variants construct it.
 
 // TODO(eaplatanios): Review this module.
 
@@ -18,9 +17,7 @@ use std::time::{Duration, Instant};
 
 use crate::captures::{CapturingContext, ClosedProgram};
 use crate::compilation::caching::accumulate_duration;
-use crate::compilation::contexts::{
-    CallRequest, CompilationDomain, CompilationRequest, LoweringRequest, StatefulCompilationDomain,
-};
+use crate::compilation::contexts::{CompilationDomain, StatefulCompilationDomain};
 use crate::contexts::{Context, Domain, StagingContext};
 use crate::macros::check_count;
 use crate::operations::Constant;
@@ -106,28 +103,6 @@ pub type FlatCompilationProgram<C> = Program<
 /// Tracer used while staging a compiled function in the operation universe of `C`.
 pub type CompilationTracer<C> = Tracer<DomainTracingContext<C, <C as Domain>::Value>>;
 
-/// Complete typed request consumed by [`CompilationDomain::call`].
-pub struct CompilationCall<C: CompilationDomain, Input: Parameterized<C::Type>, Output: Parameterized<C::Type>> {
-    /// Executable being invoked.
-    executable: ExecutableFunction<C, Input, Output>,
-
-    /// Flat public runtime inputs, excluding captures.
-    inputs: Vec<C::Value>,
-}
-
-impl<C, Input, Output> CompilationCall<C, Input, Output>
-where
-    C: CompilationDomain,
-    Input: Parameterized<C::Type, Family: ParameterizedFamily<C::Value>>,
-    Output: Parameterized<C::Type, Family: ParameterizedFamily<C::Value>>,
-    Input::To<C::Value>: Parameterized<C::Value>,
-{
-    /// Creates a structured execution request.
-    pub fn new(executable: &ExecutableFunction<C, Input, Output>, inputs: Input::To<C::Value>) -> Self {
-        Self { executable: executable.clone(), inputs: inputs.into_parameters().collect() }
-    }
-}
-
 /// Completion-bearing result of one externally stateful compiled invocation.
 ///
 /// The public result may be reconstructed immediately from pending backend values, but [`Self::await`] always observes
@@ -187,6 +162,11 @@ impl<Output, Error> ReferenceExecution<Output, Error> {
             return Err(completion_error(error));
         }
         self.result
+    }
+
+    /// Applies `function` to the public output of this invocation without changing its completion.
+    fn and_then<T>(self, function: impl FnOnce(Output) -> Result<T, Error>) -> ReferenceExecution<T, Error> {
+        ReferenceExecution { result: self.result.and_then(function), completion: self.completion }
     }
 }
 
@@ -524,29 +504,18 @@ where
         let program = Arc::new(self.state.source_program.to_program_with_lifted_captures()?);
         Ok(self.state.lifted_program.get_or_init(|| program).clone())
     }
-}
 
-impl<C, Input, Output> LoweringRequest<C> for StagedFunction<C, Input, Output>
-where
-    C: CompilationDomain,
-    Input: Parameterized<C::Type>,
-    Input::Family: ParameterizedFamily<C::Constant>,
-    Output: Parameterized<C::Type>,
-    Output::Family: ParameterizedFamily<C::Constant>,
-{
-    type Input = Input;
-    type Output = Output;
-
-    fn staged(&self) -> &Self {
-        self
-    }
-
-    fn lifted_program(&self) -> Result<Arc<FlatCompilationProgram<C>>, ProgramError> {
-        StagedFunction::lifted_program(self)
-    }
-
-    fn into_lowered(self, program: C::LoweredProgram, output_types: Vec<C::Type>) -> LoweredFunction<C, Input, Output> {
-        LoweredFunction::from_parts(self, program, output_types)
+    /// Lowers this function into a [`LoweredFunction`] through `domain` (refer to [`CompilationDomain::lower`]).
+    pub fn lower(&self, domain: &C) -> Result<LoweredFunction<C, Input, Output>, C::Error> {
+        let program = self.lifted_program()?;
+        let (lowered_program, output_types) = domain.lower(
+            &program,
+            self.state.source_program.captures().len(),
+            self.input_types(),
+            self.output_types(),
+            self.options(),
+        )?;
+        Ok(LoweredFunction { program: Arc::new(lowered_program), staged: self.clone(), output_types })
     }
 }
 
@@ -590,15 +559,6 @@ where
     Output: Parameterized<C::Type>,
     Output::Family: ParameterizedFamily<C::Constant>,
 {
-    /// Assembles a lowering whose output signature has already been established by its backend.
-    fn from_parts(
-        staged: StagedFunction<C, Input, Output>,
-        program: C::LoweredProgram,
-        output_types: Vec<C::Type>,
-    ) -> Self {
-        Self { program: Arc::new(program), staged, output_types }
-    }
-
     /// Returns the backend-owned lowered program.
     #[inline]
     pub fn lowered_program(&self) -> &C::LoweredProgram {
@@ -622,29 +582,25 @@ where
     pub fn output_types(&self) -> &[C::Type] {
         &self.output_types
     }
-}
 
-impl<C, Input, Output> CompilationRequest<C> for LoweredFunction<C, Input, Output>
-where
-    C: CompilationDomain,
-    Input: Parameterized<C::Type>,
-    Input::Family: ParameterizedFamily<C::Constant>,
-    Output: Parameterized<C::Type>,
-    Output::Family: ParameterizedFamily<C::Constant>,
-{
-    type Input = Input;
-    type Output = Output;
-
-    fn lowered(&self) -> &Self {
-        self
-    }
-
-    fn into_compiled(
-        self,
-        program: Arc<C::CompiledProgram>,
-        output_types: Vec<C::Type>,
-    ) -> CompiledFunction<C, Input, Output> {
-        CompiledFunction::from_parts(self, program, output_types)
+    /// Compiles this function into a [`CompiledFunction`] through `domain` (refer to [`CompilationDomain::compile`]).
+    ///
+    /// # Errors
+    ///
+    /// Returns the error of `domain`, or a [`ProgramError`] if the compiled output types differ in count from the
+    /// lowered output types of this function or do not refine them.
+    pub fn compile(&self, domain: &C) -> Result<CompiledFunction<C, Input, Output>, C::Error> {
+        let (program, output_types) = domain.compile(self.lowered_program())?;
+        check_count!("output", output_types, self.output_types.len(), ProgramError);
+        for (declared, actual) in self.output_types.iter().zip(&output_types) {
+            if !declared.is_refined_by(actual) {
+                return Err(ProgramError::InvalidArgument {
+                    message: format!("output type {actual} does not refine declared type {declared}"),
+                }
+                .into());
+            }
+        }
+        Ok(CompiledFunction::from_parts(self.clone(), program, output_types))
     }
 }
 
@@ -802,7 +758,9 @@ where
     /// Functions that bind external mutable references must be executed through [`Self::call_statefully`] or
     /// [`Self::call_statefully_async`] instead.
     pub fn call(&self, domain: &C, inputs: Input::To<C::Value>) -> Result<Output::To<C::Value>, C::Error> {
-        domain.call(CompilationCall::new(self, inputs))
+        let arguments = self.arguments(inputs)?;
+        let outputs = domain.call(self.compiled_program(), self.input_types(), arguments)?;
+        self.reconstruct_outputs(outputs).map_err(C::Error::from)
     }
 
     /// Executes this function on the structured runtime `inputs` through the stateful `domain` and returns a result
@@ -818,7 +776,13 @@ where
     where
         C: StatefulCompilationDomain,
     {
-        domain.call_statefully_async(CompilationCall::new(self, inputs))
+        let arguments = match self.arguments(inputs) {
+            Ok(arguments) => arguments,
+            Err(error) => return ReferenceExecution::ready(Err(error.into())),
+        };
+        domain
+            .call_statefully_async(self.compiled_program(), self.input_types(), arguments)
+            .and_then(|outputs| self.reconstruct_outputs(outputs).map_err(C::Error::from))
     }
 
     /// Executes this function on the structured runtime `inputs` through the stateful `domain` and waits for the whole
@@ -827,40 +791,14 @@ where
     where
         C: StatefulCompilationDomain,
     {
-        domain.call_statefully(CompilationCall::new(self, inputs))
-    }
-}
-
-impl<C, Input, Output> CallRequest<C> for CompilationCall<C, Input, Output>
-where
-    C: CompilationDomain,
-    Input: Parameterized<C::Type, Family: ParameterizedFamily<C::Value>>,
-    Output: Parameterized<C::Type, Family: ParameterizedFamily<C::Value>>,
-    Input::To<C::Value>: Parameterized<C::Value>,
-    Output::To<C::Value>:
-        Parameterized<C::Value, Family = Output::Family, ParameterStructure = Output::ParameterStructure>,
-{
-    type Input = Input;
-    type Output = Output;
-    type RuntimeOutput = Output::To<C::Value>;
-
-    fn executable(&self) -> &ExecutableFunction<C, Input, Output> {
-        &self.executable
+        self.call_statefully_async(domain, inputs).r#await()
     }
 
-    fn inputs(&self) -> &[C::Value] {
-        &self.inputs
-    }
-
-    fn into_arguments(self) -> Vec<C::Value> {
-        self.executable.arguments_with_captures(self.inputs)
-    }
-
-    fn reconstruct(
-        executable: &ExecutableFunction<C, Input, Output>,
-        outputs: Vec<C::Value>,
-    ) -> Result<Self::RuntimeOutput, C::Error> {
-        executable.reconstruct_outputs(outputs).map_err(C::Error::from)
+    /// Flattens the structured runtime `inputs`, validates their count, and prepends the runtime captures to them.
+    fn arguments(&self, inputs: Input::To<C::Value>) -> Result<Vec<C::Value>, ProgramError> {
+        let inputs = inputs.into_parameters().collect::<Vec<_>>();
+        self.validate_flat_input_count(&inputs)?;
+        Ok(self.arguments_with_captures(inputs))
     }
 }
 
@@ -1395,7 +1333,7 @@ where
 
     /// Calls this dispatcher statefully and waits for whole-invocation completion.
     ///
-    /// This routes through [`StatefulCompilationDomain::call_statefully`], so it reports asynchronous execution errors
+    /// This routes through [`ExecutableFunction::call_statefully`], so it reports asynchronous execution errors
     /// before returning and does not weaken the domain's reference sequencing contract.
     pub fn call_statefully(
         &self,
@@ -1500,11 +1438,11 @@ where
         let staged = staged?;
         statistics.lowerings.fetch_add(1, Ordering::Relaxed);
         let lowering_start = Instant::now();
-        let lowered = self.state.domain.lower(staged);
+        let lowered = staged.lower(&self.state.domain);
         accumulate_duration(&statistics.lowering_nanoseconds, lowering_start.elapsed());
         let lowered = lowered?;
         statistics.compilation_requests.fetch_add(1, Ordering::Relaxed);
-        let compiled = self.state.domain.compile(lowered)?;
+        let compiled = lowered.compile(&self.state.domain)?;
         Ok(producer.insert(compiled.into_executable_function()))
     }
 
@@ -1696,6 +1634,7 @@ mod tests {
         staged_input_type: Option<ArrayType>,
         fail_lowering: bool,
         fail_compilation: bool,
+        compiled_output_types: Option<Vec<ArrayType>>,
     }
 
     #[derive(Clone)]
@@ -1740,72 +1679,59 @@ mod tests {
             Ok((input_types.clone(), input_types))
         }
 
-        fn lower<Request>(
+        fn lower(
             &self,
-            staged: Request,
-        ) -> Result<LoweredFunction<Self, Request::Input, Request::Output>, Self::Error>
-        where
-            Request: LoweringRequest<Self>,
-        {
-            if staged.staged().options().fail_lowering {
+            program: &FlatCompilationProgram<Self>,
+            capture_count: usize,
+            _input_types: &[ArrayType],
+            output_types: &[ArrayType],
+            options: &Self::Options,
+        ) -> Result<(Self::LoweredProgram, Vec<ArrayType>), Self::Error> {
+            if options.fail_lowering {
                 return Err(ProgramError::InvalidArgument { message: "expected lowering failure".into() });
             }
-            let program = staged.lifted_program()?;
-            let output_types = staged.staged().output_types().to_vec();
-            let capture_count = staged.staged().source_program().captures().len();
-            let options = staged.staged().options().clone();
-            Ok(staged.into_lowered(
-                TestLoweredProgram {
-                    program: program.as_ref().clone(),
-                    capture_count,
-                    output_types: output_types.clone(),
-                    options,
-                },
-                output_types,
-            ))
+            let program = TestLoweredProgram {
+                program: program.clone(),
+                capture_count,
+                output_types: output_types.to_vec(),
+                options: options.clone(),
+            };
+            Ok((program, output_types.to_vec()))
         }
 
-        fn compile<Request>(
+        fn compile(
             &self,
-            lowered: Request,
-        ) -> Result<CompiledFunction<Self, Request::Input, Request::Output>, Self::Error>
-        where
-            Request: CompilationRequest<Self>,
-        {
-            self.cache.compile_request(
-                self,
-                lowered,
-                |program| {
-                    self.compilations.fetch_add(1, Ordering::Relaxed);
-                    if program.options.fail_compilation {
-                        return Err(ProgramError::InvalidArgument { message: "expected compilation failure".into() });
-                    }
-                    Ok(TestCompiledProgram {
-                        program: program.program.clone(),
-                        output_types: program.output_types.clone(),
-                    })
-                },
-                |program| program.output_types.clone(),
-            )
+            program: &Self::LoweredProgram,
+        ) -> Result<(Arc<Self::CompiledProgram>, Vec<ArrayType>), Self::Error> {
+            let program = self.cache.compile(self, program, |program| {
+                self.compilations.fetch_add(1, Ordering::Relaxed);
+                if program.options.fail_compilation {
+                    return Err(ProgramError::InvalidArgument { message: "expected compilation failure".into() });
+                }
+                let output_types =
+                    program.options.compiled_output_types.clone().unwrap_or_else(|| program.output_types.clone());
+                Ok(TestCompiledProgram { program: program.program.clone(), output_types })
+            })?;
+            let output_types = program.output_types.clone();
+            Ok((program, output_types))
         }
 
-        fn call<Request>(&self, request: Request) -> Result<Request::RuntimeOutput, Self::Error>
-        where
-            Request: CallRequest<Self>,
-        {
-            request.executable().validate_flat_input_count(request.inputs())?;
-            for (declared, actual) in
-                request.executable().input_types().iter().zip(request.inputs().iter().map(Typed::r#type))
-            {
+        fn call(
+            &self,
+            program: &Self::CompiledProgram,
+            input_types: &[ArrayType],
+            arguments: Vec<Array>,
+        ) -> Result<Vec<Array>, Self::Error> {
+            let inputs = &arguments[arguments.len() - input_types.len()..];
+            for (declared, actual) in input_types.iter().zip(inputs.iter().map(Typed::r#type)) {
                 if !declared.is_refined_by(actual.as_ref()) {
                     return Err(ProgramError::InvalidArgument {
                         message: format!("runtime input type {actual} does not refine declared type {declared}"),
                     });
                 }
             }
-            let executable = request.executable().clone();
-            let outputs = executable.compiled_program().program.interpret_with(
-                request.into_arguments(),
+            program.program.interpret_with(
+                arguments,
                 |_, capture| {
                     Err(ProgramError::MalformedProgram(format!(
                         "lifted test program retained capture {}",
@@ -1818,8 +1744,7 @@ mod tests {
                     }
                     Ok(vec![-inputs[0].clone()])
                 },
-            )?;
-            Request::reconstruct(&executable, outputs)
+            )
         }
     }
 
@@ -1889,38 +1814,34 @@ mod tests {
             Ok((input_types.clone(), input_types))
         }
 
-        fn lower<Request>(
+        fn lower(
             &self,
-            staged: Request,
-        ) -> Result<LoweredFunction<Self, Request::Input, Request::Output>, ProgramError>
-        where
-            Request: LoweringRequest<Self>,
-        {
-            let program = staged.lifted_program()?.as_ref().clone();
-            let output_types = staged.staged().output_types().to_vec();
-            Ok(staged.into_lowered(program, output_types))
+            program: &FlatCompilationProgram<Self>,
+            _capture_count: usize,
+            _input_types: &[ArrayIrType],
+            output_types: &[ArrayIrType],
+            _options: &Self::Options,
+        ) -> Result<(Self::LoweredProgram, Vec<ArrayIrType>), ProgramError> {
+            Ok((program.clone(), output_types.to_vec()))
         }
 
-        fn compile<Request>(
+        fn compile(
             &self,
-            lowered: Request,
-        ) -> Result<CompiledFunction<Self, Request::Input, Request::Output>, ProgramError>
-        where
-            Request: CompilationRequest<Self>,
-        {
+            program: &Self::LoweredProgram,
+        ) -> Result<(Arc<Self::CompiledProgram>, Vec<ArrayIrType>), ProgramError> {
             self.compilations.fetch_add(1, Ordering::Relaxed);
-            let program = lowered.lowered().lowered_program().clone();
-            let output_types = lowered.lowered().output_types().to_vec();
-            Ok(lowered.into_compiled(Arc::new(program), output_types))
+            let output_types = program.output_types();
+            Ok((Arc::new(program.clone()), output_types))
         }
 
-        fn call<Request>(&self, request: Request) -> Result<Request::RuntimeOutput, ProgramError>
-        where
-            Request: CallRequest<Self>,
-        {
-            let executable = request.executable().clone();
-            let outputs = executable.compiled_program().interpret_with(
-                request.into_arguments(),
+        fn call(
+            &self,
+            program: &Self::CompiledProgram,
+            _input_types: &[ArrayIrType],
+            arguments: Vec<ArrayIrValue<Array>>,
+        ) -> Result<Vec<ArrayIrValue<Array>>, ProgramError> {
+            program.interpret_with(
+                arguments,
                 |_, capture| {
                     Err(ProgramError::MalformedProgram(format!(
                         "retained-JIT test program retained capture {}",
@@ -1934,8 +1855,7 @@ mod tests {
                         inputs,
                     )
                 },
-            )?;
-            Request::reconstruct(&executable, outputs)
+            )
         }
     }
 
@@ -1950,7 +1870,7 @@ mod tests {
             TestOptions::default(),
         )
         .unwrap();
-        domain.compile(domain.lower(staged).unwrap()).unwrap()
+        staged.lower(&domain).unwrap().compile(&domain).unwrap()
     }
 
     fn reference_completion_error(reason: Arc<str>) -> ProgramError {
@@ -1973,7 +1893,7 @@ mod tests {
     }
 
     #[test]
-    fn test_compilation_staging_request_trace_propagates_closure_error() {
+    fn test_compilation_domain_stage_propagates_closure_error() {
         let domain = TestDomain::new();
         let result: Result<StagedFunction<TestDomain, ArrayType, ArrayType>, ProgramError> = domain.stage(
             |_, _, _| Err(ProgramError::InvalidArgument { message: "staging failed".into() }),
@@ -1986,7 +1906,7 @@ mod tests {
     }
 
     #[test]
-    fn test_compilation_staging_request_trace_prunes_unused_captures() {
+    fn test_compilation_domain_stage_prunes_unused_captures() {
         let domain = TestDomain::new();
         let staged: StagedFunction<TestDomain, ArrayType, ArrayType> = domain
             .stage(
@@ -2045,8 +1965,8 @@ mod tests {
         let staged_clone = staged.clone();
         assert!(std::ptr::eq(staged.options(), staged_clone.options()));
 
-        let first = domain.compile(domain.lower(staged_clone).unwrap()).unwrap();
-        let second = domain.compile(domain.lower(staged).unwrap()).unwrap();
+        let first = staged_clone.lower(&domain).unwrap().compile(&domain).unwrap();
+        let second = staged.lower(&domain).unwrap().compile(&domain).unwrap();
 
         assert_eq!(
             first.executable_function().call(&domain, Array::scalar(2.0).unwrap()).unwrap(),
@@ -2110,13 +2030,33 @@ mod tests {
                 TestOptions::default(),
             )
             .unwrap();
-        let compiled = domain.compile(domain.lower(staged).unwrap()).unwrap();
+        let compiled = staged.lower(&domain).unwrap().compile(&domain).unwrap();
 
         assert_eq!(compiled.executable_function().call(&domain, ()).unwrap(), Array::scalar(7.0).unwrap());
         assert_eq!(compiled.source_program().captures(), &[Array::scalar(7.0).unwrap()]);
         assert!(compiled.staged().input_types().is_empty());
         assert_eq!(compiled.lowered().output_types(), &[ArrayType::scalar(DataType::F64)]);
         assert_eq!(compiled.output_types(), &[ArrayType::scalar(DataType::F64)]);
+    }
+
+    #[test]
+    fn test_lowered_function_compile_validates_output_types() {
+        let domain = TestDomain::new();
+        let compile = |compiled_output_types: Vec<ArrayType>| {
+            let options = TestOptions { compiled_output_types: Some(compiled_output_types), ..TestOptions::default() };
+            let staged: StagedFunction<TestDomain, ArrayType, ArrayType> =
+                stage(&domain, |input| input, ArrayType::scalar(DataType::F64), options).unwrap();
+            staged.lower(&domain).unwrap().compile(&domain).map(|compiled| compiled.output_types().to_vec())
+        };
+
+        // The compiled output types must match the lowered output types in count and refine them.
+        assert_eq!(compile(vec![ArrayType::scalar(DataType::F64)]).unwrap(), vec![ArrayType::scalar(DataType::F64)]);
+        assert!(matches!(compile(Vec::new()), Err(ProgramError::InvalidOutputCount { expected: 1, actual: 0 })));
+        assert!(matches!(
+            compile(vec![ArrayType::scalar(DataType::I64)]),
+            Err(ProgramError::InvalidArgument { message })
+                if message == "output type i64[] does not refine declared type f64[]",
+        ));
     }
 
     #[test]
@@ -2130,7 +2070,7 @@ mod tests {
                 TestOptions::default(),
             )
             .unwrap();
-        let compiled = domain.compile(domain.lower(staged).unwrap()).unwrap();
+        let compiled = staged.lower(&domain).unwrap().compile(&domain).unwrap();
         let executable = compiled.into_executable_function();
 
         // The runtime handle outlives the transform metadata and still supplies its captures on every call.
