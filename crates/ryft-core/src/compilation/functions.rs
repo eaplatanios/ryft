@@ -27,79 +27,10 @@ pub(super) const DEFAULT_JIT_CACHE_CAPACITY: usize = 256;
 /// Tracer used while staging a compiled function in the operation universe of `C`.
 pub type CompilationTracer<C> = Tracer<DomainTracingContext<C, <C as Domain>::Value>>;
 
-/// Cache key identifying one specialization of a retained function. Cache reuse is authorized only when all
-/// three of the following components agree:
-///
-///   - **Static Parameters:** The host values the traced function may branch on, read, or embed as literals. Unequal
-///     static parameters can stage arbitrarily different programs, so they must separate specializations. Static
-///     parameters must be `Clone + Debug + Eq + Hash`. Runtime arrays and other backend values should be represented
-///     as dynamic inputs rather than static parameters.
-///   - **Input Structure:** The [`Parameterized::ParameterStructure`] shape of the dynamic function input. Tracing
-///     rebuilds the function's argument from this structure, so a function may legitimately branch on container arity.
-///     Keying on the structure rather than on the flattened leaves also distinguishes inputs that differ only in
-///     _empty_ substructure, which flat leaf paths and flat leaf types cannot see.
-///   - **Dispatch Key:** An owner-defined key used to select an interchangeable retained specialization for the dynamic
-///     inputs. It may be an exact abstract input signature or a normalized equivalence-class key such as a shape
-///     bucket. Equal dispatch keys must guarantee that the retained artifact can safely serve either call, while
-///     unequal keys conservatively separate specializations. Retained Just-In-Time (JIT) compilation dispatch uses
-///     [`CompilationDomain::DispatchKey`], for example.
-///
-/// Equal keys must identify calls that can safely share the same staged [`Program`](crate::Program). Unequal keys
-/// remain separate even if they happen to stage structurally equivalent programs.
-///
-/// Everything else that affects staging (e.g., the closure itself, its captures, the domain, any fixed options, etc.)
-/// is implicit in the cache's owner, because a cache is scoped to exactly one retained callable. That is why this key
-/// carries no fragile function-pointer identity. All three components are call-level (i.e., function-level) concepts,
-/// since a bare program has neither static parameters nor a structured input. That is what separates function-level
-/// specialization caching from structural region transformation through [`Transform`](crate::Transform).
-#[derive(Clone, Debug, PartialEq, Eq, Hash)]
-pub struct FunctionSpecializationKey<P, I, K> {
-    /// Host values declared static for the keyed specialization, such as an axis number, mode enum, or boolean option.
-    static_parameters: P,
-
-    /// Parameter structure of the dynamic input, such as the shape of a nested tuple or named parameter container.
-    input_structure: I,
-
-    /// Owner-defined cache key for the dynamic input, such as an exact abstract signature or normalized shape bucket.
-    dispatch_key: K,
-}
-
-impl<P, I, K> FunctionSpecializationKey<P, I, K> {
-    /// Creates a new [`FunctionSpecializationKey`].
-    #[inline]
-    pub fn new(static_parameters: P, input_structure: I, dispatch_key: K) -> Self {
-        Self { static_parameters, input_structure, dispatch_key }
-    }
-
-    /// Returns the static parameters (i.e., the host values declared static) for the keyed specialization.
-    /// Refer to the documentation of [`FunctionSpecializationKey`] for more information.
-    #[inline]
-    pub fn static_parameters(&self) -> &P {
-        &self.static_parameters
-    }
-
-    /// Returns the parameter structure of the dynamic input for the keyed specialization.
-    /// Refer to the documentation of [`FunctionSpecializationKey`] for more information.
-    #[inline]
-    pub fn input_structure(&self) -> &I {
-        &self.input_structure
-    }
-
-    /// Returns the owner-defined dispatch key for the dynamic inputs.
-    /// Refer to the documentation of [`FunctionSpecializationKey`] for more information.
-    #[inline]
-    pub fn dispatch_key(&self) -> &K {
-        &self.dispatch_key
-    }
-}
-
-// TODO(eaplatanios): Review from here onwards.
-
 /// Owned flat staging artifact constructed by [`Self::stage`] and borrowed by [`CompilationDomain::lower`].
-///
 /// This artifact retains the source program, runtime captures, flat public signature, and compilation options.
 /// [`StagedFunction`] pairs it with the Rust input and output container structures used by typed callers. Captures
-/// remain symbolic constants in the source program and become leading inputs in [`Self::lifted_program`].
+/// remain symbolic constants in the source program and become leading inputs in [`Self::lifted_program`]
 pub struct StagedProgram<C: CompilationDomain> {
     /// Flat source program and the runtime values referenced by its captured constants.
     source_program: ClosedProgram<C::Value, C::Constant, C::Operation, Vec<C::Constant>, Vec<C::Constant>>,
@@ -116,6 +47,8 @@ pub struct StagedProgram<C: CompilationDomain> {
     /// Memoized source program with runtime captures lifted into leading flat inputs.
     lifted_program: OnceLock<Arc<FlatProgram<C>>>,
 }
+
+// TODO(eaplatanios): Review from here onwards.
 
 impl<C: CompilationDomain> StagedProgram<C> {
     /// Traces the fallible flat `function` into an owned [`StagedProgram`]. `function` receives the symbolic references
@@ -975,6 +908,58 @@ where
     }
 }
 
+/// Key of one retained specialization of a [`CompiledFunctionDispatcher`]. The dispatcher reuses a specialization only
+/// when all three of the following components agree:
+///
+///   - **Static Parameters:** The host values the traced function may branch on, read, or embed as literals. Unequal
+///     static parameters can stage arbitrarily different programs, so they must separate specializations. Runtime
+///     arrays and other backend values should be represented as dynamic inputs rather than static parameters.
+///   - **Input Structure:** The [`Parameterized::ParameterStructure`] shape of the dynamic function input. Tracing
+///     rebuilds the function's argument from this structure, so a function may legitimately branch on container arity.
+///     Keying on the structure rather than on the flattened leaves also distinguishes inputs that differ only in
+///     _empty_ substructure, which flat leaf paths and flat leaf types cannot see.
+///   - **Dispatch Key:** The [`CompilationDomain::DispatchKey`] that [`CompilationDomain::dispatch_signature`] derives
+///     from the runtime input types. It may be an exact abstract input signature or a normalized equivalence-class key
+///     such as a shape bucket. Equal dispatch keys must guarantee that the retained executable can safely serve either
+///     call, while unequal keys conservatively separate specializations.
+///
+/// Equal keys must identify calls that can safely share the same staged [`Program`](crate::Program). Unequal keys
+/// remain separate even if they happen to stage structurally equivalent programs. Everything else that affects staging
+/// (e.g., the closure itself, its captures, the domain, and the compilation options) is fixed by the dispatcher, whose
+/// specialization cache serves exactly one retained closure. That is why this key carries no fragile function-pointer
+/// identity.
+#[derive(Clone, Debug, PartialEq, Eq, Hash)]
+struct SpecializationKey<Static, Structure, Key> {
+    /// Host values declared static for the keyed specialization, such as an axis number, mode enum, or boolean option.
+    static_parameters: Static,
+
+    /// Parameter structure of the dynamic input, such as the shape of a nested tuple or named parameter container.
+    input_structure: Structure,
+
+    /// Domain-derived dispatch key of the runtime input types (refer to [`CompilationDomain::dispatch_signature`]).
+    dispatch_key: Key,
+}
+
+impl<Static, Structure, Key> SpecializationKey<Static, Structure, Key> {
+    /// Creates a new [`SpecializationKey`].
+    #[inline]
+    fn new(static_parameters: Static, input_structure: Structure, dispatch_key: Key) -> Self {
+        Self { static_parameters, input_structure, dispatch_key }
+    }
+
+    /// Returns the static parameters of the keyed specialization.
+    #[inline]
+    fn static_parameters(&self) -> &Static {
+        &self.static_parameters
+    }
+
+    /// Returns the parameter structure of the dynamic input of the keyed specialization.
+    #[inline]
+    fn input_structure(&self) -> &Structure {
+        &self.input_structure
+    }
+}
+
 /// Retained JIT dispatcher that caches compiled specializations of one Rust closure.
 ///
 /// Unlike [`CompiledFunction`], which represents one executable that is already specialized, a
@@ -1023,7 +1008,7 @@ where
 /// %%{init: {"themeCSS": ".nodeLabel code { white-space: nowrap !important; }"}}%%
 /// flowchart TD
 ///   call["&lt;code&gt;CompiledFunctionDispatcher::call&lt;/code&gt; with Static Parameters and Dynamic Inputs"]
-///   call --> key["Derive Function Specialization Key"]
+///   call --> key["Derive Specialization Key"]
 ///   key --> frontend_cache["Per-Function Bounded Specialization Cache"]
 ///   frontend_cache -->|"hit"| executable["Shared &lt;code&gt;ExecutableFunction&lt;/code&gt;"]
 ///   frontend_cache -->|"miss"| closure["Invoke Rust Closure"]
@@ -1328,7 +1313,7 @@ where
         let runtime_input_types = self.staged_runtime_input_types(&input_structure, runtime_input_types)?;
         let (dispatch_key, effective_input_types) =
             domain.dispatch_signature(runtime_input_types, &self.state.options)?;
-        let key = FunctionSpecializationKey::new(static_parameters.clone(), input_structure, dispatch_key);
+        let key = SpecializationKey::new(static_parameters.clone(), input_structure, dispatch_key);
 
         // One clock read both ends dispatch key derivation and starts the dispatch lookup, which keeps the timing of
         // every cached call to three clock reads.
@@ -1470,7 +1455,7 @@ struct CompiledFunctionDispatcherState<
 
     /// Bounded LRU cache of compiled specializations.
     specializations: SpecializationCache<
-        FunctionSpecializationKey<Static, Input::ParameterStructure, C::DispatchKey>,
+        SpecializationKey<Static, Input::ParameterStructure, C::DispatchKey>,
         ExecutableFunction<C, Input, Output>,
     >,
 
@@ -2089,21 +2074,6 @@ pub(crate) mod tests {
     }
 
     #[test]
-    fn test_function_specialization_key() {
-        let key: FunctionSpecializationKey<(&str, usize), Vec<()>, &str> =
-            FunctionSpecializationKey::new(("training", 4), vec![(), ()], "f32[2,3]");
-        assert_eq!(key.static_parameters(), &("training", 4));
-        assert_eq!(key.input_structure(), &vec![(), ()]);
-        assert_eq!(key.dispatch_key(), &"f32[2,3]");
-
-        // Every component participates in equality.
-        assert_eq!(key, FunctionSpecializationKey::new(("training", 4), vec![(), ()], "f32[2,3]"));
-        assert_ne!(key, FunctionSpecializationKey::new(("inference", 4), vec![(), ()], "f32[2,3]"));
-        assert_ne!(key, FunctionSpecializationKey::new(("training", 4), vec![()], "f32[2,3]"));
-        assert_ne!(key, FunctionSpecializationKey::new(("training", 4), vec![(), ()], "f32[4,3]"));
-    }
-
-    #[test]
     fn test_staged_program_stage() {
         let input_type = ArrayType::scalar(DataType::F64);
         let capture = Array::scalar(7.0).unwrap();
@@ -2349,6 +2319,20 @@ pub(crate) mod tests {
             executable.inputs_with_captures(vec![Array::scalar(1.0).unwrap()]),
             vec![Array::scalar(7.0).unwrap(), Array::scalar(1.0).unwrap()],
         );
+    }
+
+    #[test]
+    fn test_specialization_key() {
+        let key: SpecializationKey<(&str, usize), Vec<()>, &str> =
+            SpecializationKey::new(("training", 4), vec![(), ()], "f32[2,3]");
+        assert_eq!(key.static_parameters(), &("training", 4));
+        assert_eq!(key.input_structure(), &vec![(), ()]);
+
+        // Every component participates in equality.
+        assert_eq!(key, SpecializationKey::new(("training", 4), vec![(), ()], "f32[2,3]"));
+        assert_ne!(key, SpecializationKey::new(("inference", 4), vec![(), ()], "f32[2,3]"));
+        assert_ne!(key, SpecializationKey::new(("training", 4), vec![()], "f32[2,3]"));
+        assert_ne!(key, SpecializationKey::new(("training", 4), vec![(), ()], "f32[4,3]"));
     }
 
     #[test]

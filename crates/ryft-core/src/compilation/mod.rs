@@ -175,6 +175,6 @@ pub use contexts::{
 pub use exchange::{CompilationArtifactExchange, CompilationArtifactExchangePolicy, CompilationExchangeError};
 pub use functions::{
     CompilationTracer, CompiledFunction, CompiledFunctionDispatcher, DispatcherStatistics, ExecutableFunction,
-    FunctionSpecializationKey, LoweredFunction, StagedFunction, StagedProgram, StatefulExecution,
+    LoweredFunction, StagedFunction, StagedProgram, StatefulExecution,
 };
 pub use operations::StagedCallOperation;
