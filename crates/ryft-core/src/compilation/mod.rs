@@ -26,10 +26,11 @@
 //! carries the resulting backend artifacts through the lifecycle. Every lifecycle handle below is therefore a function,
 //! and [`CompiledFunctionDispatcher`] is a retained dispatcher over a Rust closure that produces one program per
 //! specialization. In this module, every `*Program` name denotes a flat artifact without container structures.
-//! Besides [`StagedProgram`], which core produces by staging, these are [`FlatCompilationProgram`] (i.e., the source
-//! program of a staged program with its captures lifted into leading inputs, which backends lower and nested calls
-//! embed) and the backend-owned [`CompilationDomain::LoweredProgram`] and [`CompilationDomain::CompiledProgram`] that
-//! lowering and compilation produce. The lifecycle handles carry these artifacts from one phase to the next.
+//! Besides [`StagedProgram`], which core produces by staging, these are the backend-owned
+//! [`CompilationDomain::LoweredProgram`] and [`CompilationDomain::CompiledProgram`] that lowering and compilation
+//! produce. In between, [`StagedProgram::lifted_program`] provides the source program with its captures lifted into
+//! leading inputs as an ordinary [`FlatProgram`](crate::FlatProgram), which backends lower and nested calls embed. The
+//! lifecycle handles carry these artifacts from one phase to the next.
 //!
 //! # Entry Points
 //!
@@ -173,6 +174,5 @@ pub use contexts::{
 pub use exchange::{CompilationArtifactExchange, CompilationArtifactExchangePolicy, CompilationExchangeError};
 pub use functions::{
     CompilationTracer, CompiledCallOperation, CompiledFunction, CompiledFunctionDispatcher, ExecutableFunction,
-    FlatCompilationProgram, FunctionSpecializationKey, JitCacheStatistics, LoweredFunction, ReferenceExecution,
-    StagedFunction, StagedProgram,
+    FunctionSpecializationKey, JitCacheStatistics, LoweredFunction, ReferenceExecution, StagedFunction, StagedProgram,
 };

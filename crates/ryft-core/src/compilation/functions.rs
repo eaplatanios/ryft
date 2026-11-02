@@ -1,16 +1,3 @@
-//! Core-owned flat staging, typed compilation lifecycle handles, and retained JIT dispatch.
-//!
-//! [`StagedProgram::stage`] implements flat tracing. [`StagedFunction::stage`] preserves typed container structures.
-//! The lifecycle handles ([`StagedFunction`], [`LoweredFunction`], [`CompiledFunction`], and [`ExecutableFunction`])
-//! carry a program through staging, lowering, compilation, and execution together with its runtime captures and
-//! structured signatures. [`StagedFunction::lower`], [`LoweredFunction::compile`], and [`ExecutableFunction::call`]
-//! advance a handle through the flat functions of its [`CompilationDomain`]. [`CompiledFunctionDispatcher`] retains
-//! compiled specializations of one Rust closure. [`Compile`](crate::Compile) and the global [`stage`](crate::stage)
-//! and [`jit`](crate::jit) functions that construct these handles live in the `contexts` module next to the flat
-//! compilation hooks of [`CompilationDomain`].
-
-// TODO(eaplatanios): Review this module.
-
 use std::fmt::Debug;
 use std::hash::Hash;
 use std::marker::PhantomData;
@@ -28,15 +15,19 @@ use crate::operations::Constant;
 use crate::parameters::{ParameterError, Parameterized, ParameterizedFamily, Placeholder};
 use crate::programs::transforms::{Transform, TransformCache};
 use crate::programs::{
-    AttachedRegions, Operation, Program, ProgramError, ReferenceCompletion, Type, TypeError, TypeRefinements, Typed,
-    Value, validate_reference_boundary,
+    AttachedRegions, FlatProgram, Operation, ProgramError, ReferenceCompletion, Type, TypeError, TypeRefinements,
+    Typed, Value, validate_reference_boundary,
 };
 use crate::specialization::SpecializationCacheEntry;
 use crate::tracing::{DomainTracingContext, Tracer};
 
-/// Cache key identifying one specialization of a retained function. Cache reuse is authorized only when
-/// all three components below agree. Equal keys must identify calls that can safely share the same staged
-/// [`Program`]. Unequal keys remain separate even if they happen to stage structurally equivalent programs.
+/// Tracer used while staging a compiled function in the operation universe of `C`.
+pub type CompilationTracer<C> = Tracer<DomainTracingContext<C, <C as Domain>::Value>>;
+
+// TODO(eaplatanios): Review from here onwards.
+
+/// Cache key identifying one specialization of a retained function. Cache reuse is authorized only when all
+/// three of the following components agree:
 ///
 ///   - **Static Parameters:** The host values the traced function may branch on, read, or embed as literals. Unequal
 ///     static parameters can stage arbitrarily different programs, so they must separate specializations. Static
@@ -51,6 +42,9 @@ use crate::tracing::{DomainTracingContext, Tracer};
 ///     bucket. Equal dispatch keys must guarantee that the retained artifact can safely serve either call, while
 ///     unequal keys conservatively separate specializations. Retained Just-In-Time (JIT) compilation dispatch uses
 ///     [`CompilationDomain::DispatchKey`], for example.
+///
+/// Equal keys must identify calls that can safely share the same staged [`Program`](crate::Program). Unequal keys
+/// remain separate even if they happen to stage structurally equivalent programs.
 ///
 /// Everything else that affects staging (e.g., the closure itself, its captures, the domain, any fixed options, etc.)
 /// is implicit in the cache's owner, because a cache is scoped to exactly one retained callable. That is why this key
@@ -95,18 +89,6 @@ impl<P, I, K> FunctionSpecializationKey<P, I, K> {
     }
 }
 
-/// Flat source-program representation of a compiled call's callee, supplied through the operation's region driver and
-/// interned as a shared callee root region on the staged instruction.
-pub type FlatCompilationProgram<C> = Program<
-    <C as Domain>::Constant,
-    <C as Domain>::Operation,
-    Vec<<C as Domain>::Constant>,
-    Vec<<C as Domain>::Constant>,
->;
-
-/// Tracer used while staging a compiled function in the operation universe of `C`.
-pub type CompilationTracer<C> = Tracer<DomainTracingContext<C, <C as Domain>::Value>>;
-
 /// Owned flat staging artifact constructed by [`Self::stage`] and borrowed by [`CompilationDomain::lower`].
 ///
 /// This artifact retains the source program, runtime captures, flat public signature, and compilation options.
@@ -126,7 +108,7 @@ pub struct StagedProgram<C: CompilationDomain> {
     options: C::Options,
 
     /// Memoized source program with runtime captures lifted into leading flat inputs.
-    lifted_program: OnceLock<Arc<FlatCompilationProgram<C>>>,
+    lifted_program: OnceLock<Arc<FlatProgram<C>>>,
 }
 
 impl<C: CompilationDomain> StagedProgram<C> {
@@ -260,7 +242,7 @@ impl<C: CompilationDomain> StagedProgram<C> {
     /// # Errors
     ///
     /// Returns a [`ProgramError`] if rebuilding the source program with explicit capture inputs fails.
-    pub fn lifted_program(&self) -> Result<Arc<FlatCompilationProgram<C>>, ProgramError> {
+    pub fn lifted_program(&self) -> Result<Arc<FlatProgram<C>>, ProgramError> {
         if let Some(program) = self.lifted_program.get() {
             return Ok(program.clone());
         }
@@ -661,7 +643,7 @@ where
     /// a nested call. Reference discharge cannot publish a reference that a callee allocates itself, because the caller
     /// has no allocation that could receive it, so this function rejects such outputs here with a diagnostic that
     /// names the offending output. Outputs that forward a reference received as an input or capture remain allowed.
-    fn callee_program(&self) -> Result<Arc<FlatCompilationProgram<C>>, ProgramError> {
+    fn callee_program(&self) -> Result<Arc<FlatProgram<C>>, ProgramError> {
         let callee = self.lifted_program()?;
         if self.output_types().iter().any(Type::is_reference) {
             let capture_count = self.source_program().captures().len();
@@ -695,7 +677,7 @@ where
     /// # Errors
     ///
     /// Returns a [`ProgramError`] if rebuilding the source program with explicit capture inputs fails.
-    pub fn lifted_program(&self) -> Result<Arc<FlatCompilationProgram<C>>, ProgramError> {
+    pub fn lifted_program(&self) -> Result<Arc<FlatProgram<C>>, ProgramError> {
         self.state.program.lifted_program()
     }
 
@@ -1778,14 +1760,14 @@ pub(crate) mod tests {
 
     #[derive(Clone)]
     pub(crate) struct TestLoweredProgram {
-        program: FlatCompilationProgram<TestDomain>,
+        program: FlatProgram<TestDomain>,
         capture_count: usize,
         output_types: Vec<ArrayType>,
         options: TestOptions,
     }
 
     pub(crate) struct TestCompiledProgram {
-        program: FlatCompilationProgram<TestDomain>,
+        program: FlatProgram<TestDomain>,
         output_types: Vec<ArrayType>,
     }
 
@@ -1953,8 +1935,8 @@ pub(crate) mod tests {
 
     impl CompilationDomain for TestArrayIrDomain {
         type DispatchKey = Arc<[ArrayIrType]>;
-        type LoweredProgram = FlatCompilationProgram<Self>;
-        type CompiledProgram = FlatCompilationProgram<Self>;
+        type LoweredProgram = FlatProgram<Self>;
+        type CompiledProgram = FlatProgram<Self>;
         type Options = TestArrayIrOptions;
         type Error = ProgramError;
 
@@ -2046,8 +2028,8 @@ pub(crate) mod tests {
 
     impl CompilationDomain for CarriedDomain {
         type DispatchKey = Arc<[ArrayType]>;
-        type LoweredProgram = FlatCompilationProgram<Self>;
-        type CompiledProgram = FlatCompilationProgram<Self>;
+        type LoweredProgram = FlatProgram<Self>;
+        type CompiledProgram = FlatProgram<Self>;
         type Options = CarriedOptions;
         type Error = ProgramError;
 
