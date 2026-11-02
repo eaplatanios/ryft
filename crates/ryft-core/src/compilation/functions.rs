@@ -14,13 +14,15 @@ use crate::contexts::{Context, Domain, StagingContext};
 use crate::macros::{check_builders, check_count};
 use crate::operations::Constant;
 use crate::parameters::{ParameterError, Parameterized, ParameterizedFamily, Placeholder};
-use crate::programs::transforms::{Transform, TransformCache};
 use crate::programs::{
     AttachedRegions, FlatProgram, ProgramError, ReferenceCompletion, Type, TypeError, TypeRefinements, Typed, Value,
     validate_reference_boundary,
 };
-use crate::specialization::SpecializationCacheEntry;
+use crate::specialization::{SpecializationCache, SpecializationCacheEntry};
 use crate::tracing::{DomainTracingContext, Tracer};
+
+/// Default number of compiled specializations retained by one [`CompiledFunctionDispatcher`].
+pub(super) const DEFAULT_JIT_CACHE_CAPACITY: usize = 256;
 
 /// Tracer used while staging a compiled function in the operation universe of `C`.
 pub type CompilationTracer<C> = Tracer<DomainTracingContext<C, <C as Domain>::Value>>;
@@ -49,7 +51,7 @@ pub type CompilationTracer<C> = Tracer<DomainTracingContext<C, <C as Domain>::Va
 /// is implicit in the cache's owner, because a cache is scoped to exactly one retained callable. That is why this key
 /// carries no fragile function-pointer identity. All three components are call-level (i.e., function-level) concepts,
 /// since a bare program has neither static parameters nor a structured input. That is what separates function-level
-/// specialization caching from structural region transformation through [`Transform`].
+/// specialization caching from structural region transformation through [`Transform`](crate::Transform).
 #[derive(Clone, Debug, PartialEq, Eq, Hash)]
 pub struct FunctionSpecializationKey<P, I, K> {
     /// Host values declared static for the keyed specialization, such as an axis number, mode enum, or boolean option.
@@ -1103,10 +1105,7 @@ where
                 function,
                 options,
                 staged_input_types: None,
-                specializations: TransformCache::<
-                    JitCompilationTransform,
-                    JitCompilationSource<C, Static, Input, Output>,
-                >::new(capacity),
+                specializations: SpecializationCache::new(capacity),
                 statistics: JitCacheStatisticsAccumulator::default(),
             }),
         }
@@ -1473,7 +1472,10 @@ struct CompiledFunctionDispatcherState<
     staged_input_types: Option<StagedInputTypes<C::Type, Input::ParameterStructure>>,
 
     /// Bounded LRU cache of compiled specializations.
-    specializations: TransformCache<JitCompilationTransform, JitCompilationSource<C, Static, Input, Output>>,
+    specializations: SpecializationCache<
+        FunctionSpecializationKey<Static, Input::ParameterStructure, C::DispatchKey>,
+        ExecutableFunction<C, Input, Output>,
+    >,
 
     /// Dispatch activity counters.
     statistics: JitCacheStatisticsAccumulator,
@@ -1665,37 +1667,6 @@ impl JitCacheStatisticsAccumulator {
         self.tracing_nanoseconds.store(0, Ordering::Relaxed);
         self.lowering_nanoseconds.store(0, Ordering::Relaxed);
     }
-}
-
-/// Default number of compiled specializations retained by one [`CompiledFunctionDispatcher`].
-pub(crate) const DEFAULT_JIT_CACHE_CAPACITY: usize = 256;
-
-/// Type-level source universe for retained JIT specialization.
-///
-/// The owning [`CompiledFunctionDispatcherState`] fixes the closure identity, lexical captures, domain instance, and
-/// immutable compilation options. This token stores none of them and only makes the key and artifact families of the
-/// descriptor coherent at the type level. If any of those owner semantics becomes variable per call, it must enter the
-/// transform inputs instead.
-struct JitCompilationSource<C, StaticParameters, Input, Output>(
-    PhantomData<fn() -> (C, StaticParameters, Input, Output)>,
-);
-
-/// Transform descriptor for the executable specializations retained by one [`CompiledFunctionDispatcher`].
-struct JitCompilationTransform;
-
-impl<C, StaticParameters, Input, Output> Transform<JitCompilationSource<C, StaticParameters, Input, Output>>
-    for JitCompilationTransform
-where
-    C: CompilationDomain,
-    StaticParameters: Clone + Eq + Hash,
-    Input: Parameterized<C::Type>,
-    Input::ParameterStructure: Eq + Hash,
-    Output: Parameterized<C::Type>,
-{
-    type Arguments = FunctionSpecializationKey<StaticParameters, Input::ParameterStructure, C::DispatchKey>;
-    type Artifact = ExecutableFunction<C, Input, Output>;
-
-    const DEFAULT_CACHE_CAPACITY: usize = DEFAULT_JIT_CACHE_CAPACITY;
 }
 
 #[cfg(test)]
@@ -3098,21 +3069,5 @@ pub(crate) mod tests {
         );
         let expected = Err(ProgramError::InvalidArgument { message: "execution failed".to_string() });
         assert_eq!(execution.r#await(), expected);
-    }
-
-    #[test]
-    fn test_jit_compilation_transform() {
-        type Source = JitCompilationSource<TestDomain, usize, Vec<ArrayType>, Vec<ArrayType>>;
-        type Arguments = FunctionSpecializationKey<usize, Vec<Placeholder>, Arc<[ArrayType]>>;
-        type Artifact = ExecutableFunction<TestDomain, Vec<ArrayType>, Vec<ArrayType>>;
-
-        fn assert_contract<T, S>()
-        where
-            T: Transform<S, Arguments = Arguments, Artifact = Artifact>,
-        {
-        }
-
-        assert_contract::<JitCompilationTransform, Source>();
-        assert_eq!(<JitCompilationTransform as Transform<Source>>::DEFAULT_CACHE_CAPACITY, DEFAULT_JIT_CACHE_CAPACITY,);
     }
 }
