@@ -129,14 +129,14 @@
 //! [`CompilationContext`] is the backend-artifact cache shared by every compilation using the same domain handle, and
 //! it resolves the domain's [`CompilationCacheDomain::CacheKey`] through memory, same-key single-flight coordination,
 //! optional persistent storage, optional distributed exchange, and finally backend compilation. Backends own their
-//! contexts, so users configure these tiers when they construct a backend handle. Refer to [`CompilationContext`] for
-//! the rendered tier diagram and an example that configures every tier.
+//! contexts, so users configure caching and exchange when they construct a backend handle. Refer to
+//! [`CompilationContext`] for the rendered resolution diagram and a configuration example.
 //!
 //! Misses for the same key are single flight, while different keys may compile concurrently. [`DiskCache`] provides
 //! optional checksummed persistent storage, and [`CompilationArtifactExchange`] optionally shares serialized artifacts
 //! among processes according to [`CompilationArtifactExchangePolicy`]. [`DispatcherStatistics`] reports the frontend
 //! activity of retained dispatchers, while [`CompilationCacheStatistics`] and structured [`CompilationEvent`]s report
-//! the activity of the shared context across the memory, persistent, exchange, and backend compilation tiers.
+//! the activity of the shared context across cache lookups, artifact exchange, and backend compilation.
 //!
 //! # Extending Compilation
 //!
@@ -167,8 +167,8 @@ pub mod functions;
 pub mod operations;
 
 pub use caching::{
-    CompilationCacheOutcome, CompilationCacheStatistics, CompilationCacheTier, CompilationContext, CompilationEvent,
-    CompilationMissReason, DiskCache,
+    CompilationCacheStatistics, CompilationCacheTier, CompilationContext, CompilationEvent, CompilationEventKind,
+    CompilationEventReason, CompilationLookupOutcome, CompilationOperationOutcome, DiskCache,
 };
 pub use contexts::{
     AnalyzableCompilationDomain, CompilationCacheDomain, CompilationDomain, Compile, StatefulCompilationDomain, jit,

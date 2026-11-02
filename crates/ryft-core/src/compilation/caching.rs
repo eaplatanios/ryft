@@ -32,8 +32,8 @@ const DEFAULT_EVENT_CAPACITY: usize = 0;
 
 // TODO(eaplatanios): Review from here onwards.
 
-/// Cache tier that produced a [`CompilationEvent`]. Only [`CompilationContext`] emits events, so the variants cover
-/// exactly the tiers that it coordinates, with backend compilation as the final tier.
+/// Storage tier consulted by a [`CompilationEventKind::CacheLookup`]. Distributed artifact exchange and backend
+/// compilation are separate operations represented by their own [`CompilationEventKind`] variants.
 #[derive(Copy, Clone, Debug, PartialEq, Eq)]
 pub enum CompilationCacheTier {
     /// In-memory cache of compiled programs, local to the process.
@@ -41,46 +41,46 @@ pub enum CompilationCacheTier {
 
     /// Persistent cache of serialized programs.
     Persistent,
-
-    /// Distributed exchange of serialized programs.
-    Exchange,
-
-    /// Backend executable compilation.
-    Backend,
 }
 
-/// Outcome of one cache tier operation reported by a [`CompilationEvent`].
+/// Result of looking up a reusable program in a cache or receiving one through the artifact exchange.
 #[derive(Copy, Clone, Debug, PartialEq, Eq)]
-pub enum CompilationCacheOutcome {
+pub enum CompilationLookupOutcome {
     /// A reusable entry was found.
     Hit,
 
     /// No reusable entry was found.
-    Miss,
+    Miss(CompilationEventReason),
 
-    /// The caller waited for another producer.
-    Wait,
+    /// The lookup or deserialization failed.
+    Failed(CompilationEventReason),
+}
 
+/// Completion result of a compilation, storage, or exchange operation. Reuse results belong to
+/// [`CompilationLookupOutcome`] instead.
+#[derive(Copy, Clone, Debug, PartialEq, Eq)]
+pub enum CompilationOperationOutcome {
     /// The operation completed successfully.
     Succeeded,
 
     /// The operation failed.
-    Failed,
+    Failed(CompilationEventReason),
 
     /// The operation was unsupported or disabled.
-    Skipped,
+    Skipped(CompilationEventReason),
 }
 
-/// Stable explanation for a compilation cache miss or failure.
+/// Stable explanation for a compilation event's miss, failure, or skipped operation. Failure notifications carry the
+/// original cause separately from the outcome of delivering the notification.
 #[derive(Copy, Clone, Debug, PartialEq, Eq)]
-pub enum CompilationMissReason {
+pub enum CompilationEventReason {
     /// No entry existed for the requested key.
     NotFound,
 
-    /// The domain or configured service does not support the requested cache tier.
+    /// The domain or configured service does not support the requested operation.
     Unsupported,
 
-    /// A stored artifact was incompatible with the current domain or runtime.
+    /// Artifact or exchange compatibility requirements were not satisfied.
     Incompatible,
 
     /// The configured deadline elapsed.
@@ -89,36 +89,100 @@ pub enum CompilationMissReason {
     /// Reading or receiving an artifact failed.
     ReadFailed,
 
+    /// The artifact exchange failed to coordinate the processes that share an artifact.
+    ExchangeFailed,
+
     /// Backend deserialization failed.
     DeserializationFailed,
 
-    /// Serializing or writing an artifact failed.
+    /// Backend serialization failed before an artifact could be stored or published.
+    SerializationFailed,
+
+    /// Writing or publishing an artifact or failure notification failed.
     WriteFailed,
 
     /// The backend producer failed.
     ProducerFailed,
+
+    /// The compilation was faster, or its serialized program smaller, than the write thresholds of the persistent
+    /// cache require.
+    BelowWriteThreshold,
 }
 
-/// Structured diagnostic event for one cache tier operation of a [`CompilationContext`]. Contexts retain recent events
+/// Operation reported by a [`CompilationEvent`], together with the result appropriate to that operation. A cache hit
+/// describes artifact reuse, while successful compilation or publication describes completed work.
+#[derive(Copy, Clone, Debug, PartialEq, Eq)]
+pub enum CompilationEventKind {
+    /// Looked up a program in a local cache.
+    CacheLookup {
+        /// Storage tier that was consulted.
+        tier: CompilationCacheTier,
+
+        /// Whether the lookup found a reusable program.
+        outcome: CompilationLookupOutcome,
+    },
+
+    /// Waited for an in-flight producer, which shared its program. Waits whose producer fails retry without emitting
+    /// this event.
+    MemoryWait,
+
+    /// Checked compatibility before using a distributed artifact exchange.
+    ExchangePreflight {
+        /// Completion result of the compatibility check.
+        outcome: CompilationOperationOutcome,
+    },
+
+    /// Attempted to receive and restore an artifact published by the exchange leader.
+    ExchangeReceive {
+        /// Whether a compatible program was received and deserialized.
+        outcome: CompilationLookupOutcome,
+    },
+
+    /// Prepared or published a serialized artifact to followers. Preparation can fail or be unsupported during
+    /// serialization.
+    ExchangePublish {
+        /// Completion result of preparing or publishing the artifact.
+        outcome: CompilationOperationOutcome,
+    },
+
+    /// Notified followers that the leader cannot provide an artifact. Successful delivery does not imply that the
+    /// original compilation or serialization succeeded.
+    ExchangeFailureNotification {
+        /// Original reason that the leader cannot provide an artifact.
+        cause: CompilationEventReason,
+
+        /// Completion result of delivering the failure notification.
+        outcome: CompilationOperationOutcome,
+    },
+
+    /// Prepared or wrote a program to persistent storage. Preparation includes serialization. Exchange followers never
+    /// write to persistent storage, so they emit no such events.
+    PersistentStore {
+        /// Completion result of preparing or writing the artifact.
+        outcome: CompilationOperationOutcome,
+    },
+
+    /// Invoked the backend producer to compile a program after reuse attempts were exhausted.
+    BackendCompilation {
+        /// Completion result of the producer invocation.
+        outcome: CompilationOperationOutcome,
+    },
+}
+
+/// Structured diagnostic event for one operation of a [`CompilationContext`]. Contexts retain recent events
 /// when configured via [`CompilationContext::with_event_capacity`] and report every event to the hook installed via
 /// [`CompilationContext::with_event_reporter`].
 #[derive(Copy, Clone, Debug, PartialEq, Eq)]
 pub struct CompilationEvent {
-    /// Cache tier that emitted this event.
-    pub tier: CompilationCacheTier,
-
-    /// Result of the operation.
-    pub outcome: CompilationCacheOutcome,
+    /// Operation being reported and its result.
+    pub kind: CompilationEventKind,
 
     /// Host duration spent in this operation.
     pub duration: Duration,
-
-    /// Stable miss or failure explanation, when applicable.
-    pub miss_reason: Option<CompilationMissReason>,
 }
 
-/// Snapshot of the activity of one [`CompilationContext`] across its memory, persistent, exchange, and backend
-/// compilation tiers. The statistics accumulate from construction or from the latest
+/// Snapshot of the activity of one [`CompilationContext`] across its cache lookups, artifact exchange, and backend
+/// compilation. The statistics accumulate from construction or from the latest
 /// [`CompilationContext::clear_statistics`] call and are unaffected by [`CompilationContext::clear_cache`]. Each
 /// field is read independently, so a snapshot taken during concurrent compilations need not correspond to a single
 /// point in time.
@@ -140,8 +204,7 @@ pub struct CompilationCacheStatistics {
     /// Lookups restored from a validated persistent cache entry.
     pub persistent_hits: u64,
 
-    /// Persistent read, write, serialization, and deserialization failures, none of which fails a
-    /// compilation.
+    /// Persistent read, write, serialization, and deserialization failures, none of which fails a compilation.
     pub persistent_errors: u64,
 
     /// Lookups restored from a distributed artifact exchange.
@@ -162,7 +225,7 @@ pub struct CompilationCacheStatistics {
     /// Distributed misses or failures that fell back to local compilation.
     pub exchange_fallbacks: u64,
 
-    /// Backend producer closures invoked after every cache tier missed.
+    /// Backend producer closures invoked when no reusable program was available.
     pub compilations: u64,
 
     /// Total host duration spent in in-memory lookups and same key waits.
@@ -399,8 +462,8 @@ impl ActiveExchange<'_> {
 ///
 /// The cache is keyed by the structural [`CompilationCacheDomain::CacheKey`] of the domain. Equality of keys, rather
 /// than equality of their hashes, guarantees that distinct programs never collide. On a hit, the cached program is
-/// returned without invoking the producer closure. On a miss, the remaining tiers restore the program or the producer
-/// compiles it, and the result is inserted.
+/// returned without invoking the producer closure. On a miss, persistent storage or artifact exchange restores the
+/// program, or the producer compiles it, and the result is inserted.
 ///
 /// The in-memory tier uses LRU eviction with a default capacity of `8192` entries, which
 /// [`CompilationContext::with_capacity`] overrides.
@@ -410,7 +473,8 @@ impl ActiveExchange<'_> {
 /// tier and the producer closure. The cache uses [`CompilationCacheDomain::serialize_program`] and
 /// [`CompilationCacheDomain::deserialize_program`] to persist and restore programs, and it records failures of either
 /// function and of the disk itself without failing the compilation. An optional [`CompilationArtifactExchange`] may
-/// provide the next serialized tier according to the configured [`CompilationArtifactExchangePolicy`].
+/// provide a serialized program from the leader after local cache misses, according to the configured
+/// [`CompilationArtifactExchangePolicy`].
 ///
 /// # Cache Resolution
 ///
@@ -441,8 +505,8 @@ impl ActiveExchange<'_> {
 ///
 /// # Example
 ///
-/// Backends own their context (e.g., one per XLA session), so users configure these tiers when they construct a
-/// backend handle. The following function configures every tier of a context for any caching domain. It bounds the
+/// Backends own their context (e.g., one per XLA session), so users configure caching and artifact exchange when they
+/// construct a backend handle. The following function configures both for any caching domain. It bounds the
 /// in-memory tier, persists only compilations that take at least ten seconds in a disk cache capped at 10 GiB, and
 /// prefers artifacts that the exchange leader publishes while still allowing followers to compile locally after a
 /// miss. It also retains the most recent events for diagnostics.
@@ -508,7 +572,7 @@ pub struct CompilationContext<C: CompilationCacheDomain> {
 }
 
 impl<C: CompilationCacheDomain> CompilationContext<C> {
-    /// Creates a [`CompilationContext`] with the default cache capacity and no persistent or exchange tiers.
+    /// Creates a [`CompilationContext`] with the default cache capacity and no persistent cache or artifact exchange.
     #[inline]
     pub fn new() -> Self {
         Self::with_capacity(DEFAULT_CACHE_CAPACITY)
@@ -648,10 +712,10 @@ impl<C: CompilationCacheDomain> CompilationContext<C> {
         self.recent_events.lock().expect("compilation event mutex should not be poisoned").clear();
     }
 
-    /// Compiles `program` through the shared cache tiers. This function derives the exact structural key of `program`
+    /// Compiles `program` through the shared cache. This function derives the exact structural key of `program`
     /// through [`CompilationCacheDomain::compilation_key`] and resolves it through [`Self::get_or_compile`], with
-    /// `produce` as the backend producer that is invoked only when every cache tier misses. Backends that construct
-    /// cache keys differently can call [`Self::get_or_compile`] directly.
+    /// `produce` as the backend producer invoked when no cached or exchanged program is available. Backends that
+    /// construct cache keys differently can call [`Self::get_or_compile`] directly.
     ///
     /// # Errors
     ///
@@ -701,10 +765,11 @@ impl<C: CompilationCacheDomain> CompilationContext<C> {
             let lookup_start = Instant::now();
             if let Some(program) = self.cached_program(&cache_key) {
                 self.statistics.memory_hits.fetch_add(1, Ordering::Relaxed);
-                self.record_tier(
-                    CompilationCacheTier::Memory,
-                    CompilationCacheOutcome::Hit,
-                    None,
+                self.record_duration(
+                    CompilationEventKind::CacheLookup {
+                        tier: CompilationCacheTier::Memory,
+                        outcome: CompilationLookupOutcome::Hit,
+                    },
                     lookup_start.elapsed(),
                     &self.statistics.memory_lookup_nanoseconds,
                 );
@@ -727,15 +792,14 @@ impl<C: CompilationCacheDomain> CompilationContext<C> {
                 self.statistics.waits.fetch_add(1, Ordering::Relaxed);
                 let wait_start = Instant::now();
                 if let Some(program) = in_flight.wait() {
-                    self.record_tier(
-                        CompilationCacheTier::Memory,
-                        CompilationCacheOutcome::Wait,
-                        None,
+                    self.record_duration(
+                        CompilationEventKind::MemoryWait,
                         wait_start.elapsed(),
                         &self.statistics.memory_lookup_nanoseconds,
                     );
                     return Ok(program);
                 }
+                accumulate_duration(wait_start.elapsed(), &self.statistics.memory_lookup_nanoseconds);
                 continue;
             }
 
@@ -746,10 +810,11 @@ impl<C: CompilationCacheDomain> CompilationContext<C> {
                 self.in_flight.lock().expect("in-flight cache mutex should not be poisoned").remove(&cache_key);
                 in_flight.finish(InFlightState::Ready(Arc::clone(&program)));
                 self.statistics.memory_hits.fetch_add(1, Ordering::Relaxed);
-                self.record_tier(
-                    CompilationCacheTier::Memory,
-                    CompilationCacheOutcome::Hit,
-                    None,
+                self.record_duration(
+                    CompilationEventKind::CacheLookup {
+                        tier: CompilationCacheTier::Memory,
+                        outcome: CompilationLookupOutcome::Hit,
+                    },
                     lookup_start.elapsed(),
                     &self.statistics.memory_lookup_nanoseconds,
                 );
@@ -757,10 +822,11 @@ impl<C: CompilationCacheDomain> CompilationContext<C> {
             }
 
             self.statistics.misses.fetch_add(1, Ordering::Relaxed);
-            self.record_tier(
-                CompilationCacheTier::Memory,
-                CompilationCacheOutcome::Miss,
-                Some(CompilationMissReason::NotFound),
+            self.record_duration(
+                CompilationEventKind::CacheLookup {
+                    tier: CompilationCacheTier::Memory,
+                    outcome: CompilationLookupOutcome::Miss(CompilationEventReason::NotFound),
+                },
                 lookup_start.elapsed(),
                 &self.statistics.memory_lookup_nanoseconds,
             );
@@ -809,10 +875,10 @@ impl<C: CompilationCacheDomain> CompilationContext<C> {
             (None, _) => None,
             (Some(_), None) => {
                 self.record_event(CompilationEvent {
-                    tier: CompilationCacheTier::Exchange,
-                    outcome: CompilationCacheOutcome::Skipped,
+                    kind: CompilationEventKind::ExchangePreflight {
+                        outcome: CompilationOperationOutcome::Skipped(CompilationEventReason::Unsupported),
+                    },
                     duration: Duration::ZERO,
-                    miss_reason: Some(CompilationMissReason::Unsupported),
                 });
                 self.require_exchange_or_record_fallback("domain does not provide a persistent compilation key")?;
                 None
@@ -852,21 +918,27 @@ impl<C: CompilationCacheDomain> CompilationContext<C> {
     fn preflight_exchange(&self, exchange: ActiveExchange<'_>) -> Result<bool, C::Error> {
         let preflight_start = Instant::now();
         let Err(error) = exchange.exchange.preflight(exchange.key, exchange.timeout) else {
+            self.record_duration(
+                CompilationEventKind::ExchangePreflight { outcome: CompilationOperationOutcome::Succeeded },
+                preflight_start.elapsed(),
+                &self.statistics.exchange_nanoseconds,
+            );
             return Ok(true);
         };
-        let (counter, miss_reason) = match &error {
-            CompilationExchangeError::TimedOut => (&self.statistics.exchange_timeouts, CompilationMissReason::TimedOut),
+        let (counter, reason) = match &error {
+            CompilationExchangeError::TimedOut => {
+                (&self.statistics.exchange_timeouts, CompilationEventReason::TimedOut)
+            }
             CompilationExchangeError::Incompatible { .. } => {
-                (&self.statistics.exchange_errors, CompilationMissReason::Incompatible)
+                (&self.statistics.exchange_errors, CompilationEventReason::Incompatible)
             }
             CompilationExchangeError::Failed { .. } => {
-                (&self.statistics.exchange_errors, CompilationMissReason::ReadFailed)
+                (&self.statistics.exchange_errors, CompilationEventReason::ExchangeFailed)
             }
         };
-        self.record_exchange_miss(
+        self.record_exchange_fallback(
             counter,
-            CompilationCacheOutcome::Failed,
-            miss_reason,
+            CompilationEventKind::ExchangePreflight { outcome: CompilationOperationOutcome::Failed(reason) },
             preflight_start,
             error.to_string().as_str(),
         )?;
@@ -883,31 +955,26 @@ impl<C: CompilationCacheDomain> CompilationContext<C> {
         digest: &CacheDigest,
     ) -> Option<(C::CompiledProgram, Vec<u8>)> {
         let lookup_start = Instant::now();
-        let (outcome, miss_reason, restored) = match disk_cache.get(digest) {
+        let (outcome, restored) = match disk_cache.get(digest) {
             Ok(Some(bytes)) => match domain.deserialize_program(bytes.as_slice()) {
-                Ok(Some(program)) => (CompilationCacheOutcome::Hit, None, Some((program, bytes))),
-                Ok(None) => (CompilationCacheOutcome::Miss, Some(CompilationMissReason::Incompatible), None),
-                Err(_) => (CompilationCacheOutcome::Failed, Some(CompilationMissReason::DeserializationFailed), None),
+                Ok(Some(program)) => (CompilationLookupOutcome::Hit, Some((program, bytes))),
+                Ok(None) => (CompilationLookupOutcome::Miss(CompilationEventReason::Incompatible), None),
+                Err(_) => (CompilationLookupOutcome::Failed(CompilationEventReason::DeserializationFailed), None),
             },
-            Ok(None) => (CompilationCacheOutcome::Miss, Some(CompilationMissReason::NotFound), None),
-            Err(_) => (CompilationCacheOutcome::Failed, Some(CompilationMissReason::ReadFailed), None),
+            Ok(None) => (CompilationLookupOutcome::Miss(CompilationEventReason::NotFound), None),
+            Err(_) => (CompilationLookupOutcome::Failed(CompilationEventReason::ReadFailed), None),
         };
         match outcome {
-            CompilationCacheOutcome::Hit => {
+            CompilationLookupOutcome::Hit => {
                 self.statistics.persistent_hits.fetch_add(1, Ordering::Relaxed);
             }
-            CompilationCacheOutcome::Failed => {
+            CompilationLookupOutcome::Failed(_) => {
                 self.statistics.persistent_errors.fetch_add(1, Ordering::Relaxed);
             }
-            CompilationCacheOutcome::Miss
-            | CompilationCacheOutcome::Wait
-            | CompilationCacheOutcome::Succeeded
-            | CompilationCacheOutcome::Skipped => {}
+            CompilationLookupOutcome::Miss(_) => {}
         }
-        self.record_tier(
-            CompilationCacheTier::Persistent,
-            outcome,
-            miss_reason,
+        self.record_duration(
+            CompilationEventKind::CacheLookup { tier: CompilationCacheTier::Persistent, outcome },
             lookup_start.elapsed(),
             &self.statistics.persistent_lookup_nanoseconds,
         );
@@ -928,30 +995,33 @@ impl<C: CompilationCacheDomain> CompilationContext<C> {
         let bytes = match exchange.exchange.receive(exchange.key, exchange.timeout) {
             Ok(Some(bytes)) => bytes,
             Ok(None) | Err(CompilationExchangeError::TimedOut) => {
-                self.record_exchange_miss(
+                self.record_exchange_fallback(
                     &self.statistics.exchange_timeouts,
-                    CompilationCacheOutcome::Miss,
-                    CompilationMissReason::TimedOut,
+                    CompilationEventKind::ExchangeReceive {
+                        outcome: CompilationLookupOutcome::Miss(CompilationEventReason::TimedOut),
+                    },
                     exchange_start,
                     "timed out waiting for a compilation artifact",
                 )?;
                 return Ok(None);
             }
             Err(CompilationExchangeError::Incompatible { message }) => {
-                self.record_exchange_miss(
+                self.record_exchange_fallback(
                     &self.statistics.exchange_errors,
-                    CompilationCacheOutcome::Failed,
-                    CompilationMissReason::Incompatible,
+                    CompilationEventKind::ExchangeReceive {
+                        outcome: CompilationLookupOutcome::Failed(CompilationEventReason::Incompatible),
+                    },
                     exchange_start,
                     message.as_str(),
                 )?;
                 return Ok(None);
             }
             Err(CompilationExchangeError::Failed { message }) => {
-                self.record_exchange_miss(
+                self.record_exchange_fallback(
                     &self.statistics.exchange_errors,
-                    CompilationCacheOutcome::Failed,
-                    CompilationMissReason::ReadFailed,
+                    CompilationEventKind::ExchangeReceive {
+                        outcome: CompilationLookupOutcome::Failed(CompilationEventReason::ReadFailed),
+                    },
                     exchange_start,
                     message.as_str(),
                 )?;
@@ -961,33 +1031,32 @@ impl<C: CompilationCacheDomain> CompilationContext<C> {
         match domain.deserialize_program(bytes.as_slice()) {
             Ok(Some(program)) => {
                 self.statistics.exchange_hits.fetch_add(1, Ordering::Relaxed);
-                self.record_tier(
-                    CompilationCacheTier::Exchange,
-                    CompilationCacheOutcome::Hit,
-                    None,
+                self.record_duration(
+                    CompilationEventKind::ExchangeReceive { outcome: CompilationLookupOutcome::Hit },
                     exchange_start.elapsed(),
                     &self.statistics.exchange_nanoseconds,
                 );
                 Ok(Some(program))
             }
             Ok(None) => {
-                self.record_exchange_miss(
-                    &self.statistics.exchange_errors,
-                    CompilationCacheOutcome::Miss,
-                    CompilationMissReason::Incompatible,
-                    exchange_start,
-                    "received compilation artifact is incompatible",
-                )?;
+                self.record_duration(
+                    CompilationEventKind::ExchangeReceive {
+                        outcome: CompilationLookupOutcome::Miss(CompilationEventReason::Incompatible),
+                    },
+                    exchange_start.elapsed(),
+                    &self.statistics.exchange_nanoseconds,
+                );
+                self.require_exchange_or_record_fallback("received compilation artifact is incompatible")?;
                 Ok(None)
             }
             Err(error) => {
                 // The domain error is more informative than a generic exchange requirement error, so it is returned
                 // directly when the policy does not permit a fallback.
                 self.statistics.exchange_errors.fetch_add(1, Ordering::Relaxed);
-                self.record_tier(
-                    CompilationCacheTier::Exchange,
-                    CompilationCacheOutcome::Failed,
-                    Some(CompilationMissReason::DeserializationFailed),
+                self.record_duration(
+                    CompilationEventKind::ExchangeReceive {
+                        outcome: CompilationLookupOutcome::Failed(CompilationEventReason::DeserializationFailed),
+                    },
                     exchange_start.elapsed(),
                     &self.statistics.exchange_nanoseconds,
                 );
@@ -1010,20 +1079,18 @@ impl<C: CompilationCacheDomain> CompilationContext<C> {
             Ok(()) => {
                 self.statistics.exchange_publishes.fetch_add(1, Ordering::Relaxed);
                 self.record_event(CompilationEvent {
-                    tier: CompilationCacheTier::Exchange,
-                    outcome: CompilationCacheOutcome::Succeeded,
+                    kind: CompilationEventKind::ExchangePublish { outcome: CompilationOperationOutcome::Succeeded },
                     duration: publish_start.elapsed(),
-                    miss_reason: None,
                 });
                 Ok(())
             }
             Err(error) => {
                 self.statistics.exchange_errors.fetch_add(1, Ordering::Relaxed);
                 self.record_event(CompilationEvent {
-                    tier: CompilationCacheTier::Exchange,
-                    outcome: CompilationCacheOutcome::Failed,
+                    kind: CompilationEventKind::ExchangePublish {
+                        outcome: CompilationOperationOutcome::Failed(CompilationEventReason::WriteFailed),
+                    },
                     duration: publish_start.elapsed(),
-                    miss_reason: Some(CompilationMissReason::WriteFailed),
                 });
                 self.require_exchange_or_record_fallback(error.to_string().as_str())
             }
@@ -1034,24 +1101,22 @@ impl<C: CompilationCacheDomain> CompilationContext<C> {
     /// stop waiting for it instead of running into their deadline. `reason` classifies the failure in the recorded
     /// event, and `message` describes it to the followers. Failures to publish the failure itself are recorded but
     /// never replace the original failure.
-    fn publish_failure_to_exchange(&self, exchange: ActiveExchange<'_>, reason: CompilationMissReason, message: &str) {
+    fn publish_failure_to_exchange(&self, exchange: ActiveExchange<'_>, reason: CompilationEventReason, message: &str) {
         let publish_start = Instant::now();
         let outcome = match exchange.exchange.publish_failure(exchange.key, message) {
-            Ok(()) => CompilationCacheOutcome::Succeeded,
+            Ok(()) => CompilationOperationOutcome::Succeeded,
             Err(_) => {
                 self.statistics.exchange_errors.fetch_add(1, Ordering::Relaxed);
-                CompilationCacheOutcome::Failed
+                CompilationOperationOutcome::Failed(CompilationEventReason::WriteFailed)
             }
         };
         self.record_event(CompilationEvent {
-            tier: CompilationCacheTier::Exchange,
-            outcome,
+            kind: CompilationEventKind::ExchangeFailureNotification { cause: reason, outcome },
             duration: publish_start.elapsed(),
-            miss_reason: Some(reason),
         });
     }
 
-    /// Invokes the backend producer and publishes its program to every configured tier.
+    /// Invokes the backend producer and publishes its program to configured caches and the artifact exchange.
     ///
     /// The persistent tier is written only by the exchange leader (or by every process when no exchange is active),
     /// and only when the compilation meets the write thresholds of the [`DiskCache`]. The exchange leader publishes
@@ -1073,17 +1138,17 @@ impl<C: CompilationCacheDomain> CompilationContext<C> {
         let program = match produce() {
             Ok(program) => program,
             Err(error) => {
-                self.record_tier(
-                    CompilationCacheTier::Backend,
-                    CompilationCacheOutcome::Failed,
-                    Some(CompilationMissReason::ProducerFailed),
+                self.record_duration(
+                    CompilationEventKind::BackendCompilation {
+                        outcome: CompilationOperationOutcome::Failed(CompilationEventReason::ProducerFailed),
+                    },
                     compilation_start.elapsed(),
                     &self.statistics.compilation_nanoseconds,
                 );
                 if let Some(exchange) = leader_exchange {
                     self.publish_failure_to_exchange(
                         exchange,
-                        CompilationMissReason::ProducerFailed,
+                        CompilationEventReason::ProducerFailed,
                         error.to_string().as_str(),
                     );
                 }
@@ -1091,18 +1156,25 @@ impl<C: CompilationCacheDomain> CompilationContext<C> {
             }
         };
         let compilation_duration = compilation_start.elapsed();
-        self.record_tier(
-            CompilationCacheTier::Backend,
-            CompilationCacheOutcome::Succeeded,
-            None,
+        self.record_duration(
+            CompilationEventKind::BackendCompilation { outcome: CompilationOperationOutcome::Succeeded },
             compilation_duration,
             &self.statistics.compilation_nanoseconds,
         );
 
         // Serialization is skipped entirely when neither the persistent tier nor the exchange would consume its bytes.
-        let persistent = persistent.filter(|(disk_cache, _)| {
-            exchange.is_none_or(ActiveExchange::is_leader) && disk_cache.should_serialize(compilation_duration)
-        });
+        let persistent = match persistent.filter(|_| exchange.is_none_or(ActiveExchange::is_leader)) {
+            Some((disk_cache, _)) if !disk_cache.should_serialize(compilation_duration) => {
+                self.record_event(CompilationEvent {
+                    kind: CompilationEventKind::PersistentStore {
+                        outcome: CompilationOperationOutcome::Skipped(CompilationEventReason::BelowWriteThreshold),
+                    },
+                    duration: Duration::ZERO,
+                });
+                None
+            }
+            persistent => persistent,
+        };
         if persistent.is_none() && leader_exchange.is_none() {
             return Ok(producer.finish(program));
         }
@@ -1110,16 +1182,18 @@ impl<C: CompilationCacheDomain> CompilationContext<C> {
         let serialization_start = Instant::now();
         match domain.serialize_program(&program) {
             Ok(Some(bytes)) => {
-                if let Some((disk_cache, digest)) = &persistent
-                    && disk_cache.should_persist(compilation_duration, bytes.len())
-                    && disk_cache.put(digest, bytes.as_slice()).is_err()
-                {
-                    self.statistics.persistent_errors.fetch_add(1, Ordering::Relaxed);
+                if let Some((disk_cache, digest)) = &persistent {
+                    let outcome = if !disk_cache.should_persist(compilation_duration, bytes.len()) {
+                        CompilationOperationOutcome::Skipped(CompilationEventReason::BelowWriteThreshold)
+                    } else if disk_cache.put(digest, bytes.as_slice()).is_ok() {
+                        CompilationOperationOutcome::Succeeded
+                    } else {
+                        self.statistics.persistent_errors.fetch_add(1, Ordering::Relaxed);
+                        CompilationOperationOutcome::Failed(CompilationEventReason::WriteFailed)
+                    };
                     self.record_event(CompilationEvent {
-                        tier: CompilationCacheTier::Persistent,
-                        outcome: CompilationCacheOutcome::Failed,
+                        kind: CompilationEventKind::PersistentStore { outcome },
                         duration: serialization_start.elapsed(),
-                        miss_reason: Some(CompilationMissReason::WriteFailed),
                     });
                 }
                 if let Some(exchange) = leader_exchange {
@@ -1130,21 +1204,21 @@ impl<C: CompilationCacheDomain> CompilationContext<C> {
                 let duration = serialization_start.elapsed();
                 if persistent.is_some() {
                     self.record_event(CompilationEvent {
-                        tier: CompilationCacheTier::Persistent,
-                        outcome: CompilationCacheOutcome::Skipped,
+                        kind: CompilationEventKind::PersistentStore {
+                            outcome: CompilationOperationOutcome::Skipped(CompilationEventReason::Unsupported),
+                        },
                         duration,
-                        miss_reason: Some(CompilationMissReason::Unsupported),
                     });
                 }
                 if let Some(exchange) = leader_exchange {
                     let message = "domain does not support compiled program serialization";
                     self.record_event(CompilationEvent {
-                        tier: CompilationCacheTier::Exchange,
-                        outcome: CompilationCacheOutcome::Skipped,
+                        kind: CompilationEventKind::ExchangePublish {
+                            outcome: CompilationOperationOutcome::Skipped(CompilationEventReason::Unsupported),
+                        },
                         duration,
-                        miss_reason: Some(CompilationMissReason::Unsupported),
                     });
-                    self.publish_failure_to_exchange(exchange, CompilationMissReason::Unsupported, message);
+                    self.publish_failure_to_exchange(exchange, CompilationEventReason::Unsupported, message);
                     self.require_exchange_or_record_fallback(message)?;
                 }
             }
@@ -1153,23 +1227,23 @@ impl<C: CompilationCacheDomain> CompilationContext<C> {
                 if persistent.is_some() {
                     self.statistics.persistent_errors.fetch_add(1, Ordering::Relaxed);
                     self.record_event(CompilationEvent {
-                        tier: CompilationCacheTier::Persistent,
-                        outcome: CompilationCacheOutcome::Failed,
+                        kind: CompilationEventKind::PersistentStore {
+                            outcome: CompilationOperationOutcome::Failed(CompilationEventReason::SerializationFailed),
+                        },
                         duration,
-                        miss_reason: Some(CompilationMissReason::WriteFailed),
                     });
                 }
                 if let Some(exchange) = leader_exchange {
                     self.statistics.exchange_errors.fetch_add(1, Ordering::Relaxed);
                     self.record_event(CompilationEvent {
-                        tier: CompilationCacheTier::Exchange,
-                        outcome: CompilationCacheOutcome::Failed,
+                        kind: CompilationEventKind::ExchangePublish {
+                            outcome: CompilationOperationOutcome::Failed(CompilationEventReason::SerializationFailed),
+                        },
                         duration,
-                        miss_reason: Some(CompilationMissReason::WriteFailed),
                     });
                     self.publish_failure_to_exchange(
                         exchange,
-                        CompilationMissReason::WriteFailed,
+                        CompilationEventReason::SerializationFailed,
                         error.to_string().as_str(),
                     );
                     if !self.artifact_exchange_policy.permits_local_fallback() {
@@ -1188,26 +1262,18 @@ impl<C: CompilationCacheDomain> CompilationContext<C> {
     /// # Parameters
     ///
     ///   - `counter`: Statistics counter that classifies the miss (e.g., timeouts or errors).
-    ///   - `outcome`: Outcome of the exchange operation.
-    ///   - `miss_reason`: Stable explanation of the miss.
+    ///   - `kind`: Exchange operation and its lookup or completion result.
     ///   - `start`: Instant at which the exchange operation started.
     ///   - `message`: Description of the miss used in the error returned when the policy requires sharing.
-    fn record_exchange_miss(
+    fn record_exchange_fallback(
         &self,
         counter: &AtomicU64,
-        outcome: CompilationCacheOutcome,
-        miss_reason: CompilationMissReason,
+        kind: CompilationEventKind,
         start: Instant,
         message: &str,
     ) -> Result<(), C::Error> {
         counter.fetch_add(1, Ordering::Relaxed);
-        self.record_tier(
-            CompilationCacheTier::Exchange,
-            outcome,
-            Some(miss_reason),
-            start.elapsed(),
-            &self.statistics.exchange_nanoseconds,
-        );
+        self.record_duration(kind, start.elapsed(), &self.statistics.exchange_nanoseconds);
         self.require_exchange_or_record_fallback(message)
     }
 
@@ -1226,16 +1292,9 @@ impl<C: CompilationCacheDomain> CompilationContext<C> {
     }
 
     /// Accumulates `duration` into `duration_counter` and records one structured event for the operation.
-    fn record_tier(
-        &self,
-        tier: CompilationCacheTier,
-        outcome: CompilationCacheOutcome,
-        miss_reason: Option<CompilationMissReason>,
-        duration: Duration,
-        duration_counter: &AtomicU64,
-    ) {
+    fn record_duration(&self, kind: CompilationEventKind, duration: Duration, duration_counter: &AtomicU64) {
         accumulate_duration(duration, duration_counter);
-        self.record_event(CompilationEvent { tier, outcome, duration, miss_reason });
+        self.record_event(CompilationEvent { kind, duration });
     }
 
     /// Retains `event` when event retention is enabled and then reports it to the installed reporter, if any. The
@@ -1811,11 +1870,13 @@ mod tests {
     struct TestDomain {
         persistent: bool,
         serialization_fails: bool,
+        serialization_unsupported: bool,
+        deserialization_incompatible: bool,
     }
 
     impl TestDomain {
         fn persistent() -> Self {
-            Self { persistent: true, serialization_fails: false }
+            Self { persistent: true, ..Self::default() }
         }
     }
 
@@ -1873,11 +1934,14 @@ mod tests {
             if self.serialization_fails {
                 return Err(ProgramError::MalformedProgram("expected serialization failure".to_string()));
             }
+            if self.serialization_unsupported {
+                return Ok(None);
+            }
             Ok(self.persistent.then(|| program.0.to_le_bytes().to_vec()))
         }
 
         fn deserialize_program(&self, bytes: &[u8]) -> Result<Option<Self::CompiledProgram>, Self::Error> {
-            if !self.persistent {
+            if !self.persistent || self.deserialization_incompatible {
                 return Ok(None);
             }
             let bytes: [u8; size_of::<usize>()] = bytes.try_into().map_err(|_| {
@@ -1893,7 +1957,9 @@ mod tests {
         ready: Condvar,
         preflight_fails: AtomicBool,
         receive_fails: AtomicBool,
+        receive_incompatible: AtomicBool,
         publish_fails: AtomicBool,
+        failure_publish_fails: AtomicBool,
     }
 
     struct TestExchange {
@@ -1936,6 +2002,11 @@ mod tests {
         }
 
         fn publish_failure(&self, key: &[u8], message: &str) -> Result<(), CompilationExchangeError> {
+            if self.state.failure_publish_fails.load(Ordering::Relaxed) {
+                return Err(CompilationExchangeError::Failed {
+                    message: "expected failure notification publication failure".to_string(),
+                });
+            }
             self.state.artifacts.lock().unwrap().insert(key.to_vec(), Err(message.to_string()));
             self.state.ready.notify_all();
             Ok(())
@@ -1944,6 +2015,11 @@ mod tests {
         fn receive(&self, key: &[u8], timeout: Duration) -> Result<Option<Vec<u8>>, CompilationExchangeError> {
             if self.state.receive_fails.load(Ordering::Relaxed) {
                 return Err(CompilationExchangeError::Failed { message: "expected receive failure".to_string() });
+            }
+            if self.state.receive_incompatible.load(Ordering::Relaxed) {
+                return Err(CompilationExchangeError::Incompatible {
+                    message: "expected receive incompatibility".to_string(),
+                });
             }
             let artifacts = self.state.artifacts.lock().unwrap();
             let (artifacts, _) = self
@@ -1957,6 +2033,11 @@ mod tests {
                 Some(Err(message)) => Err(CompilationExchangeError::Failed { message }),
             }
         }
+    }
+
+    /// Returns the operation kinds retained by `context`, preserving their reported order.
+    fn event_kinds(context: &CompilationContext<TestDomain>) -> Vec<CompilationEventKind> {
+        context.recent_events().into_iter().map(|event| event.kind).collect()
     }
 
     /// Returns the uncompressed envelope that stores `payload` under `digest`.
@@ -1995,12 +2076,13 @@ mod tests {
         let directory = tempfile::tempdir().unwrap();
         let domain = TestDomain::persistent();
         let disk_cache = DiskCache::open(directory.path()).unwrap().with_write_thresholds(Duration::ZERO, 0);
-        let first_context = CompilationContext::<TestDomain>::new().with_disk_cache(disk_cache);
+        let first_context = CompilationContext::<TestDomain>::new().with_event_capacity(16).with_disk_cache(disk_cache);
         first_context.get_or_compile(&domain, 3, || Ok(TestCompiledProgram(17))).unwrap();
         assert_eq!(first_context.disk_cache().unwrap().directory(), directory.path());
 
         let disk_cache = DiskCache::open(directory.path()).unwrap().with_write_thresholds(Duration::ZERO, 0);
-        let second_context = CompilationContext::<TestDomain>::new().with_disk_cache(disk_cache);
+        let second_context =
+            CompilationContext::<TestDomain>::new().with_event_capacity(16).with_disk_cache(disk_cache);
         let restored = second_context
             .get_or_compile(&domain, 3, || -> Result<TestCompiledProgram, ProgramError> {
                 panic!("persistent hit must not invoke producer")
@@ -2010,6 +2092,106 @@ mod tests {
         assert_eq!(restored.0, 17);
         assert_eq!(second_context.statistics().persistent_hits, 1);
         assert_eq!(second_context.statistics().compilations, 0);
+
+        assert_eq!(
+            event_kinds(&first_context),
+            vec![
+                CompilationEventKind::CacheLookup {
+                    tier: CompilationCacheTier::Memory,
+                    outcome: CompilationLookupOutcome::Miss(CompilationEventReason::NotFound),
+                },
+                CompilationEventKind::CacheLookup {
+                    tier: CompilationCacheTier::Persistent,
+                    outcome: CompilationLookupOutcome::Miss(CompilationEventReason::NotFound),
+                },
+                CompilationEventKind::BackendCompilation { outcome: CompilationOperationOutcome::Succeeded },
+            ],
+        );
+        assert_eq!(
+            event_kinds(&second_context),
+            vec![
+                CompilationEventKind::CacheLookup {
+                    tier: CompilationCacheTier::Memory,
+                    outcome: CompilationLookupOutcome::Miss(CompilationEventReason::NotFound),
+                },
+                CompilationEventKind::CacheLookup {
+                    tier: CompilationCacheTier::Persistent,
+                    outcome: CompilationLookupOutcome::Hit,
+                },
+            ],
+        );
+        assert_eq!(second_context.statistics().persistent_lookup_duration, second_context.recent_events()[1].duration);
+    }
+
+    #[test]
+    fn test_compilation_context_with_disk_cache_lookup_failures() {
+        let directory = tempfile::tempdir().unwrap();
+        let cache = DiskCache::open(directory.path()).unwrap().with_write_thresholds(Duration::MAX, 0);
+        cache.put(&CacheDigest::from_key(&[1]), b"invalid payload").unwrap();
+        let context = CompilationContext::<TestDomain>::new().with_disk_cache(cache).with_event_capacity(8);
+        let program = context.get_or_compile(&TestDomain::persistent(), 1, || Ok(TestCompiledProgram(17))).unwrap();
+        assert_eq!(program.0, 17);
+        assert_eq!(
+            event_kinds(&context),
+            vec![
+                CompilationEventKind::CacheLookup {
+                    tier: CompilationCacheTier::Memory,
+                    outcome: CompilationLookupOutcome::Miss(CompilationEventReason::NotFound),
+                },
+                CompilationEventKind::CacheLookup {
+                    tier: CompilationCacheTier::Persistent,
+                    outcome: CompilationLookupOutcome::Failed(CompilationEventReason::DeserializationFailed),
+                },
+                CompilationEventKind::BackendCompilation { outcome: CompilationOperationOutcome::Succeeded },
+            ],
+        );
+        assert_eq!(context.statistics().persistent_errors, 1);
+
+        // An incompatible artifact is a completed lookup miss, rather than a failed lookup.
+        let directory = tempfile::tempdir().unwrap();
+        let cache = DiskCache::open(directory.path()).unwrap().with_write_thresholds(Duration::MAX, 0);
+        cache.put(&CacheDigest::from_key(&[2]), &19usize.to_le_bytes()).unwrap();
+        let context = CompilationContext::<TestDomain>::new().with_disk_cache(cache).with_event_capacity(8);
+        let domain = TestDomain { persistent: true, deserialization_incompatible: true, ..TestDomain::default() };
+        assert_eq!(context.get_or_compile(&domain, 2, || Ok(TestCompiledProgram(23))).unwrap().0, 23);
+        assert_eq!(
+            event_kinds(&context),
+            vec![
+                CompilationEventKind::CacheLookup {
+                    tier: CompilationCacheTier::Memory,
+                    outcome: CompilationLookupOutcome::Miss(CompilationEventReason::NotFound),
+                },
+                CompilationEventKind::CacheLookup {
+                    tier: CompilationCacheTier::Persistent,
+                    outcome: CompilationLookupOutcome::Miss(CompilationEventReason::Incompatible),
+                },
+                CompilationEventKind::BackendCompilation { outcome: CompilationOperationOutcome::Succeeded },
+            ],
+        );
+        assert_eq!(context.statistics().persistent_errors, 0);
+
+        // A directory at the artifact path deterministically makes the read fail without filesystem permissions.
+        let directory = tempfile::tempdir().unwrap();
+        let cache = DiskCache::open(directory.path()).unwrap().with_write_thresholds(Duration::MAX, 0);
+        fs::create_dir(cache.entry_path(&CacheDigest::from_key(&[3]))).unwrap();
+        let context = CompilationContext::<TestDomain>::new().with_disk_cache(cache).with_event_capacity(8);
+        let program = context.get_or_compile(&TestDomain::persistent(), 3, || Ok(TestCompiledProgram(29))).unwrap();
+        assert_eq!(program.0, 29);
+        assert_eq!(
+            event_kinds(&context),
+            vec![
+                CompilationEventKind::CacheLookup {
+                    tier: CompilationCacheTier::Memory,
+                    outcome: CompilationLookupOutcome::Miss(CompilationEventReason::NotFound),
+                },
+                CompilationEventKind::CacheLookup {
+                    tier: CompilationCacheTier::Persistent,
+                    outcome: CompilationLookupOutcome::Failed(CompilationEventReason::ReadFailed),
+                },
+                CompilationEventKind::BackendCompilation { outcome: CompilationOperationOutcome::Succeeded },
+            ],
+        );
+        assert_eq!(context.statistics().persistent_errors, 1);
     }
 
     #[test]
@@ -2039,17 +2221,56 @@ mod tests {
         let directory = tempfile::tempdir().unwrap();
         let disk_cache = DiskCache::open(directory.path()).unwrap().with_write_thresholds(Duration::ZERO, 0);
         let context = CompilationContext::<TestDomain>::new().with_disk_cache(disk_cache).with_event_capacity(8);
-        let domain = TestDomain { persistent: true, serialization_fails: true };
+        let domain = TestDomain { persistent: true, serialization_fails: true, ..TestDomain::default() };
 
-        // Serialization failures degrade to an in-memory result and are recorded as persistent write failures.
+        // Serialization failures degrade to an in-memory result and are recorded separately from persistent write
+        // failures.
         let program = context.get_or_compile(&domain, 1, || Ok(TestCompiledProgram(3))).unwrap();
         assert_eq!(program.0, 3);
         assert_eq!(std::fs::read_dir(directory.path()).unwrap().count(), 0);
         assert_eq!(context.statistics().persistent_errors, 1);
         let last_event = context.recent_events().pop().unwrap();
-        assert_eq!(last_event.tier, CompilationCacheTier::Persistent);
-        assert_eq!(last_event.outcome, CompilationCacheOutcome::Failed);
-        assert_eq!(last_event.miss_reason, Some(CompilationMissReason::WriteFailed));
+        assert_eq!(
+            last_event.kind,
+            CompilationEventKind::PersistentStore {
+                outcome: CompilationOperationOutcome::Failed(CompilationEventReason::SerializationFailed),
+            },
+        );
+    }
+
+    #[test]
+    fn test_compilation_context_with_disk_cache_write_failure() {
+        let directory = tempfile::tempdir().unwrap();
+        let cache = DiskCache::open(directory.path()).unwrap().with_write_thresholds(Duration::ZERO, 0);
+        let entry_path = cache.entry_path(&CacheDigest::from_key(&[1]));
+        let context = CompilationContext::<TestDomain>::new().with_disk_cache(cache).with_event_capacity(8);
+
+        // Create the obstruction after the lookup, so only the store fails and compilation still succeeds.
+        let program = context
+            .get_or_compile(&TestDomain::persistent(), 1, || {
+                fs::create_dir(&entry_path).unwrap();
+                Ok(TestCompiledProgram(3))
+            })
+            .unwrap();
+        assert_eq!(program.0, 3);
+        assert_eq!(context.statistics().persistent_errors, 1);
+        assert_eq!(
+            event_kinds(&context),
+            vec![
+                CompilationEventKind::CacheLookup {
+                    tier: CompilationCacheTier::Memory,
+                    outcome: CompilationLookupOutcome::Miss(CompilationEventReason::NotFound),
+                },
+                CompilationEventKind::CacheLookup {
+                    tier: CompilationCacheTier::Persistent,
+                    outcome: CompilationLookupOutcome::Miss(CompilationEventReason::NotFound),
+                },
+                CompilationEventKind::BackendCompilation { outcome: CompilationOperationOutcome::Succeeded },
+                CompilationEventKind::PersistentStore {
+                    outcome: CompilationOperationOutcome::Failed(CompilationEventReason::WriteFailed),
+                },
+            ],
+        );
     }
 
     #[test]
@@ -2057,6 +2278,7 @@ mod tests {
         let state = Arc::new(TestExchangeState::default());
         let policy = CompilationArtifactExchangePolicy::RequireSharing { timeout: Duration::from_secs(5) };
         let follower_context = CompilationContext::<TestDomain>::new()
+            .with_event_capacity(16)
             .with_artifact_exchange(Arc::new(TestExchange::new(1, Arc::clone(&state))), policy);
         assert_eq!(follower_context.artifact_exchange().unwrap().process_index(), 1);
         assert_eq!(follower_context.artifact_exchange_policy(), policy);
@@ -2066,14 +2288,15 @@ mod tests {
                     panic!("follower must restore the leader artifact")
                 })
                 .unwrap();
-            (program.0, follower_context.statistics())
+            (program.0, follower_context.statistics(), follower_context.recent_events())
         });
 
         let leader_context = CompilationContext::<TestDomain>::new()
+            .with_event_capacity(16)
             .with_artifact_exchange(Arc::new(TestExchange::new(0, Arc::clone(&state))), policy);
         let leader =
             leader_context.get_or_compile(&TestDomain::persistent(), 7, || Ok(TestCompiledProgram(29))).unwrap();
-        let (follower_value, follower_statistics) = follower.join().unwrap();
+        let (follower_value, follower_statistics, follower_events) = follower.join().unwrap();
 
         assert_eq!(leader.0, 29);
         assert_eq!(follower_value, 29);
@@ -2082,6 +2305,30 @@ mod tests {
         assert_eq!(follower_statistics.compilations, 0);
         assert_eq!(follower_statistics.exchange_hits, 1);
         assert_eq!(follower_statistics.exchange_waits, 1);
+
+        assert_eq!(
+            event_kinds(&leader_context),
+            vec![
+                CompilationEventKind::CacheLookup {
+                    tier: CompilationCacheTier::Memory,
+                    outcome: CompilationLookupOutcome::Miss(CompilationEventReason::NotFound),
+                },
+                CompilationEventKind::BackendCompilation { outcome: CompilationOperationOutcome::Succeeded },
+                CompilationEventKind::ExchangePublish { outcome: CompilationOperationOutcome::Succeeded },
+            ],
+        );
+        assert_eq!(
+            follower_events.iter().map(|event| event.kind).collect::<Vec<_>>(),
+            vec![
+                CompilationEventKind::CacheLookup {
+                    tier: CompilationCacheTier::Memory,
+                    outcome: CompilationLookupOutcome::Miss(CompilationEventReason::NotFound),
+                },
+                CompilationEventKind::ExchangeReceive { outcome: CompilationLookupOutcome::Hit },
+            ],
+        );
+        assert_eq!(leader_context.statistics().exchange_duration, Duration::ZERO);
+        assert_eq!(follower_statistics.exchange_duration, follower_events[1].duration);
     }
 
     #[test]
@@ -2090,6 +2337,7 @@ mod tests {
         let domain = TestDomain::persistent();
         let seed_cache = DiskCache::open(directory.path()).unwrap().with_write_thresholds(Duration::ZERO, 0);
         CompilationContext::<TestDomain>::new()
+            .with_event_capacity(16)
             .with_disk_cache(seed_cache)
             .get_or_compile(&domain, 8, || Ok(TestCompiledProgram(53)))
             .unwrap();
@@ -2097,6 +2345,7 @@ mod tests {
         let state = Arc::new(TestExchangeState::default());
         let policy = CompilationArtifactExchangePolicy::RequireSharing { timeout: Duration::from_secs(5) };
         let follower_context = CompilationContext::<TestDomain>::new()
+            .with_event_capacity(16)
             .with_artifact_exchange(Arc::new(TestExchange::new(1, Arc::clone(&state))), policy);
         let follower = thread::spawn(move || {
             follower_context
@@ -2109,6 +2358,7 @@ mod tests {
 
         let leader_cache = DiskCache::open(directory.path()).unwrap().with_write_thresholds(Duration::ZERO, 0);
         let leader_context = CompilationContext::<TestDomain>::new()
+            .with_event_capacity(16)
             .with_disk_cache(leader_cache)
             .with_artifact_exchange(Arc::new(TestExchange::new(0, state)), policy);
         let leader = leader_context
@@ -2122,6 +2372,21 @@ mod tests {
         assert_eq!(leader_context.statistics().persistent_hits, 1);
         assert_eq!(leader_context.statistics().exchange_publishes, 1);
         assert_eq!(leader_context.statistics().compilations, 0);
+
+        assert_eq!(
+            event_kinds(&leader_context),
+            vec![
+                CompilationEventKind::CacheLookup {
+                    tier: CompilationCacheTier::Memory,
+                    outcome: CompilationLookupOutcome::Miss(CompilationEventReason::NotFound),
+                },
+                CompilationEventKind::CacheLookup {
+                    tier: CompilationCacheTier::Persistent,
+                    outcome: CompilationLookupOutcome::Hit,
+                },
+                CompilationEventKind::ExchangePublish { outcome: CompilationOperationOutcome::Succeeded },
+            ],
+        );
     }
 
     #[test]
@@ -2129,6 +2394,7 @@ mod tests {
         let state = Arc::new(TestExchangeState::default());
         let policy = CompilationArtifactExchangePolicy::RequireSharing { timeout: Duration::from_secs(30) };
         let leader_context = CompilationContext::<TestDomain>::new()
+            .with_event_capacity(16)
             .with_artifact_exchange(Arc::new(TestExchange::new(0, Arc::clone(&state))), policy);
         let producer_error = ProgramError::MalformedProgram("expected test failure".to_string());
         assert_eq!(
@@ -2138,6 +2404,7 @@ mod tests {
 
         // The follower observes the terminal failure published by the leader instead of waiting for its deadline.
         let follower_context = CompilationContext::<TestDomain>::new()
+            .with_event_capacity(16)
             .with_artifact_exchange(Arc::new(TestExchange::new(1, state)), policy);
         let start = Instant::now();
         assert_eq!(
@@ -2149,19 +2416,84 @@ mod tests {
         assert!(start.elapsed() < Duration::from_secs(1));
         assert_eq!(follower_context.statistics().exchange_errors, 1);
         assert_eq!(follower_context.statistics().compilations, 0);
+
+        assert_eq!(
+            event_kinds(&leader_context),
+            vec![
+                CompilationEventKind::CacheLookup {
+                    tier: CompilationCacheTier::Memory,
+                    outcome: CompilationLookupOutcome::Miss(CompilationEventReason::NotFound),
+                },
+                CompilationEventKind::BackendCompilation {
+                    outcome: CompilationOperationOutcome::Failed(CompilationEventReason::ProducerFailed),
+                },
+                CompilationEventKind::ExchangeFailureNotification {
+                    cause: CompilationEventReason::ProducerFailed,
+                    outcome: CompilationOperationOutcome::Succeeded,
+                },
+            ],
+        );
+        assert_eq!(
+            event_kinds(&follower_context),
+            vec![
+                CompilationEventKind::CacheLookup {
+                    tier: CompilationCacheTier::Memory,
+                    outcome: CompilationLookupOutcome::Miss(CompilationEventReason::NotFound),
+                },
+                CompilationEventKind::ExchangeReceive {
+                    outcome: CompilationLookupOutcome::Failed(CompilationEventReason::ReadFailed),
+                },
+            ],
+        );
+        assert_eq!(leader_context.statistics().compilation_duration, leader_context.recent_events()[1].duration);
+        assert_eq!(leader_context.statistics().exchange_duration, Duration::ZERO);
+    }
+
+    #[test]
+    fn test_compilation_context_with_artifact_exchange_failure_notification_failure() {
+        let state = Arc::new(TestExchangeState::default());
+        state.failure_publish_fails.store(true, Ordering::Relaxed);
+        let context = CompilationContext::<TestDomain>::new().with_event_capacity(8).with_artifact_exchange(
+            Arc::new(TestExchange::new(0, state)),
+            CompilationArtifactExchangePolicy::RequireSharing { timeout: Duration::from_secs(1) },
+        );
+        let producer_error = ProgramError::MalformedProgram("expected producer failure".to_string());
+
+        assert_eq!(
+            context.get_or_compile(&TestDomain::persistent(), 1, || Err(producer_error.clone())).err(),
+            Some(producer_error),
+        );
+        assert_eq!(context.statistics().exchange_errors, 1);
+        assert_eq!(context.statistics().compilations, 1);
+        assert_eq!(
+            event_kinds(&context),
+            vec![
+                CompilationEventKind::CacheLookup {
+                    tier: CompilationCacheTier::Memory,
+                    outcome: CompilationLookupOutcome::Miss(CompilationEventReason::NotFound),
+                },
+                CompilationEventKind::BackendCompilation {
+                    outcome: CompilationOperationOutcome::Failed(CompilationEventReason::ProducerFailed),
+                },
+                CompilationEventKind::ExchangeFailureNotification {
+                    cause: CompilationEventReason::ProducerFailed,
+                    outcome: CompilationOperationOutcome::Failed(CompilationEventReason::WriteFailed),
+                },
+            ],
+        );
     }
 
     #[test]
     fn test_compilation_context_with_artifact_exchange_publishes_leader_serialization_failure() {
         let state = Arc::new(TestExchangeState::default());
-        let leader_context = CompilationContext::<TestDomain>::new().with_artifact_exchange(
+        let leader_context = CompilationContext::<TestDomain>::new().with_event_capacity(16).with_artifact_exchange(
             Arc::new(TestExchange::new(0, Arc::clone(&state))),
             CompilationArtifactExchangePolicy::PreferSharing {
                 timeout: Duration::from_secs(30),
                 fallback_to_local_compile: true,
             },
         );
-        let domain = TestDomain { persistent: true, serialization_fails: true };
+        let domain = TestDomain { persistent: true, serialization_fails: true, ..TestDomain::default() };
 
         // The leader keeps its program when the policy permits a fallback, but still releases its followers.
         let program = leader_context.get_or_compile(&domain, 10, || Ok(TestCompiledProgram(61))).unwrap();
@@ -2173,13 +2505,79 @@ mod tests {
             state.artifacts.lock().unwrap().get([10u8].as_slice()),
             Some(&Err(ProgramError::MalformedProgram("expected serialization failure".to_string()).to_string())),
         );
+
+        assert_eq!(
+            event_kinds(&leader_context),
+            vec![
+                CompilationEventKind::CacheLookup {
+                    tier: CompilationCacheTier::Memory,
+                    outcome: CompilationLookupOutcome::Miss(CompilationEventReason::NotFound),
+                },
+                CompilationEventKind::BackendCompilation { outcome: CompilationOperationOutcome::Succeeded },
+                CompilationEventKind::ExchangePublish {
+                    outcome: CompilationOperationOutcome::Failed(CompilationEventReason::SerializationFailed),
+                },
+                CompilationEventKind::ExchangeFailureNotification {
+                    cause: CompilationEventReason::SerializationFailed,
+                    outcome: CompilationOperationOutcome::Succeeded,
+                },
+            ],
+        );
+    }
+
+    #[test]
+    fn test_compilation_context_with_artifact_exchange_serialization_unsupported() {
+        let directory = tempfile::tempdir().unwrap();
+        let cache = DiskCache::open(directory.path()).unwrap().with_write_thresholds(Duration::ZERO, 0);
+        let state = Arc::new(TestExchangeState::default());
+        let context = CompilationContext::<TestDomain>::new()
+            .with_disk_cache(cache)
+            .with_event_capacity(8)
+            .with_artifact_exchange(
+                Arc::new(TestExchange::new(0, state)),
+                CompilationArtifactExchangePolicy::PreferSharing {
+                    timeout: Duration::from_secs(1),
+                    fallback_to_local_compile: true,
+                },
+            );
+        let domain = TestDomain { persistent: true, serialization_unsupported: true, ..TestDomain::default() };
+
+        assert_eq!(context.get_or_compile(&domain, 1, || Ok(TestCompiledProgram(3))).unwrap().0, 3);
+        assert_eq!(context.statistics().persistent_errors, 0);
+        assert_eq!(context.statistics().exchange_errors, 0);
+        assert_eq!(context.statistics().exchange_fallbacks, 1);
+        assert_eq!(context.statistics().exchange_publishes, 0);
+        assert_eq!(
+            event_kinds(&context),
+            vec![
+                CompilationEventKind::CacheLookup {
+                    tier: CompilationCacheTier::Memory,
+                    outcome: CompilationLookupOutcome::Miss(CompilationEventReason::NotFound),
+                },
+                CompilationEventKind::CacheLookup {
+                    tier: CompilationCacheTier::Persistent,
+                    outcome: CompilationLookupOutcome::Miss(CompilationEventReason::NotFound),
+                },
+                CompilationEventKind::BackendCompilation { outcome: CompilationOperationOutcome::Succeeded },
+                CompilationEventKind::PersistentStore {
+                    outcome: CompilationOperationOutcome::Skipped(CompilationEventReason::Unsupported),
+                },
+                CompilationEventKind::ExchangePublish {
+                    outcome: CompilationOperationOutcome::Skipped(CompilationEventReason::Unsupported),
+                },
+                CompilationEventKind::ExchangeFailureNotification {
+                    cause: CompilationEventReason::Unsupported,
+                    outcome: CompilationOperationOutcome::Succeeded,
+                },
+            ],
+        );
     }
 
     #[test]
     fn test_compilation_context_with_artifact_exchange_receive_failure_fallback() {
         let state = Arc::new(TestExchangeState::default());
         state.receive_fails.store(true, Ordering::Relaxed);
-        let context = CompilationContext::<TestDomain>::new().with_artifact_exchange(
+        let context = CompilationContext::<TestDomain>::new().with_event_capacity(16).with_artifact_exchange(
             Arc::new(TestExchange::new(1, state)),
             CompilationArtifactExchangePolicy::PreferSharing {
                 timeout: Duration::from_millis(10),
@@ -2193,13 +2591,149 @@ mod tests {
         assert_eq!(context.statistics().exchange_errors, 1);
         assert_eq!(context.statistics().exchange_fallbacks, 1);
         assert_eq!(context.statistics().compilations, 1);
+
+        assert_eq!(
+            event_kinds(&context),
+            vec![
+                CompilationEventKind::CacheLookup {
+                    tier: CompilationCacheTier::Memory,
+                    outcome: CompilationLookupOutcome::Miss(CompilationEventReason::NotFound),
+                },
+                CompilationEventKind::ExchangeReceive {
+                    outcome: CompilationLookupOutcome::Failed(CompilationEventReason::ReadFailed),
+                },
+                CompilationEventKind::BackendCompilation { outcome: CompilationOperationOutcome::Succeeded },
+            ],
+        );
+        assert_eq!(context.statistics().exchange_duration, context.recent_events()[1].duration);
+    }
+
+    #[test]
+    fn test_compilation_context_with_artifact_exchange_receive_incompatible() {
+        let state = Arc::new(TestExchangeState::default());
+        state.receive_incompatible.store(true, Ordering::Relaxed);
+        let context = CompilationContext::<TestDomain>::new().with_event_capacity(8).with_artifact_exchange(
+            Arc::new(TestExchange::new(1, state)),
+            CompilationArtifactExchangePolicy::PreferSharing {
+                timeout: Duration::from_secs(1),
+                fallback_to_local_compile: true,
+            },
+        );
+        assert_eq!(context.get_or_compile(&TestDomain::persistent(), 1, || Ok(TestCompiledProgram(3))).unwrap().0, 3);
+        assert_eq!(context.statistics().exchange_errors, 1);
+        assert_eq!(context.statistics().exchange_fallbacks, 1);
+        assert_eq!(
+            event_kinds(&context),
+            vec![
+                CompilationEventKind::CacheLookup {
+                    tier: CompilationCacheTier::Memory,
+                    outcome: CompilationLookupOutcome::Miss(CompilationEventReason::NotFound),
+                },
+                CompilationEventKind::ExchangeReceive {
+                    outcome: CompilationLookupOutcome::Failed(CompilationEventReason::Incompatible),
+                },
+                CompilationEventKind::BackendCompilation { outcome: CompilationOperationOutcome::Succeeded },
+            ],
+        );
+
+        // Receiving bytes succeeds, but rejecting their backend compatibility is a lookup miss.
+        let state = Arc::new(TestExchangeState::default());
+        state.artifacts.lock().unwrap().insert(vec![1], Ok(5usize.to_le_bytes().to_vec()));
+        let context = CompilationContext::<TestDomain>::new().with_event_capacity(8).with_artifact_exchange(
+            Arc::new(TestExchange::new(1, state)),
+            CompilationArtifactExchangePolicy::PreferSharing {
+                timeout: Duration::from_secs(1),
+                fallback_to_local_compile: true,
+            },
+        );
+        let domain = TestDomain { persistent: true, deserialization_incompatible: true, ..TestDomain::default() };
+        assert_eq!(context.get_or_compile(&domain, 1, || Ok(TestCompiledProgram(7))).unwrap().0, 7);
+        assert_eq!(context.statistics().exchange_errors, 1);
+        assert_eq!(context.statistics().exchange_fallbacks, 1);
+        assert_eq!(
+            event_kinds(&context),
+            vec![
+                CompilationEventKind::CacheLookup {
+                    tier: CompilationCacheTier::Memory,
+                    outcome: CompilationLookupOutcome::Miss(CompilationEventReason::NotFound),
+                },
+                CompilationEventKind::ExchangeReceive {
+                    outcome: CompilationLookupOutcome::Miss(CompilationEventReason::Incompatible),
+                },
+                CompilationEventKind::BackendCompilation { outcome: CompilationOperationOutcome::Succeeded },
+            ],
+        );
+    }
+
+    #[test]
+    fn test_compilation_context_with_artifact_exchange_deserialization_failure() {
+        let state = Arc::new(TestExchangeState::default());
+        state.artifacts.lock().unwrap().insert(vec![1], Ok(vec![0]));
+        let context = CompilationContext::<TestDomain>::new().with_event_capacity(8).with_artifact_exchange(
+            Arc::new(TestExchange::new(1, state)),
+            CompilationArtifactExchangePolicy::RequireSharing { timeout: Duration::from_secs(1) },
+        );
+        assert_eq!(
+            context
+                .get_or_compile(&TestDomain::persistent(), 1, || -> Result<TestCompiledProgram, ProgramError> {
+                    panic!("required sharing must not compile after deserialization fails")
+                })
+                .err(),
+            Some(ProgramError::MalformedProgram("test persistent payload has the wrong length".to_string())),
+        );
+        assert_eq!(context.statistics().exchange_errors, 1);
+        assert_eq!(context.statistics().exchange_fallbacks, 0);
+        assert_eq!(context.statistics().compilations, 0);
+        assert_eq!(
+            event_kinds(&context),
+            vec![
+                CompilationEventKind::CacheLookup {
+                    tier: CompilationCacheTier::Memory,
+                    outcome: CompilationLookupOutcome::Miss(CompilationEventReason::NotFound),
+                },
+                CompilationEventKind::ExchangeReceive {
+                    outcome: CompilationLookupOutcome::Failed(CompilationEventReason::DeserializationFailed),
+                },
+            ],
+        );
+    }
+
+    #[test]
+    fn test_compilation_context_with_artifact_exchange_publish_failure() {
+        let state = Arc::new(TestExchangeState::default());
+        state.publish_fails.store(true, Ordering::Relaxed);
+        let context = CompilationContext::<TestDomain>::new().with_event_capacity(8).with_artifact_exchange(
+            Arc::new(TestExchange::new(0, state)),
+            CompilationArtifactExchangePolicy::PreferSharing {
+                timeout: Duration::from_secs(1),
+                fallback_to_local_compile: true,
+            },
+        );
+        assert_eq!(context.get_or_compile(&TestDomain::persistent(), 1, || Ok(TestCompiledProgram(3))).unwrap().0, 3);
+        assert_eq!(context.statistics().exchange_errors, 1);
+        assert_eq!(context.statistics().exchange_fallbacks, 1);
+        assert_eq!(context.statistics().exchange_publishes, 0);
+        assert_eq!(
+            event_kinds(&context),
+            vec![
+                CompilationEventKind::CacheLookup {
+                    tier: CompilationCacheTier::Memory,
+                    outcome: CompilationLookupOutcome::Miss(CompilationEventReason::NotFound),
+                },
+                CompilationEventKind::BackendCompilation { outcome: CompilationOperationOutcome::Succeeded },
+                CompilationEventKind::ExchangePublish {
+                    outcome: CompilationOperationOutcome::Failed(CompilationEventReason::WriteFailed),
+                },
+            ],
+        );
+        assert_eq!(context.statistics().exchange_duration, Duration::ZERO);
     }
 
     #[test]
     fn test_compilation_context_with_artifact_exchange_rejects_preflight_disagreement() {
         let state = Arc::new(TestExchangeState::default());
         state.preflight_fails.store(true, Ordering::Relaxed);
-        let context = CompilationContext::<TestDomain>::new().with_artifact_exchange(
+        let context = CompilationContext::<TestDomain>::new().with_event_capacity(16).with_artifact_exchange(
             Arc::new(TestExchange::new(0, state)),
             CompilationArtifactExchangePolicy::RequireSharing { timeout: Duration::from_secs(1) },
         );
@@ -2221,11 +2755,25 @@ mod tests {
         assert_eq!(producer_calls.load(Ordering::Relaxed), 0);
         assert_eq!(context.statistics().exchange_errors, 1);
         assert_eq!(context.statistics().compilations, 0);
+
+        assert_eq!(
+            event_kinds(&context),
+            vec![
+                CompilationEventKind::CacheLookup {
+                    tier: CompilationCacheTier::Memory,
+                    outcome: CompilationLookupOutcome::Miss(CompilationEventReason::NotFound),
+                },
+                CompilationEventKind::ExchangePreflight {
+                    outcome: CompilationOperationOutcome::Failed(CompilationEventReason::Incompatible),
+                },
+            ],
+        );
+        assert_eq!(context.statistics().exchange_duration, context.recent_events()[1].duration);
     }
 
     #[test]
     fn test_compilation_context_with_artifact_exchange_rejects_unsupported_domain_without_waiting() {
-        let context = CompilationContext::<TestDomain>::new().with_artifact_exchange(
+        let context = CompilationContext::<TestDomain>::new().with_event_capacity(16).with_artifact_exchange(
             Arc::new(TestExchange::new(1, Arc::new(TestExchangeState::default()))),
             CompilationArtifactExchangePolicy::RequireSharing { timeout: Duration::from_secs(30) },
         );
@@ -2243,11 +2791,24 @@ mod tests {
         );
         assert!(start.elapsed() < Duration::from_secs(1));
         assert_eq!(context.statistics().compilations, 0);
+
+        assert_eq!(
+            event_kinds(&context),
+            vec![
+                CompilationEventKind::CacheLookup {
+                    tier: CompilationCacheTier::Memory,
+                    outcome: CompilationLookupOutcome::Miss(CompilationEventReason::NotFound),
+                },
+                CompilationEventKind::ExchangePreflight {
+                    outcome: CompilationOperationOutcome::Skipped(CompilationEventReason::Unsupported),
+                },
+            ],
+        );
     }
 
     #[test]
     fn test_compilation_context_with_artifact_exchange_required_timeout() {
-        let context = CompilationContext::<TestDomain>::new().with_artifact_exchange(
+        let context = CompilationContext::<TestDomain>::new().with_event_capacity(16).with_artifact_exchange(
             Arc::new(TestExchange::new(1, Arc::new(TestExchangeState::default()))),
             CompilationArtifactExchangePolicy::RequireSharing { timeout: Duration::from_millis(1) },
         );
@@ -2269,11 +2830,24 @@ mod tests {
         assert_eq!(producer_calls.load(Ordering::Relaxed), 0);
         assert_eq!(context.statistics().exchange_timeouts, 1);
         assert_eq!(context.statistics().exchange_fallbacks, 0);
+
+        assert_eq!(
+            event_kinds(&context),
+            vec![
+                CompilationEventKind::CacheLookup {
+                    tier: CompilationCacheTier::Memory,
+                    outcome: CompilationLookupOutcome::Miss(CompilationEventReason::NotFound),
+                },
+                CompilationEventKind::ExchangeReceive {
+                    outcome: CompilationLookupOutcome::Miss(CompilationEventReason::TimedOut),
+                },
+            ],
+        );
     }
 
     #[test]
     fn test_compilation_context_with_artifact_exchange_permitted_timeout_fallback() {
-        let context = CompilationContext::<TestDomain>::new().with_artifact_exchange(
+        let context = CompilationContext::<TestDomain>::new().with_event_capacity(16).with_artifact_exchange(
             Arc::new(TestExchange::new(1, Arc::new(TestExchangeState::default()))),
             CompilationArtifactExchangePolicy::PreferSharing {
                 timeout: Duration::from_millis(1),
@@ -2287,6 +2861,20 @@ mod tests {
         assert_eq!(context.statistics().exchange_timeouts, 1);
         assert_eq!(context.statistics().exchange_fallbacks, 1);
         assert_eq!(context.statistics().compilations, 1);
+
+        assert_eq!(
+            event_kinds(&context),
+            vec![
+                CompilationEventKind::CacheLookup {
+                    tier: CompilationCacheTier::Memory,
+                    outcome: CompilationLookupOutcome::Miss(CompilationEventReason::NotFound),
+                },
+                CompilationEventKind::ExchangeReceive {
+                    outcome: CompilationLookupOutcome::Miss(CompilationEventReason::TimedOut),
+                },
+                CompilationEventKind::BackendCompilation { outcome: CompilationOperationOutcome::Succeeded },
+            ],
+        );
     }
 
     #[test]
@@ -2299,10 +2887,17 @@ mod tests {
         // The memory miss of the first lookup is evicted by the two later events.
         let events = context.recent_events();
         assert_eq!(events.len(), 2);
-        assert_eq!(events[0].tier, CompilationCacheTier::Backend);
-        assert_eq!(events[0].outcome, CompilationCacheOutcome::Succeeded);
-        assert_eq!(events[1].tier, CompilationCacheTier::Memory);
-        assert_eq!(events[1].outcome, CompilationCacheOutcome::Hit);
+        assert_eq!(
+            events[0].kind,
+            CompilationEventKind::BackendCompilation { outcome: CompilationOperationOutcome::Succeeded },
+        );
+        assert_eq!(
+            events[1].kind,
+            CompilationEventKind::CacheLookup {
+                tier: CompilationCacheTier::Memory,
+                outcome: CompilationLookupOutcome::Hit,
+            },
+        );
 
         context.clear_events();
         assert_eq!(context.recent_events(), Vec::new());
@@ -2322,10 +2917,13 @@ mod tests {
         assert_eq!(context.recent_events(), Vec::new());
         let reported = reported.lock().unwrap();
         assert_eq!(
-            reported.iter().map(|event| (event.tier, event.outcome)).collect::<Vec<_>>(),
+            reported.iter().map(|event| event.kind).collect::<Vec<_>>(),
             vec![
-                (CompilationCacheTier::Memory, CompilationCacheOutcome::Miss),
-                (CompilationCacheTier::Backend, CompilationCacheOutcome::Succeeded),
+                CompilationEventKind::CacheLookup {
+                    tier: CompilationCacheTier::Memory,
+                    outcome: CompilationLookupOutcome::Miss(CompilationEventReason::NotFound),
+                },
+                CompilationEventKind::BackendCompilation { outcome: CompilationOperationOutcome::Succeeded },
             ],
         );
     }
@@ -2364,7 +2962,7 @@ mod tests {
 
     #[test]
     fn test_compilation_context_get_or_compile() {
-        let context = CompilationContext::<TestDomain>::new();
+        let context = CompilationContext::<TestDomain>::new().with_event_capacity(16);
         let domain = TestDomain::default();
         let producer_calls = AtomicUsize::new(0);
 
@@ -2388,11 +2986,26 @@ mod tests {
         assert_eq!(statistics.memory_hits, 1);
         assert_eq!(statistics.misses, 1);
         assert_eq!(statistics.compilations, 1);
+
+        assert_eq!(
+            event_kinds(&context),
+            vec![
+                CompilationEventKind::CacheLookup {
+                    tier: CompilationCacheTier::Memory,
+                    outcome: CompilationLookupOutcome::Miss(CompilationEventReason::NotFound),
+                },
+                CompilationEventKind::BackendCompilation { outcome: CompilationOperationOutcome::Succeeded },
+                CompilationEventKind::CacheLookup {
+                    tier: CompilationCacheTier::Memory,
+                    outcome: CompilationLookupOutcome::Hit,
+                },
+            ],
+        );
     }
 
     #[test]
     fn test_compilation_context_get_or_compile_producer_error() {
-        let context = CompilationContext::<TestDomain>::new();
+        let context = CompilationContext::<TestDomain>::new().with_event_capacity(16);
         let domain = TestDomain::default();
 
         // Producer errors are returned to their caller and never cached.
@@ -2402,6 +3015,24 @@ mod tests {
 
         assert_eq!(program.0, 9);
         assert_eq!(context.statistics().compilations, 2);
+
+        assert_eq!(
+            event_kinds(&context),
+            vec![
+                CompilationEventKind::CacheLookup {
+                    tier: CompilationCacheTier::Memory,
+                    outcome: CompilationLookupOutcome::Miss(CompilationEventReason::NotFound),
+                },
+                CompilationEventKind::BackendCompilation {
+                    outcome: CompilationOperationOutcome::Failed(CompilationEventReason::ProducerFailed),
+                },
+                CompilationEventKind::CacheLookup {
+                    tier: CompilationCacheTier::Memory,
+                    outcome: CompilationLookupOutcome::Miss(CompilationEventReason::NotFound),
+                },
+                CompilationEventKind::BackendCompilation { outcome: CompilationOperationOutcome::Succeeded },
+            ],
+        );
     }
 
     #[test]
@@ -2427,7 +3058,7 @@ mod tests {
     fn test_compilation_context_get_or_compile_single_flight() {
         const THREAD_COUNT: usize = 8;
 
-        let context = Arc::new(CompilationContext::<TestDomain>::new());
+        let context = Arc::new(CompilationContext::<TestDomain>::new().with_event_capacity(16));
         let start = Arc::new(Barrier::new(THREAD_COUNT + 1));
         let release = Arc::new(AtomicBool::new(false));
         let producer_calls = Arc::new(AtomicUsize::new(0));
@@ -2464,6 +3095,23 @@ mod tests {
         assert_eq!(producer_calls.load(Ordering::Relaxed), 1);
         assert!(programs.iter().all(|program| Arc::ptr_eq(program, &programs[0])));
         assert_eq!(context.statistics().waits, (THREAD_COUNT - 1) as u64);
+
+        let mut expected = vec![
+            CompilationEventKind::CacheLookup {
+                tier: CompilationCacheTier::Memory,
+                outcome: CompilationLookupOutcome::Miss(CompilationEventReason::NotFound),
+            },
+            CompilationEventKind::BackendCompilation { outcome: CompilationOperationOutcome::Succeeded },
+        ];
+        expected.extend(std::iter::repeat_n(CompilationEventKind::MemoryWait, THREAD_COUNT - 1));
+        assert_eq!(event_kinds(&context), expected);
+        let lookup_duration = context
+            .recent_events()
+            .iter()
+            .filter(|event| !matches!(event.kind, CompilationEventKind::BackendCompilation { .. }))
+            .map(|event| event.duration)
+            .sum::<Duration>();
+        assert_eq!(context.statistics().memory_lookup_duration, lookup_duration);
     }
 
     #[test]
