@@ -1288,9 +1288,9 @@ where
     {
         // Static values and input structure can change the traced program, while the domain's dispatch key groups
         // input signatures that can safely share it. Dynamic values remain runtime inputs, and the closure, captures,
-        // selected domain, and options are fixed for this dispatcher. Time the full derivation, including domain
+        // selected domain, and options are fixed for this dispatcher. Time all dispatch preparation, including domain
         // selection and input validation.
-        let dispatch_key_start = Instant::now();
+        let dispatch_preparation_start = Instant::now();
 
         // Every specialization and clone shares one domain, which remains selected after failures or cache eviction.
         let domain = match &self.state.domain {
@@ -1361,13 +1361,16 @@ where
         // Backend normalization can share dispatch keys, but static values and container structures remain distinct.
         let key = SpecializationKey::new(static_parameters.clone(), input_structure, dispatch_key);
 
-        // One clock read both ends dispatch key derivation and starts the dispatch lookup, which keeps the timing
+        // One clock read both ends dispatch preparation and starts the specialization lookup, which keeps the timing
         // of every cached call to three clock reads.
         let statistics = &self.state.statistics;
-        let dispatch_start = Instant::now();
-        accumulate_duration(dispatch_start.duration_since(dispatch_key_start), &statistics.dispatch_key_nanoseconds);
+        let dispatch_lookup_start = Instant::now();
+        accumulate_duration(
+            dispatch_lookup_start.duration_since(dispatch_preparation_start),
+            &statistics.dispatch_preparation_nanoseconds,
+        );
         let entry = self.state.specializations.try_entry(key);
-        accumulate_duration(dispatch_start.elapsed(), &statistics.dispatch_nanoseconds);
+        accumulate_duration(dispatch_lookup_start.elapsed(), &statistics.dispatch_lookup_nanoseconds);
 
         // A hit skips all frontend production. A vacant producer clears its in-flight marker if any later phase fails,
         // allowing retries. Only recursive production of the same key on this thread is rejected.
@@ -1563,9 +1566,7 @@ impl<Output, Error> StatefulExecution<Output, Error> {
     }
 }
 
-// TODO(eaplatanios): Review from here onwards.
-
-/// Snapshot of the frontend activity of one retained [`CompiledFunctionDispatcher`], covering dispatch key derivation,
+/// Snapshot of the frontend activity of one retained [`CompiledFunctionDispatcher`], covering dispatch preparation,
 /// specialization lookup, tracing, lowering, and compilation requests. The statistics accumulate from construction or
 /// from the latest [`CompiledFunctionDispatcher::clear_statistics`] call, are shared by every clone of the dispatcher,
 /// and are unaffected by [`CompiledFunctionDispatcher::clear_cache`]. Each field is read independently, so a snapshot
@@ -1578,8 +1579,8 @@ impl<Output, Error> StatefulExecution<Output, Error> {
 /// each trace, lower, and request compilation. Durations are host durations summed over all calls, so concurrent calls
 /// can make them exceed the elapsed wall-clock time. Backend compilation time is not included, because a compilation
 /// request may be served by a compilation cache. Refer to
-/// [`CompilationCacheStatistics::compilation_duration`](crate::CompilationCacheStatistics::compilation_duration) for
-/// the backend compilation activity of a shared [`CompilationContext`](crate::CompilationContext).
+/// [`CompilationCacheStatistics::compilation_duration`](crate::CompilationCacheStatistics::compilation_duration)
+/// for the backend compilation activity of a shared [`CompilationContext`](crate::CompilationContext).
 #[derive(Copy, Clone, Debug, Default, PartialEq, Eq)]
 pub struct DispatcherStatistics {
     /// Calls served by a retained specialization.
@@ -1599,12 +1600,13 @@ pub struct DispatcherStatistics {
     /// domain served from a compilation cache.
     pub compilation_requests: u64,
 
-    /// Total host duration spent deriving dispatch keys, which includes recovering an inferred domain, reading input
-    /// types, checking declared staged input types, and calling [`CompilationDomain::dispatch_signature`].
-    pub dispatch_key_duration: Duration,
+    /// Total host duration spent preparing dispatch, including recovering an inferred domain, reading input structure
+    /// and types, validating declared staged input types, calling [`CompilationDomain::dispatch_signature`], and
+    /// constructing the specialization key.
+    pub dispatch_preparation_duration: Duration,
 
-    /// Total host duration spent looking up retained specializations by their dispatch keys.
-    pub dispatch_duration: Duration,
+    /// Total host duration spent looking up retained specializations by their specialization keys.
+    pub dispatch_lookup_duration: Duration,
 
     /// Total host duration spent tracing the dispatcher's closure after dispatch misses.
     pub tracing_duration: Duration,
@@ -1631,11 +1633,11 @@ struct DispatcherStatisticsAccumulator {
     /// Counter underlying [`DispatcherStatistics::compilation_requests`].
     compilation_requests: AtomicU64,
 
-    /// Nanoseconds underlying [`DispatcherStatistics::dispatch_key_duration`].
-    dispatch_key_nanoseconds: AtomicU64,
+    /// Nanoseconds underlying [`DispatcherStatistics::dispatch_preparation_duration`].
+    dispatch_preparation_nanoseconds: AtomicU64,
 
-    /// Nanoseconds underlying [`DispatcherStatistics::dispatch_duration`].
-    dispatch_nanoseconds: AtomicU64,
+    /// Nanoseconds underlying [`DispatcherStatistics::dispatch_lookup_duration`].
+    dispatch_lookup_nanoseconds: AtomicU64,
 
     /// Nanoseconds underlying [`DispatcherStatistics::tracing_duration`].
     tracing_nanoseconds: AtomicU64,
@@ -1653,8 +1655,10 @@ impl DispatcherStatisticsAccumulator {
             traces: self.traces.load(Ordering::Relaxed),
             lowerings: self.lowerings.load(Ordering::Relaxed),
             compilation_requests: self.compilation_requests.load(Ordering::Relaxed),
-            dispatch_key_duration: Duration::from_nanos(self.dispatch_key_nanoseconds.load(Ordering::Relaxed)),
-            dispatch_duration: Duration::from_nanos(self.dispatch_nanoseconds.load(Ordering::Relaxed)),
+            dispatch_preparation_duration: Duration::from_nanos(
+                self.dispatch_preparation_nanoseconds.load(Ordering::Relaxed),
+            ),
+            dispatch_lookup_duration: Duration::from_nanos(self.dispatch_lookup_nanoseconds.load(Ordering::Relaxed)),
             tracing_duration: Duration::from_nanos(self.tracing_nanoseconds.load(Ordering::Relaxed)),
             lowering_duration: Duration::from_nanos(self.lowering_nanoseconds.load(Ordering::Relaxed)),
         }
@@ -1667,8 +1671,8 @@ impl DispatcherStatisticsAccumulator {
         self.traces.store(0, Ordering::Relaxed);
         self.lowerings.store(0, Ordering::Relaxed);
         self.compilation_requests.store(0, Ordering::Relaxed);
-        self.dispatch_key_nanoseconds.store(0, Ordering::Relaxed);
-        self.dispatch_nanoseconds.store(0, Ordering::Relaxed);
+        self.dispatch_preparation_nanoseconds.store(0, Ordering::Relaxed);
+        self.dispatch_lookup_nanoseconds.store(0, Ordering::Relaxed);
         self.tracing_nanoseconds.store(0, Ordering::Relaxed);
         self.lowering_nanoseconds.store(0, Ordering::Relaxed);
     }
@@ -1681,6 +1685,8 @@ pub(super) fn accumulate_duration(duration: Duration, counter: &AtomicU64) {
         .try_update(Ordering::Relaxed, Ordering::Relaxed, |total| Some(total.saturating_add(nanoseconds)))
         .unwrap();
 }
+
+// TODO(eaplatanios): Review from here onwards.
 
 #[cfg(test)]
 pub(crate) mod tests {
