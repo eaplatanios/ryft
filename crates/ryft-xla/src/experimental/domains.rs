@@ -4038,7 +4038,7 @@ impl<'c> XlaDomain<'c> {
     ) -> Result<(Vec<XlaValue<'c>>, ExecutionFence), XlaDomainError> {
         if program.requires_stateful_call() {
             return Err(XlaDomainError::UnsupportedReferenceAbi {
-                reason: "external reference state requires `call_statefully`".to_string(),
+                reason: "external reference state requires `execute_statefully`".to_string(),
             });
         }
         check_count!("input", inputs, program.input_types.len(), ProgramError);
@@ -10553,7 +10553,7 @@ mod tests {
             for _ in 0..2 {
                 // Both launches use the same bounded executable. The second also proves that replay does not
                 // accidentally specialize or recompile the program for the concrete logical size.
-                let output = compiled.executable_function().call(&domain, XlaValue::Array(input.clone())).unwrap();
+                let output = compiled.executable_function().execute(&domain, XlaValue::Array(input.clone())).unwrap();
                 let XlaValue::Array(output) = output else {
                     panic!("array-only compiled function returned a first-class dimension");
                 };
@@ -10878,7 +10878,7 @@ mod tests {
             values_to_bytes::<f32>(&values).as_slice(),
         )
         .unwrap();
-        let array = compiled.executable_function().call(&engine, XlaValue::Array(source)).unwrap();
+        let array = compiled.executable_function().execute(&engine, XlaValue::Array(source)).unwrap();
         let XlaValue::Array(array) = array else {
             panic!("array-only compiled function returned a first-class dimension");
         };
@@ -10970,7 +10970,7 @@ mod tests {
         );
 
         let input = XlaArray::from_host_buffer(&domain, input_type, mesh, []).unwrap();
-        let output = compiled.executable_function().call(&domain, XlaValue::Array(input)).unwrap();
+        let output = compiled.executable_function().execute(&domain, XlaValue::Array(input)).unwrap();
         let XlaValue::Array(output) = output else {
             panic!("array-only compiled function returned a first-class dimension");
         };
@@ -11019,7 +11019,7 @@ mod tests {
 
         let (zero_output, value_output) = compiled
             .executable_function()
-            .call(&domain, (XlaValue::Array(value), XlaValue::Array(zero)))
+            .execute(&domain, (XlaValue::Array(value), XlaValue::Array(zero)))
             .unwrap();
         let XlaValue::Array(zero_output) = zero_output else {
             panic!("array-only compiled function returned a first-class dimension");
@@ -11123,7 +11123,7 @@ mod tests {
                 values_to_bytes(values.as_slice()).as_slice(),
             )
             .unwrap();
-            let output = compiled.executable_function().call(&domain, XlaValue::Array(input)).unwrap();
+            let output = compiled.executable_function().execute(&domain, XlaValue::Array(input)).unwrap();
             let XlaValue::Array(output) = output else {
                 panic!("array-only compiled function returned a first-class dimension");
             };
@@ -11520,7 +11520,7 @@ mod tests {
                 values_to_bytes(values.as_slice()).as_slice(),
             )
             .unwrap();
-            let output = compiled.executable_function().call(&domain, XlaValue::Array(input)).unwrap();
+            let output = compiled.executable_function().execute(&domain, XlaValue::Array(input)).unwrap();
             let XlaValue::Array(output) = output else {
                 panic!("array-only compiled function returned a first-class dimension");
             };
@@ -11876,7 +11876,7 @@ mod tests {
         )
         .unwrap();
         let call = || {
-            let output = compiled.executable_function().call(&domain, XlaValue::Array(input.clone())).unwrap();
+            let output = compiled.executable_function().execute(&domain, XlaValue::Array(input.clone())).unwrap();
             let XlaValue::Array(output) = output else {
                 panic!("array-only compiled function returned a first-class dimension");
             };

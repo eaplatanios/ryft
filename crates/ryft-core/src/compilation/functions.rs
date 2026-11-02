@@ -669,13 +669,11 @@ impl<C: CompilationDomain, Input: Parameterized<C::Type>, Output: Parameterized<
         &self.state.output_structure
     }
 
-    // TODO(eaplatanios): Review from here onwards.
-
     /// Executes this function on the structured runtime `inputs` through `domain` and returns its structured outputs.
-    ///
-    /// Functions that bind external mutable references must be executed through [`Self::call_statefully`] or
-    /// [`Self::call_statefully_async`] instead.
-    pub fn call(&self, domain: &C, inputs: Input::To<C::Value>) -> Result<Output::To<C::Value>, C::Error>
+    /// Backend output values may still represent pending execution. Functions that bind external mutable references
+    /// must use [`Self::execute_statefully`] or [`Self::execute_statefully_and_wait`].
+    #[inline]
+    pub fn execute(&self, domain: &C, inputs: Input::To<C::Value>) -> Result<Output::To<C::Value>, C::Error>
     where
         Input::Family: ParameterizedFamily<C::Value>,
         Input::To<C::Value>: Parameterized<C::Value>,
@@ -688,12 +686,12 @@ impl<C: CompilationDomain, Input: Parameterized<C::Type>, Output: Parameterized<
         self.reconstruct_outputs(outputs).map_err(C::Error::from)
     }
 
-    /// Executes this function on the structured runtime `inputs` through the stateful `domain` and returns a result
-    /// that carries the completion of the whole invocation.
-    ///
-    /// The returned completion owns error observation but not cancellation. The semantics of submission and of the
-    /// publication of reference state are defined by [`StatefulCompilationDomain::execute_statefully`].
-    pub fn call_statefully_async(
+    /// Submits this function on structured runtime `inputs` through the stateful `domain` and returns a
+    /// [`StatefulExecution`] tracking completion of the whole invocation. Submission happens before this function
+    /// returns. Await the result to observe execution failures. Dropping it does not cancel submitted work. Reference
+    /// state publication follows [`StatefulCompilationDomain::execute_statefully`].
+    #[inline]
+    pub fn execute_statefully(
         &self,
         domain: &C,
         inputs: Input::To<C::Value>,
@@ -716,8 +714,13 @@ impl<C: CompilationDomain, Input: Parameterized<C::Type>, Output: Parameterized<
     }
 
     /// Executes this function on the structured runtime `inputs` through the stateful `domain` and waits for the whole
-    /// invocation to complete, which makes it the blocking form of [`Self::call_statefully_async`].
-    pub fn call_statefully(&self, domain: &C, inputs: Input::To<C::Value>) -> Result<Output::To<C::Value>, C::Error>
+    /// invocation to complete. This is the blocking convenience form of [`Self::execute_statefully`].
+    #[inline]
+    pub fn execute_statefully_and_wait(
+        &self,
+        domain: &C,
+        inputs: Input::To<C::Value>,
+    ) -> Result<Output::To<C::Value>, C::Error>
     where
         C: StatefulCompilationDomain,
         Input::Family: ParameterizedFamily<C::Value>,
@@ -726,8 +729,10 @@ impl<C: CompilationDomain, Input: Parameterized<C::Type>, Output: Parameterized<
         Output::To<C::Value>:
             Parameterized<C::Value, Family = Output::Family, ParameterStructure = Output::ParameterStructure>,
     {
-        self.call_statefully_async(domain, inputs).r#await()
+        self.execute_statefully(domain, inputs).r#await()
     }
+
+    // TODO(eaplatanios): Review from here onwards.
 
     /// Validates that `inputs` matches the declared flat public input arity, excluding hidden captures.
     pub fn validate_flat_input_count(&self, inputs: &[C::Value]) -> Result<(), ProgramError> {
@@ -1208,7 +1213,7 @@ where
             StagingContext<Type = C::Type, Constant = C::Constant, Operation = C::Operation>,
     {
         let (domain, executable) = self.specialization(static_parameters, &inputs)?;
-        executable.call(domain, inputs)
+        executable.execute(domain, inputs)
     }
 
     /// Calls this dispatcher through its domain's completion-bearing stateful execution capability.
@@ -1243,13 +1248,13 @@ where
             Ok(specialization) => specialization,
             Err(error) => return StatefulExecution::ready(Err(error)),
         };
-        executable.call_statefully_async(domain, inputs)
+        executable.execute_statefully(domain, inputs)
     }
 
     /// Calls this dispatcher statefully and waits for whole-invocation completion.
     ///
-    /// This routes through [`ExecutableFunction::call_statefully`], so it reports asynchronous execution errors
-    /// before returning and does not weaken the domain's reference sequencing contract.
+    /// This routes through [`ExecutableFunction::execute_statefully_and_wait`], preserving the domain's reference
+    /// sequencing and reporting asynchronous execution errors before returning.
     pub fn call_statefully(
         &self,
         static_parameters: Static,
@@ -1275,7 +1280,7 @@ where
             StagingContext<Type = C::Type, Constant = C::Constant, Operation = C::Operation>,
     {
         let (domain, executable) = self.specialization(static_parameters, &inputs)?;
-        executable.call_statefully(domain, inputs)
+        executable.execute_statefully_and_wait(domain, inputs)
     }
 
     /// Acquires or produces the executable specialization for one runtime input signature and returns it together with
@@ -2165,7 +2170,7 @@ pub(crate) mod tests {
         );
         let executable = staged.lower(&domain).unwrap().compile(&domain).unwrap().into_executable_function();
         assert_eq!(
-            executable.call(&domain, (vec![Vec::new(), Vec::new()], Array::scalar(3.0).unwrap())).unwrap(),
+            executable.execute(&domain, (vec![Vec::new(), Vec::new()], Array::scalar(3.0).unwrap())).unwrap(),
             (vec![Vec::new(), Vec::new(), Vec::new()], Array::scalar(3.0).unwrap()),
         );
     }
@@ -2188,11 +2193,11 @@ pub(crate) mod tests {
         let second = staged.lower(&domain).unwrap().compile(&domain).unwrap();
 
         assert_eq!(
-            first.executable_function().call(&domain, Array::scalar(2.0).unwrap()).unwrap(),
+            first.executable_function().execute(&domain, Array::scalar(2.0).unwrap()).unwrap(),
             Array::scalar(-2.0).unwrap()
         );
         assert_eq!(
-            second.executable_function().call(&domain, Array::scalar(4.0).unwrap()).unwrap(),
+            second.executable_function().execute(&domain, Array::scalar(4.0).unwrap()).unwrap(),
             Array::scalar(-4.0).unwrap()
         );
         assert_eq!(domain.compilation_count(), 1);
@@ -2214,8 +2219,8 @@ pub(crate) mod tests {
 
         // The replacement runs the new program with the retained signature, while the original function is unaffected.
         assert_eq!(replaced.input_types(), identity.input_types());
-        assert_eq!(replaced.call(&domain, Array::scalar(3.0).unwrap()).unwrap(), Array::scalar(-3.0).unwrap());
-        assert_eq!(identity.call(&domain, Array::scalar(3.0).unwrap()).unwrap(), Array::scalar(3.0).unwrap());
+        assert_eq!(replaced.execute(&domain, Array::scalar(3.0).unwrap()).unwrap(), Array::scalar(-3.0).unwrap());
+        assert_eq!(identity.execute(&domain, Array::scalar(3.0).unwrap()).unwrap(), Array::scalar(3.0).unwrap());
     }
 
     #[test]
@@ -2230,9 +2235,9 @@ pub(crate) mod tests {
         let first_domain = domain.clone();
         let second_domain = domain.clone();
         let first_thread =
-            std::thread::spawn(move || executable.call(&first_domain, Array::scalar(3.0).unwrap()).unwrap());
+            std::thread::spawn(move || executable.execute(&first_domain, Array::scalar(3.0).unwrap()).unwrap());
         let second_thread =
-            std::thread::spawn(move || second.call(&second_domain, Array::scalar(4.0).unwrap()).unwrap());
+            std::thread::spawn(move || second.execute(&second_domain, Array::scalar(4.0).unwrap()).unwrap());
 
         assert_eq!(first_thread.join().unwrap(), Array::scalar(-3.0).unwrap());
         assert_eq!(second_thread.join().unwrap(), Array::scalar(-4.0).unwrap());
@@ -2250,7 +2255,7 @@ pub(crate) mod tests {
         .unwrap();
         let compiled = staged.lower(&domain).unwrap().compile(&domain).unwrap();
 
-        assert_eq!(compiled.executable_function().call(&domain, ()).unwrap(), Array::scalar(7.0).unwrap());
+        assert_eq!(compiled.executable_function().execute(&domain, ()).unwrap(), Array::scalar(7.0).unwrap());
         assert_eq!(compiled.source_program().captures(), &[Array::scalar(7.0).unwrap()]);
         assert!(compiled.staged().input_types().is_empty());
         assert_eq!(compiled.lowered().output_types(), &[ArrayType::scalar(DataType::F64)]);
@@ -2294,7 +2299,7 @@ pub(crate) mod tests {
         assert_eq!(executable.captures(), &[Array::scalar(7.0).unwrap()]);
         assert!(executable.input_types().is_empty());
         assert_eq!(executable.output_types(), &[ArrayType::scalar(DataType::F64)]);
-        assert_eq!(executable.call(&domain, ()).unwrap(), Array::scalar(7.0).unwrap());
+        assert_eq!(executable.execute(&domain, ()).unwrap(), Array::scalar(7.0).unwrap());
         assert_eq!(executable.validate_flat_input_count(&[]), Ok(()));
         assert_eq!(
             executable.validate_flat_input_count(&[Array::scalar(1.0).unwrap()]),

@@ -1160,7 +1160,13 @@ impl BlockScaleFormat {
 
     /// Validates this format against the requirements of block quantization that do not depend on input shapes.
     fn validate(&self, name: &str) -> Result<(), ProgramError> {
-        BlockElementFormat::new(self.element_type)?;
+        if BlockElementFormat::new(self.element_type).is_err() {
+            return Err(TypeError::invalid(format!(
+                "`block_scaled_dot` {name} format does not support element data type `{}`",
+                self.element_type,
+            ))
+            .into());
+        }
         if !matches!(self.scale_type, DataType::F8E4M3FN | DataType::F8E8M0FNU) {
             return Err(TypeError::invalid(format!(
                 "`block_scaled_dot` {name} format does not support scale data type `{}`",
@@ -1184,9 +1190,10 @@ impl BlockScaleFormat {
 pub enum BlockScaledGlobalScaling {
     /// Global scales are optional inputs of [`BlockScaledDot::call`], and absent ones are `1`. This matches the
     /// `global_scale` of the JAX `BlockScaleConfig`, whose default is `1`. Absent scales suit inputs whose block
-    /// maxima lie roughly within `[6 · 2^-9, 6 · 448]`. In particular, quantized NVFP4 backward contractions usually
-    /// need a gradient global scale (or [current](Self::Current) scaling), because gradients are often much smaller
-    /// and the smallest block scale flushes them to zero.
+    /// maxima lie roughly within `[element_max · 2^-9, element_max · 448]` (e.g., `[6 · 2^-9, 6 · 448]` for NVFP4),
+    /// where `element_max` is the largest finite magnitude of the element type. In particular, quantized NVFP4
+    /// backward contractions usually need a gradient global scale (or [current](Self::Current) scaling), because
+    /// gradients are often much smaller and the smallest block scale flushes them to zero.
     #[default]
     Provided,
 
@@ -1205,7 +1212,7 @@ pub struct BlockScaledDotConfiguration {
     /// Contracting and batching dimension specification.
     dimensions: DotDimensionNumbers,
 
-    /// Data type of the output, which is also the accumulation type of non-NVFP4 contractions.
+    /// Data type of the output (refer to [`Self::with_accumulation_type`]).
     accumulation_type: DataType,
 
     /// Format of the left input.
@@ -1281,8 +1288,9 @@ impl BlockScaledDotConfiguration {
     }
 
     /// Returns this configuration with the provided output data type, which must be one of `bf16`, `f16`, `f32`, and
-    /// `f64`. NVFP4 contractions accumulate at `f32` and convert to it, while other contractions accumulate at it, as
-    /// in JAX.
+    /// `f64`. Forward contractions accumulate at it when it is `bf16`, `f32`, or `f64` and the left format has no
+    /// global scale. Otherwise, as for NVFP4, they accumulate at the compute type (i.e., `f64` when either input is
+    /// `f64`, and `f32` otherwise) and convert to it. JAX accumulates at the output type and rejects `f64` outputs.
     #[inline]
     pub fn with_accumulation_type(mut self, accumulation_type: DataType) -> Self {
         self.accumulation_type = accumulation_type;
@@ -1475,8 +1483,10 @@ pub struct BlockScaledDotInputs<P: Parameter> {
     /// [`BlockScaledGlobalScaling::Provided`]).
     pub gradient_global_scale: Option<P>,
 
-    /// Random generator state (refer to [`Random`]) that seeds stochastic gradient rounding, which
-    /// must be present exactly when [`BlockScaledDotConfiguration::stochastic_gradient_rounding`] is enabled.
+    /// Random generator state (refer to [`Random`]) that seeds stochastic gradient rounding, which must be present
+    /// exactly when [`BlockScaledDotConfiguration::stochastic_gradient_rounding`] is enabled. The call does not return
+    /// an advanced state, so every call needs a fresh state (e.g., split from the caller's generator), or it repeats
+    /// the same rounding noise.
     pub random_state: Option<P>,
 }
 
@@ -1593,13 +1603,16 @@ where
     /// [`Dot`] output.
     ///
     /// The left and right inputs must be real floating-point arrays with static shapes and the extents that the
-    /// dimension numbers require. They are quantized at `f64` when either is `f64`, and at `f32` otherwise. The
-    /// product of the contracting extents must be a positive multiple of the block sizes of both input formats, and
-    /// tiled right scales additionally require that of the free extents of the right input. Quantized backward
-    /// contractions block the products of the free extents of both inputs, so differentiation requires each of them
-    /// to be a multiple of the gradient format's block size and of the block size of its own input's format (and of
-    /// `16` for Hadamard transforms of the left free extents). Global scales must be rank-0 real floating-point arrays that are only
-    /// present for formats with global scales under [`BlockScaledGlobalScaling::Provided`].
+    /// dimension numbers require. They are quantized at `f64` when either is `f64`, and at `f32` otherwise, whereas
+    /// JAX always quantizes at `f32`. The product of the contracting extents must be a positive multiple of the block
+    /// sizes of both input formats, and tiled right scales additionally require that of the free extents of the right
+    /// input. Quantized backward contractions block the products of the free extents of both inputs, so
+    /// differentiation requires each of them to be a multiple of the gradient format's block size and of the block
+    /// size of its own input's format (and of `16` for Hadamard transforms of the left free extents). Global scales
+    /// must be rank-0 real floating-point arrays that are only present for formats with global scales under
+    /// [`BlockScaledGlobalScaling::Provided`], and a gradient global scale additionally requires quantized backward
+    /// contractions. A random generator state must be present exactly when stochastic gradient rounding is enabled
+    /// and must have a generator state type (refer to [`RandomAlgorithm::from_state_type`]).
     ///
     /// # Errors
     ///
@@ -3231,8 +3244,8 @@ mod tests {
         assert_eq!(scales.to_f64s(), vec![1.0]);
         assert_eq!(elements.to_f64s(), vec![57344.0, 0.0, 0.0, 0.0]);
 
-        // Stratified noise over ten rows makes the column sums of the rounded values exactly ten times the inputs, which
-        // shows that rounding is unbiased at both `f64` and `f32`. Zero never rounds away from zero.
+        // Stratified noise over ten rows makes the column sums of the rounded values exactly ten times the inputs,
+        // which shows that rounding is unbiased at both `f64` and `f32`. Zero never rounds away from zero.
         let input = Array::from_elements::<f64>(
             ArrayType::new_static(DataType::F64, [10, 8]),
             &(0..10).flat_map(|_| [6.0, 1.3, -1.3, 0.2, 0.0, -6.0, 2.5, 0.75]).collect::<Vec<_>>(),
@@ -5451,7 +5464,7 @@ mod tests {
                 DataType::F8E4M3FN,
             ))),
             Err(error) if error == ProgramError::from(TypeError::invalid(
-                "`block_quantize` does not support element data type `f16`",
+                "`block_scaled_dot` left format does not support element data type `f16`",
             )),
         ));
         assert!(matches!(

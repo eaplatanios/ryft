@@ -22,7 +22,7 @@ use crate::tracing::DomainTracingContext;
 ///   3. [`Self::compile`] compiles a [`Self::LoweredProgram`] into a [`Self::CompiledProgram`], typically
 ///      through [`LoweredFunction::compile`](crate::LoweredFunction::compile).
 ///   4. [`Self::execute`] executes a [`Self::CompiledProgram`] on flat runtime inputs, typically through
-///      [`ExecutableFunction::call`].
+///      [`ExecutableFunction::execute`].
 ///
 /// Core owns staging and everything that depends on the structured input and output types of a function. It traces
 /// closures, lifts runtime captures into leading program inputs, checks input counts and compiled output types, and
@@ -86,7 +86,7 @@ pub trait CompilationDomain: Domain<Constant: CaptureConstant> + Clone {
     ) -> Result<(Arc<Self::CompiledProgram>, Vec<Self::Type>), Self::Error>;
 
     /// Executes a compiled program on flat runtime `inputs` and returns its flat outputs. Callers typically use
-    /// [`ExecutableFunction::call`] rather than calling this function directly. The backend retains any declaration
+    /// [`ExecutableFunction::execute`] rather than calling this function directly. The backend retains any declaration
     /// metadata it needs in [`Self::CompiledProgram`] and validates inputs according to its execution contract.
     ///
     /// # Parameters
@@ -107,8 +107,8 @@ pub trait CompilationDomain: Domain<Constant: CaptureConstant> + Clone {
 pub trait StatefulCompilationDomain: CompilationDomain {
     /// Executes a compiled program that binds external mutable references and returns its flat outputs together with
     /// the completion of the whole invocation, _without_ waiting for that completion. The parameters are the same as
-    /// for [`CompilationDomain::execute`]. Callers use [`ExecutableFunction::call_statefully_async`] rather than
-    /// calling this function directly.
+    /// for [`CompilationDomain::execute`]. Callers use [`ExecutableFunction::execute_statefully`] rather than calling
+    /// this function directly.
     fn execute_statefully(
         &self,
         program: &Self::CompiledProgram,
@@ -473,11 +473,11 @@ mod tests {
         let identity = compile_from_one_call_site(&domain, false);
         let negate = compile_from_one_call_site(&domain, true);
         assert_eq!(
-            identity.executable_function().call(&domain, Array::scalar(3.0).unwrap()),
+            identity.executable_function().execute(&domain, Array::scalar(3.0).unwrap()),
             Ok(Array::scalar(3.0).unwrap())
         );
         assert_eq!(
-            negate.executable_function().call(&domain, Array::scalar(3.0).unwrap()),
+            negate.executable_function().execute(&domain, Array::scalar(3.0).unwrap()),
             Ok(Array::scalar(-3.0).unwrap())
         );
         assert_eq!(domain.compilation_count(), 2);
@@ -559,7 +559,7 @@ mod tests {
         // The staged function runs on fresh tracers and is compiled through the domain recovered from its inputs.
         assert_eq!(domain.compilation_count(), 0);
         let compiled = staged.lower(&domain).unwrap().compile(&domain).unwrap();
-        assert_eq!(compiled.executable_function().call(&domain, domain.scalar(3.0)), Ok(domain.scalar(-3.0)));
+        assert_eq!(compiled.executable_function().execute(&domain, domain.scalar(3.0)), Ok(domain.scalar(-3.0)));
         assert_eq!(domain.compilation_count(), 1);
     }
 

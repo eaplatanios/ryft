@@ -1401,7 +1401,7 @@ pub(crate) mod tests {
             .collect::<Vec<_>>();
         compiled
             .executable_function()
-            .call(&domain, inputs)
+            .execute(&domain, inputs)
             .unwrap()
             .into_iter()
             .map(|value| {

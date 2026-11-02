@@ -596,7 +596,7 @@ where
         domain: &XlaDomain<'c>,
         inputs: In::To<XlaStatefulValue<'c>>,
     ) -> Result<Out::To<XlaStatefulValue<'c>>, XlaDomainError> {
-        self.function.executable_function().call_statefully(domain, inputs)
+        self.function.executable_function().execute_statefully_and_wait(domain, inputs)
     }
 
     /// Submits a stateful call and returns its non-cancelling completion-bearing result.
@@ -608,7 +608,7 @@ where
         domain: &XlaDomain<'c>,
         inputs: In::To<XlaStatefulValue<'c>>,
     ) -> StatefulExecution<Out::To<XlaStatefulValue<'c>>, XlaDomainError> {
-        self.function.executable_function().call_statefully_async(domain, inputs)
+        self.function.executable_function().execute_statefully(domain, inputs)
     }
 
     /// Returns the public flat output types, excluding the hidden final-state output suffix that reference
@@ -866,7 +866,7 @@ impl<'c> XlaDomain<'c> {
             Parameterized<XlaArray<'c>, Family = Out::Family, ParameterStructure = Out::ParameterStructure>,
     {
         let inputs = lift_arrays::<In>(inputs)?;
-        project_arrays::<Out>(executable.function.call(self, inputs)?)
+        project_arrays::<Out>(executable.function.execute(self, inputs)?)
     }
 
     /// Enqueues an XLA runtime program and retains whole-execution completion, including for zero-output calls.
@@ -897,7 +897,7 @@ impl<'c> XlaDomain<'c> {
     {
         if executable.function.compiled_program().requires_stateful_call() {
             return Err(XlaDomainError::UnsupportedReferenceAbi {
-                reason: "external reference state requires `call_statefully`".to_string(),
+                reason: "external reference state requires `execute_statefully`".to_string(),
             });
         }
         let flat_inputs = lift_arrays::<In>(inputs)?.into_parameters().collect::<Vec<_>>();
@@ -2694,12 +2694,12 @@ mod tests {
             XlaArray::from_host_buffer(&domain, array_type.clone(), mesh.clone(), 2.0f32.to_ne_bytes().as_slice())
                 .unwrap();
         assert!(matches!(
-            compiled.executable_function().call(&domain, (
+            compiled.executable_function().execute(&domain, (
                     XlaValue::Reference(XlaReference::new(reference.clone(), domain.clone())),
                     XlaValue::Array(rejected_update),
                 )),
             Err(XlaDomainError::UnsupportedReferenceAbi { reason })
-                if reason == "external reference state requires `call_statefully`",
+                if reason == "external reference state requires `execute_statefully`",
         ));
         assert_eq!(read_f32_array(&client, &reference.read().unwrap()), vec![1.0]);
 
@@ -3180,7 +3180,7 @@ mod tests {
             XlaArray::from_host_buffer(&domain, array_type, mesh, 1f32.to_ne_bytes().as_slice()).unwrap(),
         );
         let (XlaValue::Array(typed), XlaValue::Array(flat)) =
-            compiled.executable_function().call(&domain, input).unwrap()
+            compiled.executable_function().execute(&domain, input).unwrap()
         else {
             panic!("capture-only calls must return arrays");
         };
@@ -3400,7 +3400,7 @@ mod tests {
         assert!(matches!(
             domain.interpret_async(&executable, input),
             Err(XlaDomainError::UnsupportedReferenceAbi { reason })
-                if reason == "external reference state requires `call_statefully`",
+                if reason == "external reference state requires `execute_statefully`",
         ));
     }
 

@@ -1413,7 +1413,7 @@ mod cutile {
             arrays[1] = arrays[0].clone();
         }
         let original = arrays[0].clone();
-        let results = executable.call(&runtime, arrays.into_iter().map(XlaValue::Array).collect())?;
+        let results = executable.execute(&runtime, arrays.into_iter().map(XlaValue::Array).collect())?;
         let XlaValue::Array(result) = &results[0] else { panic!("kernel output must be an array") };
         let bytes =
             result.device_shard(device.id().unwrap()).unwrap().buffer().unwrap().copy_to_host(None)?.r#await()?;
@@ -1774,7 +1774,7 @@ mod tuning {
                     .executable
                     .as_ref()
                     .unwrap()
-                    .call_statefully(&self.domain, self.inputs.clone())
+                    .execute_statefully_and_wait(&self.domain, self.inputs.clone())
                     .map_err(error)?;
                 let XlaValue::Array(output) = &outputs[0] else {
                     return Err(KernelTuningError::Invalid { message: "expected an ordinary array output".into() });
@@ -2338,7 +2338,7 @@ mod triton {
             })
             .collect::<Vec<_>>();
         for _ in 0..3 {
-            let outputs = executable.call(&runtime, inputs.iter().cloned().map(XlaValue::Array).collect()).unwrap();
+            let outputs = executable.execute(&runtime, inputs.iter().cloned().map(XlaValue::Array).collect()).unwrap();
             let XlaValue::Array(output) = &outputs[0] else { panic!("expected array output") };
             let bytes = output
                 .device_shard(device.id().unwrap())

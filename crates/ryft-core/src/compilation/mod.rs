@@ -47,10 +47,10 @@
 //!     host parameters, the dynamic input's parameter structure, and the domain's runtime-derived dispatch key. Its
 //!     first call for a specialization stages, lowers, and requests compilation; warm calls dispatch directly to the
 //!     retained executable.
-//!   - Execute an [`ExecutableFunction`] through [`ExecutableFunction::call`]. Domains with transactional
+//!   - Execute an [`ExecutableFunction`] through [`ExecutableFunction::execute`]. Domains with transactional
 //!     external state implement [`StatefulCompilationDomain`], and their executable functions are invoked through
-//!     [`ExecutableFunction::call_statefully`] or [`ExecutableFunction::call_statefully_async`] instead. Retained
-//!     dispatchers expose the same functions (e.g., [`CompiledFunctionDispatcher::call_statefully`]).
+//!     [`ExecutableFunction::execute_statefully`] or [`ExecutableFunction::execute_statefully_and_wait`]. Retained
+//!     dispatchers expose corresponding invocation functions (e.g., [`CompiledFunctionDispatcher::call_statefully`]).
 //!
 //! Backend-facing crates normally wrap these generic entry points with value- and option-specific APIs.
 //! New backend-neutral code can call them directly.
@@ -82,8 +82,8 @@
 //!   2. [`LoweredFunction`] owns the backend's [`CompilationDomain::LoweredProgram`], the source handle, and the
 //!      options used to lower it. Compilation computes the domain's exact key and consults its [`CompilationContext`].
 //!   3. [`CompiledFunction`] combines the executable with the staged and lowered metadata required for inspection and
-//!      transformations. Pure runtime execution uses [`ExecutableFunction::call`]; transactional external state uses
-//!      [`ExecutableFunction::call_statefully_async`].
+//!      transformations. Pure runtime execution uses [`ExecutableFunction::execute`]; transactional external state uses
+//!      [`ExecutableFunction::execute_statefully`].
 //!   4. [`ExecutableFunction`] retains only the executable, captures, signatures, and output structure. Use
 //!      [`CompiledFunction::into_executable_function`] when transform metadata is no longer needed. This runtime-only
 //!      handle gains [`Send`] and [`Sync`] structurally whenever its backend fields do.
@@ -154,7 +154,7 @@
 //! before staging (e.g., in [`CompilationDomain::dispatch_signature`]) and options that change output types during
 //! lowering. [`CompilationDomain`] contains only backend hooks, with no generic functions, over flat programs, types,
 //! and values. Core owns everything that depends on structured signatures. [`StagedFunction::stage`] preserves the
-//! container structures. [`StagedFunction::lower`], [`LoweredFunction::compile`], and [`ExecutableFunction::call`]
+//! container structures. [`StagedFunction::lower`], [`LoweredFunction::compile`], and [`ExecutableFunction::execute`]
 //! carry the typed metadata through lowering, check input counts and compiled output types, call the backend, and
 //! reconstruct structured outputs. [`StagedProgram::lifted_program`] supplies the shared flat capture-lifting step.
 
