@@ -307,6 +307,29 @@ where
         self.state.program.options()
     }
 
+    /// Returns the source program with its runtime captures lifted into leading flat inputs, in the `[captures...,
+    /// public inputs...]` order that compiled executables are invoked with. Backends lower this program rather than the
+    /// [`ClosedProgram`] returned by [`Self::source_program`], and use the capture count of the source program to tell
+    /// lifted captures apart from public inputs. The source program itself has a flat boundary, while this function
+    /// retains its exact container structures separately.
+    ///
+    /// The program is derived once and then cached on the shared staged state, so repeated calls, including calls on
+    /// clones of this function, return the same [`Arc`].
+    ///
+    /// # Errors
+    ///
+    /// Returns a [`ProgramError`] if rebuilding the source program with explicit capture inputs fails.
+    #[inline]
+    pub fn lifted_program(&self) -> Result<Arc<FlatProgram<C>>, ProgramError> {
+        self.state.program.lifted_program()
+    }
+
+    /// Lowers this function into a [`LoweredFunction`] through `domain` (refer to [`CompilationDomain::lower`]).
+    pub fn lower(&self, domain: &C) -> Result<LoweredFunction<C, Input, Output>, C::Error> {
+        let (lowered_program, output_types) = domain.lower(self.staged_program())?;
+        Ok(LoweredFunction { program: Arc::new(lowered_program), staged: self.clone(), output_types })
+    }
+
     // TODO(eaplatanios): Review from here onwards.
 
     /// Stages a call to this function into the active context recovered from `inputs`.
@@ -432,8 +455,8 @@ where
         context.bind(operation, AttachedRegions::Callees(&[callee]), flat_inputs.as_slice())
     }
 
-    /// Returns the lifted program of this function (refer to [`Self::lifted_program`]) for embedding as the callee of
-    /// a nested call. Reference discharge cannot publish a reference that a callee allocates itself, because the caller
+    /// Returns the lifted program of this function (i.e., [`Self::lifted_program`]) for embedding as the callee of a
+    /// nested call. Reference discharge cannot publish a reference that a callee allocates itself, because the caller
     /// has no allocation that could receive it, so this function rejects such outputs here with a diagnostic that
     /// names the offending output. Outputs that forward a reference received as an input or capture remain allowed.
     fn callee_program(&self) -> Result<Arc<FlatProgram<C>>, ProgramError> {
@@ -456,28 +479,6 @@ where
             }
         }
         Ok(callee)
-    }
-
-    /// Returns the source program with its runtime captures lifted into leading flat inputs, in the
-    /// `[captures..., public inputs...]` order that compiled executables are invoked with. Backends lower this program
-    /// rather than the [`ClosedProgram`] returned by [`Self::source_program`], and use the capture count of the source
-    /// program to tell lifted captures apart from public inputs. The source program itself has a flat boundary, while
-    /// this function retains its exact container structures separately.
-    ///
-    /// The program is derived once and then cached on the shared staged state, so repeated calls, including calls on
-    /// clones of this function, return the same [`Arc`].
-    ///
-    /// # Errors
-    ///
-    /// Returns a [`ProgramError`] if rebuilding the source program with explicit capture inputs fails.
-    pub fn lifted_program(&self) -> Result<Arc<FlatProgram<C>>, ProgramError> {
-        self.state.program.lifted_program()
-    }
-
-    /// Lowers this function into a [`LoweredFunction`] through `domain` (refer to [`CompilationDomain::lower`]).
-    pub fn lower(&self, domain: &C) -> Result<LoweredFunction<C, Input, Output>, C::Error> {
-        let (lowered_program, output_types) = domain.lower(self.staged_program())?;
-        Ok(LoweredFunction { program: Arc::new(lowered_program), staged: self.clone(), output_types })
     }
 }
 
