@@ -12,20 +12,18 @@ use crate::parameters::{Parameterized, ParameterizedFamily};
 use crate::programs::{ProgramError, Typed, validate_reference_boundary};
 use crate::tracing::{DomainTracingContext, Tracer};
 
-// TODO(eaplatanios): Review from here onwards.
-
 /// [`CompilationDomain`]s are [`Domain`]s that support lowering, compiling, and executing staged programs.
 /// Compilation is deliberately split into four phases:
 ///
 ///   1. [`Self::stage`] traces a closure into a [`StagedFunction`] that retains the options for the later phases.
 ///   2. [`Self::lower`] lowers a staged function into a lowered function.
 ///   3. [`Self::compile`] compiles a lowered function into a compiled function.
-///   4. [`Self::call`] executes a compiled function on structured runtime inputs.
+///   4. [`Self::execute`] executes a compiled function on runtime inputs.
 ///
 /// The domain performs every phase, while staged, lowered, compiled, and executable functions remain passive values.
 /// Core owns everything that depends on the structured input and output types of a function. It traces closures,
 /// lifts runtime captures into leading program inputs, checks input counts and compiled output types, and reconstructs
-/// structured outputs. Backends implement [`Self::lower`], [`Self::compile`], and [`Self::call`] over flat programs,
+/// structured outputs. Backends implement [`Self::lower`], [`Self::compile`], and [`Self::execute`] over flat programs,
 /// types, and values, including any validation, caching, or runtime conversion that they choose to apply. Staging
 /// traces exactly the input types that it receives. Backends apply options that change input types before staging
 /// (e.g., in [`Self::dispatch_signature`] for retained dispatch), apply options that change output types during
@@ -51,24 +49,21 @@ pub trait CompilationDomain: Domain<Constant: CaptureConstant> + Clone {
     /// Derives the effective staged input types and their dispatch key from one runtime input signature. Most domains
     /// return the input types unchanged and use them as the key. Backends may instead apply a semantics preserving
     /// dispatch policy such as bounded shape bucketing. The returned key must compare equal exactly when the returned
-    /// effective types are interchangeable for tracing, lowering, compilation, and calls.
-    ///
-    /// The effective types are returned as a shared slice so that key construction on the hot path of retained dispatch
-    /// never clones the type vector deeply. Domains whose key embeds the effective types (e.g., exact dispatch) share
-    /// one allocation between the key and the returned signature, and the caller clones individual types only on a
-    /// specialization miss, when it prepares the staging request.
+    /// effective types are interchangeable for tracing, lowering, compilation, and calls. The effective types are
+    /// returned as a shared slice so that key construction on the hot path of retained dispatch never clones the type
+    /// vector deeply. Domains whose key embeds the effective types (e.g., exact dispatch) share one allocation between
+    /// the key and the returned signature, and the caller clones individual types only on a specialization miss, when
+    /// it prepares the staging request.
     fn dispatch_signature(
         &self,
         input_types: Vec<Self::Type>,
         options: &Self::Options,
     ) -> Result<(Self::DispatchKey, Arc<[Self::Type]>), Self::Error>;
 
-    /// Traces the fallible `function` into a staged function. `function` receives the symbolic references of
+    /// Traces the fallible `function` into a [`StagedFunction`]. `function` receives the symbolic references of
     /// `captures`, tracers for those captures, and tracers for inputs of `input_types`, and returns its traced outputs.
     /// This is the only staging primitive. It traces at exactly `input_types` and retains `options` in the returned
-    /// staged function for lowering and compilation.
-    ///
-    /// Backends must not override this function (refer to the [`CompilationDomain`] documentation for why).
+    /// [`StagedFunction`] for lowering and compilation.
     #[inline]
     fn stage<F, Input, Output>(
         &self,
@@ -102,15 +97,15 @@ pub trait CompilationDomain: Domain<Constant: CaptureConstant> + Clone {
         let context = DomainTracingContext::<Self, Self::Value>::new();
         let capture_table = context.captures().clone();
         let builder = context.builder().clone();
-        let capture_references =
+        let capture_constants =
             captures.into_iter().map(|capture| context.capture(capture)).collect::<Result<Vec<_>, _>>()?;
-        let capture_tracers = capture_references
+        let capture_tracers = capture_constants
             .iter()
             .cloned()
             .map(|capture| StagingContext::constant(&context, capture))
             .collect::<Vec<_>>();
         let inputs = input_types.map_parameters(|input_type| context.input(input_type)).map_err(ProgramError::from)?;
-        let outputs = function(capture_references, capture_tracers, inputs)?;
+        let outputs = function(capture_constants, capture_tracers, inputs)?;
         check_builders!(&builder, [outputs.parameters().map(|output| output.builder())])?;
         if let Some(error) = builder.borrow_mut().error.take() {
             return Err(error.into());
@@ -126,6 +121,8 @@ pub trait CompilationDomain: Domain<Constant: CaptureConstant> + Clone {
         let source_program = ClosedProgram::new(program, captures)?.without_unused_captures()?;
         Ok(StagedFunction::new(source_program, input_type_values, output_types, output_structure, options))
     }
+
+    // TODO(eaplatanios): Review from here onwards.
 
     /// Lowers the lifted program of a staged function into the program representation of this backend (i.e.,
     /// [`Self::LoweredProgram`]) and returns it together with its effective flat output types. Callers use
@@ -171,7 +168,7 @@ pub trait CompilationDomain: Domain<Constant: CaptureConstant> + Clone {
     ///   - `input_types`: Flat declared public input types of the compiled function, excluding captures.
     ///   - `arguments`: Runtime captures of the compiled function followed by exactly one public input per entry of
     ///     `input_types`, in the `[captures..., public inputs...]` order of lifted programs.
-    fn call(
+    fn execute(
         &self,
         program: &Self::CompiledProgram,
         input_types: &[Self::Type],
@@ -186,9 +183,9 @@ pub trait CompilationDomain: Domain<Constant: CaptureConstant> + Clone {
 pub trait StatefulCompilationDomain: CompilationDomain {
     /// Executes a compiled program that binds external mutable references and returns its flat outputs together with
     /// the completion of the whole invocation, without waiting for that completion. The parameters are the same as for
-    /// [`CompilationDomain::call`]. Callers use [`ExecutableFunction::call_statefully_async`] rather than calling this
-    /// function directly.
-    fn call_statefully_async(
+    /// [`CompilationDomain::execute`]. Callers use [`ExecutableFunction::call_statefully_async`] rather than calling
+    /// this function directly.
+    fn execute_statefully_async(
         &self,
         program: &Self::CompiledProgram,
         input_types: &[Self::Type],

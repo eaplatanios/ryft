@@ -759,7 +759,7 @@ where
     /// [`Self::call_statefully_async`] instead.
     pub fn call(&self, domain: &C, inputs: Input::To<C::Value>) -> Result<Output::To<C::Value>, C::Error> {
         let arguments = self.arguments(inputs)?;
-        let outputs = domain.call(self.compiled_program(), self.input_types(), arguments)?;
+        let outputs = domain.execute(self.compiled_program(), self.input_types(), arguments)?;
         self.reconstruct_outputs(outputs).map_err(C::Error::from)
     }
 
@@ -767,7 +767,7 @@ where
     /// that carries the completion of the whole invocation.
     ///
     /// The returned completion owns error observation but not cancellation. The semantics of submission and of the
-    /// publication of reference state are defined by [`StatefulCompilationDomain::call_statefully_async`].
+    /// publication of reference state are defined by [`StatefulCompilationDomain::execute_statefully_async`].
     pub fn call_statefully_async(
         &self,
         domain: &C,
@@ -781,7 +781,7 @@ where
             Err(error) => return ReferenceExecution::ready(Err(error.into())),
         };
         domain
-            .call_statefully_async(self.compiled_program(), self.input_types(), arguments)
+            .execute_statefully_async(self.compiled_program(), self.input_types(), arguments)
             .and_then(|outputs| self.reconstruct_outputs(outputs).map_err(C::Error::from))
     }
 
@@ -1716,7 +1716,7 @@ mod tests {
             Ok((program, output_types))
         }
 
-        fn call(
+        fn execute(
             &self,
             program: &Self::CompiledProgram,
             input_types: &[ArrayType],
@@ -1834,7 +1834,7 @@ mod tests {
             Ok((Arc::new(program.clone()), output_types))
         }
 
-        fn call(
+        fn execute(
             &self,
             program: &Self::CompiledProgram,
             _input_types: &[ArrayIrType],

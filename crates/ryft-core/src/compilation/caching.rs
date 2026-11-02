@@ -1803,7 +1803,7 @@ mod tests {
             Ok((Arc::new(TestCompiledProgram(0)), program.clone()))
         }
 
-        fn call(
+        fn execute(
             &self,
             _program: &Self::CompiledProgram,
             _input_types: &[ArrayType],
