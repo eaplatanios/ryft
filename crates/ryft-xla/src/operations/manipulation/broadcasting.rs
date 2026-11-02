@@ -534,6 +534,7 @@ mod tests {
                     Some(file!()),
                     None,
                     None,
+                    &[],
                 )
                 .unwrap()
                 .block_until_ready()
@@ -759,6 +760,7 @@ mod tests {
                     Some(file!()),
                     None,
                     None,
+                    &[],
                 )
                 .unwrap()
                 .block_until_ready()
@@ -1034,6 +1036,7 @@ mod tests {
                     target_config: None,
                     allow_in_place_mlir_modification: false,
                     matrix_unit_operand_precision: Precision::Default as i32,
+                    compiler_variant: None,
                 },
             )
             .unwrap();
@@ -1048,7 +1051,7 @@ mod tests {
         let execution_device_ids = execution_devices.iter().map(|device| device.id().unwrap()).collect::<Vec<_>>();
         let arguments = XlaArray::into_execute_arguments(vec![input], execution_device_ids.as_slice()).unwrap();
         let outputs = executable
-            .execute(arguments.as_execution_device_inputs(), Vec::new(), 0, None, Some(file!()), None, None)
+            .execute(arguments.as_execution_device_inputs(), Vec::new(), 0, None, Some(file!()), None, None, &[])
             .unwrap()
             .block_until_ready()
             .unwrap();

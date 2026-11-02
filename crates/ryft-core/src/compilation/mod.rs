@@ -132,9 +132,9 @@
 //!
 //! Misses for the same key are single flight, while different keys may compile concurrently. [`DiskCache`] provides
 //! optional checksummed persistent storage, and [`CompilationArtifactExchange`] optionally shares serialized artifacts
-//! among processes according to [`CompilationArtifactExchangePolicy`]. [`JitCacheStatistics`] reports frontend dispatch
-//! activity, while [`CompilationCacheStatistics`] and structured [`CompilationEvent`]s report the activity of the
-//! shared context across the memory, persistent, exchange, and backend compilation tiers.
+//! among processes according to [`CompilationArtifactExchangePolicy`]. [`DispatcherStatistics`] reports the frontend
+//! activity of retained dispatchers, while [`CompilationCacheStatistics`] and structured [`CompilationEvent`]s report
+//! the activity of the shared context across the memory, persistent, exchange, and backend compilation tiers.
 //!
 //! # Extending Compilation
 //!
@@ -174,7 +174,7 @@ pub use contexts::{
 };
 pub use exchange::{CompilationArtifactExchange, CompilationArtifactExchangePolicy, CompilationExchangeError};
 pub use functions::{
-    CompilationTracer, CompiledFunction, CompiledFunctionDispatcher, ExecutableFunction, FunctionSpecializationKey,
-    JitCacheStatistics, LoweredFunction, StagedFunction, StagedProgram, StatefulExecution,
+    CompilationTracer, CompiledFunction, CompiledFunctionDispatcher, DispatcherStatistics, ExecutableFunction,
+    FunctionSpecializationKey, LoweredFunction, StagedFunction, StagedProgram, StatefulExecution,
 };
 pub use operations::StagedCallOperation;

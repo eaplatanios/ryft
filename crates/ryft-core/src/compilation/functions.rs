@@ -1106,7 +1106,7 @@ where
                 options,
                 staged_input_types: None,
                 specializations: SpecializationCache::new(capacity),
-                statistics: JitCacheStatisticsAccumulator::default(),
+                statistics: DispatcherStatisticsAccumulator::default(),
             }),
         }
     }
@@ -1182,13 +1182,13 @@ where
         self.state.specializations.capacity()
     }
 
-    /// Returns a snapshot of this dispatcher's cache activity.
+    /// Returns a snapshot of this dispatcher's frontend activity.
     #[inline]
-    pub fn statistics(&self) -> JitCacheStatistics {
+    pub fn statistics(&self) -> DispatcherStatistics {
         self.state.statistics.snapshot()
     }
 
-    /// Resets dispatch statistics without clearing compiled specializations.
+    /// Resets the statistics of this dispatcher and its clones without clearing compiled specializations.
     #[inline]
     pub fn clear_statistics(&self) {
         self.state.statistics.clear();
@@ -1321,7 +1321,7 @@ where
         DomainTracingContext<C, C::Value>:
             StagingContext<Type = C::Type, Constant = C::Constant, Operation = C::Operation>,
     {
-        let abstractification_start = Instant::now();
+        let dispatch_key_start = Instant::now();
         let domain = self.resolve_domain(inputs)?;
         let input_structure = inputs.parameter_structure();
         let runtime_input_types = inputs.parameters().map(|input| input.r#type().into_owned()).collect::<Vec<_>>();
@@ -1330,14 +1330,11 @@ where
             domain.dispatch_signature(runtime_input_types, &self.state.options)?;
         let key = FunctionSpecializationKey::new(static_parameters.clone(), input_structure, dispatch_key);
 
-        // One clock read both ends input abstractification (including key construction) and starts the dispatch
-        // lookup, which keeps the timing of every cached call to three clock reads.
+        // One clock read both ends dispatch key derivation and starts the dispatch lookup, which keeps the timing of
+        // every cached call to three clock reads.
         let statistics = &self.state.statistics;
         let dispatch_start = Instant::now();
-        accumulate_duration(
-            &statistics.input_abstractification_nanoseconds,
-            dispatch_start.duration_since(abstractification_start),
-        );
+        accumulate_duration(&statistics.dispatch_key_nanoseconds, dispatch_start.duration_since(dispatch_key_start));
         let entry = self.state.specializations.try_entry(key);
         accumulate_duration(&statistics.dispatch_nanoseconds, dispatch_start.elapsed());
         let producer = match entry {
@@ -1478,7 +1475,7 @@ struct CompiledFunctionDispatcherState<
     >,
 
     /// Dispatch activity counters.
-    statistics: JitCacheStatisticsAccumulator,
+    statistics: DispatcherStatisticsAccumulator,
 }
 
 /// Explicit or lazily recovered domain shared by one dispatcher's specializations and clones.
@@ -1574,81 +1571,95 @@ impl<Output, Error> StatefulExecution<Output, Error> {
     }
 }
 
-/// Snapshot of the dispatch activity of one retained [`CompiledFunctionDispatcher`].
+/// Snapshot of the frontend activity of one retained [`CompiledFunctionDispatcher`], covering dispatch key derivation,
+/// specialization lookup, tracing, lowering, and compilation requests. The statistics accumulate from construction or
+/// from the latest [`CompiledFunctionDispatcher::clear_statistics`] call, are shared by every clone of the dispatcher,
+/// and are unaffected by [`CompiledFunctionDispatcher::clear_cache`]. Each field is read independently, so a snapshot
+/// taken during concurrent calls need not correspond to a single point in time.
+///
+/// Every call that reaches the specialization lookup counts as exactly one of [`Self::dispatch_hits`] and
+/// [`Self::dispatch_misses`]. Calls that fail earlier (e.g., because an inferred domain cannot be recovered, an input
+/// does not refine its declared staged type, or [`CompilationDomain::dispatch_signature`] fails) count as neither. The
+/// production counters record attempts, including failed ones, and concurrent cold misses for one specialization may
+/// each trace, lower, and request compilation. Durations are host durations summed over all calls, so concurrent calls
+/// can make them exceed the elapsed wall-clock time. Backend compilation time is not included, because a compilation
+/// request may be served by a compilation cache. Refer to
+/// [`CompilationCacheStatistics::compilation_duration`](crate::CompilationCacheStatistics::compilation_duration) for
+/// the backend compilation activity of a shared [`CompilationContext`](crate::CompilationContext).
 #[derive(Copy, Clone, Debug, Default, PartialEq, Eq)]
-pub struct JitCacheStatistics {
-    /// Calls served by an already compiled specialization.
+pub struct DispatcherStatistics {
+    /// Calls served by a retained specialization.
     pub dispatch_hits: u64,
 
-    /// Calls for which no compiled specialization was retained.
+    /// Calls that found no retained specialization, including recursive calls that requested a specialization that
+    /// was still being produced and were therefore rejected.
     pub dispatch_misses: u64,
 
-    /// Closure traces performed after dispatch misses.
+    /// Traces of the dispatcher's closure started after dispatch misses, including traces that failed.
     pub traces: u64,
 
-    /// Backend lowerings performed after new traces.
+    /// Lowerings started after successful traces, including lowerings that failed.
     pub lowerings: u64,
 
-    /// Compilation requests made to the domain after lowering.
+    /// Compilation requests made to the domain after successful lowerings, including requests that failed or that the
+    /// domain served from a compilation cache.
     pub compilation_requests: u64,
 
-    /// Total host duration spent flattening inputs and deriving their dispatch key and effective signature.
-    pub input_abstractification_duration: Duration,
+    /// Total host duration spent deriving dispatch keys, which includes recovering an inferred domain, reading input
+    /// types, checking declared staged input types, and calling [`CompilationDomain::dispatch_signature`].
+    pub dispatch_key_duration: Duration,
 
-    /// Total host duration spent looking up retained specializations.
+    /// Total host duration spent looking up retained specializations by their dispatch keys.
     pub dispatch_duration: Duration,
 
-    /// Total host duration spent tracing specialization misses.
+    /// Total host duration spent tracing the dispatcher's closure after dispatch misses.
     pub tracing_duration: Duration,
 
     /// Total host duration spent lowering newly traced specializations.
     pub lowering_duration: Duration,
 }
 
-/// Lock-free counters underlying [`JitCacheStatistics`]. Durations accumulate in nanoseconds.
+/// Lock-free counters underlying [`DispatcherStatistics`]. Durations accumulate in nanoseconds.
 #[derive(Default)]
-struct JitCacheStatisticsAccumulator {
-    /// Counter underlying [`JitCacheStatistics::dispatch_hits`].
+struct DispatcherStatisticsAccumulator {
+    /// Counter underlying [`DispatcherStatistics::dispatch_hits`].
     dispatch_hits: AtomicU64,
 
-    /// Counter underlying [`JitCacheStatistics::dispatch_misses`].
+    /// Counter underlying [`DispatcherStatistics::dispatch_misses`].
     dispatch_misses: AtomicU64,
 
-    /// Counter underlying [`JitCacheStatistics::traces`].
+    /// Counter underlying [`DispatcherStatistics::traces`].
     traces: AtomicU64,
 
-    /// Counter underlying [`JitCacheStatistics::lowerings`].
+    /// Counter underlying [`DispatcherStatistics::lowerings`].
     lowerings: AtomicU64,
 
-    /// Counter underlying [`JitCacheStatistics::compilation_requests`].
+    /// Counter underlying [`DispatcherStatistics::compilation_requests`].
     compilation_requests: AtomicU64,
 
-    /// Nanoseconds underlying [`JitCacheStatistics::input_abstractification_duration`].
-    input_abstractification_nanoseconds: AtomicU64,
+    /// Nanoseconds underlying [`DispatcherStatistics::dispatch_key_duration`].
+    dispatch_key_nanoseconds: AtomicU64,
 
-    /// Nanoseconds underlying [`JitCacheStatistics::dispatch_duration`].
+    /// Nanoseconds underlying [`DispatcherStatistics::dispatch_duration`].
     dispatch_nanoseconds: AtomicU64,
 
-    /// Nanoseconds underlying [`JitCacheStatistics::tracing_duration`].
+    /// Nanoseconds underlying [`DispatcherStatistics::tracing_duration`].
     tracing_nanoseconds: AtomicU64,
 
-    /// Nanoseconds underlying [`JitCacheStatistics::lowering_duration`].
+    /// Nanoseconds underlying [`DispatcherStatistics::lowering_duration`].
     lowering_nanoseconds: AtomicU64,
 }
 
-impl JitCacheStatisticsAccumulator {
-    /// Returns a snapshot of the counters. The counters are read independently, so a snapshot taken during concurrent
-    /// calls need not correspond to a single point in time.
-    fn snapshot(&self) -> JitCacheStatistics {
-        JitCacheStatistics {
+impl DispatcherStatisticsAccumulator {
+    /// Returns a snapshot of the counters (refer to [`DispatcherStatistics`] for its consistency guarantees).
+    fn snapshot(&self) -> DispatcherStatistics {
+        DispatcherStatistics {
             dispatch_hits: self.dispatch_hits.load(Ordering::Relaxed),
             dispatch_misses: self.dispatch_misses.load(Ordering::Relaxed),
             traces: self.traces.load(Ordering::Relaxed),
             lowerings: self.lowerings.load(Ordering::Relaxed),
             compilation_requests: self.compilation_requests.load(Ordering::Relaxed),
-            input_abstractification_duration: Duration::from_nanos(
-                self.input_abstractification_nanoseconds.load(Ordering::Relaxed),
-            ),
+            dispatch_key_duration: Duration::from_nanos(self.dispatch_key_nanoseconds.load(Ordering::Relaxed)),
             dispatch_duration: Duration::from_nanos(self.dispatch_nanoseconds.load(Ordering::Relaxed)),
             tracing_duration: Duration::from_nanos(self.tracing_nanoseconds.load(Ordering::Relaxed)),
             lowering_duration: Duration::from_nanos(self.lowering_nanoseconds.load(Ordering::Relaxed)),
@@ -1662,7 +1673,7 @@ impl JitCacheStatisticsAccumulator {
         self.traces.store(0, Ordering::Relaxed);
         self.lowerings.store(0, Ordering::Relaxed);
         self.compilation_requests.store(0, Ordering::Relaxed);
-        self.input_abstractification_nanoseconds.store(0, Ordering::Relaxed);
+        self.dispatch_key_nanoseconds.store(0, Ordering::Relaxed);
         self.dispatch_nanoseconds.store(0, Ordering::Relaxed);
         self.tracing_nanoseconds.store(0, Ordering::Relaxed);
         self.lowering_nanoseconds.store(0, Ordering::Relaxed);
@@ -1692,7 +1703,7 @@ pub(crate) mod tests {
     use crate::contexts::EagerContext;
     use crate::interpretation::InterpretableOperation;
     use crate::operations::{NegOperation, ZeroOperation};
-    use crate::parameters::{Parameter, Placeholder};
+    use crate::parameters::Parameter;
     use crate::programs::{EmptyRegionDriver, Operation, Type, TypeError, ValueDirectDispatch};
 
     use super::*;

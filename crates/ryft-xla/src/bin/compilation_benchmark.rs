@@ -7,7 +7,7 @@ use std::time::{Duration, Instant};
 
 use ryft_core::{
     ArrayIrType, ArrayType, Compile, CompiledFunction, DataType, Device, DeviceMesh, Dimension, DiskCache,
-    JitCacheStatistics, LogicalMesh, MeshAxis, MeshAxisType, Shape, Sharding, Sin, StagedFunction, ValueProjection,
+    DispatcherStatistics, LogicalMesh, MeshAxis, MeshAxisType, Shape, Sharding, Sin, StagedFunction, ValueProjection,
 };
 use ryft_pjrt::{Client, ClientOptions, CpuClientOptions, load_cpu_plugin};
 use ryft_xla::{
@@ -119,14 +119,14 @@ fn distribution(samples: &[u64]) -> Value {
     })
 }
 
-fn jit_statistics(statistics: JitCacheStatistics) -> Value {
+fn dispatcher_statistics(statistics: DispatcherStatistics) -> Value {
     json!({
         "dispatch_hits": statistics.dispatch_hits,
         "dispatch_misses": statistics.dispatch_misses,
         "traces": statistics.traces,
         "lowerings": statistics.lowerings,
         "compilation_requests": statistics.compilation_requests,
-        "input_abstractification_duration_ns": nanoseconds(statistics.input_abstractification_duration),
+        "dispatch_key_duration_ns": nanoseconds(statistics.dispatch_key_duration),
         "dispatch_duration_ns": nanoseconds(statistics.dispatch_duration),
         "tracing_duration_ns": nanoseconds(statistics.tracing_duration),
         "lowering_duration_ns": nanoseconds(statistics.lowering_duration),
@@ -357,8 +357,8 @@ fn main() -> Result<(), Box<dyn std::error::Error>> {
             "synchronized": distribution(&synchronized_samples),
         },
         "counters": {
-            "after_cold_dispatch": jit_statistics(cold_dispatch_statistics),
-            "after_warm_dispatch": jit_statistics(warm_dispatch_statistics),
+            "after_cold_dispatch": dispatcher_statistics(cold_dispatch_statistics),
+            "after_warm_dispatch": dispatcher_statistics(warm_dispatch_statistics),
             "compilation_cache": compilation_statistics(&domain),
         },
     });

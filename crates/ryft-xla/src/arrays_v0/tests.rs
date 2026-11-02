@@ -34,6 +34,7 @@ fn test_spmd_compilation_options(partition_count: usize) -> CompilationOptions {
         target_config: None,
         allow_in_place_mlir_modification: false,
         matrix_unit_operand_precision: Precision::Default as i32,
+        compiler_variant: None,
     }
 }
 
@@ -839,7 +840,7 @@ fn test_array_driven_shardy_jit_sharded_matmul_on_cpu() {
     let execute_arguments =
         XlaArray::into_execute_arguments(vec![lhs_array, rhs_array], execution_device_ids.as_slice()).unwrap();
     let outputs = executable
-        .execute(execute_arguments.as_execution_device_inputs(), Vec::new(), 0, None, Some(file!()), None, None)
+        .execute(execute_arguments.as_execution_device_inputs(), Vec::new(), 0, None, Some(file!()), None, None, &[])
         .unwrap()
         .block_until_ready()
         .unwrap();

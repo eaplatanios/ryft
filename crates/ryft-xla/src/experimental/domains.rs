@@ -6851,7 +6851,7 @@ impl<'c> XlaDomain<'c> {
         };
         let (mut device_outputs, fence) = program
             .executable
-            .execute(arguments.as_execution_device_inputs(), Vec::new(), 0, context, None, None, None)?
+            .execute(arguments.as_execution_device_inputs(), Vec::new(), 0, context, None, None, None, &[])?
             .into_parts();
         if program.signature.requires_cuda_kernel_runtime() {
             let session = &self.session;

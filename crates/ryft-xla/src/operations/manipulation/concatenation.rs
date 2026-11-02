@@ -598,6 +598,7 @@ mod tests {
                             Some(file!()),
                             None,
                             None,
+                            &[],
                         )
                         .and_then(|execution| execution.block_until_ready());
                     if left_size + right_size != 3 {

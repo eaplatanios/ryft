@@ -254,6 +254,7 @@ fn try_replicated_cross_mesh<'o>(
                 send_buffers.as_slice(),
                 send_dst_devices.as_slice(),
                 send_transfer_keys.as_slice(),
+                &[],
             )
             .map_err(XlaError::from)?;
     }
@@ -281,6 +282,7 @@ fn try_replicated_cross_mesh<'o>(
                 pjrt_device,
                 source_devices.as_slice(),
                 transfer_keys.as_slice(),
+                &[],
             )
             .map_err(XlaError::from)?;
         for buffer in received {

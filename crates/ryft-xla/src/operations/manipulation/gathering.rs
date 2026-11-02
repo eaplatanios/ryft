@@ -450,6 +450,7 @@ mod tests {
                     None,
                     None,
                     None,
+                    &[],
                 )
                 .unwrap()
                 .block_until_ready()
@@ -530,6 +531,7 @@ mod tests {
                         None,
                         None,
                         None,
+                        &[],
                     )
                     .unwrap()
                     .block_until_ready()

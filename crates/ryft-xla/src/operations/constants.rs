@@ -1078,6 +1078,7 @@ mod tests {
                     Some(file!()),
                     None,
                     None,
+                    &[],
                 )
                 .unwrap()
                 .block_until_ready()
@@ -1529,11 +1530,12 @@ mod tests {
                     target_config: None,
                     allow_in_place_mlir_modification: false,
                     matrix_unit_operand_precision: Precision::Default as i32,
+                    compiler_variant: None,
                 },
             )
             .unwrap();
         let mut executions = executable
-            .execute(vec![ExecutionDeviceInputs::default()], Vec::new(), 0, None, Some(file!()), None, None)
+            .execute(vec![ExecutionDeviceInputs::default()], Vec::new(), 0, None, Some(file!()), None, None, &[])
             .unwrap()
             .block_until_ready()
             .unwrap();

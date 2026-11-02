@@ -80,6 +80,7 @@ pub(crate) fn test_spmd_compilation_options(partition_count: usize) -> ryft_pjrt
         target_config: None,
         allow_in_place_mlir_modification: false,
         matrix_unit_operand_precision: Precision::Default as i32,
+        compiler_variant: None,
     }
 }
 
@@ -178,6 +179,7 @@ pub(crate) fn execute_mixed_program(
             Some(file!()),
             None,
             None,
+            &[],
         )?
         .block_until_ready()?
         .remove(0)
@@ -657,6 +659,7 @@ fn test_entry_alias_attribute_executes_in_place_on_cpu() {
                 target_config: None,
                 allow_in_place_mlir_modification: false,
                 matrix_unit_operand_precision: Precision::Default as i32,
+                compiler_variant: None,
             },
         )
         .unwrap();
@@ -678,6 +681,7 @@ fn test_entry_alias_attribute_executes_in_place_on_cpu() {
             Some(file!()),
             None,
             None,
+            &[],
         )
         .unwrap();
     let mut device_outputs = execution.block_until_ready().unwrap().remove(0);
@@ -1064,6 +1068,7 @@ pub(crate) fn ragged_dot_cpu_compilation_options() -> ryft_pjrt::protos::Compila
         target_config: None,
         allow_in_place_mlir_modification: false,
         matrix_unit_operand_precision: Precision::Default as i32,
+        compiler_variant: None,
     }
 }
 

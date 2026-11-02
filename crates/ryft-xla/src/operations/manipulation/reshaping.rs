@@ -458,6 +458,7 @@ mod tests {
                         None,
                         None,
                         None,
+                        &[],
                     )
                     .and_then(|execution| execution.block_until_ready());
                 if input_size != output_size {

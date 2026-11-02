@@ -395,6 +395,7 @@ pub(crate) fn copy_addressable_destination_shards_from_exact_source_shards<'o>(
             send_buffers.as_slice(),
             destination_devices.as_slice(),
             transfer_keys.as_slice(),
+            &[],
         )?;
     }
 
@@ -453,6 +454,7 @@ pub(crate) fn copy_addressable_destination_shards_from_exact_source_shards<'o>(
             destination_device,
             source_devices.as_slice(),
             transfer_keys.as_slice(),
+            &[],
         )?;
         addressable_buffers.extend(received_buffers);
     }

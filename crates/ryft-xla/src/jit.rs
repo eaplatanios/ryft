@@ -87,7 +87,7 @@ use std::sync::{Arc, Mutex};
 use ryft_core::{
     ArrayIrType, ArrayType, CapturingContext, ClosedProgram, Compile, CompiledFunction,
     CompiledFunctionDispatcher as CoreCompiledFunctionDispatcher, Constant, Context, DeviceMesh, DifferentiableType,
-    DomainTracingContext, ExecutableFunction, ForwardModeDifferentiate, JitCacheStatistics, Parameterized,
+    DispatcherStatistics, DomainTracingContext, ExecutableFunction, ForwardModeDifferentiate, Parameterized,
     ParameterizedFamily, ProgramError, ProjectedContext, ProjectedValue, ReverseModeDifferentiate, StagedFunction,
     StatefulExecution, Tracer, Typed, Value, ValueProjection,
 };
@@ -281,9 +281,9 @@ where
         project_arrays::<Out>(self.function.call(static_parameters, inputs)?)
     }
 
-    /// Returns a snapshot of this dispatcher's cache activity.
+    /// Returns a snapshot of this dispatcher's frontend activity (refer to [`DispatcherStatistics`]).
     #[inline]
-    pub fn statistics(&self) -> JitCacheStatistics {
+    pub fn statistics(&self) -> DispatcherStatistics {
         self.function.statistics()
     }
 }
@@ -476,9 +476,9 @@ where
         self.function.call_statefully_async(static_parameters, inputs)
     }
 
-    /// Returns a snapshot of this dispatcher's cache activity.
+    /// Returns a snapshot of this dispatcher's frontend activity (refer to [`DispatcherStatistics`]).
     #[inline]
-    pub fn statistics(&self) -> JitCacheStatistics {
+    pub fn statistics(&self) -> DispatcherStatistics {
         self.function.statistics()
     }
 }
@@ -7430,7 +7430,7 @@ mod tests {
 
         print_baseline_durations("jit(eager gradient) repeated dispatch", &durations);
         println!(
-            "  jit cache: dispatch_hits={} dispatch_misses={} traces={} lowerings={} compilation_requests={}",
+            "  dispatcher: dispatch_hits={} dispatch_misses={} traces={} lowerings={} compilation_requests={}",
             statistics.dispatch_hits,
             statistics.dispatch_misses,
             statistics.traces,
@@ -7438,8 +7438,8 @@ mod tests {
             statistics.compilation_requests,
         );
         println!(
-            "  jit cache: abstractification_ms={:.3} dispatch_ms={:.3} tracing_ms={:.3} lowering_ms={:.3}",
-            statistics.input_abstractification_duration.as_secs_f64() * 1e3,
+            "  dispatcher: dispatch_key_ms={:.3} dispatch_ms={:.3} tracing_ms={:.3} lowering_ms={:.3}",
+            statistics.dispatch_key_duration.as_secs_f64() * 1e3,
             statistics.dispatch_duration.as_secs_f64() * 1e3,
             statistics.tracing_duration.as_secs_f64() * 1e3,
             statistics.lowering_duration.as_secs_f64() * 1e3,

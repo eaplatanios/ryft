@@ -726,6 +726,7 @@ mod tests {
                         None,
                         None,
                         None,
+                        &[],
                     )
                     .unwrap()
                     .block_until_ready()
@@ -825,6 +826,7 @@ mod tests {
                     None,
                     None,
                     None,
+                    &[],
                 )
                 .and_then(|execution| execution.block_until_ready());
             if start + size > 4 {

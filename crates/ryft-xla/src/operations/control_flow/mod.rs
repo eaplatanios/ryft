@@ -604,7 +604,7 @@ mod tests {
             .collect();
         let arguments = XlaArray::into_execute_arguments(inputs, device_ids.as_slice()).unwrap();
         let outputs = executable
-            .execute(arguments.as_execution_device_inputs(), Vec::new(), 0, None, Some(file!()), None, None)
+            .execute(arguments.as_execution_device_inputs(), Vec::new(), 0, None, Some(file!()), None, None, &[])
             .unwrap()
             .block_until_ready()
             .unwrap();

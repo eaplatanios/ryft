@@ -1093,6 +1093,7 @@ mod tests {
                 Some(file!()),
                 None,
                 None,
+                &[],
             )?
             .block_until_ready()?;
         outputs

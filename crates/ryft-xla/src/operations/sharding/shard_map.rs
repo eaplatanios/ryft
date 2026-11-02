@@ -740,6 +740,7 @@ mod tests {
             target_config: None,
             allow_in_place_mlir_modification: false,
             matrix_unit_operand_precision: Precision::Default as i32,
+            compiler_variant: None,
         };
         let executable = client.compile(&PjrtProgram::Mlir { bytecode: module.into_bytes() }, &options).unwrap();
         let values = [1.0f32, 2.0, 3.0, 4.0];
@@ -767,6 +768,7 @@ mod tests {
                     Some(file!()),
                     None,
                     None,
+                    &[],
                 )
                 .unwrap()
                 .block_until_ready()
@@ -859,6 +861,7 @@ mod tests {
                 None,
                 None,
                 None,
+                &[],
             )
             .unwrap()
             .block_until_ready()
@@ -1193,7 +1196,16 @@ mod tests {
         let execute_arguments =
             XlaArray::into_execute_arguments(vec![input_array], execution_device_ids.as_slice()).unwrap();
         let outputs = executable
-            .execute(execute_arguments.as_execution_device_inputs(), Vec::new(), 0, None, Some(file!()), None, None)
+            .execute(
+                execute_arguments.as_execution_device_inputs(),
+                Vec::new(),
+                0,
+                None,
+                Some(file!()),
+                None,
+                None,
+                &[],
+            )
             .unwrap()
             .block_until_ready()
             .unwrap();
@@ -1330,7 +1342,16 @@ mod tests {
         let execute_arguments =
             XlaArray::into_execute_arguments(vec![lhs_array, rhs_array], execution_device_ids.as_slice()).unwrap();
         let outputs = executable
-            .execute(execute_arguments.as_execution_device_inputs(), Vec::new(), 0, None, Some(file!()), None, None)
+            .execute(
+                execute_arguments.as_execution_device_inputs(),
+                Vec::new(),
+                0,
+                None,
+                Some(file!()),
+                None,
+                None,
+                &[],
+            )
             .unwrap()
             .block_until_ready()
             .unwrap();
@@ -1582,7 +1603,16 @@ mod tests {
         let execute_arguments =
             XlaArray::into_execute_arguments(vec![input_array], execution_device_ids.as_slice()).unwrap();
         let outputs = executable
-            .execute(execute_arguments.as_execution_device_inputs(), Vec::new(), 0, None, Some(file!()), None, None)
+            .execute(
+                execute_arguments.as_execution_device_inputs(),
+                Vec::new(),
+                0,
+                None,
+                Some(file!()),
+                None,
+                None,
+                &[],
+            )
             .unwrap()
             .block_until_ready()
             .unwrap();

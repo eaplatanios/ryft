@@ -733,6 +733,7 @@ mod tests {
             target_config: None,
             allow_in_place_mlir_modification: false,
             matrix_unit_operand_precision: Precision::Default as i32,
+            compiler_variant: None,
         };
 
         let executable = client.compile(&program, &options).unwrap();
@@ -752,7 +753,7 @@ mod tests {
                 }],
                 ..Default::default()
             };
-            let execution = executable.execute(vec![inputs], Vec::new(), 0, None, None, None, None).unwrap();
+            let execution = executable.execute(vec![inputs], Vec::new(), 0, None, None, None, None, &[]).unwrap();
             let mut outputs = execution.block_until_ready().unwrap().remove(0);
             assert_eq!(outputs.outputs.len(), 1);
             let output_bytes = outputs.outputs.remove(0).copy_to_host(None).unwrap().r#await().unwrap();

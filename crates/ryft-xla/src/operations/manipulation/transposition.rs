@@ -151,6 +151,7 @@ mod tests {
                     Some(file!()),
                     None,
                     None,
+                    &[],
                 )
                 .unwrap()
                 .block_until_ready()
