@@ -1,0 +1,19 @@
+diff --git a/third_party/llvm/toolchains.patch b/third_party/llvm/toolchains.patch
+--- a/third_party/llvm/toolchains.patch
++++ b/third_party/llvm/toolchains.patch
+@@ -77,3 +77,15 @@
+      Label("//llvm:linux_aarch64"): native_arch_defines("AArch64", "aarch64-unknown-linux-gnu"),
+      Label("//llvm:linux_armv7"): native_arch_defines("ARM", "armv7-linux-gnueabihf"),
+      Label("//llvm:linux_ppc64le"): native_arch_defines("PowerPC", "powerpc64le-unknown-linux-gnu"),
++diff --git a/utils/bazel/llvm-project-overlay/mlir/tblgen.bzl b/utils/bazel/llvm-project-overlay/mlir/tblgen.bzl
++--- a/utils/bazel/llvm-project-overlay/mlir/tblgen.bzl
+++++ b/utils/bazel/llvm-project-overlay/mlir/tblgen.bzl
++@@ -586,7 +586,6 @@
++             name = name + "_shard_" + str(i),
++             srcs = [source_file],
++             outs = [out_file],
++-            cmd = "echo -e \"#define GET_OP_DEFS_" + str(i) + "\n$$(cat $(SRCS))\" > $(OUTS)",
++-            cmd_bat = ">$(OUTS) echo #define GET_OP_DEFS_" + str(i) + "&& >>$(OUTS) type $(SRCS)",
+++            cmd = "printf '#define GET_OP_DEFS_{}\\n' > \"$@\" && cat \"$<\" >> \"$@\"".format(i),
++         )
++     return copies

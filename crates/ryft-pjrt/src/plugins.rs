@@ -140,11 +140,11 @@ pub fn load_cuda_13_plugin() -> Result<Plugin, Error> {
     load_plugin(&ryft_xla_sys::pjrt_cuda_13_plugin_path())
 }
 
-/// Loads the [ROCm 7](https://rocm.docs.amd.com/) PJRT [`Plugin`] that is backed by [XLA](https://openxla.org/xla)
+/// Loads the [ROCm 10](https://rocm.docs.amd.com/) PJRT [`Plugin`] that is backed by [XLA](https://openxla.org/xla)
 /// from [`ryft_xla_sys`].
-#[cfg(feature = "rocm-7")]
-pub fn load_rocm_7_plugin() -> Result<Plugin, Error> {
-    load_plugin(&ryft_xla_sys::pjrt_rocm_7_plugin_path())
+#[cfg(feature = "rocm-10")]
+pub fn load_rocm_10_plugin() -> Result<Plugin, Error> {
+    load_plugin(&ryft_xla_sys::pjrt_rocm_10_plugin_path())
 }
 
 /// Loads the [TPU](https://cloud.google.com/tpu) PJRT [`Plugin`] that is backed by [XLA](https://openxla.org/xla)

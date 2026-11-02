@@ -190,17 +190,16 @@ mod tests {
         region.append_block(context.block_with_no_arguments()).unwrap();
         let module = named_module("private_module", SymbolVisibility::Private, region, location).unwrap();
         assert!(module.verify());
-        assert_eq!(module.to_string(), "module @private_module attributes {sym_visibility = \"private\"} {\n}\n");
+        assert_eq!(module.to_string(), "module @private_module <sym_visibility = \"private\"> {\n}\n");
     }
 
     #[test]
     fn test_named_module_with_private_visibility_parse() {
         let context = Context::new();
-        let parsed = context
-            .parse_operation("module @private_module attributes {sym_visibility = \"private\"} {}", "test")
-            .unwrap();
+        let parsed =
+            context.parse_operation("module @private_module <sym_visibility = \"private\"> {}", "test").unwrap();
         assert!(parsed.verify());
-        assert_eq!(parsed.to_string(), "module @private_module attributes {sym_visibility = \"private\"} {\n}\n");
+        assert_eq!(parsed.to_string(), "module @private_module <sym_visibility = \"private\"> {\n}\n");
     }
 
     #[test]

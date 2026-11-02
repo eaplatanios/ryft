@@ -86,10 +86,10 @@
 //!
 //! # Design And Soundness
 //!
-//! Retained Just-In-Time (JIT) compilation dispatch and region transformation share this cache vocabulary without
-//! pretending to share a source, artifact representation, validation policy, or reentrancy behavior. [`Transform`]'s
-//! own documentation carries the diagram relating the two owners to the descriptor, the typed alias, and their
-//! artifacts.
+//! Region transformation builds on the same [`SpecializationCache`] as other retained specializations, such as the
+//! executables of a [`CompiledFunctionDispatcher`](crate::CompiledFunctionDispatcher), without sharing their source,
+//! artifact representation, validation policy, or reentrancy behavior. [`Transform`]'s own documentation carries the
+//! diagram relating region transforms to the descriptor, the typed alias, and their artifacts.
 //!
 //! ## Cache Provenance
 //!
@@ -185,10 +185,9 @@ use crate::specialization::{ReentrantSpecializationError, SpecializationCache, S
 
 /// Describes a family of retained specializations within `Source`. `Source` is a type-level coherence and
 /// documentation parameter. It is not stored or invoked by a cache. For example, structural region markers implement
-/// `Transform<Region<V, O>>`, while retained Just-In-Time (JIT) compilation specialization uses a private source token
-/// describing its domain and function signature. Also, equal [`Arguments`](Self::Arguments) must make retained
-/// artifacts interchangeable within one owning cache. Any fixed semantics absent from the arguments, such as a retained
-/// closure or immutable options, must be fixed by that cache's owner.
+/// `Transform<Region<V, O>>`. Also, equal [`Arguments`](Self::Arguments) must make retained artifacts interchangeable
+/// within one owning cache. Any fixed semantics absent from the arguments, such as a retained closure or immutable
+/// options, must be fixed by that cache's owner.
 ///
 /// # Type Relationships
 ///
@@ -204,9 +203,6 @@ use crate::specialization::{ReentrantSpecializationError, SpecializationCache, S
 ///   region_owner["&lt;code&gt;RegionRef&lt;/code&gt;"]
 ///   registry["Per-Region Namespace Registry"]
 ///   region_artifact["&lt;code&gt;Program&lt;/code&gt; Bundle and Metadata"]
-///   dispatcher["&lt;code&gt;JittedFunction&lt;/code&gt;"]
-///   executable["&lt;code&gt;ExecutableFunction&lt;/code&gt;"]
-///   backend["&lt;code&gt;CompilationContext&lt;/code&gt; on a Miss"]
 ///   descriptor --> arguments
 ///   descriptor --> artifact
 ///   descriptor --> capacity
@@ -214,9 +210,6 @@ use crate::specialization::{ReentrantSpecializationError, SpecializationCache, S
 ///   region_owner --> registry
 ///   registry --> specialization
 ///   registry --> region_artifact
-///   dispatcher --> typed_cache
-///   typed_cache --> executable
-///   dispatcher --> backend
 /// ```
 #[cfg_attr(doc, ryft_macros::mermaid)]
 pub trait Transform<Source> {

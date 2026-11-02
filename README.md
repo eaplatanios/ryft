@@ -27,7 +27,7 @@ crate is an umbrella crate that re-exports functionality from a few different cr
 ## Feature Flags
 
 The `ryft` crate enables the `xla` feature by default which brings in the `ryft-mlir`, `ryft-pjrt`, and `ryft-xla-sys`
-dependencies. Accelerator-specific features (e.g., `cuda-12`, `cuda-13`, `rocm-7`, `tpu`, `neuron`, `metal`, and `mps`)
+dependencies. Accelerator-specific features (e.g., `cuda-12`, `cuda-13`, `rocm-10`, `tpu`, `neuron`, `metal`, and `mps`)
 are forwarded through the crate stack (`ryft` -> `ryft-xla` -> `ryft-pjrt` -> `ryft-xla-sys`). For feature semantics,
 platform/runtime requirements, and artifact-loading behavior, refer to:
 

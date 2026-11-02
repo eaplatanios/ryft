@@ -429,7 +429,7 @@ mod tests {
         assert!(operation.verify());
         assert_eq!(operation.symbol_name().unwrap().map(|name| name.as_str().unwrap()), Some("test_module"));
         assert_eq!(operation.symbol_visibility().unwrap(), SymbolVisibility::Private);
-        assert_eq!(operation.to_string(), "module @test_module attributes {sym_visibility = \"private\"} {\n}\n")
+        assert_eq!(operation.to_string(), "module @test_module <sym_visibility = \"private\"> {\n}\n")
     }
 
     #[test]

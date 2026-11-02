@@ -1,7 +1,7 @@
 diff --git a/jaxlib/mosaic/gpu/BUILD b/jaxlib/mosaic/gpu/BUILD
 --- a/jaxlib/mosaic/gpu/BUILD
 +++ b/jaxlib/mosaic/gpu/BUILD
-@@ -253,6 +253,7 @@
+@@ -258,6 +258,7 @@
  cc_library(
      name = "runtime",
      srcs = ["runtime.cc"],
@@ -9,7 +9,7 @@ diff --git a/jaxlib/mosaic/gpu/BUILD b/jaxlib/mosaic/gpu/BUILD
      # Linker may prune these symbols if they are not explicitly exported.
      linkopts = [
          "-Wl,--export-dynamic-symbol='mosaic_gpu_*'",
-@@ -296,6 +297,7 @@
+@@ -316,6 +317,7 @@
          ":mosaic_gpu_cc_proto",
          ":nvshmem",
          ":passes",
@@ -17,7 +17,7 @@ diff --git a/jaxlib/mosaic/gpu/BUILD b/jaxlib/mosaic/gpu/BUILD
          ":serde",
          ":target",
          "//jaxlib/cuda:cuda_vendor",
-@@ -447,7 +449,7 @@
+@@ -479,7 +481,7 @@
  
  cc_binary(
      name = "libmosaic_gpu_runtime.so",
@@ -29,25 +29,27 @@ diff --git a/jaxlib/mosaic/gpu/BUILD b/jaxlib/mosaic/gpu/BUILD
 diff --git a/jaxlib/mosaic/gpu/runtime.cc b/jaxlib/mosaic/gpu/runtime.cc
 --- a/jaxlib/mosaic/gpu/runtime.cc
 +++ b/jaxlib/mosaic/gpu/runtime.cc
-@@ -13,12 +13,12 @@
+@@ -13,14 +13,15 @@
  limitations under the License.
  ==============================================================================*/
  
 +#include "jaxlib/mosaic/gpu/runtime.h"
 +
+ #include <algorithm>
  #include <cassert>
  #include <cstdint>
  #include <cstdio>
+ #include <numeric>
  #include <utility>
--
+ 
 -#include "third_party/gpus/cuda/include/cuda.h"
+ #include "jaxlib/mosaic/gpu/launch_config.h"
  
  namespace {
- template <typename... Args>
 diff --git a/jaxlib/mosaic/gpu/custom_call.cc b/jaxlib/mosaic/gpu/custom_call.cc
 --- a/jaxlib/mosaic/gpu/custom_call.cc
 +++ b/jaxlib/mosaic/gpu/custom_call.cc
-@@ -136,6 +136,7 @@
+@@ -140,6 +140,7 @@
  #include "jaxlib/mosaic/gpu/mosaic_gpu.pb.h"
  #include "jaxlib/mosaic/gpu/nvshmem.h"
  #include "jaxlib/mosaic/gpu/passes.h"
@@ -55,7 +57,7 @@ diff --git a/jaxlib/mosaic/gpu/custom_call.cc b/jaxlib/mosaic/gpu/custom_call.cc
  #include "jaxlib/mosaic/gpu/serde.h"
  #include "jaxlib/mosaic/gpu/target.h"
  #include "xla/backends/cpu/target_machine_options.h"
-@@ -663,6 +664,23 @@
+@@ -764,6 +765,26 @@
                                                 llvm::toString(std::move(err))));
    }
    std::unique_ptr<llvm::orc::LLJIT> lljit = std::move(*lljit_or_error);
@@ -67,8 +69,11 @@ diff --git a/jaxlib/mosaic/gpu/custom_call.cc b/jaxlib/mosaic/gpu/custom_call.cc
 +  runtime_symbols[lljit->mangleAndIntern("mosaic_gpu_init_tma_desc")] =
 +      llvm::orc::ExecutorSymbolDef::fromPtr(&mosaic_gpu_init_tma_desc,
 +                                          llvm::JITSymbolFlags::Exported);
-+  runtime_symbols[lljit->mangleAndIntern("mosaic_gpu_launch_kernel")] =
-+      llvm::orc::ExecutorSymbolDef::fromPtr(&mosaic_gpu_launch_kernel,
++  runtime_symbols[lljit->mangleAndIntern("mosaic_gpu_init_tma_im2col_desc")] =
++      llvm::orc::ExecutorSymbolDef::fromPtr(&mosaic_gpu_init_tma_im2col_desc,
++                                          llvm::JITSymbolFlags::Exported);
++  runtime_symbols[lljit->mangleAndIntern("mosaic_gpu_build_kernel_spec")] =
++      llvm::orc::ExecutorSymbolDef::fromPtr(&mosaic_gpu_build_kernel_spec,
 +                                          llvm::JITSymbolFlags::Exported);
 +  if (auto err = lljit->getMainJITDylib().define(
 +          llvm::orc::absoluteSymbols(std::move(runtime_symbols)))) {
@@ -82,7 +87,7 @@ diff --git a/jaxlib/mosaic/gpu/custom_call.cc b/jaxlib/mosaic/gpu/custom_call.cc
 diff --git a/jaxlib/mosaic/gpu/runtime.h b/jaxlib/mosaic/gpu/runtime.h
 --- /dev/null
 +++ b/jaxlib/mosaic/gpu/runtime.h
-@@ -0,0 +1,39 @@
+@@ -0,0 +1,47 @@
 +/* Copyright 2024 The JAX Authors.
 +
 +Licensed under the Apache License, Version 2.0 (the "License");
@@ -98,27 +103,35 @@ diff --git a/jaxlib/mosaic/gpu/runtime.h b/jaxlib/mosaic/gpu/runtime.h
 +limitations under the License.
 +==============================================================================*/
 +
-+#ifndef JAXLIB_MOSAIC_GPU_RUNTIME_H_
-+#define JAXLIB_MOSAIC_GPU_RUNTIME_H_
++#pragma once
 +
 +#include <cstdint>
 +
 +#include "third_party/gpus/cuda/include/cuda.h"
 +
-+// Host functions called by generated Mosaic GPU code. Keep declarations shared
-+// with their definitions so JIT-local registration preserves the exact ABI.
++namespace mosaic::gpu {
++struct MosaicKernelSpec;
++}
++
++// Host functions called by generated Mosaic GPU code. Shared declarations keep
++// plugin-local JIT registration synchronized with their exact native ABI.
 +extern "C" {
 +void mosaic_gpu_init_tma_desc(CUtensorMap* tma_desc, void* base_addr,
 +                             int64_t elem_type, int64_t rank, int64_t* sizes,
 +                             int64_t* strides, int64_t swizzle_bytes,
 +                             int64_t* window_shape);
-+CUresult mosaic_gpu_launch_kernel(CUfunction function, uint32_t grid_x,
-+                                 uint32_t grid_y, uint32_t grid_z,
-+                                 uint32_t cluster_x, uint32_t cluster_y,
-+                                 uint32_t cluster_z, uint32_t block_x,
-+                                 uint32_t block_y, uint32_t block_z,
-+                                 uint32_t smem_bytes, int32_t uses_pdl,
-+                                 CUstream stream, void** params);
-+}  // extern "C"
-+
-+#endif  // JAXLIB_MOSAIC_GPU_RUNTIME_H_
++void mosaic_gpu_init_tma_im2col_desc(
++    CUtensorMap* tma_desc, void* base_addr, int64_t elem_type, int64_t rank,
++    int64_t* sizes, int64_t* strides, int64_t swizzle_bytes,
++    int32_t* pixel_box_lower_corner, int32_t* pixel_box_upper_corner,
++    int64_t channels_per_pixel, int64_t pixels_per_column,
++    int32_t* window_strides);
++void mosaic_gpu_build_kernel_spec(mosaic::gpu::MosaicKernelSpec* cfg,
++                                  uint32_t grid_x, uint32_t grid_y,
++                                  uint32_t grid_z, uint32_t cluster_x,
++                                  uint32_t cluster_y, uint32_t cluster_z,
++                                  uint32_t block_x, uint32_t block_y,
++                                  uint32_t block_z, uint32_t smem_bytes,
++                                  int32_t uses_pdl, int32_t num_args,
++                                  void** arg_ptrs, const int32_t* arg_bytes);
++}

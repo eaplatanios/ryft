@@ -389,7 +389,7 @@ mod tests {
         Cpu,
         Cuda12,
         Cuda13,
-        Rocm7,
+        Rocm10,
         Tpu,
         Neuron,
         Metal,
@@ -398,7 +398,7 @@ mod tests {
 
     /// Executes the provided block once per enabled test platform backend. The CPU backend is always tested, and then
     /// other accelerator backends are included only when their corresponding cargo features are enabled (i.e.,
-    /// `cuda-12`, `cuda-13`, `rocm-7`, `tpu`, `neuron`, `metal`, and `mps`).
+    /// `cuda-12`, `cuda-13`, `rocm-10`, `tpu`, `neuron`, `metal`, and `mps`).
     ///
     /// # Parameters
     ///
@@ -432,11 +432,11 @@ mod tests {
                 $body
             }
 
-            #[cfg(feature = "rocm-7")]
+            #[cfg(feature = "rocm-10")]
             {
-                let $plugin = $crate::load_rocm_7_plugin();
-                let $plugin = $plugin.expect("failed to load the PJRT ROCm 7 plugin");
-                let $platform = $crate::tests::TestPlatform::Rocm7;
+                let $plugin = $crate::load_rocm_10_plugin();
+                let $plugin = $plugin.expect("failed to load the PJRT ROCm 10 plugin");
+                let $platform = $crate::tests::TestPlatform::Rocm10;
                 $body
             }
 
@@ -511,16 +511,16 @@ mod tests {
                 $body
             }
 
-            #[cfg(feature = "rocm-7")]
+            #[cfg(feature = "rocm-10")]
             {
-                let $plugin = $crate::load_rocm_7_plugin();
-                let $plugin = $plugin.expect("failed to load the PJRT ROCm 7 plugin");
+                let $plugin = $crate::load_rocm_10_plugin();
+                let $plugin = $plugin.expect("failed to load the PJRT ROCm 10 plugin");
                 let $client = $plugin.client($crate::ClientOptions::GPU($crate::GpuClientOptions {
                     allocator: $crate::GpuMemoryAllocator::CudaAsync { memory_fraction_to_preallocate: None },
                     ..Default::default()
                 }));
-                let $client = $client.expect("failed to create a PJRT ROCm 7 client");
-                let $platform = $crate::tests::TestPlatform::Rocm7;
+                let $client = $client.expect("failed to create a PJRT ROCm 10 client");
+                let $platform = $crate::tests::TestPlatform::Rocm10;
                 $body
             }
 
@@ -609,7 +609,7 @@ mod tests {
 
         let plugin = test_cpu_plugin();
         let api = plugin.api();
-        assert_eq!(plugin.attribute("stablehlo_current_version"), Ok(Value::i64_list([1, 20, 0])));
+        assert_eq!(plugin.attribute("stablehlo_current_version"), Ok(Value::i64_list([1, 24, 0])));
         assert_eq!(plugin.attribute("stablehlo_minimum_version"), Ok(Value::i64_list([0, 9, 0])));
         assert_eq!(plugin.attribute("xla_version"), Ok(Value::i64(2)));
         assert_eq!(plugin.attribute("xla_version"), api.attribute("xla_version"));
@@ -617,7 +617,7 @@ mod tests {
             plugin.attribute("__missing__"),
             Err(Error::NotFound { message, .. }) if message.contains("__missing__")));
         let attributes = plugin.attributes().unwrap();
-        assert_eq!(attributes.get("stablehlo_current_version"), Some(&Value::i64_list([1, 20, 0])));
+        assert_eq!(attributes.get("stablehlo_current_version"), Some(&Value::i64_list([1, 24, 0])));
         assert_eq!(attributes.get("stablehlo_minimum_version"), Some(&Value::i64_list([0, 9, 0])));
         assert_eq!(attributes.get("xla_version"), Some(&Value::i64(2)));
         assert_eq!(attributes.get("__missing__"), None);

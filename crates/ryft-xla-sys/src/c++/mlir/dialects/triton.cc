@@ -252,3 +252,38 @@ MlirStringRef mlirTritonTtEnumAttrGetValue(MlirAttribute attribute, enum MlirTri
   }
   return {nullptr, 0};
 }
+
+bool mlirAttributeIsATritonTtCachePolicyAttr(MlirAttribute attribute) {
+  return attribute.ptr != nullptr && llvm::isa<mlir::triton::CachePolicyAttr>(unwrap(attribute));
+}
+
+MlirAttribute mlirTritonTtCachePolicyAttrGet(
+    MlirContext context,
+    MlirStringRef cacheModifier,
+    MlirStringRef evictionPolicy) {
+  if (context.ptr == nullptr || cacheModifier.data == nullptr || evictionPolicy.data == nullptr) {
+    return {nullptr};
+  }
+  auto cache = mlir::triton::symbolizeEnum<mlir::triton::CacheModifier>(unwrap(cacheModifier));
+  auto eviction = mlir::triton::symbolizeEnum<mlir::triton::EvictionPolicy>(unwrap(evictionPolicy));
+  if (!cache || !eviction) {
+    return {nullptr};
+  }
+  return wrap(mlir::triton::CachePolicyAttr::get(unwrap(context), *cache, *eviction));
+}
+
+MlirStringRef mlirTritonTtCachePolicyAttrGetCacheModifier(MlirAttribute attribute) {
+  if (attribute.ptr == nullptr) {
+    return {nullptr, 0};
+  }
+  auto policy = llvm::dyn_cast<mlir::triton::CachePolicyAttr>(unwrap(attribute));
+  return policy ? wrap(mlir::triton::stringifyEnum(policy.getCacheModifier())) : MlirStringRef{nullptr, 0};
+}
+
+MlirStringRef mlirTritonTtCachePolicyAttrGetEvictionPolicy(MlirAttribute attribute) {
+  if (attribute.ptr == nullptr) {
+    return {nullptr, 0};
+  }
+  auto policy = llvm::dyn_cast<mlir::triton::CachePolicyAttr>(unwrap(attribute));
+  return policy ? wrap(mlir::triton::stringifyEnum(policy.getEvictionPolicy())) : MlirStringRef{nullptr, 0};
+}

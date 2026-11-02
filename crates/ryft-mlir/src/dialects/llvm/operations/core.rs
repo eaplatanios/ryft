@@ -1756,7 +1756,7 @@ mod tests {
             indoc! {"
                 module {
                   func.func @llvm_load_test(%arg0: !llvm.ptr) -> i32 {
-                    %0 = llvm.load volatile %arg0 {alignment = 4 : i64} : !llvm.ptr -> i32
+                    %0 = llvm.load volatile %arg0 <alignment = 4> : !llvm.ptr -> i32
                     return %0 : i32
                   }
                 }
@@ -1808,7 +1808,7 @@ mod tests {
             indoc! {"
                 module {
                   func.func @llvm_store_test(%arg0: i32, %arg1: !llvm.ptr) {
-                    llvm.store volatile %arg0, %arg1 {alignment = 4 : i64} : i32, !llvm.ptr
+                    llvm.store volatile %arg0, %arg1 <alignment = 4> : i32, !llvm.ptr
                     return
                   }
                 }

@@ -1,15 +1,14 @@
 use crate::{
-    ArrayAttributeRef, Attribute, DenseInteger32ArrayAttributeRef, DetachedOp, DetachedRegion, DialectHandle, Error,
-    FlatSymbolRefAttributeRef, IntegerAttributeRef, Location, Operation, OperationBuilder, OperationResultRef,
-    RegionRef, StringAttributeRef, TypeAttributeRef, TypeRef, ValueRef, mlir_op, mlir_op_trait,
+    ArrayAttributeRef, Attribute, AttributeRef, DenseInteger32ArrayAttributeRef, DetachedOp, DetachedRegion,
+    DialectHandle, Error, FlatSymbolRefAttributeRef, IntegerAttributeRef, Location, Operation, OperationBuilder,
+    OperationResultRef, RegionRef, StringAttributeRef, TypeAttributeRef, TypeRef, ValueRef, mlir_op, mlir_op_trait,
 };
 
 use super::attributes::{
-    CacheModifier, CacheModifierAttributeRef, DescriptorReduceKind, DescriptorReduceKindAttributeRef, EvictionPolicy,
-    EvictionPolicyAttributeRef, InputPrecision, InputPrecisionAttributeRef, MemSemantic, MemSemanticAttributeRef,
-    MemSyncScope, MemSyncScopeAttributeRef, PaddingOption, PaddingOptionAttributeRef, ProgramIdDim,
-    ProgramIdDimAttributeRef, PropagateNan, PropagateNanAttributeRef, RmwOp, RmwOpAttributeRef, RoundingMode,
-    RoundingModeAttributeRef, ScaleDotElemType, ScaleDotElemTypeAttributeRef,
+    DescriptorReduceKind, DescriptorReduceKindAttributeRef, InputPrecision, InputPrecisionAttributeRef, MemSemantic,
+    MemSemanticAttributeRef, MemSyncScope, MemSyncScopeAttributeRef, PaddingOption, PaddingOptionAttributeRef,
+    ProgramIdDim, ProgramIdDimAttributeRef, PropagateNan, PropagateNanAttributeRef, RmwOp, RmwOpAttributeRef,
+    RoundingMode, RoundingModeAttributeRef, ScaleDotElemType, ScaleDotElemTypeAttributeRef,
 };
 
 /// Triton `tt` [`Operation`] that casts an integer value to a pointer value.
@@ -326,6 +325,59 @@ pub fn precise_divf<'v, 'c: 'v, 't: 'c, L: Location<'c, 't>>(
         })
 }
 
+/// Triton `tt` [`Operation`] that computes an approximate `f32` division.
+///
+/// NVIDIA uses `div.approx.f32`, while AMD uses `llvm.amdgcn.fdiv.fast`. Accuracy and denormal support depend on the
+/// target. Both operands and the result are `f32` or equally shaped `f32` tensors.
+///
+/// # Example
+///
+/// ```mlir
+/// %result = tt.approx_divf %x, %y : f32
+/// ```
+///
+/// Refer to the [official Triton operation documentation](https://triton-lang.org/main/dialects/TritonOps.html)
+/// for more information.
+pub trait ApproxDivFOperation<'o, 'c: 'o, 't: 'c>: Operation<'o, 'c, 't> {
+    /// Returns the dividend.
+    fn x(&self) -> Result<ValueRef<'o, 'c, 't>, Error> {
+        self.operand_value(0)
+    }
+
+    /// Returns the divisor.
+    fn y(&self) -> Result<ValueRef<'o, 'c, 't>, Error> {
+        self.operand_value(1)
+    }
+
+    /// Returns the division result.
+    fn result(&self) -> Result<OperationResultRef<'o, 'c, 't>, Error> {
+        self.as_ref().result(0)
+    }
+}
+
+mlir_op!(ApproxDivF);
+mlir_op_trait!(ApproxDivF, OneResult);
+mlir_op_trait!(ApproxDivF, ZeroRegions);
+mlir_op_trait!(ApproxDivF, ZeroSuccessors);
+
+/// Constructs a new detached/owned [`ApproxDivFOperation`] at the specified [`Location`].
+pub fn approx_divf<'v, 'c: 'v, 't: 'c, L: Location<'c, 't>>(
+    x: ValueRef<'v, 'c, 't>,
+    y: ValueRef<'v, 'c, 't>,
+    result_type: TypeRef<'c, 't>,
+    location: L,
+) -> Result<DetachedApproxDivFOperation<'c, 't>, Error> {
+    location.context().load_dialect(DialectHandle::triton_tt()?)?;
+    OperationBuilder::new("tt.approx_divf", location)
+        .add_operand(x)?
+        .add_operand(y)?
+        .add_result(result_type)?
+        .build()
+        .and_then(|operation| unsafe {
+            operation.cast().ok_or_else(|| Error::invalid_argument("invalid arguments to `tt::approx_divf`"))
+        })
+}
+
 /// Triton `tt` [`Operation`] that returns the high bits of an unsigned integer product.
 ///
 /// Refer to the [official Triton operation documentation](https://triton-lang.org/main/dialects/TritonOps.html)
@@ -417,11 +469,8 @@ pub fn addptr<'v, 'c: 'v, 't: 'c, L: Location<'c, 't>>(
 /// Name of the [`Attribute`] that stores Triton `tt` operand segment sizes.
 pub const OPERAND_SEGMENT_SIZES_ATTRIBUTE: &str = "operand_segment_sizes";
 
-/// Name of the [`Attribute`] that stores a Triton `tt` cache modifier.
-pub const CACHE_ATTRIBUTE: &str = "cache";
-
-/// Name of the [`Attribute`] that stores a Triton `tt` eviction policy.
-pub const EVICT_ATTRIBUTE: &str = "evict";
+/// Name of the [`Attribute`] that stores target-neutral or target-specific Triton cache hints.
+pub const CACHE_POLICY_ATTRIBUTE: &str = "cachePolicy";
 
 /// Name of the [`Attribute`] that marks a Triton `tt` load as volatile.
 pub const IS_VOLATILE_ATTRIBUTE: &str = "isVolatile";
@@ -455,26 +504,9 @@ pub trait LoadOperation<'o, 'c: 'o, 't: 'c>: Operation<'o, 'c, 't> {
         }
     }
 
-    /// Returns the cache modifier.
-    fn cache(&self) -> Result<CacheModifierAttributeRef<'c, 't>, Error> {
-        self.attribute(CACHE_ATTRIBUTE)?.and_then(|attribute| attribute.cast()).ok_or_else(|| {
-            Error::invalid_argument(format!(
-                "missing or invalid `{}` attribute in `{}`",
-                CACHE_ATTRIBUTE,
-                self.name().as_str().unwrap_or("<unknown>"),
-            ))
-        })
-    }
-
-    /// Returns the eviction policy.
-    fn evict(&self) -> Result<EvictionPolicyAttributeRef<'c, 't>, Error> {
-        self.attribute(EVICT_ATTRIBUTE)?.and_then(|attribute| attribute.cast()).ok_or_else(|| {
-            Error::invalid_argument(format!(
-                "missing or invalid `{}` attribute in `{}`",
-                EVICT_ATTRIBUTE,
-                self.name().as_str().unwrap_or("<unknown>"),
-            ))
-        })
+    /// Returns the optional cache policy, which may belong to a target-specific dialect.
+    fn cache_policy(&self) -> Result<Option<AttributeRef<'c, 't>>, Error> {
+        self.attribute(CACHE_POLICY_ATTRIBUTE)
     }
 
     /// Returns `true` if this load is volatile.
@@ -498,8 +530,7 @@ pub fn load<'v, 'c: 'v, 't: 'c, L: Location<'c, 't>>(
     ptr: ValueRef<'v, 'c, 't>,
     mask: Option<ValueRef<'v, 'c, 't>>,
     other: Option<ValueRef<'v, 'c, 't>>,
-    cache: CacheModifier,
-    evict: EvictionPolicy,
+    cache_policy: Option<AttributeRef<'c, 't>>,
     is_volatile: bool,
     result_type: TypeRef<'c, 't>,
     location: L,
@@ -513,13 +544,14 @@ pub fn load<'v, 'c: 'v, 't: 'c, L: Location<'c, 't>>(
     if let Some(other) = other {
         builder = builder.add_operand(other)?;
     }
+    if let Some(cache_policy) = cache_policy {
+        builder = builder.add_attribute(CACHE_POLICY_ATTRIBUTE, cache_policy)?;
+    }
     builder
         .add_attribute(
             OPERAND_SEGMENT_SIZES_ATTRIBUTE,
             context.dense_i32_array_attribute(&[1, i32::from(mask.is_some()), i32::from(other.is_some())])?,
         )?
-        .add_attribute(CACHE_ATTRIBUTE, context.triton_tt_cache_modifier_attribute(cache)?)?
-        .add_attribute(EVICT_ATTRIBUTE, context.triton_tt_eviction_policy_attribute(evict)?)?
         .add_attribute(IS_VOLATILE_ATTRIBUTE, context.boolean_attribute(is_volatile))?
         .add_result(result_type)?
         .build()
@@ -555,26 +587,9 @@ pub trait StoreOperation<'o, 'c: 'o, 't: 'c>: Operation<'o, 'c, 't> {
         }
     }
 
-    /// Returns the cache modifier.
-    fn cache(&self) -> Result<CacheModifierAttributeRef<'c, 't>, Error> {
-        self.attribute(CACHE_ATTRIBUTE)?.and_then(|attribute| attribute.cast()).ok_or_else(|| {
-            Error::invalid_argument(format!(
-                "missing or invalid `{}` attribute in `{}`",
-                CACHE_ATTRIBUTE,
-                self.name().as_str().unwrap_or("<unknown>"),
-            ))
-        })
-    }
-
-    /// Returns the eviction policy.
-    fn evict(&self) -> Result<EvictionPolicyAttributeRef<'c, 't>, Error> {
-        self.attribute(EVICT_ATTRIBUTE)?.and_then(|attribute| attribute.cast()).ok_or_else(|| {
-            Error::invalid_argument(format!(
-                "missing or invalid `{}` attribute in `{}`",
-                EVICT_ATTRIBUTE,
-                self.name().as_str().unwrap_or("<unknown>"),
-            ))
-        })
+    /// Returns the optional cache policy, which may belong to a target-specific dialect.
+    fn cache_policy(&self) -> Result<Option<AttributeRef<'c, 't>>, Error> {
+        self.attribute(CACHE_POLICY_ATTRIBUTE)
     }
 
     /// Returns `true` if this store is marked to ignore CTA behavior.
@@ -592,8 +607,7 @@ pub fn store<'v, 'c: 'v, 't: 'c, L: Location<'c, 't>>(
     ptr: ValueRef<'v, 'c, 't>,
     value: ValueRef<'v, 'c, 't>,
     mask: Option<ValueRef<'v, 'c, 't>>,
-    cache: CacheModifier,
-    evict: EvictionPolicy,
+    cache_policy: Option<AttributeRef<'c, 't>>,
     ignore_cta: bool,
     location: L,
 ) -> Result<DetachedStoreOperation<'c, 't>, Error> {
@@ -603,13 +617,13 @@ pub fn store<'v, 'c: 'v, 't: 'c, L: Location<'c, 't>>(
     if let Some(mask) = mask {
         builder = builder.add_operand(mask)?;
     }
-    builder = builder
-        .add_attribute(
-            OPERAND_SEGMENT_SIZES_ATTRIBUTE,
-            context.dense_i32_array_attribute(&[1, 1, i32::from(mask.is_some())])?,
-        )?
-        .add_attribute(CACHE_ATTRIBUTE, context.triton_tt_cache_modifier_attribute(cache)?)?
-        .add_attribute(EVICT_ATTRIBUTE, context.triton_tt_eviction_policy_attribute(evict)?)?;
+    builder = builder.add_attribute(
+        OPERAND_SEGMENT_SIZES_ATTRIBUTE,
+        context.dense_i32_array_attribute(&[1, 1, i32::from(mask.is_some())])?,
+    )?;
+    if let Some(cache_policy) = cache_policy {
+        builder = builder.add_attribute(CACHE_POLICY_ATTRIBUTE, cache_policy)?;
+    }
     if ignore_cta {
         builder = builder.add_attribute(IGNORE_CTA_ATTRIBUTE, context.unit_attribute())?;
     }
@@ -624,10 +638,168 @@ pub const SEM_ATTRIBUTE: &str = "sem";
 /// Name of the [`Attribute`] that stores a Triton `tt` memory synchronization scope.
 pub const SCOPE_ATTRIBUTE: &str = "scope";
 
+/// Triton `tt` [`Operation`] that atomically loads from pointers with explicit memory ordering.
+///
+/// Refer to the [official Triton operation documentation](https://triton-lang.org/main/dialects/TritonOps.html)
+/// for the supported memory semantics and synchronization scopes.
+///
+/// # Example
+///
+/// ```mlir
+/// %value = tt.atomic_load acquire, gpu, %ptr : (!tt.ptr<f32>) -> f32
+/// ```
+pub trait AtomicLoadOperation<'o, 'c: 'o, 't: 'c>: Operation<'o, 'c, 't> {
+    /// Returns the pointer or tensor of pointers.
+    fn ptr(&self) -> Result<ValueRef<'o, 'c, 't>, Error> {
+        self.operand_value(0)
+    }
+
+    /// Returns the optional mask controlling participating elements.
+    fn mask(&self) -> Result<Option<ValueRef<'o, 'c, 't>>, Error> {
+        if self.operand_count() > 1 { self.operand_value(1).map(Some) } else { Ok(None) }
+    }
+
+    /// Returns the memory semantic.
+    fn sem(&self) -> Result<MemSemanticAttributeRef<'c, 't>, Error> {
+        self.attribute(SEM_ATTRIBUTE)?.and_then(|attribute| attribute.cast()).ok_or_else(|| {
+            Error::invalid_argument(format!(
+                "missing or invalid `{}` attribute in `{}`",
+                SEM_ATTRIBUTE,
+                self.name().as_str().unwrap_or("<unknown>"),
+            ))
+        })
+    }
+
+    /// Returns the memory synchronization scope.
+    fn scope(&self) -> Result<MemSyncScopeAttributeRef<'c, 't>, Error> {
+        self.attribute(SCOPE_ATTRIBUTE)?.and_then(|attribute| attribute.cast()).ok_or_else(|| {
+            Error::invalid_argument(format!(
+                "missing or invalid `{}` attribute in `{}`",
+                SCOPE_ATTRIBUTE,
+                self.name().as_str().unwrap_or("<unknown>"),
+            ))
+        })
+    }
+
+    /// Returns the atomically loaded scalar or tensor.
+    fn result(&self) -> Result<OperationResultRef<'o, 'c, 't>, Error> {
+        self.as_ref().result(0)
+    }
+}
+
+mlir_op!(AtomicLoad);
+mlir_op_trait!(AtomicLoad, OneResult);
+mlir_op_trait!(AtomicLoad, ZeroRegions);
+mlir_op_trait!(AtomicLoad, ZeroSuccessors);
+
+/// Constructs a detached [`AtomicLoadOperation`] with optional masking.
+pub fn atomic_load<'v, 'c: 'v, 't: 'c, L: Location<'c, 't>>(
+    ptr: ValueRef<'v, 'c, 't>,
+    mask: Option<ValueRef<'v, 'c, 't>>,
+    sem: MemSemantic,
+    scope: MemSyncScope,
+    result_type: TypeRef<'c, 't>,
+    location: L,
+) -> Result<DetachedAtomicLoadOperation<'c, 't>, Error> {
+    let context = location.context();
+    context.load_dialect(DialectHandle::triton_tt()?)?;
+    let mut builder = OperationBuilder::new("tt.atomic_load", location).add_operand(ptr)?;
+    if let Some(mask) = mask {
+        builder = builder.add_operand(mask)?;
+    }
+    builder
+        .add_attribute(SEM_ATTRIBUTE, context.triton_tt_mem_semantic_attribute(sem)?)?
+        .add_attribute(SCOPE_ATTRIBUTE, context.triton_tt_mem_sync_scope_attribute(scope)?)?
+        .add_result(result_type)?
+        .build()
+        .and_then(|operation| unsafe {
+            operation.cast().ok_or_else(|| Error::invalid_argument("invalid arguments to `tt::atomic_load`"))
+        })
+}
+
+/// Triton `tt` [`Operation`] that atomically stores through pointers with explicit memory ordering.
+///
+/// Refer to the [official Triton operation documentation](https://triton-lang.org/main/dialects/TritonOps.html)
+/// for the supported memory semantics and synchronization scopes.
+///
+/// # Example
+///
+/// ```mlir
+/// tt.atomic_store release, gpu, %ptr, %value : !tt.ptr<f32>
+/// ```
+pub trait AtomicStoreOperation<'o, 'c: 'o, 't: 'c>: Operation<'o, 'c, 't> {
+    /// Returns the pointer or tensor of pointers.
+    fn ptr(&self) -> Result<ValueRef<'o, 'c, 't>, Error> {
+        self.operand_value(0)
+    }
+
+    /// Returns the value to store.
+    fn value(&self) -> Result<ValueRef<'o, 'c, 't>, Error> {
+        self.operand_value(1)
+    }
+
+    /// Returns the optional mask controlling participating elements.
+    fn mask(&self) -> Result<Option<ValueRef<'o, 'c, 't>>, Error> {
+        if self.operand_count() > 2 { self.operand_value(2).map(Some) } else { Ok(None) }
+    }
+
+    /// Returns the memory semantic.
+    fn sem(&self) -> Result<MemSemanticAttributeRef<'c, 't>, Error> {
+        self.attribute(SEM_ATTRIBUTE)?.and_then(|attribute| attribute.cast()).ok_or_else(|| {
+            Error::invalid_argument(format!(
+                "missing or invalid `{}` attribute in `{}`",
+                SEM_ATTRIBUTE,
+                self.name().as_str().unwrap_or("<unknown>"),
+            ))
+        })
+    }
+
+    /// Returns the memory synchronization scope.
+    fn scope(&self) -> Result<MemSyncScopeAttributeRef<'c, 't>, Error> {
+        self.attribute(SCOPE_ATTRIBUTE)?.and_then(|attribute| attribute.cast()).ok_or_else(|| {
+            Error::invalid_argument(format!(
+                "missing or invalid `{}` attribute in `{}`",
+                SCOPE_ATTRIBUTE,
+                self.name().as_str().unwrap_or("<unknown>"),
+            ))
+        })
+    }
+}
+
+mlir_op!(AtomicStore);
+mlir_op_trait!(AtomicStore, ZeroRegions);
+mlir_op_trait!(AtomicStore, ZeroSuccessors);
+
+/// Constructs a detached [`AtomicStoreOperation`] with optional masking.
+pub fn atomic_store<'v, 'c: 'v, 't: 'c, L: Location<'c, 't>>(
+    ptr: ValueRef<'v, 'c, 't>,
+    value: ValueRef<'v, 'c, 't>,
+    mask: Option<ValueRef<'v, 'c, 't>>,
+    sem: MemSemantic,
+    scope: MemSyncScope,
+    location: L,
+) -> Result<DetachedAtomicStoreOperation<'c, 't>, Error> {
+    let context = location.context();
+    context.load_dialect(DialectHandle::triton_tt()?)?;
+    let mut builder = OperationBuilder::new("tt.atomic_store", location).add_operand(ptr)?;
+    builder = builder.add_operand(value)?;
+    if let Some(mask) = mask {
+        builder = builder.add_operand(mask)?;
+    }
+    builder
+        .add_attribute(SEM_ATTRIBUTE, context.triton_tt_mem_semantic_attribute(sem)?)?
+        .add_attribute(SCOPE_ATTRIBUTE, context.triton_tt_mem_sync_scope_attribute(scope)?)?
+        .build()
+        .and_then(|operation| unsafe {
+            operation.cast().ok_or_else(|| Error::invalid_argument("invalid arguments to `tt::atomic_store`"))
+        })
+}
+
 /// Triton `tt` [`Operation`] that repeatedly loads from a pointer until the loaded value equals an expected value.
 ///
-/// The load is performed with relaxed semantics on a single thread. For acquire semantics, an acquire fence is
-/// issued only after a successful poll. Other threads wait for the polling thread to finish.
+/// Each logical element is polled by one thread with relaxed loads until it equals the expected value or the shared
+/// timeout expires. An acquire fence follows each successful poll when requested. The boolean result has the same
+/// shape and encoding as the pointer, and each element is loaded at least once even when the timeout is zero.
 ///
 /// Refer to the [official Triton operation documentation](https://triton-lang.org/main/dialects/TritonOps.html)
 /// for more information.
@@ -2538,26 +2710,9 @@ pub trait DescriptorLoadOperation<'o, 'c: 'o, 't: 'c>: Operation<'o, 'c, 't> {
         self.operand_values().skip(1).collect()
     }
 
-    /// Returns the cache modifier.
-    fn cache(&self) -> Result<CacheModifierAttributeRef<'c, 't>, Error> {
-        self.attribute(CACHE_ATTRIBUTE)?.and_then(|attribute| attribute.cast()).ok_or_else(|| {
-            Error::invalid_argument(format!(
-                "missing or invalid `{}` attribute in `{}`",
-                CACHE_ATTRIBUTE,
-                self.name().as_str().unwrap_or("<unknown>"),
-            ))
-        })
-    }
-
-    /// Returns the eviction policy.
-    fn evict(&self) -> Result<EvictionPolicyAttributeRef<'c, 't>, Error> {
-        self.attribute(EVICT_ATTRIBUTE)?.and_then(|attribute| attribute.cast()).ok_or_else(|| {
-            Error::invalid_argument(format!(
-                "missing or invalid `{}` attribute in `{}`",
-                EVICT_ATTRIBUTE,
-                self.name().as_str().unwrap_or("<unknown>"),
-            ))
-        })
+    /// Returns the optional cache policy, which may belong to a target-specific dialect.
+    fn cache_policy(&self) -> Result<Option<AttributeRef<'c, 't>>, Error> {
+        self.attribute(CACHE_POLICY_ATTRIBUTE)
     }
 
     /// Returns the loaded tensor.
@@ -2575,25 +2730,24 @@ mlir_op_trait!(DescriptorLoad, ZeroSuccessors);
 pub fn descriptor_load<'v, 'c: 'v, 't: 'c, L: Location<'c, 't>>(
     desc: ValueRef<'v, 'c, 't>,
     indices: &[ValueRef<'v, 'c, 't>],
-    cache: CacheModifier,
-    evict: EvictionPolicy,
+    cache_policy: Option<AttributeRef<'c, 't>>,
     result_type: TypeRef<'c, 't>,
     location: L,
 ) -> Result<DetachedDescriptorLoadOperation<'c, 't>, Error> {
     let context = location.context();
     context.load_dialect(DialectHandle::triton_tt()?)?;
-    OperationBuilder::new("tt.descriptor_load", location)
+    let mut builder = OperationBuilder::new("tt.descriptor_load", location)
         .add_operand(desc)?
         .add_operands(indices)?
-        .add_attribute(CACHE_ATTRIBUTE, context.triton_tt_cache_modifier_attribute(cache)?)?
-        .add_attribute(EVICT_ATTRIBUTE, context.triton_tt_eviction_policy_attribute(evict)?)?
-        .add_result(result_type)?
-        .build()
-        .and_then(|operation| unsafe {
-            operation
-                .cast()
-                .ok_or_else(|| Error::invalid_argument("invalid arguments to `tt::descriptor_load`"))
-        })
+        .add_result(result_type)?;
+    if let Some(cache_policy) = cache_policy {
+        builder = builder.add_attribute(CACHE_POLICY_ATTRIBUTE, cache_policy)?;
+    }
+    builder.build().and_then(|operation| unsafe {
+        operation
+            .cast()
+            .ok_or_else(|| Error::invalid_argument("invalid arguments to `tt::descriptor_load`"))
+    })
 }
 
 /// Triton `tt` [`Operation`] that stores a tensor through a tensor descriptor.
@@ -2989,6 +3143,14 @@ mod tests {
         assert_eq!(operation.x().unwrap(), values[2]);
     });
 
+    tt_operation_test!(test_approx_divf_operation, |_context, location, values, types| {
+        let operation = approx_divf(values[2], values[14], types.f32, location).unwrap();
+        assert_eq!(operation.x().unwrap(), values[2]);
+        assert_eq!(operation.y().unwrap(), values[14]);
+        assert_eq!(ApproxDivFOperation::result(&operation).unwrap().r#type().unwrap(), types.f32);
+        assert!(operation.verify());
+    });
+
     tt_operation_test!(test_mulhiui_operation, |_context, location, values, types| {
         let operation = mulhiui(values[8], values[12], types.i32, location).unwrap();
 
@@ -3007,48 +3169,59 @@ mod tests {
         assert_eq!(operation.ptr().unwrap(), values[1]);
     });
 
-    tt_operation_test!(test_load_operation, |_context, location, values, types| {
-        let operation = load(
-            values[1],
-            Some(values[7]),
-            Some(values[2]),
-            CacheModifier::CacheAll,
-            EvictionPolicy::EvictFirst,
-            true,
-            types.f32,
-            location,
-        )
-        .unwrap();
+    tt_operation_test!(test_load_operation, |context, location, values, types| {
+        let policy = context
+            .triton_tt_cache_policy_attribute(CacheModifier::CacheAll, EvictionPolicy::EvictFirst)
+            .unwrap();
+        let operation =
+            load(values[1], Some(values[7]), Some(values[2]), Some(policy.as_ref()), true, types.f32, location)
+                .unwrap();
 
         assert_eq!(operation.name().as_str(), Ok("tt.load"));
+        assert_eq!(operation.cache_policy().unwrap(), Some(policy.as_ref()));
         assert_eq!(operation.ptr().unwrap(), values[1]);
         assert_eq!(operation.mask().unwrap(), Some(values[7]));
         assert_eq!(operation.other().unwrap(), Some(values[2]));
-        assert_eq!(operation.cache().unwrap().value().unwrap(), CacheModifier::CacheAll);
-        assert_eq!(operation.evict().unwrap().value().unwrap(), EvictionPolicy::EvictFirst);
         assert!(operation.is_volatile().unwrap());
         assert_eq!(operation.ptr().unwrap(), values[1]);
     });
 
-    tt_operation_test!(test_store_operation, |_context, location, values, _types| {
-        let operation = store(
-            values[1],
-            values[2],
-            Some(values[7]),
-            CacheModifier::WriteBack,
-            EvictionPolicy::EvictLast,
-            true,
-            location,
-        )
-        .unwrap();
+    tt_operation_test!(test_store_operation, |context, location, values, _types| {
+        let policy = context
+            .triton_tt_cache_policy_attribute(CacheModifier::WriteBack, EvictionPolicy::EvictLast)
+            .unwrap();
+        let operation = store(values[1], values[2], Some(values[7]), Some(policy.as_ref()), true, location).unwrap();
 
         assert_eq!(operation.name().as_str(), Ok("tt.store"));
+        assert_eq!(operation.cache_policy().unwrap(), Some(policy.as_ref()));
         assert_eq!(operation.ptr().unwrap(), values[1]);
         assert_eq!(operation.value().unwrap(), values[2]);
         assert_eq!(operation.mask().unwrap(), Some(values[7]));
-        assert_eq!(operation.cache().unwrap().value().unwrap(), CacheModifier::WriteBack);
-        assert_eq!(operation.evict().unwrap().value().unwrap(), EvictionPolicy::EvictLast);
         assert!(operation.ignore_cta());
+    });
+
+    tt_operation_test!(test_atomic_load_operation, |_context, location, values, types| {
+        let operation =
+            atomic_load(values[1], Some(values[7]), MemSemantic::Acquire, MemSyncScope::Gpu, types.f32, location)
+                .unwrap();
+        assert_eq!(operation.ptr().unwrap(), values[1]);
+        assert_eq!(operation.mask().unwrap(), Some(values[7]));
+        assert_eq!(operation.sem().unwrap().value(), Ok(MemSemantic::Acquire));
+        assert_eq!(operation.scope().unwrap().value(), Ok(MemSyncScope::Gpu));
+        assert_eq!(AtomicLoadOperation::result(&operation).unwrap().r#type().unwrap(), types.f32);
+        assert!(operation.verify());
+    });
+
+    tt_operation_test!(test_atomic_store_operation, |_context, location, values, _types| {
+        let operation =
+            atomic_store(values[1], values[2], Some(values[7]), MemSemantic::Release, MemSyncScope::Gpu, location)
+                .unwrap();
+        assert_eq!(operation.ptr().unwrap(), values[1]);
+        assert_eq!(operation.value().unwrap(), values[2]);
+        assert_eq!(operation.mask().unwrap(), Some(values[7]));
+        assert_eq!(operation.sem().unwrap().value(), Ok(MemSemantic::Release));
+        assert_eq!(operation.scope().unwrap().value(), Ok(MemSyncScope::Gpu));
+        assert!(operation.verify());
     });
 
     tt_operation_test!(test_atomic_poll_operation, |_context, location, values, types| {
@@ -3072,6 +3245,32 @@ mod tests {
         assert_eq!(operation.as_ref().result(0).unwrap().r#type().unwrap(), types.i1);
         assert_eq!(operation.ptr().unwrap(), values[1]);
     });
+
+    #[test]
+    fn test_atomic_poll_operation_tensor_result() {
+        let context = Context::new();
+        context.load_dialect(DialectHandle::triton_tt().unwrap()).unwrap();
+        let location = context.unknown_location();
+        let pointer = context.triton_tt_pointer_type(context.signless_integer_type(32), 1).unwrap();
+        let pointer_tensor = context.tensor_type(pointer, &[Size::Static(4)], None, location).unwrap();
+        let integer_tensor =
+            context.tensor_type(context.signless_integer_type(32), &[Size::Static(4)], None, location).unwrap();
+        let boolean_tensor =
+            context.tensor_type(context.signless_integer_type(1), &[Size::Static(4)], None, location).unwrap();
+        let block = context.block(&[(pointer_tensor.as_ref(), location), (integer_tensor.as_ref(), location)]);
+        let operation = atomic_poll(
+            block.argument(0).unwrap().as_ref(),
+            block.argument(1).unwrap().as_ref(),
+            None,
+            MemSemantic::Acquire,
+            MemSyncScope::Gpu,
+            boolean_tensor.as_ref(),
+            location,
+        )
+        .unwrap();
+        assert_eq!(AtomicPollOperation::result(&operation).unwrap().r#type().unwrap(), boolean_tensor.as_ref());
+        assert!(operation.verify());
+    }
 
     tt_operation_test!(test_atomic_rmw_operation, |_context, location, values, types| {
         let operation = atomic_rmw(
@@ -3434,23 +3633,18 @@ mod tests {
         assert_eq!(operation.srcs().unwrap(), vec![values[2]]);
     });
 
-    tt_operation_test!(test_descriptor_load_operation, |_context, location, values, types| {
-        let operation = descriptor_load(
-            values[9],
-            &[values[0], values[15]],
-            CacheModifier::CacheGlobal,
-            EvictionPolicy::Normal,
-            types.tensor_f32,
-            location,
-        )
-        .unwrap();
+    tt_operation_test!(test_descriptor_load_operation, |context, location, values, types| {
+        let policy = context
+            .triton_tt_cache_policy_attribute(CacheModifier::CacheGlobal, EvictionPolicy::Normal)
+            .unwrap();
+        let operation =
+            descriptor_load(values[9], &[values[0], values[15]], Some(policy.as_ref()), types.tensor_f32, location)
+                .unwrap();
 
         assert_eq!(operation.name().as_str(), Ok("tt.descriptor_load"));
+        assert_eq!(operation.cache_policy().unwrap(), Some(policy.as_ref()));
         assert_eq!(operation.desc().unwrap(), values[9]);
         assert_eq!(operation.indices().unwrap(), vec![values[0], values[15]]);
-        assert_eq!(operation.cache().unwrap().value().unwrap(), CacheModifier::CacheGlobal);
-        assert_eq!(operation.evict().unwrap().value().unwrap(), EvictionPolicy::Normal);
-        assert_eq!(operation.cache().unwrap().value().unwrap(), CacheModifier::CacheGlobal);
     });
 
     tt_operation_test!(test_descriptor_store_operation, |_context, location, values, _types| {

@@ -4,9 +4,10 @@ use ryft_xla_sys::mlir::dialects::mosaic::gpu::{
     mlirAttributeIsAMosaicGpuTmemAttr, mlirMosaicGpuCopyPartitionedAttrGet, mlirMosaicGpuCopyPartitionedAttrGetAxis,
     mlirMosaicGpuCopyReplicatedAttrGet, mlirMosaicGpuEnumAttrGet, mlirMosaicGpuEnumAttrGetValue,
     mlirMosaicGpuIsACopyPartitionAttr, mlirMosaicGpuIsACopyPartitionedAttr, mlirMosaicGpuIsACopyReplicatedAttr,
-    mlirMosaicGpuIsAReplicatedAttr, mlirMosaicGpuIsASwizzleTransformAttr, mlirMosaicGpuIsATileTransformAttr,
-    mlirMosaicGpuIsATiledLayoutAttr, mlirMosaicGpuIsAWGSplatFragLayoutAttr, mlirMosaicGpuIsAWGStridedFragLayoutAttr,
-    mlirMosaicGpuReplicatedAttrGet, mlirMosaicGpuReplicatedAttrGetTimes, mlirMosaicGpuSmemClusterAttrGet,
+    mlirMosaicGpuIsAReplicatedAttr, mlirMosaicGpuIsASmemAllocAttr, mlirMosaicGpuIsASwizzleTransformAttr,
+    mlirMosaicGpuIsATileTransformAttr, mlirMosaicGpuIsATiledLayoutAttr, mlirMosaicGpuIsAWGSplatFragLayoutAttr,
+    mlirMosaicGpuIsAWGStridedFragLayoutAttr, mlirMosaicGpuReplicatedAttrGet, mlirMosaicGpuReplicatedAttrGetTimes,
+    mlirMosaicGpuSmemAllocAttrGet, mlirMosaicGpuSmemAllocAttrGetAlignment, mlirMosaicGpuSmemClusterAttrGet,
     mlirMosaicGpuSwizzleTransformAttrGet, mlirMosaicGpuSwizzleTransformAttrGetSwizzle,
     mlirMosaicGpuTileTransformAttrGet, mlirMosaicGpuTileTransformAttrGetTiling, mlirMosaicGpuTiledLayoutAttrGet,
     mlirMosaicGpuTiledLayoutAttrGetLaneDims, mlirMosaicGpuTiledLayoutAttrGetTiling,
@@ -18,7 +19,7 @@ use ryft_xla_sys::mlir::dialects::mosaic::gpu::{
 
 use crate::{
     ArrayAttributeRef, Attribute, Context, DenseInteger32ArrayAttributeRef, DenseInteger64ArrayAttributeRef,
-    DialectHandle, Error, StringRef, mlir_subtype_trait_impls,
+    DialectHandle, Error, IntegerAttributeRef, StringRef, mlir_subtype_trait_impls,
 };
 
 macro_rules! mosaic_gpu_enum_attribute {
@@ -623,6 +624,48 @@ impl<'c, 't> Attribute<'c, 't> for CopyPartitionedAttributeRef<'c, 't> {
 
 mlir_subtype_trait_impls!(CopyPartitionedAttributeRef<'c, 't> as Attribute, mlir_type = Attribute);
 
+/// Mosaic GPU shared-memory allocation metadata [`Attribute`].
+#[derive(Copy, Clone)]
+pub struct SmemAllocAttributeRef<'c, 't> {
+    /// Handle that represents this [`Attribute`] in the MLIR C API.
+    handle: MlirAttribute,
+
+    /// [`Context`] that owns this [`Attribute`].
+    context: &'c Context<'t>,
+}
+
+impl<'c, 't> SmemAllocAttributeRef<'c, 't> {
+    /// Returns the optional byte alignment of the scoped allocation.
+    pub fn alignment(&self) -> Result<Option<IntegerAttributeRef<'c, 't>>, Error> {
+        let handle = unsafe { mlirMosaicGpuSmemAllocAttrGetAlignment(self.handle) };
+        if handle.ptr.is_null() {
+            Ok(None)
+        } else {
+            unsafe { IntegerAttributeRef::from_c_api(handle, self.context) }.map(Some)
+        }
+    }
+}
+
+impl<'c, 't> Attribute<'c, 't> for SmemAllocAttributeRef<'c, 't> {
+    unsafe fn from_c_api(handle: MlirAttribute, context: &'c Context<'t>) -> Result<Self, Error> {
+        if !handle.ptr.is_null() && unsafe { mlirMosaicGpuIsASmemAllocAttr(handle) } {
+            Ok(Self { handle, context })
+        } else {
+            Err(Error::invalid_argument("expected MLIR attribute handle"))
+        }
+    }
+
+    unsafe fn to_c_api(&self) -> MlirAttribute {
+        self.handle
+    }
+
+    fn context(&self) -> &'c Context<'t> {
+        self.context
+    }
+}
+
+mlir_subtype_trait_impls!(SmemAllocAttributeRef<'c, 't> as Attribute, mlir_type = Attribute);
+
 /// Mosaic GPU tensor-memory address-space [`Attribute`].
 #[derive(Copy, Clone)]
 pub struct TmemAttributeRef<'c, 't> {
@@ -804,6 +847,30 @@ impl<'t> Context<'t> {
                 context: self,
             }
         })
+    }
+
+    /// Creates Mosaic GPU scoped shared-memory allocation metadata owned by this [`Context`].
+    ///
+    /// An explicit byte alignment must be a positive power of two representable by an `i64` attribute.
+    pub fn mosaic_gpu_smem_alloc_attribute<'c>(
+        &'c self,
+        alignment: Option<u64>,
+    ) -> Result<SmemAllocAttributeRef<'c, 't>, Error> {
+        if alignment.is_some_and(|alignment| !alignment.is_power_of_two() || alignment > i64::MAX as u64) {
+            return Err(Error::invalid_argument("expected a positive power-of-two `i64` shared-memory alignment"));
+        }
+        self.load_dialect(DialectHandle::mosaic_gpu()?)?;
+        let alignment =
+            alignment.map(|alignment| self.integer_attribute(self.signless_integer_type(64), alignment as i64));
+        unsafe {
+            SmemAllocAttributeRef::from_c_api(
+                mlirMosaicGpuSmemAllocAttrGet(
+                    *self.handle.borrow_mut(),
+                    alignment.map_or(MlirAttribute { ptr: std::ptr::null() }, |alignment| alignment.to_c_api()),
+                ),
+                self,
+            )
+        }
     }
 
     /// Creates a Mosaic GPU tensor-memory address-space attribute owned by this [`Context`].
@@ -1007,6 +1074,30 @@ mod tests {
         assert_eq!(attribute.axis(), 1);
         assert!(attribute.is::<CopyPartitionAttributeRef>());
         test_attribute_casting(attribute);
+    }
+
+    #[test]
+    fn test_smem_alloc_attribute() {
+        let context = Context::new();
+        let attribute = context.mosaic_gpu_smem_alloc_attribute(Some(128)).unwrap();
+        assert_eq!(&context, attribute.context());
+        assert_eq!(attribute.alignment().unwrap().unwrap().signless_value(), 128);
+        assert_eq!(attribute.to_string(), "#mosaic_gpu.smem_alloc<alignment = 128>");
+        assert_eq!(attribute, context.mosaic_gpu_smem_alloc_attribute(Some(128)).unwrap());
+        assert_ne!(attribute, context.mosaic_gpu_smem_alloc_attribute(Some(64)).unwrap());
+        test_attribute_casting(attribute);
+        let unspecified = context.mosaic_gpu_smem_alloc_attribute(None).unwrap();
+        assert_eq!(unspecified.alignment().unwrap(), None);
+        assert_eq!(unspecified.to_string(), "#mosaic_gpu.smem_alloc");
+        assert!(matches!(
+            context.mosaic_gpu_smem_alloc_attribute(Some(3)),
+            Err(Error::InvalidArgument { message, .. })
+                if message == "expected a positive power-of-two `i64` shared-memory alignment",
+        ));
+        assert!(matches!(
+            unsafe { SmemAllocAttributeRef::from_c_api(MlirAttribute { ptr: std::ptr::null() }, &context) },
+            Err(Error::InvalidArgument { message, .. }) if message == "expected MLIR attribute handle",
+        ));
     }
 
     #[test]

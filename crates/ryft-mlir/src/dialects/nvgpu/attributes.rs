@@ -213,7 +213,7 @@ mod tests {
                 fn [<test_ $test_name _attribute_display_and_debug>]() {
                     let context = Context::new();
                     let attribute = context.$constructor($enum_name::$first).unwrap();
-                    let expected = format!("#nvgpu<{} {}>", stringify!($test_name), $enum_name::$first.as_str());
+                    let expected = format!("#nvgpu.{}<{}>", stringify!($test_name), $enum_name::$first.as_str());
                     test_attribute_display_and_debug(attribute, Box::leak(expected.into_boxed_str()));
                 }
 
@@ -222,7 +222,7 @@ mod tests {
                     let context = Context::new();
                     context.load_dialect(DialectHandle::nvgpu().unwrap()).unwrap();
                     let attribute = context.$constructor($enum_name::$first).unwrap();
-                    let source = format!("#nvgpu<{} {}>", stringify!($test_name), $enum_name::$first.as_str());
+                    let source = format!("#nvgpu.{}<{}>", stringify!($test_name), $enum_name::$first.as_str());
                     assert_eq!(context.parse_attribute(&source).unwrap().cast::<$attribute_name>().unwrap(), attribute);
                 }
 

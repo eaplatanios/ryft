@@ -447,9 +447,10 @@ pub(crate) mod ffi {
 
     use crate::extensions::ffi::attributes::ffi::{XLA_FFI_Attrs, XLA_FFI_ByteSpan};
     use crate::extensions::ffi::context::ffi::{
-        XLA_FFI_DeviceMemory_Allocate, XLA_FFI_DeviceMemory_Free, XLA_FFI_DeviceOrdinal_Get, XLA_FFI_InvokeContext,
-        XLA_FFI_InvokeContext_FindExtension, XLA_FFI_InvokeContext_Get, XLA_FFI_RunId_Get, XLA_FFI_State_Get,
-        XLA_FFI_State_Set, XLA_FFI_Stream_Get, XLA_FFI_ThreadPool_NumThreads, XLA_FFI_ThreadPool_Schedule,
+        XLA_FFI_CustomOptions_Get, XLA_FFI_DeviceMemory_Allocate, XLA_FFI_DeviceMemory_Free, XLA_FFI_DeviceOrdinal_Get,
+        XLA_FFI_InvokeContext, XLA_FFI_InvokeContext_FindExtension, XLA_FFI_InvokeContext_Get, XLA_FFI_RunId_Get,
+        XLA_FFI_State_Get, XLA_FFI_State_Set, XLA_FFI_Stream_Get, XLA_FFI_ThreadPool_NumThreads,
+        XLA_FFI_ThreadPool_Schedule,
     };
     use crate::extensions::ffi::errors::ffi::{
         XLA_FFI_Error, XLA_FFI_Error_Create, XLA_FFI_Error_Destroy, XLA_FFI_Error_GetDetails,
@@ -517,6 +518,7 @@ pub(crate) mod ffi {
         pub XLA_FFI_RunId_Get: Option<XLA_FFI_RunId_Get>,
         pub XLA_FFI_DeviceOrdinal_Get: Option<XLA_FFI_DeviceOrdinal_Get>,
         pub XLA_FFI_InvokeContext_FindExtension: Option<XLA_FFI_InvokeContext_FindExtension>,
+        pub XLA_FFI_CustomOptions_Get: Option<XLA_FFI_CustomOptions_Get>,
     }
 
     #[repr(C)]

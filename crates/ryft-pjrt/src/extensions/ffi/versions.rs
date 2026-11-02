@@ -30,7 +30,7 @@ pub(crate) mod ffi {
     use crate::extensions::ffi::handlers::ffi::XLA_FFI_InternalExtension;
 
     pub const XLA_FFI_API_VERSION_MAJOR: usize = 0;
-    pub const XLA_FFI_API_VERSION_MINOR: usize = 4;
+    pub const XLA_FFI_API_VERSION_MINOR: usize = 5;
 
     #[repr(C)]
     pub struct XLA_FFI_Api_Version {
@@ -55,7 +55,7 @@ mod tests {
 
     #[test]
     fn test_version_display() {
-        assert_eq!(format!("{VERSION}"), "0.4");
+        assert_eq!(format!("{VERSION}"), "0.5");
     }
 
     #[test]

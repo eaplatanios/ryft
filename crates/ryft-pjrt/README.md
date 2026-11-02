@@ -11,7 +11,7 @@ Producer-neutral cubin/PTX artifact loading and CUDA Driver API kernel launching
 [`ryft-cuda`](../ryft-cuda) crate. This crate only adapts CUDA PJRT clients and XLA FFI streams and buffers to that
 runtime when either the `cuda-12` or `cuda-13` feature is enabled.
 
-Note that this crate forwards the following feature flags directly to `ryft-xla-sys`: `cuda-12`, `cuda-13`, `rocm-7`,
+Note that this crate forwards the following feature flags directly to `ryft-xla-sys`: `cuda-12`, `cuda-13`, `rocm-10`,
 `tpu`, `neuron`, `metal`, and `mps`. For information on what those flags represent and guidance on how to use them,
 refer to [`crates/ryft-xla-sys/README.md`](../ryft-xla-sys/README.md).
 
@@ -38,10 +38,11 @@ fn main() {
 
 At a high-level, a typical workflow for working with `ryft-pjrt` looks as follows:
 
-1. **Load a Plugin:** Load the built-in CPU plugin using `load_cpu_plugin()` or, depending on the feature flags you have
-   enabled, accelerator-specific plugins using `load_cuda_12_plugin()`, `load_cuda_13_plugin()`, `load_rocm_7_plugin()`,
-   `load_tpu_plugin()`, `load_neuron_plugin()`, `load_metal_plugin()`, and `load_mps_plugin()`. You can also load a
-   third-party plugin by using `load_plugin(path)` and providing a path to the relevant shared library.
+1. **Load a Plugin:** Load the built-in CPU plugin using `load_cpu_plugin()` or, depending on the feature
+   flags you have enabled, accelerator-specific plugins using `load_cuda_12_plugin()`, `load_cuda_13_plugin()`,
+   `load_rocm_10_plugin()`, `load_tpu_plugin()`, `load_neuron_plugin()`, `load_metal_plugin()`, and `load_mps_plugin()`.
+   You can also load a third-party plugin by using `load_plugin(path)` and providing a path to the relevant shared
+   library.
 2. **Create a Client:** Create a single-host client using `plugin.client(options)` and a multi-host client using
    `plugin.client_with_key_value_store(options, store)`. In order to use the latter properly, you will also need
    to leverage `plugin.distributed_runtime_service(..)`, `plugin.distributed_runtime_client(..)`,

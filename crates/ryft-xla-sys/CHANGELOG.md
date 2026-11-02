@@ -26,9 +26,21 @@ and this project adheres to [Semantic Versioning](https://semver.org/).
 
 ### Changed
 
-- Upgraded the OpenXLA dependency pin to commit `eb6b90ed013f511eca088c52f541f3c0819f919e` and the JAX dependency pin
-  to commit `a7606f995e1a92707cbeb257e487fa53e7abe84b`, which also upgraded the LLVM, StableHLO (v1.20.0), Shardy, and
-  Triton pins. This also required updating the Bazel dependency for building the native library to version 8.7.0.
+- Upgraded the OpenXLA dependency pin to commit `f824cdd4dce2f2c0ce092fb7cfdc7ad1ebc92163` and the JAX dependency pin
+  to commit `9564ca1d3df0d312cad4346458b8d41ce5204ff7`, together with their LLVM, StableHLO, Shardy, and Triton pins.
+  Native builds now use Bazel 8.8.2, CCCL 3.4.0 and XLA's pinned ROCm 10.0.0 multiarch distribution.
+- Updated the ROCm plugin feature, artifact names, environment variables and path accessor to ROCm 10.
+- Removed the obsolete `enable_libnvjitlink_support` Bazel flag following XLA's unconditional nvJitLink support.
+- Removed the CUDA 12 `sm_50` target because the pinned Eigen headers require compute capability 6.0 or newer.
+- Used the shared Bash copy recipe for LLVM operation shards on Windows and preserved copied C++ source bytes.
+- Retained absolute junctions in the Windows LLVM source overlay by opting it out of Bazel's reproducible repository
+  contents caching, whose relative link rewriting made sources inaccessible through the execroot junction.
+- Avoided Windows SDK floating-point classification overloads in XNNPACK integer min/max reductions while preserving
+  floating-point NaN handling.
+- Regenerated native bindings for XLA FFI custom options, split GPU pass registrations and the LLVM C API changes,
+  including the additional DI string type character-type argument and removal of obsolete MHLO domain attributes.
+- Synchronized XLA Protobuf fields, enums and optional-presence semantics, including BLASLt algorithm configurations,
+  target-machine options, GPU device metadata, memory statistics, compiler variants and profiler multipass settings.
 - Replaced the LLVM dialect token type C++ bindings (`mlirTypeIsALlvmTokenType` and `mlirLlvmTokenTypeGet`) with
   builtin dialect token type bindings (`mlirTypeIsAToken` and `mlirTokenTypeGet`) following the upstream MLIR
   replacement of `!llvm.token` with the builtin `token` type.
@@ -38,8 +50,8 @@ and this project adheres to [Semantic Versioning](https://semver.org/).
   types, the mesh iota transform, the named sharding reduction operation, new GPU topology and GPU device information
   fields, new `DebugOptions` fields and support types, and the `OpMetadata` payload message, and removed fields whose
   tags are now reserved upstream.
-- Updated CUDA 12 and ROCm 7 Bazel build configuration for the new OpenXLA toolchain dependencies, including bumping
-  `rules_ml_toolchain` and the hermetic ROCm distribution to `rocm_7.13.0_gfx908`.
+- Updated CUDA 12 and ROCm 10 Bazel build configuration for the new OpenXLA toolchain dependencies, including the
+  inherited `rules_ml_toolchain` revision and hermetic ROCm distribution.
 - Updated the PJRT TPU plugin to `libtpu` version `0.0.47`.
 - Updated the PJRT Neuron plugin to `libneuronxla` version `3.0.5356.0+c743c3ec`.
 - Synchronized mirrored XLA protobuf definitions for command buffer command types, autotune backends, debug options,

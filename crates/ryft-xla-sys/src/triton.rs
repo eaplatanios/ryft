@@ -324,7 +324,8 @@ mod tests {
         let mut versions = unsafe { RYFT_XLA_Triton_Get_Versions() };
         let revision = unsafe { std::slice::from_raw_parts(versions.xla.data.cast::<u8>(), versions.xla.length) };
         assert_eq!(revision, crate::XLA_COMMIT.as_bytes());
-        assert_eq!(versions.jax.length, 40);
+        let revision = unsafe { std::slice::from_raw_parts(versions.jax.data.cast::<u8>(), versions.jax.length) };
+        assert_eq!(revision, crate::JAX_COMMIT.as_bytes());
         assert_eq!(versions.triton.length, 40);
         assert_eq!(versions.rocm_device_libs.length, 40);
         assert!(versions.assembler_version_size > 0);

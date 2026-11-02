@@ -690,7 +690,7 @@ mod tests {
     fn test_profiler_extension() {
         test_for_each_platform!(|plugin, client, platform| {
             match platform {
-                TestPlatform::Cuda12 | TestPlatform::Cuda13 | TestPlatform::Rocm7 | TestPlatform::Mps => {
+                TestPlatform::Cuda12 | TestPlatform::Cuda13 | TestPlatform::Rocm10 | TestPlatform::Mps => {
                     assert!(plugin.profiler_extension().is_ok());
                     assert!(client.profiler_extension().is_ok());
                 }
@@ -706,7 +706,7 @@ mod tests {
     fn test_profiler() {
         test_for_each_platform!(|plugin, client, platform| {
             match platform {
-                TestPlatform::Cuda12 | TestPlatform::Cuda13 | TestPlatform::Rocm7 => {
+                TestPlatform::Cuda12 | TestPlatform::Cuda13 | TestPlatform::Rocm10 => {
                     // Create a profiler and start profiling.
                     let options = ProfileOptions {
                         version: 1,
@@ -748,6 +748,7 @@ mod tests {
                         target_config: None,
                         allow_in_place_mlir_modification: false,
                         matrix_unit_operand_precision: Precision::Default as i32,
+                        ..Default::default()
                     };
                     let executable = client.compile(&program, &options).unwrap();
                     let device = executable.addressable_devices().unwrap()[0].clone();
@@ -770,7 +771,7 @@ mod tests {
                         ],
                         ..Default::default()
                     };
-                    let execution = executable.execute(vec![inputs], vec![], 0, None, None, None, None).unwrap();
+                    let execution = executable.execute(vec![inputs], vec![], 0, None, None, None, None, &[]).unwrap();
                     let mut outputs = execution.block_until_ready().unwrap();
                     assert_eq!(outputs.len(), 1);
                     let mut outputs = outputs.remove(0);
