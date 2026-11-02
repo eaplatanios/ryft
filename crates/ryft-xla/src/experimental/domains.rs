@@ -14,14 +14,14 @@ use prost::Message;
 use ryft_core::macros::check_count;
 use ryft_core::{
     AnalyzableCompilationDomain, ArrayIrType, ArrayIrValue, ArrayOperation, ArrayReference, ArrayType, AttachedRegions,
-    BatchingError, CallRequest, Cast, CastType, Compare, CompilationCacheDomain, CompilationContext, CompilationDomain,
-    CompilationRequest, Concretizable, Constant, ConstantOperation, Context, DataType, Device, DeviceId, DeviceMesh,
-    DifferentiationError, Dimension, DimensionBounds, DimensionFromScalar, DimensionOperation, DimensionSize,
-    DimensionType, DimensionValue, DimensionVariable, DiskCache, Domain, DomainTracer, EagerContext, EffectClass,
-    EmptyRegionDriver, ExternalReferenceBinding, FlatCompilationProgram, InterpretableOperation, Layout, LogicalMesh,
-    LoweringRequest, Memory, MeshAxis, MeshAxisType, ONE_OPERATION_NAME, Operation, OperationProvider, Parameterized,
-    Placeholder, ProgramError, Provenance, ProvenanceScope, ReadyOrPendingReferenceGuard, ReductionKind,
-    ReferenceCompletion, ReferenceCompletionBackend, ReferenceDischargeResult, ReferenceExecution, ReferenceId,
+    BatchingError, Cast, CastType, Compare, CompilationCacheDomain, CompilationContext, CompilationDomain,
+    Concretizable, Constant, ConstantOperation, Context, DataType, Device, DeviceId, DeviceMesh, DifferentiationError,
+    Dimension, DimensionBounds, DimensionFromScalar, DimensionOperation, DimensionSize, DimensionType, DimensionValue,
+    DimensionVariable, DiskCache, Domain, DomainTracer, EagerContext, EffectClass, EmptyRegionDriver,
+    ExternalReferenceBinding, FlatCompilationProgram, InterpretableOperation, Layout, LogicalMesh, Memory, MeshAxis,
+    MeshAxisType, ONE_OPERATION_NAME, Operation, OperationProvider, Parameterized, Placeholder, ProgramError,
+    Provenance, ProvenanceScope, ReadyOrPendingReferenceGuard, ReductionKind, ReferenceCompletion,
+    ReferenceCompletionBackend, ReferenceDischargeResult, ReferenceExecution, ReferenceId,
     ReferenceReplacementPreparation, ReferenceSource, RegionDriver, RegionKey, RegionRef, ScatterMode,
     ScatterReductionKind, Shape, Sharding, ShardingDimension, SortDirection, SpecializationCache,
     SpecializationCacheEntry, SpecializationCacheStatistics, StatefulCompilationDomain, StaticShape, StridedLayout,
@@ -3970,102 +3970,82 @@ impl<'c> CompilationDomain for XlaDomain<'c> {
         Ok((XlaDispatchKey(XlaDispatchKeyKind::Bucketed(key)), input_types.into()))
     }
 
-    fn lower<Request>(
+    fn lower(
         &self,
-        staged: Request,
-    ) -> Result<ryft_core::compilation::LoweredFunction<Self, Request::Input, Request::Output>, Self::Error>
-    where
-        Request: LoweringRequest<Self>,
-    {
-        let staged_input_types = staged.staged().input_types();
-        if apply_input_shardings(staged_input_types.to_vec(), staged.staged().options())? != staged_input_types {
+        program: &FlatCompilationProgram<Self>,
+        capture_count: usize,
+        input_types: &[ArrayIrType],
+        output_types: &[ArrayIrType],
+        options: &XlaOptions,
+    ) -> Result<(XlaLoweredProgram, Vec<ArrayIrType>), Self::Error> {
+        if apply_input_shardings(input_types.to_vec(), options)? != input_types {
             return Err(XlaDomainError::InvalidCompilationOptions {
                 reason: "staged input types do not carry the shardings requested by `in_shardings`; apply them to the \
                          input types before staging (e.g., with `with_input_shardings`)"
                     .to_string(),
             });
         }
-        let lifted_program = staged.lifted_program()?;
-        let capture_count = staged.staged().source_program().captures().len();
-        validate_reference_outputs(&lifted_program, capture_count, staged.staged().output_types())?;
-        let program = self.lower_xla_program(&lifted_program, capture_count, staged.staged().options())?;
-        let output_types = program.output_types().to_vec();
+        validate_reference_outputs(program, capture_count, output_types)?;
+        let lowered_program = self.lower_xla_program(program, capture_count, options)?;
+        let lowered_output_types = lowered_program.output_types().to_vec();
         // Lowering applies the output sharding overrides to the program outputs, so the traced output types of the
         // staged function are checked against the lowered ones with those same overrides applied.
-        let declared_output_types = apply_signature_shardings(
-            staged.staged().output_types().to_vec(),
-            staged.staged().options().out_shardings.as_deref(),
-            "out",
-        )?;
-        validate_output_types(&declared_output_types, &output_types)?;
-        Ok(staged.into_lowered(program, output_types.into_iter().map(Into::into).collect()))
+        let declared_output_types =
+            apply_signature_shardings(output_types.to_vec(), options.out_shardings.as_deref(), "out")?;
+        validate_output_types(&declared_output_types, &lowered_output_types)?;
+        Ok((lowered_program, lowered_output_types.into_iter().map(Into::into).collect()))
     }
 
-    fn compile<Request>(
+    fn compile(
         &self,
-        lowered: Request,
-    ) -> Result<ryft_core::compilation::CompiledFunction<Self, Request::Input, Request::Output>, Self::Error>
-    where
-        Request: CompilationRequest<Self>,
-    {
-        // Cheap clone: the lowered program is a bundle of `Arc` handles. The snapshot outlives `compile_request`,
-        // which consumes the request, so the resolved program can be cross-checked below even on cache hits.
-        let expected = lowered.lowered().lowered_program().clone();
-        let compiled = self.compilation_context().compile_request(
-            self,
-            lowered,
-            |program| self.compile_xla_program(program),
-            |program| program.output_types().iter().cloned().map(Into::into).collect(),
-        )?;
+        program: &XlaLoweredProgram,
+    ) -> Result<(Arc<XlaCompiledProgram<'c>>, Vec<ArrayIrType>), Self::Error> {
+        let compiled =
+            self.compilation_context().compile(self, program, |program| self.compile_xla_program(program))?;
         // Fresh compilations copy this metadata verbatim, so this rejects only programs resolved from the in-memory,
         // persistent, or distributed cache tiers whose invocation contract does not match the requesting lowering
         // (e.g., a corrupted or colliding persistent entry). The stateful transaction trusts this metadata, so a
         // mismatch must fail the compile instead of the first call.
-        if let Some(field) = incompatible_xla_invocation_field((&expected).into(), compiled.compiled_program().into()) {
+        if let Some(field) = incompatible_xla_invocation_field(program.into(), compiled.as_ref().into()) {
             return Err(XlaDomainError::InvalidCompilationOptions {
                 reason: format!("cached executable has incompatible {field}"),
             });
         }
-        Ok(compiled)
+        let output_types = compiled.output_types().iter().cloned().map(Into::into).collect();
+        Ok((compiled, output_types))
     }
 
-    fn call<Request>(&self, request: Request) -> Result<Request::RuntimeOutput, Self::Error>
-    where
-        Request: CallRequest<Self>,
-    {
-        self.call_stateless_request(request).map(|(output, _)| output)
+    fn call(
+        &self,
+        program: &XlaCompiledProgram<'c>,
+        input_types: &[ArrayIrType],
+        arguments: Vec<XlaValue<'c>>,
+    ) -> Result<Vec<XlaValue<'c>>, Self::Error> {
+        self.call_stateless(program, input_types, arguments).map(|(outputs, _)| outputs)
     }
 }
 
 impl<'c> XlaDomain<'c> {
-    /// Executes one stateless request and returns its reconstructed public output together with the whole-execution
-    /// completion fence.
+    /// Executes one stateless call on flat `arguments` (refer to [`CompilationDomain::call`]) and returns its public
+    /// outputs together with the whole-execution completion fence.
     ///
     /// The returned output arrays already carry the fence individually, so the synchronous [`CompilationDomain`]
     /// `call` drops the returned fence; the stateful asynchronous surface threads it into a completion instead so
     /// that awaiting a reference-free invocation still observes asynchronous execution errors. When the program has
     /// no outputs, the effect scope retains effectful completion. Only pure zero-output calls explicitly wait.
-    fn call_stateless_request<Request>(
+    fn call_stateless(
         &self,
-        request: Request,
-    ) -> Result<(Request::RuntimeOutput, ExecutionFence), XlaDomainError>
-    where
-        Request: CallRequest<Self>,
-    {
-        let executable = request.executable().clone();
-        if executable.compiled_program().requires_stateful_call() {
+        program: &XlaCompiledProgram<'c>,
+        input_types: &[ArrayIrType],
+        arguments: Vec<XlaValue<'c>>,
+    ) -> Result<(Vec<XlaValue<'c>>, ExecutionFence), XlaDomainError> {
+        if program.requires_stateful_call() {
             return Err(XlaDomainError::UnsupportedReferenceAbi {
                 reason: "external reference state requires `call_statefully`".to_string(),
             });
         }
-        if request.inputs().len() != executable.input_types().len() {
-            return Err(ProgramError::InvalidInputCount {
-                expected: executable.input_types().len(),
-                actual: request.inputs().len(),
-            }
-            .into());
-        }
-        for (declared, input) in executable.input_types().iter().zip(request.inputs()) {
+        check_count!("input", arguments, program.capture_count + input_types.len(), ProgramError);
+        for (declared, input) in input_types.iter().zip(&arguments[program.capture_count..]) {
             let declared = <&ArrayType>::try_from(declared).map_err(ProgramError::from)?;
             // Array inputs borrow their types, while the array IR type of other inputs is built only to report them.
             match input {
@@ -4076,20 +4056,18 @@ impl<'c> XlaDomain<'c> {
                 )?,
             }
         }
-        let arguments = request
-            .into_arguments()
+        let arguments = arguments
             .into_iter()
             .map(ValueProjection::<ArrayType>::into_projected)
             .collect::<Result<Vec<_>, _>>()
             .map_err(ProgramError::from)?;
-        let execution = self.execute_compiled_async(executable.compiled_program(), arguments)?;
-        if execution.output().is_empty() && !executable.compiled_program().signature.has_effects() {
+        let execution = self.execute_compiled_async(program, arguments)?;
+        if execution.output().is_empty() && !program.signature.has_effects() {
             execution.fence().block_until_ready()?;
         }
         let (outputs, fence) = execution.into_parts();
-        validate_runtime_outputs(executable.compiled_program().output_types(), &outputs)?;
-        let output = Request::reconstruct(&executable, outputs.into_iter().map(XlaValue::Array).collect())?;
-        Ok((output, fence))
+        validate_runtime_outputs(program.output_types(), &outputs)?;
+        Ok((outputs.into_iter().map(XlaValue::Array).collect(), fence))
     }
 
     /// Locks one stateful reference while preserving reference lifecycle errors as [`XlaDomainError::Reference`].
@@ -4105,24 +4083,22 @@ impl<'c> XlaDomain<'c> {
         })
     }
 
-    /// Submits one stateful request, publishes its dependencies, and commits hidden final states without waiting for
-    /// device completion when the logical boundary is static.
-    fn execute_stateful_request_async<Request>(
+    /// Submits one stateful call on flat `arguments` (refer to [`CompilationDomain::call`]), publishes its
+    /// dependencies, and commits hidden final states without waiting for device completion when the logical boundary
+    /// is static.
+    fn execute_stateful_async(
         &self,
-        request: Request,
-    ) -> ReferenceExecution<Request::RuntimeOutput, XlaDomainError>
-    where
-        Request: CallRequest<Self>,
-    {
+        program: &XlaCompiledProgram<'c>,
+        input_types: &[ArrayIrType],
+        arguments: Vec<XlaValue<'c>>,
+    ) -> ReferenceExecution<Vec<XlaValue<'c>>, XlaDomainError> {
         if let Err(error) = ensure_effect_dispatch_allowed() {
             return ReferenceExecution::ready(Err(error));
         }
-        let executable = request.executable().clone();
-        let program = executable.compiled_program();
         if program.reference_states.is_empty() {
             // A reference-free invocation binds no holders, but the completion contract still promises that awaiting
             // the result observes whole-invocation completion, so the execution fence rides along as the completion.
-            return match self.call_stateless_request(request) {
+            return match self.call_stateless(program, input_types, arguments) {
                 Ok((output, fence)) => ReferenceExecution::pending(
                     Ok(output),
                     ReferenceCompletion::new(XlaReferenceCompletion { fence }),
@@ -4132,14 +4108,10 @@ impl<'c> XlaDomain<'c> {
             };
         }
         let prepared = (|| -> Result<_, XlaDomainError> {
-            if request.inputs().len() != executable.input_types().len() {
-                return Err(ProgramError::InvalidInputCount {
-                    expected: executable.input_types().len(),
-                    actual: request.inputs().len(),
-                }
-                .into());
-            }
-            for (declared, actual) in executable.input_types().iter().zip(request.inputs().iter().map(Typed::r#type)) {
+            check_count!("input", arguments, program.capture_count + input_types.len(), ProgramError);
+            for (declared, actual) in
+                input_types.iter().zip(arguments[program.capture_count..].iter().map(Typed::r#type))
+            {
                 match (declared, actual.as_ref()) {
                     (ArrayIrType::Array(declared), ArrayIrType::Array(actual)) => {
                         validate_xla_input_type(declared, actual)?;
@@ -4156,7 +4128,6 @@ impl<'c> XlaDomain<'c> {
                 }
             }
 
-            let arguments = request.into_arguments();
             let (captures, inputs) = arguments.split_at(program.capture_count.min(arguments.len()));
             validate_reference_boundary(inputs.iter(), captures.iter()).map_err(ProgramError::from)?;
             let reference_state_input_indices = program
@@ -4478,7 +4449,7 @@ impl<'c> XlaDomain<'c> {
                     .into());
                 }
                 validate_runtime_outputs(program.output_types(), &public_outputs)?;
-                Request::reconstruct(&executable, public_outputs.into_iter().map(XlaValue::Array).collect())
+                Ok(public_outputs.into_iter().map(XlaValue::Array).collect())
             })();
             Ok(ReferenceExecution::pending(public_result, completion, xla_reference_completion_error))
         })();
@@ -4490,14 +4461,13 @@ impl<'c> XlaDomain<'c> {
 }
 
 impl<'c> StatefulCompilationDomain for XlaDomain<'c> {
-    fn call_statefully_async<Request>(
+    fn call_statefully_async(
         &self,
-        request: Request,
-    ) -> ReferenceExecution<Request::RuntimeOutput, Self::Error>
-    where
-        Request: CallRequest<Self>,
-    {
-        self.execute_stateful_request_async(request)
+        program: &XlaCompiledProgram<'c>,
+        input_types: &[ArrayIrType],
+        arguments: Vec<XlaValue<'c>>,
+    ) -> ReferenceExecution<Vec<XlaValue<'c>>, Self::Error> {
+        self.execute_stateful_async(program, input_types, arguments)
     }
 }
 
@@ -10577,7 +10547,7 @@ mod tests {
         .unwrap()
         .into_inner();
         let compiled: ryft_core::compilation::CompiledFunction<XlaDomain<'_>, ArrayIrType, ArrayIrType> =
-            domain.compile(domain.lower(staged).unwrap()).unwrap();
+            staged.lower(&domain).unwrap().compile(&domain).unwrap();
         assert_eq!(domain.cache_size(), 1);
 
         for size in [4usize, 7] {
@@ -10909,7 +10879,7 @@ mod tests {
                 .unwrap()
                 .into_inner();
         let compiled: ryft_core::compilation::CompiledFunction<XlaDomain<'_>, ArrayIrType, ArrayIrType> =
-            engine.compile(engine.lower(staged).unwrap()).unwrap();
+            staged.lower(&engine).unwrap().compile(&engine).unwrap();
 
         // Round-trip a small input through the new CompilationDomain-driven pipeline.
         let values = [0.0f32, 0.5, 1.0, 1.5];
@@ -10953,7 +10923,7 @@ mod tests {
             .unwrap()
             .into_inner();
             let _: ryft_core::compilation::CompiledFunction<XlaDomain<'_>, ArrayIrType, ArrayIrType> =
-                engine.compile(engine.lower(staged).unwrap()).unwrap();
+                staged.lower(&engine).unwrap().compile(&engine).unwrap();
         }
         assert_eq!(
             engine.cache_size(),
@@ -10982,7 +10952,7 @@ mod tests {
         .unwrap()
         .into_inner();
         let compiled: ryft_core::compilation::CompiledFunction<XlaDomain<'_>, ArrayIrType, ArrayIrType> =
-            domain.compile(domain.lower(staged).unwrap()).unwrap();
+            staged.lower(&domain).unwrap().compile(&domain).unwrap();
         assert_eq!(compiled.compiled_program().output_types(), std::slice::from_ref(&input_type));
 
         let donated_staged: StagedFunction<XlaDomain<'_>, ArrayIrType, ArrayIrType> =
@@ -10994,7 +10964,7 @@ mod tests {
             )
             .unwrap()
             .into_inner();
-        let donated_lowered = domain.lower(donated_staged).unwrap();
+        let donated_lowered = donated_staged.lower(&domain).unwrap();
         assert_eq!(donated_lowered.lowered_program().donation_flags.as_ref(), &[false]);
         assert_eq!(
             domain.compilation_key(compiled.lowered().lowered_program()).unwrap(),
@@ -11013,7 +10983,7 @@ mod tests {
             )
             .unwrap()
             .into_inner();
-        let boolean_lowered = domain.lower(boolean_staged).unwrap();
+        let boolean_lowered = boolean_staged.lower(&domain).unwrap();
         assert_ne!(
             domain.compilation_key(compiled.lowered().lowered_program()).unwrap(),
             domain.compilation_key(boolean_lowered.lowered_program()).unwrap(),
@@ -11052,13 +11022,13 @@ mod tests {
         )
         .unwrap()
         .into_inner();
-        let lowered = domain.lower(staged).unwrap();
+        let lowered = staged.lower(&domain).unwrap();
         assert!(lowered.lowered_program().stable_hlo().contains("func.func @main(%arg0: tensor<3xf32>"));
         let compiled: ryft_core::compilation::CompiledFunction<
             XlaDomain<'_>,
             (ArrayIrType, ArrayIrType),
             (ArrayIrType, ArrayIrType),
-        > = domain.compile(lowered).unwrap();
+        > = lowered.compile(&domain).unwrap();
         let value = XlaArray::from_host_buffer(
             &domain,
             value_type.clone(),
@@ -11165,7 +11135,7 @@ mod tests {
         .unwrap()
         .into_inner();
         let compiled: ryft_core::compilation::CompiledFunction<XlaDomain<'_>, ArrayIrType, ArrayIrType> =
-            domain.compile(domain.lower(staged).unwrap()).unwrap();
+            staged.lower(&domain).unwrap().compile(&domain).unwrap();
         for rows in [2usize, 4] {
             let values = (0..rows * 5).map(|value| ((value * 7) % 11) as f32).collect::<Vec<_>>();
             let input = XlaArray::from_host_buffer(
@@ -11551,7 +11521,7 @@ mod tests {
         .unwrap()
         .into_inner();
         let compiled: ryft_core::compilation::CompiledFunction<XlaDomain<'_>, ArrayIrType, ArrayIrType> =
-            domain.compile(domain.lower(staged).unwrap()).unwrap();
+            staged.lower(&domain).unwrap().compile(&domain).unwrap();
         let executable_options =
             compiled.compiled_program().compilation_options.executable_build_options.as_ref().unwrap();
         assert_eq!(executable_options.replica_count, 4);
@@ -11605,7 +11575,7 @@ mod tests {
         )
         .unwrap()
         .into_inner();
-        let Err(error) = domain.lower(staged) else {
+        let Err(error) = staged.lower(&domain) else {
             panic!("bounded-dynamic sharded program unexpectedly lowered");
         };
         assert_eq!(
@@ -11917,7 +11887,7 @@ mod tests {
         .unwrap()
         .into_inner();
         let compiled: ryft_core::compilation::CompiledFunction<XlaDomain<'_>, ArrayIrType, ArrayIrType> =
-            domain.compile(domain.lower(staged).unwrap()).unwrap();
+            staged.lower(&domain).unwrap().compile(&domain).unwrap();
         assert!(compiled.compiled_program().plan.output_layouts.is_some());
 
         // Outputs are built from the program's planned layouts, which place every shard like the validating
@@ -11989,7 +11959,7 @@ mod tests {
             .unwrap()
             .into_inner();
             let compiled: ryft_core::compilation::CompiledFunction<XlaDomain<'_>, ArrayIrType, ArrayIrType> =
-                domain.compile(domain.lower(staged).unwrap()).unwrap();
+                staged.lower(&domain).unwrap().compile(&domain).unwrap();
             assert!(compiled.compiled_program().plan.output_layouts.is_none());
         }
     }
@@ -13587,7 +13557,7 @@ mod tests {
         .unwrap()
         .into_inner();
         let compiled: ryft_core::compilation::CompiledFunction<XlaDomain<'_>, ArrayIrType, ArrayIrType> =
-            domain.compile(domain.lower(staged).unwrap()).unwrap();
+            staged.lower(&domain).unwrap().compile(&domain).unwrap();
         let key = domain.compilation_key(compiled.lowered().lowered_program()).unwrap();
         let independent_domain = XlaSession::new(&client).domain();
         let repeated = independent_domain.compilation_key(compiled.lowered().lowered_program()).unwrap();
@@ -13641,7 +13611,7 @@ mod tests {
                 XlaOptions::new(mesh.clone()).with_donate(true),
             )
             .unwrap();
-        let compiled = domain.compile(domain.lower(staged).unwrap()).unwrap();
+        let compiled = staged.lower(&domain).unwrap().compile(&domain).unwrap();
         let compiled_analysis = domain.analyze(compiled.executable_function()).unwrap();
         assert_eq!(domain.analyze(compiled.executable_function()).unwrap(), compiled_analysis);
 
@@ -13771,7 +13741,7 @@ mod tests {
         .unwrap()
         .into_inner();
         let first: ryft_core::compilation::CompiledFunction<XlaDomain<'_>, ArrayIrType, ArrayIrType> =
-            first_domain.compile(first_domain.lower(staged).unwrap()).unwrap();
+            staged.lower(&first_domain).unwrap().compile(&first_domain).unwrap();
         assert_eq!(first_domain.compilation_context().statistics().compilations, 1);
         drop(first);
         drop(first_domain);
@@ -13790,7 +13760,7 @@ mod tests {
         .unwrap()
         .into_inner();
         let _restored: ryft_core::compilation::CompiledFunction<XlaDomain<'_>, ArrayIrType, ArrayIrType> =
-            second_domain.compile(second_domain.lower(staged).unwrap()).unwrap();
+            staged.lower(&second_domain).unwrap().compile(&second_domain).unwrap();
         let statistics = second_domain.compilation_context().statistics();
         assert_eq!(statistics.persistent_hits, 1);
         assert_eq!(statistics.compilations, 0, "restoration must not invoke backend compilation");
@@ -13850,7 +13820,7 @@ mod tests {
         .unwrap()
         .into_inner();
         let foreign: ryft_core::compilation::CompiledFunction<XlaDomain<'_>, ArrayIrType, ArrayIrType> =
-            producer.compile(producer.lower(staged).unwrap()).unwrap();
+            staged.lower(&producer).unwrap().compile(&producer).unwrap();
         let artifact = producer.serialize_program(foreign.compiled_program()).unwrap().unwrap();
 
         let exchange: Arc<dyn CompilationArtifactExchange> = Arc::new(CollidingArtifactExchange { artifact });
@@ -13873,12 +13843,12 @@ mod tests {
         )
         .unwrap()
         .into_inner();
-        let lowered = consumer.lower(staged).unwrap();
+        let lowered = staged.lower(&consumer).unwrap();
 
         // The resolved executable loads cleanly and reports matching boundary types, so only the compile-time
         // cross-check against the requesting lowering can catch the foreign invocation contract.
         assert!(matches!(
-            consumer.compile(lowered),
+            lowered.compile(&consumer),
             Err(XlaDomainError::InvalidCompilationOptions { reason })
                 if reason == "cached executable has incompatible donation flags",
         ));
@@ -14282,7 +14252,7 @@ mod tests {
                         reference_type.clone(),
                         XlaOptions::new(mesh.clone()).with_in_shardings(vec![scalar_sharding.clone()]),
                     )
-                .and_then(|staged| domain.lower(staged))
+                .and_then(|staged| staged.lower(&domain))
                 .map(|_| ()),
             Err(XlaDomainError::UnsupportedReferenceAbi { reason })
                 if reason == "external reference inputs do not support explicit input shardings",
@@ -14306,7 +14276,7 @@ mod tests {
                         ArrayIrType::Array(ArrayType::scalar(DataType::F32)),
                         XlaOptions::new(mesh.clone()).with_out_shardings(vec![scalar_sharding]),
                     )
-                .and_then(|staged| domain.lower(staged))
+                .and_then(|staged| staged.lower(&domain))
                 .map(|_| ()),
             Err(XlaDomainError::UnsupportedReferenceAbi { reason })
                 if reason == "output 0 is a reference allocated inside the program and cannot be returned through \
@@ -14324,7 +14294,7 @@ mod tests {
                         reference_type,
                         XlaOptions::new(mesh.clone()),
                     )
-                .and_then(|staged| domain.lower(staged))
+                .and_then(|staged| staged.lower(&domain))
                 .map(|_| ()),
             Err(XlaDomainError::UnsupportedReferenceAbi { reason })
                 if reason == "output 0 forwards the external reference bound at input 0, and the stateful XLA ABI \
@@ -14358,7 +14328,7 @@ mod tests {
             .stage::<_, ArrayIrType, ArrayIrType>(forward, Vec::new(), scalar_type.clone(), options.clone())
             .unwrap();
         assert!(matches!(
-            domain.lower(staged).map(|_| ()),
+            staged.lower(&domain).map(|_| ()),
             Err(XlaDomainError::InvalidCompilationOptions { reason })
                 if reason == "staged input types do not carry the shardings requested by `in_shardings`; apply them \
                               to the input types before staging (e.g., with `with_input_shardings`)",
@@ -14366,7 +14336,7 @@ mod tests {
 
         let input_types = with_input_shardings(scalar_type, &options).unwrap();
         let staged = domain.stage::<_, ArrayIrType, ArrayIrType>(forward, Vec::new(), input_types, options).unwrap();
-        assert!(domain.lower(staged).is_ok());
+        assert!(staged.lower(&domain).is_ok());
     }
 
     #[test]

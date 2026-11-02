@@ -6,9 +6,8 @@ use std::process::Command;
 use std::time::{Duration, Instant};
 
 use ryft_core::{
-    ArrayIrType, ArrayType, CompilationDomain, CompiledFunction, DataType, Device, DeviceMesh, Dimension, DiskCache,
-    JitCacheStatistics, LogicalMesh, MeshAxis, MeshAxisType, Shape, Sharding, Sin, StagedFunction, ValueProjection,
-    stage,
+    ArrayIrType, ArrayType, CompiledFunction, DataType, Device, DeviceMesh, Dimension, DiskCache, JitCacheStatistics,
+    LogicalMesh, MeshAxis, MeshAxisType, Shape, Sharding, Sin, StagedFunction, ValueProjection, stage,
 };
 use ryft_pjrt::{Client, ClientOptions, CpuClientOptions, load_cpu_plugin};
 use ryft_xla::{
@@ -213,8 +212,8 @@ fn persistent_restore(
     )
     .domain();
     let producer_staged = stage_workload(&producer, mesh, r#type.clone())?;
-    let producer_lowered = producer.lower(producer_staged)?;
-    producer.compile(producer_lowered)?;
+    let producer_lowered = producer_staged.lower(&producer)?;
+    producer_lowered.compile(&producer)?;
 
     let restored = XlaSession::with_configured_disk_cache(
         client,
@@ -222,9 +221,9 @@ fn persistent_restore(
     )
     .domain();
     let restored_staged = stage_workload(&restored, mesh, r#type.clone())?;
-    let restored_lowered = restored.lower(restored_staged)?;
+    let restored_lowered = restored_staged.lower(&restored)?;
     let start = Instant::now();
-    restored.compile(restored_lowered)?;
+    restored_lowered.compile(&restored)?;
     let duration = duration_nanoseconds(start);
     let statistics = restored.compilation_context().statistics();
     Ok(json!({
@@ -253,11 +252,11 @@ fn main() -> Result<(), Box<dyn std::error::Error>> {
     let cold_trace_ns = duration_nanoseconds(start);
 
     let start = Instant::now();
-    let lowered = domain.lower(staged)?;
+    let lowered = staged.lower(&domain)?;
     let cold_lower_ns = duration_nanoseconds(start);
 
     let start = Instant::now();
-    let compiled: BenchmarkCompiledFunction<'_> = domain.compile(lowered)?;
+    let compiled: BenchmarkCompiledFunction<'_> = lowered.compile(&domain)?;
     let cold_compile_ns = duration_nanoseconds(start);
 
     let warmup = call_workload(&domain, &compiled, input.clone())?;

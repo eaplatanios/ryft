@@ -50,13 +50,13 @@ pub use batching::{
 };
 pub use captures::{CaptureConstant, CaptureReference, CapturingContext, ClosedProgram};
 pub use compilation::{
-    AnalyzableCompilationDomain, CallRequest, CompilationArtifactExchange, CompilationArtifactExchangePolicy,
+    AnalyzableCompilationDomain, CompilationArtifactExchange, CompilationArtifactExchangePolicy,
     CompilationCacheDomain, CompilationCacheLevel, CompilationCacheOutcome, CompilationCacheStatistics,
-    CompilationCall, CompilationContext, CompilationDomain, CompilationEvent, CompilationExchangeError,
-    CompilationMissReason, CompilationRequest, CompilationTracer, CompiledCallOperation, CompiledFunction,
-    CompiledFunctionDispatcher, DiskCache, ExecutableFunction, FlatCompilationProgram, FunctionSpecializationKey,
-    JitCacheStatistics, LoweredFunction, LoweringRequest, ReferenceExecution, StagedFunction,
-    StatefulCompilationDomain, jit, jit_with_options, jit_with_options_and_capacity, stage,
+    CompilationContext, CompilationDomain, CompilationEvent, CompilationExchangeError, CompilationMissReason,
+    CompilationTracer, CompiledCallOperation, CompiledFunction, CompiledFunctionDispatcher, DiskCache,
+    ExecutableFunction, FlatCompilationProgram, FunctionSpecializationKey, JitCacheStatistics, LoweredFunction,
+    ReferenceExecution, StagedFunction, StatefulCompilationDomain, jit, jit_with_options,
+    jit_with_options_and_capacity, stage,
 };
 pub use contexts::{
     Context, ContextProjection, Domain, DomainProjection, EagerContext, ProjectedContext, StagingContext,

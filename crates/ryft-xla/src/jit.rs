@@ -672,8 +672,8 @@ where
     let input_types = with_input_shardings(input_types, &options)?;
     let staged =
         domain.stage(|_, capture_tracers, inputs| function(capture_tracers, inputs), captures, input_types, options)?;
-    let lowered = domain.lower(staged)?;
-    Ok(StatefulCompiledXlaFunction { function: domain.compile(lowered)? })
+    let lowered = staged.lower(&domain)?;
+    Ok(StatefulCompiledXlaFunction { function: lowered.compile(&domain)? })
 }
 
 /// Captured-constant output tree produced by tracing an XLA closure.
@@ -841,8 +841,7 @@ impl<'c> XlaDomain<'c> {
         Out::Family:
             ParameterizedFamily<ArrayType> + ParameterizedFamily<ArrayIrType> + ParameterizedFamily<XlaConstant>,
     {
-        let lowered = self.lower(staged.function)?;
-        let function = self.compile(lowered)?;
+        let function = staged.function.lower(self)?.compile(self)?;
         Ok(CompiledXlaFunction { function, derived: Arc::new(DerivedFunctionSlots::new()) })
     }
 
@@ -3129,7 +3128,7 @@ mod tests {
                 XlaOptions::new(mesh),
             )
             .unwrap();
-        let error = domain.lower(staged).err().unwrap();
+        let error = staged.lower(&domain).err().unwrap();
         assert!(matches!(
             error,
             XlaDomainError::UnsupportedReferenceAbi { reason }

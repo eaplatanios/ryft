@@ -1386,7 +1386,7 @@ pub(crate) mod tests {
         let staged: StagedFunction<XlaDomain<'_>, Vec<ArrayIrType>, Vec<ArrayIrType>> = domain
             .stage(|_, _, inputs| replay(program, inputs), vec![], program.input_types(), XlaOptions::new(mesh.clone()))
             .unwrap();
-        let compiled = domain.compile(domain.lower(staged).unwrap()).unwrap();
+        let compiled = staged.lower(&domain).unwrap().compile(&domain).unwrap();
         let inputs = inputs
             .iter()
             .zip(program.input_types())

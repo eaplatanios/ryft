@@ -23,9 +23,9 @@ use std::time::{Duration, Instant};
 
 use ryft_core::compilation::AnalyzableCompilationDomain;
 use ryft_core::{
-    ArrayIrType, ArrayType, CompilationDomain, CompiledFunction, Context, DataType, Device, DeviceMesh, Dimension,
-    DomainTracer, DomainTracingContext, Dot, DotDimensionNumbers, DotsSavable, LogicalMesh, Memory, MeshAxis,
-    MeshAxisType, NothingSavable, OffloadDotsWithNoBatchDimensions, ProgramError, Reduce, ReductionKind,
+    ArrayIrType, ArrayType, CompiledFunction, Context, DataType, Device, DeviceMesh, Dimension, DomainTracer,
+    DomainTracingContext, Dot, DotDimensionNumbers, DotsSavable, LogicalMesh, Memory, MeshAxis, MeshAxisType,
+    NothingSavable, OffloadDotsWithNoBatchDimensions, ProgramError, Reduce, ReductionKind,
     RematerializationOptimizationBarrier, ResidualPolicy, ScanOperation, Shape, Sharding, StagedFunction, Tanh, Typed,
     Value, ValueProjection, differentiate_at, rematerialize, stage,
 };
@@ -313,11 +313,11 @@ fn measure<'c>(
     execution_count: usize,
 ) -> Measurement<'c> {
     let start = Instant::now();
-    let lowered = domain.lower(staged).unwrap();
+    let lowered = staged.lower(&domain).unwrap();
     let lower = start.elapsed();
     let operation_count = lowered.lowered_program().stable_hlo().matches(" = stablehlo.").count();
     let start = Instant::now();
-    let compiled: BenchmarkCompiledFunction<'c> = domain.compile(lowered).unwrap();
+    let compiled: BenchmarkCompiledFunction<'c> = lowered.compile(&domain).unwrap();
     let compile = start.elapsed();
     let memory = domain.analyze(compiled.executable_function()).unwrap().memory;
     let inputs = (XlaValue::Array(inputs.0), XlaValue::Array(inputs.1), XlaValue::Array(inputs.2));

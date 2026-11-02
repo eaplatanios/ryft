@@ -141,11 +141,11 @@ impl KernelAotBundle {
             definition.operation().input_types(),
             options,
         )?;
-        let lowered = domain.lower(staged)?;
+        let lowered = staged.lower(&domain)?;
         let stable_hlo = lowered.lowered_program().stable_hlo().to_owned();
         let lowering_duration = start.elapsed();
         let start = Instant::now();
-        let compiled = domain.compile(lowered)?;
+        let compiled = lowered.compile(&domain)?;
         let compilation_duration = start.elapsed();
         let executable = domain
             .serialize_program(compiled.compiled_program())?
@@ -441,7 +441,7 @@ pub(crate) mod tests {
                 XlaOptions::new(mesh.clone()),
             )
             .unwrap();
-        let compiled = domain.compile(domain.lower(staged).unwrap()).unwrap();
+        let compiled = staged.lower(&domain).unwrap().compile(&domain).unwrap();
         let mut bundle = bundle();
         bundle.manifest.configuration = compiler.configuration().to_vec();
         bundle.executable = domain.serialize_program(compiled.compiled_program()).unwrap().unwrap();

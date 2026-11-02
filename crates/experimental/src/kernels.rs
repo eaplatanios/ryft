@@ -1383,7 +1383,7 @@ mod cutile {
                 ryft_xla::XlaOptions::new(mesh.clone()).with_kernel_compiler(binding),
             )
             .unwrap();
-        let compiled = domain.compile(domain.lower(staged).unwrap()).unwrap();
+        let compiled = staged.lower(&domain).unwrap().compile(&domain).unwrap();
         let executable_bytes = domain.serialize_program(compiled.compiled_program()).unwrap().unwrap();
         cancellation.store(true, Ordering::Release);
         let restored_output =
@@ -1710,8 +1710,8 @@ mod tuning {
 
     use pretty_assertions::assert_eq;
     use ryft_core::{
-        ArrayIrType, CompilationCall, CompilationDomain, CompilationTracer, Device, DeviceMesh, ExecutableFunction,
-        LogicalMesh, MeshAxis, MeshAxisType, ReferenceExecution, StatefulCompilationDomain,
+        ArrayIrType, CompilationDomain, CompilationTracer, Device, DeviceMesh, ExecutableFunction, LogicalMesh,
+        MeshAxis, MeshAxisType, ReferenceExecution, StatefulCompilationDomain,
     };
     use ryft_kernels::{KernelCompiler, KernelSchedule, VerifiedKernel};
     use ryft_xla::kernels::{
@@ -1766,7 +1766,7 @@ mod tuning {
                 )
                 .map_err(error)?;
             // The existing lower/compile path performs real adapter admission before artifact lookup.
-            let compiled = self.domain.compile(self.domain.lower(staged).map_err(error)?).map_err(error)?;
+            let compiled = staged.lower(&self.domain).map_err(error)?.compile(&self.domain).map_err(error)?;
             self.executable = Some(compiled.executable_function().clone());
             Ok(())
         }
@@ -1774,9 +1774,10 @@ mod tuning {
         fn execute(&mut self) -> ReferenceExecution<(), KernelTuningError> {
             let result = (|| {
                 let outputs = self
-                    .domain
-                    .call_statefully_async(CompilationCall::new(self.executable.as_ref().unwrap(), self.inputs.clone()))
-                    .r#await()
+                    .executable
+                    .as_ref()
+                    .unwrap()
+                    .call_statefully(&self.domain, self.inputs.clone())
                     .map_err(error)?;
                 let XlaValue::Array(output) = &outputs[0] else {
                     return Err(KernelTuningError::Invalid { message: "expected an ordinary array output".into() });
@@ -2317,7 +2318,7 @@ mod triton {
                 XlaOptions::new(mesh.clone()).with_kernel_compiler(binding),
             )
             .unwrap();
-        let compiled = domain.compile(domain.lower(staged).unwrap()).unwrap();
+        let compiled = staged.lower(&domain).unwrap().compile(&domain).unwrap();
         let bytes = domain.serialize_program(compiled.compiled_program()).unwrap().unwrap();
         cancellation.store(true, Ordering::Release);
         let session = XlaSession::new(client);
