@@ -29,6 +29,7 @@ use crate::compilation::contexts::CompilationCacheDomain;
 use crate::compilation::exchange::{
     CompilationArtifactExchange, CompilationArtifactExchangePolicy, CompilationExchangeError,
 };
+use crate::compilation::functions::accumulate_duration;
 use crate::programs::ProgramError;
 
 /// Default capacity of the in-memory tier of a [`CompilationContext`]. Use [`CompilationContext::with_capacity`] when
@@ -173,14 +174,6 @@ pub struct CompilationCacheStatistics {
 
     /// Total host duration spent in backend producer closures.
     pub compilation_duration: Duration,
-}
-
-/// Adds `duration` to `counter`, which accumulates nanoseconds and saturates at [`u64::MAX`].
-pub(super) fn accumulate_duration(counter: &AtomicU64, duration: Duration) {
-    let nanoseconds = u64::try_from(duration.as_nanos()).unwrap_or(u64::MAX);
-    counter
-        .try_update(Ordering::Relaxed, Ordering::Relaxed, |total| Some(total.saturating_add(nanoseconds)))
-        .unwrap();
 }
 
 /// Lock-free counters underlying [`CompilationCacheStatistics`]. Durations accumulate in nanoseconds.
@@ -1189,7 +1182,7 @@ impl<C: CompilationCacheDomain> CompilationContext<C> {
         duration: Duration,
         duration_counter: &AtomicU64,
     ) {
-        accumulate_duration(duration_counter, duration);
+        accumulate_duration(duration, duration_counter);
         self.record_event(CompilationEvent { level, outcome, duration, miss_reason });
     }
 

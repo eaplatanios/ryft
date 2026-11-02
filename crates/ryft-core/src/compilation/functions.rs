@@ -7,7 +7,6 @@ use std::sync::{Arc, OnceLock};
 use std::time::{Duration, Instant};
 
 use crate::captures::{CapturingContext, ClosedProgram};
-use crate::compilation::caching::accumulate_duration;
 use crate::compilation::contexts::{CompilationDomain, StatefulCompilationDomain};
 use crate::compilation::operations::StagedCallOperation;
 use crate::contexts::{Context, Domain, StagingContext};
@@ -1019,7 +1018,7 @@ pub struct CompiledFunctionDispatcher<
     Output::Family: ParameterizedFamily<C::Constant>,
 {
     /// State shared by every clone of this dispatcher.
-    state: Arc<CompiledFunctionDispatcherState<C, F, Static, Input, Output>>,
+    state: Arc<CompiledFunctionDispatcherState<C, Static, Input, Output, F>>,
 }
 
 impl<C, Static: Clone + Debug + Eq + Hash, Input, Output, F> CompiledFunctionDispatcher<C, Static, Input, Output, F>
@@ -1366,9 +1365,9 @@ where
         // of every cached call to three clock reads.
         let statistics = &self.state.statistics;
         let dispatch_start = Instant::now();
-        accumulate_duration(&statistics.dispatch_key_nanoseconds, dispatch_start.duration_since(dispatch_key_start));
+        accumulate_duration(dispatch_start.duration_since(dispatch_key_start), &statistics.dispatch_key_nanoseconds);
         let entry = self.state.specializations.try_entry(key);
-        accumulate_duration(&statistics.dispatch_nanoseconds, dispatch_start.elapsed());
+        accumulate_duration(dispatch_start.elapsed(), &statistics.dispatch_nanoseconds);
 
         // A hit skips all frontend production. A vacant producer clears its in-flight marker if any later phase fails,
         // allowing retries. Only recursive production of the same key on this thread is rejected.
@@ -1405,12 +1404,12 @@ where
             input_types,
             self.state.options.clone(),
         );
-        accumulate_duration(&statistics.tracing_nanoseconds, tracing_start.elapsed());
+        accumulate_duration(tracing_start.elapsed(), &statistics.tracing_nanoseconds);
         let staged = staged?;
         statistics.lowerings.fetch_add(1, Ordering::Relaxed);
         let lowering_start = Instant::now();
         let lowered = staged.lower(domain);
-        accumulate_duration(&statistics.lowering_nanoseconds, lowering_start.elapsed());
+        accumulate_duration(lowering_start.elapsed(), &statistics.lowering_nanoseconds);
         let lowered = lowered?;
         statistics.compilation_requests.fetch_add(1, Ordering::Relaxed);
         let compiled = lowered.compile(domain)?;
@@ -1442,10 +1441,10 @@ where
 /// Shared state of a [`CompiledFunctionDispatcher`].
 struct CompiledFunctionDispatcherState<
     C: CompilationDomain<Type: Eq + Hash>,
-    F,
     Static: Clone + Debug + Eq + Hash,
     Input: Parameterized<C::Type, Family: ParameterizedFamily<C::Constant>>,
     Output: Parameterized<C::Type, Family: ParameterizedFamily<C::Constant>>,
+    F,
 > where
     Input::ParameterStructure: Eq + Hash,
 {
@@ -1671,6 +1670,14 @@ impl DispatcherStatisticsAccumulator {
         self.tracing_nanoseconds.store(0, Ordering::Relaxed);
         self.lowering_nanoseconds.store(0, Ordering::Relaxed);
     }
+}
+
+/// Adds `duration` to `counter`, which accumulates nanoseconds and saturates at [`u64::MAX`].
+pub(super) fn accumulate_duration(duration: Duration, counter: &AtomicU64) {
+    let nanoseconds = u64::try_from(duration.as_nanos()).unwrap_or(u64::MAX);
+    counter
+        .try_update(Ordering::Relaxed, Ordering::Relaxed, |total| Some(total.saturating_add(nanoseconds)))
+        .unwrap();
 }
 
 #[cfg(test)]

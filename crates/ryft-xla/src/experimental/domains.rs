@@ -10582,7 +10582,7 @@ mod tests {
             let value =
                 XlaArray::from_host_buffer(&domain, scalar_f32.clone(), mesh.clone(), 2.0_f32.to_ne_bytes().as_slice())
                     .unwrap();
-            function.call((), vec![XlaValue::Array(size), XlaValue::Array(value)])
+            function.execute((), vec![XlaValue::Array(size), XlaValue::Array(value)])
         };
         assert_eq!(read_f32s(&client, program_array(&call(4).unwrap())), vec![8.0]);
         assert_eq!(read_f32s(&client, program_array(&call(7).unwrap())), vec![14.0]);
@@ -12055,7 +12055,7 @@ mod tests {
             let value =
                 XlaArray::from_host_buffer(&domain, scalar_f32.clone(), mesh.clone(), 2.0_f32.to_ne_bytes().as_slice())
                     .unwrap();
-            function.call((), vec![XlaValue::Array(size), XlaValue::Array(value)]).unwrap()
+            function.execute((), vec![XlaValue::Array(size), XlaValue::Array(value)]).unwrap()
         };
 
         assert_eq!(read_f32s(&client, program_array(&call(2))), vec![4.0]);
@@ -13145,7 +13145,7 @@ mod tests {
             );
         let call = |values: &[f32]| {
             let input = f32_vector(&domain, &mesh, values);
-            function.call((), XlaValue::Array(input)).unwrap()
+            function.execute((), XlaValue::Array(input)).unwrap()
         };
 
         let three = call(&[1.0, 2.0, 3.0]);

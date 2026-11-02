@@ -278,7 +278,7 @@ where
             >,
     {
         let inputs = lift_arrays::<In>(inputs)?;
-        project_arrays::<Out>(self.function.call(static_parameters, inputs)?)
+        project_arrays::<Out>(self.function.execute(static_parameters, inputs)?)
     }
 
     /// Returns a snapshot of this dispatcher's frontend activity (refer to [`DispatcherStatistics`]).
@@ -452,7 +452,7 @@ where
             In::To<XlaStatefulCompileTracer<'c>>,
         ) -> Result<Out::To<XlaStatefulCompileTracer<'c>>, XlaDomainError>,
     {
-        self.function.call_statefully(static_parameters, inputs)
+        self.function.execute_statefully_and_wait(static_parameters, inputs)
     }
 
     /// Returns the completion-bearing stateful call shape for one retained specialization.
@@ -473,7 +473,7 @@ where
             In::To<XlaStatefulCompileTracer<'c>>,
         ) -> Result<Out::To<XlaStatefulCompileTracer<'c>>, XlaDomainError>,
     {
-        self.function.call_statefully_async(static_parameters, inputs)
+        self.function.execute_statefully(static_parameters, inputs)
     }
 
     /// Returns a snapshot of this dispatcher's frontend activity (refer to [`DispatcherStatistics`]).
@@ -6306,7 +6306,7 @@ mod tests {
                         tangent,
                         (),
                     )
-                    .expect("nested captured jvp(jit) should stage");
+                    .expect("the JVP of a nested compiled call with captures should stage");
                 (
                     ValueProjection::<ArrayType>::into_projected(primal_output).expect("primal should remain an array"),
                     ValueProjection::<ArrayType>::into_projected(tangent_output)
@@ -6371,8 +6371,11 @@ mod tests {
             .iter()
             .filter(|instruction| matches!(instruction.operation(), XlaOperation::Array(ArrayOperation::Sin(_))))
             .count();
-        assert_eq!(jit_call_count, 2, "jvp(jit(f)) should stage separate primal and pushforward jit_call boundaries",);
-        assert_eq!(inlined_sin_count, 0, "jvp(jit(f)) should not inline the callee body");
+        assert_eq!(
+            jit_call_count, 2,
+            "the JVP of a compiled call should stage separate primal and pushforward `jit_call` boundaries",
+        );
+        assert_eq!(inlined_sin_count, 0, "the JVP of a compiled call should not inline the callee body");
 
         for &(primal, tangent) in &[(0.0f32, 1.0f32), (0.25, 2.0), (0.5, -0.5), (1.0, 0.7)] {
             let primal_array = XlaArray::from_host_buffer(
