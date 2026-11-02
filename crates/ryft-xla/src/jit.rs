@@ -85,7 +85,7 @@ use std::hash::Hash;
 use std::sync::{Arc, Mutex};
 
 use ryft_core::{
-    ArrayIrType, ArrayType, CapturingContext, ClosedProgram, CompilationDomain, CompiledFunction,
+    ArrayIrType, ArrayType, CapturingContext, ClosedProgram, CompiledFunction,
     CompiledFunctionDispatcher as CoreCompiledFunctionDispatcher, Constant, Context, DeviceMesh, DifferentiableType,
     DomainTracingContext, ExecutableFunction, ForwardModeDifferentiate, JitCacheStatistics, Parameterized,
     ParameterizedFamily, ProgramError, ProjectedContext, ProjectedValue, ReferenceExecution, ReverseModeDifferentiate,
@@ -670,14 +670,16 @@ where
         Parameterized<XlaStatefulCompileTracer<'c>, To<ArrayIrType> = Out, To<XlaConstant> = Out::To<XlaConstant>>,
 {
     let input_types = with_input_shardings(input_types, &options)?;
-    let staged =
-        domain.stage(|_, capture_tracers, inputs| function(capture_tracers, inputs), captures, input_types, options)?;
+    let staged = StagedFunction::<_, In, Out>::stage(
+        domain,
+        |_, capture_tracers, inputs| function(capture_tracers, inputs),
+        captures,
+        input_types,
+        options,
+    )?;
     let lowered = staged.lower(&domain)?;
     Ok(StatefulCompiledXlaFunction { function: lowered.compile(&domain)? })
 }
-
-/// Captured-constant output tree produced by tracing an XLA closure.
-type XlaSourceProgramOutput<Out> = XlaProgramConstants<Out>;
 
 /// Staged-but-uncompiled XLA function handle. Returned by [`stage`] and [`stage_with_captures`].
 ///
@@ -712,19 +714,13 @@ where
     In::Family: ParameterizedFamily<ArrayType> + ParameterizedFamily<ArrayIrType> + ParameterizedFamily<XlaConstant>,
     Out::Family: ParameterizedFamily<ArrayType> + ParameterizedFamily<ArrayIrType> + ParameterizedFamily<XlaConstant>,
 {
-    /// Returns the staged source [`Program`](ryft_core::Program) together with its captured runtime values. Useful for
-    /// outer transforms (`grad` / `jvp` / `vjp` / `batch`), staged `jit_call` payloads, and diagnostics (printing the
-    /// traced IR, instruction counts, graph rendering).
+    /// Returns the flat staged source [`Program`](ryft_core::Program) together with its captured runtime values.
+    /// Use it for outer transforms (e.g., `grad`, `jvp`, `vjp`, and `batch`), staged `jit_call` payloads, and
+    /// diagnostics such as printed IR, instruction counts, and graph rendering.
     #[inline]
     pub fn source_program(
         &self,
-    ) -> &ClosedProgram<
-        XlaStatefulValue<'c>,
-        XlaConstant,
-        XlaOperation,
-        XlaProgramConstants<In>,
-        XlaSourceProgramOutput<Out>,
-    > {
+    ) -> &ClosedProgram<XlaStatefulValue<'c>, XlaConstant, XlaOperation, Vec<XlaConstant>, Vec<XlaConstant>> {
         self.function.source_program()
     }
 
@@ -914,14 +910,14 @@ impl<'c> XlaDomain<'c> {
             )?;
         }
 
-        let arguments = executable
+        let inputs = executable
             .function
-            .arguments_with_captures(flat_inputs)
+            .inputs_with_captures(flat_inputs)
             .into_iter()
             .map(ValueProjection::<ArrayType>::into_projected)
             .collect::<Result<Vec<_>, _>>()
             .map_err(ProgramError::from)?;
-        let execution = self.execute_compiled_async(executable.function.compiled_program(), arguments)?;
+        let execution = self.execute_compiled_async(executable.function.compiled_program(), inputs)?;
         let (flat_outputs, fence) = execution.into_parts();
         crate::experimental::domains::validate_runtime_outputs(
             executable.function.compiled_program().output_types(),
@@ -1110,19 +1106,13 @@ where
         self.function.staged().clone().into()
     }
 
-    /// Returns the source [`Program`](ryft_core::Program) that produced the compiled artifact. Useful for outer
+    /// Returns the flat source [`Program`](ryft_core::Program) that produced the compiled artifact. Useful for outer
     /// transforms (`grad` / `jvp` / `vjp` / `batch`), staged `jit_call` payloads, and diagnostics (printing the traced
     /// IR, instruction counts, graph rendering).
     #[inline]
     pub fn source_program(
         &self,
-    ) -> &ClosedProgram<
-        XlaStatefulValue<'c>,
-        XlaConstant,
-        XlaOperation,
-        XlaProgramConstants<In>,
-        XlaSourceProgramOutput<Out>,
-    > {
+    ) -> &ClosedProgram<XlaStatefulValue<'c>, XlaConstant, XlaOperation, Vec<XlaConstant>, Vec<XlaConstant>> {
         self.function.source_program()
     }
 
@@ -1212,7 +1202,7 @@ where
             }
         }
         let staged = self.function.staged();
-        let input_structure = staged.source_program().program().input_structure().clone();
+        let input_structure = staged.input_structure().clone();
         let input_signature = In::from_parameters(
             input_structure.clone(),
             staged
@@ -1338,7 +1328,7 @@ where
         }
         let staged = self.function.staged();
         let input_signature = In::from_parameters(
-            staged.source_program().program().input_structure().clone(),
+            staged.input_structure().clone(),
             staged
                 .input_types()
                 .iter()
@@ -1721,7 +1711,13 @@ where
         lift_tracers::<Out>(function(capture_references, capture_tracers, inputs)?)
     };
     let input_types = with_input_shardings(input_types, &options)?;
-    let function = domain.stage(function, captures, input_types, options)?;
+    let function = StagedFunction::<_, XlaProgramParameters<In>, XlaProgramParameters<Out>>::stage(
+        domain,
+        function,
+        captures,
+        input_types,
+        options,
+    )?;
     Ok(StagedXlaFunction { function })
 }
 
@@ -1788,16 +1784,16 @@ mod tests {
     use ryft_core::{
         Add, AddOperation, ArgMax, Array, ArrayIrType, ArrayOperation, ArrayReference, ArrayReferenceTransform,
         ArrayReferenceTransformIndex, ArrayType, Atan2, AttachedRegions, Broadcast, CaptureReference, Compare,
-        ComparisonDirection, CompilationDomain, Condition, ConstrainSharding, Context, ConvertElementType, Cos,
-        CotangentDestinationKind, Cumulative, CustomCall, CustomCallOperation, DataType, Device, DeviceMesh,
-        DifferentiableType, Differentiate, Dimension, DimensionBounds, DimensionSizeOperation, DimensionVariable, Div,
-        DomainTracer, DomainTracingContext, Dot, DotDimensionNumbers, DynamicSlice, DynamicUpdateSlice, EagerContext,
-        Exp, Fill, ForwardModeDifferentiate, Hessian, Iota, Jacobian, LogicalMesh, Logistic, Memory, MeshAxis,
-        MeshAxisType, Mul, MulOperation, OneLike, ParallelVaryOperation, Placeholder, ProgramBuilder, ProgramError,
-        ProjectedValue, Random, Reduce, ReductionKind, ReferenceAddUpdate, ReferenceAddUpdateOperation,
-        ReferenceCompletion, ReferenceCompletionBackend, ReferenceError, ReferenceFreeze, ReferenceFreezeOperation,
-        ReferenceNew, ReferenceNewOperation, ReferenceRead, ReferenceReadOperation, ReferenceType, Reshape, Reshard,
-        ScanOperation, Select, Shape, ShardMap, ShardMapOperation, Sharding, ShardingDimension, Sin, Softmax,
+        ComparisonDirection, Condition, ConstrainSharding, Context, ConvertElementType, Cos, CotangentDestinationKind,
+        Cumulative, CustomCall, CustomCallOperation, DataType, Device, DeviceMesh, DifferentiableType, Differentiate,
+        Dimension, DimensionBounds, DimensionSizeOperation, DimensionVariable, Div, DomainTracer, DomainTracingContext,
+        Dot, DotDimensionNumbers, DynamicSlice, DynamicUpdateSlice, EagerContext, Exp, Fill, ForwardModeDifferentiate,
+        Hessian, Iota, Jacobian, LogicalMesh, Logistic, Memory, MeshAxis, MeshAxisType, Mul, MulOperation, OneLike,
+        ParallelVaryOperation, Placeholder, ProgramBuilder, ProgramError, ProjectedValue, Random, Reduce,
+        ReductionKind, ReferenceAddUpdate, ReferenceAddUpdateOperation, ReferenceCompletion,
+        ReferenceCompletionBackend, ReferenceError, ReferenceFreeze, ReferenceFreezeOperation, ReferenceNew,
+        ReferenceNewOperation, ReferenceRead, ReferenceReadOperation, ReferenceType, Reshape, Reshard, ScanOperation,
+        Select, Shape, ShardMap, ShardMapOperation, Sharding, ShardingDimension, Sin, Softmax, StagedFunction,
         StopGradient, StopGradientOperation, Sub, Tanh, TopK, Trace, TransferToMemory, Typed, Value, ValueProjection,
         WhileOperation, ZeroLike, differentiate_at,
     };
@@ -3120,14 +3116,14 @@ mod tests {
 
         // The stateful XLA ABI only restricts the outputs of a lowered program, so a function that returns a reference
         // stages successfully and is rejected when it is lowered on its own.
-        let staged = domain
-            .stage::<_, ArrayIrType, ArrayIrType>(
-                allocate_reference,
-                Vec::new(),
-                ArrayIrType::Array(array_type),
-                XlaOptions::new(mesh),
-            )
-            .unwrap();
+        let staged = StagedFunction::<_, ArrayIrType, ArrayIrType>::stage(
+            &domain,
+            allocate_reference,
+            Vec::new(),
+            ArrayIrType::Array(array_type),
+            XlaOptions::new(mesh),
+        )
+        .unwrap();
         let error = staged.lower(&domain).err().unwrap();
         assert!(matches!(
             error,
@@ -3160,14 +3156,14 @@ mod tests {
 
         // A nested call may return the external reference that it receives, because that reference never crosses the
         // ABI as an output of the enclosing program.
-        let inner = domain
-            .stage::<_, ArrayIrType, ArrayIrType>(
-                forward,
-                Vec::new(),
-                reference_type.clone(),
-                XlaOptions::new(mesh.clone()),
-            )
-            .unwrap();
+        let inner = StagedFunction::<_, ArrayIrType, ArrayIrType>::stage(
+            &domain,
+            forward,
+            Vec::new(),
+            reference_type.clone(),
+            XlaOptions::new(mesh.clone()),
+        )
+        .unwrap();
         let outer = compile_statefully::<_, ArrayIrType, ArrayIrType>(
             move |reference| inner.call(reference)?.read().map_err(Into::into),
             reference_type,
@@ -3208,14 +3204,14 @@ mod tests {
 
         // A reference that a nested call allocates has no caller allocation that could receive it, so embedding the
         // call is rejected with a diagnostic that names the offending output.
-        let inner = domain
-            .stage::<_, ArrayIrType, ArrayIrType>(
-                allocate_reference,
-                Vec::new(),
-                ArrayIrType::Array(array_type.clone()),
-                XlaOptions::new(mesh.clone()),
-            )
-            .unwrap();
+        let inner = StagedFunction::<_, ArrayIrType, ArrayIrType>::stage(
+            &domain,
+            allocate_reference,
+            Vec::new(),
+            ArrayIrType::Array(array_type.clone()),
+            XlaOptions::new(mesh.clone()),
+        )
+        .unwrap();
         let error = compile_statefully::<_, ArrayIrType, ArrayIrType>(
             move |input| inner.call(input)?.freeze().map_err(Into::into),
             ArrayIrType::Array(array_type),

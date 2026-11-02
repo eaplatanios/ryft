@@ -9,8 +9,8 @@ use std::sync::Arc;
 use std::time::{Duration, Instant};
 
 use ryft_core::{
-    AnalyzableCompilationDomain, ArrayIrType, ArrayType, CompilationCacheDomain, CompilationDomain, CompilationTracer,
-    DeviceMesh,
+    AnalyzableCompilationDomain, ArrayIrType, ArrayType, CompilationCacheDomain, CompilationTracer, DeviceMesh,
+    StagedFunction,
 };
 use ryft_kernels::{KernelDefinition, VerifiedKernel};
 use ryft_pjrt::Execution;
@@ -133,7 +133,8 @@ impl KernelAotBundle {
         let facts = XlaKernelExecutionFacts::from_target(domain.target()?, &options.mesh)?;
         let execution = facts.configuration_key()?;
         let start = Instant::now();
-        let staged = domain.stage::<_, Vec<ArrayIrType>, Vec<ArrayIrType>>(
+        let staged = StagedFunction::<_, Vec<ArrayIrType>, Vec<ArrayIrType>>::stage(
+            domain,
             |_, _, inputs: Vec<CompilationTracer<XlaDomain<'c>>>| {
                 Ok(stage_kernel(inputs[0].context(), definition, &inputs)?)
             },
@@ -430,17 +431,17 @@ pub(crate) mod tests {
         } else {
             vec![]
         };
-        let staged = domain
-            .stage::<_, Vec<ArrayIrType>, Vec<ArrayIrType>>(
-                |_, captures: Vec<CompilationTracer<XlaDomain<'c>>>, inputs| {
-                    // Returning the capture retains a real capture slot without introducing unrelated operations.
-                    Ok(if captures.is_empty() { inputs } else { captures })
-                },
-                captures,
-                vec![ArrayIrType::Array(r#type)],
-                XlaOptions::new(mesh.clone()),
-            )
-            .unwrap();
+        let staged = StagedFunction::<_, Vec<ArrayIrType>, Vec<ArrayIrType>>::stage(
+            domain,
+            |_, captures: Vec<CompilationTracer<XlaDomain<'c>>>, inputs| {
+                // Returning the capture retains a real capture slot without introducing unrelated operations.
+                Ok(if captures.is_empty() { inputs } else { captures })
+            },
+            captures,
+            vec![ArrayIrType::Array(r#type)],
+            XlaOptions::new(mesh.clone()),
+        )
+        .unwrap();
         let compiled = staged.lower(&domain).unwrap().compile(&domain).unwrap();
         let mut bundle = bundle();
         bundle.manifest.configuration = compiler.configuration().to_vec();
