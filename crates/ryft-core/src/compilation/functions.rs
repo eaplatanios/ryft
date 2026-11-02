@@ -1090,7 +1090,7 @@ where
         Input::Family: ParameterizedFamily<Option<C::Type>>,
     {
         let state = Arc::get_mut(&mut self.state).ok_or_else(|| ProgramError::InvalidArgument {
-            message: "staged input types must be declared before a jit dispatcher is shared".to_string(),
+            message: "staged input types must be declared before a compilation dispatcher is shared".to_string(),
         })?;
         state.staged_input_types = Some(StagedInputTypes {
             structure: staged_input_types.parameter_structure(),
@@ -1262,8 +1262,6 @@ where
         self.state.specializations.invalidate_entries_if(|key| key.static_parameters() == static_parameters)
     }
 
-    // TODO(eaplatanios): Review from here onwards.
-
     /// Acquires or produces the executable specialization for one runtime input signature and returns it together with
     /// the resolved domain that executes it.
     fn specialization(
@@ -1289,22 +1287,91 @@ where
         DomainTracingContext<C, C::Value>:
             StagingContext<Type = C::Type, Constant = C::Constant, Operation = C::Operation>,
     {
+        // Static values and input structure can change the traced program, while the domain's dispatch key groups
+        // input signatures that can safely share it. Dynamic values remain runtime inputs, and the closure, captures,
+        // selected domain, and options are fixed for this dispatcher. Time the full derivation, including domain
+        // selection and input validation.
         let dispatch_key_start = Instant::now();
-        let domain = self.resolve_domain(inputs)?;
+
+        // Every specialization and clone shares one domain, which remains selected after failures or cache eviction.
+        let domain = match &self.state.domain {
+            DispatcherDomain::Explicit(domain) => domain,
+            DispatcherDomain::Inferred { domain, from_input } => {
+                // Reuse an existing selection before inspecting inputs so later calls may have no input leaves.
+                if let Some(domain) = domain.get() {
+                    domain
+                } else {
+                    let input = inputs.parameters().next().ok_or_else(|| ProgramError::InvalidArgument {
+                        message: "compilation requires an input leaf to infer a domain; use an explicit domain for \
+                                  empty inputs"
+                            .to_string(),
+                    })?;
+
+                    // Recover inside initialization so racing clones all use the stored winner's domain.
+                    domain.get_or_init(|| from_input(input))
+                }
+            }
+        };
+
         let input_structure = inputs.parameter_structure();
-        let runtime_input_types = inputs.parameters().map(|input| input.r#type().into_owned()).collect::<Vec<_>>();
-        let runtime_input_types = self.staged_runtime_input_types(&input_structure, runtime_input_types)?;
+        let mut runtime_input_types = inputs.parameters().map(|input| input.r#type().into_owned()).collect::<Vec<_>>();
+        if let Some(StagedInputTypes { structure, types }) = &self.state.staged_input_types {
+            // Equal structures guarantee that declared and runtime leaves align, including empty substructures.
+            if structure != &input_structure {
+                return Err(ProgramError::InvalidArgument {
+                    message: "compilation inputs do not have the structure of their declared staged input types"
+                        .to_string(),
+                }
+                .into());
+            }
+
+            let declared = types
+                .iter()
+                .enumerate()
+                .filter_map(|(index, r#type)| Some((index, r#type.as_ref()?)))
+                .collect::<Vec<_>>();
+            for &(index, staged_type) in &declared {
+                if !staged_type.is_refined_by(&runtime_input_types[index]) {
+                    let (path, _) = structure.named_parameters().nth(index).unwrap();
+                    return Err(ProgramError::from(TypeError::invalid(format!(
+                        "compilation input `{}` has type `{}`, which does not refine its declared staged type `{}`",
+                        path, runtime_input_types[index], staged_type,
+                    )))
+                    .into());
+                }
+            }
+
+            // Check the declarations together before replacing any types. Individual refinement checks cannot detect
+            // conflicting runtime extents for an identity shared by multiple inputs, such as a dimension and an array.
+            <C::Type as Type>::Refinements::new(
+                declared.iter().map(|(_, staged_type)| *staged_type),
+                declared.iter().map(|(index, _)| &runtime_input_types[*index]),
+            )
+            .map_err(ProgramError::from)?;
+
+            // Declared leaves specialize at their staged types so compatible runtime values reuse a trace.
+            // Undeclared leaves keep their runtime types. Validate before lookup so cache hits obey the same contract.
+            for (index, staged_type) in declared {
+                runtime_input_types[index] = staged_type.clone();
+            }
+        }
+
         let (dispatch_key, effective_input_types) =
             domain.dispatch_signature(runtime_input_types, &self.state.options)?;
+
+        // Backend normalization can share dispatch keys, but static values and container structures remain distinct.
         let key = SpecializationKey::new(static_parameters.clone(), input_structure, dispatch_key);
 
-        // One clock read both ends dispatch key derivation and starts the dispatch lookup, which keeps the timing of
-        // every cached call to three clock reads.
+        // One clock read both ends dispatch key derivation and starts the dispatch lookup, which keeps the timing
+        // of every cached call to three clock reads.
         let statistics = &self.state.statistics;
         let dispatch_start = Instant::now();
         accumulate_duration(&statistics.dispatch_key_nanoseconds, dispatch_start.duration_since(dispatch_key_start));
         let entry = self.state.specializations.try_entry(key);
         accumulate_duration(&statistics.dispatch_nanoseconds, dispatch_start.elapsed());
+
+        // A hit skips all frontend production. A vacant producer clears its in-flight marker if any later phase fails,
+        // allowing retries. Only recursive production of the same key on this thread is rejected.
         let producer = match entry {
             Ok(SpecializationCacheEntry::Occupied(executable)) => {
                 statistics.dispatch_hits.fetch_add(1, Ordering::Relaxed);
@@ -1317,15 +1384,19 @@ where
             Err(_) => {
                 statistics.dispatch_misses.fetch_add(1, Ordering::Relaxed);
                 return Err(ProgramError::InvalidArgument {
-                    message: "recursive JIT dispatch requested a specialization that is already being produced".into(),
+                    message: "recursive compilation dispatch requested a specialization that is already being produced"
+                        .into(),
                 }
                 .into());
             }
         };
 
+        // Rebuild the structured signature from the backend's effective types, retaining empty container structure.
         let input_types =
             Input::from_parameters(producer.key().input_structure().clone(), effective_input_types.iter().cloned())
                 .map_err(ProgramError::from)?;
+
+        // Record tracing and lowering durations before propagating errors so failed attempts remain in statistics.
         statistics.traces.fetch_add(1, Ordering::Relaxed);
         let tracing_start = Instant::now();
         let staged = StagedFunction::<C, Input, Output>::stage(
@@ -1343,73 +1414,9 @@ where
         let lowered = lowered?;
         statistics.compilation_requests.fetch_add(1, Ordering::Relaxed);
         let compiled = lowered.compile(domain)?;
+
+        // Retain only execution state, allowing the staged and lowered program artifacts to be released.
         Ok((domain, producer.insert(compiled.into_executable())))
-    }
-
-    /// Resolves this dispatcher's domain before producing or executing any specialization.
-    fn resolve_domain(&self, inputs: &Input::To<C::Value>) -> Result<&C, C::Error>
-    where
-        Input::Family: ParameterizedFamily<C::Value>,
-    {
-        let (domain, from_input) = match &self.state.domain {
-            DispatcherDomain::Explicit(domain) => return Ok(domain),
-            DispatcherDomain::Inferred { domain, from_input } => (domain, from_input),
-        };
-        if let Some(domain) = domain.get() {
-            return Ok(domain);
-        }
-        let input = inputs.parameters().next().ok_or_else(|| ProgramError::InvalidArgument {
-            message: "compilation requires an input leaf to infer a domain; use an explicit domain for empty inputs"
-                .to_string(),
-        })?;
-        // Recovery runs inside initialization so racing clones cannot produce or execute against a losing domain.
-        // The binding remains fixed after failures and cache eviction because it owns every retained specialization.
-        Ok(domain.get_or_init(|| from_input(input)))
-    }
-
-    /// Validates `input_types`, the flattened runtime input types of inputs with structure `input_structure`, against
-    /// the declared staged input types (refer to [`Self::with_staged_input_types`]) and replaces every declared one by
-    /// its staged type.
-    fn staged_runtime_input_types(
-        &self,
-        input_structure: &Input::ParameterStructure,
-        mut input_types: Vec<C::Type>,
-    ) -> Result<Vec<C::Type>, C::Error> {
-        let Some(StagedInputTypes { structure, types }) = &self.state.staged_input_types else {
-            return Ok(input_types);
-        };
-        if structure != input_structure {
-            return Err(ProgramError::InvalidArgument {
-                message: "jit inputs do not have the structure of their declared staged input types".to_string(),
-            }
-            .into());
-        }
-        let declared = types
-            .iter()
-            .enumerate()
-            .filter_map(|(index, r#type)| Some((index, r#type.as_ref()?)))
-            .collect::<Vec<_>>();
-        for &(index, staged_type) in &declared {
-            if !staged_type.is_refined_by(&input_types[index]) {
-                let (path, _) = structure.named_parameters().nth(index).unwrap();
-                return Err(ProgramError::from(TypeError::invalid(format!(
-                    "jit input `{path}` has type `{}`, which does not refine its declared staged type `{staged_type}`",
-                    input_types[index],
-                )))
-                .into());
-            }
-        }
-        // Inputs that share an identity in their declared types must agree, which establishing the facts of all of
-        // them together checks.
-        <C::Type as Type>::Refinements::new(
-            declared.iter().map(|(_, staged_type)| *staged_type),
-            declared.iter().map(|(index, _)| &input_types[*index]),
-        )
-        .map_err(ProgramError::from)?;
-        for (index, staged_type) in declared {
-            input_types[index] = staged_type.clone();
-        }
-        Ok(input_types)
     }
 }
 
@@ -1429,6 +1436,8 @@ where
         Self { state: self.state.clone() }
     }
 }
+
+// TODO(eaplatanios): Review from here onwards.
 
 /// Shared state of a [`CompiledFunctionDispatcher`].
 struct CompiledFunctionDispatcherState<
@@ -1908,7 +1917,7 @@ pub(crate) mod tests {
                 inputs,
                 |_, capture| {
                     Err(ProgramError::MalformedProgram(format!(
-                        "retained-JIT test program retained capture {}",
+                        "compiled test program retained capture {}",
                         capture.index(),
                     )))
                 },
@@ -2381,7 +2390,7 @@ pub(crate) mod tests {
         assert_eq!(
             function.execute((), ArrayIrValue::Dimension(DimensionValue::new(wide_type, 7).unwrap())),
             Err(TypeError::invalid(
-                "jit input `$` has type `dimension<7>`, which does not refine its declared staged type \
+                "compilation input `$` has type `dimension<7>`, which does not refine its declared staged type \
                  `dimension<extent ∈ [1, 5)>`",
             )
             .into()),
@@ -2395,7 +2404,7 @@ pub(crate) mod tests {
         assert!(matches!(
             function.with_staged_input_types(Some(extent_type.into())),
             Err(ProgramError::InvalidArgument { message })
-                if message == "staged input types must be declared before a jit dispatcher is shared",
+                if message == "staged input types must be declared before a compilation dispatcher is shared",
         ));
     }
 
@@ -2489,7 +2498,7 @@ pub(crate) mod tests {
         assert!(matches!(
             function.execute((), extents(2, 3)),
             Err(ProgramError::InvalidArgument { message })
-                if message == "jit inputs do not have the structure of their declared staged input types",
+                if message == "compilation inputs do not have the structure of their declared staged input types",
         ));
         assert_eq!(function.specialization_count(), 0);
     }
@@ -2813,7 +2822,7 @@ pub(crate) mod tests {
         assert!(matches!(
             function.execute(true, Array::scalar(1.0).unwrap()),
             Err(ProgramError::InvalidArgument { message })
-                if message == "recursive JIT dispatch requested a specialization that is already being produced",
+                if message == "recursive compilation dispatch requested a specialization that is already being produced",
         ));
         assert_eq!(function.specialization_count(), 0);
         assert_eq!(function.statistics().dispatch_misses, 2);
