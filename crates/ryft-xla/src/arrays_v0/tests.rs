@@ -3,8 +3,8 @@ use std::collections::HashMap;
 use indoc::indoc;
 use pretty_assertions::assert_eq;
 use ryft_core::{
-    ArrayType, DataType, Device, DeviceMesh, Dimension, DimensionBounds, DimensionVariable, Layout, LogicalMesh,
-    Memory, MeshAxis, MeshAxisType, Shape, Sharding, ShardingDimension, StaticShape, TiledLayout, Typed,
+    ArrayType, DataType, Device, DeviceMesh, Dimension, DimensionBounds, DimensionVariable, DiskCache, Layout,
+    LogicalMesh, Memory, MeshAxis, MeshAxisType, Shape, Sharding, ShardingDimension, StaticShape, TiledLayout, Typed,
 };
 use ryft_pjrt::protos::{CompilationOptions, ExecutableCompilationOptions, Precision};
 use ryft_pjrt::{BufferType, ClientOptions, CpuClientOptions, ExecutionFence, Program, load_cpu_plugin};
@@ -1236,7 +1236,7 @@ fn bench_compiled_reshard_cache_hit_avoids_trace_and_lower() {
 
     eprintln!("cold reshard (trace+lower+compile+execute): {cold_elapsed:?}");
     eprintln!("warm reshard (structural cache hit + execute, no trace/lower): {warm_elapsed:?}");
-    assert_eq!(engine.cache_size(), 1);
+    assert_eq!(engine.program_count(), 1);
 }
 
 #[test]
@@ -1288,8 +1288,8 @@ fn test_compilation_context_preserves_custom_base_options() {
         .unwrap();
 
     // Both domains observe the shared session cache, which holds one executable per option template.
-    assert_eq!(default_engine.cache_size(), 2);
-    assert_eq!(custom_engine.cache_size(), 2);
+    assert_eq!(default_engine.program_count(), 2);
+    assert_eq!(custom_engine.program_count(), 2);
     assert_eq!(
         custom_engine.compilation_options().matrix_unit_operand_precision,
         Precision::Highest as i32,
@@ -1471,7 +1471,7 @@ fn test_to_with_manual_mesh_axes_uses_host_fallback() {
     }
 
     // No executable was compiled — the host fallback bypasses the compile cache.
-    assert_eq!(engine.cache_size(), 0, "host fallback should not populate the executable cache");
+    assert_eq!(engine.program_count(), 0, "host fallback should not populate the executable cache");
 }
 
 fn two_device_sub_mesh_x(client: &ryft_pjrt::Client<'_>) -> DeviceMesh {
@@ -1601,7 +1601,7 @@ fn test_compiled_reshard_cross_mesh_sharded_source_compiles_two_executables() {
     let target_mesh = four_device_mesh_x(&client);
     let target_sharding =
         Sharding::new(target_mesh.logical_mesh().clone(), vec![ShardingDimension::sharded(["x"])]).unwrap();
-    assert_eq!(engine.cache_size(), 0);
+    assert_eq!(engine.program_count(), 0);
     let _ = source_array
         .to_placement(
             &engine,
@@ -1611,7 +1611,7 @@ fn test_compiled_reshard_cross_mesh_sharded_source_compiles_two_executables() {
 
     // Sub-case B compiles two executables: an all-gather on src_mesh and a replicated->sharded
     // reshard on dst_mesh.
-    assert_eq!(engine.cache_size(), 2);
+    assert_eq!(engine.program_count(), 2);
 }
 
 #[test]
@@ -1664,7 +1664,7 @@ fn test_fast_path_replicated_cross_mesh_to_replicated_destination() {
         assert_eq!(values_from_bytes::<f32>(shard_bytes.as_slice()), values.to_vec());
     }
     // The fast path satisfies this request without compiling any SPMD program.
-    assert_eq!(engine.cache_size(), 0);
+    assert_eq!(engine.program_count(), 0);
 }
 
 #[test]
@@ -1686,7 +1686,7 @@ fn test_compiled_reshard_caches_executable_across_calls() {
             .unwrap();
 
     let sharded_target = Sharding::new(mesh.logical_mesh().clone(), vec![ShardingDimension::sharded(["x"])]).unwrap();
-    assert_eq!(engine.cache_size(), 0);
+    assert_eq!(engine.program_count(), 0);
     let first = source_array
         .clone()
         .to_placement(
@@ -1694,14 +1694,14 @@ fn test_compiled_reshard_caches_executable_across_calls() {
             crate::arrays_v0::DevicePutTarget::Placement { mesh: mesh.clone(), sharding: sharded_target.clone() },
         )
         .unwrap();
-    let after_first = engine.cache_size();
+    let after_first = engine.program_count();
     let second = source_array
         .to_placement(
             &engine,
             crate::arrays_v0::DevicePutTarget::Placement { mesh: mesh.clone(), sharding: sharded_target },
         )
         .unwrap();
-    let after_second = engine.cache_size();
+    let after_second = engine.program_count();
 
     assert_eq!(first.addressable_shards().count(), 4);
     assert_eq!(second.addressable_shards().count(), 4);
@@ -1758,28 +1758,28 @@ fn test_compilation_context_lru_evicts_oldest_entry() {
     )
     .unwrap();
 
-    assert_eq!(engine.cache_size(), 0);
+    assert_eq!(engine.program_count(), 0);
     let _ = make_source()
         .to_placement(
             &engine,
             crate::arrays_v0::DevicePutTarget::Placement { mesh: mesh.clone(), sharding: sharded_along_x },
         )
         .unwrap();
-    assert_eq!(engine.cache_size(), 1);
+    assert_eq!(engine.program_count(), 1);
     let _ = make_source()
         .to_placement(
             &engine,
             crate::arrays_v0::DevicePutTarget::Placement { mesh: mesh.clone(), sharding: sharded_along_y },
         )
         .unwrap();
-    assert_eq!(engine.cache_size(), 2);
+    assert_eq!(engine.program_count(), 2);
     let _ = make_source()
         .to_placement(
             &engine,
             crate::arrays_v0::DevicePutTarget::Placement { mesh: mesh.clone(), sharding: sharded_along_both },
         )
         .unwrap();
-    assert_eq!(engine.cache_size(), 2, "third distinct reshard should evict the LRU entry");
+    assert_eq!(engine.program_count(), 2, "third distinct reshard should evict the LRU entry");
 }
 
 #[test]
@@ -1799,7 +1799,7 @@ fn test_compilation_context_disk_cache_warm_starts_a_fresh_context() {
     let target_sharding = Sharding::new(mesh.logical_mesh().clone(), vec![ShardingDimension::sharded(["x"])]).unwrap();
 
     // First context: cold compile, disk cache picks up the serialized executable.
-    let engine_one = XlaSession::with_disk_cache(&client, cache_dir.path()).unwrap().domain();
+    let engine_one = XlaSession::with_disk_cache(&client, DiskCache::open(cache_dir.path()).unwrap()).domain();
     let source = XlaArray::from_host_buffer(
         &engine_one,
         source_type.clone(),
@@ -1813,13 +1813,13 @@ fn test_compilation_context_disk_cache_warm_starts_a_fresh_context() {
             crate::arrays_v0::DevicePutTarget::Placement { mesh: mesh.clone(), sharding: target_sharding.clone() },
         )
         .unwrap();
-    assert_eq!(engine_one.cache_size(), 1, "first reshard should populate the in-memory cache");
+    assert_eq!(engine_one.program_count(), 1, "first reshard should populate the in-memory cache");
     drop(source);
     drop(engine_one);
 
     // Second context starts with an empty in-memory cache but loads from the disk cache.
-    let engine_two = XlaSession::with_disk_cache(&client, cache_dir.path()).unwrap().domain();
-    assert_eq!(engine_two.cache_size(), 0, "fresh context starts empty in-memory");
+    let engine_two = XlaSession::with_disk_cache(&client, DiskCache::open(cache_dir.path()).unwrap()).domain();
+    assert_eq!(engine_two.program_count(), 0, "fresh context starts empty in-memory");
     let source_two =
         XlaArray::from_host_buffer(&engine_two, source_type, mesh.clone(), values_to_bytes::<f32>(&values).as_slice())
             .unwrap();
@@ -1827,7 +1827,7 @@ fn test_compilation_context_disk_cache_warm_starts_a_fresh_context() {
         .to_placement(&engine_two, crate::arrays_v0::DevicePutTarget::Placement { mesh, sharding: target_sharding })
         .unwrap();
     assert_eq!(
-        engine_two.cache_size(),
+        engine_two.program_count(),
         1,
         "second context should populate its in-memory cache via the disk hit (no recompile expected)",
     );
@@ -1855,7 +1855,7 @@ fn test_compilation_context_clear_cache() {
     let _ = source_array
         .to_placement(&engine, crate::arrays_v0::DevicePutTarget::Placement { mesh, sharding: target_sharding })
         .unwrap();
-    assert_eq!(engine.cache_size(), 1);
+    assert_eq!(engine.program_count(), 1);
     engine.clear_cache();
-    assert_eq!(engine.cache_size(), 0);
+    assert_eq!(engine.program_count(), 0);
 }

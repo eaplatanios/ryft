@@ -205,20 +205,16 @@ fn persistent_restore(
     r#type: &ArrayType,
     directory: &Path,
 ) -> Result<Value, Box<dyn std::error::Error>> {
-    let producer = XlaSession::with_configured_disk_cache(
-        client,
-        DiskCache::open(directory)?.with_write_thresholds(Duration::ZERO, 0),
-    )
-    .domain();
+    let producer =
+        XlaSession::with_disk_cache(client, DiskCache::open(directory)?.with_write_thresholds(Duration::ZERO, 0))
+            .domain();
     let producer_staged = stage_workload(&producer, mesh, r#type.clone())?;
     let producer_lowered = producer_staged.lower(&producer)?;
     producer_lowered.compile(&producer)?;
 
-    let restored = XlaSession::with_configured_disk_cache(
-        client,
-        DiskCache::open(directory)?.with_write_thresholds(Duration::ZERO, 0),
-    )
-    .domain();
+    let restored =
+        XlaSession::with_disk_cache(client, DiskCache::open(directory)?.with_write_thresholds(Duration::ZERO, 0))
+            .domain();
     let restored_staged = stage_workload(&restored, mesh, r#type.clone())?;
     let restored_lowered = restored_staged.lower(&restored)?;
     let start = Instant::now();

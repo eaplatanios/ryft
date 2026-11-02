@@ -4513,7 +4513,7 @@ mod tests {
         let sum = a.add(&b).unwrap();
         assert!(std::ptr::eq(sum.client(), &client));
         assert!(Arc::ptr_eq(sum.xla_domain().session(), domain.session()));
-        assert_eq!(sum.domain().parent().cache_size(), 1);
+        assert_eq!(sum.domain().parent().program_count(), 1);
 
         let product = sum.mul(&b).unwrap();
         assert_eq!(read_f32s(&product), vec![12.0, 24.0]);
@@ -4522,12 +4522,12 @@ mod tests {
 
         // All values derived from `a` share one dispatch cache: `add` and `mul` each compiled once, and repeating
         // `add` at the same input signature is a cache hit.
-        assert_eq!(product.domain().parent().cache_size(), 2);
-        assert_eq!(a.domain().parent().cache_size(), 2);
+        assert_eq!(product.domain().parent().program_count(), 2);
+        assert_eq!(a.domain().parent().program_count(), 2);
         let repeated = a.add(&b).unwrap();
         assert_eq!(read_f32s(&repeated), vec![4.0, 6.0]);
-        assert_eq!(a.domain().parent().cache_size(), 2);
-        assert_eq!(domain.cache_size(), 2);
+        assert_eq!(a.domain().parent().program_count(), 2);
+        assert_eq!(domain.program_count(), 2);
     }
 
     #[test]
@@ -4552,8 +4552,8 @@ mod tests {
         let recovered = associated.domain();
         assert!(Arc::ptr_eq(recovered.parent().session(), other_domain.session()));
         assert_eq!(read_f32s(&associated.neg().unwrap()), vec![-1.0, -2.0]);
-        assert_eq!(other_domain.cache_size(), 1);
-        assert_eq!(domain.cache_size(), 0);
+        assert_eq!(other_domain.program_count(), 1);
+        assert_eq!(domain.program_count(), 0);
     }
 
     /// Top-level forward mode over concrete arrays: `jvp` of `f(x) = x * x` at `x = [1, 2, 3]` with unit tangents

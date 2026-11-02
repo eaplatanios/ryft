@@ -651,13 +651,13 @@ mod tests {
         let domain = XlaSession::new(&client).domain();
         let two = XlaDimension::new(DimensionValue::constant(2).unwrap(), domain.clone());
         let three = XlaDimension::new(DimensionValue::constant(3).unwrap(), domain.clone());
-        let cache_size = domain.cache_size();
+        let program_count = domain.program_count();
         let less_than = two.compare(&three, ComparisonDirection::LessThan).unwrap();
         assert_eq!(read::<u8>(&less_than), vec![1]);
         assert!(same_session(less_than.xla_domain(), &domain));
         assert_eq!(read::<u8>(&two.compare(&three, ComparisonDirection::Equal).unwrap()), vec![0]);
         assert_eq!(read::<u8>(&three.compare(&three, ComparisonDirection::GreaterThanOrEqual).unwrap()), vec![1]);
-        assert_eq!(domain.cache_size(), cache_size);
+        assert_eq!(domain.program_count(), program_count);
     }
 
     #[test]
@@ -669,11 +669,11 @@ mod tests {
         let three = XlaDimension::new(DimensionValue::constant(3).unwrap(), domain.clone());
         assert!(same_session(two.domain().parent(), &domain));
         assert!(same_session(two.domain().parent(), &domain));
-        let cache_size = domain.cache_size();
+        let program_count = domain.program_count();
         let five = Add::add(&two, &three).unwrap();
         assert_eq!(five.value().extent(), 5);
         assert!(same_session(five.xla_domain(), &domain));
-        assert_eq!(domain.cache_size(), cache_size);
+        assert_eq!(domain.program_count(), program_count);
     }
 
     #[test]
@@ -1085,11 +1085,11 @@ mod tests {
         let domain = XlaSession::new(&client).domain();
         let mesh = mesh_on(&client, 0);
         let (two, three) = (dimension(&domain, 2), dimension(&domain, 3));
-        let cache_size = domain.cache_size();
+        let program_count = domain.program_count();
         assert_eq!(read::<u8>(&two.less_than(&three).unwrap()), vec![1]);
         assert_eq!(read::<u8>(&two.equal(&three).unwrap()), vec![0]);
         assert_eq!(read::<u8>(&three.greater_than_or_equal(&three).unwrap()), vec![1]);
-        assert_eq!(domain.cache_size(), cache_size);
+        assert_eq!(domain.program_count(), program_count);
 
         // A dimension cannot be compared with an array.
         let scalar = XlaValue::Array(array(&domain, &mesh, DataType::I64, &[2i64], &[]));
@@ -1104,14 +1104,14 @@ mod tests {
     fn test_xla_value_dimension_to_scalar() {
         let client = execution_client();
         let domain = XlaSession::new(&client).domain();
-        let cache_size = domain.cache_size();
+        let program_count = domain.program_count();
         let scalar = dimension(&domain, 2).to_scalar().unwrap();
         assert!(matches!(
             scalar.r#type().as_ref(),
             ArrayIrType::Array(r#type) if r#type.data_type() == DataType::I64 && r#type.rank() == 0,
         ));
         assert_eq!(read::<i64>(&scalar), vec![2]);
-        assert_eq!(domain.cache_size(), cache_size);
+        assert_eq!(domain.program_count(), program_count);
     }
 
     #[test]

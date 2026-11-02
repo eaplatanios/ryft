@@ -540,13 +540,16 @@ mod tests {
     use indoc::indoc;
     use pretty_assertions::assert_eq;
     use ryft_core::{
-        AddOperation, Array, ArrayOperation, BlockScaledDotConfiguration, BlockScaledDotInputs, Device, DeviceMesh,
-        DimensionBounds, DimensionVariable, DotDimensionNumbers, EagerContext, LogicalMesh, MeshAxis, MeshAxisType,
-        Placeholder, ProjectedContext, RandomAlgorithm, Sharding, block_scaled_dot, differentiate_at,
+        AddOperation, Array, ArrayIrType, ArrayOperation, BlockQuantize, BlockScaledDotConfiguration,
+        BlockScaledDotInputs, ConvertElementType, Device, DeviceMesh, DimensionBounds, DimensionVariable,
+        DotDimensionNumbers, EagerContext, LogicalMesh, MeshAxis, MeshAxisType, Placeholder, ProjectedContext,
+        RandomAlgorithm, Sharding, block_scaled_dot, differentiate_at,
     };
 
     use crate::experimental::lowering::lower_mlir_module_for_program;
-    use crate::experimental::lowering::tests::{XlaProgramBuilder, add_xla_jit_call, unproject_plain_program};
+    use crate::experimental::lowering::tests::{
+        MixedValue, XlaProgramBuilder, add_xla_jit_call, execute_mixed_program, unproject_plain_program,
+    };
     use crate::experimental::ops::{
         XlaArrayConstant, XlaConstant, XlaProgram, XlaProgramBuilder as ArrayIrXlaProgramBuilder,
     };
@@ -1039,6 +1042,43 @@ mod tests {
         assert_eq!(module.matches("stablehlo.custom_call @__op$block_scaled_dot").count(), 1);
         assert_eq!(module.matches("stablehlo.composite \"xla.scaled_dot\"").count(), 0);
         assert_eq!(module.matches("call @jit_call_0").count(), 2);
+    }
+
+    #[test]
+    fn test_compile_block_quantize_dynamic_extents() {
+        let client = execution_client();
+        for (element_type, scale_type) in
+            [(DataType::F8E4M3FN, DataType::F8E8M0FNU), (DataType::F4E2M1FN, DataType::F8E4M3FN)]
+        {
+            let extent = DimensionVariable::new("n", DimensionBounds::new(0, Some(9)).unwrap());
+            let input_type = ArrayType::new(DataType::F64, Shape::new(vec![Dimension::Dynamic(extent)]));
+            let (_, program) = DomainTracingContext::<XlaDomain<'static>>::trace(
+                |inputs: Vec<XlaTracer<'static>>| {
+                    let (elements, scales) = inputs[0].block_quantize(4, element_type, scale_type)?;
+                    // Return ordinary floating-point arrays so that the mixed executable fixture can decode them.
+                    Ok(vec![elements.convert_element_type(DataType::F64)?, scales.convert_element_type(DataType::F64)?])
+                },
+                vec![ArrayIrType::Array(input_type)],
+            )
+            .unwrap();
+            let program = program.into_flat_program().simplified().unwrap();
+            let input = Array::vector(vec![3.0f64, 1.5, 0.5, 6.0]).unwrap();
+            let (elements, scales) = input.block_quantize(4, element_type, scale_type).unwrap();
+            assert_eq!(
+                execute_mixed_program(
+                    &client,
+                    &program,
+                    &[MixedValue::Array(vec![3.0, 1.5, 0.5, 6.0, 0.0, 0.0, 0.0, 0.0], vec![8])],
+                    &[4],
+                ),
+                Ok(vec![
+                    MixedValue::Array(elements.to_f64s(), vec![4]),
+                    MixedValue::Array(scales.to_f64s(), vec![1]),
+                    MixedValue::Dimension(4),
+                    MixedValue::Dimension(1),
+                ]),
+            );
+        }
     }
 
     #[test]

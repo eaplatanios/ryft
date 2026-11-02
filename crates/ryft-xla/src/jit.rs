@@ -4793,7 +4793,7 @@ mod tests {
         )
         .unwrap();
 
-        assert_eq!(domain.cache_size(), 2);
+        assert_eq!(domain.program_count(), 2);
         let _: CompiledXlaFunction<'_, ArrayType, Jacobian<ArrayType, ArrayType, ArrayType, ArrayType>> = compile(
             |input| {
                 input
@@ -4807,7 +4807,7 @@ mod tests {
             mesh.clone(),
         )
         .unwrap();
-        assert_eq!(domain.cache_size(), 2, "an equivalent dense transform should reuse its enclosing compilation");
+        assert_eq!(domain.program_count(), 2, "an equivalent dense transform should reuse its enclosing compilation");
 
         assert!(forward.source_program().program().regions().iter().any(|region| {
             region
@@ -6707,13 +6707,13 @@ mod tests {
             .with_sharding(Sharding::replicated(mesh.logical_mesh().clone(), 1))
             .unwrap();
 
-        assert_eq!(engine.cache_size(), 0);
+        assert_eq!(engine.program_count(), 0);
         // Equivalent lowerings share one executable, so the second invocation is a cache hit.
         for _ in 0..2 {
             let _: CompiledXlaFunction<'_, ArrayType, ArrayType> =
                 compile(|x| x.sin().unwrap(), input_type.clone(), &engine, mesh.clone()).unwrap();
         }
-        assert_eq!(engine.cache_size(), 1, "an equivalent repeated lowering should hit the cache");
+        assert_eq!(engine.program_count(), 1, "an equivalent repeated lowering should hit the cache");
     }
 
     #[test]
@@ -6728,13 +6728,13 @@ mod tests {
             .with_sharding(Sharding::replicated(mesh.logical_mesh().clone(), 1))
             .unwrap();
 
-        assert_eq!(engine.cache_size(), 0);
+        assert_eq!(engine.program_count(), 0);
         // Cache identity is the complete lowering plus options and target, not the Rust source location.
         let _: CompiledXlaFunction<'_, ArrayType, ArrayType> =
             compile(|x| x.sin().unwrap(), input_type.clone(), &engine, mesh.clone()).unwrap();
         let _: CompiledXlaFunction<'_, ArrayType, ArrayType> =
             compile(|x| x.sin().unwrap(), input_type, &engine, mesh).unwrap();
-        assert_eq!(engine.cache_size(), 1);
+        assert_eq!(engine.program_count(), 1);
     }
 
     #[test]
@@ -6828,7 +6828,7 @@ mod tests {
             let _: CompiledXlaFunction<'_, HyperparamInput<ArrayType>, ArrayType> =
                 compile(|input| input.array.sin().unwrap(), input, &engine, mesh.clone()).unwrap();
         }
-        assert_eq!(engine.cache_size(), 1);
+        assert_eq!(engine.program_count(), 1);
     }
 
     #[test]
@@ -7036,7 +7036,7 @@ mod tests {
         assert_eq!(output_type.data_type(), DataType::F32);
         assert_eq!(output_type.shape(), input_type.shape());
         // `infer_output_types` must not have populated the compile cache.
-        assert_eq!(engine.cache_size(), 0);
+        assert_eq!(engine.program_count(), 0);
     }
 
     /// Verifies that [`ConstrainSharding::constrain_sharding`] works inside a `compile`-compiled function over an
@@ -7144,7 +7144,7 @@ mod tests {
         .unwrap();
 
         // One compile means one cache entry for the whole pipeline.
-        assert_eq!(engine.cache_size(), 1, "three staged reshards should compile into one program");
+        assert_eq!(engine.program_count(), 1, "three staged reshards should compile into one program");
 
         let values = [0.1f32, 0.2, 0.3, 0.4];
         let source =
@@ -7186,10 +7186,10 @@ mod tests {
 
         let staged: StagedXlaFunction<'_, ArrayType, ArrayType> =
             stage(|x| x.sin().unwrap(), input_type.clone(), XlaOptions::new(mesh.clone())).unwrap();
-        assert_eq!(engine.cache_size(), 0, "staging must not compile a PJRT executable");
+        assert_eq!(engine.program_count(), 0, "staging must not compile a PJRT executable");
 
         let staged_compiled = engine.compile_staged_function(staged).unwrap();
-        assert_eq!(engine.cache_size(), 1, "compiling the staged handle should build exactly one executable");
+        assert_eq!(engine.program_count(), 1, "compiling the staged handle should build exactly one executable");
 
         let direct: CompiledXlaFunction<'_, ArrayType, ArrayType> =
             compile(|x| x.sin().unwrap(), input_type.clone(), &engine, mesh.clone()).unwrap();
@@ -7239,11 +7239,11 @@ mod tests {
             XlaOptions::new(mesh.clone()),
         )
         .unwrap();
-        assert_eq!(engine.cache_size(), 0, "staging the inner function must not compile it");
+        assert_eq!(engine.program_count(), 0, "staging the inner function must not compile it");
 
         let outer: CompiledXlaFunction<'_, ArrayType, ArrayType> =
             compile(move |x| inner.call(x).unwrap().cos().unwrap(), input_type.clone(), &engine, mesh.clone()).unwrap();
-        assert_eq!(engine.cache_size(), 1, "only the outer program should be compiled");
+        assert_eq!(engine.program_count(), 1, "only the outer program should be compiled");
         assert_eq!(outer.source_program().captures().len(), 1);
 
         let input_value = 0.5f32;
@@ -7280,7 +7280,7 @@ mod tests {
             panic!("public staged input should remain an array");
         };
         assert!(staged_input_type.sharding().is_some());
-        assert_eq!(engine.cache_size(), 0, "staging must not build an executable");
+        assert_eq!(engine.program_count(), 0, "staging must not build an executable");
     }
 
     /// End-to-end check that a function calling the same staged block twice — whose two `jit_call`s deduplicate into
@@ -7352,7 +7352,7 @@ mod tests {
         );
         println!(
             "  compilation cache: retained_entries={} lookup_ms={:.3} compilation_ms={:.3}",
-            domain.cache_size(),
+            domain.program_count(),
             statistics.memory_lookup_duration.as_secs_f64() * 1e3,
             statistics.compilation_duration.as_secs_f64() * 1e3,
         );

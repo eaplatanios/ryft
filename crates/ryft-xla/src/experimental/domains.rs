@@ -5,7 +5,7 @@ use std::cell::RefCell;
 use std::collections::{BTreeMap, HashMap, HashSet};
 use std::fmt::{Display, Formatter};
 use std::hash::{Hash, Hasher};
-use std::path::{Path, PathBuf};
+use std::path::Path;
 use std::rc::Rc;
 use std::sync::{Arc, Condvar, LazyLock, Mutex, OnceLock};
 use std::time::{Duration, Instant};
@@ -194,6 +194,17 @@ impl<'c> PreparedXlaExecution<'c> {
 /// [`Self::effects_barrier`] before dropping the client when its effects must be observed; destruction adds no implicit
 /// barrier and backend behavior with unfinished device work is plugin-specific.
 ///
+/// # Compilation Caching
+///
+/// Each session owns one [`CompilationContext`], which its constructors configure. [`Self::new`] keeps compiled
+/// programs only in memory, and [`Self::with_cache_capacity`] bounds that in-memory tier. [`Self::with_disk_cache`]
+/// adds a persistent [`DiskCache`] so that later processes restart warm, and [`Self::with_disk_cache_from_env`] adds
+/// the one that the [`DiskCache::ENV_VAR`] environment variable configures, which sessions never read otherwise.
+/// Multi-process programs share compiled artifacts through a context with an exchange from
+/// [`DistributedRuntime::compilation_artifact_exchange`](crate::DistributedRuntime::compilation_artifact_exchange),
+/// which they pass to [`Self::with_compilation_context`]. Refer to [`CompilationContext`] for a configuration
+/// example.
+///
 /// # Example
 ///
 /// ```no_run
@@ -306,20 +317,10 @@ impl<'c> XlaSession<'c> {
         Self::with_compilation_context(client, CompilationContext::with_capacity(capacity))
     }
 
-    /// Creates a session whose compilation cache also writes through to a [`DiskCache`] rooted at `directory`.
-    ///
-    /// # Errors
-    ///
-    /// Returns an [`std::io::Error`] only when the directory itself cannot be opened or created.
-    pub fn with_disk_cache(client: &'c Client<'c>, directory: impl Into<PathBuf>) -> std::io::Result<Arc<Self>> {
-        Ok(Self::with_compilation_context(client, CompilationContext::new().with_disk_cache(directory)?))
-    }
-
-    /// Creates a session whose compilation cache uses an already configured persistent [`DiskCache`]. This is the
-    /// constructor to use when callers need explicit capacity or write thresholds rather than the defaults of
-    /// [`Self::with_disk_cache`].
-    pub fn with_configured_disk_cache(client: &'c Client<'c>, disk_cache: DiskCache) -> Arc<Self> {
-        Self::with_compilation_context(client, CompilationContext::new().with_configured_disk_cache(disk_cache))
+    /// Creates a session whose compilation cache also writes through to `disk_cache`, with its size cap and write
+    /// thresholds.
+    pub fn with_disk_cache(client: &'c Client<'c>, disk_cache: DiskCache) -> Arc<Self> {
+        Self::with_compilation_context(client, CompilationContext::new().with_disk_cache(disk_cache))
     }
 
     /// Creates a session whose compilation cache also writes through to a [`DiskCache`] configured via the
@@ -1073,8 +1074,8 @@ impl<'c> XlaDomain<'c> {
 
     /// Returns the number of compiled programs currently cached in the in-memory tier.
     #[inline]
-    pub fn cache_size(&self) -> usize {
-        self.compilation_context().cache_size()
+    pub fn program_count(&self) -> usize {
+        self.compilation_context().program_count()
     }
 
     /// Returns this domain's shared compilation context, which is owned by its session.
@@ -8398,7 +8399,7 @@ mod tests {
             panic!("dimension arithmetic must produce a dimension value");
         };
         assert_eq!(output.value().extent(), 5);
-        assert_eq!(domain.cache_size(), 0);
+        assert_eq!(domain.program_count(), 0);
 
         let scalar = domain
             .bind(DimensionToScalarOperation, Vec::new(), &[XlaValue::Dimension(output.clone())])
@@ -8408,7 +8409,7 @@ mod tests {
             panic!("dimension_to_scalar must produce an array");
         };
         assert_eq!(read_i64s(&client, &scalar), vec![5]);
-        assert_eq!(domain.cache_size(), 0);
+        assert_eq!(domain.program_count(), 0);
 
         let from_scalar = domain
             .bind(
@@ -8422,7 +8423,7 @@ mod tests {
             panic!("dimension_from_scalar must produce a dimension value");
         };
         assert_eq!(from_scalar.value().extent(), 5);
-        assert_eq!(domain.cache_size(), 0);
+        assert_eq!(domain.program_count(), 0);
     }
 
     #[test]
@@ -9339,7 +9340,7 @@ mod tests {
             panic!("dimension_size must produce a dimension value");
         };
         assert_eq!(extent.value().extent(), 6);
-        assert_eq!(domain.cache_size(), 0);
+        assert_eq!(domain.program_count(), 0);
 
         let two = DimensionValue::constant(2).unwrap();
         let division = DimensionDivOperation::new(extent.r#type().as_ref(), two.r#type().as_ref()).unwrap();
@@ -9355,7 +9356,7 @@ mod tests {
             panic!("dimension division must produce a dimension value");
         };
         assert_eq!(three.value().extent(), 3);
-        assert_eq!(domain.cache_size(), 0);
+        assert_eq!(domain.program_count(), 0);
 
         let reshape_inputs = [
             XlaValue::Array(input),
@@ -9364,7 +9365,7 @@ mod tests {
         ];
         let reshaped = domain.bind(DynamicReshapeOperation::new(), Vec::new(), &reshape_inputs).unwrap().remove(0);
         assert_eq!(program_array(&reshaped).shape().as_slice(), &[2, 3]);
-        assert_eq!(domain.cache_size(), 1);
+        assert_eq!(domain.program_count(), 1);
 
         let four = DimensionValue::constant(4).unwrap();
         let broadcast_inputs = [
@@ -9379,14 +9380,14 @@ mod tests {
             .remove(0);
         assert_eq!(program_array(&broadcast).shape().as_slice(), &[4, 2, 3]);
         assert_eq!(read_f32s(&client, program_array(&broadcast)), vec![1.0, 2.0, 3.0, 4.0, 5.0, 6.0].repeat(4));
-        assert_eq!(domain.cache_size(), 2);
+        assert_eq!(domain.program_count(), 2);
 
         let repeated = domain
             .bind(DynamicBroadcastOperation::new(vec![1, 2]), Vec::new(), &broadcast_inputs)
             .unwrap()
             .remove(0);
         assert_eq!(program_array(&repeated).shape().as_slice(), &[4, 2, 3]);
-        assert_eq!(domain.cache_size(), 2);
+        assert_eq!(domain.program_count(), 2);
     }
 
     #[test]
@@ -10538,7 +10539,7 @@ mod tests {
         .into_inner();
         let compiled: ryft_core::compilation::CompiledFunction<XlaDomain<'_>, ArrayIrType, ArrayIrType> =
             staged.lower(&domain).unwrap().compile(&domain).unwrap();
-        assert_eq!(domain.cache_size(), 1);
+        assert_eq!(domain.program_count(), 1);
 
         for size in [4usize, 7] {
             let input_type = replicated_vector_type(&mesh, size);
@@ -10560,7 +10561,7 @@ mod tests {
                 output.block_until_ready().unwrap();
                 assert_eq!(output.shape().as_slice(), &[size]);
                 assert_eq!(read_f32s(&client, &output), values.iter().map(|value| value * 2.0).collect::<Vec<_>>());
-                assert_eq!(domain.cache_size(), 1, "executing a loaded executable must not trigger recompilation");
+                assert_eq!(domain.program_count(), 1, "executing a loaded executable must not trigger recompilation");
             }
         }
 
@@ -10900,7 +10901,7 @@ mod tests {
         }
 
         // Equivalent lowerings share the entry populated by the first compilation, independent of source location.
-        let cache_size_before = engine.cache_size();
+        let program_count_before = engine.program_count();
         for _ in 0..3 {
             let staged = crate::jit::stage::<_, ArrayType, ArrayType>(
                 |x| x.sin().unwrap(),
@@ -10913,8 +10914,8 @@ mod tests {
                 staged.lower(&engine).unwrap().compile(&engine).unwrap();
         }
         assert_eq!(
-            engine.cache_size(),
-            cache_size_before,
+            engine.program_count(),
+            program_count_before,
             "equivalent repeat compilations should reuse the existing cache entry",
         );
     }
@@ -11527,7 +11528,7 @@ mod tests {
             assert_eq!(output.shape().as_slice(), shape.as_slice());
             assert_eq!(read_f32s(&client, &output), values.iter().map(|value| value * 2.0).collect::<Vec<_>>());
         }
-        assert_eq!(domain.cache_size(), 1);
+        assert_eq!(domain.program_count(), 1);
 
         // Dynamic tensor partitioning remains an explicit backend limitation rather than silently changing a user's
         // requested placement to replication.
@@ -12067,7 +12068,7 @@ mod tests {
         assert_eq!(statistics.lowerings, 1);
         assert_eq!(statistics.compilation_requests, 1);
         assert_eq!(function.specialization_count(), 1);
-        assert_eq!(domain.cache_size(), 1);
+        assert_eq!(domain.program_count(), 1);
     }
 
     #[test]
@@ -13165,7 +13166,7 @@ mod tests {
         assert_eq!(statistics.lowerings, 2);
         assert_eq!(statistics.compilation_requests, 2);
         assert_eq!(function.specialization_count(), 2);
-        assert_eq!(domain.cache_size(), 2);
+        assert_eq!(domain.program_count(), 2);
     }
 
     #[test]
@@ -13714,7 +13715,7 @@ mod tests {
             .unwrap();
         let directory = tempdir().unwrap();
 
-        let first_domain = XlaSession::with_configured_disk_cache(
+        let first_domain = XlaSession::with_disk_cache(
             &client,
             DiskCache::open(directory.path()).unwrap().with_write_thresholds(Duration::ZERO, 0),
         )
@@ -13732,7 +13733,7 @@ mod tests {
         drop(first);
         drop(first_domain);
 
-        let second_domain = XlaSession::with_configured_disk_cache(
+        let second_domain = XlaSession::with_disk_cache(
             &client,
             DiskCache::open(directory.path()).unwrap().with_write_thresholds(Duration::ZERO, 0),
         )
@@ -13937,7 +13938,7 @@ mod tests {
             assert_eq!(outputs, vec![value.clone()]);
             assert!(Arc::ptr_eq(&outputs[0].xla_domain().effect_scope, &selected.effect_scope));
         }
-        assert_eq!(domain.cache_size(), 0);
+        assert_eq!(domain.program_count(), 0);
     }
 
     #[test]
@@ -13992,7 +13993,7 @@ mod tests {
                 "operation `cast` declares no region slots but 1 regions were attached".to_owned(),
             )),
         );
-        assert_eq!(domain.cache_size(), 0);
+        assert_eq!(domain.program_count(), 0);
     }
 
     #[test]
@@ -14036,7 +14037,7 @@ mod tests {
                 assert_eq!(result, Err(ProgramError::InvalidArgument { message: "cast witness failed".to_owned() }),);
             }
         }
-        assert_eq!(domain.cache_size(), 0);
+        assert_eq!(domain.program_count(), 0);
     }
 
     #[test]
@@ -16146,22 +16147,22 @@ mod tests {
             .unwrap();
         let mesh = domain_mesh(&client, "x", 1);
         let domain = array_domain(&client);
-        assert_eq!(domain.parent().cache_size(), 0);
+        assert_eq!(domain.parent().program_count(), 0);
 
         let left = f32_vector(domain.parent(), &mesh, &[1.0, 2.0]);
         let right = f32_vector(domain.parent(), &mesh, &[3.0, 4.0]);
         let first = domain.bind(AddOperation::new(), Vec::new(), &[left.clone(), right.clone()]).unwrap();
-        assert_eq!(domain.parent().cache_size(), 1);
+        assert_eq!(domain.parent().program_count(), 1);
 
         let second = domain.bind(AddOperation::new(), Vec::new(), &[left, right]).unwrap();
-        assert_eq!(domain.parent().cache_size(), 1, "a repeated eager operation must be a compile-cache hit");
+        assert_eq!(domain.parent().program_count(), 1, "a repeated eager operation must be a compile-cache hit");
         assert_eq!(read_f32s(&client, &first[0]), read_f32s(&client, &second[0]));
 
         // A different input signature compiles (and caches) a distinct executable.
         let wider_left = f32_vector(domain.parent(), &mesh, &[1.0, 2.0, 3.0]);
         let wider_right = f32_vector(domain.parent(), &mesh, &[4.0, 5.0, 6.0]);
         domain.bind(AddOperation::new(), Vec::new(), &[wider_left, wider_right]).unwrap();
-        assert_eq!(domain.parent().cache_size(), 2);
+        assert_eq!(domain.parent().program_count(), 2);
     }
 
     #[test]
@@ -16496,9 +16497,9 @@ mod tests {
         let domain = XlaSession::new(&client).domain();
         let inputs = [XlaValue::Array(f32_vector(&domain, &mesh, &[1.0, 2.0]))];
         domain.bind(XlaOperation::Array(NegOperation::new().into()), Vec::new(), &inputs).unwrap();
-        assert_eq!((domain.session().eager_dispatch_cache.len(), domain.cache_size()), (1, 1));
+        assert_eq!((domain.session().eager_dispatch_cache.len(), domain.program_count()), (1, 1));
         domain.clear_cache();
-        assert_eq!((domain.session().eager_dispatch_cache.len(), domain.cache_size()), (0, 0));
+        assert_eq!((domain.session().eager_dispatch_cache.len(), domain.program_count()), (0, 0));
         domain.bind(XlaOperation::Array(NegOperation::new().into()), Vec::new(), &inputs).unwrap();
         assert_eq!(domain.eager_dispatch_statistics().misses, 2);
     }
@@ -16688,7 +16689,7 @@ mod tests {
             )
             .unwrap();
         assert_eq!(read_f32s(&client, program_array(&false_outputs[0])), vec![1.0, 4.0, 9.0, 16.0]);
-        assert_eq!(domain.cache_size(), 1, "both predicate values must share one compiled executable");
+        assert_eq!(domain.program_count(), 1, "both predicate values must share one compiled executable");
     }
 
     #[test]
@@ -16793,7 +16794,7 @@ mod tests {
             )
             .unwrap();
         assert_eq!(read_f32s(&client, program_array(&false_outputs[0])), vec![-2.0; 3]);
-        assert_eq!(domain.cache_size(), 1, "both branch selections must share one compiled executable");
+        assert_eq!(domain.program_count(), 1, "both branch selections must share one compiled executable");
     }
 
     #[test]
@@ -17177,12 +17178,12 @@ mod tests {
             .unwrap();
         assert_eq!(first.len(), 1);
         assert_eq!(read_f32s(&client, program_array(&first[0])), vec![1.0, 4.0, 9.0, 16.0]);
-        assert_eq!(domain.cache_size(), 1);
+        assert_eq!(domain.program_count(), 1);
 
         // A repeated eager `jit_call` at the same input signature is a dispatch-cache hit.
         let second = domain.bind(operation, AttachedRegions::Callees(&[callee]), &[XlaValue::Array(input)]).unwrap();
         assert_eq!(read_f32s(&client, program_array(&second[0])), vec![1.0, 4.0, 9.0, 16.0]);
-        assert_eq!(domain.cache_size(), 1, "a repeated eager jit_call must be a compile-cache hit");
+        assert_eq!(domain.program_count(), 1, "a repeated eager jit_call must be a compile-cache hit");
     }
 
     #[test]
@@ -17410,7 +17411,7 @@ mod tests {
             assert!(second_pending);
         }
         assert_eq!(lines, vec!["first: [1.0]", "second: [2.0]"]);
-        assert_eq!(session.compilation_context().cache_size(), 2);
+        assert_eq!(session.compilation_context().program_count(), 2);
     }
 
     #[test]

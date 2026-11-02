@@ -2105,6 +2105,7 @@ mod tests {
                     outcome: CompilationLookupOutcome::Miss(CompilationEventReason::NotFound),
                 },
                 CompilationEventKind::BackendCompilation { outcome: CompilationOperationOutcome::Succeeded },
+                CompilationEventKind::PersistentStore { outcome: CompilationOperationOutcome::Succeeded },
             ],
         );
         assert_eq!(
@@ -2143,6 +2144,9 @@ mod tests {
                     outcome: CompilationLookupOutcome::Failed(CompilationEventReason::DeserializationFailed),
                 },
                 CompilationEventKind::BackendCompilation { outcome: CompilationOperationOutcome::Succeeded },
+                CompilationEventKind::PersistentStore {
+                    outcome: CompilationOperationOutcome::Skipped(CompilationEventReason::BelowWriteThreshold),
+                },
             ],
         );
         assert_eq!(context.statistics().persistent_errors, 1);
@@ -2166,6 +2170,9 @@ mod tests {
                     outcome: CompilationLookupOutcome::Miss(CompilationEventReason::Incompatible),
                 },
                 CompilationEventKind::BackendCompilation { outcome: CompilationOperationOutcome::Succeeded },
+                CompilationEventKind::PersistentStore {
+                    outcome: CompilationOperationOutcome::Skipped(CompilationEventReason::BelowWriteThreshold),
+                },
             ],
         );
         assert_eq!(context.statistics().persistent_errors, 0);
@@ -2189,6 +2196,9 @@ mod tests {
                     outcome: CompilationLookupOutcome::Failed(CompilationEventReason::ReadFailed),
                 },
                 CompilationEventKind::BackendCompilation { outcome: CompilationOperationOutcome::Succeeded },
+                CompilationEventKind::PersistentStore {
+                    outcome: CompilationOperationOutcome::Skipped(CompilationEventReason::BelowWriteThreshold),
+                },
             ],
         );
         assert_eq!(context.statistics().persistent_errors, 1);
@@ -2214,6 +2224,34 @@ mod tests {
 
         // A fast compilation is below the default minimum compilation duration, so it is never serialized.
         assert_eq!(std::fs::read_dir(directory.path()).unwrap().count(), 0);
+    }
+
+    #[test]
+    fn test_compilation_context_with_disk_cache_below_minimum_entry_size() {
+        // A serialized program that is smaller than the minimum entry size is skipped after serialization.
+        let directory = tempfile::tempdir().unwrap();
+        let disk_cache = DiskCache::open(directory.path()).unwrap().with_write_thresholds(Duration::ZERO, usize::MAX);
+        let context = CompilationContext::<TestDomain>::new().with_event_capacity(8).with_disk_cache(disk_cache);
+        context.get_or_compile(&TestDomain::persistent(), 1, || Ok(TestCompiledProgram(1))).unwrap();
+        assert_eq!(std::fs::read_dir(directory.path()).unwrap().count(), 0);
+        assert_eq!(context.statistics().persistent_errors, 0);
+        assert_eq!(
+            event_kinds(&context),
+            vec![
+                CompilationEventKind::CacheLookup {
+                    tier: CompilationCacheTier::Memory,
+                    outcome: CompilationLookupOutcome::Miss(CompilationEventReason::NotFound),
+                },
+                CompilationEventKind::CacheLookup {
+                    tier: CompilationCacheTier::Persistent,
+                    outcome: CompilationLookupOutcome::Miss(CompilationEventReason::NotFound),
+                },
+                CompilationEventKind::BackendCompilation { outcome: CompilationOperationOutcome::Succeeded },
+                CompilationEventKind::PersistentStore {
+                    outcome: CompilationOperationOutcome::Skipped(CompilationEventReason::BelowWriteThreshold),
+                },
+            ],
+        );
     }
 
     #[test]
@@ -2313,6 +2351,7 @@ mod tests {
                     tier: CompilationCacheTier::Memory,
                     outcome: CompilationLookupOutcome::Miss(CompilationEventReason::NotFound),
                 },
+                CompilationEventKind::ExchangePreflight { outcome: CompilationOperationOutcome::Succeeded },
                 CompilationEventKind::BackendCompilation { outcome: CompilationOperationOutcome::Succeeded },
                 CompilationEventKind::ExchangePublish { outcome: CompilationOperationOutcome::Succeeded },
             ],
@@ -2324,11 +2363,13 @@ mod tests {
                     tier: CompilationCacheTier::Memory,
                     outcome: CompilationLookupOutcome::Miss(CompilationEventReason::NotFound),
                 },
+                CompilationEventKind::ExchangePreflight { outcome: CompilationOperationOutcome::Succeeded },
                 CompilationEventKind::ExchangeReceive { outcome: CompilationLookupOutcome::Hit },
             ],
         );
-        assert_eq!(leader_context.statistics().exchange_duration, Duration::ZERO);
-        assert_eq!(follower_statistics.exchange_duration, follower_events[1].duration);
+        // The exchange duration covers preflights and receptions, but never publication.
+        assert_eq!(leader_context.statistics().exchange_duration, leader_context.recent_events()[1].duration);
+        assert_eq!(follower_statistics.exchange_duration, follower_events[1].duration + follower_events[2].duration);
     }
 
     #[test]
@@ -2380,6 +2421,7 @@ mod tests {
                     tier: CompilationCacheTier::Memory,
                     outcome: CompilationLookupOutcome::Miss(CompilationEventReason::NotFound),
                 },
+                CompilationEventKind::ExchangePreflight { outcome: CompilationOperationOutcome::Succeeded },
                 CompilationEventKind::CacheLookup {
                     tier: CompilationCacheTier::Persistent,
                     outcome: CompilationLookupOutcome::Hit,
@@ -2424,6 +2466,7 @@ mod tests {
                     tier: CompilationCacheTier::Memory,
                     outcome: CompilationLookupOutcome::Miss(CompilationEventReason::NotFound),
                 },
+                CompilationEventKind::ExchangePreflight { outcome: CompilationOperationOutcome::Succeeded },
                 CompilationEventKind::BackendCompilation {
                     outcome: CompilationOperationOutcome::Failed(CompilationEventReason::ProducerFailed),
                 },
@@ -2440,13 +2483,14 @@ mod tests {
                     tier: CompilationCacheTier::Memory,
                     outcome: CompilationLookupOutcome::Miss(CompilationEventReason::NotFound),
                 },
+                CompilationEventKind::ExchangePreflight { outcome: CompilationOperationOutcome::Succeeded },
                 CompilationEventKind::ExchangeReceive {
                     outcome: CompilationLookupOutcome::Failed(CompilationEventReason::ReadFailed),
                 },
             ],
         );
-        assert_eq!(leader_context.statistics().compilation_duration, leader_context.recent_events()[1].duration);
-        assert_eq!(leader_context.statistics().exchange_duration, Duration::ZERO);
+        assert_eq!(leader_context.statistics().compilation_duration, leader_context.recent_events()[2].duration);
+        assert_eq!(leader_context.statistics().exchange_duration, leader_context.recent_events()[1].duration);
     }
 
     #[test]
@@ -2472,6 +2516,7 @@ mod tests {
                     tier: CompilationCacheTier::Memory,
                     outcome: CompilationLookupOutcome::Miss(CompilationEventReason::NotFound),
                 },
+                CompilationEventKind::ExchangePreflight { outcome: CompilationOperationOutcome::Succeeded },
                 CompilationEventKind::BackendCompilation {
                     outcome: CompilationOperationOutcome::Failed(CompilationEventReason::ProducerFailed),
                 },
@@ -2513,6 +2558,7 @@ mod tests {
                     tier: CompilationCacheTier::Memory,
                     outcome: CompilationLookupOutcome::Miss(CompilationEventReason::NotFound),
                 },
+                CompilationEventKind::ExchangePreflight { outcome: CompilationOperationOutcome::Succeeded },
                 CompilationEventKind::BackendCompilation { outcome: CompilationOperationOutcome::Succeeded },
                 CompilationEventKind::ExchangePublish {
                     outcome: CompilationOperationOutcome::Failed(CompilationEventReason::SerializationFailed),
@@ -2554,6 +2600,7 @@ mod tests {
                     tier: CompilationCacheTier::Memory,
                     outcome: CompilationLookupOutcome::Miss(CompilationEventReason::NotFound),
                 },
+                CompilationEventKind::ExchangePreflight { outcome: CompilationOperationOutcome::Succeeded },
                 CompilationEventKind::CacheLookup {
                     tier: CompilationCacheTier::Persistent,
                     outcome: CompilationLookupOutcome::Miss(CompilationEventReason::NotFound),
@@ -2599,13 +2646,17 @@ mod tests {
                     tier: CompilationCacheTier::Memory,
                     outcome: CompilationLookupOutcome::Miss(CompilationEventReason::NotFound),
                 },
+                CompilationEventKind::ExchangePreflight { outcome: CompilationOperationOutcome::Succeeded },
                 CompilationEventKind::ExchangeReceive {
                     outcome: CompilationLookupOutcome::Failed(CompilationEventReason::ReadFailed),
                 },
                 CompilationEventKind::BackendCompilation { outcome: CompilationOperationOutcome::Succeeded },
             ],
         );
-        assert_eq!(context.statistics().exchange_duration, context.recent_events()[1].duration);
+        assert_eq!(
+            context.statistics().exchange_duration,
+            context.recent_events()[1].duration + context.recent_events()[2].duration,
+        );
     }
 
     #[test]
@@ -2629,6 +2680,7 @@ mod tests {
                     tier: CompilationCacheTier::Memory,
                     outcome: CompilationLookupOutcome::Miss(CompilationEventReason::NotFound),
                 },
+                CompilationEventKind::ExchangePreflight { outcome: CompilationOperationOutcome::Succeeded },
                 CompilationEventKind::ExchangeReceive {
                     outcome: CompilationLookupOutcome::Failed(CompilationEventReason::Incompatible),
                 },
@@ -2648,7 +2700,7 @@ mod tests {
         );
         let domain = TestDomain { persistent: true, deserialization_incompatible: true, ..TestDomain::default() };
         assert_eq!(context.get_or_compile(&domain, 1, || Ok(TestCompiledProgram(7))).unwrap().0, 7);
-        assert_eq!(context.statistics().exchange_errors, 1);
+        assert_eq!(context.statistics().exchange_errors, 0);
         assert_eq!(context.statistics().exchange_fallbacks, 1);
         assert_eq!(
             event_kinds(&context),
@@ -2657,6 +2709,7 @@ mod tests {
                     tier: CompilationCacheTier::Memory,
                     outcome: CompilationLookupOutcome::Miss(CompilationEventReason::NotFound),
                 },
+                CompilationEventKind::ExchangePreflight { outcome: CompilationOperationOutcome::Succeeded },
                 CompilationEventKind::ExchangeReceive {
                     outcome: CompilationLookupOutcome::Miss(CompilationEventReason::Incompatible),
                 },
@@ -2691,6 +2744,7 @@ mod tests {
                     tier: CompilationCacheTier::Memory,
                     outcome: CompilationLookupOutcome::Miss(CompilationEventReason::NotFound),
                 },
+                CompilationEventKind::ExchangePreflight { outcome: CompilationOperationOutcome::Succeeded },
                 CompilationEventKind::ExchangeReceive {
                     outcome: CompilationLookupOutcome::Failed(CompilationEventReason::DeserializationFailed),
                 },
@@ -2720,13 +2774,15 @@ mod tests {
                     tier: CompilationCacheTier::Memory,
                     outcome: CompilationLookupOutcome::Miss(CompilationEventReason::NotFound),
                 },
+                CompilationEventKind::ExchangePreflight { outcome: CompilationOperationOutcome::Succeeded },
                 CompilationEventKind::BackendCompilation { outcome: CompilationOperationOutcome::Succeeded },
                 CompilationEventKind::ExchangePublish {
                     outcome: CompilationOperationOutcome::Failed(CompilationEventReason::WriteFailed),
                 },
             ],
         );
-        assert_eq!(context.statistics().exchange_duration, Duration::ZERO);
+        // The failed publication does not count toward the exchange duration, which covers only the preflight.
+        assert_eq!(context.statistics().exchange_duration, context.recent_events()[1].duration);
     }
 
     #[test]
@@ -2838,6 +2894,7 @@ mod tests {
                     tier: CompilationCacheTier::Memory,
                     outcome: CompilationLookupOutcome::Miss(CompilationEventReason::NotFound),
                 },
+                CompilationEventKind::ExchangePreflight { outcome: CompilationOperationOutcome::Succeeded },
                 CompilationEventKind::ExchangeReceive {
                     outcome: CompilationLookupOutcome::Miss(CompilationEventReason::TimedOut),
                 },
@@ -2869,6 +2926,7 @@ mod tests {
                     tier: CompilationCacheTier::Memory,
                     outcome: CompilationLookupOutcome::Miss(CompilationEventReason::NotFound),
                 },
+                CompilationEventKind::ExchangePreflight { outcome: CompilationOperationOutcome::Succeeded },
                 CompilationEventKind::ExchangeReceive {
                     outcome: CompilationLookupOutcome::Miss(CompilationEventReason::TimedOut),
                 },
