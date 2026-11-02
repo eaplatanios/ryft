@@ -989,7 +989,7 @@ impl<Static, Structure, Key> SpecializationKey<Static, Structure, Key> {
 /// ```mermaid
 /// %%{init: {"themeCSS": ".nodeLabel code { white-space: nowrap !important; }"}}%%
 /// flowchart TD
-///   call["&lt;code&gt;CompiledFunctionDispatcher::call&lt;/code&gt; with Static Parameters and Dynamic Inputs"]
+///   call["&lt;code&gt;CompiledFunctionDispatcher::execute&lt;/code&gt; with Static Parameters and Dynamic Inputs"]
 ///   call --> key["Derive Specialization Key"]
 ///   key --> frontend_cache["Per-Function Bounded Specialization Cache"]
 ///   frontend_cache -->|"hit"| executable["Shared &lt;code&gt;ExecutableFunction&lt;/code&gt;"]
@@ -1001,7 +1001,7 @@ impl<Static, Structure, Key> SpecializationKey<Static, Structure, Key> {
 ///   compilation_context -->|"restore or compile"| compiled["&lt;code&gt;CompiledFunction&lt;/code&gt;"]
 ///   compiled -->|"&lt;code&gt;into_executable&lt;/code&gt;"| executable
 ///   executable -->|"insert after cold production"| frontend_cache
-///   executable -->|"call"| outputs["Structured Runtime Outputs"]
+///   executable -->|"execute"| outputs["Structured Runtime Outputs"]
 /// ```
 ///
 /// The cache hit edge skips staging, lowering, and compilation. The dotted edge is the alternative staging path, along
@@ -1156,19 +1156,16 @@ where
         self.state.specializations.clear();
     }
 
-    // TODO(eaplatanios): Review from here onwards.
-
-    /// Invalidates every retained specialization for `static_parameters` and returns the number removed.
+    /// Executes a specialization with explicit host `static_parameters` and dynamic runtime `inputs`, compiling it
+    /// on a specialization miss.
     #[inline]
-    pub fn invalidate_static(&self, static_parameters: &Static) -> usize {
-        self.state.specializations.invalidate_entries_if(|key| key.static_parameters() == static_parameters)
-    }
-
-    /// Calls this dispatcher with explicit host-side `static_parameters` and dynamic runtime `inputs`.
-    pub fn call(&self, static_parameters: Static, inputs: Input::To<C::Value>) -> Result<Output::To<C::Value>, C::Error>
+    pub fn execute(
+        &self,
+        static_parameters: Static,
+        inputs: Input::To<C::Value>,
+    ) -> Result<Output::To<C::Value>, C::Error>
     where
         C::Options: Clone,
-        F: Fn(Static, Input::To<CompilationTracer<C>>) -> Result<Output::To<CompilationTracer<C>>, C::Error>,
         Input::Family: ParameterizedFamily<C::Value> + ParameterizedFamily<CompilationTracer<C>>,
         Input::To<C::Value>: Parameterized<
                 C::Value,
@@ -1181,6 +1178,7 @@ where
             Parameterized<C::Value, Family = Output::Family, ParameterStructure = Output::ParameterStructure>,
         Output::To<CompilationTracer<C>>:
             Parameterized<CompilationTracer<C>, To<C::Type> = Output, To<C::Constant> = Output::To<C::Constant>>,
+        F: Fn(Static, Input::To<CompilationTracer<C>>) -> Result<Output::To<CompilationTracer<C>>, C::Error>,
         DomainTracingContext<C, C::Value>:
             StagingContext<Type = C::Type, Constant = C::Constant, Operation = C::Operation>,
     {
@@ -1188,11 +1186,12 @@ where
         executable.execute(domain, inputs)
     }
 
-    /// Calls this dispatcher through its domain's completion-bearing stateful execution capability.
-    ///
-    /// Submission publishes the domain's reference dependencies before this function returns. The returned completion
-    /// must be awaited to observe asynchronous failure, and dropping it does not cancel the invocation.
-    pub fn call_statefully_async(
+    /// Executes a specialization through its domain's stateful execution capability and returns a [`StatefulExecution`]
+    /// tracking completion of the whole invocation. Submission publishes the domain's reference dependencies before
+    /// this function returns. The returned completion must be awaited to observe asynchronous failure, and dropping
+    /// it does not cancel the invocation.
+    #[inline]
+    pub fn execute_statefully(
         &self,
         static_parameters: Static,
         inputs: Input::To<C::Value>,
@@ -1200,7 +1199,6 @@ where
     where
         C: StatefulCompilationDomain,
         C::Options: Clone,
-        F: Fn(Static, Input::To<CompilationTracer<C>>) -> Result<Output::To<CompilationTracer<C>>, C::Error>,
         Input::Family: ParameterizedFamily<C::Value> + ParameterizedFamily<CompilationTracer<C>>,
         Input::To<C::Value>: Parameterized<
                 C::Value,
@@ -1213,6 +1211,7 @@ where
             Parameterized<C::Value, Family = Output::Family, ParameterStructure = Output::ParameterStructure>,
         Output::To<CompilationTracer<C>>:
             Parameterized<CompilationTracer<C>, To<C::Type> = Output, To<C::Constant> = Output::To<C::Constant>>,
+        F: Fn(Static, Input::To<CompilationTracer<C>>) -> Result<Output::To<CompilationTracer<C>>, C::Error>,
         DomainTracingContext<C, C::Value>:
             StagingContext<Type = C::Type, Constant = C::Constant, Operation = C::Operation>,
     {
@@ -1223,11 +1222,12 @@ where
         executable.execute_statefully(domain, inputs)
     }
 
-    /// Calls this dispatcher statefully and waits for whole-invocation completion.
-    ///
-    /// This routes through [`ExecutableFunction::execute_statefully_and_wait`], preserving the domain's reference
+    /// Executes a specialization statefully and waits for the whole invocation to complete. This is the blocking
+    /// convenience form of [`Self::execute_statefully`]. This routes through
+    /// [`ExecutableFunction::execute_statefully_and_wait`], preserving the domain's reference
     /// sequencing and reporting asynchronous execution errors before returning.
-    pub fn call_statefully(
+    #[inline]
+    pub fn execute_statefully_and_wait(
         &self,
         static_parameters: Static,
         inputs: Input::To<C::Value>,
@@ -1235,7 +1235,6 @@ where
     where
         C: StatefulCompilationDomain,
         C::Options: Clone,
-        F: Fn(Static, Input::To<CompilationTracer<C>>) -> Result<Output::To<CompilationTracer<C>>, C::Error>,
         Input::Family: ParameterizedFamily<C::Value> + ParameterizedFamily<CompilationTracer<C>>,
         Input::To<C::Value>: Parameterized<
                 C::Value,
@@ -1248,12 +1247,22 @@ where
             Parameterized<C::Value, Family = Output::Family, ParameterStructure = Output::ParameterStructure>,
         Output::To<CompilationTracer<C>>:
             Parameterized<CompilationTracer<C>, To<C::Type> = Output, To<C::Constant> = Output::To<C::Constant>>,
+        F: Fn(Static, Input::To<CompilationTracer<C>>) -> Result<Output::To<CompilationTracer<C>>, C::Error>,
         DomainTracingContext<C, C::Value>:
             StagingContext<Type = C::Type, Constant = C::Constant, Operation = C::Operation>,
     {
         let (domain, executable) = self.specialization(static_parameters, &inputs)?;
         executable.execute_statefully_and_wait(domain, inputs)
     }
+
+    /// Invalidates every retained specialization for `static_parameters` across all runtime input signatures and
+    /// returns the number removed. Backend compilation caches remain available for reuse.
+    #[inline]
+    pub fn invalidate_specializations(&self, static_parameters: &Static) -> usize {
+        self.state.specializations.invalidate_entries_if(|key| key.static_parameters() == static_parameters)
+    }
+
+    // TODO(eaplatanios): Review from here onwards.
 
     /// Acquires or produces the executable specialization for one runtime input signature and returns it together with
     /// the resolved domain that executes it.
@@ -1264,7 +1273,6 @@ where
     ) -> Result<(&C, ExecutableFunction<C, Input, Output>), C::Error>
     where
         C::Options: Clone,
-        F: Fn(Static, Input::To<CompilationTracer<C>>) -> Result<Output::To<CompilationTracer<C>>, C::Error>,
         Input::Family: ParameterizedFamily<C::Value> + ParameterizedFamily<CompilationTracer<C>>,
         Input::To<C::Value>: Parameterized<
                 C::Value,
@@ -1277,6 +1285,7 @@ where
             Parameterized<C::Value, Family = Output::Family, ParameterStructure = Output::ParameterStructure>,
         Output::To<CompilationTracer<C>>:
             Parameterized<CompilationTracer<C>, To<C::Type> = Output, To<C::Constant> = Output::To<C::Constant>>,
+        F: Fn(Static, Input::To<CompilationTracer<C>>) -> Result<Output::To<CompilationTracer<C>>, C::Error>,
         DomainTracingContext<C, C::Value>:
             StagingContext<Type = C::Type, Constant = C::Constant, Operation = C::Operation>,
     {
@@ -2340,10 +2349,10 @@ pub(crate) mod tests {
         // which separately created values of that extent share because static types have no identity.
         let function: CompiledFunctionDispatcher<TestArrayIrDomain, (), ArrayIrType, ArrayIrType, _> =
             domain.jit(zeros);
-        assert_eq!(function.call((), three.clone()), Ok(three_zeros.clone()));
-        assert_eq!(function.call((), four.clone()), Ok(four_zeros.clone()));
+        assert_eq!(function.execute((), three.clone()), Ok(three_zeros.clone()));
+        assert_eq!(function.execute((), four.clone()), Ok(four_zeros.clone()));
         assert_eq!(
-            function.call((), ArrayIrValue::Dimension(DimensionValue::constant(3).unwrap())),
+            function.execute((), ArrayIrValue::Dimension(DimensionValue::constant(3).unwrap())),
             Ok(three_zeros.clone()),
         );
         assert_eq!(function.specialization_count(), 2);
@@ -2356,8 +2365,8 @@ pub(crate) mod tests {
         let function: CompiledFunctionDispatcher<TestArrayIrDomain, (), ArrayIrType, ArrayIrType, _> =
             domain.jit(zeros).with_staged_input_types(Some(extent_type.clone().into())).unwrap();
         assert_eq!(function.staged_input_types(), Some(Some(extent_type.clone().into())));
-        assert_eq!(function.call((), three), Ok(three_zeros));
-        assert_eq!(function.call((), four), Ok(four_zeros));
+        assert_eq!(function.execute((), three), Ok(three_zeros));
+        assert_eq!(function.execute((), four), Ok(four_zeros));
         assert_eq!(function.specialization_count(), 1);
         let statistics = function.statistics();
         assert_eq!(statistics.dispatch_misses, 1);
@@ -2370,7 +2379,7 @@ pub(crate) mod tests {
         // An input whose type does not refine its declared staged type is rejected rather than specialized.
         let wide_type = DimensionType::new("wide", DimensionBounds::new(1, Some(9)).unwrap());
         assert_eq!(
-            function.call((), ArrayIrValue::Dimension(DimensionValue::new(wide_type, 7).unwrap())),
+            function.execute((), ArrayIrValue::Dimension(DimensionValue::new(wide_type, 7).unwrap())),
             Err(TypeError::invalid(
                 "jit input `$` has type `dimension<7>`, which does not refine its declared staged type \
                  `dimension<extent ∈ [1, 5)>`",
@@ -2430,11 +2439,11 @@ pub(crate) mod tests {
             .with_staged_input_types(vec![Some(rows.clone().into()), Some(columns.clone().into())])
             .unwrap();
         assert_eq!(
-            function.call((), extents(2, 3)),
+            function.execute((), extents(2, 3)),
             Ok(ArrayIrValue::Array(Array::matrix(2, 3, vec![0f32; 6]).unwrap())),
         );
         assert_eq!(
-            function.call((), extents(3, 2)),
+            function.execute((), extents(3, 2)),
             Ok(ArrayIrValue::Array(Array::matrix(3, 2, vec![0f32; 6]).unwrap())),
         );
         assert_eq!(function.specialization_count(), 1);
@@ -2445,11 +2454,11 @@ pub(crate) mod tests {
             .with_staged_input_types(vec![Some(rows.clone().into()), Some(rows.clone().into())])
             .unwrap();
         assert_eq!(
-            function.call((), extents(2, 2)),
+            function.execute((), extents(2, 2)),
             Ok(ArrayIrValue::Array(Array::matrix(2, 2, vec![0f32; 4]).unwrap())),
         );
         assert_eq!(
-            function.call((), extents(2, 3)),
+            function.execute((), extents(2, 3)),
             Err(TypeError::custom(DimensionError::InputDimensionMismatch {
                 dimension: "rows".to_string(),
                 expected: 2,
@@ -2466,7 +2475,7 @@ pub(crate) mod tests {
         assert_eq!(function.staged_input_types(), Some(vec![Some(rows.clone().into()), None]));
         for (rows_extent, columns_extent) in [(2, 3), (3, 3), (2, 4)] {
             assert_eq!(
-                function.call((), extents(rows_extent, columns_extent)),
+                function.execute((), extents(rows_extent, columns_extent)),
                 Ok(ArrayIrValue::Array(
                     Array::matrix(rows_extent, columns_extent, vec![0f32; rows_extent * columns_extent]).unwrap(),
                 )),
@@ -2478,7 +2487,7 @@ pub(crate) mod tests {
         let function: CompiledFunctionDispatcher<TestArrayIrDomain, (), Vec<ArrayIrType>, ArrayIrType, _> =
             domain.jit(zeros).with_staged_input_types(vec![Some(rows.clone().into())]).unwrap();
         assert!(matches!(
-            function.call((), extents(2, 3)),
+            function.execute((), extents(2, 3)),
             Err(ProgramError::InvalidArgument { message })
                 if message == "jit inputs do not have the structure of their declared staged input types",
         ));
@@ -2499,41 +2508,23 @@ pub(crate) mod tests {
             jit(|(), input: CompilationTracer<CarriedDomain>| Ok(input));
         let clone = inferred.clone();
         assert_eq!(inferred.domain(), None);
-        assert_eq!(clone.call((), domain.scalar(1.0)), Ok(domain.scalar(1.0)));
+        assert_eq!(clone.execute((), domain.scalar(1.0)), Ok(domain.scalar(1.0)));
         assert_eq!(inferred.domain(), Some(&domain));
         inferred.clear_cache();
         assert_eq!(clone.domain(), Some(&domain));
     }
 
     #[test]
-    fn test_compiled_function_dispatcher_invalidate_static() {
-        let domain = TestDomain::new();
-        let function: CompiledFunctionDispatcher<TestDomain, bool, ArrayType, ArrayType, _> =
-            domain.jit(|negate, input: CompilationTracer<TestDomain>| {
-                Ok(if negate { input.unary(NegOperation::new()) } else { input })
-            });
-        function.call(true, Array::scalar(2.0).unwrap()).unwrap();
-        function.call(false, Array::scalar(2.0).unwrap()).unwrap();
-
-        assert_eq!(function.cache_capacity(), DEFAULT_JIT_CACHE_CAPACITY);
-        assert_eq!(function.invalidate_static(&true), 1);
-        assert_eq!(function.specialization_count(), 1);
-        function.call(true, Array::scalar(2.0).unwrap()).unwrap();
-        assert_eq!(function.statistics().traces, 3);
-        assert_eq!(domain.compilation_count(), 2);
-    }
-
-    #[test]
-    fn test_compiled_function_dispatcher_call() {
+    fn test_compiled_function_dispatcher_execute() {
         let domain = TestDomain::new();
         let function: CompiledFunctionDispatcher<TestDomain, bool, ArrayType, ArrayType, _> =
             domain.jit(|negate, input: CompilationTracer<TestDomain>| {
                 Ok(if negate { input.unary(NegOperation::new()) } else { input })
             });
 
-        assert_eq!(function.call(true, Array::scalar(2.0).unwrap()).unwrap(), Array::scalar(-2.0).unwrap());
-        assert_eq!(function.call(true, Array::scalar(3.0).unwrap()).unwrap(), Array::scalar(-3.0).unwrap());
-        assert_eq!(function.call(false, Array::scalar(4.0).unwrap()).unwrap(), Array::scalar(4.0).unwrap());
+        assert_eq!(function.execute(true, Array::scalar(2.0).unwrap()).unwrap(), Array::scalar(-2.0).unwrap());
+        assert_eq!(function.execute(true, Array::scalar(3.0).unwrap()).unwrap(), Array::scalar(-3.0).unwrap());
+        assert_eq!(function.execute(false, Array::scalar(4.0).unwrap()).unwrap(), Array::scalar(4.0).unwrap());
         assert_eq!(function.specialization_count(), 2);
         let statistics = function.statistics();
         assert_eq!(statistics.dispatch_hits, 1);
@@ -2545,36 +2536,36 @@ pub(crate) mod tests {
     }
 
     #[test]
-    fn test_compiled_function_dispatcher_call_with_empty_inputs() {
+    fn test_compiled_function_dispatcher_execute_with_empty_inputs() {
         let domain = TestDomain::new();
         let function: CompiledFunctionDispatcher<TestDomain, (), (), (), _> = domain.jit(|(), ()| Ok(()));
 
         assert!(function.domain().is_some());
         assert_eq!(domain.compilation_count(), 0);
-        assert_eq!(function.call((), ()), Ok(()));
-        assert_eq!(function.call((), ()), Ok(()));
+        assert_eq!(function.execute((), ()), Ok(()));
+        assert_eq!(function.execute((), ()), Ok(()));
         assert_eq!(domain.compilation_count(), 1);
         assert_eq!(function.statistics().dispatch_hits, 1);
     }
 
     #[test]
-    fn test_compiled_function_dispatcher_call_with_inferred_domain() {
+    fn test_compiled_function_dispatcher_execute_with_inferred_domain() {
         // Later calls never select another domain, so inputs from another domain execute on the selected one, both on
         // warm calls and on the cold calls that follow cache clearing.
         let first_domain = CarriedDomain::new();
         let second_domain = CarriedDomain::new();
         let function: CompiledFunctionDispatcher<CarriedDomain, (), ArrayType, ArrayType, _> =
             jit(|(), input: CompilationTracer<CarriedDomain>| Ok(input.unary(NegOperation::new())));
-        assert_eq!(function.call((), first_domain.scalar(1.0)), Ok(first_domain.scalar(-1.0)));
-        assert_eq!(function.call((), second_domain.scalar(2.0)), Ok(first_domain.scalar(-2.0)));
+        assert_eq!(function.execute((), first_domain.scalar(1.0)), Ok(first_domain.scalar(-1.0)));
+        assert_eq!(function.execute((), second_domain.scalar(2.0)), Ok(first_domain.scalar(-2.0)));
         function.clear_cache();
-        assert_eq!(function.call((), second_domain.scalar(3.0)), Ok(first_domain.scalar(-3.0)));
+        assert_eq!(function.execute((), second_domain.scalar(3.0)), Ok(first_domain.scalar(-3.0)));
         assert_eq!(first_domain.compilation_count(), 2);
         assert_eq!(second_domain.compilation_count(), 0);
     }
 
     #[test]
-    fn test_compiled_function_dispatcher_call_with_inferred_domain_and_empty_inputs() {
+    fn test_compiled_function_dispatcher_execute_with_inferred_domain_and_empty_inputs() {
         // Empty inputs carry no domain, so they fail before tracing until a non-empty call selects one.
         let domain = CarriedDomain::new();
         let traces = AtomicUsize::new(0);
@@ -2584,20 +2575,20 @@ pub(crate) mod tests {
                 Ok(inputs)
             });
         assert!(matches!(
-            function.call((), Vec::new()),
+            function.execute((), Vec::new()),
             Err(ProgramError::InvalidArgument { message })
                 if message == "compilation requires an input leaf to infer a domain; use an explicit domain for \
                                empty inputs",
         ));
         assert_eq!(function.domain(), None);
         assert_eq!(traces.load(Ordering::Relaxed), 0);
-        assert_eq!(function.call((), vec![domain.scalar(1.0)]), Ok(vec![domain.scalar(1.0)]));
-        assert_eq!(function.call((), Vec::new()), Ok(Vec::new()));
+        assert_eq!(function.execute((), vec![domain.scalar(1.0)]), Ok(vec![domain.scalar(1.0)]));
+        assert_eq!(function.execute((), Vec::new()), Ok(Vec::new()));
         assert_eq!(traces.load(Ordering::Relaxed), 2);
     }
 
     #[test]
-    fn test_compiled_function_dispatcher_call_applies_staging_options_before_tracing() {
+    fn test_compiled_function_dispatcher_execute_applies_staging_options_before_tracing() {
         let domain = TestDomain::new();
         let options =
             TestOptions { staged_input_type: Some(ArrayType::scalar(DataType::I64)), ..TestOptions::default() };
@@ -2605,7 +2596,7 @@ pub(crate) mod tests {
             domain.jit_with_options(|(), input: CompilationTracer<TestDomain>| Ok(input), options);
 
         assert!(matches!(
-            function.call((), Array::scalar(2.0).unwrap()),
+            function.execute((), Array::scalar(2.0).unwrap()),
             Err(ProgramError::InvalidArgument { message })
                 if message == "runtime input type f64[] does not refine declared type i64[]",
         ));
@@ -2613,7 +2604,7 @@ pub(crate) mod tests {
     }
 
     #[test]
-    fn test_compiled_function_dispatcher_call_distinguishes_hash_colliding_static_values() {
+    fn test_compiled_function_dispatcher_execute_distinguishes_hash_colliding_static_values() {
         #[derive(Clone, Debug, PartialEq, Eq)]
         struct CollidingStatic(bool);
 
@@ -2630,11 +2621,11 @@ pub(crate) mod tests {
             });
 
         assert_eq!(
-            function.call(CollidingStatic(false), Array::scalar(2.0).unwrap()).unwrap(),
+            function.execute(CollidingStatic(false), Array::scalar(2.0).unwrap()).unwrap(),
             Array::scalar(2.0).unwrap()
         );
         assert_eq!(
-            function.call(CollidingStatic(true), Array::scalar(2.0).unwrap()).unwrap(),
+            function.execute(CollidingStatic(true), Array::scalar(2.0).unwrap()).unwrap(),
             Array::scalar(-2.0).unwrap()
         );
         assert_eq!(function.specialization_count(), 2);
@@ -2642,23 +2633,23 @@ pub(crate) mod tests {
     }
 
     #[test]
-    fn test_compiled_function_dispatcher_call_partitions_input_structures() {
+    fn test_compiled_function_dispatcher_execute_partitions_input_structures() {
         let domain = TestDomain::new();
         let function: CompiledFunctionDispatcher<TestDomain, (), Vec<ArrayType>, ArrayType, _> =
             domain.jit(|(), mut inputs: Vec<CompilationTracer<TestDomain>>| {
                 inputs.drain(..1).next().ok_or(ProgramError::InvalidInputCount { expected: 1, actual: 0 })
             });
 
-        assert_eq!(function.call((), vec![Array::scalar(2.0).unwrap()]).unwrap(), Array::scalar(2.0).unwrap());
+        assert_eq!(function.execute((), vec![Array::scalar(2.0).unwrap()]).unwrap(), Array::scalar(2.0).unwrap());
         assert_eq!(
-            function.call((), vec![Array::scalar(2.0).unwrap(), Array::scalar(3.0).unwrap()]).unwrap(),
+            function.execute((), vec![Array::scalar(2.0).unwrap(), Array::scalar(3.0).unwrap()]).unwrap(),
             Array::scalar(2.0).unwrap(),
         );
         assert_eq!(function.specialization_count(), 2);
     }
 
     #[test]
-    fn test_compiled_function_dispatcher_call_distinguishes_empty_substructure() {
+    fn test_compiled_function_dispatcher_execute_distinguishes_empty_substructure() {
         // Both calls flatten to zero leaves, so they share static parameters and an empty dispatch signature. Only
         // the input parameter structure distinguishes them, while the traced closure branches on the observed
         // container arity. Key reuse across these calls would therefore silently return the first call's staged
@@ -2673,9 +2664,9 @@ pub(crate) mod tests {
                 }
             });
 
-        assert_eq!(function.call((), vec![Vec::new()]).unwrap(), Vec::new());
+        assert_eq!(function.execute((), vec![Vec::new()]).unwrap(), Vec::new());
         assert!(matches!(
-            function.call((), Vec::new()),
+            function.execute((), Vec::new()),
             Err(ProgramError::InvalidInputCount { expected: 1, actual: 0 }),
         ));
         assert_eq!(function.specialization_count(), 1);
@@ -2683,7 +2674,7 @@ pub(crate) mod tests {
     }
 
     #[test]
-    fn test_compiled_function_dispatcher_call_flattens_map_inputs_deterministically() {
+    fn test_compiled_function_dispatcher_execute_flattens_map_inputs_deterministically() {
         // Map-like containers flatten in key order, so two runtime maps with the same keys must produce one
         // specialization regardless of construction order, and replay must bind flat inputs to the same leaves.
         let domain = TestDomain::new();
@@ -2694,14 +2685,14 @@ pub(crate) mod tests {
 
         let first = BTreeMap::from([("a", Array::scalar(1.0).unwrap()), ("b", Array::scalar(2.0).unwrap())]);
         let second = BTreeMap::from([("b", Array::scalar(4.0).unwrap()), ("a", Array::scalar(3.0).unwrap())]);
-        assert_eq!(function.call((), first).unwrap(), Array::scalar(1.0).unwrap());
-        assert_eq!(function.call((), second).unwrap(), Array::scalar(3.0).unwrap());
+        assert_eq!(function.execute((), first).unwrap(), Array::scalar(1.0).unwrap());
+        assert_eq!(function.execute((), second).unwrap(), Array::scalar(3.0).unwrap());
         assert_eq!(function.specialization_count(), 1);
         assert_eq!(function.statistics().dispatch_hits, 1);
     }
 
     #[test]
-    fn test_compiled_function_dispatcher_call_retries_tracing_failures() {
+    fn test_compiled_function_dispatcher_execute_retries_tracing_failures() {
         let domain = TestDomain::new();
         let function: CompiledFunctionDispatcher<TestDomain, bool, ArrayType, ArrayType, _> =
             domain.jit(|fail, input: CompilationTracer<TestDomain>| {
@@ -2714,17 +2705,17 @@ pub(crate) mod tests {
 
         for _ in 0..2 {
             assert!(matches!(
-                function.call(true, Array::scalar(2.0).unwrap()),
+                function.execute(true, Array::scalar(2.0).unwrap()),
                 Err(ProgramError::InvalidArgument { message }) if message == "expected trace failure",
             ));
         }
-        assert_eq!(function.call(false, Array::scalar(2.0).unwrap()).unwrap(), Array::scalar(2.0).unwrap());
+        assert_eq!(function.execute(false, Array::scalar(2.0).unwrap()).unwrap(), Array::scalar(2.0).unwrap());
         assert_eq!(function.specialization_count(), 1);
         assert_eq!(function.statistics().traces, 3);
     }
 
     #[test]
-    fn test_compiled_function_dispatcher_call_retains_inferred_domain_after_tracing_failure() {
+    fn test_compiled_function_dispatcher_execute_retains_inferred_domain_after_tracing_failure() {
         // The first non-empty call selects the domain before tracing, so a failed trace still fixes it for retries.
         let first_domain = CarriedDomain::new();
         let second_domain = CarriedDomain::new();
@@ -2738,25 +2729,25 @@ pub(crate) mod tests {
                 }
             });
         assert!(matches!(
-            function.call((), first_domain.scalar(1.0)),
+            function.execute((), first_domain.scalar(1.0)),
             Err(ProgramError::InvalidArgument { message }) if message == "expected trace failure",
         ));
         assert_eq!(function.domain(), Some(&first_domain));
         assert_eq!(function.specialization_count(), 0);
-        assert_eq!(function.call((), second_domain.scalar(2.0)), Ok(first_domain.scalar(2.0)));
+        assert_eq!(function.execute((), second_domain.scalar(2.0)), Ok(first_domain.scalar(2.0)));
         assert_eq!(first_domain.compilation_count(), 1);
         assert_eq!(second_domain.compilation_count(), 0);
     }
 
     #[test]
-    fn test_compiled_function_dispatcher_call_retries_lowering_and_compilation_failures() {
+    fn test_compiled_function_dispatcher_execute_retries_lowering_and_compilation_failures() {
         let lowering_domain = TestDomain::new();
         let lowering_options = TestOptions { fail_lowering: true, ..TestOptions::default() };
         let lowering_function: CompiledFunctionDispatcher<TestDomain, (), ArrayType, ArrayType, _> =
             lowering_domain.jit_with_options(|(), input: CompilationTracer<TestDomain>| Ok(input), lowering_options);
         for _ in 0..2 {
             assert!(matches!(
-                lowering_function.call((), Array::scalar(2.0).unwrap()),
+                lowering_function.execute((), Array::scalar(2.0).unwrap()),
                 Err(ProgramError::InvalidArgument { message }) if message == "expected lowering failure",
             ));
         }
@@ -2771,7 +2762,7 @@ pub(crate) mod tests {
                 .jit_with_options(|(), input: CompilationTracer<TestDomain>| Ok(input), compilation_options);
         for _ in 0..2 {
             assert!(matches!(
-                compilation_function.call((), Array::scalar(2.0).unwrap()),
+                compilation_function.execute((), Array::scalar(2.0).unwrap()),
                 Err(ProgramError::InvalidArgument { message }) if message == "expected compilation failure",
             ));
         }
@@ -2782,7 +2773,7 @@ pub(crate) mod tests {
     }
 
     #[test]
-    fn test_compiled_function_dispatcher_call_retains_specialization_after_execution_failure() {
+    fn test_compiled_function_dispatcher_execute_retains_specialization_after_execution_failure() {
         let domain = TestDomain::new();
         let options =
             TestOptions { staged_input_type: Some(ArrayType::scalar(DataType::I64)), ..TestOptions::default() };
@@ -2791,7 +2782,7 @@ pub(crate) mod tests {
 
         for _ in 0..2 {
             assert!(matches!(
-                function.call((), Array::scalar(2.0).unwrap()),
+                function.execute((), Array::scalar(2.0).unwrap()),
                 Err(ProgramError::InvalidArgument { message })
                     if message == "runtime input type f64[] does not refine declared type i64[]",
             ));
@@ -2805,7 +2796,7 @@ pub(crate) mod tests {
     }
 
     #[test]
-    fn test_compiled_function_dispatcher_call_rejects_same_key_recursive_dispatch() {
+    fn test_compiled_function_dispatcher_execute_rejects_same_key_recursive_dispatch() {
         let domain = TestDomain::new();
         let recursive: Rc<RefCell<Option<Box<dyn Fn() -> Result<Array, ProgramError>>>>> = Rc::new(RefCell::new(None));
         let closure_recursive = recursive.clone();
@@ -2817,10 +2808,10 @@ pub(crate) mod tests {
                 Ok(input)
             });
         let function_clone = function.clone();
-        *recursive.borrow_mut() = Some(Box::new(move || function_clone.call(true, Array::scalar(1.0).unwrap())));
+        *recursive.borrow_mut() = Some(Box::new(move || function_clone.execute(true, Array::scalar(1.0).unwrap())));
 
         assert!(matches!(
-            function.call(true, Array::scalar(1.0).unwrap()),
+            function.execute(true, Array::scalar(1.0).unwrap()),
             Err(ProgramError::InvalidArgument { message })
                 if message == "recursive JIT dispatch requested a specialization that is already being produced",
         ));
@@ -2829,7 +2820,7 @@ pub(crate) mod tests {
     }
 
     #[test]
-    fn test_compiled_function_dispatcher_call_allows_different_key_recursive_dispatch() {
+    fn test_compiled_function_dispatcher_execute_allows_different_key_recursive_dispatch() {
         let domain = TestDomain::new();
         let recursive: Rc<RefCell<Option<Box<dyn Fn() -> Result<Array, ProgramError>>>>> = Rc::new(RefCell::new(None));
         let closure_recursive = recursive.clone();
@@ -2843,23 +2834,23 @@ pub(crate) mod tests {
                 Ok(input)
             });
         let function_clone = function.clone();
-        *recursive.borrow_mut() = Some(Box::new(move || function_clone.call(false, Array::scalar(1.0).unwrap())));
+        *recursive.borrow_mut() = Some(Box::new(move || function_clone.execute(false, Array::scalar(1.0).unwrap())));
 
-        assert_eq!(function.call(true, Array::scalar(2.0).unwrap()).unwrap(), Array::scalar(2.0).unwrap());
+        assert_eq!(function.execute(true, Array::scalar(2.0).unwrap()).unwrap(), Array::scalar(2.0).unwrap());
         assert_eq!(function.specialization_count(), 2);
         assert_eq!(function.statistics().traces, 2);
     }
 
     #[test]
-    fn test_compiled_function_dispatcher_call_isolates_dispatchers() {
+    fn test_compiled_function_dispatcher_execute_isolates_dispatchers() {
         let domain = TestDomain::new();
         let first: CompiledFunctionDispatcher<TestDomain, (), ArrayType, ArrayType, _> =
             domain.jit(|(), input: CompilationTracer<TestDomain>| Ok(input));
         let second: CompiledFunctionDispatcher<TestDomain, (), ArrayType, ArrayType, _> =
             domain.jit(|(), input: CompilationTracer<TestDomain>| Ok(input));
 
-        assert_eq!(first.call((), Array::scalar(1.0).unwrap()).unwrap(), Array::scalar(1.0).unwrap());
-        assert_eq!(second.call((), Array::scalar(2.0).unwrap()).unwrap(), Array::scalar(2.0).unwrap());
+        assert_eq!(first.execute((), Array::scalar(1.0).unwrap()).unwrap(), Array::scalar(1.0).unwrap());
+        assert_eq!(second.execute((), Array::scalar(2.0).unwrap()).unwrap(), Array::scalar(2.0).unwrap());
         assert_eq!(first.specialization_count(), 1);
         assert_eq!(second.specialization_count(), 1);
         assert_eq!(first.statistics().traces, 1);
@@ -2868,13 +2859,13 @@ pub(crate) mod tests {
     }
 
     #[test]
-    fn test_compiled_function_dispatcher_call_concurrent_warm_calls() {
+    fn test_compiled_function_dispatcher_execute_concurrent_warm_calls() {
         let domain = TestDomain::new();
         let function: CompiledFunctionDispatcher<TestDomain, bool, ArrayType, ArrayType, _> =
             domain.jit(|negate, input: CompilationTracer<TestDomain>| {
                 Ok(if negate { input.unary(NegOperation::new()) } else { input })
             });
-        function.call(true, Array::scalar(1.0).unwrap()).unwrap();
+        function.execute(true, Array::scalar(1.0).unwrap()).unwrap();
 
         std::thread::scope(|scope| {
             for index in 0..4 {
@@ -2882,7 +2873,7 @@ pub(crate) mod tests {
                 scope.spawn(move || {
                     let value = f64::from(index);
                     assert_eq!(
-                        function.call(true, Array::scalar(value).unwrap()).unwrap(),
+                        function.execute(true, Array::scalar(value).unwrap()).unwrap(),
                         Array::scalar(-value).unwrap()
                     );
                 });
@@ -2895,7 +2886,7 @@ pub(crate) mod tests {
     }
 
     #[test]
-    fn test_compiled_function_dispatcher_call_concurrent_cold_misses() {
+    fn test_compiled_function_dispatcher_execute_concurrent_cold_misses() {
         let domain = TestDomain::new();
         let function: CompiledFunctionDispatcher<TestDomain, bool, ArrayType, ArrayType, _> =
             domain.jit(|negate, input: CompilationTracer<TestDomain>| {
@@ -2909,7 +2900,10 @@ pub(crate) mod tests {
                 let barrier = &barrier;
                 scope.spawn(move || {
                     barrier.wait();
-                    assert_eq!(function.call(true, Array::scalar(3.0).unwrap()).unwrap(), Array::scalar(-3.0).unwrap());
+                    assert_eq!(
+                        function.execute(true, Array::scalar(3.0).unwrap()).unwrap(),
+                        Array::scalar(-3.0).unwrap()
+                    );
                 });
             }
         });
@@ -2926,7 +2920,7 @@ pub(crate) mod tests {
     }
 
     #[test]
-    fn test_compiled_function_dispatcher_call_concurrent_domain_inference() {
+    fn test_compiled_function_dispatcher_execute_concurrent_domain_inference() {
         // Racing first calls through clones with inputs from different domains select one domain, which then executes
         // both calls.
         let first_domain = CarriedDomain::new();
@@ -2938,11 +2932,11 @@ pub(crate) mod tests {
         let (first_output, second_output) = std::thread::scope(|scope| {
             let first_call = scope.spawn(|| {
                 barrier.wait();
-                function.clone().call((), first_domain.scalar(1.0))
+                function.clone().execute((), first_domain.scalar(1.0))
             });
             let second_call = scope.spawn(|| {
                 barrier.wait();
-                function.clone().call((), second_domain.scalar(2.0))
+                function.clone().execute((), second_domain.scalar(2.0))
             });
             (first_call.join().unwrap(), second_call.join().unwrap())
         });
@@ -2960,33 +2954,45 @@ pub(crate) mod tests {
     }
 
     #[test]
-    fn test_compiled_function_dispatcher_call_statefully_async() {
+    fn test_compiled_function_dispatcher_execute_statefully() {
         let first_domain = CarriedDomain::new();
         let second_domain = CarriedDomain::new();
         let function: CompiledFunctionDispatcher<CarriedDomain, (), ArrayType, ArrayType, _> =
             jit(|(), input: CompilationTracer<CarriedDomain>| Ok(input.unary(NegOperation::new())));
-        assert_eq!(
-            function.call_statefully_async((), first_domain.scalar(1.0)).r#await(),
-            Ok(first_domain.scalar(-1.0))
-        );
+        assert_eq!(function.execute_statefully((), first_domain.scalar(1.0)).r#await(), Ok(first_domain.scalar(-1.0)));
         assert_eq!(function.domain(), Some(&first_domain));
-        assert_eq!(
-            function.call_statefully_async((), second_domain.scalar(2.0)).r#await(),
-            Ok(first_domain.scalar(-2.0)),
-        );
+        assert_eq!(function.execute_statefully((), second_domain.scalar(2.0)).r#await(), Ok(first_domain.scalar(-2.0)),);
         assert_eq!(function.statistics().dispatch_hits, 1);
     }
 
     #[test]
-    fn test_compiled_function_dispatcher_call_statefully() {
+    fn test_compiled_function_dispatcher_execute_statefully_and_wait() {
         let first_domain = CarriedDomain::new();
         let second_domain = CarriedDomain::new();
         let function: CompiledFunctionDispatcher<CarriedDomain, (), ArrayType, ArrayType, _> =
             jit(|(), input: CompilationTracer<CarriedDomain>| Ok(input.unary(NegOperation::new())));
-        assert_eq!(function.call_statefully((), first_domain.scalar(1.0)), Ok(first_domain.scalar(-1.0)));
+        assert_eq!(function.execute_statefully_and_wait((), first_domain.scalar(1.0)), Ok(first_domain.scalar(-1.0)));
         assert_eq!(function.domain(), Some(&first_domain));
-        assert_eq!(function.call_statefully((), second_domain.scalar(2.0)), Ok(first_domain.scalar(-2.0)));
+        assert_eq!(function.execute_statefully_and_wait((), second_domain.scalar(2.0)), Ok(first_domain.scalar(-2.0)));
         assert_eq!(function.statistics().dispatch_hits, 1);
+    }
+
+    #[test]
+    fn test_compiled_function_dispatcher_invalidate_specializations() {
+        let domain = TestDomain::new();
+        let function: CompiledFunctionDispatcher<TestDomain, bool, ArrayType, ArrayType, _> =
+            domain.jit(|negate, input: CompilationTracer<TestDomain>| {
+                Ok(if negate { input.unary(NegOperation::new()) } else { input })
+            });
+        function.execute(true, Array::scalar(2.0).unwrap()).unwrap();
+        function.execute(false, Array::scalar(2.0).unwrap()).unwrap();
+
+        assert_eq!(function.cache_capacity(), DEFAULT_JIT_CACHE_CAPACITY);
+        assert_eq!(function.invalidate_specializations(&true), 1);
+        assert_eq!(function.specialization_count(), 1);
+        function.execute(true, Array::scalar(2.0).unwrap()).unwrap();
+        assert_eq!(function.statistics().traces, 3);
+        assert_eq!(domain.compilation_count(), 2);
     }
 
     #[test]

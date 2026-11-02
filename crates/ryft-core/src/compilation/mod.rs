@@ -50,7 +50,8 @@
 //!   - Execute an [`ExecutableFunction`] through [`ExecutableFunction::execute`]. Domains with transactional
 //!     external state implement [`StatefulCompilationDomain`], and their executable functions are invoked through
 //!     [`ExecutableFunction::execute_statefully`] or [`ExecutableFunction::execute_statefully_and_wait`]. Retained
-//!     dispatchers expose corresponding invocation functions (e.g., [`CompiledFunctionDispatcher::call_statefully`]).
+//!     dispatchers expose corresponding invocation functions (e.g.,
+//!     [`CompiledFunctionDispatcher::execute_statefully_and_wait`]).
 //!
 //! Backend-facing crates normally wrap these generic entry points with value- and option-specific APIs.
 //! New backend-neutral code can call them directly.

@@ -489,7 +489,7 @@ mod tests {
         assert_eq!(function.options(), &CarriedOptions::default());
         assert_eq!(function.cache_capacity(), DEFAULT_JIT_CACHE_CAPACITY);
         assert_eq!(domain.compilation_count(), 0);
-        assert_eq!(function.call((), domain.scalar(2.0)), Ok(domain.scalar(-2.0)));
+        assert_eq!(function.execute((), domain.scalar(2.0)), Ok(domain.scalar(-2.0)));
         assert_eq!(domain.compilation_count(), 1);
     }
 
@@ -502,7 +502,7 @@ mod tests {
         assert_eq!(function.domain(), Some(&domain));
         assert_eq!(function.options(), &options);
         assert_eq!(function.cache_capacity(), DEFAULT_JIT_CACHE_CAPACITY);
-        assert_eq!(function.call((), domain.scalar(2.0)), Ok(domain.scalar(2.0)));
+        assert_eq!(function.execute((), domain.scalar(2.0)), Ok(domain.scalar(2.0)));
     }
 
     #[test]
@@ -522,9 +522,9 @@ mod tests {
         assert_eq!(function.cache_capacity(), 1);
 
         // Alternating static values evict the only retained specialization, so every call traces and compiles again.
-        assert_eq!(function.call(false, domain.scalar(2.0)), Ok(domain.scalar(2.0)));
-        assert_eq!(function.call(true, domain.scalar(2.0)), Ok(domain.scalar(-2.0)));
-        assert_eq!(function.call(false, domain.scalar(2.0)), Ok(domain.scalar(2.0)));
+        assert_eq!(function.execute(false, domain.scalar(2.0)), Ok(domain.scalar(2.0)));
+        assert_eq!(function.execute(true, domain.scalar(2.0)), Ok(domain.scalar(-2.0)));
+        assert_eq!(function.execute(false, domain.scalar(2.0)), Ok(domain.scalar(2.0)));
         assert_eq!(function.specialization_count(), 1);
         assert_eq!(function.statistics().dispatch_misses, 3);
         assert_eq!(domain.compilation_count(), 3);
@@ -586,7 +586,7 @@ mod tests {
 
         // The first input leaf of the first call selects the domain, even when other leaves carry another domain.
         assert_eq!(
-            function.call((), vec![first_domain.scalar(2.0), second_domain.scalar(3.0)]),
+            function.execute((), vec![first_domain.scalar(2.0), second_domain.scalar(3.0)]),
             Ok(first_domain.scalar(-2.0)),
         );
         assert_eq!(function.domain(), Some(&first_domain));
@@ -603,7 +603,7 @@ mod tests {
         assert_eq!(function.domain(), None);
         assert_eq!(function.options(), &options);
         assert_eq!(function.cache_capacity(), DEFAULT_JIT_CACHE_CAPACITY);
-        assert_eq!(function.call((), domain.scalar(2.0)), Ok(domain.scalar(2.0)));
+        assert_eq!(function.execute((), domain.scalar(2.0)), Ok(domain.scalar(2.0)));
         assert_eq!(function.domain(), Some(&domain));
     }
 
@@ -616,7 +616,7 @@ mod tests {
         assert_eq!(function.domain(), None);
         assert_eq!(function.options(), &options);
         assert_eq!(function.cache_capacity(), 1);
-        assert_eq!(function.call((), domain.scalar(2.0)), Ok(domain.scalar(2.0)));
+        assert_eq!(function.execute((), domain.scalar(2.0)), Ok(domain.scalar(2.0)));
         assert_eq!(function.domain(), Some(&domain));
     }
 }
