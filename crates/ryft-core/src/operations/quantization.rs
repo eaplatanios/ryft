@@ -207,10 +207,10 @@ pub trait BlockQuantize<T = <Self as Capability>::Universe>: Capability + Parame
     /// dequantized value of an element is `element * scale * global_scale`. The returned representation retains this
     /// global scale so that [`BlockDequantize`] reconstructs the original magnitude. Uniform `rounding_noise` samples
     /// in `[0, 1)` (e.g., drawn with [`Random::random_uniform`]) replace rounding to the nearest value (with ties to
-    /// even) by stochastic rounding. Each scaled value `x` rounds to `floor(x / ulp + noise) · ulp`, where `ulp` is
-    /// the spacing of the element type grid at `x`, so that it rounds up with probability equal to its distance from
-    /// the grid value below it, in units of `ulp`, and quantization is unbiased within the finite range of the element
-    /// type up to the rounding of the noise addition at the compute type. Results past the largest finite magnitude of
+    /// even) by stochastic rounding. Each scaled value `x` rounds to `floor(x / ulp + noise) · ulp`, where `ulp` is the
+    /// spacing of the element type grid at `x`, so that it rounds up with probability equal to its distance from the
+    /// grid value below it, in units of `ulp`, and quantization is unbiased within the finite range of the element type
+    /// up to the rounding of the noise addition at the computation type. Results past the largest finite magnitude of
     /// the element type saturate to it. The spacing is computed exactly from the exponent bits of `x`.
     ///
     /// `self` must be an `f32` or `f64` array of rank at least one, `block_size` must be at least two, `block_axes`
@@ -289,7 +289,7 @@ where
             return Err(TypeError::invalid("`block_quantize` input must have a static shape").into());
         };
         let dimensions = shape.dimensions().to_vec();
-        let compute_type = input_type.data_type();
+        let computation_type = input_type.data_type();
 
         // Splitting every block axis into a pair of `(block_count, block_size)` dimensions keeps the row-major element
         // order, so each block is the set of values that share all block counts. Reducing the block size dimensions
@@ -312,7 +312,7 @@ where
         }
 
         let scale_value_type = ArrayType::new(
-            compute_type,
+            computation_type,
             Shape::new(scale_dimensions.iter().map(|&size| Dimension::Static(size)).collect()),
         );
         let domain = self.domain();
@@ -1618,10 +1618,10 @@ impl BlockScaledDotConfiguration {
     ///
     /// The recipe follows Transformer Engine in which tensors it quantizes and how, but not bit for bit. Global scales
     /// divide the input as in JAX, whereas Transformer Engine multiplies by reciprocals, so roundings can differ.
-    /// Stochastic rounding draws a uniform sample at the compute type per value rather than eight random bits, which
-    /// keeps rounding unbiased with a finer probability resolution. Hadamard transforms run at the compute type rather
-    /// than at `bf16`. Which layers keep higher precision (e.g., the last blocks of a model) is the caller's choice, as
-    /// in Transformer Engine.
+    /// Stochastic rounding draws a uniform sample at the computation type per value rather than eight random bits,
+    /// which keeps rounding unbiased with a finer probability resolution. Hadamard transforms run at the computation
+    /// type rather than at `bf16`. Which layers keep higher precision (e.g., the last blocks of a model) is the
+    /// caller's choice, as in Transformer Engine.
     #[inline]
     pub fn nvfp4_training(dimensions: DotDimensionNumbers) -> Self {
         Self::new(dimensions, BlockScaleFormat::nvfp4())
@@ -1635,7 +1635,7 @@ impl BlockScaledDotConfiguration {
 
     /// Returns this configuration with the provided output data type, which must be one of `bf16`, `f16`, `f32`, and
     /// `f64`. Forward contractions accumulate at it when it is `bf16`, `f32`, or `f64` and the left format has no
-    /// global scale. Otherwise, as for NVFP4, they accumulate at the compute type (i.e., `f64` when either input is
+    /// global scale. Otherwise, as for NVFP4, they accumulate at the computation type (i.e., `f64` when either input is
     /// `f64`, and `f32` otherwise) and convert to it. JAX accumulates at the output type and rejects `f64` outputs.
     #[inline]
     pub fn with_accumulation_type(mut self, accumulation_type: DataType) -> Self {
@@ -2026,9 +2026,9 @@ where
 /// Both policies first normalize every input to the rank-three layout `[batch, free, contracting]` by transposing and
 /// merging its dimensions, so several contracting dimensions form one blocked dimension. That dimension follows the
 /// listed order of the contracting dimensions. Clipping thresholds use each input's own format. Backward contractions
-/// accumulate at the compute type (i.e., `f64` when either input is `f64` and `f32` otherwise). Microscaling (i.e., MX)
-/// forward contractions with an output type at which [`ScaledDotOperation`] cannot accumulate (e.g., `f16`) accumulate
-/// at the compute type and convert afterwards. Forward mode differentiation is not supported.
+/// accumulate at the computation type (i.e., `f64` when either input is `f64` and `f32` otherwise). Microscaling (i.e.,
+/// MX) forward contractions with an output type at which [`ScaledDotOperation`] cannot accumulate (e.g., `f16`)
+/// accumulate at the computation type and convert afterwards. Forward mode differentiation is not supported.
 ///
 /// # Example
 ///
@@ -2162,8 +2162,6 @@ where
     })
 }
 
-// TODO(eaplatanios): Review from here onwards.
-
 /// Grid parameters of a block-scaled element data type.
 #[derive(Copy, Clone, Debug, PartialEq)]
 struct BlockElementFormat {
@@ -2189,7 +2187,7 @@ impl BlockElementFormat {
             DataType::F8E4M3FN => Ok(Self { max: 448.0, max_exponent: 8, min_exponent: -6, mantissa_bits: 3 }),
             DataType::F8E5M2 => Ok(Self { max: 57344.0, max_exponent: 15, min_exponent: -14, mantissa_bits: 2 }),
             element_type => {
-                Err(TypeError::invalid(format!("`block_quantize` does not support element data type `{element_type}`")))
+                Err(TypeError::invalid(format!("unsupported block-scaled element data type `{element_type}`")))
             }
         }
     }
@@ -2201,21 +2199,23 @@ enum GlobalScale<V> {
     /// No global scale, for formats without global scales.
     None,
 
-    /// Provided global scale (absent provided scales are `1`, i.e., [`GlobalScale::None`]).
+    /// Provided global scale (absent provided scales are `1`; i.e., [`GlobalScale::None`]).
     Provided(V),
 
     /// Global scale computed from the current maximum magnitude of the tensor.
     Current,
 }
 
-/// Shapes and permutations that normalize the inputs of a [`BlockScaledDot`] to the rank-three layout
+// TODO(eaplatanios): Review from here onwards.
+
+/// Shapes and permutations that normalize the inputs of a [`BlockScaledDot`] to the rank-`3` layout
 /// `[batch, free, contracting]`, together with the rules that operate on that layout.
 struct BlockScaledDotRules<'o> {
-    /// Configuration of the rules.
+    /// [`BlockScaledDotConfiguration`] of the rules.
     configuration: &'o BlockScaledDotConfiguration,
 
-    /// Floating-point type at which inputs are quantized and unquantized contractions accumulate.
-    compute_type: DataType,
+    /// Floating-point data type used for quantization and intermediate arithmetic.
+    computation_type: DataType,
 
     /// Permutation of the left-hand side input dimensions into batch, free, and contracting order.
     lhs_permutation: Vec<usize>,
@@ -2229,10 +2229,10 @@ struct BlockScaledDotRules<'o> {
     /// Static shape of the right-hand side input.
     rhs_shape: Vec<usize>,
 
-    /// Rank-three shape `[batch, lhs free, contracting]` of the normalized left-hand side input.
+    /// Rank-`3` shape `[batch, lhs free, contracting]` of the normalized left-hand side input.
     lhs_canonical_shape: [usize; 3],
 
-    /// Rank-three shape `[batch, rhs free, contracting]` of the normalized right-hand side input.
+    /// Rank-`3` shape `[batch, rhs free, contracting]` of the normalized right-hand side input.
     rhs_canonical_shape: [usize; 3],
 
     /// Static shape of the output, which lists the batch, left free, and right free dimensions.
@@ -2262,18 +2262,18 @@ impl<'o> BlockScaledDotRules<'o> {
         };
         let lhs_shape = lhs_shape.dimensions().to_vec();
         let rhs_shape = rhs_shape.dimensions().to_vec();
-        let compute_type = if lhs_type.data_type() == DataType::F64 || rhs_type.data_type() == DataType::F64 {
+        let computation_type = if lhs_type.data_type() == DataType::F64 || rhs_type.data_type() == DataType::F64 {
             DataType::F64
         } else {
             DataType::F32
         };
 
-        // Dot type inference validates the dimension numbers and extents at the common compute type.
+        // Dot type inference validates the dimension numbers and extents at the common computation type.
         let dimensions = &configuration.dimensions;
         let output_type = infer_dot_output_type(
             BLOCK_SCALED_DOT_NAME,
-            &lhs_type.as_ref().clone().with_data_type(compute_type),
-            &rhs_type.as_ref().clone().with_data_type(compute_type),
+            &lhs_type.as_ref().clone().with_data_type(computation_type),
+            &rhs_type.as_ref().clone().with_data_type(computation_type),
             dimensions,
             None,
             None,
@@ -2300,7 +2300,7 @@ impl<'o> BlockScaledDotRules<'o> {
         let rhs_free = product(&rhs_shape, &rhs_free_axes);
         let rules = Self {
             configuration,
-            compute_type,
+            computation_type,
             lhs_permutation,
             rhs_permutation,
             lhs_shape,
@@ -2350,7 +2350,7 @@ impl<'o> BlockScaledDotRules<'o> {
         Ok(())
     }
 
-    /// Returns `value` converted to the compute type and normalized to the rank-three `[batch, free, contracting]`
+    /// Returns `value` converted to the computation type and normalized to the rank-three `[batch, free, contracting]`
     /// layout through `permutation`.
     fn normalize<V: ConvertElementType + Reshape + Transpose>(
         &self,
@@ -2358,7 +2358,7 @@ impl<'o> BlockScaledDotRules<'o> {
         permutation: &[usize],
         shape: [usize; 3],
     ) -> Result<V, ProgramError> {
-        let value = value.convert_element_type(self.compute_type)?;
+        let value = value.convert_element_type(self.computation_type)?;
         let value = if permutation.iter().enumerate().all(|(index, &axis)| index == axis) {
             value
         } else {
@@ -2469,7 +2469,7 @@ impl<'o> BlockScaledDotRules<'o> {
         let [_, n, _] = self.rhs_canonical_shape;
         let lhs = self.normalize(lhs, &self.lhs_permutation, self.lhs_canonical_shape)?;
         let rhs = self.normalize(rhs, &self.rhs_permutation, self.rhs_canonical_shape)?;
-        let seed = seed.convert_element_type(self.compute_type)?.reshape(Shape::new(vec![
+        let seed = seed.convert_element_type(self.computation_type)?.reshape(Shape::new(vec![
             Dimension::Static(batch),
             Dimension::Static(m),
             Dimension::Static(n),
@@ -2480,7 +2480,7 @@ impl<'o> BlockScaledDotRules<'o> {
             let gradient_global_scale = self.global_scale(configuration.gradient_format(), gradient_global_scale)?;
             let (noise, weight_gradient_noise) = match random_state {
                 Some(state) => {
-                    let noise_type = |shape: [usize; 3]| ArrayType::new_static(self.compute_type, shape);
+                    let noise_type = |shape: [usize; 3]| ArrayType::new_static(self.computation_type, shape);
                     let (state, noise) = state.random_uniform(&noise_type([batch, m, n]))?;
                     let (_, weight_gradient_noise) = state.random_uniform(&noise_type([batch, m, n]))?;
                     (Some(noise), Some(weight_gradient_noise))
@@ -2506,7 +2506,7 @@ impl<'o> BlockScaledDotRules<'o> {
                 None,
             )?;
             let dimensions = DotDimensionNumbers::new(vec![2], vec![1], vec![0], vec![0]);
-            let lhs_cotangent = self.contract(&seed_along_n, &rhs_along_n, &dimensions, self.compute_type)?;
+            let lhs_cotangent = self.contract(&seed_along_n, &rhs_along_n, &dimensions, self.computation_type)?;
 
             // The weight gradient contracts the seed `[B, M, N]` with the left input `[B, M, K]` along `M`, after the
             // optional Hadamard transform of both along `M`.
@@ -2525,7 +2525,7 @@ impl<'o> BlockScaledDotRules<'o> {
             )?;
             let lhs_along_m = self.quantize(&lhs, configuration.lhs_format, 1, false, lhs_global_scale, None)?;
             let dimensions = DotDimensionNumbers::new(vec![1], vec![1], vec![0], vec![0]);
-            let rhs_cotangent = self.contract(&seed_along_m, &lhs_along_m, &dimensions, self.compute_type)?;
+            let rhs_cotangent = self.contract(&seed_along_m, &lhs_along_m, &dimensions, self.computation_type)?;
             (lhs_cotangent, rhs_cotangent)
         } else {
             let lhs_cotangent = seed.dot(&rhs, &DotDimensionNumbers::new(vec![2], vec![1], vec![0], vec![0]))?;
@@ -2570,7 +2570,7 @@ impl<'o> BlockScaledDotRules<'o> {
         match (self.configuration.global_scaling, global_scale) {
             (BlockScaledGlobalScaling::Current, _) => Ok(GlobalScale::Current),
             (BlockScaledGlobalScaling::Provided, Some(global_scale)) => {
-                Ok(GlobalScale::Provided(global_scale.convert_element_type(self.compute_type)?))
+                Ok(GlobalScale::Provided(global_scale.convert_element_type(self.computation_type)?))
             }
             (BlockScaledGlobalScaling::Provided, None) => Ok(GlobalScale::None),
         }
@@ -2599,9 +2599,9 @@ impl<'o> BlockScaledDotRules<'o> {
                 // `max_abs / (element_max · 448)` maps the largest magnitude to the largest element and scale. Clamping
                 // the scale to the smallest normal value keeps it positive for tensors whose values are all zero.
                 let max_abs = value.abs()?.reduce(&[0, 1, 2], ReductionKind::Max)?;
-                let scalar = |constant: f64| value.domain().fill(&ArrayType::scalar(self.compute_type), constant);
+                let scalar = |constant: f64| value.domain().fill(&ArrayType::scalar(self.computation_type), constant);
                 let global_scale = max_abs.div(&scalar(format.largest_unclipped_value()?)?)?;
-                let smallest = if self.compute_type == DataType::F64 { f64::MIN_POSITIVE } else { 2f64.powi(-126) };
+                let smallest = if self.computation_type == DataType::F64 { f64::MIN_POSITIVE } else { 2f64.powi(-126) };
                 Some(global_scale.clamp(&scalar(smallest)?, &scalar(f64::INFINITY)?)?)
             }
         };
@@ -2631,10 +2631,10 @@ impl<'o> BlockScaledDotRules<'o> {
     }
 
     /// Contracts two quantized inputs with [`ScaledDot`], including their global scales. When the left format uses a
-    /// global scale (i.e., the `nvfp4` mode of JAX), the product accumulates at the compute type and converts to
+    /// global scale (i.e., the `nvfp4` mode of JAX), the product accumulates at the computation type and converts to
     /// `data_type` afterwards, as in JAX, which accumulates at `f32`. Other products accumulate at `data_type`
     /// directly, unless [`ScaledDotOperation`] cannot accumulate its `bf16` dequantized inputs at it (e.g., `f16`).
-    /// Those products accumulate at the compute type as well.
+    /// Those products accumulate at the computation type as well.
     fn contract<V>(
         &self,
         lhs: &BlockQuantizedValue<V>,
@@ -2649,7 +2649,7 @@ impl<'o> BlockScaledDotRules<'o> {
         let accumulation_type = if self.configuration.lhs_format.has_global_scale()
             || !matches!(data_type, DataType::BF16 | DataType::F32 | DataType::F64)
         {
-            self.compute_type
+            self.computation_type
         } else {
             data_type
         };
@@ -2685,7 +2685,7 @@ impl<'o> BlockScaledDotRules<'o> {
         // The butterfly along bit axis `a` computes `y[.., k, ..] = Σ_j x[.., j, ..] · H2[j, k]` with
         // `H2[j, k] = 1 - 2 · j · k`, by broadcasting the input over a new output bit axis and reducing the input one.
         let domain = value.domain();
-        let butterfly_type = ArrayType::new_static(self.compute_type, [2, 2]);
+        let butterfly_type = ArrayType::new_static(self.computation_type, [2, 2]);
         let butterfly = domain.fill(&butterfly_type, 1.0)?.sub(
             &domain
                 .fill(&butterfly_type, 2.0)?
@@ -2721,7 +2721,7 @@ impl<'o> BlockScaledDotRules<'o> {
         V::Domain: Fill<f64, V> + Iota<V>,
     {
         let domain = value.domain();
-        let vector_type = ArrayType::new_static(self.compute_type, [16]);
+        let vector_type = ArrayType::new_static(self.computation_type, [16]);
         let fill = |constant: f64| domain.fill(&vector_type, constant);
         let positions = domain.iota(&vector_type, 0)?;
         let mut powers = fill(1.0)?;
@@ -2739,12 +2739,14 @@ impl<'o> BlockScaledDotRules<'o> {
         fill(1.0)?.sub(&fill(2.0)?.mul(&negative)?)
     }
 
-    /// Returns a value of the compute type with the shape of `value` and every element set to `constant`.
+    /// Returns a value of the computation type with the shape of `value` and every element set to `constant`.
     fn fill<V: Value<Type = ArrayType>>(&self, value: &V, constant: f64) -> Result<V, ProgramError>
     where
         V::Domain: Fill<f64, V>,
     {
-        value.domain().fill(&ArrayType::new(self.compute_type, value.r#type().shape().clone()), constant)
+        value
+            .domain()
+            .fill(&ArrayType::new(self.computation_type, value.r#type().shape().clone()), constant)
     }
 
     /// Broadcasts the rank-0 `scalar` to a rank-three array of `shape`, keeping its placement.
@@ -2777,10 +2779,10 @@ fn validate_block_quantize_inputs(
             TypeError::invalid(format!("`block_quantize` does not support scale data type `{scale_type}`")).into()
         );
     }
-    let compute_type = input_type.data_type();
-    if !matches!(compute_type, DataType::F32 | DataType::F64) {
+    let computation_type = input_type.data_type();
+    if !matches!(computation_type, DataType::F32 | DataType::F64) {
         return Err(TypeError::invalid(format!(
-            "`block_quantize` expects an `f32` or `f64` input but got `{compute_type}`",
+            "`block_quantize` expects an `f32` or `f64` input but got `{computation_type}`",
         ))
         .into());
     }
@@ -2814,16 +2816,16 @@ fn validate_block_quantize_inputs(
             ))
             .into());
         }
-        if global_scale_type.rank() != 0 || global_scale_type.data_type() != compute_type {
+        if global_scale_type.rank() != 0 || global_scale_type.data_type() != computation_type {
             return Err(TypeError::invalid(format!(
-                "`block_quantize` global scale must be a rank-0 `{compute_type}` array but got \
+                "`block_quantize` global scale must be a rank-0 `{computation_type}` array but got \
                  `{global_scale_type}`",
             ))
             .into());
         }
     }
     if let Some(noise_type) = rounding_noise
-        && (noise_type.data_type() != compute_type || noise_type.shape() != input_type.shape())
+        && (noise_type.data_type() != computation_type || noise_type.shape() != input_type.shape())
     {
         return Err(TypeError::invalid(format!(
             "`block_quantize` rounding noise must have the data type and shape of the input `{input_type}` \
@@ -2920,7 +2922,7 @@ where
     V: Value<Type = ArrayType> + Add + And + Clamp + ConvertElementType + Div + Floor + Mul + Round,
     F: Fn(&ArrayType, f64) -> Result<V, ProgramError>,
 {
-    let compute_type = block_max.r#type().data_type();
+    let computation_type = block_max.r#type().data_type();
     let (smallest_scale, largest_scale) = match scale_type {
         DataType::F8E4M3FN => ((-9.0f64).exp2(), 448.0),
         DataType::F8E8M0FNU => ((-126.0f64).exp2(), 127.0f64.exp2()),
@@ -2930,8 +2932,8 @@ where
         // NVFP4 linear scaling maps the block maximum to the largest finite magnitude of the element type,
         // and the clamped scale rounds to the nearest `f8e4m3fn` value.
         let scales = block_max.div(&fill(scale_value_type, element_format.max)?)?.clamp(
-            &fill(&ArrayType::scalar(compute_type), smallest_scale)?,
-            &fill(&ArrayType::scalar(compute_type), largest_scale)?,
+            &fill(&ArrayType::scalar(computation_type), smallest_scale)?,
+            &fill(&ArrayType::scalar(computation_type), largest_scale)?,
         )?;
         round_to_floating_point_grid(&scales, -6, 3, None, &|value| fill(scale_value_type, value))?
     } else {
@@ -2941,8 +2943,8 @@ where
         binade_scale(block_max, &|value| fill(scale_value_type, value))?
             .mul(&fill(scale_value_type, (-f64::from(element_format.max_exponent)).exp2())?)?
             .clamp(
-                &fill(&ArrayType::scalar(compute_type), smallest_scale)?,
-                &fill(&ArrayType::scalar(compute_type), largest_scale)?,
+                &fill(&ArrayType::scalar(computation_type), smallest_scale)?,
+                &fill(&ArrayType::scalar(computation_type), largest_scale)?,
             )?
     };
     Ok(stored_scales)
@@ -2959,15 +2961,15 @@ where
     V: Value<Type = ArrayType> + Add + And + Clamp + ConvertElementType + Div + Floor + Mul + Round,
     F: Fn(&ArrayType, f64) -> Result<V, ProgramError>,
 {
-    let compute_type = quotients.r#type().data_type();
-    let element_value_type = ArrayType::new(compute_type, quotients.r#type().shape().clone());
+    let computation_type = quotients.r#type().data_type();
+    let element_value_type = ArrayType::new(computation_type, quotients.r#type().shape().clone());
     // The quotients are clamped to the finite range of the element type before rounding, which saturates infinite
     // values rather than dividing infinite spacings, and the largest magnitude is on the grid, so rounding to the
     // nearest value keeps the clamped quotients in range. Stochastic rounding can still step past the largest
     // magnitude when adding noise just below one rounds up to the next integer, so its result is clamped again.
     let quotients = quotients.clamp(
-        &fill(&ArrayType::scalar(compute_type), -element_format.max)?,
-        &fill(&ArrayType::scalar(compute_type), element_format.max)?,
+        &fill(&ArrayType::scalar(computation_type), -element_format.max)?,
+        &fill(&ArrayType::scalar(computation_type), element_format.max)?,
     )?;
     let elements = round_to_floating_point_grid(
         &quotients,
@@ -2978,8 +2980,8 @@ where
     )?;
     let elements = match rounding_noise {
         Some(_) => elements.clamp(
-            &fill(&ArrayType::scalar(compute_type), -element_format.max)?,
-            &fill(&ArrayType::scalar(compute_type), element_format.max)?,
+            &fill(&ArrayType::scalar(computation_type), -element_format.max)?,
+            &fill(&ArrayType::scalar(computation_type), element_format.max)?,
         )?,
         None => elements,
     };
@@ -2995,13 +2997,13 @@ where
 ///
 /// The grid spacing at `x` derives from the power of two of [`binade_scale`], which is zero for zero and subnormal
 /// values, where the clamp to the smallest normal value applies. Rounding to the nearest value is exact, because it
-/// only multiplies or divides by powers of two and rounds to an integer. Stochastic rounding adds the noise first,
-/// and that addition itself rounds, so values within one unit in the last place of the compute type below an integer
+/// only multiplies or divides by powers of two and rounds to an integer. Stochastic rounding adds the noise first, and
+/// that addition itself rounds, so values within one unit in the last place of the computation type below an integer
 /// round up to it.
 ///
 /// # Parameters
 ///
-///   - `value`: Value to round, whose element type is the compute type.
+///   - `value`: Value to round, whose element type is the computation type.
 ///   - `min_exponent`: Exponent of the smallest normal value of the narrow type.
 ///   - `mantissa_bits`: Number of explicit mantissa bits of the narrow type.
 ///   - `rounding_noise`: Optional uniform samples in `[0, 1)` that select stochastic rounding.
@@ -3034,19 +3036,19 @@ where
 ///
 /// # Parameters
 ///
-///   - `value`: Value whose element type is the compute type.
+///   - `value`: Value whose element type is the computation type.
 ///   - `fill`: Function that returns a value with the type of `value` and every element set to its argument.
 fn binade_scale<V, F>(value: &V, fill: &F) -> Result<V, ProgramError>
 where
     V: Value<Type = ArrayType> + And + ConvertElementType,
     F: Fn(f64) -> Result<V, ProgramError>,
 {
-    let compute_type = value.r#type().data_type();
-    let bits_type = if compute_type == DataType::F64 { DataType::U64 } else { DataType::U32 };
+    let computation_type = value.r#type().data_type();
+    let bits_type = if computation_type == DataType::F64 { DataType::U64 } else { DataType::U32 };
     value
         .bitcast_element_type(bits_type)?
         .and(&fill(f64::INFINITY)?.bitcast_element_type(bits_type)?)?
-        .bitcast_element_type(compute_type)
+        .bitcast_element_type(computation_type)
 }
 
 /// Validates block dequantization's array types and returns normalized, distinct block axes before any operations
@@ -3424,7 +3426,7 @@ mod tests {
         let input = Array::matrix(2, 8, vec![1.0f32; 16]).unwrap();
         assert_eq!(
             input.block_quantize(4, DataType::F16, DataType::F8E4M3FN),
-            Err(ProgramError::from(TypeError::invalid("`block_quantize` does not support element data type `f16`"))),
+            Err(ProgramError::from(TypeError::invalid("unsupported block-scaled element data type `f16`"))),
         );
         assert_eq!(
             input.block_quantize(4, DataType::F4E2M1FN, DataType::F16),
@@ -6697,7 +6699,7 @@ mod tests {
         // Construction does not validate formats, but element types without a grid have no largest value.
         assert_eq!(
             BlockScaleFormat::new(4, DataType::F16, DataType::F8E4M3FN).largest_unclipped_value(),
-            Err(TypeError::invalid("`block_quantize` does not support element data type `f16`")),
+            Err(TypeError::invalid("unsupported block-scaled element data type `f16`")),
         );
     }
 
@@ -6938,7 +6940,7 @@ mod tests {
         );
 
         // MXFP8 contractions accumulate at the output type directly, unless `ScaledDotOperation` cannot accumulate at
-        // it, as for `f16`, where they accumulate at the compute type and convert afterwards.
+        // it, as for `f16`, where they accumulate at the computation type and convert afterwards.
         let mxfp8 = BlockScaleFormat::new(4, DataType::F8E4M3FN, DataType::F8E8M0FNU);
         let function = block_scaled_dot::<EagerArrayContext>(
             BlockScaledDotConfiguration::new(DotDimensionNumbers::matmul(), mxfp8)
@@ -6959,8 +6961,8 @@ mod tests {
             Ok(expected.convert_element_type(DataType::F16).unwrap()),
         );
 
-        // NVFP4 contractions accumulate at the compute type even without global scales and convert to the output type
-        // afterwards, as in JAX.
+        // NVFP4 contractions accumulate at the computation type even without global scales and convert to the output
+        // type afterwards, as in JAX.
         let function = block_scaled_dot::<EagerArrayContext>(
             BlockScaledDotConfiguration::new(DotDimensionNumbers::matmul(), nvfp4)
                 .with_accumulation_type(DataType::BF16),

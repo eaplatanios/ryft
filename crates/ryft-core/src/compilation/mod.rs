@@ -127,12 +127,12 @@
 //! of backend compilation to the shared context.
 //!
 //! [`CompilationContext`] is the backend-artifact cache shared by every compilation using the same domain handle, and
-//! it resolves the domain's [`CompilationCacheDomain::CacheKey`] through memory, same-key single-flight coordination,
+//! it resolves the domain's [`CompilationCacheDomain::CacheKey`] through memory, waiting on in-flight compilations,
 //! optional persistent storage, optional distributed exchange, and finally backend compilation. Backends own their
 //! contexts, so users configure caching and exchange when they construct a backend handle. Refer to
 //! [`CompilationContext`] for the rendered resolution diagram and a configuration example.
 //!
-//! Misses for the same key are single flight, while different keys may compile concurrently. [`DiskCache`] provides
+//! Misses for the same key are deduplicated, while different keys may compile concurrently. [`DiskCache`] provides
 //! optional checksummed persistent storage, and [`CompilationArtifactExchange`] optionally shares serialized artifacts
 //! among processes according to [`CompilationArtifactExchangePolicy`]. [`DispatcherStatistics`] reports the frontend
 //! activity of retained dispatchers, while [`CompilationCacheStatistics`] and structured [`CompilationEvent`]s report

@@ -352,8 +352,6 @@ impl CompilationCacheStatisticsAccumulator {
     }
 }
 
-// TODO(eaplatanios): Review from here onwards.
-
 /// State of one in-flight compilation that same key waiters observe.
 enum InFlightState<P> {
     /// The producer has not finished yet.
@@ -362,7 +360,7 @@ enum InFlightState<P> {
     /// The producer published this program.
     Ready(Arc<P>),
 
-    /// The producer failed, so waiters must retry through a new producer election.
+    /// The producer failed, so waiters must retry, and the first of them to miss again becomes the new producer.
     Failed,
 }
 
@@ -402,12 +400,12 @@ impl<P> InFlightCompilation<P> {
     }
 }
 
-/// Elected producer for one missing cache key.
-///
-/// Dropping a producer without calling [`Self::finish`] (e.g., when compilation fails or panics) removes its in-flight
-/// marker and wakes its waiters, which then retry through a new producer election.
+/// Producer of the in-flight compilation for one missing cache key. The first caller to miss on a key becomes
+/// its producer, while later callers for the same key wait for its result. Dropping a producer without calling
+/// [`Self::finish`] (e.g., when compilation fails or panics) removes its in-flight marker and wakes its waiters,
+/// which then retry, and the first of them to miss again becomes the new producer.
 struct InFlightProducer<'o, C: CompilationCacheDomain> {
-    /// Compilation context that elected this producer.
+    /// Compilation context in which this producer registered its in-flight compilation.
     context: &'o CompilationContext<C>,
 
     /// Cache key owned by this producer, which is taken when the producer finishes.
@@ -442,12 +440,14 @@ impl<'o, C: CompilationCacheDomain> InFlightProducer<'o, C> {
 
 impl<C: CompilationCacheDomain> Drop for InFlightProducer<'_, C> {
     fn drop(&mut self) {
-        // A producer that never finished releases its waiters so that they can elect a new producer.
+        // A producer that never finished releases its waiters so that one of them can become the new producer.
         if let (Some(cache_key), Some(in_flight)) = (self.cache_key.take(), self.in_flight.take()) {
             self.context.finish_failure(&cache_key, in_flight);
         }
     }
 }
+
+// TODO(eaplatanios): Review from here onwards.
 
 /// Artifact exchange that participates in one compilation, together with the persistent key that addresses the
 /// exchanged artifact.
@@ -509,12 +509,12 @@ const DEFAULT_EVENT_CAPACITY: usize = 0;
 ///   memory -->|"hit"| validate["Validate Against the Request"]
 ///   validate -->|"accepted"| shared["Shared Compiled Program in &lt;code&gt;Arc&lt;/code&gt;"]
 ///   validate -.->|"rejected"| error["Return the Validation Error"]
-///   memory -->|"miss"| flight["2. Same-Key Single-Flight Election"]
+///   memory -->|"miss"| flight["2. In-Flight Compilation Check"]
 ///   flight -->|"another producer"| wait["Wait for the Producer"]
 ///   wait -->|"shared program"| validate
 ///   wait -->|"producer failed"| memory
 ///   publish["Publish Successful Artifact"]
-///   flight -->|"elected producer"| disk["3. Optional Persistent Disk Cache"]
+///   flight -->|"producer"| disk["3. Optional Persistent Disk Cache"]
 ///   disk -->|"hit, deserialize, and validate"| publish
 ///   disk -->|"miss, disabled, or rejected"| exchange["4. Optional Distributed Artifact Exchange"]
 ///   exchange -->|"hit, deserialize, and validate"| publish
@@ -748,9 +748,10 @@ impl<C: CompilationCacheDomain> CompilationContext<C> {
     /// On a hit, the entry is moved to the most recently used position. On a miss, the new entry is inserted, and the
     /// least recently used entry is evicted if the cache is at capacity.
     ///
-    /// Misses for the same key are single flight. Exactly one caller restores or compiles the program while the rest
-    /// wait for its result, and different keys may compile concurrently. When a producer fails, its error is returned
-    /// only to that caller, and waiters retry through a new producer election.
+    /// Misses for the same key are deduplicated. The first caller to miss becomes the producer and restores or compiles
+    /// the program, while the rest wait for its result, and different keys may compile concurrently. When a producer
+    /// fails, its error is returned only to that caller, and waiters retry, so the first of them to miss again becomes
+    /// the new producer.
     ///
     /// Persistent caching is consulted only when both a [`DiskCache`] is attached and
     /// [`CompilationCacheDomain::persistent_cache_key`] returns key bytes for the requesting compilation. Persistent
@@ -826,9 +827,9 @@ impl<C: CompilationCacheDomain> CompilationContext<C> {
             }
 
             // A prior producer can insert the program after the first lookup above and remove its in-flight marker
-            // before this caller elects itself. Checking again after the election closes that narrow handoff window,
-            // which would otherwise trigger a duplicate compilation. The waiters of this election validate the program
-            // against their own requests.
+            // before this caller registers as the new producer. Checking again after registering closes that narrow
+            // handoff window, which would otherwise trigger a duplicate compilation. The waiters of this producer
+            // validate the program against their own requests.
             if let Some(cached) = self.cached_program(&cache_key) {
                 self.in_flight.lock().expect("in-flight cache mutex should not be poisoned").remove(&cache_key);
                 in_flight.finish(InFlightState::Ready(Arc::clone(&cached)));
@@ -3665,13 +3666,13 @@ mod tests {
         }));
         assert!(panic.is_err());
 
-        // The panicking producer released its in-flight state, so the next lookup elects a new producer.
+        // The panicking producer released its in-flight state, so the next lookup becomes the new producer.
         let program = context.get_or_compile(&domain, 1, None, || Ok(TestCompiledProgram(13))).unwrap();
         assert_eq!(program.0, 13);
     }
 
     #[test]
-    fn test_compilation_context_get_or_compile_single_flight() {
+    fn test_compilation_context_get_or_compile_deduplicates_same_key_misses() {
         const THREAD_COUNT: usize = 8;
 
         let context = Arc::new(CompilationContext::<TestDomain>::new().with_event_capacity(16));
