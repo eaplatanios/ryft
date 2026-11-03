@@ -24,13 +24,7 @@
 //! let quantized = input.block_quantize(4, DataType::F4E2M1FN, DataType::F8E4M3FN)?;
 //! assert_eq!(quantized.scales.to_f64s(), vec![1.0, 0.25]);
 //! let dimensions = DotDimensionNumbers::new(vec![1], vec![1], Vec::new(), Vec::new());
-//! let product = quantized.elements.scaled_dot(
-//!     &quantized.elements,
-//!     Some(&quantized.scales),
-//!     Some(&quantized.scales),
-//!     Some(&dimensions),
-//!     Some(DataType::F32),
-//! )?;
+//! let product = quantized.scaled_dot(&quantized, Some(&dimensions), Some(DataType::F32))?;
 //! assert_eq!(product.to_f64s(), vec![51.0625]);
 //! # Ok(())
 //! # }
@@ -41,14 +35,14 @@ use std::fmt::Display;
 use ryft_macros::{Parameterized, capability};
 
 use crate::arrays::{
-    Array, ArrayBatch, ArrayBatchingPolicy, ArrayExtentBatchingPolicy, ArrayIrType, ArrayIrValue, ArrayMemberType,
-    ArrayType, DataType, Dimension, DimensionType, Shape,
+    ArrayBatch, ArrayBatchingPolicy, ArrayExtentBatchingPolicy, ArrayIrType, ArrayMemberType, ArrayType, DataType,
+    Dimension, DimensionType, Shape, Sharding,
 };
 use crate::axes::{Axes, Axis};
 use crate::batching::{
     BatchAxis, BatchableOperation, BatchingContext, BatchingDriver, BatchingError, InterpretableBatchableOperation,
 };
-use crate::contexts::{Context, Domain, EagerContext, StagingContext};
+use crate::contexts::{Context, Domain, StagingContext};
 use crate::differentiation::{
     DifferentiableOperation, DifferentiableType, DifferentiationContext, DifferentiationDriver, DifferentiationDual,
     DifferentiationError, DifferentiationPolicy,
@@ -58,7 +52,9 @@ use crate::macros::{check_count, impl_non_transposable_operation};
 use crate::operations::Capability;
 use crate::operations::arithmetic::{Abs, Add, Div, Mul, Rem, Sub};
 use crate::operations::assertions::Assert;
-use crate::operations::collectives::parallel_vary::ManualVariationAlignment;
+use crate::operations::collectives::parallel_vary::{
+    ManualVariationAlignment, ParallelVaryOperation, manual_variation_axes, vary_over_missing_manual_axes,
+};
 use crate::operations::comparisons::{Compare, ComparisonDirection};
 use crate::operations::composites::builders::{Composite, CompositeCallContext, composite};
 use crate::operations::composites::configurations::{CompositeVjp, DefaultJvp, SymbolicZeroVjp};
@@ -82,8 +78,8 @@ use crate::operations::rounding::{Floor, Round};
 use crate::parameters::{Parameter, Parameterized};
 use crate::partial::PartiallyEvaluatableOperation;
 use crate::programs::{
-    EmptyRegionDriver, MaybeZero, Operation, OperationFormatter, ProgramError, RegionInterface, TypeError, Typed,
-    Value, ValueDomainDispatch, ValueProjection,
+    MaybeZero, Operation, OperationFormatter, ProgramError, RegionInterface, TypeError, Typed, Value,
+    ValueDirectDispatch, ValueDomainDispatch, ValueProjection,
 };
 use crate::tracing::{DomainTracer, DomainTracingContext};
 
@@ -346,9 +342,9 @@ where
             })?;
         let scales = stored_scales.convert_element_type(scale_type)?;
 
-        // The elements are divided by the stored scales, which are exactly the values that `ScaledDot` dequantizes
-        // with. The scales derive from the input, so the expanded scales keep its memory space, placement, and manual
-        // variation and only add replicated block dimensions, because broadcasting cannot change manual variation.
+        // The elements are divided by the stored scales, which are exactly the values that `ScaledDotOperation`
+        // dequantizes with. The scales derive from the input, so the expanded scales keep its memory space, placement,
+        // and manual variation and only add replicated block dimensions, because broadcasting cannot change variation.
         let mut expanded_type = stored_scales.r#type().into_owned();
         for &axis in &reduction_axes {
             expanded_type = expanded_type.with_inserted_dimension(axis, Dimension::Static(block_size))?;
@@ -824,15 +820,16 @@ pub const SCALED_DOT_OPERATION_NAME: &str = "scaled_dot";
 /// the resulting arrays with a [`DotOperation`](crate::DotOperation) that uses [`Self::dimensions`] and accumulates
 /// at [`Self::accumulation_type`], which is also the output element type. It is the accumulation type of
 /// [`DotOperation::with_accumulation_type`](crate::DotOperation::with_accumulation_type) and corresponds to the
-/// `preferred_element_type` of the JAX `scaled_matmul` primitive and of the `xla.scaled_dot` composite. An absent
-/// scale leaves its element array unchanged apart from the `bf16` conversion. The [`MemberInterpretableOperation`]
-/// implementation evaluates this composition using the parent array IR domain's dimension values. Operation enums
-/// reach this operation through their projected array members and never dispatch to that rule, so its callers invoke it
-/// directly. Eager arrays use it, and the XLA backend traces it as the decomposition of the `xla.scaled_dot` composite
-/// that it lowers this operation to whenever it does not use cuDNN's block-scaled matrix product. Native block-scaled
-/// matrix products (e.g., that of cuDNN) may accumulate at a higher precision than [`Self::accumulation_type`] and may
-/// ignore the signs of scales, so they match this composition up to accumulation rounding and only for the
-/// non-negative finite scales that [`BlockQuantize`] produces.
+/// `preferred_element_type` of the JAX `scaled_matmul` primitive and of the `xla.scaled_dot` composite. An absent scale
+/// leaves its element array unchanged apart from the `bf16` conversion. Direct eager values evaluate this composition
+/// through [`BlockDequantize`] and [`Dot`], while domain-dispatched values bind the primitive through their own
+/// contexts. The [`MemberInterpretableOperation`] implementation additionally supports runtime extents using the parent
+/// array IR domain's dimension values. Operation enums reach this operation through their projected array members and
+/// never dispatch to that rule, so its callers invoke it directly. The XLA backend traces it as the decomposition of
+/// the `xla.scaled_dot` composite that it lowers this operation to whenever it does not use cuDNN's block-scaled matrix
+/// product. Native block-scaled matrix products (e.g., that of cuDNN) may accumulate at a higher precision than
+/// [`Self::accumulation_type`] and may ignore the signs of scales, so they match this composition up to accumulation
+/// rounding and only for the non-negative finite scales that [`BlockQuantize`] produces.
 ///
 /// Partial evaluation folds the operation when all inputs are known and stages it otherwise. Batching moves every
 /// mapped axis to the front and materializes replicated inputs along a new leading axis, because each scale array
@@ -1070,7 +1067,7 @@ impl Operation for ScaledDotOperation {
 
 impl<C: Domain<Type = ArrayType>> InterpretableOperation<C> for ScaledDotOperation
 where
-    C::Value: ScaledDot,
+    <C::Value as Value>::Dispatch: ScaledDotInterpretation<C>,
 {
     #[inline]
     fn interpret<D: InterpretationDriver<C>>(
@@ -1079,8 +1076,7 @@ where
         _driver: &D,
         inputs: &[C::Value],
     ) -> Result<Vec<C::Value>, ProgramError> {
-        let (lhs, rhs, lhs_scale, rhs_scale) = self.split_inputs(inputs)?;
-        Ok(vec![lhs.scaled_dot(rhs, lhs_scale, rhs_scale, Some(&self.dimensions), Some(self.accumulation_type))?])
+        <C::Value as Value>::Dispatch::interpret_scaled_dot(self, inputs)
     }
 }
 
@@ -1169,7 +1165,7 @@ where
         inputs: &[C::Value],
     ) -> Result<Vec<C::Value>, ProgramError> {
         // The array boundary stays homogeneous, but its composition needs the parent domain's dimension values for
-        // runtime extent reads and ratio assertions. This rule is shared by eager arrays and XLA decomposition traces.
+        // runtime extent reads and ratio assertions. XLA decomposition traces call this rule directly.
         let (lhs, rhs, lhs_scale, rhs_scale) = self.split_inputs(inputs)?;
         let input_types = inputs
             .iter()
@@ -1203,131 +1199,245 @@ where
     }
 }
 
-/// Value-level generalized block-scaled dot product capability. [`ScaledDot`] is the receiver-style entry point for
-/// staging or executing [`ScaledDotOperation`]s, which contract element arrays after scaling every block of their
-/// contracting dimensions by the corresponding scale value. [`BlockQuantize`] produces element and scale arrays
-/// in the layout that this capability consumes.
+/// Generalized dot product capability for [`BlockQuantizedValue`]. Both representations supply their element and block
+/// scale arrays to [`ScaledDotOperation`] through their context, retaining the primitive and its backend lowering.
+/// Their optional global scales multiply the contraction result afterwards. This frontend inherits the primitive's
+/// rejection of differentiation. Use [`BlockScaledDot`] to train from unquantized floating-point inputs with an
+/// explicit policy.
 ///
-/// The universe parameter `T` defaults to the [`Capability`] universe of the implementor, so that homogeneous array
-/// values implement this capability for [`ArrayType`] and array IR values implement it for [`ArrayIrType`].
-#[capability(projection(ArrayIrType => ArrayType))]
-pub trait ScaledDot<T = <Self as Capability>::Universe>: Capability + Sized {
-    /// Computes the generalized dot product `(self * lhs_scale) · (rhs * rhs_scale)`, where each scale is repeated
-    /// over its blocks before the multiplication and an absent scale is the multiplicative identity. Refer to
-    /// [`ScaledDotOperation`] for the exact semantics and input constraints. Returns a [`ProgramError`] if the inputs
-    /// are incompatible with each other or with `dimensions`, or if the operation cannot be recorded in the context
-    /// of the value.
+/// Blanket implementations compose primitive contraction, broadcasting, multiplication, and conversion. Homogeneous
+/// values, including projected array views, require a static output shape when global scales are present. Parent
+/// array IR values additionally support dynamic output extents through dimension reads and dynamic broadcasting.
+/// Values covered by a blanket implementation cannot supply another implementation of this capability.
+///
+/// The value parameter `V` identifies the array representation carried by [`BlockQuantizedValue`] and returned by
+/// the contraction. The implementations for [`BlockQuantizedValue`] infer it from the elements and scales.
+///
+/// The universe parameter `T` selects [`ArrayType`] for homogeneous array representations and [`ArrayIrType`] for
+/// array IR representations. Both parameters are explicit because `V` follows `T` and has no meaningful default for
+/// a structured receiver. The `capability` attribute is omitted because it requires a default universe parameter.
+pub trait ScaledDot<T, V: Parameter>: Capability + Sized {
+    /// Contracts both representations' elements with their block scales, then multiplies the result by their global
+    /// scales, treating an absent global scale as `1`. Elements and block scales follow [`ScaledDotOperation`]'s
+    /// requirements. Each present global scale must be a rank-`0` real floating-point array. Known rank, shape, and
+    /// data type violations are rejected before staging any operations.
+    ///
+    /// If both global scales are present, their product is computed first using ordinary arithmetic type promotion.
+    /// That product, or the single present global scale, is broadcast at its own precision and multiplied with the
+    /// contraction result using arithmetic type promotion. The final result is converted to `accumulation_type`.
+    /// This preserves global-scale precision until after contraction rather than narrowing either input beforehand.
     ///
     /// # Parameters
     ///
-    ///   - `rhs`: Right element array.
-    ///   - `lhs_scale`: Optional scale array of the left element array (i.e., of `self`).
-    ///   - `rhs_scale`: Optional scale array of the right element array.
-    ///   - `dimensions`: Optional dimension numbers of the generalized dot product. They default to
-    ///     [`ScaledDotOperation::default_dimensions`] for the rank of `self`.
-    ///   - `accumulation_type`: Optional data type of the contraction accumulator and the output, which defaults to
-    ///     `f32` so that the contraction of the `bf16` dequantized inputs does not lose precision. That is the default
-    ///     of `jax.nn.scaled_matmul`, whereas `jax.lax.scaled_dot` defaults to `bf16`.
+    ///   - `rhs`: Right block-quantized representation.
+    ///   - `dimensions`: Optional dimension numbers. They default to [`ScaledDotOperation::default_dimensions`]
+    ///     for the rank of the element arrays.
+    ///   - `accumulation_type`: Contraction accumulator and final output data type, defaulting to `f32`.
+    ///
+    /// # Errors
+    ///
+    /// Returns a [`ProgramError`] for invalid representations, dimensions, accumulation type, unsupported shapes,
+    /// or a failed component operation.
     fn scaled_dot(
         &self,
-        rhs: &Self,
-        lhs_scale: Option<&Self>,
-        rhs_scale: Option<&Self>,
+        rhs: &BlockQuantizedValue<V>,
         dimensions: Option<&DotDimensionNumbers>,
         accumulation_type: Option<DataType>,
-    ) -> Result<Self, ProgramError>;
+    ) -> Result<V, ProgramError>;
 
-    /// Computes the rank-three block-scaled batched matrix product `[B, M, K] × [B, N, K] → [B, M, N]` of `self` and
-    /// `rhs`, where both inputs contract their last dimension and pair their first dimension as a batching dimension.
-    /// Unlike [`Self::scaled_dot`], both scales are required. Returns a [`ProgramError`] if any input does not have
-    /// rank three or if [`Self::scaled_dot`] fails.
-    #[inline]
+    /// Computes the rank-three batched matrix product `[B, M, K] × [B, N, K] → [B, M, N]` with last-dimension
+    /// contraction and leading batch dimensions. Both element and block-scale arrays must have rank three. Global
+    /// scales remain rank-`0`. Precision and errors follow [`Self::scaled_dot`].
+    ///
+    /// # Parameters
+    ///
+    ///   - `rhs`: Right block-quantized representation.
+    ///   - `accumulation_type`: Contraction accumulator and final output data type, defaulting to `f32`.
     fn scaled_matmul(
         &self,
-        rhs: &Self,
-        lhs_scale: &Self,
-        rhs_scale: &Self,
+        rhs: &BlockQuantizedValue<V>,
         accumulation_type: Option<DataType>,
-    ) -> Result<Self, ProgramError>
-    where
-        Self: Typed<Type: ArrayMemberType>,
-    {
-        for value in [self, rhs, lhs_scale, rhs_scale] {
-            if value.r#type().as_array_type()?.rank() != 3 {
-                return Err(TypeError::invalid("`scaled_matmul` expects rank-3 inputs").into());
-            }
-        }
-        self.scaled_dot(
-            rhs,
-            Some(lhs_scale),
-            Some(rhs_scale),
-            Some(&DotDimensionNumbers::new(vec![2], vec![2], vec![0], vec![0])),
-            accumulation_type,
-        )
-    }
+    ) -> Result<V, ProgramError>;
 }
 
-impl ScaledDot for Array {
-    fn scaled_dot(
-        &self,
-        rhs: &Self,
-        lhs_scale: Option<&Self>,
-        rhs_scale: Option<&Self>,
-        dimensions: Option<&DotDimensionNumbers>,
-        accumulation_type: Option<DataType>,
-    ) -> Result<Self, ProgramError> {
-        // Lift concrete arrays into the array IR so that the eager interpretation rule can read their extents
-        // as dimension values and validate the inputs before dequantizing and contracting them.
-        let dimensions = match dimensions {
-            Some(dimensions) => dimensions.clone(),
-            None => ScaledDotOperation::default_dimensions(self.r#type().rank())?,
-        };
-        let accumulation_type = accumulation_type.unwrap_or(DataType::F32);
-        let operation =
-            ScaledDotOperation::new(dimensions, accumulation_type, lhs_scale.is_some(), rhs_scale.is_some());
-        let inputs = std::iter::once(self)
-            .chain(std::iter::once(rhs))
-            .chain(lhs_scale)
-            .chain(rhs_scale)
-            .cloned()
-            .map(ArrayIrValue::from)
-            .collect::<Vec<_>>();
-        let mut outputs =
-            operation.interpret_in_parent(&EagerContext::<ArrayIrValue<Array>>::new(), &EmptyRegionDriver, &inputs)?;
-        check_count!("output", outputs, 1, ProgramError);
-        Ok(ValueProjection::<ArrayType>::into_projected(outputs.remove(0))?)
-    }
-}
-
-impl<V: Value<Type = ArrayType, Dispatch = ValueDomainDispatch> + ManualVariationAlignment<ArrayType>>
-    ScaledDot<ArrayType> for V
+impl<V> ScaledDot<ArrayType, V> for BlockQuantizedValue<V>
 where
+    V: Value<Type = ArrayType> + Broadcast + ConvertElementType + Mul + ManualVariationAlignment<ArrayType>,
     V::Domain: Context<Operation: From<ScaledDotOperation>>,
 {
     fn scaled_dot(
         &self,
-        rhs: &Self,
-        lhs_scale: Option<&Self>,
-        rhs_scale: Option<&Self>,
+        rhs: &BlockQuantizedValue<V>,
         dimensions: Option<&DotDimensionNumbers>,
         accumulation_type: Option<DataType>,
-    ) -> Result<Self, ProgramError> {
-        // Values that carry a context stage a scaled dot through that context. The `ValueDomainDispatch` marker keeps
-        // this implementation disjoint from eager values, which implement the capability directly.
+    ) -> Result<V, ProgramError> {
+        let output_type = validate_scaled_dot_inputs(self, rhs, dimensions, accumulation_type)?;
+        if (self.global_scale.is_some() || rhs.global_scale.is_some()) && output_type.static_shape().is_none() {
+            return Err(TypeError::invalid(format!(
+                "`{SCALED_DOT_OPERATION_NAME}` homogeneous global scaling requires a static output shape; \
+                 use array IR values for dynamic extents",
+            ))
+            .into());
+        }
+        let global_scale = match (&self.global_scale, &rhs.global_scale) {
+            (Some(lhs), Some(rhs)) => Some(lhs.mul(rhs)?),
+            (Some(scale), None) | (None, Some(scale)) => Some(scale.clone()),
+            (None, None) => None,
+        };
         let dimensions = match dimensions {
             Some(dimensions) => dimensions.clone(),
-            None => ScaledDotOperation::default_dimensions(self.r#type().rank())?,
+            None => ScaledDotOperation::default_dimensions(self.elements.r#type().rank())?,
         };
-        let accumulation_type = accumulation_type.unwrap_or(DataType::F32);
-        let mut inputs = vec![self.clone(), rhs.clone()];
-        inputs.extend(lhs_scale.cloned());
-        inputs.extend(rhs_scale.cloned());
-        let inputs = ManualVariationAlignment::align_manual_variation(&inputs)?;
-        let operation =
-            ScaledDotOperation::new(dimensions, accumulation_type, lhs_scale.is_some(), rhs_scale.is_some());
-        let mut outputs = self.domain().bind(operation, Vec::new(), inputs.as_slice())?;
+        let operation = ScaledDotOperation::new(dimensions, output_type.data_type(), true, true);
+        let inputs = V::align_manual_variation(&[
+            self.elements.clone(),
+            rhs.elements.clone(),
+            self.scales.clone(),
+            rhs.scales.clone(),
+        ])?;
+        let mut outputs = self.elements.domain().bind(operation, Vec::new(), &inputs)?;
         check_count!("output", outputs, 1, ProgramError);
-        Ok(outputs.remove(0))
+        let output = outputs.remove(0);
+        let output = match global_scale {
+            Some(global_scale) => {
+                let mut expanded_type = global_scale.r#type().into_owned();
+                for (axis, &extent) in output_type.static_shape().unwrap().dimensions().iter().enumerate() {
+                    expanded_type = expanded_type.with_inserted_dimension(axis, Dimension::Static(extent))?;
+                }
+                output.mul(&global_scale.broadcast(expanded_type, &[])?)?
+            }
+            None => output,
+        };
+        output.convert_element_type(output_type.data_type())
+    }
+
+    #[inline]
+    fn scaled_matmul(
+        &self,
+        rhs: &BlockQuantizedValue<V>,
+        accumulation_type: Option<DataType>,
+    ) -> Result<V, ProgramError> {
+        validate_scaled_matmul_inputs(self, rhs)?;
+        self.scaled_dot(rhs, Some(&DotDimensionNumbers::new(vec![2], vec![2], vec![0], vec![0])), accumulation_type)
+    }
+}
+
+impl<V> ScaledDot<ArrayIrType, V> for BlockQuantizedValue<V>
+where
+    V: Value<Type = ArrayIrType> + DimensionSize + DynamicBroadcast + Mul + ValueProjection<ArrayType>,
+    V::Projected: Value<Type = ArrayType> + ConvertElementType,
+    BlockQuantizedValue<V::Projected>: ScaledDot<ArrayType, V::Projected>,
+{
+    fn scaled_dot(
+        &self,
+        rhs: &BlockQuantizedValue<V>,
+        dimensions: Option<&DotDimensionNumbers>,
+        accumulation_type: Option<DataType>,
+    ) -> Result<V, ProgramError> {
+        let output_type = validate_scaled_dot_inputs(self, rhs, dimensions, accumulation_type)?;
+        let global_scale = match (&self.global_scale, &rhs.global_scale) {
+            (Some(lhs), Some(rhs)) => Some(lhs.mul(rhs)?),
+            (Some(scale), None) | (None, Some(scale)) => Some(scale.clone()),
+            (None, None) => None,
+        };
+
+        // Global-free member representations preserve dynamic primitive binding in the projected context. Apply
+        // global scales only in the parent universe, where their runtime broadcast extents remain available.
+        let lhs = BlockQuantizedValue::new(
+            ValueProjection::<ArrayType>::into_projected(self.elements.clone())?,
+            ValueProjection::<ArrayType>::into_projected(self.scales.clone())?,
+        );
+        let rhs = BlockQuantizedValue::new(
+            ValueProjection::<ArrayType>::into_projected(rhs.elements.clone())?,
+            ValueProjection::<ArrayType>::into_projected(rhs.scales.clone())?,
+        );
+        let output = lhs.scaled_dot(&rhs, dimensions, Some(output_type.data_type()))?;
+        let output = <V as ValueProjection<ArrayType>>::from_projected(output);
+        let output = match global_scale {
+            Some(global_scale) => {
+                let dimensions =
+                    (0..output_type.rank()).map(|axis| output.dimension_size(axis)).collect::<Result<Vec<_>, _>>()?;
+                output.mul(&global_scale.dynamic_broadcast(&dimensions, &[])?)?
+            }
+            None => output,
+        };
+
+        Ok(ValueProjection::<ArrayType>::from_projected(
+            ValueProjection::<ArrayType>::into_projected(output)?.convert_element_type(output_type.data_type())?,
+        ))
+    }
+
+    #[inline]
+    fn scaled_matmul(
+        &self,
+        rhs: &BlockQuantizedValue<V>,
+        accumulation_type: Option<DataType>,
+    ) -> Result<V, ProgramError> {
+        validate_scaled_matmul_inputs(self, rhs)?;
+        self.scaled_dot(rhs, Some(&DotDimensionNumbers::new(vec![2], vec![2], vec![0], vec![0])), accumulation_type)
+    }
+}
+
+/// Selects primitive binding or eager decomposition using the sealed [`Value::Dispatch`] markers. Domain-dispatched
+/// values bind [`ScaledDotOperation`] through their own context, preserving its backend lowering and rejection of
+/// differentiation when interpretation is used during replay or batching. Direct eager values execute the
+/// [`BlockDequantize`] and [`Dot`] composition instead, because rebinding the primitive through their eager
+/// context would recursively invoke the same interpretation rule.
+///
+/// [`ScaledDot`] cannot provide this routing. Its structured inputs require both block scales and it binds the
+/// primitive, while primitive interpretation also accepts absent block scales and must bottom out in eager
+/// computations. Keeping this dispatch private supports both execution paths without introducing another public
+/// capability with separate element and scale inputs.
+trait ScaledDotInterpretation<C: Domain<Type = ArrayType>> {
+    /// Executes the primitive for direct values or binds it through a domain-dispatched value's own context.
+    fn interpret_scaled_dot(operation: &ScaledDotOperation, inputs: &[C::Value])
+    -> Result<Vec<C::Value>, ProgramError>;
+}
+
+impl<C: Domain<Type = ArrayType>> ScaledDotInterpretation<C> for ValueDomainDispatch
+where
+    C::Value: Value<Dispatch = ValueDomainDispatch> + ManualVariationAlignment<ArrayType>,
+    <C::Value as Value>::Domain: Context<Operation: From<ScaledDotOperation>>,
+{
+    #[inline]
+    fn interpret_scaled_dot(
+        operation: &ScaledDotOperation,
+        inputs: &[C::Value],
+    ) -> Result<Vec<C::Value>, ProgramError> {
+        operation.split_inputs(inputs)?;
+        let inputs = C::Value::align_manual_variation(inputs)?;
+        inputs[0].domain().bind(operation.clone(), Vec::new(), &inputs)
+    }
+}
+
+impl<C: Domain<Type = ArrayType>> ScaledDotInterpretation<C> for ValueDirectDispatch
+where
+    C::Value: Value<Dispatch = ValueDirectDispatch> + ConvertElementType + Dot,
+    BlockQuantizedValue<C::Value>: BlockDequantize<Output = C::Value>,
+{
+    fn interpret_scaled_dot(
+        operation: &ScaledDotOperation,
+        inputs: &[C::Value],
+    ) -> Result<Vec<C::Value>, ProgramError> {
+        let (lhs, rhs, lhs_scale, rhs_scale) = operation.split_inputs(inputs)?;
+        let input_types = inputs.iter().map(|input| input.r#type().into_owned()).collect::<Vec<_>>();
+        operation.infer_output_types(&input_types, &[])?;
+        let lhs = match lhs_scale {
+            Some(scales) => BlockQuantizedValue::new(lhs.clone(), scales.clone())
+                .block_dequantize(operation.dimensions.lhs_contracting_dimensions(), DataType::BF16)?,
+            None => lhs.convert_element_type(DataType::BF16)?,
+        };
+        let rhs = match rhs_scale {
+            Some(scales) => BlockQuantizedValue::new(rhs.clone(), scales.clone())
+                .block_dequantize(operation.dimensions.rhs_contracting_dimensions(), DataType::BF16)?,
+            None => rhs.convert_element_type(DataType::BF16)?,
+        };
+        let output = if operation.accumulation_type == DataType::BF16 {
+            lhs.dot(&rhs, &operation.dimensions)?
+        } else {
+            lhs.dot_with_accumulation_type(&rhs, &operation.dimensions, operation.accumulation_type)?
+        };
+        Ok(vec![output])
     }
 }
 
@@ -1874,9 +1984,8 @@ where
 
 /// Creates a differentiable block-scaled generalized dot product (refer to [`BlockScaledDot`]), the analogue of
 /// `jax.nn.scaled_dot_general`. Its primal quantizes both inputs along their contracting dimensions with the formats
-/// of `configuration`, contracts them with [`ScaledDot`], and multiplies the result by the product of their global
-/// scales. Its reverse mode rule saves the inputs at high precision and computes the input gradients with one of two
-/// policies.
+/// of `configuration` and contracts the resulting representations with [`ScaledDot`], including their global scales.
+/// Its reverse mode rule saves the inputs at high precision and computes the input gradients with one of two policies.
 ///
 ///   - **Unquantized backward contractions** (the JAX default for NVFP4 gradients) contract the output cotangent with
 ///     the other input at `f32` (or `f64`), so quantization acts as a straight-through estimator. When the gradient
@@ -1896,7 +2005,7 @@ where
 /// (refer to its documentation), because MX scales round down to the OCP power of two rather than up and NVFP4 scales
 /// never round to zero. JAX takes the clipping thresholds of both inputs from the left format, while this function
 /// uses the format of each input. Backward contractions accumulate at the compute type, whereas JAX accumulates them
-/// at the output type, and MX forward contractions with an output type at which [`ScaledDot`] cannot accumulate
+/// at the output type. MX forward contractions with an output type at which [`ScaledDotOperation`] cannot accumulate
 /// (e.g., `f16`) accumulate at the compute type and convert afterwards.
 ///
 /// # Example
@@ -1936,7 +2045,7 @@ pub fn block_scaled_dot<D>(configuration: BlockScaledDotConfiguration) -> Result
 where
     D: Domain<Type = ArrayType>,
     D::Constant: 'static,
-    D::Operation: 'static,
+    D::Operation: 'static + From<ScaledDotOperation>,
     DomainTracer<D>: Abs
         + Add
         + Broadcast
@@ -1948,11 +2057,11 @@ where
         + Dot
         + Floor
         + Mul
+        + ManualVariationAlignment<ArrayType>
         + Random
         + Reduce
         + Rem
         + Reshape
-        + ScaledDot
         + Select
         + Sub
         + Transpose,
@@ -2266,11 +2375,11 @@ impl<'o> BlockScaledDotRules<'o> {
             + ConvertElementType
             + Div
             + Mul
+            + ManualVariationAlignment<ArrayType>
             + Reduce
             + Reshape
-            + ScaledDot
             + Transpose,
-        V::Domain: Fill<f64, V>,
+        V::Domain: Context<Operation: From<ScaledDotOperation>> + Fill<f64, V>,
     {
         let configuration = self.configuration;
         let lhs = self.normalize(lhs, &self.lhs_permutation, self.lhs_canonical_shape)?;
@@ -2310,15 +2419,15 @@ impl<'o> BlockScaledDotRules<'o> {
             + Dot
             + Floor
             + Mul
+            + ManualVariationAlignment<ArrayType>
             + Random
             + Reduce
             + Rem
             + Reshape
-            + ScaledDot
             + Select
             + Sub
             + Transpose,
-        V::Domain: Fill<f64, V> + Iota<V>,
+        V::Domain: Context<Operation: From<ScaledDotOperation>> + Fill<f64, V> + Iota<V>,
     {
         self.validate_extents(true)?;
         let lhs_type = lhs.r#type().cotangent()?.data_type();
@@ -2435,9 +2544,9 @@ impl<'o> BlockScaledDotRules<'o> {
         }
     }
 
-    /// Quantizes the rank-three `value` along `axis` and returns its elements, the scales that [`ScaledDot`] consumes
-    /// for a contraction along `axis`, and the effective global scale, if any. Tiled scales span both the free and the
-    /// contracting dimension (i.e., axes 1 and 2) and are expanded along the dimension other than `axis`.
+    /// Quantizes the rank-three `value` along `axis` into the representation that [`ScaledDot`] consumes for a
+    /// contraction along `axis`. Tiled scales span both the free and the contracting dimension (i.e., axes 1 and 2)
+    /// and are expanded along the dimension other than `axis`.
     fn quantize<V>(
         &self,
         value: &V,
@@ -2489,11 +2598,11 @@ impl<'o> BlockScaledDotRules<'o> {
         Ok(BlockQuantizedValue { elements, scales, global_scale })
     }
 
-    /// Contracts two quantized inputs with [`ScaledDot`] and multiplies the result by their global scales. When the
-    /// left format uses a global scale (i.e., the `nvfp4` mode of JAX), the product accumulates at the compute type
-    /// and converts to `data_type` afterwards, as in JAX, which accumulates at `f32`. Other products accumulate at
-    /// `data_type` directly, unless [`ScaledDot`] cannot accumulate its `bf16` dequantized inputs at it (e.g., `f16`),
-    /// in which case they accumulate at the compute type as well.
+    /// Contracts two quantized inputs with [`ScaledDot`], including their global scales. When the left format uses a
+    /// global scale (i.e., the `nvfp4` mode of JAX), the product accumulates at the compute type and converts to
+    /// `data_type` afterwards, as in JAX, which accumulates at `f32`. Other products accumulate at `data_type`
+    /// directly, unless [`ScaledDotOperation`] cannot accumulate its `bf16` dequantized inputs at it (e.g., `f16`).
+    /// Those products accumulate at the compute type as well.
     fn contract<V>(
         &self,
         lhs: &BlockQuantizedValue<V>,
@@ -2502,13 +2611,9 @@ impl<'o> BlockScaledDotRules<'o> {
         data_type: DataType,
     ) -> Result<V, ProgramError>
     where
-        V: Value<Type = ArrayType> + Broadcast + ConvertElementType + Mul + ScaledDot,
+        V: Value<Type = ArrayType> + Broadcast + ConvertElementType + Mul + ManualVariationAlignment<ArrayType>,
+        V::Domain: Context<Operation: From<ScaledDotOperation>>,
     {
-        let global_scale = match (&lhs.global_scale, &rhs.global_scale) {
-            (Some(lhs), Some(rhs)) => Some(lhs.mul(rhs)?),
-            (Some(scale), None) | (None, Some(scale)) => Some(scale.clone()),
-            (None, None) => None,
-        };
         let accumulation_type = if self.configuration.lhs_format.has_global_scale()
             || !matches!(data_type, DataType::BF16 | DataType::F32 | DataType::F64)
         {
@@ -2516,21 +2621,7 @@ impl<'o> BlockScaledDotRules<'o> {
         } else {
             data_type
         };
-        let output = lhs.elements.scaled_dot(
-            &rhs.elements,
-            Some(&lhs.scales),
-            Some(&rhs.scales),
-            Some(dimensions),
-            Some(accumulation_type),
-        )?;
-        let output = match global_scale {
-            Some(global_scale) => {
-                let shape = output.r#type().static_shape().unwrap().dimensions().to_vec();
-                output.mul(&self.broadcast_scalar(&global_scale, [shape[0], shape[1], shape[2]])?)?
-            }
-            None => output,
-        };
-        output.convert_element_type(data_type)
+        lhs.scaled_dot(rhs, Some(dimensions), Some(accumulation_type))?.convert_element_type(data_type)
     }
 
     /// Applies the random Hadamard transform of NVIDIA Transformer Engine along the dimension of extent `extent` (axis
@@ -2709,6 +2800,80 @@ fn validate_block_quantize_inputs(
         .into());
     }
     Ok((element_format, block_axes))
+}
+
+/// Validates both representations and infers the contraction output before any operations are staged.
+fn validate_scaled_dot_inputs<P: Parameter>(
+    lhs: &BlockQuantizedValue<P>,
+    rhs: &BlockQuantizedValue<P>,
+    dimensions: Option<&DotDimensionNumbers>,
+    accumulation_type: Option<DataType>,
+) -> Result<ArrayType, ProgramError>
+where
+    P: Typed<Type: ArrayMemberType>,
+{
+    for (name, global_scale) in [("left", &lhs.global_scale), ("right", &rhs.global_scale)] {
+        if let Some(global_scale) = global_scale {
+            let r#type = global_scale.r#type();
+            let r#type = r#type.as_array_type()?;
+            if r#type.rank() != 0 || !r#type.data_type().is_floating_point() || !r#type.data_type().is_real() {
+                return Err(TypeError::invalid(format!(
+                    "`{SCALED_DOT_OPERATION_NAME}` {name} global scale must be a rank-0 real floating-point array \
+                     but got `{type}`",
+                ))
+                .into());
+            }
+        }
+    }
+    let input_types = [&lhs.elements, &rhs.elements, &lhs.scales, &rhs.scales]
+        .into_iter()
+        .map(|value| Ok(value.r#type().as_array_type()?.clone()))
+        .collect::<Result<Vec<_>, TypeError>>()?;
+    // Model the raw capability's variation alignment on descriptors only. The actual value transitions are
+    // still staged by that capability, preserving their transpose and cross-device cotangent sums.
+    let input_types = vary_over_missing_manual_axes(
+        input_types.clone(),
+        &input_types,
+        &manual_variation_axes(&input_types),
+        |input, axis, mesh| {
+            let input = match input.sharding() {
+                Some(sharding) if sharding.mesh() != mesh => {
+                    return Err(TypeError::invalid(format!(
+                        "`{SCALED_DOT_OPERATION_NAME}` input mesh does not match the mesh of manual axis `{axis}`",
+                    ))
+                    .into());
+                }
+                Some(_) => input,
+                None => {
+                    let rank = input.rank();
+                    input.with_sharding(Sharding::replicated(mesh.clone(), rank)).map_err(TypeError::from)?
+                }
+            };
+            Ok(ParallelVaryOperation::new(axis.to_string()).infer_output_types(&[input], &[])?.remove(0))
+        },
+    )?;
+    let dimensions = match dimensions {
+        Some(dimensions) => dimensions.clone(),
+        None => ScaledDotOperation::default_dimensions(input_types[0].rank())?,
+    };
+    let operation = ScaledDotOperation::new(dimensions, accumulation_type.unwrap_or(DataType::F32), true, true);
+    Ok(operation.infer_output_types(&input_types, &[])?.remove(0))
+}
+
+/// Validates the rank-three element and block-scale arrays required by the matrix-product frontend.
+fn validate_scaled_matmul_inputs<P: Parameter>(
+    lhs: &BlockQuantizedValue<P>,
+    rhs: &BlockQuantizedValue<P>,
+) -> Result<(), ProgramError>
+where
+    P: Typed<Type: ArrayMemberType>,
+{
+    for value in [&lhs.elements, &rhs.elements, &lhs.scales, &rhs.scales] {
+        if value.r#type().as_array_type()?.rank() != 3 {
+            return Err(TypeError::invalid("`scaled_matmul` expects rank-3 inputs").into());
+        }
+    }
+    Ok(())
 }
 
 /// Computes the stored block scales at the input precision, sharing the numerical recipe across shape universes.
@@ -2944,12 +3109,12 @@ mod tests {
     use pretty_assertions::assert_eq;
 
     use crate::arrays::{
-        ArrayIrOperation, ArrayOperation, DimensionBounds, DimensionValue, DimensionVariable, LogicalMesh, MeshAxis,
-        MeshAxisType, Sharding, ShardingDimension,
+        Array, ArrayIrOperation, ArrayIrValue, ArrayOperation, DimensionBounds, DimensionValue, DimensionVariable,
+        LogicalMesh, MeshAxis, MeshAxisType, Sharding, ShardingDimension,
     };
     use crate::axes::{AxisError, NamedAxis};
     use crate::batching::batch;
-    use crate::contexts::ProjectedContext;
+    use crate::contexts::{EagerContext, ProjectedContext};
     use crate::differentiation::differentiate_at;
     use crate::macros::{
         check_gradient, check_operation_batching, check_operation_partial_evaluation, check_operation_type_inference,
@@ -2958,7 +3123,7 @@ mod tests {
     use crate::operations::sharding::shard_map::{ShardMapTracer, shard_map};
     use crate::parameters::Placeholder;
     use crate::partial::PartialValue;
-    use crate::programs::TypedProgram;
+    use crate::programs::{EmptyRegionDriver, TypedProgram};
     use crate::tracing::{Tracer, TracingContext};
 
     use super::*;
@@ -2966,6 +3131,36 @@ mod tests {
     /// Returns a `[rows, columns]` matrix whose values cycle through `values` in row-major order.
     fn cyclic_matrix(rows: usize, columns: usize, values: &[f32]) -> Array {
         Array::matrix(rows, columns, (0..rows * columns).map(|index| values[index % values.len()]).collect()).unwrap()
+    }
+
+    /// Binds the primitive directly so its optional block-scale inputs can be tested independently of the structured
+    /// frontend, which always supplies both block scales.
+    fn bind_scaled_dot<V: Value<Type = ArrayType>>(
+        lhs: &V,
+        rhs: &V,
+        lhs_scale: Option<&V>,
+        rhs_scale: Option<&V>,
+        dimensions: Option<&DotDimensionNumbers>,
+        accumulation_type: Option<DataType>,
+    ) -> Result<V, ProgramError>
+    where
+        V::Domain: Context<Operation: From<ScaledDotOperation>>,
+    {
+        let dimensions = match dimensions {
+            Some(dimensions) => dimensions.clone(),
+            None => ScaledDotOperation::default_dimensions(lhs.r#type().rank())?,
+        };
+        let operation = ScaledDotOperation::new(
+            dimensions,
+            accumulation_type.unwrap_or(DataType::F32),
+            lhs_scale.is_some(),
+            rhs_scale.is_some(),
+        );
+        let mut inputs = vec![lhs.clone(), rhs.clone()];
+        inputs.extend(lhs_scale.cloned());
+        inputs.extend(rhs_scale.cloned());
+        let mut outputs = lhs.domain().bind(operation, Vec::new(), &inputs)?;
+        Ok(outputs.remove(0))
     }
 
     type EagerArrayContext = EagerContext<Array, ArrayOperation<Array>>;
@@ -3066,7 +3261,7 @@ mod tests {
         // The quantized inputs contract through `scaled_dot` to the exact full precision dot product.
         let dimensions = DotDimensionNumbers::new(vec![1], vec![1], Vec::new(), Vec::new());
         assert_eq!(
-            elements.scaled_dot(&elements, Some(&scales), Some(&scales), Some(&dimensions), Some(DataType::F32)),
+            bind_scaled_dot(&elements, &elements, Some(&scales), Some(&scales), Some(&dimensions), Some(DataType::F32)),
             input.dot(&input, &dimensions),
         );
     }
@@ -3099,7 +3294,7 @@ mod tests {
         // The quantized inputs contract through `scaled_dot` to the exact full precision dot product.
         let dimensions = DotDimensionNumbers::new(vec![1], vec![1], Vec::new(), Vec::new());
         assert_eq!(
-            elements.scaled_dot(&elements, Some(&scales), Some(&scales), Some(&dimensions), Some(DataType::F32)),
+            bind_scaled_dot(&elements, &elements, Some(&scales), Some(&scales), Some(&dimensions), Some(DataType::F32)),
             input.dot(&input, &dimensions),
         );
 
@@ -3152,10 +3347,10 @@ mod tests {
         assert_eq!(elements.r#type().into_owned(), ArrayType::new_static(DataType::F8E4M3FN, [1, 8]));
         assert_eq!(scales.r#type().into_owned(), ArrayType::new_static(DataType::F8E8M0FNU, [1, 2]));
         let dimensions = DotDimensionNumbers::new(vec![1], vec![1], Vec::new(), Vec::new());
-        let product = elements
-            .scaled_dot(&elements, Some(&scales), Some(&scales), Some(&dimensions), Some(DataType::F32))
-            .unwrap()
-            .to_f64s()[0];
+        let product =
+            bind_scaled_dot(&elements, &elements, Some(&scales), Some(&scales), Some(&dimensions), Some(DataType::F32))
+                .unwrap()
+                .to_f64s()[0];
         let expected = input.dot(&input, &dimensions).unwrap().to_f64s()[0];
         assert_abs_diff_eq!(product, expected, epsilon = 0.05 * expected);
     }
@@ -3214,7 +3409,7 @@ mod tests {
             Err(ProgramError::from(TypeError::invalid("`block_quantize` does not support rank-0 inputs"))),
         );
 
-        // `ScaledDot` requires blocks of at least two values and non-empty scales.
+        // `ScaledDotOperation` requires blocks of at least two values and non-empty scales.
         assert_eq!(
             input.block_quantize(1, DataType::F4E2M1FN, DataType::F8E4M3FN),
             Err(ProgramError::from(TypeError::invalid("`block_quantize` block size must be at least 2 but got 1"))),
@@ -5339,7 +5534,7 @@ mod tests {
         // Staging records the default dimension numbers, the default `f32` accumulation type, and the scales.
         let (_, program) = TracingContext::<Array, ArrayOperation<Array>>::trace(
             |(lhs, rhs, lhs_scale, rhs_scale): (Tracer<_>, Tracer<_>, Tracer<_>, Tracer<_>)| {
-                lhs.scaled_dot(&rhs, Some(&lhs_scale), Some(&rhs_scale), None, None)
+                bind_scaled_dot(&lhs, &rhs, Some(&lhs_scale), Some(&rhs_scale), None, None)
             },
             (
                 ArrayType::new_static(DataType::F8E4M3FN, [2, 4]),
@@ -5577,33 +5772,33 @@ mod tests {
         let lhs_scale = Array::matrix(2, 2, vec![1.0f32, 2.0, 0.5, 1.0]).unwrap();
         let rhs_scale = Array::matrix(2, 3, vec![1.0f32, 1.0, 1.0, 2.0, 2.0, 2.0]).unwrap();
         assert_eq!(
-            lhs.scaled_dot(&rhs, Some(&lhs_scale), Some(&rhs_scale), None, Some(DataType::F32)),
+            bind_scaled_dot(&lhs, &rhs, Some(&lhs_scale), Some(&rhs_scale), None, Some(DataType::F32)),
             Ok(Array::matrix(2, 3, vec![253.0f32, 284.0, 315.0, 272.5, 308.0, 343.5]).unwrap()),
         );
 
         // Each scale is independently optional, and an absent scale is the multiplicative identity.
         assert_eq!(
-            lhs.scaled_dot(&rhs, Some(&lhs_scale), None, None, Some(DataType::F32)),
+            bind_scaled_dot(&lhs, &rhs, Some(&lhs_scale), None, None, Some(DataType::F32)),
             Ok(Array::matrix(2, 3, vec![131.0f32, 148.0, 165.0, 143.5, 164.0, 184.5]).unwrap()),
         );
         assert_eq!(
-            lhs.scaled_dot(&rhs, None, None, None, Some(DataType::F32)),
+            bind_scaled_dot(&lhs, &rhs, None, None, None, Some(DataType::F32)),
             Ok(Array::matrix(2, 3, vec![70.0f32, 80.0, 90.0, 158.0, 184.0, 210.0]).unwrap()),
         );
 
         // Without an accumulation type, the contraction accumulates at and returns `f32`, while an explicit `bf16`
         // accumulation type keeps the contraction at the dequantized input type.
         assert_eq!(
-            lhs.scaled_dot(&rhs, Some(&lhs_scale), Some(&rhs_scale), None, None),
+            bind_scaled_dot(&lhs, &rhs, Some(&lhs_scale), Some(&rhs_scale), None, None),
             Ok(Array::matrix(2, 3, vec![253.0f32, 284.0, 315.0, 272.5, 308.0, 343.5]).unwrap()),
         );
-        let product = lhs.scaled_dot(&rhs, None, None, None, Some(DataType::BF16)).unwrap();
+        let product = bind_scaled_dot(&lhs, &rhs, None, None, None, Some(DataType::BF16)).unwrap();
         assert_eq!(product.r#type().into_owned(), ArrayType::new_static(DataType::BF16, [2, 3]));
         assert_eq!(product.to_f64s(), vec![70.0, 80.0, 90.0, 158.0, 184.0, 210.0]);
 
         // The type inference rule rejects invalid inputs before anything is evaluated.
         assert_eq!(
-            lhs.scaled_dot(&rhs, Some(&rhs_scale), None, None, None),
+            bind_scaled_dot(&lhs, &rhs, Some(&rhs_scale), None, None, None),
             Err(ProgramError::from(TypeError::invalid(format!(
                 "`{SCALED_DOT_OPERATION_NAME}` left contracting dimension 1 has size 4, which is not divisible by its \
                  scale size 3",
@@ -5623,7 +5818,7 @@ mod tests {
             Array::from_elements::<f32>(ArrayType::new_static(DataType::F32, [1, 2, 2, 3]), &[1.0; 12]).unwrap();
         let dimensions = DotDimensionNumbers::new(vec![2, 3], vec![1, 2], vec![0], vec![0]);
         assert_eq!(
-            lhs.scaled_dot(&rhs, Some(&lhs_scale), Some(&rhs_scale), Some(&dimensions), Some(DataType::F32)),
+            bind_scaled_dot(&lhs, &rhs, Some(&lhs_scale), Some(&rhs_scale), Some(&dimensions), Some(DataType::F32)),
             Ok(Array::from_elements::<f32>(
                 ArrayType::new_static(DataType::F32, [1, 2, 3]),
                 &[60.0, 60.0, 60.0, 156.0, 156.0, 156.0],
@@ -5638,16 +5833,20 @@ mod tests {
         let lhs = Array::matrix(2, 4, vec![1.0f32, 2.0, 3.0, 4.0, 5.0, 6.0, 7.0, 8.0]).unwrap();
         let rhs = Array::matrix(4, 2, vec![1.0f32; 8]).unwrap();
         let lhs_scale = Array::matrix(2, 2, vec![1.0f32, 2.0, 0.5, 1.0]).unwrap();
-        let expected = lhs.scaled_dot(&rhs, Some(&lhs_scale), None, None, Some(DataType::F32)).unwrap();
+        let expected = bind_scaled_dot(&lhs, &rhs, Some(&lhs_scale), None, None, Some(DataType::F32)).unwrap();
+        let operation = ArrayIrOperation::Array(ArrayOperation::ScaledDot(ScaledDotOperation::new(
+            DotDimensionNumbers::matmul(),
+            DataType::F32,
+            true,
+            false,
+        )));
         assert_eq!(
-            ArrayIrValue::Array(lhs).scaled_dot(
-                &ArrayIrValue::Array(rhs),
-                Some(&ArrayIrValue::Array(lhs_scale)),
-                None,
-                None,
-                Some(DataType::F32),
+            EagerContext::<ArrayIrValue<Array>, ArrayIrOperation<Array>>::new().bind(
+                operation,
+                Vec::new(),
+                &[ArrayIrValue::Array(lhs), ArrayIrValue::Array(rhs), ArrayIrValue::Array(lhs_scale)],
             ),
-            Ok(ArrayIrValue::Array(expected)),
+            Ok(vec![ArrayIrValue::Array(expected)]),
         );
     }
 
@@ -5941,7 +6140,8 @@ mod tests {
             Array::from_elements::<f32>(ArrayType::new_static(DataType::F32, [1, 2, 2]), &[1.0, 1.0, 2.0, 2.0])
                 .unwrap();
         assert_eq!(
-            lhs.scaled_matmul(&rhs, &lhs_scale, &rhs_scale, None),
+            BlockQuantizedValue::new(lhs.clone(), lhs_scale.clone())
+                .scaled_matmul(&BlockQuantizedValue::new(rhs.clone(), rhs_scale.clone()), None),
             Ok(Array::from_elements::<f32>(ArrayType::new_static(DataType::F32, [1, 1, 2]), &[17.0, 34.0]).unwrap()),
         );
 
@@ -5949,16 +6149,494 @@ mod tests {
         let rhs_scale =
             Array::from_elements::<f32>(ArrayType::new_static(DataType::F32, [1, 2, 1]), &[3.0, 1.0]).unwrap();
         assert_eq!(
-            lhs.scaled_matmul(&rhs, &lhs_scale, &rhs_scale, Some(DataType::F64)),
+            BlockQuantizedValue::new(lhs.clone(), lhs_scale.clone())
+                .scaled_matmul(&BlockQuantizedValue::new(rhs.clone(), rhs_scale.clone()), Some(DataType::F64)),
             Ok(Array::from_elements::<f64>(ArrayType::new_static(DataType::F64, [1, 1, 2]), &[51.0, 17.0]).unwrap()),
         );
 
         // Inputs of any other rank are rejected.
         let matrix = Array::matrix(2, 2, vec![1.0f32; 4]).unwrap();
         assert_eq!(
-            matrix.scaled_matmul(&matrix, &matrix, &matrix, None),
+            BlockQuantizedValue::new(matrix.clone(), matrix.clone())
+                .scaled_matmul(&BlockQuantizedValue::new(matrix.clone(), matrix.clone()), None),
             Err(ProgramError::from(TypeError::invalid("`scaled_matmul` expects rank-3 inputs"))),
         );
+    }
+
+    #[test]
+    fn test_block_quantized_value_scaled_dot() {
+        let lhs = BlockQuantizedValue::new(
+            Array::matrix(1, 4, vec![1.0f32, 2.0, 3.0, 4.0]).unwrap(),
+            Array::matrix(1, 2, vec![1.0f32, 2.0]).unwrap(),
+        );
+        let rhs = BlockQuantizedValue::new(
+            Array::matrix(4, 1, vec![1.0f32; 4]).unwrap(),
+            Array::matrix(2, 1, vec![3.0f32, 4.0]).unwrap(),
+        );
+        for (lhs_global_scale, rhs_global_scale, expected) in [
+            (None, None, 65.0f32),
+            (Some(2.0f64), None, 130.0),
+            (None, Some(3.0f64), 195.0),
+            (Some(2.0f64), Some(3.0f64), 390.0),
+        ] {
+            let lhs = BlockQuantizedValue {
+                global_scale: lhs_global_scale.map(|scale| Array::scalar(scale).unwrap()),
+                ..lhs.clone()
+            };
+            let rhs = BlockQuantizedValue {
+                global_scale: rhs_global_scale.map(|scale| Array::scalar(scale).unwrap()),
+                ..rhs.clone()
+            };
+            let expected = Array::matrix(1, 1, vec![expected]).unwrap();
+            assert_eq!(lhs.scaled_dot(&rhs, None, None), Ok(expected.clone()));
+            let lhs = lhs.map_parameters(ArrayIrValue::Array).unwrap();
+            let rhs = rhs.map_parameters(ArrayIrValue::Array).unwrap();
+            assert_eq!(lhs.scaled_dot(&rhs, None, None), Ok(ArrayIrValue::Array(expected)));
+        }
+    }
+
+    #[test]
+    fn test_block_quantized_value_scaled_dot_global_scale_precision() {
+        // The primitive contraction is exactly `3`. A global scale at the midpoint above `1` in `bf16` must keep
+        // its `f32` precision until the contraction result has been multiplied, instead of narrowing to `1` first.
+        let lhs = BlockQuantizedValue::new(
+            Array::matrix(1, 2, vec![3.0f32, 0.0]).unwrap(),
+            Array::matrix(1, 1, vec![1.0f32]).unwrap(),
+        );
+        let rhs = BlockQuantizedValue::new(
+            Array::matrix(2, 1, vec![1.0f32, 0.0]).unwrap(),
+            Array::matrix(1, 1, vec![1.0f32]).unwrap(),
+        );
+        for (lhs_global_scale, rhs_global_scale, expected) in [
+            (Some(1.00390625f32), None, 3.015625f32),
+            (None, Some(1.00390625f32), 3.015625),
+            (Some(1.00390625f32), Some(1.00390625f32), 3.03125),
+        ] {
+            let lhs = BlockQuantizedValue {
+                global_scale: lhs_global_scale.map(|scale| Array::scalar(scale).unwrap()),
+                ..lhs.clone()
+            };
+            let rhs = BlockQuantizedValue {
+                global_scale: rhs_global_scale.map(|scale| Array::scalar(scale).unwrap()),
+                ..rhs.clone()
+            };
+            let expected = Array::matrix(1, 1, vec![expected]).unwrap().convert_element_type(DataType::BF16).unwrap();
+            assert_eq!(
+                lhs.scaled_dot(&rhs, Some(&DotDimensionNumbers::matmul()), Some(DataType::BF16)),
+                Ok(expected.clone()),
+            );
+            let lhs = lhs.map_parameters(ArrayIrValue::Array).unwrap();
+            let rhs = rhs.map_parameters(ArrayIrValue::Array).unwrap();
+            assert_eq!(
+                lhs.scaled_dot(&rhs, Some(&DotDimensionNumbers::matmul()), Some(DataType::BF16)),
+                Ok(ArrayIrValue::Array(expected)),
+            );
+        }
+    }
+
+    #[test]
+    fn test_block_quantized_value_scaled_dot_validation() {
+        let lhs = BlockQuantizedValue::new(
+            Array::matrix(1, 4, vec![1.0f32; 4]).unwrap(),
+            Array::matrix(1, 2, vec![1.0f32; 2]).unwrap(),
+        );
+        let rhs = BlockQuantizedValue::new(
+            Array::matrix(4, 1, vec![1.0f32; 4]).unwrap(),
+            Array::matrix(2, 1, vec![1.0f32; 2]).unwrap(),
+        );
+        for (lhs_global_scale, rhs_global_scale, message) in [
+            (
+                Some(Array::vector(vec![1.0f32]).unwrap()),
+                None,
+                "`scaled_dot` left global scale must be a rank-0 real floating-point array but got `f32[1]`",
+            ),
+            (
+                None,
+                Some(Array::scalar(1i32).unwrap()),
+                "`scaled_dot` right global scale must be a rank-0 real floating-point array but got `i32[]`",
+            ),
+        ] {
+            let lhs = BlockQuantizedValue { global_scale: lhs_global_scale, ..lhs.clone() };
+            let rhs = BlockQuantizedValue { global_scale: rhs_global_scale, ..rhs.clone() };
+            let expected = ProgramError::from(TypeError::invalid(message));
+            assert_eq!(lhs.scaled_dot(&rhs, None, None), Err(expected.clone()));
+            let lhs = lhs.map_parameters(ArrayIrValue::Array).unwrap();
+            let rhs = rhs.map_parameters(ArrayIrValue::Array).unwrap();
+            assert_eq!(lhs.scaled_dot(&rhs, None, None), Err(expected));
+        }
+
+        // Even with two global scales, invalid block shapes are rejected before their scalar product is staged.
+        let (output_type, program) = TracingContext::<Array, ArrayOperation<Array>>::trace(
+            |(lhs, rhs): (BlockQuantizedValue<Tracer<_>>, BlockQuantizedValue<Tracer<_>>)| {
+                assert_eq!(
+                    lhs.scaled_dot(&rhs, None, None),
+                    Err(TypeError::invalid(
+                        "`scaled_dot` right contracting dimension 0 has size 4, which is not divisible by its \
+                         scale size 3",
+                    )
+                    .into()),
+                );
+                Ok(lhs.elements)
+            },
+            (
+                BlockQuantizedValue::new(
+                    ArrayType::new_static(DataType::F32, [1, 4]),
+                    ArrayType::new_static(DataType::F32, [1, 2]),
+                )
+                .with_global_scale(ArrayType::scalar(DataType::F32)),
+                BlockQuantizedValue::new(
+                    ArrayType::new_static(DataType::F32, [4, 1]),
+                    ArrayType::new_static(DataType::F32, [3, 1]),
+                )
+                .with_global_scale(ArrayType::scalar(DataType::F32)),
+            ),
+        )
+        .unwrap();
+        assert_eq!(output_type, ArrayType::new_static(DataType::F32, [1, 4]));
+        assert_eq!(
+            program.to_string(),
+            indoc! {"
+                lambda %0:f32[1, 4], %1:f32[1, 2], %2:f32[], %3:f32[4, 1], %4:f32[3, 1], %5:f32[] .
+                in (%0)
+            "}
+            .trim_end(),
+        );
+    }
+
+    #[test]
+    fn test_block_quantized_value_scaled_dot_batching() {
+        let lhs = BlockQuantizedValue::new(
+            Array::from_elements::<f32>(
+                ArrayType::new_static(DataType::F32, [2, 1, 4]),
+                &[1.0, 2.0, 3.0, 4.0, 2.0, 4.0, 6.0, 8.0],
+            )
+            .unwrap(),
+            Array::matrix(1, 2, vec![2.0f32, 3.0]).unwrap(),
+        )
+        .with_global_scale(Array::vector(vec![2.0f32, 4.0]).unwrap());
+        let rhs = BlockQuantizedValue::new(
+            Array::matrix(4, 1, vec![1.0f32; 4]).unwrap(),
+            Array::matrix(2, 1, vec![4.0f32, 5.0]).unwrap(),
+        )
+        .with_global_scale(Array::scalar(3.0f32).unwrap());
+        let axes = (
+            BlockQuantizedValue::new(BatchAxis::new(0), BatchAxis::replicated()).with_global_scale(BatchAxis::new(0)),
+            BlockQuantizedValue::new(BatchAxis::replicated(), BatchAxis::replicated())
+                .with_global_scale(BatchAxis::replicated()),
+        );
+        let expected =
+            Array::from_elements::<f32>(ArrayType::new_static(DataType::F32, [2, 1, 1]), &[774.0, 3096.0]).unwrap();
+        assert_eq!(
+            batch(
+                |(lhs, rhs)| lhs.scaled_dot(&rhs, None, None),
+                (lhs.clone(), rhs.clone()),
+                axes.clone(),
+                BatchAxis::new(0),
+                2,
+            ),
+            Ok(expected.clone()),
+        );
+        assert_eq!(
+            batch(
+                |(lhs, rhs)| lhs.scaled_dot(&rhs, None, None),
+                (lhs.map_parameters(ArrayIrValue::Array).unwrap(), rhs.map_parameters(ArrayIrValue::Array).unwrap(),),
+                axes,
+                BatchAxis::new(0),
+                None,
+            ),
+            Ok(ArrayIrValue::Array(expected)),
+        );
+    }
+
+    #[test]
+    fn test_block_quantized_value_scaled_dot_dynamic_output() {
+        let extent = Dimension::Dynamic(DimensionVariable::new("n", DimensionBounds::new(0, Some(3)).unwrap()));
+        let input_types = (
+            BlockQuantizedValue::new(
+                ArrayIrType::Array(ArrayType::new(
+                    DataType::F32,
+                    Shape::new(vec![extent.clone(), Dimension::Static(4)]),
+                )),
+                ArrayIrType::Array(ArrayType::new(
+                    DataType::F32,
+                    Shape::new(vec![extent.clone(), Dimension::Static(2)]),
+                )),
+            )
+            .with_global_scale(ArrayIrType::Array(ArrayType::scalar(DataType::F64))),
+            BlockQuantizedValue::new(
+                ArrayIrType::Array(ArrayType::new_static(DataType::F32, [4, 1])),
+                ArrayIrType::Array(ArrayType::new_static(DataType::F32, [2, 1])),
+            )
+            .with_global_scale(ArrayIrType::Array(ArrayType::scalar(DataType::F32))),
+        );
+        let (output_type, program) = TracingContext::<ArrayIrValue<Array>, ArrayIrOperation<Array>>::trace(
+            |(lhs, rhs): (BlockQuantizedValue<Tracer<_>>, BlockQuantizedValue<Tracer<_>>)| {
+                lhs.scaled_dot(&rhs, None, None)
+            },
+            input_types.clone(),
+        )
+        .unwrap();
+        assert_eq!(
+            output_type,
+            ArrayIrType::Array(ArrayType::new(DataType::F32, Shape::new(vec![extent, Dimension::Static(1)]))),
+        );
+        // Global scales retain their promoted precision, and only the result's free extent is read at runtime.
+        assert_eq!(
+            program.to_string(),
+            indoc! {"
+                lambda %0:f32[n, 4], %1:f32[n, 2], %2:f64[], %3:f32[4, 1], %4:f32[2, 1], %5:f32[] .
+                let %6:f64[] = mul %2 %5
+                    %7:f32[n, 1] = scaled_dot [
+                        dimensions=(lhs_contracting=[1], rhs_contracting=[0], lhs_batching=[], rhs_batching=[]),
+                        accumulation_type=f32,
+                        lhs_scale=true,
+                        rhs_scale=true,
+                    ] %0 %3 %1 %4
+                    %8:dimension<n ∈ [0, 3)> = dimension_size [axis=0] %7
+                    %9:dimension<1> = constant [value=1]
+                    %10:f64[n, 1] = broadcast [output_axes=[]] %6 %8 %9
+                    %11:f64[n, 1] = mul %7 %10
+                    %12:f32[n, 1] = convert_element_type [data_type=f32] %11
+                in (%12)
+            "}
+            .trim_end(),
+        );
+        let lhs = BlockQuantizedValue::new(
+            ArrayIrValue::Array(Array::matrix(2, 4, vec![1.0f32, 2.0, 3.0, 4.0, 2.0, 4.0, 6.0, 8.0]).unwrap()),
+            ArrayIrValue::Array(Array::matrix(2, 2, vec![2.0f32, 3.0, 2.0, 3.0]).unwrap()),
+        )
+        .with_global_scale(ArrayIrValue::Array(Array::scalar(2.0f64).unwrap()));
+        let rhs = BlockQuantizedValue::new(
+            ArrayIrValue::Array(Array::matrix(4, 1, vec![1.0f32; 4]).unwrap()),
+            ArrayIrValue::Array(Array::matrix(2, 1, vec![4.0f32, 5.0]).unwrap()),
+        )
+        .with_global_scale(ArrayIrValue::Array(Array::scalar(3.0f32).unwrap()));
+        // The dequantized first row is [2, 4, 9, 12], whose dot with [4, 4, 5, 5] is 129.
+        // Both global scales multiply it by six, and the second row doubles every element.
+        assert_eq!(
+            program.interpret((lhs, rhs.clone())),
+            Ok(ArrayIrValue::Array(Array::matrix(2, 1, vec![774.0f32, 1548.0]).unwrap())),
+        );
+        let lhs = BlockQuantizedValue::new(
+            ArrayIrValue::Array(Array::matrix(0, 4, Vec::<f32>::new()).unwrap()),
+            ArrayIrValue::Array(Array::matrix(0, 2, Vec::<f32>::new()).unwrap()),
+        )
+        .with_global_scale(ArrayIrValue::Array(Array::scalar(2.0f64).unwrap()));
+        assert_eq!(
+            program.interpret((lhs, rhs)),
+            Ok(ArrayIrValue::Array(Array::matrix(0, 1, Vec::<f32>::new()).unwrap())),
+        );
+
+        // A projected homogeneous call rejects the dynamic output before even multiplying its global scalars.
+        let (_, rejected_program) = TracingContext::<ArrayIrValue<Array>, ArrayIrOperation<Array>>::trace(
+            |(lhs, rhs): (BlockQuantizedValue<Tracer<_>>, BlockQuantizedValue<Tracer<_>>)| {
+                let lhs = lhs.try_map_parameters(|value| {
+                    ValueProjection::<ArrayType>::into_projected(value).map_err(ProgramError::from)
+                })?;
+                let rhs = rhs.try_map_parameters(|value| {
+                    ValueProjection::<ArrayType>::into_projected(value).map_err(ProgramError::from)
+                })?;
+                assert_eq!(
+                    lhs.scaled_dot(&rhs, None, None),
+                    Err(TypeError::invalid(
+                        "`scaled_dot` homogeneous global scaling requires a static output shape; use array IR values \
+                         for dynamic extents",
+                    )
+                    .into()),
+                );
+                Ok::<_, ProgramError>(lhs.elements.into_value())
+            },
+            input_types,
+        )
+        .unwrap();
+        assert_eq!(
+            rejected_program.to_string(),
+            indoc! {"
+                lambda %0:f32[n, 4], %1:f32[n, 2], %2:f64[], %3:f32[4, 1], %4:f32[2, 1], %5:f32[] .
+                in (%0)
+            "}
+            .trim_end(),
+        );
+    }
+
+    #[test]
+    fn test_block_quantized_value_scaled_dot_manual_variation() {
+        type ArrayIrContext = EagerContext<ArrayIrValue<Array>, ArrayIrOperation<Array>>;
+        let mesh = LogicalMesh::new(vec![MeshAxis::new("x", 2, MeshAxisType::Manual).unwrap()]).unwrap();
+        let sharded_rows =
+            Sharding::new(mesh.clone(), vec![ShardingDimension::sharded(["x"]), ShardingDimension::replicated()])
+                .unwrap();
+        let replicated_matrix = Sharding::replicated(mesh.clone(), 2);
+        let replicated_scalar = Sharding::replicated(mesh.clone(), 0);
+        let (output_type, program) = TracingContext::<ArrayIrValue<Array>, ArrayIrOperation<Array>>::trace(
+            |(lhs, rhs): (BlockQuantizedValue<Tracer<_>>, BlockQuantizedValue<Tracer<_>>)| {
+                let lhs = lhs.try_map_parameters(|value| {
+                    ValueProjection::<ArrayType>::into_projected(value).map_err(ProgramError::from)
+                })?;
+                let rhs = rhs.try_map_parameters(|value| {
+                    ValueProjection::<ArrayType>::into_projected(value).map_err(ProgramError::from)
+                })?;
+                let output = shard_map(
+                    |(lhs, rhs): (
+                        BlockQuantizedValue<ShardMapTracer<ArrayIrContext>>,
+                        BlockQuantizedValue<ShardMapTracer<ArrayIrContext>>,
+                    )| lhs.scaled_dot(&rhs, None, None).unwrap(),
+                    (lhs, rhs),
+                    mesh.clone(),
+                    (
+                        BlockQuantizedValue::new(sharded_rows.clone(), replicated_matrix.clone())
+                            .with_global_scale(replicated_scalar.clone()),
+                        BlockQuantizedValue::new(replicated_matrix.clone(), replicated_matrix.clone())
+                            .with_global_scale(replicated_scalar.clone()),
+                    ),
+                    sharded_rows.clone(),
+                )?;
+                Ok::<_, ProgramError>(output.into_value())
+            },
+            (
+                BlockQuantizedValue::new(
+                    ArrayIrType::Array(ArrayType::new_static(DataType::F32, [2, 4])),
+                    ArrayIrType::Array(ArrayType::new_static(DataType::F32, [1, 2])),
+                )
+                .with_global_scale(ArrayIrType::Array(ArrayType::scalar(DataType::F32))),
+                BlockQuantizedValue::new(
+                    ArrayIrType::Array(ArrayType::new_static(DataType::F32, [4, 1])),
+                    ArrayIrType::Array(ArrayType::new_static(DataType::F32, [2, 1])),
+                )
+                .with_global_scale(ArrayIrType::Array(ArrayType::scalar(DataType::F32))),
+            ),
+        )
+        .unwrap();
+        let expected_type = ArrayType::new_static(DataType::F32, [2, 1]).with_sharding(sharded_rows).unwrap();
+        assert_eq!(output_type, ArrayIrType::Array(expected_type.clone()));
+        // Only the left elements initially vary. The primitive aligns its other three inputs, and the final
+        // multiplication separately varies the broadcast global scale instead of changing its descriptor alone.
+        assert_eq!(
+            program.to_string(),
+            indoc! {"
+                lambda %0:f32[2, 4], %1:f32[1, 2], %2:f32[], %3:f32[4, 1], %4:f32[2, 1], %5:f32[] .
+                let %6:f32[2, 1][sharding={mesh<['x'=2:manual]>, [{'x'}, {}]}] = shard_map [
+                    mesh=['x'=2:manual],
+                    in_shardings=[{mesh<['x'=2:manual]>, [{'x'}, {}]}, {mesh<['x'=2:manual]>, [{}, {}]}, \
+                    {mesh<['x'=2:manual]>, []}, {mesh<['x'=2:manual]>, [{}, {}]}, {mesh<['x'=2:manual]>, [{}, {}]}, \
+                    {mesh<['x'=2:manual]>, []}],
+                    out_shardings=[{mesh<['x'=2:manual]>, [{'x'}, {}]}],
+                    manual_axes=['x'],
+                    global_input_types=[f32[2, 4][sharding={mesh<['x'=2:manual]>, [{'x'}, {}]}], f32[1, \
+                    2][sharding={mesh<['x'=2:manual]>, [{}, {}]}], f32[][sharding={mesh<['x'=2:manual]>, []}], f32[4, \
+                    1][sharding={mesh<['x'=2:manual]>, [{}, {}]}], f32[2, 1][sharding={mesh<['x'=2:manual]>, [{}, \
+                    {}]}], f32[][sharding={mesh<['x'=2:manual]>, []}]],
+                    global_output_types=[f32[2, 1][sharding={mesh<['x'=2:manual]>, [{'x'}, {}]}]],
+                ] %0 %1 %2 %3 %4 %5 [
+                    body={
+                        lambda %0:f32[1, 4][sharding={mesh<['x'=2:manual]>, [{}, {}], varying_manual={'x'}}], \
+                    %1:f32[1, 2][sharding={mesh<['x'=2:manual]>, [{}, {}]}], %2:f32[][sharding={mesh<['x'=2:manual]>, \
+                    []}], %3:f32[4, 1][sharding={mesh<['x'=2:manual]>, [{}, {}]}], %4:f32[2, \
+                    1][sharding={mesh<['x'=2:manual]>, [{}, {}]}], %5:f32[][sharding={mesh<['x'=2:manual]>, []}] .
+                        let %6:f32[4, 1][sharding={mesh<['x'=2:manual]>, [{}, {}], varying_manual={'x'}}] = \
+                    parallel_vary [axis_name=\"x\"] %3
+                            %7:f32[1, 2][sharding={mesh<['x'=2:manual]>, [{}, {}], varying_manual={'x'}}] = \
+                    parallel_vary [axis_name=\"x\"] %1
+                            %8:f32[2, 1][sharding={mesh<['x'=2:manual]>, [{}, {}], varying_manual={'x'}}] = \
+                    parallel_vary [axis_name=\"x\"] %4
+                            %9:f32[1, 1][sharding={mesh<['x'=2:manual]>, [{}, {}], varying_manual={'x'}}] = \
+                    scaled_dot [
+                                dimensions=(lhs_contracting=[1], rhs_contracting=[0], lhs_batching=[], \
+                    rhs_batching=[]),
+                                accumulation_type=f32,
+                                lhs_scale=true,
+                                rhs_scale=true,
+                            ] %0 %6 %7 %8
+                            %10:f32[][sharding={mesh<['x'=2:manual]>, []}] = mul %2 %5
+                            %11:f32[1, 1][sharding={mesh<['x'=2:manual]>, [{}, {}]}] = broadcast [output_type=f32[1, \
+                    1][sharding={mesh<['x'=2:manual]>, [{}, {}]}], output_axes=[]] %10
+                            %12:f32[1, 1][sharding={mesh<['x'=2:manual]>, [{}, {}], varying_manual={'x'}}] = \
+                    parallel_vary [axis_name=\"x\"] %11
+                            %13:f32[1, 1][sharding={mesh<['x'=2:manual]>, [{}, {}], varying_manual={'x'}}] = mul %9 %12
+                        in (%13)
+                    },
+                ]
+                in (%6)
+            "}
+            .trim_end(),
+        );
+        let lhs = BlockQuantizedValue::new(
+            ArrayIrValue::Array(Array::matrix(2, 4, vec![1.0f32, 2.0, 3.0, 4.0, 2.0, 4.0, 6.0, 8.0]).unwrap()),
+            ArrayIrValue::Array(Array::matrix(1, 2, vec![2.0f32, 3.0]).unwrap()),
+        )
+        .with_global_scale(ArrayIrValue::Array(Array::scalar(2.0f32).unwrap()));
+        let rhs = BlockQuantizedValue::new(
+            ArrayIrValue::Array(Array::matrix(4, 1, vec![1.0f32; 4]).unwrap()),
+            ArrayIrValue::Array(Array::matrix(2, 1, vec![4.0f32, 5.0]).unwrap()),
+        )
+        .with_global_scale(ArrayIrValue::Array(Array::scalar(3.0f32).unwrap()));
+        assert_eq!(
+            program.interpret((lhs, rhs)),
+            Ok(ArrayIrValue::Array(Array::from_elements(expected_type, &[774.0f32, 1548.0]).unwrap())),
+        );
+    }
+
+    #[test]
+    fn test_block_quantized_value_scaled_dot_differentiation() {
+        let lhs = BlockQuantizedValue::new(
+            Array::matrix(1, 2, vec![3.0f32, 0.0]).unwrap(),
+            Array::matrix(1, 1, vec![1.0f32]).unwrap(),
+        );
+        let rhs = BlockQuantizedValue::new(
+            Array::matrix(2, 1, vec![1.0f32, 0.0]).unwrap(),
+            Array::matrix(1, 1, vec![1.0f32]).unwrap(),
+        );
+        assert!(matches!(
+            differentiate_at((lhs.clone(), rhs.clone())).vjp(|(lhs, rhs)| lhs.scaled_dot(&rhs, None, None)),
+            Err(DifferentiationError::Program(ProgramError::UnsupportedOperation { message }))
+                if message == format!("`{SCALED_DOT_OPERATION_NAME}` does not support differentiation"),
+        ));
+        assert!(matches!(
+            differentiate_at((
+                lhs.map_parameters(ArrayIrValue::Array).unwrap(),
+                rhs.map_parameters(ArrayIrValue::Array).unwrap(),
+            ))
+            .vjp(|(lhs, rhs)| lhs.scaled_dot(&rhs, None, None)),
+            Err(DifferentiationError::Program(ProgramError::UnsupportedOperation { message }))
+                if message == format!("`{SCALED_DOT_OPERATION_NAME}` does not support differentiation"),
+        ));
+    }
+
+    #[test]
+    fn test_block_quantized_value_scaled_matmul() {
+        let lhs = BlockQuantizedValue::new(
+            Array::from_elements::<f32>(ArrayType::new_static(DataType::F32, [1, 1, 4]), &[1.0, 2.0, 3.0, 4.0])
+                .unwrap(),
+            Array::from_elements::<f32>(ArrayType::new_static(DataType::F32, [1, 1, 2]), &[1.0, 2.0]).unwrap(),
+        )
+        .with_global_scale(Array::scalar(2.0f32).unwrap());
+        let rhs = BlockQuantizedValue::new(
+            Array::from_elements::<f32>(ArrayType::new_static(DataType::F32, [1, 2, 4]), &[1.0; 8]).unwrap(),
+            Array::from_elements::<f32>(ArrayType::new_static(DataType::F32, [1, 2, 2]), &[1.0, 1.0, 2.0, 2.0])
+                .unwrap(),
+        )
+        .with_global_scale(Array::scalar(3.0f32).unwrap());
+        let expected =
+            Array::from_elements::<f32>(ArrayType::new_static(DataType::F32, [1, 1, 2]), &[102.0, 204.0]).unwrap();
+        assert_eq!(lhs.scaled_matmul(&rhs, None), Ok(expected.clone()));
+        let rich_lhs = lhs.clone().map_parameters(ArrayIrValue::Array).unwrap();
+        let rich_rhs = rhs.clone().map_parameters(ArrayIrValue::Array).unwrap();
+        assert_eq!(rich_lhs.scaled_matmul(&rich_rhs, None), Ok(ArrayIrValue::Array(expected)));
+
+        let invalid = BlockQuantizedValue::new(
+            Array::matrix(1, 4, vec![1.0f32; 4]).unwrap(),
+            Array::matrix(1, 2, vec![1.0f32; 2]).unwrap(),
+        );
+        let expected = ProgramError::from(TypeError::invalid("`scaled_matmul` expects rank-3 inputs"));
+        assert_eq!(invalid.scaled_matmul(&invalid, None), Err(expected.clone()));
+        let invalid = invalid.map_parameters(ArrayIrValue::Array).unwrap();
+        assert_eq!(invalid.scaled_matmul(&invalid, None), Err(expected.clone()));
+
+        // The scale arrays must also have rank three, even when both element arrays have the required layout.
+        let invalid_rhs = BlockQuantizedValue { scales: Array::matrix(2, 2, vec![1.0f32; 4]).unwrap(), ..rhs };
+        assert_eq!(lhs.scaled_matmul(&invalid_rhs, None), Err(expected.clone()));
+        let invalid_rhs = invalid_rhs.map_parameters(ArrayIrValue::Array).unwrap();
+        assert_eq!(rich_lhs.scaled_matmul(&invalid_rhs, None), Err(expected));
     }
 
     #[test]
@@ -6198,8 +6876,8 @@ mod tests {
             Ok(expected.mul(&Array::matrix(2, 3, vec![2.0f32; 6]).unwrap()).unwrap()),
         );
 
-        // MXFP8 contractions accumulate at the output type directly, unless `ScaledDot` cannot accumulate at it, as for
-        // `f16`, where they accumulate at the compute type and convert afterwards.
+        // MXFP8 contractions accumulate at the output type directly, unless `ScaledDotOperation` cannot accumulate at
+        // it, as for `f16`, where they accumulate at the compute type and convert afterwards.
         let mxfp8 = BlockScaleFormat::new(4, DataType::F8E4M3FN, DataType::F8E8M0FNU);
         let function = block_scaled_dot::<EagerArrayContext>(
             BlockScaledDotConfiguration::new(DotDimensionNumbers::matmul(), mxfp8)
@@ -6363,6 +7041,31 @@ mod tests {
         assert_eq!(
             function.call(lhs, rhs, None, None, None, None),
             Ok(expected.convert_element_type(DataType::BF16).unwrap()),
+        );
+    }
+
+    #[test]
+    fn test_block_scaled_dot_mixed_formats_global_scale_precision() {
+        // With an MX left format the contraction accumulates at `bf16`. The right global scale stays at `f32` until
+        // it multiplies the exact contraction result `3`, and only then does the final conversion round the product.
+        let mxfp8 = BlockScaleFormat::new(2, DataType::F8E4M3FN, DataType::F8E8M0FNU);
+        let nvfp4 = BlockScaleFormat::new(2, DataType::F4E2M1FN, DataType::F8E4M3FN);
+        let function = block_scaled_dot::<EagerArrayContext>(
+            BlockScaledDotConfiguration::new(DotDimensionNumbers::matmul(), mxfp8)
+                .with_rhs_format(nvfp4)
+                .with_accumulation_type(DataType::BF16),
+        )
+        .unwrap();
+        assert_eq!(
+            function.call(
+                Array::matrix(1, 2, vec![0.5f32, 0.0]).unwrap(),
+                Array::matrix(2, 1, vec![6.0234375f32, 0.0]).unwrap(),
+                None,
+                Some(Array::scalar(1.00390625f32).unwrap()),
+                None,
+                None,
+            ),
+            Ok(Array::matrix(1, 1, vec![3.015625f32]).unwrap().convert_element_type(DataType::BF16).unwrap()),
         );
     }
 
