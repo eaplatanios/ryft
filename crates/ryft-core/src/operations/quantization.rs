@@ -3065,11 +3065,9 @@ impl<'o> BlockScaledDotRules<'o> {
     }
 }
 
-// TODO(eaplatanios): Review from here onwards.
-
 /// Rounds the `f32` or `f64` `value` to the grid of a narrow floating-point type whose normal values have
-/// `mantissa_bits` explicit mantissa bits and whose smallest normal value is `2^min_exponent`, below which the grid
-/// spacing stays constant (i.e., subnormal values). Rounding is to the nearest grid value with ties to even, or
+/// `mantissa_bits` explicit mantissa bits and whose smallest normal value is `2^min_exponent`, below which the
+/// grid spacing stays constant (i.e., subnormal values). Rounding is to the nearest grid value with ties to even, or
 /// stochastic with `rounding_noise` (refer to [`BlockQuantize::block_quantize_with_options`]). `value` must be finite,
 /// and the result is not clamped to the finite range of the narrow type.
 ///
@@ -3128,6 +3126,8 @@ where
         .and(&fill(f64::INFINITY)?.bitcast_element_type(bits_type)?)?
         .bitcast_element_type(computation_type)
 }
+
+// TODO(eaplatanios): Review from here onwards.
 
 /// Validates block dequantization's array types and returns normalized, distinct block axes before any operations
 /// execute or stage. Dynamic block ratios are checked by the array IR composition at runtime.
