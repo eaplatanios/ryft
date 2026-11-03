@@ -99,7 +99,7 @@ pub struct BlockQuantizedValue<P: Parameter> {
     /// Scale array with one value per block and the same rank as [`Self::elements`].
     pub scales: P,
 
-    /// Optional rank-`0` real floating-point scale that multiplies the values after block dequantization.
+    /// Optional rank-0 real floating-point scale that multiplies the values after block dequantization.
     pub global_scale: Option<P>,
 }
 
@@ -574,6 +574,88 @@ where
     }
 }
 
+/// Validates the statically decidable requirements of block quantization before composing operations.
+fn validate_block_quantize_inputs(
+    input_type: &ArrayType,
+    block_size: usize,
+    element_type: DataType,
+    scale_type: DataType,
+    block_axes: Axes,
+    global_scale: Option<&ArrayType>,
+    rounding_noise: Option<&ArrayType>,
+) -> Result<(BlockElementFormat, Vec<usize>), ProgramError> {
+    let element_format = BlockElementFormat::new(element_type)?;
+    if !matches!(scale_type, DataType::F8E4M3FN | DataType::F8E8M0FNU) {
+        return Err(
+            TypeError::invalid(format!("`block_quantize` does not support scale data type `{scale_type}`")).into()
+        );
+    }
+
+    let computation_type = input_type.data_type();
+    if !matches!(computation_type, DataType::F32 | DataType::F64) {
+        return Err(TypeError::invalid(format!(
+            "`block_quantize` expects an `f32` or `f64` input but got `{computation_type}`",
+        ))
+        .into());
+    }
+
+    if input_type.rank() == 0 {
+        return Err(TypeError::invalid("`block_quantize` does not support rank-0 inputs").into());
+    }
+
+    if block_size < 2 {
+        return Err(
+            TypeError::invalid(format!("`block_quantize` block size must be at least 2 but got {block_size}")).into()
+        );
+    }
+
+    let block_axes = block_axes.normalize(input_type.rank())?;
+    if block_axes.is_empty() {
+        return Err(TypeError::invalid("`block_quantize` requires at least one block axis").into());
+    }
+
+    for &axis in &block_axes {
+        if let Some(size) = input_type.dimension(axis).value()
+            && (size == 0 || size % block_size != 0)
+        {
+            return Err(TypeError::invalid(format!(
+                "`block_quantize` block dimension {axis} size {size} is not a positive multiple of block size \
+                 {block_size}",
+            ))
+            .into());
+        }
+    }
+
+    if let Some(global_scale_type) = global_scale {
+        if scale_type != DataType::F8E4M3FN {
+            return Err(TypeError::invalid(format!(
+                "`block_quantize` global scales require `f8e4m3fn` scales but got `{scale_type}` scales",
+            ))
+            .into());
+        }
+
+        if global_scale_type.rank() != 0 || global_scale_type.data_type() != computation_type {
+            return Err(TypeError::invalid(format!(
+                "`block_quantize` global scale must be a rank-0 `{computation_type}` array but got \
+                 `{global_scale_type}`",
+            ))
+            .into());
+        }
+    }
+
+    if let Some(noise_type) = rounding_noise
+        && (noise_type.data_type() != computation_type || noise_type.shape() != input_type.shape())
+    {
+        return Err(TypeError::invalid(format!(
+            "`block_quantize` rounding noise must have the data type and shape of the input `{input_type}` \
+             but got `{noise_type}`",
+        ))
+        .into());
+    }
+
+    Ok((element_format, block_axes))
+}
+
 /// Block dequantization capability for [`BlockQuantizedValue`]. [`BlockDequantize::block_dequantize`] reconstructs
 /// an array by repeating each block scale and multiplying the elements, expanded scales, and optional global scale
 /// at a chosen floating-point precision. It accepts representations produced by [`BlockQuantize`] using the final
@@ -879,8 +961,8 @@ impl ScaledDotOperation {
 
     /// Returns the default dimension numbers that [`ScaledDot::scaled_dot`] uses for element arrays of rank `rank`.
     /// They contract the last left dimension with the penultimate right dimension and pair every preceding dimension
-    /// as a batching dimension. For example, rank-two inputs describe the matrix product `[M, K] × [K, N] → [M, N]`
-    /// and rank-three inputs describe the batched matrix product `[B, M, K] × [B, K, N] → [B, M, N]`. Returns a
+    /// as a batching dimension. For example, rank-2 inputs describe the matrix product `[M, K] × [K, N] → [M, N]`
+    /// and rank-3 inputs describe the batched matrix product `[B, M, K] × [B, K, N] → [B, M, N]`. Returns a
     /// [`TypeError`] when `rank` is smaller than two.
     #[inline]
     pub fn default_dimensions(rank: usize) -> Result<DotDimensionNumbers, TypeError> {
@@ -1219,7 +1301,7 @@ where
 pub trait ScaledDot<T, V: Parameter>: Capability + Sized {
     /// Contracts both representations' elements with their block scales, then multiplies the result by their global
     /// scales, treating an absent global scale as `1`. Elements and block scales follow [`ScaledDotOperation`]'s
-    /// requirements. Each present global scale must be a rank-`0` real floating-point array. Known rank, shape, and
+    /// requirements. Each present global scale must be a rank-0 real floating-point array. Known rank, shape, and
     /// data type violations are rejected before staging any operations.
     ///
     /// If both global scales are present, their product is computed first using ordinary arithmetic type promotion.
@@ -1245,9 +1327,9 @@ pub trait ScaledDot<T, V: Parameter>: Capability + Sized {
         accumulation_type: Option<DataType>,
     ) -> Result<V, ProgramError>;
 
-    /// Computes the rank-three batched matrix product `[B, M, K] × [B, N, K] → [B, M, N]` with last-dimension
-    /// contraction and leading batch dimensions. Both element and block-scale arrays must have rank three. Global
-    /// scales remain rank-`0`. Precision and errors follow [`Self::scaled_dot`].
+    /// Computes the rank-3 batched matrix product `[B, M, K] × [B, N, K] → [B, M, N]` with last-dimension
+    /// contraction and leading batch dimensions. Both element and block-scale arrays must have rank 3. Global
+    /// scales remain rank-0. Precision and errors follow [`Self::scaled_dot`].
     ///
     /// # Parameters
     ///
@@ -1443,10 +1525,6 @@ where
 
 /// Name of the composite calls that [`BlockScaledDot`] stages.
 const BLOCK_SCALED_DOT_NAME: &str = "block_scaled_dot";
-
-/// Fixed sign vector of the random Hadamard transform of the NVIDIA Transformer Engine.
-const HADAMARD_SIGNS: [f64; 16] =
-    [1.0, 1.0, 1.0, -1.0, 1.0, -1.0, -1.0, -1.0, -1.0, -1.0, -1.0, 1.0, -1.0, 1.0, -1.0, -1.0];
 
 /// Element and scale formats of one input of a block-scaled matrix product, which [`BlockScaledDotConfiguration`]
 /// assigns to the left-hand side input, the right-hand side input, and/or the gradients. The scale data type selects
@@ -1894,7 +1972,7 @@ where
     /// formats, and tiled right scales additionally require that of the free extents of the right-hand side input.
     /// Quantized backward contractions block the products of the free extents of both inputs, so differentiation
     /// requires each of them to be a multiple of the gradient format's block size and of the block size of its own
-    /// input's format (and of `16` for Hadamard transforms of the left free extents). Global scales must be rank-`0`
+    /// input's format (and of `16` for Hadamard transforms of the left free extents). Global scales must be rank-0
     /// real floating-point arrays that are only present for formats with global scales under
     /// [`BlockScaledGlobalScaling::Provided`], and a gradient global scale additionally requires quantized backward
     /// contractions. A random generator state must be present exactly when stochastic gradient rounding is enabled
@@ -2023,7 +2101,7 @@ where
 ///     [`ScaledDot`]. The configuration can add stochastic gradient rounding, Hadamard transforms of the weight
 ///     gradient inputs, and tiled right scales.
 ///
-/// Both policies first normalize every input to the rank-three layout `[batch, free, contracting]` by transposing and
+/// Both policies first normalize every input to the rank-3 layout `[batch, free, contracting]` by transposing and
 /// merging its dimensions, so several contracting dimensions form one blocked dimension. That dimension follows the
 /// listed order of the contracting dimensions. Clipping thresholds use each input's own format. Backward contractions
 /// accumulate at the computation type (i.e., `f64` when either input is `f64` and `f32` otherwise). Microscaling (i.e.,
@@ -2206,7 +2284,7 @@ enum GlobalScale<V> {
     Current,
 }
 
-/// Shapes and permutations that normalize the inputs of a [`BlockScaledDot`] to the rank-`3` layout
+/// Shapes and permutations that normalize the inputs of a [`BlockScaledDot`] to the rank-3 layout
 /// `[batch, free, contracting]`, together with the rules that operate on that layout.
 struct BlockScaledDotRules<'o> {
     /// [`BlockScaledDotConfiguration`] of the rules.
@@ -2227,10 +2305,10 @@ struct BlockScaledDotRules<'o> {
     /// Static shape of the right-hand side input.
     rhs_shape: Vec<usize>,
 
-    /// Rank-`3` shape `[batch, lhs free, contracting]` of the normalized left-hand side input.
+    /// Rank-3 shape `[batch, lhs free, contracting]` of the normalized left-hand side input.
     lhs_canonical_shape: [usize; 3],
 
-    /// Rank-`3` shape `[batch, rhs free, contracting]` of the normalized right-hand side input.
+    /// Rank-3 shape `[batch, rhs free, contracting]` of the normalized right-hand side input.
     rhs_canonical_shape: [usize; 3],
 
     /// Static shape of the output, which lists the batch, left free, and right free dimensions.
@@ -2323,7 +2401,7 @@ impl<'o> BlockScaledDotRules<'o> {
             .copied()
             .collect::<Vec<_>>();
 
-        // Multiply the extents in each group to obtain the rank-`3` shapes. Dot validation has already checked that
+        // Multiply the extents in each group to obtain the rank-3 shapes. Dot validation has already checked that
         // paired batching and contracting extents match, so either input determines their shared products. Empty
         // groups have product 1 and become singleton dimensions in the normalized layout.
         let batch = dimensions.lhs_batching_dimensions().iter().map(|&axis| lhs_shape[axis]).product::<usize>();
@@ -2394,7 +2472,7 @@ impl<'o> BlockScaledDotRules<'o> {
         Ok(())
     }
 
-    /// Returns `value` converted to the computation type and normalized to the rank-three `[batch, free, contracting]`
+    /// Returns `value` converted to the computation type and normalized to the rank-3 `[batch, free, contracting]`
     /// layout through `permutation`.
     fn normalize<V: ConvertElementType + Reshape + Transpose>(
         &self,
@@ -2411,7 +2489,7 @@ impl<'o> BlockScaledDotRules<'o> {
         value.reshape(Shape::new(shape.iter().map(|&size| Dimension::Static(size)).collect()))
     }
 
-    /// Restores a rank-three gradient in normalized layout to the layout of an input with `shape`,
+    /// Restores a rank-3 gradient in normalized layout to the layout of an input with `shape`,
     /// and converts it to `data_type`.
     fn denormalize<V: ConvertElementType + Reshape + Transpose>(
         &self,
@@ -2620,7 +2698,7 @@ impl<'o> BlockScaledDotRules<'o> {
         }
     }
 
-    /// Quantizes the rank-three `value` along `axis` into the representation that [`ScaledDot`] consumes for a
+    /// Quantizes the rank-3 `value` along `axis` into the representation that [`ScaledDot`] consumes for a
     /// contraction along `axis`. Tiled scales span both the free and the contracting dimension (i.e., axes `1` and `2`)
     /// and are expanded along the dimension other than `axis`.
     fn quantize<V>(
@@ -2704,7 +2782,7 @@ impl<'o> BlockScaledDotRules<'o> {
     }
 
     /// Applies the random Hadamard transform of NVIDIA Transformer Engine along the dimension of extent `extent` (i.e.,
-    /// axis `1`) of the rank-`3` `value`, multiplying every 16 consecutive values by `diag(s) · H / 4`. The 16×16
+    /// axis `1`) of the rank-3 `value`, multiplying every 16 consecutive values by `diag(s) · H / 4`. The 16×16
     /// Sylvester Hadamard matrix `H` is the Kronecker product of four 2×2 Hadamard matrices, so the transform applies
     /// one 2×2 butterfly along each of the four bits of the position within a chunk. Every butterfly adds or subtracts
     /// two values, so the transform rounds identically on every backend, unlike a matrix product that may use reduced
@@ -2759,8 +2837,6 @@ impl<'o> BlockScaledDotRules<'o> {
         transformed.reshape(static_shape(&shape))?.div(&self.fill(value, 4.0)?)
     }
 
-    // TODO(eaplatanios): Review from here onwards.
-
     /// Builds the sign vector `s` of the random Hadamard transform in the domain of `value`. The signs `1 - 2 · b_i`
     /// derive from the bits `b_i` of the constant whose set bits mark the negative signs, extracted from coordinate
     /// values with exact power of two arithmetic, because staged rules can only create constants by filling.
@@ -2769,6 +2845,10 @@ impl<'o> BlockScaledDotRules<'o> {
         V: Value<Type = ArrayType> + Add + Div + Floor + Mul + Rem + Sub,
         V::Domain: Fill<f64, V> + Iota<V>,
     {
+        /// Fixed sign vector of the random Hadamard transform of the NVIDIA Transformer Engine.
+        const HADAMARD_SIGNS: [f64; 16] =
+            [1.0, 1.0, 1.0, -1.0, 1.0, -1.0, -1.0, -1.0, -1.0, -1.0, -1.0, 1.0, -1.0, 1.0, -1.0, -1.0];
+
         let domain = value.domain();
         let vector_type = ArrayType::new_static(self.computation_type, [16]);
         let fill = |constant: f64| domain.fill(&vector_type, constant);
@@ -2798,7 +2878,7 @@ impl<'o> BlockScaledDotRules<'o> {
             .fill(&ArrayType::new(self.computation_type, value.r#type().shape().clone()), constant)
     }
 
-    /// Broadcasts the rank-0 `scalar` to a rank-three array of `shape`, keeping its placement.
+    /// Broadcasts the rank-0 `scalar` to a rank-3 array of `shape`, keeping its placement.
     fn broadcast_scalar<V: Value<Type = ArrayType> + Broadcast>(
         &self,
         scalar: &V,
@@ -2812,78 +2892,7 @@ impl<'o> BlockScaledDotRules<'o> {
     }
 }
 
-/// Validates the statically decidable requirements of block quantization before composing operations.
-fn validate_block_quantize_inputs(
-    input_type: &ArrayType,
-    block_size: usize,
-    element_type: DataType,
-    scale_type: DataType,
-    block_axes: Axes,
-    global_scale: Option<&ArrayType>,
-    rounding_noise: Option<&ArrayType>,
-) -> Result<(BlockElementFormat, Vec<usize>), ProgramError> {
-    let element_format = BlockElementFormat::new(element_type)?;
-    if !matches!(scale_type, DataType::F8E4M3FN | DataType::F8E8M0FNU) {
-        return Err(
-            TypeError::invalid(format!("`block_quantize` does not support scale data type `{scale_type}`")).into()
-        );
-    }
-    let computation_type = input_type.data_type();
-    if !matches!(computation_type, DataType::F32 | DataType::F64) {
-        return Err(TypeError::invalid(format!(
-            "`block_quantize` expects an `f32` or `f64` input but got `{computation_type}`",
-        ))
-        .into());
-    }
-    if input_type.rank() == 0 {
-        return Err(TypeError::invalid("`block_quantize` does not support rank-0 inputs").into());
-    }
-    if block_size < 2 {
-        return Err(
-            TypeError::invalid(format!("`block_quantize` block size must be at least 2 but got {block_size}")).into()
-        );
-    }
-    let block_axes = block_axes.normalize(input_type.rank())?;
-    if block_axes.is_empty() {
-        return Err(TypeError::invalid("`block_quantize` requires at least one block axis").into());
-    }
-    for &axis in &block_axes {
-        if let Some(size) = input_type.dimension(axis).value()
-            && (size == 0 || size % block_size != 0)
-        {
-            return Err(TypeError::invalid(format!(
-                "`block_quantize` block dimension {axis} size {size} is not a positive multiple of block size \
-                 {block_size}",
-            ))
-            .into());
-        }
-    }
-    if let Some(global_scale_type) = global_scale {
-        if scale_type != DataType::F8E4M3FN {
-            return Err(TypeError::invalid(format!(
-                "`block_quantize` global scales require `f8e4m3fn` scales but got `{scale_type}` scales",
-            ))
-            .into());
-        }
-        if global_scale_type.rank() != 0 || global_scale_type.data_type() != computation_type {
-            return Err(TypeError::invalid(format!(
-                "`block_quantize` global scale must be a rank-0 `{computation_type}` array but got \
-                 `{global_scale_type}`",
-            ))
-            .into());
-        }
-    }
-    if let Some(noise_type) = rounding_noise
-        && (noise_type.data_type() != computation_type || noise_type.shape() != input_type.shape())
-    {
-        return Err(TypeError::invalid(format!(
-            "`block_quantize` rounding noise must have the data type and shape of the input `{input_type}` \
-             but got `{noise_type}`",
-        ))
-        .into());
-    }
-    Ok((element_format, block_axes))
-}
+// TODO(eaplatanios): Review from here onwards.
 
 /// Validates both representations and infers the contraction output before any operations are staged.
 fn validate_scaled_dot_inputs<P: Parameter>(
@@ -2943,7 +2952,7 @@ where
     Ok(operation.infer_output_types(&input_types, &[])?.remove(0))
 }
 
-/// Validates the rank-three element and block-scale arrays required by the matrix-product frontend.
+/// Validates the rank-3 element and block-scale arrays required by the matrix-product frontend.
 fn validate_scaled_matmul_inputs<P: Parameter>(
     lhs: &BlockQuantizedValue<P>,
     rhs: &BlockQuantizedValue<P>,
@@ -5848,7 +5857,7 @@ mod tests {
 
     #[test]
     fn test_scaled_dot_interpretation() {
-        // Rank-two inputs use the default dimension numbers, which contract the last left dimension with the first
+        // Rank-2 inputs use the default dimension numbers, which contract the last left dimension with the first
         // right dimension. The two sides infer independent block sizes of two along different scale dimensions.
         let lhs = Array::matrix(2, 4, vec![1.0f32, 2.0, 3.0, 4.0, 5.0, 6.0, 7.0, 8.0]).unwrap();
         let rhs = Array::matrix(4, 3, (1..=12).map(|value| value as f32).collect()).unwrap();
@@ -6715,7 +6724,7 @@ mod tests {
         let invalid = invalid.map_parameters(ArrayIrValue::Array).unwrap();
         assert_eq!(invalid.scaled_matmul(&invalid, None), Err(expected.clone()));
 
-        // The scale arrays must also have rank three, even when both element arrays have the required layout.
+        // The scale arrays must also have rank 3, even when both element arrays have the required layout.
         let invalid_rhs = BlockQuantizedValue { scales: Array::matrix(2, 2, vec![1.0f32; 4]).unwrap(), ..rhs };
         assert_eq!(lhs.scaled_matmul(&invalid_rhs, None), Err(expected.clone()));
         let invalid_rhs = invalid_rhs.map_parameters(ArrayIrValue::Array).unwrap();
@@ -7938,10 +7947,14 @@ mod tests {
             .unwrap()
             .transpose(vec![1, 0])
             .unwrap();
+        // Pin the recipe's sign vector independently of the implementation so that changing its signs fails this
+        // comparison even if the transform remains orthogonal.
+        let expected_signs: [f64; 16] =
+            [1.0, 1.0, 1.0, -1.0, 1.0, -1.0, -1.0, -1.0, -1.0, -1.0, -1.0, 1.0, -1.0, 1.0, -1.0, -1.0];
         let expected = (0..16)
             .flat_map(|row: u32| {
                 (0..16u32).map(move |column| {
-                    HADAMARD_SIGNS[row as usize] * if (row & column).count_ones() % 2 == 0 { 0.25 } else { -0.25 }
+                    expected_signs[row as usize] * if (row & column).count_ones() % 2 == 0 { 0.25 } else { -0.25 }
                 })
             })
             .collect::<Vec<_>>();
