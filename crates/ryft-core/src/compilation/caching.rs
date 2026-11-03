@@ -1716,15 +1716,84 @@ impl DiskCache {
                 let maximum_envelope_size = ENTRY_HEADER_LENGTH + maximum_payload_size;
                 GzDecoder::new(file).take(maximum_envelope_size as u64 + 1).read_to_end(&mut envelope)?;
                 if envelope.len() > maximum_envelope_size {
-                    return Err(Self::invalid_data(format!(
-                        "persistent cache payload exceeds the {} MiB limit",
-                        maximum_payload_size / (1024 * 1024),
-                    )));
+                    return Err(std::io::Error::new(
+                        std::io::ErrorKind::InvalidData,
+                        format!(
+                            "persistent cache payload exceeds the {} MiB limit",
+                            maximum_payload_size / (1024 * 1024),
+                        ),
+                    ));
                 }
             }
         }
-        Self::decode_envelope(digest, envelope.as_slice()).map(Some)
+
+        // Validate the complete header before slicing it, so the fixed-width slice conversions below cannot fail.
+        if envelope.len() < ENTRY_HEADER_LENGTH {
+            return Err(std::io::Error::new(
+                std::io::ErrorKind::InvalidData,
+                "persistent cache entry is shorter than its header",
+            ));
+        }
+
+        if &envelope[..ENTRY_MAGIC.len()] != ENTRY_MAGIC {
+            return Err(std::io::Error::new(
+                std::io::ErrorKind::InvalidData,
+                "persistent cache entry has an invalid magic value",
+            ));
+        }
+
+        let mut offset = ENTRY_MAGIC.len();
+        let version = u32::from_le_bytes(envelope[offset..offset + 4].try_into().unwrap());
+        offset += 4;
+        if version != ENTRY_FORMAT_VERSION {
+            return Err(std::io::Error::new(
+                std::io::ErrorKind::InvalidData,
+                format!("persistent cache entry uses unsupported format version {version}",),
+            ));
+        }
+
+        // Reject an artifact addressed by another key before interpreting its payload.
+        let stored_digest = &envelope[offset..offset + SHA256_LENGTH];
+        offset += SHA256_LENGTH;
+        if stored_digest != digest.as_bytes() {
+            return Err(std::io::Error::new(
+                std::io::ErrorKind::InvalidData,
+                "persistent cache entry key digest does not match its requested key",
+            ));
+        }
+
+        let payload_length = u64::from_le_bytes(envelope[offset..offset + 8].try_into().unwrap());
+        offset += 8;
+        let payload_length = usize::try_from(payload_length).map_err(|_| {
+            std::io::Error::new(
+                std::io::ErrorKind::InvalidData,
+                "persistent cache payload length does not fit in memory",
+            )
+        })?;
+
+        let stored_checksum = &envelope[offset..offset + SHA256_LENGTH];
+        offset += SHA256_LENGTH;
+        let payload = &envelope[offset..];
+
+        // Require an exact payload length, including rejecting trailing bytes, before checking its integrity.
+        if payload.len() != payload_length {
+            return Err(std::io::Error::new(
+                std::io::ErrorKind::InvalidData,
+                format!("persistent cache payload declares {} bytes but contains {}", payload_length, payload.len()),
+            ));
+        }
+
+        if Sha256::digest(payload).as_slice() != stored_checksum {
+            return Err(std::io::Error::new(
+                std::io::ErrorKind::InvalidData,
+                "persistent cache payload checksum does not match",
+            ));
+        }
+
+        Ok(Some(payload.to_vec()))
     }
+
+    // TODO(eaplatanios): Review from here onwards.
 
     /// Atomically writes `data` as the entry at `path` for `digest` and then evicts older entries when a size cap is
     /// configured. The entry is first written gzip-compressed to an exclusively created temporary file, synchronized,
@@ -1735,14 +1804,64 @@ impl DiskCache {
         let write_result = (|| -> std::io::Result<()> {
             // Fast compression bounds the host overhead added after an already expensive compilation.
             let mut encoder = GzEncoder::new(temporary_file, Compression::fast());
-            Self::write_envelope(&mut encoder, digest, data)?;
+
+            // Keep the versioned header in wire order and append the payload. The digest binds the entry to its
+            // requested key, while the checksum detects payload corruption.
+            let payload_checksum = Sha256::digest(data);
+            let payload_length = u64::try_from(data.len()).map_err(|_| {
+                std::io::Error::new(
+                    std::io::ErrorKind::InvalidData,
+                    "persistent cache payload length does not fit in `u64`",
+                )
+            })?;
+            encoder.write_all(ENTRY_MAGIC)?;
+            encoder.write_all(&ENTRY_FORMAT_VERSION.to_le_bytes())?;
+            encoder.write_all(digest.as_bytes())?;
+            encoder.write_all(&payload_length.to_le_bytes())?;
+            encoder.write_all(payload_checksum.as_slice())?;
+            encoder.write_all(data)?;
             encoder.finish()?.sync_all()
         })();
         if let Err(error) = write_result.and_then(|()| fs::rename(&temporary_path, path)) {
             return Self::remove_temporary_entry(&temporary_path, error);
         }
+        // Evict only after the atomic rename succeeds. Count completed executable and auxiliary entries, leaving
+        // temporary files alone because another process may still be writing them.
         if let Some(max_bytes) = self.max_bytes {
-            self.evict_to_fit(path, max_bytes)?;
+            let mut total_bytes = 0u64;
+            let mut candidates = Vec::new();
+            for entry in fs::read_dir(&self.directory)? {
+                let entry = entry?;
+                let entry_path = entry.path();
+                if !Self::is_entry_path(&entry_path) {
+                    continue;
+                }
+                let metadata = entry.metadata()?;
+                total_bytes = total_bytes.saturating_add(metadata.len());
+                if entry_path != path {
+                    candidates.push((entry_path, metadata.modified()?, metadata.len()));
+                }
+            }
+            if total_bytes <= max_bytes {
+                return Ok(());
+            }
+            // Evict by write time rather than read activity. This eviction pass keeps the just-published entry even
+            // when it alone exceeds the cap.
+            candidates.sort_by_key(|(_, modified, _)| *modified);
+            let mut bytes_to_evict = total_bytes - max_bytes;
+            for (entry_path, _, size) in candidates {
+                if bytes_to_evict == 0 {
+                    break;
+                }
+                match fs::remove_file(&entry_path) {
+                    Ok(()) => {
+                        bytes_to_evict = bytes_to_evict.saturating_sub(size);
+                    }
+                    // Another cache instance may already have removed this candidate.
+                    Err(error) if error.kind() == std::io::ErrorKind::NotFound => continue,
+                    Err(error) => return Err(error),
+                }
+            }
         }
         Ok(())
     }
@@ -1778,109 +1897,6 @@ impl DiskCache {
                 format!("{error}, and failed to clean up the temporary cache entry: {cleanup_error}"),
             )),
         }
-    }
-
-    // TODO(eaplatanios): Review from here onwards.
-
-    /// Evicts the least recently written entries until the size of the cache on disk is at most `max_bytes`,
-    /// never evicting the entry at `keep_path`. Returns the number of evicted entries.
-    fn evict_to_fit(&self, keep_path: &Path, max_bytes: u64) -> std::io::Result<usize> {
-        let mut total_bytes = 0u64;
-        let mut candidates = Vec::new();
-        for entry in fs::read_dir(&self.directory)? {
-            let entry = entry?;
-            let path = entry.path();
-            if !Self::is_entry_path(&path) {
-                continue;
-            }
-            let metadata = entry.metadata()?;
-            total_bytes = total_bytes.saturating_add(metadata.len());
-            if path != keep_path {
-                candidates.push((path, metadata.modified()?, metadata.len()));
-            }
-        }
-        if total_bytes <= max_bytes {
-            return Ok(0);
-        }
-        candidates.sort_by_key(|(_, modified, _)| *modified);
-        let mut bytes_to_evict = total_bytes - max_bytes;
-        let mut evicted = 0usize;
-        for (path, _, size) in candidates {
-            if bytes_to_evict == 0 {
-                break;
-            }
-            match fs::remove_file(&path) {
-                Ok(()) => {
-                    evicted += 1;
-                    bytes_to_evict = bytes_to_evict.saturating_sub(size);
-                }
-                Err(error) if error.kind() == std::io::ErrorKind::NotFound => continue,
-                Err(error) => return Err(error),
-            }
-        }
-        Ok(evicted)
-    }
-
-    /// Writes the uncompressed envelope that stores `payload` under `digest` to `writer`.
-    fn write_envelope(writer: &mut impl Write, digest: &DiskCacheDigest, payload: &[u8]) -> std::io::Result<()> {
-        let payload_checksum = Sha256::digest(payload);
-        let payload_length = u64::try_from(payload.len())
-            .map_err(|_| Self::invalid_data("persistent cache payload length does not fit in `u64`"))?;
-        writer.write_all(ENTRY_MAGIC)?;
-        writer.write_all(&ENTRY_FORMAT_VERSION.to_le_bytes())?;
-        writer.write_all(digest.as_bytes())?;
-        writer.write_all(&payload_length.to_le_bytes())?;
-        writer.write_all(payload_checksum.as_slice())?;
-        writer.write_all(payload)
-    }
-
-    /// Validates the uncompressed `envelope` of an entry stored under `digest` and returns its payload.
-    fn decode_envelope(digest: &DiskCacheDigest, envelope: &[u8]) -> std::io::Result<Vec<u8>> {
-        if envelope.len() < ENTRY_HEADER_LENGTH {
-            return Err(Self::invalid_data("persistent cache entry is shorter than its header"));
-        }
-        if &envelope[..ENTRY_MAGIC.len()] != ENTRY_MAGIC {
-            return Err(Self::invalid_data("persistent cache entry has an invalid magic value"));
-        }
-
-        let mut offset = ENTRY_MAGIC.len();
-        let version = u32::from_le_bytes(envelope[offset..offset + 4].try_into().unwrap());
-        offset += 4;
-        if version != ENTRY_FORMAT_VERSION {
-            return Err(Self::invalid_data(format!(
-                "persistent cache entry uses unsupported format version {version}",
-            )));
-        }
-
-        let stored_digest = &envelope[offset..offset + SHA256_LENGTH];
-        offset += SHA256_LENGTH;
-        if stored_digest != digest.as_bytes() {
-            return Err(Self::invalid_data("persistent cache entry key digest does not match its requested key"));
-        }
-
-        let payload_length = u64::from_le_bytes(envelope[offset..offset + 8].try_into().unwrap());
-        offset += 8;
-        let payload_length = usize::try_from(payload_length)
-            .map_err(|_| Self::invalid_data("persistent cache payload length does not fit in memory"))?;
-        let stored_checksum = &envelope[offset..offset + SHA256_LENGTH];
-        offset += SHA256_LENGTH;
-        let payload = &envelope[offset..];
-        if payload.len() != payload_length {
-            return Err(Self::invalid_data(format!(
-                "persistent cache payload declares {payload_length} bytes but contains {}",
-                payload.len(),
-            )));
-        }
-        if Sha256::digest(payload).as_slice() != stored_checksum {
-            return Err(Self::invalid_data("persistent cache payload checksum does not match"));
-        }
-        Ok(payload.to_vec())
-    }
-
-    /// Returns an [`std::io::ErrorKind::InvalidData`] error carrying `message`.
-    #[inline]
-    fn invalid_data(message: impl Into<String>) -> std::io::Error {
-        std::io::Error::new(std::io::ErrorKind::InvalidData, message.into())
     }
 }
 
@@ -2225,11 +2241,23 @@ mod tests {
         context.recent_events().into_iter().map(|event| event.step).collect()
     }
 
-    /// Returns the uncompressed envelope that stores `payload` under `digest`.
+    /// Returns the uncompressed envelope that the production cache writes for `payload` under `digest`.
     fn encode_envelope(digest: &DiskCacheDigest, payload: &[u8]) -> Vec<u8> {
-        let mut envelope = Vec::with_capacity(ENTRY_HEADER_LENGTH + payload.len());
-        DiskCache::write_envelope(&mut envelope, digest, payload).unwrap();
+        let directory = tempfile::tempdir().unwrap();
+        let cache = DiskCache::open(directory.path()).unwrap();
+        cache.put(digest, payload).unwrap();
+        let file = File::open(cache.entry_path(digest)).unwrap();
+        let mut envelope = Vec::new();
+        GzDecoder::new(file).read_to_end(&mut envelope).unwrap();
         envelope
+    }
+
+    /// Writes `envelope` verbatim as a gzip entry so read tests can inject malformed envelope bytes.
+    fn write_compressed_envelope(path: &Path, envelope: &[u8]) {
+        let file = File::create(path).unwrap();
+        let mut encoder = GzEncoder::new(file, Compression::default());
+        encoder.write_all(envelope).unwrap();
+        encoder.finish().unwrap();
     }
 
     #[test]
@@ -4089,6 +4117,92 @@ mod tests {
     }
 
     #[test]
+    fn test_disk_cache_put_evicts_to_capacity() {
+        let directory = tempfile::tempdir().unwrap();
+        let uncapped = DiskCache::open(directory.path()).unwrap();
+        let payloads: Vec<Vec<u8>> =
+            (0..3).map(|entry| (0..256).map(|byte| (entry * 31 + byte) as u8).collect()).collect();
+        let digests: Vec<DiskCacheDigest> = (0..3).map(|index| DiskCacheDigest::from_key(&[index])).collect();
+        for index in 0..3 {
+            uncapped.put(&digests[index], &payloads[index]).unwrap();
+            let file = File::options().write(true).open(uncapped.entry_path(&digests[index])).unwrap();
+            let modified = SystemTime::UNIX_EPOCH + Duration::from_secs(index as u64 + 1);
+            file.set_times(FileTimes::new().set_modified(modified)).unwrap();
+        }
+
+        let sizes = digests
+            .iter()
+            .map(|digest| fs::metadata(uncapped.entry_path(digest)).unwrap().len())
+            .collect::<Vec<_>>();
+        let capacity = sizes[1] + sizes[2];
+        let cache = DiskCache::with_max_bytes(directory.path(), capacity).unwrap();
+
+        // Rewriting the newest entry triggers eviction through the production write path and protects that entry.
+        cache.put(&digests[2], &payloads[2]).unwrap();
+        assert_eq!(cache.get(&digests[0]).unwrap(), None);
+        assert_eq!(cache.get(&digests[1]).unwrap(), Some(payloads[1].clone()));
+        assert_eq!(cache.get(&digests[2]).unwrap(), Some(payloads[2].clone()));
+        assert!(cache.cache_size_bytes().unwrap() <= capacity);
+    }
+
+    #[test]
+    fn test_disk_cache_read_entry() {
+        let directory = tempfile::tempdir().unwrap();
+        let path = directory.path().join("entry");
+        let digest = DiskCacheDigest::from_key(b"key");
+        let envelope = encode_envelope(&digest, b"compiled");
+        assert_eq!(envelope.len(), ENTRY_HEADER_LENGTH + b"compiled".len());
+
+        write_compressed_envelope(&path, &envelope);
+        assert_eq!(DiskCache::read_entry(&path, &digest, None).unwrap(), Some(b"compiled".to_vec()));
+    }
+
+    #[test]
+    fn test_disk_cache_read_entry_rejects_malformed_envelopes() {
+        let directory = tempfile::tempdir().unwrap();
+        let path = directory.path().join("entry");
+        let digest = DiskCacheDigest::from_key(b"key");
+        let envelope = encode_envelope(&digest, b"compiled");
+
+        write_compressed_envelope(&path, &envelope[..ENTRY_HEADER_LENGTH - 1]);
+        let error = DiskCache::read_entry(&path, &digest, None).unwrap_err();
+        assert_eq!(error.kind(), std::io::ErrorKind::InvalidData);
+        assert_eq!(error.to_string(), "persistent cache entry is shorter than its header");
+
+        let mut invalid_magic = envelope.clone();
+        invalid_magic[0] ^= 0xff;
+        write_compressed_envelope(&path, &invalid_magic);
+        let error = DiskCache::read_entry(&path, &digest, None).unwrap_err();
+        assert_eq!(error.kind(), std::io::ErrorKind::InvalidData);
+        assert_eq!(error.to_string(), "persistent cache entry has an invalid magic value");
+
+        let mut unsupported_version = envelope.clone();
+        unsupported_version[ENTRY_MAGIC.len()..ENTRY_MAGIC.len() + 4].copy_from_slice(&2u32.to_le_bytes());
+        write_compressed_envelope(&path, &unsupported_version);
+        let error = DiskCache::read_entry(&path, &digest, None).unwrap_err();
+        assert_eq!(error.kind(), std::io::ErrorKind::InvalidData);
+        assert_eq!(error.to_string(), "persistent cache entry uses unsupported format version 2");
+
+        let other_key = encode_envelope(&DiskCacheDigest::from_key(b"other"), b"compiled");
+        write_compressed_envelope(&path, &other_key);
+        let error = DiskCache::read_entry(&path, &digest, None).unwrap_err();
+        assert_eq!(error.kind(), std::io::ErrorKind::InvalidData);
+        assert_eq!(error.to_string(), "persistent cache entry key digest does not match its requested key");
+
+        write_compressed_envelope(&path, &envelope[..envelope.len() - 1]);
+        let error = DiskCache::read_entry(&path, &digest, None).unwrap_err();
+        assert_eq!(error.kind(), std::io::ErrorKind::InvalidData);
+        assert_eq!(error.to_string(), "persistent cache payload declares 8 bytes but contains 7");
+
+        let mut corrupted_payload = envelope.clone();
+        *corrupted_payload.last_mut().unwrap() ^= 0xff;
+        write_compressed_envelope(&path, &corrupted_payload);
+        let error = DiskCache::read_entry(&path, &digest, None).unwrap_err();
+        assert_eq!(error.kind(), std::io::ErrorKind::InvalidData);
+        assert_eq!(error.to_string(), "persistent cache payload checksum does not match");
+    }
+
+    #[test]
     fn test_disk_cache_temporary_entry_independent_instances() {
         let directory = tempfile::tempdir().unwrap();
         let first = DiskCache::open(directory.path()).unwrap();
@@ -4125,77 +4239,6 @@ mod tests {
         drop(file);
         assert_eq!(fs::read(&paths.0).unwrap(), b"first writer");
         assert_eq!(fs::read(&paths.1).unwrap(), b"second writer");
-    }
-
-    #[test]
-    fn test_disk_cache_evict_to_fit() {
-        let directory = tempfile::tempdir().unwrap();
-        let cache = DiskCache::open(directory.path()).unwrap();
-        let payloads: Vec<Vec<u8>> =
-            (0..3).map(|entry| (0..256).map(|byte| (entry * 31 + byte) as u8).collect()).collect();
-        let digests: Vec<DiskCacheDigest> = (0..3).map(|index| DiskCacheDigest::from_key(&[index])).collect();
-        for index in 0..3 {
-            cache.put(&digests[index], &payloads[index]).unwrap();
-            let file = File::options().write(true).open(cache.entry_path(&digests[index])).unwrap();
-            let modified = SystemTime::UNIX_EPOCH + Duration::from_secs(index as u64 + 1);
-            file.set_times(FileTimes::new().set_modified(modified)).unwrap();
-        }
-
-        let sizes = digests
-            .iter()
-            .map(|digest| fs::metadata(cache.entry_path(digest)).unwrap().len())
-            .collect::<Vec<_>>();
-        let capacity = sizes[1] + sizes[2];
-        assert_eq!(cache.evict_to_fit(&cache.entry_path(&digests[2]), capacity).unwrap(), 1);
-        assert_eq!(cache.get(&digests[0]).unwrap(), None);
-        assert_eq!(cache.get(&digests[1]).unwrap(), Some(payloads[1].clone()));
-        assert_eq!(cache.get(&digests[2]).unwrap(), Some(payloads[2].clone()));
-        assert_eq!(cache.cache_size_bytes().unwrap(), capacity);
-    }
-
-    #[test]
-    fn test_disk_cache_decode_envelope() {
-        let digest = DiskCacheDigest::from_key(b"key");
-        let envelope = encode_envelope(&digest, b"compiled");
-        assert_eq!(envelope.len(), ENTRY_HEADER_LENGTH + b"compiled".len());
-        assert_eq!(DiskCache::decode_envelope(&digest, &envelope).unwrap(), b"compiled");
-    }
-
-    #[test]
-    fn test_disk_cache_decode_envelope_rejects_malformed_envelopes() {
-        let digest = DiskCacheDigest::from_key(b"key");
-        let envelope = encode_envelope(&digest, b"compiled");
-
-        let error = DiskCache::decode_envelope(&digest, &envelope[..ENTRY_HEADER_LENGTH - 1]).unwrap_err();
-        assert_eq!(error.kind(), std::io::ErrorKind::InvalidData);
-        assert_eq!(error.to_string(), "persistent cache entry is shorter than its header");
-
-        let mut invalid_magic = envelope.clone();
-        invalid_magic[0] ^= 0xff;
-        let error = DiskCache::decode_envelope(&digest, &invalid_magic).unwrap_err();
-        assert_eq!(error.kind(), std::io::ErrorKind::InvalidData);
-        assert_eq!(error.to_string(), "persistent cache entry has an invalid magic value");
-
-        let mut unsupported_version = envelope.clone();
-        unsupported_version[ENTRY_MAGIC.len()..ENTRY_MAGIC.len() + 4].copy_from_slice(&2u32.to_le_bytes());
-        let error = DiskCache::decode_envelope(&digest, &unsupported_version).unwrap_err();
-        assert_eq!(error.kind(), std::io::ErrorKind::InvalidData);
-        assert_eq!(error.to_string(), "persistent cache entry uses unsupported format version 2");
-
-        let other_key = encode_envelope(&DiskCacheDigest::from_key(b"other"), b"compiled");
-        let error = DiskCache::decode_envelope(&digest, &other_key).unwrap_err();
-        assert_eq!(error.kind(), std::io::ErrorKind::InvalidData);
-        assert_eq!(error.to_string(), "persistent cache entry key digest does not match its requested key");
-
-        let error = DiskCache::decode_envelope(&digest, &envelope[..envelope.len() - 1]).unwrap_err();
-        assert_eq!(error.kind(), std::io::ErrorKind::InvalidData);
-        assert_eq!(error.to_string(), "persistent cache payload declares 8 bytes but contains 7");
-
-        let mut corrupted_payload = envelope.clone();
-        *corrupted_payload.last_mut().unwrap() ^= 0xff;
-        let error = DiskCache::decode_envelope(&digest, &corrupted_payload).unwrap_err();
-        assert_eq!(error.kind(), std::io::ErrorKind::InvalidData);
-        assert_eq!(error.to_string(), "persistent cache payload checksum does not match");
     }
 
     #[test]

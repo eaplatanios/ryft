@@ -1,39 +1,27 @@
-//! Backend-neutral exchange of serialized compilation artifacts among the processes of one distributed run.
-
-// TODO(eaplatanios): Review this module.
-
 use std::time::Duration;
 
 use thiserror::Error;
 
 /// Failure reported by a [`CompilationArtifactExchange`] implementation.
-#[derive(Error, Clone, Debug, PartialEq, Eq)]
+#[derive(Clone, Debug, PartialEq, Eq, Error)]
 pub enum CompilationExchangeError {
-    /// The exchange deadline elapsed before an artifact became available.
     #[error("compilation artifact exchange timed out")]
     TimedOut,
 
-    /// Participating processes disagreed about the launch, compilation, backend, or topology identity.
     #[error("compilation artifact exchange is incompatible: {message}")]
-    Incompatible {
-        /// Human-readable lowercase description of the incompatibility.
-        message: String,
-    },
+    Incompatible { message: String },
 
-    /// The exchange transport or coordination protocol failed.
     #[error("compilation artifact exchange failed: {message}")]
-    Failed {
-        /// Human-readable lowercase description of the failure.
-        message: String,
-    },
+    Failed { message: String },
 }
 
-/// Exchanges serialized compiled programs between processes participating in one distributed run.
-///
-/// Core treats keys and artifacts as opaque bytes. Backends must encode the complete compilation identity in keys,
-/// using identical bytes for matching compilations across processes. They must serialize every piece of invocation
-/// metadata and reject artifacts that are incompatible with the local runtime. Process zero is the leader that
-/// compiles and publishes, and every other process is a follower that receives.
+// TODO(eaplatanios): Review from here onwards.
+
+/// Exchanges serialized compiled programs between processes participating in a distributed job. Core treats keys and
+/// artifacts as opaque bytes. Backends must encode the complete compilation identity in keys, using identical bytes
+/// for matching compilations across processes. They must serialize every piece of invocation metadata and reject
+/// artifacts that are incompatible with the local runtime. Process zero is the leader that compiles and publishes,
+/// and every other process is a follower that receives.
 pub trait CompilationArtifactExchange: Send + Sync {
     /// Returns the zero-based index of this process.
     fn process_index(&self) -> usize;
@@ -41,16 +29,16 @@ pub trait CompilationArtifactExchange: Send + Sync {
     /// Returns the number of processes participating in the exchange.
     fn process_count(&self) -> usize;
 
-    /// Verifies that this process is compatible with the leader for `key`, before the leader compiles the program or a
-    /// follower waits for its artifact.
-    ///
-    /// A process calls this function only for compilations that miss its in-memory cache. Processes may therefore call
-    /// it for different keys and in different orders, skip a key that another process compiles, or call it again for a
-    /// key whose program they evicted. Implementations must address each round by `key` rather than by call order, and
-    /// the leader must not wait for followers. Implementations should compare `key`, the process count, and any launch
-    /// or backend compatibility identity that the transport owns. The default validates only the local process
-    /// coordinates so that simple transports remain usable.
-    fn preflight(&self, _key: &[u8], _timeout: Duration) -> Result<(), CompilationExchangeError> {
+    /// Verifies that this process is compatible with the leader for `key`, before the leader compiles the program or
+    /// a follower waits for its artifact. A process calls this function only for compilations that miss its in-memory
+    /// cache. Processes may therefore call it for different keys and in different orders, skip a key that another
+    /// process compiles, or call it again for a key whose program they evicted. Implementations must address each
+    /// round by `key` rather than by call order, and the leader must not wait for followers. Implementations should
+    /// compare `key`, the process count, and any launch or backend compatibility identity that the transport owns.
+    /// The default validates only the local process coordinates so that simple transports remain usable.
+    fn preflight(&self, key: &[u8], timeout: Duration) -> Result<(), CompilationExchangeError> {
+        let _ = key;
+        let _ = timeout;
         if self.process_count() == 0 {
             return Err(CompilationExchangeError::Incompatible {
                 message: "exchange process count must be greater than zero".to_string(),
