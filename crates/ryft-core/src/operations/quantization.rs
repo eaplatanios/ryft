@@ -2206,8 +2206,6 @@ enum GlobalScale<V> {
     Current,
 }
 
-// TODO(eaplatanios): Review from here onwards.
-
 /// Shapes and permutations that normalize the inputs of a [`BlockScaledDot`] to the rank-`3` layout
 /// `[batch, free, contracting]`, together with the rules that operate on that layout.
 struct BlockScaledDotRules<'o> {
@@ -2239,36 +2237,51 @@ struct BlockScaledDotRules<'o> {
     output_shape: Vec<usize>,
 }
 
+// TODO(eaplatanios): Review from here onwards.
+
 impl<'o> BlockScaledDotRules<'o> {
-    /// Validates the shapes of `lhs` and `rhs` against `configuration` and computes their normalization.
+    /// Creates a new [`BlockScaledDotRules`] instance by validating the shapes of `lhs` and `rhs` against
+    /// `configuration` and computing their normalization.
     fn new<V: Value<Type = ArrayType>>(
         configuration: &'o BlockScaledDotConfiguration,
         lhs: &V,
         rhs: &V,
     ) -> Result<Self, ProgramError> {
+        // The quantization recipes require real floating-point inputs. Reject other element types before selecting
+        // the computation type or inferring the contraction shape.
         let lhs_type = lhs.r#type();
         let rhs_type = rhs.r#type();
         for (name, r#type) in [("left", &lhs_type), ("right", &rhs_type)] {
             if !r#type.data_type().is_floating_point() || !r#type.data_type().is_real() {
                 return Err(TypeError::invalid(format!(
-                    "`{BLOCK_SCALED_DOT_NAME}` {name} input must have a real floating-point element type but got `{}`",
+                    "`{}` {} input must have a real floating-point element type but got `{}`",
+                    BLOCK_SCALED_DOT_NAME,
+                    name,
                     r#type.data_type(),
                 ))
                 .into());
             }
         }
+
+        // Normalization and block validation use concrete extents to merge dimensions and size the blocks,
+        // so both input shapes must be static.
         let (Some(lhs_shape), Some(rhs_shape)) = (lhs_type.static_shape(), rhs_type.static_shape()) else {
             return Err(TypeError::invalid(format!("`{BLOCK_SCALED_DOT_NAME}` inputs must have static shapes")).into());
         };
         let lhs_shape = lhs_shape.dimensions().to_vec();
         let rhs_shape = rhs_shape.dimensions().to_vec();
+
+        // Use `f64` if either input is `f64`, and `f32` otherwise. This common type governs quantization and
+        // intermediate arithmetic independently of the configured output type.
         let computation_type = if lhs_type.data_type() == DataType::F64 || rhs_type.data_type() == DataType::F64 {
             DataType::F64
         } else {
             DataType::F32
         };
 
-        // Dot type inference validates the dimension numbers and extents at the common computation type.
+        // Dot type inference validates the dimension lists and paired extents at the common computation type and
+        // determines the output shape in batching, left-hand side free, and right-hand side free dimension order.
+        // Both inputs have static shapes, so the inferred output shape is also static.
         let dimensions = &configuration.dimensions;
         let output_type = infer_dot_output_type(
             BLOCK_SCALED_DOT_NAME,
@@ -2279,25 +2292,50 @@ impl<'o> BlockScaledDotRules<'o> {
             None,
         )?;
         let output_shape = output_type.static_shape().unwrap().dimensions().to_vec();
-        let free_axes = |rank: usize, batching: &[usize], contracting: &[usize]| {
-            (0..rank).filter(|axis| !batching.contains(axis) && !contracting.contains(axis)).collect::<Vec<_>>()
-        };
-        let lhs_free_axes =
-            free_axes(lhs_shape.len(), dimensions.lhs_batching_dimensions(), dimensions.lhs_contracting_dimensions());
-        let rhs_free_axes =
-            free_axes(rhs_shape.len(), dimensions.rhs_batching_dimensions(), dimensions.rhs_contracting_dimensions());
-        let permutation = |batching: &[usize], free: &[usize], contracting: &[usize]| {
-            batching.iter().chain(free).chain(contracting).copied().collect::<Vec<_>>()
-        };
-        let lhs_permutation =
-            permutation(dimensions.lhs_batching_dimensions(), &lhs_free_axes, dimensions.lhs_contracting_dimensions());
-        let rhs_permutation =
-            permutation(dimensions.rhs_batching_dimensions(), &rhs_free_axes, dimensions.rhs_contracting_dimensions());
+
+        // Free dimensions are neither batched nor contracted. Keep their original input order so that the merged
+        // free dimension agrees with the corresponding dimensions of the dot output.
+        let lhs_free_axes = (0..lhs_shape.len())
+            .filter(|axis| {
+                !dimensions.lhs_batching_dimensions().contains(axis)
+                    && !dimensions.lhs_contracting_dimensions().contains(axis)
+            })
+            .collect::<Vec<_>>();
+        let rhs_free_axes = (0..rhs_shape.len())
+            .filter(|axis| {
+                !dimensions.rhs_batching_dimensions().contains(axis)
+                    && !dimensions.rhs_contracting_dimensions().contains(axis)
+            })
+            .collect::<Vec<_>>();
+
+        // Build permutations that group each input's batching, free, and contracting dimensions before merging them.
+        // Preserve the listed batching and contracting orders so that dimensions on both sides remain paired.
+        let lhs_permutation = dimensions
+            .lhs_batching_dimensions()
+            .iter()
+            .chain(&lhs_free_axes)
+            .chain(dimensions.lhs_contracting_dimensions())
+            .copied()
+            .collect::<Vec<_>>();
+        let rhs_permutation = dimensions
+            .rhs_batching_dimensions()
+            .iter()
+            .chain(&rhs_free_axes)
+            .chain(dimensions.rhs_contracting_dimensions())
+            .copied()
+            .collect::<Vec<_>>();
+
+        // Multiply the extents in each group to obtain the rank-`3` shapes. Dot validation has already checked that
+        // paired batching and contracting extents match, so either input determines their shared products. Empty
+        // groups have product 1 and become singleton dimensions in the normalized layout.
         let product = |shape: &[usize], axes: &[usize]| axes.iter().map(|&axis| shape[axis]).product::<usize>();
         let batch = product(&lhs_shape, dimensions.lhs_batching_dimensions());
         let contracting = product(&lhs_shape, dimensions.lhs_contracting_dimensions());
         let lhs_free = product(&lhs_shape, &lhs_free_axes);
         let rhs_free = product(&rhs_shape, &rhs_free_axes);
+
+        // Retain the original shapes and output shape alongside the canonical shapes so that the forward and
+        // backward rules can restore the public layouts after their contractions.
         let rules = Self {
             configuration,
             computation_type,
@@ -2309,6 +2347,9 @@ impl<'o> BlockScaledDotRules<'o> {
             rhs_canonical_shape: [batch, rhs_free, contracting],
             output_shape,
         };
+
+        // Check the extents blocked by the forward rule here. Backward contractions can block different dimensions,
+        // which are validated only when the backward rule is used.
         rules.validate_extents(false)?;
         Ok(rules)
     }
