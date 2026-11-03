@@ -1523,6 +1523,84 @@ where
     }
 }
 
+/// Validates both representations and infers the contraction output before any operations are staged.
+fn validate_scaled_dot_inputs<P: Parameter>(
+    lhs: &BlockQuantizedValue<P>,
+    rhs: &BlockQuantizedValue<P>,
+    dimensions: Option<&DotDimensionNumbers>,
+    accumulation_type: Option<DataType>,
+) -> Result<ArrayType, ProgramError>
+where
+    P: Typed<Type: ArrayMemberType>,
+{
+    for (name, global_scale) in [("left", &lhs.global_scale), ("right", &rhs.global_scale)] {
+        if let Some(global_scale) = global_scale {
+            let r#type = global_scale.r#type();
+            let r#type = r#type.as_array_type()?;
+            if r#type.rank() != 0 || !r#type.data_type().is_floating_point() || !r#type.data_type().is_real() {
+                return Err(TypeError::invalid(format!(
+                    "`{SCALED_DOT_OPERATION_NAME}` {name} global scale must be a rank-0 real floating-point array \
+                     but got `{type}`",
+                ))
+                .into());
+            }
+        }
+    }
+
+    let input_types = [&lhs.elements, &rhs.elements, &lhs.scales, &rhs.scales]
+        .into_iter()
+        .map(|value| Ok(value.r#type().as_array_type()?.clone()))
+        .collect::<Result<Vec<_>, TypeError>>()?;
+
+    // Model the raw capability's variation alignment on descriptors only. The actual value transitions are
+    // still staged by that capability, preserving their transpose and cross-device cotangent sums.
+    let input_types = vary_over_missing_manual_axes(
+        input_types.clone(),
+        &input_types,
+        &manual_variation_axes(&input_types),
+        |input, axis, mesh| {
+            let input = match input.sharding() {
+                Some(sharding) if sharding.mesh() != mesh => {
+                    return Err(TypeError::invalid(format!(
+                        "`{SCALED_DOT_OPERATION_NAME}` input mesh does not match the mesh of manual axis `{axis}`",
+                    ))
+                    .into());
+                }
+                Some(_) => input,
+                None => {
+                    let rank = input.rank();
+                    input.with_sharding(Sharding::replicated(mesh.clone(), rank)).map_err(TypeError::from)?
+                }
+            };
+            Ok(ParallelVaryOperation::new(axis.to_string()).infer_output_types(&[input], &[])?.remove(0))
+        },
+    )?;
+
+    let dimensions = match dimensions {
+        Some(dimensions) => dimensions.clone(),
+        None => ScaledDotOperation::default_dimensions(input_types[0].rank())?,
+    };
+
+    let operation = ScaledDotOperation::new(dimensions, accumulation_type.unwrap_or(DataType::F32), true, true);
+    Ok(operation.infer_output_types(&input_types, &[])?.remove(0))
+}
+
+/// Validates the rank-3 element and block-scale arrays required by the matrix-product frontend.
+fn validate_scaled_matmul_inputs<P: Parameter>(
+    lhs: &BlockQuantizedValue<P>,
+    rhs: &BlockQuantizedValue<P>,
+) -> Result<(), ProgramError>
+where
+    P: Typed<Type: ArrayMemberType>,
+{
+    for value in [&lhs.elements, &rhs.elements, &lhs.scales, &rhs.scales] {
+        if value.r#type().as_array_type()?.rank() != 3 {
+            return Err(TypeError::invalid("`scaled_matmul` expects rank-3 inputs").into());
+        }
+    }
+    Ok(())
+}
+
 /// Name of the composite calls that [`BlockScaledDot`] stages.
 const BLOCK_SCALED_DOT_NAME: &str = "block_scaled_dot";
 
@@ -2893,80 +2971,6 @@ impl<'o> BlockScaledDotRules<'o> {
 }
 
 // TODO(eaplatanios): Review from here onwards.
-
-/// Validates both representations and infers the contraction output before any operations are staged.
-fn validate_scaled_dot_inputs<P: Parameter>(
-    lhs: &BlockQuantizedValue<P>,
-    rhs: &BlockQuantizedValue<P>,
-    dimensions: Option<&DotDimensionNumbers>,
-    accumulation_type: Option<DataType>,
-) -> Result<ArrayType, ProgramError>
-where
-    P: Typed<Type: ArrayMemberType>,
-{
-    for (name, global_scale) in [("left", &lhs.global_scale), ("right", &rhs.global_scale)] {
-        if let Some(global_scale) = global_scale {
-            let r#type = global_scale.r#type();
-            let r#type = r#type.as_array_type()?;
-            if r#type.rank() != 0 || !r#type.data_type().is_floating_point() || !r#type.data_type().is_real() {
-                return Err(TypeError::invalid(format!(
-                    "`{SCALED_DOT_OPERATION_NAME}` {name} global scale must be a rank-0 real floating-point array \
-                     but got `{type}`",
-                ))
-                .into());
-            }
-        }
-    }
-    let input_types = [&lhs.elements, &rhs.elements, &lhs.scales, &rhs.scales]
-        .into_iter()
-        .map(|value| Ok(value.r#type().as_array_type()?.clone()))
-        .collect::<Result<Vec<_>, TypeError>>()?;
-    // Model the raw capability's variation alignment on descriptors only. The actual value transitions are
-    // still staged by that capability, preserving their transpose and cross-device cotangent sums.
-    let input_types = vary_over_missing_manual_axes(
-        input_types.clone(),
-        &input_types,
-        &manual_variation_axes(&input_types),
-        |input, axis, mesh| {
-            let input = match input.sharding() {
-                Some(sharding) if sharding.mesh() != mesh => {
-                    return Err(TypeError::invalid(format!(
-                        "`{SCALED_DOT_OPERATION_NAME}` input mesh does not match the mesh of manual axis `{axis}`",
-                    ))
-                    .into());
-                }
-                Some(_) => input,
-                None => {
-                    let rank = input.rank();
-                    input.with_sharding(Sharding::replicated(mesh.clone(), rank)).map_err(TypeError::from)?
-                }
-            };
-            Ok(ParallelVaryOperation::new(axis.to_string()).infer_output_types(&[input], &[])?.remove(0))
-        },
-    )?;
-    let dimensions = match dimensions {
-        Some(dimensions) => dimensions.clone(),
-        None => ScaledDotOperation::default_dimensions(input_types[0].rank())?,
-    };
-    let operation = ScaledDotOperation::new(dimensions, accumulation_type.unwrap_or(DataType::F32), true, true);
-    Ok(operation.infer_output_types(&input_types, &[])?.remove(0))
-}
-
-/// Validates the rank-3 element and block-scale arrays required by the matrix-product frontend.
-fn validate_scaled_matmul_inputs<P: Parameter>(
-    lhs: &BlockQuantizedValue<P>,
-    rhs: &BlockQuantizedValue<P>,
-) -> Result<(), ProgramError>
-where
-    P: Typed<Type: ArrayMemberType>,
-{
-    for value in [&lhs.elements, &rhs.elements, &lhs.scales, &rhs.scales] {
-        if value.r#type().as_array_type()?.rank() != 3 {
-            return Err(TypeError::invalid("`scaled_matmul` expects rank-3 inputs").into());
-        }
-    }
-    Ok(())
-}
 
 /// Computes the stored block scales at the input precision, sharing the numerical recipe across shape universes.
 fn quantize_block_scales<V, F>(
