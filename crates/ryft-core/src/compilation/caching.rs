@@ -195,19 +195,14 @@ pub struct CompilationEvent {
     pub duration: Duration,
 }
 
-// TODO(eaplatanios): Review from here onwards.
-
 /// Snapshot of the activity of one [`CompilationContext`] across its cache lookups, artifact exchange, and backend
-/// compilation. The statistics accumulate from construction or from the latest
-/// [`CompilationContext::clear_statistics`] call and are unaffected by [`CompilationContext::clear_cache`]. Each
-/// field is read independently, so a snapshot taken during concurrent compilations need not correspond to a single
-/// point in time.
-///
-/// Every attempt of a lookup counts as exactly one of [`Self::memory_hits`], [`Self::waits`], and [`Self::misses`], and
-/// a waiter whose producer fails retries and counts again. A memory hit or wait whose program
-/// [`CompilationCacheDomain::validate_cached_program`] rejects still counts, although it fails the compilation.
-/// Durations are host durations summed over all threads, so concurrent compilations can make them exceed the elapsed
-/// wall-clock time.
+/// compilation. The statistics accumulate from construction or from the latest [`CompilationContext::clear_statistics`]
+/// call and are unaffected by [`CompilationContext::clear_cache`]. Each field is read independently, so a snapshot
+/// taken during concurrent compilations need not correspond to a single point in time. Every attempt of a lookup counts
+/// as exactly one of [`Self::memory_hits`], [`Self::waits`], and [`Self::misses`], and a waiter whose producer fails
+/// retries and counts again. A memory hit or wait whose program [`CompilationCacheDomain::validate_cached_program`]
+/// rejects still counts, although it fails the compilation. Durations are host durations summed over all threads,
+/// so concurrent compilations can make them exceed the elapsed wall-clock time.
 #[derive(Copy, Clone, Debug, Default, PartialEq, Eq)]
 pub struct CompilationCacheStatistics {
     /// Lookups served directly by the in-memory LRU cache.
@@ -356,6 +351,8 @@ impl CompilationCacheStatisticsAccumulator {
         self.compilation_nanoseconds.store(0, Ordering::Relaxed);
     }
 }
+
+// TODO(eaplatanios): Review from here onwards.
 
 /// State of one in-flight compilation that same key waiters observe.
 enum InFlightState<P> {

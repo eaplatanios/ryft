@@ -1444,6 +1444,10 @@ where
 /// Name of the composite calls that [`BlockScaledDot`] stages.
 const BLOCK_SCALED_DOT_NAME: &str = "block_scaled_dot";
 
+/// Fixed sign vector of the random Hadamard transform of the NVIDIA Transformer Engine.
+const HADAMARD_SIGNS: [f64; 16] =
+    [1.0, 1.0, 1.0, -1.0, 1.0, -1.0, -1.0, -1.0, -1.0, -1.0, -1.0, 1.0, -1.0, 1.0, -1.0, -1.0];
+
 /// Element and scale formats of one input of a block-scaled matrix product, which [`BlockScaledDotConfiguration`]
 /// assigns to the left-hand side input, the right-hand side input, and/or the gradients. The scale data type selects
 /// the [`BlockQuantize`] recipe. Formats with [`F8E4M3FN`](DataType::F8E4M3FN) scales (e.g., NVFP4) use a global scale
@@ -2159,10 +2163,6 @@ where
 }
 
 // TODO(eaplatanios): Review from here onwards.
-
-/// Fixed sign vector of the random Hadamard transform of NVIDIA Transformer Engine.
-const HADAMARD_SIGNS: [f64; 16] =
-    [1.0, 1.0, 1.0, -1.0, 1.0, -1.0, -1.0, -1.0, -1.0, -1.0, -1.0, 1.0, -1.0, 1.0, -1.0, -1.0];
 
 /// Grid parameters of a block-scaled element data type.
 #[derive(Copy, Clone, Debug, PartialEq)]
