@@ -241,7 +241,7 @@ pub enum Error {
     /// Error returned when [`to_mlir_module`](crate::operations::sharding::shard_map::to_mlir_module) lowers a traced
     /// shard map whose global input or output type varies along a mesh axis that is not one of its own manual axes.
     /// Only an enclosing manual region makes such an axis manual (e.g., for a body traced with
-    /// [`ryft_core::trace_shard_map_with_named_axes`]), and the standalone module that
+    /// [`ryft_core::trace_shard_map`] under the named axes of such a region), and the standalone module that
     /// [`to_mlir_module`](crate::operations::sharding::shard_map::to_mlir_module) produces has none, so the shard map
     /// can only be lowered as part of the program that encloses it.
     #[error(
@@ -262,10 +262,10 @@ pub enum Error {
     /// Error returned when [`to_mlir_module`](crate::operations::sharding::shard_map::to_mlir_module) lowers a traced
     /// shard map whose body applies a collective (e.g., `parallel_reduce` or `axis_index`) along a manual mesh axis
     /// that neither the shard map nor a shard map nested in its body makes manual. Only an enclosing manual region
-    /// makes such an axis manual (e.g., for a body traced with [`ryft_core::trace_shard_map_with_named_axes`]), even
-    /// when the boundary of the shard map does not vary along it (e.g., for a reduction of an invariant input), and the
-    /// standalone module that [`to_mlir_module`](crate::operations::sharding::shard_map::to_mlir_module) produces has
-    /// none.
+    /// makes such an axis manual (e.g., for a body traced with [`ryft_core::trace_shard_map`] under the named axes of
+    /// such a region), even when the boundary of the shard map does not vary along it (e.g., for a reduction of an
+    /// invariant input), and the standalone module that
+    /// [`to_mlir_module`](crate::operations::sharding::shard_map::to_mlir_module) produces has none.
     #[error(
         "`{operation_name}` in the body of a standalone `shard_map` communicates along mesh axis `{axis_name}`, which \
          is not one of its manual axes; lower it as part of the program whose manual region makes that axis manual"

@@ -940,7 +940,7 @@ mod tests {
     use crate::macros::check_gradient;
     use crate::operations::manipulation::reshaping::Reshape;
     use crate::operations::manipulation::slicing::Slice;
-    use crate::operations::sharding::shard_map::{ShardMapTracer, shard_map};
+    use crate::operations::sharding::shard_map::{ShardMapOptions, ShardMapTracer, shard_map};
     use crate::partial::{
         PartialEvaluationContext, PartialEvaluationOutput, PartialEvaluationValue, PartialTracer, PartialValue,
     };
@@ -1458,8 +1458,8 @@ mod tests {
                 .value_and_gradient(|logits, mask| {
                     let (output, selected) = shard_map(
                         |(logits, mask): (ShardMapTracer<ArrayIrContext>, ShardMapTracer<ArrayIrContext>)| {
-                            let output = logits.masked_softmax(&mask, 0).unwrap();
-                            (output.clone(), output.slice_axis(0, 0, 1, 1).unwrap())
+                            let output = logits.masked_softmax(&mask, 0)?;
+                            Ok((output.clone(), output.slice_axis(0, 0, 1, 1)?))
                         },
                         (
                             ValueProjection::<ArrayType>::into_projected(logits)?,
@@ -1468,6 +1468,7 @@ mod tests {
                         mesh.clone(),
                         input_shardings,
                         (sharded.clone(), sharded.clone()),
+                        ShardMapOptions::new(),
                     )?;
                     Ok::<_, ProgramError>((selected.reduce_sum(&[0], None)?.into_value(), output.into_value()))
                 })
@@ -1909,8 +1910,8 @@ mod tests {
                 .value_and_gradient(|logits, mask| {
                     let (output, selected) = shard_map(
                         |(logits, mask): (ShardMapTracer<ArrayIrContext>, ShardMapTracer<ArrayIrContext>)| {
-                            let output = logits.masked_log_softmax(&mask, 0).unwrap();
-                            (output.clone(), output.slice_axis(0, 0, 1, 1).unwrap())
+                            let output = logits.masked_log_softmax(&mask, 0)?;
+                            Ok((output.clone(), output.slice_axis(0, 0, 1, 1)?))
                         },
                         (
                             ValueProjection::<ArrayType>::into_projected(logits)?,
@@ -1919,6 +1920,7 @@ mod tests {
                         mesh.clone(),
                         input_shardings,
                         (sharded.clone(), sharded.clone()),
+                        ShardMapOptions::new(),
                     )?;
                     Ok::<_, ProgramError>((selected.reduce_sum(&[0], None)?.into_value(), output.into_value()))
                 })
@@ -2411,7 +2413,7 @@ mod tests {
                         ShardMapTracer<ArrayIrTracingContext>,
                         ShardMapTracer<ArrayIrTracingContext>,
                         ShardMapTracer<ArrayIrTracingContext>,
-                    )| logits.masked_softmax_cross_entropy(&targets, &mask, 1).unwrap(),
+                    )| logits.masked_softmax_cross_entropy(&targets, &mask, 1),
                     (
                         ValueProjection::<ArrayType>::into_projected(logits)?,
                         ValueProjection::<ArrayType>::into_projected(targets)?,
@@ -2420,6 +2422,7 @@ mod tests {
                     mesh,
                     (replicated.clone(), replicated, sharded_mask),
                     sharded_loss.clone(),
+                    ShardMapOptions::new(),
                 )?;
                 Ok::<_, ProgramError>((loss.reduce_sum(&[0], None)?.into_value(), loss.into_value()))
             })
@@ -2914,7 +2917,7 @@ mod tests {
                     |(logits, labels): (
                         ShardMapTracer<ArrayIrTracingContext>,
                         ShardMapTracer<ArrayIrTracingContext>,
-                    )| logits.softmax_cross_entropy_with_integer_labels(&labels, 1).unwrap(),
+                    )| logits.softmax_cross_entropy_with_integer_labels(&labels, 1),
                     (
                         ValueProjection::<ArrayType>::into_projected(logits)?,
                         ValueProjection::<ArrayType>::into_projected(labels)?,
@@ -2922,6 +2925,7 @@ mod tests {
                     mesh,
                     (sharded_rows, replicated),
                     sharded.clone(),
+                    ShardMapOptions::new(),
                 )?;
                 Ok::<_, ProgramError>((loss.reduce_sum(&[0], None)?.into_value(), loss.into_value()))
             })
@@ -3811,7 +3815,7 @@ mod tests {
             .value_and_gradient(|student, teacher| {
                 let loss = shard_map(
                     |(student, teacher): (ShardMapTracer<ArrayIrContext>, ShardMapTracer<ArrayIrContext>)| {
-                        function.call(student, teacher).unwrap()
+                        function.call(student, teacher)
                     },
                     (
                         ValueProjection::<ArrayType>::into_projected(student)?,
@@ -3820,6 +3824,7 @@ mod tests {
                     mesh.clone(),
                     (sharded_rows.clone(), replicated.clone()),
                     sharded.clone(),
+                    ShardMapOptions::new(),
                 )?;
                 Ok::<_, ProgramError>((loss.reduce_sum(&[0], None)?.into_value(), loss.into_value()))
             })

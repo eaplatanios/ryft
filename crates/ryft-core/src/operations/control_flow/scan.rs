@@ -15457,7 +15457,7 @@ mod tests {
         let stack_sharding =
             Sharding::new(mesh.clone(), vec![ShardingDimension::replicated(), ShardingDimension::sharded(["devices"])])
                 .unwrap();
-        let shard_map = ShardMapBoundary::new(
+        let boundary = ShardMapBoundary::new(
             mesh.clone(),
             vec![replicated.clone(), stack_sharding.clone()],
             vec![replicated, stack_sharding],
@@ -15466,8 +15466,8 @@ mod tests {
         .unwrap();
         let global_carry_type = ArrayType::new_static(DataType::F32, [2]);
         let global_stack_type = ArrayType::new_static(DataType::F32, [3, 4]);
-        let local_carry_type = shard_map.local_input_type(0, &global_carry_type).unwrap();
-        let local_stack_type = shard_map.local_input_type(1, &global_stack_type).unwrap();
+        let local_carry_type = boundary.local_input_type(0, &global_carry_type).unwrap();
+        let local_stack_type = boundary.local_input_type(1, &global_stack_type).unwrap();
         let mut body = ProgramBuilder::<TestIrValue, TestIrOperation>::new();
         body.add_input(ArrayType::scalar(DataType::I64).into());
         let carry = body.add_input(local_carry_type.clone().into());
@@ -15519,7 +15519,7 @@ mod tests {
             .to_vec();
         let map_body: TestIrProgram = map_body.build(outputs, vec![Placeholder; 2], vec![Placeholder; 2]).unwrap();
         let global_input_types = vec![ArrayIrType::from(global_carry_type), ArrayIrType::from(global_stack_type)];
-        let operation = ShardMapOperation::from_program(&map_body, global_input_types.clone(), shard_map).unwrap();
+        let operation = ShardMapOperation::from_program(&map_body, global_input_types.clone(), boundary).unwrap();
         let mut builder = ProgramBuilder::<TestIrValue, TestIrOperation>::new();
         let map_body = builder.import_program(map_body);
         let inputs = global_input_types.iter().map(|r#type| builder.add_input(r#type.clone())).collect::<Vec<_>>();
@@ -23073,13 +23073,13 @@ mod tests {
         let map_body: TestIrProgram = builder.build(Vec::new(), vec![Placeholder; 2], Vec::new()).unwrap();
         let mesh = LogicalMesh::new(vec![MeshAxis::new("x", 2, MeshAxisType::Manual).unwrap()]).unwrap();
         let replicated = Sharding::replicated(mesh.clone(), 0);
-        let shard_map =
+        let boundary =
             ShardMapBoundary::new(mesh, vec![replicated.clone(), replicated], Vec::new(), Vec::new()).unwrap();
         let input_types = vec![ArrayIrType::from(scalar_type.clone()); 2];
         let mut builder = ProgramBuilder::<TestIrValue, TestIrOperation>::new();
         let map_body = builder.import_program(map_body);
         let inputs = input_types.iter().map(|r#type| builder.add_input(r#type.clone())).collect::<Vec<_>>();
-        let operation = ShardMapOperation::from_boundary(shard_map, input_types, Vec::<ArrayIrType>::new());
+        let operation = ShardMapOperation::from_boundary(boundary, input_types, Vec::<ArrayIrType>::new());
         builder.add_instruction(operation, vec![map_body], inputs, None).unwrap();
         let mapped: TestIrProgram = builder.build(Vec::new(), vec![Placeholder; 2], Vec::new()).unwrap();
 

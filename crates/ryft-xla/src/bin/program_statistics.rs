@@ -14,8 +14,8 @@ use serde::Serialize;
 use ryft_core::{
     Array, ArrayOperation, ArrayType, Context, DataType, Differentiate, DifferentiationError, Dimension, Dot,
     DotDimensionNumbers, EagerContext, ForwardModeDifferentiate, LogicalMesh, MeshAxis, MeshAxisType, Program,
-    ProgramError, ProgramStatistics, ReverseModeDifferentiate, Shape, Sharding, ShardingDimension, Sin, shard_map,
-    shard_map_with_options,
+    ProgramError, ProgramStatistics, ReverseModeDifferentiate, Shape, ShardMapOptions, Sharding, ShardingDimension,
+    Sin, shard_map,
 };
 use ryft_xla::Error;
 use ryft_xla::experimental::{TracedXlaProgram, XlaArrayTracer, trace};
@@ -280,13 +280,12 @@ fn emit_shard_map_basic() -> Result<ProgramStatistics, Error> {
             let mesh = mesh.clone();
             move |x| {
                 shard_map(
-                    |local_x: XlaArrayTracer| {
-                        local_x.sin().unwrap_or_else(|error| panic!("basic shard_map case should trace sine: {error}"))
-                    },
+                    |local_x: XlaArrayTracer| local_x.sin(),
                     x,
                     mesh.clone(),
                     sharding.clone(),
                     sharding.clone(),
+                    ShardMapOptions::new(),
                 )
                 .unwrap_or_else(|error| panic!("basic shard_map case should trace: {error}"))
             }
@@ -308,13 +307,12 @@ fn emit_shard_map_matmul() -> Result<ProgramStatistics, Error> {
             let mesh = mesh.clone();
             move |inputs| {
                 shard_map(
-                    |(lhs, rhs): (XlaArrayTracer, XlaArrayTracer)| {
-                        lhs.dot(&rhs, &DotDimensionNumbers::matmul()).unwrap()
-                    },
+                    |(lhs, rhs): (XlaArrayTracer, XlaArrayTracer)| lhs.dot(&rhs, &DotDimensionNumbers::matmul()),
                     inputs,
                     mesh.clone(),
                     (lhs_sharding.clone(), rhs_sharding.clone()),
                     output_sharding.clone(),
+                    ShardMapOptions::new(),
                 )
                 .unwrap_or_else(|error| panic!("matmul shard_map case should trace: {error}"))
             }
@@ -338,28 +336,26 @@ fn emit_nested_shard_map() -> Result<ProgramStatistics, Error> {
         {
             let mesh = mesh.clone();
             move |x| {
-                shard_map_with_options(
+                shard_map(
                     {
                         let mesh = mesh.clone();
                         move |outer_x: XlaArrayTracer| {
                             let nested = shard_map(
-                                |inner_x: XlaArrayTracer| inner_x.clone() + inner_x,
+                                |inner_x: XlaArrayTracer| Ok(inner_x.clone() + inner_x),
                                 outer_x.clone(),
                                 mesh.clone(),
                                 inner_sharding.clone(),
                                 inner_sharding.clone(),
-                            )
-                            .unwrap_or_else(|error| {
-                                panic!("nested shard_map case should trace the inner shard_map: {error}")
-                            });
-                            nested + outer_x
+                                ShardMapOptions::new(),
+                            )?;
+                            Ok(nested + outer_x)
                         }
                     },
                     x,
                     mesh.clone(),
                     outer_sharding.clone(),
                     outer_sharding.clone(),
-                    vec!["x".to_string()],
+                    ShardMapOptions::new().with_manual_axes(["x"]),
                 )
                 .unwrap_or_else(|error| panic!("nested shard_map case should trace the outer shard_map: {error}"))
             }

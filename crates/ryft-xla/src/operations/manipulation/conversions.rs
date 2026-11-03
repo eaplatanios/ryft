@@ -1568,7 +1568,7 @@ mod tests {
     fn test_lower_checked_cast_in_shard_map() {
         use ryft_core::{
             Cast, ConvertElementType, DimensionFromScalar, DimensionToScalar, LogicalMesh, MeshAxis, MeshAxisType,
-            Sharding, TracedShardMap, ValueProjection, trace_shard_map,
+            ShardMapOptions, Sharding, TracedShardMap, ValueProjection, trace_shard_map,
         };
 
         use crate::XlaDomain;
@@ -1580,17 +1580,19 @@ mod tests {
         let scalar = ArrayType::scalar(DataType::F64);
         let extent = DimensionType::new("extent", DimensionBounds::positive(Some(8)).unwrap());
         let traced: TracedShardMap<XlaDomain<'static>, ArrayType, ArrayType> = trace_shard_map(
-            |input| {
-                let integer = input.convert_element_type(DataType::I64).unwrap();
-                let dimension = integer.to_dimension(extent.to_variable()).unwrap();
-                let checked = dimension.cast(DimensionType::from(Dimension::Static(2)).into(), &[]).unwrap();
-                let scalar = checked.to_scalar().unwrap().convert_element_type(DataType::F64).unwrap();
-                scalar.into_projected().unwrap()
+            |_, input| {
+                let integer = input.convert_element_type(DataType::I64)?;
+                let dimension = integer.to_dimension(extent.to_variable())?;
+                let checked = dimension.cast(DimensionType::from(Dimension::Static(2)).into(), &[])?;
+                let scalar = checked.to_scalar()?.convert_element_type(DataType::F64)?;
+                Ok(scalar.into_projected()?)
             },
             scalar.clone(),
             mesh,
             sharding.clone(),
             sharding,
+            ShardMapOptions::new(),
+            &[],
         )
         .unwrap();
         let mut builder = ArrayIrXlaProgramBuilder::new();
@@ -3357,7 +3359,8 @@ mod tests {
     #[test]
     fn test_lower_cast_explicit_sharding_multiple_devices() {
         use ryft_core::{
-            Cast, LogicalMesh, MeshAxis, Sharding, ShardingDimension, TracedShardMap, Typed, trace_shard_map,
+            Cast, LogicalMesh, MeshAxis, ShardMapOptions, Sharding, ShardingDimension, TracedShardMap, Typed,
+            trace_shard_map,
         };
 
         use crate::XlaDomain;
@@ -3426,16 +3429,18 @@ mod tests {
         let in_sharding = Sharding::new(mesh.clone(), vec![ShardingDimension::sharded(["x", "z"])]).unwrap();
         let out_sharding = Sharding::new(mesh.clone(), vec![ShardingDimension::sharded(["x"])]).unwrap();
         let traced: TracedShardMap<XlaDomain<'static>, ArrayType, ArrayType> = trace_shard_map(
-            |input| {
+            |_, input| {
                 let local_type = input.r#type().into_owned();
                 let replicated =
                     local_type.sharding().unwrap().with_dimensions(vec![ShardingDimension::replicated()]).unwrap();
-                input.cast(local_type.with_sharding(replicated).unwrap(), &[]).unwrap()
+                input.cast(local_type.with_sharding(replicated).unwrap(), &[])
             },
             ArrayType::new_static(DataType::F64, [8]),
             mesh,
             in_sharding,
             out_sharding,
+            ShardMapOptions::new(),
+            &[],
         )
         .unwrap();
         let module = to_mlir_module_for_shard_map(&traced, "main").unwrap();
@@ -3571,7 +3576,8 @@ mod tests {
     #[test]
     fn test_lower_cast_rejects_bound_manual_output_placement() {
         use ryft_core::{
-            Cast, LogicalMesh, MeshAxis, Sharding, ShardingDimension, TracedShardMap, Typed, trace_shard_map,
+            Cast, LogicalMesh, MeshAxis, ShardMapOptions, Sharding, ShardingDimension, TracedShardMap, Typed,
+            trace_shard_map,
         };
 
         use crate::XlaDomain;
@@ -3584,7 +3590,7 @@ mod tests {
         let explicit_mesh = LogicalMesh::new(vec![MeshAxis::new("x", 2, MeshAxisType::Explicit).unwrap()]).unwrap();
         let replicated = Sharding::replicated(mesh.clone(), 1);
         let traced: TracedShardMap<XlaDomain<'static>, ArrayType, ArrayType> = trace_shard_map(
-            |input| {
+            |_, input| {
                 let local_type = input.r#type().into_owned();
                 let explicit_type = local_type
                     .clone()
@@ -3592,12 +3598,14 @@ mod tests {
                         Sharding::new(explicit_mesh.clone(), vec![ShardingDimension::sharded(["x"])]).unwrap(),
                     )
                     .unwrap();
-                input.cast(explicit_type, &[]).unwrap().cast(local_type, &[]).unwrap()
+                input.cast(explicit_type, &[])?.cast(local_type, &[])
             },
             ArrayType::new_static(DataType::F64, [4]),
             mesh,
             replicated.clone(),
             replicated,
+            ShardMapOptions::new(),
+            &[],
         )
         .unwrap();
         assert!(matches!(

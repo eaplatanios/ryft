@@ -1132,7 +1132,7 @@ pub(crate) fn select_kernels(
             }
             let mut child_axes = bound_axes.clone();
             if let XlaOperation::ShardMap(operation) = instruction.operation() {
-                let map = operation.shard_map();
+                let map = operation.boundary();
                 child_axes.extend(map.manual_axes().iter().map(|name| {
                     let index = map.mesh().axis_index(name).unwrap();
                     (name.clone(), map.mesh().axes()[index].clone())

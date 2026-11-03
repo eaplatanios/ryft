@@ -291,8 +291,8 @@ mod tests {
         BatchingContext, ConstantOperation, Context, DataType, DimensionBounds, DimensionFromScalarOperation,
         DimensionOperation, DimensionType, DimensionValue, DimensionVariable, DynamicReshapeOperation, EffectClass,
         EffectClasses, EmptyRegionDriver, LogicalMesh, MeshAxis, MeshAxisType, Operation, Placeholder,
-        ProgramBatchingOutputAxesPolicy, ProgramError, Reshape, Shape, Sharding, ShardingDimension, StagingContext,
-        TracedShardMap, TracingContext, TransposeOperation, Typed, TypedProgram, trace_shard_map,
+        ProgramBatchingOutputAxesPolicy, ProgramError, Reshape, Shape, ShardMapOptions, Sharding, ShardingDimension,
+        StagingContext, TracedShardMap, TracingContext, TransposeOperation, Typed, TypedProgram, trace_shard_map,
     };
     use ryft_mlir::Location;
     use ryft_pjrt::{BufferType, ExecutionDeviceInputs, ExecutionInput, Program as PjrtProgram};
@@ -1302,14 +1302,15 @@ mod tests {
         .unwrap();
 
         let traced: TracedShardMap<XlaDomain<'static>, ArrayType, ArrayType> = trace_shard_map(
-            |x: XlaArrayTracer| {
+            |_, x: XlaArrayTracer| {
                 x.reshape(Shape::new(vec![Dimension::Static(1), Dimension::Static(2), Dimension::Static(1)]))
-                    .unwrap()
             },
             global_input_type,
             mesh.clone(),
             input_sharding.clone(),
             output_sharding.clone(),
+            ShardMapOptions::new(),
+            &[],
         )
         .unwrap();
 
@@ -1347,11 +1348,13 @@ mod tests {
                 .unwrap();
 
         let traced: TracedShardMap<XlaDomain<'static>, ArrayType, ArrayType> = trace_shard_map(
-            |x: XlaArrayTracer| x.reshape(Shape::new(vec![Dimension::Static(2), Dimension::Static(6)])).unwrap(),
+            |_, x: XlaArrayTracer| x.reshape(Shape::new(vec![Dimension::Static(2), Dimension::Static(6)])),
             global_input_type,
             mesh.clone(),
             input_sharding.clone(),
             output_sharding.clone(),
+            ShardMapOptions::new(),
+            &[],
         )
         .unwrap();
 
@@ -1387,14 +1390,15 @@ mod tests {
         .unwrap();
 
         let traced: TracedShardMap<XlaDomain<'static>, ArrayType, ArrayType> = trace_shard_map(
-            |x: XlaArrayTracer| {
+            |_, x: XlaArrayTracer| {
                 x.reshape(Shape::new(vec![Dimension::Static(2), Dimension::Static(2), Dimension::Static(3)]))
-                    .unwrap()
             },
             global_input_type,
             mesh.clone(),
             input_sharding.clone(),
             output_sharding.clone(),
+            ShardMapOptions::new(),
+            &[],
         )
         .unwrap();
 

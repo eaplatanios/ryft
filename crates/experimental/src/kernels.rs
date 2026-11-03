@@ -1536,7 +1536,7 @@ mod cutile {
 
     #[test]
     fn test_shard_map_on_cuda() {
-        use ryft_core::{ProjectedValue, Sharding, ShardingDimension, Typed, shard_map};
+        use ryft_core::{ProjectedValue, ShardMapOptions, Sharding, ShardingDimension, Typed, shard_map};
         use ryft_xla::experimental::XlaArrayTracer;
         use ryft_xla::{CompiledXlaFunction, XlaCompileTracer, XlaOptions, compile_with_options};
 
@@ -1589,14 +1589,14 @@ mod cutile {
                                 )
                                 .unwrap();
                                 let value = local.into_value();
-                                let output =
-                                    stage_kernel(value.context(), &definition, &[value.clone()]).unwrap().remove(0);
-                                ProjectedValue::new(output, local_type)
+                                let output = stage_kernel(value.context(), &definition, &[value.clone()])?.remove(0);
+                                Ok(ProjectedValue::new(output, local_type))
                             },
                             input,
                             logical_mesh.clone(),
                             sharding.clone(),
                             sharding.clone(),
+                            ShardMapOptions::new(),
                         )
                         .unwrap()
                     },

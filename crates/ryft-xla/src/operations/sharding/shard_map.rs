@@ -51,7 +51,7 @@ use crate::{Error, LowerableOperation, LowerableOperationFamily, ToMlir, XlaDoma
 /// computation already made manual, and a
 /// [`ShardMapError::SpecificationNamesEnclosingManualAxis`] when an input or output sharding of a nested shard map
 /// names such an axis. A traced shard map whose global input or output type varies along a mesh axis that is not one
-/// of its own manual axes (e.g., one traced with [`ryft_core::trace_shard_map_with_named_axes`] inside an enclosing
+/// of its own manual axes (e.g., one traced with [`ryft_core::trace_shard_map`] for the named axes of an enclosing
 /// manual region) is rejected with [`Error::StandaloneShardMapVariesAlongEnclosingManualAxis`], because the
 /// standalone module has no enclosing manual region that makes such an axis manual. For the same reason, a body that
 /// applies a collective (including `axis_index`) along such an axis is rejected with
@@ -63,7 +63,7 @@ pub fn to_mlir_module<Input: Parameterized<ArrayType>, Output: Parameterized<Arr
     function_name: S,
 ) -> Result<String, Error> {
     let program = traced_shard_map.body();
-    let shard_map = traced_shard_map.operation().shard_map();
+    let boundary = traced_shard_map.operation().boundary();
     // The boundary of a standalone module is global, so it cannot carry the variation of enclosing manual regions.
     for (value_kind, types) in [
         ("input", traced_shard_map.global_input_types().parameters().collect::<Vec<_>>()),
@@ -71,7 +71,7 @@ pub fn to_mlir_module<Input: Parameterized<ArrayType>, Output: Parameterized<Arr
     ] {
         for (value_index, r#type) in types.into_iter().enumerate() {
             let axis_name = r#type.sharding().and_then(|sharding| {
-                sharding.varying_manual_axes().iter().find(|axis| !shard_map.manual_axes().contains(*axis))
+                sharding.varying_manual_axes().iter().find(|axis| !boundary.manual_axes().contains(*axis))
             });
             if let Some(axis_name) = axis_name {
                 return Err(Error::StandaloneShardMapVariesAlongEnclosingManualAxis {
@@ -87,8 +87,8 @@ pub fn to_mlir_module<Input: Parameterized<ArrayType>, Output: Parameterized<Arr
     if let Some((operation_name, axis_name)) = find_collective_along_enclosing_manual_axis(
         program,
         program.entry_region_ref().id(),
-        shard_map.mesh(),
-        shard_map.manual_axes(),
+        boundary.mesh(),
+        boundary.manual_axes(),
     ) {
         return Err(Error::StandaloneShardMapCommunicatesAlongEnclosingManualAxis { operation_name, axis_name });
     }
@@ -101,7 +101,7 @@ pub fn to_mlir_module<Input: Parameterized<ArrayType>, Output: Parameterized<Arr
         return Err(Error::UnresolvedState { construct: "program".to_string() });
     }
     lower_shard_map_module(
-        shard_map,
+        boundary,
         program,
         traced_shard_map.global_input_types().parameters().cloned().collect(),
         traced_shard_map.local_input_types().parameters().cloned().collect(),
@@ -157,7 +157,7 @@ fn find_collective_along_enclosing_manual_axis(
         }
         let nested_manual_axes = match operation {
             XlaOperation::ShardMap(nested) => {
-                Cow::Owned(manual_axes.iter().chain(nested.shard_map().manual_axes()).cloned().collect::<Vec<_>>())
+                Cow::Owned(manual_axes.iter().chain(nested.boundary().manual_axes()).cloned().collect::<Vec<_>>())
             }
             _ => Cow::Borrowed(manual_axes),
         };
@@ -174,7 +174,7 @@ fn find_collective_along_enclosing_manual_axis(
 /// Lowers the shard-map `program` over its flat boundary types to a textual StableHLO/Shardy MLIR module (refer to
 /// [`to_mlir_module`]).
 fn lower_shard_map_module(
-    shard_map: &ShardMapBoundary,
+    boundary: &ShardMapBoundary,
     program: &FlatXlaProgram,
     global_input_types: Vec<ArrayType>,
     local_input_types: Vec<ArrayType>,
@@ -195,16 +195,16 @@ fn lower_shard_map_module(
         .iter()
         .map(|array_type| lower_tensor_type(array_type, &context, location))
         .collect::<Result<Vec<_>, _>>()?;
-    let mesh_operation = shard_map.mesh().to_mlir(location)?;
+    let mesh_operation = boundary.mesh().to_mlir(location)?;
     module.body()?.append_operation(mesh_operation)?;
 
-    // The global boundary types of a traced shard map carry no memory kind (refer to `ShardMapBoundary::global_input_type` and
-    // to the global output type derivation of `ShardMapOperation::from_program`), so the function signature carries
-    // the boundary shardings and any requested physical layouts.
+    // The global boundary types of a traced shard map carry no memory kind (refer to the global input and output type
+    // derivations of `ShardMapBoundary::global_input_type` and `ShardMapOperation::from_program`), so the function
+    // signature carries the boundary shardings and any requested physical layouts.
     let function_arguments = global_input_tensor_types
         .iter()
         .zip(&global_input_types)
-        .zip(shard_map.in_shardings().iter())
+        .zip(boundary.in_shardings().iter())
         .map(|((tensor_type, array_type), sharding)| {
             let sharding = sharding.to_mlir(location)?;
             let mut attributes = HashMap::from([("sdy.sharding".into(), sharding.as_ref())]);
@@ -217,7 +217,7 @@ fn lower_shard_map_module(
     let function_results = global_output_tensor_types
         .iter()
         .zip(&global_output_types)
-        .zip(shard_map.out_shardings().iter())
+        .zip(boundary.out_shardings().iter())
         .map(|((tensor_type, array_type), sharding)| {
             let sharding = sharding.to_mlir(location)?;
             let mut attributes = HashMap::from([("sdy.sharding".into(), sharding.as_ref())]);
@@ -245,7 +245,7 @@ fn lower_shard_map_module(
         let manual_results = lower_manual_computation(
             &mut function_block_ref,
             outer_inputs.as_slice(),
-            shard_map,
+            boundary,
             program,
             local_input_types.as_slice(),
             global_output_types.as_slice(),
@@ -281,7 +281,7 @@ fn lower_shard_map_module(
 pub(crate) fn lower_manual_computation<'b, 'c: 'b, 't: 'c, ProgramInput, ProgramOutput, O: LowerableOperationFamily>(
     block: &mut BlockRef<'b, 'c, 't>,
     outer_inputs: &[ValueRef<'b, 'c, 't>],
-    shard_map: &ShardMapBoundary,
+    boundary: &ShardMapBoundary,
     program: &XlaProgram<ProgramInput, ProgramOutput, O>,
     local_input_types: &[ArrayType],
     global_output_types: &[ArrayType],
@@ -299,13 +299,13 @@ where
     // vary along such an axis, but a checked or transformed program can still nest a map over invariant inputs this
     // way, so it is rejected here instead of emitting an invalid manual computation.
     if let Some(axis_name) =
-        shard_map.manual_axes().iter().find(|axis| collective_state.bound_manual_axes.contains(*axis))
+        boundary.manual_axes().iter().find(|axis| collective_state.bound_manual_axes.contains(*axis))
     {
         return Err(ProgramError::from(ShardMapError::AxisAlreadyManual { axis_name: axis_name.clone() }).into());
     }
     // For the same reason, an input or output sharding must not name such an axis (the closure entry points reject
     // these specifications too), so it is rejected here rather than silently dropped from the Shardy shardings.
-    for (value_kind, shardings) in [("input", shard_map.in_shardings()), ("output", shard_map.out_shardings())] {
+    for (value_kind, shardings) in [("input", boundary.in_shardings()), ("output", boundary.out_shardings())] {
         for (value_index, sharding) in shardings.iter().enumerate() {
             let axis_name = sharding
                 .dimensions()
@@ -342,9 +342,9 @@ where
         .collect::<Result<Vec<_>, _>>()?;
     let mut manual_inputs = outer_inputs.to_vec();
     let mut input_shardings =
-        to_shardy_in_shardings(shard_map, &collective_state.bound_manual_axes, context)?.shardings();
+        to_shardy_in_shardings(boundary, &collective_state.bound_manual_axes, context)?.shardings();
     let mut output_shardings =
-        to_shardy_out_shardings(shard_map, &collective_state.bound_manual_axes, context)?.shardings();
+        to_shardy_out_shardings(boundary, &collective_state.bound_manual_axes, context)?.shardings();
     if !threaded_effects.is_empty() {
         let token_type = context.stable_hlo_token_type()?.as_ref();
         // Tokens have rank zero and no replicated/unreduced axes. Each device carries its own token, without
@@ -370,7 +370,7 @@ where
     {
         let mut body_block_ref = body_block.as_ref();
         // Shard-local callees always inline. The fresh-root body has no enclosing capture namespace.
-        let body_collective_state = collective_state.enter_manual_region(shard_map.clone());
+        let body_collective_state = collective_state.enter_manual_region(boundary.clone());
         let mut body_effect_tokens = EffectTokens::default();
         for (index, &effect) in threaded_effects.iter().enumerate() {
             body_effect_tokens.set(effect, body_block.argument(local_input_types.len() + index).unwrap().as_ref());
@@ -398,7 +398,7 @@ where
         global_output_tensor_types.as_slice(),
         context.shardy_tensor_sharding_per_value(&input_shardings)?,
         context.shardy_tensor_sharding_per_value(&output_shardings)?,
-        to_shardy_manual_axes(shard_map, context)?,
+        to_shardy_manual_axes(boundary, context)?,
         body_region,
         location,
     )?)?;
@@ -415,29 +415,29 @@ where
 /// Builds the typed Shardy `in_shardings` attribute of `shard_map`, excluding axes already bound by enclosing manual
 /// regions.
 fn to_shardy_in_shardings<'c, 't>(
-    shard_map: &ShardMapBoundary,
+    boundary: &ShardMapBoundary,
     enclosing_manual_axes: &[String],
     context: &'c MlirContext<'t>,
 ) -> Result<TensorShardingPerValueAttributeRef<'c, 't>, Error> {
-    shardy_tensor_sharding_per_value(shard_map.in_shardings(), shard_map.manual_axes(), enclosing_manual_axes, context)
+    shardy_tensor_sharding_per_value(boundary.in_shardings(), boundary.manual_axes(), enclosing_manual_axes, context)
 }
 
 /// Builds the typed Shardy `out_shardings` attribute of `shard_map`, excluding axes already bound by enclosing manual
 /// regions.
 fn to_shardy_out_shardings<'c, 't>(
-    shard_map: &ShardMapBoundary,
+    boundary: &ShardMapBoundary,
     enclosing_manual_axes: &[String],
     context: &'c MlirContext<'t>,
 ) -> Result<TensorShardingPerValueAttributeRef<'c, 't>, Error> {
-    shardy_tensor_sharding_per_value(shard_map.out_shardings(), shard_map.manual_axes(), enclosing_manual_axes, context)
+    shardy_tensor_sharding_per_value(boundary.out_shardings(), boundary.manual_axes(), enclosing_manual_axes, context)
 }
 
 /// Builds the typed Shardy `manual_axes` attribute that `shard_map` attaches to `sdy.manual_computation`.
 fn to_shardy_manual_axes<'c, 't>(
-    shard_map: &ShardMapBoundary,
+    boundary: &ShardMapBoundary,
     context: &'c MlirContext<'t>,
 ) -> Result<ManualAxesAttributeRef<'c, 't>, Error> {
-    Ok(context.shardy_manual_axes(shard_map.manual_axes())?)
+    Ok(context.shardy_manual_axes(boundary.manual_axes())?)
 }
 
 /// Builds the typed Shardy per-value tensor sharding attribute of a `sdy.manual_computation` boundary, with one tensor
@@ -575,7 +575,7 @@ impl LowerableOperation for ShardMapOperation {
         lower_manual_computation(
             &mut lowerer.block,
             input_values,
-            self.shard_map(),
+            self.boundary(),
             &simplified_body,
             local_input_types.as_slice(),
             global_output_types.as_slice(),
@@ -595,8 +595,8 @@ mod tests {
     use pretty_assertions::assert_eq;
     use ryft_core::{
         Context, ConvertElementTypeOperation, CustomCallOperation, DataType, Device, DeviceMesh, Dimension, Dot,
-        DotDimensionNumbers, EffectClass, MeshAxis, NamedAxis, Placeholder, ReductionKind, Shape, ValueProjection,
-        shard_map_with_options, trace_shard_map, trace_shard_map_with_named_axes, trace_shard_map_with_options,
+        DotDimensionNumbers, EffectClass, MeshAxis, NamedAxis, Placeholder, ReductionKind, Shape, ShardMapOptions,
+        ValueProjection, shard_map, trace_shard_map,
     };
     use ryft_mlir::Block;
     use ryft_pjrt::{BufferType, ClientOptions, CpuClientOptions, Program as PjrtProgram, load_cpu_plugin};
@@ -800,14 +800,16 @@ mod tests {
         let layout = Layout::Tiled(TiledLayout::new(vec![0, 1], vec![]));
         let input_type = ArrayType::new_static(DataType::F32, [2, 3]).with_layout(layout.clone());
         let traced: TracedShardMap<XlaDomain<'static>, ArrayType, ArrayType> = trace_shard_map(
-            |input| {
-                let input = input.cast(input.r#type().into_owned().with_layout(None), &[]).unwrap();
-                input.cast(input.r#type().into_owned().with_layout(layout.clone()), &[]).unwrap()
+            |_, input| {
+                let input = input.cast(input.r#type().into_owned().with_layout(None), &[])?;
+                input.cast(input.r#type().into_owned().with_layout(layout.clone()), &[])
             },
             input_type,
             mesh,
             sharding.clone(),
             sharding,
+            ShardMapOptions::new(),
+            &[],
         )
         .unwrap();
         let module = to_mlir_module(&traced, "main").unwrap();
@@ -876,11 +878,13 @@ mod tests {
         let mesh = test_logical_mesh_data_model();
         let input_sharding = test_sharding(&mesh, vec![ShardingDimension::sharded(["data", "model"])], vec![]);
         let traced: TracedShardMap<XlaDomain<'static>, ArrayType, ArrayType> = trace_shard_map(
-            |x| x.clone() + x,
+            |_, x| Ok(x.clone() + x),
             global_input_type.clone(),
             mesh.clone(),
             input_sharding.clone(),
             input_sharding,
+            ShardMapOptions::new(),
+            &[],
         )
         .unwrap();
         assert_eq!(
@@ -910,28 +914,28 @@ mod tests {
         let inner_mesh = mesh.clone();
         let outer_sharding = test_sharding(&mesh, vec![ShardingDimension::sharded(["x"])], vec![]);
         let inner_sharding = test_sharding(&inner_mesh, vec![ShardingDimension::sharded(["y"])], vec![]);
-        let traced: TracedShardMap<XlaDomain<'static>, ArrayType, ArrayType> = trace_shard_map_with_options(
+        let traced: TracedShardMap<XlaDomain<'static>, ArrayType, ArrayType> = trace_shard_map(
             {
                 let inner_mesh = inner_mesh.clone();
                 let inner_sharding = inner_sharding.clone();
-                move |x: XlaArrayTracer| {
-                    let nested: XlaArrayTracer = shard_map_with_options(
-                        |y: XlaArrayTracer| y.clone() + y,
+                move |_, x: XlaArrayTracer| {
+                    let nested: XlaArrayTracer = shard_map(
+                        |y: XlaArrayTracer| Ok(y.clone() + y),
                         x.clone(),
                         inner_mesh.clone(),
                         inner_sharding.clone(),
                         inner_sharding.clone(),
-                        vec!["y".to_string()],
-                    )
-                    .expect("nested shard_map should trace");
-                    nested + x
+                        ShardMapOptions::new().with_manual_axes(["y"]),
+                    )?;
+                    Ok(nested + x)
                 }
             },
             ArrayType::new(DataType::F32, Shape::new(vec![Dimension::Static(8)])),
             mesh,
             outer_sharding.clone(),
             outer_sharding,
-            vec!["x".to_string()],
+            ShardMapOptions::new().with_manual_axes(["x"]),
+            &[],
         )
         .unwrap();
 
@@ -965,27 +969,29 @@ mod tests {
         let mesh = LogicalMesh::new(vec![MeshAxis::new("x", 2, MeshAxisType::Manual).unwrap()]).unwrap();
         let replicated = test_sharding(&mesh, vec![ShardingDimension::replicated()], vec![]);
         let traced: TracedShardMap<XlaDomain<'static>, ArrayType, ArrayType> = trace_shard_map(
-            |x: XlaArrayTracer| {
+            |_, x: XlaArrayTracer| {
                 let inner: TracedShardMap<XlaDomain<'static>, ArrayType, ArrayType> = trace_shard_map(
-                    |y: XlaArrayTracer| y.clone() + y,
+                    |_, y: XlaArrayTracer| Ok(y.clone() + y),
                     ArrayType::new_static(DataType::F32, [4]),
                     mesh.clone(),
                     replicated.clone(),
                     replicated.clone(),
-                )
-                .unwrap();
+                    ShardMapOptions::new(),
+                    &[],
+                )?;
                 let output = x
                     .value()
                     .context()
-                    .bind(inner.operation().clone(), vec![inner.body().clone()], &[x.value().clone()])
-                    .unwrap()
+                    .bind(inner.operation().clone(), vec![inner.body().clone()], &[x.value().clone()])?
                     .remove(0);
-                ValueProjection::<ArrayType>::into_projected(output).unwrap()
+                Ok(ValueProjection::<ArrayType>::into_projected(output)?)
             },
             ArrayType::new_static(DataType::F32, [4]),
             mesh.clone(),
             replicated.clone(),
             replicated.clone(),
+            ShardMapOptions::new(),
+            &[],
         )
         .unwrap();
         let expected = ShardMapError::AxisAlreadyManual { axis_name: "x".to_string() };
@@ -1004,30 +1010,30 @@ mod tests {
         let mesh = test_logical_mesh_2x2();
         let replicated = test_sharding(&mesh, vec![ShardingDimension::replicated()], vec![]);
         let sharded = test_sharding(&mesh, vec![ShardingDimension::sharded(["x"])], vec![]);
-        let traced: TracedShardMap<XlaDomain<'static>, ArrayType, ArrayType> = trace_shard_map_with_options(
-            |x: XlaArrayTracer| {
-                let inner: TracedShardMap<XlaDomain<'static>, ArrayType, ArrayType> = trace_shard_map_with_options(
-                    |y: XlaArrayTracer| y.clone() + y,
+        let traced: TracedShardMap<XlaDomain<'static>, ArrayType, ArrayType> = trace_shard_map(
+            |_, x: XlaArrayTracer| {
+                let inner: TracedShardMap<XlaDomain<'static>, ArrayType, ArrayType> = trace_shard_map(
+                    |_, y: XlaArrayTracer| Ok(y.clone() + y),
                     ArrayType::new_static(DataType::F32, [4]),
                     mesh.clone(),
                     sharded.clone(),
                     sharded.clone(),
-                    vec!["y".to_string()],
-                )
-                .unwrap();
+                    ShardMapOptions::new().with_manual_axes(["y"]),
+                    &[],
+                )?;
                 let output = x
                     .value()
                     .context()
-                    .bind(inner.operation().clone(), vec![inner.body().clone()], &[x.value().clone()])
-                    .unwrap()
+                    .bind(inner.operation().clone(), vec![inner.body().clone()], &[x.value().clone()])?
                     .remove(0);
-                ValueProjection::<ArrayType>::into_projected(output).unwrap()
+                Ok(ValueProjection::<ArrayType>::into_projected(output)?)
             },
             ArrayType::new_static(DataType::F32, [4]),
             mesh.clone(),
             replicated.clone(),
             replicated.clone(),
-            vec!["x".to_string()],
+            ShardMapOptions::new().with_manual_axes(["x"]),
+            &[],
         )
         .unwrap();
         let expected = ShardMapError::SpecificationNamesEnclosingManualAxis {
@@ -1052,14 +1058,14 @@ mod tests {
         let input_type = ArrayType::new_static(DataType::F32, [4])
             .with_sharding(Sharding::replicated(mesh.clone(), 1).with_varying_manual_axes(["x"]).unwrap())
             .unwrap();
-        let traced: TracedShardMap<XlaDomain<'static>, ArrayType, ArrayType> = trace_shard_map_with_named_axes(
-            |_, y: XlaArrayTracer| y.clone() + y,
+        let traced: TracedShardMap<XlaDomain<'static>, ArrayType, ArrayType> = trace_shard_map(
+            |_, y: XlaArrayTracer| Ok(y.clone() + y),
             input_type,
             mesh.clone(),
             sharded.clone(),
             sharded,
-            Vec::new(),
-            vec![("x".to_string(), NamedAxis::Mesh { mesh, axis: 0, size: 2 })],
+            ShardMapOptions::new(),
+            &[("x".to_string(), NamedAxis::Mesh { mesh, axis: 0, size: 2 })],
         )
         .unwrap();
         let error = to_mlir_module(&traced, "main").unwrap_err();
@@ -1090,14 +1096,14 @@ mod tests {
             .unwrap();
         let replicated = test_sharding(&mesh, vec![ShardingDimension::replicated()], vec![]);
         let trace = |axis_name: &'static str, out_sharding: Sharding| {
-            let traced: TracedShardMap<XlaDomain<'static>, ArrayType, ArrayType> = trace_shard_map_with_named_axes(
-                |_, y: XlaArrayTracer| y.parallel_reduce(ReductionKind::Sum, axis_name).unwrap(),
+            let traced: TracedShardMap<XlaDomain<'static>, ArrayType, ArrayType> = trace_shard_map(
+                |_, y: XlaArrayTracer| y.parallel_reduce(ReductionKind::Sum, axis_name),
                 input_type.clone(),
                 mesh.clone(),
                 sharded.clone(),
                 out_sharding,
-                Vec::new(),
-                vec![("x".to_string(), NamedAxis::Mesh { mesh: mesh.clone(), axis: 0, size: 2 })],
+                ShardMapOptions::new(),
+                &[("x".to_string(), NamedAxis::Mesh { mesh: mesh.clone(), axis: 0, size: 2 })],
             )
             .unwrap();
             traced
@@ -1142,11 +1148,13 @@ mod tests {
             Sharding::new(device_mesh.logical_mesh().clone(), vec![ShardingDimension::sharded(["x"])]).unwrap();
         let global_input_type = ArrayType::new(DataType::F32, Shape::new(vec![Dimension::Static(8)]));
         let traced: TracedShardMap<XlaDomain<'static>, ArrayType, ArrayType> = trace_shard_map(
-            |x| x.clone() + x,
+            |_, x| Ok(x.clone() + x),
             global_input_type,
             device_mesh.logical_mesh().clone(),
             sharding.clone(),
             sharding.clone(),
+            ShardMapOptions::new(),
+            &[],
         )
         .unwrap();
         let mlir_program = to_mlir_module(&traced, "main").unwrap();
@@ -1249,11 +1257,13 @@ mod tests {
             ArrayType::new(DataType::F32, Shape::new(vec![Dimension::Static(4), Dimension::Static(2)])),
         );
         let traced: TracedShardMap<XlaDomain<'static>, (ArrayType, ArrayType), ArrayType> = trace_shard_map(
-            |(lhs, rhs)| lhs.dot(&rhs, &DotDimensionNumbers::matmul()).unwrap(),
+            |_, (lhs, rhs)| lhs.dot(&rhs, &DotDimensionNumbers::matmul()),
             global_input_types,
             device_mesh.logical_mesh().clone(),
             (lhs_sharding.clone(), rhs_sharding.clone()),
             output_sharding.clone(),
+            ShardMapOptions::new(),
+            &[],
         )
         .unwrap();
         let mlir_program = to_mlir_module(&traced, "main").unwrap();
@@ -1368,7 +1378,7 @@ mod tests {
     fn test_to_shardy_in_shardings() {
         let context = MlirContext::new();
         let mesh = test_logical_mesh_2x2();
-        let shard_map = ShardMapBoundary::new(
+        let boundary = ShardMapBoundary::new(
             mesh.clone(),
             vec![test_sharding(&mesh, vec![ShardingDimension::sharded(["x"])], Vec::new())],
             Vec::new(),
@@ -1376,7 +1386,7 @@ mod tests {
         )
         .unwrap();
         assert_eq!(
-            to_shardy_in_shardings(&shard_map, &[], &context).unwrap().to_string(),
+            to_shardy_in_shardings(&boundary, &[], &context).unwrap().to_string(),
             r#"#sdy.sharding_per_value<[<@mesh, [{"x"}], replicated={"y"}>]>"#,
         );
     }
@@ -1387,7 +1397,7 @@ mod tests {
         // an enclosing manual region already bound them, in which case they are omitted.
         let context = MlirContext::new();
         let mesh = test_logical_mesh_2x2();
-        let shard_map = ShardMapBoundary::new(
+        let boundary = ShardMapBoundary::new(
             mesh.clone(),
             vec![test_sharding(&mesh, vec![ShardingDimension::sharded(["x", "y"])], Vec::new())],
             Vec::new(),
@@ -1395,10 +1405,10 @@ mod tests {
         )
         .unwrap();
         assert_eq!(
-            to_shardy_in_shardings(&shard_map, &[], &context).unwrap().to_string(),
+            to_shardy_in_shardings(&boundary, &[], &context).unwrap().to_string(),
             r#"#sdy.sharding_per_value<[<@mesh, [{"x", "y", ?}]>]>"#,
         );
-        let shard_map = ShardMapBoundary::new(
+        let boundary = ShardMapBoundary::new(
             mesh.clone(),
             vec![test_sharding(&mesh, vec![ShardingDimension::sharded(["y"])], Vec::new())],
             Vec::new(),
@@ -1406,11 +1416,11 @@ mod tests {
         )
         .unwrap();
         assert_eq!(
-            to_shardy_in_shardings(&shard_map, &[], &context).unwrap().to_string(),
+            to_shardy_in_shardings(&boundary, &[], &context).unwrap().to_string(),
             r#"#sdy.sharding_per_value<[<@mesh, [{"y", ?}], replicated={"x"}>]>"#,
         );
         assert_eq!(
-            to_shardy_in_shardings(&shard_map, &["x".to_string()], &context).unwrap().to_string(),
+            to_shardy_in_shardings(&boundary, &["x".to_string()], &context).unwrap().to_string(),
             r#"#sdy.sharding_per_value<[<@mesh, [{"y"}]>]>"#,
         );
     }
@@ -1419,7 +1429,7 @@ mod tests {
     fn test_to_shardy_in_shardings_renders_free_axes_as_open_dimension_shardings() {
         let context = MlirContext::new();
         let mesh = test_logical_mesh_data_model();
-        let shard_map = ShardMapBoundary::new(
+        let boundary = ShardMapBoundary::new(
             mesh.clone(),
             vec![
                 test_sharding(&mesh, vec![ShardingDimension::sharded(["data", "model"])], Vec::new()),
@@ -1430,7 +1440,7 @@ mod tests {
         )
         .unwrap();
         assert_eq!(
-            to_shardy_in_shardings(&shard_map, &[], &context).unwrap().to_string(),
+            to_shardy_in_shardings(&boundary, &[], &context).unwrap().to_string(),
             r#"#sdy.sharding_per_value<[<@mesh, [{"data", ?}]>, <@mesh, [{"data", ?}]>]>"#,
         );
     }
@@ -1439,7 +1449,7 @@ mod tests {
     fn test_to_shardy_in_shardings_keeps_explicit_axes() {
         let context = MlirContext::new();
         let mesh = test_logical_mesh_data_model_explicit();
-        let shard_map = ShardMapBoundary::new(
+        let boundary = ShardMapBoundary::new(
             mesh.clone(),
             vec![test_sharding(&mesh, vec![ShardingDimension::sharded(["data", "model"])], Vec::new())],
             Vec::new(),
@@ -1447,7 +1457,7 @@ mod tests {
         )
         .unwrap();
         assert_eq!(
-            to_shardy_in_shardings(&shard_map, &[], &context).unwrap().to_string(),
+            to_shardy_in_shardings(&boundary, &[], &context).unwrap().to_string(),
             r#"#sdy.sharding_per_value<[<@mesh, [{"data", "model", ?}]>]>"#,
         );
     }
@@ -1460,7 +1470,7 @@ mod tests {
             MeshAxis::new("y", 2, MeshAxisType::Auto).unwrap(),
         ])
         .unwrap();
-        let shard_map = ShardMapBoundary::new(
+        let boundary = ShardMapBoundary::new(
             mesh.clone(),
             Vec::new(),
             vec![test_sharding(&mesh, vec![ShardingDimension::replicated()], Vec::new())],
@@ -1468,24 +1478,24 @@ mod tests {
         )
         .unwrap();
         assert_eq!(
-            to_shardy_out_shardings(&shard_map, &[], &context).unwrap().to_string(),
+            to_shardy_out_shardings(&boundary, &[], &context).unwrap().to_string(),
             r#"#sdy.sharding_per_value<[<@mesh, [{?}], replicated={"x"}>]>"#,
         );
 
         // Output shardings render exactly like input shardings.
         let mesh = test_logical_mesh_data_model();
         let sharding = test_sharding(&mesh, vec![ShardingDimension::sharded(["data"])], Vec::new());
-        let shard_map = ShardMapBoundary::new(mesh, vec![sharding.clone()], vec![sharding], Vec::new()).unwrap();
+        let boundary = ShardMapBoundary::new(mesh, vec![sharding.clone()], vec![sharding], Vec::new()).unwrap();
         assert_eq!(
-            to_shardy_out_shardings(&shard_map, &[], &context).unwrap().to_string(),
-            to_shardy_in_shardings(&shard_map, &[], &context).unwrap().to_string(),
+            to_shardy_out_shardings(&boundary, &[], &context).unwrap().to_string(),
+            to_shardy_in_shardings(&boundary, &[], &context).unwrap().to_string(),
         );
     }
 
     #[test]
     fn test_to_shardy_manual_axes() {
         let context = MlirContext::new();
-        let shard_map = ShardMapBoundary::new(
+        let boundary = ShardMapBoundary::new(
             LogicalMesh::new(vec![
                 MeshAxis::new("x", 2, MeshAxisType::Auto).unwrap(),
                 MeshAxis::new("y", 2, MeshAxisType::Manual).unwrap(),
@@ -1496,10 +1506,10 @@ mod tests {
             Vec::new(),
         )
         .unwrap();
-        assert_eq!(to_shardy_manual_axes(&shard_map, &context).unwrap().to_string(), r#"#sdy<manual_axes{"y"}>"#);
-        let shard_map =
+        assert_eq!(to_shardy_manual_axes(&boundary, &context).unwrap().to_string(), r#"#sdy<manual_axes{"y"}>"#);
+        let boundary =
             ShardMapBoundary::new(test_logical_mesh_2x2(), Vec::new(), Vec::new(), vec!["x".into()]).unwrap();
-        assert_eq!(to_shardy_manual_axes(&shard_map, &context).unwrap().to_string(), r#"#sdy<manual_axes{"x"}>"#);
+        assert_eq!(to_shardy_manual_axes(&boundary, &context).unwrap().to_string(), r#"#sdy<manual_axes{"x"}>"#);
     }
 
     #[test]
@@ -1521,7 +1531,7 @@ mod tests {
 
         let sharding =
             Sharding::new(device_mesh.logical_mesh().clone(), vec![ShardingDimension::sharded(["x"])]).unwrap();
-        let shard_map = ShardMapBoundary::new(
+        let boundary = ShardMapBoundary::new(
             device_mesh.logical_mesh().clone(),
             vec![sharding.clone()],
             vec![sharding.clone()],
@@ -1529,20 +1539,20 @@ mod tests {
         )
         .unwrap();
         assert_eq!(
-            shard_map.local_input_type(0, &ArrayType::new_static(DataType::F32, [8])).unwrap().shape(),
+            boundary.local_input_type(0, &ArrayType::new_static(DataType::F32, [8])).unwrap().shape(),
             &Shape::new(vec![Dimension::Static(2)]),
         );
 
         let context = MlirContext::new();
-        let input_sharding = shard_map.in_shardings()[0].to_mlir(context.unknown_location()).unwrap().to_string();
-        let output_sharding = shard_map.out_shardings()[0].to_mlir(context.unknown_location()).unwrap().to_string();
+        let input_sharding = boundary.in_shardings()[0].to_mlir(context.unknown_location()).unwrap().to_string();
+        let output_sharding = boundary.out_shardings()[0].to_mlir(context.unknown_location()).unwrap().to_string();
         let manual_computation_attributes =
             r#"in_shardings=[<@mesh, [{"x"}]>] out_shardings=[<@mesh, [{"x"}]>] manual_axes={"x"}"#;
         let mesh_module = context.module(context.unknown_location()).unwrap();
         let mesh_operation = mesh_module
             .body()
             .unwrap()
-            .append_operation(shard_map.mesh().to_mlir(context.unknown_location()).unwrap())
+            .append_operation(boundary.mesh().to_mlir(context.unknown_location()).unwrap())
             .unwrap()
             .to_string();
 

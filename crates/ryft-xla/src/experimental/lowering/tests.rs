@@ -6,8 +6,8 @@ use ryft_core::{
     AddOperation, AtomId, CaptureReference, CastOperation, ConditionOperation, Context, Cos, Differentiate, Dimension,
     DimensionBounds, DimensionType, DimensionValue, DimensionVariable, Dot, DotDimensionNumbers, EagerContext,
     EffectClasses, MeshAxis, MeshAxisType, NegOperation, OneLike, Placeholder, Program, ProgramBuilder,
-    ProvenanceScope, ReduceOperation, ReductionKind, ReshapeOperation, ReverseModeDifferentiate, Sin, TracedShardMap,
-    Transpose, TypedProgram, ZeroLike, trace_shard_map,
+    ProvenanceScope, ReduceOperation, ReductionKind, ReshapeOperation, ReverseModeDifferentiate, ShardMapOptions, Sin,
+    TracedShardMap, Transpose, TypedProgram, ZeroLike, trace_shard_map,
 };
 use ryft_mlir::{Attribute, Operation as MlirOperation, Region, Size as MlirSize};
 use ryft_pjrt::{BufferType, ExecutionDeviceInputs, ExecutionInput, Program as PjrtProgram};
@@ -904,11 +904,13 @@ fn test_to_mlir_module_renders_a_full_add_module() {
     let global_input_type = test_vector_type(8);
     let mesh = test_manual_mesh("x", 4);
     let traced: TracedShardMap<XlaDomain<'static>, ArrayType, ArrayType> = trace_shard_map(
-        |x| x.clone() + x,
+        |_, x| Ok(x.clone() + x),
         global_input_type,
         mesh.clone(),
         Sharding::new(mesh.clone(), vec![ShardingDimension::sharded(["x"])]).unwrap(),
         Sharding::new(mesh, vec![ShardingDimension::sharded(["x"])]).unwrap(),
+        ShardMapOptions::new(),
+        &[],
     )
     .unwrap();
 
@@ -934,7 +936,7 @@ fn test_to_mlir_module_renders_provenance_locations() {
     let global_input_type = test_vector_type(8);
     let mesh = test_manual_mesh("x", 4);
     let traced: TracedShardMap<XlaDomain<'static>, ArrayType, ArrayType> = trace_shard_map(
-        |x| {
+        |_, x| {
             let context = x.value().context().clone();
             // One instruction staged under nested scopes, one under a fused origin, and one with unknown
             // provenance, covering every provenance shape in one lowered module.
@@ -946,12 +948,14 @@ fn test_to_mlir_module_renders_provenance_locations() {
                 Provenance::scope(ProvenanceScope::new("b"), Provenance::unknown()),
             ]);
             let product = context.invoke_with_provenance_origin(fused, || scoped.clone() * scoped);
-            product + x
+            Ok(product + x)
         },
         global_input_type,
         mesh.clone(),
         Sharding::new(mesh.clone(), vec![ShardingDimension::sharded(["x"])]).unwrap(),
         Sharding::new(mesh, vec![ShardingDimension::sharded(["x"])]).unwrap(),
+        ShardMapOptions::new(),
+        &[],
     )
     .unwrap();
 
@@ -989,15 +993,17 @@ fn test_to_mlir_module_renders_constants_and_supported_ops() {
     let global_input_type = test_matrix_type(4, 4);
     let mesh = test_manual_mesh("x", 2);
     let traced: TracedShardMap<XlaDomain<'static>, ArrayType, ArrayType> = trace_shard_map(
-        |x| {
-            let product = x.transpose(vec![1, 0]).unwrap().dot(&x, &DotDimensionNumbers::matmul()).unwrap();
-            let waveform = (-product).cos().unwrap().sin().unwrap();
-            (waveform.clone() * waveform.one_like().unwrap()) + waveform.zero_like().unwrap()
+        |_, x| {
+            let product = x.transpose(vec![1, 0])?.dot(&x, &DotDimensionNumbers::matmul())?;
+            let waveform = (-product).cos()?.sin()?;
+            Ok((waveform.clone() * waveform.one_like()?) + waveform.zero_like()?)
         },
         global_input_type,
         mesh.clone(),
         Sharding::new(mesh.clone(), vec![ShardingDimension::sharded(["x"]), ShardingDimension::replicated()]).unwrap(),
         Sharding::new(mesh, vec![ShardingDimension::sharded(["x"]), ShardingDimension::replicated()]).unwrap(),
+        ShardMapOptions::new(),
+        &[],
     )
     .unwrap();
 

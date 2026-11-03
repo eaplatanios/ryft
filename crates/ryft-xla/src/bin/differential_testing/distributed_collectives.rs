@@ -13,8 +13,8 @@ use serde::Deserialize;
 #[cfg(any(test, feature = "cuda-13"))]
 use ryft_core::{
     ArrayType, CollectiveOptions, DataType, LogicalMesh, MeshAxis, MeshAxisType, ParallelAllGather,
-    ParallelAllGatherOutputVariance, ParallelAllToAll, ParallelRaggedAllToAll, ParallelReduce, ReductionKind, Sharding,
-    ShardingDimension, shard_map,
+    ParallelAllGatherOutputVariance, ParallelAllToAll, ParallelRaggedAllToAll, ParallelReduce, ReductionKind,
+    ShardMapOptions, Sharding, ShardingDimension, shard_map,
 };
 #[cfg(feature = "cuda-13")]
 use ryft_pjrt::{
@@ -165,27 +165,26 @@ impl DistributedCollectiveCase {
             |inputs: Vec<XlaArrayTracer>| {
                 shard_map(
                     |inputs: Vec<XlaArrayTracer>| match self.operation.as_str() {
-                        "sum" => inputs[0].parallel_reduce(ReductionKind::Sum, "x").unwrap(),
-                        "all_gather" => inputs[0]
-                            .parallel_all_gather_with_options(
-                                "x",
-                                0,
-                                CollectiveOptions::tiled(),
-                                ParallelAllGatherOutputVariance::Varying,
-                            )
-                            .unwrap(),
+                        "sum" => inputs[0].parallel_reduce(ReductionKind::Sum, "x"),
+                        "all_gather" => inputs[0].parallel_all_gather_with_options(
+                            "x",
+                            0,
+                            CollectiveOptions::tiled(),
+                            ParallelAllGatherOutputVariance::Varying,
+                        ),
                         "all_to_all" => {
-                            inputs[0].parallel_all_to_all_with_options("x", 0, 1, CollectiveOptions::tiled()).unwrap()
+                            inputs[0].parallel_all_to_all_with_options("x", 0, 1, CollectiveOptions::tiled())
                         }
-                        "ragged_all_to_all" => inputs[0]
-                            .parallel_ragged_all_to_all("x", &inputs[1], &inputs[2], &inputs[3], &inputs[4], &inputs[5])
-                            .unwrap(),
+                        "ragged_all_to_all" => inputs[0].parallel_ragged_all_to_all(
+                            "x", &inputs[1], &inputs[2], &inputs[3], &inputs[4], &inputs[5],
+                        ),
                         _ => unreachable!(),
                     },
                     inputs,
                     mesh.clone(),
                     input_shardings.clone(),
                     output_sharding.clone(),
+                    ShardMapOptions::new(),
                 )
                 .unwrap()
             },

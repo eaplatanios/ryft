@@ -9830,13 +9830,13 @@ mod tests {
 
         // The discharged program computes what the source computes eagerly.
         let inputs = vec![
-            DischargeValue::Array(Array::vector(vec![2.0_f32, 3.0, 5.0]).unwrap()),
-            DischargeValue::Array(Array::scalar(1_i32).unwrap()),
-            DischargeValue::Array(Array::scalar(7.0_f32).unwrap()),
+            DischargeValue::Array(Array::vector(vec![2.0f32, 3.0, 5.0]).unwrap()),
+            DischargeValue::Array(Array::scalar(1i32).unwrap()),
+            DischargeValue::Array(Array::scalar(7.0f32).unwrap()),
         ];
         let outputs = vec![
-            DischargeValue::Array(Array::scalar(10.0_f32).unwrap()),
-            DischargeValue::Array(Array::vector(vec![2.0_f32, 10.0, 5.0]).unwrap()),
+            DischargeValue::Array(Array::scalar(10.0f32).unwrap()),
+            DischargeValue::Array(Array::vector(vec![2.0f32, 10.0, 5.0]).unwrap()),
         ];
         assert_eq!(source.interpret(inputs.clone()), Ok(outputs.clone()));
         assert_eq!(discharged.program().interpret(inputs), Ok(outputs));

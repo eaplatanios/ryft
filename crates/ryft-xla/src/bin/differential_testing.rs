@@ -21,8 +21,8 @@ use ryft_core::{
     DimensionVariable, DotDimensionNumbers, DynamicSlice, DynamicSliceOperation, DynamicUpdateSlice, EagerContext,
     LogicalMesh, MeshAxis, MeshAxisType, ParallelAllGather, ParallelAllGatherOutputVariance, ParallelAllToAll,
     ParallelPermute, ParallelReduce, ParallelSumScatter, Placeholder, ProgramBuilder, ProgramError, ProjectedContext,
-    Reduce, ReduceOperation, ReductionKind, ScaledDot, ScaledDotOperation, Shape, Sharding, ShardingDimension,
-    TypedProgram, Value, ValueProjection, ZeroLike, block_scaled_dot, differentiate_at, shard_map,
+    Reduce, ReduceOperation, ReductionKind, ScaledDot, ScaledDotOperation, Shape, ShardMapOptions, Sharding,
+    ShardingDimension, TypedProgram, Value, ValueProjection, ZeroLike, block_scaled_dot, differentiate_at, shard_map,
 };
 use ryft_pjrt::protos::{CompilationOptions, ExecutableCompilationOptions, Precision};
 use ryft_pjrt::{BufferType, Client, ClientOptions, CpuClientOptions, Program, load_cpu_plugin};
@@ -303,23 +303,22 @@ fn emit_grouped_collectives() -> Result<DifferentialObservation, Box<dyn Error>>
                 shard_map(
                     |local_input: XlaArrayTracer| {
                         let options = CollectiveOptions::tiled().with_axis_index_groups(vec![vec![0, 2], vec![3, 1]]);
-                        (
-                            local_input
-                                .parallel_all_gather_with_options(
-                                    "x",
-                                    0,
-                                    options.clone(),
-                                    ParallelAllGatherOutputVariance::Varying,
-                                )
-                                .unwrap(),
-                            local_input.clone().parallel_sum_scatter_with_options("x", 0, options.clone()).unwrap(),
-                            local_input.parallel_all_to_all_with_options("x", 0, 0, options).unwrap(),
-                        )
+                        Ok((
+                            local_input.parallel_all_gather_with_options(
+                                "x",
+                                0,
+                                options.clone(),
+                                ParallelAllGatherOutputVariance::Varying,
+                            )?,
+                            local_input.clone().parallel_sum_scatter_with_options("x", 0, options.clone())?,
+                            local_input.parallel_all_to_all_with_options("x", 0, 0, options)?,
+                        ))
                     },
                     input,
                     mesh.clone(),
                     sharding.clone(),
                     (sharding.clone(), sharding.clone(), sharding.clone()),
+                    ShardMapOptions::new(),
                 )
                 .unwrap()
             }
@@ -363,11 +362,12 @@ fn emit_parallel_shuffle() -> Result<DifferentialObservation, Box<dyn Error>> {
             let sharding = sharding.clone();
             move |input: XlaArrayTracer| {
                 shard_map(
-                    |local_input: XlaArrayTracer| local_input.parallel_shuffle("x", &[2, 0, 3, 1]).unwrap(),
+                    |local_input: XlaArrayTracer| local_input.parallel_shuffle("x", &[2, 0, 3, 1]),
                     input,
                     mesh.clone(),
                     sharding.clone(),
                     sharding.clone(),
+                    ShardMapOptions::new(),
                 )
                 .unwrap()
             }
@@ -431,11 +431,12 @@ fn emit_parallel_swap_axes() -> Result<DifferentialObservation, Box<dyn Error>> 
             let sharding = sharding.clone();
             move |input: XlaArrayTracer| {
                 shard_map(
-                    |local_input: XlaArrayTracer| local_input.parallel_swap_axes("x", 0).unwrap(),
+                    |local_input: XlaArrayTracer| local_input.parallel_swap_axes("x", 0),
                     input,
                     mesh.clone(),
                     sharding.clone(),
                     sharding.clone(),
+                    ShardMapOptions::new(),
                 )
                 .unwrap()
             }
@@ -855,34 +856,26 @@ fn emit_condition_varying_predicate_gradient() -> Result<DifferentialObservation
                         let values = ValueProjection::<ArrayType>::into_projected(values)?;
                         Ok(shard_map(
                             |(weight, values): (XlaArrayTracer, XlaArrayTracer)| {
-                                let sum = values.reduce(&[0], ReductionKind::Sum).unwrap();
-                                let predicate =
-                                    sum.compare(&sum.zero_like().unwrap(), ComparisonDirection::GreaterThan).unwrap();
-                                let mut outputs = predicate
-                                    .into_value()
-                                    .condition(
-                                        |inputs| {
-                                            let weight =
-                                                ValueProjection::<ArrayType>::into_projected(inputs[0].clone())?;
-                                            let values =
-                                                ValueProjection::<ArrayType>::into_projected(inputs[1].clone())?;
-                                            Ok(vec![(weight * values).into_value()])
-                                        },
-                                        |inputs| Ok(vec![inputs[1].clone()]),
-                                        vec![weight.into_value(), values.into_value()],
-                                    )
-                                    .unwrap();
-                                ValueProjection::<ArrayType>::into_projected(outputs.remove(0))
-                                    .unwrap()
-                                    .reduce(&[0], ReductionKind::Sum)
-                                    .unwrap()
+                                let sum = values.reduce(&[0], ReductionKind::Sum)?;
+                                let predicate = sum.compare(&sum.zero_like()?, ComparisonDirection::GreaterThan)?;
+                                let mut outputs = predicate.into_value().condition(
+                                    |inputs| {
+                                        let weight = ValueProjection::<ArrayType>::into_projected(inputs[0].clone())?;
+                                        let values = ValueProjection::<ArrayType>::into_projected(inputs[1].clone())?;
+                                        Ok(vec![(weight * values).into_value()])
+                                    },
+                                    |inputs| Ok(vec![inputs[1].clone()]),
+                                    vec![weight.into_value(), values.into_value()],
+                                )?;
+                                ValueProjection::<ArrayType>::into_projected(outputs.remove(0))?
+                                    .reduce(&[0], ReductionKind::Sum)?
                                     .parallel_reduce(ReductionKind::Sum, "x")
-                                    .unwrap()
                             },
                             (weight, values),
                             mesh.clone(),
                             (replicated.clone(), sharded.clone()),
                             Sharding::replicated(mesh.clone(), 0),
+                            ShardMapOptions::new(),
                         )
                         .unwrap()
                         .into_value())

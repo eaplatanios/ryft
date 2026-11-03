@@ -1936,7 +1936,7 @@ mod tests {
             .with_sharding(reference_sharding.clone())
             .unwrap();
         let value_type = ArrayType::new_static(DataType::F32, [4]).with_sharding(sharded.clone()).unwrap();
-        let shard_map = ShardMapBoundary::new(
+        let boundary = ShardMapBoundary::new(
             mesh.clone(),
             vec![reference_sharding.clone(), sharded.clone()],
             vec![sharded.clone()],
@@ -1945,8 +1945,8 @@ mod tests {
         .unwrap();
         let mut body = ProgramBuilder::<XlaConstant, XlaOperation>::new();
         let reference =
-            body.add_input(ReferenceType::new(shard_map.local_input_type(0, &reference_type).unwrap()).into());
-        let value = body.add_input(shard_map.local_input_type(1, &value_type).unwrap().into());
+            body.add_input(ReferenceType::new(boundary.local_input_type(0, &reference_type).unwrap()).into());
+        let value = body.add_input(boundary.local_input_type(1, &value_type).unwrap().into());
         let state = body.add_instruction(ReferenceReadOperation::new(), Vec::new(), vec![reference], None).unwrap()[0];
         let state = if replicated_reference {
             body.add_instruction(ParallelVaryOperation::new("x".to_string()), Vec::new(), vec![state], None)
@@ -1959,7 +1959,7 @@ mod tests {
             .build::<Vec<XlaConstant>, Vec<XlaConstant>>(vec![output], vec![Placeholder; 2], vec![Placeholder])
             .unwrap();
         let inputs = vec![ArrayIrType::Reference(ReferenceType::new(reference_type)), ArrayIrType::Array(value_type)];
-        let operation = ShardMapOperation::from_program(&body, inputs.clone(), shard_map).unwrap();
+        let operation = ShardMapOperation::from_program(&body, inputs.clone(), boundary).unwrap();
         let mut builder = ProgramBuilder::<XlaConstant, XlaOperation>::new();
         let inputs = inputs.into_iter().map(|r#type| builder.add_input(r#type)).collect::<Vec<_>>();
         let body = builder.import_program(body);
@@ -3969,7 +3969,7 @@ mod tests {
 
         // The boundary is `[r: ref<f32[4]>, x: f32[4]] -> f32[4]`, everything sharded along `x`, and the local body
         // performs `add_update(r_local, x_local); read(r_local)` over the `f32[2]` shards the device owns.
-        let shard_map = ShardMapBoundary::new(
+        let boundary = ShardMapBoundary::new(
             logical_mesh,
             vec![sharded.clone(), sharded.clone()],
             vec![sharded.clone()],
@@ -3978,9 +3978,9 @@ mod tests {
         .unwrap();
         let body = {
             let mut builder = ProgramBuilder::<XlaConstant, XlaOperation>::new();
-            let local_referent = shard_map.local_input_type(0, &global_type).unwrap();
+            let local_referent = boundary.local_input_type(0, &global_type).unwrap();
             let reference = builder.add_input(ArrayIrType::Reference(ReferenceType::new(local_referent)));
-            let update = builder.add_input(ArrayIrType::Array(shard_map.local_input_type(1, &global_type).unwrap()));
+            let update = builder.add_input(ArrayIrType::Array(boundary.local_input_type(1, &global_type).unwrap()));
             builder
                 .add_instruction(ReferenceAddUpdateOperation::new(), Vec::new(), vec![reference, update], None)
                 .unwrap();
@@ -3996,7 +3996,7 @@ mod tests {
                 ArrayIrType::Reference(ReferenceType::new(sharded_type.clone())),
                 ArrayIrType::Array(sharded_type.clone()),
             ],
-            shard_map,
+            boundary,
         )
         .unwrap();
         assert_eq!(operation.global_output_types(), &[ArrayIrType::Array(sharded_type.clone())]);
@@ -4073,7 +4073,7 @@ mod tests {
         // The boundary is `[r: ref<f32[2]>, x: f32[4]] -> f32[4]` with `r` replicated and `x` and the output sharded
         // along `x`, and the local body performs `read(r_local) + x_local` over the whole `f32[2]` referent and the
         // `f32[2]` shard of `x` the device owns.
-        let shard_map = ShardMapBoundary::new(
+        let boundary = ShardMapBoundary::new(
             logical_mesh,
             vec![replicated, sharded.clone()],
             vec![sharded.clone()],
@@ -4082,9 +4082,9 @@ mod tests {
         .unwrap();
         let body = {
             let mut builder = ProgramBuilder::<XlaConstant, XlaOperation>::new();
-            let local_referent = shard_map.local_input_type(0, &referent_type).unwrap();
+            let local_referent = boundary.local_input_type(0, &referent_type).unwrap();
             let reference = builder.add_input(ArrayIrType::Reference(ReferenceType::new(local_referent)));
-            let update = builder.add_input(ArrayIrType::Array(shard_map.local_input_type(1, &global_type).unwrap()));
+            let update = builder.add_input(ArrayIrType::Array(boundary.local_input_type(1, &global_type).unwrap()));
             let state =
                 builder.add_instruction(ReferenceReadOperation::new(), Vec::new(), vec![reference], None).unwrap()[0];
             let state = builder
@@ -4102,7 +4102,7 @@ mod tests {
                 ArrayIrType::Reference(ReferenceType::new(replicated_type.clone())),
                 ArrayIrType::Array(sharded_type.clone()),
             ],
-            shard_map,
+            boundary,
         )
         .unwrap();
         assert_eq!(operation.global_output_types(), &[ArrayIrType::Array(sharded_type.clone())]);

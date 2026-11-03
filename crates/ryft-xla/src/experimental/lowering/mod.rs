@@ -780,15 +780,15 @@ impl CollectiveLoweringState {
     /// Derives the state used inside one `sdy.manual_computation` region's body. The target platform, grouped-dot
     /// representation, named compositions, provenance state, and module channel allocator are inherited, while the
     /// provided [`ShardMapBoundary`] becomes the innermost manual region.
-    pub(crate) fn enter_manual_region(&self, shard_map: ShardMapBoundary) -> Self {
+    pub(crate) fn enter_manual_region(&self, boundary: ShardMapBoundary) -> Self {
         let mut bound_manual_axes = self.bound_manual_axes.clone();
-        for axis in shard_map.manual_axes() {
+        for axis in boundary.manual_axes() {
             if !bound_manual_axes.contains(axis) {
                 bound_manual_axes.push(axis.clone());
             }
         }
         let mut manual_regions = self.manual_regions.clone();
-        manual_regions.push(Rc::new(shard_map));
+        manual_regions.push(Rc::new(boundary));
         Self {
             channel_ids: self.channel_ids.clone(),
             manual_regions,
@@ -1872,7 +1872,7 @@ where
             let operation = instruction.operation();
             let declared_mesh = operation
                 .projected_payload::<ShardMapOperation>()
-                .map(|operation| operation.shard_map().mesh())
+                .map(|operation| operation.boundary().mesh())
                 .or_else(|| {
                     operation.projected_payload::<ReshardOperation>().map(|operation| operation.sharding().mesh())
                 })

@@ -10240,7 +10240,7 @@ pub(crate) mod tests {
         }
 
         let context = EagerContext::<ArrayIrValue<Array>, ValueOnlyOperation>::new();
-        let result = differentiate_at(ArrayIrValue::Array(Array::scalar(3.0_f32).unwrap()))
+        let result = differentiate_at(ArrayIrValue::Array(Array::scalar(3.0f32).unwrap()))
             .in_context(&context)
             .value_and_gradient(|value| {
                 let operation = ValueOnlyOperation::Array(ValueOnlyArrayOperation::Add(AddOperation::new()));
@@ -10250,8 +10250,8 @@ pub(crate) mod tests {
         assert_eq!(
             result,
             Ok((
-                ArrayIrValue::Array(Array::scalar(6.0_f32).unwrap()),
-                ArrayIrValue::Array(Array::scalar(2.0_f32).unwrap()),
+                ArrayIrValue::Array(Array::scalar(6.0f32).unwrap()),
+                ArrayIrValue::Array(Array::scalar(2.0f32).unwrap()),
             )),
         );
     }

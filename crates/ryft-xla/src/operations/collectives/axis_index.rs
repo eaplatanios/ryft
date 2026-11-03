@@ -28,7 +28,7 @@ pub(crate) fn lower_axis_index_to_coordinate<'b, 'c: 'b, 't: 'c>(
     location: LocationRef<'c, 't>,
 ) -> Result<ValueRef<'b, 'c, 't>, Error> {
     let axis_name = operation.axis_name();
-    let Some(shard_map) = collective_state.manual_shard_map() else {
+    let Some(boundary) = collective_state.manual_shard_map() else {
         return Err(ProgramError::UnsupportedOperation {
             message: format!(
                 "{AXIS_INDEX_OPERATION_NAME} for axis `{axis_name}` can only be lowered inside a \
@@ -38,7 +38,7 @@ pub(crate) fn lower_axis_index_to_coordinate<'b, 'c: 'b, 't: 'c>(
         .into());
     };
     let axis_region = collective_state.manual_axis_region(axis_name);
-    let mesh = axis_region.unwrap_or(shard_map).mesh();
+    let mesh = axis_region.unwrap_or(boundary).mesh();
     if axis_region.is_none() {
         return Err(ProgramError::UnsupportedOperation {
             message: format!(
@@ -112,7 +112,7 @@ impl LowerableOperation for AxisIndexOperation {
 
 #[cfg(test)]
 mod tests {
-    use ryft_core::{Context, Sharding, TracedShardMap, Value, trace_shard_map};
+    use ryft_core::{Context, ShardMapOptions, Sharding, TracedShardMap, Value, trace_shard_map};
 
     use crate::XlaDomain;
     use crate::experimental::lowering::tests::{test_manual_mesh, test_vector_type};
@@ -124,11 +124,13 @@ mod tests {
     fn test_axis_index_rejects_missing_checked_mesh_metadata() {
         let mesh = test_manual_mesh("x", 2);
         let traced: TracedShardMap<XlaDomain<'static>, ArrayType, ArrayType> = trace_shard_map(
-            |input| input.domain().bind(AxisIndexOperation::new("x".to_string()), Vec::new(), &[]).unwrap().remove(0),
+            |_, input| Ok(input.domain().bind(AxisIndexOperation::new("x".to_string()), Vec::new(), &[])?.remove(0)),
             test_vector_type(4),
             mesh.clone(),
             Sharding::replicated(mesh.clone(), 1),
             Sharding::replicated(mesh, 0),
+            ShardMapOptions::new(),
+            &[],
         )
         .unwrap();
         assert!(matches!(

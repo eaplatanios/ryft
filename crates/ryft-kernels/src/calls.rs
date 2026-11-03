@@ -1968,7 +1968,7 @@ mod tests {
         fn identity_shard_map() -> (ShardMapOperation, FlatProgram<EagerContext<ArrayIrValue<Array>, KernelOperation>>)
         {
             let mesh = LogicalMesh::new(vec![MeshAxis::new("x", 2, MeshAxisType::Manual).unwrap()]).unwrap();
-            let shard_map = ShardMapBoundary::new(
+            let boundary = ShardMapBoundary::new(
                 mesh.clone(),
                 vec![Sharding::replicated(mesh.clone(), 0)],
                 vec![Sharding::replicated(mesh, 0)],
@@ -1977,9 +1977,9 @@ mod tests {
             .unwrap();
             let scalar_type = ArrayType::scalar(DataType::I32);
             let mut builder = ProgramBuilder::<ArrayIrValue<Array>, KernelOperation>::new();
-            let input = builder.add_input(shard_map.local_input_type(0, &scalar_type).unwrap().into());
+            let input = builder.add_input(boundary.local_input_type(0, &scalar_type).unwrap().into());
             let body = builder.build(vec![input], vec![Placeholder], vec![Placeholder]).unwrap();
-            let operation = ShardMapOperation::from_program(&body, vec![scalar_type.into()], shard_map).unwrap();
+            let operation = ShardMapOperation::from_program(&body, vec![scalar_type.into()], boundary).unwrap();
             (operation, body)
         }
 

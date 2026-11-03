@@ -1292,14 +1292,14 @@ mod tests {
                     let body = ProgramBuilder::<ArrayIrValue<Array>, ArrayIrOperation<Array>>::new()
                         .build::<Vec<ArrayIrValue<Array>>, Vec<ArrayIrValue<Array>>>(Vec::new(), Vec::new(), Vec::new())
                         .unwrap();
-                    let shard_map = ShardMapBoundary::new(
+                    let boundary = ShardMapBoundary::new(
                         LogicalMesh::new(vec![MeshAxis::new("x", 2, MeshAxisType::Manual).unwrap()]).unwrap(),
                         Vec::new(),
                         Vec::new(),
                         vec!["x".to_string()],
                     )
                     .unwrap();
-                    ArrayIrOperation::ShardMap(ShardMapOperation::from_program(&body, Vec::new(), shard_map).unwrap())
+                    ArrayIrOperation::ShardMap(ShardMapOperation::from_program(&body, Vec::new(), boundary).unwrap())
                 },
                 RegionForwarding,
             ),

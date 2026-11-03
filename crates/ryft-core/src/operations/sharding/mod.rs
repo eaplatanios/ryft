@@ -19,15 +19,14 @@
 //!     constraint to the cotangent, and the constraint is enforced when a backend lowers the program (i.e., the backend
 //!     compiler must place the value as requested over the auto axes, and remains free everywhere the constraint is
 //!     unconstrained). Requests that shard a dimension over a non-auto axis are rejected in favor of a reshard.
-//!   - The [`shard_map`](fn@shard_map), [`shard_map_with_options`], and [`shard_map_in_context`] closure entry points,
-//!     which trace a local body and bind it on input values, the [`trace_shard_map`], [`trace_shard_map_with_options`],
-//!     and [`trace_shard_map_with_named_axes`] closure entry points, which trace a local body for global input types
-//!     and return it unbound as a [`TracedShardMap`], and the [`ShardMapOperation`] they stage, which runs its local
-//!     body once per device coordinate along the active manual axes of a [`ShardMapBoundary`]. The body receives the
-//!     local shards that the input shardings assign to the executing device, and the global outputs are assembled from
-//!     its local outputs through the output shardings. The closures of [`shard_map_in_context`] and
-//!     [`trace_shard_map_with_named_axes`] also receive the [`ShardMapContext`] of the body, through
-//!     which bodies without inputs can create values (e.g., device coordinates along manual axes).
+//!   - The [`ShardMap`] context capability and the global [`shard_map()`](fn@shard_map) function, which trace a local
+//!     body and bind it on input values, the [`trace_shard_map`] function, which traces a local body for global input
+//!     types and returns it unbound as a [`TracedShardMap`], and the [`ShardMapOperation`] they stage, which runs its
+//!     local body once per device coordinate along the active manual axes of a [`ShardMapBoundary`]. All three take
+//!     [`ShardMapOptions`], which select these axes. The body receives the local shards that the input shardings assign
+//!     to the executing device, and the global outputs are assembled from its local outputs through the output
+//!     shardings. The body functions of [`ShardMap`] and [`trace_shard_map`] also receive the [`ShardMapContext`] of
+//!     the body, through which bodies without inputs can create values (e.g., device coordinates along manual axes).
 //!     Refer to the [`shard_map`](mod@shard_map) module for its complete semantics, including the ownership contract
 //!     for references that cross its boundary.
 //!
@@ -104,9 +103,8 @@ pub use constrain_sharding::{
 };
 pub use reshard::{RESHARD_OPERATION_NAME, Reshard, ReshardDispatch, ReshardOperation};
 pub use shard_map::{
-    SHARD_MAP_OPERATION_NAME, ShardMapBoundary, ShardMapContext, ShardMapError, ShardMapOperation, ShardMapTracer,
-    TracedShardMap, shard_map, shard_map_in_context, shard_map_with_options, trace_shard_map,
-    trace_shard_map_with_named_axes, trace_shard_map_with_options,
+    SHARD_MAP_OPERATION_NAME, ShardMap, ShardMapBoundary, ShardMapContext, ShardMapError, ShardMapOperation,
+    ShardMapOptions, ShardMapTracer, TracedShardMap, shard_map, trace_shard_map,
 };
 
 /// Group of the sharding-control capabilities [`Reshard`] and [`ConstrainSharding`]. It is implemented automatically

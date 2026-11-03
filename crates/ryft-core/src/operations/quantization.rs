@@ -3243,7 +3243,7 @@ mod tests {
         check_gradient, check_operation_batching, check_operation_partial_evaluation, check_operation_type_inference,
     };
     use crate::operations::assertions::AssertionError;
-    use crate::operations::sharding::shard_map::{ShardMapTracer, shard_map};
+    use crate::operations::sharding::shard_map::{ShardMapOptions, ShardMapTracer, shard_map};
     use crate::parameters::Placeholder;
     use crate::partial::PartialValue;
     use crate::programs::{EmptyRegionDriver, TypedProgram};
@@ -5708,7 +5708,7 @@ mod tests {
             .vjp(|quantized| {
                 let output = shard_map(
                     |quantized: BlockQuantizedValue<ShardMapTracer<EagerArrayIrContext>>| {
-                        quantized.block_dequantize([0], DataType::F32).unwrap()
+                        quantized.block_dequantize([0], DataType::F32)
                     },
                     quantized.try_map_parameters(|value| {
                         ValueProjection::<ArrayType>::into_projected(value).map_err(ProgramError::from)
@@ -5717,6 +5717,7 @@ mod tests {
                     BlockQuantizedValue::new(sharded.clone(), sharded.clone())
                         .with_global_scale(Sharding::replicated(mesh.clone(), 0)),
                     sharded.clone(),
+                    ShardMapOptions::new(),
                 )?;
                 Ok::<_, ProgramError>(output.into_value())
             })
@@ -6737,7 +6738,7 @@ mod tests {
                     |(lhs, rhs): (
                         BlockQuantizedValue<ShardMapTracer<EagerArrayIrContext>>,
                         BlockQuantizedValue<ShardMapTracer<EagerArrayIrContext>>,
-                    )| lhs.scaled_dot(&rhs, None, None).unwrap(),
+                    )| lhs.scaled_dot(&rhs, None, None),
                     (lhs, rhs),
                     mesh.clone(),
                     (
@@ -6747,6 +6748,7 @@ mod tests {
                             .with_global_scale(replicated_scalar.clone()),
                     ),
                     sharded_rows.clone(),
+                    ShardMapOptions::new(),
                 )?;
                 Ok::<_, ProgramError>(output.into_value())
             },
@@ -7875,7 +7877,7 @@ mod tests {
                     ShardMapTracer<EagerArrayIrContext>,
                     ShardMapTracer<EagerArrayIrContext>,
                     ShardMapTracer<EagerArrayIrContext>,
-                )| function.call(lhs, rhs, None, None, None, Some(state)).unwrap(),
+                )| function.call(lhs, rhs, None, None, None, Some(state)),
                 (
                     ValueProjection::<ArrayType>::into_projected(lhs)?,
                     ValueProjection::<ArrayType>::into_projected(rhs)?,
@@ -7884,6 +7886,7 @@ mod tests {
                 mesh.clone(),
                 (sharded_rows.clone(), Sharding::replicated(mesh.clone(), 2), Sharding::replicated(mesh.clone(), 1)),
                 sharded_rows.clone(),
+                ShardMapOptions::new(),
             )?;
             Ok::<_, ProgramError>(output.into_value())
         })

@@ -201,9 +201,9 @@ mod tests {
         Array, BatchAxis, BatchAxisSpecification, CollectiveOptions, ConstrainSharding, Context, DataType, Device,
         DeviceMesh, Differentiate, Dimension, EffectClass, LogicalMesh, MeshAxis, MeshAxisType, Mul, NamedAxis,
         ParallelAllGather, ParallelAllGatherOutputVariance, ParallelRaggedAllToAll, ParallelVary, Placeholder, Print,
-        Reduce, ReductionKind, RegionRole, Reshape, Reshard, Shape, ShardMapBoundary, ShardMapContext,
-        ShardMapOperation, Sharding, ShardingDimension, Sin, StagingContext, Typed, Value, batch, shard_map,
-        shard_map_in_context, shard_map_with_options,
+        Reduce, ReductionKind, RegionRole, Reshape, Reshard, Shape, ShardMap, ShardMapBoundary, ShardMapContext,
+        ShardMapOperation, ShardMapOptions, Sharding, ShardingDimension, Sin, StagingContext, Typed, Value, batch,
+        shard_map,
     };
     use ryft_pjrt::{BufferType, ClientOptions, CpuClientOptions, Program, load_cpu_plugin};
     #[cfg(feature = "cuda-13")]
@@ -246,11 +246,12 @@ mod tests {
                 let sharding = sharding.clone();
                 move |x: XlaArrayTracer| {
                     shard_map(
-                        |local_x: XlaArrayTracer| local_x.parallel_reduce(kind, "x").unwrap(),
+                        |local_x: XlaArrayTracer| local_x.parallel_reduce(kind, "x"),
                         x,
                         mesh.clone(),
                         sharding.clone(),
                         sharding.clone(),
+                        ShardMapOptions::new(),
                     )
                     .unwrap()
                 }
@@ -304,13 +305,12 @@ mod tests {
                 let sharding = sharding.clone();
                 move |x: XlaArrayTracer| {
                     let _printed = shard_map(
-                        |local_x: XlaArrayTracer| {
-                            local_x.print_with_effect_class("body", EffectClass::DeviceOrderedIo).unwrap()
-                        },
+                        |local_x: XlaArrayTracer| local_x.print_with_effect_class("body", EffectClass::DeviceOrderedIo),
                         x.clone(),
                         mesh.clone(),
                         sharding.clone(),
                         sharding.clone(),
+                        ShardMapOptions::new(),
                     )
                     .unwrap();
                     x
@@ -466,11 +466,12 @@ mod tests {
                 let mesh = mesh.clone();
                 move |x: XlaArrayTracer| {
                     shard_map(
-                        |local_x: XlaArrayTracer| local_x.sin().unwrap(),
+                        |local_x: XlaArrayTracer| local_x.sin(),
                         x,
                         mesh.clone(),
                         sharding.clone(),
                         sharding.clone(),
+                        ShardMapOptions::new(),
                     )
                     .unwrap()
                 }
@@ -621,16 +622,15 @@ mod tests {
                 move |inputs: Vec<XlaArrayTracer>| {
                     shard_map(
                         |inputs: Vec<XlaArrayTracer>| {
-                            inputs[0]
-                                .parallel_ragged_all_to_all(
-                                    "x", &inputs[1], &inputs[2], &inputs[3], &inputs[4], &inputs[5],
-                                )
-                                .unwrap()
+                            inputs[0].parallel_ragged_all_to_all(
+                                "x", &inputs[1], &inputs[2], &inputs[3], &inputs[4], &inputs[5],
+                            )
                         },
                         inputs,
                         mesh.clone(),
                         shardings.clone(),
                         output_sharding.clone(),
+                        ShardMapOptions::new(),
                     )
                     .unwrap()
                 }
@@ -696,16 +696,15 @@ mod tests {
                 move |inputs: Vec<XlaArrayTracer>| {
                     shard_map(
                         |inputs: Vec<XlaArrayTracer>| {
-                            inputs[0]
-                                .parallel_ragged_all_to_all(
-                                    "x", &inputs[1], &inputs[2], &inputs[3], &inputs[4], &inputs[5],
-                                )
-                                .unwrap()
+                            inputs[0].parallel_ragged_all_to_all(
+                                "x", &inputs[1], &inputs[2], &inputs[3], &inputs[4], &inputs[5],
+                            )
                         },
                         inputs,
                         mesh.clone(),
                         shardings.clone(),
                         output_sharding.clone(),
+                        ShardMapOptions::new(),
                     )
                     .unwrap()
                 }
@@ -804,7 +803,7 @@ mod tests {
                     shard_map(
                         |inputs: Vec<XlaArrayTracer>| {
                             let context = inputs[0].domain();
-                            context
+                            Ok(context
                                 .differentiate_at(inputs[0].clone())
                                 .with_captures((
                                     inputs[1].clone(),
@@ -826,13 +825,13 @@ mod tests {
                                             )
                                             .map(|result| result.reduce(&[0], ReductionKind::Sum).unwrap())
                                     },
-                                )
-                                .unwrap()
+                                )?)
                         },
                         inputs,
                         mesh.clone(),
                         shardings.clone(),
                         output_sharding.clone(),
+                        ShardMapOptions::new(),
                     )
                     .unwrap()
                 }
@@ -965,11 +964,12 @@ mod tests {
                 let sharding = sharding.clone();
                 move |x: XlaArrayTracer| {
                     shard_map(
-                        |local_x: XlaArrayTracer| local_x.parallel_reduce(ReductionKind::Sum, "x").unwrap(),
+                        |local_x: XlaArrayTracer| local_x.parallel_reduce(ReductionKind::Sum, "x"),
                         x,
                         mesh.clone(),
                         sharding.clone(),
                         sharding.clone(),
+                        ShardMapOptions::new(),
                     )
                     .expect("shard_map with a sum parallel_reduce should trace")
                 }
@@ -1170,15 +1170,14 @@ mod tests {
                             Ok(shard_map(
                                 |local_x: XlaArrayTracer| {
                                     local_x
-                                        .reduce(&[0], ReductionKind::Sum)
-                                        .unwrap()
+                                        .reduce(&[0], ReductionKind::Sum)?
                                         .parallel_reduce(ReductionKind::LogSumExp, "x")
-                                        .unwrap()
                                 },
                                 x,
                                 mesh.clone(),
                                 sharded.clone(),
                                 replicated.clone(),
+                                ShardMapOptions::new(),
                             )
                             .unwrap()
                             .into_value())
@@ -1278,20 +1277,19 @@ mod tests {
                             let x = ValueProjection::<ArrayType>::into_projected(x)?;
                             Ok(shard_map(
                                 |local_x: XlaArrayTracer| {
-                                    let gathered = local_x
-                                        .parallel_all_gather_with_options(
-                                            "x",
-                                            0,
-                                            CollectiveOptions::tiled(),
-                                            ParallelAllGatherOutputVariance::Invariant,
-                                        )
-                                        .unwrap();
-                                    gathered.mul(&gathered).unwrap().reduce(&[0], ReductionKind::Sum).unwrap()
+                                    let gathered = local_x.parallel_all_gather_with_options(
+                                        "x",
+                                        0,
+                                        CollectiveOptions::tiled(),
+                                        ParallelAllGatherOutputVariance::Invariant,
+                                    )?;
+                                    gathered.mul(&gathered)?.reduce(&[0], ReductionKind::Sum)
                                 },
                                 x,
                                 mesh.clone(),
                                 sharded.clone(),
                                 replicated.clone(),
+                                ShardMapOptions::new(),
                             )
                             .unwrap()
                             .into_value())
@@ -1394,15 +1392,14 @@ mod tests {
                                 Ok(shard_map(
                                     |(shared, weights): (XlaArrayTracer, XlaArrayTracer)| {
                                         (shared.clone() * shared * weights)
-                                            .reduce(&[0], ReductionKind::Sum)
-                                            .unwrap()
+                                            .reduce(&[0], ReductionKind::Sum)?
                                             .parallel_reduce(ReductionKind::Sum, "x")
-                                            .unwrap()
                                     },
                                     (shared, weights),
                                     mesh.clone(),
                                     (replicated.clone(), sharded.clone()),
                                     replicated.clone(),
+                                    ShardMapOptions::new(),
                                 )
                                 .unwrap()
                                 .into_value())
@@ -1418,15 +1415,14 @@ mod tests {
                                 Ok(shard_map(
                                     |varying: XlaArrayTracer| {
                                         (varying.clone() * varying)
-                                            .reduce(&[0], ReductionKind::Sum)
-                                            .unwrap()
+                                            .reduce(&[0], ReductionKind::Sum)?
                                             .parallel_reduce(ReductionKind::Sum, "x")
-                                            .unwrap()
                                     },
                                     varying,
                                     mesh.clone(),
                                     sharded.clone(),
                                     replicated.clone(),
+                                    ShardMapOptions::new(),
                                 )
                                 .unwrap()
                                 .into_value())
@@ -1449,15 +1445,14 @@ mod tests {
                                         Ok(shard_map(
                                             |(shared, weights): (XlaArrayTracer, XlaArrayTracer)| {
                                                 (shared.clone() * shared * weights)
-                                                    .reduce(&[0], ReductionKind::Sum)
-                                                    .unwrap()
+                                                    .reduce(&[0], ReductionKind::Sum)?
                                                     .parallel_reduce(ReductionKind::Sum, "x")
-                                                    .unwrap()
                                             },
                                             (shared, weights),
                                             mesh.clone(),
                                             (replicated.clone(), sharded.clone()),
                                             replicated.clone(),
+                                            ShardMapOptions::new(),
                                         )
                                         .unwrap()
                                         .into_value())
@@ -1475,12 +1470,13 @@ mod tests {
                                 let weights = ValueProjection::<ArrayType>::into_projected(weights)?;
                                 Ok(shard_map(
                                     |(shared, weights): (XlaArrayTracer, XlaArrayTracer)| {
-                                        shared.clone() * shared * weights
+                                        Ok(shared.clone() * shared * weights)
                                     },
                                     (shared, weights),
                                     mesh.clone(),
                                     (replicated.clone(), sharded.clone()),
                                     sharded.clone(),
+                                    ShardMapOptions::new(),
                                 )
                                 .unwrap()
                                 .into_value())
@@ -1499,12 +1495,13 @@ mod tests {
                                     let weights = ValueProjection::<ArrayType>::into_projected(weights)?;
                                     Ok(shard_map(
                                         |(shared, weights): (XlaArrayTracer, XlaArrayTracer)| {
-                                            shared.clone() * shared * weights
+                                            Ok(shared.clone() * shared * weights)
                                         },
                                         (shared, weights),
                                         mesh.clone(),
                                         (replicated.clone(), sharded.clone()),
                                         sharded.clone(),
+                                        ShardMapOptions::new(),
                                     )
                                     .unwrap()
                                     .into_value())
@@ -1526,25 +1523,26 @@ mod tests {
                                             .reduce(&[0], ReductionKind::Sum)
                                             .unwrap()
                                             .into_value())
-                                    })
-                                    .unwrap();
-                                ValueProjection::<ArrayType>::into_projected(derivative).unwrap()
+                                    })?;
+                                Ok(ValueProjection::<ArrayType>::into_projected(derivative)?)
                             },
                             (inputs[0].clone(), inputs[1].clone()),
                             mesh.clone(),
                             (replicated.clone(), sharded.clone()),
                             replicated.clone(),
+                            ShardMapOptions::new(),
                         )
                         .unwrap();
                         let constant_sum = shard_map(
                             |input: XlaArrayTracer| {
-                                let constant: XlaArrayTracer = input.domain().fill(&input.r#type(), 3.0_f32).unwrap();
-                                constant.parallel_reduce(ReductionKind::Sum, "x").unwrap()
+                                let constant: XlaArrayTracer = input.domain().fill(&input.r#type(), 3.0_f32)?;
+                                constant.parallel_reduce(ReductionKind::Sum, "x")
                             },
                             inputs[0].clone(),
                             mesh.clone(),
                             replicated.clone(),
                             replicated.clone(),
+                            ShardMapOptions::new(),
                         )
                         .unwrap();
                         vec![
@@ -1717,12 +1715,13 @@ mod tests {
                             let indices = ValueProjection::<ArrayType>::into_projected(indices)?;
                             Ok(shard_map(
                                 |(data, indices): (XlaArrayTracer, XlaArrayTracer)| {
-                                    data.gather_axis(&indices, 0, GatherMode::Clip).unwrap()
+                                    data.gather_axis(&indices, 0, GatherMode::Clip)
                                 },
                                 (data, indices),
                                 mesh.clone(),
                                 (replicated.clone(), sharded.clone()),
                                 sharded.clone(),
+                                ShardMapOptions::new(),
                             )
                             .unwrap()
                             .into_value())
@@ -1731,14 +1730,15 @@ mod tests {
                     let gradient = pullback.apply_materialized(inputs[2].clone().into_value()).unwrap();
                     let maxima = shard_map(
                         |input: XlaArrayTracer| {
-                            let maximum = input.parallel_reduce(ReductionKind::Max, "x").unwrap();
-                            let varying = maximum.parallel_vary("x").unwrap();
-                            (maximum, varying)
+                            let maximum = input.parallel_reduce(ReductionKind::Max, "x")?;
+                            let varying = maximum.parallel_vary("x")?;
+                            Ok((maximum, varying))
                         },
                         inputs[2].clone(),
                         mesh.clone(),
                         sharded.clone(),
                         (replicated.clone(), sharded.clone()),
+                        ShardMapOptions::new(),
                     )
                     .unwrap();
                     vec![
@@ -1888,12 +1888,13 @@ mod tests {
                             let indices = ValueProjection::<ArrayType>::into_projected(indices)?;
                             Ok(shard_map(
                                 |(data, indices): (XlaArrayTracer, XlaArrayTracer)| {
-                                    Sort::sort(&[indices, data], 0, SortDirection::Ascending).unwrap().remove(1)
+                                    Ok(Sort::sort(&[indices, data], 0, SortDirection::Ascending)?.remove(1))
                                 },
                                 (data, indices),
                                 mesh.clone(),
                                 (replicated.clone(), sharded.clone()),
                                 sharded.clone(),
+                                ShardMapOptions::new(),
                             )
                             .unwrap()
                             .into_value())
@@ -2180,31 +2181,27 @@ mod tests {
                         .value_and_gradient(|(shared, weights)| {
                             let shared = ValueProjection::<ArrayType>::into_projected(shared)?;
                             let weights = ValueProjection::<ArrayType>::into_projected(weights)?;
-                            Ok(shard_map_with_options(
+                            Ok(shard_map(
                                 |inputs: (XlaArrayTracer, XlaArrayTracer)| {
-                                    shard_map_with_options(
+                                    shard_map(
                                         |(shared, weights): (XlaArrayTracer, XlaArrayTracer)| {
                                             (shared.clone() * shared * weights.clone() * weights)
-                                                .reduce(&[0], ReductionKind::Sum)
-                                                .unwrap()
+                                                .reduce(&[0], ReductionKind::Sum)?
                                                 .parallel_reduce(ReductionKind::Sum, "y")
-                                                .unwrap()
                                         },
                                         inputs,
                                         mesh.clone(),
                                         (replicated.clone(), inner.clone()),
                                         replicated.clone(),
-                                        vec!["y".to_string()],
-                                    )
-                                    .unwrap()
+                                        ShardMapOptions::new().with_manual_axes(["y"]),
+                                    )?
                                     .parallel_reduce(ReductionKind::Sum, "x")
-                                    .unwrap()
                                 },
                                 (shared, weights),
                                 mesh.clone(),
                                 (replicated.clone(), outer.clone()),
                                 replicated.clone(),
-                                vec!["x".to_string()],
+                                ShardMapOptions::new().with_manual_axes(["x"]),
                             )
                             .unwrap()
                             .into_value())
@@ -2327,19 +2324,17 @@ mod tests {
                         .value_and_gradient(|(shared, weights)| {
                             let shared = ValueProjection::<ArrayType>::into_projected(shared)?;
                             let weights = ValueProjection::<ArrayType>::into_projected(weights)?;
-                            Ok(shard_map_with_options(
+                            Ok(shard_map(
                                 |(shared, weights): (XlaArrayTracer, XlaArrayTracer)| {
                                     (shared.clone() * shared * weights)
-                                        .reduce(&[0, 1], ReductionKind::Sum)
-                                        .unwrap()
+                                        .reduce(&[0, 1], ReductionKind::Sum)?
                                         .parallel_reduce(ReductionKind::Sum, "x")
-                                        .unwrap()
                                 },
                                 (shared, weights),
                                 mesh.clone(),
                                 (shared_sharding.clone(), global.clone()),
                                 replicated.clone(),
-                                vec!["x".to_string()],
+                                ShardMapOptions::new().with_manual_axes(["x"]),
                             )
                             .unwrap()
                             .into_value())
@@ -2515,19 +2510,18 @@ mod tests {
                                         builder.build(vec![next_state], vec![Placeholder], vec![Placeholder]).unwrap()
                                     };
                                     let context = local_x.value().context().clone();
-                                    let mut outputs = context
-                                        .stage_operation(
-                                            XlaOperation::While(WhileOperation::new().with_iteration_bound(4).unwrap()),
-                                            vec![condition, body],
-                                            &[local_x.into_value()],
-                                        )
-                                        .unwrap();
-                                    ValueProjection::<ArrayType>::into_projected(outputs.remove(0)).unwrap()
+                                    let mut outputs = context.stage_operation(
+                                        XlaOperation::While(WhileOperation::new().with_iteration_bound(4).unwrap()),
+                                        vec![condition, body],
+                                        &[local_x.into_value()],
+                                    )?;
+                                    Ok(ValueProjection::<ArrayType>::into_projected(outputs.remove(0))?)
                                 },
                                 x,
                                 mesh.clone(),
                                 sharded.clone(),
                                 sharded.clone(),
+                                ShardMapOptions::new(),
                             )
                             .unwrap()
                             .reduce(&[0], ReductionKind::Sum)
@@ -2639,12 +2633,13 @@ mod tests {
                                 ADD_ONE_CUSTOM_CALL_TARGET,
                                 vec![local_x.r#type().into_owned()],
                             );
-                            CustomCall::custom_call(&operation, std::slice::from_ref(&local_x)).unwrap().remove(0)
+                            Ok(CustomCall::custom_call(&operation, std::slice::from_ref(&local_x))?.remove(0))
                         },
                         x,
                         mesh.clone(),
                         sharding.clone(),
                         sharding.clone(),
+                        ShardMapOptions::new(),
                     )
                     .expect("shard_map with a custom call should trace")
                 }
@@ -2741,11 +2736,12 @@ mod tests {
                 let sharding = sharding.clone();
                 move |x: XlaArrayTracer| {
                     shard_map(
-                        |local_x: XlaArrayTracer| local_x.parallel_reduce(ReductionKind::Mean, "x").unwrap(),
+                        |local_x: XlaArrayTracer| local_x.parallel_reduce(ReductionKind::Mean, "x"),
                         x,
                         mesh.clone(),
                         sharding.clone(),
                         sharding.clone(),
+                        ShardMapOptions::new(),
                     )
                     .expect("shard_map with a mean parallel_reduce should trace")
                 }
@@ -2790,18 +2786,17 @@ mod tests {
                 move |x: XlaArrayTracer| {
                     shard_map(
                         |local_x: XlaArrayTracer| {
-                            local_x
-                                .parallel_reduce_with_axis_index_groups(
-                                    ReductionKind::Mean,
-                                    "x",
-                                    vec![vec![0, 2], vec![3, 1]],
-                                )
-                                .unwrap()
+                            local_x.parallel_reduce_with_axis_index_groups(
+                                ReductionKind::Mean,
+                                "x",
+                                vec![vec![0, 2], vec![3, 1]],
+                            )
                         },
                         x,
                         mesh.clone(),
                         sharding.clone(),
                         sharding.clone(),
+                        ShardMapOptions::new(),
                     )
                     .unwrap()
                 }
@@ -2842,14 +2837,14 @@ mod tests {
                                 BatchAxis::new(0),
                                 BatchAxis::new(0),
                                 BatchAxisSpecification::named("b"),
-                            )
-                            .expect("vmap inside shard_map should trace");
-                            summed
+                            )?;
+                            Ok(summed)
                         },
                         x,
                         mesh.clone(),
                         sharding.clone(),
                         sharding.clone(),
+                        ShardMapOptions::new(),
                     )
                     .expect("shard_map with a vmapped sum parallel_reduce should trace")
                 }
@@ -2914,11 +2909,12 @@ mod tests {
                         |item| {
                             let item = ValueProjection::<ArrayType>::into_projected(item)?;
                             let output = shard_map(
-                                |local: BatchedShardMapTracer| local.parallel_reduce(ReductionKind::Sum, "x").unwrap(),
+                                |local: BatchedShardMapTracer| local.parallel_reduce(ReductionKind::Sum, "x"),
                                 item,
                                 mesh.clone(),
                                 item_sharding.clone(),
                                 item_sharding.clone(),
+                                ShardMapOptions::new(),
                             )?;
                             Ok(output.into_value())
                         },
@@ -3063,11 +3059,12 @@ mod tests {
                         |item| {
                             let item = ValueProjection::<ArrayType>::into_projected(item)?;
                             let output = shard_map(
-                                |local: BatchedShardMapTracer| local.parallel_reduce(ReductionKind::Sum, "x").unwrap(),
+                                |local: BatchedShardMapTracer| local.parallel_reduce(ReductionKind::Sum, "x"),
                                 item,
                                 mesh.clone(),
                                 item_sharding.clone(),
                                 item_sharding.clone(),
+                                ShardMapOptions::new(),
                             )?;
                             Ok(output.into_value())
                         },
@@ -3206,21 +3203,20 @@ mod tests {
                                 builder.build(vec![input], vec![Placeholder], vec![Placeholder]).unwrap()
                             };
                             let context = local_x.value().context().clone();
-                            let predicate = context.lift(XlaConstant::Boolean(true)).unwrap();
-                            let mut outputs = context
-                                .stage_operation(
-                                    XlaOperation::Condition(ConditionOperation::new()),
-                                    vec![parallel_sum_branch, identity_branch],
-                                    &[predicate, local_x.into_value()],
-                                )
-                                .unwrap();
-                            ValueProjection::<ArrayType>::into_projected(outputs.remove(0))
-                                .expect("condition output should remain an array")
+                            let predicate = context.lift(XlaConstant::Boolean(true))?;
+                            let mut outputs = context.stage_operation(
+                                XlaOperation::Condition(ConditionOperation::new()),
+                                vec![parallel_sum_branch, identity_branch],
+                                &[predicate, local_x.into_value()],
+                            )?;
+                            Ok(ValueProjection::<ArrayType>::into_projected(outputs.remove(0))
+                                .expect("condition output should remain an array"))
                         },
                         x,
                         mesh.clone(),
                         sharding.clone(),
                         sharding.clone(),
+                        ShardMapOptions::new(),
                     )
                     .expect("shard_map with a sum parallel_reduce inside a condition should trace")
                 }
@@ -3269,19 +3265,18 @@ mod tests {
                 shard_map(
                     |local_x: XlaArrayTracer| {
                         let context = local_x.value().context().clone();
-                        let mut outputs = context
-                            .stage_operation(
-                                ParallelReduceOperation::new(ReductionKind::LogSumExp, "x".to_string()),
-                                Vec::new(),
-                                &[local_x.into_value()],
-                            )
-                            .unwrap();
-                        ValueProjection::<ArrayType>::into_projected(outputs.remove(0)).unwrap()
+                        let mut outputs = context.stage_operation(
+                            ParallelReduceOperation::new(ReductionKind::LogSumExp, "x".to_string()),
+                            Vec::new(),
+                            &[local_x.into_value()],
+                        )?;
+                        Ok(ValueProjection::<ArrayType>::into_projected(outputs.remove(0))?)
                     },
                     x,
                     mesh.clone(),
                     sharding.clone(),
                     sharding.clone(),
+                    ShardMapOptions::new(),
                 )
                 .unwrap()
             },
@@ -3311,19 +3306,21 @@ mod tests {
                 let sharding = sharding.clone();
                 move |x: XlaArrayTracer| {
                     let first = shard_map(
-                        |local_x: XlaArrayTracer| local_x.parallel_reduce(ReductionKind::Sum, "x").unwrap(),
+                        |local_x: XlaArrayTracer| local_x.parallel_reduce(ReductionKind::Sum, "x"),
                         x,
                         mesh.clone(),
                         sharding.clone(),
                         sharding.clone(),
+                        ShardMapOptions::new(),
                     )
                     .expect("first shard_map should trace");
                     shard_map(
-                        |local_x: XlaArrayTracer| local_x.parallel_reduce(ReductionKind::Sum, "x").unwrap(),
+                        |local_x: XlaArrayTracer| local_x.parallel_reduce(ReductionKind::Sum, "x"),
                         first,
                         mesh.clone(),
                         sharding.clone(),
                         sharding.clone(),
+                        ShardMapOptions::new(),
                     )
                     .expect("second shard_map should trace")
                 }
@@ -3395,7 +3392,7 @@ mod tests {
                             // `axis_index` is a scalar per device; broadcast it to the shard shape so the add has
                             // shape-congruent operands (StableHLO has no implicit broadcasting).
                             let local_type = local_x.r#type().into_owned();
-                            let index = local_x.domain().axis_index("x").unwrap();
+                            let index = local_x.domain().axis_index("x")?;
                             let index_sharding = index
                                 .r#type()
                                 .sharding()
@@ -3403,13 +3400,14 @@ mod tests {
                                 .with_broadcasted_dimensions(local_type.rank(), &[])
                                 .unwrap();
                             let index_type = local_type.with_sharding(index_sharding).unwrap();
-                            let index = index.broadcast(index_type, &[]).unwrap();
-                            local_x + index
+                            let index = index.broadcast(index_type, &[])?;
+                            Ok(local_x + index)
                         },
                         x,
                         mesh.clone(),
                         sharding.clone(),
                         sharding.clone(),
+                        ShardMapOptions::new(),
                     )
                     .expect("shard_map with axis_index should trace")
                 }
@@ -3493,7 +3491,7 @@ mod tests {
     }
 
     #[test]
-    fn test_shard_map_in_context_without_inputs_executes_on_cpu() {
+    fn test_context_shard_map_without_inputs_executes_on_cpu() {
         use ryft_core::AxisIndex;
 
         // JAX's `test_axis_index`: a body without inputs reads the coordinate of each device along `x` through its
@@ -3519,18 +3517,19 @@ mod tests {
             {
                 let sharded = sharded.clone();
                 move |x: XlaArrayTracer| {
-                    shard_map_in_context(
-                        x.value().context(),
-                        |context: &ShardMapContext<DomainTracingContext<XlaDomain<'static>>>, ()| {
-                            context.axis_index("x").unwrap().reshape([1]).unwrap()
-                        },
-                        (),
-                        mesh,
-                        (),
-                        sharded,
-                        Vec::new(),
-                    )
-                    .unwrap()
+                    x.value()
+                        .context()
+                        .shard_map(
+                            |context: &ShardMapContext<DomainTracingContext<XlaDomain<'static>>>, ()| {
+                                context.axis_index("x")?.reshape([1])
+                            },
+                            (),
+                            mesh,
+                            (),
+                            sharded,
+                            ShardMapOptions::new(),
+                        )
+                        .unwrap()
                 }
             },
             ArrayType::scalar(DataType::F32),
@@ -3618,7 +3617,7 @@ mod tests {
                     shard_map(
                         |local_x: XlaArrayTracer| {
                             let local_type = local_x.r#type().into_owned();
-                            let index = local_x.domain().axis_index("x").unwrap();
+                            let index = local_x.domain().axis_index("x")?;
                             let index_sharding = index
                                 .r#type()
                                 .sharding()
@@ -3626,12 +3625,13 @@ mod tests {
                                 .with_broadcasted_dimensions(local_type.rank(), &[])
                                 .unwrap();
                             let index_type = local_type.with_sharding(index_sharding).unwrap();
-                            index.broadcast(index_type, &[]).unwrap()
+                            index.broadcast(index_type, &[])
                         },
                         x,
                         mesh.clone(),
                         sharding.clone(),
                         sharding.clone(),
+                        ShardMapOptions::new(),
                     )
                     .expect("shard_map with axis_index of the major axis should trace")
                 }
@@ -3696,19 +3696,18 @@ mod tests {
                 move |x: XlaArrayTracer| {
                     shard_map(
                         |local_x: XlaArrayTracer| {
-                            local_x
-                                .parallel_all_gather_with_options(
-                                    "x",
-                                    0,
-                                    CollectiveOptions::tiled(),
-                                    ParallelAllGatherOutputVariance::Varying,
-                                )
-                                .unwrap()
+                            local_x.parallel_all_gather_with_options(
+                                "x",
+                                0,
+                                CollectiveOptions::tiled(),
+                                ParallelAllGatherOutputVariance::Varying,
+                            )
                         },
                         x,
                         mesh.clone(),
                         sharding.clone(),
                         sharding.clone(),
+                        ShardMapOptions::new(),
                     )
                     .expect("shard_map with parallel_all_gather should trace")
                 }
@@ -3820,19 +3819,18 @@ mod tests {
                 move |x: XlaArrayTracer| {
                     shard_map(
                         |local_x: XlaArrayTracer| {
-                            local_x
-                                .parallel_all_gather_with_options(
-                                    "x",
-                                    0,
-                                    CollectiveOptions::default(),
-                                    ParallelAllGatherOutputVariance::Varying,
-                                )
-                                .unwrap()
+                            local_x.parallel_all_gather_with_options(
+                                "x",
+                                0,
+                                CollectiveOptions::default(),
+                                ParallelAllGatherOutputVariance::Varying,
+                            )
                         },
                         x,
                         mesh.clone(),
                         input_sharding.clone(),
                         output_sharding.clone(),
+                        ShardMapOptions::new(),
                     )
                     .unwrap()
                 }
@@ -3918,19 +3916,18 @@ mod tests {
                 move |x: XlaArrayTracer| {
                     shard_map(
                         |local_x: XlaArrayTracer| {
-                            local_x
-                                .parallel_all_gather_with_options(
-                                    "x",
-                                    0,
-                                    CollectiveOptions::tiled().with_axis_index_groups(vec![vec![0, 2], vec![3, 1]]),
-                                    ParallelAllGatherOutputVariance::Varying,
-                                )
-                                .unwrap()
+                            local_x.parallel_all_gather_with_options(
+                                "x",
+                                0,
+                                CollectiveOptions::tiled().with_axis_index_groups(vec![vec![0, 2], vec![3, 1]]),
+                                ParallelAllGatherOutputVariance::Varying,
+                            )
                         },
                         x,
                         mesh.clone(),
                         sharding.clone(),
                         sharding.clone(),
+                        ShardMapOptions::new(),
                     )
                     .unwrap()
                 }
@@ -3973,23 +3970,22 @@ mod tests {
                         |local_x: XlaArrayTracer| {
                             let options =
                                 CollectiveOptions::tiled().with_axis_index_groups(vec![vec![0, 2], vec![3, 1]]);
-                            (
-                                local_x
-                                    .parallel_all_gather_with_options(
-                                        "x",
-                                        0,
-                                        options.clone(),
-                                        ParallelAllGatherOutputVariance::Varying,
-                                    )
-                                    .unwrap(),
-                                local_x.clone().parallel_sum_scatter_with_options("x", 0, options.clone()).unwrap(),
-                                local_x.parallel_all_to_all_with_options("x", 0, 0, options).unwrap(),
-                            )
+                            Ok((
+                                local_x.parallel_all_gather_with_options(
+                                    "x",
+                                    0,
+                                    options.clone(),
+                                    ParallelAllGatherOutputVariance::Varying,
+                                )?,
+                                local_x.clone().parallel_sum_scatter_with_options("x", 0, options.clone())?,
+                                local_x.parallel_all_to_all_with_options("x", 0, 0, options)?,
+                            ))
                         },
                         x,
                         mesh.clone(),
                         sharding.clone(),
                         (sharding.clone(), sharding.clone(), sharding.clone()),
+                        ShardMapOptions::new(),
                     )
                     .unwrap()
                 }
@@ -4117,12 +4113,13 @@ mod tests {
                 move |x: XlaArrayTracer| {
                     shard_map(
                         |local_x: XlaArrayTracer| {
-                            local_x.parallel_sum_scatter_with_options("x", 0, CollectiveOptions::tiled()).unwrap()
+                            local_x.parallel_sum_scatter_with_options("x", 0, CollectiveOptions::tiled())
                         },
                         x,
                         mesh.clone(),
                         sharding.clone(),
                         sharding.clone(),
+                        ShardMapOptions::new(),
                     )
                     .expect("shard_map with parallel_sum_scatter should trace")
                 }
@@ -4243,18 +4240,17 @@ mod tests {
                 move |x: XlaArrayTracer| {
                     shard_map(
                         |local_x: XlaArrayTracer| {
-                            local_x
-                                .parallel_sum_scatter_with_options(
-                                    "x",
-                                    1,
-                                    CollectiveOptions::default().with_axis_index_groups(vec![vec![1, 0]]),
-                                )
-                                .unwrap()
+                            local_x.parallel_sum_scatter_with_options(
+                                "x",
+                                1,
+                                CollectiveOptions::default().with_axis_index_groups(vec![vec![1, 0]]),
+                            )
                         },
                         x,
                         mesh.clone(),
                         input_sharding.clone(),
                         output_sharding.clone(),
+                        ShardMapOptions::new(),
                     )
                     .unwrap()
                 }
@@ -4377,11 +4373,12 @@ mod tests {
                 let sharding = sharding.clone();
                 move |x: XlaArrayTracer| {
                     shard_map(
-                        |local_x: XlaArrayTracer| local_x.parallel_permute("x", vec![(0, 1), (1, 0)]).unwrap(),
+                        |local_x: XlaArrayTracer| local_x.parallel_permute("x", vec![(0, 1), (1, 0)]),
                         x,
                         mesh.clone(),
                         sharding.clone(),
                         sharding.clone(),
+                        ShardMapOptions::new(),
                     )
                     .expect("shard_map with parallel_permute should trace")
                 }
@@ -4473,11 +4470,12 @@ mod tests {
             let traced: TracedXlaProgram<ArrayType, ArrayType> = trace(
                 move |input: XlaArrayTracer| {
                     shard_map(
-                        |local_input: XlaArrayTracer| local_input.parallel_permute("x", pairs.clone()).unwrap(),
+                        |local_input: XlaArrayTracer| local_input.parallel_permute("x", pairs.clone()),
                         input,
                         mesh.clone(),
                         sharding.clone(),
                         sharding.clone(),
+                        ShardMapOptions::new(),
                     )
                     .unwrap()
                 },
@@ -4534,20 +4532,20 @@ mod tests {
                 move |input: XlaArrayTracer| {
                     shard_map(
                         |local_input: XlaArrayTracer| {
-                            local_input
+                            Ok(local_input
                                 .domain()
                                 .bind(
                                     ParallelPermuteOperation::new("x".to_string(), axis_size, pairs.clone()),
                                     Vec::new(),
                                     &[local_input],
-                                )
-                                .unwrap()
-                                .remove(0)
+                                )?
+                                .remove(0))
                         },
                         input,
                         mesh.clone(),
                         sharding.clone(),
                         sharding.clone(),
+                        ShardMapOptions::new(),
                     )
                     .unwrap()
                 },
@@ -4597,12 +4595,13 @@ mod tests {
                 move |x: XlaArrayTracer| {
                     shard_map(
                         |local_x: XlaArrayTracer| {
-                            local_x.parallel_all_to_all_with_options("x", 0, 0, CollectiveOptions::tiled()).unwrap()
+                            local_x.parallel_all_to_all_with_options("x", 0, 0, CollectiveOptions::tiled())
                         },
                         x,
                         mesh.clone(),
                         sharding.clone(),
                         sharding.clone(),
+                        ShardMapOptions::new(),
                     )
                     .expect("shard_map with parallel_all_to_all should trace")
                 }
@@ -4720,14 +4719,15 @@ mod tests {
                         |local_x: XlaArrayTracer| {
                             // Removing split axis 0 puts the gathered participant axis at output axis 1.
                             // The inverse exchanges axis 1 back into output axis 0.
-                            let exchanged = local_x.parallel_all_to_all("x", 0, 1).unwrap();
-                            let recovered = exchanged.parallel_all_to_all("x", 1, 0).unwrap();
-                            (exchanged, recovered)
+                            let exchanged = local_x.parallel_all_to_all("x", 0, 1)?;
+                            let recovered = exchanged.parallel_all_to_all("x", 1, 0)?;
+                            Ok((exchanged, recovered))
                         },
                         x,
                         mesh.clone(),
                         input_sharding.clone(),
                         (output_sharding.clone(), input_sharding.clone()),
+                        ShardMapOptions::new(),
                     )
                     .unwrap()
                 }

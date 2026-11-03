@@ -6910,9 +6910,9 @@ mod tests {
         ReferenceNewOperation, ReferenceRead, ReferenceReadOperation, ReferenceSwapOperation, ReferenceType,
         ReferenceWrite, ReferenceWriteOperation, Reshape, ReshapeOperation, RngBitGeneratorOperation,
         ScaledDotOperation, ScanOperation, Scatter, ScatterDimensionNumbers, ScatterMode, ScatterOperation,
-        ScatterOptions, SelectOperation, ShardMapBoundary, ShardMapOperation, Sharding, ShardingDimension,
-        SliceOperation, SortDirection, SortOperation, StagedFunction, StagingContext, StaticShape, SubOperation,
-        TracingContext, Value, WhileOperation, ZeroOperation, batch, shard_map,
+        ScatterOptions, SelectOperation, ShardMapBoundary, ShardMapOperation, ShardMapOptions, Sharding,
+        ShardingDimension, SliceOperation, SortDirection, SortOperation, StagedFunction, StagingContext, StaticShape,
+        SubOperation, TracingContext, Value, WhileOperation, ZeroOperation, batch, shard_map,
     };
     use ryft_pjrt::{ClientOptions, CpuClientOptions, load_cpu_plugin};
     #[cfg(feature = "cuda-13")]
@@ -7639,29 +7639,29 @@ mod tests {
             ArrayType::new_static(DataType::F32, shape.to_vec()).with_sharding(sharding.clone()).unwrap()
         };
         let sum_over_x = ParallelReduceOperation::new(ReductionKind::Sum, "x".to_string()).with_mesh(mesh.clone());
-        let (shard_map, global_input_types, body) = match case {
+        let (boundary, global_input_types, body) = match case {
             ShardMapDifferentialCase::IdentityAndSum => {
-                let shard_map = ShardMapBoundary::new(
+                let boundary = ShardMapBoundary::new(
                     mesh.clone(),
                     vec![sharded("x")],
                     vec![sharded("x"), replicated],
                     vec!["x".into()],
-                );
-                let shard_map = shard_map.unwrap();
+                )
+                .unwrap();
                 let global_type = f32_type(&[4], &sharded("x"));
-                let local_type = shard_map.local_input_type(0, &global_type).unwrap();
+                let local_type = boundary.local_input_type(0, &global_type).unwrap();
                 let body = build_differential_program::<V, O>(vec![local_type.into()], |builder, inputs| {
                     let sum = array_operation(ArrayOperation::ParallelReduce(sum_over_x));
                     vec![inputs[0], builder.add_instruction(sum, Vec::new(), vec![inputs[0]], None).unwrap()[0]]
                 });
-                (shard_map, vec![global_type.into()], body)
+                (boundary, vec![global_type.into()], body)
             }
             ShardMapDifferentialCase::AxisIndex => {
-                let shard_map =
-                    ShardMapBoundary::new(mesh.clone(), vec![sharded("x")], vec![sharded("x")], vec!["x".into()]);
-                let shard_map = shard_map.unwrap();
+                let boundary =
+                    ShardMapBoundary::new(mesh.clone(), vec![sharded("x")], vec![sharded("x")], vec!["x".into()])
+                        .unwrap();
                 let global_type = f32_type(&[2], &sharded("x"));
-                let local_type = shard_map.local_input_type(0, &global_type).unwrap();
+                let local_type = boundary.local_input_type(0, &global_type).unwrap();
                 let body = build_differential_program::<V, O>(vec![local_type.into()], |builder, _| {
                     let index = AxisIndexOperation::new("x".to_string()).with_mesh(mesh.clone());
                     let index = array_operation(ArrayOperation::AxisIndex(index));
@@ -7670,14 +7670,14 @@ mod tests {
                     let reshape = array_operation(ArrayOperation::Reshape(reshape));
                     builder.add_instruction(reshape, Vec::new(), vec![index], None).unwrap().to_vec()
                 });
-                (shard_map, vec![global_type.into()], body)
+                (boundary, vec![global_type.into()], body)
             }
             ShardMapDifferentialCase::AllGather => {
-                let shard_map =
-                    ShardMapBoundary::new(mesh.clone(), vec![sharded("x")], vec![replicated], vec!["x".into()]);
-                let shard_map = shard_map.unwrap();
+                let boundary =
+                    ShardMapBoundary::new(mesh.clone(), vec![sharded("x")], vec![replicated], vec!["x".into()])
+                        .unwrap();
                 let global_type = f32_type(&[4], &sharded("x"));
-                let local_type = shard_map.local_input_type(0, &global_type).unwrap();
+                let local_type = boundary.local_input_type(0, &global_type).unwrap();
                 let body = build_differential_program::<V, O>(vec![local_type.into()], |builder, inputs| {
                     let gather = ParallelAllGatherOperation::new(
                         "x".to_string(),
@@ -7689,7 +7689,7 @@ mod tests {
                     let gather = array_operation(ArrayOperation::ParallelAllGather(gather.with_mesh(mesh.clone())));
                     builder.add_instruction(gather, Vec::new(), vec![inputs[0]], None).unwrap().to_vec()
                 });
-                (shard_map, vec![global_type.into()], body)
+                (boundary, vec![global_type.into()], body)
             }
             ShardMapDifferentialCase::AllToAll => {
                 let rows =
@@ -7697,65 +7697,61 @@ mod tests {
                 let columns =
                     Sharding::new(mesh.clone(), vec![ShardingDimension::Replicated, ShardingDimension::sharded(["x"])]);
                 let (rows, columns) = (rows.unwrap(), columns.unwrap());
-                let shard_map =
-                    ShardMapBoundary::new(mesh.clone(), vec![rows.clone()], vec![columns], vec!["x".into()]);
-                let shard_map = shard_map.unwrap();
+                let boundary =
+                    ShardMapBoundary::new(mesh.clone(), vec![rows.clone()], vec![columns], vec!["x".into()]).unwrap();
                 let global_type = f32_type(&[2, 4], &rows);
-                let local_type = shard_map.local_input_type(0, &global_type).unwrap();
+                let local_type = boundary.local_input_type(0, &global_type).unwrap();
                 let body = build_differential_program::<V, O>(vec![local_type.into()], |builder, inputs| {
                     let exchange = ParallelAllToAllOperation::new("x".to_string(), 2, 1, 0, CollectiveOptions::tiled());
                     let exchange = array_operation(ArrayOperation::ParallelAllToAll(exchange.with_mesh(mesh.clone())));
                     builder.add_instruction(exchange, Vec::new(), vec![inputs[0]], None).unwrap().to_vec()
                 });
-                (shard_map, vec![global_type.into()], body)
+                (boundary, vec![global_type.into()], body)
             }
             ShardMapDifferentialCase::Permute => {
-                let shard_map =
-                    ShardMapBoundary::new(mesh.clone(), vec![sharded("x")], vec![sharded("x")], vec!["x".into()]);
-                let shard_map = shard_map.unwrap();
+                let boundary =
+                    ShardMapBoundary::new(mesh.clone(), vec![sharded("x")], vec![sharded("x")], vec!["x".into()])
+                        .unwrap();
                 let global_type = f32_type(&[4], &sharded("x"));
-                let local_type = shard_map.local_input_type(0, &global_type).unwrap();
+                let local_type = boundary.local_input_type(0, &global_type).unwrap();
                 let body = build_differential_program::<V, O>(vec![local_type.into()], |builder, inputs| {
                     let permute = ParallelPermuteOperation::new("x".to_string(), 2, vec![(0, 1)]);
                     let permute = array_operation(ArrayOperation::ParallelPermute(permute.with_mesh(mesh.clone())));
                     builder.add_instruction(permute, Vec::new(), vec![inputs[0]], None).unwrap().to_vec()
                 });
-                (shard_map, vec![global_type.into()], body)
+                (boundary, vec![global_type.into()], body)
             }
             ShardMapDifferentialCase::Nested => {
-                let shard_map =
-                    ShardMapBoundary::new(mesh.clone(), vec![sharded("x")], vec![replicated], vec!["x".into()]);
-                let shard_map = shard_map.unwrap();
+                let boundary =
+                    ShardMapBoundary::new(mesh.clone(), vec![sharded("x")], vec![replicated], vec!["x".into()])
+                        .unwrap();
                 let global_type = f32_type(&[4], &sharded("x"));
-                let outer_local_type = shard_map.local_input_type(0, &global_type).unwrap();
-                let inner_shard_map =
+                let outer_local_type = boundary.local_input_type(0, &global_type).unwrap();
+                let inner_boundary =
                     ShardMapBoundary::new(mesh.clone(), vec![sharded("y")], vec![sharded("y")], vec!["y".into()])
                         .unwrap();
-                let inner_local_type = inner_shard_map.local_input_type(0, &outer_local_type).unwrap();
+                let inner_local_type = inner_boundary.local_input_type(0, &outer_local_type).unwrap();
                 let inner_body =
                     build_differential_program::<V, O>(vec![inner_local_type.into()], |builder, inputs| {
                         let sum = array_operation(ArrayOperation::ParallelReduce(sum_over_x));
                         builder.add_instruction(sum, Vec::new(), vec![inputs[0]], None).unwrap().to_vec()
                     });
-                let inner_operation = ShardMapOperation::from_program(
-                    &inner_body,
-                    vec![outer_local_type.clone().into()],
-                    inner_shard_map,
-                )
-                .unwrap();
+                let inner_operation =
+                    ShardMapOperation::from_program(&inner_body, vec![outer_local_type.clone().into()], inner_boundary)
+                        .unwrap();
                 let body = build_differential_program::<V, O>(vec![outer_local_type.into()], |builder, inputs| {
                     let inner_body = builder.import_program(inner_body);
                     let inner_operation = ArrayIrOperation::<A>::from(inner_operation);
                     builder.add_instruction(inner_operation, vec![inner_body], inputs.to_vec(), None).unwrap().to_vec()
                 });
-                (shard_map, vec![global_type.into()], body)
+                (boundary, vec![global_type.into()], body)
             }
             ShardMapDifferentialCase::Reference => {
-                let shard_map =
+                let boundary =
                     ShardMapBoundary::new(mesh.clone(), vec![sharded("x"); 2], vec![sharded("x")], vec!["x".into()])
                         .unwrap();
                 let global_type = f32_type(&[4], &sharded("x"));
-                let local_type = shard_map.local_input_type(0, &global_type).unwrap();
+                let local_type = boundary.local_input_type(0, &global_type).unwrap();
                 let input_types = vec![ReferenceType::new(local_type.clone()).into(), local_type.into()];
                 let body = build_differential_program::<V, O>(input_types, |builder, inputs| {
                     let add_update =
@@ -7766,19 +7762,19 @@ mod tests {
                     let read = ArrayIrOperation::<A>::from(read);
                     builder.add_instruction(read, Vec::new(), vec![inputs[0]], None).unwrap().to_vec()
                 });
-                (shard_map, vec![ReferenceType::new(global_type.clone()).into(), global_type.into()], body)
+                (boundary, vec![ReferenceType::new(global_type.clone()).into(), global_type.into()], body)
             }
             ShardMapDifferentialCase::VaryingIndexReference => {
                 let table_sharding = Sharding::replicated(mesh.clone(), 2);
-                let shard_map = ShardMapBoundary::new(
+                let boundary = ShardMapBoundary::new(
                     mesh.clone(),
                     vec![table_sharding.clone()],
                     vec![sharded("x")],
                     vec!["x".into()],
-                );
-                let shard_map = shard_map.unwrap();
+                )
+                .unwrap();
                 let global_type = f32_type(&[2, 3], &table_sharding);
-                let local_type = shard_map.local_input_type(0, &global_type).unwrap();
+                let local_type = boundary.local_input_type(0, &global_type).unwrap();
                 let input_types = vec![ReferenceType::new(local_type).into()];
                 let body = build_differential_program::<V, O>(input_types, |builder, inputs| {
                     let index = AxisIndexOperation::new("x".to_string()).with_mesh(mesh.clone());
@@ -7792,14 +7788,14 @@ mod tests {
                     let read = ArrayIrOperation::<A>::from(read);
                     builder.add_instruction(read, Vec::new(), vec![inputs[0], index], None).unwrap().to_vec()
                 });
-                (shard_map, vec![ReferenceType::new(global_type).into()], body)
+                (boundary, vec![ReferenceType::new(global_type).into()], body)
             }
             ShardMapDifferentialCase::ReplicatedReference => {
-                let shard_map =
-                    ShardMapBoundary::new(mesh.clone(), vec![replicated.clone()], vec![sharded("x")], vec!["x".into()]);
-                let shard_map = shard_map.unwrap();
+                let boundary =
+                    ShardMapBoundary::new(mesh.clone(), vec![replicated.clone()], vec![sharded("x")], vec!["x".into()])
+                        .unwrap();
                 let global_type = f32_type(&[2], &replicated);
-                let local_type = shard_map.local_input_type(0, &global_type).unwrap();
+                let local_type = boundary.local_input_type(0, &global_type).unwrap();
                 let input_types = vec![ReferenceType::new(local_type).into()];
                 let body = build_differential_program::<V, O>(input_types, |builder, inputs| {
                     let read = ReferenceReadOperation::<ArrayType, ArrayIrType, ArrayReferenceTransform>::new();
@@ -7813,10 +7809,10 @@ mod tests {
                     let vary = array_operation(ArrayOperation::ParallelVary(ParallelVaryOperation::new("x".into())));
                     builder.add_instruction(vary, Vec::new(), vec![state], None).unwrap().to_vec()
                 });
-                (shard_map, vec![ReferenceType::new(global_type).into()], body)
+                (boundary, vec![ReferenceType::new(global_type).into()], body)
             }
         };
-        let operation = ShardMapOperation::from_program(&body, global_input_types, shard_map).unwrap();
+        let operation = ShardMapOperation::from_program(&body, global_input_types, boundary).unwrap();
 
         // Reference inputs of the map are allocated from the corresponding program inputs and frozen after the map.
         let program_input_types = operation
@@ -13286,10 +13282,10 @@ mod tests {
             .with_sharding(Sharding::replicated(mesh.logical_mesh().clone(), 1))
             .unwrap();
         let manual_sharding = Sharding::new(manual_mesh.clone(), vec![ShardingDimension::sharded(["x"])]).unwrap();
-        let shard_map =
+        let boundary =
             ShardMapBoundary::new(manual_mesh, vec![manual_sharding.clone()], vec![manual_sharding], Vec::new())
                 .unwrap();
-        let local_type = shard_map.local_input_type(0, &global_type).unwrap();
+        let local_type = boundary.local_input_type(0, &global_type).unwrap();
 
         // A `shard_map` body always has static boundary types, so it can coexist with dynamic tensors that are staged
         // beside it. Here the gateway makes the program bounded-dynamic while the `shard_map` stays fully static.
@@ -13312,7 +13308,7 @@ mod tests {
         let dynamic = builder
             .add_instruction(DynamicBroadcastOperation::new(Vec::new()), Vec::new(), vec![value, dimension], None)
             .unwrap()[0];
-        let operation = ShardMapOperation::from_program(&body, vec![global_type.into()], shard_map).unwrap();
+        let operation = ShardMapOperation::from_program(&body, vec![global_type.into()], boundary).unwrap();
         let mapped = builder
             .add_instruction(XlaOperation::ShardMap(Box::new(operation)), vec![body_region], vec![global], None)
             .unwrap()[0];
@@ -14512,14 +14508,14 @@ mod tests {
         let sharding = Sharding::new(logical_mesh.clone(), vec![ShardingDimension::sharded(["x"])]).unwrap();
         let device_type = ArrayType::new_static(DataType::F32, [4]).with_sharding(sharding.clone()).unwrap();
         let host_type = device_type.clone().with_memory(Memory::Host { pinned: true });
-        let shard_map = ShardMapBoundary::new(
+        let boundary = ShardMapBoundary::new(
             logical_mesh,
             vec![sharding.clone(), sharding.clone()],
             vec![sharding],
             vec!["x".to_string()],
         )
         .unwrap();
-        let local_type = shard_map.local_input_type(1, &device_type).unwrap();
+        let local_type = boundary.local_input_type(1, &device_type).unwrap();
         let body = {
             let mut builder = XlaProgramBuilder::new();
             let reference = builder.add_input(ReferenceType::new(local_type.clone()).into());
@@ -14536,7 +14532,7 @@ mod tests {
         let operation = ShardMapOperation::from_program(
             &body,
             vec![ReferenceType::new(host_type.clone()).into(), device_type.clone().into()],
-            shard_map,
+            boundary,
         )
         .unwrap();
         let program = {
@@ -14651,20 +14647,18 @@ mod tests {
                         Ok(shard_map(
                             |local_x: XlaArrayTracer| {
                                 let value = local_x.clone().into_value();
-                                let reference = value.reference_new().unwrap();
-                                let output = function.call((reference.clone(), value)).unwrap();
-                                reference.write(&(local_x.clone() * local_x).into_value()).unwrap();
-                                ValueProjection::<ArrayType>::into_projected(output)
-                                    .unwrap()
-                                    .reduce(&[0], ReductionKind::Sum)
-                                    .unwrap()
+                                let reference = value.reference_new()?;
+                                let output = function.call((reference.clone(), value))?;
+                                reference.write(&(local_x.clone() * local_x).into_value())?;
+                                ValueProjection::<ArrayType>::into_projected(output)?
+                                    .reduce(&[0], ReductionKind::Sum)?
                                     .parallel_reduce(ReductionKind::Sum, "x")
-                                    .unwrap()
                             },
                             x,
                             logical_mesh.clone(),
                             sharded.clone(),
                             replicated.clone(),
+                            ShardMapOptions::new(),
                         )
                         .unwrap()
                         .into_value())
@@ -14731,9 +14725,15 @@ mod tests {
             |inputs: Vec<XlaTracer<'static>>| {
                 let input =
                     ValueProjection::<ArrayType>::into_projected(inputs[0].clone()).map_err(ProgramError::from)?;
-                let output =
-                    shard_map(|x: XlaArrayTracer| x, input, logical_mesh.clone(), along_x.clone(), along_x.clone())
-                        .unwrap();
+                let output = shard_map(
+                    |x: XlaArrayTracer| Ok(x),
+                    input,
+                    logical_mesh.clone(),
+                    along_x.clone(),
+                    along_x.clone(),
+                    ShardMapOptions::new(),
+                )
+                .unwrap();
                 Ok(vec![output.into_value()])
             },
             vec![ArrayIrType::Array(caller_type.clone())],
@@ -17536,14 +17536,14 @@ mod tests {
             XlaArray::from_host_buffer(&domain, r#type.clone(), mesh.clone(), values_to_bytes(&[0.0f64, 1.0])).unwrap();
         let second =
             XlaArray::from_host_buffer(&domain, r#type.clone(), mesh.clone(), values_to_bytes(&[2.0f64, 3.0])).unwrap();
-        let shard_map = ShardMapBoundary::new(
+        let boundary = ShardMapBoundary::new(
             mesh.logical_mesh().clone(),
             vec![r#type.sharding().unwrap().clone()],
             Vec::new(),
             vec!["x".to_string()],
         )
         .unwrap();
-        let local_type = shard_map.local_input_type(0, &r#type).unwrap();
+        let local_type = boundary.local_input_type(0, &r#type).unwrap();
         let mut builder = XlaProgramBuilder::new();
         let input = builder.add_input(local_type.clone().into());
         builder
@@ -17559,7 +17559,7 @@ mod tests {
         let body = builder
             .build::<Vec<XlaConstant>, Vec<XlaConstant>>(Vec::new(), vec![Placeholder], Vec::new())
             .unwrap();
-        let operation = ShardMapOperation::from_program(&body, vec![r#type.clone().into()], shard_map).unwrap();
+        let operation = ShardMapOperation::from_program(&body, vec![r#type.clone().into()], boundary).unwrap();
         let mut builder = XlaProgramBuilder::new();
         let input = builder.add_input(r#type.into());
         let body = builder.import_program(body);

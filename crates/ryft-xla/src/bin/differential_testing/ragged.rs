@@ -11,7 +11,8 @@ use serde::Deserialize;
 #[cfg(any(test, feature = "cuda-13"))]
 use ryft_core::{
     ArrayType, BatchAxis, BatchAxisSpecification, DataType, Differentiate, LogicalMesh, MeshAxis, MeshAxisType,
-    ParallelRaggedAllToAll, ProgramError, Sharding, ShardingDimension, Value, ValueProjection, batch, shard_map,
+    ParallelRaggedAllToAll, ProgramError, ShardMapOptions, Sharding, ShardingDimension, Value, ValueProjection, batch,
+    shard_map,
 };
 #[cfg(feature = "cuda-13")]
 use ryft_pjrt::{
@@ -248,11 +249,12 @@ impl RaggedCase {
         let traced: TracedXlaProgram<Vec<ArrayType>, Vec<ArrayType>> = trace(
             |inputs: Vec<XlaArrayTracer>| {
                 shard_map(
-                    |inputs| self.transformed(inputs).unwrap(),
+                    |inputs| self.transformed(inputs),
                     inputs,
                     mesh.clone(),
                     input_shardings.clone(),
                     output_shardings.clone(),
+                    ShardMapOptions::new(),
                 )
                 .unwrap()
             },

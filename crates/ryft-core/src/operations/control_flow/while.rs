@@ -13879,7 +13879,7 @@ mod tests {
         /// Builds a program that applies `shard_map` to inputs of the `global_types`, with a body that runs the
         /// bounded `while` loop over the condition and body `regions` on the local values of those inputs.
         fn mapped_while_program(
-            shard_map: ShardMapBoundary,
+            boundary: ShardMapBoundary,
             global_types: Vec<ArrayType>,
             regions: Vec<TestIrProgram>,
         ) -> TestIrProgram {
@@ -13889,7 +13889,7 @@ mod tests {
             let inputs = global_types
                 .iter()
                 .enumerate()
-                .map(|(index, r#type)| map_body.add_input(shard_map.local_input_type(index, r#type).unwrap().into()))
+                .map(|(index, r#type)| map_body.add_input(boundary.local_input_type(index, r#type).unwrap().into()))
                 .collect();
             let while_operation = WhileOperation::<ArrayIrType>::new().with_iteration_bound(3).unwrap();
             let outputs = map_body.add_instruction(while_operation, regions, inputs, None).unwrap().to_vec();
@@ -13901,7 +13901,7 @@ mod tests {
                 )
                 .unwrap();
             let global_types = global_types.into_iter().map(ArrayIrType::from).collect::<Vec<_>>();
-            let operation = ShardMapOperation::from_program(&map_body, global_types.clone(), shard_map).unwrap();
+            let operation = ShardMapOperation::from_program(&map_body, global_types.clone(), boundary).unwrap();
             let mut builder = ProgramBuilder::<TestIrValue, TestIrOperation>::new();
             let map_body = builder.import_program(map_body);
             let inputs = global_types.into_iter().map(|r#type| builder.add_input(r#type)).collect();
@@ -13931,9 +13931,9 @@ mod tests {
         // two iterations of the masked form, whose per-item masks differ across devices. Locally
         // `f = [x⁴, x², x², x⁴]`, with value `[16, 25, 25, 81]` and derivative
         // `[4 x³, 2 x, 2 x, 4 x³] = [32, 10, 10, 108]`.
-        let shard_map =
+        let boundary =
             ShardMapBoundary::new(mesh.clone(), vec![sharded.clone()], vec![sharded.clone()], Vec::new()).unwrap();
-        let local_type = shard_map.local_input_type(0, &global_type).unwrap();
+        let local_type = boundary.local_input_type(0, &global_type).unwrap();
         let mut condition = ProgramBuilder::<TestIrValue, TestIrOperation>::new();
         let state = condition.add_input(local_type.clone().into());
         let limit = condition.add_constant(array(Array::from_elements(local_type.clone(), &[10f32, 10.0]).unwrap()));
@@ -13947,7 +13947,7 @@ mod tests {
         let body = body
             .build::<Vec<TestIrValue>, Vec<TestIrValue>>(vec![squared], vec![Placeholder], vec![Placeholder])
             .unwrap();
-        let program = mapped_while_program(shard_map, vec![global_type.clone()], vec![condition, body]);
+        let program = mapped_while_program(boundary, vec![global_type.clone()], vec![condition, body]);
         let x = array(Array::vector(vec![2f32, 5.0, 5.0, 3.0]).unwrap());
 
         // Each device stages the masked augmented loop and the masked tangent scan over its own shard, so the counter,
@@ -14067,15 +14067,15 @@ mod tests {
         // is invariant while the stored residual `x` varies, and forward mode, linearization, and the pullback still
         // read each device's own residual stack. Two iterations give `[x⁴, …] = [16, 625, 625, 81]` with derivative
         // `4 x³ = [32, 500, 500, 108]`.
-        let shard_map = ShardMapBoundary::new(
+        let boundary = ShardMapBoundary::new(
             mesh.clone(),
             vec![replicated.clone(), sharded.clone()],
             vec![replicated.clone(), sharded],
             Vec::new(),
         )
         .unwrap();
-        let counter_type = shard_map.local_input_type(0, &ArrayType::scalar(DataType::I64)).unwrap();
-        let local_type = shard_map.local_input_type(1, &global_type).unwrap();
+        let counter_type = boundary.local_input_type(0, &ArrayType::scalar(DataType::I64)).unwrap();
+        let local_type = boundary.local_input_type(1, &global_type).unwrap();
         let mut condition = ProgramBuilder::<TestIrValue, TestIrOperation>::new();
         let counter = condition.add_input(counter_type.clone().into());
         condition.add_input(local_type.clone().into());
@@ -14105,7 +14105,7 @@ mod tests {
             )
             .unwrap();
         let program =
-            mapped_while_program(shard_map, vec![ArrayType::scalar(DataType::I64), global_type], vec![condition, body]);
+            mapped_while_program(boundary, vec![ArrayType::scalar(DataType::I64), global_type], vec![condition, body]);
         let counter = array(Array::scalar(0i64).unwrap());
         let x = array(Array::vector(vec![2f32, 5.0, 5.0, 3.0]).unwrap());
         let final_counter = array(
@@ -15799,13 +15799,13 @@ mod tests {
             .unwrap();
         let mesh = LogicalMesh::new(vec![MeshAxis::new("x", 2, MeshAxisType::Manual).unwrap()]).unwrap();
         let replicated = Sharding::replicated(mesh.clone(), 0);
-        let shard_map =
+        let boundary =
             ShardMapBoundary::new(mesh, vec![replicated.clone(), replicated], Vec::new(), Vec::new()).unwrap();
         let input_types = vec![ArrayIrType::from(scalar_type.clone()); 2];
         let mut builder = ProgramBuilder::<TestIrValue, TestIrOperation>::new();
         let map_body = builder.import_program(map_body);
         let inputs = input_types.iter().map(|r#type| builder.add_input(r#type.clone())).collect::<Vec<_>>();
-        let operation = ShardMapOperation::from_boundary(shard_map, input_types, Vec::<ArrayIrType>::new());
+        let operation = ShardMapOperation::from_boundary(boundary, input_types, Vec::<ArrayIrType>::new());
         builder.add_instruction(operation, vec![map_body], inputs, None).unwrap();
         let mapped = builder
             .build::<Vec<TestIrValue>, Vec<TestIrValue>>(Vec::new(), vec![Placeholder; 2], Vec::new())

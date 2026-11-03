@@ -8,8 +8,8 @@ use serde::Deserialize;
 use ryft_core::{
     ArrayType, AxisIndex, BatchAxis, Broadcast, ConvertElementType, Differentiate, LogicalMesh, MeshAxis, MeshAxisType,
     ParallelAllGather, ParallelAllGatherOutputVariance, ParallelAllToAll, ParallelPermute, ParallelReduce,
-    ParallelSumScatter, ParallelVary, ProgramError, ReductionKind, Sharding, ShardingDimension, Typed, Value,
-    ValueProjection, batch, shard_map,
+    ParallelSumScatter, ParallelVary, ProgramError, ReductionKind, ShardMapOptions, Sharding, ShardingDimension, Typed,
+    Value, ValueProjection, batch, shard_map,
 };
 use ryft_pjrt::{ClientOptions, CpuClientOptions, load_cpu_plugin};
 use ryft_xla::FromPjrt;
@@ -317,11 +317,12 @@ impl CollectiveCase {
             let traced: TracedXlaProgram<ArrayType, Vec<ArrayType>> = trace(
                 |input: XlaArrayTracer| {
                     shard_map(
-                        |input: XlaArrayTracer| self.transformed(input.clone(), input).unwrap(),
+                        |input: XlaArrayTracer| self.transformed(input.clone(), input),
                         input,
                         mesh.clone(),
                         input_sharding.clone(),
                         output_shardings.clone(),
+                        ShardMapOptions::new(),
                     )
                     .unwrap()
                 },
@@ -332,11 +333,12 @@ impl CollectiveCase {
             let traced: TracedXlaProgram<(ArrayType, ArrayType), Vec<ArrayType>> = trace(
                 |inputs: (XlaArrayTracer, XlaArrayTracer)| {
                     shard_map(
-                        |(input, seed): (XlaArrayTracer, XlaArrayTracer)| self.transformed(input, seed).unwrap(),
+                        |(input, seed): (XlaArrayTracer, XlaArrayTracer)| self.transformed(input, seed),
                         inputs,
                         mesh.clone(),
                         (input_sharding.clone(), seed_sharding.clone()),
                         output_shardings.clone(),
+                        ShardMapOptions::new(),
                     )
                     .unwrap()
                 },

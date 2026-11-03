@@ -313,8 +313,8 @@ mod tests {
     use ryft_core::{
         Array, ArrayIrType, DataType, DimensionBounds, DimensionSizeOperation, DimensionType, DimensionValue,
         DimensionVariable, DynamicBroadcastOperation, Layout, LogicalMesh, MeshAxis, Placeholder, ProgramBuilder,
-        ProgramError, Shape, StridedLayout, Tile, TileDimension, TiledLayout, TracedShardMap, TypedProgram,
-        trace_shard_map,
+        ProgramError, Shape, ShardMapOptions, StridedLayout, Tile, TileDimension, TiledLayout, TracedShardMap,
+        TypedProgram, trace_shard_map,
     };
     use ryft_pjrt::{BufferType, ExecutionDeviceInputs, ExecutionInput, Program as PjrtProgram};
 
@@ -909,11 +909,13 @@ mod tests {
             .with_sharding(boundary.clone().with_varying_manual_axes(["x"]).unwrap())
             .unwrap();
         let traced: TracedShardMap<XlaDomain<'static>, ArrayType, ArrayType> = trace_shard_map(
-            |input| input.broadcast(local_output.clone(), &[0]).unwrap(),
+            |_, input| input.broadcast(local_output.clone(), &[0]),
             test_vector_type(4),
             mesh,
             boundary.clone(),
             boundary,
+            ShardMapOptions::new(),
+            &[],
         )
         .unwrap();
         assert!(matches!(

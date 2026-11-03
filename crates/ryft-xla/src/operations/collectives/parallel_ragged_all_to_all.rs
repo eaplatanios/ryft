@@ -402,7 +402,8 @@ mod tests {
     use ryft_core::{
         Array, ArrayBatch, ArrayOperation, BatchAxis, BatchAxisSpecification, BatchableOperation, BatchingContext,
         Context, Differentiate, EmptyRegionDriver, LogicalMesh, MeshAxis, MeshAxisType, ParallelRaggedAllToAll, Reduce,
-        ShardingDimension, StagingContext, TracedShardMap, TracingContext, Value, batch, trace_shard_map,
+        ShardMapOptions, ShardingDimension, StagingContext, TracedShardMap, TracingContext, Value, batch,
+        trace_shard_map,
     };
     use ryft_mlir::Location;
 
@@ -432,10 +433,8 @@ mod tests {
         let mesh = LogicalMesh::new(vec![MeshAxis::new("x", 2, MeshAxisType::Manual).unwrap()]).unwrap();
         let sharding = test_sharding(&mesh, vec![ShardingDimension::sharded(["x"])], vec![]);
         let traced: TracedShardMap<XlaDomain<'static>, Vec<ArrayType>, ArrayType> = trace_shard_map(
-            |inputs: Vec<XlaArrayTracer>| {
-                inputs[0]
-                    .parallel_ragged_all_to_all("x", &inputs[1], &inputs[2], &inputs[3], &inputs[4], &inputs[5])
-                    .unwrap()
+            |_, inputs: Vec<XlaArrayTracer>| {
+                inputs[0].parallel_ragged_all_to_all("x", &inputs[1], &inputs[2], &inputs[3], &inputs[4], &inputs[5])
             },
             vec![
                 ArrayType::new_static(DataType::F32, [6]),
@@ -448,6 +447,8 @@ mod tests {
             mesh.clone(),
             vec![sharding.clone(); 6],
             sharding,
+            ShardMapOptions::new(),
+            &[],
         )
         .unwrap();
         assert_eq!(
@@ -493,8 +494,8 @@ mod tests {
         let sharding =
             test_sharding(&mesh, vec![ShardingDimension::sharded(["x"]), ShardingDimension::replicated()], vec![]);
         let traced: TracedShardMap<XlaDomain<'static>, Vec<ArrayType>, ArrayType> = trace_shard_map(
-            |inputs: Vec<XlaArrayTracer>| {
-                batch(
+            |_, inputs: Vec<XlaArrayTracer>| {
+                Ok(batch(
                     |inputs: Vec<_>| {
                         inputs[0]
                             .parallel_ragged_all_to_all("x", &inputs[1], &inputs[2], &inputs[3], &inputs[4], &inputs[5])
@@ -503,8 +504,7 @@ mod tests {
                     vec![BatchAxis::new(0); 6],
                     BatchAxis::new(0),
                     BatchAxisSpecification::named("y"),
-                )
-                .unwrap()
+                )?)
             },
             vec![
                 ArrayType::new_static(DataType::F32, [4, 3]),
@@ -517,6 +517,8 @@ mod tests {
             mesh.clone(),
             vec![sharding.clone(); 6],
             sharding,
+            ShardMapOptions::new(),
+            &[],
         )
         .unwrap();
         assert_eq!(
@@ -586,7 +588,7 @@ mod tests {
         let mesh = LogicalMesh::new(vec![MeshAxis::new("x", 4, MeshAxisType::Manual).unwrap()]).unwrap();
         let sharding = test_sharding(&mesh, vec![ShardingDimension::sharded(["x"])], vec![]);
         let traced: TracedShardMap<XlaDomain<'static>, Vec<ArrayType>, ArrayType> = trace_shard_map(
-            |inputs: Vec<XlaArrayTracer>| {
+            |_, inputs: Vec<XlaArrayTracer>| {
                 let input_offsets = inputs[2].clone();
                 let send_sizes = inputs[3].clone();
                 let output_offsets = inputs[4].clone();
@@ -609,9 +611,8 @@ mod tests {
                                 )?
                                 .reduce(&[0], ReductionKind::Sum)?)
                         },
-                    )
-                    .unwrap();
-                gradients.0
+                    )?;
+                Ok(gradients.0)
             },
             vec![
                 ArrayType::new_static(DataType::F32, [12]),
@@ -624,6 +625,8 @@ mod tests {
             mesh.clone(),
             vec![sharding.clone(); 6],
             sharding,
+            ShardMapOptions::new(),
+            &[],
         )
         .unwrap();
         assert_eq!(
@@ -758,10 +761,8 @@ mod tests {
         // Direct `u64` metadata: copy `operand` rows `1..3` into `output` rows `0..2`.
         let sharding = test_sharding(&mesh, vec![ShardingDimension::sharded(["x"])], vec![]);
         let traced: TracedShardMap<XlaDomain<'static>, Vec<ArrayType>, ArrayType> = trace_shard_map(
-            |inputs: Vec<XlaArrayTracer>| {
-                inputs[0]
-                    .parallel_ragged_all_to_all("x", &inputs[1], &inputs[2], &inputs[3], &inputs[4], &inputs[5])
-                    .unwrap()
+            |_, inputs: Vec<XlaArrayTracer>| {
+                inputs[0].parallel_ragged_all_to_all("x", &inputs[1], &inputs[2], &inputs[3], &inputs[4], &inputs[5])
             },
             vec![
                 ArrayType::new_static(DataType::F32, [3]),
@@ -774,6 +775,8 @@ mod tests {
             mesh.clone(),
             vec![sharding.clone(); 6],
             sharding.clone(),
+            ShardMapOptions::new(),
+            &[],
         )
         .unwrap();
         let metadata = |value: u64| (values_to_bytes::<u64>(&[value]), BufferType::U64, vec![1]);
@@ -796,8 +799,8 @@ mod tests {
         let batched_sharding =
             test_sharding(&mesh, vec![ShardingDimension::sharded(["x"]), ShardingDimension::replicated()], vec![]);
         let traced: TracedShardMap<XlaDomain<'static>, Vec<ArrayType>, ArrayType> = trace_shard_map(
-            |inputs: Vec<XlaArrayTracer>| {
-                batch(
+            |_, inputs: Vec<XlaArrayTracer>| {
+                Ok(batch(
                     |inputs: Vec<_>| {
                         inputs[0]
                             .parallel_ragged_all_to_all("x", &inputs[1], &inputs[2], &inputs[3], &inputs[4], &inputs[5])
@@ -806,8 +809,7 @@ mod tests {
                     vec![BatchAxis::new(0); 6],
                     BatchAxis::new(0),
                     BatchAxisSpecification::named("y"),
-                )
-                .unwrap()
+                )?)
             },
             vec![
                 ArrayType::new_static(DataType::F32, [2, 3]),
@@ -820,6 +822,8 @@ mod tests {
             mesh.clone(),
             vec![batched_sharding.clone(); 6],
             batched_sharding,
+            ShardMapOptions::new(),
+            &[],
         )
         .unwrap();
         let program = to_mlir_module(&traced, "main").unwrap();
@@ -847,8 +851,8 @@ mod tests {
         // The gradient of the summed exchange with respect to `operand` lowers through the additive transpose, whose
         // rebased metadata are `u64`. Only the sent rows `1..3` reach the sum.
         let traced: TracedShardMap<XlaDomain<'static>, Vec<ArrayType>, ArrayType> = trace_shard_map(
-            |inputs: Vec<XlaArrayTracer>| {
-                inputs[0]
+            |_, inputs: Vec<XlaArrayTracer>| {
+                Ok(inputs[0]
                     .domain()
                     .differentiate_at(inputs[0].clone())
                     .with_captures((
@@ -869,8 +873,7 @@ mod tests {
                                 &receive_sizes,
                             )
                             .map(|result| result.reduce(&[0], ReductionKind::Sum).unwrap())
-                    })
-                    .unwrap()
+                    })?)
             },
             vec![
                 ArrayType::new_static(DataType::F32, [3]),
@@ -883,6 +886,8 @@ mod tests {
             mesh,
             vec![sharding.clone(); 6],
             sharding,
+            ShardMapOptions::new(),
+            &[],
         )
         .unwrap();
         let program = to_mlir_module(&traced, "main").unwrap();

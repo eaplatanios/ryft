@@ -34,7 +34,7 @@ pub(crate) fn mesh_axis_replica_groups(
     collective_state: &CollectiveLoweringState,
     axis_name: &str,
 ) -> Result<(Vec<Vec<usize>>, usize), Error> {
-    let Some(shard_map) = collective_state.manual_shard_map() else {
+    let Some(boundary) = collective_state.manual_shard_map() else {
         return Err(ProgramError::UnsupportedOperation {
             message: format!(
                 "collective over axis `{axis_name}` can only be lowered inside a \
@@ -44,7 +44,7 @@ pub(crate) fn mesh_axis_replica_groups(
         .into());
     };
     let axis_region = collective_state.manual_axis_region(axis_name);
-    let mesh = axis_region.unwrap_or(shard_map).mesh();
+    let mesh = axis_region.unwrap_or(boundary).mesh();
     if axis_region.is_none() {
         return Err(ProgramError::UnsupportedOperation {
             message: format!(
