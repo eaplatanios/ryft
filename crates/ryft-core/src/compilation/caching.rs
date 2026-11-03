@@ -501,31 +501,39 @@ const DEFAULT_EVENT_CAPACITY: usize = 0;
 ///
 /// # Cache Resolution
 ///
-/// ```mermaid
-/// %%{init: {"themeCSS": ".nodeLabel code { white-space: nowrap !important; }"}}%%
-/// flowchart TD
-///   request["Lowered Program and Domain Cache Key"] --> memory["1. In-Memory LRU"]
-///   memory -->|"hit"| validate["Validate Against the Request"]
-///   validate -->|"accepted"| shared["Shared Compiled Program in &lt;code&gt;Arc&lt;/code&gt;"]
-///   validate -.->|"rejected"| error["Return the Validation Error"]
-///   memory -->|"miss"| flight["2. In-Flight Compilation Check"]
-///   flight -->|"another producer"| wait["Wait for the Producer"]
-///   wait -->|"shared program"| validate
-///   wait -->|"producer failed"| memory
-///   publish["Publish Successful Artifact"]
-///   flight -->|"producer"| disk["3. Optional Persistent Disk Cache"]
-///   disk -->|"hit, deserialize, and validate"| publish
-///   disk -->|"miss, disabled, or rejected"| exchange["4. Optional Distributed Artifact Exchange"]
-///   exchange -->|"hit, deserialize, and validate"| publish
-///   exchange -->|"miss, unavailable, or rejected"| backend["5. Uncached Backend Compilation"]
-///   backend --> publish
-///   publish --> memory_insert["Insert into In-Memory LRU"]
-///   memory_insert --> shared
-///   publish -.->|"best-effort serialization"| disk_store["Store in Persistent Disk Cache"]
-///   publish -.->|"policy-controlled publication"| exchange_store["Publish through Artifact Exchange"]
+/// ```text
+/// ┌──────────────────────────┐
+/// │ Program and Cache Key    │
+/// └─────────────┬────────────┘
+///               ▼
+/// ┌──────────────────────────┐  hit   ┌───────────────────────┐ accepted ┌──────────────────────┐
+/// │ 1. In-Memory LRU         ├───────▶│ Validate the Program  ├─────────▶│ Arc<CompiledProgram> │◀┐
+/// └─────────────┬────────────┘        └───────────────────┬───┘          └──────────────────────┘ │
+///               │ miss    ▲ producer failed         ▲     └┄┄┄┄┄┄┄┄┄┄┄┄┄┄┄┄┄┄┄┄┄┄┄┄┄┄┐            │
+///               ▼         └───────────────┐         │ shared program                 ▼ rejected   │
+/// ┌──────────────────────────┐ waiter ┌───┴─────────┴─────────┐          ┌──────────────────────┐ │
+/// │ 2. In-Flight Compilation ├───────▶│ Wait for the Producer │          │ Validation Error     │ │
+/// └─────────────┬────────────┘        └───────────────────────┘          └──────────────────────┘ │
+///               │ producer                                                                        │
+///               ▼                                                                                 │
+/// ┌──────────────────────────┐  hit   ┌───────────────────────┐          ┌──────────────────────┐ │
+/// │ 3. Disk Cache            ├─────┬─▶│ Publish the Program   ├─────────▶│ Insert into the LRU  ├─┘
+/// └─────────────┬────────────┘     │  └─────┬───────────┬─────┘          └──────────────────────┘
+///               │ miss or skipped  │        ┆           └┄┄┄┄┄┄┄┄┄┄┄┄┄┄┄┄┄┄┄┄┄┄┄┄┄┄┄┄┐
+///               ▼                  │        ▼ best effort                            ▼ per policy
+/// ┌──────────────────────────┐ hit │  ┌───────────────────────┐          ┌──────────────────────┐
+/// │ 4. Artifact Exchange     ├─────┤  │ Store in Disk Cache   │          │ Publish to Exchange  │
+/// └─────────────┬────────────┘     │  └───────────────────────┘          └──────────────────────┘
+///               │ miss or skipped  │
+///               ▼                  │
+/// ┌──────────────────────────┐     │
+/// │ 5. Backend Compilation   ├─────┘
+/// └──────────────────────────┘
 /// ```
 ///
 /// Misses for the same key coordinate one backend producer, while requests for different keys remain concurrent.
+/// The disk cache and the artifact exchange are skipped when they are not configured or when the domain supplies no
+/// persistent key. Programs that they restore are validated like memory hits, and rejected ones count as misses.
 /// Every successful source publishes to memory, while persistent writes are best effort and exchange publication is
 /// controlled by the configured policy.
 ///
@@ -564,13 +572,12 @@ const DEFAULT_EVENT_CAPACITY: usize = 0;
 ///
 /// Contexts never read the environment on their own. Use [`CompilationContext::with_disk_cache_from_env`] to opt into
 /// the disk cache that the [`DiskCache::ENV_VAR`] and [`DiskCache::MAX_BYTES_ENV_VAR`] environment variables configure.
-#[cfg_attr(doc, ryft_macros::mermaid)]
 pub struct CompilationContext<C: CompilationCacheDomain> {
     /// In-memory LRU cache keyed by the structural [`CompilationCacheDomain::CacheKey`] of the domain.
     programs: Mutex<LruCache<C::CacheKey, Arc<C::CompiledProgram>>>,
 
-    /// Producer coordination for each key. Entries exist only while a cache miss is being restored or compiled, so
-    /// unrelated keys never wait for the backend work of one another.
+    /// Producer coordination for each key. Entries exist only while a cache miss is being restored or compiled,
+    /// so unrelated keys never wait for the backend work of one another.
     in_flight: Mutex<HashMap<C::CacheKey, Arc<InFlightCompilation<C::CompiledProgram>>>>,
 
     /// Optional disk-backed persistent tier.

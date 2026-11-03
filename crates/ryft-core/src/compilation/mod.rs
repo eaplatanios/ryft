@@ -130,7 +130,7 @@
 //! it resolves the domain's [`CompilationCacheDomain::CacheKey`] through memory, waiting on in-flight compilations,
 //! optional persistent storage, optional distributed exchange, and finally backend compilation. Backends own their
 //! contexts, so users configure caching and exchange when they construct a backend handle. Refer to
-//! [`CompilationContext`] for the rendered resolution diagram and a configuration example.
+//! [`CompilationContext`] for the resolution diagram and a configuration example.
 //!
 //! Misses for the same key are deduplicated, while different keys may compile concurrently. [`DiskCache`] provides
 //! optional checksummed persistent storage, and [`CompilationArtifactExchange`] optionally shares serialized artifacts
