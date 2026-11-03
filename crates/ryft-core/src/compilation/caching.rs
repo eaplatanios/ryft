@@ -557,7 +557,7 @@ const DEFAULT_EVENT_CAPACITY: usize = 0;
 /// # };
 /// fn compilation_context<'o, C: CompilationCacheDomain>(
 ///     directory: &Path,
-///     exchange: Arc<dyn CompilationArtifactExchange + 'o>,
+///     exchange: Arc<dyn 'o + CompilationArtifactExchange>,
 /// ) -> std::io::Result<CompilationContext<'o, C>> {
 ///     let disk_cache = DiskCache::with_max_bytes(directory, 10 << 30)?
 ///         .with_write_thresholds(Duration::from_secs(10), 0);
@@ -586,7 +586,7 @@ pub struct CompilationContext<'o, C: CompilationCacheDomain> {
     disk_cache: Option<DiskCache>,
 
     /// Optional exchange for sharing serialized programs across processes.
-    artifact_exchange: Option<Arc<dyn CompilationArtifactExchange + 'o>>,
+    artifact_exchange: Option<Arc<dyn 'o + CompilationArtifactExchange>>,
 
     /// Distributed exchange behavior, which is disabled by default to preserve local compilation semantics.
     artifact_exchange_policy: CompilationArtifactExchangePolicy,
@@ -601,7 +601,7 @@ pub struct CompilationContext<'o, C: CompilationCacheDomain> {
     event_capacity: usize,
 
     /// Optional reporting hook invoked after an event is retained.
-    event_reporter: Option<Arc<dyn Fn(&CompilationEvent) + Send + Sync + 'o>>,
+    event_reporter: Option<Arc<dyn 'o + Fn(&CompilationEvent) + Send + Sync>>,
 }
 
 impl<'o, C: CompilationCacheDomain> CompilationContext<'o, C> {
@@ -662,7 +662,7 @@ impl<'o, C: CompilationCacheDomain> CompilationContext<'o, C> {
     #[inline]
     pub fn with_artifact_exchange(
         mut self,
-        exchange: Arc<dyn CompilationArtifactExchange + 'o>,
+        exchange: Arc<dyn 'o + CompilationArtifactExchange>,
         policy: CompilationArtifactExchangePolicy,
     ) -> Self {
         self.artifact_exchange = Some(exchange);
@@ -683,7 +683,7 @@ impl<'o, C: CompilationCacheDomain> CompilationContext<'o, C> {
     /// internal cache or event buffer lock, and it should return promptly so that it does not add latency to
     /// compilations.
     #[inline]
-    pub fn with_event_reporter(mut self, reporter: Arc<dyn Fn(&CompilationEvent) + Send + Sync + 'o>) -> Self {
+    pub fn with_event_reporter(mut self, reporter: Arc<dyn 'o + Fn(&CompilationEvent) + Send + Sync>) -> Self {
         self.event_reporter = Some(reporter);
         self
     }
@@ -696,7 +696,7 @@ impl<'o, C: CompilationCacheDomain> CompilationContext<'o, C> {
 
     /// Returns the attached distributed artifact exchange, if any.
     #[inline]
-    pub fn artifact_exchange(&self) -> Option<&(dyn CompilationArtifactExchange + 'o)> {
+    pub fn artifact_exchange(&self) -> Option<&(dyn 'o + CompilationArtifactExchange)> {
         self.artifact_exchange.as_deref()
     }
 
@@ -749,8 +749,6 @@ impl<'o, C: CompilationCacheDomain> CompilationContext<'o, C> {
     pub fn clear_events(&self) {
         self.recent_events.lock().expect("compilation event mutex should not be poisoned").clear();
     }
-
-    // TODO(eaplatanios): Review from here onwards.
 
     /// Compiles `program` through the shared cache and returns the shared compiled program. This function derives the
     /// exact structural key of `program` through [`CompilationCacheDomain::compilation_key`] and resolves it through
@@ -823,6 +821,7 @@ impl<'o, C: CompilationCacheDomain> CompilationContext<'o, C> {
                     accumulate_duration(wait_start.elapsed(), &self.statistics.memory_lookup_nanoseconds);
                     continue;
                 };
+
                 // Another producer compiled the shared program for its own request, so it is validated like a hit.
                 let validation = program.map_or(Ok(()), |program| domain.validate_cached_program(program, &shared));
                 let outcome = match &validation {
@@ -831,11 +830,13 @@ impl<'o, C: CompilationCacheDomain> CompilationContext<'o, C> {
                         message: error.to_string(),
                     }),
                 };
+
                 self.record_duration(
                     CompilationStep::MemoryWait { outcome },
                     wait_start.elapsed(),
                     &self.statistics.memory_lookup_nanoseconds,
                 );
+
                 return validation.map(|()| shared);
             }
 
@@ -859,6 +860,7 @@ impl<'o, C: CompilationCacheDomain> CompilationContext<'o, C> {
                 lookup_start.elapsed(),
                 &self.statistics.memory_lookup_nanoseconds,
             );
+
             return self.restore_or_compile(
                 domain,
                 program,
@@ -867,6 +869,8 @@ impl<'o, C: CompilationCacheDomain> CompilationContext<'o, C> {
             );
         }
     }
+
+    // TODO(eaplatanios): Review from here onwards.
 
     /// Validates the `cached` in-memory program against the requesting `program`, if any, and records the lookup that
     /// started at `lookup_start`. A rejection fails the compilation, because equal exact keys must mean interchangeable
