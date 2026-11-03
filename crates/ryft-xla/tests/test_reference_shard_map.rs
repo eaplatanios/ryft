@@ -84,12 +84,12 @@ fn test_batched_shard_map_mutates_mapped_reference_items_on_cpu() {
     let domain = XlaSession::new(&client).domain();
     let sharded = Sharding::new(logical_mesh.clone(), vec![ShardingDimension::sharded(["x"])]).unwrap();
     let item_type = ArrayType::new_static(DataType::F32, [4]).with_sharding(sharded.clone()).unwrap();
-    let shard_map =
+    let boundary =
         ShardMapBoundary::new(logical_mesh.clone(), vec![sharded.clone(); 2], vec![sharded], vec!["x".to_string()])
             .unwrap();
     let body = {
         let mut builder = ProgramBuilder::<XlaConstant, XlaOperation>::new();
-        let local_type = shard_map.local_input_type(0, &item_type).unwrap();
+        let local_type = boundary.local_input_type(0, &item_type).unwrap();
         let reference = builder.add_input(ArrayIrType::Reference(ReferenceType::new(local_type.clone())));
         let update = builder.add_input(ArrayIrType::Array(local_type));
         builder
@@ -104,7 +104,7 @@ fn test_batched_shard_map_mutates_mapped_reference_items_on_cpu() {
     let operation = ShardMapOperation::from_program(
         &body,
         vec![ArrayIrType::Reference(ReferenceType::new(item_type.clone())), ArrayIrType::Array(item_type)],
-        shard_map,
+        boundary,
     )
     .unwrap();
     let operation = XlaOperation::ShardMap(Box::new(operation));

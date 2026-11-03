@@ -1,12 +1,11 @@
-//! Allocation regression tests for the reference [`Array`] backend.
-//!
-//! Direct typed kernels must allocate output storage without adding a payload-sized intermediate, and deriving the
-//! identity renaming of identity-free array IR signatures must not allocate at all. These contracts are invisible to
-//! ordinary assertions, so this binary counts allocations with its own global allocator, which is why it is a
-//! dedicated integration-test binary rather than part of the unit tests: a global allocator is one per binary, and a
-//! counting one in the unit-test binary would tax every other test. Storage sharing of array clones and the
-//! allocation-free member projections out of [`ArrayIrValue`](ryft_core::ArrayIrValue) are pinned by the unit tests
-//! of `arrays::arrays` and `arrays::ir` through pointer identity, which needs no allocator.
+//! Allocation tests for the reference [`Array`] backend. Direct typed kernels must allocate their output storage
+//! without adding a payload-sized intermediate, and deriving the identity renaming of identity-free array IR signatures
+//! must not allocate at all. Ordinary assertions cannot observe these contracts, so this binary counts allocations with
+//! its own global allocator. That is why these tests form a dedicated integration test binary rather than unit tests.
+//! A binary has exactly one global allocator, and a counting one in the unit test binary would slow down every other
+//! test. The unit tests of `arrays::arrays` and `arrays::ir` pin the storage sharing of array clones and the
+//! allocation-free member projections out of [`ArrayIrValue`](ryft_core::ArrayIrValue) through pointer identity,
+//! which needs no allocator.
 
 use std::alloc::{GlobalAlloc, Layout, System};
 use std::cell::Cell;
@@ -19,7 +18,7 @@ use ryft_core::{
     RngBitGenerator, Shape, Sin, Type,
 };
 
-/// Allocator that counts allocations made by this integration-test binary.
+/// Allocator that counts the allocations made by this integration test binary.
 struct CountingAllocator;
 
 /// Number of allocations made since the latest measurement reset.
@@ -31,7 +30,7 @@ static ALLOCATED_BYTE_COUNT: AtomicUsize = AtomicUsize::new(0);
 /// Largest allocation requested since the latest measurement reset.
 static LARGEST_ALLOCATION_BYTE_COUNT: AtomicUsize = AtomicUsize::new(0);
 
-/// Serializes measurements because the allocation counter is global to this test binary.
+/// Serializes measurements because the allocation counters are global to this test binary.
 static MEASUREMENT_LOCK: Mutex<()> = Mutex::new(());
 
 thread_local! {
@@ -85,7 +84,7 @@ struct AllocationStatistics {
     largest_allocation_byte_count: usize,
 }
 
-/// Runs `setup` outside the counted interval, then returns the allocations performed by `operation`.
+/// Runs `setup` outside the counted interval and then returns the allocations performed by `operation`.
 fn measure_allocations<S, T>(setup: impl FnOnce() -> S, operation: impl FnOnce(S) -> T) -> AllocationStatistics {
     let _guard = MEASUREMENT_LOCK.lock().expect("allocation measurement mutex is poisoned");
     let state = setup();
@@ -104,7 +103,95 @@ fn measure_allocations<S, T>(setup: impl FnOnce() -> S, operation: impl FnOnce(S
 }
 
 #[test]
-fn test_static_array_ir_identity_renaming_does_not_allocate() {
+fn test_array_sin_allocates_one_payload_buffer() {
+    // Growing the input from 1 to 4096 elements adds no allocation and exactly the extra output payload bytes.
+    let small = measure_allocations(|| Array::vector(vec![1.0f32]).unwrap(), |array| array.sin().unwrap());
+    let large = measure_allocations(
+        || Array::vector((0..4096).map(|value| value as f32).collect()).unwrap(),
+        |array| array.sin().unwrap(),
+    );
+    assert_eq!(large.allocation_count, small.allocation_count);
+    assert_eq!(large.allocated_byte_count - small.allocated_byte_count, (4096 - 1) * size_of::<f32>());
+}
+
+#[test]
+fn test_array_add_allocates_one_payload_buffer() {
+    let small = measure_allocations(
+        || (Array::vector(vec![1.0f32]).unwrap(), Array::vector(vec![2.0f32]).unwrap()),
+        |(left, right)| left.add(&right).unwrap(),
+    );
+    let large = measure_allocations(
+        || {
+            (
+                Array::vector((0..4096).map(|value| value as f32).collect()).unwrap(),
+                Array::vector((0..4096).map(|value| value as f32).collect()).unwrap(),
+            )
+        },
+        |(left, right)| left.add(&right).unwrap(),
+    );
+    assert_eq!(large.allocation_count, small.allocation_count);
+    assert_eq!(large.allocated_byte_count - small.allocated_byte_count, (4096 - 1) * size_of::<f32>());
+}
+
+#[test]
+fn test_array_rng_bit_generator_allocates_no_narrowing_buffer() {
+    // Narrow random outputs retain the generated `u32` words and construct their output storage directly,
+    // without a third payload-sized narrowing buffer.
+    let small = measure_allocations(
+        || {
+            (
+                Array::vector(vec![42u64, 7]).unwrap(),
+                ArrayType::new(DataType::U16, Shape::new(vec![Dimension::Static(1)])),
+            )
+        },
+        |(state, r#type)| state.rng_bit_generator(RandomAlgorithm::ThreeFry, &r#type).unwrap(),
+    );
+    let large = measure_allocations(
+        || {
+            (
+                Array::vector(vec![42u64, 7]).unwrap(),
+                ArrayType::new(DataType::U16, Shape::new(vec![Dimension::Static(4096)])),
+            )
+        },
+        |(state, r#type)| state.rng_bit_generator(RandomAlgorithm::ThreeFry, &r#type).unwrap(),
+    );
+    assert_eq!(large.allocation_count, small.allocation_count);
+    assert_eq!(
+        large.allocated_byte_count - small.allocated_byte_count,
+        (4096 - 1) * (size_of::<u32>() + size_of::<u16>()),
+    );
+}
+
+#[test]
+fn test_eager_context_fill_allocates_one_payload_buffer() {
+    let small = measure_allocations(
+        || ArrayType::new(DataType::F32, Shape::new(vec![Dimension::Static(1)])),
+        |r#type| EagerContext::<Array>::new().fill(&r#type, 2.5f32).unwrap(),
+    );
+    let large = measure_allocations(
+        || ArrayType::new(DataType::F32, Shape::new(vec![Dimension::Static(4096)])),
+        |r#type| EagerContext::<Array>::new().fill(&r#type, 2.5f32).unwrap(),
+    );
+    assert_eq!(large.allocation_count, small.allocation_count);
+    assert_eq!(large.allocated_byte_count - small.allocated_byte_count, (4096 - 1) * size_of::<f32>());
+}
+
+#[test]
+fn test_eager_context_iota_allocates_one_payload_buffer() {
+    let small = measure_allocations(
+        || ArrayType::new(DataType::U32, Shape::new(vec![Dimension::Static(1)])),
+        |r#type| EagerContext::<Array>::new().iota(&r#type, 0).unwrap(),
+    );
+    let large = measure_allocations(
+        || ArrayType::new(DataType::U32, Shape::new(vec![Dimension::Static(4096)])),
+        |r#type| EagerContext::<Array>::new().iota(&r#type, 0).unwrap(),
+    );
+    assert_eq!(large.allocation_count, small.allocation_count);
+    assert_eq!(large.allocated_byte_count - small.allocated_byte_count, (4096 - 1) * size_of::<u32>());
+}
+
+#[test]
+fn test_array_ir_type_derive_identity_renaming_does_not_allocate() {
     let statistics = measure_allocations(
         || {
             vec![
@@ -115,82 +202,4 @@ fn test_static_array_ir_identity_renaming_does_not_allocate() {
         |types| ArrayIrType::derive_identity_renaming(black_box(&types), black_box(&types)).unwrap(),
     );
     assert_eq!(statistics, AllocationStatistics::default());
-}
-
-#[test]
-fn test_reference_elementwise_kernels_allocate_only_one_payload_buffer() {
-    let small_unary = measure_allocations(|| Array::vector(vec![1.0f32]).unwrap(), |array| array.sin().unwrap());
-    let large_unary = measure_allocations(
-        || Array::vector((0..4096).map(|value| value as f32).collect()).unwrap(),
-        |array| array.sin().unwrap(),
-    );
-    assert_eq!(large_unary.allocation_count, small_unary.allocation_count);
-    assert_eq!(large_unary.allocated_byte_count - small_unary.allocated_byte_count, (4096 - 1) * size_of::<f32>());
-
-    let small_binary = measure_allocations(
-        || (Array::vector(vec![1.0f32]).unwrap(), Array::vector(vec![2.0f32]).unwrap()),
-        |(left, right)| left.add(&right).unwrap(),
-    );
-    let large_binary = measure_allocations(
-        || {
-            (
-                Array::vector((0..4096).map(|value| value as f32).collect()).unwrap(),
-                Array::vector((0..4096).map(|value| value as f32).collect()).unwrap(),
-            )
-        },
-        |(left, right)| left.add(&right).unwrap(),
-    );
-    assert_eq!(large_binary.allocation_count, small_binary.allocation_count);
-    assert_eq!(large_binary.allocated_byte_count - small_binary.allocated_byte_count, (4096 - 1) * size_of::<f32>());
-}
-
-#[test]
-fn test_reference_constructor_kernels_allocate_only_one_payload_buffer() {
-    let small_fill = measure_allocations(
-        || ArrayType::new(DataType::F32, Shape::new(vec![Dimension::Static(1)])),
-        |r#type| EagerContext::<Array>::new().fill(&r#type, 2.5f32).unwrap(),
-    );
-    let large_fill = measure_allocations(
-        || ArrayType::new(DataType::F32, Shape::new(vec![Dimension::Static(4096)])),
-        |r#type| EagerContext::<Array>::new().fill(&r#type, 2.5f32).unwrap(),
-    );
-    assert_eq!(large_fill.allocation_count, small_fill.allocation_count);
-    assert_eq!(large_fill.allocated_byte_count - small_fill.allocated_byte_count, (4096 - 1) * size_of::<f32>());
-
-    let small_iota = measure_allocations(
-        || ArrayType::new(DataType::U32, Shape::new(vec![Dimension::Static(1)])),
-        |r#type| EagerContext::<Array>::new().iota(&r#type, 0).unwrap(),
-    );
-    let large_iota = measure_allocations(
-        || ArrayType::new(DataType::U32, Shape::new(vec![Dimension::Static(4096)])),
-        |r#type| EagerContext::<Array>::new().iota(&r#type, 0).unwrap(),
-    );
-    assert_eq!(large_iota.allocation_count, small_iota.allocation_count);
-    assert_eq!(large_iota.allocated_byte_count - small_iota.allocated_byte_count, (4096 - 1) * size_of::<u32>());
-
-    // Narrow random outputs retain the generated U32 words and construct their output storage directly, without a
-    // third payload-sized narrowing buffer.
-    let small_random = measure_allocations(
-        || {
-            (
-                Array::vector(vec![42u64, 7]).unwrap(),
-                ArrayType::new(DataType::U16, Shape::new(vec![Dimension::Static(1)])),
-            )
-        },
-        |(state, r#type)| state.rng_bit_generator(RandomAlgorithm::ThreeFry, &r#type).unwrap(),
-    );
-    let large_random = measure_allocations(
-        || {
-            (
-                Array::vector(vec![42u64, 7]).unwrap(),
-                ArrayType::new(DataType::U16, Shape::new(vec![Dimension::Static(4096)])),
-            )
-        },
-        |(state, r#type)| state.rng_bit_generator(RandomAlgorithm::ThreeFry, &r#type).unwrap(),
-    );
-    assert_eq!(large_random.allocation_count, small_random.allocation_count);
-    assert_eq!(
-        large_random.allocated_byte_count - small_random.allocated_byte_count,
-        (4096 - 1) * (size_of::<u32>() + size_of::<u16>()),
-    );
 }
