@@ -29,14 +29,15 @@ pub trait CompilationArtifactExchange: Send + Sync {
     /// Returns the number of processes participating in the exchange.
     fn process_count(&self) -> usize;
 
-    /// Verifies that this process is compatible with the leader for `key`, before the leader compiles the program or
-    /// a follower waits for its artifact. A process calls this function only for compilations that miss its in-memory
-    /// cache. Processes may therefore call it for different keys and in different orders, skip a key that another
-    /// process compiles, or call it again for a key whose program they evicted. Implementations must address each
-    /// round by `key` rather than by call order, and the leader must not wait for followers. Implementations should
-    /// compare `key`, the process count, and any launch or backend compatibility identity that the transport owns.
-    /// The default validates only the local process coordinates so that simple transports remain usable.
-    fn preflight(&self, key: &[u8], timeout: Duration) -> Result<(), CompilationExchangeError> {
+    /// Validates this process's compatibility with the leader for `key` before the leader compiles the program or a
+    /// follower waits for its artifact. Followers may wait up to `timeout` for the leader's compatibility announcement.
+    /// A process calls this function only for compilations that miss its in-memory cache. Processes may therefore call
+    /// it for different keys and in different orders, skip a key that another process compiles, or call it again for a
+    /// key whose program they evicted. Implementations must address each round by `key` rather than by call order, and
+    /// the leader must not wait for followers. Implementations should compare `key`, the process count, and any launch
+    /// or backend compatibility identity that the transport owns. The default validates only the local process
+    /// coordinates so that simple transports remain usable.
+    fn validate_compatibility(&self, key: &[u8], timeout: Duration) -> Result<(), CompilationExchangeError> {
         let _ = key;
         let _ = timeout;
         if self.process_count() == 0 {
@@ -142,7 +143,7 @@ mod tests {
     }
 
     #[test]
-    fn test_compilation_artifact_exchange_preflight() {
+    fn test_compilation_artifact_exchange_validate_compatibility() {
         struct TestExchange {
             process_index: usize,
             process_count: usize,
@@ -167,15 +168,15 @@ mod tests {
         }
 
         let timeout = Duration::from_secs(1);
-        assert_eq!(TestExchange { process_index: 1, process_count: 2 }.preflight(b"key", timeout), Ok(()));
+        assert_eq!(TestExchange { process_index: 1, process_count: 2 }.validate_compatibility(b"key", timeout), Ok(()));
         assert_eq!(
-            TestExchange { process_index: 0, process_count: 0 }.preflight(b"key", timeout),
+            TestExchange { process_index: 0, process_count: 0 }.validate_compatibility(b"key", timeout),
             Err(CompilationExchangeError::Incompatible {
                 message: "exchange process count must be greater than zero".to_string(),
             }),
         );
         assert_eq!(
-            TestExchange { process_index: 2, process_count: 2 }.preflight(b"key", timeout),
+            TestExchange { process_index: 2, process_count: 2 }.validate_compatibility(b"key", timeout),
             Err(CompilationExchangeError::Incompatible {
                 message: "exchange process index is outside the configured process count".to_string(),
             }),

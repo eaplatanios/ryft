@@ -36,7 +36,7 @@ use sha2::{Digest, Sha256};
 
 const DEFAULT_ARTIFACT_CHUNK_SIZE: usize = 4 * 1024 * 1024;
 const DEFAULT_MAX_ARTIFACT_SIZE: usize = 2 * 1024 * 1024 * 1024;
-const DEFAULT_MAX_PREFLIGHT_KEY_SIZE: usize = 64 * 1024 * 1024;
+const DEFAULT_MAX_COMPATIBILITY_KEY_SIZE: usize = 64 * 1024 * 1024;
 const LAUNCH_ID_WAIT_TIMEOUT: Duration = Duration::from_secs(60);
 const ARTIFACT_EXCHANGE_SCHEMA_VERSION: u32 = 3;
 const LAUNCH_ID_KEY: &[u8] = b"ryft/distributed-launch/v1/id";
@@ -50,9 +50,9 @@ struct CompilationArtifactManifest {
     failure: Option<String>,
 }
 
-/// Announcement that the leader publishes in its preflight for one persistent compilation key.
+/// Announcement that the leader publishes during compatibility validation for one persistent compilation key.
 #[derive(Serialize, Deserialize)]
-struct CompilationPreflightManifest {
+struct CompilationCompatibilityManifest {
     /// Exchange protocol version of the leader.
     schema_version: u32,
 
@@ -75,7 +75,7 @@ struct DistributedCompilationArtifactExchange {
     process_count: usize,
     chunk_size: usize,
     maximum_artifact_size: usize,
-    maximum_preflight_key_size: usize,
+    maximum_compatibility_key_size: usize,
 }
 
 impl DistributedCompilationArtifactExchange {
@@ -119,32 +119,33 @@ impl CompilationArtifactExchange for DistributedCompilationArtifactExchange {
         self.process_count
     }
 
-    fn preflight(&self, key: &[u8], timeout: Duration) -> Result<(), CompilationExchangeError> {
-        // Preflight rounds are addressed by the compilation key rather than by call order, because each process
-        // preflights only the compilations that miss its own in-memory cache. The leader announces every key that it
-        // is about to compile without waiting for anyone, and each follower waits for the announcement of its own key.
+    fn validate_compatibility(&self, key: &[u8], timeout: Duration) -> Result<(), CompilationExchangeError> {
+        // Address compatibility validation by the compilation key because each process validates only compilations
+        // that miss its own in-memory cache. The leader announces every key that it is about to compile without
+        // waiting for anyone, and each follower waits for the announcement of its own key.
         if self.process_count == 0 || self.process_index >= self.process_count {
             return Err(CompilationExchangeError::Incompatible {
                 message: "exchange process coordinates are invalid".to_string(),
             });
         }
-        if key.len() > self.maximum_preflight_key_size {
+        if key.len() > self.maximum_compatibility_key_size {
             return Err(CompilationExchangeError::Incompatible {
                 message: format!(
-                    "persistent compilation key size {} exceeds configured preflight maximum {}",
+                    "persistent compilation key size {} exceeds configured compatibility validation maximum {}",
                     key.len(),
-                    self.maximum_preflight_key_size,
+                    self.maximum_compatibility_key_size,
                 ),
             });
         }
 
         if self.process_index == 0 {
-            let manifest = CompilationPreflightManifest {
+            let manifest = CompilationCompatibilityManifest {
                 schema_version: ARTIFACT_EXCHANGE_SCHEMA_VERSION,
                 process_count: self.process_count as u64,
             };
-            let manifest = serde_json::to_vec(&manifest)
-                .map_err(|error| Self::failed(format!("failed to encode compilation preflight manifest: {error}")))?;
+            let manifest = serde_json::to_vec(&manifest).map_err(|error| {
+                Self::failed(format!("failed to encode compilation compatibility manifest: {error}"))
+            })?;
             // The key is written before the manifest so that a follower that observes the manifest also finds the key.
             self.put_if_absent(&self.key(key, b"preflight/key"), key)?;
             return self.put_if_absent(&self.key(key, b"preflight/manifest"), manifest.as_slice());
@@ -161,8 +162,8 @@ impl CompilationArtifactExchange for DistributedCompilationArtifactExchange {
             })
         };
         let manifest = get(b"preflight/manifest")?;
-        let manifest: CompilationPreflightManifest = serde_json::from_slice(manifest.as_slice())
-            .map_err(|error| Self::failed(format!("failed to decode compilation preflight manifest: {error}")))?;
+        let manifest: CompilationCompatibilityManifest = serde_json::from_slice(manifest.as_slice())
+            .map_err(|error| Self::failed(format!("failed to decode compilation compatibility manifest: {error}")))?;
         if manifest.schema_version != ARTIFACT_EXCHANGE_SCHEMA_VERSION {
             return Err(CompilationExchangeError::Incompatible {
                 message: format!(
@@ -431,12 +432,13 @@ impl DistributedRuntime {
     /// programs that their in-memory caches already hold, or compile programs that no other process compiles (e.g.,
     /// eager operations that only process zero runs).
     ///
-    /// Before process zero compiles a program, its preflight announces the persistent compilation key and the
-    /// process count without waiting for any other process. A follower that misses its in-memory cache waits for that
-    /// announcement before it waits for the artifact, and rejects a process count that disagrees with its own. The
-    /// XLA persistent key includes platform and plugin versions, compiler identity, and logical topology, so a
-    /// follower whose compatibility properties differ from those of process zero never observes an announcement for
-    /// its key. Its preflight then times out, and the configured exchange policy decides whether it compiles locally.
+    /// Before process zero compiles a program, [`CompilationArtifactExchange::validate_compatibility`] announces the
+    /// persistent compilation key and the process count without waiting for any other process. A follower that misses
+    /// its in-memory cache waits for that announcement before it waits for the artifact, and rejects a process count
+    /// that disagrees with its own. The XLA persistent key includes platform and plugin versions, compiler identity,
+    /// and logical topology, so a follower whose compatibility properties differ from those of process zero never
+    /// observes an announcement for its key. Its compatibility validation then times out, and the configured exchange
+    /// policy decides whether it compiles locally.
     pub fn compilation_artifact_exchange(
         &self,
         process_index: usize,
@@ -448,7 +450,7 @@ impl DistributedRuntime {
             process_count,
             chunk_size: DEFAULT_ARTIFACT_CHUNK_SIZE,
             maximum_artifact_size: DEFAULT_MAX_ARTIFACT_SIZE,
-            maximum_preflight_key_size: DEFAULT_MAX_PREFLIGHT_KEY_SIZE,
+            maximum_compatibility_key_size: DEFAULT_MAX_COMPATIBILITY_KEY_SIZE,
         })
     }
 
@@ -548,7 +550,7 @@ mod tests {
             process_count: 2,
             chunk_size: 3,
             maximum_artifact_size: 16,
-            maximum_preflight_key_size: 16,
+            maximum_compatibility_key_size: 16,
         };
 
         exchange.publish(b"program", b"abcdefgh").unwrap();
@@ -563,7 +565,7 @@ mod tests {
     }
 
     #[test]
-    fn test_compilation_artifact_preflight_and_single_producer_path() {
+    fn test_compilation_artifact_exchange_validate_compatibility_and_single_producer_path() {
         let Some(address) = loopback_address() else {
             return;
         };
@@ -577,13 +579,13 @@ mod tests {
             let producer_calls = Arc::clone(&producer_calls);
             let leader = Arc::clone(&leader);
             let producer = scope.spawn(move || {
-                leader.preflight(b"complete-xla-persistent-key", Duration::from_secs(1)).unwrap();
+                leader.validate_compatibility(b"complete-xla-persistent-key", Duration::from_secs(1)).unwrap();
                 producer_calls.fetch_add(1, Ordering::Relaxed);
                 leader.publish(b"complete-xla-persistent-key", b"serialized-executable").unwrap();
             });
             let follower = Arc::clone(&follower);
             let consumer = scope.spawn(move || {
-                follower.preflight(b"complete-xla-persistent-key", Duration::from_secs(1)).unwrap();
+                follower.validate_compatibility(b"complete-xla-persistent-key", Duration::from_secs(1)).unwrap();
                 follower.receive(b"complete-xla-persistent-key", Duration::from_secs(1)).unwrap().unwrap()
             });
 
@@ -594,7 +596,7 @@ mod tests {
     }
 
     #[test]
-    fn test_compilation_artifact_preflight_times_out_on_key_disagreement() {
+    fn test_compilation_artifact_exchange_validate_compatibility_times_out_on_key_disagreement() {
         let Some(address) = loopback_address() else {
             return;
         };
@@ -604,15 +606,15 @@ mod tests {
         let follower = runtime.compilation_artifact_exchange(1, 2);
 
         // The leader never waits, while a follower whose key differs never observes an announcement for its key.
-        assert_eq!(leader.preflight(b"first-key", Duration::from_secs(1)), Ok(()));
+        assert_eq!(leader.validate_compatibility(b"first-key", Duration::from_secs(1)), Ok(()));
         assert_eq!(
-            follower.preflight(b"second-key", Duration::from_millis(20)),
+            follower.validate_compatibility(b"second-key", Duration::from_millis(20)),
             Err(CompilationExchangeError::TimedOut),
         );
     }
 
     #[test]
-    fn test_compilation_artifact_preflight_is_independent_of_call_order() {
+    fn test_compilation_artifact_exchange_validate_compatibility_is_independent_of_call_order() {
         let Some(address) = loopback_address() else {
             return;
         };
@@ -622,12 +624,13 @@ mod tests {
         let follower = runtime.compilation_artifact_exchange(1, 2);
 
         // The leader compiles programs that the follower skips (e.g., because its in-memory cache already holds them),
-        // compiles one program twice (e.g., after evicting it), and the follower preflights in a different order.
+        // compiles one program twice (e.g., after evicting it), and the follower validates compatibility in a different
+        // order.
         for key in [b"first-key".as_slice(), b"second-key", b"third-key", b"first-key"] {
-            assert_eq!(leader.preflight(key, Duration::from_secs(1)), Ok(()));
+            assert_eq!(leader.validate_compatibility(key, Duration::from_secs(1)), Ok(()));
         }
-        assert_eq!(follower.preflight(b"third-key", Duration::from_secs(1)), Ok(()));
-        assert_eq!(follower.preflight(b"first-key", Duration::from_secs(1)), Ok(()));
+        assert_eq!(follower.validate_compatibility(b"third-key", Duration::from_secs(1)), Ok(()));
+        assert_eq!(follower.validate_compatibility(b"first-key", Duration::from_secs(1)), Ok(()));
 
         // Publishing an already published artifact again is a no-op that keeps the first artifact.
         leader.publish(b"first-key", b"first-executable").unwrap();
@@ -653,7 +656,7 @@ mod tests {
     }
 
     #[test]
-    fn test_compilation_artifact_preflight_rejects_process_count_disagreement() {
+    fn test_compilation_artifact_exchange_validate_compatibility_rejects_process_count_disagreement() {
         let Some(address) = loopback_address() else {
             return;
         };
@@ -662,9 +665,9 @@ mod tests {
         let leader = runtime.compilation_artifact_exchange(0, 2);
         let follower = runtime.compilation_artifact_exchange(1, 3);
 
-        assert_eq!(leader.preflight(b"key", Duration::from_secs(1)), Ok(()));
+        assert_eq!(leader.validate_compatibility(b"key", Duration::from_secs(1)), Ok(()));
         assert_eq!(
-            follower.preflight(b"key", Duration::from_secs(1)),
+            follower.validate_compatibility(b"key", Duration::from_secs(1)),
             Err(CompilationExchangeError::Incompatible {
                 message: "process 0 expects 2 processes, but this process expects 3".to_string(),
             }),
@@ -682,9 +685,9 @@ mod tests {
         let follower = runtime.compilation_artifact_exchange(1, 2);
 
         thread::scope(|scope| {
-            let leader = scope.spawn(move || leader.preflight(b"key", Duration::from_secs(1)));
+            let leader = scope.spawn(move || leader.validate_compatibility(b"key", Duration::from_secs(1)));
             let follower = scope.spawn(move || {
-                follower.preflight(b"key", Duration::from_secs(1)).unwrap();
+                follower.validate_compatibility(b"key", Duration::from_secs(1)).unwrap();
                 follower.receive(b"key", Duration::from_millis(20))
             });
             leader.join().unwrap().unwrap();
@@ -705,7 +708,7 @@ mod tests {
             process_count: 2,
             chunk_size: 3,
             maximum_artifact_size: 16,
-            maximum_preflight_key_size: 16,
+            maximum_compatibility_key_size: 16,
         };
 
         let publish_invalid = |key: &[u8], first: &[u8], second: &[u8]| {
@@ -740,7 +743,7 @@ mod tests {
         let plugin = load_cpu_plugin().unwrap();
         let runtime = DistributedRuntime::initialize(&plugin, &address, 2, process_index as u32).unwrap();
         let exchange = runtime.compilation_artifact_exchange(process_index, 2);
-        exchange.preflight(b"multi-process-key", Duration::from_secs(5)).unwrap();
+        exchange.validate_compatibility(b"multi-process-key", Duration::from_secs(5)).unwrap();
 
         if process_index == 0 {
             let mut producers =

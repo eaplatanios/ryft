@@ -139,9 +139,9 @@ pub enum CompilationStep {
         outcome: CompilationLookupOutcome,
     },
 
-    /// Checked compatibility before using a distributed artifact exchange.
-    ExchangePreflight {
-        /// Completion result of the compatibility check.
+    /// Validated compatibility before using a distributed artifact exchange.
+    ExchangeCompatibilityValidation {
+        /// Completion result of the compatibility validation.
         outcome: CompilationStepOutcome,
     },
 
@@ -232,7 +232,7 @@ pub struct CompilationCacheStatistics {
     /// Distributed exchange, serialization, or deserialization failures.
     pub exchange_errors: u64,
 
-    /// Exchange preflights and follower waits that reached their deadline or ended without an artifact.
+    /// Exchange compatibility validations and follower waits that reached their deadline or ended without an artifact.
     pub exchange_timeouts: u64,
 
     /// Distributed misses or failures that fell back to local compilation.
@@ -247,7 +247,7 @@ pub struct CompilationCacheStatistics {
     /// Total host duration spent in persistent lookups and deserialization.
     pub persistent_lookup_duration: Duration,
 
-    /// Total host duration spent in exchange preflights, waits, receptions, and deserialization.
+    /// Total host duration spent in exchange compatibility validation, waits, receptions, and deserialization.
     pub exchange_duration: Duration,
 
     /// Total host duration spent in uncached backend compilations.
@@ -907,12 +907,12 @@ impl<'o, C: CompilationCacheDomain> CompilationContext<'o, C> {
                 .map(|(disk_cache, key)| (disk_cache, DiskCacheDigest::from_key(key)));
 
             // The persistent key addresses artifacts across processes, so the exchange cannot participate without it.
-            // Preflight runs before disk restore so peer compatibility is checked even when this process has a hit.
+            // Validate peer compatibility before disk restoration, including when this process has a disk hit.
             let exchange = match (configured_exchange, persistent_key.as_deref()) {
                 (None, _) => None,
                 (Some(_), None) => {
                     self.record_event(CompilationEvent {
-                        step: CompilationStep::ExchangePreflight {
+                        step: CompilationStep::ExchangeCompatibilityValidation {
                             outcome: CompilationStepOutcome::Skipped(CompilationSkipReason::Unsupported),
                         },
                         duration: Duration::ZERO,
@@ -922,7 +922,7 @@ impl<'o, C: CompilationCacheDomain> CompilationContext<'o, C> {
                 }
                 (Some((exchange, timeout)), Some(key)) => {
                     let exchange = ActiveExchange { exchange, key, timeout };
-                    self.preflight_exchange(exchange)?.then_some(exchange)
+                    self.validate_exchange_compatibility(exchange)?.then_some(exchange)
                 }
             };
 
@@ -977,14 +977,15 @@ impl<'o, C: CompilationCacheDomain> CompilationContext<'o, C> {
         validation.map(|()| cached)
     }
 
-    /// Preflights `exchange` and returns whether it participates in this compilation. A preflight failure is fatal when
-    /// the policy requires sharing. Otherwise, it is recorded and the exchange is deactivated for this compilation.
-    fn preflight_exchange(&self, exchange: ActiveExchange<'_>) -> Result<bool, C::Error> {
-        let preflight_start = Instant::now();
-        let Err(error) = exchange.exchange.preflight(exchange.key, exchange.timeout) else {
+    /// Validates compatibility with `exchange` and returns whether it participates in this compilation. A validation
+    /// failure is fatal when the policy requires sharing. Otherwise, it is recorded and the exchange is deactivated for
+    /// this compilation.
+    fn validate_exchange_compatibility(&self, exchange: ActiveExchange<'_>) -> Result<bool, C::Error> {
+        let compatibility_start = Instant::now();
+        let Err(error) = exchange.exchange.validate_compatibility(exchange.key, exchange.timeout) else {
             self.record_duration(
-                CompilationStep::ExchangePreflight { outcome: CompilationStepOutcome::Succeeded },
-                preflight_start.elapsed(),
+                CompilationStep::ExchangeCompatibilityValidation { outcome: CompilationStepOutcome::Succeeded },
+                compatibility_start.elapsed(),
                 &self.statistics.exchange_nanoseconds,
             );
             return Ok(true);
@@ -1001,8 +1002,8 @@ impl<'o, C: CompilationCacheDomain> CompilationContext<'o, C> {
         };
         self.record_exchange_fallback(
             counter,
-            CompilationStep::ExchangePreflight { outcome: CompilationStepOutcome::Failed(reason) },
-            preflight_start,
+            CompilationStep::ExchangeCompatibilityValidation { outcome: CompilationStepOutcome::Failed(reason) },
+            compatibility_start,
             message.as_str(),
         )?;
         Ok(false)
@@ -2141,7 +2142,7 @@ mod tests {
     struct TestExchangeState {
         artifacts: Mutex<HashMap<Vec<u8>, Result<Vec<u8>, String>>>,
         ready: Condvar,
-        preflight_error: Mutex<Option<CompilationExchangeError>>,
+        compatibility_error: Mutex<Option<CompilationExchangeError>>,
         receive_fails: AtomicBool,
         receive_incompatible: AtomicBool,
         publish_fails: AtomicBool,
@@ -2168,8 +2169,8 @@ mod tests {
             2
         }
 
-        fn preflight(&self, _key: &[u8], _timeout: Duration) -> Result<(), CompilationExchangeError> {
-            match self.state.preflight_error.lock().unwrap().as_ref() {
+        fn validate_compatibility(&self, _key: &[u8], _timeout: Duration) -> Result<(), CompilationExchangeError> {
+            match self.state.compatibility_error.lock().unwrap().as_ref() {
                 Some(error) => Err(error.clone()),
                 None => Ok(()),
             }
@@ -2230,8 +2231,8 @@ mod tests {
             self.0.process_count()
         }
 
-        fn preflight(&self, key: &[u8], timeout: Duration) -> Result<(), CompilationExchangeError> {
-            self.0.preflight(key, timeout)
+        fn validate_compatibility(&self, key: &[u8], timeout: Duration) -> Result<(), CompilationExchangeError> {
+            self.0.validate_compatibility(key, timeout)
         }
 
         fn publish(&self, key: &[u8], artifact: &[u8]) -> Result<(), CompilationExchangeError> {
@@ -2642,7 +2643,7 @@ mod tests {
                     tier: CompilationCacheTier::Memory,
                     outcome: CompilationLookupOutcome::Miss(CompilationMissReason::NotFound),
                 },
-                CompilationStep::ExchangePreflight { outcome: CompilationStepOutcome::Succeeded },
+                CompilationStep::ExchangeCompatibilityValidation { outcome: CompilationStepOutcome::Succeeded },
                 CompilationStep::BackendCompilation { outcome: CompilationStepOutcome::Succeeded },
                 CompilationStep::ExchangePublish { outcome: CompilationStepOutcome::Succeeded },
             ],
@@ -2654,11 +2655,11 @@ mod tests {
                     tier: CompilationCacheTier::Memory,
                     outcome: CompilationLookupOutcome::Miss(CompilationMissReason::NotFound),
                 },
-                CompilationStep::ExchangePreflight { outcome: CompilationStepOutcome::Succeeded },
+                CompilationStep::ExchangeCompatibilityValidation { outcome: CompilationStepOutcome::Succeeded },
                 CompilationStep::ExchangeReceive { outcome: CompilationLookupOutcome::Hit },
             ],
         );
-        // The exchange duration covers preflights and receptions, but never publication.
+        // The exchange duration covers compatibility validation and receptions, but never publication.
         assert_eq!(leader_context.statistics().exchange_duration, leader_context.recent_events()[1].duration);
         assert_eq!(follower_statistics.exchange_duration, follower_events[1].duration + follower_events[2].duration);
     }
@@ -2749,7 +2750,7 @@ mod tests {
                     tier: CompilationCacheTier::Memory,
                     outcome: CompilationLookupOutcome::Miss(CompilationMissReason::NotFound),
                 },
-                CompilationStep::ExchangePreflight { outcome: CompilationStepOutcome::Succeeded },
+                CompilationStep::ExchangeCompatibilityValidation { outcome: CompilationStepOutcome::Succeeded },
                 CompilationStep::CacheLookup {
                     tier: CompilationCacheTier::Persistent,
                     outcome: CompilationLookupOutcome::Hit,
@@ -2798,7 +2799,7 @@ mod tests {
                     tier: CompilationCacheTier::Memory,
                     outcome: CompilationLookupOutcome::Miss(CompilationMissReason::NotFound),
                 },
-                CompilationStep::ExchangePreflight { outcome: CompilationStepOutcome::Succeeded },
+                CompilationStep::ExchangeCompatibilityValidation { outcome: CompilationStepOutcome::Succeeded },
                 CompilationStep::BackendCompilation {
                     outcome: CompilationStepOutcome::Failed(CompilationStepError::CompilationFailed {
                         message: "encountered malformed program: expected test failure".to_string()
@@ -2819,7 +2820,7 @@ mod tests {
                     tier: CompilationCacheTier::Memory,
                     outcome: CompilationLookupOutcome::Miss(CompilationMissReason::NotFound),
                 },
-                CompilationStep::ExchangePreflight { outcome: CompilationStepOutcome::Succeeded },
+                CompilationStep::ExchangeCompatibilityValidation { outcome: CompilationStepOutcome::Succeeded },
                 CompilationStep::ExchangeReceive {
                     outcome: CompilationLookupOutcome::Failed(CompilationStepError::ReadFailed {
                         message:
@@ -2860,7 +2861,7 @@ mod tests {
                     tier: CompilationCacheTier::Memory,
                     outcome: CompilationLookupOutcome::Miss(CompilationMissReason::NotFound),
                 },
-                CompilationStep::ExchangePreflight { outcome: CompilationStepOutcome::Succeeded },
+                CompilationStep::ExchangeCompatibilityValidation { outcome: CompilationStepOutcome::Succeeded },
                 CompilationStep::BackendCompilation {
                     outcome: CompilationStepOutcome::Failed(CompilationStepError::CompilationFailed {
                         message: "encountered malformed program: expected producer failure".to_string()
@@ -2910,7 +2911,7 @@ mod tests {
                     tier: CompilationCacheTier::Memory,
                     outcome: CompilationLookupOutcome::Miss(CompilationMissReason::NotFound),
                 },
-                CompilationStep::ExchangePreflight { outcome: CompilationStepOutcome::Succeeded },
+                CompilationStep::ExchangeCompatibilityValidation { outcome: CompilationStepOutcome::Succeeded },
                 CompilationStep::BackendCompilation { outcome: CompilationStepOutcome::Succeeded },
                 CompilationStep::ExchangePublish {
                     outcome: CompilationStepOutcome::Failed(CompilationStepError::SerializationFailed {
@@ -2958,7 +2959,7 @@ mod tests {
                     tier: CompilationCacheTier::Memory,
                     outcome: CompilationLookupOutcome::Miss(CompilationMissReason::NotFound),
                 },
-                CompilationStep::ExchangePreflight { outcome: CompilationStepOutcome::Succeeded },
+                CompilationStep::ExchangeCompatibilityValidation { outcome: CompilationStepOutcome::Succeeded },
                 CompilationStep::CacheLookup {
                     tier: CompilationCacheTier::Persistent,
                     outcome: CompilationLookupOutcome::Miss(CompilationMissReason::NotFound),
@@ -3000,7 +3001,7 @@ mod tests {
                     tier: CompilationCacheTier::Memory,
                     outcome: CompilationLookupOutcome::Miss(CompilationMissReason::NotFound),
                 },
-                CompilationStep::ExchangePreflight { outcome: CompilationStepOutcome::Succeeded },
+                CompilationStep::ExchangeCompatibilityValidation { outcome: CompilationStepOutcome::Succeeded },
                 CompilationStep::CacheLookup {
                     tier: CompilationCacheTier::Persistent,
                     outcome: CompilationLookupOutcome::Miss(CompilationMissReason::NotFound),
@@ -3047,7 +3048,7 @@ mod tests {
                     tier: CompilationCacheTier::Memory,
                     outcome: CompilationLookupOutcome::Miss(CompilationMissReason::NotFound),
                 },
-                CompilationStep::ExchangePreflight { outcome: CompilationStepOutcome::Succeeded },
+                CompilationStep::ExchangeCompatibilityValidation { outcome: CompilationStepOutcome::Succeeded },
                 CompilationStep::ExchangeReceive {
                     outcome: CompilationLookupOutcome::Failed(CompilationStepError::ReadFailed {
                         message: "compilation artifact exchange failed: expected receive failure".to_string()
@@ -3086,7 +3087,7 @@ mod tests {
                     tier: CompilationCacheTier::Memory,
                     outcome: CompilationLookupOutcome::Miss(CompilationMissReason::NotFound),
                 },
-                CompilationStep::ExchangePreflight { outcome: CompilationStepOutcome::Succeeded },
+                CompilationStep::ExchangeCompatibilityValidation { outcome: CompilationStepOutcome::Succeeded },
                 CompilationStep::ExchangeReceive {
                     outcome: CompilationLookupOutcome::Failed(CompilationStepError::Incompatible {
                         message: "compilation artifact exchange is incompatible: expected receive incompatibility"
@@ -3118,7 +3119,7 @@ mod tests {
                     tier: CompilationCacheTier::Memory,
                     outcome: CompilationLookupOutcome::Miss(CompilationMissReason::NotFound),
                 },
-                CompilationStep::ExchangePreflight { outcome: CompilationStepOutcome::Succeeded },
+                CompilationStep::ExchangeCompatibilityValidation { outcome: CompilationStepOutcome::Succeeded },
                 CompilationStep::ExchangeReceive {
                     outcome: CompilationLookupOutcome::Miss(CompilationMissReason::Incompatible),
                 },
@@ -3157,7 +3158,7 @@ mod tests {
                     tier: CompilationCacheTier::Memory,
                     outcome: CompilationLookupOutcome::Miss(CompilationMissReason::NotFound),
                 },
-                CompilationStep::ExchangePreflight { outcome: CompilationStepOutcome::Succeeded },
+                CompilationStep::ExchangeCompatibilityValidation { outcome: CompilationStepOutcome::Succeeded },
                 CompilationStep::ExchangeReceive {
                     outcome: CompilationLookupOutcome::Failed(CompilationStepError::DeserializationFailed {
                         message: "encountered malformed program: test persistent payload has the wrong length"
@@ -3193,7 +3194,7 @@ mod tests {
                     tier: CompilationCacheTier::Memory,
                     outcome: CompilationLookupOutcome::Miss(CompilationMissReason::NotFound),
                 },
-                CompilationStep::ExchangePreflight { outcome: CompilationStepOutcome::Succeeded },
+                CompilationStep::ExchangeCompatibilityValidation { outcome: CompilationStepOutcome::Succeeded },
                 CompilationStep::BackendCompilation { outcome: CompilationStepOutcome::Succeeded },
                 CompilationStep::ExchangePublish {
                     outcome: CompilationStepOutcome::Failed(CompilationStepError::WriteFailed {
@@ -3202,15 +3203,15 @@ mod tests {
                 },
             ],
         );
-        // The failed publication does not count toward the exchange duration, which covers only the preflight.
+        // Exchange duration includes compatibility validation and excludes the failed publication.
         assert_eq!(context.statistics().exchange_duration, context.recent_events()[1].duration);
     }
 
     #[test]
-    fn test_compilation_context_with_artifact_exchange_rejects_preflight_disagreement() {
+    fn test_compilation_context_with_artifact_exchange_rejects_compatibility_disagreement() {
         let state = Arc::new(TestExchangeState::default());
-        *state.preflight_error.lock().unwrap() =
-            Some(CompilationExchangeError::Incompatible { message: "expected preflight incompatibility".to_string() });
+        *state.compatibility_error.lock().unwrap() =
+            Some(CompilationExchangeError::Incompatible { message: "expected exchange incompatibility".to_string() });
         let context = CompilationContext::<TestDomain>::new().with_event_capacity(16).with_artifact_exchange(
             Arc::new(TestExchange::new(0, state)),
             CompilationArtifactExchangePolicy::RequireSharing { timeout: Duration::from_secs(1) },
@@ -3229,7 +3230,7 @@ mod tests {
             result.err(),
             Some(ProgramError::InvalidArgument {
                 message: "compilation artifact exchange requirement was not satisfied: \
-                    compilation artifact exchange is incompatible: expected preflight incompatibility"
+                    compilation artifact exchange is incompatible: expected exchange incompatibility"
                     .to_string(),
             }),
         );
@@ -3244,9 +3245,9 @@ mod tests {
                     tier: CompilationCacheTier::Memory,
                     outcome: CompilationLookupOutcome::Miss(CompilationMissReason::NotFound),
                 },
-                CompilationStep::ExchangePreflight {
+                CompilationStep::ExchangeCompatibilityValidation {
                     outcome: CompilationStepOutcome::Failed(CompilationStepError::Incompatible {
-                        message: "compilation artifact exchange is incompatible: expected preflight incompatibility"
+                        message: "compilation artifact exchange is incompatible: expected exchange incompatibility"
                             .to_string()
                     }),
                 },
@@ -3256,9 +3257,9 @@ mod tests {
     }
 
     #[test]
-    fn test_compilation_context_with_artifact_exchange_preflight_failure() {
+    fn test_compilation_context_with_artifact_exchange_compatibility_validation_failure() {
         let state = Arc::new(TestExchangeState::default());
-        *state.preflight_error.lock().unwrap() =
+        *state.compatibility_error.lock().unwrap() =
             Some(CompilationExchangeError::Failed { message: "expected coordination failure".to_string() });
         let context = CompilationContext::<TestDomain>::new().with_event_capacity(8).with_artifact_exchange(
             Arc::new(TestExchange::new(0, state)),
@@ -3281,7 +3282,7 @@ mod tests {
                     tier: CompilationCacheTier::Memory,
                     outcome: CompilationLookupOutcome::Miss(CompilationMissReason::NotFound),
                 },
-                CompilationStep::ExchangePreflight {
+                CompilationStep::ExchangeCompatibilityValidation {
                     outcome: CompilationStepOutcome::Failed(CompilationStepError::ExchangeFailed {
                         message: "compilation artifact exchange failed: expected coordination failure".to_string(),
                     }),
@@ -3319,7 +3320,7 @@ mod tests {
                     tier: CompilationCacheTier::Memory,
                     outcome: CompilationLookupOutcome::Miss(CompilationMissReason::NotFound),
                 },
-                CompilationStep::ExchangePreflight {
+                CompilationStep::ExchangeCompatibilityValidation {
                     outcome: CompilationStepOutcome::Skipped(CompilationSkipReason::Unsupported),
                 },
             ],
@@ -3361,7 +3362,7 @@ mod tests {
                     tier: CompilationCacheTier::Memory,
                     outcome: CompilationLookupOutcome::Miss(CompilationMissReason::NotFound),
                 },
-                CompilationStep::ExchangePreflight { outcome: CompilationStepOutcome::Succeeded },
+                CompilationStep::ExchangeCompatibilityValidation { outcome: CompilationStepOutcome::Succeeded },
                 CompilationStep::ExchangeReceive {
                     outcome: CompilationLookupOutcome::Miss(CompilationMissReason::TimedOut),
                 },
@@ -3394,7 +3395,7 @@ mod tests {
                     tier: CompilationCacheTier::Memory,
                     outcome: CompilationLookupOutcome::Miss(CompilationMissReason::NotFound),
                 },
-                CompilationStep::ExchangePreflight { outcome: CompilationStepOutcome::Succeeded },
+                CompilationStep::ExchangeCompatibilityValidation { outcome: CompilationStepOutcome::Succeeded },
                 CompilationStep::ExchangeReceive {
                     outcome: CompilationLookupOutcome::Miss(CompilationMissReason::TimedOut),
                 },
@@ -3674,7 +3675,7 @@ mod tests {
                     tier: CompilationCacheTier::Memory,
                     outcome: CompilationLookupOutcome::Miss(CompilationMissReason::NotFound),
                 },
-                CompilationStep::ExchangePreflight { outcome: CompilationStepOutcome::Succeeded },
+                CompilationStep::ExchangeCompatibilityValidation { outcome: CompilationStepOutcome::Succeeded },
                 CompilationStep::ExchangeReceive {
                     outcome: CompilationLookupOutcome::Miss(CompilationMissReason::Incompatible),
                 },
