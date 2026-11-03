@@ -3223,8 +3223,6 @@ where
         .bitcast_element_type(computation_type)
 }
 
-// TODO(eaplatanios): Review from here onwards.
-
 #[cfg(test)]
 mod tests {
     use approx::assert_abs_diff_eq;
@@ -3250,6 +3248,9 @@ mod tests {
     use crate::tracing::{Tracer, TracingContext};
 
     use super::*;
+
+    type EagerArrayContext = EagerContext<Array, ArrayOperation<Array>>;
+    type EagerArrayIrContext = EagerContext<ArrayIrValue<Array>, ArrayIrOperation<Array>>;
 
     /// Returns a `[rows, columns]` matrix whose values cycle through `values` in row-major order.
     fn cyclic_matrix(rows: usize, columns: usize, values: &[f32]) -> Array {
@@ -3286,8 +3287,6 @@ mod tests {
         Ok(outputs.remove(0))
     }
 
-    type EagerArrayContext = EagerContext<Array, ArrayOperation<Array>>;
-
     #[test]
     fn test_block_quantized_value_new() {
         let elements = Array::vector(vec![1.0f32, 2.0, 3.0, 4.0]).unwrap();
@@ -3304,6 +3303,7 @@ mod tests {
 
     #[test]
     fn test_block_quantized_value_with_global_scale() {
+        // Setting a global scale replaces any previous one and keeps the elements and block scales.
         let elements = Array::vector(vec![1.0f32, 2.0, 3.0, 4.0]).unwrap();
         let scales = Array::vector(vec![2.0f32, 3.0]).unwrap();
         let global_scale = Array::scalar(5.0f32).unwrap();
@@ -3325,6 +3325,7 @@ mod tests {
 
     #[test]
     fn test_block_quantized_value_parameterized() {
+        // The parameters are the elements, the block scales, and the global scale when present, in that order.
         let input = BlockQuantizedValue::new(
             Array::vector(vec![1.0f32, 2.0, 3.0, 4.0]).unwrap(),
             Array::vector(vec![2.0f32, 3.0]).unwrap(),
@@ -3336,7 +3337,7 @@ mod tests {
             input.parameters().cloned().collect::<Vec<_>>(),
             vec![input.elements.clone(), input.scales.clone(), input.global_scale.clone().unwrap()],
         );
-        assert_eq!(BlockQuantizedValue::from_parameters(structure, input.clone().into_parameters()), Ok(input.clone()),);
+        assert_eq!(BlockQuantizedValue::from_parameters(structure, input.clone().into_parameters()), Ok(input.clone()));
 
         // The complete representation, including its optional scalar, is a structured tracing boundary.
         let input_types = input.clone().map_parameters(|value| value.r#type().into_owned()).unwrap();
@@ -3393,8 +3394,8 @@ mod tests {
     fn test_block_quantize_mxfp8() {
         // The OCP MX recipe uses `f8e4m3fn` elements with power of two `f8e8m0fnu` scales
         // `2^(floor(log2(max_abs(block))) - 8)`. Several block maxima below are exact powers of two, and every
-        // quotient is exactly representable in `f8e4m3fn`, so quantization is exact. The block whose values are all
-        // zero uses the smallest scale, `2^-126`.
+        // quotient is exactly representable in `f8e4m3fn`, so quantization is exact. The block whose values are
+        // all zero uses the smallest scale, `2^-126`.
         let input = Array::matrix(
             2,
             8,
@@ -3431,7 +3432,7 @@ mod tests {
     }
 
     #[test]
-    fn test_block_quantize_clamps_scales() {
+    fn test_block_quantize_saturation() {
         // An NVFP4 block maximum above `6 · 448` would need a scale beyond the largest finite `f8e4m3fn` value, so the
         // scale saturates at `448` and the quotients saturate at the largest element magnitude instead of becoming NaN.
         let input = Array::vector(vec![6000.0f32, 3000.0, 0.0, 0.0, 1.0, 1.0, 1.0, 1.0]).unwrap();
@@ -3512,6 +3513,8 @@ mod tests {
 
     #[test]
     fn test_block_quantize_validation() {
+        // Element and scale types must be supported block-scaled formats, and inputs must be `f32` or `f64` arrays of
+        // positive rank.
         let input = Array::matrix(2, 8, vec![1.0f32; 16]).unwrap();
         assert_eq!(
             input.block_quantize(4, DataType::F16, DataType::F8E4M3FN),
@@ -3558,17 +3561,16 @@ mod tests {
             )))),
         );
 
-        // Staged inputs must have a static shape, and rejected requests stage nothing.
+        // Staged homogeneous inputs must have a static shape, and rejected requests stage nothing.
         let extent = Dimension::Dynamic(DimensionVariable::new("n", DimensionBounds::new(0, Some(8)).unwrap()));
         let (_, program) = TracingContext::<Array, ArrayOperation<Array>>::trace(
             |input: Tracer<_>| {
-                assert!(matches!(
+                assert_eq!(
                     input.block_quantize(4, DataType::F4E2M1FN, DataType::F8E4M3FN),
-                    Err(error) if error
-                        == ProgramError::from(TypeError::invalid(format!(
-                            "`{BLOCK_QUANTIZE_NAME}` input must have a static shape",
-                        ))),
-                ));
+                    Err(ProgramError::from(TypeError::invalid(format!(
+                        "`{BLOCK_QUANTIZE_NAME}` input must have a static shape",
+                    )))),
+                );
                 Ok(input)
             },
             ArrayType::new(DataType::F32, Shape::new(vec![extent])),
@@ -3663,6 +3665,9 @@ mod tests {
 
     #[test]
     fn test_block_quantize_dynamic_extents() {
+        // A dynamic block extent is read at runtime and asserted to be a positive multiple of the block size before the
+        // input is split into blocks. The recipe then stages the same arithmetic as for static shapes, with the block
+        // count and the extent as dimension values.
         let extent = DimensionVariable::new("n", DimensionBounds::new(0, Some(9)).unwrap());
         let (_, program) = TracingContext::<ArrayIrValue<Array>, ArrayIrOperation<Array>>::trace(
             |inputs: Vec<Tracer<_>>| {
@@ -3733,12 +3738,26 @@ mod tests {
             "#}
             .trim_end(),
         );
+
+        // Partial evaluation with an unknown input keeps every assertion, and the known recipe constants become inputs
+        // of the residual program.
         let evaluation =
             program.partially_evaluate(&[PartialValue::Unknown(program.input_types()[0].clone())]).unwrap();
         assert_eq!(
             evaluation.program().to_string(),
             indoc! {r#"
-                lambda %0:f32[n], %1:f32[], %2:f32[], %3:f32[], %4:f32[], %5:f32[], %6:f32[], %7:f32[], %8:f32[], %9:f32[], %10:f32[] .
+                lambda \
+                    %0:f32[n], \
+                    %1:f32[], \
+                    %2:f32[], \
+                    %3:f32[], \
+                    %4:f32[], \
+                    %5:f32[], \
+                    %6:f32[], \
+                    %7:f32[], \
+                    %8:f32[], \
+                    %9:f32[], \
+                    %10:f32[] .
                 let %11:dimension<n ∈ [0, 9)> = dimension_size [axis=0] %0
                     %12:dimension<0> = const 0
                     %13:bool[] = compare [direction=GreaterThan] %11 %12
@@ -3782,20 +3801,17 @@ mod tests {
                     %46:f8e4m3fn[n] = convert_element_type [data_type=f8e4m3fn] %45
                     %47:f8e8m0fnu[n / 4] = convert_element_type [data_type=f8e8m0fnu] %28
                 in (%46, %47)
-            "#}.trim_end(),
+            "#}
+            .trim_end(),
         );
+
+        // Both programs quantize valid extents like the eager composition.
         let input = Array::vector(vec![3.0f32, 1.5, 0.5, 6.0]).unwrap();
         let BlockQuantizedValue { elements, scales, .. } =
             input.block_quantize(4, DataType::F8E4M3FN, DataType::F8E8M0FNU).unwrap();
         let expected = vec![ArrayIrValue::Array(elements), ArrayIrValue::Array(scales)];
         assert_eq!(program.interpret(vec![ArrayIrValue::Array(input.clone())]), Ok(expected.clone()));
-        assert_eq!(
-            evaluation.interpret(
-                &EagerContext::<ArrayIrValue<Array>, ArrayIrOperation<Array>>::new(),
-                &[ArrayIrValue::Array(input)]
-            ),
-            Ok(expected)
-        );
+        assert_eq!(evaluation.interpret(&EagerArrayIrContext::new(), &[ArrayIrValue::Array(input)]), Ok(expected));
         let input = Array::vector(vec![3.0f32, 1.5, 0.5, 6.0, 0.5, 1.0, 0.25, 1.5]).unwrap();
         let BlockQuantizedValue { elements, scales, .. } =
             input.block_quantize(4, DataType::F8E4M3FN, DataType::F8E8M0FNU).unwrap();
@@ -3803,22 +3819,23 @@ mod tests {
             program.interpret(vec![ArrayIrValue::Array(input)]),
             Ok(vec![ArrayIrValue::Array(elements), ArrayIrValue::Array(scales)]),
         );
-        for (values, message) in [
-            (vec![], "block extent of axis 0 must be positive"),
-            (vec![1.0f32; 6], "block extent of axis 0 must be divisible by block size"),
-        ] {
-            let extent = values.len();
-            let input = ArrayIrValue::Array(Array::vector(values).unwrap());
-            let expected = ProgramError::from(AssertionError::Failed {
-                message: message.to_string(),
-                observations: vec![("extent".to_string(), extent.to_string())],
-            });
-            assert_eq!(program.interpret(vec![input.clone()]), Err(expected.clone()));
-            assert_eq!(
-                evaluation.interpret(&EagerContext::<ArrayIrValue<Array>, ArrayIrOperation<Array>>::new(), &[input]),
-                Err(expected)
-            );
-        }
+
+        // Empty extents and extents that are not multiples of the block size fail the assertions of their axis, both
+        // before and after partial evaluation.
+        let input = ArrayIrValue::Array(Array::vector(Vec::<f32>::new()).unwrap());
+        let expected = ProgramError::from(AssertionError::Failed {
+            message: "block extent of axis 0 must be positive".to_string(),
+            observations: vec![("extent".to_string(), "0".to_string())],
+        });
+        assert_eq!(program.interpret(vec![input.clone()]), Err(expected.clone()));
+        assert_eq!(evaluation.interpret(&EagerArrayIrContext::new(), &[input]), Err(expected));
+        let input = ArrayIrValue::Array(Array::vector(vec![1.0f32; 6]).unwrap());
+        let expected = ProgramError::from(AssertionError::Failed {
+            message: "block extent of axis 0 must be divisible by block size".to_string(),
+            observations: vec![("extent".to_string(), "6".to_string())],
+        });
+        assert_eq!(program.interpret(vec![input.clone()]), Err(expected.clone()));
+        assert_eq!(evaluation.interpret(&EagerArrayIrContext::new(), &[input]), Err(expected));
 
         // Replaying the dynamic program through batching keeps one shared extent for every mapped row.
         let input = Array::matrix(2, 4, vec![3.0f32, 1.5, 0.5, 6.0, 0.5, 1.0, 0.25, 1.5]).unwrap();
@@ -3838,6 +3855,8 @@ mod tests {
 
     #[test]
     fn test_block_quantize_dynamic_non_block_extents() {
+        // Static block extents need no runtime assertions even when other extents are dynamic, so the reshapes are
+        // proven statically and empty non-block extents quantize to empty outputs.
         let extent = DimensionVariable::new("batch", DimensionBounds::new(0, Some(3)).unwrap());
         let (_, program) = TracingContext::<ArrayIrValue<Array>, ArrayIrOperation<Array>>::trace(
             |input: Tracer<_>| {
@@ -3916,7 +3935,7 @@ mod tests {
             program.interpret(ArrayIrValue::Array(input)),
             Ok(vec![ArrayIrValue::Array(elements), ArrayIrValue::Array(scales)]),
         );
-        let input = Array::matrix(0, 4, vec![] as Vec<f64>).unwrap();
+        let input = Array::matrix(0, 4, Vec::<f64>::new()).unwrap();
         let BlockQuantizedValue { elements, scales, .. } =
             input.block_quantize(2, DataType::F8E5M2, DataType::F8E8M0FNU).unwrap();
         assert_eq!(
@@ -3926,46 +3945,36 @@ mod tests {
     }
 
     #[test]
-    fn test_block_quantize_dynamic_validation() {
-        let extent = DimensionVariable::new("n", DimensionBounds::new(0, Some(9)).unwrap());
-        let (_, program) = TracingContext::<ArrayIrValue<Array>, ArrayIrOperation<Array>>::trace(
-            |input: Tracer<_>| {
-                assert_eq!(
-                    input.block_quantize(4, DataType::F4E2M1FN, DataType::F8E4M3FN),
-                    Err(TypeError::invalid(format!(
-                        "`{BLOCK_QUANTIZE_NAME}` block dimension 1 size 6 is not a positive multiple of block size 4",
-                    ))
-                    .into()),
-                );
-                assert_eq!(
-                    input.block_quantize_with_options(
-                        4,
-                        DataType::F4E2M1FN,
-                        DataType::F8E4M3FN,
-                        [0],
-                        Some(&input),
-                        None,
-                    ),
-                    Err(TypeError::invalid(format!(
-                        "`{BLOCK_QUANTIZE_NAME}` global scale must be a rank-0 `f32` array but got `f32[n, 6]`",
-                    ))
-                    .into()),
-                );
-                Ok(input)
-            },
-            ArrayIrType::Array(ArrayType::new(
-                DataType::F32,
-                Shape::new(vec![Dimension::Dynamic(extent), Dimension::Static(6)]),
-            )),
+    fn test_block_quantize_batching() {
+        // The composition inherits the batching rules of its operations, so each batch item is quantized like an
+        // unbatched input, whether the batch axis leads or not.
+        let input = Array::matrix(
+            2,
+            8,
+            vec![3.0f32, 1.5, 0.5, 6.0, 0.5, 1.0, 0.25, 1.5, -12.0, 6.0, 3.0, -1.0, 0.0, 0.0, 0.0, 0.0],
         )
         .unwrap();
+        let expected = input.block_quantize(4, DataType::F4E2M1FN, DataType::F8E4M3FN).unwrap();
+        let output_axes = BlockQuantizedValue::new(BatchAxis::new(0), BatchAxis::new(0));
         assert_eq!(
-            program.to_string(),
-            indoc! {"
-                lambda %0:f32[n, 6] .
-                in (%0)
-            "}
-            .trim_end(),
+            batch(
+                |input| input.block_quantize(4, DataType::F4E2M1FN, DataType::F8E4M3FN),
+                input.clone(),
+                BatchAxis::new(0),
+                output_axes.clone(),
+                2,
+            ),
+            Ok(expected.clone()),
+        );
+        assert_eq!(
+            batch(
+                |input| input.block_quantize(4, DataType::F4E2M1FN, DataType::F8E4M3FN),
+                input.transpose(vec![1, 0]).unwrap(),
+                BatchAxis::new(1),
+                output_axes,
+                2,
+            ),
+            Ok(expected),
         );
     }
 
@@ -3995,47 +4004,66 @@ mod tests {
             program.to_string(),
             indoc! {r#"
                 lambda %0:f32[8][sharding={mesh<['x'=2:manual]>, [{}], varying_manual={'x'}}] .
-                let %1:f32[2, 4][sharding={mesh<['x'=2:manual]>, [{}, {}], varying_manual={'x'}}] = reshape [shape=[2, 4]] %0
+                let %1:f32[2, 4][sharding={mesh<['x'=2:manual]>, [{}, {}], varying_manual={'x'}}] = \
+                        reshape [shape=[2, 4]] %0
                     %2:f32[2, 4][sharding={mesh<['x'=2:manual]>, [{}, {}], varying_manual={'x'}}] = abs %1
-                    %3:f32[2][sharding={mesh<['x'=2:manual]>, [{}], varying_manual={'x'}}] = reduce [kind=max, axes=[1]] %2
+                    %3:f32[2][sharding={mesh<['x'=2:manual]>, [{}], varying_manual={'x'}}] = \
+                        reduce [kind=max, axes=[1]] %2
                     %4:f32[] = constant [value=6.0]
                     %5:f32[2] = broadcast [output_type=f32[2], output_axes=[]] %4
-                    %6:f32[2][sharding={mesh<['x'=2:manual]>, [{}]}] = broadcast [output_type=f32[2][sharding={mesh<['x'=2:manual]>, [{}]}], output_axes=[0]] %5
-                    %7:f32[2][sharding={mesh<['x'=2:manual]>, [{}], varying_manual={'x'}}] = parallel_vary [axis_name="x"] %6
+                    %6:f32[2][sharding={mesh<['x'=2:manual]>, [{}]}] = \
+                        broadcast [output_type=f32[2][sharding={mesh<['x'=2:manual]>, [{}]}], output_axes=[0]] %5
+                    %7:f32[2][sharding={mesh<['x'=2:manual]>, [{}], varying_manual={'x'}}] = \
+                        parallel_vary [axis_name="x"] %6
                     %8:f32[2][sharding={mesh<['x'=2:manual]>, [{}], varying_manual={'x'}}] = div %3 %7
                     %9:f32[] = constant [value=0.001953125]
                     %10:f32[] = constant [value=448.0]
-                    %11:f32[][sharding={mesh<['x'=2:manual]>, []}] = broadcast [output_type=f32[][sharding={mesh<['x'=2:manual]>, []}], output_axes=[]] %9
-                    %12:f32[][sharding={mesh<['x'=2:manual]>, [], varying_manual={'x'}}] = parallel_vary [axis_name="x"] %11
-                    %13:f32[][sharding={mesh<['x'=2:manual]>, []}] = broadcast [output_type=f32[][sharding={mesh<['x'=2:manual]>, []}], output_axes=[]] %10
-                    %14:f32[][sharding={mesh<['x'=2:manual]>, [], varying_manual={'x'}}] = parallel_vary [axis_name="x"] %13
+                    %11:f32[][sharding={mesh<['x'=2:manual]>, []}] = \
+                        broadcast [output_type=f32[][sharding={mesh<['x'=2:manual]>, []}], output_axes=[]] %9
+                    %12:f32[][sharding={mesh<['x'=2:manual]>, [], varying_manual={'x'}}] = \
+                        parallel_vary [axis_name="x"] %11
+                    %13:f32[][sharding={mesh<['x'=2:manual]>, []}] = \
+                        broadcast [output_type=f32[][sharding={mesh<['x'=2:manual]>, []}], output_axes=[]] %10
+                    %14:f32[][sharding={mesh<['x'=2:manual]>, [], varying_manual={'x'}}] = \
+                        parallel_vary [axis_name="x"] %13
                     %15:f32[2][sharding={mesh<['x'=2:manual]>, [{}], varying_manual={'x'}}] = clamp %12 %8 %14
-                    %16:u32[2][sharding={mesh<['x'=2:manual]>, [{}], varying_manual={'x'}}] = convert_element_type [data_type=u32, bitcast=true] %15
+                    %16:u32[2][sharding={mesh<['x'=2:manual]>, [{}], varying_manual={'x'}}] = \
+                        convert_element_type [data_type=u32, bitcast=true] %15
                     %17:f32[] = constant [value=inf]
                     %18:f32[2] = broadcast [output_type=f32[2], output_axes=[]] %17
                     %19:u32[2] = convert_element_type [data_type=u32, bitcast=true] %18
-                    %20:u32[2][sharding={mesh<['x'=2:manual]>, [{}]}] = broadcast [output_type=u32[2][sharding={mesh<['x'=2:manual]>, [{}]}], output_axes=[0]] %19
-                    %21:u32[2][sharding={mesh<['x'=2:manual]>, [{}], varying_manual={'x'}}] = parallel_vary [axis_name="x"] %20
+                    %20:u32[2][sharding={mesh<['x'=2:manual]>, [{}]}] = \
+                        broadcast [output_type=u32[2][sharding={mesh<['x'=2:manual]>, [{}]}], output_axes=[0]] %19
+                    %21:u32[2][sharding={mesh<['x'=2:manual]>, [{}], varying_manual={'x'}}] = \
+                        parallel_vary [axis_name="x"] %20
                     %22:u32[2][sharding={mesh<['x'=2:manual]>, [{}], varying_manual={'x'}}] = and %16 %21
-                    %23:f32[2][sharding={mesh<['x'=2:manual]>, [{}], varying_manual={'x'}}] = convert_element_type [data_type=f32, bitcast=true] %22
+                    %23:f32[2][sharding={mesh<['x'=2:manual]>, [{}], varying_manual={'x'}}] = \
+                        convert_element_type [data_type=f32, bitcast=true] %22
                     %24:f32[] = constant [value=0.015625]
                     %25:f32[2] = broadcast [output_type=f32[2], output_axes=[]] %24
                     %26:f32[] = constant [value=inf]
                     %27:f32[2] = broadcast [output_type=f32[2], output_axes=[]] %26
-                    %28:f32[2][sharding={mesh<['x'=2:manual]>, [{}]}] = broadcast [output_type=f32[2][sharding={mesh<['x'=2:manual]>, [{}]}], output_axes=[0]] %25
-                    %29:f32[2][sharding={mesh<['x'=2:manual]>, [{}], varying_manual={'x'}}] = parallel_vary [axis_name="x"] %28
-                    %30:f32[2][sharding={mesh<['x'=2:manual]>, [{}]}] = broadcast [output_type=f32[2][sharding={mesh<['x'=2:manual]>, [{}]}], output_axes=[0]] %27
-                    %31:f32[2][sharding={mesh<['x'=2:manual]>, [{}], varying_manual={'x'}}] = parallel_vary [axis_name="x"] %30
+                    %28:f32[2][sharding={mesh<['x'=2:manual]>, [{}]}] = \
+                        broadcast [output_type=f32[2][sharding={mesh<['x'=2:manual]>, [{}]}], output_axes=[0]] %25
+                    %29:f32[2][sharding={mesh<['x'=2:manual]>, [{}], varying_manual={'x'}}] = \
+                        parallel_vary [axis_name="x"] %28
+                    %30:f32[2][sharding={mesh<['x'=2:manual]>, [{}]}] = \
+                        broadcast [output_type=f32[2][sharding={mesh<['x'=2:manual]>, [{}]}], output_axes=[0]] %27
+                    %31:f32[2][sharding={mesh<['x'=2:manual]>, [{}], varying_manual={'x'}}] = \
+                        parallel_vary [axis_name="x"] %30
                     %32:f32[2][sharding={mesh<['x'=2:manual]>, [{}], varying_manual={'x'}}] = clamp %29 %23 %31
                     %33:f32[] = constant [value=0.125]
                     %34:f32[2] = broadcast [output_type=f32[2], output_axes=[]] %33
-                    %35:f32[2][sharding={mesh<['x'=2:manual]>, [{}]}] = broadcast [output_type=f32[2][sharding={mesh<['x'=2:manual]>, [{}]}], output_axes=[0]] %34
-                    %36:f32[2][sharding={mesh<['x'=2:manual]>, [{}], varying_manual={'x'}}] = parallel_vary [axis_name="x"] %35
+                    %35:f32[2][sharding={mesh<['x'=2:manual]>, [{}]}] = \
+                        broadcast [output_type=f32[2][sharding={mesh<['x'=2:manual]>, [{}]}], output_axes=[0]] %34
+                    %36:f32[2][sharding={mesh<['x'=2:manual]>, [{}], varying_manual={'x'}}] = \
+                        parallel_vary [axis_name="x"] %35
                     %37:f32[2][sharding={mesh<['x'=2:manual]>, [{}], varying_manual={'x'}}] = mul %32 %36
                     %38:f32[2][sharding={mesh<['x'=2:manual]>, [{}], varying_manual={'x'}}] = div %15 %37
                     %39:f32[2][sharding={mesh<['x'=2:manual]>, [{}], varying_manual={'x'}}] = round %38
                     %40:f32[2][sharding={mesh<['x'=2:manual]>, [{}], varying_manual={'x'}}] = mul %39 %37
-                    %41:f8e4m3fn[2][sharding={mesh<['x'=2:manual]>, [{}], varying_manual={'x'}}] = convert_element_type [data_type=f8e4m3fn] %40
+                    %41:f8e4m3fn[2][sharding={mesh<['x'=2:manual]>, [{}], varying_manual={'x'}}] = \
+                        convert_element_type [data_type=f8e4m3fn] %40
                     %42:f32[2, 4][sharding={mesh<['x'=2:manual]>, [{}, {}], varying_manual={'x'}}] = broadcast [
                         output_type=f32[2, 4][sharding={mesh<['x'=2:manual]>, [{}, {}], varying_manual={'x'}}],
                         output_axes=[0],
@@ -4044,37 +4072,52 @@ mod tests {
                     %44:f32[8][sharding={mesh<['x'=2:manual]>, [{}], varying_manual={'x'}}] = div %0 %43
                     %45:f32[] = constant [value=-6.0]
                     %46:f32[] = constant [value=6.0]
-                    %47:f32[][sharding={mesh<['x'=2:manual]>, []}] = broadcast [output_type=f32[][sharding={mesh<['x'=2:manual]>, []}], output_axes=[]] %45
-                    %48:f32[][sharding={mesh<['x'=2:manual]>, [], varying_manual={'x'}}] = parallel_vary [axis_name="x"] %47
-                    %49:f32[][sharding={mesh<['x'=2:manual]>, []}] = broadcast [output_type=f32[][sharding={mesh<['x'=2:manual]>, []}], output_axes=[]] %46
-                    %50:f32[][sharding={mesh<['x'=2:manual]>, [], varying_manual={'x'}}] = parallel_vary [axis_name="x"] %49
+                    %47:f32[][sharding={mesh<['x'=2:manual]>, []}] = \
+                        broadcast [output_type=f32[][sharding={mesh<['x'=2:manual]>, []}], output_axes=[]] %45
+                    %48:f32[][sharding={mesh<['x'=2:manual]>, [], varying_manual={'x'}}] = \
+                        parallel_vary [axis_name="x"] %47
+                    %49:f32[][sharding={mesh<['x'=2:manual]>, []}] = \
+                        broadcast [output_type=f32[][sharding={mesh<['x'=2:manual]>, []}], output_axes=[]] %46
+                    %50:f32[][sharding={mesh<['x'=2:manual]>, [], varying_manual={'x'}}] = \
+                        parallel_vary [axis_name="x"] %49
                     %51:f32[8][sharding={mesh<['x'=2:manual]>, [{}], varying_manual={'x'}}] = clamp %48 %44 %50
-                    %52:u32[8][sharding={mesh<['x'=2:manual]>, [{}], varying_manual={'x'}}] = convert_element_type [data_type=u32, bitcast=true] %51
+                    %52:u32[8][sharding={mesh<['x'=2:manual]>, [{}], varying_manual={'x'}}] = \
+                        convert_element_type [data_type=u32, bitcast=true] %51
                     %53:f32[] = constant [value=inf]
                     %54:f32[8] = broadcast [output_type=f32[8], output_axes=[]] %53
                     %55:u32[8] = convert_element_type [data_type=u32, bitcast=true] %54
-                    %56:u32[8][sharding={mesh<['x'=2:manual]>, [{}]}] = broadcast [output_type=u32[8][sharding={mesh<['x'=2:manual]>, [{}]}], output_axes=[0]] %55
-                    %57:u32[8][sharding={mesh<['x'=2:manual]>, [{}], varying_manual={'x'}}] = parallel_vary [axis_name="x"] %56
+                    %56:u32[8][sharding={mesh<['x'=2:manual]>, [{}]}] = \
+                        broadcast [output_type=u32[8][sharding={mesh<['x'=2:manual]>, [{}]}], output_axes=[0]] %55
+                    %57:u32[8][sharding={mesh<['x'=2:manual]>, [{}], varying_manual={'x'}}] = \
+                        parallel_vary [axis_name="x"] %56
                     %58:u32[8][sharding={mesh<['x'=2:manual]>, [{}], varying_manual={'x'}}] = and %52 %57
-                    %59:f32[8][sharding={mesh<['x'=2:manual]>, [{}], varying_manual={'x'}}] = convert_element_type [data_type=f32, bitcast=true] %58
+                    %59:f32[8][sharding={mesh<['x'=2:manual]>, [{}], varying_manual={'x'}}] = \
+                        convert_element_type [data_type=f32, bitcast=true] %58
                     %60:f32[] = constant [value=1.0]
                     %61:f32[8] = broadcast [output_type=f32[8], output_axes=[]] %60
                     %62:f32[] = constant [value=inf]
                     %63:f32[8] = broadcast [output_type=f32[8], output_axes=[]] %62
-                    %64:f32[8][sharding={mesh<['x'=2:manual]>, [{}]}] = broadcast [output_type=f32[8][sharding={mesh<['x'=2:manual]>, [{}]}], output_axes=[0]] %61
-                    %65:f32[8][sharding={mesh<['x'=2:manual]>, [{}], varying_manual={'x'}}] = parallel_vary [axis_name="x"] %64
-                    %66:f32[8][sharding={mesh<['x'=2:manual]>, [{}]}] = broadcast [output_type=f32[8][sharding={mesh<['x'=2:manual]>, [{}]}], output_axes=[0]] %63
-                    %67:f32[8][sharding={mesh<['x'=2:manual]>, [{}], varying_manual={'x'}}] = parallel_vary [axis_name="x"] %66
+                    %64:f32[8][sharding={mesh<['x'=2:manual]>, [{}]}] = \
+                        broadcast [output_type=f32[8][sharding={mesh<['x'=2:manual]>, [{}]}], output_axes=[0]] %61
+                    %65:f32[8][sharding={mesh<['x'=2:manual]>, [{}], varying_manual={'x'}}] = \
+                        parallel_vary [axis_name="x"] %64
+                    %66:f32[8][sharding={mesh<['x'=2:manual]>, [{}]}] = \
+                        broadcast [output_type=f32[8][sharding={mesh<['x'=2:manual]>, [{}]}], output_axes=[0]] %63
+                    %67:f32[8][sharding={mesh<['x'=2:manual]>, [{}], varying_manual={'x'}}] = \
+                        parallel_vary [axis_name="x"] %66
                     %68:f32[8][sharding={mesh<['x'=2:manual]>, [{}], varying_manual={'x'}}] = clamp %65 %59 %67
                     %69:f32[] = constant [value=0.5]
                     %70:f32[8] = broadcast [output_type=f32[8], output_axes=[]] %69
-                    %71:f32[8][sharding={mesh<['x'=2:manual]>, [{}]}] = broadcast [output_type=f32[8][sharding={mesh<['x'=2:manual]>, [{}]}], output_axes=[0]] %70
-                    %72:f32[8][sharding={mesh<['x'=2:manual]>, [{}], varying_manual={'x'}}] = parallel_vary [axis_name="x"] %71
+                    %71:f32[8][sharding={mesh<['x'=2:manual]>, [{}]}] = \
+                        broadcast [output_type=f32[8][sharding={mesh<['x'=2:manual]>, [{}]}], output_axes=[0]] %70
+                    %72:f32[8][sharding={mesh<['x'=2:manual]>, [{}], varying_manual={'x'}}] = \
+                        parallel_vary [axis_name="x"] %71
                     %73:f32[8][sharding={mesh<['x'=2:manual]>, [{}], varying_manual={'x'}}] = mul %68 %72
                     %74:f32[8][sharding={mesh<['x'=2:manual]>, [{}], varying_manual={'x'}}] = div %51 %73
                     %75:f32[8][sharding={mesh<['x'=2:manual]>, [{}], varying_manual={'x'}}] = round %74
                     %76:f32[8][sharding={mesh<['x'=2:manual]>, [{}], varying_manual={'x'}}] = mul %75 %73
-                    %77:f4e2m1fn[8][sharding={mesh<['x'=2:manual]>, [{}], varying_manual={'x'}}] = convert_element_type [data_type=f4e2m1fn] %76
+                    %77:f4e2m1fn[8][sharding={mesh<['x'=2:manual]>, [{}], varying_manual={'x'}}] = \
+                        convert_element_type [data_type=f4e2m1fn] %76
                 in (%77, %41)
             "#}
             .trim_end(),
@@ -4250,7 +4293,555 @@ mod tests {
     }
 
     #[test]
-    fn test_block_quantize_sharding_dynamic_extents() {
+    fn test_block_quantize_with_options() {
+        // Blocks along the leading axis quantize like the transposed input with blocks along its last axis.
+        let input = Array::matrix(
+            4,
+            4,
+            vec![1.0f32, 2.0, 0.5, 0.25, 3.0, 6.0, 1.0, 1.5, 3.0, 0.5, 12.0, 2.0, 1.0, 1.0, 3.0, 6.0],
+        )
+        .unwrap();
+        let BlockQuantizedValue { elements, scales, .. } =
+            input.block_quantize_with_options(2, DataType::F4E2M1FN, DataType::F8E4M3FN, 0, None, None).unwrap();
+        let BlockQuantizedValue { elements: transposed_elements, scales: transposed_scales, .. } = input
+            .transpose(vec![1, 0])
+            .unwrap()
+            .block_quantize(2, DataType::F4E2M1FN, DataType::F8E4M3FN)
+            .unwrap();
+        assert_eq!(scales.r#type().into_owned(), ArrayType::new_static(DataType::F8E4M3FN, [2, 4]));
+        assert_eq!(elements, transposed_elements.transpose(vec![1, 0]).unwrap());
+        assert_eq!(scales, transposed_scales.transpose(vec![1, 0]).unwrap());
+
+        // Two block axes form tiles that share one scale. Every tile below is a scaled copy of `f4e2m1fn` grid points,
+        // so quantization is exact and dequantization over both block axes reproduces the input.
+        let BlockQuantizedValue { elements, scales, .. } = input
+            .block_quantize_with_options(2, DataType::F4E2M1FN, DataType::F8E4M3FN, [0, 1], None, None)
+            .unwrap();
+        assert_eq!(scales.r#type().into_owned(), ArrayType::new_static(DataType::F8E4M3FN, [2, 2]));
+        assert_eq!(scales.to_f64s(), vec![1.0, 0.25, 0.5, 2.0]);
+        assert_eq!(
+            elements.to_f64s(),
+            vec![1.0, 2.0, 2.0, 1.0, 3.0, 6.0, 4.0, 6.0, 6.0, 1.0, 6.0, 1.0, 2.0, 2.0, 1.5, 3.0],
+        );
+        assert_eq!(
+            BlockQuantizedValue::new(elements.clone(), scales.clone()).block_dequantize([0, 1], DataType::F32),
+            Ok(input),
+        );
+    }
+
+    #[test]
+    fn test_block_quantize_with_options_global_scale() {
+        // A global scale divides the input before block scaling, so a scaled copy of the module example quantizes to
+        // the same elements and scales, and the global scale restores the input after dequantization.
+        let input = Array::vector(vec![12.0f32, 6.0, 2.0, 24.0, 2.0, 4.0, 1.0, 6.0]).unwrap();
+        let global_scale = Array::scalar(4.0f32).unwrap();
+        let quantized = input
+            .block_quantize_with_options(4, DataType::F4E2M1FN, DataType::F8E4M3FN, -1, Some(&global_scale), None)
+            .unwrap();
+        assert_eq!(quantized.scales.to_f64s(), vec![1.0, 0.25]);
+        assert_eq!(quantized.elements.to_f64s(), vec![3.0, 1.5, 0.5, 6.0, 2.0, 4.0, 1.0, 6.0]);
+        assert_eq!(quantized.global_scale, Some(global_scale.clone()));
+        assert_eq!(quantized.block_dequantize([0], DataType::F32), Ok(input));
+
+        // Without the global scale, the block maximum `6000` exceeds `6 · 448` and saturates, while the global scale
+        // brings it back into range.
+        let input = Array::vector(vec![6000.0f32, 3000.0, 0.0, 0.0, 1.0, 1.0, 1.0, 1.0]).unwrap();
+        let BlockQuantizedValue { elements, scales, .. } = input
+            .block_quantize_with_options(4, DataType::F4E2M1FN, DataType::F8E4M3FN, -1, Some(&global_scale), None)
+            .unwrap();
+        assert_eq!(scales.to_f64s(), vec![256.0, 0.04296875]);
+        assert_eq!(elements.to_f64s(), vec![6.0, 3.0, 0.0, 0.0, 6.0, 6.0, 6.0, 6.0]);
+    }
+
+    #[test]
+    fn test_block_quantize_with_options_global_scale_array_ir() {
+        // Concrete array IR values keep the supplied global scale in their representation, which dequantizes back to
+        // the input.
+        let input = ArrayIrValue::Array(Array::vector(vec![6.0f32, 3.0, 1.0, 12.0]).unwrap());
+        let global_scale = ArrayIrValue::Array(Array::scalar(2.0f32).unwrap());
+        let quantized = input
+            .block_quantize_with_options(4, DataType::F4E2M1FN, DataType::F8E4M3FN, -1, Some(&global_scale), None)
+            .unwrap();
+        assert_eq!(quantized.global_scale, Some(global_scale.clone()));
+        assert_eq!(quantized.block_dequantize([-1], DataType::F32), Ok(input));
+
+        // The dynamic quantization branch must also retain the supplied scale. Selecting that field and removing
+        // unused arithmetic exposes its exact connection to the input without depending on the numerical recipe.
+        let extent = DimensionVariable::new("n", DimensionBounds::new(0, Some(9)).unwrap());
+        let (output_type, program) = TracingContext::<ArrayIrValue<Array>, ArrayIrOperation<Array>>::trace(
+            |(input, global_scale): (Tracer<_>, Tracer<_>)| {
+                let quantized = input.block_quantize_with_options(
+                    4,
+                    DataType::F4E2M1FN,
+                    DataType::F8E4M3FN,
+                    1,
+                    Some(&global_scale),
+                    None,
+                )?;
+                Ok(quantized.global_scale.unwrap())
+            },
+            (
+                ArrayIrType::Array(ArrayType::new(
+                    DataType::F32,
+                    Shape::new(vec![Dimension::Dynamic(extent), Dimension::Static(4)]),
+                )),
+                ArrayIrType::Array(ArrayType::scalar(DataType::F32)),
+            ),
+        )
+        .unwrap();
+        assert_eq!(output_type, ArrayIrType::Array(ArrayType::scalar(DataType::F32)));
+        let program = program.simplified().unwrap();
+        assert_eq!(
+            program.to_string(),
+            indoc! {"
+                lambda %0:f32[n, 4], %1:f32[] .
+                in (%1)
+            "}
+            .trim_end(),
+        );
+        assert_eq!(
+            program.interpret((
+                ArrayIrValue::Array(Array::matrix(0, 4, Vec::<f32>::new()).unwrap()),
+                global_scale.clone(),
+            )),
+            Ok(global_scale),
+        );
+    }
+
+    #[test]
+    fn test_block_quantize_with_options_stochastic_rounding() {
+        // The block scale is `1`, so the quotients equal the inputs. `6` is on the grid, `1.3` lies between `1.0` and
+        // `1.5` (spacing `0.5`), and `0.2` lies below the smallest normal value `1.0`, where the spacing stays `0.5`.
+        // Each value rounds up exactly when its noise reaches its distance from the grid value below it.
+        let input = Array::vector(vec![6.0f32, 1.3, -1.3, 0.2]).unwrap();
+        let noise = Array::vector(vec![0.0f32, 0.3, 0.3, 0.7]).unwrap();
+        let BlockQuantizedValue { elements, scales, .. } = input
+            .block_quantize_with_options(4, DataType::F4E2M1FN, DataType::F8E4M3FN, -1, None, Some(&noise))
+            .unwrap();
+        assert_eq!(scales.to_f64s(), vec![1.0]);
+        assert_eq!(elements.to_f64s(), vec![6.0, 1.0, -1.5, 0.5]);
+
+        // Adding noise just below one to the largest grid value rounds up to the next integer at `f32`, so the result
+        // saturates at the largest element magnitude rather than overflowing to NaN (`f8e4m3fn`) or infinity
+        // (`f8e5m2`). The scales are `1`, and the quotients `448 / 32 = 14` and `57344 / 8192 = 7` are integers.
+        let noise = Array::vector(vec![1.0f32 - f32::EPSILON / 2.0, 0.0, 0.0, 0.0]).unwrap();
+        let input = Array::vector(vec![448.0f32, 0.0, 0.0, 0.0]).unwrap();
+        let BlockQuantizedValue { elements, scales, .. } = input
+            .block_quantize_with_options(4, DataType::F8E4M3FN, DataType::F8E8M0FNU, -1, None, Some(&noise))
+            .unwrap();
+        assert_eq!(scales.to_f64s(), vec![1.0]);
+        assert_eq!(elements.to_f64s(), vec![448.0, 0.0, 0.0, 0.0]);
+        let input = Array::vector(vec![57344.0f32, 0.0, 0.0, 0.0]).unwrap();
+        let BlockQuantizedValue { elements, scales, .. } = input
+            .block_quantize_with_options(4, DataType::F8E5M2, DataType::F8E8M0FNU, -1, None, Some(&noise))
+            .unwrap();
+        assert_eq!(scales.to_f64s(), vec![1.0]);
+        assert_eq!(elements.to_f64s(), vec![57344.0, 0.0, 0.0, 0.0]);
+
+        // Stratified noise over ten rows makes the column sums of the rounded values exactly ten times the inputs,
+        // which shows that rounding is unbiased at both `f64` and `f32`. Zero never rounds away from zero.
+        let input = Array::from_elements::<f64>(
+            ArrayType::new_static(DataType::F64, [10, 8]),
+            &(0..10).flat_map(|_| [6.0, 1.3, -1.3, 0.2, 0.0, -6.0, 2.5, 0.75]).collect::<Vec<_>>(),
+        )
+        .unwrap();
+        let noise = Array::from_elements::<f64>(
+            ArrayType::new_static(DataType::F64, [10, 8]),
+            &(0..10).flat_map(|row| [(row as f64 + 0.5) / 10.0; 8]).collect::<Vec<_>>(),
+        )
+        .unwrap();
+        let BlockQuantizedValue { elements, scales, .. } = input
+            .block_quantize_with_options(4, DataType::F4E2M1FN, DataType::F8E4M3FN, -1, None, Some(&noise))
+            .unwrap();
+        assert_eq!(scales.to_f64s(), vec![1.0; 20]);
+        assert_eq!(
+            elements
+                .convert_element_type(DataType::F64)
+                .unwrap()
+                .reduce(&[0], ReductionKind::Sum)
+                .unwrap()
+                .to_f64s(),
+            vec![60.0, 13.0, -13.0, 2.0, 0.0, -60.0, 25.0, 7.5],
+        );
+        let BlockQuantizedValue { elements, scales, .. } = input
+            .convert_element_type(DataType::F32)
+            .unwrap()
+            .block_quantize_with_options(
+                4,
+                DataType::F4E2M1FN,
+                DataType::F8E4M3FN,
+                -1,
+                None,
+                Some(&noise.convert_element_type(DataType::F32).unwrap()),
+            )
+            .unwrap();
+        assert_eq!(scales.to_f64s(), vec![1.0; 20]);
+        assert_eq!(
+            elements
+                .convert_element_type(DataType::F64)
+                .unwrap()
+                .reduce(&[0], ReductionKind::Sum)
+                .unwrap()
+                .to_f64s(),
+            vec![60.0, 13.0, -13.0, 2.0, 0.0, -60.0, 25.0, 7.5],
+        );
+    }
+
+    #[test]
+    fn test_block_quantize_with_options_validation() {
+        // Block axes must be distinct, in bounds, and non-empty, and each block extent must be a positive multiple of
+        // the block size.
+        let input = Array::matrix(2, 8, vec![1.0f32; 16]).unwrap();
+        assert_eq!(
+            input.block_quantize_with_options(4, DataType::F4E2M1FN, DataType::F8E4M3FN, Axes::default(), None, None),
+            Err(ProgramError::from(TypeError::invalid(format!(
+                "`{BLOCK_QUANTIZE_NAME}` requires at least one block axis",
+            )))),
+        );
+        assert_eq!(
+            input.block_quantize_with_options(4, DataType::F4E2M1FN, DataType::F8E4M3FN, [0], None, None),
+            Err(ProgramError::from(TypeError::invalid(format!(
+                "`{BLOCK_QUANTIZE_NAME}` block dimension 0 size 2 is not a positive multiple of block size 4",
+            )))),
+        );
+        assert_eq!(
+            input.block_quantize_with_options(4, DataType::F4E2M1FN, DataType::F8E4M3FN, [2], None, None),
+            Err(ProgramError::Axis(AxisError::OutOfBounds { axis: Axis::from(2), rank: 2 })),
+        );
+        assert_eq!(
+            input.block_quantize_with_options(4, DataType::F4E2M1FN, DataType::F8E4M3FN, [1, -1], None, None),
+            Err(ProgramError::Axis(AxisError::DuplicateAxis { axis: 1 })),
+        );
+
+        // Global scales must be `f32` scalars and require `f8e4m3fn` block scales, and rounding noise must match the
+        // input type.
+        assert_eq!(
+            input.block_quantize_with_options(
+                4,
+                DataType::F4E2M1FN,
+                DataType::F8E4M3FN,
+                [1],
+                Some(&Array::vector(vec![1.0f32]).unwrap()),
+                None,
+            ),
+            Err(ProgramError::from(TypeError::invalid(format!(
+                "`{BLOCK_QUANTIZE_NAME}` global scale must be a rank-0 `f32` array but got `f32[1]`",
+            )))),
+        );
+        assert_eq!(
+            input.block_quantize_with_options(
+                4,
+                DataType::F4E2M1FN,
+                DataType::F8E4M3FN,
+                [1],
+                Some(&Array::scalar(1.0f64).unwrap()),
+                None,
+            ),
+            Err(ProgramError::from(TypeError::invalid(format!(
+                "`{BLOCK_QUANTIZE_NAME}` global scale must be a rank-0 `f32` array but got `f64[]`",
+            )))),
+        );
+        assert_eq!(
+            input.block_quantize_with_options(
+                4,
+                DataType::F8E4M3FN,
+                DataType::F8E8M0FNU,
+                -1,
+                Some(&Array::scalar(1.0f32).unwrap()),
+                None,
+            ),
+            Err(ProgramError::from(TypeError::invalid(format!(
+                "`{BLOCK_QUANTIZE_NAME}` global scales require `f8e4m3fn` scales but got `f8e8m0fnu` scales",
+            )))),
+        );
+        assert_eq!(
+            input.block_quantize_with_options(
+                4,
+                DataType::F4E2M1FN,
+                DataType::F8E4M3FN,
+                [1],
+                None,
+                Some(&Array::vector(vec![0.5f32; 16]).unwrap()),
+            ),
+            Err(ProgramError::from(TypeError::invalid(format!(
+                "`{BLOCK_QUANTIZE_NAME}` rounding noise must have the data type and shape of the input `f32[2, 8]` \
+                 but got `f32[16]`",
+            )))),
+        );
+    }
+
+    #[test]
+    fn test_block_quantize_with_options_staging() {
+        // Stochastic rounding computes the grid spacing from the exponent bits of the quotients.
+        let (_, program) = TracingContext::<Array, ArrayOperation<Array>>::trace(
+            |(input, global_scale, noise): (Tracer<_>, Tracer<_>, Tracer<_>)| {
+                let BlockQuantizedValue { elements, scales, .. } = input.block_quantize_with_options(
+                    2,
+                    DataType::F4E2M1FN,
+                    DataType::F8E4M3FN,
+                    [0],
+                    Some(&global_scale),
+                    Some(&noise),
+                )?;
+                Ok(vec![elements, scales])
+            },
+            (
+                ArrayType::new_static(DataType::F32, [2]),
+                ArrayType::scalar(DataType::F32),
+                ArrayType::new_static(DataType::F32, [2]),
+            ),
+        )
+        .unwrap();
+        assert_eq!(
+            program.to_string(),
+            indoc! {"
+                lambda %0:f32[2], %1:f32[], %2:f32[2] .
+                let %3:f32[2] = broadcast [output_type=f32[2], output_axes=[]] %1
+                    %4:f32[2] = div %0 %3
+                    %5:f32[1, 2] = reshape [shape=[1, 2]] %4
+                    %6:f32[1, 2] = abs %5
+                    %7:f32[1] = reduce [kind=max, axes=[1]] %6
+                    %8:f32[] = constant [value=6.0]
+                    %9:f32[1] = broadcast [output_type=f32[1], output_axes=[]] %8
+                    %10:f32[1] = div %7 %9
+                    %11:f32[] = constant [value=0.001953125]
+                    %12:f32[] = constant [value=448.0]
+                    %13:f32[1] = clamp %11 %10 %12
+                    %14:u32[1] = convert_element_type [data_type=u32, bitcast=true] %13
+                    %15:f32[] = constant [value=inf]
+                    %16:f32[1] = broadcast [output_type=f32[1], output_axes=[]] %15
+                    %17:u32[1] = convert_element_type [data_type=u32, bitcast=true] %16
+                    %18:u32[1] = and %14 %17
+                    %19:f32[1] = convert_element_type [data_type=f32, bitcast=true] %18
+                    %20:f32[] = constant [value=0.015625]
+                    %21:f32[1] = broadcast [output_type=f32[1], output_axes=[]] %20
+                    %22:f32[] = constant [value=inf]
+                    %23:f32[1] = broadcast [output_type=f32[1], output_axes=[]] %22
+                    %24:f32[1] = clamp %21 %19 %23
+                    %25:f32[] = constant [value=0.125]
+                    %26:f32[1] = broadcast [output_type=f32[1], output_axes=[]] %25
+                    %27:f32[1] = mul %24 %26
+                    %28:f32[1] = div %13 %27
+                    %29:f32[1] = round %28
+                    %30:f32[1] = mul %29 %27
+                    %31:f8e4m3fn[1] = convert_element_type [data_type=f8e4m3fn] %30
+                    %32:f32[1, 2] = broadcast [output_type=f32[1, 2], output_axes=[0]] %30
+                    %33:f32[2] = reshape [shape=[2]] %32
+                    %34:f32[2] = div %4 %33
+                    %35:f32[] = constant [value=-6.0]
+                    %36:f32[] = constant [value=6.0]
+                    %37:f32[2] = clamp %35 %34 %36
+                    %38:u32[2] = convert_element_type [data_type=u32, bitcast=true] %37
+                    %39:f32[] = constant [value=inf]
+                    %40:f32[2] = broadcast [output_type=f32[2], output_axes=[]] %39
+                    %41:u32[2] = convert_element_type [data_type=u32, bitcast=true] %40
+                    %42:u32[2] = and %38 %41
+                    %43:f32[2] = convert_element_type [data_type=f32, bitcast=true] %42
+                    %44:f32[] = constant [value=1.0]
+                    %45:f32[2] = broadcast [output_type=f32[2], output_axes=[]] %44
+                    %46:f32[] = constant [value=inf]
+                    %47:f32[2] = broadcast [output_type=f32[2], output_axes=[]] %46
+                    %48:f32[2] = clamp %45 %43 %47
+                    %49:f32[] = constant [value=0.5]
+                    %50:f32[2] = broadcast [output_type=f32[2], output_axes=[]] %49
+                    %51:f32[2] = mul %48 %50
+                    %52:f32[2] = div %37 %51
+                    %53:f32[2] = add %52 %2
+                    %54:f32[2] = floor %53
+                    %55:f32[2] = mul %54 %51
+                    %56:f32[] = constant [value=-6.0]
+                    %57:f32[] = constant [value=6.0]
+                    %58:f32[2] = clamp %56 %55 %57
+                    %59:f4e2m1fn[2] = convert_element_type [data_type=f4e2m1fn] %58
+                in (%59, %31)
+            "}
+            .trim_end(),
+        );
+    }
+
+    #[test]
+    fn test_block_quantize_with_options_dynamic_extents() {
+        // Tiles over two dynamic block axes assert each extent separately, and the global scale and rounding noise
+        // combine with the input at its runtime extents. The program agrees with the eager composition.
+        let rows = DimensionVariable::new("rows", DimensionBounds::new(0, Some(9)).unwrap());
+        let columns = DimensionVariable::new("columns", DimensionBounds::new(0, Some(9)).unwrap());
+        let input_type =
+            ArrayType::new(DataType::F32, Shape::new(vec![Dimension::Dynamic(rows), Dimension::Dynamic(columns)]));
+        let (_, program) = TracingContext::<ArrayIrValue<Array>, ArrayIrOperation<Array>>::trace(
+            |(input, global_scale, noise): (Tracer<_>, Tracer<_>, Tracer<_>)| {
+                let BlockQuantizedValue { elements, scales, .. } = input.block_quantize_with_options(
+                    4,
+                    DataType::F4E2M1FN,
+                    DataType::F8E4M3FN,
+                    [-1, 0],
+                    Some(&global_scale),
+                    Some(&noise),
+                )?;
+                Ok(vec![elements, scales])
+            },
+            (
+                ArrayIrType::Array(input_type.clone()),
+                ArrayIrType::Array(ArrayType::scalar(DataType::F32)),
+                ArrayIrType::Array(input_type),
+            ),
+        )
+        .unwrap();
+        assert_eq!(
+            program.to_string(),
+            indoc! {r#"
+                lambda %0:f32[rows, columns], %1:f32[], %2:f32[rows, columns] .
+                let %3:dimension<4> = constant [value=4]
+                    %4:dimension<rows ∈ [0, 9)> = dimension_size [axis=0] %0
+                    %5:dimension<columns ∈ [0, 9)> = dimension_size [axis=1] %0
+                    %6:dimension<0> = constant [value=0]
+                    %7:bool[] = compare [direction=GreaterThan] %4 %6
+                    () = assert [message="block extent of axis 0 must be positive", labels=["extent"]] %7 %4
+                    %8:dimension<rows % 4 ∈ [0, 4)> = dimension_rem %4 %3
+                    %9:bool[] = compare [direction=Equal] %8 %6
+                    () = assert [
+                        message="block extent of axis 0 must be divisible by block size",
+                        labels=["extent"],
+                    ] %9 %4
+                    %10:dimension<rows / 4 ∈ [0, 3)> = dimension_div %4 %3
+                    %11:bool[] = compare [direction=GreaterThan] %5 %6
+                    () = assert [message="block extent of axis 1 must be positive", labels=["extent"]] %11 %5
+                    %12:dimension<columns % 4 ∈ [0, 4)> = dimension_rem %5 %3
+                    %13:bool[] = compare [direction=Equal] %12 %6
+                    () = assert [
+                        message="block extent of axis 1 must be divisible by block size",
+                        labels=["extent"],
+                    ] %13 %5
+                    %14:dimension<columns / 4 ∈ [0, 3)> = dimension_div %5 %3
+                    %15:f32[rows, columns] = broadcast [output_axes=[]] %1 %4 %5
+                    %16:f32[rows, columns] = div %0 %15
+                    %17:f32[rows / 4, 4, columns / 4, 4] = reshape %16 %10 %3 %14 %3
+                    %18:f32[rows / 4, 4, columns / 4, 4] = abs %17
+                    %19:f32[rows / 4, columns / 4] = reduce [kind=max, axes=[1, 3]] %18
+                    %20:f32[] = constant [value=6.0]
+                    %21:f32[rows / 4, columns / 4] = broadcast [output_axes=[]] %20 %10 %14
+                    %22:f32[rows / 4, columns / 4] = div %19 %21
+                    %23:f32[] = constant [value=0.001953125]
+                    %24:f32[] = constant [value=448.0]
+                    %25:f32[rows / 4, columns / 4] = clamp %23 %22 %24
+                    %26:u32[rows / 4, columns / 4] = convert_element_type [data_type=u32, bitcast=true] %25
+                    %27:f32[] = constant [value=inf]
+                    %28:f32[rows / 4, columns / 4] = broadcast [output_axes=[]] %27 %10 %14
+                    %29:u32[rows / 4, columns / 4] = convert_element_type [data_type=u32, bitcast=true] %28
+                    %30:u32[rows / 4, columns / 4] = and %26 %29
+                    %31:f32[rows / 4, columns / 4] = convert_element_type [data_type=f32, bitcast=true] %30
+                    %32:f32[] = constant [value=0.015625]
+                    %33:f32[rows / 4, columns / 4] = broadcast [output_axes=[]] %32 %10 %14
+                    %34:f32[] = constant [value=inf]
+                    %35:f32[rows / 4, columns / 4] = broadcast [output_axes=[]] %34 %10 %14
+                    %36:f32[rows / 4, columns / 4] = clamp %33 %31 %35
+                    %37:f32[] = constant [value=0.125]
+                    %38:f32[rows / 4, columns / 4] = broadcast [output_axes=[]] %37 %10 %14
+                    %39:f32[rows / 4, columns / 4] = mul %36 %38
+                    %40:f32[rows / 4, columns / 4] = div %25 %39
+                    %41:f32[rows / 4, columns / 4] = round %40
+                    %42:f32[rows / 4, columns / 4] = mul %41 %39
+                    %43:f8e4m3fn[rows / 4, columns / 4] = convert_element_type [data_type=f8e4m3fn] %42
+                    %44:f32[rows / 4, 4, columns / 4, 4] = broadcast [output_axes=[0, 2]] %42 %10 %3 %14 %3
+                    %45:f32[rows, columns] = reshape %44 %4 %5
+                    %46:f32[rows, columns] = div %16 %45
+                    %47:f32[] = constant [value=-6.0]
+                    %48:f32[] = constant [value=6.0]
+                    %49:f32[rows, columns] = clamp %47 %46 %48
+                    %50:u32[rows, columns] = convert_element_type [data_type=u32, bitcast=true] %49
+                    %51:f32[] = constant [value=inf]
+                    %52:f32[rows, columns] = broadcast [output_axes=[]] %51 %4 %5
+                    %53:u32[rows, columns] = convert_element_type [data_type=u32, bitcast=true] %52
+                    %54:u32[rows, columns] = and %50 %53
+                    %55:f32[rows, columns] = convert_element_type [data_type=f32, bitcast=true] %54
+                    %56:f32[] = constant [value=1.0]
+                    %57:f32[rows, columns] = broadcast [output_axes=[]] %56 %4 %5
+                    %58:f32[] = constant [value=inf]
+                    %59:f32[rows, columns] = broadcast [output_axes=[]] %58 %4 %5
+                    %60:f32[rows, columns] = clamp %57 %55 %59
+                    %61:f32[] = constant [value=0.5]
+                    %62:f32[rows, columns] = broadcast [output_axes=[]] %61 %4 %5
+                    %63:f32[rows, columns] = mul %60 %62
+                    %64:f32[rows, columns] = div %49 %63
+                    %65:f32[rows, columns] = add %64 %2
+                    %66:f32[rows, columns] = floor %65
+                    %67:f32[rows, columns] = mul %66 %63
+                    %68:f32[] = constant [value=-6.0]
+                    %69:f32[] = constant [value=6.0]
+                    %70:f32[rows, columns] = clamp %68 %67 %69
+                    %71:f4e2m1fn[rows, columns] = convert_element_type [data_type=f4e2m1fn] %70
+                in (%71, %43)
+            "#}
+            .trim_end(),
+        );
+        let input = Array::matrix(4, 8, (0..32).map(|index| index as f32 / 3.0 - 5.0).collect()).unwrap();
+        let global_scale = Array::scalar(2.0f32).unwrap();
+        let noise = Array::matrix(4, 8, vec![0.75f32; 32]).unwrap();
+        let BlockQuantizedValue { elements, scales, .. } = input
+            .block_quantize_with_options(
+                4,
+                DataType::F4E2M1FN,
+                DataType::F8E4M3FN,
+                [-1, 0],
+                Some(&global_scale),
+                Some(&noise),
+            )
+            .unwrap();
+        assert_eq!(
+            program.interpret((
+                ArrayIrValue::Array(input),
+                ArrayIrValue::Array(global_scale),
+                ArrayIrValue::Array(noise),
+            )),
+            Ok(vec![ArrayIrValue::Array(elements), ArrayIrValue::Array(scales)]),
+        );
+    }
+
+    #[test]
+    fn test_block_quantize_with_options_dynamic_extents_validation() {
+        // With dynamic extents, everything that the types determine (e.g., static block extents and global scale
+        // types) is still rejected before staging, and rejected requests stage nothing.
+        let extent = DimensionVariable::new("n", DimensionBounds::new(0, Some(9)).unwrap());
+        let (_, program) = TracingContext::<ArrayIrValue<Array>, ArrayIrOperation<Array>>::trace(
+            |input: Tracer<_>| {
+                assert_eq!(
+                    input.block_quantize_with_options(4, DataType::F4E2M1FN, DataType::F8E4M3FN, -1, None, None),
+                    Err(ProgramError::from(TypeError::invalid(format!(
+                        "`{BLOCK_QUANTIZE_NAME}` block dimension 1 size 6 is not a positive multiple of block size 4",
+                    )))),
+                );
+                assert_eq!(
+                    input.block_quantize_with_options(
+                        4,
+                        DataType::F4E2M1FN,
+                        DataType::F8E4M3FN,
+                        [0],
+                        Some(&input),
+                        None,
+                    ),
+                    Err(ProgramError::from(TypeError::invalid(format!(
+                        "`{BLOCK_QUANTIZE_NAME}` global scale must be a rank-0 `f32` array but got `f32[n, 6]`",
+                    )))),
+                );
+                Ok(input)
+            },
+            ArrayIrType::Array(ArrayType::new(
+                DataType::F32,
+                Shape::new(vec![Dimension::Dynamic(extent), Dimension::Static(6)]),
+            )),
+        )
+        .unwrap();
+        assert_eq!(
+            program.to_string(),
+            indoc! {"
+                lambda %0:f32[n, 6] .
+                in (%0)
+            "}
+            .trim_end(),
+        );
+    }
+
+    #[test]
+    fn test_block_quantize_with_options_dynamic_extents_manual_variation() {
         // Inside a manual region, the dynamic composition keeps the variation of a varying input in its elements and
         // scales like the static one, while its dimension values stay invariant. The invariant global scale is
         // broadcast to the runtime input extents and aligned with the input by the division.
@@ -4389,508 +4980,14 @@ mod tests {
     }
 
     #[test]
-    fn test_block_quantize_with_options() {
-        // Blocks along the leading axis quantize like the transposed input with blocks along its last axis.
-        let input = Array::matrix(
-            4,
-            4,
-            vec![1.0f32, 2.0, 0.5, 0.25, 3.0, 6.0, 1.0, 1.5, 3.0, 0.5, 12.0, 2.0, 1.0, 1.0, 3.0, 6.0],
-        )
-        .unwrap();
-        let BlockQuantizedValue { elements, scales, .. } =
-            input.block_quantize_with_options(2, DataType::F4E2M1FN, DataType::F8E4M3FN, 0, None, None).unwrap();
-        let BlockQuantizedValue { elements: transposed_elements, scales: transposed_scales, .. } = input
-            .transpose(vec![1, 0])
-            .unwrap()
-            .block_quantize(2, DataType::F4E2M1FN, DataType::F8E4M3FN)
-            .unwrap();
-        assert_eq!(scales.r#type().into_owned(), ArrayType::new_static(DataType::F8E4M3FN, [2, 4]));
-        assert_eq!(elements, transposed_elements.transpose(vec![1, 0]).unwrap());
-        assert_eq!(scales, transposed_scales.transpose(vec![1, 0]).unwrap());
-
-        // Two block axes form tiles that share one scale. Every tile below is a scaled copy of `f4e2m1fn` grid points,
-        // so quantization is exact and dequantization over both block axes reproduces the input.
-        let BlockQuantizedValue { elements, scales, .. } = input
-            .block_quantize_with_options(2, DataType::F4E2M1FN, DataType::F8E4M3FN, [0, 1], None, None)
-            .unwrap();
-        assert_eq!(scales.r#type().into_owned(), ArrayType::new_static(DataType::F8E4M3FN, [2, 2]));
-        assert_eq!(scales.to_f64s(), vec![1.0, 0.25, 0.5, 2.0]);
-        assert_eq!(
-            elements.to_f64s(),
-            vec![1.0, 2.0, 2.0, 1.0, 3.0, 6.0, 4.0, 6.0, 6.0, 1.0, 6.0, 1.0, 2.0, 2.0, 1.5, 3.0],
-        );
-        assert_eq!(
-            BlockQuantizedValue::new(elements.clone(), scales.clone()).block_dequantize([0, 1], DataType::F32),
-            Ok(input),
-        );
-    }
-
-    #[test]
-    fn test_block_quantize_with_options_global_scale() {
-        // A global scale divides the input before block scaling, so a scaled copy of the module example quantizes to
-        // the same elements and scales, and the global scale restores the input after dequantization.
-        let input = Array::vector(vec![12.0f32, 6.0, 2.0, 24.0, 2.0, 4.0, 1.0, 6.0]).unwrap();
-        let global_scale = Array::scalar(4.0f32).unwrap();
-        let quantized = input
-            .block_quantize_with_options(4, DataType::F4E2M1FN, DataType::F8E4M3FN, -1, Some(&global_scale), None)
-            .unwrap();
-        assert_eq!(quantized.scales.to_f64s(), vec![1.0, 0.25]);
-        assert_eq!(quantized.elements.to_f64s(), vec![3.0, 1.5, 0.5, 6.0, 2.0, 4.0, 1.0, 6.0]);
-        assert_eq!(quantized.global_scale, Some(global_scale.clone()));
-        assert_eq!(quantized.block_dequantize([0], DataType::F32), Ok(input));
-
-        // Without the global scale, the block maximum `6000` exceeds `6 · 448` and saturates, while the global scale
-        // brings it back into range.
-        let input = Array::vector(vec![6000.0f32, 3000.0, 0.0, 0.0, 1.0, 1.0, 1.0, 1.0]).unwrap();
-        let BlockQuantizedValue { elements, scales, .. } = input
-            .block_quantize_with_options(4, DataType::F4E2M1FN, DataType::F8E4M3FN, -1, Some(&global_scale), None)
-            .unwrap();
-        assert_eq!(scales.to_f64s(), vec![256.0, 0.04296875]);
-        assert_eq!(elements.to_f64s(), vec![6.0, 3.0, 0.0, 0.0, 6.0, 6.0, 6.0, 6.0]);
-    }
-
-    #[test]
-    fn test_block_quantize_with_options_global_scale_array_ir() {
-        let input = ArrayIrValue::Array(Array::vector(vec![6.0f32, 3.0, 1.0, 12.0]).unwrap());
-        let global_scale = ArrayIrValue::Array(Array::scalar(2.0f32).unwrap());
-        let quantized = input
-            .block_quantize_with_options(4, DataType::F4E2M1FN, DataType::F8E4M3FN, -1, Some(&global_scale), None)
-            .unwrap();
-        assert_eq!(quantized.global_scale, Some(global_scale.clone()));
-        assert_eq!(quantized.block_dequantize([-1], DataType::F32), Ok(input));
-
-        // The dynamic quantization branch must also retain the supplied scale. Selecting that field and removing
-        // unused arithmetic exposes its exact connection to the input without depending on the numerical recipe.
-        let extent = DimensionVariable::new("n", DimensionBounds::new(0, Some(9)).unwrap());
-        let (output_type, program) = TracingContext::<ArrayIrValue<Array>, ArrayIrOperation<Array>>::trace(
-            |(input, global_scale): (Tracer<_>, Tracer<_>)| {
-                let quantized = input.block_quantize_with_options(
-                    4,
-                    DataType::F4E2M1FN,
-                    DataType::F8E4M3FN,
-                    1,
-                    Some(&global_scale),
-                    None,
-                )?;
-                Ok(quantized.global_scale.unwrap())
-            },
-            (
-                ArrayIrType::Array(ArrayType::new(
-                    DataType::F32,
-                    Shape::new(vec![Dimension::Dynamic(extent), Dimension::Static(4)]),
-                )),
-                ArrayIrType::Array(ArrayType::scalar(DataType::F32)),
-            ),
-        )
-        .unwrap();
-        assert_eq!(output_type, ArrayIrType::Array(ArrayType::scalar(DataType::F32)));
-        let program = program.simplified().unwrap();
-        assert_eq!(
-            program.to_string(),
-            indoc! {"
-                lambda %0:f32[n, 4], %1:f32[] .
-                in (%1)
-            "}
-            .trim_end(),
-        );
-        assert_eq!(
-            program.interpret((
-                ArrayIrValue::Array(Array::matrix(0, 4, Vec::<f32>::new()).unwrap()),
-                global_scale.clone(),
-            )),
-            Ok(global_scale),
-        );
-    }
-
-    #[test]
-    fn test_block_quantize_with_options_stochastic_rounding() {
-        // The block scale is `1`, so the quotients equal the inputs. `6` is on the grid, `1.3` lies between `1.0` and
-        // `1.5` (spacing `0.5`), and `0.2` lies below the smallest normal value `1.0`, where the spacing stays `0.5`.
-        // Each value rounds up exactly when its noise reaches its distance from the grid value below it.
-        let input = Array::vector(vec![6.0f32, 1.3, -1.3, 0.2]).unwrap();
-        let noise = Array::vector(vec![0.0f32, 0.3, 0.3, 0.7]).unwrap();
-        let BlockQuantizedValue { elements, scales, .. } = input
-            .block_quantize_with_options(4, DataType::F4E2M1FN, DataType::F8E4M3FN, -1, None, Some(&noise))
-            .unwrap();
-        assert_eq!(scales.to_f64s(), vec![1.0]);
-        assert_eq!(elements.to_f64s(), vec![6.0, 1.0, -1.5, 0.5]);
-
-        // Adding noise just below one to the largest grid value rounds up to the next integer at `f32`, so the result
-        // saturates at the largest element magnitude rather than overflowing to NaN (`f8e4m3fn`) or infinity
-        // (`f8e5m2`). The scales are `1`, and the quotients `448 / 32 = 14` and `57344 / 8192 = 7` are integers.
-        let noise = Array::vector(vec![1.0f32 - f32::EPSILON / 2.0, 0.0, 0.0, 0.0]).unwrap();
-        let input = Array::vector(vec![448.0f32, 0.0, 0.0, 0.0]).unwrap();
-        let BlockQuantizedValue { elements, scales, .. } = input
-            .block_quantize_with_options(4, DataType::F8E4M3FN, DataType::F8E8M0FNU, -1, None, Some(&noise))
-            .unwrap();
-        assert_eq!(scales.to_f64s(), vec![1.0]);
-        assert_eq!(elements.to_f64s(), vec![448.0, 0.0, 0.0, 0.0]);
-        let input = Array::vector(vec![57344.0f32, 0.0, 0.0, 0.0]).unwrap();
-        let BlockQuantizedValue { elements, scales, .. } = input
-            .block_quantize_with_options(4, DataType::F8E5M2, DataType::F8E8M0FNU, -1, None, Some(&noise))
-            .unwrap();
-        assert_eq!(scales.to_f64s(), vec![1.0]);
-        assert_eq!(elements.to_f64s(), vec![57344.0, 0.0, 0.0, 0.0]);
-
-        // Stratified noise over ten rows makes the column sums of the rounded values exactly ten times the inputs,
-        // which shows that rounding is unbiased at both `f64` and `f32`. Zero never rounds away from zero.
-        let input = Array::from_elements::<f64>(
-            ArrayType::new_static(DataType::F64, [10, 8]),
-            &(0..10).flat_map(|_| [6.0, 1.3, -1.3, 0.2, 0.0, -6.0, 2.5, 0.75]).collect::<Vec<_>>(),
-        )
-        .unwrap();
-        let noise = Array::from_elements::<f64>(
-            ArrayType::new_static(DataType::F64, [10, 8]),
-            &(0..10).flat_map(|row| [(row as f64 + 0.5) / 10.0; 8]).collect::<Vec<_>>(),
-        )
-        .unwrap();
-        let BlockQuantizedValue { elements, scales, .. } = input
-            .block_quantize_with_options(4, DataType::F4E2M1FN, DataType::F8E4M3FN, -1, None, Some(&noise))
-            .unwrap();
-        assert_eq!(scales.to_f64s(), vec![1.0; 20]);
-        assert_eq!(
-            elements
-                .convert_element_type(DataType::F64)
-                .unwrap()
-                .reduce(&[0], ReductionKind::Sum)
-                .unwrap()
-                .to_f64s(),
-            vec![60.0, 13.0, -13.0, 2.0, 0.0, -60.0, 25.0, 7.5],
-        );
-        let BlockQuantizedValue { elements, scales, .. } = input
-            .convert_element_type(DataType::F32)
-            .unwrap()
-            .block_quantize_with_options(
-                4,
-                DataType::F4E2M1FN,
-                DataType::F8E4M3FN,
-                -1,
-                None,
-                Some(&noise.convert_element_type(DataType::F32).unwrap()),
-            )
-            .unwrap();
-        assert_eq!(scales.to_f64s(), vec![1.0; 20]);
-        assert_eq!(
-            elements
-                .convert_element_type(DataType::F64)
-                .unwrap()
-                .reduce(&[0], ReductionKind::Sum)
-                .unwrap()
-                .to_f64s(),
-            vec![60.0, 13.0, -13.0, 2.0, 0.0, -60.0, 25.0, 7.5],
-        );
-    }
-
-    #[test]
-    fn test_block_quantize_with_options_staging() {
-        // Stochastic rounding computes the grid spacing from the exponent bits of the quotients.
-        let (_, program) = TracingContext::<Array, ArrayOperation<Array>>::trace(
-            |(input, global_scale, noise): (Tracer<_>, Tracer<_>, Tracer<_>)| {
-                let BlockQuantizedValue { elements, scales, .. } = input.block_quantize_with_options(
-                    2,
-                    DataType::F4E2M1FN,
-                    DataType::F8E4M3FN,
-                    [0],
-                    Some(&global_scale),
-                    Some(&noise),
-                )?;
-                Ok(vec![elements, scales])
-            },
-            (
-                ArrayType::new_static(DataType::F32, [2]),
-                ArrayType::scalar(DataType::F32),
-                ArrayType::new_static(DataType::F32, [2]),
-            ),
-        )
-        .unwrap();
-        assert_eq!(
-            program.to_string(),
-            indoc! {"
-                lambda %0:f32[2], %1:f32[], %2:f32[2] .
-                let %3:f32[2] = broadcast [output_type=f32[2], output_axes=[]] %1
-                    %4:f32[2] = div %0 %3
-                    %5:f32[1, 2] = reshape [shape=[1, 2]] %4
-                    %6:f32[1, 2] = abs %5
-                    %7:f32[1] = reduce [kind=max, axes=[1]] %6
-                    %8:f32[] = constant [value=6.0]
-                    %9:f32[1] = broadcast [output_type=f32[1], output_axes=[]] %8
-                    %10:f32[1] = div %7 %9
-                    %11:f32[] = constant [value=0.001953125]
-                    %12:f32[] = constant [value=448.0]
-                    %13:f32[1] = clamp %11 %10 %12
-                    %14:u32[1] = convert_element_type [data_type=u32, bitcast=true] %13
-                    %15:f32[] = constant [value=inf]
-                    %16:f32[1] = broadcast [output_type=f32[1], output_axes=[]] %15
-                    %17:u32[1] = convert_element_type [data_type=u32, bitcast=true] %16
-                    %18:u32[1] = and %14 %17
-                    %19:f32[1] = convert_element_type [data_type=f32, bitcast=true] %18
-                    %20:f32[] = constant [value=0.015625]
-                    %21:f32[1] = broadcast [output_type=f32[1], output_axes=[]] %20
-                    %22:f32[] = constant [value=inf]
-                    %23:f32[1] = broadcast [output_type=f32[1], output_axes=[]] %22
-                    %24:f32[1] = clamp %21 %19 %23
-                    %25:f32[] = constant [value=0.125]
-                    %26:f32[1] = broadcast [output_type=f32[1], output_axes=[]] %25
-                    %27:f32[1] = mul %24 %26
-                    %28:f32[1] = div %13 %27
-                    %29:f32[1] = round %28
-                    %30:f32[1] = mul %29 %27
-                    %31:f8e4m3fn[1] = convert_element_type [data_type=f8e4m3fn] %30
-                    %32:f32[1, 2] = broadcast [output_type=f32[1, 2], output_axes=[0]] %30
-                    %33:f32[2] = reshape [shape=[2]] %32
-                    %34:f32[2] = div %4 %33
-                    %35:f32[] = constant [value=-6.0]
-                    %36:f32[] = constant [value=6.0]
-                    %37:f32[2] = clamp %35 %34 %36
-                    %38:u32[2] = convert_element_type [data_type=u32, bitcast=true] %37
-                    %39:f32[] = constant [value=inf]
-                    %40:f32[2] = broadcast [output_type=f32[2], output_axes=[]] %39
-                    %41:u32[2] = convert_element_type [data_type=u32, bitcast=true] %40
-                    %42:u32[2] = and %38 %41
-                    %43:f32[2] = convert_element_type [data_type=f32, bitcast=true] %42
-                    %44:f32[] = constant [value=1.0]
-                    %45:f32[2] = broadcast [output_type=f32[2], output_axes=[]] %44
-                    %46:f32[] = constant [value=inf]
-                    %47:f32[2] = broadcast [output_type=f32[2], output_axes=[]] %46
-                    %48:f32[2] = clamp %45 %43 %47
-                    %49:f32[] = constant [value=0.5]
-                    %50:f32[2] = broadcast [output_type=f32[2], output_axes=[]] %49
-                    %51:f32[2] = mul %48 %50
-                    %52:f32[2] = div %37 %51
-                    %53:f32[2] = add %52 %2
-                    %54:f32[2] = floor %53
-                    %55:f32[2] = mul %54 %51
-                    %56:f32[] = constant [value=-6.0]
-                    %57:f32[] = constant [value=6.0]
-                    %58:f32[2] = clamp %56 %55 %57
-                    %59:f4e2m1fn[2] = convert_element_type [data_type=f4e2m1fn] %58
-                in (%59, %31)
-            "}
-            .trim_end(),
-        );
-    }
-
-    #[test]
-    fn test_block_quantize_with_options_dynamic_extents() {
-        let rows = DimensionVariable::new("rows", DimensionBounds::new(0, Some(9)).unwrap());
-        let columns = DimensionVariable::new("columns", DimensionBounds::new(0, Some(9)).unwrap());
-        let input_type =
-            ArrayType::new(DataType::F32, Shape::new(vec![Dimension::Dynamic(rows), Dimension::Dynamic(columns)]));
-        let (_, program) = TracingContext::<ArrayIrValue<Array>, ArrayIrOperation<Array>>::trace(
-            |(input, global_scale, noise): (Tracer<_>, Tracer<_>, Tracer<_>)| {
-                let BlockQuantizedValue { elements, scales, .. } = input.block_quantize_with_options(
-                    4,
-                    DataType::F4E2M1FN,
-                    DataType::F8E4M3FN,
-                    [-1, 0],
-                    Some(&global_scale),
-                    Some(&noise),
-                )?;
-                Ok(vec![elements, scales])
-            },
-            (
-                ArrayIrType::Array(input_type.clone()),
-                ArrayIrType::Array(ArrayType::scalar(DataType::F32)),
-                ArrayIrType::Array(input_type),
-            ),
-        )
-        .unwrap();
-        assert_eq!(
-            program.to_string(),
-            indoc! {r#"
-                lambda %0:f32[rows, columns], %1:f32[], %2:f32[rows, columns] .
-                let %3:dimension<4> = constant [value=4]
-                    %4:dimension<rows ∈ [0, 9)> = dimension_size [axis=0] %0
-                    %5:dimension<columns ∈ [0, 9)> = dimension_size [axis=1] %0
-                    %6:dimension<0> = constant [value=0]
-                    %7:bool[] = compare [direction=GreaterThan] %4 %6
-                    () = assert [message="block extent of axis 0 must be positive", labels=["extent"]] %7 %4
-                    %8:dimension<rows % 4 ∈ [0, 4)> = dimension_rem %4 %3
-                    %9:bool[] = compare [direction=Equal] %8 %6
-                    () = assert [
-                        message="block extent of axis 0 must be divisible by block size",
-                        labels=["extent"],
-                    ] %9 %4
-                    %10:dimension<rows / 4 ∈ [0, 3)> = dimension_div %4 %3
-                    %11:bool[] = compare [direction=GreaterThan] %5 %6
-                    () = assert [message="block extent of axis 1 must be positive", labels=["extent"]] %11 %5
-                    %12:dimension<columns % 4 ∈ [0, 4)> = dimension_rem %5 %3
-                    %13:bool[] = compare [direction=Equal] %12 %6
-                    () = assert [
-                        message="block extent of axis 1 must be divisible by block size",
-                        labels=["extent"],
-                    ] %13 %5
-                    %14:dimension<columns / 4 ∈ [0, 3)> = dimension_div %5 %3
-                    %15:f32[rows, columns] = broadcast [output_axes=[]] %1 %4 %5
-                    %16:f32[rows, columns] = div %0 %15
-                    %17:f32[rows / 4, 4, columns / 4, 4] = reshape %16 %10 %3 %14 %3
-                    %18:f32[rows / 4, 4, columns / 4, 4] = abs %17
-                    %19:f32[rows / 4, columns / 4] = reduce [kind=max, axes=[1, 3]] %18
-                    %20:f32[] = constant [value=6.0]
-                    %21:f32[rows / 4, columns / 4] = broadcast [output_axes=[]] %20 %10 %14
-                    %22:f32[rows / 4, columns / 4] = div %19 %21
-                    %23:f32[] = constant [value=0.001953125]
-                    %24:f32[] = constant [value=448.0]
-                    %25:f32[rows / 4, columns / 4] = clamp %23 %22 %24
-                    %26:u32[rows / 4, columns / 4] = convert_element_type [data_type=u32, bitcast=true] %25
-                    %27:f32[] = constant [value=inf]
-                    %28:f32[rows / 4, columns / 4] = broadcast [output_axes=[]] %27 %10 %14
-                    %29:u32[rows / 4, columns / 4] = convert_element_type [data_type=u32, bitcast=true] %28
-                    %30:u32[rows / 4, columns / 4] = and %26 %29
-                    %31:f32[rows / 4, columns / 4] = convert_element_type [data_type=f32, bitcast=true] %30
-                    %32:f32[] = constant [value=0.015625]
-                    %33:f32[rows / 4, columns / 4] = broadcast [output_axes=[]] %32 %10 %14
-                    %34:f32[] = constant [value=inf]
-                    %35:f32[rows / 4, columns / 4] = broadcast [output_axes=[]] %34 %10 %14
-                    %36:f32[rows / 4, columns / 4] = clamp %33 %31 %35
-                    %37:f32[] = constant [value=0.125]
-                    %38:f32[rows / 4, columns / 4] = broadcast [output_axes=[]] %37 %10 %14
-                    %39:f32[rows / 4, columns / 4] = mul %36 %38
-                    %40:f32[rows / 4, columns / 4] = div %25 %39
-                    %41:f32[rows / 4, columns / 4] = round %40
-                    %42:f32[rows / 4, columns / 4] = mul %41 %39
-                    %43:f8e4m3fn[rows / 4, columns / 4] = convert_element_type [data_type=f8e4m3fn] %42
-                    %44:f32[rows / 4, 4, columns / 4, 4] = broadcast [output_axes=[0, 2]] %42 %10 %3 %14 %3
-                    %45:f32[rows, columns] = reshape %44 %4 %5
-                    %46:f32[rows, columns] = div %16 %45
-                    %47:f32[] = constant [value=-6.0]
-                    %48:f32[] = constant [value=6.0]
-                    %49:f32[rows, columns] = clamp %47 %46 %48
-                    %50:u32[rows, columns] = convert_element_type [data_type=u32, bitcast=true] %49
-                    %51:f32[] = constant [value=inf]
-                    %52:f32[rows, columns] = broadcast [output_axes=[]] %51 %4 %5
-                    %53:u32[rows, columns] = convert_element_type [data_type=u32, bitcast=true] %52
-                    %54:u32[rows, columns] = and %50 %53
-                    %55:f32[rows, columns] = convert_element_type [data_type=f32, bitcast=true] %54
-                    %56:f32[] = constant [value=1.0]
-                    %57:f32[rows, columns] = broadcast [output_axes=[]] %56 %4 %5
-                    %58:f32[] = constant [value=inf]
-                    %59:f32[rows, columns] = broadcast [output_axes=[]] %58 %4 %5
-                    %60:f32[rows, columns] = clamp %57 %55 %59
-                    %61:f32[] = constant [value=0.5]
-                    %62:f32[rows, columns] = broadcast [output_axes=[]] %61 %4 %5
-                    %63:f32[rows, columns] = mul %60 %62
-                    %64:f32[rows, columns] = div %49 %63
-                    %65:f32[rows, columns] = add %64 %2
-                    %66:f32[rows, columns] = floor %65
-                    %67:f32[rows, columns] = mul %66 %63
-                    %68:f32[] = constant [value=-6.0]
-                    %69:f32[] = constant [value=6.0]
-                    %70:f32[rows, columns] = clamp %68 %67 %69
-                    %71:f4e2m1fn[rows, columns] = convert_element_type [data_type=f4e2m1fn] %70
-                in (%71, %43)
-            "#}
-            .trim_end(),
-        );
-        let input = Array::matrix(4, 8, (0..32).map(|index| index as f32 / 3.0 - 5.0).collect()).unwrap();
-        let global_scale = Array::scalar(2.0f32).unwrap();
-        let noise = Array::matrix(4, 8, vec![0.75f32; 32]).unwrap();
-        let BlockQuantizedValue { elements, scales, .. } = input
-            .block_quantize_with_options(
-                4,
-                DataType::F4E2M1FN,
-                DataType::F8E4M3FN,
-                [-1, 0],
-                Some(&global_scale),
-                Some(&noise),
-            )
-            .unwrap();
-        assert_eq!(
-            program.interpret((
-                ArrayIrValue::Array(input),
-                ArrayIrValue::Array(global_scale),
-                ArrayIrValue::Array(noise),
-            )),
-            Ok(vec![ArrayIrValue::Array(elements), ArrayIrValue::Array(scales)]),
-        );
-    }
-
-    #[test]
-    fn test_block_quantize_with_options_validation() {
-        let input = Array::matrix(2, 8, vec![1.0f32; 16]).unwrap();
-        assert_eq!(
-            input.block_quantize_with_options(4, DataType::F4E2M1FN, DataType::F8E4M3FN, Axes::default(), None, None),
-            Err(ProgramError::from(TypeError::invalid(format!(
-                "`{BLOCK_QUANTIZE_NAME}` requires at least one block axis",
-            )))),
-        );
-        assert_eq!(
-            input.block_quantize_with_options(4, DataType::F4E2M1FN, DataType::F8E4M3FN, [0], None, None),
-            Err(ProgramError::from(TypeError::invalid(format!(
-                "`{BLOCK_QUANTIZE_NAME}` block dimension 0 size 2 is not a positive multiple of block size 4",
-            )))),
-        );
-        assert_eq!(
-            input.block_quantize_with_options(4, DataType::F4E2M1FN, DataType::F8E4M3FN, [2], None, None),
-            Err(ProgramError::Axis(AxisError::OutOfBounds { axis: Axis::from(2), rank: 2 })),
-        );
-        assert_eq!(
-            input.block_quantize_with_options(4, DataType::F4E2M1FN, DataType::F8E4M3FN, [1, -1], None, None),
-            Err(ProgramError::Axis(AxisError::DuplicateAxis { axis: 1 })),
-        );
-        assert_eq!(
-            input.block_quantize_with_options(
-                4,
-                DataType::F4E2M1FN,
-                DataType::F8E4M3FN,
-                [1],
-                Some(&Array::vector(vec![1.0f32]).unwrap()),
-                None,
-            ),
-            Err(ProgramError::from(TypeError::invalid(format!(
-                "`{BLOCK_QUANTIZE_NAME}` global scale must be a rank-0 `f32` array but got `f32[1]`",
-            )))),
-        );
-        assert_eq!(
-            input.block_quantize_with_options(
-                4,
-                DataType::F4E2M1FN,
-                DataType::F8E4M3FN,
-                [1],
-                Some(&Array::scalar(1.0f64).unwrap()),
-                None,
-            ),
-            Err(ProgramError::from(TypeError::invalid(format!(
-                "`{BLOCK_QUANTIZE_NAME}` global scale must be a rank-0 `f32` array but got `f64[]`",
-            )))),
-        );
-        assert_eq!(
-            input.block_quantize_with_options(
-                4,
-                DataType::F8E4M3FN,
-                DataType::F8E8M0FNU,
-                -1,
-                Some(&Array::scalar(1.0f32).unwrap()),
-                None,
-            ),
-            Err(ProgramError::from(TypeError::invalid(format!(
-                "`{BLOCK_QUANTIZE_NAME}` global scales require `f8e4m3fn` scales but got `f8e8m0fnu` scales",
-            )))),
-        );
-        assert_eq!(
-            input.block_quantize_with_options(
-                4,
-                DataType::F4E2M1FN,
-                DataType::F8E4M3FN,
-                [1],
-                None,
-                Some(&Array::vector(vec![0.5f32; 16]).unwrap()),
-            ),
-            Err(ProgramError::from(TypeError::invalid(format!(
-                "`{BLOCK_QUANTIZE_NAME}` rounding noise must have the data type and shape of the input `f32[2, 8]` \
-                 but got `f32[16]`",
-            )))),
-        );
-    }
-
-    #[test]
     fn test_block_dequantize() {
+        // Each scale multiplies its block of elements, and both are converted to the requested data type first.
         let elements = Array::vector(vec![1i32, 2, 3, 4]).unwrap();
         let scales = Array::vector(vec![2.0f32, 3.0]).unwrap();
         let expected = Array::vector(vec![2.0f64, 4.0, 9.0, 12.0]).unwrap();
         assert_eq!(
             BlockQuantizedValue::new(elements.clone(), scales.clone()).block_dequantize([-1], DataType::F64),
-            Ok(expected.clone())
+            Ok(expected.clone()),
         );
         assert_eq!(
             BlockQuantizedValue::new(ArrayIrValue::Array(elements), ArrayIrValue::Array(scales))
@@ -4915,6 +5012,8 @@ mod tests {
                 .block_dequantize(Axes::default(), DataType::F32),
             Ok(ArrayIrValue::Array(Array::scalar(1.0078277587890625f32).unwrap())),
         );
+
+        // Boolean elements dequantize to zero or their block scale.
         let elements = Array::vector(vec![true, false, true, false]).unwrap();
         let scales = Array::vector(vec![2.0f32, 3.0]).unwrap();
         assert_eq!(
@@ -4925,6 +5024,7 @@ mod tests {
 
     #[test]
     fn test_block_dequantize_global_scale_precision() {
+        // The multiplication order is observable for both 16-bit floating-point output types.
         for (data_type, scale, expected, midpoint) in
             [(DataType::BF16, 1.0078125, 3.0625, 1.00390625), (DataType::F16, 1.0009765625, 3.0078125, 1.00048828125)]
         {
@@ -4961,7 +5061,7 @@ mod tests {
         .unwrap();
         assert_eq!(
             BlockQuantizedValue::new(elements.clone(), scales.clone()).block_dequantize([-1, 0], DataType::F32),
-            Ok(expected.clone())
+            Ok(expected.clone()),
         );
         assert_eq!(
             BlockQuantizedValue::new(ArrayIrValue::Array(elements), ArrayIrValue::Array(scales))
@@ -4975,7 +5075,7 @@ mod tests {
         let expected = Array::vector(vec![8.0f32, 15.0]).unwrap();
         assert_eq!(
             BlockQuantizedValue::new(elements.clone(), scales.clone()).block_dequantize(Axes::default(), DataType::F32),
-            Ok(expected.clone())
+            Ok(expected.clone()),
         );
         assert_eq!(
             BlockQuantizedValue::new(ArrayIrValue::Array(elements), ArrayIrValue::Array(scales))
@@ -4988,7 +5088,7 @@ mod tests {
         let scales = Array::matrix(0, 2, Vec::<f32>::new()).unwrap();
         assert_eq!(
             BlockQuantizedValue::new(elements.clone(), scales.clone()).block_dequantize([1], DataType::F32),
-            Ok(elements.clone())
+            Ok(elements.clone()),
         );
         assert_eq!(
             BlockQuantizedValue::new(ArrayIrValue::Array(elements.clone()), ArrayIrValue::Array(scales))
@@ -4998,17 +5098,8 @@ mod tests {
     }
 
     #[test]
-    fn test_block_dequantize_quantized_values() {
-        let input = Array::vector(vec![3.0f32, 1.5, 0.5, 6.0, 0.0, 0.25, 0.5, 1.5]).unwrap();
-        let quantized = input.block_quantize(4, DataType::F4E2M1FN, DataType::F8E4M3FN).unwrap();
-        assert_eq!(quantized.block_dequantize([-1], DataType::F32), Ok(input.clone()));
-        let input = ArrayIrValue::Array(input);
-        let quantized = input.block_quantize(4, DataType::F4E2M1FN, DataType::F8E4M3FN).unwrap();
-        assert_eq!(quantized.block_dequantize([-1], DataType::F32), Ok(input));
-    }
-
-    #[test]
     fn test_block_dequantize_validation() {
+        // Block axes must be distinct and in bounds, and the output must be floating-point.
         let elements = Array::vector(vec![1.0f32; 4]).unwrap();
         let scales = Array::vector(vec![2.0f32; 2]).unwrap();
         assert_eq!(
@@ -5021,114 +5112,136 @@ mod tests {
         );
         assert_eq!(
             BlockQuantizedValue::new(elements.clone(), scales.clone()).block_dequantize([0], DataType::I32),
-            Err(TypeError::invalid(format!(
+            Err(ProgramError::from(TypeError::invalid(format!(
                 "`{BLOCK_DEQUANTIZE_NAME}` output data type must be floating-point but got `i32`",
-            ))
-            .into()),
+            )))),
         );
+
+        // Elements and scales must be real arrays of the same rank whose extents match outside the block axes.
         assert_eq!(
             BlockQuantizedValue::new(elements.convert_element_type(DataType::C64).unwrap(), scales.clone())
                 .block_dequantize([0], DataType::F32),
-            Err(TypeError::invalid(format!(
+            Err(ProgramError::from(TypeError::invalid(format!(
                 "`{BLOCK_DEQUANTIZE_NAME}` elements must have a real numeric or Boolean element type but got `c64`",
-            ))
-            .into()),
+            )))),
         );
         assert_eq!(
             BlockQuantizedValue::new(elements.clone(), scales.convert_element_type(DataType::C64).unwrap())
                 .block_dequantize([0], DataType::F32),
-            Err(TypeError::invalid(format!(
+            Err(ProgramError::from(TypeError::invalid(format!(
                 "`{BLOCK_DEQUANTIZE_NAME}` scales must have a real numeric or Boolean element type but got `c64`",
-            ))
-            .into()),
+            )))),
         );
         assert_eq!(
             BlockQuantizedValue::new(elements.clone(), Array::scalar(2.0f32).unwrap())
                 .block_dequantize([0], DataType::F32),
-            Err(TypeError::invalid(format!("`{BLOCK_DEQUANTIZE_NAME}` inputs must have the same rank")).into()),
+            Err(ProgramError::from(TypeError::invalid(format!(
+                "`{BLOCK_DEQUANTIZE_NAME}` inputs must have the same rank",
+            )))),
         );
         assert_eq!(
             BlockQuantizedValue::new(elements.clone(), scales.clone()).block_dequantize(Axes::default(), DataType::F32),
-            Err(TypeError::invalid(format!(
+            Err(ProgramError::from(TypeError::invalid(format!(
                 "`{BLOCK_DEQUANTIZE_NAME}` non-block dimension 0 has element extent `4` but scale extent `2`",
-            ))
-            .into()),
+            )))),
         );
+
+        // Every block extent must contain a positive number of at least two elements per scale.
         assert_eq!(
             BlockQuantizedValue::new(elements.clone(), Array::vector(Vec::<f32>::new()).unwrap())
                 .block_dequantize([0], DataType::F32),
-            Err(TypeError::invalid(format!(
+            Err(ProgramError::from(TypeError::invalid(format!(
                 "`{BLOCK_DEQUANTIZE_NAME}` block dimension 0 has an empty scale but scale extents must be positive",
-            ))
-            .into()),
+            )))),
         );
         assert_eq!(
             BlockQuantizedValue::new(elements.clone(), Array::vector(vec![1.0f32; 3]).unwrap())
                 .block_dequantize([0], DataType::F32),
-            Err(TypeError::invalid(format!(
+            Err(ProgramError::from(TypeError::invalid(format!(
                 "`{BLOCK_DEQUANTIZE_NAME}` element extent 4 of block dimension 0 is not divisible by scale extent 3",
-            ))
-            .into()),
+            )))),
         );
         assert_eq!(
             BlockQuantizedValue::new(elements.clone(), elements.clone()).block_dequantize([0], DataType::F32),
-            Err(TypeError::invalid(format!(
+            Err(ProgramError::from(TypeError::invalid(format!(
                 "`{BLOCK_DEQUANTIZE_NAME}` block dimension 0 must have ratio at least 2 but got 1",
-            ))
-            .into()),
+            )))),
         );
+
+        // Array IR values validate their array members in the same way and reject members of other types.
         assert_eq!(
-            BlockQuantizedValue::new(ArrayIrValue::Array(elements.clone()), ArrayIrValue::Array(elements))
+            BlockQuantizedValue::new(ArrayIrValue::Array(elements.clone()), ArrayIrValue::Array(elements.clone()))
                 .block_dequantize([0], DataType::F32),
-            Err(TypeError::invalid(format!(
+            Err(ProgramError::from(TypeError::invalid(format!(
                 "`{BLOCK_DEQUANTIZE_NAME}` block dimension 0 must have ratio at least 2 but got 1",
-            ))
-            .into()),
+            )))),
         );
         assert_eq!(
             BlockQuantizedValue::new(
                 ArrayIrValue::Dimension(DimensionValue::constant(4).unwrap()),
-                ArrayIrValue::Array(scales)
+                ArrayIrValue::Array(scales),
             )
             .block_dequantize([0], DataType::F32),
-            Err(TypeError::invalid("expected array type but got dimension type").into()),
+            Err(ProgramError::from(TypeError::invalid("expected array type but got dimension type"))),
+        );
+
+        // Staged homogeneous inputs must have static shapes, and rejected requests stage nothing.
+        let extent = DimensionVariable::new("elements", DimensionBounds::new(4, Some(9)).unwrap());
+        let (_, program) = TracingContext::<Array, ArrayOperation<Array>>::trace(
+            |(elements, scales): (Tracer<_>, Tracer<_>)| {
+                assert_eq!(
+                    BlockQuantizedValue::new(elements.clone(), scales).block_dequantize([0], DataType::F32),
+                    Err(ProgramError::from(TypeError::invalid(format!(
+                        "`{BLOCK_DEQUANTIZE_NAME}` homogeneous inputs must have static shapes; use array IR values for \
+                         dynamic extents",
+                    )))),
+                );
+                Ok(elements)
+            },
+            (
+                ArrayType::new(DataType::F32, Shape::new(vec![Dimension::Dynamic(extent)])),
+                ArrayType::new_static(DataType::F32, [2]),
+            ),
+        )
+        .unwrap();
+        assert_eq!(
+            program.to_string(),
+            indoc! {"
+                lambda %0:f32[elements], %1:f32[2] .
+                in (%0)
+            "}
+            .trim_end(),
         );
     }
 
     #[test]
     fn test_block_dequantize_validation_global_scale() {
+        // Global scales must be rank-0 real floating-point arrays, for arrays and array IR values alike.
         let quantized = BlockQuantizedValue::new(
             Array::vector(vec![1.0f32, 2.0, 3.0, 4.0]).unwrap(),
             Array::vector(vec![2.0f32, 3.0]).unwrap(),
         );
-        for (global_scale, message) in [
-            (
-                Array::vector(vec![5.0f32]).unwrap(),
-                format!(
-                    "`{BLOCK_DEQUANTIZE_NAME}` global scale must be a rank-0 real floating-point array but \
-                     got `f32[1]`",
-                ),
-            ),
-            (
-                Array::scalar(5i32).unwrap(),
-                format!(
-                    "`{BLOCK_DEQUANTIZE_NAME}` global scale must be a rank-0 real floating-point array but got `i32[]`",
-                ),
-            ),
-        ] {
-            let quantized = quantized.clone().with_global_scale(global_scale);
-            let expected = ProgramError::from(TypeError::invalid(message));
-            assert_eq!(quantized.block_dequantize([0], DataType::F32), Err(expected.clone()));
-            let quantized = quantized.map_parameters(ArrayIrValue::Array).unwrap();
-            assert_eq!(quantized.block_dequantize([0], DataType::F32), Err(expected));
-        }
+        let invalid = quantized.clone().with_global_scale(Array::vector(vec![5.0f32]).unwrap());
+        let expected = ProgramError::from(TypeError::invalid(format!(
+            "`{BLOCK_DEQUANTIZE_NAME}` global scale must be a rank-0 real floating-point array but got `f32[1]`",
+        )));
+        assert_eq!(invalid.block_dequantize([0], DataType::F32), Err(expected.clone()));
+        let invalid = invalid.map_parameters(ArrayIrValue::Array).unwrap();
+        assert_eq!(invalid.block_dequantize([0], DataType::F32), Err(expected));
+        let invalid = quantized.with_global_scale(Array::scalar(5i32).unwrap());
+        let expected = ProgramError::from(TypeError::invalid(format!(
+            "`{BLOCK_DEQUANTIZE_NAME}` global scale must be a rank-0 real floating-point array but got `i32[]`",
+        )));
+        assert_eq!(invalid.block_dequantize([0], DataType::F32), Err(expected.clone()));
+        let invalid = invalid.map_parameters(ArrayIrValue::Array).unwrap();
+        assert_eq!(invalid.block_dequantize([0], DataType::F32), Err(expected));
 
-        // A rich non-array global scale is rejected before dimension reads or any numerical operations stage.
+        // A dimension global scale is rejected before dimension reads or any numerical operations stage.
         let (output_type, program) = TracingContext::<ArrayIrValue<Array>, ArrayIrOperation<Array>>::trace(
             |quantized: BlockQuantizedValue<Tracer<_>>| {
                 assert_eq!(
                     quantized.block_dequantize([0], DataType::F32),
-                    Err(TypeError::invalid("expected array type but got dimension type").into()),
+                    Err(ProgramError::from(TypeError::invalid("expected array type but got dimension type"))),
                 );
                 Ok(quantized.elements)
             },
@@ -5152,9 +5265,10 @@ mod tests {
 
     #[test]
     fn test_block_dequantize_staging() {
+        // Static shapes stage one broadcast and reshape that expand the scales over their blocks.
         let (_, program) = TracingContext::<Array, ArrayOperation<Array>>::trace(
             |(elements, scales): (Tracer<_>, Tracer<_>)| {
-                BlockQuantizedValue::new(elements.clone(), scales.clone()).block_dequantize([-1], DataType::F32)
+                BlockQuantizedValue::new(elements, scales).block_dequantize([-1], DataType::F32)
             },
             (ArrayType::new_static(DataType::F4E2M1FN, [4]), ArrayType::new_static(DataType::F8E4M3FN, [2])),
         )
@@ -5185,9 +5299,7 @@ mod tests {
             |(elements, scales): (Tracer<_>, Tracer<_>)| {
                 let elements = ValueProjection::<ArrayType>::into_projected(elements)?;
                 let scales = ValueProjection::<ArrayType>::into_projected(scales)?;
-                Ok(BlockQuantizedValue::new(elements.clone(), scales.clone())
-                    .block_dequantize([-1], DataType::F32)?
-                    .into_value())
+                Ok(BlockQuantizedValue::new(elements, scales).block_dequantize([-1], DataType::F32)?.into_value())
             },
             (
                 ArrayIrType::Array(ArrayType::new_static(DataType::F4E2M1FN, [4])),
@@ -5199,85 +5311,54 @@ mod tests {
     }
 
     #[test]
-    fn test_block_dequantize_staging_rejects_dynamic_homogeneous_shapes() {
-        let extent = DimensionVariable::new("elements", DimensionBounds::new(4, Some(9)).unwrap());
-        let (_, program) = TracingContext::<Array, ArrayOperation<Array>>::trace(
-            |(elements, scales): (Tracer<_>, Tracer<_>)| {
-                assert_eq!(
-                    BlockQuantizedValue::new(elements.clone(), scales.clone()).block_dequantize([0], DataType::F32),
-                    Err(TypeError::invalid(format!(
-                        "`{BLOCK_DEQUANTIZE_NAME}` homogeneous inputs must have static shapes; use array IR values for \
-                         dynamic extents",
-                    ))
-                    .into()),
-                );
-                Ok(elements)
+    fn test_block_dequantize_dynamic_extents() {
+        // A dynamic scale extent is read at runtime, and staged assertions require it to be positive and to divide the
+        // element extent into blocks of at least two before the scales are expanded over their blocks.
+        let extent = DimensionVariable::new("scale", DimensionBounds::new(0, Some(9)).unwrap());
+        let (_, program) = TracingContext::<ArrayIrValue<Array>, ArrayIrOperation<Array>>::trace(
+            |inputs: Vec<Tracer<_>>| {
+                let output = BlockQuantizedValue::new(inputs[0].clone(), inputs[1].clone())
+                    .block_dequantize([0], DataType::BF16)?;
+                Ok(vec![output])
             },
-            (
-                ArrayType::new(DataType::F32, Shape::new(vec![Dimension::Dynamic(extent)])),
-                ArrayType::new_static(DataType::F32, [2]),
-            ),
+            vec![
+                ArrayIrType::Array(ArrayType::new_static(DataType::F32, [8])),
+                ArrayIrType::Array(ArrayType::new(DataType::F32, Shape::new(vec![Dimension::Dynamic(extent)]))),
+            ],
         )
         .unwrap();
         assert_eq!(
             program.to_string(),
-            indoc! {"
-                lambda %0:f32[elements], %1:f32[2] .
-                in (%0)
-            "}
-            .trim_end(),
-        );
-    }
-
-    #[test]
-    fn test_block_dequantize_dynamic_extents() {
-        let context = TracingContext::<ArrayIrValue<Array>, ArrayIrOperation<Array>>::new();
-        let elements = context.input(ArrayType::new_static(DataType::F32, [8]).into());
-        let extent = DimensionVariable::new("scale", DimensionBounds::new(0, Some(9)).unwrap());
-        let scales = context.input(ArrayType::new(DataType::F32, Shape::new(vec![Dimension::Dynamic(extent)])).into());
-        let output = BlockQuantizedValue::new(elements.clone(), scales.clone())
-            .block_dequantize([0], DataType::BF16)
-            .unwrap();
-        let program = context
-            .builder()
-            .borrow()
-            .clone()
-            .build::<Vec<ArrayIrValue<Array>>, Vec<ArrayIrValue<Array>>>(
-                vec![output.atom_id().unwrap()],
-                vec![Placeholder; 2],
-                vec![Placeholder],
-            )
-            .unwrap();
-        assert_eq!(
-            program.to_string(),
             indoc! {r#"
-            lambda %0:f32[8], %1:f32[scale] .
-            let %2:dimension<8> = constant [value=8]
-                %3:bf16[8] = convert_element_type [data_type=bf16] %0
-                %4:dimension<scale ∈ [0, 9)> = dimension_size [axis=0] %1
-                %5:dimension<0> = constant [value=0]
-                %6:dimension<1> = constant [value=1]
-                %7:bool[] = compare [direction=GreaterThan] %4 %5
-                () = assert [message="scale extent must be positive", labels=["scale"]] %7 %4
-                %8:dimension<max(scale, 1) ∈ [1, 9)> = dimension_max %4 %6
-                %9:dimension<8 % max(scale, 1) ∈ [0, 8)> = dimension_rem %2 %8
-                %10:bool[] = compare [direction=Equal] %9 %5
-                () = assert [
-                    message="element extent must be divisible by scale extent",
-                    labels=["elements", "scale"],
-                ] %10 %2 %4
-                %11:dimension<8 / max(scale, 1) ∈ [1, 9)> = dimension_div %2 %8
-                %12:dimension<2> = constant [value=2]
-                %13:bool[] = compare [direction=LessThanOrEqual] %12 %11
-                () = assert [message="block ratio must be at least two", labels=["ratio"]] %13 %11
-                %14:f32[scale, 8 / max(scale, 1)] = broadcast [output_axes=[0]] %1 %4 %11
-                %15:f32[8] = reshape %14 %2
-                %16:bf16[8] = convert_element_type [data_type=bf16] %15
-                %17:bf16[8] = mul %3 %16
-            in (%17)
-        "#}
+                lambda %0:f32[8], %1:f32[scale] .
+                let %2:dimension<8> = constant [value=8]
+                    %3:bf16[8] = convert_element_type [data_type=bf16] %0
+                    %4:dimension<scale ∈ [0, 9)> = dimension_size [axis=0] %1
+                    %5:dimension<0> = constant [value=0]
+                    %6:dimension<1> = constant [value=1]
+                    %7:bool[] = compare [direction=GreaterThan] %4 %5
+                    () = assert [message="scale extent must be positive", labels=["scale"]] %7 %4
+                    %8:dimension<max(scale, 1) ∈ [1, 9)> = dimension_max %4 %6
+                    %9:dimension<8 % max(scale, 1) ∈ [0, 8)> = dimension_rem %2 %8
+                    %10:bool[] = compare [direction=Equal] %9 %5
+                    () = assert [
+                        message="element extent must be divisible by scale extent",
+                        labels=["elements", "scale"],
+                    ] %10 %2 %4
+                    %11:dimension<8 / max(scale, 1) ∈ [1, 9)> = dimension_div %2 %8
+                    %12:dimension<2> = constant [value=2]
+                    %13:bool[] = compare [direction=LessThanOrEqual] %12 %11
+                    () = assert [message="block ratio must be at least two", labels=["ratio"]] %13 %11
+                    %14:f32[scale, 8 / max(scale, 1)] = broadcast [output_axes=[0]] %1 %4 %11
+                    %15:f32[8] = reshape %14 %2
+                    %16:bf16[8] = convert_element_type [data_type=bf16] %15
+                    %17:bf16[8] = mul %3 %16
+                in (%17)
+            "#}
             .trim_end(),
         );
+
+        // Partial evaluation with unknown inputs keeps every assertion.
         let evaluation = program
             .partially_evaluate(
                 &program.input_types().into_owned().into_iter().map(PartialValue::Unknown).collect::<Vec<_>>(),
@@ -5286,33 +5367,35 @@ mod tests {
         assert_eq!(
             evaluation.program().to_string(),
             indoc! {r#"
-            lambda %0:f32[8], %1:f32[scale] .
-            let %2:dimension<scale ∈ [0, 9)> = dimension_size [axis=0] %1
-                %3:dimension<0> = const 0
-                %4:bool[] = compare [direction=GreaterThan] %2 %3
-                %5:dimension<8> = const 8
-                %6:dimension<1> = const 1
-                () = assert [message="scale extent must be positive", labels=["scale"]] %4 %2
-                %7:dimension<max(scale, 1) ∈ [1, 9)> = dimension_max %2 %6
-                %8:dimension<8 % max(scale, 1) ∈ [0, 8)> = dimension_rem %5 %7
-                %9:bool[] = compare [direction=Equal] %8 %3
-                %10:dimension<2> = const 2
-                () = assert [
-                    message="element extent must be divisible by scale extent",
-                    labels=["elements", "scale"],
-                ] %9 %5 %2
-                %11:dimension<8 / max(scale, 1) ∈ [1, 9)> = dimension_div %5 %7
-                %12:bool[] = compare [direction=LessThanOrEqual] %10 %11
-                () = assert [message="block ratio must be at least two", labels=["ratio"]] %12 %11
-                %13:f32[scale, 8 / max(scale, 1)] = broadcast [output_axes=[0]] %1 %2 %11
-                %14:f32[8] = reshape %13 %5
-                %15:bf16[8] = convert_element_type [data_type=bf16] %0
-                %16:bf16[8] = convert_element_type [data_type=bf16] %14
-                %17:bf16[8] = mul %15 %16
-            in (%17)
-        "#}
+                lambda %0:f32[8], %1:f32[scale] .
+                let %2:dimension<scale ∈ [0, 9)> = dimension_size [axis=0] %1
+                    %3:dimension<0> = const 0
+                    %4:bool[] = compare [direction=GreaterThan] %2 %3
+                    %5:dimension<8> = const 8
+                    %6:dimension<1> = const 1
+                    () = assert [message="scale extent must be positive", labels=["scale"]] %4 %2
+                    %7:dimension<max(scale, 1) ∈ [1, 9)> = dimension_max %2 %6
+                    %8:dimension<8 % max(scale, 1) ∈ [0, 8)> = dimension_rem %5 %7
+                    %9:bool[] = compare [direction=Equal] %8 %3
+                    %10:dimension<2> = const 2
+                    () = assert [
+                        message="element extent must be divisible by scale extent",
+                        labels=["elements", "scale"],
+                    ] %9 %5 %2
+                    %11:dimension<8 / max(scale, 1) ∈ [1, 9)> = dimension_div %5 %7
+                    %12:bool[] = compare [direction=LessThanOrEqual] %10 %11
+                    () = assert [message="block ratio must be at least two", labels=["ratio"]] %12 %11
+                    %13:f32[scale, 8 / max(scale, 1)] = broadcast [output_axes=[0]] %1 %2 %11
+                    %14:f32[8] = reshape %13 %5
+                    %15:bf16[8] = convert_element_type [data_type=bf16] %0
+                    %16:bf16[8] = convert_element_type [data_type=bf16] %14
+                    %17:bf16[8] = mul %15 %16
+                in (%17)
+            "#}
             .trim_end(),
         );
+
+        // Both programs expand each scale over its observed block size.
         let elements = ArrayIrValue::Array(Array::vector(vec![1.0f32; 8]).unwrap());
         let scales = ArrayIrValue::Array(Array::vector(vec![1.0f32, 2.0, 3.0, 4.0]).unwrap());
         let expected = ArrayIrValue::Array(
@@ -5322,81 +5405,37 @@ mod tests {
                 .unwrap(),
         );
         assert_eq!(program.interpret(vec![elements.clone(), scales.clone()]), Ok(vec![expected.clone()]));
-        assert_eq!(
-            evaluation.interpret(
-                &EagerContext::<ArrayIrValue<Array>, ArrayIrOperation<Array>>::new(),
-                &[elements.clone(), scales],
-            ),
-            Ok(vec![expected]),
-        );
-        // Invalid scale extents fail the staged assertions both before and after partial evaluation.
+        assert_eq!(evaluation.interpret(&EagerArrayIrContext::new(), &[elements.clone(), scales]), Ok(vec![expected]));
+
+        // Empty scales, scale extents that do not divide the element extent, and block ratios of one fail the
+        // corresponding assertions, both before and after partial evaluation.
         let scales = ArrayIrValue::Array(Array::vector(Vec::<f32>::new()).unwrap());
-        let expected = AssertionError::Failed {
+        let expected = ProgramError::from(AssertionError::Failed {
             message: "scale extent must be positive".to_string(),
             observations: vec![("scale".to_string(), "0".to_string())],
-        };
-        assert_eq!(
-            program
-                .interpret(vec![elements.clone(), scales.clone()])
-                .unwrap_err()
-                .downcast_custom::<AssertionError>(),
-            Some(&expected),
-        );
-        assert_eq!(
-            evaluation
-                .interpret(
-                    &EagerContext::<ArrayIrValue<Array>, ArrayIrOperation<Array>>::new(),
-                    &[elements.clone(), scales],
-                )
-                .unwrap_err()
-                .downcast_custom::<AssertionError>(),
-            Some(&expected),
-        );
+        });
+        assert_eq!(program.interpret(vec![elements.clone(), scales.clone()]), Err(expected.clone()));
+        assert_eq!(evaluation.interpret(&EagerArrayIrContext::new(), &[elements.clone(), scales]), Err(expected));
         let scales = ArrayIrValue::Array(Array::vector(vec![1.0f32; 3]).unwrap());
-        let expected = AssertionError::Failed {
+        let expected = ProgramError::from(AssertionError::Failed {
             message: "element extent must be divisible by scale extent".to_string(),
             observations: vec![("elements".to_string(), "8".to_string()), ("scale".to_string(), "3".to_string())],
-        };
-        assert_eq!(
-            program
-                .interpret(vec![elements.clone(), scales.clone()])
-                .unwrap_err()
-                .downcast_custom::<AssertionError>(),
-            Some(&expected),
-        );
-        assert_eq!(
-            evaluation
-                .interpret(
-                    &EagerContext::<ArrayIrValue<Array>, ArrayIrOperation<Array>>::new(),
-                    &[elements.clone(), scales],
-                )
-                .unwrap_err()
-                .downcast_custom::<AssertionError>(),
-            Some(&expected),
-        );
+        });
+        assert_eq!(program.interpret(vec![elements.clone(), scales.clone()]), Err(expected.clone()));
+        assert_eq!(evaluation.interpret(&EagerArrayIrContext::new(), &[elements.clone(), scales]), Err(expected));
         let scales = ArrayIrValue::Array(Array::vector(vec![1.0f32; 8]).unwrap());
-        let expected = AssertionError::Failed {
+        let expected = ProgramError::from(AssertionError::Failed {
             message: "block ratio must be at least two".to_string(),
             observations: vec![("ratio".to_string(), "1".to_string())],
-        };
-        assert_eq!(
-            program
-                .interpret(vec![elements.clone(), scales.clone()])
-                .unwrap_err()
-                .downcast_custom::<AssertionError>(),
-            Some(&expected),
-        );
-        assert_eq!(
-            evaluation
-                .interpret(&EagerContext::<ArrayIrValue<Array>, ArrayIrOperation<Array>>::new(), &[elements, scales])
-                .unwrap_err()
-                .downcast_custom::<AssertionError>(),
-            Some(&expected),
-        );
+        });
+        assert_eq!(program.interpret(vec![elements.clone(), scales.clone()]), Err(expected.clone()));
+        assert_eq!(evaluation.interpret(&EagerArrayIrContext::new(), &[elements, scales]), Err(expected));
     }
 
     #[test]
-    fn test_block_dequantize_global_scale_dynamic_extents() {
+    fn test_block_dequantize_dynamic_extents_global_scale() {
+        // With per-element scales of a dynamic extent, the global scale is broadcast to the runtime extent of the
+        // elements, including an empty one.
         let extent = DimensionVariable::new("n", DimensionBounds::new(0, Some(9)).unwrap());
         let array_type = ArrayType::new(DataType::F32, Shape::new(vec![Dimension::Dynamic(extent)]));
         let (output_type, program) = TracingContext::<ArrayIrValue<Array>, ArrayIrOperation<Array>>::trace(
@@ -5444,36 +5483,35 @@ mod tests {
 
     #[test]
     fn test_block_dequantize_batching() {
+        // Mapped elements and scales dequantize each batch item with its own scales, for arrays and array IR values.
         let elements = Array::matrix(2, 4, vec![1.0f32, 2.0, 3.0, 4.0, 5.0, 6.0, 7.0, 8.0]).unwrap();
         let scales = Array::matrix(2, 2, vec![2.0f32, 3.0, 4.0, 5.0]).unwrap();
+        let expected = Array::matrix(2, 4, vec![2.0f32, 4.0, 9.0, 12.0, 20.0, 24.0, 35.0, 40.0]).unwrap();
         assert_eq!(
             batch(
-                |(elements, scales)| BlockQuantizedValue::new(elements.clone(), scales.clone())
-                    .block_dequantize([-1], DataType::F32),
+                |(elements, scales)| BlockQuantizedValue::new(elements, scales).block_dequantize([-1], DataType::F32),
                 (elements.clone(), scales.clone()),
                 (BatchAxis::new(0), BatchAxis::new(0)),
                 BatchAxis::new(0),
                 2,
             ),
-            Ok(Array::matrix(2, 4, vec![2.0f32, 4.0, 9.0, 12.0, 20.0, 24.0, 35.0, 40.0]).unwrap()),
+            Ok(expected.clone()),
         );
         assert_eq!(
             batch(
-                |(elements, scales)| BlockQuantizedValue::new(elements.clone(), scales.clone())
-                    .block_dequantize([-1], DataType::F32),
+                |(elements, scales)| BlockQuantizedValue::new(elements, scales).block_dequantize([-1], DataType::F32),
                 (ArrayIrValue::Array(elements), ArrayIrValue::Array(scales.clone())),
                 (BatchAxis::new(0), BatchAxis::new(0)),
                 BatchAxis::new(0),
                 None,
             ),
-            Ok(
-                ArrayIrValue::Array(Array::matrix(2, 4, vec![2.0f32, 4.0, 9.0, 12.0, 20.0, 24.0, 35.0, 40.0]).unwrap(),)
-            ),
+            Ok(ArrayIrValue::Array(expected)),
         );
+
+        // Replicated elements are shared by the mapped scales of every batch item.
         assert_eq!(
             batch(
-                |(elements, scales)| BlockQuantizedValue::new(elements.clone(), scales.clone())
-                    .block_dequantize([-1], DataType::F32),
+                |(elements, scales)| BlockQuantizedValue::new(elements, scales).block_dequantize([-1], DataType::F32),
                 (Array::vector(vec![1.0f32, 2.0, 3.0, 4.0]).unwrap(), scales),
                 (BatchAxis::replicated(), BatchAxis::new(0)),
                 BatchAxis::new(0),
@@ -5485,6 +5523,8 @@ mod tests {
 
     #[test]
     fn test_block_dequantize_differentiation() {
+        // Dequantization is bilinear, so each element receives the gradient of its block scale and each scale the sum
+        // of its block elements.
         let elements = Array::vector(vec![1.0f64, 2.0, 3.0, 4.0]).unwrap();
         let scales = Array::vector(vec![2.0f64, 3.0]).unwrap();
         assert_eq!(
@@ -5535,6 +5575,7 @@ mod tests {
 
     #[test]
     fn test_block_dequantize_differentiation_global_scale() {
+        // The global scale scales both block gradients and receives the sum of the block products.
         let quantized = BlockQuantizedValue::new(
             Array::vector(vec![1.0f64, 2.0, 3.0, 4.0]).unwrap(),
             Array::vector(vec![2.0f64, 3.0]).unwrap(),
@@ -5563,7 +5604,51 @@ mod tests {
     }
 
     #[test]
+    fn test_block_dequantize_differentiation_manual_variation() {
+        // Elements and block scales vary across devices, while the global scale is invariant. Its cotangent must sum
+        // the contributions of both devices through the transpose of the variation inserted by multiplication.
+        let mesh = LogicalMesh::new(vec![MeshAxis::new("x", 2, MeshAxisType::Manual).unwrap()]).unwrap();
+        let sharded = Sharding::new(mesh.clone(), vec![ShardingDimension::sharded(["x"])]).unwrap();
+        let quantized = BlockQuantizedValue::new(
+            ArrayIrValue::Array(Array::vector(vec![1.0f32, 2.0, 3.0, 4.0]).unwrap()),
+            ArrayIrValue::Array(Array::vector(vec![2.0f32, 3.0]).unwrap()),
+        )
+        .with_global_scale(ArrayIrValue::Array(Array::scalar(5.0f32).unwrap()));
+        let (output, pullback) = differentiate_at(quantized)
+            .vjp(|quantized| {
+                let output = shard_map(
+                    |quantized: BlockQuantizedValue<ShardMapTracer<EagerArrayIrContext>>| {
+                        quantized.block_dequantize([0], DataType::F32).unwrap()
+                    },
+                    quantized.try_map_parameters(|value| {
+                        ValueProjection::<ArrayType>::into_projected(value).map_err(ProgramError::from)
+                    })?,
+                    mesh.clone(),
+                    BlockQuantizedValue::new(sharded.clone(), sharded.clone())
+                        .with_global_scale(Sharding::replicated(mesh.clone(), 0)),
+                    sharded.clone(),
+                )?;
+                Ok::<_, ProgramError>(output.into_value())
+            })
+            .unwrap();
+        let output_type = ArrayType::new_static(DataType::F32, [4]).with_sharding(sharded).unwrap();
+        assert_eq!(
+            output,
+            ArrayIrValue::Array(Array::from_elements(output_type.clone(), &[10.0f32, 20.0, 45.0, 60.0]).unwrap()),
+        );
+        assert_eq!(
+            pullback.apply_materialized(ArrayIrValue::Array(Array::from_elements(output_type, &[1.0f32; 4]).unwrap())),
+            Ok(BlockQuantizedValue::new(
+                ArrayIrValue::Array(Array::vector(vec![10.0f32, 10.0, 15.0, 15.0]).unwrap()),
+                ArrayIrValue::Array(Array::vector(vec![15.0f32, 35.0]).unwrap()),
+            )
+            .with_global_scale(ArrayIrValue::Array(Array::scalar(27.0f32).unwrap()))),
+        );
+    }
+
+    #[test]
     fn test_block_dequantize_sharding() {
+        // Explicit placement of a non-block dimension is kept by the scale broadcast.
         let mesh = LogicalMesh::new(vec![MeshAxis::new("x", 2, MeshAxisType::Explicit).unwrap()]).unwrap();
         let element_type = ArrayType::new_static(DataType::F32, [2, 4])
             .with_sharding(
@@ -5589,6 +5674,7 @@ mod tests {
             Ok(ArrayIrValue::Array(output)),
         );
 
+        // Inside a manual region, the output keeps the variation of its varying elements and scales.
         let mesh = LogicalMesh::new(vec![MeshAxis::new("x", 2, MeshAxisType::Manual).unwrap()]).unwrap();
         let element_type = ArrayType::new_static(DataType::F32, [4])
             .with_sharding(Sharding::replicated(mesh.clone(), 1).with_varying_manual_axes(["x"]).unwrap())
@@ -5607,50 +5693,6 @@ mod tests {
             BlockQuantizedValue::new(ArrayIrValue::Array(elements), ArrayIrValue::Array(scales))
                 .block_dequantize([0], DataType::F32),
             Ok(ArrayIrValue::Array(output)),
-        );
-    }
-
-    #[test]
-    fn test_block_dequantize_global_scale_manual_variation() {
-        // Elements and block scales vary across devices, while the global scale is invariant. Its cotangent must sum
-        // the contributions of both devices through the transpose of the variation inserted by multiplication.
-        type ArrayIrContext = EagerContext<ArrayIrValue<Array>, ArrayIrOperation<Array>>;
-        let mesh = LogicalMesh::new(vec![MeshAxis::new("x", 2, MeshAxisType::Manual).unwrap()]).unwrap();
-        let sharded = Sharding::new(mesh.clone(), vec![ShardingDimension::sharded(["x"])]).unwrap();
-        let quantized = BlockQuantizedValue::new(
-            ArrayIrValue::Array(Array::vector(vec![1.0f32, 2.0, 3.0, 4.0]).unwrap()),
-            ArrayIrValue::Array(Array::vector(vec![2.0f32, 3.0]).unwrap()),
-        )
-        .with_global_scale(ArrayIrValue::Array(Array::scalar(5.0f32).unwrap()));
-        let (output, pullback) = differentiate_at(quantized)
-            .vjp(|quantized| {
-                let output = shard_map(
-                    |quantized: BlockQuantizedValue<ShardMapTracer<ArrayIrContext>>| {
-                        quantized.block_dequantize([0], DataType::F32).unwrap()
-                    },
-                    quantized.try_map_parameters(|value| {
-                        ValueProjection::<ArrayType>::into_projected(value).map_err(ProgramError::from)
-                    })?,
-                    mesh.clone(),
-                    BlockQuantizedValue::new(sharded.clone(), sharded.clone())
-                        .with_global_scale(Sharding::replicated(mesh.clone(), 0)),
-                    sharded.clone(),
-                )?;
-                Ok::<_, ProgramError>(output.into_value())
-            })
-            .unwrap();
-        let output_type = ArrayType::new_static(DataType::F32, [4]).with_sharding(sharded).unwrap();
-        assert_eq!(
-            output,
-            ArrayIrValue::Array(Array::from_elements(output_type.clone(), &[10.0f32, 20.0, 45.0, 60.0]).unwrap()),
-        );
-        assert_eq!(
-            pullback.apply_materialized(ArrayIrValue::Array(Array::from_elements(output_type, &[1.0f32; 4]).unwrap())),
-            Ok(BlockQuantizedValue::new(
-                ArrayIrValue::Array(Array::vector(vec![10.0f32, 10.0, 15.0, 15.0]).unwrap()),
-                ArrayIrValue::Array(Array::vector(vec![15.0f32, 35.0]).unwrap()),
-            )
-            .with_global_scale(ArrayIrValue::Array(Array::scalar(27.0f32).unwrap())),),
         );
     }
 
@@ -5678,7 +5720,7 @@ mod tests {
             .trim_end(),
         );
 
-        // Staging records the default dimension numbers, the default `f32` accumulation type, and the scales.
+        // Staging records the dimension numbers, the accumulation type, and the present scales as attributes.
         let (_, program) = TracingContext::<Array, ArrayOperation<Array>>::trace(
             |(lhs, rhs, lhs_scale, rhs_scale): (Tracer<_>, Tracer<_>, Tracer<_>, Tracer<_>)| {
                 bind_scaled_dot(&lhs, &rhs, Some(&lhs_scale), Some(&rhs_scale), None, None)
@@ -5709,6 +5751,8 @@ mod tests {
 
     #[test]
     fn test_scaled_dot_operation_default_dimensions() {
+        // The last left dimension contracts with the second-to-last right dimension, and all leading dimensions are
+        // batching dimensions.
         assert_eq!(ScaledDotOperation::default_dimensions(2), Ok(DotDimensionNumbers::matmul()));
         assert_eq!(
             ScaledDotOperation::default_dimensions(4),
@@ -5725,6 +5769,8 @@ mod tests {
 
     #[test]
     fn test_scaled_dot_type_inference() {
+        // Scales must have the rank of their element arrays and real element types, and their extents must divide the
+        // element extents into blocks of at least two along the contracting dimensions and match them elsewhere.
         let dimensions = DotDimensionNumbers::new(vec![2, 3], vec![1, 2], vec![0], vec![0]);
         let lhs = ArrayType::new_static(DataType::F8E4M3FN, [2, 3, 4, 6]);
         let rhs = ArrayType::new_static(DataType::F8E5M2, [2, 4, 6, 5]);
@@ -5883,6 +5929,7 @@ mod tests {
 
     #[test]
     fn test_scaled_dot_type_inference_manual_variation() {
+        // Inside a manual region, all inputs must vary over the same manual axes, and the output varies over them too.
         let mesh = LogicalMesh::new(vec![MeshAxis::new("x", 2, MeshAxisType::Manual).unwrap()]).unwrap();
         let sharding = Sharding::replicated(mesh, 2).with_varying_manual_axes(["x"]).unwrap();
         let lhs = ArrayType::new_static(DataType::F32, [2, 4]);
@@ -5933,12 +5980,7 @@ mod tests {
             Ok(Array::matrix(2, 3, vec![70.0f32, 80.0, 90.0, 158.0, 184.0, 210.0]).unwrap()),
         );
 
-        // Without an accumulation type, the contraction accumulates at and returns `f32`, while an explicit `bf16`
-        // accumulation type keeps the contraction at the dequantized input type.
-        assert_eq!(
-            bind_scaled_dot(&lhs, &rhs, Some(&lhs_scale), Some(&rhs_scale), None, None),
-            Ok(Array::matrix(2, 3, vec![253.0f32, 284.0, 315.0, 272.5, 308.0, 343.5]).unwrap()),
-        );
+        // The accumulation type is also the output type, so `bf16` accumulation returns `bf16` values.
         let product = bind_scaled_dot(&lhs, &rhs, None, None, None, Some(DataType::BF16)).unwrap();
         assert_eq!(product.r#type().into_owned(), ArrayType::new_static(DataType::BF16, [2, 3]));
         assert_eq!(product.to_f64s(), vec![70.0, 80.0, 90.0, 158.0, 184.0, 210.0]);
@@ -5988,153 +6030,12 @@ mod tests {
             false,
         )));
         assert_eq!(
-            EagerContext::<ArrayIrValue<Array>, ArrayIrOperation<Array>>::new().bind(
+            EagerArrayIrContext::new().bind(
                 operation,
                 Vec::new(),
                 &[ArrayIrValue::Array(lhs), ArrayIrValue::Array(rhs), ArrayIrValue::Array(lhs_scale)],
             ),
             Ok(vec![ArrayIrValue::Array(expected)]),
-        );
-    }
-
-    #[test]
-    fn test_scaled_dot_interpret_in_parent() {
-        // A right-only scale follows the two element arrays, and interpretation returns an array IR member.
-        let operation = ScaledDotOperation::new(DotDimensionNumbers::inner_product(), DataType::F32, false, true);
-        let context = EagerContext::<ArrayIrValue<Array>>::new();
-        let inputs = [
-            ArrayIrValue::Array(Array::vector(vec![1.0f32, 2.0, 3.0, 4.0]).unwrap()),
-            ArrayIrValue::Array(Array::vector(vec![1.0f32; 4]).unwrap()),
-            ArrayIrValue::Array(Array::vector(vec![2.0f32, 3.0]).unwrap()),
-        ];
-        assert_eq!(
-            operation.interpret_in_parent(&context, &EmptyRegionDriver, &inputs),
-            Ok(vec![ArrayIrValue::Array(Array::scalar(27.0f32).unwrap())]),
-        );
-
-        // Validate the operation boundary before reading extents or evaluating array operations.
-        assert_eq!(
-            operation.interpret_in_parent(&context, &EmptyRegionDriver, &inputs[..2]),
-            Err(ProgramError::from(TypeError::invalid(format!(
-                "`{SCALED_DOT_OPERATION_NAME}` expects 3 inputs but got 2",
-            )))),
-        );
-        assert_eq!(
-            operation.interpret_in_parent(
-                &context,
-                &EmptyRegionDriver,
-                &[inputs[0].clone(), inputs[1].clone(), inputs[1].clone()],
-            ),
-            Err(ProgramError::from(TypeError::invalid(format!(
-                "`{SCALED_DOT_OPERATION_NAME}` right contracting dimension 0 must be at least twice as large as its \
-                 scale but has ratio 1",
-            )))),
-        );
-    }
-
-    #[test]
-    fn test_scaled_dot_interpret_in_parent_dynamic_extents() {
-        // A dynamic scale extent is validated at runtime by the staged assertions.
-        let context = TracingContext::<ArrayIrValue<Array>, ArrayIrOperation<Array>>::new();
-        let lhs = context.input(ArrayType::new_static(DataType::F32, [8]).into());
-        let rhs = context.input(ArrayType::new_static(DataType::F32, [8]).into());
-        let scale_extent = DimensionVariable::new("scale", DimensionBounds::new(0, Some(5)).unwrap());
-        let lhs_scale =
-            context.input(ArrayType::new(DataType::F32, Shape::new(vec![Dimension::Dynamic(scale_extent)])).into());
-        let operation = ScaledDotOperation::new(DotDimensionNumbers::inner_product(), DataType::F32, true, false);
-        let output = operation
-            .interpret_in_parent(&context, &EmptyRegionDriver, &[lhs, rhs, lhs_scale])
-            .unwrap()
-            .remove(0);
-        let program = context
-            .builder()
-            .borrow()
-            .clone()
-            .build::<Vec<ArrayIrValue<Array>>, Vec<ArrayIrValue<Array>>>(
-                vec![output.atom_id().unwrap()],
-                vec![Placeholder, Placeholder, Placeholder],
-                vec![Placeholder],
-            )
-            .unwrap();
-        assert_eq!(
-            program.to_string(),
-            indoc! {r#"
-                lambda %0:f32[8], %1:f32[8], %2:f32[scale] .
-                let %3:dimension<8> = constant [value=8]
-                    %4:bf16[8] = convert_element_type [data_type=bf16] %0
-                    %5:dimension<scale ∈ [0, 5)> = dimension_size [axis=0] %2
-                    %6:dimension<0> = constant [value=0]
-                    %7:dimension<1> = constant [value=1]
-                    %8:bool[] = compare [direction=GreaterThan] %5 %6
-                    () = assert [message="scale extent must be positive", labels=["scale"]] %8 %5
-                    %9:dimension<max(scale, 1) ∈ [1, 5)> = dimension_max %5 %7
-                    %10:dimension<8 % max(scale, 1) ∈ [0, 4)> = dimension_rem %3 %9
-                    %11:bool[] = compare [direction=Equal] %10 %6
-                    () = assert [
-                        message="element extent must be divisible by scale extent",
-                        labels=["elements", "scale"],
-                    ] %11 %3 %5
-                    %12:dimension<8 / max(scale, 1) ∈ [2, 9)> = dimension_div %3 %9
-                    %13:dimension<2> = constant [value=2]
-                    %14:bool[] = const true
-                    %15:f32[scale, 8 / max(scale, 1)] = broadcast [output_axes=[0]] %2 %5 %12
-                    %16:f32[8] = reshape %15 %3
-                    %17:bf16[8] = convert_element_type [data_type=bf16] %16
-                    %18:bf16[8] = mul %4 %17
-                    %19:bf16[8] = convert_element_type [data_type=bf16] %1
-                    %20:f32[] = dot [
-                        dimensions=(lhs_contracting=[0], rhs_contracting=[0], lhs_batching=[], rhs_batching=[]),
-                        accumulation_type=f32,
-                    ] %18 %19
-                in (%20)
-            "#}
-            .trim_end(),
-        );
-
-        // Valid inputs dequantize with the observed block size and contract.
-        let ones = ArrayIrValue::Array(Array::vector(vec![1.0f32; 8]).unwrap());
-        assert_eq!(
-            program.interpret(vec![
-                ones.clone(),
-                ones.clone(),
-                ArrayIrValue::Array(Array::vector(vec![1.0f32, 2.0, 3.0, 4.0]).unwrap()),
-            ]),
-            Ok(vec![ArrayIrValue::Array(Array::scalar(20.0f32).unwrap())]),
-        );
-
-        // An empty scale reports the positivity assertion rather than a failed remainder or division, and a positive
-        // scale extent that does not divide the element extent reports the divisibility assertion. Partially evaluating
-        // the program with unknown inputs preserves both diagnostics.
-        let evaluation = program
-            .partially_evaluate(
-                &program.input_types().into_owned().into_iter().map(PartialValue::Unknown).collect::<Vec<_>>(),
-            )
-            .unwrap();
-        let inputs = vec![ones.clone(), ones.clone(), ArrayIrValue::Array(Array::vector(Vec::<f32>::new()).unwrap())];
-        let expected = AssertionError::Failed {
-            message: "scale extent must be positive".to_string(),
-            observations: vec![("scale".to_string(), "0".to_string())],
-        };
-        assert_eq!(program.interpret(inputs.clone()).unwrap_err().downcast_custom::<AssertionError>(), Some(&expected));
-        assert_eq!(
-            evaluation
-                .interpret(&EagerContext::<ArrayIrValue<Array>, ArrayIrOperation<Array>>::new(), &inputs)
-                .unwrap_err()
-                .downcast_custom::<AssertionError>(),
-            Some(&expected),
-        );
-        let inputs = vec![ones.clone(), ones, ArrayIrValue::Array(Array::vector(vec![1.0f32; 3]).unwrap())];
-        let expected = AssertionError::Failed {
-            message: "element extent must be divisible by scale extent".to_string(),
-            observations: vec![("elements".to_string(), "8".to_string()), ("scale".to_string(), "3".to_string())],
-        };
-        assert_eq!(program.interpret(inputs.clone()).unwrap_err().downcast_custom::<AssertionError>(), Some(&expected));
-        assert_eq!(
-            evaluation
-                .interpret(&EagerContext::<ArrayIrValue<Array>, ArrayIrOperation<Array>>::new(), &inputs)
-                .unwrap_err()
-                .downcast_custom::<AssertionError>(),
-            Some(&expected),
         );
     }
 
@@ -6227,7 +6128,8 @@ mod tests {
     }
 
     #[test]
-    fn test_scaled_dot_batching_validates_original_dimensions() {
+    fn test_scaled_dot_batching_validation() {
+        // Batching validates the original dimension numbers before shifting them past the new batching dimension.
         let input = ArrayBatch::new(Array::matrix(2, 1, vec![1.0f32, 2.0]).unwrap(), BatchAxis::new(0)).unwrap();
         let operation = ScaledDotOperation::new(
             DotDimensionNumbers::new(vec![usize::MAX], vec![0], Vec::new(), Vec::new()),
@@ -6245,10 +6147,8 @@ mod tests {
                 "`{SCALED_DOT_OPERATION_NAME}` left-hand side dimension index out of bounds",
             )))),
         );
-    }
 
-    #[test]
-    fn test_scaled_dot_batching_validates_mapped_extents() {
+        // Mapped inputs must agree on the batch size.
         let lhs = ArrayBatch::new(Array::matrix(2, 4, vec![1.0f32; 8]).unwrap(), BatchAxis::new(0)).unwrap();
         let rhs = ArrayBatch::new(Array::matrix(3, 4, vec![1.0f32; 12]).unwrap(), BatchAxis::new(0)).unwrap();
         let operation = ScaledDotOperation::new(DotDimensionNumbers::inner_product(), DataType::F32, false, false);
@@ -6276,42 +6176,131 @@ mod tests {
     }
 
     #[test]
-    fn test_scaled_dot_scaled_matmul() {
-        // Both inputs contract their last dimension, and the output defaults to `f32`.
-        let lhs = Array::from_elements::<f32>(ArrayType::new_static(DataType::F32, [1, 1, 4]), &[1.0, 2.0, 3.0, 4.0])
-            .unwrap();
-        let rhs = Array::from_elements::<f32>(ArrayType::new_static(DataType::F32, [1, 2, 4]), &[1.0; 8]).unwrap();
-        let lhs_scale =
-            Array::from_elements::<f32>(ArrayType::new_static(DataType::F32, [1, 1, 2]), &[1.0, 2.0]).unwrap();
-        let rhs_scale =
-            Array::from_elements::<f32>(ArrayType::new_static(DataType::F32, [1, 2, 2]), &[1.0, 1.0, 2.0, 2.0])
-                .unwrap();
+    fn test_scaled_dot_member_interpretation() {
+        // A right-only scale follows the two element arrays, and interpretation returns an array IR member.
+        let operation = ScaledDotOperation::new(DotDimensionNumbers::inner_product(), DataType::F32, false, true);
+        let context = EagerContext::<ArrayIrValue<Array>>::new();
+        let inputs = [
+            ArrayIrValue::Array(Array::vector(vec![1.0f32, 2.0, 3.0, 4.0]).unwrap()),
+            ArrayIrValue::Array(Array::vector(vec![1.0f32; 4]).unwrap()),
+            ArrayIrValue::Array(Array::vector(vec![2.0f32, 3.0]).unwrap()),
+        ];
         assert_eq!(
-            BlockQuantizedValue::new(lhs.clone(), lhs_scale.clone())
-                .scaled_matmul(&BlockQuantizedValue::new(rhs.clone(), rhs_scale.clone()), None),
-            Ok(Array::from_elements::<f32>(ArrayType::new_static(DataType::F32, [1, 1, 2]), &[17.0, 34.0]).unwrap()),
+            operation.interpret_in_parent(&context, &EmptyRegionDriver, &inputs),
+            Ok(vec![ArrayIrValue::Array(Array::scalar(27.0f32).unwrap())]),
         );
 
-        // Each side infers its own block size, so the right scale may use larger blocks than the left one.
-        let rhs_scale =
-            Array::from_elements::<f32>(ArrayType::new_static(DataType::F32, [1, 2, 1]), &[3.0, 1.0]).unwrap();
+        // Validate the operation boundary before reading extents or evaluating array operations.
         assert_eq!(
-            BlockQuantizedValue::new(lhs.clone(), lhs_scale.clone())
-                .scaled_matmul(&BlockQuantizedValue::new(rhs.clone(), rhs_scale.clone()), Some(DataType::F64)),
-            Ok(Array::from_elements::<f64>(ArrayType::new_static(DataType::F64, [1, 1, 2]), &[51.0, 17.0]).unwrap()),
+            operation.interpret_in_parent(&context, &EmptyRegionDriver, &inputs[..2]),
+            Err(ProgramError::from(TypeError::invalid(format!(
+                "`{SCALED_DOT_OPERATION_NAME}` expects 3 inputs but got 2",
+            )))),
         );
-
-        // Inputs of any other rank are rejected.
-        let matrix = Array::matrix(2, 2, vec![1.0f32; 4]).unwrap();
         assert_eq!(
-            BlockQuantizedValue::new(matrix.clone(), matrix.clone())
-                .scaled_matmul(&BlockQuantizedValue::new(matrix.clone(), matrix.clone()), None),
-            Err(ProgramError::from(TypeError::invalid(format!("`{SCALED_MATMUL_NAME}` expects rank-3 inputs")))),
+            operation.interpret_in_parent(
+                &context,
+                &EmptyRegionDriver,
+                &[inputs[0].clone(), inputs[1].clone(), inputs[1].clone()],
+            ),
+            Err(ProgramError::from(TypeError::invalid(format!(
+                "`{SCALED_DOT_OPERATION_NAME}` right contracting dimension 0 must be at least twice as large as its \
+                 scale but has ratio 1",
+            )))),
         );
     }
 
     #[test]
+    fn test_scaled_dot_member_interpretation_dynamic_extents() {
+        // A dynamic scale extent is read at runtime, and the staged assertions validate the block size that it
+        // implies before the scale is expanded and the dequantized values are contracted.
+        let scale_extent = DimensionVariable::new("scale", DimensionBounds::new(0, Some(5)).unwrap());
+        let operation = ScaledDotOperation::new(DotDimensionNumbers::inner_product(), DataType::F32, true, false);
+        let (_, program) = TracingContext::<ArrayIrValue<Array>, ArrayIrOperation<Array>>::trace(
+            |inputs: Vec<Tracer<_>>| operation.interpret_in_parent(&inputs[0].domain(), &EmptyRegionDriver, &inputs),
+            vec![
+                ArrayIrType::Array(ArrayType::new_static(DataType::F32, [8])),
+                ArrayIrType::Array(ArrayType::new_static(DataType::F32, [8])),
+                ArrayIrType::Array(ArrayType::new(DataType::F32, Shape::new(vec![Dimension::Dynamic(scale_extent)]))),
+            ],
+        )
+        .unwrap();
+        assert_eq!(
+            program.to_string(),
+            indoc! {r#"
+                lambda %0:f32[8], %1:f32[8], %2:f32[scale] .
+                let %3:dimension<8> = constant [value=8]
+                    %4:bf16[8] = convert_element_type [data_type=bf16] %0
+                    %5:dimension<scale ∈ [0, 5)> = dimension_size [axis=0] %2
+                    %6:dimension<0> = constant [value=0]
+                    %7:dimension<1> = constant [value=1]
+                    %8:bool[] = compare [direction=GreaterThan] %5 %6
+                    () = assert [message="scale extent must be positive", labels=["scale"]] %8 %5
+                    %9:dimension<max(scale, 1) ∈ [1, 5)> = dimension_max %5 %7
+                    %10:dimension<8 % max(scale, 1) ∈ [0, 4)> = dimension_rem %3 %9
+                    %11:bool[] = compare [direction=Equal] %10 %6
+                    () = assert [
+                        message="element extent must be divisible by scale extent",
+                        labels=["elements", "scale"],
+                    ] %11 %3 %5
+                    %12:dimension<8 / max(scale, 1) ∈ [2, 9)> = dimension_div %3 %9
+                    %13:dimension<2> = constant [value=2]
+                    %14:bool[] = const true
+                    %15:f32[scale, 8 / max(scale, 1)] = broadcast [output_axes=[0]] %2 %5 %12
+                    %16:f32[8] = reshape %15 %3
+                    %17:bf16[8] = convert_element_type [data_type=bf16] %16
+                    %18:bf16[8] = mul %4 %17
+                    %19:bf16[8] = convert_element_type [data_type=bf16] %1
+                    %20:f32[] = dot [
+                        dimensions=(lhs_contracting=[0], rhs_contracting=[0], lhs_batching=[], rhs_batching=[]),
+                        accumulation_type=f32,
+                    ] %18 %19
+                in (%20)
+            "#}
+            .trim_end(),
+        );
+
+        // Valid inputs dequantize with the observed block size and contract.
+        let ones = ArrayIrValue::Array(Array::vector(vec![1.0f32; 8]).unwrap());
+        assert_eq!(
+            program.interpret(vec![
+                ones.clone(),
+                ones.clone(),
+                ArrayIrValue::Array(Array::vector(vec![1.0f32, 2.0, 3.0, 4.0]).unwrap()),
+            ]),
+            Ok(vec![ArrayIrValue::Array(Array::scalar(20.0f32).unwrap())]),
+        );
+
+        // An empty scale reports the positivity assertion rather than a failed remainder or division, and a positive
+        // scale extent that does not divide the element extent reports the divisibility assertion. Partially evaluating
+        // the program with unknown inputs preserves both diagnostics.
+        let evaluation = program
+            .partially_evaluate(
+                &program.input_types().into_owned().into_iter().map(PartialValue::Unknown).collect::<Vec<_>>(),
+            )
+            .unwrap();
+        let scale = ArrayIrValue::Array(Array::vector(Vec::<f32>::new()).unwrap());
+        let expected = ProgramError::from(AssertionError::Failed {
+            message: "scale extent must be positive".to_string(),
+            observations: vec![("scale".to_string(), "0".to_string())],
+        });
+        assert_eq!(program.interpret(vec![ones.clone(), ones.clone(), scale.clone()]), Err(expected.clone()));
+        assert_eq!(
+            evaluation.interpret(&EagerArrayIrContext::new(), &[ones.clone(), ones.clone(), scale]),
+            Err(expected),
+        );
+        let scale = ArrayIrValue::Array(Array::vector(vec![1.0f32; 3]).unwrap());
+        let expected = ProgramError::from(AssertionError::Failed {
+            message: "element extent must be divisible by scale extent".to_string(),
+            observations: vec![("elements".to_string(), "8".to_string()), ("scale".to_string(), "3".to_string())],
+        });
+        assert_eq!(program.interpret(vec![ones.clone(), ones.clone(), scale.clone()]), Err(expected.clone()));
+        assert_eq!(evaluation.interpret(&EagerArrayIrContext::new(), &[ones.clone(), ones, scale]), Err(expected));
+    }
+
+    #[test]
     fn test_block_quantized_value_scaled_dot() {
+        // Each global scale is optional and multiplies the contraction result, which defaults to `f32`.
         let lhs = BlockQuantizedValue::new(
             Array::matrix(1, 4, vec![1.0f32, 2.0, 3.0, 4.0]).unwrap(),
             Array::matrix(1, 2, vec![1.0f32, 2.0]).unwrap(),
@@ -6391,43 +6380,35 @@ mod tests {
             Array::matrix(4, 1, vec![1.0f32; 4]).unwrap(),
             Array::matrix(2, 1, vec![1.0f32; 2]).unwrap(),
         );
-        for (lhs_global_scale, rhs_global_scale, message) in [
-            (
-                Some(Array::vector(vec![1.0f32]).unwrap()),
-                None,
-                format!(
-                    "`{SCALED_DOT_OPERATION_NAME}` left global scale must be a rank-0 real floating-point array but \
-                     got `f32[1]`",
-                ),
-            ),
-            (
-                None,
-                Some(Array::scalar(1i32).unwrap()),
-                format!(
-                    "`{SCALED_DOT_OPERATION_NAME}` right global scale must be a rank-0 real floating-point array but \
-                     got `i32[]`",
-                ),
-            ),
-        ] {
-            let lhs = BlockQuantizedValue { global_scale: lhs_global_scale, ..lhs.clone() };
-            let rhs = BlockQuantizedValue { global_scale: rhs_global_scale, ..rhs.clone() };
-            let expected = ProgramError::from(TypeError::invalid(message));
-            assert_eq!(lhs.scaled_dot(&rhs, None, None), Err(expected.clone()));
-            let lhs = lhs.map_parameters(ArrayIrValue::Array).unwrap();
-            let rhs = rhs.map_parameters(ArrayIrValue::Array).unwrap();
-            assert_eq!(lhs.scaled_dot(&rhs, None, None), Err(expected));
-        }
+        // Global scales on either side must be rank-0 real floating-point arrays, for arrays and array IR values alike.
+        let invalid_lhs = lhs.clone().with_global_scale(Array::vector(vec![1.0f32]).unwrap());
+        let expected = ProgramError::from(TypeError::invalid(format!(
+            "`{SCALED_DOT_OPERATION_NAME}` left global scale must be a rank-0 real floating-point array but got \
+             `f32[1]`",
+        )));
+        assert_eq!(invalid_lhs.scaled_dot(&rhs, None, None), Err(expected.clone()));
+        let array_ir_rhs = rhs.clone().map_parameters(ArrayIrValue::Array).unwrap();
+        let invalid_lhs = invalid_lhs.map_parameters(ArrayIrValue::Array).unwrap();
+        assert_eq!(invalid_lhs.scaled_dot(&array_ir_rhs, None, None), Err(expected));
+        let invalid_rhs = rhs.with_global_scale(Array::scalar(1i32).unwrap());
+        let expected = ProgramError::from(TypeError::invalid(format!(
+            "`{SCALED_DOT_OPERATION_NAME}` right global scale must be a rank-0 real floating-point array but got \
+             `i32[]`",
+        )));
+        assert_eq!(lhs.scaled_dot(&invalid_rhs, None, None), Err(expected.clone()));
+        let array_ir_lhs = lhs.map_parameters(ArrayIrValue::Array).unwrap();
+        let invalid_rhs = invalid_rhs.map_parameters(ArrayIrValue::Array).unwrap();
+        assert_eq!(array_ir_lhs.scaled_dot(&invalid_rhs, None, None), Err(expected));
 
         // Even with two global scales, invalid block shapes are rejected before their scalar product is staged.
         let (output_type, program) = TracingContext::<Array, ArrayOperation<Array>>::trace(
             |(lhs, rhs): (BlockQuantizedValue<Tracer<_>>, BlockQuantizedValue<Tracer<_>>)| {
                 assert_eq!(
                     lhs.scaled_dot(&rhs, None, None),
-                    Err(TypeError::invalid(format!(
+                    Err(ProgramError::from(TypeError::invalid(format!(
                         "`{SCALED_DOT_OPERATION_NAME}` right contracting dimension 0 has size 4, which is not \
                          divisible by its scale size 3",
-                    ))
-                    .into()),
+                    )))),
                 );
                 Ok(lhs.elements)
             },
@@ -6457,7 +6438,123 @@ mod tests {
     }
 
     #[test]
+    fn test_block_quantized_value_scaled_dot_dynamic_extents() {
+        // A dynamic free extent of the left input becomes a dynamic output extent, to which the global scale product
+        // is broadcast at runtime.
+        let extent = Dimension::Dynamic(DimensionVariable::new("n", DimensionBounds::new(0, Some(3)).unwrap()));
+        let input_types = (
+            BlockQuantizedValue::new(
+                ArrayIrType::Array(ArrayType::new(
+                    DataType::F32,
+                    Shape::new(vec![extent.clone(), Dimension::Static(4)]),
+                )),
+                ArrayIrType::Array(ArrayType::new(
+                    DataType::F32,
+                    Shape::new(vec![extent.clone(), Dimension::Static(2)]),
+                )),
+            )
+            .with_global_scale(ArrayIrType::Array(ArrayType::scalar(DataType::F64))),
+            BlockQuantizedValue::new(
+                ArrayIrType::Array(ArrayType::new_static(DataType::F32, [4, 1])),
+                ArrayIrType::Array(ArrayType::new_static(DataType::F32, [2, 1])),
+            )
+            .with_global_scale(ArrayIrType::Array(ArrayType::scalar(DataType::F32))),
+        );
+        let (output_type, program) = TracingContext::<ArrayIrValue<Array>, ArrayIrOperation<Array>>::trace(
+            |(lhs, rhs): (BlockQuantizedValue<Tracer<_>>, BlockQuantizedValue<Tracer<_>>)| {
+                lhs.scaled_dot(&rhs, None, None)
+            },
+            input_types.clone(),
+        )
+        .unwrap();
+        assert_eq!(
+            output_type,
+            ArrayIrType::Array(ArrayType::new(DataType::F32, Shape::new(vec![extent, Dimension::Static(1)]))),
+        );
+
+        // Global scales retain their promoted precision, and only the result's free extent is read at runtime.
+        assert_eq!(
+            program.to_string(),
+            indoc! {"
+                lambda %0:f32[n, 4], %1:f32[n, 2], %2:f64[], %3:f32[4, 1], %4:f32[2, 1], %5:f32[] .
+                let %6:f64[] = mul %2 %5
+                    %7:f32[n, 1] = scaled_dot [
+                        dimensions=(lhs_contracting=[1], rhs_contracting=[0], lhs_batching=[], rhs_batching=[]),
+                        accumulation_type=f32,
+                        lhs_scale=true,
+                        rhs_scale=true,
+                    ] %0 %3 %1 %4
+                    %8:dimension<n ∈ [0, 3)> = dimension_size [axis=0] %7
+                    %9:dimension<1> = constant [value=1]
+                    %10:f64[n, 1] = broadcast [output_axes=[]] %6 %8 %9
+                    %11:f64[n, 1] = mul %7 %10
+                    %12:f32[n, 1] = convert_element_type [data_type=f32] %11
+                in (%12)
+            "}
+            .trim_end(),
+        );
+        let lhs = BlockQuantizedValue::new(
+            ArrayIrValue::Array(Array::matrix(2, 4, vec![1.0f32, 2.0, 3.0, 4.0, 2.0, 4.0, 6.0, 8.0]).unwrap()),
+            ArrayIrValue::Array(Array::matrix(2, 2, vec![2.0f32, 3.0, 2.0, 3.0]).unwrap()),
+        )
+        .with_global_scale(ArrayIrValue::Array(Array::scalar(2.0f64).unwrap()));
+        let rhs = BlockQuantizedValue::new(
+            ArrayIrValue::Array(Array::matrix(4, 1, vec![1.0f32; 4]).unwrap()),
+            ArrayIrValue::Array(Array::matrix(2, 1, vec![4.0f32, 5.0]).unwrap()),
+        )
+        .with_global_scale(ArrayIrValue::Array(Array::scalar(3.0f32).unwrap()));
+
+        // The dequantized first row is `[2, 4, 9, 12]`, whose dot product with `[4, 4, 5, 5]` is `129`. Both global
+        // scales multiply it by six, and the second row doubles every element. Empty extents give empty outputs.
+        assert_eq!(
+            program.interpret((lhs, rhs.clone())),
+            Ok(ArrayIrValue::Array(Array::matrix(2, 1, vec![774.0f32, 1548.0]).unwrap())),
+        );
+        let lhs = BlockQuantizedValue::new(
+            ArrayIrValue::Array(Array::matrix(0, 4, Vec::<f32>::new()).unwrap()),
+            ArrayIrValue::Array(Array::matrix(0, 2, Vec::<f32>::new()).unwrap()),
+        )
+        .with_global_scale(ArrayIrValue::Array(Array::scalar(2.0f64).unwrap()));
+        assert_eq!(
+            program.interpret((lhs, rhs)),
+            Ok(ArrayIrValue::Array(Array::matrix(0, 1, Vec::<f32>::new()).unwrap())),
+        );
+
+        // A projected homogeneous call rejects the dynamic output before even multiplying its global scalars.
+        let (_, rejected_program) = TracingContext::<ArrayIrValue<Array>, ArrayIrOperation<Array>>::trace(
+            |(lhs, rhs): (BlockQuantizedValue<Tracer<_>>, BlockQuantizedValue<Tracer<_>>)| {
+                let lhs = lhs.try_map_parameters(|value| {
+                    ValueProjection::<ArrayType>::into_projected(value).map_err(ProgramError::from)
+                })?;
+                let rhs = rhs.try_map_parameters(|value| {
+                    ValueProjection::<ArrayType>::into_projected(value).map_err(ProgramError::from)
+                })?;
+                assert_eq!(
+                    lhs.scaled_dot(&rhs, None, None),
+                    Err(ProgramError::from(TypeError::invalid(format!(
+                        "`{SCALED_DOT_OPERATION_NAME}` homogeneous global scaling requires a static output shape; \
+                         use array IR values for dynamic extents",
+                    )))),
+                );
+                Ok::<_, ProgramError>(lhs.elements.into_value())
+            },
+            input_types,
+        )
+        .unwrap();
+        assert_eq!(
+            rejected_program.to_string(),
+            indoc! {"
+                lambda %0:f32[n, 4], %1:f32[n, 2], %2:f64[], %3:f32[4, 1], %4:f32[2, 1], %5:f32[] .
+                in (%0)
+            "}
+            .trim_end(),
+        );
+    }
+
+    #[test]
     fn test_block_quantized_value_scaled_dot_batching() {
+        // Mapped left elements and global scale give each batch item its own contraction and global scaling, while the
+        // left block scales and the right operand are shared.
         let lhs = BlockQuantizedValue::new(
             Array::from_elements::<f32>(
                 ArrayType::new_static(DataType::F32, [2, 1, 4]),
@@ -6492,7 +6589,7 @@ mod tests {
         assert_eq!(
             batch(
                 |(lhs, rhs)| lhs.scaled_dot(&rhs, None, None),
-                (lhs.map_parameters(ArrayIrValue::Array).unwrap(), rhs.map_parameters(ArrayIrValue::Array).unwrap(),),
+                (lhs.map_parameters(ArrayIrValue::Array).unwrap(), rhs.map_parameters(ArrayIrValue::Array).unwrap()),
                 axes,
                 BatchAxis::new(0),
                 None,
@@ -6502,119 +6599,36 @@ mod tests {
     }
 
     #[test]
-    fn test_block_quantized_value_scaled_dot_dynamic_output() {
-        let extent = Dimension::Dynamic(DimensionVariable::new("n", DimensionBounds::new(0, Some(3)).unwrap()));
-        let input_types = (
-            BlockQuantizedValue::new(
-                ArrayIrType::Array(ArrayType::new(
-                    DataType::F32,
-                    Shape::new(vec![extent.clone(), Dimension::Static(4)]),
-                )),
-                ArrayIrType::Array(ArrayType::new(
-                    DataType::F32,
-                    Shape::new(vec![extent.clone(), Dimension::Static(2)]),
-                )),
-            )
-            .with_global_scale(ArrayIrType::Array(ArrayType::scalar(DataType::F64))),
-            BlockQuantizedValue::new(
-                ArrayIrType::Array(ArrayType::new_static(DataType::F32, [4, 1])),
-                ArrayIrType::Array(ArrayType::new_static(DataType::F32, [2, 1])),
-            )
-            .with_global_scale(ArrayIrType::Array(ArrayType::scalar(DataType::F32))),
-        );
-        let (output_type, program) = TracingContext::<ArrayIrValue<Array>, ArrayIrOperation<Array>>::trace(
-            |(lhs, rhs): (BlockQuantizedValue<Tracer<_>>, BlockQuantizedValue<Tracer<_>>)| {
-                lhs.scaled_dot(&rhs, None, None)
-            },
-            input_types.clone(),
-        )
-        .unwrap();
-        assert_eq!(
-            output_type,
-            ArrayIrType::Array(ArrayType::new(DataType::F32, Shape::new(vec![extent, Dimension::Static(1)]))),
-        );
-        // Global scales retain their promoted precision, and only the result's free extent is read at runtime.
-        assert_eq!(
-            program.to_string(),
-            indoc! {"
-                lambda %0:f32[n, 4], %1:f32[n, 2], %2:f64[], %3:f32[4, 1], %4:f32[2, 1], %5:f32[] .
-                let %6:f64[] = mul %2 %5
-                    %7:f32[n, 1] = scaled_dot [
-                        dimensions=(lhs_contracting=[1], rhs_contracting=[0], lhs_batching=[], rhs_batching=[]),
-                        accumulation_type=f32,
-                        lhs_scale=true,
-                        rhs_scale=true,
-                    ] %0 %3 %1 %4
-                    %8:dimension<n ∈ [0, 3)> = dimension_size [axis=0] %7
-                    %9:dimension<1> = constant [value=1]
-                    %10:f64[n, 1] = broadcast [output_axes=[]] %6 %8 %9
-                    %11:f64[n, 1] = mul %7 %10
-                    %12:f32[n, 1] = convert_element_type [data_type=f32] %11
-                in (%12)
-            "}
-            .trim_end(),
-        );
+    fn test_block_quantized_value_scaled_dot_differentiation() {
+        // The frontend inherits the rejection of differentiation by `ScaledDotOperation`.
         let lhs = BlockQuantizedValue::new(
-            ArrayIrValue::Array(Array::matrix(2, 4, vec![1.0f32, 2.0, 3.0, 4.0, 2.0, 4.0, 6.0, 8.0]).unwrap()),
-            ArrayIrValue::Array(Array::matrix(2, 2, vec![2.0f32, 3.0, 2.0, 3.0]).unwrap()),
-        )
-        .with_global_scale(ArrayIrValue::Array(Array::scalar(2.0f64).unwrap()));
+            Array::matrix(1, 2, vec![3.0f32, 0.0]).unwrap(),
+            Array::matrix(1, 1, vec![1.0f32]).unwrap(),
+        );
         let rhs = BlockQuantizedValue::new(
-            ArrayIrValue::Array(Array::matrix(4, 1, vec![1.0f32; 4]).unwrap()),
-            ArrayIrValue::Array(Array::matrix(2, 1, vec![4.0f32, 5.0]).unwrap()),
-        )
-        .with_global_scale(ArrayIrValue::Array(Array::scalar(3.0f32).unwrap()));
-        // The dequantized first row is [2, 4, 9, 12], whose dot with [4, 4, 5, 5] is 129.
-        // Both global scales multiply it by six, and the second row doubles every element.
-        assert_eq!(
-            program.interpret((lhs, rhs.clone())),
-            Ok(ArrayIrValue::Array(Array::matrix(2, 1, vec![774.0f32, 1548.0]).unwrap())),
+            Array::matrix(2, 1, vec![1.0f32, 0.0]).unwrap(),
+            Array::matrix(1, 1, vec![1.0f32]).unwrap(),
         );
-        let lhs = BlockQuantizedValue::new(
-            ArrayIrValue::Array(Array::matrix(0, 4, Vec::<f32>::new()).unwrap()),
-            ArrayIrValue::Array(Array::matrix(0, 2, Vec::<f32>::new()).unwrap()),
-        )
-        .with_global_scale(ArrayIrValue::Array(Array::scalar(2.0f64).unwrap()));
-        assert_eq!(
-            program.interpret((lhs, rhs)),
-            Ok(ArrayIrValue::Array(Array::matrix(0, 1, Vec::<f32>::new()).unwrap())),
-        );
-
-        // A projected homogeneous call rejects the dynamic output before even multiplying its global scalars.
-        let (_, rejected_program) = TracingContext::<ArrayIrValue<Array>, ArrayIrOperation<Array>>::trace(
-            |(lhs, rhs): (BlockQuantizedValue<Tracer<_>>, BlockQuantizedValue<Tracer<_>>)| {
-                let lhs = lhs.try_map_parameters(|value| {
-                    ValueProjection::<ArrayType>::into_projected(value).map_err(ProgramError::from)
-                })?;
-                let rhs = rhs.try_map_parameters(|value| {
-                    ValueProjection::<ArrayType>::into_projected(value).map_err(ProgramError::from)
-                })?;
-                assert_eq!(
-                    lhs.scaled_dot(&rhs, None, None),
-                    Err(TypeError::invalid(format!(
-                        "`{SCALED_DOT_OPERATION_NAME}` homogeneous global scaling requires a static output shape; \
-                         use array IR values for dynamic extents",
-                    ))
-                    .into()),
-                );
-                Ok::<_, ProgramError>(lhs.elements.into_value())
-            },
-            input_types,
-        )
-        .unwrap();
-        assert_eq!(
-            rejected_program.to_string(),
-            indoc! {"
-                lambda %0:f32[n, 4], %1:f32[n, 2], %2:f64[], %3:f32[4, 1], %4:f32[2, 1], %5:f32[] .
-                in (%0)
-            "}
-            .trim_end(),
-        );
+        assert!(matches!(
+            differentiate_at((lhs.clone(), rhs.clone())).vjp(|(lhs, rhs)| lhs.scaled_dot(&rhs, None, None)),
+            Err(DifferentiationError::Program(ProgramError::UnsupportedOperation { message }))
+                if message == format!("`{SCALED_DOT_OPERATION_NAME}` does not support differentiation"),
+        ));
+        assert!(matches!(
+            differentiate_at((
+                lhs.map_parameters(ArrayIrValue::Array).unwrap(),
+                rhs.map_parameters(ArrayIrValue::Array).unwrap(),
+            ))
+            .vjp(|(lhs, rhs)| lhs.scaled_dot(&rhs, None, None)),
+            Err(DifferentiationError::Program(ProgramError::UnsupportedOperation { message }))
+                if message == format!("`{SCALED_DOT_OPERATION_NAME}` does not support differentiation"),
+        ));
     }
 
     #[test]
     fn test_block_quantized_value_scaled_dot_manual_variation() {
-        type ArrayIrContext = EagerContext<ArrayIrValue<Array>, ArrayIrOperation<Array>>;
+        // Inside a manual region whose left rows vary over `x`, each device contracts its own rows with the invariant
+        // right operand and scales them by the invariant global scales.
         let mesh = LogicalMesh::new(vec![MeshAxis::new("x", 2, MeshAxisType::Manual).unwrap()]).unwrap();
         let sharded_rows =
             Sharding::new(mesh.clone(), vec![ShardingDimension::sharded(["x"]), ShardingDimension::replicated()])
@@ -6631,8 +6645,8 @@ mod tests {
                 })?;
                 let output = shard_map(
                     |(lhs, rhs): (
-                        BlockQuantizedValue<ShardMapTracer<ArrayIrContext>>,
-                        BlockQuantizedValue<ShardMapTracer<ArrayIrContext>>,
+                        BlockQuantizedValue<ShardMapTracer<EagerArrayIrContext>>,
+                        BlockQuantizedValue<ShardMapTracer<EagerArrayIrContext>>,
                     )| lhs.scaled_dot(&rhs, None, None).unwrap(),
                     (lhs, rhs),
                     mesh.clone(),
@@ -6662,6 +6676,7 @@ mod tests {
         .unwrap();
         let expected_type = ArrayType::new_static(DataType::F32, [2, 1]).with_sharding(sharded_rows).unwrap();
         assert_eq!(output_type, ArrayIrType::Array(expected_type.clone()));
+
         // Only the left elements initially vary. The primitive aligns its other three inputs, and the final
         // multiplication separately varies the broadcast global scale instead of changing its descriptor alone.
         assert_eq!(
@@ -6730,52 +6745,45 @@ mod tests {
     }
 
     #[test]
-    fn test_block_quantized_value_scaled_dot_differentiation() {
-        let lhs = BlockQuantizedValue::new(
-            Array::matrix(1, 2, vec![3.0f32, 0.0]).unwrap(),
-            Array::matrix(1, 1, vec![1.0f32]).unwrap(),
-        );
-        let rhs = BlockQuantizedValue::new(
-            Array::matrix(2, 1, vec![1.0f32, 0.0]).unwrap(),
-            Array::matrix(1, 1, vec![1.0f32]).unwrap(),
-        );
-        assert!(matches!(
-            differentiate_at((lhs.clone(), rhs.clone())).vjp(|(lhs, rhs)| lhs.scaled_dot(&rhs, None, None)),
-            Err(DifferentiationError::Program(ProgramError::UnsupportedOperation { message }))
-                if message == format!("`{SCALED_DOT_OPERATION_NAME}` does not support differentiation"),
-        ));
-        assert!(matches!(
-            differentiate_at((
-                lhs.map_parameters(ArrayIrValue::Array).unwrap(),
-                rhs.map_parameters(ArrayIrValue::Array).unwrap(),
-            ))
-            .vjp(|(lhs, rhs)| lhs.scaled_dot(&rhs, None, None)),
-            Err(DifferentiationError::Program(ProgramError::UnsupportedOperation { message }))
-                if message == format!("`{SCALED_DOT_OPERATION_NAME}` does not support differentiation"),
-        ));
-    }
-
-    #[test]
     fn test_block_quantized_value_scaled_matmul() {
+        // Both inputs contract their last dimension and share their leading batch dimension, and the output defaults
+        // to `f32`.
         let lhs = BlockQuantizedValue::new(
             Array::from_elements::<f32>(ArrayType::new_static(DataType::F32, [1, 1, 4]), &[1.0, 2.0, 3.0, 4.0])
                 .unwrap(),
             Array::from_elements::<f32>(ArrayType::new_static(DataType::F32, [1, 1, 2]), &[1.0, 2.0]).unwrap(),
-        )
-        .with_global_scale(Array::scalar(2.0f32).unwrap());
+        );
         let rhs = BlockQuantizedValue::new(
             Array::from_elements::<f32>(ArrayType::new_static(DataType::F32, [1, 2, 4]), &[1.0; 8]).unwrap(),
             Array::from_elements::<f32>(ArrayType::new_static(DataType::F32, [1, 2, 2]), &[1.0, 1.0, 2.0, 2.0])
                 .unwrap(),
-        )
-        .with_global_scale(Array::scalar(3.0f32).unwrap());
+        );
+        assert_eq!(
+            lhs.scaled_matmul(&rhs, None),
+            Ok(Array::from_elements::<f32>(ArrayType::new_static(DataType::F32, [1, 1, 2]), &[17.0, 34.0]).unwrap()),
+        );
+
+        // Each side infers its own block size, so the right scale may use larger blocks than the left one.
+        let coarse_rhs = BlockQuantizedValue::new(
+            rhs.elements.clone(),
+            Array::from_elements::<f32>(ArrayType::new_static(DataType::F32, [1, 2, 1]), &[3.0, 1.0]).unwrap(),
+        );
+        assert_eq!(
+            lhs.scaled_matmul(&coarse_rhs, Some(DataType::F64)),
+            Ok(Array::from_elements::<f64>(ArrayType::new_static(DataType::F64, [1, 1, 2]), &[51.0, 17.0]).unwrap()),
+        );
+
+        // Global scales multiply the product, for arrays and array IR values alike.
+        let lhs = lhs.with_global_scale(Array::scalar(2.0f32).unwrap());
+        let rhs = rhs.with_global_scale(Array::scalar(3.0f32).unwrap());
         let expected =
             Array::from_elements::<f32>(ArrayType::new_static(DataType::F32, [1, 1, 2]), &[102.0, 204.0]).unwrap();
         assert_eq!(lhs.scaled_matmul(&rhs, None), Ok(expected.clone()));
-        let rich_lhs = lhs.clone().map_parameters(ArrayIrValue::Array).unwrap();
-        let rich_rhs = rhs.clone().map_parameters(ArrayIrValue::Array).unwrap();
-        assert_eq!(rich_lhs.scaled_matmul(&rich_rhs, None), Ok(ArrayIrValue::Array(expected)));
+        let array_ir_lhs = lhs.clone().map_parameters(ArrayIrValue::Array).unwrap();
+        let array_ir_rhs = rhs.clone().map_parameters(ArrayIrValue::Array).unwrap();
+        assert_eq!(array_ir_lhs.scaled_matmul(&array_ir_rhs, None), Ok(ArrayIrValue::Array(expected)));
 
+        // Element arrays of any other rank are rejected.
         let invalid = BlockQuantizedValue::new(
             Array::matrix(1, 4, vec![1.0f32; 4]).unwrap(),
             Array::matrix(1, 2, vec![1.0f32; 2]).unwrap(),
@@ -6789,11 +6797,12 @@ mod tests {
         let invalid_rhs = BlockQuantizedValue { scales: Array::matrix(2, 2, vec![1.0f32; 4]).unwrap(), ..rhs };
         assert_eq!(lhs.scaled_matmul(&invalid_rhs, None), Err(expected.clone()));
         let invalid_rhs = invalid_rhs.map_parameters(ArrayIrValue::Array).unwrap();
-        assert_eq!(rich_lhs.scaled_matmul(&invalid_rhs, None), Err(expected));
+        assert_eq!(array_ir_lhs.scaled_matmul(&invalid_rhs, None), Err(expected));
     }
 
     #[test]
     fn test_block_scale_format() {
+        // Formats expose their parameters, and their largest unclipped value combines the largest element and scale.
         let format = BlockScaleFormat::new(4, DataType::F8E5M2, DataType::F8E8M0FNU);
         assert_eq!(format.block_size(), 4);
         assert_eq!(format.element_type(), DataType::F8E5M2);
@@ -6891,12 +6900,12 @@ mod tests {
 
     #[test]
     fn test_block_scaled_dot_configuration_gradient_format() {
+        // Without an explicit gradient format, gradients use the left input format, together with its backward policy.
         let dimensions = DotDimensionNumbers::matmul();
         let (nvfp4, mxfp8, mxfp4) = (BlockScaleFormat::nvfp4(), BlockScaleFormat::mxfp8(), BlockScaleFormat::mxfp4());
         let configuration = BlockScaledDotConfiguration::new(dimensions.clone(), mxfp8).with_rhs_format(nvfp4);
         assert_eq!(configuration.gradient_format(), mxfp8);
         assert!(configuration.quantized_backward());
-
         let configuration = configuration.with_lhs_format(nvfp4);
         assert_eq!(configuration.gradient_format(), nvfp4);
         assert!(!configuration.quantized_backward());
@@ -6910,6 +6919,7 @@ mod tests {
         assert!(!overridden.quantized_backward());
         assert_eq!(overridden, configuration.with_lhs_format(mxfp8).with_gradient_format(nvfp4));
 
+        // The NVIDIA recipe sets its gradient format explicitly, so input format overrides keep NVFP4 gradients.
         let recipe = BlockScaledDotConfiguration::nvfp4_training(dimensions)
             .with_lhs_format(mxfp8)
             .with_rhs_format(mxfp4);
@@ -6933,90 +6943,6 @@ mod tests {
                 .with_hadamard_transform(true)
                 .with_tiled_rhs_scales(true),
         );
-
-        // The same random state reproduces the gradients of the recipe, while a different random state changes them.
-        let function = block_scaled_dot::<EagerArrayContext>(configuration).unwrap();
-        let values = |rows: usize, columns: usize, phase: f64| {
-            Array::from_elements::<f64>(
-                ArrayType::new_static(DataType::F64, [rows, columns]),
-                &(0..rows * columns).map(|index| (index as f64 * 0.37 + phase).sin()).collect::<Vec<_>>(),
-            )
-            .unwrap()
-            .convert_element_type(DataType::F32)
-            .unwrap()
-        };
-        let (lhs, rhs, seed) = (values(32, 32, 0.1), values(16, 32, 0.7), values(32, 16, 1.3));
-        let gradients = |state: u64| {
-            let state = Array::from_elements(RandomAlgorithm::ThreeFry.state_type(), &[state, 0u64]).unwrap();
-            let (_, pullback) = differentiate_at((lhs.clone(), rhs.clone()))
-                .with_captures(state)
-                .vjp(|(lhs, rhs), state| function.call(lhs, rhs, None, None, None, Some(state)))
-                .unwrap();
-            pullback.apply_materialized(seed.clone()).unwrap()
-        };
-        let (lhs_cotangent, rhs_cotangent) = gradients(1);
-        assert_eq!(gradients(1), (lhs_cotangent.clone(), rhs_cotangent.clone()));
-        assert_ne!(gradients(2).0, lhs_cotangent);
-
-        // The gradients equal a reference built from the public quantization capabilities. The input gradient
-        // contracts the seed, quantized along `N` with the first noise draw, with the tiled weight, which forward
-        // quantization also uses. The weight gradient contracts the Hadamard transforms of the seed and the left input,
-        // quantized along `M` with the second noise draw. Every tensor uses its current global scale.
-        let quantize = |value: &Array, axes: Vec<isize>, noise: Option<&Array>| {
-            let global_scale = value
-                .abs()
-                .unwrap()
-                .reduce(&(0..value.r#type().rank()).collect::<Vec<_>>(), ReductionKind::Max)
-                .unwrap()
-                .div(&Array::scalar(6.0f32 * 448.0).unwrap())
-                .unwrap();
-            let quantized = value
-                .block_quantize_with_options(
-                    16,
-                    DataType::F4E2M1FN,
-                    DataType::F8E4M3FN,
-                    axes.clone(),
-                    Some(&global_scale),
-                    noise,
-                )
-                .unwrap();
-            quantized.block_dequantize(axes, DataType::F32).unwrap()
-        };
-        let rank_three = |value: &Array| {
-            let dimensions = value.r#type().static_shape().unwrap().dimensions().to_vec();
-            value
-                .reshape(Shape::new(vec![
-                    Dimension::Static(1),
-                    Dimension::Static(dimensions[0]),
-                    Dimension::Static(dimensions[1]),
-                ]))
-                .unwrap()
-        };
-        let noise_type = ArrayType::new_static(DataType::F32, [1, 32, 16]);
-        let state = Array::from_elements(RandomAlgorithm::ThreeFry.state_type(), &[1u64, 0]).unwrap();
-        let (state, input_gradient_noise) = state.random_uniform(&noise_type).unwrap();
-        let (_, weight_gradient_noise) = state.random_uniform(&noise_type).unwrap();
-        let weight = quantize(&rank_three(&rhs), vec![1, 2], None);
-        let expected_lhs = quantize(&rank_three(&seed), vec![2], Some(&input_gradient_noise))
-            .dot(&weight, &DotDimensionNumbers::new(vec![2], vec![1], vec![0], vec![0]))
-            .unwrap();
-        let rules = BlockScaledDotRules::new(function.configuration(), &lhs, &rhs).unwrap();
-        let expected_rhs =
-            quantize(&rules.hadamard_transform(&rank_three(&seed), 32).unwrap(), vec![1], Some(&weight_gradient_noise))
-                .dot(
-                    &quantize(&rules.hadamard_transform(&rank_three(&lhs), 32).unwrap(), vec![1], None),
-                    &DotDimensionNumbers::new(vec![1], vec![1], vec![0], vec![0]),
-                )
-                .unwrap();
-        let close = |actual: &Array, expected: &Array| {
-            let expected = expected.to_f64s();
-            let magnitude = expected.iter().fold(0.0f64, |maximum, &value| maximum.max(f64::abs(value)));
-            for (actual, expected) in actual.to_f64s().into_iter().zip(expected) {
-                assert_abs_diff_eq!(actual, expected, epsilon = 1e-5 * magnitude);
-            }
-        };
-        close(&lhs_cotangent, &expected_lhs);
-        close(&rhs_cotangent, &expected_rhs);
     }
 
     #[test]
@@ -7081,145 +7007,12 @@ mod tests {
         );
 
         // NVFP4 contractions accumulate at the computation type even without global scales and convert to the output
-        // type afterwards, as in JAX.
+        // type afterwards, as in JAX (see `test_block_scaled_dot_staging`).
         let function = block_scaled_dot::<EagerArrayContext>(
             BlockScaledDotConfiguration::new(DotDimensionNumbers::matmul(), nvfp4)
                 .with_accumulation_type(DataType::BF16),
         )
         .unwrap();
-        let (output_type, program) = TracingContext::<Array, ArrayOperation<Array>>::trace(
-            |(lhs, rhs): (Tracer<_>, Tracer<_>)| function.call(lhs, rhs, None, None, None, None),
-            (ArrayType::new_static(DataType::F32, [2, 8]), ArrayType::new_static(DataType::F32, [8, 3])),
-        )
-        .unwrap();
-        assert_eq!(output_type, ArrayType::new_static(DataType::BF16, [2, 3]));
-        assert_eq!(
-            program.to_string(),
-            indoc! {r#"
-                lambda %0:f32[2, 8], %1:f32[8, 3] .
-                let %2:bf16[2, 3] = composite [name="block_scaled_dot"] %0 %1 [
-                    primal={
-                        lambda %0:f32[2, 8], %1:f32[8, 3] .
-                        let %2:f32[1, 2, 8] = reshape [shape=[1, 2, 8]] %0
-                            %3:f32[3, 8] = transpose [permutation=[1, 0]] %1
-                            %4:f32[1, 3, 8] = reshape [shape=[1, 3, 8]] %3
-                            %5:f32[1, 2, 2, 4] = reshape [shape=[1, 2, 2, 4]] %2
-                            %6:f32[1, 2, 2, 4] = abs %5
-                            %7:f32[1, 2, 2] = reduce [kind=max, axes=[3]] %6
-                            %8:f32[] = constant [value=6.0]
-                            %9:f32[1, 2, 2] = broadcast [output_type=f32[1, 2, 2], output_axes=[]] %8
-                            %10:f32[1, 2, 2] = div %7 %9
-                            %11:f32[] = constant [value=0.001953125]
-                            %12:f32[] = constant [value=448.0]
-                            %13:f32[1, 2, 2] = clamp %11 %10 %12
-                            %14:u32[1, 2, 2] = convert_element_type [data_type=u32, bitcast=true] %13
-                            %15:f32[] = constant [value=inf]
-                            %16:f32[1, 2, 2] = broadcast [output_type=f32[1, 2, 2], output_axes=[]] %15
-                            %17:u32[1, 2, 2] = convert_element_type [data_type=u32, bitcast=true] %16
-                            %18:u32[1, 2, 2] = and %14 %17
-                            %19:f32[1, 2, 2] = convert_element_type [data_type=f32, bitcast=true] %18
-                            %20:f32[] = constant [value=0.015625]
-                            %21:f32[1, 2, 2] = broadcast [output_type=f32[1, 2, 2], output_axes=[]] %20
-                            %22:f32[] = constant [value=inf]
-                            %23:f32[1, 2, 2] = broadcast [output_type=f32[1, 2, 2], output_axes=[]] %22
-                            %24:f32[1, 2, 2] = clamp %21 %19 %23
-                            %25:f32[] = constant [value=0.125]
-                            %26:f32[1, 2, 2] = broadcast [output_type=f32[1, 2, 2], output_axes=[]] %25
-                            %27:f32[1, 2, 2] = mul %24 %26
-                            %28:f32[1, 2, 2] = div %13 %27
-                            %29:f32[1, 2, 2] = round %28
-                            %30:f32[1, 2, 2] = mul %29 %27
-                            %31:f8e4m3fn[1, 2, 2] = convert_element_type [data_type=f8e4m3fn] %30
-                            %32:f32[1, 2, 2, 4] = broadcast [output_type=f32[1, 2, 2, 4], output_axes=[0, 1, 2]] %30
-                            %33:f32[1, 2, 8] = reshape [shape=[1, 2, 8]] %32
-                            %34:f32[1, 2, 8] = div %2 %33
-                            %35:f32[] = constant [value=-6.0]
-                            %36:f32[] = constant [value=6.0]
-                            %37:f32[1, 2, 8] = clamp %35 %34 %36
-                            %38:u32[1, 2, 8] = convert_element_type [data_type=u32, bitcast=true] %37
-                            %39:f32[] = constant [value=inf]
-                            %40:f32[1, 2, 8] = broadcast [output_type=f32[1, 2, 8], output_axes=[]] %39
-                            %41:u32[1, 2, 8] = convert_element_type [data_type=u32, bitcast=true] %40
-                            %42:u32[1, 2, 8] = and %38 %41
-                            %43:f32[1, 2, 8] = convert_element_type [data_type=f32, bitcast=true] %42
-                            %44:f32[] = constant [value=1.0]
-                            %45:f32[1, 2, 8] = broadcast [output_type=f32[1, 2, 8], output_axes=[]] %44
-                            %46:f32[] = constant [value=inf]
-                            %47:f32[1, 2, 8] = broadcast [output_type=f32[1, 2, 8], output_axes=[]] %46
-                            %48:f32[1, 2, 8] = clamp %45 %43 %47
-                            %49:f32[] = constant [value=0.5]
-                            %50:f32[1, 2, 8] = broadcast [output_type=f32[1, 2, 8], output_axes=[]] %49
-                            %51:f32[1, 2, 8] = mul %48 %50
-                            %52:f32[1, 2, 8] = div %37 %51
-                            %53:f32[1, 2, 8] = round %52
-                            %54:f32[1, 2, 8] = mul %53 %51
-                            %55:f4e2m1fn[1, 2, 8] = convert_element_type [data_type=f4e2m1fn] %54
-                            %56:f32[1, 3, 2, 4] = reshape [shape=[1, 3, 2, 4]] %4
-                            %57:f32[1, 3, 2, 4] = abs %56
-                            %58:f32[1, 3, 2] = reduce [kind=max, axes=[3]] %57
-                            %59:f32[] = constant [value=6.0]
-                            %60:f32[1, 3, 2] = broadcast [output_type=f32[1, 3, 2], output_axes=[]] %59
-                            %61:f32[1, 3, 2] = div %58 %60
-                            %62:f32[] = constant [value=0.001953125]
-                            %63:f32[] = constant [value=448.0]
-                            %64:f32[1, 3, 2] = clamp %62 %61 %63
-                            %65:u32[1, 3, 2] = convert_element_type [data_type=u32, bitcast=true] %64
-                            %66:f32[] = constant [value=inf]
-                            %67:f32[1, 3, 2] = broadcast [output_type=f32[1, 3, 2], output_axes=[]] %66
-                            %68:u32[1, 3, 2] = convert_element_type [data_type=u32, bitcast=true] %67
-                            %69:u32[1, 3, 2] = and %65 %68
-                            %70:f32[1, 3, 2] = convert_element_type [data_type=f32, bitcast=true] %69
-                            %71:f32[] = constant [value=0.015625]
-                            %72:f32[1, 3, 2] = broadcast [output_type=f32[1, 3, 2], output_axes=[]] %71
-                            %73:f32[] = constant [value=inf]
-                            %74:f32[1, 3, 2] = broadcast [output_type=f32[1, 3, 2], output_axes=[]] %73
-                            %75:f32[1, 3, 2] = clamp %72 %70 %74
-                            %76:f32[] = constant [value=0.125]
-                            %77:f32[1, 3, 2] = broadcast [output_type=f32[1, 3, 2], output_axes=[]] %76
-                            %78:f32[1, 3, 2] = mul %75 %77
-                            %79:f32[1, 3, 2] = div %64 %78
-                            %80:f32[1, 3, 2] = round %79
-                            %81:f32[1, 3, 2] = mul %80 %78
-                            %82:f8e4m3fn[1, 3, 2] = convert_element_type [data_type=f8e4m3fn] %81
-                            %83:f32[1, 3, 2, 4] = broadcast [output_type=f32[1, 3, 2, 4], output_axes=[0, 1, 2]] %81
-                            %84:f32[1, 3, 8] = reshape [shape=[1, 3, 8]] %83
-                            %85:f32[1, 3, 8] = div %4 %84
-                            %86:f32[] = constant [value=-6.0]
-                            %87:f32[] = constant [value=6.0]
-                            %88:f32[1, 3, 8] = clamp %86 %85 %87
-                            %89:u32[1, 3, 8] = convert_element_type [data_type=u32, bitcast=true] %88
-                            %90:f32[] = constant [value=inf]
-                            %91:f32[1, 3, 8] = broadcast [output_type=f32[1, 3, 8], output_axes=[]] %90
-                            %92:u32[1, 3, 8] = convert_element_type [data_type=u32, bitcast=true] %91
-                            %93:u32[1, 3, 8] = and %89 %92
-                            %94:f32[1, 3, 8] = convert_element_type [data_type=f32, bitcast=true] %93
-                            %95:f32[] = constant [value=1.0]
-                            %96:f32[1, 3, 8] = broadcast [output_type=f32[1, 3, 8], output_axes=[]] %95
-                            %97:f32[] = constant [value=inf]
-                            %98:f32[1, 3, 8] = broadcast [output_type=f32[1, 3, 8], output_axes=[]] %97
-                            %99:f32[1, 3, 8] = clamp %96 %94 %98
-                            %100:f32[] = constant [value=0.5]
-                            %101:f32[1, 3, 8] = broadcast [output_type=f32[1, 3, 8], output_axes=[]] %100
-                            %102:f32[1, 3, 8] = mul %99 %101
-                            %103:f32[1, 3, 8] = div %88 %102
-                            %104:f32[1, 3, 8] = round %103
-                            %105:f32[1, 3, 8] = mul %104 %102
-                            %106:f4e2m1fn[1, 3, 8] = convert_element_type [data_type=f4e2m1fn] %105
-                            %107:f32[1, 2, 3] = scaled_dot [
-                                dimensions=(lhs_contracting=[2], rhs_contracting=[2], lhs_batching=[0], rhs_batching=[0]),
-                                accumulation_type=f32,
-                                lhs_scale=true,
-                                rhs_scale=true,
-                            ] %55 %106 %31 %82
-                            %108:bf16[1, 2, 3] = convert_element_type [data_type=bf16] %107
-                            %109:bf16[2, 3] = reshape [shape=[2, 3]] %108
-                        in (%109)
-                    },
-                ]
-                in (%2)
-            "#}
-            .trim_end(),
-        );
         assert_eq!(
             function.call(lhs, rhs, None, None, None, None),
             Ok(expected.convert_element_type(DataType::BF16).unwrap()),
@@ -7252,24 +7045,281 @@ mod tests {
     }
 
     #[test]
-    fn test_block_scaled_dot_staging() {
+    fn test_block_scaled_dot_dimension_numbers() {
+        // Several contracting dimensions, listed in different orders on both sides, merge into one blocked dimension,
+        // and batching dimensions need not lead. Every value is `±6`, so every block scale is `1` and quantization is
+        // exact, and the gradients restore the input layouts and data types.
+        let dimensions = DotDimensionNumbers::new(vec![3, 1], vec![0, 2], vec![0], vec![1]);
         let nvfp4 = BlockScaleFormat::new(4, DataType::F4E2M1FN, DataType::F8E4M3FN);
+        let function = block_scaled_dot::<EagerArrayContext>(
+            BlockScaledDotConfiguration::new(dimensions.clone(), nvfp4).with_accumulation_type(DataType::BF16),
+        )
+        .unwrap();
+        let signs = |shape: &[usize], phase: f64| {
+            let count = shape.iter().product::<usize>();
+            Array::from_elements::<f64>(
+                ArrayType::new_static(DataType::F64, shape.to_vec()),
+                &(0..count)
+                    .map(|index| if (index as f64 * 1.7 + phase).sin() < 0.0 { -6.0 } else { 6.0 })
+                    .collect::<Vec<_>>(),
+            )
+            .unwrap()
+            .convert_element_type(DataType::BF16)
+            .unwrap()
+        };
+        let lhs = signs(&[3, 4, 2, 2], 0.3);
+        let rhs = signs(&[2, 3, 4, 5], 0.9);
+        let seed = signs(&[3, 2, 5], 1.4);
+        let (output, pullback) = differentiate_at((lhs.clone(), rhs.clone()))
+            .vjp(|(lhs, rhs)| function.call(lhs, rhs, None, None, None, None))
+            .unwrap();
+        let (expected_output, expected_pullback) =
+            differentiate_at((lhs, rhs)).vjp(|(lhs, rhs)| lhs.dot(&rhs, &dimensions)).unwrap();
+        assert_eq!(output, expected_output);
+        let (lhs_cotangent, rhs_cotangent) = pullback.apply_materialized(seed.clone()).unwrap();
+        assert_eq!(lhs_cotangent.r#type().data_type(), DataType::BF16);
+        assert_eq!((lhs_cotangent, rhs_cotangent), expected_pullback.apply_materialized(seed).unwrap());
+    }
+
+    #[test]
+    fn test_block_scaled_dot_validation() {
+        // Configurations are validated when the function is created.
+        let nvfp4 = BlockScaleFormat::new(4, DataType::F4E2M1FN, DataType::F8E4M3FN);
+        let configuration = BlockScaledDotConfiguration::new(DotDimensionNumbers::matmul(), nvfp4);
+        assert!(matches!(
+            block_scaled_dot::<EagerArrayContext>(configuration.clone().with_lhs_format(BlockScaleFormat::new(
+                4,
+                DataType::F16,
+                DataType::F8E4M3FN,
+            ))),
+            Err(error) if error == ProgramError::from(TypeError::invalid(format!(
+                "`{BLOCK_SCALED_DOT_NAME}` left format does not support element data type `f16`",
+            ))),
+        ));
+        assert!(matches!(
+            block_scaled_dot::<EagerArrayContext>(configuration.clone().with_rhs_format(BlockScaleFormat::new(
+                4,
+                DataType::F4E2M1FN,
+                DataType::F32,
+            ))),
+            Err(error) if error == ProgramError::from(TypeError::invalid(format!(
+                "`{BLOCK_SCALED_DOT_NAME}` right format does not support scale data type `f32`",
+            ))),
+        ));
+        assert!(matches!(
+            block_scaled_dot::<EagerArrayContext>(configuration.clone().with_gradient_format(BlockScaleFormat::new(
+                1,
+                DataType::F4E2M1FN,
+                DataType::F8E4M3FN,
+            ))),
+            Err(error) if error == ProgramError::from(TypeError::invalid(format!(
+                "`{BLOCK_SCALED_DOT_NAME}` gradient format block size must be at least 2 but got 1",
+            ))),
+        ));
+        assert!(matches!(
+            block_scaled_dot::<EagerArrayContext>(configuration.clone().with_accumulation_type(DataType::I32)),
+            Err(error) if error == ProgramError::from(TypeError::invalid(format!(
+                "`{BLOCK_SCALED_DOT_NAME}` accumulation type must be one of `bf16`, `f16`, `f32`, and `f64` but \
+                 got `i32`",
+            ))),
+        ));
+        assert!(matches!(
+            block_scaled_dot::<EagerArrayContext>(configuration.clone().with_tiled_rhs_scales(true)),
+            Err(error) if error == ProgramError::from(TypeError::invalid(format!(
+                "`{BLOCK_SCALED_DOT_NAME}` stochastic gradient rounding, Hadamard transforms, and tiled right scales \
+                 require quantized backward contractions",
+            ))),
+        ));
+        assert!(matches!(
+            block_scaled_dot::<EagerArrayContext>(
+                configuration.clone().with_quantized_backward(true).with_hadamard_transform(true),
+            ),
+            Err(error) if error == ProgramError::from(TypeError::invalid(format!(
+                "`{BLOCK_SCALED_DOT_NAME}` Hadamard transforms of formats with global scales require current global \
+                 scaling",
+            ))),
+        ));
+
+        // Calls validate the contracting extent, global scales, random states, and input types.
+        let function = block_scaled_dot::<EagerArrayContext>(configuration).unwrap();
+        let lhs = cyclic_matrix(2, 8, &[1.0]);
+        let rhs = cyclic_matrix(8, 3, &[1.0]);
+        assert_eq!(
+            function.call(cyclic_matrix(2, 6, &[1.0]), cyclic_matrix(6, 3, &[1.0]), None, None, None, None),
+            Err(ProgramError::from(TypeError::invalid(format!(
+                "`{BLOCK_SCALED_DOT_NAME}` contracting extent 6 is not a positive multiple of block size 4",
+            )))),
+        );
+        assert_eq!(
+            function.call(lhs.clone(), rhs.clone(), Some(Array::vector(vec![1.0f32]).unwrap()), None, None, None),
+            Err(ProgramError::from(TypeError::invalid(format!(
+                "`{BLOCK_SCALED_DOT_NAME}` left global scale must be a rank-0 real floating-point array but \
+                 got `f32[1]`",
+            )))),
+        );
+        assert_eq!(
+            function.call(
+                lhs.clone(),
+                rhs.clone(),
+                None,
+                None,
+                None,
+                Some(Array::from_elements(RandomAlgorithm::ThreeFry.state_type(), &[1u64, 0]).unwrap()),
+            ),
+            Err(ProgramError::from(TypeError::invalid(format!(
+                "`{BLOCK_SCALED_DOT_NAME}` random generator states require stochastic gradient rounding",
+            )))),
+        );
+        assert_eq!(
+            function.call(Array::matrix(2, 8, vec![1i32; 16]).unwrap(), rhs.clone(), None, None, None, None),
+            Err(ProgramError::from(TypeError::invalid(format!(
+                "`{BLOCK_SCALED_DOT_NAME}` left input must have a real floating-point element type but got `i32`",
+            )))),
+        );
+        let current = block_scaled_dot::<EagerArrayContext>(
+            BlockScaledDotConfiguration::new(DotDimensionNumbers::matmul(), nvfp4)
+                .with_global_scaling(BlockScaledGlobalScaling::Current),
+        )
+        .unwrap();
+        assert_eq!(
+            current.call(lhs.clone(), rhs.clone(), None, Some(Array::scalar(1.0f32).unwrap()), None, None),
+            Err(ProgramError::from(TypeError::invalid(format!(
+                "`{BLOCK_SCALED_DOT_NAME}` right global scale requires provided global scaling and a format with \
+                 `f8e4m3fn` scales",
+            )))),
+        );
+
+        // Gradient global scales require quantized backward contractions, and random states must have a generator
+        // state type.
+        assert_eq!(
+            function.call(lhs.clone(), rhs.clone(), None, None, Some(Array::scalar(1.0f32).unwrap()), None),
+            Err(ProgramError::from(TypeError::invalid(format!(
+                "`{BLOCK_SCALED_DOT_NAME}` gradient global scales require quantized backward contractions",
+            )))),
+        );
+        let rounding = block_scaled_dot::<EagerArrayContext>(
+            BlockScaledDotConfiguration::new(DotDimensionNumbers::matmul(), nvfp4)
+                .with_quantized_backward(true)
+                .with_stochastic_gradient_rounding(true),
+        )
+        .unwrap();
+        assert_eq!(
+            rounding.call(lhs.clone(), rhs.clone(), None, None, None, Some(Array::vector(vec![1u32, 0]).unwrap())),
+            Err(ProgramError::from(TypeError::invalid(
+                "random generator states must have type `u64[2]` (i.e., for `three_fry`) or `u64[3]` (i.e., for \
+                 `philox`) but got `u32[2]`",
+            ))),
+        );
+
+        // Extents that only backward contractions block are validated when differentiating.
+        let mxfp8 = BlockScaleFormat::new(4, DataType::F8E4M3FN, DataType::F8E8M0FNU);
         let function = block_scaled_dot::<EagerArrayContext>(BlockScaledDotConfiguration::new(
             DotDimensionNumbers::matmul(),
-            nvfp4,
+            mxfp8,
         ))
+        .unwrap();
+        assert_eq!(
+            function.call(lhs.clone(), rhs.clone(), None, None, None, None),
+            Ok(Array::matrix(2, 3, vec![8.0f32; 6]).unwrap()),
+        );
+        let (_, pullback) = differentiate_at((lhs, rhs))
+            .vjp(|(lhs, rhs)| function.call(lhs, rhs, None, None, None, None))
+            .unwrap();
+        assert_eq!(
+            pullback.apply_materialized(cyclic_matrix(2, 3, &[1.0])),
+            Err(ProgramError::from(TypeError::invalid(format!(
+                "`{BLOCK_SCALED_DOT_NAME}` right free extent 3 is not a positive multiple of block size 4",
+            )))),
+        );
+    }
+
+    #[test]
+    fn test_block_scaled_dot_validation_gradient_format() {
+        // Validation uses the gradient format that the configuration resolves to, including an inherited one.
+        let nvfp4 = BlockScaleFormat::new(4, DataType::F4E2M1FN, DataType::F8E4M3FN);
+        let mxfp8 = BlockScaleFormat::new(2, DataType::F8E4M3FN, DataType::F8E8M0FNU);
+        let configuration =
+            BlockScaledDotConfiguration::new(DotDimensionNumbers::matmul(), nvfp4).with_lhs_format(mxfp8);
+
+        // Neither Hadamard input uses a global scale after the left format changes to MXFP8.
+        assert_eq!(
+            block_scaled_dot::<EagerArrayContext>(configuration.clone().with_hadamard_transform(true))
+                .map(|function| function.configuration().gradient_format()),
+            Ok(mxfp8),
+        );
+        let function = block_scaled_dot::<EagerArrayContext>(configuration).unwrap();
+        assert_eq!(
+            function.call(
+                cyclic_matrix(2, 4, &[6.0]),
+                cyclic_matrix(4, 4, &[1.0]),
+                None,
+                None,
+                Some(Array::scalar(1.0f32).unwrap()),
+                None,
+            ),
+            Err(ProgramError::from(TypeError::invalid(format!(
+                "`{BLOCK_SCALED_DOT_NAME}` gradient global scale requires provided global scaling and a format with \
+                 `f8e4m3fn` scales",
+            )))),
+        );
+
+        // An inherited NVFP4 gradient format accepts a provided gradient global scale.
+        let function = block_scaled_dot::<EagerArrayContext>(
+            BlockScaledDotConfiguration::new(DotDimensionNumbers::matmul(), mxfp8)
+                .with_lhs_format(nvfp4)
+                .with_quantized_backward(true),
+        )
+        .unwrap();
+        assert_eq!(
+            function.call(
+                cyclic_matrix(2, 4, &[6.0]),
+                cyclic_matrix(4, 4, &[1.0]),
+                None,
+                None,
+                Some(Array::scalar(1.0f32).unwrap()),
+                None,
+            ),
+            Ok(cyclic_matrix(2, 4, &[24.0])),
+        );
+
+        // The inherited block size applies to the output cotangent's right free extent during differentiation.
+        let function = block_scaled_dot::<EagerArrayContext>(
+            BlockScaledDotConfiguration::new(DotDimensionNumbers::matmul(), mxfp8)
+                .with_lhs_format(BlockScaleFormat::new(4, DataType::F8E4M3FN, DataType::F8E8M0FNU)),
+        )
+        .unwrap();
+        let (_, pullback) = differentiate_at((cyclic_matrix(4, 4, &[1.0]), cyclic_matrix(4, 2, &[1.0])))
+            .vjp(|(lhs, rhs)| function.call(lhs, rhs, None, None, None, None))
+            .unwrap();
+        assert_eq!(
+            pullback.apply_materialized(cyclic_matrix(4, 2, &[1.0])),
+            Err(ProgramError::from(TypeError::invalid(format!(
+                "`{BLOCK_SCALED_DOT_NAME}` right free extent 2 is not a positive multiple of block size 4",
+            )))),
+        );
+    }
+
+    #[test]
+    fn test_block_scaled_dot_staging() {
+        // The primal converts the inputs to `f32`, normalizes them to `[batch, free, contracting]` layouts, quantizes
+        // both, and contracts them at `f32` before converting the result to the `bf16` accumulation type.
+        let nvfp4 = BlockScaleFormat::new(4, DataType::F4E2M1FN, DataType::F8E4M3FN);
+        let function = block_scaled_dot::<EagerArrayContext>(
+            BlockScaledDotConfiguration::new(DotDimensionNumbers::matmul(), nvfp4)
+                .with_accumulation_type(DataType::BF16),
+        )
         .unwrap();
         let (output_type, program) = DomainTracingContext::<EagerArrayContext>::trace(
             |(lhs, rhs)| function.call(lhs, rhs, None, None, None, None),
             (ArrayType::new_static(DataType::BF16, [2, 8]), ArrayType::new_static(DataType::BF16, [8, 4])),
         )
         .unwrap();
-        assert_eq!(output_type, ArrayType::new_static(DataType::F32, [2, 4]));
+        assert_eq!(output_type, ArrayType::new_static(DataType::BF16, [2, 4]));
         assert_eq!(
             program.to_string(),
             indoc! {r#"
                 lambda %0:bf16[2, 8], %1:bf16[8, 4] .
-                let %2:f32[2, 4] = composite [name="block_scaled_dot"] %0 %1 [
+                let %2:bf16[2, 4] = composite [name="block_scaled_dot"] %0 %1 [
                     primal={
                         lambda %0:bf16[2, 8], %1:bf16[8, 4] .
                         let %2:f32[2, 8] = convert_element_type [data_type=f32] %0
@@ -7385,8 +7435,9 @@ mod tests {
                                 lhs_scale=true,
                                 rhs_scale=true,
                             ] %57 %108 %33 %84
-                            %110:f32[2, 4] = reshape [shape=[2, 4]] %109
-                        in (%110)
+                            %110:bf16[1, 2, 4] = convert_element_type [data_type=bf16] %109
+                            %111:bf16[2, 4] = reshape [shape=[2, 4]] %110
+                        in (%111)
                     },
                 ]
                 in (%2)
@@ -7396,7 +7447,35 @@ mod tests {
     }
 
     #[test]
-    fn test_block_scaled_dot_full_precision_differentiation() {
+    fn test_block_scaled_dot_batching() {
+        // Batching a mapped left input against a replicated right input calls the function once per batch item.
+        let nvfp4 = BlockScaleFormat::new(4, DataType::F4E2M1FN, DataType::F8E4M3FN);
+        let function = block_scaled_dot::<EagerArrayContext>(BlockScaledDotConfiguration::new(
+            DotDimensionNumbers::matmul(),
+            nvfp4,
+        ))
+        .unwrap();
+        let lhs = cyclic_matrix(2, 8, &[6.0, 1.0, 0.5, 2.0, 3.0, 4.0, 1.5]);
+        let rhs = cyclic_matrix(8, 3, &[1.0, 6.0, 2.0, 0.5, 3.0]);
+        let expected = function.call(lhs.clone(), rhs.clone(), None, None, None, None).unwrap();
+        let stacked = |value: &Array| {
+            let r#type = value.r#type().into_owned().with_inserted_dimension(0, Dimension::Static(2)).unwrap();
+            value.broadcast(r#type, &[1, 2]).unwrap()
+        };
+        assert_eq!(
+            batch(
+                |(lhs, rhs)| function.call(lhs, rhs, None, None, None, None),
+                (stacked(&lhs), rhs),
+                (BatchAxis::new(0), BatchAxis::replicated()),
+                BatchAxis::new(0),
+                2,
+            ),
+            Ok(stacked(&expected)),
+        );
+    }
+
+    #[test]
+    fn test_block_scaled_dot_differentiation_full_precision() {
         // NVFP4 gradients default to unquantized backward contractions, which equal the gradients of the plain dot
         // product, except that values that the forward quantization clipped receive zero gradients.
         let nvfp4 = BlockScaleFormat::new(4, DataType::F4E2M1FN, DataType::F8E4M3FN);
@@ -7438,7 +7517,7 @@ mod tests {
     }
 
     #[test]
-    fn test_block_scaled_dot_gradient_format_full_precision_differentiation() {
+    fn test_block_scaled_dot_differentiation_full_precision_gradient_format() {
         // Changing the left format to NVFP4 also selects its unquantized backward policy and clipping mask.
         let mxfp8 = BlockScaleFormat::new(2, DataType::F8E4M3FN, DataType::F8E8M0FNU);
         let nvfp4 = BlockScaleFormat::new(4, DataType::F4E2M1FN, DataType::F8E4M3FN);
@@ -7462,70 +7541,7 @@ mod tests {
     }
 
     #[test]
-    fn test_block_scaled_dot_gradient_format_quantized_differentiation() {
-        // The inherited MXFP8 gradient format uses blocks of two, including along the left free extent of two.
-        let nvfp4 = BlockScaleFormat::new(4, DataType::F4E2M1FN, DataType::F8E4M3FN);
-        let mxfp8 = BlockScaleFormat::new(2, DataType::F8E4M3FN, DataType::F8E8M0FNU);
-        let configuration =
-            BlockScaledDotConfiguration::new(DotDimensionNumbers::matmul(), nvfp4).with_lhs_format(mxfp8);
-        assert!(configuration.quantized_backward());
-        let function = block_scaled_dot::<EagerArrayContext>(configuration).unwrap();
-        let lhs = cyclic_matrix(2, 4, &[1.0]);
-        let rhs = Array::matrix(
-            4,
-            4,
-            vec![6.0f32, 0.0, 0.0, 0.0, 0.0, 6.0, 0.0, 0.0, 0.0, 0.0, 6.0, 0.0, 0.0, 0.0, 0.0, 6.0],
-        )
-        .unwrap();
-        let (output, pullback) = differentiate_at((lhs, rhs))
-            .vjp(|(lhs, rhs)| function.call(lhs, rhs, None, None, None, None))
-            .unwrap();
-        assert_eq!(output, cyclic_matrix(2, 4, &[6.0]));
-        assert_eq!(
-            pullback.apply_materialized(cyclic_matrix(2, 4, &[1.0])),
-            Ok((cyclic_matrix(2, 4, &[6.0]), cyclic_matrix(4, 4, &[2.0]))),
-        );
-    }
-
-    #[test]
-    fn test_block_scaled_dot_dimension_numbers() {
-        // Several contracting dimensions, listed in different orders on both sides, merge into one blocked dimension,
-        // and batching dimensions need not lead. Every value is `±6`, so every block scale is `1` and quantization is
-        // exact, and the gradients restore the input layouts and data types.
-        let dimensions = DotDimensionNumbers::new(vec![3, 1], vec![0, 2], vec![0], vec![1]);
-        let nvfp4 = BlockScaleFormat::new(4, DataType::F4E2M1FN, DataType::F8E4M3FN);
-        let function = block_scaled_dot::<EagerArrayContext>(
-            BlockScaledDotConfiguration::new(dimensions.clone(), nvfp4).with_accumulation_type(DataType::BF16),
-        )
-        .unwrap();
-        let signs = |shape: &[usize], phase: f64| {
-            let count = shape.iter().product::<usize>();
-            Array::from_elements::<f64>(
-                ArrayType::new_static(DataType::F64, shape.to_vec()),
-                &(0..count)
-                    .map(|index| if (index as f64 * 1.7 + phase).sin() < 0.0 { -6.0 } else { 6.0 })
-                    .collect::<Vec<_>>(),
-            )
-            .unwrap()
-            .convert_element_type(DataType::BF16)
-            .unwrap()
-        };
-        let lhs = signs(&[3, 4, 2, 2], 0.3);
-        let rhs = signs(&[2, 3, 4, 5], 0.9);
-        let seed = signs(&[3, 2, 5], 1.4);
-        let (output, pullback) = differentiate_at((lhs.clone(), rhs.clone()))
-            .vjp(|(lhs, rhs)| function.call(lhs, rhs, None, None, None, None))
-            .unwrap();
-        let (expected_output, expected_pullback) =
-            differentiate_at((lhs, rhs)).vjp(|(lhs, rhs)| lhs.dot(&rhs, &dimensions)).unwrap();
-        assert_eq!(output, expected_output);
-        let (lhs_cotangent, rhs_cotangent) = pullback.apply_materialized(seed.clone()).unwrap();
-        assert_eq!(lhs_cotangent.r#type().data_type(), DataType::BF16);
-        assert_eq!((lhs_cotangent, rhs_cotangent), expected_pullback.apply_materialized(seed).unwrap());
-    }
-
-    #[test]
-    fn test_block_scaled_dot_quantized_differentiation() {
+    fn test_block_scaled_dot_differentiation_quantized() {
         // MX gradients default to quantized backward contractions. Every value below is exactly representable after
         // power of two scaling, so the quantized gradients equal the gradients of the plain dot product.
         let mxfp8 = BlockScaleFormat::new(4, DataType::F8E4M3FN, DataType::F8E8M0FNU);
@@ -7560,7 +7576,33 @@ mod tests {
     }
 
     #[test]
-    fn test_block_scaled_dot_quantized_differentiation_optional_inputs() {
+    fn test_block_scaled_dot_differentiation_quantized_gradient_format() {
+        // The inherited MXFP8 gradient format uses blocks of two, including along the left free extent of two.
+        let nvfp4 = BlockScaleFormat::new(4, DataType::F4E2M1FN, DataType::F8E4M3FN);
+        let mxfp8 = BlockScaleFormat::new(2, DataType::F8E4M3FN, DataType::F8E8M0FNU);
+        let configuration =
+            BlockScaledDotConfiguration::new(DotDimensionNumbers::matmul(), nvfp4).with_lhs_format(mxfp8);
+        assert!(configuration.quantized_backward());
+        let function = block_scaled_dot::<EagerArrayContext>(configuration).unwrap();
+        let lhs = cyclic_matrix(2, 4, &[1.0]);
+        let rhs = Array::matrix(
+            4,
+            4,
+            vec![6.0f32, 0.0, 0.0, 0.0, 0.0, 6.0, 0.0, 0.0, 0.0, 0.0, 6.0, 0.0, 0.0, 0.0, 0.0, 6.0],
+        )
+        .unwrap();
+        let (output, pullback) = differentiate_at((lhs, rhs))
+            .vjp(|(lhs, rhs)| function.call(lhs, rhs, None, None, None, None))
+            .unwrap();
+        assert_eq!(output, cyclic_matrix(2, 4, &[6.0]));
+        assert_eq!(
+            pullback.apply_materialized(cyclic_matrix(2, 4, &[1.0])),
+            Ok((cyclic_matrix(2, 4, &[6.0]), cyclic_matrix(4, 4, &[2.0]))),
+        );
+    }
+
+    #[test]
+    fn test_block_scaled_dot_differentiation_quantized_optional_inputs() {
         // Distinct provided scales exercise all optional positions. Every normalized value and seed is exactly `6`,
         // so quantization is exact and the live cotangents equal the unquantized dot product's cotangents.
         let nvfp4 = BlockScaleFormat::new(4, DataType::F4E2M1FN, DataType::F8E4M3FN);
@@ -7605,20 +7647,109 @@ mod tests {
     }
 
     #[test]
+    fn test_block_scaled_dot_differentiation_nvfp4_training() {
+        // The same random state reproduces the gradients of the recipe, while a different random state changes them.
+        let dimensions = DotDimensionNumbers::new(vec![1], vec![1], Vec::new(), Vec::new());
+        let function =
+            block_scaled_dot::<EagerArrayContext>(BlockScaledDotConfiguration::nvfp4_training(dimensions)).unwrap();
+        let values = |rows: usize, columns: usize, phase: f64| {
+            Array::from_elements::<f64>(
+                ArrayType::new_static(DataType::F64, [rows, columns]),
+                &(0..rows * columns).map(|index| (index as f64 * 0.37 + phase).sin()).collect::<Vec<_>>(),
+            )
+            .unwrap()
+            .convert_element_type(DataType::F32)
+            .unwrap()
+        };
+        let (lhs, rhs, seed) = (values(32, 32, 0.1), values(16, 32, 0.7), values(32, 16, 1.3));
+        let gradients = |state: u64| {
+            let state = Array::from_elements(RandomAlgorithm::ThreeFry.state_type(), &[state, 0u64]).unwrap();
+            let (_, pullback) = differentiate_at((lhs.clone(), rhs.clone()))
+                .with_captures(state)
+                .vjp(|(lhs, rhs), state| function.call(lhs, rhs, None, None, None, Some(state)))
+                .unwrap();
+            pullback.apply_materialized(seed.clone()).unwrap()
+        };
+        let (lhs_cotangent, rhs_cotangent) = gradients(1);
+        assert_eq!(gradients(1), (lhs_cotangent.clone(), rhs_cotangent.clone()));
+        assert_ne!(gradients(2).0, lhs_cotangent);
+
+        // The gradients equal a reference built from the public quantization capabilities. The input gradient
+        // contracts the seed, quantized along `N` with the first noise draw, with the tiled weight, which forward
+        // quantization also uses. The weight gradient contracts the Hadamard transforms of the seed and the left input,
+        // quantized along `M` with the second noise draw. Every tensor uses its current global scale.
+        let quantize = |value: &Array, axes: Vec<isize>, noise: Option<&Array>| {
+            let global_scale = value
+                .abs()
+                .unwrap()
+                .reduce(&(0..value.r#type().rank()).collect::<Vec<_>>(), ReductionKind::Max)
+                .unwrap()
+                .div(&Array::scalar(6.0f32 * 448.0).unwrap())
+                .unwrap();
+            let quantized = value
+                .block_quantize_with_options(
+                    16,
+                    DataType::F4E2M1FN,
+                    DataType::F8E4M3FN,
+                    axes.clone(),
+                    Some(&global_scale),
+                    noise,
+                )
+                .unwrap();
+            quantized.block_dequantize(axes, DataType::F32).unwrap()
+        };
+        let rank_three = |value: &Array| {
+            let dimensions = value.r#type().static_shape().unwrap().dimensions().to_vec();
+            value
+                .reshape(Shape::new(vec![
+                    Dimension::Static(1),
+                    Dimension::Static(dimensions[0]),
+                    Dimension::Static(dimensions[1]),
+                ]))
+                .unwrap()
+        };
+        let noise_type = ArrayType::new_static(DataType::F32, [1, 32, 16]);
+        let state = Array::from_elements(RandomAlgorithm::ThreeFry.state_type(), &[1u64, 0]).unwrap();
+        let (state, input_gradient_noise) = state.random_uniform(&noise_type).unwrap();
+        let (_, weight_gradient_noise) = state.random_uniform(&noise_type).unwrap();
+        let weight = quantize(&rank_three(&rhs), vec![1, 2], None);
+        let expected_lhs = quantize(&rank_three(&seed), vec![2], Some(&input_gradient_noise))
+            .dot(&weight, &DotDimensionNumbers::new(vec![2], vec![1], vec![0], vec![0]))
+            .unwrap();
+        let rules = BlockScaledDotRules::new(function.configuration(), &lhs, &rhs).unwrap();
+        let expected_rhs =
+            quantize(&rules.hadamard_transform(&rank_three(&seed), 32).unwrap(), vec![1], Some(&weight_gradient_noise))
+                .dot(
+                    &quantize(&rules.hadamard_transform(&rank_three(&lhs), 32).unwrap(), vec![1], None),
+                    &DotDimensionNumbers::new(vec![1], vec![1], vec![0], vec![0]),
+                )
+                .unwrap();
+
+        // The contractions accumulate in different orders, so the gradients agree within a tolerance relative to the
+        // largest magnitude of each reference.
+        let expected_lhs = expected_lhs.reshape(lhs.r#type().shape().clone()).unwrap();
+        let expected_rhs = expected_rhs.reshape(rhs.r#type().shape().clone()).unwrap();
+        let magnitude =
+            |value: &Array| value.to_f64s().into_iter().fold(0.0f64, |maximum, value| maximum.max(value.abs()));
+        assert_abs_diff_eq!(lhs_cotangent, expected_lhs, epsilon = 1e-5 * magnitude(&expected_lhs));
+        assert_abs_diff_eq!(rhs_cotangent, expected_rhs, epsilon = 1e-5 * magnitude(&expected_rhs));
+    }
+
+    #[test]
     fn test_block_scaled_dot_manual_variation() {
         // The NVIDIA recipe combines values that its rules create (e.g., the Hadamard signs and butterflies, the bounds
         // of current global scales, and the stochastic rounding noise drawn from an invariant random state) with the
         // varying left input and output cotangent. Inside a manual region whose rows are sharded over `x`, every device
         // therefore computes the forward and backward rules of its own shard, so the outputs and the left gradient
         // concatenate the results of the two shards, and the gradient of the invariant right input sums them.
-        type ArrayIrContext = EagerContext<ArrayIrValue<Array>, ArrayIrOperation<Array>>;
         let configuration = BlockScaledDotConfiguration::nvfp4_training(DotDimensionNumbers::new(
             vec![1],
             vec![1],
             Vec::new(),
             Vec::new(),
         ));
-        let function = block_scaled_dot::<ProjectedContext<ArrayIrContext, ArrayType>>(configuration.clone()).unwrap();
+        let function =
+            block_scaled_dot::<ProjectedContext<EagerArrayIrContext, ArrayType>>(configuration.clone()).unwrap();
         let reference = block_scaled_dot::<EagerArrayContext>(configuration).unwrap();
         let mesh = LogicalMesh::new(vec![MeshAxis::new("x", 2, MeshAxisType::Manual).unwrap()]).unwrap();
         let sharded_rows =
@@ -7637,10 +7768,10 @@ mod tests {
         .vjp(|(lhs, rhs), state| {
             let output = shard_map(
                 |(lhs, rhs, state): (
-                    ShardMapTracer<ArrayIrContext>,
-                    ShardMapTracer<ArrayIrContext>,
-                    ShardMapTracer<ArrayIrContext>,
-                )| { function.call(lhs, rhs, None, None, None, Some(state)).unwrap() },
+                    ShardMapTracer<EagerArrayIrContext>,
+                    ShardMapTracer<EagerArrayIrContext>,
+                    ShardMapTracer<EagerArrayIrContext>,
+                )| function.call(lhs, rhs, None, None, None, Some(state)).unwrap(),
                 (
                     ValueProjection::<ArrayType>::into_projected(lhs)?,
                     ValueProjection::<ArrayType>::into_projected(rhs)?,
@@ -7699,271 +7830,7 @@ mod tests {
     }
 
     #[test]
-    fn test_block_scaled_dot_batching() {
-        let nvfp4 = BlockScaleFormat::new(4, DataType::F4E2M1FN, DataType::F8E4M3FN);
-        let function = block_scaled_dot::<EagerArrayContext>(BlockScaledDotConfiguration::new(
-            DotDimensionNumbers::matmul(),
-            nvfp4,
-        ))
-        .unwrap();
-        let lhs = cyclic_matrix(2, 8, &[6.0, 1.0, 0.5, 2.0, 3.0, 4.0, 1.5]);
-        let rhs = cyclic_matrix(8, 3, &[1.0, 6.0, 2.0, 0.5, 3.0]);
-        let expected = function.call(lhs.clone(), rhs.clone(), None, None, None, None).unwrap();
-        let stacked = |value: &Array| {
-            let mut r#type = value.r#type().into_owned();
-            r#type = r#type.with_inserted_dimension(0, Dimension::Static(2)).unwrap();
-            value.broadcast(r#type, &[1, 2]).unwrap()
-        };
-        assert_eq!(
-            batch(
-                |(lhs, rhs)| function.call(lhs, rhs, None, None, None, None),
-                (stacked(&lhs), rhs),
-                (BatchAxis::new(0), BatchAxis::replicated()),
-                BatchAxis::new(0),
-                2,
-            ),
-            Ok(stacked(&expected)),
-        );
-    }
-
-    #[test]
-    fn test_block_scaled_dot_validation() {
-        let nvfp4 = BlockScaleFormat::new(4, DataType::F4E2M1FN, DataType::F8E4M3FN);
-        let configuration = BlockScaledDotConfiguration::new(DotDimensionNumbers::matmul(), nvfp4);
-        assert!(matches!(
-            block_scaled_dot::<EagerArrayContext>(configuration.clone().with_lhs_format(BlockScaleFormat::new(
-                4,
-                DataType::F16,
-                DataType::F8E4M3FN,
-            ))),
-            Err(error) if error == ProgramError::from(TypeError::invalid(format!(
-                "`{BLOCK_SCALED_DOT_NAME}` left format does not support element data type `f16`",
-            ))),
-        ));
-        assert!(matches!(
-            block_scaled_dot::<EagerArrayContext>(configuration.clone().with_rhs_format(BlockScaleFormat::new(
-                4,
-                DataType::F4E2M1FN,
-                DataType::F32,
-            ))),
-            Err(error) if error == ProgramError::from(TypeError::invalid(format!(
-                "`{BLOCK_SCALED_DOT_NAME}` right format does not support scale data type `f32`",
-            ))),
-        ));
-        assert!(matches!(
-            block_scaled_dot::<EagerArrayContext>(configuration.clone().with_gradient_format(BlockScaleFormat::new(
-                1,
-                DataType::F4E2M1FN,
-                DataType::F8E4M3FN,
-            ))),
-            Err(error) if error == ProgramError::from(TypeError::invalid(format!(
-                "`{BLOCK_SCALED_DOT_NAME}` gradient format block size must be at least 2 but got 1",
-            ))),
-        ));
-        assert!(matches!(
-            block_scaled_dot::<EagerArrayContext>(configuration.clone().with_accumulation_type(DataType::I32)),
-            Err(error) if error == ProgramError::from(TypeError::invalid(format!(
-                "`{BLOCK_SCALED_DOT_NAME}` accumulation type must be one of `bf16`, `f16`, `f32`, and `f64` but \
-                 got `i32`",
-            ))),
-        ));
-        assert!(matches!(
-            block_scaled_dot::<EagerArrayContext>(configuration.clone().with_tiled_rhs_scales(true)),
-            Err(error) if error == ProgramError::from(TypeError::invalid(format!(
-                "`{BLOCK_SCALED_DOT_NAME}` stochastic gradient rounding, Hadamard transforms, and tiled right scales \
-                 require quantized backward contractions",
-            ))),
-        ));
-        assert!(matches!(
-            block_scaled_dot::<EagerArrayContext>(
-                configuration.clone().with_quantized_backward(true).with_hadamard_transform(true),
-            ),
-            Err(error) if error == ProgramError::from(TypeError::invalid(format!(
-                "`{BLOCK_SCALED_DOT_NAME}` Hadamard transforms of formats with global scales require current global \
-                 scaling",
-            ))),
-        ));
-
-        let function = block_scaled_dot::<EagerArrayContext>(configuration).unwrap();
-        let lhs = cyclic_matrix(2, 8, &[1.0]);
-        let rhs = cyclic_matrix(8, 3, &[1.0]);
-        assert_eq!(
-            function.call(cyclic_matrix(2, 6, &[1.0]), cyclic_matrix(6, 3, &[1.0]), None, None, None, None),
-            Err(ProgramError::from(TypeError::invalid(format!(
-                "`{BLOCK_SCALED_DOT_NAME}` contracting extent 6 is not a positive multiple of block size 4",
-            )))),
-        );
-        assert_eq!(
-            function.call(lhs.clone(), rhs.clone(), Some(Array::vector(vec![1.0f32]).unwrap()), None, None, None),
-            Err(ProgramError::from(TypeError::invalid(format!(
-                "`{BLOCK_SCALED_DOT_NAME}` left global scale must be a rank-0 real floating-point array but \
-                 got `f32[1]`",
-            )))),
-        );
-        assert_eq!(
-            function.call(
-                lhs.clone(),
-                rhs.clone(),
-                None,
-                None,
-                None,
-                Some(Array::from_elements(RandomAlgorithm::ThreeFry.state_type(), &[1u64, 0]).unwrap()),
-            ),
-            Err(ProgramError::from(TypeError::invalid(format!(
-                "`{BLOCK_SCALED_DOT_NAME}` random generator states require stochastic gradient rounding",
-            )))),
-        );
-        assert_eq!(
-            function.call(Array::matrix(2, 8, vec![1i32; 16]).unwrap(), rhs, None, None, None, None),
-            Err(ProgramError::from(TypeError::invalid(format!(
-                "`{BLOCK_SCALED_DOT_NAME}` left input must have a real floating-point element type but got `i32`",
-            )))),
-        );
-        let current = block_scaled_dot::<EagerArrayContext>(
-            BlockScaledDotConfiguration::new(DotDimensionNumbers::matmul(), nvfp4)
-                .with_global_scaling(BlockScaledGlobalScaling::Current),
-        )
-        .unwrap();
-        assert_eq!(
-            current.call(
-                lhs.clone(),
-                cyclic_matrix(8, 3, &[1.0]),
-                None,
-                Some(Array::scalar(1.0f32).unwrap()),
-                None,
-                None,
-            ),
-            Err(ProgramError::from(TypeError::invalid(format!(
-                "`{BLOCK_SCALED_DOT_NAME}` right global scale requires provided global scaling and a format with \
-                 `f8e4m3fn` scales",
-            )))),
-        );
-
-        // Gradient global scales require quantized backward contractions, and random states must have a generator
-        // state type.
-        assert_eq!(
-            function.call(
-                lhs.clone(),
-                cyclic_matrix(8, 3, &[1.0]),
-                None,
-                None,
-                Some(Array::scalar(1.0f32).unwrap()),
-                None,
-            ),
-            Err(ProgramError::from(TypeError::invalid(format!(
-                "`{BLOCK_SCALED_DOT_NAME}` gradient global scales require quantized backward contractions",
-            )))),
-        );
-        let rounding = block_scaled_dot::<EagerArrayContext>(
-            BlockScaledDotConfiguration::new(DotDimensionNumbers::matmul(), nvfp4)
-                .with_quantized_backward(true)
-                .with_stochastic_gradient_rounding(true),
-        )
-        .unwrap();
-        assert_eq!(
-            rounding.call(
-                lhs.clone(),
-                cyclic_matrix(8, 3, &[1.0]),
-                None,
-                None,
-                None,
-                Some(Array::vector(vec![1u32, 0]).unwrap()),
-            ),
-            Err(ProgramError::from(TypeError::invalid(
-                "random generator states must have type `u64[2]` (i.e., for `three_fry`) or `u64[3]` (i.e., for \
-                 `philox`) but got `u32[2]`",
-            ))),
-        );
-
-        // Extents that only backward contractions block are validated when differentiating.
-        let mxfp8 = BlockScaleFormat::new(4, DataType::F8E4M3FN, DataType::F8E8M0FNU);
-        let function = block_scaled_dot::<EagerArrayContext>(BlockScaledDotConfiguration::new(
-            DotDimensionNumbers::matmul(),
-            mxfp8,
-        ))
-        .unwrap();
-        assert_eq!(
-            function.call(lhs.clone(), cyclic_matrix(8, 3, &[1.0]), None, None, None, None),
-            Ok(Array::matrix(2, 3, vec![8.0f32; 6]).unwrap()),
-        );
-        let (_, pullback) = differentiate_at((lhs, cyclic_matrix(8, 3, &[1.0])))
-            .vjp(|(lhs, rhs)| function.call(lhs, rhs, None, None, None, None))
-            .unwrap();
-        assert_eq!(
-            pullback.apply_materialized(cyclic_matrix(2, 3, &[1.0])),
-            Err(ProgramError::from(TypeError::invalid(format!(
-                "`{BLOCK_SCALED_DOT_NAME}` right free extent 3 is not a positive multiple of block size 4",
-            )))),
-        );
-    }
-
-    #[test]
-    fn test_block_scaled_dot_gradient_format_validation() {
-        let nvfp4 = BlockScaleFormat::new(4, DataType::F4E2M1FN, DataType::F8E4M3FN);
-        let mxfp8 = BlockScaleFormat::new(2, DataType::F8E4M3FN, DataType::F8E8M0FNU);
-        let configuration =
-            BlockScaledDotConfiguration::new(DotDimensionNumbers::matmul(), nvfp4).with_lhs_format(mxfp8);
-
-        // Neither Hadamard input uses a global scale after the left format changes to MXFP8.
-        assert_eq!(
-            block_scaled_dot::<EagerArrayContext>(configuration.clone().with_hadamard_transform(true))
-                .map(|function| function.configuration().gradient_format()),
-            Ok(mxfp8),
-        );
-        let function = block_scaled_dot::<EagerArrayContext>(configuration).unwrap();
-        assert_eq!(
-            function.call(
-                cyclic_matrix(2, 4, &[6.0]),
-                cyclic_matrix(4, 4, &[1.0]),
-                None,
-                None,
-                Some(Array::scalar(1.0f32).unwrap()),
-                None,
-            ),
-            Err(ProgramError::from(TypeError::invalid(format!(
-                "`{BLOCK_SCALED_DOT_NAME}` gradient global scale requires provided global scaling and a format with \
-                 `f8e4m3fn` scales",
-            )))),
-        );
-
-        // An inherited NVFP4 gradient format accepts a provided gradient global scale.
-        let function = block_scaled_dot::<EagerArrayContext>(
-            BlockScaledDotConfiguration::new(DotDimensionNumbers::matmul(), mxfp8)
-                .with_lhs_format(nvfp4)
-                .with_quantized_backward(true),
-        )
-        .unwrap();
-        assert_eq!(
-            function.call(
-                cyclic_matrix(2, 4, &[6.0]),
-                cyclic_matrix(4, 4, &[1.0]),
-                None,
-                None,
-                Some(Array::scalar(1.0f32).unwrap()),
-                None,
-            ),
-            Ok(cyclic_matrix(2, 4, &[24.0])),
-        );
-
-        // The inherited block size applies to the output cotangent's right free extent during differentiation.
-        let function = block_scaled_dot::<EagerArrayContext>(
-            BlockScaledDotConfiguration::new(DotDimensionNumbers::matmul(), mxfp8)
-                .with_lhs_format(BlockScaleFormat::new(4, DataType::F8E4M3FN, DataType::F8E8M0FNU)),
-        )
-        .unwrap();
-        let (_, pullback) = differentiate_at((cyclic_matrix(4, 4, &[1.0]), cyclic_matrix(4, 2, &[1.0])))
-            .vjp(|(lhs, rhs)| function.call(lhs, rhs, None, None, None, None))
-            .unwrap();
-        assert_eq!(
-            pullback.apply_materialized(cyclic_matrix(4, 2, &[1.0])),
-            Err(ProgramError::from(TypeError::invalid(format!(
-                "`{BLOCK_SCALED_DOT_NAME}` right free extent 2 is not a positive multiple of block size 4",
-            )))),
-        );
-    }
-
-    #[test]
-    fn test_block_scaled_dot_tiled_rhs_scales() {
+    fn test_block_scaled_dot_rules_quantize_tiled_rhs_scales() {
         // Tiled scales quantize the right input identically along either of its tile dimensions, so the forward and
         // input gradient contractions see the same quantized weight.
         let nvfp4 = BlockScaleFormat::new(4, DataType::F4E2M1FN, DataType::F8E4M3FN);
@@ -7989,7 +7856,7 @@ mod tests {
     }
 
     #[test]
-    fn test_block_scaled_dot_hadamard_transform() {
+    fn test_block_scaled_dot_rules_hadamard_transform() {
         // Transforming the standard basis along the transformed dimension yields the transposed transform matrix, which
         // is `diag(s) · H / 4` for the Sylvester Hadamard matrix `H` and the sign vector of NVIDIA Transformer Engine.
         // The matrix is orthogonal.
@@ -8008,6 +7875,7 @@ mod tests {
             .unwrap()
             .transpose(vec![1, 0])
             .unwrap();
+
         // Pin the recipe's sign vector independently of the implementation so that changing its signs fails this
         // comparison even if the transform remains orthogonal.
         let expected_signs: [f64; 16] =
