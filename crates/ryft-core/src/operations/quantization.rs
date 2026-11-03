@@ -1,8 +1,8 @@
 //! Block-scaled (i.e., microscaling) quantization through [`BlockQuantize`], [`BlockDequantize`], [`ScaledDot`], and
-//! [`BlockScaledDot`]. [`BlockQuantize`] splits a floating-point array into an array of narrow elements and an array
-//! of block scales, [`BlockDequantize`] reconstructs their values at a chosen precision, and [`ScaledDotOperation`]
-//! contracts such element and scale pairs as a generalized dot product of their dequantized values. Together they
-//! cover the NVFP4 format and the [Open Compute Project Microscaling Formats](
+//! [`BlockScaledDot`]. [`BlockQuantize`] represents a floating-point array as a [`BlockQuantizedValue`] with narrow
+//! elements, block scales, and an optional global scale. [`BlockDequantize`] reconstructs its values at a chosen
+//! precision, and [`ScaledDotOperation`] contracts such element and scale pairs as a generalized dot product of their
+//! dequantized values. Together they cover the NVFP4 format and the [Open Compute Project Microscaling Formats](
 //! https://www.opencompute.org/documents/ocp-microscaling-formats-mx-v1-0-spec-final-pdf)
 //! (e.g., MXFP8) that low precision matrix units consume natively.
 //!
@@ -21,10 +21,16 @@
 //! # use ryft_core::{Array, BlockQuantize, DataType, DotDimensionNumbers, ProgramError, ScaledDot};
 //! # fn main() -> Result<(), ProgramError> {
 //! let input = Array::matrix(1, 8, vec![3.0f32, 1.5, 0.5, 6.0, 0.5, 1.0, 0.25, 1.5])?;
-//! let (elements, scales) = input.block_quantize(4, DataType::F4E2M1FN, DataType::F8E4M3FN)?;
-//! assert_eq!(scales.to_f64s(), vec![1.0, 0.25]);
+//! let quantized = input.block_quantize(4, DataType::F4E2M1FN, DataType::F8E4M3FN)?;
+//! assert_eq!(quantized.scales.to_f64s(), vec![1.0, 0.25]);
 //! let dimensions = DotDimensionNumbers::new(vec![1], vec![1], Vec::new(), Vec::new());
-//! let product = elements.scaled_dot(&elements, Some(&scales), Some(&scales), Some(&dimensions), Some(DataType::F32))?;
+//! let product = quantized.elements.scaled_dot(
+//!     &quantized.elements,
+//!     Some(&quantized.scales),
+//!     Some(&quantized.scales),
+//!     Some(&dimensions),
+//!     Some(DataType::F32),
+//! )?;
 //! assert_eq!(product.to_f64s(), vec![51.0625]);
 //! # Ok(())
 //! # }
@@ -32,7 +38,7 @@
 
 use std::fmt::Display;
 
-use ryft_macros::capability;
+use ryft_macros::{Parameterized, capability};
 
 use crate::arrays::{
     Array, ArrayBatch, ArrayBatchingPolicy, ArrayExtentBatchingPolicy, ArrayIrType, ArrayIrValue, ArrayMemberType,
@@ -73,13 +79,52 @@ use crate::operations::manipulation::transposition::Transpose;
 use crate::operations::random::{Random, RandomAlgorithm};
 use crate::operations::reductions::{Reduce, ReductionKind};
 use crate::operations::rounding::{Floor, Round};
-use crate::parameters::Parameterized;
+use crate::parameters::{Parameter, Parameterized};
 use crate::partial::PartiallyEvaluatableOperation;
 use crate::programs::{
     EmptyRegionDriver, MaybeZero, Operation, OperationFormatter, ProgramError, RegionInterface, TypeError, Typed,
     Value, ValueDomainDispatch, ValueProjection,
 };
 use crate::tracing::{DomainTracer, DomainTracingContext};
+
+/// Block-quantized representation of a value, consisting of narrow elements, one scale per block, and an optional
+/// global scale. [`BlockQuantize`] produces this representation and [`BlockDequantize`] reconstructs its values as
+/// `elements * expand(scales) * global_scale`, where an absent global scale is `1`. Block axes and reconstruction
+/// precision are explicit inputs of [`BlockDequantize::block_dequantize`]. The representation imposes no rank or
+/// contraction layout, and consuming operations validate the element types, shapes, and scaling requirements.
+///
+/// The parameter type can be an array value, a tracer, or a type descriptor, so this representation can be traced
+/// and transformed as a [`Parameterized`] structure, including its global scale when present.
+#[derive(Clone, Debug, PartialEq, Parameterized)]
+pub struct BlockQuantizedValue<P: Parameter> {
+    /// Quantized elements, with the shape of the unquantized value.
+    pub elements: P,
+
+    /// Scale array with one value per block and the same rank as [`Self::elements`].
+    pub scales: P,
+
+    /// Optional rank-`0` real floating-point scale that multiplies the values after block dequantization.
+    pub global_scale: Option<P>,
+}
+
+impl<P: Parameter> BlockQuantizedValue<P> {
+    /// Creates a [`BlockQuantizedValue`] without a global scale. Consuming operations validate its inputs.
+    #[inline]
+    pub fn new(elements: P, scales: P) -> Self {
+        Self { elements, scales, global_scale: None }
+    }
+
+    /// Returns this [`BlockQuantizedValue`] with the provided global scale.
+    #[inline]
+    pub fn with_global_scale(mut self, global_scale: P) -> Self {
+        self.global_scale = Some(global_scale);
+        self
+    }
+}
+
+impl<P: Parameter + Capability> Capability for BlockQuantizedValue<P> {
+    type Universe = P::Universe;
+}
 
 /// Value-level block quantization capability. [`BlockQuantize::block_quantize`] splits an `f32` or `f64` array into
 /// an array of narrow elements and an array of scales with one scale per block of consecutive values along the last
@@ -134,8 +179,8 @@ use crate::tracing::{DomainTracer, DomainTracingContext};
 /// The universe parameter `T` defaults to the [`Capability`] universe of the implementor, so that homogeneous array
 /// values implement this capability for [`ArrayType`] and array IR values implement it for [`ArrayIrType`].
 #[capability]
-pub trait BlockQuantize<T = <Self as Capability>::Universe>: Capability + Sized {
-    /// Quantizes `self` into a pair `(elements, scales)`, with one scale per block of `block_size` consecutive values
+pub trait BlockQuantize<T = <Self as Capability>::Universe>: Capability + Parameter + Sized {
+    /// Quantizes `self` into a [`BlockQuantizedValue`], with one scale per block of `block_size` consecutive values
     /// along the last dimension. `elements` has the shape of `self` and element type `element_type`, while `scales` has
     /// the shape of `self` with its last extent divided by `block_size` and element type `scale_type`. Refer to the
     /// documentation of [`BlockQuantize`] for the exact recipes and to [`Self::block_quantize_with_options`] for the
@@ -152,21 +197,22 @@ pub trait BlockQuantize<T = <Self as Capability>::Universe>: Capability + Sized 
         block_size: usize,
         element_type: DataType,
         scale_type: DataType,
-    ) -> Result<(Self, Self), ProgramError> {
+    ) -> Result<BlockQuantizedValue<Self>, ProgramError> {
         self.block_quantize_with_options(block_size, element_type, scale_type, -1, None, None)
     }
 
-    /// Quantizes `self` into a pair `(elements, scales)` like [`Self::block_quantize`], with blocks of `block_size`
+    /// Quantizes `self` into a [`BlockQuantizedValue`] like [`Self::block_quantize`], with blocks of `block_size`
     /// consecutive values along each of `block_axes`. A block therefore spans `block_size` values along every block
     /// axis (e.g., two block axes form `block_size × block_size` tiles). `elements` has the shape of `self`, while
     /// `scales` has the shape of `self` with the extent of every block axis divided by `block_size`.
     ///
     /// A `global_scale` divides `self` before the block scales are computed, as in the NVFP4 recipe, which scales
     /// tensors both globally and per block, and as with the `global_scale` of the JAX `quantize` helper, so the
-    /// dequantized value of an element is `element * scale * global_scale`. A `rounding_noise` array of uniform samples
-    /// in `[0, 1)` (e.g., drawn with [`Random::random_uniform`]) replaces rounding to the nearest value (with ties to
-    /// even) by stochastic rounding. Each scaled value `x` then rounds to `floor(x / ulp + noise) · ulp`, where `ulp`
-    /// is the spacing of the element type grid at `x`, so that it rounds up with probability equal to its distance from
+    /// dequantized value of an element is `element * scale * global_scale`. The returned representation retains this
+    /// global scale so that [`BlockDequantize`] reconstructs the original magnitude. Uniform `rounding_noise` samples
+    /// in `[0, 1)` (e.g., drawn with [`Random::random_uniform`]) replace rounding to the nearest value (with ties to
+    /// even) by stochastic rounding. Each scaled value `x` rounds to `floor(x / ulp + noise) · ulp`, where `ulp` is
+    /// the spacing of the element type grid at `x`, so that it rounds up with probability equal to its distance from
     /// the grid value below it, in units of `ulp`, and quantization is unbiased within the finite range of the element
     /// type up to the rounding of the noise addition at the compute type. Results past the largest finite magnitude of
     /// the element type saturate to it. The spacing is computed exactly from the exponent bits of `x`.
@@ -199,7 +245,7 @@ pub trait BlockQuantize<T = <Self as Capability>::Universe>: Capability + Sized 
         block_axes: A,
         global_scale: Option<&Self>,
         rounding_noise: Option<&Self>,
-    ) -> Result<(Self, Self), ProgramError>;
+    ) -> Result<BlockQuantizedValue<Self>, ProgramError>;
 }
 
 impl<V> BlockQuantize<ArrayType> for V
@@ -227,7 +273,7 @@ where
         block_axes: A,
         global_scale: Option<&Self>,
         rounding_noise: Option<&Self>,
-    ) -> Result<(Self, Self), ProgramError> {
+    ) -> Result<BlockQuantizedValue<Self>, ProgramError> {
         // Every value with the capabilities used by the recipe, which include both the concrete reference `Array`
         // backend and the transform tracers, quantizes through this composition. All validation happens before the
         // first operation, so that rejected requests stage nothing.
@@ -313,7 +359,11 @@ where
         let elements = quantize_block_elements(&quotients, element_format, rounding_noise, &|r#type, value| {
             domain.fill(r#type, value)
         })?;
-        Ok((elements.convert_element_type(element_type)?, scales))
+        Ok(BlockQuantizedValue {
+            elements: elements.convert_element_type(element_type)?,
+            scales,
+            global_scale: global_scale.cloned(),
+        })
     }
 }
 
@@ -351,7 +401,7 @@ where
         block_axes: A,
         global_scale: Option<&Self>,
         rounding_noise: Option<&Self>,
-    ) -> Result<(Self, Self), ProgramError> {
+    ) -> Result<BlockQuantizedValue<Self>, ProgramError> {
         let input_type = self.r#type();
         let input_type = <&ArrayType>::try_from(input_type.as_ref())?;
 
@@ -362,7 +412,7 @@ where
             let project = |value: &Self| ValueProjection::<ArrayType>::into_projected(value.clone());
             let global_scale = global_scale.map(project).transpose()?;
             let rounding_noise = rounding_noise.map(project).transpose()?;
-            let (elements, scales) = project(self)?.block_quantize_with_options(
+            let quantized = project(self)?.block_quantize_with_options(
                 block_size,
                 element_type,
                 scale_type,
@@ -370,10 +420,11 @@ where
                 global_scale.as_ref(),
                 rounding_noise.as_ref(),
             )?;
-            return Ok((
-                <V as ValueProjection<ArrayType>>::from_projected(elements),
-                <V as ValueProjection<ArrayType>>::from_projected(scales),
-            ));
+            return Ok(BlockQuantizedValue {
+                elements: <V as ValueProjection<ArrayType>>::from_projected(quantized.elements),
+                scales: <V as ValueProjection<ArrayType>>::from_projected(quantized.scales),
+                global_scale: quantized.global_scale.map(<V as ValueProjection<ArrayType>>::from_projected),
+            });
         }
 
         // Everything decidable from the types is validated before the first operation, so that rejected requests
@@ -519,30 +570,33 @@ where
                 let elements = context.dynamic_fill(r#type, value, &input_dynamic_dimensions)?;
                 Ok(ValueProjection::<ArrayType>::into_projected(elements)?)
             })?;
-        Ok((
-            <V as ValueProjection<ArrayType>>::from_projected(elements.convert_element_type(element_type)?),
-            <V as ValueProjection<ArrayType>>::from_projected(scales),
-        ))
+        Ok(BlockQuantizedValue {
+            elements: <V as ValueProjection<ArrayType>>::from_projected(elements.convert_element_type(element_type)?),
+            scales: <V as ValueProjection<ArrayType>>::from_projected(scales),
+            global_scale: global_scale.cloned(),
+        })
     }
 }
 
-/// Value-level block dequantization capability. [`BlockDequantize::block_dequantize`] reconstructs an array from
-/// elements and scales by repeating each scale over its block and multiplying at a chosen floating-point precision.
-/// It accepts the pairs produced by [`BlockQuantize`] using the final axis as the block axis, and it also supports
-/// blocks along several axes, as used by [`ScaledDot`]. An axis with equal element and scale extents is left out of
-/// the block axes, allowing per-element scaling and scalar inputs with an empty axis list.
+/// Block dequantization capability for [`BlockQuantizedValue`]. [`BlockDequantize::block_dequantize`] reconstructs
+/// an array by repeating each block scale and multiplying the elements, expanded scales, and optional global scale
+/// at a chosen floating-point precision. It accepts representations produced by [`BlockQuantize`] using the final
+/// axis as the block axis, and it also supports blocks along several axes, as used by [`ScaledDot`]. An axis with
+/// equal element and scale extents is left out of the block axes, allowing per-element scaling and scalar inputs with
+/// an empty axis list.
 ///
 /// Homogeneous array values require static shapes. Array IR values compose first-class dimension operations directly
 /// and support dynamic extents with runtime assertions. Use the parent array IR value when a projected array view
 /// has dynamic extents. The composition inherits the transform rules of its component operations and differentiates
-/// both elements and scales where their data types are differentiable.
+/// elements, block scales, and global scales where their data types are differentiable.
 ///
 /// Blanket implementations derive this capability from conversion, shape, and multiplication capabilities, together
 /// with dimension and assertion capabilities for array IR values. Values covered by a blanket implementation cannot
 /// supply another implementation of this capability.
 ///
-/// The universe parameter `T` defaults to the [`Capability`] universe of the implementor, so that homogeneous array
-/// values implement this capability for [`ArrayType`] and array IR values implement it for [`ArrayIrType`].
+/// The universe parameter `T` defaults to the [`Capability`] universe of the implementor, so that representations of
+/// homogeneous arrays implement this capability for [`ArrayType`] and representations of array IR values implement
+/// it for [`ArrayIrType`].
 ///
 /// # Example
 ///
@@ -550,25 +604,29 @@ where
 /// # use ryft_core::{Array, BlockDequantize, BlockQuantize, DataType, ProgramError};
 /// # fn main() -> Result<(), ProgramError> {
 /// let input = Array::vector(vec![3.0f32, 1.5, 0.5, 6.0])?;
-/// let (elements, scales) = input.block_quantize(4, DataType::F4E2M1FN, DataType::F8E4M3FN)?;
-/// assert_eq!(elements.block_dequantize(&scales, [-1], DataType::F32)?, input);
+/// let quantized = input.block_quantize(4, DataType::F4E2M1FN, DataType::F8E4M3FN)?;
+/// assert_eq!(quantized.block_dequantize([-1], DataType::F32)?, input);
 /// # Ok(())
 /// # }
 /// ```
 #[capability]
 pub trait BlockDequantize<T = <Self as Capability>::Universe>: Capability + Sized {
-    /// Repeats each scale over its block, converts both `self` and the expanded scales to `data_type`, and multiplies
-    /// them. The output has the shape of `self`. Inputs must have equal ranks and real numeric or Boolean element
+    /// Reconstructed value returned by this capability.
+    type Output;
+
+    /// Repeats each block scale, converts elements and expanded scales to `data_type`, and multiplies them. If a global
+    /// scale is present, it is converted to `data_type`, broadcast, and multiplied into that result. The output has
+    /// the shape of the elements. Elements and block scales must have equal ranks and real numeric or Boolean element
     /// types. Non-block dimensions must match exactly. Along each block axis the scale extent must be positive and
     /// divide the element extent with a quotient of at least two, as in [`BlockQuantize`]. Known violations are
     /// rejected before composing operations, and array IR values assert unknown ratios at runtime. Empty non-block
     /// dimensions are supported. Homogeneous values, including projected array views, require static shapes. Use the
-    /// parent array IR value for dynamic extents. Returns a [`ProgramError`] for invalid inputs, axes, output
-    /// precision, or unsupported shapes, or when a component operation fails.
+    /// parent array IR value for dynamic extents. A global scale must be a rank-0 real floating-point array. Returns a
+    /// [`ProgramError`] for invalid inputs, axes, output precision, or unsupported shapes, or if a component operation
+    /// fails.
     ///
     /// # Parameters
     ///
-    ///   - `scales`: Scale array with one value per block of elements in `self`.
     ///   - `block_axes`: Axes along which scales are repeated. Negative axes count backward from the input rank.
     ///     Duplicate axes are rejected. An empty list requests elementwise scaling of equal-shaped inputs.
     ///   - `data_type`: Floating-point data type of the multiplication and output. Conversion occurs before
@@ -577,26 +635,34 @@ pub trait BlockDequantize<T = <Self as Capability>::Universe>: Capability + Size
     ///     (e.g., `f16` turns `f8e8m0fnu` scales of at least `2^16` into infinity and scales below `2^-24` into zero),
     ///     which matches the CPU lowering of the JAX `scaled_matmul` primitive. Use a type with the exponent range of
     ///     the scales, such as `bf16` or `f32`, for such scales.
-    fn block_dequantize<A: Into<Axes>>(
-        &self,
-        scales: &Self,
-        block_axes: A,
-        data_type: DataType,
-    ) -> Result<Self, ProgramError>;
+    fn block_dequantize<A: Into<Axes>>(&self, block_axes: A, data_type: DataType)
+    -> Result<Self::Output, ProgramError>;
 }
 
-impl<V: Value<Type = ArrayType> + Broadcast + ConvertElementType + Mul + Reshape> BlockDequantize<ArrayType> for V {
+impl<V: Value<Type = ArrayType> + Broadcast + ConvertElementType + Mul + Reshape> BlockDequantize<ArrayType>
+    for BlockQuantizedValue<V>
+{
+    type Output = V;
+
     fn block_dequantize<A: Into<Axes>>(
         &self,
-        scales: &Self,
         block_axes: A,
         data_type: DataType,
-    ) -> Result<Self, ProgramError> {
+    ) -> Result<Self::Output, ProgramError> {
         // Homogeneous values compose the static shape operations directly. Keep the scale's placement and memory
         // through expansion, inserting only replicated block dimensions before reshaping to the element shape.
-        let element_type = self.r#type();
+        let elements = &self.elements;
+        let scales = &self.scales;
+        let element_type = elements.r#type();
         let scale_type = scales.r#type();
-        let block_axes = validate_block_dequantize_inputs(&element_type, &scale_type, block_axes.into(), data_type)?;
+        let global_scale_type = self.global_scale.as_ref().map(|value| value.r#type().into_owned());
+        let block_axes = validate_block_dequantize_inputs(
+            &element_type,
+            &scale_type,
+            global_scale_type.as_ref(),
+            block_axes.into(),
+            data_type,
+        )?;
         let (Some(element_shape), Some(scale_shape)) = (element_type.static_shape(), scale_type.static_shape()) else {
             return Err(TypeError::invalid(
                 "`block_dequantize` homogeneous inputs must have static shapes; use array IR values \
@@ -617,16 +683,27 @@ impl<V: Value<Type = ArrayType> + Broadcast + ConvertElementType + Mul + Reshape
                 inserted_dimensions += 1;
             }
         }
-        let elements = self.convert_element_type(data_type)?;
+        let elements = elements.convert_element_type(data_type)?;
         let expanded_scales = scales
             .broadcast(expanded_type, &output_axes)?
             .reshape(element_type.shape().clone())?
             .convert_element_type(data_type)?;
-        elements.mul(&expanded_scales)
+        let output = elements.mul(&expanded_scales)?;
+        match &self.global_scale {
+            Some(global_scale) => {
+                let global_scale = global_scale.convert_element_type(data_type)?;
+                let mut expanded_type = global_scale.r#type().into_owned();
+                for (axis, &extent) in element_shape.dimensions().iter().enumerate() {
+                    expanded_type = expanded_type.with_inserted_dimension(axis, Dimension::Static(extent))?;
+                }
+                output.mul(&global_scale.broadcast(expanded_type, &[])?)
+            }
+            None => Ok(output),
+        }
     }
 }
 
-impl<V> BlockDequantize<ArrayIrType> for V
+impl<V> BlockDequantize<ArrayIrType> for BlockQuantizedValue<V>
 where
     V: Value<Type = ArrayIrType>
         + Assert
@@ -640,23 +717,38 @@ where
     <V as ValueProjection<DimensionType>>::Projected:
         Value<Type = DimensionType> + Compare<V> + DimensionMax + Div + Rem,
 {
+    type Output = V;
+
     fn block_dequantize<A: Into<Axes>>(
         &self,
-        scales: &Self,
         block_axes: A,
         data_type: DataType,
-    ) -> Result<Self, ProgramError> {
+    ) -> Result<Self::Output, ProgramError> {
         // Array IR values keep shape computations in the parent universe. This composition also serves eager
         // ArrayIrValue arrays, whose dimension values execute as checked host integers.
-        let element_type = self.r#type();
+        let elements = &self.elements;
+        let scales = &self.scales;
+        let element_type = elements.r#type();
         let element_type = <&ArrayType>::try_from(element_type.as_ref())?;
         let scale_type = scales.r#type();
         let scale_type = <&ArrayType>::try_from(scale_type.as_ref())?;
-        let block_axes = validate_block_dequantize_inputs(element_type, scale_type, block_axes.into(), data_type)?;
-        let context = self.domain();
+        let global_scale_type = self
+            .global_scale
+            .as_ref()
+            .map(|value| Ok::<_, TypeError>(<&ArrayType>::try_from(value.r#type().as_ref())?.clone()))
+            .transpose()?;
+        let block_axes = validate_block_dequantize_inputs(
+            element_type,
+            scale_type,
+            global_scale_type.as_ref(),
+            block_axes.into(),
+            data_type,
+        )?;
+        let context = elements.domain();
         let element_dimensions =
-            (0..element_type.rank()).map(|axis| self.dimension_size(axis)).collect::<Result<Vec<_>, _>>()?;
-        let elements = ValueProjection::<ArrayType>::into_projected(self.clone())?.convert_element_type(data_type)?;
+            (0..element_type.rank()).map(|axis| elements.dimension_size(axis)).collect::<Result<Vec<_>, _>>()?;
+        let elements =
+            ValueProjection::<ArrayType>::into_projected(elements.clone())?.convert_element_type(data_type)?;
         let scale_dimensions =
             (0..scale_type.rank()).map(|axis| scales.dimension_size(axis)).collect::<Result<Vec<_>, _>>()?;
         let mut expanded_dimensions = Vec::with_capacity(scale_type.rank() + block_axes.len());
@@ -697,7 +789,18 @@ where
             scales.dynamic_broadcast(&expanded_dimensions, &output_axes)?.dynamic_reshape(&element_dimensions)?;
         let expanded_scales =
             ValueProjection::<ArrayType>::into_projected(expanded_scales)?.convert_element_type(data_type)?;
-        Ok(ValueProjection::<ArrayType>::from_projected(elements.mul(&expanded_scales)?))
+        let output = elements.mul(&expanded_scales)?;
+        let output = match &self.global_scale {
+            Some(global_scale) => {
+                let global_scale = ValueProjection::<ArrayType>::into_projected(global_scale.clone())?
+                    .convert_element_type(data_type)?;
+                let expanded = <V as ValueProjection<ArrayType>>::from_projected(global_scale)
+                    .dynamic_broadcast(&element_dimensions, &[])?;
+                output.mul(&ValueProjection::<ArrayType>::into_projected(expanded)?)?
+            }
+            None => output,
+        };
+        Ok(ValueProjection::<ArrayType>::from_projected(output))
     }
 }
 
@@ -1055,8 +1158,9 @@ impl_non_transposable_operation!(ScaledDotOperation);
 
 impl<C: Domain<Type = ArrayIrType>> MemberInterpretableOperation<C> for ScaledDotOperation
 where
-    C::Value: BlockDequantize + ValueProjection<ArrayType>,
+    C::Value: ValueProjection<ArrayType>,
     <C::Value as ValueProjection<ArrayType>>::Projected: Value<Type = ArrayType> + ConvertElementType + Dot,
+    BlockQuantizedValue<C::Value>: BlockDequantize<Output = C::Value>,
 {
     fn interpret_in_parent<D: InterpretationDriver<C>>(
         &self,
@@ -1074,20 +1178,18 @@ where
         self.infer_output_types(&input_types, &[])?;
 
         let lhs = match lhs_scale {
-            Some(scale) => ValueProjection::<ArrayType>::into_projected(lhs.block_dequantize(
-                scale,
-                self.dimensions.lhs_contracting_dimensions(),
-                DataType::BF16,
-            )?)?,
+            Some(scale) => ValueProjection::<ArrayType>::into_projected(
+                BlockQuantizedValue::new(lhs.clone(), scale.clone())
+                    .block_dequantize(self.dimensions.lhs_contracting_dimensions(), DataType::BF16)?,
+            )?,
             None => ValueProjection::<ArrayType>::into_projected(lhs.clone())?.convert_element_type(DataType::BF16)?,
         };
 
         let rhs = match rhs_scale {
-            Some(scale) => ValueProjection::<ArrayType>::into_projected(rhs.block_dequantize(
-                scale,
-                self.dimensions.rhs_contracting_dimensions(),
-                DataType::BF16,
-            )?)?,
+            Some(scale) => ValueProjection::<ArrayType>::into_projected(
+                BlockQuantizedValue::new(rhs.clone(), scale.clone())
+                    .block_dequantize(self.dimensions.rhs_contracting_dimensions(), DataType::BF16)?,
+            )?,
             None => ValueProjection::<ArrayType>::into_projected(rhs.clone())?.convert_element_type(DataType::BF16)?,
         };
 
@@ -2344,7 +2446,7 @@ impl<'o> BlockScaledDotRules<'o> {
         tiled: bool,
         global_scale: GlobalScale<V>,
         rounding_noise: Option<&V>,
-    ) -> Result<QuantizedInput<V>, ProgramError>
+    ) -> Result<BlockQuantizedValue<V>, ProgramError>
     where
         V: Value<Type = ArrayType> + Abs + Broadcast + BlockQuantize + Clamp + Div + Mul + Reduce + Reshape,
         V::Domain: Fill<f64, V>,
@@ -2363,7 +2465,7 @@ impl<'o> BlockScaledDotRules<'o> {
             }
         };
         let block_axes = if tiled { vec![1, 2] } else { vec![axis] };
-        let (elements, scales) = value.block_quantize_with_options(
+        let BlockQuantizedValue { elements, scales, global_scale } = value.block_quantize_with_options(
             format.block_size,
             format.element_type,
             format.scale_type,
@@ -2384,7 +2486,7 @@ impl<'o> BlockScaledDotRules<'o> {
         } else {
             scales
         };
-        Ok(QuantizedInput { elements, scales, global_scale })
+        Ok(BlockQuantizedValue { elements, scales, global_scale })
     }
 
     /// Contracts two quantized inputs with [`ScaledDot`] and multiplies the result by their global scales. When the
@@ -2394,8 +2496,8 @@ impl<'o> BlockScaledDotRules<'o> {
     /// in which case they accumulate at the compute type as well.
     fn contract<V>(
         &self,
-        lhs: &QuantizedInput<V>,
-        rhs: &QuantizedInput<V>,
+        lhs: &BlockQuantizedValue<V>,
+        rhs: &BlockQuantizedValue<V>,
         dimensions: &DotDimensionNumbers,
         data_type: DataType,
     ) -> Result<V, ProgramError>
@@ -2534,18 +2636,6 @@ impl<'o> BlockScaledDotRules<'o> {
         }
         scalar.broadcast(expanded_type, &[])
     }
-}
-
-/// Quantized rank-three input of a contraction in the rules of a [`BlockScaledDot`].
-struct QuantizedInput<V> {
-    /// Quantized elements.
-    elements: V,
-
-    /// Scales expanded to one per block along the contracting dimension.
-    scales: V,
-
-    /// Global scale that multiplies the dequantized values, if any.
-    global_scale: Option<V>,
 }
 
 /// Validates the statically decidable requirements of block quantization before composing operations.
@@ -2767,6 +2857,7 @@ where
 fn validate_block_dequantize_inputs(
     elements: &ArrayType,
     scales: &ArrayType,
+    global_scale: Option<&ArrayType>,
     block_axes: Axes,
     data_type: DataType,
 ) -> Result<Vec<usize>, ProgramError> {
@@ -2784,6 +2875,16 @@ fn validate_block_dequantize_inputs(
             ))
             .into());
         }
+    }
+    if let Some(global_scale) = global_scale
+        && (global_scale.rank() != 0
+            || !global_scale.data_type().is_floating_point()
+            || !global_scale.data_type().is_real())
+    {
+        return Err(TypeError::invalid(format!(
+            "`block_dequantize` global scale must be a rank-0 real floating-point array but got `{global_scale}`",
+        ))
+        .into());
     }
     if elements.rank() != scales.rank() {
         return Err(TypeError::invalid("`block_dequantize` inputs must have the same rank").into());
@@ -2870,6 +2971,75 @@ mod tests {
     type EagerArrayContext = EagerContext<Array, ArrayOperation<Array>>;
 
     #[test]
+    fn test_block_quantized_value_new() {
+        let elements = Array::vector(vec![1.0f32, 2.0, 3.0, 4.0]).unwrap();
+        let scales = Array::vector(vec![2.0f32, 3.0]).unwrap();
+        assert_eq!(
+            BlockQuantizedValue::new(elements.clone(), scales.clone()),
+            BlockQuantizedValue { elements, scales, global_scale: None },
+        );
+        assert_eq!(
+            BlockQuantizedValue::new(Placeholder, Placeholder),
+            BlockQuantizedValue { elements: Placeholder, scales: Placeholder, global_scale: None },
+        );
+    }
+
+    #[test]
+    fn test_block_quantized_value_with_global_scale() {
+        let elements = Array::vector(vec![1.0f32, 2.0, 3.0, 4.0]).unwrap();
+        let scales = Array::vector(vec![2.0f32, 3.0]).unwrap();
+        let global_scale = Array::scalar(5.0f32).unwrap();
+        let value = BlockQuantizedValue::new(elements.clone(), scales.clone());
+        assert_eq!(
+            value.clone().with_global_scale(global_scale.clone()),
+            BlockQuantizedValue {
+                elements: elements.clone(),
+                scales: scales.clone(),
+                global_scale: Some(global_scale),
+            },
+        );
+        let replacement = Array::scalar(7.0f32).unwrap();
+        assert_eq!(
+            value.with_global_scale(Array::scalar(5.0f32).unwrap()).with_global_scale(replacement.clone()),
+            BlockQuantizedValue { elements, scales, global_scale: Some(replacement) },
+        );
+    }
+
+    #[test]
+    fn test_block_quantized_value_parameterized() {
+        let input = BlockQuantizedValue::new(
+            Array::vector(vec![1.0f32, 2.0, 3.0, 4.0]).unwrap(),
+            Array::vector(vec![2.0f32, 3.0]).unwrap(),
+        )
+        .with_global_scale(Array::scalar(5.0f32).unwrap());
+        let structure = BlockQuantizedValue::new(Placeholder, Placeholder).with_global_scale(Placeholder);
+        assert_eq!(input.parameter_structure(), structure);
+        assert_eq!(
+            input.parameters().cloned().collect::<Vec<_>>(),
+            vec![input.elements.clone(), input.scales.clone(), input.global_scale.clone().unwrap()],
+        );
+        assert_eq!(BlockQuantizedValue::from_parameters(structure, input.clone().into_parameters()), Ok(input.clone()),);
+
+        // The complete representation, including its optional scalar, is a structured tracing boundary.
+        let input_types = input.clone().map_parameters(|value| value.r#type().into_owned()).unwrap();
+        let (output_types, program) = TracingContext::<Array, ArrayOperation<Array>>::trace(
+            |value: BlockQuantizedValue<Tracer<_>>| Ok(value),
+            input_types.clone(),
+        )
+        .unwrap();
+        assert_eq!(output_types, input_types);
+        assert_eq!(
+            program.to_string(),
+            indoc! {"
+                lambda %0:f32[4], %1:f32[2], %2:f32[] .
+                in (%0, %1, %2)
+            "}
+            .trim_end(),
+        );
+        assert_eq!(program.interpret(input.clone()), Ok(input));
+    }
+
+    #[test]
     fn test_block_quantize() {
         // The NVFP4 recipe uses `f4e2m1fn` elements with `f8e4m3fn` scales `max_abs(block) / 6`. Every block below is a
         // scaled copy of `f4e2m1fn` grid points whose scale is exactly representable in `f8e4m3fn`, so quantization is
@@ -2883,7 +3053,8 @@ mod tests {
             ],
         )
         .unwrap();
-        let (elements, scales) = input.block_quantize(4, DataType::F4E2M1FN, DataType::F8E4M3FN).unwrap();
+        let BlockQuantizedValue { elements, scales, .. } =
+            input.block_quantize(4, DataType::F4E2M1FN, DataType::F8E4M3FN).unwrap();
         assert_eq!(elements.r#type().into_owned(), ArrayType::new_static(DataType::F4E2M1FN, [2, 8]));
         assert_eq!(scales.r#type().into_owned(), ArrayType::new_static(DataType::F8E4M3FN, [2, 2]));
         assert_eq!(scales.to_f64s(), vec![1.0, 0.25, 2.0, 0.001953125]);
@@ -2915,7 +3086,8 @@ mod tests {
             ],
         )
         .unwrap();
-        let (elements, scales) = input.block_quantize(4, DataType::F8E4M3FN, DataType::F8E8M0FNU).unwrap();
+        let BlockQuantizedValue { elements, scales, .. } =
+            input.block_quantize(4, DataType::F8E4M3FN, DataType::F8E8M0FNU).unwrap();
         assert_eq!(elements.r#type().into_owned(), ArrayType::new_static(DataType::F8E4M3FN, [2, 8]));
         assert_eq!(scales.r#type().into_owned(), ArrayType::new_static(DataType::F8E8M0FNU, [2, 2]));
         assert_eq!(scales.to_f64s(), vec![(-6.0f64).exp2(), (-8.0f64).exp2(), (-5.0f64).exp2(), (-126.0f64).exp2()]);
@@ -2934,7 +3106,8 @@ mod tests {
         // A block maximum just below a power of two stays in its own binade, so `3.9998` uses the scale
         // `2^(1 - 2) = 0.5` with `f4e2m1fn` elements, and its quotient `7.9996` saturates at `6`.
         let input = Array::vector(vec![3.9998f32, 0.75, 0.0, 0.0]).unwrap();
-        let (elements, scales) = input.block_quantize(4, DataType::F4E2M1FN, DataType::F8E8M0FNU).unwrap();
+        let BlockQuantizedValue { elements, scales, .. } =
+            input.block_quantize(4, DataType::F4E2M1FN, DataType::F8E8M0FNU).unwrap();
         assert_eq!(scales.to_f64s(), vec![0.5]);
         assert_eq!(elements.to_f64s(), vec![6.0, 1.5, 0.0, 0.0]);
     }
@@ -2944,21 +3117,25 @@ mod tests {
         // An NVFP4 block maximum above `6 · 448` would need a scale beyond the largest finite `f8e4m3fn` value, so the
         // scale saturates at `448` and the quotients saturate at the largest element magnitude instead of becoming NaN.
         let input = Array::vector(vec![6000.0f32, 3000.0, 0.0, 0.0, 1.0, 1.0, 1.0, 1.0]).unwrap();
-        let (elements, scales) = input.block_quantize(4, DataType::F4E2M1FN, DataType::F8E4M3FN).unwrap();
+        let BlockQuantizedValue { elements, scales, .. } =
+            input.block_quantize(4, DataType::F4E2M1FN, DataType::F8E4M3FN).unwrap();
         assert_eq!(scales.to_f64s(), vec![448.0, 0.171875]);
         assert_eq!(elements.to_f64s(), vec![6.0, 6.0, 0.0, 0.0, 6.0, 6.0, 6.0, 6.0]);
 
         // Likewise, an `f64` MX block maximum beyond the `f8e8m0fnu` range saturates at the largest scale, `2^127`.
         let input = Array::vector(vec![1e300f64, 0.0, 0.0, 0.0]).unwrap();
-        let (elements, scales) = input.block_quantize(4, DataType::F8E4M3FN, DataType::F8E8M0FNU).unwrap();
+        let BlockQuantizedValue { elements, scales, .. } =
+            input.block_quantize(4, DataType::F8E4M3FN, DataType::F8E8M0FNU).unwrap();
         assert_eq!(scales.to_f64s(), vec![127.0f64.exp2()]);
         assert_eq!(elements.to_f64s(), vec![448.0, 0.0, 0.0, 0.0]);
 
         // Infinite values saturate to the largest element magnitude under both recipes.
         let input = Array::vector(vec![f32::INFINITY, 1.0, f32::NEG_INFINITY, 0.0]).unwrap();
-        let (elements, _) = input.block_quantize(4, DataType::F4E2M1FN, DataType::F8E4M3FN).unwrap();
+        let BlockQuantizedValue { elements, .. } =
+            input.block_quantize(4, DataType::F4E2M1FN, DataType::F8E4M3FN).unwrap();
         assert_eq!(elements.to_f64s(), vec![6.0, 0.0, -6.0, 0.0]);
-        let (elements, _) = input.block_quantize(4, DataType::F8E4M3FN, DataType::F8E8M0FNU).unwrap();
+        let BlockQuantizedValue { elements, .. } =
+            input.block_quantize(4, DataType::F8E4M3FN, DataType::F8E8M0FNU).unwrap();
         assert_eq!(elements.to_f64s(), vec![448.0, 0.0, -448.0, 0.0]);
     }
 
@@ -2970,7 +3147,8 @@ mod tests {
         // stays within a proportional tolerance of the full precision dot product.
         let values = [1.1f32, -2.3, 0.7, 3.9, 0.013, -0.27, 5.4, 8.9];
         let input = Array::matrix(1, 8, values.to_vec()).unwrap();
-        let (elements, scales) = input.block_quantize(4, DataType::F8E4M3FN, DataType::F8E8M0FNU).unwrap();
+        let BlockQuantizedValue { elements, scales, .. } =
+            input.block_quantize(4, DataType::F8E4M3FN, DataType::F8E8M0FNU).unwrap();
         assert_eq!(elements.r#type().into_owned(), ArrayType::new_static(DataType::F8E4M3FN, [1, 8]));
         assert_eq!(scales.r#type().into_owned(), ArrayType::new_static(DataType::F8E8M0FNU, [1, 2]));
         let dimensions = DotDimensionNumbers::new(vec![1], vec![1], Vec::new(), Vec::new());
@@ -2986,7 +3164,7 @@ mod tests {
     fn test_block_quantize_ranks() {
         // Inputs of any positive rank quantize each block of their last dimension identically.
         let values = [1.1f32, -2.3, 0.7, 3.9, 0.013, -0.27, 5.4, 8.9];
-        let (elements, scales) = Array::vector(values.to_vec())
+        let BlockQuantizedValue { elements, scales, .. } = Array::vector(values.to_vec())
             .unwrap()
             .block_quantize(4, DataType::F8E4M3FN, DataType::F8E8M0FNU)
             .unwrap();
@@ -2994,7 +3172,7 @@ mod tests {
         assert_eq!(scales.r#type().into_owned(), ArrayType::new_static(DataType::F8E8M0FNU, [2]));
         let rank_four =
             Array::from_elements::<f32>(ArrayType::new_static(DataType::F32, [1, 1, 1, 8]), &values).unwrap();
-        let (rank_four_elements, rank_four_scales) =
+        let BlockQuantizedValue { elements: rank_four_elements, scales: rank_four_scales, .. } =
             rank_four.block_quantize(4, DataType::F8E4M3FN, DataType::F8E8M0FNU).unwrap();
         assert_eq!(rank_four_elements.r#type().into_owned(), ArrayType::new_static(DataType::F8E4M3FN, [1, 1, 1, 8]));
         assert_eq!(rank_four_scales.r#type().into_owned(), ArrayType::new_static(DataType::F8E8M0FNU, [1, 1, 1, 2]));
@@ -3006,10 +3184,11 @@ mod tests {
     fn test_block_quantize_array_ir() {
         // Concrete array IR values quantize their array members exactly like the arrays themselves.
         let input = Array::matrix(1, 8, vec![3.0f32, 1.5, 0.5, 6.0, 0.5, 1.0, 0.25, 1.5]).unwrap();
-        let (elements, scales) = input.block_quantize(4, DataType::F4E2M1FN, DataType::F8E4M3FN).unwrap();
+        let BlockQuantizedValue { elements, scales, .. } =
+            input.block_quantize(4, DataType::F4E2M1FN, DataType::F8E4M3FN).unwrap();
         assert_eq!(
             ArrayIrValue::Array(input).block_quantize(4, DataType::F4E2M1FN, DataType::F8E4M3FN),
-            Ok((ArrayIrValue::Array(elements), ArrayIrValue::Array(scales))),
+            Ok(BlockQuantizedValue::new(ArrayIrValue::Array(elements), ArrayIrValue::Array(scales))),
         );
     }
 
@@ -3084,7 +3263,8 @@ mod tests {
         // Quantizing a tracer stages the composition, and the staged outputs carry the element and scale types.
         let (output_types, program) = TracingContext::<Array, ArrayOperation<Array>>::trace(
             |input: Tracer<_>| {
-                let (elements, scales) = input.block_quantize(4, DataType::F4E2M1FN, DataType::F8E4M3FN)?;
+                let BlockQuantizedValue { elements, scales, .. } =
+                    input.block_quantize(4, DataType::F4E2M1FN, DataType::F8E4M3FN)?;
                 Ok(vec![elements, scales])
             },
             ArrayType::new_static(DataType::F32, [2, 8]),
@@ -3160,7 +3340,8 @@ mod tests {
         let extent = DimensionVariable::new("n", DimensionBounds::new(0, Some(9)).unwrap());
         let (_, program) = TracingContext::<ArrayIrValue<Array>, ArrayIrOperation<Array>>::trace(
             |inputs: Vec<Tracer<_>>| {
-                let (elements, scales) = inputs[0].block_quantize(4, DataType::F8E4M3FN, DataType::F8E8M0FNU)?;
+                let BlockQuantizedValue { elements, scales, .. } =
+                    inputs[0].block_quantize(4, DataType::F8E4M3FN, DataType::F8E8M0FNU)?;
                 Ok(vec![elements, scales])
             },
             vec![ArrayIrType::Array(ArrayType::new(DataType::F32, Shape::new(vec![Dimension::Dynamic(extent)])))],
@@ -3278,7 +3459,8 @@ mod tests {
             "#}.trim_end(),
         );
         let input = Array::vector(vec![3.0f32, 1.5, 0.5, 6.0]).unwrap();
-        let (elements, scales) = input.block_quantize(4, DataType::F8E4M3FN, DataType::F8E8M0FNU).unwrap();
+        let BlockQuantizedValue { elements, scales, .. } =
+            input.block_quantize(4, DataType::F8E4M3FN, DataType::F8E8M0FNU).unwrap();
         let expected = vec![ArrayIrValue::Array(elements), ArrayIrValue::Array(scales)];
         assert_eq!(program.interpret(vec![ArrayIrValue::Array(input.clone())]), Ok(expected.clone()));
         assert_eq!(
@@ -3289,7 +3471,8 @@ mod tests {
             Ok(expected)
         );
         let input = Array::vector(vec![3.0f32, 1.5, 0.5, 6.0, 0.5, 1.0, 0.25, 1.5]).unwrap();
-        let (elements, scales) = input.block_quantize(4, DataType::F8E4M3FN, DataType::F8E8M0FNU).unwrap();
+        let BlockQuantizedValue { elements, scales, .. } =
+            input.block_quantize(4, DataType::F8E4M3FN, DataType::F8E8M0FNU).unwrap();
         assert_eq!(
             program.interpret(vec![ArrayIrValue::Array(input)]),
             Ok(vec![ArrayIrValue::Array(elements), ArrayIrValue::Array(scales)]),
@@ -3313,7 +3496,8 @@ mod tests {
 
         // Replaying the dynamic program through batching keeps one shared extent for every mapped row.
         let input = Array::matrix(2, 4, vec![3.0f32, 1.5, 0.5, 6.0, 0.5, 1.0, 0.25, 1.5]).unwrap();
-        let (elements, scales) = input.block_quantize(4, DataType::F8E4M3FN, DataType::F8E8M0FNU).unwrap();
+        let BlockQuantizedValue { elements, scales, .. } =
+            input.block_quantize(4, DataType::F8E4M3FN, DataType::F8E8M0FNU).unwrap();
         assert_eq!(
             batch(
                 |input| program.interpret_in_context(&input.domain(), vec![input]),
@@ -3331,7 +3515,8 @@ mod tests {
         let extent = DimensionVariable::new("batch", DimensionBounds::new(0, Some(3)).unwrap());
         let (_, program) = TracingContext::<ArrayIrValue<Array>, ArrayIrOperation<Array>>::trace(
             |input: Tracer<_>| {
-                let (elements, scales) = input.block_quantize(2, DataType::F8E5M2, DataType::F8E8M0FNU)?;
+                let BlockQuantizedValue { elements, scales, .. } =
+                    input.block_quantize(2, DataType::F8E5M2, DataType::F8E8M0FNU)?;
                 Ok(vec![elements, scales])
             },
             ArrayIrType::Array(ArrayType::new(
@@ -3399,13 +3584,15 @@ mod tests {
             .trim_end(),
         );
         let input = Array::matrix(2, 4, vec![3.0f64, 1.5, 0.5, 6.0, 0.5, 1.0, 0.25, 1.5]).unwrap();
-        let (elements, scales) = input.block_quantize(2, DataType::F8E5M2, DataType::F8E8M0FNU).unwrap();
+        let BlockQuantizedValue { elements, scales, .. } =
+            input.block_quantize(2, DataType::F8E5M2, DataType::F8E8M0FNU).unwrap();
         assert_eq!(
             program.interpret(ArrayIrValue::Array(input)),
             Ok(vec![ArrayIrValue::Array(elements), ArrayIrValue::Array(scales)]),
         );
         let input = Array::matrix(0, 4, vec![] as Vec<f64>).unwrap();
-        let (elements, scales) = input.block_quantize(2, DataType::F8E5M2, DataType::F8E8M0FNU).unwrap();
+        let BlockQuantizedValue { elements, scales, .. } =
+            input.block_quantize(2, DataType::F8E5M2, DataType::F8E8M0FNU).unwrap();
         assert_eq!(
             program.interpret(ArrayIrValue::Array(input)),
             Ok(vec![ArrayIrValue::Array(elements), ArrayIrValue::Array(scales)]),
@@ -3469,7 +3656,8 @@ mod tests {
         };
         let (output_types, program) = TracingContext::<Array, ArrayOperation<Array>>::trace_with_named_axes(
             |input: Tracer<_>| {
-                let (elements, scales) = input.block_quantize(4, DataType::F4E2M1FN, DataType::F8E4M3FN)?;
+                let BlockQuantizedValue { elements, scales, .. } =
+                    input.block_quantize(4, DataType::F4E2M1FN, DataType::F8E4M3FN)?;
                 Ok(vec![elements, scales])
             },
             varying(DataType::F32, 8),
@@ -3567,7 +3755,8 @@ mod tests {
         );
         let (output_types, program) = TracingContext::<Array, ArrayOperation<Array>>::trace_with_named_axes(
             |input: Tracer<_>| {
-                let (elements, scales) = input.block_quantize(4, DataType::F8E4M3FN, DataType::F8E8M0FNU)?;
+                let BlockQuantizedValue { elements, scales, .. } =
+                    input.block_quantize(4, DataType::F8E4M3FN, DataType::F8E8M0FNU)?;
                 Ok(vec![elements, scales])
             },
             varying(DataType::F32, 8),
@@ -3662,7 +3851,8 @@ mod tests {
         };
         let (output_types, program) = TracingContext::<Array, ArrayOperation<Array>>::trace(
             |input: Tracer<_>| {
-                let (elements, scales) = input.block_quantize(4, DataType::F4E2M1FN, DataType::F8E4M3FN)?;
+                let BlockQuantizedValue { elements, scales, .. } =
+                    input.block_quantize(4, DataType::F4E2M1FN, DataType::F8E4M3FN)?;
                 Ok(vec![elements, scales])
             },
             sharded(DataType::F32, 8),
@@ -3748,7 +3938,7 @@ mod tests {
         let (output_types, program) =
             TracingContext::<ArrayIrValue<Array>, ArrayIrOperation<Array>>::trace_with_named_axes(
                 |(input, global_scale): (Tracer<_>, Tracer<_>)| {
-                    let (elements, scales) = input.block_quantize_with_options(
+                    let BlockQuantizedValue { elements, scales, .. } = input.block_quantize_with_options(
                         4,
                         DataType::F4E2M1FN,
                         DataType::F8E4M3FN,
@@ -3881,9 +4071,9 @@ mod tests {
             vec![1.0f32, 2.0, 0.5, 0.25, 3.0, 6.0, 1.0, 1.5, 3.0, 0.5, 12.0, 2.0, 1.0, 1.0, 3.0, 6.0],
         )
         .unwrap();
-        let (elements, scales) =
+        let BlockQuantizedValue { elements, scales, .. } =
             input.block_quantize_with_options(2, DataType::F4E2M1FN, DataType::F8E4M3FN, 0, None, None).unwrap();
-        let (transposed_elements, transposed_scales) = input
+        let BlockQuantizedValue { elements: transposed_elements, scales: transposed_scales, .. } = input
             .transpose(vec![1, 0])
             .unwrap()
             .block_quantize(2, DataType::F4E2M1FN, DataType::F8E4M3FN)
@@ -3894,7 +4084,7 @@ mod tests {
 
         // Two block axes form tiles that share one scale. Every tile below is a scaled copy of `f4e2m1fn` grid points,
         // so quantization is exact and dequantization over both block axes reproduces the input.
-        let (elements, scales) = input
+        let BlockQuantizedValue { elements, scales, .. } = input
             .block_quantize_with_options(2, DataType::F4E2M1FN, DataType::F8E4M3FN, [0, 1], None, None)
             .unwrap();
         assert_eq!(scales.r#type().into_owned(), ArrayType::new_static(DataType::F8E4M3FN, [2, 2]));
@@ -3903,7 +4093,10 @@ mod tests {
             elements.to_f64s(),
             vec![1.0, 2.0, 2.0, 1.0, 3.0, 6.0, 4.0, 6.0, 6.0, 1.0, 6.0, 1.0, 2.0, 2.0, 1.5, 3.0],
         );
-        assert_eq!(elements.block_dequantize(&scales, [0, 1], DataType::F32), Ok(input));
+        assert_eq!(
+            BlockQuantizedValue::new(elements.clone(), scales.clone()).block_dequantize([0, 1], DataType::F32),
+            Ok(input),
+        );
     }
 
     #[test]
@@ -3912,27 +4105,75 @@ mod tests {
         // the same elements and scales, and the global scale restores the input after dequantization.
         let input = Array::vector(vec![12.0f32, 6.0, 2.0, 24.0, 2.0, 4.0, 1.0, 6.0]).unwrap();
         let global_scale = Array::scalar(4.0f32).unwrap();
-        let (elements, scales) = input
+        let quantized = input
             .block_quantize_with_options(4, DataType::F4E2M1FN, DataType::F8E4M3FN, -1, Some(&global_scale), None)
             .unwrap();
-        assert_eq!(scales.to_f64s(), vec![1.0, 0.25]);
-        assert_eq!(elements.to_f64s(), vec![3.0, 1.5, 0.5, 6.0, 2.0, 4.0, 1.0, 6.0]);
-        assert_eq!(
-            elements
-                .block_dequantize(&scales, [0], DataType::F32)
-                .unwrap()
-                .mul(&Array::vector(vec![4.0f32; 8]).unwrap()),
-            Ok(input),
-        );
+        assert_eq!(quantized.scales.to_f64s(), vec![1.0, 0.25]);
+        assert_eq!(quantized.elements.to_f64s(), vec![3.0, 1.5, 0.5, 6.0, 2.0, 4.0, 1.0, 6.0]);
+        assert_eq!(quantized.global_scale, Some(global_scale.clone()));
+        assert_eq!(quantized.block_dequantize([0], DataType::F32), Ok(input));
 
         // Without the global scale, the block maximum `6000` exceeds `6 · 448` and saturates, while the global scale
         // brings it back into range.
         let input = Array::vector(vec![6000.0f32, 3000.0, 0.0, 0.0, 1.0, 1.0, 1.0, 1.0]).unwrap();
-        let (elements, scales) = input
+        let BlockQuantizedValue { elements, scales, .. } = input
             .block_quantize_with_options(4, DataType::F4E2M1FN, DataType::F8E4M3FN, -1, Some(&global_scale), None)
             .unwrap();
         assert_eq!(scales.to_f64s(), vec![256.0, 0.04296875]);
         assert_eq!(elements.to_f64s(), vec![6.0, 3.0, 0.0, 0.0, 6.0, 6.0, 6.0, 6.0]);
+    }
+
+    #[test]
+    fn test_block_quantize_with_options_global_scale_array_ir() {
+        let input = ArrayIrValue::Array(Array::vector(vec![6.0f32, 3.0, 1.0, 12.0]).unwrap());
+        let global_scale = ArrayIrValue::Array(Array::scalar(2.0f32).unwrap());
+        let quantized = input
+            .block_quantize_with_options(4, DataType::F4E2M1FN, DataType::F8E4M3FN, -1, Some(&global_scale), None)
+            .unwrap();
+        assert_eq!(quantized.global_scale, Some(global_scale.clone()));
+        assert_eq!(quantized.block_dequantize([-1], DataType::F32), Ok(input));
+
+        // The dynamic quantization branch must also retain the supplied scale. Selecting that field and removing
+        // unused arithmetic exposes its exact connection to the input without depending on the numerical recipe.
+        let extent = DimensionVariable::new("n", DimensionBounds::new(0, Some(9)).unwrap());
+        let (output_type, program) = TracingContext::<ArrayIrValue<Array>, ArrayIrOperation<Array>>::trace(
+            |(input, global_scale): (Tracer<_>, Tracer<_>)| {
+                let quantized = input.block_quantize_with_options(
+                    4,
+                    DataType::F4E2M1FN,
+                    DataType::F8E4M3FN,
+                    1,
+                    Some(&global_scale),
+                    None,
+                )?;
+                Ok(quantized.global_scale.unwrap())
+            },
+            (
+                ArrayIrType::Array(ArrayType::new(
+                    DataType::F32,
+                    Shape::new(vec![Dimension::Dynamic(extent), Dimension::Static(4)]),
+                )),
+                ArrayIrType::Array(ArrayType::scalar(DataType::F32)),
+            ),
+        )
+        .unwrap();
+        assert_eq!(output_type, ArrayIrType::Array(ArrayType::scalar(DataType::F32)));
+        let program = program.simplified().unwrap();
+        assert_eq!(
+            program.to_string(),
+            indoc! {"
+                lambda %0:f32[n, 4], %1:f32[] .
+                in (%1)
+            "}
+            .trim_end(),
+        );
+        assert_eq!(
+            program.interpret((
+                ArrayIrValue::Array(Array::matrix(0, 4, Vec::<f32>::new()).unwrap()),
+                global_scale.clone(),
+            )),
+            Ok(global_scale),
+        );
     }
 
     #[test]
@@ -3942,7 +4183,7 @@ mod tests {
         // Each value rounds up exactly when its noise reaches its distance from the grid value below it.
         let input = Array::vector(vec![6.0f32, 1.3, -1.3, 0.2]).unwrap();
         let noise = Array::vector(vec![0.0f32, 0.3, 0.3, 0.7]).unwrap();
-        let (elements, scales) = input
+        let BlockQuantizedValue { elements, scales, .. } = input
             .block_quantize_with_options(4, DataType::F4E2M1FN, DataType::F8E4M3FN, -1, None, Some(&noise))
             .unwrap();
         assert_eq!(scales.to_f64s(), vec![1.0]);
@@ -3953,13 +4194,13 @@ mod tests {
         // (`f8e5m2`). The scales are `1`, and the quotients `448 / 32 = 14` and `57344 / 8192 = 7` are integers.
         let noise = Array::vector(vec![1.0f32 - f32::EPSILON / 2.0, 0.0, 0.0, 0.0]).unwrap();
         let input = Array::vector(vec![448.0f32, 0.0, 0.0, 0.0]).unwrap();
-        let (elements, scales) = input
+        let BlockQuantizedValue { elements, scales, .. } = input
             .block_quantize_with_options(4, DataType::F8E4M3FN, DataType::F8E8M0FNU, -1, None, Some(&noise))
             .unwrap();
         assert_eq!(scales.to_f64s(), vec![1.0]);
         assert_eq!(elements.to_f64s(), vec![448.0, 0.0, 0.0, 0.0]);
         let input = Array::vector(vec![57344.0f32, 0.0, 0.0, 0.0]).unwrap();
-        let (elements, scales) = input
+        let BlockQuantizedValue { elements, scales, .. } = input
             .block_quantize_with_options(4, DataType::F8E5M2, DataType::F8E8M0FNU, -1, None, Some(&noise))
             .unwrap();
         assert_eq!(scales.to_f64s(), vec![1.0]);
@@ -3977,7 +4218,7 @@ mod tests {
             &(0..10).flat_map(|row| [(row as f64 + 0.5) / 10.0; 8]).collect::<Vec<_>>(),
         )
         .unwrap();
-        let (elements, scales) = input
+        let BlockQuantizedValue { elements, scales, .. } = input
             .block_quantize_with_options(4, DataType::F4E2M1FN, DataType::F8E4M3FN, -1, None, Some(&noise))
             .unwrap();
         assert_eq!(scales.to_f64s(), vec![1.0; 20]);
@@ -3990,7 +4231,7 @@ mod tests {
                 .to_f64s(),
             vec![60.0, 13.0, -13.0, 2.0, 0.0, -60.0, 25.0, 7.5],
         );
-        let (elements, scales) = input
+        let BlockQuantizedValue { elements, scales, .. } = input
             .convert_element_type(DataType::F32)
             .unwrap()
             .block_quantize_with_options(
@@ -4019,7 +4260,7 @@ mod tests {
         // Stochastic rounding computes the grid spacing from the exponent bits of the quotients.
         let (_, program) = TracingContext::<Array, ArrayOperation<Array>>::trace(
             |(input, global_scale, noise): (Tracer<_>, Tracer<_>, Tracer<_>)| {
-                let (elements, scales) = input.block_quantize_with_options(
+                let BlockQuantizedValue { elements, scales, .. } = input.block_quantize_with_options(
                     2,
                     DataType::F4E2M1FN,
                     DataType::F8E4M3FN,
@@ -4111,7 +4352,7 @@ mod tests {
             ArrayType::new(DataType::F32, Shape::new(vec![Dimension::Dynamic(rows), Dimension::Dynamic(columns)]));
         let (_, program) = TracingContext::<ArrayIrValue<Array>, ArrayIrOperation<Array>>::trace(
             |(input, global_scale, noise): (Tracer<_>, Tracer<_>, Tracer<_>)| {
-                let (elements, scales) = input.block_quantize_with_options(
+                let BlockQuantizedValue { elements, scales, .. } = input.block_quantize_with_options(
                     4,
                     DataType::F4E2M1FN,
                     DataType::F8E4M3FN,
@@ -4218,7 +4459,7 @@ mod tests {
         let input = Array::matrix(4, 8, (0..32).map(|index| index as f32 / 3.0 - 5.0).collect()).unwrap();
         let global_scale = Array::scalar(2.0f32).unwrap();
         let noise = Array::matrix(4, 8, vec![0.75f32; 32]).unwrap();
-        let (elements, scales) = input
+        let BlockQuantizedValue { elements, scales, .. } = input
             .block_quantize_with_options(
                 4,
                 DataType::F4E2M1FN,
@@ -4319,9 +4560,13 @@ mod tests {
         let elements = Array::vector(vec![1i32, 2, 3, 4]).unwrap();
         let scales = Array::vector(vec![2.0f32, 3.0]).unwrap();
         let expected = Array::vector(vec![2.0f64, 4.0, 9.0, 12.0]).unwrap();
-        assert_eq!(elements.block_dequantize(&scales, [-1], DataType::F64), Ok(expected.clone()));
         assert_eq!(
-            ArrayIrValue::Array(elements).block_dequantize(&ArrayIrValue::Array(scales), [-1], DataType::F64),
+            BlockQuantizedValue::new(elements.clone(), scales.clone()).block_dequantize([-1], DataType::F64),
+            Ok(expected.clone())
+        );
+        assert_eq!(
+            BlockQuantizedValue::new(ArrayIrValue::Array(elements), ArrayIrValue::Array(scales))
+                .block_dequantize([-1], DataType::F64),
             Ok(ArrayIrValue::Array(expected)),
         );
 
@@ -4329,27 +4574,50 @@ mod tests {
         let elements = Array::scalar(1.00390625f64).unwrap();
         let scales = elements.clone();
         assert_eq!(
-            elements.block_dequantize(&scales, Axes::default(), DataType::BF16),
+            BlockQuantizedValue::new(elements.clone(), scales.clone())
+                .block_dequantize(Axes::default(), DataType::BF16),
             Ok(Array::scalar(1.0f32).unwrap().convert_element_type(DataType::BF16).unwrap()),
         );
         assert_eq!(
-            elements.block_dequantize(&scales, Axes::default(), DataType::F32),
+            BlockQuantizedValue::new(elements.clone(), scales.clone()).block_dequantize(Axes::default(), DataType::F32),
             Ok(Array::scalar(1.0078277587890625f32).unwrap()),
         );
         assert_eq!(
-            ArrayIrValue::Array(elements).block_dequantize(
-                &ArrayIrValue::Array(scales),
-                Axes::default(),
-                DataType::F32,
-            ),
+            BlockQuantizedValue::new(ArrayIrValue::Array(elements), ArrayIrValue::Array(scales))
+                .block_dequantize(Axes::default(), DataType::F32),
             Ok(ArrayIrValue::Array(Array::scalar(1.0078277587890625f32).unwrap())),
         );
         let elements = Array::vector(vec![true, false, true, false]).unwrap();
         let scales = Array::vector(vec![2.0f32, 3.0]).unwrap();
         assert_eq!(
-            elements.block_dequantize(&scales, [0], DataType::F32),
+            BlockQuantizedValue::new(elements.clone(), scales.clone()).block_dequantize([0], DataType::F32),
             Ok(Array::vector(vec![2.0f32, 0.0, 3.0, 0.0]).unwrap()),
         );
+    }
+
+    #[test]
+    fn test_block_dequantize_global_scale_precision() {
+        for (data_type, scale, expected, midpoint) in
+            [(DataType::BF16, 1.0078125, 3.0625, 1.00390625), (DataType::F16, 1.0009765625, 3.0078125, 1.00048828125)]
+        {
+            // The block product rounds before the global multiplication. Multiplying the scales first would yield
+            // `3.046875` in `bf16` and `3.005859375` in `f16` instead.
+            let quantized = BlockQuantizedValue::new(Array::scalar(3.0f64).unwrap(), Array::scalar(scale).unwrap())
+                .with_global_scale(Array::scalar(scale).unwrap());
+            let expected = Array::scalar(expected).unwrap().convert_element_type(data_type).unwrap();
+            assert_eq!(quantized.block_dequantize(Axes::default(), data_type), Ok(expected.clone()));
+            let quantized = quantized.map_parameters(ArrayIrValue::Array).unwrap();
+            assert_eq!(quantized.block_dequantize(Axes::default(), data_type), Ok(ArrayIrValue::Array(expected)));
+
+            // The global scale is converted before multiplication. Each midpoint rounds to `1`, giving `3` exactly.
+            // Multiplying at `f64` before narrowing would instead yield the next representable output above `3`.
+            let quantized = BlockQuantizedValue::new(Array::scalar(3.0f64).unwrap(), Array::scalar(1.0f64).unwrap())
+                .with_global_scale(Array::scalar(midpoint).unwrap());
+            let expected = Array::scalar(3.0f64).unwrap().convert_element_type(data_type).unwrap();
+            assert_eq!(quantized.block_dequantize(Axes::default(), data_type), Ok(expected.clone()));
+            let quantized = quantized.map_parameters(ArrayIrValue::Array).unwrap();
+            assert_eq!(quantized.block_dequantize(Axes::default(), data_type), Ok(ArrayIrValue::Array(expected)));
+        }
     }
 
     #[test]
@@ -4363,9 +4631,13 @@ mod tests {
             vec![2.0f32, 4.0, 9.0, 12.0, 10.0, 12.0, 21.0, 24.0, 36.0, 40.0, 55.0, 60.0, 52.0, 56.0, 75.0, 80.0],
         )
         .unwrap();
-        assert_eq!(elements.block_dequantize(&scales, [-1, 0], DataType::F32), Ok(expected.clone()));
         assert_eq!(
-            ArrayIrValue::Array(elements).block_dequantize(&ArrayIrValue::Array(scales), [-1, 0], DataType::F32),
+            BlockQuantizedValue::new(elements.clone(), scales.clone()).block_dequantize([-1, 0], DataType::F32),
+            Ok(expected.clone())
+        );
+        assert_eq!(
+            BlockQuantizedValue::new(ArrayIrValue::Array(elements), ArrayIrValue::Array(scales))
+                .block_dequantize([-1, 0], DataType::F32),
             Ok(ArrayIrValue::Array(expected)),
         );
 
@@ -4373,22 +4645,26 @@ mod tests {
         let elements = Array::vector(vec![2.0f32, 3.0]).unwrap();
         let scales = Array::vector(vec![4.0f32, 5.0]).unwrap();
         let expected = Array::vector(vec![8.0f32, 15.0]).unwrap();
-        assert_eq!(elements.block_dequantize(&scales, Axes::default(), DataType::F32), Ok(expected.clone()));
         assert_eq!(
-            ArrayIrValue::Array(elements).block_dequantize(
-                &ArrayIrValue::Array(scales),
-                Axes::default(),
-                DataType::F32,
-            ),
+            BlockQuantizedValue::new(elements.clone(), scales.clone()).block_dequantize(Axes::default(), DataType::F32),
+            Ok(expected.clone())
+        );
+        assert_eq!(
+            BlockQuantizedValue::new(ArrayIrValue::Array(elements), ArrayIrValue::Array(scales))
+                .block_dequantize(Axes::default(), DataType::F32),
             Ok(ArrayIrValue::Array(expected)),
         );
 
         // Empty non-block dimensions remain empty without rejecting the positive block ratio.
         let elements = Array::matrix(0, 4, Vec::<f32>::new()).unwrap();
         let scales = Array::matrix(0, 2, Vec::<f32>::new()).unwrap();
-        assert_eq!(elements.block_dequantize(&scales, [1], DataType::F32), Ok(elements.clone()));
         assert_eq!(
-            ArrayIrValue::Array(elements.clone()).block_dequantize(&ArrayIrValue::Array(scales), [1], DataType::F32),
+            BlockQuantizedValue::new(elements.clone(), scales.clone()).block_dequantize([1], DataType::F32),
+            Ok(elements.clone())
+        );
+        assert_eq!(
+            BlockQuantizedValue::new(ArrayIrValue::Array(elements.clone()), ArrayIrValue::Array(scales))
+                .block_dequantize([1], DataType::F32),
             Ok(ArrayIrValue::Array(elements)),
         );
     }
@@ -4396,11 +4672,11 @@ mod tests {
     #[test]
     fn test_block_dequantize_quantized_values() {
         let input = Array::vector(vec![3.0f32, 1.5, 0.5, 6.0, 0.0, 0.25, 0.5, 1.5]).unwrap();
-        let (elements, scales) = input.block_quantize(4, DataType::F4E2M1FN, DataType::F8E4M3FN).unwrap();
-        assert_eq!(elements.block_dequantize(&scales, [-1], DataType::F32), Ok(input.clone()));
+        let quantized = input.block_quantize(4, DataType::F4E2M1FN, DataType::F8E4M3FN).unwrap();
+        assert_eq!(quantized.block_dequantize([-1], DataType::F32), Ok(input.clone()));
         let input = ArrayIrValue::Array(input);
-        let (elements, scales) = input.block_quantize(4, DataType::F4E2M1FN, DataType::F8E4M3FN).unwrap();
-        assert_eq!(elements.block_dequantize(&scales, [-1], DataType::F32), Ok(input));
+        let quantized = input.block_quantize(4, DataType::F4E2M1FN, DataType::F8E4M3FN).unwrap();
+        assert_eq!(quantized.block_dequantize([-1], DataType::F32), Ok(input));
     }
 
     #[test]
@@ -4408,78 +4684,136 @@ mod tests {
         let elements = Array::vector(vec![1.0f32; 4]).unwrap();
         let scales = Array::vector(vec![2.0f32; 2]).unwrap();
         assert_eq!(
-            elements.block_dequantize(&scales, [0, -1], DataType::F32),
+            BlockQuantizedValue::new(elements.clone(), scales.clone()).block_dequantize([0, -1], DataType::F32),
             Err(ProgramError::Axis(AxisError::DuplicateAxis { axis: 0 })),
         );
         assert_eq!(
-            elements.block_dequantize(&scales, [1], DataType::F32),
+            BlockQuantizedValue::new(elements.clone(), scales.clone()).block_dequantize([1], DataType::F32),
             Err(ProgramError::Axis(AxisError::OutOfBounds { axis: Axis::from(1), rank: 1 })),
         );
         assert_eq!(
-            elements.block_dequantize(&scales, [0], DataType::I32),
+            BlockQuantizedValue::new(elements.clone(), scales.clone()).block_dequantize([0], DataType::I32),
             Err(TypeError::invalid("`block_dequantize` output data type must be floating-point but got `i32`").into()),
         );
         assert_eq!(
-            elements.convert_element_type(DataType::C64).unwrap().block_dequantize(&scales, [0], DataType::F32),
+            BlockQuantizedValue::new(elements.convert_element_type(DataType::C64).unwrap(), scales.clone())
+                .block_dequantize([0], DataType::F32),
             Err(TypeError::invalid(
                 "`block_dequantize` elements must have a real numeric or Boolean element type but got `c64`",
             )
             .into()),
         );
         assert_eq!(
-            elements.block_dequantize(&scales.convert_element_type(DataType::C64).unwrap(), [0], DataType::F32),
+            BlockQuantizedValue::new(elements.clone(), scales.convert_element_type(DataType::C64).unwrap())
+                .block_dequantize([0], DataType::F32),
             Err(TypeError::invalid(
                 "`block_dequantize` scales must have a real numeric or Boolean element type but got `c64`",
             )
             .into()),
         );
         assert_eq!(
-            elements.block_dequantize(&Array::scalar(2.0f32).unwrap(), [0], DataType::F32),
+            BlockQuantizedValue::new(elements.clone(), Array::scalar(2.0f32).unwrap())
+                .block_dequantize([0], DataType::F32),
             Err(TypeError::invalid("`block_dequantize` inputs must have the same rank").into()),
         );
         assert_eq!(
-            elements.block_dequantize(&scales, Axes::default(), DataType::F32),
+            BlockQuantizedValue::new(elements.clone(), scales.clone()).block_dequantize(Axes::default(), DataType::F32),
             Err(TypeError::invalid(
                 "`block_dequantize` non-block dimension 0 has element extent `4` but scale extent `2`",
             )
             .into()),
         );
         assert_eq!(
-            elements.block_dequantize(&Array::vector(Vec::<f32>::new()).unwrap(), [0], DataType::F32),
+            BlockQuantizedValue::new(elements.clone(), Array::vector(Vec::<f32>::new()).unwrap())
+                .block_dequantize([0], DataType::F32),
             Err(TypeError::invalid(
                 "`block_dequantize` block dimension 0 has an empty scale but scale extents must be positive",
             )
             .into()),
         );
         assert_eq!(
-            elements.block_dequantize(&Array::vector(vec![1.0f32; 3]).unwrap(), [0], DataType::F32),
+            BlockQuantizedValue::new(elements.clone(), Array::vector(vec![1.0f32; 3]).unwrap())
+                .block_dequantize([0], DataType::F32),
             Err(TypeError::invalid(
                 "`block_dequantize` element extent 4 of block dimension 0 is not divisible by scale extent 3",
             )
             .into()),
         );
         assert_eq!(
-            elements.block_dequantize(&elements, [0], DataType::F32),
+            BlockQuantizedValue::new(elements.clone(), elements.clone()).block_dequantize([0], DataType::F32),
             Err(TypeError::invalid("`block_dequantize` block dimension 0 must have ratio at least 2 but got 1").into()),
         );
         assert_eq!(
-            ArrayIrValue::Array(elements.clone()).block_dequantize(&ArrayIrValue::Array(elements), [0], DataType::F32,),
+            BlockQuantizedValue::new(ArrayIrValue::Array(elements.clone()), ArrayIrValue::Array(elements))
+                .block_dequantize([0], DataType::F32),
             Err(TypeError::invalid("`block_dequantize` block dimension 0 must have ratio at least 2 but got 1").into()),
         );
         assert_eq!(
-            ArrayIrValue::Dimension(DimensionValue::constant(4).unwrap()).block_dequantize(
-                &ArrayIrValue::Array(scales),
-                [0],
-                DataType::F32,
-            ),
+            BlockQuantizedValue::new(
+                ArrayIrValue::Dimension(DimensionValue::constant(4).unwrap()),
+                ArrayIrValue::Array(scales)
+            )
+            .block_dequantize([0], DataType::F32),
             Err(TypeError::invalid("expected array type but got dimension type").into()),
+        );
+    }
+
+    #[test]
+    fn test_block_dequantize_validation_global_scale() {
+        let quantized = BlockQuantizedValue::new(
+            Array::vector(vec![1.0f32, 2.0, 3.0, 4.0]).unwrap(),
+            Array::vector(vec![2.0f32, 3.0]).unwrap(),
+        );
+        for (global_scale, message) in [
+            (
+                Array::vector(vec![5.0f32]).unwrap(),
+                "`block_dequantize` global scale must be a rank-0 real floating-point array but got `f32[1]`",
+            ),
+            (
+                Array::scalar(5i32).unwrap(),
+                "`block_dequantize` global scale must be a rank-0 real floating-point array but got `i32[]`",
+            ),
+        ] {
+            let quantized = quantized.clone().with_global_scale(global_scale);
+            let expected = ProgramError::from(TypeError::invalid(message));
+            assert_eq!(quantized.block_dequantize([0], DataType::F32), Err(expected.clone()));
+            let quantized = quantized.map_parameters(ArrayIrValue::Array).unwrap();
+            assert_eq!(quantized.block_dequantize([0], DataType::F32), Err(expected));
+        }
+
+        // A rich non-array global scale is rejected before dimension reads or any numerical operations stage.
+        let (output_type, program) = TracingContext::<ArrayIrValue<Array>, ArrayIrOperation<Array>>::trace(
+            |quantized: BlockQuantizedValue<Tracer<_>>| {
+                assert_eq!(
+                    quantized.block_dequantize([0], DataType::F32),
+                    Err(TypeError::invalid("expected array type but got dimension type").into()),
+                );
+                Ok(quantized.elements)
+            },
+            BlockQuantizedValue::new(
+                ArrayIrType::Array(ArrayType::new_static(DataType::F32, [4])),
+                ArrayIrType::Array(ArrayType::new_static(DataType::F32, [2])),
+            )
+            .with_global_scale(ArrayIrType::Dimension(DimensionValue::constant(2).unwrap().r#type().into_owned())),
+        )
+        .unwrap();
+        assert_eq!(output_type, ArrayIrType::Array(ArrayType::new_static(DataType::F32, [4])));
+        assert_eq!(
+            program.to_string(),
+            indoc! {"
+                lambda %0:f32[4], %1:f32[2], %2:dimension<2> .
+                in (%0)
+            "}
+            .trim_end(),
         );
     }
 
     #[test]
     fn test_block_dequantize_staging() {
         let (_, program) = TracingContext::<Array, ArrayOperation<Array>>::trace(
-            |(elements, scales): (Tracer<_>, Tracer<_>)| elements.block_dequantize(&scales, [-1], DataType::F32),
+            |(elements, scales): (Tracer<_>, Tracer<_>)| {
+                BlockQuantizedValue::new(elements.clone(), scales.clone()).block_dequantize([-1], DataType::F32)
+            },
             (ArrayType::new_static(DataType::F4E2M1FN, [4]), ArrayType::new_static(DataType::F8E4M3FN, [2])),
         )
         .unwrap();
@@ -4509,7 +4843,9 @@ mod tests {
             |(elements, scales): (Tracer<_>, Tracer<_>)| {
                 let elements = ValueProjection::<ArrayType>::into_projected(elements)?;
                 let scales = ValueProjection::<ArrayType>::into_projected(scales)?;
-                Ok(elements.block_dequantize(&scales, [-1], DataType::F32)?.into_value())
+                Ok(BlockQuantizedValue::new(elements.clone(), scales.clone())
+                    .block_dequantize([-1], DataType::F32)?
+                    .into_value())
             },
             (
                 ArrayIrType::Array(ArrayType::new_static(DataType::F4E2M1FN, [4])),
@@ -4526,7 +4862,7 @@ mod tests {
         let (_, program) = TracingContext::<Array, ArrayOperation<Array>>::trace(
             |(elements, scales): (Tracer<_>, Tracer<_>)| {
                 assert_eq!(
-                    elements.block_dequantize(&scales, [0], DataType::F32),
+                    BlockQuantizedValue::new(elements.clone(), scales.clone()).block_dequantize([0], DataType::F32),
                     Err(TypeError::invalid(
                         "`block_dequantize` homogeneous inputs must have static shapes; use array IR values for \
                          dynamic extents",
@@ -4557,7 +4893,9 @@ mod tests {
         let elements = context.input(ArrayType::new_static(DataType::F32, [8]).into());
         let extent = DimensionVariable::new("scale", DimensionBounds::new(0, Some(9)).unwrap());
         let scales = context.input(ArrayType::new(DataType::F32, Shape::new(vec![Dimension::Dynamic(extent)])).into());
-        let output = elements.block_dequantize(&scales, [0], DataType::BF16).unwrap();
+        let output = BlockQuantizedValue::new(elements.clone(), scales.clone())
+            .block_dequantize([0], DataType::BF16)
+            .unwrap();
         let program = context
             .builder()
             .borrow()
@@ -4716,12 +5054,60 @@ mod tests {
     }
 
     #[test]
+    fn test_block_dequantize_global_scale_dynamic_extents() {
+        let extent = DimensionVariable::new("n", DimensionBounds::new(0, Some(9)).unwrap());
+        let array_type = ArrayType::new(DataType::F32, Shape::new(vec![Dimension::Dynamic(extent)]));
+        let (output_type, program) = TracingContext::<ArrayIrValue<Array>, ArrayIrOperation<Array>>::trace(
+            |quantized: BlockQuantizedValue<Tracer<_>>| quantized.block_dequantize(Axes::default(), DataType::F32),
+            BlockQuantizedValue::new(ArrayIrType::Array(array_type.clone()), ArrayIrType::Array(array_type.clone()))
+                .with_global_scale(ArrayIrType::Array(ArrayType::scalar(DataType::F32))),
+        )
+        .unwrap();
+        assert_eq!(output_type, ArrayIrType::Array(array_type));
+        assert_eq!(
+            program.to_string(),
+            indoc! {r#"
+                lambda %0:f32[n], %1:f32[n], %2:f32[] .
+                let %3:dimension<n ∈ [0, 9)> = dimension_size [axis=0] %0
+                    %4:dimension<n ∈ [0, 9)> = dimension_size [axis=0] %1
+                    %5:f32[n] = reshape [requires_runtime_assertion=false] %1 %3
+                    %6:f32[n] = mul %0 %5
+                    %7:f32[n] = broadcast [output_axes=[]] %2 %3
+                    %8:f32[n] = mul %6 %7
+                in (%8)
+            "#}
+            .trim_end(),
+        );
+        assert_eq!(
+            program.interpret(
+                BlockQuantizedValue::new(
+                    ArrayIrValue::Array(Array::vector(vec![1.0f32, 2.0, 3.0]).unwrap()),
+                    ArrayIrValue::Array(Array::vector(vec![2.0f32, 3.0, 4.0]).unwrap()),
+                )
+                .with_global_scale(ArrayIrValue::Array(Array::scalar(5.0f32).unwrap())),
+            ),
+            Ok(ArrayIrValue::Array(Array::vector(vec![10.0f32, 30.0, 60.0]).unwrap())),
+        );
+        assert_eq!(
+            program.interpret(
+                BlockQuantizedValue::new(
+                    ArrayIrValue::Array(Array::vector(Vec::<f32>::new()).unwrap()),
+                    ArrayIrValue::Array(Array::vector(Vec::<f32>::new()).unwrap()),
+                )
+                .with_global_scale(ArrayIrValue::Array(Array::scalar(5.0f32).unwrap())),
+            ),
+            Ok(ArrayIrValue::Array(Array::vector(Vec::<f32>::new()).unwrap())),
+        );
+    }
+
+    #[test]
     fn test_block_dequantize_batching() {
         let elements = Array::matrix(2, 4, vec![1.0f32, 2.0, 3.0, 4.0, 5.0, 6.0, 7.0, 8.0]).unwrap();
         let scales = Array::matrix(2, 2, vec![2.0f32, 3.0, 4.0, 5.0]).unwrap();
         assert_eq!(
             batch(
-                |(elements, scales)| elements.block_dequantize(&scales, [-1], DataType::F32),
+                |(elements, scales)| BlockQuantizedValue::new(elements.clone(), scales.clone())
+                    .block_dequantize([-1], DataType::F32),
                 (elements.clone(), scales.clone()),
                 (BatchAxis::new(0), BatchAxis::new(0)),
                 BatchAxis::new(0),
@@ -4731,7 +5117,8 @@ mod tests {
         );
         assert_eq!(
             batch(
-                |(elements, scales)| elements.block_dequantize(&scales, [-1], DataType::F32),
+                |(elements, scales)| BlockQuantizedValue::new(elements.clone(), scales.clone())
+                    .block_dequantize([-1], DataType::F32),
                 (ArrayIrValue::Array(elements), ArrayIrValue::Array(scales.clone())),
                 (BatchAxis::new(0), BatchAxis::new(0)),
                 BatchAxis::new(0),
@@ -4743,7 +5130,8 @@ mod tests {
         );
         assert_eq!(
             batch(
-                |(elements, scales)| elements.block_dequantize(&scales, [-1], DataType::F32),
+                |(elements, scales)| BlockQuantizedValue::new(elements.clone(), scales.clone())
+                    .block_dequantize([-1], DataType::F32),
                 (Array::vector(vec![1.0f32, 2.0, 3.0, 4.0]).unwrap(), scales),
                 (BatchAxis::replicated(), BatchAxis::new(0)),
                 BatchAxis::new(0),
@@ -4759,7 +5147,9 @@ mod tests {
         let scales = Array::vector(vec![2.0f64, 3.0]).unwrap();
         assert_eq!(
             differentiate_at((elements.clone(), scales.clone())).value_and_gradient(|(elements, scales)| {
-                elements.block_dequantize(&scales, [0], DataType::F64)?.reduce(&[0], ReductionKind::Sum)
+                BlockQuantizedValue::new(elements.clone(), scales.clone())
+                    .block_dequantize([0], DataType::F64)?
+                    .reduce(&[0], ReductionKind::Sum)
             }),
             Ok((
                 Array::scalar(27.0f64).unwrap(),
@@ -4769,7 +5159,9 @@ mod tests {
         assert_eq!(
             differentiate_at((ArrayIrValue::Array(elements.clone()), ArrayIrValue::Array(scales.clone())))
                 .value_and_gradient(|(elements, scales)| {
-                    elements.block_dequantize(&scales, [0], DataType::F64)?.reduce(&[0], ReductionKind::Sum)
+                    BlockQuantizedValue::new(elements.clone(), scales.clone())
+                        .block_dequantize([0], DataType::F64)?
+                        .reduce(&[0], ReductionKind::Sum)
                 }),
             Ok((
                 ArrayIrValue::Array(Array::scalar(27.0f64).unwrap()),
@@ -4780,18 +5172,51 @@ mod tests {
             )),
         );
         check_gradient!(
-            |elements, scales| elements.block_dequantize(&scales, [0], DataType::F64)?.reduce(&[0], ReductionKind::Sum),
+            |elements, scales| BlockQuantizedValue::new(elements.clone(), scales.clone())
+                .block_dequantize([0], DataType::F64)?
+                .reduce(&[0], ReductionKind::Sum),
             at = elements.clone(),
             with = scales.clone(),
             step = 1e-5,
             tolerance = 1e-8,
         );
         check_gradient!(
-            |scales, elements| elements.block_dequantize(&scales, [0], DataType::F64)?.reduce(&[0], ReductionKind::Sum),
+            |scales, elements| BlockQuantizedValue::new(elements.clone(), scales.clone())
+                .block_dequantize([0], DataType::F64)?
+                .reduce(&[0], ReductionKind::Sum),
             at = scales,
             with = elements,
             step = 1e-5,
             tolerance = 1e-8,
+        );
+    }
+
+    #[test]
+    fn test_block_dequantize_differentiation_global_scale() {
+        let quantized = BlockQuantizedValue::new(
+            Array::vector(vec![1.0f64, 2.0, 3.0, 4.0]).unwrap(),
+            Array::vector(vec![2.0f64, 3.0]).unwrap(),
+        )
+        .with_global_scale(Array::scalar(5.0f64).unwrap());
+        let expected_gradient = BlockQuantizedValue::new(
+            Array::vector(vec![10.0f64, 10.0, 15.0, 15.0]).unwrap(),
+            Array::vector(vec![15.0f64, 35.0]).unwrap(),
+        )
+        .with_global_scale(Array::scalar(27.0f64).unwrap());
+        assert_eq!(
+            differentiate_at(quantized.clone()).value_and_gradient(|quantized| {
+                quantized.block_dequantize([0], DataType::F64)?.reduce(&[0], ReductionKind::Sum)
+            }),
+            Ok((Array::scalar(135.0f64).unwrap(), expected_gradient.clone())),
+        );
+        assert_eq!(
+            differentiate_at(quantized.map_parameters(ArrayIrValue::Array).unwrap()).value_and_gradient(|quantized| {
+                quantized.block_dequantize([0], DataType::F64)?.reduce(&[0], ReductionKind::Sum)
+            }),
+            Ok((
+                ArrayIrValue::Array(Array::scalar(135.0f64).unwrap()),
+                expected_gradient.map_parameters(ArrayIrValue::Array).unwrap(),
+            )),
         );
     }
 
@@ -4811,11 +5236,14 @@ mod tests {
             .unwrap();
         let elements = Array::from_elements::<f32>(element_type.clone(), &[1.0; 8]).unwrap();
         let scales = Array::from_elements::<f32>(scale_type, &[2.0, 3.0, 4.0, 5.0]).unwrap();
-        let output = elements.block_dequantize(&scales, [1], DataType::F32).unwrap();
+        let output = BlockQuantizedValue::new(elements.clone(), scales.clone())
+            .block_dequantize([1], DataType::F32)
+            .unwrap();
         assert_eq!(output.r#type().as_ref(), &element_type);
         assert_eq!(output.to_f64s(), vec![2.0, 2.0, 3.0, 3.0, 4.0, 4.0, 5.0, 5.0]);
         assert_eq!(
-            ArrayIrValue::Array(elements).block_dequantize(&ArrayIrValue::Array(scales), [1], DataType::F32),
+            BlockQuantizedValue::new(ArrayIrValue::Array(elements), ArrayIrValue::Array(scales))
+                .block_dequantize([1], DataType::F32),
             Ok(ArrayIrValue::Array(output)),
         );
 
@@ -4828,12 +5256,59 @@ mod tests {
             .unwrap();
         let elements = Array::from_elements::<f32>(element_type.clone(), &[1.0; 4]).unwrap();
         let scales = Array::from_elements::<f32>(scale_type, &[2.0, 3.0]).unwrap();
-        let output = elements.block_dequantize(&scales, [0], DataType::F32).unwrap();
+        let output = BlockQuantizedValue::new(elements.clone(), scales.clone())
+            .block_dequantize([0], DataType::F32)
+            .unwrap();
         assert_eq!(output.r#type().as_ref(), &element_type);
         assert_eq!(output.to_f64s(), vec![2.0, 2.0, 3.0, 3.0]);
         assert_eq!(
-            ArrayIrValue::Array(elements).block_dequantize(&ArrayIrValue::Array(scales), [0], DataType::F32),
+            BlockQuantizedValue::new(ArrayIrValue::Array(elements), ArrayIrValue::Array(scales))
+                .block_dequantize([0], DataType::F32),
             Ok(ArrayIrValue::Array(output)),
+        );
+    }
+
+    #[test]
+    fn test_block_dequantize_global_scale_manual_variation() {
+        // Elements and block scales vary across devices, while the global scale is invariant. Its cotangent must sum
+        // the contributions of both devices through the transpose of the variation inserted by multiplication.
+        type ArrayIrContext = EagerContext<ArrayIrValue<Array>, ArrayIrOperation<Array>>;
+        let mesh = LogicalMesh::new(vec![MeshAxis::new("x", 2, MeshAxisType::Manual).unwrap()]).unwrap();
+        let sharded = Sharding::new(mesh.clone(), vec![ShardingDimension::sharded(["x"])]).unwrap();
+        let quantized = BlockQuantizedValue::new(
+            ArrayIrValue::Array(Array::vector(vec![1.0f32, 2.0, 3.0, 4.0]).unwrap()),
+            ArrayIrValue::Array(Array::vector(vec![2.0f32, 3.0]).unwrap()),
+        )
+        .with_global_scale(ArrayIrValue::Array(Array::scalar(5.0f32).unwrap()));
+        let (output, pullback) = differentiate_at(quantized)
+            .vjp(|quantized| {
+                let output = shard_map(
+                    |quantized: BlockQuantizedValue<ShardMapTracer<ArrayIrContext>>| {
+                        quantized.block_dequantize([0], DataType::F32).unwrap()
+                    },
+                    quantized.try_map_parameters(|value| {
+                        ValueProjection::<ArrayType>::into_projected(value).map_err(ProgramError::from)
+                    })?,
+                    mesh.clone(),
+                    BlockQuantizedValue::new(sharded.clone(), sharded.clone())
+                        .with_global_scale(Sharding::replicated(mesh.clone(), 0)),
+                    sharded.clone(),
+                )?;
+                Ok::<_, ProgramError>(output.into_value())
+            })
+            .unwrap();
+        let output_type = ArrayType::new_static(DataType::F32, [4]).with_sharding(sharded).unwrap();
+        assert_eq!(
+            output,
+            ArrayIrValue::Array(Array::from_elements(output_type.clone(), &[10.0f32, 20.0, 45.0, 60.0]).unwrap()),
+        );
+        assert_eq!(
+            pullback.apply_materialized(ArrayIrValue::Array(Array::from_elements(output_type, &[1.0f32; 4]).unwrap())),
+            Ok(BlockQuantizedValue::new(
+                ArrayIrValue::Array(Array::vector(vec![10.0f32, 10.0, 15.0, 15.0]).unwrap()),
+                ArrayIrValue::Array(Array::vector(vec![15.0f32, 35.0]).unwrap()),
+            )
+            .with_global_scale(ArrayIrValue::Array(Array::scalar(27.0f32).unwrap())),),
         );
     }
 
@@ -5635,7 +6110,7 @@ mod tests {
                 .unwrap()
                 .div(&Array::scalar(6.0f32 * 448.0).unwrap())
                 .unwrap();
-            let (elements, scales) = value
+            let quantized = value
                 .block_quantize_with_options(
                     16,
                     DataType::F4E2M1FN,
@@ -5645,8 +6120,7 @@ mod tests {
                     noise,
                 )
                 .unwrap();
-            let dequantized = elements.block_dequantize(&scales, axes, DataType::F32).unwrap();
-            dequantized.mul(&global_scale.broadcast(dequantized.r#type().into_owned(), &[]).unwrap()).unwrap()
+            quantized.block_dequantize(axes, DataType::F32).unwrap()
         };
         let rank_three = |value: &Array| {
             let dimensions = value.r#type().static_shape().unwrap().dimensions().to_vec();
@@ -6492,11 +6966,11 @@ mod tests {
         .unwrap();
         let dequantize = |axis: usize| {
             let quantized = rules.quantize(&weight, nvfp4, axis, true, GlobalScale::None, None).unwrap();
-            quantized.elements.block_dequantize(&quantized.scales, [axis as isize], DataType::F32).unwrap()
+            quantized.block_dequantize([axis as isize], DataType::F32).unwrap()
         };
         assert_eq!(dequantize(1), dequantize(2));
         let quantized = rules.quantize(&weight, nvfp4, 2, false, GlobalScale::None, None).unwrap();
-        assert_ne!(quantized.elements.block_dequantize(&quantized.scales, [2], DataType::F32).unwrap(), dequantize(2));
+        assert_ne!(quantized.block_dequantize([2], DataType::F32).unwrap(), dequantize(2));
     }
 
     #[test]
