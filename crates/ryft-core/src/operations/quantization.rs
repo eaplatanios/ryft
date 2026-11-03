@@ -1441,13 +1441,10 @@ where
     }
 }
 
-// TODO(eaplatanios): Review from here onwards.
-
 /// Element and scale formats of one input of a block-scaled matrix product, which [`BlockScaledDotConfiguration`]
-/// assigns to the left input, the right input, and the gradients. It is the analogue of the `BlockScaleConfig` of
-/// JAX, except that global scales are inputs of [`BlockScaledDot::call`] or computed by it rather than part of the
-/// format. The scale data type selects the [`BlockQuantize`] recipe, and formats with `f8e4m3fn` scales (e.g., NVFP4)
-/// use a global scale in addition to their block scales.
+/// assigns to the left input, the right input, and/or the gradients. The scale data type selects the [`BlockQuantize`]
+/// recipe, and formats with [`F8E4M3FN`](DataType::F8E4M3FN) scales (e.g., NVFP4) use a global scale in addition to
+/// their block scales, that is supplied as an input of [`BlockScaledDot::call`] or is computed by it.
 #[derive(Copy, Clone, Debug, PartialEq, Eq, Hash)]
 pub struct BlockScaleFormat {
     /// Number of consecutive values along the contracting dimension that share one scale.
@@ -1468,19 +1465,22 @@ impl BlockScaleFormat {
         Self { block_size, element_type, scale_type }
     }
 
-    /// Returns the NVFP4 format of NVIDIA, which has blocks of 16 `f4e2m1fn` elements with `f8e4m3fn` scales.
+    /// Returns the NVFP4 format of NVIDIA, which has blocks of 16 [`F4E2M1FN`](DataType::F4E2M1FN) elements with
+    /// [`F8E4M3FN`](DataType::F8E4M3FN) scales.
     #[inline]
     pub const fn nvfp4() -> Self {
         Self::new(16, DataType::F4E2M1FN, DataType::F8E4M3FN)
     }
 
-    /// Returns the OCP MXFP8 format, which has blocks of 32 `f8e4m3fn` elements with `f8e8m0fnu` scales.
+    /// Returns the OCP MXFP8 format, which has blocks of 32 [`F8E4M3FN`](DataType::F8E4M3FN) elements with
+    /// [`F8E8M0FNU`](DataType::F8E8M0FNU) scales.
     #[inline]
     pub const fn mxfp8() -> Self {
         Self::new(32, DataType::F8E4M3FN, DataType::F8E8M0FNU)
     }
 
-    /// Returns the OCP MXFP4 format, which has blocks of 32 `f4e2m1fn` elements with `f8e8m0fnu` scales.
+    /// Returns the OCP MXFP4 format, which has blocks of 32 [`F4E2M1FN`](DataType::F4E2M1FN) elements wit
+    /// [`F8E8M0FNU`](DataType::F8E8M0FNU) scales.
     #[inline]
     pub const fn mxfp4() -> Self {
         Self::new(32, DataType::F4E2M1FN, DataType::F8E8M0FNU)
@@ -1505,7 +1505,7 @@ impl BlockScaleFormat {
     }
 
     /// Returns whether this format uses a global scale in addition to its block scales (i.e., whether it has
-    /// `f8e4m3fn` scales), which corresponds to the `nvfp4` mode of JAX.
+    /// [`F8E4M3FN`](DataType::F8E4M3FN) scales), which corresponds to the NVFP4 format of NVIDIA.
     #[inline]
     pub fn has_global_scale(&self) -> bool {
         self.scale_type == DataType::F8E4M3FN
@@ -1522,28 +1522,30 @@ impl BlockScaleFormat {
     fn validate(&self, name: &str) -> Result<(), ProgramError> {
         if BlockElementFormat::new(self.element_type).is_err() {
             return Err(TypeError::invalid(format!(
-                "`block_scaled_dot` {name} format does not support element data type `{}`",
-                self.element_type,
+                "`block_scaled_dot` {} format does not support element data type `{}`",
+                name, self.element_type,
             ))
             .into());
         }
         if !matches!(self.scale_type, DataType::F8E4M3FN | DataType::F8E8M0FNU) {
             return Err(TypeError::invalid(format!(
-                "`block_scaled_dot` {name} format does not support scale data type `{}`",
-                self.scale_type,
+                "`block_scaled_dot` {} format does not support scale data type `{}`",
+                name, self.scale_type,
             ))
             .into());
         }
         if self.block_size < 2 {
             return Err(TypeError::invalid(format!(
-                "`block_scaled_dot` {name} format block size must be at least 2 but got {}",
-                self.block_size,
+                "`block_scaled_dot` {} format block size must be at least 2 but got {}",
+                name, self.block_size,
             ))
             .into());
         }
         Ok(())
     }
 }
+
+// TODO(eaplatanios): Review from here onwards.
 
 /// Source of the global scales of [`BlockScaleFormat`]s that use global scales.
 #[derive(Copy, Clone, Debug, Default, PartialEq, Eq, Hash)]
