@@ -2237,8 +2237,6 @@ struct BlockScaledDotRules<'o> {
     output_shape: Vec<usize>,
 }
 
-// TODO(eaplatanios): Review from here onwards.
-
 impl<'o> BlockScaledDotRules<'o> {
     /// Creates a new [`BlockScaledDotRules`] instance by validating the shapes of `lhs` and `rhs` against
     /// `configuration` and computing their normalization.
@@ -2328,11 +2326,11 @@ impl<'o> BlockScaledDotRules<'o> {
         // Multiply the extents in each group to obtain the rank-`3` shapes. Dot validation has already checked that
         // paired batching and contracting extents match, so either input determines their shared products. Empty
         // groups have product 1 and become singleton dimensions in the normalized layout.
-        let product = |shape: &[usize], axes: &[usize]| axes.iter().map(|&axis| shape[axis]).product::<usize>();
-        let batch = product(&lhs_shape, dimensions.lhs_batching_dimensions());
-        let contracting = product(&lhs_shape, dimensions.lhs_contracting_dimensions());
-        let lhs_free = product(&lhs_shape, &lhs_free_axes);
-        let rhs_free = product(&rhs_shape, &rhs_free_axes);
+        let batch = dimensions.lhs_batching_dimensions().iter().map(|&axis| lhs_shape[axis]).product::<usize>();
+        let contracting =
+            dimensions.lhs_contracting_dimensions().iter().map(|&axis| lhs_shape[axis]).product::<usize>();
+        let lhs_free = lhs_free_axes.iter().map(|&axis| lhs_shape[axis]).product::<usize>();
+        let rhs_free = rhs_free_axes.iter().map(|&axis| rhs_shape[axis]).product::<usize>();
 
         // Retain the original shapes and output shape alongside the canonical shapes so that the forward and
         // backward rules can restore the public layouts after their contractions.
@@ -2354,9 +2352,9 @@ impl<'o> BlockScaledDotRules<'o> {
         Ok(rules)
     }
 
-    /// Validates that every extent that the forward rule (or, if `backward` is set, the backward rule) blocks is a
-    /// positive multiple of the block sizes that apply to it. Like JAX, only differentiation requires the backward
-    /// extents.
+    /// Validates that every extent that the forward differentiation rule (or, if `backward` is set, the backward rule)
+    /// blocks is a positive multiple of the block sizes that apply to it. Like JAX, only differentiation requires the
+    /// backward extents.
     fn validate_extents(&self, backward: bool) -> Result<(), ProgramError> {
         let configuration = self.configuration;
         let [_, m, k] = self.lhs_canonical_shape;
@@ -2365,6 +2363,7 @@ impl<'o> BlockScaledDotRules<'o> {
             ("contracting", k, configuration.lhs_format.block_size),
             ("contracting", k, configuration.rhs_format.block_size),
         ];
+
         if backward && configuration.quantized_backward() {
             requirements.extend([
                 ("right free", n, configuration.gradient_format().block_size),
@@ -2372,22 +2371,26 @@ impl<'o> BlockScaledDotRules<'o> {
                 ("left free", m, configuration.gradient_format().block_size),
                 ("left free", m, configuration.lhs_format.block_size),
             ]);
+
             if configuration.hadamard_transform {
                 requirements.push(("left free", m, 16));
             }
         }
+
         if configuration.tiled_rhs_scales {
             requirements.push(("right free", n, configuration.rhs_format.block_size));
         }
+
         for (name, extent, block_size) in requirements {
             if extent == 0 || extent % block_size != 0 {
                 return Err(TypeError::invalid(format!(
-                    "`{BLOCK_SCALED_DOT_NAME}` {name} extent {extent} is not a positive multiple of block size \
-                     {block_size}",
+                    "`{BLOCK_SCALED_DOT_NAME}` {name} extent {extent} is not a positive multiple \
+                     of block size {block_size}",
                 ))
                 .into());
             }
         }
+
         Ok(())
     }
 
@@ -2408,8 +2411,8 @@ impl<'o> BlockScaledDotRules<'o> {
         value.reshape(Shape::new(shape.iter().map(|&size| Dimension::Static(size)).collect()))
     }
 
-    /// Restores a rank-three gradient in normalized layout to the layout of an input with `shape`, and converts it to
-    /// `data_type`.
+    /// Restores a rank-three gradient in normalized layout to the layout of an input with `shape`,
+    /// and converts it to `data_type`.
     fn denormalize<V: ConvertElementType + Reshape + Transpose>(
         &self,
         value: &V,
@@ -2549,8 +2552,8 @@ impl<'o> BlockScaledDotRules<'o> {
             let dimensions = DotDimensionNumbers::new(vec![2], vec![1], vec![0], vec![0]);
             let lhs_cotangent = self.contract(&seed_along_n, &rhs_along_n, &dimensions, self.computation_type)?;
 
-            // The weight gradient contracts the seed `[B, M, N]` with the left input `[B, M, K]` along `M`, after the
-            // optional Hadamard transform of both along `M`.
+            // The weight gradient contracts the seed `[B, M, N]` with the left input `[B, M, K]` along `M`,
+            // after the optional Hadamard transform of both along `M`.
             let (seed, lhs) = if configuration.hadamard_transform {
                 (self.hadamard_transform(&seed, m)?, self.hadamard_transform(&lhs, m)?)
             } else {
@@ -2618,7 +2621,7 @@ impl<'o> BlockScaledDotRules<'o> {
     }
 
     /// Quantizes the rank-three `value` along `axis` into the representation that [`ScaledDot`] consumes for a
-    /// contraction along `axis`. Tiled scales span both the free and the contracting dimension (i.e., axes 1 and 2)
+    /// contraction along `axis`. Tiled scales span both the free and the contracting dimension (i.e., axes `1` and `2`)
     /// and are expanded along the dimension other than `axis`.
     fn quantize<V>(
         &self,
@@ -2646,6 +2649,7 @@ impl<'o> BlockScaledDotRules<'o> {
                 Some(global_scale.clamp(&scalar(smallest)?, &scalar(f64::INFINITY)?)?)
             }
         };
+
         let block_axes = if tiled { vec![1, 2] } else { vec![axis] };
         let BlockQuantizedValue { elements, scales, global_scale } = value.block_quantize_with_options(
             format.block_size,
@@ -2655,6 +2659,7 @@ impl<'o> BlockScaledDotRules<'o> {
             global_scale.as_ref(),
             rounding_noise,
         )?;
+
         let scales = if tiled {
             // Every tile scale repeats over the `block_size` rows of its tile along the dimension other than `axis`.
             let repeated_axis = 3 - axis;
@@ -2668,6 +2673,7 @@ impl<'o> BlockScaledDotRules<'o> {
         } else {
             scales
         };
+
         Ok(BlockQuantizedValue { elements, scales, global_scale })
     }
 
@@ -2697,11 +2703,11 @@ impl<'o> BlockScaledDotRules<'o> {
         lhs.scaled_dot(rhs, Some(dimensions), Some(accumulation_type))?.convert_element_type(data_type)
     }
 
-    /// Applies the random Hadamard transform of NVIDIA Transformer Engine along the dimension of extent `extent` (axis
-    /// 1) of the rank-three `value`, multiplying every 16 consecutive values by `diag(s) · H / 4`. The 16×16 Sylvester
-    /// Hadamard matrix `H` is the Kronecker product of four 2×2 Hadamard matrices, so the transform applies one 2×2
-    /// butterfly along each of the four bits of the position within a chunk. Every butterfly adds or subtracts two
-    /// values, so the transform rounds identically on every backend, unlike a matrix product that may use reduced
+    /// Applies the random Hadamard transform of NVIDIA Transformer Engine along the dimension of extent `extent` (i.e.,
+    /// axis `1`) of the rank-`3` `value`, multiplying every 16 consecutive values by `diag(s) · H / 4`. The 16×16
+    /// Sylvester Hadamard matrix `H` is the Kronecker product of four 2×2 Hadamard matrices, so the transform applies
+    /// one 2×2 butterfly along each of the four bits of the position within a chunk. Every butterfly adds or subtracts
+    /// two values, so the transform rounds identically on every backend, unlike a matrix product that may use reduced
     /// precision (e.g., TF32 on GPUs).
     fn hadamard_transform<V>(&self, value: &V, extent: usize) -> Result<V, ProgramError>
     where
@@ -2752,6 +2758,8 @@ impl<'o> BlockScaledDotRules<'o> {
         }
         transformed.reshape(static_shape(&shape))?.div(&self.fill(value, 4.0)?)
     }
+
+    // TODO(eaplatanios): Review from here onwards.
 
     /// Builds the sign vector `s` of the random Hadamard transform in the domain of `value`. The signs `1 - 2 · b_i`
     /// derive from the bits `b_i` of the constant whose set bits mark the negative signs, extracted from coordinate
