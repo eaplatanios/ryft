@@ -43,6 +43,18 @@ and this project adheres to [Semantic Versioning](https://semver.org/).
   - **Partial Evaluation** in `ryft_core::partial` via `Program::partially_evaluate` and `Program::partition`,
     splitting known work from a residual program.
   - **Reference Discharge** via `Program::discharge_references`.
+- Added backend-neutral Just-In-Time (JIT) compilation in `ryft_core::compilation`, which backends plug into by
+  implementing `CompilationDomain`:
+  - Staging via `stage` and `Compile::stage`, followed by lowering, compilation, and execution through the
+    `StagedFunction`, `LoweredFunction`, `CompiledFunction`, and `ExecutableFunction` lifecycle handles. Runtime
+    captures are lifted into leading program inputs, and staged functions can be embedded as nested calls in enclosing
+    traces through `StagedCallOperation`s.
+  - Retained JIT dispatch via `jit` and `Compile::jit`, which return `CompiledFunctionDispatcher`s that keep the
+    compiled executables of their specializations in a bounded LRU cache.
+  - A shared `CompilationContext` that deduplicates backend compilation, with caching in memory, optional persistent
+    caching via `DiskCache`, and optional artifact exchange among processes via `CompilationArtifactExchange`, and
+    which reports `CompilationCacheStatistics` and `CompilationEvent`s.
+  - Execution with transactional external state for backends that implement `StatefulCompilationDomain`.
 - Added arrays and array programs in `ryft_core::arrays`. `ArrayType`s model data types, shapes with static or symbolic
   bounded `Dimension`s, layouts, memory spaces, and shardings over `LogicalMesh`es and `DeviceMesh`es, which are
   defined in `ryft_core::arrays::sharding`. `Array` is an eager reference implementation, `ArrayReference` provides
