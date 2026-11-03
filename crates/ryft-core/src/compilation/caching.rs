@@ -434,7 +434,22 @@ impl<'o, C: CompilationCacheDomain> InFlightProducer<'o, C> {
     fn finish(mut self, program: C::CompiledProgram) -> Arc<C::CompiledProgram> {
         let cache_key = self.cache_key.take().unwrap();
         let in_flight = self.in_flight.take().unwrap();
-        self.context.finish_success(cache_key, in_flight, program)
+        let program = Arc::new(program);
+
+        // Publish to memory before releasing the producer slot so a racing lookup can find this program.
+        // Release each lock before acquiring the next one or notifying waiters.
+        self.context
+            .programs
+            .lock()
+            .expect("compilation cache mutex should not be poisoned")
+            .put(cache_key.clone(), Arc::clone(&program));
+        self.context
+            .in_flight
+            .lock()
+            .expect("in-flight cache mutex should not be poisoned")
+            .remove(&cache_key);
+        in_flight.finish(InFlightState::Ready(Arc::clone(&program)));
+        program
     }
 }
 
@@ -442,7 +457,13 @@ impl<C: CompilationCacheDomain> Drop for InFlightProducer<'_, C> {
     fn drop(&mut self) {
         // A producer that never finished releases its waiters so that one of them can become the new producer.
         if let (Some(cache_key), Some(in_flight)) = (self.cache_key.take(), self.in_flight.take()) {
-            self.context.finish_failure(&cache_key, in_flight);
+            // Remove the marker before waking waiters so their retries can elect a new producer.
+            self.context
+                .in_flight
+                .lock()
+                .expect("in-flight cache mutex should not be poisoned")
+                .remove(&cache_key);
+            in_flight.finish(InFlightState::Failed);
         }
     }
 }
@@ -1380,31 +1401,6 @@ impl<'o, C: CompilationCacheDomain> CompilationContext<'o, C> {
             reporter(&event);
         }
     }
-
-    // TODO(eaplatanios): Review from here onwards.
-
-    /// Publishes the `program` produced for `cache_key` to the in-memory tier and to the waiters of `in_flight`.
-    fn finish_success(
-        &self,
-        cache_key: C::CacheKey,
-        in_flight: Arc<InFlightCompilation<C::CompiledProgram>>,
-        program: C::CompiledProgram,
-    ) -> Arc<C::CompiledProgram> {
-        let program = Arc::new(program);
-        self.programs
-            .lock()
-            .expect("compilation cache mutex should not be poisoned")
-            .put(cache_key.clone(), Arc::clone(&program));
-        self.in_flight.lock().expect("in-flight cache mutex should not be poisoned").remove(&cache_key);
-        in_flight.finish(InFlightState::Ready(Arc::clone(&program)));
-        program
-    }
-
-    /// Removes the in-flight marker of a failed producer for `cache_key` and releases its waiters.
-    fn finish_failure(&self, cache_key: &C::CacheKey, in_flight: Arc<InFlightCompilation<C::CompiledProgram>>) {
-        self.in_flight.lock().expect("in-flight cache mutex should not be poisoned").remove(cache_key);
-        in_flight.finish(InFlightState::Failed);
-    }
 }
 
 impl<C: CompilationCacheDomain> Default for CompilationContext<'_, C> {
@@ -1413,6 +1409,8 @@ impl<C: CompilationCacheDomain> Default for CompilationContext<'_, C> {
         Self::new()
     }
 }
+
+// TODO(eaplatanios): Review from here onwards.
 
 /// Magic bytes that open every uncompressed entry envelope, which identify files that this cache wrote apart from other
 /// gzip compressed files in its directory. The envelope header has a fixed layout, so the magic value has a fixed
