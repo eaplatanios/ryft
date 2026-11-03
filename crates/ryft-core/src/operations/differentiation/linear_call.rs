@@ -20,7 +20,7 @@ use crate::partial::{PartialValue, PartiallyEvaluatableOperation};
 use crate::programs::{
     InputRegionProvenance, MaybeZero, Operation, OperationFormatter, OperationProvider, OutputRegionProvenance,
     ProgramError, RegionDataFlow, RegionInterface, RegionSlot, TypeError, TypeIdentityRenaming, TypeRefinements, Typed,
-    Value,
+    TypedProgram, Value,
 };
 use crate::tracing::{NestedTracingContext, Tracer, TracingContext};
 

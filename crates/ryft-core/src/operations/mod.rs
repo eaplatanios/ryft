@@ -27,6 +27,7 @@ pub mod exponential;
 pub mod extrema;
 pub mod logical;
 pub mod manipulation;
+pub mod quantization;
 pub mod random;
 pub mod reductions;
 pub mod references;
@@ -142,6 +143,10 @@ pub use manipulation::{
     SliceOperation, TRANSFER_TO_MEMORY_OPERATION_NAME, TRANSPOSE_OPERATION_NAME, TransferToMemory,
     TransferToMemoryOperation, Transpose, TransposeOperation, UPDATE_SLICE_OPERATION_NAME, UpdateSlice,
     UpdateSliceOperation,
+};
+pub use quantization::{
+    BlockDequantize, BlockQuantize, BlockQuantizedValue, BlockScaleFormat, BlockScaledDot, BlockScaledDotConfiguration,
+    BlockScaledGlobalScaling, SCALED_DOT_OPERATION_NAME, ScaledDot, ScaledDotOperation, block_scaled_dot,
 };
 pub use random::{
     CategoricalSamplingMode, DynamicRngBitGenerator, RNG_BIT_GENERATOR_OPERATION_NAME, Random, RandomAlgorithm,

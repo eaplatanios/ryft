@@ -33,7 +33,8 @@ use crate::operations::composites::rules::{
 };
 use crate::parameters::{Parameter, Placeholder};
 use crate::programs::{
-    MaybeZero, Operation, Program, ProgramBuilder, ProgramError, Type, TypeError, Typed, Value, ValueProjection,
+    MaybeZero, Operation, Program, ProgramBuilder, ProgramError, Type, TypeError, Typed, TypedProgram, Value,
+    ValueProjection,
 };
 use crate::tracing::TracingContext;
 
@@ -1480,7 +1481,7 @@ where
                     &aligned_inputs.iter().map(|&index| aligned_axes[index]).collect::<Vec<_>>(),
                     &key.level,
                 )?;
-                for (&index, r#type) in aligned_inputs.iter().zip(alignment.output_types()) {
+                for (&index, r#type) in aligned_inputs.iter().zip(alignment.output_types().into_owned()) {
                     aligned_types[index] = r#type;
                 }
                 Some(alignment)

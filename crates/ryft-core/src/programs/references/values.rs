@@ -112,18 +112,28 @@ impl ReferenceGeneration {
 ///
 /// Each reference alias family has one synchronized state. The following diagram illustrates its lifecycle:
 ///
-/// ```mermaid
-/// stateDiagram-v2
-///   [*] --> Ready: new at generation 0
-///   Ready --> Ready: write, swap, or update (generation + 1)
-///   Ready --> Taken: synchronous take or asynchronous submission (generation + 1)
-///   Pending --> Taken: chained asynchronous submission (generation + 1)
-///   Taken --> Ready: replace synchronously
-///   Taken --> Pending: commit asynchronous replacement
-///   Taken --> Poisoned: guard drop or backend failure
-///   Pending --> Ready: backend completion succeeds
-///   Pending --> Poisoned: backend completion fails
-///   Ready --> Frozen: freeze
+/// ```text
+///                     ┌───────────────────────┐
+///                     │ Initial               │
+///                     └───┬───────────────────┘
+///   `new` at generation 0 │
+///                         │       ┌──────┐ `write`, `swap`, or `update` (generation + 1)
+///                         ▼       │      ▼
+/// ┌────────┐ `freeze` ┌───────────┴───────────┐          completion succeeds
+/// │ Frozen │◀─────────┤ Ready                 │◀───────────────────────────────────────┐
+/// └────────┘          └─────────────────┬─────┘                                        │
+///                                       │   ▲                                          │
+/// `take` or submission (generation + 1) │   │ `replace` synchronously                  │
+///                                       ▼   │                                          │
+///                     ┌─────────────────────┴─┐ commit asynchronous replacement  ┌─────┴───┐
+///                     │ Taken                 ├─────────────────────────────────▶│ Pending │
+///                     └────────────┬──────────┘                                  └──┬───┬──┘
+///                                  │       ▲ chained submission (generation + 1)    │   │
+///   guard drop or backend failure  │       └────────────────────────────────────────┘   │
+///                                  ▼                                                    │
+///                     ┌───────────────────────┐            completion fails             │
+///                     │ Poisoned              │◀────────────────────────────────────────┘
+///                     └───────────────────────┘
 /// ```
 ///
 /// `Ready` exposes a completed immutable snapshot. `Taken` contains no accessible value: the value was either returned
@@ -151,7 +161,6 @@ impl ReferenceGeneration {
 /// bidirectionally at the shared-state boundary. Because exact clones share that metadata, `Reference<V>` is [`Send`]
 /// and [`Sync`] only when the referent value and its type and identity metadata are all safe to share across threads
 /// (i.e., they are all `Send + Sync`).
-#[cfg_attr(doc, ryft_macros::mermaid)]
 #[derive(Parameter)]
 pub struct Reference<V: Value> {
     /// Immutable [`ReferenceHandle`] shared by exact clones. All runtime mutability lives behind its shared state lock.
@@ -746,12 +755,20 @@ enum ReferenceState<V: Value> {
 ///
 /// An asynchronous read keeps the state `Ready` or `Pending` and records how long its snapshot must remain valid:
 ///
-/// ```mermaid
-/// flowchart LR
-///   state["Ready or Pending"] -->|observe| observation["ReferenceObservation"]
-///   observation --> submission["Submit backend read"]
-///   submission -->|use snapshot after dependency| execution["Backend execution"]
-///   submission -->|preserve value until completion| state
+/// ```text
+/// ┌──────────────────┐      `observe`     ┌────────────────────────┐
+/// │ Ready or Pending ├───────────────────▶│ `ReferenceObservation` │
+/// └──────────────────┘                    └─────┬──────────────────┘
+///     ▲                                         │
+///     │                                         ▼
+///     │  preserve value until completion  ┌────────────────────────┐
+///     └───────────────────────────────────┤ Submit Backend Read    │
+///                                         └─────┬──────────────────┘
+///                                               │ use snapshot after dependency
+///                                               ▼
+///                                         ┌────────────────────────┐
+///                                         │ Backend Execution      │
+///                                         └────────────────────────┘
 /// ```
 ///
 /// [`Self::preserve_value_until`] is infallible because this guard can protect only observable state. Before a later
@@ -761,21 +778,49 @@ enum ReferenceState<V: Value> {
 /// An asynchronous mutation first observes the value and prepares backend work. It then reacquires the guard and
 /// verifies that the observed generation is still current before submitting that work:
 ///
-/// ```mermaid
-/// flowchart LR
-///   state["Ready or Pending"] -->|observe| prepare["Prepare execution"]
-///   prepare --> validate["Reacquire guard and check observation"]
-///   validate -->|stale| state
-///   validate -->|prepare_replacement| preparation{"Read leases active?"}
-///   preparation -->|yes| retry["Wait and retry"]
-///   retry --> state
-///   preparation -->|no| prepared["PreparedReferenceReplacement"]
-///   prepared -->|submission succeeds; begin| transaction["ReferenceReplacementTransaction (Taken)"]
-///   transaction -->|validate| validated["ValidatedPendingReplacementTransaction"]
-///   validated -->|commit| pending["ReadyOrPendingReferenceGuard (Pending)"]
-///   pending -->|completion succeeds| ready["Ready"]
-///   pending -->|completion fails| poisoned["Poisoned"]
-///   transaction -->|poison or drop| poisoned
+/// ```text
+/// ┌───────────────────────────────────────────┐
+/// │ Ready or Pending                          │◀──────────────────────────────────────┐
+/// └───┬───────────────────────────────────────┘                                       │
+///     │ `observe`                                                                     │
+///     ▼                                                                               │
+/// ┌───────────────────────────────────────────┐                                       │
+/// │ Prepare execution                         │                                       │
+/// └───┬───────────────────────────────────────┘                                       │
+///     ▼                                                                               │
+/// ┌───────────────────────────────────────────┐                 stale                 │
+/// │ Reacquire guard and check observation     ├───────────────────────────────────────┤
+/// └───┬───────────────────────────────────────┘                                       │
+///     │ `prepare_replacement`                                                         │
+///     ▼                                                                               │
+/// ┌───────────────────────────────────────────┐        yes        ┌────────────────┐  │
+/// │ Read leases active?                       ├──────────────────▶│ Wait and retry ├──┘
+/// └───┬───────────────────────────────────────┘                   └────────────────┘
+///     │ no
+///     ▼
+/// ┌───────────────────────────────────────────┐
+/// │ `PreparedReferenceReplacement`            │
+/// └───┬───────────────────────────────────────┘
+///     │ submission succeeds; `begin`
+///     ▼
+/// ┌───────────────────────────────────────────┐      `poison` or drop
+/// │ `ReferenceReplacementTransaction` (Taken) ├───────────────────────────┐
+/// └───┬───────────────────────────────────────┘                           │
+///     │ `validate`                                                        │
+///     ▼                                                                   │
+/// ┌───────────────────────────────────────────┐                           │
+/// │ `ValidatedPendingReplacementTransaction`  │                           │
+/// └───┬───────────────────────────────────────┘                           │
+///     │ `commit`                                                          │
+///     ▼                                                                   ▼
+/// ┌───────────────────────────────────────────┐ completion fails  ┌────────────────┐
+/// │ `ReadyOrPendingReferenceGuard` (Pending)  ├──────────────────▶│ Poisoned       │
+/// └───┬───────────────────────────────────────┘                   └────────────────┘
+///     │ completion succeeds
+///     ▼
+/// ┌───────────────────────────────────────────┐
+/// │ Ready                                     │
+/// └───────────────────────────────────────────┘
 /// ```
 ///
 /// Preparation checks active readers and computes the next generation before submission, while leaving the state
@@ -788,19 +833,21 @@ enum ReferenceState<V: Value> {
 ///
 /// A synchronous or potentially donating backend follows the following shorter extraction protocol:
 ///
-/// ```mermaid
-/// flowchart LR
-///   observable["ReadyOrPendingReferenceGuard"] -->|wait_until_ready| ready["ReadyReferenceGuard (Ready)"]
-///   ready -->|take| taken["TakenReferenceGuard (Taken)"]
-///   taken -->|replace| ready
-///   taken -->|poison or drop| poisoned["Poisoned"]
+/// ```text
+/// ┌────────────────────────────────┐ `wait_until_ready` ┌───────────────────────────────┐
+/// │ `ReadyOrPendingReferenceGuard` ├───────────────────▶│ `ReadyReferenceGuard` (Ready) │
+/// └────────────────────────────────┘                    └───┬───────────────────────────┘
+///                                                           │ `take`  ▲
+///                                                           ▼         │ `replace`
+/// ┌────────────────────────────────┐   `poison` or drop ┌─────────────┴─────────────────┐
+/// │ Poisoned                       │◀───────────────────┤ `TakenReferenceGuard` (Taken) │
+/// └────────────────────────────────┘                    └───────────────────────────────┘
 /// ```
 ///
 /// [`Self::wait_until_ready`] releases this guard while waiting for a pending mutation or read leases, then returns a
 /// guard proven to protect the `Ready` state. [`ReadyReferenceGuard::take`] returns the value and the only typestate
 /// that can resolve the resulting `Taken` state. Dropping that [`TakenReferenceGuard`] poisons the reference because
 /// the previous value is no longer available and may already have been consumed by backend work.
-#[cfg_attr(doc, ryft_macros::mermaid)]
 pub struct ReadyOrPendingReferenceGuard<'g, V: Value> {
     /// Underlying [`ReferenceGuard`].
     guard: ReferenceGuard<'g, V>,

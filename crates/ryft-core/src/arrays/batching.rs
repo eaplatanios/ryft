@@ -46,7 +46,7 @@ use crate::parameters::{Parameter, Placeholder};
 use crate::programs::{
     AttachedRegions, Operation, OperationProjection, OperationProvider, Program, ProgramError, ProjectedValue,
     ReferenceType, Region, RegionRef, RegionReplayMappings, ReplayRegionDriver, Transform, TransformArtifact, Type,
-    TypeError, Typed, Value, ValueDirectDispatch, ValueProjection,
+    TypeError, Typed, TypedProgram, Value, ValueDirectDispatch, ValueProjection,
 };
 use crate::tracing::{Tracer, TracingContext};
 
@@ -3082,7 +3082,9 @@ mod tests {
         ReferenceReadOperation, ReshardOperation,
     };
     use crate::parameters::Placeholder;
-    use crate::programs::{EmptyRegionDriver, ProgramBuilder, Provenance, ProvenanceScope, ReferenceType};
+    use crate::programs::{
+        EmptyRegionDriver, ProgramBuilder, Provenance, ProvenanceScope, ReferenceType, TypedProgram,
+    };
     use crate::specialization::SpecializationCacheStatistics;
     use crate::tests::TestArrayContext;
     use crate::tracing::{DomainTracingContext, Trace, TracingContext};
@@ -6212,8 +6214,8 @@ mod tests {
                     .with_sharding(expected_sharding)
                     .unwrap();
 
-            assert_eq!(batched.input_types(), &[expected_type.clone()]);
-            assert_eq!(batched.output_types(), &[expected_type]);
+            assert_eq!(batched.input_types().into_owned(), std::slice::from_ref(&expected_type));
+            assert_eq!(batched.output_types().into_owned(), &[expected_type]);
             assert_eq!(output_axes, vec![BatchAxis::new(1)]);
         }
     }
@@ -6251,7 +6253,7 @@ mod tests {
             .batched(3, ShardingDimension::Replicated, &[BatchAxis::new(0)], ProgramBatchingOutputAxesPolicy::Natural)
             .unwrap();
         assert_eq!(
-            wider.into_parts().0.input_types(),
+            wider.into_parts().0.input_types().as_ref(),
             &[ArrayType::new(DataType::F64, Shape::new(vec![Dimension::Static(3)]))],
         );
         region
@@ -6704,8 +6706,8 @@ mod tests {
             .batched(2, ShardingDimension::Replicated, &[BatchAxis::new(0)], ProgramBatchingOutputAxesPolicy::Natural)
             .unwrap()
             .into_parts();
-        assert_eq!(batched.input_types(), &[batched_type.clone()]);
-        assert_eq!(batched.output_types(), &[batched_type]);
+        assert_eq!(batched.input_types().into_owned(), &[batched_type.clone()]);
+        assert_eq!(batched.output_types().into_owned(), &[batched_type]);
         assert_eq!(output_axes, vec![BatchAxis::new(0)]);
 
         // Adding a replicated second input routes the elementwise rule through its broadcast path, where each dynamic

@@ -7,6 +7,7 @@ pub mod arrays;
 pub mod axes;
 pub mod batching;
 pub mod captures;
+pub mod compilation;
 pub mod contexts;
 pub mod differentiation;
 pub mod errors;
@@ -48,6 +49,15 @@ pub use batching::{
     check_batching_rule_consistency,
 };
 pub use captures::{CaptureConstant, CaptureReference, CapturingContext, ClosedProgram};
+pub use compilation::{
+    AnalyzableCompilationDomain, CompilationArtifactExchange, CompilationArtifactExchangePolicy,
+    CompilationCacheDomain, CompilationCacheStatistics, CompilationCacheTier, CompilationContext, CompilationDomain,
+    CompilationEvent, CompilationExchangeError, CompilationLookupOutcome, CompilationMissReason, CompilationSkipReason,
+    CompilationStep, CompilationStepError, CompilationStepOutcome, CompilationTracer, Compile, CompiledFunction,
+    CompiledFunctionDispatcher, DiskCache, DispatcherStatistics, ExecutableFunction, LoweredFunction,
+    StagedCallOperation, StagedFunction, StagedProgram, StatefulCompilationDomain, StatefulExecution, jit,
+    jit_with_options, jit_with_options_and_capacity, stage,
+};
 pub use contexts::{
     Context, ContextProjection, Domain, DomainProjection, EagerContext, ProjectedContext, StagingContext,
     ValueResolution,
@@ -87,10 +97,12 @@ pub use operations::{
     Accuracy, Add, AddOperation, And, AndOperation, ArgMax, ArgMaxOperation, ArgMin, ArgMinOperation,
     ArithmeticDimensionOperation, ArithmeticOperations, ArrayAssertionBatchingPolicy, Assert, AssertOperation,
     AssertionError, AssertionFailure, AssertionValue, Atan2, Atan2Operation, AxisIndex, AxisIndexOperation,
-    BROADCAST_OPERATION_NAME, BasicIndex, BatchedComposite, Broadcast, BroadcastInvariantBatching, BroadcastOperation,
-    BroadcastSensitiveBatching, CAST_OPERATION_NAME, CEIL_OPERATION_NAME, CLAMP_OPERATION_NAME, COMPARE_OPERATION_NAME,
-    COMPLEX_OPERATION_NAME, COMPOSITE_OPERATION_NAME, COMPOSITE_TRANSPOSE_OPERATION_NAME, CONCATENATE_OPERATION_NAME,
-    CONDITION_OPERATION_NAME, CONJUGATE_OPERATION_NAME, CONSTANT_OPERATION_NAME, CONSTRAIN_SHARDING_OPERATION_NAME,
+    BROADCAST_OPERATION_NAME, BasicIndex, BatchedComposite, BlockDequantize, BlockQuantize, BlockQuantizedValue,
+    BlockScaleFormat, BlockScaledDot, BlockScaledDotConfiguration, BlockScaledGlobalScaling, Broadcast,
+    BroadcastInvariantBatching, BroadcastOperation, BroadcastSensitiveBatching, CAST_OPERATION_NAME,
+    CEIL_OPERATION_NAME, CLAMP_OPERATION_NAME, COMPARE_OPERATION_NAME, COMPLEX_OPERATION_NAME,
+    COMPOSITE_OPERATION_NAME, COMPOSITE_TRANSPOSE_OPERATION_NAME, CONCATENATE_OPERATION_NAME, CONDITION_OPERATION_NAME,
+    CONJUGATE_OPERATION_NAME, CONSTANT_OPERATION_NAME, CONSTRAIN_SHARDING_OPERATION_NAME,
     CONVERT_ELEMENT_TYPE_OPERATION_NAME, COS_OPERATION_NAME, CUMULATIVE_OPERATION_NAME, CUSTOM_CALL_OPERATION_NAME,
     Capability, Cast, CastOperation, CastType, CategoricalSamplingMode, Ceil, CeilOperation, Clamp, ClampOperation,
     CollectiveMode, CollectiveOperations, CollectiveOptions, Compare, CompareOperation, ComparisonDirection,
@@ -111,8 +123,9 @@ pub use operations::{
     DimensionMax, DimensionMaxOperation, DimensionMin, DimensionMinOperation, DimensionMulOperation, DimensionPow,
     DimensionPowOperation, DimensionRemOperation, DimensionSize, DimensionSizeOperation, DimensionSubOperation,
     DimensionToScalar, DimensionToScalarOperation, Div, DivOperation, Dot, DotDimensionNumbers, DotOperation,
-    DotOperations, DynamicBroadcast, DynamicBroadcastOperation, DynamicConcatenate, DynamicFill, DynamicGather,
-    DynamicIota, DynamicManipulationOperations, DynamicOne, DynamicPad, DynamicReshape, DynamicReshapeOperation,
+    DotOperations, DotProductAttention, DotProductAttentionBackwardOperation, DotProductAttentionOperation,
+    DynamicBroadcast, DynamicBroadcastOperation, DynamicConcatenate, DynamicFill, DynamicGather, DynamicIota,
+    DynamicManipulationOperations, DynamicOne, DynamicPad, DynamicReshape, DynamicReshapeOperation,
     DynamicRngBitGenerator, DynamicScatter, DynamicSlice, DynamicSliceBounds, DynamicSliceOperation,
     DynamicSliceWithDimensions, DynamicUpdateSlice, DynamicUpdateSliceOperation, DynamicZero, ERF_OPERATION_NAME,
     EXP_M1_OPERATION_NAME, EXP_OPERATION_NAME, ElementType, ElementwiseOperation, Erf, ErfOperation, Exp, ExpM1,
@@ -147,22 +160,25 @@ pub use operations::{
     ReferenceWriteOperation, Rem, RemOperation, RematerializationOptimizationBarrier, RematerializeOperation, Reshape,
     ReshapeOperation, Reshard, ReshardDispatch, ReshardOperation, ResidualStorageOperation, Reverse, ReverseOperation,
     RngBitGenerator, RngBitGeneratorOperation, Round, RoundOperation, RoundingOperations, Rsqrt, RsqrtOperation,
-    SATURATING_SUB_OPERATION_NAME, SCAN_OPERATION_NAME, SCATTER_OPERATION_NAME, SELECT_OPERATION_NAME,
-    SIGN_OPERATION_NAME, SIN_OPERATION_NAME, SLICE_OPERATION_NAME, SORT_OPERATION_NAME, SQRT_OPERATION_NAME,
-    STOP_GRADIENT_OPERATION_NAME, SUB_OPERATION_NAME, SaturatingSub, SaturatingSubOperation, Scan,
-    ScanInterpretationDomain, ScanIterationCount, ScanOperation, ScanOptions, ScanType, Scatter,
-    ScatterDimensionNumbers, ScatterMode, ScatterOperation, ScatterOptions, ScatterReductionKind, Select,
-    SelectOperation, SequentialBatching, ShapeChangingCollectiveValue, ShardingOperations, Sign, SignOperation, Sin,
-    SinOperation, Slice, SliceOperation, Softmax, SoftmaxCrossEntropyWithTargetLogits, Sort, SortDirection,
-    SortOperation, SortOrdering, Sqrt, SqrtOperation, StopGradient, StopGradientOperation, StopGradients, Sub,
-    SubOperation, SymbolicZeroJvp, SymbolicZeroVjp, TAG_OPERATION_NAME, TAN_OPERATION_NAME, TANH_OPERATION_NAME,
-    TRANSFER_TO_MEMORY_OPERATION_NAME, TRANSPOSE_OPERATION_NAME, Tag, TagOperation, Tan, TanOperation, Tanh,
-    TanhOperation, Tolerance, TopK, TransferToMemory, TransferToMemoryOperation, Transpose, TransposeOperation,
-    TrigonometricOperations, UPDATE_SLICE_OPERATION_NAME, UnavailableCustomRules, UpdateSlice, UpdateSliceOperation,
-    VjpComposite, WHILE_OPERATION_NAME, WeakCustomRuleReference, While, WhileOperation, WhileOptions, WhilePredicate,
-    WhileType, XOR_OPERATION_NAME, Xor, XorOperation, ZERO_LIKE_OPERATION_NAME, ZERO_OPERATION_NAME, Zero, ZeroLike,
-    ZeroLikeOperation, ZeroOperation, associative_scan, composite, scan, softmax_cross_entropy_with_target_logits,
-    r#while,
+    SATURATING_SUB_OPERATION_NAME, SCALED_DOT_OPERATION_NAME, SCAN_OPERATION_NAME, SCATTER_OPERATION_NAME,
+    SELECT_OPERATION_NAME, SHARD_MAP_OPERATION_NAME, SIGN_OPERATION_NAME, SIN_OPERATION_NAME, SLICE_OPERATION_NAME,
+    SORT_OPERATION_NAME, SQRT_OPERATION_NAME, STOP_GRADIENT_OPERATION_NAME, SUB_OPERATION_NAME, SaturatingSub,
+    SaturatingSubOperation, ScaledDot, ScaledDotOperation, Scan, ScanInterpretationDomain, ScanIterationCount,
+    ScanOperation, ScanOptions, ScanType, Scatter, ScatterDimensionNumbers, ScatterMode, ScatterOperation,
+    ScatterOptions, ScatterReductionKind, Select, SelectOperation, SequentialBatching, ShapeChangingCollectiveValue,
+    ShardMap, ShardMapContext, ShardMapError, ShardMapOperation, ShardMapTracer, ShardingOperations, Sign,
+    SignOperation, Sin, SinOperation, Slice, SliceOperation, Softmax, SoftmaxCrossEntropyWithTargetLogits, Sort,
+    SortDirection, SortOperation, SortOrdering, Sqrt, SqrtOperation, StopGradient, StopGradientOperation,
+    StopGradients, Sub, SubOperation, SymbolicZeroJvp, SymbolicZeroVjp, TAG_OPERATION_NAME, TAN_OPERATION_NAME,
+    TANH_OPERATION_NAME, TRANSFER_TO_MEMORY_OPERATION_NAME, TRANSPOSE_OPERATION_NAME, Tag, TagOperation, Tan,
+    TanOperation, Tanh, TanhOperation, Tolerance, TopK, TracedShardMap, TransferToMemory, TransferToMemoryOperation,
+    Transpose, TransposeOperation, TrigonometricOperations, UPDATE_SLICE_OPERATION_NAME, UnavailableCustomRules,
+    UpdateSlice, UpdateSliceOperation, VjpComposite, WHILE_OPERATION_NAME, WeakCustomRuleReference, While,
+    WhileOperation, WhileOptions, WhilePredicate, WhileType, XOR_OPERATION_NAME, Xor, XorOperation,
+    ZERO_LIKE_OPERATION_NAME, ZERO_OPERATION_NAME, Zero, ZeroLike, ZeroLikeOperation, ZeroOperation, associative_scan,
+    block_scaled_dot, composite, scan, shard_map, shard_map_in_context, shard_map_with_options,
+    softmax_cross_entropy_with_target_logits, trace_shard_map, trace_shard_map_with_named_axes,
+    trace_shard_map_with_options, r#while,
 };
 pub use parameters::{
     ArrayParameterizedFamily, BTreeMapParameterizedFamily, HashMapParameterizedFamily, Parameter, ParameterError,
@@ -205,12 +221,12 @@ pub use programs::{
     RegionId, RegionInterface, RegionKey, RegionLiveness, RegionRef, RegionReplayMappings, RegionRole, RegionSlot,
     RegionStatistics, ReplayRegionDriver, TakenReferenceGuard, Transform, TransformArtifact, TransformCache, Type,
     TypeError, TypeIdentity, TypeIdentityClass, TypeIdentityKind, TypeIdentityPosition, TypeIdentityRenaming,
-    TypeIdentitySignature, TypeRefinements, Typed, ValidatedPendingReplacementTransaction, Value, ValueDirectDispatch,
-    ValueDispatch, ValueDomainDispatch, ValueId, ValueProjection, batch_reference_transforms, fold_projected_operation,
-    infer_projected_operation_output_types, infer_projected_operation_region_input_types, infer_reference_view_type,
-    prune_projected_operation_boundary, rewrite_reference_access_transforms, type_identities_needing_runtime_checks,
-    validate_projected_operation_region_interfaces, validate_reference_boundary,
-    validated_reference_access_descriptors,
+    TypeIdentitySignature, TypeRefinements, Typed, TypedProgram, ValidatedPendingReplacementTransaction, Value,
+    ValueDirectDispatch, ValueDispatch, ValueDomainDispatch, ValueId, ValueProjection, batch_reference_transforms,
+    fold_projected_operation, infer_projected_operation_output_types, infer_projected_operation_region_input_types,
+    infer_reference_view_type, prune_projected_operation_boundary, rewrite_reference_access_transforms,
+    type_identities_needing_runtime_checks, validate_projected_operation_region_interfaces,
+    validate_reference_boundary, validated_reference_access_descriptors,
 };
 pub use specialization::{
     ReentrantSpecializationError, SpecializationCache, SpecializationCacheEntry, SpecializationCacheError,

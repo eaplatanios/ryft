@@ -4,7 +4,7 @@
 //! Rust closure once. Operations applied to those values bind through an active [`StagingContext`], which records typed
 //! instructions in a shared [`ProgramBuilder`]. Finalization validates the resulting graph, preserves the structured
 //! input and output boundaries, and returns the program together with its inferred output types. Refer to the
-//! [`TracingContext`] documentation for a rendered diagram of this pipeline and the relationship between root and
+//! [`TracingContext`] documentation for a diagram of this pipeline and the relationship between root and
 //! nested tracing.
 //!
 //! # What Gets Traced
@@ -82,7 +82,7 @@ use crate::parameters::{Parameter, Parameterized, ParameterizedFamily, Placehold
 use crate::programs::{
     AtomId, AttachedRegions, Operation, OperationProvider, Program, ProgramBuilder, ProgramError, ProjectedValue,
     Provenance, ProvenanceScope, ProvenanceState, ReferenceIdentity, RegionRef, Type, TypeError, TypeIdentityRenaming,
-    TypeRefinements, Typed, Value, ValueDomainDispatch, ValueProjection,
+    TypeRefinements, Typed, TypedProgram, Value, ValueDomainDispatch, ValueProjection,
 };
 
 /// State carried by a [`Tracer`] that indicates whether this tracer is _live_ and has a corresponding
@@ -292,29 +292,51 @@ where
 ///
 /// # Tracing Pipeline
 ///
-/// ```mermaid
-/// %%{init: {"themeCSS": ".edgeLabel code { white-space: nowrap !important; }"}}%%
-/// flowchart TD
-///   values["Example Input Values"]
-///   root["TracingContext"]
-///   values -->|"&lt;code&gt;trace&lt;/code&gt; or &lt;code&gt;infer_output_type&lt;/code&gt;"| root
-///   types["Domain + Input Types"] -->|"&lt;code&gt;Trace&lt;/code&gt; Trait"| root
-///   request["Nested Trace Request"] --> nested["NestedTracingContext"]
-///   parent["Enclosing Context"] -->|"universe and capabilities"| nested
-///   root --> root_state["Shared Builder, Capture Table, and Named Axes"]
-///   nested --> nested_state["Fresh Builder and Local Named Axes"]
-///   nested -.->|"delegates capture registration"| parent
-///   root_state --> tracers["Symbolic Input Tracers"]
-///   nested_state --> tracers
-///   tracers -->|"invoke once"| closure["Rust Closure"]
-///   closure -->|"bind typed operations"| builder["Active Program Builder"]
-///   builder -->|"validate and build"| result["Program + Structured Boundary Metadata"]
+/// ```text
+/// ┌──────────────────────┐
+/// │ Example Input Values │
+/// └──────────┬───────────┘
+///            │ `trace` or `infer_output_type`
+///            ▼
+/// ┌──────────────────────┐   `Trace` Trait    ┌────────────────────────┐
+/// │ `TracingContext`     │◀───────────────────┤ Domain + Input Types   │
+/// └──┬───────────────────┘                    └────────────────────────┘
+///    │       delegates capture registration   ┌────────────────────────┐
+///    │    ┌┄┄┄┄┄┄┄┄┄┄┄┄┄┄┄┄┄┄┄┄┄┄┄┄┄┄┄┄┄┄┄┄┄┄▶│ Enclosing Context      │
+///    │    ┆                                   └──┬─────────────────────┘
+///    │    ┆                                      │ universe and capabilities
+///    │    ┆                                      ▼
+///    │    ┆                                   ┌────────────────────────┐   ┌──────────────────────┐
+///    │    └┄┄┄┄┄┄┄┄┄┄┄┄┄┄┄┄┄┄┄┄┄┄┄┄┄┄┄┄┄┄┄┄┄┄┄┤ `NestedTracingContext` │◀──┤ Nested Trace Request │
+///    │                                        └───────────┬────────────┘   └──────────────────────┘
+///    ▼                                                    ▼
+/// ┌───────────────────────────────────────────────┐    ┌────────────────────────────────────┐
+/// │ Shared Builder, Capture Table, and Named Axes │    │ Fresh Builder and Local Named Axes │
+/// └────────────────────┬──────────────────────────┘    └──────┬─────────────────────────────┘
+///                      ▼                                      │
+/// ┌────────────────────────────────────────┐                  │
+/// │ Symbolic Input Tracers                 │◀─────────────────┘
+/// └────────────────────┬───────────────────┘
+///                      │ invoke once
+///                      ▼
+/// ┌────────────────────────────────────────┐
+/// │ Rust Closure                           │
+/// └────────────────────┬───────────────────┘
+///                      │ bind typed operations
+///                      ▼
+/// ┌────────────────────────────────────────┐
+/// │ Active Program Builder                 │
+/// └────────────────────┬───────────────────┘
+///                      │ validate and build
+///                      ▼
+/// ┌────────────────────────────────────────┐
+/// │ Program + Structured Boundary Metadata │
+/// └────────────────────────────────────────┘
 /// ```
 ///
 /// Both paths use the same staging protocol after creating their context. The root path owns capture storage. The
 /// nested path expresses its program in the parent's type, constant, and operation universe and delegates capture
 /// registration to that parent.
-#[cfg_attr(doc, ryft_macros::mermaid)]
 pub struct TracingContext<V: Value, O: Operation<Type = V::Type>, C = V> {
     /// [`ProgramBuilder`] that owns the staged [`Program`] that is currently being traced. The builder is held behind
     /// an [`Rc`] rather than being outright owned because a single trace shares one builder across many contexts.

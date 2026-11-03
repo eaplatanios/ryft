@@ -1229,7 +1229,7 @@ mod tests {
     use crate::operations::reductions::Reduce;
     use crate::parameters::Placeholder;
     use crate::partial::PartialValue;
-    use crate::programs::{EmptyRegionDriver, Program, ProgramBuilder, ProgramRenderingMode};
+    use crate::programs::{EmptyRegionDriver, Program, ProgramBuilder, ProgramRenderingMode, TypedProgram};
 
     use super::*;
 
@@ -1770,7 +1770,7 @@ mod tests {
                     let residuals = primal_outputs.split_off(1);
                     let transposed = linearization.tangent().transpose_with_respect_to(&[0], &[]).unwrap();
                     let cotangents = transposed.interpret([vec![cotangent.clone()], residuals].concat());
-                    (transposed.output_types(), cotangents)
+                    (transposed.output_types().into_owned(), cotangents)
                 };
                 for kind in
                     [CumulativeKind::Product, CumulativeKind::LogSumExp, CumulativeKind::Max, CumulativeKind::Min]

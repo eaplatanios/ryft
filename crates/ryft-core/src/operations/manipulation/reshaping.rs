@@ -1720,7 +1720,7 @@ mod tests {
     use crate::partial::PartialValue;
     use crate::programs::{
         AttachedRegions, EmptyRegionDriver, OperationProvider, Program, ProgramBuilder, ProgramError, Provenance,
-        ProvenanceScope, Typed, ValueDomainDispatch,
+        ProvenanceScope, Typed, TypedProgram, ValueDomainDispatch,
     };
     use crate::tracing::Trace;
 
@@ -3764,10 +3764,10 @@ mod tests {
                 let context = inputs[0].context().clone();
                 program.interpret_in_context(&context, inputs)
             },
-            program.input_types(),
+            program.input_types().into_owned(),
         )
         .unwrap();
-        assert_ne!(replayed_types, program.output_types());
+        assert_ne!(replayed_types, program.output_types().into_owned());
         assert_eq!(replayed_types[0].to_string(), "f64[2, source * 2]");
 
         // Specialization replays this retained graph rather than retracing its construction closure. Both the dimension
@@ -4573,6 +4573,7 @@ mod tests {
         let imported_inputs = linearization
             .tangent()
             .input_types()
+            .into_owned()
             .into_iter()
             .map(|r#type| imported_builder.add_input(r#type))
             .collect::<Vec<_>>();

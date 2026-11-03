@@ -1060,7 +1060,7 @@ mod tests {
     use crate::operations::manipulation::slicing::Slice;
     use crate::parameters::Placeholder;
     use crate::partial::{PartialEvaluationContext, PartialEvaluationOutput, PartialEvaluationValue};
-    use crate::programs::{EmptyRegionDriver, ProgramBuilder};
+    use crate::programs::{EmptyRegionDriver, ProgramBuilder, TypedProgram};
 
     use super::*;
 

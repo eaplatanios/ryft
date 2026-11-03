@@ -1477,6 +1477,7 @@ mod tests {
     use crate::partial::PartialValue;
     use crate::programs::{
         AttachedRegions, EffectClass, EffectClasses, EmptyRegionDriver, Program, ProgramBuilder, ProgramError, Typed,
+        TypedProgram,
     };
 
     use super::*;

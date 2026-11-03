@@ -89,7 +89,7 @@ use crate::programs::{
     ReferenceDischargeRegionBoundary, ReferenceDischargeRegionBoundaryInsertion, ReferenceDischargeValue,
     ReferenceDischargeableOperation, ReferenceType, RegionDataFlow, RegionDataFlowBoundary, RegionDataFlowRule,
     RegionDataFlowSource, RegionDataFlowSources, RegionInterface, RegionLiveness, RegionRef, RegionSlot, Type,
-    TypeError, Typed, Value, ValueProjection,
+    TypeError, Typed, TypedProgram, Value, ValueProjection,
 };
 use crate::tracing::{NestedTracingContext, Tracer, TracingContext};
 
@@ -1247,7 +1247,7 @@ impl<
                     // rejects a dimension output under a varying predicate, which a `while` carry accepts). With every
                     // position forwarded, the `condition` is bound only for the effects (e.g., a preserved-reference
                     // write) or deferred work of the body, which must still run under the final predicate.
-                    let state_types = body_program.input_types();
+                    let state_types = body_program.input_types().into_owned();
                     let state_count = state_types.len();
                     let forwarded = loop_carry_passthrough_mask(body_program.entry_region_ref(), 0..state_count);
                     let kept = (0..state_count).filter(|&position| !forwarded[position]).collect::<Vec<_>>();
@@ -2300,6 +2300,7 @@ impl<C: Context<Type: WhileType, Operation: From<WhileOperation<C::Type>>>, P: B
                 let mut builder = ProgramBuilder::<C::Constant, C::Operation>::new();
                 let inputs = batched_condition
                     .input_types()
+                    .into_owned()
                     .into_iter()
                     .map(|r#type| builder.add_input(r#type))
                     .collect::<Vec<_>>();
@@ -2474,9 +2475,9 @@ where
             // batched-predicate loops, whose counter- and stack-augmented differentiation state is not
             // predicate-prefixed and therefore needs the loop's masking made explicit as program data
             // hanging off a scalar predicate.
-            let state_types = body.input_types();
+            let state_types = body.input_types().into_owned();
             let state_count = state_types.len();
-            let mask_axes = (0..condition.output_types()[0].as_array_type()?.rank()).collect::<Vec<_>>();
+            let mask_axes = (0..condition.output_types().into_owned()[0].as_array_type()?.rank()).collect::<Vec<_>>();
 
             // The masked condition computes `any(condition(state))` over every predicate axis.
             let (_, masked_condition) = TracingContext::<C::Constant, C::Operation>::trace_with_context_and_named_axes(
@@ -2615,7 +2616,7 @@ where
         let live_tangent_slots = linearization.tangent_output_positions(activity.output_tangent_liveness())?;
         let (primal_program, tangent_program, residual_count, _) = linearization.into_parts();
         let tangent_program = tangent_program.with_outputs(&live_tangent_slots)?;
-        let residual_types = primal_program.output_types().split_off(state_count);
+        let residual_types = primal_program.output_types().into_owned().split_off(state_count);
         check_count!("output", residual_types, residual_count, ProgramError);
 
         // A dimension residual that is exactly a forwarded dimension-state input is invariant across the loop. Thread
@@ -2697,7 +2698,7 @@ where
         let stored_primal_program = if stored_residual_indices.iter().copied().eq(0..residual_count) {
             primal_program
         } else {
-            let input_types = primal_program.input_types();
+            let input_types = primal_program.input_types().into_owned();
             let mut builder = ProgramBuilder::new();
             let inputs = input_types.into_iter().map(|r#type| builder.add_input(r#type)).collect::<Vec<_>>();
             let outputs = builder.splice_program(&primal_program, inputs.as_slice())?;
@@ -2786,6 +2787,7 @@ where
 
             let body_input_types = primal_body
                 .input_types()
+                .into_owned()
                 .into_iter()
                 .chain(std::iter::once(counter_type.clone()))
                 .chain(carry_types.iter().cloned())
@@ -2917,6 +2919,7 @@ where
             // Extend the original loop condition with ignored extra-state inputs.
             let condition_input_types = condition
                 .input_types()
+                .into_owned()
                 .into_iter()
                 .chain(std::iter::once(counter_type.clone()))
                 .chain(carry_types.iter().cloned())
@@ -3188,7 +3191,7 @@ where
         } else {
             Arc::new(fused_body.with_outputs(&fused_outputs)?)
         };
-        let fused_state_types = fused_body.input_types();
+        let fused_state_types = fused_body.input_types().into_owned();
         check_count!("input", fused_state_types, fused_state_count, ProgramError);
 
         // Extend the condition over the compact fused state. The original condition reads the primal prefix and the

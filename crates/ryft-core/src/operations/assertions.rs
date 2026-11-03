@@ -2229,7 +2229,7 @@ mod tests {
     use crate::operations::references::ReferenceReadOperation;
     use crate::parameters::Placeholder;
     use crate::partial::PartialTracer;
-    use crate::programs::{EmptyRegionDriver, OperationProjection, ProgramBuilder, ReferenceType};
+    use crate::programs::{EmptyRegionDriver, OperationProjection, ProgramBuilder, ReferenceType, TypedProgram};
 
     use super::*;
 

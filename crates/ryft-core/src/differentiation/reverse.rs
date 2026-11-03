@@ -4656,7 +4656,7 @@ pub(crate) mod tests {
     use crate::programs::{
         AtomId, Concretizable, EffectClass, EffectClasses, Effects, MaybeZero, NoReferenceTransform, NoReferent,
         Operation, Program, ProgramBuilder, ProgramError, ProvenanceScope, ReferenceAccessDescriptor, ReferenceError,
-        ReferenceType, RegionInterface, RegionSlot, TypeError, Typed, Value,
+        ReferenceType, RegionInterface, RegionSlot, TypeError, Typed, TypedProgram, Value,
     };
     use crate::specialization::SpecializationCacheStatistics;
     use crate::tests::{
@@ -5073,7 +5073,7 @@ pub(crate) mod tests {
             .splice_program(transposed, inputs.as_slice())
             .unwrap()
             .into_iter()
-            .zip(transposed.output_types())
+            .zip(transposed.output_types().into_owned())
             .filter_map(|(output, r#type)| (!r#type.is_reference()).then_some(output))
             .collect::<Vec<_>>();
         for reference in references {

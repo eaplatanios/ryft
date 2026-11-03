@@ -1764,7 +1764,7 @@ mod tests {
     use crate::partial::PartialValue;
     use crate::programs::{
         AttachedRegions, EffectClasses, EmptyRegionDriver, ProgramBuilder, ProgramError, Provenance, ProvenanceScope,
-        Typed, ValueDomainDispatch,
+        Typed, TypedProgram, ValueDomainDispatch,
     };
     use crate::tracing::TracingContext;
 

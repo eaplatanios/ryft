@@ -14,6 +14,7 @@ use crate::parameters::{Parameter, ParameterPath, Parameterized, ParameterizedFa
 use crate::partial::{PartialEvaluationContext, PartialValue, PartiallyEvaluatableOperation};
 use crate::programs::{
     OperationProvider, ProgramError, ReferenceAccessOperation, ReferenceMemberType, ReferenceTransform, Type, Typed,
+    TypedProgram,
 };
 use crate::tracing::TracingContext;
 

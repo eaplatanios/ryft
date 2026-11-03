@@ -2362,7 +2362,7 @@ mod tests {
     use crate::partial::PartialValue;
     use crate::programs::{
         EffectClasses, EmptyRegionDriver, Program, ProgramBuilder, ReferenceDischargeContext, ReferenceDischargeValue,
-        ReferenceDischargeableOperation,
+        ReferenceDischargeableOperation, TypedProgram,
     };
     use crate::tracing::{DomainTracingContext, Trace};
 

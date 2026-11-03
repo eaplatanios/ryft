@@ -91,7 +91,7 @@ use crate::programs::{
     ReferenceDischargeRegionBoundaryInsertion, ReferenceDischargeValue, ReferenceDischargeableOperation,
     ReferenceMemberType, RegionDataFlow, RegionDataFlowBoundary, RegionDataFlowRule, RegionDataFlowSource,
     RegionDataFlowSources, RegionInterface, RegionLiveness, RegionRef, RegionSlot, Type, TypeError,
-    TypeIdentityPosition, TypeIdentityRenaming, TypeRefinements, Typed, Value, ValueProjection,
+    TypeIdentityPosition, TypeIdentityRenaming, TypeRefinements, Typed, TypedProgram, Value, ValueProjection,
 };
 use crate::tracing::{NestedTracingContext, Tracer, TracingContext};
 
@@ -3380,7 +3380,7 @@ impl<C: Context<Type: ScanType + DifferentiableType>> ScanJvp<C> {
         let (primal_program, tangent_program, residual_count, _) = linearization.into_parts();
         let tangent_program = tangent_program.with_outputs(&live_tangent_slots)?;
         let mut fused_input_types = body.input_types();
-        fused_input_types.extend(tangent_program.input_types().into_iter().take(live_input_count));
+        fused_input_types.extend(tangent_program.input_types().into_owned().into_iter().take(live_input_count));
         let body_input_types =
             self.input_order.iter().map(|&position| fused_input_types[position].clone()).collect::<Vec<_>>();
         let mut scan_positions = vec![0; self.input_order.len()];
@@ -4064,8 +4064,12 @@ fn reconstruct_partitioned_scan<
                 known_body
             } else {
                 let mut builder = ProgramBuilder::<V, O>::new();
-                let inputs =
-                    known_body.input_types().into_iter().map(|r#type| builder.add_input(r#type)).collect::<Vec<_>>();
+                let inputs = known_body
+                    .input_types()
+                    .into_owned()
+                    .into_iter()
+                    .map(|r#type| builder.add_input(r#type))
+                    .collect::<Vec<_>>();
                 let mut outputs = builder.splice_program(&known_body, &inputs)?;
                 for (position, operation) in conversions {
                     outputs[position] =
@@ -6641,7 +6645,7 @@ mod tests {
                 in (%2)"},
         );
         let (output_types, traced) = trace(input_types).unwrap();
-        assert_eq!(output_types, program.output_types());
+        assert_eq!(output_types, program.output_types().into_owned());
         assert_eq!(traced.to_string(), program.to_string());
         let values = array(Array::vector(vec![1f32, 2.0, 3.0]).unwrap());
         assert_eq!(

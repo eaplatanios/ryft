@@ -5,7 +5,7 @@
 //! packed parent-context value and records whether one physical dimension is the mapped batch axis or whether the value
 //! is replicated across all batch items. Each operation-owned [`BatchableOperation`] rule decides how that metadata
 //! propagates, aligns, broadcasts, moves, reduces, or interacts with nested programs. Refer to [`BatchingContext`] for
-//! a rendered diagram of the value-level transform pipeline.
+//! a diagram of the value-level transform pipeline.
 //!
 //! # Choosing an Entry Point
 //!
@@ -99,7 +99,8 @@ use crate::parameters::{Parameter, ParameterError, Parameterized, ParameterizedF
 use crate::programs::{
     AttachedRegions, EmptyRegionDriver, Operation, OperationProjection, Program, ProgramError, Provenance,
     ProvenanceScope, ReferenceBoundary, ReferenceBoundaryError, ReferenceBoundaryPosition, ReferenceIdentity,
-    RegionDriver, RegionRef, Type, TypeError, TypeIdentityRenaming, Typed, Value, ValueDomainDispatch, ValueProjection,
+    RegionDriver, RegionRef, Type, TypeError, TypeIdentityRenaming, Typed, TypedProgram, Value, ValueDomainDispatch,
+    ValueProjection,
 };
 use crate::tracing::{Tracer, TracingContext};
 
@@ -545,7 +546,12 @@ impl<V: Value, O: Operation<Type = V::Type>> BoundaryPreservingBatchedProgram<V,
             let (builder, output_ids) = {
                 let context = TracingContext::<V, O>::new();
                 let builder = context.builder().clone();
-                let inputs = program.input_types().into_iter().map(|r#type| context.input(r#type)).collect::<Vec<_>>();
+                let inputs = program
+                    .input_types()
+                    .into_owned()
+                    .into_iter()
+                    .map(|r#type| context.input(r#type))
+                    .collect::<Vec<_>>();
                 let mut outputs = program.interpret_in_context(&context, inputs)?;
                 check_count!("output", outputs, output_axes.len() + widening_output_count, ProgramError);
 
@@ -1373,39 +1379,81 @@ impl<C: Context, O: InterpretableOperation<C>, P: BatchingPolicy<C>> Interpretab
 ///
 /// # Value-Level Batching Pipeline
 ///
-/// ```mermaid
-/// %%{init: {"themeCSS": ".nodeLabel code { white-space: nowrap !important; }"}}%%
-/// flowchart TD
-///   inputs["Structured Inputs and Broadcast Input Axes"]
-///   prepare["Entrypoint Policy &lt;code&gt;pack_inputs&lt;/code&gt;"]
-///   inputs --> prepare
-///   specification["Extent and Optional Axis Name"] --> prepare
-///   prepare --> context["Batching Context"]
-///   prepare --> carriers["Policy-Selected Batch Carriers"]
-///   context --> tracers["Batching Tracer Inputs"]
-///   carriers --> tracers
-///   tracers --> closure["Invoke Closure Once over Packed Batches"]
-///   closure -->|"operation application"| bind["Context &lt;code&gt;bind&lt;/code&gt;"]
-///   regions["Attached Regions"] --> driver["Instruction-Scoped Batching Driver"]
-///   bind --> driver
-///   driver --> rule["Batchable Operation Rule"]
-///   driver --> nested["Optional Active Region Replay or Structural Program Batching"]
-///   rule -->|"lift packed work"| parent["Parent Context &lt;code&gt;bind&lt;/code&gt;"]
-///   parent --> packed["Parent-Owned Packed Results"]
-///   packed --> assemble["Rule Assembles Output Carriers"]
-///   nested --> assemble
-///   rule -->|"metadata-only or specialized result"| assemble
-///   assemble --> outputs["Output Carriers"]
-///   outputs --> flowing["Flowing Batching Tracer Results"]
-///   flowing --> closure
-///   closure -->|"returns"| closure_outputs["Structured Closure Outputs"]
-///   closure_outputs --> materialize["Entrypoint Policy &lt;code&gt;materialize_output&lt;/code&gt;"]
-///   materialize --> result["Parent-Owned Outputs in Requested Axis Positions"]
+/// ```text
+///    ┌────────────────────────────────────────┐
+///    │ Structured Inputs and Broadcast Axes   │
+///    └────────────────────┬───────────────────┘
+///                         ▼
+///    ┌────────────────────────────────────────┐   ┌────────────────────────────────────────┐
+///    │ Entrypoint Policy `pack_inputs`        │◀──┤ Extent and Optional Axis Name          │
+///    └────────────────────┬─────────────┬─────┘   └────────────────────────────────────────┘
+///                         │             └──────────────────────────────┐
+///                         ▼                                            ▼
+///    ┌────────────────────────────────────────┐   ┌────────────────────────────────────────┐
+///    │ `BatchingContext`                      │   │ Policy-Selected Batch Carriers         │
+///    └────────────────────┬───────────────────┘   └────────────────────┬───────────────────┘
+///                         ▼                                            │
+///    ┌────────────────────────────────────────┐                        │
+///    │ Batching Tracer Inputs                 │◀───────────────────────┘
+///    └────────────────────┬───────────────────┘
+///                         ▼
+///    ┌────────────────────────────────────────┐
+///  ┌─┤ Invoke Closure Once on Packed Batches  │◀───────────────────────────────────────────────┐
+///  │ └────────────────────┬───────────────────┘                                                │
+///  │                      │ operation application                                              │
+///  │                      ▼                                                                    │
+///  │ ┌────────────────────────────────────────┐   ┌────────────────────────────────────────┐   │
+///  │ │ `Context::bind`                        │   │ Attached Regions                       │   │
+///  │ └────────────────────┬───────────────────┘   └────────────────────┬───────────────────┘   │
+///  │                      │             ┌──────────────────────────────┘                       │
+///  │                      ▼             ▼                                                      │
+///  │ ┌────────────────────────────────────────┐   ┌────────────────────────────────────────┐   │
+///  │ │ Instruction-Scoped Batching Driver     ├──▶│ Region Replay or Program Batching      ├─┐ │
+///  │ └────────────────────┬───────────────────┘   └────────────────────────────────────────┘ │ │
+///  │                      ▼                                                                  │ │
+///  │ ┌────────────────────────────────────────┐                                              │ │
+///  │ │ Batchable Operation Rule               │                                              │ │
+///  │ └─────┬────────────────────────────┬─────┘                                              │ │
+///  │       │                            └──────────────────────────────┐                     │ │
+///  │       │                                                           ▼ lift packed work    │ │
+///  │       │                                      ┌────────────────────────────────────────┐ │ │
+///  │       │                                      │ Parent `Context::bind`                 │ │ │
+///  │       │                                      └────────────────────┬───────────────────┘ │ │
+///  │       │ metadata-only or specialized result                       │                     │ │
+///  │       │                                                           ▼                     │ │
+///  │       │                                      ┌────────────────────────────────────────┐ │ │
+///  │       │                                      │ Parent-Owned Packed Results            │ │ │
+///  │       │                                      └────────────────────┬───────────────────┘ │ │
+///  │       │                            ┌──────────────────────────────┘                     │ │
+///  │       ▼                            ▼                                                    │ │
+///  │ ┌────────────────────────────────────────┐                                              │ │
+///  │ │ Rule Assembles Output Carriers         │◀─────────────────────────────────────────────┘ │
+///  │ └────────────────────┬───────────────────┘                                                │
+///  │                      ▼                                                                    │
+///  │ ┌────────────────────────────────────────┐                                                │
+///  │ │ Output Carriers                        │                                                │
+///  │ └────────────────────┬───────────────────┘                                                │
+///  │                      ▼                                                                    │
+///  │ ┌────────────────────────────────────────┐                                                │
+///  │ │ Flowing Batching Tracer Results        ├────────────────────────────────────────────────┘
+///  │ └────────────────────────────────────────┘
+///  └──────────────────────┐
+///                         ▼ returns
+///    ┌────────────────────────────────────────┐
+///    │ Structured Closure Outputs             │
+///    └────────────────────┬───────────────────┘
+///                         ▼
+///    ┌────────────────────────────────────────┐
+///    │ Entrypoint Policy `materialize_output` │
+///    └────────────────────┬───────────────────┘
+///                         ▼
+///    ┌────────────────────────────────────────┐
+///    │ Parent-Owned Outputs at Requested Axes │
+///    └────────────────────────────────────────┘
 /// ```
 ///
-/// One context instance is shared by every tracer at this batching level. Its parent may itself be eager, staging, or
-/// another transform context, which is what makes batching compose without changing this pipeline.
-#[cfg_attr(doc, ryft_macros::mermaid)]
+/// One context instance is shared by every tracer at this batching level. Its parent may itself be eager, staging,
+/// or another transform context, which is what makes batching compose without changing this pipeline.
 #[derive(Debug, Clone)]
 pub struct BatchingContext<C: Context, P: BatchingPolicy<C>> {
     /// [`Context`] that this [`BatchingContext`] is nested into.
@@ -2957,10 +3005,10 @@ mod tests {
         let packed_type =
             ArrayType::new(DataType::F64, Shape::new(vec![Dimension::Dynamic(batch), Dimension::Static(3)]));
         assert_eq!(
-            adapted_program.input_types(),
+            adapted_program.input_types().as_ref(),
             &[ArrayIrType::Dimension(extent_type), ArrayIrType::Array(packed_type.clone())],
         );
-        assert_eq!(adapted_program.output_types(), &[ArrayIrType::Array(packed_type)]);
+        assert_eq!(adapted_program.output_types().into_owned(), &[ArrayIrType::Array(packed_type)]);
         assert_eq!(adapted_program.output_ids(), &adapted_program.input_ids()[1..]);
         assert!(adapted_program.instructions().is_empty());
     }

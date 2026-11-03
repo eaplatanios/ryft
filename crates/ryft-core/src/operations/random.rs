@@ -1258,7 +1258,7 @@ mod tests {
     };
     use crate::macros::{check_operation_batching, check_operation_partial_evaluation, check_operation_type_inference};
     use crate::partial::PartialValue;
-    use crate::programs::{EffectClasses, EmptyRegionDriver, MaybeZero};
+    use crate::programs::{EffectClasses, EmptyRegionDriver, MaybeZero, TypedProgram};
     use crate::tracing::TracingContext;
 
     use super::*;

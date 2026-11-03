@@ -1420,7 +1420,7 @@ mod tests {
     use crate::operations::reductions::{Reduce, ReductionKind};
     use crate::parameters::Placeholder;
     use crate::partial::PartialEvaluationOutput;
-    use crate::programs::{EmptyRegionDriver, ProgramBuilder};
+    use crate::programs::{EmptyRegionDriver, ProgramBuilder, TypedProgram};
 
     use super::*;
 

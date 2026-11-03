@@ -4443,7 +4443,7 @@ mod tests {
     use crate::parameters::Placeholder;
     use crate::programs::{
         EmptyRegionDriver, ProgramBuilder, ProgramError, ReferenceDischargeContext, ReferenceDischargeValue,
-        ReferenceDischargeableOperation, Typed,
+        ReferenceDischargeableOperation, Typed, TypedProgram,
     };
     use crate::tracing::{DomainTracingContext, Trace};
 

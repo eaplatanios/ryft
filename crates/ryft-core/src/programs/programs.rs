@@ -18,7 +18,7 @@ use crate::programs::regions::{
     RegionLiveness, RegionRef, reachable_region_mask,
 };
 use crate::programs::transforms::RegionTransformCache;
-use crate::programs::types::{Type, Typed, type_identities_needing_runtime_checks};
+use crate::programs::types::{Type, Typed, TypedProgram, type_identities_needing_runtime_checks};
 use crate::programs::values::{Value, ValueId, ValueProjection};
 
 /// Mode selecting what a [`Program`] rendering includes. The semantic rendering is the canonical structural fingerprint
@@ -56,26 +56,40 @@ pub enum ProgramRenderingMode {
 ///
 /// # Program Lifecycle
 ///
-/// ```mermaid
-/// %%{init: {"themeCSS": ".nodeLabel code { white-space: nowrap !important; }"}}%%
-/// flowchart TD
-///   inputs["Typed Inputs and Stored Constants"] --> builder["Mutable &lt;code&gt;ProgramBuilder&lt;/code&gt;"]
-///   regions["Sealed Nested Region Closures"] --> builder
-///   builder -->|"add atoms and checked instructions"| boundary["Validate Structured Boundaries"]
-///   program["Immutable &lt;code&gt;Program&lt;/code&gt; with One Region Arena"]
-///   boundary -->|"&lt;code&gt;build&lt;/code&gt;"| program
-///   program --> replay["Interpret through an Active Context"]
-///   program --> transform["Batch, Differentiate, or Partially Evaluate"]
-///   program --> analyze["Inspect Effects, Liveness, and Statistics"]
-///   program --> rewrite["Simplify or Filter"]
-///   program --> compile["Lower and Compile through a Backend"]
-///   transform --> derived["New Validated Program"]
-///   rewrite --> derived
+/// ```text
+/// ┌────────────────────────────────────────┐     ┌───────────────────────────────────────────┐
+/// │ Typed Inputs and Stored Constants      │     │ Sealed Nested Region Closures             │
+/// └────────────────────┬───────────────────┘     └─────────────────────┬─────────────────────┘
+///                      └──────────────────────┬────────────────────────┘
+///                                             ▼
+///                         ┌─────────────────────────────────────────┐
+///                         │ Mutable `ProgramBuilder`                │
+///                         └───────────────────┬─────────────────────┘
+///                                             │ add atoms and checked instructions
+///                                             ▼
+///                         ┌─────────────────────────────────────────┐
+///                         │ Validate Structured Boundaries          │
+///                         └───────────────────┬─────────────────────┘
+///                                             │ `build`
+///                                             ▼
+///                         ┌─────────────────────────────────────────┐
+///                         │ Immutable `Program` (One Region Arena)  │
+///                         └───────────────────┬─────────────────────┘
+/// ┌────────────────────────────────────────┐  │  ┌───────────────────────────────────────────┐
+/// │ Interpret through an Active Context    │◀─┼─▶│ Batch, Differentiate, Partially Evaluate  ├─┐
+/// └────────────────────────────────────────┘  │  └───────────────────────────────────────────┘ │
+///                                             │                                                │
+/// ┌────────────────────────────────────────┐  │  ┌───────────────────────────────────────────┐ │
+/// │ Inspect Effects, Liveness, Statistics  │◀─┼─▶│ Simplify or Filter                        │ │
+/// └────────────────────────────────────────┘  │  └─────────────────────┬─────────────────────┘ │
+///                                             │                        ▼                       │
+/// ┌────────────────────────────────────────┐  │  ┌───────────────────────────────────────────┐ │
+/// │ Lower and Compile through a Backend    │◀─┘  │ New Validated Program                     │◀┘
+/// └────────────────────────────────────────┘     └───────────────────────────────────────────┘
 /// ```
 ///
 /// Construction through [`ProgramBuilder`](crate::ProgramBuilder) is the only mutable phase. Every consumer starts
 /// from a program whose region graph and structured boundaries have already been validated.
-#[cfg_attr(doc, ryft_macros::mermaid)]
 #[derive(Debug)]
 pub struct Program<V: Typed + Parameter, O, Input: Parameterized<V>, Output: Parameterized<V>> {
     /// [`Parameter`] structure that can be used to map flat lists of inputs to structured `Input` values.
@@ -185,22 +199,10 @@ impl<V: Value, O: Operation<Type = V::Type>, Input: Parameterized<V>, Output: Pa
         self.entry_region_ref().atoms()
     }
 
-    /// Returns the number of input [`Atom`]s (i.e., arguments) of this [`Program`].
-    #[inline]
-    pub fn input_count(&self) -> usize {
-        self.entry_region_ref().input_ids().len()
-    }
-
     /// Returns the [`AtomId`]s of the [`Atom`]s that correspond to the inputs (i.e., arguments) of this [`Program`].
     #[inline]
     pub fn input_ids(&self) -> &[AtomId] {
         self.entry_region_ref().input_ids()
-    }
-
-    /// Returns the [`Type`]s of the inputs of this [`Program`], in order.
-    #[inline]
-    pub fn input_types(&self) -> Vec<V::Type> {
-        self.entry_region_ref().input_types()
     }
 
     /// Returns the [`Atom`]s that correspond to the inputs of this [`Program`].
@@ -219,23 +221,11 @@ impl<V: Value, O: Operation<Type = V::Type>, Input: Parameterized<V>, Output: Pa
         Input::To::<Atom<V>>::from_parameters(self.input_structure.clone(), self.inputs().cloned())
     }
 
-    /// Returns the number of output [`Atom`]s (i.e., return values) of this [`Program`].
-    #[inline]
-    pub fn output_count(&self) -> usize {
-        self.entry_region_ref().output_ids().len()
-    }
-
     /// Returns the [`AtomId`]s of the [`Atom`]s that correspond to the outputs (i.e., return values)
     /// of this [`Program`].
     #[inline]
     pub fn output_ids(&self) -> &[AtomId] {
         self.entry_region_ref().output_ids()
-    }
-
-    /// Returns the [`Type`]s of the outputs of this [`Program`], in order.
-    #[inline]
-    pub fn output_types(&self) -> Vec<V::Type> {
-        self.entry_region_ref().output_types()
     }
 
     /// Returns the [`Atom`]s that correspond to the outputs of this [`Program`].
@@ -548,7 +538,7 @@ impl<V: Value, O: Operation<Type = V::Type>, Input: Parameterized<V>, Output: Pa
     /// but do not specialize the returned program's types. When no renaming is required, the result borrows this
     /// program.
     pub fn with_instantiated_type_identities(&self, input_types: &[V::Type]) -> Result<Cow<'_, Self>, ProgramError> {
-        let renaming = V::Type::derive_identity_renaming(self.input_types().as_slice(), input_types)?;
+        let renaming = V::Type::derive_identity_renaming(self.input_types().as_ref(), input_types)?;
         if renaming.is_identity() {
             return Ok(Cow::Borrowed(self));
         }
@@ -1767,6 +1757,32 @@ impl<V: Value, O: Operation<Type = V::Type>, Input: Parameterized<V>, Output: Pa
     #[inline]
     fn fmt(&self, formatter: &mut std::fmt::Formatter<'_>) -> std::fmt::Result {
         self.render(formatter, 0, ProgramRenderingMode::Semantic)
+    }
+}
+
+impl<V: Value, O: Operation<Type = V::Type>, Input: Parameterized<V>, Output: Parameterized<V>> TypedProgram
+    for Program<V, O, Input, Output>
+{
+    type Type = V::Type;
+
+    #[inline]
+    fn input_count(&self) -> usize {
+        self.entry_region_ref().input_ids().len()
+    }
+
+    #[inline]
+    fn input_types(&self) -> Cow<'_, [V::Type]> {
+        Cow::Owned(self.entry_region_ref().input_types())
+    }
+
+    #[inline]
+    fn output_count(&self) -> usize {
+        self.entry_region_ref().output_ids().len()
+    }
+
+    #[inline]
+    fn output_types(&self) -> Cow<'_, [V::Type]> {
+        Cow::Owned(self.entry_region_ref().output_types())
     }
 }
 

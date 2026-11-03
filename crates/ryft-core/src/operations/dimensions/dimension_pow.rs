@@ -134,7 +134,7 @@ mod tests {
     use crate::arrays::{Array, ArrayIrType, ArrayIrValue, DimensionBounds, DimensionOperation, DimensionValue};
     use crate::parameters::Placeholder;
     use crate::partial::{PartialEvaluationOutput, PartialValue};
-    use crate::programs::{EffectClass, EffectClasses, ProgramBuilder, ValueProjection};
+    use crate::programs::{EffectClass, EffectClasses, ProgramBuilder, TypedProgram, ValueProjection};
     use crate::tracing::{Tracer, TracingContext};
 
     use super::*;
@@ -290,7 +290,9 @@ mod tests {
                 in (%2)"},
         );
         let evaluation = program
-            .partially_evaluate(&program.input_types().into_iter().map(PartialValue::Unknown).collect::<Vec<_>>())
+            .partially_evaluate(
+                &program.input_types().into_owned().into_iter().map(PartialValue::Unknown).collect::<Vec<_>>(),
+            )
             .unwrap();
         let PartialEvaluationOutput::Known(output) = &evaluation.outputs()[0] else {
             panic!("expected the zero-exponent power to evaluate to a known constant");

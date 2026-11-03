@@ -4,7 +4,7 @@
 //! logical transform dimensions—such as a vectorized batch or device-mesh axis—through the active [`Context`] stack.
 //! The two forms meet inside operation-owned rules: a named binding supplies value-free scope metadata, while the
 //! rule supplies the physical dimension of each participating value when one exists. Refer to [`NamedAxes`] for a
-//! rendered diagram of named-axis lookup and consumption.
+//! diagram of named-axis lookup and consumption.
 //!
 //! # Positional Axes
 //!
@@ -287,26 +287,40 @@ impl NamedAxis {
 ///
 /// # Dynamic-Scope Lookup
 ///
-/// ```mermaid
-/// %%{init: {"themeCSS": ".nodeLabel code { white-space: nowrap !important; }"}}%%
-/// flowchart TD
-///   request["Operation Requests an Axis Name"] --> current["Current Context"]
-///   current --> local["Check Local Named-Axis Bindings"]
-///   local -->|"nearest local binding"| binding["Named Axis: Batched or Mesh"]
-///   local -->|"not bound locally"| parent["Delegate to Parent Context"]
-///   parent --> lookup["Repeat Innermost-First Lookup"]
-///   lookup -->|"binding found"| binding
-///   lookup -->|"no enclosing binding"| unbound["Unbound Axis Error"]
-///   binding --> facts["Value-Free Kind and Optional Static Size"]
-///   facts --> rule["Operation-Owned Rule"]
-///   per_value["Per-Value Mapped-Axis Metadata"] --> rule
-///   facts --> axis_index["&lt;code&gt;AxisIndex&lt;/code&gt; Capability"]
-///   axis_index --> value["Current Index Value"]
+/// ```text
+/// ┌───────────────────────────────────────┐
+/// │ Operation Requests an Axis Name       │
+/// └───────────────────┬───────────────────┘
+///                     ▼
+/// ┌───────────────────────────────────────┐
+/// │ Current Context                       │
+/// └───────────────────┬───────────────────┘
+///                     ▼
+/// ┌───────────────────────────────────────┐ not bound locally ┌───────────────────────────────┐
+/// │ Check Local Named-Axis Bindings       ├──────────────────▶│ Delegate to Parent Context    │
+/// └───────────────────┬───────────────────┘                   └───┬───────────────────────────┘
+///                     │ nearest local binding                     │
+///                     ▼                                           ▼
+/// ┌───────────────────────────────────────┐   binding found   ┌───────────────────────────────┐
+/// │ Named Axis: Batched or Mesh           │◀──────────────────┤ Repeat Innermost-First Lookup │
+/// └───────────────────┬───────────────────┘                   └───┬───────────────────────────┘
+///                     │                                           │ no enclosing binding
+///                     ▼                                           ▼
+/// ┌───────────────────────────────────────┐                   ┌───────────────────────────────┐
+/// │ Value-Free Kind, Optional Static Size ├─────────┐         │ Unbound Axis Error            │
+/// └───────────────────┬───────────────────┘         │         └───────────────────────────────┘
+///                     ▼                             │
+/// ┌───────────────────────────────────────┐         │         ┌───────────────────────────────┐
+/// │ Operation-Owned Rule                  │         └────────▶│ `AxisIndex` Capability        │
+/// └───────────────────────────────────────┘                   └───┬───────────────────────────┘
+///                     ▲                                           ▼
+/// ┌───────────────────┴───────────────────┐                   ┌───────────────────────────────┐
+/// │ Per-Value Mapped-Axis Metadata        │                   │ Current Index Value           │
+/// └───────────────────────────────────────┘                   └───────────────────────────────┘
 /// ```
 ///
 /// Lookup (i.e., [`NamedAxes::named_axis`]) checks local bindings before delegating outward unless the context is a
 /// leaf. Enumeration (i.e., [`NamedAxes::named_axes`]) includes the enclosing bindings with the same shadowing rules.
-#[cfg_attr(doc, ryft_macros::mermaid)]
 pub trait NamedAxes: Context {
     /// Resolves `name` against this context, returning the [`NamedAxis`] it is bound to,
     /// or `None` when no enclosing binder binds it.
