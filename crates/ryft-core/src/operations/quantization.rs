@@ -168,7 +168,9 @@ const BLOCK_QUANTIZE_NAME: &str = "block_quantize";
 /// Both recipes round their scales and elements to the grids of the narrow types arithmetically (i.e., with exact
 /// power of two spacings derived from exponent bits) before converting them, so that every conversion is exact. This
 /// keeps quantization intact under compilers that fold a conversion to a narrow type into a following conversion back,
-/// as the XLA backend does on GPUs, where JAX places optimization barriers for the same reason.
+/// as the XLA backend does on GPUs, where JAX places optimization barriers for the same reason. This rounding is
+/// piecewise constant, so gradients through quantization are zero rather than straight-through estimates. Training
+/// contractions should use [`block_scaled_dot`], whose rules define their own gradients.
 ///
 /// Homogeneous arrays, including projected array views, require static shapes. Array IR values additionally support
 /// runtime extents through dimension arithmetic and assertions. Use the parent array IR value for dynamic shapes.
@@ -3745,7 +3747,7 @@ mod tests {
             program.partially_evaluate(&[PartialValue::Unknown(program.input_types()[0].clone())]).unwrap();
         assert_eq!(
             evaluation.program().to_string(),
-            indoc! {r#"
+            indoc! {"
                 lambda \
                     %0:f32[n], \
                     %1:f32[], \
@@ -3762,12 +3764,12 @@ mod tests {
                     %12:dimension<0> = const 0
                     %13:bool[] = compare [direction=GreaterThan] %11 %12
                     %14:dimension<4> = const 4
-                    () = assert [message="block extent of axis 0 must be positive", labels=["extent"]] %13 %11
+                    () = assert [message=\"block extent of axis 0 must be positive\", labels=[\"extent\"]] %13 %11
                     %15:dimension<n % 4 ∈ [0, 4)> = dimension_rem %11 %14
                     %16:bool[] = compare [direction=Equal] %15 %12
                     () = assert [
-                        message="block extent of axis 0 must be divisible by block size",
-                        labels=["extent"],
+                        message=\"block extent of axis 0 must be divisible by block size\",
+                        labels=[\"extent\"],
                     ] %16 %11
                     %17:dimension<n / 4 ∈ [0, 3)> = dimension_div %11 %14
                     %18:f32[n / 4, 4] = reshape %0 %17 %14
@@ -3801,7 +3803,7 @@ mod tests {
                     %46:f8e4m3fn[n] = convert_element_type [data_type=f8e4m3fn] %45
                     %47:f8e8m0fnu[n / 4] = convert_element_type [data_type=f8e8m0fnu] %28
                 in (%46, %47)
-            "#}
+            "}
             .trim_end(),
         );
 
@@ -3979,6 +3981,22 @@ mod tests {
     }
 
     #[test]
+    fn test_block_quantize_differentiation() {
+        // Rounding to the element and scale grids is piecewise constant, so gradients through quantization are zero
+        // rather than straight-through estimates. Training uses `block_scaled_dot`, whose rules define its gradients.
+        let input = Array::vector(vec![3.0f32, 1.5, 0.5, 6.0, 0.5, 1.0, 0.25, 1.5]).unwrap();
+        assert_eq!(
+            differentiate_at(input.clone()).value_and_gradient(|input| {
+                input
+                    .block_quantize(4, DataType::F4E2M1FN, DataType::F8E4M3FN)?
+                    .block_dequantize([-1], DataType::F32)?
+                    .reduce(&[0], ReductionKind::Sum)
+            }),
+            Ok((Array::scalar(14.25f32).unwrap(), Array::vector(vec![0.0f32; 8]).unwrap())),
+        );
+    }
+
+    #[test]
     fn test_block_quantize_sharding() {
         // Inside a manual region, the elements and scales of a varying input keep its variation for both recipes,
         // because the scales are broadcast back over their blocks with their own variation rather than to an invariant
@@ -4002,7 +4020,7 @@ mod tests {
         assert_eq!(output_types, vec![varying(DataType::F4E2M1FN, 8), varying(DataType::F8E4M3FN, 2)]);
         assert_eq!(
             program.to_string(),
-            indoc! {r#"
+            indoc! {"
                 lambda %0:f32[8][sharding={mesh<['x'=2:manual]>, [{}], varying_manual={'x'}}] .
                 let %1:f32[2, 4][sharding={mesh<['x'=2:manual]>, [{}, {}], varying_manual={'x'}}] = \
                         reshape [shape=[2, 4]] %0
@@ -4014,18 +4032,18 @@ mod tests {
                     %6:f32[2][sharding={mesh<['x'=2:manual]>, [{}]}] = \
                         broadcast [output_type=f32[2][sharding={mesh<['x'=2:manual]>, [{}]}], output_axes=[0]] %5
                     %7:f32[2][sharding={mesh<['x'=2:manual]>, [{}], varying_manual={'x'}}] = \
-                        parallel_vary [axis_name="x"] %6
+                        parallel_vary [axis_name=\"x\"] %6
                     %8:f32[2][sharding={mesh<['x'=2:manual]>, [{}], varying_manual={'x'}}] = div %3 %7
                     %9:f32[] = constant [value=0.001953125]
                     %10:f32[] = constant [value=448.0]
                     %11:f32[][sharding={mesh<['x'=2:manual]>, []}] = \
                         broadcast [output_type=f32[][sharding={mesh<['x'=2:manual]>, []}], output_axes=[]] %9
                     %12:f32[][sharding={mesh<['x'=2:manual]>, [], varying_manual={'x'}}] = \
-                        parallel_vary [axis_name="x"] %11
+                        parallel_vary [axis_name=\"x\"] %11
                     %13:f32[][sharding={mesh<['x'=2:manual]>, []}] = \
                         broadcast [output_type=f32[][sharding={mesh<['x'=2:manual]>, []}], output_axes=[]] %10
                     %14:f32[][sharding={mesh<['x'=2:manual]>, [], varying_manual={'x'}}] = \
-                        parallel_vary [axis_name="x"] %13
+                        parallel_vary [axis_name=\"x\"] %13
                     %15:f32[2][sharding={mesh<['x'=2:manual]>, [{}], varying_manual={'x'}}] = clamp %12 %8 %14
                     %16:u32[2][sharding={mesh<['x'=2:manual]>, [{}], varying_manual={'x'}}] = \
                         convert_element_type [data_type=u32, bitcast=true] %15
@@ -4035,7 +4053,7 @@ mod tests {
                     %20:u32[2][sharding={mesh<['x'=2:manual]>, [{}]}] = \
                         broadcast [output_type=u32[2][sharding={mesh<['x'=2:manual]>, [{}]}], output_axes=[0]] %19
                     %21:u32[2][sharding={mesh<['x'=2:manual]>, [{}], varying_manual={'x'}}] = \
-                        parallel_vary [axis_name="x"] %20
+                        parallel_vary [axis_name=\"x\"] %20
                     %22:u32[2][sharding={mesh<['x'=2:manual]>, [{}], varying_manual={'x'}}] = and %16 %21
                     %23:f32[2][sharding={mesh<['x'=2:manual]>, [{}], varying_manual={'x'}}] = \
                         convert_element_type [data_type=f32, bitcast=true] %22
@@ -4046,18 +4064,18 @@ mod tests {
                     %28:f32[2][sharding={mesh<['x'=2:manual]>, [{}]}] = \
                         broadcast [output_type=f32[2][sharding={mesh<['x'=2:manual]>, [{}]}], output_axes=[0]] %25
                     %29:f32[2][sharding={mesh<['x'=2:manual]>, [{}], varying_manual={'x'}}] = \
-                        parallel_vary [axis_name="x"] %28
+                        parallel_vary [axis_name=\"x\"] %28
                     %30:f32[2][sharding={mesh<['x'=2:manual]>, [{}]}] = \
                         broadcast [output_type=f32[2][sharding={mesh<['x'=2:manual]>, [{}]}], output_axes=[0]] %27
                     %31:f32[2][sharding={mesh<['x'=2:manual]>, [{}], varying_manual={'x'}}] = \
-                        parallel_vary [axis_name="x"] %30
+                        parallel_vary [axis_name=\"x\"] %30
                     %32:f32[2][sharding={mesh<['x'=2:manual]>, [{}], varying_manual={'x'}}] = clamp %29 %23 %31
                     %33:f32[] = constant [value=0.125]
                     %34:f32[2] = broadcast [output_type=f32[2], output_axes=[]] %33
                     %35:f32[2][sharding={mesh<['x'=2:manual]>, [{}]}] = \
                         broadcast [output_type=f32[2][sharding={mesh<['x'=2:manual]>, [{}]}], output_axes=[0]] %34
                     %36:f32[2][sharding={mesh<['x'=2:manual]>, [{}], varying_manual={'x'}}] = \
-                        parallel_vary [axis_name="x"] %35
+                        parallel_vary [axis_name=\"x\"] %35
                     %37:f32[2][sharding={mesh<['x'=2:manual]>, [{}], varying_manual={'x'}}] = mul %32 %36
                     %38:f32[2][sharding={mesh<['x'=2:manual]>, [{}], varying_manual={'x'}}] = div %15 %37
                     %39:f32[2][sharding={mesh<['x'=2:manual]>, [{}], varying_manual={'x'}}] = round %38
@@ -4075,11 +4093,11 @@ mod tests {
                     %47:f32[][sharding={mesh<['x'=2:manual]>, []}] = \
                         broadcast [output_type=f32[][sharding={mesh<['x'=2:manual]>, []}], output_axes=[]] %45
                     %48:f32[][sharding={mesh<['x'=2:manual]>, [], varying_manual={'x'}}] = \
-                        parallel_vary [axis_name="x"] %47
+                        parallel_vary [axis_name=\"x\"] %47
                     %49:f32[][sharding={mesh<['x'=2:manual]>, []}] = \
                         broadcast [output_type=f32[][sharding={mesh<['x'=2:manual]>, []}], output_axes=[]] %46
                     %50:f32[][sharding={mesh<['x'=2:manual]>, [], varying_manual={'x'}}] = \
-                        parallel_vary [axis_name="x"] %49
+                        parallel_vary [axis_name=\"x\"] %49
                     %51:f32[8][sharding={mesh<['x'=2:manual]>, [{}], varying_manual={'x'}}] = clamp %48 %44 %50
                     %52:u32[8][sharding={mesh<['x'=2:manual]>, [{}], varying_manual={'x'}}] = \
                         convert_element_type [data_type=u32, bitcast=true] %51
@@ -4089,7 +4107,7 @@ mod tests {
                     %56:u32[8][sharding={mesh<['x'=2:manual]>, [{}]}] = \
                         broadcast [output_type=u32[8][sharding={mesh<['x'=2:manual]>, [{}]}], output_axes=[0]] %55
                     %57:u32[8][sharding={mesh<['x'=2:manual]>, [{}], varying_manual={'x'}}] = \
-                        parallel_vary [axis_name="x"] %56
+                        parallel_vary [axis_name=\"x\"] %56
                     %58:u32[8][sharding={mesh<['x'=2:manual]>, [{}], varying_manual={'x'}}] = and %52 %57
                     %59:f32[8][sharding={mesh<['x'=2:manual]>, [{}], varying_manual={'x'}}] = \
                         convert_element_type [data_type=f32, bitcast=true] %58
@@ -4100,18 +4118,18 @@ mod tests {
                     %64:f32[8][sharding={mesh<['x'=2:manual]>, [{}]}] = \
                         broadcast [output_type=f32[8][sharding={mesh<['x'=2:manual]>, [{}]}], output_axes=[0]] %61
                     %65:f32[8][sharding={mesh<['x'=2:manual]>, [{}], varying_manual={'x'}}] = \
-                        parallel_vary [axis_name="x"] %64
+                        parallel_vary [axis_name=\"x\"] %64
                     %66:f32[8][sharding={mesh<['x'=2:manual]>, [{}]}] = \
                         broadcast [output_type=f32[8][sharding={mesh<['x'=2:manual]>, [{}]}], output_axes=[0]] %63
                     %67:f32[8][sharding={mesh<['x'=2:manual]>, [{}], varying_manual={'x'}}] = \
-                        parallel_vary [axis_name="x"] %66
+                        parallel_vary [axis_name=\"x\"] %66
                     %68:f32[8][sharding={mesh<['x'=2:manual]>, [{}], varying_manual={'x'}}] = clamp %65 %59 %67
                     %69:f32[] = constant [value=0.5]
                     %70:f32[8] = broadcast [output_type=f32[8], output_axes=[]] %69
                     %71:f32[8][sharding={mesh<['x'=2:manual]>, [{}]}] = \
                         broadcast [output_type=f32[8][sharding={mesh<['x'=2:manual]>, [{}]}], output_axes=[0]] %70
                     %72:f32[8][sharding={mesh<['x'=2:manual]>, [{}], varying_manual={'x'}}] = \
-                        parallel_vary [axis_name="x"] %71
+                        parallel_vary [axis_name=\"x\"] %71
                     %73:f32[8][sharding={mesh<['x'=2:manual]>, [{}], varying_manual={'x'}}] = mul %68 %72
                     %74:f32[8][sharding={mesh<['x'=2:manual]>, [{}], varying_manual={'x'}}] = div %51 %73
                     %75:f32[8][sharding={mesh<['x'=2:manual]>, [{}], varying_manual={'x'}}] = round %74
@@ -4119,7 +4137,7 @@ mod tests {
                     %77:f4e2m1fn[8][sharding={mesh<['x'=2:manual]>, [{}], varying_manual={'x'}}] = \
                         convert_element_type [data_type=f4e2m1fn] %76
                 in (%77, %41)
-            "#}
+            "}
             .trim_end(),
         );
         let (output_types, program) = TracingContext::<Array, ArrayOperation<Array>>::trace_with_named_axes(
@@ -4135,32 +4153,45 @@ mod tests {
         assert_eq!(output_types, vec![varying(DataType::F8E4M3FN, 8), varying(DataType::F8E8M0FNU, 2)]);
         assert_eq!(
             program.to_string(),
-            indoc! {r#"
+            indoc! {"
                 lambda %0:f32[8][sharding={mesh<['x'=2:manual]>, [{}], varying_manual={'x'}}] .
-                let %1:f32[2, 4][sharding={mesh<['x'=2:manual]>, [{}, {}], varying_manual={'x'}}] = reshape [shape=[2, 4]] %0
+                let %1:f32[2, 4][sharding={mesh<['x'=2:manual]>, [{}, {}], varying_manual={'x'}}] = \
+                        reshape [shape=[2, 4]] %0
                     %2:f32[2, 4][sharding={mesh<['x'=2:manual]>, [{}, {}], varying_manual={'x'}}] = abs %1
-                    %3:f32[2][sharding={mesh<['x'=2:manual]>, [{}], varying_manual={'x'}}] = reduce [kind=max, axes=[1]] %2
-                    %4:u32[2][sharding={mesh<['x'=2:manual]>, [{}], varying_manual={'x'}}] = convert_element_type [data_type=u32, bitcast=true] %3
+                    %3:f32[2][sharding={mesh<['x'=2:manual]>, [{}], varying_manual={'x'}}] = \
+                        reduce [kind=max, axes=[1]] %2
+                    %4:u32[2][sharding={mesh<['x'=2:manual]>, [{}], varying_manual={'x'}}] = \
+                        convert_element_type [data_type=u32, bitcast=true] %3
                     %5:f32[] = constant [value=inf]
                     %6:f32[2] = broadcast [output_type=f32[2], output_axes=[]] %5
                     %7:u32[2] = convert_element_type [data_type=u32, bitcast=true] %6
-                    %8:u32[2][sharding={mesh<['x'=2:manual]>, [{}]}] = broadcast [output_type=u32[2][sharding={mesh<['x'=2:manual]>, [{}]}], output_axes=[0]] %7
-                    %9:u32[2][sharding={mesh<['x'=2:manual]>, [{}], varying_manual={'x'}}] = parallel_vary [axis_name="x"] %8
+                    %8:u32[2][sharding={mesh<['x'=2:manual]>, [{}]}] = \
+                        broadcast [output_type=u32[2][sharding={mesh<['x'=2:manual]>, [{}]}], output_axes=[0]] %7
+                    %9:u32[2][sharding={mesh<['x'=2:manual]>, [{}], varying_manual={'x'}}] = \
+                        parallel_vary [axis_name=\"x\"] %8
                     %10:u32[2][sharding={mesh<['x'=2:manual]>, [{}], varying_manual={'x'}}] = and %4 %9
-                    %11:f32[2][sharding={mesh<['x'=2:manual]>, [{}], varying_manual={'x'}}] = convert_element_type [data_type=f32, bitcast=true] %10
+                    %11:f32[2][sharding={mesh<['x'=2:manual]>, [{}], varying_manual={'x'}}] = \
+                        convert_element_type [data_type=f32, bitcast=true] %10
                     %12:f32[] = constant [value=0.00390625]
                     %13:f32[2] = broadcast [output_type=f32[2], output_axes=[]] %12
-                    %14:f32[2][sharding={mesh<['x'=2:manual]>, [{}]}] = broadcast [output_type=f32[2][sharding={mesh<['x'=2:manual]>, [{}]}], output_axes=[0]] %13
-                    %15:f32[2][sharding={mesh<['x'=2:manual]>, [{}], varying_manual={'x'}}] = parallel_vary [axis_name="x"] %14
+                    %14:f32[2][sharding={mesh<['x'=2:manual]>, [{}]}] = \
+                        broadcast [output_type=f32[2][sharding={mesh<['x'=2:manual]>, [{}]}], output_axes=[0]] %13
+                    %15:f32[2][sharding={mesh<['x'=2:manual]>, [{}], varying_manual={'x'}}] = \
+                        parallel_vary [axis_name=\"x\"] %14
                     %16:f32[2][sharding={mesh<['x'=2:manual]>, [{}], varying_manual={'x'}}] = mul %11 %15
                     %17:f32[] = constant [value=1.1754944e-38]
                     %18:f32[] = constant [value=1.7014118e38]
-                    %19:f32[][sharding={mesh<['x'=2:manual]>, []}] = broadcast [output_type=f32[][sharding={mesh<['x'=2:manual]>, []}], output_axes=[]] %17
-                    %20:f32[][sharding={mesh<['x'=2:manual]>, [], varying_manual={'x'}}] = parallel_vary [axis_name="x"] %19
-                    %21:f32[][sharding={mesh<['x'=2:manual]>, []}] = broadcast [output_type=f32[][sharding={mesh<['x'=2:manual]>, []}], output_axes=[]] %18
-                    %22:f32[][sharding={mesh<['x'=2:manual]>, [], varying_manual={'x'}}] = parallel_vary [axis_name="x"] %21
+                    %19:f32[][sharding={mesh<['x'=2:manual]>, []}] = \
+                        broadcast [output_type=f32[][sharding={mesh<['x'=2:manual]>, []}], output_axes=[]] %17
+                    %20:f32[][sharding={mesh<['x'=2:manual]>, [], varying_manual={'x'}}] = \
+                        parallel_vary [axis_name=\"x\"] %19
+                    %21:f32[][sharding={mesh<['x'=2:manual]>, []}] = \
+                        broadcast [output_type=f32[][sharding={mesh<['x'=2:manual]>, []}], output_axes=[]] %18
+                    %22:f32[][sharding={mesh<['x'=2:manual]>, [], varying_manual={'x'}}] = \
+                        parallel_vary [axis_name=\"x\"] %21
                     %23:f32[2][sharding={mesh<['x'=2:manual]>, [{}], varying_manual={'x'}}] = clamp %20 %16 %22
-                    %24:f8e8m0fnu[2][sharding={mesh<['x'=2:manual]>, [{}], varying_manual={'x'}}] = convert_element_type [data_type=f8e8m0fnu] %23
+                    %24:f8e8m0fnu[2][sharding={mesh<['x'=2:manual]>, [{}], varying_manual={'x'}}] = \
+                        convert_element_type [data_type=f8e8m0fnu] %23
                     %25:f32[2, 4][sharding={mesh<['x'=2:manual]>, [{}, {}], varying_manual={'x'}}] = broadcast [
                         output_type=f32[2, 4][sharding={mesh<['x'=2:manual]>, [{}, {}], varying_manual={'x'}}],
                         output_axes=[0],
@@ -4169,39 +4200,54 @@ mod tests {
                     %27:f32[8][sharding={mesh<['x'=2:manual]>, [{}], varying_manual={'x'}}] = div %0 %26
                     %28:f32[] = constant [value=-448.0]
                     %29:f32[] = constant [value=448.0]
-                    %30:f32[][sharding={mesh<['x'=2:manual]>, []}] = broadcast [output_type=f32[][sharding={mesh<['x'=2:manual]>, []}], output_axes=[]] %28
-                    %31:f32[][sharding={mesh<['x'=2:manual]>, [], varying_manual={'x'}}] = parallel_vary [axis_name="x"] %30
-                    %32:f32[][sharding={mesh<['x'=2:manual]>, []}] = broadcast [output_type=f32[][sharding={mesh<['x'=2:manual]>, []}], output_axes=[]] %29
-                    %33:f32[][sharding={mesh<['x'=2:manual]>, [], varying_manual={'x'}}] = parallel_vary [axis_name="x"] %32
+                    %30:f32[][sharding={mesh<['x'=2:manual]>, []}] = \
+                        broadcast [output_type=f32[][sharding={mesh<['x'=2:manual]>, []}], output_axes=[]] %28
+                    %31:f32[][sharding={mesh<['x'=2:manual]>, [], varying_manual={'x'}}] = \
+                        parallel_vary [axis_name=\"x\"] %30
+                    %32:f32[][sharding={mesh<['x'=2:manual]>, []}] = \
+                        broadcast [output_type=f32[][sharding={mesh<['x'=2:manual]>, []}], output_axes=[]] %29
+                    %33:f32[][sharding={mesh<['x'=2:manual]>, [], varying_manual={'x'}}] = \
+                        parallel_vary [axis_name=\"x\"] %32
                     %34:f32[8][sharding={mesh<['x'=2:manual]>, [{}], varying_manual={'x'}}] = clamp %31 %27 %33
-                    %35:u32[8][sharding={mesh<['x'=2:manual]>, [{}], varying_manual={'x'}}] = convert_element_type [data_type=u32, bitcast=true] %34
+                    %35:u32[8][sharding={mesh<['x'=2:manual]>, [{}], varying_manual={'x'}}] = \
+                        convert_element_type [data_type=u32, bitcast=true] %34
                     %36:f32[] = constant [value=inf]
                     %37:f32[8] = broadcast [output_type=f32[8], output_axes=[]] %36
                     %38:u32[8] = convert_element_type [data_type=u32, bitcast=true] %37
-                    %39:u32[8][sharding={mesh<['x'=2:manual]>, [{}]}] = broadcast [output_type=u32[8][sharding={mesh<['x'=2:manual]>, [{}]}], output_axes=[0]] %38
-                    %40:u32[8][sharding={mesh<['x'=2:manual]>, [{}], varying_manual={'x'}}] = parallel_vary [axis_name="x"] %39
+                    %39:u32[8][sharding={mesh<['x'=2:manual]>, [{}]}] = \
+                        broadcast [output_type=u32[8][sharding={mesh<['x'=2:manual]>, [{}]}], output_axes=[0]] %38
+                    %40:u32[8][sharding={mesh<['x'=2:manual]>, [{}], varying_manual={'x'}}] = \
+                        parallel_vary [axis_name=\"x\"] %39
                     %41:u32[8][sharding={mesh<['x'=2:manual]>, [{}], varying_manual={'x'}}] = and %35 %40
-                    %42:f32[8][sharding={mesh<['x'=2:manual]>, [{}], varying_manual={'x'}}] = convert_element_type [data_type=f32, bitcast=true] %41
+                    %42:f32[8][sharding={mesh<['x'=2:manual]>, [{}], varying_manual={'x'}}] = \
+                        convert_element_type [data_type=f32, bitcast=true] %41
                     %43:f32[] = constant [value=0.015625]
                     %44:f32[8] = broadcast [output_type=f32[8], output_axes=[]] %43
                     %45:f32[] = constant [value=inf]
                     %46:f32[8] = broadcast [output_type=f32[8], output_axes=[]] %45
-                    %47:f32[8][sharding={mesh<['x'=2:manual]>, [{}]}] = broadcast [output_type=f32[8][sharding={mesh<['x'=2:manual]>, [{}]}], output_axes=[0]] %44
-                    %48:f32[8][sharding={mesh<['x'=2:manual]>, [{}], varying_manual={'x'}}] = parallel_vary [axis_name="x"] %47
-                    %49:f32[8][sharding={mesh<['x'=2:manual]>, [{}]}] = broadcast [output_type=f32[8][sharding={mesh<['x'=2:manual]>, [{}]}], output_axes=[0]] %46
-                    %50:f32[8][sharding={mesh<['x'=2:manual]>, [{}], varying_manual={'x'}}] = parallel_vary [axis_name="x"] %49
+                    %47:f32[8][sharding={mesh<['x'=2:manual]>, [{}]}] = \
+                        broadcast [output_type=f32[8][sharding={mesh<['x'=2:manual]>, [{}]}], output_axes=[0]] %44
+                    %48:f32[8][sharding={mesh<['x'=2:manual]>, [{}], varying_manual={'x'}}] = \
+                        parallel_vary [axis_name=\"x\"] %47
+                    %49:f32[8][sharding={mesh<['x'=2:manual]>, [{}]}] = \
+                        broadcast [output_type=f32[8][sharding={mesh<['x'=2:manual]>, [{}]}], output_axes=[0]] %46
+                    %50:f32[8][sharding={mesh<['x'=2:manual]>, [{}], varying_manual={'x'}}] = \
+                        parallel_vary [axis_name=\"x\"] %49
                     %51:f32[8][sharding={mesh<['x'=2:manual]>, [{}], varying_manual={'x'}}] = clamp %48 %42 %50
                     %52:f32[] = constant [value=0.125]
                     %53:f32[8] = broadcast [output_type=f32[8], output_axes=[]] %52
-                    %54:f32[8][sharding={mesh<['x'=2:manual]>, [{}]}] = broadcast [output_type=f32[8][sharding={mesh<['x'=2:manual]>, [{}]}], output_axes=[0]] %53
-                    %55:f32[8][sharding={mesh<['x'=2:manual]>, [{}], varying_manual={'x'}}] = parallel_vary [axis_name="x"] %54
+                    %54:f32[8][sharding={mesh<['x'=2:manual]>, [{}]}] = \
+                        broadcast [output_type=f32[8][sharding={mesh<['x'=2:manual]>, [{}]}], output_axes=[0]] %53
+                    %55:f32[8][sharding={mesh<['x'=2:manual]>, [{}], varying_manual={'x'}}] = \
+                        parallel_vary [axis_name=\"x\"] %54
                     %56:f32[8][sharding={mesh<['x'=2:manual]>, [{}], varying_manual={'x'}}] = mul %51 %55
                     %57:f32[8][sharding={mesh<['x'=2:manual]>, [{}], varying_manual={'x'}}] = div %34 %56
                     %58:f32[8][sharding={mesh<['x'=2:manual]>, [{}], varying_manual={'x'}}] = round %57
                     %59:f32[8][sharding={mesh<['x'=2:manual]>, [{}], varying_manual={'x'}}] = mul %58 %56
-                    %60:f8e4m3fn[8][sharding={mesh<['x'=2:manual]>, [{}], varying_manual={'x'}}] = convert_element_type [data_type=f8e4m3fn] %59
+                    %60:f8e4m3fn[8][sharding={mesh<['x'=2:manual]>, [{}], varying_manual={'x'}}] = \
+                        convert_element_type [data_type=f8e4m3fn] %59
                 in (%60, %24)
-            "#}
+            "}
             .trim_end(),
         );
 
@@ -4230,7 +4276,7 @@ mod tests {
         assert_eq!(output_types, vec![sharded(DataType::F4E2M1FN, 8), sharded(DataType::F8E4M3FN, 2)]);
         assert_eq!(
             program.to_string(),
-            indoc! {r#"
+            indoc! {"
                 lambda %0:f32[2, 8][sharding={mesh<['y'=2:explicit]>, [{'y'}, {}]}] .
                 let %1:f32[2, 2, 4][sharding={mesh<['y'=2:explicit]>, [{'y'}, {}, {}]}] = reshape [shape=[2, 2, 4]] %0
                     %2:f32[2, 2, 4][sharding={mesh<['y'=2:explicit]>, [{'y'}, {}, {}]}] = abs %1
@@ -4241,12 +4287,14 @@ mod tests {
                     %7:f32[] = constant [value=0.001953125]
                     %8:f32[] = constant [value=448.0]
                     %9:f32[2, 2][sharding={mesh<['y'=2:explicit]>, [{'y'}, {}]}] = clamp %7 %6 %8
-                    %10:u32[2, 2][sharding={mesh<['y'=2:explicit]>, [{'y'}, {}]}] = convert_element_type [data_type=u32, bitcast=true] %9
+                    %10:u32[2, 2][sharding={mesh<['y'=2:explicit]>, [{'y'}, {}]}] = \
+                        convert_element_type [data_type=u32, bitcast=true] %9
                     %11:f32[] = constant [value=inf]
                     %12:f32[2, 2] = broadcast [output_type=f32[2, 2], output_axes=[]] %11
                     %13:u32[2, 2] = convert_element_type [data_type=u32, bitcast=true] %12
                     %14:u32[2, 2][sharding={mesh<['y'=2:explicit]>, [{'y'}, {}]}] = and %10 %13
-                    %15:f32[2, 2][sharding={mesh<['y'=2:explicit]>, [{'y'}, {}]}] = convert_element_type [data_type=f32, bitcast=true] %14
+                    %15:f32[2, 2][sharding={mesh<['y'=2:explicit]>, [{'y'}, {}]}] = \
+                        convert_element_type [data_type=f32, bitcast=true] %14
                     %16:f32[] = constant [value=0.015625]
                     %17:f32[2, 2] = broadcast [output_type=f32[2, 2], output_axes=[]] %16
                     %18:f32[] = constant [value=inf]
@@ -4258,7 +4306,8 @@ mod tests {
                     %24:f32[2, 2][sharding={mesh<['y'=2:explicit]>, [{'y'}, {}]}] = div %9 %23
                     %25:f32[2, 2][sharding={mesh<['y'=2:explicit]>, [{'y'}, {}]}] = round %24
                     %26:f32[2, 2][sharding={mesh<['y'=2:explicit]>, [{'y'}, {}]}] = mul %25 %23
-                    %27:f8e4m3fn[2, 2][sharding={mesh<['y'=2:explicit]>, [{'y'}, {}]}] = convert_element_type [data_type=f8e4m3fn] %26
+                    %27:f8e4m3fn[2, 2][sharding={mesh<['y'=2:explicit]>, [{'y'}, {}]}] = \
+                        convert_element_type [data_type=f8e4m3fn] %26
                     %28:f32[2, 2, 4][sharding={mesh<['y'=2:explicit]>, [{'y'}, {}, {}]}] = broadcast [
                         output_type=f32[2, 2, 4][sharding={mesh<['y'=2:explicit]>, [{'y'}, {}, {}]}],
                         output_axes=[0, 1],
@@ -4268,12 +4317,14 @@ mod tests {
                     %31:f32[] = constant [value=-6.0]
                     %32:f32[] = constant [value=6.0]
                     %33:f32[2, 8][sharding={mesh<['y'=2:explicit]>, [{'y'}, {}]}] = clamp %31 %30 %32
-                    %34:u32[2, 8][sharding={mesh<['y'=2:explicit]>, [{'y'}, {}]}] = convert_element_type [data_type=u32, bitcast=true] %33
+                    %34:u32[2, 8][sharding={mesh<['y'=2:explicit]>, [{'y'}, {}]}] = \
+                        convert_element_type [data_type=u32, bitcast=true] %33
                     %35:f32[] = constant [value=inf]
                     %36:f32[2, 8] = broadcast [output_type=f32[2, 8], output_axes=[]] %35
                     %37:u32[2, 8] = convert_element_type [data_type=u32, bitcast=true] %36
                     %38:u32[2, 8][sharding={mesh<['y'=2:explicit]>, [{'y'}, {}]}] = and %34 %37
-                    %39:f32[2, 8][sharding={mesh<['y'=2:explicit]>, [{'y'}, {}]}] = convert_element_type [data_type=f32, bitcast=true] %38
+                    %39:f32[2, 8][sharding={mesh<['y'=2:explicit]>, [{'y'}, {}]}] = \
+                        convert_element_type [data_type=f32, bitcast=true] %38
                     %40:f32[] = constant [value=1.0]
                     %41:f32[2, 8] = broadcast [output_type=f32[2, 8], output_axes=[]] %40
                     %42:f32[] = constant [value=inf]
@@ -4285,9 +4336,10 @@ mod tests {
                     %48:f32[2, 8][sharding={mesh<['y'=2:explicit]>, [{'y'}, {}]}] = div %33 %47
                     %49:f32[2, 8][sharding={mesh<['y'=2:explicit]>, [{'y'}, {}]}] = round %48
                     %50:f32[2, 8][sharding={mesh<['y'=2:explicit]>, [{'y'}, {}]}] = mul %49 %47
-                    %51:f4e2m1fn[2, 8][sharding={mesh<['y'=2:explicit]>, [{'y'}, {}]}] = convert_element_type [data_type=f4e2m1fn] %50
+                    %51:f4e2m1fn[2, 8][sharding={mesh<['y'=2:explicit]>, [{'y'}, {}]}] = \
+                        convert_element_type [data_type=f4e2m1fn] %50
                 in (%51, %27)
-            "#}
+            "}
             .trim_end(),
         );
     }
@@ -4879,102 +4931,140 @@ mod tests {
         );
         assert_eq!(
             program.to_string(),
-            indoc! {r#"
-                lambda %0:f32[n][sharding={mesh<['x'=2:manual]>, [{}], varying_manual={'x'}}], %1:f32[][sharding={mesh<['x'=2:manual]>, []}] .
+            indoc! {"
+                lambda \
+                    %0:f32[n][sharding={mesh<['x'=2:manual]>, [{}], varying_manual={'x'}}], \
+                    %1:f32[][sharding={mesh<['x'=2:manual]>, []}] .
                 let %2:dimension<4> = constant [value=4]
                     %3:dimension<n ∈ [0, 9)> = dimension_size [axis=0] %0
                     %4:dimension<0> = constant [value=0]
                     %5:bool[] = compare [direction=GreaterThan] %3 %4
-                    () = assert [message="block extent of axis 0 must be positive", labels=["extent"]] %5 %3
+                    () = assert [message=\"block extent of axis 0 must be positive\", labels=[\"extent\"]] %5 %3
                     %6:dimension<n % 4 ∈ [0, 4)> = dimension_rem %3 %2
                     %7:bool[] = compare [direction=Equal] %6 %4
                     () = assert [
-                        message="block extent of axis 0 must be divisible by block size",
-                        labels=["extent"],
+                        message=\"block extent of axis 0 must be divisible by block size\",
+                        labels=[\"extent\"],
                     ] %7 %3
                     %8:dimension<n / 4 ∈ [0, 3)> = dimension_div %3 %2
                     %9:f32[n][sharding={mesh<['x'=2:manual]>, [{}]}] = broadcast [output_axes=[]] %1 %3
-                    %10:f32[n][sharding={mesh<['x'=2:manual]>, [{}], varying_manual={'x'}}] = parallel_vary [axis_name="x"] %9
+                    %10:f32[n][sharding={mesh<['x'=2:manual]>, [{}], varying_manual={'x'}}] = \
+                        parallel_vary [axis_name=\"x\"] %9
                     %11:f32[n][sharding={mesh<['x'=2:manual]>, [{}], varying_manual={'x'}}] = div %0 %10
-                    %12:f32[n / 4, 4][sharding={mesh<['x'=2:manual]>, [{}, {}], varying_manual={'x'}}] = reshape %11 %8 %2
+                    %12:f32[n / 4, 4][sharding={mesh<['x'=2:manual]>, [{}, {}], varying_manual={'x'}}] = \
+                        reshape %11 %8 %2
                     %13:f32[n / 4, 4][sharding={mesh<['x'=2:manual]>, [{}, {}], varying_manual={'x'}}] = abs %12
-                    %14:f32[n / 4][sharding={mesh<['x'=2:manual]>, [{}], varying_manual={'x'}}] = reduce [kind=max, axes=[1]] %13
+                    %14:f32[n / 4][sharding={mesh<['x'=2:manual]>, [{}], varying_manual={'x'}}] = \
+                        reduce [kind=max, axes=[1]] %13
                     %15:f32[] = constant [value=6.0]
                     %16:f32[n / 4] = broadcast [output_axes=[]] %15 %8
-                    %17:f32[n / 4][sharding={mesh<['x'=2:manual]>, [{}]}] = broadcast [output_type=f32[n / 4][sharding={mesh<['x'=2:manual]>, [{}]}], output_axes=[0]] %16
-                    %18:f32[n / 4][sharding={mesh<['x'=2:manual]>, [{}], varying_manual={'x'}}] = parallel_vary [axis_name="x"] %17
+                    %17:f32[n / 4][sharding={mesh<['x'=2:manual]>, [{}]}] = \
+                        broadcast [output_type=f32[n / 4][sharding={mesh<['x'=2:manual]>, [{}]}], output_axes=[0]] %16
+                    %18:f32[n / 4][sharding={mesh<['x'=2:manual]>, [{}], varying_manual={'x'}}] = \
+                        parallel_vary [axis_name=\"x\"] %17
                     %19:f32[n / 4][sharding={mesh<['x'=2:manual]>, [{}], varying_manual={'x'}}] = div %14 %18
                     %20:f32[] = constant [value=0.001953125]
                     %21:f32[] = constant [value=448.0]
-                    %22:f32[][sharding={mesh<['x'=2:manual]>, []}] = broadcast [output_type=f32[][sharding={mesh<['x'=2:manual]>, []}], output_axes=[]] %20
-                    %23:f32[][sharding={mesh<['x'=2:manual]>, [], varying_manual={'x'}}] = parallel_vary [axis_name="x"] %22
-                    %24:f32[][sharding={mesh<['x'=2:manual]>, []}] = broadcast [output_type=f32[][sharding={mesh<['x'=2:manual]>, []}], output_axes=[]] %21
-                    %25:f32[][sharding={mesh<['x'=2:manual]>, [], varying_manual={'x'}}] = parallel_vary [axis_name="x"] %24
+                    %22:f32[][sharding={mesh<['x'=2:manual]>, []}] = \
+                        broadcast [output_type=f32[][sharding={mesh<['x'=2:manual]>, []}], output_axes=[]] %20
+                    %23:f32[][sharding={mesh<['x'=2:manual]>, [], varying_manual={'x'}}] = \
+                        parallel_vary [axis_name=\"x\"] %22
+                    %24:f32[][sharding={mesh<['x'=2:manual]>, []}] = \
+                        broadcast [output_type=f32[][sharding={mesh<['x'=2:manual]>, []}], output_axes=[]] %21
+                    %25:f32[][sharding={mesh<['x'=2:manual]>, [], varying_manual={'x'}}] = \
+                        parallel_vary [axis_name=\"x\"] %24
                     %26:f32[n / 4][sharding={mesh<['x'=2:manual]>, [{}], varying_manual={'x'}}] = clamp %23 %19 %25
-                    %27:u32[n / 4][sharding={mesh<['x'=2:manual]>, [{}], varying_manual={'x'}}] = convert_element_type [data_type=u32, bitcast=true] %26
+                    %27:u32[n / 4][sharding={mesh<['x'=2:manual]>, [{}], varying_manual={'x'}}] = \
+                        convert_element_type [data_type=u32, bitcast=true] %26
                     %28:f32[] = constant [value=inf]
                     %29:f32[n / 4] = broadcast [output_axes=[]] %28 %8
                     %30:u32[n / 4] = convert_element_type [data_type=u32, bitcast=true] %29
-                    %31:u32[n / 4][sharding={mesh<['x'=2:manual]>, [{}]}] = broadcast [output_type=u32[n / 4][sharding={mesh<['x'=2:manual]>, [{}]}], output_axes=[0]] %30
-                    %32:u32[n / 4][sharding={mesh<['x'=2:manual]>, [{}], varying_manual={'x'}}] = parallel_vary [axis_name="x"] %31
+                    %31:u32[n / 4][sharding={mesh<['x'=2:manual]>, [{}]}] = \
+                        broadcast [output_type=u32[n / 4][sharding={mesh<['x'=2:manual]>, [{}]}], output_axes=[0]] %30
+                    %32:u32[n / 4][sharding={mesh<['x'=2:manual]>, [{}], varying_manual={'x'}}] = \
+                        parallel_vary [axis_name=\"x\"] %31
                     %33:u32[n / 4][sharding={mesh<['x'=2:manual]>, [{}], varying_manual={'x'}}] = and %27 %32
-                    %34:f32[n / 4][sharding={mesh<['x'=2:manual]>, [{}], varying_manual={'x'}}] = convert_element_type [data_type=f32, bitcast=true] %33
+                    %34:f32[n / 4][sharding={mesh<['x'=2:manual]>, [{}], varying_manual={'x'}}] = \
+                        convert_element_type [data_type=f32, bitcast=true] %33
                     %35:f32[] = constant [value=0.015625]
                     %36:f32[n / 4] = broadcast [output_axes=[]] %35 %8
                     %37:f32[] = constant [value=inf]
                     %38:f32[n / 4] = broadcast [output_axes=[]] %37 %8
-                    %39:f32[n / 4][sharding={mesh<['x'=2:manual]>, [{}]}] = broadcast [output_type=f32[n / 4][sharding={mesh<['x'=2:manual]>, [{}]}], output_axes=[0]] %36
-                    %40:f32[n / 4][sharding={mesh<['x'=2:manual]>, [{}], varying_manual={'x'}}] = parallel_vary [axis_name="x"] %39
-                    %41:f32[n / 4][sharding={mesh<['x'=2:manual]>, [{}]}] = broadcast [output_type=f32[n / 4][sharding={mesh<['x'=2:manual]>, [{}]}], output_axes=[0]] %38
-                    %42:f32[n / 4][sharding={mesh<['x'=2:manual]>, [{}], varying_manual={'x'}}] = parallel_vary [axis_name="x"] %41
+                    %39:f32[n / 4][sharding={mesh<['x'=2:manual]>, [{}]}] = \
+                        broadcast [output_type=f32[n / 4][sharding={mesh<['x'=2:manual]>, [{}]}], output_axes=[0]] %36
+                    %40:f32[n / 4][sharding={mesh<['x'=2:manual]>, [{}], varying_manual={'x'}}] = \
+                        parallel_vary [axis_name=\"x\"] %39
+                    %41:f32[n / 4][sharding={mesh<['x'=2:manual]>, [{}]}] = \
+                        broadcast [output_type=f32[n / 4][sharding={mesh<['x'=2:manual]>, [{}]}], output_axes=[0]] %38
+                    %42:f32[n / 4][sharding={mesh<['x'=2:manual]>, [{}], varying_manual={'x'}}] = \
+                        parallel_vary [axis_name=\"x\"] %41
                     %43:f32[n / 4][sharding={mesh<['x'=2:manual]>, [{}], varying_manual={'x'}}] = clamp %40 %34 %42
                     %44:f32[] = constant [value=0.125]
                     %45:f32[n / 4] = broadcast [output_axes=[]] %44 %8
-                    %46:f32[n / 4][sharding={mesh<['x'=2:manual]>, [{}]}] = broadcast [output_type=f32[n / 4][sharding={mesh<['x'=2:manual]>, [{}]}], output_axes=[0]] %45
-                    %47:f32[n / 4][sharding={mesh<['x'=2:manual]>, [{}], varying_manual={'x'}}] = parallel_vary [axis_name="x"] %46
+                    %46:f32[n / 4][sharding={mesh<['x'=2:manual]>, [{}]}] = \
+                        broadcast [output_type=f32[n / 4][sharding={mesh<['x'=2:manual]>, [{}]}], output_axes=[0]] %45
+                    %47:f32[n / 4][sharding={mesh<['x'=2:manual]>, [{}], varying_manual={'x'}}] = \
+                        parallel_vary [axis_name=\"x\"] %46
                     %48:f32[n / 4][sharding={mesh<['x'=2:manual]>, [{}], varying_manual={'x'}}] = mul %43 %47
                     %49:f32[n / 4][sharding={mesh<['x'=2:manual]>, [{}], varying_manual={'x'}}] = div %26 %48
                     %50:f32[n / 4][sharding={mesh<['x'=2:manual]>, [{}], varying_manual={'x'}}] = round %49
                     %51:f32[n / 4][sharding={mesh<['x'=2:manual]>, [{}], varying_manual={'x'}}] = mul %50 %48
-                    %52:f8e4m3fn[n / 4][sharding={mesh<['x'=2:manual]>, [{}], varying_manual={'x'}}] = convert_element_type [data_type=f8e4m3fn] %51
-                    %53:f32[n / 4, 4][sharding={mesh<['x'=2:manual]>, [{}, {}], varying_manual={'x'}}] = broadcast [output_axes=[0]] %51 %8 %2
+                    %52:f8e4m3fn[n / 4][sharding={mesh<['x'=2:manual]>, [{}], varying_manual={'x'}}] = \
+                        convert_element_type [data_type=f8e4m3fn] %51
+                    %53:f32[n / 4, 4][sharding={mesh<['x'=2:manual]>, [{}, {}], varying_manual={'x'}}] = \
+                        broadcast [output_axes=[0]] %51 %8 %2
                     %54:f32[n][sharding={mesh<['x'=2:manual]>, [{}], varying_manual={'x'}}] = reshape %53 %3
                     %55:f32[n][sharding={mesh<['x'=2:manual]>, [{}], varying_manual={'x'}}] = div %11 %54
                     %56:f32[] = constant [value=-6.0]
                     %57:f32[] = constant [value=6.0]
-                    %58:f32[][sharding={mesh<['x'=2:manual]>, []}] = broadcast [output_type=f32[][sharding={mesh<['x'=2:manual]>, []}], output_axes=[]] %56
-                    %59:f32[][sharding={mesh<['x'=2:manual]>, [], varying_manual={'x'}}] = parallel_vary [axis_name="x"] %58
-                    %60:f32[][sharding={mesh<['x'=2:manual]>, []}] = broadcast [output_type=f32[][sharding={mesh<['x'=2:manual]>, []}], output_axes=[]] %57
-                    %61:f32[][sharding={mesh<['x'=2:manual]>, [], varying_manual={'x'}}] = parallel_vary [axis_name="x"] %60
+                    %58:f32[][sharding={mesh<['x'=2:manual]>, []}] = \
+                        broadcast [output_type=f32[][sharding={mesh<['x'=2:manual]>, []}], output_axes=[]] %56
+                    %59:f32[][sharding={mesh<['x'=2:manual]>, [], varying_manual={'x'}}] = \
+                        parallel_vary [axis_name=\"x\"] %58
+                    %60:f32[][sharding={mesh<['x'=2:manual]>, []}] = \
+                        broadcast [output_type=f32[][sharding={mesh<['x'=2:manual]>, []}], output_axes=[]] %57
+                    %61:f32[][sharding={mesh<['x'=2:manual]>, [], varying_manual={'x'}}] = \
+                        parallel_vary [axis_name=\"x\"] %60
                     %62:f32[n][sharding={mesh<['x'=2:manual]>, [{}], varying_manual={'x'}}] = clamp %59 %55 %61
-                    %63:u32[n][sharding={mesh<['x'=2:manual]>, [{}], varying_manual={'x'}}] = convert_element_type [data_type=u32, bitcast=true] %62
+                    %63:u32[n][sharding={mesh<['x'=2:manual]>, [{}], varying_manual={'x'}}] = \
+                        convert_element_type [data_type=u32, bitcast=true] %62
                     %64:f32[] = constant [value=inf]
                     %65:f32[n] = broadcast [output_axes=[]] %64 %3
                     %66:u32[n] = convert_element_type [data_type=u32, bitcast=true] %65
-                    %67:u32[n][sharding={mesh<['x'=2:manual]>, [{}]}] = broadcast [output_type=u32[n][sharding={mesh<['x'=2:manual]>, [{}]}], output_axes=[0]] %66
-                    %68:u32[n][sharding={mesh<['x'=2:manual]>, [{}], varying_manual={'x'}}] = parallel_vary [axis_name="x"] %67
+                    %67:u32[n][sharding={mesh<['x'=2:manual]>, [{}]}] = \
+                        broadcast [output_type=u32[n][sharding={mesh<['x'=2:manual]>, [{}]}], output_axes=[0]] %66
+                    %68:u32[n][sharding={mesh<['x'=2:manual]>, [{}], varying_manual={'x'}}] = \
+                        parallel_vary [axis_name=\"x\"] %67
                     %69:u32[n][sharding={mesh<['x'=2:manual]>, [{}], varying_manual={'x'}}] = and %63 %68
-                    %70:f32[n][sharding={mesh<['x'=2:manual]>, [{}], varying_manual={'x'}}] = convert_element_type [data_type=f32, bitcast=true] %69
+                    %70:f32[n][sharding={mesh<['x'=2:manual]>, [{}], varying_manual={'x'}}] = \
+                        convert_element_type [data_type=f32, bitcast=true] %69
                     %71:f32[] = constant [value=1.0]
                     %72:f32[n] = broadcast [output_axes=[]] %71 %3
                     %73:f32[] = constant [value=inf]
                     %74:f32[n] = broadcast [output_axes=[]] %73 %3
-                    %75:f32[n][sharding={mesh<['x'=2:manual]>, [{}]}] = broadcast [output_type=f32[n][sharding={mesh<['x'=2:manual]>, [{}]}], output_axes=[0]] %72
-                    %76:f32[n][sharding={mesh<['x'=2:manual]>, [{}], varying_manual={'x'}}] = parallel_vary [axis_name="x"] %75
-                    %77:f32[n][sharding={mesh<['x'=2:manual]>, [{}]}] = broadcast [output_type=f32[n][sharding={mesh<['x'=2:manual]>, [{}]}], output_axes=[0]] %74
-                    %78:f32[n][sharding={mesh<['x'=2:manual]>, [{}], varying_manual={'x'}}] = parallel_vary [axis_name="x"] %77
+                    %75:f32[n][sharding={mesh<['x'=2:manual]>, [{}]}] = \
+                        broadcast [output_type=f32[n][sharding={mesh<['x'=2:manual]>, [{}]}], output_axes=[0]] %72
+                    %76:f32[n][sharding={mesh<['x'=2:manual]>, [{}], varying_manual={'x'}}] = \
+                        parallel_vary [axis_name=\"x\"] %75
+                    %77:f32[n][sharding={mesh<['x'=2:manual]>, [{}]}] = \
+                        broadcast [output_type=f32[n][sharding={mesh<['x'=2:manual]>, [{}]}], output_axes=[0]] %74
+                    %78:f32[n][sharding={mesh<['x'=2:manual]>, [{}], varying_manual={'x'}}] = \
+                        parallel_vary [axis_name=\"x\"] %77
                     %79:f32[n][sharding={mesh<['x'=2:manual]>, [{}], varying_manual={'x'}}] = clamp %76 %70 %78
                     %80:f32[] = constant [value=0.5]
                     %81:f32[n] = broadcast [output_axes=[]] %80 %3
-                    %82:f32[n][sharding={mesh<['x'=2:manual]>, [{}]}] = broadcast [output_type=f32[n][sharding={mesh<['x'=2:manual]>, [{}]}], output_axes=[0]] %81
-                    %83:f32[n][sharding={mesh<['x'=2:manual]>, [{}], varying_manual={'x'}}] = parallel_vary [axis_name="x"] %82
+                    %82:f32[n][sharding={mesh<['x'=2:manual]>, [{}]}] = \
+                        broadcast [output_type=f32[n][sharding={mesh<['x'=2:manual]>, [{}]}], output_axes=[0]] %81
+                    %83:f32[n][sharding={mesh<['x'=2:manual]>, [{}], varying_manual={'x'}}] = \
+                        parallel_vary [axis_name=\"x\"] %82
                     %84:f32[n][sharding={mesh<['x'=2:manual]>, [{}], varying_manual={'x'}}] = mul %79 %83
                     %85:f32[n][sharding={mesh<['x'=2:manual]>, [{}], varying_manual={'x'}}] = div %62 %84
                     %86:f32[n][sharding={mesh<['x'=2:manual]>, [{}], varying_manual={'x'}}] = round %85
                     %87:f32[n][sharding={mesh<['x'=2:manual]>, [{}], varying_manual={'x'}}] = mul %86 %84
-                    %88:f4e2m1fn[n][sharding={mesh<['x'=2:manual]>, [{}], varying_manual={'x'}}] = convert_element_type [data_type=f4e2m1fn] %87
+                    %88:f4e2m1fn[n][sharding={mesh<['x'=2:manual]>, [{}], varying_manual={'x'}}] = \
+                        convert_element_type [data_type=f4e2m1fn] %87
                 in (%88, %52)
-            "#}
+            "}
             .trim_end(),
         );
     }
@@ -6685,41 +6775,51 @@ mod tests {
                 lambda %0:f32[2, 4], %1:f32[1, 2], %2:f32[], %3:f32[4, 1], %4:f32[2, 1], %5:f32[] .
                 let %6:f32[2, 1][sharding={mesh<['x'=2:manual]>, [{'x'}, {}]}] = shard_map [
                     mesh=['x'=2:manual],
-                    in_shardings=[{mesh<['x'=2:manual]>, [{'x'}, {}]}, {mesh<['x'=2:manual]>, [{}, {}]}, \
-                    {mesh<['x'=2:manual]>, []}, {mesh<['x'=2:manual]>, [{}, {}]}, {mesh<['x'=2:manual]>, [{}, {}]}, \
-                    {mesh<['x'=2:manual]>, []}],
+                    in_shardings=[\
+                        {mesh<['x'=2:manual]>, [{'x'}, {}]}, \
+                        {mesh<['x'=2:manual]>, [{}, {}]}, \
+                        {mesh<['x'=2:manual]>, []}, \
+                        {mesh<['x'=2:manual]>, [{}, {}]}, \
+                        {mesh<['x'=2:manual]>, [{}, {}]}, \
+                        {mesh<['x'=2:manual]>, []}],
                     out_shardings=[{mesh<['x'=2:manual]>, [{'x'}, {}]}],
                     manual_axes=['x'],
-                    global_input_types=[f32[2, 4][sharding={mesh<['x'=2:manual]>, [{'x'}, {}]}], f32[1, \
-                    2][sharding={mesh<['x'=2:manual]>, [{}, {}]}], f32[][sharding={mesh<['x'=2:manual]>, []}], f32[4, \
-                    1][sharding={mesh<['x'=2:manual]>, [{}, {}]}], f32[2, 1][sharding={mesh<['x'=2:manual]>, [{}, \
-                    {}]}], f32[][sharding={mesh<['x'=2:manual]>, []}]],
+                    global_input_types=[\
+                        f32[2, 4][sharding={mesh<['x'=2:manual]>, [{'x'}, {}]}], \
+                        f32[1, 2][sharding={mesh<['x'=2:manual]>, [{}, {}]}], \
+                        f32[][sharding={mesh<['x'=2:manual]>, []}], \
+                        f32[4, 1][sharding={mesh<['x'=2:manual]>, [{}, {}]}], \
+                        f32[2, 1][sharding={mesh<['x'=2:manual]>, [{}, {}]}], \
+                        f32[][sharding={mesh<['x'=2:manual]>, []}]],
                     global_output_types=[f32[2, 1][sharding={mesh<['x'=2:manual]>, [{'x'}, {}]}]],
                 ] %0 %1 %2 %3 %4 %5 [
                     body={
-                        lambda %0:f32[1, 4][sharding={mesh<['x'=2:manual]>, [{}, {}], varying_manual={'x'}}], \
-                    %1:f32[1, 2][sharding={mesh<['x'=2:manual]>, [{}, {}]}], %2:f32[][sharding={mesh<['x'=2:manual]>, \
-                    []}], %3:f32[4, 1][sharding={mesh<['x'=2:manual]>, [{}, {}]}], %4:f32[2, \
-                    1][sharding={mesh<['x'=2:manual]>, [{}, {}]}], %5:f32[][sharding={mesh<['x'=2:manual]>, []}] .
+                        lambda \
+                            %0:f32[1, 4][sharding={mesh<['x'=2:manual]>, [{}, {}], varying_manual={'x'}}], \
+                            %1:f32[1, 2][sharding={mesh<['x'=2:manual]>, [{}, {}]}], \
+                            %2:f32[][sharding={mesh<['x'=2:manual]>, []}], \
+                            %3:f32[4, 1][sharding={mesh<['x'=2:manual]>, [{}, {}]}], \
+                            %4:f32[2, 1][sharding={mesh<['x'=2:manual]>, [{}, {}]}], \
+                            %5:f32[][sharding={mesh<['x'=2:manual]>, []}] .
                         let %6:f32[4, 1][sharding={mesh<['x'=2:manual]>, [{}, {}], varying_manual={'x'}}] = \
-                    parallel_vary [axis_name=\"x\"] %3
+                                parallel_vary [axis_name=\"x\"] %3
                             %7:f32[1, 2][sharding={mesh<['x'=2:manual]>, [{}, {}], varying_manual={'x'}}] = \
-                    parallel_vary [axis_name=\"x\"] %1
+                                parallel_vary [axis_name=\"x\"] %1
                             %8:f32[2, 1][sharding={mesh<['x'=2:manual]>, [{}, {}], varying_manual={'x'}}] = \
-                    parallel_vary [axis_name=\"x\"] %4
-                            %9:f32[1, 1][sharding={mesh<['x'=2:manual]>, [{}, {}], varying_manual={'x'}}] = \
-                    scaled_dot [
-                                dimensions=(lhs_contracting=[1], rhs_contracting=[0], lhs_batching=[], \
-                    rhs_batching=[]),
+                                parallel_vary [axis_name=\"x\"] %4
+                            %9:f32[1, 1][sharding={mesh<['x'=2:manual]>, [{}, {}], varying_manual={'x'}}] = scaled_dot [
+                                dimensions=(lhs_contracting=[1], rhs_contracting=[0], lhs_batching=[], rhs_batching=[]),
                                 accumulation_type=f32,
                                 lhs_scale=true,
                                 rhs_scale=true,
                             ] %0 %6 %7 %8
                             %10:f32[][sharding={mesh<['x'=2:manual]>, []}] = mul %2 %5
-                            %11:f32[1, 1][sharding={mesh<['x'=2:manual]>, [{}, {}]}] = broadcast [output_type=f32[1, \
-                    1][sharding={mesh<['x'=2:manual]>, [{}, {}]}], output_axes=[]] %10
+                            %11:f32[1, 1][sharding={mesh<['x'=2:manual]>, [{}, {}]}] = \
+                                broadcast [\
+                                    output_type=f32[1, 1][sharding={mesh<['x'=2:manual]>, [{}, {}]}], \
+                                    output_axes=[]] %10
                             %12:f32[1, 1][sharding={mesh<['x'=2:manual]>, [{}, {}], varying_manual={'x'}}] = \
-                    parallel_vary [axis_name=\"x\"] %11
+                                parallel_vary [axis_name=\"x\"] %11
                             %13:f32[1, 1][sharding={mesh<['x'=2:manual]>, [{}, {}], varying_manual={'x'}}] = mul %9 %12
                         in (%13)
                     },
@@ -7317,9 +7417,9 @@ mod tests {
         assert_eq!(output_type, ArrayType::new_static(DataType::BF16, [2, 4]));
         assert_eq!(
             program.to_string(),
-            indoc! {r#"
+            indoc! {"
                 lambda %0:bf16[2, 8], %1:bf16[8, 4] .
-                let %2:bf16[2, 4] = composite [name="block_scaled_dot"] %0 %1 [
+                let %2:bf16[2, 4] = composite [name=\"block_scaled_dot\"] %0 %1 [
                     primal={
                         lambda %0:bf16[2, 8], %1:bf16[8, 4] .
                         let %2:f32[2, 8] = convert_element_type [data_type=f32] %0
@@ -7430,7 +7530,11 @@ mod tests {
                             %107:f32[1, 4, 8] = mul %106 %104
                             %108:f4e2m1fn[1, 4, 8] = convert_element_type [data_type=f4e2m1fn] %107
                             %109:f32[1, 2, 4] = scaled_dot [
-                                dimensions=(lhs_contracting=[2], rhs_contracting=[2], lhs_batching=[0], rhs_batching=[0]),
+                                dimensions=(\
+                                    lhs_contracting=[2], \
+                                    rhs_contracting=[2], \
+                                    lhs_batching=[0], \
+                                    rhs_batching=[0]),
                                 accumulation_type=f32,
                                 lhs_scale=true,
                                 rhs_scale=true,
@@ -7441,7 +7545,7 @@ mod tests {
                     },
                 ]
                 in (%2)
-            "#}
+            "}
             .trim_end(),
         );
     }
