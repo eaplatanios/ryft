@@ -127,8 +127,9 @@ impl RaggedCase {
                     .parallel_ragged_all_to_all("x", &inputs[1], &inputs[2], &inputs[3], &inputs[4], &inputs[5])?,
             ]),
             "batch" => {
-                // The leading physical axis maps independent exchanges. The unrelated named axis merges transfers
-                // and rebases row offsets, exercising the GPU's widened `u64` metadata path.
+                // The leading physical axis maps independent exchanges. The unrelated named axis adds a batch
+                // dimension, whose lowering merges transfers and rebases row offsets, exercising the GPU's widened
+                // `u64` metadata path.
                 let output = batch(
                     |inputs: Vec<_>| {
                         inputs[0]
