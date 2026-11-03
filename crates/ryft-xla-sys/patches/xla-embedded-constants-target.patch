@@ -1,0 +1,13 @@
+diff --git a/xla/util/embedded_constant_buffers.cc b/xla/util/embedded_constant_buffers.cc
+--- a/xla/util/embedded_constant_buffers.cc
++++ b/xla/util/embedded_constant_buffers.cc
+@@ -144,6 +144,9 @@
+   llvm::LLVMContext llvm_context;
+   auto module_with_serialized_proto = std::make_unique<llvm::Module>(
+       "embedded_constant_data_module", llvm_context);
++  // Preserve the platform and deployment target when emitting the data object.
++  // LLVM's Mach-O backend reads the module triple to emit version load commands.
++  module_with_serialized_proto->setTargetTriple(target_machine->getTargetTriple());
+ 
+   EmbeddedConstantBuffers result;
+ 

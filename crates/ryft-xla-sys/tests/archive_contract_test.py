@@ -4,8 +4,13 @@
 from __future__ import annotations
 
 import pathlib
+import re
+import shutil
+import subprocess
 import sys
 import tarfile
+import tempfile
+import unittest
 
 
 REQUIRED_PATHS = {
@@ -65,34 +70,100 @@ def normalized_path(name: str) -> str:
     return name.removeprefix("./")
 
 
-def main() -> int:
-    """Checks required paths, duplicates, and the single-library contract."""
-    if len(sys.argv) != 2:
-        raise SystemExit("usage: archive_contract_test.py <archive.tar.gz>")
+def check_macos_platform_commands(library: pathlib.Path) -> None:
+    """Requires every Mach-O archive member to declare its target platform."""
+    output = subprocess.run(
+        ["xcrun", "otool", "-l", str(library)], capture_output=True, text=True, check=True, timeout=300
+    ).stdout
+    members = re.split(r"(?m)^.+\((.+)\):\n", output)[1:]
+    if not members:
+        raise AssertionError("no Mach-O objects found in static library")
+    missing_commands = [
+        name
+        for name, commands in zip(members[::2], members[1::2])
+        if not re.search(r"(?m)^\s*cmd LC_(BUILD_VERSION|VERSION_MIN_MACOSX)$", commands)
+    ]
+    if missing_commands:
+        raise AssertionError("objects missing macOS platform version commands:\n" + "\n".join(missing_commands))
 
-    archive_path = pathlib.Path(sys.argv[1])
-    with tarfile.open(archive_path, "r:gz") as archive:
-        paths = [normalized_path(member.name) for member in archive.getmembers() if member.isfile()]
 
-    duplicate_paths = sorted(path for path in set(paths) if paths.count(path) > 1)
-    if duplicate_paths:
-        raise AssertionError(f"duplicate archive paths: {duplicate_paths}")
+@unittest.skipUnless(sys.platform == "darwin", "requires the macOS assembler and object tools")
+class MacosPlatformCommandsTest(unittest.TestCase):
+    """Exercises platform validation on real archives with mixed object metadata."""
 
-    missing_paths = sorted(REQUIRED_PATHS.difference(paths))
-    if missing_paths:
-        raise AssertionError("missing required archive paths:\n" + "\n".join(missing_paths))
+    def test_check_macos_platform_commands(self) -> None:
+        with tempfile.TemporaryDirectory() as directory:
+            root = pathlib.Path(directory)
+            for name, directive in (
+                ("modern", ".build_version macos, 11, 0"),
+                ("legacy", ".macosx_version_min 10, 14"),
+                ("missing", ""),
+            ):
+                source = root / f"{name}.s"
+                source.write_text(f"{directive}\n.section __TEXT,__const\n.byte 1\n", encoding="utf-8")
+                subprocess.run(
+                    [
+                        "xcrun", "clang", "-cc1as", "-triple", "x86_64-apple-macosx", "-filetype", "obj",
+                        str(source), "-o", str(root / f"{name}.o"),
+                    ],
+                    check=True,
+                    timeout=300,
+                )
 
-    forbidden_paths = sorted(path for path in paths if path.startswith(FORBIDDEN_PREFIXES))
-    if forbidden_paths:
-        raise AssertionError("source-only metadata present in native archive:\n" + "\n".join(forbidden_paths))
+            library = root / "library.a"
+            subprocess.run(
+                ["xcrun", "ar", "rcs", str(library), str(root / "modern.o"), str(root / "legacy.o")],
+                check=True,
+                timeout=300,
+            )
+            check_macos_platform_commands(library)
 
-    libraries = sorted(
-        path for path in paths if path.startswith("lib/") and path.endswith((".a", ".dylib", ".dll", ".lib", ".so"))
-    )
-    if len(libraries) != 1 or "ryft-xla-sys-static-library" not in libraries[0]:
-        raise AssertionError(f"expected exactly the main static library, found: {libraries}")
-    return 0
+            subprocess.run(
+                ["xcrun", "ar", "r", str(library), str(root / "missing.o")], check=True, timeout=300
+            )
+            with self.assertRaises(AssertionError) as error:
+                check_macos_platform_commands(library)
+            self.assertEqual(str(error.exception), "objects missing macOS platform version commands:\nmissing.o")
+
+
+class ArchiveContractTest(unittest.TestCase):
+    """Validates the built archive supplied on the script's command line."""
+
+    archive_path: pathlib.Path
+
+    def test_archive_contents(self) -> None:
+        with tarfile.open(self.archive_path, "r:gz") as archive:
+            paths = [normalized_path(member.name) for member in archive.getmembers() if member.isfile()]
+
+        duplicate_paths = sorted(path for path in set(paths) if paths.count(path) > 1)
+        if duplicate_paths:
+            raise AssertionError(f"duplicate archive paths: {duplicate_paths}")
+
+        missing_paths = sorted(REQUIRED_PATHS.difference(paths))
+        if missing_paths:
+            raise AssertionError("missing required archive paths:\n" + "\n".join(missing_paths))
+
+        forbidden_paths = sorted(path for path in paths if path.startswith(FORBIDDEN_PREFIXES))
+        if forbidden_paths:
+            raise AssertionError("source-only metadata present in native archive:\n" + "\n".join(forbidden_paths))
+
+        libraries = sorted(
+            path for path in paths if path.startswith("lib/") and path.endswith((".a", ".dylib", ".dll", ".lib", ".so"))
+        )
+        if len(libraries) != 1 or "ryft-xla-sys-static-library" not in libraries[0]:
+            raise AssertionError(f"expected exactly the main static library, found: {libraries}")
+
+        if sys.platform == "darwin":
+            with tarfile.open(self.archive_path, "r:gz") as archive, tempfile.TemporaryDirectory() as directory:
+                member = next(member for member in archive.getmembers() if normalized_path(member.name) == libraries[0])
+                library = pathlib.Path(directory) / "library.a"
+                with archive.extractfile(member) as source, library.open("wb") as destination:
+                    shutil.copyfileobj(source, destination)
+                check_macos_platform_commands(library)
 
 
 if __name__ == "__main__":
-    raise SystemExit(main())
+    if len(sys.argv) < 2:
+        raise SystemExit("usage: archive_contract_test.py <archive.tar.gz> [unittest options]")
+    ArchiveContractTest.archive_path = pathlib.Path(sys.argv.pop(1))
+    unittest.main()
