@@ -181,8 +181,9 @@ compute capability, NVIDIA driver r580 or newer, CUDA Toolkit 13.1 or newer, and
 
 The static library archive contains one main library under `lib/`, public C/C++ headers under `include/`, Protobuf
 sources and descriptors under `proto/`, and MLIR TableGen inputs under `td/`. Archive construction normalizes member
-ordering, timestamps, ownership, and permissions so identical inputs produce byte-identical release artifacts.
-Archive tests reject missing or duplicate canonical paths and incidental libraries.
+ordering, timestamps, ownership, and permissions so identical inputs produce byte-identical release artifacts. Archive
+tests reject missing or duplicate canonical paths and incidental libraries. On macOS, they also require every object
+in the static library to include a platform version command, including the objects that embed XLA's LLVM bitcode.
 
 Validate the source and archive contracts with `tests/symbol_contract_test.py`, passing `--archive` and the exact JAX,
 OpenXLA, LLVM/MLIR, `ryft-xla-sys`, and `ryft-mlir` source roots through the corresponding `--*-root` options. The
