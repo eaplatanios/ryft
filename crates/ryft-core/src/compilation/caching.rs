@@ -904,7 +904,7 @@ impl<'o, C: CompilationCacheDomain> CompilationContext<'o, C> {
                 .disk_cache
                 .as_ref()
                 .zip(persistent_key.as_deref())
-                .map(|(disk_cache, key)| (disk_cache, CacheDigest::from_key(key)));
+                .map(|(disk_cache, key)| (disk_cache, DiskCacheDigest::from_key(key)));
 
             // The persistent key addresses artifacts across processes, so the exchange cannot participate without it.
             // Preflight runs before disk restore so peer compatibility is checked even when this process has a hit.
@@ -1016,7 +1016,7 @@ impl<'o, C: CompilationCacheDomain> CompilationContext<'o, C> {
         domain: &C,
         program: &C::LoweredProgram,
         disk_cache: &DiskCache,
-        digest: &CacheDigest,
+        digest: &DiskCacheDigest,
     ) -> Option<(C::CompiledProgram, Vec<u8>)> {
         let lookup_start = Instant::now();
         let (outcome, restored) = match disk_cache.get(digest) {
@@ -1220,7 +1220,7 @@ impl<'o, C: CompilationCacheDomain> CompilationContext<'o, C> {
         domain: &C,
         program: &C::LoweredProgram,
         producer: InFlightProducer<'_, C>,
-        persistent: Option<(&DiskCache, CacheDigest)>,
+        persistent: Option<(&DiskCache, DiskCacheDigest)>,
         exchange: Option<ActiveExchange<'_>>,
     ) -> Result<Arc<C::CompiledProgram>, C::Error> {
         let leader_exchange = exchange.filter(|exchange| exchange.is_leader());
@@ -1410,10 +1410,8 @@ impl<C: CompilationCacheDomain> Default for CompilationContext<'_, C> {
     }
 }
 
-// TODO(eaplatanios): Review from here onwards.
-
-/// Magic bytes that open every uncompressed entry envelope, which identify files that this cache wrote apart from other
-/// gzip compressed files in its directory. The envelope header has a fixed layout, so the magic value has a fixed
+/// Magic bytes that open every uncompressed entry envelope, which identify files that this cache wrote apart from
+/// other gzip compressed files in its directory. The envelope header has a fixed layout, so the magic value has a fixed
 /// width, and eight bytes is the conventional width of a file signature (e.g., that of PNG files) that makes accidental
 /// matches negligible. `RYFTCACHE` is therefore truncated to `RYFTCACH`. Changes to the envelope layout increment
 /// [`ENTRY_FORMAT_VERSION`] instead of changing this value.
@@ -1446,22 +1444,21 @@ const DEFAULT_MINIMUM_COMPILATION_DURATION: Duration = Duration::from_secs(1);
 /// Default minimum serialized payload size required before a newly compiled program is persisted.
 const DEFAULT_MINIMUM_ENTRY_SIZE: usize = 0;
 
-/// Directory-backed persistent cache of serialized compiled programs.
-///
-/// A [`DiskCache`] persists serialized compiled programs across processes, similar to JAX's
-/// [persistent compilation cache](https://docs.jax.dev/en/latest/persistent_compilation_cache.html). When attached to a
-/// [`CompilationContext`], it serves as a second tier below the in-memory LRU cache. On a memory miss, the context
+/// Directory-backed persistent cache of serialized compiled programs. A [`DiskCache`] persists serialized compiled
+/// programs across processes, similar to JAX's
+/// [persistent compilation cache](https://docs.jax.dev/en/latest/persistent_compilation_cache.html). When attached
+/// to a [`CompilationContext`], it serves as a second tier below the in-memory LRU cache. On a memory miss, the context
 /// first checks the disk for a serialized program that matches the persistent cache key and deserializes it if found.
 /// Otherwise, it compiles the program and writes the serialized program back to disk when the compilation meets the
 /// write thresholds configured via [`DiskCache::with_write_thresholds`].
 ///
 /// Entries are stored gzip compressed as `<directory>/<sha256>.executable`. A backend opts into this tier by providing
-/// canonical bytes for the complete persistent cache key through [`CompilationCacheDomain::persistent_cache_key`]. For
-/// the same compilation, processes sharing the cache must produce identical key bytes, and the filename is their
+/// canonical bytes for the complete persistent cache key through [`CompilationCacheDomain::persistent_cache_key`].
+/// For the same compilation, processes sharing the cache must produce identical key bytes, and the filename is their
 /// SHA-256 digest. The compressed entry is a versioned envelope that repeats the key digest and records the payload
 /// length and SHA-256 checksum, all of which are validated before backend deserialization. Backends may also store
-/// auxiliary payloads (e.g., tuning results) in the same directory as `<directory>/<sha256>.metadata` entries that use
-/// the same envelope.
+/// auxiliary payloads (e.g., tuning results) in the same directory as `<directory>/<sha256>.metadata` entries that
+/// use the same envelope.
 ///
 /// Writes are atomic because they use the standard pattern of writing a temporary file and renaming it. Filesystem and
 /// validation failures are returned to the [`CompilationContext`], which records each failure and degrades it to a
@@ -1498,16 +1495,17 @@ impl DiskCache {
     /// Environment variable that [`Self::from_env`] reads for the cache directory.
     pub const ENV_VAR: &str = "RYFT_COMPILATION_CACHE_DIR";
 
-    /// Environment variable that [`Self::from_env`] reads for the optional cap on the size of the cache on disk, in
-    /// bytes. It must hold an unsigned 64-bit integer when set, and eviction is disabled when it is absent.
+    /// Environment variable that [`Self::from_env`] reads for the optional cap on the size of the cache on disk,
+    /// in bytes. It must hold an unsigned 64-bit integer when set, and eviction is disabled when it is absent.
     pub const MAX_BYTES_ENV_VAR: &str = "RYFT_COMPILATION_CACHE_MAX_BYTES";
 
-    /// Opens a [`DiskCache`] rooted at `directory`, creating the directory and any missing parents if necessary. The
-    /// resulting cache has no size cap. Use [`Self::with_max_bytes`] to bound its footprint on disk.
+    /// Opens a [`DiskCache`] rooted at `directory`, creating the directory and any missing parents if necessary.
+    /// The resulting cache has no size cap. Use [`Self::with_max_bytes`] to bound its footprint on disk.
     ///
     /// # Errors
     ///
     /// Returns an error if `directory` already exists as a non-directory or cannot be created.
+    #[inline]
     pub fn open(directory: impl Into<PathBuf>) -> std::io::Result<Self> {
         Self::open_with_max_bytes(directory, None)
     }
@@ -1521,14 +1519,15 @@ impl DiskCache {
     /// # Errors
     ///
     /// Returns the same errors as [`Self::open`].
-    pub fn with_max_bytes(directory: impl Into<PathBuf>, max_bytes: u64) -> std::io::Result<Self> {
+    #[inline]
+    pub fn with_max_bytes<D: Into<PathBuf>>(directory: D, max_bytes: u64) -> std::io::Result<Self> {
         Self::open_with_max_bytes(directory, Some(max_bytes))
     }
 
-    /// Opens the [`DiskCache`] configured by the [`RYFT_COMPILATION_CACHE_DIR`](Self::ENV_VAR) environment variable.
-    /// Returns `Ok(Some(cache))` when the variable is set and `Ok(None)` when it is unset. When
-    /// [`RYFT_COMPILATION_CACHE_MAX_BYTES`](Self::MAX_BYTES_ENV_VAR) is also set, the resulting cache is capped as if
-    /// it were opened via [`Self::with_max_bytes`].
+    /// Opens the [`DiskCache`] configured by the [`RYFT_COMPILATION_CACHE_DIR`](Self::ENV_VAR) environment
+    /// variable. Returns `Ok(Some(cache))` when the variable is set and `Ok(None)` when it is unset. When
+    /// [`RYFT_COMPILATION_CACHE_MAX_BYTES`](Self::MAX_BYTES_ENV_VAR) is also set, the resulting cache is
+    /// capped as if it were opened via [`Self::with_max_bytes`].
     ///
     /// # Errors
     ///
@@ -1542,31 +1541,18 @@ impl DiskCache {
             Ok(value) => Some(value.parse::<u64>().map_err(|error| {
                 std::io::Error::new(
                     std::io::ErrorKind::InvalidInput,
-                    format!("invalid `{}` value `{value}`: {error}", Self::MAX_BYTES_ENV_VAR),
+                    format!("invalid `{}` value `{}`: {}", Self::MAX_BYTES_ENV_VAR, value, error),
                 )
             })?),
             Err(std::env::VarError::NotPresent) => None,
             Err(error) => {
                 return Err(std::io::Error::new(
                     std::io::ErrorKind::InvalidInput,
-                    format!("invalid `{}` value: {error}", Self::MAX_BYTES_ENV_VAR),
+                    format!("invalid `{}` value: {}", Self::MAX_BYTES_ENV_VAR, error),
                 ));
             }
         };
         Self::open_with_max_bytes(directory, max_bytes).map(Some)
-    }
-
-    /// Opens a [`DiskCache`] rooted at `directory` with an optional size cap and the default write thresholds.
-    fn open_with_max_bytes(directory: impl Into<PathBuf>, max_bytes: Option<u64>) -> std::io::Result<Self> {
-        let directory = directory.into();
-        fs::create_dir_all(&directory)?;
-        Ok(Self {
-            directory,
-            write_counter: AtomicU64::new(0),
-            max_bytes,
-            minimum_compilation_duration: DEFAULT_MINIMUM_COMPILATION_DURATION,
-            minimum_entry_size: DEFAULT_MINIMUM_ENTRY_SIZE,
-        })
     }
 
     /// Configures the minimum compilation duration and serialized payload size required before a newly compiled
@@ -1612,20 +1598,18 @@ impl DiskCache {
         Ok(total_bytes)
     }
 
-    /// Reads a checksummed auxiliary payload that a backend associated with `key` in `namespace`.
-    ///
-    /// Auxiliary entries share the directory of this cache but use a different filename extension than executables.
-    /// Reads are bounded to 64 MiB of uncompressed payload so that corrupted compressed inputs cannot grow memory
-    /// without limit. Missing entries return `Ok(None)`, while validation and I/O failures are returned explicitly.
+    /// Reads a checksummed auxiliary payload that a backend associated with `key` in `namespace`. Auxiliary entries
+    /// share the directory of this cache but use a different filename extension than executables. Reads are bounded to
+    /// 64 MiB of uncompressed payload so that corrupted compressed inputs cannot grow memory without limit. Missing
+    /// entries return `Ok(None)`, while validation and I/O failures are returned explicitly.
     pub fn get_auxiliary(&self, namespace: &str, key: &[u8]) -> std::io::Result<Option<Vec<u8>>> {
         let digest = Self::auxiliary_digest(namespace, key);
         Self::read_entry(&self.auxiliary_entry_path(&digest), &digest, Some(MAXIMUM_AUXILIARY_ENTRY_SIZE))
     }
 
-    /// Atomically writes a checksummed auxiliary payload that a backend associates with `key` in `namespace`.
-    ///
-    /// Payloads larger than 64 MiB are rejected. Readers observe either the prior complete entry or the new complete
-    /// entry across crashes and concurrent processes.
+    /// Atomically writes a checksummed auxiliary payload that a backend associates with `key` in `namespace`. Payloads
+    /// larger than 64 MiB are rejected. Readers observe either the prior complete entry or the new complete entry
+    /// across crashes and concurrent processes.
     pub fn put_auxiliary(&self, namespace: &str, key: &[u8], data: &[u8]) -> std::io::Result<()> {
         if data.len() > MAXIMUM_AUXILIARY_ENTRY_SIZE {
             return Err(std::io::Error::new(
@@ -1637,9 +1621,24 @@ impl DiskCache {
         self.write_entry(&self.auxiliary_entry_path(&digest), &digest, AUXILIARY_EXTENSION, data)
     }
 
+    // TODO(eaplatanios): Review from here onwards.
+
+    /// Opens a [`DiskCache`] rooted at `directory` with an optional size cap and the default write thresholds.
+    fn open_with_max_bytes<D: Into<PathBuf>>(directory: D, max_bytes: Option<u64>) -> std::io::Result<Self> {
+        let directory = directory.into();
+        fs::create_dir_all(&directory)?;
+        Ok(Self {
+            directory,
+            write_counter: AtomicU64::new(0),
+            max_bytes,
+            minimum_compilation_duration: DEFAULT_MINIMUM_COMPILATION_DURATION,
+            minimum_entry_size: DEFAULT_MINIMUM_ENTRY_SIZE,
+        })
+    }
+
     /// Reads and validates the cached serialized payload for `digest`. A missing entry is a cache miss, while
     /// filesystem, decompression, envelope, and checksum failures are returned explicitly.
-    fn get(&self, digest: &CacheDigest) -> std::io::Result<Option<Vec<u8>>> {
+    fn get(&self, digest: &DiskCacheDigest) -> std::io::Result<Option<Vec<u8>>> {
         Self::read_entry(&self.entry_path(digest), digest, None)
     }
 
@@ -1649,7 +1648,7 @@ impl DiskCache {
     ///
     /// Returns any write, synchronization, rename, cleanup, or eviction failure explicitly. The compilation context
     /// records such failures before degrading to an in-memory result.
-    fn put(&self, digest: &CacheDigest, data: &[u8]) -> std::io::Result<()> {
+    fn put(&self, digest: &DiskCacheDigest, data: &[u8]) -> std::io::Result<()> {
         self.write_entry(&self.entry_path(digest), digest, EXECUTABLE_EXTENSION, data)
     }
 
@@ -1668,12 +1667,12 @@ impl DiskCache {
     }
 
     /// Returns the filesystem path of the executable entry for `digest`.
-    fn entry_path(&self, digest: &CacheDigest) -> PathBuf {
+    fn entry_path(&self, digest: &DiskCacheDigest) -> PathBuf {
         self.directory.join(format!("{}.{EXECUTABLE_EXTENSION}", digest.to_hex()))
     }
 
     /// Returns the filesystem path of the auxiliary entry for `digest`.
-    fn auxiliary_entry_path(&self, digest: &CacheDigest) -> PathBuf {
+    fn auxiliary_entry_path(&self, digest: &DiskCacheDigest) -> PathBuf {
         self.directory.join(format!("{}.{AUXILIARY_EXTENSION}", digest.to_hex()))
     }
 
@@ -1686,12 +1685,12 @@ impl DiskCache {
     /// Returns the digest that addresses the auxiliary entry for `key` in `namespace`. The digest is domain separated
     /// from executable digests and hashes both components independently, so that no pair of namespaces and keys
     /// can collide by concatenation.
-    fn auxiliary_digest(namespace: &str, key: &[u8]) -> CacheDigest {
+    fn auxiliary_digest(namespace: &str, key: &[u8]) -> DiskCacheDigest {
         let mut hasher = Sha256::new();
         hasher.update(b"RYFT-AUXILIARY\0");
         hasher.update(Sha256::digest(namespace.as_bytes()));
         hasher.update(Sha256::digest(key));
-        CacheDigest { bytes: hasher.finalize().into() }
+        DiskCacheDigest { bytes: hasher.finalize().into() }
     }
 
     /// Reads and validates the entry at `path` for `digest`, returning `Ok(None)` when it does not exist.
@@ -1704,7 +1703,7 @@ impl DiskCache {
     ///     decompression may allocate.
     fn read_entry(
         path: &Path,
-        digest: &CacheDigest,
+        digest: &DiskCacheDigest,
         maximum_payload_size: Option<usize>,
     ) -> std::io::Result<Option<Vec<u8>>> {
         let file = match File::open(path) {
@@ -1737,7 +1736,7 @@ impl DiskCache {
     /// The entry is first written gzip-compressed to an exclusively created temporary file, synchronized, and then
     /// renamed over `path`, so that readers observe either the prior complete entry or the new complete entry. The
     /// temporary file is removed when any step before the rename fails.
-    fn write_entry(&self, path: &Path, digest: &CacheDigest, extension: &str, data: &[u8]) -> std::io::Result<()> {
+    fn write_entry(&self, path: &Path, digest: &DiskCacheDigest, extension: &str, data: &[u8]) -> std::io::Result<()> {
         let (temporary_path, temporary_file) = self.temporary_entry(digest, extension)?;
         let write_result = (|| -> std::io::Result<()> {
             // Fast compression bounds the host overhead added after an already expensive compilation.
@@ -1757,7 +1756,7 @@ impl DiskCache {
     /// Exclusively creates a temporary file for an entry without truncating the active write of another cache instance.
     /// Existing files, including symbolic links and files abandoned by an earlier process with the same process
     /// identifier, are skipped, while all other creation errors are returned without deleting anything.
-    fn temporary_entry(&self, digest: &CacheDigest, extension: &str) -> std::io::Result<(PathBuf, File)> {
+    fn temporary_entry(&self, digest: &DiskCacheDigest, extension: &str) -> std::io::Result<(PathBuf, File)> {
         for _ in 0..MAXIMUM_TEMPORARY_FILE_ATTEMPTS {
             let counter = self.write_counter.fetch_add(1, Ordering::Relaxed);
             let path = self.directory.join(format!("{}.{extension}.tmp.{}.{counter}", digest.to_hex(), process::id()));
@@ -1826,7 +1825,7 @@ impl DiskCache {
     }
 
     /// Writes the uncompressed envelope that stores `payload` under `digest` to `writer`.
-    fn write_envelope(writer: &mut impl Write, digest: &CacheDigest, payload: &[u8]) -> std::io::Result<()> {
+    fn write_envelope(writer: &mut impl Write, digest: &DiskCacheDigest, payload: &[u8]) -> std::io::Result<()> {
         let payload_checksum = Sha256::digest(payload);
         let payload_length = u64::try_from(payload.len())
             .map_err(|_| Self::invalid_data("persistent cache payload length does not fit in `u64`"))?;
@@ -1839,7 +1838,7 @@ impl DiskCache {
     }
 
     /// Validates the uncompressed `envelope` of an entry stored under `digest` and returns its payload.
-    fn decode_envelope(digest: &CacheDigest, envelope: &[u8]) -> std::io::Result<Vec<u8>> {
+    fn decode_envelope(digest: &DiskCacheDigest, envelope: &[u8]) -> std::io::Result<Vec<u8>> {
         if envelope.len() < ENTRY_HEADER_LENGTH {
             return Err(Self::invalid_data("persistent cache entry is shorter than its header"));
         }
@@ -1888,14 +1887,15 @@ impl DiskCache {
     }
 }
 
-/// SHA-256 digest of a persistent cache key provided by a compilation domain.
+/// SHA-256 digest identifying a [`DiskCache`] entry in its filename and serialized envelope. Executable entries hash
+/// the domain's persistent cache key, while auxiliary entries hash their namespace and key.
 #[derive(Copy, Clone, Debug, PartialEq, Eq)]
-struct CacheDigest {
+struct DiskCacheDigest {
     /// Raw digest bytes.
     bytes: [u8; SHA256_LENGTH],
 }
 
-impl CacheDigest {
+impl DiskCacheDigest {
     /// Hashes the canonical persistent key bytes provided by a compilation domain.
     fn from_key(key: &[u8]) -> Self {
         Self { bytes: Sha256::digest(key).into() }
@@ -2229,7 +2229,7 @@ mod tests {
     }
 
     /// Returns the uncompressed envelope that stores `payload` under `digest`.
-    fn encode_envelope(digest: &CacheDigest, payload: &[u8]) -> Vec<u8> {
+    fn encode_envelope(digest: &DiskCacheDigest, payload: &[u8]) -> Vec<u8> {
         let mut envelope = Vec::with_capacity(ENTRY_HEADER_LENGTH + payload.len());
         DiskCache::write_envelope(&mut envelope, digest, payload).unwrap();
         envelope
@@ -2359,7 +2359,7 @@ mod tests {
     fn test_compilation_context_with_disk_cache_lookup_failures() {
         let directory = tempfile::tempdir().unwrap();
         let cache = DiskCache::open(directory.path()).unwrap().with_write_thresholds(Duration::MAX, 0);
-        cache.put(&CacheDigest::from_key(&[1]), b"invalid payload").unwrap();
+        cache.put(&DiskCacheDigest::from_key(&[1]), b"invalid payload").unwrap();
         let context = CompilationContext::<TestDomain>::new().with_disk_cache(cache).with_event_capacity(8);
         let program =
             compile_with(&context, &TestDomain::persistent(), 1, move || Ok(TestCompiledProgram(17))).unwrap();
@@ -2389,7 +2389,7 @@ mod tests {
         // An incompatible artifact is a completed lookup miss, rather than a failed lookup.
         let directory = tempfile::tempdir().unwrap();
         let cache = DiskCache::open(directory.path()).unwrap().with_write_thresholds(Duration::MAX, 0);
-        cache.put(&CacheDigest::from_key(&[2]), &19usize.to_le_bytes()).unwrap();
+        cache.put(&DiskCacheDigest::from_key(&[2]), &19usize.to_le_bytes()).unwrap();
         let context = CompilationContext::<TestDomain>::new().with_disk_cache(cache).with_event_capacity(8);
         let domain = TestDomain { persistent: true, deserialization_incompatible: true, ..TestDomain::default() };
         assert_eq!(compile_with(&context, &domain, 2, move || Ok(TestCompiledProgram(23))).unwrap().0, 23);
@@ -2415,8 +2415,8 @@ mod tests {
         // A directory at the artifact path deterministically makes the read fail without filesystem permissions.
         let directory = tempfile::tempdir().unwrap();
         let cache = DiskCache::open(directory.path()).unwrap().with_write_thresholds(Duration::MAX, 0);
-        fs::create_dir(cache.entry_path(&CacheDigest::from_key(&[3]))).unwrap();
-        let read_message = cache.get(&CacheDigest::from_key(&[3])).unwrap_err().to_string();
+        fs::create_dir(cache.entry_path(&DiskCacheDigest::from_key(&[3]))).unwrap();
+        let read_message = cache.get(&DiskCacheDigest::from_key(&[3])).unwrap_err().to_string();
         let context = CompilationContext::<TestDomain>::new().with_disk_cache(cache).with_event_capacity(8);
         let program =
             compile_with(&context, &TestDomain::persistent(), 3, move || Ok(TestCompiledProgram(29))).unwrap();
@@ -2521,7 +2521,7 @@ mod tests {
     fn test_compilation_context_with_disk_cache_write_failure() {
         let directory = tempfile::tempdir().unwrap();
         let cache = DiskCache::open(directory.path()).unwrap().with_write_thresholds(Duration::ZERO, 0);
-        let entry_path = cache.entry_path(&CacheDigest::from_key(&[1]));
+        let entry_path = cache.entry_path(&DiskCacheDigest::from_key(&[1]));
         let context = CompilationContext::<TestDomain>::new().with_disk_cache(cache).with_event_capacity(8);
 
         // Create the obstruction after the lookup, so only the store fails and compilation still succeeds.
@@ -2538,7 +2538,7 @@ mod tests {
         let write_message = context
             .disk_cache()
             .unwrap()
-            .put(&CacheDigest::from_key(&[1]), &3usize.to_le_bytes())
+            .put(&DiskCacheDigest::from_key(&[1]), &3usize.to_le_bytes())
             .unwrap_err()
             .to_string();
         assert_eq!(
@@ -3951,7 +3951,7 @@ mod tests {
         assert_eq!(cache.max_bytes(), Some(64));
 
         // The most recently written entry is preserved even when it alone exceeds the cap.
-        let digest = CacheDigest::from_key(b"oversized");
+        let digest = DiskCacheDigest::from_key(b"oversized");
         let payload = vec![0u8; 16 * 1024];
         cache.put(&digest, &payload).unwrap();
         assert_eq!(cache.get(&digest).unwrap(), Some(payload));
@@ -4033,20 +4033,20 @@ mod tests {
     fn test_disk_cache_get() {
         let directory = tempfile::tempdir().unwrap();
         let cache = DiskCache::open(directory.path()).unwrap();
-        let digest = CacheDigest::from_key(b"stable-key");
+        let digest = DiskCacheDigest::from_key(b"stable-key");
         let data = b"hello compiled bytes".to_vec();
 
         assert_eq!(cache.get(&digest).unwrap(), None);
         cache.put(&digest, &data).unwrap();
         assert_eq!(cache.get(&digest).unwrap(), Some(data));
-        assert_eq!(cache.get(&CacheDigest::from_key(b"missing")).unwrap(), None);
+        assert_eq!(cache.get(&DiskCacheDigest::from_key(b"missing")).unwrap(), None);
     }
 
     #[test]
     fn test_disk_cache_put_compresses_entries() {
         let directory = tempfile::tempdir().unwrap();
         let cache = DiskCache::open(directory.path()).unwrap();
-        let digest = CacheDigest::from_key(b"compressible");
+        let digest = DiskCacheDigest::from_key(b"compressible");
         let payload = vec![0u8; 64 * 1024];
         cache.put(&digest, &payload).unwrap();
 
@@ -4064,7 +4064,7 @@ mod tests {
         let directory = tempfile::tempdir().unwrap();
         let first = DiskCache::open(directory.path()).unwrap();
         let second = DiskCache::open(directory.path()).unwrap();
-        let digest = CacheDigest::from_key(b"same-key");
+        let digest = DiskCacheDigest::from_key(b"same-key");
         let barrier = Barrier::new(2);
         let first_payload = vec![17u8; 32 * 1024];
         let second_payload = vec![93u8; 48 * 1024];
@@ -4096,7 +4096,7 @@ mod tests {
         let directory = tempfile::tempdir().unwrap();
         let first = DiskCache::open(directory.path()).unwrap();
         let second = DiskCache::open(directory.path()).unwrap();
-        let digest = CacheDigest::from_key(b"same-key");
+        let digest = DiskCacheDigest::from_key(b"same-key");
         let barrier = Barrier::new(2);
 
         // Both caches begin with counter zero. Holding both files open together prevents either writer from reusing a
@@ -4136,7 +4136,7 @@ mod tests {
         let cache = DiskCache::open(directory.path()).unwrap();
         let payloads: Vec<Vec<u8>> =
             (0..3).map(|entry| (0..256).map(|byte| (entry * 31 + byte) as u8).collect()).collect();
-        let digests: Vec<CacheDigest> = (0..3).map(|index| CacheDigest::from_key(&[index])).collect();
+        let digests: Vec<DiskCacheDigest> = (0..3).map(|index| DiskCacheDigest::from_key(&[index])).collect();
         for index in 0..3 {
             cache.put(&digests[index], &payloads[index]).unwrap();
             let file = File::options().write(true).open(cache.entry_path(&digests[index])).unwrap();
@@ -4158,7 +4158,7 @@ mod tests {
 
     #[test]
     fn test_disk_cache_decode_envelope() {
-        let digest = CacheDigest::from_key(b"key");
+        let digest = DiskCacheDigest::from_key(b"key");
         let envelope = encode_envelope(&digest, b"compiled");
         assert_eq!(envelope.len(), ENTRY_HEADER_LENGTH + b"compiled".len());
         assert_eq!(DiskCache::decode_envelope(&digest, &envelope).unwrap(), b"compiled");
@@ -4166,7 +4166,7 @@ mod tests {
 
     #[test]
     fn test_disk_cache_decode_envelope_rejects_malformed_envelopes() {
-        let digest = CacheDigest::from_key(b"key");
+        let digest = DiskCacheDigest::from_key(b"key");
         let envelope = encode_envelope(&digest, b"compiled");
 
         let error = DiskCache::decode_envelope(&digest, &envelope[..ENTRY_HEADER_LENGTH - 1]).unwrap_err();
@@ -4185,7 +4185,7 @@ mod tests {
         assert_eq!(error.kind(), std::io::ErrorKind::InvalidData);
         assert_eq!(error.to_string(), "persistent cache entry uses unsupported format version 2");
 
-        let other_key = encode_envelope(&CacheDigest::from_key(b"other"), b"compiled");
+        let other_key = encode_envelope(&DiskCacheDigest::from_key(b"other"), b"compiled");
         let error = DiskCache::decode_envelope(&digest, &other_key).unwrap_err();
         assert_eq!(error.kind(), std::io::ErrorKind::InvalidData);
         assert_eq!(error.to_string(), "persistent cache entry key digest does not match its requested key");
@@ -4202,10 +4202,10 @@ mod tests {
     }
 
     #[test]
-    fn test_cache_digest_from_key() {
-        let digest = CacheDigest::from_key(b"abc");
+    fn test_disk_cache_digest_from_key() {
+        let digest = DiskCacheDigest::from_key(b"abc");
         assert_eq!(digest.to_hex(), "ba7816bf8f01cfea414140de5dae2223b00361a396177a9cb410ff61f20015ad");
-        assert_eq!(digest, CacheDigest::from_key(b"abc"));
-        assert_ne!(digest, CacheDigest::from_key(b"abd"));
+        assert_eq!(digest, DiskCacheDigest::from_key(b"abc"));
+        assert_ne!(digest, DiskCacheDigest::from_key(b"abd"));
     }
 }
