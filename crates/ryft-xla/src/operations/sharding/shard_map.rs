@@ -6,6 +6,7 @@ use ryft_core::{
     ParallelAllGatherOperation, ParallelAllToAllOperation, ParallelPermuteOperation, ParallelRaggedAllToAllOperation,
     ParallelReduceOperation, ParallelSumScatterOperation, ParallelVaryOperation, Parameterized, ProgramError, RegionId,
     SHARD_MAP_OPERATION_NAME, ShardMap, ShardMapError, ShardMapOperation, Sharding, ShardingDimension, TracedShardMap,
+    TypedProgram,
 };
 use ryft_mlir::dialects::shardy::{
     DimensionShardingAttributeRef, ManualAxesAttributeRef, TensorShardingAttributeRef,

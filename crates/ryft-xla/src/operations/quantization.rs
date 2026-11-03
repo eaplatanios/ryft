@@ -540,8 +540,8 @@ mod tests {
     use indoc::indoc;
     use pretty_assertions::assert_eq;
     use ryft_core::{
-        AddOperation, Array, ArrayIrType, ArrayOperation, BlockQuantize, BlockScaledDotConfiguration,
-        BlockScaledDotInputs, ConvertElementType, Device, DeviceMesh, DimensionBounds, DimensionVariable,
+        AddOperation, Array, ArrayIrType, ArrayOperation, BlockQuantize, BlockQuantizedValue,
+        BlockScaledDotConfiguration, ConvertElementType, Device, DeviceMesh, DimensionBounds, DimensionVariable,
         DotDimensionNumbers, EagerContext, LogicalMesh, MeshAxis, MeshAxisType, Placeholder, ProjectedContext,
         RandomAlgorithm, Sharding, block_scaled_dot, differentiate_at,
     };
@@ -1054,7 +1054,8 @@ mod tests {
             let input_type = ArrayType::new(DataType::F64, Shape::new(vec![Dimension::Dynamic(extent)]));
             let (_, program) = DomainTracingContext::<XlaDomain<'static>>::trace(
                 |inputs: Vec<XlaTracer<'static>>| {
-                    let (elements, scales) = inputs[0].block_quantize(4, element_type, scale_type)?;
+                    let BlockQuantizedValue { elements, scales, .. } =
+                        inputs[0].block_quantize(4, element_type, scale_type)?;
                     // Return ordinary floating-point arrays so that the mixed executable fixture can decode them.
                     Ok(vec![elements.convert_element_type(DataType::F64)?, scales.convert_element_type(DataType::F64)?])
                 },
@@ -1063,7 +1064,8 @@ mod tests {
             .unwrap();
             let program = program.into_flat_program().simplified().unwrap();
             let input = Array::vector(vec![3.0f64, 1.5, 0.5, 6.0]).unwrap();
-            let (elements, scales) = input.block_quantize(4, element_type, scale_type).unwrap();
+            let BlockQuantizedValue { elements, scales, .. } =
+                input.block_quantize(4, element_type, scale_type).unwrap();
             assert_eq!(
                 execute_mixed_program(
                     &client,
@@ -1110,9 +1112,7 @@ mod tests {
             move |(lhs, rhs, seed, state)| {
                 let (output, pullback) = differentiate_at((lhs, rhs))
                     .with_captures(state)
-                    .vjp(|(lhs, rhs), state| {
-                        function.call(BlockScaledDotInputs::new(lhs, rhs).with_random_state(state))
-                    })
+                    .vjp(|(lhs, rhs), state| function.call(lhs, rhs, None, None, None, Some(state)))
                     .unwrap();
                 let (lhs_cotangent, rhs_cotangent) = pullback.apply_materialized(seed).unwrap();
                 (output, lhs_cotangent, rhs_cotangent)
@@ -1158,9 +1158,7 @@ mod tests {
         let state = Array::from_elements(RandomAlgorithm::ThreeFry.state_type(), &[7u64, 0]).unwrap();
         let (reference_output, pullback) = differentiate_at((host([32, 32], &lhs), host([16, 32], &rhs)))
             .with_captures(state)
-            .vjp(|(lhs, rhs), state| {
-                reference_function.call(BlockScaledDotInputs::new(lhs, rhs).with_random_state(state))
-            })
+            .vjp(|(lhs, rhs), state| reference_function.call(lhs, rhs, None, None, None, Some(state)))
             .unwrap();
         let (reference_lhs, reference_rhs) = pullback.apply_materialized(host([32, 16], &seed)).unwrap();
         for (actual, expected) in

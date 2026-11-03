@@ -313,7 +313,8 @@ mod tests {
     use ryft_core::{
         Array, ArrayIrType, DataType, DimensionBounds, DimensionSizeOperation, DimensionType, DimensionValue,
         DimensionVariable, DynamicBroadcastOperation, Layout, LogicalMesh, MeshAxis, Placeholder, ProgramBuilder,
-        ProgramError, Shape, StridedLayout, Tile, TileDimension, TiledLayout, TracedShardMap, trace_shard_map,
+        ProgramError, Shape, StridedLayout, Tile, TileDimension, TiledLayout, TracedShardMap, TypedProgram,
+        trace_shard_map,
     };
     use ryft_pjrt::{BufferType, ExecutionDeviceInputs, ExecutionInput, Program as PjrtProgram};
 
@@ -465,8 +466,8 @@ mod tests {
     fn test_plain_broadcast_dynamic_pullbacks_execute_on_cpu() {
         /// Executes one homogeneous broadcast or its adjoint through the mixed executable ABI.
         fn execute(program: PlainXlaProgram, values: &[f32], extent: i32) -> (Vec<f32>, Vec<u64>) {
-            let input_type = program.input_types().remove(0);
-            let output_type = program.output_types().remove(0);
+            let input_type = program.input_types().into_owned().remove(0);
+            let output_type = program.output_types().into_owned().remove(0);
             let dimensions = physical_bound_type(&input_type)
                 .unwrap()
                 .static_shape()

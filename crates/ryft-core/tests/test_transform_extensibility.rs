@@ -15,7 +15,8 @@ use ryft_core::{
     InterpretationDriver, Linearization, LogicalMesh, ManualVariationAlignment, NoIdentity, Operation, ParallelVary,
     Parameter, PartitionedProgram, Placeholder, Program, ProgramBuilder, ProgramError, Region, RegionDriver,
     RegionInterface, RegionRef, RegionSlot, ScanInterpretationDomain, ScanOperation, ShardingDimension, Sin,
-    SinOperation, StagedCallOperation, TangentActivity, Type, TypeError, Typed, Value, ValueDirectDispatch,
+    SinOperation, StagedCallOperation, TangentActivity, Type, TypeError, Typed, TypedProgram, Value,
+    ValueDirectDispatch,
 };
 
 /// External transform arguments selecting one independently retained identity artifact.

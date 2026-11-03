@@ -124,7 +124,7 @@ mod tests {
     use ryft_core::{
         AddOperation, ArrayIrType, ArrayOperation, ArrayType, CaptureReference, Context, CosOperation, DataType,
         DomainTracingContext, Memory, MulOperation, Placeholder, ProgramError, RematerializationOptimizationBarrier,
-        SinOperation,
+        SinOperation, TypedProgram,
     };
 
     use crate::experimental::domains::XlaTracer;
@@ -400,8 +400,8 @@ mod tests {
             let array_types = |types: Vec<ArrayIrType>| {
                 types.iter().map(|r#type| <&ArrayType>::try_from(r#type).unwrap().clone()).collect::<Vec<_>>()
             };
-            let input_types = array_types(program.input_types());
-            let output_types = array_types(program.output_types());
+            let input_types = array_types(program.input_types().into_owned());
+            let output_types = array_types(program.output_types().into_owned());
             to_mlir_module_for_program(program, &[], &input_types, &output_types, "main", None, None).unwrap()
         };
         assert_eq!(

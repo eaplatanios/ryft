@@ -851,7 +851,7 @@ pub(crate) mod tests {
         DimensionBounds, DimensionVariable, EagerContext, EffectClasses, EmptyRegionDriver, NegOperation,
         PartialEvaluationOutput, PartialValue, Placeholder, ProgramBuilder, ReferenceEffect, ReferenceRead,
         ReferenceSwap, ReferenceType, ReferenceWrite, ScanOperation, Shape, StagingContext, SubOperation, TagOperation,
-        Tracer, TracingContext,
+        Tracer, TracingContext, TypedProgram,
     };
 
     use crate::calls::KernelParameter;

@@ -25,7 +25,7 @@ use ryft_core::{
     RegionDriver, RegionKey, RegionRef, ScatterMode, ScatterReductionKind, Shape, Sharding, ShardingDimension,
     SortDirection, SpecializationCache, SpecializationCacheEntry, SpecializationCacheStatistics, StagedProgram,
     StatefulCompilationDomain, StatefulExecution, StaticShape, StridedLayout, Tile, TileDimension, TiledLayout, Type,
-    TypeError, TypeRefinements, Typed, ValueProjection, ZERO_OPERATION_NAME, Zero, ZeroOperation,
+    TypeError, TypeRefinements, Typed, TypedProgram, ValueProjection, ZERO_OPERATION_NAME, Zero, ZeroOperation,
     validate_reference_boundary,
 };
 #[cfg(test)]
@@ -2472,6 +2472,20 @@ impl XlaLoweredProgram {
     }
 }
 
+impl TypedProgram for XlaLoweredProgram {
+    type Type = ArrayIrType;
+
+    // Core reads the public logical signature in the type universe of the domain, which excludes the hidden
+    // final-state output suffix appended by reference discharge, like the inherent `output_types` function.
+    fn input_types(&self) -> Cow<'_, [ArrayIrType]> {
+        Cow::Owned(self.input_types.iter().cloned().map(Into::into).collect())
+    }
+
+    fn output_types(&self) -> Cow<'_, [ArrayIrType]> {
+        Cow::Owned(self.output_types[..self.output_count].iter().cloned().map(Into::into).collect())
+    }
+}
+
 const XLA_PERSISTENT_EXECUTABLE_MAGIC: &[u8; 8] = b"RYFTXLA8";
 const XLA_PERSISTENT_EXECUTABLE_SCHEMA_VERSION: u32 = 8;
 const XLA_PERSISTENT_EXECUTABLE_FEATURE_FLAGS: u64 = 15;
@@ -3616,6 +3630,20 @@ impl<'c> XlaCompiledProgram<'c> {
     }
 }
 
+impl TypedProgram for XlaCompiledProgram<'_> {
+    type Type = ArrayIrType;
+
+    // Core reads the public logical signature in the type universe of the domain, which excludes the hidden
+    // final-state output suffix appended by reference discharge, like the inherent `output_types` function.
+    fn input_types(&self) -> Cow<'_, [ArrayIrType]> {
+        Cow::Owned(self.input_types.iter().cloned().map(Into::into).collect())
+    }
+
+    fn output_types(&self) -> Cow<'_, [ArrayIrType]> {
+        Cow::Owned(self.output_types[..self.output_count].iter().cloned().map(Into::into).collect())
+    }
+}
+
 impl<'c> XlaDomain<'c> {
     /// Ensures that process-local runtime support required by one compiled program is available.
     fn ensure_runtime_requirements(
@@ -3971,7 +3999,7 @@ impl<'c> CompilationDomain for XlaDomain<'c> {
         Ok((XlaDispatchKey(XlaDispatchKeyKind::Bucketed(key)), input_types.into()))
     }
 
-    fn lower(&self, staged: &StagedProgram<Self>) -> Result<(XlaLoweredProgram, Vec<ArrayIrType>), Self::Error> {
+    fn lower(&self, staged: &StagedProgram<Self>) -> Result<XlaLoweredProgram, Self::Error> {
         let program = staged.lifted_program()?;
         let capture_count = staged.source_program().captures().len();
         let input_types = staged.input_types();
@@ -3992,16 +4020,11 @@ impl<'c> CompilationDomain for XlaDomain<'c> {
         let declared_output_types =
             apply_signature_shardings(output_types.to_vec(), options.out_shardings.as_deref(), "out")?;
         validate_output_types(&declared_output_types, &lowered_output_types)?;
-        Ok((lowered_program, lowered_output_types.into_iter().map(Into::into).collect()))
+        Ok(lowered_program)
     }
 
-    fn compile(
-        &self,
-        program: &XlaLoweredProgram,
-    ) -> Result<(Arc<XlaCompiledProgram<'c>>, Vec<ArrayIrType>), Self::Error> {
-        let compiled = self.compilation_context().compile(self, program)?;
-        let output_types = compiled.output_types().iter().cloned().map(Into::into).collect();
-        Ok((compiled, output_types))
+    fn compile(&self, program: &XlaLoweredProgram) -> Result<Arc<XlaCompiledProgram<'c>>, Self::Error> {
+        self.compilation_context().compile(self, program)
     }
 
     fn execute(
@@ -7906,6 +7929,7 @@ mod tests {
         let xla_program = shard_map_differential_program::<XlaArrayMember, XlaConstant, XlaOperation>(case);
         let input_types = xla_program
             .input_types()
+            .into_owned()
             .into_iter()
             .map(|r#type| match r#type {
                 ArrayIrType::Array(r#type) => r#type,
@@ -7974,8 +7998,8 @@ mod tests {
                 })
                 .collect::<Vec<_>>()
         };
-        let input_types = array_types(xla_program.input_types());
-        let output_types = array_types(xla_program.output_types());
+        let input_types = array_types(xla_program.input_types().into_owned());
+        let output_types = array_types(xla_program.output_types().into_owned());
         let bytes = |offset: usize, r#type: &ArrayType| {
             let element_count = r#type.static_shape().unwrap().dimensions().iter().product::<usize>();
             let elements = (0..element_count).map(|element| (offset + element + 1) as f32).collect::<Vec<_>>();
@@ -9639,7 +9663,7 @@ mod tests {
                             }
                         }])
                     },
-                    program.input_types(),
+                    program.input_types().into_owned(),
                 )
                 .unwrap()
                 .1

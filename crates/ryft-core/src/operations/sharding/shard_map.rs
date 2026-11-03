@@ -212,8 +212,8 @@ use crate::programs::{
     ReferenceDischargeDriver, ReferenceDischargePolicy, ReferenceDischargeRegionBoundary,
     ReferenceDischargeRegionBoundaryInsertion, ReferenceDischargeRegionInput, ReferenceDischargeRegionOutput,
     ReferenceDischargeValue, ReferenceDischargeableOperation, ReferenceRoot, ReferenceType, Region, RegionArena,
-    RegionDataFlow, RegionInterface, RegionLiveness, RegionRef, RegionSlot, Type, TypeError, Typed, Value,
-    ValueProjection,
+    RegionDataFlow, RegionInterface, RegionLiveness, RegionRef, RegionSlot, Type, TypeError, Typed, TypedProgram,
+    Value, ValueProjection,
 };
 use crate::tracing::{DomainTracer, DomainTracingContext, Tracer, TracingContext};
 
@@ -1452,7 +1452,7 @@ impl ShardMapOperation {
                 Ok(if r#type.is_reference() { ReferenceType::new(global).into() } else { global.into() })
             })
             .collect::<Result<Vec<ArrayIrType>, ShardMapError>>()?;
-        let local_input_types = body.input_types();
+        let local_input_types = body.input_types().into_owned();
         check_count!("input", local_input_types, global_input_types.len(), ProgramError);
         for (index, (global, local)) in global_input_types.iter().zip(&local_input_types).enumerate() {
             let expected =
@@ -2409,7 +2409,7 @@ where
         // axis, which the structural batching of references guarantees and which is validated here defensively.
         let output_positions = output_axes
             .iter()
-            .zip(batched_body.output_types())
+            .zip(batched_body.output_types().into_owned())
             .map(|(axis, r#type)| Ok(boundary_array_type(&r#type)?.normalize_batch_axis(*axis)?.1))
             .collect::<Result<Vec<_>, BatchingError>>()?;
         for (output_index, input_index) in self.output_forwarding.iter().enumerate() {
@@ -3540,7 +3540,7 @@ where
     let converted_inputs = inputs
         .iter()
         .copied()
-        .zip(input_types.iter().zip(program.input_types()))
+        .zip(input_types.iter().zip(program.input_types().into_owned()))
         .map(|(input, (source, target))| {
             let variable = match (source, &target) {
                 (ArrayIrType::Array(_), ArrayIrType::Dimension(target)) => target.variable().cloned(),
@@ -3702,20 +3702,20 @@ where
         Ok(promoted_residual_type(&edge_type, &operation.shard_map)?.into())
     };
     let known_program = partition.known_program().clone();
-    let mut known_output_types = known_program.output_types();
+    let mut known_output_types = known_program.output_types().into_owned();
     for r#type in &mut known_output_types[known_output_indices.len()..] {
         *r#type = edge_local_type(r#type)?;
     }
-    let known_input_types = known_program.input_types();
+    let known_input_types = known_program.input_types().into_owned();
     let known_body = reshape_program_boundary(&known_program, known_input_types, known_output_types)?;
     let residual_program = partition.residual_program().clone();
-    let mut residual_input_types = residual_program.input_types();
+    let mut residual_input_types = residual_program.input_types().into_owned();
     for (source, r#type) in partition.residual_inputs().iter().zip(&mut residual_input_types) {
         if matches!(source, ResidualInputSource::ResidualEdge(_)) {
             *r#type = edge_local_type(r#type)?;
         }
     }
-    let residual_output_types = residual_program.output_types();
+    let residual_output_types = residual_program.output_types().into_owned();
     let residual_body = reshape_program_boundary(&residual_program, residual_input_types, residual_output_types)?;
 
     // Bind the known-side `shard_map` into the enclosing known-side context, emit the residual `shard_map` over its
@@ -4032,8 +4032,12 @@ where
     let primal_program = primal_program.with_outputs(&(0..output_count).chain(edge_positions).collect::<Vec<_>>())?;
     let primal_program = if edge_roots.iter().any(Option::is_some) {
         let mut builder = ProgramBuilder::<C::Constant, C::Operation>::new();
-        let inputs =
-            primal_program.input_types().into_iter().map(|r#type| builder.add_input(r#type)).collect::<Vec<_>>();
+        let inputs = primal_program
+            .input_types()
+            .into_owned()
+            .into_iter()
+            .map(|r#type| builder.add_input(r#type))
+            .collect::<Vec<_>>();
         let mut outputs = builder.splice_program(&primal_program, inputs.as_slice())?;
         for (output, root) in outputs[output_count..].iter_mut().zip(&edge_roots) {
             if root.is_some() {
@@ -4050,9 +4054,9 @@ where
     } else {
         primal_program
     };
-    let mut primal_output_types = primal_program.output_types();
+    let mut primal_output_types = primal_program.output_types().into_owned();
     primal_output_types[output_count..].clone_from_slice(&edge_local_types);
-    let primal_input_types = primal_program.input_types();
+    let primal_input_types = primal_program.input_types().into_owned();
     let primal_program = reshape_program_boundary(&primal_program, primal_input_types, primal_output_types)?;
 
     // The tangent body receives one residual input per distinct residual, in order of first use, so it is rebuilt over
@@ -4101,13 +4105,13 @@ where
             vec![Placeholder; output_count],
         )?
     };
-    let mut tangent_input_types = tangent_program.input_types();
+    let mut tangent_input_types = tangent_program.input_types().into_owned();
     for (r#type, residual) in tangent_input_types[tangent_input_count..].iter_mut().zip(&residuals) {
         if let ShardMapResidual::Edge(edge) | ShardMapResidual::ReferenceSnapshot(edge) = residual {
             *r#type = edge_local_types[*edge].clone();
         }
     }
-    let tangent_output_types = tangent_program.output_types();
+    let tangent_output_types = tangent_program.output_types().into_owned();
     let tangent_program = reshape_program_boundary(&tangent_program, tangent_input_types, tangent_output_types)?;
 
     let primal_operation = ShardMapOperation::from_boundary(
@@ -4801,7 +4805,7 @@ where
             .collect::<Vec<_>>();
         // The inputs that still cross the boundary are declared first, so that they keep their relative order and
         // precede the locally materialized accumulators in the rebuilt body.
-        let input_types = transposed_program.input_types();
+        let input_types = transposed_program.input_types().into_owned();
         let materialized = (0..input_types.len())
             .map(|position| {
                 position
@@ -5705,7 +5709,12 @@ mod tests {
         let (_, body) = reference_shard_map(f32_vector_type(4), sharded.clone(), true);
         let forwarding_body = {
             let mut builder = ProgramBuilder::<TestValue, TestOperation>::new();
-            let inputs = body.input_types().into_iter().map(|r#type| builder.add_input(r#type)).collect::<Vec<_>>();
+            let inputs = body
+                .input_types()
+                .into_owned()
+                .into_iter()
+                .map(|r#type| builder.add_input(r#type))
+                .collect::<Vec<_>>();
             let mut outputs = builder.splice_program(&body, inputs.as_slice()).unwrap();
             outputs.push(inputs[0]);
             builder
@@ -7252,7 +7261,11 @@ mod tests {
         assert_eq!(
             operation.infer_output_types(
                 &global_input_types,
-                &[RegionInterface::new(body.input_types(), body.output_types(), EffectClasses::NONE)],
+                &[RegionInterface::new(
+                    body.input_types().into_owned(),
+                    body.output_types().into_owned(),
+                    EffectClasses::NONE
+                )],
             ),
             Ok(operation.global_output_types().to_vec()),
         );
@@ -7262,7 +7275,11 @@ mod tests {
         assert_eq!(
             operation.infer_output_types(
                 &global_input_types,
-                &[RegionInterface::new(vec![wrong_shape.clone().into()], body.output_types(), EffectClasses::NONE)],
+                &[RegionInterface::new(
+                    vec![wrong_shape.clone().into()],
+                    body.output_types().into_owned(),
+                    EffectClasses::NONE
+                )],
             ),
             Err(TypeError::invalid(format!(
                 "`shard_map` body input #0 has type `{wrong_shape}` but the local shard of input #0 is `{local_type}`",
@@ -7275,7 +7292,7 @@ mod tests {
                 &global_input_types,
                 &[RegionInterface::new(
                     vec![wrong_element_type.clone().into()],
-                    body.output_types(),
+                    body.output_types().into_owned(),
                     EffectClasses::NONE,
                 )],
             ),
@@ -7288,7 +7305,11 @@ mod tests {
         assert_eq!(
             operation.infer_output_types(
                 &global_input_types,
-                &[RegionInterface::new(vec![wrong_layout.clone().into()], body.output_types(), EffectClasses::NONE)],
+                &[RegionInterface::new(
+                    vec![wrong_layout.clone().into()],
+                    body.output_types().into_owned(),
+                    EffectClasses::NONE
+                )],
             ),
             Err(TypeError::invalid(format!(
                 "`shard_map` body input #0 has type `{wrong_layout}` but the local shard of input #0 is `{local_type}`",
@@ -7301,7 +7322,11 @@ mod tests {
         assert_eq!(
             operation.infer_output_types(
                 &global_input_types,
-                &[RegionInterface::new(body.input_types(), vec![wrong_output.clone().into()], EffectClasses::NONE)],
+                &[RegionInterface::new(
+                    body.input_types().into_owned(),
+                    vec![wrong_output.clone().into()],
+                    EffectClasses::NONE
+                )],
             ),
             Err(TypeError::invalid(format!(
                 "`shard_map` body output #0 has type `{wrong_output}`, whose global type `{wrong_global_output}` does \
@@ -7316,7 +7341,11 @@ mod tests {
             .unwrap();
         let result = operation.infer_output_types(
             &global_input_types,
-            &[RegionInterface::new(body.input_types(), vec![invariant_output.into()], EffectClasses::NONE)],
+            &[RegionInterface::new(
+                body.input_types().into_owned(),
+                vec![invariant_output.into()],
+                EffectClasses::NONE,
+            )],
         );
         assert_eq!(
             result,
@@ -7395,8 +7424,8 @@ mod tests {
             operation.infer_output_types(
                 &[array_type.clone().into()],
                 &[RegionInterface::new(
-                    device_ordered_body.input_types(),
-                    device_ordered_body.output_types(),
+                    device_ordered_body.input_types().into_owned(),
+                    device_ordered_body.output_types().into_owned(),
                     device_ordered_body.effects().classes(),
                 )],
             ),
@@ -7408,8 +7437,8 @@ mod tests {
             operation.infer_output_types(
                 &[array_type.into()],
                 &[RegionInterface::new(
-                    ordered_body.input_types(),
-                    ordered_body.output_types(),
+                    ordered_body.input_types().into_owned(),
+                    ordered_body.output_types().into_owned(),
                     ordered_body.effects().classes(),
                 )],
             ),
@@ -7617,7 +7646,11 @@ mod tests {
         // declare the type of that input.
         let sharded = sharded_along_x();
         let (operation, body) = reference_shard_map(f32_vector_type(4), sharded.clone(), true);
-        let body_interface = RegionInterface::new(body.input_types(), body.output_types(), body.effects().classes());
+        let body_interface = RegionInterface::new(
+            body.input_types().into_owned(),
+            body.output_types().into_owned(),
+            body.effects().classes(),
+        );
         let reference_type = ArrayIrType::Reference(ReferenceType::new(f32_vector_type(4)));
         let value_type = ArrayIrType::Array(f32_vector_type(4));
         assert_eq!(
@@ -7638,7 +7671,7 @@ mod tests {
         // The body must receive the local shard of the referent, not the global referent.
         let global_body = RegionInterface::new(
             vec![reference_type.clone(), body.input_types()[1].clone()],
-            body.output_types(),
+            body.output_types().into_owned(),
             body.effects().classes(),
         );
         assert_eq!(
@@ -7651,7 +7684,7 @@ mod tests {
 
         // A reference output must declare which input it forwards, forward it by identity, and share its sharding.
         let forwarding_body = RegionInterface::new(
-            body.input_types(),
+            body.input_types().into_owned(),
             vec![body.output_types()[0].clone(), body.input_types()[0].clone()],
             body.effects().classes(),
         );
@@ -8788,7 +8821,12 @@ mod tests {
         let value_type = ArrayIrType::Array(f32_vector_type(4));
         let body = {
             let mut builder = ProgramBuilder::<TestValue, TestOperation>::new();
-            let inputs = body.input_types().into_iter().map(|r#type| builder.add_input(r#type)).collect::<Vec<_>>();
+            let inputs = body
+                .input_types()
+                .into_owned()
+                .into_iter()
+                .map(|r#type| builder.add_input(r#type))
+                .collect::<Vec<_>>();
             let (reference, update) = (inputs[0], inputs[1]);
             let selected =
                 builder.add_instruction(ReferenceNewOperation::new(), Vec::new(), vec![update], None).unwrap()[0];
@@ -8977,7 +9015,12 @@ mod tests {
         let reference_type = ArrayIrType::Reference(ReferenceType::new(f32_vector_type(4)));
         let forwarding_body = {
             let mut builder = ProgramBuilder::<TestValue, TestOperation>::new();
-            let inputs = body.input_types().into_iter().map(|r#type| builder.add_input(r#type)).collect::<Vec<_>>();
+            let inputs = body
+                .input_types()
+                .into_owned()
+                .into_iter()
+                .map(|r#type| builder.add_input(r#type))
+                .collect::<Vec<_>>();
             let mut outputs = builder.splice_program(&body, inputs.as_slice()).unwrap();
             outputs.push(inputs[0]);
             builder
@@ -9068,7 +9111,12 @@ mod tests {
         // declares it as forwarding an input of the same local type.
         let escaping_body = {
             let mut builder = ProgramBuilder::<TestValue, TestOperation>::new();
-            let inputs = body.input_types().into_iter().map(|r#type| builder.add_input(r#type)).collect::<Vec<_>>();
+            let inputs = body
+                .input_types()
+                .into_owned()
+                .into_iter()
+                .map(|r#type| builder.add_input(r#type))
+                .collect::<Vec<_>>();
             let mut outputs = builder.splice_program(&body, inputs.as_slice()).unwrap();
             let allocation =
                 builder.add_instruction(ReferenceNewOperation::new(), Vec::new(), vec![inputs[1]], None).unwrap()[0];

@@ -9,7 +9,7 @@
 //! result types, and both branches normalize their results to the refined output types of the condition. Results whose
 //! types place them over explicit mesh axes are constrained to that placement.
 
-use ryft_core::{ArrayIrType, ArrayType, ConditionOperation, Operation, ProgramError};
+use ryft_core::{ArrayIrType, ArrayType, ConditionOperation, Operation, ProgramError, TypedProgram};
 use ryft_mlir::dialects::stable_hlo;
 use ryft_mlir::{Block, Operation as MlirOperation, Value as MlirValue, ValueRef};
 
@@ -158,7 +158,7 @@ mod tests {
         DimensionSizeOperation, DimensionType, DimensionVariable, DynamicBroadcastOperation, GuardOperation,
         MeshAxisType, MulOperation, NegOperation, OneLikeOperation, OneOperation, Placeholder, PrintOperation,
         ProgramBatchingOutputAxesPolicy, ReduceOperation, ReductionKind, ScanOperation, Shape, Sharding,
-        ShardingDimension, SubOperation, TransposedProgramCotangent, WhileOperation, ZeroOperation,
+        ShardingDimension, SubOperation, TransposedProgramCotangent, TypedProgram, WhileOperation, ZeroOperation,
     };
     use ryft_mlir::{Context as MlirContext, Location};
     use ryft_pjrt::{BufferType, ExecutionDeviceInputs, ExecutionInput, Program as PjrtProgram};

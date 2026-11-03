@@ -630,7 +630,7 @@ mod tests {
     use crate::partial::{PartialEvaluationContext, PartialValue, ResidualPolicyReference};
     use crate::programs::{
         AtomId, EffectClass, EffectClasses, Operation, OperationProjection, Program, ProgramBuilder, ProgramError,
-        ReferenceType, RegionInterface, Type, TypeIdentityPosition, TypeIdentityRenaming, Typed, Value,
+        ReferenceType, RegionInterface, Type, TypeIdentityPosition, TypeIdentityRenaming, Typed, TypedProgram, Value,
         ValueProjection,
     };
     use crate::tests::hash_of;

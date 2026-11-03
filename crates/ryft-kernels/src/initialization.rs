@@ -13,7 +13,7 @@ use ryft_core::{
     Array, ArrayAddressing, ArrayIrOperation, ArrayIrType, ArrayIrValue, ArrayReferenceTransform,
     ArrayReferenceTransformPath, ArraySliceAxis, ArrayType, Atom, AtomId, DataType, Dimension, DimensionValue,
     InstructionId, Operation, ProgramError, ReferenceAccessMode, ReferenceEffect, ReferenceRoot, ReferenceType,
-    ReferenceViewOverlap, RegionRef, Typed, ValueId,
+    ReferenceViewOverlap, RegionRef, Typed, TypedProgram, ValueId,
 };
 use thiserror::Error;
 
@@ -259,6 +259,7 @@ where
             let inputs = mapping
                 .program()
                 .input_types()
+                .into_owned()
                 .into_iter()
                 .zip(&extents)
                 .map(|(r#type, extent)| {
@@ -311,6 +312,7 @@ where
             let inputs = mapping
                 .program()
                 .input_types()
+                .into_owned()
                 .into_iter()
                 .zip(&point)
                 .map(|(r#type, &extent)| {
@@ -882,7 +884,7 @@ mod tests {
         DimensionAddOperation, DimensionBounds, DimensionMulOperation, DimensionType, EagerContext, FlatProgram,
         NotOperation, Placeholder, ProgramBuilder, ReferenceAddUpdateOperation, ReferenceAtomicAddUpdateOperation,
         ReferenceFreezeOperation, ReferenceNewOperation, ReferenceReadOperation, ReferenceSwapOperation,
-        ReferenceWriteOperation, WhileOperation,
+        ReferenceWriteOperation, TypedProgram, WhileOperation,
     };
 
     use crate::calls::KernelParameter;

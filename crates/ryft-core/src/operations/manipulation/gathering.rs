@@ -2101,7 +2101,7 @@ mod tests {
     use crate::partial::PartialValue;
     use crate::programs::{
         EffectClasses, EmptyRegionDriver, OperationProvider, Program, ProgramBuilder, ReferenceDischargeContext,
-        ReferenceDischargeValue, ReferenceDischargeableOperation, ValueDirectDispatch,
+        ReferenceDischargeValue, ReferenceDischargeableOperation, TypedProgram, ValueDirectDispatch,
     };
     use crate::tests::hash_of;
     use crate::tracing::{DomainTracingContext, Trace, Tracer, TracingContext};
@@ -4067,7 +4067,7 @@ mod tests {
         // dynamic zero from the retained extent.
         assert_eq!(linearization.residual_count(), 2);
         assert_eq!(
-            linearization.tangent().input_types(),
+            linearization.tangent().input_types().as_ref(),
             &[
                 input_type.tangent().unwrap().into(),
                 indices_type.clone().into(),

@@ -15,14 +15,14 @@ use ryft_core::operations::attention::{
 };
 use ryft_core::{
     Array, ArrayIrBatch, ArrayIrBatchingPolicy, ArrayIrOperation, ArrayIrType, ArrayIrValue, ArrayOperation, ArrayType,
-    BatchAxis, BatchingContext, BatchingTracer, BlockScaleFormat, BlockScaledDotConfiguration, BlockScaledDotInputs,
-    CollectiveOptions, Compare, ComparisonDirection, Condition, ConvertElementTypeOperation, DataType, Device,
-    DeviceMesh, Differentiate, Dimension, DimensionBounds, DimensionFromScalarOperation, DimensionValue,
-    DimensionVariable, DotDimensionNumbers, DynamicSlice, DynamicSliceOperation, DynamicUpdateSlice, EagerContext,
-    LogicalMesh, MeshAxis, MeshAxisType, ParallelAllGather, ParallelAllGatherOutputVariance, ParallelAllToAll,
-    ParallelPermute, ParallelReduce, ParallelSumScatter, Placeholder, ProgramBuilder, ProgramError, ProjectedContext,
-    Reduce, ReduceOperation, ReductionKind, ScaledDot, Shape, Sharding, ShardingDimension, Value, ValueProjection,
-    ZeroLike, block_scaled_dot, differentiate_at, shard_map,
+    BatchAxis, BatchingContext, BatchingTracer, BlockScaleFormat, BlockScaledDotConfiguration, CollectiveOptions,
+    Compare, ComparisonDirection, Condition, ConvertElementTypeOperation, DataType, Device, DeviceMesh, Differentiate,
+    Dimension, DimensionBounds, DimensionFromScalarOperation, DimensionValue, DimensionVariable, DotDimensionNumbers,
+    DynamicSlice, DynamicSliceOperation, DynamicUpdateSlice, EagerContext, LogicalMesh, MeshAxis, MeshAxisType,
+    ParallelAllGather, ParallelAllGatherOutputVariance, ParallelAllToAll, ParallelPermute, ParallelReduce,
+    ParallelSumScatter, Placeholder, ProgramBuilder, ProgramError, ProjectedContext, Reduce, ReduceOperation,
+    ReductionKind, ScaledDot, Shape, Sharding, ShardingDimension, TypedProgram, Value, ValueProjection, ZeroLike,
+    block_scaled_dot, differentiate_at, shard_map,
 };
 use ryft_pjrt::protos::{CompilationOptions, ExecutableCompilationOptions, Precision};
 use ryft_pjrt::{BufferType, Client, ClientOptions, CpuClientOptions, Program, load_cpu_plugin};
@@ -661,15 +661,14 @@ fn emit_block_scaled_dot() -> Result<DifferentialObservation, Box<dyn Error>> {
         let function = block_scaled_dot::<EagerContext<Array, ArrayOperation<Array>>>(configuration)?;
         let (output, (lhs_gradient, rhs_gradient)) = match global_scale {
             Some(global_scale) => {
-                let (output, pullback) =
-                    differentiate_at((lhs, rhs)).with_captures(global_scale).vjp(|(lhs, rhs), scale| {
-                        function.call(BlockScaledDotInputs::new(lhs, rhs).with_lhs_global_scale(scale))
-                    })?;
+                let (output, pullback) = differentiate_at((lhs, rhs))
+                    .with_captures(global_scale)
+                    .vjp(|(lhs, rhs), scale| function.call(lhs, rhs, Some(scale), None, None, None))?;
                 (output, pullback.apply_materialized(seed)?)
             }
             None => {
-                let (output, pullback) = differentiate_at((lhs, rhs))
-                    .vjp(|(lhs, rhs)| function.call(BlockScaledDotInputs::new(lhs, rhs)))?;
+                let (output, pullback) =
+                    differentiate_at((lhs, rhs)).vjp(|(lhs, rhs)| function.call(lhs, rhs, None, None, None, None))?;
                 (output, pullback.apply_materialized(seed)?)
             }
         };
@@ -681,7 +680,7 @@ fn emit_block_scaled_dot() -> Result<DifferentialObservation, Box<dyn Error>> {
     let traced: TracedXlaProgram<(ArrayType, ArrayType, ArrayType), (ArrayType, ArrayType, ArrayType)> = trace(
         move |(lhs, rhs, seed): (XlaArrayTracer, XlaArrayTracer, XlaArrayTracer)| {
             let (output, pullback) = differentiate_at((lhs, rhs))
-                .vjp(|(lhs, rhs)| function.call(BlockScaledDotInputs::new(lhs, rhs)))
+                .vjp(|(lhs, rhs)| function.call(lhs, rhs, None, None, None, None))
                 .unwrap();
             let (lhs_gradient, rhs_gradient) = pullback.apply_materialized(seed).unwrap();
             (output, lhs_gradient, rhs_gradient)

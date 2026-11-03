@@ -2163,7 +2163,7 @@ mod tests {
     use crate::operations::manipulation::scattering::SCATTER_OPERATION_NAME;
     use crate::parameters::Placeholder;
     use crate::partial::PartialValue;
-    use crate::programs::{EmptyRegionDriver, Program, ProgramBuilder, ProgramError, Typed};
+    use crate::programs::{EmptyRegionDriver, Program, ProgramBuilder, ProgramError, Typed, TypedProgram};
 
     use super::*;
 

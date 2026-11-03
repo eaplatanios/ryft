@@ -1889,6 +1889,7 @@ impl CacheDigest {
 
 #[cfg(test)]
 mod tests {
+    use std::borrow::Cow;
     use std::collections::HashMap;
     use std::fs::FileTimes;
     use std::sync::atomic::{AtomicBool, AtomicUsize};
@@ -1903,12 +1904,40 @@ mod tests {
     use crate::compilation::contexts::{CompilationDomain, Compile};
     use crate::compilation::functions::{CompilationTracer, StagedFunction, StagedProgram};
     use crate::contexts::Domain;
-    use crate::programs::ProgramError;
+    use crate::programs::{ProgramError, TypedProgram};
 
     use super::*;
 
+    /// Lowered program of [`TestDomain`], which holds only its output types.
+    struct TestLoweredProgram(Vec<ArrayType>);
+
+    impl TypedProgram for TestLoweredProgram {
+        type Type = ArrayType;
+
+        fn input_types(&self) -> Cow<'_, [ArrayType]> {
+            Cow::Borrowed(&[])
+        }
+
+        fn output_types(&self) -> Cow<'_, [ArrayType]> {
+            Cow::Borrowed(&self.0)
+        }
+    }
+
+    /// Compiled program of [`TestDomain`], which holds only its number of outputs.
     #[derive(Debug, PartialEq, Eq)]
     struct TestCompiledProgram(usize);
+
+    impl TypedProgram for TestCompiledProgram {
+        type Type = ArrayType;
+
+        fn input_types(&self) -> Cow<'_, [ArrayType]> {
+            Cow::Borrowed(&[])
+        }
+
+        fn output_types(&self) -> Cow<'_, [ArrayType]> {
+            Cow::Owned(vec![ArrayType::scalar(DataType::F32); self.0])
+        }
+    }
 
     #[derive(Clone, Default)]
     struct TestDomain {
@@ -1933,7 +1962,7 @@ mod tests {
 
     impl CompilationDomain for TestDomain {
         type DispatchKey = Arc<[ArrayType]>;
-        type LoweredProgram = Vec<ArrayType>;
+        type LoweredProgram = TestLoweredProgram;
         type CompiledProgram = TestCompiledProgram;
         type Options = ();
         type Error = ProgramError;
@@ -1947,15 +1976,12 @@ mod tests {
             Ok((input_types.clone(), input_types))
         }
 
-        fn lower(&self, staged: &StagedProgram<Self>) -> Result<(Self::LoweredProgram, Vec<ArrayType>), Self::Error> {
-            Ok((staged.output_types().to_vec(), staged.output_types().to_vec()))
+        fn lower(&self, staged: &StagedProgram<Self>) -> Result<Self::LoweredProgram, Self::Error> {
+            Ok(TestLoweredProgram(staged.output_types().to_vec()))
         }
 
-        fn compile(
-            &self,
-            program: &Self::LoweredProgram,
-        ) -> Result<(Arc<Self::CompiledProgram>, Vec<ArrayType>), Self::Error> {
-            Ok((Arc::new(TestCompiledProgram(0)), program.clone()))
+        fn compile(&self, program: &Self::LoweredProgram) -> Result<Arc<Self::CompiledProgram>, Self::Error> {
+            Ok(Arc::new(TestCompiledProgram(program.0.len())))
         }
 
         fn execute(&self, _program: &Self::CompiledProgram, _inputs: Vec<Array>) -> Result<Vec<Array>, Self::Error> {
@@ -1966,25 +1992,25 @@ mod tests {
     impl CompilationCacheDomain for TestDomain {
         type CacheKey = u8;
 
-        fn compilation_key(&self, _program: &Vec<ArrayType>) -> Result<u8, ProgramError> {
+        fn compilation_key(&self, _program: &TestLoweredProgram) -> Result<u8, ProgramError> {
             Ok(0)
         }
 
-        fn compile_uncached(&self, program: &Vec<ArrayType>) -> Result<TestCompiledProgram, ProgramError> {
-            Ok(TestCompiledProgram(program.len()))
+        fn compile_uncached(&self, program: &TestLoweredProgram) -> Result<TestCompiledProgram, ProgramError> {
+            Ok(TestCompiledProgram(program.0.len()))
         }
 
         // A compiled program serves exactly the lowered programs whose output count it holds.
         fn validate_cached_program(
             &self,
-            program: &Vec<ArrayType>,
+            program: &TestLoweredProgram,
             compiled: &TestCompiledProgram,
         ) -> Result<(), ProgramError> {
-            if compiled.0 == program.len() {
+            if compiled.0 == program.0.len() {
                 Ok(())
             } else {
                 Err(ProgramError::InvalidArgument {
-                    message: format!("cached program {} cannot serve {} outputs", compiled.0, program.len()),
+                    message: format!("cached program {} cannot serve {} outputs", compiled.0, program.0.len()),
                 })
             }
         }
@@ -3105,11 +3131,14 @@ mod tests {
 
         // Equal exact keys must mean interchangeable programs, so a rejected in-memory program fails the compilation.
         assert_eq!(
-            context.compile(&domain, &vec![ArrayType::scalar(DataType::F32)]),
+            context.compile(&domain, &TestLoweredProgram(vec![ArrayType::scalar(DataType::F32)])),
             Err(ProgramError::InvalidArgument { message: "cached program 2 cannot serve 1 outputs".to_string() }),
         );
         assert_eq!(
-            context.compile(&domain, &vec![ArrayType::scalar(DataType::F32); 2]).unwrap().as_ref(),
+            context
+                .compile(&domain, &TestLoweredProgram(vec![ArrayType::scalar(DataType::F32); 2]))
+                .unwrap()
+                .as_ref(),
             &TestCompiledProgram(2),
         );
         assert_eq!(context.statistics().memory_hits, 2);
@@ -3153,7 +3182,9 @@ mod tests {
         }
         let waiter = {
             let context = Arc::clone(&context);
-            thread::spawn(move || context.compile(&TestDomain::default(), &vec![ArrayType::scalar(DataType::F32)]))
+            thread::spawn(move || {
+                context.compile(&TestDomain::default(), &TestLoweredProgram(vec![ArrayType::scalar(DataType::F32)]))
+            })
         };
         while context.statistics().waits == 0 && Instant::now() < deadline {
             thread::yield_now();
@@ -3187,7 +3218,7 @@ mod tests {
 
         // A rejected persistent artifact is an incompatible miss, and the fresh compilation replaces it.
         let context = CompilationContext::<TestDomain>::new().with_event_capacity(8).with_disk_cache(disk_cache());
-        let lowered = vec![ArrayType::scalar(DataType::F32)];
+        let lowered = TestLoweredProgram(vec![ArrayType::scalar(DataType::F32)]);
         assert_eq!(context.compile(&domain, &lowered).unwrap().as_ref(), &TestCompiledProgram(1));
         assert_eq!(context.statistics().persistent_hits, 0);
         assert_eq!(context.statistics().persistent_errors, 0);
@@ -3223,7 +3254,7 @@ mod tests {
                 .with_event_capacity(8)
                 .with_artifact_exchange(Arc::new(TestExchange::new(1, state)), policy)
         };
-        let lowered = vec![ArrayType::scalar(DataType::F32)];
+        let lowered = TestLoweredProgram(vec![ArrayType::scalar(DataType::F32)]);
 
         // A rejected received artifact is an incompatible miss, so a follower that may fall back compiles locally.
         let context = follower_context(CompilationArtifactExchangePolicy::PreferSharing {
@@ -3281,7 +3312,10 @@ mod tests {
             CompilationArtifactExchangePolicy::RequireSharing { timeout: Duration::from_secs(1) },
         );
         assert_eq!(
-            context.compile(&domain, &vec![ArrayType::scalar(DataType::F32)]).unwrap().as_ref(),
+            context
+                .compile(&domain, &TestLoweredProgram(vec![ArrayType::scalar(DataType::F32)]))
+                .unwrap()
+                .as_ref(),
             &TestCompiledProgram(1),
         );
         assert_eq!(context.statistics().exchange_publishes, 1);

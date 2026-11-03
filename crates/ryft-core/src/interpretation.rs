@@ -1512,7 +1512,7 @@ mod tests {
     };
     use crate::programs::{
         AtomId, ProgramBuilder, ProgramError, Provenance, ProvenanceScope, ReferenceType, RegionId, RegionInterface,
-        RegionSlot, TypeError,
+        RegionSlot, TypeError, TypedProgram,
     };
     use crate::tests::{TestArrayContext, TestRegionOperation};
     use crate::tracing::{Tracer, TracingContext};

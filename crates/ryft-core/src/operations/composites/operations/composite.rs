@@ -36,7 +36,7 @@ use crate::programs::{
     OperationProvider, OutputRegionProvenance, ProgramBuilder, ProgramError, ReferenceBoundary,
     ReferenceDischargeContext, ReferenceDischargeDriver, ReferenceDischargePolicy, ReferenceDischargeValue,
     ReferenceDischargeableOperation, RegionDataFlow, RegionInterface, RegionLiveness, RegionRef, RegionSlot, Type,
-    TypeError, TypeIdentityRenaming, Typed, Value,
+    TypeError, TypeIdentityRenaming, Typed, TypedProgram, Value,
 };
 use crate::tracing::TracingContext;
 
@@ -3641,7 +3641,12 @@ mod tests {
         let program = ir_counter_square_program();
         let mut builder = ProgramBuilder::<ArrayIrValue<Array>, ArrayIrOperation<Array>>::new();
         let primal = builder.import_program(program.clone());
-        let inputs = program.input_types().into_iter().map(|r#type| builder.add_input(r#type)).collect::<Vec<_>>();
+        let inputs = program
+            .input_types()
+            .into_owned()
+            .into_iter()
+            .map(|r#type| builder.add_input(r#type))
+            .collect::<Vec<_>>();
         assert!(matches!(
             builder.add_instruction(
                 ArrayIrOperation::Composite(CompositeOperation::new(definition.reference())),

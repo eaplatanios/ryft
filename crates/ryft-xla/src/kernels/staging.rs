@@ -17,7 +17,7 @@ use ryft_core::{
     ReferenceAccessOperation, ReferenceDischargeContext, ReferenceDischargeDriver, ReferenceDischargePolicy,
     ReferenceDischargeValue, ReferenceDischargeableOperation, Region, RegionDataFlow, RegionInterface, RegionLiveness,
     RegionSlot, Tracer, TracingContext, TransposableOperation, TranspositionContext, TranspositionDriver, Type,
-    TypeError, TypeIdentityRenaming, Typed, Value,
+    TypeError, TypeIdentityRenaming, Typed, TypedProgram, Value,
 };
 use ryft_kernels::{
     KernelCallOperation, KernelCompiler, KernelDefinition, KernelExtension, KernelExtensionMemory, KernelOperation,
@@ -1228,7 +1228,7 @@ pub(crate) fn select_kernels(
 pub(crate) mod tests {
     use indoc::indoc;
     use pretty_assertions::assert_eq;
-    use ryft_core::{CustomCallOperation, EffectClass};
+    use ryft_core::{CustomCallOperation, EffectClass, TypedProgram};
     use ryft_kernels::{KernelCompilationError, KernelCompiler, KernelSchedule, VerifiedKernel};
 
     use crate::experimental::ops::XlaProgramBuilder;
@@ -1384,14 +1384,14 @@ pub(crate) mod tests {
         let staged = StagedFunction::<XlaDomain<'_>, Vec<ArrayIrType>, Vec<ArrayIrType>>::stage(
             |_, _, inputs| replay(program, inputs),
             vec![],
-            program.input_types(),
+            program.input_types().into_owned(),
             XlaOptions::new(mesh.clone()),
         )
         .unwrap();
         let compiled = staged.lower(&domain).unwrap().compile(&domain).unwrap();
         let inputs = inputs
             .iter()
-            .zip(program.input_types())
+            .zip(program.input_types().into_owned())
             .map(|(value, r#type)| {
                 let r#type = <&ArrayType>::try_from(&r#type).unwrap().clone();
                 crate::XlaValue::Array(
@@ -1552,7 +1552,7 @@ pub(crate) mod tests {
         assert_eq!(call.grid().dimensions().len(), 1);
         assert_eq!(call.aliases(), vec![(0, 0)]);
         let body = program.region_ref(program.instructions()[0].regions()[0]).unwrap();
-        assert_eq!(definition_from_body(call, body).unwrap().operation().input_types(), program.input_types());
+        assert_eq!(definition_from_body(call, body).unwrap().operation().input_types(), program.input_types().as_ref());
     }
 
     #[test]
@@ -1871,8 +1871,13 @@ pub(crate) mod tests {
         let definition = differentiable_definition();
         let scalar = definition.operation().input_types()[0].clone();
         let mut body = ProgramBuilder::<ArrayIrValue<Array>, KernelOperation>::new();
-        let inputs =
-            definition.body().input_types().into_iter().map(|r#type| body.add_input(r#type)).collect::<Vec<_>>();
+        let inputs = definition
+            .body()
+            .input_types()
+            .into_owned()
+            .into_iter()
+            .map(|r#type| body.add_input(r#type))
+            .collect::<Vec<_>>();
         body.splice_program(definition.body(), &inputs).unwrap();
         let predicate = body.add_constant(ArrayIrValue::Array(Array::scalar(false).unwrap()));
         body.add_instruction(
@@ -2286,7 +2291,7 @@ pub(crate) mod tests {
         assert!(matches!(selected.instructions()[0].operation(), XlaOperation::ShardMap(_)));
         let local = selected.region_ref(selected.instructions()[0].regions()[0]).unwrap();
         assert!(matches!(local.instructions()[0].operation(), XlaOperation::CustomCall(_)));
-        assert_eq!(local.input_types(), body.input_types());
+        assert_eq!(local.input_types(), body.input_types().into_owned());
         assert!(matches!(select_kernels(&body, Some(&binding), facts),
             Err(KernelEmbeddingError::Invalid { message }) if message ==
                 "kernel parameter 0 requires a local shard with all partitioned axes bound by `shard_map`"));

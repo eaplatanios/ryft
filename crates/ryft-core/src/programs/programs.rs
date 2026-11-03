@@ -18,7 +18,7 @@ use crate::programs::regions::{
     RegionLiveness, RegionRef, reachable_region_mask,
 };
 use crate::programs::transforms::RegionTransformCache;
-use crate::programs::types::{Type, Typed, type_identities_needing_runtime_checks};
+use crate::programs::types::{Type, Typed, TypedProgram, type_identities_needing_runtime_checks};
 use crate::programs::values::{Value, ValueId, ValueProjection};
 
 /// Mode selecting what a [`Program`] rendering includes. The semantic rendering is the canonical structural fingerprint
@@ -197,12 +197,6 @@ impl<V: Value, O: Operation<Type = V::Type>, Input: Parameterized<V>, Output: Pa
         self.entry_region_ref().input_ids()
     }
 
-    /// Returns the [`Type`]s of the inputs of this [`Program`], in order.
-    #[inline]
-    pub fn input_types(&self) -> Vec<V::Type> {
-        self.entry_region_ref().input_types()
-    }
-
     /// Returns the [`Atom`]s that correspond to the inputs of this [`Program`].
     #[inline]
     pub fn inputs(&self) -> impl Iterator<Item = &Atom<V>> {
@@ -230,12 +224,6 @@ impl<V: Value, O: Operation<Type = V::Type>, Input: Parameterized<V>, Output: Pa
     #[inline]
     pub fn output_ids(&self) -> &[AtomId] {
         self.entry_region_ref().output_ids()
-    }
-
-    /// Returns the [`Type`]s of the outputs of this [`Program`], in order.
-    #[inline]
-    pub fn output_types(&self) -> Vec<V::Type> {
-        self.entry_region_ref().output_types()
     }
 
     /// Returns the [`Atom`]s that correspond to the outputs of this [`Program`].
@@ -548,7 +536,7 @@ impl<V: Value, O: Operation<Type = V::Type>, Input: Parameterized<V>, Output: Pa
     /// but do not specialize the returned program's types. When no renaming is required, the result borrows this
     /// program.
     pub fn with_instantiated_type_identities(&self, input_types: &[V::Type]) -> Result<Cow<'_, Self>, ProgramError> {
-        let renaming = V::Type::derive_identity_renaming(self.input_types().as_slice(), input_types)?;
+        let renaming = V::Type::derive_identity_renaming(self.input_types().as_ref(), input_types)?;
         if renaming.is_identity() {
             return Ok(Cow::Borrowed(self));
         }
@@ -1767,6 +1755,22 @@ impl<V: Value, O: Operation<Type = V::Type>, Input: Parameterized<V>, Output: Pa
     #[inline]
     fn fmt(&self, formatter: &mut std::fmt::Formatter<'_>) -> std::fmt::Result {
         self.render(formatter, 0, ProgramRenderingMode::Semantic)
+    }
+}
+
+impl<V: Value, O: Operation<Type = V::Type>, Input: Parameterized<V>, Output: Parameterized<V>> TypedProgram
+    for Program<V, O, Input, Output>
+{
+    type Type = V::Type;
+
+    #[inline]
+    fn input_types(&self) -> Cow<'_, [V::Type]> {
+        Cow::Owned(self.entry_region_ref().input_types())
+    }
+
+    #[inline]
+    fn output_types(&self) -> Cow<'_, [V::Type]> {
+        Cow::Owned(self.entry_region_ref().output_types())
     }
 }
 

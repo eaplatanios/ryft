@@ -16,7 +16,7 @@ use ryft_core::{
     DimensionFromScalar, DimensionFromScalarOperation, DimensionType, DimensionVariable, EagerContext, FlatProgram,
     InputRegionProvenance, InstructionId, Operation, OperationFormatter, PadOperation, Placeholder, ProgramBuilder,
     ProgramError, ReferenceAccessMode, ReferenceAccessOperation, ReferenceType, RegionInterface, RegionRef, RegionSlot,
-    Tracer, TracingContext, Type, TypeError, TypeIdentityRenaming, TypeRefinements, Typed,
+    Tracer, TracingContext, Type, TypeError, TypeIdentityRenaming, TypeRefinements, Typed, TypedProgram,
 };
 use thiserror::Error;
 
@@ -794,6 +794,7 @@ where
         let mut inputs = self
             .body
             .input_types()
+            .into_owned()
             .into_iter()
             .take(remaining)
             .map(|r#type| builder.add_input(r#type))
@@ -1259,7 +1260,7 @@ mod tests {
         DataType, DimensionError, DimensionType, DimensionValue, EffectClasses, Layout, LogicalMesh, Memory, MeshAxis,
         MeshAxisType, Placeholder, ProgramBuilder, ReferenceAddUpdateOperation, ReferenceAtomicAddUpdateOperation,
         ReferenceRead, ReferenceReadOperation, ReferenceWrite, ReferenceWriteOperation, RegionId, Shape, ShardMap,
-        ShardMapOperation, Sharding, TiledLayout, ZeroOperation,
+        ShardMapOperation, Sharding, TiledLayout, TypedProgram, ZeroOperation,
     };
 
     use crate::authoring::whole_array_parameter;
@@ -1786,7 +1787,7 @@ mod tests {
     fn test_kernel_call_operation_body_input_types() {
         let definition = dynamic_definition("extent", 4, true);
         let operation = definition.operation();
-        assert_eq!(operation.body_input_types(), definition.body().input_types());
+        assert_eq!(operation.body_input_types(), definition.body().input_types().into_owned());
         assert_eq!(operation.body_input_types()[0], operation.parameters()[0].body_type());
         assert_eq!(
             &operation.body_input_types()[1..],

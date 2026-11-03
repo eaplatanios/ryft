@@ -200,7 +200,9 @@ mod tests {
     use crate::macros::check_count;
     use crate::operations::NegOperation;
     use crate::parameters::Parameter;
-    use crate::programs::{FlatProgram, Operation, ProgramError, Type, Typed, Value, ValueDirectDispatch};
+    use crate::programs::{
+        FlatProgram, Operation, ProgramError, Type, Typed, TypedProgram, Value, ValueDirectDispatch,
+    };
 
     /// Lowered program of [`TestDomain`].
     #[derive(Clone)]
@@ -225,6 +227,30 @@ mod tests {
 
         /// Compiled output types.
         pub(super) output_types: Vec<ArrayType>,
+    }
+
+    impl TypedProgram for TestLoweredProgram {
+        type Type = ArrayType;
+
+        fn input_types(&self) -> Cow<'_, [ArrayType]> {
+            self.program.input_types()
+        }
+
+        fn output_types(&self) -> Cow<'_, [ArrayType]> {
+            Cow::Borrowed(&self.output_types)
+        }
+    }
+
+    impl TypedProgram for TestCompiledProgram {
+        type Type = ArrayType;
+
+        fn input_types(&self) -> Cow<'_, [ArrayType]> {
+            self.program.input_types()
+        }
+
+        fn output_types(&self) -> Cow<'_, [ArrayType]> {
+            Cow::Borrowed(&self.output_types)
+        }
     }
 
     /// Options of [`TestDomain`], which inject staged input types, failures, and output types into the lifecycle.
@@ -293,7 +319,7 @@ mod tests {
             Ok((input_types.clone(), input_types))
         }
 
-        fn lower(&self, staged: &StagedProgram<Self>) -> Result<(Self::LoweredProgram, Vec<ArrayType>), Self::Error> {
+        fn lower(&self, staged: &StagedProgram<Self>) -> Result<Self::LoweredProgram, Self::Error> {
             let program = staged.lifted_program()?;
             let capture_count = staged.source_program().captures().len();
             let output_types = staged.output_types();
@@ -301,22 +327,16 @@ mod tests {
             if options.fail_lowering {
                 return Err(ProgramError::InvalidArgument { message: "expected lowering failure".into() });
             }
-            let program = TestLoweredProgram {
+            Ok(TestLoweredProgram {
                 program: program.as_ref().clone(),
                 capture_count,
                 output_types: output_types.to_vec(),
                 options: options.clone(),
-            };
-            Ok((program, output_types.to_vec()))
+            })
         }
 
-        fn compile(
-            &self,
-            program: &Self::LoweredProgram,
-        ) -> Result<(Arc<Self::CompiledProgram>, Vec<ArrayType>), Self::Error> {
-            let program = self.cache.compile(self, program)?;
-            let output_types = program.output_types.clone();
-            Ok((program, output_types))
+        fn compile(&self, program: &Self::LoweredProgram) -> Result<Arc<Self::CompiledProgram>, Self::Error> {
+            self.cache.compile(self, program)
         }
 
         fn execute(&self, program: &Self::CompiledProgram, inputs: Vec<Array>) -> Result<Vec<Array>, Self::Error> {
@@ -431,16 +451,13 @@ mod tests {
             Ok((input_types.clone(), input_types))
         }
 
-        fn lower(&self, staged: &StagedProgram<Self>) -> Result<(Self::LoweredProgram, Vec<ArrayType>), ProgramError> {
-            Ok((staged.lifted_program()?.as_ref().clone(), staged.output_types().to_vec()))
+        fn lower(&self, staged: &StagedProgram<Self>) -> Result<Self::LoweredProgram, ProgramError> {
+            Ok(staged.lifted_program()?.as_ref().clone())
         }
 
-        fn compile(
-            &self,
-            program: &Self::LoweredProgram,
-        ) -> Result<(Arc<Self::CompiledProgram>, Vec<ArrayType>), ProgramError> {
+        fn compile(&self, program: &Self::LoweredProgram) -> Result<Arc<Self::CompiledProgram>, ProgramError> {
             self.compilations.fetch_add(1, Ordering::Relaxed);
-            Ok((Arc::new(program.clone()), program.output_types()))
+            Ok(Arc::new(program.clone()))
         }
 
         fn execute(

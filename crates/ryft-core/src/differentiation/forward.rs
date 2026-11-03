@@ -29,7 +29,7 @@ use crate::programs::{
     OperationProvider, Program, ProgramBuilder, ProgramError, ProjectedValue, Provenance, ProvenanceScope,
     ReferenceAccessOperation, ReferenceBoundary, ReferenceIdentity, ReferenceMemberType, ReferenceRoot,
     ReferenceTransform, Region, RegionDriver, RegionRef, RegionReplayMappings, ReplayRegionDriver, Type, TypeError,
-    TypeIdentityPosition, Typed, Value, ValueDomainDispatch, ValueProjection,
+    TypeIdentityPosition, Typed, TypedProgram, Value, ValueDomainDispatch, ValueProjection,
 };
 use crate::tracing::{Tracer, TracerState, TracingContext};
 
@@ -3054,6 +3054,7 @@ where
             let old_input_count = tangent_program.input_ids().len();
             let inputs = tangent_program
                 .input_types()
+                .into_owned()
                 .into_iter()
                 .chain(zero_residual_types)
                 .map(|r#type| builder.add_input(r#type))
@@ -3835,6 +3836,7 @@ where
         let old_input_count = program.input_ids().len();
         let inputs = program
             .input_types()
+            .into_owned()
             .into_iter()
             .chain(zero_residuals.iter().map(|value| value.r#type().into_owned()))
             .map(|r#type| builder.add_input(r#type))

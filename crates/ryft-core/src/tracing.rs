@@ -82,7 +82,7 @@ use crate::parameters::{Parameter, Parameterized, ParameterizedFamily, Placehold
 use crate::programs::{
     AtomId, AttachedRegions, Operation, OperationProvider, Program, ProgramBuilder, ProgramError, ProjectedValue,
     Provenance, ProvenanceScope, ProvenanceState, ReferenceIdentity, RegionRef, Type, TypeError, TypeIdentityRenaming,
-    TypeRefinements, Typed, Value, ValueDomainDispatch, ValueProjection,
+    TypeRefinements, Typed, TypedProgram, Value, ValueDomainDispatch, ValueProjection,
 };
 
 /// State carried by a [`Tracer`] that indicates whether this tracer is _live_ and has a corresponding

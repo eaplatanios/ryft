@@ -120,7 +120,7 @@ mod tests {
     use crate::operations::arithmetic::Mul;
     use crate::parameters::Placeholder;
     use crate::partial::PartialValue;
-    use crate::programs::{EffectClass, EffectClasses, ProgramBuilder};
+    use crate::programs::{EffectClass, EffectClasses, ProgramBuilder, TypedProgram};
     use crate::tracing::TracingContext;
 
     use super::*;
@@ -214,7 +214,9 @@ mod tests {
                 in (%3, %4, %5, %6)"},
         );
         let evaluation = program
-            .partially_evaluate(&program.input_types().into_iter().map(PartialValue::Unknown).collect::<Vec<_>>())
+            .partially_evaluate(
+                &program.input_types().into_owned().into_iter().map(PartialValue::Unknown).collect::<Vec<_>>(),
+            )
             .unwrap();
         assert_eq!(
             evaluation.program().to_string(),

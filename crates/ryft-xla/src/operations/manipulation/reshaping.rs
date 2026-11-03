@@ -292,7 +292,7 @@ mod tests {
         DimensionOperation, DimensionType, DimensionValue, DimensionVariable, DynamicReshapeOperation, EffectClass,
         EffectClasses, EmptyRegionDriver, LogicalMesh, MeshAxis, MeshAxisType, Operation, Placeholder,
         ProgramBatchingOutputAxesPolicy, ProgramError, Reshape, Shape, Sharding, ShardingDimension, StagingContext,
-        TracedShardMap, TracingContext, TransposeOperation, Typed, trace_shard_map,
+        TracedShardMap, TracingContext, TransposeOperation, Typed, TypedProgram, trace_shard_map,
     };
     use ryft_mlir::Location;
     use ryft_pjrt::{BufferType, ExecutionDeviceInputs, ExecutionInput, Program as PjrtProgram};

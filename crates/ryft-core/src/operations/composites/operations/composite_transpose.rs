@@ -32,7 +32,7 @@ use crate::programs::{
     Effects, MaybeZero, Operation, OperationFormatter, OperationProvider, ProgramBuilder, ProgramError,
     ReferenceDischargeContext, ReferenceDischargeDriver, ReferenceDischargePolicy, ReferenceDischargeValue,
     ReferenceDischargeableOperation, RegionInterface, RegionSlot, Type, TypeError, TypeIdentityRenaming,
-    TypeRefinements, Typed, Value,
+    TypeRefinements, Typed, TypedProgram, Value,
 };
 use crate::tracing::TracingContext;
 
@@ -800,7 +800,7 @@ where
                 .iter()
                 .map(|input| P::value(input).r#type().into_owned())
                 .collect(),
-            output_tangent_types: batched_identity.output_types(),
+            output_tangent_types: batched_identity.output_types().into_owned(),
             rules: CompositeTransposeRules::Retained {
                 rules: rules.clone(),
                 batching: Some(batching),
@@ -3335,6 +3335,7 @@ mod tests {
         let parent = TracingContext::<ArrayIrValue<Array>, ArrayIrOperation<Array>>::new();
         let known_inputs = program
             .input_types()
+            .into_owned()
             .into_iter()
             .map(|input_type| PartialValue::Known(parent.input(input_type)))
             .collect::<Vec<_>>();

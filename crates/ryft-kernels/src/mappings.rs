@@ -10,7 +10,7 @@ use std::hash::{Hash, Hasher};
 use ryft_core::{
     Array, ArrayIrOperation, ArrayIrType, ArrayIrValue, ArrayReferenceTransform, ArraySliceAxis, Atom,
     DimensionOperation, DimensionRefinements, DimensionValue, EagerContext, FlatProgram, MAX_DIMENSION_EXTENT,
-    Operation, Placeholder, ProgramBuilder, ProgramError, ReferenceViewOverlap, TypeError, Typed,
+    Operation, Placeholder, ProgramBuilder, ProgramError, ReferenceViewOverlap, TypeError, Typed, TypedProgram,
 };
 use thiserror::Error;
 
@@ -162,6 +162,7 @@ impl BlockMapping {
         let mut inputs = self
             .program
             .input_types()
+            .into_owned()
             .into_iter()
             .take(remaining)
             .map(|r#type| builder.add_input(r#type))
@@ -368,7 +369,7 @@ mod tests {
     use pretty_assertions::assert_eq;
     use ryft_core::{
         ArrayType, DataType, DimensionBounds, DimensionError, DimensionMulOperation, DimensionType, ParameterError,
-        Placeholder, ProgramBuilder, ReferenceType, ZERO_OPERATION_NAME, ZeroOperation,
+        Placeholder, ProgramBuilder, ReferenceType, TypedProgram, ZERO_OPERATION_NAME, ZeroOperation,
     };
 
     use super::*;
@@ -398,6 +399,7 @@ mod tests {
         mapping
             .program()
             .input_types()
+            .into_owned()
             .into_iter()
             .zip(extents)
             .map(|(r#type, &extent)| {
@@ -459,8 +461,8 @@ mod tests {
     #[test]
     fn test_block_mapping_program() {
         let program = identity_program(1);
-        let input_types = program.input_types();
-        let output_types = program.output_types();
+        let input_types = program.input_types().into_owned();
+        let output_types = program.output_types().into_owned();
         let mapping = BlockMapping::new(program, vec![4], BoundaryPolicy::InBounds).unwrap();
         assert_eq!(mapping.program().input_types(), input_types);
         assert_eq!(mapping.program().output_types(), output_types);

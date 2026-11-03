@@ -541,7 +541,7 @@ mod tests {
     use pretty_assertions::assert_eq;
     use ryft_core::{
         ArrayIrType, DataType, Dimension, DimensionBounds, DimensionSizeOperation, DimensionType, DimensionValue,
-        DimensionVariable, Memory, Placeholder, Shape,
+        DimensionVariable, Memory, Placeholder, Shape, TypedProgram,
     };
     use ryft_mlir::{Operation as MlirOperation, Value as MlirValue};
     use ryft_pjrt::extensions::ffi::{

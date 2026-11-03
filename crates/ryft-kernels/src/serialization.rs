@@ -1516,7 +1516,9 @@ fn bounded_dot_dimensions<'de, D: Deserializer<'de>>(deserializer: D) -> Result<
 #[cfg(test)]
 mod tests {
     use pretty_assertions::assert_eq;
-    use ryft_core::{Context, ProgramBuilder, SinOperation, TanOperation, TanhOperation, TypeIdentityRenaming};
+    use ryft_core::{
+        Context, ProgramBuilder, SinOperation, TanOperation, TanhOperation, TypeIdentityRenaming, TypedProgram,
+    };
 
     use crate::authoring::whole_array_parameter;
     use crate::interpretation::DEFAULT_KERNEL_INTERPRETATION_MAXIMUM_PROGRAMS;

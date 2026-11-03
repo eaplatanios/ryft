@@ -1130,7 +1130,7 @@ mod tests {
     use crate::programs::{
         Atom, AtomId, AttachedRegions, ProgramBuilder, ProgramError, ProjectedValue, Provenance, ProvenanceScope,
         RegionInterface, RegionReplayMappings, RegionSlot, ReplayRegionDriver, TypeError, TypeIdentityRenaming, Typed,
-        ValueProjection,
+        TypedProgram, ValueProjection,
     };
     use crate::tests::{
         ProjectedMemberOperation, ProjectedMemberType, ProjectedMemberValue, ProjectedProgramOperation,

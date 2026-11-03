@@ -1564,7 +1564,7 @@ mod tests {
     use pretty_assertions::assert_eq;
     use ryft_core::{
         ArrayIrType, CompareOperation, DimensionBounds, DimensionError, DimensionPow, DimensionType, DimensionValue,
-        DimensionVariable, Div, Placeholder, ProgramError, Rem, Shape, Sub,
+        DimensionVariable, Div, Placeholder, ProgramError, Rem, Shape, Sub, TypedProgram,
     };
     use ryft_pjrt::extensions::ffi::XLA_FFI_Buffer;
 
@@ -2019,7 +2019,7 @@ mod tests {
             // Exercise the public specialization and reference-discharge boundaries before differentiating and
             // lowering. These read-only external bindings become the two explicit initial-state array arguments.
             let context = TracingContext::<XlaConstant, XlaOperation>::new();
-            let inputs = source.input_types().into_iter().map(PartialValue::Unknown).collect::<Vec<_>>();
+            let inputs = source.input_types().into_owned().into_iter().map(PartialValue::Unknown).collect::<Vec<_>>();
             let evaluation = source.partially_evaluate_in_context(&context, &inputs).unwrap();
             let discharged = evaluation.program().clone().discharge_references::<ArrayReferenceDischarge>(0).unwrap();
             assert_eq!(discharged.external_reference_bindings().len(), 2);

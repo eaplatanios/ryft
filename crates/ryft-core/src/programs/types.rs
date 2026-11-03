@@ -791,12 +791,12 @@ pub trait TypedProgram {
     /// [`Type`] family of the inputs and outputs of this program.
     type Type: Type;
 
-    /// Returns the [`Type`]s of the inputs of this program, in order. Like [`Typed::r#type`], this function returns
-    /// a [`Cow`] so that implementors can lend out stored types by borrow or compute them on the fly.
+    /// Returns the [`Type`]s of the inputs of this program, in order. Like the type accessor of [`Typed`], this
+    /// function returns a [`Cow`] so that implementors can lend out stored types by borrow or compute them on the fly.
     fn input_types(&self) -> Cow<'_, [Self::Type]>;
 
-    /// Returns the [`Type`]s of the outputs of this program, in order. Like [`Typed::r#type`], this function returns
-    /// a [`Cow`] so that implementors can lend out stored types by borrow or compute them on the fly.
+    /// Returns the [`Type`]s of the outputs of this program, in order. Like the type accessor of [`Typed`], this
+    /// function returns a [`Cow`] so that implementors can lend out stored types by borrow or compute them on the fly.
     fn output_types(&self) -> Cow<'_, [Self::Type]>;
 }
 

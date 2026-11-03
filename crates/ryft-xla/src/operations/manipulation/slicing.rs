@@ -632,7 +632,7 @@ mod tests {
     use ryft_core::{
         Array, ArrayIrType, ArrayOperation, Context, DimensionBounds, DimensionFromScalarOperation, DimensionVariable,
         DynamicSlice, DynamicSliceOperation, DynamicUpdateSliceOperation, EagerContext, Placeholder,
-        ReverseModeDifferentiate, UpdateSliceOperation,
+        ReverseModeDifferentiate, TypedProgram, UpdateSliceOperation,
     };
     use ryft_pjrt::{BufferType, ExecutionDeviceInputs, ExecutionInput, Program as PjrtProgram};
 

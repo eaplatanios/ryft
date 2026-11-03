@@ -214,7 +214,7 @@ mod tests {
     use pretty_assertions::assert_eq;
     use ryft_core::{
         AndOperation, ArrayOperation, Atan2Operation, CompareOperation, ComparisonDirection, DataType, DivOperation,
-        OrOperation, Placeholder, SelectOperation, Shape, SinOperation, XorOperation,
+        OrOperation, Placeholder, SelectOperation, Shape, SinOperation, TypedProgram, XorOperation,
     };
 
     use crate::experimental::lowering::tests::{PlainXlaProgram, XlaProgramBuilder, lowered_unary_module};
@@ -285,8 +285,8 @@ mod tests {
     #[test]
     fn test_traced_elementwise_lowering_normalizes_all_implicit_operands() {
         let plain_program = xla_elementwise_normalization_program();
-        let input_types = plain_program.input_types();
-        let output_types = plain_program.output_types();
+        let input_types = plain_program.input_types().into_owned();
+        let output_types = plain_program.output_types().into_owned();
         let program = plain_program.into_unprojected::<XlaConstant, XlaOperation>().unwrap();
         let stablehlo =
             to_mlir_module_for_program(&program, &[], &input_types, &output_types, "main", None, None).unwrap();

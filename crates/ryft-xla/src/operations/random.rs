@@ -111,7 +111,7 @@ impl LowerableOperation for RngBitGeneratorOperation<ArrayIrType> {
 mod tests {
     use indoc::indoc;
     use pretty_assertions::assert_eq;
-    use ryft_core::{ArrayType, DataType, Dimension, Placeholder, Shape};
+    use ryft_core::{ArrayType, DataType, Dimension, Placeholder, Shape, TypedProgram};
 
     use crate::experimental::lowering::tests::{XlaProgramBuilder, unproject_plain_program};
     use crate::experimental::ops::XlaArrayConstant;

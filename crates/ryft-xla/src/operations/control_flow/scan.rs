@@ -23,7 +23,7 @@ use std::rc::Rc;
 
 use ryft_core::{
     ArrayIrType, ArrayType, ComparisonDirection, DataType, Dimension, EffectClasses, Operation, ProgramError,
-    RematerializationOptimizationBarrier, SCAN_OPERATION_NAME, ScanOperation, Shape,
+    RematerializationOptimizationBarrier, SCAN_OPERATION_NAME, ScanOperation, Shape, TypedProgram,
 };
 use ryft_mlir::dialects::stable_hlo;
 use ryft_mlir::{
@@ -642,8 +642,8 @@ mod tests {
         LogicalMesh, Memory, MeshAxis, MeshAxisType, Mul, MulOperation, NegOperation, OneLikeOperation, Placeholder,
         PrintOperation, ProgramBatchingOutputAxesPolicy, RandomAlgorithm, ReferenceNewOperation,
         ReferenceReadOperation, ReferenceType, RngBitGeneratorOperation, ScanOptions, ShardMap, ShardMapOperation,
-        Sharding, ShardingDimension, TracingContext, TransposedProgramCotangent, TypeError, WhileOperation,
-        ZeroOperation, scan,
+        Sharding, ShardingDimension, TracingContext, TransposedProgramCotangent, TypeError, TypedProgram,
+        WhileOperation, ZeroOperation, scan,
     };
     use ryft_mlir::Location;
     use ryft_pjrt::{BufferType, ExecutionDeviceInputs, ExecutionInput, Layout, Program as PjrtProgram};
@@ -2867,7 +2867,7 @@ mod tests {
             let program = builder
                 .build::<Vec<XlaConstant>, Vec<XlaConstant>>(outputs, vec![Placeholder], vec![Placeholder])
                 .unwrap();
-            let output_type = program.output_types().remove(0);
+            let output_type = program.output_types().into_owned().remove(0);
             let output_type = <&ArrayType>::try_from(&output_type).unwrap().clone();
             let module =
                 to_mlir_module_for_program(&program, &[], &[stacked_type.clone()], &[output_type], "main", None, None)
@@ -3724,7 +3724,12 @@ mod tests {
             let linearization = program.linearize_with_respect_to(&[1]).unwrap();
             let pullback = linearization.pullback().unwrap().into_program();
             let mut builder = ArrayIrXlaProgramBuilder::new();
-            let inputs = program.input_types().into_iter().map(|r#type| builder.add_input(r#type)).collect::<Vec<_>>();
+            let inputs = program
+                .input_types()
+                .into_owned()
+                .into_iter()
+                .map(|r#type| builder.add_input(r#type))
+                .collect::<Vec<_>>();
             let cotangent = builder.add_input(scalar_type.clone().into());
             let primal_outputs = builder.splice_program(linearization.primal(), &inputs).unwrap();
             let mut pullback_inputs = vec![cotangent];

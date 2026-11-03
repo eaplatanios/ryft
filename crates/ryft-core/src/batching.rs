@@ -99,7 +99,8 @@ use crate::parameters::{Parameter, ParameterError, Parameterized, ParameterizedF
 use crate::programs::{
     AttachedRegions, EmptyRegionDriver, Operation, OperationProjection, Program, ProgramError, Provenance,
     ProvenanceScope, ReferenceBoundary, ReferenceBoundaryError, ReferenceBoundaryPosition, ReferenceIdentity,
-    RegionDriver, RegionRef, Type, TypeError, TypeIdentityRenaming, Typed, Value, ValueDomainDispatch, ValueProjection,
+    RegionDriver, RegionRef, Type, TypeError, TypeIdentityRenaming, Typed, TypedProgram, Value, ValueDomainDispatch,
+    ValueProjection,
 };
 use crate::tracing::{Tracer, TracingContext};
 
@@ -545,7 +546,12 @@ impl<V: Value, O: Operation<Type = V::Type>> BoundaryPreservingBatchedProgram<V,
             let (builder, output_ids) = {
                 let context = TracingContext::<V, O>::new();
                 let builder = context.builder().clone();
-                let inputs = program.input_types().into_iter().map(|r#type| context.input(r#type)).collect::<Vec<_>>();
+                let inputs = program
+                    .input_types()
+                    .into_owned()
+                    .into_iter()
+                    .map(|r#type| context.input(r#type))
+                    .collect::<Vec<_>>();
                 let mut outputs = program.interpret_in_context(&context, inputs)?;
                 check_count!("output", outputs, output_axes.len() + widening_output_count, ProgramError);
 
@@ -2957,10 +2963,10 @@ mod tests {
         let packed_type =
             ArrayType::new(DataType::F64, Shape::new(vec![Dimension::Dynamic(batch), Dimension::Static(3)]));
         assert_eq!(
-            adapted_program.input_types(),
+            adapted_program.input_types().as_ref(),
             &[ArrayIrType::Dimension(extent_type), ArrayIrType::Array(packed_type.clone())],
         );
-        assert_eq!(adapted_program.output_types(), &[ArrayIrType::Array(packed_type)]);
+        assert_eq!(adapted_program.output_types().into_owned(), &[ArrayIrType::Array(packed_type)]);
         assert_eq!(adapted_program.output_ids(), &adapted_program.input_ids()[1..]);
         assert!(adapted_program.instructions().is_empty());
     }

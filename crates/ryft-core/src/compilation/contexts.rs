@@ -9,7 +9,7 @@ use crate::compilation::functions::{
 };
 use crate::contexts::{Domain, StagingContext};
 use crate::parameters::{Parameterized, ParameterizedFamily};
-use crate::programs::{ProgramError, Value};
+use crate::programs::{ProgramError, TypedProgram, Value};
 use crate::tracing::DomainTracingContext;
 
 /// [`CompilationDomain`]s are [`Domain`]s that support lowering, compiling, and executing staged programs.
@@ -36,10 +36,10 @@ pub trait CompilationDomain: Domain<Constant: CaptureConstant> + Clone {
     type DispatchKey: Clone + Eq + Hash;
 
     /// Backend-specific lowered program representation produced by [`Self::lower`].
-    type LoweredProgram;
+    type LoweredProgram: TypedProgram<Type = Self::Type>;
 
     /// Backend-specific compiled program representation produced by [`Self::compile`].
-    type CompiledProgram;
+    type CompiledProgram: TypedProgram<Type = Self::Type>;
 
     /// Backend-specific compilation options type. Meshes, sharding and layout overrides, donation declarations,
     /// compiler flags, etc., are all represented as part of this type.
@@ -63,27 +63,22 @@ pub trait CompilationDomain: Domain<Constant: CaptureConstant> + Clone {
         options: &Self::Options,
     ) -> Result<(Self::DispatchKey, Arc<[Self::Type]>), Self::Error>;
 
-    /// Lowers `staged` into the lowered program representation of this backend and returns it together with its
-    /// effective flat output types. Callers typically use [`StagedFunction::lower`](crate::StagedFunction::lower)
-    /// rather than calling this function directly. The lowered program must capture every option, compiler, target,
-    /// and topology property that affects compilation, because caching backends derive the identity of compiled
-    /// programs from the lowered program alone.
+    /// Lowers `staged` into the lowered program representation of this backend. Callers typically use
+    /// [`StagedFunction::lower`] rather than calling this function directly. The lowered program must capture every
+    /// option, compiler, target, and topology property that affects compilation, because caching backends derive the
+    /// identity of compiled programs from the lowered program alone.
     ///
     /// # Parameters
     ///
     ///   - `staged`: Owned staging artifact borrowed for lowering. Use [`StagedProgram::lifted_program`] to obtain the
     ///     source program with captures lifted into leading inputs.
-    fn lower(&self, staged: &StagedProgram<Self>) -> Result<(Self::LoweredProgram, Vec<Self::Type>), Self::Error>;
+    fn lower(&self, staged: &StagedProgram<Self>) -> Result<Self::LoweredProgram, Self::Error>;
 
-    /// Compiles a lowered program into an executable program of this backend and returns it together with its effective
-    /// flat output types. Callers use [`LoweredFunction::compile`](crate::LoweredFunction::compile) rather than calling
-    /// this function directly, which also checks that the returned output types refine the lowered ones. Caching
-    /// backends usually implement this function via
-    /// [`CompilationContext::compile`](crate::CompilationContext::compile).
-    fn compile(
-        &self,
-        program: &Self::LoweredProgram,
-    ) -> Result<(Arc<Self::CompiledProgram>, Vec<Self::Type>), Self::Error>;
+    /// Compiles a lowered program into an executable program of this backend. Callers use
+    /// [`LoweredFunction::compile`](crate::LoweredFunction::compile) rather than calling this function directly, which
+    /// also checks that the output types of the compiled program refine those of the lowered program. Caching backends
+    /// usually implement this function via [`CompilationContext::compile`](crate::CompilationContext::compile).
+    fn compile(&self, program: &Self::LoweredProgram) -> Result<Arc<Self::CompiledProgram>, Self::Error>;
 
     /// Executes a compiled program on flat runtime `inputs` and returns its flat outputs. Callers typically use
     /// [`ExecutableFunction::execute`] rather than calling this function directly. The backend retains any declaration

@@ -2048,7 +2048,7 @@ mod tests {
     use crate::programs::{
         AtomId, Concretizable, EffectClass, EffectClasses, Effects, InstructionId, Operation, ProgramBuilder,
         ProgramError, Provenance, ProvenanceScope, ReferenceError, ReferenceIdentity, ReferenceType, RegionInterface,
-        TypeError, Typed,
+        TypeError, Typed, TypedProgram,
     };
     use crate::tests::{TestArrayContext, TestArrayTracingContext, TestOrderedStateOperation, TestRegionOperation};
     use crate::tracing::TracingContext;

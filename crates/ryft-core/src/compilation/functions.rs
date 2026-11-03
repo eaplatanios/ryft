@@ -14,8 +14,8 @@ use crate::macros::{check_builders, check_count};
 use crate::operations::Constant;
 use crate::parameters::{Parameterized, ParameterizedFamily, Placeholder};
 use crate::programs::{
-    AttachedRegions, FlatProgram, ProgramError, ReferenceCompletion, Type, TypeError, TypeRefinements, Typed, Value,
-    validate_reference_boundary,
+    AttachedRegions, FlatProgram, ProgramError, ReferenceCompletion, Type, TypeError, TypeRefinements, Typed,
+    TypedProgram, Value, validate_reference_boundary,
 };
 use crate::specialization::{SpecializationCache, SpecializationCacheEntry};
 use crate::tracing::{DomainTracingContext, Tracer};
@@ -325,7 +325,8 @@ where
 
     /// Lowers this function into a [`LoweredFunction`] through `domain` (refer to [`CompilationDomain::lower`]).
     pub fn lower(&self, domain: &C) -> Result<LoweredFunction<C, Input, Output>, C::Error> {
-        let (lowered_program, output_types) = domain.lower(self.staged_program())?;
+        let lowered_program = domain.lower(self.staged_program())?;
+        let output_types = lowered_program.output_types().into_owned();
         Ok(LoweredFunction { program: Arc::new(lowered_program), staged: self.clone(), output_types })
     }
 
@@ -568,7 +569,8 @@ where
     /// Returns the error of `domain`, or a [`ProgramError`] if the compiled output types differ in count from the
     /// lowered output types of this function or do not refine them.
     pub fn compile(&self, domain: &C) -> Result<CompiledFunction<C, Input, Output>, C::Error> {
-        let (program, output_types) = domain.compile(self.lowered_program())?;
+        let program = domain.compile(self.lowered_program())?;
+        let output_types = program.output_types().into_owned();
         check_count!("output", output_types, self.output_types.len(), ProgramError);
         for (declared, actual) in self.output_types.iter().zip(&output_types) {
             if !declared.is_refined_by(actual) {
@@ -615,17 +617,13 @@ impl<C: CompilationDomain, Input: Parameterized<C::Type>, Output: Parameterized<
     /// an equivalent executable, such as one deserialized from a persistent cache or recompiled with profile guidance.
     ///
     /// This function does not check compatibility, so the caller must establish it first. `program` must accept the
-    /// same `[captures..., public inputs...]` inputs as the current program, and `output_types` must be its
-    /// effective flat output types, with one entry per leaf of the retained output structure. A backend that breaks
-    /// these invariants produces a function whose calls fail or return values of unexpected types. The existing
-    /// function and its clones are unaffected, because this creates new shared state.
-    ///
-    /// # Parameters
-    ///
-    ///   - `program`: Replacement backend executable.
-    ///   - `output_types`: Effective flat output types of `program`.
+    /// same `[captures..., public inputs...]` inputs as the current program, and its output types must have one entry
+    /// per leaf of the retained output structure. A backend that breaks these invariants produces a function whose
+    /// calls fail or return values of unexpected types. The existing function and its clones are unaffected, because
+    /// this creates new shared state.
     #[inline]
-    pub fn with_compiled_program(&self, program: Arc<C::CompiledProgram>, output_types: Vec<C::Type>) -> Self {
+    pub fn with_compiled_program(&self, program: Arc<C::CompiledProgram>) -> Self {
+        let output_types = program.output_types().into_owned();
         Self {
             state: Arc::new(ExecutableFunctionState {
                 program,
@@ -1764,20 +1762,13 @@ mod tests {
             Ok((input_types.clone(), input_types))
         }
 
-        fn lower(
-            &self,
-            staged: &StagedProgram<Self>,
-        ) -> Result<(Self::LoweredProgram, Vec<ArrayIrType>), ProgramError> {
-            Ok((staged.lifted_program()?.as_ref().clone(), staged.output_types().to_vec()))
+        fn lower(&self, staged: &StagedProgram<Self>) -> Result<Self::LoweredProgram, ProgramError> {
+            Ok(staged.lifted_program()?.as_ref().clone())
         }
 
-        fn compile(
-            &self,
-            program: &Self::LoweredProgram,
-        ) -> Result<(Arc<Self::CompiledProgram>, Vec<ArrayIrType>), ProgramError> {
+        fn compile(&self, program: &Self::LoweredProgram) -> Result<Arc<Self::CompiledProgram>, ProgramError> {
             self.compilations.fetch_add(1, Ordering::Relaxed);
-            let output_types = program.output_types();
-            Ok((Arc::new(program.clone()), output_types))
+            Ok(Arc::new(program.clone()))
         }
 
         fn execute(
@@ -1859,8 +1850,8 @@ mod tests {
 
     impl CompilationDomain for TestCallDomain {
         type DispatchKey = Arc<[ArrayType]>;
-        type LoweredProgram = ();
-        type CompiledProgram = ();
+        type LoweredProgram = FlatProgram<Self>;
+        type CompiledProgram = FlatProgram<Self>;
         type Options = ();
         type Error = ProgramError;
 
@@ -1873,15 +1864,15 @@ mod tests {
             Ok((input_types.clone(), input_types))
         }
 
-        fn lower(&self, _staged: &StagedProgram<Self>) -> Result<((), Vec<ArrayType>), ProgramError> {
+        fn lower(&self, _staged: &StagedProgram<Self>) -> Result<FlatProgram<Self>, ProgramError> {
             Err(ProgramError::UnsupportedOperation { message: "the test call domain does not lower programs".into() })
         }
 
-        fn compile(&self, _program: &()) -> Result<(Arc<()>, Vec<ArrayType>), ProgramError> {
+        fn compile(&self, _program: &FlatProgram<Self>) -> Result<Arc<FlatProgram<Self>>, ProgramError> {
             unreachable!("the test call domain never lowers programs")
         }
 
-        fn execute(&self, _program: &(), _inputs: Vec<Array>) -> Result<Vec<Array>, ProgramError> {
+        fn execute(&self, _program: &FlatProgram<Self>, _inputs: Vec<Array>) -> Result<Vec<Array>, ProgramError> {
             unreachable!("the test call domain never lowers programs")
         }
     }
@@ -1925,9 +1916,9 @@ mod tests {
         assert_eq!(staged.source_program().captures(), &[capture]);
         assert_eq!(staged.input_types(), &[input_type.clone()]);
         assert_eq!(staged.output_types(), &[input_type.clone(), input_type]);
-        let (lowered, output_types) = TestDomain::new().lower(&staged).unwrap();
+        let lowered = TestDomain::new().lower(&staged).unwrap();
         assert_eq!(lowered.capture_count, 1);
-        assert_eq!(output_types, staged.output_types());
+        assert_eq!(lowered.output_types(), staged.output_types());
         assert_eq!(
             lowered.program.to_string(),
             indoc! {"
@@ -2245,13 +2236,10 @@ mod tests {
         let domain = TestDomain::new();
         let identity = compile_from_one_call_site(&domain, false).into_executable();
         let negate = compile_from_one_call_site(&domain, true).into_executable();
-        let replaced = identity.with_compiled_program(
-            Arc::new(TestCompiledProgram {
-                program: negate.compiled_program().program.clone(),
-                output_types: negate.output_types().to_vec(),
-            }),
-            negate.output_types().to_vec(),
-        );
+        let replaced = identity.with_compiled_program(Arc::new(TestCompiledProgram {
+            program: negate.compiled_program().program.clone(),
+            output_types: negate.output_types().to_vec(),
+        }));
 
         // The replacement runs the new program with the retained signature, while the original function is unaffected.
         assert_eq!(replaced.input_types(), identity.input_types());

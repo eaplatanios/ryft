@@ -447,8 +447,8 @@ mod tests {
     use ryft_core::{
         ArrayIrOperation, ArrayOperation, Context, DimensionBounds, DimensionType, DimensionValue, DimensionVariable,
         Fill, LogicalMesh, Memory, MeshAxis, MeshAxisType, OneLikeOperation, OneOperation, Placeholder, ProgramBuilder,
-        Sharding, ShardingDimension, TiledLayout, TracingContext, Typed, ZeroLikeOperation, ZeroOperation, i1, i2, i4,
-        u1, u2, u4,
+        Sharding, ShardingDimension, TiledLayout, TracingContext, Typed, TypedProgram, ZeroLikeOperation,
+        ZeroOperation, i1, i2, i4, u1, u2, u4,
     };
     use ryft_mlir::dialects::builtin::attributes::DenseElementsAttribute;
     use ryft_mlir::{ElementsAttribute, Size as MlirSize};

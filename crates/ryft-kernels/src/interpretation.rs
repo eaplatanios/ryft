@@ -42,7 +42,7 @@ use ryft_core::{
     ArraySliceAxis, ArrayType, AttachedRegions, Context, DataType, DimensionValue, Domain, EagerContext,
     EagerInterpretationDriver, InterpretableOperation, InterpretationDriver, Operation, ProgramError, Provenance,
     ProvenanceScope, ProvenanceState, ReferenceAccessMode, ReferenceId, RegionDriver, RegionInterpreter, RegionRef,
-    TypeError, Typed, ValueResolution, Zero, validated_reference_access_descriptors,
+    TypeError, Typed, TypedProgram, ValueResolution, Zero, validated_reference_access_descriptors,
 };
 use thiserror::Error;
 

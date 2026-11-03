@@ -661,7 +661,7 @@ mod tests {
     use crate::operations::collectives::tests::eager_collective_context;
     use crate::parameters::Placeholder;
     use crate::partial::{PartialEvaluationContext, PartialEvaluationOutput, PartialEvaluationValue, PartialValue};
-    use crate::programs::{EmptyRegionDriver, ProgramBuilder, ReferenceType};
+    use crate::programs::{EmptyRegionDriver, ProgramBuilder, ReferenceType, TypedProgram};
     use crate::tracing::{DomainTracingContext, Tracer, TracingContext};
 
     use super::*;

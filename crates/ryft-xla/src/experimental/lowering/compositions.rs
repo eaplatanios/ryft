@@ -3,7 +3,7 @@ use std::collections::{HashMap, HashSet};
 use ryft_core::operations::attention::{DotProductAttentionBackwardOperation, DotProductAttentionOperation};
 use ryft_core::{
     ArrayIrType, ArrayType, DataType, Parameterized, ProgramError, RegionId, RegionRef,
-    RematerializationOptimizationBarrier, ScaledDotOperation, Typed,
+    RematerializationOptimizationBarrier, ScaledDotOperation, Typed, TypedProgram,
 };
 use ryft_mlir::dialects::func;
 use ryft_mlir::{

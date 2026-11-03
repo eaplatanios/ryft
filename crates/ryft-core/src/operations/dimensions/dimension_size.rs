@@ -382,7 +382,7 @@ mod tests {
     use crate::partial::{PartialEvaluationOutput, PartialValue};
     use crate::programs::{
         EffectClasses, EmptyRegionDriver, Operation, ProgramBuilder, RegionInterface, TypeIdentityRenaming,
-        ValueProjection,
+        TypedProgram, ValueProjection,
     };
     use crate::tracing::TracingContext;
 
@@ -627,7 +627,7 @@ mod tests {
             )
             .unwrap();
         assert!(imported.type_identity_signature().internal_identities().is_empty());
-        let output_types = imported.output_types();
+        let output_types = imported.output_types().into_owned();
         let [ArrayIrType::Dimension(first), ArrayIrType::Dimension(second)] = output_types.as_slice() else {
             panic!("expected two imported dimension output types");
         };

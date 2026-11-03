@@ -7,7 +7,7 @@ use ryft_core::{
     DimensionBounds, DimensionType, DimensionValue, DimensionVariable, Dot, DotDimensionNumbers, EagerContext,
     EffectClasses, MeshAxis, MeshAxisType, NegOperation, OneLike, Placeholder, Program, ProgramBuilder,
     ProvenanceScope, ReduceOperation, ReductionKind, ReshapeOperation, ReverseModeDifferentiate, Sin, TracedShardMap,
-    Transpose, ZeroLike, trace_shard_map,
+    Transpose, TypedProgram, ZeroLike, trace_shard_map,
 };
 use ryft_mlir::{Attribute, Operation as MlirOperation, Region, Size as MlirSize};
 use ryft_pjrt::{BufferType, ExecutionDeviceInputs, ExecutionInput, Program as PjrtProgram};

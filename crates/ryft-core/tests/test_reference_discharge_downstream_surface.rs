@@ -65,8 +65,8 @@ use ryft_core::{
     ReferenceViewOverlap, ReferenceWrite, ReferenceWriteOperation, RegionInterface, RegionRef, RegionSlot,
     ReshapeOperation, ReshardOperation, ResidualZeroProvider, SelectOperation, SubOperation, Trace, Tracer,
     TracingContext, TransposableOperation, TransposeOperation, TranspositionContext, TranspositionDriver, Type,
-    TypeError, Typed, Value, ValueDomainDispatch, ValueId, ValueProjection, Zero, ZeroLikeOperation, ZeroOperation,
-    batch, check_count, differentiate_at, impl_guardless_operation, infer_reference_view_type,
+    TypeError, Typed, TypedProgram, Value, ValueDomainDispatch, ValueId, ValueProjection, Zero, ZeroLikeOperation,
+    ZeroOperation, batch, check_count, differentiate_at, impl_guardless_operation, infer_reference_view_type,
 };
 
 /// Destination universe of the downstream programs: the eager context over the register family, which is what a

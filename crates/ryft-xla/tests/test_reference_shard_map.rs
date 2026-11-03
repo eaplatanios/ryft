@@ -5,7 +5,7 @@ use pretty_assertions::assert_eq;
 use ryft_core::{
     ArrayIrType, ArrayReference, ArrayType, BatchAxis, Context, DataType, Device, DeviceMesh, LogicalMesh, MeshAxis,
     MeshAxisType, Placeholder, ProgramBuilder, ReferenceAddUpdateOperation, ReferenceReadOperation, ReferenceType,
-    ShardMap, ShardMapOperation, Sharding, ShardingDimension, Value, batch,
+    ShardMap, ShardMapOperation, Sharding, ShardingDimension, TypedProgram, Value, batch,
 };
 use ryft_pjrt::{ClientOptions, CpuClientOptions, load_cpu_plugin};
 use ryft_xla::experimental::ops::{XlaConstant, XlaOperation};

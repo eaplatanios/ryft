@@ -18,7 +18,7 @@ use ryft_core::{
     ReferenceDischargeableOperation, RegionDataFlow, RegionId, RegionInterface, RegionLiveness, RegionRef, RegionSlot,
     RematerializationOptimizationBarrier, ShardMapOperation, StagedCallOperation, Tracer, TracingContext,
     TransposableOperation, TranspositionContext, TranspositionDriver, Type, TypeError, TypeIdentityRenaming,
-    TypeRefinements, Typed, Value, ValueProjection, ValueResolution, Zero,
+    TypeRefinements, Typed, TypedProgram, Value, ValueProjection, ValueResolution, Zero,
 };
 use ryft_mlir::dialects::func;
 use ryft_mlir::{
@@ -103,8 +103,8 @@ fn supports_structural_dedup_region<O: LowerableOperationFamily>(region: RegionR
 fn jit_call_program_key<O: LowerableOperationFamily>(program: &FlatXlaProgram<O>) -> Option<JitCallProgramKey> {
     supports_structural_dedup(program).then(|| JitCallProgramKey {
         rendered: program.to_string(),
-        input_types: program.input_types(),
-        output_types: program.output_types(),
+        input_types: program.input_types().into_owned(),
+        output_types: program.output_types().into_owned(),
     })
 }
 
@@ -116,8 +116,8 @@ fn jit_call_region_key<O: LowerableOperationFamily>(
         let program = region.to_program();
         JitCallProgramKey {
             rendered: program.to_string(),
-            input_types: program.input_types(),
-            output_types: program.output_types(),
+            input_types: program.input_types().into_owned(),
+            output_types: program.output_types().into_owned(),
         }
     })
 }
@@ -270,8 +270,8 @@ where
             continue;
         }
         let symbol = format!("jit_call_{}", map.order.len());
-        let input_types = program.input_types();
-        let output_types = program.output_types();
+        let input_types = program.input_types().into_owned();
+        let output_types = program.output_types().into_owned();
         map.functions.insert(key.clone(), JitCallFunction { symbol, program, input_types, output_types });
         map.order.push(key);
     }
@@ -1630,7 +1630,7 @@ mod tests {
         RematerializeOperation, ResidualCandidate, ResidualDecision, ResidualPolicy, ResidualPolicyReference,
         ResidualRejection, ScanOperation, Shape, Sharding, ShardingDimension, SinOperation, StagingContext,
         TagOperation, Tracer, TracingContext, TransposeOperation, TransposedProgram, TransposedProgramCotangent,
-        TranspositionDriver, TypeError, TypeIdentity, Typed, Value, ZeroLikeOperation, ZeroOperation,
+        TranspositionDriver, TypeError, TypeIdentity, Typed, TypedProgram, Value, ZeroLikeOperation, ZeroOperation,
     };
     use ryft_macros::Operation;
 
@@ -1743,7 +1743,7 @@ mod tests {
         assert_eq!(values.len(), program.input_count());
         let inputs = values
             .into_iter()
-            .zip(program.input_types())
+            .zip(program.input_types().into_owned())
             .map(|(values, r#type)| {
                 let ArrayIrType::Array(r#type) = r#type else {
                     panic!("expected an array input");
@@ -2961,7 +2961,7 @@ mod tests {
             .build::<Vec<XlaConstant>, Vec<XlaConstant>>(vec![output], vec![Placeholder; 2], vec![Placeholder])
             .unwrap();
 
-        let outputs = program.jvp().unwrap().output_types();
+        let outputs = program.jvp().unwrap().output_types().into_owned();
         assert_eq!(outputs.len(), 2);
         assert_eq!(outputs[1], outputs[0].tangent().unwrap());
     }
@@ -4673,7 +4673,12 @@ mod tests {
         let policy = ResidualPolicyReference::new(NothingSavable);
         let check_boundary = |callee: XlaProgram<Vec<XlaConstant>, Vec<XlaConstant>>, capture_count: usize| {
             let mut builder = ArrayIrXlaProgramBuilder::new();
-            let inputs = callee.input_types().into_iter().map(|r#type| builder.add_input(r#type)).collect::<Vec<_>>();
+            let inputs = callee
+                .input_types()
+                .into_owned()
+                .into_iter()
+                .map(|r#type| builder.add_input(r#type))
+                .collect::<Vec<_>>();
             let input_count = inputs.len();
             let callee = builder.import_program(callee);
             let outputs = builder

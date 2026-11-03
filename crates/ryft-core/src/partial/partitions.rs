@@ -15,7 +15,8 @@ use crate::partial::values::{
 };
 use crate::programs::{
     EffectClass, EffectsSummary, InstructionId, Operation, OperationFormatter, OperationPayloadProjection, Program,
-    ProgramError, ProgramRenderingMode, ReferenceAccessMode, ReferenceRoot, RegionRef, Type, Typed, Value, ValueId,
+    ProgramError, ProgramRenderingMode, ReferenceAccessMode, ReferenceRoot, RegionRef, Type, Typed, TypedProgram,
+    Value, ValueId,
 };
 use crate::tracing::TracingContext;
 
@@ -375,6 +376,7 @@ impl<V: Value, O: Operation<Type = V::Type>> PartitionedProgram<V, O> {
         let known_output_count = self.metadata.outputs.iter().filter(|output| output.is_known()).count();
         self.known_program
             .output_types()
+            .into_owned()
             .into_iter()
             .enumerate()
             .skip(known_output_count)

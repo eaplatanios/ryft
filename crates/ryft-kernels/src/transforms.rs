@@ -8,8 +8,8 @@ use std::collections::BTreeMap;
 use ryft_core::{
     Array, ArrayIrBatch, ArrayIrBatchingPolicy, ArrayIrOperation, ArrayIrType, ArrayIrValue, ArrayReferenceTransform,
     ArrayReferenceTransformIndex, Atom, BatchableOperation, BatchingContext, BatchingDriver, BatchingError, Context,
-    Dimension, DimensionBounds, DimensionType, Operation, Placeholder, ProgramBuilder, ProgramError, Typed, Value,
-    rewrite_reference_access_transforms, validated_reference_access_descriptors,
+    Dimension, DimensionBounds, DimensionType, Operation, Placeholder, ProgramBuilder, ProgramError, Typed,
+    TypedProgram, Value, rewrite_reference_access_transforms, validated_reference_access_descriptors,
 };
 use thiserror::Error;
 
@@ -87,6 +87,7 @@ impl<Extension: KernelExtension> KernelDefinition<Extension> {
                 .mapping()
                 .program()
                 .input_types()
+                .into_owned()
                 .into_iter()
                 .map(|r#type| builder.add_input(r#type))
                 .collect::<Vec<_>>();

@@ -943,12 +943,7 @@ impl<'c> XlaDomain<'c> {
         Out::Family: ParameterizedFamily<ArrayIrType> + ParameterizedFamily<XlaConstant>,
     {
         self.validate_xla_replacement(executable.function.compiled_program(), &program)?;
-        Ok(ExecutableXlaFunction {
-            function: executable.function.with_compiled_program(
-                program.clone(),
-                program.output_types().iter().cloned().map(Into::into).collect(),
-            ),
-        })
+        Ok(ExecutableXlaFunction { function: executable.function.with_compiled_program(program.clone()) })
     }
 
     /// Wraps a compiled function in an adaptive profile-guided dispatcher.
@@ -1789,8 +1784,8 @@ mod tests {
         ReferenceCompletionBackend, ReferenceError, ReferenceFreeze, ReferenceFreezeOperation, ReferenceNew,
         ReferenceNewOperation, ReferenceRead, ReferenceReadOperation, ReferenceType, Reshape, Reshard, ScanOperation,
         Select, Shape, ShardMap, ShardMapOperation, Sharding, ShardingDimension, Sin, Softmax, StagedFunction,
-        StopGradient, StopGradientOperation, Sub, Tanh, TopK, Trace, TransferToMemory, Typed, Value, ValueProjection,
-        WhileOperation, ZeroLike, differentiate_at,
+        StopGradient, StopGradientOperation, Sub, Tanh, TopK, Trace, TransferToMemory, Typed, TypedProgram, Value,
+        ValueProjection, WhileOperation, ZeroLike, differentiate_at,
     };
     use ryft_pjrt::{ClientOptions, CpuClientOptions, load_cpu_plugin};
 
@@ -3009,7 +3004,7 @@ mod tests {
         let (_, pullback) = domain.differentiate_at(input).vjp(|x| function.call(x)).unwrap();
         assert!(pullback.residuals().is_empty());
         let pullback = pullback.transposed_program(&[CotangentDestinationKind::Reference]).unwrap().into_program();
-        let [seed_type, buffer_type] = <[ArrayIrType; 2]>::try_from(pullback.input_types()).unwrap();
+        let [seed_type, buffer_type] = <[ArrayIrType; 2]>::try_from(pullback.input_types().into_owned()).unwrap();
         assert!(matches!(&buffer_type, ArrayIrType::Reference(_)));
         assert_eq!(
             pullback.to_string(),
@@ -3802,7 +3797,7 @@ mod tests {
         let logical_mesh = mesh.logical_mesh().clone();
         let domain = XlaSession::new(&client).domain();
         let program = nonlinear_reference_shard_map_program(&logical_mesh, false).jvp().unwrap();
-        let inputs = program.input_types();
+        let inputs = program.input_types().into_owned();
         let array_type = <&ReferenceType<ArrayType>>::try_from(&inputs[0]).unwrap().referent().clone();
         let compiled = compile_statefully::<_, Vec<ArrayIrType>, Vec<ArrayIrType>>(
             |inputs| program.interpret_in_context(inputs[0].context(), inputs.clone()).map_err(Into::into),
@@ -3850,7 +3845,7 @@ mod tests {
         let logical_mesh = mesh.logical_mesh().clone();
         let domain = XlaSession::new(&client).domain();
         let program = nonlinear_reference_shard_map_program(&logical_mesh, true);
-        let mut input_types = program.input_types();
+        let mut input_types = program.input_types().into_owned();
         let reference_type = <&ReferenceType<ArrayType>>::try_from(&input_types[0]).unwrap().referent().clone();
         let array_type = <&ArrayType>::try_from(&input_types[1]).unwrap().clone();
         input_types.extend(input_types.clone());

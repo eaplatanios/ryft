@@ -167,7 +167,7 @@ use crate::programs::regions::{
     AttachedRegions, EmptyRegionDriver, InputRegionProvenance, RegionDriver, RegionId, RegionRef, RegionReplayMappings,
     ReplayRegionDriver,
 };
-use crate::programs::types::{Type, Typed};
+use crate::programs::types::{Type, Typed, TypedProgram};
 use crate::programs::values::{Value, ValueId};
 use crate::tracing::TracingContext;
 
@@ -4026,8 +4026,7 @@ where
         V::Type: From<P::Referent> + From<ReferenceType<P::Referent>>,
         for<'t> &'t ReferenceType<P::Referent>: TryFrom<&'t V::Type>,
     {
-        let input_types = self.input_types();
-        let input_count = input_types.len();
+        let input_count = self.input_count();
         if capture_count > input_count {
             return Err(ProgramError::MalformedProgram(format!(
                 "reference discharge requests {capture_count} captures but the program has {input_count} inputs",
@@ -4045,6 +4044,10 @@ where
         if !entry.contains_references_in_closure() && !entry.defers_reference_discharge_in_closure() {
             return PartialReferenceDischargeResult::new(self, capture_count, output_count, Vec::new());
         }
+
+        // The replay below consumes the input types by value and then moves `self` into its attached regions, so it
+        // takes ownership of the types instead of borrowing them from `self`.
+        let input_types = self.input_types().into_owned();
 
         // The block scopes the destination context, the discharge context, and every value, because recovering the
         // traced program below requires unique ownership of the shared builder and therefore that every other handle

@@ -4,7 +4,7 @@ use ryft_core::{
     ArrayIrType, ArrayType, CONDITION_OPERATION_NAME, ConditionOperation, CustomCallOperation, DataType, Dimension,
     EffectClass, EffectClasses, GuardOperation, IotaOperation, MeshAxisType, OneOperation, Parameterized, ProgramError,
     RematerializationOptimizationBarrier, RngBitGeneratorOperation, SCAN_OPERATION_NAME, ScanOperation, Shape, Typed,
-    WHILE_OPERATION_NAME, WhileOperation, ZeroOperation,
+    TypedProgram, WHILE_OPERATION_NAME, WhileOperation, ZeroOperation,
 };
 use ryft_mlir::dialects::stable_hlo;
 use ryft_mlir::{
@@ -515,7 +515,7 @@ mod tests {
     use pretty_assertions::assert_eq;
     use ryft_core::{
         AddOperation, ArrayOperation, AtomId, CompareOperation, ComparisonDirection, ConditionOperation, Device,
-        DeviceMesh, LogicalMesh, MeshAxis, Placeholder, PrintOperation, ScanOperation, WhileOperation,
+        DeviceMesh, LogicalMesh, MeshAxis, Placeholder, PrintOperation, ScanOperation, TypedProgram, WhileOperation,
         ZeroLikeOperation,
     };
     use ryft_mlir::Location;
@@ -827,14 +827,14 @@ mod tests {
 
         let linearization = program.linearize().unwrap();
         let primal = linearization.primal();
-        let array_types = |types: Vec<ArrayIrType>| {
-            types.into_iter().map(|r#type| <&ArrayType>::try_from(&r#type).unwrap().clone()).collect::<Vec<_>>()
+        let array_types = |types: &[ArrayIrType]| {
+            types.iter().map(|r#type| <&ArrayType>::try_from(r#type).unwrap().clone()).collect::<Vec<_>>()
         };
         let primal_module = to_mlir_module_for_program(
             primal,
             &[],
-            &array_types(primal.input_types()),
-            &array_types(primal.output_types()),
+            &array_types(&primal.input_types()),
+            &array_types(&primal.output_types()),
             "main",
             None,
             None,
@@ -844,8 +844,8 @@ mod tests {
         let pullback_module = to_mlir_module_for_program(
             &pullback,
             &[],
-            &array_types(pullback.input_types()),
-            &array_types(pullback.output_types()),
+            &array_types(&pullback.input_types()),
+            &array_types(&pullback.output_types()),
             "main",
             None,
             None,

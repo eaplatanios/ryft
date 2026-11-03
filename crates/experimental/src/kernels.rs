@@ -1392,9 +1392,7 @@ mod cutile {
         let runtime_session = XlaSession::new(client);
         let runtime = runtime_session.domain();
         let restored = runtime.deserialize_program(&executable_bytes).unwrap().unwrap();
-        let executable = compiled
-            .executable()
-            .with_compiled_program(Arc::new(restored), compiled.executable().output_types().to_vec());
+        let executable = compiled.executable().with_compiled_program(Arc::new(restored));
         let mut arrays = case
             .input_types
             .iter()
@@ -2320,9 +2318,7 @@ mod triton {
         let session = XlaSession::new(client);
         let runtime = session.domain();
         let restored = runtime.deserialize_program(&bytes).unwrap().unwrap();
-        let executable = compiled
-            .executable()
-            .with_compiled_program(Arc::new(restored), compiled.executable().output_types().to_vec());
+        let executable = compiled.executable().with_compiled_program(Arc::new(restored));
         let inputs = case
             .input_types
             .iter()

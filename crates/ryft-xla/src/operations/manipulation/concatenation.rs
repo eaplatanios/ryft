@@ -222,7 +222,7 @@ mod tests {
         ArrayIrType, ArrayType, Concatenate, ConcatenateOperation, ConstantOperation, DataType, Device, DeviceMesh,
         Dimension, DimensionAddOperation, DimensionBounds, DimensionOperation, DimensionSizeOperation, DimensionType,
         DimensionValue, DimensionVariable, EffectClasses, LogicalMesh, MeshAxis, MeshAxisType, Placeholder, Shape,
-        Sharding, ShardingDimension, TypeError, Typed,
+        Sharding, ShardingDimension, TypeError, Typed, TypedProgram,
     };
     use ryft_pjrt::{
         BufferType, ClientOptions, CpuClientOptions, ExecutionDeviceInputs, ExecutionInput, Program as PjrtProgram,

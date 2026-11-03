@@ -669,7 +669,7 @@ mod tests {
     use crate::parameters::Placeholder;
     use crate::programs::{
         EmptyRegionDriver, ProgramBuilder, ProgramError, ReferenceType, RegionId, RegionSlot, TypeIdentityRenaming,
-        ValueDirectDispatch, ValueProjection,
+        TypedProgram, ValueDirectDispatch, ValueProjection,
     };
     use crate::tests::{TestArrayContext, TestRegionOperation};
     use crate::tracing::{NestedTracingContext, Tracer, TracingContext};
@@ -1112,7 +1112,7 @@ mod tests {
                 vec![Placeholder],
             )
             .unwrap();
-        let source_types = source.output_types();
+        let source_types = source.output_types().into_owned();
         let closed = ClosedProgram::new(source, vec![ArrayIrValue::Array(captured)]).unwrap();
         let lifted = closed.to_program_with_lifted_captures().unwrap();
         assert_eq!(lifted.output_types(), source_types);

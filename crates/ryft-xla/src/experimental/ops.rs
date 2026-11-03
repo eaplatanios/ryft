@@ -1003,7 +1003,8 @@ pub(crate) mod tests {
         ReferenceSource, ReferenceSwapOperation, ReferenceType, ReferenceWriteOperation,
         RematerializationOptimizationBarrier, RematerializeOperation, ResidualZeroProvider, ScanOperation, Shape,
         StagingContext, TagOperation, Tracer, TracingContext, TransferToMemoryOperation, TransposedProgramCotangent,
-        TypeError, TypeIdentityRenaming, Typed, Value, ValueProjection, ValueResolution, WhileOperation, ZeroOperation,
+        TypeError, TypeIdentityRenaming, Typed, TypedProgram, Value, ValueProjection, ValueResolution, WhileOperation,
+        ZeroOperation,
     };
 
     use crate::XlaArray;

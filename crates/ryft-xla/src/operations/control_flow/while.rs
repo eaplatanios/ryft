@@ -15,7 +15,7 @@
 
 use ryft_core::{
     ArrayIrType, ArrayType, ComparisonDirection, DataType, EffectClasses, Operation, ProgramError, ReductionKind,
-    RematerializationOptimizationBarrier, WhileOperation,
+    RematerializationOptimizationBarrier, TypedProgram, WhileOperation,
 };
 use ryft_mlir::dialects::{stable_hlo, tensor};
 use ryft_mlir::{Block, Operation as MlirOperation, Region, Type, Value as MlirValue, ValueRef};
@@ -506,7 +506,7 @@ mod tests {
     use ryft_core::{
         AddOperation, AssertOperation, CompareOperation, Dimension, DimensionBounds, DimensionSizeOperation,
         DimensionType, DimensionVariable, DynamicBroadcastOperation, MeshAxisType, NegOperation, OneLikeOperation,
-        Placeholder, PrintOperation, Shape, Sharding, ShardingDimension, SubOperation,
+        Placeholder, PrintOperation, Shape, Sharding, ShardingDimension, SubOperation, TypedProgram,
     };
 
     use crate::experimental::lowering::tests::{

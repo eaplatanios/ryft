@@ -321,7 +321,7 @@ mod tests {
     use pretty_assertions::assert_eq;
     use ryft_core::{
         ConstantOperation, DimensionBounds, DimensionOperation, DimensionType, DimensionValue, Placeholder,
-        SliceOperation,
+        SliceOperation, TypedProgram,
     };
     use ryft_mlir::{Operation as MlirOperation, Type, Value as MlirValue};
     use ryft_pjrt::{BufferType, ExecutionDeviceInputs, ExecutionInput, Program as PjrtProgram};
