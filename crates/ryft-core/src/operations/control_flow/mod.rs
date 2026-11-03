@@ -633,7 +633,7 @@ mod tests {
     use crate::programs::{
         Atom, AttachedRegions, InstructionId, Operation, Program, ProgramBuilder, ProgramError, ReferenceAnalysisError,
         ReferenceId, ReferenceRoot, ReferenceType, Region, RegionDriver, RegionId, RegionLiveness, RegionRef,
-        TypeError, Typed, Value, ValueDirectDispatch, ValueId,
+        TypeError, Typed, TypedProgram, Value, ValueDirectDispatch, ValueId,
     };
     use crate::tracing::TracingContext;
 

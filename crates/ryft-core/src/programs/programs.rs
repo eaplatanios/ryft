@@ -185,12 +185,6 @@ impl<V: Value, O: Operation<Type = V::Type>, Input: Parameterized<V>, Output: Pa
         self.entry_region_ref().atoms()
     }
 
-    /// Returns the number of input [`Atom`]s (i.e., arguments) of this [`Program`].
-    #[inline]
-    pub fn input_count(&self) -> usize {
-        self.entry_region_ref().input_ids().len()
-    }
-
     /// Returns the [`AtomId`]s of the [`Atom`]s that correspond to the inputs (i.e., arguments) of this [`Program`].
     #[inline]
     pub fn input_ids(&self) -> &[AtomId] {
@@ -211,12 +205,6 @@ impl<V: Value, O: Operation<Type = V::Type>, Input: Parameterized<V>, Output: Pa
         Input::Family: ParameterizedFamily<Atom<V>>,
     {
         Input::To::<Atom<V>>::from_parameters(self.input_structure.clone(), self.inputs().cloned())
-    }
-
-    /// Returns the number of output [`Atom`]s (i.e., return values) of this [`Program`].
-    #[inline]
-    pub fn output_count(&self) -> usize {
-        self.entry_region_ref().output_ids().len()
     }
 
     /// Returns the [`AtomId`]s of the [`Atom`]s that correspond to the outputs (i.e., return values)
@@ -1764,8 +1752,18 @@ impl<V: Value, O: Operation<Type = V::Type>, Input: Parameterized<V>, Output: Pa
     type Type = V::Type;
 
     #[inline]
+    fn input_count(&self) -> usize {
+        self.entry_region_ref().input_ids().len()
+    }
+
+    #[inline]
     fn input_types(&self) -> Cow<'_, [V::Type]> {
         Cow::Owned(self.entry_region_ref().input_types())
+    }
+
+    #[inline]
+    fn output_count(&self) -> usize {
+        self.entry_region_ref().output_ids().len()
     }
 
     #[inline]

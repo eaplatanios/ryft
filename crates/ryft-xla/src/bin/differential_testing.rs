@@ -21,8 +21,8 @@ use ryft_core::{
     DynamicSlice, DynamicSliceOperation, DynamicUpdateSlice, EagerContext, LogicalMesh, MeshAxis, MeshAxisType,
     ParallelAllGather, ParallelAllGatherOutputVariance, ParallelAllToAll, ParallelPermute, ParallelReduce,
     ParallelSumScatter, Placeholder, ProgramBuilder, ProgramError, ProjectedContext, Reduce, ReduceOperation,
-    ReductionKind, ScaledDot, Shape, Sharding, ShardingDimension, TypedProgram, Value, ValueProjection, ZeroLike,
-    block_scaled_dot, differentiate_at, shard_map,
+    ReductionKind, ScaledDotElements, Shape, Sharding, ShardingDimension, TypedProgram, Value, ValueProjection,
+    ZeroLike, block_scaled_dot, differentiate_at, shard_map,
 };
 use ryft_pjrt::protos::{CompilationOptions, ExecutableCompilationOptions, Precision};
 use ryft_pjrt::{BufferType, Client, ClientOptions, CpuClientOptions, Program, load_cpu_plugin};

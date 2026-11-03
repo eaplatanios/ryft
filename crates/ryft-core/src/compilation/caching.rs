@@ -1914,8 +1914,16 @@ mod tests {
     impl TypedProgram for TestLoweredProgram {
         type Type = ArrayType;
 
+        fn input_count(&self) -> usize {
+            0
+        }
+
         fn input_types(&self) -> Cow<'_, [ArrayType]> {
             Cow::Borrowed(&[])
+        }
+
+        fn output_count(&self) -> usize {
+            self.0.len()
         }
 
         fn output_types(&self) -> Cow<'_, [ArrayType]> {
@@ -1930,8 +1938,16 @@ mod tests {
     impl TypedProgram for TestCompiledProgram {
         type Type = ArrayType;
 
+        fn input_count(&self) -> usize {
+            0
+        }
+
         fn input_types(&self) -> Cow<'_, [ArrayType]> {
             Cow::Borrowed(&[])
+        }
+
+        fn output_count(&self) -> usize {
+            self.0
         }
 
         fn output_types(&self) -> Cow<'_, [ArrayType]> {

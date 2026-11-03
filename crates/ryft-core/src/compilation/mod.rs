@@ -225,6 +225,9 @@ mod tests {
         /// Lifted flat program that execution interprets.
         pub(super) program: FlatProgram<TestDomain>,
 
+        /// Compiled input types, including the lifted captures first.
+        pub(super) input_types: Vec<ArrayType>,
+
         /// Compiled output types.
         pub(super) output_types: Vec<ArrayType>,
     }
@@ -232,8 +235,16 @@ mod tests {
     impl TypedProgram for TestLoweredProgram {
         type Type = ArrayType;
 
+        fn input_count(&self) -> usize {
+            self.program.input_count()
+        }
+
         fn input_types(&self) -> Cow<'_, [ArrayType]> {
             self.program.input_types()
+        }
+
+        fn output_count(&self) -> usize {
+            self.output_types.len()
         }
 
         fn output_types(&self) -> Cow<'_, [ArrayType]> {
@@ -244,8 +255,16 @@ mod tests {
     impl TypedProgram for TestCompiledProgram {
         type Type = ArrayType;
 
+        fn input_count(&self) -> usize {
+            self.input_types.len()
+        }
+
         fn input_types(&self) -> Cow<'_, [ArrayType]> {
-            self.program.input_types()
+            Cow::Borrowed(&self.input_types)
+        }
+
+        fn output_count(&self) -> usize {
+            self.output_types.len()
         }
 
         fn output_types(&self) -> Cow<'_, [ArrayType]> {
@@ -264,6 +283,9 @@ mod tests {
 
         /// Whether compilation fails.
         pub(super) fail_compilation: bool,
+
+        /// Input types that compilation reports instead of the lowered input types, if any.
+        pub(super) compiled_input_types: Option<Vec<ArrayType>>,
 
         /// Output types that compilation reports instead of the lowered output types, if any.
         pub(super) compiled_output_types: Option<Vec<ArrayType>>,
@@ -389,9 +411,14 @@ mod tests {
             if program.options.fail_compilation {
                 return Err(ProgramError::InvalidArgument { message: "expected compilation failure".into() });
             }
+            let input_types = program
+                .options
+                .compiled_input_types
+                .clone()
+                .unwrap_or_else(|| program.program.input_types().into_owned());
             let output_types =
                 program.options.compiled_output_types.clone().unwrap_or_else(|| program.output_types.clone());
-            Ok(TestCompiledProgram { program: program.program.clone(), output_types })
+            Ok(TestCompiledProgram { program: program.program.clone(), input_types, output_types })
         }
     }
 

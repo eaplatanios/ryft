@@ -9,8 +9,8 @@ use ryft_core::{
     DynamicReshapeOperation, EffectClass, EffectClasses, ExternalReferenceBinding, GatherOperation, Instruction,
     LogicalMesh, Memory, OneLikeOperation, Operation, OperationPayloadProjection, Parameterized, ProgramError,
     Provenance, RematerializationOptimizationBarrier, ReshapeOperation, ReshardOperation, ScatterOperation, Shape,
-    ShardMap, ShardMapOperation, Sharding, ShardingDimension, ShardingError, Type as RyftType, TypeError, Typed, Value,
-    ZeroLikeOperation,
+    ShardMap, ShardMapOperation, Sharding, ShardingDimension, ShardingError, Type as RyftType, TypeError, Typed,
+    TypedProgram, Value, ZeroLikeOperation,
 };
 use ryft_mlir::dialects::{func, shardy, stable_hlo};
 use ryft_mlir::{

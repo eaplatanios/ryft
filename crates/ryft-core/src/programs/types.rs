@@ -791,9 +791,18 @@ pub trait TypedProgram {
     /// [`Type`] family of the inputs and outputs of this program.
     type Type: Type;
 
+    /// Returns the number of inputs of this program, which equals the length of [`Self::input_types`]. Implementations
+    /// answer it without constructing the input types, so that callers on hot paths (e.g., input count validation on
+    /// every call of a compiled function) never pay for them.
+    fn input_count(&self) -> usize;
+
     /// Returns the [`Type`]s of the inputs of this program, in order. Like the type accessor of [`Typed`], this
     /// function returns a [`Cow`] so that implementors can lend out stored types by borrow or compute them on the fly.
     fn input_types(&self) -> Cow<'_, [Self::Type]>;
+
+    /// Returns the number of outputs of this program, which equals the length of [`Self::output_types`].
+    /// Implementations answer it without constructing the output types.
+    fn output_count(&self) -> usize;
 
     /// Returns the [`Type`]s of the outputs of this program, in order. Like the type accessor of [`Typed`], this
     /// function returns a [`Cow`] so that implementors can lend out stored types by borrow or compute them on the fly.

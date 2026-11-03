@@ -3792,7 +3792,7 @@ mod tests {
     /// representable, so both reference and CPU-XLA backends are exact.
     #[test]
     fn test_eager_scaled_dot_parity_with_reference_backend() {
-        use ryft_core::{DotDimensionNumbers, ScaledDot};
+        use ryft_core::{DotDimensionNumbers, ScaledDotElements};
 
         let plugin = load_cpu_plugin().unwrap();
         let client = plugin

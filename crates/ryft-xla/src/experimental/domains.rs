@@ -2477,8 +2477,16 @@ impl TypedProgram for XlaLoweredProgram {
 
     // Core reads the public logical signature in the type universe of the domain, which excludes the hidden
     // final-state output suffix appended by reference discharge, like the inherent `output_types` function.
+    fn input_count(&self) -> usize {
+        self.input_types.len()
+    }
+
     fn input_types(&self) -> Cow<'_, [ArrayIrType]> {
         Cow::Owned(self.input_types.iter().cloned().map(Into::into).collect())
+    }
+
+    fn output_count(&self) -> usize {
+        self.output_count
     }
 
     fn output_types(&self) -> Cow<'_, [ArrayIrType]> {
@@ -3635,8 +3643,16 @@ impl TypedProgram for XlaCompiledProgram<'_> {
 
     // Core reads the public logical signature in the type universe of the domain, which excludes the hidden
     // final-state output suffix appended by reference discharge, like the inherent `output_types` function.
+    fn input_count(&self) -> usize {
+        self.input_types.len()
+    }
+
     fn input_types(&self) -> Cow<'_, [ArrayIrType]> {
         Cow::Owned(self.input_types.iter().cloned().map(Into::into).collect())
+    }
+
+    fn output_count(&self) -> usize {
+        self.output_count
     }
 
     fn output_types(&self) -> Cow<'_, [ArrayIrType]> {
