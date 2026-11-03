@@ -118,69 +118,97 @@ impl CompilationArtifactExchangePolicy {
     }
 }
 
-// TODO(eaplatanios): Review from here onwards.
-
 #[cfg(test)]
 mod tests {
+    use pretty_assertions::assert_eq;
+
     use super::*;
+
+    /// Exchange with fixed process coordinates that implements only the required functions, so tests observe the
+    /// default implementations of the optional ones.
+    struct TestExchange {
+        process_index: usize,
+        process_count: usize,
+    }
+
+    impl CompilationArtifactExchange for TestExchange {
+        fn process_index(&self) -> usize {
+            self.process_index
+        }
+
+        fn process_count(&self) -> usize {
+            self.process_count
+        }
+
+        fn publish(&self, _key: &[u8], _artifact: &[u8]) -> Result<(), CompilationArtifactExchangeError> {
+            Ok(())
+        }
+
+        fn receive(
+            &self,
+            _key: &[u8],
+            _timeout: Duration,
+        ) -> Result<Option<Vec<u8>>, CompilationArtifactExchangeError> {
+            Ok(None)
+        }
+    }
 
     #[test]
     fn test_compilation_artifact_exchange_error_display() {
-        assert_eq!(CompilationArtifactExchangeError::TimedOut.to_string(), "compilation artifact exchange timed out");
-        assert_eq!(
-            CompilationArtifactExchangeError::Incompatible { message: "launch identities differ".to_string() }
-                .to_string(),
-            "compilation artifact exchange is incompatible: launch identities differ",
-        );
-        assert_eq!(
-            CompilationArtifactExchangeError::Failed { message: "connection reset".to_string() }.to_string(),
-            "compilation artifact exchange failed: connection reset",
-        );
+        for (error, message) in [
+            (CompilationArtifactExchangeError::TimedOut, "compilation artifact exchange timed out"),
+            (
+                CompilationArtifactExchangeError::Incompatible { message: "launch identities differ".to_string() },
+                "compilation artifact exchange is incompatible: launch identities differ",
+            ),
+            (
+                CompilationArtifactExchangeError::Failed { message: "connection reset".to_string() },
+                "compilation artifact exchange failed: connection reset",
+            ),
+        ] {
+            let diagnostic: &dyn std::error::Error = &error;
+            assert_eq!(diagnostic.to_string(), message);
+            assert!(diagnostic.source().is_none());
+        }
     }
 
     #[test]
     fn test_compilation_artifact_exchange_validate_compatibility() {
-        struct TestExchange {
-            process_index: usize,
-            process_count: usize,
-        }
-
-        impl CompilationArtifactExchange for TestExchange {
-            fn process_index(&self) -> usize {
-                self.process_index
-            }
-
-            fn process_count(&self) -> usize {
-                self.process_count
-            }
-
-            fn publish(&self, _key: &[u8], _artifact: &[u8]) -> Result<(), CompilationArtifactExchangeError> {
-                Ok(())
-            }
-
-            fn receive(
-                &self,
-                _key: &[u8],
-                _timeout: Duration,
-            ) -> Result<Option<Vec<u8>>, CompilationArtifactExchangeError> {
-                Ok(None)
-            }
-        }
-
-        let timeout = Duration::from_secs(1);
-        assert_eq!(TestExchange { process_index: 1, process_count: 2 }.validate_compatibility(b"key", timeout), Ok(()));
+        // The default checks only the process coordinates, so it accepts any key and timeout.
         assert_eq!(
-            TestExchange { process_index: 0, process_count: 0 }.validate_compatibility(b"key", timeout),
+            TestExchange { process_index: 0, process_count: 1 }.validate_compatibility(b"", Duration::ZERO),
+            Ok(())
+        );
+        assert_eq!(
+            TestExchange { process_index: 1, process_count: 2 }.validate_compatibility(b"key", Duration::from_secs(1)),
+            Ok(()),
+        );
+
+        // An empty exchange reports its process count before the index that it cannot contain.
+        assert_eq!(
+            TestExchange { process_index: 0, process_count: 0 }.validate_compatibility(b"key", Duration::from_secs(1)),
             Err(CompilationArtifactExchangeError::Incompatible {
                 message: "exchange process count must be greater than zero".to_string(),
             }),
         );
         assert_eq!(
-            TestExchange { process_index: 2, process_count: 2 }.validate_compatibility(b"key", timeout),
+            TestExchange { process_index: 2, process_count: 2 }.validate_compatibility(b"key", Duration::from_secs(1)),
             Err(CompilationArtifactExchangeError::Incompatible {
                 message: "exchange process index is outside the configured process count".to_string(),
             }),
         );
+    }
+
+    #[test]
+    fn test_compilation_artifact_exchange_publish_failure() {
+        // Transports that cannot represent terminal failures keep the default, which accepts every notification.
+        let exchange = TestExchange { process_index: 0, process_count: 2 };
+        assert_eq!(exchange.publish_failure(b"key", "backend compilation failed"), Ok(()));
+    }
+
+    #[test]
+    fn test_compilation_artifact_exchange_policy_default() {
+        assert_eq!(CompilationArtifactExchangePolicy::default(), CompilationArtifactExchangePolicy::Disabled);
     }
 
     #[test]
