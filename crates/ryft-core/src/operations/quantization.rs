@@ -974,6 +974,102 @@ where
     }
 }
 
+/// Validates block dequantization's array types and returns normalized, distinct block axes before any operations
+/// execute or stage. Dynamic block ratios are checked by the array IR composition at runtime.
+fn validate_block_dequantize_inputs(
+    elements: &ArrayType,
+    scales: &ArrayType,
+    global_scale: Option<&ArrayType>,
+    block_axes: Axes,
+    data_type: DataType,
+) -> Result<Vec<usize>, ProgramError> {
+    if !data_type.is_floating_point() {
+        return Err(TypeError::invalid(format!(
+            "`{BLOCK_DEQUANTIZE_NAME}` output data type must be floating-point but got `{data_type}`",
+        ))
+        .into());
+    }
+
+    for (name, input_type) in [("elements", elements), ("scales", scales)] {
+        let data_type = input_type.data_type();
+        if !data_type.is_real() && data_type != DataType::Boolean {
+            return Err(TypeError::invalid(format!(
+                "`{BLOCK_DEQUANTIZE_NAME}` {name} must have a real numeric or Boolean element type \
+                 but got `{data_type}`",
+            ))
+            .into());
+        }
+    }
+
+    if let Some(global_scale) = global_scale
+        && (global_scale.rank() != 0
+            || !global_scale.data_type().is_floating_point()
+            || !global_scale.data_type().is_real())
+    {
+        return Err(TypeError::invalid(format!(
+            "`{BLOCK_DEQUANTIZE_NAME}` global scale must be a rank-0 real floating-point array \
+             but got `{global_scale}`",
+        ))
+        .into());
+    }
+
+    if elements.rank() != scales.rank() {
+        return Err(TypeError::invalid(format!("`{BLOCK_DEQUANTIZE_NAME}` inputs must have the same rank")).into());
+    }
+
+    let block_axes = block_axes.normalize(elements.rank())?;
+    for axis in 0..elements.rank() {
+        let element_dimension = elements.dimension(axis);
+        let scale_dimension = scales.dimension(axis);
+        if !block_axes.contains(&axis) {
+            if element_dimension != scale_dimension {
+                return Err(TypeError::invalid(format!(
+                    "`{BLOCK_DEQUANTIZE_NAME}` non-block dimension {axis} has element extent `{element_dimension}` \
+                     but scale extent `{scale_dimension}`",
+                ))
+                .into());
+            }
+            continue;
+        }
+
+        match (element_dimension.value(), scale_dimension.value()) {
+            (_, Some(0)) => {
+                return Err(TypeError::invalid(format!(
+                    "`{BLOCK_DEQUANTIZE_NAME}` block dimension {axis} has an empty scale but scale extents must \
+                     be positive",
+                ))
+                .into());
+            }
+            (Some(element_extent), Some(scale_extent)) if element_extent % scale_extent != 0 => {
+                return Err(TypeError::invalid(format!(
+                    "`{BLOCK_DEQUANTIZE_NAME}` element extent {element_extent} of block dimension {axis} is not \
+                     divisible by scale extent {scale_extent}",
+                ))
+                .into());
+            }
+            (Some(element_extent), Some(scale_extent)) if element_extent / scale_extent < 2 => {
+                return Err(TypeError::invalid(format!(
+                    "`{}` block dimension {} must have ratio at least 2 but got {}",
+                    BLOCK_DEQUANTIZE_NAME,
+                    axis,
+                    element_extent / scale_extent,
+                ))
+                .into());
+            }
+            _ if element_dimension == scale_dimension => {
+                return Err(TypeError::invalid(format!(
+                    "`{BLOCK_DEQUANTIZE_NAME}` block dimension {axis} must have ratio at least 2 \
+                     but both extents are `{element_dimension}`",
+                ))
+                .into());
+            }
+            _ => {}
+        }
+    }
+
+    Ok(block_axes)
+}
+
 /// Canonical operation name for [`ScaledDotOperation`].
 pub const SCALED_DOT_OPERATION_NAME: &str = "scaled_dot";
 
@@ -3128,94 +3224,6 @@ where
 }
 
 // TODO(eaplatanios): Review from here onwards.
-
-/// Validates block dequantization's array types and returns normalized, distinct block axes before any operations
-/// execute or stage. Dynamic block ratios are checked by the array IR composition at runtime.
-fn validate_block_dequantize_inputs(
-    elements: &ArrayType,
-    scales: &ArrayType,
-    global_scale: Option<&ArrayType>,
-    block_axes: Axes,
-    data_type: DataType,
-) -> Result<Vec<usize>, ProgramError> {
-    if !data_type.is_floating_point() {
-        return Err(TypeError::invalid(format!(
-            "`{BLOCK_DEQUANTIZE_NAME}` output data type must be floating-point but got `{data_type}`",
-        ))
-        .into());
-    }
-    for (name, input_type) in [("elements", elements), ("scales", scales)] {
-        let data_type = input_type.data_type();
-        if !data_type.is_real() && data_type != DataType::Boolean {
-            return Err(TypeError::invalid(format!(
-                "`{BLOCK_DEQUANTIZE_NAME}` {name} must have a real numeric or Boolean element type but \
-                 got `{data_type}`",
-            ))
-            .into());
-        }
-    }
-    if let Some(global_scale) = global_scale
-        && (global_scale.rank() != 0
-            || !global_scale.data_type().is_floating_point()
-            || !global_scale.data_type().is_real())
-    {
-        return Err(TypeError::invalid(format!(
-            "`{BLOCK_DEQUANTIZE_NAME}` global scale must be a rank-0 real floating-point array but \
-             got `{global_scale}`",
-        ))
-        .into());
-    }
-    if elements.rank() != scales.rank() {
-        return Err(TypeError::invalid(format!("`{BLOCK_DEQUANTIZE_NAME}` inputs must have the same rank")).into());
-    }
-    let block_axes = block_axes.normalize(elements.rank())?;
-    for axis in 0..elements.rank() {
-        let element_dimension = elements.dimension(axis);
-        let scale_dimension = scales.dimension(axis);
-        if !block_axes.contains(&axis) {
-            if element_dimension != scale_dimension {
-                return Err(TypeError::invalid(format!(
-                    "`{BLOCK_DEQUANTIZE_NAME}` non-block dimension {axis} has element extent `{element_dimension}` \
-                     but scale extent `{scale_dimension}`",
-                ))
-                .into());
-            }
-            continue;
-        }
-        match (element_dimension.value(), scale_dimension.value()) {
-            (_, Some(0)) => {
-                return Err(TypeError::invalid(format!(
-                    "`{BLOCK_DEQUANTIZE_NAME}` block dimension {axis} has an empty scale but scale extents must \
-                     be positive",
-                ))
-                .into());
-            }
-            (Some(element_extent), Some(scale_extent)) if element_extent % scale_extent != 0 => {
-                return Err(TypeError::invalid(format!(
-                    "`{BLOCK_DEQUANTIZE_NAME}` element extent {element_extent} of block dimension {axis} is not \
-                     divisible by scale extent {scale_extent}",
-                ))
-                .into());
-            }
-            (Some(element_extent), Some(scale_extent)) if element_extent / scale_extent < 2 => {
-                return Err(TypeError::invalid(format!(
-                    "`{BLOCK_DEQUANTIZE_NAME}` block dimension {axis} must have ratio at least 2 but got {}",
-                    element_extent / scale_extent,
-                ))
-                .into());
-            }
-            _ if element_dimension == scale_dimension => {
-                return Err(TypeError::invalid(format!(
-                    "`{BLOCK_DEQUANTIZE_NAME}` block dimension {axis} must have ratio at least 2 but both extents are \
-                     `{element_dimension}`",
-                ))
-                .into());
-            }
-            _ => {}
-        }
-    }
-    Ok(block_axes)
-}
 
 #[cfg(test)]
 mod tests {
