@@ -447,8 +447,6 @@ impl<C: CompilationCacheDomain> Drop for InFlightProducer<'_, C> {
     }
 }
 
-// TODO(eaplatanios): Review from here onwards.
-
 /// Artifact exchange that participates in one compilation, together with the persistent key that addresses the
 /// exchanged artifact.
 #[derive(Copy, Clone)]
@@ -478,10 +476,11 @@ const DEFAULT_CACHE_CAPACITY: usize = 8192;
 /// [`CompilationContext::with_event_capacity`] enables it.
 const DEFAULT_EVENT_CAPACITY: usize = 0;
 
-/// Process-local cache of compiled programs, generic over the [`CompilationCacheDomain`] backend.
-///
-/// Construct one [`CompilationContext`] per backend handle at program start and reuse it across compilations and any
-/// backend-specific helpers that look up entries in the cache.
+// TODO(eaplatanios): Review from here onwards.
+
+/// Process-local cache of compiled programs, generic over the [`CompilationCacheDomain`] backend. Construct one
+/// [`CompilationContext`] per backend handle at program start and reuse it across compilations and any backend-specific
+/// helpers that look up entries in the cache.
 ///
 /// The cache is keyed by the structural [`CompilationCacheDomain::CacheKey`] of the domain. Equality of keys, rather
 /// than equality of their hashes, guarantees that distinct programs never collide. On a hit, the cached program is
@@ -493,8 +492,8 @@ const DEFAULT_EVENT_CAPACITY: usize = 0;
 /// [`CompilationContext::with_capacity`] overrides.
 ///
 /// An optional [`DiskCache`] tier is attached via [`CompilationContext::with_disk_cache`] or
-/// [`CompilationContext::with_disk_cache_from_env`]. When present, the disk tier is consulted between the in-memory
-/// tier and backend compilation. The cache uses [`CompilationCacheDomain::serialize_program`] and
+/// [`CompilationContext::with_disk_cache_from_env`]. When present, the disk tier is consulted between the
+/// in-memory tier and backend compilation. The cache uses [`CompilationCacheDomain::serialize_program`] and
 /// [`CompilationCacheDomain::deserialize_program`] to persist and restore programs, and it records failures of either
 /// function and of the disk itself without failing the compilation. An optional [`CompilationArtifactExchange`] may
 /// provide a serialized program from the leader after local cache misses, according to the configured
@@ -533,21 +532,19 @@ const DEFAULT_EVENT_CAPACITY: usize = 0;
 /// # Example
 ///
 /// Backends own their context (e.g., one per XLA session), so users configure caching and artifact exchange when they
-/// construct a backend handle. The following function configures both for any caching domain. It bounds the
-/// in-memory tier, persists only compilations that take at least ten seconds in a disk cache capped at 10 GiB, and
-/// prefers artifacts that the exchange leader publishes while still allowing followers to compile locally after a
-/// miss. It also retains the most recent events for diagnostics.
+/// construct a backend handle. The following function configures both for any caching domain. It bounds the in-memory
+/// tier, persists only compilations that take at least ten seconds in a disk cache capped at 10 GiB, and prefers
+/// artifacts that the exchange leader publishes while still allowing followers to compile locally after a miss.
+/// It also retains the most recent events for diagnostics.
 ///
-/// ```
-/// use std::path::Path;
-/// use std::sync::Arc;
-/// use std::time::Duration;
-///
-/// use ryft_core::{
-///     CompilationArtifactExchange, CompilationArtifactExchangePolicy, CompilationCacheDomain, CompilationContext,
-///     DiskCache,
-/// };
-///
+/// ```rust
+/// # use std::path::Path;
+/// # use std::sync::Arc;
+/// # use std::time::Duration;
+/// # use ryft_core::{
+/// #     CompilationArtifactExchange, CompilationArtifactExchangePolicy, CompilationCacheDomain, CompilationContext,
+/// #     DiskCache,
+/// # };
 /// fn compilation_context<C: CompilationCacheDomain>(
 ///     directory: &Path,
 ///     exchange: Arc<dyn CompilationArtifactExchange>,
