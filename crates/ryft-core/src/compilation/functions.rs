@@ -1,3 +1,4 @@
+use std::borrow::Cow;
 use std::fmt::Debug;
 use std::hash::Hash;
 use std::marker::PhantomData;
@@ -326,8 +327,7 @@ where
     /// Lowers this function into a [`LoweredFunction`] through `domain` (refer to [`CompilationDomain::lower`]).
     pub fn lower(&self, domain: &C) -> Result<LoweredFunction<C, Input, Output>, C::Error> {
         let lowered_program = domain.lower(self.staged_program())?;
-        let output_types = lowered_program.output_types().into_owned();
-        Ok(LoweredFunction { program: Arc::new(lowered_program), staged: self.clone(), output_types })
+        Ok(LoweredFunction { program: Arc::new(lowered_program), staged: self.clone() })
     }
 
     /// Stages a call to this function into the active context recovered from `inputs`. For nullary functions use
@@ -525,9 +525,6 @@ pub struct LoweredFunction<
 
     /// Staged source and structured metadata retained across compilation.
     staged: StagedFunction<C, Input, Output>,
-
-    /// Effective flat output types after lowering-time rewrites.
-    output_types: Vec<C::Type>,
 }
 
 impl<C, Input, Output> LoweredFunction<C, Input, Output>
@@ -556,10 +553,10 @@ where
         self.staged.options()
     }
 
-    /// Returns the effective flat output types after lowering-time rewrites.
+    /// Returns the effective flat output types of the lowered program, which include lowering-time rewrites.
     #[inline]
-    pub fn output_types(&self) -> &[C::Type] {
-        &self.output_types
+    pub fn output_types(&self) -> Cow<'_, [C::Type]> {
+        self.program.output_types()
     }
 
     /// Compiles this function into a [`CompiledFunction`] through `domain` via [`CompilationDomain::compile`].
@@ -570,9 +567,10 @@ where
     /// lowered output types of this function or do not refine them.
     pub fn compile(&self, domain: &C) -> Result<CompiledFunction<C, Input, Output>, C::Error> {
         let program = domain.compile(self.lowered_program())?;
-        let output_types = program.output_types().into_owned();
-        check_count!("output", output_types, self.output_types.len(), ProgramError);
-        for (declared, actual) in self.output_types.iter().zip(&output_types) {
+        let declared_output_types = self.output_types();
+        let output_types = program.output_types();
+        check_count!("output", output_types, declared_output_types.len(), ProgramError);
+        for (declared, actual) in declared_output_types.iter().zip(output_types.iter()) {
             if !declared.is_refined_by(actual) {
                 return Err(ProgramError::InvalidArgument {
                     message: format!("output type {actual} does not refine declared type {declared}"),
@@ -580,7 +578,7 @@ where
                 .into());
             }
         }
-        Ok(CompiledFunction::from_parts(self.clone(), program, output_types))
+        Ok(CompiledFunction::from_parts(self.clone(), program))
     }
 }
 
@@ -594,13 +592,13 @@ where
 {
     #[inline]
     fn clone(&self) -> Self {
-        Self { program: self.program.clone(), staged: self.staged.clone(), output_types: self.output_types.clone() }
+        Self { program: self.program.clone(), staged: self.staged.clone() }
     }
 }
 
 /// Runtime-only handle for one compiled executable. This handle retains only the state required to validate and
-/// execute calls, namely the backend executable, concrete captures, flat signatures, and structured output shape.
-/// That call-level state is what still makes it a function rather than a program, even though it has shed every
+/// execute calls, namely the backend executable, concrete captures, flat public input types, and structured output
+/// shape. That call-level state is what still makes it a function rather than a program, even though it has shed every
 /// transformable artifact. It deliberately does not retain the staged or lowered programs, so it becomes [`Send`] and
 /// [`Sync`] automatically whenever those runtime fields are `Send + Sync`. In contrast, [`CompiledFunction`] remains
 /// transformable and may retain `Rc`-backed source programs.
@@ -623,13 +621,11 @@ impl<C: CompilationDomain, Input: Parameterized<C::Type>, Output: Parameterized<
     /// this creates new shared state.
     #[inline]
     pub fn with_compiled_program(&self, program: Arc<C::CompiledProgram>) -> Self {
-        let output_types = program.output_types().into_owned();
         Self {
             state: Arc::new(ExecutableFunctionState {
                 program,
                 captures: self.state.captures.clone(),
                 input_types: self.state.input_types.clone(),
-                output_types,
                 output_structure: self.state.output_structure.clone(),
                 input: PhantomData,
             }),
@@ -654,10 +650,10 @@ impl<C: CompilationDomain, Input: Parameterized<C::Type>, Output: Parameterized<
         &self.state.input_types
     }
 
-    /// Returns the effective flat output types produced by the executable.
+    /// Returns the effective flat output types of the compiled program.
     #[inline]
-    pub fn output_types(&self) -> &[C::Type] {
-        &self.state.output_types
+    pub fn output_types(&self) -> Cow<'_, [C::Type]> {
+        self.state.program.output_types()
     }
 
     /// Returns the output parameter structure used to reconstruct structured runtime values.
@@ -774,11 +770,10 @@ struct ExecutableFunctionState<C: CompilationDomain, Input: Parameterized<C::Typ
     /// Concrete runtime captures supplied before the public inputs on every call.
     captures: Vec<C::Value>,
 
-    /// Flat declared public input types, excluding hidden captures.
+    /// Flat declared public input types, excluding hidden captures. These differ from the input types of the compiled
+    /// program, which lead with the lifted captures, and they are kept here because calls validate their inputs
+    /// against them.
     input_types: Vec<C::Type>,
-
-    /// Effective flat output types produced by the executable.
-    output_types: Vec<C::Type>,
 
     /// Output parameter structure used to reconstruct structured runtime values.
     output_structure: Output::ParameterStructure,
@@ -811,17 +806,12 @@ where
     Output::Family: ParameterizedFamily<C::Constant>,
 {
     /// Assembles a [`CompiledFunction`] from the provided backend-validated parts.
-    fn from_parts(
-        lowered: LoweredFunction<C, Input, Output>,
-        program: Arc<C::CompiledProgram>,
-        output_types: Vec<C::Type>,
-    ) -> Self {
+    fn from_parts(lowered: LoweredFunction<C, Input, Output>, program: Arc<C::CompiledProgram>) -> Self {
         let executable_function = ExecutableFunction {
             state: Arc::new(ExecutableFunctionState {
                 program,
                 captures: lowered.staged.source_program().captures().to_vec(),
                 input_types: lowered.staged.input_types().to_vec(),
-                output_types,
                 output_structure: lowered.staged.output_structure().clone(),
                 input: PhantomData,
             }),
@@ -867,9 +857,9 @@ where
         self.staged().source_program()
     }
 
-    /// Returns the effective flat output types produced by the executable.
+    /// Returns the effective flat output types of the compiled program.
     #[inline]
-    pub fn output_types(&self) -> &[C::Type] {
+    pub fn output_types(&self) -> Cow<'_, [C::Type]> {
         self.executable.output_types()
     }
 }
@@ -2318,8 +2308,8 @@ mod tests {
         assert_eq!(compiled.executable().execute(&domain, ()).unwrap(), Array::scalar(7.0).unwrap());
         assert_eq!(compiled.source_program().captures(), &[Array::scalar(7.0).unwrap()]);
         assert!(compiled.staged().input_types().is_empty());
-        assert_eq!(compiled.lowered().output_types(), &[ArrayType::scalar(DataType::F64)]);
-        assert_eq!(compiled.output_types(), &[ArrayType::scalar(DataType::F64)]);
+        assert_eq!(compiled.lowered().output_types().as_ref(), &[ArrayType::scalar(DataType::F64)]);
+        assert_eq!(compiled.output_types().as_ref(), &[ArrayType::scalar(DataType::F64)]);
     }
 
     #[test]
@@ -2329,7 +2319,7 @@ mod tests {
         let executable = compile_capture_function(&domain).into_executable();
         assert_eq!(executable.captures(), &[Array::scalar(7.0).unwrap()]);
         assert!(executable.input_types().is_empty());
-        assert_eq!(executable.output_types(), &[ArrayType::scalar(DataType::F64)]);
+        assert_eq!(executable.output_types().as_ref(), &[ArrayType::scalar(DataType::F64)]);
         assert_eq!(executable.execute(&domain, ()).unwrap(), Array::scalar(7.0).unwrap());
     }
 

@@ -80,6 +80,7 @@
 //! custom-derivative rule references, and preserved references outside the experimental kernel boundary are rejected
 //! explicitly.
 
+use std::borrow::Cow;
 use std::fmt::Debug;
 use std::hash::Hash;
 use std::sync::{Arc, Mutex};
@@ -614,7 +615,7 @@ where
     /// Returns the public flat output types, excluding the hidden final-state output suffix that reference
     /// discharge appends for mutated external references.
     #[inline]
-    pub fn output_types(&self) -> &[ArrayIrType] {
+    pub fn output_types(&self) -> Cow<'_, [ArrayIrType]> {
         self.function.executable().output_types()
     }
 }
