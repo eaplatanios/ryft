@@ -1793,8 +1793,6 @@ impl DiskCache {
         Ok(Some(payload.to_vec()))
     }
 
-    // TODO(eaplatanios): Review from here onwards.
-
     /// Atomically writes `data` as the entry at `path` for `digest` and then evicts older entries when a size cap is
     /// configured. The entry is first written gzip-compressed to an exclusively created temporary file, synchronized,
     /// and then renamed over `path`, so that readers observe either the prior complete entry or the new complete entry.
@@ -1814,6 +1812,7 @@ impl DiskCache {
                     "persistent cache payload length does not fit in `u64`",
                 )
             })?;
+
             encoder.write_all(ENTRY_MAGIC)?;
             encoder.write_all(&ENTRY_FORMAT_VERSION.to_le_bytes())?;
             encoder.write_all(digest.as_bytes())?;
@@ -1822,11 +1821,13 @@ impl DiskCache {
             encoder.write_all(data)?;
             encoder.finish()?.sync_all()
         })();
+
         if let Err(error) = write_result.and_then(|()| fs::rename(&temporary_path, path)) {
             return Self::remove_temporary_entry(&temporary_path, error);
         }
-        // Evict only after the atomic rename succeeds. Count completed executable and auxiliary entries, leaving
-        // temporary files alone because another process may still be writing them.
+
+        // Evict only after the atomic rename succeeds. Count completed executable and auxiliary entries,
+        // leaving temporary files alone because another process may still be writing them.
         if let Some(max_bytes) = self.max_bytes {
             let mut total_bytes = 0u64;
             let mut candidates = Vec::new();
@@ -1842,9 +1843,11 @@ impl DiskCache {
                     candidates.push((entry_path, metadata.modified()?, metadata.len()));
                 }
             }
+
             if total_bytes <= max_bytes {
                 return Ok(());
             }
+
             // Evict by write time rather than read activity. This eviction pass keeps the just-published entry even
             // when it alone exceeds the cap.
             candidates.sort_by_key(|(_, modified, _)| *modified);
@@ -1853,16 +1856,20 @@ impl DiskCache {
                 if bytes_to_evict == 0 {
                     break;
                 }
+
                 match fs::remove_file(&entry_path) {
                     Ok(()) => {
                         bytes_to_evict = bytes_to_evict.saturating_sub(size);
                     }
-                    // Another cache instance may already have removed this candidate.
-                    Err(error) if error.kind() == std::io::ErrorKind::NotFound => continue,
+                    Err(error) if error.kind() == std::io::ErrorKind::NotFound => {
+                        // Another cache instance may already have removed this candidate.
+                        continue;
+                    }
                     Err(error) => return Err(error),
                 }
             }
         }
+
         Ok(())
     }
 
@@ -1910,6 +1917,7 @@ struct DiskCacheDigest {
 
 impl DiskCacheDigest {
     /// Hashes the canonical persistent key bytes provided by a compilation domain.
+    #[inline]
     fn from_key(key: &[u8]) -> Self {
         Self { bytes: Sha256::digest(key).into() }
     }
@@ -1921,10 +1929,13 @@ impl DiskCacheDigest {
     }
 
     /// Returns the lowercase hexadecimal encoding of this digest, which is suitable for filenames.
+    #[inline]
     fn to_hex(&self) -> String {
         self.bytes.iter().map(|byte| format!("{byte:02x}")).collect()
     }
 }
+
+// TODO(eaplatanios): Review from here onwards.
 
 #[cfg(test)]
 mod tests {
