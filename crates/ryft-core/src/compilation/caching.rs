@@ -582,10 +582,7 @@ const DEFAULT_EVENT_CAPACITY: usize = 0;
 /// ) -> std::io::Result<CompilationContext<'o, C>> {
 ///     let disk_cache = DiskCache::with_max_bytes(directory, 10 << 30)?
 ///         .with_write_thresholds(Duration::from_secs(10), 0);
-///     let policy = CompilationArtifactExchangePolicy::PreferSharing {
-///         timeout: Duration::from_secs(60),
-///         fallback_to_local_compile: true,
-///     };
+///     let policy = CompilationArtifactExchangePolicy::PreferSharing { timeout: Duration::from_secs(60) };
 ///     Ok(CompilationContext::with_capacity(1024)
 ///         .with_disk_cache(disk_cache)
 ///         .with_artifact_exchange(exchange, policy)
@@ -1938,8 +1935,6 @@ impl DiskCacheDigest {
     }
 }
 
-// TODO(eaplatanios): Review from here onwards.
-
 #[cfg(test)]
 mod tests {
     use std::borrow::Cow;
@@ -3014,10 +3009,7 @@ mod tests {
         let state = Arc::new(TestExchangeState::default());
         let leader_context = CompilationContext::<TestDomain>::new().with_event_capacity(16).with_artifact_exchange(
             Arc::new(TestExchange::new(0, Arc::clone(&state))),
-            CompilationArtifactExchangePolicy::PreferSharing {
-                timeout: Duration::from_secs(30),
-                fallback_to_local_compile: true,
-            },
+            CompilationArtifactExchangePolicy::PreferSharing { timeout: Duration::from_secs(30) },
         );
         let domain = TestDomain { persistent: true, serialization_fails: true, ..TestDomain::default() };
 
@@ -3110,10 +3102,7 @@ mod tests {
             .with_event_capacity(8)
             .with_artifact_exchange(
                 Arc::new(TestExchange::new(0, state)),
-                CompilationArtifactExchangePolicy::PreferSharing {
-                    timeout: Duration::from_secs(1),
-                    fallback_to_local_compile: true,
-                },
+                CompilationArtifactExchangePolicy::PreferSharing { timeout: Duration::from_secs(1) },
             );
         let domain = TestDomain { persistent: true, serialization_unsupported: true, ..TestDomain::default() };
 
@@ -3155,10 +3144,7 @@ mod tests {
         state.receive_fails.store(true, Ordering::Relaxed);
         let context = CompilationContext::<TestDomain>::new().with_event_capacity(16).with_artifact_exchange(
             Arc::new(TestExchange::new(1, state)),
-            CompilationArtifactExchangePolicy::PreferSharing {
-                timeout: Duration::from_millis(10),
-                fallback_to_local_compile: true,
-            },
+            CompilationArtifactExchangePolicy::PreferSharing { timeout: Duration::from_millis(10) },
         );
 
         let program =
@@ -3197,10 +3183,7 @@ mod tests {
         state.receive_incompatible.store(true, Ordering::Relaxed);
         let context = CompilationContext::<TestDomain>::new().with_event_capacity(8).with_artifact_exchange(
             Arc::new(TestExchange::new(1, state)),
-            CompilationArtifactExchangePolicy::PreferSharing {
-                timeout: Duration::from_secs(1),
-                fallback_to_local_compile: true,
-            },
+            CompilationArtifactExchangePolicy::PreferSharing { timeout: Duration::from_secs(1) },
         );
         assert_eq!(
             compile_with(&context, &TestDomain::persistent(), 1, move || Ok(TestCompiledProgram(3))).unwrap().0,
@@ -3231,10 +3214,7 @@ mod tests {
         state.artifacts.lock().unwrap().insert(vec![1], Ok(5usize.to_le_bytes().to_vec()));
         let context = CompilationContext::<TestDomain>::new().with_event_capacity(8).with_artifact_exchange(
             Arc::new(TestExchange::new(1, state)),
-            CompilationArtifactExchangePolicy::PreferSharing {
-                timeout: Duration::from_secs(1),
-                fallback_to_local_compile: true,
-            },
+            CompilationArtifactExchangePolicy::PreferSharing { timeout: Duration::from_secs(1) },
         );
         let domain = TestDomain { persistent: true, deserialization_incompatible: true, ..TestDomain::default() };
         assert_eq!(compile_with(&context, &domain, 1, move || Ok(TestCompiledProgram(7))).unwrap().0, 7);
@@ -3302,10 +3282,7 @@ mod tests {
         state.artifacts.lock().unwrap().insert(vec![1], Ok(vec![0]));
         let context = CompilationContext::<TestDomain>::new().with_artifact_exchange(
             Arc::new(TestExchange::new(1, state)),
-            CompilationArtifactExchangePolicy::PreferSharing {
-                timeout: Duration::from_secs(1),
-                fallback_to_local_compile: true,
-            },
+            CompilationArtifactExchangePolicy::PreferSharing { timeout: Duration::from_secs(1) },
         );
         assert_eq!(
             compile_with(&context, &TestDomain::persistent(), 1, move || Ok(TestCompiledProgram(3))).unwrap().0,
@@ -3322,10 +3299,7 @@ mod tests {
         state.publish_fails.store(true, Ordering::Relaxed);
         let context = CompilationContext::<TestDomain>::new().with_event_capacity(8).with_artifact_exchange(
             Arc::new(TestExchange::new(0, state)),
-            CompilationArtifactExchangePolicy::PreferSharing {
-                timeout: Duration::from_secs(1),
-                fallback_to_local_compile: true,
-            },
+            CompilationArtifactExchangePolicy::PreferSharing { timeout: Duration::from_secs(1) },
         );
         assert_eq!(
             compile_with(&context, &TestDomain::persistent(), 1, move || Ok(TestCompiledProgram(3))).unwrap().0,
@@ -3411,10 +3385,7 @@ mod tests {
             Some(CompilationArtifactExchangeError::Failed { message: "expected coordination failure".to_string() });
         let context = CompilationContext::<TestDomain>::new().with_event_capacity(8).with_artifact_exchange(
             Arc::new(TestExchange::new(0, state)),
-            CompilationArtifactExchangePolicy::PreferSharing {
-                timeout: Duration::from_secs(1),
-                fallback_to_local_compile: true,
-            },
+            CompilationArtifactExchangePolicy::PreferSharing { timeout: Duration::from_secs(1) },
         );
 
         assert_eq!(
@@ -3444,10 +3415,7 @@ mod tests {
         *state.compatibility_error.lock().unwrap() = Some(CompilationArtifactExchangeError::TimedOut);
         let context = CompilationContext::<TestDomain>::new().with_event_capacity(8).with_artifact_exchange(
             Arc::new(TestExchange::new(0, state)),
-            CompilationArtifactExchangePolicy::PreferSharing {
-                timeout: Duration::from_secs(1),
-                fallback_to_local_compile: true,
-            },
+            CompilationArtifactExchangePolicy::PreferSharing { timeout: Duration::from_secs(1) },
         );
         assert_eq!(
             compile_with(&context, &TestDomain::persistent(), 1, move || Ok(TestCompiledProgram(3))).unwrap().0,
@@ -3553,10 +3521,7 @@ mod tests {
     fn test_compilation_context_with_artifact_exchange_timeout_fallback() {
         let context = CompilationContext::<TestDomain>::new().with_event_capacity(16).with_artifact_exchange(
             Arc::new(TestExchange::new(1, Arc::new(TestExchangeState::default()))),
-            CompilationArtifactExchangePolicy::PreferSharing {
-                timeout: Duration::from_millis(1),
-                fallback_to_local_compile: true,
-            },
+            CompilationArtifactExchangePolicy::PreferSharing { timeout: Duration::from_millis(1) },
         );
 
         let program =
@@ -3891,10 +3856,8 @@ mod tests {
         let lowered = TestLoweredProgram(vec![ArrayType::scalar(DataType::F32)]);
 
         // A rejected received artifact is an incompatible miss, so a follower that may fall back compiles locally.
-        let context = follower_context(CompilationArtifactExchangePolicy::PreferSharing {
-            timeout: Duration::from_secs(1),
-            fallback_to_local_compile: true,
-        });
+        let context =
+            follower_context(CompilationArtifactExchangePolicy::PreferSharing { timeout: Duration::from_secs(1) });
         assert_eq!(context.compile(&TestDomain::persistent(), &lowered).unwrap().as_ref(), &TestCompiledProgram(1));
         assert_eq!(context.statistics().exchange_hits, 0);
         assert_eq!(context.statistics().exchange_errors, 0);

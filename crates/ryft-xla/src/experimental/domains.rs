@@ -13879,10 +13879,8 @@ mod tests {
         // The received executable loads cleanly and reports matching boundary types, so only the validation against
         // the requesting lowering catches the foreign invocation contract. The executable is then an incompatible
         // miss, so a follower that may fall back compiles its own executable.
-        let fallback_consumer = consumer(CompilationArtifactExchangePolicy::PreferSharing {
-            timeout: Duration::from_secs(5),
-            fallback_to_local_compile: true,
-        });
+        let fallback_consumer =
+            consumer(CompilationArtifactExchangePolicy::PreferSharing { timeout: Duration::from_secs(5) });
         let lowered = staged.lower(&fallback_consumer).unwrap();
         let compiled = lowered.compile(&fallback_consumer).unwrap();
         assert!(

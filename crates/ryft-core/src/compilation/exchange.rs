@@ -83,16 +83,15 @@ pub enum CompilationArtifactExchangePolicy {
     #[default]
     Disabled,
 
-    /// Prefer an exchanged artifact and optionally compile locally when the exchange is unavailable or fails.
+    /// Prefer an exchanged artifact and allow local compilation when the exchange is unavailable or fails.
+    /// Leaders may keep their compiled programs when serialization or publication fails.
     PreferSharing {
         /// Maximum time that followers wait for the leader.
         timeout: Duration,
-
-        /// Whether a follower may compile locally after an exchange miss or failure.
-        fallback_to_local_compile: bool,
     },
 
-    /// Require a compatible exchanged artifact and fail instead of compiling on follower processes.
+    /// Require a compatible exchanged artifact on followers and fail on exchange errors, including serialization
+    /// or publication failures on the leader.
     RequireSharing {
         /// Maximum time that followers wait for the leader.
         timeout: Duration,
@@ -105,7 +104,7 @@ impl CompilationArtifactExchangePolicy {
     pub fn timeout(self) -> Option<Duration> {
         match self {
             Self::Disabled => None,
-            Self::PreferSharing { timeout, .. } | Self::RequireSharing { timeout } => Some(timeout),
+            Self::PreferSharing { timeout } | Self::RequireSharing { timeout } => Some(timeout),
         }
     }
 
@@ -113,8 +112,7 @@ impl CompilationArtifactExchangePolicy {
     #[inline]
     pub fn permits_local_fallback(self) -> bool {
         match self {
-            Self::Disabled => true,
-            Self::PreferSharing { fallback_to_local_compile, .. } => fallback_to_local_compile,
+            Self::Disabled | Self::PreferSharing { .. } => true,
             Self::RequireSharing { .. } => false,
         }
     }
@@ -189,10 +187,7 @@ mod tests {
     fn test_compilation_artifact_exchange_policy_timeout() {
         let timeout = Duration::from_millis(10);
         assert_eq!(CompilationArtifactExchangePolicy::Disabled.timeout(), None);
-        assert_eq!(
-            CompilationArtifactExchangePolicy::PreferSharing { timeout, fallback_to_local_compile: false }.timeout(),
-            Some(timeout),
-        );
+        assert_eq!(CompilationArtifactExchangePolicy::PreferSharing { timeout }.timeout(), Some(timeout));
         assert_eq!(CompilationArtifactExchangePolicy::RequireSharing { timeout }.timeout(), Some(timeout));
     }
 
@@ -200,14 +195,7 @@ mod tests {
     fn test_compilation_artifact_exchange_policy_permits_local_fallback() {
         let timeout = Duration::from_millis(10);
         assert!(CompilationArtifactExchangePolicy::Disabled.permits_local_fallback());
-        assert!(
-            CompilationArtifactExchangePolicy::PreferSharing { timeout, fallback_to_local_compile: true }
-                .permits_local_fallback()
-        );
-        assert!(
-            !CompilationArtifactExchangePolicy::PreferSharing { timeout, fallback_to_local_compile: false }
-                .permits_local_fallback()
-        );
+        assert!(CompilationArtifactExchangePolicy::PreferSharing { timeout }.permits_local_fallback());
         assert!(!CompilationArtifactExchangePolicy::RequireSharing { timeout }.permits_local_fallback());
     }
 }
