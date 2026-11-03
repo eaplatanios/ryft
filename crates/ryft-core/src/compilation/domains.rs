@@ -118,7 +118,7 @@ pub trait StatefulCompilationDomain: CompilationDomain {
 ///
 /// In-memory caching and coordination of concurrent compilations for the same key require only
 /// [`Self::compilation_key`]. Persistent caching and artifact exchange additionally use the optional
-/// stable [`Self::persistent_cache_key`] and serialization hooks (i.e., [`Self::serialize_program`] and
+/// [`Self::persistent_cache_key`] and serialization hooks (i.e., [`Self::serialize_program`] and
 /// [`Self::deserialize_program`]). Their availability may depend on the active runtime plugin or the
 /// particular compiled program, so implementing this trait does not guarantee serialization support.
 pub trait CompilationCacheDomain: CompilationDomain {
@@ -153,10 +153,11 @@ pub trait CompilationCacheDomain: CompilationDomain {
         Ok(())
     }
 
-    /// Returns stable canonical bytes for persistent compilation cache identity, or [`None`] when this domain does not
-    /// support persistent executable caching. These bytes must remain stable across processes that may share the cache
-    /// and must cover the complete computation, options, compiler and backend versions, and target topology. Core
-    /// hashes them only to obtain safe filenames and does not add any missing semantic state.
+    /// Returns canonical bytes identifying the compilation for persistent caching, or [`None`] when this domain does
+    /// not support persistent executable caching. For the same compilation, every process that may share a cache entry
+    /// must produce identical bytes. The key must cover the complete computation, options, compiler and backend
+    /// versions, and target topology. Core hashes these bytes only to obtain safe filenames and does not add any
+    /// missing semantic state.
     #[inline]
     fn persistent_cache_key(&self, key: &Self::CacheKey) -> Option<Vec<u8>> {
         let _ = key;

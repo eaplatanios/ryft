@@ -1064,7 +1064,7 @@ where
     /// `dimension<n>` input and an `f32[n]` input) must agree at runtime. Every call validates its inputs against the
     /// declared types before dispatching, and rejects a violation (including inputs whose structure differs from the
     /// declaration) rather than producing another specialization. The declared types are created once by the caller,
-    /// so their identities, and thus the dispatch keys, are stable across calls.
+    /// so their identities, and thus the dispatch keys, remain unchanged across calls.
     ///
     /// # Errors
     ///

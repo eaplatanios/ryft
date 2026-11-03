@@ -1838,16 +1838,18 @@ impl BlockScaledDotConfiguration {
 /// Differentiable block-scaled generalized dot product, built by [`block_scaled_dot`]. It quantizes its
 /// unquantized inputs with [`BlockQuantize`] and contracts them with [`ScaledDot`] in its primal, and its reverse
 /// mode rule implements a quantization-aware gradient policy, which is how models train with block-scaled formats
-/// such as NVFP4 and MXFP8. It is the analogue of `jax.nn.scaled_dot_general`, and its rules are retained, so create
-/// it once and call it many times.
+/// such as NVFP4 and MXFP8. It is the Ryft analogue of JAX's
+/// [`jax.nn.scaled_dot_general`](https://docs.jax.dev/en/latest/_autosummary/jax.nn.scaled_dot_general.html),
+/// and its rules are retained, so users only need to create it once and can then call it multiple times.
+#[allow(clippy::type_complexity)]
 pub struct BlockScaledDot<D: Domain<Type = ArrayType>>
 where
     DomainTracingContext<D>: StagingContext<Type = ArrayType, Constant = D::Constant, Operation = D::Operation>,
 {
-    /// Configuration that the rules of [`Self::function`] implement.
+    /// [`BlockScaledDotConfiguration`] that the rules of [`Self::function`] implement.
     configuration: BlockScaledDotConfiguration,
 
-    /// Composite that stages the block-scaled dot product call.
+    /// [`Composite`] that stages the block-scaled dot product call.
     function: Composite<
         D::Constant,
         D::Operation,

@@ -30,10 +30,10 @@ pub enum CompilationExchangeError {
 
 /// Exchanges serialized compiled programs between processes participating in one distributed run.
 ///
-/// Core treats keys and artifacts as opaque bytes. Backends remain responsible for producing a complete stable key,
-/// serializing every piece of invocation metadata, and rejecting artifacts that are incompatible with the local
-/// runtime. Process zero is the leader that compiles and publishes, and every other process is a follower that
-/// receives.
+/// Core treats keys and artifacts as opaque bytes. Backends must encode the complete compilation identity in keys,
+/// using identical bytes for matching compilations across processes. They must serialize every piece of invocation
+/// metadata and reject artifacts that are incompatible with the local runtime. Process zero is the leader that
+/// compiles and publishes, and every other process is a follower that receives.
 pub trait CompilationArtifactExchange: Send + Sync {
     /// Returns the zero-based index of this process.
     fn process_index(&self) -> usize;
