@@ -23,12 +23,12 @@ use crate::compilation::exchange::{
 use crate::compilation::functions::accumulate_duration;
 use crate::programs::ProgramError;
 
-/// Represents errors reported by [`CompilationEvent`]s. Each variant classifies a failure during cache access,
+/// Represents errors reported by [`CompilationStep`] outcomes. Each variant classifies a failure during cache access,
 /// artifact exchange, or backend compilation. Message payloads capture snapshots of the underlying errors' display
 /// text. Compilation APIs preserve the original error types when propagating failures to callers. Lookup misses and
 /// skipped operations use [`CompilationMissReason`] and [`CompilationSkipReason`] instead.
 #[derive(Clone, Debug, PartialEq, Eq, Error)]
-pub enum CompilationEventError {
+pub enum CompilationStepError {
     #[error("required compilation artifact operation is unsupported")]
     Unsupported,
 
@@ -57,8 +57,8 @@ pub enum CompilationEventError {
     CompilationFailed { message: String },
 }
 
-/// Storage tier consulted by a [`CompilationEventKind::CacheLookup`]. Distributed artifact exchange and backend
-/// compilation are separate operations represented by their own [`CompilationEventKind`] variants.
+/// Storage tier consulted by a [`CompilationStep::CacheLookup`]. Distributed artifact exchange and backend
+/// compilation are separate operations represented by their own [`CompilationStep`] variants.
 #[derive(Copy, Clone, Debug, PartialEq, Eq)]
 pub enum CompilationCacheTier {
     /// In-memory cache of compiled programs, local to the process.
@@ -102,7 +102,7 @@ pub enum CompilationLookupOutcome {
     Miss(CompilationMissReason),
 
     /// The lookup or deserialization failed.
-    Failed(CompilationEventError),
+    Failed(CompilationStepError),
 }
 
 /// Completion result of a backend compilation, persistent storage, or artifact exchange step.
@@ -113,18 +113,16 @@ pub enum CompilationStepOutcome {
     Succeeded,
 
     /// The step failed.
-    Failed(CompilationEventError),
+    Failed(CompilationStepError),
 
     /// The step was unsupported or below its configured write thresholds.
     Skipped(CompilationSkipReason),
 }
 
-// TODO(eaplatanios): Review from here onwards.
-
 /// Step reported by a [`CompilationEvent`], together with its lookup or completion result. A cache hit describes
 /// artifact reuse, while successful compilation or publication describes completed work.
 #[derive(Clone, Debug, PartialEq, Eq)]
-pub enum CompilationEventKind {
+pub enum CompilationStep {
     /// Looked up a program in a local cache.
     CacheLookup {
         /// Storage tier that was consulted.
@@ -165,7 +163,7 @@ pub enum CompilationEventKind {
     ExchangeFailureNotification {
         /// Original failure that prevents the leader from providing an artifact, including required serialization
         /// that the domain does not support.
-        cause: CompilationEventError,
+        cause: CompilationStepError,
 
         /// Completion result of delivering the failure notification.
         outcome: CompilationStepOutcome,
@@ -185,17 +183,19 @@ pub enum CompilationEventKind {
     },
 }
 
-/// Structured diagnostic event for one step of a [`CompilationContext`]. Contexts retain recent events
-/// when configured via [`CompilationContext::with_event_capacity`] and report every event to the hook installed via
-/// [`CompilationContext::with_event_reporter`].
+/// Structured diagnostic event for one [`CompilationStep`] of a [`CompilationContext`]. Contexts retain recent
+/// events when configured via [`CompilationContext::with_event_capacity`] and report every event to the hook
+/// installed via [`CompilationContext::with_event_reporter`].
 #[derive(Clone, Debug, PartialEq, Eq)]
 pub struct CompilationEvent {
     /// Step being reported and its result.
-    pub kind: CompilationEventKind,
+    pub step: CompilationStep,
 
     /// Host duration spent in this step.
     pub duration: Duration,
 }
+
+// TODO(eaplatanios): Review from here onwards.
 
 /// Snapshot of the activity of one [`CompilationContext`] across its cache lookups, artifact exchange, and backend
 /// compilation. The statistics accumulate from construction or from the latest
@@ -816,12 +816,12 @@ impl<C: CompilationCacheDomain> CompilationContext<C> {
                 let validation = program.map_or(Ok(()), |program| domain.validate_cached_program(program, &shared));
                 let outcome = match &validation {
                     Ok(()) => CompilationLookupOutcome::Hit,
-                    Err(error) => CompilationLookupOutcome::Failed(CompilationEventError::Incompatible {
+                    Err(error) => CompilationLookupOutcome::Failed(CompilationStepError::Incompatible {
                         message: error.to_string(),
                     }),
                 };
                 self.record_duration(
-                    CompilationEventKind::MemoryWait { outcome },
+                    CompilationStep::MemoryWait { outcome },
                     wait_start.elapsed(),
                     &self.statistics.memory_lookup_nanoseconds,
                 );
@@ -841,7 +841,7 @@ impl<C: CompilationCacheDomain> CompilationContext<C> {
 
             self.statistics.misses.fetch_add(1, Ordering::Relaxed);
             self.record_duration(
-                CompilationEventKind::CacheLookup {
+                CompilationStep::CacheLookup {
                     tier: CompilationCacheTier::Memory,
                     outcome: CompilationLookupOutcome::Miss(CompilationMissReason::NotFound),
                 },
@@ -871,11 +871,11 @@ impl<C: CompilationCacheDomain> CompilationContext<C> {
         let outcome = match &validation {
             Ok(()) => CompilationLookupOutcome::Hit,
             Err(error) => {
-                CompilationLookupOutcome::Failed(CompilationEventError::Incompatible { message: error.to_string() })
+                CompilationLookupOutcome::Failed(CompilationStepError::Incompatible { message: error.to_string() })
             }
         };
         self.record_duration(
-            CompilationEventKind::CacheLookup { tier: CompilationCacheTier::Memory, outcome },
+            CompilationStep::CacheLookup { tier: CompilationCacheTier::Memory, outcome },
             lookup_start.elapsed(),
             &self.statistics.memory_lookup_nanoseconds,
         );
@@ -924,7 +924,7 @@ impl<C: CompilationCacheDomain> CompilationContext<C> {
             (None, _) => None,
             (Some(_), None) => {
                 self.record_event(CompilationEvent {
-                    kind: CompilationEventKind::ExchangePreflight {
+                    step: CompilationStep::ExchangePreflight {
                         outcome: CompilationStepOutcome::Skipped(CompilationSkipReason::Unsupported),
                     },
                     duration: Duration::ZERO,
@@ -968,7 +968,7 @@ impl<C: CompilationCacheDomain> CompilationContext<C> {
         let preflight_start = Instant::now();
         let Err(error) = exchange.exchange.preflight(exchange.key, exchange.timeout) else {
             self.record_duration(
-                CompilationEventKind::ExchangePreflight { outcome: CompilationStepOutcome::Succeeded },
+                CompilationStep::ExchangePreflight { outcome: CompilationStepOutcome::Succeeded },
                 preflight_start.elapsed(),
                 &self.statistics.exchange_nanoseconds,
             );
@@ -976,17 +976,17 @@ impl<C: CompilationCacheDomain> CompilationContext<C> {
         };
         let message = error.to_string();
         let (counter, reason) = match &error {
-            CompilationExchangeError::TimedOut => (&self.statistics.exchange_timeouts, CompilationEventError::TimedOut),
+            CompilationExchangeError::TimedOut => (&self.statistics.exchange_timeouts, CompilationStepError::TimedOut),
             CompilationExchangeError::Incompatible { .. } => {
-                (&self.statistics.exchange_errors, CompilationEventError::Incompatible { message: message.clone() })
+                (&self.statistics.exchange_errors, CompilationStepError::Incompatible { message: message.clone() })
             }
             CompilationExchangeError::Failed { .. } => {
-                (&self.statistics.exchange_errors, CompilationEventError::ExchangeFailed { message: message.clone() })
+                (&self.statistics.exchange_errors, CompilationStepError::ExchangeFailed { message: message.clone() })
             }
         };
         self.record_exchange_fallback(
             counter,
-            CompilationEventKind::ExchangePreflight { outcome: CompilationStepOutcome::Failed(reason) },
+            CompilationStep::ExchangePreflight { outcome: CompilationStepOutcome::Failed(reason) },
             preflight_start,
             message.as_str(),
         )?;
@@ -1014,7 +1014,7 @@ impl<C: CompilationCacheDomain> CompilationContext<C> {
                 Ok(Some(restored)) => (CompilationLookupOutcome::Hit, Some((restored, bytes))),
                 Ok(None) => (CompilationLookupOutcome::Miss(CompilationMissReason::Incompatible), None),
                 Err(error) => (
-                    CompilationLookupOutcome::Failed(CompilationEventError::DeserializationFailed {
+                    CompilationLookupOutcome::Failed(CompilationStepError::DeserializationFailed {
                         message: error.to_string(),
                     }),
                     None,
@@ -1022,7 +1022,7 @@ impl<C: CompilationCacheDomain> CompilationContext<C> {
             },
             Ok(None) => (CompilationLookupOutcome::Miss(CompilationMissReason::NotFound), None),
             Err(error) => (
-                CompilationLookupOutcome::Failed(CompilationEventError::ReadFailed { message: error.to_string() }),
+                CompilationLookupOutcome::Failed(CompilationStepError::ReadFailed { message: error.to_string() }),
                 None,
             ),
         };
@@ -1036,7 +1036,7 @@ impl<C: CompilationCacheDomain> CompilationContext<C> {
             CompilationLookupOutcome::Miss(_) => {}
         }
         self.record_duration(
-            CompilationEventKind::CacheLookup { tier: CompilationCacheTier::Persistent, outcome },
+            CompilationStep::CacheLookup { tier: CompilationCacheTier::Persistent, outcome },
             lookup_start.elapsed(),
             &self.statistics.persistent_lookup_nanoseconds,
         );
@@ -1061,7 +1061,7 @@ impl<C: CompilationCacheDomain> CompilationContext<C> {
             Ok(None) | Err(CompilationExchangeError::TimedOut) => {
                 self.record_exchange_fallback(
                     &self.statistics.exchange_timeouts,
-                    CompilationEventKind::ExchangeReceive {
+                    CompilationStep::ExchangeReceive {
                         outcome: CompilationLookupOutcome::Miss(CompilationMissReason::TimedOut),
                     },
                     exchange_start,
@@ -1072,8 +1072,8 @@ impl<C: CompilationCacheDomain> CompilationContext<C> {
             Err(ref error @ CompilationExchangeError::Incompatible { ref message }) => {
                 self.record_exchange_fallback(
                     &self.statistics.exchange_errors,
-                    CompilationEventKind::ExchangeReceive {
-                        outcome: CompilationLookupOutcome::Failed(CompilationEventError::Incompatible {
+                    CompilationStep::ExchangeReceive {
+                        outcome: CompilationLookupOutcome::Failed(CompilationStepError::Incompatible {
                             message: error.to_string(),
                         }),
                     },
@@ -1085,8 +1085,8 @@ impl<C: CompilationCacheDomain> CompilationContext<C> {
             Err(ref error @ CompilationExchangeError::Failed { ref message }) => {
                 self.record_exchange_fallback(
                     &self.statistics.exchange_errors,
-                    CompilationEventKind::ExchangeReceive {
-                        outcome: CompilationLookupOutcome::Failed(CompilationEventError::ReadFailed {
+                    CompilationStep::ExchangeReceive {
+                        outcome: CompilationLookupOutcome::Failed(CompilationStepError::ReadFailed {
                             message: error.to_string(),
                         }),
                     },
@@ -1100,7 +1100,7 @@ impl<C: CompilationCacheDomain> CompilationContext<C> {
             Ok(Some(received)) => {
                 if let Some(Err(error)) = program.map(|program| domain.validate_cached_program(program, &received)) {
                     self.record_duration(
-                        CompilationEventKind::ExchangeReceive {
+                        CompilationStep::ExchangeReceive {
                             outcome: CompilationLookupOutcome::Miss(CompilationMissReason::Incompatible),
                         },
                         exchange_start.elapsed(),
@@ -1113,7 +1113,7 @@ impl<C: CompilationCacheDomain> CompilationContext<C> {
                 }
                 self.statistics.exchange_hits.fetch_add(1, Ordering::Relaxed);
                 self.record_duration(
-                    CompilationEventKind::ExchangeReceive { outcome: CompilationLookupOutcome::Hit },
+                    CompilationStep::ExchangeReceive { outcome: CompilationLookupOutcome::Hit },
                     exchange_start.elapsed(),
                     &self.statistics.exchange_nanoseconds,
                 );
@@ -1121,7 +1121,7 @@ impl<C: CompilationCacheDomain> CompilationContext<C> {
             }
             Ok(None) => {
                 self.record_duration(
-                    CompilationEventKind::ExchangeReceive {
+                    CompilationStep::ExchangeReceive {
                         outcome: CompilationLookupOutcome::Miss(CompilationMissReason::Incompatible),
                     },
                     exchange_start.elapsed(),
@@ -1135,8 +1135,8 @@ impl<C: CompilationCacheDomain> CompilationContext<C> {
                 // directly when the policy does not permit a fallback.
                 self.statistics.exchange_errors.fetch_add(1, Ordering::Relaxed);
                 self.record_duration(
-                    CompilationEventKind::ExchangeReceive {
-                        outcome: CompilationLookupOutcome::Failed(CompilationEventError::DeserializationFailed {
+                    CompilationStep::ExchangeReceive {
+                        outcome: CompilationLookupOutcome::Failed(CompilationStepError::DeserializationFailed {
                             message: error.to_string(),
                         }),
                     },
@@ -1162,7 +1162,7 @@ impl<C: CompilationCacheDomain> CompilationContext<C> {
             Ok(()) => {
                 self.statistics.exchange_publishes.fetch_add(1, Ordering::Relaxed);
                 self.record_event(CompilationEvent {
-                    kind: CompilationEventKind::ExchangePublish { outcome: CompilationStepOutcome::Succeeded },
+                    step: CompilationStep::ExchangePublish { outcome: CompilationStepOutcome::Succeeded },
                     duration: publish_start.elapsed(),
                 });
                 Ok(())
@@ -1170,8 +1170,8 @@ impl<C: CompilationCacheDomain> CompilationContext<C> {
             Err(error) => {
                 self.statistics.exchange_errors.fetch_add(1, Ordering::Relaxed);
                 self.record_event(CompilationEvent {
-                    kind: CompilationEventKind::ExchangePublish {
-                        outcome: CompilationStepOutcome::Failed(CompilationEventError::WriteFailed {
+                    step: CompilationStep::ExchangePublish {
+                        outcome: CompilationStepOutcome::Failed(CompilationStepError::WriteFailed {
                             message: error.to_string(),
                         }),
                     },
@@ -1186,17 +1186,17 @@ impl<C: CompilationCacheDomain> CompilationContext<C> {
     /// stop waiting for it instead of running into their deadline. `cause` classifies the failure in the recorded
     /// event, and `message` describes it to the followers. Failures to publish the failure itself are recorded but
     /// never replace the original failure.
-    fn publish_failure_to_exchange(&self, exchange: ActiveExchange<'_>, cause: CompilationEventError, message: &str) {
+    fn publish_failure_to_exchange(&self, exchange: ActiveExchange<'_>, cause: CompilationStepError, message: &str) {
         let publish_start = Instant::now();
         let outcome = match exchange.exchange.publish_failure(exchange.key, message) {
             Ok(()) => CompilationStepOutcome::Succeeded,
             Err(error) => {
                 self.statistics.exchange_errors.fetch_add(1, Ordering::Relaxed);
-                CompilationStepOutcome::Failed(CompilationEventError::WriteFailed { message: error.to_string() })
+                CompilationStepOutcome::Failed(CompilationStepError::WriteFailed { message: error.to_string() })
             }
         };
         self.record_event(CompilationEvent {
-            kind: CompilationEventKind::ExchangeFailureNotification { cause, outcome },
+            step: CompilationStep::ExchangeFailureNotification { cause, outcome },
             duration: publish_start.elapsed(),
         });
     }
@@ -1224,9 +1224,9 @@ impl<C: CompilationCacheDomain> CompilationContext<C> {
             Ok(program) => program,
             Err(error) => {
                 let message = error.to_string();
-                let cause = CompilationEventError::CompilationFailed { message: message.clone() };
+                let cause = CompilationStepError::CompilationFailed { message: message.clone() };
                 self.record_duration(
-                    CompilationEventKind::BackendCompilation { outcome: CompilationStepOutcome::Failed(cause.clone()) },
+                    CompilationStep::BackendCompilation { outcome: CompilationStepOutcome::Failed(cause.clone()) },
                     compilation_start.elapsed(),
                     &self.statistics.compilation_nanoseconds,
                 );
@@ -1238,7 +1238,7 @@ impl<C: CompilationCacheDomain> CompilationContext<C> {
         };
         let compilation_duration = compilation_start.elapsed();
         self.record_duration(
-            CompilationEventKind::BackendCompilation { outcome: CompilationStepOutcome::Succeeded },
+            CompilationStep::BackendCompilation { outcome: CompilationStepOutcome::Succeeded },
             compilation_duration,
             &self.statistics.compilation_nanoseconds,
         );
@@ -1247,7 +1247,7 @@ impl<C: CompilationCacheDomain> CompilationContext<C> {
         let persistent = match persistent.filter(|_| exchange.is_none_or(ActiveExchange::is_leader)) {
             Some((disk_cache, _)) if !disk_cache.should_serialize(compilation_duration) => {
                 self.record_event(CompilationEvent {
-                    kind: CompilationEventKind::PersistentStore {
+                    step: CompilationStep::PersistentStore {
                         outcome: CompilationStepOutcome::Skipped(CompilationSkipReason::BelowWriteThreshold),
                     },
                     duration: Duration::ZERO,
@@ -1271,14 +1271,14 @@ impl<C: CompilationCacheDomain> CompilationContext<C> {
                             Ok(()) => CompilationStepOutcome::Succeeded,
                             Err(error) => {
                                 self.statistics.persistent_errors.fetch_add(1, Ordering::Relaxed);
-                                CompilationStepOutcome::Failed(CompilationEventError::WriteFailed {
+                                CompilationStepOutcome::Failed(CompilationStepError::WriteFailed {
                                     message: error.to_string(),
                                 })
                             }
                         }
                     };
                     self.record_event(CompilationEvent {
-                        kind: CompilationEventKind::PersistentStore { outcome },
+                        step: CompilationStep::PersistentStore { outcome },
                         duration: serialization_start.elapsed(),
                     });
                 }
@@ -1290,7 +1290,7 @@ impl<C: CompilationCacheDomain> CompilationContext<C> {
                 let duration = serialization_start.elapsed();
                 if persistent.is_some() {
                     self.record_event(CompilationEvent {
-                        kind: CompilationEventKind::PersistentStore {
+                        step: CompilationStep::PersistentStore {
                             outcome: CompilationStepOutcome::Skipped(CompilationSkipReason::Unsupported),
                         },
                         duration,
@@ -1299,23 +1299,23 @@ impl<C: CompilationCacheDomain> CompilationContext<C> {
                 if let Some(exchange) = leader_exchange {
                     let message = "domain does not support compiled program serialization";
                     self.record_event(CompilationEvent {
-                        kind: CompilationEventKind::ExchangePublish {
+                        step: CompilationStep::ExchangePublish {
                             outcome: CompilationStepOutcome::Skipped(CompilationSkipReason::Unsupported),
                         },
                         duration,
                     });
-                    self.publish_failure_to_exchange(exchange, CompilationEventError::Unsupported, message);
+                    self.publish_failure_to_exchange(exchange, CompilationStepError::Unsupported, message);
                     self.require_exchange_or_record_fallback(message)?;
                 }
             }
             Err(error) => {
                 let duration = serialization_start.elapsed();
                 let message = error.to_string();
-                let cause = CompilationEventError::SerializationFailed { message: message.clone() };
+                let cause = CompilationStepError::SerializationFailed { message: message.clone() };
                 if persistent.is_some() {
                     self.statistics.persistent_errors.fetch_add(1, Ordering::Relaxed);
                     self.record_event(CompilationEvent {
-                        kind: CompilationEventKind::PersistentStore {
+                        step: CompilationStep::PersistentStore {
                             outcome: CompilationStepOutcome::Failed(cause.clone()),
                         },
                         duration,
@@ -1324,7 +1324,7 @@ impl<C: CompilationCacheDomain> CompilationContext<C> {
                 if let Some(exchange) = leader_exchange {
                     self.statistics.exchange_errors.fetch_add(1, Ordering::Relaxed);
                     self.record_event(CompilationEvent {
-                        kind: CompilationEventKind::ExchangePublish {
+                        step: CompilationStep::ExchangePublish {
                             outcome: CompilationStepOutcome::Failed(cause.clone()),
                         },
                         duration,
@@ -1346,18 +1346,18 @@ impl<C: CompilationCacheDomain> CompilationContext<C> {
     /// # Parameters
     ///
     ///   - `counter`: Statistics counter that classifies the miss (e.g., timeouts or errors).
-    ///   - `kind`: Exchange step and its lookup or completion result.
+    ///   - `step`: Exchange step and its lookup or completion result.
     ///   - `start`: Instant at which the exchange step started.
     ///   - `message`: Description of the miss used in the error returned when the policy requires sharing.
     fn record_exchange_fallback(
         &self,
         counter: &AtomicU64,
-        kind: CompilationEventKind,
+        step: CompilationStep,
         start: Instant,
         message: &str,
     ) -> Result<(), C::Error> {
         counter.fetch_add(1, Ordering::Relaxed);
-        self.record_duration(kind, start.elapsed(), &self.statistics.exchange_nanoseconds);
+        self.record_duration(step, start.elapsed(), &self.statistics.exchange_nanoseconds);
         self.require_exchange_or_record_fallback(message)
     }
 
@@ -1376,9 +1376,9 @@ impl<C: CompilationCacheDomain> CompilationContext<C> {
     }
 
     /// Accumulates `duration` into `duration_counter` and records one structured event for the step.
-    fn record_duration(&self, kind: CompilationEventKind, duration: Duration, duration_counter: &AtomicU64) {
+    fn record_duration(&self, step: CompilationStep, duration: Duration, duration_counter: &AtomicU64) {
         accumulate_duration(duration, duration_counter);
-        self.record_event(CompilationEvent { kind, duration });
+        self.record_event(CompilationEvent { step, duration });
     }
 
     /// Retains `event` when event retention is enabled and then reports it to the installed reporter, if any. The
@@ -2178,9 +2178,9 @@ mod tests {
         }
     }
 
-    /// Returns the step kinds retained by `context`, preserving their reported order.
-    fn event_kinds(context: &CompilationContext<TestDomain>) -> Vec<CompilationEventKind> {
-        context.recent_events().into_iter().map(|event| event.kind).collect()
+    /// Returns the steps retained by `context`, preserving their reported order.
+    fn event_steps(context: &CompilationContext<TestDomain>) -> Vec<CompilationStep> {
+        context.recent_events().into_iter().map(|event| event.step).collect()
     }
 
     /// Returns the uncompressed envelope that stores `payload` under `digest`.
@@ -2193,35 +2193,35 @@ mod tests {
     #[test]
     fn test_compilation_event_error_display() {
         for (error, message) in [
-            (CompilationEventError::Unsupported, "required compilation artifact operation is unsupported"),
+            (CompilationStepError::Unsupported, "required compilation artifact operation is unsupported"),
             (
-                CompilationEventError::Incompatible { message: "compiler versions differ".to_string() },
+                CompilationStepError::Incompatible { message: "compiler versions differ".to_string() },
                 "compilation artifact or exchange compatibility requirements were not satisfied: \
                  compiler versions differ",
             ),
-            (CompilationEventError::TimedOut, "compilation artifact exchange timed out"),
+            (CompilationStepError::TimedOut, "compilation artifact exchange timed out"),
             (
-                CompilationEventError::ReadFailed { message: "connection reset".to_string() },
+                CompilationStepError::ReadFailed { message: "connection reset".to_string() },
                 "failed to read or receive a compilation artifact: connection reset",
             ),
             (
-                CompilationEventError::ExchangeFailed { message: "leader disconnected".to_string() },
+                CompilationStepError::ExchangeFailed { message: "leader disconnected".to_string() },
                 "compilation artifact exchange coordination failed: leader disconnected",
             ),
             (
-                CompilationEventError::DeserializationFailed { message: "invalid executable header".to_string() },
+                CompilationStepError::DeserializationFailed { message: "invalid executable header".to_string() },
                 "failed to deserialize a compiled program: invalid executable header",
             ),
             (
-                CompilationEventError::SerializationFailed { message: "executable serialization failed".to_string() },
+                CompilationStepError::SerializationFailed { message: "executable serialization failed".to_string() },
                 "failed to serialize a compiled program: executable serialization failed",
             ),
             (
-                CompilationEventError::WriteFailed { message: "disk quota exceeded".to_string() },
+                CompilationStepError::WriteFailed { message: "disk quota exceeded".to_string() },
                 "failed to write or publish a compilation artifact or failure notification: disk quota exceeded",
             ),
             (
-                CompilationEventError::CompilationFailed { message: "unsupported operation".to_string() },
+                CompilationStepError::CompilationFailed { message: "unsupported operation".to_string() },
                 "backend compilation failed: unsupported operation",
             ),
         ] {
@@ -2278,28 +2278,28 @@ mod tests {
         assert_eq!(second_context.statistics().compilations, 0);
 
         assert_eq!(
-            event_kinds(&first_context),
+            event_steps(&first_context),
             vec![
-                CompilationEventKind::CacheLookup {
+                CompilationStep::CacheLookup {
                     tier: CompilationCacheTier::Memory,
                     outcome: CompilationLookupOutcome::Miss(CompilationMissReason::NotFound),
                 },
-                CompilationEventKind::CacheLookup {
+                CompilationStep::CacheLookup {
                     tier: CompilationCacheTier::Persistent,
                     outcome: CompilationLookupOutcome::Miss(CompilationMissReason::NotFound),
                 },
-                CompilationEventKind::BackendCompilation { outcome: CompilationStepOutcome::Succeeded },
-                CompilationEventKind::PersistentStore { outcome: CompilationStepOutcome::Succeeded },
+                CompilationStep::BackendCompilation { outcome: CompilationStepOutcome::Succeeded },
+                CompilationStep::PersistentStore { outcome: CompilationStepOutcome::Succeeded },
             ],
         );
         assert_eq!(
-            event_kinds(&second_context),
+            event_steps(&second_context),
             vec![
-                CompilationEventKind::CacheLookup {
+                CompilationStep::CacheLookup {
                     tier: CompilationCacheTier::Memory,
                     outcome: CompilationLookupOutcome::Miss(CompilationMissReason::NotFound),
                 },
-                CompilationEventKind::CacheLookup {
+                CompilationStep::CacheLookup {
                     tier: CompilationCacheTier::Persistent,
                     outcome: CompilationLookupOutcome::Hit,
                 },
@@ -2318,21 +2318,21 @@ mod tests {
             context.get_or_compile(&TestDomain::persistent(), 1, None, || Ok(TestCompiledProgram(17))).unwrap();
         assert_eq!(program.0, 17);
         assert_eq!(
-            event_kinds(&context),
+            event_steps(&context),
             vec![
-                CompilationEventKind::CacheLookup {
+                CompilationStep::CacheLookup {
                     tier: CompilationCacheTier::Memory,
                     outcome: CompilationLookupOutcome::Miss(CompilationMissReason::NotFound),
                 },
-                CompilationEventKind::CacheLookup {
+                CompilationStep::CacheLookup {
                     tier: CompilationCacheTier::Persistent,
-                    outcome: CompilationLookupOutcome::Failed(CompilationEventError::DeserializationFailed {
+                    outcome: CompilationLookupOutcome::Failed(CompilationStepError::DeserializationFailed {
                         message: "encountered malformed program: test persistent payload has the wrong length"
                             .to_string()
                     }),
                 },
-                CompilationEventKind::BackendCompilation { outcome: CompilationStepOutcome::Succeeded },
-                CompilationEventKind::PersistentStore {
+                CompilationStep::BackendCompilation { outcome: CompilationStepOutcome::Succeeded },
+                CompilationStep::PersistentStore {
                     outcome: CompilationStepOutcome::Skipped(CompilationSkipReason::BelowWriteThreshold),
                 },
             ],
@@ -2347,18 +2347,18 @@ mod tests {
         let domain = TestDomain { persistent: true, deserialization_incompatible: true, ..TestDomain::default() };
         assert_eq!(context.get_or_compile(&domain, 2, None, || Ok(TestCompiledProgram(23))).unwrap().0, 23);
         assert_eq!(
-            event_kinds(&context),
+            event_steps(&context),
             vec![
-                CompilationEventKind::CacheLookup {
+                CompilationStep::CacheLookup {
                     tier: CompilationCacheTier::Memory,
                     outcome: CompilationLookupOutcome::Miss(CompilationMissReason::NotFound),
                 },
-                CompilationEventKind::CacheLookup {
+                CompilationStep::CacheLookup {
                     tier: CompilationCacheTier::Persistent,
                     outcome: CompilationLookupOutcome::Miss(CompilationMissReason::Incompatible),
                 },
-                CompilationEventKind::BackendCompilation { outcome: CompilationStepOutcome::Succeeded },
-                CompilationEventKind::PersistentStore {
+                CompilationStep::BackendCompilation { outcome: CompilationStepOutcome::Succeeded },
+                CompilationStep::PersistentStore {
                     outcome: CompilationStepOutcome::Skipped(CompilationSkipReason::BelowWriteThreshold),
                 },
             ],
@@ -2375,20 +2375,20 @@ mod tests {
             context.get_or_compile(&TestDomain::persistent(), 3, None, || Ok(TestCompiledProgram(29))).unwrap();
         assert_eq!(program.0, 29);
         assert_eq!(
-            event_kinds(&context),
+            event_steps(&context),
             vec![
-                CompilationEventKind::CacheLookup {
+                CompilationStep::CacheLookup {
                     tier: CompilationCacheTier::Memory,
                     outcome: CompilationLookupOutcome::Miss(CompilationMissReason::NotFound),
                 },
-                CompilationEventKind::CacheLookup {
+                CompilationStep::CacheLookup {
                     tier: CompilationCacheTier::Persistent,
-                    outcome: CompilationLookupOutcome::Failed(CompilationEventError::ReadFailed {
+                    outcome: CompilationLookupOutcome::Failed(CompilationStepError::ReadFailed {
                         message: read_message
                     }),
                 },
-                CompilationEventKind::BackendCompilation { outcome: CompilationStepOutcome::Succeeded },
-                CompilationEventKind::PersistentStore {
+                CompilationStep::BackendCompilation { outcome: CompilationStepOutcome::Succeeded },
+                CompilationStep::PersistentStore {
                     outcome: CompilationStepOutcome::Skipped(CompilationSkipReason::BelowWriteThreshold),
                 },
             ],
@@ -2428,18 +2428,18 @@ mod tests {
         assert_eq!(std::fs::read_dir(directory.path()).unwrap().count(), 0);
         assert_eq!(context.statistics().persistent_errors, 0);
         assert_eq!(
-            event_kinds(&context),
+            event_steps(&context),
             vec![
-                CompilationEventKind::CacheLookup {
+                CompilationStep::CacheLookup {
                     tier: CompilationCacheTier::Memory,
                     outcome: CompilationLookupOutcome::Miss(CompilationMissReason::NotFound),
                 },
-                CompilationEventKind::CacheLookup {
+                CompilationStep::CacheLookup {
                     tier: CompilationCacheTier::Persistent,
                     outcome: CompilationLookupOutcome::Miss(CompilationMissReason::NotFound),
                 },
-                CompilationEventKind::BackendCompilation { outcome: CompilationStepOutcome::Succeeded },
-                CompilationEventKind::PersistentStore {
+                CompilationStep::BackendCompilation { outcome: CompilationStepOutcome::Succeeded },
+                CompilationStep::PersistentStore {
                     outcome: CompilationStepOutcome::Skipped(CompilationSkipReason::BelowWriteThreshold),
                 },
             ],
@@ -2461,9 +2461,9 @@ mod tests {
         assert_eq!(context.statistics().persistent_errors, 1);
         let last_event = context.recent_events().pop().unwrap();
         assert_eq!(
-            last_event.kind,
-            CompilationEventKind::PersistentStore {
-                outcome: CompilationStepOutcome::Failed(CompilationEventError::SerializationFailed {
+            last_event.step,
+            CompilationStep::PersistentStore {
+                outcome: CompilationStepOutcome::Failed(CompilationStepError::SerializationFailed {
                     message: "encountered malformed program: expected serialization failure".to_string()
                 }),
             },
@@ -2493,19 +2493,19 @@ mod tests {
             .unwrap_err()
             .to_string();
         assert_eq!(
-            event_kinds(&context),
+            event_steps(&context),
             vec![
-                CompilationEventKind::CacheLookup {
+                CompilationStep::CacheLookup {
                     tier: CompilationCacheTier::Memory,
                     outcome: CompilationLookupOutcome::Miss(CompilationMissReason::NotFound),
                 },
-                CompilationEventKind::CacheLookup {
+                CompilationStep::CacheLookup {
                     tier: CompilationCacheTier::Persistent,
                     outcome: CompilationLookupOutcome::Miss(CompilationMissReason::NotFound),
                 },
-                CompilationEventKind::BackendCompilation { outcome: CompilationStepOutcome::Succeeded },
-                CompilationEventKind::PersistentStore {
-                    outcome: CompilationStepOutcome::Failed(CompilationEventError::WriteFailed {
+                CompilationStep::BackendCompilation { outcome: CompilationStepOutcome::Succeeded },
+                CompilationStep::PersistentStore {
+                    outcome: CompilationStepOutcome::Failed(CompilationStepError::WriteFailed {
                         message: write_message
                     }),
                 },
@@ -2548,26 +2548,26 @@ mod tests {
         assert_eq!(follower_statistics.exchange_waits, 1);
 
         assert_eq!(
-            event_kinds(&leader_context),
+            event_steps(&leader_context),
             vec![
-                CompilationEventKind::CacheLookup {
+                CompilationStep::CacheLookup {
                     tier: CompilationCacheTier::Memory,
                     outcome: CompilationLookupOutcome::Miss(CompilationMissReason::NotFound),
                 },
-                CompilationEventKind::ExchangePreflight { outcome: CompilationStepOutcome::Succeeded },
-                CompilationEventKind::BackendCompilation { outcome: CompilationStepOutcome::Succeeded },
-                CompilationEventKind::ExchangePublish { outcome: CompilationStepOutcome::Succeeded },
+                CompilationStep::ExchangePreflight { outcome: CompilationStepOutcome::Succeeded },
+                CompilationStep::BackendCompilation { outcome: CompilationStepOutcome::Succeeded },
+                CompilationStep::ExchangePublish { outcome: CompilationStepOutcome::Succeeded },
             ],
         );
         assert_eq!(
-            follower_events.iter().map(|event| event.kind.clone()).collect::<Vec<_>>(),
+            follower_events.iter().map(|event| event.step.clone()).collect::<Vec<_>>(),
             vec![
-                CompilationEventKind::CacheLookup {
+                CompilationStep::CacheLookup {
                     tier: CompilationCacheTier::Memory,
                     outcome: CompilationLookupOutcome::Miss(CompilationMissReason::NotFound),
                 },
-                CompilationEventKind::ExchangePreflight { outcome: CompilationStepOutcome::Succeeded },
-                CompilationEventKind::ExchangeReceive { outcome: CompilationLookupOutcome::Hit },
+                CompilationStep::ExchangePreflight { outcome: CompilationStepOutcome::Succeeded },
+                CompilationStep::ExchangeReceive { outcome: CompilationLookupOutcome::Hit },
             ],
         );
         // The exchange duration covers preflights and receptions, but never publication.
@@ -2618,18 +2618,18 @@ mod tests {
         assert_eq!(leader_context.statistics().compilations, 0);
 
         assert_eq!(
-            event_kinds(&leader_context),
+            event_steps(&leader_context),
             vec![
-                CompilationEventKind::CacheLookup {
+                CompilationStep::CacheLookup {
                     tier: CompilationCacheTier::Memory,
                     outcome: CompilationLookupOutcome::Miss(CompilationMissReason::NotFound),
                 },
-                CompilationEventKind::ExchangePreflight { outcome: CompilationStepOutcome::Succeeded },
-                CompilationEventKind::CacheLookup {
+                CompilationStep::ExchangePreflight { outcome: CompilationStepOutcome::Succeeded },
+                CompilationStep::CacheLookup {
                     tier: CompilationCacheTier::Persistent,
                     outcome: CompilationLookupOutcome::Hit,
                 },
-                CompilationEventKind::ExchangePublish { outcome: CompilationStepOutcome::Succeeded },
+                CompilationStep::ExchangePublish { outcome: CompilationStepOutcome::Succeeded },
             ],
         );
     }
@@ -2667,20 +2667,20 @@ mod tests {
         assert_eq!(follower_context.statistics().compilations, 0);
 
         assert_eq!(
-            event_kinds(&leader_context),
+            event_steps(&leader_context),
             vec![
-                CompilationEventKind::CacheLookup {
+                CompilationStep::CacheLookup {
                     tier: CompilationCacheTier::Memory,
                     outcome: CompilationLookupOutcome::Miss(CompilationMissReason::NotFound),
                 },
-                CompilationEventKind::ExchangePreflight { outcome: CompilationStepOutcome::Succeeded },
-                CompilationEventKind::BackendCompilation {
-                    outcome: CompilationStepOutcome::Failed(CompilationEventError::CompilationFailed {
+                CompilationStep::ExchangePreflight { outcome: CompilationStepOutcome::Succeeded },
+                CompilationStep::BackendCompilation {
+                    outcome: CompilationStepOutcome::Failed(CompilationStepError::CompilationFailed {
                         message: "encountered malformed program: expected test failure".to_string()
                     }),
                 },
-                CompilationEventKind::ExchangeFailureNotification {
-                    cause: CompilationEventError::CompilationFailed {
+                CompilationStep::ExchangeFailureNotification {
+                    cause: CompilationStepError::CompilationFailed {
                         message: "encountered malformed program: expected test failure".to_string()
                     },
                     outcome: CompilationStepOutcome::Succeeded,
@@ -2688,15 +2688,15 @@ mod tests {
             ],
         );
         assert_eq!(
-            event_kinds(&follower_context),
+            event_steps(&follower_context),
             vec![
-                CompilationEventKind::CacheLookup {
+                CompilationStep::CacheLookup {
                     tier: CompilationCacheTier::Memory,
                     outcome: CompilationLookupOutcome::Miss(CompilationMissReason::NotFound),
                 },
-                CompilationEventKind::ExchangePreflight { outcome: CompilationStepOutcome::Succeeded },
-                CompilationEventKind::ExchangeReceive {
-                    outcome: CompilationLookupOutcome::Failed(CompilationEventError::ReadFailed {
+                CompilationStep::ExchangePreflight { outcome: CompilationStepOutcome::Succeeded },
+                CompilationStep::ExchangeReceive {
+                    outcome: CompilationLookupOutcome::Failed(CompilationStepError::ReadFailed {
                         message:
                             "compilation artifact exchange failed: encountered malformed program: expected test failure"
                                 .to_string()
@@ -2725,23 +2725,23 @@ mod tests {
         assert_eq!(context.statistics().exchange_errors, 1);
         assert_eq!(context.statistics().compilations, 1);
         assert_eq!(
-            event_kinds(&context),
+            event_steps(&context),
             vec![
-                CompilationEventKind::CacheLookup {
+                CompilationStep::CacheLookup {
                     tier: CompilationCacheTier::Memory,
                     outcome: CompilationLookupOutcome::Miss(CompilationMissReason::NotFound),
                 },
-                CompilationEventKind::ExchangePreflight { outcome: CompilationStepOutcome::Succeeded },
-                CompilationEventKind::BackendCompilation {
-                    outcome: CompilationStepOutcome::Failed(CompilationEventError::CompilationFailed {
+                CompilationStep::ExchangePreflight { outcome: CompilationStepOutcome::Succeeded },
+                CompilationStep::BackendCompilation {
+                    outcome: CompilationStepOutcome::Failed(CompilationStepError::CompilationFailed {
                         message: "encountered malformed program: expected producer failure".to_string()
                     }),
                 },
-                CompilationEventKind::ExchangeFailureNotification {
-                    cause: CompilationEventError::CompilationFailed {
+                CompilationStep::ExchangeFailureNotification {
+                    cause: CompilationStepError::CompilationFailed {
                         message: "encountered malformed program: expected producer failure".to_string()
                     },
-                    outcome: CompilationStepOutcome::Failed(CompilationEventError::WriteFailed {
+                    outcome: CompilationStepOutcome::Failed(CompilationStepError::WriteFailed {
                         message:
                             "compilation artifact exchange failed: expected failure notification publication failure"
                                 .to_string()
@@ -2775,21 +2775,21 @@ mod tests {
         );
 
         assert_eq!(
-            event_kinds(&leader_context),
+            event_steps(&leader_context),
             vec![
-                CompilationEventKind::CacheLookup {
+                CompilationStep::CacheLookup {
                     tier: CompilationCacheTier::Memory,
                     outcome: CompilationLookupOutcome::Miss(CompilationMissReason::NotFound),
                 },
-                CompilationEventKind::ExchangePreflight { outcome: CompilationStepOutcome::Succeeded },
-                CompilationEventKind::BackendCompilation { outcome: CompilationStepOutcome::Succeeded },
-                CompilationEventKind::ExchangePublish {
-                    outcome: CompilationStepOutcome::Failed(CompilationEventError::SerializationFailed {
+                CompilationStep::ExchangePreflight { outcome: CompilationStepOutcome::Succeeded },
+                CompilationStep::BackendCompilation { outcome: CompilationStepOutcome::Succeeded },
+                CompilationStep::ExchangePublish {
+                    outcome: CompilationStepOutcome::Failed(CompilationStepError::SerializationFailed {
                         message: "encountered malformed program: expected serialization failure".to_string()
                     }),
                 },
-                CompilationEventKind::ExchangeFailureNotification {
-                    cause: CompilationEventError::SerializationFailed {
+                CompilationStep::ExchangeFailureNotification {
+                    cause: CompilationStepError::SerializationFailed {
                         message: "encountered malformed program: expected serialization failure".to_string()
                     },
                     outcome: CompilationStepOutcome::Succeeded,
@@ -2812,7 +2812,7 @@ mod tests {
             );
         let domain = TestDomain { persistent: true, serialization_fails: true, ..TestDomain::default() };
         let error = ProgramError::MalformedProgram("expected serialization failure".to_string());
-        let cause = CompilationEventError::SerializationFailed { message: error.to_string() };
+        let cause = CompilationStepError::SerializationFailed { message: error.to_string() };
 
         // All three destinations retain the diagnostic while the caller receives the original domain error.
         assert_eq!(context.get_or_compile(&domain, 1, None, || Ok(TestCompiledProgram(3))).err(), Some(error.clone()));
@@ -2823,21 +2823,21 @@ mod tests {
         assert_eq!(context.statistics().compilations, 1);
         assert_eq!(state.artifacts.lock().unwrap().get([1u8].as_slice()), Some(&Err(error.to_string())));
         assert_eq!(
-            event_kinds(&context),
+            event_steps(&context),
             vec![
-                CompilationEventKind::CacheLookup {
+                CompilationStep::CacheLookup {
                     tier: CompilationCacheTier::Memory,
                     outcome: CompilationLookupOutcome::Miss(CompilationMissReason::NotFound),
                 },
-                CompilationEventKind::ExchangePreflight { outcome: CompilationStepOutcome::Succeeded },
-                CompilationEventKind::CacheLookup {
+                CompilationStep::ExchangePreflight { outcome: CompilationStepOutcome::Succeeded },
+                CompilationStep::CacheLookup {
                     tier: CompilationCacheTier::Persistent,
                     outcome: CompilationLookupOutcome::Miss(CompilationMissReason::NotFound),
                 },
-                CompilationEventKind::BackendCompilation { outcome: CompilationStepOutcome::Succeeded },
-                CompilationEventKind::PersistentStore { outcome: CompilationStepOutcome::Failed(cause.clone()) },
-                CompilationEventKind::ExchangePublish { outcome: CompilationStepOutcome::Failed(cause.clone()) },
-                CompilationEventKind::ExchangeFailureNotification { cause, outcome: CompilationStepOutcome::Succeeded },
+                CompilationStep::BackendCompilation { outcome: CompilationStepOutcome::Succeeded },
+                CompilationStep::PersistentStore { outcome: CompilationStepOutcome::Failed(cause.clone()) },
+                CompilationStep::ExchangePublish { outcome: CompilationStepOutcome::Failed(cause.clone()) },
+                CompilationStep::ExchangeFailureNotification { cause, outcome: CompilationStepOutcome::Succeeded },
             ],
         );
     }
@@ -2865,26 +2865,26 @@ mod tests {
         assert_eq!(context.statistics().exchange_fallbacks, 1);
         assert_eq!(context.statistics().exchange_publishes, 0);
         assert_eq!(
-            event_kinds(&context),
+            event_steps(&context),
             vec![
-                CompilationEventKind::CacheLookup {
+                CompilationStep::CacheLookup {
                     tier: CompilationCacheTier::Memory,
                     outcome: CompilationLookupOutcome::Miss(CompilationMissReason::NotFound),
                 },
-                CompilationEventKind::ExchangePreflight { outcome: CompilationStepOutcome::Succeeded },
-                CompilationEventKind::CacheLookup {
+                CompilationStep::ExchangePreflight { outcome: CompilationStepOutcome::Succeeded },
+                CompilationStep::CacheLookup {
                     tier: CompilationCacheTier::Persistent,
                     outcome: CompilationLookupOutcome::Miss(CompilationMissReason::NotFound),
                 },
-                CompilationEventKind::BackendCompilation { outcome: CompilationStepOutcome::Succeeded },
-                CompilationEventKind::PersistentStore {
+                CompilationStep::BackendCompilation { outcome: CompilationStepOutcome::Succeeded },
+                CompilationStep::PersistentStore {
                     outcome: CompilationStepOutcome::Skipped(CompilationSkipReason::Unsupported),
                 },
-                CompilationEventKind::ExchangePublish {
+                CompilationStep::ExchangePublish {
                     outcome: CompilationStepOutcome::Skipped(CompilationSkipReason::Unsupported),
                 },
-                CompilationEventKind::ExchangeFailureNotification {
-                    cause: CompilationEventError::Unsupported,
+                CompilationStep::ExchangeFailureNotification {
+                    cause: CompilationStepError::Unsupported,
                     outcome: CompilationStepOutcome::Succeeded,
                 },
             ],
@@ -2912,19 +2912,19 @@ mod tests {
         assert_eq!(context.statistics().compilations, 1);
 
         assert_eq!(
-            event_kinds(&context),
+            event_steps(&context),
             vec![
-                CompilationEventKind::CacheLookup {
+                CompilationStep::CacheLookup {
                     tier: CompilationCacheTier::Memory,
                     outcome: CompilationLookupOutcome::Miss(CompilationMissReason::NotFound),
                 },
-                CompilationEventKind::ExchangePreflight { outcome: CompilationStepOutcome::Succeeded },
-                CompilationEventKind::ExchangeReceive {
-                    outcome: CompilationLookupOutcome::Failed(CompilationEventError::ReadFailed {
+                CompilationStep::ExchangePreflight { outcome: CompilationStepOutcome::Succeeded },
+                CompilationStep::ExchangeReceive {
+                    outcome: CompilationLookupOutcome::Failed(CompilationStepError::ReadFailed {
                         message: "compilation artifact exchange failed: expected receive failure".to_string()
                     }),
                 },
-                CompilationEventKind::BackendCompilation { outcome: CompilationStepOutcome::Succeeded },
+                CompilationStep::BackendCompilation { outcome: CompilationStepOutcome::Succeeded },
             ],
         );
         assert_eq!(
@@ -2951,20 +2951,20 @@ mod tests {
         assert_eq!(context.statistics().exchange_errors, 1);
         assert_eq!(context.statistics().exchange_fallbacks, 1);
         assert_eq!(
-            event_kinds(&context),
+            event_steps(&context),
             vec![
-                CompilationEventKind::CacheLookup {
+                CompilationStep::CacheLookup {
                     tier: CompilationCacheTier::Memory,
                     outcome: CompilationLookupOutcome::Miss(CompilationMissReason::NotFound),
                 },
-                CompilationEventKind::ExchangePreflight { outcome: CompilationStepOutcome::Succeeded },
-                CompilationEventKind::ExchangeReceive {
-                    outcome: CompilationLookupOutcome::Failed(CompilationEventError::Incompatible {
+                CompilationStep::ExchangePreflight { outcome: CompilationStepOutcome::Succeeded },
+                CompilationStep::ExchangeReceive {
+                    outcome: CompilationLookupOutcome::Failed(CompilationStepError::Incompatible {
                         message: "compilation artifact exchange is incompatible: expected receive incompatibility"
                             .to_string()
                     }),
                 },
-                CompilationEventKind::BackendCompilation { outcome: CompilationStepOutcome::Succeeded },
+                CompilationStep::BackendCompilation { outcome: CompilationStepOutcome::Succeeded },
             ],
         );
 
@@ -2983,17 +2983,17 @@ mod tests {
         assert_eq!(context.statistics().exchange_errors, 0);
         assert_eq!(context.statistics().exchange_fallbacks, 1);
         assert_eq!(
-            event_kinds(&context),
+            event_steps(&context),
             vec![
-                CompilationEventKind::CacheLookup {
+                CompilationStep::CacheLookup {
                     tier: CompilationCacheTier::Memory,
                     outcome: CompilationLookupOutcome::Miss(CompilationMissReason::NotFound),
                 },
-                CompilationEventKind::ExchangePreflight { outcome: CompilationStepOutcome::Succeeded },
-                CompilationEventKind::ExchangeReceive {
+                CompilationStep::ExchangePreflight { outcome: CompilationStepOutcome::Succeeded },
+                CompilationStep::ExchangeReceive {
                     outcome: CompilationLookupOutcome::Miss(CompilationMissReason::Incompatible),
                 },
-                CompilationEventKind::BackendCompilation { outcome: CompilationStepOutcome::Succeeded },
+                CompilationStep::BackendCompilation { outcome: CompilationStepOutcome::Succeeded },
             ],
         );
     }
@@ -3018,15 +3018,15 @@ mod tests {
         assert_eq!(context.statistics().exchange_fallbacks, 0);
         assert_eq!(context.statistics().compilations, 0);
         assert_eq!(
-            event_kinds(&context),
+            event_steps(&context),
             vec![
-                CompilationEventKind::CacheLookup {
+                CompilationStep::CacheLookup {
                     tier: CompilationCacheTier::Memory,
                     outcome: CompilationLookupOutcome::Miss(CompilationMissReason::NotFound),
                 },
-                CompilationEventKind::ExchangePreflight { outcome: CompilationStepOutcome::Succeeded },
-                CompilationEventKind::ExchangeReceive {
-                    outcome: CompilationLookupOutcome::Failed(CompilationEventError::DeserializationFailed {
+                CompilationStep::ExchangePreflight { outcome: CompilationStepOutcome::Succeeded },
+                CompilationStep::ExchangeReceive {
+                    outcome: CompilationLookupOutcome::Failed(CompilationStepError::DeserializationFailed {
                         message: "encountered malformed program: test persistent payload has the wrong length"
                             .to_string()
                     }),
@@ -3054,16 +3054,16 @@ mod tests {
         assert_eq!(context.statistics().exchange_fallbacks, 1);
         assert_eq!(context.statistics().exchange_publishes, 0);
         assert_eq!(
-            event_kinds(&context),
+            event_steps(&context),
             vec![
-                CompilationEventKind::CacheLookup {
+                CompilationStep::CacheLookup {
                     tier: CompilationCacheTier::Memory,
                     outcome: CompilationLookupOutcome::Miss(CompilationMissReason::NotFound),
                 },
-                CompilationEventKind::ExchangePreflight { outcome: CompilationStepOutcome::Succeeded },
-                CompilationEventKind::BackendCompilation { outcome: CompilationStepOutcome::Succeeded },
-                CompilationEventKind::ExchangePublish {
-                    outcome: CompilationStepOutcome::Failed(CompilationEventError::WriteFailed {
+                CompilationStep::ExchangePreflight { outcome: CompilationStepOutcome::Succeeded },
+                CompilationStep::BackendCompilation { outcome: CompilationStepOutcome::Succeeded },
+                CompilationStep::ExchangePublish {
+                    outcome: CompilationStepOutcome::Failed(CompilationStepError::WriteFailed {
                         message: "compilation artifact exchange failed: expected publish failure".to_string()
                     }),
                 },
@@ -3102,14 +3102,14 @@ mod tests {
         assert_eq!(context.statistics().compilations, 0);
 
         assert_eq!(
-            event_kinds(&context),
+            event_steps(&context),
             vec![
-                CompilationEventKind::CacheLookup {
+                CompilationStep::CacheLookup {
                     tier: CompilationCacheTier::Memory,
                     outcome: CompilationLookupOutcome::Miss(CompilationMissReason::NotFound),
                 },
-                CompilationEventKind::ExchangePreflight {
-                    outcome: CompilationStepOutcome::Failed(CompilationEventError::Incompatible {
+                CompilationStep::ExchangePreflight {
+                    outcome: CompilationStepOutcome::Failed(CompilationStepError::Incompatible {
                         message: "compilation artifact exchange is incompatible: expected preflight incompatibility"
                             .to_string()
                     }),
@@ -3139,18 +3139,18 @@ mod tests {
         assert_eq!(context.statistics().exchange_errors, 1);
         assert_eq!(context.statistics().exchange_fallbacks, 1);
         assert_eq!(
-            event_kinds(&context),
+            event_steps(&context),
             vec![
-                CompilationEventKind::CacheLookup {
+                CompilationStep::CacheLookup {
                     tier: CompilationCacheTier::Memory,
                     outcome: CompilationLookupOutcome::Miss(CompilationMissReason::NotFound),
                 },
-                CompilationEventKind::ExchangePreflight {
-                    outcome: CompilationStepOutcome::Failed(CompilationEventError::ExchangeFailed {
+                CompilationStep::ExchangePreflight {
+                    outcome: CompilationStepOutcome::Failed(CompilationStepError::ExchangeFailed {
                         message: "compilation artifact exchange failed: expected coordination failure".to_string(),
                     }),
                 },
-                CompilationEventKind::BackendCompilation { outcome: CompilationStepOutcome::Succeeded },
+                CompilationStep::BackendCompilation { outcome: CompilationStepOutcome::Succeeded },
             ],
         );
     }
@@ -3177,13 +3177,13 @@ mod tests {
         assert_eq!(context.statistics().compilations, 0);
 
         assert_eq!(
-            event_kinds(&context),
+            event_steps(&context),
             vec![
-                CompilationEventKind::CacheLookup {
+                CompilationStep::CacheLookup {
                     tier: CompilationCacheTier::Memory,
                     outcome: CompilationLookupOutcome::Miss(CompilationMissReason::NotFound),
                 },
-                CompilationEventKind::ExchangePreflight {
+                CompilationStep::ExchangePreflight {
                     outcome: CompilationStepOutcome::Skipped(CompilationSkipReason::Unsupported),
                 },
             ],
@@ -3216,14 +3216,14 @@ mod tests {
         assert_eq!(context.statistics().exchange_fallbacks, 0);
 
         assert_eq!(
-            event_kinds(&context),
+            event_steps(&context),
             vec![
-                CompilationEventKind::CacheLookup {
+                CompilationStep::CacheLookup {
                     tier: CompilationCacheTier::Memory,
                     outcome: CompilationLookupOutcome::Miss(CompilationMissReason::NotFound),
                 },
-                CompilationEventKind::ExchangePreflight { outcome: CompilationStepOutcome::Succeeded },
-                CompilationEventKind::ExchangeReceive {
+                CompilationStep::ExchangePreflight { outcome: CompilationStepOutcome::Succeeded },
+                CompilationStep::ExchangeReceive {
                     outcome: CompilationLookupOutcome::Miss(CompilationMissReason::TimedOut),
                 },
             ],
@@ -3249,17 +3249,17 @@ mod tests {
         assert_eq!(context.statistics().compilations, 1);
 
         assert_eq!(
-            event_kinds(&context),
+            event_steps(&context),
             vec![
-                CompilationEventKind::CacheLookup {
+                CompilationStep::CacheLookup {
                     tier: CompilationCacheTier::Memory,
                     outcome: CompilationLookupOutcome::Miss(CompilationMissReason::NotFound),
                 },
-                CompilationEventKind::ExchangePreflight { outcome: CompilationStepOutcome::Succeeded },
-                CompilationEventKind::ExchangeReceive {
+                CompilationStep::ExchangePreflight { outcome: CompilationStepOutcome::Succeeded },
+                CompilationStep::ExchangeReceive {
                     outcome: CompilationLookupOutcome::Miss(CompilationMissReason::TimedOut),
                 },
-                CompilationEventKind::BackendCompilation { outcome: CompilationStepOutcome::Succeeded },
+                CompilationStep::BackendCompilation { outcome: CompilationStepOutcome::Succeeded },
             ],
         );
     }
@@ -3274,16 +3274,10 @@ mod tests {
         // The memory miss of the first lookup is evicted by the two later events.
         let events = context.recent_events();
         assert_eq!(events.len(), 2);
+        assert_eq!(events[0].step, CompilationStep::BackendCompilation { outcome: CompilationStepOutcome::Succeeded });
         assert_eq!(
-            events[0].kind,
-            CompilationEventKind::BackendCompilation { outcome: CompilationStepOutcome::Succeeded },
-        );
-        assert_eq!(
-            events[1].kind,
-            CompilationEventKind::CacheLookup {
-                tier: CompilationCacheTier::Memory,
-                outcome: CompilationLookupOutcome::Hit,
-            },
+            events[1].step,
+            CompilationStep::CacheLookup { tier: CompilationCacheTier::Memory, outcome: CompilationLookupOutcome::Hit },
         );
 
         context.clear_events();
@@ -3304,13 +3298,13 @@ mod tests {
         assert_eq!(context.recent_events(), Vec::new());
         let reported = reported.lock().unwrap();
         assert_eq!(
-            reported.iter().map(|event| event.kind.clone()).collect::<Vec<_>>(),
+            reported.iter().map(|event| event.step.clone()).collect::<Vec<_>>(),
             vec![
-                CompilationEventKind::CacheLookup {
+                CompilationStep::CacheLookup {
                     tier: CompilationCacheTier::Memory,
                     outcome: CompilationLookupOutcome::Miss(CompilationMissReason::NotFound),
                 },
-                CompilationEventKind::BackendCompilation { outcome: CompilationStepOutcome::Succeeded },
+                CompilationStep::BackendCompilation { outcome: CompilationStepOutcome::Succeeded },
             ],
         );
     }
@@ -3328,14 +3322,14 @@ mod tests {
         let retained = context.recent_events();
         assert_eq!(*reported.lock().unwrap(), retained);
         assert_eq!(
-            retained.iter().map(|event| event.kind.clone()).collect::<Vec<_>>(),
+            retained.iter().map(|event| event.step.clone()).collect::<Vec<_>>(),
             vec![
-                CompilationEventKind::CacheLookup {
+                CompilationStep::CacheLookup {
                     tier: CompilationCacheTier::Memory,
                     outcome: CompilationLookupOutcome::Miss(CompilationMissReason::NotFound),
                 },
-                CompilationEventKind::BackendCompilation {
-                    outcome: CompilationStepOutcome::Failed(CompilationEventError::CompilationFailed {
+                CompilationStep::BackendCompilation {
+                    outcome: CompilationStepOutcome::Failed(CompilationStepError::CompilationFailed {
                         message: "encountered malformed program: expected reported producer failure".to_string(),
                     }),
                 },
@@ -3401,15 +3395,15 @@ mod tests {
         assert_eq!(context.statistics().memory_hits, 2);
         assert_eq!(context.statistics().compilations, 1);
         assert_eq!(
-            event_kinds(&context),
+            event_steps(&context),
             vec![
-                CompilationEventKind::CacheLookup {
+                CompilationStep::CacheLookup {
                     tier: CompilationCacheTier::Memory,
-                    outcome: CompilationLookupOutcome::Failed(CompilationEventError::Incompatible {
+                    outcome: CompilationLookupOutcome::Failed(CompilationStepError::Incompatible {
                         message: "cached program 2 cannot serve 1 outputs".to_string()
                     }),
                 },
-                CompilationEventKind::CacheLookup {
+                CompilationStep::CacheLookup {
                     tier: CompilationCacheTier::Memory,
                     outcome: CompilationLookupOutcome::Hit,
                 },
@@ -3458,9 +3452,9 @@ mod tests {
         );
         assert_eq!(context.statistics().waits, 1);
         assert_eq!(
-            event_kinds(&context).last(),
-            Some(&CompilationEventKind::MemoryWait {
-                outcome: CompilationLookupOutcome::Failed(CompilationEventError::Incompatible {
+            event_steps(&context).last(),
+            Some(&CompilationStep::MemoryWait {
+                outcome: CompilationLookupOutcome::Failed(CompilationStepError::Incompatible {
                     message: "cached program 2 cannot serve 1 outputs".to_string()
                 }),
             }),
@@ -3485,18 +3479,18 @@ mod tests {
         assert_eq!(context.statistics().persistent_errors, 0);
         assert_eq!(context.statistics().compilations, 1);
         assert_eq!(
-            event_kinds(&context),
+            event_steps(&context),
             vec![
-                CompilationEventKind::CacheLookup {
+                CompilationStep::CacheLookup {
                     tier: CompilationCacheTier::Memory,
                     outcome: CompilationLookupOutcome::Miss(CompilationMissReason::NotFound),
                 },
-                CompilationEventKind::CacheLookup {
+                CompilationStep::CacheLookup {
                     tier: CompilationCacheTier::Persistent,
                     outcome: CompilationLookupOutcome::Miss(CompilationMissReason::Incompatible),
                 },
-                CompilationEventKind::BackendCompilation { outcome: CompilationStepOutcome::Succeeded },
-                CompilationEventKind::PersistentStore { outcome: CompilationStepOutcome::Succeeded },
+                CompilationStep::BackendCompilation { outcome: CompilationStepOutcome::Succeeded },
+                CompilationStep::PersistentStore { outcome: CompilationStepOutcome::Succeeded },
             ],
         );
 
@@ -3528,17 +3522,17 @@ mod tests {
         assert_eq!(context.statistics().exchange_fallbacks, 1);
         assert_eq!(context.statistics().compilations, 1);
         assert_eq!(
-            event_kinds(&context),
+            event_steps(&context),
             vec![
-                CompilationEventKind::CacheLookup {
+                CompilationStep::CacheLookup {
                     tier: CompilationCacheTier::Memory,
                     outcome: CompilationLookupOutcome::Miss(CompilationMissReason::NotFound),
                 },
-                CompilationEventKind::ExchangePreflight { outcome: CompilationStepOutcome::Succeeded },
-                CompilationEventKind::ExchangeReceive {
+                CompilationStep::ExchangePreflight { outcome: CompilationStepOutcome::Succeeded },
+                CompilationStep::ExchangeReceive {
                     outcome: CompilationLookupOutcome::Miss(CompilationMissReason::Incompatible),
                 },
-                CompilationEventKind::BackendCompilation { outcome: CompilationStepOutcome::Succeeded },
+                CompilationStep::BackendCompilation { outcome: CompilationStepOutcome::Succeeded },
             ],
         );
 
@@ -3611,14 +3605,14 @@ mod tests {
         assert_eq!(statistics.compilations, 1);
 
         assert_eq!(
-            event_kinds(&context),
+            event_steps(&context),
             vec![
-                CompilationEventKind::CacheLookup {
+                CompilationStep::CacheLookup {
                     tier: CompilationCacheTier::Memory,
                     outcome: CompilationLookupOutcome::Miss(CompilationMissReason::NotFound),
                 },
-                CompilationEventKind::BackendCompilation { outcome: CompilationStepOutcome::Succeeded },
-                CompilationEventKind::CacheLookup {
+                CompilationStep::BackendCompilation { outcome: CompilationStepOutcome::Succeeded },
+                CompilationStep::CacheLookup {
                     tier: CompilationCacheTier::Memory,
                     outcome: CompilationLookupOutcome::Hit,
                 },
@@ -3640,22 +3634,22 @@ mod tests {
         assert_eq!(context.statistics().compilations, 2);
 
         assert_eq!(
-            event_kinds(&context),
+            event_steps(&context),
             vec![
-                CompilationEventKind::CacheLookup {
+                CompilationStep::CacheLookup {
                     tier: CompilationCacheTier::Memory,
                     outcome: CompilationLookupOutcome::Miss(CompilationMissReason::NotFound),
                 },
-                CompilationEventKind::BackendCompilation {
-                    outcome: CompilationStepOutcome::Failed(CompilationEventError::CompilationFailed {
+                CompilationStep::BackendCompilation {
+                    outcome: CompilationStepOutcome::Failed(CompilationStepError::CompilationFailed {
                         message: "encountered malformed program: expected test failure".to_string()
                     }),
                 },
-                CompilationEventKind::CacheLookup {
+                CompilationStep::CacheLookup {
                     tier: CompilationCacheTier::Memory,
                     outcome: CompilationLookupOutcome::Miss(CompilationMissReason::NotFound),
                 },
-                CompilationEventKind::BackendCompilation { outcome: CompilationStepOutcome::Succeeded },
+                CompilationStep::BackendCompilation { outcome: CompilationStepOutcome::Succeeded },
             ],
         );
     }
@@ -3722,21 +3716,21 @@ mod tests {
         assert_eq!(context.statistics().waits, (THREAD_COUNT - 1) as u64);
 
         let mut expected = vec![
-            CompilationEventKind::CacheLookup {
+            CompilationStep::CacheLookup {
                 tier: CompilationCacheTier::Memory,
                 outcome: CompilationLookupOutcome::Miss(CompilationMissReason::NotFound),
             },
-            CompilationEventKind::BackendCompilation { outcome: CompilationStepOutcome::Succeeded },
+            CompilationStep::BackendCompilation { outcome: CompilationStepOutcome::Succeeded },
         ];
         expected.extend(std::iter::repeat_n(
-            CompilationEventKind::MemoryWait { outcome: CompilationLookupOutcome::Hit },
+            CompilationStep::MemoryWait { outcome: CompilationLookupOutcome::Hit },
             THREAD_COUNT - 1,
         ));
-        assert_eq!(event_kinds(&context), expected);
+        assert_eq!(event_steps(&context), expected);
         let lookup_duration = context
             .recent_events()
             .iter()
-            .filter(|event| !matches!(event.kind, CompilationEventKind::BackendCompilation { .. }))
+            .filter(|event| !matches!(event.step, CompilationStep::BackendCompilation { .. }))
             .map(|event| event.duration)
             .sum::<Duration>();
         assert_eq!(context.statistics().memory_lookup_duration, lookup_duration);

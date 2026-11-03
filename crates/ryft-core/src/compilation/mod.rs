@@ -170,9 +170,9 @@ pub mod functions;
 pub mod operations;
 
 pub use caching::{
-    CompilationCacheStatistics, CompilationCacheTier, CompilationContext, CompilationEvent, CompilationEventError,
-    CompilationEventKind, CompilationLookupOutcome, CompilationMissReason, CompilationSkipReason,
-    CompilationStepOutcome, DiskCache,
+    CompilationCacheStatistics, CompilationCacheTier, CompilationContext, CompilationEvent, CompilationLookupOutcome,
+    CompilationMissReason, CompilationSkipReason, CompilationStep, CompilationStepError, CompilationStepOutcome,
+    DiskCache,
 };
 pub use domains::{
     AnalyzableCompilationDomain, CompilationCacheDomain, CompilationDomain, Compile, StatefulCompilationDomain, jit,

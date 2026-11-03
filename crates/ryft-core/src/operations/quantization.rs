@@ -1441,6 +1441,9 @@ where
     }
 }
 
+/// Name of the composite calls that [`BlockScaledDot`] stages.
+const BLOCK_SCALED_DOT_NAME: &str = "block_scaled_dot";
+
 /// Element and scale formats of one input of a block-scaled matrix product, which [`BlockScaledDotConfiguration`]
 /// assigns to the left-hand side input, the right-hand side input, and/or the gradients. The scale data type selects
 /// the [`BlockQuantize`] recipe. Formats with [`F8E4M3FN`](DataType::F8E4M3FN) scales (e.g., NVFP4) use a global scale
@@ -1778,24 +1781,24 @@ impl BlockScaledDotConfiguration {
         {
             if BlockElementFormat::new(format.element_type).is_err() {
                 return Err(TypeError::invalid(format!(
-                    "`block_scaled_dot` {} format does not support element data type `{}`",
-                    name, format.element_type,
+                    "`{}` {} format does not support element data type `{}`",
+                    BLOCK_SCALED_DOT_NAME, name, format.element_type,
                 ))
                 .into());
             }
 
             if !matches!(format.scale_type, DataType::F8E4M3FN | DataType::F8E8M0FNU) {
                 return Err(TypeError::invalid(format!(
-                    "`block_scaled_dot` {} format does not support scale data type `{}`",
-                    name, format.scale_type,
+                    "`{}` {} format does not support scale data type `{}`",
+                    BLOCK_SCALED_DOT_NAME, name, format.scale_type,
                 ))
                 .into());
             }
 
             if format.block_size < 2 {
                 return Err(TypeError::invalid(format!(
-                    "`block_scaled_dot` {} format block size must be at least 2 but got {}",
-                    name, format.block_size,
+                    "`{}` {} format block size must be at least 2 but got {}",
+                    BLOCK_SCALED_DOT_NAME, name, format.block_size,
                 ))
                 .into());
             }
@@ -1803,8 +1806,8 @@ impl BlockScaledDotConfiguration {
 
         if !matches!(self.accumulation_type, DataType::BF16 | DataType::F16 | DataType::F32 | DataType::F64) {
             return Err(TypeError::invalid(format!(
-                "`block_scaled_dot` accumulation type must be one of `bf16`, `f16`, `f32`, and `f64` but got `{}`",
-                self.accumulation_type,
+                "`{}` accumulation type must be one of `bf16`, `f16`, `f32`, and `f64` but got `{}`",
+                BLOCK_SCALED_DOT_NAME, self.accumulation_type,
             ))
             .into());
         }
@@ -1812,10 +1815,10 @@ impl BlockScaledDotConfiguration {
         if !self.quantized_backward()
             && (self.stochastic_gradient_rounding || self.hadamard_transform || self.tiled_rhs_scales)
         {
-            return Err(TypeError::invalid(
-                "`block_scaled_dot` stochastic gradient rounding, Hadamard transforms, and tiled right scales require \
-                 quantized backward contractions",
-            )
+            return Err(TypeError::invalid(format!(
+                "`{BLOCK_SCALED_DOT_NAME}` stochastic gradient rounding, Hadamard transforms, and tiled right scales \
+                 require quantized backward contractions",
+            ))
             .into());
         }
 
@@ -1823,9 +1826,10 @@ impl BlockScaledDotConfiguration {
             && self.global_scaling == BlockScaledGlobalScaling::Provided
             && (self.lhs_format.has_global_scale() || self.gradient_format().has_global_scale())
         {
-            return Err(TypeError::invalid(
-                "`block_scaled_dot` Hadamard transforms of formats with global scales require current global scaling",
-            )
+            return Err(TypeError::invalid(format!(
+                "`{BLOCK_SCALED_DOT_NAME}` Hadamard transforms of formats with global scales require current global \
+                 scaling",
+            ))
             .into());
         }
 
@@ -1948,7 +1952,7 @@ where
             let Some(global_scale) = global_scale else { continue };
             if configuration.global_scaling != BlockScaledGlobalScaling::Provided || !format.has_global_scale() {
                 return Err(TypeError::invalid(format!(
-                    "`block_scaled_dot` {name} global scale requires provided global scaling and a format \
+                    "`{BLOCK_SCALED_DOT_NAME}` {name} global scale requires provided global scaling and a format \
                      with `f8e4m3fn` scales",
                 ))
                 .into());
@@ -1957,7 +1961,7 @@ where
             let r#type = global_scale.r#type();
             if r#type.rank() != 0 || !r#type.data_type().is_floating_point() || !r#type.data_type().is_real() {
                 return Err(TypeError::invalid(format!(
-                    "`block_scaled_dot` {name} global scale must be a rank-0 real floating-point array \
+                    "`{BLOCK_SCALED_DOT_NAME}` {name} global scale must be a rank-0 real floating-point array \
                      but got `{type}`",
                 ))
                 .into());
@@ -1967,9 +1971,9 @@ where
         let requires_random_state = configuration.stochastic_gradient_rounding;
         if random_state.is_some() != requires_random_state {
             return Err(TypeError::invalid(if requires_random_state {
-                "`block_scaled_dot` stochastic gradient rounding requires a random generator state"
+                format!("`{BLOCK_SCALED_DOT_NAME}` stochastic gradient rounding requires a random generator state")
             } else {
-                "`block_scaled_dot` random generator states require stochastic gradient rounding"
+                format!("`{BLOCK_SCALED_DOT_NAME}` random generator states require stochastic gradient rounding")
             })
             .into());
         }
@@ -1979,9 +1983,9 @@ where
         }
 
         if gradient_global_scale.is_some() && !configuration.quantized_backward() {
-            return Err(TypeError::invalid(
-                "`block_scaled_dot` gradient global scales require quantized backward contractions",
-            )
+            return Err(TypeError::invalid(format!(
+                "`{BLOCK_SCALED_DOT_NAME}` gradient global scales require quantized backward contractions",
+            ))
             .into());
         }
 
@@ -2156,9 +2160,6 @@ where
 
 // TODO(eaplatanios): Review from here onwards.
 
-/// Name of the composite calls that [`BlockScaledDot`] stages.
-const BLOCK_SCALED_DOT_NAME: &str = "block_scaled_dot";
-
 /// Fixed sign vector of the random Hadamard transform of NVIDIA Transformer Engine.
 const HADAMARD_SIGNS: [f64; 16] =
     [1.0, 1.0, 1.0, -1.0, 1.0, -1.0, -1.0, -1.0, -1.0, -1.0, -1.0, 1.0, -1.0, 1.0, -1.0, -1.0];
@@ -2250,14 +2251,14 @@ impl<'o> BlockScaledDotRules<'o> {
         for (name, r#type) in [("left", &lhs_type), ("right", &rhs_type)] {
             if !r#type.data_type().is_floating_point() || !r#type.data_type().is_real() {
                 return Err(TypeError::invalid(format!(
-                    "`block_scaled_dot` {name} input must have a real floating-point element type but got `{}`",
+                    "`{BLOCK_SCALED_DOT_NAME}` {name} input must have a real floating-point element type but got `{}`",
                     r#type.data_type(),
                 ))
                 .into());
             }
         }
         let (Some(lhs_shape), Some(rhs_shape)) = (lhs_type.static_shape(), rhs_type.static_shape()) else {
-            return Err(TypeError::invalid("`block_scaled_dot` inputs must have static shapes").into());
+            return Err(TypeError::invalid(format!("`{BLOCK_SCALED_DOT_NAME}` inputs must have static shapes")).into());
         };
         let lhs_shape = lhs_shape.dimensions().to_vec();
         let rhs_shape = rhs_shape.dimensions().to_vec();
@@ -2340,7 +2341,8 @@ impl<'o> BlockScaledDotRules<'o> {
         for (name, extent, block_size) in requirements {
             if extent == 0 || extent % block_size != 0 {
                 return Err(TypeError::invalid(format!(
-                    "`block_scaled_dot` {name} extent {extent} is not a positive multiple of block size {block_size}",
+                    "`{BLOCK_SCALED_DOT_NAME}` {name} extent {extent} is not a positive multiple of block size \
+                     {block_size}",
                 ))
                 .into());
             }
@@ -7428,9 +7430,11 @@ mod tests {
             differentiate_at((lhs.clone(), rhs.clone()))
                 .jvp((lhs, rhs), |(lhs, rhs)| function.call(lhs, rhs, None, None, None, None)),
             Err(DifferentiationError::Program(ProgramError::UnsupportedOperation { message }))
-                if message == "cannot apply forward mode differentiation to a `composite` call of `block_scaled_dot` \
-                               that has only reverse mode rules; it supports only reverse mode differentiation (e.g., \
-                               `vjp`, `value_and_gradient`, or `jacobian_reverse`)",
+                if message == format!(
+                    "cannot apply forward mode differentiation to a `composite` call of `{BLOCK_SCALED_DOT_NAME}` \
+                     that has only reverse mode rules; it supports only reverse mode differentiation (e.g., \
+                     `vjp`, `value_and_gradient`, or `jacobian_reverse`)",
+                ),
         ));
     }
 
@@ -7611,9 +7615,9 @@ mod tests {
                 DataType::F16,
                 DataType::F8E4M3FN,
             ))),
-            Err(error) if error == ProgramError::from(TypeError::invalid(
-                "`block_scaled_dot` left format does not support element data type `f16`",
-            )),
+            Err(error) if error == ProgramError::from(TypeError::invalid(format!(
+                "`{BLOCK_SCALED_DOT_NAME}` left format does not support element data type `f16`",
+            ))),
         ));
         assert!(matches!(
             block_scaled_dot::<EagerArrayContext>(configuration.clone().with_rhs_format(BlockScaleFormat::new(
@@ -7621,9 +7625,9 @@ mod tests {
                 DataType::F4E2M1FN,
                 DataType::F32,
             ))),
-            Err(error) if error == ProgramError::from(TypeError::invalid(
-                "`block_scaled_dot` right format does not support scale data type `f32`",
-            )),
+            Err(error) if error == ProgramError::from(TypeError::invalid(format!(
+                "`{BLOCK_SCALED_DOT_NAME}` right format does not support scale data type `f32`",
+            ))),
         ));
         assert!(matches!(
             block_scaled_dot::<EagerArrayContext>(configuration.clone().with_gradient_format(BlockScaleFormat::new(
@@ -7631,30 +7635,32 @@ mod tests {
                 DataType::F4E2M1FN,
                 DataType::F8E4M3FN,
             ))),
-            Err(error) if error == ProgramError::from(TypeError::invalid(
-                "`block_scaled_dot` gradient format block size must be at least 2 but got 1",
-            )),
+            Err(error) if error == ProgramError::from(TypeError::invalid(format!(
+                "`{BLOCK_SCALED_DOT_NAME}` gradient format block size must be at least 2 but got 1",
+            ))),
         ));
         assert!(matches!(
             block_scaled_dot::<EagerArrayContext>(configuration.clone().with_accumulation_type(DataType::I32)),
-            Err(error) if error == ProgramError::from(TypeError::invalid(
-                "`block_scaled_dot` accumulation type must be one of `bf16`, `f16`, `f32`, and `f64` but got `i32`",
-            )),
+            Err(error) if error == ProgramError::from(TypeError::invalid(format!(
+                "`{BLOCK_SCALED_DOT_NAME}` accumulation type must be one of `bf16`, `f16`, `f32`, and `f64` but \
+                 got `i32`",
+            ))),
         ));
         assert!(matches!(
             block_scaled_dot::<EagerArrayContext>(configuration.clone().with_tiled_rhs_scales(true)),
-            Err(error) if error == ProgramError::from(TypeError::invalid(
-                "`block_scaled_dot` stochastic gradient rounding, Hadamard transforms, and tiled right scales require \
-                 quantized backward contractions",
-            )),
+            Err(error) if error == ProgramError::from(TypeError::invalid(format!(
+                "`{BLOCK_SCALED_DOT_NAME}` stochastic gradient rounding, Hadamard transforms, and tiled right scales \
+                 require quantized backward contractions",
+            ))),
         ));
         assert!(matches!(
             block_scaled_dot::<EagerArrayContext>(
                 configuration.clone().with_quantized_backward(true).with_hadamard_transform(true),
             ),
-            Err(error) if error == ProgramError::from(TypeError::invalid(
-                "`block_scaled_dot` Hadamard transforms of formats with global scales require current global scaling",
-            )),
+            Err(error) if error == ProgramError::from(TypeError::invalid(format!(
+                "`{BLOCK_SCALED_DOT_NAME}` Hadamard transforms of formats with global scales require current global \
+                 scaling",
+            ))),
         ));
 
         let function = block_scaled_dot::<EagerArrayContext>(configuration).unwrap();
@@ -7662,15 +7668,16 @@ mod tests {
         let rhs = cyclic_matrix(8, 3, &[1.0]);
         assert_eq!(
             function.call(cyclic_matrix(2, 6, &[1.0]), cyclic_matrix(6, 3, &[1.0]), None, None, None, None),
-            Err(ProgramError::from(TypeError::invalid(
-                "`block_scaled_dot` contracting extent 6 is not a positive multiple of block size 4",
-            ))),
+            Err(ProgramError::from(TypeError::invalid(format!(
+                "`{BLOCK_SCALED_DOT_NAME}` contracting extent 6 is not a positive multiple of block size 4",
+            )))),
         );
         assert_eq!(
             function.call(lhs.clone(), rhs.clone(), Some(Array::vector(vec![1.0f32]).unwrap()), None, None, None),
-            Err(ProgramError::from(TypeError::invalid(
-                "`block_scaled_dot` left global scale must be a rank-0 real floating-point array but got `f32[1]`",
-            ))),
+            Err(ProgramError::from(TypeError::invalid(format!(
+                "`{BLOCK_SCALED_DOT_NAME}` left global scale must be a rank-0 real floating-point array but \
+                 got `f32[1]`",
+            )))),
         );
         assert_eq!(
             function.call(
@@ -7681,15 +7688,15 @@ mod tests {
                 None,
                 Some(Array::from_elements(RandomAlgorithm::ThreeFry.state_type(), &[1u64, 0]).unwrap()),
             ),
-            Err(ProgramError::from(TypeError::invalid(
-                "`block_scaled_dot` random generator states require stochastic gradient rounding",
-            ))),
+            Err(ProgramError::from(TypeError::invalid(format!(
+                "`{BLOCK_SCALED_DOT_NAME}` random generator states require stochastic gradient rounding",
+            )))),
         );
         assert_eq!(
             function.call(Array::matrix(2, 8, vec![1i32; 16]).unwrap(), rhs, None, None, None, None),
-            Err(ProgramError::from(TypeError::invalid(
-                "`block_scaled_dot` left input must have a real floating-point element type but got `i32`",
-            ))),
+            Err(ProgramError::from(TypeError::invalid(format!(
+                "`{BLOCK_SCALED_DOT_NAME}` left input must have a real floating-point element type but got `i32`",
+            )))),
         );
         let current = block_scaled_dot::<EagerArrayContext>(
             BlockScaledDotConfiguration::new(DotDimensionNumbers::matmul(), nvfp4)
@@ -7705,10 +7712,10 @@ mod tests {
                 None,
                 None,
             ),
-            Err(ProgramError::from(TypeError::invalid(
-                "`block_scaled_dot` right global scale requires provided global scaling and a format with `f8e4m3fn` \
-                 scales",
-            ))),
+            Err(ProgramError::from(TypeError::invalid(format!(
+                "`{BLOCK_SCALED_DOT_NAME}` right global scale requires provided global scaling and a format with \
+                 `f8e4m3fn` scales",
+            )))),
         );
 
         // Gradient global scales require quantized backward contractions, and random states must have a generator
@@ -7722,9 +7729,9 @@ mod tests {
                 Some(Array::scalar(1.0f32).unwrap()),
                 None,
             ),
-            Err(ProgramError::from(TypeError::invalid(
-                "`block_scaled_dot` gradient global scales require quantized backward contractions",
-            ))),
+            Err(ProgramError::from(TypeError::invalid(format!(
+                "`{BLOCK_SCALED_DOT_NAME}` gradient global scales require quantized backward contractions",
+            )))),
         );
         let rounding = block_scaled_dot::<EagerArrayContext>(
             BlockScaledDotConfiguration::new(DotDimensionNumbers::matmul(), nvfp4)
@@ -7763,9 +7770,9 @@ mod tests {
             .unwrap();
         assert_eq!(
             pullback.apply_materialized(cyclic_matrix(2, 3, &[1.0])),
-            Err(ProgramError::from(TypeError::invalid(
-                "`block_scaled_dot` right free extent 3 is not a positive multiple of block size 4",
-            ))),
+            Err(ProgramError::from(TypeError::invalid(format!(
+                "`{BLOCK_SCALED_DOT_NAME}` right free extent 3 is not a positive multiple of block size 4",
+            )))),
         );
     }
 
@@ -7792,10 +7799,10 @@ mod tests {
                 Some(Array::scalar(1.0f32).unwrap()),
                 None,
             ),
-            Err(ProgramError::from(TypeError::invalid(
-                "`block_scaled_dot` gradient global scale requires provided global scaling and a format with \
+            Err(ProgramError::from(TypeError::invalid(format!(
+                "`{BLOCK_SCALED_DOT_NAME}` gradient global scale requires provided global scaling and a format with \
                  `f8e4m3fn` scales",
-            ))),
+            )))),
         );
 
         // An inherited NVFP4 gradient format accepts a provided gradient global scale.
@@ -7828,9 +7835,9 @@ mod tests {
             .unwrap();
         assert_eq!(
             pullback.apply_materialized(cyclic_matrix(4, 2, &[1.0])),
-            Err(ProgramError::from(TypeError::invalid(
-                "`block_scaled_dot` right free extent 2 is not a positive multiple of block size 4",
-            ))),
+            Err(ProgramError::from(TypeError::invalid(format!(
+                "`{BLOCK_SCALED_DOT_NAME}` right free extent 2 is not a positive multiple of block size 4",
+            )))),
         );
     }
 
