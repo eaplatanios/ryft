@@ -6,7 +6,7 @@
 //! constants into flowing values, binds operations, resolves values conservatively, and reports whether its innermost
 //! semantics execute eagerly. Keeping those roles separate lets one program universe participate in eager execution,
 //! staging, batching, differentiation, partial evaluation, and nested combinations of those transforms. Refer to the
-//! documentation of [`Context`] for a rendered diagram of this relationship.
+//! documentation of [`Context`] for a diagram of this relationship.
 //!
 //! # Where Contexts Participate
 //!
@@ -179,27 +179,26 @@ impl<T: Type, C: Context + DomainProjection<T>> ContextProjection<T> for C where
 ///
 /// # Context Model
 ///
-/// ```mermaid
-/// %%{init: {"themeCSS": ".nodeLabel code { white-space: nowrap !important; }"}}%%
-/// flowchart TD
-///   domain["Domain"] --> families["Type, Value, Constant, and Operation Families"]
-///   domain --> context["Context"]
-///   context --> lift["&lt;code&gt;lift&lt;/code&gt;: Stored Constant to Flowing Value"]
-///   context --> bind["&lt;code&gt;bind&lt;/code&gt;: Apply Operation with Attached Regions"]
-///   context --> resolve["&lt;code&gt;resolve&lt;/code&gt;: Constant, Staged, or Opaque"]
-///   context --> eager_query["&lt;code&gt;is_eager&lt;/code&gt;: Innermost Execution Semantics"]
-///   bind --> eager["Eager Binding"]
-///   bind --> staging["Staging Binding"]
-///   bind --> transform["Transform Binding"]
-///   eager --> interpretation["InterpretableOperation Rule"]
-///   staging --> builder["Append Instruction to Program Builder"]
-///   transform --> rule["Apply Operation-Owned Transform Rule"]
-///   rule --> parent["Delegate Rewritten Primitive Work to Parent Context"]
-///   parent --> terminal["Eventually Execute Eagerly or Stage an Instruction"]
+/// ```text
+/// Domain
+/// ├─▶ Type, Value, Constant, and Operation Families
+/// └─▶ Context
+///     ├─▶ `lift`: Stored Constant to Flowing Value
+///     ├─▶ `bind`: Apply Operation with Attached Regions
+///     │   ├─▶ Eager Binding
+///     │   │   └─▶ InterpretableOperation Rule
+///     │   ├─▶ Staging Binding
+///     │   │   └─▶ Append Instruction to Program Builder
+///     │   └─▶ Transform Binding
+///     │       └─▶ Apply Operation-Owned Transform Rule
+///     │           └─▶ Delegate Rewritten Primitive Work to Parent Context
+///     │               └─▶ Eventually Execute Eagerly or Stage an Instruction
+///     ├─▶ `resolve`: Constant, Staged, or Opaque
+///     └─▶ `is_eager`: Innermost Execution Semantics
 /// ```
 ///
-/// All contexts are cloneable handles. Stateful implementations must ensure that clones share one active builder or
-/// transform state rather than fork it.
+/// All contexts are cloneable handles. Stateful implementations must ensure that clones share one active builder
+/// or transform state rather than fork it.
 ///
 /// # Guard Provision
 ///
@@ -215,7 +214,6 @@ impl<T: Type, C: Context + DomainProjection<T>> ContextProjection<T> for C where
 /// them (refer to [`needs_guards`](Self::needs_guards)). A guard that replay does construct is enforced by the
 /// family's rule under a transform, by interpretation in an eager context, or by staging, according to the contract in
 /// [the `GuardOperation` documentation](GuardOperation#enforcement).
-#[cfg_attr(doc, ryft_macros::mermaid)]
 pub trait Context:
     Clone + Domain<Operation: OperationProvider<Self::Type, GuardOperation<Self::Type>, Operation = Self::Operation>>
 {

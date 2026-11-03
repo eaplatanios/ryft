@@ -5,8 +5,8 @@
 //! order, and routes every operation through [`Context::bind`]. The supplied context determines what each bind means:
 //! an [`EagerContext`] executes an eager rule, a [`StagingContext`](crate::StagingContext) records an equivalent
 //! instruction, and a transform context applies its operation-owned rewrite. After replay, interpretation validates
-//! output refinements and rebuilds the declared output structure. Refer to [`InterpretationDriver`] for a rendered
-//! diagram of this pipeline and its nested-region path.
+//! output refinements and rebuilds the declared output structure. Refer to [`InterpretationDriver`] for a diagram of
+//! this pipeline and its nested-region path.
 //!
 //! # Choosing an Entry Point
 //!
@@ -104,33 +104,48 @@ use crate::programs::{
 ///
 /// # Replay Pipeline
 ///
-/// ```mermaid
-/// flowchart TD
-///   inputs["Structured Inputs"] --> environment["Flat Atom Environment"]
-///   constants["Live Program Constants"] -->|"lift through active context"| environment
-///   environment --> instruction["Next Instruction in Program Order"]
-///   regions["Instruction Attached Regions"] --> binding_driver["Application-Scoped Binding Region Driver"]
-///   instruction --> bind["Context Bind"]
-///   binding_driver --> bind
-///   bind --> eager["Eager Context"]
-///   bind --> staging["Staging Context"]
-///   bind --> transform["Transform Context"]
-///   eager --> driver["Adapt Attached Regions as Interpretation Driver"]
-///   driver --> rule["InterpretableOperation Rule"]
-///   staging --> staged["Import Regions and Append Equivalent Instruction"]
-///   transform --> transformed["Apply Transform Rule"]
-///   rule -->|"higher-order rule requests a region"| recurse["Replay Borrowed Region Through Same Eager Context"]
-///   rule --> results["Instruction Results"]
-///   staged --> results
-///   transformed --> results
-///   recurse --> results
-///   results --> environment
-///   environment -->|"after final instruction"| outputs["Validate Flat Outputs and Reconstruct Declared Structure"]
+/// ```text
+///   ┌───────────────────┐   ┌────────────────────────┐       ┌──────────────────────────────────┐
+///   │ Structured Inputs │   │ Live Program Constants │       │ Validate and Reconstruct Outputs │
+///   └─────────┬─────────┘   └──┬─────────────────────┘       └──────────────────────────────────┘
+///             ▼                ▼ lift through active context     ▲
+///   ┌──────────────────────────────────────────────────────┐     │ after final instruction
+/// ┌▶│ Flat Atom Environment                                ├─────┘
+/// │ └──────────────┬───────────────────────────────────────┘
+/// │                ▼
+/// │ ┌─────────────────────────────┐   ┌───────────────────────────────┐
+/// │ │ Next Instruction in Order   │   │ Instruction Attached Regions  │
+/// │ └──────────────┬──────────────┘   └───────────────┬───────────────┘
+/// │                ▼                                  ▼
+/// │ ┌─────────────────────────────┐   ┌───────────────────────────────┐
+/// │ │ `Context::bind`             │◀──┤ Binding RegionDriver          │
+/// │ └──────────────┬──────────────┘   └───────────────────────────────┘
+/// │                ├──────────────────────────────────┬──────────────────────────────┐
+/// │                ▼                                  ▼                              ▼
+/// │ ┌─────────────────────────────┐   ┌───────────────────────────────┐  ┌──────────────────────┐
+/// │ │ Eager Context               │   │ Staging Context               │  │ Transform Context    │
+/// │ └──────────────┬──────────────┘   └───────────────┬───────────────┘  └───────────┬──────────┘
+/// │                ▼                                  ▼                              ▼
+/// │ ┌─────────────────────────────┐   ┌───────────────────────────────┐  ┌──────────────────────┐
+/// │ │ Adapt InterpretationDriver  │   │ Append Equivalent Instruction │  │ Apply Transform Rule │
+/// │ └──────────────┬──────────────┘   └───────────────┬───────────────┘  └───────────┬──────────┘
+/// │                ▼                                  │                              │
+/// │ ┌─────────────────────────────┐                   │                              │
+/// │ │ InterpretableOperation Rule ├─┐                 │                              │
+/// │ └───┬─────────────────────────┘ │                 │                              │
+/// │     │ rule requests a region    │                 │                              │
+/// │     ▼                           │                 │                              │
+/// │ ┌─────────────────────────────┐ │                 │                              │
+/// │ │ Replay Region, Same Context │ │                 │                              │
+/// │ └──────────────┬──────────────┘ │                 │                              │
+/// │                ▼                ▼                 ▼                              ▼
+/// │ ┌───────────────────────────────────────────────────────────────────────────────────────────┐
+/// └─┤ Instruction Results                                                                       │
+///   └───────────────────────────────────────────────────────────────────────────────────────────┘
 /// ```
 ///
 /// The driver is application-scoped rather than stored in the operation payload, so the same operation can receive
 /// owned, borrowed, replayed, or shared attached computations through one ordered region contract.
-#[cfg_attr(doc, ryft_macros::mermaid)]
 pub trait InterpretationDriver<C: Domain>: RegionDriver<C::Constant, C::Operation> {
     /// Interprets the [`Region`](crate::Region) at `index` over the provided input values, re-entering the active
     /// program interpreter, and returns the region's output values.
