@@ -239,7 +239,7 @@ pub struct XlaSession<'c> {
     target: OnceLock<Result<XlaTarget, ryft_pjrt::Error>>,
 
     /// Cached artifacts contain no runtime execution association.
-    cache: CompilationContext<XlaDomain<'c>>,
+    cache: CompilationContext<'c, XlaDomain<'c>>,
 
     /// Compiled programs of eager operation applications, keyed in front of tracing and lowering. Refer to the
     /// documentation of [`XlaEagerDispatchKey`] for information on what the key captures.
@@ -295,7 +295,7 @@ impl<'c> XlaSession<'c> {
     }
 
     /// Creates a session with an explicitly configured compilation cache.
-    pub fn with_compilation_context(client: &'c Client<'c>, cache: CompilationContext<XlaDomain<'c>>) -> Arc<Self> {
+    pub fn with_compilation_context(client: &'c Client<'c>, cache: CompilationContext<'c, XlaDomain<'c>>) -> Arc<Self> {
         Arc::new(Self {
             client,
             target: OnceLock::new(),
@@ -353,7 +353,7 @@ impl<'c> XlaSession<'c> {
     }
 
     /// Returns the shared compilation cache.
-    pub fn compilation_context(&self) -> &CompilationContext<XlaDomain<'c>> {
+    pub fn compilation_context(&self) -> &CompilationContext<'c, XlaDomain<'c>> {
         &self.cache
     }
 
@@ -1080,7 +1080,7 @@ impl<'c> XlaDomain<'c> {
 
     /// Returns this domain's shared compilation context, which is owned by its session.
     #[inline]
-    pub fn compilation_context(&self) -> &CompilationContext<Self> {
+    pub fn compilation_context(&self) -> &CompilationContext<'c, Self> {
         &self.session.cache
     }
 

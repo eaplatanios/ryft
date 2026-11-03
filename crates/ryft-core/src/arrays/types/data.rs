@@ -36,34 +36,22 @@ pub enum DataTypeError {
 ///
 /// The data types form an automatic promotion lattice that is used whenever values of multiple types participate in the
 /// same operation. The diagram below shows the connected core of that lattice. Each node is a concrete [`DataType`]
-/// except for the special `f*/c*` node that is described below the diagram. A solid arrow `A -> B` means that `A`
+/// except for the special `f*/c*` node that is described below the diagram. A solid arrow `A ─▶ B` means that `A`
 /// can be promoted directly to `B`, and any longer solid path represents transitive widening to a more general type.
-/// The semantics of dashed arrows are explained later along with the semantics of the special `f*/c*` node.
+/// The semantics of dotted arrows are explained later along with the semantics of the special `f*/c*` node.
 ///
-/// ```mermaid
-///   flowchart LR
-///     boolean["bool"]
-///
-///     i1["i1"] --> i2["i2"] --> i4["i4"] --> i8["i8"] --> i16["i16"] --> i32["i32"] --> i64["i64"]
-///     u1["u1"] --> u2["u2"] --> u4["u4"] --> u8["u8"] --> u16["u16"] --> u32["u32"] --> u64["u64"]
-///     join["f*/c*"]
-///     join -.-> bf16["bf16"] --> f32["f32"]
-///     join -.-> f16["f16"] --> f32
-///     f32 --> f64["f64"] --> c128["c128"]
-///     f32 --> c64["c64"] --> c128
-///
-///     boolean --> u1
-///     u1 --> i2
-///     u2 --> i4
-///     u4 --> i8
-///
-///     i64 -.-> join
-///     u64 -.-> join
+/// ```text
+/// bool ─▶ u1 ─▶ u2 ─▶ u4 ─▶ u8 ─▶ u16 ─▶ u32 ─▶ u64 ┄┐
+///         │     │     │                              ┆
+///         ▼     ▼     ▼                              ▼
+///   i1 ─▶ i2 ─▶ i4 ─▶ i8 ─▶ i16 ─▶ i32 ─▶ i64 ┄┄┄▶ f*/c* ┄┬┄▶ bf16 ─┬─▶ f32 ─┬─▶ f64 ─┬─▶ c128
+///                                                         ┆         │        │        │
+///                                                         └┄▶ f16 ──┘        └─▶ c64 ─┘
 /// ```
 ///
 /// The special `f*/c*` node does not correspond to a real [`DataType`] variant. Instead, it represents some standard
 /// floating-point or complex type that is already present in the expression involving the type that is being promoted.
-/// Dashed edges from `i64` and `u64` into that node indicate that these wide integer types do not move onto the
+/// Dotted edges from `i64` and `u64` into that node indicate that these wide integer types do not move onto the
 /// floating-point or complex side of the lattice on their own, but they may do so when they are combined with an input
 /// that is already on that side. Once that happens, the final result is determined by following the solid arrows on
 /// that branch starting at the type of that input. When only `i64` and `u64` are involved, the result defaults to
@@ -696,7 +684,6 @@ pub enum DataTypeError {
 /// Ordinary scalar types may also support explicit element-type conversion between pairs that do not promote. Such
 /// conversions remain explicit because they may lose precision. [`DataType::Token`] and [`DataType::Zero`] are not
 /// ordinary scalar representations and cannot be converted to or from other types.
-#[cfg_attr(doc, ryft_macros::mermaid)]
 #[derive(Copy, Clone, Debug, PartialEq, Eq, Hash, Parameter)]
 pub enum DataType {
     /// [`DataType`] that represents token values that are threaded between side-effecting operations.
