@@ -1066,6 +1066,28 @@ mod tests {
     }
 
     #[test]
+    fn test_region_ref_transform_shares_artifacts_across_program_clones() {
+        // Program clones share their sealed regions and therefore their retained artifacts, whereas an independently
+        // built program with identical contents owns a separate cache.
+        let program = identity_program();
+        let artifact = program
+            .entry_region_ref()
+            .transform::<TestTransform, _, Infallible>(CollisionKey(0), derive_test_artifact)
+            .unwrap();
+        let cloned = program
+            .clone()
+            .entry_region_ref()
+            .transform::<TestTransform, _, Infallible>(CollisionKey(0), derive_test_artifact)
+            .unwrap();
+        assert!(Arc::ptr_eq(&artifact.programs()[0], &cloned.programs()[0]));
+        let independent = identity_program()
+            .entry_region_ref()
+            .transform::<TestTransform, _, Infallible>(CollisionKey(0), derive_test_artifact)
+            .unwrap();
+        assert!(!Arc::ptr_eq(&artifact.programs()[0], &independent.programs()[0]));
+    }
+
+    #[test]
     fn test_region_ref_transform_derivation_errors_are_not_retained() {
         let program = identity_program();
         let region = program.entry_region_ref();

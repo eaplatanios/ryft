@@ -4479,7 +4479,7 @@ mod tests {
         ReferenceFreezeOperation, ReferenceNewOperation, ReferenceRead, ReferenceReadOperation,
         ReferenceWriteOperation,
     };
-    use crate::operations::sharding::shard_map::{ShardMap, ShardMapOperation};
+    use crate::operations::sharding::shard_map::{ShardMapBoundary, ShardMapOperation};
     use crate::operations::trigonometric::SinOperation;
     use crate::parameters::{Parameter, Placeholder};
     use crate::partial::{PartialEvaluationInput, PartialTracer};
@@ -15457,7 +15457,7 @@ mod tests {
         let stack_sharding =
             Sharding::new(mesh.clone(), vec![ShardingDimension::replicated(), ShardingDimension::sharded(["devices"])])
                 .unwrap();
-        let shard_map = ShardMap::new(
+        let shard_map = ShardMapBoundary::new(
             mesh.clone(),
             vec![replicated.clone(), stack_sharding.clone()],
             vec![replicated, stack_sharding],
@@ -23073,7 +23073,8 @@ mod tests {
         let map_body: TestIrProgram = builder.build(Vec::new(), vec![Placeholder; 2], Vec::new()).unwrap();
         let mesh = LogicalMesh::new(vec![MeshAxis::new("x", 2, MeshAxisType::Manual).unwrap()]).unwrap();
         let replicated = Sharding::replicated(mesh.clone(), 0);
-        let shard_map = ShardMap::new(mesh, vec![replicated.clone(), replicated], Vec::new(), Vec::new()).unwrap();
+        let shard_map =
+            ShardMapBoundary::new(mesh, vec![replicated.clone(), replicated], Vec::new(), Vec::new()).unwrap();
         let input_types = vec![ArrayIrType::from(scalar_type.clone()); 2];
         let mut builder = ProgramBuilder::<TestIrValue, TestIrOperation>::new();
         let map_body = builder.import_program(map_body);
@@ -23990,7 +23991,7 @@ mod tests {
                     in (%5, %6, %7)"},
             );
 
-            let map = ShardMap::new(
+            let map = ShardMapBoundary::new(
                 mesh.clone(),
                 vec![replicated.clone(), replicated.clone(), sharded.clone()],
                 vec![sharded.clone(); 3],
@@ -24091,7 +24092,8 @@ mod tests {
         let operation = ShardMapOperation::from_program(
             &transposed,
             vec![ArrayType::new_static(DataType::F32, [2]).into()],
-            ShardMap::new(mesh, vec![sharded], vec![replicated.clone(), stacked_sharding.clone()], Vec::new()).unwrap(),
+            ShardMapBoundary::new(mesh, vec![sharded], vec![replicated.clone(), stacked_sharding.clone()], Vec::new())
+                .unwrap(),
         )
         .unwrap();
         assert_eq!(

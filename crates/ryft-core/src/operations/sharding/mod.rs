@@ -23,9 +23,9 @@
 //!     which trace a local body and bind it on input values, the [`trace_shard_map`], [`trace_shard_map_with_options`],
 //!     and [`trace_shard_map_with_named_axes`] closure entry points, which trace a local body for global input types
 //!     and return it unbound as a [`TracedShardMap`], and the [`ShardMapOperation`] they stage, which runs its local
-//!     body once per device coordinate along the active manual axes of a [`ShardMap`]. The body receives the local
-//!     shards that the input shardings assign to the executing device, and the global outputs are assembled from its
-//!     local outputs through the output shardings. The closures of [`shard_map_in_context`] and
+//!     body once per device coordinate along the active manual axes of a [`ShardMapBoundary`]. The body receives the
+//!     local shards that the input shardings assign to the executing device, and the global outputs are assembled from
+//!     its local outputs through the output shardings. The closures of [`shard_map_in_context`] and
 //!     [`trace_shard_map_with_named_axes`] also receive the [`ShardMapContext`] of the body, through
 //!     which bodies without inputs can create values (e.g., device coordinates along manual axes).
 //!     Refer to the [`shard_map`](mod@shard_map) module for its complete semantics, including the ownership contract
@@ -104,7 +104,7 @@ pub use constrain_sharding::{
 };
 pub use reshard::{RESHARD_OPERATION_NAME, Reshard, ReshardDispatch, ReshardOperation};
 pub use shard_map::{
-    SHARD_MAP_OPERATION_NAME, ShardMap, ShardMapContext, ShardMapError, ShardMapOperation, ShardMapTracer,
+    SHARD_MAP_OPERATION_NAME, ShardMapBoundary, ShardMapContext, ShardMapError, ShardMapOperation, ShardMapTracer,
     TracedShardMap, shard_map, shard_map_in_context, shard_map_with_options, trace_shard_map,
     trace_shard_map_with_named_axes, trace_shard_map_with_options,
 };

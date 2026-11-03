@@ -4579,8 +4579,8 @@ mod tests {
     use pretty_assertions::assert_eq;
 
     use crate::arrays::{
-        Array, ArrayIrOperation, ArrayIrType, ArrayIrValue, ArrayOperation, ArrayReference, ArrayReferenceTransform,
-        ArrayReferenceTransformIndex, ArrayType, DataType,
+        Array, ArrayIrOperation, ArrayIrType, ArrayIrValue, ArrayOperation, ArrayReference, ArrayReferenceDischarge,
+        ArrayReferenceTransform, ArrayReferenceTransformIndex, ArrayReferenceTransformPath, ArrayType, DataType,
     };
     use crate::captures::CaptureReference;
     use crate::contexts::EagerContext;
@@ -9711,6 +9711,138 @@ mod tests {
     }
 
     #[test]
+    fn test_program_discharge_references_with_policy() {
+        thread_local! {
+            static POLICY_CALLS: RefCell<Vec<&'static str>> = const { RefCell::new(Vec::new()) };
+        }
+
+        /// Policy other than the canonical policy of [`ArrayIrType`] that records each of its calls and delegates
+        /// the array semantics of every call to [`ArrayReferenceDischarge`].
+        #[derive(Copy, Clone, Debug)]
+        struct RecordingPolicy;
+
+        impl<C: Context<Type = ArrayIrType, Operation = DischargeOperation>> ReferenceDischargePolicy<C> for RecordingPolicy {
+            type Referent = ArrayType;
+            type Transform = ArrayReferenceTransform;
+            type Alias = ArrayReferenceTransformPath<C::Value>;
+
+            fn storage_alias(referent: &ArrayType) -> Self::Alias {
+                POLICY_CALLS.with_borrow_mut(|calls| calls.push("storage_alias"));
+                <ArrayReferenceDischarge as ReferenceDischargePolicy<C>>::storage_alias(referent)
+            }
+
+            fn apply_transforms(
+                context: &C,
+                alias: &Self::Alias,
+                transforms: &[ArrayReferenceTransform],
+                bindings: &[C::Value],
+            ) -> Result<Self::Alias, ProgramError> {
+                POLICY_CALLS.with_borrow_mut(|calls| calls.push("apply_transforms"));
+                ArrayReferenceDischarge::apply_transforms(context, alias, transforms, bindings)
+            }
+
+            fn read(context: &C, current: &C::Value, alias: &Self::Alias) -> Result<C::Value, ProgramError> {
+                POLICY_CALLS.with_borrow_mut(|calls| calls.push("read"));
+                ArrayReferenceDischarge::read(context, current, alias)
+            }
+
+            fn write(
+                context: &C,
+                current: &C::Value,
+                replacement: C::Value,
+                alias: &Self::Alias,
+            ) -> Result<C::Value, ProgramError> {
+                POLICY_CALLS.with_borrow_mut(|calls| calls.push("write"));
+                ArrayReferenceDischarge::write(context, current, replacement, alias)
+            }
+        }
+
+        impl<C: Context<Type = ArrayIrType, Operation = DischargeOperation>> ReferenceAccumulationPolicy<C>
+            for RecordingPolicy
+        {
+            fn accumulate(
+                context: &C,
+                current: &C::Value,
+                update: C::Value,
+                alias: &Self::Alias,
+            ) -> Result<C::Value, ProgramError> {
+                POLICY_CALLS.with_borrow_mut(|calls| calls.push("accumulate"));
+                ArrayReferenceDischarge::accumulate(context, current, update, alias)
+            }
+        }
+
+        // `f(initial, index, update) = { r = new(initial); r[index] += update; (r[index], freeze(r)) }`.
+        let view = vec![ArrayReferenceTransform::Index { axis: 0, index: ArrayReferenceTransformIndex::Dynamic }];
+        let mut builder = ProgramBuilder::<DischargeValue, DischargeOperation>::new();
+        let initial = builder.add_input(ArrayType::new_static(DataType::F32, [3]).into());
+        let index = builder.add_input(ArrayType::scalar(DataType::I32).into());
+        let update = builder.add_input(ArrayType::scalar(DataType::F32).into());
+        let reference =
+            builder.add_instruction(ReferenceNewOperation::new(), Vec::new(), vec![initial], None).unwrap()[0];
+        builder
+            .add_instruction(
+                ReferenceAddUpdateOperation::new().with_transforms(view.clone()),
+                Vec::new(),
+                vec![reference, update, index],
+                None,
+            )
+            .unwrap();
+        let observed = builder
+            .add_instruction(
+                ReferenceReadOperation::new().with_transforms(view),
+                Vec::new(),
+                vec![reference, index],
+                None,
+            )
+            .unwrap()[0];
+        let frozen =
+            builder.add_instruction(ReferenceFreezeOperation::new(), Vec::new(), vec![reference], None).unwrap()[0];
+        let source = builder
+            .build::<Vec<DischargeValue>, Vec<DischargeValue>>(
+                vec![observed, frozen],
+                vec![Placeholder; 3],
+                vec![Placeholder; 2],
+            )
+            .unwrap();
+
+        // Every view reconstruction goes through the explicit policy rather than the canonical one.
+        POLICY_CALLS.with_borrow_mut(Vec::clear);
+        let discharged = source.clone().discharge_references_with_policy::<RecordingPolicy>(0).unwrap();
+        assert_eq!(
+            POLICY_CALLS.with_borrow(Vec::clone),
+            vec!["storage_alias", "apply_transforms", "accumulate", "apply_transforms", "read"],
+        );
+        assert_eq!(discharged.output_count(), 2);
+        assert_eq!(discharged.external_reference_bindings(), &[]);
+        assert_eq!(
+            discharged.program().to_string(),
+            indoc! {"
+                lambda %0:f32[3], %1:i32[], %2:f32[] .
+                let %3:f32[1] = dynamic_slice [sizes=[1]] %0 %1
+                    %4:f32[] = reshape [shape=[]] %3
+                    %5:f32[] = add %4 %2
+                    %6:f32[1] = reshape [shape=[1]] %5
+                    %7:f32[3] = dynamic_update_slice %0 %6 %1
+                    %8:f32[1] = dynamic_slice [sizes=[1]] %7 %1
+                    %9:f32[] = reshape [shape=[]] %8
+                in (%9, %7)"},
+        );
+
+        // The discharged program computes what the source computes eagerly.
+        let inputs = vec![
+            DischargeValue::Array(Array::vector(vec![2.0_f32, 3.0, 5.0]).unwrap()),
+            DischargeValue::Array(Array::scalar(1_i32).unwrap()),
+            DischargeValue::Array(Array::scalar(7.0_f32).unwrap()),
+        ];
+        let outputs = vec![
+            DischargeValue::Array(Array::scalar(10.0_f32).unwrap()),
+            DischargeValue::Array(Array::vector(vec![2.0_f32, 10.0, 5.0]).unwrap()),
+        ];
+        assert_eq!(source.interpret(inputs.clone()), Ok(outputs.clone()));
+        assert_eq!(discharged.program().interpret(inputs), Ok(outputs));
+    }
+
+    #[test]
     fn test_program_discharge_references_in_capture_lifted_program() {
         // The attached region names the caller-owned reference only through a capture constant. Capture lifting moves
         // that reference into the entry input prefix while leaving the nested constant for the discharge transform to
@@ -10060,6 +10192,70 @@ mod tests {
         let selected = ReferenceDischargeResult::try_from(selected.unwrap()).unwrap();
         let full = source.discharge_references(0).unwrap();
         assert_eq!(selected.program().to_string(), full.program().to_string());
+    }
+
+    #[test]
+    fn test_program_partially_discharge_references_selects_an_internal_target_inside_a_region() {
+        // The allocation lives inside the callee region, so whether it is discharged is decided while the callee is
+        // rebuilt, from the replay location that the region driver reports for the allocating instruction.
+        let mut callee_builder = ProgramBuilder::<ListIrValue, ListOperation>::new();
+        let initial = callee_builder.add_input(ListIrType::List(ListType { length: 2 }));
+        let allocation = callee_builder
+            .add_instruction(ListOperation::ReferenceNew, Vec::new(), vec![initial], None)
+            .unwrap()[0];
+        let frozen =
+            callee_builder.add_instruction(ListOperation::Freeze, Vec::new(), vec![allocation], None).unwrap()[0];
+        let callee = callee_builder
+            .build::<Vec<ListIrValue>, Vec<ListIrValue>>(vec![frozen], vec![Placeholder], vec![Placeholder])
+            .unwrap();
+
+        let mut builder = ProgramBuilder::<ListIrValue, ListOperation>::new();
+        let initial = builder.add_input(ListIrType::List(ListType { length: 2 }));
+        let callee = builder.import_program(callee);
+        let value = builder.add_instruction(ListOperation::Call, vec![callee], vec![initial], None).unwrap()[0];
+        let source = builder
+            .build::<Vec<ListIrValue>, Vec<ListIrValue>>(vec![value], vec![Placeholder], vec![Placeholder])
+            .unwrap();
+
+        // Selecting nothing preserves the allocation inside the rebuilt callee.
+        let preserved = source.clone().partially_discharge_references(0, &[]).unwrap();
+        assert_eq!(preserved.external_reference_bindings(), &[]);
+        assert_eq!(
+            preserved.program().to_string(),
+            indoc! {"
+                lambda %0:list<2> .
+                let %1:list<2> = list.call %0 [
+                    callee={
+                        lambda %0:list<2> .
+                        let %1:ref<list<2>> = list.reference_new %0
+                            %2:list<2> = list.freeze %1
+                        in (%2)
+                    },
+                ]
+                in (%1)"},
+        );
+
+        // Selecting the enumerated interior target discharges the allocation completely.
+        let targets = source.reference_discharge_targets(0).unwrap();
+        assert_eq!(
+            targets,
+            vec![ReferenceDischargeTarget::Internal { instruction: InstructionId::new(callee, 0), output_index: 0 }],
+        );
+        let selected = source.partially_discharge_references(0, targets.as_slice()).unwrap();
+        let selected = ReferenceDischargeResult::try_from(selected).unwrap();
+        assert_eq!(selected.external_reference_bindings(), &[]);
+        assert_eq!(
+            selected.program().to_string(),
+            indoc! {"
+                lambda %0:list<2> .
+                let %1:list<2> = list.call %0 [
+                    callee={
+                        lambda %0:list<2> .
+                        in (%0)
+                    },
+                ]
+                in (%1)"},
+        );
     }
 
     #[test]

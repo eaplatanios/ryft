@@ -622,7 +622,7 @@ mod tests {
         CustomRuleDefinition, CustomRuleRegistration, DimensionAddOperation, DimensionFromScalarOperation,
         DimensionMulOperation, DimensionSizeOperation, DynamicBroadcastOperation, DynamicReshapeOperation,
         MulOperation, ParallelAllGatherOutputVariance, RandomAlgorithm, ReduceOperation, ReductionKind,
-        RematerializationOptimizationBarrier, ScanOperation, ShardMap, WhileOperation, ZeroOperation,
+        RematerializationOptimizationBarrier, ScanOperation, ShardMapBoundary, WhileOperation, ZeroOperation,
     };
     use crate::parameters::Placeholder;
     use crate::partial::{PartialEvaluationContext, PartialValue, ResidualPolicyReference};
@@ -1292,7 +1292,7 @@ mod tests {
                     let body = ProgramBuilder::<ArrayIrValue<Array>, ArrayIrOperation<Array>>::new()
                         .build::<Vec<ArrayIrValue<Array>>, Vec<ArrayIrValue<Array>>>(Vec::new(), Vec::new(), Vec::new())
                         .unwrap();
-                    let shard_map = ShardMap::new(
+                    let shard_map = ShardMapBoundary::new(
                         LogicalMesh::new(vec![MeshAxis::new("x", 2, MeshAxisType::Manual).unwrap()]).unwrap(),
                         Vec::new(),
                         Vec::new(),

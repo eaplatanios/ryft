@@ -4634,6 +4634,7 @@ pub(crate) mod tests {
     use indoc::indoc;
     use num_complex::Complex;
     use pretty_assertions::assert_eq;
+    use ryft_macros::Operation;
 
     use crate::arrays::{
         Array, ArrayIrOperation, ArrayIrType, ArrayIrValue, ArrayOperation, ArrayReference, ArrayReferenceTransform,
@@ -4641,15 +4642,22 @@ pub(crate) mod tests {
         DimensionValue, DimensionVariable, LogicalMesh, MeshAxis, MeshAxisType, Shape, Sharding,
     };
     use crate::batching::{BatchAxis, batch};
-    use crate::contexts::{EagerContext, StagingContext};
-    use crate::differentiation::forward::LinearizationTracer;
+    use crate::contexts::{EagerContext, ProjectedContext, StagingContext};
+    use crate::differentiation::forward::{
+        DifferentiationContext, DifferentiationDriver, DifferentiationDual, DifferentiationPolicy, LinearizationTracer,
+        MemberDifferentiableOperation,
+    };
     use crate::differentiation::{Differentiate, differentiate_at};
     use crate::macros::{check_count, check_types, impl_guardless_operation};
     use crate::operations::{
-        AddOperation, CastOperation, ConditionOperation, Constant, MulOperation, PrintOperation, ReduceOperation,
+        AddOperation, BroadcastOperation, CastOperation, CompareOperation, ConcatenateOperation, ConditionOperation,
+        Constant, ConstantOperation, ConvertElementTypeOperation, DivOperation, ExpOperation, MulOperation,
+        NegOperation, OneLikeOperation, PadOperation, ParallelVaryOperation, PrintOperation, ReduceOperation,
         ReductionKind, ReferenceAddUpdate, ReferenceAddUpdateOperation, ReferenceFreeze, ReferenceFreezeOperation,
         ReferenceNew, ReferenceNewOperation, ReferenceRead, ReferenceReadOperation, ReferenceSwap,
-        ReferenceSwapOperation, ReferenceWrite, ReferenceWriteOperation, Sin, StopGradient, ZeroOperation,
+        ReferenceSwapOperation, ReferenceWrite, ReferenceWriteOperation, ReshapeOperation, ReshardOperation,
+        SelectOperation, Sin, SliceOperation, StopGradient, SubOperation, TransposeOperation, UpdateSliceOperation,
+        ZeroLikeOperation, ZeroOperation,
     };
     use crate::parameters::Placeholder;
     use crate::partial::PartialValue;
@@ -10049,6 +10057,203 @@ pub(crate) mod tests {
         assert_eq!(outputs.len(), 2);
         assert_abs_diff_eq!(outputs[0].to_f64s()[0], expected_value, epsilon = 1e-9);
         assert_abs_diff_eq!(outputs[1].to_f64s()[0], expected_gradient, epsilon = 1e-9);
+    }
+
+    #[test]
+    fn test_value_and_gradient_value_only_array_ir_family() {
+        // An operation family over the array IR type universe that supports no reference operation still computes
+        // ordinary gradients, because gradients of value-only inputs never allocate, accumulate into, or freeze
+        // cotangent references.
+
+        /// Ordinary array primitives needed by elementwise differentiation and its shape alignment rules.
+        #[derive(Clone, Debug, Operation)]
+        #[ryft(type(ArrayType), constant(Array), dispatch(differentiation, transposition))]
+        enum ValueOnlyArrayOperation {
+            Constant(ConstantOperation<Array>),
+            Zero(ZeroOperation<ArrayType>),
+            One(OneOperation<ArrayType>),
+            ZeroLike(ZeroLikeOperation<ArrayType>),
+            OneLike(OneLikeOperation<ArrayType>),
+            Neg(NegOperation<ArrayType>),
+            Add(AddOperation<ArrayType>),
+            Sub(SubOperation<ArrayType>),
+            Exp(ExpOperation<ArrayType>),
+            Mul(MulOperation<ArrayType>),
+            ConvertElementType(ConvertElementTypeOperation<ArrayType>),
+            Broadcast(BroadcastOperation),
+            Transpose(TransposeOperation),
+            Reshape(ReshapeOperation),
+            Reduce(ReduceOperation),
+            Concatenate(ConcatenateOperation<ArrayType>),
+            Slice(SliceOperation),
+            UpdateSlice(UpdateSliceOperation),
+            Pad(PadOperation<ArrayType>),
+            Reshard(ReshardOperation),
+            Compare(CompareOperation<ArrayType>),
+            Div(DivOperation<ArrayType>),
+            Select(SelectOperation<ArrayType>),
+        }
+
+        impl OperationProvider<ArrayType, ParallelVaryOperation> for ValueOnlyArrayOperation {
+            type Operation = Self;
+
+            fn provide(_request: ParallelVaryOperation, input_types: &[&ArrayType]) -> Result<Self, ProgramError> {
+                check_count!("input", input_types, 1, ProgramError);
+                Err(ProgramError::UnsupportedOperation {
+                    message: "value-only test operation family cannot align manual variation".to_string(),
+                })
+            }
+        }
+
+        /// Array IR operation family containing only constants and ordinary array operations.
+        #[derive(Clone, Debug, Operation)]
+        #[ryft(
+            type(ArrayIrType),
+            constant(ArrayIrValue<Array>),
+            members(ArrayType),
+            dispatch(differentiation, transposition),
+        )]
+        enum ValueOnlyOperation {
+            Constant(ConstantOperation<ArrayIrValue<Array>>),
+            Zero(ZeroOperation<ArrayIrType>),
+            One(OneOperation<ArrayIrType>),
+            #[ryft(projected(ArrayType))]
+            Array(ValueOnlyArrayOperation),
+        }
+
+        impl ReferenceAccessOperation for ValueOnlyOperation {
+            type Transform = NoReferenceTransform<ArrayType, ArrayIrType>;
+
+            fn base_input_count(&self) -> usize {
+                0
+            }
+
+            fn reference_access_descriptor(
+                &self,
+                _input_index: usize,
+            ) -> Option<ReferenceAccessDescriptor<'_, Self::Transform>> {
+                None
+            }
+
+            fn with_reference_access_transforms(
+                &self,
+                _input_index: usize,
+                _transforms: Vec<Self::Transform>,
+            ) -> Result<Self, ProgramError> {
+                Err(ProgramError::UnsupportedOperation {
+                    message: "value-only operations have no reference accesses".to_string(),
+                })
+            }
+        }
+
+        // The member rules stay entirely within ordinary arrays, so the standard projection adapters suffice.
+        impl<C> MemberDifferentiableOperation<C> for ValueOnlyArrayOperation
+        where
+            C: Context<
+                    Type = ArrayIrType,
+                    Value: ValueProjection<ArrayType, Projected: Value<Type = ArrayType>>,
+                    Constant: ValueProjection<ArrayType, Projected: Value<Type = ArrayType>>,
+                    Operation = ValueOnlyOperation,
+                >,
+            ProjectedContext<C, ArrayType>: Domain<
+                    Type = ArrayType,
+                    Value = <C::Value as ValueProjection<ArrayType>>::Projected,
+                    Constant = <C::Constant as ValueProjection<ArrayType>>::Projected,
+                    Operation = ValueOnlyArrayOperation,
+                >,
+            Self: DifferentiableOperation<ProjectedContext<C, ArrayType>>,
+        {
+            fn jvp_in_parent<D: DifferentiationDriver<C>, P: DifferentiationPolicy<C>>(
+                &self,
+                context: &DifferentiationContext<C, P>,
+                _driver: &D,
+                inputs: &[DifferentiationDual<C::Value>],
+            ) -> Result<Vec<DifferentiationDual<C::Value>>, DifferentiationError> {
+                context.jvp_projected_operation(self, inputs)
+            }
+        }
+
+        impl MemberTransposableOperation<ArrayIrValue<Array>, ValueOnlyOperation> for ValueOnlyArrayOperation {
+            fn transpose_in_parent<D: TranspositionDriver<ArrayIrValue<Array>, ValueOnlyOperation>>(
+                &self,
+                context: &mut TranspositionContext<ArrayIrValue<Array>, ValueOnlyOperation>,
+                _driver: &D,
+                inputs: &[PartialValue<Tracer<TracingContext<ArrayIrValue<Array>, ValueOnlyOperation>>>],
+                outputs: &[MaybeZero<Tracer<TracingContext<ArrayIrValue<Array>, ValueOnlyOperation>>>],
+                accumulators: &[CotangentAccumulator],
+            ) -> Result<(), DifferentiationError> {
+                context.transpose_projected_operation(self, inputs, outputs, accumulators)
+            }
+        }
+
+        // This fixture uses static shapes, whose residual zeros need no runtime dimensions.
+        impl ResidualZeroProvider<ArrayIrType> for ValueOnlyOperation {}
+
+        impl From<AddOperation<ArrayIrType>> for ValueOnlyOperation {
+            fn from(_operation: AddOperation<ArrayIrType>) -> Self {
+                Self::Array(ValueOnlyArrayOperation::Add(AddOperation::new()))
+            }
+        }
+
+        // The family converts from no reference payload, so it explicitly reports every reference operation that
+        // reverse mode may request as unsupported.
+        impl OperationProvider<ArrayIrType, ReferenceNewOperation<ArrayType, ArrayIrType>> for ValueOnlyOperation {
+            type Operation = Self;
+
+            fn provide(
+                _request: ReferenceNewOperation<ArrayType, ArrayIrType>,
+                input_types: &[&ArrayIrType],
+            ) -> Result<Self, ProgramError> {
+                check_count!("input", input_types, 1, ProgramError);
+                Err(ProgramError::UnsupportedOperation {
+                    message: "this operation family does not support reference allocation".to_string(),
+                })
+            }
+        }
+
+        impl OperationProvider<ArrayIrType, ReferenceAddUpdateOperation<ArrayType, ArrayIrType>> for ValueOnlyOperation {
+            type Operation = Self;
+
+            fn provide(
+                _request: ReferenceAddUpdateOperation<ArrayType, ArrayIrType>,
+                input_types: &[&ArrayIrType],
+            ) -> Result<Self, ProgramError> {
+                check_count!("input", input_types, 2, ProgramError);
+                Err(ProgramError::UnsupportedOperation {
+                    message: "this operation family does not support reference accumulation".to_string(),
+                })
+            }
+        }
+
+        impl OperationProvider<ArrayIrType, ReferenceFreezeOperation<ArrayType, ArrayIrType>> for ValueOnlyOperation {
+            type Operation = Self;
+
+            fn provide(
+                _request: ReferenceFreezeOperation<ArrayType, ArrayIrType>,
+                input_types: &[&ArrayIrType],
+            ) -> Result<Self, ProgramError> {
+                check_count!("input", input_types, 1, ProgramError);
+                Err(ProgramError::UnsupportedOperation {
+                    message: "this operation family does not support reference freezing".to_string(),
+                })
+            }
+        }
+
+        let context = EagerContext::<ArrayIrValue<Array>, ValueOnlyOperation>::new();
+        let result = differentiate_at(ArrayIrValue::Array(Array::scalar(3.0_f32).unwrap()))
+            .in_context(&context)
+            .value_and_gradient(|value| {
+                let operation = ValueOnlyOperation::Array(ValueOnlyArrayOperation::Add(AddOperation::new()));
+                let mut outputs = value.context().bind(operation, Vec::new(), &[value.clone(), value.clone()])?;
+                Ok::<_, ProgramError>(outputs.remove(0))
+            });
+        assert_eq!(
+            result,
+            Ok((
+                ArrayIrValue::Array(Array::scalar(6.0_f32).unwrap()),
+                ArrayIrValue::Array(Array::scalar(2.0_f32).unwrap()),
+            )),
+        );
     }
 
     #[test]
