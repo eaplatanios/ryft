@@ -331,19 +331,30 @@ pub enum SpecializationCacheEntry<'c, Key: Clone + Eq + Hash, Artifact: Clone> {
 ///
 /// # Type Relationships
 ///
-/// ```mermaid
-/// %%{init: {"themeCSS": ".nodeLabel code, .edgeLabel code { white-space: nowrap !important; }"}}%%
-/// flowchart LR
-///   owner["Retained Callable or Transform Owner"] -->|"owns"| cache["&lt;code&gt;SpecializationCache&lt;/code&gt;"]
-///   key["Owner-Defined &lt;code&gt;Key&lt;/code&gt;"] --> cache
-///   caller["Caller"] -->|"&lt;code&gt;try_entry(Key)&lt;/code&gt;"| cache
-///   cache -->|"&lt;code&gt;Occupied&lt;/code&gt;"| artifact["Cloned &lt;code&gt;Artifact&lt;/code&gt;"]
-///   cache -->|"&lt;code&gt;Vacant&lt;/code&gt;"| producer["&lt;code&gt;SpecializationCacheProducer&lt;/code&gt;"]
-///   cache -->|"same thread and &lt;code&gt;Key&lt;/code&gt;"| reentrant["&lt;code&gt;ReentrantSpecializationError&lt;/code&gt;"]
-///   producer -->|"&lt;code&gt;insert(Artifact)&lt;/code&gt;"| cache
-///   producer -->|"drop without insert"| retry["Marker cleared; next request retries"]
-///   cache --> counters["Private atomic counters"]
-///   counters -->|"&lt;code&gt;statistics()&lt;/code&gt;"| snapshot["&lt;code&gt;SpecializationCacheStatistics&lt;/code&gt;"]
+/// ```text
+/// ┌──────────────────────────────────────┐    ┌─────────────────────┐    ┌────────┐
+/// │ Retained Callable or Transform Owner │    │ Owner-Defined `Key` │    │ Caller │
+/// └───────────────────┬──────────────────┘    └──────────┬──────────┘    └───┬────┘
+///                     │ owns                             │                   │ `try_entry(key)`
+///                     ▼                                  ▼                   ▼
+/// ┌─────────────────────────────────────────────────────────────────────────────────────────────┐
+/// │ `SpecializationCache`                                                                       │
+/// └┬────────────┬───────────────────┬─────────────────────────────────────┬─────────────────────┘
+///  │            │ `Occupied`        │ `Vacant`      ▲                     │ same thread and `key`
+///  │            ▼                   ▼               │ `insert(artifact)`  ▼
+///  │ ┌───────────────────┐  ┌───────────────────────┴───────┐  ┌────────────────────────────────┐
+///  │ │ Cloned `Artifact` │  │ `SpecializationCacheProducer` │  │ `ReentrantSpecializationError` │
+///  │ └───────────────────┘  └─────────────────────────┬─────┘  └────────────────────────────────┘
+///  │                                                  │ drop without insert
+///  ▼                                                  ▼
+/// ┌─────────────────────────────────┐  ┌──────────────────────────────────────┐
+/// │ Private Atomic Counters         │  │ Marker Cleared; Next Request Retries │
+/// └────────────────┬────────────────┘  └──────────────────────────────────────┘
+///                  │ `statistics()`
+///                  ▼
+/// ┌─────────────────────────────────┐
+/// │ `SpecializationCacheStatistics` │
+/// └─────────────────────────────────┘
 /// ```
 ///
 /// [`Self::try_entry`] represents the low-level entry API for this cache. An occupied entry returns a cloned artifact.
@@ -353,7 +364,6 @@ pub enum SpecializationCacheEntry<'c, Key: Clone + Eq + Hash, Artifact: Clone> {
 /// owned key, and a miss continues through [`Self::try_entry`] with the owned key, which counts the miss and authorizes
 /// production. Statistics are exposed as ordinary value snapshots, while private atomics accumulate events without
 /// participating in cache correctness.
-#[cfg_attr(doc, ryft_macros::mermaid)]
 pub struct SpecializationCache<Key, Artifact> {
     /// Retained artifacts in Least-Recently-Used (LRU) order.
     entries: Mutex<LruCache<Key, Artifact>>,

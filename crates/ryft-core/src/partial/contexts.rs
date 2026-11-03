@@ -70,23 +70,48 @@ pub enum ReferencePlacement {
 ///
 /// # Evaluation Pipeline
 ///
-/// ```mermaid
-/// flowchart TD
-///   inputs["Inputs Classified as Known Values or Unknown Types"] --> context["PartialEvaluationContext"]
-///   context --> rules["Operation Partial-Evaluation Rules"]
-///   rules -->|"all inputs known"| parent["Known-Side Parent Context"]
-///   parent -->|"execute eagerly or append to an outer program"| known["Known Result Values"]
-///   rules -->|"mixed or unknown"| residualize["Residualize Operation"]
-///   unknown["Unknown Inputs and Residual Variables"] --> residualize
-///   known -->|"needed by residual work"| materialize["Materialization Policy"]
-///   materialize -->|"known variable"| residual_input["Residual Input Feeder"]
-///   materialize -->|"literal or designated constant"| residual_constant["Inline Residual Constant"]
-///   residual_input --> builder["Residual Program Builder"]
-///   residual_constant --> builder
-///   residualize --> builder
-///   known --> finalize["Finalize Boundary Mappings"]
-///   builder --> finalize
-///   finalize --> result["Residual Program with Input and Output Wiring"]
+/// ```text
+///   ┌────────────────────────────────────────────────────┐
+///   │ Inputs Classified as Known Values or Unknown Types │
+///   └───┬────────────────────────────────────────────────┘
+///       ▼
+///   ┌────────────────────────────────────────────────────┐
+///   │ `PartialEvaluationContext`                         │
+///   └───┬────────────────────────────────────────────────┘
+///       ▼
+///   ┌────────────────────────────────────────────────────┐          mixed or unknown
+///   │ Operation Partial-Evaluation Rules                 ├─────────────────────────────────────┐
+///   └───┬────────────────────────────────────────────────┘                                     │
+///       │ all inputs known                                                                     │
+///       ▼                                                                                      │
+///   ┌────────────────────────────┐                   ┌───────────────────────────────────────┐ │
+///   │ Known-Side Parent Context  │                   │ Unknown Inputs and Residual Variables │ │
+///   └───┬────────────────────────┘                   └──────────────────┬────────────────────┘ │
+///       │ execute eagerly or append to an outer program                 │                      │
+///       ▼                                                               ▼                      │
+///   ┌────────────────────────────┐                                ┌──────────────────────────┐ │
+/// ┌─┤ Known Result Values        │                                │ Residualize Operation    │◀┘
+/// │ └───┬────────────────────────┘                                └───────────────────────┬──┘
+/// │     │ needed by residual work                                                         │
+/// │     ▼                                                                                 │
+/// │ ┌────────────────────────────┐                                                        │
+/// │ │ Materialization Policy     ├───────┐                                                │
+/// │ └───┬────────────────────────┘       │                                                │
+/// │     │                                │ literal or designated constant                 │
+/// │     │ known variable                 │                                                │
+/// │     ▼                                ▼                                                ▼
+/// │ ┌────────────────────────────┐  ┌──────────────────────────┐  ┌──────────────────────────┐
+/// │ │ Residual Input Feeder      │  │ Inline Residual Constant ├─▶│ Residual Program Builder │
+/// │ └────────────────┬───────────┘  └──────────────────────────┘  └───────────────┬──────────┘
+/// │                  │                                                  ▲         │
+/// │                  └──────────────────────────────────────────────────┘         │
+/// │ ┌────────────────────────────────────────────────────┐                        │
+/// └▶│ Finalize Boundary Mappings                         │◀───────────────────────┘
+///   └───┬────────────────────────────────────────────────┘
+///       ▼
+///   ┌────────────────────────────────────────────────────┐
+///   │ Residual Program with Input and Output Wiring      │
+///   └────────────────────────────────────────────────────┘
 /// ```
 ///
 /// # Preserving Effect Order
@@ -120,7 +145,6 @@ pub enum ReferencePlacement {
 /// Mutable state is shared behind `Rc<RefCell<...>>` handles. Cloning this context therefore keeps every clone writing
 /// to the same residual program, input descriptors, staged-feeder table, and ordering state, and lets rules re-enter
 /// the context (e.g., to inline a selected condition branch through [`inline_program`](Self::inline_program)).
-#[cfg_attr(doc, ryft_macros::mermaid)]
 pub struct PartialEvaluationContext<C: Context> {
     /// Parent context in which known operations are evaluated or staged. An `Rc` shares the exact parent object across
     /// clones and deferred siblings instead of cloning `C`, whose `Clone` implementation need not preserve object

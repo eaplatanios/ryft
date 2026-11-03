@@ -186,7 +186,7 @@ impl<T: Type, C: Context + DomainProjection<T>> ContextProjection<T> for C where
 ///     ├─▶ `lift`: Stored Constant to Flowing Value
 ///     ├─▶ `bind`: Apply Operation with Attached Regions
 ///     │   ├─▶ Eager Binding
-///     │   │   └─▶ InterpretableOperation Rule
+///     │   │   └─▶ `InterpretableOperation` Rule
 ///     │   ├─▶ Staging Binding
 ///     │   │   └─▶ Append Instruction to Program Builder
 ///     │   └─▶ Transform Binding

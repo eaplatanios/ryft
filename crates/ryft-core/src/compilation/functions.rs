@@ -974,27 +974,34 @@ impl<Static, Structure, Key> SpecializationKey<Static, Structure, Key> {
 ///
 /// # Retained JIT Lifecycle
 ///
-/// ```mermaid
-/// %%{init: {"themeCSS": ".nodeLabel code { white-space: nowrap !important; }"}}%%
-/// flowchart TD
-///   call["&lt;code&gt;CompiledFunctionDispatcher::execute&lt;/code&gt; with Static Parameters and Dynamic Inputs"]
-///   call --> key["Derive Specialization Key"]
-///   key --> frontend_cache["Per-Function Bounded Specialization Cache"]
-///   frontend_cache -->|"hit"| executable["Shared &lt;code&gt;ExecutableFunction&lt;/code&gt;"]
-///   frontend_cache -->|"miss"| closure["Invoke Rust Closure"]
-///   closure -->|"stage"| staged["&lt;code&gt;StagedFunction&lt;/code&gt; and Closed Source Program"]
-///   staged -->|"lower"| lowered["&lt;code&gt;LoweredFunction&lt;/code&gt; and Backend Lowered Program"]
-///   staged -.->|"&lt;code&gt;call&lt;/code&gt; inside an outer trace"| nested["Nested Call Operation"]
-///   lowered --> compilation_context["Shared &lt;code&gt;CompilationContext&lt;/code&gt;"]
-///   compilation_context -->|"restore or compile"| compiled["&lt;code&gt;CompiledFunction&lt;/code&gt;"]
-///   compiled -->|"&lt;code&gt;into_executable&lt;/code&gt;"| executable
-///   executable -->|"insert after cold production"| frontend_cache
-///   executable -->|"execute"| outputs["Structured Runtime Outputs"]
+/// ```text
+/// ┌────────────────────────────────────────┐
+/// │ `CompiledFunctionDispatcher::execute`  │
+/// └──────────────┬─────────────────────────┘
+///                │ static parameters and dynamic inputs
+///                ▼
+/// ┌────────────────────────────┐                                ┌─────────────────────────────┐
+/// │ Derive Specialization Key  │                                │ Structured Runtime Outputs  │
+/// └──────────────┬─────────────┘  insert after cold production  └─────────────────────────────┘
+///                │        ┌─────────────────────────────────────────┐          ▲
+///                ▼        ▼                                         │          │ execute
+/// ┌────────────────────────────┐              hit               ┌───┴──────────┴──────────────┐
+/// │ Specialization Cache       ├───────────────────────────────▶│ Shared `ExecutableFunction` │
+/// └──────────────┬─────────────┘                                └─────────────────────────────┘
+///                │ miss                                             ▲
+///                ▼                                                  │ `into_executable`
+/// ┌────────────────────────────┐ stage ┌────────────────────┐   ┌───┴─────────────────────────┐
+/// │ Invoke Rust Closure        ├──────▶│ `StagedFunction`   │   │ `CompiledFunction`          │
+/// └────────────────────────────┘       └──┬──────┬──────────┘   └─────────────────────────────┘
+///     ┌┄┄┄┄┄┄┄┄┄┄┄┄┄┄┄┄┄┄┄┄┄┄┄┄┄┄┄┄┄┄┄┄┄┄┄┘      │ lower            ▲
+///     ▼ `call` inside an outer trace             ▼                  │ restore or compile
+/// ┌────────────────────────────┐       ┌────────────────────┐   ┌───┴─────────────────────────┐
+/// │ Nested Call Operation      │       │ `LoweredFunction`  ├──▶│ Shared `CompilationContext` │
+/// └────────────────────────────┘       └────────────────────┘   └─────────────────────────────┘
 /// ```
 ///
 /// The cache hit edge skips staging, lowering, and compilation. The dotted edge is the alternative staging path, along
 /// which a staged function becomes a nested call boundary instead of continuing immediately toward an executable.
-#[cfg_attr(doc, ryft_macros::mermaid)]
 pub struct CompiledFunctionDispatcher<
     C: CompilationDomain<Type: Eq + Hash>,
     Static: Clone + Debug + Eq + Hash,

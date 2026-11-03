@@ -56,26 +56,40 @@ pub enum ProgramRenderingMode {
 ///
 /// # Program Lifecycle
 ///
-/// ```mermaid
-/// %%{init: {"themeCSS": ".nodeLabel code { white-space: nowrap !important; }"}}%%
-/// flowchart TD
-///   inputs["Typed Inputs and Stored Constants"] --> builder["Mutable &lt;code&gt;ProgramBuilder&lt;/code&gt;"]
-///   regions["Sealed Nested Region Closures"] --> builder
-///   builder -->|"add atoms and checked instructions"| boundary["Validate Structured Boundaries"]
-///   program["Immutable &lt;code&gt;Program&lt;/code&gt; with One Region Arena"]
-///   boundary -->|"&lt;code&gt;build&lt;/code&gt;"| program
-///   program --> replay["Interpret through an Active Context"]
-///   program --> transform["Batch, Differentiate, or Partially Evaluate"]
-///   program --> analyze["Inspect Effects, Liveness, and Statistics"]
-///   program --> rewrite["Simplify or Filter"]
-///   program --> compile["Lower and Compile through a Backend"]
-///   transform --> derived["New Validated Program"]
-///   rewrite --> derived
+/// ```text
+/// ┌────────────────────────────────────────┐     ┌───────────────────────────────────────────┐
+/// │ Typed Inputs and Stored Constants      │     │ Sealed Nested Region Closures             │
+/// └────────────────────┬───────────────────┘     └─────────────────────┬─────────────────────┘
+///                      └──────────────────────┬────────────────────────┘
+///                                             ▼
+///                         ┌─────────────────────────────────────────┐
+///                         │ Mutable `ProgramBuilder`                │
+///                         └───────────────────┬─────────────────────┘
+///                                             │ add atoms and checked instructions
+///                                             ▼
+///                         ┌─────────────────────────────────────────┐
+///                         │ Validate Structured Boundaries          │
+///                         └───────────────────┬─────────────────────┘
+///                                             │ `build`
+///                                             ▼
+///                         ┌─────────────────────────────────────────┐
+///                         │ Immutable `Program` (One Region Arena)  │
+///                         └───────────────────┬─────────────────────┘
+/// ┌────────────────────────────────────────┐  │  ┌───────────────────────────────────────────┐
+/// │ Interpret through an Active Context    │◀─┼─▶│ Batch, Differentiate, Partially Evaluate  ├─┐
+/// └────────────────────────────────────────┘  │  └───────────────────────────────────────────┘ │
+///                                             │                                                │
+/// ┌────────────────────────────────────────┐  │  ┌───────────────────────────────────────────┐ │
+/// │ Inspect Effects, Liveness, Statistics  │◀─┼─▶│ Simplify or Filter                        │ │
+/// └────────────────────────────────────────┘  │  └─────────────────────┬─────────────────────┘ │
+///                                             │                        ▼                       │
+/// ┌────────────────────────────────────────┐  │  ┌───────────────────────────────────────────┐ │
+/// │ Lower and Compile through a Backend    │◀─┘  │ New Validated Program                     │◀┘
+/// └────────────────────────────────────────┘     └───────────────────────────────────────────┘
 /// ```
 ///
 /// Construction through [`ProgramBuilder`](crate::ProgramBuilder) is the only mutable phase. Every consumer starts
 /// from a program whose region graph and structured boundaries have already been validated.
-#[cfg_attr(doc, ryft_macros::mermaid)]
 #[derive(Debug)]
 pub struct Program<V: Typed + Parameter, O, Input: Parameterized<V>, Output: Parameterized<V>> {
     /// [`Parameter`] structure that can be used to map flat lists of inputs to structured `Input` values.

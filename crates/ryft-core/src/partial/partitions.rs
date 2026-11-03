@@ -179,19 +179,27 @@ impl PartitionMetadata {
 ///
 /// # Boundary Wiring
 ///
-/// ```mermaid
-/// flowchart LR
-///   known_inputs["Selected Original Known Inputs"] --> known_program["Known Program"]
-///   known_program --> known_outputs["Known Original Outputs"]
-///   known_program --> residual_edges["Residual Edge Values"]
-///   unknown_inputs["Original Unknown Inputs"] --> residual_program["Residual Program"]
-///   residual_edges --> residual_program
-///   known_inputs -. "forwarded" .-> residual_program
-///   known_outputs -. "forwarded" .-> residual_program
-///   residual_program --> residual_outputs["Residual Original Outputs"]
-///   known_outputs --> descriptors["Output Descriptors"]
-///   residual_outputs --> descriptors
-///   descriptors --> outputs["Outputs in Original Order"]
+/// ```text
+/// ┌────────────────────────────────┐   ┌──────────────────────┐   ┌───────────────────────────┐
+/// │ Selected Original Known Inputs ├──▶│ Known Program        ├──▶│ Known Original Outputs    ├─┐
+/// └───────────────────┬────────────┘   └───────────┬──────────┘   └───┬───────────────────────┘ │
+///                     ┆                            ▼                  ┆                         │
+///                     ┆                ┌──────────────────────┐       ┆                         │
+///                     ┆ forwarded      │ Residual Edge Values │       ┆ forwarded               │
+///                     ┆                └───────────┬──────────┘       ┆                         │
+///                     └┄┄┄┄┄┄┄┄┄┄┄┄┄┄┄┄┄┄┄┄┐       │      ┌┄┄┄┄┄┄┄┄┄┄┄┘                         │
+///                                          ▼       ▼      ▼                                     │
+/// ┌────────────────────────────────┐   ┌──────────────────────┐   ┌───────────────────────────┐ │
+/// │ Original Unknown Inputs        ├──▶│ Residual Program     ├──▶│ Residual Original Outputs │ │
+/// └────────────────────────────────┘   └──────────────────────┘   └─────────────┬─────────────┘ │
+///                                                                               ▼               │
+///                                                                 ┌───────────────────────────┐ │
+///                                                                 │ Output Descriptors        │◀┘
+///                                                                 └─────────────┬─────────────┘
+///                                                                               ▼
+///                                                                 ┌───────────────────────────┐
+///                                                                 │ Outputs in Original Order │
+///                                                                 └───────────────────────────┘
 /// ```
 ///
 /// The known program receives only the original inputs selected by [`known_input_indices`](Self::known_input_indices).
@@ -232,7 +240,6 @@ impl PartitionMetadata {
 /// The wiring renders on one line when it is short enough. The effect-ordering constraints are not rendered, because
 /// reference analysis derives them from the two programs, and neither is the
 /// [`original_input_count`](Self::original_input_count).
-#[cfg_attr(doc, ryft_macros::mermaid)]
 pub struct PartitionedProgram<V: Value, O: Operation<Type = V::Type>> {
     /// Refer to the documentation of [`known_program`](Self::known_program) for more information.
     known_program: Program<V, O, Vec<V>, Vec<V>>,

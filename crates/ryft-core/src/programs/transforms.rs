@@ -191,27 +191,14 @@ use crate::specialization::{ReentrantSpecializationError, SpecializationCache, S
 ///
 /// # Type Relationships
 ///
-/// ```mermaid
-/// %%{init: {"themeCSS": ".nodeLabel code { white-space: nowrap !important; }"}}%%
-/// flowchart TB
-///   descriptor["&lt;code&gt;Transform&lt;/code&gt; Descriptor"]
-///   arguments["&lt;code&gt;Arguments&lt;/code&gt;"]
-///   artifact["&lt;code&gt;Artifact&lt;/code&gt;"]
-///   capacity["&lt;code&gt;DEFAULT_CACHE_CAPACITY&lt;/code&gt;"]
-///   typed_cache["&lt;code&gt;TransformCache&lt;/code&gt; Alias"]
-///   specialization["&lt;code&gt;SpecializationCache&lt;/code&gt;"]
-///   region_owner["&lt;code&gt;RegionRef&lt;/code&gt;"]
-///   registry["Per-Region Namespace Registry"]
-///   region_artifact["&lt;code&gt;Program&lt;/code&gt; Bundle and Metadata"]
-///   descriptor --> arguments
-///   descriptor --> artifact
-///   descriptor --> capacity
-///   typed_cache --> specialization
-///   region_owner --> registry
-///   registry --> specialization
-///   registry --> region_artifact
+/// ```text
+/// `Transform` Descriptor ─┬─▶ `Arguments`
+///                         ├─▶ `Artifact`
+///                         └─▶ `DEFAULT_CACHE_CAPACITY`
+///
+/// `RegionRef` ─▶ Per-Region Namespace Registry ─┬─▶ `SpecializationCache` ◀─ `TransformCache` Alias
+///                                               └─▶ `Program` Bundle and Metadata
 /// ```
-#[cfg_attr(doc, ryft_macros::mermaid)]
 pub trait Transform<Source> {
     /// Complete equality and hash identity of one specialization within the owning transform cache.
     type Arguments: Clone + Eq + Hash;
@@ -661,16 +648,28 @@ impl<'r, V: Value, O: Operation<Type = V::Type>> RegionRef<'r, V, O> {
     /// # }
     /// ```
     ///
-    /// ```mermaid
-    /// %%{init: {"themeCSS": ".nodeLabel code { white-space: nowrap !important; }"}}%%
-    /// flowchart LR
-    ///   request["&lt;code&gt;RegionRef&lt;/code&gt; and &lt;code&gt;Arguments&lt;/code&gt;"] --> namespace["Marker Namespace"]
-    ///   namespace -->|"hit"| retained["Retained &lt;code&gt;TransformArtifact&lt;/code&gt;"]
-    ///   namespace -->|"miss"| derive["Uncached Derivation"]
-    ///   derive --> sanitize["Detach Source Cache Identity"]
-    ///   sanitize --> publish["Publish and Return &lt;code&gt;TransformArtifact&lt;/code&gt;"]
+    /// ```text
+    /// ┌────────────────────────────────────────┐
+    /// │ `RegionRef` and `Arguments`            │
+    /// └───────────────────┬────────────────────┘
+    ///                     ▼
+    /// ┌────────────────────────────────────────┐  hit   ┌──────────────────────────────┐
+    /// │ Marker Namespace                       ├───────▶│ Retained `TransformArtifact` │
+    /// └───────────────────┬────────────────────┘        └──────────────────────────────┘
+    ///                     │ miss
+    ///                     ▼
+    /// ┌────────────────────────────────────────┐
+    /// │ Uncached Derivation                    │
+    /// └───────────────────┬────────────────────┘
+    ///                     ▼
+    /// ┌────────────────────────────────────────┐
+    /// │ Detach Source Cache Identity           │
+    /// └───────────────────┬────────────────────┘
+    ///                     ▼
+    /// ┌────────────────────────────────────────┐
+    /// │ Publish and Return `TransformArtifact` │
+    /// └────────────────────────────────────────┘
     /// ```
-    #[cfg_attr(doc, ryft_macros::mermaid)]
     pub fn transform<
         T: 'static
             + Transform<
