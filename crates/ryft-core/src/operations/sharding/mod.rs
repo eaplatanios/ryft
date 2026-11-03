@@ -20,15 +20,15 @@
 //!     compiler must place the value as requested over the auto axes, and remains free everywhere the constraint is
 //!     unconstrained). Requests that shard a dimension over a non-auto axis are rejected in favor of a reshard.
 //!   - The [`ShardMap`] context capability and the global [`shard_map()`](fn@shard_map) function, which trace a local
-//!     body and bind it on input values, the [`trace_shard_map`] function, which traces a local body for global input
-//!     types and returns it unbound as a [`TracedShardMap`], and the [`ShardMapOperation`] they stage, which runs its
-//!     local body once per device coordinate along the active manual axes of a [`ShardMapBoundary`]. All three take
-//!     [`ShardMapOptions`], which select these axes. The body receives the local shards that the input shardings assign
-//!     to the executing device, and the global outputs are assembled from its local outputs through the output
-//!     shardings. The body functions of [`ShardMap`] and [`trace_shard_map`] also receive the [`ShardMapContext`] of
-//!     the body, through which bodies without inputs can create values (e.g., device coordinates along manual axes).
-//!     Refer to the [`shard_map`](mod@shard_map) module for its complete semantics, including the ownership contract
-//!     for references that cross its boundary.
+//!     body and bind it on input values, and the [`ShardMapOperation`] they stage, which runs its local body once per
+//!     device coordinate along the active manual axes of a [`ShardMapBoundary`]. Both take [`ShardMapOptions`], which
+//!     select these axes. The body receives the local shards that the input shardings assign to the executing device,
+//!     and the global outputs are assembled from its local outputs through the output shardings. The body function of
+//!     [`ShardMap`] also receives the [`ShardMapContext`] of the body, through which bodies without inputs can create
+//!     values (e.g., device coordinates along manual axes). Like every other operation, a `shard_map` is traced without
+//!     values by invoking it on tracers (e.g., through [`trace`](crate::trace)). Refer to the
+//!     [`shard_map`](mod@shard_map) module for its complete semantics, including the ownership
+//!     contract for references that cross its boundary.
 //!
 //! Batching lifts the reshard and the sharding constraint by inserting an entry for the new batch axis into the
 //! target sharding (i.e., a reshard takes the mapped axis's own sharding, whereas a constraint leaves the new axis
@@ -104,7 +104,7 @@ pub use constrain_sharding::{
 pub use reshard::{RESHARD_OPERATION_NAME, Reshard, ReshardDispatch, ReshardOperation};
 pub use shard_map::{
     SHARD_MAP_OPERATION_NAME, ShardMap, ShardMapBoundary, ShardMapContext, ShardMapError, ShardMapOperation,
-    ShardMapOptions, ShardMapTracer, TracedShardMap, shard_map, trace_shard_map,
+    ShardMapOptions, ShardMapTracer, shard_map,
 };
 
 /// Group of the sharding-control capabilities [`Reshard`] and [`ConstrainSharding`]. It is implemented automatically

@@ -402,15 +402,12 @@ mod tests {
     use ryft_core::{
         Array, ArrayBatch, ArrayOperation, BatchAxis, BatchAxisSpecification, BatchableOperation, BatchingContext,
         Context, Differentiate, EmptyRegionDriver, LogicalMesh, MeshAxis, MeshAxisType, ParallelRaggedAllToAll, Reduce,
-        ShardMapOptions, ShardingDimension, StagingContext, TracedShardMap, TracingContext, Value, batch,
-        trace_shard_map,
+        ShardMapOptions, ShardingDimension, StagingContext, TracingContext, Value, batch,
     };
     use ryft_mlir::Location;
 
-    use crate::XlaDomain;
     use crate::experimental::XlaArrayTracer;
-    use crate::experimental::lowering::tests::test_sharding;
-    use crate::operations::sharding::shard_map::to_mlir_module;
+    use crate::experimental::lowering::tests::{shard_map_module, test_sharding};
 
     use super::*;
 
@@ -429,10 +426,10 @@ mod tests {
     use crate::tests::{values_from_bytes, values_to_bytes};
 
     #[test]
-    fn test_to_mlir_module_renders_parallel_ragged_all_to_all() {
+    fn test_to_mlir_module_for_program_renders_parallel_ragged_all_to_all() {
         let mesh = LogicalMesh::new(vec![MeshAxis::new("x", 2, MeshAxisType::Manual).unwrap()]).unwrap();
         let sharding = test_sharding(&mesh, vec![ShardingDimension::sharded(["x"])], vec![]);
-        let traced: TracedShardMap<XlaDomain<'static>, Vec<ArrayType>, ArrayType> = trace_shard_map(
+        let module = shard_map_module::<_, Vec<ArrayType>, ArrayType>(
             |_, inputs: Vec<XlaArrayTracer>| {
                 inputs[0].parallel_ragged_all_to_all("x", &inputs[1], &inputs[2], &inputs[3], &inputs[4], &inputs[5])
             },
@@ -448,11 +445,10 @@ mod tests {
             vec![sharding.clone(); 6],
             sharding,
             ShardMapOptions::new(),
-            &[],
         )
         .unwrap();
         assert_eq!(
-            to_mlir_module(&traced, "main").unwrap(),
+            module,
             indoc! {"
                 module {
                   sdy.mesh @mesh = <[\"x\"=2]>
@@ -487,13 +483,13 @@ mod tests {
     }
 
     #[test]
-    fn test_to_mlir_module_renders_parallel_ragged_all_to_all_batched_over_an_unrelated_axis() {
+    fn test_to_mlir_module_for_program_renders_parallel_ragged_all_to_all_batched_over_an_unrelated_axis() {
         // A named batch over `y` inside a manual region over `x` merges its batch items into the packed exchange and
         // rebases the varying metadata by offsets that share their variation, so the merged program lowers.
         let mesh = LogicalMesh::new(vec![MeshAxis::new("x", 2, MeshAxisType::Manual).unwrap()]).unwrap();
         let sharding =
             test_sharding(&mesh, vec![ShardingDimension::sharded(["x"]), ShardingDimension::replicated()], vec![]);
-        let traced: TracedShardMap<XlaDomain<'static>, Vec<ArrayType>, ArrayType> = trace_shard_map(
+        let module = shard_map_module::<_, Vec<ArrayType>, ArrayType>(
             |_, inputs: Vec<XlaArrayTracer>| {
                 Ok(batch(
                     |inputs: Vec<_>| {
@@ -518,11 +514,10 @@ mod tests {
             vec![sharding.clone(); 6],
             sharding,
             ShardMapOptions::new(),
-            &[],
         )
         .unwrap();
         assert_eq!(
-            to_mlir_module(&traced, "main").unwrap(),
+            module,
             indoc! {"
                 #loc = loc(unknown)
                 module {
@@ -584,10 +579,10 @@ mod tests {
     }
 
     #[test]
-    fn test_to_mlir_module_renders_grouped_parallel_ragged_all_to_all_transpose_with_group_local_sources() {
+    fn test_to_mlir_module_for_program_renders_grouped_parallel_ragged_all_to_all_transpose_with_group_local_sources() {
         let mesh = LogicalMesh::new(vec![MeshAxis::new("x", 4, MeshAxisType::Manual).unwrap()]).unwrap();
         let sharding = test_sharding(&mesh, vec![ShardingDimension::sharded(["x"])], vec![]);
-        let traced: TracedShardMap<XlaDomain<'static>, Vec<ArrayType>, ArrayType> = trace_shard_map(
+        let module = shard_map_module::<_, Vec<ArrayType>, ArrayType>(
             |_, inputs: Vec<XlaArrayTracer>| {
                 let input_offsets = inputs[2].clone();
                 let send_sizes = inputs[3].clone();
@@ -626,11 +621,10 @@ mod tests {
             vec![sharding.clone(); 6],
             sharding,
             ShardMapOptions::new(),
-            &[],
         )
         .unwrap();
         assert_eq!(
-            to_mlir_module(&traced, "main").unwrap(),
+            module,
             indoc! {"
                 #loc = loc(unknown)
                 module {
@@ -643,24 +637,22 @@ mod tests {
                   {sdy.sharding = #sdy.sharding<@mesh, [{\"x\"}]>} loc(unknown), %arg5: tensor<16xi32> \
                   {sdy.sharding = #sdy.sharding<@mesh, [{\"x\"}]>} loc(unknown)) -> \
                   (tensor<12xf32> {sdy.sharding = #sdy.sharding<@mesh, [{\"x\"}]>}) {
-                    %0 = sdy.manual_computation(%arg0, %arg1, %arg2, %arg3, %arg4, %arg5) \
-                    in_shardings=[<@mesh, [{\"x\"}]>, <@mesh, [{\"x\"}]>, <@mesh, [{\"x\"}]>, \
-                    <@mesh, [{\"x\"}]>, <@mesh, [{\"x\"}]>, <@mesh, [{\"x\"}]>] \
+                    %0 = sdy.manual_computation(%arg2, %arg3, %arg4, %arg5) \
+                    in_shardings=[<@mesh, [{\"x\"}]>, <@mesh, [{\"x\"}]>, <@mesh, [{\"x\"}]>, <@mesh, [{\"x\"}]>] \
                     out_shardings=[<@mesh, [{\"x\"}]>] manual_axes={\"x\"} \
-                    (%arg6: tensor<3xf32> loc(unknown), %arg7: tensor<4xf32> loc(unknown), \
-                    %arg8: tensor<4xi32> loc(unknown), %arg9: tensor<4xi32> loc(unknown), \
-                    %arg10: tensor<4xi32> loc(unknown), %arg11: tensor<4xi32> loc(unknown)) {
+                    (%arg6: tensor<4xi32> loc(unknown), %arg7: tensor<4xi32> loc(unknown), \
+                    %arg8: tensor<4xi32> loc(unknown), %arg9: tensor<4xi32> loc(unknown)) {
                       %cst = stablehlo.constant dense<1.000000e+00> : tensor<f32> loc(#loc)
                       %1 = stablehlo.broadcast_in_dim %cst, dims = [] : (tensor<f32>) -> tensor<4xf32> loc(#loc)
                       %cst_0 = stablehlo.constant dense<0.000000e+00> : tensor<f32> loc(#loc3)
                       %2 = stablehlo.broadcast_in_dim %cst_0, dims = [] : (tensor<f32>) -> tensor<3xf32> loc(#loc3)
-                      %3 = \"stablehlo.all_to_all\"(%arg10) \
+                      %3 = \"stablehlo.all_to_all\"(%arg8) \
                       <{channel_handle = #stablehlo.channel_handle<handle = 1, type = 1>, \
                       concat_dimension = 0 : i64, \
                       replica_groups = dense<[[0, 2], [3, 1]]> : tensor<2x2xi64>, split_count = 2 : i64, \
                       split_dimension = 0 : i64}> {use_global_device_ids} : \
                       (tensor<4xi32>) -> tensor<4xi32> loc(#loc3)
-                      %4 = \"stablehlo.all_to_all\"(%arg8) \
+                      %4 = \"stablehlo.all_to_all\"(%arg6) \
                       <{channel_handle = #stablehlo.channel_handle<handle = 2, type = 1>, \
                       concat_dimension = 0 : i64, \
                       replica_groups = dense<[[0, 2], [3, 1]]> : tensor<2x2xi64>, split_count = 2 : i64, \
@@ -669,9 +661,9 @@ mod tests {
                       %cst_1 = stablehlo.constant dense<0.000000e+00> : tensor<f32> loc(#loc3)
                       %5 = stablehlo.broadcast_in_dim %cst_1, dims = [] : (tensor<f32>) -> tensor<12xf32> loc(#loc3)
                       %6 = stablehlo.convert %3 : (tensor<4xi32>) -> tensor<4xui64> loc(#loc3)
-                      %7 = stablehlo.convert %arg11 : (tensor<4xi32>) -> tensor<4xui64> loc(#loc3)
+                      %7 = stablehlo.convert %arg9 : (tensor<4xi32>) -> tensor<4xui64> loc(#loc3)
                       %8 = stablehlo.convert %4 : (tensor<4xi32>) -> tensor<4xui64> loc(#loc3)
-                      %9 = stablehlo.convert %arg9 : (tensor<4xi32>) -> tensor<4xui64> loc(#loc3)
+                      %9 = stablehlo.convert %arg7 : (tensor<4xi32>) -> tensor<4xui64> loc(#loc3)
                       %10 = stablehlo.iota dim = 0 : tensor<4xui64> loc(#loc3)
                       %c = stablehlo.constant dense<2> : tensor<ui64> loc(#loc3)
                       %11 = stablehlo.broadcast_in_dim %c, dims = [] : (tensor<ui64>) -> tensor<4xui64> loc(#loc3)
@@ -700,8 +692,7 @@ mod tests {
                       (tensor<4x3xf32>, tensor<f32>) -> tensor<3xf32> loc(#loc3)
                       %26 = stablehlo.add %2, %25 : tensor<3xf32> loc(#loc3)
                       sdy.return %26 : tensor<3xf32> loc(#loc)
-                    } : (tensor<12xf32>, tensor<16xf32>, tensor<16xi32>, tensor<16xi32>, \
-                    tensor<16xi32>, tensor<16xi32>) -> tensor<12xf32> loc(#loc)
+                    } : (tensor<16xi32>, tensor<16xi32>, tensor<16xi32>, tensor<16xi32>) -> tensor<12xf32> loc(#loc)
                     return %0 : tensor<12xf32> loc(#loc)
                   } loc(#loc)
                 } loc(#loc)
@@ -714,7 +705,7 @@ mod tests {
 
     #[cfg(feature = "cuda-13")]
     #[test]
-    fn test_to_mlir_module_executes_parallel_ragged_all_to_all_u64_metadata_on_cuda() {
+    fn test_to_mlir_module_for_program_executes_parallel_ragged_all_to_all_u64_metadata_on_cuda() {
         // XLA's GPU `ragged_all_to_all` receives `u64` metadata from three sources: inputs that are already `u64`, the
         // widened metadata of an exchange merged with an unrelated batch axis, and the rebased metadata of the additive
         // transpose. A single-participant axis exercises all three on one device.
@@ -760,7 +751,7 @@ mod tests {
         };
         // Direct `u64` metadata: copy `operand` rows `1..3` into `output` rows `0..2`.
         let sharding = test_sharding(&mesh, vec![ShardingDimension::sharded(["x"])], vec![]);
-        let traced: TracedShardMap<XlaDomain<'static>, Vec<ArrayType>, ArrayType> = trace_shard_map(
+        let module = shard_map_module::<_, Vec<ArrayType>, ArrayType>(
             |_, inputs: Vec<XlaArrayTracer>| {
                 inputs[0].parallel_ragged_all_to_all("x", &inputs[1], &inputs[2], &inputs[3], &inputs[4], &inputs[5])
             },
@@ -776,13 +767,12 @@ mod tests {
             vec![sharding.clone(); 6],
             sharding.clone(),
             ShardMapOptions::new(),
-            &[],
         )
         .unwrap();
         let metadata = |value: u64| (values_to_bytes::<u64>(&[value]), BufferType::U64, vec![1]);
         assert_eq!(
             execute(
-                to_mlir_module(&traced, "main").unwrap(),
+                module,
                 vec![
                     (values_to_bytes::<f32>(&[10.0, 11.0, 12.0]), BufferType::F32, vec![3]),
                     (values_to_bytes::<f32>(&[100.0, 101.0, 102.0, 103.0]), BufferType::F32, vec![4]),
@@ -798,7 +788,7 @@ mod tests {
         // Merged batching over `y` widens the `i32` metadata to `u64` and rebases the offsets of the second item.
         let batched_sharding =
             test_sharding(&mesh, vec![ShardingDimension::sharded(["x"]), ShardingDimension::replicated()], vec![]);
-        let traced: TracedShardMap<XlaDomain<'static>, Vec<ArrayType>, ArrayType> = trace_shard_map(
+        let program = shard_map_module::<_, Vec<ArrayType>, ArrayType>(
             |_, inputs: Vec<XlaArrayTracer>| {
                 Ok(batch(
                     |inputs: Vec<_>| {
@@ -823,10 +813,8 @@ mod tests {
             vec![batched_sharding.clone(); 6],
             batched_sharding,
             ShardMapOptions::new(),
-            &[],
         )
         .unwrap();
-        let program = to_mlir_module(&traced, "main").unwrap();
         assert!(program.contains("tensor<2xui64>"));
         let metadata = |values: [i32; 2]| (values_to_bytes::<i32>(&values), BufferType::I32, vec![2, 1]);
         assert_eq!(
@@ -850,7 +838,7 @@ mod tests {
 
         // The gradient of the summed exchange with respect to `operand` lowers through the additive transpose, whose
         // rebased metadata are `u64`. Only the sent rows `1..3` reach the sum.
-        let traced: TracedShardMap<XlaDomain<'static>, Vec<ArrayType>, ArrayType> = trace_shard_map(
+        let program = shard_map_module::<_, Vec<ArrayType>, ArrayType>(
             |_, inputs: Vec<XlaArrayTracer>| {
                 Ok(inputs[0]
                     .domain()
@@ -887,10 +875,8 @@ mod tests {
             vec![sharding.clone(); 6],
             sharding,
             ShardMapOptions::new(),
-            &[],
         )
         .unwrap();
-        let program = to_mlir_module(&traced, "main").unwrap();
         assert!(program.contains("tensor<1xui64>"));
         let metadata = |value: i32| (values_to_bytes::<i32>(&[value]), BufferType::I32, vec![1]);
         assert_eq!(

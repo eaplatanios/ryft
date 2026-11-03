@@ -174,7 +174,7 @@ pub use sharding::{
     CONSTRAIN_SHARDING_OPERATION_NAME, ConstrainSharding, ConstrainShardingDispatch, ConstrainShardingOperation,
     RESHARD_OPERATION_NAME, Reshard, ReshardDispatch, ReshardOperation, SHARD_MAP_OPERATION_NAME, ShardMap,
     ShardMapBoundary, ShardMapContext, ShardMapError, ShardMapOperation, ShardMapOptions, ShardMapTracer,
-    ShardingOperations, TracedShardMap, shard_map, trace_shard_map,
+    ShardingOperations, shard_map,
 };
 pub use softmax::{Softmax, SoftmaxCrossEntropyWithTargetLogits, softmax_cross_entropy_with_target_logits};
 pub use sorting::{SORT_OPERATION_NAME, Sort, SortDirection, SortOperation, SortOrdering, TopK};

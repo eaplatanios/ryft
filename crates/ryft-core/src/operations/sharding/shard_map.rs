@@ -9,12 +9,14 @@
 //!
 //! Functions construct shard maps by tracing an array-only local body over [`ShardMapTracer`]s. The [`ShardMap`]
 //! capability binds a shard map in an explicitly provided context on input values, and its body function also receives
-//! the body context, so that bodies without inputs can create values. The global [`shard_map()`](fn@shard_map)
-//! function binds it in the context of its first input instead, and [`trace_shard_map`] traces a body for global input
-//! types in an explicitly named domain and returns the unbound [`TracedShardMap`]. All of them take
-//! [`ShardMapOptions`], which select the active manual mesh axes. These functions accept array leaves only, so bodies
-//! with reference boundaries are traced explicitly and checked through [`ShardMapOperation::from_program`]. Every
-//! boundary position is an array or a reference, so first-class dimensions may appear only inside a body.
+//! the body context, so that bodies without inputs can create values. The global [`shard_map()`](fn@shard_map) function
+//! binds it in the context of its first input instead. Both take [`ShardMapOptions`], which select the active manual
+//! mesh axes. Like any other operation, a shard map is traced for types rather than values by binding it on tracers
+//! (e.g., through [`trace`](crate::trace) or the [`Trace`](crate::Trace) capability of a [`Domain`]), which is the
+//! analogue of applying JAX's [`make_jaxpr`](https://docs.jax.dev/en/latest/_autosummary/jax.make_jaxpr.html) to a
+//! function that calls `jax.shard_map`. These functions accept array leaves only, so bodies with reference boundaries
+//! are traced explicitly and checked through [`ShardMapOperation::from_program`]. Every boundary position is an array
+//! or a reference, so first-class dimensions may appear only inside a body.
 //!
 //! The operation's inputs and outputs are global values whose placement over the mesh is described by one input or
 //! output [`Sharding`] each. The body receives the shard of every global input that its input sharding assigns to the
@@ -2783,22 +2785,21 @@ where
 }
 
 /// Local value that a `shard_map` body function traced for the [`Domain`] `C` receives and returns, which is a
-/// [`DomainTracer`] of `C` projected onto its array member. The bodies that [`ShardMap`],
-/// [`shard_map()`](fn@shard_map), and [`trace_shard_map`] trace are array-only, so every local input and output of such
-/// a body is one of these values.
+/// [`DomainTracer`] of `C` projected onto its array member. The bodies that [`ShardMap`] and
+/// [`shard_map()`](fn@shard_map) trace are array-only, so every local input and output of such a body is one of these
+/// values.
 pub type ShardMapTracer<C> = ProjectedValue<ArrayType, DomainTracer<C>>;
 
-/// Local context that a `shard_map` body function traced for the [`Domain`] `C` receives from [`ShardMap`] and
-/// [`trace_shard_map`], which is the array view (refer to [`ProjectedContext`]) of the fresh [`DomainTracingContext`]
-/// of `C` that the body is traced in. It is the [`Domain`](Value::Domain) of the body's [`ShardMapTracer`]s, so values
-/// that it creates through its capabilities are [`ShardMapTracer`]s as well (e.g., `context.axis_index("x")` returns
-/// the coordinate of the executing device along the manual axis `x`, and [`Context::lift`] stages an array constant),
-/// and [`ProjectedContext::parent`] returns the underlying array IR tracing context.
+/// Local context that a `shard_map` body function traced for the [`Domain`] `C` receives from [`ShardMap`], which is
+/// the array view (refer to [`ProjectedContext`]) of the fresh [`DomainTracingContext`] of `C` that the body is traced
+/// in. It is the [`Domain`](Value::Domain) of the body's [`ShardMapTracer`]s, so values that it creates through its
+/// capabilities are [`ShardMapTracer`]s as well (e.g., `context.axis_index("x")` returns the coordinate of the
+/// executing device along the manual axis `x`, and [`Context::lift`] stages an array constant), and
+/// [`ProjectedContext::parent`] returns the underlying array IR tracing context.
 pub type ShardMapContext<C> = ProjectedContext<DomainTracingContext<C>, ArrayType>;
 
-/// Configuration of the `shard_map` function of [`ShardMap`], of [`shard_map()`](fn@shard_map), and of
-/// [`trace_shard_map`]. By default, every mesh axis of type [`Manual`](MeshAxisType::Manual) that no enclosing manual
-/// region already made manual is active.
+/// Configuration of the `shard_map` function of [`ShardMap`] and of [`shard_map()`](fn@shard_map). By default, every
+/// mesh axis of type [`Manual`](MeshAxisType::Manual) that no enclosing manual region already made manual is active.
 #[derive(Clone, Debug, Default, PartialEq, Eq)]
 pub struct ShardMapOptions {
     /// Explicitly selected active manual mesh axes, or an empty list for the default selection.
@@ -2981,7 +2982,7 @@ where
             options.manual_axes,
             &self.named_axes(),
         )?;
-        let traced = trace_shard_map_body::<Self, _>(
+        let (operation, body) = trace_shard_map_body::<Self, _>(
             boundary,
             |body_context, local_inputs| {
                 let local_inputs = Input::To::<ShardMapTracer<Self>>::from_parameters(input_structure, local_inputs)?;
@@ -2993,7 +2994,7 @@ where
             outer_named_axes,
         )?;
         let outputs = self
-            .bind(traced.operation, vec![traced.body], inputs.as_slice())?
+            .bind(operation, vec![body], inputs.as_slice())?
             .into_iter()
             .map(|output| ValueProjection::<ArrayType>::into_projected(output).map_err(ProgramError::from))
             .collect::<Result<Vec<_>, _>>()?;
@@ -3053,162 +3054,6 @@ where
         output_shardings,
         options,
     )
-}
-
-/// Traces `function` as the local body of a manual SPMD computation over `mesh` for global inputs of the provided
-/// types, without binding it, and returns the [`TracedShardMap`] that holds the checked [`ShardMapOperation`], its
-/// global and local boundary types, and the traced body. This is the descriptor-only counterpart of the `shard_map`
-/// function of [`ShardMap`], whose boundary derivation, output variation, and inheritance of named axes it shares, for
-/// callers that inspect, lower, or bind a `shard_map` body on their own (e.g., to bind its [`ShardMapOperation`] with
-/// the body themselves).
-///
-/// No input value supplies a [`Domain`] here, so the caller names the [`Domain`] `C` whose staged constant and
-/// operation families the body is traced in (e.g., as the first generic argument or through the annotated result type).
-/// The body is traced in a fresh [`DomainTracingContext`] of `C`, and `function` receives its [`ShardMapContext`]
-/// together with its local inputs, as the body function of the `shard_map` function of [`ShardMap`] does, so that it
-/// can create values that derive from no input (e.g., the body of JAX's
-/// `shard_map(lambda: axis_index('x'), in_specs=(), out_specs=P('x'))`, traced for the global input types `()`).
-///
-/// The body inherits the bindings of `named_axes` exactly as the `shard_map` function of [`ShardMap`] inherits the
-/// named axes of its context, so `named_axes` names the scope where the traced `shard_map` is meant to be bound
-/// (typically `enclosing_context.named_axes()`, refer to [`NamedAxes::named_axes`]) and is empty for a top-level
-/// computation. When several bindings of `named_axes` share a name, the first one is used, which is the one that
-/// [`NamedAxes::named_axis`] resolves when `named_axes` comes from [`NamedAxes::named_axes`]. The global input types
-/// describe the values that the enclosing region passes, including the manual variation that they carry along the
-/// inherited axes, so a traced `shard_map` whose boundary varies along inherited axes describes a computation nested in
-/// those enclosing manual regions and is only meaningful inside them.
-///
-/// # Parameters
-///
-///   - `function`: Body function traced over the body context and the local shards of global inputs of type
-///     `global_input_types`.
-///   - `global_input_types`: Structured global input types.
-///   - `mesh`: Logical mesh that the manual computation is defined over.
-///   - `input_shardings`: Shardings of the global inputs (i.e., JAX's `in_specs`), with the same structure as
-///     `global_input_types`.
-///   - `output_shardings`: Shardings of the global outputs (i.e., JAX's `out_specs`), with the same structure as the
-///     outputs of `function`.
-///   - `options`: Selection of the active manual mesh axes.
-///   - `named_axes`: Named axes in scope where the traced `shard_map` is meant to be bound, innermost first.
-///
-/// # Errors
-///
-/// Returns the errors of the `shard_map` function of [`ShardMap`], apart from those of binding the operation.
-pub fn trace_shard_map<C, F, Input, Output>(
-    function: F,
-    global_input_types: Input,
-    mesh: LogicalMesh,
-    input_shardings: Input::To<Sharding>,
-    output_shardings: Output::To<Sharding>,
-    options: ShardMapOptions,
-    named_axes: &[(String, NamedAxis)],
-) -> Result<TracedShardMap<C, Input, Output>, ShardMapError>
-where
-    TracingContext<C::Constant, C::Operation>:
-        StagingContext<Type = ArrayIrType, Constant = C::Constant, Operation = C::Operation>,
-    C: Domain<Type = ArrayIrType>,
-    ShardMapTracer<C>: ParallelVary,
-    Input: Parameterized<ArrayType>,
-    Input::Family: ParameterizedFamily<Sharding> + ParameterizedFamily<ShardMapTracer<C>>,
-    Output: Parameterized<ArrayType>,
-    Output::Family: ParameterizedFamily<Sharding> + ParameterizedFamily<ShardMapTracer<C>>,
-    F: FnOnce(&ShardMapContext<C>, Input::To<ShardMapTracer<C>>) -> Result<Output::To<ShardMapTracer<C>>, ProgramError>,
-{
-    validate_parameter_structure(&global_input_types.parameter_paths().collect::<Vec<_>>(), &input_shardings)?;
-    let input_structure = global_input_types.parameter_structure();
-    let output_structure = output_shardings.parameter_structure();
-    let output_paths = output_shardings.parameter_paths().collect::<Vec<_>>();
-    let (boundary, outer_named_axes) = shard_map_within_named_axes(
-        mesh,
-        input_shardings.into_parameters().collect(),
-        output_shardings.into_parameters().collect(),
-        options.manual_axes,
-        named_axes,
-    )?;
-    let traced = trace_shard_map_body::<C, _>(
-        boundary,
-        |body_context, local_inputs| {
-            let local_inputs = Input::To::<ShardMapTracer<C>>::from_parameters(input_structure.clone(), local_inputs)?;
-            let local_outputs = function(body_context, local_inputs)?;
-            validate_parameter_structure(&output_paths, &local_outputs)?;
-            Ok(local_outputs.into_parameters().collect())
-        },
-        global_input_types.into_parameters().collect(),
-        outer_named_axes,
-    )?;
-    Ok(TracedShardMap {
-        operation: traced.operation,
-        global_input_types: Input::from_parameters(input_structure.clone(), traced.global_input_types)?,
-        local_input_types: Input::from_parameters(input_structure, traced.local_input_types)?,
-        global_output_types: Output::from_parameters(output_structure.clone(), traced.global_output_types)?,
-        local_output_types: Output::from_parameters(output_structure, traced.local_output_types)?,
-        body: traced.body,
-    })
-}
-
-/// Traced `shard_map` body together with its checked boundary, as returned by [`trace_shard_map`]. It owns the
-/// [`ShardMapOperation`] that carries the boundary metadata, the structured global and local boundary types, and the
-/// traced local body over the staged constant and operation families of the [`Domain`] `C`, which is the region that
-/// the operation is bound with. Backends lower it through their own lowering functions.
-pub struct TracedShardMap<C: Domain, Input, Output> {
-    /// Checked `shard_map` boundary of the traced body, which owns its manual SPMD metadata.
-    operation: ShardMapOperation,
-
-    /// Global input types of the boundary, normalized from the caller's input types.
-    global_input_types: Input,
-
-    /// Local input types of the traced body.
-    local_input_types: Input,
-
-    /// Global output types of the boundary, derived from the local output types through the output shardings.
-    global_output_types: Output,
-
-    /// Local output types of the traced body.
-    local_output_types: Output,
-
-    /// Simplified traced local body, flattened to the region boundary of [`Self::operation`].
-    body: FlatProgram<C>,
-}
-
-impl<C: Domain, Input, Output> TracedShardMap<C, Input, Output> {
-    /// Returns the checked [`ShardMapOperation`] of the traced body, whose [`ShardMapOperation::boundary`] holds the
-    /// mesh, the boundary shardings, and the active manual axes.
-    #[inline]
-    pub fn operation(&self) -> &ShardMapOperation {
-        &self.operation
-    }
-
-    /// Returns the global input types of the boundary, which are the caller's input types under their input shardings,
-    /// without memory kinds (refer to [`ShardMapBoundary::global_input_type`] for details).
-    #[inline]
-    pub fn global_input_types(&self) -> &Input {
-        &self.global_input_types
-    }
-
-    /// Returns the local input types of the traced body (i.e., the shards that each device receives).
-    #[inline]
-    pub fn local_input_types(&self) -> &Input {
-        &self.local_input_types
-    }
-
-    /// Returns the global output types of the boundary, derived from the local output types through the output
-    /// shardings.
-    #[inline]
-    pub fn global_output_types(&self) -> &Output {
-        &self.global_output_types
-    }
-
-    /// Returns the local output types of the traced body, including the manual variation that tiled outputs acquire.
-    #[inline]
-    pub fn local_output_types(&self) -> &Output {
-        &self.local_output_types
-    }
-
-    /// Returns the simplified traced local body, flattened to the region boundary of [`Self::operation`].
-    #[inline]
-    pub fn body(&self) -> &FlatProgram<C> {
-        &self.body
-    }
 }
 
 /// Returns `true` when two `shard_map` boundary types agree apart from carried placement metadata, which is when their
@@ -6194,8 +6039,8 @@ fn shard_map_within_named_axes(
 }
 
 /// Traces `function` as the local body of `shard_map` for the flat caller input types `global_input_types` and returns
-/// the flat [`TracedShardMap`] that the `shard_map` function of [`ShardMap`] and [`trace_shard_map`] restructure or
-/// bind. The caller types are normalized through [`ShardMapBoundary::global_input_type`], `function` is traced in a
+/// the checked [`ShardMapOperation`] together with the traced body that the `shard_map` function of [`ShardMap`] binds.
+/// The caller types are normalized through [`ShardMapBoundary::global_input_type`], `function` is traced in a
 /// fresh [`DomainTracingContext`] of `C` over the [`ShardMapContext`] of that trace and the local shards of those
 /// types, with the trace seeded with `outer_named_axes` shadowed by the active manual axes of `shard_map`, each output
 /// receives `parallel_vary` along every active manual axis that its output sharding tiles and along which it does not
@@ -6217,7 +6062,7 @@ fn trace_shard_map_body<
     function: F,
     global_input_types: Vec<ArrayType>,
     outer_named_axes: Vec<(String, NamedAxis)>,
-) -> Result<TracedShardMap<C, Vec<ArrayType>, Vec<ArrayType>>, ShardMapError>
+) -> Result<(ShardMapOperation, FlatProgram<C>), ShardMapError>
 where
     ShardMapTracer<C>: ParallelVary,
     TracingContext<C::Constant, C::Operation>:
@@ -6234,7 +6079,7 @@ where
         ) -> Result<Vec<ShardMapTracer<C>>, ProgramError>,
         global_input_types: Vec<ArrayType>,
         mut outer_named_axes: Vec<(String, NamedAxis)>,
-    ) -> Result<TracedShardMap<C, Vec<ArrayType>, Vec<ArrayType>>, ShardMapError>
+    ) -> Result<(ShardMapOperation, FlatProgram<C>), ShardMapError>
     where
         ShardMapTracer<C>: ParallelVary,
         TracingContext<C::Constant, C::Operation>:
@@ -6266,7 +6111,7 @@ where
             (name.clone(), NamedAxis::Mesh { mesh: mesh.clone(), axis, size })
         }));
 
-        let (local_output_types, body) = DomainTracingContext::<C>::trace_with_context_and_named_axes(
+        let (_, body) = DomainTracingContext::<C>::trace_with_context_and_named_axes(
             |context: &DomainTracingContext<C>, local_inputs: Vec<DomainTracer<C>>| {
                 let local_inputs = local_inputs
                     .into_iter()
@@ -6301,29 +6146,11 @@ where
             global_input_types.iter().cloned().map(ArrayIrType::Array).collect(),
             boundary,
         )?;
-        let local_output_types = local_output_types
-            .iter()
-            .map(|r#type| boundary_array_type(r#type).cloned())
-            .collect::<Result<Vec<_>, _>>()
-            .map_err(ProgramError::from)?;
-        let global_output_types = operation
-            .global_output_types()
-            .iter()
-            .map(|r#type| boundary_array_type(r#type).cloned())
-            .collect::<Result<Vec<_>, _>>()
-            .map_err(ProgramError::from)?;
-        Ok(TracedShardMap {
-            operation,
-            global_input_types,
-            local_input_types,
-            global_output_types,
-            local_output_types,
-            body,
-        })
+        Ok((operation, body))
     }
 
     let mut function = Some(function);
-    inner(
+    inner::<C>(
         boundary,
         &mut |context, inputs| function.take().unwrap()(context, inputs),
         global_input_types,
@@ -6389,10 +6216,10 @@ mod tests {
     type TestContext = TracingContext<TestValue, TestOperation>;
 
     /// Array projection of a [`TestContext`] tracer. It is both the input leaf of `shard_map` invocations in a
-    /// [`TestContext`] trace and the local value of bodies traced for [`TestContext`] or for the eager test domain.
+    /// [`TestContext`] trace and the local value of bodies traced for [`TestContext`].
     type TestTracer = ShardMapTracer<TestContext>;
 
-    /// Eager context over the array IR test family, which descriptor-only tracing names as the domain of its bodies.
+    /// Eager context over the array IR test family, which interprets the test programs.
     type TestEagerContext = EagerContext<TestValue, TestOperation>;
 
     // The transform tests below stage complete programs rather than using the `check_operation_*` macros, because those
@@ -6944,24 +6771,6 @@ mod tests {
         };
         let global_input_types = vec![ReferenceType::new(f32_vector_type(4)).into(), f32_vector_type(4).into()];
         (ShardMapOperation::from_program(&body, global_input_types, boundary).unwrap(), body)
-    }
-
-    /// Traces a two-input, two-output shard map over the two-device manual mesh for the eager test domain: the first
-    /// input `f32[8]` is sharded along `x` and doubled, and the second input `f32[2]` is replicated and returned as is.
-    fn traced_test_shard_map() -> TracedShardMap<TestEagerContext, Vec<ArrayType>, Vec<ArrayType>> {
-        let mesh = manual_mesh();
-        let sharded = sharded_along_x();
-        let replicated = Sharding::replicated(mesh.clone(), 1);
-        trace_shard_map(
-            |_, inputs: Vec<TestTracer>| Ok(vec![inputs[0].clone() + inputs[0].clone(), inputs[1].clone()]),
-            vec![f32_vector_type(8), f32_vector_type(2)],
-            mesh,
-            vec![sharded.clone(), replicated.clone()],
-            vec![sharded, replicated],
-            ShardMapOptions::new(),
-            &[],
-        )
-        .unwrap()
     }
 
     /// Traces `function` over [`TestTracer`]s of `input_types` in a fresh [`TestContext`] seeded with `named_axes`, and
@@ -8923,43 +8732,47 @@ mod tests {
              therefore already made manual",
         );
 
-        // Descriptor-only tracing has no enclosing context to exclude already manual axes, so binding a body traced
-        // over all manual axes of the 2x2 mesh with specifications over `x` inside a manual region over `x` (whose
-        // local values vary along `x`) is rejected when the body is attached, which also fails the enclosing trace.
+        // A map built from its boundary (e.g., as a transformation could) bypasses the checks of the frontend against
+        // enclosing manual axes, so binding one over all manual axes of the 2x2 mesh with specifications over `x`
+        // inside a manual region over `x` (whose local values vary along `x`) is rejected when its body is attached,
+        // which also fails the enclosing map.
         let mesh = manual_mesh_2x2();
         let sharding = Sharding::new(mesh.clone(), vec![ShardingDimension::sharded(["x"])]).unwrap();
-        let result: Result<TracedShardMap<TestEagerContext, ArrayType, ArrayType>, _> = trace_shard_map(
-            |_, x: TestTracer| {
-                let inner: TracedShardMap<TestEagerContext, ArrayType, ArrayType> = trace_shard_map(
-                    |_, y: TestTracer| Ok(y.clone() + y),
-                    f32_vector_type(4),
+        let boundary = ShardMapBoundary::new(
+            mesh.clone(),
+            vec![sharding.clone()],
+            vec![sharding.clone()],
+            vec!["x".to_string(), "y".to_string()],
+        )
+        .unwrap();
+        let global_type = boundary.global_input_type(0, &f32_vector_type(4)).unwrap();
+        let body = identity_body(boundary.local_input_type(0, &global_type).unwrap());
+        let operation = ShardMapOperation::from_program(&body, vec![global_type.into()], boundary).unwrap();
+        trace_test_program(
+            |inputs| {
+                let result = shard_map(
+                    |x: TestTracer| {
+                        let result =
+                            x.value().context().bind(operation.clone(), vec![body.clone()], &[x.value().clone()]);
+                        assert!(matches!(
+                            result,
+                            Err(ProgramError::Type(error))
+                                if error.downcast_custom::<ShardMapError>() == Some(&expected),
+                        ));
+                        Ok(x)
+                    },
+                    inputs[0].clone(),
                     mesh.clone(),
                     sharding.clone(),
                     sharding.clone(),
-                    ShardMapOptions::new(),
-                    &[],
-                )
-                .unwrap();
-                let result = x.value().context().bind(
-                    inner.operation().clone(),
-                    vec![inner.body().clone()],
-                    &[x.value().clone()],
+                    ShardMapOptions::new().with_manual_axes(["x"]),
                 );
-                assert!(matches!(
-                    result,
-                    Err(ProgramError::Type(error))
-                        if error.downcast_custom::<ShardMapError>() == Some(&expected),
-                ));
-                Ok(x)
+                assert_eq!(result.map(|_| ()), Err(expected.clone()));
+                inputs
             },
-            f32_vector_type(8),
-            mesh.clone(),
-            sharding.clone(),
-            sharding.clone(),
-            ShardMapOptions::new().with_manual_axes(["x"]),
-            &[],
+            vec![f32_vector_type(8)],
+            Vec::new(),
         );
-        assert_eq!(result.map(|_| ()), Err(expected));
     }
 
     #[test]
@@ -9746,7 +9559,8 @@ mod tests {
                 lambda %0:f32[], %1:f32[] .
                 let %2:f32[] = shard_map [
                     mesh=['x'=2:manual, 'y'=2:manual],
-                    input_shardings=[{mesh<['x'=2:manual, 'y'=2:manual]>, []}, {mesh<['x'=2:manual, 'y'=2:manual]>, []}],
+                    input_shardings=[{mesh<['x'=2:manual, 'y'=2:manual]>, []}, \
+                        {mesh<['x'=2:manual, 'y'=2:manual]>, []}],
                     output_shardings=[{mesh<['x'=2:manual, 'y'=2:manual]>, []}],
                     manual_axes=['x'],
                     global_input_types=[f32[], f32[]],
@@ -16320,7 +16134,8 @@ mod tests {
                     %10:{global} = shard_map [
                     mesh=['x'=2:manual],
                     input_shardings=[{sharding}, {sharding}, {sharding}, {sharding}],
-                    output_shardings=[{sharding}, {sharding}, {sharding}, {sharding}, {sharding}, {sharding}, {sharding}],
+                    output_shardings=[{sharding}, {sharding}, {sharding}, {sharding}, {sharding}, {sharding}, \
+                        {sharding}],
                     manual_axes=['x'],
                     global_input_types=[{global}, {global}, {global}, {global}],
                     global_output_types=[{global}, {global}, {global}, {global}, {global}, {global}, {global}],
@@ -16348,8 +16163,8 @@ mod tests {
                 lambda {tangent_inputs} .
                 let %12:{global}, %13:{global} = shard_map [
                     mesh=['x'=2:manual],
-                    input_shardings=[{sharding}, {sharding}, {sharding}, {sharding}, {sharding}, {sharding}, {sharding}, \
-                        {sharding}, {sharding}, {sharding}, {sharding}, {sharding}],
+                    input_shardings=[{sharding}, {sharding}, {sharding}, {sharding}, {sharding}, {sharding}, \
+                        {sharding}, {sharding}, {sharding}, {sharding}, {sharding}, {sharding}],
                     output_shardings=[{sharding}, {sharding}],
                     manual_axes=['x'],
                     global_input_types=[{global}, {global}, {global}, {global}, {global}, {global}, {global}, \
@@ -17550,8 +17365,8 @@ mod tests {
                 let %4:f32[][sharding={mesh<['x'=2:manual]>, []}], %5:f32[][sharding={mesh<['x'=2:manual]>, []}] = \
                     shard_map [
                     mesh=['x'=2:manual],
-                    input_shardings=[{mesh<['x'=2:manual]>, []}, {mesh<['x'=2:manual]>, []}, {mesh<['x'=2:manual]>, []}, \
-                        {mesh<['x'=2:manual]>, []}],
+                    input_shardings=[{mesh<['x'=2:manual]>, []}, {mesh<['x'=2:manual]>, []}, \
+                        {mesh<['x'=2:manual]>, []}, {mesh<['x'=2:manual]>, []}],
                     output_shardings=[{mesh<['x'=2:manual]>, []}, {mesh<['x'=2:manual]>, []}],
                     manual_axes=['x'],
                     global_input_types=[f32[][sharding={mesh<['x'=2:manual]>, []}], \
@@ -18281,8 +18096,8 @@ mod tests {
                 let %4:f32[][sharding={mesh<['x'=2:manual]>, []}], %5:f32[][sharding={mesh<['x'=2:manual]>, []}] = \
                     shard_map [
                     mesh=['x'=2:manual],
-                    input_shardings=[{mesh<['x'=2:manual]>, []}, {mesh<['x'=2:manual]>, []}, {mesh<['x'=2:manual]>, []}, \
-                        {mesh<['x'=2:manual]>, []}],
+                    input_shardings=[{mesh<['x'=2:manual]>, []}, {mesh<['x'=2:manual]>, []}, \
+                        {mesh<['x'=2:manual]>, []}, {mesh<['x'=2:manual]>, []}],
                     output_shardings=[{mesh<['x'=2:manual]>, []}, {mesh<['x'=2:manual]>, []}],
                     manual_axes=['x'],
                     global_input_types=[f32[][sharding={mesh<['x'=2:manual]>, []}], \
@@ -20372,6 +20187,41 @@ mod tests {
     }
 
     #[test]
+    fn test_shard_map_shard_map_rejects_captures_registered_in_its_body() {
+        // The body is traced in a fresh trace whose capture table is discarded, so registering a capture rejects the
+        // body regardless of whether the returned reference is staged (refer to `TracingContext::trace_with_named_axes`
+        // for the silent-aliasing rationale). The array IR test family does not embed capture references, so this test
+        // traces over a constant family that does.
+        type CapturingDomain = TracingContext<CaptureReference<ArrayIrType>, TestOperation>;
+        let context = CapturingDomain::new();
+        let input = context.input(ArrayIrType::Array(f32_vector_type(4)));
+        let input = ValueProjection::<ArrayType>::into_projected(input).unwrap();
+        let sharded = sharded_along_x();
+        let result = context.shard_map(
+            |_: &ShardMapContext<CapturingDomain>, x: ShardMapTracer<CapturingDomain>| {
+                x.value()
+                    .context()
+                    .capture(CaptureReference::new(0, ArrayIrType::Array(f32_vector_type(2))))
+                    .unwrap();
+                Ok(x)
+            },
+            input,
+            manual_mesh(),
+            sharded.clone(),
+            sharded,
+            ShardMapOptions::new(),
+        );
+        let error = result.map(|_| ()).unwrap_err();
+        assert_eq!(error, ShardMapError::Program(ProgramError::DiscardedCaptures { count: 1 }));
+        assert_eq!(
+            error.to_string(),
+            "trace registered 1 runtime capture(s) through a trace entry point that discards its capture table; \
+             capture-owning traces must construct their `TracingContext` directly and pair the traced program with \
+             that context's capture table",
+        );
+    }
+
+    #[test]
     fn test_shard_map_shard_map_inherits_enclosing_manual_axes() {
         // A body without inputs inherits the enclosing binding of `x`, through which it reads its coordinate along the
         // enclosing manual axis, while the empty manual-axis selection selects only the remaining manual axis `y`. The
@@ -20646,29 +20496,36 @@ mod tests {
         let outer_sharding = Sharding::new(mesh.clone(), vec![ShardingDimension::sharded(["x"])]).unwrap();
         let inner_sharding = Sharding::new(mesh.clone(), vec![ShardingDimension::sharded(["y"])]).unwrap();
         let inner_named_axes = RefCell::new(None);
-        let traced: TracedShardMap<TestEagerContext, ArrayType, ArrayType> = trace_shard_map(
-            |_, x: TestTracer| {
-                let nested = shard_map(
-                    |y: TestTracer| {
-                        inner_named_axes.replace(Some(y.value().context().named_axes()));
-                        Ok(y.clone() + y)
-                    },
-                    x.clone(),
-                    mesh.clone(),
-                    inner_sharding.clone(),
-                    inner_sharding.clone(),
-                    ShardMapOptions::new().with_manual_axes(["y"]),
-                )?;
-                Ok(nested + x)
+        let program = trace_test_program(
+            |inputs| {
+                vec![
+                    shard_map(
+                        |x: TestTracer| {
+                            let nested = shard_map(
+                                |y: TestTracer| {
+                                    inner_named_axes.replace(Some(y.value().context().named_axes()));
+                                    Ok(y.clone() + y)
+                                },
+                                x.clone(),
+                                mesh.clone(),
+                                inner_sharding.clone(),
+                                inner_sharding.clone(),
+                                ShardMapOptions::new().with_manual_axes(["y"]),
+                            )?;
+                            Ok(nested + x)
+                        },
+                        inputs[0].clone(),
+                        mesh.clone(),
+                        outer_sharding.clone(),
+                        outer_sharding.clone(),
+                        ShardMapOptions::new().with_manual_axes(["x"]),
+                    )
+                    .unwrap(),
+                ]
             },
-            f32_vector_type(8),
-            mesh.clone(),
-            outer_sharding.clone(),
-            outer_sharding,
-            ShardMapOptions::new().with_manual_axes(["x"]),
-            &[],
-        )
-        .unwrap();
+            vec![f32_vector_type(8)],
+            Vec::new(),
+        );
         assert_eq!(
             inner_named_axes.into_inner(),
             Some(vec![
@@ -20677,31 +20534,44 @@ mod tests {
             ]),
         );
         assert_eq!(
-            traced.body().to_string(),
+            program.to_string(),
             indoc! {"
-                lambda %0:f32[4][sharding={mesh<['x'=2:manual, 'y'=2:manual]>, [{}], varying_manual={'x'}}] .
-                let %1:f32[4][sharding={mesh<['x'=2:manual, 'y'=2:manual]>, [{'y'}], varying_manual={'x'}}] = \
-                        shard_map [
+                lambda %0:f32[8] .
+                let %1:f32[8][sharding={mesh<['x'=2:manual, 'y'=2:manual]>, [{'x'}]}] = shard_map [
                     mesh=['x'=2:manual, 'y'=2:manual],
-                    input_shardings=[{mesh<['x'=2:manual, 'y'=2:manual]>, [{'y'}]}],
-                    output_shardings=[{mesh<['x'=2:manual, 'y'=2:manual]>, [{'y'}]}],
-                    manual_axes=['y'],
-                    global_input_types=[\
-                        f32[4][sharding={mesh<['x'=2:manual, 'y'=2:manual]>, [{'y'}], varying_manual={'x'}}]],
-                    global_output_types=[\
-                        f32[4][sharding={mesh<['x'=2:manual, 'y'=2:manual]>, [{'y'}], varying_manual={'x'}}]],
+                    input_shardings=[{mesh<['x'=2:manual, 'y'=2:manual]>, [{'x'}]}],
+                    output_shardings=[{mesh<['x'=2:manual, 'y'=2:manual]>, [{'x'}]}],
+                    manual_axes=['x'],
+                    global_input_types=[f32[8][sharding={mesh<['x'=2:manual, 'y'=2:manual]>, [{'x'}]}]],
+                    global_output_types=[f32[8][sharding={mesh<['x'=2:manual, 'y'=2:manual]>, [{'x'}]}]],
                 ] %0 [
                     body={
-                        lambda \
-                            %0:f32[2][sharding={mesh<['x'=2:manual, 'y'=2:manual]>, [{}], varying_manual={'x', 'y'}}] .
-                        let \
-                            %1:f32[2][sharding={mesh<['x'=2:manual, 'y'=2:manual]>, [{}], varying_manual={'x', 'y'}}] \
-                            = add %0 %0
-                        in (%1)
+                        lambda %0:f32[4][sharding={mesh<['x'=2:manual, 'y'=2:manual]>, [{}], varying_manual={'x'}}] .
+                        let %1:f32[4][sharding={mesh<['x'=2:manual, 'y'=2:manual]>, [{'y'}], varying_manual={'x'}}] = \
+                            shard_map [
+                            mesh=['x'=2:manual, 'y'=2:manual],
+                            input_shardings=[{mesh<['x'=2:manual, 'y'=2:manual]>, [{'y'}]}],
+                            output_shardings=[{mesh<['x'=2:manual, 'y'=2:manual]>, [{'y'}]}],
+                            manual_axes=['y'],
+                            global_input_types=[f32[4][sharding={mesh<['x'=2:manual, 'y'=2:manual]>, [{'y'}], \
+                                varying_manual={'x'}}]],
+                            global_output_types=[f32[4][sharding={mesh<['x'=2:manual, 'y'=2:manual]>, [{'y'}], \
+                                varying_manual={'x'}}]],
+                        ] %0 [
+                            body={
+                                lambda %0:f32[2][sharding={mesh<['x'=2:manual, 'y'=2:manual]>, [{}], \
+                                    varying_manual={'x', 'y'}}] .
+                                let %1:f32[2][sharding={mesh<['x'=2:manual, 'y'=2:manual]>, [{}], varying_manual={'x', \
+                                    'y'}}] = add %0 %0
+                                in (%1)
+                            },
+                        ]
+                            %2:f32[4][sharding={mesh<['x'=2:manual, 'y'=2:manual]>, [{'y'}], varying_manual={'x'}}] = \
+                                add %1 %0
+                        in (%2)
                     },
                 ]
-                    %2:f32[4][sharding={mesh<['x'=2:manual, 'y'=2:manual]>, [{'y'}], varying_manual={'x'}}] = add %1 %0
-                in (%2)"
+                in (%1)"
             },
         );
     }
@@ -20767,46 +20637,65 @@ mod tests {
         let mesh = manual_mesh_2x2();
         let outer_sharding = Sharding::new(mesh.clone(), vec![ShardingDimension::sharded(["x"])]).unwrap();
         let inner_sharding = Sharding::new(mesh.clone(), vec![ShardingDimension::sharded(["y"])]).unwrap();
-        let traced: TracedShardMap<TestEagerContext, ArrayType, ArrayType> = trace_shard_map(
-            |_, x: TestTracer| {
-                Ok(shard_map(
-                    |y: TestTracer| Ok(y.clone() + y),
-                    x,
-                    mesh.clone(),
-                    inner_sharding.clone(),
-                    inner_sharding.clone(),
-                    ShardMapOptions::new(),
-                )?)
+        let program = trace_test_program(
+            |inputs| {
+                vec![
+                    shard_map(
+                        |x: TestTracer| {
+                            Ok(shard_map(
+                                |y: TestTracer| Ok(y.clone() + y),
+                                x,
+                                mesh.clone(),
+                                inner_sharding.clone(),
+                                inner_sharding.clone(),
+                                ShardMapOptions::new(),
+                            )?)
+                        },
+                        inputs[0].clone(),
+                        mesh.clone(),
+                        outer_sharding.clone(),
+                        outer_sharding.clone(),
+                        ShardMapOptions::new().with_manual_axes(["x"]),
+                    )
+                    .unwrap(),
+                ]
             },
-            f32_vector_type(8),
-            mesh.clone(),
-            outer_sharding.clone(),
-            outer_sharding.clone(),
-            ShardMapOptions::new().with_manual_axes(["x"]),
-            &[],
-        )
-        .unwrap();
+            vec![f32_vector_type(8)],
+            Vec::new(),
+        );
         assert_eq!(
-            traced.body().to_string(),
+            program.to_string(),
             indoc! {"
-                lambda %0:f32[4][sharding={mesh<['x'=2:manual, 'y'=2:manual]>, [{}], varying_manual={'x'}}] .
-                let %1:f32[4][sharding={mesh<['x'=2:manual, 'y'=2:manual]>, [{'y'}], varying_manual={'x'}}] = \
-                        shard_map [
+                lambda %0:f32[8] .
+                let %1:f32[8][sharding={mesh<['x'=2:manual, 'y'=2:manual]>, [{'x'}]}] = shard_map [
                     mesh=['x'=2:manual, 'y'=2:manual],
-                    input_shardings=[{mesh<['x'=2:manual, 'y'=2:manual]>, [{'y'}]}],
-                    output_shardings=[{mesh<['x'=2:manual, 'y'=2:manual]>, [{'y'}]}],
-                    manual_axes=['y'],
-                    global_input_types=[\
-                        f32[4][sharding={mesh<['x'=2:manual, 'y'=2:manual]>, [{'y'}], varying_manual={'x'}}]],
-                    global_output_types=[\
-                        f32[4][sharding={mesh<['x'=2:manual, 'y'=2:manual]>, [{'y'}], varying_manual={'x'}}]],
+                    input_shardings=[{mesh<['x'=2:manual, 'y'=2:manual]>, [{'x'}]}],
+                    output_shardings=[{mesh<['x'=2:manual, 'y'=2:manual]>, [{'x'}]}],
+                    manual_axes=['x'],
+                    global_input_types=[f32[8][sharding={mesh<['x'=2:manual, 'y'=2:manual]>, [{'x'}]}]],
+                    global_output_types=[f32[8][sharding={mesh<['x'=2:manual, 'y'=2:manual]>, [{'x'}]}]],
                 ] %0 [
                     body={
-                        lambda \
-                            %0:f32[2][sharding={mesh<['x'=2:manual, 'y'=2:manual]>, [{}], varying_manual={'x', 'y'}}] .
-                        let \
-                            %1:f32[2][sharding={mesh<['x'=2:manual, 'y'=2:manual]>, [{}], varying_manual={'x', 'y'}}] \
-                            = add %0 %0
+                        lambda %0:f32[4][sharding={mesh<['x'=2:manual, 'y'=2:manual]>, [{}], varying_manual={'x'}}] .
+                        let %1:f32[4][sharding={mesh<['x'=2:manual, 'y'=2:manual]>, [{'y'}], varying_manual={'x'}}] = \
+                            shard_map [
+                            mesh=['x'=2:manual, 'y'=2:manual],
+                            input_shardings=[{mesh<['x'=2:manual, 'y'=2:manual]>, [{'y'}]}],
+                            output_shardings=[{mesh<['x'=2:manual, 'y'=2:manual]>, [{'y'}]}],
+                            manual_axes=['y'],
+                            global_input_types=[f32[4][sharding={mesh<['x'=2:manual, 'y'=2:manual]>, [{'y'}], \
+                                varying_manual={'x'}}]],
+                            global_output_types=[f32[4][sharding={mesh<['x'=2:manual, 'y'=2:manual]>, [{'y'}], \
+                                varying_manual={'x'}}]],
+                        ] %0 [
+                            body={
+                                lambda %0:f32[2][sharding={mesh<['x'=2:manual, 'y'=2:manual]>, [{}], \
+                                    varying_manual={'x', 'y'}}] .
+                                let %1:f32[2][sharding={mesh<['x'=2:manual, 'y'=2:manual]>, [{}], varying_manual={'x', \
+                                    'y'}}] = add %0 %0
+                                in (%1)
+                            },
+                        ]
                         in (%1)
                     },
                 ]
@@ -20816,68 +20705,102 @@ mod tests {
 
         // Specifications over the already manual axis `x` are rejected instead of making `x` manual again, which would
         // drop the variation of the input along `x` and type the per-device output as replicated.
-        let traced: TracedShardMap<TestEagerContext, ArrayType, ArrayType> = trace_shard_map(
-            |_, x: TestTracer| {
-                let result = shard_map(
-                    |x: TestTracer| Ok(x.clone() + x),
-                    x.clone(),
-                    mesh.clone(),
-                    outer_sharding.clone(),
-                    outer_sharding.clone(),
-                    ShardMapOptions::new(),
-                );
-                let expected = ShardMapError::SpecificationNamesEnclosingManualAxis {
-                    value_kind: "input",
-                    value_index: 0,
-                    axis_name: "x".to_string(),
-                };
-                assert_eq!(result, Err(expected));
-                assert_eq!(
-                    result.unwrap_err().to_string(),
-                    "input sharding #0 names mesh axis `x`, which is already manual in an enclosing manual region",
-                );
-                Ok(x)
+        let program = trace_test_program(
+            |inputs| {
+                vec![
+                    shard_map(
+                        |x: TestTracer| {
+                            let result = shard_map(
+                                |x: TestTracer| Ok(x.clone() + x),
+                                x.clone(),
+                                mesh.clone(),
+                                outer_sharding.clone(),
+                                outer_sharding.clone(),
+                                ShardMapOptions::new(),
+                            );
+                            let expected = ShardMapError::SpecificationNamesEnclosingManualAxis {
+                                value_kind: "input",
+                                value_index: 0,
+                                axis_name: "x".to_string(),
+                            };
+                            assert_eq!(result, Err(expected));
+                            assert_eq!(
+                                result.unwrap_err().to_string(),
+                                "input sharding #0 names mesh axis `x`, which is already manual in an enclosing manual \
+                                 region",
+                            );
+                            Ok(x)
+                        },
+                        inputs[0].clone(),
+                        mesh.clone(),
+                        outer_sharding.clone(),
+                        outer_sharding.clone(),
+                        ShardMapOptions::new().with_manual_axes(["x"]),
+                    )
+                    .unwrap(),
+                ]
             },
-            f32_vector_type(8),
-            mesh.clone(),
-            outer_sharding.clone(),
-            outer_sharding.clone(),
-            ShardMapOptions::new().with_manual_axes(["x"]),
-            &[],
-        )
-        .unwrap();
-        assert_eq!(traced.body().instructions().len(), 0);
+            vec![f32_vector_type(8)],
+            Vec::new(),
+        );
+        assert_eq!(
+            program.to_string(),
+            indoc! {"
+                lambda %0:f32[8] .
+                let %1:f32[8][sharding={mesh<['x'=2:manual, 'y'=2:manual]>, [{'x'}]}] = shard_map [
+                    mesh=['x'=2:manual, 'y'=2:manual],
+                    input_shardings=[{mesh<['x'=2:manual, 'y'=2:manual]>, [{'x'}]}],
+                    output_shardings=[{mesh<['x'=2:manual, 'y'=2:manual]>, [{'x'}]}],
+                    manual_axes=['x'],
+                    global_input_types=[f32[8][sharding={mesh<['x'=2:manual, 'y'=2:manual]>, [{'x'}]}]],
+                    global_output_types=[f32[8][sharding={mesh<['x'=2:manual, 'y'=2:manual]>, [{'x'}]}]],
+                ] %0 [
+                    body={
+                        lambda %0:f32[4][sharding={mesh<['x'=2:manual, 'y'=2:manual]>, [{}], varying_manual={'x'}}] .
+                        in (%0)
+                    },
+                ]
+                in (%1)"
+            },
+        );
 
         // A mesh whose manual axes are all already manual leaves no axis for the nested map.
         let mesh = manual_mesh();
         let sharding = sharded_along_x();
         let replicated = Sharding::replicated(mesh.clone(), 1);
-        let _: TracedShardMap<TestEagerContext, ArrayType, ArrayType> = trace_shard_map(
-            |_, x: TestTracer| {
-                let result = shard_map(
-                    |x: TestTracer| Ok(x),
-                    x.clone(),
-                    mesh.clone(),
-                    replicated.clone(),
-                    replicated.clone(),
-                    ShardMapOptions::new(),
-                );
-                assert_eq!(result, Err(ShardMapError::AllManualAxesAlreadyManual));
-                assert_eq!(
-                    result.unwrap_err().to_string(),
-                    "every manual mesh axis is already manual in an enclosing manual region, so `shard_map` has no \
-                     mesh axis left to make manual",
-                );
-                Ok(x)
+        trace_test_program(
+            |inputs| {
+                vec![
+                    shard_map(
+                        |x: TestTracer| {
+                            let result = shard_map(
+                                |x: TestTracer| Ok(x),
+                                x.clone(),
+                                mesh.clone(),
+                                replicated.clone(),
+                                replicated.clone(),
+                                ShardMapOptions::new(),
+                            );
+                            assert_eq!(result, Err(ShardMapError::AllManualAxesAlreadyManual));
+                            assert_eq!(
+                                result.unwrap_err().to_string(),
+                                "every manual mesh axis is already manual in an enclosing manual region, so \
+                                 `shard_map` has no mesh axis left to make manual",
+                            );
+                            Ok(x)
+                        },
+                        inputs[0].clone(),
+                        mesh.clone(),
+                        sharding.clone(),
+                        sharding.clone(),
+                        ShardMapOptions::new(),
+                    )
+                    .unwrap(),
+                ]
             },
-            f32_vector_type(8),
-            mesh.clone(),
-            sharding.clone(),
-            sharding,
-            ShardMapOptions::new(),
-            &[],
-        )
-        .unwrap();
+            vec![f32_vector_type(8)],
+            Vec::new(),
+        );
     }
 
     #[test]
@@ -21076,515 +20999,142 @@ mod tests {
     }
 
     #[test]
-    fn test_trace_shard_map() {
-        // Descriptor-only tracing names its domain explicitly, here through the annotated result, which also lets the
-        // body closure infer the type of its input. The traced boundary derives the global and local types of both
-        // sides and checks the simplified body.
-        let mesh = LogicalMesh::new(vec![MeshAxis::new("x", 4, MeshAxisType::Manual).unwrap()]).unwrap();
-        let sharded = Sharding::new(mesh.clone(), vec![ShardingDimension::sharded(["x"])]).unwrap();
-        let traced: TracedShardMap<TestEagerContext, ArrayType, ArrayType> = trace_shard_map(
-            |_, x| Ok(x.clone() + x),
-            f32_vector_type(8),
-            mesh.clone(),
-            sharded.clone(),
-            sharded.clone(),
-            ShardMapOptions::new(),
-            &[],
-        )
-        .unwrap();
-        let global_type = f32_vector_type(8).with_sharding(sharded.clone()).unwrap();
-        let local_type = ArrayType::new(DataType::F32, Shape::new(vec![Dimension::Static(2)]))
-            .with_sharding(Sharding::replicated(mesh.clone(), 1).with_varying_manual_axes(["x"]).unwrap())
-            .unwrap();
-        assert_eq!(traced.global_input_types(), &global_type);
-        assert_eq!(traced.local_input_types(), &local_type);
-        assert_eq!(traced.local_output_types(), &local_type);
-        assert_eq!(traced.global_output_types(), &global_type);
-        assert_eq!(
-            traced.operation().boundary(),
-            &ShardMapBoundary::new(mesh, vec![sharded.clone()], vec![sharded], Vec::new()).unwrap(),
-        );
-        assert_eq!(traced.operation().global_input_types(), &[ArrayIrType::Array(global_type.clone())]);
-        assert_eq!(traced.operation().global_output_types(), &[ArrayIrType::Array(global_type)]);
-        assert_eq!(
-            traced.body().to_string(),
-            indoc! {"
-                lambda %0:f32[2][sharding={mesh<['x'=4:manual]>, [{}], varying_manual={'x'}}] .
-                let %1:f32[2][sharding={mesh<['x'=4:manual]>, [{}], varying_manual={'x'}}] = add %0 %0
-                in (%1)"
-            },
-        );
-    }
-
-    #[test]
-    fn test_trace_shard_map_inserts_output_variation() {
+    fn test_shard_map_function_inserts_output_variation() {
         // An invariant body output whose output sharding tiles an active manual axis is marked as varying along it.
         let mesh = manual_mesh();
         let replicated = Sharding::replicated(mesh.clone(), 1);
-        let sharded = sharded_along_x();
-        let traced: TracedShardMap<TestEagerContext, ArrayType, ArrayType> = trace_shard_map(
-            |_, x| Ok(x),
-            f32_vector_type(1),
-            mesh,
-            replicated.clone(),
-            sharded.clone(),
-            ShardMapOptions::new(),
-            &[],
-        )
-        .unwrap();
-        assert_eq!(
-            traced.local_output_types(),
-            &f32_vector_type(1).with_sharding(replicated.with_varying_manual_axes(["x"]).unwrap()).unwrap(),
+        let program = trace_test_program(
+            |inputs| {
+                vec![
+                    shard_map(
+                        |x: TestTracer| Ok(x),
+                        inputs[0].clone(),
+                        mesh.clone(),
+                        replicated.clone(),
+                        sharded_along_x(),
+                        ShardMapOptions::new(),
+                    )
+                    .unwrap(),
+                ]
+            },
+            vec![f32_vector_type(1)],
+            Vec::new(),
         );
-        assert_eq!(traced.global_output_types(), &f32_vector_type(2).with_sharding(sharded).unwrap());
         assert_eq!(
-            traced.body().to_string(),
+            program.to_string(),
             indoc! {"
-                lambda %0:f32[1][sharding={mesh<['x'=2:manual]>, [{}]}] .
-                let %1:f32[1][sharding={mesh<['x'=2:manual]>, [{}], varying_manual={'x'}}] = \
-                        parallel_vary [axis_name=\"x\"] %0
+                lambda %0:f32[1] .
+                let %1:f32[2][sharding={mesh<['x'=2:manual]>, [{'x'}]}] = shard_map [
+                    mesh=['x'=2:manual],
+                    input_shardings=[{mesh<['x'=2:manual]>, [{}]}],
+                    output_shardings=[{mesh<['x'=2:manual]>, [{'x'}]}],
+                    manual_axes=['x'],
+                    global_input_types=[f32[1][sharding={mesh<['x'=2:manual]>, [{}]}]],
+                    global_output_types=[f32[2][sharding={mesh<['x'=2:manual]>, [{'x'}]}]],
+                ] %0 [
+                    body={
+                        lambda %0:f32[1][sharding={mesh<['x'=2:manual]>, [{}]}] .
+                        let %1:f32[1][sharding={mesh<['x'=2:manual]>, [{}], varying_manual={'x'}}] = \
+                            parallel_vary [axis_name=\"x\"] %0
+                        in (%1)
+                    },
+                ]
                 in (%1)"
             },
         );
     }
 
     #[test]
-    fn test_trace_shard_map_hides_auto_axes_in_boundary_types() {
+    fn test_shard_map_function_hides_auto_axes_in_boundary_types() {
         // Auto axes are placed by backend compilers, so the boundary types carry the specifications without them.
         let mesh = data_model_mesh();
         let sharding = Sharding::new(mesh.clone(), vec![ShardingDimension::sharded(["data", "model"])]).unwrap();
-        let traced: TracedShardMap<TestEagerContext, ArrayType, ArrayType> = trace_shard_map(
-            |_, x| Ok(x.clone() + x),
-            f32_vector_type(16),
-            mesh.clone(),
-            sharding.clone(),
-            sharding.clone(),
-            ShardMapOptions::new(),
-            &[],
-        )
-        .unwrap();
-        let global_type = f32_vector_type(16).with_sharding(sharding.without_auto_axes()).unwrap();
-        assert_eq!(traced.global_input_types(), &global_type);
-        assert_eq!(
-            traced.local_input_types(),
-            &f32_vector_type(8)
-                .with_sharding(Sharding::replicated(mesh, 1).with_varying_manual_axes(["data"]).unwrap())
-                .unwrap(),
-        );
-        assert_eq!(traced.global_output_types(), &global_type);
-    }
-
-    #[test]
-    fn test_trace_shard_map_structured_inputs() {
-        // Structured inputs and outputs keep their structure on both sides of the boundary, and the body receives its
-        // local inputs with the structure of the global input types.
-        let mesh = manual_mesh();
-        let sharding = sharded_along_x();
-        let input_types = vec![
-            ArrayType::new_static(DataType::F32, [6]),
-            ArrayType::new_static(DataType::F32, [8]),
-            ArrayType::new_static(DataType::I32, [4]),
-            ArrayType::new_static(DataType::I32, [4]),
-            ArrayType::new_static(DataType::I32, [4]),
-            ArrayType::new_static(DataType::I32, [4]),
-        ];
-        let traced: TracedShardMap<TestEagerContext, Vec<ArrayType>, ArrayType> = trace_shard_map(
-            |_, inputs: Vec<TestTracer>| {
-                Ok(inputs[0]
-                    .parallel_ragged_all_to_all("x", &inputs[1], &inputs[2], &inputs[3], &inputs[4], &inputs[5])?)
+        let program = trace_test_program(
+            |inputs| {
+                vec![
+                    shard_map(
+                        |x: TestTracer| Ok(x.clone() + x),
+                        inputs[0].clone(),
+                        mesh.clone(),
+                        sharding.clone(),
+                        sharding.clone(),
+                        ShardMapOptions::new(),
+                    )
+                    .unwrap(),
+                ]
             },
-            input_types.clone(),
-            mesh.clone(),
-            vec![sharding.clone(); 6],
-            sharding.clone(),
-            ShardMapOptions::new(),
-            &[],
-        )
-        .unwrap();
-        assert_eq!(
-            traced.global_input_types(),
-            &input_types
-                .into_iter()
-                .map(|input_type| input_type.with_sharding(sharding.clone()).unwrap())
-                .collect::<Vec<_>>(),
+            vec![f32_vector_type(16)],
+            Vec::new(),
         );
-        let local_sharding = Sharding::replicated(mesh, 1).with_varying_manual_axes(["x"]).unwrap();
         assert_eq!(
-            traced.local_input_types(),
-            &vec![
-                ArrayType::new_static(DataType::F32, [3]).with_sharding(local_sharding.clone()).unwrap(),
-                ArrayType::new_static(DataType::F32, [4]).with_sharding(local_sharding.clone()).unwrap(),
-                ArrayType::new_static(DataType::I32, [2]).with_sharding(local_sharding.clone()).unwrap(),
-                ArrayType::new_static(DataType::I32, [2]).with_sharding(local_sharding.clone()).unwrap(),
-                ArrayType::new_static(DataType::I32, [2]).with_sharding(local_sharding.clone()).unwrap(),
-                ArrayType::new_static(DataType::I32, [2]).with_sharding(local_sharding).unwrap(),
-            ],
-        );
-        assert_eq!(traced.global_output_types(), &f32_vector_type(8).with_sharding(sharding).unwrap());
-        assert_eq!(
-            traced.body().to_string(),
+            program.to_string(),
             indoc! {"
-                lambda \
-                %0:f32[3][sharding={mesh<['x'=2:manual]>, [{}], varying_manual={'x'}}], \
-                %1:f32[4][sharding={mesh<['x'=2:manual]>, [{}], varying_manual={'x'}}], \
-                %2:i32[2][sharding={mesh<['x'=2:manual]>, [{}], varying_manual={'x'}}], \
-                %3:i32[2][sharding={mesh<['x'=2:manual]>, [{}], varying_manual={'x'}}], \
-                %4:i32[2][sharding={mesh<['x'=2:manual]>, [{}], varying_manual={'x'}}], \
-                %5:i32[2][sharding={mesh<['x'=2:manual]>, [{}], varying_manual={'x'}}] .
-                let \
-                %6:f32[4][sharding={mesh<['x'=2:manual]>, [{}], varying_manual={'x'}}] = \
-                parallel_ragged_all_to_all [axis_name=\"x\", axis_size=2, mesh=['x'=2:manual]] %0 %1 %2 %3 %4 %5
-                in (%6)
-            "}
-            .trim_end(),
-        );
-    }
-
-    #[test]
-    fn test_trace_shard_map_rejects_dynamic_input_types() {
-        let dynamic_input_type = ArrayType::new(
-            DataType::F32,
-            Shape::new(vec![DimensionVariable::new("dynamic", DimensionBounds::unbounded()).into()]),
-        );
-        let mesh = LogicalMesh::new(vec![MeshAxis::new("x", 4, MeshAxisType::Manual).unwrap()]).unwrap();
-        let sharded = Sharding::new(mesh.clone(), vec![ShardingDimension::sharded(["x"])]).unwrap();
-        let result: Result<TracedShardMap<TestEagerContext, ArrayType, ArrayType>, _> = trace_shard_map(
-            |_, x| Ok(x),
-            dynamic_input_type,
-            mesh,
-            sharded.clone(),
-            sharded,
-            ShardMapOptions::new(),
-            &[],
-        );
-        let error = result.map(|_| ()).unwrap_err();
-        assert_eq!(
-            error,
-            ShardMapError::DynamicShapeNotSupported { value_kind: "input", value_index: 0, dimension: 0 },
-        );
-        assert_eq!(error.to_string(), "input type #0 dimension #0 must be static at a `shard_map` boundary");
-    }
-
-    #[test]
-    fn test_trace_shard_map_rejects_ordered_io_bodies() {
-        let mesh = LogicalMesh::new(vec![MeshAxis::new("x", 4, MeshAxisType::Manual).unwrap()]).unwrap();
-        let sharded = Sharding::new(mesh.clone(), vec![ShardingDimension::sharded(["x"])]).unwrap();
-
-        // `OrderedIo` demands one order across devices, which independent per-device execution cannot provide.
-        let result: Result<TracedShardMap<TestEagerContext, ArrayType, ArrayType>, _> = trace_shard_map(
-            |_, x: TestTracer| Ok(x.print("body")?),
-            f32_vector_type(8),
-            mesh.clone(),
-            sharded.clone(),
-            sharded.clone(),
-            ShardMapOptions::new(),
-            &[],
-        );
-        let error = result.map(|_| ()).unwrap_err();
-        assert_eq!(error, ShardMapError::OrderedIoNotSupported);
-        assert_eq!(
-            error.to_string(),
-            "`shard_map` bodies require `DeviceOrderedIo` because `OrderedIo` demands one order across devices",
-        );
-
-        // `DeviceOrderedIo` only orders effects on each device, which a manual computation preserves.
-        let traced: TracedShardMap<TestEagerContext, ArrayType, ArrayType> = trace_shard_map(
-            |_, x: TestTracer| Ok(x.print_with_effect_class("body", EffectClass::DeviceOrderedIo)?),
-            f32_vector_type(8),
-            mesh,
-            sharded.clone(),
-            sharded,
-            ShardMapOptions::new(),
-            &[],
-        )
-        .unwrap();
-        assert_eq!(
-            traced.body().to_string(),
-            indoc! {"
-                lambda %0:f32[2][sharding={mesh<['x'=4:manual]>, [{}], varying_manual={'x'}}] .
-                let %1:f32[2][sharding={mesh<['x'=4:manual]>, [{}], varying_manual={'x'}}] = print [label=body, \
-                    effect_class=device_ordered_io] %0
-                in (%1)"},
-        );
-    }
-
-    #[test]
-    fn test_trace_shard_map_rejects_captures_registered_in_its_body() {
-        // The body is traced in a fresh trace whose capture table is discarded, so registering a capture rejects the
-        // body regardless of whether the returned reference is staged (refer to `TracingContext::trace_with_named_axes`
-        // for the silent-aliasing rationale). The array IR test family does not embed capture references, so this test
-        // traces over a constant family that does.
-        type CapturingDomain = TracingContext<CaptureReference<ArrayIrType>, TestOperation>;
-        let mesh = manual_mesh();
-        let sharded = sharded_along_x();
-        let result: Result<TracedShardMap<CapturingDomain, ArrayType, ArrayType>, _> = trace_shard_map(
-            |_, x: ShardMapTracer<CapturingDomain>| {
-                x.value()
-                    .context()
-                    .capture(CaptureReference::new(0, ArrayIrType::Array(f32_vector_type(2))))
-                    .unwrap();
-                Ok(x)
+                lambda %0:f32[16] .
+                let %1:f32[16][sharding={mesh<['data'=2:manual, 'model'=4:auto]>, [{'data'}]}] = shard_map [
+                    mesh=['data'=2:manual, 'model'=4:auto],
+                    input_shardings=[{mesh<['data'=2:manual, 'model'=4:auto]>, [{'data'}]}],
+                    output_shardings=[{mesh<['data'=2:manual, 'model'=4:auto]>, [{'data'}]}],
+                    manual_axes=['data'],
+                    global_input_types=[f32[16][sharding={mesh<['data'=2:manual, 'model'=4:auto]>, [{'data'}]}]],
+                    global_output_types=[f32[16][sharding={mesh<['data'=2:manual, 'model'=4:auto]>, [{'data'}]}]],
+                ] %0 [
+                    body={
+                        lambda %0:f32[8][sharding={mesh<['data'=2:manual, 'model'=4:auto]>, [{}], \
+                            varying_manual={'data'}}] .
+                        let %1:f32[8][sharding={mesh<['data'=2:manual, 'model'=4:auto]>, [{}], \
+                            varying_manual={'data'}}] = add %0 %0
+                        in (%1)
+                    },
+                ]
+                in (%1)"
             },
-            f32_vector_type(4),
-            mesh,
-            sharded.clone(),
-            sharded,
-            ShardMapOptions::new(),
-            &[],
-        );
-        let error = result.map(|_| ()).unwrap_err();
-        assert_eq!(error, ShardMapError::Program(ProgramError::DiscardedCaptures { count: 1 }));
-        assert_eq!(
-            error.to_string(),
-            "trace registered 1 runtime capture(s) through a trace entry point that discards its capture table; \
-             capture-owning traces must construct their `TracingContext` directly and pair the traced program with \
-             that context's capture table",
         );
     }
 
     #[test]
-    fn test_trace_shard_map_selects_manual_axis_subsets() {
-        // Tracing over the manual-axis subset `y` of the 2x2 mesh shrinks the local shard along `y` only and marks it
-        // as varying along `y` only, while `x` stays a free axis whose placement the body does not see.
+    fn test_shard_map_function_selects_manual_axis_subsets() {
+        // Selecting the manual-axis subset `y` of the 2x2 mesh shrinks the local shard along `y` only and marks it as
+        // varying along `y` only, while `x` stays a free axis whose placement the body does not see.
         let mesh = manual_mesh_2x2();
         let sharding = Sharding::new(mesh.clone(), vec![ShardingDimension::sharded(["y"])]).unwrap();
-        let traced: TracedShardMap<TestEagerContext, ArrayType, ArrayType> = trace_shard_map(
-            |_, x| Ok(x.clone() + x),
-            f32_vector_type(8),
-            mesh,
-            sharding.clone(),
-            sharding,
-            ShardMapOptions::new().with_manual_axes(["y"]),
-            &[],
-        )
-        .unwrap();
+        let program = trace_test_program(
+            |inputs| {
+                vec![
+                    shard_map(
+                        |x: TestTracer| Ok(x.clone() + x),
+                        inputs[0].clone(),
+                        mesh.clone(),
+                        sharding.clone(),
+                        sharding.clone(),
+                        ShardMapOptions::new().with_manual_axes(["y"]),
+                    )
+                    .unwrap(),
+                ]
+            },
+            vec![f32_vector_type(8)],
+            Vec::new(),
+        );
         assert_eq!(
-            traced.operation().to_string(),
+            program.to_string(),
             indoc! {"
-                shard_map [
+                lambda %0:f32[8] .
+                let %1:f32[8][sharding={mesh<['x'=2:manual, 'y'=2:manual]>, [{'y'}]}] = shard_map [
                     mesh=['x'=2:manual, 'y'=2:manual],
                     input_shardings=[{mesh<['x'=2:manual, 'y'=2:manual]>, [{'y'}]}],
                     output_shardings=[{mesh<['x'=2:manual, 'y'=2:manual]>, [{'y'}]}],
                     manual_axes=['y'],
                     global_input_types=[f32[8][sharding={mesh<['x'=2:manual, 'y'=2:manual]>, [{'y'}]}]],
                     global_output_types=[f32[8][sharding={mesh<['x'=2:manual, 'y'=2:manual]>, [{'y'}]}]],
-                ]"},
-        );
-        assert_eq!(
-            traced.body().to_string(),
-            indoc! {"
-                lambda %0:f32[4][sharding={mesh<['x'=2:manual, 'y'=2:manual]>, [{}], varying_manual={'y'}}] .
-                let %1:f32[4][sharding={mesh<['x'=2:manual, 'y'=2:manual]>, [{}], varying_manual={'y'}}] = add %0 %0
-                in (%1)"},
-        );
-    }
-
-    #[test]
-    fn test_trace_shard_map_inherits_named_axes() {
-        // A body traced for the named-axis scope of an enclosing manual region over `x` inherits the binding of `x`, so
-        // a collective over `x` resolves inside it, and the empty manual-axis selection selects only the remaining
-        // manual axis `y`. The global input carries the variation along `x` of the enclosing region, which the
-        // reduction over `x` removes from the output.
-        let mesh = manual_mesh_2x2();
-        let sharding = Sharding::new(mesh.clone(), vec![ShardingDimension::sharded(["y"])]).unwrap();
-        let input_type = f32_vector_type(4)
-            .with_sharding(Sharding::replicated(mesh.clone(), 1).with_varying_manual_axes(["x"]).unwrap())
-            .unwrap();
-        let body_named_axes = RefCell::new(None);
-        let traced: TracedShardMap<TestEagerContext, ArrayType, ArrayType> = trace_shard_map(
-            |_, y: TestTracer| {
-                body_named_axes.replace(Some(y.value().context().named_axes()));
-                Ok(y.parallel_reduce(ReductionKind::Sum, "x")?)
-            },
-            input_type,
-            mesh.clone(),
-            sharding.clone(),
-            sharding,
-            ShardMapOptions::new(),
-            &vec![("x".to_string(), NamedAxis::Mesh { mesh: mesh.clone(), axis: 0, size: 2 })],
-        )
-        .unwrap();
-        assert_eq!(
-            body_named_axes.into_inner(),
-            Some(vec![
-                ("x".to_string(), NamedAxis::Mesh { mesh: mesh.clone(), axis: 0, size: 2 }),
-                ("y".to_string(), NamedAxis::Mesh { mesh, axis: 1, size: 2 }),
-            ]),
-        );
-        assert_eq!(
-            traced.operation().to_string(),
-            indoc! {"
-                shard_map [
-                    mesh=['x'=2:manual, 'y'=2:manual],
-                    input_shardings=[{mesh<['x'=2:manual, 'y'=2:manual]>, [{'y'}]}],
-                    output_shardings=[{mesh<['x'=2:manual, 'y'=2:manual]>, [{'y'}]}],
-                    manual_axes=['y'],
-                    global_input_types=[f32[4][sharding={mesh<['x'=2:manual, 'y'=2:manual]>, [{'y'}], \
-                        varying_manual={'x'}}]],
-                    global_output_types=[f32[4][sharding={mesh<['x'=2:manual, 'y'=2:manual]>, [{'y'}]}]],
-                ]"
-            },
-        );
-        assert_eq!(
-            traced.body().to_string(),
-            indoc! {"
-                lambda %0:f32[2][sharding={mesh<['x'=2:manual, 'y'=2:manual]>, [{}], varying_manual={'x', 'y'}}] .
-                let %1:f32[2][sharding={mesh<['x'=2:manual, 'y'=2:manual]>, [{}], varying_manual={'y'}}] = \
-                    parallel_reduce [kind=sum, axis_name=\"x\", mesh=['x'=2:manual, 'y'=2:manual]] %0
+                ] %0 [
+                    body={
+                        lambda %0:f32[4][sharding={mesh<['x'=2:manual, 'y'=2:manual]>, [{}], varying_manual={'y'}}] .
+                        let %1:f32[4][sharding={mesh<['x'=2:manual, 'y'=2:manual]>, [{}], varying_manual={'y'}}] = \
+                            add %0 %0
+                        in (%1)
+                    },
+                ]
                 in (%1)"
             },
-        );
-    }
-
-    #[test]
-    fn test_trace_shard_map_traces_bodies_without_inputs() {
-        // A descriptor-only body without inputs creates its values through its body context, here the coordinate of
-        // each device along `x`, which the output sharding tiles into the global vector of device coordinates (JAX's
-        // `shard_map(lambda: axis_index('x'), in_specs=(), out_specs=P('x'))`).
-        let traced: TracedShardMap<TestEagerContext, (), ArrayType> = trace_shard_map(
-            |context: &ShardMapContext<TestEagerContext>, ()| Ok(context.axis_index("x")?.reshape([1])?),
-            (),
-            manual_mesh(),
-            (),
-            sharded_along_x(),
-            ShardMapOptions::new(),
-            &[],
-        )
-        .unwrap();
-        assert_eq!(
-            traced.operation().to_string(),
-            indoc! {"
-                shard_map [
-                    mesh=['x'=2:manual],
-                    input_shardings=[],
-                    output_shardings=[{mesh<['x'=2:manual]>, [{'x'}]}],
-                    manual_axes=['x'],
-                    global_input_types=[],
-                    global_output_types=[u64[2][sharding={mesh<['x'=2:manual]>, [{'x'}]}]],
-                ]"},
-        );
-        assert_eq!(
-            traced.body().to_string(),
-            indoc! {"
-                lambda  .
-                let %0:u64[][sharding={mesh<['x'=2:manual]>, [], varying_manual={'x'}}] = axis_index \
-                    [axis_name=\"x\", mesh=['x'=2:manual]]
-                    %1:u64[1][sharding={mesh<['x'=2:manual]>, [{}], varying_manual={'x'}}] = reshape [shape=[1]] %0
-                in (%1)"
-            },
-        );
-    }
-
-    #[test]
-    fn test_trace_shard_map_rejects_input_shardings_with_other_structures() {
-        // Input shardings with as many leaves as the global input types but a different structure are rejected before
-        // the body is traced, instead of being silently restructured into the structure of the input types.
-        let replicated = Sharding::replicated(manual_mesh(), 1);
-        let result: Result<TracedShardMap<TestEagerContext, Vec<Vec<ArrayType>>, ArrayType>, _> = trace_shard_map(
-            |_, _: Vec<Vec<TestTracer>>| -> Result<TestTracer, ProgramError> {
-                unreachable!("input types whose shardings have another structure are never traced")
-            },
-            vec![vec![f32_vector_type(4)], vec![f32_vector_type(4), f32_vector_type(4)]],
-            manual_mesh(),
-            vec![vec![replicated.clone(), replicated.clone()], vec![replicated.clone()]],
-            replicated,
-            ShardMapOptions::new(),
-            &[],
-        );
-        assert_eq!(
-            result.map(|_| ()),
-            Err(ShardMapError::Parameter(ParameterError::MismatchedParameterStructures {
-                left_structure: "[$[0][0], $[1][0], $[1][1]]".to_string(),
-                right_structure: "[$[0][0], $[0][1], $[1][0]]".to_string(),
-            })),
-        );
-    }
-
-    #[test]
-    fn test_traced_shard_map_operation() {
-        assert_eq!(
-            traced_test_shard_map().operation().to_string(),
-            indoc! {"
-                shard_map [
-                    mesh=['x'=2:manual],
-                    input_shardings=[{mesh<['x'=2:manual]>, [{'x'}]}, {mesh<['x'=2:manual]>, [{}]}],
-                    output_shardings=[{mesh<['x'=2:manual]>, [{'x'}]}, {mesh<['x'=2:manual]>, [{}]}],
-                    manual_axes=['x'],
-                    global_input_types=[f32[8][sharding={mesh<['x'=2:manual]>, [{'x'}]}], \
-                    f32[2][sharding={mesh<['x'=2:manual]>, [{}]}]],
-                    global_output_types=[f32[8][sharding={mesh<['x'=2:manual]>, [{'x'}]}], \
-                    f32[2][sharding={mesh<['x'=2:manual]>, [{}]}]],
-                ]"},
-        );
-    }
-
-    #[test]
-    fn test_traced_shard_map_global_input_types() {
-        let mesh = manual_mesh();
-        let sharded = sharded_along_x();
-        assert_eq!(
-            traced_test_shard_map().global_input_types(),
-            &vec![
-                f32_vector_type(8).with_sharding(sharded).unwrap(),
-                f32_vector_type(2).with_sharding(Sharding::replicated(mesh, 1)).unwrap(),
-            ],
-        );
-    }
-
-    #[test]
-    fn test_traced_shard_map_local_input_types() {
-        // The sharded input shrinks along `x` and varies along it, while the replicated input keeps its shape.
-        let replicated = Sharding::replicated(manual_mesh(), 1);
-        assert_eq!(
-            traced_test_shard_map().local_input_types(),
-            &vec![
-                f32_vector_type(4)
-                    .with_sharding(replicated.clone().with_varying_manual_axes(["x"]).unwrap())
-                    .unwrap(),
-                f32_vector_type(2).with_sharding(replicated).unwrap(),
-            ],
-        );
-    }
-
-    #[test]
-    fn test_traced_shard_map_global_output_types() {
-        let mesh = manual_mesh();
-        let sharded = sharded_along_x();
-        assert_eq!(
-            traced_test_shard_map().global_output_types(),
-            &vec![
-                f32_vector_type(8).with_sharding(sharded).unwrap(),
-                f32_vector_type(2).with_sharding(Sharding::replicated(mesh, 1)).unwrap(),
-            ],
-        );
-    }
-
-    #[test]
-    fn test_traced_shard_map_local_output_types() {
-        let replicated = Sharding::replicated(manual_mesh(), 1);
-        assert_eq!(
-            traced_test_shard_map().local_output_types(),
-            &vec![
-                f32_vector_type(4)
-                    .with_sharding(replicated.clone().with_varying_manual_axes(["x"]).unwrap())
-                    .unwrap(),
-                f32_vector_type(2).with_sharding(replicated).unwrap(),
-            ],
-        );
-    }
-
-    #[test]
-    fn test_traced_shard_map_body() {
-        assert_eq!(
-            traced_test_shard_map().body().to_string(),
-            indoc! {"
-                lambda \
-                %0:f32[4][sharding={mesh<['x'=2:manual]>, [{}], varying_manual={'x'}}], \
-                %1:f32[2][sharding={mesh<['x'=2:manual]>, [{}]}] .
-                let %2:f32[4][sharding={mesh<['x'=2:manual]>, [{}], varying_manual={'x'}}] = add %0 %0
-                in (%2, %1)
-            "}
-            .trim_end(),
         );
     }
 }

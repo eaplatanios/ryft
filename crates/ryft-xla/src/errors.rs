@@ -238,40 +238,6 @@ pub enum Error {
     #[error("invalid XLA reference-state ABI: {message}")]
     InvalidReferenceStateAbi { message: String },
 
-    /// Error returned when [`to_mlir_module`](crate::operations::sharding::shard_map::to_mlir_module) lowers a traced
-    /// shard map whose global input or output type varies along a mesh axis that is not one of its own manual axes.
-    /// Only an enclosing manual region makes such an axis manual (e.g., for a body traced with
-    /// [`ryft_core::trace_shard_map`] under the named axes of such a region), and the standalone module that
-    /// [`to_mlir_module`](crate::operations::sharding::shard_map::to_mlir_module) produces has none, so the shard map
-    /// can only be lowered as part of the program that encloses it.
-    #[error(
-        "{value_kind} type #{value_index} of a standalone `shard_map` varies along mesh axis `{axis_name}`, which is \
-         not one of its manual axes; lower it as part of the program whose manual region makes that axis manual"
-    )]
-    StandaloneShardMapVariesAlongEnclosingManualAxis {
-        /// Whether the varying value is an input or output.
-        value_kind: &'static str,
-
-        /// Position of the varying value in its input or output signature.
-        value_index: usize,
-
-        /// Mesh axis requiring an enclosing manual region.
-        axis_name: String,
-    },
-
-    /// Error returned when [`to_mlir_module`](crate::operations::sharding::shard_map::to_mlir_module) lowers a traced
-    /// shard map whose body applies a collective (e.g., `parallel_reduce` or `axis_index`) along a manual mesh axis
-    /// that neither the shard map nor a shard map nested in its body makes manual. Only an enclosing manual region
-    /// makes such an axis manual (e.g., for a body traced with [`ryft_core::trace_shard_map`] under the named axes of
-    /// such a region), even when the boundary of the shard map does not vary along it (e.g., for a reduction of an
-    /// invariant input), and the standalone module that
-    /// [`to_mlir_module`](crate::operations::sharding::shard_map::to_mlir_module) produces has none.
-    #[error(
-        "`{operation_name}` in the body of a standalone `shard_map` communicates along mesh axis `{axis_name}`, which \
-         is not one of its manual axes; lower it as part of the program whose manual region makes that axis manual"
-    )]
-    StandaloneShardMapCommunicatesAlongEnclosingManualAxis { operation_name: &'static str, axis_name: String },
-
     /// Error surfaced when [`compile_with_options`](crate::jit::compile_with_options) is given options
     /// that do not match the traced function's arity or shape — for example a
     /// `donate_argnums` index outside the flat input range, or an `input_shardings` length that

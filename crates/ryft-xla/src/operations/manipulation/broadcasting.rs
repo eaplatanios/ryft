@@ -313,22 +313,20 @@ mod tests {
     use ryft_core::{
         Array, ArrayIrType, DataType, DimensionBounds, DimensionSizeOperation, DimensionType, DimensionValue,
         DimensionVariable, DynamicBroadcastOperation, Layout, LogicalMesh, MeshAxis, Placeholder, ProgramBuilder,
-        ProgramError, Shape, ShardMapOptions, StridedLayout, Tile, TileDimension, TiledLayout, TracedShardMap,
-        TypedProgram, trace_shard_map,
+        ProgramError, Shape, ShardMapOptions, StridedLayout, Tile, TileDimension, TiledLayout, TypedProgram,
     };
     use ryft_pjrt::{BufferType, ExecutionDeviceInputs, ExecutionInput, Program as PjrtProgram};
 
     use crate::experimental::lowering::tests::{
-        PlainXlaProgram, XlaProgramBuilder, dynamic_dimension, ragged_dot_cpu_compilation_options, test_manual_mesh,
-        test_vector_type,
+        PlainXlaProgram, XlaProgramBuilder, dynamic_dimension, ragged_dot_cpu_compilation_options, shard_map_module,
+        test_manual_mesh, test_vector_type,
     };
     use crate::experimental::lowering::to_mlir_module_for_plain_program;
     use crate::experimental::ops::{
         XlaArrayConstant, XlaConstant, XlaOperation, XlaProgramBuilder as ArrayIrXlaProgramBuilder,
     };
-    use crate::operations::sharding::shard_map::to_mlir_module;
     use crate::tests::{execution_client, values_from_bytes, values_to_bytes};
-    use crate::{XlaDomain, XlaSession, to_mlir_module_for_program};
+    use crate::{XlaSession, to_mlir_module_for_program};
 
     use super::*;
 
@@ -908,18 +906,16 @@ mod tests {
         let local_output = test_vector_type(2)
             .with_sharding(boundary.clone().with_varying_manual_axes(["x"]).unwrap())
             .unwrap();
-        let traced: TracedShardMap<XlaDomain<'static>, ArrayType, ArrayType> = trace_shard_map(
+        let module = shard_map_module::<_, ArrayType, ArrayType>(
             |_, input| input.broadcast(local_output.clone(), &[0]),
             test_vector_type(4),
             mesh,
             boundary.clone(),
             boundary,
             ShardMapOptions::new(),
-            &[],
-        )
-        .unwrap();
+        );
         assert!(matches!(
-            to_mlir_module(&traced, "main"),
+            module,
             Err(Error::Core(ryft_core::Error::Program(ProgramError::UnsupportedOperation { message })))
                 if message == "`broadcast` cannot assign bound manual mesh axes to local output dimensions",
         ));

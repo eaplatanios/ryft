@@ -13,4 +13,4 @@ pub use domains::{
     XlaOptimizedProgram, XlaSession,
 };
 
-pub use tracing::{TracedXlaProgram, XlaArrayTracer, trace};
+pub use tracing::{TracedXlaProgram, XlaArrayTracer, trace, trace_with_context};

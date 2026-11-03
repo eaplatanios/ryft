@@ -5,9 +5,9 @@ use pretty_assertions::assert_eq;
 use ryft_core::{
     AddOperation, AtomId, CaptureReference, CastOperation, ConditionOperation, Context, Cos, Differentiate, Dimension,
     DimensionBounds, DimensionType, DimensionValue, DimensionVariable, Dot, DotDimensionNumbers, EagerContext,
-    EffectClasses, MeshAxis, MeshAxisType, NegOperation, OneLike, Placeholder, Program, ProgramBuilder,
-    ProvenanceScope, ReduceOperation, ReductionKind, ReshapeOperation, ReverseModeDifferentiate, ShardMapOptions, Sin,
-    TracedShardMap, Transpose, TypedProgram, ZeroLike, trace_shard_map,
+    EffectClasses, MeshAxis, MeshAxisType, NegOperation, OneLike, ParameterizedFamily, Placeholder, Program,
+    ProgramBuilder, ProvenanceScope, ReduceOperation, ReductionKind, ReshapeOperation, ReverseModeDifferentiate,
+    ShardMap, ShardMapContext, ShardMapOptions, Sin, Transpose, TypedProgram, ZeroLike,
 };
 use ryft_mlir::{Attribute, Operation as MlirOperation, Region, Size as MlirSize};
 use ryft_pjrt::{BufferType, ExecutionDeviceInputs, ExecutionInput, Program as PjrtProgram};
@@ -15,9 +15,9 @@ use ryft_pjrt::{BufferType, ExecutionDeviceInputs, ExecutionInput, Program as Pj
 use crate::experimental::domains::XlaDomain;
 use crate::experimental::lowering::types::lower_array_ir_type;
 use crate::experimental::ops::{FlatXlaProgram, XlaProgramBuilder as ArrayIrXlaProgramBuilder};
+use crate::experimental::tracing::{TracedXlaProgram, XlaArrayTracer, trace_with_context};
 use crate::operations::assertions::ensure_assertion_handler_registered;
 use crate::operations::jit_call::JitCallOperation;
-use crate::operations::sharding::shard_map::to_mlir_module;
 use crate::tests::{values_from_bytes, values_to_bytes};
 
 use super::*;
@@ -55,6 +55,55 @@ pub(crate) fn test_sharding(
     unreduced_axes: Vec<String>,
 ) -> Sharding {
     Sharding::new(mesh.clone(), dimensions).unwrap().with_unreduced_axes(unreduced_axes).unwrap()
+}
+
+/// Traces `function` as the body of one top-level `shard_map` (refer to [`ShardMap`]) over global inputs of
+/// `global_input_types` and lowers the traced program to a module whose `main` function signature carries the boundary
+/// shardings, which are `input_shardings` and `output_shardings` without their auto axes.
+pub(crate) fn shard_map_module<F, Input, Output>(
+    function: F,
+    global_input_types: Input,
+    mesh: LogicalMesh,
+    input_shardings: Input::To<Sharding>,
+    output_shardings: Output::To<Sharding>,
+    options: ShardMapOptions,
+) -> Result<String, Error>
+where
+    Input: Parameterized<ArrayType>,
+    Input::Family:
+        ParameterizedFamily<XlaConstant> + ParameterizedFamily<XlaArrayTracer> + ParameterizedFamily<Sharding>,
+    Output: Parameterized<ArrayType>,
+    Output::Family:
+        ParameterizedFamily<XlaConstant> + ParameterizedFamily<XlaArrayTracer> + ParameterizedFamily<Sharding>,
+    F: FnOnce(
+        &ShardMapContext<XlaDomain<'static>>,
+        Input::To<XlaArrayTracer>,
+    ) -> Result<Output::To<XlaArrayTracer>, ProgramError>,
+{
+    let input_structure = global_input_types.parameter_structure();
+    let output_structure = output_shardings.parameter_structure();
+    let input_shardings = input_shardings.into_parameters().collect::<Vec<_>>();
+    let output_shardings = output_shardings.into_parameters().collect::<Vec<_>>();
+    let argument_shardings = input_shardings.iter().map(Sharding::without_auto_axes).collect::<Vec<_>>();
+    let result_shardings = output_shardings.iter().map(Sharding::without_auto_axes).collect::<Vec<_>>();
+    let traced: TracedXlaProgram<Input, Output> = trace_with_context(
+        |context, inputs| {
+            let outputs = context.shard_map(
+                |body_context, local_inputs: Vec<XlaArrayTracer>| {
+                    let local_inputs = Input::To::<XlaArrayTracer>::from_parameters(input_structure, local_inputs)?;
+                    Ok(function(body_context, local_inputs)?.into_parameters().collect::<Vec<_>>())
+                },
+                inputs.into_parameters().collect::<Vec<_>>(),
+                mesh,
+                input_shardings,
+                output_shardings,
+                options,
+            )?;
+            Ok(Output::To::<XlaArrayTracer>::from_parameters(output_structure, outputs)?)
+        },
+        global_input_types,
+    )?;
+    traced.to_mlir_module_with_signature_shardings("main", Some(&argument_shardings), Some(&result_shardings))
 }
 
 /// Compilation options for an SPMD executable with `partition_count` partitions, partitioned by Shardy.
@@ -900,22 +949,21 @@ pub(crate) fn lower_replicated_shard_map_body(
 }
 
 #[test]
-fn test_to_mlir_module_renders_a_full_add_module() {
+fn test_to_mlir_module_for_program_renders_a_full_add_module() {
     let global_input_type = test_vector_type(8);
     let mesh = test_manual_mesh("x", 4);
-    let traced: TracedShardMap<XlaDomain<'static>, ArrayType, ArrayType> = trace_shard_map(
+    let module = shard_map_module::<_, ArrayType, ArrayType>(
         |_, x| Ok(x.clone() + x),
         global_input_type,
         mesh.clone(),
         Sharding::new(mesh.clone(), vec![ShardingDimension::sharded(["x"])]).unwrap(),
         Sharding::new(mesh, vec![ShardingDimension::sharded(["x"])]).unwrap(),
         ShardMapOptions::new(),
-        &[],
     )
     .unwrap();
 
     assert_eq!(
-        to_mlir_module(&traced, "main").unwrap(),
+        module,
         indoc! {r#"
             module {
               sdy.mesh @mesh = <["x"=4]>
@@ -932,10 +980,10 @@ fn test_to_mlir_module_renders_a_full_add_module() {
 }
 
 #[test]
-fn test_to_mlir_module_renders_provenance_locations() {
+fn test_to_mlir_module_for_program_renders_provenance_locations() {
     let global_input_type = test_vector_type(8);
     let mesh = test_manual_mesh("x", 4);
-    let traced: TracedShardMap<XlaDomain<'static>, ArrayType, ArrayType> = trace_shard_map(
+    let module = shard_map_module::<_, ArrayType, ArrayType>(
         |_, x| {
             let context = x.value().context().clone();
             // One instruction staged under nested scopes, one under a fused origin, and one with unknown
@@ -955,7 +1003,6 @@ fn test_to_mlir_module_renders_provenance_locations() {
         Sharding::new(mesh.clone(), vec![ShardingDimension::sharded(["x"])]).unwrap(),
         Sharding::new(mesh, vec![ShardingDimension::sharded(["x"])]).unwrap(),
         ShardMapOptions::new(),
-        &[],
     )
     .unwrap();
 
@@ -964,7 +1011,7 @@ fn test_to_mlir_module_renders_provenance_locations() {
     // module/function scaffolding keeps the base location. Locations render because provenance-carrying modules
     // serialize with debug information enabled (and the non-pretty, parsable form).
     assert_eq!(
-        to_mlir_module(&traced, "main").unwrap(),
+        module,
         indoc! {r#"
             #loc = loc(unknown)
             module {
@@ -989,10 +1036,10 @@ fn test_to_mlir_module_renders_provenance_locations() {
 }
 
 #[test]
-fn test_to_mlir_module_renders_constants_and_supported_ops() {
+fn test_to_mlir_module_for_program_renders_constants_and_supported_ops() {
     let global_input_type = test_matrix_type(4, 4);
     let mesh = test_manual_mesh("x", 2);
-    let traced: TracedShardMap<XlaDomain<'static>, ArrayType, ArrayType> = trace_shard_map(
+    let module = shard_map_module::<_, ArrayType, ArrayType>(
         |_, x| {
             let product = x.transpose(vec![1, 0])?.dot(&x, &DotDimensionNumbers::matmul())?;
             let waveform = (-product).cos()?.sin()?;
@@ -1003,16 +1050,15 @@ fn test_to_mlir_module_renders_constants_and_supported_ops() {
         Sharding::new(mesh.clone(), vec![ShardingDimension::sharded(["x"]), ShardingDimension::replicated()]).unwrap(),
         Sharding::new(mesh, vec![ShardingDimension::sharded(["x"]), ShardingDimension::replicated()]).unwrap(),
         ShardMapOptions::new(),
-        &[],
     )
     .unwrap();
 
     assert_eq!(
-        to_mlir_module(&traced, "kernel").unwrap(),
+        module,
         indoc! {r#"
             module {
               sdy.mesh @mesh = <["x"=2]>
-              func.func @kernel(%arg0: tensor<4x4xf32> {sdy.sharding = #sdy.sharding<@mesh, [{"x"}, {}]>}) -> (tensor<8x4xf32> {sdy.sharding = #sdy.sharding<@mesh, [{"x"}, {}]>}) {
+              func.func @main(%arg0: tensor<4x4xf32> {sdy.sharding = #sdy.sharding<@mesh, [{"x"}, {}]>}) -> (tensor<8x4xf32> {sdy.sharding = #sdy.sharding<@mesh, [{"x"}, {}]>}) {
                 %0 = sdy.manual_computation(%arg0) in_shardings=[<@mesh, [{"x"}, {}]>] out_shardings=[<@mesh, [{"x"}, {}]>] manual_axes={"x"} (%arg1: tensor<2x4xf32>) {
                   %1 = stablehlo.transpose %arg1, dims = [1, 0] : (tensor<2x4xf32>) -> tensor<4x2xf32>
                   %2 = stablehlo.dot_general %1, %arg1, contracting_dims = [1] x [0], precision = [DEFAULT, DEFAULT] : (tensor<4x2xf32>, tensor<2x4xf32>) -> tensor<4x4xf32>

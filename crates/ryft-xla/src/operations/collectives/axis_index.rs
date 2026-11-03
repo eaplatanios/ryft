@@ -112,29 +112,25 @@ impl LowerableOperation for AxisIndexOperation {
 
 #[cfg(test)]
 mod tests {
-    use ryft_core::{Context, ShardMapOptions, Sharding, TracedShardMap, Value, trace_shard_map};
+    use ryft_core::{Context, ShardMapOptions, Sharding, Value};
 
-    use crate::XlaDomain;
-    use crate::experimental::lowering::tests::{test_manual_mesh, test_vector_type};
-    use crate::operations::sharding::shard_map::to_mlir_module;
+    use crate::experimental::lowering::tests::{shard_map_module, test_manual_mesh, test_vector_type};
 
     use super::*;
 
     #[test]
     fn test_axis_index_rejects_missing_checked_mesh_metadata() {
         let mesh = test_manual_mesh("x", 2);
-        let traced: TracedShardMap<XlaDomain<'static>, ArrayType, ArrayType> = trace_shard_map(
+        let module = shard_map_module::<_, ArrayType, ArrayType>(
             |_, input| Ok(input.domain().bind(AxisIndexOperation::new("x".to_string()), Vec::new(), &[])?.remove(0)),
             test_vector_type(4),
             mesh.clone(),
             Sharding::replicated(mesh.clone(), 1),
             Sharding::replicated(mesh, 0),
             ShardMapOptions::new(),
-            &[],
-        )
-        .unwrap();
+        );
         assert!(matches!(
-            to_mlir_module(&traced, "main"),
+            module,
             Err(Error::Core(ryft_core::Error::Program(ProgramError::MalformedProgram(message))))
                 if message == "`axis_index` requires mesh metadata inside a manual region",
         ));

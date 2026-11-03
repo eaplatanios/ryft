@@ -292,7 +292,7 @@ mod tests {
         DimensionOperation, DimensionType, DimensionValue, DimensionVariable, DynamicReshapeOperation, EffectClass,
         EffectClasses, EmptyRegionDriver, LogicalMesh, MeshAxis, MeshAxisType, Operation, Placeholder,
         ProgramBatchingOutputAxesPolicy, ProgramError, Reshape, Shape, ShardMapOptions, Sharding, ShardingDimension,
-        StagingContext, TracedShardMap, TracingContext, TransposeOperation, Typed, TypedProgram, trace_shard_map,
+        StagingContext, TracingContext, TransposeOperation, Typed, TypedProgram,
     };
     use ryft_mlir::Location;
     use ryft_pjrt::{BufferType, ExecutionDeviceInputs, ExecutionInput, Program as PjrtProgram};
@@ -300,15 +300,15 @@ mod tests {
     use crate::experimental::XlaArrayTracer;
     use crate::experimental::lowering::tests::{
         MixedValue, PlainXlaProgram, XlaProgramBuilder, dynamic_dimension, execute_mixed_program,
-        ragged_dot_cpu_compilation_options, test_matrix_type, test_vector_type, unproject_plain_program,
+        ragged_dot_cpu_compilation_options, shard_map_module, test_matrix_type, test_vector_type,
+        unproject_plain_program,
     };
     use crate::experimental::lowering::to_mlir_module_for_plain_program;
     use crate::experimental::ops::{
         FlatXlaProgram, XlaArrayConstant, XlaConstant, XlaOperation, XlaProgramBuilder as ArrayIrXlaProgramBuilder,
     };
-    use crate::operations::sharding::shard_map::to_mlir_module;
     use crate::tests::{execution_client, values_to_bytes};
-    use crate::{XlaDomain, to_mlir_module_for_program};
+    use crate::to_mlir_module_for_program;
 
     use super::*;
 
@@ -1291,7 +1291,7 @@ mod tests {
     }
 
     #[test]
-    fn test_to_mlir_module_renders_reshape_singleton_axis_sharding_propagation() {
+    fn test_to_mlir_module_for_program_renders_reshape_singleton_axis_sharding_propagation() {
         let mesh = LogicalMesh::new(vec![MeshAxis::new("x", 4, MeshAxisType::Manual).unwrap()]).unwrap();
         let global_input_type = ArrayType::new(DataType::F32, Shape::new(vec![Dimension::Static(8)]));
         let input_sharding = Sharding::new(mesh.clone(), vec![ShardingDimension::sharded(["x"])]).unwrap();
@@ -1301,7 +1301,7 @@ mod tests {
         )
         .unwrap();
 
-        let traced: TracedShardMap<XlaDomain<'static>, ArrayType, ArrayType> = trace_shard_map(
+        let module = shard_map_module::<_, ArrayType, ArrayType>(
             |_, x: XlaArrayTracer| {
                 x.reshape(Shape::new(vec![Dimension::Static(1), Dimension::Static(2), Dimension::Static(1)]))
             },
@@ -1310,12 +1310,11 @@ mod tests {
             input_sharding.clone(),
             output_sharding.clone(),
             ShardMapOptions::new(),
-            &[],
         )
         .unwrap();
 
         assert_eq!(
-            to_mlir_module(&traced, "main").unwrap(),
+            module,
             indoc! {r#"
                 module {
                   sdy.mesh @mesh = <["x"=4]>
@@ -1332,7 +1331,7 @@ mod tests {
     }
 
     #[test]
-    fn test_to_mlir_module_renders_reshape_replicated_merge_sharding_propagation() {
+    fn test_to_mlir_module_for_program_renders_reshape_replicated_merge_sharding_propagation() {
         let mesh = LogicalMesh::new(vec![MeshAxis::new("x", 4, MeshAxisType::Manual).unwrap()]).unwrap();
         let global_input_type = ArrayType::new(
             DataType::F32,
@@ -1347,19 +1346,18 @@ mod tests {
             Sharding::new(mesh.clone(), vec![ShardingDimension::sharded(["x"]), ShardingDimension::replicated()])
                 .unwrap();
 
-        let traced: TracedShardMap<XlaDomain<'static>, ArrayType, ArrayType> = trace_shard_map(
+        let module = shard_map_module::<_, ArrayType, ArrayType>(
             |_, x: XlaArrayTracer| x.reshape(Shape::new(vec![Dimension::Static(2), Dimension::Static(6)])),
             global_input_type,
             mesh.clone(),
             input_sharding.clone(),
             output_sharding.clone(),
             ShardMapOptions::new(),
-            &[],
         )
         .unwrap();
 
         assert_eq!(
-            to_mlir_module(&traced, "main").unwrap(),
+            module,
             indoc! {r#"
                 module {
                   sdy.mesh @mesh = <["x"=4]>
@@ -1376,7 +1374,7 @@ mod tests {
     }
 
     #[test]
-    fn test_to_mlir_module_renders_reshape_replicated_split_sharding_propagation() {
+    fn test_to_mlir_module_for_program_renders_reshape_replicated_split_sharding_propagation() {
         let mesh = LogicalMesh::new(vec![MeshAxis::new("x", 4, MeshAxisType::Manual).unwrap()]).unwrap();
         let global_input_type =
             ArrayType::new(DataType::F32, Shape::new(vec![Dimension::Static(8), Dimension::Static(6)]));
@@ -1389,7 +1387,7 @@ mod tests {
         )
         .unwrap();
 
-        let traced: TracedShardMap<XlaDomain<'static>, ArrayType, ArrayType> = trace_shard_map(
+        let module = shard_map_module::<_, ArrayType, ArrayType>(
             |_, x: XlaArrayTracer| {
                 x.reshape(Shape::new(vec![Dimension::Static(2), Dimension::Static(2), Dimension::Static(3)]))
             },
@@ -1398,12 +1396,11 @@ mod tests {
             input_sharding.clone(),
             output_sharding.clone(),
             ShardMapOptions::new(),
-            &[],
         )
         .unwrap();
 
         assert_eq!(
-            to_mlir_module(&traced, "main").unwrap(),
+            module,
             indoc! {r#"
                 module {
                   sdy.mesh @mesh = <["x"=4]>

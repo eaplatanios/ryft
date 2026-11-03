@@ -172,12 +172,12 @@ pub use operations::{
     StopGradient, StopGradientOperation, StopGradients, Sub, SubOperation, SymbolicZeroJvp, SymbolicZeroVjp,
     TAG_OPERATION_NAME, TAN_OPERATION_NAME, TANH_OPERATION_NAME, TRANSFER_TO_MEMORY_OPERATION_NAME,
     TRANSPOSE_OPERATION_NAME, Tag, TagOperation, Tan, TanOperation, Tanh, TanhOperation, Tolerance, TopK,
-    TracedShardMap, TransferToMemory, TransferToMemoryOperation, Transpose, TransposeOperation,
-    TrigonometricOperations, UPDATE_SLICE_OPERATION_NAME, UnavailableCustomRules, UpdateSlice, UpdateSliceOperation,
-    VjpComposite, WHILE_OPERATION_NAME, WeakCustomRuleReference, While, WhileOperation, WhileOptions, WhilePredicate,
-    WhileType, XOR_OPERATION_NAME, Xor, XorOperation, ZERO_LIKE_OPERATION_NAME, ZERO_OPERATION_NAME, Zero, ZeroLike,
+    TransferToMemory, TransferToMemoryOperation, Transpose, TransposeOperation, TrigonometricOperations,
+    UPDATE_SLICE_OPERATION_NAME, UnavailableCustomRules, UpdateSlice, UpdateSliceOperation, VjpComposite,
+    WHILE_OPERATION_NAME, WeakCustomRuleReference, While, WhileOperation, WhileOptions, WhilePredicate, WhileType,
+    XOR_OPERATION_NAME, Xor, XorOperation, ZERO_LIKE_OPERATION_NAME, ZERO_OPERATION_NAME, Zero, ZeroLike,
     ZeroLikeOperation, ZeroOperation, associative_scan, block_scaled_dot, composite, scan, shard_map,
-    softmax_cross_entropy_with_target_logits, trace_shard_map, r#while,
+    softmax_cross_entropy_with_target_logits, r#while,
 };
 pub use parameters::{
     ArrayParameterizedFamily, BTreeMapParameterizedFamily, HashMapParameterizedFamily, Parameter, ParameterError,

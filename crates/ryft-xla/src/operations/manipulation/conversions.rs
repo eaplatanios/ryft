@@ -1567,41 +1567,45 @@ mod tests {
     #[test]
     fn test_lower_checked_cast_in_shard_map() {
         use ryft_core::{
-            Cast, ConvertElementType, DimensionFromScalar, DimensionToScalar, LogicalMesh, MeshAxis, MeshAxisType,
-            ShardMapOptions, Sharding, TracedShardMap, ValueProjection, trace_shard_map,
+            Cast, ConvertElementType, DimensionFromScalar, DimensionToScalar, DomainTracingContext, LogicalMesh,
+            MeshAxis, MeshAxisType, ProgramError, ProjectedValue, ShardMap, ShardMapOptions, Sharding, ValueProjection,
         };
 
-        use crate::XlaDomain;
+        use crate::experimental::domains::{XlaDomain, XlaTracer};
         use crate::experimental::lowering::tests::{MixedValue, execute_mixed_program};
+        use crate::experimental::tracing::XlaArrayTracer;
         use crate::tests::execution_client;
 
         let mesh = LogicalMesh::new(vec![MeshAxis::new("x", 1, MeshAxisType::Manual).unwrap()]).unwrap();
         let sharding = Sharding::replicated(mesh.clone(), 0);
         let scalar = ArrayType::scalar(DataType::F64);
         let extent = DimensionType::new("extent", DimensionBounds::positive(Some(8)).unwrap());
-        let traced: TracedShardMap<XlaDomain<'static>, ArrayType, ArrayType> = trace_shard_map(
-            |_, input| {
-                let integer = input.convert_element_type(DataType::I64)?;
-                let dimension = integer.to_dimension(extent.to_variable())?;
-                let checked = dimension.cast(DimensionType::from(Dimension::Static(2)).into(), &[])?;
-                let scalar = checked.to_scalar()?.convert_element_type(DataType::F64)?;
-                Ok(scalar.into_projected()?)
+        let (_, program) = DomainTracingContext::<XlaDomain<'static>>::trace_with_context_and_named_axes(
+            |context, inputs: Vec<XlaTracer<'static>>| {
+                let inputs = inputs
+                    .into_iter()
+                    .map(|input| ValueProjection::<ArrayType>::into_projected(input).map_err(ProgramError::from))
+                    .collect::<Result<Vec<_>, _>>()?;
+                let outputs = context.shard_map(
+                    |_, inputs: Vec<XlaArrayTracer>| {
+                        let integer = inputs[0].convert_element_type(DataType::I64)?;
+                        let dimension = integer.to_dimension(extent.to_variable())?;
+                        let checked = dimension.cast(DimensionType::from(Dimension::Static(2)).into(), &[])?;
+                        let scalar = checked.to_scalar()?.convert_element_type(DataType::F64)?;
+                        Ok(vec![scalar.into_projected()?])
+                    },
+                    inputs,
+                    mesh,
+                    vec![sharding.clone()],
+                    vec![sharding],
+                    ShardMapOptions::new(),
+                )?;
+                Ok(outputs.into_iter().map(ProjectedValue::into_value).collect::<Vec<_>>())
             },
-            scalar.clone(),
-            mesh,
-            sharding.clone(),
-            sharding,
-            ShardMapOptions::new(),
-            &[],
+            vec![ArrayIrType::Array(scalar)],
+            Vec::new(),
         )
         .unwrap();
-        let mut builder = ArrayIrXlaProgramBuilder::new();
-        let input = builder.add_input(scalar.into());
-        let body = builder.import_region(traced.body().entry_region_ref());
-        let output = builder.add_instruction(traced.operation().clone(), vec![body], vec![input], None).unwrap()[0];
-        let program = builder
-            .build::<Vec<XlaConstant>, Vec<XlaConstant>>(vec![output], vec![Placeholder], vec![Placeholder])
-            .unwrap();
         let client = execution_client();
         assert_eq!(
             execute_mixed_program(&client, &program, &[MixedValue::Array(vec![2.0], vec![])], &[]).unwrap(),
@@ -3358,13 +3362,9 @@ mod tests {
 
     #[test]
     fn test_lower_cast_explicit_sharding_multiple_devices() {
-        use ryft_core::{
-            Cast, LogicalMesh, MeshAxis, ShardMapOptions, Sharding, ShardingDimension, TracedShardMap, Typed,
-            trace_shard_map,
-        };
+        use ryft_core::{Cast, LogicalMesh, MeshAxis, ShardMapOptions, Sharding, ShardingDimension, Typed};
 
-        use crate::XlaDomain;
-        use crate::operations::sharding::shard_map::to_mlir_module as to_mlir_module_for_shard_map;
+        use crate::experimental::lowering::tests::shard_map_module;
 
         // A cast whose output moves the placement over an explicit axis emits its complete output sharding as a
         // constraint, which the partitioner realizes by gathering the shards: every device returns the whole array.
@@ -3428,7 +3428,7 @@ mod tests {
         .unwrap();
         let in_sharding = Sharding::new(mesh.clone(), vec![ShardingDimension::sharded(["x", "z"])]).unwrap();
         let out_sharding = Sharding::new(mesh.clone(), vec![ShardingDimension::sharded(["x"])]).unwrap();
-        let traced: TracedShardMap<XlaDomain<'static>, ArrayType, ArrayType> = trace_shard_map(
+        let module = shard_map_module::<_, ArrayType, ArrayType>(
             |_, input| {
                 let local_type = input.r#type().into_owned();
                 let replicated =
@@ -3440,10 +3440,8 @@ mod tests {
             in_sharding,
             out_sharding,
             ShardMapOptions::new(),
-            &[],
         )
         .unwrap();
-        let module = to_mlir_module_for_shard_map(&traced, "main").unwrap();
         assert_eq!(
             module,
             indoc! {"
@@ -3575,13 +3573,9 @@ mod tests {
 
     #[test]
     fn test_lower_cast_rejects_bound_manual_output_placement() {
-        use ryft_core::{
-            Cast, LogicalMesh, MeshAxis, ShardMapOptions, Sharding, ShardingDimension, TracedShardMap, Typed,
-            trace_shard_map,
-        };
+        use ryft_core::{Cast, LogicalMesh, MeshAxis, ShardMapOptions, Sharding, ShardingDimension, Typed};
 
-        use crate::XlaDomain;
-        use crate::operations::sharding::shard_map::to_mlir_module as to_mlir_module_for_shard_map;
+        use crate::experimental::lowering::tests::shard_map_module;
 
         // A body value that does not vary along the bound manual axis `x` preserves no definition of it, so a cast may
         // name a mesh that redefines `x` as explicit. Sharding a local dimension over `x` would request a placement
@@ -3589,7 +3583,7 @@ mod tests {
         let mesh = LogicalMesh::new(vec![MeshAxis::new("x", 2, MeshAxisType::Manual).unwrap()]).unwrap();
         let explicit_mesh = LogicalMesh::new(vec![MeshAxis::new("x", 2, MeshAxisType::Explicit).unwrap()]).unwrap();
         let replicated = Sharding::replicated(mesh.clone(), 1);
-        let traced: TracedShardMap<XlaDomain<'static>, ArrayType, ArrayType> = trace_shard_map(
+        let module = shard_map_module::<_, ArrayType, ArrayType>(
             |_, input| {
                 let local_type = input.r#type().into_owned();
                 let explicit_type = local_type
@@ -3605,11 +3599,9 @@ mod tests {
             replicated.clone(),
             replicated,
             ShardMapOptions::new(),
-            &[],
-        )
-        .unwrap();
+        );
         assert!(matches!(
-            to_mlir_module_for_shard_map(&traced, "main"),
+            module,
             Err(Error::Core(ryft_core::Error::Program(ProgramError::UnsupportedOperation { message })))
                 if message == "`cast` cannot assign bound manual mesh axes to local output dimensions",
         ));
