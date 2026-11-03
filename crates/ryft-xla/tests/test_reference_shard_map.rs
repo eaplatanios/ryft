@@ -5,7 +5,7 @@ use pretty_assertions::assert_eq;
 use ryft_core::{
     ArrayIrType, ArrayReference, ArrayType, BatchAxis, Context, DataType, Device, DeviceMesh, LogicalMesh, MeshAxis,
     MeshAxisType, Placeholder, ProgramBuilder, ReferenceAddUpdateOperation, ReferenceReadOperation, ReferenceType,
-    ShardMap, ShardMapOperation, Sharding, ShardingDimension, TypedProgram, Value, batch,
+    ShardMapBoundary, ShardMapOperation, Sharding, ShardingDimension, TypedProgram, Value, batch,
 };
 use ryft_pjrt::{ClientOptions, CpuClientOptions, load_cpu_plugin};
 use ryft_xla::experimental::ops::{XlaConstant, XlaOperation};
@@ -43,7 +43,8 @@ fn test_shard_map_operation_from_program() {
     let operation = ShardMapOperation::from_program(
         &body,
         vec![reference_type.clone()],
-        ShardMap::new(mesh, vec![sharding.clone()], vec![sharding.clone(), sharding], vec!["x".to_string()]).unwrap(),
+        ShardMapBoundary::new(mesh, vec![sharding.clone()], vec![sharding.clone(), sharding], vec!["x".to_string()])
+            .unwrap(),
     )
     .unwrap();
     let mut builder = ProgramBuilder::<XlaConstant, XlaOperation>::new();
@@ -84,13 +85,16 @@ fn test_batched_shard_map_mutates_mapped_reference_items_on_cpu() {
     let sharded = Sharding::new(logical_mesh.clone(), vec![ShardingDimension::sharded(["x"])]).unwrap();
     let item_type = ArrayType::new_static(DataType::F32, [4]).with_sharding(sharded.clone()).unwrap();
     let shard_map =
-        ShardMap::new(logical_mesh.clone(), vec![sharded.clone(); 2], vec![sharded], vec!["x".to_string()]).unwrap();
+        ShardMapBoundary::new(logical_mesh.clone(), vec![sharded.clone(); 2], vec![sharded], vec!["x".to_string()])
+            .unwrap();
     let body = {
         let mut builder = ProgramBuilder::<XlaConstant, XlaOperation>::new();
         let local_type = shard_map.local_input_type(0, &item_type).unwrap();
         let reference = builder.add_input(ArrayIrType::Reference(ReferenceType::new(local_type.clone())));
         let update = builder.add_input(ArrayIrType::Array(local_type));
-        builder.add_instruction(ReferenceAddUpdateOperation::new(), Vec::new(), vec![reference, update], None).unwrap();
+        builder
+            .add_instruction(ReferenceAddUpdateOperation::new(), Vec::new(), vec![reference, update], None)
+            .unwrap();
         let output =
             builder.add_instruction(ReferenceReadOperation::new(), Vec::new(), vec![reference], None).unwrap()[0];
         builder
@@ -104,11 +108,8 @@ fn test_batched_shard_map_mutates_mapped_reference_items_on_cpu() {
     )
     .unwrap();
     let operation = XlaOperation::ShardMap(Box::new(operation));
-    let batched_sharding = Sharding::new(
-        logical_mesh,
-        vec![ShardingDimension::replicated(), ShardingDimension::sharded(["x"])],
-    )
-    .unwrap();
+    let batched_sharding =
+        Sharding::new(logical_mesh, vec![ShardingDimension::replicated(), ShardingDimension::sharded(["x"])]).unwrap();
     let batched_type = ArrayType::new_static(DataType::F32, [3, 4]).with_sharding(batched_sharding.clone()).unwrap();
     let compiled = compile_statefully::<_, (ArrayIrType, ArrayIrType), ArrayIrType>(
         |(reference, update)| {
@@ -152,10 +153,7 @@ fn test_batched_shard_map_mutates_mapped_reference_items_on_cpu() {
 
     // Device 0 owns columns 0 and 1 and device 1 owns columns 2 and 3 of every item, so each device's shard holds the
     // updated values of its own columns of all three items, both in the read output and in the committed referent.
-    let expected = vec![
-        vec![101.0, 102.0, 211.0, 212.0, 321.0, 322.0],
-        vec![103.0, 104.0, 213.0, 214.0, 323.0, 324.0],
-    ];
+    let expected = vec![vec![101.0, 102.0, 211.0, 212.0, 321.0, 322.0], vec![103.0, 104.0, 213.0, 214.0, 323.0, 324.0]];
     assert_eq!(output.sharding(), &batched_sharding);
     assert_eq!(device_shards(&output), expected);
     let committed = reference.read().unwrap();

@@ -3,7 +3,7 @@ use ryft_mlir::dialects::{chlo, stable_hlo};
 use ryft_mlir::{Block, Operation as MlirOperation, Value as MlirValue, ValueRef};
 
 use crate::experimental::lowering::types::{lower_f64_constant_splat, lower_tensor_type};
-use crate::{LowerableOperation, LowerableOperationFamily, LoweringError, XlaLowerer};
+use crate::{Error, LowerableOperation, LowerableOperationFamily, XlaLowerer};
 
 // [`ErfOperation`] lowers to `chlo.erf`, which the XLA compiler legalizes to a rational polynomial approximation
 // over StableHLO operations during compilation.
@@ -14,7 +14,7 @@ impl LowerableOperation for ErfOperation<ArrayType> {
         input_values: &[ValueRef<'b, 'c, 't>],
         _input_types: &[ArrayType],
         output_types: &[ArrayType],
-    ) -> Result<Vec<ValueRef<'b, 'c, 't>>, LoweringError> {
+    ) -> Result<Vec<ValueRef<'b, 'c, 't>>, Error> {
         let mut input = input_values[0];
         if output_types[0].data_type() == DataType::F8E8M0FNU {
             // Both smallest encodings have erf outputs that round to 0x01 under the exponent-only conversion

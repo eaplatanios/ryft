@@ -3,7 +3,7 @@ use ryft_core::{ArrayType, ParallelVaryOperation};
 use ryft_mlir::ValueRef;
 
 use crate::operations::collectives::mesh_axis_replica_groups;
-use crate::{LowerableOperation, LowerableOperationFamily, LoweringError, XlaLowerer};
+use crate::{Error, LowerableOperation, LowerableOperationFamily, XlaLowerer};
 
 impl LowerableOperation for ParallelVaryOperation {
     fn lower<'b, 'c: 'b, 't: 'c, O: LowerableOperationFamily>(
@@ -12,7 +12,7 @@ impl LowerableOperation for ParallelVaryOperation {
         input_values: &[ValueRef<'b, 'c, 't>],
         _input_types: &[ArrayType],
         output_types: &[ArrayType],
-    ) -> Result<Vec<ValueRef<'b, 'c, 't>>, LoweringError> {
+    ) -> Result<Vec<ValueRef<'b, 'c, 't>>, Error> {
         check_count!("input", input_values, 1, ProgramError);
         check_count!("output", output_types, 1, ProgramError);
         // The forward map only weakens invariance. Resolve its axis even though it emits no communication.

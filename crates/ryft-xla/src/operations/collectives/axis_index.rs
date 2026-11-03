@@ -9,7 +9,7 @@ use ryft_mlir::{
 
 use crate::experimental::lowering::CollectiveLoweringState;
 use crate::experimental::lowering::types::{lower_tensor_type, lower_u64_scalar_constant};
-use crate::{LowerableOperation, LowerableOperationFamily, LoweringError, XlaLowerer};
+use crate::{Error, LowerableOperation, LowerableOperationFamily, XlaLowerer};
 
 /// Lowers one [`AxisIndexOperation`] inside a `sdy.manual_computation` region to the executing device's coordinate
 /// along the named device mesh axis, as a scalar `u64`.
@@ -26,7 +26,7 @@ pub(crate) fn lower_axis_index_to_coordinate<'b, 'c: 'b, 't: 'c>(
     block: &mut BlockRef<'b, 'c, 't>,
     context: &'c MlirContext<'t>,
     location: LocationRef<'c, 't>,
-) -> Result<ValueRef<'b, 'c, 't>, LoweringError> {
+) -> Result<ValueRef<'b, 'c, 't>, Error> {
     let axis_name = operation.axis_name();
     let Some(shard_map) = collective_state.manual_shard_map() else {
         return Err(ProgramError::UnsupportedOperation {
@@ -89,7 +89,7 @@ impl LowerableOperation for AxisIndexOperation {
         input_values: &[ValueRef<'b, 'c, 't>],
         _input_types: &[ArrayType],
         output_types: &[ArrayType],
-    ) -> Result<Vec<ValueRef<'b, 'c, 't>>, LoweringError> {
+    ) -> Result<Vec<ValueRef<'b, 'c, 't>>, Error> {
         check_count!("input", input_values, 0, ProgramError);
         check_count!("output", output_types, 1, ProgramError);
         let collective_state = lowerer.collective_state.clone();
@@ -133,7 +133,7 @@ mod tests {
         .unwrap();
         assert!(matches!(
             to_mlir_module(&traced, "main"),
-            Err(LoweringError::Tracing(ProgramError::MalformedProgram(message)))
+            Err(Error::Core(ryft_core::Error::Program(ProgramError::MalformedProgram(message))))
                 if message == "`axis_index` requires mesh metadata inside a manual region",
         ));
     }

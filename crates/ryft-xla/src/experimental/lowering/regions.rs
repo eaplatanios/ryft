@@ -9,9 +9,10 @@ use ryft_mlir::{
     Block, BlockRef, Context as MlirContext, LocationRef, Operation as MlirOperation, Value as MlirValue, ValueRef,
 };
 
+use crate::Error;
 use crate::experimental::lowering::types::lower_constant;
 use crate::experimental::lowering::{
-    CollectiveLoweringState, EffectTokens, LowerableOperationFamily, LoweringError, XlaLowerer, lower_instruction,
+    CollectiveLoweringState, EffectTokens, LowerableOperationFamily, XlaLowerer, lower_instruction,
 };
 use crate::experimental::ops::{FlatXlaProgram, XlaConstant, XlaProgram};
 use crate::operations::jit_call::JitCallFunctionMap;
@@ -55,7 +56,7 @@ pub(crate) fn lower_nested_program_inline<'b, 'c: 'b, 't: 'c, O: LowerableOperat
     nested_functions: Option<&Rc<JitCallFunctionMap<O>>>,
     collective_state: &CollectiveLoweringState,
     effect_tokens: &mut EffectTokens<'b, 'c, 't>,
-) -> Result<Vec<ValueRef<'b, 'c, 't>>, LoweringError> {
+) -> Result<Vec<ValueRef<'b, 'c, 't>>, Error> {
     lower_nested_region_inline(
         program.entry_region_ref(),
         input_values,
@@ -84,7 +85,7 @@ fn lower_nested_region_inline<'b, 'c: 'b, 't: 'c, O: LowerableOperationFamily>(
     nested_functions: Option<&Rc<JitCallFunctionMap<O>>>,
     collective_state: &CollectiveLoweringState,
     effect_tokens: &mut EffectTokens<'b, 'c, 't>,
-) -> Result<Vec<ValueRef<'b, 'c, 't>>, LoweringError> {
+) -> Result<Vec<ValueRef<'b, 'c, 't>>, Error> {
     let mut input_values = input_values.to_vec();
     let selected_input_indices =
         (0..input_values.len()).filter(|index| optimization_barrier.selects(*index)).collect::<Vec<_>>();
@@ -181,7 +182,7 @@ fn replay_program_into_block<
     location: LocationRef<'c, 't>,
     mut lift_constant: LiftConstant,
     mut apply_op: ApplyOp,
-) -> Result<Vec<ValueRef<'b, 'c, 't>>, LoweringError>
+) -> Result<Vec<ValueRef<'b, 'c, 't>>, Error>
 where
     O: Operation<Type = T>,
     Input: Parameterized<V>,
@@ -192,14 +193,14 @@ where
         &mut BlockRef<'b, 'c, 't>,
         &'c MlirContext<'t>,
         LocationRef<'c, 't>,
-    ) -> Result<ValueRef<'b, 'c, 't>, LoweringError>,
+    ) -> Result<ValueRef<'b, 'c, 't>, Error>,
     ApplyOp: FnMut(
         &Instruction<O>,
         &[ValueRef<'b, 'c, 't>],
         &mut BlockRef<'b, 'c, 't>,
         &'c MlirContext<'t>,
         LocationRef<'c, 't>,
-    ) -> Result<Vec<ValueRef<'b, 'c, 't>>, LoweringError>,
+    ) -> Result<Vec<ValueRef<'b, 'c, 't>>, Error>,
 {
     let mut block_for_constants = *block;
     let mut block_for_ops = *block;
@@ -219,7 +220,7 @@ fn replay_region_ref_into_block<'b, 'c: 'b, 't: 'c, O, V, LiftConstant, ApplyOp>
     location: LocationRef<'c, 't>,
     mut lift_constant: LiftConstant,
     mut apply_op: ApplyOp,
-) -> Result<Vec<ValueRef<'b, 'c, 't>>, LoweringError>
+) -> Result<Vec<ValueRef<'b, 'c, 't>>, Error>
 where
     V: Value,
     O: Operation<Type = V::Type>,
@@ -229,14 +230,14 @@ where
         &mut BlockRef<'b, 'c, 't>,
         &'c MlirContext<'t>,
         LocationRef<'c, 't>,
-    ) -> Result<ValueRef<'b, 'c, 't>, LoweringError>,
+    ) -> Result<ValueRef<'b, 'c, 't>, Error>,
     ApplyOp: FnMut(
         &Instruction<O>,
         &[ValueRef<'b, 'c, 't>],
         &mut BlockRef<'b, 'c, 't>,
         &'c MlirContext<'t>,
         LocationRef<'c, 't>,
-    ) -> Result<Vec<ValueRef<'b, 'c, 't>>, LoweringError>,
+    ) -> Result<Vec<ValueRef<'b, 'c, 't>>, Error>,
 {
     let mut block_for_constants = *block;
     let mut block_for_ops = *block;
@@ -255,7 +256,7 @@ pub(crate) fn lower_plain_program_outputs<'b, 'c: 'b, 't: 'c, O, V, Input, Outpu
     context: &'c MlirContext<'t>,
     location: LocationRef<'c, 't>,
     collective_state: &CollectiveLoweringState,
-) -> Result<Vec<ValueRef<'b, 'c, 't>>, LoweringError>
+) -> Result<Vec<ValueRef<'b, 'c, 't>>, Error>
 where
     V: MlirLowerableValue,
     O: LowerableOperation<Type = ArrayType>,
@@ -286,7 +287,7 @@ where
                 .map(|output| program.atoms()[output.index()].r#type().into_owned())
                 .collect::<Vec<_>>();
             if !instruction.regions().is_empty() {
-                return Err(LoweringError::UnsupportedOp {
+                return Err(Error::UnsupportedOperation {
                     op: format!(
                         "plain-program lowering does not support attached regions for `{}`; use the production \
                          array IR XLA lowerer",
@@ -329,7 +330,7 @@ pub(crate) fn lower_program_outputs_with_inputs<
     nested_functions: Option<&Rc<JitCallFunctionMap<O>>>,
     collective_state: &CollectiveLoweringState,
     effect_tokens: &mut EffectTokens<'b, 'c, 't>,
-) -> Result<Vec<ValueRef<'b, 'c, 't>>, LoweringError>
+) -> Result<Vec<ValueRef<'b, 'c, 't>>, Error>
 where
     ProgramInput: Parameterized<XlaConstant>,
     ProgramOutput: Parameterized<XlaConstant>,

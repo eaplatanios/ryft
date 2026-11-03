@@ -13,10 +13,10 @@ use ryft_pjrt::extensions::ffi::{
     FfiAttribute, FfiBuffer, FfiBufferType, FfiCallFrame, FfiError, FfiExecutionStage, FfiHandler, FfiHandlerTraits,
     FfiInput, FfiOutput, FfiTypeId, XLA_FFI_CallFrame, XLA_FFI_Error, XLA_FFI_Handler,
 };
-use ryft_pjrt::{Client, Error};
+use ryft_pjrt::{Client, Error as PjrtError};
 
 use crate::experimental::lowering::{EffectTokens, current_or_new_token};
-use crate::{LowerableOperation, LowerableOperationFamily, LoweringError, XlaLowerer};
+use crate::{Error, LowerableOperation, LowerableOperationFamily, XlaLowerer};
 
 #[cfg(any(feature = "cuda-12", feature = "cuda-13"))]
 use crate::operations::assertions::copy_cuda_bytes;
@@ -46,7 +46,7 @@ pub(crate) fn lower_print_to_custom_call<'b, 'c: 'b, 't: 'c>(
     block: &mut BlockRef<'b, 'c, 't>,
     context: &'c MlirContext<'t>,
     location: LocationRef<'c, 't>,
-) -> Result<(), LoweringError> {
+) -> Result<(), Error> {
     // Unordered calls retain the registered handler ABI, using a fresh local token with no boundary dependency.
     let mut local_tokens = EffectTokens::default();
     let effect_tokens = if ordered { effect_tokens } else { &mut local_tokens };
@@ -172,7 +172,7 @@ pub fn with_captured_prints<R, F: FnOnce() -> R>(body: F) -> (R, Vec<String>) {
 pub fn ensure_print_handler_registered(client: &Client<'_>) -> Result<(), Error> {
     let platform_name = client.platform_name()?.into_owned();
     if platform_name.eq_ignore_ascii_case("cpu") {
-        static CPU_PRINT_HANDLER_REGISTRATION: OnceLock<Result<(), Error>> = OnceLock::new();
+        static CPU_PRINT_HANDLER_REGISTRATION: OnceLock<Result<(), PjrtError>> = OnceLock::new();
         return CPU_PRINT_HANDLER_REGISTRATION
             .get_or_init(|| {
                 client.register_ffi_handler(
@@ -182,11 +182,12 @@ pub fn ensure_print_handler_registered(client: &Client<'_>) -> Result<(), Error>
                     FfiHandlerTraits::NONE,
                 )
             })
-            .clone();
+            .clone()
+            .map_err(Error::from);
     }
     #[cfg(any(feature = "cuda-12", feature = "cuda-13"))]
     if platform_name.eq_ignore_ascii_case("cuda") {
-        static CUDA_PRINT_HANDLER_REGISTRATION: OnceLock<Result<(), Error>> = OnceLock::new();
+        static CUDA_PRINT_HANDLER_REGISTRATION: OnceLock<Result<(), PjrtError>> = OnceLock::new();
         return CUDA_PRINT_HANDLER_REGISTRATION
             .get_or_init(|| {
                 client.register_ffi_handler(
@@ -196,11 +197,13 @@ pub fn ensure_print_handler_registered(client: &Client<'_>) -> Result<(), Error>
                     FfiHandlerTraits::NONE,
                 )
             })
-            .clone();
+            .clone()
+            .map_err(Error::from);
     }
-    Err(Error::unimplemented(format!(
+    Err(PjrtError::unimplemented(format!(
         "the `{PRINT_CUSTOM_CALL_TARGET}` handler cannot read operand buffers of the `{platform_name}` platform"
-    )))
+    ))
+    .into())
 }
 
 /// Memory location of the value buffer passed to one print callback.
@@ -407,7 +410,7 @@ fn copy_value_to_outputs(
             PrintBufferMemory::Host => {}
             #[cfg(any(feature = "cuda-12", feature = "cuda-13"))]
             PrintBufferMemory::Cuda(_) => {
-                return Err(FfiError::unimplemented(format!(
+                return Err(FfiPjrtError::unimplemented(format!(
                     "the `{PRINT_CUSTOM_CALL_TARGET}` custom call cannot copy its value to a CUDA device output buffer"
                 )));
             }
@@ -452,7 +455,7 @@ impl LowerableOperation for PrintOperation<ArrayType> {
         input_values: &[ValueRef<'b, 'c, 't>],
         _input_types: &[ArrayType],
         _output_types: &[ArrayType],
-    ) -> Result<Vec<ValueRef<'b, 'c, 't>>, LoweringError> {
+    ) -> Result<Vec<ValueRef<'b, 'c, 't>>, Error> {
         // `print` is the identity on its data flow output; its observable effect lowers to a host-callback custom call
         // that consumes and produces a StableHLO token, so the effect ordering rides the scope's token chain instead of
         // the value data flow.
@@ -686,9 +689,9 @@ mod tests {
         let client = plugin
             .client(ClientOptions::CPU(CpuClientOptions { device_count: Some(1), ..Default::default() }))
             .unwrap();
-        assert_eq!(ensure_print_handler_registered(&client), Ok(()));
+        ensure_print_handler_registered(&client).unwrap();
         // Registration is idempotent.
-        assert_eq!(ensure_print_handler_registered(&client), Ok(()));
+        ensure_print_handler_registered(&client).unwrap();
 
         // The program threads one token chain through three prints: an `f64` vector argument, an `f64` scalar
         // constant, and an `f32` constant that exercises the hexadecimal fallback rendering.

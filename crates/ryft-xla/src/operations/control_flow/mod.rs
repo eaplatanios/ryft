@@ -24,7 +24,7 @@ use crate::experimental::ops::{FlatXlaProgram, XlaConstant, XlaProgram};
 use crate::operations::assertions::{lower_guard, validates_output_extents};
 use crate::operations::jit_call::JitCallFunctionMap;
 use crate::operations::sharding::constrain_sharding::lower_sharding_constraint;
-use crate::{LowerableOperationFamily, LoweringError};
+use crate::{Error, LowerableOperationFamily};
 
 /// StableHLO lowering of `condition`.
 pub(crate) mod condition;
@@ -58,7 +58,7 @@ pub(crate) fn lower_region_guard<'b, 'c: 'b, 't: 'c>(
     block: &mut BlockRef<'b, 'c, 't>,
     context: &'c MlirContext<'t>,
     location: LocationRef<'c, 't>,
-) -> Result<(), LoweringError> {
+) -> Result<(), Error> {
     let Some((guard, members)) =
         GuardOperation::for_entry(boundary, declared_types, actual_types).map_err(ProgramError::from)?
     else {
@@ -89,7 +89,7 @@ pub(crate) fn lower_region_guard<'b, 'c: 'b, 't: 'c>(
 /// into the ordered I/O chain, and every assertion advances the ordered-assertion chain.
 pub(crate) fn lowered_effect_classes<ProgramInput, ProgramOutput, O: LowerableOperationFamily>(
     program: &XlaProgram<ProgramInput, ProgramOutput, O>,
-) -> Result<EffectClasses, LoweringError>
+) -> Result<EffectClasses, Error>
 where
     ProgramInput: Parameterized<XlaConstant>,
     ProgramOutput: Parameterized<XlaConstant>,
@@ -105,7 +105,7 @@ where
                 .iter()
                 .map(|id| region.atoms()[id.index()].r#type().into_owned())
                 .collect::<Vec<_>>();
-            let first_region_input_types = || -> Result<Vec<ArrayIrType>, LoweringError> {
+            let first_region_input_types = || -> Result<Vec<ArrayIrType>, Error> {
                 let id = instruction.regions().first().copied().ok_or_else(|| {
                     ProgramError::MalformedProgram("control flow without an attached region".to_string())
                 })?;
@@ -179,7 +179,7 @@ pub(crate) fn lower_refined_region_input<'b, 'c: 'b, 't: 'c>(
     block: &mut BlockRef<'b, 'c, 't>,
     context: &'c MlirContext<'t>,
     location: LocationRef<'c, 't>,
-) -> Result<ValueRef<'b, 'c, 't>, LoweringError> {
+) -> Result<ValueRef<'b, 'c, 't>, Error> {
     let (ArrayIrType::Array(input_type), ArrayIrType::Array(declared_type)) = (input_type, region_input_type) else {
         return Ok(value);
     };
@@ -271,9 +271,9 @@ pub(crate) fn lower_refined_region_outputs<'b, 'c: 'b, 't: 'c>(
     block: &mut BlockRef<'b, 'c, 't>,
     context: &'c MlirContext<'t>,
     location: LocationRef<'c, 't>,
-) -> Result<Vec<ValueRef<'b, 'c, 't>>, LoweringError> {
+) -> Result<Vec<ValueRef<'b, 'c, 't>>, Error> {
     if values.len() != region_output_types.len() || values.len() != output_types.len() {
-        return Err(LoweringError::UnsupportedOp {
+        return Err(Error::UnsupportedOperation {
             op: format!(
                 "control-flow lowering produced {} results for {} region output types and {} output types",
                 values.len(),
@@ -365,7 +365,7 @@ pub(crate) fn lower_control_flow_region<'b, 'c: 'b, 't: 'c, O: LowerableOperatio
     collective_state: &CollectiveLoweringState,
     entry_effect_tokens: EffectTokens<'b, 'c, 't>,
     threaded_effects: EffectClasses,
-) -> Result<ryft_mlir::DetachedRegion<'c, 't>, LoweringError> {
+) -> Result<ryft_mlir::DetachedRegion<'c, 't>, Error> {
     let mut region = context.region();
     let block = context.block_with_no_arguments();
     {
@@ -442,7 +442,7 @@ pub(crate) fn append_loop_effect_tokens<'b, 'c: 'b, 't: 'c>(
     block: &mut BlockRef<'b, 'c, 't>,
     context: &'c MlirContext<'t>,
     location: LocationRef<'c, 't>,
-) -> Result<(), LoweringError> {
+) -> Result<(), Error> {
     for effect in token_threaded_effects(threaded_effects) {
         state_values.push(current_or_new_token(effect, effect_tokens, block, location)?);
         state_types.push(context.stable_hlo_token_type()?.as_ref());
@@ -490,7 +490,7 @@ pub(crate) fn lower_explicit_sharding_constraints<'b, 'c: 'b, 't: 'c>(
     bound_manual_axes: &[String],
     block: &mut BlockRef<'b, 'c, 't>,
     location: LocationRef<'c, 't>,
-) -> Result<Vec<ValueRef<'b, 'c, 't>>, LoweringError> {
+) -> Result<Vec<ValueRef<'b, 'c, 't>>, Error> {
     let mut constrained = Vec::with_capacity(outputs.len());
     for (output, output_type) in outputs.into_iter().zip(output_types) {
         let explicit_sharding = match output_type {
@@ -660,7 +660,8 @@ mod tests {
             "control-flow region lowering advanced the `ordered_io` token, which the region does not thread";
         assert!(matches!(
             lower(EffectClasses::NONE),
-            Err(LoweringError::Tracing(ProgramError::MalformedProgram(message))) if message == expected_message,
+            Err(Error::Core(ryft_core::Error::Program(ProgramError::MalformedProgram(message))))
+                if message == expected_message,
         ));
     }
 
@@ -678,20 +679,14 @@ mod tests {
 
         // A region that leaves every token unchanged threads nothing it would have to return.
         let threaded_effects = EffectClasses::NONE;
-        assert_eq!(
-            validate_unthreaded_effect_tokens(entry_effect_tokens, entry_effect_tokens, threaded_effects),
-            Ok(()),
-        );
+        validate_unthreaded_effect_tokens(entry_effect_tokens, entry_effect_tokens, threaded_effects).unwrap();
 
         // A region may advance the token of a class that it threads, and threading assertions threads I/O too.
         let mut region_effect_tokens = entry_effect_tokens;
         region_effect_tokens.set(EffectClass::OrderedIo, advanced_token);
-        assert_eq!(validate_unthreaded_effect_tokens(entry_effect_tokens, region_effect_tokens, ordered_io), Ok(()));
+        validate_unthreaded_effect_tokens(entry_effect_tokens, region_effect_tokens, ordered_io).unwrap();
         let threaded_effects = EffectClasses::single(EffectClass::OrderedAssertion);
-        assert_eq!(
-            validate_unthreaded_effect_tokens(entry_effect_tokens, region_effect_tokens, threaded_effects),
-            Ok(()),
-        );
+        validate_unthreaded_effect_tokens(entry_effect_tokens, region_effect_tokens, threaded_effects).unwrap();
 
         // The advanced token of a class that the region does not thread would be dropped, and so would a token that the
         // region creates for a class that had none when it started.

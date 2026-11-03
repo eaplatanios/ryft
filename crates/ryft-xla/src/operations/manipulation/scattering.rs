@@ -18,7 +18,7 @@ use crate::operations::comparisons::lower_compare_to_mlir;
 use crate::operations::extrema::lower_extremum_to_mlir;
 use crate::operations::reductions::build_reduce_body_region;
 use crate::operations::sharding::constrain_sharding::lower_sharding_constraint;
-use crate::{LowerableOperation, LowerableOperationFamily, LoweringError, XlaLowerer};
+use crate::{Error, LowerableOperation, LowerableOperationFamily, XlaLowerer};
 
 /// Builds the scalar combiner region of a `stablehlo.scatter` for the given [`ScatterReductionKind`], modeled on
 /// [`build_reduce_body_region`]. The region's block takes the existing operand scalar and the update scalar and
@@ -29,7 +29,7 @@ fn build_scatter_combiner_region<'c, 't>(
     element_type: DataType,
     context: &'c MlirContext<'t>,
     location: LocationRef<'c, 't>,
-) -> Result<ryft_mlir::DetachedRegion<'c, 't>, LoweringError> {
+) -> Result<ryft_mlir::DetachedRegion<'c, 't>, Error> {
     let scalar_tensor_type = lower_tensor_type(&ArrayType::scalar(element_type), context, location)?;
     let block = context.block(&[(scalar_tensor_type, location), (scalar_tensor_type, location)]);
     let mut region = context.region();
@@ -94,7 +94,7 @@ fn lower_index_broadcast<'b, 'c: 'b, 't: 'c>(
     block: &mut BlockRef<'b, 'c, 't>,
     context: &'c MlirContext<'t>,
     location: LocationRef<'c, 't>,
-) -> Result<ValueRef<'b, 'c, 't>, LoweringError> {
+) -> Result<ValueRef<'b, 'c, 't>, Error> {
     if let Some(exemplar) = shape_source {
         let input_type = ArrayType::new(
             output_type.data_type(),
@@ -139,7 +139,7 @@ pub(crate) fn lower_scatter_to_mlir<'b, 'c: 'b, 't: 'c>(
     block: &mut BlockRef<'b, 'c, 't>,
     context: &'c MlirContext<'t>,
     location: LocationRef<'c, 't>,
-) -> Result<Vec<ValueRef<'b, 'c, 't>>, LoweringError> {
+) -> Result<Vec<ValueRef<'b, 'c, 't>>, Error> {
     check_count!("input", input_values, 3, ProgramError);
     check_count!("input", input_types, 3, ProgramError);
     check_count!("output", output_types, 1, ProgramError);
@@ -153,7 +153,7 @@ pub(crate) fn lower_scatter_to_mlir<'b, 'c: 'b, 't: 'c>(
     for (&axis, &update_axis) in window_axes.iter().zip(dimensions.update_window_dimensions()) {
         let update_dimension = input_types[2].dimension(update_axis);
         if matches!(update_dimension, Dimension::Dynamic(_)) && update_dimension != input_types[0].dimension(axis) {
-            return Err(LoweringError::UnsupportedOp {
+            return Err(Error::UnsupportedOperation {
                 op: format!(
                     "`scatter` dynamic update window axis {update_axis} must match input axis {axis}; independently \
                      sized dynamic windows are unsupported by XLA",
@@ -360,7 +360,7 @@ impl LowerableOperation for ScatterOperation {
         input_values: &[ValueRef<'b, 'c, 't>],
         input_types: &[ArrayType],
         output_types: &[ArrayType],
-    ) -> Result<Vec<ValueRef<'b, 'c, 't>>, LoweringError> {
+    ) -> Result<Vec<ValueRef<'b, 'c, 't>>, Error> {
         let values = lower_scatter_to_mlir(
             self,
             input_values,
@@ -755,14 +755,12 @@ mod tests {
         let program = builder
             .build::<Vec<Array>, Vec<Array>>(vec![output], vec![Placeholder; 3], vec![Placeholder])
             .unwrap();
-        assert_eq!(
+        assert!(matches!(
             to_mlir_module_for_plain_program(&program, "main"),
-            Err(LoweringError::UnsupportedOp {
-                op: "`scatter` dynamic update window axis 1 must match input axis 0; independently sized dynamic \
-                     windows are unsupported by XLA"
-                    .to_string(),
-            }),
-        );
+            Err(Error::UnsupportedOperation { op })
+                if op == "`scatter` dynamic update window axis 1 must match input axis 0; independently sized dynamic \
+                   windows are unsupported by XLA",
+        ));
     }
 
     #[test]

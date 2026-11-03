@@ -18,7 +18,7 @@ use crate::experimental::lowering::types::{
 use crate::operations::collectives::axis_index::lower_axis_index_to_coordinate;
 use crate::operations::collectives::collective_replica_groups;
 use crate::operations::reductions::lower_reduce_to_mlir;
-use crate::{LowerableOperation, LowerableOperationFamily, LoweringError, MemberLowerableOperation, XlaLowerer};
+use crate::{Error, LowerableOperation, LowerableOperationFamily, MemberLowerableOperation, XlaLowerer};
 
 /// Emits one overwrite-mode `parallel_ragged_all_to_all` typed-FFI custom call.
 fn emit_parallel_ragged_all_to_all_custom_call<'b, 'c: 'b, 't: 'c>(
@@ -28,7 +28,7 @@ fn emit_parallel_ragged_all_to_all_custom_call<'b, 'c: 'b, 't: 'c>(
     block: &mut BlockRef<'b, 'c, 't>,
     context: &'c MlirContext<'t>,
     location: LocationRef<'c, 't>,
-) -> Result<ValueRef<'b, 'c, 't>, LoweringError> {
+) -> Result<ValueRef<'b, 'c, 't>, Error> {
     let group_size = replica_groups.first().map(Vec::len).unwrap_or(0);
     if replica_groups.iter().any(|group| group.len() != group_size) {
         return Err(ProgramError::MalformedProgram(
@@ -43,7 +43,7 @@ fn emit_parallel_ragged_all_to_all_custom_call<'b, 'c: 'b, 't: 'c>(
             None,
             location,
         )
-        .map_err(|_| LoweringError::InvalidTensorType {
+        .map_err(|_| Error::InvalidTensorType {
             array_type: ArrayType::new_static(DataType::I64, [replica_groups.len(), group_size]),
         })?;
     let replica_group_values = replica_groups
@@ -60,7 +60,7 @@ fn emit_parallel_ragged_all_to_all_custom_call<'b, 'c: 'b, 't: 'c>(
         .collect::<Result<Vec<_>, _>>()?;
     let replica_groups = context
         .dense_i64_elements_attribute(replica_group_type, replica_group_values.as_slice())
-        .map_err(|_| LoweringError::InvalidDenseElementsAttribute { data_type: DataType::I64 })?;
+        .map_err(|_| Error::InvalidDenseElementsAttribute { data_type: DataType::I64 })?;
     let channel_id = collective_state.next_channel_id();
     let channel_id = i64::try_from(channel_id).map_err(|_| {
         ProgramError::MalformedProgram(format!(
@@ -95,7 +95,7 @@ fn emit_parallel_ragged_all_to_all_custom_call<'b, 'c: 'b, 't: 'c>(
 }
 
 /// Rejects target platforms whose runtime does not register the accelerator ragged-collective custom call.
-fn validate_parallel_ragged_all_to_all_target(collective_state: &CollectiveLoweringState) -> Result<(), LoweringError> {
+fn validate_parallel_ragged_all_to_all_target(collective_state: &CollectiveLoweringState) -> Result<(), Error> {
     if collective_state.target_platform().is_some_and(|platform| platform.eq_ignore_ascii_case("cpu")) {
         return Err(ProgramError::UnsupportedOperation {
             message: "`parallel_ragged_all_to_all` is not supported by the XLA CPU backend".to_string(),
@@ -118,7 +118,7 @@ pub(crate) fn lower_parallel_ragged_all_to_all_to_mlir<'b, 'c: 'b, 't: 'c>(
     block: &mut BlockRef<'b, 'c, 't>,
     context: &'c MlirContext<'t>,
     location: LocationRef<'c, 't>,
-) -> Result<Vec<ValueRef<'b, 'c, 't>>, LoweringError> {
+) -> Result<Vec<ValueRef<'b, 'c, 't>>, Error> {
     if operation.is_physical() {
         return Err(ProgramError::MalformedProgram(
             "`parallel_ragged_all_to_all` lowering does not support the batching-internal physical operand \
@@ -202,7 +202,7 @@ pub(crate) fn lower_parallel_ragged_all_to_all_to_mlir<'b, 'c: 'b, 't: 'c>(
             let converted = block.append_operation(stable_hlo::convert(value, metadata_tensor_type, location)?)?;
             Ok(converted.result(0).expect("stablehlo.convert should return one result").as_ref())
         })
-        .collect::<Result<Vec<_>, LoweringError>>()?;
+        .collect::<Result<Vec<_>, Error>>()?;
     let metadata_indices = block.append_operation(stable_hlo::iota(metadata_tensor_type, 0, location)?)?;
     let metadata_indices = metadata_indices.result(0).expect("stablehlo.iota should return one result").as_ref();
     let transfers_per_participant_value = lower_u64_scalar_constant(
@@ -248,7 +248,7 @@ pub(crate) fn lower_parallel_ragged_all_to_all_to_mlir<'b, 'c: 'b, 't: 'c>(
             lower_tensor_type(&ArrayType::new_static(DataType::I64, [operation.axis_size()]), context, location)?;
         let positions = context
             .dense_i64_elements_attribute(positions_type, positions.as_slice())
-            .map_err(|_| LoweringError::InvalidDenseElementsAttribute { data_type: DataType::I64 })?;
+            .map_err(|_| Error::InvalidDenseElementsAttribute { data_type: DataType::I64 })?;
         let positions = block.append_operation(stable_hlo::constant(positions, location)?)?;
         let positions = positions.result(0).expect("stablehlo.constant should return one result").as_ref();
         let position =
@@ -326,7 +326,7 @@ impl LowerableOperation for ParallelRaggedAllToAllOperation {
         input_values: &[ValueRef<'b, 'c, 't>],
         input_types: &[ArrayType],
         output_types: &[ArrayType],
-    ) -> Result<Vec<ValueRef<'b, 'c, 't>>, LoweringError> {
+    ) -> Result<Vec<ValueRef<'b, 'c, 't>>, Error> {
         check_count!("output", output_types, 1, ProgramError);
         let collective_state = lowerer.collective_state.clone();
         collective_state.check_manual_collective(
@@ -356,7 +356,7 @@ impl MemberLowerableOperation<ArrayIrType> for ParallelRaggedAllToAllOperation {
         input_values: &[ValueRef<'b, 'c, 't>],
         input_types: &[ArrayIrType],
         output_types: &[ArrayIrType],
-    ) -> Result<Vec<ValueRef<'b, 'c, 't>>, LoweringError> {
+    ) -> Result<Vec<ValueRef<'b, 'c, 't>>, Error> {
         let context = lowerer.context;
         let location = lowerer.location;
         let collective_state = &lowerer.collective_state;
@@ -378,12 +378,11 @@ impl MemberLowerableOperation<ArrayIrType> for ParallelRaggedAllToAllOperation {
         let array_input_types = input_types
             .iter()
             .map(|r#type| <&ArrayType>::try_from(r#type).cloned())
-            .collect::<Result<Vec<_>, _>>()
-            .map_err(|error| LoweringError::Tracing(error.into()))?;
+            .collect::<Result<Vec<_>, _>>()?;
         let [output_type] = output_types else {
             return Err(ProgramError::InvalidOutputCount { expected: 1, actual: output_types.len() }.into());
         };
-        <&ArrayType>::try_from(output_type).map_err(|error| LoweringError::Tracing(error.into()))?;
+        <&ArrayType>::try_from(output_type)?;
         lower_parallel_ragged_all_to_all_to_mlir(
             self,
             collective_state,
@@ -948,7 +947,7 @@ mod tests {
                 &mlir_context,
                 location.as_ref(),
             ),
-            Err(LoweringError::Tracing(ProgramError::MalformedProgram(message)))
+            Err(Error::Core(ryft_core::Error::Program(ProgramError::MalformedProgram(message))))
                 if message
                     == "`parallel_ragged_all_to_all` lowering does not support the batching-internal physical operand \
                         representation",

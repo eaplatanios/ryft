@@ -14,13 +14,13 @@ use prost::Message;
 use ryft_core::macros::check_count;
 use ryft_core::{
     AnalyzableCompilationDomain, ArrayIrType, ArrayIrValue, ArrayOperation, ArrayReference, ArrayType, AttachedRegions,
-    BatchingError, Cast, CastType, Compare, CompilationCacheDomain, CompilationContext, CompilationDomain,
-    Concretizable, Constant, ConstantOperation, Context, DataType, Device, DeviceId, DeviceMesh, DifferentiationError,
-    Dimension, DimensionBounds, DimensionFromScalar, DimensionOperation, DimensionSize, DimensionType, DimensionValue,
-    DimensionVariable, DiskCache, Domain, DomainTracer, EagerContext, EffectClass, EmptyRegionDriver,
-    ExternalReferenceBinding, FlatProgram, InterpretableOperation, Layout, LogicalMesh, Memory, MeshAxis, MeshAxisType,
-    ONE_OPERATION_NAME, Operation, OperationProvider, Parameterized, Placeholder, ProgramError, Provenance,
-    ProvenanceScope, ReadyOrPendingReferenceGuard, ReductionKind, ReferenceCompletion, ReferenceCompletionBackend,
+    Cast, CastType, Compare, CompilationCacheDomain, CompilationContext, CompilationDomain, Concretizable, Constant,
+    ConstantOperation, Context, DataType, Device, DeviceId, DeviceMesh, Dimension, DimensionBounds,
+    DimensionFromScalar, DimensionOperation, DimensionSize, DimensionType, DimensionValue, DimensionVariable,
+    DiskCache, Domain, DomainTracer, EagerContext, EffectClass, EmptyRegionDriver, ExternalReferenceBinding,
+    FlatProgram, InterpretableOperation, Layout, LogicalMesh, Memory, MeshAxis, MeshAxisType, ONE_OPERATION_NAME,
+    Operation, OperationProvider, Parameterized, Placeholder, ProgramError, Provenance, ProvenanceScope,
+    ReadyOrPendingReferenceGuard, ReductionKind, ReferenceCompletion, ReferenceCompletionBackend,
     ReferenceDischargeResult, ReferenceId, ReferenceReplacementPreparation, ReferenceSource, ReferenceType,
     RegionDriver, RegionKey, RegionRef, ScatterMode, ScatterReductionKind, Shape, Sharding, ShardingDimension,
     SortDirection, SpecializationCache, SpecializationCacheEntry, SpecializationCacheStatistics, StagedProgram,
@@ -41,95 +41,18 @@ use sha2::{Digest, Sha256};
 use super::lowering::signature::XlaExecutableSignature;
 use super::lowering::{contains_unresolved_references, contains_unresolved_state};
 use super::ops::{FlatXlaProgram, XlaConstant, XlaOperation, XlaProgramBuilder};
-use super::tracing::TraceError;
 use crate::arrays::{ArrayOutputLayout, ArrayTypeExtension};
 use crate::arrays_v0::host::{DenseArrayHostCopy, begin_materialize_dense_array_bytes, materialize_dense_array_bytes};
 use crate::arrays_v0::{
     BoundedMaterializationKey, BoundedMaterializationProbe, BoundedMaterializationProducer,
     BoundedMaterializationWaiter, ExecuteArguments,
 };
+use crate::kernels::CudaKernelRuntime;
 #[cfg(feature = "rocm")]
 use crate::kernels::RocmKernelRuntime;
-use crate::kernels::{CudaKernelRuntime, KernelEmbeddingError};
 use crate::{
-    ArrayError, Error, FromPjrt, RaggedDotLoweringStrategy, ShardDescriptor, ShardLayout, ToPjrt, XlaArray,
-    XlaDimension, XlaValue,
+    Error, FromPjrt, RaggedDotLoweringStrategy, ShardDescriptor, ShardLayout, ToPjrt, XlaArray, XlaDimension, XlaValue,
 };
-
-/// Error type returned by [`XlaDomain`] orchestration helpers.
-#[derive(Debug, thiserror::Error)]
-pub enum XlaDomainError {
-    /// Typed kernel embedding or session-owned native support failed.
-    #[error(transparent)]
-    Kernel(#[from] KernelEmbeddingError),
-
-    /// Error surfaced while lowering a traced XLA program to StableHLO/Shardy MLIR.
-    #[error("{0}")]
-    Lowering(#[from] TraceError),
-
-    /// Error surfaced while materializing or marshalling [`XlaArray`] values.
-    #[error("{0}")]
-    Array(#[from] ArrayError),
-
-    /// Error surfaced by crate-level XLA helpers.
-    #[error("{0}")]
-    Xla(#[from] Error),
-
-    /// Error surfaced by the underlying PJRT runtime.
-    #[error("{0}")]
-    Pjrt(#[from] ryft_pjrt::Error),
-
-    /// Error surfaced by the core tracing pipeline (e.g. a builder error during trace).
-    #[error("{0}")]
-    Tracing(#[from] ProgramError),
-
-    /// Error surfaced while acquiring or updating eager reference state.
-    #[error("{0}")]
-    Reference(#[from] ryft_core::ReferenceError),
-
-    /// Error surfaced by reverse-mode differentiation (e.g. a non-scalar gradient output).
-    #[error("{0}")]
-    Differentiation(#[from] DifferentiationError),
-
-    /// Error surfaced by batching (e.g. an unsupported operation inside a batched `jit_call` boundary).
-    #[error("{0}")]
-    Batching(#[from] BatchingError),
-
-    /// Error surfaced when [`compile_with_options`](crate::jit::compile_with_options) is given options
-    /// that do not match the traced function's arity or shape — for example a
-    /// `donate_argnums` index outside the flat input range, or an `in_shardings` length that
-    /// doesn't match the number of flat inputs.
-    #[error("invalid compilation options: {reason}")]
-    InvalidCompilationOptions { reason: String },
-
-    /// The runtime domain does not own the PJRT executable it was asked to invoke or install.
-    #[error("xla executable belongs to a different PJRT client")]
-    ExecutableClientMismatch,
-
-    /// Error surfaced while encoding or decoding persistent compilation metadata.
-    #[error("invalid persistent XLA executable: {reason}")]
-    InvalidPersistentExecutable { reason: String },
-
-    /// Error surfaced while normalizing backend analysis data.
-    #[error("invalid XLA compilation analysis: {reason}")]
-    InvalidCompilationAnalysis { reason: String },
-
-    /// Runtime assertion host callbacks currently require host-accessible scalar buffers.
-    #[error("compiled runtime assertions are not supported on XLA platform `{platform}`")]
-    UnsupportedRuntimeAssertionPlatform { platform: String },
-
-    /// The selected XLA invocation or reference ABI does not support the requested external-state configuration.
-    #[error("unsupported XLA reference ABI: {reason}")]
-    UnsupportedReferenceAbi { reason: String },
-
-    /// Ordering, completion observation, or recovery of an effect scope failed.
-    #[error("effect scope: {reason}")]
-    EffectScope { reason: String },
-
-    /// A submitted asynchronous XLA reference execution failed before its pending state became ready.
-    #[error("asynchronous XLA reference execution failed: {reason}")]
-    AsynchronousReferenceExecution { reason: String },
-}
 
 /// Backend-neutral completion adapter for one submitted PJRT execution.
 struct XlaReferenceCompletion {
@@ -148,8 +71,8 @@ impl ReferenceCompletionBackend for XlaReferenceCompletion {
 }
 
 /// Maps one backend-neutral completion failure into the XLA domain's public error type.
-fn xla_reference_completion_error(reason: Arc<str>) -> XlaDomainError {
-    XlaDomainError::AsynchronousReferenceExecution { reason: reason.to_string() }
+fn xla_reference_completion_error(reason: Arc<str>) -> Error {
+    Error::AsynchronousReferenceExecution { reason: reason.to_string() }
 }
 
 /// Fully materialized physical arguments and logical refinements prepared before PJRT submission.
@@ -172,7 +95,7 @@ struct PreparedXlaExecution<'c> {
 
 impl<'c> PreparedXlaExecution<'c> {
     /// Consumes the materialized arrays into device-major PJRT arguments.
-    fn into_arguments(self) -> Result<(ExecuteArguments<'c>, <ArrayType as Type>::Refinements, usize), ArrayError> {
+    fn into_arguments(self) -> Result<(ExecuteArguments<'c>, <ArrayType as Type>::Refinements, usize), Error> {
         let arguments = ExecuteArguments::from_arrays_with_donation(
             self.inputs,
             self.addressable_device_ids,
@@ -329,8 +252,8 @@ impl<'c> XlaSession<'c> {
     ///
     /// # Errors
     ///
-    /// Returns the corresponding [`std::io::Error`] when the configured cache directory is invalid.
-    pub fn with_disk_cache_from_env(client: &'c Client<'c>) -> std::io::Result<Arc<Self>> {
+    /// Returns [`Error::Io`] when the configured cache directory is invalid.
+    pub fn with_disk_cache_from_env(client: &'c Client<'c>) -> Result<Arc<Self>, Error> {
         Ok(Self::with_compilation_context(client, CompilationContext::new().with_disk_cache_from_env()?))
     }
 
@@ -343,9 +266,9 @@ impl<'c> XlaSession<'c> {
     ///
     /// # Errors
     ///
-    /// Returns [`XlaDomainError::Pjrt`] if querying the platform, plugin, or device facts from the client failed. The
+    /// Returns [`Error::Pjrt`] if querying the platform, plugin, or device facts from the client failed. The
     /// failure is retained, so every later call returns the same error.
-    pub fn target(&self) -> Result<&XlaTarget, XlaDomainError> {
+    pub fn target(&self) -> Result<&XlaTarget, Error> {
         self.target
             .get_or_init(|| XlaTarget::from_client(self.client))
             .as_ref()
@@ -370,19 +293,19 @@ impl<'c> XlaSession<'c> {
         r#type: ArrayType,
         mesh: DeviceMesh,
         buffer: B,
-    ) -> Result<XlaArray<'c>, ArrayError> {
+    ) -> Result<XlaArray<'c>, Error> {
         XlaArray::from_host_buffer(&self.domain(), r#type, mesh, buffer)
     }
 
     /// Waits for the default scope's previously reserved effects, including unordered I/O and local assertions.
     /// Later submissions and forked scopes are excluded. Failures are retained until explicitly acknowledged.
-    pub fn effects_barrier(&self) -> Result<(), XlaDomainError> {
+    pub fn effects_barrier(&self) -> Result<(), Error> {
         self.default_effect_scope.barrier()
     }
 
     /// Acknowledges failures reported by a completed barrier once their affected ordering chain is quiescent.
     /// This never waits, repairs reference state, or changes errors retained by existing arrays/executions.
-    pub fn acknowledge_effect_errors(&self) -> Result<(), XlaDomainError> {
+    pub fn acknowledge_effect_errors(&self) -> Result<(), Error> {
         self.default_effect_scope.acknowledge()
     }
 }
@@ -521,7 +444,7 @@ impl XlaTarget {
 
     /// Returns the kinds of the devices of `mesh`, in mesh order, matching devices by identifier. Lowered and
     /// persisted programs record these kinds so that executables are only reused on equivalent hardware.
-    pub(crate) fn mesh_device_kinds(&self, mesh: &DeviceMesh) -> Result<Vec<String>, XlaDomainError> {
+    pub(crate) fn mesh_device_kinds(&self, mesh: &DeviceMesh) -> Result<Vec<String>, Error> {
         mesh.devices()
             .iter()
             .map(|mesh_device| {
@@ -696,7 +619,7 @@ struct EffectScope<'c> {
 
 impl<'c> EffectScope<'c> {
     /// Reserves a position and snapshots the predecessor atomically before releasing the scope mutex.
-    fn reserve(&self, device: Option<Vec<DeviceId>>) -> Result<EffectReservation<'c>, XlaDomainError> {
+    fn reserve(&self, device: Option<Vec<DeviceId>>) -> Result<EffectReservation<'c>, Error> {
         ensure_effect_dispatch_allowed()?;
         let mut state = self.state.lock().expect("effect scope mutex poisoned");
         if device.is_some()
@@ -705,7 +628,7 @@ impl<'c> EffectScope<'c> {
                 .iter()
                 .any(|submission| submission.ordered && matches!(submission.completion.result(), Some(Err(_))))
         {
-            return Err(XlaDomainError::EffectScope {
+            return Err(Error::EffectScope {
                 reason: "ordered I/O has failed; call `effects_barrier()` and then \
                     `acknowledge_effect_errors()` before retrying"
                     .to_string(),
@@ -713,7 +636,7 @@ impl<'c> EffectScope<'c> {
         }
         if let Some(device) = &device {
             if state.device.as_ref().is_some_and(|previous| previous != device) {
-                return Err(XlaDomainError::EffectScope {
+                return Err(Error::EffectScope {
                     reason: "ordered I/O device changed; use `fork_effect_scope()` for a new device assignment"
                         .to_string(),
                 });
@@ -745,7 +668,7 @@ impl<'c> EffectScope<'c> {
     }
 
     /// Waits for a fixed snapshot and reports its failures in submission order.
-    fn barrier(&self) -> Result<(), XlaDomainError> {
+    fn barrier(&self) -> Result<(), Error> {
         ensure_effect_dispatch_allowed()?;
         let submissions = self.state.lock().expect("effect scope mutex poisoned").submissions.clone();
         let mut failures = Vec::new();
@@ -774,7 +697,7 @@ impl<'c> EffectScope<'c> {
         if failures.is_empty() {
             return Ok(());
         }
-        Err(XlaDomainError::EffectScope {
+        Err(Error::EffectScope {
             reason: format!(
                 "{}; call `effects_barrier()` again if more work was submitted, then `acknowledge_effect_errors()` \
                  to recover once affected work is complete",
@@ -788,7 +711,7 @@ impl<'c> EffectScope<'c> {
     }
 
     /// Clears only observed failures after affected invocations have completed, without waiting.
-    fn acknowledge(&self) -> Result<(), XlaDomainError> {
+    fn acknowledge(&self) -> Result<(), Error> {
         ensure_effect_dispatch_allowed()?;
         let mut state = self.state.lock().expect("effect scope mutex poisoned");
         // Callbacks publish independently of the scope mutex. Read each completion exactly once so a failure
@@ -803,7 +726,7 @@ impl<'c> EffectScope<'c> {
             (ordered_failure && *ordered && result.is_none())
                 || (matches!(result, Some(Err(_))) && !state.observed.contains(identity))
         }) {
-            return Err(XlaDomainError::EffectScope {
+            return Err(Error::EffectScope {
                 reason: "effect failures are pending or unreported; call `effects_barrier()` and then \
                     `acknowledge_effect_errors()` again"
                     .to_string(),
@@ -879,9 +802,9 @@ impl Drop for EffectCallbackGuard {
 }
 
 /// Rejects managed-callback reentrancy before any scope or reference locks are taken.
-fn ensure_effect_dispatch_allowed() -> Result<(), XlaDomainError> {
+fn ensure_effect_dispatch_allowed() -> Result<(), Error> {
     if EFFECT_CALLBACK_DEPTH.with(|depth| depth.get() != 0) {
-        Err(XlaDomainError::EffectScope {
+        Err(Error::EffectScope {
             reason: "execution and effect barriers cannot be entered from a managed callback".to_string(),
         })
     } else {
@@ -1055,7 +978,7 @@ impl<'c> XlaDomain<'c> {
     /// Returns the [`XlaTarget`] of this domain's session. Refer to the documentation of [`XlaSession::target`] for
     /// more information.
     #[inline]
-    pub fn target(&self) -> Result<&XlaTarget, XlaDomainError> {
+    pub fn target(&self) -> Result<&XlaTarget, Error> {
         self.session.target()
     }
 
@@ -1106,13 +1029,13 @@ impl<'c> XlaDomain<'c> {
     /// Waits for this scope's previously reserved effects, including unordered I/O and local assertions.
     /// Backend-selected inline execution is allowed; this function waits only for work still pending. Later
     /// reservations and other scopes are excluded. Call before client destruction to ensure effects are observed.
-    pub fn effects_barrier(&self) -> Result<(), XlaDomainError> {
+    pub fn effects_barrier(&self) -> Result<(), Error> {
         self.effect_scope.barrier()
     }
 
     /// Acknowledges barrier-reported failures after affected work has completed, without waiting or repairing
     /// references. If work is pending or unreported, call `effects_barrier()` and retry this function.
-    pub fn acknowledge_effect_errors(&self) -> Result<(), XlaDomainError> {
+    pub fn acknowledge_effect_errors(&self) -> Result<(), Error> {
         self.effect_scope.acknowledge()
     }
 }
@@ -1687,15 +1610,15 @@ impl<'c> XlaDomain<'c> {
     }
 
     /// Materializes a concrete [`XlaArray`] whose addressable shards are filled with a constant.
-    fn constant(&self, array_type: &ArrayType, kind: ConstantKind) -> Result<XlaArray<'c>, XlaDomainError> {
+    fn constant(&self, array_type: &ArrayType, kind: ConstantKind) -> Result<XlaArray<'c>, Error> {
         let client = self.client();
-        let mesh = self.mesh.as_ref().ok_or_else(|| XlaDomainError::InvalidCompilationOptions {
+        let mesh = self.mesh.as_ref().ok_or_else(|| Error::InvalidCompilationOptions {
             reason: "xla runtime constants require a concrete device mesh".to_string(),
         })?;
         static_dimensions_or_panic(array_type);
         let effective_type = match array_type.sharding() {
             Some(_) => array_type.clone(),
-            None => array_type.replicated(mesh).map_err(ArrayError::from)?,
+            None => array_type.replicated(mesh)?,
         };
         if array_type.data_type().is_zero() {
             return Ok(XlaArray::from_zero_space(self, effective_type, mesh.clone())?);
@@ -1711,8 +1634,7 @@ impl<'c> XlaDomain<'c> {
                 continue;
             }
             let shard_shape = shard.shape();
-            let element_count =
-                Shape::from(&shard_shape).element_count().map_err(Error::from)?.expect("shard shapes are static");
+            let element_count = Shape::from(&shard_shape).element_count()?.expect("shard shapes are static");
             let bytes = constant_bytes(array_type.data_type(), kind, element_count, element_size_in_bytes);
             let dimensions = shard_shape.as_slice().iter().map(|&dimension| dimension as u64).collect::<Vec<_>>();
             let device = client
@@ -1843,7 +1765,7 @@ fn one_pattern_bytes(data_type: DataType) -> Vec<u8> {
 
 /// Returns the addressable device IDs for `client`, filtered to devices that are both addressable by the client and
 /// present in the mesh.
-fn addressable_device_ids(client: &Client<'_>, mesh: &DeviceMesh) -> Result<Vec<DeviceId>, XlaDomainError> {
+fn addressable_device_ids(client: &Client<'_>, mesh: &DeviceMesh) -> Result<Vec<DeviceId>, Error> {
     let mut addressable = Vec::new();
     for device in client.addressable_devices()? {
         let device_id = device.id()?;
@@ -1855,7 +1777,7 @@ fn addressable_device_ids(client: &Client<'_>, mesh: &DeviceMesh) -> Result<Vec<
 }
 
 /// Returns the shard descriptors implied by `array_type` and `mesh`.
-fn shards_for_type(array_type: &ArrayType, mesh: &DeviceMesh) -> Result<Vec<ShardDescriptor>, ArrayError> {
+fn shards_for_type(array_type: &ArrayType, mesh: &DeviceMesh) -> Result<Vec<ShardDescriptor>, Error> {
     let sharding = array_type.sharding().ok_or(Error::MissingSharding)?;
     let global_shape =
         array_type.static_shape().ok_or_else(|| Error::DynamicShape { shape: array_type.shape().clone() })?;
@@ -1886,8 +1808,8 @@ impl XlaFeedbackDirectedProfile {
     }
 
     /// Loads opaque profile bytes from `path`.
-    pub fn from_file(path: impl AsRef<Path>) -> std::io::Result<Self> {
-        std::fs::read(path).map(Self::new)
+    pub fn from_file(path: impl AsRef<Path>) -> Result<Self, Error> {
+        Ok(Self::new(std::fs::read(path)?))
     }
 
     /// Sets the XLA compilation profile version associated with these bytes.
@@ -1917,8 +1839,9 @@ impl XlaFeedbackDirectedProfile {
 
     /// Writes the opaque profile bytes to `path`.
     #[inline]
-    pub fn write_to_file(&self, path: impl AsRef<Path>) -> std::io::Result<()> {
-        std::fs::write(path, self.bytes())
+    pub fn write_to_file(&self, path: impl AsRef<Path>) -> Result<(), Error> {
+        std::fs::write(path, self.bytes())?;
+        Ok(())
     }
 }
 
@@ -2293,7 +2216,7 @@ impl XlaOptions {
 
     /// Sets the per-input sharding overrides that the SPMD partitioner reads at lowering time.
     /// Length must equal the flat input arity once the program is traced; mismatches surface as
-    /// [`XlaDomainError::InvalidCompilationOptions`] at compile time.
+    /// [`Error::InvalidCompilationOptions`] at compile time.
     #[inline]
     pub fn with_in_shardings(mut self, in_shardings: Vec<Sharding>) -> Self {
         self.in_shardings = Some(in_shardings);
@@ -2563,9 +2486,8 @@ pub struct XlaCompilationAnalysis {
 
 impl XlaCompilationAnalysis {
     /// Returns a deterministic JSON representation suitable for machine-readable diagnostics.
-    pub fn to_json(&self) -> Result<String, XlaDomainError> {
-        serde_json::to_string(self)
-            .map_err(|error| XlaDomainError::InvalidCompilationAnalysis { reason: error.to_string() })
+    pub fn to_json(&self) -> Result<String, Error> {
+        serde_json::to_string(self).map_err(|error| Error::InvalidCompilationAnalysis { reason: error.to_string() })
     }
 }
 
@@ -2886,7 +2808,7 @@ impl PersistentArraySignatureV3 {
     }
 
     /// Decodes input and output types while recreating each shared dynamic dimension variable exactly once.
-    fn decode(self) -> Result<(Vec<ArrayType>, Vec<ArrayType>), XlaDomainError> {
+    fn decode(self) -> Result<(Vec<ArrayType>, Vec<ArrayType>), Error> {
         let variables = self
             .variables
             .into_iter()
@@ -2898,8 +2820,8 @@ impl PersistentArraySignatureV3 {
                 .map_err(|error| persistent_error(error.to_string()))?;
                 Ok(DimensionVariable::new(variable.name, bounds))
             })
-            .collect::<Result<Vec<_>, XlaDomainError>>()?;
-        let decode_type = |r#type: PersistentArrayTypeV3| -> Result<ArrayType, XlaDomainError> {
+            .collect::<Result<Vec<_>, Error>>()?;
+        let decode_type = |r#type: PersistentArrayTypeV3| -> Result<ArrayType, Error> {
             let shape = Shape::new(
                 r#type
                     .shape
@@ -2957,7 +2879,7 @@ impl From<&Layout> for PersistentLayoutV1 {
 }
 
 impl TryFrom<PersistentLayoutV1> for Layout {
-    type Error = XlaDomainError;
+    type Error = Error;
 
     fn try_from(value: PersistentLayoutV1) -> Result<Self, Self::Error> {
         Ok(match value {
@@ -3011,7 +2933,7 @@ impl From<&Sharding> for PersistentShardingV1 {
 }
 
 impl TryFrom<PersistentShardingV1> for Sharding {
-    type Error = XlaDomainError;
+    type Error = Error;
 
     fn try_from(value: PersistentShardingV1) -> Result<Self, Self::Error> {
         Sharding::new(
@@ -3054,7 +2976,7 @@ impl From<&LogicalMesh> for PersistentLogicalMeshV1 {
 }
 
 impl TryFrom<PersistentLogicalMeshV1> for LogicalMesh {
-    type Error = XlaDomainError;
+    type Error = Error;
 
     fn try_from(value: PersistentLogicalMeshV1) -> Result<Self, Self::Error> {
         LogicalMesh::new(
@@ -3094,7 +3016,7 @@ impl From<&DeviceMesh> for PersistentDeviceMeshV1 {
 }
 
 impl TryFrom<PersistentDeviceMeshV1> for DeviceMesh {
-    type Error = XlaDomainError;
+    type Error = Error;
 
     fn try_from(value: PersistentDeviceMeshV1) -> Result<Self, Self::Error> {
         DeviceMesh::new(
@@ -3103,22 +3025,22 @@ impl TryFrom<PersistentDeviceMeshV1> for DeviceMesh {
                 .devices
                 .into_iter()
                 .map(|device| Ok(Device::new(checked_usize(device.id)?, checked_usize(device.process_index)?)))
-                .collect::<Result<Vec<_>, XlaDomainError>>()?,
+                .collect::<Result<Vec<_>, Error>>()?,
         )
         .map_err(|error| persistent_error(error.to_string()))
     }
 }
 
-fn persistent_error(reason: impl Into<String>) -> XlaDomainError {
-    XlaDomainError::InvalidPersistentExecutable { reason: reason.into() }
+fn persistent_error(reason: impl Into<String>) -> Error {
+    Error::InvalidPersistentExecutable { reason: reason.into() }
 }
 
-fn checked_usize(value: u64) -> Result<usize, XlaDomainError> {
+fn checked_usize(value: u64) -> Result<usize, Error> {
     usize::try_from(value).map_err(|_| persistent_error(format!("value {value} does not fit in usize")))
 }
 
 /// Converts an in-memory executable signature mapping to its stable persistent representation.
-fn persistent_mapping(mapping: &[Option<usize>]) -> Result<Vec<Option<u64>>, XlaDomainError> {
+fn persistent_mapping(mapping: &[Option<usize>]) -> Result<Vec<Option<u64>>, Error> {
     mapping
         .iter()
         .map(|index| {
@@ -3139,7 +3061,7 @@ fn persistent_mapping(mapping: &[Option<usize>]) -> Result<Vec<Option<u64>>, Xla
 fn persistent_reference_states(
     states: &[ExternalReferenceBinding],
     capture_count: usize,
-) -> Result<Vec<PersistentReferenceStateV6>, XlaDomainError> {
+) -> Result<Vec<PersistentReferenceStateV6>, Error> {
     states
         .iter()
         .map(|state| {
@@ -3162,7 +3084,7 @@ fn persistent_reference_states(
 fn decode_persistent_reference_states(
     states: Vec<PersistentReferenceStateV6>,
     capture_count: usize,
-) -> Result<Vec<ExternalReferenceBinding>, XlaDomainError> {
+) -> Result<Vec<ExternalReferenceBinding>, Error> {
     states
         .into_iter()
         .map(|state| {
@@ -3252,7 +3174,7 @@ fn encode_data_type(data_type: DataType) -> u8 {
     }
 }
 
-fn decode_data_type(value: u8) -> Result<DataType, XlaDomainError> {
+fn decode_data_type(value: u8) -> Result<DataType, Error> {
     Ok(match value {
         0 => DataType::Token,
         1 => DataType::Boolean,
@@ -3372,7 +3294,7 @@ impl XlaExecutionPlan {
         donation_flags: &[bool],
         capture_count: usize,
         mesh: &DeviceMesh,
-    ) -> Result<Self, XlaDomainError> {
+    ) -> Result<Self, Error> {
         let physical_input_logical_indices = signature.project_inputs(&(0..input_types.len()).collect::<Vec<_>>());
         let mut physical_input_types = signature.physical_input_types(input_types);
         let compiled_executable = executable.executable()?;
@@ -3393,13 +3315,12 @@ impl XlaExecutionPlan {
         ] {
             for (index, array_type) in types.iter().enumerate() {
                 if let Some(expected) = array_type.layout() {
-                    let layout = layouts.get(index).ok_or_else(|| XlaDomainError::InvalidCompilationOptions {
+                    let layout = layouts.get(index).ok_or_else(|| Error::InvalidCompilationOptions {
                         reason: format!("executable {kind} {index} has no physical layout"),
                     })?;
-                    let actual = Layout::from_pjrt(ryft_pjrt::Layout::from_proto(layout.serialize()?.proto()?)?)
-                        .map_err(Error::from)?;
+                    let actual = Layout::from_pjrt(ryft_pjrt::Layout::from_proto(layout.serialize()?.proto()?)?)?;
                     if &actual != expected {
-                        return Err(XlaDomainError::InvalidCompilationOptions {
+                        return Err(Error::InvalidCompilationOptions {
                             reason: format!(
                                 "executable {kind} {index} uses layout `{actual}` but its type declares `{expected}`",
                             ),
@@ -3411,11 +3332,10 @@ impl XlaExecutionPlan {
         // These types describe the physical executable signature, including layouts chosen for unconstrained
         // logical inputs. Keep the logical declarations unchanged so they still admit other representations.
         for (index, array_type) in physical_input_types.iter_mut().enumerate() {
-            let layout = input_layouts.get(index).ok_or_else(|| XlaDomainError::InvalidCompilationOptions {
+            let layout = input_layouts.get(index).ok_or_else(|| Error::InvalidCompilationOptions {
                 reason: format!("executable input {index} has no physical layout"),
             })?;
-            let layout =
-                Layout::from_pjrt(ryft_pjrt::Layout::from_proto(layout.serialize()?.proto()?)?).map_err(Error::from)?;
+            let layout = Layout::from_pjrt(ryft_pjrt::Layout::from_proto(layout.serialize()?.proto()?)?)?;
             *array_type = array_type.clone().with_layout(layout);
         }
         let logical_donation_flags =
@@ -3430,7 +3350,7 @@ impl XlaExecutionPlan {
         let addressable_device_ids = executable
             .addressable_devices()?
             .iter()
-            .map(|device| device.id().map_err(XlaDomainError::from))
+            .map(|device| device.id().map_err(Error::from))
             .collect::<Result<Arc<[_]>, _>>()?;
         let static_inputs = input_types.iter().all(|input_type| input_type.static_shape().is_some());
         let zero_space_inputs = physical_input_types.iter().any(|input_type| input_type.data_type().is_zero());
@@ -3456,12 +3376,11 @@ impl XlaExecutionPlan {
                     .map(|output_type| {
                         let output_type = match output_type.sharding() {
                             Some(_) => output_type.clone(),
-                            None => output_type.replicated(mesh.as_ref()).map_err(ArrayError::from)?,
+                            None => output_type.replicated(mesh.as_ref())?,
                         };
-                        Ok(ArrayOutputLayout::new(output_type, Arc::clone(&mesh), &addressable_device_ids)
-                            .map_err(ArrayError::from)?)
+                        Ok(ArrayOutputLayout::new(output_type, Arc::clone(&mesh), &addressable_device_ids)?)
                     })
-                    .collect::<Result<Vec<_>, XlaDomainError>>()?,
+                    .collect::<Result<Vec<_>, Error>>()?,
             )
         } else {
             None
@@ -3580,11 +3499,11 @@ fn incompatible_xla_invocation_field(
 fn validate_xla_replacement_metadata(
     current: XlaInvocationMetadata<'_>,
     replacement: XlaInvocationMetadata<'_>,
-) -> Result<(), XlaDomainError> {
+) -> Result<(), Error> {
     match incompatible_xla_invocation_field(current, replacement) {
-        Some(field) => Err(XlaDomainError::InvalidCompilationOptions {
-            reason: format!("replacement executable has incompatible {field}"),
-        }),
+        Some(field) => {
+            Err(Error::InvalidCompilationOptions { reason: format!("replacement executable has incompatible {field}") })
+        }
         None => Ok(()),
     }
 }
@@ -3629,7 +3548,7 @@ impl<'c> XlaCompiledProgram<'c> {
     }
 
     /// Returns the backend's optimized program only when explicitly requested.
-    pub fn optimized_program(&self) -> Result<XlaOptimizedProgram, XlaDomainError> {
+    pub fn optimized_program(&self) -> Result<XlaOptimizedProgram, Error> {
         match self.executable.executable()?.optimized_program()? {
             PjrtProgram::Mlir { bytecode } => Ok(XlaOptimizedProgram { format: "mlir", bytes: bytecode }),
             PjrtProgram::Hlo { proto } => Ok(XlaOptimizedProgram { format: "hlo", bytes: proto }),
@@ -3666,10 +3585,10 @@ impl<'c> XlaDomain<'c> {
         &self,
         signature: &XlaExecutableSignature,
         platform_name: &str,
-    ) -> Result<(), XlaDomainError> {
+    ) -> Result<(), Error> {
         if signature.requires_cuda_kernel_runtime() {
             if !platform_name.eq_ignore_ascii_case("cuda") {
-                return Err(XlaDomainError::InvalidCompilationOptions {
+                return Err(Error::InvalidCompilationOptions {
                     reason: "cuda artifact calls require a cuda platform".to_owned(),
                 });
             }
@@ -3680,12 +3599,12 @@ impl<'c> XlaDomain<'c> {
         }
         if signature.requires_rocm_kernel_runtime() {
             if !platform_name.eq_ignore_ascii_case("rocm") {
-                return Err(XlaDomainError::InvalidCompilationOptions {
+                return Err(Error::InvalidCompilationOptions {
                     reason: "rocm artifact calls require a rocm platform".into(),
                 });
             }
             #[cfg(not(feature = "rocm"))]
-            return Err(XlaDomainError::InvalidCompilationOptions {
+            return Err(Error::InvalidCompilationOptions {
                 reason: "rocm artifact execution requires the `rocm` feature".into(),
             });
             #[cfg(feature = "rocm")]
@@ -3710,19 +3629,15 @@ impl<'c> XlaDomain<'c> {
         let supported = platform_name.eq_ignore_ascii_case("cpu")
             || (cfg!(any(feature = "cuda-12", feature = "cuda-13")) && platform_name.eq_ignore_ascii_case("cuda"));
         if !supported {
-            return Err(XlaDomainError::UnsupportedRuntimeAssertionPlatform { platform: platform_name.to_string() });
+            return Err(Error::UnsupportedRuntimeAssertionPlatform { platform: platform_name.to_string() });
         }
         crate::operations::assertions::ensure_assertion_handler_registered(self.client())?;
         Ok(())
     }
 
     /// Validates that this domain's PJRT client owns `program`.
-    fn validate_xla_program_owner(&self, program: &XlaCompiledProgram<'c>) -> Result<(), XlaDomainError> {
-        if program.executable.is_owned_by(self.client()) {
-            Ok(())
-        } else {
-            Err(XlaDomainError::ExecutableClientMismatch)
-        }
+    fn validate_xla_program_owner(&self, program: &XlaCompiledProgram<'c>) -> Result<(), Error> {
+        if program.executable.is_owned_by(self.client()) { Ok(()) } else { Err(Error::ExecutableClientMismatch) }
     }
 
     /// Enqueues a stateless `program` and returns its possibly still pending flat outputs together with a
@@ -3738,7 +3653,7 @@ impl<'c> XlaDomain<'c> {
         &self,
         program: &XlaCompiledProgram<'c>,
         inputs: Vec<XlaArray<'c>>,
-    ) -> Result<Execution<Vec<XlaArray<'c>>>, XlaDomainError> {
+    ) -> Result<Execution<Vec<XlaArray<'c>>>, Error> {
         // Public call surfaces screen stateful programs out before reaching this entry point: only the stateful call
         // path owns holder leases and pending generations, so a stateful program arriving here must already carry
         // state values as plain arrays (as ABI-level tests do), and its hidden final-state outputs are returned
@@ -3774,7 +3689,7 @@ impl<'c> XlaDomain<'c> {
         program: &XlaCompiledProgram<'c>,
         inputs: Vec<XlaArray<'c>>,
         donation_overrides: &[(usize, bool)],
-    ) -> Result<PreparedXlaExecution<'c>, XlaDomainError> {
+    ) -> Result<PreparedXlaExecution<'c>, Error> {
         ensure_effect_dispatch_allowed()?;
         self.validate_xla_program_owner(program)?;
         if program.kernel_execution_facts.is_some()
@@ -3785,7 +3700,7 @@ impl<'c> XlaDomain<'c> {
         }
         self.ensure_runtime_requirements(&program.signature, &program.platform_name)?;
         if inputs.len() != program.input_types.len() {
-            return Err(XlaDomainError::InvalidCompilationOptions {
+            return Err(Error::InvalidCompilationOptions {
                 reason: format!(
                     "compiled program expects {} flat argument(s), including {} capture(s), but got {}",
                     program.input_types.len(),
@@ -3818,7 +3733,7 @@ impl<'c> XlaDomain<'c> {
                 .map(|(declared, actual)| {
                     // Preserve every observed type component except the sharding, so that refinement still rejects a
                     // wrong data type, layout, memory space, rank, or extent.
-                    actual.clone().with_sharding(declared.sharding().cloned()).map_err(ArrayError::from)
+                    actual.clone().with_sharding(declared.sharding().cloned()).map_err(Error::from)
                 })
                 .collect::<Result<Vec<_>, _>>()?;
             let input_refinements = <ArrayType as Type>::Refinements::from_local_declarations(
@@ -3883,7 +3798,7 @@ impl<'c> XlaDomain<'c> {
                     *input = source.cast(source.r#type().into_owned().with_layout(expected.clone()), &[])?;
                 }
             } else {
-                let expected_buffer_layout = expected.to_pjrt().map_err(Error::from)?;
+                let expected_buffer_layout = expected.to_pjrt()?;
                 let mut needs_conversion = false;
                 for shard in input.addressable_shards() {
                     if let Some(buffer) = shard.buffer()
@@ -3912,7 +3827,7 @@ impl<'c> XlaDomain<'c> {
                 .collect::<Vec<_>>();
             for &(logical_input_index, donation) in donation_overrides {
                 let flag = logical_donation_flags.get_mut(logical_input_index).ok_or_else(|| {
-                    XlaDomainError::InvalidCompilationOptions {
+                    Error::InvalidCompilationOptions {
                         reason: format!("donation override input {logical_input_index} is out of range"),
                     }
                 })?;
@@ -3942,7 +3857,7 @@ impl<'c> CompilationDomain for XlaDomain<'c> {
     type LoweredProgram = XlaLoweredProgram;
     type CompiledProgram = XlaCompiledProgram<'c>;
     type Options = XlaOptions;
-    type Error = XlaDomainError;
+    type Error = Error;
 
     fn dispatch_signature(
         &self,
@@ -3955,7 +3870,7 @@ impl<'c> CompilationDomain for XlaDomain<'c> {
             return Ok((XlaDispatchKey(XlaDispatchKeyKind::Exact(input_types.clone())), input_types));
         };
         if options.mesh.devices().len() > 1 {
-            return Err(XlaDomainError::InvalidCompilationOptions {
+            return Err(Error::InvalidCompilationOptions {
                 reason: "input-bound bucketing is unsupported on multi-device meshes because bucketed dynamic \
                          signatures require disabling the Shardy partitioner"
                     .to_string(),
@@ -3966,7 +3881,7 @@ impl<'c> CompilationDomain for XlaDomain<'c> {
             let array_type = match r#type {
                 ArrayIrType::Array(array_type) => array_type,
                 ArrayIrType::Dimension(_) => {
-                    return Err(XlaDomainError::InvalidCompilationOptions {
+                    return Err(Error::InvalidCompilationOptions {
                         reason: format!(
                             "input-bound bucketing only supports array inputs, but input {} has first-class dimension \
                              type {}",
@@ -3975,7 +3890,7 @@ impl<'c> CompilationDomain for XlaDomain<'c> {
                     });
                 }
                 ArrayIrType::Reference(_) => {
-                    return Err(XlaDomainError::UnsupportedReferenceAbi {
+                    return Err(Error::UnsupportedReferenceAbi {
                         reason: format!(
                             "external reference input {input_index} does not support input-bound bucketing"
                         ),
@@ -4022,7 +3937,7 @@ impl<'c> CompilationDomain for XlaDomain<'c> {
         let output_types = staged.output_types();
         let options = staged.options();
         if apply_input_shardings(input_types.to_vec(), options)? != input_types {
-            return Err(XlaDomainError::InvalidCompilationOptions {
+            return Err(Error::InvalidCompilationOptions {
                 reason: "staged input types do not carry the shardings requested by `in_shardings`; apply them to the \
                          input types before staging (e.g., with `with_input_shardings`)"
                     .to_string(),
@@ -4065,9 +3980,9 @@ impl<'c> XlaDomain<'c> {
         &self,
         program: &XlaCompiledProgram<'c>,
         inputs: Vec<XlaValue<'c>>,
-    ) -> Result<(Vec<XlaValue<'c>>, ExecutionFence), XlaDomainError> {
+    ) -> Result<(Vec<XlaValue<'c>>, ExecutionFence), Error> {
         if program.requires_stateful_call() {
-            return Err(XlaDomainError::UnsupportedReferenceAbi {
+            return Err(Error::UnsupportedReferenceAbi {
                 reason: "external reference state requires `execute_statefully`".to_string(),
             });
         }
@@ -4096,15 +4011,15 @@ impl<'c> XlaDomain<'c> {
         Ok((outputs.into_iter().map(XlaValue::Array).collect(), fence))
     }
 
-    /// Locks one stateful reference while preserving reference lifecycle errors as [`XlaDomainError::Reference`].
+    /// Locks one stateful reference while preserving reference lifecycle errors through [`Error::Core`].
     fn lock_stateful_reference<'g>(
         reference: &'g ArrayReference<XlaArray<'c>>,
-    ) -> Result<ReadyOrPendingReferenceGuard<'g, XlaArray<'c>>, XlaDomainError> {
+    ) -> Result<ReadyOrPendingReferenceGuard<'g, XlaArray<'c>>, Error> {
         reference.lock_storage().map_err(|error| {
             if let Some(reference_error) = error.downcast_custom::<ryft_core::ReferenceError>().cloned() {
-                XlaDomainError::Reference(reference_error)
+                Error::Core(ryft_core::Error::Reference(reference_error))
             } else {
-                XlaDomainError::Tracing(error)
+                Error::Core(ryft_core::Error::Program(error))
             }
         })
     }
@@ -4116,7 +4031,7 @@ impl<'c> XlaDomain<'c> {
         &self,
         program: &XlaCompiledProgram<'c>,
         inputs: Vec<XlaValue<'c>>,
-    ) -> StatefulExecution<Vec<XlaValue<'c>>, XlaDomainError> {
+    ) -> StatefulExecution<Vec<XlaValue<'c>>, Error> {
         if let Err(error) = ensure_effect_dispatch_allowed() {
             return StatefulExecution::ready(Err(error));
         }
@@ -4132,7 +4047,7 @@ impl<'c> XlaDomain<'c> {
                 Err(error) => StatefulExecution::ready(Err(error)),
             };
         }
-        let prepared = (|| -> Result<_, XlaDomainError> {
+        let prepared = (|| -> Result<_, Error> {
             check_count!("input", inputs, program.input_types.len(), ProgramError);
             let reference_state_input_indices = program
                 .reference_states
@@ -4173,7 +4088,7 @@ impl<'c> XlaDomain<'c> {
                 let reference = match inputs.get(logical_input_index) {
                     Some(XlaValue::Reference(reference)) => reference.handle(),
                     Some(value) => {
-                        return Err(XlaDomainError::UnsupportedReferenceAbi {
+                        return Err(Error::UnsupportedReferenceAbi {
                             reason: format!(
                                 "external state input {logical_input_index} must be a reference, but received `{}`",
                                 value.r#type(),
@@ -4194,11 +4109,11 @@ impl<'c> XlaDomain<'c> {
                 let effective_type = if declared_type.sharding().is_some() {
                     declared_type.clone()
                 } else {
-                    declared_type.clone().with_sharding(expected_sharding.clone()).map_err(ArrayError::from)?
+                    declared_type.clone().with_sharding(expected_sharding.clone())?
                 };
                 let actual_type = reference.r#type();
                 if !effective_type.is_refined_by(actual_type.referent()) {
-                    return Err(XlaDomainError::UnsupportedReferenceAbi {
+                    return Err(Error::UnsupportedReferenceAbi {
                         reason: format!(
                             "external state input {logical_input_index} reference type `{}` does not refine effective \
                              compiled state type `{effective_type}`",
@@ -4207,7 +4122,7 @@ impl<'c> XlaDomain<'c> {
                     });
                 }
                 if !reference.is_storage_root() {
-                    return Err(XlaDomainError::UnsupportedReferenceAbi {
+                    return Err(Error::UnsupportedReferenceAbi {
                         reason: format!(
                             "external state input {logical_input_index} must be a root reference handle that uses its \
                              allocation's stored type identities",
@@ -4248,7 +4163,7 @@ impl<'c> XlaDomain<'c> {
                 let guards = bindings
                     .iter()
                     .map(|(_, reference)| Self::lock_stateful_reference(reference))
-                    .collect::<Result<Vec<ReadyOrPendingReferenceGuard<'_, XlaArray<'c>>>, XlaDomainError>>()?;
+                    .collect::<Result<Vec<ReadyOrPendingReferenceGuard<'_, XlaArray<'c>>>, Error>>()?;
                 let observations =
                     guards.iter().map(ReadyOrPendingReferenceGuard::observe).collect::<Result<Vec<_>, _>>()?;
                 let logical_inputs = inputs.as_ref().unwrap();
@@ -4259,7 +4174,7 @@ impl<'c> XlaDomain<'c> {
                     };
                     let snapshot = observations[guard_indices[&reference.handle().id()]].snapshot().clone();
                     if snapshot.mesh() != &program.mesh {
-                        return Err(XlaDomainError::UnsupportedReferenceAbi {
+                        return Err(Error::UnsupportedReferenceAbi {
                             reason: format!(
                                 "external state input {logical_input_index} reference mesh does not match the compiled \
                                  device mesh",
@@ -4281,7 +4196,7 @@ impl<'c> XlaDomain<'c> {
                 let guards = bindings
                     .iter()
                     .map(|(_, reference)| Self::lock_stateful_reference(reference))
-                    .collect::<Result<Vec<ReadyOrPendingReferenceGuard<'_, XlaArray<'c>>>, XlaDomainError>>()?;
+                    .collect::<Result<Vec<ReadyOrPendingReferenceGuard<'_, XlaArray<'c>>>, Error>>()?;
                 if !guards.iter().zip(&observations).all(|(guard, observation)| observation.is_current(guard)) {
                     continue;
                 }
@@ -4323,7 +4238,7 @@ impl<'c> XlaDomain<'c> {
                 drop(inputs.take());
                 // Nothing has been submitted or published yet, so a failed projection simply releases the guards.
                 let (execution_inputs, input_refinements, physical_output_count) =
-                    prepared_execution.into_arguments().map_err(XlaDomainError::from)?;
+                    prepared_execution.into_arguments()?;
                 let read_only_guard_storage = RefCell::new(read_only_guards);
                 let prepared_replacement_storage = RefCell::new(prepared_replacements);
                 let publication: RefCell<Option<ReferenceCompletion>> = RefCell::new(None);
@@ -4378,10 +4293,10 @@ impl<'c> XlaDomain<'c> {
             let (physical_outputs, fence) = execution.into_parts();
             let mut physical_outputs = physical_outputs.into_iter().map(Some).collect::<Vec<_>>();
             debug_assert!(prepared_replacements.is_empty());
-            let replacements = (|| -> Result<Vec<_>, XlaDomainError> {
+            let replacements = (|| -> Result<Vec<_>, Error> {
                 #[cfg(test)]
                 if take_stateful_failure_injection(StatefulFailureInjection::BeforeHiddenReplacementCommit) {
-                    return Err(XlaDomainError::InvalidCompilationOptions {
+                    return Err(Error::InvalidCompilationOptions {
                         reason: "injected failure before hidden state replacement commit".to_string(),
                     });
                 }
@@ -4458,10 +4373,10 @@ impl<'c> XlaDomain<'c> {
             drop(committed_replacement_guards);
             drop(read_only_guards);
 
-            let public_result = (|| -> Result<_, XlaDomainError> {
+            let public_result = (|| -> Result<_, Error> {
                 #[cfg(test)]
                 if take_stateful_failure_injection(StatefulFailureInjection::BeforePublicReconstruction) {
-                    return Err(XlaDomainError::InvalidCompilationOptions {
+                    return Err(Error::InvalidCompilationOptions {
                         reason: "injected failure before public output reconstruction".to_string(),
                     });
                 }
@@ -4507,7 +4422,7 @@ impl<'c> XlaDomain<'c> {
         program: &FlatXlaProgram,
         capture_count: usize,
         options: &XlaOptions,
-    ) -> Result<XlaLoweredProgram, XlaDomainError> {
+    ) -> Result<XlaLoweredProgram, Error> {
         // Kernel selection validates the actual attached body and discharges only its owned local state before the
         // ordinary reference-discharge and effect gates. Existing lowering, caching, and runtime lifecycle then apply.
         let selected = crate::kernels::select_kernels(program, options.kernel_compiler.as_ref(), || {
@@ -4518,7 +4433,7 @@ impl<'c> XlaDomain<'c> {
         })?;
         let program = selected.as_ref().unwrap_or(program);
         if capture_count > program.input_count() {
-            return Err(XlaDomainError::InvalidCompilationOptions {
+            return Err(Error::InvalidCompilationOptions {
                 reason: format!(
                     "capture_count is {capture_count}, but the program has only {} flat input(s)",
                     program.input_count(),
@@ -4548,7 +4463,7 @@ impl<'c> XlaDomain<'c> {
         &self,
         discharged: &ReferenceDischargeResult<XlaConstant, XlaOperation>,
         options: &XlaOptions,
-    ) -> Result<XlaLoweredProgram, XlaDomainError> {
+    ) -> Result<XlaLoweredProgram, Error> {
         // The backend verifier remains independent from core discharge and runs before boundary projection,
         // partitioner selection, or StableHLO construction. The reference scan runs first so a malformed artifact
         // containing both a reference and ordered state receives the more precise reference diagnostic.
@@ -4576,7 +4491,7 @@ impl<'c> XlaDomain<'c> {
         output_count: usize,
         reference_states: &[ExternalReferenceBinding],
         options: &XlaOptions,
-    ) -> Result<XlaLoweredProgram, XlaDomainError> {
+    ) -> Result<XlaLoweredProgram, Error> {
         if contains_unresolved_state(program) {
             return Err(ProgramError::UnsupportedOperation {
                 message: "discharged program still contains ordered state, which XLA lowering cannot represent"
@@ -4593,12 +4508,12 @@ impl<'c> XlaDomain<'c> {
             .into());
         }
         if !reference_states.is_empty() && !self.target()?.is_fully_addressable_single_process_mesh(&options.mesh) {
-            return Err(XlaDomainError::UnsupportedReferenceAbi {
+            return Err(Error::UnsupportedReferenceAbi {
                 reason: "external reference state requires a fully addressable single-process mesh".to_string(),
             });
         }
         if !reference_states.is_empty() && options.input_bound_bucketing.is_some() {
-            return Err(XlaDomainError::UnsupportedReferenceAbi {
+            return Err(Error::UnsupportedReferenceAbi {
                 reason: "external reference inputs do not support input-bound bucketing".to_string(),
             });
         }
@@ -4607,7 +4522,7 @@ impl<'c> XlaDomain<'c> {
         if let Some(donation_flags) = &options.donation_flags
             && donation_flags.len() != public_input_types.len()
         {
-            return Err(XlaDomainError::InvalidCompilationOptions {
+            return Err(Error::InvalidCompilationOptions {
                 reason: format!(
                     "donation_flags has {} entries but the program has {} flat public input(s)",
                     donation_flags.len(),
@@ -4660,7 +4575,7 @@ impl<'c> XlaDomain<'c> {
                 ))
             })?;
             if input_type.sharding().is_some_and(|sharding| sharding.mesh() != options.mesh.logical_mesh()) {
-                return Err(XlaDomainError::UnsupportedReferenceAbi {
+                return Err(Error::UnsupportedReferenceAbi {
                     reason: format!(
                         "external reference state at logical input {logical_input_index} uses a sharding mesh that \
                          does not match the compilation mesh",
@@ -4668,7 +4583,7 @@ impl<'c> XlaDomain<'c> {
                 });
             }
             if input_type.data_type().is_zero() {
-                return Err(XlaDomainError::UnsupportedReferenceAbi {
+                return Err(Error::UnsupportedReferenceAbi {
                     reason: format!(
                         "external reference state at logical input {logical_input_index} cannot use a zero-space type \
                          because it has no executable buffer",
@@ -4676,7 +4591,7 @@ impl<'c> XlaDomain<'c> {
                 });
             }
             if input_type.memory() != Memory::Device {
-                return Err(XlaDomainError::UnsupportedReferenceAbi {
+                return Err(Error::UnsupportedReferenceAbi {
                     reason: format!(
                         "external reference state at logical input {logical_input_index} must use device memory"
                     ),
@@ -4688,7 +4603,7 @@ impl<'c> XlaDomain<'c> {
                 .iter()
                 .any(|dimension| dimension.value().is_none() && dimension.upper_bound().is_none())
             {
-                return Err(XlaDomainError::UnsupportedReferenceAbi {
+                return Err(Error::UnsupportedReferenceAbi {
                     reason: format!(
                         "external reference state at logical input {logical_input_index} has an unbounded dynamic \
                          dimension",
@@ -4713,7 +4628,7 @@ impl<'c> XlaDomain<'c> {
         for (state, &logical_input_index) in reference_states.iter().zip(&reference_state_input_indices) {
             if effective_input_types[logical_input_index].static_shape().is_none() {
                 if state.output_index().is_some() {
-                    return Err(XlaDomainError::UnsupportedReferenceAbi {
+                    return Err(Error::UnsupportedReferenceAbi {
                         reason: format!(
                             "mutated bounded-dynamic external state input {logical_input_index} is unsupported because \
                              backend alias compatibility has not been verified",
@@ -4721,7 +4636,7 @@ impl<'c> XlaDomain<'c> {
                     });
                 }
                 if !logical_argument_shardings[logical_input_index].is_replicated() {
-                    return Err(XlaDomainError::UnsupportedReferenceAbi {
+                    return Err(Error::UnsupportedReferenceAbi {
                         reason: format!(
                             "bounded-dynamic external state input {logical_input_index} must use replicated sharding",
                         ),
@@ -4764,7 +4679,7 @@ impl<'c> XlaDomain<'c> {
         // elsewhere in the same program. Its `sdy.manual_computation` lowering is meaningless without Shardy on any
         // device count, and bounded-dynamic tensors force Shardy off for the whole module.
         if !use_shardy_partitioner && contains_shard_map(program) {
-            return Err(XlaDomainError::InvalidCompilationOptions {
+            return Err(Error::InvalidCompilationOptions {
                 reason: "bounded-dynamic programs cannot contain shard_map regions because sdy.manual_computation \
                          requires the Shardy partitioner"
                     .to_string(),
@@ -4776,7 +4691,7 @@ impl<'c> XlaDomain<'c> {
                 .chain(output_types.iter().filter_map(ArrayType::sharding))
                 .any(|sharding| !sharding.is_replicated())
             {
-                return Err(XlaDomainError::InvalidCompilationOptions {
+                return Err(Error::InvalidCompilationOptions {
                     reason: "bounded-dynamic multi-device programs currently require fully replicated shardings \
                              because Shardy rejects dynamic tensors"
                         .to_string(),
@@ -4808,8 +4723,7 @@ impl<'c> XlaDomain<'c> {
             target_platform.as_deref(),
             reference_states,
             options.ragged_dot_lowering_strategy,
-        )
-        .map_err(|error| XlaDomainError::Lowering(error.into()))?;
+        )?;
         let (stable_hlo, signature, requires_assertion_handler) = lowered_module.into_parts();
         for (mapping, donation) in signature.input_mapping()[capture_count..].iter().zip(donation_flags.iter_mut()) {
             if mapping.is_none() {
@@ -4853,7 +4767,7 @@ impl<'c> XlaDomain<'c> {
         })
     }
 
-    fn xla_compilation_key(program: &XlaLoweredProgram) -> Result<XlaCompilationKey, XlaDomainError> {
+    fn xla_compilation_key(program: &XlaLoweredProgram) -> Result<XlaCompilationKey, Error> {
         let compilation_options = canonical_compilation_options_bytes(&program.compilation_options);
         let key = XlaPersistentKeyV8 {
             schema_version: XLA_PERSISTENT_KEY_SCHEMA_VERSION,
@@ -4893,10 +4807,7 @@ impl<'c> XlaDomain<'c> {
         Ok(XlaCompilationKey { canonical_bytes: canonical_bytes.into() })
     }
 
-    pub(crate) fn compile_xla_program(
-        &self,
-        program: &XlaLoweredProgram,
-    ) -> Result<XlaCompiledProgram<'c>, XlaDomainError> {
+    pub(crate) fn compile_xla_program(&self, program: &XlaLoweredProgram) -> Result<XlaCompiledProgram<'c>, Error> {
         self.ensure_runtime_requirements(&program.signature, &program.platform_name)?;
         let pjrt_program = PjrtProgram::Mlir { bytecode: program.stable_hlo.as_bytes().to_vec() };
         let compilation_start = Instant::now();
@@ -4940,7 +4851,7 @@ impl<'c> XlaDomain<'c> {
         &self,
         current: &XlaCompiledProgram<'c>,
         replacement: &XlaCompiledProgram<'c>,
-    ) -> Result<(), XlaDomainError> {
+    ) -> Result<(), Error> {
         self.validate_xla_program_owner(current)?;
         self.validate_xla_program_owner(replacement)?;
         validate_xla_replacement_metadata(current.into(), replacement.into())
@@ -4950,7 +4861,7 @@ impl<'c> XlaDomain<'c> {
         &self,
         program: &XlaCompiledProgram<'c>,
         inputs: Vec<XlaArray<'c>>,
-    ) -> Result<Vec<XlaArray<'c>>, XlaDomainError> {
+    ) -> Result<Vec<XlaArray<'c>>, Error> {
         let execution = self.execute_compiled_async(program, inputs)?;
         if execution.output().is_empty() && !program.signature.has_effects() {
             // No output array carries the execution fence out of this call, so an asynchronous execution error would
@@ -4969,7 +4880,7 @@ impl<'c> XlaDomain<'c> {
         Some(key.canonical_bytes.to_vec())
     }
 
-    fn serialize_xla_program(&self, program: &XlaCompiledProgram<'c>) -> Result<Option<Vec<u8>>, XlaDomainError> {
+    fn serialize_xla_program(&self, program: &XlaCompiledProgram<'c>) -> Result<Option<Vec<u8>>, Error> {
         let executable = match program.executable.executable() {
             Ok(executable) => executable,
             Err(ryft_pjrt::Error::Unimplemented { .. }) => return Ok(None),
@@ -5033,7 +4944,7 @@ impl<'c> XlaDomain<'c> {
         Ok(Some(bytes))
     }
 
-    fn deserialize_xla_program(&self, bytes: &[u8]) -> Result<Option<XlaCompiledProgram<'c>>, XlaDomainError> {
+    fn deserialize_xla_program(&self, bytes: &[u8]) -> Result<Option<XlaCompiledProgram<'c>>, Error> {
         let header_size = XLA_PERSISTENT_EXECUTABLE_MAGIC.len() + size_of::<u64>();
         if bytes.len() < header_size {
             return Err(persistent_error("missing persistent executable header"));
@@ -5320,9 +5231,9 @@ impl<'c> CompilationCacheDomain for XlaDomain<'c> {
         // artifact). The stateful transaction trusts this metadata, so a mismatch must be caught before the first
         // call.
         match incompatible_xla_invocation_field(program.into(), compiled.into()) {
-            Some(field) => Err(XlaDomainError::InvalidCompilationOptions {
-                reason: format!("cached executable has incompatible {field}"),
-            }),
+            Some(field) => {
+                Err(Error::InvalidCompilationOptions { reason: format!("cached executable has incompatible {field}") })
+            }
             None => Ok(()),
         }
     }
@@ -5355,11 +5266,11 @@ impl<'c> AnalyzableCompilationDomain for XlaDomain<'c> {
             .analysis
             .get_or_init(|| analyze_xla_program(program).map_err(|error| error.to_string()))
             .clone()
-            .map_err(|reason| XlaDomainError::InvalidCompilationAnalysis { reason })
+            .map_err(|reason| Error::InvalidCompilationAnalysis { reason })
     }
 }
 
-fn flatten_device_assignment(assignment: &ryft_pjrt::DeviceAssignment) -> Result<Vec<u64>, XlaDomainError> {
+fn flatten_device_assignment(assignment: &ryft_pjrt::DeviceAssignment) -> Result<Vec<u64>, Error> {
     let mut devices = Vec::with_capacity(assignment.replica_count() * assignment.computation_count());
     for replica in 0..assignment.replica_count() {
         for partition in 0..assignment.computation_count() {
@@ -5369,15 +5280,13 @@ fn flatten_device_assignment(assignment: &ryft_pjrt::DeviceAssignment) -> Result
     Ok(devices)
 }
 
-pub(crate) fn validate_xla_input_type(declared: &ArrayType, actual: &ArrayType) -> Result<(), XlaDomainError> {
+pub(crate) fn validate_xla_input_type(declared: &ArrayType, actual: &ArrayType) -> Result<(), Error> {
     // Calls of a specialization ordinarily pass inputs of exactly its declared types, which refine them trivially.
     if declared == actual {
         return Ok(());
     }
-    let declared_without_sharding =
-        declared.clone().with_sharding(None).map_err(|error| XlaDomainError::Array(error.into()))?;
-    let actual_without_sharding =
-        actual.clone().with_sharding(None).map_err(|error| XlaDomainError::Array(error.into()))?;
+    let declared_without_sharding = declared.clone().with_sharding(None)?;
+    let actual_without_sharding = actual.clone().with_sharding(None)?;
     if declared_without_sharding.is_refined_by(&actual_without_sharding) {
         Ok(())
     } else {
@@ -5395,15 +5304,12 @@ pub(crate) fn validate_xla_input_type(declared: &ArrayType, actual: &ArrayType) 
 /// [`with_input_shardings`], and lowering rejects staged functions whose input types do not carry them. External
 /// reference inputs are rejected when overrides are present, because holder state derives its effective sharding from
 /// the compiled reference ABI.
-fn apply_input_shardings(
-    input_types: Vec<ArrayIrType>,
-    options: &XlaOptions,
-) -> Result<Vec<ArrayIrType>, XlaDomainError> {
+fn apply_input_shardings(input_types: Vec<ArrayIrType>, options: &XlaOptions) -> Result<Vec<ArrayIrType>, Error> {
     let Some(in_shardings) = options.in_shardings.as_deref() else {
         return Ok(input_types);
     };
     if input_types.iter().any(|r#type| r#type.is_reference()) {
-        return Err(XlaDomainError::UnsupportedReferenceAbi {
+        return Err(Error::UnsupportedReferenceAbi {
             reason: "external reference inputs do not support explicit input shardings".to_string(),
         });
     }
@@ -5416,7 +5322,7 @@ fn apply_input_shardings(
 pub(crate) fn with_input_shardings<In: Parameterized<ArrayIrType>>(
     input_types: In,
     options: &XlaOptions,
-) -> Result<In, XlaDomainError> {
+) -> Result<In, Error> {
     if options.in_shardings.is_none() {
         return Ok(input_types);
     }
@@ -5435,7 +5341,7 @@ fn validate_reference_outputs(
     program: &FlatProgram<XlaDomain<'_>>,
     capture_count: usize,
     output_types: &[ArrayIrType],
-) -> Result<(), XlaDomainError> {
+) -> Result<(), Error> {
     let Some(output_index) = output_types.iter().position(|r#type| r#type.is_reference()) else {
         return Ok(());
     };
@@ -5455,10 +5361,10 @@ fn validate_reference_outputs(
              nor an allocation, and the stateful XLA ABI cannot return it",
         ),
     };
-    Err(XlaDomainError::UnsupportedReferenceAbi { reason })
+    Err(Error::UnsupportedReferenceAbi { reason })
 }
 
-fn validate_output_types(declared: &[ArrayIrType], actual: &[ArrayType]) -> Result<(), XlaDomainError> {
+fn validate_output_types(declared: &[ArrayIrType], actual: &[ArrayType]) -> Result<(), Error> {
     if declared.len() != actual.len() {
         return Err(ProgramError::InvalidOutputCount { expected: declared.len(), actual: actual.len() }.into());
     }
@@ -5474,7 +5380,7 @@ fn validate_output_types(declared: &[ArrayIrType], actual: &[ArrayType]) -> Resu
     Ok(())
 }
 
-pub(crate) fn validate_runtime_outputs(declared: &[ArrayType], outputs: &[XlaArray<'_>]) -> Result<(), XlaDomainError> {
+pub(crate) fn validate_runtime_outputs(declared: &[ArrayType], outputs: &[XlaArray<'_>]) -> Result<(), Error> {
     if declared.len() != outputs.len() {
         return Err(ProgramError::InvalidOutputCount { expected: declared.len(), actual: outputs.len() }.into());
     }
@@ -5489,7 +5395,7 @@ pub(crate) fn validate_runtime_outputs(declared: &[ArrayType], outputs: &[XlaArr
     Ok(())
 }
 
-fn analyze_xla_program(program: &XlaCompiledProgram<'_>) -> Result<XlaCompilationAnalysis, XlaDomainError> {
+fn analyze_xla_program(program: &XlaCompiledProgram<'_>) -> Result<XlaCompilationAnalysis, Error> {
     let executable = program.executable.executable()?;
     let properties = match executable.cost_analysis() {
         Ok(properties) => properties
@@ -5552,18 +5458,18 @@ impl From<&PjrtValue> for XlaAnalysisValue {
 fn numeric_analysis_property(
     properties: &BTreeMap<String, XlaAnalysisValue>,
     names: &[&str],
-) -> Result<Option<f64>, XlaDomainError> {
+) -> Result<Option<f64>, Error> {
     let Some((name, value)) = names.iter().find_map(|name| properties.get(*name).map(|value| (*name, value))) else {
         return Ok(None);
     };
     match value {
         XlaAnalysisValue::Integer(value) => Ok(Some(*value as f64)),
         XlaAnalysisValue::Float(value) => Ok(Some(*value)),
-        _ => Err(XlaDomainError::InvalidCompilationAnalysis { reason: format!("property `{name}` is not numeric") }),
+        _ => Err(Error::InvalidCompilationAnalysis { reason: format!("property `{name}` is not numeric") }),
     }
 }
 
-fn optional_pjrt_analysis<T>(result: Result<T, ryft_pjrt::Error>) -> Result<Option<T>, XlaDomainError> {
+fn optional_pjrt_analysis<T>(result: Result<T, ryft_pjrt::Error>) -> Result<Option<T>, Error> {
     match result {
         Ok(value) => Ok(Some(value)),
         Err(ryft_pjrt::Error::Unimplemented { .. } | ryft_pjrt::Error::Unavailable { .. }) => Ok(None),
@@ -5580,12 +5486,12 @@ fn apply_signature_shardings(
     mut types: Vec<ArrayIrType>,
     shardings: Option<&[Sharding]>,
     kind: &'static str,
-) -> Result<Vec<ArrayIrType>, XlaDomainError> {
+) -> Result<Vec<ArrayIrType>, Error> {
     let Some(shardings) = shardings else {
         return Ok(types);
     };
     if shardings.len() != types.len() {
-        return Err(XlaDomainError::InvalidCompilationOptions {
+        return Err(Error::InvalidCompilationOptions {
             reason: format!(
                 "{kind}_shardings has {} entries but the function has {} flat {kind}put(s)",
                 shardings.len(),
@@ -5595,11 +5501,7 @@ fn apply_signature_shardings(
     }
     for (r#type, sharding) in types.iter_mut().zip(shardings) {
         *r#type = match r#type {
-            ArrayIrType::Array(array_type) => array_type
-                .clone()
-                .with_sharding(sharding.clone())
-                .map_err(|error| XlaDomainError::Array(error.into()))?
-                .into(),
+            ArrayIrType::Array(array_type) => array_type.clone().with_sharding(sharding.clone())?.into(),
             ArrayIrType::Dimension(_) | ArrayIrType::Reference(_) => {
                 return Err(ProgramError::from(TypeError::invalid(format!(
                     "cannot apply an array sharding to type `{type}`",
@@ -5922,7 +5824,7 @@ fn references_data_derived_dimension(r#type: &ArrayIrType, variables: &HashSet<D
 /// transformations. `RyftMasked` operations instead materialize their physical kernel inputs and restore logical
 /// extents in Ryft's lowering. Only configurations with execution evidence are admitted; unbounded gateways and
 /// unsupported consumers are rejected before MLIR construction.
-fn validate_data_dependent_compilation(program: &FlatXlaProgram) -> Result<(), XlaDomainError> {
+fn validate_data_dependent_compilation(program: &FlatXlaProgram) -> Result<(), Error> {
     let mut variables = HashSet::new();
     for region in program.regions() {
         for instruction in region.instructions() {
@@ -6144,7 +6046,7 @@ fn reshard_inputs_if_needed<'c>(
     mesh: &DeviceMesh,
     expected_shardings: &[Sharding],
     inputs: Vec<XlaArray<'c>>,
-) -> Result<Vec<XlaArray<'c>>, XlaDomainError> {
+) -> Result<Vec<XlaArray<'c>>, Error> {
     let needs_reshard = inputs.iter().zip(expected_shardings).any(|(array, expected)| array.sharding() != expected);
     if !needs_reshard {
         return Ok(inputs);
@@ -6157,7 +6059,6 @@ fn reshard_inputs_if_needed<'c>(
                 Ok(array)
             } else {
                 crate::arrays_v0::compiled_reshard::reshard(&array, domain, mesh, expected)
-                    .map_err(XlaDomainError::Array)
             }
         })
         .collect()
@@ -6285,7 +6186,7 @@ fn upload_bounded_input_host_copy<'c>(
     input: &XlaArray<'c>,
     pending: PendingBoundedInputHostCopy<'c>,
     report: &mut BoundedInputMaterializationReport,
-) -> Result<PendingBoundedInputPublication<'c>, XlaDomainError> {
+) -> Result<PendingBoundedInputPublication<'c>, Error> {
     report.device_to_host_shard_copies += pending.host_copy.shard_copy_count();
     let (source_bytes, allocated_merge_buffer) = pending.host_copy.finish_with_measurements()?;
     report.host_merge_buffer_allocations += usize::from(allocated_merge_buffer);
@@ -6309,8 +6210,8 @@ fn upload_bounded_input_host_copy<'c>(
 fn publish_bounded_input_uploads<'c>(
     publications: Vec<PendingBoundedInputPublication<'c>>,
     physical_inputs: &mut [XlaArray<'c>],
-    check_readiness: &mut impl FnMut(&[PendingBoundedInputPublication<'c>]) -> Result<(), XlaDomainError>,
-) -> Result<(), XlaDomainError> {
+    check_readiness: &mut impl FnMut(&[PendingBoundedInputPublication<'c>]) -> Result<(), Error>,
+) -> Result<(), Error> {
     // Readiness is checked for the complete batch before any producer publishes. An error therefore drops every
     // reservation in the batch, caches no failed upload, and leaves all concurrent H2D work issued.
     check_readiness(publications.as_slice())?;
@@ -6337,7 +6238,7 @@ fn materialize_bounded_dynamic_inputs<'c>(
     declared_types: &[ArrayType],
     actual_types: &[ArrayType],
     inputs: Vec<XlaArray<'c>>,
-) -> Result<MaterializedBoundedInputs<'c>, XlaDomainError> {
+) -> Result<MaterializedBoundedInputs<'c>, Error> {
     materialize_bounded_dynamic_inputs_with_readiness(
         domain,
         signature,
@@ -6360,8 +6261,8 @@ fn materialize_bounded_dynamic_inputs_with_readiness<'c>(
     declared_types: &[ArrayType],
     actual_types: &[ArrayType],
     inputs: Vec<XlaArray<'c>>,
-    mut check_readiness: impl FnMut(&[PendingBoundedInputPublication<'c>]) -> Result<(), XlaDomainError>,
-) -> Result<MaterializedBoundedInputs<'c>, XlaDomainError> {
+    mut check_readiness: impl FnMut(&[PendingBoundedInputPublication<'c>]) -> Result<(), Error>,
+) -> Result<MaterializedBoundedInputs<'c>, Error> {
     assert_eq!(declared_types.len(), inputs.len());
     assert_eq!(actual_types.len(), inputs.len());
     let physical_types = signature.physical_input_types(declared_types);
@@ -6507,7 +6408,7 @@ fn pad_dense_array_bytes(
     source_shape: &[usize],
     target_shape: &[usize],
     data_type: DataType,
-) -> Result<Vec<u8>, XlaDomainError> {
+) -> Result<Vec<u8>, Error> {
     pad_dense_array_bytes_with_target_allocation_count(source, source_shape, target_shape, data_type)
         .map(|(bytes, _)| bytes)
 }
@@ -6521,7 +6422,7 @@ fn pad_dense_array_bytes_with_target_allocation_count(
     source_shape: &[usize],
     target_shape: &[usize],
     data_type: DataType,
-) -> Result<(Vec<u8>, usize), XlaDomainError> {
+) -> Result<(Vec<u8>, usize), Error> {
     if source_shape.len() != target_shape.len()
         || source_shape.iter().zip(target_shape).any(|(source, target)| source > target)
     {
@@ -6622,7 +6523,7 @@ fn materialize_zero_space_carriers<'c>(
     domain: &XlaDomain<'c>,
     physical_input_types: &[ArrayType],
     inputs: Vec<XlaArray<'c>>,
-) -> Result<Vec<XlaArray<'c>>, XlaDomainError> {
+) -> Result<Vec<XlaArray<'c>>, Error> {
     assert_eq!(physical_input_types.len(), inputs.len());
     physical_input_types
         .iter()
@@ -6633,10 +6534,8 @@ fn materialize_zero_space_carriers<'c>(
             }
             input.block_until_ready()?;
             let carrier_type = physical_type.clone().with_data_type(DataType::Boolean);
-            let element_count = carrier_type
-                .element_count()
-                .map_err(Error::from)?
-                .expect("physical bounded input types should only have static shapes");
+            let element_count =
+                carrier_type.element_count()?.expect("physical bounded input types should only have static shapes");
             Ok(XlaArray::from_host_buffer(domain, carrier_type, input.mesh().clone(), vec![0u8; element_count])?)
         })
         .collect()
@@ -6649,7 +6548,7 @@ fn reconstruct_compiled_outputs<'c>(
     physical_outputs: &mut [Option<Vec<Buffer<'c>>>],
     fence: ryft_pjrt::ExecutionFence,
     logical_indices: impl IntoIterator<Item = usize>,
-) -> Result<Vec<XlaArray<'c>>, XlaDomainError> {
+) -> Result<Vec<XlaArray<'c>>, Error> {
     // Programs with only static outputs build each output directly from its planned layout, without querying the
     // returned buffers or re-deriving their placement.
     if let Some(layouts) = &program.plan.output_layouts {
@@ -6672,7 +6571,7 @@ fn reconstruct_compiled_outputs<'c>(
             .collect();
     }
     let logical_indices = logical_indices.into_iter().collect::<Vec<_>>();
-    let scalar_type = ArrayType::scalar(DataType::I64).replicated(&program.mesh).map_err(ArrayError::from)?;
+    let scalar_type = ArrayType::scalar(DataType::I64).replicated(&program.mesh)?;
     let mut output_extents = BTreeMap::new();
     for output_dimension in program
         .signature
@@ -6740,7 +6639,7 @@ fn reconstruct_compiled_outputs<'c>(
                     let output_type = output_type.clone().with_shape(Shape::new(dimensions));
                     let output_type = match output_type.sharding() {
                         Some(_) => output_type,
-                        None => output_type.replicated(&program.mesh).map_err(ArrayError::from)?,
+                        None => output_type.replicated(&program.mesh)?,
                     };
                     Ok(XlaArray::from_canonical_addressable_buffers(
                         domain,
@@ -6768,7 +6667,7 @@ fn validate_compiled_output_refinements(
     input_refinements: &<ArrayType as Type>::Refinements,
     declared_output_types: &[ArrayType],
     outputs: &[XlaArray<'_>],
-) -> Result<(), XlaDomainError> {
+) -> Result<(), Error> {
     let mut closed_identities = Vec::new();
     for (_, identity) in program.input_types.iter().chain(program.output_types.iter()).flat_map(Type::identities) {
         if !closed_identities.contains(identity) {
@@ -6794,7 +6693,7 @@ impl<'c> XlaDomain<'c> {
         mut arguments: ExecuteArguments<'c>,
         array_output_count: usize,
         after_submission: impl FnOnce(&ExecutionFence),
-    ) -> Result<Execution<Vec<Vec<Buffer<'c>>>>, XlaDomainError> {
+    ) -> Result<Execution<Vec<Vec<Buffer<'c>>>>, Error> {
         ensure_effect_dispatch_allowed()?;
         let addressable_device_count = arguments.addressable_device_ids().len();
         let ordered = program.signature.has_ordered_io();
@@ -6807,7 +6706,7 @@ impl<'c> XlaDomain<'c> {
                 .iter()
                 .any(|platform| program.platform_name.eq_ignore_ascii_case(platform))
             {
-                return Err(XlaDomainError::EffectScope {
+                return Err(Error::EffectScope {
                     reason: format!(
                         "native ordered I/O transport is not yet verified on platform `{}`",
                         program.platform_name
@@ -6815,13 +6714,13 @@ impl<'c> XlaDomain<'c> {
                 });
             }
             if !self.target()?.is_fully_addressable_single_process_mesh(&program.mesh) {
-                return Err(XlaDomainError::EffectScope {
+                return Err(Error::EffectScope {
                     reason: "ordered I/O requires a fixed fully addressable single-process device assignment"
                         .to_string(),
                 });
             }
             if addressable_device_count > 1 && !program.signature.has_device_ordered_io() {
-                return Err(XlaDomainError::EffectScope {
+                return Err(Error::EffectScope {
                     reason: "multi-device ordered I/O requires every ordered occurrence to declare `DeviceOrderedIo`"
                         .to_string(),
                 });
@@ -6836,7 +6735,7 @@ impl<'c> XlaDomain<'c> {
                     .predecessor
                     .as_ref()
                     .map_or(Ok(None), |previous| previous.carrier())
-                    .map_err(|error| XlaDomainError::EffectScope { reason: error.to_string() })?;
+                    .map_err(|error| Error::EffectScope { reason: error.to_string() })?;
                 let tokens = match predecessor {
                     Some(tokens) => tokens,
                     None => {
@@ -6849,7 +6748,7 @@ impl<'c> XlaDomain<'c> {
                                 .find(|candidate| {
                                     Device::from_pjrt(*candidate).is_ok_and(|candidate| candidate.id() == device_id)
                                 })
-                                .ok_or_else(|| XlaDomainError::EffectScope {
+                                .ok_or_else(|| Error::EffectScope {
                                     reason: "ordered I/O device is not addressable".to_string(),
                                 })?;
                             let manager = client.host_to_device_transfer_manager(
@@ -6876,7 +6775,7 @@ impl<'c> XlaDomain<'c> {
         );
         #[cfg(test)]
         if take_stateful_failure_injection(StatefulFailureInjection::BeforeSubmission) {
-            return Err(XlaDomainError::InvalidCompilationOptions {
+            return Err(Error::InvalidCompilationOptions {
                 reason: "injected failure before execution submission".to_string(),
             });
         }
@@ -6895,7 +6794,7 @@ impl<'c> XlaDomain<'c> {
                 Some(unsafe { runtime.as_ref().unwrap().execution_context(self.client()) }?)
             }
             #[cfg(not(feature = "rocm"))]
-            return Err(XlaDomainError::InvalidCompilationOptions {
+            return Err(Error::InvalidCompilationOptions {
                 reason: "rocm artifact execution requires the `rocm` feature".into(),
             });
         } else {
@@ -6955,13 +6854,13 @@ impl<'c> XlaDomain<'c> {
             reservation.published = true;
         }
         if let Some(actual) = invalid_count {
-            return Err(XlaDomainError::Pjrt(ryft_pjrt::Error::invalid_argument(format!(
+            return Err(Error::Pjrt(ryft_pjrt::Error::invalid_argument(format!(
                 "expected {output_count} output(s) per device, but got {actual}",
             ))));
         }
         #[cfg(test)]
         if take_stateful_failure_injection(StatefulFailureInjection::AfterHandoff) {
-            return Err(XlaDomainError::InvalidCompilationOptions {
+            return Err(Error::InvalidCompilationOptions {
                 reason: "injected failure after execution handoff".to_string(),
             });
         }
@@ -7011,9 +6910,9 @@ mod tests {
         ReferenceNewOperation, ReferenceRead, ReferenceReadOperation, ReferenceSwapOperation, ReferenceType,
         ReferenceWrite, ReferenceWriteOperation, Reshape, ReshapeOperation, RngBitGeneratorOperation,
         ScaledDotOperation, ScanOperation, Scatter, ScatterDimensionNumbers, ScatterMode, ScatterOperation,
-        ScatterOptions, SelectOperation, ShardMap, ShardMapOperation, Sharding, ShardingDimension, SliceOperation,
-        SortDirection, SortOperation, StagedFunction, StagingContext, StaticShape, SubOperation, TracingContext, Value,
-        WhileOperation, ZeroOperation, batch, shard_map,
+        ScatterOptions, SelectOperation, ShardMapBoundary, ShardMapOperation, Sharding, ShardingDimension,
+        SliceOperation, SortDirection, SortOperation, StagedFunction, StagingContext, StaticShape, SubOperation,
+        TracingContext, Value, WhileOperation, ZeroOperation, batch, shard_map,
     };
     use ryft_pjrt::{ClientOptions, CpuClientOptions, load_cpu_plugin};
     #[cfg(feature = "cuda-13")]
@@ -7742,8 +7641,12 @@ mod tests {
         let sum_over_x = ParallelReduceOperation::new(ReductionKind::Sum, "x".to_string()).with_mesh(mesh.clone());
         let (shard_map, global_input_types, body) = match case {
             ShardMapDifferentialCase::IdentityAndSum => {
-                let shard_map =
-                    ShardMap::new(mesh.clone(), vec![sharded("x")], vec![sharded("x"), replicated], vec!["x".into()]);
+                let shard_map = ShardMapBoundary::new(
+                    mesh.clone(),
+                    vec![sharded("x")],
+                    vec![sharded("x"), replicated],
+                    vec!["x".into()],
+                );
                 let shard_map = shard_map.unwrap();
                 let global_type = f32_type(&[4], &sharded("x"));
                 let local_type = shard_map.local_input_type(0, &global_type).unwrap();
@@ -7754,7 +7657,8 @@ mod tests {
                 (shard_map, vec![global_type.into()], body)
             }
             ShardMapDifferentialCase::AxisIndex => {
-                let shard_map = ShardMap::new(mesh.clone(), vec![sharded("x")], vec![sharded("x")], vec!["x".into()]);
+                let shard_map =
+                    ShardMapBoundary::new(mesh.clone(), vec![sharded("x")], vec![sharded("x")], vec!["x".into()]);
                 let shard_map = shard_map.unwrap();
                 let global_type = f32_type(&[2], &sharded("x"));
                 let local_type = shard_map.local_input_type(0, &global_type).unwrap();
@@ -7769,7 +7673,8 @@ mod tests {
                 (shard_map, vec![global_type.into()], body)
             }
             ShardMapDifferentialCase::AllGather => {
-                let shard_map = ShardMap::new(mesh.clone(), vec![sharded("x")], vec![replicated], vec!["x".into()]);
+                let shard_map =
+                    ShardMapBoundary::new(mesh.clone(), vec![sharded("x")], vec![replicated], vec!["x".into()]);
                 let shard_map = shard_map.unwrap();
                 let global_type = f32_type(&[4], &sharded("x"));
                 let local_type = shard_map.local_input_type(0, &global_type).unwrap();
@@ -7792,7 +7697,8 @@ mod tests {
                 let columns =
                     Sharding::new(mesh.clone(), vec![ShardingDimension::Replicated, ShardingDimension::sharded(["x"])]);
                 let (rows, columns) = (rows.unwrap(), columns.unwrap());
-                let shard_map = ShardMap::new(mesh.clone(), vec![rows.clone()], vec![columns], vec!["x".into()]);
+                let shard_map =
+                    ShardMapBoundary::new(mesh.clone(), vec![rows.clone()], vec![columns], vec!["x".into()]);
                 let shard_map = shard_map.unwrap();
                 let global_type = f32_type(&[2, 4], &rows);
                 let local_type = shard_map.local_input_type(0, &global_type).unwrap();
@@ -7804,7 +7710,8 @@ mod tests {
                 (shard_map, vec![global_type.into()], body)
             }
             ShardMapDifferentialCase::Permute => {
-                let shard_map = ShardMap::new(mesh.clone(), vec![sharded("x")], vec![sharded("x")], vec!["x".into()]);
+                let shard_map =
+                    ShardMapBoundary::new(mesh.clone(), vec![sharded("x")], vec![sharded("x")], vec!["x".into()]);
                 let shard_map = shard_map.unwrap();
                 let global_type = f32_type(&[4], &sharded("x"));
                 let local_type = shard_map.local_input_type(0, &global_type).unwrap();
@@ -7816,12 +7723,14 @@ mod tests {
                 (shard_map, vec![global_type.into()], body)
             }
             ShardMapDifferentialCase::Nested => {
-                let shard_map = ShardMap::new(mesh.clone(), vec![sharded("x")], vec![replicated], vec!["x".into()]);
+                let shard_map =
+                    ShardMapBoundary::new(mesh.clone(), vec![sharded("x")], vec![replicated], vec!["x".into()]);
                 let shard_map = shard_map.unwrap();
                 let global_type = f32_type(&[4], &sharded("x"));
                 let outer_local_type = shard_map.local_input_type(0, &global_type).unwrap();
                 let inner_shard_map =
-                    ShardMap::new(mesh.clone(), vec![sharded("y")], vec![sharded("y")], vec!["y".into()]).unwrap();
+                    ShardMapBoundary::new(mesh.clone(), vec![sharded("y")], vec![sharded("y")], vec!["y".into()])
+                        .unwrap();
                 let inner_local_type = inner_shard_map.local_input_type(0, &outer_local_type).unwrap();
                 let inner_body =
                     build_differential_program::<V, O>(vec![inner_local_type.into()], |builder, inputs| {
@@ -7843,7 +7752,8 @@ mod tests {
             }
             ShardMapDifferentialCase::Reference => {
                 let shard_map =
-                    ShardMap::new(mesh.clone(), vec![sharded("x"); 2], vec![sharded("x")], vec!["x".into()]).unwrap();
+                    ShardMapBoundary::new(mesh.clone(), vec![sharded("x"); 2], vec![sharded("x")], vec!["x".into()])
+                        .unwrap();
                 let global_type = f32_type(&[4], &sharded("x"));
                 let local_type = shard_map.local_input_type(0, &global_type).unwrap();
                 let input_types = vec![ReferenceType::new(local_type.clone()).into(), local_type.into()];
@@ -7860,8 +7770,12 @@ mod tests {
             }
             ShardMapDifferentialCase::VaryingIndexReference => {
                 let table_sharding = Sharding::replicated(mesh.clone(), 2);
-                let shard_map =
-                    ShardMap::new(mesh.clone(), vec![table_sharding.clone()], vec![sharded("x")], vec!["x".into()]);
+                let shard_map = ShardMapBoundary::new(
+                    mesh.clone(),
+                    vec![table_sharding.clone()],
+                    vec![sharded("x")],
+                    vec!["x".into()],
+                );
                 let shard_map = shard_map.unwrap();
                 let global_type = f32_type(&[2, 3], &table_sharding);
                 let local_type = shard_map.local_input_type(0, &global_type).unwrap();
@@ -7882,7 +7796,7 @@ mod tests {
             }
             ShardMapDifferentialCase::ReplicatedReference => {
                 let shard_map =
-                    ShardMap::new(mesh.clone(), vec![replicated.clone()], vec![sharded("x")], vec!["x".into()]);
+                    ShardMapBoundary::new(mesh.clone(), vec![replicated.clone()], vec![sharded("x")], vec!["x".into()]);
                 let shard_map = shard_map.unwrap();
                 let global_type = f32_type(&[2], &replicated);
                 let local_type = shard_map.local_input_type(0, &global_type).unwrap();
@@ -8108,9 +8022,11 @@ mod tests {
         // A topology change cannot reach resharding, donation, or PJRT execution; the retained input stays readable.
         assert!(matches!(
             domain.prepare_compiled_execution(&program, vec![input.clone()], &[]),
-            Err(XlaDomainError::Kernel(crate::kernels::KernelEmbeddingError::Invalid { message }))
-                if message == "cross-process kernel execution requires a qualified collective ordering and \
-                               completion contract",
+            Err(error)
+                if matches!(error.downcast_custom::<crate::kernels::KernelEmbeddingError>(),
+                    Some(crate::kernels::KernelEmbeddingError::Invalid { message })
+                        if message == "cross-process kernel execution requires a qualified collective ordering and \
+                                       completion contract"),
         ));
         assert_eq!(read_f32s(&client, &input), vec![2.0, 5.0]);
     }
@@ -8155,42 +8071,42 @@ mod tests {
         };
         let replacement = XlaInvocationMetadata { kernel_execution_facts: Some(b"changed"), ..current };
         assert!(matches!(validate_xla_replacement_metadata(current, replacement),
-            Err(XlaDomainError::InvalidCompilationOptions { reason })
+            Err(Error::InvalidCompilationOptions { reason })
                 if reason == "replacement executable has incompatible kernel execution facts"));
         let cuda_signature = signature.clone().with_cuda_kernel_runtime(true);
         let replacement = XlaInvocationMetadata { signature: &cuda_signature, ..current };
         assert!(matches!(validate_xla_replacement_metadata(current, replacement),
-            Err(XlaDomainError::InvalidCompilationOptions { reason })
+            Err(Error::InvalidCompilationOptions { reason })
                 if reason == "replacement executable has incompatible executable signature"));
         let rocm_signature = signature.clone().with_rocm_kernel_runtime(true);
         let replacement = XlaInvocationMetadata { signature: &rocm_signature, ..current };
         assert!(matches!(validate_xla_replacement_metadata(current, replacement),
-            Err(XlaDomainError::InvalidCompilationOptions { reason })
+            Err(Error::InvalidCompilationOptions { reason })
                 if reason == "replacement executable has incompatible executable signature"));
         let replacement = XlaInvocationMetadata { donation_flags: &[true], ..current };
 
         assert!(matches!(
             validate_xla_replacement_metadata(current, replacement),
-            Err(XlaDomainError::InvalidCompilationOptions { reason })
+            Err(Error::InvalidCompilationOptions { reason })
                 if reason == "replacement executable has incompatible donation flags",
         ));
         let replacement = XlaInvocationMetadata { output_count: 1, ..current };
         assert!(matches!(
             validate_xla_replacement_metadata(current, replacement),
-            Err(XlaDomainError::InvalidCompilationOptions { reason })
+            Err(Error::InvalidCompilationOptions { reason })
                 if reason == "replacement executable has incompatible output count",
         ));
         let state = ExternalReferenceBinding::new(ReferenceSource::Input { index: 0 }, None);
         let replacement = XlaInvocationMetadata { reference_states: std::slice::from_ref(&state), ..current };
         assert!(matches!(
             validate_xla_replacement_metadata(current, replacement),
-            Err(XlaDomainError::InvalidCompilationOptions { reason })
+            Err(Error::InvalidCompilationOptions { reason })
                 if reason == "replacement executable has incompatible reference-state signature",
         ));
         let replacement = XlaInvocationMetadata { requires_assertion_handler: true, ..current };
         assert!(matches!(
             validate_xla_replacement_metadata(current, replacement),
-            Err(XlaDomainError::InvalidCompilationOptions { reason })
+            Err(Error::InvalidCompilationOptions { reason })
                 if reason == "replacement executable has incompatible assertion-handler requirement",
         ));
 
@@ -8218,7 +8134,7 @@ mod tests {
         let different = XlaInvocationMetadata { input_types: static_types.as_slice(), ..current };
         assert!(matches!(
             validate_xla_replacement_metadata(left, different),
-            Err(XlaDomainError::InvalidCompilationOptions { reason })
+            Err(Error::InvalidCompilationOptions { reason })
                 if reason == "replacement executable has incompatible boundary types",
         ));
     }
@@ -10553,7 +10469,7 @@ mod tests {
         fn trace_data_derived<'c>(
             extent: DimensionVariable,
             inputs: Vec<CompilationTracer<XlaDomain<'c>>>,
-        ) -> Result<CompilationTracer<XlaDomain<'c>>, XlaDomainError> {
+        ) -> Result<CompilationTracer<XlaDomain<'c>>, Error> {
             let [size, value] = inputs.as_slice() else {
                 return Err(ProgramError::InvalidInputCount { expected: 2, actual: inputs.len() }.into());
             };
@@ -11134,7 +11050,7 @@ mod tests {
             .unwrap();
             assert!(matches!(
                 domain.execute_compiled_async(&compiled, vec![zero, value]),
-                Err(XlaDomainError::Xla(Error::PjrtError(ryft_pjrt::Error::InvalidArgument { message, .. })))
+                Err(Error::Pjrt(ryft_pjrt::Error::InvalidArgument { message, .. }))
                     if message == "erased producer failed",
             ));
         }
@@ -12074,7 +11990,7 @@ mod tests {
         fn trace<'c>(
             extent: DimensionVariable,
             inputs: Vec<CompilationTracer<XlaDomain<'c>>>,
-        ) -> Result<CompilationTracer<XlaDomain<'c>>, XlaDomainError> {
+        ) -> Result<CompilationTracer<XlaDomain<'c>>, Error> {
             let [size, value] = inputs.as_slice() else {
                 return Err(ProgramError::InvalidInputCount { expected: 2, actual: inputs.len() }.into());
             };
@@ -12671,7 +12587,7 @@ mod tests {
         let execute = || {
             let outputs = domain.execute_xla_program(&compiled, vec![input.clone(), input.clone(), input.clone()])?;
             outputs[0].block_until_ready()?;
-            Ok::<_, XlaDomainError>(())
+            Ok::<_, Error>(())
         };
         // The Spark idles at its lowest power state, so warm the fused kernel long enough for clocks to stabilize
         // before collecting synchronized samples.
@@ -13020,7 +12936,7 @@ mod tests {
             .unwrap();
         assert!(matches!(
             domain.lower_xla_program(&program, 0, &XlaOptions::new(mesh.clone())),
-            Err(XlaDomainError::Tracing(ProgramError::InvalidArgument { message }))
+            Err(Error::Core(ryft_core::Error::Program(ProgramError::InvalidArgument { message })))
                 if message == "data-derived dimension `unbounded` with bounds [0, ∞) needs a finite upper bound \
                     for XLA compilation",
         ));
@@ -13048,7 +12964,7 @@ mod tests {
             .unwrap();
         assert!(matches!(
             domain.lower_xla_program(&program, 0, &XlaOptions::new(mesh.clone())),
-            Err(XlaDomainError::Tracing(ProgramError::UnsupportedOperation { message }))
+            Err(Error::Core(ryft_core::Error::Program(ProgramError::UnsupportedOperation { message })))
                 if message == "operation `custom_call` cannot consume data-derived dimensions during XLA lowering \
                     because custom-call physical-padding semantics are opaque",
         ));
@@ -13071,7 +12987,7 @@ mod tests {
             .unwrap();
         assert!(matches!(
             domain.lower_xla_program(&program, 0, &XlaOptions::new(mesh.clone())),
-            Err(XlaDomainError::Tracing(ProgramError::UnsupportedOperation { message }))
+            Err(Error::Core(ryft_core::Error::Program(ProgramError::UnsupportedOperation { message })))
                 if message == "operation `reduce` cannot consume data-derived dimensions during XLA lowering \
                     because mean over a dynamically sized reduction axis is not supported by the XLA lowering",
         ));
@@ -13096,7 +13012,7 @@ mod tests {
             .unwrap();
         assert!(matches!(
             domain.lower_xla_program(&program, 0, &XlaOptions::new(mesh.clone())),
-            Err(XlaDomainError::Tracing(ProgramError::UnsupportedOperation { message }))
+            Err(Error::Core(ryft_core::Error::Program(ProgramError::UnsupportedOperation { message })))
                 if message == "operation `print` cannot consume data-derived dimensions during XLA lowering because \
                     print exposes the physical representation of its operand",
         ));
@@ -13128,7 +13044,7 @@ mod tests {
             .unwrap();
         assert!(matches!(
             domain.lower_xla_program(&program, 0, &XlaOptions::new(mesh.clone())),
-            Err(XlaDomainError::Tracing(ProgramError::UnsupportedOperation { message }))
+            Err(Error::Core(ryft_core::Error::Program(ProgramError::UnsupportedOperation { message })))
                 if message == "operation `rng_bit_generator` cannot consume data-derived dimensions during XLA \
                     lowering because random generation advances state according to physical rather than logical \
                     element count",
@@ -13170,7 +13086,7 @@ mod tests {
             .unwrap();
         assert!(matches!(
             domain.lower_xla_program(&program, 0, &XlaOptions::new(mesh)),
-            Err(XlaDomainError::Tracing(ProgramError::UnsupportedOperation { message }))
+            Err(Error::Core(ryft_core::Error::Program(ProgramError::UnsupportedOperation { message })))
                 if message == "operation `scatter` cannot consume data-derived dimensions during XLA lowering because \
                     add-scatter padding semantics have not been verified for data-derived dimensions",
         ));
@@ -13178,9 +13094,7 @@ mod tests {
 
     #[test]
     fn test_input_bound_bucketing_reuses_power_of_two_specializations() {
-        fn trace<'c>(
-            input: CompilationTracer<XlaDomain<'c>>,
-        ) -> Result<CompilationTracer<XlaDomain<'c>>, XlaDomainError> {
+        fn trace<'c>(input: CompilationTracer<XlaDomain<'c>>) -> Result<CompilationTracer<XlaDomain<'c>>, Error> {
             let context = input.context().clone();
             Ok(context.bind(AddOperation::new(), Vec::new(), &[input.clone(), input])?.remove(0))
         }
@@ -13237,7 +13151,7 @@ mod tests {
                 &XlaOptions::new(single_device_mesh.clone())
                     .with_input_bound_bucketing(XlaInputBoundBucketing::PowerOfTwo),
             ),
-            Err(XlaDomainError::InvalidCompilationOptions { reason })
+            Err(Error::InvalidCompilationOptions { reason })
                 if reason == format!(
                     "input-bound bucketing only supports array inputs, but input 0 has first-class dimension type {}",
                     dimension_type,
@@ -13259,7 +13173,7 @@ mod tests {
                 &XlaOptions::new(single_device_mesh.clone())
                     .with_input_bound_bucketing(XlaInputBoundBucketing::PowerOfTwo),
             ),
-            Err(XlaDomainError::UnsupportedReferenceAbi { reason })
+            Err(Error::UnsupportedReferenceAbi { reason })
                 if reason == "external reference input 0 does not support input-bound bucketing",
         ));
         assert!(matches!(
@@ -13269,7 +13183,7 @@ mod tests {
                 &XlaOptions::new(single_device_mesh.clone())
                     .with_input_bound_bucketing(XlaInputBoundBucketing::PowerOfTwo),
             ),
-            Err(XlaDomainError::UnsupportedReferenceAbi { reason })
+            Err(Error::UnsupportedReferenceAbi { reason })
                 if reason == "external reference inputs do not support input-bound bucketing",
         ));
 
@@ -13284,7 +13198,7 @@ mod tests {
                 &XlaOptions::new(multi_device_mesh)
                     .with_input_bound_bucketing(XlaInputBoundBucketing::PowerOfTwo),
             ),
-            Err(XlaDomainError::InvalidCompilationOptions { reason })
+            Err(Error::InvalidCompilationOptions { reason })
                 if reason == "input-bound bucketing is unsupported on multi-device meshes because bucketed dynamic \
                     signatures require disabling the Shardy partitioner",
         ));
@@ -13296,7 +13210,7 @@ mod tests {
                 &XlaOptions::new(domain_mesh(&multi_device_client, "x", 2))
                     .with_input_bound_bucketing(XlaInputBoundBucketing::PowerOfTwo),
             ),
-            Err(XlaDomainError::InvalidCompilationOptions { reason })
+            Err(Error::InvalidCompilationOptions { reason })
                 if reason == "input-bound bucketing is unsupported on multi-device meshes because bucketed dynamic \
                     signatures require disabling the Shardy partitioner",
         ));
@@ -13373,7 +13287,8 @@ mod tests {
             .unwrap();
         let manual_sharding = Sharding::new(manual_mesh.clone(), vec![ShardingDimension::sharded(["x"])]).unwrap();
         let shard_map =
-            ShardMap::new(manual_mesh, vec![manual_sharding.clone()], vec![manual_sharding], Vec::new()).unwrap();
+            ShardMapBoundary::new(manual_mesh, vec![manual_sharding.clone()], vec![manual_sharding], Vec::new())
+                .unwrap();
         let local_type = shard_map.local_input_type(0, &global_type).unwrap();
 
         // A `shard_map` body always has static boundary types, so it can coexist with dynamic tensors that are staged
@@ -13618,7 +13533,7 @@ mod tests {
             _: Vec<XlaConstant>,
             captures: Vec<ryft_core::compilation::CompilationTracer<XlaDomain<'c>>>,
             input: ryft_core::compilation::CompilationTracer<XlaDomain<'c>>,
-        ) -> Result<ryft_core::compilation::CompilationTracer<XlaDomain<'c>>, XlaDomainError> {
+        ) -> Result<ryft_core::compilation::CompilationTracer<XlaDomain<'c>>, Error> {
             let capture = ValueProjection::<ArrayType>::into_projected(captures.into_iter().next().unwrap())
                 .map_err(ProgramError::from)?;
             let input = ValueProjection::<ArrayType>::into_projected(input).map_err(ProgramError::from)?;
@@ -13680,7 +13595,7 @@ mod tests {
             serde_json::from_slice(&bytes[header_size..metadata_end]).unwrap();
         missing.requires_cuda_kernel_runtime = true;
         assert!(matches!(domain.deserialize_program(&encode(missing)),
-            Err(XlaDomainError::InvalidPersistentExecutable { reason })
+            Err(Error::InvalidPersistentExecutable { reason })
                 if reason == "cuda kernel executable is missing execution facts"));
 
         let legacy: serde_json::Value = serde_json::from_slice(&bytes[header_size..metadata_end]).unwrap();
@@ -13691,7 +13606,7 @@ mod tests {
         rocm.requires_rocm_kernel_runtime = true;
         assert_eq!(serde_json::to_value(&rocm).unwrap()["requires_rocm_kernel_runtime"], true);
         assert!(matches!(domain.deserialize_program(&encode(rocm)),
-            Err(XlaDomainError::InvalidPersistentExecutable { reason })
+            Err(Error::InvalidPersistentExecutable { reason })
                 if reason == "rocm kernel executable is missing execution facts"));
 
         let mut invalid_signature_metadata: XlaPersistentExecutableMetadataV8 =
@@ -13704,7 +13619,7 @@ mod tests {
         invalid_signature.extend_from_slice(&bytes[metadata_end..]);
         assert!(matches!(
             domain.deserialize_program(invalid_signature.as_slice()),
-            Err(XlaDomainError::InvalidPersistentExecutable { .. }),
+            Err(Error::InvalidPersistentExecutable { .. }),
         ));
 
         let mut incompatible_metadata: XlaPersistentExecutableMetadataV8 =
@@ -13727,7 +13642,7 @@ mod tests {
         // A restored program owns the complete declaration contract, including the hidden capture prefix.
         assert!(matches!(
             domain.execute(&restored, vec![XlaValue::Array(capture.clone())]),
-            Err(XlaDomainError::Tracing(ProgramError::InvalidInputCount { expected: 2, actual: 1 })),
+            Err(Error::Core(ryft_core::Error::Program(ProgramError::InvalidInputCount { expected: 2, actual: 1 }))),
         ));
         let wrong_type = f64_vector(&domain, &mesh, &[1.0, 2.0, 3.0, 4.0]);
         for index in 0..2 {
@@ -13740,7 +13655,8 @@ mod tests {
             inputs[index] = XlaValue::Array(wrong_type.clone());
             assert!(matches!(
                 domain.execute(&restored, inputs),
-                Err(XlaDomainError::Tracing(ProgramError::InvalidArgument { message })) if message == expected,
+                Err(Error::Core(ryft_core::Error::Program(ProgramError::InvalidArgument { message })))
+                    if message == expected,
             ));
         }
         let outputs = domain.execute(&restored, vec![XlaValue::Array(capture), XlaValue::Array(input)]).unwrap();
@@ -13898,7 +13814,7 @@ mod tests {
             consumer(CompilationArtifactExchangePolicy::RequireSharing { timeout: Duration::from_secs(5) });
         assert!(matches!(
             staged.lower(&required_consumer).unwrap().compile(&required_consumer),
-            Err(XlaDomainError::Tracing(ProgramError::InvalidArgument { message }))
+            Err(Error::Core(ryft_core::Error::Program(ProgramError::InvalidArgument { message })))
                 if message == "compilation artifact exchange requirement was not satisfied: received compilation \
                                artifact is incompatible: invalid compilation options: cached executable has \
                                incompatible donation flags",
@@ -13914,10 +13830,7 @@ mod tests {
             .unwrap();
         let domain = XlaSession::new(&client).domain();
 
-        assert!(matches!(
-            domain.deserialize_program(b"truncated"),
-            Err(XlaDomainError::InvalidPersistentExecutable { .. }),
-        ));
+        assert!(matches!(domain.deserialize_program(b"truncated"), Err(Error::InvalidPersistentExecutable { .. }),));
         let mut legacy = b"RYFTXLA5".to_vec();
         legacy.extend_from_slice(&0u64.to_le_bytes());
         assert!(domain.deserialize_program(legacy.as_slice()).unwrap().is_none());
@@ -14290,7 +14203,7 @@ mod tests {
             _: Vec<XlaConstant>,
             _: Vec<CompilationTracer<XlaDomain<'c>>>,
             input: CompilationTracer<XlaDomain<'c>>,
-        ) -> Result<CompilationTracer<XlaDomain<'c>>, XlaDomainError> {
+        ) -> Result<CompilationTracer<XlaDomain<'c>>, Error> {
             Ok(input)
         }
         assert!(matches!(
@@ -14301,7 +14214,7 @@ mod tests {
             )
             .and_then(|staged| staged.lower(&domain))
             .map(|_| ()),
-            Err(XlaDomainError::UnsupportedReferenceAbi { reason })
+            Err(Error::UnsupportedReferenceAbi { reason })
                 if reason == "external reference inputs do not support explicit input shardings",
         ));
 
@@ -14312,7 +14225,7 @@ mod tests {
             _: Vec<XlaConstant>,
             _: Vec<CompilationTracer<XlaDomain<'c>>>,
             input: CompilationTracer<XlaDomain<'c>>,
-        ) -> Result<CompilationTracer<XlaDomain<'c>>, XlaDomainError> {
+        ) -> Result<CompilationTracer<XlaDomain<'c>>, Error> {
             Ok(input.reference_new()?)
         }
         assert!(matches!(
@@ -14323,7 +14236,7 @@ mod tests {
             )
             .and_then(|staged| staged.lower(&domain))
             .map(|_| ()),
-            Err(XlaDomainError::UnsupportedReferenceAbi { reason })
+            Err(Error::UnsupportedReferenceAbi { reason })
                 if reason == "output 0 is a reference allocated inside the program and cannot be returned through \
                               the stateful XLA ABI, which has no protocol to turn a backend array into a host \
                               reference",
@@ -14339,7 +14252,7 @@ mod tests {
             )
             .and_then(|staged| staged.lower(&domain))
             .map(|_| ()),
-            Err(XlaDomainError::UnsupportedReferenceAbi { reason })
+            Err(Error::UnsupportedReferenceAbi { reason })
                 if reason == "output 0 forwards the external reference bound at input 0, and the stateful XLA ABI \
                               does not return forwarded references; read the reference after the call instead",
         ));
@@ -14361,7 +14274,7 @@ mod tests {
             _: Vec<XlaConstant>,
             _: Vec<CompilationTracer<XlaDomain<'c>>>,
             input: CompilationTracer<XlaDomain<'c>>,
-        ) -> Result<CompilationTracer<XlaDomain<'c>>, XlaDomainError> {
+        ) -> Result<CompilationTracer<XlaDomain<'c>>, Error> {
             Ok(input)
         }
 
@@ -14376,7 +14289,7 @@ mod tests {
         .unwrap();
         assert!(matches!(
             staged.lower(&domain).map(|_| ()),
-            Err(XlaDomainError::InvalidCompilationOptions { reason })
+            Err(Error::InvalidCompilationOptions { reason })
                 if reason == "staged input types do not carry the shardings requested by `in_shardings`; apply them \
                               to the input types before staging (e.g., with `with_input_shardings`)",
         ));
@@ -14407,7 +14320,7 @@ mod tests {
                 0,
                 &XlaOptions::new(mesh.clone()),
             ),
-            Err(XlaDomainError::UnsupportedReferenceAbi { reason })
+            Err(Error::UnsupportedReferenceAbi { reason })
                 if reason == "external reference state at logical input 0 cannot use a zero-space type because it has \
                               no executable buffer",
         ));
@@ -14422,7 +14335,7 @@ mod tests {
                 0,
                 &XlaOptions::new(mesh.clone()),
             ),
-            Err(XlaDomainError::UnsupportedReferenceAbi { reason })
+            Err(Error::UnsupportedReferenceAbi { reason })
                 if reason == "external reference state at logical input 0 must use device memory",
         ));
 
@@ -14436,7 +14349,7 @@ mod tests {
                 0,
                 &XlaOptions::new(mesh.clone()),
             ),
-            Err(XlaDomainError::UnsupportedReferenceAbi { reason })
+            Err(Error::UnsupportedReferenceAbi { reason })
                 if reason == "external reference state at logical input 0 has an unbounded dynamic dimension",
         ));
 
@@ -14450,7 +14363,7 @@ mod tests {
                 0,
                 &XlaOptions::new(mesh.clone()),
             ),
-            Err(XlaDomainError::UnsupportedReferenceAbi { reason })
+            Err(Error::UnsupportedReferenceAbi { reason })
                 if reason == "bounded-dynamic external state input 0 must use replicated sharding",
         ));
 
@@ -14465,7 +14378,7 @@ mod tests {
                 0,
                 &XlaOptions::new(mesh.clone()),
             ),
-            Err(XlaDomainError::UnsupportedReferenceAbi { reason })
+            Err(Error::UnsupportedReferenceAbi { reason })
                 if reason == "external reference state at logical input 0 uses a sharding mesh that does not match \
                               the compilation mesh",
         ));
@@ -14485,7 +14398,7 @@ mod tests {
                 0,
                 &XlaOptions::new(foreign_mesh),
             ),
-            Err(XlaDomainError::UnsupportedReferenceAbi { reason })
+            Err(Error::UnsupportedReferenceAbi { reason })
                 if reason == "external reference state requires a fully addressable single-process mesh",
         ));
 
@@ -14503,7 +14416,7 @@ mod tests {
                 0,
                 &XlaOptions::new(non_addressable_mesh),
             ),
-            Err(XlaDomainError::UnsupportedReferenceAbi { reason })
+            Err(Error::UnsupportedReferenceAbi { reason })
                 if reason == "external reference state requires a fully addressable single-process mesh",
         ));
     }
@@ -14599,7 +14512,7 @@ mod tests {
         let sharding = Sharding::new(logical_mesh.clone(), vec![ShardingDimension::sharded(["x"])]).unwrap();
         let device_type = ArrayType::new_static(DataType::F32, [4]).with_sharding(sharding.clone()).unwrap();
         let host_type = device_type.clone().with_memory(Memory::Host { pinned: true });
-        let shard_map = ShardMap::new(
+        let shard_map = ShardMapBoundary::new(
             logical_mesh,
             vec![sharding.clone(), sharding.clone()],
             vec![sharding],
@@ -15208,7 +15121,7 @@ mod tests {
 
         assert!(matches!(
             domain.lower_xla_program(&program, 2, &XlaOptions::new(mesh)),
-            Err(XlaDomainError::InvalidCompilationOptions { reason })
+            Err(Error::InvalidCompilationOptions { reason })
                 if reason == "capture_count is 2, but the program has only 1 flat input(s)",
         ));
     }
@@ -15746,7 +15659,8 @@ mod tests {
             );
             assert!(matches!(
                 domain.execute_statefully(program, vec![update.clone(), update.clone()]).r#await(),
-                Err(XlaDomainError::Tracing(ProgramError::InvalidArgument { message })) if message == expected,
+                Err(Error::Core(ryft_core::Error::Program(ProgramError::InvalidArgument { message })))
+                    if message == expected,
             ));
             let expected = format!(
                 "runtime input type `{}` does not match declared type `{}`",
@@ -15755,11 +15669,12 @@ mod tests {
             );
             assert!(matches!(
                 domain.execute_statefully(program, vec![reference.clone(), reference.clone()]).r#await(),
-                Err(XlaDomainError::Tracing(ProgramError::InvalidArgument { message })) if message == expected,
+                Err(Error::Core(ryft_core::Error::Program(ProgramError::InvalidArgument { message })))
+                    if message == expected,
             ));
             assert!(matches!(
                 domain.execute_statefully(program, Vec::new()).r#await(),
-                Err(XlaDomainError::Tracing(ProgramError::InvalidInputCount { expected: 2, actual: 0 })),
+                Err(Error::Core(ryft_core::Error::Program(ProgramError::InvalidInputCount { expected: 2, actual: 0 }))),
             ));
             assert_eq!(read_f32s(&client, &holder.read().unwrap()), vec![1.0]);
 
@@ -15837,7 +15752,7 @@ mod tests {
         let corrupted = corrupt(metadata);
         assert!(matches!(
             domain.deserialize_xla_program(corrupted.as_slice()),
-            Err(XlaDomainError::InvalidPersistentExecutable { reason })
+            Err(Error::InvalidPersistentExecutable { reason })
                 if reason == "reference-state source does not match its logical input",
         ));
 
@@ -15847,7 +15762,7 @@ mod tests {
         let corrupted = corrupt(metadata);
         assert!(matches!(
             domain.deserialize_xla_program(corrupted.as_slice()),
-            Err(XlaDomainError::InvalidPersistentExecutable { reason })
+            Err(Error::InvalidPersistentExecutable { reason })
                 if reason == "reference-state source does not match its logical input",
         ));
 
@@ -15858,7 +15773,7 @@ mod tests {
         let corrupted = corrupt(invalid_outputs);
         assert!(matches!(
             domain.deserialize_xla_program(corrupted.as_slice()),
-            Err(XlaDomainError::InvalidPersistentExecutable { reason })
+            Err(Error::InvalidPersistentExecutable { reason })
                 if reason == "reference-state metadata has an invalid output count",
         ));
 
@@ -15871,7 +15786,7 @@ mod tests {
         let corrupted = corrupt(truncated_expected_shardings);
         assert!(matches!(
             domain.deserialize_xla_program(corrupted.as_slice()),
-            Err(XlaDomainError::InvalidPersistentExecutable { reason })
+            Err(Error::InvalidPersistentExecutable { reason })
                 if reason == "expected argument shardings do not match the physical input count",
         ));
 
@@ -15881,7 +15796,7 @@ mod tests {
         let corrupted = corrupt(reordered);
         assert!(matches!(
             domain.deserialize_xla_program(corrupted.as_slice()),
-            Err(XlaDomainError::InvalidPersistentExecutable { reason })
+            Err(Error::InvalidPersistentExecutable { reason })
                 if reason == "reference states are not in canonical logical input order",
         ));
 
@@ -15891,7 +15806,7 @@ mod tests {
         let corrupted = corrupt(foreign_process_mesh);
         assert!(matches!(
             domain.deserialize_xla_program(corrupted.as_slice()),
-            Err(XlaDomainError::InvalidPersistentExecutable { reason })
+            Err(Error::InvalidPersistentExecutable { reason })
                 if reason == "reference-state mesh is not fully addressable by this process",
         ));
 
@@ -15901,7 +15816,7 @@ mod tests {
         let corrupted = corrupt(mismatched_expected_sharding);
         assert!(matches!(
             domain.deserialize_xla_program(corrupted.as_slice()),
-            Err(XlaDomainError::InvalidPersistentExecutable { reason })
+            Err(Error::InvalidPersistentExecutable { reason })
                 if reason == "reference-state input 0 logical sharding does not match its expected argument sharding",
         ));
 
@@ -15922,7 +15837,7 @@ mod tests {
         let corrupted = corrupt(mismatched_input);
         assert!(matches!(
             domain.deserialize_xla_program(corrupted.as_slice()),
-            Err(XlaDomainError::InvalidPersistentExecutable { reason })
+            Err(Error::InvalidPersistentExecutable { reason })
                 if reason == "reference-state input 0 logical sharding does not match its expected argument sharding",
         ));
 
@@ -15937,7 +15852,7 @@ mod tests {
         let corrupted = corrupt(mismatched_output);
         assert!(matches!(
             domain.deserialize_xla_program(corrupted.as_slice()),
-            Err(XlaDomainError::InvalidPersistentExecutable { reason })
+            Err(Error::InvalidPersistentExecutable { reason })
                 if reason == "reference-state output 1 logical sharding does not match state input 0",
         ));
 
@@ -15947,7 +15862,7 @@ mod tests {
         let corrupted = corrupt(zero_space);
         assert!(matches!(
             domain.deserialize_xla_program(corrupted.as_slice()),
-            Err(XlaDomainError::InvalidPersistentExecutable { reason })
+            Err(Error::InvalidPersistentExecutable { reason })
                 if reason == "reference-state input has a zero-space type",
         ));
 
@@ -15957,7 +15872,7 @@ mod tests {
         let corrupted = corrupt(host_memory);
         assert!(matches!(
             domain.deserialize_xla_program(corrupted.as_slice()),
-            Err(XlaDomainError::InvalidPersistentExecutable { reason })
+            Err(Error::InvalidPersistentExecutable { reason })
                 if reason == "reference-state input is not in device memory",
         ));
 
@@ -15974,7 +15889,7 @@ mod tests {
         let corrupted = corrupt(unbounded_dynamic);
         assert!(matches!(
             domain.deserialize_xla_program(corrupted.as_slice()),
-            Err(XlaDomainError::InvalidPersistentExecutable { reason })
+            Err(Error::InvalidPersistentExecutable { reason })
                 if reason == "reference-state input has an unbounded dynamic dimension",
         ));
 
@@ -15991,7 +15906,7 @@ mod tests {
         let corrupted = corrupt(mutated_dynamic);
         assert!(matches!(
             domain.deserialize_xla_program(corrupted.as_slice()),
-            Err(XlaDomainError::InvalidPersistentExecutable { reason })
+            Err(Error::InvalidPersistentExecutable { reason })
                 if reason == "mutated bounded-dynamic reference-state input 0 is unsupported because backend alias \
                               compatibility has not been verified",
         ));
@@ -16009,7 +15924,7 @@ mod tests {
         let corrupted = corrupt(sharded_dynamic);
         assert!(matches!(
             domain.deserialize_xla_program(corrupted.as_slice()),
-            Err(XlaDomainError::InvalidPersistentExecutable { reason })
+            Err(Error::InvalidPersistentExecutable { reason })
                 if reason == "bounded-dynamic reference-state input 1 logical sharding is not replicated",
         ));
     }
@@ -17284,7 +17199,8 @@ mod tests {
         let operation = ShardMapOperation::from_program(
             &body_program,
             vec![global_type.into()],
-            ShardMap::new(logical_mesh, vec![sharding.clone()], vec![sharding.clone()], vec!["x".to_string()]).unwrap(),
+            ShardMapBoundary::new(logical_mesh, vec![sharding.clone()], vec![sharding.clone()], vec!["x".to_string()])
+                .unwrap(),
         )
         .unwrap();
         let operation = XlaOperation::ShardMap(Box::new(operation));
@@ -17541,7 +17457,7 @@ mod tests {
         corrupted.extend_from_slice(&serialized[metadata_end..]);
         assert!(matches!(
             domain.deserialize_xla_program(&corrupted),
-            Err(XlaDomainError::InvalidPersistentExecutable { reason })
+            Err(Error::InvalidPersistentExecutable { reason })
                 if reason == "effect signature does not match executable physical outputs",
         ));
         let mut builder = XlaProgramBuilder::new();
@@ -17620,7 +17536,7 @@ mod tests {
             XlaArray::from_host_buffer(&domain, r#type.clone(), mesh.clone(), values_to_bytes(&[0.0f64, 1.0])).unwrap();
         let second =
             XlaArray::from_host_buffer(&domain, r#type.clone(), mesh.clone(), values_to_bytes(&[2.0f64, 3.0])).unwrap();
-        let shard_map = ShardMap::new(
+        let shard_map = ShardMapBoundary::new(
             mesh.logical_mesh().clone(),
             vec![r#type.sharding().unwrap().clone()],
             Vec::new(),
@@ -17734,7 +17650,7 @@ mod tests {
 
         let mesh = domain_mesh(client, "x", 1);
         let domain = array_domain(client);
-        assert_eq!(ensure_print_handler_registered(client), Ok(()));
+        ensure_print_handler_registered(client).unwrap();
 
         // The effectful `print` rides the compiled per-operation program as a token-threaded `@ryft.print` custom
         // call: eagerly binding it fires the host callback once and passes the payload through unchanged.
@@ -18032,7 +17948,7 @@ mod tests {
         assert!(Arc::ptr_eq(second.predecessor.as_ref().unwrap(), &first.submission));
         assert!(matches!(
             scope.reserve(Some(vec![1])),
-            Err(XlaDomainError::EffectScope { reason })
+            Err(Error::EffectScope { reason })
                 if reason == "ordered I/O device changed; use `fork_effect_scope()` for a new device assignment",
         ));
         // Cancelling the successor while its predecessor is unpublished must return without waiting.
@@ -18078,7 +17994,7 @@ mod tests {
         assert!(
             matches!(final_submission.carrier(), Err(reason) if reason.as_ref() == "predecessor publication failed")
         );
-        assert!(matches!(scope.barrier(), Err(XlaDomainError::EffectScope { .. })));
+        assert!(matches!(scope.barrier(), Err(Error::EffectScope { .. })));
     }
 
     #[test]
@@ -18100,7 +18016,7 @@ mod tests {
     fn test_effect_scope_reserve_device_assignment() {
         let scope = EffectScope::default();
         let first = scope.reserve(Some(vec![0, 1])).unwrap();
-        assert!(matches!(scope.reserve(Some(vec![1, 0])), Err(XlaDomainError::EffectScope { .. })));
+        assert!(matches!(scope.reserve(Some(vec![1, 0])), Err(Error::EffectScope { .. })));
         drop(first);
         let successor = scope.reserve(Some(vec![0, 1])).unwrap();
         assert!(successor.predecessor.is_some());
@@ -18146,22 +18062,22 @@ mod tests {
         first.submission.publish(Ok(None));
         second.submission.publish(Ok(None));
         first.submission.completion.complete(Err(Arc::from("first effect failed")));
-        assert!(matches!(scope.reserve(Some(vec![0])), Err(XlaDomainError::EffectScope { .. })));
+        assert!(matches!(scope.reserve(Some(vec![0])), Err(Error::EffectScope { .. })));
         assert!(matches!(
             scope.acknowledge(),
-            Err(XlaDomainError::EffectScope { reason })
+            Err(Error::EffectScope { reason })
                 if reason == "effect failures are pending or unreported; call `effects_barrier()` and then \
                               `acknowledge_effect_errors()` again",
         ));
         second.submission.completion.complete(Err(Arc::from("second effect failed")));
-        assert!(matches!(scope.acknowledge(), Err(XlaDomainError::EffectScope { .. })));
+        assert!(matches!(scope.acknowledge(), Err(Error::EffectScope { .. })));
         let expected = concat!(
             "submission 0: first effect failed; submission 1: second effect failed; ",
             "call `effects_barrier()` again if more work was submitted, then `acknowledge_effect_errors()` ",
             "to recover once affected work is complete",
         );
-        assert!(matches!(scope.barrier(), Err(XlaDomainError::EffectScope { reason }) if reason == expected));
-        assert!(matches!(scope.barrier(), Err(XlaDomainError::EffectScope { reason }) if reason == expected));
+        assert!(matches!(scope.barrier(), Err(Error::EffectScope { reason }) if reason == expected));
+        assert!(matches!(scope.barrier(), Err(Error::EffectScope { reason }) if reason == expected));
         assert!(scope.acknowledge().is_ok());
         assert!(scope.barrier().is_ok());
         let recovered = scope.reserve(Some(vec![1])).unwrap();
@@ -18179,8 +18095,8 @@ mod tests {
         assert!(scope.acknowledge().is_ok());
         assert_eq!(scope.state.lock().unwrap().submissions.len(), 1);
         pending.submission.completion.complete(Err(Arc::from("late completion failure")));
-        assert!(matches!(scope.acknowledge(), Err(XlaDomainError::EffectScope { .. })));
-        assert!(matches!(scope.barrier(), Err(XlaDomainError::EffectScope { .. })));
+        assert!(matches!(scope.acknowledge(), Err(Error::EffectScope { .. })));
+        assert!(matches!(scope.barrier(), Err(Error::EffectScope { .. })));
         assert!(scope.acknowledge().is_ok());
         assert_eq!(scope.state.lock().unwrap().submissions.len(), 0);
     }
@@ -18192,9 +18108,9 @@ mod tests {
         let scope = EffectScope::default();
         let guard = EffectCallbackGuard::enter();
         let reason = "execution and effect barriers cannot be entered from a managed callback";
-        assert!(matches!(scope.reserve(None), Err(XlaDomainError::EffectScope { reason: actual }) if actual == reason));
-        assert!(matches!(scope.barrier(), Err(XlaDomainError::EffectScope { reason: actual }) if actual == reason));
-        assert!(matches!(scope.acknowledge(), Err(XlaDomainError::EffectScope { reason: actual }) if actual == reason));
+        assert!(matches!(scope.reserve(None), Err(Error::EffectScope { reason: actual }) if actual == reason));
+        assert!(matches!(scope.barrier(), Err(Error::EffectScope { reason: actual }) if actual == reason));
+        assert!(matches!(scope.acknowledge(), Err(Error::EffectScope { reason: actual }) if actual == reason));
         assert!(matches!(
             domain.bind(OneOperation::new(ArrayType::scalar(DataType::F32)), Vec::new(), &[]),
             Err(ProgramError::InvalidArgument { message })
@@ -18455,7 +18371,7 @@ mod tests {
         assert!(!signature.has_effects());
         assert!(matches!(
             session.domain().ensure_runtime_requirements(&signature, "cpu"),
-            Err(XlaDomainError::InvalidCompilationOptions { reason })
+            Err(Error::InvalidCompilationOptions { reason })
                 if reason == "cuda artifact calls require a cuda platform",
         ));
         assert!(session.cuda_kernel_runtime.lock().unwrap().is_none());
@@ -18470,13 +18386,13 @@ mod tests {
         assert!(!signature.has_effects());
         assert!(matches!(
             session.domain().ensure_runtime_requirements(&signature, "cpu"),
-            Err(XlaDomainError::InvalidCompilationOptions { reason })
+            Err(Error::InvalidCompilationOptions { reason })
                 if reason == "rocm artifact calls require a rocm platform",
         ));
         #[cfg(not(feature = "rocm"))]
         assert!(matches!(
             session.domain().ensure_runtime_requirements(&signature, "rocm"),
-            Err(XlaDomainError::InvalidCompilationOptions { reason })
+            Err(Error::InvalidCompilationOptions { reason })
                 if reason == "rocm artifact execution requires the `rocm` feature",
         ));
         #[cfg(feature = "rocm")]

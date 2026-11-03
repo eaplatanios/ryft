@@ -14,7 +14,7 @@ use crate::experimental::lowering::types::{
 use crate::operations::comparisons::lower_compare_to_mlir;
 use crate::operations::reductions::build_reduce_body_region;
 use crate::operations::sharding::constrain_sharding::lower_sharding_constraint;
-use crate::{LowerableOperation, LowerableOperationFamily, LoweringError, XlaLowerer};
+use crate::{Error, LowerableOperation, LowerableOperationFamily, XlaLowerer};
 
 /// Lowers gather with its explicit index-vector axis. Fill mode masks whole out-of-bounds windows, and clip mode
 /// clamps against logical input sizes even when the allocation is larger. Comparisons preserve index signedness.
@@ -26,7 +26,7 @@ pub(crate) fn lower_gather_to_mlir<'b, 'c: 'b, 't: 'c>(
     block: &mut BlockRef<'b, 'c, 't>,
     context: &'c MlirContext<'t>,
     location: LocationRef<'c, 't>,
-) -> Result<Vec<ValueRef<'b, 'c, 't>>, LoweringError> {
+) -> Result<Vec<ValueRef<'b, 'c, 't>>, Error> {
     check_count!("input", input_values, 2, ProgramError);
     check_count!("input", input_types, 2, ProgramError);
     check_count!("output", output_types, 1, ProgramError);
@@ -226,7 +226,7 @@ impl LowerableOperation for GatherOperation {
         input_values: &[ValueRef<'b, 'c, 't>],
         input_types: &[ArrayType],
         output_types: &[ArrayType],
-    ) -> Result<Vec<ValueRef<'b, 'c, 't>>, LoweringError> {
+    ) -> Result<Vec<ValueRef<'b, 'c, 't>>, Error> {
         let values = lower_gather_to_mlir(
             self,
             input_values,

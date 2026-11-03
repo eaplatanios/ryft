@@ -15,7 +15,7 @@ use crate::experimental::lowering::types::{
     lower_unplaced_constant_output, physical_bound_type,
 };
 use crate::operations::comparisons::lower_compare_to_mlir;
-use crate::{LowerableOperation, LowerableOperationFamily, LoweringError, XlaLowerer};
+use crate::{Error, LowerableOperation, LowerableOperationFamily, XlaLowerer};
 
 /// XLA representation used when lowering ragged dots. Selection is compilation-wide through
 /// [`XlaOptions::with_ragged_dot_lowering_strategy`](crate::XlaOptions::with_ragged_dot_lowering_strategy).
@@ -37,7 +37,7 @@ impl LowerableOperation for DotOperation {
         input_values: &[ValueRef<'b, 'c, 't>],
         _input_types: &[ArrayType],
         output_types: &[ArrayType],
-    ) -> Result<Vec<ValueRef<'b, 'c, 't>>, LoweringError> {
+    ) -> Result<Vec<ValueRef<'b, 'c, 't>>, Error> {
         let output_tensor_type = lowerer.lower_tensor_type(&output_types[0])?;
         let dimension_numbers = self.dimensions();
         let dimensions = lowerer.context.stable_hlo_dot_dimensions(
@@ -69,9 +69,9 @@ fn lower_ragged_dot_group_intervals<'b, 'c: 'b, 't: 'c>(
     block: &mut BlockRef<'b, 'c, 't>,
     context: &'c MlirContext<'t>,
     location: LocationRef<'c, 't>,
-) -> Result<(ValueRef<'b, 'c, 't>, ValueRef<'b, 'c, 't>), LoweringError> {
+) -> Result<(ValueRef<'b, 'c, 't>, ValueRef<'b, 'c, 't>), Error> {
     let group_axis = group_sizes_type.rank() - 1;
-    let group_count = group_sizes_type.dimension(group_axis).value().ok_or_else(|| LoweringError::UnsupportedOp {
+    let group_count = group_sizes_type.dimension(group_axis).value().ok_or_else(|| Error::UnsupportedOperation {
         op: "`ragged_dot` with a dynamically sized group axis".to_string(),
     })?;
     let group_sizes = if group_sizes_type.data_type().is_signed() {
@@ -96,7 +96,7 @@ fn lower_ragged_dot_group_intervals<'b, 'c: 'b, 't: 'c>(
     };
     let wide_group_sizes =
         lower_physical_bound_value(wide_group_sizes, &wide_group_sizes_type, 0.0, block, context, location)?;
-    let physical_ragged_extent = u64::try_from(physical_ragged_extent).map_err(|_| LoweringError::UnsupportedOp {
+    let physical_ragged_extent = u64::try_from(physical_ragged_extent).map_err(|_| Error::UnsupportedOperation {
         op: "`ragged_dot` whose physical ragged extent cannot be represented as `u64`".to_string(),
     })?;
     if group_count == 0 {
@@ -173,7 +173,7 @@ fn lower_ragged_dot_expansion<'b, 'c: 'b, 't: 'c>(
     block: &mut BlockRef<'b, 'c, 't>,
     context: &'c MlirContext<'t>,
     location: LocationRef<'c, 't>,
-) -> Result<ValueRef<'b, 'c, 't>, LoweringError> {
+) -> Result<ValueRef<'b, 'c, 't>, Error> {
     let group_axis = group_sizes_type.rank() - 1;
     let group_count = group_sizes_type.dimension(group_axis);
 
@@ -282,7 +282,7 @@ fn lower_dense_ragged_dot<'b, 'c: 'b, 't: 'c>(
     block: &mut BlockRef<'b, 'c, 't>,
     context: &'c MlirContext<'t>,
     location: LocationRef<'c, 't>,
-) -> Result<ValueRef<'b, 'c, 't>, LoweringError> {
+) -> Result<ValueRef<'b, 'c, 't>, Error> {
     let dimensions = context.stable_hlo_dot_dimensions(
         dimensions.lhs_batching_dimensions(),
         dimensions.rhs_batching_dimensions(),
@@ -309,7 +309,7 @@ impl LowerableOperation for RaggedDotOperation {
         input_values: &[ValueRef<'b, 'c, 't>],
         input_types: &[ArrayType],
         output_types: &[ArrayType],
-    ) -> Result<Vec<ValueRef<'b, 'c, 't>>, LoweringError> {
+    ) -> Result<Vec<ValueRef<'b, 'c, 't>>, Error> {
         check_count!("input", input_values, 3, ProgramError);
         check_count!("input", input_types, 3, ProgramError);
         check_count!("output", output_types, 1, ProgramError);
@@ -472,7 +472,7 @@ mod tests {
         rhs_type: ArrayType,
         group_sizes_type: ArrayType,
         strategy: RaggedDotLoweringStrategy,
-    ) -> Result<String, LoweringError> {
+    ) -> Result<String, Error> {
         let mut builder = XlaProgramBuilder::new();
         let lhs = builder.add_input(lhs_type);
         let rhs = builder.add_input(rhs_type);
@@ -496,7 +496,7 @@ mod tests {
     }
 
     // Lowers the basic non-contracting grouped-matrix form using `strategy`.
-    fn lowered_ragged_dot_module(strategy: RaggedDotLoweringStrategy) -> Result<String, LoweringError> {
+    fn lowered_ragged_dot_module(strategy: RaggedDotLoweringStrategy) -> Result<String, Error> {
         lowered_ragged_dot_module_for(
             RaggedDotDimensionNumbers::matmul(),
             ArrayType::new_static(DataType::F32, [5, 2]),

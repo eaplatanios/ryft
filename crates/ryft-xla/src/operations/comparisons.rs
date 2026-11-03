@@ -8,17 +8,17 @@ use ryft_mlir::{
 
 use crate::experimental::lowering::types::lower_signed_one_bit_to_mlir;
 use crate::operations::normalize_binary_elementwise_operands;
-use crate::{LowerableOperation, LowerableOperationFamily, LoweringError, ToMlir, XlaLowerer};
+use crate::{Error, LowerableOperation, LowerableOperationFamily, ToMlir, XlaLowerer};
 
 /// Returns the promoted numeric operand descriptor for one comparison result descriptor.
 pub(crate) fn comparison_operand_type(
     input_types: &[ArrayType],
     output_types: &[ArrayType],
-) -> Result<ArrayType, LoweringError> {
+) -> Result<ArrayType, Error> {
     check_count!("input", input_types, 2, ProgramError);
     check_count!("output", output_types, 1, ProgramError);
     let data_type = DataType::promoted(&[input_types[0].data_type(), input_types[1].data_type()]).map_err(|error| {
-        LoweringError::UnsupportedOp { op: format!("cannot normalize comparison operands: {error}") }
+        Error::UnsupportedOperation { op: format!("cannot normalize comparison operands: {error}") }
     })?;
     Ok(output_types[0].clone().with_data_type(data_type))
 }
@@ -48,7 +48,7 @@ pub(crate) fn lower_compare_to_mlir<'b, 'c: 'b, 't: 'c>(
     rhs: ValueRef<'b, 'c, 't>,
     block: &mut BlockRef<'b, 'c, 't>,
     location: LocationRef<'c, 't>,
-) -> Result<ValueRef<'b, 'c, 't>, LoweringError> {
+) -> Result<ValueRef<'b, 'c, 't>, Error> {
     let direction = direction.to_mlir(location)?;
     let lhs_type = lhs.r#type()?;
     let comparison_type = comparison_type_for_mlir_type(lhs_type)?;
@@ -63,12 +63,8 @@ pub(crate) fn lower_compare_to_mlir<'b, 'c: 'b, 't: 'c>(
 /// unsigned integers and one-bit predicate carriers route to [`stable_hlo::ComparisonType::Unsigned`]; other
 /// integers route to [`stable_hlo::ComparisonType::Signed`]. Logical signed one-bit inputs must be widened before
 /// calling this function because their MLIR carrier alone cannot distinguish them from Boolean inputs.
-fn comparison_type_for_mlir_type<'c, 't>(r#type: TypeRef<'c, 't>) -> Result<stable_hlo::ComparisonType, LoweringError> {
-    let element_type = if let Some(tensor) = r#type.cast::<TensorTypeRef>() {
-        tensor.element_type().map_err(|error| LoweringError::MlirError(error))?
-    } else {
-        r#type
-    };
+fn comparison_type_for_mlir_type<'c, 't>(r#type: TypeRef<'c, 't>) -> Result<stable_hlo::ComparisonType, Error> {
+    let element_type = if let Some(tensor) = r#type.cast::<TensorTypeRef>() { tensor.element_type()? } else { r#type };
     if element_type.is::<FloatTypeRef>() {
         return Ok(stable_hlo::ComparisonType::Float);
     }
@@ -90,7 +86,7 @@ impl LowerableOperation for CompareOperation<ArrayType> {
         input_values: &[ValueRef<'b, 'c, 't>],
         input_types: &[ArrayType],
         output_types: &[ArrayType],
-    ) -> Result<Vec<ValueRef<'b, 'c, 't>>, LoweringError> {
+    ) -> Result<Vec<ValueRef<'b, 'c, 't>>, Error> {
         let mut operand_type = comparison_operand_type(input_types, output_types)?;
         // StableHLO treats i1 as a predicate, even when its logical dtype is signed. Recover each
         // signed input before promotion, and compare two I1 inputs in the same signed byte carrier.
@@ -122,7 +118,7 @@ impl LowerableOperation for CompareOperation<ArrayIrType> {
         input_values: &[ValueRef<'b, 'c, 't>],
         _input_types: &[ArrayIrType],
         _output_types: &[ArrayIrType],
-    ) -> Result<Vec<ValueRef<'b, 'c, 't>>, LoweringError> {
+    ) -> Result<Vec<ValueRef<'b, 'c, 't>>, Error> {
         let location = lowerer.location;
         let block = &mut lowerer.block;
         let [left, right] = input_values else {

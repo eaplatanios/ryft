@@ -27,7 +27,7 @@ pub trait DevicePutLeaf<'c>: Parameter {
         src: Option<DevicePutTarget>,
         donate: bool,
         may_alias: Option<bool>,
-    ) -> Result<XlaArray<'c>, ArrayError>;
+    ) -> Result<XlaArray<'c>, Error>;
 }
 
 impl<'c, T: DenseHostDevicePutLeaf + Parameter> DevicePutLeaf<'c> for T {
@@ -38,14 +38,13 @@ impl<'c, T: DenseHostDevicePutLeaf + Parameter> DevicePutLeaf<'c> for T {
         _src: Option<DevicePutTarget>,
         _donate: bool,
         _may_alias: Option<bool>,
-    ) -> Result<XlaArray<'c>, ArrayError> {
+    ) -> Result<XlaArray<'c>, Error> {
         let client = engine.client();
         let (shape, element_type, bytes) = self.into_dense_host_array();
         let (mesh, sharding) = match device {
             Some(device) => device.resolve(shape.len())?,
             None => {
-                let device =
-                    client.addressable_devices()?.into_iter().next().ok_or(ArrayError::MissingDefaultDevice)?;
+                let device = client.addressable_devices()?.into_iter().next().ok_or(Error::MissingDefaultDevice)?;
                 DevicePutTarget::device(Device::from_pjrt(device)?).resolve(shape.len())?
             }
         };
@@ -63,13 +62,13 @@ impl<'c> DevicePutLeaf<'c> for XlaArray<'c> {
         src: Option<DevicePutTarget>,
         _donate: bool,
         may_alias: Option<bool>,
-    ) -> Result<XlaArray<'c>, ArrayError> {
+    ) -> Result<XlaArray<'c>, Error> {
         let current_mesh = self.mesh().clone();
         let current_sharding = self.sharding().clone();
         if let Some(src) = src {
             let (expected_mesh, expected_sharding) = src.resolve(current_sharding.rank())?;
             if expected_mesh != current_mesh || expected_sharding != current_sharding {
-                return Err(ArrayError::SourcePlacementMismatch {
+                return Err(Error::SourcePlacementMismatch {
                     expected_mesh,
                     expected_sharding,
                     actual_mesh: current_mesh.clone(),
@@ -111,7 +110,7 @@ pub fn device_put<
     engine: &XlaDomain<'c>,
     x: Input,
     options: DevicePutOptions<DeviceTarget, SourceTarget, Donate, MayAlias>,
-) -> Result<<Input as Parameterized<P>>::To<XlaArray<'c>>, ArrayError>
+) -> Result<<Input as Parameterized<P>>::To<XlaArray<'c>>, Error>
 where
     <Input as Parameterized<P>>::Family: ParameterizedFamily<XlaArray<'c>>
         + ParameterizedFamily<DevicePutTarget>

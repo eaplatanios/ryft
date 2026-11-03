@@ -15,7 +15,7 @@ use crate::experimental::lowering::types::{
 use crate::operations::assertions::lower_output_extent_validation;
 use crate::operations::manipulation::memory::annotate_output_memory;
 use crate::operations::sharding::constrain_sharding::lower_sharding_constraint;
-use crate::{LowerableOperation, LowerableOperationFamily, LoweringError, MemberLowerableOperation, XlaLowerer};
+use crate::{Error, LowerableOperation, LowerableOperationFamily, MemberLowerableOperation, XlaLowerer};
 
 impl LowerableOperation for IotaOperation<ArrayType> {
     fn lower<'b, 'c: 'b, 't: 'c, O: LowerableOperationFamily>(
@@ -24,7 +24,7 @@ impl LowerableOperation for IotaOperation<ArrayType> {
         input_values: &[ValueRef<'b, 'c, 't>],
         _input_types: &[ArrayType],
         output_types: &[ArrayType],
-    ) -> Result<Vec<ValueRef<'b, 'c, 't>>, LoweringError> {
+    ) -> Result<Vec<ValueRef<'b, 'c, 't>>, Error> {
         check_count!("input", input_values, 0, ProgramError);
         check_count!("output", output_types, 1, ProgramError);
         let output_tensor_type = lowerer.lower_tensor_type(&output_types[0])?;
@@ -51,7 +51,7 @@ impl LowerableOperation for ConstantOperation<Array> {
         input_values: &[ValueRef<'b, 'c, 't>],
         _input_types: &[ArrayType],
         output_types: &[ArrayType],
-    ) -> Result<Vec<ValueRef<'b, 'c, 't>>, LoweringError> {
+    ) -> Result<Vec<ValueRef<'b, 'c, 't>>, Error> {
         check_count!("input", input_values, 0, ProgramError);
         check_count!("output", output_types, 1, ProgramError);
         let constant_value =
@@ -69,7 +69,7 @@ pub(crate) fn lower_like_constant<'b, 'c: 'b, 't: 'c>(
     block: &mut BlockRef<'b, 'c, 't>,
     context: &'c MlirContext<'t>,
     location: LocationRef<'c, 't>,
-) -> Result<Vec<ValueRef<'b, 'c, 't>>, LoweringError> {
+) -> Result<Vec<ValueRef<'b, 'c, 't>>, Error> {
     if input_values.len() != 1 {
         return Err(ProgramError::InvalidInputCount { expected: 1, actual: input_values.len() }.into());
     }
@@ -126,22 +126,22 @@ pub(crate) fn lower_layout_constraint<'b, 'c: 'b, 't: 'c>(
     r#type: &ArrayType,
     block: &mut ryft_mlir::BlockRef<'b, 'c, 't>,
     location: ryft_mlir::LocationRef<'c, 't>,
-) -> Result<ValueRef<'b, 'c, 't>, LoweringError> {
+) -> Result<ValueRef<'b, 'c, 't>, Error> {
     let Some(layout) = r#type.layout() else {
         return Ok(value);
     };
     let Layout::Tiled(tiled) = layout else {
-        return Err(LoweringError::UnsupportedOp { op: format!("strided output layout `{layout}`") });
+        return Err(Error::UnsupportedOperation { op: format!("strided output layout `{layout}`") });
     };
     if !tiled.tiles().is_empty() {
-        return Err(LoweringError::UnsupportedOp { op: format!("tiled output layout `{layout}`") });
+        return Err(Error::UnsupportedOperation { op: format!("tiled output layout `{layout}`") });
     }
     let axes = tiled.minor_to_major();
     if axes.len() != r#type.rank()
         || axes.iter().any(|axis| *axis >= r#type.rank())
         || axes.iter().collect::<std::collections::HashSet<_>>().len() != r#type.rank()
     {
-        return Err(LoweringError::UnsupportedOp { op: format!("invalid output layout `{layout}` for type `{type}`") });
+        return Err(Error::UnsupportedOperation { op: format!("invalid output layout `{layout}` for type `{type}`") });
     }
     // XLA recognizes this custom call as a physical layout constraint. Apply it to the allocation's static shape:
     // runtime extents are attached afterward, so the call needs no separate dynamic result-shape arguments.
@@ -166,11 +166,11 @@ pub(crate) fn dynamic_constructor_types(
     name: &str,
     input_count: usize,
     output_types: &[ArrayIrType],
-) -> Result<(ArrayType, ArrayType), LoweringError> {
+) -> Result<(ArrayType, ArrayType), Error> {
     let [output_type] = output_types else {
         return Err(ProgramError::InvalidOutputCount { expected: 1, actual: output_types.len() }.into());
     };
-    let output_type = <&ArrayType>::try_from(output_type).map_err(|error| LoweringError::Tracing(error.into()))?;
+    let output_type = <&ArrayType>::try_from(output_type)?;
     let dynamic_count = output_type
         .shape()
         .dimensions()
@@ -188,16 +188,16 @@ pub(crate) fn dynamic_constructor_types(
         .map(|dimension| match dimension {
             Dimension::Static(extent) => Ok(Dimension::Static(*extent)),
             Dimension::Dynamic(variable) => {
-                let bound = stable_hlo_dynamic_dimension_bound(dimension).ok_or_else(|| LoweringError::UnsupportedOp {
+                let bound = stable_hlo_dynamic_dimension_bound(dimension).ok_or_else(|| Error::UnsupportedOperation {
                     op: format!(
                         "{name} output dimension `{variable}` needs a finite upper bound for physical buffer allocation",
                     ),
                 })?;
-                i32::try_from(bound).map_err(|_| LoweringError::DynamicDimensionOutOfRange { value: bound })?;
+                i32::try_from(bound).map_err(|_| Error::DynamicDimensionOutOfRange { value: bound })?;
                 Ok(Dimension::Static(bound))
             }
         })
-        .collect::<Result<Vec<_>, LoweringError>>()?;
+        .collect::<Result<Vec<_>, Error>>()?;
     let physical_type = output_type.clone().with_shape(Shape::new(physical_dimensions));
     Ok((output_type.clone(), physical_type))
 }
@@ -211,11 +211,11 @@ pub(crate) fn refine_dynamic_constructor_result<'b, 'c: 'b, 't: 'c>(
     block: &mut ryft_mlir::BlockRef<'b, 'c, 't>,
     context: &'c MlirContext<'t>,
     location: ryft_mlir::LocationRef<'c, 't>,
-) -> Result<Vec<ValueRef<'b, 'c, 't>>, LoweringError> {
+) -> Result<Vec<ValueRef<'b, 'c, 't>>, Error> {
     result = lower_layout_constraint(result, &refined_type, block, location)?;
     let i32_scalar_type = context
         .tensor_type(context.signless_integer_type(32), &[], None, location)
-        .map_err(|_| LoweringError::InvalidTensorType { array_type: ArrayType::scalar(DataType::I32) })?;
+        .map_err(|_| Error::InvalidTensorType { array_type: ArrayType::scalar(DataType::I32) })?;
     // The dimension operands are compact (one per dynamic axis, in axis order), so advance the operand iterator only
     // when a dynamic axis is encountered rather than indexing by the physical axis number.
     let mut operands = input_values.iter();
@@ -255,11 +255,11 @@ pub(crate) fn dynamic_constructor_inputs<'b, 'c: 'b, 't: 'c, O: LowerableOperati
     input_types: &[ArrayIrType],
     output_types: &[ArrayIrType],
     lowerer: &mut XlaLowerer<'b, 'c, 't, O>,
-) -> Result<Vec<ValueRef<'b, 'c, 't>>, LoweringError> {
+) -> Result<Vec<ValueRef<'b, 'c, 't>>, Error> {
     let [output_type] = output_types else {
         return Err(ProgramError::InvalidOutputCount { expected: 1, actual: output_types.len() }.into());
     };
-    let output_type = <&ArrayType>::try_from(output_type).map_err(|error| LoweringError::Tracing(error.into()))?;
+    let output_type = <&ArrayType>::try_from(output_type)?;
     let declared_dimensions = declared_type.shape().dimensions();
     let dynamic_count =
         declared_dimensions.iter().filter(|dimension| matches!(dimension, Dimension::Dynamic(_))).count();
@@ -306,7 +306,7 @@ pub(crate) fn lower_dynamic_constructor<'b, 'c: 'b, 't: 'c>(
     block: &mut ryft_mlir::BlockRef<'b, 'c, 't>,
     context: &'c MlirContext<'t>,
     location: ryft_mlir::LocationRef<'c, 't>,
-) -> Result<Vec<ValueRef<'b, 'c, 't>>, LoweringError> {
+) -> Result<Vec<ValueRef<'b, 'c, 't>>, Error> {
     let (output_type, physical_type) = dynamic_constructor_types(name, input_values.len(), output_types)?;
     let result =
         lower_constant_output(std::slice::from_ref(&physical_type), integer_value, block, context, location)?.remove(0);
@@ -320,7 +320,7 @@ impl LowerableOperation for ZeroOperation<ArrayType> {
         input_values: &[ValueRef<'b, 'c, 't>],
         _input_types: &[ArrayType],
         output_types: &[ArrayType],
-    ) -> Result<Vec<ValueRef<'b, 'c, 't>>, LoweringError> {
+    ) -> Result<Vec<ValueRef<'b, 'c, 't>>, Error> {
         if !input_values.is_empty() {
             return Err(ProgramError::InvalidInputCount { expected: 0, actual: input_values.len() }.into());
         }
@@ -335,7 +335,7 @@ impl LowerableOperation for OneOperation<ArrayType> {
         input_values: &[ValueRef<'b, 'c, 't>],
         _input_types: &[ArrayType],
         output_types: &[ArrayType],
-    ) -> Result<Vec<ValueRef<'b, 'c, 't>>, LoweringError> {
+    ) -> Result<Vec<ValueRef<'b, 'c, 't>>, Error> {
         if !input_values.is_empty() {
             return Err(ProgramError::InvalidInputCount { expected: 0, actual: input_values.len() }.into());
         }
@@ -350,7 +350,7 @@ impl LowerableOperation for ZeroLikeOperation<ArrayType> {
         input_values: &[ValueRef<'b, 'c, 't>],
         _input_types: &[ArrayType],
         output_types: &[ArrayType],
-    ) -> Result<Vec<ValueRef<'b, 'c, 't>>, LoweringError> {
+    ) -> Result<Vec<ValueRef<'b, 'c, 't>>, Error> {
         lower_like_constant(
             input_values,
             output_types,
@@ -370,7 +370,7 @@ impl LowerableOperation for OneLikeOperation<ArrayType> {
         input_values: &[ValueRef<'b, 'c, 't>],
         _input_types: &[ArrayType],
         output_types: &[ArrayType],
-    ) -> Result<Vec<ValueRef<'b, 'c, 't>>, LoweringError> {
+    ) -> Result<Vec<ValueRef<'b, 'c, 't>>, Error> {
         lower_like_constant(
             input_values,
             output_types,
@@ -390,7 +390,7 @@ impl MemberLowerableOperation<ArrayIrType> for ZeroOperation<ArrayType> {
         input_values: &[ValueRef<'b, 'c, 't>],
         input_types: &[ArrayIrType],
         output_types: &[ArrayIrType],
-    ) -> Result<Vec<ValueRef<'b, 'c, 't>>, LoweringError> {
+    ) -> Result<Vec<ValueRef<'b, 'c, 't>>, Error> {
         let context = lowerer.context;
         let location = lowerer.location;
         let input_values =
@@ -407,7 +407,7 @@ impl MemberLowerableOperation<ArrayIrType> for OneOperation<ArrayType> {
         input_values: &[ValueRef<'b, 'c, 't>],
         input_types: &[ArrayIrType],
         output_types: &[ArrayIrType],
-    ) -> Result<Vec<ValueRef<'b, 'c, 't>>, LoweringError> {
+    ) -> Result<Vec<ValueRef<'b, 'c, 't>>, Error> {
         let context = lowerer.context;
         let location = lowerer.location;
         let input_values =
@@ -424,7 +424,7 @@ impl MemberLowerableOperation<ArrayIrType> for IotaOperation<ArrayType> {
         input_values: &[ValueRef<'b, 'c, 't>],
         input_types: &[ArrayIrType],
         output_types: &[ArrayIrType],
-    ) -> Result<Vec<ValueRef<'b, 'c, 't>>, LoweringError> {
+    ) -> Result<Vec<ValueRef<'b, 'c, 't>>, Error> {
         let context = lowerer.context;
         let location = lowerer.location;
         let input_values =
@@ -542,15 +542,15 @@ mod tests {
         assert_eq!(module.matches("stablehlo.set_dimension_size").count(), 3, "{module}");
         // Each dynamic output is followed by its trailing hidden runtime extent.
         assert_eq!(
-            execute_mixed_program(&execution_client(), &program, &[MixedValue::Dimension(3)], &[]),
-            Ok(vec![
+            execute_mixed_program(&execution_client(), &program, &[MixedValue::Dimension(3)], &[]).unwrap(),
+            vec![
                 MixedValue::Array(vec![0.0, 0.0, 0.0], vec![3]),
                 MixedValue::Array(vec![1.0, 1.0, 1.0], vec![3]),
                 MixedValue::Array(vec![0.0, 1.0, 2.0], vec![3]),
                 MixedValue::Dimension(3),
                 MixedValue::Dimension(3),
                 MixedValue::Dimension(3),
-            ]),
+            ],
         );
     }
 
@@ -605,8 +605,9 @@ mod tests {
                 &program,
                 &[MixedValue::Dimension(3), MixedValue::Dimension(3)],
                 &[],
-            ),
-            Ok(vec![MixedValue::Array(vec![0.0; 9], vec![3, 3]), MixedValue::Dimension(3), MixedValue::Dimension(3)]),
+            )
+            .unwrap(),
+            vec![MixedValue::Array(vec![0.0; 9], vec![3, 3]), MixedValue::Dimension(3), MixedValue::Dimension(3)],
         );
     }
 
@@ -654,8 +655,8 @@ mod tests {
             "#},
         );
         assert_eq!(
-            execute_mixed_program(&execution_client(), &program, &[MixedValue::Dimension(3)], &[]),
-            Ok(vec![MixedValue::Array(vec![0.0; 9], vec![3, 3]), MixedValue::Dimension(3), MixedValue::Dimension(3)]),
+            execute_mixed_program(&execution_client(), &program, &[MixedValue::Dimension(3)], &[]).unwrap(),
+            vec![MixedValue::Array(vec![0.0; 9], vec![3, 3]), MixedValue::Dimension(3), MixedValue::Dimension(3)],
         );
     }
 
@@ -692,8 +693,8 @@ mod tests {
             "#},
         );
         assert_eq!(
-            execute_mixed_program(&execution_client(), &program, &[], &[]),
-            Ok(vec![MixedValue::Array(vec![0.0; 9], vec![3, 3])]),
+            execute_mixed_program(&execution_client(), &program, &[], &[]).unwrap(),
+            vec![MixedValue::Array(vec![0.0; 9], vec![3, 3])],
         );
     }
 
@@ -773,12 +774,12 @@ mod tests {
         let client = execution_client();
         ensure_assertion_handler_registered(&client).unwrap();
         assert_eq!(
-            execute_mixed_program(&client, &program, &[MixedValue::Dimension(3)], &[]),
-            Ok(vec![
+            execute_mixed_program(&client, &program, &[MixedValue::Dimension(3)], &[]).unwrap(),
+            vec![
                 MixedValue::Array(vec![0.0; 9], vec![3, 3]),
                 MixedValue::Array(vec![1.0; 9], vec![3, 3]),
                 MixedValue::Array(vec![0.0, 0.0, 0.0, 1.0, 1.0, 1.0, 2.0, 2.0, 2.0], vec![3, 3]),
-            ]),
+            ],
         );
         let error = execute_mixed_program(&client, &program, &[MixedValue::Dimension(4)], &[]).unwrap_err().to_string();
         assert!(error.contains("input dimension `size` expected 3"), "{error}");
@@ -832,8 +833,8 @@ mod tests {
         let client = execution_client();
         ensure_assertion_handler_registered(&client).unwrap();
         assert_eq!(
-            execute_mixed_program(&client, &program, &[MixedValue::Dimension(2)], &[]),
-            Ok(vec![MixedValue::Array(vec![0.0; 8], vec![2, 2, 2])]),
+            execute_mixed_program(&client, &program, &[MixedValue::Dimension(2)], &[]).unwrap(),
+            vec![MixedValue::Array(vec![0.0; 8], vec![2, 2, 2])],
         );
         let error = execute_mixed_program(&client, &program, &[MixedValue::Dimension(3)], &[]).unwrap_err().to_string();
         assert!(error.contains("input dimension `size` expected 2"), "{error}");
@@ -871,15 +872,15 @@ mod tests {
         for extent in [3, 0] {
             let length = extent as usize;
             assert_eq!(
-                execute_mixed_program(&execution_client(), &program, &[MixedValue::Dimension(extent)], &[]),
-                Ok(vec![
+                execute_mixed_program(&execution_client(), &program, &[MixedValue::Dimension(extent)], &[]).unwrap(),
+                vec![
                     MixedValue::Array(vec![0.0; length], vec![length as u64]),
                     MixedValue::Array(vec![1.0; length], vec![length as u64]),
                     MixedValue::Array(vec![0.0; length], vec![length as u64]),
                     MixedValue::Dimension(extent),
                     MixedValue::Dimension(extent),
                     MixedValue::Dimension(extent),
-                ]),
+                ],
             );
         }
     }
@@ -965,14 +966,13 @@ mod tests {
                     vec![Placeholder],
                 )
                 .unwrap();
-            assert_eq!(
+            assert!(matches!(
                 to_mlir_module_for_plain_program(&program, "main"),
-                Err(LoweringError::UnsupportedOp {
-                    op: format!(
-                        "{name} output dimension `size` needs a finite upper bound for physical buffer allocation",
-                    ),
-                }),
-            );
+                Err(Error::UnsupportedOperation { op })
+                    if op == format!(
+                           "{name} output dimension `size` needs a finite upper bound for physical buffer allocation",
+                       ),
+            ));
         }
 
         let input_type =
@@ -983,10 +983,11 @@ mod tests {
         let program = builder
             .build::<Vec<XlaArrayConstant>, Vec<XlaArrayConstant>>(vec![output], vec![Placeholder], vec![Placeholder])
             .unwrap();
-        assert_eq!(
+        assert!(matches!(
             to_mlir_module_for_plain_program(&program, "main"),
-            Err(LoweringError::DynamicDimensionOutOfRange { value: i32::MAX as usize + 1 }),
-        );
+            Err(Error::DynamicDimensionOutOfRange { value })
+                if value == i32::MAX as usize + 1,
+        ));
     }
 
     #[test]
@@ -1412,10 +1413,10 @@ mod tests {
 
         // Tokens remain effect values and have no dense literal representation.
         let token = Array::from_logical_bytes(ArrayType::new_static(DataType::Token, [2]), &[]).unwrap();
-        assert_eq!(
+        assert!(matches!(
             token.to_dense_elements_attribute(tensor_type, &context),
-            Err(LoweringError::UnsupportedDataType { data_type: DataType::Token }),
-        );
+            Err(Error::UnsupportedDataType { data_type: DataType::Token }),
+        ));
     }
 
     #[test]

@@ -15,7 +15,7 @@ use crate::experimental::lowering::types::{
 use crate::operations::complex::lower_select_principal_phase_to_mlir;
 use crate::operations::extrema::lower_extremum_to_mlir;
 use crate::operations::{lower_accuracy, normalize_binary_elementwise_operands};
-use crate::{LowerableOperation, LowerableOperationFamily, LoweringError, XlaLowerer};
+use crate::{Error, LowerableOperation, LowerableOperationFamily, XlaLowerer};
 
 impl LowerableOperation for ExpOperation<ArrayType> {
     fn lower<'b, 'c: 'b, 't: 'c, O: LowerableOperationFamily>(
@@ -24,7 +24,7 @@ impl LowerableOperation for ExpOperation<ArrayType> {
         input_values: &[ValueRef<'b, 'c, 't>],
         _input_types: &[ArrayType],
         _output_types: &[ArrayType],
-    ) -> Result<Vec<ValueRef<'b, 'c, 't>>, LoweringError> {
+    ) -> Result<Vec<ValueRef<'b, 'c, 't>>, Error> {
         let result = lowerer.block.append_operation(stable_hlo::exponential(
             input_values[0],
             lower_accuracy(self.accuracy()),
@@ -41,7 +41,7 @@ impl LowerableOperation for ExpM1Operation<ArrayType> {
         input_values: &[ValueRef<'b, 'c, 't>],
         _input_types: &[ArrayType],
         output_types: &[ArrayType],
-    ) -> Result<Vec<ValueRef<'b, 'c, 't>>, LoweringError> {
+    ) -> Result<Vec<ValueRef<'b, 'c, 't>>, Error> {
         if output_types[0].data_type().is_complex() {
             return Ok(vec![lower_complex_exp_m1_to_mlir(
                 input_values[0],
@@ -68,7 +68,7 @@ impl LowerableOperation for LogOperation<ArrayType> {
         input_values: &[ValueRef<'b, 'c, 't>],
         _input_types: &[ArrayType],
         _output_types: &[ArrayType],
-    ) -> Result<Vec<ValueRef<'b, 'c, 't>>, LoweringError> {
+    ) -> Result<Vec<ValueRef<'b, 'c, 't>>, Error> {
         let result = lowerer.block.append_operation(stable_hlo::log(
             input_values[0],
             lower_accuracy(self.accuracy()),
@@ -85,7 +85,7 @@ impl LowerableOperation for Ln1pOperation<ArrayType> {
         input_values: &[ValueRef<'b, 'c, 't>],
         _input_types: &[ArrayType],
         output_types: &[ArrayType],
-    ) -> Result<Vec<ValueRef<'b, 'c, 't>>, LoweringError> {
+    ) -> Result<Vec<ValueRef<'b, 'c, 't>>, Error> {
         if output_types[0].data_type().is_complex() {
             return Ok(vec![lower_complex_ln_1p_to_mlir(
                 input_values[0],
@@ -113,7 +113,7 @@ impl LowerableOperation for LogAddExpOperation<ArrayType> {
         input_values: &[ValueRef<'b, 'c, 't>],
         _input_types: &[ArrayType],
         output_types: &[ArrayType],
-    ) -> Result<Vec<ValueRef<'b, 'c, 't>>, LoweringError> {
+    ) -> Result<Vec<ValueRef<'b, 'c, 't>>, Error> {
         let [left, right] = normalize_binary_elementwise_operands(
             input_values,
             output_types,
@@ -140,7 +140,7 @@ impl LowerableOperation for LogisticOperation<ArrayType> {
         input_values: &[ValueRef<'b, 'c, 't>],
         _input_types: &[ArrayType],
         output_types: &[ArrayType],
-    ) -> Result<Vec<ValueRef<'b, 'c, 't>>, LoweringError> {
+    ) -> Result<Vec<ValueRef<'b, 'c, 't>>, Error> {
         let output_type = &output_types[0];
         // Native logistic expands to `1 / (1 + exp(-x))`, whose exponential overflows before a negative
         // sigmoid tail underflows. Select the exponential's sign so its real component stays nonpositive.
@@ -282,7 +282,7 @@ fn lower_exponential_constant_like<'b, 'c: 'b, 't: 'c>(
     block: &mut BlockRef<'b, 'c, 't>,
     context: &'c MlirContext<'t>,
     location: LocationRef<'c, 't>,
-) -> Result<ValueRef<'b, 'c, 't>, LoweringError> {
+) -> Result<ValueRef<'b, 'c, 't>, Error> {
     let output_tensor_type = lower_tensor_type(output_type, context, location)?;
     if output_type.static_shape().is_some() {
         return lower_f64_constant_splat(factor, output_type, output_tensor_type, block, context, location);
@@ -307,7 +307,7 @@ fn lower_exponential_constant_like<'b, 'c: 'b, 't: 'c>(
             }
             Dimension::Dynamic(_) => lower_runtime_dimension_size_i64(input, axis, block, context, location),
         })
-        .collect::<Result<Vec<_>, LoweringError>>()?;
+        .collect::<Result<Vec<_>, Error>>()?;
     let shape = lower_explicit_shape(&dimensions, block, context, location)?;
     let broadcast = block
         .append_operation(stable_hlo::dynamic_broadcast(scalar, shape, &[], None, None, location)?)?
@@ -329,7 +329,7 @@ fn lower_complex_exp_m1_to_mlir<'b, 'c: 'b, 't: 'c>(
     block: &mut BlockRef<'b, 'c, 't>,
     context: &'c MlirContext<'t>,
     location: LocationRef<'c, 't>,
-) -> Result<ValueRef<'b, 'c, 't>, LoweringError> {
+) -> Result<ValueRef<'b, 'c, 't>, Error> {
     let part_type = output_type.clone().with_data_type(if output_type.data_type() == DataType::C64 {
         DataType::F32
     } else {
@@ -407,7 +407,7 @@ fn lower_complex_ln_1p_to_mlir<'b, 'c: 'b, 't: 'c>(
     block: &mut BlockRef<'b, 'c, 't>,
     context: &'c MlirContext<'t>,
     location: LocationRef<'c, 't>,
-) -> Result<ValueRef<'b, 'c, 't>, LoweringError> {
+) -> Result<ValueRef<'b, 'c, 't>, Error> {
     let part_type = output_type.clone().with_data_type(if output_type.data_type() == DataType::C64 {
         DataType::F32
     } else {
@@ -567,7 +567,7 @@ pub(crate) fn lower_log_add_exp_to_mlir<'b, 'c: 'b, 't: 'c>(
     block: &mut BlockRef<'b, 'c, 't>,
     context: &'c MlirContext<'t>,
     location: LocationRef<'c, 't>,
-) -> Result<ValueRef<'b, 'c, 't>, LoweringError> {
+) -> Result<ValueRef<'b, 'c, 't>, Error> {
     let output_tensor_type = lower_tensor_type(output_type, context, location)?;
     let data_type = output_type.data_type();
     let narrow = !data_type.is_complex() && !matches!(data_type, DataType::F32 | DataType::F64);

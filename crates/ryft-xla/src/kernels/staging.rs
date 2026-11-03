@@ -27,7 +27,7 @@ use ryft_mlir::ValueRef;
 
 use crate::experimental::ops::{FlatXlaProgram, XlaConstant, XlaOperation};
 use crate::kernels::{CompiledKernel, KernelEmbeddingError, KernelOutputEmbedding, validate_kernel_sharding};
-use crate::{LowerableOperation, LowerableOperationFamily, LoweringError, XlaLowerer, XlaTarget};
+use crate::{Error, LowerableOperation, LowerableOperationFamily, XlaLowerer, XlaTarget};
 
 /// Adapter operation families enabled in this XLA integration.
 ///
@@ -532,8 +532,8 @@ impl LowerableOperation for XlaKernelOperation {
         _input_values: &[ValueRef<'b, 'c, 't>],
         _input_types: &[ArrayIrType],
         _output_types: &[ArrayIrType],
-    ) -> Result<Vec<ValueRef<'b, 'c, 't>>, LoweringError> {
-        Err(LoweringError::UnsupportedOp {
+    ) -> Result<Vec<ValueRef<'b, 'c, 't>>, Error> {
+        Err(Error::UnsupportedOperation {
             op: format!("unselected kernel operation `{}` requires an explicit XLA compiler binding", self.name()),
         })
     }
@@ -1369,7 +1369,7 @@ pub(crate) mod tests {
         fn replay<'c>(
             program: &FlatXlaProgram,
             inputs: Vec<CompilationTracer<XlaDomain<'c>>>,
-        ) -> Result<Vec<CompilationTracer<XlaDomain<'c>>>, crate::experimental::domains::XlaDomainError> {
+        ) -> Result<Vec<CompilationTracer<XlaDomain<'c>>>, crate::Error> {
             let context = inputs[0].context().clone();
             Ok(program.interpret_in_context(&context, inputs)?)
         }
@@ -2238,7 +2238,7 @@ pub(crate) mod tests {
     #[test]
     fn test_select_kernels_in_shard_map() {
         use ryft_core::{
-            ArrayType, DataType, LogicalMesh, MeshAxis, MeshAxisType, ShardMap, ShardMapOperation, Sharding,
+            ArrayType, DataType, LogicalMesh, MeshAxis, MeshAxisType, ShardMapBoundary, ShardMapOperation, Sharding,
             ShardingDimension,
         };
         use ryft_kernels::{Grid, KernelParameterAccess, whole_array_parameter};
@@ -2263,7 +2263,7 @@ pub(crate) mod tests {
         let operation = ShardMapOperation::from_program(
             &body,
             vec![global.clone().into()],
-            ShardMap::new(mesh, vec![sharding.clone()], vec![sharding], vec!["device".to_owned()]).unwrap(),
+            ShardMapBoundary::new(mesh, vec![sharding.clone()], vec![sharding], vec!["device".to_owned()]).unwrap(),
         )
         .unwrap();
         let mut builder = XlaProgramBuilder::new();

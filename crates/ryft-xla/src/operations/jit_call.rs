@@ -31,7 +31,7 @@ use crate::experimental::lowering::types::lower_array_ir_type;
 use crate::experimental::lowering::{CollectiveLoweringState, EffectTokens};
 use crate::experimental::ops::{FlatXlaProgram, XlaConstant, XlaOperation, XlaProgram};
 use crate::operations::control_flow::lowered_effect_classes;
-use crate::{LowerableOperation, LowerableOperationFamily, LoweringError, XlaDomain, XlaLowerer, XlaValue};
+use crate::{Error, LowerableOperation, LowerableOperationFamily, XlaDomain, XlaLowerer, XlaValue};
 
 /// Structural identity of a flat callee program attached behind a `jit_call`, used to deduplicate repeated nested
 /// programs into shared private `func.func`s at lowering time.
@@ -250,7 +250,7 @@ fn count_jit_calls<Input, Output, O: LowerableOperationFamily>(
 /// [`lowered_effect_classes`]).
 pub(crate) fn collect_jit_call_functions<Input, Output, O: LowerableOperationFamily>(
     program: &XlaProgram<Input, Output, O>,
-) -> Result<JitCallFunctionMap<O>, LoweringError>
+) -> Result<JitCallFunctionMap<O>, Error>
 where
     Input: Parameterized<XlaConstant>,
     Output: Parameterized<XlaConstant>,
@@ -292,7 +292,7 @@ pub(crate) fn emit_jit_call_function<'b, 'c: 'b, 't: 'c, O: LowerableOperationFa
     collective_state: &CollectiveLoweringState,
     context: &'c MlirContext<'t>,
     location: LocationRef<'c, 't>,
-) -> Result<(), LoweringError> {
+) -> Result<(), Error> {
     let argument_tensor_types = function
         .input_types
         .iter()
@@ -371,7 +371,7 @@ pub(crate) fn lower_jit_call<'b, 'c: 'b, 't: 'c, O: LowerableOperationFamily>(
     nested_functions: Option<&Rc<JitCallFunctionMap<O>>>,
     collective_state: &CollectiveLoweringState,
     effect_tokens: &mut EffectTokens<'b, 'c, 't>,
-) -> Result<Vec<ValueRef<'b, 'c, 't>>, LoweringError> {
+) -> Result<Vec<ValueRef<'b, 'c, 't>>, Error> {
     // Only pure callees are ever deduplicated (`collect_jit_call_functions` skips effectful programs), so the
     // shared-function path below never interacts with the caller's effect tokens; effectful callees always take the
     // inline path, which threads the caller's per-class tokens through the callee body in program order.
@@ -409,7 +409,7 @@ pub(crate) fn lower_jit_call<'b, 'c: 'b, 't: 'c, O: LowerableOperationFamily>(
         }
     }
     if input_values.len() < capture_count {
-        return Err(LoweringError::MissingCapturedConstant { index: capture_count.saturating_sub(1) });
+        return Err(Error::MissingCapturedConstant { index: capture_count.saturating_sub(1) });
     }
     let captured_values = input_values[..capture_count].to_vec();
     lower_nested_program_inline(
@@ -1590,9 +1590,9 @@ impl LowerableOperation for JitCallOperation<ArrayIrType> {
         input_values: &[ValueRef<'b, 'c, 't>],
         _input_types: &[ArrayIrType],
         _output_types: &[ArrayIrType],
-    ) -> Result<Vec<ValueRef<'b, 'c, 't>>, LoweringError> {
+    ) -> Result<Vec<ValueRef<'b, 'c, 't>>, Error> {
         let [callee] = lowerer.regions.as_slice() else {
-            return Err(LoweringError::UnsupportedOp {
+            return Err(Error::UnsupportedOperation {
                 op: format!("jit_call expected 1 attached region but got {}", lowerer.regions.len()),
             });
         };
@@ -3328,8 +3328,9 @@ mod tests {
                 &pullback,
                 &[MixedValue::Array(vec![1.0, 2.0, 3.0, 0.0], vec![4])],
                 &[3],
-            ),
-            Ok(vec![MixedValue::Array(vec![1.0, 2.0, 3.0], vec![3]), MixedValue::Dimension(3)]),
+            )
+            .unwrap(),
+            vec![MixedValue::Array(vec![1.0, 2.0, 3.0], vec![3]), MixedValue::Dimension(3)],
         );
     }
 
@@ -3395,8 +3396,8 @@ mod tests {
             .trim_end(),
         );
         assert_eq!(
-            execute_mixed_program(&client, &transposed, &[MixedValue::Array(vec![2.0], vec![])], &[]),
-            Ok(vec![MixedValue::Array(vec![2.0], vec![])]),
+            execute_mixed_program(&client, &transposed, &[MixedValue::Array(vec![2.0], vec![])], &[]).unwrap(),
+            vec![MixedValue::Array(vec![2.0], vec![])],
         );
 
         let transposed = program.transpose_with_respect_to(&[0], &[]).unwrap();
@@ -3421,8 +3422,9 @@ mod tests {
                 &transposed,
                 &[MixedValue::Array(vec![2.0], vec![]), MixedValue::Array(vec![5.0], vec![])],
                 &[],
-            ),
-            Ok(vec![MixedValue::Array(vec![7.0], vec![])]),
+            )
+            .unwrap(),
+            vec![MixedValue::Array(vec![7.0], vec![])],
         );
     }
 
@@ -3495,7 +3497,7 @@ mod tests {
         let client = execution_client();
         ensure_print_handler_registered(&client).unwrap();
         let (outputs, lines) = with_captured_prints(|| execute_mixed_program(&client, &pullback, &[], &[]));
-        assert_eq!(outputs, Ok(Vec::new()));
+        assert_eq!(outputs.unwrap(), Vec::new(),);
         assert_eq!(lines, vec!["backward: 0.0"]);
     }
 
@@ -3659,8 +3661,9 @@ mod tests {
             .trim_end(),
         );
         assert_eq!(
-            execute_mixed_program(&execution_client(), &transposed, &[MixedValue::Array(vec![2.0], vec![])], &[]),
-            Ok(vec![MixedValue::Array(vec![2.0], vec![]), MixedValue::Array(vec![2.0, 2.0, 2.0], vec![3])]),
+            execute_mixed_program(&execution_client(), &transposed, &[MixedValue::Array(vec![2.0], vec![])], &[])
+                .unwrap(),
+            vec![MixedValue::Array(vec![2.0], vec![]), MixedValue::Array(vec![2.0, 2.0, 2.0], vec![3])],
         );
     }
 
@@ -3759,8 +3762,9 @@ mod tests {
                     &transposed,
                     &[MixedValue::Array(vec![3.0], vec![]), MixedValue::Array(vec![selector], vec![])],
                     &[],
-                ),
-                Ok(vec![MixedValue::Array(vec![expected], vec![])]),
+                )
+                .unwrap(),
+                vec![MixedValue::Array(vec![expected], vec![])],
             );
         }
     }
@@ -3830,8 +3834,8 @@ mod tests {
             .trim_end(),
         );
         assert_eq!(
-            execute_mixed_program(&client, &transposed, &[MixedValue::Array(vec![2.0], vec![])], &[]),
-            Ok(vec![MixedValue::Array(vec![4.0], vec![])]),
+            execute_mixed_program(&client, &transposed, &[MixedValue::Array(vec![2.0], vec![])], &[]).unwrap(),
+            vec![MixedValue::Array(vec![4.0], vec![])],
         );
 
         let program = nest(rematerialize().into(), XlaOperation::JitCall(JitCallOperation::new(0)));
@@ -3858,8 +3862,8 @@ mod tests {
             .trim_end(),
         );
         assert_eq!(
-            execute_mixed_program(&client, &transposed, &[MixedValue::Array(vec![2.0], vec![])], &[]),
-            Ok(vec![MixedValue::Array(vec![4.0], vec![])]),
+            execute_mixed_program(&client, &transposed, &[MixedValue::Array(vec![2.0], vec![])], &[]).unwrap(),
+            vec![MixedValue::Array(vec![4.0], vec![])],
         );
     }
 
@@ -5170,7 +5174,7 @@ mod tests {
         let local = ArrayIrType::from(DimensionType::new("local", bounds));
         let inputs = vec![input.clone()];
         let outputs = vec![input.clone(), local.clone(), local.clone()];
-        assert_eq!(CallTypeBindings::fresh(&inputs, &inputs), Ok(None));
+        assert_eq!(CallTypeBindings::fresh(&inputs, &inputs).unwrap(), None,);
 
         // One local family is exported once even when several results share it. Separate calls allocate separate
         // families, while forwarded input names stay shared.

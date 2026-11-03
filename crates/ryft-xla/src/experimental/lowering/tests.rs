@@ -112,7 +112,7 @@ pub(crate) fn execute_mixed_program(
     program: &FlatXlaProgram,
     inputs: &[MixedValue],
     extents: &[i32],
-) -> Result<Vec<MixedValue>, ryft_pjrt::Error> {
+) -> Result<Vec<MixedValue>, Error> {
     // First-class dimensions cross the executable boundary as `i64` scalars.
     let boundary_type = |r#type: &ArrayIrType| match r#type {
         ArrayIrType::Array(r#type) => r#type.clone(),
@@ -265,7 +265,7 @@ fn test_collect_nested_sharding_mesh() {
     let incompatible = LogicalMesh::new(vec![MeshAxis::new("x", 3, MeshAxisType::Explicit).unwrap()]).unwrap();
     assert!(matches!(
         collect_nested_sharding_mesh(&program, Some(incompatible.clone())),
-        Err(LoweringError::IncompatibleNestedMeshes)
+        Err(Error::IncompatibleNestedMeshes)
     ));
     assert!(matches!(
         to_mlir_module_for_program(
@@ -277,7 +277,7 @@ fn test_collect_nested_sharding_mesh() {
             Some(&[Sharding::replicated(incompatible, 1)]),
             None,
         ),
-        Err(LoweringError::IncompatibleNestedMeshes)
+        Err(Error::IncompatibleNestedMeshes)
     ));
 
     // Cast placement can be the module's only mesh use, including when its result is internal.
@@ -330,7 +330,7 @@ fn test_array_ir_lowering_rejects_unresolved_reference_type() {
     let reference_type = ArrayIrType::Reference(ReferenceType::new(ArrayType::scalar(DataType::F32)));
     assert!(matches!(
         lower_array_ir_type(&reference_type, &context, location),
-        Err(LoweringError::UnresolvedReference { construct }) if construct == reference_type.to_string(),
+        Err(Error::UnresolvedReference { construct }) if construct == reference_type.to_string(),
     ));
 }
 
@@ -361,7 +361,7 @@ fn test_array_ir_lowering_rejects_bound_manual_output_placement() {
         .unwrap();
     assert!(matches!(
         lower_replicated_shard_map_body(body, 2),
-        Err(LoweringError::Tracing(ProgramError::UnsupportedOperation { message }))
+        Err(Error::Core(ryft_core::Error::Program(ProgramError::UnsupportedOperation { message })))
             if message == "`cast` cannot assign bound manual mesh axes to local output dimensions",
     ));
 }
@@ -415,7 +415,7 @@ fn test_xla_lowering_rejects_unresolved_reference_state_before_token_threading()
             None,
             None,
         ),
-        Err(LoweringError::UnresolvedReference { construct }) if construct == "program",
+        Err(Error::UnresolvedReference { construct }) if construct == "program",
     ));
 }
 
@@ -495,7 +495,7 @@ fn test_reference_state_aliases_use_physical_indices_and_preserve_shardings() {
             std::slice::from_ref(&invalid_state),
             RaggedDotLoweringStrategy::default(),
         ),
-        Err(LoweringError::InvalidReferenceStateAbi { message })
+        Err(Error::InvalidReferenceStateAbi { message })
             if message == "logical state input 0 is erased from the executable boundary",
     ));
 
@@ -517,7 +517,7 @@ fn test_reference_state_aliases_use_physical_indices_and_preserve_shardings() {
                 &states,
                 RaggedDotLoweringStrategy::default(),
             ),
-            Err(LoweringError::InvalidReferenceStateAbi { message })
+            Err(Error::InvalidReferenceStateAbi { message })
                 if message == asymmetric_sharding_message,
         ));
     }
@@ -536,7 +536,7 @@ fn test_reference_state_aliases_use_physical_indices_and_preserve_shardings() {
             &states,
             RaggedDotLoweringStrategy::default(),
         ),
-        Err(LoweringError::InvalidReferenceStateAbi { message })
+        Err(Error::InvalidReferenceStateAbi { message })
             if message == "state input 1 and output 0 must use the same sharding",
     ));
 }
@@ -567,7 +567,7 @@ fn test_bounded_dynamic_reference_state_alias_is_rejected_before_lowering() {
             std::slice::from_ref(&reference_state),
             RaggedDotLoweringStrategy::default(),
         ),
-        Err(LoweringError::InvalidReferenceStateAbi { message })
+        Err(Error::InvalidReferenceStateAbi { message })
             if message == "state input 0 and output 0 must be static because bounded-dynamic mutation alias \
                            compatibility is unsupported",
     ));
@@ -875,7 +875,7 @@ pub(crate) fn add_xla_jit_call(
 pub(crate) fn lower_replicated_shard_map_body(
     body_program: FlatXlaProgram,
     device_count: usize,
-) -> Result<String, LoweringError> {
+) -> Result<String, Error> {
     use ryft_core::ShardMapOperation;
 
     let vector_type = test_vector_type(4);
@@ -884,7 +884,7 @@ pub(crate) fn lower_replicated_shard_map_body(
     let operation = ShardMapOperation::from_program(
         &body_program,
         vec![vector_type.clone().into()],
-        ShardMap::new(mesh, vec![sharding.clone()], vec![sharding], vec!["x".to_string()]).unwrap(),
+        ShardMapBoundary::new(mesh, vec![sharding.clone()], vec![sharding], vec!["x".to_string()]).unwrap(),
     )
     .unwrap();
     let mut builder = ArrayIrXlaProgramBuilder::new();
@@ -1036,7 +1036,7 @@ pub(crate) fn lowered_unary_module(
     operation: ArrayOperation<XlaArrayConstant>,
     data_type: DataType,
     dimensions: Vec<usize>,
-) -> Result<String, LoweringError> {
+) -> Result<String, Error> {
     let input_type = ArrayType::new(data_type, Shape::new(dimensions.into_iter().map(Dimension::Static).collect()));
     let mut builder = XlaProgramBuilder::new();
     let input = builder.add_input(input_type);
@@ -1079,7 +1079,7 @@ pub(crate) fn lowered_reduce_module(
     kind: ReductionKind,
     axes: Vec<usize>,
     dimensions: Vec<usize>,
-) -> Result<String, LoweringError> {
+) -> Result<String, Error> {
     lowered_unary_module(ArrayOperation::Reduce(ReduceOperation::new(axes, kind)), data_type, dimensions)
 }
 
@@ -1258,6 +1258,6 @@ fn test_xla_lowering_rejects_preserved_reference_entries() {
             None,
             None,
         ),
-        Err(LoweringError::UnresolvedReference { construct }) if construct == "program",
+        Err(Error::UnresolvedReference { construct }) if construct == "program",
     ));
 }

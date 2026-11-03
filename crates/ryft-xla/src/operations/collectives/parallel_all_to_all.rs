@@ -13,7 +13,7 @@ use crate::experimental::lowering::types::lower_tensor_type;
 use crate::operations::collectives::{
     collapse_singleton_axis, collective_replica_groups, refine_collective_result_dimensions,
 };
-use crate::{LowerableOperation, LowerableOperationFamily, LoweringError, MemberLowerableOperation, XlaLowerer};
+use crate::{Error, LowerableOperation, LowerableOperationFamily, MemberLowerableOperation, XlaLowerer};
 
 /// Lowers one traced `parallel_all_to_all` to a channeled `stablehlo.all_to_all` over the named mesh axis's replica
 /// groups.
@@ -26,7 +26,7 @@ pub(crate) fn lower_parallel_all_to_all_to_mlir<'b, 'c: 'b, 't: 'c>(
     block: &mut BlockRef<'b, 'c, 't>,
     context: &'c MlirContext<'t>,
     location: LocationRef<'c, 't>,
-) -> Result<Vec<ValueRef<'b, 'c, 't>>, LoweringError> {
+) -> Result<Vec<ValueRef<'b, 'c, 't>>, Error> {
     let (replica_groups, axis_size) = collective_replica_groups(
         collective_state,
         operation.axis_name(),
@@ -91,7 +91,7 @@ impl LowerableOperation for ParallelAllToAllOperation {
         input_values: &[ValueRef<'b, 'c, 't>],
         input_types: &[ArrayType],
         output_types: &[ArrayType],
-    ) -> Result<Vec<ValueRef<'b, 'c, 't>>, LoweringError> {
+    ) -> Result<Vec<ValueRef<'b, 'c, 't>>, Error> {
         check_count!("input", input_values, 1, ProgramError);
         check_count!("output", output_types, 1, ProgramError);
         let collective_state = lowerer.collective_state.clone();
@@ -123,7 +123,7 @@ impl MemberLowerableOperation<ArrayIrType> for ParallelAllToAllOperation {
         input_values: &[ValueRef<'b, 'c, 't>],
         input_types: &[ArrayIrType],
         output_types: &[ArrayIrType],
-    ) -> Result<Vec<ValueRef<'b, 'c, 't>>, LoweringError> {
+    ) -> Result<Vec<ValueRef<'b, 'c, 't>>, Error> {
         let context = lowerer.context;
         let location = lowerer.location;
         let collective_state = &lowerer.collective_state;
@@ -142,11 +142,11 @@ impl MemberLowerableOperation<ArrayIrType> for ParallelAllToAllOperation {
         let Some(input_type) = input_types.first() else {
             return Err(ProgramError::InvalidInputCount { expected: 1, actual: 0 }.into());
         };
-        let input_type = <&ArrayType>::try_from(input_type).map_err(|error| LoweringError::Tracing(error.into()))?;
+        let input_type = <&ArrayType>::try_from(input_type)?;
         let [output_type] = output_types else {
             return Err(ProgramError::InvalidOutputCount { expected: 1, actual: output_types.len() }.into());
         };
-        let output_type = <&ArrayType>::try_from(output_type).map_err(|error| LoweringError::Tracing(error.into()))?;
+        let output_type = <&ArrayType>::try_from(output_type)?;
         let result = lower_parallel_all_to_all_to_mlir(
             self,
             collective_state,

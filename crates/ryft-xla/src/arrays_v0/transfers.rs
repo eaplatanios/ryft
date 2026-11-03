@@ -209,28 +209,28 @@ pub(crate) fn exact_shard_transfer_key(
     source_shard_index: ShardIndex,
     destination_shard_index: ShardIndex,
     destination_shard_count: usize,
-) -> Result<CrossHostTransferKey, ArrayError> {
+) -> Result<CrossHostTransferKey, Error> {
     let transfer_key = source_shard_index
         .checked_mul(destination_shard_count)
         .and_then(|key| key.checked_add(destination_shard_index))
-        .ok_or(ArrayError::CrossHostTransferKeyTooLarge { source_shard_index, destination_shard_index })?;
+        .ok_or(Error::CrossHostTransferKeyTooLarge { source_shard_index, destination_shard_index })?;
     i64::try_from(transfer_key)
-        .map_err(|_| ArrayError::CrossHostTransferKeyTooLarge { source_shard_index, destination_shard_index })
+        .map_err(|_| Error::CrossHostTransferKeyTooLarge { source_shard_index, destination_shard_index })
 }
 
 /// Returns the PJRT cross-host global device ID for `device_id`.
-pub(crate) fn cross_host_global_device_id(device_id: DeviceId) -> Result<GlobalDeviceId, ArrayError> {
-    i32::try_from(device_id).map_err(|_| ArrayError::CrossHostTransferDeviceIdTooLarge { device_id })
+pub(crate) fn cross_host_global_device_id(device_id: DeviceId) -> Result<GlobalDeviceId, Error> {
+    i32::try_from(device_id).map_err(|_| Error::CrossHostTransferDeviceIdTooLarge { device_id })
 }
 
 /// Returns the PJRT cross-host shape for one destination shard.
-fn cross_host_shape(plan: &CrossHostShardReceivePlan) -> Result<Vec<i64>, ArrayError> {
+fn cross_host_shape(plan: &CrossHostShardReceivePlan) -> Result<Vec<i64>, Error> {
     plan.destination_shape()
         .as_slice()
         .iter()
         .enumerate()
         .map(|(dimension, &size)| {
-            i64::try_from(size).map_err(|_| ArrayError::CrossHostTransferShapeDimensionTooLarge {
+            i64::try_from(size).map_err(|_| Error::CrossHostTransferShapeDimensionTooLarge {
                 shard_index: plan.destination_shard_index(),
                 dimension,
                 size,
@@ -276,7 +276,7 @@ pub(crate) fn plan_exact_shard_put<'o>(
     global_shape: &StaticShape,
     mesh: &DeviceMesh,
     sharding: &Sharding,
-) -> Result<Option<ExactShardPutPlan>, ArrayError> {
+) -> Result<Option<ExactShardPutPlan>, Error> {
     let mut source_shards_by_slices = HashMap::<Vec<Range<usize>>, Vec<&XlaArrayShard<'o>>>::new();
     for shard in array.shards() {
         source_shards_by_slices.entry(shard.slice().to_vec()).or_default().push(shard);
@@ -352,7 +352,7 @@ pub(crate) fn copy_addressable_destination_shards_from_exact_source_shards<'o>(
     global_shape: &StaticShape,
     mesh: &DeviceMesh,
     sharding: &Sharding,
-) -> Result<Option<Vec<Buffer<'o>>>, ArrayError> {
+) -> Result<Option<Vec<Buffer<'o>>>, Error> {
     let client_process_index = client.process_index()?;
     let plan = match plan_exact_shard_put(array, client_process_index, global_shape, mesh, sharding)? {
         Some(plan) => plan,
@@ -380,7 +380,7 @@ pub(crate) fn copy_addressable_destination_shards_from_exact_source_shards<'o>(
         for send_plan in plan.cross_host_sends() {
             let source_buffer = array
                 .addressable_device_shard(send_plan.source_device_id())
-                .ok_or(ArrayError::MissingAddressableShardForMove {
+                .ok_or(Error::MissingAddressableShardForMove {
                     shard_index: send_plan.source_shard_index(),
                     device_id: send_plan.source_device_id(),
                 })?
@@ -403,7 +403,7 @@ pub(crate) fn copy_addressable_destination_shards_from_exact_source_shards<'o>(
     for local_copy_plan in plan.local_copies() {
         let source_buffer = array
             .addressable_device_shard(local_copy_plan.source_device_id())
-            .ok_or(ArrayError::MissingAddressableShardForMove {
+            .ok_or(Error::MissingAddressableShardForMove {
                 shard_index: local_copy_plan.source_shard_index(),
                 device_id: local_copy_plan.source_device_id(),
             })?

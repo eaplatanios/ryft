@@ -8,6 +8,8 @@ use std::sync::Mutex;
 
 use thiserror::Error;
 
+// TODO(eaplatanios): Promote ROCm errors to dedicated `ryft_xla::Error` variants after
+//  this support leaves experimental status.
 /// Validation, availability, or native execution failure produced by this crate.
 #[derive(Error, Clone, Debug, PartialEq, Eq)]
 pub enum Error {

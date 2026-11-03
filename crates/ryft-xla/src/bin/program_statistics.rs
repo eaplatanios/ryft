@@ -10,7 +10,6 @@ use std::env;
 use std::ops::{Add, Mul};
 
 use serde::Serialize;
-use thiserror::Error;
 
 use ryft_core::{
     Array, ArrayOperation, ArrayType, Context, DataType, Differentiate, DifferentiationError, Dimension, Dot,
@@ -18,30 +17,8 @@ use ryft_core::{
     ProgramError, ProgramStatistics, ReverseModeDifferentiate, Shape, Sharding, ShardingDimension, Sin, shard_map,
     shard_map_with_options,
 };
-use ryft_xla::experimental::{TraceError, TracedXlaProgram, XlaArrayTracer, trace};
-
-/// Error type returned by the program statistics emitters.
-#[derive(Debug, Error)]
-enum StatisticsError {
-    /// Wrapper around tracing failures while building a case's program.
-    #[error("{0}")]
-    Trace(#[from] ProgramError),
-
-    /// Wrapper around differentiation failures while building a case's program.
-    #[error("{0}")]
-    Differentiation(#[from] DifferentiationError),
-
-    /// Wrapper around XLA tracing failures (including shard-map tracing failures) while building a case's program.
-    #[error("{0}")]
-    XlaTrace(#[from] TraceError),
-
-    /// Error returned when a requested case ID is unknown.
-    #[error("unknown program statistics case `{case_id}`")]
-    UnknownCase {
-        /// Unknown case identifier.
-        case_id: String,
-    },
-}
+use ryft_xla::Error;
+use ryft_xla::experimental::{TracedXlaProgram, XlaArrayTracer, trace};
 
 /// One emitted program statistics record.
 #[derive(Clone, Debug, Serialize, PartialEq, Eq)]
@@ -72,7 +49,7 @@ struct ProgramStatisticsCase {
     surface: &'static str,
 
     /// Callback that traces the case's workload and returns its structural statistics.
-    emit: fn() -> Result<ProgramStatistics, StatisticsError>,
+    emit: fn() -> Result<ProgramStatistics, Error>,
 }
 
 /// Returns the stable case registry, asserting that its case IDs are unique.
@@ -143,7 +120,7 @@ fn registry() -> Vec<ProgramStatisticsCase> {
 /// # Parameters
 ///
 ///   - `case_ids`: Optional exact case IDs to emit.
-fn collect_records(case_ids: &[String]) -> Result<Vec<ProgramStatisticsRecord>, StatisticsError> {
+fn collect_records(case_ids: &[String]) -> Result<Vec<ProgramStatisticsRecord>, Error> {
     let all_cases = registry();
     let selected_cases = if case_ids.is_empty() {
         all_cases
@@ -155,7 +132,7 @@ fn collect_records(case_ids: &[String]) -> Result<Vec<ProgramStatisticsRecord>, 
                     .iter()
                     .copied()
                     .find(|case| case.case_id == case_id)
-                    .ok_or_else(|| StatisticsError::UnknownCase { case_id: case_id.clone() })
+                    .ok_or_else(|| Error::UnknownProgramStatisticsCase { case_id: case_id.clone() })
             })
             .collect::<Result<Vec<_>, _>>()?
     };
@@ -183,7 +160,7 @@ fn quartic_plus_sin<T: Clone + Sin + Add<Output = T> + Mul<Output = T>>(x: T) ->
 }
 
 /// Emits the plain JIT scalar bilinear case.
-fn emit_scalar_bilinear_sin_jit() -> Result<ProgramStatistics, StatisticsError> {
+fn emit_scalar_bilinear_sin_jit() -> Result<ProgramStatistics, Error> {
     let (_, program): (Array, Program<Array, ArrayOperation<Array>, (Array, Array), Array>) =
         EagerContext::<Array, ArrayOperation<Array>>::new().interpret_and_trace(
             |inputs| Ok(inputs.0.clone() * inputs.1 + inputs.0.sin()?),
@@ -193,7 +170,7 @@ fn emit_scalar_bilinear_sin_jit() -> Result<ProgramStatistics, StatisticsError> 
 }
 
 /// Emits the staged scalar bilinear pullback case.
-fn emit_scalar_bilinear_sin_vjp_pullback() -> Result<ProgramStatistics, StatisticsError> {
+fn emit_scalar_bilinear_sin_vjp_pullback() -> Result<ProgramStatistics, Error> {
     let (_, pullback): (Array, _) = EagerContext::<Array, ArrayOperation<Array>>::new().vjp(
         |inputs, ()| Ok(inputs.0.clone() * inputs.1 + inputs.0.sin()?),
         (Array::scalar(2.0)?, Array::scalar(3.0)?),
@@ -205,7 +182,7 @@ fn emit_scalar_bilinear_sin_vjp_pullback() -> Result<ProgramStatistics, Statisti
 }
 
 /// Emits the staged scalar reverse-mode gradient case.
-fn emit_scalar_quartic_plus_sin_grad() -> Result<ProgramStatistics, StatisticsError> {
+fn emit_scalar_quartic_plus_sin_grad() -> Result<ProgramStatistics, Error> {
     let (_, program): (Array, Program<Array, ArrayOperation<Array>, Array, Array>) =
         EagerContext::<Array, ArrayOperation<Array>>::new().interpret_and_trace(
             |x| {
@@ -224,7 +201,7 @@ fn emit_scalar_quartic_plus_sin_grad() -> Result<ProgramStatistics, StatisticsEr
 }
 
 /// Emits the staged scalar value-and-gradient case.
-fn emit_scalar_quartic_plus_sin_value_and_gradient() -> Result<ProgramStatistics, StatisticsError> {
+fn emit_scalar_quartic_plus_sin_value_and_gradient() -> Result<ProgramStatistics, Error> {
     let (_, program): ((Array, Array), Program<Array, ArrayOperation<Array>, Array, (Array, Array)>) =
         EagerContext::<Array, ArrayOperation<Array>>::new().interpret_and_trace(
             |x| {
@@ -243,7 +220,7 @@ fn emit_scalar_quartic_plus_sin_value_and_gradient() -> Result<ProgramStatistics
 }
 
 /// Emits the directly linearized pushforward of `f(x) = x⁴ + sin(x)`, closed over its lifted residuals.
-fn emit_scalar_quartic_plus_sin_linearize_pushforward() -> Result<ProgramStatistics, StatisticsError> {
+fn emit_scalar_quartic_plus_sin_linearize_pushforward() -> Result<ProgramStatistics, Error> {
     let context = EagerContext::<Array, ArrayOperation<Array>>::new();
     let (_, pushforward) = context.linearize(
         |x, ()| Ok(x.clone() * x.clone() * x.clone() * x.clone() + x.sin()?),
@@ -295,7 +272,7 @@ fn matrix_type(rows: usize, cols: usize) -> ArrayType {
 }
 
 /// Emits the basic traced `shard_map` case.
-fn emit_shard_map_basic() -> Result<ProgramStatistics, StatisticsError> {
+fn emit_shard_map_basic() -> Result<ProgramStatistics, Error> {
     let mesh = shard_map_mesh();
     let sharding = Sharding::new(mesh.clone(), vec![ShardingDimension::sharded(["x"])]).unwrap();
     let traced: TracedXlaProgram<ArrayType, ArrayType> = trace(
@@ -320,7 +297,7 @@ fn emit_shard_map_basic() -> Result<ProgramStatistics, StatisticsError> {
 }
 
 /// Emits the traced `shard_map` matrix-multiplication case.
-fn emit_shard_map_matmul() -> Result<ProgramStatistics, StatisticsError> {
+fn emit_shard_map_matmul() -> Result<ProgramStatistics, Error> {
     let mesh = shard_map_mesh();
     let lhs_sharding =
         Sharding::new(mesh.clone(), vec![ShardingDimension::sharded(["x"]), ShardingDimension::replicated()]).unwrap();
@@ -349,7 +326,7 @@ fn emit_shard_map_matmul() -> Result<ProgramStatistics, StatisticsError> {
 
 /// Emits the nested traced `shard_map` case: an outer map that makes only `x` manual around an inner map over the
 /// remaining manual axis `y` of the same mesh, which inherits `x` from the outer map.
-fn emit_nested_shard_map() -> Result<ProgramStatistics, StatisticsError> {
+fn emit_nested_shard_map() -> Result<ProgramStatistics, Error> {
     let mesh = LogicalMesh::new(vec![
         MeshAxis::new("x", 2, MeshAxisType::Manual).unwrap(),
         MeshAxis::new("y", 2, MeshAxisType::Manual).unwrap(),

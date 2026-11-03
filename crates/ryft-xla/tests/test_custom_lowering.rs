@@ -10,7 +10,7 @@ use ryft_mlir::dialects::stable_hlo;
 use ryft_mlir::{Block, Operation as MlirOperation, Value as MlirValue, ValueRef};
 use ryft_xla::experimental::ops::{XlaConstant, XlaOperation};
 use ryft_xla::{
-    LowerableOperation, LowerableOperationFamily, LoweringError, XlaLowerer, lower_operation_variants,
+    Error, LowerableOperation, LowerableOperationFamily, XlaLowerer, lower_operation_variants,
     to_mlir_module_for_program,
 };
 
@@ -41,7 +41,7 @@ impl LowerableOperation for TwiceOperation {
         input_values: &[ValueRef<'b, 'c, 't>],
         _input_types: &[ArrayIrType],
         _output_types: &[ArrayIrType],
-    ) -> Result<Vec<ValueRef<'b, 'c, 't>>, LoweringError> {
+    ) -> Result<Vec<ValueRef<'b, 'c, 't>>, Error> {
         let doubled =
             lowerer
                 .block()
@@ -65,7 +65,7 @@ impl LowerableOperation for ExtendedOperation {
         input_values: &[ValueRef<'b, 'c, 't>],
         input_types: &[ArrayIrType],
         output_types: &[ArrayIrType],
-    ) -> Result<Vec<ValueRef<'b, 'c, 't>>, LoweringError> {
+    ) -> Result<Vec<ValueRef<'b, 'c, 't>>, Error> {
         lower_operation_variants!(
             self, ExtendedOperation, lowerer, input_values, input_types, output_types;
             Xla => boxed,

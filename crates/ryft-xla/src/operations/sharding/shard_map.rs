@@ -5,8 +5,8 @@ use ryft_core::{
     ArrayIrType, ArrayType, AxisIndexOperation, LogicalMesh, MeshAxisType, Operation, OperationPayloadProjection,
     ParallelAllGatherOperation, ParallelAllToAllOperation, ParallelPermuteOperation, ParallelRaggedAllToAllOperation,
     ParallelReduceOperation, ParallelSumScatterOperation, ParallelVaryOperation, Parameterized, ProgramError, RegionId,
-    SHARD_MAP_OPERATION_NAME, ShardMap, ShardMapError, ShardMapOperation, Sharding, ShardingDimension, TracedShardMap,
-    TypedProgram,
+    SHARD_MAP_OPERATION_NAME, ShardMapBoundary, ShardMapError, ShardMapOperation, Sharding, ShardingDimension,
+    TracedShardMap, TypedProgram,
 };
 use ryft_mlir::dialects::shardy::{
     DimensionShardingAttributeRef, ManualAxesAttributeRef, TensorShardingAttributeRef,
@@ -28,7 +28,7 @@ use crate::experimental::lowering::{
 use crate::experimental::ops::{FlatXlaProgram, XlaConstant, XlaOperation, XlaProgram};
 use crate::operations::control_flow::lowered_effect_classes;
 use crate::sharding::SHARDY_MESH_SYMBOL_NAME;
-use crate::{LowerableOperation, LowerableOperationFamily, LoweringError, ToMlir, XlaDomain, XlaLowerer};
+use crate::{Error, LowerableOperation, LowerableOperationFamily, ToMlir, XlaDomain, XlaLowerer};
 
 /// Lowers a [`TracedShardMap`] traced for [`XlaDomain`] (e.g., by [`ryft_core::trace_shard_map`]) to a textual
 /// StableHLO/Shardy MLIR module whose single function runs the traced body as one `sdy.manual_computation` over the
@@ -43,24 +43,25 @@ use crate::{LowerableOperation, LowerableOperationFamily, LoweringError, ToMlir,
 ///
 /// # Errors
 ///
-/// Returns [`LoweringError::UnresolvedReference`] or [`LoweringError::UnresolvedState`] when the traced body contains
-/// undischarged references or state, and [`LoweringError::InvalidFunctionName`] for an invalid `function_name`. Nested
-/// manual computations that Shardy cannot represent are rejected with [`LoweringError::Tracing`] wrapping (as a
-/// [`ProgramError::Custom`] that [`ProgramError::downcast_custom`] recovers) a [`ShardMapError::AxisAlreadyManual`]
-/// when a nested shard map makes an axis manual that an enclosing manual computation already made manual, and a
+/// Returns [`Error::UnresolvedReference`] or [`Error::UnresolvedState`] when the traced body contains
+/// undischarged references or state, and [`Error::InvalidFunctionName`] for an invalid `function_name`. Nested
+/// manual computations that Shardy cannot represent are rejected with [`Error::Core`] wrapping a [`ProgramError`]
+/// whose [`ProgramError::Custom`] payload [`ProgramError::downcast_custom`] recovers as a
+/// [`ShardMapError::AxisAlreadyManual`] when a nested shard map makes an axis manual that an enclosing manual
+/// computation already made manual, and a
 /// [`ShardMapError::SpecificationNamesEnclosingManualAxis`] when an input or output sharding of a nested shard map
 /// names such an axis. A traced shard map whose global input or output type varies along a mesh axis that is not one
 /// of its own manual axes (e.g., one traced with [`ryft_core::trace_shard_map_with_named_axes`] inside an enclosing
-/// manual region) is rejected with [`LoweringError::StandaloneShardMapVariesAlongEnclosingManualAxis`], because the
+/// manual region) is rejected with [`Error::StandaloneShardMapVariesAlongEnclosingManualAxis`], because the
 /// standalone module has no enclosing manual region that makes such an axis manual. For the same reason, a body that
 /// applies a collective (including `axis_index`) along such an axis is rejected with
-/// [`LoweringError::StandaloneShardMapCommunicatesAlongEnclosingManualAxis`], even when the boundary does not vary
-/// along it. Other [`LoweringError`]s report failures to lower the traced body (e.g., for operations that the backend
+/// [`Error::StandaloneShardMapCommunicatesAlongEnclosingManualAxis`], even when the boundary does not vary
+/// along it. Other [`Error`]s report failures to lower the traced body (e.g., for operations that the backend
 /// cannot lower or invalid tensor types).
 pub fn to_mlir_module<Input: Parameterized<ArrayType>, Output: Parameterized<ArrayType>, S: AsRef<str>>(
     traced_shard_map: &TracedShardMap<XlaDomain<'static>, Input, Output>,
     function_name: S,
-) -> Result<String, LoweringError> {
+) -> Result<String, Error> {
     let program = traced_shard_map.body();
     let shard_map = traced_shard_map.operation().shard_map();
     // The boundary of a standalone module is global, so it cannot carry the variation of enclosing manual regions.
@@ -73,7 +74,7 @@ pub fn to_mlir_module<Input: Parameterized<ArrayType>, Output: Parameterized<Arr
                 sharding.varying_manual_axes().iter().find(|axis| !shard_map.manual_axes().contains(*axis))
             });
             if let Some(axis_name) = axis_name {
-                return Err(LoweringError::StandaloneShardMapVariesAlongEnclosingManualAxis {
+                return Err(Error::StandaloneShardMapVariesAlongEnclosingManualAxis {
                     value_kind,
                     value_index,
                     axis_name: axis_name.clone(),
@@ -89,18 +90,15 @@ pub fn to_mlir_module<Input: Parameterized<ArrayType>, Output: Parameterized<Arr
         shard_map.mesh(),
         shard_map.manual_axes(),
     ) {
-        return Err(LoweringError::StandaloneShardMapCommunicatesAlongEnclosingManualAxis {
-            operation_name,
-            axis_name,
-        });
+        return Err(Error::StandaloneShardMapCommunicatesAlongEnclosingManualAxis { operation_name, axis_name });
     }
     // This module entry must enforce the same discharge preconditions as `lower_mlir_module_for_program`: these are
     // the only guards keeping unresolved state and references out of the shard-map token-threading machinery.
     if contains_unresolved_references(program) {
-        return Err(LoweringError::UnresolvedReference { construct: "program".to_string() });
+        return Err(Error::UnresolvedReference { construct: "program".to_string() });
     }
     if contains_unresolved_state(program) {
-        return Err(LoweringError::UnresolvedState { construct: "program".to_string() });
+        return Err(Error::UnresolvedState { construct: "program".to_string() });
     }
     lower_shard_map_module(
         shard_map,
@@ -176,13 +174,13 @@ fn find_collective_along_enclosing_manual_axis(
 /// Lowers the shard-map `program` over its flat boundary types to a textual StableHLO/Shardy MLIR module (refer to
 /// [`to_mlir_module`]).
 fn lower_shard_map_module(
-    shard_map: &ShardMap,
+    shard_map: &ShardMapBoundary,
     program: &FlatXlaProgram,
     global_input_types: Vec<ArrayType>,
     local_input_types: Vec<ArrayType>,
     global_output_types: Vec<ArrayType>,
     function_name: &str,
-) -> Result<String, LoweringError> {
+) -> Result<String, Error> {
     let function_name = normalize_function_name(function_name)?;
 
     let context = MlirContext::new();
@@ -200,7 +198,7 @@ fn lower_shard_map_module(
     let mesh_operation = shard_map.mesh().to_mlir(location)?;
     module.body()?.append_operation(mesh_operation)?;
 
-    // The global boundary types of a traced shard map carry no memory kind (refer to `ShardMap::global_input_type` and
+    // The global boundary types of a traced shard map carry no memory kind (refer to `ShardMapBoundary::global_input_type` and
     // to the global output type derivation of `ShardMapOperation::from_program`), so the function signature carries
     // the boundary shardings and any requested physical layouts.
     let function_arguments = global_input_tensor_types
@@ -215,7 +213,7 @@ fn lower_shard_map_module(
             }
             Ok(TypeAndAttributes { r#type: tensor_type.as_ref(), attributes: Some(attributes) })
         })
-        .collect::<Result<Vec<_>, LoweringError>>()?;
+        .collect::<Result<Vec<_>, Error>>()?;
     let function_results = global_output_tensor_types
         .iter()
         .zip(&global_output_types)
@@ -228,7 +226,7 @@ fn lower_shard_map_module(
             }
             Ok(TypeAndAttributes { r#type: tensor_type.as_ref(), attributes: Some(attributes) })
         })
-        .collect::<Result<Vec<_>, LoweringError>>()?;
+        .collect::<Result<Vec<_>, Error>>()?;
 
     // Module-scoped collective lowering state: this entry point lowers one whole module.
     let collective_state = CollectiveLoweringState::new();
@@ -270,7 +268,7 @@ fn lower_shard_map_module(
 
     remove_unused_constants(&module)?;
     if !module.verify()? {
-        return Err(LoweringError::MlirVerificationFailure);
+        return Err(Error::MlirVerificationFailure);
     }
 
     serialize_lowered_module(&module, &collective_state)
@@ -283,7 +281,7 @@ fn lower_shard_map_module(
 pub(crate) fn lower_manual_computation<'b, 'c: 'b, 't: 'c, ProgramInput, ProgramOutput, O: LowerableOperationFamily>(
     block: &mut BlockRef<'b, 'c, 't>,
     outer_inputs: &[ValueRef<'b, 'c, 't>],
-    shard_map: &ShardMap,
+    shard_map: &ShardMapBoundary,
     program: &XlaProgram<ProgramInput, ProgramOutput, O>,
     local_input_types: &[ArrayType],
     global_output_types: &[ArrayType],
@@ -291,7 +289,7 @@ pub(crate) fn lower_manual_computation<'b, 'c: 'b, 't: 'c, ProgramInput, Program
     location: LocationRef<'c, 't>,
     collective_state: &CollectiveLoweringState,
     effect_tokens: &mut EffectTokens<'b, 'c, 't>,
-) -> Result<Vec<ValueRef<'b, 'c, 't>>, LoweringError>
+) -> Result<Vec<ValueRef<'b, 'c, 't>>, Error>
 where
     ProgramInput: Parameterized<XlaConstant>,
     ProgramOutput: Parameterized<XlaConstant>,
@@ -410,36 +408,36 @@ where
     manual_computation
         .results()
         .take(global_output_types.len())
-        .map(|result| result.map(|result| result.as_ref()).map_err(LoweringError::from))
+        .map(|result| result.map(|result| result.as_ref()).map_err(Error::from))
         .collect()
 }
 
 /// Builds the typed Shardy `in_shardings` attribute of `shard_map`, excluding axes already bound by enclosing manual
 /// regions.
 fn to_shardy_in_shardings<'c, 't>(
-    shard_map: &ShardMap,
+    shard_map: &ShardMapBoundary,
     enclosing_manual_axes: &[String],
     context: &'c MlirContext<'t>,
-) -> Result<TensorShardingPerValueAttributeRef<'c, 't>, ryft_mlir::Error> {
+) -> Result<TensorShardingPerValueAttributeRef<'c, 't>, Error> {
     shardy_tensor_sharding_per_value(shard_map.in_shardings(), shard_map.manual_axes(), enclosing_manual_axes, context)
 }
 
 /// Builds the typed Shardy `out_shardings` attribute of `shard_map`, excluding axes already bound by enclosing manual
 /// regions.
 fn to_shardy_out_shardings<'c, 't>(
-    shard_map: &ShardMap,
+    shard_map: &ShardMapBoundary,
     enclosing_manual_axes: &[String],
     context: &'c MlirContext<'t>,
-) -> Result<TensorShardingPerValueAttributeRef<'c, 't>, ryft_mlir::Error> {
+) -> Result<TensorShardingPerValueAttributeRef<'c, 't>, Error> {
     shardy_tensor_sharding_per_value(shard_map.out_shardings(), shard_map.manual_axes(), enclosing_manual_axes, context)
 }
 
 /// Builds the typed Shardy `manual_axes` attribute that `shard_map` attaches to `sdy.manual_computation`.
 fn to_shardy_manual_axes<'c, 't>(
-    shard_map: &ShardMap,
+    shard_map: &ShardMapBoundary,
     context: &'c MlirContext<'t>,
-) -> Result<ManualAxesAttributeRef<'c, 't>, ryft_mlir::Error> {
-    context.shardy_manual_axes(shard_map.manual_axes())
+) -> Result<ManualAxesAttributeRef<'c, 't>, Error> {
+    Ok(context.shardy_manual_axes(shard_map.manual_axes())?)
 }
 
 /// Builds the typed Shardy per-value tensor sharding attribute of a `sdy.manual_computation` boundary, with one tensor
@@ -449,12 +447,12 @@ fn shardy_tensor_sharding_per_value<'c, 't>(
     manual_axes: &[String],
     enclosing_manual_axes: &[String],
     context: &'c MlirContext<'t>,
-) -> Result<TensorShardingPerValueAttributeRef<'c, 't>, ryft_mlir::Error> {
+) -> Result<TensorShardingPerValueAttributeRef<'c, 't>, Error> {
     let shardings = shardings
         .iter()
         .map(|sharding| manual_computation_tensor_sharding(sharding, manual_axes, enclosing_manual_axes, context))
         .collect::<Result<Vec<_>, _>>()?;
-    context.shardy_tensor_sharding_per_value(shardings.as_slice())
+    Ok(context.shardy_tensor_sharding_per_value(shardings.as_slice())?)
 }
 
 /// Builds the typed Shardy tensor sharding of one `sdy.manual_computation` boundary value placed by `sharding`. The
@@ -467,7 +465,7 @@ fn manual_computation_tensor_sharding<'c, 't>(
     manual_axes: &[String],
     enclosing_manual_axes: &[String],
     context: &'c MlirContext<'t>,
-) -> Result<TensorShardingAttributeRef<'c, 't>, ryft_mlir::Error> {
+) -> Result<TensorShardingAttributeRef<'c, 't>, Error> {
     let mesh_symbol_ref = context.flat_symbol_ref_attribute(SHARDY_MESH_SYMBOL_NAME);
     let dimension_shardings =
         manual_computation_dimension_shardings(sharding, manual_axes, enclosing_manual_axes, context)?;
@@ -482,13 +480,13 @@ fn manual_computation_tensor_sharding<'c, 't>(
         .iter()
         .map(|axis_name| context.shardy_axis_ref(axis_name.as_str(), None))
         .collect::<Result<Vec<_>, _>>()?;
-    context.shardy_tensor_sharding(
+    Ok(context.shardy_tensor_sharding(
         mesh_symbol_ref,
         dimension_shardings.as_slice(),
         replicated_axes.as_slice(),
         unreduced_axes.as_slice(),
         shardy::ReductionOperation::Sum,
-    )
+    )?)
 }
 
 /// Builds the typed Shardy dimension shardings of one `sdy.manual_computation` boundary value placed by `sharding`. A
@@ -501,7 +499,7 @@ fn manual_computation_dimension_shardings<'c, 't>(
     manual_axes: &[String],
     enclosing_manual_axes: &[String],
     context: &'c MlirContext<'t>,
-) -> Result<Vec<DimensionShardingAttributeRef<'c, 't>>, ryft_mlir::Error> {
+) -> Result<Vec<DimensionShardingAttributeRef<'c, 't>>, Error> {
     let manual_axis_names = manual_axes.iter().map(String::as_str).collect::<HashSet<_>>();
     let free_axis_names = sharding
         .mesh()
@@ -538,7 +536,8 @@ fn manual_computation_dimension_shardings<'c, 't>(
             }
             ShardingDimension::Unconstrained => context.shardy_dimension_sharding([], false, None),
         })
-        .collect()
+        .collect::<Result<Vec<_>, _>>()
+        .map_err(Error::from)
 }
 
 impl LowerableOperation for ShardMapOperation {
@@ -548,9 +547,9 @@ impl LowerableOperation for ShardMapOperation {
         input_values: &[ValueRef<'b, 'c, 't>],
         _input_types: &[ArrayIrType],
         _output_types: &[ArrayIrType],
-    ) -> Result<Vec<ValueRef<'b, 'c, 't>>, LoweringError> {
+    ) -> Result<Vec<ValueRef<'b, 'c, 't>>, Error> {
         let [body] = lowerer.regions.as_slice() else {
-            return Err(LoweringError::UnsupportedOp {
+            return Err(Error::UnsupportedOperation {
                 op: format!(
                     "{} expected 1 attached region but got {}",
                     SHARD_MAP_OPERATION_NAME,
@@ -558,9 +557,7 @@ impl LowerableOperation for ShardMapOperation {
                 ),
             });
         };
-        let simplified_body = body
-            .simplified()
-            .map_err(|error| LoweringError::SimplificationFailure { message: error.to_string() })?;
+        let simplified_body = body.simplified()?;
         let local_input_types = simplified_body
             .input_types()
             .iter()
@@ -868,7 +865,7 @@ mod tests {
             .block_until_ready()
             .unwrap();
         let output = &outputs[0].outputs[0];
-        assert_eq!(output.layout(), Ok(layout.to_pjrt().unwrap()));
+        assert_eq!(output.layout().unwrap(), layout.to_pjrt().unwrap(),);
         let bytes = output.copy_to_host(Some(ryft_pjrt::Layout::dense_major_to_minor(2))).unwrap().r#await().unwrap();
         assert_eq!(values_from_bytes::<f32>(&bytes), values);
     }
@@ -994,7 +991,8 @@ mod tests {
         let expected = ShardMapError::AxisAlreadyManual { axis_name: "x".to_string() };
         assert!(matches!(
             to_mlir_module(&traced, "main"),
-            Err(LoweringError::Tracing(error)) if error.downcast_custom::<ShardMapError>() == Some(&expected),
+            Err(Error::Core(ryft_core::Error::Program(error)))
+                if error.downcast_custom::<ShardMapError>() == Some(&expected),
         ));
     }
 
@@ -1039,7 +1037,8 @@ mod tests {
         };
         assert!(matches!(
             to_mlir_module(&traced, "main"),
-            Err(LoweringError::Tracing(error)) if error.downcast_custom::<ShardMapError>() == Some(&expected),
+            Err(Error::Core(ryft_core::Error::Program(error)))
+                if error.downcast_custom::<ShardMapError>() == Some(&expected),
         ));
     }
 
@@ -1064,14 +1063,11 @@ mod tests {
         )
         .unwrap();
         let error = to_mlir_module(&traced, "main").unwrap_err();
-        assert_eq!(
+        assert!(matches!(
             error,
-            LoweringError::StandaloneShardMapVariesAlongEnclosingManualAxis {
-                value_kind: "input",
-                value_index: 0,
-                axis_name: "x".to_string(),
-            },
-        );
+            Error::StandaloneShardMapVariesAlongEnclosingManualAxis { value_kind, value_index: 0, ref axis_name }
+                if value_kind == "input" && axis_name == "x",
+        ));
         assert_eq!(
             error.to_string(),
             "input type #0 of a standalone `shard_map` varies along mesh axis `x`, which is not one of its manual axes; \
@@ -1111,7 +1107,7 @@ mod tests {
         assert!(
             matches!(
                 &error,
-                LoweringError::StandaloneShardMapCommunicatesAlongEnclosingManualAxis { axis_name, .. }
+                Error::StandaloneShardMapCommunicatesAlongEnclosingManualAxis { axis_name, .. }
                     if axis_name == "x",
             ),
             "{error:?}",
@@ -1372,7 +1368,7 @@ mod tests {
     fn test_to_shardy_in_shardings() {
         let context = MlirContext::new();
         let mesh = test_logical_mesh_2x2();
-        let shard_map = ShardMap::new(
+        let shard_map = ShardMapBoundary::new(
             mesh.clone(),
             vec![test_sharding(&mesh, vec![ShardingDimension::sharded(["x"])], Vec::new())],
             Vec::new(),
@@ -1391,7 +1387,7 @@ mod tests {
         // an enclosing manual region already bound them, in which case they are omitted.
         let context = MlirContext::new();
         let mesh = test_logical_mesh_2x2();
-        let shard_map = ShardMap::new(
+        let shard_map = ShardMapBoundary::new(
             mesh.clone(),
             vec![test_sharding(&mesh, vec![ShardingDimension::sharded(["x", "y"])], Vec::new())],
             Vec::new(),
@@ -1402,7 +1398,7 @@ mod tests {
             to_shardy_in_shardings(&shard_map, &[], &context).unwrap().to_string(),
             r#"#sdy.sharding_per_value<[<@mesh, [{"x", "y", ?}]>]>"#,
         );
-        let shard_map = ShardMap::new(
+        let shard_map = ShardMapBoundary::new(
             mesh.clone(),
             vec![test_sharding(&mesh, vec![ShardingDimension::sharded(["y"])], Vec::new())],
             Vec::new(),
@@ -1423,7 +1419,7 @@ mod tests {
     fn test_to_shardy_in_shardings_renders_free_axes_as_open_dimension_shardings() {
         let context = MlirContext::new();
         let mesh = test_logical_mesh_data_model();
-        let shard_map = ShardMap::new(
+        let shard_map = ShardMapBoundary::new(
             mesh.clone(),
             vec![
                 test_sharding(&mesh, vec![ShardingDimension::sharded(["data", "model"])], Vec::new()),
@@ -1443,7 +1439,7 @@ mod tests {
     fn test_to_shardy_in_shardings_keeps_explicit_axes() {
         let context = MlirContext::new();
         let mesh = test_logical_mesh_data_model_explicit();
-        let shard_map = ShardMap::new(
+        let shard_map = ShardMapBoundary::new(
             mesh.clone(),
             vec![test_sharding(&mesh, vec![ShardingDimension::sharded(["data", "model"])], Vec::new())],
             Vec::new(),
@@ -1464,7 +1460,7 @@ mod tests {
             MeshAxis::new("y", 2, MeshAxisType::Auto).unwrap(),
         ])
         .unwrap();
-        let shard_map = ShardMap::new(
+        let shard_map = ShardMapBoundary::new(
             mesh.clone(),
             Vec::new(),
             vec![test_sharding(&mesh, vec![ShardingDimension::replicated()], Vec::new())],
@@ -1479,7 +1475,7 @@ mod tests {
         // Output shardings render exactly like input shardings.
         let mesh = test_logical_mesh_data_model();
         let sharding = test_sharding(&mesh, vec![ShardingDimension::sharded(["data"])], Vec::new());
-        let shard_map = ShardMap::new(mesh, vec![sharding.clone()], vec![sharding], Vec::new()).unwrap();
+        let shard_map = ShardMapBoundary::new(mesh, vec![sharding.clone()], vec![sharding], Vec::new()).unwrap();
         assert_eq!(
             to_shardy_out_shardings(&shard_map, &[], &context).unwrap().to_string(),
             to_shardy_in_shardings(&shard_map, &[], &context).unwrap().to_string(),
@@ -1489,7 +1485,7 @@ mod tests {
     #[test]
     fn test_to_shardy_manual_axes() {
         let context = MlirContext::new();
-        let shard_map = ShardMap::new(
+        let shard_map = ShardMapBoundary::new(
             LogicalMesh::new(vec![
                 MeshAxis::new("x", 2, MeshAxisType::Auto).unwrap(),
                 MeshAxis::new("y", 2, MeshAxisType::Manual).unwrap(),
@@ -1501,7 +1497,8 @@ mod tests {
         )
         .unwrap();
         assert_eq!(to_shardy_manual_axes(&shard_map, &context).unwrap().to_string(), r#"#sdy<manual_axes{"y"}>"#);
-        let shard_map = ShardMap::new(test_logical_mesh_2x2(), Vec::new(), Vec::new(), vec!["x".into()]).unwrap();
+        let shard_map =
+            ShardMapBoundary::new(test_logical_mesh_2x2(), Vec::new(), Vec::new(), vec!["x".into()]).unwrap();
         assert_eq!(to_shardy_manual_axes(&shard_map, &context).unwrap().to_string(), r#"#sdy<manual_axes{"x"}>"#);
     }
 
@@ -1524,9 +1521,13 @@ mod tests {
 
         let sharding =
             Sharding::new(device_mesh.logical_mesh().clone(), vec![ShardingDimension::sharded(["x"])]).unwrap();
-        let shard_map =
-            ShardMap::new(device_mesh.logical_mesh().clone(), vec![sharding.clone()], vec![sharding.clone()], vec![])
-                .unwrap();
+        let shard_map = ShardMapBoundary::new(
+            device_mesh.logical_mesh().clone(),
+            vec![sharding.clone()],
+            vec![sharding.clone()],
+            vec![],
+        )
+        .unwrap();
         assert_eq!(
             shard_map.local_input_type(0, &ArrayType::new_static(DataType::F32, [8])).unwrap().shape(),
             &Shape::new(vec![Dimension::Static(2)]),

@@ -16,16 +16,19 @@ use ryft_kernels::{KernelDefinition, VerifiedKernel};
 use ryft_pjrt::Execution;
 use serde::{Deserialize, Serialize};
 use sha2::{Digest, Sha256};
-use thiserror::Error;
 
-use crate::experimental::XlaDomainError;
 use crate::experimental::domains::XlaCompiledProgram;
 use crate::kernels::KernelEmbeddingError;
 use crate::kernels::staging::{XlaKernelCompilerBinding, XlaKernelExecutionFacts, stage_kernel};
-use crate::{XlaArray, XlaCompilationAnalysis, XlaDomain, XlaOptions};
+use crate::{Error, XlaArray, XlaCompilationAnalysis, XlaDomain, XlaOptions};
 
+// TODO(eaplatanios): Promote kernel AOT errors to dedicated `ryft_xla::Error` variants after
+// this support leaves experimental status.
 /// A bundle is malformed, incompatible, or cannot be produced by the selected backend.
-#[derive(Debug, Error)]
+///
+/// Converting to [`Error`] unwraps [`Self::Xla`] and wraps every other variant in [`Error::Custom`]. Converting an
+/// [`Error`] into this type uses [`Self::Xla`], so round trips preserve canonical errors and shared custom payloads.
+#[derive(Debug, thiserror::Error)]
 pub enum KernelAotError {
     /// A bounded envelope or compatibility check failed before native loading.
     #[error("invalid kernel AOT bundle: {message}")]
@@ -44,7 +47,16 @@ pub enum KernelAotError {
 
     /// Existing XLA compilation, persistence, or runtime checks failed.
     #[error(transparent)]
-    Xla(#[from] XlaDomainError),
+    Xla(#[from] Error),
+}
+
+impl From<KernelAotError> for crate::Error {
+    fn from(error: KernelAotError) -> Self {
+        match error {
+            KernelAotError::Xla(error) => error,
+            error => Self::custom(error),
+        }
+    }
 }
 
 /// Timings and compiler diagnostics correlated with one exact kernel definition.
@@ -449,6 +461,28 @@ pub(crate) mod tests {
             .configuration_key()
             .unwrap();
         bundle
+    }
+
+    #[test]
+    fn test_kernel_aot_error_roundtrip() {
+        let core = Error::from(KernelAotError::from(Error::from(ryft_core::ProgramError::PoisonedValue)));
+        assert!(matches!(core, Error::Core(ryft_core::Error::Program(ryft_core::ProgramError::PoisonedValue))));
+
+        let pjrt = Error::from(KernelAotError::from(Error::from(ryft_pjrt::Error::invalid_argument(
+            "invalid AOT runtime input",
+        ))));
+        assert!(matches!(pjrt, Error::Pjrt(ryft_pjrt::Error::InvalidArgument { ref message, .. })
+            if message == "invalid AOT runtime input"));
+
+        let custom = Error::from(KernelAotError::Invalid { message: "invalid AOT bundle".into() });
+        let roundtrip = Error::from(KernelAotError::from(custom.clone()));
+        let roundtrip = Error::from(KernelAotError::from(roundtrip));
+        assert!(matches!(roundtrip.downcast_custom::<KernelAotError>(),
+            Some(KernelAotError::Invalid { message }) if message == "invalid AOT bundle"));
+        assert!(std::ptr::eq(
+            custom.downcast_custom::<KernelAotError>().unwrap(),
+            roundtrip.downcast_custom::<KernelAotError>().unwrap(),
+        ));
     }
 
     #[test]

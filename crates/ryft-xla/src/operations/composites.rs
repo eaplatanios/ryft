@@ -5,7 +5,7 @@ use ryft_core::{
 use ryft_mlir::ValueRef;
 
 use crate::experimental::lowering::regions::lower_nested_program_inline;
-use crate::{LowerableOperation, LowerableOperationFamily, LoweringError, XlaLowerer};
+use crate::{Error, LowerableOperation, LowerableOperationFamily, XlaLowerer};
 
 impl<V: Typed + Parameter, RegionOperation, S> LowerableOperation for CompositeOperation<V, RegionOperation, S>
 where
@@ -17,14 +17,14 @@ where
         input_values: &[ValueRef<'b, 'c, 't>],
         _input_types: &[Self::Type],
         _output_types: &[Self::Type],
-    ) -> Result<Vec<ValueRef<'b, 'c, 't>>, LoweringError> {
+    ) -> Result<Vec<ValueRef<'b, 'c, 't>>, Error> {
         let [primal, ..] = lowerer.regions.as_slice() else {
-            return Err(LoweringError::UnsupportedOp {
+            return Err(Error::UnsupportedOperation {
                 op: format!("{COMPOSITE_OPERATION_NAME} expected a primal region but got no regions"),
             });
         };
         if lowerer.regions.len() != self.region_slots().len() {
-            return Err(LoweringError::UnsupportedOp {
+            return Err(Error::UnsupportedOperation {
                 op: format!(
                     "{} expected {} attached regions but got {}",
                     COMPOSITE_OPERATION_NAME,
@@ -66,7 +66,7 @@ where
         _input_values: &[ValueRef<'b, 'c, 't>],
         _input_types: &[Self::Type],
         _output_types: &[Self::Type],
-    ) -> Result<Vec<ValueRef<'b, 'c, 't>>, LoweringError> {
+    ) -> Result<Vec<ValueRef<'b, 'c, 't>>, Error> {
         Err(ProgramError::UnsupportedOperation {
             message: format!(
                 "a `{COMPOSITE_TRANSPOSE_OPERATION_NAME}` has no forward program and cannot be lowered to \
@@ -85,7 +85,7 @@ mod tests {
 
     use crate::experimental::lowering::tests::test_vector_type;
     use crate::experimental::ops::{XlaConstant, XlaOperation, XlaProgramBuilder as ArrayIrXlaProgramBuilder};
-    use crate::{LoweringError, to_mlir_module_for_program};
+    use crate::{Error, to_mlir_module_for_program};
 
     #[test]
     fn test_composite_lowering_inlines_only_the_primal_program() {
@@ -302,7 +302,7 @@ mod tests {
 
         assert!(matches!(
             to_mlir_module_for_program(&program, &[], &input_types, &output_types, "main", None, None),
-            Err(LoweringError::Tracing(ProgramError::UnsupportedOperation { message }))
+            Err(Error::Core(ryft_core::Error::Program(ProgramError::UnsupportedOperation { message })))
                 if message == "a `composite_transpose` has no forward program and cannot be lowered to \
                                StableHLO; transpose it before lowering",
         ));

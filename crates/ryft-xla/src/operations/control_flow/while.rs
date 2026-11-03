@@ -33,7 +33,7 @@ use crate::operations::control_flow::{
     set_threaded_effect_tokens, threaded_effect_token_values, validate_unthreaded_effect_tokens,
 };
 use crate::operations::reductions::lower_reduce_to_mlir;
-use crate::{LowerableOperation, LowerableOperationFamily, LoweringError, XlaLowerer};
+use crate::{Error, LowerableOperation, LowerableOperationFamily, XlaLowerer};
 
 impl LowerableOperation for WhileOperation<ArrayType> {
     fn lower<'b, 'c: 'b, 't: 'c, O: LowerableOperationFamily>(
@@ -42,7 +42,7 @@ impl LowerableOperation for WhileOperation<ArrayType> {
         _input_values: &[ValueRef<'b, 'c, 't>],
         _input_types: &[ArrayType],
         _output_types: &[ArrayType],
-    ) -> Result<Vec<ValueRef<'b, 'c, 't>>, LoweringError> {
+    ) -> Result<Vec<ValueRef<'b, 'c, 't>>, Error> {
         Err(ProgramError::UnsupportedOperation {
             message: format!(
                 "higher-order operation `{}` must be stored directly in the enclosing backend operation family",
@@ -60,7 +60,7 @@ impl LowerableOperation for WhileOperation<ArrayIrType> {
         input_values: &[ValueRef<'b, 'c, 't>],
         input_types: &[ArrayIrType],
         output_types: &[ArrayIrType],
-    ) -> Result<Vec<ValueRef<'b, 'c, 't>>, LoweringError> {
+    ) -> Result<Vec<ValueRef<'b, 'c, 't>>, Error> {
         // A while loop lowers to one `stablehlo.while` whose state starts with the loop inputs, which the condition and
         // the body receive as their shared state types. The lowering proceeds in order:
         //
@@ -395,7 +395,7 @@ impl LowerableOperation for WhileOperation<ArrayIrType> {
                         )?)?;
                         Ok(select.result(0).unwrap().as_ref())
                     })
-                    .collect::<Result<Vec<_>, LoweringError>>()?
+                    .collect::<Result<Vec<_>, Error>>()?
             } else {
                 body_outputs
             };
@@ -845,11 +845,9 @@ mod tests {
                     MixedValue::Array(vec![10.0, 20.0, 30.0], vec![3])
                 ],
                 &[3],
-            ),
-            Ok(vec![
-                MixedValue::Array(vec![1.0, 2.0, 3.0], vec![3]),
-                MixedValue::Array(vec![11.0, 22.0, 33.0], vec![3]),
-            ]),
+            )
+            .unwrap(),
+            vec![MixedValue::Array(vec![1.0, 2.0, 3.0], vec![3]), MixedValue::Array(vec![11.0, 22.0, 33.0], vec![3]),],
         );
         let error = execute_mixed_program(
             &client,
@@ -926,13 +924,14 @@ mod tests {
                 &program,
                 &[MixedValue::Array(first.to_vec(), vec![4, 4]), MixedValue::Array(second.to_vec(), vec![4, 3])],
                 &[2, 3, 2],
-            ),
-            Ok(vec![
+            )
+            .unwrap(),
+            vec![
                 MixedValue::Array(vec![1.0, 2.0, 3.0, 4.0, 5.0, 6.0], vec![2, 3]),
                 MixedValue::Array(vec![11.0, 22.0, 33.0, 44.0, 55.0, 66.0], vec![2, 3]),
                 MixedValue::Dimension(2),
                 MixedValue::Dimension(2),
-            ]),
+            ],
         );
     }
 
@@ -1077,7 +1076,7 @@ mod tests {
             let (outputs, lines) = with_captured_prints(|| {
                 execute_mixed_program(&client, &program, &[MixedValue::Array(vec![input], vec![])], &[])
             });
-            assert_eq!(outputs, Ok(vec![MixedValue::Array(vec![expected], vec![])]), "input {input}");
+            assert_eq!(outputs.unwrap(), vec![MixedValue::Array(vec![expected], vec![])], "input {input}",);
             assert_eq!(lines, expected_lines, "input {input}");
         }
     }
@@ -1159,8 +1158,9 @@ mod tests {
                 &program,
                 &[MixedValue::Array(vec![3.0, 1.0, 2.0], vec![3])],
                 &[]
-            ),
-            Ok(vec![MixedValue::Array(vec![0.0, 0.0, 0.0], vec![3])]),
+            )
+            .unwrap(),
+            vec![MixedValue::Array(vec![0.0, 0.0, 0.0], vec![3])],
         );
     }
 

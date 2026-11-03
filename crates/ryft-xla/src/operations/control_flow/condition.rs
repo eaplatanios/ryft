@@ -18,7 +18,7 @@ use crate::operations::control_flow::{
     lower_control_flow_region, lower_explicit_sharding_constraints, lower_refined_region_input, lower_region_guard,
     lowered_effect_classes, set_threaded_effect_tokens,
 };
-use crate::{LowerableOperation, LowerableOperationFamily, LoweringError, XlaLowerer};
+use crate::{Error, LowerableOperation, LowerableOperationFamily, XlaLowerer};
 
 impl LowerableOperation for ConditionOperation<ArrayType> {
     fn lower<'b, 'c: 'b, 't: 'c, O: LowerableOperationFamily>(
@@ -27,7 +27,7 @@ impl LowerableOperation for ConditionOperation<ArrayType> {
         _input_values: &[ValueRef<'b, 'c, 't>],
         _input_types: &[ArrayType],
         _output_types: &[ArrayType],
-    ) -> Result<Vec<ValueRef<'b, 'c, 't>>, LoweringError> {
+    ) -> Result<Vec<ValueRef<'b, 'c, 't>>, Error> {
         Err(ProgramError::UnsupportedOperation {
             message: format!(
                 "higher-order operation `{}` must be stored directly in the enclosing backend operation family",
@@ -45,7 +45,7 @@ impl LowerableOperation for ConditionOperation<ArrayIrType> {
         input_values: &[ValueRef<'b, 'c, 't>],
         input_types: &[ArrayIrType],
         output_types: &[ArrayIrType],
-    ) -> Result<Vec<ValueRef<'b, 'c, 't>>, LoweringError> {
+    ) -> Result<Vec<ValueRef<'b, 'c, 't>>, Error> {
         // A condition lowers to one `stablehlo.if` on its predicate, which is the first of its `1 + n` inputs, followed
         // by the `n` inputs of both branches. The branch regions take no arguments: each one is inlined over the
         // lowered branch inputs, which it captures implicitly, and returns the condition's `output_types` followed by
@@ -1047,8 +1047,9 @@ mod tests {
                     MixedValue::Array(vec![10.0, 20.0, 30.0], vec![3]),
                 ],
                 &[3],
-            ),
-            Ok(vec![MixedValue::Array(vec![11.0, 22.0, 33.0], vec![3])]),
+            )
+            .unwrap(),
+            vec![MixedValue::Array(vec![11.0, 22.0, 33.0], vec![3])],
         );
     }
 
@@ -1100,8 +1101,9 @@ mod tests {
                     &program,
                     &[MixedValue::Dimension(3), MixedValue::Array(vec![1.0, 2.0, 3.0], vec![3])],
                     &[],
-                ),
-                Ok(vec![MixedValue::Array(expected, vec![3])]),
+                )
+                .unwrap(),
+                vec![MixedValue::Array(expected, vec![3])],
             );
 
             // Lowering retypes each branch input independently, so only the entry guard rejects a dimension that
@@ -1137,14 +1139,15 @@ mod tests {
         );
         assert!(matches!(
             ConditionOperation::<ArrayType>::new().lower(&mut lowerer, &[], &[], &[]),
-            Err(LoweringError::Tracing(ProgramError::UnsupportedOperation { message })) if message == expected_message,
+            Err(Error::Core(ryft_core::Error::Program(ProgramError::UnsupportedOperation { message })))
+                if message == expected_message,
         ));
 
         // An array IR condition needs exactly one region per branch.
         let mut lowerer = XlaLowerer::new(block.as_ref(), &context, location).with_regions(vec![branch.clone()]);
         assert!(matches!(
             ConditionOperation::<ArrayIrType>::new().lower(&mut lowerer, &[], &[], &[]),
-            Err(LoweringError::Tracing(ProgramError::MalformedProgram(message)))
+            Err(Error::Core(ryft_core::Error::Program(ProgramError::MalformedProgram(message))))
                 if message == "operation `condition` declares 2 region slots but 1 regions were attached",
         ));
 
@@ -1152,7 +1155,7 @@ mod tests {
         let mut lowerer = XlaLowerer::new(block.as_ref(), &context, location).with_regions(vec![branch; 2]);
         assert!(matches!(
             ConditionOperation::<ArrayIrType>::new().lower(&mut lowerer, &[], &[], &[]),
-            Err(LoweringError::Tracing(ProgramError::InvalidInputCount { expected: 2, actual: 0 })),
+            Err(Error::Core(ryft_core::Error::Program(ProgramError::InvalidInputCount { expected: 2, actual: 0 }))),
         ));
     }
 
@@ -1276,12 +1279,13 @@ mod tests {
                             MixedValue::Array(vec![7.0], vec![]),
                         ],
                         &[],
-                    ),
-                    Ok(vec![
+                    )
+                    .unwrap(),
+                    vec![
                         MixedValue::Array(vec![value; extent as usize], vec![extent as u64]),
                         MixedValue::Array(Vec::new(), vec![0]),
                         MixedValue::Dimension(extent),
-                    ]),
+                    ],
                 );
             }
         }
@@ -1394,13 +1398,14 @@ mod tests {
                         MixedValue::Array(vec![7.0], vec![]),
                     ],
                     &[],
-                ),
-                Ok(vec![
+                )
+                .unwrap(),
+                vec![
                     MixedValue::Array(vec![value; extent as usize], vec![extent as u64]),
                     MixedValue::Array(vec![value; extent as usize], vec![extent as u64]),
                     MixedValue::Dimension(extent),
                     MixedValue::Dimension(extent),
-                ]),
+                ],
             );
         }
     }
@@ -1495,8 +1500,8 @@ mod tests {
         );
         let client = execution_client();
         assert_eq!(
-            execute_mixed_program(&client, &program, &[MixedValue::Array(vec![2.0], vec![])], &[]),
-            Ok(vec![MixedValue::Array(vec![2.0], vec![])]),
+            execute_mixed_program(&client, &program, &[MixedValue::Array(vec![2.0], vec![])], &[]).unwrap(),
+            vec![MixedValue::Array(vec![2.0], vec![])],
         );
         let error = execute_mixed_program(&client, &program, &[MixedValue::Array(vec![-2.0], vec![])], &[])
             .unwrap_err()
@@ -1646,7 +1651,7 @@ mod tests {
                 &[],
             )
         });
-        assert_eq!(outputs, Ok(vec![MixedValue::Array(vec![3.0], vec![])]));
+        assert_eq!(outputs.unwrap(), vec![MixedValue::Array(vec![3.0], vec![])],);
         assert_eq!(lines, vec!["first: 0.0", "later: 1.0", "later: 2.0"]);
     }
 
@@ -1790,8 +1795,8 @@ mod tests {
             )
         });
         assert_eq!(
-            outputs,
-            Ok(vec![MixedValue::Array(vec![6.0], vec![]), MixedValue::Array(vec![1.0, 3.0, 6.0], vec![3])]),
+            outputs.unwrap(),
+            vec![MixedValue::Array(vec![6.0], vec![]), MixedValue::Array(vec![1.0, 3.0, 6.0], vec![3])],
         );
         assert_eq!(lines, vec!["positive: 1.0", "nonpositive: -2.0", "positive: 3.0"]);
     }
@@ -1874,8 +1879,9 @@ mod tests {
                         MixedValue::Array(vec![1.0, 2.0, 3.0], vec![3]),
                     ],
                     &[],
-                ),
-                Ok(vec![MixedValue::Dimension(3), MixedValue::Array(expected, vec![3])]),
+                )
+                .unwrap(),
+                vec![MixedValue::Dimension(3), MixedValue::Array(expected, vec![3])],
             );
         }
 
@@ -1915,8 +1921,9 @@ mod tests {
                     MixedValue::Array(vec![1.0, 2.0, 3.0], vec![3]),
                 ],
                 &[],
-            ),
-            Ok(vec![MixedValue::Dimension(3), MixedValue::Array(vec![-1.0, 4.0, -3.0], vec![3])]),
+            )
+            .unwrap(),
+            vec![MixedValue::Dimension(3), MixedValue::Array(vec![-1.0, 4.0, -3.0], vec![3])],
         );
     }
 
@@ -2115,13 +2122,14 @@ mod tests {
                         MixedValue::Array(vec![1.0, 1.0, 1.0, 0.0], vec![4]),
                     ],
                     &[3, 3],
-                ),
-                Ok(vec![
+                )
+                .unwrap(),
+                vec![
                     MixedValue::Array(expected_value, vec![3]),
                     MixedValue::Array(expected_gradient, vec![3]),
                     MixedValue::Dimension(3),
                     MixedValue::Dimension(3),
-                ]),
+                ],
             );
         }
     }

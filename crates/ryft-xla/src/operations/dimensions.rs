@@ -21,7 +21,7 @@ use crate::operations::assertions::{
 };
 use crate::operations::comparisons::lower_compare_to_mlir;
 use crate::operations::lower_tensor_type;
-use crate::{LowerableOperation, LowerableOperationFamily, LoweringError, XlaLowerer};
+use crate::{Error, LowerableOperation, LowerableOperationFamily, XlaLowerer};
 
 /// Lowers one runtime safety check for dimension arithmetic whose declared bounds do not prove totality.
 pub(crate) fn lower_dimension_arithmetic_assertion<'b, 'c: 'b, 't: 'c>(
@@ -34,7 +34,7 @@ pub(crate) fn lower_dimension_arithmetic_assertion<'b, 'c: 'b, 't: 'c>(
     block: &mut BlockRef<'b, 'c, 't>,
     context: &'c MlirContext<'t>,
     location: LocationRef<'c, 't>,
-) -> Result<(), LoweringError> {
+) -> Result<(), Error> {
     let kind = match operation {
         DimensionOperation::Add(_) => ASSERT_ADD_KIND,
         DimensionOperation::Sub(_) => ASSERT_SUB_KIND,
@@ -65,7 +65,7 @@ impl LowerableOperation for DimensionSizeOperation {
         input_values: &[ValueRef<'b, 'c, 't>],
         input_types: &[ArrayIrType],
         _output_types: &[ArrayIrType],
-    ) -> Result<Vec<ValueRef<'b, 'c, 't>>, LoweringError> {
+    ) -> Result<Vec<ValueRef<'b, 'c, 't>>, Error> {
         let context = lowerer.context;
         let location = lowerer.location;
         let block = &mut lowerer.block;
@@ -75,11 +75,11 @@ impl LowerableOperation for DimensionSizeOperation {
         let [input_type] = input_types else {
             return Err(ProgramError::InvalidInputCount { expected: 1, actual: input_types.len() }.into());
         };
-        let input_type = <&ArrayType>::try_from(input_type).map_err(|error| LoweringError::Tracing(error.into()))?;
+        let input_type = <&ArrayType>::try_from(input_type)?;
         match input_type.shape().dimensions()[self.axis()] {
             Dimension::Static(extent) => {
                 let output_type = lower_tensor_type(&ArrayType::scalar(DataType::I64), context, location)?;
-                let extent = i64::try_from(extent).map_err(|_| LoweringError::UnsupportedOp {
+                let extent = i64::try_from(extent).map_err(|_| Error::UnsupportedOperation {
                     op: format!("dimension extent {extent} does not fit StableHLO i64"),
                 })?;
                 let elements = lower_constant_elements_attribute(DataType::I64, output_type, extent, context)?;
@@ -104,7 +104,7 @@ impl LowerableOperation for DimensionFromScalarOperation {
         input_values: &[ValueRef<'b, 'c, 't>],
         _input_types: &[ArrayIrType],
         _output_types: &[ArrayIrType],
-    ) -> Result<Vec<ValueRef<'b, 'c, 't>>, LoweringError> {
+    ) -> Result<Vec<ValueRef<'b, 'c, 't>>, Error> {
         let context = lowerer.context;
         let location = lowerer.location;
         let effect_tokens = &mut lowerer.effect_tokens;
@@ -160,7 +160,7 @@ impl LowerableOperation for DimensionToScalarOperation {
         input_values: &[ValueRef<'b, 'c, 't>],
         _input_types: &[ArrayIrType],
         _output_types: &[ArrayIrType],
-    ) -> Result<Vec<ValueRef<'b, 'c, 't>>, LoweringError> {
+    ) -> Result<Vec<ValueRef<'b, 'c, 't>>, Error> {
         let [input] = input_values else {
             return Err(ProgramError::InvalidInputCount { expected: 1, actual: input_values.len() }.into());
         };
@@ -175,7 +175,7 @@ impl LowerableOperation for ConstantOperation<DimensionValue> {
         input_values: &[ValueRef<'b, 'c, 't>],
         _input_types: &[DimensionType],
         _output_types: &[DimensionType],
-    ) -> Result<Vec<ValueRef<'b, 'c, 't>>, LoweringError> {
+    ) -> Result<Vec<ValueRef<'b, 'c, 't>>, Error> {
         if !input_values.is_empty() {
             return Err(ProgramError::InvalidInputCount { expected: 0, actual: input_values.len() }.into());
         }
@@ -190,7 +190,7 @@ impl LowerableOperation for DimensionMaxOperation {
         input_values: &[ValueRef<'b, 'c, 't>],
         input_types: &[DimensionType],
         _output_types: &[DimensionType],
-    ) -> Result<Vec<ValueRef<'b, 'c, 't>>, LoweringError> {
+    ) -> Result<Vec<ValueRef<'b, 'c, 't>>, Error> {
         lower_dimension_arithmetic(&DimensionOperation::Max(self.clone()), lowerer, input_values, input_types)
     }
 }
@@ -202,7 +202,7 @@ impl LowerableOperation for DimensionMinOperation {
         input_values: &[ValueRef<'b, 'c, 't>],
         input_types: &[DimensionType],
         _output_types: &[DimensionType],
-    ) -> Result<Vec<ValueRef<'b, 'c, 't>>, LoweringError> {
+    ) -> Result<Vec<ValueRef<'b, 'c, 't>>, Error> {
         lower_dimension_arithmetic(&DimensionOperation::Min(self.clone()), lowerer, input_values, input_types)
     }
 }
@@ -214,7 +214,7 @@ impl LowerableOperation for DimensionAddOperation {
         input_values: &[ValueRef<'b, 'c, 't>],
         input_types: &[DimensionType],
         _output_types: &[DimensionType],
-    ) -> Result<Vec<ValueRef<'b, 'c, 't>>, LoweringError> {
+    ) -> Result<Vec<ValueRef<'b, 'c, 't>>, Error> {
         lower_dimension_arithmetic(&DimensionOperation::Add(self.clone()), lowerer, input_values, input_types)
     }
 }
@@ -226,7 +226,7 @@ impl LowerableOperation for DimensionSubOperation {
         input_values: &[ValueRef<'b, 'c, 't>],
         input_types: &[DimensionType],
         _output_types: &[DimensionType],
-    ) -> Result<Vec<ValueRef<'b, 'c, 't>>, LoweringError> {
+    ) -> Result<Vec<ValueRef<'b, 'c, 't>>, Error> {
         lower_dimension_arithmetic(&DimensionOperation::Sub(self.clone()), lowerer, input_values, input_types)
     }
 }
@@ -238,7 +238,7 @@ impl LowerableOperation for SaturatingSubOperation<DimensionType> {
         input_values: &[ValueRef<'b, 'c, 't>],
         input_types: &[DimensionType],
         _output_types: &[DimensionType],
-    ) -> Result<Vec<ValueRef<'b, 'c, 't>>, LoweringError> {
+    ) -> Result<Vec<ValueRef<'b, 'c, 't>>, Error> {
         lower_dimension_arithmetic(&DimensionOperation::SaturatingSub(self.clone()), lowerer, input_values, input_types)
     }
 }
@@ -250,7 +250,7 @@ impl LowerableOperation for DimensionMulOperation {
         input_values: &[ValueRef<'b, 'c, 't>],
         input_types: &[DimensionType],
         _output_types: &[DimensionType],
-    ) -> Result<Vec<ValueRef<'b, 'c, 't>>, LoweringError> {
+    ) -> Result<Vec<ValueRef<'b, 'c, 't>>, Error> {
         lower_dimension_arithmetic(&DimensionOperation::Mul(self.clone()), lowerer, input_values, input_types)
     }
 }
@@ -262,7 +262,7 @@ impl LowerableOperation for DimensionDivOperation {
         input_values: &[ValueRef<'b, 'c, 't>],
         input_types: &[DimensionType],
         _output_types: &[DimensionType],
-    ) -> Result<Vec<ValueRef<'b, 'c, 't>>, LoweringError> {
+    ) -> Result<Vec<ValueRef<'b, 'c, 't>>, Error> {
         lower_dimension_arithmetic(&DimensionOperation::Div(self.clone()), lowerer, input_values, input_types)
     }
 }
@@ -274,7 +274,7 @@ impl LowerableOperation for DimensionRemOperation {
         input_values: &[ValueRef<'b, 'c, 't>],
         input_types: &[DimensionType],
         _output_types: &[DimensionType],
-    ) -> Result<Vec<ValueRef<'b, 'c, 't>>, LoweringError> {
+    ) -> Result<Vec<ValueRef<'b, 'c, 't>>, Error> {
         lower_dimension_arithmetic(&DimensionOperation::Rem(self.clone()), lowerer, input_values, input_types)
     }
 }
@@ -286,7 +286,7 @@ impl LowerableOperation for DimensionPowOperation {
         input_values: &[ValueRef<'b, 'c, 't>],
         input_types: &[DimensionType],
         _output_types: &[DimensionType],
-    ) -> Result<Vec<ValueRef<'b, 'c, 't>>, LoweringError> {
+    ) -> Result<Vec<ValueRef<'b, 'c, 't>>, Error> {
         lower_dimension_arithmetic(&DimensionOperation::Pow(self.clone()), lowerer, input_values, input_types)
     }
 }
@@ -298,7 +298,7 @@ fn lower_dimension_arithmetic<'b, 'c: 'b, 't: 'c, O: LowerableOperationFamily>(
     lowerer: &mut XlaLowerer<'b, 'c, 't, O>,
     input_values: &[ValueRef<'b, 'c, 't>],
     input_types: &[DimensionType],
-) -> Result<Vec<ValueRef<'b, 'c, 't>>, LoweringError> {
+) -> Result<Vec<ValueRef<'b, 'c, 't>>, Error> {
     let context = lowerer.context;
     let location = lowerer.location;
     let effect_tokens = &mut lowerer.effect_tokens;
@@ -429,12 +429,18 @@ mod tests {
         );
         let client = execution_client();
         assert_eq!(
-            execute_mixed_program(&client, &program, &[MixedValue::Dimension(2), MixedValue::Dimension(5)], &[]),
-            Ok(vec![MixedValue::Dimension(0)]),
+            execute_mixed_program(&client, &program, &[MixedValue::Dimension(2), MixedValue::Dimension(5)], &[])
+                .unwrap(),
+            vec![MixedValue::Dimension(0)],
         );
         assert_eq!(
-            execute_mixed_program(&client, &program, &[MixedValue::Dimension(i64::MAX), MixedValue::Dimension(0)], &[],),
-            Ok(vec![MixedValue::Dimension(i64::MAX)]),
+            execute_mixed_program(
+                &client,
+                &program,
+                &[MixedValue::Dimension(i64::MAX), MixedValue::Dimension(0)],
+                &[],
+            ).unwrap(),
+            vec![MixedValue::Dimension(i64::MAX)],
         );
     }
 

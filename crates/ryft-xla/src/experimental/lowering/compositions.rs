@@ -11,9 +11,10 @@ use ryft_mlir::{
     TypeAndAttributes, Value as MlirValue, ValueAndAttributes, ValueRef,
 };
 
+use crate::Error;
 use crate::experimental::lowering::regions::lower_nested_program_inline;
 use crate::experimental::lowering::types::{lower_array_ir_type, lower_tensor_type};
-use crate::experimental::lowering::{CollectiveLoweringState, EffectTokens, LowerableOperationFamily, LoweringError};
+use crate::experimental::lowering::{CollectiveLoweringState, EffectTokens, LowerableOperationFamily};
 use crate::experimental::ops::{FlatXlaProgram, XlaConstant, XlaProgram};
 use crate::operations::attention::{
     attention_backward_composition_key, attention_composition_key, trace_attention_backward_composition,
@@ -29,7 +30,7 @@ use crate::operations::quantization::{
 /// has already determined the enclosing program's explicit transitions and adjoints, so it must not trigger new
 /// transitions when expanding these functions. Retain mesh placement and reduction state, and keep the original types
 /// in the named-composition key so the external operation contract remains unchanged.
-pub(crate) fn named_composition_input_types(input_types: &[ArrayType]) -> Result<Vec<ArrayIrType>, LoweringError> {
+pub(crate) fn named_composition_input_types(input_types: &[ArrayType]) -> Result<Vec<ArrayIrType>, Error> {
     input_types
         .iter()
         .map(|input| {
@@ -50,7 +51,7 @@ pub(crate) fn lower_decomposition_call<'b, 'c: 'b, 't: 'c>(
     block: &mut BlockRef<'b, 'c, 't>,
     context: &'c MlirContext<'t>,
     location: LocationRef<'c, 't>,
-) -> Result<Vec<ValueRef<'b, 'c, 't>>, LoweringError> {
+) -> Result<Vec<ValueRef<'b, 'c, 't>>, Error> {
     let result_types = output_types
         .iter()
         .map(|r#type| lower_tensor_type(r#type, context, location).map(|r#type| r#type.as_ref()))
@@ -146,11 +147,11 @@ impl NamedCompositionFunctionMap {
     /// Registers one typed decomposition lazily, sharing an existing private function when the complete semantic key
     /// is already present. The registry is independent of the operation family that produced `key` and `program`;
     /// closed backend operation enums only decide when to call this seam.
-    fn register<F: FnOnce() -> Result<FlatXlaProgram, LoweringError>>(
+    fn register<F: FnOnce() -> Result<FlatXlaProgram, Error>>(
         &mut self,
         key: NamedCompositionKey,
         program: F,
-    ) -> Result<(), LoweringError> {
+    ) -> Result<(), Error> {
         if self.functions.contains_key(&key) {
             return Ok(());
         }
@@ -171,7 +172,7 @@ impl NamedCompositionFunctionMap {
         operation: &ScaledDotOperation,
         input_types: &[ArrayType],
         output_types: &[ArrayType],
-    ) -> Result<Option<&NamedCompositionFunction>, LoweringError> {
+    ) -> Result<Option<&NamedCompositionFunction>, Error> {
         Ok(self.functions.get(&scaled_dot_composition_key(operation, input_types, output_types)?))
     }
 
@@ -200,7 +201,7 @@ impl NamedCompositionFunctionMap {
 pub(crate) fn collect_named_composition_functions<Input, Output, O: LowerableOperationFamily>(
     program: &XlaProgram<Input, Output, O>,
     target_platform: Option<&str>,
-) -> Result<NamedCompositionFunctionMap, LoweringError>
+) -> Result<NamedCompositionFunctionMap, Error>
 where
     Input: Parameterized<XlaConstant>,
     Output: Parameterized<XlaConstant>,
@@ -210,7 +211,7 @@ where
         map: &mut NamedCompositionFunctionMap,
         visited: &mut HashSet<RegionId>,
         target_platform: Option<&str>,
-    ) -> Result<(), LoweringError> {
+    ) -> Result<(), Error> {
         if !visited.insert(region.id()) {
             return Ok(());
         }
@@ -290,7 +291,7 @@ pub(crate) fn emit_named_composition_function<'b, 'c: 'b, 't: 'c>(
     collective_state: &CollectiveLoweringState,
     context: &'c MlirContext<'t>,
     location: LocationRef<'c, 't>,
-) -> Result<(), LoweringError> {
+) -> Result<(), Error> {
     let input_types = function.program.input_types();
     let output_types = function.program.output_types();
     let argument_tensor_types = input_types

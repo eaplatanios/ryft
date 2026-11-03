@@ -16,7 +16,7 @@ use ryft_pjrt::extensions::ffi::{
     FfiAttribute, FfiBuffer, FfiBufferType, FfiCallFrame, FfiError, FfiExecutionStage, FfiHandler, FfiHandlerTraits,
     FfiInput, FfiTypeId, XLA_FFI_CallFrame, XLA_FFI_Error, XLA_FFI_Handler,
 };
-use ryft_pjrt::{Client, Error};
+use ryft_pjrt::{Client, Error as PjrtError};
 
 use crate::experimental::lowering::types::{
     lower_physical_bound_value, lower_runtime_dimension_size_i64, lower_static_index_constants, lower_tensor_type,
@@ -24,7 +24,7 @@ use crate::experimental::lowering::types::{
 use crate::experimental::lowering::{EffectTokens, current_or_new_token};
 use crate::operations::comparisons::lower_compare_to_mlir;
 use crate::operations::manipulation::conversions::lower_cast_shape;
-use crate::{LowerableOperation, LowerableOperationFamily, LoweringError, XlaLowerer};
+use crate::{Error, LowerableOperation, LowerableOperationFamily, XlaLowerer};
 
 #[cfg(any(feature = "cuda-12", feature = "cuda-13"))]
 use ryft_pjrt::extensions::ffi::FfiStream;
@@ -38,7 +38,7 @@ pub(crate) fn lower_assertion_custom_call<'b, 'c: 'b, 't: 'c>(
     block: &mut BlockRef<'b, 'c, 't>,
     context: &'c MlirContext<'t>,
     location: LocationRef<'c, 't>,
-) -> Result<(), LoweringError> {
+) -> Result<(), Error> {
     let input_token = current_or_new_token(EffectClass::OrderedAssertion, effect_tokens, block, location)?;
     let mut inputs = Vec::with_capacity(2 + observed_values.len());
     inputs.push(predicate);
@@ -53,7 +53,7 @@ pub(crate) fn lower_assertion_custom_call<'b, 'c: 'b, 't: 'c>(
                 .map(|tensor| (0..tensor.dimensions().count()).rev().collect::<Vec<_>>())
                 .unwrap_or_default())
         })
-        .collect::<Result<Vec<_>, LoweringError>>()?;
+        .collect::<Result<Vec<_>, Error>>()?;
     let layouts = layouts
         .iter()
         .any(|layout| !layout.is_empty())
@@ -92,7 +92,7 @@ pub(crate) fn lower_assert_to_custom_call<'b, 'c: 'b, 't: 'c>(
     block: &mut BlockRef<'b, 'c, 't>,
     context: &'c MlirContext<'t>,
     location: LocationRef<'c, 't>,
-) -> Result<(), LoweringError> {
+) -> Result<(), Error> {
     check_count!("input", input_values, labels.len() + 1, ProgramError);
     check_count!("input", input_types, input_values.len(), ProgramError);
     let mut attributes = vec![
@@ -180,7 +180,7 @@ pub(crate) fn lower_deliberately_false_assertion_predicate<'b, 'c: 'b, 't: 'c>(
     block: &mut BlockRef<'b, 'c, 't>,
     context: &'c MlirContext<'t>,
     location: LocationRef<'c, 't>,
-) -> Result<ValueRef<'b, 'c, 't>, LoweringError> {
+) -> Result<ValueRef<'b, 'c, 't>, Error> {
     let zero = lower_static_index_constants(&[0], block, context, location)?[0];
     lower_compare_to_mlir(ComparisonDirection::LessThan, value, zero, block, location)
 }
@@ -212,7 +212,7 @@ pub(crate) fn lower_output_extent_validation<'b, 'c: 'b, 't: 'c>(
     block: &mut BlockRef<'b, 'c, 't>,
     context: &'c MlirContext<'t>,
     location: LocationRef<'c, 't>,
-) -> Result<Option<ValueRef<'b, 'c, 't>>, LoweringError> {
+) -> Result<Option<ValueRef<'b, 'c, 't>>, Error> {
     let checks = output_extent_checks(declared_types, input_types, output_types)?;
     check_count!("input", input_values, input_types.len(), ProgramError);
     let mut checked = Vec::new();
@@ -263,7 +263,7 @@ pub(crate) fn validates_output_extents(
     declared_types: &[ArrayType],
     input_types: &[ArrayIrType],
     output_types: &[ArrayIrType],
-) -> Result<bool, LoweringError> {
+) -> Result<bool, Error> {
     let dynamic_count = declared_types
         .iter()
         .flat_map(|r#type| r#type.shape().dimensions())
@@ -275,8 +275,7 @@ pub(crate) fn validates_output_extents(
     let output_types = output_types
         .iter()
         .map(|r#type| <&ArrayType>::try_from(r#type).cloned())
-        .collect::<Result<Vec<_>, _>>()
-        .map_err(|error| LoweringError::Tracing(error.into()))?;
+        .collect::<Result<Vec<_>, _>>()?;
     Ok(!output_extent_checks(declared_types, &input_types[extent_offset..], &output_types)?.is_empty())
 }
 
@@ -287,7 +286,7 @@ fn output_extent_checks<'d>(
     declared_types: &'d [ArrayType],
     input_types: &[ArrayIrType],
     output_types: &[ArrayType],
-) -> Result<Vec<(usize, &'d DimensionVariable, usize)>, LoweringError> {
+) -> Result<Vec<(usize, &'d DimensionVariable, usize)>, Error> {
     check_count!("output", output_types, declared_types.len(), ProgramError);
     let dynamic_count = declared_types
         .iter()
@@ -304,8 +303,7 @@ fn output_extent_checks<'d>(
     for (declared, output) in dimensions {
         let Dimension::Dynamic(variable) = declared else { continue };
         let (index, input_type) = inputs.next().unwrap();
-        let input_type =
-            <&DimensionType>::try_from(input_type).map_err(|error| LoweringError::Tracing(error.into()))?;
+        let input_type = <&DimensionType>::try_from(input_type)?;
         if let Dimension::Static(extent) = *output
             && input_type.extent() != Some(extent)
         {
@@ -423,7 +421,7 @@ enum AssertionBufferMemory {
 pub(crate) fn ensure_assertion_handler_registered(client: &Client<'_>) -> Result<(), Error> {
     let platform_name = client.platform_name()?.into_owned();
     if platform_name.eq_ignore_ascii_case("cpu") {
-        static CPU_ASSERTION_HANDLER_REGISTRATION: OnceLock<Result<(), Error>> = OnceLock::new();
+        static CPU_ASSERTION_HANDLER_REGISTRATION: OnceLock<Result<(), PjrtError>> = OnceLock::new();
         return CPU_ASSERTION_HANDLER_REGISTRATION
             .get_or_init(|| {
                 client.register_ffi_handler(
@@ -433,11 +431,12 @@ pub(crate) fn ensure_assertion_handler_registered(client: &Client<'_>) -> Result
                     FfiHandlerTraits::NONE,
                 )
             })
-            .clone();
+            .clone()
+            .map_err(Error::from);
     }
     #[cfg(any(feature = "cuda-12", feature = "cuda-13"))]
     if platform_name.eq_ignore_ascii_case("cuda") {
-        static CUDA_ASSERTION_HANDLER_REGISTRATION: OnceLock<Result<(), Error>> = OnceLock::new();
+        static CUDA_ASSERTION_HANDLER_REGISTRATION: OnceLock<Result<(), PjrtError>> = OnceLock::new();
         return CUDA_ASSERTION_HANDLER_REGISTRATION
             .get_or_init(|| {
                 client.register_ffi_handler(
@@ -447,11 +446,13 @@ pub(crate) fn ensure_assertion_handler_registered(client: &Client<'_>) -> Result
                     FfiHandlerTraits::NONE,
                 )
             })
-            .clone();
+            .clone()
+            .map_err(Error::from);
     }
-    Err(Error::unimplemented(format!(
+    Err(PjrtError::unimplemented(format!(
         "compiled runtime assertions are not supported on XLA platform `{platform_name}`",
-    )))
+    ))
+    .into())
 }
 
 /// XLA FFI handler for host-resident assertion operands.
@@ -1214,7 +1215,7 @@ pub(crate) fn lower_guard<'b, 'c: 'b, 't: 'c>(
     block: &mut BlockRef<'b, 'c, 't>,
     context: &'c MlirContext<'t>,
     location: LocationRef<'c, 't>,
-) -> Result<(), LoweringError> {
+) -> Result<(), Error> {
     let guarded = lower_type_relationship_checks(
         GUARD_OPERATION_NAME,
         &format!("at the entry of `{boundary}`"),
@@ -1275,7 +1276,7 @@ pub(crate) fn lower_type_relationship_checks<'b, 'c: 'b, 't: 'c>(
     block: &mut BlockRef<'b, 'c, 't>,
     context: &'c MlirContext<'t>,
     location: LocationRef<'c, 't>,
-) -> Result<bool, LoweringError> {
+) -> Result<bool, Error> {
     check_count!("input", values, declared_types.len(), ProgramError);
     check_count!("input", actual_types, declared_types.len(), ProgramError);
     let mut checked = false;
@@ -1284,7 +1285,7 @@ pub(crate) fn lower_type_relationship_checks<'b, 'c: 'b, 't: 'c>(
                            message: String,
                            effect_tokens: &mut EffectTokens<'b, 'c, 't>,
                            block: &mut BlockRef<'b, 'c, 't>|
-     -> Result<(), LoweringError> {
+     -> Result<(), Error> {
         let predicate = lower_compare_to_mlir(ComparisonDirection::Equal, actual, expected, block, location)?;
         lower_assert_to_custom_call(
             actor,
@@ -1356,7 +1357,7 @@ pub(crate) fn lower_type_relationship_checks<'b, 'c: 'b, 't: 'c>(
                 }
             }
             (declared, actual) => {
-                return Err(LoweringError::UnsupportedOp {
+                return Err(Error::UnsupportedOperation {
                     op: format!(
                         "`{actor}` cannot check actual type `{actual}` against declared type `{declared}` {site}"
                     ),
@@ -1394,7 +1395,7 @@ pub(crate) fn lower_type_relationship_checks<'b, 'c: 'b, 't: 'c>(
         let lower_extent = |extent: &Result<usize, (ValueRef<'b, 'c, 't>, Option<usize>)>,
                             block: &mut BlockRef<'b, 'c, 't>| match extent {
             Ok(extent) => Ok(lower_static_index_constants(&[*extent], block, context, location)?.remove(0)),
-            Err((value, None)) => Ok::<_, LoweringError>(*value),
+            Err((value, None)) => Ok::<_, Error>(*value),
             Err((value, Some(axis))) => lower_runtime_dimension_size_i64(*value, *axis, block, context, location),
         };
         let expected = lower_extent(first, block)?;
@@ -1413,7 +1414,7 @@ impl LowerableOperation for GuardOperation<ArrayType> {
         input_values: &[ValueRef<'b, 'c, 't>],
         input_types: &[ArrayType],
         output_types: &[ArrayType],
-    ) -> Result<Vec<ValueRef<'b, 'c, 't>>, LoweringError> {
+    ) -> Result<Vec<ValueRef<'b, 'c, 't>>, Error> {
         let declared_types = self.declared_types().iter().cloned().map(ArrayIrType::from).collect::<Vec<_>>();
         let input_types = input_types.iter().cloned().map(ArrayIrType::from).collect::<Vec<_>>();
         let output_types = output_types.iter().cloned().map(ArrayIrType::from).collect::<Vec<_>>();
@@ -1428,7 +1429,7 @@ impl LowerableOperation for GuardOperation<ArrayIrType> {
         input_values: &[ValueRef<'b, 'c, 't>],
         input_types: &[ArrayIrType],
         output_types: &[ArrayIrType],
-    ) -> Result<Vec<ValueRef<'b, 'c, 't>>, LoweringError> {
+    ) -> Result<Vec<ValueRef<'b, 'c, 't>>, Error> {
         lower_guard_with_outputs(
             self.boundary(),
             self.declared_types(),
@@ -1449,7 +1450,7 @@ pub(crate) fn lower_dependency_barrier<'b, 'c: 'b, 't: 'c>(
     assertion_token: Option<ValueRef<'b, 'c, 't>>,
     block: &mut BlockRef<'b, 'c, 't>,
     location: LocationRef<'c, 't>,
-) -> Result<Vec<ValueRef<'b, 'c, 't>>, LoweringError> {
+) -> Result<Vec<ValueRef<'b, 'c, 't>>, Error> {
     if values.is_empty() || (values.len() == 1 && assertion_token.is_none()) {
         return Ok(values.to_vec());
     }
@@ -1469,7 +1470,7 @@ fn lower_guard_with_outputs<'b, 'c: 'b, 't: 'c, O: LowerableOperationFamily>(
     input_types: &[ArrayIrType],
     output_types: &[ArrayIrType],
     lowerer: &mut XlaLowerer<'b, 'c, 't, O>,
-) -> Result<Vec<ValueRef<'b, 'c, 't>>, LoweringError> {
+) -> Result<Vec<ValueRef<'b, 'c, 't>>, Error> {
     check_count!("output", output_types, input_values.len(), ProgramError);
     lower_guard(
         boundary,
@@ -1504,7 +1505,7 @@ impl LowerableOperation for AssertOperation<ArrayType> {
         input_values: &[ValueRef<'b, 'c, 't>],
         input_types: &[ArrayType],
         _output_types: &[ArrayType],
-    ) -> Result<Vec<ValueRef<'b, 'c, 't>>, LoweringError> {
+    ) -> Result<Vec<ValueRef<'b, 'c, 't>>, Error> {
         lower_assert_to_custom_call(
             self.name(),
             self.message(),
@@ -1528,7 +1529,7 @@ impl LowerableOperation for AssertOperation<ArrayIrType> {
         input_values: &[ValueRef<'b, 'c, 't>],
         input_types: &[ArrayIrType],
         _output_types: &[ArrayIrType],
-    ) -> Result<Vec<ValueRef<'b, 'c, 't>>, LoweringError> {
+    ) -> Result<Vec<ValueRef<'b, 'c, 't>>, Error> {
         let context = lowerer.context;
         let location = lowerer.location;
         let effect_tokens = &mut lowerer.effect_tokens;
@@ -1777,8 +1778,8 @@ mod tests {
         ensure_print_handler_registered(&client).unwrap();
         let values = MixedValue::Array(vec![1.0, 2.0], vec![2]);
         assert_eq!(
-            execute_mixed_program(&client, &program, &[MixedValue::Dimension(2), values.clone()], &[]),
-            Ok(vec![values.clone()]),
+            execute_mixed_program(&client, &program, &[MixedValue::Dimension(2), values.clone()], &[]).unwrap(),
+            vec![values.clone()],
         );
         let error = execute_mixed_program(&client, &program, &[MixedValue::Dimension(5), values], &[])
             .unwrap_err()
@@ -1828,8 +1829,8 @@ mod tests {
             MixedValue::Array(vec![5.0, 6.0, 7.0, 0.0, 0.0, 0.0, 0.0, 0.0], vec![8]),
         ];
         assert_eq!(
-            execute_mixed_program(&client, &program, &inputs, &[2, 2]),
-            Ok(vec![MixedValue::Array(vec![9.0, 12.0], vec![2]), MixedValue::Dimension(2)]),
+            execute_mixed_program(&client, &program, &inputs, &[2, 2]).unwrap(),
+            vec![MixedValue::Array(vec![9.0, 12.0], vec![2]), MixedValue::Dimension(2)],
         );
         let error = execute_mixed_program(&client, &program, &inputs, &[2, 3]).unwrap_err().to_string();
         assert!(error.contains("must have one extent at the entry of `region`"), "{error}");
@@ -1869,8 +1870,8 @@ mod tests {
             MixedValue::Array(vec![3.0, 4.0, 5.0, 6.0, 7.0, 8.0, 9.0, 10.0], vec![8]),
         ];
         assert_eq!(
-            execute_mixed_program(&client, &program, &inputs, &[2, 2]),
-            Ok(vec![MixedValue::Array(vec![4.0, 6.0], vec![2]), MixedValue::Dimension(2)]),
+            execute_mixed_program(&client, &program, &inputs, &[2, 2]).unwrap(),
+            vec![MixedValue::Array(vec![4.0, 6.0], vec![2]), MixedValue::Dimension(2)],
         );
         let error = execute_mixed_program(&client, &program, &inputs, &[2, 3]).unwrap_err().to_string();
         assert!(error.contains("must have one extent at the entry of `region`"), "{error}");
@@ -2052,8 +2053,8 @@ mod tests {
                 MixedValue::Array(vec![3.0, 4.0, 5.0, 6.0, 7.0, 8.0, 0.0, 0.0], vec![8]),
             ];
             assert_eq!(
-                execute_mixed_program(&client, program, &inputs, &[2, 2]),
-                Ok(vec![MixedValue::Array(vec![4.0, 6.0], vec![2]), MixedValue::Dimension(2)]),
+                execute_mixed_program(&client, program, &inputs, &[2, 2]).unwrap(),
+                vec![MixedValue::Array(vec![4.0, 6.0], vec![2]), MixedValue::Dimension(2)],
             );
             let error = execute_mixed_program(&client, program, &inputs, &[2, 6]).unwrap_err().to_string();
             assert!(error.contains("must have one extent at the entry of `region`"), "{error}");
@@ -2247,13 +2248,13 @@ mod tests {
             assert_eq!(tangent_module, expected_tangent_module);
             let inputs = [inputs[0].clone(), inputs[1].clone(), inputs[0].clone(), inputs[1].clone()];
             assert_eq!(
-                execute_mixed_program(&client, &jvp, &inputs, &[2, 2, 2, 2]),
-                Ok(vec![
+                execute_mixed_program(&client, &jvp, &inputs, &[2, 2, 2, 2]).unwrap(),
+                vec![
                     MixedValue::Array(vec![4.0, 6.0], vec![2]),
                     MixedValue::Array(vec![4.0, 6.0], vec![2]),
                     MixedValue::Dimension(2),
                     MixedValue::Dimension(2),
-                ]),
+                ],
             );
             let error = execute_mixed_program(&client, &jvp, &inputs, &[2, 6, 2, 6]).unwrap_err().to_string();
             assert!(error.contains("must have one extent at the entry of `region`"), "{error}");
@@ -2408,12 +2409,12 @@ mod tests {
 
     #[test]
     fn test_validate_arithmetic() {
-        assert_eq!(validate_arithmetic(ASSERT_ADD_KIND, "left", 2, "right", 3), Ok(()));
-        assert_eq!(validate_arithmetic(ASSERT_SUB_KIND, "left", 3, "right", 2), Ok(()));
-        assert_eq!(validate_arithmetic(ASSERT_MUL_KIND, "left", 2, "right", 3), Ok(()));
-        assert_eq!(validate_arithmetic(ASSERT_POW_KIND, "left", 2, "right", 3), Ok(()));
-        assert_eq!(validate_arithmetic(ASSERT_DIV_KIND, "left", 7, "right", 3), Ok(()));
-        assert_eq!(validate_arithmetic(ASSERT_REM_KIND, "left", 7, "right", 3), Ok(()));
+        validate_arithmetic(ASSERT_ADD_KIND, "left", 2, "right", 3).unwrap();
+        validate_arithmetic(ASSERT_SUB_KIND, "left", 3, "right", 2).unwrap();
+        validate_arithmetic(ASSERT_MUL_KIND, "left", 2, "right", 3).unwrap();
+        validate_arithmetic(ASSERT_POW_KIND, "left", 2, "right", 3).unwrap();
+        validate_arithmetic(ASSERT_DIV_KIND, "left", 7, "right", 3).unwrap();
+        validate_arithmetic(ASSERT_REM_KIND, "left", 7, "right", 3).unwrap();
 
         assert_eq!(
             validate_arithmetic(ASSERT_ADD_KIND, "left", i64::MAX, "right", 1),
@@ -2451,9 +2452,9 @@ mod tests {
 
     #[test]
     fn test_validate_pad() {
-        assert_eq!(validate_pad(0, 3, 6, -1, 2, 1), Ok(()));
-        assert_eq!(validate_pad(0, 0, 3, 1, 2, usize::MAX), Ok(()));
-        assert_eq!(validate_pad(0, 1, 4, 1, 2, usize::MAX), Ok(()));
+        validate_pad(0, 3, 6, -1, 2, 1).unwrap();
+        validate_pad(0, 0, 3, 1, 2, usize::MAX).unwrap();
+        validate_pad(0, 1, 4, 1, 2, usize::MAX).unwrap();
         assert_eq!(
             validate_pad(0, 3, 5, -1, 2, 1),
             Err("`pad` result extent on axis 0 must equal 6 but got 5".to_string())
@@ -2475,9 +2476,9 @@ mod tests {
 
     #[test]
     fn test_validate_reshape() {
-        assert_eq!(validate_reshape("reshape", &[4], &[2, 2]), Ok(()));
-        assert_eq!(validate_reshape("reshape", &[], &[1]), Ok(()));
-        assert_eq!(validate_reshape("reshape", &[0, i64::MAX, 2], &[2, 0]), Ok(()));
+        validate_reshape("reshape", &[4], &[2, 2]).unwrap();
+        validate_reshape("reshape", &[], &[1]).unwrap();
+        validate_reshape("reshape", &[0, i64::MAX, 2], &[2, 0]).unwrap();
         assert_eq!(
             validate_reshape("reshape", &[4], &[3]),
             Err("`reshape` changes the number of elements from 4 to 3".to_string())
@@ -2498,7 +2499,7 @@ mod tests {
 
     #[test]
     fn test_validate_concatenate() {
-        assert_eq!(validate_concatenate("concatenate", "1", 7, &[2, 3, 2]), Ok(()));
+        validate_concatenate("concatenate", "1", 7, &[2, 3, 2]).unwrap();
         assert_eq!(
             validate_concatenate("concatenate", "1", 8, &[2, 3, 2]),
             Err("`concatenate` result extent must equal the sum of input axis 1 extents; expected 7 but got 8"
@@ -2512,8 +2513,8 @@ mod tests {
 
     #[test]
     fn test_validate_dynamic_slice_with_dimensions() {
-        assert_eq!(validate_dynamic_slice_with_dimensions(1, 2, 8, 1, 3), Ok(()));
-        assert_eq!(validate_dynamic_slice_with_dimensions(1, 2, 8, 8, 0), Ok(()));
+        validate_dynamic_slice_with_dimensions(1, 2, 8, 1, 3).unwrap();
+        validate_dynamic_slice_with_dimensions(1, 2, 8, 8, 0).unwrap();
         assert_eq!(
             validate_dynamic_slice_with_dimensions(1, 2, 8, 3, 4),
             Err("`dynamic_slice` limit 10 exceeds input axis 1 extent 8".to_string()),

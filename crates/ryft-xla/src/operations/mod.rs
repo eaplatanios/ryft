@@ -7,7 +7,7 @@ use ryft_mlir::{
     ValueRef,
 };
 
-use crate::LoweringError;
+use crate::Error;
 use crate::experimental::lowering::types::{lower_restore_dynamic_dimensions, lower_tensor_type, physical_bound_type};
 use crate::operations::constants::lower_layout_constraint;
 
@@ -88,13 +88,13 @@ pub(crate) fn normalize_elementwise_operand<'b, 'c: 'b, 't: 'c, B, L>(
     block: &mut B,
     context: &'c MlirContext<'t>,
     location: L,
-) -> Result<ValueRef<'b, 'c, 't>, LoweringError>
+) -> Result<ValueRef<'b, 'c, 't>, Error>
 where
     B: Block<'b, 'c, 't>,
     L: Copy + Location<'c, 't>,
 {
     let input_type = input.r#type()?;
-    let input_tensor_type = input_type.cast::<TensorTypeRef>().ok_or_else(|| LoweringError::UnsupportedOp {
+    let input_tensor_type = input_type.cast::<TensorTypeRef>().ok_or_else(|| Error::UnsupportedOperation {
         op: format!("elementwise operand has non-tensor MLIR type `{input_type}`"),
     })?;
     let output_tensor_type = lower_tensor_type(output_type, context, location)?;
@@ -109,7 +109,7 @@ where
     if input_tensor_type.dimensions().ne(output_tensor_type.dimensions()) {
         let output_rank = output_tensor_type.rank();
         let input_rank = input_tensor_type.rank();
-        let first_dimension = output_rank.checked_sub(input_rank).ok_or_else(|| LoweringError::UnsupportedOp {
+        let first_dimension = output_rank.checked_sub(input_rank).ok_or_else(|| Error::UnsupportedOperation {
             op: format!("cannot broadcast rank-{input_rank} elementwise operand to rank-{output_rank} output"),
         })?;
         let dimensions = (first_dimension..output_rank).collect::<Vec<_>>();
@@ -144,7 +144,7 @@ pub(crate) fn normalize_binary_elementwise_operands<'b, 'c: 'b, 't: 'c, B, L>(
     block: &mut B,
     context: &'c MlirContext<'t>,
     location: L,
-) -> Result<[ValueRef<'b, 'c, 't>; 2], LoweringError>
+) -> Result<[ValueRef<'b, 'c, 't>; 2], Error>
 where
     B: Block<'b, 'c, 't>,
     L: Copy + Location<'c, 't>,

@@ -18,7 +18,7 @@ use crate::operations::assertions::{
     lower_assertion_custom_call, lower_deliberately_false_assertion_predicate,
 };
 use crate::operations::lower_tensor_type;
-use crate::{LowerableOperation, LowerableOperationFamily, LoweringError, XlaLowerer};
+use crate::{Error, LowerableOperation, LowerableOperationFamily, XlaLowerer};
 
 /// Joins inputs using a bounded fan-in tree so very wide concatenations do not create pathological compiler work.
 pub(crate) fn lower_concatenate_tree<'b, 'c: 'b, 't: 'c>(
@@ -26,7 +26,7 @@ pub(crate) fn lower_concatenate_tree<'b, 'c: 'b, 't: 'c>(
     axis: usize,
     block: &mut BlockRef<'b, 'c, 't>,
     location: LocationRef<'c, 't>,
-) -> Result<ValueRef<'b, 'c, 't>, LoweringError> {
+) -> Result<ValueRef<'b, 'c, 't>, Error> {
     if inputs.is_empty() {
         return Err(ProgramError::InvalidInputCount { expected: 1, actual: 0 }.into());
     }
@@ -41,7 +41,7 @@ pub(crate) fn lower_concatenate_tree<'b, 'c: 'b, 't: 'c>(
                 let joined = block.append_operation(stable_hlo::concatenate(chunk, axis, location)?)?;
                 Ok(joined.result(0).unwrap().as_ref())
             })
-            .collect::<Result<Vec<_>, LoweringError>>()?;
+            .collect::<Result<Vec<_>, Error>>()?;
     }
     Ok(values[0])
 }
@@ -55,7 +55,7 @@ pub(crate) fn lower_concatenate_extent_assertion<'b, 'c: 'b, 't: 'c>(
     block: &mut BlockRef<'b, 'c, 't>,
     context: &'c MlirContext<'t>,
     location: LocationRef<'c, 't>,
-) -> Result<(), LoweringError> {
+) -> Result<(), Error> {
     let predicate = lower_deliberately_false_assertion_predicate(actual, block, context, location)?;
     let axis = axis.to_string();
     let backend_config = context.dictionary_attribute(&[
@@ -77,7 +77,7 @@ impl LowerableOperation for ConcatenateOperation<ArrayType> {
         input_values: &[ValueRef<'b, 'c, 't>],
         _input_types: &[ArrayType],
         _output_types: &[ArrayType],
-    ) -> Result<Vec<ValueRef<'b, 'c, 't>>, LoweringError> {
+    ) -> Result<Vec<ValueRef<'b, 'c, 't>>, Error> {
         Ok(vec![lower_concatenate_tree(input_values, self.axis(), &mut lowerer.block, lowerer.location)?])
     }
 }
@@ -89,7 +89,7 @@ impl LowerableOperation for ConcatenateOperation<ArrayIrType> {
         input_values: &[ValueRef<'b, 'c, 't>],
         input_types: &[ArrayIrType],
         output_types: &[ArrayIrType],
-    ) -> Result<Vec<ValueRef<'b, 'c, 't>>, LoweringError> {
+    ) -> Result<Vec<ValueRef<'b, 'c, 't>>, Error> {
         let context = lowerer.context;
         let location = lowerer.location;
         let effect_tokens = &mut lowerer.effect_tokens;
@@ -103,7 +103,7 @@ impl LowerableOperation for ConcatenateOperation<ArrayIrType> {
         if array_inputs.is_empty() {
             return Err(ProgramError::InvalidInputCount { expected: 2, actual: input_values.len() }.into());
         }
-        <&DimensionType>::try_from(result_extent_type).map_err(|error| LoweringError::Tracing(error.into()))?;
+        <&DimensionType>::try_from(result_extent_type)?;
 
         if self.effects().classes().contains(EffectClass::OrderedAssertion) {
             // The callback receives every concrete logical input extent and computes their checked sum on the
@@ -112,7 +112,7 @@ impl LowerableOperation for ConcatenateOperation<ArrayIrType> {
             let i64_type = lower_tensor_type(&ArrayType::scalar(DataType::I64), context, location)?;
             let mut input_extents = Vec::with_capacity(array_inputs.len());
             for (input, r#type) in array_inputs.iter().zip(array_input_types) {
-                let r#type = <&ArrayType>::try_from(r#type).map_err(|error| LoweringError::Tracing(error.into()))?;
+                let r#type = <&ArrayType>::try_from(r#type)?;
                 let extent = match r#type.shape().dimensions()[self.axis()] {
                     Dimension::Static(extent) => lower_static_index_constants(&[extent], block, context, location)?[0],
                     Dimension::Dynamic(_) => {
@@ -143,14 +143,10 @@ impl LowerableOperation for ConcatenateOperation<ArrayIrType> {
         let [output_type] = output_types else {
             return Err(ProgramError::InvalidOutputCount { expected: 1, actual: output_types.len() }.into());
         };
-        let output_type = <&ArrayType>::try_from(output_type).map_err(|error| LoweringError::Tracing(error.into()))?;
+        let output_type = <&ArrayType>::try_from(output_type)?;
         let expected_type = lower_tensor_type(output_type, context, location)?;
         if result.r#type()? != expected_type.as_ref() {
-            let inputs = array_input_types
-                .iter()
-                .map(<&ArrayType>::try_from)
-                .collect::<Result<Vec<_>, _>>()
-                .map_err(|error| LoweringError::Tracing(error.into()))?;
+            let inputs = array_input_types.iter().map(<&ArrayType>::try_from).collect::<Result<Vec<_>, _>>()?;
             let mut inferred_extent = DimensionSizeOperation::new(inputs[0], self.axis())
                 .map_err(ProgramError::from)?
                 .output_type()

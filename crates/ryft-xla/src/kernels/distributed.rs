@@ -38,12 +38,16 @@ use ryft_pjrt::{Client, Execution, ExecutionFence, KeyValueStore};
 use serde::{Deserialize, Serialize};
 use sha2::{Digest, Sha256};
 
-use crate::experimental::XlaDomainError;
 use crate::kernels::KernelEmbeddingError;
 use crate::kernels::aot::{KernelAotError, LoadedKernel};
-use crate::{DistributedRuntime, FromPjrt, XlaArray};
+use crate::{DistributedRuntime, Error, FromPjrt, XlaArray};
 
+// TODO(eaplatanios): Promote distributed kernel errors to dedicated `ryft_xla::Error` variants after
+// this support leaves experimental status.
 /// Failure in host-coordinated kernel execution. Submitted device work is drained before returning an error.
+///
+/// Converting to [`Error`] unwraps [`Self::Xla`] and wraps every other variant in [`Error::Custom`]. Converting an
+/// [`Error`] into this type uses [`Self::Xla`], so round trips preserve canonical errors and shared custom payloads.
 #[derive(Debug, thiserror::Error)]
 pub enum DistributedKernelError {
     /// The call or its peer manifest violates a bounded coordination contract.
@@ -96,7 +100,7 @@ pub enum DistributedKernelError {
 
     /// The existing XLA array or session operation failed.
     #[error(transparent)]
-    Xla(#[from] XlaDomainError),
+    Xla(#[from] Error),
 
     /// Bounded coordination metadata was malformed.
     #[error(transparent)]
@@ -105,6 +109,15 @@ pub enum DistributedKernelError {
     /// Live local participant admission failed.
     #[error(transparent)]
     Embedding(#[from] KernelEmbeddingError),
+}
+
+impl From<DistributedKernelError> for crate::Error {
+    fn from(error: DistributedKernelError) -> Self {
+        match error {
+            DistributedKernelError::Xla(error) => error,
+            error => Self::custom(error),
+        }
+    }
 }
 
 impl DistributedKernelError {
@@ -484,7 +497,7 @@ impl<'r, 'c> DistributedKernel<'r, 'c> {
         }
         for (index, input) in inputs.iter().enumerate() {
             self.coordination.check(cancelled, deadline)?;
-            input.block_until_ready().map_err(XlaDomainError::from)?;
+            input.block_until_ready()?;
             let shard = input.addressable_shards().next().unwrap();
             let buffer =
                 shard.buffer().ok_or_else(|| DistributedKernelError::invalid("input has no addressable buffer"))?;
@@ -534,9 +547,8 @@ impl<'r, 'c> DistributedKernel<'r, 'c> {
             if Sha256::digest(&bytes).as_slice() != manifest.checksum {
                 return Err(DistributedKernelError::invalid("received input checksum mismatch"));
             }
-            let value = XlaArray::from_host_buffer(domain, r#type.clone(), mesh.clone(), bytes)
-                .map_err(XlaDomainError::from)?;
-            value.block_until_ready().map_err(XlaDomainError::from)?;
+            let value = XlaArray::from_host_buffer(domain, r#type.clone(), mesh.clone(), bytes)?;
+            value.block_until_ready()?;
             arguments.push(value);
         }
         self.coordination.check(cancelled, deadline)?;
@@ -791,6 +803,30 @@ mod tests {
             eprintln!("distributed kernel {mode} child {process}: {}", output.status);
             assert!(output.status.success(), "{}", String::from_utf8_lossy(&output.stderr));
         }
+    }
+
+    #[test]
+    fn test_distributed_kernel_error_roundtrip() {
+        let core = Error::from(DistributedKernelError::from(Error::from(ryft_core::ProgramError::PoisonedValue)));
+        assert!(matches!(core, Error::Core(ryft_core::Error::Program(ryft_core::ProgramError::PoisonedValue))));
+
+        let pjrt = Error::from(DistributedKernelError::from(Error::from(ryft_pjrt::Error::invalid_argument(
+            "invalid distributed runtime input",
+        ))));
+        assert!(matches!(pjrt, Error::Pjrt(ryft_pjrt::Error::InvalidArgument { ref message, .. })
+            if message == "invalid distributed runtime input"));
+
+        let custom = Error::from(DistributedKernelError::Cancelled);
+        let roundtrip = Error::from(DistributedKernelError::from(custom.clone()));
+        let roundtrip = Error::from(DistributedKernelError::from(roundtrip));
+        assert!(matches!(
+            roundtrip.downcast_custom::<DistributedKernelError>(),
+            Some(DistributedKernelError::Cancelled)
+        ));
+        assert!(std::ptr::eq(
+            custom.downcast_custom::<DistributedKernelError>().unwrap(),
+            roundtrip.downcast_custom::<DistributedKernelError>().unwrap(),
+        ));
     }
 
     #[test]

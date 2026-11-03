@@ -10,7 +10,7 @@ use crate::experimental::lowering::types::{
     lower_constant_elements_attribute, lower_signed_one_bit_to_mlir, lower_tensor_type,
 };
 use crate::operations::{lower_accuracy, normalize_binary_elementwise_operands};
-use crate::{LowerableOperation, LowerableOperationFamily, LoweringError, XlaLowerer};
+use crate::{Error, LowerableOperation, LowerableOperationFamily, XlaLowerer};
 
 /// Recovers signed one-bit values before promotion and computes one-bit arithmetic in a byte carrier.
 fn normalize_arithmetic_inputs<'b, 'c: 'b, 't: 'c, O: LowerableOperationFamily>(
@@ -18,7 +18,7 @@ fn normalize_arithmetic_inputs<'b, 'c: 'b, 't: 'c, O: LowerableOperationFamily>(
     input_types: &[ArrayType],
     output_types: &[ArrayType],
     lowerer: &mut XlaLowerer<'b, 'c, 't, O>,
-) -> Result<[ValueRef<'b, 'c, 't>; 2], LoweringError> {
+) -> Result<[ValueRef<'b, 'c, 't>; 2], Error> {
     check_count!("input", input_values, 2, ProgramError);
     check_count!("output", output_types, 1, ProgramError);
     let mut inputs = [input_values[0], input_values[1]];
@@ -46,7 +46,7 @@ fn lower_arithmetic_output<'b, 'c: 'b, 't: 'c, O: LowerableOperationFamily>(
     output: ValueRef<'b, 'c, 't>,
     output_type: &ArrayType,
     lowerer: &mut XlaLowerer<'b, 'c, 't, O>,
-) -> Result<ValueRef<'b, 'c, 't>, LoweringError> {
+) -> Result<ValueRef<'b, 'c, 't>, Error> {
     if !matches!(output_type.data_type(), DataType::I1 | DataType::U1) {
         return Ok(output);
     }
@@ -79,7 +79,7 @@ impl LowerableOperation for AddOperation<ArrayType> {
         input_values: &[ValueRef<'b, 'c, 't>],
         input_types: &[ArrayType],
         output_types: &[ArrayType],
-    ) -> Result<Vec<ValueRef<'b, 'c, 't>>, LoweringError> {
+    ) -> Result<Vec<ValueRef<'b, 'c, 't>>, Error> {
         let [left, right] = normalize_arithmetic_inputs(input_values, input_types, output_types, lowerer)?;
         let result = lowerer.block.append_operation(stable_hlo::add(left, right, lowerer.location)?)?;
         Ok(vec![lower_arithmetic_output(result.result(0).unwrap().as_ref(), &output_types[0], lowerer)?])
@@ -93,7 +93,7 @@ impl LowerableOperation for SubOperation<ArrayType> {
         input_values: &[ValueRef<'b, 'c, 't>],
         input_types: &[ArrayType],
         output_types: &[ArrayType],
-    ) -> Result<Vec<ValueRef<'b, 'c, 't>>, LoweringError> {
+    ) -> Result<Vec<ValueRef<'b, 'c, 't>>, Error> {
         let [left, right] = normalize_arithmetic_inputs(input_values, input_types, output_types, lowerer)?;
         let result = lowerer.block.append_operation(stable_hlo::subtract(left, right, lowerer.location)?)?;
         Ok(vec![lower_arithmetic_output(result.result(0).unwrap().as_ref(), &output_types[0], lowerer)?])
@@ -107,7 +107,7 @@ impl LowerableOperation for SaturatingSubOperation<ArrayType> {
         input_values: &[ValueRef<'b, 'c, 't>],
         input_types: &[ArrayType],
         output_types: &[ArrayType],
-    ) -> Result<Vec<ValueRef<'b, 'c, 't>>, LoweringError> {
+    ) -> Result<Vec<ValueRef<'b, 'c, 't>>, Error> {
         let [left, right] = normalize_arithmetic_inputs(input_values, input_types, output_types, lowerer)?;
         let data_type = output_types[0].data_type();
         if data_type.is_unsigned() {
@@ -125,7 +125,7 @@ impl LowerableOperation for SaturatingSubOperation<ArrayType> {
             )?]);
         }
         if !data_type.is_signed() {
-            return Err(LoweringError::UnsupportedDataType { data_type });
+            return Err(Error::UnsupportedDataType { data_type });
         }
 
         let carrier_data_type = if data_type == DataType::I1 { DataType::I8 } else { data_type };
@@ -149,7 +149,7 @@ impl LowerableOperation for SaturatingSubOperation<ArrayType> {
                     lowerer.location,
                 )?[0])
             })
-            .collect::<Result<Vec<_>, LoweringError>>()?;
+            .collect::<Result<Vec<_>, Error>>()?;
         let [minimum, maximum, zero] = constants.as_slice() else { unreachable!() };
 
         // Clamp the minuend to [MIN + max(right, 0), MAX + min(right, 0)] before subtracting. Each bound addition
@@ -189,7 +189,7 @@ impl LowerableOperation for MulOperation<ArrayType> {
         input_values: &[ValueRef<'b, 'c, 't>],
         input_types: &[ArrayType],
         output_types: &[ArrayType],
-    ) -> Result<Vec<ValueRef<'b, 'c, 't>>, LoweringError> {
+    ) -> Result<Vec<ValueRef<'b, 'c, 't>>, Error> {
         let [left, right] = normalize_arithmetic_inputs(input_values, input_types, output_types, lowerer)?;
         let result = lowerer.block.append_operation(stable_hlo::multiply(left, right, lowerer.location)?)?;
         Ok(vec![lower_arithmetic_output(result.result(0).unwrap().as_ref(), &output_types[0], lowerer)?])
@@ -203,7 +203,7 @@ impl LowerableOperation for DivOperation<ArrayType> {
         input_values: &[ValueRef<'b, 'c, 't>],
         input_types: &[ArrayType],
         output_types: &[ArrayType],
-    ) -> Result<Vec<ValueRef<'b, 'c, 't>>, LoweringError> {
+    ) -> Result<Vec<ValueRef<'b, 'c, 't>>, Error> {
         let [left, right] = normalize_arithmetic_inputs(input_values, input_types, output_types, lowerer)?;
         let result = lowerer.block.append_operation(stable_hlo::divide(left, right, lowerer.location)?)?;
         Ok(vec![lower_arithmetic_output(result.result(0).unwrap().as_ref(), &output_types[0], lowerer)?])
@@ -217,7 +217,7 @@ impl LowerableOperation for NegOperation<ArrayType> {
         input_values: &[ValueRef<'b, 'c, 't>],
         _input_types: &[ArrayType],
         output_types: &[ArrayType],
-    ) -> Result<Vec<ValueRef<'b, 'c, 't>>, LoweringError> {
+    ) -> Result<Vec<ValueRef<'b, 'c, 't>>, Error> {
         if matches!(output_types[0].data_type(), DataType::I1 | DataType::U1) {
             return Ok(vec![input_values[0]]);
         }
@@ -233,7 +233,7 @@ impl LowerableOperation for SqrtOperation<ArrayType> {
         input_values: &[ValueRef<'b, 'c, 't>],
         _input_types: &[ArrayType],
         _output_types: &[ArrayType],
-    ) -> Result<Vec<ValueRef<'b, 'c, 't>>, LoweringError> {
+    ) -> Result<Vec<ValueRef<'b, 'c, 't>>, Error> {
         let result = lowerer.block.append_operation(stable_hlo::sqrt(
             input_values[0],
             lower_accuracy(self.accuracy()),
@@ -250,7 +250,7 @@ impl LowerableOperation for RsqrtOperation<ArrayType> {
         input_values: &[ValueRef<'b, 'c, 't>],
         _input_types: &[ArrayType],
         _output_types: &[ArrayType],
-    ) -> Result<Vec<ValueRef<'b, 'c, 't>>, LoweringError> {
+    ) -> Result<Vec<ValueRef<'b, 'c, 't>>, Error> {
         let result = lowerer.block.append_operation(stable_hlo::rsqrt(
             input_values[0],
             lower_accuracy(self.accuracy()),
@@ -267,7 +267,7 @@ impl LowerableOperation for PowOperation<ArrayType> {
         input_values: &[ValueRef<'b, 'c, 't>],
         _input_types: &[ArrayType],
         output_types: &[ArrayType],
-    ) -> Result<Vec<ValueRef<'b, 'c, 't>>, LoweringError> {
+    ) -> Result<Vec<ValueRef<'b, 'c, 't>>, Error> {
         let [left, right] = normalize_binary_elementwise_operands(
             input_values,
             output_types,
@@ -287,7 +287,7 @@ impl LowerableOperation for SignOperation<ArrayType> {
         input_values: &[ValueRef<'b, 'c, 't>],
         _input_types: &[ArrayType],
         output_types: &[ArrayType],
-    ) -> Result<Vec<ValueRef<'b, 'c, 't>>, LoweringError> {
+    ) -> Result<Vec<ValueRef<'b, 'c, 't>>, Error> {
         if matches!(output_types[0].data_type(), DataType::I1 | DataType::U1) {
             return Ok(vec![input_values[0]]);
         }
@@ -303,7 +303,7 @@ impl LowerableOperation for RemOperation<ArrayType> {
         input_values: &[ValueRef<'b, 'c, 't>],
         input_types: &[ArrayType],
         output_types: &[ArrayType],
-    ) -> Result<Vec<ValueRef<'b, 'c, 't>>, LoweringError> {
+    ) -> Result<Vec<ValueRef<'b, 'c, 't>>, Error> {
         let [left, right] = normalize_arithmetic_inputs(input_values, input_types, output_types, lowerer)?;
         let result = lowerer.block.append_operation(stable_hlo::remainder(left, right, lowerer.location)?)?;
         Ok(vec![lower_arithmetic_output(result.result(0).unwrap().as_ref(), &output_types[0], lowerer)?])
@@ -317,7 +317,7 @@ impl LowerableOperation for AbsOperation<ArrayType> {
         input_values: &[ValueRef<'b, 'c, 't>],
         _input_types: &[ArrayType],
         _output_types: &[ArrayType],
-    ) -> Result<Vec<ValueRef<'b, 'c, 't>>, LoweringError> {
+    ) -> Result<Vec<ValueRef<'b, 'c, 't>>, Error> {
         let result = lowerer.block.append_operation(stable_hlo::abs(input_values[0], lowerer.location)?)?;
         Ok(vec![result.result(0).expect("stablehlo.abs should return one result").as_ref()])
     }

@@ -34,12 +34,12 @@ impl DevicePutTarget {
     ///
     /// Returns an error if `sharding` refers to a different logical mesh than `mesh`.
     #[inline]
-    pub fn placement(mesh: DeviceMesh, sharding: Sharding) -> Result<Self, ArrayError> {
+    pub fn placement(mesh: DeviceMesh, sharding: Sharding) -> Result<Self, Error> {
         check_sharding!(&mesh, &sharding);
         Ok(Self::Placement { mesh, sharding })
     }
 
-    pub(crate) fn resolve(self, rank: usize) -> Result<(DeviceMesh, Sharding), ArrayError> {
+    pub(crate) fn resolve(self, rank: usize) -> Result<(DeviceMesh, Sharding), Error> {
         match self {
             Self::Device(device) => {
                 let logical_mesh = LogicalMesh::new(vec![MeshAxis::new("device", 1, MeshAxisType::Auto)?])?;

@@ -17,7 +17,6 @@ pub mod types;
 pub mod values;
 
 pub use arrays::{ShardDescriptor, ShardIndex, ShardLayout, XlaArray, XlaArrayShard, block_until_ready, ready};
-pub use arrays_v0::ArrayError;
 pub use distributed::DistributedRuntime;
 pub use errors::Error;
 pub use experimental::domains::{
@@ -25,8 +24,7 @@ pub use experimental::domains::{
     XlaMemoryAnalysis, XlaOptimizedProgram, XlaOptions, XlaSession, XlaTarget, XlaTargetDevice,
 };
 pub use experimental::lowering::{
-    LowerableOperation, LowerableOperationFamily, LoweringError, MemberLowerableOperation, XlaLowerer,
-    to_mlir_module_for_program,
+    LowerableOperation, LowerableOperationFamily, MemberLowerableOperation, XlaLowerer, to_mlir_module_for_program,
 };
 pub use jit::{
     CompiledXlaFunction, ExecutableXlaFunction, JittedXlaFunction, StagedXlaFunction, StatefulCompiledXlaFunction,

@@ -2,7 +2,7 @@ use ryft_core::{ArrayType, ProgramError, TransposeOperation};
 use ryft_mlir::dialects::stable_hlo;
 use ryft_mlir::{Block, Operation as MlirOperation, Value as MlirValue, ValueRef};
 
-use crate::{LowerableOperation, LowerableOperationFamily, LoweringError, XlaLowerer};
+use crate::{Error, LowerableOperation, LowerableOperationFamily, XlaLowerer};
 
 impl LowerableOperation for TransposeOperation {
     fn lower<'b, 'c: 'b, 't: 'c, O: LowerableOperationFamily>(
@@ -11,7 +11,7 @@ impl LowerableOperation for TransposeOperation {
         input_values: &[ValueRef<'b, 'c, 't>],
         _input_types: &[ArrayType],
         _output_types: &[ArrayType],
-    ) -> Result<Vec<ValueRef<'b, 'c, 't>>, LoweringError> {
+    ) -> Result<Vec<ValueRef<'b, 'c, 't>>, Error> {
         let result = lowerer.block.append_operation(stable_hlo::transpose(
             input_values[0],
             self.permutation().normalize(self.permutation().len()).map_err(ProgramError::from)?.as_slice(),

@@ -7,7 +7,7 @@ use ryft_mlir::{
 };
 
 use crate::experimental::lowering::types::{lower_f64_constant_splat, lower_tensor_type};
-use crate::{LowerableOperation, LowerableOperationFamily, LoweringError, XlaLowerer};
+use crate::{Error, LowerableOperation, LowerableOperationFamily, XlaLowerer};
 
 impl LowerableOperation for ComplexOperation<ArrayType> {
     fn lower<'b, 'c: 'b, 't: 'c, O: LowerableOperationFamily>(
@@ -16,7 +16,7 @@ impl LowerableOperation for ComplexOperation<ArrayType> {
         input_values: &[ValueRef<'b, 'c, 't>],
         _input_types: &[ArrayType],
         _output_types: &[ArrayType],
-    ) -> Result<Vec<ValueRef<'b, 'c, 't>>, LoweringError> {
+    ) -> Result<Vec<ValueRef<'b, 'c, 't>>, Error> {
         let result =
             lowerer
                 .block
@@ -34,7 +34,7 @@ impl LowerableOperation for ConjugateOperation<ArrayType> {
         input_values: &[ValueRef<'b, 'c, 't>],
         _input_types: &[ArrayType],
         _output_types: &[ArrayType],
-    ) -> Result<Vec<ValueRef<'b, 'c, 't>>, LoweringError> {
+    ) -> Result<Vec<ValueRef<'b, 'c, 't>>, Error> {
         let real = lowerer.block.append_operation(stable_hlo::real(input_values[0], lowerer.location)?)?;
         let imaginary = lowerer.block.append_operation(stable_hlo::imag(input_values[0], lowerer.location)?)?;
         let negated = lowerer.block.append_operation(stable_hlo::negate(
@@ -57,7 +57,7 @@ impl LowerableOperation for RealOperation<ArrayType> {
         input_values: &[ValueRef<'b, 'c, 't>],
         _input_types: &[ArrayType],
         _output_types: &[ArrayType],
-    ) -> Result<Vec<ValueRef<'b, 'c, 't>>, LoweringError> {
+    ) -> Result<Vec<ValueRef<'b, 'c, 't>>, Error> {
         let result = lowerer.block.append_operation(stable_hlo::real(input_values[0], lowerer.location)?)?;
         Ok(vec![result.result(0).expect("stablehlo.real should return one result").as_ref()])
     }
@@ -70,7 +70,7 @@ impl LowerableOperation for ImaginaryOperation<ArrayType> {
         input_values: &[ValueRef<'b, 'c, 't>],
         _input_types: &[ArrayType],
         _output_types: &[ArrayType],
-    ) -> Result<Vec<ValueRef<'b, 'c, 't>>, LoweringError> {
+    ) -> Result<Vec<ValueRef<'b, 'c, 't>>, Error> {
         let result = lowerer.block.append_operation(stable_hlo::imag(input_values[0], lowerer.location)?)?;
         Ok(vec![result.result(0).expect("stablehlo.imag should return one result").as_ref()])
     }
@@ -86,7 +86,7 @@ pub(crate) fn lower_principal_phase_to_mlir<'b, 'c: 'b, 't: 'c>(
     block: &mut BlockRef<'b, 'c, 't>,
     context: &'c MlirContext<'t>,
     location: LocationRef<'c, 't>,
-) -> Result<ValueRef<'b, 'c, 't>, LoweringError> {
+) -> Result<ValueRef<'b, 'c, 't>, Error> {
     let part_type = output_type.clone().with_data_type(if output_type.data_type() == DataType::C64 {
         DataType::F32
     } else {
@@ -128,7 +128,7 @@ pub(crate) fn lower_select_principal_phase_to_mlir<'b, 'c: 'b, 't: 'c>(
     block: &mut BlockRef<'b, 'c, 't>,
     context: &'c MlirContext<'t>,
     location: LocationRef<'c, 't>,
-) -> Result<ValueRef<'b, 'c, 't>, LoweringError> {
+) -> Result<ValueRef<'b, 'c, 't>, Error> {
     let pi = lower_f64_constant_splat(std::f64::consts::PI, part_type, part_tensor_type, block, context, location)?;
     let negative_pi = block.append_operation(stable_hlo::negate(pi, location)?)?.result(0).unwrap().as_ref();
     let above_lower = block

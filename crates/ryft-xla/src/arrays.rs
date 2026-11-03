@@ -16,7 +16,7 @@ use crate::arrays_v0::{
     BoundedMaterializationCache, BoundedMaterializationKey, BoundedMaterializationProbe,
     LOGICAL_EXTENT_SCALAR_CACHE_CAPACITY,
 };
-use crate::{ArrayError, Error, FromPjrt, ToPjrt, XlaDomain};
+use crate::{Error, FromPjrt, ToPjrt, XlaDomain};
 
 // TODO(eaplatanios): Is `ArrayType::memory` being set, handled, and propagated correctly throughout this crate?
 
@@ -317,7 +317,7 @@ impl<'o> XlaArray<'o> {
         r#type: ArrayType,
         mesh: DeviceMesh,
         buffer: B,
-    ) -> Result<Self, ArrayError> {
+    ) -> Result<Self, Error> {
         // Normalize missing sharding metadata before any placement-derived work. A dense host buffer with no explicit
         // sharding is interpreted as one replicated logical array over the provided mesh.
         let r#type = match r#type.sharding() {
@@ -347,7 +347,7 @@ impl<'o> XlaArray<'o> {
         // Derive the global shard layout and transfer only the shards owned by this process. Remote shards remain
         // represented by metadata when `Self::from_addressable_buffers` materializes the final array.
         let data_type = r#type.data_type();
-        let device_layout = r#type.layout().map(ToPjrt::to_pjrt).transpose().map_err(Error::from)?;
+        let device_layout = r#type.layout().map(ToPjrt::to_pjrt).transpose()?;
         let shape = r#type.static_shape().ok_or_else(|| Error::DynamicShape { shape: r#type.shape().clone() })?;
         let sharding = r#type.sharding().unwrap();
         let layout = ShardLayout::new(&shape, &mesh, &sharding)?;
@@ -415,7 +415,7 @@ impl<'o> XlaArray<'o> {
 
                 // Convert the shard's starting coordinates into a flat row-major element offset in the full host
                 // buffer, and then into the corresponding byte offset.
-                let element_size_in_bytes = buffer_type.element_size_in_bytes().map_err(Error::from)?;
+                let element_size_in_bytes = buffer_type.element_size_in_bytes()?;
                 let start_element_offset = shard_slice
                     .iter()
                     .enumerate()
@@ -548,7 +548,7 @@ impl<'o> XlaArray<'o> {
     ///
     /// # Errors
     ///
-    /// Returns [`Error::PjrtError`] (wrapping an [`InvalidArgument`](ryft_pjrt::Error::InvalidArgument) error) if
+    /// Returns [`Error::Pjrt`] (wrapping an [`InvalidArgument`](ryft_pjrt::Error::InvalidArgument) error) if
     /// `domain` belongs to a different PJRT client than this array. Arrays cannot move between clients because their
     /// addressable shard buffers are owned by the client they were created on.
     pub fn associate(mut self, domain: &XlaDomain<'o>) -> Result<Self, Error> {
@@ -683,7 +683,7 @@ impl<'o> XlaArray<'o> {
         &self,
         domain: &XlaDomain<'o>,
         extent: i32,
-    ) -> Result<(XlaArray<'o>, bool), ArrayError> {
+    ) -> Result<(XlaArray<'o>, bool), Error> {
         let mut scalars = self.parts.logical_extent_scalars.lock().expect("logical extent scalar cache mutex poisoned");
         if let Some(index) = scalars.iter().position(|(candidate, _)| *candidate == extent) {
             let entry = scalars.remove(index).unwrap();
@@ -693,9 +693,8 @@ impl<'o> XlaArray<'o> {
         }
         drop(scalars);
 
-        let scalar_type = ArrayType::scalar(DataType::I32)
-            .with_sharding(Sharding::replicated(self.sharding().mesh().clone(), 0))
-            .map_err(Error::from)?;
+        let scalar_type =
+            ArrayType::scalar(DataType::I32).with_sharding(Sharding::replicated(self.sharding().mesh().clone(), 0))?;
         let scalar = XlaArray::from_host_buffer(domain, scalar_type, self.mesh().clone(), extent.to_ne_bytes())?;
         let mut scalars = self.parts.logical_extent_scalars.lock().expect("logical extent scalar cache mutex poisoned");
         if let Some(index) = scalars.iter().position(|(candidate, _)| *candidate == extent) {
@@ -1474,7 +1473,7 @@ mod tests {
         assert_eq!(array.shards().len(), 4);
         assert_eq!(array.addressable_shards().count(), 4);
         assert!(array.shards().iter().all(|shard| shard.shape() == StaticShape::new(vec![2, 2])));
-        assert_eq!(array.size_in_bytes(), Ok(64));
+        assert_eq!(array.size_in_bytes().unwrap(), 64);
         array.block_until_ready().unwrap();
         block_until_ready(&vec![array.clone()]).unwrap();
 
@@ -1566,20 +1565,20 @@ mod tests {
         let buffer = client.buffer(values.as_slice(), BufferType::I32, [], None, device.clone(), None).unwrap();
         let actual = buffer.memory().unwrap().kind().unwrap().to_string();
         assert_ne!(actual, "pinned_host");
-        assert_eq!(
+        assert!(matches!(
             XlaArray::from_addressable_buffers(
                 &domain,
                 r#type.with_memory(Memory::Host { pinned: true }),
                 mesh,
                 vec![buffer],
             )
-            .unwrap_err(),
-            Error::BufferMemoryMismatch {
-                device_id: device.id().unwrap(),
+            ,
+            Err(Error::BufferMemoryMismatch {
+                device_id,
                 expected: Memory::Host { pinned: true },
-                actual,
-            },
-        );
+                actual: reported,
+            }) if device_id == device.id().unwrap() && reported == actual,
+        ));
     }
 
     #[test]
@@ -1807,7 +1806,7 @@ mod tests {
 
         let array = XlaArray::from_host_buffer(&domain, r#type, mesh, []).unwrap();
         assert_eq!(array.data_type(), DataType::Zero);
-        assert_eq!(array.size_in_bytes(), Ok(0));
+        assert_eq!(array.size_in_bytes().unwrap(), 0);
         let shard = array.addressable_shards().next().unwrap();
         assert!(shard.buffer().is_none());
         assert_eq!(array, array.clone());
@@ -1856,7 +1855,7 @@ mod tests {
 
         assert_eq!(array.addressable_shards().count(), 1);
         assert!(array.addressable_shards().next().unwrap().buffer().is_none());
-        assert_eq!(array.size_in_bytes(), Ok(0));
+        assert_eq!(array.size_in_bytes().unwrap(), 0);
     }
 
     #[test]
@@ -1960,7 +1959,7 @@ mod tests {
         let error =
             XlaArray::from_addressable_buffers(&other_domain, array_type.clone(), mesh.clone(), shard_buffers())
                 .unwrap_err();
-        assert!(matches!(&error, Error::PjrtError(PjrtError::InvalidArgument { .. })));
+        assert!(matches!(&error, Error::Pjrt(PjrtError::InvalidArgument { .. })));
         assert!(error.to_string().starts_with("the domain's client does not own the addressable shard buffer"));
 
         // Metadata-only arrays with no addressable buffers carry no storage to validate, and still belong to (and live
@@ -2021,7 +2020,7 @@ mod tests {
         for array in [original, session.array(ArrayType::scalar(DataType::Zero), mesh, []).unwrap()] {
             assert!(matches!(
                 array.associate(&other_client_domain),
-                Err(Error::PjrtError(PjrtError::InvalidArgument { message, .. }))
+                Err(Error::Pjrt(PjrtError::InvalidArgument { message, .. }))
                     if message == "cannot associate an array with a domain of a different PJRT client",
             ));
         }
@@ -2093,30 +2092,30 @@ mod tests {
 
         // The inner dimension is not fully covered by the host extent, and so the block stops at the innermost
         // dimension and only spans `slice[1].len()` elements.
-        assert_eq!(descriptor.contiguous_inner_block(&StaticShape::new(vec![8, 5])), Ok((1, 4)));
+        assert_eq!(descriptor.contiguous_inner_block(&StaticShape::new(vec![8, 5])).unwrap(), (1, 4));
 
         // When the inner dimension is fully covered, the block absorbs the outer dimension and spans
         // `slice[0].len() * slice[1].len()` elements.
-        assert_eq!(descriptor.contiguous_inner_block(&StaticShape::new(vec![8, 4])), Ok((0, 12)));
+        assert_eq!(descriptor.contiguous_inner_block(&StaticShape::new(vec![8, 4])).unwrap(), (0, 12));
 
         // A shape whose rank does not match the descriptor's slice rank reports a rank-mismatch error.
-        assert_eq!(
+        assert!(matches!(
             descriptor.contiguous_inner_block(&StaticShape::new(vec![8, 4, 2])),
             Err(Error::ShardSliceRankMismatch { shape_rank: 3, slice_rank: 2 }),
-        );
+        ));
 
         // A rank-one descriptor always reports a single block over its slice.
         let descriptor = ShardDescriptor::new(0, device, vec![2..7]);
-        assert_eq!(descriptor.contiguous_inner_block(&StaticShape::new(vec![10])), Ok((0, 5)));
+        assert_eq!(descriptor.contiguous_inner_block(&StaticShape::new(vec![10])).unwrap(), (0, 5));
 
         // A rank-three descriptor whose two innermost dimensions are fully covered collapses to a single block
         // over all three dimensions.
         let descriptor = ShardDescriptor::new(0, device, vec![1..2, 0..3, 0..4]);
-        assert_eq!(descriptor.contiguous_inner_block(&StaticShape::new(vec![5, 3, 4])), Ok((0, 12)));
+        assert_eq!(descriptor.contiguous_inner_block(&StaticShape::new(vec![5, 3, 4])).unwrap(), (0, 12));
 
         // A scalar (i.e., rank-zero) descriptor trivially reports a single one-element block.
         let descriptor = ShardDescriptor::new(0, device, vec![]);
-        assert_eq!(descriptor.contiguous_inner_block(&StaticShape::new(vec![])), Ok((0, 1)));
+        assert_eq!(descriptor.contiguous_inner_block(&StaticShape::new(vec![])).unwrap(), (0, 1));
     }
 
     #[test]
@@ -2130,8 +2129,8 @@ mod tests {
         .unwrap();
 
         assert_eq!(
-            ShardLayout::new(&shape, &mesh, &sharding),
-            Ok(ShardLayout {
+            ShardLayout::new(&shape, &mesh, &sharding).unwrap(),
+            ShardLayout {
                 descriptors: vec![
                     ShardDescriptor::new(0, Device::new(0, 0), vec![0..4, 0..3]),
                     ShardDescriptor::new(1, Device::new(1, 0), vec![0..4, 3..6]),
@@ -2139,7 +2138,7 @@ mod tests {
                     ShardDescriptor::new(3, Device::new(3, 1), vec![4..8, 3..6]),
                 ],
                 shard_index_by_device: HashMap::from([(0, 0), (1, 1), (2, 2), (3, 3)]),
-            }),
+            },
         );
     }
 
@@ -2158,8 +2157,8 @@ mod tests {
         .unwrap();
 
         assert_eq!(
-            ShardLayout::new(&shape, &mesh, &sharding),
-            Ok(ShardLayout {
+            ShardLayout::new(&shape, &mesh, &sharding).unwrap(),
+            ShardLayout {
                 descriptors: vec![
                     ShardDescriptor::new(0, Device::new(0, 0), vec![0..4, 0..6, 0..5]),
                     ShardDescriptor::new(1, Device::new(1, 0), vec![0..4, 0..6, 0..5]),
@@ -2167,7 +2166,7 @@ mod tests {
                     ShardDescriptor::new(3, Device::new(3, 1), vec![4..8, 0..6, 0..5]),
                 ],
                 shard_index_by_device: HashMap::from([(0, 0), (1, 1), (2, 2), (3, 3)]),
-            }),
+            },
         );
     }
 
@@ -2179,14 +2178,14 @@ mod tests {
         let sharding = Sharding::new(logical_mesh, vec![ShardingDimension::sharded(["x"])]).unwrap();
 
         assert_eq!(
-            ShardLayout::new(&shape, &mesh, &sharding),
-            Ok(ShardLayout {
+            ShardLayout::new(&shape, &mesh, &sharding).unwrap(),
+            ShardLayout {
                 descriptors: vec![
                     ShardDescriptor::new(0, Device::new(0, 0), vec![0..3]),
                     ShardDescriptor::new(1, Device::new(1, 0), vec![3..5]),
                 ],
                 shard_index_by_device: HashMap::from([(0, 0), (1, 1)]),
-            }),
+            },
         );
     }
 
@@ -2198,8 +2197,8 @@ mod tests {
             Sharding::new(mesh.logical_mesh().clone(), vec![ShardingDimension::sharded(["x", "y"])]).unwrap();
 
         assert_eq!(
-            ShardLayout::new(&shape, &mesh, &sharding),
-            Ok(ShardLayout {
+            ShardLayout::new(&shape, &mesh, &sharding).unwrap(),
+            ShardLayout {
                 descriptors: vec![
                     ShardDescriptor::new(0, Device::new(0, 0), vec![0..3]),
                     ShardDescriptor::new(1, Device::new(1, 0), vec![3..6]),
@@ -2207,7 +2206,7 @@ mod tests {
                     ShardDescriptor::new(3, Device::new(3, 1), vec![8..10]),
                 ],
                 shard_index_by_device: HashMap::from([(0, 0), (1, 1), (2, 2), (3, 3)]),
-            }),
+            },
         );
     }
 
@@ -2245,13 +2244,10 @@ mod tests {
         let sharding = Sharding::new(actual_mesh.clone(), vec![ShardingDimension::sharded(["z"])]).unwrap();
 
         let error = ShardLayout::new(&shape, &mesh, &sharding).unwrap_err();
-        assert_eq!(
-            error,
-            Error::CoreError(CoreError::Sharding(ShardingError::MeshMismatch {
-                expected: expected_mesh.clone(),
-                actual: actual_mesh.clone(),
-            })),
-        );
+        assert!(matches!(&error,
+            Error::Core(CoreError::Sharding(ShardingError::MeshMismatch { expected, actual }))
+                if expected == &expected_mesh && actual == &actual_mesh,
+        ));
         let expected_message = format!("mesh mismatch; expected `{expected_mesh:?}` but got `{actual_mesh:?}`");
         assert_eq!(error.to_string(), expected_message);
     }
@@ -2267,13 +2263,10 @@ mod tests {
         .unwrap();
 
         let error = ShardLayout::new(&shape, &mesh, &sharding).unwrap_err();
-        assert_eq!(
-            error,
-            Error::CoreError(CoreError::Sharding(ShardingError::ShardingRankMismatch {
-                sharding_rank: 2,
-                array_rank: 1,
-            })),
-        );
+        assert!(matches!(
+            &error,
+            Error::Core(CoreError::Sharding(ShardingError::ShardingRankMismatch { sharding_rank: 2, array_rank: 1 })),
+        ));
         assert_eq!(error.to_string(), "sharding rank (2) does not match array rank (1)");
     }
 
@@ -2293,16 +2286,16 @@ mod tests {
         let scalar_type = ArrayType::scalar(DataType::C128);
         let token_type = ArrayType::new(DataType::Token, Shape::new(vec![Dimension::Static(4)]));
 
-        assert_eq!(matrix_type.size_in_bytes(), Ok(24));
-        assert_eq!(scalar_type.size_in_bytes(), Ok(16));
-        assert_eq!(token_type.size_in_bytes(), Ok(0));
+        assert_eq!(matrix_type.size_in_bytes().unwrap(), 24);
+        assert_eq!(scalar_type.size_in_bytes().unwrap(), 16);
+        assert_eq!(token_type.size_in_bytes().unwrap(), 0);
 
         let dynamic_type = ArrayType::new(
             DataType::F32,
             Shape::new(vec![DimensionVariable::new("dynamic", DimensionBounds::unbounded()).into()]),
         );
         let error = dynamic_type.size_in_bytes().unwrap_err();
-        assert_eq!(error, Error::DynamicShape { shape: dynamic_type.shape().clone() });
+        assert!(matches!(&error, Error::DynamicShape { shape } if shape == dynamic_type.shape()));
         assert_eq!(error.to_string(), "expected static shape but got [dynamic]");
 
         let oversized_type = ArrayType::new(DataType::U16, Shape::new(vec![Dimension::Static(usize::MAX)]));
@@ -2311,7 +2304,7 @@ mod tests {
             "dense byte size for array type {oversized_type} exceeds the maximum allowed size of {}",
             usize::MAX,
         );
-        assert_eq!(error, Error::SizeLimitExceeded { message: message.clone() });
+        assert!(matches!(&error, Error::SizeLimitExceeded { message: actual } if actual == &message));
         assert_eq!(error.to_string(), message);
     }
 }

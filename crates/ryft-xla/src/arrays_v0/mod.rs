@@ -4,19 +4,19 @@ use std::ops::Range;
 use half::{bf16, f16};
 use ryft_core::{
     DataType, Device, DeviceMesh, LogicalMesh, MeshAxis, MeshAxisType, Parameter, Parameterized, ParameterizedFamily,
-    Sharding, ShardingError, StaticShape,
+    Sharding, StaticShape,
 };
 use ryft_macros::Parameter;
 #[cfg(test)]
 use ryft_mlir::Block;
 use ryft_pjrt::extensions::cross_host_transfers::{CrossHostTransferKey, GlobalDeviceId};
 use ryft_pjrt::{Buffer, Client, DeviceId, Error as PjrtError, ExecutionDeviceInputs, ExecutionInput};
-use thiserror::Error;
+
+use crate::Error;
 
 pub mod array;
 pub mod compiled_reshard;
 pub mod device_put;
-pub mod error;
 pub mod execution;
 pub mod host;
 mod materialization;
@@ -28,7 +28,6 @@ pub mod tests;
 
 pub use crate::arrays::{ShardDescriptor, ShardIndex, ShardLayout, XlaArrayShard};
 pub use device_put::{DevicePutLeaf, device_put};
-pub use error::ArrayError;
 pub use execution::ExecuteArguments;
 pub(crate) use host::DenseHostDevicePutLeaf;
 pub(crate) use materialization::{

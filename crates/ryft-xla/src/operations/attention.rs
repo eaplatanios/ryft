@@ -27,13 +27,13 @@ use crate::experimental::lowering::types::{
 };
 use crate::experimental::ops::FlatXlaProgram;
 use crate::operations::reductions::lower_reduce_to_mlir;
-use crate::{LowerableOperation, LowerableOperationFamily, LoweringError, XlaDomain, XlaLowerer};
+use crate::{Error, LowerableOperation, LowerableOperationFamily, XlaDomain, XlaLowerer};
 
 /// Traces the canonical portable attention composition for one validated operation boundary.
 pub(crate) fn trace_attention_composition(
     operation: &DotProductAttentionOperation,
     input_types: &[ArrayType],
-) -> Result<FlatXlaProgram, LoweringError> {
+) -> Result<FlatXlaProgram, Error> {
     let input_types = named_composition_input_types(input_types)?;
     let (_, program) = DomainTracingContext::<XlaDomain<'static>>::trace(
         |inputs: Vec<XlaTracer<'static>>| {
@@ -54,7 +54,7 @@ pub(crate) fn trace_attention_composition(
 pub(crate) fn trace_attention_backward_composition(
     operation: &DotProductAttentionBackwardOperation,
     input_types: &[ArrayType],
-) -> Result<FlatXlaProgram, LoweringError> {
+) -> Result<FlatXlaProgram, Error> {
     let input_types = named_composition_input_types(input_types)?;
     let (_, program) = DomainTracingContext::<XlaDomain<'static>>::trace(
         |inputs: Vec<XlaTracer<'static>>| {
@@ -155,7 +155,7 @@ pub(crate) fn attention_backward_composition_key(
 }
 
 /// Canonical `[batch, sequence, heads, head_dimension]` dimensions of one rank-three or rank-four attention type.
-fn attention_dimensions(input_type: &ArrayType) -> Result<[Dimension; 4], LoweringError> {
+fn attention_dimensions(input_type: &ArrayType) -> Result<[Dimension; 4], Error> {
     match input_type.shape().dimensions() {
         [sequence, heads, head_dimension] => {
             Ok([Dimension::Static(1), sequence.clone(), heads.clone(), head_dimension.clone()])
@@ -163,7 +163,7 @@ fn attention_dimensions(input_type: &ArrayType) -> Result<[Dimension; 4], Loweri
         [batch, sequence, heads, head_dimension] => {
             Ok([batch.clone(), sequence.clone(), heads.clone(), head_dimension.clone()])
         }
-        _ => Err(LoweringError::UnsupportedOp {
+        _ => Err(Error::UnsupportedOperation {
             op: format!(
                 "{} operand must have rank 3 or 4 but got rank {}",
                 DOT_PRODUCT_ATTENTION_OPERATION_NAME,
@@ -174,12 +174,12 @@ fn attention_dimensions(input_type: &ArrayType) -> Result<[Dimension; 4], Loweri
 }
 
 /// Returns the physical maximum extent of one attention dimension.
-fn attention_physical_extent(dimension: &Dimension) -> Result<usize, LoweringError> {
+fn attention_physical_extent(dimension: &Dimension) -> Result<usize, Error> {
     match dimension {
         Dimension::Static(extent) => Ok(*extent),
         Dimension::Dynamic(variable) => {
             variable.bounds().upper().and_then(|upper| upper.checked_sub(1)).ok_or_else(|| {
-                LoweringError::UnsupportedOp {
+                Error::UnsupportedOperation {
                     op: format!(
                         "{DOT_PRODUCT_ATTENTION_OPERATION_NAME} dimension {variable} needs a finite positive physical \
                          bound",
@@ -301,7 +301,7 @@ fn fmha_eligibility(
     signature: ryft_core::operations::attention::AttentionInputSignature,
     input_types: &[ArrayType],
     collective_state: &CollectiveLoweringState,
-) -> Result<FmhaEligibility, LoweringError> {
+) -> Result<FmhaEligibility, Error> {
     if configuration.local_window().is_some_and(|(_, right)| {
         right != 0
             && (!configuration.causal()
@@ -349,7 +349,7 @@ fn normalize_fmha_operand<'b, 'c: 'b, 't: 'c>(
     r#type: &ArrayType,
     block: &mut BlockRef<'b, 'c, 't>,
     location: LocationRef<'c, 't>,
-) -> Result<ValueRef<'b, 'c, 't>, LoweringError> {
+) -> Result<ValueRef<'b, 'c, 't>, Error> {
     if r#type.rank() == 4 {
         return Ok(value);
     }
@@ -367,7 +367,7 @@ fn broadcast_fmha_score_operand<'b, 'c: 'b, 't: 'c>(
     block: &mut BlockRef<'b, 'c, 't>,
     context: &'c MlirContext<'t>,
     location: LocationRef<'c, 't>,
-) -> Result<ValueRef<'b, 'c, 't>, LoweringError> {
+) -> Result<ValueRef<'b, 'c, 't>, Error> {
     let mut dimensions = vec![1; 4 - r#type.rank()];
     dimensions.extend(static_dimensions(r#type)?);
     let value = if r#type.rank() == 4 {
@@ -396,7 +396,7 @@ fn prepare_fmha_bias<'b, 'c: 'b, 't: 'c>(
     block: &mut BlockRef<'b, 'c, 't>,
     context: &'c MlirContext<'t>,
     location: LocationRef<'c, 't>,
-) -> Result<Option<ValueRef<'b, 'c, 't>>, LoweringError> {
+) -> Result<Option<ValueRef<'b, 'c, 't>>, Error> {
     let bias = inputs
         .bias
         .map(|index| {
@@ -409,14 +409,14 @@ fn prepare_fmha_bias<'b, 'c: 'b, 't: 'c>(
                 location,
             )?;
             if input_types[index].data_type() == score_type.data_type() {
-                return Ok::<_, LoweringError>(bias);
+                return Ok::<_, Error>(bias);
             }
             let converted = block.append_operation(stable_hlo::convert(
                 bias,
                 lower_tensor_type(score_type, context, location)?,
                 location,
             )?)?;
-            Ok::<_, LoweringError>(converted.result(0).expect("stablehlo.convert should return one result").as_ref())
+            Ok::<_, Error>(converted.result(0).expect("stablehlo.convert should return one result").as_ref())
         })
         .transpose()?;
     let mask = inputs
@@ -438,7 +438,7 @@ fn prepare_fmha_bias<'b, 'c: 'b, 't: 'c>(
             let masked_value = if score_type.data_type() == DataType::F16 { -32_768.0 } else { -2_199_023_255_552.0 };
             let masked = lower_f64_constant_splat(masked_value, score_type, tensor_type, block, context, location)?;
             let selected = block.append_operation(stable_hlo::select(mask, zero, masked, location)?)?;
-            Ok::<_, LoweringError>(selected.result(0).expect("stablehlo.select should return one result").as_ref())
+            Ok::<_, Error>(selected.result(0).expect("stablehlo.select should return one result").as_ref())
         })
         .transpose()?;
     match (bias, mask) {
@@ -462,7 +462,7 @@ fn synthesize_fmha_sequence_lengths<'b, 'c: 'b, 't: 'c>(
     block: &mut BlockRef<'b, 'c, 't>,
     context: &'c MlirContext<'t>,
     location: LocationRef<'c, 't>,
-) -> Result<ValueRef<'b, 'c, 't>, LoweringError> {
+) -> Result<ValueRef<'b, 'c, 't>, Error> {
     let size = block.append_operation(stable_hlo::get_dimension_size(source, source_axis, location)?)?;
     let size = size.result(0).expect("stablehlo.get_dimension_size should return one result").as_ref();
     let physical_type = attention_array_type(DataType::I32, &[physical_batch]);
@@ -512,7 +512,7 @@ pub(crate) fn lower_dot_product_attention_to_mlir<'b, 'c: 'b, 't: 'c>(
     block: &mut BlockRef<'b, 'c, 't>,
     context: &'c MlirContext<'t>,
     location: LocationRef<'c, 't>,
-) -> Result<Vec<ValueRef<'b, 'c, 't>>, LoweringError> {
+) -> Result<Vec<ValueRef<'b, 'c, 't>>, Error> {
     let signature = operation.signature();
     if input_values.len() != 3 + signature.count() || input_values.len() != input_types.len() {
         return Err(ProgramError::InvalidInputCount { expected: 3, actual: input_values.len() }.into());
@@ -528,14 +528,14 @@ pub(crate) fn lower_dot_product_attention_to_mlir<'b, 'c: 'b, 't: 'c>(
     {
         if configuration.implementation() == AttentionImplementation::Fused {
             if configuration.dropout().is_some() {
-                return Err(LoweringError::UnsupportedOp {
+                return Err(Error::UnsupportedOperation {
                     op: format!(
                         "`{DOT_PRODUCT_ATTENTION_OPERATION_NAME}` dropout is only supported by the fused CUDA lowering",
                     ),
                 });
             }
             let FmhaEligibility::Ineligible(reason) = eligibility else { unreachable!() };
-            return Err(LoweringError::UnsupportedOp {
+            return Err(Error::UnsupportedOperation {
                 op: format!("the fused attention implementation is unavailable because {reason}"),
             });
         }
@@ -543,7 +543,7 @@ pub(crate) fn lower_dot_product_attention_to_mlir<'b, 'c: 'b, 't: 'c>(
             .named_compositions
             .as_ref()
             .and_then(|functions| functions.get_attention(operation, input_types, output_types))
-            .ok_or_else(|| LoweringError::UnsupportedOp {
+            .ok_or_else(|| Error::UnsupportedOperation {
                 op: format!("missing typed decomposition for `{}`", operation.name()),
             })?;
         return lower_decomposition_call(decomposition, input_values, output_types, block, context, location);
@@ -551,10 +551,10 @@ pub(crate) fn lower_dot_product_attention_to_mlir<'b, 'c: 'b, 't: 'c>(
     let data_type = input_types[0].data_type();
     let [batch, query_sequence, heads, head_dimension] = attention_dimensions(&input_types[0])?;
     let [_, key_value_sequence, _, _] = attention_dimensions(&input_types[1])?;
-    let heads = heads.value().ok_or_else(|| LoweringError::UnsupportedOp {
+    let heads = heads.value().ok_or_else(|| Error::UnsupportedOperation {
         op: format!("{DOT_PRODUCT_ATTENTION_OPERATION_NAME} heads dimension must be static"),
     })?;
-    let head_dimension = head_dimension.value().ok_or_else(|| LoweringError::UnsupportedOp {
+    let head_dimension = head_dimension.value().ok_or_else(|| Error::UnsupportedOperation {
         op: format!("{DOT_PRODUCT_ATTENTION_OPERATION_NAME} head dimension must be static"),
     })?;
     let physical_batch = attention_physical_extent(&batch)?;
@@ -745,7 +745,7 @@ pub(crate) fn lower_dot_product_attention_backward_to_mlir<'b, 'c: 'b, 't: 'c>(
     block: &mut BlockRef<'b, 'c, 't>,
     context: &'c MlirContext<'t>,
     location: LocationRef<'c, 't>,
-) -> Result<Vec<ValueRef<'b, 'c, 't>>, LoweringError> {
+) -> Result<Vec<ValueRef<'b, 'c, 't>>, Error> {
     let signature = operation.signature();
     if input_values.len() != 6 + signature.count() || input_values.len() != input_types.len() {
         return Err(ProgramError::InvalidInputCount { expected: 6, actual: input_values.len() }.into());
@@ -766,7 +766,7 @@ pub(crate) fn lower_dot_product_attention_backward_to_mlir<'b, 'c: 'b, 't: 'c>(
     {
         if configuration.implementation() == AttentionImplementation::Fused {
             if configuration.dropout().is_some() {
-                return Err(LoweringError::UnsupportedOp {
+                return Err(Error::UnsupportedOperation {
                     op: format!(
                         "`{DOT_PRODUCT_ATTENTION_BACKWARD_OPERATION_NAME}` dropout is only supported by the fused CUDA \
                          lowering",
@@ -774,7 +774,7 @@ pub(crate) fn lower_dot_product_attention_backward_to_mlir<'b, 'c: 'b, 't: 'c>(
                 });
             }
             let FmhaEligibility::Ineligible(reason) = eligibility else { unreachable!() };
-            return Err(LoweringError::UnsupportedOp {
+            return Err(Error::UnsupportedOperation {
                 op: format!("the fused attention backward implementation is unavailable because {reason}"),
             });
         }
@@ -782,7 +782,7 @@ pub(crate) fn lower_dot_product_attention_backward_to_mlir<'b, 'c: 'b, 't: 'c>(
             .named_compositions
             .as_ref()
             .and_then(|functions| functions.get_attention_backward(operation, input_types, output_types))
-            .ok_or_else(|| LoweringError::UnsupportedOp {
+            .ok_or_else(|| Error::UnsupportedOperation {
                 op: format!("missing typed decomposition for `{}`", operation.name()),
             })?;
         return lower_decomposition_call(decomposition, input_values, output_types, block, context, location);
@@ -790,13 +790,13 @@ pub(crate) fn lower_dot_product_attention_backward_to_mlir<'b, 'c: 'b, 't: 'c>(
     let data_type = input_types[0].data_type();
     let [batch, query_sequence, heads, head_dimension] = attention_dimensions(&input_types[0])?;
     let [_, key_value_sequence, key_value_heads, _] = attention_dimensions(&input_types[1])?;
-    let heads = heads.value().ok_or_else(|| LoweringError::UnsupportedOp {
+    let heads = heads.value().ok_or_else(|| Error::UnsupportedOperation {
         op: format!("{DOT_PRODUCT_ATTENTION_BACKWARD_OPERATION_NAME} heads dimension must be static"),
     })?;
-    let key_value_heads = key_value_heads.value().ok_or_else(|| LoweringError::UnsupportedOp {
+    let key_value_heads = key_value_heads.value().ok_or_else(|| Error::UnsupportedOperation {
         op: format!("{DOT_PRODUCT_ATTENTION_BACKWARD_OPERATION_NAME} key/value heads dimension must be static"),
     })?;
-    let head_dimension = head_dimension.value().ok_or_else(|| LoweringError::UnsupportedOp {
+    let head_dimension = head_dimension.value().ok_or_else(|| Error::UnsupportedOperation {
         op: format!("{DOT_PRODUCT_ATTENTION_BACKWARD_OPERATION_NAME} head dimension must be static"),
     })?;
     let physical_batch = attention_physical_extent(&batch)?;
@@ -1031,7 +1031,7 @@ impl LowerableOperation for DotProductAttentionOperation {
         input_values: &[ValueRef<'b, 'c, 't>],
         input_types: &[ArrayType],
         output_types: &[ArrayType],
-    ) -> Result<Vec<ValueRef<'b, 'c, 't>>, LoweringError> {
+    ) -> Result<Vec<ValueRef<'b, 'c, 't>>, Error> {
         let collective_state = lowerer.collective_state.clone();
         lower_dot_product_attention_to_mlir(
             self,
@@ -1053,7 +1053,7 @@ impl LowerableOperation for DotProductAttentionBackwardOperation {
         input_values: &[ValueRef<'b, 'c, 't>],
         input_types: &[ArrayType],
         output_types: &[ArrayType],
-    ) -> Result<Vec<ValueRef<'b, 'c, 't>>, LoweringError> {
+    ) -> Result<Vec<ValueRef<'b, 'c, 't>>, Error> {
         let collective_state = lowerer.collective_state.clone();
         lower_dot_product_attention_backward_to_mlir(
             self,

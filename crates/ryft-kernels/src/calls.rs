@@ -27,6 +27,8 @@ use crate::validation::{
     KernelBoundaryContract, KernelParameterAccess, KernelReferenceSummary, KernelValidationError, validate_kernel_body,
 };
 
+// TODO(eaplatanios): Promote kernel errors to dedicated `ryft_xla::Error` variants after
+// this support leaves experimental status.
 /// Invalid kernel signature or body boundary.
 #[derive(Clone, Debug, PartialEq, Eq, Hash, Error)]
 pub enum KernelError {
@@ -1259,8 +1261,8 @@ mod tests {
         CompositeTransposeOperation, ConditionOperation, Context, CustomRuleDefinition, CustomRuleRegistration,
         DataType, DimensionError, DimensionType, DimensionValue, EffectClasses, Layout, LogicalMesh, Memory, MeshAxis,
         MeshAxisType, Placeholder, ProgramBuilder, ReferenceAddUpdateOperation, ReferenceAtomicAddUpdateOperation,
-        ReferenceRead, ReferenceReadOperation, ReferenceWrite, ReferenceWriteOperation, RegionId, Shape, ShardMap,
-        ShardMapOperation, Sharding, TiledLayout, TypedProgram, ZeroOperation,
+        ReferenceRead, ReferenceReadOperation, ReferenceWrite, ReferenceWriteOperation, RegionId, Shape,
+        ShardMapBoundary, ShardMapOperation, Sharding, TiledLayout, TypedProgram, ZeroOperation,
     };
 
     use crate::authoring::whole_array_parameter;
@@ -1966,7 +1968,7 @@ mod tests {
         fn identity_shard_map() -> (ShardMapOperation, FlatProgram<EagerContext<ArrayIrValue<Array>, KernelOperation>>)
         {
             let mesh = LogicalMesh::new(vec![MeshAxis::new("x", 2, MeshAxisType::Manual).unwrap()]).unwrap();
-            let shard_map = ShardMap::new(
+            let shard_map = ShardMapBoundary::new(
                 mesh.clone(),
                 vec![Sharding::replicated(mesh.clone(), 0)],
                 vec![Sharding::replicated(mesh, 0)],

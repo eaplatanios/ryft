@@ -17,7 +17,7 @@ use crate::operations::assertions::{
     ASSERT_ACTOR_ATTRIBUTE, ASSERT_DETAIL_ATTRIBUTE, ASSERT_KIND_ATTRIBUTE, ASSERT_PAD_KIND,
     lower_assertion_custom_call, lower_deliberately_false_assertion_predicate,
 };
-use crate::{LowerableOperation, LowerableOperationFamily, LoweringError, XlaLowerer};
+use crate::{Error, LowerableOperation, LowerableOperationFamily, XlaLowerer};
 
 impl LowerableOperation for PadOperation<ArrayType> {
     fn lower<'b, 'c: 'b, 't: 'c, O: LowerableOperationFamily>(
@@ -26,7 +26,7 @@ impl LowerableOperation for PadOperation<ArrayType> {
         input_values: &[ValueRef<'b, 'c, 't>],
         input_types: &[ArrayType],
         output_types: &[ArrayType],
-    ) -> Result<Vec<ValueRef<'b, 'c, 't>>, LoweringError> {
+    ) -> Result<Vec<ValueRef<'b, 'c, 't>>, Error> {
         lower_pad_to_mlir(
             self,
             input_values,
@@ -41,8 +41,8 @@ impl LowerableOperation for PadOperation<ArrayType> {
 }
 
 /// Validates that one pad interior amount can be represented by StableHLO's signed 64-bit attribute storage.
-fn validate_pad_interior_padding(value: usize) -> Result<(), LoweringError> {
-    i64::try_from(value).map(|_| ()).map_err(|_| LoweringError::PadInteriorPaddingOutOfRange { value })
+fn validate_pad_interior_padding(value: usize) -> Result<(), Error> {
+    i64::try_from(value).map(|_| ()).map_err(|_| Error::PadInteriorPaddingOutOfRange { value })
 }
 
 /// Lowers a pad through the shared StableHLO path used by plain, generic-array, and shard-map dispatch.
@@ -56,7 +56,7 @@ pub(crate) fn lower_pad_to_mlir<'b, 'c: 'b, 't: 'c, T: RyftType, B: Block<'b, 'c
     block: &mut B,
     context: &'c MlirContext<'t>,
     location: L,
-) -> Result<Vec<ValueRef<'b, 'c, 't>>, LoweringError> {
+) -> Result<Vec<ValueRef<'b, 'c, 't>>, Error> {
     check_count!("input", input_values, 2, ProgramError);
     check_count!("input", input_types, 2, ProgramError);
     check_count!("output", output_types, 1, ProgramError);
@@ -242,7 +242,7 @@ pub(crate) fn lower_pad_extent_assertion<'b, 'c: 'b, 't: 'c>(
     block: &mut BlockRef<'b, 'c, 't>,
     context: &'c MlirContext<'t>,
     location: LocationRef<'c, 't>,
-) -> Result<(), LoweringError> {
+) -> Result<(), Error> {
     let predicate = lower_deliberately_false_assertion_predicate(output, block, context, location)?;
     let detail = format!(
         "{axis}:{}:{}:{}",
@@ -265,7 +265,7 @@ impl LowerableOperation for PadOperation<ArrayIrType> {
         input_values: &[ValueRef<'b, 'c, 't>],
         input_types: &[ArrayIrType],
         output_types: &[ArrayIrType],
-    ) -> Result<Vec<ValueRef<'b, 'c, 't>>, LoweringError> {
+    ) -> Result<Vec<ValueRef<'b, 'c, 't>>, Error> {
         let context = lowerer.context;
         let location = lowerer.location;
         let effect_tokens = &mut lowerer.effect_tokens;
@@ -273,7 +273,7 @@ impl LowerableOperation for PadOperation<ArrayIrType> {
         let [output_type] = output_types else {
             return Err(ProgramError::InvalidOutputCount { expected: 1, actual: output_types.len() }.into());
         };
-        let output_type = <&ArrayType>::try_from(output_type).map_err(|error| LoweringError::Tracing(error.into()))?;
+        let output_type = <&ArrayType>::try_from(output_type)?;
         let expected_input_count = output_type.rank() + 2;
         if input_values.len() != expected_input_count {
             return Err(
@@ -343,10 +343,10 @@ mod tests {
             return;
         }
 
-        assert_eq!(
+        assert!(matches!(
             validate_pad_interior_padding(usize::MAX),
-            Err(LoweringError::PadInteriorPaddingOutOfRange { value: usize::MAX }),
-        );
+            Err(Error::PadInteriorPaddingOutOfRange { value: usize::MAX }),
+        ));
     }
 
     #[test]
@@ -361,7 +361,7 @@ mod tests {
         let mut block = context.block(&[(input_tensor, location), (padding_tensor, location)]);
         let input = block.argument(0).unwrap().as_ref();
         let padding = block.argument(1).unwrap().as_ref();
-        assert_eq!(
+        assert!(matches!(
             lower_pad_to_mlir(
                 &PadOperation::<ArrayType>::new(vec![1], vec![1], vec![usize::MAX]).unwrap(),
                 &[input, padding],
@@ -373,8 +373,8 @@ mod tests {
                 location,
             )
             .unwrap_err(),
-            LoweringError::Tracing(ProgramError::InvalidOutputCount { expected: 1, actual: 0 }),
-        );
+            Error::Core(ryft_core::Error::Program(ProgramError::InvalidOutputCount { expected: 1, actual: 0 })),
+        ));
         // Interior padding is unobservable on a one-element axis, so it need not fit the native attribute type.
         let results = lower_pad_to_mlir(
             &PadOperation::<ArrayType>::new(vec![1], vec![1], vec![usize::MAX]).unwrap(),

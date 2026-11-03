@@ -584,9 +584,10 @@ mod gpu {
     use ryft_core::{Device, DeviceMesh, LogicalMesh, MeshAxis, MeshAxisType, ProgramError, ProjectedValue, Typed};
     use ryft_kernels::{KernelExtension, KernelOperation, KernelSchedule};
     use ryft_mosaic::kernels::gpu::{Compiler, GpuOperation, Options, Target};
-    use ryft_xla::experimental::XlaDomainError;
     use ryft_xla::kernels::{MosaicGpuEmbedding, XlaKernelCompilerBinding, XlaKernelExtension, stage_kernel};
-    use ryft_xla::{CompiledXlaFunction, FromPjrt, XlaCompileTracer, XlaOptions, XlaSession, compile_with_options};
+    use ryft_xla::{
+        CompiledXlaFunction, Error, FromPjrt, XlaCompileTracer, XlaOptions, XlaSession, compile_with_options,
+    };
 
     use crate::tests::{TestPlatform, test_for_each_platform};
 
@@ -631,7 +632,7 @@ mod gpu {
         client: &'c crate::Client<'c>,
         case: KernelCase,
         options: Options,
-    ) -> Result<Vec<f32>, XlaDomainError> {
+    ) -> Result<Vec<f32>, Error> {
         eprintln!(
             "Mosaic {}: semantic={}",
             case.name,
@@ -656,7 +657,7 @@ mod gpu {
         target: Target,
         options: Options,
         iterations: usize,
-    ) -> Result<Vec<f32>, XlaDomainError>
+    ) -> Result<Vec<f32>, Error>
     where
         Extension: 'static
             + Send
@@ -1265,9 +1266,8 @@ mod cutile {
     };
     use ryft_cuda::kernels::cutile::{CompiledKernel, Compiler, Options, Target};
     use ryft_kernels::{KernelSchedule, VerifiedKernel};
-    use ryft_xla::experimental::XlaDomainError;
     use ryft_xla::kernels::{CuTileEmbedding, XlaKernelCompilerBinding, stage_kernel};
-    use ryft_xla::{FromPjrt, XlaDomain, XlaSession, XlaValue};
+    use ryft_xla::{Error, FromPjrt, XlaDomain, XlaSession, XlaValue};
 
     use crate::tests::{TestPlatform, test_for_each_platform};
 
@@ -1340,7 +1340,7 @@ mod cutile {
         client: &'c crate::Client<'c>,
         case: KernelCase,
         repeated_input: bool,
-    ) -> Result<(), XlaDomainError> {
+    ) -> Result<(), Error> {
         if case.name != "assertion_failure" {
             interpret_case(&case);
         }

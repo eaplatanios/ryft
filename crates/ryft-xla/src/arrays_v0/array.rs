@@ -2,12 +2,11 @@ use ryft_core::{ArrayType, DeviceMesh, Dimension, Shape, Sharding, Typed, check_
 use ryft_pjrt::DeviceId;
 
 use crate::arrays_v0::compiled_reshard;
-use crate::arrays_v0::error::ArrayError;
 use crate::arrays_v0::execution::ExecuteArguments;
 use crate::arrays_v0::host::materialize_dense_array_bytes;
 use crate::arrays_v0::placement::DevicePutTarget;
 use crate::arrays_v0::transfers::copy_addressable_destination_shards_from_exact_source_shards;
-use crate::{ToMlir, XlaArray, XlaDomain};
+use crate::{Error, ToMlir, XlaArray, XlaDomain};
 
 impl<'o> XlaArray<'o> {
     /// Moves or copies this array to the provided placement, **without** donating the source
@@ -43,7 +42,7 @@ impl<'o> XlaArray<'o> {
     ///
     ///   - `engine`: [`XlaDomain`] wrapping the PJRT client and the compile-program cache.
     ///   - `target`: Resolved into a destination [`DeviceMesh`] + [`Sharding`].
-    pub fn to_placement(&self, engine: &XlaDomain<'o>, target: DevicePutTarget) -> Result<Self, ArrayError> {
+    pub fn to_placement(&self, engine: &XlaDomain<'o>, target: DevicePutTarget) -> Result<Self, Error> {
         let (target_mesh, target_sharding) = target.resolve(self.sharding().rank())?;
         if self.mesh() == &target_mesh && self.sharding() == &target_sharding {
             return Ok(self.clone());
@@ -68,7 +67,7 @@ impl<'o> XlaArray<'o> {
     ///
     ///   - `engine`: [`XlaDomain`] wrapping the PJRT client and the compile-program cache.
     ///   - `target`: Resolved into a destination [`DeviceMesh`] + [`Sharding`].
-    pub fn into_placement(self, engine: &XlaDomain<'o>, target: DevicePutTarget) -> Result<Self, ArrayError> {
+    pub fn into_placement(self, engine: &XlaDomain<'o>, target: DevicePutTarget) -> Result<Self, Error> {
         let (target_mesh, target_sharding) = target.resolve(self.sharding().rank())?;
         if self.mesh() == &target_mesh && self.sharding() == &target_sharding {
             return Ok(self);
@@ -86,7 +85,7 @@ impl<'o> XlaArray<'o> {
         target_mesh: DeviceMesh,
         target_sharding: Sharding,
         donate: bool,
-    ) -> Result<Self, ArrayError> {
+    ) -> Result<Self, Error> {
         let client = engine.client();
         check_sharding!(&target_mesh, &target_sharding);
 
@@ -159,7 +158,7 @@ impl<'o> XlaArray<'o> {
     pub fn into_execute_arguments(
         arrays: Vec<Self>,
         addressable_device_ids: &[DeviceId],
-    ) -> Result<ExecuteArguments<'o>, ArrayError> {
+    ) -> Result<ExecuteArguments<'o>, Error> {
         let donation_flags = vec![false; arrays.len()];
         ExecuteArguments::from_arrays_with_donation(arrays, addressable_device_ids.into(), donation_flags.as_slice())
     }
@@ -173,7 +172,7 @@ impl<'o> XlaArray<'o> {
         arrays: Vec<Self>,
         addressable_device_ids: &[DeviceId],
         donation_flags: &[bool],
-    ) -> Result<ExecuteArguments<'o>, ArrayError> {
+    ) -> Result<ExecuteArguments<'o>, Error> {
         ExecuteArguments::from_arrays_with_donation(arrays, addressable_device_ids.into(), donation_flags)
     }
 }

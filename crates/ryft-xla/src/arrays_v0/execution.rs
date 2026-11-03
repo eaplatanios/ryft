@@ -45,16 +45,16 @@ impl<'o> ExecuteArguments<'o> {
         arrays: Vec<XlaArray<'o>>,
         addressable_device_ids: Arc<[DeviceId]>,
         donation_flags: &[bool],
-    ) -> Result<Self, ArrayError> {
+    ) -> Result<Self, Error> {
         if donation_flags.len() != arrays.len() {
-            return Err(ArrayError::DonationFlagCountMismatch {
+            return Err(Error::DonationFlagCountMismatch {
                 expected_count: arrays.len(),
                 actual_count: donation_flags.len(),
             });
         }
         for (position, &device_id) in addressable_device_ids.iter().enumerate() {
             if addressable_device_ids[..position].contains(&device_id) {
-                return Err(ArrayError::DuplicateExecutionDeviceId { device_id });
+                return Err(Error::DuplicateExecutionDeviceId { device_id });
             }
         }
 
@@ -69,7 +69,7 @@ impl<'o> ExecuteArguments<'o> {
                 let buffer = array
                     .device_shard(device_id)
                     .and_then(XlaArrayShard::buffer)
-                    .ok_or(ArrayError::MissingArrayShardForDevice { array_index, device_id })?;
+                    .ok_or(Error::MissingArrayShardForDevice { array_index, device_id })?;
                 device_inputs.push(ExecutionInput { buffer: Arc::clone(buffer), donatable });
             }
             if array.shards().iter().filter(|shard| shard.buffer().is_some()).count() != addressable_device_ids.len() {
@@ -80,7 +80,7 @@ impl<'o> ExecuteArguments<'o> {
                     .map(|shard| shard.device().id())
                     .find(|device_id| !addressable_device_ids.contains(device_id))
                     .unwrap();
-                return Err(ArrayError::UnexpectedArrayShardDevice { array_index, device_id });
+                return Err(Error::UnexpectedArrayShardDevice { array_index, device_id });
             }
         }
 

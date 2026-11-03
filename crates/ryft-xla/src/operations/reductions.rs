@@ -17,7 +17,7 @@ use crate::experimental::lowering::types::{
 };
 use crate::operations::comparisons::lower_compare_to_mlir;
 use crate::operations::extrema::lower_extremum_to_mlir;
-use crate::{LowerableOperation, LowerableOperationFamily, LoweringError, XlaLowerer};
+use crate::{Error, LowerableOperation, LowerableOperationFamily, XlaLowerer};
 
 /// Lowers an [`ArgMaxOperation`] (when `maximize` is `true`) or an [`ArgMinOperation`] along `axis` to a variadic
 /// `stablehlo.reduce` over the input and a `stablehlo.iota` of its indices along `axis`, returning the reduced indices.
@@ -42,7 +42,7 @@ pub(crate) fn lower_index_reduction_to_mlir<'b, 'c: 'b, 't: 'c>(
     block: &mut BlockRef<'b, 'c, 't>,
     context: &'c MlirContext<'t>,
     location: LocationRef<'c, 't>,
-) -> Result<ValueRef<'b, 'c, 't>, LoweringError> {
+) -> Result<ValueRef<'b, 'c, 't>, Error> {
     let (value, value_data_type) = match input_type.data_type() {
         DataType::I1 => (lower_signed_one_bit_to_mlir(input_value, block, context, location)?, DataType::I8),
         data_type if data_type.is_floating_point() && !matches!(data_type, DataType::F32 | DataType::F64) => {
@@ -103,7 +103,7 @@ fn build_index_reduction_body_region<'c, 't>(
     index_data_type: DataType,
     context: &'c MlirContext<'t>,
     location: LocationRef<'c, 't>,
-) -> Result<ryft_mlir::DetachedRegion<'c, 't>, LoweringError> {
+) -> Result<ryft_mlir::DetachedRegion<'c, 't>, Error> {
     let value_tensor_type = lower_tensor_type(&ArrayType::scalar(value_data_type), context, location)?;
     let index_tensor_type = lower_tensor_type(&ArrayType::scalar(index_data_type), context, location)?;
     let block = context.block(&[
@@ -172,7 +172,7 @@ pub(crate) fn lower_product_combiner_to_mlir<'b, 'c: 'b, 't: 'c>(
     block: &mut BlockRef<'b, 'c, 't>,
     context: &'c MlirContext<'t>,
     location: LocationRef<'c, 't>,
-) -> Result<ValueRef<'b, 'c, 't>, LoweringError> {
+) -> Result<ValueRef<'b, 'c, 't>, Error> {
     let product = block.append_operation(stable_hlo::multiply(left, right, location)?)?.result(0).unwrap().as_ref();
     if !element_type.is_complex() {
         return Ok(product);
@@ -209,7 +209,7 @@ pub(crate) fn build_reduce_body_region<'c, 't>(
     element_type: DataType,
     context: &'c MlirContext<'t>,
     location: LocationRef<'c, 't>,
-) -> Result<ryft_mlir::DetachedRegion<'c, 't>, LoweringError> {
+) -> Result<ryft_mlir::DetachedRegion<'c, 't>, Error> {
     let scalar_array_type = ArrayType::scalar(element_type);
     let scalar_tensor_type = lower_tensor_type(&scalar_array_type, context, location)?;
     let block = context.block(&[(scalar_tensor_type, location), (scalar_tensor_type, location)]);
@@ -219,7 +219,7 @@ pub(crate) fn build_reduce_body_region<'c, 't>(
     let rhs = block_ref.argument(1)?.as_ref();
     let body_value = match kind {
         ReductionKind::LogSumExp => {
-            return Err(LoweringError::UnsupportedOp {
+            return Err(Error::UnsupportedOperation {
                 op: format!(
                     "`{REDUCE_OPERATION_NAME}` with kind `{}` requires a maximum-shifted expansion instead of a scalar \
                      combiner",
@@ -264,7 +264,7 @@ pub(crate) fn lower_reduce_to_mlir<'b, 'c: 'b, 't: 'c>(
     block: &mut BlockRef<'b, 'c, 't>,
     context: &'c MlirContext<'t>,
     location: LocationRef<'c, 't>,
-) -> Result<ValueRef<'b, 'c, 't>, LoweringError> {
+) -> Result<ValueRef<'b, 'c, 't>, Error> {
     let element_type = output_array_type.data_type();
     if matches!(kind, ReductionKind::Sum | ReductionKind::Product | ReductionKind::Mean | ReductionKind::LogSumExp)
         && element_type.is_floating_point()
@@ -322,7 +322,7 @@ pub(crate) fn lower_reduce_to_mlir<'b, 'c: 'b, 't: 'c>(
     // Floating-point empty means use `0 / 0`, producing NaN. Integer means retain the zero identity by clamping
     // the count, since integer division has no NaN representation.
     let input_type = input_value.r#type()?;
-    let input_tensor_type = input_type.cast::<TensorTypeRef>().ok_or_else(|| LoweringError::UnsupportedOp {
+    let input_tensor_type = input_type.cast::<TensorTypeRef>().ok_or_else(|| Error::UnsupportedOperation {
         op: format!("`reduce` operand has non-tensor MLIR type `{input_type}`"),
     })?;
     let dimensions = input_tensor_type.dimensions().collect::<Vec<_>>();
@@ -331,7 +331,7 @@ pub(crate) fn lower_reduce_to_mlir<'b, 'c: 'b, 't: 'c>(
         match dimensions.get(*axis) {
             Some(MlirSize::Static(size)) => count *= size,
             _ => {
-                return Err(LoweringError::UnsupportedOp {
+                return Err(Error::UnsupportedOperation {
                     op: format!("`reduce` mean over dynamically sized axis {axis}"),
                 });
             }
@@ -380,7 +380,7 @@ fn lower_log_sum_exp_to_mlir<'b, 'c: 'b, 't: 'c>(
     block: &mut BlockRef<'b, 'c, 't>,
     context: &'c MlirContext<'t>,
     location: LocationRef<'c, 't>,
-) -> Result<ValueRef<'b, 'c, 't>, LoweringError> {
+) -> Result<ValueRef<'b, 'c, 't>, Error> {
     let element_type = output_array_type.data_type();
     if !matches!(
         element_type,
@@ -394,7 +394,7 @@ fn lower_log_sum_exp_to_mlir<'b, 'c: 'b, 't: 'c>(
             | DataType::C64
             | DataType::C128
     ) {
-        return Err(LoweringError::UnsupportedOp {
+        return Err(Error::UnsupportedOperation {
             op: format!(
                 "`{REDUCE_OPERATION_NAME}` with kind `{}` requires a format with negative infinity but got \
                  `{element_type}`",
@@ -404,7 +404,7 @@ fn lower_log_sum_exp_to_mlir<'b, 'c: 'b, 't: 'c>(
     }
 
     let input_type = input_value.r#type()?;
-    let input_tensor_type = input_type.cast::<TensorTypeRef>().ok_or_else(|| LoweringError::UnsupportedOp {
+    let input_tensor_type = input_type.cast::<TensorTypeRef>().ok_or_else(|| Error::UnsupportedOperation {
         op: format!(
             "`{REDUCE_OPERATION_NAME}` with kind `{}` input has non-tensor MLIR type `{input_type}`",
             ReductionKind::LogSumExp,
@@ -473,7 +473,7 @@ pub(crate) fn build_reduction_identity_constant<'b, 'c: 'b, 't: 'c>(
     block: &mut BlockRef<'b, 'c, 't>,
     context: &'c MlirContext<'t>,
     location: LocationRef<'c, 't>,
-) -> Result<ValueRef<'b, 'c, 't>, LoweringError> {
+) -> Result<ValueRef<'b, 'c, 't>, Error> {
     let scalar_array_type = ArrayType::scalar(element_type);
     let scalar_tensor_type = lower_tensor_type(&scalar_array_type, context, location)?;
     if element_type.is_complex() {
@@ -483,7 +483,7 @@ pub(crate) fn build_reduction_identity_constant<'b, 'c: 'b, 't: 'c>(
             ReductionKind::Max => f64::NEG_INFINITY,
             ReductionKind::Min => f64::INFINITY,
             ReductionKind::LogSumExp | ReductionKind::Any | ReductionKind::All => {
-                return Err(LoweringError::UnsupportedDataType { data_type: element_type });
+                return Err(Error::UnsupportedDataType { data_type: element_type });
             }
         };
         let part_data_type = if element_type == DataType::C64 { DataType::F32 } else { DataType::F64 };
@@ -508,13 +508,13 @@ pub(crate) fn build_reduction_identity_constant<'b, 'c: 'b, 't: 'c>(
 /// type. `Sum` and `Mean` use zero, `Product` uses one, and `Max` and `Min` use the bounds returned by
 /// [`float_reduction_identity_bounds`] at float element types and the bounds returned by
 /// [`integer_reduction_identity_bounds`] at integer element types. Boolean `Any`/`Max` use `false`, while Boolean
-/// `All`/`Min` use `true`. Every other combination fails with [`LoweringError::UnsupportedDataType`].
+/// `All`/`Min` use `true`. Every other combination fails with [`Error::UnsupportedDataType`].
 fn build_reduction_identity_attribute<'c, 't>(
     kind: ReductionKind,
     element_type: DataType,
     tensor_type: ryft_mlir::TensorTypeRef<'c, 't>,
     context: &'c MlirContext<'t>,
-) -> Result<DenseElementsAttributeRef<'c, 't>, LoweringError> {
+) -> Result<DenseElementsAttributeRef<'c, 't>, Error> {
     if let Some((minimum, maximum)) = float_reduction_identity_bounds(element_type) {
         let identity = match kind {
             ReductionKind::Sum | ReductionKind::Mean if element_type != DataType::F8E8M0FNU => 0.0,
@@ -522,10 +522,10 @@ fn build_reduction_identity_attribute<'c, 't>(
             ReductionKind::Max => minimum,
             ReductionKind::Min => maximum,
             ReductionKind::Sum | ReductionKind::Mean => {
-                return Err(LoweringError::UnsupportedDataType { data_type: element_type });
+                return Err(Error::UnsupportedDataType { data_type: element_type });
             }
             ReductionKind::LogSumExp | ReductionKind::Any | ReductionKind::All => {
-                return Err(LoweringError::UnsupportedDataType { data_type: element_type });
+                return Err(Error::UnsupportedDataType { data_type: element_type });
             }
         };
         return lower_f64_scalar_elements_attribute(element_type, tensor_type, identity, context);
@@ -537,7 +537,7 @@ fn build_reduction_identity_attribute<'c, 't>(
             ReductionKind::Max => minimum,
             ReductionKind::Min => maximum,
             ReductionKind::LogSumExp | ReductionKind::Any | ReductionKind::All => {
-                return Err(LoweringError::UnsupportedDataType { data_type: element_type });
+                return Err(Error::UnsupportedDataType { data_type: element_type });
             }
         };
         return lower_constant_elements_attribute(element_type, tensor_type, identity, context);
@@ -545,15 +545,15 @@ fn build_reduction_identity_attribute<'c, 't>(
     match (kind, element_type) {
         (ReductionKind::Any | ReductionKind::Max, DataType::Boolean) => context
             .dense_bool_elements_attribute(tensor_type, &[false])
-            .map_err(|_| LoweringError::InvalidDenseElementsAttribute { data_type: element_type })?
+            .map_err(|_| Error::InvalidDenseElementsAttribute { data_type: element_type })?
             .cast::<DenseElementsAttributeRef>()
-            .ok_or(LoweringError::InvalidDenseElementsAttribute { data_type: element_type }),
+            .ok_or(Error::InvalidDenseElementsAttribute { data_type: element_type }),
         (ReductionKind::All | ReductionKind::Min, DataType::Boolean) => context
             .dense_bool_elements_attribute(tensor_type, &[true])
-            .map_err(|_| LoweringError::InvalidDenseElementsAttribute { data_type: element_type })?
+            .map_err(|_| Error::InvalidDenseElementsAttribute { data_type: element_type })?
             .cast::<DenseElementsAttributeRef>()
-            .ok_or(LoweringError::InvalidDenseElementsAttribute { data_type: element_type }),
-        _ => Err(LoweringError::UnsupportedDataType { data_type: element_type }),
+            .ok_or(Error::InvalidDenseElementsAttribute { data_type: element_type }),
+        _ => Err(Error::UnsupportedDataType { data_type: element_type }),
     }
 }
 
@@ -604,7 +604,7 @@ impl LowerableOperation for ReduceOperation {
         input_values: &[ValueRef<'b, 'c, 't>],
         _input_types: &[ArrayType],
         output_types: &[ArrayType],
-    ) -> Result<Vec<ValueRef<'b, 'c, 't>>, LoweringError> {
+    ) -> Result<Vec<ValueRef<'b, 'c, 't>>, Error> {
         check_count!("output", output_types, 1, ProgramError);
         let value = lower_reduce_to_mlir(
             self.kind(),
@@ -626,7 +626,7 @@ impl LowerableOperation for ArgMaxOperation {
         input_values: &[ValueRef<'b, 'c, 't>],
         input_types: &[ArrayType],
         output_types: &[ArrayType],
-    ) -> Result<Vec<ValueRef<'b, 'c, 't>>, LoweringError> {
+    ) -> Result<Vec<ValueRef<'b, 'c, 't>>, Error> {
         check_count!("input", input_types, 1, ProgramError);
         check_count!("output", output_types, 1, ProgramError);
         Ok(vec![lower_index_reduction_to_mlir(
@@ -649,7 +649,7 @@ impl LowerableOperation for ArgMinOperation {
         input_values: &[ValueRef<'b, 'c, 't>],
         input_types: &[ArrayType],
         output_types: &[ArrayType],
-    ) -> Result<Vec<ValueRef<'b, 'c, 't>>, LoweringError> {
+    ) -> Result<Vec<ValueRef<'b, 'c, 't>>, Error> {
         check_count!("input", input_types, 1, ProgramError);
         check_count!("output", output_types, 1, ProgramError);
         Ok(vec![lower_index_reduction_to_mlir(
@@ -804,13 +804,11 @@ mod tests {
         let program = builder
             .build::<Vec<XlaArrayConstant>, Vec<XlaArrayConstant>>(vec![output], vec![Placeholder], vec![Placeholder])
             .unwrap();
-        assert_eq!(
+        assert!(matches!(
             to_mlir_module_for_plain_program(&program, "main"),
-            Err(LoweringError::UnsupportedOp {
-                op: "`reduce` with kind `log_sum_exp` requires a format with negative infinity but got `f8e4m3fn`"
-                    .to_string(),
-            }),
-        );
+            Err(Error::UnsupportedOperation { op })
+                if op == "`reduce` with kind `log_sum_exp` requires a format with negative infinity but got `f8e4m3fn`",
+        ));
     }
 
     #[test]
@@ -854,10 +852,11 @@ mod tests {
         let program = builder
             .build::<Vec<XlaArrayConstant>, Vec<XlaArrayConstant>>(vec![output], vec![Placeholder], vec![Placeholder])
             .unwrap();
-        assert_eq!(
+        assert!(matches!(
             to_mlir_module_for_plain_program(&program, "main"),
-            Err(LoweringError::UnsupportedOp { op: "`reduce` mean over dynamically sized axis 0".to_string() }),
-        );
+            Err(Error::UnsupportedOperation { op })
+                if op == "`reduce` mean over dynamically sized axis 0",
+        ));
     }
 
     #[test]
@@ -1118,10 +1117,10 @@ mod tests {
 
     #[test]
     fn test_to_mlir_module_for_plain_program_supports_f8e8m0fnu_extrema_but_rejects_sum() {
-        assert_eq!(
+        assert!(matches!(
             lowered_reduce_module(DataType::F8E8M0FNU, ReductionKind::Sum, vec![0], vec![4]).unwrap_err(),
-            LoweringError::UnsupportedDataType { data_type: DataType::F8E8M0FNU },
-        );
+            Error::UnsupportedDataType { data_type: DataType::F8E8M0FNU },
+        ));
         assert!(lowered_reduce_module(DataType::F8E8M0FNU, ReductionKind::Max, vec![0], vec![0]).is_ok());
         assert!(lowered_reduce_module(DataType::F8E8M0FNU, ReductionKind::Min, vec![0], vec![0]).is_ok());
     }

@@ -16,7 +16,7 @@ use crate::operations::exponential::lower_log_add_exp_to_mlir;
 use crate::operations::reductions::{
     build_reduce_body_region, build_reduction_identity_constant, lower_product_combiner_to_mlir,
 };
-use crate::{LowerableOperation, LowerableOperationFamily, LoweringError, XlaLowerer};
+use crate::{Error, LowerableOperation, LowerableOperationFamily, XlaLowerer};
 
 /// Builds the scalar `tensor<{element_type}>` value seeding every window of a prefix scan's `reduce_window`, which is
 /// the identity of the combining operator selected by `kind`, so that the padded positions of a window cannot change
@@ -27,7 +27,7 @@ fn build_cumulative_initial_value<'b, 'c: 'b, 't: 'c>(
     block: &mut BlockRef<'b, 'c, 't>,
     context: &'c MlirContext<'t>,
     location: LocationRef<'c, 't>,
-) -> Result<ValueRef<'b, 'c, 't>, LoweringError> {
+) -> Result<ValueRef<'b, 'c, 't>, Error> {
     match kind {
         CumulativeKind::Sum => {
             build_reduction_identity_constant(ReductionKind::Sum, element_type, block, context, location)
@@ -72,7 +72,7 @@ fn build_cumulative_body_region<'c, 't>(
     element_type: DataType,
     context: &'c MlirContext<'t>,
     location: LocationRef<'c, 't>,
-) -> Result<ryft_mlir::DetachedRegion<'c, 't>, LoweringError> {
+) -> Result<ryft_mlir::DetachedRegion<'c, 't>, Error> {
     let reduction_kind = match kind {
         CumulativeKind::Sum => Some(ReductionKind::Sum),
         CumulativeKind::Max => Some(ReductionKind::Max),
@@ -191,13 +191,13 @@ pub(crate) fn lower_cumulative_to_mlir<'b, 'c: 'b, 't: 'c>(
     block: &mut BlockRef<'b, 'c, 't>,
     context: &'c MlirContext<'t>,
     location: LocationRef<'c, 't>,
-) -> Result<ValueRef<'b, 'c, 't>, LoweringError> {
+) -> Result<ValueRef<'b, 'c, 't>, Error> {
     // The scanned extent is static by construction: `ryft-core` type inference rejects a dynamic scanned axis, so a
     // dynamic extent here means the staged program bypassed that rule.
     let extent = match output_array_type.shape().dimensions().get(axis) {
         Some(Dimension::Static(extent)) => *extent,
         _ => {
-            return Err(LoweringError::UnsupportedOp {
+            return Err(Error::UnsupportedOperation {
                 op: format!("`{CUMULATIVE_OPERATION_NAME}` with kind `{kind}` over dynamically sized axis {axis}"),
             });
         }
@@ -261,7 +261,7 @@ pub(crate) fn lower_cumulative_to_mlir<'b, 'c: 'b, 't: 'c>(
     }
     // Rounded pairwise identities stay neutral in any binary tree, independent of the window extent.
     if matches!(kind, CumulativeKind::LogSumExp) && matches!(element_type, DataType::F8E8M0FNU | DataType::F6E2M3FN) {
-        return Err(LoweringError::UnsupportedOp {
+        return Err(Error::UnsupportedOperation {
             op: format!(
                 "`{CUMULATIVE_OPERATION_NAME}` with kind `{kind}` over `{element_type}`, whose lowest value is not a \
                  `log_add_exp` identity",
@@ -303,7 +303,7 @@ impl LowerableOperation for CumulativeOperation {
         input_values: &[ValueRef<'b, 'c, 't>],
         _input_types: &[ArrayType],
         output_types: &[ArrayType],
-    ) -> Result<Vec<ValueRef<'b, 'c, 't>>, LoweringError> {
+    ) -> Result<Vec<ValueRef<'b, 'c, 't>>, Error> {
         check_count!("output", output_types, 1, ProgramError);
         let value = lower_cumulative_to_mlir(
             self.kind(),
@@ -587,12 +587,11 @@ mod tests {
         let program = builder
             .build::<Vec<XlaArrayConstant>, Vec<XlaArrayConstant>>(vec![output], vec![Placeholder], vec![Placeholder])
             .unwrap();
-        assert_eq!(
+        assert!(matches!(
             to_mlir_module_for_plain_program(&program, "main"),
-            Err(LoweringError::UnsupportedOp {
-                op: "`cumulative` with kind `log_sum_exp` over dynamically sized axis 0".to_string(),
-            }),
-        );
+            Err(Error::UnsupportedOperation { op })
+                if op == "`cumulative` with kind `log_sum_exp` over dynamically sized axis 0",
+        ));
     }
 
     #[test]
@@ -720,15 +719,16 @@ mod tests {
                         ArrayOperation::Cumulative(CumulativeOperation::new(0, kind).with_reverse(reverse)),
                         DataType::Zero,
                         vec![3],
-                    ),
-                    Ok(indoc! {"
+                    )
+                    .unwrap(),
+                    indoc! {"
                         module {
                           func.func @main(%arg0: tensor<3xi1>) -> tensor<3xi1> {
                             return %arg0 : tensor<3xi1>
                           }
                         }
                     "}
-                    .to_string()),
+                    .to_string(),
                 );
             }
         }
@@ -755,15 +755,14 @@ mod tests {
                     vec![Placeholder],
                 )
                 .unwrap();
-            assert_eq!(
+            assert!(matches!(
                 to_mlir_module_for_plain_program(&program, "main"),
-                Err(LoweringError::UnsupportedOp {
-                    op: format!(
-                        "`cumulative` with kind `log_sum_exp` over `{element_type}`, whose lowest value is not a \
-                         `log_add_exp` identity",
-                    ),
-                }),
-            );
+                Err(Error::UnsupportedOperation { op })
+                    if op == format!(
+                           "`cumulative` with kind `log_sum_exp` over `{element_type}`, whose lowest value is not a \
+                            `log_add_exp` identity",
+                       ),
+            ));
         }
 
         // Finite pairwise identities remain neutral beyond the previously imposed scan-length limits.

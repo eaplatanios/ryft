@@ -18,7 +18,7 @@ use crate::operations::constants::{
     dynamic_constructor_types, lower_layout_constraint, refine_dynamic_constructor_result,
 };
 use crate::operations::sharding::constrain_sharding::lower_sharding_constraint;
-use crate::{LowerableOperation, LowerableOperationFamily, LoweringError, XlaLowerer};
+use crate::{Error, LowerableOperation, LowerableOperationFamily, XlaLowerer};
 
 impl LowerableOperation for BroadcastOperation {
     fn lower<'b, 'c: 'b, 't: 'c, O: LowerableOperationFamily>(
@@ -27,7 +27,7 @@ impl LowerableOperation for BroadcastOperation {
         input_values: &[ValueRef<'b, 'c, 't>],
         input_types: &[ArrayType],
         output_types: &[ArrayType],
-    ) -> Result<Vec<ValueRef<'b, 'c, 't>>, LoweringError> {
+    ) -> Result<Vec<ValueRef<'b, 'c, 't>>, Error> {
         lower_broadcast_to_mlir(
             self,
             input_values,
@@ -102,7 +102,7 @@ fn lower_broadcast_to_mlir<'b, 'c: 'b, 't: 'c>(
     block: &mut BlockRef<'b, 'c, 't>,
     context: &'c MlirContext<'t>,
     location: LocationRef<'c, 't>,
-) -> Result<Vec<ValueRef<'b, 'c, 't>>, LoweringError> {
+) -> Result<Vec<ValueRef<'b, 'c, 't>>, Error> {
     check_count!("input", input_values, 1, ProgramError);
     check_count!("input", input_types, 1, ProgramError);
     check_count!("output", output_types, 1, ProgramError);
@@ -117,7 +117,7 @@ fn lower_broadcast_to_mlir<'b, 'c: 'b, 't: 'c>(
     };
     let result = if output_type.static_shape().is_none() && physical_bound_type(output_type).is_err() {
         if output_type.layout().is_some() {
-            return Err(LoweringError::UnsupportedOp {
+            return Err(Error::UnsupportedOperation {
                 op: "dynamic broadcast with explicit output layout needs finite allocation bounds".to_owned(),
             });
         }
@@ -137,7 +137,7 @@ fn lower_broadcast_to_mlir<'b, 'c: 'b, 't: 'c>(
                     lower_runtime_dimension_size_i64(input, input_axis, block, context, location)
                 }
             })
-            .collect::<Result<Vec<_>, LoweringError>>()?;
+            .collect::<Result<Vec<_>, Error>>()?;
         let shape = lower_explicit_shape(&extents, block, context, location)?;
         let broadcast = block.append_operation(stable_hlo::dynamic_broadcast(
             input,
@@ -204,7 +204,7 @@ impl LowerableOperation for DynamicBroadcastOperation {
         input_values: &[ValueRef<'b, 'c, 't>],
         input_types: &[ArrayIrType],
         output_types: &[ArrayIrType],
-    ) -> Result<Vec<ValueRef<'b, 'c, 't>>, LoweringError> {
+    ) -> Result<Vec<ValueRef<'b, 'c, 't>>, Error> {
         let context = lowerer.context;
         let location = lowerer.location;
         let collective_state = &lowerer.collective_state;
@@ -215,11 +215,11 @@ impl LowerableOperation for DynamicBroadcastOperation {
         let Some(input_type) = input_types.first() else {
             return Err(ProgramError::InvalidInputCount { expected: 1, actual: 0 }.into());
         };
-        let input_type = <&ArrayType>::try_from(input_type).map_err(|error| LoweringError::Tracing(error.into()))?;
+        let input_type = <&ArrayType>::try_from(input_type)?;
         let [output_type] = output_types else {
             return Err(ProgramError::InvalidOutputCount { expected: 1, actual: output_types.len() }.into());
         };
-        let output_type = <&ArrayType>::try_from(output_type).map_err(|error| LoweringError::Tracing(error.into()))?;
+        let output_type = <&ArrayType>::try_from(output_type)?;
         let result = if output_type.static_shape().is_some() {
             // Exact symbolic axes have no inactive storage, and must lose their dynamic bit before a static result
             // is consumed as singleton broadcast storage by a later operation.
@@ -267,7 +267,7 @@ impl LowerableOperation for DynamicBroadcastOperation {
             .remove(0)
         } else {
             if output_type.layout().is_some() {
-                return Err(LoweringError::UnsupportedOp {
+                return Err(Error::UnsupportedOperation {
                     op: "dynamic broadcast with explicit output layout needs finite allocation bounds".to_owned(),
                 });
             }
@@ -620,10 +620,11 @@ mod tests {
                 .unwrap()[0];
             let program =
                 builder.build::<Vec<Array>, Vec<Array>>(vec![output], vec![Placeholder], vec![Placeholder]).unwrap();
-            assert_eq!(
+            assert!(matches!(
                 to_mlir_module_for_plain_program(&program, "main"),
-                Err(LoweringError::UnsupportedOp { op: format!("{kind} output layout `{layout}`") }),
-            );
+                Err(Error::UnsupportedOperation { op })
+                    if op == format!("{kind} output layout `{layout}`"),
+            ));
         }
     }
 
@@ -859,8 +860,9 @@ mod tests {
                 },
             );
             assert_eq!(
-                execute_mixed_program(&client, &program, &[MixedValue::Array(vec![2., 3.], vec![1, 2])], &[1, 2],),
-                Ok(vec![MixedValue::Array(vec![2., 3., 2., 3., 2., 3.], vec![3, 2])]),
+                execute_mixed_program(&client, &program, &[MixedValue::Array(vec![2., 3.], vec![1, 2])], &[1, 2],)
+                    .unwrap(),
+                vec![MixedValue::Array(vec![2., 3., 2., 3., 2., 3.], vec![3, 2])],
             );
         }
     }
@@ -916,7 +918,7 @@ mod tests {
         .unwrap();
         assert!(matches!(
             to_mlir_module(&traced, "main"),
-            Err(LoweringError::Tracing(ProgramError::UnsupportedOperation { message }))
+            Err(Error::Core(ryft_core::Error::Program(ProgramError::UnsupportedOperation { message })))
                 if message == "`broadcast` cannot assign bound manual mesh axes to local output dimensions",
         ));
     }
@@ -1089,7 +1091,7 @@ mod tests {
         let output_type =
             ArrayType::new(DataType::F32, Shape::new(vec![rows.into(), columns.into()])).with_layout(layout);
         assert_eq!(program.output_types(), vec![ArrayIrType::Array(output_type.clone())]);
-        assert_eq!(
+        assert!(matches!(
             to_mlir_module_for_program(
                 &program,
                 &[],
@@ -1103,10 +1105,9 @@ mod tests {
                 None,
                 None,
             ),
-            Err(LoweringError::UnsupportedOp {
-                op: "non-row-major bounded-dynamic output layout `tiled{0,1}`".to_string(),
-            }),
-        );
+            Err(Error::UnsupportedOperation { op })
+                if op == "non-row-major bounded-dynamic output layout `tiled{0,1}`",
+        ));
         // An unspecified executable result layout still permits the internal constraint.
         let module = to_mlir_module_for_program(
             &program,
@@ -1148,7 +1149,7 @@ mod tests {
                 .build::<Vec<XlaConstant>, Vec<XlaConstant>>(vec![output], vec![Placeholder], vec![Placeholder])
                 .unwrap();
             let output_type = ArrayType::new(DataType::F32, Shape::new(vec![size.into()])).with_layout(layout.clone());
-            assert_eq!(
+            assert!(matches!(
                 to_mlir_module_for_program(
                     &program,
                     &[],
@@ -1158,8 +1159,9 @@ mod tests {
                     None,
                     None,
                 ),
-                Err(LoweringError::UnsupportedOp { op: format!("{kind} output layout `{layout}`") }),
-            );
+                Err(Error::UnsupportedOperation { op })
+                    if op == format!("{kind} output layout `{layout}`"),
+            ));
         }
     }
 }

@@ -9,8 +9,8 @@ use ryft_core::{
     DynamicReshapeOperation, EffectClass, EffectClasses, ExternalReferenceBinding, GatherOperation, Instruction,
     LogicalMesh, Memory, OneLikeOperation, Operation, OperationPayloadProjection, Parameterized, ProgramError,
     Provenance, RematerializationOptimizationBarrier, ReshapeOperation, ReshardOperation, ScatterOperation, Shape,
-    ShardMap, ShardMapOperation, Sharding, ShardingDimension, ShardingError, Type as RyftType, TypeError, Typed,
-    TypedProgram, Value, ZeroLikeOperation,
+    ShardMapBoundary, ShardMapOperation, Sharding, ShardingDimension, Type as RyftType, TypeError, Typed, TypedProgram,
+    Value, ZeroLikeOperation,
 };
 use ryft_mlir::dialects::{func, shardy, stable_hlo};
 use ryft_mlir::{
@@ -35,7 +35,7 @@ use crate::operations::manipulation::broadcasting::broadcast_changes_explicit_sh
 use crate::operations::manipulation::conversions::cast_changes_explicit_placement;
 use crate::operations::manipulation::memory::memory_placement_kind;
 use crate::sharding::SHARDY_MESH_SYMBOL_NAME;
-use crate::{RaggedDotLoweringStrategy, ToMlir};
+use crate::{Error, RaggedDotLoweringStrategy, ToMlir};
 
 #[cfg(test)]
 use crate::experimental::lowering::regions::lower_plain_program_outputs;
@@ -50,129 +50,6 @@ pub(crate) mod regions;
 pub(crate) mod signature;
 /// Shared StableHLO type, constant, and dynamic-dimension lowering helpers.
 pub(crate) mod types;
-
-/// Error type for StableHLO/Shardy lowering. It is public because the general XLA tracing error
-/// ([`TraceError`](crate::experimental::tracing::TraceError)) wraps it, and because
-/// [`to_mlir_module`](crate::operations::sharding::shard_map::to_mlir_module) returns it.
-#[derive(Clone, Debug, thiserror::Error, PartialEq, Eq)]
-pub enum LoweringError {
-    /// Underlying sharding error returned while building mesh or sharding attributes.
-    #[error("{0}")]
-    ShardingError(#[from] ShardingError),
-
-    /// Underlying MLIR error returned while building or mutating MLIR objects.
-    #[error("{0}")]
-    MlirError(#[from] ryft_mlir::Error),
-
-    /// Error returned when a lowered function name is empty or contains whitespace.
-    #[error("invalid function name `{function_name}` used during XLA lowering")]
-    InvalidFunctionName { function_name: String },
-
-    /// Error returned when lowering encounters a traced tensor type that MLIR rejects.
-    #[error("invalid tensor type `{array_type}` used during XLA lowering")]
-    InvalidTensorType { array_type: ArrayType },
-
-    /// Error returned when a reshape dimension cannot be represented by StableHLO's signed shape element type.
-    #[error("reshape dimension {value} cannot be represented as a StableHLO i{bit_width} shape value")]
-    ReshapeDimensionOutOfRange { value: usize, bit_width: u8 },
-
-    /// Error returned when a dynamic allocation bound exceeds StableHLO's signed runtime size carrier.
-    #[error("dynamic dimension bound {value} cannot be represented as a StableHLO i32 size value")]
-    DynamicDimensionOutOfRange { value: usize },
-
-    /// Error returned when a pad interior amount cannot be represented by StableHLO's signed attribute type.
-    #[error("pad interior padding {value} cannot be represented as a StableHLO i64 attribute")]
-    PadInteriorPaddingOutOfRange { value: usize },
-
-    /// Error returned when lowering encounters a staged op that does not yet have StableHLO support.
-    #[error("unsupported staged op `{op}` during XLA lowering")]
-    UnsupportedOp { op: String },
-
-    /// Error returned when unresolved reference semantics reach XLA lowering before functionalization.
-    #[error("unresolved reference construct `{construct}` must be discharged before XLA lowering")]
-    UnresolvedReference { construct: String },
-
-    /// Error returned when unresolved mutable state reaches ordinary XLA lowering before functionalization.
-    #[error("unresolved state in `{construct}` must be discharged before XLA lowering")]
-    UnresolvedState { construct: String },
-
-    /// Error returned when lowering encounters a captured constant reference without a matching hidden argument.
-    #[error("missing captured constant #{index} during XLA lowering")]
-    MissingCapturedConstant { index: usize },
-
-    /// Error returned when lowering tries to materialize abstract XLA type metadata as a literal value.
-    #[error("abstract XLA value `{array_type}` cannot be materialized as a StableHLO literal")]
-    AbstractValueLiteral { array_type: ArrayType },
-
-    /// Error returned when signature sharding metadata does not match the lowered function signature.
-    #[error("invalid {kind} sharding count during XLA lowering: expected {expected}, got {actual}")]
-    InvalidShardingCount {
-        /// Name of the sharding group being validated.
-        kind: &'static str,
-
-        /// Number of shardings required by the signature.
-        expected: usize,
-
-        /// Number of shardings provided.
-        actual: usize,
-    },
-
-    /// Error returned when lowering encounters a type that does not have StableHLO support yet.
-    #[error("unsupported data type `{data_type}` during XLA lowering")]
-    UnsupportedDataType { data_type: DataType },
-
-    /// Error returned when MLIR rejects the constructed dense-elements attribute.
-    #[error("invalid dense elements attribute for data type `{data_type}` during XLA lowering")]
-    InvalidDenseElementsAttribute { data_type: DataType },
-
-    /// Error returned when the constructed MLIR module fails verification.
-    #[error("constructed MLIR module failed verification during XLA lowering")]
-    MlirVerificationFailure,
-
-    /// Error returned when one traced XLA program mixes shard maps from incompatible meshes.
-    #[error("traced XLA lowering requires all nested shard maps to use compatible logical meshes")]
-    IncompatibleNestedMeshes,
-
-    /// Error returned when simplifying a staged program prior to lowering fails.
-    #[error("failed to simplify staged XLA program before lowering: {message}")]
-    SimplificationFailure { message: String },
-
-    /// Error returned when logical reference-state metadata cannot map to a safe executable alias.
-    #[error("invalid XLA reference-state ABI: {message}")]
-    InvalidReferenceStateAbi { message: String },
-
-    /// Error returned when [`to_mlir_module`](crate::operations::sharding::shard_map::to_mlir_module) lowers a traced
-    /// shard map whose global input or output type varies along a mesh axis that is not one of its own manual axes.
-    /// Only an enclosing manual region makes such an axis manual (e.g., for a body traced with
-    /// [`ryft_core::trace_shard_map_with_named_axes`]), and the standalone module that
-    /// [`to_mlir_module`](crate::operations::sharding::shard_map::to_mlir_module) produces has none, so the shard map
-    /// can only be lowered as part of the program that encloses it.
-    #[error(
-        "{value_kind} type #{value_index} of a standalone `shard_map` varies along mesh axis `{axis_name}`, which is \
-         not one of its manual axes; lower it as part of the program whose manual region makes that axis manual"
-    )]
-    StandaloneShardMapVariesAlongEnclosingManualAxis { value_kind: &'static str, value_index: usize, axis_name: String },
-
-    /// Error returned when [`to_mlir_module`](crate::operations::sharding::shard_map::to_mlir_module) lowers a traced
-    /// shard map whose body applies a collective (e.g., `parallel_reduce` or `axis_index`) along a manual mesh axis
-    /// that neither the shard map nor a shard map nested in its body makes manual. Only an enclosing manual region
-    /// makes such an axis manual (e.g., for a body traced with [`ryft_core::trace_shard_map_with_named_axes`]), even
-    /// when the boundary of the shard map does not vary along it (e.g., for a reduction of an invariant input), and the
-    /// standalone module that [`to_mlir_module`](crate::operations::sharding::shard_map::to_mlir_module) produces has
-    /// none.
-    #[error(
-        "`{operation_name}` in the body of a standalone `shard_map` communicates along mesh axis `{axis_name}`, which \
-         is not one of its manual axes; lower it as part of the program whose manual region makes that axis manual"
-    )]
-    StandaloneShardMapCommunicatesAlongEnclosingManualAxis { operation_name: &'static str, axis_name: String },
-
-    /// Underlying program error returned while replaying a staged program through the generic
-    /// [`Program::interpret_with`](ryft_core::Program::interpret_with) domain, or raised directly by lowering for a
-    /// program that it cannot lower (e.g., a [`ShardMapError`](ryft_core::ShardMapError) for a nested manual
-    /// computation that Shardy cannot represent, which [`ProgramError::downcast_custom`] recovers).
-    #[error("{0}")]
-    Tracing(#[from] ProgramError),
-}
 
 /// Textual StableHLO module paired with the exact executable signature used to emit its entry function.
 pub(crate) struct LoweredXlaModule {
@@ -412,9 +289,9 @@ impl<'b, 'c: 'b, 't: 'c, O> XlaLowerer<'b, 'c, 't, O> {
     ///
     /// # Errors
     ///
-    /// Returns [`LoweringError::InvalidTensorType`] or [`LoweringError::UnsupportedDataType`] when `array_type` has no
+    /// Returns [`Error::InvalidTensorType`] or [`Error::UnsupportedDataType`] when `array_type` has no
     /// StableHLO tensor representation.
-    pub fn lower_tensor_type(&self, array_type: &ArrayType) -> Result<ryft_mlir::TensorTypeRef<'c, 't>, LoweringError> {
+    pub fn lower_tensor_type(&self, array_type: &ArrayType) -> Result<ryft_mlir::TensorTypeRef<'c, 't>, Error> {
         lower_tensor_type(array_type, self.context, self.location)
     }
 
@@ -425,13 +302,13 @@ impl<'b, 'c: 'b, 't: 'c, O> XlaLowerer<'b, 'c, 't, O> {
     ///
     /// # Errors
     ///
-    /// Returns a [`LoweringError`] when the `stablehlo.after_all` operation cannot be created.
+    /// Returns a [`Error`] when the `stablehlo.after_all` operation cannot be created.
     ///
     /// # Panics
     ///
     /// Panics for [`EffectClass::OrderedState`], which reference discharge removes before lowering, and for
     /// [`EffectClass::UnorderedIo`], which has no token chain.
-    pub fn effect_token(&mut self, effect_class: EffectClass) -> Result<ValueRef<'b, 'c, 't>, LoweringError> {
+    pub fn effect_token(&mut self, effect_class: EffectClass) -> Result<ValueRef<'b, 'c, 't>, Error> {
         assert_ne!(effect_class, EffectClass::UnorderedIo, "unordered effects do not have token chains");
         current_or_new_token(effect_class, &mut self.effect_tokens, &mut self.block, self.location)
     }
@@ -453,18 +330,18 @@ impl<'b, 'c: 'b, 't: 'c, O> XlaLowerer<'b, 'c, 't, O> {
     ///
     /// # Errors
     ///
-    /// Returns [`LoweringError::UnsupportedOp`] when the instruction being lowered has no region at `index`, and
+    /// Returns [`Error::UnsupportedOperation`] when the instruction being lowered has no region at `index`, and
     /// propagates the errors of lowering the region.
     pub fn lower_region_inline(
         &mut self,
         index: usize,
         input_values: &[ValueRef<'b, 'c, 't>],
-    ) -> Result<Vec<ValueRef<'b, 'c, 't>>, LoweringError>
+    ) -> Result<Vec<ValueRef<'b, 'c, 't>>, Error>
     where
         O: LowerableOperationFamily,
     {
         let Some(region) = self.regions.get(index) else {
-            return Err(LoweringError::UnsupportedOp {
+            return Err(Error::UnsupportedOperation {
                 op: format!("region #{index} of an instruction with {} attached regions", self.regions.len()),
             });
         };
@@ -512,7 +389,7 @@ pub trait LowerableOperation: Operation {
         input_values: &[ValueRef<'b, 'c, 't>],
         input_types: &[Self::Type],
         output_types: &[Self::Type],
-    ) -> Result<Vec<ValueRef<'b, 'c, 't>>, LoweringError>;
+    ) -> Result<Vec<ValueRef<'b, 'c, 't>>, Error>;
 }
 
 /// Operation families whose programs the XLA lowering entry points lower. Such a family lowers at [`ArrayIrType`],
@@ -545,7 +422,7 @@ pub trait MemberLowerableOperation<T: RyftType>: Operation {
         input_values: &[ValueRef<'b, 'c, 't>],
         input_types: &[T],
         output_types: &[T],
-    ) -> Result<Vec<ValueRef<'b, 'c, 't>>, LoweringError>;
+    ) -> Result<Vec<ValueRef<'b, 'c, 't>>, Error>;
 }
 
 /// Lowers a payload that a family stores as a projected member of universe `U` by projecting the instruction's
@@ -558,7 +435,7 @@ pub fn lower_projected_operation<'b, 'c: 'b, 't: 'c, U, T, P, O: LowerableOperat
     input_values: &[ValueRef<'b, 'c, 't>],
     input_types: &[T],
     output_types: &[T],
-) -> Result<Vec<ValueRef<'b, 'c, 't>>, LoweringError>
+) -> Result<Vec<ValueRef<'b, 'c, 't>>, Error>
 where
     U: RyftType,
     P: LowerableOperation<Type = U>,
@@ -567,8 +444,8 @@ where
     let project = |types: &[T]| {
         types
             .iter()
-            .map(|r#type| <&U>::try_from(r#type).cloned().map_err(|error| LoweringError::Tracing(error.into())))
-            .collect::<Result<Vec<_>, _>>()
+            .map(|r#type| <&U>::try_from(r#type).cloned().map_err(Into::<ProgramError>::into))
+            .collect::<Result<Vec<_>, ProgramError>>()
     };
     let input_types = project(input_types)?;
     let output_types = project(output_types)?;
@@ -601,7 +478,7 @@ where
 ///         input_values: &[ValueRef<'b, 'c, 't>],
 ///         input_types: &[ArrayIrType],
 ///         output_types: &[ArrayIrType],
-///     ) -> Result<Vec<ValueRef<'b, 'c, 't>>, LoweringError> {
+///     ) -> Result<Vec<ValueRef<'b, 'c, 't>>, Error> {
 ///         ryft_xla::lower_operation_variants!(
 ///             self, MyOperation, lowerer, input_values, input_types, output_types;
 ///             Xla, Custom,
@@ -672,7 +549,7 @@ pub(crate) fn current_or_new_token<'b, 'c: 'b, 't: 'c>(
     effect_tokens: &mut EffectTokens<'b, 'c, 't>,
     block: &mut BlockRef<'b, 'c, 't>,
     location: LocationRef<'c, 't>,
-) -> Result<ValueRef<'b, 'c, 't>, LoweringError> {
+) -> Result<ValueRef<'b, 'c, 't>, Error> {
     if let Some(token) = effect_tokens.get(effect_class) {
         return Ok(token);
     }
@@ -689,7 +566,7 @@ impl<V: MlirLowerableValue> LowerableOperation for ArrayOperation<V> {
         input_values: &[ValueRef<'b, 'c, 't>],
         input_types: &[ArrayType],
         output_types: &[ArrayType],
-    ) -> Result<Vec<ValueRef<'b, 'c, 't>>, LoweringError> {
+    ) -> Result<Vec<ValueRef<'b, 'c, 't>>, Error> {
         // This function does not validate the placement of local outputs. `XlaOperation::lower` validates it for every
         // variant, including this projected one, whereas downstream families that embed `ArrayOperation` must reject
         // outputs that shard a local dimension over a bound manual mesh axis themselves (refer to
@@ -717,7 +594,7 @@ impl LowerableOperation for DimensionOperation<DimensionValue> {
         input_values: &[ValueRef<'b, 'c, 't>],
         input_types: &[DimensionType],
         output_types: &[DimensionType],
-    ) -> Result<Vec<ValueRef<'b, 'c, 't>>, LoweringError> {
+    ) -> Result<Vec<ValueRef<'b, 'c, 't>>, Error> {
         lower_operation_variants!(
             self, DimensionOperation, lowerer, input_values, input_types, output_types;
             Constant, Max, Min, Add, Sub, SaturatingSub, Mul, Div, Rem, Pow,
@@ -732,7 +609,7 @@ impl LowerableOperation for XlaOperation {
         input_values: &[ValueRef<'b, 'c, 't>],
         input_types: &[ArrayIrType],
         output_types: &[ArrayIrType],
-    ) -> Result<Vec<ValueRef<'b, 'c, 't>>, LoweringError> {
+    ) -> Result<Vec<ValueRef<'b, 'c, 't>>, Error> {
         // Every variant, including the projected array operations, has its local output placement validated here
         // exactly once. A nested `shard_map` instead validates its boundary specifications against the enclosing
         // manual axes itself, reporting the more specific `ShardMapError::SpecificationNamesEnclosingManualAxis`.
@@ -796,7 +673,7 @@ fn validate_local_output_placement(
     operation_name: &str,
     output_types: &[ArrayIrType],
     bound_manual_axes: &[String],
-) -> Result<(), LoweringError> {
+) -> Result<(), Error> {
     let assigns_bound_manual_axis = output_types.iter().any(|output_type| {
         let sharding = match output_type {
             ArrayIrType::Array(output_type) => output_type.sharding(),
@@ -817,20 +694,20 @@ fn validate_local_output_placement(
 }
 
 /// Module-scoped lowering state shared across nested regions. StableHLO collectives use the channel counter and the
-/// innermost enclosing `sdy.manual_computation` region's [`ShardMap`], while other lowerings consume immutable target
-/// and representation policy stored alongside that shared state.
+/// innermost enclosing `sdy.manual_computation` region's [`ShardMapBoundary`], while other lowerings consume immutable
+/// target and representation policy stored alongside that shared state.
 ///
 /// The state is created once per lowered module and cloned per instruction lowerer. Module-owned mutable state and
 /// registries are shared through [`Rc`], while immutable target and representation policies are copied or cloned.
 /// [`enter_manual_region`](Self::enter_manual_region) preserves that module state and policy while replacing the
-/// innermost region's [`ShardMap`].
+/// innermost region's [`ShardMapBoundary`].
 #[derive(Clone)]
 pub(crate) struct CollectiveLoweringState {
     /// Module-scoped counter producing the next collective channel id.
     pub(crate) channel_ids: Rc<Cell<usize>>,
 
     /// Enclosing manual regions, ordered from outermost to innermost for named-axis resolution.
-    manual_regions: Vec<Rc<ShardMap>>,
+    manual_regions: Vec<Rc<ShardMapBoundary>>,
 
     /// Axes bound by every enclosing manual region, excluded from shard-local placement constraints.
     pub(crate) bound_manual_axes: Vec<String>,
@@ -902,8 +779,8 @@ impl CollectiveLoweringState {
 
     /// Derives the state used inside one `sdy.manual_computation` region's body. The target platform, grouped-dot
     /// representation, named compositions, provenance state, and module channel allocator are inherited, while the
-    /// provided [`ShardMap`] becomes the innermost manual region.
-    pub(crate) fn enter_manual_region(&self, shard_map: ShardMap) -> Self {
+    /// provided [`ShardMapBoundary`] becomes the innermost manual region.
+    pub(crate) fn enter_manual_region(&self, shard_map: ShardMapBoundary) -> Self {
         let mut bound_manual_axes = self.bound_manual_axes.clone();
         for axis in shard_map.manual_axes() {
             if !bound_manual_axes.contains(axis) {
@@ -924,13 +801,13 @@ impl CollectiveLoweringState {
         }
     }
 
-    /// Returns the innermost enclosing manual region's [`ShardMap`], or `None` outside manual regions.
-    pub(crate) fn manual_shard_map(&self) -> Option<&ShardMap> {
+    /// Returns the innermost enclosing manual region's [`ShardMapBoundary`], or `None` outside manual regions.
+    pub(crate) fn manual_shard_map(&self) -> Option<&ShardMapBoundary> {
         self.manual_regions.last().map(Rc::as_ref)
     }
 
     /// Returns the nearest enclosing region binding `axis_name`.
-    pub(crate) fn manual_axis_region(&self, axis_name: &str) -> Option<&ShardMap> {
+    pub(crate) fn manual_axis_region(&self, axis_name: &str) -> Option<&ShardMapBoundary> {
         self.manual_regions
             .iter()
             .rev()
@@ -946,7 +823,7 @@ impl CollectiveLoweringState {
         axis_name: &str,
         axis_size: usize,
         payload_mesh: Option<&LogicalMesh>,
-    ) -> Result<&LogicalMesh, LoweringError> {
+    ) -> Result<&LogicalMesh, Error> {
         // Resolve the binding and recorded size first, preserving the replica-group diagnostics and the nearest
         // enclosing binder when another manual region shadows the axis name.
         collective_replica_groups(self, axis_name, axis_size, None)?;
@@ -967,7 +844,7 @@ impl CollectiveLoweringState {
     ///
     /// # Errors
     ///
-    /// Returns a [`LoweringError`] if no enclosing manual region binds `axis_name`, if the recorded axis size or a
+    /// Returns a [`Error`] if no enclosing manual region binds `axis_name`, if the recorded axis size or a
     /// payload mesh disagrees with that region, if re-inference fails, or if it produces different output types.
     pub(crate) fn check_manual_collective<T: PartialEq>(
         &self,
@@ -977,7 +854,7 @@ impl CollectiveLoweringState {
         payload_mesh: Option<&LogicalMesh>,
         output_types: &[T],
         infer_output_types: impl FnOnce(&LogicalMesh) -> Result<Vec<T>, TypeError>,
-    ) -> Result<(), LoweringError> {
+    ) -> Result<(), Error> {
         let mesh = self.checked_collective_mesh(operation_name, axis_name, axis_size, payload_mesh)?;
         if infer_output_types(mesh).map_err(ProgramError::from)? != output_types {
             return Err(ProgramError::MalformedProgram(format!(
@@ -1054,7 +931,7 @@ impl CollectiveLoweringState {
 pub(crate) fn serialize_lowered_module(
     module: &Module<'_, '_>,
     collective_state: &CollectiveLoweringState,
-) -> Result<String, LoweringError> {
+) -> Result<String, Error> {
     if !collective_state.has_provenance() {
         return Ok(module.to_string());
     }
@@ -1090,9 +967,9 @@ pub(crate) fn serialize_lowered_module(
 ///
 /// # Errors
 ///
-/// Returns [`LoweringError::UnresolvedReference`] or [`LoweringError::UnresolvedState`] for programs with undischarged
-/// references or state, [`LoweringError::InvalidFunctionName`] for an invalid `function_name`, and other
-/// [`LoweringError`]s for operations or types that cannot be lowered.
+/// Returns [`Error::UnresolvedReference`] or [`Error::UnresolvedState`] for programs with undischarged
+/// references or state, [`Error::InvalidFunctionName`] for an invalid `function_name`, and other
+/// [`Error`]s for operations or types that cannot be lowered.
 pub fn to_mlir_module_for_program<'o, Input, Output, ProgramInput, ProgramOutput, S, O: LowerableOperationFamily>(
     program: &XlaProgram<ProgramInput, ProgramOutput, O>,
     capture_types: &[ArrayType],
@@ -1101,7 +978,7 @@ pub fn to_mlir_module_for_program<'o, Input, Output, ProgramInput, ProgramOutput
     function_name: S,
     argument_shardings: Option<&[Sharding]>,
     result_shardings: Option<&[Sharding]>,
-) -> Result<String, LoweringError>
+) -> Result<String, Error>
 where
     Input: Parameterized<ArrayType>,
     Output: Parameterized<ArrayType>,
@@ -1140,7 +1017,7 @@ pub(crate) fn lower_mlir_module_for_program<
     argument_shardings: Option<&[Sharding]>,
     result_shardings: Option<&[Sharding]>,
     target_platform: Option<&str>,
-) -> Result<LoweredXlaModule, LoweringError>
+) -> Result<LoweredXlaModule, Error>
 where
     Input: Parameterized<ArrayType>,
     Output: Parameterized<ArrayType>,
@@ -1192,7 +1069,7 @@ pub(crate) fn lower_mlir_module_for_program_with_reference_state<
     target_platform: Option<&str>,
     reference_states: &[ExternalReferenceBinding],
     ragged_dot_lowering_strategy: RaggedDotLoweringStrategy,
-) -> Result<LoweredXlaModule, LoweringError>
+) -> Result<LoweredXlaModule, Error>
 where
     Input: Parameterized<ArrayType>,
     Output: Parameterized<ArrayType>,
@@ -1236,7 +1113,7 @@ fn lower_mlir_module_for_program_with_effect_boundary<
     reference_states: &[ExternalReferenceBinding],
     ragged_dot_lowering_strategy: RaggedDotLoweringStrategy,
     export_effects: bool,
-) -> Result<LoweredXlaModule, LoweringError>
+) -> Result<LoweredXlaModule, Error>
 where
     Input: Parameterized<ArrayType>,
     Output: Parameterized<ArrayType>,
@@ -1245,10 +1122,10 @@ where
     S: AsRef<str>,
 {
     if contains_unresolved_references(program) {
-        return Err(LoweringError::UnresolvedReference { construct: "program".to_string() });
+        return Err(Error::UnresolvedReference { construct: "program".to_string() });
     }
     if contains_unresolved_state(program) {
-        return Err(LoweringError::UnresolvedState { construct: "program".to_string() });
+        return Err(Error::UnresolvedState { construct: "program".to_string() });
     }
     let function_name = normalize_function_name(function_name.as_ref())?;
     let global_input_types = global_input_types.parameters().cloned().collect::<Vec<_>>();
@@ -1267,7 +1144,7 @@ where
     if let Some(shardings) = argument_shardings
         && shardings.len() != logical_argument_types.len()
     {
-        return Err(LoweringError::InvalidShardingCount {
+        return Err(Error::InvalidShardingCount {
             kind: "argument",
             expected: logical_argument_types.len(),
             actual: shardings.len(),
@@ -1276,7 +1153,7 @@ where
     if let Some(shardings) = result_shardings
         && shardings.len() != global_output_types.len()
     {
-        return Err(LoweringError::InvalidShardingCount {
+        return Err(Error::InvalidShardingCount {
             kind: "result",
             expected: global_output_types.len(),
             actual: shardings.len(),
@@ -1289,37 +1166,33 @@ where
         let logical_input_index = state
             .source()
             .flat_input_index(capture_types.len())
-            .map_err(|error| LoweringError::InvalidReferenceStateAbi { message: error.to_string() })?;
+            .map_err(|error| Error::InvalidReferenceStateAbi { message: error.to_string() })?;
         if !state_inputs.insert(logical_input_index) {
-            return Err(LoweringError::InvalidReferenceStateAbi {
+            return Err(Error::InvalidReferenceStateAbi {
                 message: format!("logical state input {logical_input_index} appears more than once"),
             });
         }
         let input_type =
-            logical_argument_types
-                .get(logical_input_index)
-                .ok_or_else(|| LoweringError::InvalidReferenceStateAbi {
-                    message: format!("logical input index {logical_input_index} is out of range"),
-                })?;
+            logical_argument_types.get(logical_input_index).ok_or_else(|| Error::InvalidReferenceStateAbi {
+                message: format!("logical input index {logical_input_index} is out of range"),
+            })?;
         let physical_input_index =
-            signature.input_mapping()[logical_input_index].ok_or_else(|| LoweringError::InvalidReferenceStateAbi {
+            signature.input_mapping()[logical_input_index].ok_or_else(|| Error::InvalidReferenceStateAbi {
                 message: format!("logical state input {logical_input_index} is erased from the executable boundary"),
             })?;
         if let Some(logical_output_index) = state.output_index() {
-            let output_type = global_output_types.get(logical_output_index).ok_or_else(|| {
-                LoweringError::InvalidReferenceStateAbi {
+            let output_type =
+                global_output_types.get(logical_output_index).ok_or_else(|| Error::InvalidReferenceStateAbi {
                     message: format!("logical output index {logical_output_index} is out of range"),
-                }
-            })?;
-            let physical_output_index = signature.output_mapping()[logical_output_index].ok_or_else(|| {
-                LoweringError::InvalidReferenceStateAbi {
+                })?;
+            let physical_output_index =
+                signature.output_mapping()[logical_output_index].ok_or_else(|| Error::InvalidReferenceStateAbi {
                     message: format!(
                         "logical state output {logical_output_index} is erased from the executable boundary",
                     ),
-                }
-            })?;
+                })?;
             if input_type.static_shape().is_none() || output_type.static_shape().is_none() {
-                return Err(LoweringError::InvalidReferenceStateAbi {
+                return Err(Error::InvalidReferenceStateAbi {
                     message: format!(
                         "state input {logical_input_index} and output {logical_output_index} must be static because \
                          bounded-dynamic mutation alias compatibility is unsupported",
@@ -1327,7 +1200,7 @@ where
                 });
             }
             if input_type.memory() != Memory::Device || output_type.memory() != Memory::Device {
-                return Err(LoweringError::InvalidReferenceStateAbi {
+                return Err(Error::InvalidReferenceStateAbi {
                     message: format!(
                         "state input {logical_input_index} and output {logical_output_index} must use device \
                          memory",
@@ -1335,7 +1208,7 @@ where
                 });
             }
             if input_type != output_type {
-                return Err(LoweringError::InvalidReferenceStateAbi {
+                return Err(Error::InvalidReferenceStateAbi {
                     message: format!(
                         "state input {logical_input_index} type `{input_type}` is incompatible with output \
                          {logical_output_index} type `{output_type}`",
@@ -1346,7 +1219,7 @@ where
                 (Some(argument_shardings), Some(result_shardings))
                     if argument_shardings[logical_input_index] != result_shardings[logical_output_index] =>
                 {
-                    return Err(LoweringError::InvalidReferenceStateAbi {
+                    return Err(Error::InvalidReferenceStateAbi {
                         message: format!(
                             "state input {logical_input_index} and output {logical_output_index} must use the same \
                              sharding",
@@ -1354,7 +1227,7 @@ where
                     });
                 }
                 (Some(_), None) | (None, Some(_)) => {
-                    return Err(LoweringError::InvalidReferenceStateAbi {
+                    return Err(Error::InvalidReferenceStateAbi {
                         message:
                             "reference-state aliases require both argument and result sharding metadata or neither"
                                 .to_string(),
@@ -1363,7 +1236,7 @@ where
                 _ => {}
             }
             if !aliased_outputs.insert(physical_output_index) {
-                return Err(LoweringError::InvalidReferenceStateAbi {
+                return Err(Error::InvalidReferenceStateAbi {
                     message: "reference-state aliases must be injective".to_string(),
                 });
             }
@@ -1523,7 +1396,7 @@ where
                 attributes.insert("mhlo.layout_mode".into(), layout);
             }
             let attributes = (!attributes.is_empty()).then_some(attributes);
-            Ok::<_, LoweringError>(TypeAndAttributes { r#type: tensor_type.as_ref(), attributes })
+            Ok::<_, Error>(TypeAndAttributes { r#type: tensor_type.as_ref(), attributes })
         })
         .collect::<Result<Vec<_>, _>>()?;
     let function_results = physical_output_tensor_types
@@ -1546,7 +1419,7 @@ where
                 attributes.insert("mhlo.layout_mode".into(), layout);
             }
             let attributes = (!attributes.is_empty()).then_some(attributes);
-            Ok::<_, LoweringError>(TypeAndAttributes { r#type: tensor_type.as_ref(), attributes })
+            Ok::<_, Error>(TypeAndAttributes { r#type: tensor_type.as_ref(), attributes })
         })
         .collect::<Result<Vec<_>, _>>()?;
 
@@ -1692,7 +1565,7 @@ where
 
     remove_unused_constants(&module)?;
     if !module.verify()? {
-        return Err(LoweringError::MlirVerificationFailure);
+        return Err(Error::MlirVerificationFailure);
     }
     // Preserve the source effect classification explicitly. Persistent cache loads no longer have the core program
     // available, and scanning rendered StableHLO for a target name would be a brittle substitute for typed metadata.
@@ -1724,7 +1597,7 @@ pub(crate) trait MlirLowerableValue: Value<Type = ArrayType> + 'static {
         &self,
         tensor_type: ryft_mlir::TensorTypeRef<'c, 't>,
         context: &'c MlirContext<'t>,
-    ) -> Result<DenseElementsAttributeRef<'c, 't>, LoweringError>;
+    ) -> Result<DenseElementsAttributeRef<'c, 't>, Error>;
 
     /// Lowers this program constant inside a function body.
     #[inline]
@@ -1734,7 +1607,7 @@ pub(crate) trait MlirLowerableValue: Value<Type = ArrayType> + 'static {
         block: &mut B,
         context: &'c MlirContext<'t>,
         location: L,
-    ) -> Result<ValueRef<'b, 'c, 't>, LoweringError>
+    ) -> Result<ValueRef<'b, 'c, 't>, Error>
     where
         B: Block<'b, 'c, 't>,
         L: Copy + Location<'c, 't>,
@@ -1748,9 +1621,9 @@ impl MlirLowerableValue for XlaArrayConstant {
         &self,
         tensor_type: ryft_mlir::TensorTypeRef<'c, 't>,
         context: &'c MlirContext<'t>,
-    ) -> Result<DenseElementsAttributeRef<'c, 't>, LoweringError> {
+    ) -> Result<DenseElementsAttributeRef<'c, 't>, Error> {
         match self {
-            Self::Captured(value) => Err(LoweringError::MissingCapturedConstant { index: value.index() }),
+            Self::Captured(value) => Err(Error::MissingCapturedConstant { index: value.index() }),
             Self::Boolean(value) => Array::scalar(*value)?.to_dense_elements_attribute(tensor_type, context),
         }
     }
@@ -1761,7 +1634,7 @@ impl MlirLowerableValue for XlaArrayConstant {
         block: &mut B,
         context: &'c MlirContext<'t>,
         location: L,
-    ) -> Result<ValueRef<'b, 'c, 't>, LoweringError>
+    ) -> Result<ValueRef<'b, 'c, 't>, Error>
     where
         B: Block<'b, 'c, 't>,
         L: Copy + Location<'c, 't>,
@@ -1781,8 +1654,8 @@ impl MlirLowerableValue for ArrayType {
         &self,
         _tensor_type: ryft_mlir::TensorTypeRef<'c, 't>,
         _context: &'c MlirContext<'t>,
-    ) -> Result<DenseElementsAttributeRef<'c, 't>, LoweringError> {
-        Err(LoweringError::AbstractValueLiteral { array_type: self.clone() })
+    ) -> Result<DenseElementsAttributeRef<'c, 't>, Error> {
+        Err(Error::AbstractValueLiteral { array_type: self.clone() })
     }
 }
 
@@ -1792,13 +1665,13 @@ impl MlirLowerableValue for Array {
         &self,
         tensor_type: ryft_mlir::TensorTypeRef<'c, 't>,
         context: &'c MlirContext<'t>,
-    ) -> Result<DenseElementsAttributeRef<'c, 't>, LoweringError> {
+    ) -> Result<DenseElementsAttributeRef<'c, 't>, Error> {
         let data_type = self.r#type().data_type();
         if data_type == DataType::Zero {
             return types::lower_f64_scalar_elements_attribute(data_type, tensor_type, 0.0, context);
         }
         if data_type == DataType::Token {
-            return Err(LoweringError::UnsupportedDataType { data_type });
+            return Err(Error::UnsupportedDataType { data_type });
         }
 
         // Layout-free arrays already store values in MLIR's logical row-major order. Explicit layouts instead require
@@ -1834,14 +1707,14 @@ impl MlirLowerableValue for Array {
                     tensor_type,
                     bytes.iter().map(|value| value & 1 != 0).collect::<Vec<_>>().as_slice(),
                 )
-                .map_err(|_| LoweringError::InvalidDenseElementsAttribute { data_type })?
+                .map_err(|_| Error::InvalidDenseElementsAttribute { data_type })?
                 .cast::<DenseElementsAttributeRef>()
-                .ok_or(LoweringError::InvalidDenseElementsAttribute { data_type });
+                .ok_or(Error::InvalidDenseElementsAttribute { data_type });
         }
 
         context
             .dense_elements_attribute_from_raw_buffer(tensor_type, bytes.as_ref())
-            .map_err(|_| LoweringError::InvalidDenseElementsAttribute { data_type })
+            .map_err(|_| Error::InvalidDenseElementsAttribute { data_type })
     }
 }
 
@@ -1856,7 +1729,7 @@ pub(crate) fn to_mlir_module_for_plain_program<
 >(
     program: &Program<V, O, Input, Output>,
     function_name: S,
-) -> Result<String, LoweringError> {
+) -> Result<String, Error> {
     to_mlir_module_for_plain_program_with_ragged_dot_lowering_strategy(
         program,
         function_name,
@@ -1876,7 +1749,7 @@ pub(crate) fn to_mlir_module_for_plain_program_with_ragged_dot_lowering_strategy
     program: &Program<V, O, Input, Output>,
     function_name: S,
     ragged_dot_lowering_strategy: RaggedDotLoweringStrategy,
-) -> Result<String, LoweringError> {
+) -> Result<String, Error> {
     let function_name = normalize_function_name(function_name.as_ref())?;
     let context = MlirContext::new();
     let location = context.unknown_location();
@@ -1975,7 +1848,7 @@ pub(crate) fn to_mlir_module_for_plain_program_with_ragged_dot_lowering_strategy
 
     remove_unused_constants(&module)?;
     if !module.verify()? {
-        return Err(LoweringError::MlirVerificationFailure);
+        return Err(Error::MlirVerificationFailure);
     }
 
     serialize_lowered_module(&module, &collective_state)
@@ -1985,7 +1858,7 @@ pub(crate) fn to_mlir_module_for_plain_program_with_ragged_dot_lowering_strategy
 pub(crate) fn collect_nested_sharding_mesh<ProgramInput, ProgramOutput, O: LowerableOperationFamily>(
     program: &XlaProgram<ProgramInput, ProgramOutput, O>,
     existing: Option<LogicalMesh>,
-) -> Result<Option<LogicalMesh>, LoweringError>
+) -> Result<Option<LogicalMesh>, Error>
 where
     ProgramInput: Parameterized<XlaConstant>,
     ProgramOutput: Parameterized<XlaConstant>,
@@ -2068,18 +1941,18 @@ where
     Ok(mesh)
 }
 
-fn merge_logical_meshes(existing: &LogicalMesh, incoming: &LogicalMesh) -> Result<LogicalMesh, LoweringError> {
+fn merge_logical_meshes(existing: &LogicalMesh, incoming: &LogicalMesh) -> Result<LogicalMesh, Error> {
     let mut merged_axes = existing.axes().to_vec();
     for incoming_axis in incoming.axes() {
         match existing.axis_size(incoming_axis.name()) {
             Some(existing_size) if existing_size != incoming_axis.size() => {
-                return Err(LoweringError::IncompatibleNestedMeshes);
+                return Err(Error::IncompatibleNestedMeshes);
             }
             Some(_) => {}
             None => merged_axes.push(incoming_axis.clone()),
         }
     }
-    LogicalMesh::new(merged_axes).map_err(LoweringError::from)
+    LogicalMesh::new(merged_axes).map_err(Error::from)
 }
 
 /// Removes every `stablehlo.constant` operation whose result has no uses from `module`, including those in nested
@@ -2088,12 +1961,12 @@ fn merge_logical_meshes(existing: &LogicalMesh, incoming: &LogicalMesh) -> Resul
 /// often read them only for dynamic axes (e.g., the explicit-extent collectives only refine dynamic result axes), so a
 /// static extent would otherwise remain in the lowered module as a dead constant. Constants are pure, so removing an
 /// unused one never changes the semantics of the module.
-pub(crate) fn remove_unused_constants(module: &Module<'_, '_>) -> Result<(), LoweringError> {
+pub(crate) fn remove_unused_constants(module: &Module<'_, '_>) -> Result<(), Error> {
     remove_unused_constants_in_block(module.body()?)
 }
 
 /// Removes every unused `stablehlo.constant` operation from `block` and from the regions nested in its operations.
-fn remove_unused_constants_in_block<'b, 'c: 'b, 't: 'c>(block: BlockRef<'b, 'c, 't>) -> Result<(), LoweringError> {
+fn remove_unused_constants_in_block<'b, 'c: 'b, 't: 'c>(block: BlockRef<'b, 'c, 't>) -> Result<(), Error> {
     let mut unused_constants = Vec::new();
     for operation in block.operations()? {
         let operation = operation?;
@@ -2128,7 +2001,7 @@ pub(crate) fn lower_instruction<'b, 'c: 'b, 't: 'c, ProgramInput, ProgramOutput,
     nested_functions: Option<&Rc<JitCallFunctionMap<O>>>,
     collective_state: &CollectiveLoweringState,
     effect_tokens: &mut EffectTokens<'b, 'c, 't>,
-) -> Result<Vec<ValueRef<'b, 'c, 't>>, LoweringError>
+) -> Result<Vec<ValueRef<'b, 'c, 't>>, Error>
 where
     ProgramInput: Parameterized<XlaConstant>,
     ProgramOutput: Parameterized<XlaConstant>,
@@ -2169,10 +2042,10 @@ where
 }
 
 /// Normalizes a user-provided MLIR symbol name.
-pub(crate) fn normalize_function_name(function_name: &str) -> Result<String, LoweringError> {
+pub(crate) fn normalize_function_name(function_name: &str) -> Result<String, Error> {
     let function_name = function_name.trim();
     if function_name.is_empty() || function_name.chars().any(char::is_whitespace) {
-        return Err(LoweringError::InvalidFunctionName { function_name: function_name.to_string() });
+        return Err(Error::InvalidFunctionName { function_name: function_name.to_string() });
     }
     Ok(function_name.strip_prefix('@').unwrap_or(function_name).to_string())
 }

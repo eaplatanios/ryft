@@ -19,7 +19,7 @@ use crate::operations::assertions::{
     ASSERT_ACTOR_ATTRIBUTE, ASSERT_DETAIL_ATTRIBUTE, ASSERT_DYNAMIC_SHAPE_SLICE_KIND, ASSERT_KIND_ATTRIBUTE,
     lower_assertion_custom_call, lower_deliberately_false_assertion_predicate,
 };
-use crate::{LowerableOperation, LowerableOperationFamily, LoweringError, XlaLowerer};
+use crate::{Error, LowerableOperation, LowerableOperationFamily, XlaLowerer};
 
 /// Normalizes scalar slice starts against logical input dimensions before native allocation-based clamping. Signed
 /// starts count from the end of their axis once when `allow_negative_indices` is set, unsigned indices are widened
@@ -34,7 +34,7 @@ pub(crate) fn lower_slice_start_indices<'b, 'c: 'b, 't: 'c>(
     block: &mut BlockRef<'b, 'c, 't>,
     context: &'c MlirContext<'t>,
     location: LocationRef<'c, 't>,
-) -> Result<Vec<ValueRef<'b, 'c, 't>>, LoweringError> {
+) -> Result<Vec<ValueRef<'b, 'c, 't>>, Error> {
     check_count!("input", starts, input_type.rank(), ProgramError);
     check_count!("input", start_types, input_type.rank(), ProgramError);
     check_count!("input", sizes, input_type.rank(), ProgramError);
@@ -180,7 +180,7 @@ pub(crate) fn lower_slice_to_mlir<'b, 'c: 'b, 't: 'c>(
     block: &mut BlockRef<'b, 'c, 't>,
     context: &'c MlirContext<'t>,
     location: LocationRef<'c, 't>,
-) -> Result<Vec<ValueRef<'b, 'c, 't>>, LoweringError> {
+) -> Result<Vec<ValueRef<'b, 'c, 't>>, Error> {
     check_count!("input", input_values, 1, ProgramError);
     check_count!("input", input_types, 1, ProgramError);
     check_count!("output", output_types, 1, ProgramError);
@@ -208,7 +208,7 @@ pub(crate) fn lower_slice_to_mlir<'b, 'c: 'b, 't: 'c>(
         let extent = reshape_dimension_i32(dimension.value().unwrap())?;
         let elements = context
             .dense_i32_elements_attribute(size_type, &[extent])
-            .map_err(|_| LoweringError::InvalidDenseElementsAttribute { data_type: DataType::I32 })?;
+            .map_err(|_| Error::InvalidDenseElementsAttribute { data_type: DataType::I32 })?;
         let size = block.append_operation(stable_hlo::constant(elements, location)?)?.result(0).unwrap().as_ref();
         physical_dimensions[axis] = dimension.clone();
         let physical_type = input_type.clone().with_shape(Shape::new(physical_dimensions.clone()));
@@ -253,7 +253,7 @@ pub(crate) fn lower_dynamic_slice_assertion<'b, 'c: 'b, 't: 'c>(
     block: &mut BlockRef<'b, 'c, 't>,
     context: &'c MlirContext<'t>,
     location: LocationRef<'c, 't>,
-) -> Result<(), LoweringError> {
+) -> Result<(), Error> {
     let predicate = lower_deliberately_false_assertion_predicate(start, block, context, location)?;
     let detail = format!("{axis}:{stride}");
     let backend_config = context.dictionary_attribute(&[
@@ -298,9 +298,9 @@ pub(crate) fn plan_dynamic_slice_axis(
     input_dimension: &Dimension,
     start_type: &DimensionType,
     size_type: &DimensionType,
-) -> Result<DynamicSliceAxisPlan, LoweringError> {
+) -> Result<DynamicSliceAxisPlan, Error> {
     let Some(size_upper) = size_type.bounds().upper() else {
-        return Err(LoweringError::UnsupportedOp {
+        return Err(Error::UnsupportedOperation {
             op: format!("{DYNAMIC_SLICE_OPERATION_NAME} size on axis {axis} needs a finite upper bound",),
         });
     };
@@ -309,7 +309,7 @@ pub(crate) fn plan_dynamic_slice_axis(
         0
     } else {
         (size - 1).checked_mul(stride).and_then(|size| size.checked_add(1)).ok_or_else(|| {
-            LoweringError::UnsupportedOp {
+            Error::UnsupportedOperation {
                 op: format!("{DYNAMIC_SLICE_OPERATION_NAME} physical span overflows on axis {axis}"),
             }
         })?
@@ -318,14 +318,14 @@ pub(crate) fn plan_dynamic_slice_axis(
         Dimension::Static(extent) => (*extent, *extent),
         Dimension::Dynamic(variable) => {
             let Some(upper) = variable.bounds().upper() else {
-                return Err(LoweringError::UnsupportedOp {
+                return Err(Error::UnsupportedOperation {
                     op: format!("{DYNAMIC_SLICE_OPERATION_NAME} input on axis {axis} needs a finite upper bound",),
                 });
             };
             (variable.bounds().lower(), upper - 1)
         }
     };
-    let padded_size = input_physical_size.checked_add(span).ok_or_else(|| LoweringError::UnsupportedOp {
+    let padded_size = input_physical_size.checked_add(span).ok_or_else(|| Error::UnsupportedOperation {
         op: format!("{DYNAMIC_SLICE_OPERATION_NAME} padded input size overflows on axis {axis}"),
     })?;
     reshape_dimension_i32(padded_size)?;
@@ -345,7 +345,7 @@ impl LowerableOperation for SliceOperation {
         input_values: &[ValueRef<'b, 'c, 't>],
         input_types: &[ArrayType],
         output_types: &[ArrayType],
-    ) -> Result<Vec<ValueRef<'b, 'c, 't>>, LoweringError> {
+    ) -> Result<Vec<ValueRef<'b, 'c, 't>>, Error> {
         lower_slice_to_mlir(
             self,
             input_values,
@@ -365,7 +365,7 @@ impl LowerableOperation for UpdateSliceOperation {
         input_values: &[ValueRef<'b, 'c, 't>],
         _input_types: &[ArrayType],
         output_types: &[ArrayType],
-    ) -> Result<Vec<ValueRef<'b, 'c, 't>>, LoweringError> {
+    ) -> Result<Vec<ValueRef<'b, 'c, 't>>, Error> {
         check_count!("input", input_values, 2, ProgramError);
         check_count!("output", output_types, 1, ProgramError);
         let index_values =
@@ -387,7 +387,7 @@ impl LowerableOperation for DynamicSliceOperation {
         input_values: &[ValueRef<'b, 'c, 't>],
         input_types: &[ArrayType],
         output_types: &[ArrayType],
-    ) -> Result<Vec<ValueRef<'b, 'c, 't>>, LoweringError> {
+    ) -> Result<Vec<ValueRef<'b, 'c, 't>>, Error> {
         check_count!("input", input_values, self.sizes().len() + 1, ProgramError);
         check_count!("input", input_types, self.sizes().len() + 1, ProgramError);
         check_count!("output", output_types, 1, ProgramError);
@@ -419,7 +419,7 @@ impl LowerableOperation for DynamicUpdateSliceOperation {
         input_values: &[ValueRef<'b, 'c, 't>],
         input_types: &[ArrayType],
         output_types: &[ArrayType],
-    ) -> Result<Vec<ValueRef<'b, 'c, 't>>, LoweringError> {
+    ) -> Result<Vec<ValueRef<'b, 'c, 't>>, Error> {
         check_count!("output", output_types, 1, ProgramError);
         check_count!("input", input_values, output_types[0].rank() + 2, ProgramError);
         check_count!("input", input_types, output_types[0].rank() + 2, ProgramError);
@@ -452,7 +452,7 @@ impl LowerableOperation for DynamicSliceOperation<ArrayIrType> {
         input_values: &[ValueRef<'b, 'c, 't>],
         input_types: &[ArrayIrType],
         output_types: &[ArrayIrType],
-    ) -> Result<Vec<ValueRef<'b, 'c, 't>>, LoweringError> {
+    ) -> Result<Vec<ValueRef<'b, 'c, 't>>, Error> {
         let context = lowerer.context;
         let location = lowerer.location;
         let effect_tokens = &mut lowerer.effect_tokens;
@@ -460,12 +460,11 @@ impl LowerableOperation for DynamicSliceOperation<ArrayIrType> {
         let Some((input, bounds)) = input_values.split_first() else {
             return Err(ProgramError::InvalidInputCount { expected: 1, actual: 0 }.into());
         };
-        let input_type =
-            <&ArrayType>::try_from(&input_types[0]).map_err(|error| LoweringError::Tracing(error.into()))?;
+        let input_type = <&ArrayType>::try_from(&input_types[0])?;
         let [output_type] = output_types else {
             return Err(ProgramError::InvalidOutputCount { expected: 1, actual: output_types.len() }.into());
         };
-        let output_type = <&ArrayType>::try_from(output_type).map_err(|error| LoweringError::Tracing(error.into()))?;
+        let output_type = <&ArrayType>::try_from(output_type)?;
         let rank = output_type.rank();
         if bounds.len() != 2 * rank {
             return Err(ProgramError::InvalidInputCount { expected: 1 + 2 * rank, actual: input_values.len() }.into());
@@ -477,10 +476,8 @@ impl LowerableOperation for DynamicSliceOperation<ArrayIrType> {
         let mut physical_sizes = Vec::with_capacity(rank);
         let mut physical_spans = Vec::with_capacity(rank);
         for axis in 0..rank {
-            let start_type =
-                <&DimensionType>::try_from(&start_types[axis]).map_err(|error| LoweringError::Tracing(error.into()))?;
-            let size_type =
-                <&DimensionType>::try_from(&size_types[axis]).map_err(|error| LoweringError::Tracing(error.into()))?;
+            let start_type = <&DimensionType>::try_from(&start_types[axis])?;
+            let size_type = <&DimensionType>::try_from(&size_types[axis])?;
             // Clamping is relative to the logical span, not the larger physical allocation window.
             // Normalize once and reuse the same origin for validation and extraction.
             let zero_start = DimensionType::new("start", DimensionBounds::new(0, Some(1)).unwrap());
@@ -596,7 +593,7 @@ impl LowerableOperation for DynamicSliceOperation<ArrayIrType> {
 
         let i32_scalar_type = context
             .tensor_type(context.signless_integer_type(32), &[], None, location)
-            .map_err(|_| LoweringError::InvalidTensorType { array_type: ArrayType::scalar(DataType::I32) })?;
+            .map_err(|_| Error::InvalidTensorType { array_type: ArrayType::scalar(DataType::I32) })?;
         let mut refined_type = output_type
             .clone()
             .with_shape(Shape::new(physical_sizes.iter().copied().map(Dimension::Static).collect()));
@@ -1188,8 +1185,8 @@ mod tests {
     }
 
     /// Extracts the unsupported-operation diagnostic produced by the physical slice planner.
-    fn unsupported_operation(error: LoweringError) -> String {
-        let LoweringError::UnsupportedOp { op } = error else {
+    fn unsupported_operation(error: Error) -> String {
+        let Error::UnsupportedOperation { op } = error else {
             panic!("expected an unsupported-operation error but received {error}");
         };
         op
@@ -1200,27 +1197,26 @@ mod tests {
         let size = DimensionVariable::new("size", DimensionBounds::non_negative(Some(5)).unwrap());
         let output_type = ArrayType::new(DataType::C64, Shape::new(vec![size.into(), 2.into()]));
         assert_eq!(
-            dynamic_constructor_types("one_like", 1, &[output_type.clone().into()]),
-            Ok((output_type, ArrayType::new_static(DataType::C64, [4, 2])))
+            dynamic_constructor_types("one_like", 1, &[output_type.clone().into()]).unwrap(),
+            (output_type, ArrayType::new_static(DataType::C64, [4, 2])),
         );
 
         let size = DimensionVariable::new("size", DimensionBounds::unbounded());
         let output_type = ArrayType::new(DataType::F32, Shape::new(vec![size.into()]));
-        assert_eq!(
+        assert!(matches!(
             dynamic_constructor_types("zero_like", 1, &[output_type.into()]),
-            Err(LoweringError::UnsupportedOp {
-                op: "zero_like output dimension `size` needs a finite upper bound for physical buffer allocation"
-                    .to_string()
-            })
-        );
+            Err(Error::UnsupportedOperation { op })
+                if op == "zero_like output dimension `size` needs a finite upper bound for physical buffer allocation",
+        ));
 
         let bound = i32::MAX as usize + 1;
         let size = DimensionVariable::new("size", DimensionBounds::non_negative(Some(bound + 1)).unwrap());
         let output_type = ArrayType::new(DataType::F32, Shape::new(vec![size.into()]));
-        assert_eq!(
+        assert!(matches!(
             dynamic_constructor_types("one_like", 1, &[output_type.into()]),
-            Err(LoweringError::DynamicDimensionOutOfRange { value: bound })
-        );
+            Err(Error::DynamicDimensionOutOfRange { value })
+                if value == bound,
+        ));
     }
 
     #[test]

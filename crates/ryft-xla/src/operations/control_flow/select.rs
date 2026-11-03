@@ -12,7 +12,7 @@ use crate::experimental::lowering::types::{
 };
 use crate::operations::constants::lower_layout_constraint;
 use crate::operations::normalize_elementwise_operand;
-use crate::{LowerableOperation, LowerableOperationFamily, LoweringError, XlaLowerer};
+use crate::{Error, LowerableOperation, LowerableOperationFamily, XlaLowerer};
 
 /// Normalizes a select condition and both branches to the exact tensor descriptors required by StableHLO.
 pub(crate) fn normalize_select_operands<'b, 'c: 'b, 't: 'c, B, L>(
@@ -22,7 +22,7 @@ pub(crate) fn normalize_select_operands<'b, 'c: 'b, 't: 'c, B, L>(
     block: &mut B,
     context: &'c MlirContext<'t>,
     location: L,
-) -> Result<[ValueRef<'b, 'c, 't>; 3], LoweringError>
+) -> Result<[ValueRef<'b, 'c, 't>; 3], Error>
 where
     B: Block<'b, 'c, 't>,
     L: Copy + Location<'c, 't>,
@@ -53,7 +53,7 @@ where
                 (input_type.shape().dimensions().get(input_axis) == Some(dimension))
                     .then_some((input_values[index], input_axis))
             });
-            sources[output_axis] = source.ok_or_else(|| LoweringError::UnsupportedOp {
+            sources[output_axis] = source.ok_or_else(|| Error::UnsupportedOperation {
                 op: format!("cannot recover select output axis {output_axis} extent from its inputs"),
             })?;
         }
@@ -85,7 +85,7 @@ where
             )?;
             let physical_type = physical_bound_type(&target_type)?;
             let first_axis =
-                target_type.rank().checked_sub(converted_type.rank()).ok_or_else(|| LoweringError::UnsupportedOp {
+                target_type.rank().checked_sub(converted_type.rank()).ok_or_else(|| Error::UnsupportedOperation {
                     op: format!(
                         "cannot broadcast rank-{} select input to rank-{} output",
                         converted_type.rank(),
@@ -127,7 +127,7 @@ impl LowerableOperation for SelectOperation<ArrayType> {
         input_values: &[ValueRef<'b, 'c, 't>],
         input_types: &[ArrayType],
         output_types: &[ArrayType],
-    ) -> Result<Vec<ValueRef<'b, 'c, 't>>, LoweringError> {
+    ) -> Result<Vec<ValueRef<'b, 'c, 't>>, Error> {
         let [condition, on_true, on_false] = normalize_select_operands(
             input_values,
             input_types,
@@ -200,26 +200,26 @@ mod tests {
         // Scalar branches inherit both logical extents from a matrix condition, and a scalar condition inherits
         // them from a matrix branch. Capacity padding must not appear in either selected result.
         assert_eq!(
-            execute_mixed_program(&client, &program, &inputs, &[2, 2]),
-            Ok(vec![
+            execute_mixed_program(&client, &program, &inputs, &[2, 2]).unwrap(),
+            vec![
                 MixedValue::Array(vec![5., -7., -7., 5.], vec![2, 2]),
                 MixedValue::Array(vec![1., -8., -9., 4.], vec![2, 2]),
                 MixedValue::Dimension(2),
                 MixedValue::Dimension(2),
                 MixedValue::Dimension(2),
                 MixedValue::Dimension(2),
-            ]),
+            ],
         );
         assert_eq!(
-            execute_mixed_program(&client, &program, &inputs, &[0, 2]),
-            Ok(vec![
+            execute_mixed_program(&client, &program, &inputs, &[0, 2]).unwrap(),
+            vec![
                 MixedValue::Array(Vec::new(), vec![0, 2]),
                 MixedValue::Array(Vec::new(), vec![0, 2]),
                 MixedValue::Dimension(0),
                 MixedValue::Dimension(2),
                 MixedValue::Dimension(0),
                 MixedValue::Dimension(2),
-            ]),
+            ],
         );
     }
 
@@ -259,16 +259,16 @@ mod tests {
         // No input has the output shape: the row extent comes from the condition and the column extent from
         // the true branch. Both stretched inputs must broadcast their bounded storage before restoring sizes.
         assert_eq!(
-            execute_mixed_program(&client, &program, &inputs, &[2, 3]),
-            Ok(vec![
+            execute_mixed_program(&client, &program, &inputs, &[2, 3]).unwrap(),
+            vec![
                 MixedValue::Array(vec![10., 20., 30., -7., -7., -7.], vec![2, 3]),
                 MixedValue::Dimension(2),
                 MixedValue::Dimension(3),
-            ]),
+            ],
         );
         assert_eq!(
-            execute_mixed_program(&client, &program, &inputs, &[2, 0]),
-            Ok(vec![MixedValue::Array(Vec::new(), vec![2, 0]), MixedValue::Dimension(2), MixedValue::Dimension(0),]),
+            execute_mixed_program(&client, &program, &inputs, &[2, 0]).unwrap(),
+            vec![MixedValue::Array(Vec::new(), vec![2, 0]), MixedValue::Dimension(2), MixedValue::Dimension(0),],
         );
     }
 }

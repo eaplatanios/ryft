@@ -10,11 +10,11 @@ use ryft_mlir::{
     Value as MlirValue, ValueRef,
 };
 
-use crate::ToPjrt;
-use crate::experimental::lowering::{LoweringError, MlirLowerableValue};
+use crate::experimental::lowering::MlirLowerableValue;
 use crate::experimental::ops::{XlaArrayConstant, XlaConstant};
 use crate::operations::comparisons::lower_compare_to_mlir;
 use crate::operations::manipulation::memory::annotate_output_memory;
+use crate::{Error, ToPjrt};
 
 /// Widens a logical signed one-bit integer to `i8`, recovering `-1` from StableHLO's predicate carrier.
 pub(crate) fn lower_signed_one_bit_to_mlir<'b, 'c: 'b, 't: 'c, B, L>(
@@ -22,7 +22,7 @@ pub(crate) fn lower_signed_one_bit_to_mlir<'b, 'c: 'b, 't: 'c, B, L>(
     block: &mut B,
     context: &'c MlirContext<'t>,
     location: L,
-) -> Result<ValueRef<'b, 'c, 't>, LoweringError>
+) -> Result<ValueRef<'b, 'c, 't>, Error>
 where
     B: Block<'b, 'c, 't>,
     L: Copy + Location<'c, 't>,
@@ -43,7 +43,7 @@ pub(crate) fn lower_runtime_dimension_size_i64<'b, 'c: 'b, 't: 'c>(
     block: &mut BlockRef<'b, 'c, 't>,
     context: &'c MlirContext<'t>,
     location: LocationRef<'c, 't>,
-) -> Result<ValueRef<'b, 'c, 't>, LoweringError> {
+) -> Result<ValueRef<'b, 'c, 't>, Error> {
     let size = block.append_operation(stable_hlo::get_dimension_size(input, axis, location)?)?;
     let size = size.result(0).expect("stablehlo.get_dimension_size should return one result").as_ref();
     let i64_scalar = context.tensor_type(context.signless_integer_type(64), &[], None, location)?;
@@ -52,7 +52,7 @@ pub(crate) fn lower_runtime_dimension_size_i64<'b, 'c: 'b, 't: 'c>(
 }
 
 /// Returns the statically shaped physical-bound carrier type of one bounded dynamic array type.
-pub(crate) fn physical_bound_type(r#type: &ArrayType) -> Result<ArrayType, LoweringError> {
+pub(crate) fn physical_bound_type(r#type: &ArrayType) -> Result<ArrayType, Error> {
     let dimensions = r#type
         .shape()
         .dimensions()
@@ -61,13 +61,13 @@ pub(crate) fn physical_bound_type(r#type: &ArrayType) -> Result<ArrayType, Lower
             Dimension::Static(extent) => Ok(Dimension::Static(*extent)),
             Dimension::Dynamic(variable) => {
                 variable.bounds().upper().and_then(|upper| upper.checked_sub(1)).map(Dimension::Static).ok_or_else(
-                    || LoweringError::UnsupportedOp {
+                    || Error::UnsupportedOperation {
                         op: format!("dynamic dimension {variable} needs a finite positive physical bound"),
                     },
                 )
             }
         })
-        .collect::<Result<Vec<_>, LoweringError>>()?;
+        .collect::<Result<Vec<_>, Error>>()?;
     Ok(r#type.clone().with_shape(Shape::new(dimensions)))
 }
 
@@ -80,7 +80,7 @@ pub(crate) fn lower_physical_bound_value<'b, 'c: 'b, 't: 'c>(
     block: &mut BlockRef<'b, 'c, 't>,
     context: &'c MlirContext<'t>,
     location: LocationRef<'c, 't>,
-) -> Result<ValueRef<'b, 'c, 't>, LoweringError> {
+) -> Result<ValueRef<'b, 'c, 't>, Error> {
     lower_physical_bound_value_with_padding(value, r#type, padding_value, None, block, context, location)
 }
 
@@ -94,7 +94,7 @@ pub(crate) fn lower_physical_bound_value_with_padding<'b, 'c: 'b, 't: 'c>(
     block: &mut BlockRef<'b, 'c, 't>,
     context: &'c MlirContext<'t>,
     location: LocationRef<'c, 't>,
-) -> Result<ValueRef<'b, 'c, 't>, LoweringError> {
+) -> Result<ValueRef<'b, 'c, 't>, Error> {
     if r#type.static_shape().is_some() {
         return Ok(value);
     }
@@ -110,7 +110,7 @@ pub(crate) fn lower_physical_bound_value_with_padding<'b, 'c: 'b, 't: 'c>(
             let size = block.append_operation(stable_hlo::get_dimension_size(value, axis, location)?)?;
             Ok(Some(size.result(0).expect("stablehlo.get_dimension_size should return one result").as_ref()))
         })
-        .collect::<Result<Vec<_>, LoweringError>>()?;
+        .collect::<Result<Vec<_>, Error>>()?;
     let physical_type = physical_bound_type(r#type)?;
     let size_type = lower_tensor_type(&ArrayType::scalar(DataType::I32), context, location)?;
     let mut data = value;
@@ -123,7 +123,7 @@ pub(crate) fn lower_physical_bound_value_with_padding<'b, 'c: 'b, 't: 'c>(
         let extent = reshape_dimension_i32(physical_extent)?;
         let elements = context
             .dense_i32_elements_attribute(size_type, &[extent])
-            .map_err(|_| LoweringError::InvalidDenseElementsAttribute { data_type: DataType::I32 })?;
+            .map_err(|_| Error::InvalidDenseElementsAttribute { data_type: DataType::I32 })?;
         let size = block.append_operation(stable_hlo::constant(elements, location)?)?;
         let size = size.result(0).expect("stablehlo.constant should return one result").as_ref();
         physicalized_dimensions[axis] = Dimension::Static(physical_extent);
@@ -193,7 +193,7 @@ pub(crate) fn lower_restore_dynamic_dimensions<'b, 'c: 'b, 't: 'c>(
     block: &mut BlockRef<'b, 'c, 't>,
     context: &'c MlirContext<'t>,
     location: LocationRef<'c, 't>,
-) -> Result<ValueRef<'b, 'c, 't>, LoweringError> {
+) -> Result<ValueRef<'b, 'c, 't>, Error> {
     if sources.len() != output_type.rank() {
         return Err(ProgramError::InvalidInputCount { expected: output_type.rank(), actual: sources.len() }.into());
     }
@@ -229,7 +229,7 @@ pub(crate) fn lower_physical_storage<'b, 'c: 'b, 't: 'c>(
     block: &mut BlockRef<'b, 'c, 't>,
     context: &'c MlirContext<'t>,
     location: LocationRef<'c, 't>,
-) -> Result<ValueRef<'b, 'c, 't>, LoweringError> {
+) -> Result<ValueRef<'b, 'c, 't>, Error> {
     let physical_type = physical_bound_type(r#type)?;
     let mut dimensions = r#type.shape().dimensions().to_vec();
     let mut value = value;
@@ -261,13 +261,13 @@ pub(crate) fn lower_physical_storage<'b, 'c: 'b, 't: 'c>(
 }
 
 /// Converts one Ryft reshape dimension to StableHLO's signed shape element type.
-pub(crate) fn reshape_dimension_i64(value: usize) -> Result<i64, LoweringError> {
-    i64::try_from(value).map_err(|_| LoweringError::ReshapeDimensionOutOfRange { value, bit_width: 64 })
+pub(crate) fn reshape_dimension_i64(value: usize) -> Result<i64, Error> {
+    i64::try_from(value).map_err(|_| Error::ReshapeDimensionOutOfRange { value, bit_width: 64 })
 }
 
 /// Converts one Ryft reshape dimension to the signed shape element type required by dynamic StableHLO reshape.
-pub(crate) fn reshape_dimension_i32(value: usize) -> Result<i32, LoweringError> {
-    i32::try_from(value).map_err(|_| LoweringError::ReshapeDimensionOutOfRange { value, bit_width: 32 })
+pub(crate) fn reshape_dimension_i32(value: usize) -> Result<i32, Error> {
+    i32::try_from(value).map_err(|_| Error::ReshapeDimensionOutOfRange { value, bit_width: 32 })
 }
 
 /// Lowers static start indices to scalar `i64` StableHLO constants, as consumed by the index operands of
@@ -278,11 +278,11 @@ pub(crate) fn lower_static_index_constants<'b, 'c: 'b, 't: 'c, B: Block<'b, 'c, 
     block: &mut B,
     context: &'c MlirContext<'t>,
     location: L,
-) -> Result<Vec<ValueRef<'b, 'c, 't>>, LoweringError> {
+) -> Result<Vec<ValueRef<'b, 'c, 't>>, Error> {
     let element_type = lower_element_type(DataType::I64, context)?;
     let tensor_type = context
         .tensor_type(element_type, &[], None, location)
-        .map_err(|_| LoweringError::InvalidTensorType { array_type: ArrayType::scalar(DataType::I64) })?;
+        .map_err(|_| Error::InvalidTensorType { array_type: ArrayType::scalar(DataType::I64) })?;
     start_indices
         .iter()
         .map(|index| {
@@ -299,7 +299,7 @@ pub(crate) fn lower_unplaced_constant_output<'b, 'c: 'b, 't: 'c, B: Block<'b, 'c
     block: &mut B,
     context: &'c MlirContext<'t>,
     location: L,
-) -> Result<Vec<ValueRef<'b, 'c, 't>>, LoweringError> {
+) -> Result<Vec<ValueRef<'b, 'c, 't>>, Error> {
     check_count!("output", output_types, 1, ProgramError);
     let output_type = &output_types[0];
     let tensor_type = lower_tensor_type(output_type, context, location)?;
@@ -353,21 +353,21 @@ pub(crate) fn lower_constant_output<'b, 'c: 'b, 't: 'c, B: Block<'b, 'c, 't>, L:
     block: &mut B,
     context: &'c MlirContext<'t>,
     location: L,
-) -> Result<Vec<ValueRef<'b, 'c, 't>>, LoweringError> {
+) -> Result<Vec<ValueRef<'b, 'c, 't>>, Error> {
     let values = lower_unplaced_constant_output(output_types, integer_value, block, context, location)?;
     check_count!("output", output_types, 1, ProgramError);
     Ok(vec![annotate_output_memory(values[0], &output_types[0], block, context, location)?])
 }
 
 /// Returns the static dimensions for one tensor type.
-pub(crate) fn static_dimensions(array_type: &ArrayType) -> Result<Vec<usize>, LoweringError> {
+pub(crate) fn static_dimensions(array_type: &ArrayType) -> Result<Vec<usize>, Error> {
     array_type
         .shape()
         .dimensions()
         .iter()
         .map(|size| match size {
             Dimension::Static(value) => Ok(*value),
-            Dimension::Dynamic(_) => Err(LoweringError::InvalidTensorType { array_type: array_type.clone() }),
+            Dimension::Dynamic(_) => Err(Error::InvalidTensorType { array_type: array_type.clone() }),
         })
         .collect()
 }
@@ -378,7 +378,7 @@ pub(crate) fn lower_literal_value<'b, 'c: 'b, 't: 'c, B, V, L>(
     block: &mut B,
     context: &'c MlirContext<'t>,
     location: L,
-) -> Result<ValueRef<'b, 'c, 't>, LoweringError>
+) -> Result<ValueRef<'b, 'c, 't>, Error>
 where
     B: Block<'b, 'c, 't>,
     V: MlirLowerableValue,
@@ -396,11 +396,11 @@ where
 pub(crate) fn lower_captured_constant<'b, 'c: 'b, 't: 'c, T: RyftType>(
     value: &CaptureReference<T>,
     captured_values: &[ValueRef<'b, 'c, 't>],
-) -> Result<ValueRef<'b, 'c, 't>, LoweringError> {
+) -> Result<ValueRef<'b, 'c, 't>, Error> {
     captured_values
         .get(value.index())
         .copied()
-        .ok_or(LoweringError::MissingCapturedConstant { index: value.index() })
+        .ok_or(Error::MissingCapturedConstant { index: value.index() })
 }
 
 /// Lowers one first-class dimension extent to the scalar `i64` [`stablehlo.constant`](stable_hlo::constant) that
@@ -412,13 +412,13 @@ pub(crate) fn lower_dimension_extent<'b, 'c: 'b, 't: 'c, B, L>(
     block: &mut B,
     context: &'c MlirContext<'t>,
     location: L,
-) -> Result<ValueRef<'b, 'c, 't>, LoweringError>
+) -> Result<ValueRef<'b, 'c, 't>, Error>
 where
     B: Block<'b, 'c, 't>,
     L: Copy + Location<'c, 't>,
 {
     let tensor_type = lower_tensor_type(&ArrayType::scalar(DataType::I64), context, location)?;
-    let extent = i64::try_from(value.extent()).map_err(|_| LoweringError::UnsupportedOp {
+    let extent = i64::try_from(value.extent()).map_err(|_| Error::UnsupportedOperation {
         op: format!("first-class dimension extent {} does not fit in an i64", value.extent()),
     })?;
     let elements = lower_constant_elements_attribute(DataType::I64, tensor_type, extent, context)?;
@@ -436,7 +436,7 @@ pub(crate) fn lower_constant<'b, 'c: 'b, 't: 'c, B, L>(
     block: &mut B,
     context: &'c MlirContext<'t>,
     location: L,
-) -> Result<ValueRef<'b, 'c, 't>, LoweringError>
+) -> Result<ValueRef<'b, 'c, 't>, Error>
 where
     B: Block<'b, 'c, 't>,
     L: Copy + Location<'c, 't>,
@@ -458,7 +458,7 @@ fn lower_u64_constant_splat<'b, 'c: 'b, 't: 'c, B, L>(
     block: &mut B,
     context: &'c MlirContext<'t>,
     location: L,
-) -> Result<ValueRef<'b, 'c, 't>, LoweringError>
+) -> Result<ValueRef<'b, 'c, 't>, Error>
 where
     B: Block<'b, 'c, 't>,
     L: Copy + Location<'c, 't>,
@@ -466,7 +466,7 @@ where
     let scalar_tensor_type = lower_tensor_type(&ArrayType::scalar(DataType::U64), context, location)?;
     let attribute = context
         .dense_u64_elements_attribute(scalar_tensor_type, &[value])
-        .map_err(|_| LoweringError::InvalidDenseElementsAttribute { data_type: DataType::U64 })?;
+        .map_err(|_| Error::InvalidDenseElementsAttribute { data_type: DataType::U64 })?;
     let constant = block.append_operation(stable_hlo::constant(attribute, location)?)?;
     let constant = constant.result(0).expect("stablehlo.constant should return one result").as_ref();
     if output_type.shape().dimensions().is_empty() {
@@ -484,7 +484,7 @@ pub(crate) fn lower_u64_scalar_constant<'b, 'c: 'b, 't: 'c>(
     block: &mut BlockRef<'b, 'c, 't>,
     context: &'c MlirContext<'t>,
     location: LocationRef<'c, 't>,
-) -> Result<ValueRef<'b, 'c, 't>, LoweringError> {
+) -> Result<ValueRef<'b, 'c, 't>, Error> {
     let output_type = ArrayType::scalar(DataType::U64);
     let output_tensor_type = lower_tensor_type(&output_type, context, location)?;
     lower_u64_constant_splat(value, &output_type, output_tensor_type, block, context, location)
@@ -496,12 +496,12 @@ pub(crate) fn lower_boundary_layout<'c, 't>(
     array_type: &ArrayType,
     kind: &str,
     context: &'c MlirContext<'t>,
-) -> Result<Option<AttributeRef<'c, 't>>, LoweringError> {
+) -> Result<Option<AttributeRef<'c, 't>>, Error> {
     let Some(layout) = array_type.layout() else {
         return Ok(None);
     };
     let Layout::Tiled(tiled) = layout else {
-        return Err(LoweringError::UnsupportedOp { op: format!("strided {kind} layout `{layout}`") });
+        return Err(Error::UnsupportedOperation { op: format!("strided {kind} layout `{layout}`") });
     };
     // The pinned XLA SliceToDynamic emitter assumes row-major source/result layouts. Requesting a different
     // dynamic result layout can abort compilation rather than return an error.
@@ -509,7 +509,7 @@ pub(crate) fn lower_boundary_layout<'c, 't>(
         && array_type.static_shape().is_none()
         && !tiled.minor_to_major().iter().copied().eq((0..array_type.rank()).rev())
     {
-        return Err(LoweringError::UnsupportedOp {
+        return Err(Error::UnsupportedOperation {
             op: format!("non-row-major bounded-dynamic output layout `{layout}`"),
         });
     }
@@ -525,7 +525,7 @@ pub(crate) fn lower_tensor_type<'c, 't, L: Location<'c, 't>>(
     array_type: &ArrayType,
     context: &'c MlirContext<'t>,
     location: L,
-) -> Result<ryft_mlir::TensorTypeRef<'c, 't>, LoweringError> {
+) -> Result<ryft_mlir::TensorTypeRef<'c, 't>, Error> {
     let element_type = lower_element_type(array_type.data_type(), context)?;
     let dimensions = array_type
         .shape()
@@ -545,7 +545,7 @@ pub(crate) fn lower_tensor_type<'c, 't, L: Location<'c, 't>>(
         .map(|attribute| attribute.as_ref());
     context
         .tensor_type(element_type, dimensions.as_slice(), encoding, location)
-        .map_err(|_| LoweringError::InvalidTensorType { array_type: array_type.clone() })
+        .map_err(|_| Error::InvalidTensorType { array_type: array_type.clone() })
 }
 
 /// Converts a Ryft exclusive dynamic dimension bound to StableHLO's inclusive maximum dimension size.
@@ -560,9 +560,9 @@ pub(crate) fn stable_hlo_dynamic_dimension_bound(size: &Dimension) -> Option<usi
 pub(crate) fn lower_element_type<'c, 't>(
     data_type: DataType,
     context: &'c MlirContext<'t>,
-) -> Result<TypeRef<'c, 't>, LoweringError> {
+) -> Result<TypeRef<'c, 't>, Error> {
     Ok(match data_type {
-        DataType::Token => return Err(LoweringError::UnsupportedDataType { data_type }),
+        DataType::Token => return Err(Error::UnsupportedDataType { data_type }),
         // StableHLO has no zero-information element type. Use an i1 tensor as an unobservable physical carrier while
         // retaining the logical `DataType::Zero` in Ryft's lowered/compiled metadata.
         DataType::Zero => context.signless_integer_type(1).as_ref(),
@@ -614,7 +614,7 @@ pub(crate) fn lower_f64_constant_splat<'b, 'c: 'b, 't: 'c, B, L>(
     block: &mut B,
     context: &'c MlirContext<'t>,
     location: L,
-) -> Result<ValueRef<'b, 'c, 't>, LoweringError>
+) -> Result<ValueRef<'b, 'c, 't>, Error>
 where
     B: Block<'b, 'c, 't>,
     L: Copy + Location<'c, 't>,
@@ -622,7 +622,7 @@ where
     let data_type = output_type.data_type();
     let scalar_tensor_type = context
         .tensor_type(lower_element_type(data_type, context)?, &[], None, location)
-        .map_err(|_| LoweringError::InvalidTensorType { array_type: ArrayType::scalar(data_type) })?;
+        .map_err(|_| Error::InvalidTensorType { array_type: ArrayType::scalar(data_type) })?;
     let elements = lower_f64_scalar_elements_attribute(data_type, scalar_tensor_type, factor, context)?;
     let scalar_constant = block.append_operation(stable_hlo::constant(elements, location)?)?;
     if output_type.shape().dimensions().is_empty() {
@@ -647,15 +647,15 @@ pub(crate) fn lower_f64_scalar_elements_attribute<'c, 't>(
     tensor_type: ryft_mlir::TensorTypeRef<'c, 't>,
     factor: f64,
     context: &'c MlirContext<'t>,
-) -> Result<DenseElementsAttributeRef<'c, 't>, LoweringError> {
+) -> Result<DenseElementsAttributeRef<'c, 't>, Error> {
     match data_type {
         DataType::Zero if factor == 0.0 => context
             .splatted_dense_attribute_elements_attribute(tensor_type, context.boolean_attribute(false))
-            .map_err(|_| LoweringError::InvalidDenseElementsAttribute { data_type }),
-        DataType::Zero => Err(LoweringError::UnsupportedDataType { data_type }),
+            .map_err(|_| Error::InvalidDenseElementsAttribute { data_type }),
+        DataType::Zero => Err(Error::UnsupportedDataType { data_type }),
         DataType::Boolean => context
             .splatted_dense_attribute_elements_attribute(tensor_type, context.boolean_attribute(factor != 0.0))
-            .map_err(|_| LoweringError::InvalidDenseElementsAttribute { data_type }),
+            .map_err(|_| Error::InvalidDenseElementsAttribute { data_type }),
         DataType::I1 | DataType::I2 | DataType::I4 | DataType::I8 | DataType::I16 | DataType::I32 | DataType::I64 => {
             context
                 .splatted_dense_attribute_elements_attribute(
@@ -665,7 +665,7 @@ pub(crate) fn lower_f64_scalar_elements_attribute<'c, 't>(
                         factor as i64,
                     ),
                 )
-                .map_err(|_| LoweringError::InvalidDenseElementsAttribute { data_type })
+                .map_err(|_| Error::InvalidDenseElementsAttribute { data_type })
         }
         DataType::U1 | DataType::U2 | DataType::U4 | DataType::U8 | DataType::U16 | DataType::U32 | DataType::U64 => {
             context
@@ -676,7 +676,7 @@ pub(crate) fn lower_f64_scalar_elements_attribute<'c, 't>(
                         factor as i64,
                     ),
                 )
-                .map_err(|_| LoweringError::InvalidDenseElementsAttribute { data_type })
+                .map_err(|_| Error::InvalidDenseElementsAttribute { data_type })
         }
         DataType::BF16
         | DataType::F16
@@ -695,12 +695,12 @@ pub(crate) fn lower_f64_scalar_elements_attribute<'c, 't>(
         | DataType::F8E8M0FNU => {
             let element_type = lower_element_type(data_type, context)?
                 .cast::<FloatTypeRef>()
-                .ok_or(LoweringError::InvalidDenseElementsAttribute { data_type })?;
+                .ok_or(Error::InvalidDenseElementsAttribute { data_type })?;
             context
                 .splatted_dense_attribute_elements_attribute(tensor_type, context.float_attribute(element_type, factor))
-                .map_err(|_| LoweringError::InvalidDenseElementsAttribute { data_type })
+                .map_err(|_| Error::InvalidDenseElementsAttribute { data_type })
         }
-        DataType::Token | DataType::C64 | DataType::C128 => Err(LoweringError::UnsupportedDataType { data_type }),
+        DataType::Token | DataType::C64 | DataType::C128 => Err(Error::UnsupportedDataType { data_type }),
     }
 }
 
@@ -713,7 +713,7 @@ pub(crate) fn lower_constant_elements_attribute<'c, 't>(
     tensor_type: ryft_mlir::TensorTypeRef<'c, 't>,
     integer_value: i64,
     context: &'c MlirContext<'t>,
-) -> Result<DenseElementsAttributeRef<'c, 't>, LoweringError> {
+) -> Result<DenseElementsAttributeRef<'c, 't>, Error> {
     match data_type {
         DataType::I1 | DataType::I2 | DataType::I4 | DataType::I8 | DataType::I16 | DataType::I32 | DataType::I64 => {
             context
@@ -724,7 +724,7 @@ pub(crate) fn lower_constant_elements_attribute<'c, 't>(
                         integer_value,
                     ),
                 )
-                .map_err(|_| LoweringError::InvalidDenseElementsAttribute { data_type })
+                .map_err(|_| Error::InvalidDenseElementsAttribute { data_type })
         }
         DataType::U1 | DataType::U2 | DataType::U4 | DataType::U8 | DataType::U16 | DataType::U32 | DataType::U64 => {
             context
@@ -735,14 +735,14 @@ pub(crate) fn lower_constant_elements_attribute<'c, 't>(
                         integer_value,
                     ),
                 )
-                .map_err(|_| LoweringError::InvalidDenseElementsAttribute { data_type })
+                .map_err(|_| Error::InvalidDenseElementsAttribute { data_type })
         }
         _ => lower_f64_scalar_elements_attribute(data_type, tensor_type, integer_value as f64, context),
     }
 }
 
 /// Returns the bit width of a signed integer [`DataType`].
-pub(crate) fn signed_integer_width(data_type: DataType) -> Result<usize, LoweringError> {
+pub(crate) fn signed_integer_width(data_type: DataType) -> Result<usize, Error> {
     Ok(match data_type {
         DataType::I1 => 1,
         DataType::I2 => 2,
@@ -751,12 +751,12 @@ pub(crate) fn signed_integer_width(data_type: DataType) -> Result<usize, Lowerin
         DataType::I16 => 16,
         DataType::I32 => 32,
         DataType::I64 => 64,
-        _ => return Err(LoweringError::UnsupportedDataType { data_type }),
+        _ => return Err(Error::UnsupportedDataType { data_type }),
     })
 }
 
 /// Returns the bit width of an unsigned integer [`DataType`].
-pub(crate) fn unsigned_integer_width(data_type: DataType) -> Result<usize, LoweringError> {
+pub(crate) fn unsigned_integer_width(data_type: DataType) -> Result<usize, Error> {
     Ok(match data_type {
         DataType::U1 => 1,
         DataType::U2 => 2,
@@ -765,7 +765,7 @@ pub(crate) fn unsigned_integer_width(data_type: DataType) -> Result<usize, Lower
         DataType::U16 => 16,
         DataType::U32 => 32,
         DataType::U64 => 64,
-        _ => return Err(LoweringError::UnsupportedDataType { data_type }),
+        _ => return Err(Error::UnsupportedDataType { data_type }),
     })
 }
 
@@ -774,11 +774,11 @@ pub(crate) fn lower_array_ir_type<'c, 't, L: Location<'c, 't>>(
     r#type: &ArrayIrType,
     context: &'c MlirContext<'t>,
     location: L,
-) -> Result<ryft_mlir::TensorTypeRef<'c, 't>, LoweringError> {
+) -> Result<ryft_mlir::TensorTypeRef<'c, 't>, Error> {
     match r#type {
         ArrayIrType::Array(r#type) => lower_tensor_type(r#type, context, location),
         ArrayIrType::Dimension(_) => lower_tensor_type(&ArrayType::scalar(DataType::I64), context, location),
-        ArrayIrType::Reference(_) => Err(LoweringError::UnresolvedReference { construct: r#type.to_string() }),
+        ArrayIrType::Reference(_) => Err(Error::UnresolvedReference { construct: r#type.to_string() }),
     }
 }
 
@@ -789,16 +789,16 @@ pub(crate) fn lower_explicit_shape<'b, 'c: 'b, 't: 'c>(
     block: &mut ryft_mlir::BlockRef<'b, 'c, 't>,
     context: &'c MlirContext<'t>,
     location: ryft_mlir::LocationRef<'c, 't>,
-) -> Result<ValueRef<'b, 'c, 't>, LoweringError> {
+) -> Result<ValueRef<'b, 'c, 't>, Error> {
     let shape_type = context
         .tensor_type(context.signless_integer_type(64), &[MlirSize::Static(extents.len())], None, location)
-        .map_err(|_| LoweringError::InvalidTensorType {
+        .map_err(|_| Error::InvalidTensorType {
             array_type: ArrayType::new(DataType::I64, Shape::new(vec![Dimension::Static(extents.len())])),
         })?;
     if extents.is_empty() {
         let elements = context
             .dense_i64_elements_attribute(shape_type, &[])
-            .map_err(|_| LoweringError::InvalidDenseElementsAttribute { data_type: DataType::I64 })?;
+            .map_err(|_| Error::InvalidDenseElementsAttribute { data_type: DataType::I64 })?;
         let constant = block.append_operation(stable_hlo::constant(elements, location)?)?;
         return Ok(constant.result(0).expect("stablehlo.constant should return one result").as_ref());
     }
@@ -809,7 +809,7 @@ pub(crate) fn lower_explicit_shape<'b, 'c: 'b, 't: 'c>(
             let reshape = block.append_operation(stable_hlo::reshape(*extent, &[1], location)?)?;
             Ok(reshape.result(0).expect("stablehlo.reshape should return one result").as_ref())
         })
-        .collect::<Result<Vec<_>, LoweringError>>()?;
+        .collect::<Result<Vec<_>, Error>>()?;
     if let [dimension] = dimensions.as_slice() {
         return Ok(*dimension);
     }
@@ -824,19 +824,19 @@ pub(crate) fn lower_explicit_reshape_shape<'b, 'c: 'b, 't: 'c>(
     block: &mut ryft_mlir::BlockRef<'b, 'c, 't>,
     context: &'c MlirContext<'t>,
     location: ryft_mlir::LocationRef<'c, 't>,
-) -> Result<ValueRef<'b, 'c, 't>, LoweringError> {
+) -> Result<ValueRef<'b, 'c, 't>, Error> {
     let scalar_type = context
         .tensor_type(context.signless_integer_type(32), &[], None, location)
-        .map_err(|_| LoweringError::InvalidTensorType { array_type: ArrayType::scalar(DataType::I32) })?;
+        .map_err(|_| Error::InvalidTensorType { array_type: ArrayType::scalar(DataType::I32) })?;
     let shape_type = context
         .tensor_type(context.signless_integer_type(32), &[MlirSize::Static(extents.len())], None, location)
-        .map_err(|_| LoweringError::InvalidTensorType {
+        .map_err(|_| Error::InvalidTensorType {
             array_type: ArrayType::new(DataType::I32, Shape::new(vec![Dimension::Static(extents.len())])),
         })?;
     if extents.is_empty() {
         let elements = context
             .dense_i32_elements_attribute(shape_type, &[])
-            .map_err(|_| LoweringError::InvalidDenseElementsAttribute { data_type: DataType::I32 })?;
+            .map_err(|_| Error::InvalidDenseElementsAttribute { data_type: DataType::I32 })?;
         let constant = block.append_operation(stable_hlo::constant(elements, location)?)?;
         return Ok(constant.result(0).expect("stablehlo.constant should return one result").as_ref());
     }
@@ -849,7 +849,7 @@ pub(crate) fn lower_explicit_reshape_shape<'b, 'c: 'b, 't: 'c>(
             let reshape = block.append_operation(stable_hlo::reshape(extent, &[1], location)?)?;
             Ok(reshape.result(0).expect("stablehlo.reshape should return one result").as_ref())
         })
-        .collect::<Result<Vec<_>, LoweringError>>()?;
+        .collect::<Result<Vec<_>, Error>>()?;
     if let [dimension] = dimensions.as_slice() {
         return Ok(*dimension);
     }
@@ -906,19 +906,20 @@ mod tests {
             return;
         }
 
-        assert_eq!(
+        assert!(matches!(
             reshape_dimension_i64(usize::MAX),
-            Err(LoweringError::ReshapeDimensionOutOfRange { value: usize::MAX, bit_width: 64 }),
-        );
+            Err(Error::ReshapeDimensionOutOfRange { value: usize::MAX, bit_width: 64 }),
+        ));
     }
 
     #[test]
     fn test_reshape_dimension_i32_rejects_out_of_range_values() {
         let value = i32::MAX as usize + 1;
-        assert_eq!(
+        assert!(matches!(
             reshape_dimension_i32(value),
-            Err(LoweringError::ReshapeDimensionOutOfRange { value, bit_width: 32 }),
-        );
+            Err(Error::ReshapeDimensionOutOfRange { value: actual_value, bit_width: 32 })
+                if actual_value == value,
+        ));
     }
 
     #[test]

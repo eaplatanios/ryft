@@ -6,7 +6,7 @@ use ryft_mlir::{
 };
 
 use crate::operations::{normalize_binary_elementwise_operands, normalize_elementwise_operand};
-use crate::{LowerableOperation, LowerableOperationFamily, LoweringError, XlaLowerer};
+use crate::{Error, LowerableOperation, LowerableOperationFamily, XlaLowerer};
 
 impl LowerableOperation for MaxOperation<ArrayType> {
     fn lower<'b, 'c: 'b, 't: 'c, O: LowerableOperationFamily>(
@@ -15,7 +15,7 @@ impl LowerableOperation for MaxOperation<ArrayType> {
         input_values: &[ValueRef<'b, 'c, 't>],
         _input_types: &[ArrayType],
         output_types: &[ArrayType],
-    ) -> Result<Vec<ValueRef<'b, 'c, 't>>, LoweringError> {
+    ) -> Result<Vec<ValueRef<'b, 'c, 't>>, Error> {
         let [left, right] = normalize_binary_elementwise_operands(
             input_values,
             output_types,
@@ -45,7 +45,7 @@ impl LowerableOperation for MinOperation<ArrayType> {
         input_values: &[ValueRef<'b, 'c, 't>],
         _input_types: &[ArrayType],
         output_types: &[ArrayType],
-    ) -> Result<Vec<ValueRef<'b, 'c, 't>>, LoweringError> {
+    ) -> Result<Vec<ValueRef<'b, 'c, 't>>, Error> {
         let [left, right] = normalize_binary_elementwise_operands(
             input_values,
             output_types,
@@ -75,7 +75,7 @@ impl LowerableOperation for ClampOperation<ArrayType> {
         input_values: &[ValueRef<'b, 'c, 't>],
         _input_types: &[ArrayType],
         output_types: &[ArrayType],
-    ) -> Result<Vec<ValueRef<'b, 'c, 't>>, LoweringError> {
+    ) -> Result<Vec<ValueRef<'b, 'c, 't>>, Error> {
         check_count!("input", input_values, 3, ProgramError);
         check_count!("output", output_types, 1, ProgramError);
         let output_type = &output_types[0];
@@ -149,7 +149,7 @@ pub(crate) fn lower_extremum_to_mlir<'b, 'c: 'b, 't: 'c>(
     right: ValueRef<'b, 'c, 't>,
     block: &mut BlockRef<'b, 'c, 't>,
     location: LocationRef<'c, 't>,
-) -> Result<ValueRef<'b, 'c, 't>, LoweringError> {
+) -> Result<ValueRef<'b, 'c, 't>, Error> {
     if !element_type.is_complex() && !element_type.is_floating_point() {
         let result = if maximum {
             block.append_operation(stable_hlo::maximum(left, right, location)?)?
@@ -310,8 +310,9 @@ mod tests {
                     MixedValue::Array(vec![8.0, 10.0, 12.0, 0.0], vec![4]),
                 ],
                 &[3, 3, 3, 3],
-            ),
-            Ok(vec![
+            )
+            .unwrap(),
+            vec![
                 MixedValue::Array(vec![1.0, 1.0, 2.0], vec![3]),
                 MixedValue::Array(vec![2.0, 3.0, 2.0], vec![3]),
                 MixedValue::Array(vec![2.0, 10.0, 9.0], vec![3]),
@@ -320,7 +321,7 @@ mod tests {
                 MixedValue::Dimension(3),
                 MixedValue::Dimension(3),
                 MixedValue::Dimension(3),
-            ]),
+            ],
         );
     }
 }

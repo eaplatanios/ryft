@@ -6,7 +6,7 @@ use ryft_mlir::{
 };
 
 use crate::experimental::lowering::types::{lower_f64_constant_splat, lower_tensor_type};
-use crate::{LowerableOperation, LowerableOperationFamily, LoweringError, XlaLowerer};
+use crate::{Error, LowerableOperation, LowerableOperationFamily, XlaLowerer};
 
 /// Lowers one traced sort to a `stablehlo.sort` with a synthesized comparator region: two scalar block arguments
 /// per operand, comparing the first `key_count` operand pairs lexicographically with the sort's direction (`LT`
@@ -29,7 +29,7 @@ pub(crate) fn lower_sort_to_mlir<'b, 'c: 'b, 't: 'c>(
     block: &mut BlockRef<'b, 'c, 't>,
     context: &'c MlirContext<'t>,
     location: LocationRef<'c, 't>,
-) -> Result<Vec<ValueRef<'b, 'c, 't>>, LoweringError> {
+) -> Result<Vec<ValueRef<'b, 'c, 't>>, Error> {
     if output_types.is_empty() {
         return Err(ProgramError::UnsupportedOperation {
             message: format!("`{SORT_OPERATION_NAME}` needs at least one input"),
@@ -156,7 +156,7 @@ fn lower_canonical_sort_key<'b, 'c: 'b, 't: 'c>(
     block: &mut BlockRef<'b, 'c, 't>,
     context: &'c MlirContext<'t>,
     location: LocationRef<'c, 't>,
-) -> Result<ValueRef<'b, 'c, 't>, LoweringError> {
+) -> Result<ValueRef<'b, 'c, 't>, Error> {
     let (has_negative_zero, has_multiple_nan_encodings) = match data_type {
         DataType::F4E2M1FN | DataType::F6E2M3FN | DataType::F6E3M2FN => (true, false),
         DataType::F8E4M3FNUZ | DataType::F8E4M3B11FNUZ | DataType::F8E5M2FNUZ | DataType::F8E8M0FNU => (false, false),
@@ -209,7 +209,7 @@ impl LowerableOperation for SortOperation {
         input_values: &[ValueRef<'b, 'c, 't>],
         _input_types: &[ArrayType],
         output_types: &[ArrayType],
-    ) -> Result<Vec<ValueRef<'b, 'c, 't>>, LoweringError> {
+    ) -> Result<Vec<ValueRef<'b, 'c, 't>>, Error> {
         lower_sort_to_mlir(self, input_values, output_types, &mut lowerer.block, lowerer.context, lowerer.location)
     }
 }

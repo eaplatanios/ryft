@@ -94,11 +94,10 @@ use ryft_core::{
 };
 use ryft_pjrt::Execution;
 
-use crate::experimental::XlaDomainError;
 use crate::experimental::domains::{XlaCompiledProgram, with_input_shardings};
 use crate::experimental::ops::{XlaConstant, XlaOperation};
 use crate::{
-    AdaptiveProfileGuidedOptions, AdaptiveProfileGuidedXlaFunction, XlaArray, XlaDomain, XlaOptions, XlaValue,
+    AdaptiveProfileGuidedOptions, AdaptiveProfileGuidedXlaFunction, Error, XlaArray, XlaDomain, XlaOptions, XlaValue,
 };
 
 /// Array IR tracer retained by the experimental stateful XLA program.
@@ -130,7 +129,7 @@ pub type XlaStatefulValue<'c> = XlaValue<'c>;
 /// Projects one internal array IR tracer tree to the public array-only tracer tree.
 fn project_tracers<'c, P>(
     values: XlaProgramParameterValues<P, XlaStatefulCompileTracer<'c>>,
-) -> Result<P::To<XlaCompileTracer<'c>>, XlaDomainError>
+) -> Result<P::To<XlaCompileTracer<'c>>, Error>
 where
     P: Parameterized<ArrayType>,
     P::Family: ParameterizedFamily<XlaStatefulCompileTracer<'c>>
@@ -150,7 +149,7 @@ where
 /// Lifts one public array-only tracer tree back into the internal array IR tracer tree.
 fn lift_tracers<'c, P>(
     values: P::To<XlaCompileTracer<'c>>,
-) -> Result<XlaProgramParameterValues<P, XlaStatefulCompileTracer<'c>>, XlaDomainError>
+) -> Result<XlaProgramParameterValues<P, XlaStatefulCompileTracer<'c>>, Error>
 where
     P: Parameterized<ArrayType>,
     P::Family: ParameterizedFamily<ArrayIrType>
@@ -165,9 +164,7 @@ where
 }
 
 /// Lifts one public runtime array tree into the production array IR value family.
-fn lift_arrays<'c, P>(
-    values: P::To<XlaArray<'c>>,
-) -> Result<XlaProgramParameterValues<P, XlaStatefulValue<'c>>, XlaDomainError>
+fn lift_arrays<'c, P>(values: P::To<XlaArray<'c>>) -> Result<XlaProgramParameterValues<P, XlaStatefulValue<'c>>, Error>
 where
     P: Parameterized<ArrayType>,
     P::Family: ParameterizedFamily<ArrayIrType>
@@ -184,7 +181,7 @@ where
 /// Projects one production array IR output tree back to public runtime arrays.
 fn project_arrays<'c, P>(
     values: XlaProgramParameterValues<P, XlaStatefulValue<'c>>,
-) -> Result<P::To<XlaArray<'c>>, XlaDomainError>
+) -> Result<P::To<XlaArray<'c>>, Error>
 where
     P: Parameterized<ArrayType>,
     P::Family: ParameterizedFamily<ArrayIrType>
@@ -257,17 +254,13 @@ where
         + ParameterizedFamily<XlaStatefulCompileTracer<'c>>,
 {
     /// Calls this dispatcher with public array inputs and projects its array IR runtime outputs back to arrays.
-    pub fn call(
-        &self,
-        static_parameters: Static,
-        inputs: In::To<XlaArray<'c>>,
-    ) -> Result<Out::To<XlaArray<'c>>, XlaDomainError>
+    pub fn call(&self, static_parameters: Static, inputs: In::To<XlaArray<'c>>) -> Result<Out::To<XlaArray<'c>>, Error>
     where
         XlaOptions: Clone,
         F: Fn(
             Static,
             XlaProgramParameterValues<In, XlaStatefulCompileTracer<'c>>,
-        ) -> Result<XlaProgramParameterValues<Out, XlaStatefulCompileTracer<'c>>, XlaDomainError>,
+        ) -> Result<XlaProgramParameterValues<Out, XlaStatefulCompileTracer<'c>>, Error>,
         XlaProgramParameters<In>: Parameterized<ArrayIrType, To<ArrayIrType> = XlaProgramParameters<In>>,
         XlaProgramParameters<Out>: Parameterized<ArrayIrType, To<ArrayIrType> = XlaProgramParameters<Out>>,
         XlaProgramParameterValues<In, XlaStatefulValue<'c>>:
@@ -302,13 +295,13 @@ pub fn jitted_with_options<'c, F, Static, In, Out>(
     impl Fn(
         Static,
         XlaProgramParameterValues<In, XlaStatefulCompileTracer<'c>>,
-    ) -> Result<XlaProgramParameterValues<Out, XlaStatefulCompileTracer<'c>>, XlaDomainError>,
+    ) -> Result<XlaProgramParameterValues<Out, XlaStatefulCompileTracer<'c>>, Error>,
     Static,
     In,
     Out,
 >
 where
-    F: Fn(Static, In::To<XlaCompileTracer<'c>>) -> Result<Out::To<XlaCompileTracer<'c>>, XlaDomainError>,
+    F: Fn(Static, In::To<XlaCompileTracer<'c>>) -> Result<Out::To<XlaCompileTracer<'c>>, Error>,
     Static: Clone + Debug + Eq + Hash,
     In: Parameterized<ArrayType>,
     In::ParameterStructure: Eq + Hash,
@@ -343,13 +336,13 @@ pub fn jitted<'c, F, Static, In, Out>(
     impl Fn(
         Static,
         XlaProgramParameterValues<In, XlaStatefulCompileTracer<'c>>,
-    ) -> Result<XlaProgramParameterValues<Out, XlaStatefulCompileTracer<'c>>, XlaDomainError>,
+    ) -> Result<XlaProgramParameterValues<Out, XlaStatefulCompileTracer<'c>>, Error>,
     Static,
     In,
     Out,
 >
 where
-    F: Fn(Static, In::To<XlaCompileTracer<'c>>) -> Result<Out::To<XlaCompileTracer<'c>>, XlaDomainError>,
+    F: Fn(Static, In::To<XlaCompileTracer<'c>>) -> Result<Out::To<XlaCompileTracer<'c>>, Error>,
     Static: Clone + Debug + Eq + Hash,
     In: Parameterized<ArrayType>,
     In::ParameterStructure: Eq + Hash,
@@ -445,13 +438,10 @@ where
         &self,
         static_parameters: Static,
         inputs: In::To<XlaStatefulValue<'c>>,
-    ) -> Result<Out::To<XlaStatefulValue<'c>>, XlaDomainError>
+    ) -> Result<Out::To<XlaStatefulValue<'c>>, Error>
     where
         XlaOptions: Clone,
-        F: Fn(
-            Static,
-            In::To<XlaStatefulCompileTracer<'c>>,
-        ) -> Result<Out::To<XlaStatefulCompileTracer<'c>>, XlaDomainError>,
+        F: Fn(Static, In::To<XlaStatefulCompileTracer<'c>>) -> Result<Out::To<XlaStatefulCompileTracer<'c>>, Error>,
     {
         self.function.execute_statefully_and_wait(static_parameters, inputs)
     }
@@ -466,13 +456,10 @@ where
         &self,
         static_parameters: Static,
         inputs: In::To<XlaStatefulValue<'c>>,
-    ) -> StatefulExecution<Out::To<XlaStatefulValue<'c>>, XlaDomainError>
+    ) -> StatefulExecution<Out::To<XlaStatefulValue<'c>>, Error>
     where
         XlaOptions: Clone,
-        F: Fn(
-            Static,
-            In::To<XlaStatefulCompileTracer<'c>>,
-        ) -> Result<Out::To<XlaStatefulCompileTracer<'c>>, XlaDomainError>,
+        F: Fn(Static, In::To<XlaStatefulCompileTracer<'c>>) -> Result<Out::To<XlaStatefulCompileTracer<'c>>, Error>,
     {
         self.function.execute_statefully(static_parameters, inputs)
     }
@@ -498,10 +485,7 @@ pub fn jitted_statefully_with_options<'c, F, Static, In, Out>(
     options: XlaOptions,
 ) -> StatefulJittedXlaFunction<'c, F, Static, In, Out>
 where
-    F: Fn(
-        Static,
-        In::To<XlaStatefulCompileTracer<'c>>,
-    ) -> Result<Out::To<XlaStatefulCompileTracer<'c>>, XlaDomainError>,
+    F: Fn(Static, In::To<XlaStatefulCompileTracer<'c>>) -> Result<Out::To<XlaStatefulCompileTracer<'c>>, Error>,
     Static: Clone + Debug + Eq + Hash,
     In: Parameterized<
             ArrayIrType,
@@ -532,10 +516,7 @@ pub fn jitted_statefully<'c, F, Static, In, Out>(
     mesh: DeviceMesh,
 ) -> StatefulJittedXlaFunction<'c, F, Static, In, Out>
 where
-    F: Fn(
-        Static,
-        In::To<XlaStatefulCompileTracer<'c>>,
-    ) -> Result<Out::To<XlaStatefulCompileTracer<'c>>, XlaDomainError>,
+    F: Fn(Static, In::To<XlaStatefulCompileTracer<'c>>) -> Result<Out::To<XlaStatefulCompileTracer<'c>>, Error>,
     Static: Clone + Debug + Eq + Hash,
     In: Parameterized<
             ArrayIrType,
@@ -596,7 +577,7 @@ where
         &self,
         domain: &XlaDomain<'c>,
         inputs: In::To<XlaStatefulValue<'c>>,
-    ) -> Result<Out::To<XlaStatefulValue<'c>>, XlaDomainError> {
+    ) -> Result<Out::To<XlaStatefulValue<'c>>, Error> {
         self.function.executable().execute_statefully_and_wait(domain, inputs)
     }
 
@@ -608,7 +589,7 @@ where
         &self,
         domain: &XlaDomain<'c>,
         inputs: In::To<XlaStatefulValue<'c>>,
-    ) -> StatefulExecution<Out::To<XlaStatefulValue<'c>>, XlaDomainError> {
+    ) -> StatefulExecution<Out::To<XlaStatefulValue<'c>>, Error> {
         self.function.executable().execute_statefully(domain, inputs)
     }
 
@@ -630,9 +611,9 @@ pub fn compile_statefully<'domain, 'c: 'domain, F, In, Out>(
     input_types: In,
     domain: &'domain XlaDomain<'c>,
     options: XlaOptions,
-) -> Result<StatefulCompiledXlaFunction<'c, In, Out>, XlaDomainError>
+) -> Result<StatefulCompiledXlaFunction<'c, In, Out>, Error>
 where
-    F: FnOnce(In::To<XlaStatefulCompileTracer<'c>>) -> Result<Out::To<XlaStatefulCompileTracer<'c>>, XlaDomainError>,
+    F: FnOnce(In::To<XlaStatefulCompileTracer<'c>>) -> Result<Out::To<XlaStatefulCompileTracer<'c>>, Error>,
     In: Parameterized<ArrayIrType>,
     In::Family: ParameterizedFamily<XlaConstant> + ParameterizedFamily<XlaStatefulCompileTracer<'c>>,
     In::ParameterStructure: Hash,
@@ -656,12 +637,12 @@ pub fn compile_statefully_with_captures<'domain, 'c: 'domain, F, In, Out>(
     input_types: In,
     domain: &'domain XlaDomain<'c>,
     options: XlaOptions,
-) -> Result<StatefulCompiledXlaFunction<'c, In, Out>, XlaDomainError>
+) -> Result<StatefulCompiledXlaFunction<'c, In, Out>, Error>
 where
     F: FnOnce(
         Vec<XlaStatefulCompileTracer<'c>>,
         In::To<XlaStatefulCompileTracer<'c>>,
-    ) -> Result<Out::To<XlaStatefulCompileTracer<'c>>, XlaDomainError>,
+    ) -> Result<Out::To<XlaStatefulCompileTracer<'c>>, Error>,
     In: Parameterized<ArrayIrType>,
     In::Family: ParameterizedFamily<XlaConstant> + ParameterizedFamily<XlaStatefulCompileTracer<'c>>,
     In::ParameterStructure: Hash,
@@ -828,7 +809,7 @@ impl<'c> XlaDomain<'c> {
     pub fn compile_staged_function<In, Out>(
         &self,
         staged: StagedXlaFunction<'c, In, Out>,
-    ) -> Result<CompiledXlaFunction<'c, In, Out>, XlaDomainError>
+    ) -> Result<CompiledXlaFunction<'c, In, Out>, Error>
     where
         In: Parameterized<ArrayType>,
         In::Family:
@@ -847,7 +828,7 @@ impl<'c> XlaDomain<'c> {
         &self,
         executable: &ExecutableXlaFunction<'c, In, Out>,
         inputs: In::To<XlaArray<'c>>,
-    ) -> Result<Out::To<XlaArray<'c>>, XlaDomainError>
+    ) -> Result<Out::To<XlaArray<'c>>, Error>
     where
         In: Parameterized<
                 ArrayType,
@@ -877,7 +858,7 @@ impl<'c> XlaDomain<'c> {
         &self,
         executable: &ExecutableXlaFunction<'c, In, Out>,
         inputs: In::To<XlaArray<'c>>,
-    ) -> Result<Execution<Out::To<XlaArray<'c>>>, XlaDomainError>
+    ) -> Result<Execution<Out::To<XlaArray<'c>>>, Error>
     where
         In: Parameterized<
                 ArrayType,
@@ -897,7 +878,7 @@ impl<'c> XlaDomain<'c> {
             Parameterized<XlaArray<'c>, Family = Out::Family, ParameterStructure = Out::ParameterStructure>,
     {
         if executable.function.compiled_program().requires_stateful_call() {
-            return Err(XlaDomainError::UnsupportedReferenceAbi {
+            return Err(Error::UnsupportedReferenceAbi {
                 reason: "external reference state requires `execute_statefully`".to_string(),
             });
         }
@@ -936,7 +917,7 @@ impl<'c> XlaDomain<'c> {
         &self,
         executable: &ExecutableXlaFunction<'c, In, Out>,
         program: std::sync::Arc<XlaCompiledProgram<'c>>,
-    ) -> Result<ExecutableXlaFunction<'c, In, Out>, XlaDomainError>
+    ) -> Result<ExecutableXlaFunction<'c, In, Out>, Error>
     where
         In: Parameterized<ArrayType>,
         In::Family: ParameterizedFamily<ArrayIrType> + ParameterizedFamily<XlaConstant>,
@@ -956,7 +937,7 @@ impl<'c> XlaDomain<'c> {
         &self,
         function: &CompiledXlaFunction<'c, In, Out>,
         options: AdaptiveProfileGuidedOptions,
-    ) -> Result<AdaptiveProfileGuidedXlaFunction<'c, In, Out>, XlaDomainError>
+    ) -> Result<AdaptiveProfileGuidedXlaFunction<'c, In, Out>, Error>
     where
         In: Parameterized<ArrayType>,
         In::Family:
@@ -1169,7 +1150,7 @@ where
     pub fn gradient<'domain>(
         &'domain self,
         domain: &'domain XlaDomain<'c>,
-    ) -> Result<CompiledXlaFunction<'c, In, In>, XlaDomainError>
+    ) -> Result<CompiledXlaFunction<'c, In, In>, Error>
     where
         'c: 'domain,
         In::Family: ParameterizedFamily<XlaCompileTracer<'c>, To = In::To<XlaCompileTracer<'c>>>,
@@ -1291,7 +1272,7 @@ where
     pub fn jvp<'domain>(
         &'domain self,
         domain: &'domain XlaDomain<'c>,
-    ) -> Result<CompiledXlaFunction<'c, (In, In), (Out, Out)>, XlaDomainError>
+    ) -> Result<CompiledXlaFunction<'c, (In, In), (Out, Out)>, Error>
     where
         'c: 'domain,
         In::Family: ParameterizedFamily<XlaCompileTracer<'c>, To = In::To<XlaCompileTracer<'c>>>,
@@ -1409,7 +1390,7 @@ where
         &'domain self,
         domain: &'domain XlaDomain<'c>,
         axis_size: usize,
-    ) -> Result<CompiledXlaFunction<'c, In, Out>, XlaDomainError>
+    ) -> Result<CompiledXlaFunction<'c, In, Out>, Error>
     where
         'c: 'domain,
     {
@@ -1437,7 +1418,7 @@ pub fn compile<'domain, 'c: 'domain, F, In: Parameterized<ArrayType>, Out: Param
     input_types: In,
     domain: &'domain XlaDomain<'c>,
     mesh: DeviceMesh,
-) -> Result<CompiledXlaFunction<'c, In, Out>, XlaDomainError>
+) -> Result<CompiledXlaFunction<'c, In, Out>, Error>
 where
     F: FnOnce(In::To<XlaCompileTracer<'c>>) -> Out::To<XlaCompileTracer<'c>>,
     In::Family: ParameterizedFamily<ArrayType>
@@ -1474,7 +1455,7 @@ pub fn compile_with_captures<'domain, 'c: 'domain, F, In: Parameterized<ArrayTyp
     input_types: In,
     domain: &'domain XlaDomain<'c>,
     mesh: DeviceMesh,
-) -> Result<CompiledXlaFunction<'c, In, Out>, XlaDomainError>
+) -> Result<CompiledXlaFunction<'c, In, Out>, Error>
 where
     F: FnOnce(Vec<XlaCompileTracer<'c>>, In::To<XlaCompileTracer<'c>>) -> Out::To<XlaCompileTracer<'c>>,
     In::Family: ParameterizedFamily<ArrayType>
@@ -1512,7 +1493,7 @@ pub fn compile_with_options<'domain, 'c: 'domain, F, In: Parameterized<ArrayType
     input_types: In,
     domain: &'domain XlaDomain<'c>,
     options: XlaOptions,
-) -> Result<CompiledXlaFunction<'c, In, Out>, XlaDomainError>
+) -> Result<CompiledXlaFunction<'c, In, Out>, Error>
 where
     F: FnOnce(In::To<XlaCompileTracer<'c>>) -> Out::To<XlaCompileTracer<'c>>,
     In::Family: ParameterizedFamily<ArrayType>
@@ -1544,13 +1525,13 @@ fn compile_with_flat_captures<'domain, 'c: 'domain, F, In: Parameterized<ArrayTy
     input_types: In,
     domain: &'domain XlaDomain<'c>,
     options: XlaOptions,
-) -> Result<CompiledXlaFunction<'c, In, Out>, XlaDomainError>
+) -> Result<CompiledXlaFunction<'c, In, Out>, Error>
 where
     F: FnOnce(
         Vec<XlaConstant>,
         Vec<XlaCompileTracer<'c>>,
         In::To<XlaCompileTracer<'c>>,
-    ) -> Result<Out::To<XlaCompileTracer<'c>>, XlaDomainError>,
+    ) -> Result<Out::To<XlaCompileTracer<'c>>, Error>,
     In::Family: ParameterizedFamily<ArrayType>
         + ParameterizedFamily<ArrayIrType>
         + ParameterizedFamily<XlaConstant>
@@ -1586,7 +1567,7 @@ pub fn stage<'c, F, In: Parameterized<ArrayType>, Out: Parameterized<ArrayType>>
     function: F,
     input_types: In,
     options: XlaOptions,
-) -> Result<StagedXlaFunction<'c, In, Out>, XlaDomainError>
+) -> Result<StagedXlaFunction<'c, In, Out>, Error>
 where
     F: FnOnce(In::To<XlaCompileTracer<'c>>) -> Out::To<XlaCompileTracer<'c>>,
     In::Family: ParameterizedFamily<ArrayType>
@@ -1622,7 +1603,7 @@ pub fn stage_with_captures<'c, F, In: Parameterized<ArrayType>, Out: Parameteriz
     captures: Vec<XlaArray<'c>>,
     input_types: In,
     options: XlaOptions,
-) -> Result<StagedXlaFunction<'c, In, Out>, XlaDomainError>
+) -> Result<StagedXlaFunction<'c, In, Out>, Error>
 where
     F: FnOnce(Vec<XlaCompileTracer<'c>>, In::To<XlaCompileTracer<'c>>) -> Out::To<XlaCompileTracer<'c>>,
     In::Family: ParameterizedFamily<ArrayType>
@@ -1658,13 +1639,13 @@ fn stage_with_flat_captures<'c, F, In: Parameterized<ArrayType>, Out: Parameteri
     captures: Vec<XlaArray<'c>>,
     input_types: In,
     options: XlaOptions,
-) -> Result<StagedXlaFunction<'c, In, Out>, XlaDomainError>
+) -> Result<StagedXlaFunction<'c, In, Out>, Error>
 where
     F: FnOnce(
         Vec<XlaConstant>,
         Vec<XlaCompileTracer<'c>>,
         In::To<XlaCompileTracer<'c>>,
-    ) -> Result<Out::To<XlaCompileTracer<'c>>, XlaDomainError>,
+    ) -> Result<Out::To<XlaCompileTracer<'c>>, Error>,
     In::Family: ParameterizedFamily<ArrayType>
         + ParameterizedFamily<ArrayIrType>
         + ParameterizedFamily<XlaConstant>
@@ -1784,13 +1765,12 @@ mod tests {
         ReductionKind, ReferenceAddUpdate, ReferenceAddUpdateOperation, ReferenceCompletion,
         ReferenceCompletionBackend, ReferenceError, ReferenceFreeze, ReferenceFreezeOperation, ReferenceNew,
         ReferenceNewOperation, ReferenceRead, ReferenceReadOperation, ReferenceType, Reshape, Reshard, ScanOperation,
-        Select, Shape, ShardMap, ShardMapOperation, Sharding, ShardingDimension, Sin, Softmax, StagedFunction,
+        Select, Shape, ShardMapBoundary, ShardMapOperation, Sharding, ShardingDimension, Sin, Softmax, StagedFunction,
         StopGradient, StopGradientOperation, Sub, Tanh, TopK, Trace, TransferToMemory, Typed, TypedProgram, Value,
         ValueProjection, WhileOperation, ZeroLike, differentiate_at,
     };
     use ryft_pjrt::{ClientOptions, CpuClientOptions, load_cpu_plugin};
 
-    use crate::experimental::XlaDomainError;
     use crate::experimental::domains::StatefulFailureInjection;
     use crate::experimental::ops::{XlaConstant, XlaOperation};
     use crate::jit::{
@@ -1801,8 +1781,8 @@ mod tests {
     use crate::operations::jit_call::JitCallOperation;
     use crate::tests::{execution_client, values_from_bytes, values_to_bytes};
     use crate::{
-        AdaptiveProfileGuidedOptions, ArrayError, Error, FromPjrt, XlaArray, XlaDomain, XlaOptions, XlaReference,
-        XlaSession, XlaValue,
+        AdaptiveProfileGuidedOptions, Error, FromPjrt, XlaArray, XlaDomain, XlaOptions, XlaReference, XlaSession,
+        XlaValue,
     };
 
     /// Deterministic completion gate used by stateful asynchronous integration tests.
@@ -1956,7 +1936,7 @@ mod tests {
             .with_sharding(reference_sharding.clone())
             .unwrap();
         let value_type = ArrayType::new_static(DataType::F32, [4]).with_sharding(sharded.clone()).unwrap();
-        let shard_map = ShardMap::new(
+        let shard_map = ShardMapBoundary::new(
             mesh.clone(),
             vec![reference_sharding.clone(), sharded.clone()],
             vec![sharded.clone()],
@@ -2695,7 +2675,7 @@ mod tests {
                     XlaValue::Reference(XlaReference::new(reference.clone(), domain.clone())),
                     XlaValue::Array(rejected_update),
                 )),
-            Err(XlaDomainError::UnsupportedReferenceAbi { reason })
+            Err(Error::UnsupportedReferenceAbi { reason })
                 if reason == "external reference state requires `execute_statefully`",
         ));
         assert_eq!(read_f32_array(&client, &reference.read().unwrap()), vec![1.0]);
@@ -3062,7 +3042,7 @@ mod tests {
         .unwrap();
         assert!(matches!(
             error,
-            XlaDomainError::UnsupportedReferenceAbi { reason }
+            Error::UnsupportedReferenceAbi { reason }
                 if reason == "output 0 is a reference allocated inside the program and cannot be returned through the \
                               stateful XLA ABI, which has no protocol to turn a backend array into a host reference",
         ));
@@ -3079,7 +3059,7 @@ mod tests {
         .unwrap();
         assert!(matches!(
             error,
-            XlaDomainError::UnsupportedReferenceAbi { reason }
+            Error::UnsupportedReferenceAbi { reason }
                 if reason == "output 0 forwards the external reference bound at input 0, and the stateful XLA ABI \
                               does not return forwarded references; read the reference after the call instead",
         ));
@@ -3101,7 +3081,7 @@ mod tests {
             _: Vec<XlaConstant>,
             _: Vec<XlaStatefulCompileTracer<'c>>,
             input: XlaStatefulCompileTracer<'c>,
-        ) -> Result<XlaStatefulCompileTracer<'c>, XlaDomainError> {
+        ) -> Result<XlaStatefulCompileTracer<'c>, Error> {
             input.reference_new().map_err(Into::into)
         }
 
@@ -3117,7 +3097,7 @@ mod tests {
         let error = staged.lower(&domain).err().unwrap();
         assert!(matches!(
             error,
-            XlaDomainError::UnsupportedReferenceAbi { reason }
+            Error::UnsupportedReferenceAbi { reason }
                 if reason == "output 0 is a reference allocated inside the program and cannot be returned through the \
                               stateful XLA ABI, which has no protocol to turn a backend array into a host reference",
         ));
@@ -3201,7 +3181,7 @@ mod tests {
             _: Vec<XlaConstant>,
             _: Vec<XlaStatefulCompileTracer<'c>>,
             input: XlaStatefulCompileTracer<'c>,
-        ) -> Result<XlaStatefulCompileTracer<'c>, XlaDomainError> {
+        ) -> Result<XlaStatefulCompileTracer<'c>, Error> {
             Ok(input)
         }
 
@@ -3248,7 +3228,7 @@ mod tests {
             _: Vec<XlaConstant>,
             _: Vec<XlaStatefulCompileTracer<'c>>,
             input: XlaStatefulCompileTracer<'c>,
-        ) -> Result<XlaStatefulCompileTracer<'c>, XlaDomainError> {
+        ) -> Result<XlaStatefulCompileTracer<'c>, Error> {
             input.reference_new().map_err(Into::into)
         }
 
@@ -3271,7 +3251,7 @@ mod tests {
         .unwrap();
         assert!(matches!(
             error,
-            XlaDomainError::Tracing(ProgramError::UnsupportedOperation { message })
+            Error::Core(ryft_core::Error::Program(ProgramError::UnsupportedOperation { message }))
                 if message == "output 0 of the called function is a reference that the function allocates itself, \
                                which a nested call cannot return; allocate the reference in the caller and pass it to \
                                the function instead",
@@ -3395,7 +3375,7 @@ mod tests {
         let input = XlaArray::from_host_buffer(&domain, array_type, mesh, 7.0f32.to_ne_bytes().as_slice()).unwrap();
         assert!(matches!(
             domain.interpret_async(&executable, input),
-            Err(XlaDomainError::UnsupportedReferenceAbi { reason })
+            Err(Error::UnsupportedReferenceAbi { reason })
                 if reason == "external reference state requires `execute_statefully`",
         ));
     }
@@ -3549,7 +3529,7 @@ mod tests {
         for execution in [first, second] {
             assert!(matches!(
                 execution.r#await(),
-                Err(XlaDomainError::AsynchronousReferenceExecution { reason })
+                Err(Error::AsynchronousReferenceExecution { reason })
                     if reason == "injected predecessor failure",
             ));
         }
@@ -3624,7 +3604,7 @@ mod tests {
             .unwrap();
         assert!(matches!(
             compiled.call_statefully(&domain, XlaValue::Reference(XlaReference::new(view, domain.clone()))),
-            Err(XlaDomainError::UnsupportedReferenceAbi { reason })
+            Err(Error::UnsupportedReferenceAbi { reason })
                 if reason
                     == "external state input 0 must be a root reference handle that uses its allocation's stored \
                         type identities",
@@ -3695,7 +3675,7 @@ mod tests {
                 &domain,
                 (XlaValue::Reference(XlaReference::new(reference.clone(), domain.clone())), XlaValue::Array(update)),
             ),
-            Err(XlaDomainError::UnsupportedReferenceAbi { reason })
+            Err(Error::UnsupportedReferenceAbi { reason })
                 if reason == format!(
                     "external state input 0 reference type `{alternate_type}` does not refine effective compiled state \
                      type `{replicated_type}`",
@@ -3782,7 +3762,7 @@ mod tests {
                     XlaValue::Array(update),
                 ),
             ),
-            Err(XlaDomainError::UnsupportedReferenceAbi { reason })
+            Err(Error::UnsupportedReferenceAbi { reason })
                 if reason == "external state input 0 reference mesh does not match the compiled device mesh",
         ));
         assert_eq!(read_sharded_f32_array(&reversed_reference.read().unwrap()), vec![1.0, 2.0, 3.0, 4.0],);
@@ -3924,8 +3904,13 @@ mod tests {
         let operation = ShardMapOperation::from_program(
             &body,
             vec![reference_type.clone()],
-            ShardMap::new(logical_mesh.clone(), vec![sharding.clone()], vec![sharding.clone()], vec!["x".to_string()])
-                .unwrap(),
+            ShardMapBoundary::new(
+                logical_mesh.clone(),
+                vec![sharding.clone()],
+                vec![sharding.clone()],
+                vec!["x".to_string()],
+            )
+            .unwrap(),
         )
         .unwrap();
         let mut builder = ProgramBuilder::<XlaConstant, XlaOperation>::new();
@@ -3984,7 +3969,7 @@ mod tests {
 
         // The boundary is `[r: ref<f32[4]>, x: f32[4]] -> f32[4]`, everything sharded along `x`, and the local body
         // performs `add_update(r_local, x_local); read(r_local)` over the `f32[2]` shards the device owns.
-        let shard_map = ShardMap::new(
+        let shard_map = ShardMapBoundary::new(
             logical_mesh,
             vec![sharded.clone(), sharded.clone()],
             vec![sharded.clone()],
@@ -4088,7 +4073,7 @@ mod tests {
         // The boundary is `[r: ref<f32[2]>, x: f32[4]] -> f32[4]` with `r` replicated and `x` and the output sharded
         // along `x`, and the local body performs `read(r_local) + x_local` over the whole `f32[2]` referent and the
         // `f32[2]` shard of `x` the device owns.
-        let shard_map = ShardMap::new(
+        let shard_map = ShardMapBoundary::new(
             logical_mesh,
             vec![replicated, sharded.clone()],
             vec![sharded.clone()],
@@ -4197,7 +4182,7 @@ mod tests {
         );
         assert!(matches!(
             mutation,
-            Err(XlaDomainError::UnsupportedReferenceAbi { reason })
+            Err(Error::UnsupportedReferenceAbi { reason })
                 if reason == "mutated bounded-dynamic external state input 0 is unsupported because backend alias \
                               compatibility has not been verified",
         ));
@@ -4337,7 +4322,7 @@ mod tests {
         assert!(
             matches!(
                 &error,
-                Some(XlaDomainError::Tracing(ProgramError::InvalidArgument { message }))
+                Some(Error::Core(ryft_core::Error::Program(ProgramError::InvalidArgument { message })))
                     if message == "capture 0 and input 0 bind the same reference allocation",
             ),
             "{error:?}",
@@ -4372,7 +4357,7 @@ mod tests {
         );
         assert!(matches!(
             result,
-            Err(XlaDomainError::Tracing(ProgramError::InvalidArgument { message }))
+            Err(Error::Core(ryft_core::Error::Program(ProgramError::InvalidArgument { message })))
                 if message == "capture 1 and capture 0 bind the same reference allocation",
         ));
     }
@@ -4565,7 +4550,8 @@ mod tests {
                     XlaValue::Array(wrong_update),
                 ),
             ),
-            Err(XlaDomainError::Tracing(ProgramError::InvalidArgument { message })) if message == expected_error,
+            Err(Error::Core(ryft_core::Error::Program(ProgramError::InvalidArgument { message })))
+                if message == expected_error,
         ));
         assert_eq!(read_f32_array(&client, &pre_handoff_first.read().unwrap()), vec![1.0]);
         assert_eq!(read_f32_array(&client, &pre_handoff_second.read().unwrap()), vec![10.0]);
@@ -4589,7 +4575,7 @@ mod tests {
                     XlaValue::Array(update),
                 ),
             ),
-            Err(XlaDomainError::InvalidCompilationOptions { reason })
+            Err(Error::InvalidCompilationOptions { reason })
                 if reason == "injected failure before execution submission",
         ));
         assert_eq!(read_f32_array(&client, &pre_submission_first.read().unwrap()), vec![1.0]);
@@ -4615,7 +4601,7 @@ mod tests {
                     XlaValue::Array(update),
                 ),
             ),
-            Err(XlaDomainError::InvalidCompilationOptions { reason })
+            Err(Error::InvalidCompilationOptions { reason })
                 if reason == "injected failure after execution handoff",
         ));
         for reference in [&post_handoff_first, &post_handoff_second] {
@@ -4649,7 +4635,7 @@ mod tests {
                     XlaValue::Array(update),
                 ),
             ),
-            Err(XlaDomainError::InvalidCompilationOptions { reason })
+            Err(Error::InvalidCompilationOptions { reason })
                 if reason == "injected failure before hidden state replacement commit",
         ));
         for reference in [&pre_commit_first, &pre_commit_second] {
@@ -4680,7 +4666,7 @@ mod tests {
                     XlaValue::Array(update),
                 ),
             ),
-            Err(XlaDomainError::InvalidCompilationOptions { reason })
+            Err(Error::InvalidCompilationOptions { reason })
                 if reason == "injected failure before public output reconstruction",
         ));
         assert_eq!(read_f32_array(&client, &committed_first.read().unwrap()), vec![3.0]);
@@ -4730,7 +4716,7 @@ mod tests {
                     XlaValue::Array(update),
                 ),
             ),
-            Err(XlaDomainError::Reference(ReferenceError::Frozen)),
+            Err(Error::Core(ryft_core::Error::Reference(ReferenceError::Frozen))),
         ));
         assert_eq!(read_f32_array(&client, &first.read().unwrap()), vec![1.0]);
     }
@@ -4952,27 +4938,21 @@ mod tests {
         let input =
             XlaArray::from_host_buffer(&domain, input_type, mesh, values_to_bytes::<f32>(&[0.5]).as_slice()).unwrap();
 
-        assert!(matches!(
-            other_domain.interpret(&executable, input.clone()),
-            Err(XlaDomainError::ExecutableClientMismatch),
-        ));
-        assert!(matches!(
-            other_domain.interpret_async(&executable, input),
-            Err(XlaDomainError::ExecutableClientMismatch),
-        ));
+        assert!(matches!(other_domain.interpret(&executable, input.clone()), Err(Error::ExecutableClientMismatch),));
+        assert!(matches!(other_domain.interpret_async(&executable, input), Err(Error::ExecutableClientMismatch),));
         assert!(matches!(
             domain.validate_xla_replacement(
                 executable.function.compiled_program(),
                 other_executable.function.compiled_program(),
             ),
-            Err(XlaDomainError::ExecutableClientMismatch),
+            Err(Error::ExecutableClientMismatch),
         ));
         assert!(matches!(
             other_domain.validate_xla_replacement(
                 executable.function.compiled_program(),
                 other_executable.function.compiled_program(),
             ),
-            Err(XlaDomainError::ExecutableClientMismatch),
+            Err(Error::ExecutableClientMismatch),
         ));
     }
 
@@ -5024,7 +5004,7 @@ mod tests {
 
         assert!(matches!(
             domain.adaptive_profile_guided_recompilation(&compiled, AdaptiveProfileGuidedOptions::default()),
-            Err(XlaDomainError::InvalidCompilationOptions { reason }) if reason.contains("CUDA or ROCm"),
+            Err(Error::InvalidCompilationOptions { reason }) if reason.contains("CUDA or ROCm"),
         ));
     }
 
@@ -5161,7 +5141,7 @@ mod tests {
                 assert!(!available);
                 assert!(matches!(
                     XlaArray::from_host_buffer(&engine, host_type, mesh.clone(), values_to_bytes(&values).as_slice()),
-                    Err(ArrayError::Error(Error::UnsupportedMemory { device_id: actual_device, memory: actual_memory }))
+                    Err(Error::UnsupportedMemory { device_id: actual_device, memory: actual_memory })
                         if actual_device == device_id && actual_memory == memory,
                 ));
                 continue;
@@ -5423,7 +5403,7 @@ mod tests {
         let execution = engine.interpret_async(&compiled.executable_function(), input).unwrap();
         assert_eq!(execution.output(), &());
         execution.fence().block_until_ready().unwrap();
-        assert_eq!(execution.block_until_ready(), Ok(()));
+        execution.block_until_ready().unwrap();
     }
 
     /// Inner-composition smoke test: a compiled function can be staged into another
@@ -6791,9 +6771,9 @@ mod tests {
         let mut xla_options = XlaOptions::new(mesh.clone());
         xla_options.donation_flags = Some(vec![true, false, false]); // 3 entries, 1 input
         let options = xla_options;
-        let result: Result<CompiledXlaFunction<'_, ArrayType, ArrayType>, XlaDomainError> =
+        let result: Result<CompiledXlaFunction<'_, ArrayType, ArrayType>, Error> =
             compile_with_options(|x| x.sin().unwrap(), input_type, &engine, options);
-        assert!(matches!(result, Err(XlaDomainError::InvalidCompilationOptions { .. })));
+        assert!(matches!(result, Err(Error::InvalidCompilationOptions { .. })));
     }
 
     /// Unused non-parameter input metadata does not partition compilation when the complete lowering is identical.
@@ -6893,9 +6873,9 @@ mod tests {
         // Two shardings for one flat input — should fail.
         let xla_options = XlaOptions::new(mesh).with_in_shardings(vec![sharding.clone(), sharding]);
         let options = xla_options;
-        let result: Result<CompiledXlaFunction<'_, ArrayType, ArrayType>, XlaDomainError> =
+        let result: Result<CompiledXlaFunction<'_, ArrayType, ArrayType>, Error> =
             compile_with_options(|x| x.sin().unwrap(), input_type, &engine, options);
-        assert!(matches!(result, Err(XlaDomainError::InvalidCompilationOptions { .. })));
+        assert!(matches!(result, Err(Error::InvalidCompilationOptions { .. })));
     }
 
     #[test]
@@ -7011,9 +6991,9 @@ mod tests {
         let sharding = Sharding::replicated(mesh.logical_mesh().clone(), 1);
         let xla_options = XlaOptions::new(mesh).with_out_shardings(vec![sharding.clone(), sharding]);
         let options = xla_options;
-        let result: Result<CompiledXlaFunction<'_, ArrayType, ArrayType>, XlaDomainError> =
+        let result: Result<CompiledXlaFunction<'_, ArrayType, ArrayType>, Error> =
             compile_with_options(|x| x.sin().unwrap(), input_type, &engine, options);
-        assert!(matches!(result, Err(XlaDomainError::InvalidCompilationOptions { .. })));
+        assert!(matches!(result, Err(Error::InvalidCompilationOptions { .. })));
     }
 
     #[test]

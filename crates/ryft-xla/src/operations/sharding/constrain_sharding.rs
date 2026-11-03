@@ -3,7 +3,7 @@ use ryft_core::{ArrayType, ConstrainShardingOperation, LogicalMesh, ProgramError
 use ryft_mlir::dialects::shardy;
 use ryft_mlir::{Block, BlockRef, LocationRef, Operation as MlirOperation, Value as MlirValue, ValueRef};
 
-use crate::{LowerableOperation, LowerableOperationFamily, LoweringError, ToMlir, XlaLowerer};
+use crate::{Error, LowerableOperation, LowerableOperationFamily, ToMlir, XlaLowerer};
 
 /// Lowers a tensor placement constraint after excluding mesh axes bound by enclosing manual regions.
 pub(crate) fn lower_sharding_constraint<'b, 'c: 'b, 't: 'c>(
@@ -12,7 +12,7 @@ pub(crate) fn lower_sharding_constraint<'b, 'c: 'b, 't: 'c>(
     bound_manual_axes: &[String],
     block: &mut BlockRef<'b, 'c, 't>,
     location: LocationRef<'c, 't>,
-) -> Result<Vec<ValueRef<'b, 'c, 't>>, LoweringError> {
+) -> Result<Vec<ValueRef<'b, 'c, 't>>, Error> {
     check_count!("input", input_values, 1, ProgramError);
     // Bound manual axes describe ownership outside this local tensor and cannot appear on constraints inside the
     // manual region. Restrict only the attribute's mesh inventory; its symbol still names the module's full mesh.
@@ -63,7 +63,7 @@ impl LowerableOperation for ConstrainShardingOperation {
         input_values: &[ValueRef<'b, 'c, 't>],
         _input_types: &[ArrayType],
         output_types: &[ArrayType],
-    ) -> Result<Vec<ValueRef<'b, 'c, 't>>, LoweringError> {
+    ) -> Result<Vec<ValueRef<'b, 'c, 't>>, Error> {
         // The constraint is untracked, so the output type is the input type, and the emitted constraint must
         // carry the input's tracked placement alongside the constraint's own auto-axis placement.
         check_count!("output", output_types, 1, ProgramError);

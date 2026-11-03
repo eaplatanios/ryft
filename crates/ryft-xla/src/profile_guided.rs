@@ -12,10 +12,9 @@ use ryft_core::{ArrayIrType, ArrayType, CompilationCacheDomain, Parameterized, P
 use ryft_pjrt::extensions::profiler::FeedbackDirectedProfile;
 use ryft_pjrt::protos::{ProfileDeviceType, ProfileOptions};
 
-use crate::experimental::XlaDomainError;
 use crate::experimental::domains::XlaLoweredProgram;
 use crate::experimental::ops::XlaConstant;
-use crate::{ExecutableXlaFunction, XlaArray, XlaDomain, XlaFeedbackDirectedProfile, XlaOptions, XlaValue};
+use crate::{Error, ExecutableXlaFunction, XlaArray, XlaDomain, XlaFeedbackDirectedProfile, XlaOptions, XlaValue};
 
 const ADAPTIVE_PROFILE_CACHE_NAMESPACE: &str = "xla-adaptive-profile-v1";
 
@@ -31,14 +30,14 @@ pub struct AdaptiveProfileGuidedOptions {
 impl AdaptiveProfileGuidedOptions {
     /// Creates a policy that collects `sample_count` successful profiles in at most
     /// `maximum_profile_attempts` selected executions.
-    pub fn new(sample_count: usize, maximum_profile_attempts: usize) -> Result<Self, XlaDomainError> {
+    pub fn new(sample_count: usize, maximum_profile_attempts: usize) -> Result<Self, Error> {
         if sample_count == 0 {
-            return Err(XlaDomainError::InvalidCompilationOptions {
+            return Err(Error::InvalidCompilationOptions {
                 reason: "adaptive profile sample_count must be greater than zero".to_string(),
             });
         }
         if maximum_profile_attempts < sample_count {
-            return Err(XlaDomainError::InvalidCompilationOptions {
+            return Err(Error::InvalidCompilationOptions {
                 reason: "adaptive maximum_profile_attempts must be at least sample_count".to_string(),
             });
         }
@@ -46,9 +45,9 @@ impl AdaptiveProfileGuidedOptions {
     }
 
     /// Sets the OpenXLA instruction-cost aggregation percentile.
-    pub fn with_aggregation_percentile(mut self, percentile: u8) -> Result<Self, XlaDomainError> {
+    pub fn with_aggregation_percentile(mut self, percentile: u8) -> Result<Self, Error> {
         if percentile > 100 {
-            return Err(XlaDomainError::InvalidCompilationOptions {
+            return Err(Error::InvalidCompilationOptions {
                 reason: "adaptive aggregation percentile must be in 0..=100".to_string(),
             });
         }
@@ -305,11 +304,11 @@ impl AdaptiveProfileGuidedStateMachine {
     }
 }
 
-fn validate_adaptive_profile_guided_platform(platform_name: &str) -> Result<(), XlaDomainError> {
+fn validate_adaptive_profile_guided_platform(platform_name: &str) -> Result<(), Error> {
     if matches!(platform_name.to_ascii_lowercase().as_str(), "cuda" | "rocm") {
         Ok(())
     } else {
-        Err(XlaDomainError::InvalidCompilationOptions {
+        Err(Error::InvalidCompilationOptions {
             reason: format!(
                 "adaptive profile-guided recompilation requires a CUDA or ROCm PJRT platform, but found \
                  {platform_name}",
@@ -322,7 +321,7 @@ fn adaptive_profile_sidecar_key<'c>(
     domain: &crate::experimental::domains::XlaDomain<'c>,
     lowered_program: &XlaLoweredProgram,
     options: AdaptiveProfileGuidedOptions,
-) -> Result<Option<Vec<u8>>, XlaDomainError> {
+) -> Result<Option<Vec<u8>>, Error> {
     let cache = domain.compilation_context();
     if cache.disk_cache().is_none() {
         return Ok(None);
@@ -331,17 +330,15 @@ fn adaptive_profile_sidecar_key<'c>(
     let Some(baseline_key) = domain.persistent_cache_key(&compilation_key) else {
         return Ok(None);
     };
-    let baseline_key_length =
-        u64::try_from(baseline_key.len()).map_err(|_| XlaDomainError::InvalidCompilationOptions {
-            reason: "baseline persistent key length does not fit in u64".to_string(),
-        })?;
-    let sample_count = u64::try_from(options.sample_count).map_err(|_| XlaDomainError::InvalidCompilationOptions {
+    let baseline_key_length = u64::try_from(baseline_key.len()).map_err(|_| Error::InvalidCompilationOptions {
+        reason: "baseline persistent key length does not fit in u64".to_string(),
+    })?;
+    let sample_count = u64::try_from(options.sample_count).map_err(|_| Error::InvalidCompilationOptions {
         reason: "adaptive sample count does not fit in u64".to_string(),
     })?;
-    let maximum_profile_attempts =
-        u64::try_from(options.maximum_profile_attempts).map_err(|_| XlaDomainError::InvalidCompilationOptions {
-            reason: "adaptive maximum profile attempts does not fit in u64".to_string(),
-        })?;
+    let maximum_profile_attempts = u64::try_from(options.maximum_profile_attempts).map_err(|_| {
+        Error::InvalidCompilationOptions { reason: "adaptive maximum profile attempts does not fit in u64".to_string() }
+    })?;
     let mut key = Vec::with_capacity(baseline_key.len() + 48);
     key.extend_from_slice(b"RYFT-ADAPTIVE-PROFILE\0");
     key.extend_from_slice(&baseline_key_length.to_le_bytes());
@@ -405,9 +402,9 @@ where
         lowered_program: XlaLoweredProgram,
         compilation_options: XlaOptions,
         options: AdaptiveProfileGuidedOptions,
-    ) -> Result<Self, XlaDomainError> {
+    ) -> Result<Self, Error> {
         if compilation_options.feedback_directed_profile.is_some() {
-            return Err(XlaDomainError::InvalidCompilationOptions {
+            return Err(Error::InvalidCompilationOptions {
                 reason: "adaptive profile-guided recompilation requires an unprofiled baseline".to_string(),
             });
         }
@@ -464,7 +461,7 @@ where
     }
 
     /// Executes with the active executable and advances adaptive profiling when this call wins ownership.
-    pub fn interpret(&self, inputs: In::To<XlaArray<'c>>) -> Result<Out::To<XlaArray<'c>>, XlaDomainError>
+    pub fn interpret(&self, inputs: In::To<XlaArray<'c>>) -> Result<Out::To<XlaArray<'c>>, Error>
     where
         In::Family: ParameterizedFamily<XlaArray<'c>> + ParameterizedFamily<XlaValue<'c>>,
         Out::Family: ParameterizedFamily<XlaArray<'c>> + ParameterizedFamily<XlaValue<'c>>,
@@ -500,7 +497,7 @@ where
         &self,
         executable: ExecutableXlaFunction<'c, In, Out>,
         inputs: In::To<XlaArray<'c>>,
-    ) -> Result<Out::To<XlaArray<'c>>, XlaDomainError>
+    ) -> Result<Out::To<XlaArray<'c>>, Error>
     where
         In::Family: ParameterizedFamily<XlaArray<'c>> + ParameterizedFamily<XlaValue<'c>>,
         Out::Family: ParameterizedFamily<XlaArray<'c>> + ParameterizedFamily<XlaValue<'c>>,
@@ -582,7 +579,7 @@ where
             .profile_failed(reason, self.inner.options);
     }
 
-    fn compile_profile(&self, profile: Vec<u8>) -> Result<ExecutableXlaFunction<'c, In, Out>, XlaDomainError> {
+    fn compile_profile(&self, profile: Vec<u8>) -> Result<ExecutableXlaFunction<'c, In, Out>, Error> {
         let profile = XlaFeedbackDirectedProfile::new(profile).with_version(self.inner.options.profile_version);
         let lowered_program = self.inner.lowered_program.clone().with_feedback_directed_profile(profile);
         let domain = &self.inner.domain;
@@ -660,7 +657,7 @@ where
                     let candidate = self.compile_profile(profile.bytes().to_vec());
                     (Some(profile), candidate)
                 }
-                Err(error) => (None, Err(XlaDomainError::from(error))),
+                Err(error) => (None, Err(Error::from(error))),
             };
         match candidate {
             Ok(candidate) => {

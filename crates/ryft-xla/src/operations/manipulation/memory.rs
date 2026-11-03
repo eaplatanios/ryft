@@ -6,7 +6,7 @@ use ryft_mlir::{
     Attribute, Block, Context as MlirContext, Location, Operation as MlirOperation, Value as MlirValue, ValueRef,
 };
 
-use crate::{LowerableOperation, LowerableOperationFamily, LoweringError, XlaLowerer};
+use crate::{Error, LowerableOperation, LowerableOperationFamily, XlaLowerer};
 
 /// Returns the XLA memory-kind string for `memory`, used by `mhlo.memory_kind` signature attributes and the
 /// `_xla_buffer_placement` frontend attribute on `annotate_device_placement` custom calls. This mapping is owned by the
@@ -27,7 +27,7 @@ pub(crate) fn annotate_output_memory<'b, 'c: 'b, 't: 'c, B: Block<'b, 'c, 't>, L
     block: &mut B,
     context: &'c MlirContext<'t>,
     location: L,
-) -> Result<ValueRef<'b, 'c, 't>, LoweringError> {
+) -> Result<ValueRef<'b, 'c, 't>, Error> {
     if output_type.memory() == Memory::Device {
         return Ok(value);
     }
@@ -54,7 +54,7 @@ pub(crate) fn lower_transfer_to_memory<'b, 'c: 'b, 't: 'c, B: Block<'b, 'c, 't>,
     block: &mut B,
     context: &'c MlirContext<'t>,
     location: L,
-) -> Result<Vec<ValueRef<'b, 'c, 't>>, LoweringError> {
+) -> Result<Vec<ValueRef<'b, 'c, 't>>, Error> {
     check_count!("input", input_values, 1, ProgramError);
     let empty_backend_config = context.string_attribute("");
     let mut operation = stable_hlo::custom_call(
@@ -88,7 +88,7 @@ impl LowerableOperation for TransferToMemoryOperation {
         input_values: &[ValueRef<'b, 'c, 't>],
         _input_types: &[ArrayType],
         _output_types: &[ArrayType],
-    ) -> Result<Vec<ValueRef<'b, 'c, 't>>, LoweringError> {
+    ) -> Result<Vec<ValueRef<'b, 'c, 't>>, Error> {
         lower_transfer_to_memory(
             self.destination(),
             input_values,

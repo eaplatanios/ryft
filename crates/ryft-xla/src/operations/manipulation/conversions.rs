@@ -18,7 +18,7 @@ use crate::operations::constants::lower_layout_constraint;
 use crate::operations::control_flow::{lower_refined_region_input, lower_refined_region_outputs};
 use crate::operations::reductions::lower_reduce_to_mlir;
 use crate::operations::sharding::constrain_sharding::lower_sharding_constraint;
-use crate::{LowerableOperation, LowerableOperationFamily, LoweringError, XlaLowerer};
+use crate::{Error, LowerableOperation, LowerableOperationFamily, XlaLowerer};
 
 impl LowerableOperation for ConvertElementTypeOperation<ArrayType> {
     fn lower<'b, 'c: 'b, 't: 'c, O: LowerableOperationFamily>(
@@ -27,7 +27,7 @@ impl LowerableOperation for ConvertElementTypeOperation<ArrayType> {
         input_values: &[ValueRef<'b, 'c, 't>],
         input_types: &[ArrayType],
         output_types: &[ArrayType],
-    ) -> Result<Vec<ValueRef<'b, 'c, 't>>, LoweringError> {
+    ) -> Result<Vec<ValueRef<'b, 'c, 't>>, Error> {
         check_count!("input", input_values, 1, ProgramError);
         check_count!("output", output_types, 1, ProgramError);
         check_count!("input", input_types, 1, ProgramError);
@@ -221,7 +221,7 @@ impl LowerableOperation for ReducePrecisionOperation<ArrayType> {
         input_values: &[ValueRef<'b, 'c, 't>],
         _input_types: &[ArrayType],
         _output_types: &[ArrayType],
-    ) -> Result<Vec<ValueRef<'b, 'c, 't>>, LoweringError> {
+    ) -> Result<Vec<ValueRef<'b, 'c, 't>>, Error> {
         check_count!("input", input_values, 1, ProgramError);
         let result = lowerer.block.append_operation(stable_hlo::reduce_precision(
             input_values[0],
@@ -240,7 +240,7 @@ impl LowerableOperation for CastOperation<ArrayType> {
         input_values: &[ValueRef<'b, 'c, 't>],
         input_types: &[ArrayType],
         output_types: &[ArrayType],
-    ) -> Result<Vec<ValueRef<'b, 'c, 't>>, LoweringError> {
+    ) -> Result<Vec<ValueRef<'b, 'c, 't>>, Error> {
         lower_cast_operation(self, lowerer, input_values, input_types, output_types)
     }
 }
@@ -252,7 +252,7 @@ impl LowerableOperation for CastOperation<ArrayIrType> {
         input_values: &[ValueRef<'b, 'c, 't>],
         input_types: &[ArrayIrType],
         output_types: &[ArrayIrType],
-    ) -> Result<Vec<ValueRef<'b, 'c, 't>>, LoweringError> {
+    ) -> Result<Vec<ValueRef<'b, 'c, 't>>, Error> {
         lower_cast_operation(self, lowerer, input_values, input_types, output_types)
     }
 }
@@ -268,10 +268,10 @@ fn lower_cast_operation<'b, 'c: 'b, 't: 'c, T: CastType + Into<ArrayIrType>, O: 
     input_values: &[ValueRef<'b, 'c, 't>],
     input_types: &[T],
     output_types: &[T],
-) -> Result<Vec<ValueRef<'b, 'c, 't>>, LoweringError> {
+) -> Result<Vec<ValueRef<'b, 'c, 't>>, Error> {
     check_count!("output", output_types, 1, ProgramError);
     if input_values.is_empty() || input_types.is_empty() {
-        return Err(LoweringError::UnsupportedOp { op: format!("`{}` expects at least 1 input", operation.name()) });
+        return Err(Error::UnsupportedOperation { op: format!("`{}` expects at least 1 input", operation.name()) });
     }
     // A checked cast is ordered after preceding assertions even when the actual types prove its relationship and no
     // check is emitted (binding normalizes proven casts to unchecked ones, so this only affects casts staged directly
@@ -295,7 +295,7 @@ fn lower_cast_check<'b, 'c: 'b, 't: 'c, T: CastType + Into<ArrayIrType>, O: Lowe
     input_values: &[ValueRef<'b, 'c, 't>],
     input_types: &[T],
     lowerer: &mut XlaLowerer<'b, 'c, 't, O>,
-) -> Result<(), LoweringError> {
+) -> Result<(), Error> {
     if !operation.is_checked()
         || T::infer_cast_output_type(operation, input_types).map_err(ProgramError::from)?.1.is_some()
     {
@@ -331,7 +331,7 @@ fn lower_cast<'b, 'c: 'b, 't: 'c, O: LowerableOperationFamily>(
     input_type: &ArrayIrType,
     output_type: &ArrayIrType,
     lowerer: &mut XlaLowerer<'b, 'c, 't, O>,
-) -> Result<ValueRef<'b, 'c, 't>, LoweringError> {
+) -> Result<ValueRef<'b, 'c, 't>, Error> {
     let value =
         lower_cast_shape(value, input_type, output_type, &mut lowerer.block, lowerer.context, lowerer.location)?;
     let (ArrayIrType::Array(input_type), ArrayIrType::Array(output_type)) = (input_type, output_type) else {
@@ -409,7 +409,7 @@ pub(crate) fn lower_cast_shape<'b, 'c: 'b, 't: 'c>(
     block: &mut BlockRef<'b, 'c, 't>,
     context: &'c MlirContext<'t>,
     location: LocationRef<'c, 't>,
-) -> Result<ValueRef<'b, 'c, 't>, LoweringError> {
+) -> Result<ValueRef<'b, 'c, 't>, Error> {
     // Converting any axis materializes the static physical buffer of the whole value, which needs a finite physical
     // bound for every dynamic axis of both types, including axes that this conversion leaves unchanged.
     if let (ArrayIrType::Array(input), ArrayIrType::Array(output)) = (input_type, output_type) {
@@ -427,7 +427,7 @@ pub(crate) fn lower_cast_shape<'b, 'c: 'b, 't: 'c>(
         };
         if let Some(changed_axis) = changed_axis {
             if let Some(dimension) = unbounded_dimension(changed_axis) {
-                return Err(LoweringError::UnsupportedOp {
+                return Err(Error::UnsupportedOperation {
                     op: format!(
                         "shape conversion along axis {changed_axis} requires a finite physical bound, but that axis \
                          has unbounded dimension `{dimension}`",
@@ -437,7 +437,7 @@ pub(crate) fn lower_cast_shape<'b, 'c: 'b, 't: 'c>(
             if let Some((axis, dimension)) =
                 (0..dimension_pairs.len()).find_map(|axis| unbounded_dimension(axis).map(|dimension| (axis, dimension)))
             {
-                return Err(LoweringError::UnsupportedOp {
+                return Err(Error::UnsupportedOperation {
                     op: format!(
                         "shape conversion along axis {changed_axis} requires finite physical bounds for every axis, \
                          but axis {axis} has unbounded dimension `{dimension}`",
@@ -483,7 +483,7 @@ fn lower_conversion_round_to_odd<'b, 'c: 'b, 't: 'c>(
     block: &mut BlockRef<'b, 'c, 't>,
     context: &'c MlirContext<'t>,
     location: LocationRef<'c, 't>,
-) -> Result<ValueRef<'b, 'c, 't>, LoweringError> {
+) -> Result<ValueRef<'b, 'c, 't>, Error> {
     let float_type = lower_tensor_type(&input_type.clone().with_data_type(DataType::F32), context, location)?;
     let float = block.append_operation(stable_hlo::convert(input, float_type, location)?)?;
     let float = float.result(0).unwrap().as_ref();
@@ -665,7 +665,7 @@ fn lower_bitcast_to_mlir<'b, 'c: 'b, 't: 'c>(
     block: &mut BlockRef<'b, 'c, 't>,
     context: &'c MlirContext<'t>,
     location: LocationRef<'c, 't>,
-) -> Result<ValueRef<'b, 'c, 't>, LoweringError> {
+) -> Result<ValueRef<'b, 'c, 't>, Error> {
     let input_one_bit = matches!(input_type.data_type(), DataType::I1 | DataType::U1);
     let output_one_bit = matches!(output_type.data_type(), DataType::I1 | DataType::U1);
     if input_type.data_type() == output_type.data_type() || input_one_bit && output_one_bit {
@@ -682,7 +682,7 @@ fn lower_bitcast_to_mlir<'b, 'c: 'b, 't: 'c>(
         return Ok(result.result(0).unwrap().as_ref());
     }
     // Width-changing bitcasts need physical bounds for XLA's dynamic padding pass.
-    let physical_input_type = physical_bound_type(input_type).map_err(|_| LoweringError::UnsupportedOp {
+    let physical_input_type = physical_bound_type(input_type).map_err(|_| Error::UnsupportedOperation {
         op: "width-changing bitcast with an unbounded dynamic dimension".to_string(),
     })?;
     let padding = if input_type.data_type() == DataType::F8E8M0FNU { 1.0 } else { 0.0 };
@@ -863,7 +863,7 @@ fn lower_fp6_to_bits<'b, 'c: 'b, 't: 'c>(
     block: &mut BlockRef<'b, 'c, 't>,
     context: &'c MlirContext<'t>,
     location: LocationRef<'c, 't>,
-) -> Result<ValueRef<'b, 'c, 't>, LoweringError> {
+) -> Result<ValueRef<'b, 'c, 't>, Error> {
     let (mantissa_bits, bias) = if r#type.data_type() == DataType::F6E2M3FN { (3, 1) } else { (2, 3) };
     let integer_type = r#type.clone().with_data_type(DataType::U32);
     let integer_tensor_type = lower_tensor_type(&integer_type, context, location)?;
@@ -947,7 +947,7 @@ fn lower_bits_to_fp6<'b, 'c: 'b, 't: 'c>(
     block: &mut BlockRef<'b, 'c, 't>,
     context: &'c MlirContext<'t>,
     location: LocationRef<'c, 't>,
-) -> Result<ValueRef<'b, 'c, 't>, LoweringError> {
+) -> Result<ValueRef<'b, 'c, 't>, Error> {
     let (mantissa_bits, bias) = if r#type.data_type() == DataType::F6E2M3FN { (3, 1) } else { (2, 3) };
     let integer_type = r#type.clone().with_data_type(DataType::U32);
     let integer_tensor_type = lower_tensor_type(&integer_type, context, location)?;
@@ -1150,12 +1150,11 @@ mod tests {
         let program = builder
             .build::<Vec<XlaArrayConstant>, Vec<XlaArrayConstant>>(vec![output], vec![Placeholder], vec![Placeholder])
             .unwrap();
-        assert_eq!(
+        assert!(matches!(
             to_mlir_module_for_plain_program(&program, "main"),
-            Err(LoweringError::UnsupportedOp {
-                op: "width-changing bitcast with an unbounded dynamic dimension".to_string(),
-            }),
-        );
+            Err(Error::UnsupportedOperation { op })
+                if op == "width-changing bitcast with an unbounded dynamic dimension",
+        ));
     }
 
     #[test]
@@ -1209,8 +1208,8 @@ mod tests {
             )
             .unwrap();
             assert_eq!(
-                execute_mixed_program(&client, &program, std::slice::from_ref(&symbolic_input), &[2]),
-                Ok(vec![MixedValue::Array(vec![1.0, 2.0], vec![2])]),
+                execute_mixed_program(&client, &program, std::slice::from_ref(&symbolic_input), &[2]).unwrap(),
+                vec![MixedValue::Array(vec![1.0, 2.0], vec![2])],
             );
             let result = execute_mixed_program(&client, &program, std::slice::from_ref(&symbolic_input), &[3]);
             if checked {
@@ -1231,8 +1230,8 @@ mod tests {
         .unwrap();
         let inputs = [MixedValue::Array(vec![1.0, 2.0], vec![2]), MixedValue::Array(vec![3.0, 4.0, 5.0, 0.0], vec![4])];
         assert_eq!(
-            execute_mixed_program(&client, &program, &inputs, &[2]),
-            Ok(vec![MixedValue::Array(vec![4.0, 6.0], vec![2]), MixedValue::Dimension(2)]),
+            execute_mixed_program(&client, &program, &inputs, &[2]).unwrap(),
+            vec![MixedValue::Array(vec![4.0, 6.0], vec![2]), MixedValue::Dimension(2)],
         );
         let error = execute_mixed_program(&client, &program, &inputs, &[3]).unwrap_err().to_string();
         assert!(error.contains("input dimension `n` must have one extent in `cast`"), "{error}");
@@ -1260,8 +1259,8 @@ mod tests {
             .unwrap();
         let client = execution_client();
         assert_eq!(
-            execute_mixed_program(&client, &program, &[MixedValue::Dimension(2)], &[]),
-            Ok(vec![MixedValue::Dimension(2)]),
+            execute_mixed_program(&client, &program, &[MixedValue::Dimension(2)], &[]).unwrap(),
+            vec![MixedValue::Dimension(2)],
         );
         let error = execute_mixed_program(&client, &program, &[MixedValue::Dimension(3)], &[]).unwrap_err().to_string();
         assert!(error.contains("must have the declared extent in `cast`"), "{error}");
@@ -1287,8 +1286,9 @@ mod tests {
                 &program.to_flat_program(),
                 &[MixedValue::Array(vec![1.0, 2.0], vec![2]), MixedValue::Array(vec![3.0, 4.0, 0.0, 0.0], vec![4]),],
                 &[2]
-            ),
-            Ok(vec![MixedValue::Array(vec![1.0, 2.0], vec![2]), MixedValue::Dimension(2)]),
+            )
+            .unwrap(),
+            vec![MixedValue::Array(vec![1.0, 2.0], vec![2]), MixedValue::Dimension(2)],
         );
     }
 
@@ -1548,15 +1548,15 @@ mod tests {
                         assert!(error.contains("must have the declared extent in `cast`"), "{error}");
                     } else {
                         assert_eq!(
-                            result,
-                            Ok(vec![
+                            result.unwrap(),
+                            vec![
                                 MixedValue::Array(
                                     (1..=extent).map(|value| value as f64).collect(),
                                     vec![extent as u64]
                                 ),
                                 MixedValue::Dimension(extent as i64),
-                            ]),
-                            "wrapper={wrapper}, entered={entered}, extent={extent}"
+                            ],
+                            "wrapper={wrapper}, entered={entered}, extent={extent}",
                         );
                     }
                 }
@@ -1602,8 +1602,8 @@ mod tests {
             .unwrap();
         let client = execution_client();
         assert_eq!(
-            execute_mixed_program(&client, &program, &[MixedValue::Array(vec![2.0], vec![])], &[]),
-            Ok(vec![MixedValue::Array(vec![2.0], vec![])])
+            execute_mixed_program(&client, &program, &[MixedValue::Array(vec![2.0], vec![])], &[]).unwrap(),
+            vec![MixedValue::Array(vec![2.0], vec![])],
         );
         let error = execute_mixed_program(&client, &program, &[MixedValue::Array(vec![3.0], vec![])], &[])
             .unwrap_err()
@@ -1663,8 +1663,8 @@ mod tests {
         let primal = MixedValue::Array(vec![1.0, 2.0, 0.0, 0.0], vec![4]);
         let tangent = MixedValue::Array(vec![3.0, 4.0, 0.0, 0.0], vec![4]);
         assert_eq!(
-            execute_mixed_program(&client, &jvp, &[primal, tangent], &[2, 2]),
-            Ok(vec![MixedValue::Array(vec![1.0, 2.0], vec![2]), MixedValue::Array(vec![3.0, 4.0], vec![2])]),
+            execute_mixed_program(&client, &jvp, &[primal, tangent], &[2, 2]).unwrap(),
+            vec![MixedValue::Array(vec![1.0, 2.0], vec![2]), MixedValue::Array(vec![3.0, 4.0], vec![2])],
         );
         let wrong = MixedValue::Array(vec![1.0, 2.0, 3.0, 0.0], vec![4]);
         let error = execute_mixed_program(&client, &jvp, &[wrong.clone(), wrong], &[3, 3]).unwrap_err().to_string();
@@ -1690,8 +1690,9 @@ mod tests {
                 &pullback,
                 &[MixedValue::Array(vec![5.0, 6.0], vec![2]), MixedValue::Dimension(2)],
                 &[],
-            ),
-            Ok(vec![MixedValue::Array(vec![5.0, 6.0], vec![2]), MixedValue::Dimension(2)]),
+            )
+            .unwrap(),
+            vec![MixedValue::Array(vec![5.0, 6.0], vec![2]), MixedValue::Dimension(2)],
         );
     }
 
@@ -1725,8 +1726,8 @@ mod tests {
         let client = execution_client();
         let inputs = [MixedValue::Array(vec![1.0, 2.0], vec![2]), MixedValue::Array(vec![3.0, 4.0, 0.0, 0.0], vec![4])];
         assert_eq!(
-            execute_mixed_program(&client, &program, &inputs, &[2]),
-            Ok(vec![MixedValue::Array(vec![4.0, 6.0], vec![2])]),
+            execute_mixed_program(&client, &program, &inputs, &[2]).unwrap(),
+            vec![MixedValue::Array(vec![4.0, 6.0], vec![2])],
         );
         let error = execute_mixed_program(&client, &program, &inputs, &[3]).unwrap_err().to_string();
         assert!(error.contains("input dimension `n` must have one extent at the entry of `region`"), "{error}");
@@ -1756,8 +1757,9 @@ mod tests {
                 &jvp,
                 &[inputs[0].clone(), inputs[1].clone(), tangents[0].clone(), tangents[1].clone()],
                 &[2, 2],
-            ),
-            Ok(vec![MixedValue::Array(vec![4.0, 6.0], vec![2]), MixedValue::Array(vec![11.0, 21.0], vec![2])]),
+            )
+            .unwrap(),
+            vec![MixedValue::Array(vec![4.0, 6.0], vec![2]), MixedValue::Array(vec![11.0, 21.0], vec![2])],
         );
 
         // The pullback widens the static cotangent back to the bounded dynamic input with a `cast` that the residual
@@ -1776,12 +1778,13 @@ mod tests {
                 &pullback,
                 &[MixedValue::Array(vec![1.0, 2.0], vec![2]), MixedValue::Dimension(2)],
                 &[],
-            ),
-            Ok(vec![
+            )
+            .unwrap(),
+            vec![
                 MixedValue::Array(vec![1.0, 2.0], vec![2]),
                 MixedValue::Array(vec![1.0, 2.0], vec![2]),
                 MixedValue::Dimension(2),
-            ]),
+            ],
         );
     }
 
@@ -1822,12 +1825,12 @@ mod tests {
         let client = execution_client();
         let input = MixedValue::Array(vec![1f64; 16], vec![4, 4]);
         assert_eq!(
-            execute_mixed_program(&client, &program, std::slice::from_ref(&input), &[2, 2]),
-            Ok(vec![MixedValue::Array(vec![1f64; 4], vec![2, 2]), MixedValue::Dimension(2), MixedValue::Dimension(2)]),
+            execute_mixed_program(&client, &program, std::slice::from_ref(&input), &[2, 2]).unwrap(),
+            vec![MixedValue::Array(vec![1f64; 4], vec![2, 2]), MixedValue::Dimension(2), MixedValue::Dimension(2)],
         );
         assert_eq!(
-            execute_mixed_program(&client, &program, std::slice::from_ref(&input), &[0, 0]),
-            Ok(vec![MixedValue::Array(Vec::new(), vec![0, 0]), MixedValue::Dimension(0), MixedValue::Dimension(0)]),
+            execute_mixed_program(&client, &program, std::slice::from_ref(&input), &[0, 0]).unwrap(),
+            vec![MixedValue::Array(Vec::new(), vec![0, 0]), MixedValue::Dimension(0), MixedValue::Dimension(0)],
         );
         let error = execute_mixed_program(&client, &program, std::slice::from_ref(&input), &[2, 3])
             .unwrap_err()
@@ -1856,15 +1859,15 @@ mod tests {
         );
         let inputs = [input.clone(), input];
         assert_eq!(
-            execute_mixed_program(&client, &differentiated, &inputs, &[2, 2, 2, 2]),
-            Ok(vec![
+            execute_mixed_program(&client, &differentiated, &inputs, &[2, 2, 2, 2]).unwrap(),
+            vec![
                 MixedValue::Array(vec![1f64; 4], vec![2, 2]),
                 MixedValue::Array(vec![1f64; 4], vec![2, 2]),
                 MixedValue::Dimension(2),
                 MixedValue::Dimension(2),
                 MixedValue::Dimension(2),
                 MixedValue::Dimension(2),
-            ]),
+            ],
         );
         let error = execute_mixed_program(&client, &differentiated, &inputs, &[2, 3, 2, 3]).unwrap_err().to_string();
         assert!(error.contains("input dimension `p` must have one extent at the entry of `square`"), "{error}");
@@ -1883,14 +1886,14 @@ mod tests {
             .0;
         let inputs = [MixedValue::Dimension(2), MixedValue::Array(vec![1f64; 48], vec![3, 4, 4])];
         assert_eq!(
-            execute_mixed_program(&client, &batched, &inputs, &[2, 2, 2]),
-            Ok(vec![
+            execute_mixed_program(&client, &batched, &inputs, &[2, 2, 2]).unwrap(),
+            vec![
                 MixedValue::Dimension(2),
                 MixedValue::Array(vec![1f64; 8], vec![2, 2, 2]),
                 MixedValue::Dimension(2),
                 MixedValue::Dimension(2),
                 MixedValue::Dimension(2),
-            ]),
+            ],
         );
         let error = execute_mixed_program(&client, &batched, &inputs, &[2, 2, 3]).unwrap_err().to_string();
         assert!(error.contains("must have one extent at the entry of `square`"), "{error}");
@@ -1929,7 +1932,10 @@ mod tests {
             .unwrap();
         let client = execution_client();
         let input = MixedValue::Array(vec![1f64; 16], vec![4, 4]);
-        assert_eq!(execute_mixed_program(&client, &program, std::slice::from_ref(&input), &[2, 2]), Ok(Vec::new()));
+        assert_eq!(
+            execute_mixed_program(&client, &program, std::slice::from_ref(&input), &[2, 2]).unwrap(),
+            Vec::new(),
+        );
         let error = execute_mixed_program(&client, &program, &[input], &[2, 3]).unwrap_err().to_string();
         assert!(error.contains("input dimension `p` must have one extent at the entry of `square`"), "{error}");
     }
@@ -2272,8 +2278,8 @@ mod tests {
         let input = MixedValue::Array(vec![1f64; 16], vec![4, 4]);
         let client = execution_client();
         assert_eq!(
-            execute_mixed_program(&client, &program, std::slice::from_ref(&input), &[2, 2]),
-            Ok(vec![MixedValue::Array(vec![1f64; 4], vec![2, 2])]),
+            execute_mixed_program(&client, &program, std::slice::from_ref(&input), &[2, 2]).unwrap(),
+            vec![MixedValue::Array(vec![1f64; 4], vec![2, 2])],
         );
         let error = execute_mixed_program(&client, &program, &[input], &[3, 3]).unwrap_err().to_string();
         assert!(error.contains("input dimension `n` must have the declared extent in `cast`"), "{error}");
@@ -2432,8 +2438,8 @@ mod tests {
             assert_eq!(module, expected_module);
             let input = MixedValue::Array(vec![1.0; 16], vec![4, 4]);
             assert_eq!(
-                execute_mixed_program(&client, &program, &[MixedValue::Dimension(2), input.clone()], &[2, 2]),
-                Ok(vec![MixedValue::Array(vec![1.0; 4], vec![2, 2]), MixedValue::Dimension(2)]),
+                execute_mixed_program(&client, &program, &[MixedValue::Dimension(2), input.clone()], &[2, 2]).unwrap(),
+                vec![MixedValue::Array(vec![1.0; 4], vec![2, 2]), MixedValue::Dimension(2)],
             );
             if witness_type != b {
                 let error = execute_mixed_program(&client, &program, &[MixedValue::Dimension(3), input], &[2, 2])
@@ -2472,8 +2478,8 @@ mod tests {
         let client = execution_client();
         let input = MixedValue::Array(vec![1f64; 16], vec![4, 4]);
         assert_eq!(
-            execute_mixed_program(&client, &program, std::slice::from_ref(&input), &[2, 2]),
-            Ok(vec![MixedValue::Array(vec![1f64; 4], vec![2, 2]), MixedValue::Dimension(2), MixedValue::Dimension(2)]),
+            execute_mixed_program(&client, &program, std::slice::from_ref(&input), &[2, 2]).unwrap(),
+            vec![MixedValue::Array(vec![1f64; 4], vec![2, 2]), MixedValue::Dimension(2), MixedValue::Dimension(2)],
         );
         let error = execute_mixed_program(&client, &program, std::slice::from_ref(&input), &[2, 3])
             .unwrap_err()
@@ -2492,15 +2498,15 @@ mod tests {
                 in (%2, %3)"},
         );
         assert_eq!(
-            execute_mixed_program(&client, &differentiated, &[input.clone(), input.clone()], &[2, 2, 2, 2]),
-            Ok(vec![
+            execute_mixed_program(&client, &differentiated, &[input.clone(), input.clone()], &[2, 2, 2, 2]).unwrap(),
+            vec![
                 MixedValue::Array(vec![1f64; 4], vec![2, 2]),
                 MixedValue::Array(vec![1f64; 4], vec![2, 2]),
                 MixedValue::Dimension(2),
                 MixedValue::Dimension(2),
                 MixedValue::Dimension(2),
                 MixedValue::Dimension(2),
-            ]),
+            ],
         );
         let error = execute_mixed_program(&client, &differentiated, &[input.clone(), input.clone()], &[2, 3, 2, 3])
             .unwrap_err()
@@ -2522,8 +2528,8 @@ mod tests {
             .build::<Vec<XlaConstant>, Vec<XlaConstant>>(vec![output], vec![Placeholder], vec![Placeholder])
             .unwrap();
         assert_eq!(
-            execute_mixed_program(&client, &program, &[input], &[2, 3]),
-            Ok(vec![MixedValue::Array(vec![1f64; 6], vec![2, 3]), MixedValue::Dimension(2), MixedValue::Dimension(3)]),
+            execute_mixed_program(&client, &program, &[input], &[2, 3]).unwrap(),
+            vec![MixedValue::Array(vec![1f64; 6], vec![2, 3]), MixedValue::Dimension(2), MixedValue::Dimension(3)],
         );
     }
 
@@ -2559,8 +2565,8 @@ mod tests {
         let client = execution_client();
         let inputs = [MixedValue::Array(vec![1f64; 12], vec![4, 3]), MixedValue::Array(vec![1f64; 4], vec![4])];
         assert_eq!(
-            execute_mixed_program(&client, &program, &inputs, &[3, 3]),
-            Ok(vec![MixedValue::Array(vec![1f64; 9], vec![3, 3]), MixedValue::Dimension(3)]),
+            execute_mixed_program(&client, &program, &inputs, &[3, 3]).unwrap(),
+            vec![MixedValue::Array(vec![1f64; 9], vec![3, 3]), MixedValue::Dimension(3)],
         );
         let error = execute_mixed_program(&client, &program, &inputs, &[4, 3]).unwrap_err().to_string();
         assert!(error.contains("must have the declared extent in `cast`"), "{error}");
@@ -2660,8 +2666,8 @@ mod tests {
         let client = execution_client();
         let inputs = [MixedValue::Array(vec![1f64; 12], vec![4, 3]), MixedValue::Array(vec![1f64; 3], vec![3])];
         assert_eq!(
-            execute_mixed_program(&client, &program, &inputs, &[3]),
-            Ok(vec![MixedValue::Array(vec![1f64; 9], vec![3, 3])]),
+            execute_mixed_program(&client, &program, &inputs, &[3]).unwrap(),
+            vec![MixedValue::Array(vec![1f64; 9], vec![3, 3])],
         );
         let error = execute_mixed_program(&client, &program, &inputs, &[4]).unwrap_err().to_string();
         assert!(error.contains("must have the declared extent in `cast`"), "{error}");
@@ -2713,7 +2719,7 @@ mod tests {
                 "},
             );
             let program = program.into_unprojected::<XlaConstant, XlaOperation>().unwrap();
-            assert_eq!(
+            assert!(matches!(
                 crate::to_mlir_module_for_program(
                     &program,
                     &[],
@@ -2723,10 +2729,9 @@ mod tests {
                     None,
                     None,
                 ),
-                Err(LoweringError::UnsupportedOp {
-                    op: "non-row-major bounded-dynamic output layout `tiled{0,1}`".to_string(),
-                }),
-            );
+                Err(Error::UnsupportedOperation { op })
+                    if op == "non-row-major bounded-dynamic output layout `tiled{0,1}`",
+            ));
         }
     }
 
@@ -2824,8 +2829,8 @@ mod tests {
             MixedValue::Array(vec![0.0; 12], vec![4, 3]),
         ];
         assert_eq!(
-            execute_mixed_program(&client, &program, &inputs, &[2]),
-            Ok(vec![MixedValue::Array((1..=6).map(f64::from).collect(), vec![2, 3]), MixedValue::Dimension(2)]),
+            execute_mixed_program(&client, &program, &inputs, &[2]).unwrap(),
+            vec![MixedValue::Array((1..=6).map(f64::from).collect(), vec![2, 3]), MixedValue::Dimension(2)],
         );
         let error = execute_mixed_program(&client, &program, &inputs, &[3]).unwrap_err().to_string();
         assert!(error.contains("input dimension `n` must have one extent in `cast`"), "{error}");
@@ -2957,8 +2962,9 @@ mod tests {
                 &program,
                 &[MixedValue::Array(vec![1.0, 2.0, 3.0, 4.0, 5.0, 6.0, 0.0, 0.0, 0.0, 0.0, 0.0, 0.0], vec![4, 3])],
                 &[2],
-            ),
-            Ok(vec![MixedValue::Array(vec![1.0, 4.0, 2.0, 5.0, 3.0, 6.0], vec![6])]),
+            )
+            .unwrap(),
+            vec![MixedValue::Array(vec![1.0, 4.0, 2.0, 5.0, 3.0, 6.0], vec![6])],
         );
     }
 
@@ -2972,7 +2978,7 @@ mod tests {
             (Layout::Tiled(TiledLayout::new(vec![0], vec![Tile::new(vec![TileDimension::Sized(2)])])), "tiled"),
         ] {
             let output_type = input_type.clone().with_layout(layout.clone());
-            let expected = Err(LoweringError::UnsupportedOp { op: format!("{kind} output layout `{layout}`") });
+            let expected = format!("{kind} output layout `{layout}`");
             for constructor in [CastOperation::checked, CastOperation::unchecked] {
                 let mut builder = XlaProgramBuilder::new();
                 let input = builder.add_input(input_type.clone());
@@ -2991,9 +2997,12 @@ mod tests {
                         vec![Placeholder],
                     )
                     .unwrap();
-                assert_eq!(to_mlir_module_for_plain_program(&program, "main"), expected);
+                assert!(matches!(
+                    to_mlir_module_for_plain_program(&program, "main"),
+                    Err(Error::UnsupportedOperation { op }) if op == expected,
+                ));
                 let program = program.into_unprojected::<XlaConstant, XlaOperation>().unwrap();
-                assert_eq!(
+                assert!(matches!(
                     to_mlir_module_for_program(
                         &program,
                         &[],
@@ -3003,8 +3012,8 @@ mod tests {
                         None,
                         None,
                     ),
-                    expected,
-                );
+                    Err(Error::UnsupportedOperation { op }) if op == expected,
+                ));
             }
         }
     }
@@ -3069,8 +3078,8 @@ mod tests {
             .unwrap();
         let client = execution_client();
         assert_eq!(
-            execute_mixed_program(&client, &program, &[MixedValue::Array(vec![1.0, 2.0], vec![2])], &[],),
-            Ok(vec![MixedValue::Array(vec![1.0, 2.0], vec![2])]),
+            execute_mixed_program(&client, &program, &[MixedValue::Array(vec![1.0, 2.0], vec![2])], &[],).unwrap(),
+            vec![MixedValue::Array(vec![1.0, 2.0], vec![2])],
         );
     }
 
@@ -3553,8 +3562,9 @@ mod tests {
                 &program,
                 &[MixedValue::Array(vec![1.0, 2.0, 0.0, 0.0], vec![4])],
                 &[2],
-            ),
-            Ok(vec![MixedValue::Array(vec![1.0, 2.0], vec![2]), MixedValue::Dimension(2)]),
+            )
+            .unwrap(),
+            vec![MixedValue::Array(vec![1.0, 2.0], vec![2]), MixedValue::Dimension(2)],
         );
     }
 
@@ -3592,7 +3602,7 @@ mod tests {
         .unwrap();
         assert!(matches!(
             to_mlir_module_for_shard_map(&traced, "main"),
-            Err(LoweringError::Tracing(ProgramError::UnsupportedOperation { message }))
+            Err(Error::Core(ryft_core::Error::Program(ProgramError::UnsupportedOperation { message })))
                 if message == "`cast` cannot assign bound manual mesh axes to local output dimensions",
         ));
     }
@@ -3701,8 +3711,9 @@ mod tests {
                     &program,
                     &[MixedValue::Array(vec![1.0, 2.0, 0.0, 0.0], vec![4]), MixedValue::Array(vec![0.0; 7], vec![7]),],
                     &[2, 2]
-                ),
-                Ok(vec![MixedValue::Array(vec![1.0, 2.0], vec![2]), MixedValue::Dimension(2)])
+                )
+                .unwrap(),
+                vec![MixedValue::Array(vec![1.0, 2.0], vec![2]), MixedValue::Dimension(2)],
             );
             if program.instructions()[0]
                 .operation()
@@ -3809,8 +3820,8 @@ mod tests {
                 MixedValue::Array(vec![0.0; 4], vec![4]),
             ];
             assert_eq!(
-                execute_mixed_program(&client, &program, &inputs, &[3, 3]),
-                Ok(vec![MixedValue::Array(vec![1.0, 2.0, 3.0], vec![3]), MixedValue::Dimension(3)]),
+                execute_mixed_program(&client, &program, &inputs, &[3, 3]).unwrap(),
+                vec![MixedValue::Array(vec![1.0, 2.0, 3.0], vec![3]), MixedValue::Dimension(3)],
             );
             let result = execute_mixed_program(&client, &program, &inputs, &[3, 2]);
             if checked {
@@ -3820,7 +3831,10 @@ mod tests {
                     "{error}"
                 );
             } else {
-                assert_eq!(result, Ok(vec![MixedValue::Array(vec![1.0, 2.0, 3.0], vec![3]), MixedValue::Dimension(3)]));
+                assert_eq!(
+                    result.unwrap(),
+                    vec![MixedValue::Array(vec![1.0, 2.0, 3.0], vec![3]), MixedValue::Dimension(3)],
+                );
             }
         }
     }
@@ -3843,22 +3857,20 @@ mod tests {
             (
                 unbounded.clone(),
                 ArrayType::new_static(DataType::F32, [2]),
-                Err(LoweringError::UnsupportedOp {
-                    op: "shape conversion along axis 0 requires a finite physical bound, but that axis has unbounded \
-                         dimension `n`"
-                        .to_owned(),
-                }),
+                Some(
+                    "shape conversion along axis 0 requires a finite physical bound, but that axis has unbounded \
+                      dimension `n`",
+                ),
             ),
             (
                 mixed.clone(),
                 partially_exact,
-                Err(LoweringError::UnsupportedOp {
-                    op: "shape conversion along axis 1 requires finite physical bounds for every axis, but axis 0 \
-                         has unbounded dimension `n`"
-                        .to_owned(),
-                }),
+                Some(
+                    "shape conversion along axis 1 requires finite physical bounds for every axis, but axis 0 \
+                      has unbounded dimension `n`",
+                ),
             ),
-            (mixed.clone(), mixed, Ok(())),
+            (mixed.clone(), mixed, None),
         ];
         for (input_type, output_type, expected) in cases {
             let context = MlirContext::new();
@@ -3867,15 +3879,16 @@ mod tests {
             let source = block.argument(0).unwrap().as_ref();
             let mut lowerer: XlaLowerer<'_, '_, '_, XlaOperation> =
                 XlaLowerer::new(block.as_ref(), &context, location.as_ref());
-            assert_eq!(
-                CastOperation::unchecked(output_type.clone(), vec![input_type.clone()]).unwrap().lower(
-                    &mut lowerer,
-                    &[source],
-                    &[input_type],
-                    &[output_type],
-                ),
-                expected.map(|()| vec![source]),
+            let result = CastOperation::unchecked(output_type.clone(), vec![input_type.clone()]).unwrap().lower(
+                &mut lowerer,
+                &[source],
+                &[input_type],
+                &[output_type],
             );
+            match expected {
+                Some(expected) => assert!(matches!(result, Err(Error::UnsupportedOperation { op }) if op == expected)),
+                None => assert_eq!(result.unwrap(), vec![source]),
+            }
         }
     }
 }

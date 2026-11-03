@@ -15,20 +15,20 @@ use ryft_mlir::{
 use crate::experimental::lowering::types::{lower_physical_storage, lower_tensor_type, lower_unplaced_constant_output};
 use crate::experimental::lowering::{EffectTokens, current_or_new_token};
 use crate::operations::assertions::lower_output_extent_validation;
-use crate::{LowerableOperation, LowerableOperationFamily, LoweringError, MemberLowerableOperation, XlaLowerer};
+use crate::{Error, LowerableOperation, LowerableOperationFamily, MemberLowerableOperation, XlaLowerer};
 
 /// Returns the minor-to-major layout required by one custom-call array type.
-fn lower_custom_call_layout(r#type: &ArrayType) -> Result<Vec<usize>, LoweringError> {
+fn lower_custom_call_layout(r#type: &ArrayType) -> Result<Vec<usize>, Error> {
     let Some(layout) = r#type.layout() else {
         return Ok((0..r#type.rank()).rev().collect());
     };
     let Layout::Tiled(layout) = layout else {
-        return Err(LoweringError::UnsupportedOp {
+        return Err(Error::UnsupportedOperation {
             op: format!("{CUSTOM_CALL_OPERATION_NAME} with strided array layout `{layout}`"),
         });
     };
     if !layout.tiles().is_empty() {
-        return Err(LoweringError::UnsupportedOp {
+        return Err(Error::UnsupportedOperation {
             op: format!("{CUSTOM_CALL_OPERATION_NAME} with tiled array layout `{layout}`"),
         });
     }
@@ -36,7 +36,7 @@ fn lower_custom_call_layout(r#type: &ArrayType) -> Result<Vec<usize>, LoweringEr
         || layout.minor_to_major().iter().any(|axis| *axis >= r#type.rank())
         || layout.minor_to_major().iter().collect::<HashSet<_>>().len() != r#type.rank()
     {
-        return Err(LoweringError::UnsupportedOp {
+        return Err(Error::UnsupportedOperation {
             op: format!(
                 "{} with invalid array layout `{}` for rank-{} type `{}`",
                 CUSTOM_CALL_OPERATION_NAME,
@@ -54,7 +54,7 @@ fn lower_custom_call_memory_layouts(
     input_types: &[ArrayType],
     output_types: &[ArrayType],
     has_effect_token: bool,
-) -> Result<CustomCallMemoryLayouts, LoweringError> {
+) -> Result<CustomCallMemoryLayouts, Error> {
     let mut operands = input_types.iter().map(lower_custom_call_layout).collect::<Result<Vec<_>, _>>()?;
     let mut results = output_types.iter().map(lower_custom_call_layout).collect::<Result<Vec<_>, _>>()?;
     if has_effect_token {
@@ -70,7 +70,7 @@ fn lower_custom_call_attributes<'c, 't: 'c>(
     attributes: &[(String, CustomCallAttribute)],
     context: &'c MlirContext<'t>,
     location: LocationRef<'c, 't>,
-) -> Result<Vec<NamedAttributeRef<'c, 't>>, LoweringError> {
+) -> Result<Vec<NamedAttributeRef<'c, 't>>, Error> {
     attributes
         .iter()
         .map(|(name, value)| {
@@ -91,7 +91,7 @@ fn lower_custom_call_attribute<'c, 't: 'c>(
     value: &CustomCallAttribute,
     context: &'c MlirContext<'t>,
     location: LocationRef<'c, 't>,
-) -> Result<AttributeRef<'c, 't>, LoweringError> {
+) -> Result<AttributeRef<'c, 't>, Error> {
     let unsigned_tensor_type = |bit_width: usize, length: usize| {
         context.tensor_type(context.unsigned_integer_type(bit_width), &[MlirSize::Static(length)], None, location)
     };
@@ -158,8 +158,8 @@ fn lower_custom_call_attribute<'c, 't: 'c>(
 ///
 /// # Errors
 ///
-/// Returns [`LoweringError::UnsupportedOp`] for a dynamic dimension without a finite upper bound.
-fn custom_call_physical_type(r#type: &ArrayType, role: &str) -> Result<ArrayType, LoweringError> {
+/// Returns [`Error::UnsupportedOperation`] for a dynamic dimension without a finite upper bound.
+fn custom_call_physical_type(r#type: &ArrayType, role: &str) -> Result<ArrayType, Error> {
     let dimensions = r#type
         .shape()
         .dimensions()
@@ -168,7 +168,7 @@ fn custom_call_physical_type(r#type: &ArrayType, role: &str) -> Result<ArrayType
             Dimension::Static(extent) => Ok(Dimension::Static(*extent)),
             Dimension::Dynamic(variable) => {
                 variable.bounds().upper().and_then(|upper| upper.checked_sub(1)).map(Dimension::Static).ok_or_else(
-                    || LoweringError::UnsupportedOp {
+                    || Error::UnsupportedOperation {
                         op: format!(
                             "custom-call {role} dimension `{variable}` needs a finite upper bound for physical buffer \
                          allocation",
@@ -187,14 +187,14 @@ fn custom_call_physical_type(r#type: &ArrayType, role: &str) -> Result<ArrayType
 ///
 /// # Errors
 ///
-/// Returns [`LoweringError::UnresolvedState`] for [`EffectClass::OrderedState`], whose state must be resolved before
+/// Returns [`Error::UnresolvedState`] for [`EffectClass::OrderedState`], whose state must be resolved before
 /// lowering.
-fn custom_call_token_class(operation: &CustomCallOperation) -> Result<Option<EffectClass>, LoweringError> {
+fn custom_call_token_class(operation: &CustomCallOperation) -> Result<Option<EffectClass>, Error> {
     match operation.effect_class() {
         None | Some(EffectClass::UnorderedIo) => Ok(None),
         Some(EffectClass::OrderedAssertion) => Ok(Some(EffectClass::OrderedAssertion)),
         Some(EffectClass::OrderedIo | EffectClass::DeviceOrderedIo) => Ok(Some(EffectClass::OrderedIo)),
-        Some(EffectClass::OrderedState) => Err(LoweringError::UnresolvedState {
+        Some(EffectClass::OrderedState) => Err(Error::UnresolvedState {
             construct: format!("{CUSTOM_CALL_OPERATION_NAME} {}", operation.target_name()),
         }),
     }
@@ -220,7 +220,7 @@ pub(crate) fn lower_custom_call_to_mlir<'b, 'c: 'b, 't: 'c>(
     block: &mut BlockRef<'b, 'c, 't>,
     context: &'c MlirContext<'t>,
     location: LocationRef<'c, 't>,
-) -> Result<Vec<ValueRef<'b, 'c, 't>>, LoweringError> {
+) -> Result<Vec<ValueRef<'b, 'c, 't>>, Error> {
     let token_class = custom_call_token_class(operation)?;
     let has_token = token_class.is_some();
     check_count!("input", input_types, input_values.len(), ProgramError);
@@ -241,7 +241,7 @@ pub(crate) fn lower_custom_call_to_mlir<'b, 'c: 'b, 't: 'c>(
     let memory_layouts = if operation.target_name() == ryft_xla_sys::mlir::dialects::mosaic::gpu::MOSAIC_GPU_FFI_TARGET
     {
         let mut layouts = crate::kernels::dense_memory_layouts(input_types, output_types, "mosaic GPU")
-            .map_err(|error| LoweringError::UnsupportedOp { op: error.to_string() })?;
+            .map_err(|error| Error::UnsupportedOperation { op: error.to_string() })?;
         if has_token {
             layouts.operands.push(Vec::new());
             layouts.results.push(Vec::new());
@@ -256,7 +256,7 @@ pub(crate) fn lower_custom_call_to_mlir<'b, 'c: 'b, 't: 'c>(
             && *value == CustomCallAttribute::Boolean(true)
     }) {
         let mut layouts = crate::kernels::dense_memory_layouts(input_types, output_types, "kernel")
-            .map_err(|error| LoweringError::UnsupportedOp { op: error.to_string() })?;
+            .map_err(|error| Error::UnsupportedOperation { op: error.to_string() })?;
         if has_token {
             layouts.operands.push(Vec::new());
             layouts.results.push(Vec::new());
@@ -324,7 +324,7 @@ impl LowerableOperation for CustomCallOperation {
         input_values: &[ValueRef<'b, 'c, 't>],
         input_types: &[ArrayType],
         output_types: &[ArrayType],
-    ) -> Result<Vec<ValueRef<'b, 'c, 't>>, LoweringError> {
+    ) -> Result<Vec<ValueRef<'b, 'c, 't>>, Error> {
         lower_custom_call_to_mlir(
             self,
             input_values,
@@ -345,7 +345,7 @@ impl MemberLowerableOperation<ArrayIrType> for CustomCallOperation {
         input_values: &[ValueRef<'b, 'c, 't>],
         input_types: &[ArrayIrType],
         output_types: &[ArrayIrType],
-    ) -> Result<Vec<ValueRef<'b, 'c, 't>>, LoweringError> {
+    ) -> Result<Vec<ValueRef<'b, 'c, 't>>, Error> {
         let context = lowerer.context;
         let location = lowerer.location;
         let effect_tokens = &mut lowerer.effect_tokens;
@@ -367,15 +367,13 @@ impl MemberLowerableOperation<ArrayIrType> for CustomCallOperation {
         let array_input_types = input_types[..array_input_count]
             .iter()
             .map(|r#type| <&ArrayType>::try_from(r#type).cloned())
-            .collect::<Result<Vec<_>, _>>()
-            .map_err(|error| LoweringError::Tracing(error.into()))?;
+            .collect::<Result<Vec<_>, _>>()?;
         // Type inference refines the declared dynamic output axes whose extents are exact (e.g., those of eager
         // dimension values) to static axes, which are allocated at that extent and need no runtime refinement.
         let refined_output_types = output_types
             .iter()
             .map(|r#type| <&ArrayType>::try_from(r#type).cloned())
-            .collect::<Result<Vec<_>, _>>()
-            .map_err(|error| LoweringError::Tracing(error.into()))?;
+            .collect::<Result<Vec<_>, _>>()?;
         if refined_output_types.len() != self.output_types().len() {
             return Err(ProgramError::InvalidOutputCount {
                 expected: self.output_types().len(),
@@ -473,7 +471,7 @@ impl MemberLowerableOperation<ArrayIrType> for CustomCallOperation {
                         )?
                         .remove(0))
                     })
-                    .collect::<Result<Vec<_>, LoweringError>>()?;
+                    .collect::<Result<Vec<_>, Error>>()?;
                 if let Some(token) = entry_token {
                     outputs.push(token);
                 }
@@ -498,7 +496,7 @@ impl MemberLowerableOperation<ArrayIrType> for CustomCallOperation {
         };
         let i32_scalar_type = context
             .tensor_type(context.signless_integer_type(32), &[], None, location)
-            .map_err(|_| LoweringError::InvalidTensorType { array_type: ArrayType::scalar(DataType::I32) })?;
+            .map_err(|_| Error::InvalidTensorType { array_type: ArrayType::scalar(DataType::I32) })?;
         let mut output_extents = output_extents.iter();
         for (output_index, output_type) in self.output_types().iter().enumerate() {
             let mut refined_type = physical_output_types[output_index].clone();
@@ -658,7 +656,7 @@ mod tests {
             .build::<Vec<XlaArrayConstant>, Vec<XlaArrayConstant>>(vec![output], vec![Placeholder], vec![Placeholder])
             .unwrap();
         let program = unproject_plain_program(program);
-        assert_eq!(
+        assert!(matches!(
             to_mlir_module_for_program(
                 &program,
                 &[],
@@ -668,26 +666,24 @@ mod tests {
                 None,
                 None,
             ),
-            Err(LoweringError::UnsupportedOp { op: "strided input layout `strided{12,4}`".to_string() }),
-        );
+            Err(Error::UnsupportedOperation { op })
+                if op == "strided input layout `strided{12,4}`",
+        ));
         let invalid_permutation_type =
             test_matrix_type(2, 3).with_layout(Some(TiledLayout::new(vec![0, 0], Vec::new()).into()));
-        assert_eq!(
+        assert!(matches!(
             lower_custom_call_layout(&invalid_permutation_type),
-            Err(LoweringError::UnsupportedOp {
-                op: "custom_call with invalid array layout `tiled{0,0}` for rank-2 type \
-                     `f32[2, 3][layout=tiled{0,0}]`"
-                    .to_string(),
-            }),
-        );
+            Err(Error::UnsupportedOperation { op })
+                if op == "custom_call with invalid array layout `tiled{0,0}` for rank-2 type \
+                   `f32[2, 3][layout=tiled{0,0}]`",
+        ));
         let tiled_type = test_matrix_type(2, 3)
             .with_layout(Some(TiledLayout::new(vec![1, 0], vec![Tile::new(vec![TileDimension::Sized(2)])]).into()));
-        assert_eq!(
+        assert!(matches!(
             lower_custom_call_layout(&tiled_type),
-            Err(LoweringError::UnsupportedOp {
-                op: "custom_call with tiled array layout `tiled{1,0:T(2)}`".to_string(),
-            }),
-        );
+            Err(Error::UnsupportedOperation { op })
+                if op == "custom_call with tiled array layout `tiled{1,0:T(2)}`",
+        ));
     }
 
     #[test]
@@ -781,7 +777,7 @@ mod tests {
         context.load_dialect(DialectHandle::func().unwrap()).unwrap();
         context.load_dialect(DialectHandle::stable_hlo().unwrap()).unwrap();
         let module = context.parse_module(&text).unwrap();
-        assert_eq!(module.verify(), Ok(true));
+        assert_eq!(module.verify().unwrap(), true,);
         let mut calls = Vec::new();
         module.as_operation().unwrap().walk(WalkOrder::PreOrder, |operation| {
             if operation.name().as_str() == Ok("stablehlo.custom_call") {
@@ -828,7 +824,7 @@ mod tests {
         context.load_dialect(DialectHandle::func().unwrap()).unwrap();
         context.load_dialect(DialectHandle::stable_hlo().unwrap()).unwrap();
         let module = context.parse_module(&text).unwrap();
-        assert_eq!(module.verify(), Ok(true));
+        assert_eq!(module.verify().unwrap(), true,);
         let mut calls = Vec::new();
         module.as_operation().unwrap().walk(WalkOrder::PreOrder, |operation| {
             if operation.name().as_str() == Ok("stablehlo.custom_call") {
@@ -946,13 +942,11 @@ mod tests {
         let program = builder
             .build::<Vec<XlaConstant>, Vec<XlaConstant>>(vec![output], vec![Placeholder], vec![Placeholder])
             .unwrap();
-        assert_eq!(
+        assert!(matches!(
             to_mlir_module_for_program(&program, &[], &vec![input_type], &vec![output_type], "main", None, None),
-            Err(LoweringError::UnsupportedOp {
-                op: "custom-call input dimension `size` needs a finite upper bound for physical buffer allocation"
-                    .to_string(),
-            }),
-        );
+            Err(Error::UnsupportedOperation { op })
+                if op == "custom-call input dimension `size` needs a finite upper bound for physical buffer allocation",
+        ));
     }
 
     #[test]
@@ -1274,8 +1268,8 @@ mod tests {
                     .unwrap();
                 let before = CALLS.load(Ordering::SeqCst);
                 assert_eq!(
-                    execute_mixed_program(&client, &program, &[MixedValue::Dimension(3)], &[]),
-                    Ok(vec![MixedValue::Array(vec![7.0; 9], vec![3, 3])]),
+                    execute_mixed_program(&client, &program, &[MixedValue::Dimension(3)], &[]).unwrap(),
+                    vec![MixedValue::Array(vec![7.0; 9], vec![3, 3])],
                 );
                 assert_eq!(CALLS.load(Ordering::SeqCst), before + 1);
                 let error =
@@ -1305,8 +1299,8 @@ mod tests {
         let input = MixedValue::Array(vec![1.0, 2.0, 3.0, 4.0], vec![4]);
         let before = CALLS.load(Ordering::SeqCst);
         assert_eq!(
-            execute_mixed_program(&client, &program, &[input.clone(), MixedValue::Dimension(3)], &[]),
-            Ok(vec![MixedValue::Array(vec![7.0; 4], vec![4]), MixedValue::Array(vec![7.0; 9], vec![3, 3])]),
+            execute_mixed_program(&client, &program, &[input.clone(), MixedValue::Dimension(3)], &[]).unwrap(),
+            vec![MixedValue::Array(vec![7.0; 4], vec![4]), MixedValue::Array(vec![7.0; 9], vec![3, 3])],
         );
         assert_eq!(CALLS.load(Ordering::SeqCst), before + 1);
         let error = execute_mixed_program(&client, &program, &[input, MixedValue::Dimension(4)], &[])
@@ -1385,8 +1379,8 @@ mod tests {
             .unwrap();
         let input = MixedValue::Array((1..=8).map(f64::from).collect(), vec![8]);
         assert_eq!(
-            execute_mixed_program(&client, &program, &[input], &[3]),
-            Ok(vec![MixedValue::Array(vec![2.0, 3.0, 4.0], vec![3]), MixedValue::Dimension(3)]),
+            execute_mixed_program(&client, &program, &[input], &[3]).unwrap(),
+            vec![MixedValue::Array(vec![2.0, 3.0, 4.0], vec![3]), MixedValue::Dimension(3)],
         );
         assert_eq!(OPERAND_LENGTH.load(Ordering::SeqCst), 8);
     }

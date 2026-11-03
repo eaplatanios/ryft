@@ -1,7 +1,7 @@
 //! General XLA program tracing: the [`trace`] entry point stages an arbitrary function over [`XlaArrayTracer`]s in a
 //! fresh root tracing context of [`XlaDomain`], and its [`TracedXlaProgram`] result reports the statistics of the
-//! staged program and lowers it to a StableHLO/Shardy MLIR module through the [`lowering`] module. [`TraceError`]
-//! reports the failures of both stages.
+//! staged program and lowers it to a StableHLO/Shardy MLIR module through the [`lowering`] module.
+//! [`Error`](crate::Error) reports the failures of both stages.
 //!
 //! Traced functions may compose `shard_map` with other transforms (e.g., differentiation or batching). The logical
 //! semantics of `shard_map` (boundary metadata, validation, closure tracing, and transform rules) are owned by the
@@ -9,40 +9,22 @@
 //! lower to Shardy `sdy.manual_computation` operations in the [`lowering`] module, which also lowers
 //! [`TracedShardMap`](ryft_core::TracedShardMap)s traced for [`XlaDomain`] directly through
 //! [`to_mlir_module`](crate::operations::sharding::shard_map::to_mlir_module).
+//!
+//! Core failures use [`Error::Core`](crate::Error::Core), and concrete lowering failures have their own
+//! [`Error`](crate::Error) variants. Logical shard-map errors raised while tracing or lowering remain
+//! [`ProgramError::Custom`](ryft_core::ProgramError::Custom) payloads, recoverable through
+//! [`ProgramError::downcast_custom`](ryft_core::ProgramError::downcast_custom).
 
 use std::cell::RefCell;
 
 use ryft_core::{
-    ArrayIrType, ArrayType, DomainTracingContext, ParameterError, Parameterized, ParameterizedFamily, ProgramError,
-    ProgramStatistics, ProjectedValue, Sharding, ValueProjection,
+    ArrayIrType, ArrayType, DomainTracingContext, Parameterized, ParameterizedFamily, ProgramError, ProgramStatistics,
+    ProjectedValue, Sharding, ValueProjection,
 };
-use thiserror::Error;
 
+use crate::Error;
 use crate::experimental::domains::{XlaDomain, XlaTracer};
 use crate::experimental::ops::{XlaConstant, XlaProgram};
-
-use super::lowering::LoweringError;
-
-/// Error type for tracing XLA programs (including programs that stage `shard_map` boundaries) and lowering them to
-/// StableHLO/Shardy MLIR. It wraps the underlying core and lowering errors without flattening them into messages, so
-/// callers can match on the original error. Shard-map construction and tracing functions (e.g.,
-/// [`ryft_core::shard_map()`]) report the logical [`ShardMapError`](ryft_core::ShardMapError) themselves, and a
-/// shard-map error that a transform rule raises while a program is traced or lowered arrives as
-/// [`ProgramError::Custom`], from which [`ProgramError::downcast_custom`] recovers it.
-#[derive(Error, Clone, Debug, PartialEq, Eq)]
-pub enum TraceError {
-    /// Underlying program error returned while staging or simplifying a traced program.
-    #[error("{0}")]
-    Program(#[from] ProgramError),
-
-    /// Underlying parameter-structure error returned while reparameterizing traced values.
-    #[error("{0}")]
-    Parameter(#[from] ParameterError),
-
-    /// Error returned while lowering a traced program to StableHLO/Shardy MLIR.
-    #[error("{0}")]
-    Lowering(#[from] LoweringError),
-}
 
 /// Array value that closures traced through [`trace`] receive and return: a [`DomainTracer`](ryft_core::DomainTracer)
 /// of [`XlaDomain`] projected onto its array member. It is also the [`ShardMapTracer`](ryft_core::ShardMapTracer) of
@@ -65,13 +47,11 @@ pub type XlaArrayTracer = ProjectedValue<ArrayType, XlaTracer<'static>>;
 ///
 /// # Errors
 ///
-/// Returns [`TraceError::Program`] when tracing or simplifying the program fails (e.g., because `function` stages an
-/// invalid operation or registers a capture, which the fresh root context discards), and [`TraceError::Parameter`]
-/// when the traced inputs or outputs cannot be restructured into `Input` or `Output`.
-pub fn trace<F, Input, Output>(
-    function: F,
-    global_input_types: Input,
-) -> Result<TracedXlaProgram<Input, Output>, TraceError>
+/// Returns [`Error::Core`] wrapping a [`ProgramError`] when tracing or simplifying the program fails (e.g., because
+/// `function` stages an invalid operation or registers a capture, which the fresh root context discards), or a
+/// [`ParameterError`](ryft_core::ParameterError) when the traced inputs or outputs cannot be restructured into `Input`
+/// or `Output`.
+pub fn trace<F, Input, Output>(function: F, global_input_types: Input) -> Result<TracedXlaProgram<Input, Output>, Error>
 where
     Input: Parameterized<ArrayType>,
     Input::Family: ParameterizedFamily<XlaConstant> + ParameterizedFamily<XlaArrayTracer>,
@@ -162,7 +142,7 @@ where
     /// # Errors
     ///
     /// Returns the errors of [`Self::to_mlir_module_with_signature_shardings`].
-    pub fn to_mlir_module<S: AsRef<str>>(&self, function_name: S) -> Result<String, TraceError> {
+    pub fn to_mlir_module<S: AsRef<str>>(&self, function_name: S) -> Result<String, Error> {
         self.to_mlir_module_with_signature_shardings(function_name, None, None)
     }
 
@@ -189,15 +169,15 @@ where
     ///
     /// # Errors
     ///
-    /// Returns [`TraceError::Program`] when pruning or simplifying the traced program fails, and
-    /// [`TraceError::Lowering`] when lowering it fails (e.g., for an invalid function name, mismatched signature
-    /// shardings, unresolved references or state, or operations that the backend cannot lower).
+    /// Returns [`Error::Core`] when pruning or simplifying the traced program fails. Lowering failures use the
+    /// corresponding [`Error`] variants (e.g., for an invalid function name, mismatched signature shardings, unresolved
+    /// references or state, or operations that the backend cannot lower).
     pub fn to_mlir_module_with_signature_shardings<S: AsRef<str>>(
         &self,
         function_name: S,
         argument_shardings: Option<&[Sharding]>,
         result_shardings: Option<&[Sharding]>,
-    ) -> Result<String, TraceError> {
+    ) -> Result<String, Error> {
         let simplified_program = self.program.clone().into_pruned()?.simplified()?;
         super::lowering::to_mlir_module_for_program(
             &simplified_program,
@@ -208,7 +188,6 @@ where
             argument_shardings,
             result_shardings,
         )
-        .map_err(TraceError::from)
     }
 }
 
@@ -222,9 +201,9 @@ mod tests {
         Array, BatchAxis, BatchAxisSpecification, CollectiveOptions, ConstrainSharding, Context, DataType, Device,
         DeviceMesh, Differentiate, Dimension, EffectClass, LogicalMesh, MeshAxis, MeshAxisType, Mul, NamedAxis,
         ParallelAllGather, ParallelAllGatherOutputVariance, ParallelRaggedAllToAll, ParallelVary, Placeholder, Print,
-        Reduce, ReductionKind, RegionRole, Reshape, Reshard, Shape, ShardMap, ShardMapContext, ShardMapOperation,
-        Sharding, ShardingDimension, Sin, StagingContext, Typed, Value, batch, shard_map, shard_map_in_context,
-        shard_map_with_options,
+        Reduce, ReductionKind, RegionRole, Reshape, Reshard, Shape, ShardMapBoundary, ShardMapContext,
+        ShardMapOperation, Sharding, ShardingDimension, Sin, StagingContext, Typed, Value, batch, shard_map,
+        shard_map_in_context, shard_map_with_options,
     };
     use ryft_pjrt::{BufferType, ClientOptions, CpuClientOptions, Program, load_cpu_plugin};
     #[cfg(feature = "cuda-13")]
@@ -671,9 +650,8 @@ mod tests {
                 None,
                 Some("cpu"),
             ),
-            Err(crate::experimental::lowering::LoweringError::Tracing(
-                ProgramError::UnsupportedOperation { message },
-            )) if message == "`parallel_ragged_all_to_all` is not supported by the XLA CPU backend",
+            Err(Error::Core(ryft_core::Error::Program(ProgramError::UnsupportedOperation { message })))
+                    if message == "`parallel_ragged_all_to_all` is not supported by the XLA CPU backend",
         ));
     }
 
@@ -2069,7 +2047,7 @@ mod tests {
         let input_types = vec![query_type.clone(), key_type.clone(), value_type.clone(), seed_type.clone()];
         let in_shardings = vec![replicated.clone(), sharded.clone(), replicated.clone(), sharded.clone()];
         let out_shardings = vec![sharded.clone(), replicated.clone()];
-        let boundary = ShardMap::new(mesh.clone(), in_shardings, out_shardings, vec![]).unwrap();
+        let boundary = ShardMapBoundary::new(mesh.clone(), in_shardings, out_shardings, vec![]).unwrap();
         let local_input_types = input_types
             .iter()
             .enumerate()
@@ -4578,9 +4556,9 @@ mod tests {
             .unwrap();
             assert!(matches!(
                 traced.to_mlir_module("main"),
-                Err(TraceError::Lowering(error))
-                    if error.to_string() == format!(
-                        "encountered malformed program: collective over axis `x` records size {axis_size}, \
+                Err(Error::Core(ryft_core::Error::Program(ProgramError::MalformedProgram(message))))
+                    if message == format!(
+                        "collective over axis `x` records size {axis_size}, \
                          but the enclosing mesh axis has size 2",
                     ),
             ));

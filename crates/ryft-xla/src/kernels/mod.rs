@@ -94,6 +94,8 @@ pub use cuda::{
     CUDA_KERNEL_CUSTOM_CALL_TARGET, CudaKernelBufferBinding, CudaKernelEmbedding, CudaKernelParameterBinding,
 };
 
+// TODO(eaplatanios): Promote kernel embedding errors to dedicated `ryft_xla::Error` variants after
+// this support leaves experimental status.
 /// Invalid compiler output or unsupported XLA embedding contract.
 #[derive(Debug, Error)]
 pub enum KernelEmbeddingError {

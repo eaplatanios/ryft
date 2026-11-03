@@ -5,7 +5,7 @@ use ryft_mlir::{Block, Context as MlirContext, Location, Operation as MlirOperat
 
 use crate::experimental::lowering::types::{lower_f64_constant_splat, lower_tensor_type};
 use crate::operations::{lower_accuracy, normalize_binary_elementwise_operands};
-use crate::{LowerableOperation, LowerableOperationFamily, LoweringError, XlaLowerer};
+use crate::{Error, LowerableOperation, LowerableOperationFamily, XlaLowerer};
 
 /// Lowers complex sine or cosine through real operations while preserving an exact zero component for a zero real
 /// input. The direct StableHLO complex trigonometric operations can evaluate a mathematically zero product as
@@ -28,7 +28,7 @@ fn lower_complex_sine_or_cosine<'b, 'c: 'b, 't: 'c, B, L>(
     block: &mut B,
     context: &'c MlirContext<'t>,
     location: L,
-) -> Result<ValueRef<'b, 'c, 't>, LoweringError>
+) -> Result<ValueRef<'b, 'c, 't>, Error>
 where
     B: Block<'b, 'c, 't>,
     L: Copy + Location<'c, 't>,
@@ -144,9 +144,7 @@ where
         .result(0)
         .unwrap()
         .as_ref();
-    let mut large_component = |factor: ValueRef<'b, 'c, 't>,
-                               odd: bool|
-     -> Result<ValueRef<'b, 'c, 't>, LoweringError> {
+    let mut large_component = |factor: ValueRef<'b, 'c, 't>, odd: bool| -> Result<ValueRef<'b, 'c, 't>, Error> {
         let factor = if odd {
             let negated = block.append_operation(stable_hlo::negate(factor, location)?)?.result(0).unwrap().as_ref();
             block
@@ -279,7 +277,7 @@ impl LowerableOperation for SinOperation<ArrayType> {
         input_values: &[ValueRef<'b, 'c, 't>],
         _input_types: &[ArrayType],
         output_types: &[ArrayType],
-    ) -> Result<Vec<ValueRef<'b, 'c, 't>>, LoweringError> {
+    ) -> Result<Vec<ValueRef<'b, 'c, 't>>, Error> {
         if output_types[0].data_type().is_complex() {
             return Ok(vec![lower_complex_sine_or_cosine(
                 input_values[0],
@@ -306,7 +304,7 @@ impl LowerableOperation for CosOperation<ArrayType> {
         input_values: &[ValueRef<'b, 'c, 't>],
         _input_types: &[ArrayType],
         output_types: &[ArrayType],
-    ) -> Result<Vec<ValueRef<'b, 'c, 't>>, LoweringError> {
+    ) -> Result<Vec<ValueRef<'b, 'c, 't>>, Error> {
         if output_types[0].data_type().is_complex() {
             return Ok(vec![lower_complex_sine_or_cosine(
                 input_values[0],
@@ -333,7 +331,7 @@ impl LowerableOperation for TanOperation<ArrayType> {
         input_values: &[ValueRef<'b, 'c, 't>],
         _input_types: &[ArrayType],
         _output_types: &[ArrayType],
-    ) -> Result<Vec<ValueRef<'b, 'c, 't>>, LoweringError> {
+    ) -> Result<Vec<ValueRef<'b, 'c, 't>>, Error> {
         let result = lowerer.block.append_operation(stable_hlo::tan(
             input_values[0],
             lower_accuracy(self.accuracy()),
@@ -350,7 +348,7 @@ impl LowerableOperation for Atan2Operation<ArrayType> {
         input_values: &[ValueRef<'b, 'c, 't>],
         _input_types: &[ArrayType],
         output_types: &[ArrayType],
-    ) -> Result<Vec<ValueRef<'b, 'c, 't>>, LoweringError> {
+    ) -> Result<Vec<ValueRef<'b, 'c, 't>>, Error> {
         let [left, right] = normalize_binary_elementwise_operands(
             input_values,
             output_types,
@@ -370,7 +368,7 @@ impl LowerableOperation for TanhOperation<ArrayType> {
         input_values: &[ValueRef<'b, 'c, 't>],
         _input_types: &[ArrayType],
         _output_types: &[ArrayType],
-    ) -> Result<Vec<ValueRef<'b, 'c, 't>>, LoweringError> {
+    ) -> Result<Vec<ValueRef<'b, 'c, 't>>, Error> {
         let result = lowerer.block.append_operation(stable_hlo::tanh(
             input_values[0],
             lower_accuracy(self.accuracy()),

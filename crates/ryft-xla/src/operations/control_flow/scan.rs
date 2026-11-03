@@ -45,7 +45,7 @@ use crate::operations::control_flow::{
     threaded_effect_token_values, validate_unthreaded_effect_tokens,
 };
 use crate::operations::jit_call::JitCallFunctionMap;
-use crate::{LowerableOperation, LowerableOperationFamily, LoweringError, XlaLowerer};
+use crate::{Error, LowerableOperation, LowerableOperationFamily, XlaLowerer};
 
 /// Trip count of the loops that lower one scan.
 #[derive(Copy, Clone)]
@@ -108,7 +108,7 @@ impl<'o, 'b, 'c: 'b, 't: 'c, O: LowerableOperationFamily> ScanLoopInputs<'o, 'b,
     /// Lowers one zero accumulator per stacked output. Each accumulator is allocated at the physical bound of the scan
     /// length and, for a dynamic length, given the runtime length as the runtime extent of its leading axis with
     /// `stablehlo.set_dimension_size`.
-    fn lower_accumulators(&self, block: &mut BlockRef<'b, 'c, 't>) -> Result<Vec<ValueRef<'b, 'c, 't>>, LoweringError> {
+    fn lower_accumulators(&self, block: &mut BlockRef<'b, 'c, 't>) -> Result<Vec<ValueRef<'b, 'c, 't>>, Error> {
         let (context, location) = (self.context, self.location);
         let mut accumulators = Vec::with_capacity(self.y_stack_types.len());
         for stack_type in &self.y_stack_types {
@@ -117,7 +117,7 @@ impl<'o, 'b, 'c: 'b, 't: 'c, O: LowerableOperationFamily> ScanLoopInputs<'o, 'b,
             let physical_length = match length {
                 Dimension::Static(length) => *length,
                 Dimension::Dynamic(_) => {
-                    stable_hlo_dynamic_dimension_bound(length).ok_or_else(|| LoweringError::UnsupportedOp {
+                    stable_hlo_dynamic_dimension_bound(length).ok_or_else(|| Error::UnsupportedOperation {
                         op: format!(
                             "`{SCAN_OPERATION_NAME}` iteration count `{length}` needs a finite upper bound \
                              to allocate its stacked outputs",
@@ -160,7 +160,7 @@ impl<'o, 'b, 'c: 'b, 't: 'c, O: LowerableOperationFamily> ScanLoopInputs<'o, 'b,
         mut y_accumulators: Vec<ValueRef<'b, 'c, 't>>,
         block: &mut BlockRef<'b, 'c, 't>,
         effect_tokens: &mut EffectTokens<'b, 'c, 't>,
-    ) -> Result<Vec<ValueRef<'b, 'c, 't>>, LoweringError> {
+    ) -> Result<Vec<ValueRef<'b, 'c, 't>>, Error> {
         let zero_index = lower_static_index_constants(&[0], block, self.context, self.location)?[0];
         for iteration in first_iteration..length {
             let index = if self.reverse { length - 1 - iteration } else { iteration };
@@ -183,7 +183,7 @@ impl<'o, 'b, 'c: 'b, 't: 'c, O: LowerableOperationFamily> ScanLoopInputs<'o, 'b,
         unroll: usize,
         block: &mut BlockRef<'b, 'c, 't>,
         effect_tokens: &mut EffectTokens<'b, 'c, 't>,
-    ) -> Result<Vec<ValueRef<'b, 'c, 't>>, LoweringError> {
+    ) -> Result<Vec<ValueRef<'b, 'c, 't>>, Error> {
         let (context, location) = (self.context, self.location);
         let state_count = self.state_types.len();
         let mut state_types = self
@@ -201,7 +201,7 @@ impl<'o, 'b, 'c: 'b, 't: 'c, O: LowerableOperationFamily> ScanLoopInputs<'o, 'b,
             location,
         )?;
         let block_arguments = state_types.iter().map(|r#type| (*r#type, location)).collect::<Vec<_>>();
-        let length_value = |block: &mut BlockRef<'b, 'c, 't>| -> Result<ValueRef<'b, 'c, 't>, LoweringError> {
+        let length_value = |block: &mut BlockRef<'b, 'c, 't>| -> Result<ValueRef<'b, 'c, 't>, Error> {
             match self.length {
                 ScanLoopLength::Static(length) => {
                     Ok(lower_static_index_constants(&[length], block, context, location)?[0])
@@ -335,7 +335,7 @@ impl<'o, 'b, 'c: 'b, 't: 'c, O: LowerableOperationFamily> ScanLoopInputs<'o, 'b,
         y_accumulators: Vec<ValueRef<'b, 'c, 't>>,
         block: &mut BlockRef<'b, 'c, 't>,
         effect_tokens: &mut EffectTokens<'b, 'c, 't>,
-    ) -> Result<(Vec<ValueRef<'b, 'c, 't>>, Vec<ValueRef<'b, 'c, 't>>), LoweringError> {
+    ) -> Result<(Vec<ValueRef<'b, 'c, 't>>, Vec<ValueRef<'b, 'c, 't>>), Error> {
         let location = self.location;
         let mut iteration_inputs = Vec::with_capacity(1 + self.carry_count + self.x_slice_types.len());
         iteration_inputs.push(index_value);
@@ -403,7 +403,7 @@ impl LowerableOperation for ScanOperation<ArrayType> {
         _input_values: &[ValueRef<'b, 'c, 't>],
         _input_types: &[ArrayType],
         _output_types: &[ArrayType],
-    ) -> Result<Vec<ValueRef<'b, 'c, 't>>, LoweringError> {
+    ) -> Result<Vec<ValueRef<'b, 'c, 't>>, Error> {
         Err(ProgramError::UnsupportedOperation {
             message: format!(
                 "higher-order operation `{}` must be stored directly in the enclosing backend operation family",
@@ -421,7 +421,7 @@ impl LowerableOperation for ScanOperation<ArrayIrType> {
         input_values: &[ValueRef<'b, 'c, 't>],
         input_types: &[ArrayIrType],
         output_types: &[ArrayIrType],
-    ) -> Result<Vec<ValueRef<'b, 'c, 't>>, LoweringError> {
+    ) -> Result<Vec<ValueRef<'b, 'c, 't>>, Error> {
         // A scan's inputs are its carries and its stacked inputs, followed by the runtime length when its length is
         // dynamic, and its body receives the iteration index, which the loop supplies, before the carries and the
         // slices of the stacked inputs. The lowering proceeds in order:
@@ -475,7 +475,7 @@ impl LowerableOperation for ScanOperation<ArrayIrType> {
                 if let ArrayIrType::Array(slice_type) = slice_type
                     && slice_type.shape().dimensions().iter().any(|dimension| dimension.value().is_none())
                 {
-                    return Err(LoweringError::UnsupportedOp {
+                    return Err(Error::UnsupportedOperation {
                         op: format!(
                             "`{SCAN_OPERATION_NAME}` with the dynamic slice type `{slice_type}` for stacked {role} \
                              {index}; lowering requires static slice types, so specialize the body to the scan's \
@@ -493,7 +493,7 @@ impl LowerableOperation for ScanOperation<ArrayIrType> {
             .or_else(|| stable_hlo_dynamic_dimension_bound(length))
             .map_or(self.unroll(), |maximum_length| self.unroll().min(maximum_length.max(1)));
         if unroll > i64::MAX as usize {
-            return Err(LoweringError::UnsupportedOp {
+            return Err(Error::UnsupportedOperation {
                 op: format!("`{SCAN_OPERATION_NAME}` unroll factor {unroll} must be at most {}", i64::MAX),
             });
         }
@@ -641,14 +641,14 @@ mod tests {
         DimensionBounds, DimensionSizeOperation, DimensionType, DimensionValue, DimensionVariable, EffectClass,
         LogicalMesh, Memory, MeshAxis, MeshAxisType, Mul, MulOperation, NegOperation, OneLikeOperation, Placeholder,
         PrintOperation, ProgramBatchingOutputAxesPolicy, RandomAlgorithm, ReferenceNewOperation,
-        ReferenceReadOperation, ReferenceType, RngBitGeneratorOperation, ScanOptions, ShardMap, ShardMapOperation,
-        Sharding, ShardingDimension, TracingContext, TransposedProgramCotangent, TypeError, TypedProgram,
-        WhileOperation, ZeroOperation, scan,
+        ReferenceReadOperation, ReferenceType, RngBitGeneratorOperation, ScanOptions, ShardMapBoundary,
+        ShardMapOperation, Sharding, ShardingDimension, TracingContext, TransposedProgramCotangent, TypeError,
+        TypedProgram, WhileOperation, ZeroOperation, scan,
     };
     use ryft_mlir::Location;
     use ryft_pjrt::{BufferType, ExecutionDeviceInputs, ExecutionInput, Layout, Program as PjrtProgram};
 
-    use crate::experimental::XlaDomainError;
+    use crate::Error;
     use crate::experimental::lowering::tests::{
         MixedValue, dynamic_dimension, execute_mixed_program, ragged_dot_cpu_compilation_options, test_vector_type,
     };
@@ -819,7 +819,8 @@ mod tests {
             "higher-order operation `scan` must be stored directly in the enclosing backend operation family";
         assert!(matches!(
             ScanOperation::<ArrayType>::new(1, 3).lower(&mut lowerer, &[], &[], &[]),
-            Err(LoweringError::Tracing(ProgramError::UnsupportedOperation { message })) if message == expected_message,
+            Err(Error::Core(ryft_core::Error::Program(ProgramError::UnsupportedOperation { message })))
+                if message == expected_message,
         ));
 
         // An array IR scan needs exactly one body region.
@@ -827,7 +828,7 @@ mod tests {
             XlaLowerer::new(block.as_ref(), &context, location).with_regions(Vec::<FlatXlaProgram>::new());
         assert!(matches!(
             ScanOperation::<ArrayIrType>::new(1, 3).lower(&mut lowerer, &[], &[], &[]),
-            Err(LoweringError::Tracing(ProgramError::MalformedProgram(message)))
+            Err(Error::Core(ryft_core::Error::Program(ProgramError::MalformedProgram(message))))
                 if message == "operation `scan` declares 1 region slots but 0 regions were attached",
         ));
 
@@ -835,7 +836,7 @@ mod tests {
         let mut lowerer = XlaLowerer::new(block.as_ref(), &context, location).with_regions(vec![body.clone()]);
         assert!(matches!(
             ScanOperation::<ArrayIrType>::new(1, 3).lower(&mut lowerer, &[], &[], &[]),
-            Err(LoweringError::Tracing(ProgramError::InvalidInputCount { expected: 1, actual: 0 })),
+            Err(Error::Core(ryft_core::Error::Program(ProgramError::InvalidInputCount { expected: 1, actual: 0 }))),
         ));
 
         // A dynamic length without an upper bound leaves no physical extent at which to allocate the stacked outputs.
@@ -861,7 +862,7 @@ mod tests {
                 &input_types,
                 &output_types,
             ),
-            Err(LoweringError::UnsupportedOp { op })
+            Err(Error::UnsupportedOperation { op })
                 if op == "`scan` iteration count `length` needs a finite upper bound to allocate its stacked outputs",
         ));
     }
@@ -901,14 +902,12 @@ mod tests {
             assert_eq!(program.output_types(), vec![ArrayIrType::Array(stacked_type.clone())]);
             to_mlir_module_for_program(&program, &[], &[stacked_type.clone()], &[stacked_type], "main", None, None)
         };
-        assert_eq!(
+        assert!(matches!(
             scan_program(2),
-            Err(LoweringError::UnsupportedOp {
-                op: "`scan` with the dynamic slice type `f64[rows]` for stacked input 0; lowering requires static \
-                     slice types, so specialize the body to the scan's input types"
-                    .to_string(),
-            }),
-        );
+            Err(Error::UnsupportedOperation { op })
+                if op == "`scan` with the dynamic slice type `f64[rows]` for stacked input 0; lowering requires static \
+                   slice types, so specialize the body to the scan's input types",
+        ));
         let empty_module = scan_program(0).unwrap();
         assert_eq!(
             empty_module,
@@ -982,7 +981,8 @@ mod tests {
             "control-flow region lowering advanced the `ordered_io` token, which the region does not thread";
         assert!(matches!(
             lower(EffectClasses::NONE),
-            Err(LoweringError::Tracing(ProgramError::MalformedProgram(message))) if message == expected_message,
+            Err(Error::Core(ryft_core::Error::Program(ProgramError::MalformedProgram(message))))
+                if message == expected_message,
         ));
     }
 
@@ -1042,8 +1042,8 @@ mod tests {
                 MixedValue::Array(vec![10.0, 20.0, 30.0], vec![3]),
             ];
             assert_eq!(
-                execute_mixed_program(&client, &program, &inputs, &[3]),
-                Ok(vec![MixedValue::Array(vec![1.0, 2.0, 3.0], vec![3]), MixedValue::Array(expected, vec![3])]),
+                execute_mixed_program(&client, &program, &inputs, &[3]).unwrap(),
+                vec![MixedValue::Array(vec![1.0, 2.0, 3.0], vec![3]), MixedValue::Array(expected, vec![3])],
                 "length {length}, unroll factor {unroll}",
             );
             // The runtime appends its own context to the assertion message.
@@ -1144,8 +1144,8 @@ mod tests {
         let client = execution_client();
         let carry = MixedValue::Array(vec![1.0, 2.0, 3.0], vec![3]);
         assert_eq!(
-            execute_mixed_program(&client, &program, &[carry.clone(), MixedValue::Dimension(3)], &[]),
-            Ok(vec![MixedValue::Array(vec![8.0, 16.0, 24.0], vec![3])]),
+            execute_mixed_program(&client, &program, &[carry.clone(), MixedValue::Dimension(3)], &[]).unwrap(),
+            vec![MixedValue::Array(vec![8.0, 16.0, 24.0], vec![3])],
         );
         let error = execute_mixed_program(&client, &program, &[carry, MixedValue::Dimension(2)], &[])
             .unwrap_err()
@@ -1270,8 +1270,8 @@ mod tests {
             ]
         };
         assert_eq!(
-            execute_mixed_program(&client, &program, &inputs(3), &[]),
-            Ok(vec![MixedValue::Array(vec![7.0], vec![]), MixedValue::Array(vec![0.0, 1.0, 3.0], vec![3])]),
+            execute_mixed_program(&client, &program, &inputs(3), &[]).unwrap(),
+            vec![MixedValue::Array(vec![7.0], vec![]), MixedValue::Array(vec![0.0, 1.0, 3.0], vec![3])],
         );
         let error = execute_mixed_program(&client, &program, &inputs(2), &[]).unwrap_err().to_string();
         // The runtime appends its own context to the assertion message.
@@ -1383,8 +1383,8 @@ mod tests {
             ]
         };
         assert_eq!(
-            execute_mixed_program(&client, &pruned, &inputs(3), &[]),
-            Ok(vec![MixedValue::Array(vec![8.0], vec![])])
+            execute_mixed_program(&client, &pruned, &inputs(3), &[]).unwrap(),
+            vec![MixedValue::Array(vec![8.0], vec![])],
         );
         let error = execute_mixed_program(&client, &pruned, &inputs(2), &[]).unwrap_err().to_string();
         // The runtime appends its own context to the assertion message.
@@ -1689,11 +1689,12 @@ mod tests {
                     &binary_digits_scan_program(Dimension::Static(5), false, unroll),
                     &[MixedValue::Array(vec![0.0], vec![]), items.clone()],
                     &[],
-                ),
-                Ok(vec![
+                )
+                .unwrap(),
+                vec![
                     MixedValue::Array(vec![57.0], vec![]),
                     MixedValue::Array(vec![0.0, 1.0, 4.0, 11.0, 26.0], vec![5]),
-                ]),
+                ],
                 "unroll factor {unroll}",
             );
             assert_eq!(
@@ -1702,11 +1703,12 @@ mod tests {
                     &binary_digits_scan_program(Dimension::Static(5), true, unroll),
                     &[MixedValue::Array(vec![0.0], vec![]), items.clone()],
                     &[],
-                ),
-                Ok(vec![
+                )
+                .unwrap(),
+                vec![
                     MixedValue::Array(vec![129.0], vec![]),
                     MixedValue::Array(vec![64.0, 31.0, 14.0, 5.0, 0.0], vec![5]),
-                ]),
+                ],
                 "reversed, unroll factor {unroll}",
             );
         }
@@ -1949,7 +1951,7 @@ mod tests {
         assert!(staged);
         assert!(matches!(
             error,
-            XlaDomainError::Tracing(ProgramError::Type(TypeError::Invalid { message }))
+            Error::Core(ryft_core::Error::Program(ProgramError::Type(TypeError::Invalid { message })))
                 if message == "`dynamic_slice` size 1 is out of bounds for axis 0 with size 0",
         ));
     }
@@ -2065,12 +2067,12 @@ mod tests {
                     let inputs =
                         [MixedValue::Array(vec![0.0], vec![]), xs.clone(), MixedValue::Dimension(runtime_length)];
                     assert_eq!(
-                        execute_mixed_program(&client, &program, &inputs, &[runtime_length as i32]),
-                        Ok(vec![
+                        execute_mixed_program(&client, &program, &inputs, &[runtime_length as i32]).unwrap(),
+                        vec![
                             MixedValue::Array(vec![carry], vec![]),
                             MixedValue::Array(ys, vec![runtime_length as u64]),
                             MixedValue::Dimension(runtime_length),
-                        ]),
+                        ],
                         "reverse {reverse}, unroll factor {unroll}, runtime length {runtime_length}",
                     );
                 }
@@ -2121,8 +2123,9 @@ mod tests {
                 &program,
                 &[MixedValue::Array(vec![0.0], vec![]), MixedValue::Array(vec![1.0, 2.0, 3.0, 4.0], vec![4])],
                 &[],
-            ),
-            Ok(vec![MixedValue::Array(vec![10.0], vec![]), MixedValue::Array(vec![1.0, 3.0, 6.0, 10.0], vec![4])]),
+            )
+            .unwrap(),
+            vec![MixedValue::Array(vec![10.0], vec![]), MixedValue::Array(vec![1.0, 3.0, 6.0, 10.0], vec![4])],
         );
     }
 
@@ -2215,11 +2218,12 @@ mod tests {
         let values = vec![1.0, 2.0, 3.0, 4.0, 5.0, 6.0, 7.0, 8.0];
         for extent in [1, 8] {
             assert_eq!(
-                execute_mixed_program(&client, &program, &[MixedValue::Array(values.clone(), vec![8])], &[extent]),
-                Ok(vec![
+                execute_mixed_program(&client, &program, &[MixedValue::Array(values.clone(), vec![8])], &[extent])
+                    .unwrap(),
+                vec![
                     MixedValue::Array(values[..extent as usize].to_vec(), vec![extent as u64]),
                     MixedValue::Dimension(extent as i64),
-                ]),
+                ],
                 "extent {extent}",
             );
         }
@@ -2571,7 +2575,7 @@ mod tests {
                 &[],
             )
         });
-        assert_eq!(outputs, Ok(vec![MixedValue::Array(vec![7.0], vec![])]));
+        assert_eq!(outputs.unwrap(), vec![MixedValue::Array(vec![7.0], vec![])],);
         assert_eq!(lines, vec!["item: 1.0", "item: 2.0", "item: 3.0"]);
     }
 
@@ -2685,8 +2689,8 @@ mod tests {
                 &[runtime_length as i32],
             )
         };
-        assert_eq!(run(vec![-1.0, 2.0, 3.0, 4.0], 0), Ok(vec![MixedValue::Array(vec![0.0], vec![])]));
-        assert_eq!(run(vec![1.0, 2.0, -3.0, 4.0], 2), Ok(vec![MixedValue::Array(vec![3.0], vec![])]));
+        assert_eq!(run(vec![-1.0, 2.0, 3.0, 4.0], 0).unwrap(), vec![MixedValue::Array(vec![0.0], vec![])],);
+        assert_eq!(run(vec![1.0, 2.0, -3.0, 4.0], 2).unwrap(), vec![MixedValue::Array(vec![3.0], vec![])],);
         // The runtime appends its own context to the assertion message.
         let error = run(vec![1.0, 2.0, -3.0, 4.0], 3).unwrap_err().to_string();
         assert!(error.contains("assertion failed: item must be positive; item=-3"), "{error}");
@@ -3167,7 +3171,7 @@ mod tests {
         let operation = ShardMapOperation::from_program(
             &shard_map_body,
             vec![sum_type.clone().into(), items_type.clone().into()],
-            ShardMap::new(logical_mesh, shardings.clone(), shardings.clone(), manual_axes).unwrap(),
+            ShardMapBoundary::new(logical_mesh, shardings.clone(), shardings.clone(), manual_axes).unwrap(),
         )
         .unwrap();
         let mut builder = ArrayIrXlaProgramBuilder::new();
@@ -3407,10 +3411,10 @@ mod tests {
             })
         };
         let (outputs, lines) = run(1.0);
-        assert_eq!(outputs, Ok(vec![MixedValue::Array(vec![16.0], vec![])]));
+        assert_eq!(outputs.unwrap(), vec![MixedValue::Array(vec![16.0], vec![])],);
         assert_eq!(lines, vec!["item: 1.0", "item: 2.0", "item: 3.0"]);
         let (outputs, lines) = run(-1.0);
-        assert_eq!(outputs, Ok(vec![MixedValue::Array(vec![10.0], vec![])]));
+        assert_eq!(outputs.unwrap(), vec![MixedValue::Array(vec![10.0], vec![])],);
         assert_eq!(lines, Vec::<String>::new());
     }
 
@@ -3556,7 +3560,7 @@ mod tests {
                 &[],
             )
         });
-        assert_eq!(outputs, Ok(vec![MixedValue::Array(vec![6.0], vec![])]));
+        assert_eq!(outputs.unwrap(), vec![MixedValue::Array(vec![6.0], vec![])],);
         assert_eq!(lines, vec!["item: 1.0", "item: 2.0", "item: 1.0", "item: 2.0"]);
     }
 
@@ -3629,12 +3633,13 @@ mod tests {
                     MixedValue::Array(vec![1.0, 2.0, 3.0, 4.0, 5.0, 6.0], vec![2, 3]),
                 ],
                 &[],
-            ),
-            Ok(vec![
+            )
+            .unwrap(),
+            vec![
                 MixedValue::Dimension(2),
                 MixedValue::Array(vec![16.0, 25.0], vec![2]),
                 MixedValue::Array(vec![10.0, 10.0, 11.0, 14.0, 13.0, 19.0], vec![3, 2]),
-            ]),
+            ],
         );
 
         // A mapped initial sum with replicated items maps the carry only, so each iteration broadcasts its replicated
@@ -3673,12 +3678,13 @@ mod tests {
                     MixedValue::Array(vec![1.0, 2.0, 3.0], vec![3]),
                 ],
                 &[],
-            ),
-            Ok(vec![
+            )
+            .unwrap(),
+            vec![
                 MixedValue::Dimension(2),
                 MixedValue::Array(vec![16.0, 26.0], vec![2]),
                 MixedValue::Array(vec![10.0, 20.0, 11.0, 21.0, 13.0, 23.0], vec![3, 2]),
-            ]),
+            ],
         );
     }
 
@@ -3778,8 +3784,8 @@ mod tests {
                 in (%3, %7)"},
         );
         assert_eq!(
-            execute_mixed_program(&client, &program, &static_inputs, &[]),
-            Ok(vec![MixedValue::Array(vec![41.0], vec![]), MixedValue::Array(vec![12.0, 12.0, 10.0], vec![3])]),
+            execute_mixed_program(&client, &program, &static_inputs, &[]).unwrap(),
+            vec![MixedValue::Array(vec![41.0], vec![]), MixedValue::Array(vec![12.0, 12.0, 10.0], vec![3])],
         );
 
         // Reversed: `c1 = 5`, `c2 = 16`, and `c3 = 33`, with gradient `[c2, c1 x0, c0 x1 x0] = [16, 10, 6]`.
@@ -3809,8 +3815,8 @@ mod tests {
                 in (%3, %7)"},
         );
         assert_eq!(
-            execute_mixed_program(&client, &program, &static_inputs, &[]),
-            Ok(vec![MixedValue::Array(vec![33.0], vec![]), MixedValue::Array(vec![16.0, 10.0, 6.0], vec![3])]),
+            execute_mixed_program(&client, &program, &static_inputs, &[]).unwrap(),
+            vec![MixedValue::Array(vec![33.0], vec![]), MixedValue::Array(vec![16.0, 10.0, 6.0], vec![3])],
         );
 
         // A dynamic length runs the same iterations at runtime length 3 and leaves the carry and an empty gradient at
@@ -3855,20 +3861,16 @@ mod tests {
             )
         };
         assert_eq!(
-            run(3),
-            Ok(vec![
+            run(3).unwrap(),
+            vec![
                 MixedValue::Array(vec![41.0], vec![]),
                 MixedValue::Array(vec![12.0, 12.0, 10.0], vec![3]),
                 MixedValue::Dimension(3),
-            ]),
+            ],
         );
         assert_eq!(
-            run(0),
-            Ok(vec![
-                MixedValue::Array(vec![1.0], vec![]),
-                MixedValue::Array(vec![], vec![0]),
-                MixedValue::Dimension(0),
-            ]),
+            run(0).unwrap(),
+            vec![MixedValue::Array(vec![1.0], vec![]), MixedValue::Array(vec![], vec![0]), MixedValue::Dimension(0),],
         );
     }
 
@@ -3944,7 +3946,7 @@ mod tests {
         let (outputs, lines) = with_captured_prints(|| {
             execute_mixed_program(&client, &pullback, &[MixedValue::Array(vec![1.0, 2.0, 3.0], vec![3])], &[])
         });
-        assert_eq!(outputs, Ok(Vec::new()));
+        assert_eq!(outputs.unwrap(), Vec::new(),);
         assert_eq!(lines, vec!["backward: 3.0", "backward: 2.0", "backward: 1.0"]);
 
         // Structural-zero seeds: the stacked output is dead, so its seeds stay symbolic and the reversed scan has no
@@ -3967,7 +3969,7 @@ mod tests {
                 in ()"},
         );
         let (outputs, lines) = with_captured_prints(|| execute_mixed_program(&client, &pullback, &[], &[]));
-        assert_eq!(outputs, Ok(Vec::new()));
+        assert_eq!(outputs.unwrap(), Vec::new(),);
         assert_eq!(lines, vec!["backward: 0.0", "backward: 0.0", "backward: 0.0"]);
     }
 
@@ -4023,13 +4025,14 @@ mod tests {
                         MixedValue::Array(vec![1.0, 2.0, 3.0], vec![3]),
                     ],
                     &[],
-                ),
-                Ok(vec![
+                )
+                .unwrap(),
+                vec![
                     MixedValue::Array(vec![6.0], vec![]),
                     MixedValue::Array(vec![6.0], vec![]),
                     MixedValue::Array(sums, vec![3]),
                     MixedValue::Array(products, vec![3]),
-                ]),
+                ],
             );
         }
     }
@@ -4068,12 +4071,12 @@ mod tests {
         );
         let client = execution_client();
         assert_eq!(
-            execute_mixed_program(&client, &program, &[MixedValue::Dimension(3)], &[]),
-            Ok(vec![MixedValue::Array(vec![0.0, 1.0, 2.0], vec![3]), MixedValue::Dimension(3)]),
+            execute_mixed_program(&client, &program, &[MixedValue::Dimension(3)], &[]).unwrap(),
+            vec![MixedValue::Array(vec![0.0, 1.0, 2.0], vec![3]), MixedValue::Dimension(3)],
         );
         assert_eq!(
-            execute_mixed_program(&client, &program, &[MixedValue::Dimension(0)], &[]),
-            Ok(vec![MixedValue::Array(vec![], vec![0]), MixedValue::Dimension(0)]),
+            execute_mixed_program(&client, &program, &[MixedValue::Dimension(0)], &[]).unwrap(),
+            vec![MixedValue::Array(vec![], vec![0]), MixedValue::Dimension(0)],
         );
     }
 

@@ -10,7 +10,7 @@ use ryft_mlir::{
 
 use crate::experimental::lowering::types::lower_tensor_type;
 use crate::operations::assertions::lower_output_extent_validation;
-use crate::{LowerableOperation, LowerableOperationFamily, LoweringError, XlaLowerer};
+use crate::{Error, LowerableOperation, LowerableOperationFamily, XlaLowerer};
 
 /// Lowers one traced random bit generation with `algorithm` to a `stablehlo.rng_bit_generator` that produces bits of
 /// type `bits_type`, mapping the algorithm to the corresponding StableHLO algorithm attribute. The two results are the
@@ -23,7 +23,7 @@ pub(crate) fn lower_rng_bit_generator_to_mlir<'b, 'c: 'b, 't: 'c>(
     block: &mut BlockRef<'b, 'c, 't>,
     context: &'c MlirContext<'t>,
     location: LocationRef<'c, 't>,
-) -> Result<Vec<ValueRef<'b, 'c, 't>>, LoweringError> {
+) -> Result<Vec<ValueRef<'b, 'c, 't>>, Error> {
     check_count!("input", input_values, 1, ProgramError);
     let algorithm = match algorithm {
         RandomAlgorithm::ThreeFry => stable_hlo::RngAlgorithm::ThreeFry,
@@ -45,7 +45,7 @@ impl LowerableOperation for RngBitGeneratorOperation<ArrayType> {
         input_values: &[ValueRef<'b, 'c, 't>],
         _input_types: &[ArrayType],
         _output_types: &[ArrayType],
-    ) -> Result<Vec<ValueRef<'b, 'c, 't>>, LoweringError> {
+    ) -> Result<Vec<ValueRef<'b, 'c, 't>>, Error> {
         lower_rng_bit_generator_to_mlir(
             self.algorithm(),
             self.output_type(),
@@ -64,7 +64,7 @@ impl LowerableOperation for RngBitGeneratorOperation<ArrayIrType> {
         input_values: &[ValueRef<'b, 'c, 't>],
         input_types: &[ArrayIrType],
         output_types: &[ArrayIrType],
-    ) -> Result<Vec<ValueRef<'b, 'c, 't>>, LoweringError> {
+    ) -> Result<Vec<ValueRef<'b, 'c, 't>>, Error> {
         let context = lowerer.context;
         let location = lowerer.location;
         let block = &mut lowerer.block;
@@ -74,9 +74,9 @@ impl LowerableOperation for RngBitGeneratorOperation<ArrayIrType> {
         let [_, bits_type] = output_types else {
             return Err(ProgramError::InvalidOutputCount { expected: 2, actual: output_types.len() }.into());
         };
-        let bits_type = <&ArrayType>::try_from(bits_type).map_err(|error| LoweringError::Tracing(error.into()))?;
+        let bits_type = <&ArrayType>::try_from(bits_type)?;
         if bits_type.static_shape().is_none() {
-            return Err(LoweringError::UnsupportedOp {
+            return Err(Error::UnsupportedOperation {
                 op: "rng-bit-generator with dynamic output extents cannot lower by generating the physical \
                      upper-bound shape because that would advance its functional state by the physical rather \
                      than logical element count"
@@ -302,8 +302,8 @@ mod tests {
             1447157908.0,
         ];
         assert_eq!(
-            execute_mixed_program(&client, &program, &[MixedValue::Dimension(3)], &[]),
-            Ok(vec![MixedValue::Array(bits.clone(), vec![3, 3]), MixedValue::Array(bits, vec![3, 3])]),
+            execute_mixed_program(&client, &program, &[MixedValue::Dimension(3)], &[]).unwrap(),
+            vec![MixedValue::Array(bits.clone(), vec![3, 3]), MixedValue::Array(bits, vec![3, 3])],
         );
         let error = execute_mixed_program(&client, &program, &[MixedValue::Dimension(4)], &[]).unwrap_err().to_string();
         assert!(error.contains("input dimension `size` expected 3"), "{error}");
@@ -318,7 +318,7 @@ mod tests {
 
         use crate::experimental::lowering::types::lower_tensor_type;
         use crate::experimental::ops::XlaOperation;
-        use crate::{LowerableOperation, LoweringError, XlaLowerer};
+        use crate::{Error, LowerableOperation, XlaLowerer};
 
         // Input types are validated before they are split into the state type and the extent operand types.
         let extent = DimensionVariable::new("extent", DimensionBounds::new(1, Some(9)).unwrap());
@@ -339,7 +339,7 @@ mod tests {
         let output_types = vec![state_type.into(), ArrayType::new_static(DataType::U32, [3]).into()];
         assert!(matches!(
             operation.lower(&mut lowerer, &inputs, &[], &output_types),
-            Err(LoweringError::Tracing(ProgramError::InvalidInputCount { expected: 2, actual: 0 })),
+            Err(Error::Core(ryft_core::Error::Program(ProgramError::InvalidInputCount { expected: 2, actual: 0 }))),
         ));
     }
 }

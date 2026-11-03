@@ -5,6 +5,8 @@ use thiserror::Error;
 
 // TODO(eaplatanios): Review this.
 
+// TODO(eaplatanios): Promote CUDA errors to dedicated `ryft_xla::Error` variants after
+//  this support leaves experimental status.
 /// Error produced while validating, loading, or launching a CUDA kernel artifact.
 #[derive(Error, Clone, Debug, PartialEq, Eq)]
 pub enum Error {

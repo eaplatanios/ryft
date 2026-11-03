@@ -463,7 +463,7 @@ fn test_array_put_rejects_non_addressable_source_shards() {
             &engine,
             crate::arrays_v0::DevicePutTarget::Placement { mesh: target_mesh, sharding: target_sharding }
         ),
-        Err(ArrayError::MissingAddressableShardForMove { shard_index: 0, device_id: 0 }),
+        Err(Error::MissingAddressableShardForMove { shard_index: 0, device_id: 0 }),
     ));
 }
 
@@ -701,7 +701,7 @@ fn test_device_put_rejects_mismatched_src_for_array_leaf() {
                 Option::<Option<bool>>::None,
             ),
         ),
-        Err(ArrayError::SourcePlacementMismatch {
+        Err(Error::SourcePlacementMismatch {
             expected_mesh: reported_expected_mesh,
             expected_sharding: reported_expected_sharding,
             actual_mesh: reported_actual_mesh,
@@ -983,7 +983,7 @@ fn test_zero_space_reshard_preserves_producer_completion() {
             if fails {
                 assert!(matches!(
                     result,
-                    Err(Error::PjrtError(PjrtError::InvalidArgument { message, .. }))
+                    Err(Error::Pjrt(PjrtError::InvalidArgument { message, .. }))
                         if message == "zero producer failed",
                 ));
             } else {
@@ -1339,7 +1339,7 @@ fn test_to_placement_rejects_non_addressable_destination_device() {
     assert!(
         matches!(
             result,
-            Err(ArrayError::NonAddressableDestinationDevice {
+            Err(Error::NonAddressableDestinationDevice {
                 device_id,
                 process_index: 1,
             }) if device_id == remote_device_id

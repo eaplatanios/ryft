@@ -9,7 +9,7 @@ use ryft_mlir::{
 use crate::experimental::lowering::CollectiveLoweringState;
 use crate::experimental::lowering::types::{lower_f64_constant_splat, lower_tensor_type};
 use crate::operations::collectives::{collective_replica_groups, mesh_axis_replica_groups};
-use crate::{LowerableOperation, LowerableOperationFamily, LoweringError, XlaLowerer};
+use crate::{Error, LowerableOperation, LowerableOperationFamily, XlaLowerer};
 
 /// Lowers one [`ParallelReduceOperation`] inside a `sdy.manual_computation` region to a `stablehlo.all_reduce` over
 /// the device mesh axis the collective names.
@@ -41,7 +41,7 @@ pub(crate) fn lower_collective_to_all_reduce<'b, 'c: 'b, 't: 'c>(
     block: &mut BlockRef<'b, 'c, 't>,
     context: &'c MlirContext<'t>,
     location: LocationRef<'c, 't>,
-) -> Result<ValueRef<'b, 'c, 't>, LoweringError> {
+) -> Result<ValueRef<'b, 'c, 't>, Error> {
     if let Some(mesh) = operation.mesh()
         && collective_state
             .manual_axis_region(operation.axis_name())
@@ -152,7 +152,7 @@ impl LowerableOperation for ParallelReduceOperation {
         input_values: &[ValueRef<'b, 'c, 't>],
         _input_types: &[ArrayType],
         output_types: &[ArrayType],
-    ) -> Result<Vec<ValueRef<'b, 'c, 't>>, LoweringError> {
+    ) -> Result<Vec<ValueRef<'b, 'c, 't>>, Error> {
         // This plain dispatch serves nested programs (control-flow bodies, inlined composite primals, and
         // rematerialized bodies), which can sit inside a shard_map manual region: the threaded
         // `CollectiveLoweringState` resolves the collective's mesh axis there and errors outside manual regions (a

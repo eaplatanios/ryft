@@ -5,12 +5,12 @@ pub mod lowering;
 /// Backend-owned staged operation types for traced XLA programs.
 pub mod ops;
 /// General XLA program tracing: the [`trace`] entry point, its [`TracedXlaProgram`] result, which lowers the traced
-/// program to StableHLO/Shardy MLIR for compilation and execution, and the [`TraceError`] of both stages.
+/// program to StableHLO/Shardy MLIR for compilation and execution, and the [`Error`](crate::Error) of both stages.
 pub mod tracing;
 
 pub use domains::{
-    XlaAnalysisValue, XlaCompilationAnalysis, XlaDomain, XlaDomainError, XlaFeedbackDirectedProfile, XlaMemoryAnalysis,
+    XlaAnalysisValue, XlaCompilationAnalysis, XlaDomain, XlaFeedbackDirectedProfile, XlaMemoryAnalysis,
     XlaOptimizedProgram, XlaSession,
 };
 
-pub use tracing::{TraceError, TracedXlaProgram, XlaArrayTracer, trace};
+pub use tracing::{TracedXlaProgram, XlaArrayTracer, trace};

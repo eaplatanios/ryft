@@ -4,10 +4,8 @@ use ryft_core::{ArrayType, DeviceMesh, MeshAxisType, Sharding, Typed};
 use ryft_pjrt::extensions::cross_host_transfers::{CrossHostTransferKey, GlobalDeviceId};
 use ryft_pjrt::{Buffer, DeviceId};
 
-use crate::arrays_v0::error::ArrayError;
 use crate::arrays_v0::transfers::{cross_host_global_device_id, exact_shard_transfer_key};
-use crate::experimental::XlaDomainError;
-use crate::{Error as XlaError, ToPjrt, XlaArray, XlaDomain, XlaOptions};
+use crate::{Error, ToPjrt, XlaArray, XlaDomain, XlaOptions};
 
 /// Performs the compiled-XLA resharding path for [`XlaArray::to_placement`](crate::XlaArray::to_placement).
 ///
@@ -29,15 +27,14 @@ use crate::{Error as XlaError, ToPjrt, XlaArray, XlaDomain, XlaOptions};
 ///     then the replicated cross-mesh path broadcasts the result to `dst_mesh` and applies the
 ///     final `dst_sharding`.
 ///
-/// Unsupported requests return typed [`ArrayError`] variants:
+/// Unsupported requests return typed [`Error`] variants:
 ///
-///   - [`ArrayError::UnsupportedMeshAxisType`] when the destination mesh has any non-`Auto` axis.
-///   - [`ArrayError::NonAddressableDestinationDevice`] when a destination device is on a
+///   - [`Error::UnsupportedMeshAxisType`] when the destination mesh has any non-`Auto` axis.
+///   - [`Error::NonAddressableDestinationDevice`] when a destination device is on a
 ///     different process than the wrapped [`Client`](ryft_pjrt::Client).
-///   - [`ArrayError::MissingAddressableShardForMove`] when the source has no addressable shard.
+///   - [`Error::MissingAddressableShardForMove`] when the source has no addressable shard.
 ///
-/// PJRT compile or execute failures propagate as `ArrayError::Error(...)` wrapping the underlying
-/// [`crate::Error`].
+/// Tracing, compilation, and execution failures propagate through [`Error`] without losing their typed payloads.
 ///
 /// # Parameters
 ///
@@ -50,7 +47,7 @@ pub(crate) fn reshard<'o>(
     engine: &XlaDomain<'o>,
     dst_mesh: &DeviceMesh,
     dst_sharding: &Sharding,
-) -> Result<XlaArray<'o>, ArrayError> {
+) -> Result<XlaArray<'o>, Error> {
     reshard_with_donation(source, engine, dst_mesh, dst_sharding, false)
 }
 
@@ -65,7 +62,7 @@ pub(crate) fn reshard_with_donation<'o>(
     dst_mesh: &DeviceMesh,
     dst_sharding: &Sharding,
     donate: bool,
-) -> Result<XlaArray<'o>, ArrayError> {
+) -> Result<XlaArray<'o>, Error> {
     if source.data_type().is_zero() {
         let r#type = source.r#type().into_owned().with_sharding(dst_sharding.clone())?;
         let mut output = XlaArray::from_zero_space(engine, r#type, dst_mesh.clone())?;
@@ -78,19 +75,16 @@ pub(crate) fn reshard_with_donation<'o>(
     // planned by the SPMD partitioner from the top level. `Auto` and `Explicit` axes both go
     // through SPMD partitioning, so allow both.
     if let Some(axis) = dst_mesh.logical_mesh().axes().iter().find(|axis| axis.r#type() == MeshAxisType::Manual) {
-        return Err(ArrayError::UnsupportedMeshAxisType {
-            axis_name: axis.name().to_string(),
-            axis_type: axis.r#type(),
-        });
+        return Err(Error::UnsupportedMeshAxisType { axis_name: axis.name().to_string(), axis_type: axis.r#type() });
     }
 
     // Source shards on the current process must carry a local buffer (a missing one indicates a
     // real misconfiguration). Shards on other processes are normal — they're served by the
     // cross-host transfers extension when the compiled path needs them.
-    let client_process_index = engine.client().process_index().map_err(XlaError::from)?;
+    let client_process_index = engine.client().process_index()?;
     for shard in source.shards() {
         if shard.device().process_index() == client_process_index && shard.buffer().is_none() {
-            return Err(ArrayError::MissingAddressableShardForMove {
+            return Err(Error::MissingAddressableShardForMove {
                 shard_index: shard.index(),
                 device_id: shard.device().id(),
             });
@@ -120,7 +114,7 @@ fn try_same_mesh<'o>(
     dst_mesh: &DeviceMesh,
     dst_sharding: &Sharding,
     donate: bool,
-) -> Result<XlaArray<'o>, ArrayError> {
+) -> Result<XlaArray<'o>, Error> {
     let element_type = source.data_type();
     let shape = source.shape();
     let src_sharding = source.sharding().clone();
@@ -142,17 +136,9 @@ fn try_same_mesh<'o>(
     };
 
     let staged: crate::jit::StagedXlaFunction<'_, ArrayType, ArrayType> =
-        crate::jit::stage(|input| input, bare_input_type, xla_options).map_err(|error| {
-            ArrayError::CompiledReshardInternalError { message: format!("tracing failed: {error}") }
-        })?;
-    let compiled = engine.compile_staged_function(staged).map_err(|error| match error {
-        XlaDomainError::Array(array_error) => array_error,
-        other => ArrayError::CompiledReshardInternalError { message: format!("compilation failed: {other}") },
-    })?;
-    engine.interpret(&compiled.executable_function(), source.clone()).map_err(|error| match error {
-        XlaDomainError::Array(array_error) => array_error,
-        other => ArrayError::CompiledReshardInternalError { message: format!("execute failed: {other}") },
-    })
+        crate::jit::stage(|input| input, bare_input_type, xla_options)?;
+    let compiled = engine.compile_staged_function(staged)?;
+    engine.interpret(&compiled.executable_function(), source.clone())
 }
 
 /// Broadcasts a fully-replicated `source` onto every device in `dst_mesh` via intra-host D2D
@@ -162,13 +148,13 @@ fn try_replicated_cross_mesh<'o>(
     engine: &XlaDomain<'o>,
     dst_mesh: &DeviceMesh,
     dst_sharding: &Sharding,
-) -> Result<XlaArray<'o>, ArrayError> {
+) -> Result<XlaArray<'o>, Error> {
     let client = engine.client();
-    let client_process_index = client.process_index().map_err(XlaError::from)?;
-    let addressable_devices = client.addressable_devices().map_err(XlaError::from)?;
+    let client_process_index = client.process_index()?;
+    let addressable_devices = client.addressable_devices()?;
     let mut dst_device_by_id = HashMap::with_capacity(addressable_devices.len());
     for device in addressable_devices {
-        let id = device.id().map_err(XlaError::from)?;
+        let id = device.id()?;
         dst_device_by_id.insert(id, device);
     }
 
@@ -180,7 +166,7 @@ fn try_replicated_cross_mesh<'o>(
         .devices()
         .first()
         .copied()
-        .ok_or_else(|| ArrayError::MissingAddressableShardForMove { shard_index: 0, device_id: 0 })?;
+        .ok_or_else(|| Error::MissingAddressableShardForMove { shard_index: 0, device_id: 0 })?;
     let canonical_src_global_id = cross_host_global_device_id(canonical_src_device.id())?;
     let this_process_is_canonical_sender = canonical_src_device.process_index() == client_process_index;
     let local_source_buffer = source.addressable_shards().find_map(|shard| shard.buffer().cloned());
@@ -204,13 +190,12 @@ fn try_replicated_cross_mesh<'o>(
         let dst_global_id = cross_host_global_device_id(dst_device_id)?;
 
         if dst_local {
-            let pjrt_device =
-                dst_device_by_id.get(&dst_device_id).ok_or(ArrayError::NonAddressableDestinationDevice {
-                    device_id: dst_device_id,
-                    process_index: dst_device.process_index(),
-                })?;
+            let pjrt_device = dst_device_by_id.get(&dst_device_id).ok_or(Error::NonAddressableDestinationDevice {
+                device_id: dst_device_id,
+                process_index: dst_device.process_index(),
+            })?;
             if let Some(local_source) = local_source_buffer.as_ref() {
-                let buffer = local_source.copy_to_device(pjrt_device.clone()).map_err(XlaError::from)?;
+                let buffer = local_source.copy_to_device(pjrt_device.clone())?;
                 local_buffers.insert(dst_device_id, buffer);
             } else {
                 receive_plans_by_device
@@ -219,7 +204,7 @@ fn try_replicated_cross_mesh<'o>(
                     .push((canonical_src_global_id, transfer_key));
             }
         } else if this_process_is_canonical_sender {
-            let local_source = local_source_buffer.as_ref().ok_or(ArrayError::MissingAddressableShardForMove {
+            let local_source = local_source_buffer.as_ref().ok_or(Error::MissingAddressableShardForMove {
                 shard_index: 0,
                 device_id: canonical_src_device.id(),
             })?;
@@ -240,7 +225,7 @@ fn try_replicated_cross_mesh<'o>(
                 .iter()
                 .find(|device| device.process_index() != client_process_index)
                 .expect("cross-host transfer planned but no remote destination found");
-            return Err(ArrayError::NonAddressableDestinationDevice {
+            return Err(Error::NonAddressableDestinationDevice {
                 device_id: blocking_dst.id(),
                 process_index: blocking_dst.process_index(),
             });
@@ -249,14 +234,12 @@ fn try_replicated_cross_mesh<'o>(
 
     // Issue cross-host sends, if any.
     if !send_buffers.is_empty() {
-        client
-            .cross_host_send_buffers(
-                send_buffers.as_slice(),
-                send_dst_devices.as_slice(),
-                send_transfer_keys.as_slice(),
-                &[],
-            )
-            .map_err(XlaError::from)?;
+        client.cross_host_send_buffers(
+            send_buffers.as_slice(),
+            send_dst_devices.as_slice(),
+            send_transfer_keys.as_slice(),
+            &[],
+        )?;
     }
 
     // Issue cross-host receives, if any. Each call covers one destination device, matching the
@@ -267,7 +250,7 @@ fn try_replicated_cross_mesh<'o>(
     receive_device_ids.sort_unstable();
     for dst_device_id in receive_device_ids {
         let plans = receive_plans_by_device.get(&dst_device_id).expect("receive plans present after sort");
-        let pjrt_device = dst_device_by_id.get(&dst_device_id).ok_or(ArrayError::NonAddressableDestinationDevice {
+        let pjrt_device = dst_device_by_id.get(&dst_device_id).ok_or(Error::NonAddressableDestinationDevice {
             device_id: dst_device_id,
             process_index: client_process_index,
         })?;
@@ -275,16 +258,14 @@ fn try_replicated_cross_mesh<'o>(
         let dimensions = plans.iter().map(|_| shape_i64.as_slice()).collect::<Vec<_>>();
         let source_devices = plans.iter().map(|(src_global_id, _)| *src_global_id).collect::<Vec<_>>();
         let transfer_keys = plans.iter().map(|(_, key)| *key).collect::<Vec<_>>();
-        let received = client
-            .cross_host_receive_buffers(
-                element_types.as_slice(),
-                dimensions.as_slice(),
-                pjrt_device,
-                source_devices.as_slice(),
-                transfer_keys.as_slice(),
-                &[],
-            )
-            .map_err(XlaError::from)?;
+        let received = client.cross_host_receive_buffers(
+            element_types.as_slice(),
+            dimensions.as_slice(),
+            pjrt_device,
+            source_devices.as_slice(),
+            transfer_keys.as_slice(),
+            &[],
+        )?;
         for buffer in received {
             local_buffers.insert(dst_device_id, buffer);
         }
@@ -303,9 +284,7 @@ fn try_replicated_cross_mesh<'o>(
     let shape = source.shape();
     let element_type = source.data_type();
     let replicated_on_dst = Sharding::replicated(dst_mesh.logical_mesh().clone(), shape.rank());
-    let intermediate_type = ArrayType::new(element_type, shape.into())
-        .with_sharding(replicated_on_dst)
-        .map_err(XlaError::from)?;
+    let intermediate_type = ArrayType::new(element_type, shape.into()).with_sharding(replicated_on_dst)?;
     let intermediate = XlaArray::from_addressable_buffers(engine, intermediate_type, dst_mesh.clone(), buffers)?;
 
     // The intermediate is owned exclusively by this function and is never observed by callers.
@@ -330,7 +309,7 @@ fn try_sharded_cross_mesh<'o>(
     src_mesh: &DeviceMesh,
     dst_mesh: &DeviceMesh,
     dst_sharding: &Sharding,
-) -> Result<XlaArray<'o>, ArrayError> {
+) -> Result<XlaArray<'o>, Error> {
     let shape = source.shape();
     let replicated_on_src = Sharding::replicated(src_mesh.logical_mesh().clone(), shape.rank());
     // Source is owned externally, so we do not donate it during the all-gather. The gathered

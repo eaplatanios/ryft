@@ -4,7 +4,7 @@ use ryft_mlir::{
     Block, BlockRef, Context as MlirContext, LocationRef, Operation as MlirOperation, Value as MlirValue, ValueRef,
 };
 
-use crate::LoweringError;
+use crate::Error;
 use crate::experimental::lowering::CollectiveLoweringState;
 use crate::experimental::lowering::types::lower_tensor_type;
 
@@ -33,7 +33,7 @@ pub(crate) mod parallel_vary;
 pub(crate) fn mesh_axis_replica_groups(
     collective_state: &CollectiveLoweringState,
     axis_name: &str,
-) -> Result<(Vec<Vec<usize>>, usize), LoweringError> {
+) -> Result<(Vec<Vec<usize>>, usize), Error> {
     let Some(shard_map) = collective_state.manual_shard_map() else {
         return Err(ProgramError::UnsupportedOperation {
             message: format!(
@@ -76,7 +76,7 @@ pub(crate) fn collective_replica_groups(
     axis_name: &str,
     axis_size: usize,
     axis_index_groups: Option<&[Vec<usize>]>,
-) -> Result<(Vec<Vec<usize>>, usize), LoweringError> {
+) -> Result<(Vec<Vec<usize>>, usize), Error> {
     let (mesh_groups, mesh_axis_size) = mesh_axis_replica_groups(collective_state, axis_name)?;
     if axis_size != mesh_axis_size {
         return Err(ProgramError::MalformedProgram(format!(
@@ -117,7 +117,7 @@ pub(crate) fn collapse_singleton_axis<'b, 'c: 'b, 't: 'c>(
     block: &mut BlockRef<'b, 'c, 't>,
     context: &'c MlirContext<'t>,
     location: LocationRef<'c, 't>,
-) -> Result<ValueRef<'b, 'c, 't>, LoweringError> {
+) -> Result<ValueRef<'b, 'c, 't>, Error> {
     let output_type = lower_tensor_type(output_array_type, context, location)?;
     let reshape = block.append_operation(stable_hlo::reshape_with_output_type(value, output_type, location)?)?;
     Ok(reshape.result(0).expect("stablehlo.reshape should return one result").as_ref())
@@ -131,13 +131,13 @@ pub(crate) fn refine_collective_result_dimensions<'b, 'c: 'b, 't: 'c>(
     block: &mut ryft_mlir::BlockRef<'b, 'c, 't>,
     context: &'c MlirContext<'t>,
     location: ryft_mlir::LocationRef<'c, 't>,
-) -> Result<Vec<ValueRef<'b, 'c, 't>>, LoweringError> {
+) -> Result<Vec<ValueRef<'b, 'c, 't>>, Error> {
     if output_type.rank() != extents.len() {
         return Err(ProgramError::InvalidInputCount { expected: output_type.rank(), actual: extents.len() }.into());
     }
     let i32_scalar_type = context
         .tensor_type(context.signless_integer_type(32), &[], None, location)
-        .map_err(|_| LoweringError::InvalidTensorType { array_type: ArrayType::scalar(DataType::I32) })?;
+        .map_err(|_| Error::InvalidTensorType { array_type: ArrayType::scalar(DataType::I32) })?;
     let output_tensor_type = lower_tensor_type(output_type, context, location)?;
     for (axis, &extent) in extents.iter().enumerate() {
         if !matches!(output_type.shape().dimensions()[axis], Dimension::Dynamic(_)) {
@@ -162,7 +162,7 @@ mod tests {
     use pretty_assertions::assert_eq;
     use ryft_core::{
         Array, ArrayOperation, DimensionBounds, DimensionType, ParallelAllToAllOperation, ParallelPermuteOperation,
-        Shape, ShardMap, Sharding,
+        Shape, ShardMapBoundary, Sharding,
     };
     use ryft_mlir::{Block, Location, Value as MlirValue};
 
@@ -182,7 +182,8 @@ mod tests {
         let varying = replicated.clone().with_varying_manual_axes(["x"]).unwrap();
         let unreduced = replicated.clone().with_unreduced_axes(["x"]).unwrap();
         let state = CollectiveLoweringState::new().enter_manual_region(
-            ShardMap::new(mesh.clone(), vec![replicated.clone()], vec![replicated.clone()], Vec::new()).unwrap(),
+            ShardMapBoundary::new(mesh.clone(), vec![replicated.clone()], vec![replicated.clone()], Vec::new())
+                .unwrap(),
         );
         let exchange = ParallelAllToAllOperation::new("x".to_string(), 2, 0, 0, CollectiveOptions::tiled());
         let permute = ParallelPermuteOperation::new("x".to_string(), 2, vec![(0, 1), (1, 0)]);
@@ -231,7 +232,7 @@ mod tests {
         let varying = replicated.clone().with_varying_manual_axes(["x"]).unwrap();
         let unreduced = replicated.clone().with_unreduced_axes(["x"]).unwrap();
         let state = CollectiveLoweringState::new().enter_manual_region(
-            ShardMap::new(mesh, vec![replicated.clone()], vec![replicated.clone()], Vec::new()).unwrap(),
+            ShardMapBoundary::new(mesh, vec![replicated.clone()], vec![replicated.clone()], Vec::new()).unwrap(),
         );
         let extent = DimensionType::new("items", DimensionBounds::new(0, Some(9)).unwrap());
         let operation = ParallelAllToAllOperation::new("x".to_string(), 2, 0, 0, CollectiveOptions::tiled());
@@ -266,14 +267,14 @@ mod tests {
     fn test_collective_mesh_validation_uses_the_nearest_manual_binder() {
         let outer_mesh = test_manual_mesh("x", 2);
         let inner_mesh = test_manual_mesh("x", 3);
-        let outer = ShardMap::new(outer_mesh.clone(), Vec::new(), Vec::new(), Vec::new()).unwrap();
-        let inner = ShardMap::new(inner_mesh.clone(), Vec::new(), Vec::new(), Vec::new()).unwrap();
+        let outer = ShardMapBoundary::new(outer_mesh.clone(), Vec::new(), Vec::new(), Vec::new()).unwrap();
+        let inner = ShardMapBoundary::new(inner_mesh.clone(), Vec::new(), Vec::new(), Vec::new()).unwrap();
         let state = CollectiveLoweringState::new().enter_manual_region(outer).enter_manual_region(inner);
         assert_eq!(state.checked_collective_mesh("parallel_permute", "x", 3, None).unwrap(), &inner_mesh);
         assert!(state.checked_collective_mesh("parallel_permute", "x", 3, Some(&outer_mesh)).is_err());
         assert!(matches!(
             state.checked_collective_mesh("parallel_permute", "x", 2, Some(&outer_mesh)),
-            Err(LoweringError::Tracing(ProgramError::MalformedProgram(message)))
+            Err(Error::Core(ryft_core::Error::Program(ProgramError::MalformedProgram(message))))
                 if message == "collective over axis `x` records size 2, but the enclosing mesh axis has size 3",
         ));
     }

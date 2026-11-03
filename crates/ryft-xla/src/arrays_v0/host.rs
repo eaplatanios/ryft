@@ -4,18 +4,18 @@ use ryft_core::{ArrayType, Typed};
 use ryft_pjrt::{Event, ExecutionFence};
 
 use crate::arrays::ArrayTypeExtension;
-use crate::{Error as XlaError, ToPjrt, XlaArray};
+use crate::{Error, ToPjrt, XlaArray};
 
 use super::*;
 
 /// Returns row-major element strides for `global_shape`. `strides[i]` is the number of logical
 /// elements skipped when incrementing dimension `i` by one in a dense major-to-minor layout.
-fn row_major_element_strides(global_shape: &[usize], element_type: DataType) -> Result<Vec<usize>, ArrayError> {
+fn row_major_element_strides(global_shape: &[usize], element_type: DataType) -> Result<Vec<usize>, Error> {
     let mut strides = vec![1usize; global_shape.len()];
     let mut stride = 1usize;
     for dimension in (0..global_shape.len()).rev() {
         strides[dimension] = stride;
-        stride = stride.checked_mul(global_shape[dimension]).ok_or_else(|| XlaError::SizeLimitExceeded {
+        stride = stride.checked_mul(global_shape[dimension]).ok_or_else(|| Error::SizeLimitExceeded {
             message: format!(
                 "row-major stride for array with shape {global_shape:?} and element type {element_type} exceeds the \
                  maximum allowed size of {}",
@@ -68,12 +68,12 @@ pub(crate) struct DenseArrayHostCopy {
 
 impl DenseArrayHostCopy {
     /// Waits for every previously issued copy and produces one dense row-major byte buffer.
-    pub(crate) fn finish(self) -> Result<Vec<u8>, ArrayError> {
+    pub(crate) fn finish(self) -> Result<Vec<u8>, Error> {
         self.finish_with_measurements().map(|(bytes, _)| bytes)
     }
 
     /// Finishes this copy and reports whether a global merge buffer was allocated.
-    pub(crate) fn finish_with_measurements(self) -> Result<(Vec<u8>, bool), ArrayError> {
+    pub(crate) fn finish_with_measurements(self) -> Result<(Vec<u8>, bool), Error> {
         if let Some(completion) = &self.completion {
             completion.block_until_ready()?;
         }
@@ -88,7 +88,7 @@ impl DenseArrayHostCopy {
                 let PendingDenseShardHostCopy { event, shard_index, device_id, expected_byte_count, slices } = shard;
                 let bytes = event.r#await()?;
                 if bytes.len() != expected_byte_count {
-                    return Err(ArrayError::CopiedShardByteCountMismatch {
+                    return Err(Error::CopiedShardByteCountMismatch {
                         shard_index,
                         device_id,
                         expected_byte_count,
@@ -97,7 +97,7 @@ impl DenseArrayHostCopy {
                 }
                 Ok((shard_index, slices, bytes))
             })
-            .collect::<Result<Vec<_>, ArrayError>>()?;
+            .collect::<Result<Vec<_>, Error>>()?;
 
         if shards.len() == 1 {
             let (shard_index, slices, bytes) = shards.pop().unwrap();
@@ -138,7 +138,7 @@ impl DenseArrayHostCopy {
 
 /// Starts copies for every addressable shard of `array` without awaiting them. Errors when any global shard is not
 /// addressable from the current process.
-pub(crate) fn begin_materialize_dense_array_bytes(array: &XlaArray<'_>) -> Result<DenseArrayHostCopy, ArrayError> {
+pub(crate) fn begin_materialize_dense_array_bytes(array: &XlaArray<'_>) -> Result<DenseArrayHostCopy, Error> {
     let completion = array.execution_fence().cloned();
     // Empty arrays have no payload either. Avoid asking PJRT for a zero-byte dynamic copy, whose size-query
     // fallback can expose the bound allocation and its trailer instead of the empty logical value.
@@ -173,7 +173,7 @@ pub(crate) fn begin_materialize_dense_array_bytes(array: &XlaArray<'_>) -> Resul
             let buffer = shard
                 .buffer()
                 .map(|buffer| buffer.as_ref())
-                .ok_or(ArrayError::MissingAddressableShardForMove { shard_index, device_id: device.id() })?;
+                .ok_or(Error::MissingAddressableShardForMove { shard_index, device_id: device.id() })?;
             let shard_shape = shard.shape();
             Ok(PendingDenseShardHostCopy {
                 // The merge consumes row-major bytes even when the device buffer has another physical layout.
@@ -184,7 +184,7 @@ pub(crate) fn begin_materialize_dense_array_bytes(array: &XlaArray<'_>) -> Resul
                 slices: shard.slice().to_vec(),
             })
         })
-        .collect::<Result<Vec<_>, ArrayError>>()?;
+        .collect::<Result<Vec<_>, Error>>()?;
     Ok(DenseArrayHostCopy { global_shape, element_type, total_byte_count, shards, completion })
 }
 
@@ -193,7 +193,7 @@ pub(crate) fn begin_materialize_dense_array_bytes(array: &XlaArray<'_>) -> Resul
 ///
 /// Used by [`XlaArray::to`](crate::XlaArray::to)'s last-resort host fallback when the fast and compiled paths cannot
 /// satisfy the requested placement.
-pub(crate) fn materialize_dense_array_bytes(array: &XlaArray<'_>) -> Result<Vec<u8>, ArrayError> {
+pub(crate) fn materialize_dense_array_bytes(array: &XlaArray<'_>) -> Result<Vec<u8>, Error> {
     begin_materialize_dense_array_bytes(array)?.finish()
 }
 
@@ -206,7 +206,7 @@ fn merge_dense_shard_bytes(
     shard_index: ShardIndex,
     global_bytes: &mut [u8],
     written_intervals: &mut Vec<Range<usize>>,
-) -> Result<(), ArrayError> {
+) -> Result<(), Error> {
     if shard_slices.is_empty() {
         return merge_dense_byte_segment(shard_bytes, 0, shard_index, global_bytes, written_intervals);
     }
@@ -214,7 +214,7 @@ fn merge_dense_shard_bytes(
     let global_strides = row_major_element_strides(global_shape, element_type)?;
     let shard_shape = shard_slices.iter().map(|slice| slice.len()).collect::<Vec<_>>();
     let shard_strides = row_major_element_strides(shard_shape.as_slice(), element_type)?;
-    let element_size_in_bytes = element_type.to_pjrt().element_size_in_bytes().map_err(XlaError::from)?;
+    let element_size_in_bytes = element_type.to_pjrt().element_size_in_bytes()?;
     merge_dense_shard_bytes_recursive(
         shard_bytes,
         shard_slices,
@@ -243,7 +243,7 @@ fn merge_dense_shard_bytes_recursive(
     shard_index: ShardIndex,
     global_bytes: &mut [u8],
     written_intervals: &mut Vec<Range<usize>>,
-) -> Result<(), ArrayError> {
+) -> Result<(), Error> {
     let slice = &shard_slices[dimension];
     if dimension + 1 == shard_slices.len() {
         let global_element_offset = base_global_element_offset
@@ -293,7 +293,7 @@ fn merge_dense_byte_segment(
     shard_index: ShardIndex,
     global_bytes: &mut [u8],
     written_intervals: &mut Vec<Range<usize>>,
-) -> Result<(), ArrayError> {
+) -> Result<(), Error> {
     // Zero-extent shard slices produce empty segments; recording their degenerate `[x, x)` intervals would only
     // bloat the overlap bookkeeping without ever contributing bytes.
     if source_bytes.is_empty() {
@@ -312,7 +312,7 @@ fn merge_dense_byte_segment(
         if overlap.start < overlap.end {
             let source_offset = overlap.start - range.start;
             if global_bytes[overlap.clone()] != source_bytes[source_offset..source_offset + overlap.len()] {
-                return Err(ArrayError::InconsistentOverlappingShardData { shard_index });
+                return Err(Error::InconsistentOverlappingShardData { shard_index });
             }
         }
         overlap_index += 1;

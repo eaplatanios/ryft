@@ -5,7 +5,7 @@ use ryft_mlir::{Block, BlockRef, LocationRef, Operation as MlirOperation, Value 
 
 use crate::experimental::lowering::CollectiveLoweringState;
 use crate::operations::collectives::collective_replica_groups;
-use crate::{LowerableOperation, LowerableOperationFamily, LoweringError, XlaLowerer};
+use crate::{Error, LowerableOperation, LowerableOperationFamily, XlaLowerer};
 
 /// Lowers one traced `parallel_permute` to a channeled `stablehlo.collective_permute`, expanding the axis-local
 /// `(source, target)` pairs to global device pairs across the named mesh axis's replica groups.
@@ -15,7 +15,7 @@ pub(crate) fn lower_parallel_permute_to_mlir<'b, 'c: 'b, 't: 'c>(
     input_value: ValueRef<'b, 'c, 't>,
     block: &mut BlockRef<'b, 'c, 't>,
     location: LocationRef<'c, 't>,
-) -> Result<Vec<ValueRef<'b, 'c, 't>>, LoweringError> {
+) -> Result<Vec<ValueRef<'b, 'c, 't>>, Error> {
     let (replica_groups, _) =
         collective_replica_groups(collective_state, operation.axis_name(), operation.axis_size(), None)?;
     let mut source_target_pairs = Vec::with_capacity(replica_groups.len() * operation.source_target_pairs().len());
@@ -41,7 +41,7 @@ impl LowerableOperation for ParallelPermuteOperation {
         input_values: &[ValueRef<'b, 'c, 't>],
         input_types: &[ArrayType],
         output_types: &[ArrayType],
-    ) -> Result<Vec<ValueRef<'b, 'c, 't>>, LoweringError> {
+    ) -> Result<Vec<ValueRef<'b, 'c, 't>>, Error> {
         check_count!("input", input_values, 1, ProgramError);
         check_count!("output", output_types, 1, ProgramError);
         let collective_state = lowerer.collective_state.clone();

@@ -19,7 +19,7 @@ use crate::operations::assertions::{
     lower_assertion_custom_call, lower_deliberately_false_assertion_predicate,
 };
 use crate::operations::sharding::constrain_sharding::lower_sharding_constraint;
-use crate::{LowerableOperation, LowerableOperationFamily, LoweringError, XlaLowerer};
+use crate::{Error, LowerableOperation, LowerableOperationFamily, XlaLowerer};
 
 impl LowerableOperation for ReshapeOperation {
     fn lower<'b, 'c: 'b, 't: 'c, O: LowerableOperationFamily>(
@@ -28,7 +28,7 @@ impl LowerableOperation for ReshapeOperation {
         input_values: &[ValueRef<'b, 'c, 't>],
         input_types: &[ArrayType],
         output_types: &[ArrayType],
-    ) -> Result<Vec<ValueRef<'b, 'c, 't>>, LoweringError> {
+    ) -> Result<Vec<ValueRef<'b, 'c, 't>>, Error> {
         check_count!("input", input_types, 1, ProgramError);
         lower_reshape_to_mlir(
             self,
@@ -57,7 +57,7 @@ fn lower_reshape_to_mlir<'b, 'c: 'b, 't: 'c>(
     block: &mut BlockRef<'b, 'c, 't>,
     context: &'c MlirContext<'t>,
     location: LocationRef<'c, 't>,
-) -> Result<Vec<ValueRef<'b, 'c, 't>>, LoweringError> {
+) -> Result<Vec<ValueRef<'b, 'c, 't>>, Error> {
     check_count!("input", input_values, 1, ProgramError);
     check_count!("output", output_types, 1, ProgramError);
     let input = input_values[0];
@@ -85,7 +85,7 @@ fn lower_reshape_to_mlir<'b, 'c: 'b, 't: 'c>(
                         lower_static_index_constants(&[*extent], block, context, location)?[0]
                     }
                     Dimension::Dynamic(_) => {
-                        let axis = input_axes.next().ok_or_else(|| LoweringError::UnsupportedOp {
+                        let axis = input_axes.next().ok_or_else(|| Error::UnsupportedOperation {
                             op: format!(
                                 "reshape from {} to {} does not preserve the non-singleton dimensions in order",
                                 input_type.shape(),
@@ -146,7 +146,7 @@ pub(crate) fn lower_reshape_element_count_assertion<'b, 'c: 'b, 't: 'c>(
     block: &mut BlockRef<'b, 'c, 't>,
     context: &'c MlirContext<'t>,
     location: LocationRef<'c, 't>,
-) -> Result<(), LoweringError> {
+) -> Result<(), Error> {
     let observed = input_extents.iter().chain(output_extents).copied().collect::<Vec<_>>();
     let seed = match observed.first() {
         Some(value) => *value,
@@ -173,7 +173,7 @@ impl LowerableOperation for DynamicReshapeOperation {
         input_values: &[ValueRef<'b, 'c, 't>],
         input_types: &[ArrayIrType],
         output_types: &[ArrayIrType],
-    ) -> Result<Vec<ValueRef<'b, 'c, 't>>, LoweringError> {
+    ) -> Result<Vec<ValueRef<'b, 'c, 't>>, Error> {
         let context = lowerer.context;
         let location = lowerer.location;
         let collective_state = &lowerer.collective_state;
@@ -185,11 +185,11 @@ impl LowerableOperation for DynamicReshapeOperation {
         let [output_type] = output_types else {
             return Err(ProgramError::InvalidOutputCount { expected: 1, actual: output_types.len() }.into());
         };
-        let output_type = <&ArrayType>::try_from(output_type).map_err(|error| LoweringError::Tracing(error.into()))?;
+        let output_type = <&ArrayType>::try_from(output_type)?;
         let Some((input_type, _)) = input_types.split_first() else {
             return Err(ProgramError::InvalidInputCount { expected: 1, actual: 0 }.into());
         };
-        let input_type = <&ArrayType>::try_from(input_type).map_err(|error| LoweringError::Tracing(error.into()))?;
+        let input_type = <&ArrayType>::try_from(input_type)?;
         if output_extents.len() != output_type.rank() {
             return Err(ProgramError::InvalidInputCount {
                 expected: output_type.rank() + 1,
@@ -200,16 +200,16 @@ impl LowerableOperation for DynamicReshapeOperation {
 
         // Native reshape requires equal allocation capacities even when the runtime logical products agree.
         // Reject unsupported bound combinations here rather than letting HLO import fail with a static-count error.
-        let physical_input = physical_bound_type(input_type).map_err(|_| LoweringError::UnsupportedOp {
+        let physical_input = physical_bound_type(input_type).map_err(|_| Error::UnsupportedOperation {
             op: "reshape requires finite physical bounds for every dynamic input dimension".to_string(),
         })?;
-        let physical_output = physical_bound_type(output_type).map_err(|_| LoweringError::UnsupportedOp {
+        let physical_output = physical_bound_type(output_type).map_err(|_| Error::UnsupportedOperation {
             op: "reshape requires finite physical bounds for every dynamic output dimension".to_string(),
         })?;
         let input_capacity = physical_input.element_count().map_err(ProgramError::from)?.unwrap();
         let output_capacity = physical_output.element_count().map_err(ProgramError::from)?.unwrap();
         if input_capacity != output_capacity {
-            return Err(LoweringError::UnsupportedOp {
+            return Err(Error::UnsupportedOperation {
                 op: format!(
                     "reshape with unequal physical capacities (input {input_capacity}, output {output_capacity}); \
                      dynamic bounds must preserve the physical element count",
@@ -502,14 +502,12 @@ mod tests {
             .unwrap();
         let output_type = <&ArrayType>::try_from(&program.output_types()[0]).unwrap().clone();
         let input_types = vec![input_type, ArrayType::scalar(DataType::I64)];
-        assert_eq!(
+        assert!(matches!(
             to_mlir_module_for_program(&program, &[], &input_types, &vec![output_type], "main", None, None),
-            Err(LoweringError::UnsupportedOp {
-                op: "reshape with unequal physical capacities (input 4, output 6); dynamic bounds must preserve the \
-                     physical element count"
-                    .to_string(),
-            }),
-        );
+            Err(Error::UnsupportedOperation { op })
+                if op == "reshape with unequal physical capacities (input 4, output 6); dynamic bounds must \
+                   preserve the physical element count",
+        ));
     }
 
     #[test]
@@ -631,12 +629,12 @@ mod tests {
         let program = unproject_plain_program(program);
         let storage = vec![1.0, 2.0, 3.0, 4.0];
         assert_eq!(
-            execute_mixed_program(&client, &program, &[MixedValue::Array(storage.clone(), vec![4])], &[2]),
-            Ok(vec![MixedValue::Array(vec![1.0, 2.0], vec![1, 2]), MixedValue::Dimension(2)]),
+            execute_mixed_program(&client, &program, &[MixedValue::Array(storage.clone(), vec![4])], &[2]).unwrap(),
+            vec![MixedValue::Array(vec![1.0, 2.0], vec![1, 2]), MixedValue::Dimension(2)],
         );
         assert_eq!(
-            execute_mixed_program(&client, &program, &[MixedValue::Array(storage, vec![4])], &[0]),
-            Ok(vec![MixedValue::Array(Vec::new(), vec![1, 0]), MixedValue::Dimension(0)]),
+            execute_mixed_program(&client, &program, &[MixedValue::Array(storage, vec![4])], &[0]).unwrap(),
+            vec![MixedValue::Array(Vec::new(), vec![1, 0]), MixedValue::Dimension(0)],
         );
 
         // A trailing static axis is preserved as a constant behind the inserted singleton.
@@ -668,12 +666,12 @@ mod tests {
         let program = unproject_plain_program(program);
         let storage = (1..=12).map(f64::from).collect::<Vec<_>>();
         assert_eq!(
-            execute_mixed_program(&client, &program, &[MixedValue::Array(storage.clone(), vec![4, 3])], &[2]),
-            Ok(vec![MixedValue::Array(vec![1.0, 2.0, 3.0, 4.0, 5.0, 6.0], vec![2, 1, 3]), MixedValue::Dimension(2)]),
+            execute_mixed_program(&client, &program, &[MixedValue::Array(storage.clone(), vec![4, 3])], &[2]).unwrap(),
+            vec![MixedValue::Array(vec![1.0, 2.0, 3.0, 4.0, 5.0, 6.0], vec![2, 1, 3]), MixedValue::Dimension(2)],
         );
         assert_eq!(
-            execute_mixed_program(&client, &program, &[MixedValue::Array(storage, vec![4, 3])], &[0]),
-            Ok(vec![MixedValue::Array(Vec::new(), vec![0, 1, 3]), MixedValue::Dimension(0)]),
+            execute_mixed_program(&client, &program, &[MixedValue::Array(storage, vec![4, 3])], &[0]).unwrap(),
+            vec![MixedValue::Array(Vec::new(), vec![0, 1, 3]), MixedValue::Dimension(0)],
         );
     }
 
@@ -702,12 +700,12 @@ mod tests {
         let program = unproject_plain_program(program);
         let storage = vec![1.0, 2.0, 3.0, 4.0];
         assert_eq!(
-            execute_mixed_program(&client, &program, &[MixedValue::Array(storage.clone(), vec![1, 4])], &[2]),
-            Ok(vec![MixedValue::Array(vec![1.0, 2.0], vec![2]), MixedValue::Dimension(2)]),
+            execute_mixed_program(&client, &program, &[MixedValue::Array(storage.clone(), vec![1, 4])], &[2]).unwrap(),
+            vec![MixedValue::Array(vec![1.0, 2.0], vec![2]), MixedValue::Dimension(2)],
         );
         assert_eq!(
-            execute_mixed_program(&client, &program, &[MixedValue::Array(storage, vec![1, 4])], &[0]),
-            Ok(vec![MixedValue::Array(Vec::new(), vec![0]), MixedValue::Dimension(0)]),
+            execute_mixed_program(&client, &program, &[MixedValue::Array(storage, vec![1, 4])], &[0]).unwrap(),
+            vec![MixedValue::Array(Vec::new(), vec![0]), MixedValue::Dimension(0)],
         );
 
         // Removing an interior singleton keeps the surrounding dynamic and static axes in order.
@@ -736,12 +734,13 @@ mod tests {
         let program = unproject_plain_program(program);
         let storage = (1..=12).map(f64::from).collect::<Vec<_>>();
         assert_eq!(
-            execute_mixed_program(&client, &program, &[MixedValue::Array(storage.clone(), vec![4, 1, 3])], &[2]),
-            Ok(vec![MixedValue::Array(vec![1.0, 2.0, 3.0, 4.0, 5.0, 6.0], vec![2, 3]), MixedValue::Dimension(2)]),
+            execute_mixed_program(&client, &program, &[MixedValue::Array(storage.clone(), vec![4, 1, 3])], &[2])
+                .unwrap(),
+            vec![MixedValue::Array(vec![1.0, 2.0, 3.0, 4.0, 5.0, 6.0], vec![2, 3]), MixedValue::Dimension(2)],
         );
         assert_eq!(
-            execute_mixed_program(&client, &program, &[MixedValue::Array(storage, vec![4, 1, 3])], &[0]),
-            Ok(vec![MixedValue::Array(Vec::new(), vec![0, 3]), MixedValue::Dimension(0)]),
+            execute_mixed_program(&client, &program, &[MixedValue::Array(storage, vec![4, 1, 3])], &[0]).unwrap(),
+            vec![MixedValue::Array(Vec::new(), vec![0, 3]), MixedValue::Dimension(0)],
         );
     }
 
@@ -793,12 +792,12 @@ mod tests {
         let program = unproject_plain_program(program);
         let storage = (1..=12).map(f64::from).collect::<Vec<_>>();
         assert_eq!(
-            execute_mixed_program(&client, &program, &[MixedValue::Array(storage.clone(), vec![4, 3])], &[2]),
-            Ok(vec![MixedValue::Array(vec![1.0, 4.0, 2.0, 5.0, 3.0, 6.0], vec![3, 1, 2]), MixedValue::Dimension(2)]),
+            execute_mixed_program(&client, &program, &[MixedValue::Array(storage.clone(), vec![4, 3])], &[2]).unwrap(),
+            vec![MixedValue::Array(vec![1.0, 4.0, 2.0, 5.0, 3.0, 6.0], vec![3, 1, 2]), MixedValue::Dimension(2)],
         );
         assert_eq!(
-            execute_mixed_program(&client, &program, &[MixedValue::Array(storage, vec![4, 3])], &[0]),
-            Ok(vec![MixedValue::Array(Vec::new(), vec![3, 1, 0]), MixedValue::Dimension(0)]),
+            execute_mixed_program(&client, &program, &[MixedValue::Array(storage, vec![4, 3])], &[0]).unwrap(),
+            vec![MixedValue::Array(Vec::new(), vec![3, 1, 0]), MixedValue::Dimension(0)],
         );
 
         // The permutation may also move a singleton that the reshape then removes.
@@ -842,12 +841,13 @@ mod tests {
         let program = unproject_plain_program(program);
         let storage = (1..=12).map(f64::from).collect::<Vec<_>>();
         assert_eq!(
-            execute_mixed_program(&client, &program, &[MixedValue::Array(storage.clone(), vec![1, 4, 3])], &[2]),
-            Ok(vec![MixedValue::Array(vec![1.0, 4.0, 2.0, 5.0, 3.0, 6.0], vec![3, 2]), MixedValue::Dimension(2)]),
+            execute_mixed_program(&client, &program, &[MixedValue::Array(storage.clone(), vec![1, 4, 3])], &[2])
+                .unwrap(),
+            vec![MixedValue::Array(vec![1.0, 4.0, 2.0, 5.0, 3.0, 6.0], vec![3, 2]), MixedValue::Dimension(2)],
         );
         assert_eq!(
-            execute_mixed_program(&client, &program, &[MixedValue::Array(storage, vec![1, 4, 3])], &[0]),
-            Ok(vec![MixedValue::Array(Vec::new(), vec![3, 0]), MixedValue::Dimension(0)]),
+            execute_mixed_program(&client, &program, &[MixedValue::Array(storage, vec![1, 4, 3])], &[0]).unwrap(),
+            vec![MixedValue::Array(Vec::new(), vec![3, 0]), MixedValue::Dimension(0)],
         );
     }
 
@@ -889,16 +889,17 @@ mod tests {
         let program = unproject_plain_program(program);
         let storage = (1..=16).map(f64::from).collect::<Vec<_>>();
         assert_eq!(
-            execute_mixed_program(&client, &program, &[MixedValue::Array(storage.clone(), vec![4, 4])], &[2, 2]),
-            Ok(vec![
+            execute_mixed_program(&client, &program, &[MixedValue::Array(storage.clone(), vec![4, 4])], &[2, 2])
+                .unwrap(),
+            vec![
                 MixedValue::Array(vec![1.0, 2.0, 5.0, 6.0], vec![2, 1, 2]),
                 MixedValue::Dimension(2),
                 MixedValue::Dimension(2),
-            ]),
+            ],
         );
         assert_eq!(
-            execute_mixed_program(&client, &program, &[MixedValue::Array(storage, vec![4, 4])], &[0, 0]),
-            Ok(vec![MixedValue::Array(Vec::new(), vec![0, 1, 0]), MixedValue::Dimension(0), MixedValue::Dimension(0),]),
+            execute_mixed_program(&client, &program, &[MixedValue::Array(storage, vec![4, 4])], &[0, 0]).unwrap(),
+            vec![MixedValue::Array(Vec::new(), vec![0, 1, 0]), MixedValue::Dimension(0), MixedValue::Dimension(0),],
         );
     }
 
@@ -918,8 +919,9 @@ mod tests {
                 &program,
                 &[MixedValue::Array(values.clone(), vec![6]), MixedValue::Dimension(6)],
                 &[],
-            ),
-            Ok(vec![MixedValue::Array(values.clone(), vec![6]), MixedValue::Dimension(6)]),
+            )
+            .unwrap(),
+            vec![MixedValue::Array(values.clone(), vec![6]), MixedValue::Dimension(6)],
         );
         let error = execute_mixed_program(
             &client,
@@ -970,8 +972,9 @@ mod tests {
                 &pullback,
                 &[MixedValue::Array(tangents.clone(), vec![6]), MixedValue::Dimension(6)],
                 &[6],
-            ),
-            Ok(vec![MixedValue::Array(tangents.clone(), vec![6])]),
+            )
+            .unwrap(),
+            vec![MixedValue::Array(tangents.clone(), vec![6])],
         );
         let error = execute_mixed_program(
             &client,
@@ -1014,8 +1017,9 @@ mod tests {
                     MixedValue::Array(tangents.clone(), vec![3, 6]),
                 ],
                 &[2, 2],
-            ),
-            Ok(vec![
+            )
+            .unwrap(),
+            vec![
                 MixedValue::Dimension(2),
                 MixedValue::Array(values[..12].to_vec(), vec![2, 6]),
                 MixedValue::Array(tangents[..12].to_vec(), vec![2, 6]),
@@ -1023,7 +1027,7 @@ mod tests {
                 MixedValue::Dimension(6),
                 MixedValue::Dimension(2),
                 MixedValue::Dimension(6),
-            ]),
+            ],
         );
         assert_eq!(
             execute_mixed_program(
@@ -1036,8 +1040,9 @@ mod tests {
                     MixedValue::Array(tangents, vec![3, 6]),
                 ],
                 &[0, 0],
-            ),
-            Ok(vec![
+            )
+            .unwrap(),
+            vec![
                 MixedValue::Dimension(0),
                 MixedValue::Array(Vec::new(), vec![0, 6]),
                 MixedValue::Array(Vec::new(), vec![0, 6]),
@@ -1045,7 +1050,7 @@ mod tests {
                 MixedValue::Dimension(6),
                 MixedValue::Dimension(0),
                 MixedValue::Dimension(6),
-            ]),
+            ],
         );
     }
 
@@ -1109,8 +1114,9 @@ mod tests {
         );
         let values = (1..=12).map(f64::from).collect::<Vec<_>>();
         assert_eq!(
-            execute_mixed_program(&execution_client(), &program, &[MixedValue::Array(values.clone(), vec![2, 6])], &[]),
-            Ok(vec![MixedValue::Array(values, vec![2, 2, 3])]),
+            execute_mixed_program(&execution_client(), &program, &[MixedValue::Array(values.clone(), vec![2, 6])], &[])
+                .unwrap(),
+            vec![MixedValue::Array(values, vec![2, 2, 3])],
         );
     }
 
@@ -1176,8 +1182,9 @@ mod tests {
                 &program,
                 &[MixedValue::Array(values.clone(), vec![2, 4]), MixedValue::Dimension(2)],
                 &[2],
-            ),
-            Ok(vec![MixedValue::Array(vec![1.0, 2.0, 5.0, 6.0], vec![2, 2]), MixedValue::Dimension(2)]),
+            )
+            .unwrap(),
+            vec![MixedValue::Array(vec![1.0, 2.0, 5.0, 6.0], vec![2, 2]), MixedValue::Dimension(2)],
         );
         let error = execute_mixed_program(
             &client,
@@ -1207,7 +1214,10 @@ mod tests {
         )
         .unwrap_err();
 
-        assert_eq!(error, LoweringError::Tracing(ProgramError::InvalidInputCount { expected: 1, actual: 0 }),);
+        assert!(matches!(
+            error,
+            Error::Core(ryft_core::Error::Program(ProgramError::InvalidInputCount { expected: 1, actual: 0 })),
+        ));
     }
 
     #[test]

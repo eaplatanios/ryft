@@ -19,6 +19,8 @@ use thiserror::Error;
 use crate::kernels::staging::{XlaKernelExecutionFacts, XlaKernelTarget};
 use crate::kernels::{KernelEmbeddingError, KernelOutputEmbedding};
 
+// TODO(eaplatanios): Promote kernel tuning errors to dedicated `ryft_xla::Error` variants after
+// this support leaves experimental status.
 /// Invalid tuning input, incomplete execution, or incompatible persisted measurements.
 #[derive(Debug, Error)]
 pub enum KernelTuningError {
@@ -59,6 +61,12 @@ pub enum KernelTuningError {
     /// Versioned measurement metadata could not be decoded.
     #[error(transparent)]
     Payload(#[from] serde_json::Error),
+}
+
+impl From<KernelTuningError> for crate::Error {
+    fn from(error: KernelTuningError) -> Self {
+        Self::custom(error)
+    }
 }
 
 /// Explicit limits shared by admission, execution, and persisted-result validation.

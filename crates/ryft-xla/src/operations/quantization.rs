@@ -22,13 +22,13 @@ use crate::experimental::lowering::types::{
     lower_tensor_type, physical_bound_type,
 };
 use crate::experimental::ops::FlatXlaProgram;
-use crate::{LowerableOperation, LowerableOperationFamily, LoweringError, XlaDomain, XlaLowerer};
+use crate::{Error, LowerableOperation, LowerableOperationFamily, XlaDomain, XlaLowerer};
 
 /// Traces the canonical scaled-dot decomposition for one validated operation boundary.
 pub(crate) fn trace_scaled_dot_composition(
     operation: &ScaledDotOperation,
     input_types: &[ArrayType],
-) -> Result<FlatXlaProgram, LoweringError> {
+) -> Result<FlatXlaProgram, Error> {
     let input_types = named_composition_input_types(&scaled_dot_composite_input_types(operation, input_types)?)?;
     let (_, program) = DomainTracingContext::<XlaDomain<'static>>::trace(
         |inputs: Vec<XlaTracer<'static>>| {
@@ -69,7 +69,7 @@ fn scaled_dot_dummy_scale_type(elements: &ArrayType, contracting_dimensions: &[u
 fn scaled_dot_composite_input_types(
     operation: &ScaledDotOperation,
     input_types: &[ArrayType],
-) -> Result<Vec<ArrayType>, LoweringError> {
+) -> Result<Vec<ArrayType>, Error> {
     let expected_input_count = 2 + usize::from(operation.has_lhs_scale()) + usize::from(operation.has_rhs_scale());
     check_count!("input", input_types, expected_input_count, ProgramError);
     let mut scale_index = 2;
@@ -95,7 +95,7 @@ fn scaled_dot_uses_cuda_physical_boundary(
     operation: &ScaledDotOperation,
     input_types: &[ArrayType],
     target_platform: Option<&str>,
-) -> Result<bool, LoweringError> {
+) -> Result<bool, Error> {
     if target_platform != Some("cuda") {
         return Ok(false);
     }
@@ -143,7 +143,7 @@ fn block_scaled_dot_custom_call_permutations(
     operation: &ScaledDotOperation,
     input_types: &[ArrayType],
     target_platform: Option<&str>,
-) -> Result<Option<[Vec<usize>; 2]>, LoweringError> {
+) -> Result<Option<[Vec<usize>; 2]>, Error> {
     let dimensions = operation.dimensions();
     let batching_dimension_count = dimensions.lhs_batching_dimensions().len();
     if !operation.has_lhs_scale()
@@ -207,7 +207,7 @@ pub(crate) fn scaled_dot_composition_types(
     input_types: &[ArrayType],
     output_types: &[ArrayType],
     target_platform: Option<&str>,
-) -> Result<Option<(Vec<ArrayType>, Vec<ArrayType>)>, LoweringError> {
+) -> Result<Option<(Vec<ArrayType>, Vec<ArrayType>)>, Error> {
     if block_scaled_dot_custom_call_permutations(operation, input_types, target_platform)?.is_some() {
         return Ok(None);
     }
@@ -235,7 +235,7 @@ pub(crate) fn lower_scaled_dot_to_mlir<'b, 'c: 'b, 't: 'c>(
     block: &mut BlockRef<'b, 'c, 't>,
     context: &'c MlirContext<'t>,
     location: LocationRef<'c, 't>,
-) -> Result<Vec<ValueRef<'b, 'c, 't>>, LoweringError> {
+) -> Result<Vec<ValueRef<'b, 'c, 't>>, Error> {
     let expected_input_count = 2 + usize::from(operation.has_lhs_scale()) + usize::from(operation.has_rhs_scale());
     check_count!("input", input_values, expected_input_count, ProgramError);
     check_count!("input", input_types, input_values.len(), ProgramError);
@@ -353,7 +353,7 @@ pub(crate) fn lower_scaled_dot_to_mlir<'b, 'c: 'b, 't: 'c>(
         )?]);
     }
 
-    Err(LoweringError::UnsupportedOp { op: format!("missing typed decomposition for `{}`", operation.name()) })
+    Err(Error::UnsupportedOperation { op: format!("missing typed decomposition for `{}`", operation.name()) })
 }
 
 /// Places an optimization barrier on the scaled-dot inputs whose element types are narrow floating-point types. The
@@ -367,7 +367,7 @@ fn lower_scaled_dot_input_barrier<'b, 'c: 'b, 't: 'c>(
     input_types: &[ArrayType],
     block: &mut BlockRef<'b, 'c, 't>,
     location: LocationRef<'c, 't>,
-) -> Result<Vec<ValueRef<'b, 'c, 't>>, LoweringError> {
+) -> Result<Vec<ValueRef<'b, 'c, 't>>, Error> {
     let narrow = input_types
         .iter()
         .map(|r#type| r#type.data_type().is_floating_point() && r#type.data_type().bit_width() <= 8)
@@ -417,7 +417,7 @@ fn lower_block_scaled_dot_custom_call<'b, 'c: 'b, 't: 'c>(
     block: &mut BlockRef<'b, 'c, 't>,
     context: &'c MlirContext<'t>,
     location: LocationRef<'c, 't>,
-) -> Result<Vec<ValueRef<'b, 'c, 't>>, LoweringError> {
+) -> Result<Vec<ValueRef<'b, 'c, 't>>, Error> {
     let mut operands = Vec::with_capacity(input_values.len());
     for (index, (value, r#type)) in input_values.iter().zip(input_types).enumerate() {
         let padding_value = if index < 2 { 0.0 } else { 1.0 };
@@ -487,7 +487,7 @@ pub(crate) fn scaled_dot_composition_key(
     operation: &ScaledDotOperation,
     input_types: &[ArrayType],
     output_types: &[ArrayType],
-) -> Result<NamedCompositionKey, LoweringError> {
+) -> Result<NamedCompositionKey, Error> {
     let dimensions = operation.dimensions();
     Ok(NamedCompositionKey {
         name: "xla.scaled_dot",
@@ -518,7 +518,7 @@ impl LowerableOperation for ScaledDotOperation {
         input_values: &[ValueRef<'b, 'c, 't>],
         input_types: &[ArrayType],
         output_types: &[ArrayType],
-    ) -> Result<Vec<ValueRef<'b, 'c, 't>>, LoweringError> {
+    ) -> Result<Vec<ValueRef<'b, 'c, 't>>, Error> {
         let collective_state = lowerer.collective_state.clone();
         lower_scaled_dot_to_mlir(
             self,
@@ -958,14 +958,12 @@ mod tests {
                 Some("cuda"),
             );
             if block_bound == 3 {
-                assert_eq!(
+                assert!(matches!(
                     module.err().unwrap(),
-                    LoweringError::UnsupportedOp {
-                        op: "reshape with unequal physical capacities (input 128, output 64); dynamic bounds must \
-                             preserve the physical element count"
-                            .to_string(),
-                    },
-                );
+                    Error::UnsupportedOperation { op }
+                        if op == "reshape with unequal physical capacities (input 128, output 64); dynamic bounds must \
+                           preserve the physical element count",
+                ));
                 continue;
             }
             let module = module.unwrap().stable_hlo;
@@ -1072,13 +1070,14 @@ mod tests {
                     &program,
                     &[MixedValue::Array(vec![3.0, 1.5, 0.5, 6.0, 0.0, 0.0, 0.0, 0.0], vec![8])],
                     &[4],
-                ),
-                Ok(vec![
+                )
+                .unwrap(),
+                vec![
                     MixedValue::Array(elements.to_f64s(), vec![4]),
                     MixedValue::Array(scales.to_f64s(), vec![1]),
                     MixedValue::Dimension(4),
                     MixedValue::Dimension(1),
-                ]),
+                ],
             );
         }
     }

@@ -2,7 +2,7 @@ use ryft_core::{ArrayType, ProgramError, ReverseOperation, TypeError};
 use ryft_mlir::dialects::stable_hlo;
 use ryft_mlir::{Block, Operation as MlirOperation, Value as MlirValue, ValueRef};
 
-use crate::{LowerableOperation, LowerableOperationFamily, LoweringError, XlaLowerer};
+use crate::{Error, LowerableOperation, LowerableOperationFamily, XlaLowerer};
 
 impl LowerableOperation for ReverseOperation {
     fn lower<'b, 'c: 'b, 't: 'c, O: LowerableOperationFamily>(
@@ -11,7 +11,7 @@ impl LowerableOperation for ReverseOperation {
         input_values: &[ValueRef<'b, 'c, 't>],
         _input_types: &[ArrayType],
         output_types: &[ArrayType],
-    ) -> Result<Vec<ValueRef<'b, 'c, 't>>, LoweringError> {
+    ) -> Result<Vec<ValueRef<'b, 'c, 't>>, Error> {
         let result = lowerer.block.append_operation(stable_hlo::reverse(
             input_values[0],
             self.axes()
@@ -64,8 +64,9 @@ mod tests {
                 &unproject_plain_program(program),
                 &[MixedValue::Array(vec![1.0, 2.0, 3.0], vec![3])],
                 &[],
-            ),
-            Ok(vec![MixedValue::Array(vec![3.0, 2.0, 1.0], vec![3])]),
+            )
+            .unwrap(),
+            vec![MixedValue::Array(vec![3.0, 2.0, 1.0], vec![3])],
         );
     }
 
@@ -86,12 +87,14 @@ mod tests {
         );
         let client = execution_client();
         assert_eq!(
-            execute_mixed_program(&client, &program, &[MixedValue::Array(vec![1.0, 2.0, 3.0, 4.0], vec![4])], &[2]),
-            Ok(vec![MixedValue::Array(vec![2.0, 1.0], vec![2]), MixedValue::Dimension(2)]),
+            execute_mixed_program(&client, &program, &[MixedValue::Array(vec![1.0, 2.0, 3.0, 4.0], vec![4])], &[2])
+                .unwrap(),
+            vec![MixedValue::Array(vec![2.0, 1.0], vec![2]), MixedValue::Dimension(2)],
         );
         assert_eq!(
-            execute_mixed_program(&client, &program, &[MixedValue::Array(vec![1.0, 2.0, 3.0, 4.0], vec![4])], &[0]),
-            Ok(vec![MixedValue::Array(Vec::new(), vec![0]), MixedValue::Dimension(0)]),
+            execute_mixed_program(&client, &program, &[MixedValue::Array(vec![1.0, 2.0, 3.0, 4.0], vec![4])], &[0])
+                .unwrap(),
+            vec![MixedValue::Array(Vec::new(), vec![0]), MixedValue::Dimension(0)],
         );
     }
 }
