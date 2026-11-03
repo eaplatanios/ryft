@@ -26,7 +26,7 @@ use std::sync::Arc;
 use std::sync::atomic::{AtomicU64, Ordering};
 use std::time::{Duration, Instant, SystemTime, UNIX_EPOCH};
 
-use ryft_core::{CompilationArtifactExchange, CompilationExchangeError};
+use ryft_core::{CompilationArtifactExchange, CompilationArtifactExchangeError};
 use ryft_pjrt::{
     Client, ClientOptions, DistributedKeyValueStore, DistributedRuntimeClientOptions, DistributedRuntimeService,
     DistributedRuntimeServiceOptions, KeyValueStore, Plugin,
@@ -98,15 +98,15 @@ impl DistributedCompilationArtifactExchange {
     ///
     /// The coordination store never overwrites values, and the leader legitimately writes the same record more than
     /// once, for example when it compiles a program again after evicting it from its in-memory cache.
-    fn put_if_absent(&self, key: &[u8], value: &[u8]) -> Result<(), CompilationExchangeError> {
+    fn put_if_absent(&self, key: &[u8], value: &[u8]) -> Result<(), CompilationArtifactExchangeError> {
         match self.runtime.key_value_store.put(key, value) {
             Ok(()) | Err(ryft_pjrt::Error::AlreadyExists { .. }) => Ok(()),
             Err(error) => Err(Self::failed(error.to_string())),
         }
     }
 
-    fn failed(message: impl Into<String>) -> CompilationExchangeError {
-        CompilationExchangeError::Failed { message: message.into() }
+    fn failed(message: impl Into<String>) -> CompilationArtifactExchangeError {
+        CompilationArtifactExchangeError::Failed { message: message.into() }
     }
 }
 
@@ -119,17 +119,17 @@ impl CompilationArtifactExchange for DistributedCompilationArtifactExchange {
         self.process_count
     }
 
-    fn validate_compatibility(&self, key: &[u8], timeout: Duration) -> Result<(), CompilationExchangeError> {
+    fn validate_compatibility(&self, key: &[u8], timeout: Duration) -> Result<(), CompilationArtifactExchangeError> {
         // Address compatibility validation by the compilation key because each process validates only compilations
         // that miss its own in-memory cache. The leader announces every key that it is about to compile without
         // waiting for anyone, and each follower waits for the announcement of its own key.
         if self.process_count == 0 || self.process_index >= self.process_count {
-            return Err(CompilationExchangeError::Incompatible {
+            return Err(CompilationArtifactExchangeError::Incompatible {
                 message: "exchange process coordinates are invalid".to_string(),
             });
         }
         if key.len() > self.maximum_compatibility_key_size {
-            return Err(CompilationExchangeError::Incompatible {
+            return Err(CompilationArtifactExchangeError::Incompatible {
                 message: format!(
                     "persistent compilation key size {} exceeds configured compatibility validation maximum {}",
                     key.len(),
@@ -152,11 +152,11 @@ impl CompilationArtifactExchange for DistributedCompilationArtifactExchange {
         }
 
         let start = Instant::now();
-        let get = |suffix: &[u8]| -> Result<Vec<u8>, CompilationExchangeError> {
-            let remaining = timeout.checked_sub(start.elapsed()).ok_or(CompilationExchangeError::TimedOut)?;
+        let get = |suffix: &[u8]| -> Result<Vec<u8>, CompilationArtifactExchangeError> {
+            let remaining = timeout.checked_sub(start.elapsed()).ok_or(CompilationArtifactExchangeError::TimedOut)?;
             self.runtime.key_value_store.get(&self.key(key, suffix), remaining).map_err(|error| match error {
                 ryft_pjrt::Error::NotFound { .. } | ryft_pjrt::Error::DeadlineExceeded { .. } => {
-                    CompilationExchangeError::TimedOut
+                    CompilationArtifactExchangeError::TimedOut
                 }
                 error => Self::failed(error.to_string()),
             })
@@ -165,7 +165,7 @@ impl CompilationArtifactExchange for DistributedCompilationArtifactExchange {
         let manifest: CompilationCompatibilityManifest = serde_json::from_slice(manifest.as_slice())
             .map_err(|error| Self::failed(format!("failed to decode compilation compatibility manifest: {error}")))?;
         if manifest.schema_version != ARTIFACT_EXCHANGE_SCHEMA_VERSION {
-            return Err(CompilationExchangeError::Incompatible {
+            return Err(CompilationArtifactExchangeError::Incompatible {
                 message: format!(
                     "process 0 uses compilation artifact exchange schema {}, but this process uses schema {}",
                     manifest.schema_version, ARTIFACT_EXCHANGE_SCHEMA_VERSION,
@@ -173,7 +173,7 @@ impl CompilationArtifactExchange for DistributedCompilationArtifactExchange {
             });
         }
         if manifest.process_count != self.process_count as u64 {
-            return Err(CompilationExchangeError::Incompatible {
+            return Err(CompilationArtifactExchangeError::Incompatible {
                 message: format!(
                     "process 0 expects {} processes, but this process expects {}",
                     manifest.process_count, self.process_count,
@@ -181,14 +181,14 @@ impl CompilationArtifactExchange for DistributedCompilationArtifactExchange {
             });
         }
         if get(b"preflight/key")?.as_slice() != key {
-            return Err(CompilationExchangeError::Incompatible {
+            return Err(CompilationArtifactExchangeError::Incompatible {
                 message: "process 0 announced a different persistent compilation key with the same digest".to_string(),
             });
         }
         Ok(())
     }
 
-    fn publish(&self, key: &[u8], artifact: &[u8]) -> Result<(), CompilationExchangeError> {
+    fn publish(&self, key: &[u8], artifact: &[u8]) -> Result<(), CompilationArtifactExchangeError> {
         if artifact.len() > self.maximum_artifact_size {
             return Err(Self::failed(format!(
                 "compiled artifact size {} exceeds configured maximum {}",
@@ -232,7 +232,7 @@ impl CompilationArtifactExchange for DistributedCompilationArtifactExchange {
             .map_err(|error| Self::failed(error.to_string()))
     }
 
-    fn publish_failure(&self, key: &[u8], message: &str) -> Result<(), CompilationExchangeError> {
+    fn publish_failure(&self, key: &[u8], message: &str) -> Result<(), CompilationArtifactExchangeError> {
         let manifest = CompilationArtifactManifest {
             schema_version: ARTIFACT_EXCHANGE_SCHEMA_VERSION,
             size: 0,
@@ -246,7 +246,7 @@ impl CompilationArtifactExchange for DistributedCompilationArtifactExchange {
         self.put_if_absent(&self.key(key, b"manifest"), manifest.as_slice())
     }
 
-    fn receive(&self, key: &[u8], timeout: Duration) -> Result<Option<Vec<u8>>, CompilationExchangeError> {
+    fn receive(&self, key: &[u8], timeout: Duration) -> Result<Option<Vec<u8>>, CompilationArtifactExchangeError> {
         let start = Instant::now();
         let manifest = match self.runtime.key_value_store.get(&self.key(key, b"manifest"), timeout) {
             Ok(manifest) => manifest,
@@ -273,12 +273,12 @@ impl CompilationArtifactExchange for DistributedCompilationArtifactExchange {
         }
         let mut artifact = Vec::with_capacity(size);
         for index in 0..chunk_count {
-            let remaining = timeout.checked_sub(start.elapsed()).ok_or(CompilationExchangeError::TimedOut)?;
+            let remaining = timeout.checked_sub(start.elapsed()).ok_or(CompilationArtifactExchangeError::TimedOut)?;
             let chunk =
                 self.runtime.key_value_store.get(&self.chunk_key(key, index), remaining).map_err(
                     |error| match error {
                         ryft_pjrt::Error::NotFound { .. } | ryft_pjrt::Error::DeadlineExceeded { .. } => {
-                            CompilationExchangeError::TimedOut
+                            CompilationArtifactExchangeError::TimedOut
                         }
                         error => Self::failed(error.to_string()),
                     },
@@ -476,7 +476,7 @@ mod tests {
     use std::thread;
     use std::time::{Duration, Instant};
 
-    use ryft_core::{CompilationArtifactExchange, CompilationExchangeError};
+    use ryft_core::{CompilationArtifactExchange, CompilationArtifactExchangeError};
     use ryft_pjrt::{
         ClientOptions, CpuClientOptions, DistributedRuntimeClientOptions, DistributedRuntimeServiceOptions,
         KeyValueStore, load_cpu_plugin,
@@ -558,7 +558,7 @@ mod tests {
         exchange.publish_failure(b"failed-program", "backend compilation failed").unwrap();
         assert!(matches!(
             exchange.receive(b"failed-program", Duration::from_secs(1)),
-            Err(CompilationExchangeError::Failed { message })
+            Err(CompilationArtifactExchangeError::Failed { message })
                 if message.contains("backend compilation failed"),
         ));
         assert!(exchange.publish(b"too-large", &[0; 17]).is_err());
@@ -609,7 +609,7 @@ mod tests {
         assert_eq!(leader.validate_compatibility(b"first-key", Duration::from_secs(1)), Ok(()));
         assert_eq!(
             follower.validate_compatibility(b"second-key", Duration::from_millis(20)),
-            Err(CompilationExchangeError::TimedOut),
+            Err(CompilationArtifactExchangeError::TimedOut),
         );
     }
 
@@ -643,13 +643,13 @@ mod tests {
         leader.publish_failure(b"second-key", "backend compilation failed again").unwrap();
         assert_eq!(
             leader.publish(b"second-key", b"second-executable"),
-            Err(CompilationExchangeError::Failed {
+            Err(CompilationArtifactExchangeError::Failed {
                 message: "a terminal failure was already published for this compilation key".to_string(),
             }),
         );
         assert_eq!(
             follower.receive(b"second-key", Duration::from_secs(1)),
-            Err(CompilationExchangeError::Failed {
+            Err(CompilationArtifactExchangeError::Failed {
                 message: "compilation producer failed: backend compilation failed".to_string(),
             }),
         );
@@ -668,7 +668,7 @@ mod tests {
         assert_eq!(leader.validate_compatibility(b"key", Duration::from_secs(1)), Ok(()));
         assert_eq!(
             follower.validate_compatibility(b"key", Duration::from_secs(1)),
-            Err(CompilationExchangeError::Incompatible {
+            Err(CompilationArtifactExchangeError::Incompatible {
                 message: "process 0 expects 2 processes, but this process expects 3".to_string(),
             }),
         );

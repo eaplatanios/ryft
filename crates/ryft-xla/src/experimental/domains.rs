@@ -13804,8 +13804,8 @@ mod tests {
     #[test]
     fn test_xla_compile_rejects_an_exchanged_executable_with_a_foreign_invocation_contract() {
         use ryft_core::{
-            CompilationArtifactExchange, CompilationArtifactExchangePolicy, CompilationCacheDomain,
-            CompilationExchangeError, Sin,
+            CompilationArtifactExchange, CompilationArtifactExchangeError, CompilationArtifactExchangePolicy,
+            CompilationCacheDomain, Sin,
         };
 
         // Follower-side exchange that answers every key with one fixed artifact. This is the reachable stand-in for
@@ -13826,11 +13826,15 @@ mod tests {
                 2
             }
 
-            fn publish(&self, _key: &[u8], _artifact: &[u8]) -> Result<(), CompilationExchangeError> {
+            fn publish(&self, _key: &[u8], _artifact: &[u8]) -> Result<(), CompilationArtifactExchangeError> {
                 Ok(())
             }
 
-            fn receive(&self, _key: &[u8], _timeout: Duration) -> Result<Option<Vec<u8>>, CompilationExchangeError> {
+            fn receive(
+                &self,
+                _key: &[u8],
+                _timeout: Duration,
+            ) -> Result<Option<Vec<u8>>, CompilationArtifactExchangeError> {
                 Ok(Some(self.artifact.clone()))
             }
         }
