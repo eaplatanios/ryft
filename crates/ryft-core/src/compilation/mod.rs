@@ -178,7 +178,7 @@ pub use domains::{
     AnalyzableCompilationDomain, CompilationCacheDomain, CompilationDomain, Compile, StatefulCompilationDomain, jit,
     jit_with_options, jit_with_options_and_capacity, stage,
 };
-pub use exchange::{CompilationArtifactExchange, CompilationArtifactExchangePolicy, CompilationExchangeError};
+pub use exchange::{CompilationArtifactExchange, CompilationArtifactExchangeError, CompilationArtifactExchangePolicy};
 pub use functions::{
     CompilationTracer, CompiledFunction, CompiledFunctionDispatcher, DispatcherStatistics, ExecutableFunction,
     LoweredFunction, StagedFunction, StagedProgram, StatefulExecution,

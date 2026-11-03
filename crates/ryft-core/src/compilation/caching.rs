@@ -18,7 +18,7 @@ use thiserror::Error;
 
 use crate::compilation::domains::CompilationCacheDomain;
 use crate::compilation::exchange::{
-    CompilationArtifactExchange, CompilationArtifactExchangePolicy, CompilationExchangeError,
+    CompilationArtifactExchange, CompilationArtifactExchangeError, CompilationArtifactExchangePolicy,
 };
 use crate::compilation::functions::accumulate_duration;
 use crate::programs::ProgramError;
@@ -992,11 +992,13 @@ impl<'o, C: CompilationCacheDomain> CompilationContext<'o, C> {
         };
         let message = error.to_string();
         let (counter, reason) = match &error {
-            CompilationExchangeError::TimedOut => (&self.statistics.exchange_timeouts, CompilationStepError::TimedOut),
-            CompilationExchangeError::Incompatible { .. } => {
+            CompilationArtifactExchangeError::TimedOut => {
+                (&self.statistics.exchange_timeouts, CompilationStepError::TimedOut)
+            }
+            CompilationArtifactExchangeError::Incompatible { .. } => {
                 (&self.statistics.exchange_errors, CompilationStepError::Incompatible { message: message.clone() })
             }
-            CompilationExchangeError::Failed { .. } => {
+            CompilationArtifactExchangeError::Failed { .. } => {
                 (&self.statistics.exchange_errors, CompilationStepError::ExchangeFailed { message: message.clone() })
             }
         };
@@ -1070,7 +1072,7 @@ impl<'o, C: CompilationCacheDomain> CompilationContext<'o, C> {
         let exchange_start = Instant::now();
         let bytes = match exchange.exchange.receive(exchange.key, exchange.timeout) {
             Ok(Some(bytes)) => bytes,
-            Ok(None) | Err(CompilationExchangeError::TimedOut) => {
+            Ok(None) | Err(CompilationArtifactExchangeError::TimedOut) => {
                 self.record_exchange_fallback(
                     &self.statistics.exchange_timeouts,
                     CompilationStep::ExchangeReceive {
@@ -1081,7 +1083,7 @@ impl<'o, C: CompilationCacheDomain> CompilationContext<'o, C> {
                 )?;
                 return Ok(None);
             }
-            Err(ref error @ CompilationExchangeError::Incompatible { ref message }) => {
+            Err(ref error @ CompilationArtifactExchangeError::Incompatible { ref message }) => {
                 self.record_exchange_fallback(
                     &self.statistics.exchange_errors,
                     CompilationStep::ExchangeReceive {
@@ -1094,7 +1096,7 @@ impl<'o, C: CompilationCacheDomain> CompilationContext<'o, C> {
                 )?;
                 return Ok(None);
             }
-            Err(ref error @ CompilationExchangeError::Failed { ref message }) => {
+            Err(ref error @ CompilationArtifactExchangeError::Failed { ref message }) => {
                 self.record_exchange_fallback(
                     &self.statistics.exchange_errors,
                     CompilationStep::ExchangeReceive {
@@ -2006,11 +2008,19 @@ mod tests {
         }
     }
 
+    /// Compilation domain whose flags select the persistence and codec behavior that each test exercises.
     #[derive(Clone, Default)]
     struct TestDomain {
+        /// Provides persistent keys and serialized programs, which the disk cache and artifact exchange require.
         persistent: bool,
+
+        /// Makes serialization fail.
         serialization_fails: bool,
+
+        /// Makes serialization report that the domain does not support it.
         serialization_unsupported: bool,
+
+        /// Makes deserialization reject every artifact as incompatible.
         deserialization_incompatible: bool,
 
         /// Synthetic key used by fixtures that exercise particular cache entries.
@@ -2138,25 +2148,30 @@ mod tests {
         context.compile(&domain, &TestLoweredProgram(Vec::new()))
     }
 
+    /// State shared by the [`TestExchange`] handles of all simulated processes, with flags that inject exchange
+    /// failures.
     #[derive(Default)]
     struct TestExchangeState {
         artifacts: Mutex<HashMap<Vec<u8>, Result<Vec<u8>, String>>>,
         ready: Condvar,
-        compatibility_error: Mutex<Option<CompilationExchangeError>>,
+        compatibility_error: Mutex<Option<CompilationArtifactExchangeError>>,
         receive_fails: AtomicBool,
         receive_incompatible: AtomicBool,
         publish_fails: AtomicBool,
         failure_publish_fails: AtomicBool,
     }
 
+    /// Artifact exchange handle of one simulated process.
     struct TestExchange {
         process_index: usize,
+        process_count: usize,
         state: Arc<TestExchangeState>,
     }
 
     impl TestExchange {
+        /// Creates the handle of process `process_index` in a simulated exchange between two processes.
         fn new(process_index: usize, state: Arc<TestExchangeState>) -> Self {
-            Self { process_index, state }
+            Self { process_index, process_count: 2, state }
         }
     }
 
@@ -2166,28 +2181,34 @@ mod tests {
         }
 
         fn process_count(&self) -> usize {
-            2
+            self.process_count
         }
 
-        fn validate_compatibility(&self, _key: &[u8], _timeout: Duration) -> Result<(), CompilationExchangeError> {
+        fn validate_compatibility(
+            &self,
+            _key: &[u8],
+            _timeout: Duration,
+        ) -> Result<(), CompilationArtifactExchangeError> {
             match self.state.compatibility_error.lock().unwrap().as_ref() {
                 Some(error) => Err(error.clone()),
                 None => Ok(()),
             }
         }
 
-        fn publish(&self, key: &[u8], artifact: &[u8]) -> Result<(), CompilationExchangeError> {
+        fn publish(&self, key: &[u8], artifact: &[u8]) -> Result<(), CompilationArtifactExchangeError> {
             if self.state.publish_fails.load(Ordering::Relaxed) {
-                return Err(CompilationExchangeError::Failed { message: "expected publish failure".to_string() });
+                return Err(CompilationArtifactExchangeError::Failed {
+                    message: "expected publish failure".to_string(),
+                });
             }
             self.state.artifacts.lock().unwrap().insert(key.to_vec(), Ok(artifact.to_vec()));
             self.state.ready.notify_all();
             Ok(())
         }
 
-        fn publish_failure(&self, key: &[u8], message: &str) -> Result<(), CompilationExchangeError> {
+        fn publish_failure(&self, key: &[u8], message: &str) -> Result<(), CompilationArtifactExchangeError> {
             if self.state.failure_publish_fails.load(Ordering::Relaxed) {
-                return Err(CompilationExchangeError::Failed {
+                return Err(CompilationArtifactExchangeError::Failed {
                     message: "expected failure notification publication failure".to_string(),
                 });
             }
@@ -2196,12 +2217,14 @@ mod tests {
             Ok(())
         }
 
-        fn receive(&self, key: &[u8], timeout: Duration) -> Result<Option<Vec<u8>>, CompilationExchangeError> {
+        fn receive(&self, key: &[u8], timeout: Duration) -> Result<Option<Vec<u8>>, CompilationArtifactExchangeError> {
             if self.state.receive_fails.load(Ordering::Relaxed) {
-                return Err(CompilationExchangeError::Failed { message: "expected receive failure".to_string() });
+                return Err(CompilationArtifactExchangeError::Failed {
+                    message: "expected receive failure".to_string(),
+                });
             }
             if self.state.receive_incompatible.load(Ordering::Relaxed) {
-                return Err(CompilationExchangeError::Incompatible {
+                return Err(CompilationArtifactExchangeError::Incompatible {
                     message: "expected receive incompatibility".to_string(),
                 });
             }
@@ -2214,37 +2237,8 @@ mod tests {
             match artifacts.get(key).cloned() {
                 None => Ok(None),
                 Some(Ok(artifact)) => Ok(Some(artifact)),
-                Some(Err(message)) => Err(CompilationExchangeError::Failed { message }),
+                Some(Err(message)) => Err(CompilationArtifactExchangeError::Failed { message }),
             }
-        }
-    }
-
-    /// Exchange that borrows another exchange, which contexts accept for as long as the borrowed exchange lives.
-    struct BorrowedExchange<'o>(&'o TestExchange);
-
-    impl CompilationArtifactExchange for BorrowedExchange<'_> {
-        fn process_index(&self) -> usize {
-            self.0.process_index()
-        }
-
-        fn process_count(&self) -> usize {
-            self.0.process_count()
-        }
-
-        fn validate_compatibility(&self, key: &[u8], timeout: Duration) -> Result<(), CompilationExchangeError> {
-            self.0.validate_compatibility(key, timeout)
-        }
-
-        fn publish(&self, key: &[u8], artifact: &[u8]) -> Result<(), CompilationExchangeError> {
-            self.0.publish(key, artifact)
-        }
-
-        fn publish_failure(&self, key: &[u8], message: &str) -> Result<(), CompilationExchangeError> {
-            self.0.publish_failure(key, message)
-        }
-
-        fn receive(&self, key: &[u8], timeout: Duration) -> Result<Option<Vec<u8>>, CompilationExchangeError> {
-            self.0.receive(key, timeout)
         }
     }
 
@@ -2273,7 +2267,7 @@ mod tests {
     }
 
     #[test]
-    fn test_compilation_event_error_display() {
+    fn test_compilation_step_error_display() {
         for (error, message) in [
             (CompilationStepError::Unsupported, "required compilation artifact operation is unsupported"),
             (
@@ -2291,12 +2285,12 @@ mod tests {
                 "compilation artifact exchange coordination failed: leader disconnected",
             ),
             (
-                CompilationStepError::DeserializationFailed { message: "invalid executable header".to_string() },
-                "failed to deserialize a compiled program: invalid executable header",
-            ),
-            (
                 CompilationStepError::SerializationFailed { message: "executable serialization failed".to_string() },
                 "failed to serialize a compiled program: executable serialization failed",
+            ),
+            (
+                CompilationStepError::DeserializationFailed { message: "invalid executable header".to_string() },
+                "failed to deserialize a compiled program: invalid executable header",
             ),
             (
                 CompilationStepError::WriteFailed { message: "disk quota exceeded".to_string() },
@@ -2311,6 +2305,21 @@ mod tests {
             assert_eq!(diagnostic.to_string(), message);
             assert!(diagnostic.source().is_none());
         }
+    }
+
+    #[test]
+    fn test_compilation_context_new() {
+        let context = CompilationContext::<TestDomain>::new();
+        assert!(context.disk_cache().is_none());
+        assert!(context.artifact_exchange().is_none());
+        assert_eq!(context.artifact_exchange_policy(), CompilationArtifactExchangePolicy::Disabled);
+        assert_eq!(context.program_count(), 0);
+        assert_eq!(context.statistics(), CompilationCacheStatistics::default());
+
+        // Event retention is disabled by default.
+        compile_with(&context, &TestDomain::default(), 1, move || Ok(TestCompiledProgram(1))).unwrap();
+        assert_eq!(context.program_count(), 1);
+        assert_eq!(context.recent_events(), Vec::new());
     }
 
     #[test]
@@ -2336,6 +2345,7 @@ mod tests {
         // A zero capacity is clamped to one entry.
         let context = CompilationContext::<TestDomain>::with_capacity(0);
         compile_with(&context, &domain, 1, move || Ok(TestCompiledProgram(1))).unwrap();
+        compile_with(&context, &domain, 2, move || Ok(TestCompiledProgram(2))).unwrap();
         assert_eq!(context.program_count(), 1);
     }
 
@@ -2394,6 +2404,7 @@ mod tests {
 
     #[test]
     fn test_compilation_context_with_disk_cache_lookup_failures() {
+        // A payload that fails to deserialize is a failed lookup, which counts as a persistent error.
         let directory = tempfile::tempdir().unwrap();
         let cache = DiskCache::open(directory.path()).unwrap().with_write_thresholds(Duration::MAX, 0);
         cache.put(&DiskCacheDigest::from_key(&[1]), b"invalid payload").unwrap();
@@ -2483,23 +2494,55 @@ mod tests {
     #[test]
     fn test_compilation_context_with_disk_cache_unsupported_domain() {
         let directory = tempfile::tempdir().unwrap();
-        let context =
-            CompilationContext::<TestDomain>::new().with_disk_cache(DiskCache::open(directory.path()).unwrap());
+        let disk_cache = DiskCache::open(directory.path()).unwrap().with_write_thresholds(Duration::ZERO, 0);
+        let context = CompilationContext::<TestDomain>::new().with_event_capacity(8).with_disk_cache(disk_cache);
         compile_with(&context, &TestDomain::default(), 1, move || Ok(TestCompiledProgram(1))).unwrap();
 
-        assert_eq!(std::fs::read_dir(directory.path()).unwrap().count(), 0);
+        // A domain without persistent keys skips both the persistent lookup and the store, even though the write
+        // thresholds admit every compilation.
+        assert_eq!(fs::read_dir(directory.path()).unwrap().count(), 0);
         assert_eq!(context.statistics().persistent_errors, 0);
+        assert_eq!(
+            event_steps(&context),
+            vec![
+                CompilationStep::CacheLookup {
+                    tier: CompilationCacheTier::Memory,
+                    outcome: CompilationLookupOutcome::Miss(CompilationMissReason::NotFound),
+                },
+                CompilationStep::BackendCompilation { outcome: CompilationStepOutcome::Succeeded },
+            ],
+        );
     }
 
     #[test]
     fn test_compilation_context_with_disk_cache_default_write_thresholds() {
         let directory = tempfile::tempdir().unwrap();
-        let context =
-            CompilationContext::<TestDomain>::new().with_disk_cache(DiskCache::open(directory.path()).unwrap());
-        compile_with(&context, &TestDomain::persistent(), 1, move || Ok(TestCompiledProgram(1))).unwrap();
+        let disk_cache = DiskCache::open(directory.path()).unwrap();
+        let context = CompilationContext::<TestDomain>::new().with_event_capacity(8).with_disk_cache(disk_cache);
+        let domain = TestDomain { persistent: true, serialization_fails: true, ..TestDomain::default() };
+        compile_with(&context, &domain, 1, move || Ok(TestCompiledProgram(1))).unwrap();
 
-        // A fast compilation is below the default minimum compilation duration, so it is never serialized.
-        assert_eq!(std::fs::read_dir(directory.path()).unwrap().count(), 0);
+        // A fast compilation is below the default minimum compilation duration, so it is never serialized, which the
+        // failing serializer of this domain would otherwise record as a persistent error.
+        assert_eq!(fs::read_dir(directory.path()).unwrap().count(), 0);
+        assert_eq!(context.statistics().persistent_errors, 0);
+        assert_eq!(
+            event_steps(&context),
+            vec![
+                CompilationStep::CacheLookup {
+                    tier: CompilationCacheTier::Memory,
+                    outcome: CompilationLookupOutcome::Miss(CompilationMissReason::NotFound),
+                },
+                CompilationStep::CacheLookup {
+                    tier: CompilationCacheTier::Persistent,
+                    outcome: CompilationLookupOutcome::Miss(CompilationMissReason::NotFound),
+                },
+                CompilationStep::BackendCompilation { outcome: CompilationStepOutcome::Succeeded },
+                CompilationStep::PersistentStore {
+                    outcome: CompilationStepOutcome::Skipped(CompilationSkipReason::BelowWriteThreshold),
+                },
+            ],
+        );
     }
 
     #[test]
@@ -2509,7 +2552,7 @@ mod tests {
         let disk_cache = DiskCache::open(directory.path()).unwrap().with_write_thresholds(Duration::ZERO, usize::MAX);
         let context = CompilationContext::<TestDomain>::new().with_event_capacity(8).with_disk_cache(disk_cache);
         compile_with(&context, &TestDomain::persistent(), 1, move || Ok(TestCompiledProgram(1))).unwrap();
-        assert_eq!(std::fs::read_dir(directory.path()).unwrap().count(), 0);
+        assert_eq!(fs::read_dir(directory.path()).unwrap().count(), 0);
         assert_eq!(context.statistics().persistent_errors, 0);
         assert_eq!(
             event_steps(&context),
@@ -2541,16 +2584,26 @@ mod tests {
         // failures.
         let program = compile_with(&context, &domain, 1, move || Ok(TestCompiledProgram(3))).unwrap();
         assert_eq!(program.0, 3);
-        assert_eq!(std::fs::read_dir(directory.path()).unwrap().count(), 0);
+        assert_eq!(fs::read_dir(directory.path()).unwrap().count(), 0);
         assert_eq!(context.statistics().persistent_errors, 1);
-        let last_event = context.recent_events().pop().unwrap();
         assert_eq!(
-            last_event.step,
-            CompilationStep::PersistentStore {
-                outcome: CompilationStepOutcome::Failed(CompilationStepError::SerializationFailed {
-                    message: "encountered malformed program: expected serialization failure".to_string()
-                }),
-            },
+            event_steps(&context),
+            vec![
+                CompilationStep::CacheLookup {
+                    tier: CompilationCacheTier::Memory,
+                    outcome: CompilationLookupOutcome::Miss(CompilationMissReason::NotFound),
+                },
+                CompilationStep::CacheLookup {
+                    tier: CompilationCacheTier::Persistent,
+                    outcome: CompilationLookupOutcome::Miss(CompilationMissReason::NotFound),
+                },
+                CompilationStep::BackendCompilation { outcome: CompilationStepOutcome::Succeeded },
+                CompilationStep::PersistentStore {
+                    outcome: CompilationStepOutcome::Failed(CompilationStepError::SerializationFailed {
+                        message: "encountered malformed program: expected serialization failure".to_string()
+                    }),
+                },
+            ],
         );
     }
 
@@ -2562,12 +2615,9 @@ mod tests {
         let context = CompilationContext::<TestDomain>::new().with_disk_cache(cache).with_event_capacity(8);
 
         // Create the obstruction after the lookup, so only the store fails and compilation still succeeds.
-        let program = compile_with(&context, &TestDomain::persistent(), 1, {
-            let entry_path = entry_path.clone();
-            move || {
-                fs::create_dir(&entry_path).unwrap();
-                Ok(TestCompiledProgram(3))
-            }
+        let program = compile_with(&context, &TestDomain::persistent(), 1, move || {
+            fs::create_dir(&entry_path).unwrap();
+            Ok(TestCompiledProgram(3))
         })
         .unwrap();
         assert_eq!(program.0, 3);
@@ -2665,7 +2715,44 @@ mod tests {
     }
 
     #[test]
-    fn test_compilation_context_with_borrowed_artifact_exchange() {
+    fn test_compilation_context_with_artifact_exchange_borrowed_exchanges() {
+        /// Exchange that borrows another exchange, which contexts accept for as long as the borrowed exchange lives.
+        struct BorrowedExchange<'o>(&'o TestExchange);
+
+        impl CompilationArtifactExchange for BorrowedExchange<'_> {
+            fn process_index(&self) -> usize {
+                self.0.process_index()
+            }
+
+            fn process_count(&self) -> usize {
+                self.0.process_count()
+            }
+
+            fn validate_compatibility(
+                &self,
+                key: &[u8],
+                timeout: Duration,
+            ) -> Result<(), CompilationArtifactExchangeError> {
+                self.0.validate_compatibility(key, timeout)
+            }
+
+            fn publish(&self, key: &[u8], artifact: &[u8]) -> Result<(), CompilationArtifactExchangeError> {
+                self.0.publish(key, artifact)
+            }
+
+            fn publish_failure(&self, key: &[u8], message: &str) -> Result<(), CompilationArtifactExchangeError> {
+                self.0.publish_failure(key, message)
+            }
+
+            fn receive(
+                &self,
+                key: &[u8],
+                timeout: Duration,
+            ) -> Result<Option<Vec<u8>>, CompilationArtifactExchangeError> {
+                self.0.receive(key, timeout)
+            }
+        }
+
         let state = Arc::new(TestExchangeState::default());
         let leader_exchange = TestExchange::new(0, Arc::clone(&state));
         let follower_exchange = TestExchange::new(1, state);
@@ -2697,22 +2784,63 @@ mod tests {
     }
 
     #[test]
+    fn test_compilation_context_with_artifact_exchange_inactive() {
+        // A disabled policy never consults the exchange, so a follower compiles without waiting for its leader.
+        let state = Arc::new(TestExchangeState::default());
+        let context = CompilationContext::<TestDomain>::new().with_event_capacity(8).with_artifact_exchange(
+            Arc::new(TestExchange::new(1, Arc::clone(&state))),
+            CompilationArtifactExchangePolicy::Disabled,
+        );
+        assert_eq!(
+            compile_with(&context, &TestDomain::persistent(), 1, move || Ok(TestCompiledProgram(3))).unwrap().0,
+            3,
+        );
+        assert_eq!(
+            event_steps(&context),
+            vec![
+                CompilationStep::CacheLookup {
+                    tier: CompilationCacheTier::Memory,
+                    outcome: CompilationLookupOutcome::Miss(CompilationMissReason::NotFound),
+                },
+                CompilationStep::BackendCompilation { outcome: CompilationStepOutcome::Succeeded },
+            ],
+        );
+
+        // An exchange with a single process has no peers, so even a policy that requires sharing ignores it.
+        let context = CompilationContext::<TestDomain>::new().with_event_capacity(8).with_artifact_exchange(
+            Arc::new(TestExchange { process_index: 0, process_count: 1, state: Arc::clone(&state) }),
+            CompilationArtifactExchangePolicy::RequireSharing { timeout: Duration::from_secs(1) },
+        );
+        assert_eq!(
+            compile_with(&context, &TestDomain::persistent(), 1, move || Ok(TestCompiledProgram(3))).unwrap().0,
+            3,
+        );
+        assert_eq!(
+            event_steps(&context),
+            vec![
+                CompilationStep::CacheLookup {
+                    tier: CompilationCacheTier::Memory,
+                    outcome: CompilationLookupOutcome::Miss(CompilationMissReason::NotFound),
+                },
+                CompilationStep::BackendCompilation { outcome: CompilationStepOutcome::Succeeded },
+            ],
+        );
+        assert!(state.artifacts.lock().unwrap().is_empty());
+    }
+
+    #[test]
     fn test_compilation_context_with_artifact_exchange_publishes_leader_persistent_hit() {
         let directory = tempfile::tempdir().unwrap();
         let domain = TestDomain::persistent();
         let seed_cache = DiskCache::open(directory.path()).unwrap().with_write_thresholds(Duration::ZERO, 0);
-        compile_with(
-            &CompilationContext::<TestDomain>::new().with_event_capacity(16).with_disk_cache(seed_cache),
-            &domain,
-            8,
-            move || Ok(TestCompiledProgram(53)),
-        )
+        compile_with(&CompilationContext::<TestDomain>::new().with_disk_cache(seed_cache), &domain, 8, move || {
+            Ok(TestCompiledProgram(53))
+        })
         .unwrap();
 
         let state = Arc::new(TestExchangeState::default());
         let policy = CompilationArtifactExchangePolicy::RequireSharing { timeout: Duration::from_secs(5) };
         let follower_context = CompilationContext::<TestDomain>::new()
-            .with_event_capacity(16)
             .with_artifact_exchange(Arc::new(TestExchange::new(1, Arc::clone(&state))), policy);
         let follower = thread::spawn(move || {
             compile_with(
@@ -2771,7 +2899,7 @@ mod tests {
         assert_eq!(
             compile_with(&leader_context, &TestDomain::persistent(), 9, {
                 let producer_error = producer_error.clone();
-                move || Err(producer_error.clone())
+                move || Err(producer_error)
             })
             .err(),
             Some(producer_error.clone()),
@@ -2847,7 +2975,7 @@ mod tests {
         assert_eq!(
             compile_with(&context, &TestDomain::persistent(), 1, {
                 let producer_error = producer_error.clone();
-                move || Err(producer_error.clone())
+                move || Err(producer_error)
             })
             .err(),
             Some(producer_error),
@@ -2882,7 +3010,7 @@ mod tests {
     }
 
     #[test]
-    fn test_compilation_context_with_artifact_exchange_publishes_leader_serialization_failure() {
+    fn test_compilation_context_with_artifact_exchange_serialization_failure_fallback() {
         let state = Arc::new(TestExchangeState::default());
         let leader_context = CompilationContext::<TestDomain>::new().with_event_capacity(16).with_artifact_exchange(
             Arc::new(TestExchange::new(0, Arc::clone(&state))),
@@ -3130,6 +3258,7 @@ mod tests {
 
     #[test]
     fn test_compilation_context_with_artifact_exchange_deserialization_failure() {
+        // A policy that requires sharing returns the deserialization error of the domain instead of compiling.
         let state = Arc::new(TestExchangeState::default());
         state.artifacts.lock().unwrap().insert(vec![1], Ok(vec![0]));
         let context = CompilationContext::<TestDomain>::new().with_event_capacity(8).with_artifact_exchange(
@@ -3167,6 +3296,24 @@ mod tests {
                 },
             ],
         );
+
+        // A policy that permits a fallback compiles locally instead.
+        let state = Arc::new(TestExchangeState::default());
+        state.artifacts.lock().unwrap().insert(vec![1], Ok(vec![0]));
+        let context = CompilationContext::<TestDomain>::new().with_artifact_exchange(
+            Arc::new(TestExchange::new(1, state)),
+            CompilationArtifactExchangePolicy::PreferSharing {
+                timeout: Duration::from_secs(1),
+                fallback_to_local_compile: true,
+            },
+        );
+        assert_eq!(
+            compile_with(&context, &TestDomain::persistent(), 1, move || Ok(TestCompiledProgram(3))).unwrap().0,
+            3,
+        );
+        assert_eq!(context.statistics().exchange_errors, 1);
+        assert_eq!(context.statistics().exchange_fallbacks, 1);
+        assert_eq!(context.statistics().compilations, 1);
     }
 
     #[test]
@@ -3210,21 +3357,22 @@ mod tests {
     #[test]
     fn test_compilation_context_with_artifact_exchange_rejects_compatibility_disagreement() {
         let state = Arc::new(TestExchangeState::default());
-        *state.compatibility_error.lock().unwrap() =
-            Some(CompilationExchangeError::Incompatible { message: "expected exchange incompatibility".to_string() });
+        *state.compatibility_error.lock().unwrap() = Some(CompilationArtifactExchangeError::Incompatible {
+            message: "expected exchange incompatibility".to_string(),
+        });
         let context = CompilationContext::<TestDomain>::new().with_event_capacity(16).with_artifact_exchange(
             Arc::new(TestExchange::new(0, state)),
             CompilationArtifactExchangePolicy::RequireSharing { timeout: Duration::from_secs(1) },
         );
-        let producer_calls = Arc::new(AtomicUsize::new(0));
 
-        let result = compile_with(&context, &TestDomain::persistent(), 3, {
-            let producer_calls = Arc::clone(&producer_calls);
-            move || {
-                producer_calls.fetch_add(1, Ordering::Relaxed);
-                Ok(TestCompiledProgram(33))
-            }
-        });
+        let result = compile_with(
+            &context,
+            &TestDomain::persistent(),
+            3,
+            move || -> Result<TestCompiledProgram, ProgramError> {
+                panic!("an incompatible exchange must not compile when sharing is required")
+            },
+        );
 
         assert_eq!(
             result.err(),
@@ -3234,7 +3382,6 @@ mod tests {
                     .to_string(),
             }),
         );
-        assert_eq!(producer_calls.load(Ordering::Relaxed), 0);
         assert_eq!(context.statistics().exchange_errors, 1);
         assert_eq!(context.statistics().compilations, 0);
 
@@ -3258,9 +3405,10 @@ mod tests {
 
     #[test]
     fn test_compilation_context_with_artifact_exchange_compatibility_validation_failure() {
+        // A coordination failure deactivates the exchange, so a policy that permits a fallback compiles locally.
         let state = Arc::new(TestExchangeState::default());
         *state.compatibility_error.lock().unwrap() =
-            Some(CompilationExchangeError::Failed { message: "expected coordination failure".to_string() });
+            Some(CompilationArtifactExchangeError::Failed { message: "expected coordination failure".to_string() });
         let context = CompilationContext::<TestDomain>::new().with_event_capacity(8).with_artifact_exchange(
             Arc::new(TestExchange::new(0, state)),
             CompilationArtifactExchangePolicy::PreferSharing {
@@ -3286,6 +3434,37 @@ mod tests {
                     outcome: CompilationStepOutcome::Failed(CompilationStepError::ExchangeFailed {
                         message: "compilation artifact exchange failed: expected coordination failure".to_string(),
                     }),
+                },
+                CompilationStep::BackendCompilation { outcome: CompilationStepOutcome::Succeeded },
+            ],
+        );
+
+        // A validation that times out counts as an exchange timeout rather than as an exchange error.
+        let state = Arc::new(TestExchangeState::default());
+        *state.compatibility_error.lock().unwrap() = Some(CompilationArtifactExchangeError::TimedOut);
+        let context = CompilationContext::<TestDomain>::new().with_event_capacity(8).with_artifact_exchange(
+            Arc::new(TestExchange::new(0, state)),
+            CompilationArtifactExchangePolicy::PreferSharing {
+                timeout: Duration::from_secs(1),
+                fallback_to_local_compile: true,
+            },
+        );
+        assert_eq!(
+            compile_with(&context, &TestDomain::persistent(), 1, move || Ok(TestCompiledProgram(3))).unwrap().0,
+            3,
+        );
+        assert_eq!(context.statistics().exchange_errors, 0);
+        assert_eq!(context.statistics().exchange_timeouts, 1);
+        assert_eq!(context.statistics().exchange_fallbacks, 1);
+        assert_eq!(
+            event_steps(&context),
+            vec![
+                CompilationStep::CacheLookup {
+                    tier: CompilationCacheTier::Memory,
+                    outcome: CompilationLookupOutcome::Miss(CompilationMissReason::NotFound),
+                },
+                CompilationStep::ExchangeCompatibilityValidation {
+                    outcome: CompilationStepOutcome::Failed(CompilationStepError::TimedOut),
                 },
                 CompilationStep::BackendCompilation { outcome: CompilationStepOutcome::Succeeded },
             ],
@@ -3328,20 +3507,20 @@ mod tests {
     }
 
     #[test]
-    fn test_compilation_context_with_artifact_exchange_required_timeout() {
+    fn test_compilation_context_with_artifact_exchange_timeout_required() {
         let context = CompilationContext::<TestDomain>::new().with_event_capacity(16).with_artifact_exchange(
             Arc::new(TestExchange::new(1, Arc::new(TestExchangeState::default()))),
             CompilationArtifactExchangePolicy::RequireSharing { timeout: Duration::from_millis(1) },
         );
-        let producer_calls = Arc::new(AtomicUsize::new(0));
 
-        let result = compile_with(&context, &TestDomain::persistent(), 4, {
-            let producer_calls = Arc::clone(&producer_calls);
-            move || {
-                producer_calls.fetch_add(1, Ordering::Relaxed);
-                Ok(TestCompiledProgram(37))
-            }
-        });
+        let result = compile_with(
+            &context,
+            &TestDomain::persistent(),
+            4,
+            move || -> Result<TestCompiledProgram, ProgramError> {
+                panic!("a follower must not compile after a timeout when sharing is required")
+            },
+        );
 
         assert_eq!(
             result.err(),
@@ -3351,7 +3530,7 @@ mod tests {
                     .to_string(),
             }),
         );
-        assert_eq!(producer_calls.load(Ordering::Relaxed), 0);
+        assert_eq!(context.statistics().compilations, 0);
         assert_eq!(context.statistics().exchange_timeouts, 1);
         assert_eq!(context.statistics().exchange_fallbacks, 0);
 
@@ -3371,7 +3550,7 @@ mod tests {
     }
 
     #[test]
-    fn test_compilation_context_with_artifact_exchange_permitted_timeout_fallback() {
+    fn test_compilation_context_with_artifact_exchange_timeout_fallback() {
         let context = CompilationContext::<TestDomain>::new().with_event_capacity(16).with_artifact_exchange(
             Arc::new(TestExchange::new(1, Arc::new(TestExchangeState::default()))),
             CompilationArtifactExchangePolicy::PreferSharing {
@@ -3412,16 +3591,16 @@ mod tests {
         compile_with(&context, &domain, 1, move || Ok(TestCompiledProgram(47))).unwrap();
 
         // The memory miss of the first lookup is evicted by the two later events.
-        let events = context.recent_events();
-        assert_eq!(events.len(), 2);
-        assert_eq!(events[0].step, CompilationStep::BackendCompilation { outcome: CompilationStepOutcome::Succeeded });
         assert_eq!(
-            events[1].step,
-            CompilationStep::CacheLookup { tier: CompilationCacheTier::Memory, outcome: CompilationLookupOutcome::Hit },
+            event_steps(&context),
+            vec![
+                CompilationStep::BackendCompilation { outcome: CompilationStepOutcome::Succeeded },
+                CompilationStep::CacheLookup {
+                    tier: CompilationCacheTier::Memory,
+                    outcome: CompilationLookupOutcome::Hit,
+                },
+            ],
         );
-
-        context.clear_events();
-        assert_eq!(context.recent_events(), Vec::new());
     }
 
     #[test]
@@ -3448,26 +3627,26 @@ mod tests {
     }
 
     #[test]
-    fn test_compilation_context_with_event_reporter_failure_diagnostics() {
-        let reported = Arc::new(Mutex::new(Vec::new()));
-        let reporter_events = Arc::clone(&reported);
+    fn test_compilation_context_with_event_reporter_matches_retained_events() {
+        let reported = Mutex::new(Vec::new());
         let context = CompilationContext::<TestDomain>::new()
             .with_event_capacity(2)
-            .with_event_reporter(Arc::new(move |event| reporter_events.lock().unwrap().push(event.clone())));
+            .with_event_reporter(Arc::new(|event: &CompilationEvent| reported.lock().unwrap().push(event.clone())));
         let error = ProgramError::MalformedProgram("expected reported producer failure".to_string());
-
         assert_eq!(
             compile_with(&context, &TestDomain::default(), 1, {
                 let error = error.clone();
-                move || Err(error.clone())
+                move || Err(error)
             })
             .err(),
-            Some(error)
+            Some(error),
         );
+
+        // The reporter and the retained history observe the same events, including their durations.
         let retained = context.recent_events();
         assert_eq!(*reported.lock().unwrap(), retained);
         assert_eq!(
-            retained.iter().map(|event| event.step.clone()).collect::<Vec<_>>(),
+            event_steps(&context),
             vec![
                 CompilationStep::CacheLookup {
                     tier: CompilationCacheTier::Memory,
@@ -3480,30 +3659,62 @@ mod tests {
                 },
             ],
         );
-
-        context.clear_events();
-        assert_eq!(context.recent_events(), Vec::new());
-        assert_eq!(*reported.lock().unwrap(), retained);
     }
 
     #[test]
     fn test_compilation_context_clear_cache() {
-        let context = CompilationContext::<TestDomain>::new();
+        let context = CompilationContext::<TestDomain>::new().with_event_capacity(8);
         let domain = TestDomain::default();
         compile_with(&context, &domain, 1, move || Ok(TestCompiledProgram(1))).unwrap();
         assert_eq!(context.program_count(), 1);
 
+        // Clearing the in-memory tier keeps statistics and retained events, and the next request compiles again.
         context.clear_cache();
         assert_eq!(context.program_count(), 0);
         assert_eq!(context.statistics().compilations, 1);
+        assert_eq!(context.recent_events().len(), 2);
+        compile_with(&context, &domain, 1, move || Ok(TestCompiledProgram(1))).unwrap();
+        assert_eq!(context.statistics().compilations, 2);
+    }
 
+    #[test]
+    fn test_compilation_context_clear_statistics() {
+        let context = CompilationContext::<TestDomain>::new().with_event_capacity(8);
+        compile_with(&context, &TestDomain::default(), 1, move || Ok(TestCompiledProgram(1))).unwrap();
+        assert_ne!(context.statistics(), CompilationCacheStatistics::default());
+
+        // Clearing the statistics keeps cached programs and retained events.
         context.clear_statistics();
         assert_eq!(context.statistics(), CompilationCacheStatistics::default());
+        assert_eq!(context.program_count(), 1);
+        assert_eq!(context.recent_events().len(), 2);
+    }
+
+    #[test]
+    fn test_compilation_context_clear_events() {
+        let context = CompilationContext::<TestDomain>::new().with_event_capacity(8);
+        let domain = TestDomain::default();
+        compile_with(&context, &domain, 1, move || Ok(TestCompiledProgram(1))).unwrap();
+        assert_eq!(context.recent_events().len(), 2);
+
+        // Clearing the events keeps cached programs and statistics, and later events are still retained.
+        context.clear_events();
+        assert_eq!(context.recent_events(), Vec::new());
+        assert_eq!(context.program_count(), 1);
+        assert_eq!(context.statistics().compilations, 1);
+        compile_with(&context, &domain, 1, move || Ok(TestCompiledProgram(1))).unwrap();
+        assert_eq!(
+            event_steps(&context),
+            vec![CompilationStep::CacheLookup {
+                tier: CompilationCacheTier::Memory,
+                outcome: CompilationLookupOutcome::Hit,
+            }],
+        );
     }
 
     #[test]
     fn test_compilation_context_compile() {
-        let context = CompilationContext::<TestDomain>::new();
+        let context = CompilationContext::<TestDomain>::new().with_event_capacity(8);
         let domain = TestDomain::default();
         let staged: StagedFunction<TestDomain, ArrayType, ArrayType> = domain
             .stage(|input: CompilationTracer<TestDomain>| input, ArrayType::scalar(DataType::F32), ())
@@ -3515,7 +3726,24 @@ mod tests {
         let second = context.compile(&domain, lowered.lowered_program()).unwrap();
         assert_eq!(first.as_ref(), &TestCompiledProgram(1));
         assert!(Arc::ptr_eq(&first, &second));
-        assert_eq!(context.statistics().compilations, 1);
+        let statistics = context.statistics();
+        assert_eq!(statistics.misses, 1);
+        assert_eq!(statistics.memory_hits, 1);
+        assert_eq!(statistics.compilations, 1);
+        assert_eq!(
+            event_steps(&context),
+            vec![
+                CompilationStep::CacheLookup {
+                    tier: CompilationCacheTier::Memory,
+                    outcome: CompilationLookupOutcome::Miss(CompilationMissReason::NotFound),
+                },
+                CompilationStep::BackendCompilation { outcome: CompilationStepOutcome::Succeeded },
+                CompilationStep::CacheLookup {
+                    tier: CompilationCacheTier::Memory,
+                    outcome: CompilationLookupOutcome::Hit,
+                },
+            ],
+        );
     }
 
     #[test]
@@ -3564,14 +3792,11 @@ mod tests {
             let context = Arc::clone(&context);
             let release = Arc::clone(&release);
             thread::spawn(move || {
-                compile_with(&context, &TestDomain::default(), 0, {
-                    let release = Arc::clone(&release);
-                    move || {
-                        while !release.load(Ordering::Acquire) {
-                            thread::yield_now();
-                        }
-                        Ok(TestCompiledProgram(2))
+                compile_with(&context, &TestDomain::default(), 0, move || {
+                    while !release.load(Ordering::Acquire) {
+                        thread::yield_now();
                     }
+                    Ok(TestCompiledProgram(2))
                 })
                 .unwrap()
             })
@@ -3599,12 +3824,19 @@ mod tests {
         );
         assert_eq!(context.statistics().waits, 1);
         assert_eq!(
-            event_steps(&context).last(),
-            Some(&CompilationStep::MemoryWait {
-                outcome: CompilationLookupOutcome::Failed(CompilationStepError::Incompatible {
-                    message: "cached program 2 cannot serve 1 outputs".to_string()
-                }),
-            }),
+            event_steps(&context),
+            vec![
+                CompilationStep::CacheLookup {
+                    tier: CompilationCacheTier::Memory,
+                    outcome: CompilationLookupOutcome::Miss(CompilationMissReason::NotFound),
+                },
+                CompilationStep::BackendCompilation { outcome: CompilationStepOutcome::Succeeded },
+                CompilationStep::MemoryWait {
+                    outcome: CompilationLookupOutcome::Failed(CompilationStepError::Incompatible {
+                        message: "cached program 2 cannot serve 1 outputs".to_string()
+                    }),
+                },
+            ],
         );
     }
 
@@ -3721,54 +3953,7 @@ mod tests {
             &TestCompiledProgram(1),
         );
         assert_eq!(context.statistics().exchange_publishes, 1);
-        assert_eq!(state.artifacts.lock().unwrap().get(&vec![0]), Some(&Ok(1usize.to_le_bytes().to_vec())));
-    }
-
-    #[test]
-    fn test_compilation_context_compile_reuses_memory_entries() {
-        let context = CompilationContext::<TestDomain>::new().with_event_capacity(16);
-        let domain = TestDomain::default();
-        let producer_calls = Arc::new(AtomicUsize::new(0));
-
-        let first = compile_with(&context, &domain, 1, {
-            let producer_calls = Arc::clone(&producer_calls);
-            move || {
-                producer_calls.fetch_add(1, Ordering::Relaxed);
-                Ok(TestCompiledProgram(7))
-            }
-        })
-        .unwrap();
-        let second = compile_with(&context, &domain, 1, {
-            let producer_calls = Arc::clone(&producer_calls);
-            move || {
-                producer_calls.fetch_add(1, Ordering::Relaxed);
-                Ok(TestCompiledProgram(8))
-            }
-        })
-        .unwrap();
-
-        assert!(Arc::ptr_eq(&first, &second));
-        assert_eq!(first.0, 7);
-        assert_eq!(producer_calls.load(Ordering::Relaxed), 1);
-        let statistics = context.statistics();
-        assert_eq!(statistics.memory_hits, 1);
-        assert_eq!(statistics.misses, 1);
-        assert_eq!(statistics.compilations, 1);
-
-        assert_eq!(
-            event_steps(&context),
-            vec![
-                CompilationStep::CacheLookup {
-                    tier: CompilationCacheTier::Memory,
-                    outcome: CompilationLookupOutcome::Miss(CompilationMissReason::NotFound),
-                },
-                CompilationStep::BackendCompilation { outcome: CompilationStepOutcome::Succeeded },
-                CompilationStep::CacheLookup {
-                    tier: CompilationCacheTier::Memory,
-                    outcome: CompilationLookupOutcome::Hit,
-                },
-            ],
-        );
+        assert_eq!(state.artifacts.lock().unwrap().get([0u8].as_slice()), Some(&Ok(1usize.to_le_bytes().to_vec())));
     }
 
     #[test]
@@ -3810,7 +3995,7 @@ mod tests {
         assert_eq!(
             compile_with(&context, &domain, 1, {
                 let error = error.clone();
-                move || Err(error.clone())
+                move || Err(error)
             })
             .err(),
             Some(error)
@@ -3854,9 +4039,71 @@ mod tests {
         }));
         assert!(panic.is_err());
 
-        // The panicking producer released its in-flight state, so the next lookup becomes the new producer.
+        // The panicking producer released its in-flight marker, so the next lookup becomes the new producer. Check that
+        // cleanup before retrying so that a leaked marker fails directly instead of making the test wait forever.
+        assert!(context.in_flight.lock().unwrap().is_empty());
         let program = compile_with(&context, &domain, 1, move || Ok(TestCompiledProgram(13))).unwrap();
         assert_eq!(program.0, 13);
+    }
+
+    #[test]
+    fn test_compilation_context_compile_retries_waiters_after_producer_failure() {
+        let context = Arc::new(CompilationContext::<TestDomain>::new().with_event_capacity(8));
+        let release = Arc::new(AtomicBool::new(false));
+        let error = ProgramError::MalformedProgram("expected producer failure".to_string());
+        let producer = {
+            let context = Arc::clone(&context);
+            let release = Arc::clone(&release);
+            let error = error.clone();
+            thread::spawn(move || {
+                compile_with(&context, &TestDomain::default(), 1, move || {
+                    while !release.load(Ordering::Acquire) {
+                        thread::yield_now();
+                    }
+                    Err(error)
+                })
+            })
+        };
+        let deadline = Instant::now() + Duration::from_secs(5);
+        while context.statistics().misses == 0 && Instant::now() < deadline {
+            thread::yield_now();
+        }
+        let waiter = {
+            let context = Arc::clone(&context);
+            thread::spawn(move || compile_with(&context, &TestDomain::default(), 1, move || Ok(TestCompiledProgram(3))))
+        };
+        while context.statistics().waits == 0 && Instant::now() < deadline {
+            thread::yield_now();
+        }
+        release.store(true, Ordering::Release);
+
+        // Only the failed producer observes its error. Its waiter retries without recording a wait event, becomes the
+        // new producer, and compiles the program itself.
+        assert_eq!(producer.join().unwrap(), Err(error));
+        assert_eq!(waiter.join().unwrap().unwrap().as_ref(), &TestCompiledProgram(3));
+        let statistics = context.statistics();
+        assert_eq!(statistics.waits, 1);
+        assert_eq!(statistics.misses, 2);
+        assert_eq!(statistics.compilations, 2);
+        assert_eq!(
+            event_steps(&context),
+            vec![
+                CompilationStep::CacheLookup {
+                    tier: CompilationCacheTier::Memory,
+                    outcome: CompilationLookupOutcome::Miss(CompilationMissReason::NotFound),
+                },
+                CompilationStep::BackendCompilation {
+                    outcome: CompilationStepOutcome::Failed(CompilationStepError::CompilationFailed {
+                        message: "encountered malformed program: expected producer failure".to_string()
+                    }),
+                },
+                CompilationStep::CacheLookup {
+                    tier: CompilationCacheTier::Memory,
+                    outcome: CompilationLookupOutcome::Miss(CompilationMissReason::NotFound),
+                },
+                CompilationStep::BackendCompilation { outcome: CompilationStepOutcome::Succeeded },
+            ],
+        );
     }
 
     #[test]
@@ -3875,16 +4122,12 @@ mod tests {
             let producer_calls = Arc::clone(&producer_calls);
             threads.push(thread::spawn(move || {
                 start.wait();
-                compile_with(&context, &TestDomain::default(), 1, {
-                    let producer_calls = Arc::clone(&producer_calls);
-                    let release = Arc::clone(&release);
-                    move || {
-                        producer_calls.fetch_add(1, Ordering::Relaxed);
-                        while !release.load(Ordering::Acquire) {
-                            thread::yield_now();
-                        }
-                        Ok(TestCompiledProgram(11))
+                compile_with(&context, &TestDomain::default(), 1, move || {
+                    producer_calls.fetch_add(1, Ordering::Relaxed);
+                    while !release.load(Ordering::Acquire) {
+                        thread::yield_now();
                     }
+                    Ok(TestCompiledProgram(11))
                 })
                 .unwrap()
             }));
@@ -3926,7 +4169,7 @@ mod tests {
     }
 
     #[test]
-    fn test_compilation_context_compile_unrelated_keys_concurrently() {
+    fn test_compilation_context_compile_compiles_unrelated_keys_concurrently() {
         let context = Arc::new(CompilationContext::<TestDomain>::new());
         let start = Arc::new(Barrier::new(3));
         let release = Arc::new(AtomicBool::new(false));
@@ -3939,15 +4182,12 @@ mod tests {
             let entered_sender = entered_sender.clone();
             threads.push(thread::spawn(move || {
                 start.wait();
-                compile_with(&context, &TestDomain::default(), key, {
-                    let release = Arc::clone(&release);
-                    move || {
-                        entered_sender.send(key).unwrap();
-                        while !release.load(Ordering::Acquire) {
-                            thread::yield_now();
-                        }
-                        Ok(TestCompiledProgram(key as usize))
+                compile_with(&context, &TestDomain::default(), key, move || {
+                    entered_sender.send(key).unwrap();
+                    while !release.load(Ordering::Acquire) {
+                        thread::yield_now();
                     }
+                    Ok(TestCompiledProgram(key as usize))
                 })
                 .unwrap()
             }));
@@ -3971,14 +4211,17 @@ mod tests {
         let directory = tempfile::tempdir().unwrap();
         let nested = directory.path().join("nested").join("cache");
         let cache = DiskCache::open(&nested).unwrap();
+        assert!(nested.is_dir());
         assert_eq!(cache.directory(), nested.as_path());
         assert_eq!(cache.max_bytes(), None);
-        assert_eq!(cache.cache_size_bytes().unwrap(), 0);
 
         // A path that already exists as a file cannot back a cache.
         let file = directory.path().join("file");
         fs::write(&file, b"not a directory").unwrap();
-        assert!(DiskCache::open(&file).is_err());
+        assert!(matches!(
+            DiskCache::open(&file),
+            Err(error) if error.kind() == std::io::ErrorKind::AlreadyExists,
+        ));
     }
 
     #[test]
@@ -4004,6 +4247,29 @@ mod tests {
         assert!(!cache.should_persist(Duration::from_secs(1), 256));
         assert!(!cache.should_persist(Duration::from_secs(3), 64));
         assert!(cache.should_persist(Duration::from_secs(2), 128));
+    }
+
+    #[test]
+    fn test_disk_cache_cache_size_bytes() {
+        let directory = tempfile::tempdir().unwrap();
+        let cache = DiskCache::open(directory.path().join("cache")).unwrap();
+        assert_eq!(cache.cache_size_bytes().unwrap(), 0);
+
+        // Only executable and auxiliary entries count, so temporary and unrelated files are ignored.
+        let digest = DiskCacheDigest::from_key(b"key");
+        cache.put(&digest, b"executable").unwrap();
+        cache.put_auxiliary("namespace", b"key", b"auxiliary").unwrap();
+        let (_, mut temporary_file) = cache.temporary_entry(&digest, EXECUTABLE_EXTENSION).unwrap();
+        temporary_file.write_all(b"temporary").unwrap();
+        fs::write(cache.directory().join("unrelated"), b"unrelated").unwrap();
+        let executable_size = fs::metadata(cache.entry_path(&digest)).unwrap().len();
+        let auxiliary_path = cache.auxiliary_entry_path(&DiskCache::auxiliary_digest("namespace", b"key"));
+        let auxiliary_size = fs::metadata(auxiliary_path).unwrap().len();
+        assert_eq!(cache.cache_size_bytes().unwrap(), executable_size + auxiliary_size);
+
+        // A missing directory is an empty cache.
+        fs::remove_dir_all(cache.directory()).unwrap();
+        assert_eq!(cache.cache_size_bytes().unwrap(), 0);
     }
 
     #[test]
@@ -4042,8 +4308,25 @@ mod tests {
     fn test_disk_cache_put_auxiliary() {
         let directory = tempfile::tempdir().unwrap();
         let cache = DiskCache::open(directory.path()).unwrap();
-        let error = cache.put_auxiliary("adaptive-profile", b"key", &vec![0u8; MAXIMUM_AUXILIARY_ENTRY_SIZE + 1]);
-        let error = error.unwrap_err();
+        cache.put_auxiliary("adaptive-profile", b"key", b"first").unwrap();
+        cache.put_auxiliary("adaptive-profile", b"key", b"second").unwrap();
+
+        // Rewriting a key atomically replaces its auxiliary entry and leaves no temporary files behind.
+        let path = cache.auxiliary_entry_path(&DiskCache::auxiliary_digest("adaptive-profile", b"key"));
+        assert_eq!(
+            fs::read_dir(directory.path()).unwrap().map(|entry| entry.unwrap().path()).collect::<Vec<_>>(),
+            vec![path]
+        );
+        assert_eq!(cache.get_auxiliary("adaptive-profile", b"key").unwrap(), Some(b"second".to_vec()));
+    }
+
+    #[test]
+    fn test_disk_cache_put_auxiliary_rejects_oversized_payloads() {
+        let directory = tempfile::tempdir().unwrap();
+        let cache = DiskCache::open(directory.path()).unwrap();
+        let error = cache
+            .put_auxiliary("adaptive-profile", b"key", &vec![0u8; MAXIMUM_AUXILIARY_ENTRY_SIZE + 1])
+            .unwrap_err();
         assert_eq!(error.kind(), std::io::ErrorKind::InvalidInput);
         assert_eq!(error.to_string(), "persistent auxiliary payload exceeds the 64 MiB limit");
         assert_eq!(cache.cache_size_bytes().unwrap(), 0);
@@ -4080,6 +4363,34 @@ mod tests {
     }
 
     #[test]
+    fn test_disk_cache_put() {
+        let directory = tempfile::tempdir().unwrap();
+        let cache = DiskCache::open(directory.path()).unwrap();
+        let digest = DiskCacheDigest::from_key(b"stable-key");
+        cache.put(&digest, b"first").unwrap();
+        cache.put(&digest, b"second").unwrap();
+
+        // Rewriting a digest atomically replaces its executable entry and leaves no temporary files behind.
+        let paths = fs::read_dir(directory.path()).unwrap().map(|entry| entry.unwrap().path()).collect::<Vec<_>>();
+        assert_eq!(paths, vec![cache.entry_path(&digest)]);
+        assert_eq!(cache.get(&digest).unwrap(), Some(b"second".to_vec()));
+    }
+
+    #[test]
+    fn test_disk_cache_put_removes_temporary_entries_after_failures() {
+        let directory = tempfile::tempdir().unwrap();
+        let cache = DiskCache::open(directory.path()).unwrap();
+        let digest = DiskCacheDigest::from_key(b"obstructed");
+        fs::create_dir(cache.entry_path(&digest)).unwrap();
+
+        // Renaming the temporary file over a directory fails, after which the temporary file is removed.
+        let error = cache.put(&digest, b"compiled").unwrap_err();
+        assert_eq!(error.kind(), std::io::ErrorKind::IsADirectory);
+        let paths = fs::read_dir(directory.path()).unwrap().map(|entry| entry.unwrap().path()).collect::<Vec<_>>();
+        assert_eq!(paths, vec![cache.entry_path(&digest)]);
+    }
+
+    #[test]
     fn test_disk_cache_put_compresses_entries() {
         let directory = tempfile::tempdir().unwrap();
         let cache = DiskCache::open(directory.path()).unwrap();
@@ -4105,7 +4416,7 @@ mod tests {
         let barrier = Barrier::new(2);
         let first_payload = vec![17u8; 32 * 1024];
         let second_payload = vec![93u8; 48 * 1024];
-        std::thread::scope(|scope| {
+        thread::scope(|scope| {
             let left = scope.spawn(|| {
                 barrier.wait();
                 first.put(&digest, &first_payload).unwrap();
@@ -4154,7 +4465,19 @@ mod tests {
         assert_eq!(cache.get(&digests[0]).unwrap(), None);
         assert_eq!(cache.get(&digests[1]).unwrap(), Some(payloads[1].clone()));
         assert_eq!(cache.get(&digests[2]).unwrap(), Some(payloads[2].clone()));
-        assert!(cache.cache_size_bytes().unwrap() <= capacity);
+        assert_eq!(cache.cache_size_bytes().unwrap(), capacity);
+    }
+
+    #[test]
+    fn test_disk_cache_auxiliary_digest() {
+        // Auxiliary digests name entries that other processes read, so their encoding must stay stable.
+        assert_eq!(
+            DiskCache::auxiliary_digest("namespace", b"key").to_hex(),
+            "7d091deabce485650d600354e586046d8335d27a2526daf08500fe02b24c3d61",
+        );
+
+        // Hashing the namespace and the key independently keeps pairs with equal concatenations apart.
+        assert_ne!(DiskCache::auxiliary_digest("ab", b"c"), DiskCache::auxiliary_digest("a", b"bc"));
     }
 
     #[test]
@@ -4215,6 +4538,27 @@ mod tests {
     }
 
     #[test]
+    fn test_disk_cache_read_entry_rejects_oversized_payloads() {
+        let directory = tempfile::tempdir().unwrap();
+        let cache = DiskCache::open(directory.path()).unwrap();
+        let digest = DiskCacheDigest::from_key(b"key");
+        let maximum_payload_size = 1024 * 1024;
+
+        // A payload at the bound is read, while a payload one byte larger fails before its envelope is validated.
+        let payload = vec![7u8; maximum_payload_size];
+        cache.put(&digest, &payload).unwrap();
+        assert_eq!(
+            DiskCache::read_entry(&cache.entry_path(&digest), &digest, Some(maximum_payload_size)).unwrap(),
+            Some(payload)
+        );
+
+        cache.put(&digest, &vec![7u8; maximum_payload_size + 1]).unwrap();
+        let error = DiskCache::read_entry(&cache.entry_path(&digest), &digest, Some(maximum_payload_size)).unwrap_err();
+        assert_eq!(error.kind(), std::io::ErrorKind::InvalidData);
+        assert_eq!(error.to_string(), "persistent cache payload exceeds the 1 MiB limit");
+    }
+
+    #[test]
     fn test_disk_cache_temporary_entry_independent_instances() {
         let directory = tempfile::tempdir().unwrap();
         let first = DiskCache::open(directory.path()).unwrap();
@@ -4224,7 +4568,7 @@ mod tests {
 
         // Both caches begin with counter zero. Holding both files open together prevents either writer from reusing a
         // name after the other publishes or cleans up, which deterministically exercises independent instances.
-        let paths = std::thread::scope(|scope| {
+        let paths = thread::scope(|scope| {
             let left = scope.spawn(|| {
                 let (path, mut file) = first.temporary_entry(&digest, AUXILIARY_EXTENSION).unwrap();
                 barrier.wait();
