@@ -16,7 +16,8 @@ and this project adheres to [Semantic Versioning](https://semver.org/).
   `ryft_core::programs`:
   - `Program`s are immutable graphs of `Instruction`s over typed `Atom`s, organized into sealed `Region`s that model
     nested computations (e.g., branches, loop bodies, callees, and custom derivative rules), and are constructed and
-    validated with `ProgramBuilder`s.
+    validated with `ProgramBuilder`s. `TypedProgram` exposes the flat type signature of programs and of the artifacts
+    derived from them.
   - Operations declare their type inference and their effects (i.e., `Effects`, including `ReferenceEffect`s), types
     support dynamic type identities and refinements, and instructions carry source `Provenance`.
   - Mutable references with alias analysis and discharge into pure, state-passing programs.
@@ -66,6 +67,9 @@ and this project adheres to [Semantic Versioning](https://semver.org/).
     `DynamicPad`, `DynamicConcatenate`, `DynamicSliceWithDimensions`, `DynamicGather`, and `DynamicScatter`.
   - **Contractions, Reductions, & Sorting:** `Dot`, `RaggedDot`, `Reduce`, `ArgMax`, `ArgMin`, `Cumulative`,
     `Softmax`, `Sort`, and `TopK`.
+  - **Quantization:** `BlockQuantize`, `BlockDequantize`, and `ScaledDot` for block-scaled (i.e., microscaling) formats
+    such as NVFP4 and MXFP8, along with `block_scaled_dot`, which creates a differentiable block-scaled dot product for
+    training.
   - **Random Number Generation:** `RngBitGenerator`, `DynamicRngBitGenerator`, and `Random`.
   - **Control Flow:** `Select`, `Condition`, `While`, and `Scan`.
   - **Dimensions:** `DimensionSize`, `DimensionFromScalar`, `DimensionToScalar`, `DimensionMin`, `DimensionMax`,
