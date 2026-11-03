@@ -122,15 +122,15 @@ impl<P: Parameter + Capability> Capability for BlockQuantizedValue<P> {
     type Universe = P::Universe;
 }
 
-/// Value-level block quantization capability. [`BlockQuantize::block_quantize`] splits an `f32` or `f64` array into
-/// an array of narrow elements and an array of scales with one scale per block of consecutive values along the last
+/// Value-level block quantization capability. [`BlockQuantize::block_quantize`] splits an `f32` or `f64` array into an
+/// array of narrow elements and an array of scales with one scale per block of consecutive values along the last
 /// dimension, which are the inputs that [`ScaledDot`] consumes. This supports quantizing values on the fly (e.g., a KV
 /// cache) without a dedicated primitive, because the recipe composes existing operations and inherits their transform
 /// rules. Both sides of a [`ScaledDot`] contraction quantized this way must contract their last dimension, which
 /// [`ScaledDot::scaled_matmul`] does, while the default dimension numbers of [`ScaledDot::scaled_dot`] contract the
-/// penultimate dimension of the right input. [`BlockQuantize::block_quantize_with_options`] additionally places blocks
-/// along other axes, scales the input by a global scale first, and rounds stochastically. Its blocks may span several
-/// axes (e.g., the 16×16 weight tiles of the NVFP4 training recipe of NVIDIA), with one scale per tile.
+/// penultimate dimension of the right-hand side input. [`BlockQuantize::block_quantize_with_options`] additionally
+/// places blocks along other axes, scales the input by a global scale first, and rounds stochastically. Its blocks may
+/// span several axes (e.g., the 16×16 weight tiles of the NVFP4 training recipe of NVIDIA), with one scale per tile.
 ///
 /// The scale data type selects one of two standard microscaling recipes:
 ///
@@ -1442,9 +1442,9 @@ where
 }
 
 /// Element and scale formats of one input of a block-scaled matrix product, which [`BlockScaledDotConfiguration`]
-/// assigns to the left input, the right input, and/or the gradients. The scale data type selects the [`BlockQuantize`]
-/// recipe, and formats with [`F8E4M3FN`](DataType::F8E4M3FN) scales (e.g., NVFP4) use a global scale in addition to
-/// their block scales, that is supplied as an input of [`BlockScaledDot::call`] or is computed by it.
+/// assigns to the left-hand side input, the right-hand side input, and/or the gradients. The scale data type selects
+/// the [`BlockQuantize`] recipe. Formats with [`F8E4M3FN`](DataType::F8E4M3FN) scales (e.g., NVFP4) use a global scale
+/// in addition to their block scales. [`BlockScaledDot::call`] accepts or computes this global scale.
 #[derive(Copy, Clone, Debug, PartialEq, Eq, Hash)]
 pub struct BlockScaleFormat {
     /// Number of consecutive values along the contracting dimension that share one scale.
@@ -1517,35 +1517,7 @@ impl BlockScaleFormat {
         let scale_max = if self.has_global_scale() { 448.0 } else { 127.0f64.exp2() };
         Ok(BlockElementFormat::new(self.element_type)?.max * scale_max)
     }
-
-    /// Validates this format against the requirements of block quantization that do not depend on input shapes.
-    fn validate(&self, name: &str) -> Result<(), ProgramError> {
-        if BlockElementFormat::new(self.element_type).is_err() {
-            return Err(TypeError::invalid(format!(
-                "`block_scaled_dot` {} format does not support element data type `{}`",
-                name, self.element_type,
-            ))
-            .into());
-        }
-        if !matches!(self.scale_type, DataType::F8E4M3FN | DataType::F8E8M0FNU) {
-            return Err(TypeError::invalid(format!(
-                "`block_scaled_dot` {} format does not support scale data type `{}`",
-                name, self.scale_type,
-            ))
-            .into());
-        }
-        if self.block_size < 2 {
-            return Err(TypeError::invalid(format!(
-                "`block_scaled_dot` {} format block size must be at least 2 but got {}",
-                name, self.block_size,
-            ))
-            .into());
-        }
-        Ok(())
-    }
 }
-
-// TODO(eaplatanios): Review from here onwards.
 
 /// Source of the global scales of [`BlockScaleFormat`]s that use global scales.
 #[derive(Copy, Clone, Debug, Default, PartialEq, Eq, Hash)]
@@ -1567,9 +1539,9 @@ pub enum BlockScaledGlobalScaling {
     Current,
 }
 
-/// Value-independent semantics of a [`BlockScaledDot`], which [`block_scaled_dot`] creates. The defaults follow
-/// [`jax.nn.scaled_dot_general`](https://docs.jax.dev/en/latest/_autosummary/jax.nn.scaled_dot_general.html) and
-/// [`Self::nvfp4_training`] selects the NVFP4 training recipe of NVIDIA.
+/// Value-independent semantics of a [`BlockScaledDot`], which [`block_scaled_dot`] creates. Unless overridden, the
+/// gradient format follows the left-hand side input format, and backward contractions are quantized when that format
+/// does not use global scales. [`Self::nvfp4_training`] selects the NVFP4 training recipe of NVIDIA.
 #[derive(Clone, Debug, PartialEq, Eq, Hash)]
 pub struct BlockScaledDotConfiguration {
     /// Contracting and batching dimension specification.
@@ -1578,19 +1550,21 @@ pub struct BlockScaledDotConfiguration {
     /// Data type of the output (refer to [`Self::with_accumulation_type`]).
     accumulation_type: DataType,
 
-    /// [`BlockScaleFormat`] of the left input.
+    /// [`BlockScaleFormat`] of the left-hand side input.
     lhs_format: BlockScaleFormat,
 
-    /// [`BlockScaleFormat`] of the right input.
+    /// [`BlockScaleFormat`] of the right-hand side input.
     rhs_format: BlockScaleFormat,
 
-    /// [`BlockScaleFormat`] of the output cotangents in quantized backward contractions.
-    gradient_format: BlockScaleFormat,
+    /// Explicit format of the output cotangents in quantized backward contractions,
+    /// or [`None`] to use the left-hand side input format.
+    gradient_format: Option<BlockScaleFormat>,
 
     /// Source of the global scales of formats that use global scales.
     global_scaling: BlockScaledGlobalScaling,
 
-    /// Whether the backward contractions are quantized, or `None` to follow JAX.
+    /// Whether the backward contractions are quantized. With [`None`], they are quantized when the resolved gradient
+    /// format does not use global scales, and unquantized otherwise.
     quantized_backward: Option<bool>,
 
     /// Whether quantized gradients round stochastically.
@@ -1599,20 +1573,20 @@ pub struct BlockScaledDotConfiguration {
     /// Whether the weight gradient contraction applies a random Hadamard transform to its inputs.
     hadamard_transform: bool,
 
-    /// Whether the right input uses square tiles of scales.
+    /// Whether the right-hand side input uses square tiles of scales.
     tiled_rhs_scales: bool,
 }
 
 impl BlockScaledDotConfiguration {
-    /// Creates a new [`BlockScaledDotConfiguration`] with the JAX defaults. Every input and the gradients use `format`,
-    /// the output is `f32`, global scales are [provided](BlockScaledGlobalScaling::Provided), and the backward
-    /// contractions are quantized unless the gradient format uses global scales (refer to
-    /// [`Self::quantized_backward`]).
+    /// Creates a new [`BlockScaledDotConfiguration`] with both input formats set to `format`. The gradient format
+    /// follows the left-hand side input format unless overridden with [`Self::with_gradient_format`]. The output is
+    /// `f32`, global scales are [provided](BlockScaledGlobalScaling::Provided), and the backward contractions are
+    /// quantized unless the resolved gradient format uses global scales (refer to [`Self::quantized_backward`]).
     ///
     /// # Parameters
     ///
     ///   - `dimensions`: Contracting and batching dimensions of the generalized dot product.
-    ///   - `format`: Format of both inputs and of the gradients.
+    ///   - `format`: Initial format of both inputs.
     #[inline]
     pub fn new(dimensions: DotDimensionNumbers, format: BlockScaleFormat) -> Self {
         Self {
@@ -1620,7 +1594,7 @@ impl BlockScaledDotConfiguration {
             accumulation_type: DataType::F32,
             lhs_format: format,
             rhs_format: format,
-            gradient_format: format,
+            gradient_format: None,
             global_scaling: BlockScaledGlobalScaling::Provided,
             quantized_backward: None,
             stochastic_gradient_rounding: false,
@@ -1629,10 +1603,11 @@ impl BlockScaledDotConfiguration {
         }
     }
 
-    /// Creates the NVFP4 training recipe of NVIDIA Transformer Engine, which uses NVFP4 for all three contractions
-    /// with [current](BlockScaledGlobalScaling::Current) global scaling, rounds gradients stochastically, applies the
-    /// random Hadamard transform to the weight gradient inputs, and uses 16×16 scale tiles for the right input, which
-    /// should be the weight (e.g., `y = x · Wᵀ` with `dimensions` contracting the last dimensions of `x` and `W`).
+    /// Creates the NVFP4 training recipe of NVIDIA Transformer Engine, which uses NVFP4 for all three contractions with
+    /// [current](BlockScaledGlobalScaling::Current) global scaling, rounds gradients stochastically, applies the random
+    /// Hadamard transform to the weight gradient inputs, and uses 16×16 scale tiles for the right-hand side input,
+    /// which should be the weight (e.g., `y = x · Wᵀ` with `dimensions` contracting the last dimensions of `x` and
+    /// `W`). The gradient format is selected explicitly and is retained when the input formats change.
     ///
     /// The recipe follows Transformer Engine in which tensors it quantizes and how, but not bit for bit. Global scales
     /// divide the input as in JAX, whereas Transformer Engine multiplies by reciprocals, so roundings can differ.
@@ -1643,6 +1618,7 @@ impl BlockScaledDotConfiguration {
     #[inline]
     pub fn nvfp4_training(dimensions: DotDimensionNumbers) -> Self {
         Self::new(dimensions, BlockScaleFormat::nvfp4())
+            .with_gradient_format(BlockScaleFormat::nvfp4())
             .with_global_scaling(BlockScaledGlobalScaling::Current)
             .with_quantized_backward(true)
             .with_stochastic_gradient_rounding(true)
@@ -1660,25 +1636,26 @@ impl BlockScaledDotConfiguration {
         self
     }
 
-    /// Returns this configuration with the provided format of the left input.
+    /// Returns this configuration with the provided format of the left-hand side input. The gradient format follows it
+    /// unless overridden with [`Self::with_gradient_format`].
     #[inline]
     pub fn with_lhs_format(mut self, format: BlockScaleFormat) -> Self {
         self.lhs_format = format;
         self
     }
 
-    /// Returns this configuration with the provided format of the right input.
+    /// Returns this configuration with the provided format of the right-hand side input.
     #[inline]
     pub fn with_rhs_format(mut self, format: BlockScaleFormat) -> Self {
         self.rhs_format = format;
         self
     }
 
-    /// Returns this configuration with the provided format of the output cotangents in quantized backward
-    /// contractions.
+    /// Returns this configuration with an explicit format of the output cotangents in quantized backward
+    /// contractions. This override is retained when the input formats change.
     #[inline]
     pub fn with_gradient_format(mut self, format: BlockScaleFormat) -> Self {
-        self.gradient_format = format;
+        self.gradient_format = Some(format);
         self
     }
 
@@ -1689,15 +1666,16 @@ impl BlockScaledDotConfiguration {
         self
     }
 
-    /// Returns this configuration with quantized (`true`) or unquantized (`false`) backward contractions,
-    /// overriding the JAX default (refer to [`Self::quantized_backward`]).
+    /// Returns this configuration with quantized (`true`) or unquantized (`false`) backward contractions. This
+    /// overrides the default determined by the resolved gradient format. Refer to [`Self::quantized_backward`]
+    /// for more information.
     #[inline]
     pub fn with_quantized_backward(mut self, quantized_backward: bool) -> Self {
         self.quantized_backward = Some(quantized_backward);
         self
     }
 
-    /// Returns this configuration with stochastic (`true`) or nearest (`false`) rounding of the output
+    /// Returns this configuration with stochastic (i.e., `true`) or nearest (i.e., `false`) rounding of the output
     /// cotangents in quantized backward contractions. Stochastic rounding requires
     /// the `random_state` input of [`BlockScaledDot::call`].
     #[inline]
@@ -1707,15 +1685,15 @@ impl BlockScaledDotConfiguration {
     }
 
     /// Returns this configuration with or without the random Hadamard transform of the inputs of quantized weight
-    /// gradient contractions (refer to [`Self::hadamard_transform`]).
+    /// gradient contractions. Refer to [`Self::hadamard_transform`] for more information.
     #[inline]
     pub fn with_hadamard_transform(mut self, hadamard_transform: bool) -> Self {
         self.hadamard_transform = hadamard_transform;
         self
     }
 
-    /// Returns this configuration with square (`true`) or one-dimensional (`false`) scale blocks for the right input
-    /// (refer to [`Self::tiled_rhs_scales`]).
+    /// Returns this configuration with square (i.e., `true`) or one-dimensional (i.e., `false`) scale blocks for the
+    /// right-hand side input. Refer to [`Self::tiled_rhs_scales`] for more information.
     #[inline]
     pub fn with_tiled_rhs_scales(mut self, tiled_rhs_scales: bool) -> Self {
         self.tiled_rhs_scales = tiled_rhs_scales;
@@ -1734,22 +1712,23 @@ impl BlockScaledDotConfiguration {
         self.accumulation_type
     }
 
-    /// Returns the format of the left input.
+    /// Returns the format of the left-hand side input.
     #[inline]
     pub fn lhs_format(&self) -> BlockScaleFormat {
         self.lhs_format
     }
 
-    /// Returns the format of the right input.
+    /// Returns the format of the right-hand side input.
     #[inline]
     pub fn rhs_format(&self) -> BlockScaleFormat {
         self.rhs_format
     }
 
-    /// Returns the format of the output cotangents in quantized backward contractions.
+    /// Returns the format of the output cotangents in quantized backward contractions. Uses the left-hand side input
+    /// format unless overridden with [`Self::with_gradient_format`].
     #[inline]
     pub fn gradient_format(&self) -> BlockScaleFormat {
-        self.gradient_format
+        self.gradient_format.unwrap_or(self.lhs_format)
     }
 
     /// Returns the source of global scales.
@@ -1758,12 +1737,12 @@ impl BlockScaledDotConfiguration {
         self.global_scaling
     }
 
-    /// Returns whether the backward contractions are quantized. Unless overridden, they are quantized exactly when
-    /// the gradient format does not use global scales, which is when `jax.nn.scaled_dot_general` quantizes them,
-    /// so NVFP4 gradients default to unquantized backward contractions.
+    /// Returns whether the backward contractions are quantized. Without an explicit override, gradient formats without
+    /// global scales (e.g., MXFP8 and MXFP4) select quantized backward contractions, and formats with global scales
+    /// (e.g., NVFP4) select unquantized backward contractions.
     #[inline]
     pub fn quantized_backward(&self) -> bool {
-        self.quantized_backward.unwrap_or(!self.gradient_format.has_global_scale())
+        self.quantized_backward.unwrap_or(!self.gradient_format().has_global_scale())
     }
 
     /// Returns whether quantized gradients round stochastically.
@@ -1772,21 +1751,21 @@ impl BlockScaledDotConfiguration {
         self.stochastic_gradient_rounding
     }
 
-    /// Returns whether quantized weight gradient contractions apply the random Hadamard transform of NVIDIA
-    /// Transformer Engine to both of their inputs. The transform multiplies every 16 consecutive values along the
-    /// contracting dimension by `diag(s) · H / 4`, where `H` is the 16×16 Sylvester Hadamard matrix and `s` is the
-    /// fixed sign vector of Transformer Engine. The transform is orthogonal, so the exact product is unchanged, while
-    /// outliers spread over their blocks before quantization. It can grow the largest magnitude of a tensor up to four
-    /// times, so formats with global scales require [current](BlockScaledGlobalScaling::Current) global scaling, which
+    /// Returns whether quantized weight gradient contractions apply the random Hadamard transform of NVIDIA Transformer
+    /// Engine to both of their inputs. The transform multiplies every 16 consecutive values along the contracting
+    /// dimension by `diag(s) · H / 4`, where `H` is the 16×16 Sylvester Hadamard matrix and `s` is the fixed sign
+    /// vector of Transformer Engine. The transform is orthogonal, so the exact product is unchanged, while outliers
+    /// spread over their blocks before quantization. It can grow the largest magnitude of a tensor up to four times,
+    /// so formats with global scales require [current](BlockScaledGlobalScaling::Current) global scaling, which
     /// computes the global scales of the transformed tensors, rather than provided scales that would clip them.
     #[inline]
     pub fn hadamard_transform(&self) -> bool {
         self.hadamard_transform
     }
 
-    /// Returns whether the right input uses square tiles of `block_size × block_size` values that share one scale,
-    /// spanning its (merged) contracting and free dimensions. Its quantization along either of them then yields the
-    /// same values, so the forward contraction and the input gradient contraction see the same quantized weight.
+    /// Returns whether the right-hand side input uses square tiles of `block_size × block_size` values that share one
+    /// scale, spanning its (merged) contracting and free dimensions. Its quantization along either of them then yields
+    /// the same values, so the forward contraction and the input gradient contraction see the same quantized weight.
     #[inline]
     pub fn tiled_rhs_scales(&self) -> bool {
         self.tiled_rhs_scales
@@ -1794,9 +1773,34 @@ impl BlockScaledDotConfiguration {
 
     /// Validates this configuration independently of the input types.
     fn validate(&self) -> Result<(), ProgramError> {
-        self.lhs_format.validate("left")?;
-        self.rhs_format.validate("right")?;
-        self.gradient_format.validate("gradient")?;
+        for (name, format) in
+            [("left", self.lhs_format), ("right", self.rhs_format), ("gradient", self.gradient_format())]
+        {
+            if BlockElementFormat::new(format.element_type).is_err() {
+                return Err(TypeError::invalid(format!(
+                    "`block_scaled_dot` {} format does not support element data type `{}`",
+                    name, format.element_type,
+                ))
+                .into());
+            }
+
+            if !matches!(format.scale_type, DataType::F8E4M3FN | DataType::F8E8M0FNU) {
+                return Err(TypeError::invalid(format!(
+                    "`block_scaled_dot` {} format does not support scale data type `{}`",
+                    name, format.scale_type,
+                ))
+                .into());
+            }
+
+            if format.block_size < 2 {
+                return Err(TypeError::invalid(format!(
+                    "`block_scaled_dot` {} format block size must be at least 2 but got {}",
+                    name, format.block_size,
+                ))
+                .into());
+            }
+        }
+
         if !matches!(self.accumulation_type, DataType::BF16 | DataType::F16 | DataType::F32 | DataType::F64) {
             return Err(TypeError::invalid(format!(
                 "`block_scaled_dot` accumulation type must be one of `bf16`, `f16`, `f32`, and `f64` but got `{}`",
@@ -1804,6 +1808,7 @@ impl BlockScaledDotConfiguration {
             ))
             .into());
         }
+
         if !self.quantized_backward()
             && (self.stochastic_gradient_rounding || self.hadamard_transform || self.tiled_rhs_scales)
         {
@@ -1813,18 +1818,22 @@ impl BlockScaledDotConfiguration {
             )
             .into());
         }
+
         if self.hadamard_transform
             && self.global_scaling == BlockScaledGlobalScaling::Provided
-            && (self.lhs_format.has_global_scale() || self.gradient_format.has_global_scale())
+            && (self.lhs_format.has_global_scale() || self.gradient_format().has_global_scale())
         {
             return Err(TypeError::invalid(
                 "`block_scaled_dot` Hadamard transforms of formats with global scales require current global scaling",
             )
             .into());
         }
+
         Ok(())
     }
 }
+
+// TODO(eaplatanios): Review from here onwards.
 
 /// Differentiable block-scaled generalized dot product, built by [`block_scaled_dot`]. It quantizes its
 /// unquantized inputs with [`BlockQuantize`] and contracts them with [`ScaledDot`] in its primal, and its reverse
@@ -1871,26 +1880,26 @@ where
     /// has the [accumulation type](BlockScaledDotConfiguration::accumulation_type) and the shape of the corresponding
     /// [`Dot`] output.
     ///
-    /// The left and right inputs must be real floating-point arrays with static shapes and the extents that the
-    /// dimension numbers require. They are quantized at `f64` when either is `f64`, and at `f32` otherwise, whereas
-    /// JAX always quantizes at `f32`. The product of the contracting extents must be a positive multiple of the block
-    /// sizes of both input formats, and tiled right scales additionally require that of the free extents of the right
-    /// input. Quantized backward contractions block the products of the free extents of both inputs, so
-    /// differentiation requires each of them to be a multiple of the gradient format's block size and of the block
-    /// size of its own input's format (and of `16` for Hadamard transforms of the left free extents). Global scales
-    /// must be rank-0 real floating-point arrays that are only present for formats with global scales under
-    /// [`BlockScaledGlobalScaling::Provided`], and a gradient global scale additionally requires quantized backward
-    /// contractions. A random generator state must be present exactly when stochastic gradient rounding is enabled
-    /// and must have a generator state type (refer to [`RandomAlgorithm::from_state_type`]).
+    /// The left-hand side and right-hand side inputs must be real floating-point arrays with static shapes and the
+    /// extents that the dimension numbers require. They are quantized at `f64` when either is `f64`, and at `f32`
+    /// otherwise, whereas JAX always quantizes at `f32`. The product of the contracting extents must be a positive
+    /// multiple of the block sizes of both input formats, and tiled right scales additionally require that of the free
+    /// extents of the right-hand side input. Quantized backward contractions block the products of the free extents of
+    /// both inputs, so differentiation requires each of them to be a multiple of the gradient format's block size and
+    /// of the block size of its own input's format (and of `16` for Hadamard transforms of the left free extents).
+    /// Global scales must be rank-0 real floating-point arrays that are only present for formats with global scales
+    /// under [`BlockScaledGlobalScaling::Provided`], and a gradient global scale additionally requires quantized
+    /// backward contractions. A random generator state must be present exactly when stochastic gradient rounding is
+    /// enabled and must have a generator state type (refer to [`RandomAlgorithm::from_state_type`]).
     ///
     /// Only `lhs` and `rhs` are differentiable. The global scales and random state receive structural zero cotangents.
     ///
     /// # Parameters
     ///
-    ///   - `lhs`: Left input of the generalized dot product.
-    ///   - `rhs`: Right input of the generalized dot product.
-    ///   - `lhs_global_scale`: Optional rank-0 global scale of the left input.
-    ///   - `rhs_global_scale`: Optional rank-0 global scale of the right input.
+    ///   - `lhs`: Left-hand side input of the generalized dot product.
+    ///   - `rhs`: Right-hand side input of the generalized dot product.
+    ///   - `lhs_global_scale`: Optional rank-0 global scale of the left-hand side input.
+    ///   - `rhs_global_scale`: Optional rank-0 global scale of the right-hand side input.
     ///   - `gradient_global_scale`: Optional rank-0 global scale of the output cotangents in quantized backward
     ///     contractions.
     ///   - `random_state`: Optional random generator state (refer to [`Random`]) that seeds stochastic gradient rounding.
@@ -1932,7 +1941,7 @@ where
         let global_scales = [
             ("left", lhs_global_scale.as_ref(), configuration.lhs_format),
             ("right", rhs_global_scale.as_ref(), configuration.rhs_format),
-            ("gradient", gradient_global_scale.as_ref(), configuration.gradient_format),
+            ("gradient", gradient_global_scale.as_ref(), configuration.gradient_format()),
         ];
         for (name, global_scale, format) in global_scales {
             let Some(global_scale) = global_scale else { continue };
@@ -2189,22 +2198,22 @@ struct BlockScaledDotRules<'o> {
     /// Floating-point type at which inputs are quantized and unquantized contractions accumulate.
     compute_type: DataType,
 
-    /// Permutation of the left input dimensions into batch, free, and contracting order.
+    /// Permutation of the left-hand side input dimensions into batch, free, and contracting order.
     lhs_permutation: Vec<usize>,
 
-    /// Permutation of the right input dimensions into batch, free, and contracting order.
+    /// Permutation of the right-hand side input dimensions into batch, free, and contracting order.
     rhs_permutation: Vec<usize>,
 
-    /// Static shape of the left input.
+    /// Static shape of the left-hand side input.
     lhs_shape: Vec<usize>,
 
-    /// Static shape of the right input.
+    /// Static shape of the right-hand side input.
     rhs_shape: Vec<usize>,
 
-    /// Rank-three shape `[batch, lhs free, contracting]` of the normalized left input.
+    /// Rank-three shape `[batch, lhs free, contracting]` of the normalized left-hand side input.
     lhs_canonical_shape: [usize; 3],
 
-    /// Rank-three shape `[batch, rhs free, contracting]` of the normalized right input.
+    /// Rank-three shape `[batch, rhs free, contracting]` of the normalized right-hand side input.
     rhs_canonical_shape: [usize; 3],
 
     /// Static shape of the output, which lists the batch, left free, and right free dimensions.
@@ -2298,9 +2307,9 @@ impl<'o> BlockScaledDotRules<'o> {
         ];
         if backward && configuration.quantized_backward() {
             requirements.extend([
-                ("right free", n, configuration.gradient_format.block_size),
+                ("right free", n, configuration.gradient_format().block_size),
                 ("right free", n, configuration.rhs_format.block_size),
-                ("left free", m, configuration.gradient_format.block_size),
+                ("left free", m, configuration.gradient_format().block_size),
                 ("left free", m, configuration.lhs_format.block_size),
             ]);
             if configuration.hadamard_transform {
@@ -2398,7 +2407,7 @@ impl<'o> BlockScaledDotRules<'o> {
         output.reshape(output_shape)
     }
 
-    /// Computes the cotangents of the left and right inputs for the output cotangent `seed`.
+    /// Computes the cotangents of the left-hand side and right-hand side inputs for the output cotangent `seed`.
     fn backward<V>(
         &self,
         lhs: &V,
@@ -2448,7 +2457,7 @@ impl<'o> BlockScaledDotRules<'o> {
         let lhs_global_scale = self.global_scale(configuration.lhs_format, lhs_global_scale)?;
         let rhs_global_scale = self.global_scale(configuration.rhs_format, rhs_global_scale)?;
         let (lhs_cotangent, rhs_cotangent) = if configuration.quantized_backward() {
-            let gradient_global_scale = self.global_scale(configuration.gradient_format, gradient_global_scale)?;
+            let gradient_global_scale = self.global_scale(configuration.gradient_format(), gradient_global_scale)?;
             let (noise, weight_gradient_noise) = match random_state {
                 Some(state) => {
                     let noise_type = |shape: [usize; 3]| ArrayType::new_static(self.compute_type, shape);
@@ -2462,7 +2471,7 @@ impl<'o> BlockScaledDotRules<'o> {
             // The input gradient contracts the seed `[B, M, N]` with the right input `[B, N, K]` along `N`.
             let seed_along_n = self.quantize(
                 &seed,
-                configuration.gradient_format,
+                configuration.gradient_format(),
                 2,
                 false,
                 gradient_global_scale.clone(),
@@ -2488,7 +2497,7 @@ impl<'o> BlockScaledDotRules<'o> {
             };
             let seed_along_m = self.quantize(
                 &seed,
-                configuration.gradient_format,
+                configuration.gradient_format(),
                 1,
                 false,
                 gradient_global_scale,
@@ -2505,11 +2514,11 @@ impl<'o> BlockScaledDotRules<'o> {
             // Straight-through estimation zeroes the gradients of values that the forward quantization clipped.
             let mask = |cotangent: V, value: &V, format: BlockScaleFormat, global_scale: GlobalScale<V>| {
                 let threshold = match global_scale {
-                    GlobalScale::Provided(global_scale) if configuration.gradient_format.has_global_scale() => {
+                    GlobalScale::Provided(global_scale) if configuration.gradient_format().has_global_scale() => {
                         self.broadcast_scalar(&global_scale, [batch, value.r#type().dimension(1).value().unwrap(), k])?
                     }
                     GlobalScale::None
-                        if configuration.gradient_format.has_global_scale() && format.has_global_scale() =>
+                        if configuration.gradient_format().has_global_scale() && format.has_global_scale() =>
                     {
                         self.fill(value, 1.0)?
                     }
@@ -6674,8 +6683,8 @@ mod tests {
 
     #[test]
     fn test_block_scaled_dot_configuration() {
-        // The JAX defaults use the provided format everywhere, produce `f32` outputs, take provided global scales, and
-        // enable none of the options of the NVIDIA recipe.
+        // The initial input and gradient formats match, outputs are `f32`, global scales are provided, and none of
+        // the options of the NVIDIA recipe are enabled.
         let dimensions = DotDimensionNumbers::new(vec![1], vec![1], Vec::new(), Vec::new());
         let (nvfp4, mxfp8, mxfp4) = (BlockScaleFormat::nvfp4(), BlockScaleFormat::mxfp8(), BlockScaleFormat::mxfp4());
         let configuration = BlockScaledDotConfiguration::new(dimensions.clone(), mxfp8);
@@ -6740,6 +6749,34 @@ mod tests {
     }
 
     #[test]
+    fn test_block_scaled_dot_configuration_gradient_format() {
+        let dimensions = DotDimensionNumbers::matmul();
+        let (nvfp4, mxfp8, mxfp4) = (BlockScaleFormat::nvfp4(), BlockScaleFormat::mxfp8(), BlockScaleFormat::mxfp4());
+        let configuration = BlockScaledDotConfiguration::new(dimensions.clone(), mxfp8).with_rhs_format(nvfp4);
+        assert_eq!(configuration.gradient_format(), mxfp8);
+        assert!(configuration.quantized_backward());
+
+        let configuration = configuration.with_lhs_format(nvfp4);
+        assert_eq!(configuration.gradient_format(), nvfp4);
+        assert!(!configuration.quantized_backward());
+        let configuration = configuration.with_lhs_format(mxfp4);
+        assert_eq!(configuration.gradient_format(), mxfp4);
+        assert!(configuration.quantized_backward());
+
+        // An explicit gradient format is independent of input overrides and their builder order.
+        let overridden = configuration.clone().with_gradient_format(nvfp4).with_lhs_format(mxfp8);
+        assert_eq!(overridden.gradient_format(), nvfp4);
+        assert!(!overridden.quantized_backward());
+        assert_eq!(overridden, configuration.with_lhs_format(mxfp8).with_gradient_format(nvfp4));
+
+        let recipe = BlockScaledDotConfiguration::nvfp4_training(dimensions)
+            .with_lhs_format(mxfp8)
+            .with_rhs_format(mxfp4);
+        assert_eq!(recipe.gradient_format(), nvfp4);
+        assert!(recipe.quantized_backward());
+    }
+
+    #[test]
     fn test_block_scaled_dot_configuration_nvfp4_training() {
         // The NVIDIA recipe quantizes all three contractions with NVFP4 and current global scales, rounds gradients
         // stochastically, transforms the weight gradient inputs, and tiles the scales of the weight.
@@ -6748,6 +6785,7 @@ mod tests {
         assert_eq!(
             configuration,
             BlockScaledDotConfiguration::new(dimensions, BlockScaleFormat::nvfp4())
+                .with_gradient_format(BlockScaleFormat::nvfp4())
                 .with_global_scaling(BlockScaledGlobalScaling::Current)
                 .with_quantized_backward(true)
                 .with_stochastic_gradient_rounding(true)
@@ -7259,6 +7297,56 @@ mod tests {
     }
 
     #[test]
+    fn test_block_scaled_dot_gradient_format_full_precision_differentiation() {
+        // Changing the left format to NVFP4 also selects its unquantized backward policy and clipping mask.
+        let mxfp8 = BlockScaleFormat::new(2, DataType::F8E4M3FN, DataType::F8E8M0FNU);
+        let nvfp4 = BlockScaleFormat::new(4, DataType::F4E2M1FN, DataType::F8E4M3FN);
+        let configuration =
+            BlockScaledDotConfiguration::new(DotDimensionNumbers::matmul(), mxfp8).with_lhs_format(nvfp4);
+        assert!(!configuration.quantized_backward());
+        let function = block_scaled_dot::<EagerArrayContext>(configuration).unwrap();
+        let lhs = Array::matrix(1, 4, vec![3000.0f32, 0.0, 0.0, 0.0]).unwrap();
+        let rhs = cyclic_matrix(4, 1, &[1.0]);
+        let (output, pullback) = differentiate_at((lhs, rhs))
+            .vjp(|(lhs, rhs)| function.call(lhs, rhs, None, None, None, None))
+            .unwrap();
+        assert_eq!(output, Array::matrix(1, 1, vec![2688.0f32]).unwrap());
+        assert_eq!(
+            pullback.apply_materialized(Array::matrix(1, 1, vec![1.0f32]).unwrap()),
+            Ok((
+                Array::matrix(1, 4, vec![0.0f32, 1.0, 1.0, 1.0]).unwrap(),
+                Array::matrix(4, 1, vec![3000.0f32, 0.0, 0.0, 0.0]).unwrap(),
+            )),
+        );
+    }
+
+    #[test]
+    fn test_block_scaled_dot_gradient_format_quantized_differentiation() {
+        // The inherited MXFP8 gradient format uses blocks of two, including along the left free extent of two.
+        let nvfp4 = BlockScaleFormat::new(4, DataType::F4E2M1FN, DataType::F8E4M3FN);
+        let mxfp8 = BlockScaleFormat::new(2, DataType::F8E4M3FN, DataType::F8E8M0FNU);
+        let configuration =
+            BlockScaledDotConfiguration::new(DotDimensionNumbers::matmul(), nvfp4).with_lhs_format(mxfp8);
+        assert!(configuration.quantized_backward());
+        let function = block_scaled_dot::<EagerArrayContext>(configuration).unwrap();
+        let lhs = cyclic_matrix(2, 4, &[1.0]);
+        let rhs = Array::matrix(
+            4,
+            4,
+            vec![6.0f32, 0.0, 0.0, 0.0, 0.0, 6.0, 0.0, 0.0, 0.0, 0.0, 6.0, 0.0, 0.0, 0.0, 0.0, 6.0],
+        )
+        .unwrap();
+        let (output, pullback) = differentiate_at((lhs, rhs))
+            .vjp(|(lhs, rhs)| function.call(lhs, rhs, None, None, None, None))
+            .unwrap();
+        assert_eq!(output, cyclic_matrix(2, 4, &[6.0]));
+        assert_eq!(
+            pullback.apply_materialized(cyclic_matrix(2, 4, &[1.0])),
+            Ok((cyclic_matrix(2, 4, &[6.0]), cyclic_matrix(4, 4, &[2.0]))),
+        );
+    }
+
+    #[test]
     fn test_block_scaled_dot_dimension_numbers() {
         // Several contracting dimensions, listed in different orders on both sides, merge into one blocked dimension,
         // and batching dimensions need not lead. Every value is `±6`, so every block scale is `1` and quantization is
@@ -7510,6 +7598,16 @@ mod tests {
             )),
         ));
         assert!(matches!(
+            block_scaled_dot::<EagerArrayContext>(configuration.clone().with_rhs_format(BlockScaleFormat::new(
+                4,
+                DataType::F4E2M1FN,
+                DataType::F32,
+            ))),
+            Err(error) if error == ProgramError::from(TypeError::invalid(
+                "`block_scaled_dot` right format does not support scale data type `f32`",
+            )),
+        ));
+        assert!(matches!(
             block_scaled_dot::<EagerArrayContext>(configuration.clone().with_gradient_format(BlockScaleFormat::new(
                 1,
                 DataType::F4E2M1FN,
@@ -7649,6 +7747,71 @@ mod tests {
             pullback.apply_materialized(cyclic_matrix(2, 3, &[1.0])),
             Err(ProgramError::from(TypeError::invalid(
                 "`block_scaled_dot` right free extent 3 is not a positive multiple of block size 4",
+            ))),
+        );
+    }
+
+    #[test]
+    fn test_block_scaled_dot_gradient_format_validation() {
+        let nvfp4 = BlockScaleFormat::new(4, DataType::F4E2M1FN, DataType::F8E4M3FN);
+        let mxfp8 = BlockScaleFormat::new(2, DataType::F8E4M3FN, DataType::F8E8M0FNU);
+        let configuration =
+            BlockScaledDotConfiguration::new(DotDimensionNumbers::matmul(), nvfp4).with_lhs_format(mxfp8);
+
+        // Neither Hadamard input uses a global scale after the left format changes to MXFP8.
+        assert_eq!(
+            block_scaled_dot::<EagerArrayContext>(configuration.clone().with_hadamard_transform(true))
+                .map(|function| function.configuration().gradient_format()),
+            Ok(mxfp8),
+        );
+        let function = block_scaled_dot::<EagerArrayContext>(configuration).unwrap();
+        assert_eq!(
+            function.call(
+                cyclic_matrix(2, 4, &[6.0]),
+                cyclic_matrix(4, 4, &[1.0]),
+                None,
+                None,
+                Some(Array::scalar(1.0f32).unwrap()),
+                None,
+            ),
+            Err(ProgramError::from(TypeError::invalid(
+                "`block_scaled_dot` gradient global scale requires provided global scaling and a format with \
+                 `f8e4m3fn` scales",
+            ))),
+        );
+
+        // An inherited NVFP4 gradient format accepts a provided gradient global scale.
+        let function = block_scaled_dot::<EagerArrayContext>(
+            BlockScaledDotConfiguration::new(DotDimensionNumbers::matmul(), mxfp8)
+                .with_lhs_format(nvfp4)
+                .with_quantized_backward(true),
+        )
+        .unwrap();
+        assert_eq!(
+            function.call(
+                cyclic_matrix(2, 4, &[6.0]),
+                cyclic_matrix(4, 4, &[1.0]),
+                None,
+                None,
+                Some(Array::scalar(1.0f32).unwrap()),
+                None,
+            ),
+            Ok(cyclic_matrix(2, 4, &[24.0])),
+        );
+
+        // The inherited block size applies to the output cotangent's right free extent during differentiation.
+        let function = block_scaled_dot::<EagerArrayContext>(
+            BlockScaledDotConfiguration::new(DotDimensionNumbers::matmul(), mxfp8)
+                .with_lhs_format(BlockScaleFormat::new(4, DataType::F8E4M3FN, DataType::F8E8M0FNU)),
+        )
+        .unwrap();
+        let (_, pullback) = differentiate_at((cyclic_matrix(4, 4, &[1.0]), cyclic_matrix(4, 2, &[1.0])))
+            .vjp(|(lhs, rhs)| function.call(lhs, rhs, None, None, None, None))
+            .unwrap();
+        assert_eq!(
+            pullback.apply_materialized(cyclic_matrix(4, 2, &[1.0])),
+            Err(ProgramError::from(TypeError::invalid(
+                "`block_scaled_dot` right free extent 2 is not a positive multiple of block size 4",
             ))),
         );
     }
