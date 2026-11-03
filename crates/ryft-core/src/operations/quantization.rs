@@ -1833,8 +1833,6 @@ impl BlockScaledDotConfiguration {
     }
 }
 
-// TODO(eaplatanios): Review from here onwards.
-
 /// Differentiable block-scaled generalized dot product, built by [`block_scaled_dot`]. It quantizes its
 /// unquantized inputs with [`BlockQuantize`] and contracts them with [`ScaledDot`] in its primal, and its reverse
 /// mode rule implements a quantization-aware gradient policy, which is how models train with block-scaled formats
@@ -1872,29 +1870,30 @@ where
     D::Operation: 'static,
     DomainTracingContext<D>: StagingContext<Type = ArrayType, Constant = D::Constant, Operation = D::Operation>,
 {
-    /// Returns the configuration of this [`BlockScaledDot`].
+    /// Returns the [`BlockScaledDotConfiguration`] of this [`BlockScaledDot`].
     #[inline]
     pub fn configuration(&self) -> &BlockScaledDotConfiguration {
         &self.configuration
     }
 
-    /// Validates the inputs, aligns their manual variation, and stages one block-scaled dot product call, whose output
-    /// has the [accumulation type](BlockScaledDotConfiguration::accumulation_type) and the shape of the corresponding
-    /// [`Dot`] output.
+    /// Validates the provided inputs, aligns their manual variation, and stages one block-scaled dot product call,
+    /// whose output has the [accumulation type](BlockScaledDotConfiguration::accumulation_type) and the shape of the
+    /// corresponding [`Dot`] output.
     ///
     /// The left-hand side and right-hand side inputs must be real floating-point arrays with static shapes and the
     /// extents that the dimension numbers require. They are quantized at `f64` when either is `f64`, and at `f32`
-    /// otherwise, whereas JAX always quantizes at `f32`. The product of the contracting extents must be a positive
-    /// multiple of the block sizes of both input formats, and tiled right scales additionally require that of the free
-    /// extents of the right-hand side input. Quantized backward contractions block the products of the free extents of
-    /// both inputs, so differentiation requires each of them to be a multiple of the gradient format's block size and
-    /// of the block size of its own input's format (and of `16` for Hadamard transforms of the left free extents).
-    /// Global scales must be rank-0 real floating-point arrays that are only present for formats with global scales
-    /// under [`BlockScaledGlobalScaling::Provided`], and a gradient global scale additionally requires quantized
-    /// backward contractions. A random generator state must be present exactly when stochastic gradient rounding is
-    /// enabled and must have a generator state type (refer to [`RandomAlgorithm::from_state_type`]).
+    /// otherwise. The product of the contracting extents must be a positive multiple of the block sizes of both input
+    /// formats, and tiled right scales additionally require that of the free extents of the right-hand side input.
+    /// Quantized backward contractions block the products of the free extents of both inputs, so differentiation
+    /// requires each of them to be a multiple of the gradient format's block size and of the block size of its own
+    /// input's format (and of `16` for Hadamard transforms of the left free extents). Global scales must be rank-`0`
+    /// real floating-point arrays that are only present for formats with global scales under
+    /// [`BlockScaledGlobalScaling::Provided`], and a gradient global scale additionally requires quantized backward
+    /// contractions. A random generator state must be present exactly when stochastic gradient rounding is enabled
+    /// and must have a generator state type. Refer to [`RandomAlgorithm::from_state_type`] for more information.
     ///
-    /// Only `lhs` and `rhs` are differentiable. The global scales and random state receive structural zero cotangents.
+    /// Note that this function is differentiable only with respect to `lhs` and `rhs`. The global scales and random
+    /// state receive structural zero cotangents.
     ///
     /// # Parameters
     ///
@@ -1904,15 +1903,15 @@ where
     ///   - `rhs_global_scale`: Optional rank-0 global scale of the right-hand side input.
     ///   - `gradient_global_scale`: Optional rank-0 global scale of the output cotangents in quantized backward
     ///     contractions.
-    ///   - `random_state`: Optional random generator state (refer to [`Random`]) that seeds stochastic gradient rounding.
-    ///     The call does not return an advanced state, so each call needs a fresh state (e.g., split from the caller's
-    ///     generator), or it repeats the same rounding noise.
+    ///   - `random_state`: Optional random generator state (refer to [`Random`] for more information) that seeds
+    ///     stochastic gradient rounding. The call does not return an advanced state, so each call needs a fresh state
+    ///     (e.g., split from the caller's generator), or it will use the same rounding noise multiple times.
     ///
     /// # Errors
     ///
     /// Returns a [`ProgramError`] if the inputs do not meet these requirements or if a composed operation fails while
     /// tracing or evaluating a rule.
-    pub fn call<C, V>(
+    pub fn call<V, C>(
         &self,
         lhs: V,
         rhs: V,
@@ -1922,8 +1921,8 @@ where
         random_state: Option<V>,
     ) -> Result<V, ProgramError>
     where
-        C: CompositeCallContext<Type = ArrayType, Value = V, Constant = D::Constant, Operation = D::Operation>,
         V: Value<Type = ArrayType, Domain = C> + ManualVariationAlignment<ArrayType>,
+        C: CompositeCallContext<Type = ArrayType, Value = V, Constant = D::Constant, Operation = D::Operation>,
         CustomRuleDefinition<C::Constant, C::Operation>: CompositeVjp<
                 SymbolicZeroVjp<
                     D::Constant,
@@ -1949,20 +1948,22 @@ where
             let Some(global_scale) = global_scale else { continue };
             if configuration.global_scaling != BlockScaledGlobalScaling::Provided || !format.has_global_scale() {
                 return Err(TypeError::invalid(format!(
-                    "`block_scaled_dot` {name} global scale requires provided global scaling and a format with \
-                     `f8e4m3fn` scales",
+                    "`block_scaled_dot` {name} global scale requires provided global scaling and a format \
+                     with `f8e4m3fn` scales",
                 ))
                 .into());
             }
+
             let r#type = global_scale.r#type();
             if r#type.rank() != 0 || !r#type.data_type().is_floating_point() || !r#type.data_type().is_real() {
                 return Err(TypeError::invalid(format!(
-                    "`block_scaled_dot` {name} global scale must be a rank-0 real floating-point array but got \
-                     `{type}`",
+                    "`block_scaled_dot` {name} global scale must be a rank-0 real floating-point array \
+                     but got `{type}`",
                 ))
                 .into());
             }
         }
+
         let requires_random_state = configuration.stochastic_gradient_rounding;
         if random_state.is_some() != requires_random_state {
             return Err(TypeError::invalid(if requires_random_state {
@@ -1972,15 +1973,18 @@ where
             })
             .into());
         }
+
         if let Some(random_state) = &random_state {
             RandomAlgorithm::from_state_type(&random_state.r#type())?;
         }
+
         if gradient_global_scale.is_some() && !configuration.quantized_backward() {
             return Err(TypeError::invalid(
                 "`block_scaled_dot` gradient global scales require quantized backward contractions",
             )
             .into());
         }
+
         // Each vector contains zero or one value, preserving the presence of each optional input in the composite's
         // parameter structure without a separate input type.
         let inputs = (
@@ -1996,31 +2000,27 @@ where
     }
 }
 
-/// Creates a differentiable block-scaled generalized dot product (refer to [`BlockScaledDot`]), the analogue of
-/// `jax.nn.scaled_dot_general`. Its primal quantizes both inputs along their contracting dimensions with the formats
-/// of `configuration` and contracts the resulting representations with [`ScaledDot`], including their global scales.
-/// Its reverse mode rule saves the inputs at high precision and computes the input gradients with one of two policies.
+/// Creates a differentiable block-scaled generalized dot product operation, which is the Ryft analogue of JAX's
+/// [`jax.nn.scaled_dot_general`](https://docs.jax.dev/en/latest/_autosummary/jax.nn.scaled_dot_general.html). Its
+/// primal quantizes both inputs along their contracting dimensions with the formats of `configuration` and contracts
+/// the resulting representations with [`ScaledDot`], including their global scales. Its reverse mode differentiation
+/// rule saves the inputs at high precision and computes the input gradients with one of two policies:
 ///
-///   - **Unquantized backward contractions** (the JAX default for NVFP4 gradients) contract the output cotangent with
-///     the other input at `f32` (or `f64`), so quantization acts as a straight-through estimator. When the gradient
-///     format uses global scales (the condition of JAX), gradients of values of inputs whose formats use global scales
-///     and that the forward quantization clipped (i.e., whose magnitudes exceed `global_scale · element_max · 448`)
-///     are zero.
-///   - **Quantized backward contractions** (the JAX default for MX gradients and the NVIDIA recipe) quantize the
-///     output cotangent with the gradient format and the other input with its own format along the contracting
-///     dimension of each gradient contraction, and contract them with [`ScaledDot`]. The configuration can add
-///     stochastic gradient rounding, Hadamard transforms of the weight gradient inputs, and tiled right scales.
+///   - **Unquantized Backward Contractions:** Contract the output cotangent with the other input at `f32` (or `f64`),
+///     so that quantization acts as a straight-through estimator. When the gradient format uses global scales,
+///     gradients of values of inputs whose formats use global scales and that the forward quantization clipped
+///     (i.e., whose magnitudes exceed `global_scale · element_max · 448`) are zero.
+///   - **Quantized Backward Contractions:** Quantize the output cotangent with the gradient format and the other input
+///     with its own format along the contracting dimension of each gradient contraction, and contract them with
+///     [`ScaledDot`]. The configuration can add stochastic gradient rounding, Hadamard transforms of the weight
+///     gradient inputs, and tiled right scales.
 ///
-/// Like JAX, both policies first normalize every input to the rank-three layout `[batch, free, contracting]` by
-/// transposing and merging its dimensions, so several contracting dimensions form one blocked dimension. That dimension
-/// follows the listed order of the contracting dimensions, while JAX merges them in ascending axis order on each side
-/// (which pairs mismatched dimensions when the two sides list them in different orders). Forward mode differentiation
-/// is not supported, as with the `custom_vjp` of JAX. The function also differs from JAX where [`BlockQuantize`] does
-/// (refer to its documentation), because MX scales round down to the OCP power of two rather than up and NVFP4 scales
-/// never round to zero. JAX takes the clipping thresholds of both inputs from the left format, while this function
-/// uses the format of each input. Backward contractions accumulate at the compute type, whereas JAX accumulates them
-/// at the output type. MX forward contractions with an output type at which [`ScaledDotOperation`] cannot accumulate
-/// (e.g., `f16`) accumulate at the compute type and convert afterwards.
+/// Both policies first normalize every input to the rank-three layout `[batch, free, contracting]` by transposing and
+/// merging its dimensions, so several contracting dimensions form one blocked dimension. That dimension follows the
+/// listed order of the contracting dimensions. Clipping thresholds use each input's own format. Backward contractions
+/// accumulate at the compute type (i.e., `f64` when either input is `f64` and `f32` otherwise). Microscaling (i.e., MX)
+/// forward contractions with an output type at which [`ScaledDotOperation`] cannot accumulate (e.g., `f16`) accumulate
+/// at the compute type and convert afterwards. Forward mode differentiation is not supported.
 ///
 /// # Example
 ///
@@ -2030,8 +2030,8 @@ where
 /// #     DotDimensionNumbers, EagerContext, Reduce, ReductionKind, Transpose, block_scaled_dot, differentiate_at,
 /// # };
 /// # fn main() -> Result<(), Box<dyn std::error::Error>> {
-/// // NVFP4 with blocks of four values. Both contracting blocks below contain `6`, so their scales are `1` and these
-/// // grid values quantize exactly.
+/// // NVFP4 with blocks of four values. Both contracting blocks below contain `6`, so their scales are `1`
+/// // and these grid values quantize exactly.
 /// let format = BlockScaleFormat::new(4, DataType::F4E2M1FN, DataType::F8E4M3FN);
 /// let configuration = BlockScaledDotConfiguration::new(DotDimensionNumbers::matmul(), format);
 /// let function = block_scaled_dot::<EagerContext<Array, ArrayOperation<Array>>>(configuration)?;
@@ -2087,58 +2087,74 @@ where
     let primal_configuration = configuration.clone();
     let forward_configuration = configuration.clone();
     let backward_configuration = configuration.clone();
-    let primal = move |(lhs, rhs, [lhs_global_scale, rhs_global_scale, _, _]): (
-        DomainTracer<D>,
-        DomainTracer<D>,
-        [Vec<DomainTracer<D>>; 4],
-    )|
-          -> Result<_, ProgramError> {
-        BlockScaledDotRules::new(&primal_configuration, &lhs, &rhs)?.forward(
-            &lhs,
-            &rhs,
-            lhs_global_scale.first(),
-            rhs_global_scale.first(),
+    Ok(BlockScaledDot {
+        configuration,
+        function: composite(
+            move |(lhs, rhs, [lhs_global_scale, rhs_global_scale, _, _]): (
+                DomainTracer<D>,
+                DomainTracer<D>,
+                [Vec<DomainTracer<D>>; 4],
+            )|
+                  -> Result<_, ProgramError> {
+                // The primal quantizes the left-hand side and right-hand side inputs and contracts them using their
+                // optional global scales. The gradient global scale and random state affect only the backward rule.
+                BlockScaledDotRules::new(&primal_configuration, &lhs, &rhs)?.forward(
+                    &lhs,
+                    &rhs,
+                    lhs_global_scale.first(),
+                    rhs_global_scale.first(),
+                )
+            },
         )
-    };
-    let forward =
-        move |inputs: (DomainTracer<D>, DomainTracer<D>, [Vec<DomainTracer<D>>; 4])| -> Result<_, ProgramError> {
-            let (lhs, rhs, [lhs_global_scale, rhs_global_scale, _, _]) = &inputs;
-            let output = BlockScaledDotRules::new(&forward_configuration, lhs, rhs)?.forward(
-                lhs,
-                rhs,
-                lhs_global_scale.first(),
-                rhs_global_scale.first(),
-            )?;
-            Ok((output, inputs))
-        };
-    let backward = move |inputs: (DomainTracer<D>, DomainTracer<D>, [Vec<DomainTracer<D>>; 4]),
-                         seed: MaybeZero<DomainTracer<D>>|
-          -> Result<_, ProgramError> {
-        let mut cotangents = inputs
-            .clone()
-            .try_map_parameters(|value| Ok::<_, ProgramError>(MaybeZero::Zero(value.r#type().cotangent()?)))?;
-        if let MaybeZero::Value(seed) = seed {
-            let (lhs, rhs, [lhs_global_scale, rhs_global_scale, gradient_global_scale, random_state]) = &inputs;
-            let (lhs_cotangent, rhs_cotangent) = BlockScaledDotRules::new(&backward_configuration, lhs, rhs)?
-                .backward(
+        .with_symbolic_zero_vjp(
+            move |inputs: (DomainTracer<D>, DomainTracer<D>, [Vec<DomainTracer<D>>; 4])| -> Result<_, ProgramError> {
+                // Save the original inputs as residuals alongside the primal output. The backward rule needs these
+                // unquantized values for its contractions and clipping masks, together with the optional scales and
+                // random state.
+                let (lhs, rhs, [lhs_global_scale, rhs_global_scale, _, _]) = &inputs;
+                let output = BlockScaledDotRules::new(&forward_configuration, lhs, rhs)?.forward(
                     lhs,
                     rhs,
                     lhs_global_scale.first(),
                     rhs_global_scale.first(),
-                    gradient_global_scale.first(),
-                    random_state.first(),
-                    &seed,
                 )?;
-            cotangents.0 = MaybeZero::Value(lhs_cotangent);
-            cotangents.1 = MaybeZero::Value(rhs_cotangent);
-        }
-        Ok(cotangents)
-    };
-    Ok(BlockScaledDot {
-        configuration,
-        function: composite(primal).with_symbolic_zero_vjp(forward, backward).with_name(BLOCK_SCALED_DOT_NAME),
+                Ok((output, inputs))
+            },
+            move |inputs: (DomainTracer<D>, DomainTracer<D>, [Vec<DomainTracer<D>>; 4]),
+                  seed: MaybeZero<DomainTracer<D>>|
+                  -> Result<_, ProgramError> {
+                // Start with structural zeros in the same parameter structure as the inputs. Global scales and the
+                // random state retain these zeros because only the left-hand side and right-hand side inputs are
+                // differentiable.
+                let mut cotangents = inputs
+                    .clone()
+                    .try_map_parameters(|value| Ok::<_, ProgramError>(MaybeZero::Zero(value.r#type().cotangent()?)))?;
+
+                // A structural zero seed needs no backward contraction. For a value seed, apply the configured
+                // backward policy and replace only the left-hand side and right-hand side input cotangents.
+                if let MaybeZero::Value(seed) = seed {
+                    let (lhs, rhs, [lhs_global_scale, rhs_global_scale, gradient_global_scale, random_state]) = &inputs;
+                    let (lhs_cotangent, rhs_cotangent) = BlockScaledDotRules::new(&backward_configuration, lhs, rhs)?
+                        .backward(
+                        lhs,
+                        rhs,
+                        lhs_global_scale.first(),
+                        rhs_global_scale.first(),
+                        gradient_global_scale.first(),
+                        random_state.first(),
+                        &seed,
+                    )?;
+                    cotangents.0 = MaybeZero::Value(lhs_cotangent);
+                    cotangents.1 = MaybeZero::Value(rhs_cotangent);
+                }
+                Ok(cotangents)
+            },
+        )
+        .with_name(BLOCK_SCALED_DOT_NAME),
     })
 }
+
+// TODO(eaplatanios): Review from here onwards.
 
 /// Name of the composite calls that [`BlockScaledDot`] stages.
 const BLOCK_SCALED_DOT_NAME: &str = "block_scaled_dot";
