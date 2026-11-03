@@ -756,6 +756,7 @@ mod tests {
     use crate::arrays::{Array, ArrayType, DataType};
     use crate::parameters::Placeholder;
     use crate::programs::regions::RegionSlot;
+    use crate::programs::types::TypedProgram;
     use crate::programs::{Operation, ProgramBuilder, Region, RegionId, RegionRef, Value};
     use crate::specialization::SpecializationCacheStatistics;
     use crate::tests::{IdentityTransform, TestRegionOperation, hash_of};
@@ -1228,7 +1229,7 @@ mod tests {
         assert!(!source.entry_region().transform_cache().ptr_eq(&artifact.entry_region().transform_cache));
         drop(source);
         assert!(!source_cache.is_alive());
-        assert_eq!(artifact.output_types(), &[ArrayType::scalar(DataType::F64)]);
+        assert_eq!(artifact.output_types().into_owned(), &[ArrayType::scalar(DataType::F64)]);
     }
 
     #[test]

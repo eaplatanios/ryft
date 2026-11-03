@@ -782,6 +782,24 @@ impl<V: Typed + ?Sized> Typed for &V {
     }
 }
 
+/// Program-level counterpart of [`Typed`], which exposes the flat [`Type`] signature of a program. Besides
+/// [`Program`](crate::Program), this covers backend-specific artifacts produced from programs (e.g., the lowered and
+/// compiled programs of a [`CompilationDomain`](crate::CompilationDomain)), so that generic code can obtain their
+/// signatures directly. The signature covers every flat input and output of the program, including any leading inputs
+/// that hold lifted captures.
+pub trait TypedProgram {
+    /// [`Type`] family of the inputs and outputs of this program.
+    type Type: Type;
+
+    /// Returns the [`Type`]s of the inputs of this program, in order. Like [`Typed::r#type`], this function returns
+    /// a [`Cow`] so that implementors can lend out stored types by borrow or compute them on the fly.
+    fn input_types(&self) -> Cow<'_, [Self::Type]>;
+
+    /// Returns the [`Type`]s of the outputs of this program, in order. Like [`Typed::r#type`], this function returns
+    /// a [`Cow`] so that implementors can lend out stored types by borrow or compute them on the fly.
+    fn output_types(&self) -> Cow<'_, [Self::Type]>;
+}
+
 /// Returns the declared type identities whose equality relationships are not guaranteed by the supplied input types.
 /// For example, `[f32[n], f32[n]]` declares that two arrays have the same length. Actual types `[f32[3], f32[3]]`
 /// prove that relationship, while `[f32[n], f32[3]]` leave the first array's length unknown. A transform removing the
