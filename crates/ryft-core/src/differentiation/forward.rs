@@ -222,30 +222,38 @@ fn can_materialize_zero_tangent_from_type<T: Type>(primal_type: &T, tangent_type
 ///
 /// # Differentiation Pipeline
 ///
-/// ```mermaid
-/// %%{init: {"themeCSS": ".nodeLabel code { white-space: nowrap !important; }"}}%%
-/// flowchart TD
-///   source["Closure or Immutable Program"] --> direct["&lt;code&gt;jvp&lt;/code&gt;: Primals plus Tangents"]
-///   direct --> dual_outputs["Primal Outputs plus Output Tangents"]
-///   direct --> forward_jacobian["Forward Jacobian via Batched Input Directions"]
-///   source --> linearize["Linearize with Unknown Tangents"]
-///   linearize --> primal["Primal Program: x to y plus Residuals"]
-///   linearize --> tangent["Linear Tangent Program: dx plus Residuals to dy"]
-///   primal --> residuals["Evaluate Once and Save Residual Values"]
-///   tangent --> pushforward["Reusable &lt;code&gt;Pushforward&lt;/code&gt;"]
-///   residuals --> pushforward
-///   tangent --> transpose["Transpose in Reverse Data Flow Order"]
-///   transpose --> pullback["Reusable &lt;code&gt;Pullback&lt;/code&gt;"]
-///   residuals --> pullback
-///   pullback --> reverse_jacobian["Reverse Jacobian via Batched Output Cotangents"]
-///   pullback --> gradient["Scalar-Output Gradient by Seeding One"]
-///   gradient --> hessian["Hessian by Differentiating the Gradient"]
+/// ```text
+/// ┌───────────────────────────┐    ┌────────────────────────────┐    ┌───────────────────────────┐
+/// │ Closure or Program        ├───▶│ Linearize (Unknown `ẋ`)    ├───▶│ Primal: `x ↦ (y, r)`      │
+/// └─────────────┬─────────────┘    └────────────┬───────────────┘    └─────────────┬─────────────┘
+///               │                               │ tangent                          │ evaluate once
+///               ▼                               ▼                                  ▼
+/// ┌───────────────────────────┐    ┌────────────────────────────┐    ┌───────────────────────────┐
+/// │ `jvp(x, ẋ)`               ├─┐  │ `(live(ẋ), r) ↦ live(ẏ)`   ├─┐  │ Saved Residuals `r`       ├─┐
+/// └─────────────┬─────────────┘ │  └────────────┬───────────────┘ │  └─────────────┬─────────────┘ │
+///               ▼               │               ▼                 │                ▼               │
+/// ┌───────────────────────────┐ │  ┌────────────────────────────┐ │  ┌───────────────────────────┐ │
+/// │ Outputs `y` and `ẏ`       │ │  │ Transpose Data Flow        │ └─▶│ Reusable `Pushforward`    │ │
+/// └───────────────────────────┘ │  └────────────┬───────────────┘    └───────────────────────────┘ │
+///                               │               ▼                                                  │
+/// ┌───────────────────────────┐ │  ┌────────────────────────────┐                                  │
+/// │ Batched Forward Jacobian  │◀┘  │ Reusable `Pullback`        │◀─────────────────────────────────┘
+/// └───────────────────────────┘    └────────────┬──────────┬────┘
+///                                               │ seed one └───────────────────────┐
+///                                               ▼                                  ▼
+///                                  ┌────────────────────────────┐    ┌───────────────────────────┐
+///                                  │ Scalar Output Gradient     │    │ Batched Reverse Jacobian  │
+///                                  └────────────┬───────────────┘    └───────────────────────────┘
+///                                               │ differentiate
+///                                               ▼
+///                                  ┌────────────────────────────┐
+///                                  │ Hessian                    │
+///                                  └────────────────────────────┘
 /// ```
 ///
 /// The diagram includes both direct forward mode and the reverse mode path built from this structural split. Concrete
 /// [`Pushforward`] and [`Pullback`](crate::Pullback) callables additionally retain residual values from one
 /// linearization point; this [`Linearization`] itself does not.
-#[cfg_attr(doc, ryft_macros::mermaid)]
 #[derive(Clone, Debug)]
 pub struct Linearization<V: Value, O: Operation<Type = V::Type>> {
     /// Nonlinear primal sub-program `x ↦ (y, r)`. It takes the primal inputs `x` and produces the primal outputs

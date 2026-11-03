@@ -18,8 +18,9 @@ code comments. Preserve the documented contract, technical rationale, and links 
   own description rather than relying on a shared notation explanation in a trait or module docstring.
 - When simplifying existing documentation, preserve its architectural rationale, invariants, and relevant API links.
   Improve wording without discarding useful information merely to shorten the text.
-- When documenting `ryft` behavior, prefer stating the concrete semantics directly instead of saying that the code
-  "matches" another system such as JAX unless the external comparison is itself the point of the documentation.
+- When documenting `ryft` behavior or defaults, state the concrete semantics directly. Explain what optional values
+  such as `None` select instead of describing them as following another system. Keep external comparisons when the
+  comparison itself is the point of the documentation.
 - Link to external official documentation when relevant (e.g., for MLIR, StableHLO, PJRT, XLA, Rustonomicon, etc.).
 - When linking external documentation, prefer the most precise relevant page/section instead of just using top-level
   project pages.
@@ -51,11 +52,16 @@ code comments. Preserve the documented contract, technical rationale, and links 
   published-API compatibility reason that the user explicitly asks for.
 - For callback- and threading-heavy code, explain the lifetime/ownership invariants in comments. You can refer to
   documentation strings in the core traits of the `ryft-pjrt` crate for examples of this.
-- When using ASCII diagrams or Markdown tables in doc comments, align columns for source readability and indent the
-  block content slightly so that the raw Rust file remains easy to scan.
-- When a `rustdoc` diagram would materially improve documentation clarity, prefer a rendered Mermaid diagram via
-  `#[cfg_attr(doc, ryft_macros::mermaid)]` over a large ASCII graph, while keeping any supporting tables aligned in the
-  raw source.
+- When using Markdown tables in doc comments, align columns for source readability and indent the block content
+  slightly so that the raw Rust file remains easy to scan.
+- When a `rustdoc` diagram would materially improve documentation clarity, prefer a box-drawing diagram in a
+  ```` ```text ```` block (e.g., `┌─┐`, `├`, `┬`, `▶`, and `▼`) over a rendered Mermaid diagram, so that it reads the
+  same in the raw source and in rendered documentation. Use solid lines for the main flow and dotted lines (`┄` and
+  `┆`) for optional, best-effort, or failure paths, and label edges with the vocabulary of the documented API. Wrap the
+  names of functions, types, traits, and other Rust items in backticks, as in prose. Keep the diagram within 100
+  columns, and prefer 95, which is what rustdoc's 960 px content width fits without horizontal scrolling. Lay out
+  non-trivial diagrams on a character grid with a script rather than by hand, and check the alignment in the rendered
+  page. Reserve `#[cfg_attr(doc, ryft_macros::mermaid)]` for graphs too dense to lay out legibly within that width.
 - When a large `rustdoc` table needs color or layout that Markdown cannot express cleanly, prefer theme-aware raw HTML
   with colors derived from rustdoc CSS variables instead of hard-coded light-theme colors, and prefer a small local
   `<style>` block with namespaced classes over repeating large inline styles on every cell.
@@ -84,6 +90,9 @@ code comments. Preserve the documented contract, technical rationale, and links 
   readability-driven sentence breaks.
 - In documentation strings, use "function" for callable APIs, including methods, rather than distinguishing methods
   from free functions in prose.
+- In documentation strings, refer to binary input roles as "left-hand side input" and "right-hand side input".
+- In prose, write array ranks with plain numerals (e.g., "rank-0" and "rank-3"), without backticks or spelled-out
+  numbers.
 - For arrays and types, use "shape" for an array's shape, "extent" for the size of a dimension (static or runtime), and
   "dimension" for the dimension itself. Do not introduce "geometry" or other new umbrella nouns for these concepts.
   GPU backend crates keep "geometry" only in its standard CUDA meaning (e.g., launch/grid or descriptor geometry).

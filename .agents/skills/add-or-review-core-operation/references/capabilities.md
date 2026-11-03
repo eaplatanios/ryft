@@ -19,27 +19,30 @@ different role; inspect their existing contract instead of mechanically giving t
 
 - Every value-level capability trait, including dynamic-shape, dimension, reference, and alignment capabilities, is
   universe-parameterized (`X<T = <Self as Capability>::Universe>: Capability + Sized`, where the universe is a coherence
-  marker that need not be a `Type`, and host types are their own universe), with any other parameters (e.g.,
-  `Transform`, `Binding`, or `Output`) before the universe, and every capability bundle has the same universe parameter
-  with a blanket implementation.
+  marker that need not be a `Type`, and host types are their own universe), and every capability bundle has the same
+  universe parameter with a blanket implementation. When the API exposes its underlying value representation as a
+  separate `V`, declare `T` before `V`. If `V` has no meaningful default for the receiver, require both parameters and
+  document the exception to `#[capability]`, whose validation requires a default universe parameter. Other parameters
+  (e.g., `Transform`, `Binding`, or `Output`) precede the universe.
 - Never pin a capability's receiver to one universe through a super-trait such as `Value<Type = ArrayIrType>`:
   provided functions bound a type view instead (e.g., `Self: Value<Type: ArrayMemberType + DimensionMemberType>`).
   Implementations name their universe explicitly (e.g., `DynamicPad<ArrayIrType>`), and a blanket implementation that
   serves several universes introduces the universe as its own type parameter
   (e.g., `impl<U, V: Value<Type = U>> X<U> for V`).
-- Capability traits carry the `#[capability]` attribute that checks those conventions, and declare exactly one array IR
-  strategy: a projection through `#[capability(projection(ArrayIrType => ArrayType))]` (S1), lifting the operation into
-  the array IR family plus an eager `ArrayIrValue` delegation (S2), an existing family-native path (S3), or member-kind
-  dispatch through an operation provider (S4).
+- Except for the explicit `T, V` APIs above, capability traits carry the `#[capability]` attribute that checks those
+  conventions. Every capability declares exactly one array IR strategy: a projection through
+  `#[capability(projection(ArrayIrType => ArrayType))]` (S1), lifting the operation into the array IR family plus an
+  eager `ArrayIrValue` delegation (S2), an existing family-native path (S3), or member-kind dispatch through an
+  operation provider (S4).
 - Give capability functions default bodies only when the default is correct for every implementor (e.g., by composing
   required functions), and make implementor-dependent functions required instead.
 - Only elementwise capabilities lift to `Parameterized` structures, through the `Parameterwise<P, S>` implementations
   that `define_elementwise_capability!` generates (and `impl_parameterwise_operator!` for their `std::ops` operators,
   invoked right after the corresponding `impl_tracer_operator!`), never through derive-generated code.
-- In generic bounds, use each capability's default universe (or a bundle such as `ArrayOperations`) and never mix it
-  with an explicitly named universe for the same value, and never pin `Typed<Type = T>` next to capability bounds at
-  `T`; the trait solver cannot equate `<V as Capability>::Universe` with `<V as Typed>::Type` for generic or projected
-  `V`, so mixed bounds fail to unify and pinned equalities make bounds on `V::Type` unusable.
+- In generic bounds, use each capability's default universe where available (or a bundle such as `ArrayOperations`) and
+  never mix it with an explicitly named universe for the same value, and never pin `Typed<Type = T>` next to capability
+  bounds at `T`; the trait solver cannot equate `<V as Capability>::Universe` with `<V as Typed>::Type` for generic or
+  projected `V`, so mixed bounds fail to unify and pinned equalities make bounds on `V::Type` unusable.
 - Never bound a universe parameter by `Type`, including in bundle blanket implementations, because host types are
   universes too, and keep compile-time assertions that host types satisfy the bundles whose members they implement.
 - Every universe's implementation of a capability must honor the same documented contract, including edge cases such as
@@ -47,7 +50,8 @@ different role; inspect their existing contract instead of mechanically giving t
 - Document the universe parameter of every trait bounded by `Capability`, including bundles and macro-generated
   capabilities, with a paragraph that starts with "The universe parameter `T` defaults to the `Capability` universe of
   the implementor, so that ..." and names the universes that actually implement it (e.g., `ArrayType` and
-  `ArrayIrType`). Place it as the last paragraph before the first section heading of the trait documentation.
+  `ArrayIrType`). For explicit `T, V` APIs, describe the supported universes without claiming a default. Place this
+  paragraph last before the first section heading of the trait documentation.
 
 ## Array IR Projection and Backend State
 

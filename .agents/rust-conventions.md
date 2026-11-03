@@ -167,6 +167,7 @@ ownership, and synchronization. These shared rules also apply to test code; deta
 - In diagnostics, surround operation names, identifiers, types, attributes, command-line flags, and other literal code
   fragments with backticks, following Rust compiler conventions. Do not use single quotes for code references; reserve
   them for syntax that actually contains single quotes, such as character literals, lifetimes, or serialized formats.
+- Use "compilation" or "JIT compilation" in diagnostic prose. Reserve lowercase `jit` for a backticked function name.
 - Custom error variants typically carry a `message` and sometimes a `backtrace` via `Backtrace::capture().to_string()`.
 - `unwrap()`/`expect()` are allowed only:
   - in tests, or

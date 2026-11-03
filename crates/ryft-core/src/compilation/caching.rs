@@ -782,7 +782,16 @@ impl<'o, C: CompilationCacheDomain> CompilationContext<'o, C> {
         let cache_key = domain.compilation_key(program)?;
         loop {
             let lookup_start = Instant::now();
-            if let Some(cached) = self.cached_program(&cache_key) {
+
+            // Lookup refreshes the LRU position. Clone the handle and release the cache lock before validation and
+            // event callbacks, which may access this context again.
+            let cached = self
+                .programs
+                .lock()
+                .expect("compilation cache mutex should not be poisoned")
+                .get(&cache_key)
+                .map(Arc::clone);
+            if let Some(cached) = cached {
                 self.statistics.memory_hits.fetch_add(1, Ordering::Relaxed);
                 return self.accept_memory_hit(domain, program, cached, lookup_start);
             }
@@ -833,8 +842,14 @@ impl<'o, C: CompilationCacheDomain> CompilationContext<'o, C> {
             // A prior producer can insert the program after the first lookup above and remove its in-flight marker
             // before this caller registers as the new producer. Checking again after registering closes that narrow
             // handoff window, which would otherwise trigger a duplicate compilation. The waiters of this producer
-            // validate the program against their own requests.
-            if let Some(cached) = self.cached_program(&cache_key) {
+            // validate the program against their own requests. Release the cache lock before waking them or reporting.
+            let cached = self
+                .programs
+                .lock()
+                .expect("compilation cache mutex should not be poisoned")
+                .get(&cache_key)
+                .map(Arc::clone);
+            if let Some(cached) = cached {
                 self.in_flight.lock().expect("in-flight cache mutex should not be poisoned").remove(&cache_key);
                 in_flight.finish(InFlightState::Ready(Arc::clone(&cached)));
                 self.statistics.memory_hits.fetch_add(1, Ordering::Relaxed);
@@ -916,10 +931,9 @@ impl<'o, C: CompilationCacheDomain> CompilationContext<'o, C> {
         }
     }
 
-    // TODO(eaplatanios): Review from here onwards.
-
     /// Validates the `cached` in-memory program against the requesting `program` and records the lookup that started
-    /// at `lookup_start`. A rejection fails the compilation, because equal exact keys must mean interchangeable programs.
+    /// at `lookup_start`. A rejection fails the compilation, because equal exact keys must mean interchangeable
+    /// programs.
     fn accept_memory_hit(
         &self,
         domain: &C,
@@ -942,19 +956,8 @@ impl<'o, C: CompilationCacheDomain> CompilationContext<'o, C> {
         validation.map(|()| cached)
     }
 
-    /// Returns the program cached in the in-memory tier for `cache_key`, marking it as most recently used.
-    fn cached_program(&self, cache_key: &C::CacheKey) -> Option<Arc<C::CompiledProgram>> {
-        self.programs
-            .lock()
-            .expect("compilation cache mutex should not be poisoned")
-            .get(cache_key)
-            .map(Arc::clone)
-    }
-
-    /// Preflights `exchange` and returns whether it participates in this compilation.
-    ///
-    /// A preflight failure is fatal when the policy requires sharing. Otherwise, it is recorded and the exchange is
-    /// deactivated for this compilation.
+    /// Preflights `exchange` and returns whether it participates in this compilation. A preflight failure is fatal when
+    /// the policy requires sharing. Otherwise, it is recorded and the exchange is deactivated for this compilation.
     fn preflight_exchange(&self, exchange: ActiveExchange<'_>) -> Result<bool, C::Error> {
         let preflight_start = Instant::now();
         let Err(error) = exchange.exchange.preflight(exchange.key, exchange.timeout) else {
@@ -984,8 +987,8 @@ impl<'o, C: CompilationCacheDomain> CompilationContext<'o, C> {
         Ok(false)
     }
 
-    /// Restores a compiled program from the persistent tier, returning its serialized payload alongside it so that an
-    /// exchange leader can publish it without serializing it again. Every outcome other than a hit, including a
+    /// Restores a compiled program from the persistent tier, returning its serialized payload alongside it so that
+    /// an exchange leader can publish it without serializing it again. Every outcome other than a hit, including a
     /// restored program that the domain rejects for the requesting `program`, is recorded and degraded to [`None`].
     fn restore_from_disk(
         &self,
@@ -1032,11 +1035,9 @@ impl<'o, C: CompilationCacheDomain> CompilationContext<'o, C> {
         restored
     }
 
-    /// Waits on a follower process for the artifact that the exchange leader publishes.
-    ///
-    /// Returns the restored program on success, and [`None`] when the policy permits falling back to local compilation
-    /// after a miss, timeout, or failure. A received program that the domain rejects for the requesting `program` is
-    /// an incompatible miss.
+    /// Waits on a follower process for the artifact that the exchange leader publishes. Returns the restored program
+    /// on success, and [`None`] when the policy permits falling back to local compilation after a miss, timeout, or
+    /// failure. A received program that the domain rejects for the requesting `program` is an incompatible miss.
     fn receive_from_exchange(
         &self,
         domain: &C,
@@ -1141,10 +1142,9 @@ impl<'o, C: CompilationCacheDomain> CompilationContext<'o, C> {
         }
     }
 
-    /// Publishes the serialized `artifact` through the exchange leader.
-    ///
-    /// Publication failures are fatal only when the policy requires sharing. Publication durations deliberately stay
-    /// out of the exchange duration counter, which tracks time spent obtaining artifacts.
+    /// Publishes the serialized `artifact` through the exchange leader. Publication failures are fatal only when the
+    /// policy requires sharing. Publication durations deliberately stay out of the exchange duration counter, which
+    /// tracks time spent obtaining artifacts.
     fn publish_to_exchange(&self, exchange: ActiveExchange<'_>, artifact: &[u8]) -> Result<(), C::Error> {
         let publish_start = Instant::now();
         match exchange.exchange.publish(exchange.key, artifact) {
@@ -1190,11 +1190,10 @@ impl<'o, C: CompilationCacheDomain> CompilationContext<'o, C> {
         });
     }
 
-    /// Compiles `program` through `domain` and publishes it to configured caches and the artifact exchange.
-    ///
-    /// The persistent tier is written only by the exchange leader (or by every process when no exchange is active),
-    /// and only when the compilation meets the write thresholds of the [`DiskCache`]. The exchange leader publishes
-    /// the serialized program, or a terminal failure whenever it cannot, so that followers stop waiting.
+    /// Compiles `program` through `domain` and publishes it to configured caches and the artifact exchange. The
+    /// persistent tier is written only by the exchange leader (or by every process when no exchange is active), and
+    /// only when the compilation meets the write thresholds of the [`DiskCache`]. The exchange leader publishes the
+    /// serialized program, or a terminal failure whenever it cannot, so that followers stop waiting.
     fn compile_and_publish(
         &self,
         domain: &C,
@@ -1347,8 +1346,8 @@ impl<'o, C: CompilationCacheDomain> CompilationContext<'o, C> {
         self.require_exchange_or_record_fallback(message)
     }
 
-    /// Returns an error describing `message` when the exchange policy requires sharing, and otherwise counts a fallback
-    /// to local compilation.
+    /// Returns an error describing `message` when the exchange policy requires sharing,
+    /// and otherwise counts a fallback to local compilation.
     fn require_exchange_or_record_fallback(&self, message: &str) -> Result<(), C::Error> {
         if self.artifact_exchange_policy.permits_local_fallback() {
             self.statistics.exchange_fallbacks.fetch_add(1, Ordering::Relaxed);
@@ -1367,8 +1366,8 @@ impl<'o, C: CompilationCacheDomain> CompilationContext<'o, C> {
         self.record_event(CompilationEvent { step, duration });
     }
 
-    /// Retains `event` when event retention is enabled and then reports it to the installed reporter, if any. The
-    /// reporter runs after the event buffer lock is released.
+    /// Retains `event` when event retention is enabled and then reports it to the installed reporter, if any.
+    /// The reporter runs after the event buffer lock is released.
     fn record_event(&self, event: CompilationEvent) {
         if self.event_capacity > 0 {
             let mut events = self.recent_events.lock().expect("compilation event mutex should not be poisoned");
@@ -1381,6 +1380,8 @@ impl<'o, C: CompilationCacheDomain> CompilationContext<'o, C> {
             reporter(&event);
         }
     }
+
+    // TODO(eaplatanios): Review from here onwards.
 
     /// Publishes the `program` produced for `cache_key` to the in-memory tier and to the waiters of `in_flight`.
     fn finish_success(
