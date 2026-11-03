@@ -1568,7 +1568,8 @@ pub enum BlockScaledGlobalScaling {
 }
 
 /// Value-independent semantics of a [`BlockScaledDot`], which [`block_scaled_dot`] creates. The defaults follow
-/// `jax.nn.scaled_dot_general` and [`Self::nvfp4_training`] selects the NVFP4 training recipe of NVIDIA.
+/// [`jax.nn.scaled_dot_general`](https://docs.jax.dev/en/latest/_autosummary/jax.nn.scaled_dot_general.html) and
+/// [`Self::nvfp4_training`] selects the NVFP4 training recipe of NVIDIA.
 #[derive(Clone, Debug, PartialEq, Eq, Hash)]
 pub struct BlockScaledDotConfiguration {
     /// Contracting and batching dimension specification.
@@ -1577,13 +1578,13 @@ pub struct BlockScaledDotConfiguration {
     /// Data type of the output (refer to [`Self::with_accumulation_type`]).
     accumulation_type: DataType,
 
-    /// Format of the left input.
+    /// [`BlockScaleFormat`] of the left input.
     lhs_format: BlockScaleFormat,
 
-    /// Format of the right input.
+    /// [`BlockScaleFormat`] of the right input.
     rhs_format: BlockScaleFormat,
 
-    /// Format of the output cotangents in quantized backward contractions.
+    /// [`BlockScaleFormat`] of the output cotangents in quantized backward contractions.
     gradient_format: BlockScaleFormat,
 
     /// Source of the global scales of formats that use global scales.
