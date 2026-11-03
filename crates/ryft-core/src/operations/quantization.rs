@@ -661,6 +661,90 @@ fn validate_block_quantize_inputs(
     Ok((element_format, block_axes))
 }
 
+/// Computes the stored block scales at the input precision, sharing the numerical recipe across shape universes.
+fn quantize_block_scales<V, F>(
+    block_max: &V,
+    element_format: BlockElementFormat,
+    scale_type: DataType,
+    scale_value_type: &ArrayType,
+    fill: &F,
+) -> Result<V, ProgramError>
+where
+    V: Value<Type = ArrayType> + Add + And + Clamp + ConvertElementType + Div + Floor + Mul + Round,
+    F: Fn(&ArrayType, f64) -> Result<V, ProgramError>,
+{
+    let computation_type = block_max.r#type().data_type();
+    let (smallest_scale, largest_scale) = match scale_type {
+        DataType::F8E4M3FN => ((-9.0f64).exp2(), 448.0),
+        DataType::F8E8M0FNU => ((-126.0f64).exp2(), 127.0f64.exp2()),
+        _ => unreachable!("scale type was validated before composing operations"),
+    };
+
+    let stored_scales = if scale_type == DataType::F8E4M3FN {
+        // NVFP4 linear scaling maps the block maximum to the largest finite magnitude of the element type,
+        // and the clamped scale rounds to the nearest `f8e4m3fn` value.
+        let scales = block_max.div(&fill(scale_value_type, element_format.max)?)?.clamp(
+            &fill(&ArrayType::scalar(computation_type), smallest_scale)?,
+            &fill(&ArrayType::scalar(computation_type), largest_scale)?,
+        )?;
+        round_to_floating_point_grid(&scales, -6, 3, None, &|value| fill(scale_value_type, value))?
+    } else {
+        // OCP MX power of two scaling computes `2^(floor(log2(max_abs)) - emax)` exactly from the exponent bits of
+        // the block maximum. The clamp maps blocks whose maxima are zero or subnormal to the smallest scale and
+        // blocks whose maxima are not finite to the largest scale.
+        binade_scale(block_max, &|value| fill(scale_value_type, value))?
+            .mul(&fill(scale_value_type, (-f64::from(element_format.max_exponent)).exp2())?)?
+            .clamp(
+                &fill(&ArrayType::scalar(computation_type), smallest_scale)?,
+                &fill(&ArrayType::scalar(computation_type), largest_scale)?,
+            )?
+    };
+
+    Ok(stored_scales)
+}
+
+/// Saturates and rounds the scaled elements using the same arithmetic for static and runtime shapes.
+fn quantize_block_elements<V, F>(
+    quotients: &V,
+    element_format: BlockElementFormat,
+    rounding_noise: Option<&V>,
+    fill: &F,
+) -> Result<V, ProgramError>
+where
+    V: Value<Type = ArrayType> + Add + And + Clamp + ConvertElementType + Div + Floor + Mul + Round,
+    F: Fn(&ArrayType, f64) -> Result<V, ProgramError>,
+{
+    let computation_type = quotients.r#type().data_type();
+    let element_value_type = ArrayType::new(computation_type, quotients.r#type().shape().clone());
+
+    // The quotients are clamped to the finite range of the element type before rounding, which saturates infinite
+    // values rather than dividing infinite spacings, and the largest magnitude is on the grid, so rounding to the
+    // nearest value keeps the clamped quotients in range. Stochastic rounding can still step past the largest
+    // magnitude when adding noise just below one rounds up to the next integer, so its result is clamped again.
+    let quotients = quotients.clamp(
+        &fill(&ArrayType::scalar(computation_type), -element_format.max)?,
+        &fill(&ArrayType::scalar(computation_type), element_format.max)?,
+    )?;
+
+    let elements = round_to_floating_point_grid(
+        &quotients,
+        element_format.min_exponent,
+        element_format.mantissa_bits,
+        rounding_noise,
+        &|value| fill(&element_value_type, value),
+    )?;
+
+    let elements = match rounding_noise {
+        Some(_) => elements.clamp(
+            &fill(&ArrayType::scalar(computation_type), -element_format.max)?,
+            &fill(&ArrayType::scalar(computation_type), element_format.max)?,
+        )?,
+        None => elements,
+    };
+
+    Ok(elements)
+}
+
 /// Name used in diagnostics for [`BlockDequantize`].
 const BLOCK_DEQUANTIZE_NAME: &str = "block_dequantize";
 
@@ -2982,85 +3066,6 @@ impl<'o> BlockScaledDotRules<'o> {
 }
 
 // TODO(eaplatanios): Review from here onwards.
-
-/// Computes the stored block scales at the input precision, sharing the numerical recipe across shape universes.
-fn quantize_block_scales<V, F>(
-    block_max: &V,
-    element_format: BlockElementFormat,
-    scale_type: DataType,
-    scale_value_type: &ArrayType,
-    fill: &F,
-) -> Result<V, ProgramError>
-where
-    V: Value<Type = ArrayType> + Add + And + Clamp + ConvertElementType + Div + Floor + Mul + Round,
-    F: Fn(&ArrayType, f64) -> Result<V, ProgramError>,
-{
-    let computation_type = block_max.r#type().data_type();
-    let (smallest_scale, largest_scale) = match scale_type {
-        DataType::F8E4M3FN => ((-9.0f64).exp2(), 448.0),
-        DataType::F8E8M0FNU => ((-126.0f64).exp2(), 127.0f64.exp2()),
-        _ => unreachable!("scale type was validated before composing operations"),
-    };
-    let stored_scales = if scale_type == DataType::F8E4M3FN {
-        // NVFP4 linear scaling maps the block maximum to the largest finite magnitude of the element type,
-        // and the clamped scale rounds to the nearest `f8e4m3fn` value.
-        let scales = block_max.div(&fill(scale_value_type, element_format.max)?)?.clamp(
-            &fill(&ArrayType::scalar(computation_type), smallest_scale)?,
-            &fill(&ArrayType::scalar(computation_type), largest_scale)?,
-        )?;
-        round_to_floating_point_grid(&scales, -6, 3, None, &|value| fill(scale_value_type, value))?
-    } else {
-        // OCP MX power of two scaling computes `2^(floor(log2(max_abs)) - emax)` exactly from the exponent bits of
-        // the block maximum. The clamp maps blocks whose maxima are zero or subnormal to the smallest scale and
-        // blocks whose maxima are not finite to the largest scale.
-        binade_scale(block_max, &|value| fill(scale_value_type, value))?
-            .mul(&fill(scale_value_type, (-f64::from(element_format.max_exponent)).exp2())?)?
-            .clamp(
-                &fill(&ArrayType::scalar(computation_type), smallest_scale)?,
-                &fill(&ArrayType::scalar(computation_type), largest_scale)?,
-            )?
-    };
-    Ok(stored_scales)
-}
-
-/// Saturates and rounds the scaled elements using the same arithmetic for static and runtime shapes.
-fn quantize_block_elements<V, F>(
-    quotients: &V,
-    element_format: BlockElementFormat,
-    rounding_noise: Option<&V>,
-    fill: &F,
-) -> Result<V, ProgramError>
-where
-    V: Value<Type = ArrayType> + Add + And + Clamp + ConvertElementType + Div + Floor + Mul + Round,
-    F: Fn(&ArrayType, f64) -> Result<V, ProgramError>,
-{
-    let computation_type = quotients.r#type().data_type();
-    let element_value_type = ArrayType::new(computation_type, quotients.r#type().shape().clone());
-    // The quotients are clamped to the finite range of the element type before rounding, which saturates infinite
-    // values rather than dividing infinite spacings, and the largest magnitude is on the grid, so rounding to the
-    // nearest value keeps the clamped quotients in range. Stochastic rounding can still step past the largest
-    // magnitude when adding noise just below one rounds up to the next integer, so its result is clamped again.
-    let quotients = quotients.clamp(
-        &fill(&ArrayType::scalar(computation_type), -element_format.max)?,
-        &fill(&ArrayType::scalar(computation_type), element_format.max)?,
-    )?;
-    let elements = round_to_floating_point_grid(
-        &quotients,
-        element_format.min_exponent,
-        element_format.mantissa_bits,
-        rounding_noise,
-        &|value| fill(&element_value_type, value),
-    )?;
-    let elements = match rounding_noise {
-        Some(_) => elements.clamp(
-            &fill(&ArrayType::scalar(computation_type), -element_format.max)?,
-            &fill(&ArrayType::scalar(computation_type), element_format.max)?,
-        )?,
-        None => elements,
-    };
-
-    Ok(elements)
-}
 
 /// Rounds the `f32` or `f64` `value` to the grid of a narrow floating-point type whose normal values have
 /// `mantissa_bits` explicit mantissa bits and whose smallest normal value is `2^min_exponent`, below which the grid
