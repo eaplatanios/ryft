@@ -18,6 +18,7 @@ http_archive(
     name = "xla",
     patch_args = ["-p1"],
     patches = [
+        "//patches:xla-embedded-constants-target.patch",
         "//patches:xla-fp6-nan-predicate.patch",
         "//patches:xla-llvm-sharded-op-defs.patch",
         "//patches:xla-llvm-windows-symlinks.patch",

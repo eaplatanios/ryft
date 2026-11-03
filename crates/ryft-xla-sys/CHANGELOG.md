@@ -37,6 +37,8 @@ and this project adheres to [Semantic Versioning](https://semver.org/).
   contents caching, whose relative link rewriting made sources inaccessible through the execroot junction.
 - Avoided Windows SDK floating-point classification overloads in XNNPACK integer min/max reductions while preserving
   floating-point NaN handling.
+- Preserved the target triple in XLA's embedded constant objects so macOS archives include platform version
+  commands and link without missing-platform warnings.
 - Regenerated native bindings for XLA FFI custom options, split GPU pass registrations and the LLVM C API changes,
   including the additional DI string type character-type argument and removal of obsolete MHLO domain attributes.
 - Synchronized XLA Protobuf fields, enums and optional-presence semantics, including BLASLt algorithm configurations,
