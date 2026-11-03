@@ -63,8 +63,8 @@
 //!         lambda %0:f32[8] .
 //!         let %1:f32[8][sharding={mesh<['x'=2:manual]>, [{'x'}]}] = shard_map [
 //!             mesh=['x'=2:manual],
-//!             in_shardings=[{mesh<['x'=2:manual]>, [{'x'}]}],
-//!             out_shardings=[{mesh<['x'=2:manual]>, [{'x'}]}],
+//!             input_shardings=[{mesh<['x'=2:manual]>, [{'x'}]}],
+//!             output_shardings=[{mesh<['x'=2:manual]>, [{'x'}]}],
 //!             manual_axes=['x'],
 //!             global_input_types=[f32[8][sharding={mesh<['x'=2:manual]>, [{'x'}]}]],
 //!             global_output_types=[f32[8][sharding={mesh<['x'=2:manual]>, [{'x'}]}]],
@@ -633,10 +633,10 @@ pub struct ShardMapBoundary {
     mesh: LogicalMesh,
 
     /// Validated shardings for each global input leaf.
-    in_shardings: Vec<Sharding>,
+    input_shardings: Vec<Sharding>,
 
     /// Validated shardings for each global output leaf.
-    out_shardings: Vec<Sharding>,
+    output_shardings: Vec<Sharding>,
 
     /// Active manual mesh axes for this `shard_map` invocation.
     manual_axes: Vec<String>,
@@ -663,8 +663,8 @@ impl ShardMapBoundary {
     /// # Parameters
     ///
     ///   - `mesh`: Logical mesh that the manual computation is defined over.
-    ///   - `in_shardings`: Per-input shardings for the global inputs.
-    ///   - `out_shardings`: Per-output shardings for the global outputs.
+    ///   - `input_shardings`: Per-input shardings for the global inputs.
+    ///   - `output_shardings`: Per-output shardings for the global outputs.
     ///   - `manual_axes`: Active manual mesh axes for this shard map. An empty list means "all manual mesh axes".
     ///
     /// # Errors
@@ -674,11 +674,11 @@ impl ShardMapBoundary {
     /// axis, and [`ShardMapError::ManualAxisMustPrecedeFreeAxis`] when a free axis precedes an active manual axis.
     pub fn new(
         mesh: LogicalMesh,
-        in_shardings: Vec<Sharding>,
-        out_shardings: Vec<Sharding>,
+        input_shardings: Vec<Sharding>,
+        output_shardings: Vec<Sharding>,
         manual_axes: Vec<String>,
     ) -> Result<Self, ShardMapError> {
-        Self::new_within(mesh, in_shardings, out_shardings, manual_axes, &HashSet::new())
+        Self::new_within(mesh, input_shardings, output_shardings, manual_axes, &HashSet::new())
     }
 
     /// Creates a new [`ShardMapBoundary`] like [`Self::new`] for a manual region nested in enclosing manual regions
@@ -693,8 +693,8 @@ impl ShardMapBoundary {
     /// manual computation either.
     fn new_within(
         mesh: LogicalMesh,
-        in_shardings: Vec<Sharding>,
-        out_shardings: Vec<Sharding>,
+        input_shardings: Vec<Sharding>,
+        output_shardings: Vec<Sharding>,
         manual_axes: Vec<String>,
         enclosing_manual_axes: &HashSet<&str>,
     ) -> Result<Self, ShardMapError> {
@@ -706,9 +706,11 @@ impl ShardMapBoundary {
             return Err(ShardMapError::EnclosingManualAxisNotManual { axis_name: axis.name().to_string() });
         }
         let manual_axes = Self::normalize_manual_axes(&mesh, manual_axes, enclosing_manual_axes)?;
-        let in_shardings = Self::build_shardings(&mesh, &manual_axes, enclosing_manual_axes, in_shardings, "input")?;
-        let out_shardings = Self::build_shardings(&mesh, &manual_axes, enclosing_manual_axes, out_shardings, "output")?;
-        Ok(Self { mesh, in_shardings, out_shardings, manual_axes })
+        let input_shardings =
+            Self::build_shardings(&mesh, &manual_axes, enclosing_manual_axes, input_shardings, "input")?;
+        let output_shardings =
+            Self::build_shardings(&mesh, &manual_axes, enclosing_manual_axes, output_shardings, "output")?;
+        Ok(Self { mesh, input_shardings, output_shardings, manual_axes })
     }
 
     /// Creates a new [`ShardMapBoundary`] directly from already validated shardings, skipping every check of
@@ -716,11 +718,11 @@ impl ShardMapBoundary {
     /// validated.
     fn from_shardings(
         mesh: LogicalMesh,
-        in_shardings: Vec<Sharding>,
-        out_shardings: Vec<Sharding>,
+        input_shardings: Vec<Sharding>,
+        output_shardings: Vec<Sharding>,
         manual_axes: Vec<String>,
     ) -> Self {
-        Self { mesh, in_shardings, out_shardings, manual_axes }
+        Self { mesh, input_shardings, output_shardings, manual_axes }
     }
 
     /// Returns the logical mesh of this manual computation, which every input and output sharding is defined over.
@@ -733,15 +735,15 @@ impl ShardMapBoundary {
     /// carry no [`Auto`](MeshAxisType::Auto) axes and no varying manual axes, and list active manual axes before free
     /// axes within each dimension.
     #[inline]
-    pub fn in_shardings(&self) -> &[Sharding] {
-        self.in_shardings.as_slice()
+    pub fn input_shardings(&self) -> &[Sharding] {
+        self.input_shardings.as_slice()
     }
 
     /// Returns the per-output shardings, one per global output, in output order, with the same invariants as
-    /// [`Self::in_shardings`].
+    /// [`Self::input_shardings`].
     #[inline]
-    pub fn out_shardings(&self) -> &[Sharding] {
-        self.out_shardings.as_slice()
+    pub fn output_shardings(&self) -> &[Sharding] {
+        self.output_shardings.as_slice()
     }
 
     /// Returns the active manual mesh axes of this manual computation, in mesh order. The list is nonempty and names
@@ -778,7 +780,7 @@ impl ShardMapBoundary {
     ///
     /// Panics when `input_index` is not less than the number of input shardings.
     pub fn global_input_type(&self, input_index: usize, input_type: &ArrayType) -> Result<ArrayType, ShardMapError> {
-        let sharding = &self.in_shardings[input_index];
+        let sharding = &self.input_shardings[input_index];
         self.validate_input_mesh(input_type.sharding(), input_index)?;
         let carried_state = self.carried_reduction_state(sharding, input_type.sharding(), "input", input_index)?;
         let varying_axes =
@@ -816,7 +818,7 @@ impl ShardMapBoundary {
         input_index: usize,
         global_input_type: &ArrayType,
     ) -> Result<ArrayType, ShardMapError> {
-        let boundary_sharding = &self.in_shardings[input_index];
+        let boundary_sharding = &self.input_shardings[input_index];
         let carried_state =
             self.carried_reduction_state(boundary_sharding, global_input_type.sharding(), "input", input_index)?;
         let global_shape = Self::static_dimensions(global_input_type, "input", input_index)?;
@@ -848,7 +850,7 @@ impl ShardMapBoundary {
     ///
     /// Panics when `input_index` is not less than the number of input shardings.
     fn input_replicated_manual_axes(&self, input_index: usize) -> Vec<String> {
-        let sharded_axes = Self::sharded_manual_axes(&self.in_shardings[input_index], &self.manual_axis_names());
+        let sharded_axes = Self::sharded_manual_axes(&self.input_shardings[input_index], &self.manual_axis_names());
         self.manual_axes.iter().filter(|axis| !sharded_axes.contains(axis.as_str())).cloned().collect()
     }
 
@@ -1054,7 +1056,7 @@ impl ShardMapBoundary {
     /// sharding. Only active manual axes reduce the local shape, and free axes remain global from the body's point of
     /// view.
     fn local_input_shape(&self, input_index: usize, global_shape: &[usize]) -> Result<Vec<usize>, ShardMapError> {
-        let sharding = &self.in_shardings[input_index];
+        let sharding = &self.input_shardings[input_index];
         let partition_counts = self.manual_partition_counts(sharding, global_shape.len(), "input", input_index)?;
         global_shape
             .iter()
@@ -1077,9 +1079,9 @@ impl ShardMapBoundary {
     /// Returns the global output types for the provided local body output types, one per output sharding, through
     /// [`Self::global_output_type`].
     fn global_output_types(&self, local_output_types: &[ArrayType]) -> Result<Vec<ArrayType>, ShardMapError> {
-        if local_output_types.len() != self.out_shardings.len() {
+        if local_output_types.len() != self.output_shardings.len() {
             return Err(ShardMapError::OutputTypeCountMismatch {
-                expected: self.out_shardings.len(),
+                expected: self.output_shardings.len(),
                 actual: local_output_types.len(),
             });
         }
@@ -1106,7 +1108,7 @@ impl ShardMapBoundary {
     ) -> Result<ArrayType, ShardMapError> {
         let manual_axis_names = self.manual_axis_names();
         let local_shape = Self::static_dimensions(local_output_type, "output", output_index)?;
-        let output_sharding = &self.out_shardings[output_index];
+        let output_sharding = &self.output_shardings[output_index];
         let expected_current_varying_axes = Self::sharded_manual_axes(output_sharding, &manual_axis_names);
         let effective_local_varying_axes = local_output_type
             .sharding()
@@ -1146,7 +1148,7 @@ impl ShardMapBoundary {
     /// Returns the global shape of output `output_index` whose local shape is `local_shape`, scaling each dimension by
     /// its manual partition count under the output sharding.
     fn global_output_shape(&self, output_index: usize, local_shape: Vec<usize>) -> Result<Vec<usize>, ShardMapError> {
-        let sharding = &self.out_shardings[output_index];
+        let sharding = &self.output_shardings[output_index];
         let partition_counts = self.manual_partition_counts(sharding, local_shape.len(), "output", output_index)?;
         local_shape
             .into_iter()
@@ -1279,7 +1281,7 @@ impl ShardMapBoundary {
             if axis_type == MeshAxisType::Auto {
                 continue;
             }
-            let specified = self.in_shardings.iter().chain(&self.out_shardings).any(|sharding| {
+            let specified = self.input_shardings.iter().chain(&self.output_shardings).any(|sharding| {
                 sharding.unreduced_axes().contains(axis_name)
                     || sharding.reduced_axes().contains(axis_name)
                     || sharding.dimensions().iter().any(|dimension| {
@@ -1516,9 +1518,9 @@ impl ShardMapOperation {
         global_input_types: Vec<ArrayIrType>,
         boundary: ShardMapBoundary,
     ) -> Result<Self, ShardMapError> {
-        if global_input_types.len() != boundary.in_shardings().len() {
+        if global_input_types.len() != boundary.input_shardings().len() {
             return Err(ShardMapError::InputTypeCountMismatch {
-                expected: boundary.in_shardings().len(),
+                expected: boundary.input_shardings().len(),
                 actual: global_input_types.len(),
             });
         }
@@ -1704,12 +1706,12 @@ impl ShardMapOperation {
                      declare that forwarding",
                 )));
             }
-            if self.boundary.out_shardings()[index] != self.boundary.in_shardings()[forwarded] {
+            if self.boundary.output_shardings()[index] != self.boundary.input_shardings()[forwarded] {
                 return Err(ProgramError::MalformedProgram(format!(
                     "`{name}` output #{index} forwards reference input #{forwarded} but its output sharding `{}` \
                      differs from the input sharding `{}`",
-                    self.boundary.out_shardings()[index],
-                    self.boundary.in_shardings()[forwarded],
+                    self.boundary.output_shardings()[index],
+                    self.boundary.input_shardings()[forwarded],
                 )));
             }
         }
@@ -1751,8 +1753,8 @@ impl Operation for ShardMapOperation {
         let body_interface =
             shard_map_body_interface(region_interfaces, self.input_types.len(), self.output_types.len())?;
         Self::validate_body_effects(body_interface.effects()).map_err(TypeError::custom)?;
-        check_count!("input sharding", self.boundary.in_shardings(), self.input_types.len(), TypeError);
-        check_count!("output sharding", self.boundary.out_shardings(), self.output_types.len(), TypeError);
+        check_count!("input sharding", self.boundary.input_shardings(), self.input_types.len(), TypeError);
+        check_count!("output sharding", self.boundary.output_shardings(), self.output_types.len(), TypeError);
         check_count!("input", input_types, self.input_types.len(), TypeError);
         for (index, (actual, declared)) in input_types.iter().zip(&self.input_types).enumerate() {
             // An input placed over another mesh has no placement at this boundary, whose shardings and transposition
@@ -1829,12 +1831,12 @@ impl Operation for ShardMapOperation {
                             "`{name}` output #{index} does not forward reference input #{forwarded} by identity",
                         )));
                     }
-                    if self.boundary.out_shardings()[index] != self.boundary.in_shardings()[forwarded] {
+                    if self.boundary.output_shardings()[index] != self.boundary.input_shardings()[forwarded] {
                         return Err(TypeError::invalid(format!(
                             "`{name}` output #{index} forwards reference input #{forwarded} but its output sharding \
                              `{}` differs from the input sharding `{}`",
-                            self.boundary.out_shardings()[index],
-                            self.boundary.in_shardings()[forwarded],
+                            self.boundary.output_shardings()[index],
+                            self.boundary.input_shardings()[forwarded],
                         )));
                     }
                     // The output is the forwarded input itself, so its declared type must describe that input.
@@ -1918,8 +1920,8 @@ impl Operation for ShardMapOperation {
         let operation = Self::from_boundary(
             ShardMapBoundary::from_shardings(
                 self.boundary.mesh().clone(),
-                input_indices.iter().map(|&index| self.boundary.in_shardings()[index].clone()).collect(),
-                output_indices.iter().map(|&index| self.boundary.out_shardings()[index].clone()).collect(),
+                input_indices.iter().map(|&index| self.boundary.input_shardings()[index].clone()).collect(),
+                output_indices.iter().map(|&index| self.boundary.output_shardings()[index].clone()).collect(),
                 self.boundary.manual_axes().to_vec(),
             ),
             input_indices.iter().map(|&index| self.input_types[index].clone()),
@@ -1943,15 +1945,15 @@ impl Operation for ShardMapOperation {
 
     // Every field a consumer can observe is rendered, because this rendering is the metadata fingerprint that the debug
     // transform cache diagnostic compares programs by, so a field this rendering drops is a field whose corruption that
-    // diagnostic cannot see. All of `mesh`, `in_shardings`, `out_shardings`, and `manual_axes` steer differentiation,
-    // transposition, and backend lowering while being invisible to the instruction's rendered atom types, and so do the
-    // global boundary types, because an input type only has to match the declared global input types up to its
-    // dimension shardings and its memory kind. The declared output types retain the placement and variation established
-    // by the body and its output shardings. The output forwarding is rendered exactly when some output forwards a
-    // reference input, so a boundary with value outputs only renders without it and a boundary with a forwarded
-    // reference output never renders like one without. No state is elided. Every field is a sequence or a scalar, so
-    // the rendering is deterministic without any ordering normalization. Every mesh axis name is rendered as a
-    // single-quoted literal with Rust's character escapes (by the `Display` implementation of `MeshAxis` for the mesh
+    // diagnostic cannot see. All of `mesh`, `input_shardings`, `output_shardings`, and `manual_axes` steer
+    // differentiation, transposition, and backend lowering while being invisible to the instruction's rendered atom
+    // types, and so do the global boundary types, because an input type only has to match the declared global input
+    // types up to its dimension shardings and its memory kind. The declared output types retain the placement and
+    // variation established by the body and its output shardings. The output forwarding is rendered exactly when some
+    // output forwards a reference input, so a boundary with value outputs only renders without it and a boundary with a
+    // forwarded reference output never renders like one without. No state is elided. Every field is a sequence or a
+    // scalar, so the rendering is deterministic without any ordering normalization. Every mesh axis name is rendered as
+    // a single-quoted literal with Rust's character escapes (by the `Display` implementation of `MeshAxis` for the mesh
     // axes and by `render_mesh_axis_name` for the manual axes), so that no name can imitate the quoting or the `, `
     // separator that `OperationFormatter::list` joins items with. The two-name list `["a", "b"]` and the one-name list
     // `["a', 'b"]` render distinctly, so a collision could not hide a genuinely different manual SPMD boundary from
@@ -1962,8 +1964,8 @@ impl Operation for ShardMapOperation {
             // The mesh is redundant with any rendered sharding, which embeds it, but a boundary may have no
             // shardings at all, so it is rendered unconditionally.
             operation.list("mesh", self.boundary.mesh().axes())?;
-            operation.list("in_shardings", self.boundary.in_shardings())?;
-            operation.list("out_shardings", self.boundary.out_shardings())?;
+            operation.list("input_shardings", self.boundary.input_shardings())?;
+            operation.list("output_shardings", self.boundary.output_shardings())?;
             operation.list("manual_axes", manual_axes)?;
             operation.list("global_input_types", &self.input_types)?;
             operation.list("global_output_types", &self.output_types)?;
@@ -2110,18 +2112,18 @@ where
             .collect::<Result<Vec<_>, _>>()?;
         let mut output_types =
             value_output_indices.iter().map(|&index| self.output_types[index].clone()).collect::<Vec<_>>();
-        let mut out_shardings = value_output_indices
+        let mut output_shardings = value_output_indices
             .iter()
-            .map(|&index| self.boundary.out_shardings()[index].clone())
+            .map(|&index| self.boundary.output_shardings()[index].clone())
             .collect::<Vec<_>>();
         for &index in &mutated_inputs {
             output_types.push(boundary_inputs[index].r#type().into_owned());
-            out_shardings.push(self.boundary.in_shardings()[index].clone());
+            output_shardings.push(self.boundary.input_shardings()[index].clone());
         }
         let boundary = ShardMapBoundary::from_shardings(
             self.boundary.mesh().clone(),
-            self.boundary.in_shardings().to_vec(),
-            out_shardings,
+            self.boundary.input_shardings().to_vec(),
+            output_shardings,
             self.boundary.manual_axes().to_vec(),
         );
         let operation = ShardMapOperation::from_boundary(boundary, input_types, output_types);
@@ -2260,7 +2262,7 @@ where
                 let output = body_program.output_ids()[output_index];
                 let input_index = body_program.input_ids().iter().position(|input| *input == output)?;
                 (inputs[input_index].is_known()
-                    && self.boundary.out_shardings()[output_index] == self.boundary.in_shardings()[input_index]
+                    && self.boundary.output_shardings()[output_index] == self.boundary.input_shardings()[input_index]
                     && *inputs[input_index].r#type() == self.output_types[output_index])
                     .then_some(input_index)
             })
@@ -2273,8 +2275,8 @@ where
         let operation = Self {
             boundary: ShardMapBoundary::from_shardings(
                 self.boundary.mesh().clone(),
-                self.boundary.in_shardings().to_vec(),
-                kept_outputs.iter().map(|&index| self.boundary.out_shardings()[index].clone()).collect(),
+                self.boundary.input_shardings().to_vec(),
+                kept_outputs.iter().map(|&index| self.boundary.output_shardings()[index].clone()).collect(),
                 self.boundary.manual_axes().to_vec(),
             ),
             input_types: self.input_types.clone(),
@@ -2530,16 +2532,16 @@ where
                 *r#type = if r#type.is_reference() { ReferenceType::new(referent).into() } else { referent.into() };
                 Ok::<_, BatchingError>(())
             };
-            let mut in_shardings = self.boundary.in_shardings().to_vec();
-            let mut out_shardings = self.boundary.out_shardings().to_vec();
+            let mut input_shardings = self.boundary.input_shardings().to_vec();
+            let mut output_shardings = self.boundary.output_shardings().to_vec();
             for (index, position) in input_positions.iter().enumerate() {
                 if let Some(position) = position {
-                    batch_boundary(&mut in_shardings[index], &mut input_types[index], *position)?;
+                    batch_boundary(&mut input_shardings[index], &mut input_types[index], *position)?;
                 }
             }
             for (index, position) in output_positions.iter().enumerate() {
                 if let Some(position) = position {
-                    batch_boundary(&mut out_shardings[index], &mut output_types[index], *position)?;
+                    batch_boundary(&mut output_shardings[index], &mut output_types[index], *position)?;
                 }
             }
 
@@ -2564,8 +2566,8 @@ where
                 .collect::<HashSet<_>>();
             boundary = ShardMapBoundary::new_within(
                 mesh.clone(),
-                in_shardings,
-                out_shardings,
+                input_shardings,
+                output_shardings,
                 manual_axes,
                 &enclosing_manual_axes,
             )
@@ -2905,18 +2907,18 @@ pub trait ShardMap: Context + NamedAxes {
     ///   - `inputs`: Structured global input values, whose leaves are array projections of array IR values of this
     ///     context.
     ///   - `mesh`: Logical mesh that the manual computation is defined over.
-    ///   - `in_shardings`: Shardings of the global inputs (i.e., JAX's `in_specs`), with the same structure as
+    ///   - `input_shardings`: Shardings of the global inputs (i.e., JAX's `in_specs`), with the same structure as
     ///     `inputs`.
-    ///   - `out_shardings`: Shardings of the global outputs (i.e., JAX's `out_specs`), with the same structure as the
-    ///     outputs of `function`.
+    ///   - `output_shardings`: Shardings of the global outputs (i.e., JAX's `out_specs`), with the same structure as
+    ///     the outputs of `function`.
     ///   - `options`: Selection of the active manual mesh axes.
     ///
     /// # Errors
     ///
-    /// Returns [`ShardMapError::Parameter`] when `in_shardings` does not have the structure of `inputs` or the outputs
-    /// of `function` do not have the structure of `out_shardings`, the errors of [`ShardMapBoundary::new`] for invalid
-    /// mesh, sharding, and manual axis combinations, [`ShardMapError::AllManualAxesAlreadyManual`] when every manual
-    /// mesh axis is already manual in an enclosing manual region, [`ShardMapError::AxisAlreadyManual`] or
+    /// Returns [`ShardMapError::Parameter`] when `input_shardings` does not have the structure of `inputs` or the
+    /// outputs of `function` do not have the structure of `output_shardings`, the errors of [`ShardMapBoundary::new`]
+    /// for invalid mesh, sharding, and manual axis combinations, [`ShardMapError::AllManualAxesAlreadyManual`] when
+    /// every manual mesh axis is already manual in an enclosing manual region, [`ShardMapError::AxisAlreadyManual`] or
     /// [`ShardMapError::SpecificationNamesEnclosingManualAxis`] when the selection of manual axes or a sharding names
     /// such an axis, [`ShardMapError::EnclosingManualAxisNotManual`] when `mesh` does not type such an axis
     /// [`Manual`](MeshAxisType::Manual), [`ShardMapError::EnclosingManualAxisMeshMismatch`] when such an axis belongs
@@ -2930,8 +2932,8 @@ pub trait ShardMap: Context + NamedAxes {
         function: F,
         inputs: Input,
         mesh: LogicalMesh,
-        in_shardings: Input::To<Sharding>,
-        out_shardings: Output::To<Sharding>,
+        input_shardings: Input::To<Sharding>,
+        output_shardings: Output::To<Sharding>,
         options: ShardMapOptions,
     ) -> Result<Output::To<ProjectedValue<ArrayType, Self::Value>>, ShardMapError>
     where
@@ -2955,8 +2957,8 @@ where
         function: F,
         inputs: Input,
         mesh: LogicalMesh,
-        in_shardings: Input::To<Sharding>,
-        out_shardings: Output::To<Sharding>,
+        input_shardings: Input::To<Sharding>,
+        output_shardings: Output::To<Sharding>,
         options: ShardMapOptions,
     ) -> Result<Output::To<ProjectedValue<ArrayType, Self::Value>>, ShardMapError>
     where
@@ -2966,16 +2968,16 @@ where
         Output::Family: ParameterizedFamily<Sharding> + ParameterizedFamily<ProjectedValue<ArrayType, Self::Value>>,
         F: FnOnce(&ShardMapContext<Self>, Input::To<ShardMapTracer<Self>>) -> Result<Output, ProgramError>,
     {
-        validate_parameter_structure(&inputs.parameter_paths().collect::<Vec<_>>(), &in_shardings)?;
+        validate_parameter_structure(&inputs.parameter_paths().collect::<Vec<_>>(), &input_shardings)?;
         let input_structure = inputs.parameter_structure();
-        let output_structure = out_shardings.parameter_structure();
-        let output_paths = out_shardings.parameter_paths().collect::<Vec<_>>();
+        let output_structure = output_shardings.parameter_structure();
+        let output_paths = output_shardings.parameter_paths().collect::<Vec<_>>();
         let global_input_types = inputs.parameters().map(|input| input.r#type().into_owned()).collect::<Vec<_>>();
         let inputs = inputs.into_parameters().map(ProjectedValue::into_value).collect::<Vec<_>>();
         let (boundary, outer_named_axes) = shard_map_within_named_axes(
             mesh,
-            in_shardings.into_parameters().collect(),
-            out_shardings.into_parameters().collect(),
+            input_shardings.into_parameters().collect(),
+            output_shardings.into_parameters().collect(),
             options.manual_axes,
             &self.named_axes(),
         )?;
@@ -3013,8 +3015,8 @@ where
 ///   - `function`: Body function traced over the local shards of `inputs`.
 ///   - `inputs`: Structured global input values, whose leaves are array projections of array IR values.
 ///   - `mesh`: Logical mesh that the manual computation is defined over.
-///   - `in_shardings`: Shardings of the global inputs (i.e., JAX's `in_specs`), with the same structure as `inputs`.
-///   - `out_shardings`: Shardings of the global outputs (i.e., JAX's `out_specs`), with the same structure as the
+///   - `input_shardings`: Shardings of the global inputs (i.e., JAX's `in_specs`), with the same structure as `inputs`.
+///   - `output_shardings`: Shardings of the global outputs (i.e., JAX's `out_specs`), with the same structure as the
 ///     outputs of `function`.
 ///   - `options`: Selection of the active manual mesh axes.
 ///
@@ -3026,8 +3028,8 @@ pub fn shard_map<V, F, Input, Output>(
     function: F,
     inputs: Input,
     mesh: LogicalMesh,
-    in_shardings: Input::To<Sharding>,
-    out_shardings: Output::To<Sharding>,
+    input_shardings: Input::To<Sharding>,
+    output_shardings: Output::To<Sharding>,
     options: ShardMapOptions,
 ) -> Result<Output::To<ProjectedValue<ArrayType, V>>, ShardMapError>
 where
@@ -3043,7 +3045,14 @@ where
         .next()
         .map(|input| input.value().domain())
         .ok_or(ShardMapError::MissingInputContext)?;
-    context.shard_map(|_, local_inputs| function(local_inputs), inputs, mesh, in_shardings, out_shardings, options)
+    context.shard_map(
+        |_, local_inputs| function(local_inputs),
+        inputs,
+        mesh,
+        input_shardings,
+        output_shardings,
+        options,
+    )
 }
 
 /// Traces `function` as the local body of a manual SPMD computation over `mesh` for global inputs of the provided
@@ -3075,9 +3084,9 @@ where
 ///     `global_input_types`.
 ///   - `global_input_types`: Structured global input types.
 ///   - `mesh`: Logical mesh that the manual computation is defined over.
-///   - `in_shardings`: Shardings of the global inputs (i.e., JAX's `in_specs`), with the same structure as
+///   - `input_shardings`: Shardings of the global inputs (i.e., JAX's `in_specs`), with the same structure as
 ///     `global_input_types`.
-///   - `out_shardings`: Shardings of the global outputs (i.e., JAX's `out_specs`), with the same structure as the
+///   - `output_shardings`: Shardings of the global outputs (i.e., JAX's `out_specs`), with the same structure as the
 ///     outputs of `function`.
 ///   - `options`: Selection of the active manual mesh axes.
 ///   - `named_axes`: Named axes in scope where the traced `shard_map` is meant to be bound, innermost first.
@@ -3089,8 +3098,8 @@ pub fn trace_shard_map<C, F, Input, Output>(
     function: F,
     global_input_types: Input,
     mesh: LogicalMesh,
-    in_shardings: Input::To<Sharding>,
-    out_shardings: Output::To<Sharding>,
+    input_shardings: Input::To<Sharding>,
+    output_shardings: Output::To<Sharding>,
     options: ShardMapOptions,
     named_axes: &[(String, NamedAxis)],
 ) -> Result<TracedShardMap<C, Input, Output>, ShardMapError>
@@ -3105,14 +3114,14 @@ where
     Output::Family: ParameterizedFamily<Sharding> + ParameterizedFamily<ShardMapTracer<C>>,
     F: FnOnce(&ShardMapContext<C>, Input::To<ShardMapTracer<C>>) -> Result<Output::To<ShardMapTracer<C>>, ProgramError>,
 {
-    validate_parameter_structure(&global_input_types.parameter_paths().collect::<Vec<_>>(), &in_shardings)?;
+    validate_parameter_structure(&global_input_types.parameter_paths().collect::<Vec<_>>(), &input_shardings)?;
     let input_structure = global_input_types.parameter_structure();
-    let output_structure = out_shardings.parameter_structure();
-    let output_paths = out_shardings.parameter_paths().collect::<Vec<_>>();
+    let output_structure = output_shardings.parameter_structure();
+    let output_paths = output_shardings.parameter_paths().collect::<Vec<_>>();
     let (boundary, outer_named_axes) = shard_map_within_named_axes(
         mesh,
-        in_shardings.into_parameters().collect(),
-        out_shardings.into_parameters().collect(),
+        input_shardings.into_parameters().collect(),
+        output_shardings.into_parameters().collect(),
         options.manual_axes,
         named_axes,
     )?;
@@ -3495,7 +3504,7 @@ where
                 .map(|root| Ok(ArrayIrValue::Array(root.read()?)))
                 .collect::<Result<Vec<_>, ProgramError>>()?;
             let reference_type = reference.r#type();
-            let sharding = &boundary.in_shardings()[index];
+            let sharding = &boundary.input_shardings()[index];
             validate_replicated_copies(sharding, &local_grid, &shards, index)?;
             reference.write(assemble_global_value(sharding, reference_type.referent(), &local_grid, &shards)?)?;
         }
@@ -3510,7 +3519,7 @@ where
                     return Ok(inputs[forwarded].clone());
                 }
                 let global_type = <&ArrayType>::try_from(&operation.global_output_types()[index])?;
-                let sharding = &boundary.out_shardings()[index];
+                let sharding = &boundary.output_shardings()[index];
                 values
                     .chunks(local_device_count)
                     .map(|values| {
@@ -4362,7 +4371,7 @@ fn split_global_input(
     grid: &ManualDeviceGrid,
     coordinates: &[usize],
 ) -> Result<Array, ProgramError> {
-    let sharding = &boundary.in_shardings()[input_index];
+    let sharding = &boundary.input_shardings()[input_index];
     if sharding
         .unreduced_axes()
         .iter()
@@ -4839,53 +4848,53 @@ where
         .iter()
         .map(|&index| operation.input_types[index].clone())
         .collect::<Vec<_>>();
-    let known_in_shardings = partition
+    let known_input_shardings = partition
         .known_input_indices()
         .iter()
-        .map(|&index| operation.boundary.in_shardings()[index].clone())
+        .map(|&index| operation.boundary.input_shardings()[index].clone())
         .collect::<Vec<_>>();
     let mut known_global_output_types =
         known_output_indices.iter().map(|&index| operation.output_types[index].clone()).collect::<Vec<_>>();
-    let mut known_out_shardings = known_output_indices
+    let mut known_output_shardings = known_output_indices
         .iter()
-        .map(|&index| operation.boundary.out_shardings()[index].clone())
+        .map(|&index| operation.boundary.output_shardings()[index].clone())
         .collect::<Vec<_>>();
     for edge in &residual_edges {
         known_global_output_types.push(edge.global_type.clone().into());
-        known_out_shardings.push(edge.sharding.clone());
+        known_output_shardings.push(edge.sharding.clone());
     }
 
     // Gather the boundary metadata of the staged side, which consists of the unknown and forwarded known boundary
     // inputs, the forwarded known boundary outputs, and the residual edges, in residual input order, and the outputs
     // that the residual side owns.
     let mut staged_global_input_types = Vec::with_capacity(partition.residual_inputs().len());
-    let mut staged_in_shardings = Vec::with_capacity(partition.residual_inputs().len());
+    let mut staged_input_shardings = Vec::with_capacity(partition.residual_inputs().len());
     for source in partition.residual_inputs().iter() {
         match *source {
             // An unknown or forwarded known boundary input crosses under its declared global type and input sharding.
             ResidualInputSource::UnknownInput(index) | ResidualInputSource::KnownInput(index) => {
                 staged_global_input_types.push(operation.input_types[index].clone());
-                staged_in_shardings.push(operation.boundary.in_shardings()[index].clone());
+                staged_input_shardings.push(operation.boundary.input_shardings()[index].clone());
             }
             // A forwarded known boundary output crosses under its declared global type, with its output sharding as
             // the input sharding, which places exactly the local value that the known body returns for it.
             ResidualInputSource::KnownOutput(index) => {
                 let output_index = known_output_indices[index];
                 staged_global_input_types.push(operation.output_types[output_index].clone());
-                staged_in_shardings.push(operation.boundary.out_shardings()[output_index].clone());
+                staged_input_shardings.push(operation.boundary.output_shardings()[output_index].clone());
             }
             ResidualInputSource::ResidualEdge(edge) => {
                 staged_global_input_types.push(residual_edges[edge].global_type.clone().into());
-                staged_in_shardings.push(residual_edges[edge].sharding.clone());
+                staged_input_shardings.push(residual_edges[edge].sharding.clone());
             }
         }
     }
     let mut staged_global_output_types = Vec::new();
-    let mut staged_out_shardings = Vec::new();
+    let mut staged_output_shardings = Vec::new();
     for (index, output) in partition.outputs().iter().enumerate() {
         if output.is_unknown() {
             staged_global_output_types.push(operation.output_types[index].clone());
-            staged_out_shardings.push(operation.boundary.out_shardings()[index].clone());
+            staged_output_shardings.push(operation.boundary.output_shardings()[index].clone());
         }
     }
 
@@ -4919,8 +4928,8 @@ where
         |_known_program| {
             let known_boundary = ShardMapBoundary::from_shardings(
                 mesh.clone(),
-                known_in_shardings,
-                known_out_shardings,
+                known_input_shardings,
+                known_output_shardings,
                 operation.boundary.manual_axes().to_vec(),
             );
             let known_operation =
@@ -4930,8 +4939,8 @@ where
         |_residual_program| {
             let staged_boundary = ShardMapBoundary::from_shardings(
                 mesh.clone(),
-                staged_in_shardings,
-                staged_out_shardings,
+                staged_input_shardings,
+                staged_output_shardings,
                 operation.boundary.manual_axes().to_vec(),
             );
             let staged_operation = ShardMapOperation::from_boundary(
@@ -5298,8 +5307,8 @@ where
     let primal_operation = ShardMapOperation::from_boundary(
         ShardMapBoundary::from_shardings(
             mesh.clone(),
-            boundary.in_shardings().to_vec(),
-            boundary.out_shardings().iter().cloned().chain(edge_shardings.iter().cloned()).collect(),
+            boundary.input_shardings().to_vec(),
+            boundary.output_shardings().iter().cloned().chain(edge_shardings.iter().cloned()).collect(),
             boundary.manual_axes().to_vec(),
         ),
         operation.input_types.clone(),
@@ -5314,22 +5323,22 @@ where
     // onto the tangent position of the input it forwards. Each residual crosses under the global type and sharding of
     // the primal boundary input, primal boundary output, or residual edge that it comes from.
     let mut tangent_positions = vec![None; activity.len()];
-    let mut tangent_in_shardings = Vec::with_capacity(activity.len() + residuals.len());
+    let mut tangent_input_shardings = Vec::with_capacity(activity.len() + residuals.len());
     let mut tangent_input_types = Vec::with_capacity(activity.len() + residuals.len());
     for (index, _) in activity.iter().enumerate().filter(|(_, active)| **active) {
         tangent_positions[index] = Some(tangent_input_types.len());
-        tangent_in_shardings.push(boundary.in_shardings()[index].clone());
+        tangent_input_shardings.push(boundary.input_shardings()[index].clone());
         tangent_input_types.push(operation.input_types[index].tangent()?);
     }
     for residual in &residuals {
         let (sharding, r#type) = match *residual {
-            ShardMapResidual::Input(index) => (&boundary.in_shardings()[index], &operation.input_types[index]),
-            ShardMapResidual::Output(index) => (&boundary.out_shardings()[index], &operation.output_types[index]),
+            ShardMapResidual::Input(index) => (&boundary.input_shardings()[index], &operation.input_types[index]),
+            ShardMapResidual::Output(index) => (&boundary.output_shardings()[index], &operation.output_types[index]),
             ShardMapResidual::Edge(edge) | ShardMapResidual::ReferenceSnapshot(edge) => {
                 (&edge_shardings[edge], &edge_global_types[edge])
             }
         };
-        tangent_in_shardings.push(sharding.clone());
+        tangent_input_shardings.push(sharding.clone());
         tangent_input_types.push(r#type.clone());
     }
     let tangent_output_types = operation
@@ -5346,8 +5355,8 @@ where
         .filter(|(_, active)| **active)
         .map(|(forwarded, _)| forwarded.map(|index| tangent_positions[index].unwrap()))
         .collect();
-    let tangent_out_shardings = boundary
-        .out_shardings()
+    let tangent_output_shardings = boundary
+        .output_shardings()
         .iter()
         .zip(&output_activity)
         .filter(|(_, active)| **active)
@@ -5356,8 +5365,8 @@ where
     let tangent_operation = ShardMapOperation::from_boundary(
         ShardMapBoundary::from_shardings(
             mesh.clone(),
-            tangent_in_shardings,
-            tangent_out_shardings,
+            tangent_input_shardings,
+            tangent_output_shardings,
             boundary.manual_axes().to_vec(),
         ),
         tangent_input_types,
@@ -5438,25 +5447,25 @@ where
     };
 
     let boundary = operation.boundary();
-    let mut in_shardings = boundary.in_shardings().to_vec();
+    let mut input_shardings = boundary.input_shardings().to_vec();
     let mut input_types = operation.input_types.clone();
     let mut fused_inputs = inputs.iter().map(|input| input.primal().clone()).collect::<Vec<_>>();
     for &index in &input_indices {
-        in_shardings.push(boundary.in_shardings()[index].clone());
+        input_shardings.push(boundary.input_shardings()[index].clone());
         input_types.push(operation.input_types[index].tangent()?);
         fused_inputs.push(inputs[index].tangent().clone().materialize(context.tangent())?);
     }
-    let mut out_shardings = boundary.out_shardings().to_vec();
+    let mut output_shardings = boundary.output_shardings().to_vec();
     let mut output_types = operation.output_types.clone();
     for index in (0..output_count).filter(|&index| output_activity[index]) {
-        out_shardings.push(boundary.out_shardings()[index].clone());
+        output_shardings.push(boundary.output_shardings()[index].clone());
         output_types.push(operation.output_types[index].tangent()?);
     }
     let fused_operation = ShardMapOperation::from_boundary(
         ShardMapBoundary::from_shardings(
             boundary.mesh().clone(),
-            in_shardings,
-            out_shardings,
+            input_shardings,
+            output_shardings,
             boundary.manual_axes().to_vec(),
         ),
         input_types,
@@ -6037,14 +6046,14 @@ where
     // The transposed inputs are the cotangents of the value outputs that are not structural zeros, the cotangent
     // references of the live inputs with `Reference` destinations that are not accumulated locally, and the known
     // inputs, in that order.
-    let mut in_shardings = Vec::new();
+    let mut input_shardings = Vec::new();
     let mut global_input_types = Vec::new();
     let mut zero_output_cotangents = zero_output_cotangents.iter();
-    for (output_type, sharding) in operation.output_types.iter().zip(boundary.out_shardings()) {
+    for (output_type, sharding) in operation.output_types.iter().zip(boundary.output_shardings()) {
         if output_type.is_reference() || *zero_output_cotangents.next().unwrap() {
             continue;
         }
-        in_shardings.push(sharding.cotangent());
+        input_shardings.push(sharding.cotangent());
         global_input_types.push(output_type.cotangent()?);
     }
     let mut destination_positions = vec![None; input_linearity.len()];
@@ -6053,7 +6062,7 @@ where
             continue;
         }
         destination_positions[index] = Some(global_input_types.len());
-        in_shardings.push(boundary.in_shardings()[index].cotangent());
+        input_shardings.push(boundary.input_shardings()[index].cotangent());
         let cotangent_type = operation.input_types[index].cotangent()?;
         global_input_types.push(if operation.input_types[index].is_reference() {
             cotangent_type
@@ -6062,7 +6071,7 @@ where
         });
     }
     for (index, _) in input_linearity.iter().enumerate().filter(|(_, linear)| !**linear) {
-        in_shardings.push(boundary.in_shardings()[index].clone());
+        input_shardings.push(boundary.input_shardings()[index].clone());
         global_input_types.push(operation.input_types[index].clone());
     }
 
@@ -6070,21 +6079,21 @@ where
     // destination whose cotangent is not a structural zero, the frozen local accumulator for a `Reference` destination
     // that is accumulated locally, and the forwarded cotangent reference for any other `Reference` destination of a
     // reference input. Every other destination (e.g., an `Ignore` destination) has no output.
-    let mut out_shardings = Vec::new();
+    let mut output_shardings = Vec::new();
     let mut global_output_types = Vec::new();
     let mut output_forwarding = Vec::new();
     for (index, _) in input_linearity.iter().enumerate().filter(|(_, linear)| **linear) {
         match destination_kinds[index] {
             CotangentDestinationKind::Return if zero_input_cotangents[index] => {}
             CotangentDestinationKind::Return => {
-                out_shardings.push(boundary.in_shardings()[index].cotangent());
+                output_shardings.push(boundary.input_shardings()[index].cotangent());
                 global_output_types.push(operation.input_types[index].cotangent()?);
                 output_forwarding.push(None);
             }
             CotangentDestinationKind::Reference
                 if operation.input_types[index].is_reference() || local_accumulators[index] =>
             {
-                out_shardings.push(boundary.in_shardings()[index].cotangent());
+                output_shardings.push(boundary.input_shardings()[index].cotangent());
                 let cotangent_type = operation.input_types[index].cotangent()?;
                 if local_accumulators[index] {
                     global_output_types.push(boundary_array_type(&cotangent_type)?.clone().into());
@@ -6099,8 +6108,8 @@ where
     }
     let boundary = ShardMapBoundary::from_shardings(
         boundary.mesh().clone(),
-        in_shardings,
-        out_shardings,
+        input_shardings,
+        output_shardings,
         boundary.manual_axes().to_vec(),
     );
     let operation = ShardMapOperation::from_boundary(boundary, global_input_types, global_output_types)
@@ -6148,8 +6157,8 @@ fn validate_parameter_structure<P: Parameter, Value: Parameterized<P>>(
 /// mesh is rejected with [`ShardMapError::EnclosingManualAxisMeshMismatch`].
 fn shard_map_within_named_axes(
     mesh: LogicalMesh,
-    in_shardings: Vec<Sharding>,
-    out_shardings: Vec<Sharding>,
+    input_shardings: Vec<Sharding>,
+    output_shardings: Vec<Sharding>,
     manual_axes: Vec<String>,
     named_axes: &[(String, NamedAxis)],
 ) -> Result<(ShardMapBoundary, Vec<(String, NamedAxis)>), ShardMapError> {
@@ -6171,7 +6180,7 @@ fn shard_map_within_named_axes(
     }
     let enclosing_manual_axes = enclosing_named_axes.iter().map(|(name, _)| name.as_str()).collect::<HashSet<_>>();
     let boundary =
-        ShardMapBoundary::new_within(mesh, in_shardings, out_shardings, manual_axes, &enclosing_manual_axes)?;
+        ShardMapBoundary::new_within(mesh, input_shardings, output_shardings, manual_axes, &enclosing_manual_axes)?;
     let mut visited_names = HashSet::new();
     for (name, binding) in named_axes {
         if visited_names.insert(name.as_str())
@@ -6231,9 +6240,9 @@ where
         TracingContext<C::Constant, C::Operation>:
             StagingContext<Type = ArrayIrType, Constant = C::Constant, Operation = C::Operation>,
     {
-        if global_input_types.len() != boundary.in_shardings().len() {
+        if global_input_types.len() != boundary.input_shardings().len() {
             return Err(ShardMapError::InputTypeCountMismatch {
-                expected: boundary.in_shardings().len(),
+                expected: boundary.input_shardings().len(),
                 actual: global_input_types.len(),
             });
         }
@@ -6269,7 +6278,7 @@ where
                     .into_iter()
                     .enumerate()
                     .map(|(index, mut output)| {
-                        if let Some(sharding) = boundary.out_shardings().get(index) {
+                        if let Some(sharding) = boundary.output_shardings().get(index) {
                             for axis in ShardMapBoundary::sharded_manual_axes(sharding, &boundary.manual_axis_names()) {
                                 let output_sharding = output.r#type().sharding().cloned();
                                 if !output_sharding
@@ -7507,8 +7516,8 @@ mod tests {
         let varying = sharded.clone().with_varying_manual_axes(["x"]).unwrap();
         let boundary =
             ShardMapBoundary::new(mesh, vec![varying.clone()], vec![varying], vec!["y".to_string()]).unwrap();
-        assert_eq!(boundary.in_shardings(), &[sharded.clone()]);
-        assert_eq!(boundary.out_shardings(), &[sharded]);
+        assert_eq!(boundary.input_shardings(), &[sharded.clone()]);
+        assert_eq!(boundary.output_shardings(), &[sharded]);
     }
 
     #[test]
@@ -7519,7 +7528,7 @@ mod tests {
     }
 
     #[test]
-    fn test_shard_map_boundary_in_shardings() {
+    fn test_shard_map_boundary_input_shardings() {
         // The input shardings keep their input order and are stored in their type-level form, without auto axes.
         let mesh = data_model_mesh();
         let sharded = Sharding::new(mesh.clone(), vec![ShardingDimension::sharded(["data", "model"])]).unwrap();
@@ -7528,11 +7537,11 @@ mod tests {
             ShardMapBoundary::new(mesh.clone(), vec![sharded.clone(), replicated.clone()], Vec::new(), Vec::new())
                 .unwrap();
         let expected = Sharding::new(mesh, vec![ShardingDimension::sharded(["data"])]).unwrap();
-        assert_eq!(boundary.in_shardings(), &[expected, replicated]);
+        assert_eq!(boundary.input_shardings(), &[expected, replicated]);
     }
 
     #[test]
-    fn test_shard_map_boundary_out_shardings() {
+    fn test_shard_map_boundary_output_shardings() {
         // The output shardings keep their output order and are stored in their type-level form, without auto axes.
         let mesh = data_model_mesh();
         let sharded = Sharding::new(mesh.clone(), vec![ShardingDimension::sharded(["data", "model"])]).unwrap();
@@ -7541,7 +7550,7 @@ mod tests {
             ShardMapBoundary::new(mesh.clone(), Vec::new(), vec![replicated.clone(), sharded.clone()], Vec::new())
                 .unwrap();
         let expected = Sharding::new(mesh, vec![ShardingDimension::sharded(["data"])]).unwrap();
-        assert_eq!(boundary.out_shardings(), &[replicated, expected]);
+        assert_eq!(boundary.output_shardings(), &[replicated, expected]);
     }
 
     #[test]
@@ -8316,8 +8325,8 @@ mod tests {
                 lambda %0:f32[] .
                 let %1:f32[] = shard_map [
                     mesh=['x'=2:manual, 'y'=2:manual],
-                    in_shardings=[{mesh<['x'=2:manual, 'y'=2:manual]>, []}],
-                    out_shardings=[{mesh<['x'=2:manual, 'y'=2:manual]>, []}],
+                    input_shardings=[{mesh<['x'=2:manual, 'y'=2:manual]>, []}],
+                    output_shardings=[{mesh<['x'=2:manual, 'y'=2:manual]>, []}],
                     manual_axes=['x'],
                     global_input_types=[f32[]],
                     global_output_types=[f32[]],
@@ -8407,8 +8416,8 @@ mod tests {
             indoc! {r#"
                 shard_map [
                     mesh=['a\'b'=2:manual, 'c\\d'=2:manual, 'e\nf'=2:manual],
-                    in_shardings=[],
-                    out_shardings=[],
+                    input_shardings=[],
+                    output_shardings=[],
                     manual_axes=[],
                     global_input_types=[],
                     global_output_types=[],
@@ -8426,8 +8435,8 @@ mod tests {
             indoc! {"
                 shard_map [
                     mesh=['x'=2:manual],
-                    in_shardings=[{mesh<['x'=2:manual]>, [{'x'}]}, {mesh<['x'=2:manual]>, [{'x'}]}],
-                    out_shardings=[{mesh<['x'=2:manual]>, [{'x'}]}],
+                    input_shardings=[{mesh<['x'=2:manual]>, [{'x'}]}, {mesh<['x'=2:manual]>, [{'x'}]}],
+                    output_shardings=[{mesh<['x'=2:manual]>, [{'x'}]}],
                     manual_axes=['x'],
                     global_input_types=[ref<f32[4]>, f32[4]],
                     global_output_types=[f32[4]],
@@ -8438,8 +8447,8 @@ mod tests {
             indoc! {"
                 shard_map [
                     mesh=['x'=2:manual],
-                    in_shardings=[{mesh<['x'=2:manual]>, [{'x'}]}, {mesh<['x'=2:manual]>, [{'x'}]}],
-                    out_shardings=[{mesh<['x'=2:manual]>, [{'x'}]}],
+                    input_shardings=[{mesh<['x'=2:manual]>, [{'x'}]}, {mesh<['x'=2:manual]>, [{'x'}]}],
+                    output_shardings=[{mesh<['x'=2:manual]>, [{'x'}]}],
                     manual_axes=['x'],
                     global_input_types=[ref<f32[4]>, f32[4]],
                     global_output_types=[f32[4]],
@@ -8477,8 +8486,8 @@ mod tests {
             indoc! {"
                 shard_map [
                     mesh=['x'=2:manual],
-                    in_shardings=[{mesh<['x'=2:manual]>, [{'x'}]}],
-                    out_shardings=[{mesh<['x'=2:manual]>, [{'x'}]}],
+                    input_shardings=[{mesh<['x'=2:manual]>, [{'x'}]}],
+                    output_shardings=[{mesh<['x'=2:manual]>, [{'x'}]}],
                     manual_axes=['x'],
                     global_input_types=[f32[4][sharding={mesh<['x'=2:manual]>, [{'x'}]}]],
                     global_output_types=[f32[4][sharding={mesh<['x'=2:manual]>, [{'x'}]}]],
@@ -9339,8 +9348,8 @@ mod tests {
             ShardMapOperation::from_boundary(
                 ShardMapBoundary::from_shardings(
                     manual_mesh(),
-                    operation.boundary().in_shardings()[0..1].to_vec(),
-                    operation.boundary().out_shardings()[0..1].to_vec(),
+                    operation.boundary().input_shardings()[0..1].to_vec(),
+                    operation.boundary().output_shardings()[0..1].to_vec(),
                     vec!["x".to_string()],
                 ),
                 operation.global_input_types()[0..1].to_vec(),
@@ -9373,8 +9382,8 @@ mod tests {
                 lambda %0:f32[], %1:f32[] .
                 let %2:f32[] = shard_map [
                     mesh=['x'=2:manual],
-                    in_shardings=[{mesh<['x'=2:manual]>, []}, {mesh<['x'=2:manual]>, []}],
-                    out_shardings=[{mesh<['x'=2:manual]>, []}],
+                    input_shardings=[{mesh<['x'=2:manual]>, []}, {mesh<['x'=2:manual]>, []}],
+                    output_shardings=[{mesh<['x'=2:manual]>, []}],
                     manual_axes=['x'],
                     global_input_types=[f32[], f32[]],
                     global_output_types=[f32[]],
@@ -9393,8 +9402,8 @@ mod tests {
                 lambda %0:f32[], %1:f32[] .
                 let %2:f32[] = shard_map [
                     mesh=['x'=2:manual],
-                    in_shardings=[{mesh<['x'=2:manual]>, []}],
-                    out_shardings=[{mesh<['x'=2:manual]>, []}],
+                    input_shardings=[{mesh<['x'=2:manual]>, []}],
+                    output_shardings=[{mesh<['x'=2:manual]>, []}],
                     manual_axes=['x'],
                     global_input_types=[f32[]],
                     global_output_types=[f32[]],
@@ -9464,8 +9473,8 @@ mod tests {
                 lambda %0:f32[], %1:f32[], %2:f32[] .
                 let %3:f32[] = shard_map [
                     mesh=['x'=2:manual],
-                    in_shardings=[{mesh<['x'=2:manual]>, []}, {mesh<['x'=2:manual]>, []}],
-                    out_shardings=[{mesh<['x'=2:manual]>, []}],
+                    input_shardings=[{mesh<['x'=2:manual]>, []}, {mesh<['x'=2:manual]>, []}],
+                    output_shardings=[{mesh<['x'=2:manual]>, []}],
                     manual_axes=['x'],
                     global_input_types=[f32[], f32[]],
                     global_output_types=[f32[]],
@@ -9540,8 +9549,8 @@ mod tests {
                 lambda %0:f32[], %1:f32[] .
                 let () = shard_map [
                     mesh=['x'=2:manual],
-                    in_shardings=[{mesh<['x'=2:manual]>, []}],
-                    out_shardings=[],
+                    input_shardings=[{mesh<['x'=2:manual]>, []}],
+                    output_shardings=[],
                     manual_axes=['x'],
                     global_input_types=[f32[]],
                     global_output_types=[],
@@ -9554,8 +9563,8 @@ mod tests {
                 ]
                     () = shard_map [
                         mesh=['x'=2:manual],
-                        in_shardings=[{mesh<['x'=2:manual]>, []}],
-                        out_shardings=[],
+                        input_shardings=[{mesh<['x'=2:manual]>, []}],
+                        output_shardings=[],
                         manual_axes=['x'],
                         global_input_types=[f32[]],
                         global_output_types=[],
@@ -9568,8 +9577,8 @@ mod tests {
                     ]
                     %2:f32[] = shard_map [
                         mesh=['x'=2:manual],
-                        in_shardings=[{mesh<['x'=2:manual]>, []}, {mesh<['x'=2:manual]>, []}],
-                        out_shardings=[{mesh<['x'=2:manual]>, []}],
+                        input_shardings=[{mesh<['x'=2:manual]>, []}, {mesh<['x'=2:manual]>, []}],
+                        output_shardings=[{mesh<['x'=2:manual]>, []}],
                         manual_axes=['x'],
                         global_input_types=[f32[], f32[]],
                         global_output_types=[f32[]],
@@ -9601,8 +9610,8 @@ mod tests {
                 lambda %0:{scalar_type}, %1:{global_type} .
                 let () = shard_map [
                     mesh=['x'=2:manual],
-                    in_shardings=[{replicated}, {sharded}],
-                    out_shardings=[],
+                    input_shardings=[{replicated}, {sharded}],
+                    output_shardings=[],
                     manual_axes=['x'],
                     global_input_types=[{scalar_type}, {global_type}],
                     global_output_types=[],
@@ -9666,8 +9675,8 @@ mod tests {
                 lambda %0:f32[], %1:f32[], %2:f32[], %3:f32[] .
                 let %4:{scalar}, %5:{scalar} = shard_map [
                     mesh=['x'=2:manual],
-                    in_shardings=[{replicated}, {replicated}, {replicated}, {replicated}],
-                    out_shardings=[{replicated}, {replicated}],
+                    input_shardings=[{replicated}, {replicated}, {replicated}, {replicated}],
+                    output_shardings=[{replicated}, {replicated}],
                     manual_axes=['x'],
                     global_input_types=[{scalar}, {scalar}, {scalar}, {scalar}],
                     global_output_types=[{scalar}, {scalar}],
@@ -9737,8 +9746,8 @@ mod tests {
                 lambda %0:f32[], %1:f32[] .
                 let %2:f32[] = shard_map [
                     mesh=['x'=2:manual, 'y'=2:manual],
-                    in_shardings=[{mesh<['x'=2:manual, 'y'=2:manual]>, []}, {mesh<['x'=2:manual, 'y'=2:manual]>, []}],
-                    out_shardings=[{mesh<['x'=2:manual, 'y'=2:manual]>, []}],
+                    input_shardings=[{mesh<['x'=2:manual, 'y'=2:manual]>, []}, {mesh<['x'=2:manual, 'y'=2:manual]>, []}],
+                    output_shardings=[{mesh<['x'=2:manual, 'y'=2:manual]>, []}],
                     manual_axes=['x'],
                     global_input_types=[f32[], f32[]],
                     global_output_types=[f32[]],
@@ -9747,9 +9756,9 @@ mod tests {
                         lambda %0:f32[], %1:f32[] .
                         let %2:f32[] = shard_map [
                             mesh=['x'=2:manual, 'y'=2:manual],
-                            in_shardings=[{mesh<['x'=2:manual, 'y'=2:manual]>, []}, {mesh<['x'=2:manual, \
+                            input_shardings=[{mesh<['x'=2:manual, 'y'=2:manual]>, []}, {mesh<['x'=2:manual, \
                     'y'=2:manual]>, []}],
-                            out_shardings=[{mesh<['x'=2:manual, 'y'=2:manual]>, []}],
+                            output_shardings=[{mesh<['x'=2:manual, 'y'=2:manual]>, []}],
                             manual_axes=['y'],
                             global_input_types=[f32[], f32[]],
                             global_output_types=[f32[]],
@@ -9839,8 +9848,8 @@ mod tests {
                     lambda %0:f32[] .
                     let %1:f32[] = shard_map [
                         mesh=['x'=2:manual],
-                        in_shardings=[{mesh<['x'=2:manual]>, []}],
-                        out_shardings=[{mesh<['x'=2:manual]>, []}],
+                        input_shardings=[{mesh<['x'=2:manual]>, []}],
+                        output_shardings=[{mesh<['x'=2:manual]>, []}],
                         manual_axes=['x'],
                         global_input_types=[f32[]],
                         global_output_types=[f32[]],
@@ -9857,8 +9866,8 @@ mod tests {
                     lambda %0:f32[], %1:f32[] .
                     let %2:f32[] = shard_map [
                         mesh=['x'=2:manual],
-                        in_shardings=[{mesh<['x'=2:manual]>, []}],
-                        out_shardings=[{mesh<['x'=2:manual]>, []}],
+                        input_shardings=[{mesh<['x'=2:manual]>, []}],
+                        output_shardings=[{mesh<['x'=2:manual]>, []}],
                         manual_axes=['x'],
                         global_input_types=[f32[]],
                         global_output_types=[f32[]],
@@ -9901,8 +9910,8 @@ mod tests {
                 lambda %0:ref<f32[4]>, %1:f32[4] .
                 let %2:f32[4] = shard_map [
                     mesh=['x'=2:manual],
-                    in_shardings=[{mesh<['x'=2:manual]>, [{'x'}]}, {mesh<['x'=2:manual]>, [{'x'}]}],
-                    out_shardings=[{mesh<['x'=2:manual]>, [{'x'}]}],
+                    input_shardings=[{mesh<['x'=2:manual]>, [{'x'}]}, {mesh<['x'=2:manual]>, [{'x'}]}],
+                    output_shardings=[{mesh<['x'=2:manual]>, [{'x'}]}],
                     manual_axes=['x'],
                     global_input_types=[ref<f32[4]>, f32[4]],
                     global_output_types=[f32[4]],
@@ -9960,8 +9969,8 @@ mod tests {
                 lambda %0:f32[4], %1:f32[4] .
                 let %2:f32[4], %3:f32[4] = shard_map [
                     mesh=['x'=2:manual],
-                    in_shardings=[{mesh<['x'=2:manual]>, [{'x'}]}, {mesh<['x'=2:manual]>, [{'x'}]}],
-                    out_shardings=[{mesh<['x'=2:manual]>, [{'x'}]}, {mesh<['x'=2:manual]>, [{'x'}]}],
+                    input_shardings=[{mesh<['x'=2:manual]>, [{'x'}]}, {mesh<['x'=2:manual]>, [{'x'}]}],
+                    output_shardings=[{mesh<['x'=2:manual]>, [{'x'}]}, {mesh<['x'=2:manual]>, [{'x'}]}],
                     manual_axes=['x'],
                     global_input_types=[f32[4], f32[4]],
                     global_output_types=[f32[4], f32[4]],
@@ -10009,8 +10018,8 @@ mod tests {
                 [{'x'}]}] .
                 let %2:f32[4], %3:f32[4][sharding={mesh<['x'=2:manual]>, [{'x'}]}] = shard_map [
                     mesh=['x'=2:manual],
-                    in_shardings=[{mesh<['x'=2:manual]>, [{'x'}]}, {mesh<['x'=2:manual]>, [{'x'}]}],
-                    out_shardings=[{mesh<['x'=2:manual]>, [{'x'}]}, {mesh<['x'=2:manual]>, [{'x'}]}],
+                    input_shardings=[{mesh<['x'=2:manual]>, [{'x'}]}, {mesh<['x'=2:manual]>, [{'x'}]}],
+                    output_shardings=[{mesh<['x'=2:manual]>, [{'x'}]}, {mesh<['x'=2:manual]>, [{'x'}]}],
                     manual_axes=['x'],
                     global_input_types=[f32[4], f32[4]],
                     global_output_types=[f32[4], f32[4][sharding={mesh<['x'=2:manual]>, [{'x'}]}]],
@@ -10044,8 +10053,8 @@ mod tests {
                 lambda %0:f32[2], %1:f32[4] .
                 let %2:f32[4] = shard_map [
                     mesh=['x'=2:manual],
-                    in_shardings=[{mesh<['x'=2:manual]>, [{}]}, {mesh<['x'=2:manual]>, [{'x'}]}],
-                    out_shardings=[{mesh<['x'=2:manual]>, [{'x'}]}],
+                    input_shardings=[{mesh<['x'=2:manual]>, [{}]}, {mesh<['x'=2:manual]>, [{'x'}]}],
+                    output_shardings=[{mesh<['x'=2:manual]>, [{'x'}]}],
                     manual_axes=['x'],
                     global_input_types=[f32[2], f32[4]],
                     global_output_types=[f32[4]],
@@ -10095,8 +10104,8 @@ mod tests {
                 lambda %0:f32[2], %1:f32[4] .
                 let %2:f32[4], %3:f32[2] = shard_map [
                     mesh=['x'=2:manual],
-                    in_shardings=[{mesh<['x'=2:manual]>, [{}]}, {mesh<['x'=2:manual]>, [{'x'}]}],
-                    out_shardings=[{mesh<['x'=2:manual]>, [{'x'}]}, {mesh<['x'=2:manual]>, [{}]}],
+                    input_shardings=[{mesh<['x'=2:manual]>, [{}]}, {mesh<['x'=2:manual]>, [{'x'}]}],
+                    output_shardings=[{mesh<['x'=2:manual]>, [{'x'}]}, {mesh<['x'=2:manual]>, [{}]}],
                     manual_axes=['x'],
                     global_input_types=[f32[2], f32[4]],
                     global_output_types=[f32[4], f32[2]],
@@ -10173,8 +10182,8 @@ mod tests {
                 lambda %0:f32[2, 1][sharding={mesh<['x'=2:manual]>, [{}, {}]}] .
                 let %1:f32[2][sharding={mesh<['x'=2:manual]>, [{'x'}]}] = shard_map [
                     mesh=['x'=2:manual],
-                    in_shardings=[{mesh<['x'=2:manual]>, [{}, {}]}],
-                    out_shardings=[{mesh<['x'=2:manual]>, [{'x'}]}],
+                    input_shardings=[{mesh<['x'=2:manual]>, [{}, {}]}],
+                    output_shardings=[{mesh<['x'=2:manual]>, [{'x'}]}],
                     manual_axes=['x'],
                     global_input_types=[f32[2, 1][sharding={mesh<['x'=2:manual]>, [{}, {}]}]],
                     global_output_types=[f32[2][sharding={mesh<['x'=2:manual]>, [{'x'}]}]],
@@ -10376,7 +10385,7 @@ mod tests {
         let operation = ShardMapOperation::from_boundary(
             ShardMapBoundary::from_shardings(
                 manual_mesh(),
-                operation.boundary().in_shardings().to_vec(),
+                operation.boundary().input_shardings().to_vec(),
                 vec![sharded.clone(), sharded],
                 vec!["x".to_string()],
             ),
@@ -10428,8 +10437,8 @@ mod tests {
                 lambda %0:f32[4], %1:f32[4] .
                 let %2:f32[4], %3:f32[4] = shard_map [
                     mesh=['x'=2:manual],
-                    in_shardings=[{mesh<['x'=2:manual]>, [{'x'}]}, {mesh<['x'=2:manual]>, [{'x'}]}],
-                    out_shardings=[{mesh<['x'=2:manual]>, [{'x'}]}, {mesh<['x'=2:manual]>, [{'x'}]}],
+                    input_shardings=[{mesh<['x'=2:manual]>, [{'x'}]}, {mesh<['x'=2:manual]>, [{'x'}]}],
+                    output_shardings=[{mesh<['x'=2:manual]>, [{'x'}]}, {mesh<['x'=2:manual]>, [{'x'}]}],
                     manual_axes=['x'],
                     global_input_types=[f32[4], f32[4]],
                     global_output_types=[f32[4], f32[4]],
@@ -10552,8 +10561,8 @@ mod tests {
                 lambda %0:{global}, %1:{global} .
                 let %2:{global}, %3:{global} = shard_map [
                     mesh=['x'=2:manual],
-                    in_shardings=[{sharding}, {sharding}],
-                    out_shardings=[{sharding}, {sharding}],
+                    input_shardings=[{sharding}, {sharding}],
+                    output_shardings=[{sharding}, {sharding}],
                     manual_axes=['x'],
                     global_input_types=[{global}, {global}],
                     global_output_types=[{global}, {global}],
@@ -12064,7 +12073,7 @@ mod tests {
         let grid = ManualDeviceGrid { axes: vec![("x".to_string(), 2)] };
         let partials = [f32_value(local_type.clone(), &[1.0, 2.0]), f32_value(local_type, &[10.0, 20.0])];
         assert_eq!(
-            assemble_global_value(&boundary.out_shardings()[0], &unreduced_type, &grid, &partials)
+            assemble_global_value(&boundary.output_shardings()[0], &unreduced_type, &grid, &partials)
                 .map(ArrayIrValue::Array),
             Ok(f32_value(unreduced_type, &[11.0, 22.0])),
         );
@@ -12590,8 +12599,8 @@ mod tests {
                 lambda %0:f32[] .
                 let %1:f32[] = shard_map [
                     mesh=['x'=2:manual],
-                    in_shardings=[{mesh<['x'=2:manual]>, []}],
-                    out_shardings=[{mesh<['x'=2:manual]>, []}],
+                    input_shardings=[{mesh<['x'=2:manual]>, []}],
+                    output_shardings=[{mesh<['x'=2:manual]>, []}],
                     manual_axes=['x'],
                     global_input_types=[f32[]],
                     global_output_types=[f32[]],
@@ -12613,8 +12622,8 @@ mod tests {
                 lambda %0:f32[], %1:f32[] .
                 let %2:f32[], %3:f32[] = shard_map [
                     mesh=['x'=2:manual],
-                    in_shardings=[{mesh<['x'=2:manual]>, []}, {mesh<['x'=2:manual]>, []}],
-                    out_shardings=[{mesh<['x'=2:manual]>, []}, {mesh<['x'=2:manual]>, []}],
+                    input_shardings=[{mesh<['x'=2:manual]>, []}, {mesh<['x'=2:manual]>, []}],
+                    output_shardings=[{mesh<['x'=2:manual]>, []}, {mesh<['x'=2:manual]>, []}],
                     manual_axes=['x'],
                     global_input_types=[f32[], f32[]],
                     global_output_types=[f32[], f32[]],
@@ -12662,8 +12671,8 @@ mod tests {
                 lambda %0:f32[], %1:f32[] .
                 let %2:f32[], %3:f32[] = shard_map [
                     mesh=['x'=2:manual],
-                    in_shardings=[{mesh<['x'=2:manual]>, []}, {mesh<['x'=2:manual]>, []}],
-                    out_shardings=[{mesh<['x'=2:manual]>, []}, {mesh<['x'=2:manual]>, []}],
+                    input_shardings=[{mesh<['x'=2:manual]>, []}, {mesh<['x'=2:manual]>, []}],
+                    output_shardings=[{mesh<['x'=2:manual]>, []}, {mesh<['x'=2:manual]>, []}],
                     manual_axes=['x'],
                     global_input_types=[f32[], f32[]],
                     global_output_types=[f32[], f32[]],
@@ -12729,8 +12738,8 @@ mod tests {
                 lambda %0:{global_type}, %1:{global_type} .
                 let %2:{global_type} = shard_map [
                     mesh=['x'=2:manual],
-                    in_shardings=[{sharded}, {sharded}],
-                    out_shardings=[{sharded}],
+                    input_shardings=[{sharded}, {sharded}],
+                    output_shardings=[{sharded}],
                     manual_axes=['x'],
                     global_input_types=[{global_type}, {global_type}],
                     global_output_types=[{global_type}],
@@ -12794,8 +12803,8 @@ mod tests {
                 lambda %0:{global}, %1:{global}, %2:{global}, %3:{global} .
                 let %4:{global} = shard_map [
                     mesh=['x'=2:manual],
-                    in_shardings=[{sharding}, {sharding}, {sharding}, {sharding}],
-                    out_shardings=[{sharding}],
+                    input_shardings=[{sharding}, {sharding}, {sharding}, {sharding}],
+                    output_shardings=[{sharding}],
                     manual_axes=['x'],
                     global_input_types=[{global}, {global}, {global}, {global}],
                     global_output_types=[{global}],
@@ -12835,8 +12844,8 @@ mod tests {
                 lambda %0:{global}, %1:{global}, %2:{global}, %3:{global} .
                 let %4:{global}, %5:{global} = shard_map [
                     mesh=['x'=2:manual],
-                    in_shardings=[{sharding}, {sharding}, {sharding}, {sharding}],
-                    out_shardings=[{sharding}, {sharding}],
+                    input_shardings=[{sharding}, {sharding}, {sharding}, {sharding}],
+                    output_shardings=[{sharding}, {sharding}],
                     manual_axes=['x'],
                     global_input_types=[{global}, {global}, {global}, {global}],
                     global_output_types=[{global}, {global}],
@@ -12898,8 +12907,8 @@ mod tests {
                 lambda %0:{global}, %1:{global} .
                 let %2:{global}, %3:{global}, %4:{global} = shard_map [
                     mesh=['x'=2:manual],
-                    in_shardings=[{sharding}, {sharding}],
-                    out_shardings=[{sharding}, {sharding}, {sharding}],
+                    input_shardings=[{sharding}, {sharding}],
+                    output_shardings=[{sharding}, {sharding}, {sharding}],
                     manual_axes=['x'],
                     global_input_types=[{global}, {global}],
                     global_output_types=[{global}, {global}, {global}],
@@ -12920,8 +12929,8 @@ mod tests {
                 lambda %0:{global}, %1:{global}, %2:{global}, %3:{global}, %4:{global} .
                 let %5:{global} = shard_map [
                     mesh=['x'=2:manual],
-                    in_shardings=[{sharding}, {sharding}, {sharding}, {sharding}, {sharding}],
-                    out_shardings=[{sharding}],
+                    input_shardings=[{sharding}, {sharding}, {sharding}, {sharding}, {sharding}],
+                    output_shardings=[{sharding}],
                     manual_axes=['x'],
                     global_input_types=[{global}, {global}, {global}, {global}, {global}],
                     global_output_types=[{global}],
@@ -12983,8 +12992,8 @@ mod tests {
                 lambda %0:f32[], %1:f32[] .
                 let %2:{global_type} = shard_map [
                     mesh=['x'=2:manual],
-                    in_shardings=[{replicated}, {replicated}],
-                    out_shardings=[{replicated}],
+                    input_shardings=[{replicated}, {replicated}],
+                    output_shardings=[{replicated}],
                     manual_axes=['x'],
                     global_input_types=[{global_type}, {global_type}],
                     global_output_types=[{global_type}],
@@ -13060,8 +13069,8 @@ mod tests {
                     %1:f32[4][sharding={mesh<['x'=2:manual]>, [{'x'}]}] .
                 let %2:f32[4][sharding={mesh<['x'=2:manual]>, [{'x'}]}] = shard_map [
                     mesh=['x'=2:manual],
-                    in_shardings=[{mesh<['x'=2:manual]>, [{'x'}]}],
-                    out_shardings=[{mesh<['x'=2:manual]>, [{'x'}]}],
+                    input_shardings=[{mesh<['x'=2:manual]>, [{'x'}]}],
+                    output_shardings=[{mesh<['x'=2:manual]>, [{'x'}]}],
                     manual_axes=['x'],
                     global_input_types=[f32[4][sharding={mesh<['x'=2:manual]>, [{'x'}]}]],
                     global_output_types=[f32[4][sharding={mesh<['x'=2:manual]>, [{'x'}]}]],
@@ -13082,8 +13091,8 @@ mod tests {
                     %1:f32[4][sharding={mesh<['x'=2:manual]>, [{'x'}]}] .
                 let %2:f32[4][sharding={mesh<['x'=2:manual]>, [{'x'}]}] = shard_map [
                     mesh=['x'=2:manual],
-                    in_shardings=[{mesh<['x'=2:manual]>, [{'x'}]}, {mesh<['x'=2:manual]>, [{'x'}]}],
-                    out_shardings=[{mesh<['x'=2:manual]>, [{'x'}]}],
+                    input_shardings=[{mesh<['x'=2:manual]>, [{'x'}]}, {mesh<['x'=2:manual]>, [{'x'}]}],
+                    output_shardings=[{mesh<['x'=2:manual]>, [{'x'}]}],
                     manual_axes=['x'],
                     global_input_types=[f32[4][sharding={mesh<['x'=2:manual]>, [{'x'}]}], \
                         f32[4][sharding={mesh<['x'=2:manual]>, [{'x'}]}]],
@@ -13148,8 +13157,8 @@ mod tests {
                 lambda %0:{global_type}, %1:{global_type} .
                 let %2:{global_type} = shard_map [
                     mesh=['x'=2:manual],
-                    in_shardings=[{sharded}, {sharded}],
-                    out_shardings=[{sharded}],
+                    input_shardings=[{sharded}, {sharded}],
+                    output_shardings=[{sharded}],
                     manual_axes=['x'],
                     global_input_types=[{global_type}, {global_type}],
                     global_output_types=[{global_type}],
@@ -13194,8 +13203,8 @@ mod tests {
                 lambda %0:f32[4] .
                 let %1:{global_type} = shard_map [
                     mesh=['x'=2:manual],
-                    in_shardings=[{sharded}],
-                    out_shardings=[{sharded}],
+                    input_shardings=[{sharded}],
+                    output_shardings=[{sharded}],
                     manual_axes=['x'],
                     global_input_types=[{global_type}],
                     global_output_types=[{global_type}],
@@ -13213,8 +13222,8 @@ mod tests {
                 lambda %0:f32[4], %1:f32[4] .
                 let %2:{global_type} = shard_map [
                     mesh=['x'=2:manual],
-                    in_shardings=[{sharded}, {sharded}],
-                    out_shardings=[{sharded}],
+                    input_shardings=[{sharded}, {sharded}],
+                    output_shardings=[{sharded}],
                     manual_axes=['x'],
                     global_input_types=[{global_type}, {global_type}],
                     global_output_types=[{global_type}],
@@ -13294,8 +13303,8 @@ mod tests {
                 lambda %0:{global_type} .
                 let %1:{global_type} = shard_map [
                     mesh=['x'=2:manual],
-                    in_shardings=[{sharded}],
-                    out_shardings=[{sharded}],
+                    input_shardings=[{sharded}],
+                    output_shardings=[{sharded}],
                     manual_axes=['x'],
                     global_input_types=[{global_type}],
                     global_output_types=[{global_type}],
@@ -13314,8 +13323,8 @@ mod tests {
                 lambda %0:{global_type}, %1:{global_type} .
                 let %2:{global_type} = shard_map [
                     mesh=['x'=2:manual],
-                    in_shardings=[{sharded}, {sharded}],
-                    out_shardings=[{sharded}],
+                    input_shardings=[{sharded}, {sharded}],
+                    output_shardings=[{sharded}],
                     manual_axes=['x'],
                     global_input_types=[{global_type}, {global_type}],
                     global_output_types=[{global_type}],
@@ -13381,8 +13390,8 @@ mod tests {
                 lambda %0:{reduced_type}, %1:{unreduced_type} .
                 let %2:{unreduced_type} = shard_map [
                     mesh=['x'=2:manual],
-                    in_shardings=[{reduced}, {unreduced}],
-                    out_shardings=[{unreduced}],
+                    input_shardings=[{reduced}, {unreduced}],
+                    output_shardings=[{unreduced}],
                     manual_axes=['x'],
                     global_input_types=[{reduced_type}, {unreduced_type}],
                     global_output_types=[{unreduced_type}],
@@ -13447,8 +13456,8 @@ mod tests {
                 lambda %0:{reduced_type}, %1:{reduced_type} .
                 let %2:{reduced_type} = shard_map [
                     mesh=['x'=2:manual],
-                    in_shardings=[{reduced}, {reduced}],
-                    out_shardings=[{reduced}],
+                    input_shardings=[{reduced}, {reduced}],
+                    output_shardings=[{reduced}],
                     manual_axes=['x'],
                     global_input_types=[{reduced_type}, {reduced_type}],
                     global_output_types=[{reduced_type}],
@@ -13511,8 +13520,8 @@ mod tests {
                 lambda %0:{reduced_type}, %1:{unreduced_type} .
                 let %2:{unreduced_type} = shard_map [
                     mesh=['x'=2:manual],
-                    in_shardings=[{reduced}, {unreduced}],
-                    out_shardings=[{unreduced}],
+                    input_shardings=[{reduced}, {unreduced}],
+                    output_shardings=[{unreduced}],
                     manual_axes=['x'],
                     global_input_types=[{reduced_type}, {unreduced_type}],
                     global_output_types=[{unreduced_type}],
@@ -13575,8 +13584,8 @@ mod tests {
                 lambda %0:{scalar}, %1:{scalar} .
                 let () = shard_map [
                     mesh=['x'=2:manual],
-                    in_shardings=[{replicated}, {replicated}],
-                    out_shardings=[],
+                    input_shardings=[{replicated}, {replicated}],
+                    output_shardings=[],
                     manual_axes=['x'],
                     global_input_types=[{scalar}, {scalar}],
                     global_output_types=[],
@@ -13650,8 +13659,8 @@ mod tests {
                 lambda %0:{scalar}, %1:{scalar} .
                 let () = shard_map [
                     mesh=['x'=2:manual],
-                    in_shardings=[{replicated}, {replicated}],
-                    out_shardings=[],
+                    input_shardings=[{replicated}, {replicated}],
+                    output_shardings=[],
                     manual_axes=['x'],
                     global_input_types=[{scalar}, {scalar}],
                     global_output_types=[],
@@ -13766,8 +13775,8 @@ mod tests {
                 lambda %0:f32[] .
                 let %1:{scalar}, %2:{scalar} = shard_map [
                     mesh=['x'=2:manual],
-                    in_shardings=[{replicated}],
-                    out_shardings=[{replicated}, {replicated}],
+                    input_shardings=[{replicated}],
+                    output_shardings=[{replicated}, {replicated}],
                     manual_axes=['x'],
                     global_input_types=[{scalar}],
                     global_output_types=[{scalar}, {scalar}],
@@ -13787,8 +13796,8 @@ mod tests {
                 lambda %0:f32[], %1:{scalar} .
                 let %2:{scalar} = shard_map [
                     mesh=['x'=2:manual],
-                    in_shardings=[{replicated}, {replicated}],
-                    out_shardings=[{replicated}],
+                    input_shardings=[{replicated}, {replicated}],
+                    output_shardings=[{replicated}],
                     manual_axes=['x'],
                     global_input_types=[{scalar}, {scalar}],
                     global_output_types=[{scalar}],
@@ -13841,8 +13850,8 @@ mod tests {
                 lambda %0:f32[], %1:f32[] .
                 let %2:{scalar}, %3:{scalar} = shard_map [
                     mesh=['x'=2:manual],
-                    in_shardings=[{replicated}, {replicated}],
-                    out_shardings=[{replicated}, {replicated}],
+                    input_shardings=[{replicated}, {replicated}],
+                    output_shardings=[{replicated}, {replicated}],
                     manual_axes=['x'],
                     global_input_types=[{scalar}, {scalar}],
                     global_output_types=[{scalar}, {scalar}],
@@ -13942,8 +13951,8 @@ mod tests {
                 lambda %0:f32[] .
                 let %1:i64[2][sharding={mesh<['x'=2:manual]>, [{'x'}]}] = shard_map [
                     mesh=['x'=2:manual],
-                    in_shardings=[{mesh<['x'=2:manual]>, []}],
-                    out_shardings=[{mesh<['x'=2:manual]>, [{'x'}]}],
+                    input_shardings=[{mesh<['x'=2:manual]>, []}],
+                    output_shardings=[{mesh<['x'=2:manual]>, [{'x'}]}],
                     manual_axes=['x'],
                     global_input_types=[f32[]],
                     global_output_types=[i64[2][sharding={mesh<['x'=2:manual]>, [{'x'}]}]],
@@ -13971,8 +13980,8 @@ mod tests {
                 lambda %0:f32[], %1:i64[2][sharding={mesh<['x'=2:manual]>, [{'x'}]}] .
                 let %2:f32[] = shard_map [
                     mesh=['x'=2:manual],
-                    in_shardings=[{mesh<['x'=2:manual]>, []}, {mesh<['x'=2:manual]>, [{'x'}]}],
-                    out_shardings=[{mesh<['x'=2:manual]>, []}],
+                    input_shardings=[{mesh<['x'=2:manual]>, []}, {mesh<['x'=2:manual]>, [{'x'}]}],
+                    output_shardings=[{mesh<['x'=2:manual]>, []}],
                     manual_axes=['x'],
                     global_input_types=[f32[], i64[2][sharding={mesh<['x'=2:manual]>, [{'x'}]}]],
                     global_output_types=[f32[]],
@@ -14093,9 +14102,9 @@ mod tests {
                     %2:i64[2][sharding={mesh<['x'=2:manual]>, [{'x'}]}] .
                 let %3:f32[], %4:f32[] = shard_map [
                     mesh=['x'=2:manual],
-                    in_shardings=[{mesh<['x'=2:manual]>, []}, {mesh<['x'=2:manual]>, [{'x'}]}, \
+                    input_shardings=[{mesh<['x'=2:manual]>, []}, {mesh<['x'=2:manual]>, [{'x'}]}, \
                         {mesh<['x'=2:manual]>, [{'x'}]}],
-                    out_shardings=[{mesh<['x'=2:manual]>, []}, {mesh<['x'=2:manual]>, []}],
+                    output_shardings=[{mesh<['x'=2:manual]>, []}, {mesh<['x'=2:manual]>, []}],
                     manual_axes=['x'],
                     global_input_types=[f32[], i64[2][sharding={mesh<['x'=2:manual]>, [{'x'}]}], \
                         i64[2][sharding={mesh<['x'=2:manual]>, [{'x'}]}]],
@@ -14142,8 +14151,8 @@ mod tests {
                 lambda %0:{global_type}, %1:i64[2][sharding={sharded}] .
                 let %2:{global_type} = shard_map [
                     mesh=['x'=2:manual],
-                    in_shardings=[{sharded}, {sharded}],
-                    out_shardings=[{sharded}],
+                    input_shardings=[{sharded}, {sharded}],
+                    output_shardings=[{sharded}],
                     manual_axes=['x'],
                     global_input_types=[{global_type}, i64[2][sharding={sharded}]],
                     global_output_types=[{global_type}],
@@ -14213,8 +14222,8 @@ mod tests {
                 lambda %0:f32[][sharding={mesh<['x'=2:manual]>, []}], %1:f32[][sharding={mesh<['x'=2:manual]>, []}] .
                 let %2:f32[][sharding={mesh<['x'=2:manual]>, []}] = shard_map [
                     mesh=['x'=2:manual],
-                    in_shardings=[{mesh<['x'=2:manual]>, []}, {mesh<['x'=2:manual]>, []}],
-                    out_shardings=[{mesh<['x'=2:manual]>, []}],
+                    input_shardings=[{mesh<['x'=2:manual]>, []}, {mesh<['x'=2:manual]>, []}],
+                    output_shardings=[{mesh<['x'=2:manual]>, []}],
                     manual_axes=['x'],
                     global_input_types=[f32[][sharding={mesh<['x'=2:manual]>, []}], \
                         f32[][sharding={mesh<['x'=2:manual]>, []}]],
@@ -14257,8 +14266,8 @@ mod tests {
                 lambda %0:f32[4], %1:ref<f32[4]> .
                 let %2:f32[4] = shard_map [
                     mesh=['x'=2:manual],
-                    in_shardings=[{mesh<['x'=2:manual]>, [{'x'}]}, {mesh<['x'=2:manual]>, [{'x'}]}],
-                    out_shardings=[{mesh<['x'=2:manual]>, [{'x'}]}],
+                    input_shardings=[{mesh<['x'=2:manual]>, [{'x'}]}, {mesh<['x'=2:manual]>, [{'x'}]}],
+                    output_shardings=[{mesh<['x'=2:manual]>, [{'x'}]}],
                     manual_axes=['x'],
                     global_input_types=[ref<f32[4]>, f32[4]],
                     global_output_types=[f32[4]],
@@ -14297,8 +14306,8 @@ mod tests {
                 lambda  .
                 let %0:u64[2][sharding={mesh<['x'=2:manual]>, [{'x'}]}] = shard_map [
                     mesh=['x'=2:manual],
-                    in_shardings=[],
-                    out_shardings=[{mesh<['x'=2:manual]>, [{'x'}]}],
+                    input_shardings=[],
+                    output_shardings=[{mesh<['x'=2:manual]>, [{'x'}]}],
                     manual_axes=['x'],
                     global_input_types=[],
                     global_output_types=[u64[2][sharding={mesh<['x'=2:manual]>, [{'x'}]}]],
@@ -14368,8 +14377,8 @@ mod tests {
                 lambda %0:dimension<3>, %1:f32[4] .
                 let %2:f32[4][sharding={mesh<['x'=2:manual]>, [{'x'}]}] = shard_map [
                     mesh=['x'=2:manual],
-                    in_shardings=[{mesh<['x'=2:manual]>, [{'x'}]}],
-                    out_shardings=[{mesh<['x'=2:manual]>, [{'x'}]}],
+                    input_shardings=[{mesh<['x'=2:manual]>, [{'x'}]}],
+                    output_shardings=[{mesh<['x'=2:manual]>, [{'x'}]}],
                     manual_axes=['x'],
                     global_input_types=[f32[4][sharding={mesh<['x'=2:manual]>, [{'x'}]}]],
                     global_output_types=[f32[4][sharding={mesh<['x'=2:manual]>, [{'x'}]}]],
@@ -14393,8 +14402,8 @@ mod tests {
                 lambda %0:dimension<3>, %1:f32[4, 3] .
                 let %2:f32[4, 3][sharding={mesh<['x'=2:manual]>, [{'x'}, {}]}] = shard_map [
                     mesh=['x'=2:manual],
-                    in_shardings=[{mesh<['x'=2:manual]>, [{'x'}, {}]}],
-                    out_shardings=[{mesh<['x'=2:manual]>, [{'x'}, {}]}],
+                    input_shardings=[{mesh<['x'=2:manual]>, [{'x'}, {}]}],
+                    output_shardings=[{mesh<['x'=2:manual]>, [{'x'}, {}]}],
                     manual_axes=['x'],
                     global_input_types=[f32[4, 3][sharding={mesh<['x'=2:manual]>, [{'x'}, {}]}]],
                     global_output_types=[f32[4, 3][sharding={mesh<['x'=2:manual]>, [{'x'}, {}]}]],
@@ -14452,8 +14461,8 @@ mod tests {
                 let %1:dimension<3> = constant [value=3]
                     %2:{global} = shard_map [
                         mesh=['x'=2:manual],
-                        in_shardings=[{sharding}],
-                        out_shardings=[{sharding}],
+                        input_shardings=[{sharding}],
+                        output_shardings=[{sharding}],
                         manual_axes=['x'],
                         global_input_types=[{global}],
                         global_output_types=[{global}],
@@ -14507,8 +14516,8 @@ mod tests {
                 let %3:f32[3, 4][sharding={mesh<['x'=2:manual]>, [{}, {'x'}]}], \
                     %4:f32[4][sharding={mesh<['x'=2:manual]>, [{'x'}]}] = shard_map [
                     mesh=['x'=2:manual],
-                    in_shardings=[{mesh<['x'=2:manual]>, [{}, {'x'}]}, {mesh<['x'=2:manual]>, [{'x'}]}],
-                    out_shardings=[{mesh<['x'=2:manual]>, [{}, {'x'}]}, {mesh<['x'=2:manual]>, [{'x'}]}],
+                    input_shardings=[{mesh<['x'=2:manual]>, [{}, {'x'}]}, {mesh<['x'=2:manual]>, [{'x'}]}],
+                    output_shardings=[{mesh<['x'=2:manual]>, [{}, {'x'}]}, {mesh<['x'=2:manual]>, [{'x'}]}],
                     manual_axes=['x'],
                     global_input_types=[f32[3, 4][sharding={mesh<['x'=2:manual]>, [{}, {'x'}]}], \
                         f32[4][sharding={mesh<['x'=2:manual]>, [{'x'}]}]],
@@ -14574,8 +14583,8 @@ mod tests {
                 lambda %0:dimension<3>, %1:f32[3, 4] .
                 let %2:f32[3, 2][sharding={mesh<['x'=2:manual]>, [{}, {}]}] = shard_map [
                     mesh=['x'=2:manual],
-                    in_shardings=[{mesh<['x'=2:manual]>, [{}, {'x'}]}],
-                    out_shardings=[{mesh<['x'=2:manual]>, [{}, {}]}],
+                    input_shardings=[{mesh<['x'=2:manual]>, [{}, {'x'}]}],
+                    output_shardings=[{mesh<['x'=2:manual]>, [{}, {}]}],
                     manual_axes=['x'],
                     global_input_types=[f32[3, 4][sharding={mesh<['x'=2:manual]>, [{}, {'x'}]}]],
                     global_output_types=[f32[3, 2][sharding={mesh<['x'=2:manual]>, [{}, {}]}]],
@@ -14648,8 +14657,8 @@ mod tests {
                 lambda %0:dimension<3>, %1:{scalar_type}, %2:f32[3, 2][sharding={batched_sharded}] .
                 let %3:f32[3, 4][sharding={batched_sharded}] = shard_map [
                     mesh=['x'=2:manual],
-                    in_shardings=[{replicated}, {batched_sharded}],
-                    out_shardings=[{batched_sharded}],
+                    input_shardings=[{replicated}, {batched_sharded}],
+                    output_shardings=[{batched_sharded}],
                     manual_axes=['x'],
                     global_input_types=[{scalar_type}, f32[3, 2][sharding={batched_sharded}]],
                     global_output_types=[f32[3, 4][sharding={batched_sharded}]],
@@ -14695,8 +14704,8 @@ mod tests {
                 lambda %0:dimension<3>, %1:f32[3, 4][sharding={batched_sharded}], %2:{global_type} .
                 let %3:f32[3, 4][sharding={batched_sharded}] = shard_map [
                     mesh=['x'=2:manual],
-                    in_shardings=[{batched_sharded}, {sharded}],
-                    out_shardings=[{batched_sharded}],
+                    input_shardings=[{batched_sharded}, {sharded}],
+                    output_shardings=[{batched_sharded}],
                     manual_axes=['x'],
                     global_input_types=[f32[3, 4][sharding={batched_sharded}], {global_type}],
                     global_output_types=[f32[3, 4][sharding={batched_sharded}]],
@@ -14742,8 +14751,8 @@ mod tests {
                 lambda %0:dimension<3>, %1:ref<f32[4, 3]>, %2:f32[3, 4] .
                 let %3:f32[4, 3] = shard_map [
                     mesh=['x'=2:manual],
-                    in_shardings=[{mesh<['x'=2:manual]>, [{'x'}, {}]}, {mesh<['x'=2:manual]>, [{}, {'x'}]}],
-                    out_shardings=[{mesh<['x'=2:manual]>, [{'x'}, {}]}],
+                    input_shardings=[{mesh<['x'=2:manual]>, [{'x'}, {}]}, {mesh<['x'=2:manual]>, [{}, {'x'}]}],
+                    output_shardings=[{mesh<['x'=2:manual]>, [{'x'}, {}]}],
                     manual_axes=['x'],
                     global_input_types=[ref<f32[4, 3]>, f32[3, 4]],
                     global_output_types=[f32[4, 3]],
@@ -14785,8 +14794,8 @@ mod tests {
                 lambda %0:dimension<3>, %1:ref<f32[2]>, %2:f32[3, 4] .
                 let %3:f32[3, 4] = shard_map [
                     mesh=['x'=2:manual],
-                    in_shardings=[{mesh<['x'=2:manual]>, [{}]}, {mesh<['x'=2:manual]>, [{}, {'x'}]}],
-                    out_shardings=[{mesh<['x'=2:manual]>, [{}, {'x'}]}],
+                    input_shardings=[{mesh<['x'=2:manual]>, [{}]}, {mesh<['x'=2:manual]>, [{}, {'x'}]}],
+                    output_shardings=[{mesh<['x'=2:manual]>, [{}, {'x'}]}],
                     manual_axes=['x'],
                     global_input_types=[ref<f32[2]>, f32[3, 4]],
                     global_output_types=[f32[3, 4]],
@@ -14855,8 +14864,8 @@ mod tests {
                 lambda %0:dimension<3>, %1:ref<{packed}>, %2:{packed} .
                 let %3:{packed}, %4:ref<{packed}> = shard_map [
                     mesh=['x'=2:manual],
-                    in_shardings=[{sharding}, {sharding}],
-                    out_shardings=[{sharding}, {sharding}],
+                    input_shardings=[{sharding}, {sharding}],
+                    output_shardings=[{sharding}, {sharding}],
                     manual_axes=['x'],
                     global_input_types=[ref<{packed}>, {packed}],
                     global_output_types=[{packed}, ref<{packed}>],
@@ -14901,8 +14910,8 @@ mod tests {
                 lambda %0:dimension<3>, %1:f32[3, 4], %2:f32[3, 4] .
                 let %3:f32[3, 4], %4:f32[3, 4] = shard_map [
                     mesh=['x'=2:manual],
-                    in_shardings=[{mesh<['x'=2:manual]>, [{}, {'x'}]}, {mesh<['x'=2:manual]>, [{}, {'x'}]}],
-                    out_shardings=[{mesh<['x'=2:manual]>, [{}, {'x'}]}, {mesh<['x'=2:manual]>, [{}, {'x'}]}],
+                    input_shardings=[{mesh<['x'=2:manual]>, [{}, {'x'}]}, {mesh<['x'=2:manual]>, [{}, {'x'}]}],
+                    output_shardings=[{mesh<['x'=2:manual]>, [{}, {'x'}]}, {mesh<['x'=2:manual]>, [{}, {'x'}]}],
                     manual_axes=['x'],
                     global_input_types=[f32[3, 4], f32[3, 4]],
                     global_output_types=[f32[3, 4], f32[3, 4]],
@@ -14968,8 +14977,8 @@ mod tests {
             lambda %0:dimension<3>, %1:f32[3, 4] .
             let %2:f32[3, 4][sharding={mesh<['x'=2:manual, 'y'=2:explicit]>, [{'y'}, {'x'}]}] = shard_map [
                 mesh=['x'=2:manual, 'y'=2:explicit],
-                in_shardings=[{mesh<['x'=2:manual, 'y'=2:explicit]>, [{'y'}, {'x'}]}],
-                out_shardings=[{mesh<['x'=2:manual, 'y'=2:explicit]>, [{'y'}, {'x'}]}],
+                input_shardings=[{mesh<['x'=2:manual, 'y'=2:explicit]>, [{'y'}, {'x'}]}],
+                output_shardings=[{mesh<['x'=2:manual, 'y'=2:explicit]>, [{'y'}, {'x'}]}],
                 manual_axes=['x'],
                 global_input_types=[f32[3, 4][sharding={mesh<['x'=2:manual, 'y'=2:explicit]>, [{'y'}, {'x'}]}]],
                 global_output_types=[f32[3, 4][sharding={mesh<['x'=2:manual, 'y'=2:explicit]>, [{'y'}, {'x'}]}]],
@@ -14995,8 +15004,8 @@ mod tests {
             lambda %0:dimension<3>, %1:f32[3, 4] .
             let %2:f32[3, 4][sharding={mesh<['x'=2:manual, 'y'=2:manual]>, [{'y'}, {'x'}]}] = shard_map [
                 mesh=['x'=2:manual, 'y'=2:manual],
-                in_shardings=[{mesh<['x'=2:manual, 'y'=2:manual]>, [{'y'}, {'x'}]}],
-                out_shardings=[{mesh<['x'=2:manual, 'y'=2:manual]>, [{'y'}, {'x'}]}],
+                input_shardings=[{mesh<['x'=2:manual, 'y'=2:manual]>, [{'y'}, {'x'}]}],
+                output_shardings=[{mesh<['x'=2:manual, 'y'=2:manual]>, [{'y'}, {'x'}]}],
                 manual_axes=['x'],
                 global_input_types=[f32[3, 4][sharding={mesh<['x'=2:manual, 'y'=2:manual]>, [{'y'}, {'x'}]}]],
                 global_output_types=[f32[3, 4][sharding={mesh<['x'=2:manual, 'y'=2:manual]>, [{'y'}, {'x'}]}]],
@@ -15052,8 +15061,8 @@ mod tests {
                 lambda %0:dimension<3>, %1:f32[3, 4] .
                 let %2:f32[3, 4][sharding={mesh<['x'=2:manual, 'y'=2:manual]>, [{'y'}, {'x'}]}] = shard_map [
                     mesh=['x'=2:manual, 'y'=2:manual],
-                    in_shardings=[{mesh<['x'=2:manual, 'y'=2:manual]>, [{'y'}, {'x'}]}],
-                    out_shardings=[{mesh<['x'=2:manual, 'y'=2:manual]>, [{'y'}, {'x'}]}],
+                    input_shardings=[{mesh<['x'=2:manual, 'y'=2:manual]>, [{'y'}, {'x'}]}],
+                    output_shardings=[{mesh<['x'=2:manual, 'y'=2:manual]>, [{'y'}, {'x'}]}],
                     manual_axes=['x'],
                     global_input_types=[f32[3, 4][sharding={mesh<['x'=2:manual, 'y'=2:manual]>, [{'y'}, {'x'}]}]],
                     global_output_types=[f32[3, 4][sharding={mesh<['x'=2:manual, 'y'=2:manual]>, [{'y'}, {'x'}]}]],
@@ -15119,8 +15128,8 @@ mod tests {
             lambda %0:dimension<3>, %1:f32[3, 4] .
             let %2:f32[3, 4][sharding={mesh<['x'=2:manual, 'y'=2:explicit, 'a'=2:auto]>, [{}, {'x'}]}] = shard_map [
                 mesh=['x'=2:manual, 'y'=2:explicit, 'a'=2:auto],
-                in_shardings=[{mesh<['x'=2:manual, 'y'=2:explicit, 'a'=2:auto]>, [{}, {'x'}]}],
-                out_shardings=[{mesh<['x'=2:manual, 'y'=2:explicit, 'a'=2:auto]>, [{}, {'x'}]}],
+                input_shardings=[{mesh<['x'=2:manual, 'y'=2:explicit, 'a'=2:auto]>, [{}, {'x'}]}],
+                output_shardings=[{mesh<['x'=2:manual, 'y'=2:explicit, 'a'=2:auto]>, [{}, {'x'}]}],
                 manual_axes=['x'],
                 global_input_types=[f32[3, 4][sharding={mesh<['x'=2:manual, 'y'=2:explicit, 'a'=2:auto]>, \
                     [{}, {'x'}]}]],
@@ -15144,8 +15153,8 @@ mod tests {
             lambda %0:dimension<3>, %1:f32[3, 4] .
             let %2:f32[3, 4][sharding={mesh<['x'=2:manual, 'y'=2:explicit, 'a'=2:auto]>, [{'y'}, {'x'}]}] = shard_map [
                 mesh=['x'=2:manual, 'y'=2:explicit, 'a'=2:auto],
-                in_shardings=[{mesh<['x'=2:manual, 'y'=2:explicit, 'a'=2:auto]>, [{'y'}, {'x'}]}],
-                out_shardings=[{mesh<['x'=2:manual, 'y'=2:explicit, 'a'=2:auto]>, [{'y'}, {'x'}]}],
+                input_shardings=[{mesh<['x'=2:manual, 'y'=2:explicit, 'a'=2:auto]>, [{'y'}, {'x'}]}],
+                output_shardings=[{mesh<['x'=2:manual, 'y'=2:explicit, 'a'=2:auto]>, [{'y'}, {'x'}]}],
                 manual_axes=['x'],
                 global_input_types=[f32[3, 4][sharding={mesh<['x'=2:manual, 'y'=2:explicit, 'a'=2:auto]>, \
                     [{'y'}, {'x'}]}]],
@@ -15203,8 +15212,8 @@ mod tests {
                 lambda %0:dimension<3>, %1:f32[3, 4] .
                 let %2:f32[3, 4][sharding={mesh<['x'=2:manual]>, [{}, {'x'}]}] = shard_map [
                     mesh=['x'=2:manual],
-                    in_shardings=[{mesh<['x'=2:manual]>, [{}, {'x'}]}],
-                    out_shardings=[{mesh<['x'=2:manual]>, [{}, {'x'}]}],
+                    input_shardings=[{mesh<['x'=2:manual]>, [{}, {'x'}]}],
+                    output_shardings=[{mesh<['x'=2:manual]>, [{}, {'x'}]}],
                     manual_axes=['x'],
                     global_input_types=[f32[3, 4][sharding={mesh<['x'=2:manual]>, [{}, {'x'}]}]],
                     global_output_types=[f32[3, 4][sharding={mesh<['x'=2:manual]>, [{}, {'x'}]}]],
@@ -15503,8 +15512,8 @@ mod tests {
                 lambda %0:dimension<3>, %1:{input} .
                 let %2:{global} = shard_map [
                     mesh=['x'=2:manual, 'y'=2:manual],
-                    in_shardings=[{sharding}],
-                    out_shardings=[{sharding}],
+                    input_shardings=[{sharding}],
+                    output_shardings=[{sharding}],
                     manual_axes=['x'],
                     global_input_types=[{global}],
                     global_output_types=[{global}],
@@ -15592,8 +15601,8 @@ mod tests {
                 lambda %0:dimension<3> .
                 let %1:u64[2][sharding={mesh<['x'=2:manual]>, [{'x'}]}] = shard_map [
                     mesh=['x'=2:manual],
-                    in_shardings=[],
-                    out_shardings=[{mesh<['x'=2:manual]>, [{'x'}]}],
+                    input_shardings=[],
+                    output_shardings=[{mesh<['x'=2:manual]>, [{'x'}]}],
                     manual_axes=['x'],
                     global_input_types=[],
                     global_output_types=[u64[2][sharding={mesh<['x'=2:manual]>, [{'x'}]}]],
@@ -15653,8 +15662,8 @@ mod tests {
                 let %1:dimension<3> = constant [value=3]
                     %2:f32[4][sharding={mesh<['x'=2:manual]>, [{'x'}]}] = shard_map [
                         mesh=['x'=2:manual],
-                        in_shardings=[{mesh<['x'=2:manual]>, [{}, {'x'}]}],
-                        out_shardings=[{mesh<['x'=2:manual]>, [{'x'}]}],
+                        input_shardings=[{mesh<['x'=2:manual]>, [{}, {'x'}]}],
+                        output_shardings=[{mesh<['x'=2:manual]>, [{'x'}]}],
                         manual_axes=['x'],
                         global_input_types=[f32[3, 4][sharding={mesh<['x'=2:manual]>, [{}, {'x'}]}]],
                         global_output_types=[f32[4][sharding={mesh<['x'=2:manual]>, [{'x'}]}]],
@@ -15724,8 +15733,8 @@ mod tests {
                 let %1:dimension<4> = constant [value=4]
                     %2:f32[4][sharding={mesh<['x'=2:manual, 'y'=2:explicit]>, [{'x'}]}] = shard_map [
                         mesh=['x'=2:manual, 'y'=2:explicit],
-                        in_shardings=[{mesh<['x'=2:manual, 'y'=2:explicit]>, [{'y'}, {'x'}]}],
-                        out_shardings=[{mesh<['x'=2:manual, 'y'=2:explicit]>, [{'x'}]}],
+                        input_shardings=[{mesh<['x'=2:manual, 'y'=2:explicit]>, [{'y'}, {'x'}]}],
+                        output_shardings=[{mesh<['x'=2:manual, 'y'=2:explicit]>, [{'x'}]}],
                         manual_axes=['x'],
                         global_input_types=[f32[4, 4][sharding={mesh<['x'=2:manual, 'y'=2:explicit]>, [{'y'}, {'x'}]}]],
                         global_output_types=[f32[4][sharding={mesh<['x'=2:manual, 'y'=2:explicit]>, [{'x'}]}]],
@@ -15789,8 +15798,8 @@ mod tests {
                 let %1:dimension<3> = constant [value=3]
                     %2:u64[3][sharding={mesh<['x'=2:manual]>, [{}]}] = shard_map [
                         mesh=['x'=2:manual],
-                        in_shardings=[],
-                        out_shardings=[{mesh<['x'=2:manual]>, [{}]}],
+                        input_shardings=[],
+                        output_shardings=[{mesh<['x'=2:manual]>, [{}]}],
                         manual_axes=['x'],
                         global_input_types=[],
                         global_output_types=[u64[3][sharding={mesh<['x'=2:manual]>, [{}]}]],
@@ -15854,8 +15863,8 @@ mod tests {
                     %2:dimension<2> = constant [value=2]
                     %3:f32[2, 4][sharding={mesh<['x'=2:manual]>, [{}, {'x'}]}] = shard_map [
                         mesh=['x'=2:manual],
-                        in_shardings=[{mesh<['x'=2:manual]>, [{}, {}, {'x'}]}],
-                        out_shardings=[{mesh<['x'=2:manual]>, [{}, {'x'}]}],
+                        input_shardings=[{mesh<['x'=2:manual]>, [{}, {}, {'x'}]}],
+                        output_shardings=[{mesh<['x'=2:manual]>, [{}, {'x'}]}],
                         manual_axes=['x'],
                         global_input_types=[f32[3, 2, 4][sharding={mesh<['x'=2:manual]>, [{}, {}, {'x'}]}]],
                         global_output_types=[f32[2, 4][sharding={mesh<['x'=2:manual]>, [{}, {'x'}]}]],
@@ -15926,8 +15935,8 @@ mod tests {
                     %2:f32[3, 4][sharding={mesh<['x'=2:manual]>, [{}, {'x'}]}], \
                         %3:f32[4][sharding={mesh<['x'=2:manual]>, [{'x'}]}] = shard_map [
                         mesh=['x'=2:manual],
-                        in_shardings=[{mesh<['x'=2:manual]>, [{}, {'x'}]}],
-                        out_shardings=[{mesh<['x'=2:manual]>, [{}, {'x'}]}, {mesh<['x'=2:manual]>, [{'x'}]}],
+                        input_shardings=[{mesh<['x'=2:manual]>, [{}, {'x'}]}],
+                        output_shardings=[{mesh<['x'=2:manual]>, [{}, {'x'}]}, {mesh<['x'=2:manual]>, [{'x'}]}],
                         manual_axes=['x'],
                         global_input_types=[f32[3, 4][sharding={mesh<['x'=2:manual]>, [{}, {'x'}]}]],
                         global_output_types=[f32[3, 4][sharding={mesh<['x'=2:manual]>, [{}, {'x'}]}], \
@@ -15956,9 +15965,9 @@ mod tests {
                         [output_type=f32[4][sharding={mesh<['x'=2:manual]>, [{'x'}]}], output_axes=[]] %5
                     %7:f32[4][sharding={mesh<['x'=2:manual]>, [{'x'}]}] = shard_map [
                         mesh=['x'=2:manual],
-                        in_shardings=[{mesh<['x'=2:manual]>, [{'x'}]}, {mesh<['x'=2:manual]>, [{}, {'x'}]}, \
+                        input_shardings=[{mesh<['x'=2:manual]>, [{'x'}]}, {mesh<['x'=2:manual]>, [{}, {'x'}]}, \
                             {mesh<['x'=2:manual]>, [{'x'}]}],
-                        out_shardings=[{mesh<['x'=2:manual]>, [{'x'}]}],
+                        output_shardings=[{mesh<['x'=2:manual]>, [{'x'}]}],
                         manual_axes=['x'],
                         global_input_types=[f32[4][sharding={mesh<['x'=2:manual]>, [{'x'}]}], \
                             f32[3, 4][sharding={mesh<['x'=2:manual]>, [{}, {'x'}]}], \
@@ -16026,8 +16035,8 @@ mod tests {
                 lambda %0:f8e8m0fnu[4], %1:f32[4] .
                 let %2:f8e8m0fnu[4], %3:f32[4] = shard_map [
                     mesh=['x'=2:manual],
-                    in_shardings=[{mesh<['x'=2:manual]>, [{}]}, {mesh<['x'=2:manual]>, [{}]}],
-                    out_shardings=[{mesh<['x'=2:manual]>, [{}]}, {mesh<['x'=2:manual]>, [{}]}],
+                    input_shardings=[{mesh<['x'=2:manual]>, [{}]}, {mesh<['x'=2:manual]>, [{}]}],
+                    output_shardings=[{mesh<['x'=2:manual]>, [{}]}, {mesh<['x'=2:manual]>, [{}]}],
                     manual_axes=['x'],
                     global_input_types=[f8e8m0fnu[4], f32[4]],
                     global_output_types=[f8e8m0fnu[4], f32[4]],
@@ -16091,9 +16100,9 @@ mod tests {
                 lambda %0:f32[], %1:f32[], %2:f32[] .
                 let %3:f32[], %4:f32[], %5:f32[] = shard_map [
                     mesh=['x'=2:manual],
-                    in_shardings=[{mesh<['x'=2:manual]>, []}, {mesh<['x'=2:manual]>, []}, {mesh<['x'=2:manual]>, \
+                    input_shardings=[{mesh<['x'=2:manual]>, []}, {mesh<['x'=2:manual]>, []}, {mesh<['x'=2:manual]>, \
                     []}],
-                    out_shardings=[{mesh<['x'=2:manual]>, []}, {mesh<['x'=2:manual]>, []}, {mesh<['x'=2:manual]>, \
+                    output_shardings=[{mesh<['x'=2:manual]>, []}, {mesh<['x'=2:manual]>, []}, {mesh<['x'=2:manual]>, \
                     []}],
                     manual_axes=['x'],
                     global_input_types=[f32[], f32[], f32[]],
@@ -16145,8 +16154,8 @@ mod tests {
                 lambda %0:bool[], %1:f32[], %2:f32[], %3:f32[] .
                 let %4:{flag}, %5:{scalar}, %6:{scalar}, %7:{scalar}, %8:{scalar}, %9:{scalar} = shard_map [
                     mesh=['x'=2:manual],
-                    in_shardings=[{sharding}, {sharding}, {sharding}, {sharding}],
-                    out_shardings=[{sharding}, {sharding}, {sharding}, {sharding}, {sharding}, {sharding}],
+                    input_shardings=[{sharding}, {sharding}, {sharding}, {sharding}],
+                    output_shardings=[{sharding}, {sharding}, {sharding}, {sharding}, {sharding}, {sharding}],
                     manual_axes=['x'],
                     global_input_types=[{flag}, {scalar}, {scalar}, {scalar}],
                     global_output_types=[{flag}, {scalar}, {scalar}, {scalar}, {scalar}, {scalar}],
@@ -16201,8 +16210,8 @@ mod tests {
                 lambda %0:{global} .
                 let %1:{global}, %2:{global}, %3:{global}, %4:{global} = shard_map [
                     mesh=['x'=2:manual],
-                    in_shardings=[{sharding}],
-                    out_shardings=[{sharding}, {sharding}, {sharding}, {sharding}],
+                    input_shardings=[{sharding}],
+                    output_shardings=[{sharding}, {sharding}, {sharding}, {sharding}],
                     manual_axes=['x'],
                     global_input_types=[{global}],
                     global_output_types=[{global}, {global}, {global}, {global}],
@@ -16224,8 +16233,8 @@ mod tests {
                 lambda %0:{global}, %1:{global}, %2:{global}, %3:{global} .
                 let %4:{global}, %5:{global}, %6:{global} = shard_map [
                     mesh=['x'=2:manual],
-                    in_shardings=[{sharding}, {sharding}, {sharding}, {sharding}],
-                    out_shardings=[{sharding}, {sharding}, {sharding}],
+                    input_shardings=[{sharding}, {sharding}, {sharding}, {sharding}],
+                    output_shardings=[{sharding}, {sharding}, {sharding}],
                     manual_axes=['x'],
                     global_input_types=[{global}, {global}, {global}, {global}],
                     global_output_types=[{global}, {global}, {global}],
@@ -16263,8 +16272,8 @@ mod tests {
                 lambda %0:{global}, %1:{global} .
                 let %2:{global}, %3:{global}, %4:{global} = shard_map [
                     mesh=['x'=2:manual],
-                    in_shardings=[{sharding}, {sharding}],
-                    out_shardings=[{sharding}, {sharding}, {sharding}],
+                    input_shardings=[{sharding}, {sharding}],
+                    output_shardings=[{sharding}, {sharding}, {sharding}],
                     manual_axes=['x'],
                     global_input_types=[{global}, {global}],
                     global_output_types=[{global}, {global}, {global}],
@@ -16285,8 +16294,8 @@ mod tests {
                 lambda %0:{global}, %1:{global}, %2:{global}, %3:{global}, %4:{global} .
                 let %5:{global} = shard_map [
                     mesh=['x'=2:manual],
-                    in_shardings=[{sharding}, {sharding}, {sharding}, {sharding}, {sharding}],
-                    out_shardings=[{sharding}],
+                    input_shardings=[{sharding}, {sharding}, {sharding}, {sharding}, {sharding}],
+                    output_shardings=[{sharding}],
                     manual_axes=['x'],
                     global_input_types=[{global}, {global}, {global}, {global}, {global}],
                     global_output_types=[{global}],
@@ -16310,8 +16319,8 @@ mod tests {
                 let %4:{global}, %5:{global}, %6:{global}, %7:{global}, %8:{global}, %9:{global}, \
                     %10:{global} = shard_map [
                     mesh=['x'=2:manual],
-                    in_shardings=[{sharding}, {sharding}, {sharding}, {sharding}],
-                    out_shardings=[{sharding}, {sharding}, {sharding}, {sharding}, {sharding}, {sharding}, {sharding}],
+                    input_shardings=[{sharding}, {sharding}, {sharding}, {sharding}],
+                    output_shardings=[{sharding}, {sharding}, {sharding}, {sharding}, {sharding}, {sharding}, {sharding}],
                     manual_axes=['x'],
                     global_input_types=[{global}, {global}, {global}, {global}],
                     global_output_types=[{global}, {global}, {global}, {global}, {global}, {global}, {global}],
@@ -16339,9 +16348,9 @@ mod tests {
                 lambda {tangent_inputs} .
                 let %12:{global}, %13:{global} = shard_map [
                     mesh=['x'=2:manual],
-                    in_shardings=[{sharding}, {sharding}, {sharding}, {sharding}, {sharding}, {sharding}, {sharding}, \
+                    input_shardings=[{sharding}, {sharding}, {sharding}, {sharding}, {sharding}, {sharding}, {sharding}, \
                         {sharding}, {sharding}, {sharding}, {sharding}, {sharding}],
-                    out_shardings=[{sharding}, {sharding}],
+                    output_shardings=[{sharding}, {sharding}],
                     manual_axes=['x'],
                     global_input_types=[{global}, {global}, {global}, {global}, {global}, {global}, {global}, \
                         {global}, {global}, {global}, {global}, {global}],
@@ -16411,8 +16420,8 @@ mod tests {
                 lambda %0:f32[2] .
                 let %1:{global}, %2:{global} = shard_map [
                     mesh=['x'=2:manual],
-                    in_shardings=[{sharding}],
-                    out_shardings=[{sharding}, {sharding}],
+                    input_shardings=[{sharding}],
+                    output_shardings=[{sharding}, {sharding}],
                     manual_axes=['x'],
                     global_input_types=[{global}],
                     global_output_types=[{global}, {global}],
@@ -16435,8 +16444,8 @@ mod tests {
                 lambda %0:f32[2], %1:{global} .
                 let %2:{global} = shard_map [
                     mesh=['x'=2:manual],
-                    in_shardings=[{sharding}, {sharding}],
-                    out_shardings=[{sharding}],
+                    input_shardings=[{sharding}, {sharding}],
+                    output_shardings=[{sharding}],
                     manual_axes=['x'],
                     global_input_types=[{global}, {global}],
                     global_output_types=[{global}],
@@ -16465,8 +16474,8 @@ mod tests {
                 lambda %0:f32[2], %1:f32[2] .
                 let %2:{global}, %3:{global}, %4:{global}, %5:{global}, %6:{global}, %7:{global} = shard_map [
                     mesh=['x'=2:manual],
-                    in_shardings=[{sharding}, {sharding}],
-                    out_shardings=[{sharding}, {sharding}, {sharding}, {sharding}, {sharding}, {sharding}],
+                    input_shardings=[{sharding}, {sharding}],
+                    output_shardings=[{sharding}, {sharding}, {sharding}, {sharding}, {sharding}, {sharding}],
                     manual_axes=['x'],
                     global_input_types=[{global}, {global}],
                     global_output_types=[{global}, {global}, {global}, {global}, {global}, {global}],
@@ -16497,8 +16506,8 @@ mod tests {
                 lambda %0:f32[2], %1:f32[2], %2:{global}, %3:{global}, %4:{global}, %5:{global} .
                 let %6:{global}, %7:{global} = shard_map [
                     mesh=['x'=2:manual],
-                    in_shardings=[{sharding}, {sharding}, {sharding}, {sharding}, {sharding}, {sharding}],
-                    out_shardings=[{sharding}, {sharding}],
+                    input_shardings=[{sharding}, {sharding}, {sharding}, {sharding}, {sharding}, {sharding}],
+                    output_shardings=[{sharding}, {sharding}],
                     manual_axes=['x'],
                     global_input_types=[{global}, {global}, {global}, {global}, {global}, {global}],
                     global_output_types=[{global}, {global}],
@@ -16563,8 +16572,8 @@ mod tests {
                             %5:f32[] = sub %0 %4
                             %6:{global}, %7:{global} = shard_map [
                                 mesh=['x'=2:manual],
-                                in_shardings=[{sharding}, {sharding}],
-                                out_shardings=[{sharding}, {sharding}],
+                                input_shardings=[{sharding}, {sharding}],
+                                output_shardings=[{sharding}, {sharding}],
                                 manual_axes=['x'],
                                 global_input_types=[{global}, {global}],
                                 global_output_types=[{global}, {global}],
@@ -16831,8 +16840,8 @@ mod tests {
                 lambda %0:ref<{global}>, %1:{global}, %2:{global} .
                 let %3:{global} = shard_map [
                     mesh=['x'=2:manual],
-                    in_shardings=[{sharding}, {sharding}],
-                    out_shardings=[{sharding}],
+                    input_shardings=[{sharding}, {sharding}],
+                    output_shardings=[{sharding}],
                     manual_axes=['x'],
                     global_input_types=[ref<{global}>, {global}],
                     global_output_types=[{global}],
@@ -16846,8 +16855,8 @@ mod tests {
                 ]
                     %4:{global} = shard_map [
                         mesh=['x'=2:manual],
-                        in_shardings=[{sharding}, {sharding}],
-                        out_shardings=[{sharding}],
+                        input_shardings=[{sharding}, {sharding}],
+                        output_shardings=[{sharding}],
                         manual_axes=['x'],
                         global_input_types=[{global}, ref<{global}>],
                         global_output_types=[{global}],
@@ -16982,8 +16991,8 @@ mod tests {
                 lambda %0:f32[], %1:f32[] .
                 let %2:{scalar}, %3:{scalar} = shard_map [
                     mesh=['x'=2:manual],
-                    in_shardings=[{replicated}, {replicated}],
-                    out_shardings=[{replicated}, {replicated}],
+                    input_shardings=[{replicated}, {replicated}],
+                    output_shardings=[{replicated}, {replicated}],
                     manual_axes=['x'],
                     global_input_types=[{scalar}, {scalar}],
                     global_output_types=[{scalar}, {scalar}],
@@ -17008,8 +17017,8 @@ mod tests {
                 lambda %0:{scalar}, %1:{scalar} .
                 let %2:{scalar} = shard_map [
                     mesh=['x'=2:manual],
-                    in_shardings=[{replicated}, {replicated}],
-                    out_shardings=[{replicated}],
+                    input_shardings=[{replicated}, {replicated}],
+                    output_shardings=[{replicated}],
                     manual_axes=['x'],
                     global_input_types=[{scalar}, {scalar}],
                     global_output_types=[{scalar}],
@@ -17053,8 +17062,8 @@ mod tests {
                 lambda %0:f32[4], %1:f32[4] .
                 let %2:{global}, %3:{global} = shard_map [
                     mesh=['x'=2:manual],
-                    in_shardings=[{sharding}, {sharding}],
-                    out_shardings=[{sharding}, {sharding}],
+                    input_shardings=[{sharding}, {sharding}],
+                    output_shardings=[{sharding}, {sharding}],
                     manual_axes=['x'],
                     global_input_types=[{global}, {global}],
                     global_output_types=[{global}, {global}],
@@ -17083,8 +17092,8 @@ mod tests {
                 lambda %0:f32[4] .
                 let %1:{global}, %2:{global} = shard_map [
                     mesh=['x'=2:manual],
-                    in_shardings=[{sharding}],
-                    out_shardings=[{sharding}, {sharding}],
+                    input_shardings=[{sharding}],
+                    output_shardings=[{sharding}, {sharding}],
                     manual_axes=['x'],
                     global_input_types=[{global}],
                     global_output_types=[{global}, {global}],
@@ -17111,8 +17120,8 @@ mod tests {
                 lambda %0:f32[4], %1:{global}, %2:f32[4] .
                 let %3:{global} = shard_map [
                     mesh=['x'=2:manual],
-                    in_shardings=[{sharding}, {sharding}, {sharding}],
-                    out_shardings=[{sharding}],
+                    input_shardings=[{sharding}, {sharding}, {sharding}],
+                    output_shardings=[{sharding}],
                     manual_axes=['x'],
                     global_input_types=[{global}, {global}, {global}],
                     global_output_types=[{global}],
@@ -17194,8 +17203,8 @@ mod tests {
                     lambda %0:f32[] .
                     let %1:{scalar}, %2:{scalar}, %3:{scalar} = shard_map [
                         mesh=['x'=2:manual],
-                        in_shardings=[{replicated}],
-                        out_shardings=[{replicated}, {replicated}, {replicated}],
+                        input_shardings=[{replicated}],
+                        output_shardings=[{replicated}, {replicated}, {replicated}],
                         manual_axes=['x'],
                         global_input_types=[{scalar}],
                         global_output_types=[{scalar}, {scalar}, {scalar}],
@@ -17217,8 +17226,8 @@ mod tests {
                     lambda %0:{scalar}, %1:{scalar}, %2:{scalar} .
                     let %3:{scalar} = shard_map [
                         mesh=['x'=2:manual],
-                        in_shardings=[{replicated}, {replicated}, {replicated}],
-                        out_shardings=[{replicated}],
+                        input_shardings=[{replicated}, {replicated}, {replicated}],
+                        output_shardings=[{replicated}],
                         manual_axes=['x'],
                         global_input_types=[{scalar}, {scalar}, {scalar}],
                         global_output_types=[{scalar}],
@@ -17280,8 +17289,8 @@ mod tests {
                 lambda %0:f32[4] .
                 let %1:{global}, %2:{global}, %3:{global} = shard_map [
                     mesh=['x'=2:manual],
-                    in_shardings=[{sharding}],
-                    out_shardings=[{sharding}, {sharding}, {sharding}],
+                    input_shardings=[{sharding}],
+                    output_shardings=[{sharding}, {sharding}, {sharding}],
                     manual_axes=['x'],
                     global_input_types=[{global}],
                     global_output_types=[{global}, {global}, {global}],
@@ -17305,8 +17314,8 @@ mod tests {
                 lambda %0:{global}, %1:f32[4], %2:{global}, %3:{global} .
                 let %4:{global} = shard_map [
                     mesh=['x'=2:manual],
-                    in_shardings=[{sharding}, {sharding}, {sharding}, {sharding}],
-                    out_shardings=[{sharding}],
+                    input_shardings=[{sharding}, {sharding}, {sharding}, {sharding}],
+                    output_shardings=[{sharding}],
                     manual_axes=['x'],
                     global_input_types=[{global}, {global}, {global}, {global}],
                     global_output_types=[{global}],
@@ -17393,8 +17402,8 @@ mod tests {
                 lambda %0:{global}, %1:{global}, %2:{global} .
                 let %3:{global} = shard_map [
                     mesh=['x'=2:manual],
-                    in_shardings=[{sharding}, {sharding}, {sharding}],
-                    out_shardings=[{sharding}],
+                    input_shardings=[{sharding}, {sharding}, {sharding}],
+                    output_shardings=[{sharding}],
                     manual_axes=['x'],
                     global_input_types=[{global}, {global}, {global}],
                     global_output_types=[{global}],
@@ -17443,8 +17452,8 @@ mod tests {
                 lambda %0:ref<{global}>, %1:{global}, %2:{global} .
                 let %3:{global}, %4:{global} = shard_map [
                     mesh=['x'=2:manual],
-                    in_shardings=[{sharding}, {sharding}],
-                    out_shardings=[{sharding}, {sharding}],
+                    input_shardings=[{sharding}, {sharding}],
+                    output_shardings=[{sharding}, {sharding}],
                     manual_axes=['x'],
                     global_input_types=[ref<{global}>, {global}],
                     global_output_types=[{global}, {global}],
@@ -17458,8 +17467,8 @@ mod tests {
                 ]
                     %5:{global} = shard_map [
                         mesh=['x'=2:manual],
-                        in_shardings=[{sharding}, {sharding}],
-                        out_shardings=[{sharding}],
+                        input_shardings=[{sharding}, {sharding}],
+                        output_shardings=[{sharding}],
                         manual_axes=['x'],
                         global_input_types=[{global}, {global}],
                         global_output_types=[{global}],
@@ -17504,8 +17513,8 @@ mod tests {
                 lambda %0:f32[], %1:f32[] .
                 let %2:{scalar} = shard_map [
                     mesh=['x'=2:manual],
-                    in_shardings=[{replicated}],
-                    out_shardings=[{replicated}],
+                    input_shardings=[{replicated}],
+                    output_shardings=[{replicated}],
                     manual_axes=['x'],
                     global_input_types=[{scalar}],
                     global_output_types=[{scalar}],
@@ -17541,9 +17550,9 @@ mod tests {
                 let %4:f32[][sharding={mesh<['x'=2:manual]>, []}], %5:f32[][sharding={mesh<['x'=2:manual]>, []}] = \
                     shard_map [
                     mesh=['x'=2:manual],
-                    in_shardings=[{mesh<['x'=2:manual]>, []}, {mesh<['x'=2:manual]>, []}, {mesh<['x'=2:manual]>, []}, \
+                    input_shardings=[{mesh<['x'=2:manual]>, []}, {mesh<['x'=2:manual]>, []}, {mesh<['x'=2:manual]>, []}, \
                         {mesh<['x'=2:manual]>, []}],
-                    out_shardings=[{mesh<['x'=2:manual]>, []}, {mesh<['x'=2:manual]>, []}],
+                    output_shardings=[{mesh<['x'=2:manual]>, []}, {mesh<['x'=2:manual]>, []}],
                     manual_axes=['x'],
                     global_input_types=[f32[][sharding={mesh<['x'=2:manual]>, []}], \
                         f32[][sharding={mesh<['x'=2:manual]>, []}], f32[][sharding={mesh<['x'=2:manual]>, []}], \
@@ -17631,8 +17640,8 @@ mod tests {
                 lambda %0:{a_type}, %1:{two_global}, %2:{two_global} .
                 let %3:{four_global}, %4:{extents_global}, %5:{extents_global} = shard_map [
                     mesh=['x'=2:manual],
-                    in_shardings=[{replicated}, {sharded}],
-                    out_shardings=[{sharded}, {sharded}, {sharded}],
+                    input_shardings=[{replicated}, {sharded}],
+                    output_shardings=[{sharded}, {sharded}, {sharded}],
                     manual_axes=['x'],
                     global_input_types=[{a_type}, {two_global}],
                     global_output_types=[{four_global}, {extents_global}, {extents_global}],
@@ -17661,8 +17670,8 @@ mod tests {
                 ]
                     %6:{four_global} = shard_map [
                         mesh=['x'=2:manual],
-                        in_shardings=[{sharded}, {sharded}, {sharded}],
-                        out_shardings=[{sharded}],
+                        input_shardings=[{sharded}, {sharded}, {sharded}],
+                        output_shardings=[{sharded}],
                         manual_axes=['x'],
                         global_input_types=[{two_global}, {extents_global}, {extents_global}],
                         global_output_types=[{four_global}],
@@ -17699,8 +17708,8 @@ mod tests {
                 lambda %0:{a_type}, %1:{two_global} .
                 let %2:{four_global}, %3:{extents_global}, %4:{extents_global} = shard_map [
                     mesh=['x'=2:manual],
-                    in_shardings=[{replicated}, {sharded}],
-                    out_shardings=[{sharded}, {sharded}, {sharded}],
+                    input_shardings=[{replicated}, {sharded}],
+                    output_shardings=[{sharded}, {sharded}, {sharded}],
                     manual_axes=['x'],
                     global_input_types=[{a_type}, {two_global}],
                     global_output_types=[{four_global}, {extents_global}, {extents_global}],
@@ -17735,8 +17744,8 @@ mod tests {
                 lambda %0:{two_global}, %1:{extents_global}, %2:{extents_global} .
                 let %3:{four_global} = shard_map [
                     mesh=['x'=2:manual],
-                    in_shardings=[{sharded}, {sharded}, {sharded}],
-                    out_shardings=[{sharded}],
+                    input_shardings=[{sharded}, {sharded}, {sharded}],
+                    output_shardings=[{sharded}],
                     manual_axes=['x'],
                     global_input_types=[{two_global}, {extents_global}, {extents_global}],
                     global_output_types=[{four_global}],
@@ -17762,8 +17771,8 @@ mod tests {
                 lambda %0:{four_global}, %1:{extents_global}, %2:{extents_global} .
                 let %3:{two_global} = shard_map [
                     mesh=['x'=2:manual],
-                    in_shardings=[{sharded}, {sharded}, {sharded}],
-                    out_shardings=[{sharded}],
+                    input_shardings=[{sharded}, {sharded}, {sharded}],
+                    output_shardings=[{sharded}],
                     manual_axes=['x'],
                     global_input_types=[{four_global}, {extents_global}, {extents_global}],
                     global_output_types=[{two_global}],
@@ -17811,8 +17820,8 @@ mod tests {
                 lambda %0:{a_type}, %1:{four_global}, %2:{four_global} .
                 let %3:{four_global}, %4:{extents_global}, %5:{extents_global} = shard_map [
                     mesh=['x'=2:manual],
-                    in_shardings=[{replicated}, {sharded}],
-                    out_shardings=[{sharded}, {sharded}, {sharded}],
+                    input_shardings=[{replicated}, {sharded}],
+                    output_shardings=[{sharded}, {sharded}, {sharded}],
                     manual_axes=['x'],
                     global_input_types=[{a_type}, {four_global}],
                     global_output_types=[{four_global}, {extents_global}, {extents_global}],
@@ -17846,8 +17855,8 @@ mod tests {
                 ]
                     %6:{four_global} = shard_map [
                         mesh=['x'=2:manual],
-                        in_shardings=[{sharded}, {sharded}, {sharded}],
-                        out_shardings=[{sharded}],
+                        input_shardings=[{sharded}, {sharded}, {sharded}],
+                        output_shardings=[{sharded}],
                         manual_axes=['x'],
                         global_input_types=[{four_global}, {extents_global}, {extents_global}],
                         global_output_types=[{four_global}],
@@ -17881,8 +17890,8 @@ mod tests {
                 lambda %0:{a_type}, %1:{four_global} .
                 let %2:{four_global}, %3:{extents_global}, %4:{extents_global} = shard_map [
                     mesh=['x'=2:manual],
-                    in_shardings=[{replicated}, {sharded}],
-                    out_shardings=[{sharded}, {sharded}, {sharded}],
+                    input_shardings=[{replicated}, {sharded}],
+                    output_shardings=[{sharded}, {sharded}, {sharded}],
                     manual_axes=['x'],
                     global_input_types=[{a_type}, {four_global}],
                     global_output_types=[{four_global}, {extents_global}, {extents_global}],
@@ -17922,8 +17931,8 @@ mod tests {
                 lambda %0:{four_global}, %1:{extents_global}, %2:{extents_global} .
                 let %3:{four_global} = shard_map [
                     mesh=['x'=2:manual],
-                    in_shardings=[{sharded}, {sharded}, {sharded}],
-                    out_shardings=[{sharded}],
+                    input_shardings=[{sharded}, {sharded}, {sharded}],
+                    output_shardings=[{sharded}],
                     manual_axes=['x'],
                     global_input_types=[{four_global}, {extents_global}, {extents_global}],
                     global_output_types=[{four_global}],
@@ -17953,8 +17962,8 @@ mod tests {
                 lambda %0:{four_global}, %1:{extents_global}, %2:{extents_global} .
                 let %3:{four_global} = shard_map [
                     mesh=['x'=2:manual],
-                    in_shardings=[{sharded}, {sharded}, {sharded}],
-                    out_shardings=[{sharded}],
+                    input_shardings=[{sharded}, {sharded}, {sharded}],
+                    output_shardings=[{sharded}],
                     manual_axes=['x'],
                     global_input_types=[{four_global}, {extents_global}, {extents_global}],
                     global_output_types=[{four_global}],
@@ -18010,8 +18019,8 @@ mod tests {
                 lambda %0:{global_type}, %1:{global_type} .
                 let %2:{global_type} = shard_map [
                     mesh=['x'=2:manual],
-                    in_shardings=[{sharded}, {sharded}],
-                    out_shardings=[{sharded}],
+                    input_shardings=[{sharded}, {sharded}],
+                    output_shardings=[{sharded}],
                     manual_axes=['x'],
                     global_input_types=[{global_type}, {global_type}],
                     global_output_types=[{global_type}],
@@ -18055,8 +18064,8 @@ mod tests {
                 lambda %0:f32[4], %1:f32[4] .
                 let %2:{global_type} = shard_map [
                     mesh=['x'=2:manual],
-                    in_shardings=[{sharded}, {sharded}],
-                    out_shardings=[{sharded}],
+                    input_shardings=[{sharded}, {sharded}],
+                    output_shardings=[{sharded}],
                     manual_axes=['x'],
                     global_input_types=[{global_type}, {global_type}],
                     global_output_types=[{global_type}],
@@ -18084,8 +18093,8 @@ mod tests {
                 lambda %0:{global_type}, %1:{global_type}, %2:{global_type} .
                 let %3:{global_type}, %4:{global_type} = shard_map [
                     mesh=['x'=2:manual],
-                    in_shardings=[{sharded}, {sharded}, {sharded}],
-                    out_shardings=[{sharded}, {sharded}],
+                    input_shardings=[{sharded}, {sharded}, {sharded}],
+                    output_shardings=[{sharded}, {sharded}],
                     manual_axes=['x'],
                     global_input_types=[{global_type}, {global_type}, {global_type}],
                     global_output_types=[{global_type}, {global_type}],
@@ -18121,8 +18130,8 @@ mod tests {
                 lambda %0:{global_type}, %1:{global_type} .
                 let %2:{global_type}, %3:{global_type} = shard_map [
                     mesh=['x'=2:manual],
-                    in_shardings=[{sharded}, {sharded}],
-                    out_shardings=[{sharded}, {sharded}],
+                    input_shardings=[{sharded}, {sharded}],
+                    output_shardings=[{sharded}, {sharded}],
                     manual_axes=['x'],
                     global_input_types=[{global_type}, {global_type}],
                     global_output_types=[{global_type}, {global_type}],
@@ -18145,8 +18154,8 @@ mod tests {
                 lambda %0:{global_type}, %1:{global_type} .
                 let %2:{global_type} = shard_map [
                     mesh=['x'=2:manual],
-                    in_shardings=[{sharded}, {sharded}],
-                    out_shardings=[{sharded}],
+                    input_shardings=[{sharded}, {sharded}],
+                    output_shardings=[{sharded}],
                     manual_axes=['x'],
                     global_input_types=[{global_type}, {global_type}],
                     global_output_types=[{global_type}],
@@ -18168,8 +18177,8 @@ mod tests {
                 lambda %0:{global_type}, %1:{global_type} .
                 let %2:{global_type} = shard_map [
                     mesh=['x'=2:manual],
-                    in_shardings=[{sharded}, {sharded}],
-                    out_shardings=[{sharded}],
+                    input_shardings=[{sharded}, {sharded}],
+                    output_shardings=[{sharded}],
                     manual_axes=['x'],
                     global_input_types=[{global_type}, {global_type}],
                     global_output_types=[{global_type}],
@@ -18272,9 +18281,9 @@ mod tests {
                 let %4:f32[][sharding={mesh<['x'=2:manual]>, []}], %5:f32[][sharding={mesh<['x'=2:manual]>, []}] = \
                     shard_map [
                     mesh=['x'=2:manual],
-                    in_shardings=[{mesh<['x'=2:manual]>, []}, {mesh<['x'=2:manual]>, []}, {mesh<['x'=2:manual]>, []}, \
+                    input_shardings=[{mesh<['x'=2:manual]>, []}, {mesh<['x'=2:manual]>, []}, {mesh<['x'=2:manual]>, []}, \
                         {mesh<['x'=2:manual]>, []}],
-                    out_shardings=[{mesh<['x'=2:manual]>, []}, {mesh<['x'=2:manual]>, []}],
+                    output_shardings=[{mesh<['x'=2:manual]>, []}, {mesh<['x'=2:manual]>, []}],
                     manual_axes=['x'],
                     global_input_types=[f32[][sharding={mesh<['x'=2:manual]>, []}], \
                         f32[][sharding={mesh<['x'=2:manual]>, []}], f32[][sharding={mesh<['x'=2:manual]>, []}], \
@@ -18372,8 +18381,8 @@ mod tests {
                 lambda %0:ref<f32[4]>, %1:f32[4], %2:ref<f32[4]>, %3:f32[4] .
                 let %4:f32[4] = shard_map [
                     mesh=['x'=2:manual],
-                    in_shardings=[{mesh<['x'=2:manual]>, [{'x'}]}, {mesh<['x'=2:manual]>, [{'x'}]}],
-                    out_shardings=[{mesh<['x'=2:manual]>, [{'x'}]}],
+                    input_shardings=[{mesh<['x'=2:manual]>, [{'x'}]}, {mesh<['x'=2:manual]>, [{'x'}]}],
+                    output_shardings=[{mesh<['x'=2:manual]>, [{'x'}]}],
                     manual_axes=['x'],
                     global_input_types=[ref<f32[4]>, f32[4]],
                     global_output_types=[f32[4]],
@@ -18388,8 +18397,8 @@ mod tests {
                 ]
                     %5:f32[4] = shard_map [
                         mesh=['x'=2:manual],
-                        in_shardings=[{mesh<['x'=2:manual]>, [{'x'}]}, {mesh<['x'=2:manual]>, [{'x'}]}],
-                        out_shardings=[{mesh<['x'=2:manual]>, [{'x'}]}],
+                        input_shardings=[{mesh<['x'=2:manual]>, [{'x'}]}, {mesh<['x'=2:manual]>, [{'x'}]}],
+                        output_shardings=[{mesh<['x'=2:manual]>, [{'x'}]}],
                         manual_axes=['x'],
                         global_input_types=[ref<f32[4]>, f32[4]],
                         global_output_types=[f32[4]],
@@ -18417,8 +18426,8 @@ mod tests {
                 lambda %0:ref<f32[4]>, %1:f32[4], %2:f32[4] .
                 let %3:f32[4] = shard_map [
                     mesh=['x'=2:manual],
-                    in_shardings=[{mesh<['x'=2:manual]>, [{'x'}]}, {mesh<['x'=2:manual]>, [{'x'}]}],
-                    out_shardings=[{mesh<['x'=2:manual]>, [{'x'}]}],
+                    input_shardings=[{mesh<['x'=2:manual]>, [{'x'}]}, {mesh<['x'=2:manual]>, [{'x'}]}],
+                    output_shardings=[{mesh<['x'=2:manual]>, [{'x'}]}],
                     manual_axes=['x'],
                     global_input_types=[ref<f32[4]>, f32[4]],
                     global_output_types=[f32[4]],
@@ -18433,8 +18442,8 @@ mod tests {
                 ]
                     %4:f32[4] = shard_map [
                         mesh=['x'=2:manual],
-                        in_shardings=[{mesh<['x'=2:manual]>, [{'x'}]}],
-                        out_shardings=[{mesh<['x'=2:manual]>, [{'x'}]}],
+                        input_shardings=[{mesh<['x'=2:manual]>, [{'x'}]}],
+                        output_shardings=[{mesh<['x'=2:manual]>, [{'x'}]}],
                         manual_axes=['x'],
                         global_input_types=[f32[4]],
                         global_output_types=[f32[4]],
@@ -18516,8 +18525,8 @@ mod tests {
                     %3:ref<f32[3, 1]> = reference_new %2
                     %4:{replicated} = shard_map [
                         mesh=['x'=2:manual],
-                        in_shardings=[{{mesh<['x'=2:manual]>, [{{'x'}}]}}, {{mesh<['x'=2:manual]>, [{{'x'}}]}}],
-                        out_shardings=[{{mesh<['x'=2:manual]>, [{{}}, {{}}]}}],
+                        input_shardings=[{{mesh<['x'=2:manual]>, [{{'x'}}]}}, {{mesh<['x'=2:manual]>, [{{'x'}}]}}],
+                        output_shardings=[{{mesh<['x'=2:manual]>, [{{}}, {{}}]}}],
                         manual_axes=['x'],
                         global_input_types=[{seed}, {index}],
                         global_output_types=[{replicated}],
@@ -18601,8 +18610,8 @@ mod tests {
                     () = reference_add_update %3 %0
                     %4:ref<f32[2]> = shard_map [
                         mesh=['x'=2:manual],
-                        in_shardings=[{{mesh<['x'=2:manual]>, [{{}}]}}, {{mesh<['x'=2:manual]>, [{{}}]}}],
-                        out_shardings=[{{mesh<['x'=2:manual]>, [{{}}]}}],
+                        input_shardings=[{{mesh<['x'=2:manual]>, [{{}}]}}, {{mesh<['x'=2:manual]>, [{{}}]}}],
+                        output_shardings=[{{mesh<['x'=2:manual]>, [{{}}]}}],
                         manual_axes=['x'],
                         global_input_types=[ref<{replicated}>, {replicated}],
                         global_output_types=[ref<{replicated}>],
@@ -18673,8 +18682,8 @@ mod tests {
                 lambda  .
                 let %0:f32[2][sharding={mesh<['x'=2:manual]>, [{'x'}]}] = shard_map [
                     mesh=['x'=2:manual],
-                    in_shardings=[],
-                    out_shardings=[{mesh<['x'=2:manual]>, [{'x'}]}],
+                    input_shardings=[],
+                    output_shardings=[{mesh<['x'=2:manual]>, [{'x'}]}],
                     manual_axes=['x'],
                     global_input_types=[],
                     global_output_types=[f32[2][sharding={mesh<['x'=2:manual]>, [{'x'}]}]],
@@ -18755,8 +18764,8 @@ mod tests {
                 lambda %0:f32[4][sharding={mesh<['x'=2:manual]>, [{}], reduced={'x'}}] .
                 let %1:f32[4][sharding={mesh<['x'=2:manual]>, [{}], reduced={'x'}}] = shard_map [
                     mesh=['x'=2:manual],
-                    in_shardings=[{mesh<['x'=2:manual]>, [{}], reduced={'x'}}],
-                    out_shardings=[{mesh<['x'=2:manual]>, [{}], reduced={'x'}}],
+                    input_shardings=[{mesh<['x'=2:manual]>, [{}], reduced={'x'}}],
+                    output_shardings=[{mesh<['x'=2:manual]>, [{}], reduced={'x'}}],
                     manual_axes=['x'],
                     global_input_types=[f32[4][sharding={mesh<['x'=2:manual]>, [{}], reduced={'x'}}]],
                     global_output_types=[f32[4][sharding={mesh<['x'=2:manual]>, [{}], reduced={'x'}}]],
@@ -18797,8 +18806,8 @@ mod tests {
                 lambda %0:{cotangent_type}, %1:ref<{cotangent_type}> .
                 let %2:{cotangent_type} = shard_map [
                     mesh=['x'=2:manual],
-                    in_shardings=[{cotangent_sharding}],
-                    out_shardings=[{cotangent_sharding}],
+                    input_shardings=[{cotangent_sharding}],
+                    output_shardings=[{cotangent_sharding}],
                     manual_axes=['x'],
                     global_input_types=[{cotangent_type}],
                     global_output_types=[{cotangent_type}],
@@ -18846,8 +18855,8 @@ mod tests {
                 lambda %0:{cotangent_type}, %1:ref<{cotangent_type}> .
                 let () = shard_map [
                     mesh=['x'=2:manual, 'y'=2:explicit],
-                    in_shardings=[{cotangent_sharding}, {cotangent_sharding}],
-                    out_shardings=[],
+                    input_shardings=[{cotangent_sharding}, {cotangent_sharding}],
+                    output_shardings=[],
                     manual_axes=['x'],
                     global_input_types=[{cotangent_type}, ref<{cotangent_type}>],
                     global_output_types=[],
@@ -18957,8 +18966,8 @@ mod tests {
         let transposed_shard_map = formatdoc! {"
             let %1:{global_type} = shard_map [
                 mesh=['x'=2:manual, 'y'=2:explicit],
-                in_shardings=[{along_x}],
-                out_shardings=[{along_x}],
+                input_shardings=[{along_x}],
+                output_shardings=[{along_x}],
                 manual_axes=['x'],
                 global_input_types=[{global_type}],
                 global_output_types=[{global_type}],
@@ -19025,8 +19034,8 @@ mod tests {
                 lambda %0:{along_x_and_y_type} .
                 let %1:{along_x_and_y_type} = shard_map [
                     mesh=['x'=2:manual, 'y'=2:explicit],
-                    in_shardings=[{along_x_and_y}],
-                    out_shardings=[{along_x_and_y}],
+                    input_shardings=[{along_x_and_y}],
+                    output_shardings=[{along_x_and_y}],
                     manual_axes=['x'],
                     global_input_types=[{along_x_and_y_type}],
                     global_output_types=[{along_x_and_y_type}],
@@ -19082,8 +19091,8 @@ mod tests {
                 lambda %0:{global_type} .
                 let %1:{global_type} = shard_map [
                     mesh=['x'=2:manual, 'y'=2:auto],
-                    in_shardings=[{along_x}],
-                    out_shardings=[{along_x}],
+                    input_shardings=[{along_x}],
+                    output_shardings=[{along_x}],
                     manual_axes=['x'],
                     global_input_types=[{global_type}],
                     global_output_types=[{global_type}],
@@ -19156,8 +19165,8 @@ mod tests {
                 lambda %0:{cotangent_type} .
                 let %1:{cotangent_type} = shard_map [
                     mesh=['x'=2:manual, 'y'=2:explicit, 'z'=2:explicit],
-                    in_shardings=[{cotangent_sharding}],
-                    out_shardings=[{cotangent_sharding}],
+                    input_shardings=[{cotangent_sharding}],
+                    output_shardings=[{cotangent_sharding}],
                     manual_axes=['x'],
                     global_input_types=[{cotangent_type}],
                     global_output_types=[{cotangent_type}],
@@ -19221,8 +19230,8 @@ mod tests {
                 lambda %0:{global_type} .
                 let %1:{global_type} = shard_map [
                     mesh=['x'=2:manual, 'y'=2:manual, 'z'=2:explicit],
-                    in_shardings=[{along_y}],
-                    out_shardings=[{along_y}],
+                    input_shardings=[{along_y}],
+                    output_shardings=[{along_y}],
                     manual_axes=['y'],
                     global_input_types=[{global_type}],
                     global_output_types=[{global_type}],
@@ -19275,8 +19284,8 @@ mod tests {
                 lambda %0:{global_type} .
                 let %1:{global_type} = shard_map [
                     mesh=['x'=2:manual],
-                    in_shardings=[{sharding}],
-                    out_shardings=[{sharding}],
+                    input_shardings=[{sharding}],
+                    output_shardings=[{sharding}],
                     manual_axes=['x'],
                     global_input_types=[{global_type}],
                     global_output_types=[{global_type}],
@@ -19329,8 +19338,8 @@ mod tests {
                 lambda %0:{global}, %1:ref<f32[2]> .
                 let %2:{replicated_type} = shard_map [
                     mesh=['x'=2:manual],
-                    in_shardings=[{sharded}],
-                    out_shardings=[{replicated}],
+                    input_shardings=[{sharded}],
+                    output_shardings=[{replicated}],
                     manual_axes=['x'],
                     global_input_types=[{global}],
                     global_output_types=[{replicated_type}],
@@ -19392,8 +19401,8 @@ mod tests {
                 lambda %0:{global}, %1:ref<{along_y_type}> .
                 let %2:{replicated_type} = shard_map [
                     mesh=['x'=2:manual, 'y'=2:explicit],
-                    in_shardings=[{along_x}],
-                    out_shardings=[{replicated}],
+                    input_shardings=[{along_x}],
+                    output_shardings=[{replicated}],
                     manual_axes=['x'],
                     global_input_types=[{global}],
                     global_output_types=[{replicated_type}],
@@ -19449,8 +19458,8 @@ mod tests {
         let transposed_shard_map = formatdoc! {"
             let %1:{global} = shard_map [
                 mesh=['x'=2:manual],
-                in_shardings=[{sharded}],
-                out_shardings=[{sharded}],
+                input_shardings=[{sharded}],
+                output_shardings=[{sharded}],
                 manual_axes=['x'],
                 global_input_types=[{global}],
                 global_output_types=[{global}],
@@ -19514,8 +19523,8 @@ mod tests {
                 lambda %0:{global}, %1:ref<{host_replicated}> .
                 let %2:{replicated_type} = shard_map [
                     mesh=['x'=2:manual],
-                    in_shardings=[{sharded}],
-                    out_shardings=[{replicated}],
+                    input_shardings=[{sharded}],
+                    output_shardings=[{replicated}],
                     manual_axes=['x'],
                     global_input_types=[{global}],
                     global_output_types=[{replicated_type}],
@@ -19570,8 +19579,8 @@ mod tests {
                 lambda %0:f32[4][sharding={mesh<['x'=2:manual]>, [{'x'}]}] .
                 let %1:f32[2][sharding={mesh<['x'=2:manual]>, [{}]}] = shard_map [
                     mesh=['x'=2:manual],
-                    in_shardings=[{mesh<['x'=2:manual]>, [{'x'}]}],
-                    out_shardings=[{mesh<['x'=2:manual]>, [{}]}],
+                    input_shardings=[{mesh<['x'=2:manual]>, [{'x'}]}],
+                    output_shardings=[{mesh<['x'=2:manual]>, [{}]}],
                     manual_axes=['x'],
                     global_input_types=[f32[4][sharding={mesh<['x'=2:manual]>, [{'x'}]}]],
                     global_output_types=[f32[2][sharding={mesh<['x'=2:manual]>, [{}]}]],
@@ -19632,8 +19641,8 @@ mod tests {
                 %2:ref<f32[][sharding={mesh<['x'=2:manual]>, []}]> .
                 let %3:f32[][sharding={mesh<['x'=2:manual]>, []}] = shard_map [
                     mesh=['x'=2:manual],
-                    in_shardings=[{mesh<['x'=2:manual]>, []}],
-                    out_shardings=[{mesh<['x'=2:manual]>, []}],
+                    input_shardings=[{mesh<['x'=2:manual]>, []}],
+                    output_shardings=[{mesh<['x'=2:manual]>, []}],
                     manual_axes=['x'],
                     global_input_types=[f32[][sharding={mesh<['x'=2:manual]>, []}]],
                     global_output_types=[f32[][sharding={mesh<['x'=2:manual]>, []}]],
@@ -19768,8 +19777,8 @@ mod tests {
                 lambda %0:f32[4][sharding={mesh<['x'=2:manual]>, [{}]}] .
                 let %1:f32[4][sharding={mesh<['x'=2:manual]>, [{}]}] = shard_map [
                     mesh=['x'=2:manual],
-                    in_shardings=[{mesh<['x'=2:manual]>, [{}]}],
-                    out_shardings=[{mesh<['x'=2:manual]>, [{}]}],
+                    input_shardings=[{mesh<['x'=2:manual]>, [{}]}],
+                    output_shardings=[{mesh<['x'=2:manual]>, [{}]}],
                     manual_axes=['x'],
                     global_input_types=[f32[4][sharding={mesh<['x'=2:manual]>, [{}]}]],
                     global_output_types=[f32[4][sharding={mesh<['x'=2:manual]>, [{}]}]],
@@ -19813,8 +19822,8 @@ mod tests {
                 lambda %0:{global_type} .
                 let %1:{global_type} = shard_map [
                     mesh=['x'=2:manual],
-                    in_shardings=[{replicated}],
-                    out_shardings=[{replicated}],
+                    input_shardings=[{replicated}],
+                    output_shardings=[{replicated}],
                     manual_axes=['x'],
                     global_input_types=[{global_type}],
                     global_output_types=[{global_type}],
@@ -19881,8 +19890,8 @@ mod tests {
                 lambda %0:{global_type}, %1:{global_type}, %2:{global_type} .
                 let %3:{global_type} = shard_map [
                     mesh=['x'=2:manual],
-                    in_shardings=[{replicated}],
-                    out_shardings=[{replicated}],
+                    input_shardings=[{replicated}],
+                    output_shardings=[{replicated}],
                     manual_axes=['x'],
                     global_input_types=[{global_type}],
                     global_output_types=[{global_type}],
@@ -19894,8 +19903,8 @@ mod tests {
                 ]
                     %4:{global_type} = shard_map [
                         mesh=['x'=2:manual],
-                        in_shardings=[{replicated}],
-                        out_shardings=[{replicated}],
+                        input_shardings=[{replicated}],
+                        output_shardings=[{replicated}],
                         manual_axes=['x'],
                         global_input_types=[{global_type}],
                         global_output_types=[{global_type}],
@@ -19908,8 +19917,8 @@ mod tests {
                     %5:{global_type} = add %3 %4
                     %6:{global_type} = shard_map [
                         mesh=['x'=2:manual],
-                        in_shardings=[{replicated}],
-                        out_shardings=[{replicated}],
+                        input_shardings=[{replicated}],
+                        output_shardings=[{replicated}],
                         manual_axes=['x'],
                         global_input_types=[{global_type}],
                         global_output_types=[{global_type}],
@@ -19961,8 +19970,8 @@ mod tests {
                 lambda %0:{global_type} .
                 let %1:{global_type} = shard_map [
                     mesh=['x'=2:manual],
-                    in_shardings=[{replicated}],
-                    out_shardings=[{replicated}],
+                    input_shardings=[{replicated}],
+                    output_shardings=[{replicated}],
                     manual_axes=['x'],
                     global_input_types=[{global_type}],
                     global_output_types=[{global_type}],
@@ -20009,8 +20018,8 @@ mod tests {
                 lambda %0:{global_type} .
                 let %1:{global_type} = shard_map [
                     mesh=['x'=2:manual],
-                    in_shardings=[{replicated}],
-                    out_shardings=[{replicated}],
+                    input_shardings=[{replicated}],
+                    output_shardings=[{replicated}],
                     manual_axes=['x'],
                     global_input_types=[{global_type}],
                     global_output_types=[{global_type}],
@@ -20051,8 +20060,8 @@ mod tests {
                 lambda %0:{global_type} .
                 let %1:{global_type} = shard_map [
                     mesh=['x'=2:manual],
-                    in_shardings=[{replicated}],
-                    out_shardings=[{replicated}],
+                    input_shardings=[{replicated}],
+                    output_shardings=[{replicated}],
                     manual_axes=['x'],
                     global_input_types=[{global_type}],
                     global_output_types=[{global_type}],
@@ -20112,8 +20121,8 @@ mod tests {
                 lambda  .
                 let () = shard_map [
                     mesh=['x'=2:manual],
-                    in_shardings=[],
-                    out_shardings=[],
+                    input_shardings=[],
+                    output_shardings=[],
                     manual_axes=['x'],
                     global_input_types=[],
                     global_output_types=[],
@@ -20207,8 +20216,8 @@ mod tests {
                 lambda %0:{cotangent_type}, %1:{global_type} .
                 let %2:{cotangent_type} = shard_map [
                     mesh=['x'=2:manual, 'y'=2:explicit],
-                    in_shardings=[{cotangent_sharding}, {unreduced}],
-                    out_shardings=[{cotangent_sharding}],
+                    input_shardings=[{cotangent_sharding}, {unreduced}],
+                    output_shardings=[{cotangent_sharding}],
                     manual_axes=['x'],
                     global_input_types=[{cotangent_type}, {global_type}],
                     global_output_types=[{cotangent_type}],
@@ -20237,8 +20246,8 @@ mod tests {
                 lambda %0:f32[4], %1:ref<f32[4]> .
                 let %2:ref<f32[4]>, %3:f32[4] = shard_map [
                     mesh=['x'=2:manual],
-                    in_shardings=[{mesh<['x'=2:manual]>, [{'x'}]}, {mesh<['x'=2:manual]>, [{'x'}]}],
-                    out_shardings=[{mesh<['x'=2:manual]>, [{'x'}]}, {mesh<['x'=2:manual]>, [{'x'}]}],
+                    input_shardings=[{mesh<['x'=2:manual]>, [{'x'}]}, {mesh<['x'=2:manual]>, [{'x'}]}],
+                    output_shardings=[{mesh<['x'=2:manual]>, [{'x'}]}, {mesh<['x'=2:manual]>, [{'x'}]}],
                     manual_axes=['x'],
                     global_input_types=[f32[4], ref<f32[4]>],
                     global_output_types=[ref<f32[4]>, f32[4]],
@@ -20288,8 +20297,8 @@ mod tests {
                 lambda  .
                 let %0:u64[2][sharding={mesh<['x'=2:manual]>, [{'x'}]}] = shard_map [
                     mesh=['x'=2:manual],
-                    in_shardings=[],
-                    out_shardings=[{mesh<['x'=2:manual]>, [{'x'}]}],
+                    input_shardings=[],
+                    output_shardings=[{mesh<['x'=2:manual]>, [{'x'}]}],
                     manual_axes=['x'],
                     global_input_types=[],
                     global_output_types=[u64[2][sharding={mesh<['x'=2:manual]>, [{'x'}]}]],
@@ -20407,8 +20416,8 @@ mod tests {
                 let %1:u64[2][sharding={mesh<['x'=2:manual, 'y'=2:manual]>, [{'y'}], varying_manual={'x'}}] = \
                     shard_map [
                     mesh=['x'=2:manual, 'y'=2:manual],
-                    in_shardings=[],
-                    out_shardings=[{mesh<['x'=2:manual, 'y'=2:manual]>, [{'y'}]}],
+                    input_shardings=[],
+                    output_shardings=[{mesh<['x'=2:manual, 'y'=2:manual]>, [{'y'}]}],
                     manual_axes=['y'],
                     global_input_types=[],
                     global_output_types=[u64[2][sharding={mesh<['x'=2:manual, 'y'=2:manual]>, [{'y'}], \
@@ -20456,8 +20465,8 @@ mod tests {
                 lambda  .
                 let () = shard_map [
                     mesh=['x'=2:manual],
-                    in_shardings=[],
-                    out_shardings=[],
+                    input_shardings=[],
+                    output_shardings=[],
                     manual_axes=['x'],
                     global_input_types=[],
                     global_output_types=[],
@@ -20511,8 +20520,8 @@ mod tests {
                 let %2:f32[4][sharding={mesh<['x'=2:manual]>, [{'x'}]}], \
                     %3:f32[4][sharding={mesh<['x'=2:manual]>, [{'x'}]}] = shard_map [
                     mesh=['x'=2:manual],
-                    in_shardings=[{mesh<['x'=2:manual]>, [{'x'}]}, {mesh<['x'=2:manual]>, [{}]}],
-                    out_shardings=[{mesh<['x'=2:manual]>, [{'x'}]}, {mesh<['x'=2:manual]>, [{'x'}]}],
+                    input_shardings=[{mesh<['x'=2:manual]>, [{'x'}]}, {mesh<['x'=2:manual]>, [{}]}],
+                    output_shardings=[{mesh<['x'=2:manual]>, [{'x'}]}, {mesh<['x'=2:manual]>, [{'x'}]}],
                     manual_axes=['x'],
                     global_input_types=[f32[4][sharding={mesh<['x'=2:manual]>, [{'x'}]}], \
                         f32[2][sharding={mesh<['x'=2:manual]>, [{}]}]],
@@ -20674,8 +20683,8 @@ mod tests {
                 let %1:f32[4][sharding={mesh<['x'=2:manual, 'y'=2:manual]>, [{'y'}], varying_manual={'x'}}] = \
                         shard_map [
                     mesh=['x'=2:manual, 'y'=2:manual],
-                    in_shardings=[{mesh<['x'=2:manual, 'y'=2:manual]>, [{'y'}]}],
-                    out_shardings=[{mesh<['x'=2:manual, 'y'=2:manual]>, [{'y'}]}],
+                    input_shardings=[{mesh<['x'=2:manual, 'y'=2:manual]>, [{'y'}]}],
+                    output_shardings=[{mesh<['x'=2:manual, 'y'=2:manual]>, [{'y'}]}],
                     manual_axes=['y'],
                     global_input_types=[\
                         f32[4][sharding={mesh<['x'=2:manual, 'y'=2:manual]>, [{'y'}], varying_manual={'x'}}]],
@@ -20784,8 +20793,8 @@ mod tests {
                 let %1:f32[4][sharding={mesh<['x'=2:manual, 'y'=2:manual]>, [{'y'}], varying_manual={'x'}}] = \
                         shard_map [
                     mesh=['x'=2:manual, 'y'=2:manual],
-                    in_shardings=[{mesh<['x'=2:manual, 'y'=2:manual]>, [{'y'}]}],
-                    out_shardings=[{mesh<['x'=2:manual, 'y'=2:manual]>, [{'y'}]}],
+                    input_shardings=[{mesh<['x'=2:manual, 'y'=2:manual]>, [{'y'}]}],
+                    output_shardings=[{mesh<['x'=2:manual, 'y'=2:manual]>, [{'y'}]}],
                     manual_axes=['y'],
                     global_input_types=[\
                         f32[4][sharding={mesh<['x'=2:manual, 'y'=2:manual]>, [{'y'}], varying_manual={'x'}}]],
@@ -21354,8 +21363,8 @@ mod tests {
             indoc! {"
                 shard_map [
                     mesh=['x'=2:manual, 'y'=2:manual],
-                    in_shardings=[{mesh<['x'=2:manual, 'y'=2:manual]>, [{'y'}]}],
-                    out_shardings=[{mesh<['x'=2:manual, 'y'=2:manual]>, [{'y'}]}],
+                    input_shardings=[{mesh<['x'=2:manual, 'y'=2:manual]>, [{'y'}]}],
+                    output_shardings=[{mesh<['x'=2:manual, 'y'=2:manual]>, [{'y'}]}],
                     manual_axes=['y'],
                     global_input_types=[f32[8][sharding={mesh<['x'=2:manual, 'y'=2:manual]>, [{'y'}]}]],
                     global_output_types=[f32[8][sharding={mesh<['x'=2:manual, 'y'=2:manual]>, [{'y'}]}]],
@@ -21407,8 +21416,8 @@ mod tests {
             indoc! {"
                 shard_map [
                     mesh=['x'=2:manual, 'y'=2:manual],
-                    in_shardings=[{mesh<['x'=2:manual, 'y'=2:manual]>, [{'y'}]}],
-                    out_shardings=[{mesh<['x'=2:manual, 'y'=2:manual]>, [{'y'}]}],
+                    input_shardings=[{mesh<['x'=2:manual, 'y'=2:manual]>, [{'y'}]}],
+                    output_shardings=[{mesh<['x'=2:manual, 'y'=2:manual]>, [{'y'}]}],
                     manual_axes=['y'],
                     global_input_types=[f32[4][sharding={mesh<['x'=2:manual, 'y'=2:manual]>, [{'y'}], \
                         varying_manual={'x'}}]],
@@ -21447,8 +21456,8 @@ mod tests {
             indoc! {"
                 shard_map [
                     mesh=['x'=2:manual],
-                    in_shardings=[],
-                    out_shardings=[{mesh<['x'=2:manual]>, [{'x'}]}],
+                    input_shardings=[],
+                    output_shardings=[{mesh<['x'=2:manual]>, [{'x'}]}],
                     manual_axes=['x'],
                     global_input_types=[],
                     global_output_types=[u64[2][sharding={mesh<['x'=2:manual]>, [{'x'}]}]],
@@ -21498,8 +21507,8 @@ mod tests {
             indoc! {"
                 shard_map [
                     mesh=['x'=2:manual],
-                    in_shardings=[{mesh<['x'=2:manual]>, [{'x'}]}, {mesh<['x'=2:manual]>, [{}]}],
-                    out_shardings=[{mesh<['x'=2:manual]>, [{'x'}]}, {mesh<['x'=2:manual]>, [{}]}],
+                    input_shardings=[{mesh<['x'=2:manual]>, [{'x'}]}, {mesh<['x'=2:manual]>, [{}]}],
+                    output_shardings=[{mesh<['x'=2:manual]>, [{'x'}]}, {mesh<['x'=2:manual]>, [{}]}],
                     manual_axes=['x'],
                     global_input_types=[f32[8][sharding={mesh<['x'=2:manual]>, [{'x'}]}], \
                     f32[2][sharding={mesh<['x'=2:manual]>, [{}]}]],

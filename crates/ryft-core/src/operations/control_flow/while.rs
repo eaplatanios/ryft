@@ -13971,8 +13971,8 @@ mod tests {
                 lambda %0:f32[4], %1:f32[4] .
                 let %2:{global_state}, %3:{global_state} = shard_map [
                     mesh=['x'=2:manual],
-                    in_shardings=[{global_sharding}, {global_sharding}],
-                    out_shardings=[{global_sharding}, {global_sharding}],
+                    input_shardings=[{global_sharding}, {global_sharding}],
+                    output_shardings=[{global_sharding}, {global_sharding}],
                     manual_axes=['x'],
                     global_input_types=[{global_state}, {global_state}],
                     global_output_types=[{global_state}, {global_state}],

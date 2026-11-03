@@ -6808,7 +6808,7 @@ mod tests {
     }
 
     #[test]
-    fn test_compile_with_options_in_shardings_override_replaces_input_sharding() {
+    fn test_compile_with_options_input_shardings_override_replaces_input_sharding() {
         let plugin = load_cpu_plugin().unwrap();
         let client = plugin
             .client(ClientOptions::CPU(CpuClientOptions { device_count: Some(2), ..Default::default() }))
@@ -6817,14 +6817,14 @@ mod tests {
         let engine = XlaSession::new(&client).domain();
 
         // input_type carries the abstract shape & dtype but a "wrong" sharding (replicated). The
-        // `in_shardings` override replaces it with a 2-way shard along "x" before tracing, so
+        // `input_shardings` override replaces it with a 2-way shard along "x" before tracing, so
         // the compiled program shards the input across the 2-device mesh.
         let shape = Shape::new(vec![Dimension::Static(4)]);
         let abstract_sharding = Sharding::replicated(mesh.logical_mesh().clone(), 1);
         let abstract_input_type =
             ArrayType::new(DataType::F32, shape.clone()).with_sharding(abstract_sharding).unwrap();
         let sharded = Sharding::new(mesh.logical_mesh().clone(), vec![ShardingDimension::sharded(["x"])]).unwrap();
-        let xla_options = XlaOptions::new(mesh.clone()).with_in_shardings(vec![sharded.clone()]);
+        let xla_options = XlaOptions::new(mesh.clone()).with_input_shardings(vec![sharded.clone()]);
         let options = xla_options;
         let compiled: CompiledXlaFunction<'_, ArrayType, ArrayType> =
             compile_with_options(|x| x.sin().unwrap(), abstract_input_type, &engine, options).unwrap();
@@ -6859,7 +6859,7 @@ mod tests {
     }
 
     #[test]
-    fn test_compile_with_options_rejects_in_shardings_arity_mismatch() {
+    fn test_compile_with_options_rejects_input_shardings_arity_mismatch() {
         let plugin = load_cpu_plugin().unwrap();
         let client = plugin
             .client(ClientOptions::CPU(CpuClientOptions { device_count: Some(1), ..Default::default() }))
@@ -6871,7 +6871,7 @@ mod tests {
             .unwrap();
         let sharding = Sharding::replicated(mesh.logical_mesh().clone(), 1);
         // Two shardings for one flat input — should fail.
-        let xla_options = XlaOptions::new(mesh).with_in_shardings(vec![sharding.clone(), sharding]);
+        let xla_options = XlaOptions::new(mesh).with_input_shardings(vec![sharding.clone(), sharding]);
         let options = xla_options;
         let result: Result<CompiledXlaFunction<'_, ArrayType, ArrayType>, Error> =
             compile_with_options(|x| x.sin().unwrap(), input_type, &engine, options);
@@ -6879,7 +6879,7 @@ mod tests {
     }
 
     #[test]
-    fn test_compile_with_options_out_shardings_override_propagates_to_output_array() {
+    fn test_compile_with_options_output_shardings_override_propagates_to_output_array() {
         let plugin = load_cpu_plugin().unwrap();
         let client = plugin
             .client(ClientOptions::CPU(CpuClientOptions { device_count: Some(2), ..Default::default() }))
@@ -6892,7 +6892,7 @@ mod tests {
         let input_type = ArrayType::new(DataType::F32, shape.clone()).with_sharding(sharded.clone()).unwrap();
         // Override the output sharding to the same 2-way shard along "x" so the partitioner
         // emits a fully-sharded output and `XlaArray`'s sharding metadata matches.
-        let xla_options = XlaOptions::new(mesh.clone()).with_out_shardings(vec![sharded.clone()]);
+        let xla_options = XlaOptions::new(mesh.clone()).with_output_shardings(vec![sharded.clone()]);
         let options = xla_options;
         let compiled: CompiledXlaFunction<'_, ArrayType, ArrayType> =
             compile_with_options(|x| x.sin().unwrap(), input_type.clone(), &engine, options).unwrap();
@@ -6978,7 +6978,7 @@ mod tests {
     }
 
     #[test]
-    fn test_compile_with_options_rejects_out_shardings_arity_mismatch() {
+    fn test_compile_with_options_rejects_output_shardings_arity_mismatch() {
         let plugin = load_cpu_plugin().unwrap();
         let client = plugin
             .client(ClientOptions::CPU(CpuClientOptions { device_count: Some(1), ..Default::default() }))
@@ -6989,7 +6989,7 @@ mod tests {
             .with_sharding(Sharding::replicated(mesh.logical_mesh().clone(), 1))
             .unwrap();
         let sharding = Sharding::replicated(mesh.logical_mesh().clone(), 1);
-        let xla_options = XlaOptions::new(mesh).with_out_shardings(vec![sharding.clone(), sharding]);
+        let xla_options = XlaOptions::new(mesh).with_output_shardings(vec![sharding.clone(), sharding]);
         let options = xla_options;
         let result: Result<CompiledXlaFunction<'_, ArrayType, ArrayType>, Error> =
             compile_with_options(|x| x.sin().unwrap(), input_type, &engine, options);
@@ -7238,7 +7238,7 @@ mod tests {
 
     /// Input sharding overrides change the input types before tracing begins.
     #[test]
-    fn test_staging_applies_in_shardings() {
+    fn test_staging_applies_input_shardings() {
         let plugin = load_cpu_plugin().unwrap();
         let client = plugin
             .client(ClientOptions::CPU(CpuClientOptions { device_count: Some(1), ..Default::default() }))
@@ -7249,7 +7249,7 @@ mod tests {
         let sharding = Sharding::replicated(mesh.logical_mesh().clone(), 0);
         let input_type = ArrayType::new(DataType::F32, Shape::new(Vec::new())).with_sharding(sharding.clone()).unwrap();
 
-        let options = XlaOptions::new(mesh).with_in_shardings(vec![sharding]);
+        let options = XlaOptions::new(mesh).with_input_shardings(vec![sharding]);
         let staged: StagedXlaFunction<'_, ArrayType, ArrayType> =
             stage(|x| x.sin().unwrap(), input_type, options).unwrap();
         let ArrayIrType::Array(staged_input_type) = &staged.source_program().program().input_types()[0] else {

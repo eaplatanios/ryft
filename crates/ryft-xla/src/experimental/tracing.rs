@@ -2046,9 +2046,9 @@ mod tests {
         let value_type = ArrayType::new_static(DataType::F32, [1, 2, 1, 1]).with_sharding(replicated.clone()).unwrap();
         let seed_type = ArrayType::new_static(DataType::F32, [2, 1, 1, 1]).with_sharding(sharded.clone()).unwrap();
         let input_types = vec![query_type.clone(), key_type.clone(), value_type.clone(), seed_type.clone()];
-        let in_shardings = vec![replicated.clone(), sharded.clone(), replicated.clone(), sharded.clone()];
-        let out_shardings = vec![sharded.clone(), replicated.clone()];
-        let boundary = ShardMapBoundary::new(mesh.clone(), in_shardings, out_shardings, vec![]).unwrap();
+        let input_shardings = vec![replicated.clone(), sharded.clone(), replicated.clone(), sharded.clone()];
+        let output_shardings = vec![sharded.clone(), replicated.clone()];
+        let boundary = ShardMapBoundary::new(mesh.clone(), input_shardings, output_shardings, vec![]).unwrap();
         let local_input_types = input_types
             .iter()
             .enumerate()

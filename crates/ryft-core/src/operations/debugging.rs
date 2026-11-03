@@ -581,8 +581,8 @@ mod tests {
                 lambda %0:dimension<3>, %1:f32[3, 4] .
                 let %2:{global_type} = shard_map [
                     mesh=['x'=2:manual, 'y'=2:explicit],
-                    in_shardings=[{global_sharding}],
-                    out_shardings=[{global_sharding}],
+                    input_shardings=[{global_sharding}],
+                    output_shardings=[{global_sharding}],
                     manual_axes=['x'],
                     global_input_types=[{global_type}],
                     global_output_types=[{global_type}],

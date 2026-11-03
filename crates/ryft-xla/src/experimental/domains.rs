@@ -2172,10 +2172,10 @@ pub struct XlaOptions {
     pub mesh: DeviceMesh,
 
     /// Optional override for per-input shardings.
-    pub in_shardings: Option<Vec<Sharding>>,
+    pub input_shardings: Option<Vec<Sharding>>,
 
     /// Optional override for per-output shardings.
-    pub out_shardings: Option<Vec<Sharding>>,
+    pub output_shardings: Option<Vec<Sharding>>,
 
     /// Optional flat per-input donation flags. `None` donates nothing; a present vector must match the program's
     /// flat public input arity exactly, which lowering validates.
@@ -2199,8 +2199,8 @@ impl XlaOptions {
         Self {
             kernel_compiler: None,
             mesh,
-            in_shardings: None,
-            out_shardings: None,
+            input_shardings: None,
+            output_shardings: None,
             donation_flags: None,
             feedback_directed_profile: None,
             input_bound_bucketing: None,
@@ -2218,16 +2218,16 @@ impl XlaOptions {
     /// Length must equal the flat input arity once the program is traced; mismatches surface as
     /// [`Error::InvalidCompilationOptions`] at compile time.
     #[inline]
-    pub fn with_in_shardings(mut self, in_shardings: Vec<Sharding>) -> Self {
-        self.in_shardings = Some(in_shardings);
+    pub fn with_input_shardings(mut self, input_shardings: Vec<Sharding>) -> Self {
+        self.input_shardings = Some(input_shardings);
         self
     }
 
     /// Sets the per-output sharding overrides for SPMD partitioning. Length must equal the flat
     /// output arity once the program is traced.
     #[inline]
-    pub fn with_out_shardings(mut self, out_shardings: Vec<Sharding>) -> Self {
-        self.out_shardings = Some(out_shardings);
+    pub fn with_output_shardings(mut self, output_shardings: Vec<Sharding>) -> Self {
+        self.output_shardings = Some(output_shardings);
         self
     }
 
@@ -2287,8 +2287,8 @@ impl std::hash::Hash for XlaOptions {
         // manually instead. Everything else here derives `Hash` already.
         self.mesh.logical_mesh().hash(state);
         self.mesh.devices().hash(state);
-        self.in_shardings.hash(state);
-        self.out_shardings.hash(state);
+        self.input_shardings.hash(state);
+        self.output_shardings.hash(state);
         self.donation_flags.hash(state);
         self.feedback_directed_profile.hash(state);
         self.input_bound_bucketing.hash(state);
@@ -3938,8 +3938,8 @@ impl<'c> CompilationDomain for XlaDomain<'c> {
         let options = staged.options();
         if apply_input_shardings(input_types.to_vec(), options)? != input_types {
             return Err(Error::InvalidCompilationOptions {
-                reason: "staged input types do not carry the shardings requested by `in_shardings`; apply them to the \
-                         input types before staging (e.g., with `with_input_shardings`)"
+                reason: "staged input types do not carry the shardings requested by `input_shardings`; apply them to \
+                         the input types before staging (e.g., with `with_input_shardings`)"
                     .to_string(),
             });
         }
@@ -3949,7 +3949,7 @@ impl<'c> CompilationDomain for XlaDomain<'c> {
         // Lowering applies the output sharding overrides to the program outputs, so the traced output types of the
         // staged function are checked against the lowered ones with those same overrides applied.
         let declared_output_types =
-            apply_signature_shardings(output_types.to_vec(), options.out_shardings.as_deref(), "out")?;
+            apply_signature_shardings(output_types.to_vec(), options.output_shardings.as_deref(), "output")?;
         validate_output_types(&declared_output_types, &lowered_output_types)?;
         Ok(lowered_program)
     }
@@ -4614,8 +4614,8 @@ impl<'c> XlaDomain<'c> {
         let program_output_types = program.output_types();
         let public_output_types = apply_signature_shardings(
             program_output_types[..output_count].to_vec(),
-            options.out_shardings.as_deref(),
-            "out",
+            options.output_shardings.as_deref(),
+            "output",
         )?;
         let logical_argument_shardings = effective_input_types
             .iter()
@@ -5297,15 +5297,15 @@ pub(crate) fn validate_xla_input_type(declared: &ArrayType, actual: &ArrayType) 
     }
 }
 
-/// Returns `input_types` with the input sharding overrides of `options` (i.e., [`XlaOptions::in_shardings`]) applied,
-/// or `input_types` unchanged when `options` has none. The overrides must be applied before tracing, because tracers
-/// carry their input types and sharding-aware operations read them. Retained dispatch applies them through
+/// Returns `input_types` with the input sharding overrides of `options` (i.e., [`XlaOptions::input_shardings`])
+/// applied, or `input_types` unchanged when `options` has none. The overrides must be applied before tracing, because
+/// tracers carry their input types and sharding-aware operations read them. Retained dispatch applies them through
 /// [`CompilationDomain::dispatch_signature`], the staging entry points of this crate apply them through
 /// [`with_input_shardings`], and lowering rejects staged functions whose input types do not carry them. External
 /// reference inputs are rejected when overrides are present, because holder state derives its effective sharding from
 /// the compiled reference ABI.
 fn apply_input_shardings(input_types: Vec<ArrayIrType>, options: &XlaOptions) -> Result<Vec<ArrayIrType>, Error> {
-    let Some(in_shardings) = options.in_shardings.as_deref() else {
+    let Some(input_shardings) = options.input_shardings.as_deref() else {
         return Ok(input_types);
     };
     if input_types.iter().any(|r#type| r#type.is_reference()) {
@@ -5313,7 +5313,7 @@ fn apply_input_shardings(input_types: Vec<ArrayIrType>, options: &XlaOptions) ->
             reason: "external reference inputs do not support explicit input shardings".to_string(),
         });
     }
-    apply_signature_shardings(input_types, Some(in_shardings), "in")
+    apply_signature_shardings(input_types, Some(input_shardings), "input")
 }
 
 /// Returns the structured `input_types` with the input sharding overrides of `options` applied (refer to
@@ -5323,7 +5323,7 @@ pub(crate) fn with_input_shardings<In: Parameterized<ArrayIrType>>(
     input_types: In,
     options: &XlaOptions,
 ) -> Result<In, Error> {
-    if options.in_shardings.is_none() {
+    if options.input_shardings.is_none() {
         return Ok(input_types);
     }
     let input_structure = input_types.parameter_structure();
@@ -5493,7 +5493,7 @@ fn apply_signature_shardings(
     if shardings.len() != types.len() {
         return Err(Error::InvalidCompilationOptions {
             reason: format!(
-                "{kind}_shardings has {} entries but the function has {} flat {kind}put(s)",
+                "{kind}_shardings has {} entries but the function has {} flat {kind}(s)",
                 shardings.len(),
                 types.len(),
             ),
@@ -14206,7 +14206,7 @@ mod tests {
             StagedFunction::<XlaDomain<'_>, ArrayIrType, ArrayIrType>::stage(forward,
                 Vec::new(),
                 reference_type.clone(),
-                XlaOptions::new(mesh.clone()).with_in_shardings(vec![scalar_sharding.clone()]),
+                XlaOptions::new(mesh.clone()).with_input_shardings(vec![scalar_sharding.clone()]),
             )
             .and_then(|staged| staged.lower(&domain))
             .map(|_| ()),
@@ -14214,7 +14214,7 @@ mod tests {
                 if reason == "external reference inputs do not support explicit input shardings",
         ));
 
-        // A reference output with `out_shardings` stages successfully and is rejected when lowered, by the
+        // A reference output with `output_shardings` stages successfully and is rejected when lowered, by the
         // reference-output contract of the ABI rather than by the output override, which never runs on a reference
         // type.
         fn allocate<'c>(
@@ -14228,7 +14228,7 @@ mod tests {
             StagedFunction::<XlaDomain<'_>, ArrayIrType, ArrayIrType>::stage(allocate,
                 Vec::new(),
                 ArrayIrType::Array(ArrayType::scalar(DataType::F32)),
-                XlaOptions::new(mesh.clone()).with_out_shardings(vec![scalar_sharding]),
+                XlaOptions::new(mesh.clone()).with_output_shardings(vec![scalar_sharding]),
             )
             .and_then(|staged| staged.lower(&domain))
             .map(|_| ()),
@@ -14264,7 +14264,7 @@ mod tests {
         let domain = XlaSession::new(&client).domain();
         let scalar_type = ArrayIrType::Array(ArrayType::scalar(DataType::F32));
         let options = XlaOptions::new(mesh.clone())
-            .with_in_shardings(vec![Sharding::new(mesh.logical_mesh().clone(), Vec::new()).unwrap()]);
+            .with_input_shardings(vec![Sharding::new(mesh.logical_mesh().clone(), Vec::new()).unwrap()]);
 
         fn forward<'c>(
             _: Vec<XlaConstant>,
@@ -14286,7 +14286,7 @@ mod tests {
         assert!(matches!(
             staged.lower(&domain).map(|_| ()),
             Err(Error::InvalidCompilationOptions { reason })
-                if reason == "staged input types do not carry the shardings requested by `in_shardings`; apply them \
+                if reason == "staged input types do not carry the shardings requested by `input_shardings`; apply them \
                               to the input types before staging (e.g., with `with_input_shardings`)",
         ));
 

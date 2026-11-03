@@ -204,7 +204,7 @@ fn lower_shard_map_module(
     let function_arguments = global_input_tensor_types
         .iter()
         .zip(&global_input_types)
-        .zip(boundary.in_shardings().iter())
+        .zip(boundary.input_shardings().iter())
         .map(|((tensor_type, array_type), sharding)| {
             let sharding = sharding.to_mlir(location)?;
             let mut attributes = HashMap::from([("sdy.sharding".into(), sharding.as_ref())]);
@@ -217,7 +217,7 @@ fn lower_shard_map_module(
     let function_results = global_output_tensor_types
         .iter()
         .zip(&global_output_types)
-        .zip(boundary.out_shardings().iter())
+        .zip(boundary.output_shardings().iter())
         .map(|((tensor_type, array_type), sharding)| {
             let sharding = sharding.to_mlir(location)?;
             let mut attributes = HashMap::from([("sdy.sharding".into(), sharding.as_ref())]);
@@ -305,7 +305,7 @@ where
     }
     // For the same reason, an input or output sharding must not name such an axis (the closure entry points reject
     // these specifications too), so it is rejected here rather than silently dropped from the Shardy shardings.
-    for (value_kind, shardings) in [("input", boundary.in_shardings()), ("output", boundary.out_shardings())] {
+    for (value_kind, shardings) in [("input", boundary.input_shardings()), ("output", boundary.output_shardings())] {
         for (value_index, sharding) in shardings.iter().enumerate() {
             let axis_name = sharding
                 .dimensions()
@@ -419,7 +419,7 @@ fn to_shardy_in_shardings<'c, 't>(
     enclosing_manual_axes: &[String],
     context: &'c MlirContext<'t>,
 ) -> Result<TensorShardingPerValueAttributeRef<'c, 't>, Error> {
-    shardy_tensor_sharding_per_value(boundary.in_shardings(), boundary.manual_axes(), enclosing_manual_axes, context)
+    shardy_tensor_sharding_per_value(boundary.input_shardings(), boundary.manual_axes(), enclosing_manual_axes, context)
 }
 
 /// Builds the typed Shardy `out_shardings` attribute of `shard_map`, excluding axes already bound by enclosing manual
@@ -429,7 +429,12 @@ fn to_shardy_out_shardings<'c, 't>(
     enclosing_manual_axes: &[String],
     context: &'c MlirContext<'t>,
 ) -> Result<TensorShardingPerValueAttributeRef<'c, 't>, Error> {
-    shardy_tensor_sharding_per_value(boundary.out_shardings(), boundary.manual_axes(), enclosing_manual_axes, context)
+    shardy_tensor_sharding_per_value(
+        boundary.output_shardings(),
+        boundary.manual_axes(),
+        enclosing_manual_axes,
+        context,
+    )
 }
 
 /// Builds the typed Shardy `manual_axes` attribute that `shard_map` attaches to `sdy.manual_computation`.
@@ -1544,8 +1549,8 @@ mod tests {
         );
 
         let context = MlirContext::new();
-        let input_sharding = boundary.in_shardings()[0].to_mlir(context.unknown_location()).unwrap().to_string();
-        let output_sharding = boundary.out_shardings()[0].to_mlir(context.unknown_location()).unwrap().to_string();
+        let input_sharding = boundary.input_shardings()[0].to_mlir(context.unknown_location()).unwrap().to_string();
+        let output_sharding = boundary.output_shardings()[0].to_mlir(context.unknown_location()).unwrap().to_string();
         let manual_computation_attributes =
             r#"in_shardings=[<@mesh, [{"x"}]>] out_shardings=[<@mesh, [{"x"}]>] manual_axes={"x"}"#;
         let mesh_module = context.module(context.unknown_location()).unwrap();

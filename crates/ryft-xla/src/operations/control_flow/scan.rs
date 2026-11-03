@@ -3197,8 +3197,8 @@ mod tests {
                 lambda %0:{sum}, %1:{items} .
                 let %2:{sum}, %3:{items} = shard_map [
                     mesh=['x'=2:manual],
-                    in_shardings=[{sum_sharding}, {items_sharding}],
-                    out_shardings=[{sum_sharding}, {items_sharding}],
+                    input_shardings=[{sum_sharding}, {items_sharding}],
+                    output_shardings=[{sum_sharding}, {items_sharding}],
                     manual_axes=['x'],
                     global_input_types=[{sum}, {items}],
                     global_output_types=[{sum}, {items}],

@@ -121,14 +121,14 @@ fn try_same_mesh<'o>(
     let dst_sharding = dst_sharding.clone();
 
     // Build the bare input type for tracing (no sharding); the in/out shardings are attached as
-    // `sdy.sharding` attributes via `XlaOptions::{in_shardings, out_shardings}`.
+    // `sdy.sharding` attributes via `XlaOptions::{input_shardings, output_shardings}`.
     let bare_input_type = ArrayType::new(element_type, shape.clone().into());
 
     let xla_options = XlaOptions {
         kernel_compiler: None,
         mesh: dst_mesh.clone(),
-        in_shardings: Some(vec![src_sharding.clone()]),
-        out_shardings: Some(vec![dst_sharding.clone()]),
+        input_shardings: Some(vec![src_sharding.clone()]),
+        output_shardings: Some(vec![dst_sharding.clone()]),
         donation_flags: Some(vec![donate]),
         feedback_directed_profile: None,
         input_bound_bucketing: None,

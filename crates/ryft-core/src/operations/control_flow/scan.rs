@@ -15554,8 +15554,8 @@ mod tests {
                 lambda %0:dimension<2>, %1:f32[2], %2:f32[2, 3, 4] .
                 let %3:{invariant_matrix}, %4:{global_outputs} = shard_map [
                     mesh=['devices'=2:manual],
-                    in_shardings=[{replicated}, {sharded}],
-                    out_shardings=[{replicated_matrix}, {sharded}],
+                    input_shardings=[{replicated}, {sharded}],
+                    output_shardings=[{replicated_matrix}, {sharded}],
                     manual_axes=['devices'],
                     global_input_types=[{invariant}, {global_stacks}],
                     global_output_types=[{invariant_matrix}, {global_outputs}],

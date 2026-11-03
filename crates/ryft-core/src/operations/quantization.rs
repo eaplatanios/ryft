@@ -6777,14 +6777,14 @@ mod tests {
                 lambda %0:f32[2, 4], %1:f32[1, 2], %2:f32[], %3:f32[4, 1], %4:f32[2, 1], %5:f32[] .
                 let %6:f32[2, 1][sharding={mesh<['x'=2:manual]>, [{'x'}, {}]}] = shard_map [
                     mesh=['x'=2:manual],
-                    in_shardings=[\
+                    input_shardings=[\
                         {mesh<['x'=2:manual]>, [{'x'}, {}]}, \
                         {mesh<['x'=2:manual]>, [{}, {}]}, \
                         {mesh<['x'=2:manual]>, []}, \
                         {mesh<['x'=2:manual]>, [{}, {}]}, \
                         {mesh<['x'=2:manual]>, [{}, {}]}, \
                         {mesh<['x'=2:manual]>, []}],
-                    out_shardings=[{mesh<['x'=2:manual]>, [{'x'}, {}]}],
+                    output_shardings=[{mesh<['x'=2:manual]>, [{'x'}, {}]}],
                     manual_axes=['x'],
                     global_input_types=[\
                         f32[2, 4][sharding={mesh<['x'=2:manual]>, [{'x'}, {}]}], \

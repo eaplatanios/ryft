@@ -274,7 +274,7 @@ pub enum Error {
 
     /// Error surfaced when [`compile_with_options`](crate::jit::compile_with_options) is given options
     /// that do not match the traced function's arity or shape — for example a
-    /// `donate_argnums` index outside the flat input range, or an `in_shardings` length that
+    /// `donate_argnums` index outside the flat input range, or an `input_shardings` length that
     /// doesn't match the number of flat inputs.
     #[error("invalid compilation options: {reason}")]
     InvalidCompilationOptions { reason: String },
