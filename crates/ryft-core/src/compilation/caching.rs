@@ -1447,18 +1447,18 @@ const DEFAULT_MINIMUM_ENTRY_SIZE: usize = 0;
 /// Directory-backed persistent cache of serialized compiled programs. A [`DiskCache`] persists serialized compiled
 /// programs across processes, similar to JAX's
 /// [persistent compilation cache](https://docs.jax.dev/en/latest/persistent_compilation_cache.html). When attached
-/// to a [`CompilationContext`], it serves as a second tier below the in-memory LRU cache. On a memory miss, the context
-/// first checks the disk for a serialized program that matches the persistent cache key and deserializes it if found.
-/// Otherwise, it compiles the program and writes the serialized program back to disk when the compilation meets the
-/// write thresholds configured via [`DiskCache::with_write_thresholds`].
+/// to a [`CompilationContext`], it serves as a second tier below the in-memory LRU cache. That context manages
+/// executable persistence through the serialization hooks of [`CompilationCacheDomain`], restoring programs on memory
+/// misses and persisting new compilations that meet the write thresholds configured via
+/// [`Self::with_write_thresholds`].
 ///
 /// Entries are stored gzip compressed as `<directory>/<sha256>.executable`. A backend opts into this tier by providing
 /// canonical bytes for the complete persistent cache key through [`CompilationCacheDomain::persistent_cache_key`].
 /// For the same compilation, processes sharing the cache must produce identical key bytes, and the filename is their
 /// SHA-256 digest. The compressed entry is a versioned envelope that repeats the key digest and records the payload
-/// length and SHA-256 checksum, all of which are validated before backend deserialization. Backends may also store
-/// auxiliary payloads (e.g., tuning results) in the same directory as `<directory>/<sha256>.metadata` entries that
-/// use the same envelope.
+/// length and SHA-256 checksum, all of which are validated before backend deserialization. Backends use the public
+/// [`Self::get_auxiliary`] and [`Self::put_auxiliary`] functions to persist data outside the executable lifecycle
+/// (e.g., tuning results), stored as `<directory>/<sha256>.metadata` entries with the same envelope.
 ///
 /// Writes are atomic because they use the standard pattern of writing a temporary file and renaming it. Filesystem and
 /// validation failures are returned to the [`CompilationContext`], which records each failure and degrades it to a
@@ -1621,8 +1621,6 @@ impl DiskCache {
         self.write_entry(&self.auxiliary_entry_path(&digest), &digest, AUXILIARY_EXTENSION, data)
     }
 
-    // TODO(eaplatanios): Review from here onwards.
-
     /// Opens a [`DiskCache`] rooted at `directory` with an optional size cap and the default write thresholds.
     fn open_with_max_bytes<D: Into<PathBuf>>(directory: D, max_bytes: Option<u64>) -> std::io::Result<Self> {
         let directory = directory.into();
@@ -1644,10 +1642,8 @@ impl DiskCache {
 
     /// Atomically writes `data` to the cache under `digest`, so that a partial write or process crash can never leave
     /// a half-written entry visible to other readers. After a successful write, evicts the least recently written
-    /// entries when a size cap is configured.
-    ///
-    /// Returns any write, synchronization, rename, cleanup, or eviction failure explicitly. The compilation context
-    /// records such failures before degrading to an in-memory result.
+    /// entries when a size cap is configured. Returns any write, synchronization, rename, cleanup, or eviction failure
+    /// explicitly. The compilation context records such failures before degrading to an in-memory result.
     fn put(&self, digest: &DiskCacheDigest, data: &[u8]) -> std::io::Result<()> {
         self.write_entry(&self.entry_path(digest), digest, EXECUTABLE_EXTENSION, data)
     }
@@ -1668,12 +1664,12 @@ impl DiskCache {
 
     /// Returns the filesystem path of the executable entry for `digest`.
     fn entry_path(&self, digest: &DiskCacheDigest) -> PathBuf {
-        self.directory.join(format!("{}.{EXECUTABLE_EXTENSION}", digest.to_hex()))
+        self.directory.join(format!("{}.{}", digest.to_hex(), EXECUTABLE_EXTENSION))
     }
 
     /// Returns the filesystem path of the auxiliary entry for `digest`.
     fn auxiliary_entry_path(&self, digest: &DiskCacheDigest) -> PathBuf {
-        self.directory.join(format!("{}.{AUXILIARY_EXTENSION}", digest.to_hex()))
+        self.directory.join(format!("{}.{}", digest.to_hex(), AUXILIARY_EXTENSION))
     }
 
     /// Returns whether `path` names an executable or auxiliary entry, as opposed to a temporary or unrelated file.
@@ -1731,11 +1727,9 @@ impl DiskCache {
     }
 
     /// Atomically writes `data` as the entry at `path` for `digest` and then evicts older entries when a size cap is
-    /// configured.
-    ///
-    /// The entry is first written gzip-compressed to an exclusively created temporary file, synchronized, and then
-    /// renamed over `path`, so that readers observe either the prior complete entry or the new complete entry. The
-    /// temporary file is removed when any step before the rename fails.
+    /// configured. The entry is first written gzip-compressed to an exclusively created temporary file, synchronized,
+    /// and then renamed over `path`, so that readers observe either the prior complete entry or the new complete entry.
+    /// The temporary file is removed when any step before the rename fails.
     fn write_entry(&self, path: &Path, digest: &DiskCacheDigest, extension: &str, data: &[u8]) -> std::io::Result<()> {
         let (temporary_path, temporary_file) = self.temporary_entry(digest, extension)?;
         let write_result = (|| -> std::io::Result<()> {
@@ -1759,7 +1753,8 @@ impl DiskCache {
     fn temporary_entry(&self, digest: &DiskCacheDigest, extension: &str) -> std::io::Result<(PathBuf, File)> {
         for _ in 0..MAXIMUM_TEMPORARY_FILE_ATTEMPTS {
             let counter = self.write_counter.fetch_add(1, Ordering::Relaxed);
-            let path = self.directory.join(format!("{}.{extension}.tmp.{}.{counter}", digest.to_hex(), process::id()));
+            let path =
+                self.directory.join(format!("{}.{}.tmp.{}.{}", digest.to_hex(), extension, process::id(), counter));
             match File::options().write(true).create_new(true).open(&path) {
                 Ok(file) => return Ok((path, file)),
                 Err(error) if error.kind() == std::io::ErrorKind::AlreadyExists => continue,
@@ -1785,8 +1780,10 @@ impl DiskCache {
         }
     }
 
-    /// Evicts the least recently written entries until the size of the cache on disk is at most `max_bytes`, never
-    /// evicting the entry at `keep_path`. Returns the number of evicted entries.
+    // TODO(eaplatanios): Review from here onwards.
+
+    /// Evicts the least recently written entries until the size of the cache on disk is at most `max_bytes`,
+    /// never evicting the entry at `keep_path`. Returns the number of evicted entries.
     fn evict_to_fit(&self, keep_path: &Path, max_bytes: u64) -> std::io::Result<usize> {
         let mut total_bytes = 0u64;
         let mut candidates = Vec::new();
