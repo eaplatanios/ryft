@@ -122,6 +122,9 @@ impl<P: Parameter + Capability> Capability for BlockQuantizedValue<P> {
     type Universe = P::Universe;
 }
 
+/// Name used in diagnostics for [`BlockQuantize`].
+const BLOCK_QUANTIZE_NAME: &str = "block_quantize";
+
 /// Value-level block quantization capability. [`BlockQuantize::block_quantize`] splits an `f32` or `f64` array into an
 /// array of narrow elements and an array of scales with one scale per block of consecutive values along the last
 /// dimension, which are the inputs that [`ScaledDot`] consumes. This supports quantizing values on the fly (e.g., a KV
@@ -286,7 +289,7 @@ where
             noise_type.as_ref(),
         )?;
         let Some(shape) = input_type.static_shape() else {
-            return Err(TypeError::invalid("`block_quantize` input must have a static shape").into());
+            return Err(TypeError::invalid(format!("`{BLOCK_QUANTIZE_NAME}` input must have a static shape")).into());
         };
         let dimensions = shape.dimensions().to_vec();
         let computation_type = input_type.data_type();
@@ -586,32 +589,34 @@ fn validate_block_quantize_inputs(
 ) -> Result<(BlockElementFormat, Vec<usize>), ProgramError> {
     let element_format = BlockElementFormat::new(element_type)?;
     if !matches!(scale_type, DataType::F8E4M3FN | DataType::F8E8M0FNU) {
-        return Err(
-            TypeError::invalid(format!("`block_quantize` does not support scale data type `{scale_type}`")).into()
-        );
+        return Err(TypeError::invalid(format!(
+            "`{BLOCK_QUANTIZE_NAME}` does not support scale data type `{scale_type}`"
+        ))
+        .into());
     }
 
     let computation_type = input_type.data_type();
     if !matches!(computation_type, DataType::F32 | DataType::F64) {
         return Err(TypeError::invalid(format!(
-            "`block_quantize` expects an `f32` or `f64` input but got `{computation_type}`",
+            "`{BLOCK_QUANTIZE_NAME}` expects an `f32` or `f64` input but got `{computation_type}`",
         ))
         .into());
     }
 
     if input_type.rank() == 0 {
-        return Err(TypeError::invalid("`block_quantize` does not support rank-0 inputs").into());
+        return Err(TypeError::invalid(format!("`{BLOCK_QUANTIZE_NAME}` does not support rank-0 inputs")).into());
     }
 
     if block_size < 2 {
-        return Err(
-            TypeError::invalid(format!("`block_quantize` block size must be at least 2 but got {block_size}")).into()
-        );
+        return Err(TypeError::invalid(format!(
+            "`{BLOCK_QUANTIZE_NAME}` block size must be at least 2 but got {block_size}",
+        ))
+        .into());
     }
 
     let block_axes = block_axes.normalize(input_type.rank())?;
     if block_axes.is_empty() {
-        return Err(TypeError::invalid("`block_quantize` requires at least one block axis").into());
+        return Err(TypeError::invalid(format!("`{BLOCK_QUANTIZE_NAME}` requires at least one block axis")).into());
     }
 
     for &axis in &block_axes {
@@ -619,8 +624,8 @@ fn validate_block_quantize_inputs(
             && (size == 0 || size % block_size != 0)
         {
             return Err(TypeError::invalid(format!(
-                "`block_quantize` block dimension {axis} size {size} is not a positive multiple of block size \
-                 {block_size}",
+                "`{BLOCK_QUANTIZE_NAME}` block dimension {axis} size {size} is not a positive multiple \
+                 of block size {block_size}",
             ))
             .into());
         }
@@ -629,14 +634,14 @@ fn validate_block_quantize_inputs(
     if let Some(global_scale_type) = global_scale {
         if scale_type != DataType::F8E4M3FN {
             return Err(TypeError::invalid(format!(
-                "`block_quantize` global scales require `f8e4m3fn` scales but got `{scale_type}` scales",
+                "`{BLOCK_QUANTIZE_NAME}` global scales require `f8e4m3fn` scales but got `{scale_type}` scales",
             ))
             .into());
         }
 
         if global_scale_type.rank() != 0 || global_scale_type.data_type() != computation_type {
             return Err(TypeError::invalid(format!(
-                "`block_quantize` global scale must be a rank-0 `{computation_type}` array but got \
+                "`{BLOCK_QUANTIZE_NAME}` global scale must be a rank-0 `{computation_type}` array but got \
                  `{global_scale_type}`",
             ))
             .into());
@@ -647,7 +652,7 @@ fn validate_block_quantize_inputs(
         && (noise_type.data_type() != computation_type || noise_type.shape() != input_type.shape())
     {
         return Err(TypeError::invalid(format!(
-            "`block_quantize` rounding noise must have the data type and shape of the input `{input_type}` \
+            "`{BLOCK_QUANTIZE_NAME}` rounding noise must have the data type and shape of the input `{input_type}` \
              but got `{noise_type}`",
         ))
         .into());
@@ -655,6 +660,9 @@ fn validate_block_quantize_inputs(
 
     Ok((element_format, block_axes))
 }
+
+/// Name used in diagnostics for [`BlockDequantize`].
+const BLOCK_DEQUANTIZE_NAME: &str = "block_dequantize";
 
 /// Block dequantization capability for [`BlockQuantizedValue`]. [`BlockDequantize::block_dequantize`] reconstructs
 /// an array by repeating each block scale and multiplying the elements, expanded scales, and optional global scale
@@ -742,10 +750,10 @@ impl<V: Value<Type = ArrayType> + Broadcast + ConvertElementType + Mul + Reshape
             data_type,
         )?;
         let (Some(element_shape), Some(scale_shape)) = (element_type.static_shape(), scale_type.static_shape()) else {
-            return Err(TypeError::invalid(
-                "`block_dequantize` homogeneous inputs must have static shapes; use array IR values \
+            return Err(TypeError::invalid(format!(
+                "`{BLOCK_DEQUANTIZE_NAME}` homogeneous inputs must have static shapes; use array IR values \
                  for dynamic extents",
-            )
+            ))
             .into());
         };
         let mut expanded_type = scale_type.into_owned();
@@ -1281,6 +1289,9 @@ where
     }
 }
 
+/// Name used in diagnostics for [`ScaledDot::scaled_matmul`].
+const SCALED_MATMUL_NAME: &str = "scaled_matmul";
+
 /// Generalized dot product capability for [`BlockQuantizedValue`]. Both representations supply their element and block
 /// scale arrays to [`ScaledDotOperation`] through their context, retaining the primitive and its backend lowering.
 /// Their optional global scales multiply the contraction result afterwards. This frontend inherits the primitive's
@@ -1595,7 +1606,7 @@ where
 {
     for value in [&lhs.elements, &rhs.elements, &lhs.scales, &rhs.scales] {
         if value.r#type().as_array_type()?.rank() != 3 {
-            return Err(TypeError::invalid("`scaled_matmul` expects rank-3 inputs").into());
+            return Err(TypeError::invalid(format!("`{SCALED_MATMUL_NAME}` expects rank-3 inputs")).into());
         }
     }
     Ok(())
@@ -3124,7 +3135,7 @@ fn validate_block_dequantize_inputs(
 ) -> Result<Vec<usize>, ProgramError> {
     if !data_type.is_floating_point() {
         return Err(TypeError::invalid(format!(
-            "`block_dequantize` output data type must be floating-point but got `{data_type}`",
+            "`{BLOCK_DEQUANTIZE_NAME}` output data type must be floating-point but got `{data_type}`",
         ))
         .into());
     }
@@ -3132,7 +3143,8 @@ fn validate_block_dequantize_inputs(
         let data_type = input_type.data_type();
         if !data_type.is_real() && data_type != DataType::Boolean {
             return Err(TypeError::invalid(format!(
-                "`block_dequantize` {name} must have a real numeric or Boolean element type but got `{data_type}`",
+                "`{BLOCK_DEQUANTIZE_NAME}` {name} must have a real numeric or Boolean element type but \
+                 got `{data_type}`",
             ))
             .into());
         }
@@ -3143,12 +3155,13 @@ fn validate_block_dequantize_inputs(
             || !global_scale.data_type().is_real())
     {
         return Err(TypeError::invalid(format!(
-            "`block_dequantize` global scale must be a rank-0 real floating-point array but got `{global_scale}`",
+            "`{BLOCK_DEQUANTIZE_NAME}` global scale must be a rank-0 real floating-point array but \
+             got `{global_scale}`",
         ))
         .into());
     }
     if elements.rank() != scales.rank() {
-        return Err(TypeError::invalid("`block_dequantize` inputs must have the same rank").into());
+        return Err(TypeError::invalid(format!("`{BLOCK_DEQUANTIZE_NAME}` inputs must have the same rank")).into());
     }
     let block_axes = block_axes.normalize(elements.rank())?;
     for axis in 0..elements.rank() {
@@ -3157,8 +3170,8 @@ fn validate_block_dequantize_inputs(
         if !block_axes.contains(&axis) {
             if element_dimension != scale_dimension {
                 return Err(TypeError::invalid(format!(
-                    "`block_dequantize` non-block dimension {axis} has element extent `{element_dimension}` but scale \
-                     extent `{scale_dimension}`",
+                    "`{BLOCK_DEQUANTIZE_NAME}` non-block dimension {axis} has element extent `{element_dimension}` \
+                     but scale extent `{scale_dimension}`",
                 ))
                 .into());
             }
@@ -3167,27 +3180,28 @@ fn validate_block_dequantize_inputs(
         match (element_dimension.value(), scale_dimension.value()) {
             (_, Some(0)) => {
                 return Err(TypeError::invalid(format!(
-                    "`block_dequantize` block dimension {axis} has an empty scale but scale extents must be positive",
+                    "`{BLOCK_DEQUANTIZE_NAME}` block dimension {axis} has an empty scale but scale extents must \
+                     be positive",
                 ))
                 .into());
             }
             (Some(element_extent), Some(scale_extent)) if element_extent % scale_extent != 0 => {
                 return Err(TypeError::invalid(format!(
-                    "`block_dequantize` element extent {element_extent} of block dimension {axis} is not divisible \
-                     by scale extent {scale_extent}",
+                    "`{BLOCK_DEQUANTIZE_NAME}` element extent {element_extent} of block dimension {axis} is not \
+                     divisible by scale extent {scale_extent}",
                 ))
                 .into());
             }
             (Some(element_extent), Some(scale_extent)) if element_extent / scale_extent < 2 => {
                 return Err(TypeError::invalid(format!(
-                    "`block_dequantize` block dimension {axis} must have ratio at least 2 but got {}",
+                    "`{BLOCK_DEQUANTIZE_NAME}` block dimension {axis} must have ratio at least 2 but got {}",
                     element_extent / scale_extent,
                 ))
                 .into());
             }
             _ if element_dimension == scale_dimension => {
                 return Err(TypeError::invalid(format!(
-                    "`block_dequantize` block dimension {axis} must have ratio at least 2 but both extents are \
+                    "`{BLOCK_DEQUANTIZE_NAME}` block dimension {axis} must have ratio at least 2 but both extents are \
                      `{element_dimension}`",
                 ))
                 .into());
@@ -3492,37 +3506,43 @@ mod tests {
         );
         assert_eq!(
             input.block_quantize(4, DataType::F4E2M1FN, DataType::F16),
-            Err(ProgramError::from(TypeError::invalid("`block_quantize` does not support scale data type `f16`"))),
+            Err(ProgramError::from(TypeError::invalid(format!(
+                "`{BLOCK_QUANTIZE_NAME}` does not support scale data type `f16`",
+            )))),
         );
         assert_eq!(
             Array::vector(vec![1i32; 8]).unwrap().block_quantize(4, DataType::F4E2M1FN, DataType::F8E4M3FN),
-            Err(ProgramError::from(TypeError::invalid(
-                "`block_quantize` expects an `f32` or `f64` input but got `i32`",
-            ))),
+            Err(ProgramError::from(TypeError::invalid(format!(
+                "`{BLOCK_QUANTIZE_NAME}` expects an `f32` or `f64` input but got `i32`",
+            )))),
         );
         assert_eq!(
             Array::scalar(1.0f32).unwrap().block_quantize(2, DataType::F4E2M1FN, DataType::F8E4M3FN),
-            Err(ProgramError::from(TypeError::invalid("`block_quantize` does not support rank-0 inputs"))),
+            Err(ProgramError::from(TypeError::invalid(format!(
+                "`{BLOCK_QUANTIZE_NAME}` does not support rank-0 inputs",
+            )))),
         );
 
         // `ScaledDotOperation` requires blocks of at least two values and non-empty scales.
         assert_eq!(
             input.block_quantize(1, DataType::F4E2M1FN, DataType::F8E4M3FN),
-            Err(ProgramError::from(TypeError::invalid("`block_quantize` block size must be at least 2 but got 1"))),
+            Err(ProgramError::from(TypeError::invalid(format!(
+                "`{BLOCK_QUANTIZE_NAME}` block size must be at least 2 but got 1",
+            )))),
         );
         assert_eq!(
             input.block_quantize(3, DataType::F4E2M1FN, DataType::F8E4M3FN),
-            Err(ProgramError::from(TypeError::invalid(
-                "`block_quantize` block dimension 1 size 8 is not a positive multiple of block size 3",
-            ))),
+            Err(ProgramError::from(TypeError::invalid(format!(
+                "`{BLOCK_QUANTIZE_NAME}` block dimension 1 size 8 is not a positive multiple of block size 3",
+            )))),
         );
         assert_eq!(
             Array::from_elements::<f32>(ArrayType::new_static(DataType::F32, [2, 0]), &[])
                 .unwrap()
                 .block_quantize(4, DataType::F4E2M1FN, DataType::F8E4M3FN),
-            Err(ProgramError::from(TypeError::invalid(
-                "`block_quantize` block dimension 1 size 0 is not a positive multiple of block size 4",
-            ))),
+            Err(ProgramError::from(TypeError::invalid(format!(
+                "`{BLOCK_QUANTIZE_NAME}` block dimension 1 size 0 is not a positive multiple of block size 4",
+            )))),
         );
 
         // Staged inputs must have a static shape, and rejected requests stage nothing.
@@ -3532,7 +3552,9 @@ mod tests {
                 assert!(matches!(
                     input.block_quantize(4, DataType::F4E2M1FN, DataType::F8E4M3FN),
                     Err(error) if error
-                        == ProgramError::from(TypeError::invalid("`block_quantize` input must have a static shape")),
+                        == ProgramError::from(TypeError::invalid(format!(
+                            "`{BLOCK_QUANTIZE_NAME}` input must have a static shape",
+                        ))),
                 ));
                 Ok(input)
             },
@@ -3897,9 +3919,9 @@ mod tests {
             |input: Tracer<_>| {
                 assert_eq!(
                     input.block_quantize(4, DataType::F4E2M1FN, DataType::F8E4M3FN),
-                    Err(TypeError::invalid(
-                        "`block_quantize` block dimension 1 size 6 is not a positive multiple of block size 4",
-                    )
+                    Err(TypeError::invalid(format!(
+                        "`{BLOCK_QUANTIZE_NAME}` block dimension 1 size 6 is not a positive multiple of block size 4",
+                    ))
                     .into()),
                 );
                 assert_eq!(
@@ -3911,9 +3933,9 @@ mod tests {
                         Some(&input),
                         None,
                     ),
-                    Err(TypeError::invalid(
-                        "`block_quantize` global scale must be a rank-0 `f32` array but got `f32[n, 6]`",
-                    )
+                    Err(TypeError::invalid(format!(
+                        "`{BLOCK_QUANTIZE_NAME}` global scale must be a rank-0 `f32` array but got `f32[n, 6]`",
+                    ))
                     .into()),
                 );
                 Ok(input)
@@ -4775,13 +4797,15 @@ mod tests {
         let input = Array::matrix(2, 8, vec![1.0f32; 16]).unwrap();
         assert_eq!(
             input.block_quantize_with_options(4, DataType::F4E2M1FN, DataType::F8E4M3FN, Axes::default(), None, None),
-            Err(ProgramError::from(TypeError::invalid("`block_quantize` requires at least one block axis"))),
+            Err(ProgramError::from(TypeError::invalid(format!(
+                "`{BLOCK_QUANTIZE_NAME}` requires at least one block axis",
+            )))),
         );
         assert_eq!(
             input.block_quantize_with_options(4, DataType::F4E2M1FN, DataType::F8E4M3FN, [0], None, None),
-            Err(ProgramError::from(TypeError::invalid(
-                "`block_quantize` block dimension 0 size 2 is not a positive multiple of block size 4",
-            ))),
+            Err(ProgramError::from(TypeError::invalid(format!(
+                "`{BLOCK_QUANTIZE_NAME}` block dimension 0 size 2 is not a positive multiple of block size 4",
+            )))),
         );
         assert_eq!(
             input.block_quantize_with_options(4, DataType::F4E2M1FN, DataType::F8E4M3FN, [2], None, None),
@@ -4800,9 +4824,9 @@ mod tests {
                 Some(&Array::vector(vec![1.0f32]).unwrap()),
                 None,
             ),
-            Err(ProgramError::from(TypeError::invalid(
-                "`block_quantize` global scale must be a rank-0 `f32` array but got `f32[1]`",
-            ))),
+            Err(ProgramError::from(TypeError::invalid(format!(
+                "`{BLOCK_QUANTIZE_NAME}` global scale must be a rank-0 `f32` array but got `f32[1]`",
+            )))),
         );
         assert_eq!(
             input.block_quantize_with_options(
@@ -4813,9 +4837,9 @@ mod tests {
                 Some(&Array::scalar(1.0f64).unwrap()),
                 None,
             ),
-            Err(ProgramError::from(TypeError::invalid(
-                "`block_quantize` global scale must be a rank-0 `f32` array but got `f64[]`",
-            ))),
+            Err(ProgramError::from(TypeError::invalid(format!(
+                "`{BLOCK_QUANTIZE_NAME}` global scale must be a rank-0 `f32` array but got `f64[]`",
+            )))),
         );
         assert_eq!(
             input.block_quantize_with_options(
@@ -4826,9 +4850,9 @@ mod tests {
                 Some(&Array::scalar(1.0f32).unwrap()),
                 None,
             ),
-            Err(ProgramError::from(TypeError::invalid(
-                "`block_quantize` global scales require `f8e4m3fn` scales but got `f8e8m0fnu` scales",
-            ))),
+            Err(ProgramError::from(TypeError::invalid(format!(
+                "`{BLOCK_QUANTIZE_NAME}` global scales require `f8e4m3fn` scales but got `f8e8m0fnu` scales",
+            )))),
         );
         assert_eq!(
             input.block_quantize_with_options(
@@ -4839,10 +4863,10 @@ mod tests {
                 None,
                 Some(&Array::vector(vec![0.5f32; 16]).unwrap()),
             ),
-            Err(ProgramError::from(TypeError::invalid(
-                "`block_quantize` rounding noise must have the data type and shape of the input `f32[2, 8]` but got \
-                 `f32[16]`",
-            ))),
+            Err(ProgramError::from(TypeError::invalid(format!(
+                "`{BLOCK_QUANTIZE_NAME}` rounding noise must have the data type and shape of the input `f32[2, 8]` \
+                 but got `f32[16]`",
+            )))),
         );
     }
 
@@ -4984,60 +5008,69 @@ mod tests {
         );
         assert_eq!(
             BlockQuantizedValue::new(elements.clone(), scales.clone()).block_dequantize([0], DataType::I32),
-            Err(TypeError::invalid("`block_dequantize` output data type must be floating-point but got `i32`").into()),
+            Err(TypeError::invalid(format!(
+                "`{BLOCK_DEQUANTIZE_NAME}` output data type must be floating-point but got `i32`",
+            ))
+            .into()),
         );
         assert_eq!(
             BlockQuantizedValue::new(elements.convert_element_type(DataType::C64).unwrap(), scales.clone())
                 .block_dequantize([0], DataType::F32),
-            Err(TypeError::invalid(
-                "`block_dequantize` elements must have a real numeric or Boolean element type but got `c64`",
-            )
+            Err(TypeError::invalid(format!(
+                "`{BLOCK_DEQUANTIZE_NAME}` elements must have a real numeric or Boolean element type but got `c64`",
+            ))
             .into()),
         );
         assert_eq!(
             BlockQuantizedValue::new(elements.clone(), scales.convert_element_type(DataType::C64).unwrap())
                 .block_dequantize([0], DataType::F32),
-            Err(TypeError::invalid(
-                "`block_dequantize` scales must have a real numeric or Boolean element type but got `c64`",
-            )
+            Err(TypeError::invalid(format!(
+                "`{BLOCK_DEQUANTIZE_NAME}` scales must have a real numeric or Boolean element type but got `c64`",
+            ))
             .into()),
         );
         assert_eq!(
             BlockQuantizedValue::new(elements.clone(), Array::scalar(2.0f32).unwrap())
                 .block_dequantize([0], DataType::F32),
-            Err(TypeError::invalid("`block_dequantize` inputs must have the same rank").into()),
+            Err(TypeError::invalid(format!("`{BLOCK_DEQUANTIZE_NAME}` inputs must have the same rank")).into()),
         );
         assert_eq!(
             BlockQuantizedValue::new(elements.clone(), scales.clone()).block_dequantize(Axes::default(), DataType::F32),
-            Err(TypeError::invalid(
-                "`block_dequantize` non-block dimension 0 has element extent `4` but scale extent `2`",
-            )
+            Err(TypeError::invalid(format!(
+                "`{BLOCK_DEQUANTIZE_NAME}` non-block dimension 0 has element extent `4` but scale extent `2`",
+            ))
             .into()),
         );
         assert_eq!(
             BlockQuantizedValue::new(elements.clone(), Array::vector(Vec::<f32>::new()).unwrap())
                 .block_dequantize([0], DataType::F32),
-            Err(TypeError::invalid(
-                "`block_dequantize` block dimension 0 has an empty scale but scale extents must be positive",
-            )
+            Err(TypeError::invalid(format!(
+                "`{BLOCK_DEQUANTIZE_NAME}` block dimension 0 has an empty scale but scale extents must be positive",
+            ))
             .into()),
         );
         assert_eq!(
             BlockQuantizedValue::new(elements.clone(), Array::vector(vec![1.0f32; 3]).unwrap())
                 .block_dequantize([0], DataType::F32),
-            Err(TypeError::invalid(
-                "`block_dequantize` element extent 4 of block dimension 0 is not divisible by scale extent 3",
-            )
+            Err(TypeError::invalid(format!(
+                "`{BLOCK_DEQUANTIZE_NAME}` element extent 4 of block dimension 0 is not divisible by scale extent 3",
+            ))
             .into()),
         );
         assert_eq!(
             BlockQuantizedValue::new(elements.clone(), elements.clone()).block_dequantize([0], DataType::F32),
-            Err(TypeError::invalid("`block_dequantize` block dimension 0 must have ratio at least 2 but got 1").into()),
+            Err(TypeError::invalid(format!(
+                "`{BLOCK_DEQUANTIZE_NAME}` block dimension 0 must have ratio at least 2 but got 1",
+            ))
+            .into()),
         );
         assert_eq!(
             BlockQuantizedValue::new(ArrayIrValue::Array(elements.clone()), ArrayIrValue::Array(elements))
                 .block_dequantize([0], DataType::F32),
-            Err(TypeError::invalid("`block_dequantize` block dimension 0 must have ratio at least 2 but got 1").into()),
+            Err(TypeError::invalid(format!(
+                "`{BLOCK_DEQUANTIZE_NAME}` block dimension 0 must have ratio at least 2 but got 1",
+            ))
+            .into()),
         );
         assert_eq!(
             BlockQuantizedValue::new(
@@ -5058,11 +5091,16 @@ mod tests {
         for (global_scale, message) in [
             (
                 Array::vector(vec![5.0f32]).unwrap(),
-                "`block_dequantize` global scale must be a rank-0 real floating-point array but got `f32[1]`",
+                format!(
+                    "`{BLOCK_DEQUANTIZE_NAME}` global scale must be a rank-0 real floating-point array but \
+                     got `f32[1]`",
+                ),
             ),
             (
                 Array::scalar(5i32).unwrap(),
-                "`block_dequantize` global scale must be a rank-0 real floating-point array but got `i32[]`",
+                format!(
+                    "`{BLOCK_DEQUANTIZE_NAME}` global scale must be a rank-0 real floating-point array but got `i32[]`",
+                ),
             ),
         ] {
             let quantized = quantized.clone().with_global_scale(global_scale);
@@ -5154,10 +5192,10 @@ mod tests {
             |(elements, scales): (Tracer<_>, Tracer<_>)| {
                 assert_eq!(
                     BlockQuantizedValue::new(elements.clone(), scales.clone()).block_dequantize([0], DataType::F32),
-                    Err(TypeError::invalid(
-                        "`block_dequantize` homogeneous inputs must have static shapes; use array IR values for \
+                    Err(TypeError::invalid(format!(
+                        "`{BLOCK_DEQUANTIZE_NAME}` homogeneous inputs must have static shapes; use array IR values for \
                          dynamic extents",
-                    )
+                    ))
                     .into()),
                 );
                 Ok(elements)
@@ -6255,7 +6293,7 @@ mod tests {
         assert_eq!(
             BlockQuantizedValue::new(matrix.clone(), matrix.clone())
                 .scaled_matmul(&BlockQuantizedValue::new(matrix.clone(), matrix.clone()), None),
-            Err(ProgramError::from(TypeError::invalid("`scaled_matmul` expects rank-3 inputs"))),
+            Err(ProgramError::from(TypeError::invalid(format!("`{SCALED_MATMUL_NAME}` expects rank-3 inputs")))),
         );
     }
 
@@ -6344,12 +6382,18 @@ mod tests {
             (
                 Some(Array::vector(vec![1.0f32]).unwrap()),
                 None,
-                "`scaled_dot` left global scale must be a rank-0 real floating-point array but got `f32[1]`",
+                format!(
+                    "`{SCALED_DOT_OPERATION_NAME}` left global scale must be a rank-0 real floating-point array but \
+                     got `f32[1]`",
+                ),
             ),
             (
                 None,
                 Some(Array::scalar(1i32).unwrap()),
-                "`scaled_dot` right global scale must be a rank-0 real floating-point array but got `i32[]`",
+                format!(
+                    "`{SCALED_DOT_OPERATION_NAME}` right global scale must be a rank-0 real floating-point array but \
+                     got `i32[]`",
+                ),
             ),
         ] {
             let lhs = BlockQuantizedValue { global_scale: lhs_global_scale, ..lhs.clone() };
@@ -6366,10 +6410,10 @@ mod tests {
             |(lhs, rhs): (BlockQuantizedValue<Tracer<_>>, BlockQuantizedValue<Tracer<_>>)| {
                 assert_eq!(
                     lhs.scaled_dot(&rhs, None, None),
-                    Err(TypeError::invalid(
-                        "`scaled_dot` right contracting dimension 0 has size 4, which is not divisible by its \
-                         scale size 3",
-                    )
+                    Err(TypeError::invalid(format!(
+                        "`{SCALED_DOT_OPERATION_NAME}` right contracting dimension 0 has size 4, which is not \
+                         divisible by its scale size 3",
+                    ))
                     .into()),
                 );
                 Ok(lhs.elements)
@@ -6534,10 +6578,10 @@ mod tests {
                 })?;
                 assert_eq!(
                     lhs.scaled_dot(&rhs, None, None),
-                    Err(TypeError::invalid(
-                        "`scaled_dot` homogeneous global scaling requires a static output shape; use array IR values \
-                         for dynamic extents",
-                    )
+                    Err(TypeError::invalid(format!(
+                        "`{SCALED_DOT_OPERATION_NAME}` homogeneous global scaling requires a static output shape; \
+                         use array IR values for dynamic extents",
+                    ))
                     .into()),
                 );
                 Ok::<_, ProgramError>(lhs.elements.into_value())
@@ -6723,7 +6767,7 @@ mod tests {
             Array::matrix(1, 4, vec![1.0f32; 4]).unwrap(),
             Array::matrix(1, 2, vec![1.0f32; 2]).unwrap(),
         );
-        let expected = ProgramError::from(TypeError::invalid("`scaled_matmul` expects rank-3 inputs"));
+        let expected = ProgramError::from(TypeError::invalid(format!("`{SCALED_MATMUL_NAME}` expects rank-3 inputs")));
         assert_eq!(invalid.scaled_matmul(&invalid, None), Err(expected.clone()));
         let invalid = invalid.map_parameters(ArrayIrValue::Array).unwrap();
         assert_eq!(invalid.scaled_matmul(&invalid, None), Err(expected.clone()));

@@ -406,7 +406,7 @@ impl<P> InFlightCompilation<P> {
 /// which then retry, and the first of them to miss again becomes the new producer.
 struct InFlightProducer<'o, C: CompilationCacheDomain> {
     /// Compilation context in which this producer registered its in-flight compilation.
-    context: &'o CompilationContext<C>,
+    context: &'o CompilationContext<'o, C>,
 
     /// Cache key owned by this producer, which is taken when the producer finishes.
     cache_key: Option<C::CacheKey>,
@@ -418,7 +418,7 @@ struct InFlightProducer<'o, C: CompilationCacheDomain> {
 impl<'o, C: CompilationCacheDomain> InFlightProducer<'o, C> {
     /// Creates the producer for `cache_key`.
     fn new(
-        context: &'o CompilationContext<C>,
+        context: &'o CompilationContext<'o, C>,
         cache_key: C::CacheKey,
         in_flight: Arc<InFlightCompilation<C::CompiledProgram>>,
     ) -> Self {
@@ -476,8 +476,6 @@ const DEFAULT_CACHE_CAPACITY: usize = 8192;
 /// [`CompilationContext::with_event_capacity`] enables it.
 const DEFAULT_EVENT_CAPACITY: usize = 0;
 
-// TODO(eaplatanios): Review from here onwards.
-
 /// Process-local cache of compiled programs, generic over the [`CompilationCacheDomain`] backend. Construct one
 /// [`CompilationContext`] per backend handle at program start and reuse it across compilations and any backend-specific
 /// helpers that look up entries in the cache.
@@ -498,6 +496,10 @@ const DEFAULT_EVENT_CAPACITY: usize = 0;
 /// function and of the disk itself without failing the compilation. An optional [`CompilationArtifactExchange`] may
 /// provide a serialized program from the leader after local cache misses, according to the configured
 /// [`CompilationArtifactExchangePolicy`].
+///
+/// The attached artifact exchange and event reporter may borrow data that lives for `'o` (e.g., a backend client),
+/// so the context cannot outlive that data. A context whose exchange and reporter own all of their state can use
+/// `'static`.
 ///
 /// # Cache Resolution
 ///
@@ -553,10 +555,10 @@ const DEFAULT_EVENT_CAPACITY: usize = 0;
 /// #     CompilationArtifactExchange, CompilationArtifactExchangePolicy, CompilationCacheDomain, CompilationContext,
 /// #     DiskCache,
 /// # };
-/// fn compilation_context<C: CompilationCacheDomain>(
+/// fn compilation_context<'o, C: CompilationCacheDomain>(
 ///     directory: &Path,
-///     exchange: Arc<dyn CompilationArtifactExchange>,
-/// ) -> std::io::Result<CompilationContext<C>> {
+///     exchange: Arc<dyn CompilationArtifactExchange + 'o>,
+/// ) -> std::io::Result<CompilationContext<'o, C>> {
 ///     let disk_cache = DiskCache::with_max_bytes(directory, 10 << 30)?
 ///         .with_write_thresholds(Duration::from_secs(10), 0);
 ///     let policy = CompilationArtifactExchangePolicy::PreferSharing {
@@ -572,7 +574,7 @@ const DEFAULT_EVENT_CAPACITY: usize = 0;
 ///
 /// Contexts never read the environment on their own. Use [`CompilationContext::with_disk_cache_from_env`] to opt into
 /// the disk cache that the [`DiskCache::ENV_VAR`] and [`DiskCache::MAX_BYTES_ENV_VAR`] environment variables configure.
-pub struct CompilationContext<C: CompilationCacheDomain> {
+pub struct CompilationContext<'o, C: CompilationCacheDomain> {
     /// In-memory LRU cache keyed by the structural [`CompilationCacheDomain::CacheKey`] of the domain.
     programs: Mutex<LruCache<C::CacheKey, Arc<C::CompiledProgram>>>,
 
@@ -584,7 +586,7 @@ pub struct CompilationContext<C: CompilationCacheDomain> {
     disk_cache: Option<DiskCache>,
 
     /// Optional exchange for sharing serialized programs across processes.
-    artifact_exchange: Option<Arc<dyn CompilationArtifactExchange>>,
+    artifact_exchange: Option<Arc<dyn CompilationArtifactExchange + 'o>>,
 
     /// Distributed exchange behavior, which is disabled by default to preserve local compilation semantics.
     artifact_exchange_policy: CompilationArtifactExchangePolicy,
@@ -599,18 +601,19 @@ pub struct CompilationContext<C: CompilationCacheDomain> {
     event_capacity: usize,
 
     /// Optional reporting hook invoked after an event is retained.
-    event_reporter: Option<Arc<dyn Fn(&CompilationEvent) + Send + Sync>>,
+    event_reporter: Option<Arc<dyn Fn(&CompilationEvent) + Send + Sync + 'o>>,
 }
 
-impl<C: CompilationCacheDomain> CompilationContext<C> {
+impl<'o, C: CompilationCacheDomain> CompilationContext<'o, C> {
     /// Creates a [`CompilationContext`] with the default cache capacity and no persistent cache or artifact exchange.
     #[inline]
     pub fn new() -> Self {
         Self::with_capacity(DEFAULT_CACHE_CAPACITY)
     }
 
-    /// Creates a [`CompilationContext`] whose in-memory tier retains at most `capacity` compiled programs. A zero
-    /// `capacity` is clamped to one entry.
+    /// Creates a [`CompilationContext`] whose in-memory tier retains at most `capacity` compiled programs.
+    /// Note that a `capacity` of zero is clamped to one entry.
+    #[inline]
     pub fn with_capacity(capacity: usize) -> Self {
         let capacity = NonZeroUsize::new(capacity.max(1)).unwrap();
         Self {
@@ -637,12 +640,13 @@ impl<C: CompilationCacheDomain> CompilationContext<C> {
         self
     }
 
-    /// Attaches the [`DiskCache`] configured by the [`DiskCache::ENV_VAR`] environment variable, if it is set, and
-    /// leaves this context unchanged otherwise.
+    /// Attaches the [`DiskCache`] configured by the [`DiskCache::ENV_VAR`] environment variable, if it is set,
+    /// and leaves this context unchanged otherwise.
     ///
     /// # Errors
     ///
     /// Returns invalid configuration and filesystem failures reported by [`DiskCache::from_env`].
+    #[inline]
     pub fn with_disk_cache_from_env(mut self) -> std::io::Result<Self> {
         if let Some(disk_cache) = DiskCache::from_env()? {
             self.disk_cache = Some(disk_cache);
@@ -650,15 +654,15 @@ impl<C: CompilationCacheDomain> CompilationContext<C> {
         Ok(self)
     }
 
-    /// Attaches a distributed exchange of compiled artifacts that is used according to `policy`.
-    ///
-    /// The exchange is used only when the domain supplies a key through [`CompilationCacheDomain::persistent_cache_key`]
-    /// and can serialize and deserialize compiled programs. Participating processes must produce identical key bytes
-    /// for the same compilation. Process zero compiles and publishes, while follower processes receive and restore.
-    /// An exchange with a single process is ignored.
+    /// Attaches a distributed exchange of compiled artifacts that is used according to `policy`. The exchange is used
+    /// only when the domain supplies a key through [`CompilationCacheDomain::persistent_cache_key`] and can serialize
+    /// and deserialize compiled programs. Participating processes must produce identical key bytes for the same
+    /// compilation. Process zero compiles and publishes, while follower processes receive and restore. An exchange
+    /// with a single process is ignored.
+    #[inline]
     pub fn with_artifact_exchange(
         mut self,
-        exchange: Arc<dyn CompilationArtifactExchange>,
+        exchange: Arc<dyn CompilationArtifactExchange + 'o>,
         policy: CompilationArtifactExchangePolicy,
     ) -> Self {
         self.artifact_exchange = Some(exchange);
@@ -666,8 +670,9 @@ impl<C: CompilationCacheDomain> CompilationContext<C> {
         self
     }
 
-    /// Configures the number of structured events retained by [`Self::recent_events`]. A zero capacity disables
+    /// Configures the number of structured events retained by [`Self::recent_events`]. A capacity of zero disables
     /// retention while leaving an installed reporter active. Events retained before this call are discarded.
+    #[inline]
     pub fn with_event_capacity(mut self, capacity: usize) -> Self {
         self.event_capacity = capacity;
         self.recent_events = Mutex::new(VecDeque::with_capacity(capacity));
@@ -677,7 +682,8 @@ impl<C: CompilationCacheDomain> CompilationContext<C> {
     /// Installs a reporting hook invoked for every structured compilation event. The hook runs without holding any
     /// internal cache or event buffer lock, and it should return promptly so that it does not add latency to
     /// compilations.
-    pub fn with_event_reporter(mut self, reporter: Arc<dyn Fn(&CompilationEvent) + Send + Sync>) -> Self {
+    #[inline]
+    pub fn with_event_reporter(mut self, reporter: Arc<dyn Fn(&CompilationEvent) + Send + Sync + 'o>) -> Self {
         self.event_reporter = Some(reporter);
         self
     }
@@ -690,7 +696,7 @@ impl<C: CompilationCacheDomain> CompilationContext<C> {
 
     /// Returns the attached distributed artifact exchange, if any.
     #[inline]
-    pub fn artifact_exchange(&self) -> Option<&dyn CompilationArtifactExchange> {
+    pub fn artifact_exchange(&self) -> Option<&(dyn CompilationArtifactExchange + 'o)> {
         self.artifact_exchange.as_deref()
     }
 
@@ -715,6 +721,7 @@ impl<C: CompilationCacheDomain> CompilationContext<C> {
     }
 
     /// Returns the retained structured events in emission order.
+    #[inline]
     pub fn recent_events(&self) -> Vec<CompilationEvent> {
         self.recent_events
             .lock()
@@ -724,8 +731,8 @@ impl<C: CompilationCacheDomain> CompilationContext<C> {
             .collect()
     }
 
-    /// Removes every entry from the in-memory tier. Persistent entries, in-flight compilations, statistics, and
-    /// retained events are unaffected.
+    /// Removes every entry from the in-memory tier. Persistent entries, in-flight compilations, statistics,
+    /// and retained events are unaffected.
     #[inline]
     pub fn clear_cache(&self) {
         self.programs.lock().expect("compilation cache mutex should not be poisoned").clear();
@@ -742,6 +749,8 @@ impl<C: CompilationCacheDomain> CompilationContext<C> {
     pub fn clear_events(&self) {
         self.recent_events.lock().expect("compilation event mutex should not be poisoned").clear();
     }
+
+    // TODO(eaplatanios): Review from here onwards.
 
     /// Compiles `program` through the shared cache and returns the shared compiled program. This function derives the
     /// exact structural key of `program` through [`CompilationCacheDomain::compilation_key`] and resolves it through
@@ -1422,7 +1431,7 @@ impl<C: CompilationCacheDomain> CompilationContext<C> {
     }
 }
 
-impl<C: CompilationCacheDomain> Default for CompilationContext<C> {
+impl<C: CompilationCacheDomain> Default for CompilationContext<'_, C> {
     #[inline]
     fn default() -> Self {
         Self::new()
@@ -2180,8 +2189,37 @@ mod tests {
         }
     }
 
+    /// Exchange that borrows another exchange, which contexts accept for as long as the borrowed exchange lives.
+    struct BorrowedExchange<'o>(&'o TestExchange);
+
+    impl CompilationArtifactExchange for BorrowedExchange<'_> {
+        fn process_index(&self) -> usize {
+            self.0.process_index()
+        }
+
+        fn process_count(&self) -> usize {
+            self.0.process_count()
+        }
+
+        fn preflight(&self, key: &[u8], timeout: Duration) -> Result<(), CompilationExchangeError> {
+            self.0.preflight(key, timeout)
+        }
+
+        fn publish(&self, key: &[u8], artifact: &[u8]) -> Result<(), CompilationExchangeError> {
+            self.0.publish(key, artifact)
+        }
+
+        fn publish_failure(&self, key: &[u8], message: &str) -> Result<(), CompilationExchangeError> {
+            self.0.publish_failure(key, message)
+        }
+
+        fn receive(&self, key: &[u8], timeout: Duration) -> Result<Option<Vec<u8>>, CompilationExchangeError> {
+            self.0.receive(key, timeout)
+        }
+    }
+
     /// Returns the steps retained by `context`, preserving their reported order.
-    fn event_steps(context: &CompilationContext<TestDomain>) -> Vec<CompilationStep> {
+    fn event_steps(context: &CompilationContext<'_, TestDomain>) -> Vec<CompilationStep> {
         context.recent_events().into_iter().map(|event| event.step).collect()
     }
 
@@ -2575,6 +2613,35 @@ mod tests {
         // The exchange duration covers preflights and receptions, but never publication.
         assert_eq!(leader_context.statistics().exchange_duration, leader_context.recent_events()[1].duration);
         assert_eq!(follower_statistics.exchange_duration, follower_events[1].duration + follower_events[2].duration);
+    }
+
+    #[test]
+    fn test_compilation_context_with_borrowed_artifact_exchange() {
+        let state = Arc::new(TestExchangeState::default());
+        let leader_exchange = TestExchange::new(0, Arc::clone(&state));
+        let follower_exchange = TestExchange::new(1, state);
+        let policy = CompilationArtifactExchangePolicy::RequireSharing { timeout: Duration::from_secs(5) };
+
+        // The leader publishes before the follower looks up the key, so both contexts can borrow exchanges that live on
+        // this stack frame instead of owning them.
+        let leader_context = CompilationContext::<TestDomain>::new()
+            .with_artifact_exchange(Arc::new(BorrowedExchange(&leader_exchange)), policy);
+        let leader = leader_context
+            .get_or_compile(&TestDomain::persistent(), 7, None, || Ok(TestCompiledProgram(29)))
+            .unwrap();
+        let follower_context = CompilationContext::<TestDomain>::new()
+            .with_artifact_exchange(Arc::new(BorrowedExchange(&follower_exchange)), policy);
+        let follower = follower_context
+            .get_or_compile(&TestDomain::persistent(), 7, None, || -> Result<TestCompiledProgram, ProgramError> {
+                panic!("follower must restore the leader artifact")
+            })
+            .unwrap();
+
+        assert_eq!(leader.0, 29);
+        assert_eq!(follower.0, 29);
+        assert_eq!(leader_context.statistics().exchange_publishes, 1);
+        assert_eq!(follower_context.statistics().exchange_hits, 1);
+        assert_eq!(follower_context.statistics().compilations, 0);
     }
 
     #[test]
@@ -3288,12 +3355,10 @@ mod tests {
 
     #[test]
     fn test_compilation_context_with_event_reporter() {
-        let reported = Arc::new(Mutex::new(Vec::new()));
-        let reporter_events = Arc::clone(&reported);
-        let context =
-            CompilationContext::<TestDomain>::new().with_event_reporter(Arc::new(move |event: &CompilationEvent| {
-                reporter_events.lock().unwrap().push(event.clone())
-            }));
+        // The reporter borrows `reported`, which outlives the context.
+        let reported = Mutex::new(Vec::new());
+        let context = CompilationContext::<TestDomain>::new()
+            .with_event_reporter(Arc::new(|event: &CompilationEvent| reported.lock().unwrap().push(event.clone())));
         context.get_or_compile(&TestDomain::default(), 1, None, || Ok(TestCompiledProgram(43))).unwrap();
 
         // The reporter observes every event even though retention is disabled by default.

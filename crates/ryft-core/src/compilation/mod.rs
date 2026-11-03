@@ -292,7 +292,7 @@ mod tests {
     #[derive(Clone)]
     pub(super) struct TestDomain {
         /// Compilation cache shared by every clone of this domain.
-        pub(super) cache: Arc<CompilationContext<Self>>,
+        pub(super) cache: Arc<CompilationContext<'static, Self>>,
 
         /// Number of backend compilations, shared by every clone of this domain.
         compilations: Arc<AtomicUsize>,
