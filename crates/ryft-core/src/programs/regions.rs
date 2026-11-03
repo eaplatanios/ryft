@@ -2645,6 +2645,7 @@ pub(crate) mod tests {
     use crate::programs::identities::TypeIdentity;
     use crate::programs::programs::Program;
     use crate::programs::references::ReferenceType;
+    use crate::programs::types::TypedProgram;
     use crate::programs::values::ValueDirectDispatch;
     use crate::tests::{TestRegionOperation, hash_of};
 

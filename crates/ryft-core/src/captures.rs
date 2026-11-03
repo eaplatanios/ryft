@@ -5,9 +5,9 @@
 //! [`CaptureReference`] indices, while the concrete values they name live in a side table owned by [`ClosedProgram`].
 //! The program therefore depends on capture types and positions rather than concrete data. Large arrays stay out of the
 //! Intermediate Representation (IR), device buffers remain device-resident, and compiled executables can be reused with
-//! different captured values of compatible types. Refer to [`ClosedProgram`] for a rendered diagram of this
-//! representation and its compilation boundary. The compilation lifecycle built on these types lives in
-//! the [`compilation`](crate::compilation) module.
+//! different captured values of compatible types. Refer to [`ClosedProgram`] for a diagram of this representation and
+//! its compilation boundary. The compilation lifecycle built on these types lives in the
+//! [`compilation`](crate::compilation) module.
 //!
 //! # Capturing During Tracing
 //!
@@ -318,27 +318,48 @@ where
 ///
 /// # Capture Representation
 ///
-/// ```mermaid
-/// %%{init: {"themeCSS": ".nodeLabel code { white-space: nowrap !important; }"}}%%
-/// flowchart TD
-///   runtime["Closed-Over Runtime Value"] -->|"&lt;code&gt;capture&lt;/code&gt;"| context["Capturing Context"]
-///   context --> table["Append Concrete Value to Runtime Capture Table"]
-///   context --> reference["Return Typed Capture Reference"]
-///   reference --> atom["Program Constant Atom"]
-///   immediate["Immediate Host-Sized Constant"] --> atom
-///   atom --> program["Staged Program with Complete Region Arena"]
-///   table --> validate["&lt;code&gt;ClosedProgram::new&lt;/code&gt; Validates Every Reference"]
-///   program --> validate
-///   validate --> closed["Validated Closed Program"]
-///   closed --> reusable["Reusable Staged IR plus Concrete Capture Environment"]
-///   lifted["Leading Capture Inputs then Public Inputs"]
-///   closed -->|"&lt;code&gt;to_program_with_lifted_captures&lt;/code&gt;"| lifted
-///   lifted --> compilation["Compilation Boundary"]
+/// ```text
+/// ┌───────────────────────────────────────────┐
+/// │ Closed-Over Runtime Value                 │
+/// └─────────────────────┬─────────────────────┘
+///                       │ capture
+///                       ▼
+/// ┌───────────────────────────────────────────┐   ┌───────────────────────────────────────────┐
+/// │ Capturing Context                         ├──▶│ Append Value to Runtime Capture Table     ├─┐
+/// └─────────────────────┬─────────────────────┘   └───────────────────────────────────────────┘ │
+///                       ▼                                                                       │
+/// ┌───────────────────────────────────────────┐                                                 │
+/// │ Return Typed Capture Reference            │                                                 │
+/// └─────────────────────┬─────────────────────┘                                                 │
+///                       ▼                                                                       │
+/// ┌───────────────────────────────────────────┐   ┌───────────────────────────────────────────┐ │
+/// │ Program Constant Atom                     │◀──┤ Immediate Host-Sized Constant             │ │
+/// └─────────────────────┬─────────────────────┘   └───────────────────────────────────────────┘ │
+///                       ▼                                                                       │
+/// ┌───────────────────────────────────────────┐                                                 │
+/// │ Staged Program with Complete Region Arena │                                                 │
+/// └─────────────────────┬─────────────────────┘                                                 │
+///                       ▼                                                                       │
+/// ┌───────────────────────────────────────────┐                                                 │
+/// │ `ClosedProgram::new` Validates References │◀────────────────────────────────────────────────┘
+/// └─────────────────────┬─────────────────────┘
+///                       ▼
+/// ┌───────────────────────────────────────────┐
+/// │ Validated Closed Program                  ├───────────────┐
+/// └─────────────────────┬─────────────────────┘               │
+///                       │                                     │ `to_program_with_lifted_captures`
+///                       ▼                                     ▼
+/// ┌───────────────────────────────────────────┐   ┌───────────────────────────────────────────┐
+/// │ Reusable Staged IR plus Concrete Captures │   │ Leading Capture Inputs then Public Inputs │
+/// └───────────────────────────────────────────┘   └─────────────────────┬─────────────────────┘
+///                                                                       ▼
+///                                                 ┌───────────────────────────────────────────┐
+///                                                 │ Compilation Boundary                      │
+///                                                 └───────────────────────────────────────────┘
 /// ```
 ///
 /// One capture table scopes the entry region and every attached region. Immediate constants participate in the program
 /// but not in the table, while repeated capture references continue to name one table slot and one lifted input.
-#[cfg_attr(doc, ryft_macros::mermaid)]
 pub struct ClosedProgram<
     C: Value,
     V: CaptureConstant<Type = C::Type>,
@@ -669,7 +690,7 @@ mod tests {
     use crate::parameters::Placeholder;
     use crate::programs::{
         EmptyRegionDriver, ProgramBuilder, ProgramError, ReferenceType, RegionId, RegionSlot, TypeIdentityRenaming,
-        ValueDirectDispatch, ValueProjection,
+        TypedProgram, ValueDirectDispatch, ValueProjection,
     };
     use crate::tests::{TestArrayContext, TestRegionOperation};
     use crate::tracing::{NestedTracingContext, Tracer, TracingContext};
@@ -1112,7 +1133,7 @@ mod tests {
                 vec![Placeholder],
             )
             .unwrap();
-        let source_types = source.output_types();
+        let source_types = source.output_types().into_owned();
         let closed = ClosedProgram::new(source, vec![ArrayIrValue::Array(captured)]).unwrap();
         let lifted = closed.to_program_with_lifted_captures().unwrap();
         assert_eq!(lifted.output_types(), source_types);

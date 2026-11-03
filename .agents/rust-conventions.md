@@ -73,6 +73,9 @@ ownership, and synchronization. These shared rules also apply to test code; deta
   reference is obtained by binding the `Cow` and calling `.as_ref()`.
 - When a helper semantically belongs to an existing core type such as `Program`, prefer an associated function in the
   relevant `impl` block over a free function unless there is a clear reuse reason that truly spans multiple owners.
+- Define context-dependent frontend APIs on the corresponding context or domain capability. Global convenience
+  functions should recover the context from input values instead of taking an explicit context argument. Keep the
+  explicit functions available for empty inputs and deliberate context selection.
 - When a generic API is centered on a parameterized input or output family, prefer using that family's canonical
   reparameterized form (e.g., `Input::To<T>`) instead of introducing a separate generic metadata type that is
   only coupled by matching `ParameterStructure`s.
@@ -164,6 +167,7 @@ ownership, and synchronization. These shared rules also apply to test code; deta
 - In diagnostics, surround operation names, identifiers, types, attributes, command-line flags, and other literal code
   fragments with backticks, following Rust compiler conventions. Do not use single quotes for code references; reserve
   them for syntax that actually contains single quotes, such as character literals, lifetimes, or serialized formats.
+- Use "compilation" or "JIT compilation" in diagnostic prose. Reserve lowercase `jit` for a backticked function name.
 - Custom error variants typically carry a `message` and sometimes a `backtrace` via `Backtrace::capture().to_string()`.
 - `unwrap()`/`expect()` are allowed only:
   - in tests, or

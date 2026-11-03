@@ -18,7 +18,7 @@ use crate::programs::references::{ReferenceIdentity, ReferenceRoot};
 use crate::programs::regions::{
     InputRegionProvenance, Region, RegionArena, RegionId, RegionInterface, RegionRef, RegionRole, reachable_region_mask,
 };
-use crate::programs::types::{Type, Typed};
+use crate::programs::types::{Type, Typed, TypedProgram};
 use crate::programs::values::Value;
 
 /// Process-local identity of a live [`ProgramBuilder`] shared by clones of its owning context. Symbolic reference
@@ -605,7 +605,7 @@ impl<V: Value, O: Operation<Type = V::Type>> ProgramBuilder<V, O> {
         // Deriving the renaming both validates the requested boundary and determines whether importing the callee
         // would actually change any live identity. Calls without `input_types` have no instantiation to derive.
         let renaming = input_types
-            .map(|input_types| V::Type::derive_identity_renaming(callee.input_types().as_slice(), input_types))
+            .map(|input_types| V::Type::derive_identity_renaming(callee.input_types().as_ref(), input_types))
             .transpose()?;
 
         let non_identity_renaming = renaming.as_ref().filter(|renaming| !renaming.is_identity());

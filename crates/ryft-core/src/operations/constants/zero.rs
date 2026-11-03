@@ -364,7 +364,7 @@ mod tests {
     use crate::operations::constants::constant::ConstantOperation;
     use crate::parameters::Placeholder;
     use crate::partial::{PartialEvaluationValue, PartialValue};
-    use crate::programs::{EmptyRegionDriver, MaybeZero, Operation, ProgramBuilder, ReferenceType};
+    use crate::programs::{EmptyRegionDriver, MaybeZero, Operation, ProgramBuilder, ReferenceType, TypedProgram};
     use crate::tracing::TracingContext;
 
     use super::*;

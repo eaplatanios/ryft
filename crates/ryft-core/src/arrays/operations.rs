@@ -30,11 +30,11 @@ use crate::operations::{
     ReferenceAtomicAddUpdateOperation, ReferenceFreezeOperation, ReferenceNewOperation, ReferenceOperations,
     ReferenceReadOperation, ReferenceSwapOperation, ReferenceWriteOperation, Rem, RemOperation, RematerializeOperation,
     ReshapeOperation, ReshardOperation, ReverseOperation, RngBitGenerator, RngBitGeneratorOperation, RoundOperation,
-    RoundingOperations, RsqrtOperation, SaturatingSub, SaturatingSubOperation, ScanOperation, ScatterOperation, Select,
-    SelectOperation, ShardingOperations, SignOperation, SinOperation, SliceOperation, Softmax, Sort, SortOperation,
-    SqrtOperation, StopGradient, StopGradientOperation, Sub, SubOperation, Tag, TagOperation, TanOperation,
-    TanhOperation, TransferToMemoryOperation, TransposeOperation, TrigonometricOperations, UpdateSliceOperation,
-    WhileOperation, XorOperation, ZeroLikeOperation, ZeroOperation,
+    RoundingOperations, RsqrtOperation, SaturatingSub, SaturatingSubOperation, ScaledDotOperation, ScanOperation,
+    ScatterOperation, Select, SelectOperation, ShardingOperations, SignOperation, SinOperation, SliceOperation,
+    Softmax, Sort, SortOperation, SqrtOperation, StopGradient, StopGradientOperation, Sub, SubOperation, Tag,
+    TagOperation, TanOperation, TanhOperation, TransferToMemoryOperation, TransposeOperation, TrigonometricOperations,
+    UpdateSliceOperation, WhileOperation, XorOperation, ZeroLikeOperation, ZeroOperation,
 };
 use crate::programs::{OperationProjection, Value, ValueProjection};
 
@@ -96,6 +96,7 @@ pub enum ArrayOperation<V: Value<Type = ArrayType>> {
     Sort(SortOperation),
     Dot(DotOperation),
     RaggedDot(RaggedDotOperation),
+    ScaledDot(ScaledDotOperation),
     AxisIndex(AxisIndexOperation),
     ParallelReduce(ParallelReduceOperation),
     ParallelVary(ParallelVaryOperation),
@@ -617,7 +618,7 @@ mod tests {
     use crate::partial::{PartialEvaluationContext, PartialValue, ResidualPolicyReference};
     use crate::programs::{
         AtomId, EffectClass, EffectClasses, Operation, OperationProjection, Program, ProgramBuilder, ProgramError,
-        ReferenceType, RegionInterface, Type, TypeIdentityPosition, TypeIdentityRenaming, Typed, Value,
+        ReferenceType, RegionInterface, Type, TypeIdentityPosition, TypeIdentityRenaming, Typed, TypedProgram, Value,
         ValueProjection,
     };
     use crate::tests::hash_of;

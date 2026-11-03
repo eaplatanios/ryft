@@ -285,7 +285,9 @@ mod tests {
     use crate::operations::manipulation::broadcasting::DynamicBroadcastOperation;
     use crate::operations::trigonometric::SinOperation;
     use crate::parameters::Placeholder;
-    use crate::programs::{EffectClasses, EmptyRegionDriver, ProgramBuilder, RegionInterface, ValueProjection};
+    use crate::programs::{
+        EffectClasses, EmptyRegionDriver, ProgramBuilder, RegionInterface, TypedProgram, ValueProjection,
+    };
     use crate::tracing::TracingContext;
 
     use super::*;

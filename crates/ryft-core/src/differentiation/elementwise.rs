@@ -576,7 +576,7 @@ mod tests {
         NegOperation, ReduceOperation, TanhOperation,
     };
     use crate::parameters::Placeholder;
-    use crate::programs::{MaybeZero, ProgramBuilder};
+    use crate::programs::{MaybeZero, ProgramBuilder, TypedProgram};
     use crate::tracing::TracingContext;
 
     use super::*;

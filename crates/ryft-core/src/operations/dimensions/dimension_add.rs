@@ -118,7 +118,9 @@ mod tests {
     use crate::contexts::{Context, EagerContext, StagingContext};
     use crate::parameters::Placeholder;
     use crate::partial::{PartialEvaluationContext, PartialEvaluationOutput, PartialEvaluationValue, PartialValue};
-    use crate::programs::{EffectClass, EffectClasses, ProgramBuilder, RegionInterface, TypeError, Typed};
+    use crate::programs::{
+        EffectClass, EffectClasses, ProgramBuilder, RegionInterface, TypeError, Typed, TypedProgram,
+    };
     use crate::tracing::{Trace, TracingContext};
 
     use super::*;
@@ -201,7 +203,7 @@ mod tests {
             .unwrap();
         assert_eq!(relocated.to_string(), program.to_string());
 
-        let output_type = program.output_types().remove(0);
+        let output_type = program.output_types().into_owned().remove(0);
         assert_ne!(output_type.variable(), left_type.variable());
         assert_ne!(output_type.variable(), right_type.variable());
         let left = DimensionValue::new(left_type.clone(), 7).unwrap();
@@ -310,7 +312,9 @@ mod tests {
                 in (%3, %4)"},
         );
         let evaluation = program
-            .partially_evaluate(&program.input_types().into_iter().map(PartialValue::Unknown).collect::<Vec<_>>())
+            .partially_evaluate(
+                &program.input_types().into_owned().into_iter().map(PartialValue::Unknown).collect::<Vec<_>>(),
+            )
             .unwrap();
         assert_eq!(
             evaluation.program().to_string(),

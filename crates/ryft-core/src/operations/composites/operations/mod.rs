@@ -7,7 +7,7 @@ use crate::operations::composites::rules::specializations::CustomRuleSpecializer
 use crate::operations::composites::rules::{
     CustomRuleBatching, CustomRuleBatchingLevel, CustomRuleForwardSpecializationKey,
 };
-use crate::programs::{Operation, Value};
+use crate::programs::{Operation, TypedProgram, Value};
 use crate::tracing::TracingContext;
 
 pub mod composite;
@@ -106,7 +106,7 @@ mod tests {
         primal: ConvertedProgram,
     ) -> ConvertedProgram {
         let mut builder = ProgramBuilder::<ArrayIrValue<Array>, ArrayIrOperation<Array>>::new();
-        let input_types = primal.input_types();
+        let input_types = primal.input_types().into_owned();
         let primal = builder.import_program(primal);
         let inputs = input_types.into_iter().map(|r#type| builder.add_input(r#type)).collect::<Vec<_>>();
         let input_count = inputs.len();

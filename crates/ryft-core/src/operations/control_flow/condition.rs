@@ -79,7 +79,7 @@ use crate::programs::{
     OutputRegionProvenance, Program, ProgramBuilder, ProgramError, ReferenceDischargeContext, ReferenceDischargeDriver,
     ReferenceDischargePolicy, ReferenceDischargeValue, ReferenceDischargeableOperation, ReferenceMemberType,
     ReferenceRoot, RegionDataFlow, RegionDriver, RegionInterface, RegionLiveness, RegionRef, RegionSlot, Type,
-    TypeError, TypeIdentityPosition, TypeRefinements, Typed, Value, ValueProjection,
+    TypeError, TypeIdentityPosition, TypeRefinements, Typed, TypedProgram, Value, ValueProjection,
 };
 use crate::tracing::{NestedTracingContext, Tracer, TracingContext};
 
@@ -1103,7 +1103,7 @@ where
             // types the tangent program of either linearization declares first.
             let mut branch_input_types = branches[0].input_types();
             branch_input_types
-                .extend(partitions[0].residual_program().input_types().into_iter().take(live_input_count));
+                .extend(partitions[0].residual_program().input_types().into_owned().into_iter().take(live_input_count));
             let input_known = (0..primal_input_count + live_input_count)
                 .map(|index| index < primal_input_count)
                 .collect::<Vec<_>>();
@@ -1995,6 +1995,7 @@ impl<V: Value, O: Operation<Type = V::Type>> PartitionedConditionBranch<V, O> {
         let known_program = self.partition.known_program();
         let known_inputs = known_program
             .input_types()
+            .into_owned()
             .into_iter()
             .map(|input_type| builder.add_input(input_type))
             .collect::<Vec<_>>();
@@ -6055,7 +6056,7 @@ mod tests {
             let mut builder = ProgramBuilder::<TestIrValue, TestIrOperation>::new();
             let regions = vec![builder.import_program(branch.clone()), builder.import_program(branch.clone())];
             let input_atoms = std::iter::once(ArrayType::scalar(DataType::Boolean).into())
-                .chain(branch.input_types())
+                .chain(branch.input_types().into_owned())
                 .map(|r#type| builder.add_input(r#type))
                 .collect::<Vec<_>>();
             let outputs = builder

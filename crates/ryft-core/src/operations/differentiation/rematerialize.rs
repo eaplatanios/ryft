@@ -811,7 +811,7 @@ mod tests {
     use crate::partial::ResidualPolicy;
     use crate::programs::{
         EffectClasses, ExternalReferenceBinding, Program, ProgramBuilder, ReferenceSource, ReferenceType, RegionDriver,
-        RegionRef,
+        RegionRef, TypedProgram,
     };
     use crate::tracing::{Tracer, TracingContext};
 
@@ -916,7 +916,7 @@ mod tests {
     fn rematerialized_program(body: &TestProgram, policy: ResidualPolicyReference<ArrayType>) -> TestProgram {
         let mut builder = ProgramBuilder::<Array, ArrayOperation<Array>>::new();
         let region = builder.import_program(body.clone());
-        let inputs = body.input_types().into_iter().map(|r#type| builder.add_input(r#type)).collect();
+        let inputs = body.input_types().into_owned().into_iter().map(|r#type| builder.add_input(r#type)).collect();
         let outputs = builder
             .add_instruction(RematerializeOperation::new(policy), vec![region], inputs, None)
             .unwrap()
