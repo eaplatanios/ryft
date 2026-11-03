@@ -15,14 +15,14 @@ use ryft_core::operations::attention::{
 };
 use ryft_core::{
     Array, ArrayIrBatch, ArrayIrBatchingPolicy, ArrayIrOperation, ArrayIrType, ArrayIrValue, ArrayOperation, ArrayType,
-    BatchAxis, BatchingContext, BatchingTracer, BlockScaleFormat, BlockScaledDotConfiguration, CollectiveOptions,
-    Compare, ComparisonDirection, Condition, ConvertElementTypeOperation, DataType, Device, DeviceMesh, Differentiate,
-    Dimension, DimensionBounds, DimensionFromScalarOperation, DimensionValue, DimensionVariable, DotDimensionNumbers,
-    DynamicSlice, DynamicSliceOperation, DynamicUpdateSlice, EagerContext, LogicalMesh, MeshAxis, MeshAxisType,
-    ParallelAllGather, ParallelAllGatherOutputVariance, ParallelAllToAll, ParallelPermute, ParallelReduce,
-    ParallelSumScatter, Placeholder, ProgramBuilder, ProgramError, ProjectedContext, Reduce, ReduceOperation,
-    ReductionKind, ScaledDotElements, Shape, Sharding, ShardingDimension, TypedProgram, Value, ValueProjection,
-    ZeroLike, block_scaled_dot, differentiate_at, shard_map,
+    BatchAxis, BatchingContext, BatchingTracer, BlockQuantizedValue, BlockScaleFormat, BlockScaledDotConfiguration,
+    CollectiveOptions, Compare, ComparisonDirection, Condition, Context, ConvertElementTypeOperation, DataType, Device,
+    DeviceMesh, Differentiate, Dimension, DimensionBounds, DimensionFromScalarOperation, DimensionValue,
+    DimensionVariable, DotDimensionNumbers, DynamicSlice, DynamicSliceOperation, DynamicUpdateSlice, EagerContext,
+    LogicalMesh, MeshAxis, MeshAxisType, ParallelAllGather, ParallelAllGatherOutputVariance, ParallelAllToAll,
+    ParallelPermute, ParallelReduce, ParallelSumScatter, Placeholder, ProgramBuilder, ProgramError, ProjectedContext,
+    Reduce, ReduceOperation, ReductionKind, ScaledDot, ScaledDotOperation, Shape, Sharding, ShardingDimension,
+    TypedProgram, Value, ValueProjection, ZeroLike, block_scaled_dot, differentiate_at, shard_map,
 };
 use ryft_pjrt::protos::{CompilationOptions, ExecutableCompilationOptions, Precision};
 use ryft_pjrt::{BufferType, Client, ClientOptions, CpuClientOptions, Program, load_cpu_plugin};
@@ -544,6 +544,29 @@ fn emit_data_dependent_prefix_take() -> Result<DifferentialObservation, Box<dyn 
 
 /// Emits generalized scaled-dot and rank-three scaled-matmul values plus the named-composite StableHLO contract.
 fn emit_scaled_dot_and_matmul() -> Result<DifferentialObservation, Box<dyn Error>> {
+    /// Binds the primitive directly so the differential fixture covers its optional block-scale inputs.
+    fn bind_scaled_dot<V: Value<Type = ArrayType>>(
+        lhs: &V,
+        rhs: &V,
+        lhs_scale: Option<&V>,
+        rhs_scale: Option<&V>,
+        dimensions: &DotDimensionNumbers,
+        accumulation_type: DataType,
+    ) -> Result<V, ProgramError>
+    where
+        V::Domain: Context<Operation: From<ScaledDotOperation>>,
+    {
+        let operation =
+            ScaledDotOperation::new(dimensions.clone(), accumulation_type, lhs_scale.is_some(), rhs_scale.is_some());
+        let inputs = std::iter::once(lhs)
+            .chain(std::iter::once(rhs))
+            .chain(lhs_scale)
+            .chain(rhs_scale)
+            .cloned()
+            .collect::<Vec<_>>();
+        Ok(lhs.domain().bind(operation, Vec::new(), &inputs)?.remove(0))
+    }
+
     let lhs = Array::from_elements::<f32>(
         ArrayType::new_static(DataType::F32, [2, 4]),
         &(1..=8).map(|value| value as f32).collect::<Vec<_>>(),
@@ -565,34 +588,24 @@ fn emit_scaled_dot_and_matmul() -> Result<DifferentialObservation, Box<dyn Error
     let observations = BTreeMap::from([
         (
             "both_scales",
-            vec![values(lhs.scaled_dot(
-                &rhs,
-                Some(&lhs_scale),
-                Some(&rhs_scale),
-                Some(&dimensions),
-                Some(DataType::F32),
-            )?)],
+            vec![values(bind_scaled_dot(&lhs, &rhs, Some(&lhs_scale), Some(&rhs_scale), &dimensions, DataType::F32)?)],
         ),
-        (
-            "lhs_scale",
-            vec![values(lhs.scaled_dot(&rhs, Some(&lhs_scale), None, Some(&dimensions), Some(DataType::F32))?)],
-        ),
-        (
-            "rhs_scale",
-            vec![values(lhs.scaled_dot(&rhs, None, Some(&rhs_scale), Some(&dimensions), Some(DataType::F32))?)],
-        ),
-        ("unscaled", vec![values(lhs.scaled_dot(&rhs, None, None, Some(&dimensions), Some(DataType::F32))?)]),
+        ("lhs_scale", vec![values(bind_scaled_dot(&lhs, &rhs, Some(&lhs_scale), None, &dimensions, DataType::F32)?)]),
+        ("rhs_scale", vec![values(bind_scaled_dot(&lhs, &rhs, None, Some(&rhs_scale), &dimensions, DataType::F32)?)]),
+        ("unscaled", vec![values(bind_scaled_dot(&lhs, &rhs, None, None, &dimensions, DataType::F32)?)]),
         (
             "scaled_matmul",
-            vec![values(matmul_lhs.scaled_matmul(&matmul_rhs, &matmul_lhs_scale, &matmul_rhs_scale, None)?)],
+            vec![values(
+                BlockQuantizedValue::new(matmul_lhs, matmul_lhs_scale)
+                    .scaled_matmul(&BlockQuantizedValue::new(matmul_rhs, matmul_rhs_scale), None)?,
+            )],
         ),
     ]);
     let traced: TracedXlaProgram<(ArrayType, ArrayType, ArrayType, ArrayType), ArrayType> = trace(
         {
             let dimensions = dimensions.clone();
             move |(lhs, rhs, lhs_scale, rhs_scale): (XlaArrayTracer, XlaArrayTracer, XlaArrayTracer, XlaArrayTracer)| {
-                lhs.scaled_dot(&rhs, Some(&lhs_scale), Some(&rhs_scale), Some(&dimensions), Some(DataType::F32))
-                    .unwrap()
+                bind_scaled_dot(&lhs, &rhs, Some(&lhs_scale), Some(&rhs_scale), &dimensions, DataType::F32).unwrap()
             }
         },
         (

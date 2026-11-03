@@ -903,13 +903,9 @@ impl<'c> XlaDomain<'c> {
         }
         let flat_inputs = lift_arrays::<In>(inputs)?.into_parameters().collect::<Vec<_>>();
         executable.function.validate_input_count(flat_inputs.len())?;
-        // The compiled program stores its input types as array types with the captures first, so borrowing them avoids
-        // converting the signature on every call. They are exactly the staged types, which compilation checks.
-        let capture_count = executable.function.captures().len();
-        let input_types = &executable.function.compiled_program().input_types()[capture_count..];
-        for (expected, actual) in input_types.iter().zip(flat_inputs.iter().map(Typed::r#type)) {
+        for (expected, actual) in executable.function.input_types().iter().zip(flat_inputs.iter().map(Typed::r#type)) {
             crate::experimental::domains::validate_xla_input_type(
-                expected,
+                <&ArrayType>::try_from(expected).map_err(ProgramError::from)?,
                 <&ArrayType>::try_from(actual.as_ref()).map_err(ProgramError::from)?,
             )?;
         }
@@ -2430,7 +2426,7 @@ mod tests {
         )
         .unwrap();
         let executable = compiled.executable_function();
-        assert_eq!(executable.function.input_types().as_ref(), &[ArrayIrType::Array(input_type.clone())]);
+        assert_eq!(executable.function.input_types(), &[ArrayIrType::Array(input_type.clone())]);
         assert_eq!(executable.output_types(), &[input_type.clone()]);
 
         let input =
@@ -2477,7 +2473,7 @@ mod tests {
         )
         .unwrap();
         let executable = compiled.executable_function();
-        assert_eq!(executable.function.input_types().as_ref(), &[ArrayIrType::Array(input_type.clone())]);
+        assert_eq!(executable.function.input_types(), &[ArrayIrType::Array(input_type.clone())]);
         assert_eq!(executable.output_types(), &[input_type.clone(), input_type.clone(), input_type.clone()]);
 
         // Reusing one executable must start each invocation's cotangent state at zero. In particular, returning to
@@ -4554,8 +4550,7 @@ mod tests {
         let wrong_update =
             XlaArray::from_host_buffer(&domain, wrong_update_type, mesh.clone(), 2.0f64.to_ne_bytes().as_slice())
                 .unwrap();
-        let input_types = compiled.executable_function().input_types();
-        let declared_update_type = <&ArrayType>::try_from(&input_types[3]).unwrap();
+        let declared_update_type = <&ArrayType>::try_from(&compiled.executable_function().input_types()[3]).unwrap();
         let expected_error = format!(
             "runtime input type {} does not refine declared type {declared_update_type}",
             wrong_update.r#type(),

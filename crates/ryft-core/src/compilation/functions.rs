@@ -8,7 +8,7 @@ use std::sync::{Arc, OnceLock};
 use std::time::{Duration, Instant};
 
 use crate::captures::{CapturingContext, ClosedProgram};
-use crate::compilation::contexts::{CompilationDomain, StatefulCompilationDomain};
+use crate::compilation::domains::{CompilationDomain, StatefulCompilationDomain};
 use crate::compilation::operations::StagedCallOperation;
 use crate::contexts::{Context, Domain, StagingContext};
 use crate::macros::{check_builders, check_count};
@@ -563,26 +563,10 @@ where
     ///
     /// # Errors
     ///
-    /// Returns the error of `domain`, or a [`ProgramError`] if the compiled program does not have exactly the staged
-    /// `[captures..., public inputs...]` input types of this function, or if its output types differ in count from the
+    /// Returns the error of `domain`, or a [`ProgramError`] if the compiled output types differ in count from the
     /// lowered output types of this function or do not refine them.
     pub fn compile(&self, domain: &C) -> Result<CompiledFunction<C, Input, Output>, C::Error> {
         let program = domain.compile(self.lowered_program())?;
-
-        // Calls validate their inputs against the compiled program, so its input types must be exactly the staged
-        // ones. Any refinement would change which inputs calls accept.
-        let staged_input_types = self.staged.lifted_program()?.input_types().into_owned();
-        let input_types = program.input_types();
-        check_count!("input", input_types, staged_input_types.len(), ProgramError);
-        for (staged, actual) in staged_input_types.iter().zip(input_types.iter()) {
-            if staged != actual {
-                return Err(ProgramError::InvalidArgument {
-                    message: format!("compiled input type {actual} differs from staged input type {staged}"),
-                }
-                .into());
-            }
-        }
-
         let declared_output_types = self.output_types();
         let output_types = program.output_types();
         check_count!("output", output_types, declared_output_types.len(), ProgramError);
@@ -613,11 +597,11 @@ where
 }
 
 /// Runtime-only handle for one compiled executable. This handle retains only the state required to validate and
-/// execute calls, namely the backend executable, its concrete captures, and its structured output shape. That
-/// call-level state is what still makes it a function rather than a program, even though it has shed every
-/// transformable artifact. It deliberately does not retain the staged or lowered programs, so it becomes [`Send`] and
-/// [`Sync`] automatically whenever those runtime fields are `Send + Sync`. In contrast, [`CompiledFunction`] remains
-/// transformable and may retain `Rc`-backed source programs.
+/// execute calls, namely the backend executable, its concrete captures, its flat public input types, and its structured
+/// output shape. That call-level state is what still makes it a function rather than a program, even though it has shed
+/// every transformable artifact. It deliberately does not retain the staged or lowered programs, so it becomes [`Send`]
+/// and [`Sync`] automatically whenever those runtime fields are `Send + Sync`. In contrast, [`CompiledFunction`]
+/// remains transformable and may retain `Rc`-backed source programs.
 pub struct ExecutableFunction<C: CompilationDomain, Input: Parameterized<C::Type>, Output: Parameterized<C::Type>> {
     /// Shared immutable runtime state, which makes clones constant-time.
     state: Arc<ExecutableFunctionState<C, Input, Output>>,
@@ -627,8 +611,9 @@ impl<C: CompilationDomain, Input: Parameterized<C::Type>, Output: Parameterized<
     ExecutableFunction<C, Input, Output>
 {
     /// Returns a function that invokes `program` instead of this function's current compiled program, while keeping
-    /// this function's runtime captures and output parameter structure. Backends use it to swap in an equivalent
-    /// executable, such as one deserialized from a persistent cache or recompiled with profile guidance.
+    /// this function's runtime captures, flat public input types, and output parameter structure. Backends use it to
+    /// swap in an equivalent executable, such as one deserialized from a persistent cache or recompiled with profile
+    /// guidance.
     ///
     /// This function does not check compatibility, so the caller must establish it first. `program` must accept the
     /// same `[captures..., public inputs...]` inputs as the current program, and its output types must have one entry
@@ -641,6 +626,7 @@ impl<C: CompilationDomain, Input: Parameterized<C::Type>, Output: Parameterized<
             state: Arc::new(ExecutableFunctionState {
                 program,
                 captures: self.state.captures.clone(),
+                input_types: self.state.input_types.clone(),
                 output_structure: self.state.output_structure.clone(),
                 input: PhantomData,
             }),
@@ -659,18 +645,10 @@ impl<C: CompilationDomain, Input: Parameterized<C::Type>, Output: Parameterized<
         &self.state.captures
     }
 
-    /// Returns the flat public input types of the compiled program, excluding the leading inputs
-    /// that hold its captures.
+    /// Returns the flat staged public input types, excluding hidden captures.
     #[inline]
-    pub fn input_types(&self) -> Cow<'_, [C::Type]> {
-        let capture_count = self.state.captures.len();
-        match self.state.program.input_types() {
-            Cow::Borrowed(input_types) => Cow::Borrowed(&input_types[capture_count..]),
-            Cow::Owned(mut input_types) => {
-                input_types.drain(..capture_count);
-                Cow::Owned(input_types)
-            }
-        }
+    pub fn input_types(&self) -> &[C::Type] {
+        &self.state.input_types
     }
 
     /// Returns the effective flat output types of the compiled program.
@@ -754,9 +732,11 @@ impl<C: CompilationDomain, Input: Parameterized<C::Type>, Output: Parameterized<
 
     /// Validates that `input_count` matches the number of flat public inputs, excluding hidden captures.
     pub fn validate_input_count(&self, input_count: usize) -> Result<(), ProgramError> {
-        let expected = self.state.program.input_count() - self.state.captures.len();
-        if input_count != expected {
-            return Err(ProgramError::InvalidInputCount { expected, actual: input_count });
+        if input_count != self.state.input_types.len() {
+            return Err(ProgramError::InvalidInputCount {
+                expected: self.state.input_types.len(),
+                actual: input_count,
+            });
         }
         Ok(())
     }
@@ -790,6 +770,11 @@ struct ExecutableFunctionState<C: CompilationDomain, Input: Parameterized<C::Typ
 
     /// Concrete runtime captures supplied before the public inputs on every call.
     captures: Vec<C::Value>,
+
+    /// Flat staged public input types, excluding hidden captures, against which calls validate their inputs. These are
+    /// not derived from the compiled program, whose input types are the backend's own (e.g., the XLA backend compiles
+    /// reference inputs as their discharged referent types).
+    input_types: Vec<C::Type>,
 
     /// Output parameter structure used to reconstruct structured runtime values.
     output_structure: Output::ParameterStructure,
@@ -827,6 +812,7 @@ where
             state: Arc::new(ExecutableFunctionState {
                 program,
                 captures: lowered.staged.source_program().captures().to_vec(),
+                input_types: lowered.staged.input_types().to_vec(),
                 output_structure: lowered.staged.output_structure().clone(),
                 input: PhantomData,
             }),
@@ -976,7 +962,7 @@ impl<Static, Structure, Key> SpecializationKey<Static, Structure, Key> {
 ///
 /// The dispatcher identity only namespaces its specialization cache, which is local to the process.
 /// For domains that cache compiled programs, executable correctness and reuse still depend on
-/// [`CompilationCacheDomain::compilation_key`](super::contexts::CompilationCacheDomain::compilation_key),
+/// [`CompilationCacheDomain::compilation_key`](crate::CompilationCacheDomain::compilation_key),
 /// which receives the complete lowering.
 ///
 /// Cloned handles share one specialization cache, and the dispatcher is usable from multiple threads whenever the
@@ -1708,7 +1694,7 @@ mod tests {
         DimensionType, DimensionValue, Shape,
     };
     use crate::captures::CaptureReference;
-    use crate::compilation::contexts::{Compile, jit};
+    use crate::compilation::domains::{Compile, jit};
     use crate::compilation::tests::{
         CarriedDomain, CarriedOptions, TestCompiledProgram, TestDomain, TestOptions, compile_from_one_call_site,
     };
@@ -2237,36 +2223,12 @@ mod tests {
     }
 
     #[test]
-    fn test_lowered_function_compile_rejects_unstaged_input_types() {
-        // Calls validate their inputs against the compiled program, so its input types must be exactly the staged ones.
-        let domain = TestDomain::new();
-        let compile = |compiled_input_types: Vec<ArrayType>| {
-            let options = TestOptions { compiled_input_types: Some(compiled_input_types), ..TestOptions::default() };
-            let staged: StagedFunction<TestDomain, ArrayType, ArrayType> =
-                domain.stage(|input| input, ArrayType::scalar(DataType::F64), options).unwrap();
-            staged
-                .lower(&domain)
-                .unwrap()
-                .compile(&domain)
-                .map(|compiled| compiled.executable().input_types().to_vec())
-        };
-        assert_eq!(compile(vec![ArrayType::scalar(DataType::F64)]).unwrap(), vec![ArrayType::scalar(DataType::F64)]);
-        assert!(matches!(compile(Vec::new()), Err(ProgramError::InvalidInputCount { expected: 1, actual: 0 })));
-        assert!(matches!(
-            compile(vec![ArrayType::scalar(DataType::I64)]),
-            Err(ProgramError::InvalidArgument { message })
-                if message == "compiled input type i64[] differs from staged input type f64[]",
-        ));
-    }
-
-    #[test]
     fn test_executable_function_with_compiled_program() {
         let domain = TestDomain::new();
         let identity = compile_from_one_call_site(&domain, false).into_executable();
         let negate = compile_from_one_call_site(&domain, true).into_executable();
         let replaced = identity.with_compiled_program(Arc::new(TestCompiledProgram {
             program: negate.compiled_program().program.clone(),
-            input_types: negate.compiled_program().input_types.clone(),
             output_types: negate.output_types().to_vec(),
         }));
 

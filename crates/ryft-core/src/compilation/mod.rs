@@ -164,16 +164,17 @@
 //! reconstruct structured outputs. [`StagedProgram::lifted_program`] supplies the shared flat capture-lifting step.
 
 pub mod caching;
-pub mod contexts;
+pub mod domains;
 pub mod exchange;
 pub mod functions;
 pub mod operations;
 
 pub use caching::{
-    CompilationCacheStatistics, CompilationCacheTier, CompilationContext, CompilationEvent, CompilationEventKind,
-    CompilationEventReason, CompilationLookupOutcome, CompilationOperationOutcome, DiskCache,
+    CompilationCacheStatistics, CompilationCacheTier, CompilationContext, CompilationEvent, CompilationEventError,
+    CompilationEventKind, CompilationLookupOutcome, CompilationMissReason, CompilationOperationOutcome,
+    CompilationSkipReason, DiskCache,
 };
-pub use contexts::{
+pub use domains::{
     AnalyzableCompilationDomain, CompilationCacheDomain, CompilationDomain, Compile, StatefulCompilationDomain, jit,
     jit_with_options, jit_with_options_and_capacity, stage,
 };
@@ -194,7 +195,7 @@ mod tests {
     use crate::arrays::{Array, ArrayOperation, ArrayType, DataType};
     use crate::captures::CaptureReference;
     use crate::compilation::caching::CompilationContext;
-    use crate::compilation::contexts::{CompilationCacheDomain, CompilationDomain, Compile, StatefulCompilationDomain};
+    use crate::compilation::domains::{CompilationCacheDomain, CompilationDomain, Compile, StatefulCompilationDomain};
     use crate::compilation::functions::{CompiledFunction, StagedProgram, StatefulExecution};
     use crate::contexts::Domain;
     use crate::macros::check_count;
@@ -225,9 +226,6 @@ mod tests {
         /// Lifted flat program that execution interprets.
         pub(super) program: FlatProgram<TestDomain>,
 
-        /// Compiled input types, including the lifted captures first.
-        pub(super) input_types: Vec<ArrayType>,
-
         /// Compiled output types.
         pub(super) output_types: Vec<ArrayType>,
     }
@@ -256,11 +254,11 @@ mod tests {
         type Type = ArrayType;
 
         fn input_count(&self) -> usize {
-            self.input_types.len()
+            self.program.input_count()
         }
 
         fn input_types(&self) -> Cow<'_, [ArrayType]> {
-            Cow::Borrowed(&self.input_types)
+            self.program.input_types()
         }
 
         fn output_count(&self) -> usize {
@@ -283,9 +281,6 @@ mod tests {
 
         /// Whether compilation fails.
         pub(super) fail_compilation: bool,
-
-        /// Input types that compilation reports instead of the lowered input types, if any.
-        pub(super) compiled_input_types: Option<Vec<ArrayType>>,
 
         /// Output types that compilation reports instead of the lowered output types, if any.
         pub(super) compiled_output_types: Option<Vec<ArrayType>>,
@@ -411,14 +406,9 @@ mod tests {
             if program.options.fail_compilation {
                 return Err(ProgramError::InvalidArgument { message: "expected compilation failure".into() });
             }
-            let input_types = program
-                .options
-                .compiled_input_types
-                .clone()
-                .unwrap_or_else(|| program.program.input_types().into_owned());
             let output_types =
                 program.options.compiled_output_types.clone().unwrap_or_else(|| program.output_types.clone());
-            Ok(TestCompiledProgram { program: program.program.clone(), input_types, output_types })
+            Ok(TestCompiledProgram { program: program.program.clone(), output_types })
         }
     }
 

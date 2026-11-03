@@ -31,10 +31,10 @@ use crate::operations::{
     ReferenceAtomicAddUpdateOperation, ReferenceFreezeOperation, ReferenceNewOperation, ReferenceOperations,
     ReferenceReadOperation, ReferenceSwapOperation, ReferenceWriteOperation, Rem, RemOperation, RematerializeOperation,
     ReshapeOperation, ReshardOperation, ReverseOperation, RngBitGenerator, RngBitGeneratorOperation, RoundOperation,
-    RoundingOperations, RsqrtOperation, SaturatingSub, SaturatingSubOperation, ScaledDot, ScaledDotOperation,
-    ScanOperation, ScatterOperation, Select, SelectOperation, ShardMapOperation, ShardingOperations, SignOperation,
-    SinOperation, SliceOperation, Softmax, Sort, SortOperation, SqrtOperation, StopGradient, StopGradientOperation,
-    Sub, SubOperation, Tag, TagOperation, TanOperation, TanhOperation, TransferToMemoryOperation, TransposeOperation,
+    RoundingOperations, RsqrtOperation, SaturatingSub, SaturatingSubOperation, ScaledDotOperation, ScanOperation,
+    ScatterOperation, Select, SelectOperation, ShardMapOperation, ShardingOperations, SignOperation, SinOperation,
+    SliceOperation, Softmax, Sort, SortOperation, SqrtOperation, StopGradient, StopGradientOperation, Sub,
+    SubOperation, Tag, TagOperation, TanOperation, TanhOperation, TransferToMemoryOperation, TransposeOperation,
     TrigonometricOperations, UpdateSliceOperation, WhileOperation, XorOperation, ZeroLikeOperation, ZeroOperation,
 };
 use crate::programs::{OperationProjection, Value, ValueProjection};
@@ -182,7 +182,6 @@ pub trait ArrayOperations<T = <Self as Capability>::Universe>:
     + Cumulative<T>
     + Sort<T>
     + DotOperations<T>
-    + ScaledDot<T>
     + DotProductAttention<T>
     + CollectiveOperations<T>
     + Compare<Self, T>
@@ -216,7 +215,6 @@ impl<
         + Cumulative<T>
         + Sort<T>
         + DotOperations<T>
-        + ScaledDot<T>
         + DotProductAttention<T>
         + CollectiveOperations<T>
         + Compare<V, T>

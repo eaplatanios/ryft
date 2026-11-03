@@ -3792,7 +3792,25 @@ mod tests {
     /// representable, so both reference and CPU-XLA backends are exact.
     #[test]
     fn test_eager_scaled_dot_parity_with_reference_backend() {
-        use ryft_core::{DotDimensionNumbers, ScaledDotElements};
+        use ryft_core::{DotDimensionNumbers, ScaledDotOperation};
+
+        /// Binds the primitive on both backends without adding a public raw-array capability.
+        fn bind_scaled_dot<V: Value<Type = ArrayType>>(
+            lhs: &V,
+            rhs: &V,
+            lhs_scale: &V,
+            rhs_scale: &V,
+            dimensions: &DotDimensionNumbers,
+        ) -> Result<V, ProgramError>
+        where
+            V::Domain: Context<Operation: From<ScaledDotOperation>>,
+        {
+            let operation = ScaledDotOperation::new(dimensions.clone(), DataType::F32, true, true);
+            Ok(lhs
+                .domain()
+                .bind(operation, Vec::new(), &[lhs.clone(), rhs.clone(), lhs_scale.clone(), rhs_scale.clone()])?
+                .remove(0))
+        }
 
         let plugin = load_cpu_plugin().unwrap();
         let client = plugin
@@ -3857,18 +3875,10 @@ mod tests {
         .unwrap();
 
         let dimensions = DotDimensionNumbers::new(vec![1], vec![1], Vec::new(), Vec::new());
-        let device_product = lhs
-            .scaled_dot(&rhs, Some(&lhs_scales), Some(&rhs_scales), Some(&dimensions), Some(DataType::F32))
-            .unwrap();
-        let reference_product = reference_lhs
-            .scaled_dot(
-                &reference_rhs,
-                Some(&reference_lhs_scales),
-                Some(&reference_rhs_scales),
-                Some(&dimensions),
-                Some(DataType::F32),
-            )
-            .unwrap();
+        let device_product = bind_scaled_dot(&lhs, &rhs, &lhs_scales, &rhs_scales, &dimensions).unwrap();
+        let reference_product =
+            bind_scaled_dot(&reference_lhs, &reference_rhs, &reference_lhs_scales, &reference_rhs_scales, &dimensions)
+                .unwrap();
         assert_eq!(device_product.r#type().data_type(), DataType::F32);
         let device_value_f64s = read_f32s(&device_product).iter().map(|value| f64::from(*value)).collect::<Vec<_>>();
         assert_eq!(device_value_f64s, reference_product.to_f64s());
