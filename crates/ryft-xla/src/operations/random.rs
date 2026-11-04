@@ -208,6 +208,10 @@ impl LowerableOperation for DropoutOperation {
                 (complex(part_scale)?, complex(part_zero)?)
             }
         };
+        // A rate of one drops every element, after drawing the words that advance the state as for any other rate.
+        if self.drops_everything() {
+            return Ok(std::iter::once(zero).chain(input_values.get(1).map(|_| generated[0])).collect());
+        }
         let scaled = block
             .append_operation(stable_hlo::multiply(input, scale, location)?)?
             .result(0)

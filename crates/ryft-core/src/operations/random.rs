@@ -57,6 +57,7 @@ use crate::macros::{
 };
 use crate::operations::Capability;
 use crate::operations::arithmetic::{Add, Div, Mul, Neg, Sqrt, Sub};
+use crate::operations::collectives::parallel_vary::ManualVariationAlignment;
 use crate::operations::comparisons::Compare;
 use crate::operations::complex::Complex;
 use crate::operations::constants::constant::ConstantOperation;
@@ -1169,22 +1170,33 @@ impl DropoutOperation {
         &self.broadcast_axes
     }
 
-    /// Returns the factor `1 / (1 - rate)` by which this operation scales the kept elements, before rounding it to the
-    /// input data type.
+    /// Returns the factor by which Ryft's own implementations scale the kept elements, before rounding it to the input
+    /// data type. It is the reciprocal of the probability with which those implementations keep an element (i.e.,
+    /// `2³² / (2³² - drop_threshold())`, which is `1 / (1 - rate)` up to the rounding of the rate to a multiple of
+    /// `2⁻³²`), so that the expected value of every element is preserved exactly for every rate below one. A rate of
+    /// one drops every element, which needs no scale, and returns zero.
     #[inline]
     pub fn scale(&self) -> f64 {
-        1.0 / (1.0 - self.rate)
+        if self.rate >= 1.0 { 0.0 } else { 2.0f64.powi(32) / (2.0f64.powi(32) - f64::from(self.drop_threshold())) }
     }
 
     /// Returns the `u32` threshold `round(rate · 2³²)`, clamped to [`u32::MAX`], with which Ryft's own implementations
     /// select the kept elements. Each implementation draws one uniformly distributed `u32` word per mask element with
     /// [`RngBitGenerator`] and keeps the element if and only if that word is greater than or equal to this threshold.
-    /// The probability with which an element is kept is therefore `1 - rate` rounded to a multiple of `2⁻³²`. Backends
-    /// that lower this operation without a fused kernel use the same rule, so that a given state draws the same mask
-    /// in every one of Ryft's implementations.
+    /// The probability with which an element is kept is therefore `1 - rate` rounded to a multiple of `2⁻³²` (and at
+    /// least `2⁻³²`), and [`scale`](Self::scale) is its reciprocal. A rate of one instead drops every element, although
+    /// the words are still drawn, so that the advanced state does not depend on the rate. Backends that lower this
+    /// operation without a fused kernel use the same rule, so that a given state draws the same mask in every one of
+    /// Ryft's implementations.
     #[inline]
     pub fn drop_threshold(&self) -> u32 {
         (self.rate * 2.0f64.powi(32)).round().min(f64::from(u32::MAX)) as u32
+    }
+
+    /// Returns `true` if this operation drops every element (i.e., its rate is one).
+    #[inline]
+    pub fn drops_everything(&self) -> bool {
+        self.rate >= 1.0
     }
 
     /// Returns the type of the `u32` words from which Ryft's own implementations draw the mask of an input of type
@@ -1297,11 +1309,11 @@ impl Operation for DropoutOperation {
             }
         };
 
-        // `contains` rejects NaN rates, and a rate of one would scale the kept elements by infinity.
-        if !(0.0..1.0).contains(&self.rate) {
+        // `contains` rejects NaN rates. A rate of one drops every element.
+        if !(0.0..=1.0).contains(&self.rate) {
             return Err(TypeError::invalid(format!(
-                "`{DROPOUT_OPERATION_NAME}` requires a rate in `[0, 1)` but got `{:?}`",
-                self.rate,
+                "`{}` requires a rate in `[0, 1]` but got `{:?}`",
+                DROPOUT_OPERATION_NAME, self.rate,
             )));
         }
 
@@ -1334,35 +1346,28 @@ impl Operation for DropoutOperation {
             RandomAlgorithm::from_state_type(state_type)?;
         }
 
-        // A state that varies over manual mesh axes draws different masks on different devices, so the output varies
-        // over the varying manual axes of both the input and the state.
+        // A state that varies over manual mesh axes draws different masks on different devices, so the input must
+        // already vary over those axes, as the inputs of other operations must agree on their manual variation. The
+        // capabilities align the input (e.g., with `parallel_vary`), whose adjoint then reduces the cotangent over the
+        // axes that only the state varies over.
         let Some(state_type) = state_type else {
             return Ok(vec![input_type.clone()]);
         };
-
-        let Some(state_sharding) = state_type.sharding().filter(|sharding| !sharding.varying_manual_axes().is_empty())
-        else {
-            return Ok(vec![input_type.clone(), state_type.clone()]);
-        };
-
-        let mut output_sharding = match input_type.sharding() {
-            Some(sharding) => sharding.clone(),
-            None => Sharding::replicated(state_sharding.mesh().clone(), input_type.rank()),
-        };
-        output_sharding
-            .extend_varying_manual_axes(state_sharding.varying_manual_axes().iter().cloned())
-            .map_err(|error| {
-                TypeError::invalid(format!(
-                    "`{DROPOUT_OPERATION_NAME}` input type `{input_type}` cannot vary over the varying manual axes of \
-                     its random state: {error}",
-                ))
-            })?;
-
-        let output_type = input_type
-            .clone()
-            .with_sharding(output_sharding)
-            .map_err(|error| TypeError::invalid(error.to_string()))?;
-        Ok(vec![output_type, state_type.clone()])
+        if let Some(state_sharding) = state_type.sharding() {
+            let input_axes = input_type.sharding().map(Sharding::varying_manual_axes);
+            let missing = state_sharding
+                .varying_manual_axes()
+                .iter()
+                .filter(|axis| !input_axes.is_some_and(|input_axes| input_axes.contains(*axis)))
+                .collect::<Vec<_>>();
+            if !missing.is_empty() {
+                return Err(TypeError::invalid(format!(
+                    "`{DROPOUT_OPERATION_NAME}` input type `{input_type}` must vary over the varying manual axes of \
+                     its random state, but it does not vary over {missing:?}",
+                )));
+            }
+        }
+        Ok(vec![input_type.clone(), state_type.clone()])
     }
 
     #[inline]
@@ -1581,10 +1586,11 @@ impl_differentiable_operation! {
 
 /// Represents the ability to apply dropout, which randomly zeroes elements of an array and scales the remaining
 /// elements so that the expected value of every element is preserved. Each element of a random mask is kept with
-/// probability `1 - rate`, and the result multiplies every kept element by `1 / (1 - rate)`, rounded to the input data
-/// type, and sets every dropped element to zero (including non-finite ones). The elements along the broadcast axes
-/// share their mask element. This is the dropout of [Srivastava et al.](https://jmlr.org/papers/v15/srivastava14a.html)
-/// and the broadcast axes are the `broadcast_dims` of
+/// probability `1 - rate`, and the result multiplies every kept element by the reciprocal of the probability with which
+/// it is kept (i.e., `1 / (1 - rate)`, refer to [`DropoutOperation::scale`] for its exact value), rounded to the input
+/// data type, and sets every dropped element to zero (including non-finite ones). A rate of one drops every element.
+/// The elements along the broadcast axes share their mask element. This is the dropout of
+/// [Srivastava et al.](https://jmlr.org/papers/v15/srivastava14a.html) and the broadcast axes are `broadcast_dims` of
 /// [`flax.linen.Dropout`](https://flax.readthedocs.io/en/latest/api_reference/flax.linen/layers.html#flax.linen.Dropout).
 ///
 /// Only the distribution of the mask is specified, while the exact mask is implementation-defined. With a random state,
@@ -1636,7 +1642,8 @@ pub trait Dropout<T = <Self as Capability>::Universe>: Capability + Sized {
     ///
     /// # Parameters
     ///
-    ///   - `rate`: Probability with which each mask element is dropped, which must be finite and in `[0, 1)`.
+    ///   - `rate`: Probability with which each mask element is dropped, which must be in `[0, 1]`. A rate of one drops
+    ///     every element and returns zeros.
     ///   - `broadcast_axes`: Axes along which the mask is shared. Negative axes count from the end.
     ///   - `state`: Optional random generator state with the [`RandomAlgorithm::state_type`] of its algorithm. When it
     ///     is [`None`], backends may replace the dropout with a fused kernel, and Ryft's own implementations use a
@@ -1644,11 +1651,13 @@ pub trait Dropout<T = <Self as Capability>::Universe>: Capability + Sized {
     ///
     /// # Errors
     ///
-    /// Returns a [`ProgramError`] if `rate` is not in `[0, 1)`, if this value is not a floating-point or complex array
+    /// Returns a [`ProgramError`] if `rate` is not in `[0, 1]`, if this value is not a floating-point or complex array
     /// (in particular, `f8e8m0fnu` is unsupported), if a broadcast axis is out of bounds or repeated, if an axis that
-    /// is not a broadcast axis has a dynamic extent or is sharded, if `state` is not a generator state or is sharded,
-    /// if this value or `state` has unreduced axes, if this value cannot vary over the varying manual axes of `state`,
-    /// or if the context of the value fails to bind the operation.
+    /// is not a broadcast axis has a dynamic extent or is sharded, if `state` is not a generator state, is sharded, or
+    /// has unreduced axes, if this value cannot vary over the varying manual axes of `state` (e.g., because it is
+    /// reduced over one of them), or if the context of the value fails to bind the operation. Unreduced inputs are
+    /// supported, and the result keeps their unreduced axes. This value is first made to vary over the varying manual
+    /// axes of `state`.
     fn dropout_with_broadcast_axes<A: Into<Axes>>(
         &self,
         rate: f64,
@@ -1665,7 +1674,27 @@ impl Dropout for Array {
         state: Option<&Self>,
     ) -> Result<(Self, Option<Self>), ProgramError> {
         let operation = DropoutOperation::new(rate, broadcast_axes);
-        let input_type = self.r#type().into_owned();
+
+        // Concrete arrays hold their manual variation as type metadata only, so aligning the input with the variation
+        // of the state retypes it.
+        let mut input_type = self.r#type().into_owned();
+        if let Some(state_sharding) = state.map(|state| state.r#type().into_owned()).and_then(|state_type| {
+            state_type.sharding().filter(|sharding| !sharding.varying_manual_axes().is_empty()).cloned()
+        }) {
+            let mut sharding = match input_type.sharding() {
+                Some(sharding) => sharding.clone(),
+                None => Sharding::replicated(state_sharding.mesh().clone(), input_type.rank()),
+            };
+            sharding.extend_varying_manual_axes(state_sharding.varying_manual_axes().iter().cloned()).map_err(
+                |error| {
+                    TypeError::invalid(format!(
+                        "`{DROPOUT_OPERATION_NAME}` input type `{input_type}` cannot vary over the varying manual axes \
+                         of its random state: {error}",
+                    ))
+                },
+            )?;
+            input_type = input_type.with_sharding(sharding).map_err(|error| TypeError::invalid(error.to_string()))?;
+        }
         let input_types = std::iter::once(input_type.clone())
             .chain(state.map(|state| state.r#type().into_owned()))
             .collect::<Vec<_>>();
@@ -1694,7 +1723,7 @@ impl Dropout for Array {
             Self::from_logical_bytes(mask_type.clone(), words.logical_bytes().as_slice())?
         };
         let compute_type = input_type.without_reduction_axes();
-        let input = if compute_type == input_type {
+        let input = if &compute_type == self.r#type().as_ref() {
             self.clone()
         } else {
             Self::from_logical_bytes(compute_type.clone(), self.logical_bytes().as_slice())?
@@ -1706,7 +1735,11 @@ impl Dropout for Array {
             &(0..compute_type.rank()).collect::<Vec<_>>(),
         )?;
         let scale: Self = domain.fill(&compute_type, operation.scale())?;
-        let output = keep.select(&input.mul(&scale)?, &input.zero_like()?)?;
+        let output = if operation.drops_everything() {
+            input.zero_like()?
+        } else {
+            keep.select(&input.mul(&scale)?, &input.zero_like()?)?
+        };
         let output_type = output_types.remove(0);
         let output = if output.r#type().as_ref() == &output_type {
             output
@@ -1722,7 +1755,7 @@ impl<
             Dispatch = ValueDomainDispatch,
             Type = ArrayType,
             Domain: Context<Type = ArrayType, Operation: From<DropoutOperation>>,
-        >,
+        > + ManualVariationAlignment,
 > Dropout<ArrayType> for V
 {
     fn dropout_with_broadcast_axes<A: Into<Axes>>(
@@ -1731,7 +1764,16 @@ impl<
         broadcast_axes: A,
         state: Option<&Self>,
     ) -> Result<(Self, Option<Self>), ProgramError> {
-        let inputs = std::iter::once(self).chain(state).cloned().collect::<Vec<_>>();
+        // The input must vary over the varying manual axes of the state.
+        let input = match state.map(|state| state.r#type().into_owned()) {
+            Some(state_type)
+                if state_type.sharding().is_some_and(|sharding| !sharding.varying_manual_axes().is_empty()) =>
+            {
+                Self::align_manual_variation_to(std::slice::from_ref(self), state_type.sharding().unwrap())?.remove(0)
+            }
+            _ => self.clone(),
+        };
+        let inputs = std::iter::once(input).chain(state.cloned()).collect::<Vec<_>>();
         let mut outputs = self.domain().bind(DropoutOperation::new(rate, broadcast_axes), Vec::new(), &inputs)?;
         check_count!("output", outputs, inputs.len(), ProgramError);
         let state = (outputs.len() == 2).then(|| outputs.remove(1));
@@ -1906,6 +1948,7 @@ mod tests {
         check_operation_batching, check_operation_partial_evaluation, check_operation_transposition,
         check_operation_type_inference,
     };
+    use crate::operations::collectives::parallel_vary::ParallelVary;
     use crate::partial::PartialValue;
     use crate::programs::{EffectClasses, EmptyRegionDriver, MaybeZero, TypedProgram};
     use crate::tracing::TracingContext;
@@ -3165,6 +3208,15 @@ mod tests {
         assert_eq!(DropoutOperation::new(2.0f64.powi(-34), Axes::default()).drop_threshold(), 0);
         assert_eq!(DropoutOperation::new(1.0 - 2.0f64.powi(-40), Axes::default()).drop_threshold(), u32::MAX);
 
+        // The scale is the reciprocal of the keep probability that the threshold yields, so the expectation of every
+        // element is preserved even where the rate rounds (i.e., `2³²` rather than `2⁴⁰` just below a rate of one),
+        // and a rate of one drops everything without a scale.
+        assert_eq!(DropoutOperation::new(1.0 - 2.0f64.powi(-40), Axes::default()).scale(), 2.0f64.powi(32));
+        assert_eq!(DropoutOperation::new(0.0, Axes::default()).scale(), 1.0);
+        assert!(!DropoutOperation::new(0.5, Axes::default()).drops_everything());
+        assert!(DropoutOperation::new(1.0, Axes::default()).drops_everything());
+        assert_eq!(DropoutOperation::new(1.0, Axes::default()).scale(), 0.0);
+
         // Rates compare and hash bitwise, so that operations are faithful keys of their attributes.
         let zero = DropoutOperation::new(0.0, Axes::default());
         let negative_zero = DropoutOperation::new(-0.0, Axes::default());
@@ -3253,12 +3305,12 @@ mod tests {
                 output_types = [ArrayType::new_static(DataType::C64, [2])],
             }],
         );
-        for rate in [1.0, -0.5, f64::NAN, f64::INFINITY] {
+        for rate in [1.5, -0.5, f64::NAN, f64::INFINITY] {
             check_operation_type_inference!(
                 operation = DropoutOperation::new(rate, Axes::default()),
                 cases = [{
                     input_types = [input_type.clone()],
-                    error = format!("`dropout` requires a rate in `[0, 1)` but got `{rate:?}`"),
+                    error = format!("`dropout` requires a rate in `[0, 1]` but got `{rate:?}`"),
                 }],
             );
         }
@@ -3325,8 +3377,8 @@ mod tests {
 
     #[test]
     fn test_dropout_type_inference_manual_variation() {
-        // A state that varies over a manual mesh axis draws different masks on different devices, so the output varies
-        // over that axis even when the input is invariant. An input that is reduced over that axis is rejected.
+        // A state that varies over a manual mesh axis draws different masks on different devices, so the input must
+        // already vary over that axis, which the capabilities ensure (refer to `test_dropout_manual_variation`).
         let mesh = LogicalMesh::new(vec![MeshAxis::new("x", 2, MeshAxisType::Manual).unwrap()]).unwrap();
         let state_type = RandomAlgorithm::ThreeFry.state_type();
         let varying_state_type = state_type
@@ -3347,11 +3399,7 @@ mod tests {
             operation = DropoutOperation::new(0.5, Axes::default()),
             cases = [
                 {
-                    input_types = [input_type.clone(), varying_state_type.clone()],
-                    output_types = [varying_input_type.clone(), varying_state_type.clone()],
-                },
-                {
-                    input_types = [invariant_input_type.clone(), varying_state_type.clone()],
+                    input_types = [varying_input_type.clone(), varying_state_type.clone()],
                     output_types = [varying_input_type.clone(), varying_state_type.clone()],
                 },
                 {
@@ -3359,14 +3407,68 @@ mod tests {
                     output_types = [varying_input_type.clone(), state_type],
                 },
                 {
+                    input_types = [input_type.clone(), varying_state_type.clone()],
+                    error = format!(
+                        "`dropout` input type `{input_type}` must vary over the varying manual axes of its random \
+                         state, but it does not vary over [\"x\"]",
+                    ),
+                },
+                {
+                    input_types = [invariant_input_type.clone(), varying_state_type.clone()],
+                    error = format!(
+                        "`dropout` input type `{invariant_input_type}` must vary over the varying manual axes of its \
+                         random state, but it does not vary over [\"x\"]",
+                    ),
+                },
+                {
                     input_types = [reduced_input_type.clone(), varying_state_type],
                     error = format!(
-                        "`dropout` input type `{reduced_input_type}` cannot vary over the varying manual axes of its \
-                         random state: manual axis `x` cannot be both varying and reduced",
+                        "`dropout` input type `{reduced_input_type}` must vary over the varying manual axes of its \
+                         random state, but it does not vary over [\"x\"]",
                     ),
                 },
             ],
         );
+    }
+
+    #[test]
+    fn test_dropout_manual_variation() {
+        // Inside a manual region, an invariant input is made to vary over the axes of its state before dropout, so
+        // reverse mode reduces its cotangent back over those axes, through the capability and through direct binding
+        // of explicitly aligned inputs alike.
+        let mesh = LogicalMesh::new(vec![MeshAxis::new("x", 2, MeshAxisType::Manual).unwrap()]).unwrap();
+        let state_type = RandomAlgorithm::ThreeFry
+            .state_type()
+            .with_sharding(Sharding::replicated(mesh.clone(), 1).with_varying_manual_axes(["x"]).unwrap())
+            .unwrap();
+        let input_type = ArrayType::new_static(DataType::F32, [4]);
+        let varying_input_type = input_type
+            .clone()
+            .with_sharding(Sharding::replicated(mesh.clone(), 1).with_varying_manual_axes(["x"]).unwrap())
+            .unwrap();
+        for direct in [false, true] {
+            let (output_types, _) = TracingContext::<Array, ArrayOperation<Array>>::trace_with_named_axes(
+                |(input, state)| {
+                    let (output, pullback) = differentiate_at((input, state)).vjp(|(input, state)| {
+                        if direct {
+                            let input = input.parallel_vary("x")?;
+                            let operation = DropoutOperation::new(0.5, Axes::default());
+                            Ok(input.domain().bind(operation, Vec::new(), &[input.clone(), state])?.remove(0))
+                        } else {
+                            Ok(input.dropout(0.5, Some(&state))?.0)
+                        }
+                    })?;
+                    let (MaybeZero::Value(input_cotangent), _) = pullback.apply(output.clone())? else {
+                        panic!("the input cotangent of dropout is never a structural zero");
+                    };
+                    Ok((output, input_cotangent))
+                },
+                (input_type.clone(), state_type.clone()),
+                vec![("x".to_string(), NamedAxis::Mesh { axis: 0, size: 2, mesh: mesh.clone() })],
+            )
+            .unwrap();
+            assert_eq!(output_types, (varying_input_type.clone(), input_type.clone()));
+        }
     }
 
     #[test]
@@ -3462,11 +3564,18 @@ mod tests {
         assert_eq!(output.r#type().as_ref(), &unreduced_type);
         assert_eq!(output.elements::<f32>(), Ok(expected));
 
+        // Just below a rate of one, the single kept word of `2³²` scales its element by `2³²`, so expectations hold.
+        // A rate of one drops every element, including non-finite ones, and advances the state like any other rate.
+        let input = Array::vector(vec![1.0f32, f32::INFINITY, f32::NAN]).unwrap();
+        let (output, advanced_state) = input.dropout(1.0, Some(&state)).unwrap();
+        assert_eq!(output, Array::vector(vec![0.0f32; 3]).unwrap());
+        assert_eq!(advanced_state, input.dropout(0.5, Some(&state)).unwrap().1);
+
         // Invalid rates are rejected before drawing any words.
         assert!(matches!(
-            input.dropout(1.0, None),
+            input.dropout(1.5, None),
             Err(ProgramError::Type(error))
-                if error.to_string() == "`dropout` requires a rate in `[0, 1)` but got `1.0`",
+                if error.to_string() == "`dropout` requires a rate in `[0, 1]` but got `1.5`",
         ));
     }
 
@@ -3740,6 +3849,16 @@ mod tests {
         assert_eq!(outputs.len(), 1);
         assert_eq!(outputs[0].primal(), &input.dropout(0.5, None).unwrap().0);
         assert_eq!(outputs[0].tangent(), &MaybeZero::Value(tangent.dropout(0.5, None).unwrap().0));
+
+        // A rate of one drops every tangent element too.
+        let outputs = DropoutOperation::new(1.0, Axes::default())
+            .jvp(
+                &DifferentiationContext::fused(EagerContext::<Array, ArrayOperation<Array>>::new()),
+                &EmptyRegionDriver,
+                &[DifferentiationDual::new(input.clone(), MaybeZero::Value(tangent.clone())).unwrap()],
+            )
+            .unwrap();
+        assert_eq!(outputs[0].tangent(), &MaybeZero::Value(Array::vector(vec![0.0f32; 6]).unwrap()));
 
         // Reverse mode applies the same mask to the output cotangent.
         let (value, pullback) = differentiate_at((input.clone(), state.clone()))
