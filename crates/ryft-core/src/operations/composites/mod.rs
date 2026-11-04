@@ -197,14 +197,16 @@ mod tests {
     /// It has batching support, so that the bodies of batched calls can be specialized.
     pub(super) fn named_cube_definition(key: CompositeKey, traces: &Arc<AtomicUsize>) -> TestDefinition {
         let traces = traces.clone();
-        TestDefinition::new(key.name().to_owned()).with_batching_support().with_named(NamedComposite::new(
-            key,
-            |input_types: &[ArrayType]| Ok(input_types.to_vec()),
-            move |inputs: &[CustomRuleTracer<Array, ArrayOperation<Array>>]| {
-                traces.fetch_add(1, Ordering::SeqCst);
-                Ok(vec![inputs[0].clone() * inputs[0].clone() * inputs[0].clone()])
-            },
-        ))
+        TestDefinition::new(key.name().to_owned())
+            .with_batching_support()
+            .with_named_composite(NamedComposite::new(
+                key,
+                |input_types: &[ArrayType]| Ok(input_types.to_vec()),
+                move |inputs: &[CustomRuleTracer<Array, ArrayOperation<Array>>]| {
+                    traces.fetch_add(1, Ordering::SeqCst);
+                    Ok(vec![inputs[0].clone() * inputs[0].clone() * inputs[0].clone()])
+                },
+            ))
     }
 
     /// Returns the member-family counterpart of [`cube_definition`], whose rules are written against member tracers.

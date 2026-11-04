@@ -3430,14 +3430,11 @@ mod tests {
 
     #[test]
     fn test_custom_rule_reference_body() {
-        // The body is traced on the first request for each input types and cached, and every registration of the
-        // same named composite shares that cache.
+        // The body is traced on the first request for each input types and cached with the registration,
+        // which every reference to it shares.
         let key = CompositeKey::new("ryft.tests.body", 1);
         let traces = Arc::new(AtomicUsize::new(0));
-        let register = || {
-            CustomRuleRegistration::named(&key, &[], (), || Ok(named_cube_definition(key.clone(), &traces))).unwrap()
-        };
-        let registration = register();
+        let registration = CustomRuleRegistration::new(named_cube_definition(key, &traces));
         let scalar_type = ArrayType::scalar(DataType::F64);
         let body = registration.reference().body(std::slice::from_ref(&scalar_type)).unwrap();
         assert_eq!(
@@ -3450,7 +3447,7 @@ mod tests {
             "}
             .trim_end(),
         );
-        let repeated = register().reference().body(std::slice::from_ref(&scalar_type)).unwrap();
+        let repeated = registration.reference().body(std::slice::from_ref(&scalar_type)).unwrap();
         assert!(Arc::ptr_eq(&body, &repeated));
         assert_eq!(traces.load(Ordering::SeqCst), 1);
 
