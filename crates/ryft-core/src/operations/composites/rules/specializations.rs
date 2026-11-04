@@ -2061,7 +2061,29 @@ where
                 input_types.to_vec(),
                 self.definition().named_axes().to_vec(),
             )?;
-            Ok(Arc::new(align_rule_output_type_identities(self.name(), "body", program, &output_types, None)?))
+            let program = align_rule_output_type_identities(self.name(), "body", program, &output_types, None)?;
+
+            // Every call that shares this body has its output types, so an identity that the outputs define rather
+            // than derive from the inputs (e.g., a data-dependent extent) would be defined once per call.
+            let input_identities =
+                input_types.iter().flat_map(Type::identities).map(|(_, identity)| identity).collect::<Vec<_>>();
+            for (index, output_type) in output_types.iter().enumerate() {
+                if let Some((_, identity)) =
+                    output_type.identities().find(|(_, identity)| !input_identities.contains(identity))
+                {
+                    return Err(TypeError::invalid(format!(
+                        "named composite `{}` output {} has type `{}`, whose identity `{}` its inputs do not bind, \
+                         but the outputs of named composites must be functions of their inputs, because every call \
+                         shares the body",
+                        named_composite.key(),
+                        index,
+                        output_type,
+                        identity,
+                    ))
+                    .into());
+                }
+            }
+            Ok(Arc::new(program))
         })
     }
 }
@@ -2124,8 +2146,8 @@ mod tests {
     use pretty_assertions::assert_eq;
 
     use crate::arrays::{
-        Array, ArrayIrOperation, ArrayIrType, ArrayIrValue, ArrayOperation, ArrayType, DataType, DimensionBounds,
-        DimensionType, DimensionVariable, Shape, ShardingDimension,
+        Array, ArrayIrOperation, ArrayIrType, ArrayIrValue, ArrayOperation, ArrayType, DataType, Dimension,
+        DimensionBounds, DimensionType, DimensionVariable, Shape, ShardingDimension,
     };
     use crate::contexts::Context;
     use crate::operations::arithmetic::MulOperation;
@@ -2134,6 +2156,8 @@ mod tests {
     use crate::operations::composites::tests::{
         MemberDefinition, RuleCounters, member_cube_definition, named_cube_definition,
     };
+    use crate::operations::dimensions::dimension_from_scalar::DimensionFromScalar;
+    use crate::operations::manipulation::broadcasting::DynamicBroadcast;
     use crate::programs::ReferenceType;
     use crate::tests::hash_of;
 
@@ -3468,6 +3492,36 @@ mod tests {
         let vector_body = registration.reference().body(std::slice::from_ref(&vector_type)).unwrap();
         assert_eq!(vector_body.output_types(), vec![vector_type]);
         assert_eq!(traces.load(Ordering::SeqCst), 2);
+    }
+
+    #[test]
+    fn test_custom_rule_reference_body_rejects_output_identities_that_inputs_do_not_bind() {
+        // Every call shares the body, so its outputs cannot define identities (e.g., a data-dependent extent).
+        type IrTracer = CustomRuleTracer<ArrayIrValue<Array>, ArrayIrOperation<Array>>;
+        let key = CompositeKey::new("ryft.tests.body_data_dependent_extent", 1);
+        let output_types = |_: &[ArrayIrType]| -> Result<Vec<ArrayIrType>, ProgramError> {
+            let extent = DimensionVariable::new("extent", DimensionBounds::non_negative(Some(8)).unwrap());
+            Ok(vec![ArrayType::new(DataType::F32, Shape::new(vec![Dimension::Dynamic(extent)])).into()])
+        };
+        let body = |inputs: &[IrTracer]| -> Result<Vec<IrTracer>, ProgramError> {
+            let bounds = DimensionBounds::non_negative(Some(8)).unwrap();
+            let extent = inputs[1].to_dimension(DimensionVariable::new("extent", bounds))?;
+            Ok(vec![inputs[0].dynamic_broadcast(&[extent], &[])?])
+        };
+        let registration = CustomRuleRegistration::new(
+            CustomRuleDefinition::<ArrayIrValue<Array>, ArrayIrOperation<Array>>::new("filled")
+                .with_named_composite(NamedComposite::new(key, output_types, body)),
+        );
+        let input_types: Vec<ArrayIrType> =
+            vec![ArrayType::scalar(DataType::F32).into(), ArrayType::scalar(DataType::I64).into()];
+        assert!(matches!(
+            registration.reference().body(&input_types),
+            Err(ProgramError::Type(TypeError::Invalid { message }))
+                if message.starts_with(
+                    "named composite `ryft.tests.body_data_dependent_extent.v1` output 0 has type `f32[extent]`, \
+                     whose identity `extent` its inputs do not bind",
+                ),
+        ));
     }
 
     #[test]

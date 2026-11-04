@@ -175,7 +175,8 @@ pub const COMPOSITE_OPERATION_NAME: &str = "composite";
 /// documentation of [`Self::key`] for more information.
 ///
 /// Equality and hashing of calls with retained rules use the identity of the shared definition (i.e.,
-/// [`Arc::ptr_eq`](std::sync::Arc::ptr_eq)), while rendering prints its human-readable name.
+/// [`Arc::ptr_eq`](std::sync::Arc::ptr_eq)), while rendering prints the complete key of a named definition, or the
+/// human-readable name of any other definition.
 pub struct CompositeOperation<V: Typed + Parameter, O, S = CustomRuleReference<V, O>> {
     /// Number of leading inputs that parameterize the call without being differentiated, including the boundary inputs
     /// that the batching levels of a call with retained rules prepended to its inputs.

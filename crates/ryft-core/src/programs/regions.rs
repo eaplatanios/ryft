@@ -756,8 +756,9 @@ impl<'r, V: Typed + Parameter, O> IntoIterator for &'r RegionArena<V, O> {
 /// interned using [`ProgramBuilder::intern_callee`]), keyed by the root's [`RegionId`]. Importing such a root into
 /// another builder interns the same callee there instead of copying it, so the callee stays shared when a program
 /// that interns it is replayed or imported (e.g., when a transform replays a cached rule program that calls a named
-/// composite). Each entry holds its callee alive, so the provenance can never refer to a later allocation. Renamed
-/// or partially materialized arenas do not inherit these entries, so their roots are copied.
+/// composite). Each entry holds its callee alive, so the provenance can never refer to a later allocation. Renamed or
+/// rebuilt arenas (e.g., pruned or converted programs) do not inherit these entries, so their roots are copied, while
+/// programs materialized from a region through a builder record the callees that they import again.
 #[derive(Clone)]
 struct RegionArenaCallees<V: Typed + Parameter, O> {
     /// Interned roots and the callee [`Program`]s whose entry regions they are.

@@ -154,7 +154,7 @@ impl<V: Typed<Type: Eq + Hash> + Parameter, O, InputStructure, OutputStructure>
 
     /// Returns a reference to the definition registered for named calls with the provided flattened input types, input
     /// structure, and named axes, together with the output structure of those calls, if a call with that signature
-    /// was recorded recently with [`Self::record_input_types`].
+    /// was recorded recently with [`Self::record_output_structure`].
     fn get_by_input_types(
         &self,
         input_types: &[V::Type],
@@ -179,7 +179,7 @@ impl<V: Typed<Type: Eq + Hash> + Parameter, O, InputStructure, OutputStructure>
 
     /// Records the output structure and definition of named calls with the provided flattened input types and input
     /// structure, evicting the least recently recorded signature beyond [`NAMED_OUTPUT_STRUCTURE_CAPACITY`].
-    fn record_input_types(
+    fn record_output_structure(
         &self,
         input_types: &[V::Type],
         input_structure: &InputStructure,
@@ -374,8 +374,8 @@ where
     /// rule, whose primal closure is its body. The output type rule validates the types of a call's inputs and returns
     /// the types of its outputs, and it must agree with the body for every input it accepts.
     ///
-    /// Calls of a named function share one definition per call structure and visible named axes, together with its
-    /// rules and its specialization caches, for as long as the caller holds this [`Composite`] value (refer to
+    /// Calls of a named function share one definition per input and output structure and visible named axes, together
+    /// with its rules and its specialization caches, for as long as the caller holds this [`Composite`] value (refer to
     /// [`CustomRuleRegistration`]). The body is traced once per input types and cached with the definition, and each
     /// call attaches it as a shared region, which a staging program imports once however many calls attach it, rather
     /// than tracing the primal on every call. Callers should therefore construct a named function once and reuse it,
@@ -1512,7 +1512,7 @@ where
                             Ok::<_, ProgramError>(CustomRuleRegistration::new(definition))
                         },
                     )?;
-                        self.registrations.record_input_types(
+                        self.registrations.record_output_structure(
                             &flat_input_types,
                             &input_structure,
                             &output_structure,

@@ -92,9 +92,12 @@ impl Debug for CompositeAttribute {
 
 impl Display for CompositeAttribute {
     fn fmt(&self, formatter: &mut std::fmt::Formatter<'_>) -> std::fmt::Result {
+        // Renderings of named composite calls contain this representation and structural deduplication compares those
+        // renderings, so it distinguishes every attribute that equality distinguishes, including NaN payloads.
         match self {
             Self::Boolean(value) => write!(formatter, "{value}"),
             Self::Integer(value) => write!(formatter, "{value}"),
+            Self::Float(value) if value.is_nan() => write!(formatter, "nan({:#018x})", value.to_bits()),
             Self::Float(value) => write!(formatter, "{value:?}"),
             Self::DataType(value) => write!(formatter, "{value}"),
             Self::Sequence(values) => {
@@ -321,9 +324,9 @@ impl Display for CompositeKey {
 }
 
 /// Retained body `x ↦ y` of a [`NamedComposite`], which receives every input of a call and returns its outputs. The
-/// definition traces it lazily, once per specialization, only for the consumers that need it. Keeping operation bounds
-/// on [`Self::apply`] lets a definition retain the body without an `O: Operation` bound, avoiding a cycle with the
-/// operation family that contains its calls.
+/// definition traces it lazily, once per input types, when a call with those input types is first staged. Keeping
+/// operation bounds on [`Self::apply`] lets a definition retain the body without an `O: Operation` bound, avoiding a
+/// cycle with the operation family that contains its calls.
 ///
 /// Note that closures with the corresponding signature implement this trait automatically. Consumers can use
 /// [`NamedComposite::body`] to access the retained callback for custom tracing.
@@ -369,9 +372,12 @@ where
 /// a particular implementation encodes that choice in its key (e.g., as an attribute) for the backends that recognize
 /// it to enforce.
 ///
-/// The output type rule validates the inputs of calls and determines their outputs. The body is traced once per input
-/// types and cached with the definition, and calls attach that cached program as a shared region (refer to
-/// [`CompositeOperation`](crate::CompositeOperation)), so staging a call never traces the body again.
+/// The output type rule validates the inputs of calls and determines their outputs, whose types must be functions of
+/// the input types (i.e., they cannot define identities, such as data-dependent extents), because every call shares
+/// the body. The body is traced once per input types and cached with the definition, and calls attach that cached
+/// program as a shared region (refer to [`CompositeOperation`](crate::CompositeOperation)), so a call with cached input
+/// types never traces the body again. Input types include their type identities, so calls whose inputs have fresh
+/// symbolic extents (e.g., in a new trace) trace the body again for those identities.
 pub struct NamedComposite<V: Typed + Parameter, O> {
     /// Semantic identity.
     key: CompositeKey,
@@ -2028,6 +2034,11 @@ mod tests {
         assert_eq!(CompositeAttribute::Boolean(true).to_string(), "true");
         assert_eq!(CompositeAttribute::Integer(-3).to_string(), "-3");
         assert_eq!(CompositeAttribute::Float(0.25).to_string(), "0.25");
+        assert_eq!(CompositeAttribute::Float(-0.0).to_string(), "-0.0");
+        assert_eq!(
+            CompositeAttribute::Float(f64::from_bits(0x7ff8_0000_0000_0001)).to_string(),
+            "nan(0x7ff8000000000001)"
+        );
         assert_eq!(CompositeAttribute::from(None::<f64>).to_string(), "none");
         assert_eq!(CompositeAttribute::from(Some(3)).to_string(), "some(3)");
         assert_eq!(CompositeAttribute::from(Some((0.5f64, 7u64))).to_string(), "some([0.5, 7])");

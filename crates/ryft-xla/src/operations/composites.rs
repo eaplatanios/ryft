@@ -545,6 +545,17 @@ mod tests {
         assert_eq!(
             lower_named_calls(&program, None).unwrap(),
             indoc! {r#"
+                module {
+                  func.func private @ryft.tests.xla_named_square.v1(%arg0: tensor<4xf32>) -> tensor<4xf32> {
+                    %0 = stablehlo.add %arg0, %arg0 : tensor<4xf32>
+                    return %0 : tensor<4xf32>
+                  }
+                  func.func @main(%arg0: tensor<4xf32>) -> (tensor<4xf32>, tensor<4xf32>) {
+                    %0 = call @ryft.tests.xla_named_square.v1(%arg0) : (tensor<4xf32>) -> tensor<4xf32>
+                    %1 = call @ryft.tests.xla_named_square.v1(%arg0) : (tensor<4xf32>) -> tensor<4xf32>
+                    return %0, %1 : tensor<4xf32>, tensor<4xf32>
+                  }
+                }
             "#},
         );
 
@@ -554,6 +565,12 @@ mod tests {
         assert_eq!(
             lower_named_calls(&program, Some("cuda")).unwrap(),
             indoc! {r#"
+                module {
+                  func.func @main(%arg0: tensor<4xf32>) -> tensor<4xf32> {
+                    %0 = stablehlo.add %arg0, %arg0 : tensor<4xf32>
+                    return %0 : tensor<4xf32>
+                  }
+                }
             "#},
         );
     }
@@ -739,6 +756,19 @@ mod tests {
         assert_eq!(
             lower_named_calls(&program, None).unwrap(),
             indoc! {r#"
+                module {
+                  func.func private @ryft.tests.xla_named_unshareable.v1(%arg0: tensor<4xf32>) -> tensor<4xf32> {
+                    %0 = stablehlo.add %arg0, %arg0 : tensor<4xf32>
+                    return %0 : tensor<4xf32>
+                  }
+                  func.func @main(%arg0: tensor<4xf32>) -> (tensor<4xf32>, tensor<4xf32>, tensor<4xf32>, tensor<4xf32>) {
+                    %0 = stablehlo.multiply %arg0, %arg0 : tensor<4xf32>
+                    %1 = call @ryft.tests.xla_named_unshareable.v1(%arg0) : (tensor<4xf32>) -> tensor<4xf32>
+                    %2 = stablehlo.multiply %arg0, %arg0 : tensor<4xf32>
+                    %3 = call @ryft.tests.xla_named_unshareable.v1(%arg0) : (tensor<4xf32>) -> tensor<4xf32>
+                    return %0, %1, %2, %3 : tensor<4xf32>, tensor<4xf32>, tensor<4xf32>, tensor<4xf32>
+                  }
+                }
             "#},
         );
     }
