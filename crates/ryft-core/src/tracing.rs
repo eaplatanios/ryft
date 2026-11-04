@@ -1332,6 +1332,11 @@ impl<V: Value, O: Operation<Type = V::Type>> Program<V, O, Vec<V>, Vec<V>> {
         declared: &[V::Type],
         requested: &[V::Type],
     ) -> Result<Option<bool>, TypeError> {
+        // Identical signatures need neither a substitution nor a refinement (e.g., every call of a shared callee at the
+        // types that it was traced at), so they skip deriving and applying the identity renaming.
+        if declared == requested {
+            return Ok(Some(false));
+        }
         let Some(renaming) = Self::region_input_identity_renaming(declared, requested)? else {
             return Ok(None);
         };

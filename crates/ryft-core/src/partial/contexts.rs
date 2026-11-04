@@ -501,7 +501,7 @@ impl<C: Context> PartialEvaluationContext<C> {
             && (!effects.is_ordered() || !self.defer_ordered_effects.get())
     }
 
-    /// Applies the default partial-evaluation policy to the provided `operation`. When all inputs are known, the
+    /// Applies the default partial evaluation policy to the provided `operation`. When all inputs are known, the
     /// operation is [`bind`](Context::bind)ed in the known-side [`Context`] (i.e., interpreting it under an eager
     /// context and staging it into the outer program under a [`StagingContext`]), and its outputs become known trace
     /// values. When any input is residual, all inputs are materialized into the residual program and the operation is
@@ -557,6 +557,23 @@ impl<C: Context> PartialEvaluationContext<C> {
         if let Some(error) = self.error() {
             return Err(error);
         }
+        self.fold_or_residualize_operation(operation.into(), AttachedRegions::from(regions), inputs)
+    }
+
+    /// Folds or residualizes `operation` like [`Self::fold_or_residualize`], except that its regions are provided as
+    /// [`AttachedRegions`], so that shared callee regions (i.e., [`AttachedRegions::Callees`]) are folded by reference
+    /// instead of being materialized as owned [`Program`]s first. The regions are materialized only on the paths that
+    /// need owned programs (i.e., residualization and the eager retry of unsupported work).
+    #[inline]
+    pub fn fold_or_residualize_using_attached_regions<P: Into<C::Operation>>(
+        &self,
+        operation: P,
+        regions: AttachedRegions<'_, C::Constant, C::Operation>,
+        inputs: &[PartialEvaluationValue<C::Value>],
+    ) -> Result<Vec<PartialEvaluationValue<C::Value>>, ProgramError> {
+        if let Some(error) = self.error() {
+            return Err(error);
+        }
         self.fold_or_residualize_operation(operation.into(), regions, inputs)
     }
 
@@ -567,7 +584,7 @@ impl<C: Context> PartialEvaluationContext<C> {
     fn fold_or_residualize_operation(
         &self,
         operation: C::Operation,
-        regions: Vec<Program<C::Constant, C::Operation, Vec<C::Constant>, Vec<C::Constant>>>,
+        regions: AttachedRegions<'_, C::Constant, C::Operation>,
         inputs: &[PartialEvaluationValue<C::Value>],
     ) -> Result<Vec<PartialEvaluationValue<C::Value>>, ProgramError> {
         // Specifies whether this operation may stay in the residual program when an eager parent reports that it cannot
@@ -583,7 +600,7 @@ impl<C: Context> PartialEvaluationContext<C> {
         // Reference and region applications retain their existing binding and failure-ordering paths. Local
         // regionless folds resolve before substitution: an input replacement preserves that input's shared
         // materialization slot, and a singleton replacement becomes a known constant of the inferred output type.
-        if regions.is_empty() && !operation.effects().has_reference_declarations() {
+        if regions.region_count() == 0 && !operation.effects().has_reference_declarations() {
             let input_types = inputs.iter().map(|input| input.r#type().into_owned()).collect::<Vec<_>>();
             if !input_types.iter().any(Type::is_reference) {
                 let replacements = (|| -> Result<_, ProgramError> {
@@ -616,7 +633,7 @@ impl<C: Context> PartialEvaluationContext<C> {
         // Combine the operation's effects with those of its executable computation regions. Dormant derivative rules
         // and other non-computation regions do not contribute effects or deferred work when this operation runs.
         let summary = regions
-            .iter()
+            .regions()
             .enumerate()
             .filter(|(index, _)| operation.region_role(*index) == Some(RegionRole::Computation))
             .fold(operation.effects().summary(), |effects, (_, region)| effects.union(region.effects()));
@@ -625,18 +642,17 @@ impl<C: Context> PartialEvaluationContext<C> {
         // A region-carrying operation can be deferred like a regionless one (e.g., a loop whose body contains work that
         // the eager parent cannot execute) when neither its boundary nor any of its executable computation regions
         // involves references. Its effect summary above already includes those regions.
-        if !regions.is_empty() {
+        if regions.region_count() > 0 {
             let input_types = inputs.iter().map(|input| input.r#type().into_owned()).collect::<Vec<_>>();
-            let region_interfaces = regions.iter().map(Program::interface).collect::<Vec<_>>();
+            let region_interfaces = regions.region_interfaces();
             can_defer_unsupported = !input_types.iter().any(Type::is_reference)
                 && !operation.effects().has_reference_declarations()
                 && operation
                     .infer_output_types(&input_types, &region_interfaces)
                     .is_ok_and(|output_types| !output_types.iter().any(Type::is_reference))
-                && !regions.iter().enumerate().any(|(index, region)| {
+                && !regions.regions().enumerate().any(|(index, region)| {
                     operation.region_role(index) == Some(RegionRole::Computation)
                         && region
-                            .entry_region_ref()
                             .computation_regions()
                             .any(|region| region.atoms().iter().any(|atom| atom.r#type().is_reference()))
                 });
@@ -650,11 +666,11 @@ impl<C: Context> PartialEvaluationContext<C> {
                 && self.parent.is_eager()
                 && (inputs.iter().any(|input| input.r#type().is_reference())
                     || operation.effects().has_reference_declarations()
-                    || regions.iter().enumerate().any(|(index, region)| {
+                    || regions.regions().enumerate().any(|(index, region)| {
                         operation.region_role(index) == Some(RegionRole::Computation)
                     // Checked reference-effect endpoints are reference-typed, so inspecting atoms covers
                     // allocations, accesses, and aliases without rescanning their declarations.
-                    && region.entry_region_ref().computation_regions().any(|region| {
+                    && region.computation_regions().any(|region| {
                     region.atoms().iter().any(|atom| atom.r#type().is_reference())
                 })
                     }))
@@ -666,16 +682,17 @@ impl<C: Context> PartialEvaluationContext<C> {
             || !self.can_fold_effects(effects)
             || must_defer_references()
         {
-            return self.residualize_with_effects(operation, regions, inputs, effects);
+            return self.residualize_with_effects(operation, regions.region_programs(), inputs, effects);
         }
 
         let known = inputs.iter().map(|value| value.as_known().cloned().unwrap()).collect::<Vec<_>>();
         let outputs = if self.parent.is_eager() && can_defer_unsupported && effects.is_empty() {
             // Unsupported pure work can remain residual without repeating observable work. The validation above
             // excludes references; execution errors other than unsupported kernels remain failures.
-            match self.parent.bind(operation.clone(), regions.clone(), &known) {
+            let programs = regions.region_programs();
+            match self.parent.bind(operation.clone(), programs.clone(), &known) {
                 Err(ProgramError::UnsupportedOperation { .. }) => {
-                    return self.residualize_with_effects(operation, regions, inputs, effects);
+                    return self.residualize_with_effects(operation, programs, inputs, effects);
                 }
                 outputs => outputs?,
             }
