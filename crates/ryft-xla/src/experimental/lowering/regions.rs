@@ -15,6 +15,7 @@ use crate::experimental::lowering::{
     CollectiveLoweringState, EffectTokens, LowerableOperationFamily, XlaLowerer, lower_instruction,
 };
 use crate::experimental::ops::{FlatXlaProgram, XlaConstant, XlaProgram};
+use crate::operations::composites::lowers_without_regions;
 use crate::operations::jit_call::JitCallFunctionMap;
 
 #[cfg(test)]
@@ -130,11 +131,21 @@ fn lower_nested_region_inline<'b, 'c: 'b, 't: 'c, O: LowerableOperationFamily>(
                 .iter()
                 .map(|output| region.atoms()[output.index()].r#type().into_owned())
                 .collect::<Vec<_>>();
-            let regions = instruction
-                .regions()
-                .iter()
-                .map(|attached| RegionRef::new(region.arena(), *attached).map(RegionRef::to_program))
-                .collect::<Result<Vec<_>, ProgramError>>()?;
+            let regions = if lowers_without_regions(
+                instruction.operation(),
+                &input_types,
+                &output_types,
+                nested_functions,
+                collective_state.target_platform(),
+            ) {
+                Vec::new()
+            } else {
+                instruction
+                    .regions()
+                    .iter()
+                    .map(|attached| RegionRef::new(region.arena(), *attached).map(RegionRef::to_program))
+                    .collect::<Result<Vec<_>, ProgramError>>()?
+            };
             // Every StableHLO operation generated from this one Ryft instruction inherits the instruction's
             // provenance through the lowerer's shared location, with the ambient location as its base.
             let location = collective_state.instruction_location(context, instruction.provenance(), location);

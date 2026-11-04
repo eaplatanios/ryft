@@ -8,9 +8,9 @@
 //! [`shard_map`](mod@ryft_core::operations::sharding::shard_map) module of `ryft-core`, and its manual computations
 //! lower to Shardy `sdy.manual_computation` operations in the [`lowering`] module. A `shard_map` traced on its own is
 //! simply a traced function whose body binds one `shard_map` (e.g., through [`ShardMap`](ryft_core::ShardMap) on the
-//! context that [`trace_with_context`] passes to it), and lowering it with its boundary shardings as signature
-//! shardings (refer to [`TracedXlaProgram::to_mlir_module_with_signature_shardings`]) places its arguments and results
-//! as the boundary does.
+//! context that [`trace_with_context`] passes to it). The lowered function signature carries the sharding of every
+//! global input and output type that has one (refer to [`TracedXlaProgram::to_mlir_module`]), so tracing it over
+//! input types placed as its input shardings place them yields arguments and results placed as its boundary.
 //!
 //! Core failures use [`Error::Core`](crate::Error::Core), and concrete lowering failures have their own
 //! [`Error`](crate::Error) variants. Logical shard-map errors raised while tracing or lowering remain
@@ -168,7 +168,8 @@ where
         &self.global_output_types
     }
 
-    /// Renders a full StableHLO/Shardy MLIR module for this traced XLA program, without signature shardings (refer to
+    /// Renders a full StableHLO/Shardy MLIR module for this traced XLA program, whose function signature carries the
+    /// shardings of the global input and output types that have one (refer to
     /// [`Self::to_mlir_module_with_signature_shardings`]).
     ///
     /// # Parameters
@@ -182,10 +183,14 @@ where
         self.to_mlir_module_with_signature_shardings(function_name, None, None)
     }
 
-    /// Same as [`Self::to_mlir_module`] but additionally attaches `sdy.sharding` attributes to the function's arguments
-    /// and/or results when shardings are provided. This is what the XLA SPMD partitioner reads to drive boundary
-    /// slicing of per-device output buffers, including for shapes whose dimensions are not divisible by the partition
-    /// count (e.g., shape `[5]` on 2 partitions producing `[3]` + `[2]`).
+    /// Same as [`Self::to_mlir_module`] but with explicitly provided `sdy.sharding` attributes for the function's
+    /// arguments and/or results. This is what the XLA SPMD partitioner reads to drive boundary slicing of per-device
+    /// output buffers, including for shapes whose dimensions are not divisible by the partition count (e.g., shape
+    /// `[5]` on 2 partitions producing `[3]` + `[2]`). A side without explicit shardings carries the sharding of each
+    /// of its global types that has one, as the compilation path of [`XlaDomain`] does. Unlike that path, which places
+    /// a value whose type has no sharding as replicated because it lowers for concrete placed arrays, such a value is
+    /// left unannotated here, so that Shardy propagates its placement from the program (as JAX does for unspecified
+    /// shardings).
     ///
     /// The traced program is pruned before lowering (refer to
     /// [`Program::into_pruned`](ryft_core::Program::into_pruned)), which drops dead outputs of region-carrying
@@ -198,10 +203,10 @@ where
     /// # Parameters
     ///
     ///   - `function_name`: Symbol name to use for the outer `func.func`.
-    ///   - `argument_shardings`: Optional shardings to attach to each function argument. Must have the same length as
-    ///     the global input types, or be `None`.
-    ///   - `result_shardings`: Optional shardings to attach to each function result. Must have the same length as the
-    ///     global output types, or be `None`.
+    ///   - `argument_shardings`: Optional shardings to attach to each function argument instead of those of the global
+    ///     input types. Must have the same length as the global input types, or be `None`.
+    ///   - `result_shardings`: Optional shardings to attach to each function result instead of those of the global
+    ///     output types. Must have the same length as the global output types, or be `None`.
     ///
     /// # Errors
     ///
@@ -214,16 +219,27 @@ where
         argument_shardings: Option<&[Sharding]>,
         result_shardings: Option<&[Sharding]>,
     ) -> Result<String, Error> {
+        fn value_shardings<'t>(
+            shardings: Option<&[Sharding]>,
+            types: impl Iterator<Item = &'t ArrayType>,
+        ) -> Vec<Option<Sharding>> {
+            match shardings {
+                Some(shardings) => shardings.iter().cloned().map(Some).collect(),
+                None => types.map(|r#type| r#type.sharding().cloned()).collect(),
+            }
+        }
+
         let simplified_program = self.program.clone().into_pruned()?.simplified()?;
-        super::lowering::to_mlir_module_for_program(
+        Ok(super::lowering::lower_mlir_module_for_program_with_value_shardings(
             &simplified_program,
             &[],
             &self.global_input_types,
             &self.global_output_types,
             function_name,
-            argument_shardings,
-            result_shardings,
-        )
+            &value_shardings(argument_shardings, self.global_input_types.parameters()),
+            &value_shardings(result_shardings, self.global_output_types.parameters()),
+        )?
+        .stable_hlo)
     }
 }
 
@@ -404,7 +420,7 @@ mod tests {
             indoc! {r#"
                 module {
                   sdy.mesh @mesh = <["x"=4]>
-                  func.func @main(%arg0: tensor<8xf32>) -> tensor<8xf32> {
+                  func.func @main(%arg0: tensor<8xf32>) -> (tensor<8xf32> {sdy.sharding = #sdy.sharding<@mesh, [{"x"}]>}) {
                     %0 = stablehlo.sine %arg0 : tensor<8xf32>
                     %1 = sdy.sharding_constraint %0 <@mesh, [{"x"}]> : tensor<8xf32>
                     return %1 : tensor<8xf32>
@@ -439,7 +455,7 @@ mod tests {
             indoc! {r#"
                 module {
                   sdy.mesh @mesh = <["x"=4]>
-                  func.func @main(%arg0: tensor<8xf32>) -> tensor<1x8x1xf32> {
+                  func.func @main(%arg0: tensor<8xf32>) -> (tensor<1x8x1xf32> {sdy.sharding = #sdy.sharding<@mesh, [{}, {"x"}, {}]>}) {
                     %0 = sdy.sharding_constraint %arg0 <@mesh, [{"x"}]> : tensor<8xf32>
                     %1 = stablehlo.reshape %0 : (tensor<8xf32>) -> tensor<1x8x1xf32>
                     return %1 : tensor<1x8x1xf32>
@@ -481,7 +497,7 @@ mod tests {
             indoc! {r#"
                 module {
                   sdy.mesh @mesh = <["x"=2, "a"=2]>
-                  func.func @main(%arg0: tensor<8xf32>) -> tensor<8xf32> {
+                  func.func @main(%arg0: tensor<8xf32> {sdy.sharding = #sdy.sharding<@mesh, [{"x"}]>}) -> (tensor<8xf32> {sdy.sharding = #sdy.sharding<@mesh, [{"x"}]>}) {
                     %0 = sdy.sharding_constraint %arg0 <@mesh, [{"x", "a"}]> : tensor<8xf32>
                     return %0 : tensor<8xf32>
                   }
@@ -1020,7 +1036,7 @@ mod tests {
             indoc! {r#"
                 module {
                   sdy.mesh @mesh = <["x"=4]>
-                  func.func @main(%arg0: tensor<8xf32>) -> tensor<8xf32> {
+                  func.func @main(%arg0: tensor<8xf32>) -> (tensor<8xf32> {sdy.sharding = #sdy.sharding<@mesh, [{"x"}]>}) {
                     %0 = sdy.manual_computation(%arg0) in_shardings=[<@mesh, [{"x"}]>] out_shardings=[<@mesh, [{"x"}]>] manual_axes={"x"} (%arg1: tensor<2xf32>) {
                       %1 = "stablehlo.all_reduce"(%arg1) <{channel_handle = #stablehlo.channel_handle<handle = 1, type = 1>, replica_groups = dense<[[0, 1, 2, 3]]> : tensor<1x4xi64>, use_global_device_ids}> ({
                       ^bb0(%arg2: tensor<f32>, %arg3: tensor<f32>):
@@ -2690,7 +2706,7 @@ mod tests {
             indoc! {r#"
                 module {
                   sdy.mesh @mesh = <["x"=2]>
-                  func.func @main(%arg0: tensor<4xf32>) -> tensor<4xf32> {
+                  func.func @main(%arg0: tensor<4xf32>) -> (tensor<4xf32> {sdy.sharding = #sdy.sharding<@mesh, [{"x"}]>}) {
                     %0 = sdy.manual_computation(%arg0) in_shardings=[<@mesh, [{"x"}]>] out_shardings=[<@mesh, [{"x"}]>] manual_axes={"x"} (%arg1: tensor<2xf32>) {
                       %1 = stablehlo.custom_call @ryft.test.add_one(%arg1) {api_version = 4 : i32, backend_config = {}, operand_layouts = [dense<0> : tensor<1xindex>], result_layouts = [dense<0> : tensor<1xindex>]} : (tensor<2xf32>) -> tensor<2xf32>
                       sdy.return %1 : tensor<2xf32>
@@ -2791,7 +2807,7 @@ mod tests {
             indoc! {r#"
                 module {
                   sdy.mesh @mesh = <["x"=4]>
-                  func.func @main(%arg0: tensor<8xf32>) -> tensor<8xf32> {
+                  func.func @main(%arg0: tensor<8xf32>) -> (tensor<8xf32> {sdy.sharding = #sdy.sharding<@mesh, [{"x"}]>}) {
                     %0 = sdy.manual_computation(%arg0) in_shardings=[<@mesh, [{"x"}]>] out_shardings=[<@mesh, [{"x"}]>] manual_axes={"x"} (%arg1: tensor<2xf32>) {
                       %1 = "stablehlo.all_reduce"(%arg1) <{channel_handle = #stablehlo.channel_handle<handle = 1, type = 1>, replica_groups = dense<[[0, 1, 2, 3]]> : tensor<1x4xi64>, use_global_device_ids}> ({
                       ^bb0(%arg2: tensor<f32>, %arg3: tensor<f32>):
@@ -2896,7 +2912,7 @@ mod tests {
             indoc! {r#"
                 module {
                   sdy.mesh @mesh = <["x"=4]>
-                  func.func @main(%arg0: tensor<8xf32>) -> tensor<8xf32> {
+                  func.func @main(%arg0: tensor<8xf32>) -> (tensor<8xf32> {sdy.sharding = #sdy.sharding<@mesh, [{"x"}]>}) {
                     %0 = sdy.manual_computation(%arg0) in_shardings=[<@mesh, [{"x"}]>] out_shardings=[<@mesh, [{"x"}]>] manual_axes={"x"} (%arg1: tensor<2xf32>) {
                       %1 = "stablehlo.all_reduce"(%arg1) <{channel_handle = #stablehlo.channel_handle<handle = 1, type = 1>, replica_groups = dense<[[0, 1, 2, 3]]> : tensor<1x4xi64>, use_global_device_ids}> ({
                       ^bb0(%arg2: tensor<f32>, %arg3: tensor<f32>):
@@ -2972,7 +2988,7 @@ mod tests {
             indoc! {r#"
                 module {
                   sdy.mesh @mesh = <["x"=4]>
-                  func.func @main(%arg0: tensor<3x8xf32>) -> tensor<3x8xf32> {
+                  func.func @main(%arg0: tensor<3x8xf32>) -> (tensor<3x8xf32> {sdy.sharding = #sdy.sharding<@mesh, [{}, {"x"}]>}) {
                     %0 = sdy.manual_computation(%arg0) in_shardings=[<@mesh, [{}, {"x"}]>] out_shardings=[<@mesh, [{}, {"x"}]>] manual_axes={"x"} (%arg1: tensor<3x2xf32>) {
                       %1 = "stablehlo.all_reduce"(%arg1) <{channel_handle = #stablehlo.channel_handle<handle = 1, type = 1>, replica_groups = dense<[[0, 1, 2, 3]]> : tensor<1x4xi64>, use_global_device_ids}> ({
                       ^bb0(%arg2: tensor<f32>, %arg3: tensor<f32>):
@@ -3122,7 +3138,7 @@ mod tests {
             indoc! {r#"
                 module {
                   sdy.mesh @mesh = <["x"=2, "y"=2]>
-                  func.func @main(%arg0: tensor<4x8xf32>) -> tensor<4x8xf32> {
+                  func.func @main(%arg0: tensor<4x8xf32> {sdy.sharding = #sdy.sharding<@mesh, [{"y"}, {"x"}]>}) -> (tensor<4x8xf32> {sdy.sharding = #sdy.sharding<@mesh, [{"y"}, {"x"}]>}) {
                     %0 = sdy.manual_computation(%arg0) in_shardings=[<@mesh, [{"y", ?}, {"x"}]>] out_shardings=[<@mesh, [{"y", ?}, {"x"}]>] manual_axes={"x"} (%arg1: tensor<4x4xf32>) {
                       %1 = "stablehlo.all_reduce"(%arg1) <{channel_handle = #stablehlo.channel_handle<handle = 1, type = 1>, replica_groups = dense<[[0, 2], [1, 3]]> : tensor<2x2xi64>, use_global_device_ids}> ({
                       ^bb0(%arg2: tensor<f32>, %arg3: tensor<f32>):
@@ -3266,7 +3282,7 @@ mod tests {
             indoc! {r#"
                 module {
                   sdy.mesh @mesh = <["x"=4]>
-                  func.func @main(%arg0: tensor<8xf32>) -> tensor<8xf32> {
+                  func.func @main(%arg0: tensor<8xf32>) -> (tensor<8xf32> {sdy.sharding = #sdy.sharding<@mesh, [{"x"}]>}) {
                     %0 = sdy.manual_computation(%arg0) in_shardings=[<@mesh, [{"x"}]>] out_shardings=[<@mesh, [{"x"}]>] manual_axes={"x"} (%arg1: tensor<2xf32>) {
                       %c = stablehlo.constant dense<true> : tensor<i1>
                       %1 = "stablehlo.if"(%c) ({
@@ -3370,7 +3386,7 @@ mod tests {
             indoc! {r#"
                 module {
                   sdy.mesh @mesh = <["x"=4]>
-                  func.func @main(%arg0: tensor<8xf32>) -> tensor<8xf32> {
+                  func.func @main(%arg0: tensor<8xf32>) -> (tensor<8xf32> {sdy.sharding = #sdy.sharding<@mesh, [{"x"}]>}) {
                     %0 = sdy.manual_computation(%arg0) in_shardings=[<@mesh, [{"x"}]>] out_shardings=[<@mesh, [{"x"}]>] manual_axes={"x"} (%arg1: tensor<2xf32>) {
                       %2 = "stablehlo.all_reduce"(%arg1) <{channel_handle = #stablehlo.channel_handle<handle = 1, type = 1>, replica_groups = dense<[[0, 1, 2, 3]]> : tensor<1x4xi64>, use_global_device_ids}> ({
                       ^bb0(%arg2: tensor<f32>, %arg3: tensor<f32>):
@@ -3458,7 +3474,7 @@ mod tests {
             indoc! {r#"
                 module {
                   sdy.mesh @mesh = <["x"=4]>
-                  func.func @main(%arg0: tensor<4xui64>) -> tensor<4xui64> {
+                  func.func @main(%arg0: tensor<4xui64>) -> (tensor<4xui64> {sdy.sharding = #sdy.sharding<@mesh, [{"x"}]>}) {
                     %0 = sdy.manual_computation(%arg0) in_shardings=[<@mesh, [{"x"}]>] out_shardings=[<@mesh, [{"x"}]>] manual_axes={"x"} (%arg1: tensor<1xui64>) {
                       %1 = stablehlo.partition_id : tensor<ui32>
                       %2 = stablehlo.convert %1 : (tensor<ui32>) -> tensor<ui64>
@@ -3682,7 +3698,7 @@ mod tests {
             indoc! {r#"
                 module {
                   sdy.mesh @mesh = <["x"=2, "y"=2]>
-                  func.func @main(%arg0: tensor<4xui64>) -> tensor<4xui64> {
+                  func.func @main(%arg0: tensor<4xui64>) -> (tensor<4xui64> {sdy.sharding = #sdy.sharding<@mesh, [{"x", "y"}]>}) {
                     %0 = sdy.manual_computation() in_shardings=[] out_shardings=[<@mesh, [{"x", "y"}]>] manual_axes={"x", "y"} () {
                       %1 = stablehlo.partition_id : tensor<ui32>
                       %2 = stablehlo.convert %1 : (tensor<ui32>) -> tensor<ui64>
@@ -3758,7 +3774,7 @@ mod tests {
             indoc! {r#"
                 module {
                   sdy.mesh @mesh = <["x"=2]>
-                  func.func @main(%arg0: tensor<4xf32>) -> tensor<8xf32> {
+                  func.func @main(%arg0: tensor<4xf32>) -> (tensor<8xf32> {sdy.sharding = #sdy.sharding<@mesh, [{"x"}]>}) {
                     %0 = sdy.manual_computation(%arg0) in_shardings=[<@mesh, [{"x"}]>] out_shardings=[<@mesh, [{"x"}]>] manual_axes={"x"} (%arg1: tensor<2xf32>) {
                       %c = stablehlo.constant dense<2> : tensor<i64>
                       %c_0 = stablehlo.constant dense<2> : tensor<i64>
@@ -4170,7 +4186,7 @@ mod tests {
             indoc! {r#"
                 module {
                   sdy.mesh @mesh = <["x"=2]>
-                  func.func @main(%arg0: tensor<8xf32>) -> tensor<4xf32> {
+                  func.func @main(%arg0: tensor<8xf32>) -> (tensor<4xf32> {sdy.sharding = #sdy.sharding<@mesh, [{"x"}]>}) {
                     %0 = sdy.manual_computation(%arg0) in_shardings=[<@mesh, [{"x"}]>] out_shardings=[<@mesh, [{"x"}]>] manual_axes={"x"} (%arg1: tensor<4xf32>) {
                       %c = stablehlo.constant dense<4> : tensor<i64>
                       %c_0 = stablehlo.constant dense<2> : tensor<i64>
@@ -4303,7 +4319,7 @@ mod tests {
             indoc! {r#"
                 module {
                   sdy.mesh @mesh = <["x"=2]>
-                  func.func @main(%arg0: tensor<6x2xf32>) -> tensor<6xf32> {
+                  func.func @main(%arg0: tensor<6x2xf32>) -> (tensor<6xf32> {sdy.sharding = #sdy.sharding<@mesh, [{"x"}]>}) {
                     %0 = sdy.manual_computation(%arg0) in_shardings=[<@mesh, [{"x"}, {}]>] out_shardings=[<@mesh, [{"x"}]>] manual_axes={"x"} (%arg1: tensor<3x2xf32>) {
                       %1 = "stablehlo.reduce_scatter"(%arg1) <{channel_handle = #stablehlo.channel_handle<handle = 1, type = 1>, replica_groups = dense<[[1, 0]]> : tensor<1x2xi64>, scatter_dimension = 1 : i64, use_global_device_ids}> ({
                       ^bb0(%arg2: tensor<f32>, %arg3: tensor<f32>):
@@ -4429,7 +4445,7 @@ mod tests {
             indoc! {r#"
                 module {
                   sdy.mesh @mesh = <["x"=2]>
-                  func.func @main(%arg0: tensor<4xf32>) -> tensor<4xf32> {
+                  func.func @main(%arg0: tensor<4xf32>) -> (tensor<4xf32> {sdy.sharding = #sdy.sharding<@mesh, [{"x"}]>}) {
                     %0 = sdy.manual_computation(%arg0) in_shardings=[<@mesh, [{"x"}]>] out_shardings=[<@mesh, [{"x"}]>] manual_axes={"x"} (%arg1: tensor<2xf32>) {
                       %1 = "stablehlo.collective_permute"(%arg1) <{channel_handle = #stablehlo.channel_handle<handle = 1, type = 1>, source_target_pairs = dense<[[0, 1], [1, 0]]> : tensor<2x2xi64>}> : (tensor<2xf32>) -> tensor<2xf32>
                       sdy.return %1 : tensor<2xf32>
@@ -4652,7 +4668,7 @@ mod tests {
             indoc! {r#"
                 module {
                   sdy.mesh @mesh = <["x"=2]>
-                  func.func @main(%arg0: tensor<8xf32>) -> tensor<8xf32> {
+                  func.func @main(%arg0: tensor<8xf32>) -> (tensor<8xf32> {sdy.sharding = #sdy.sharding<@mesh, [{"x"}]>}) {
                     %0 = sdy.manual_computation(%arg0) in_shardings=[<@mesh, [{"x"}]>] out_shardings=[<@mesh, [{"x"}]>] manual_axes={"x"} (%arg1: tensor<4xf32>) {
                       %1 = "stablehlo.all_to_all"(%arg1) <{channel_handle = #stablehlo.channel_handle<handle = 1, type = 1>, concat_dimension = 0 : i64, replica_groups = dense<[[0, 1]]> : tensor<1x2xi64>, split_count = 2 : i64, split_dimension = 0 : i64}> {use_global_device_ids} : (tensor<4xf32>) -> tensor<4xf32>
                       sdy.return %1 : tensor<4xf32>
@@ -4778,7 +4794,7 @@ mod tests {
             indoc! {r#"
                 module {
                   sdy.mesh @mesh = <["x"=2]>
-                  func.func @main(%arg0: tensor<2x6xf32>) -> (tensor<6x2xf32>, tensor<2x6xf32>) {
+                  func.func @main(%arg0: tensor<2x6xf32>) -> (tensor<6x2xf32> {sdy.sharding = #sdy.sharding<@mesh, [{"x"}, {}]>}, tensor<2x6xf32> {sdy.sharding = #sdy.sharding<@mesh, [{}, {"x"}]>}) {
                     %0:2 = sdy.manual_computation(%arg0) in_shardings=[<@mesh, [{}, {"x"}]>] out_shardings=[<@mesh, [{"x"}, {}]>, <@mesh, [{}, {"x"}]>] manual_axes={"x"} (%arg1: tensor<2x3xf32>) {
                       %1 = stablehlo.broadcast_in_dim %arg1, dims = [0, 1] : (tensor<2x3xf32>) -> tensor<2x3x1xf32>
                       %2 = "stablehlo.all_to_all"(%1) <{channel_handle = #stablehlo.channel_handle<handle = 1, type = 1>, concat_dimension = 2 : i64, replica_groups = dense<[[0, 1]]> : tensor<1x2xi64>, split_count = 2 : i64, split_dimension = 0 : i64}> {use_global_device_ids} : (tensor<2x3x1xf32>) -> tensor<1x3x2xf32>

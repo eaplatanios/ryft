@@ -1,4 +1,5 @@
 use std::borrow::Cow;
+use std::collections::hash_map::Entry;
 use std::collections::{HashMap, HashSet};
 use std::hash::Hash;
 use std::marker::PhantomData;
@@ -9,16 +10,17 @@ use ryft_core::macros::check_count;
 use ryft_core::{
     ArrayBatch, ArrayBatchingPolicy, ArrayIrBatch, ArrayIrBatchingPolicy, ArrayIrType, ArrayType, AttachedRegions,
     BatchAxis, BatchableOperation, BatchedProgram, BatchingContext, BatchingDriver, BatchingError, CaptureConstant,
-    Concretizable, Context, CotangentDestinations, DifferentiableOperation, DifferentiableType, DifferentiationContext,
-    DifferentiationDriver, DifferentiationDual, DifferentiationError, DifferentiationPolicy, InputRegionProvenance,
-    InterpretableOperation, InterpretationDriver, MaybeZero, Operation, OperationBoundaryPruning, OperationFormatter,
-    OutputRegionProvenance, Parameterized, PartialEvaluationContext, PartialEvaluationDriver, PartialEvaluationValue,
-    PartialValue, PartiallyEvaluatableOperation, ProgramBatchingOutputAxesPolicy, ProgramError,
-    ReferenceDischargeContext, ReferenceDischargeDriver, ReferenceDischargePolicy, ReferenceDischargeValue,
-    ReferenceDischargeableOperation, RegionDataFlow, RegionId, RegionInterface, RegionLiveness, RegionRef, RegionSlot,
-    RematerializationOptimizationBarrier, ShardMapOperation, StagedCallOperation, Tracer, TracingContext,
-    TransposableOperation, TranspositionContext, TranspositionDriver, Type, TypeError, TypeIdentityRenaming,
-    TypeRefinements, Typed, TypedProgram, Value, ValueProjection, ValueResolution, Zero,
+    CompositeKey, Concretizable, Context, CotangentDestinations, DifferentiableOperation, DifferentiableType,
+    DifferentiationContext, DifferentiationDriver, DifferentiationDual, DifferentiationError, DifferentiationPolicy,
+    InputRegionProvenance, InterpretableOperation, InterpretationDriver, MaybeZero, Operation,
+    OperationBoundaryPruning, OperationFormatter, OutputRegionProvenance, Parameterized, PartialEvaluationContext,
+    PartialEvaluationDriver, PartialEvaluationValue, PartialValue, PartiallyEvaluatableOperation,
+    ProgramBatchingOutputAxesPolicy, ProgramError, ReferenceDischargeContext, ReferenceDischargeDriver,
+    ReferenceDischargePolicy, ReferenceDischargeValue, ReferenceDischargeableOperation, RegionDataFlow, RegionId,
+    RegionInterface, RegionLiveness, RegionRef, RegionSlot, RematerializationOptimizationBarrier, ShardMapOperation,
+    StagedCallOperation, Tracer, TracingContext, TransposableOperation, TranspositionContext, TranspositionDriver,
+    Type, TypeError, TypeIdentityRenaming, TypeRefinements, Typed, TypedProgram, Value, ValueProjection,
+    ValueResolution, Zero,
 };
 use ryft_mlir::dialects::func;
 use ryft_mlir::{
@@ -30,6 +32,7 @@ use crate::experimental::lowering::regions::lower_nested_program_inline;
 use crate::experimental::lowering::types::lower_array_ir_type;
 use crate::experimental::lowering::{CollectiveLoweringState, EffectTokens};
 use crate::experimental::ops::{FlatXlaProgram, XlaConstant, XlaOperation, XlaProgram};
+use crate::operations::composites::NamedCompositeImplementation;
 use crate::operations::control_flow::lowered_effect_classes;
 use crate::{Error, LowerableOperation, LowerableOperationFamily, XlaDomain, XlaLowerer, XlaValue};
 
@@ -149,11 +152,40 @@ pub(crate) struct JitCallFunctionMap<O = XlaOperation> {
 
     /// Keys in first-occurrence order, so emitted symbol names and module layout are deterministic.
     pub(crate) order: Vec<JitCallProgramKey>,
+
+    /// Shared functions that implement the bodies of named composite calls, indexed by the calls' semantic identity
+    /// and then by their boundary, so that lowering a call finds its function without rendering or hashing its body.
+    named: HashMap<CompositeKey, Vec<NamedFunction>>,
+}
+
+/// Shared function that implements the body of the named composite calls with one boundary.
+pub(crate) struct NamedFunction {
+    /// Input types of the calls.
+    input_types: Vec<ArrayIrType>,
+
+    /// Output types of the calls, which are also the results of the function.
+    pub(crate) output_types: Vec<ArrayIrType>,
+
+    /// Symbol of the function.
+    pub(crate) symbol: String,
+}
+
+/// Semantic identity and boundary of the named composite calls that one shared function implements.
+#[derive(Clone, PartialEq, Eq, Hash)]
+struct NamedFunctionKey {
+    /// Semantic identity of the calls.
+    key: CompositeKey,
+
+    /// Input types of the calls.
+    input_types: Vec<ArrayIrType>,
+
+    /// Output types of the calls.
+    output_types: Vec<ArrayIrType>,
 }
 
 impl<O> Default for JitCallFunctionMap<O> {
     fn default() -> Self {
-        Self { functions: HashMap::new(), order: Vec::new() }
+        Self { functions: HashMap::new(), order: Vec::new(), named: HashMap::new() }
     }
 }
 
@@ -162,6 +194,26 @@ impl<O: LowerableOperationFamily> JitCallFunctionMap<O> {
     pub(crate) fn get(&self, program: &FlatXlaProgram<O>) -> Option<&JitCallFunction<O>> {
         self.functions.get(&jit_call_program_key(program)?)
     }
+
+    /// Returns the shared function that implements the body of the named composite calls of `key` at the provided
+    /// boundary, if one was emitted for them.
+    ///
+    /// The index assumes that named composite calls with equal keys and equal boundaries carry equal bodies, which
+    /// the contract of [`NamedComposite`](ryft_core::NamedComposite) requires but cannot verify (and which does not
+    /// hold across definitions with equal keys under different named axes, or in different operation families).
+    /// [`collect_jit_call_functions`] enforces it: a key and boundary whose calls carry different bodies is left out
+    /// of the index, so its calls look up their shared function by their own body (refer to [`Self::get`]).
+    pub(crate) fn named(
+        &self,
+        key: &CompositeKey,
+        input_types: &[ArrayIrType],
+        output_types: &[ArrayIrType],
+    ) -> Option<&NamedFunction> {
+        self.named
+            .get(key)?
+            .iter()
+            .find(|function| function.input_types == input_types && function.output_types == output_types)
+    }
 }
 
 /// Counts `jit_call` callee occurrences in `program`, covering nested computations at every depth: attached regions
@@ -169,42 +221,86 @@ impl<O: LowerableOperationFamily> JitCallFunctionMap<O> {
 /// so the walk descends region edges without materializing nested programs. Shard-map body regions are intentionally
 /// skipped: their `jit_call`s lower with shard-local types and always inline.
 ///
+/// The bodies of named composite calls count like callees (refer to
+/// [`NamedComposite`](ryft_core::NamedComposite)), unless a backend implementation replaces the call on
+/// `target_platform`, so that each specialization lowers to one shared function. Their calls share one interned body
+/// region per specialization, so each body is rendered once. `named` records the semantic identity and boundary
+/// of the calls that each counted body implements, and `names` the name of their definition.
+///
 /// `counts` accumulates the occurrence count and a representative materialized program per identity, `order` records
 /// keys in first-occurrence order, and `memo` caches the (possibly expensive) key computation per callee root
 /// [`RegionId`] — interned shared callees repeat their root region id, so each shared callee is rendered once.
 fn count_jit_calls<Input, Output, O: LowerableOperationFamily>(
     program: &XlaProgram<Input, Output, O>,
+    target_platform: Option<&str>,
     counts: &mut HashMap<JitCallProgramKey, (usize, FlatXlaProgram<O>)>,
     order: &mut Vec<JitCallProgramKey>,
     memo: &mut HashMap<RegionId, Option<JitCallProgramKey>>,
-) where
+    named: &mut HashMap<NamedFunctionKey, Option<JitCallProgramKey>>,
+    names: &mut HashMap<JitCallProgramKey, String>,
+) -> Result<(), Error>
+where
     Input: Parameterized<XlaConstant>,
     Output: Parameterized<XlaConstant>,
 {
+    #[allow(clippy::too_many_arguments)]
     fn walk<Input, Output, O: LowerableOperationFamily>(
         program: &XlaProgram<Input, Output, O>,
         region: RegionId,
+        target_platform: Option<&str>,
         counts: &mut HashMap<JitCallProgramKey, (usize, FlatXlaProgram<O>)>,
         order: &mut Vec<JitCallProgramKey>,
         memo: &mut HashMap<RegionId, Option<JitCallProgramKey>>,
+        named_calls: &mut NamedRegionCalls,
         visited: &mut HashSet<RegionId>,
-    ) where
+    ) -> Result<(), Error>
+    where
         Input: Parameterized<XlaConstant>,
         Output: Parameterized<XlaConstant>,
     {
         // Interned shared callees repeat their root region id; each region's instructions are walked once while
         // every referencing `jit_call` instruction still contributes one occurrence to the counts below.
         if !visited.insert(region) {
-            return;
+            return Ok(());
         }
-        for instruction in
-            program.region(region).expect("region ids in the arena are valid by construction").instructions()
-        {
+        let region_ref = program.region_ref(region).expect("region ids in the arena are valid by construction");
+        for instruction in region_ref.instructions() {
             if instruction.operation().projected_payload::<ShardMapOperation>().is_some() {
                 continue;
             }
             for &nested in instruction.regions() {
-                walk(program, nested, counts, order, memo, visited);
+                walk(program, nested, target_platform, counts, order, memo, named_calls, visited)?;
+            }
+
+            // Calls that a backend implementation replaces, and calls without a body, need no shared function. Calls that
+            // share an interned body region also share their key, boundary and backend selection, so only the first
+            // call of each region computes them, and the others only count.
+            if let Some((composite_key, implementation)) = instruction.operation().named_composite() {
+                let Some(&body_region) = instruction.regions().first() else {
+                    continue;
+                };
+                if let Some(&index) = named_calls.index.get(&body_region) {
+                    named_calls.calls[index].count += 1;
+                    continue;
+                }
+                let atom_types = |atoms: &[ryft_core::AtomId]| {
+                    atoms.iter().map(|atom| region_ref.atoms()[atom.index()].r#type().into_owned()).collect::<Vec<_>>()
+                };
+                let input_types = atom_types(instruction.inputs());
+                let output_types = atom_types(instruction.outputs());
+                let replaced = NamedCompositeImplementation::select(
+                    composite_key,
+                    implementation,
+                    &input_types,
+                    &output_types,
+                    target_platform,
+                )
+                .is_some();
+                let key =
+                    (!replaced).then(|| NamedFunctionKey { key: composite_key.clone(), input_types, output_types });
+                named_calls.index.insert(body_region, named_calls.calls.len());
+                named_calls.calls.push(NamedRegionCall { region: body_region, count: 1, key });
+                continue;
             }
             if instruction.operation().projected_payload::<JitCallOperation<ArrayIrType>>().is_some() {
                 let Some(&callee_region) = instruction.regions().first() else {
@@ -235,14 +331,82 @@ fn count_jit_calls<Input, Output, O: LowerableOperationFamily>(
                 entry.0 += 1;
             }
         }
+        Ok(())
     }
     let mut visited = HashSet::new();
-    walk(program, program.entry(), counts, order, memo, &mut visited);
+    let mut named_calls = NamedRegionCalls::default();
+    walk(program, program.entry(), target_platform, counts, order, memo, &mut named_calls, &mut visited)?;
+
+    // Each named composite body region is rendered and counted once, with the number of calls that share it.
+    for call in named_calls.calls {
+        let Some(named_key) = call.key else {
+            continue;
+        };
+        let key = memo
+            .entry(call.region)
+            .or_insert_with(|| {
+                jit_call_region_key(
+                    program.region_ref(call.region).expect("composite regions are validated at build time"),
+                )
+            })
+            .clone();
+        let Some(key) = key else {
+            continue;
+        };
+        let entry = counts.entry(key.clone()).or_insert_with(|| {
+            order.push(key.clone());
+            (0, program.region_ref(call.region).expect("composite regions are validated at build time").to_program())
+        });
+        entry.0 += call.count;
+        names
+            .entry(key.clone())
+            .or_insert_with(|| format!("{}.v{}", named_key.key.name(), named_key.key.version()));
+
+        // Calls with equal keys and boundaries but different bodies must not share an index entry, because lowering
+        // would then call one body's function for the other's calls. Such a conflict is recorded as `None` and left
+        // out of the index.
+        match named.entry(named_key) {
+            Entry::Vacant(entry) => {
+                entry.insert(Some(key));
+            }
+            Entry::Occupied(mut entry) => {
+                if entry.get().as_ref() != Some(&key) {
+                    entry.insert(None);
+                }
+            }
+        }
+    }
+    Ok(())
+}
+
+/// Named composite calls found by [`count_jit_calls`], grouped by the interned body region that they share.
+#[derive(Default)]
+struct NamedRegionCalls {
+    /// Position of each body region in [`Self::calls`].
+    index: HashMap<RegionId, usize>,
+
+    /// Body regions in first-occurrence order.
+    calls: Vec<NamedRegionCall>,
+}
+
+/// Named composite calls that share one interned body region.
+struct NamedRegionCall {
+    /// Body region of the calls.
+    region: RegionId,
+
+    /// Number of calls.
+    count: usize,
+
+    /// Semantic identity and boundary of the calls, or [`None`] when a backend implementation replaces them.
+    key: Option<NamedFunctionKey>,
 }
 
 /// Builds the [`JitCallFunctionMap`] for a module by emitting a shared private function for every `jit_call` callee
-/// that occurs at least twice (per [`JitCallProgramKey`] identity). Single-occurrence callees are left to inline, so
-/// modules without repeated calls lower exactly as before.
+/// that occurs at least twice (per [`JitCallProgramKey`] identity), and for every named composite body that no
+/// backend implementation replaces on `target_platform` and that occurs at least twice. Single-occurrence callees are
+/// left to inline, so modules without repeated calls lower exactly as before. A shared function first reached through
+/// named composite calls is named after the name and version of their definition (e.g., `ryft.example.v1`, with a
+/// numeric suffix for other specializations), which no `jit_call` or named-composition function name can match.
 ///
 /// # Errors
 ///
@@ -250,6 +414,7 @@ fn count_jit_calls<Input, Output, O: LowerableOperationFamily>(
 /// [`lowered_effect_classes`]).
 pub(crate) fn collect_jit_call_functions<Input, Output, O: LowerableOperationFamily>(
     program: &XlaProgram<Input, Output, O>,
+    target_platform: Option<&str>,
 ) -> Result<JitCallFunctionMap<O>, Error>
 where
     Input: Parameterized<XlaConstant>,
@@ -258,9 +423,12 @@ where
     let mut counts: HashMap<JitCallProgramKey, (usize, FlatXlaProgram<O>)> = HashMap::new();
     let mut order: Vec<JitCallProgramKey> = Vec::new();
     let mut memo: HashMap<RegionId, Option<JitCallProgramKey>> = HashMap::new();
-    count_jit_calls(program, &mut counts, &mut order, &mut memo);
+    let mut named = HashMap::new();
+    let mut names = HashMap::new();
+    count_jit_calls(program, target_platform, &mut counts, &mut order, &mut memo, &mut named, &mut names)?;
 
     let mut map = JitCallFunctionMap::default();
+    let mut name_counts = HashMap::<String, usize>::new();
     for key in order {
         let (count, program) = counts.remove(&key).expect("every ordered key was counted");
         // Effectful callees always inline (even when repeated) so their effectful instructions chain onto the
@@ -269,11 +437,29 @@ where
         if count < 2 || !lowered_effect_classes(&program)?.is_empty() {
             continue;
         }
-        let symbol = format!("jit_call_{}", map.order.len());
+        let symbol = match names.get(&key) {
+            Some(name) => {
+                let count = name_counts.entry(name.clone()).or_default();
+                *count += 1;
+                if *count == 1 { name.clone() } else { format!("{name}_{}", *count - 1) }
+            }
+            None => format!("jit_call_{}", map.order.len()),
+        };
         let input_types = program.input_types().into_owned();
         let output_types = program.output_types().into_owned();
         map.functions.insert(key.clone(), JitCallFunction { symbol, program, input_types, output_types });
         map.order.push(key);
+    }
+    for (named_key, key) in named {
+        let Some(function) = key.and_then(|key| map.functions.get(&key)) else {
+            continue;
+        };
+        let NamedFunctionKey { key: composite_key, input_types, output_types } = named_key;
+        let symbol = function.symbol.clone();
+        map.named
+            .entry(composite_key)
+            .or_default()
+            .push(NamedFunction { input_types, output_types, symbol });
     }
     Ok(map)
 }
@@ -380,31 +566,14 @@ pub(crate) fn lower_jit_call<'b, 'c: 'b, 't: 'c, O: LowerableOperationFamily>(
             // The `jit_call` operation's type inference already pins its operands to the callee input types, so a
             // matching arity is the only guard needed before emitting the symbol call; anything else inlines.
             if input_values.len() == function.input_types.len() {
-                let result_tensor_types = function
-                    .output_types
-                    .iter()
-                    .map(|r#type| lower_array_ir_type(r#type, context, location))
-                    .collect::<Result<Vec<_>, _>>()?;
-                let operation = block.append_operation(func::call(
-                    function.symbol.as_str(),
-                    func::CallProperties {
-                        arguments: input_values
-                            .iter()
-                            .map(|value| ValueAndAttributes { value: *value, attributes: None })
-                            .collect(),
-                        results: result_tensor_types
-                            .iter()
-                            .map(|tensor_type| TypeAndAttributes { r#type: tensor_type.as_ref(), attributes: None })
-                            .collect(),
-                        no_inline: false,
-                    },
+                return lower_shared_function_call(
+                    &function.symbol,
+                    &function.output_types,
+                    input_values,
+                    block,
+                    context,
                     location,
-                )?)?;
-                return Ok((0..function.output_types.len())
-                    .map(|index| {
-                        operation.result(index).expect("func.call should return one result per output").as_ref()
-                    })
-                    .collect());
+                );
             }
         }
     }
@@ -424,6 +593,39 @@ pub(crate) fn lower_jit_call<'b, 'c: 'b, 't: 'c, O: LowerableOperationFamily>(
         collective_state,
         effect_tokens,
     )
+}
+
+/// Calls the shared private `func.func` emitted for `function` with the provided operands, which must match its inputs.
+pub(crate) fn lower_shared_function_call<'b, 'c: 'b, 't: 'c>(
+    symbol: &str,
+    output_types: &[ArrayIrType],
+    input_values: &[ValueRef<'b, 'c, 't>],
+    block: &mut BlockRef<'b, 'c, 't>,
+    context: &'c MlirContext<'t>,
+    location: LocationRef<'c, 't>,
+) -> Result<Vec<ValueRef<'b, 'c, 't>>, Error> {
+    let result_tensor_types = output_types
+        .iter()
+        .map(|r#type| lower_array_ir_type(r#type, context, location))
+        .collect::<Result<Vec<_>, _>>()?;
+    let operation = block.append_operation(func::call(
+        symbol,
+        func::CallProperties {
+            arguments: input_values
+                .iter()
+                .map(|value| ValueAndAttributes { value: *value, attributes: None })
+                .collect(),
+            results: result_tensor_types
+                .iter()
+                .map(|tensor_type| TypeAndAttributes { r#type: tensor_type.as_ref(), attributes: None })
+                .collect(),
+            no_inline: false,
+        },
+        location,
+    )?)?;
+    Ok((0..output_types.len())
+        .map(|index| operation.result(index).expect("func.call should return one result per output").as_ref())
+        .collect())
 }
 
 /// Canonical operation name for [`JitCallOperation`].

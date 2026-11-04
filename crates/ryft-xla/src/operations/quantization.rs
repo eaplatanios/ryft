@@ -2,8 +2,8 @@ use std::collections::HashMap;
 
 use ryft_core::macros::check_count;
 use ryft_core::{
-    ArrayType, DataType, Dimension, DomainTracingContext, EmptyRegionDriver, MemberInterpretableOperation, Operation,
-    ProgramError, ScaledDotOperation, Shape, Value,
+    ArrayType, CompositeAttribute, CompositeKey, DataType, Dimension, DomainTracingContext, EmptyRegionDriver,
+    MemberInterpretableOperation, Operation, ProgramError, ScaledDotOperation, Shape, Value,
 };
 use ryft_mlir::dialects::stable_hlo;
 use ryft_mlir::dialects::stable_hlo::{CustomCallApiVersion, CustomCallMemoryLayouts};
@@ -15,7 +15,7 @@ use ryft_mlir::{
 use crate::experimental::domains::XlaTracer;
 use crate::experimental::lowering::CollectiveLoweringState;
 use crate::experimental::lowering::compositions::{
-    NamedCompositionAttribute, NamedCompositionKey, lower_decomposition_call, named_composition_input_types,
+    NamedCompositionKey, lower_decomposition_call, named_composition_input_types,
 };
 use crate::experimental::lowering::types::{
     lower_element_type, lower_f64_constant_splat, lower_physical_bound_value, lower_restore_dynamic_dimensions,
@@ -490,22 +490,18 @@ pub(crate) fn scaled_dot_composition_key(
 ) -> Result<NamedCompositionKey, Error> {
     let dimensions = operation.dimensions();
     Ok(NamedCompositionKey {
-        name: "xla.scaled_dot",
-        version: 0,
-        decomposition: "ryft.scaled_dot.v0",
-        attributes: vec![
-            (
+        composite: CompositeKey::new("xla.scaled_dot", 0)
+            .with_attribute(
                 "dimension_numbers",
-                NamedCompositionAttribute::AxisLists(vec![
+                CompositeAttribute::AxisLists(vec![
                     vec![
                         dimensions.lhs_contracting_dimensions().to_vec(),
                         dimensions.rhs_contracting_dimensions().to_vec(),
                     ],
                     vec![dimensions.lhs_batching_dimensions().to_vec(), dimensions.rhs_batching_dimensions().to_vec()],
                 ]),
-            ),
-            ("preferred_element_type", NamedCompositionAttribute::DataType(operation.accumulation_type())),
-        ],
+            )
+            .with_attribute("preferred_element_type", CompositeAttribute::DataType(operation.accumulation_type())),
         input_types: scaled_dot_composite_input_types(operation, input_types)?,
         output_types: output_types.to_vec(),
     })

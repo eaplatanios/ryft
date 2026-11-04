@@ -7,16 +7,18 @@
 
 use std::borrow::Cow;
 use std::fmt::{Display, Write};
+use std::hash::Hash;
 
 use ryft_core::operations::attention::AttentionConfiguration;
 use ryft_core::{
     Array, ArrayIrOperation, ArrayIrType, ArrayIrValue, ArrayOperation, ArrayReferenceTransform, ArraySliceAxis,
     ArrayType, ArrayTypeRefinements, Atom, COMPOSITE_OPERATION_NAME, COMPOSITE_TRANSPOSE_OPERATION_NAME,
-    CustomCallArrayAttribute, CustomCallAttribute, CustomCallOperation, Dimension, DimensionBounds,
-    DimensionFromScalar, DimensionFromScalarOperation, DimensionType, DimensionVariable, EagerContext, FlatProgram,
-    InputRegionProvenance, InstructionId, Operation, OperationFormatter, PadOperation, Placeholder, ProgramBuilder,
-    ProgramError, ReferenceAccessMode, ReferenceAccessOperation, ReferenceType, RegionInterface, RegionRef, RegionSlot,
-    Tracer, TracingContext, Type, TypeError, TypeIdentityRenaming, TypeRefinements, Typed, TypedProgram,
+    CompositeOperation, CustomCallArrayAttribute, CustomCallAttribute, CustomCallOperation, CustomRuleSource,
+    DifferentiableType, Dimension, DimensionBounds, DimensionFromScalar, DimensionFromScalarOperation, DimensionType,
+    DimensionVariable, EagerContext, FlatProgram, InputRegionProvenance, InstructionId, Operation, OperationFormatter,
+    PadOperation, Parameter, Placeholder, ProgramBuilder, ProgramError, ReferenceAccessMode, ReferenceAccessOperation,
+    ReferenceType, RegionInterface, RegionRef, RegionSlot, Tracer, TracingContext, Type, TypeError,
+    TypeIdentityRenaming, TypeRefinements, Typed, TypedProgram,
 };
 use thiserror::Error;
 
@@ -1069,6 +1071,29 @@ impl<Extension: Operation<Type = ArrayIrType>> KernelDefinition<Extension> {
         ))
     }
 
+    /// Encodes the semantic identity of a `composite` call with retained rules, which only a call of a named
+    /// definition has (refer to [`NamedComposite`](ryft_core::NamedComposite)): its key and implementation
+    /// requirement identify its rules across processes, and the derived rendering of its key encodes floating-point
+    /// attributes by their IEEE bits. Its body, if any, is encoded with the other regions of the kernel. Calls of other
+    /// definitions are rejected, because the identity of their rules is local to the process, and calls with attached
+    /// rules need no fields beyond their regions.
+    fn composite_semantic_fields<V: Typed<Type: DifferentiableType + Eq + Hash> + Parameter, O, S>(
+        key: &mut String,
+        operation: &CompositeOperation<V, O, S>,
+    ) -> Result<(), TypeError>
+    where
+        S: CustomRuleSource<V, O>,
+    {
+        let Some(rules) = operation.rules() else {
+            return Ok(());
+        };
+        let Some((composite, implementation)) = rules.named() else {
+            return Err(Self::retained_composite_encoding_error(COMPOSITE_OPERATION_NAME));
+        };
+        Self::semantic_field(key, &format!("named composite {composite:?} {implementation:?}"));
+        Ok(())
+    }
+
     /// Encodes the closed canonical portable payload family, with explicit eligibility for lossy/opaque forms.
     fn portable_semantic_fields(key: &mut String, operation: &ArrayIrOperation<Array>) -> Result<(), TypeError> {
         // Unlike the public Operation render contract, this closed structural representation includes typed variant
@@ -1087,9 +1112,7 @@ impl<Extension: Operation<Type = ArrayIrType>> KernelDefinition<Extension> {
                 ArrayOperation::DotProductAttentionBackward(operation) => {
                     Self::attention_semantic_fields(key, operation.configuration())
                 }
-                ArrayOperation::Composite(operation) if operation.rules().is_some() => {
-                    return Err(Self::retained_composite_encoding_error(COMPOSITE_OPERATION_NAME));
-                }
+                ArrayOperation::Composite(operation) => Self::composite_semantic_fields(key, operation)?,
                 ArrayOperation::CompositeTranspose(operation) if operation.rules().is_some() => {
                     return Err(Self::retained_composite_encoding_error(COMPOSITE_TRANSPOSE_OPERATION_NAME));
                 }
@@ -1188,16 +1211,11 @@ impl<Extension: Operation<Type = ArrayIrType>> KernelDefinition<Extension> {
                 | ArrayOperation::Guard(_)
                 | ArrayOperation::Cast(_)
                 | ArrayOperation::Print(_)
-                | ArrayOperation::Composite(_)
                 | ArrayOperation::LinearCall(_) => {}
             },
             ArrayIrOperation::CustomCall(operation) => Self::custom_call_semantic_fields(key, operation),
-            ArrayIrOperation::Composite(operation) if operation.rules().is_some() => {
-                return Err(Self::retained_composite_encoding_error(COMPOSITE_OPERATION_NAME));
-            }
-            ArrayIrOperation::LiftedComposite(_) => {
-                return Err(Self::retained_composite_encoding_error(COMPOSITE_OPERATION_NAME));
-            }
+            ArrayIrOperation::Composite(operation) => Self::composite_semantic_fields(key, operation)?,
+            ArrayIrOperation::LiftedComposite(operation) => Self::composite_semantic_fields(key, operation)?,
             ArrayIrOperation::CompositeTranspose(operation) if operation.rules().is_some() => {
                 return Err(Self::retained_composite_encoding_error(COMPOSITE_TRANSPOSE_OPERATION_NAME));
             }
@@ -1238,7 +1256,6 @@ impl<Extension: Operation<Type = ArrayIrType>> KernelDefinition<Extension> {
             | ArrayIrOperation::Condition(_)
             | ArrayIrOperation::While(_)
             | ArrayIrOperation::Scan(_)
-            | ArrayIrOperation::Composite(_)
             | ArrayIrOperation::LinearCall(_)
             | ArrayIrOperation::Assert(_)
             | ArrayIrOperation::Guard(_)
@@ -1257,10 +1274,11 @@ impl<Extension: Operation<Type = ArrayIrType>> KernelDefinition<Extension> {
 mod tests {
     use pretty_assertions::assert_eq;
     use ryft_core::{
-        ArrayIrOperation, ArrayOperation, ArrayReferenceTransformIndex, AtomId, CompositeJvpRule, CompositeOperation,
-        CompositeTransposeOperation, ConditionOperation, Context, CustomRuleDefinition, CustomRuleRegistration,
-        DataType, DimensionError, DimensionType, DimensionValue, EffectClasses, Layout, LogicalMesh, Memory, MeshAxis,
-        MeshAxisType, Placeholder, ProgramBuilder, ReferenceAddUpdateOperation, ReferenceAtomicAddUpdateOperation,
+        ArrayIrOperation, ArrayOperation, ArrayReferenceTransformIndex, AtomId, CompositeAttribute,
+        CompositeImplementation, CompositeJvpRule, CompositeKey, CompositeOperation, CompositeTransposeOperation,
+        ConditionOperation, Context, CustomRuleDefinition, CustomRuleRegistration, DataType, DimensionError,
+        DimensionType, DimensionValue, EffectClasses, Layout, LogicalMesh, Memory, MeshAxis, MeshAxisType,
+        NamedComposite, Placeholder, ProgramBuilder, ReferenceAddUpdateOperation, ReferenceAtomicAddUpdateOperation,
         ReferenceRead, ReferenceReadOperation, ReferenceWrite, ReferenceWriteOperation, RegionId, Shape,
         ShardMapBoundary, ShardMapOperation, Sharding, TiledLayout, TypedProgram, ZeroOperation,
     };
@@ -2540,6 +2558,49 @@ mod tests {
         assert_eq!(
             definition(ArrayIrOperation::CompositeTranspose(carrier), 0).semantic_key(),
             retained("composite_transpose"),
+        );
+
+        // Calls of named composites are encoded by their keys and requirements, so separately registered
+        // definitions with equal keys encode equally, in either family.
+        let named = |attribute: bool| {
+            let key = CompositeKey::new("ryft.tests.kernel_named", 1)
+                .with_attribute("flag", CompositeAttribute::Boolean(attribute));
+            CustomRuleRegistration::new(
+                CustomRuleDefinition::<ArrayIrValue<Array>, ArrayIrOperation<Array>>::new("named").with_named(
+                    NamedComposite::new(
+                        key,
+                        CompositeImplementation::Primal,
+                        |types: &[ArrayIrType]| Ok(types.to_vec()),
+                        |inputs: &[Tracer<TracingContext<ArrayIrValue<Array>, ArrayIrOperation<Array>>>]| {
+                            Ok(inputs.to_vec())
+                        },
+                    ),
+                ),
+            )
+        };
+        let named_key = |rules: &CustomRuleRegistration<ArrayIrValue<Array>, ArrayIrOperation<Array>>| {
+            definition(ArrayIrOperation::Composite(CompositeOperation::new(rules.reference())), 1).semantic_key()
+        };
+        let (first, second, other) = (named(true), named(true), named(false));
+        assert!(first.definition().id() != second.definition().id());
+        assert_eq!(named_key(&first).unwrap(), named_key(&second).unwrap());
+        assert!(named_key(&first).unwrap() != named_key(&other).unwrap());
+        let member_key = CompositeKey::new("ryft.tests.kernel_named_member", 1);
+        let member_rules = CustomRuleRegistration::new(
+            CustomRuleDefinition::<Array, ArrayOperation<Array>>::new("member").with_named(NamedComposite::new(
+                member_key,
+                CompositeImplementation::Primal,
+                |types: &[ArrayType]| Ok(types.to_vec()),
+                |inputs: &[Tracer<TracingContext<Array, ArrayOperation<Array>>>]| Ok(inputs.to_vec()),
+            )),
+        );
+        assert!(
+            definition(
+                ArrayIrOperation::from(ArrayOperation::Composite(CompositeOperation::new(member_rules.reference()))),
+                1,
+            )
+            .semantic_key()
+            .is_ok()
         );
 
         // A carrier with an attached backward rule is an unresolved reverse-mode obligation, so it has no encoding

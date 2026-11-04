@@ -7,7 +7,8 @@ use ryft_core::operations::attention::{
     dot_product_attention_backward_ir_composition, dot_product_attention_ir_composition,
 };
 use ryft_core::{
-    ArrayType, DataType, Dimension, DomainTracingContext, Operation, ProgramError, ProjectedValue, ReductionKind, Shape,
+    ArrayType, CompositeAttribute, CompositeKey, DataType, Dimension, DomainTracingContext, Operation, ProgramError,
+    ProjectedValue, ReductionKind, Shape,
 };
 use ryft_mlir::dialects::stable_hlo;
 use ryft_mlir::dialects::stable_hlo::{CustomCallApiVersion, CustomCallMemoryLayouts};
@@ -19,7 +20,7 @@ use ryft_mlir::{
 use crate::experimental::domains::XlaTracer;
 use crate::experimental::lowering::CollectiveLoweringState;
 use crate::experimental::lowering::compositions::{
-    NamedCompositionAttribute, NamedCompositionKey, lower_decomposition_call, named_composition_input_types,
+    NamedCompositionKey, lower_decomposition_call, named_composition_input_types,
 };
 use crate::experimental::lowering::types::{
     lower_f64_constant_splat, lower_physical_bound_value, lower_restore_dynamic_dimensions, lower_tensor_type,
@@ -84,32 +85,31 @@ pub(crate) fn attention_composition_key(
     let configuration = operation.configuration();
     let signature = operation.signature();
     NamedCompositionKey {
-        name: "ryft.dot_product_attention",
-        version: 0,
-        decomposition: "ryft.dot_product_attention.v0",
-        attributes: vec![
-            ("scale", NamedCompositionAttribute::OptionalFloat64(configuration.scale().map(f64::to_bits))),
-            ("causal", NamedCompositionAttribute::Boolean(configuration.causal())),
-            (
+        composite: CompositeKey::new("ryft.dot_product_attention", 0)
+            .with_attribute("scale", CompositeAttribute::OptionalFloat64(configuration.scale().map(f64::to_bits)))
+            .with_attribute("causal", CompositeAttribute::Boolean(configuration.causal()))
+            .with_attribute(
                 "local_window_left",
-                NamedCompositionAttribute::OptionalUnsigned(configuration.local_window().map(|window| window.0)),
-            ),
-            (
+                CompositeAttribute::OptionalUnsigned(configuration.local_window().map(|window| window.0)),
+            )
+            .with_attribute(
                 "local_window_right",
-                NamedCompositionAttribute::OptionalUnsigned(configuration.local_window().map(|window| window.1)),
-            ),
-            (
+                CompositeAttribute::OptionalUnsigned(configuration.local_window().map(|window| window.1)),
+            )
+            .with_attribute(
                 "dropout",
-                NamedCompositionAttribute::OptionalFloat64Unsigned(
+                CompositeAttribute::OptionalFloat64Unsigned(
                     configuration.dropout().map(|(rate, seed)| (rate.to_bits(), seed)),
                 ),
+            )
+            .with_attribute("residual", CompositeAttribute::Boolean(configuration.return_residual()))
+            .with_attribute("bias", CompositeAttribute::Boolean(signature.has_bias()))
+            .with_attribute("mask", CompositeAttribute::Boolean(signature.has_mask()))
+            .with_attribute("query_lengths", CompositeAttribute::Boolean(signature.has_query_sequence_lengths()))
+            .with_attribute(
+                "key_value_lengths",
+                CompositeAttribute::Boolean(signature.has_key_value_sequence_lengths()),
             ),
-            ("residual", NamedCompositionAttribute::Boolean(configuration.return_residual())),
-            ("bias", NamedCompositionAttribute::Boolean(signature.has_bias())),
-            ("mask", NamedCompositionAttribute::Boolean(signature.has_mask())),
-            ("query_lengths", NamedCompositionAttribute::Boolean(signature.has_query_sequence_lengths())),
-            ("key_value_lengths", NamedCompositionAttribute::Boolean(signature.has_key_value_sequence_lengths())),
-        ],
         input_types: input_types.to_vec(),
         output_types: output_types.to_vec(),
     }
@@ -124,31 +124,30 @@ pub(crate) fn attention_backward_composition_key(
     let configuration = operation.configuration();
     let signature = operation.signature();
     NamedCompositionKey {
-        name: "ryft.dot_product_attention_backward",
-        version: 0,
-        decomposition: "ryft.dot_product_attention_backward.v0",
-        attributes: vec![
-            ("scale", NamedCompositionAttribute::OptionalFloat64(configuration.scale().map(f64::to_bits))),
-            ("causal", NamedCompositionAttribute::Boolean(configuration.causal())),
-            (
+        composite: CompositeKey::new("ryft.dot_product_attention_backward", 0)
+            .with_attribute("scale", CompositeAttribute::OptionalFloat64(configuration.scale().map(f64::to_bits)))
+            .with_attribute("causal", CompositeAttribute::Boolean(configuration.causal()))
+            .with_attribute(
                 "local_window_left",
-                NamedCompositionAttribute::OptionalUnsigned(configuration.local_window().map(|window| window.0)),
-            ),
-            (
+                CompositeAttribute::OptionalUnsigned(configuration.local_window().map(|window| window.0)),
+            )
+            .with_attribute(
                 "local_window_right",
-                NamedCompositionAttribute::OptionalUnsigned(configuration.local_window().map(|window| window.1)),
-            ),
-            (
+                CompositeAttribute::OptionalUnsigned(configuration.local_window().map(|window| window.1)),
+            )
+            .with_attribute(
                 "dropout",
-                NamedCompositionAttribute::OptionalFloat64Unsigned(
+                CompositeAttribute::OptionalFloat64Unsigned(
                     configuration.dropout().map(|(rate, seed)| (rate.to_bits(), seed)),
                 ),
+            )
+            .with_attribute("bias", CompositeAttribute::Boolean(signature.has_bias()))
+            .with_attribute("mask", CompositeAttribute::Boolean(signature.has_mask()))
+            .with_attribute("query_lengths", CompositeAttribute::Boolean(signature.has_query_sequence_lengths()))
+            .with_attribute(
+                "key_value_lengths",
+                CompositeAttribute::Boolean(signature.has_key_value_sequence_lengths()),
             ),
-            ("bias", NamedCompositionAttribute::Boolean(signature.has_bias())),
-            ("mask", NamedCompositionAttribute::Boolean(signature.has_mask())),
-            ("query_lengths", NamedCompositionAttribute::Boolean(signature.has_query_sequence_lengths())),
-            ("key_value_lengths", NamedCompositionAttribute::Boolean(signature.has_key_value_sequence_lengths())),
-        ],
         input_types: input_types.to_vec(),
         output_types: output_types.to_vec(),
     }

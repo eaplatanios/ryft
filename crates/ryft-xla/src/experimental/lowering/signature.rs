@@ -339,19 +339,31 @@ impl XlaExecutableSignature {
         physical.extend(
             self.input_dimensions
                 .iter()
-                .map(|dimension| Sharding::replicated(shardings[dimension.logical_input_index].mesh().clone(), 0)),
+                .map(|dimension| extent_sharding(&shardings[dimension.logical_input_index])),
         );
         physical
     }
 
-    /// Projects logical output shardings and appends a replicated scalar sharding per hidden extent result, on the
-    /// mesh of the output that owns the extent.
-    pub(crate) fn physical_output_shardings(&self, shardings: &[Sharding]) -> Vec<Sharding> {
+    /// Projects optional logical input shardings like [`Self::physical_input_shardings`], leaving a hidden extent
+    /// argument unannotated when the argument that owns it is unannotated.
+    pub(crate) fn physical_optional_input_shardings(&self, shardings: &[Option<Sharding>]) -> Vec<Option<Sharding>> {
+        let mut physical = Self::project(&self.input_mapping, shardings);
+        physical.extend(
+            self.input_dimensions
+                .iter()
+                .map(|dimension| shardings[dimension.logical_input_index].as_ref().map(extent_sharding)),
+        );
+        physical
+    }
+
+    /// Projects optional logical output shardings and appends the sharding of each hidden extent result, which is
+    /// replicated on the mesh of the output that owns the extent, or absent when that output is unannotated.
+    pub(crate) fn physical_optional_output_shardings(&self, shardings: &[Option<Sharding>]) -> Vec<Option<Sharding>> {
         let mut physical = Self::project(&self.output_mapping, shardings);
         physical.extend(
             self.output_dimensions
                 .iter()
-                .map(|dimension| Sharding::replicated(shardings[dimension.logical_output_index].mesh().clone(), 0)),
+                .map(|dimension| shardings[dimension.logical_output_index].as_ref().map(extent_sharding)),
         );
         physical
     }
@@ -365,6 +377,11 @@ impl XlaExecutableSignature {
             .filter_map(|(physical_index, value)| physical_index.map(|_| value.clone()))
             .collect()
     }
+}
+
+/// Returns the sharding of a hidden extent scalar, which is replicated on the mesh of the value that owns the extent.
+fn extent_sharding(owner_sharding: &Sharding) -> Sharding {
+    Sharding::replicated(owner_sharding.mesh().clone(), 0)
 }
 
 #[cfg(test)]

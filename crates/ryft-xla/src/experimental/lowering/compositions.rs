@@ -2,7 +2,7 @@ use std::collections::{HashMap, HashSet};
 
 use ryft_core::operations::attention::{DotProductAttentionBackwardOperation, DotProductAttentionOperation};
 use ryft_core::{
-    ArrayIrType, ArrayType, DataType, Parameterized, ProgramError, RegionId, RegionRef,
+    ArrayIrType, ArrayType, CompositeKey, Parameterized, ProgramError, RegionId, RegionRef,
     RematerializationOptimizationBarrier, ScaledDotOperation, Typed, TypedProgram,
 };
 use ryft_mlir::dialects::func;
@@ -76,46 +76,11 @@ pub(crate) fn lower_decomposition_call<'b, 'c: 'b, 't: 'c>(
         .collect())
 }
 
-/// Lowering state consulted when lowering collectives: the module-scoped channel-id allocator (each channeled
-/// Typed attribute value that participates in named-composition identity.
-///
-/// This intentionally models only the structural values required by StableHLO named compositions. It is independent
-/// of any one Ryft operation family, so adding another named composition does not require a bespoke key type.
-#[derive(Clone, Debug, PartialEq, Eq, Hash)]
-pub(crate) enum NamedCompositionAttribute {
-    /// Nested axis lists, such as StableHLO dot dimension numbers.
-    AxisLists(Vec<Vec<Vec<usize>>>),
-
-    /// An array element type.
-    DataType(DataType),
-
-    /// Boolean configuration value.
-    Boolean(bool),
-
-    /// Optional bit-preserving `f64` configuration value.
-    OptionalFloat64(Option<u64>),
-
-    /// Optional non-negative integer configuration value.
-    OptionalUnsigned(Option<usize>),
-
-    /// Optional pair of a bit-preserving `f64` and an unsigned integer.
-    OptionalFloat64Unsigned(Option<(u64, u64)>),
-}
-
 /// Identity of one generated named-composition decomposition at a concrete typed boundary.
 #[derive(Clone, Debug, PartialEq, Eq, Hash)]
 pub(crate) struct NamedCompositionKey {
-    /// Stable semantic name consumed by the backend replacement pass.
-    pub(crate) name: &'static str,
-
-    /// Stable semantic version consumed by the backend replacement pass.
-    pub(crate) version: u32,
-
-    /// Stable identity of the typed program that defines the decomposition semantics.
-    pub(crate) decomposition: &'static str,
-
-    /// Canonically ordered semantic attributes.
-    pub(crate) attributes: Vec<(&'static str, NamedCompositionAttribute)>,
+    /// Semantic identity of the composition, whose name also names the emitted private function.
+    pub(crate) composite: CompositeKey,
 
     /// Logical operand types of the composition boundary.
     pub(crate) input_types: Vec<ArrayType>,
@@ -155,11 +120,10 @@ impl NamedCompositionFunctionMap {
         if self.functions.contains_key(&key) {
             return Ok(());
         }
-        let base_symbol = key.name.to_string();
-        let symbol = if self.order.iter().all(|existing| existing.name != key.name) {
-            base_symbol
-        } else {
-            format!("{base_symbol}_{}", self.order.iter().filter(|existing| existing.name == key.name).count())
+        let name = key.composite.name();
+        let symbol = match self.order.iter().filter(|existing| existing.composite.name() == name).count() {
+            0 => name.to_string(),
+            count => format!("{name}_{count}"),
         };
         self.functions.insert(key.clone(), NamedCompositionFunction { symbol, program: program()? });
         self.order.push(key);
@@ -357,7 +321,10 @@ mod tests {
     use std::cell::Cell;
 
     use pretty_assertions::assert_eq;
-    use ryft_core::{DomainTracingContext, LogicalMesh, MeshAxis, MeshAxisType, Shape, Sharding, ShardingDimension};
+    use ryft_core::{
+        CompositeAttribute, DataType, DomainTracingContext, LogicalMesh, MeshAxis, MeshAxisType, Shape, Sharding,
+        ShardingDimension,
+    };
 
     use crate::experimental::domains::{XlaDomain, XlaTracer};
 
@@ -400,10 +367,8 @@ mod tests {
         .unwrap();
         let program = program.simplified().unwrap();
         let key = NamedCompositionKey {
-            name: "downstream.example",
-            version: 1,
-            decomposition: "downstream.identity.v1",
-            attributes: vec![("enabled", NamedCompositionAttribute::Boolean(true))],
+            composite: CompositeKey::new("downstream.example", 1)
+                .with_attribute("enabled", CompositeAttribute::Boolean(true)),
             input_types: vec![boundary_type.clone()],
             output_types: vec![boundary_type],
         };

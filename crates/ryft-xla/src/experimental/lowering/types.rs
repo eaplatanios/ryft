@@ -476,9 +476,9 @@ where
     Ok(broadcast.result(0).expect("stablehlo.broadcast should return one result").as_ref())
 }
 
-/// Lowers a scalar `u64` constant. Shared by the ragged-dot group-interval arithmetic, the physical
-/// `parallel_ragged_all_to_all` lane arithmetic, and the [`AxisIndexOperation`](ryft_core::AxisIndexOperation)
-/// coordinate arithmetic.
+/// Lowers a scalar `u64` constant. Shared by the ragged-dot group-interval arithmetic, the
+/// `parallel_ragged_all_to_all` lane and batch-item arithmetic, and the
+/// [`AxisIndexOperation`](ryft_core::AxisIndexOperation) coordinate arithmetic.
 pub(crate) fn lower_u64_scalar_constant<'b, 'c: 'b, 't: 'c>(
     value: u64,
     block: &mut BlockRef<'b, 'c, 't>,

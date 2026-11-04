@@ -58,8 +58,9 @@ pub(crate) fn test_sharding(
 }
 
 /// Traces `function` as the body of one top-level `shard_map` (refer to [`ShardMap`]) over global inputs of
-/// `global_input_types` and lowers the traced program to a module whose `main` function signature carries the boundary
-/// shardings, which are `input_shardings` and `output_shardings` without their auto axes.
+/// `global_input_types` placed by `input_shardings` without their auto axes (i.e., as the boundary places them), and
+/// lowers the traced program to a module whose `main` function signature carries the shardings of its global input and
+/// output types, which are the boundary shardings.
 pub(crate) fn shard_map_module<F, Input, Output>(
     function: F,
     global_input_types: Input,
@@ -84,8 +85,14 @@ where
     let output_structure = output_shardings.parameter_structure();
     let input_shardings = input_shardings.into_parameters().collect::<Vec<_>>();
     let output_shardings = output_shardings.into_parameters().collect::<Vec<_>>();
-    let argument_shardings = input_shardings.iter().map(Sharding::without_auto_axes).collect::<Vec<_>>();
-    let result_shardings = output_shardings.iter().map(Sharding::without_auto_axes).collect::<Vec<_>>();
+    let global_input_types = Input::from_parameters(
+        input_structure.clone(),
+        global_input_types
+            .into_parameters()
+            .zip(&input_shardings)
+            .map(|(r#type, sharding)| r#type.with_sharding(sharding.without_auto_axes()))
+            .collect::<Result<Vec<_>, _>>()?,
+    )?;
     let traced: TracedXlaProgram<Input, Output> = trace_with_context(
         |context, inputs| {
             let outputs = context.shard_map(
@@ -103,7 +110,7 @@ where
         },
         global_input_types,
     )?;
-    traced.to_mlir_module_with_signature_shardings("main", Some(&argument_shardings), Some(&result_shardings))
+    traced.to_mlir_module("main")
 }
 
 /// Compilation options for an SPMD executable with `partition_count` partitions, partitioned by Shardy.

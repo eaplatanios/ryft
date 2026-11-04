@@ -390,6 +390,16 @@ pub trait LowerableOperation: Operation {
         input_types: &[Self::Type],
         output_types: &[Self::Type],
     ) -> Result<Vec<ValueRef<'b, 'c, 't>>, Error>;
+
+    /// Returns the semantic identity and implementation requirement of this operation if it is a call of a named
+    /// composite (refer to [`NamedComposite`](ryft_core::NamedComposite)), and [`None`] otherwise. Module-level
+    /// lowering passes use it to emit one shared function per specialization of a named composite body and to
+    /// skip the bodies that a backend implementation replaces. Families forward it to the variants that can hold such
+    /// calls, and the calls of a family that does not are lowered without sharing their bodies.
+    #[inline]
+    fn named_composite(&self) -> Option<(&ryft_core::CompositeKey, ryft_core::CompositeImplementation)> {
+        None
+    }
 }
 
 /// Operation families whose programs the XLA lowering entry points lower. Such a family lowers at [`ArrayIrType`],
@@ -603,6 +613,15 @@ impl LowerableOperation for DimensionOperation<DimensionValue> {
 }
 
 impl LowerableOperation for XlaOperation {
+    #[inline]
+    fn named_composite(&self) -> Option<(&ryft_core::CompositeKey, ryft_core::CompositeImplementation)> {
+        match self {
+            Self::Composite(operation) => operation.named_composite(),
+            Self::LiftedComposite(operation) => operation.named_composite(),
+            _ => None,
+        }
+    }
+
     fn lower<'b, 'c: 'b, 't: 'c, O: LowerableOperationFamily>(
         &self,
         lowerer: &mut XlaLowerer<'b, 'c, 't, O>,
@@ -952,8 +971,8 @@ pub(crate) fn serialize_lowered_module(
 ///
 /// When `argument_shardings` and/or `result_shardings` are provided, the corresponding `sdy.sharding` attribute is
 /// attached to each function argument or result, which drives per-device boundary slicing (including uneven splits)
-/// in the XLA SPMD partitioner. When they are `None`, the function signature has no sharding attributes, which is the
-/// form used by traced programs that do not participate in SPMD compilation.
+/// in the XLA SPMD partitioner. When they are `None`, the corresponding values carry no sharding attributes, and Shardy
+/// propagates their placement from the program.
 ///
 /// # Parameters
 ///
@@ -1025,6 +1044,49 @@ where
     ProgramOutput: Parameterized<XlaConstant>,
     S: AsRef<str>,
 {
+    let argument_count = capture_types.len() + global_input_types.parameter_count();
+    lower_mlir_module_for_program_with_effect_boundary(
+        program,
+        capture_types,
+        global_input_types,
+        global_output_types,
+        function_name,
+        &value_shardings(argument_shardings, argument_count),
+        &value_shardings(result_shardings, global_output_types.parameter_count()),
+        target_platform,
+        &[],
+        RaggedDotLoweringStrategy::default(),
+        false,
+    )
+}
+
+/// Lowers an arbitrary traced XLA program like [`lower_mlir_module_for_program`], but with one optional sharding per
+/// entry function argument (captures first) and per result, so that only the values whose sharding is known carry an
+/// `sdy.sharding` attribute, while Shardy propagates the placement of the others from the program.
+pub(crate) fn lower_mlir_module_for_program_with_value_shardings<
+    'o,
+    Input,
+    Output,
+    ProgramInput,
+    ProgramOutput,
+    S,
+    O: LowerableOperationFamily,
+>(
+    program: &XlaProgram<ProgramInput, ProgramOutput, O>,
+    capture_types: &[ArrayType],
+    global_input_types: &Input,
+    global_output_types: &Output,
+    function_name: S,
+    argument_shardings: &[Option<Sharding>],
+    result_shardings: &[Option<Sharding>],
+) -> Result<LoweredXlaModule, Error>
+where
+    Input: Parameterized<ArrayType>,
+    Output: Parameterized<ArrayType>,
+    ProgramInput: Parameterized<XlaConstant>,
+    ProgramOutput: Parameterized<XlaConstant>,
+    S: AsRef<str>,
+{
     lower_mlir_module_for_program_with_effect_boundary(
         program,
         capture_types,
@@ -1033,7 +1095,7 @@ where
         function_name,
         argument_shardings,
         result_shardings,
-        target_platform,
+        None,
         &[],
         RaggedDotLoweringStrategy::default(),
         false,
@@ -1077,19 +1139,29 @@ where
     ProgramOutput: Parameterized<XlaConstant>,
     S: AsRef<str>,
 {
+    let argument_count = capture_types.len() + global_input_types.parameter_count();
     lower_mlir_module_for_program_with_effect_boundary(
         program,
         capture_types,
         global_input_types,
         global_output_types,
         function_name,
-        argument_shardings,
-        result_shardings,
+        &value_shardings(argument_shardings, argument_count),
+        &value_shardings(result_shardings, global_output_types.parameter_count()),
         target_platform,
         reference_states,
         ragged_dot_lowering_strategy,
         true,
     )
+}
+
+/// Expands optional shardings of every value of a signature with `count` values into one optional sharding per value.
+/// Provided shardings are kept as they are, so that a count mismatch is still reported when the module is lowered.
+fn value_shardings(shardings: Option<&[Sharding]>, count: usize) -> Vec<Option<Sharding>> {
+    match shardings {
+        Some(shardings) => shardings.iter().cloned().map(Some).collect(),
+        None => vec![None; count],
+    }
 }
 
 /// Lowers the entry boundary, optionally exporting the runtime ordered-I/O chain.
@@ -1107,8 +1179,8 @@ fn lower_mlir_module_for_program_with_effect_boundary<
     global_input_types: &Input,
     global_output_types: &Output,
     function_name: S,
-    argument_shardings: Option<&[Sharding]>,
-    result_shardings: Option<&[Sharding]>,
+    argument_shardings: &[Option<Sharding>],
+    result_shardings: &[Option<Sharding>],
     target_platform: Option<&str>,
     reference_states: &[ExternalReferenceBinding],
     ragged_dot_lowering_strategy: RaggedDotLoweringStrategy,
@@ -1141,22 +1213,18 @@ where
             effects.contains(EffectClass::OrderedAssertion),
             !effects.contains(EffectClass::OrderedIo),
         );
-    if let Some(shardings) = argument_shardings
-        && shardings.len() != logical_argument_types.len()
-    {
+    if argument_shardings.len() != logical_argument_types.len() {
         return Err(Error::InvalidShardingCount {
             kind: "argument",
             expected: logical_argument_types.len(),
-            actual: shardings.len(),
+            actual: argument_shardings.len(),
         });
     }
-    if let Some(shardings) = result_shardings
-        && shardings.len() != global_output_types.len()
-    {
+    if result_shardings.len() != global_output_types.len() {
         return Err(Error::InvalidShardingCount {
             kind: "result",
             expected: global_output_types.len(),
-            actual: shardings.len(),
+            actual: result_shardings.len(),
         });
     }
     let mut aliases = HashMap::with_capacity(reference_states.len());
@@ -1215,10 +1283,8 @@ where
                     ),
                 });
             }
-            match (argument_shardings, result_shardings) {
-                (Some(argument_shardings), Some(result_shardings))
-                    if argument_shardings[logical_input_index] != result_shardings[logical_output_index] =>
-                {
+            match (&argument_shardings[logical_input_index], &result_shardings[logical_output_index]) {
+                (Some(argument_sharding), Some(result_sharding)) if argument_sharding != result_sharding => {
                     return Err(Error::InvalidReferenceStateAbi {
                         message: format!(
                             "state input {logical_input_index} and output {logical_output_index} must use the same \
@@ -1255,7 +1321,7 @@ where
     // Emit `sdy.mesh` declarations for any sharding referenced either by inner ops or by the
     // optional signature shardings, so the func attributes can refer to `@mesh`.
     let mut signature_mesh = None;
-    for sharding in argument_shardings.into_iter().flatten().chain(result_shardings.into_iter().flatten()) {
+    for sharding in argument_shardings.iter().chain(result_shardings).flatten() {
         signature_mesh = Some(match signature_mesh.take() {
             Some(existing_mesh) => merge_logical_meshes(&existing_mesh, sharding.mesh())?,
             None => sharding.mesh().clone(),
@@ -1282,7 +1348,7 @@ where
     // programs (identical transformer blocks, or the per-block primal and pullback programs produced by `grad`) lower
     // to one function plus N `func.call`s instead of N inlined copies. The map is empty for modules without repeated
     // calls, in which case every `jit_call` inlines exactly as before.
-    let nested_functions = Rc::new(collect_jit_call_functions(program)?);
+    let nested_functions = Rc::new(collect_jit_call_functions(program, target_platform)?);
     {
         let mut module_block = module.body()?;
         for key in &named_compositions.order {
@@ -1326,30 +1392,18 @@ where
     if signature.has_ordered_io() {
         physical_output_tensor_types.push(context.stable_hlo_token_type()?.as_ref());
     }
-    let mut argument_sharding_attributes = match argument_shardings {
-        Some(shardings) => {
-            let physical_shardings = signature.physical_input_shardings(shardings);
-            Some(
-                physical_shardings
-                    .iter()
-                    .map(|sharding| sharding.to_mlir(location))
-                    .collect::<Result<Vec<_>, _>>()?,
-            )
-        }
-        None => None,
-    };
-    let mut result_sharding_attributes = match result_shardings {
-        Some(shardings) => {
-            let physical_shardings = signature.physical_output_shardings(shardings);
-            Some(
-                physical_shardings
-                    .iter()
-                    .map(|sharding| sharding.to_mlir(location))
-                    .collect::<Result<Vec<_>, _>>()?,
-            )
-        }
-        None => None,
-    };
+    let mut argument_sharding_attributes = signature
+        .physical_optional_input_shardings(argument_shardings)
+        .iter()
+        .map(|sharding| sharding.as_ref().map(|sharding| sharding.to_mlir(location)).transpose())
+        .collect::<Result<Vec<_>, _>>()?;
+    let mut result_sharding_attributes = signature
+        .physical_optional_output_shardings(result_shardings)
+        .iter()
+        .map(|sharding| sharding.as_ref().map(|sharding| sharding.to_mlir(location)).transpose())
+        .collect::<Result<Vec<_>, _>>()?;
+    // The effect token of a signature side is annotated when any value of that side is, as each device threads its
+    // own token.
     if signature.has_ordered_io() && mesh.is_some() {
         let token_sharding = context.shardy_tensor_sharding(
             context.flat_symbol_ref_attribute(SHARDY_MESH_SYMBOL_NAME),
@@ -1358,11 +1412,10 @@ where
             &[],
             shardy::ReductionOperation::Sum,
         )?;
-        if let Some(shardings) = &mut argument_sharding_attributes {
-            shardings.push(token_sharding);
-        }
-        if let Some(shardings) = &mut result_sharding_attributes {
-            shardings.push(token_sharding);
+        for shardings in [&mut argument_sharding_attributes, &mut result_sharding_attributes] {
+            if shardings.iter().any(Option::is_some) {
+                shardings.push(Some(token_sharding));
+            }
         }
     }
     // Internal layout constraints do not constrain the executable ABI. Declare layouts on the physical boundary,
@@ -1374,7 +1427,7 @@ where
         .enumerate()
         .map(|(index, tensor_type)| {
             let mut attributes = HashMap::new();
-            if let Some(sharding) = argument_sharding_attributes.as_ref().and_then(|shardings| shardings.get(index)) {
+            if let Some(sharding) = argument_sharding_attributes.get(index).and_then(Option::as_ref) {
                 attributes.insert("sdy.sharding".into(), sharding.as_ref());
             }
             if let Some(r#type) = physical_argument_types.get(index).filter(|r#type| r#type.memory() != Memory::Device)
@@ -1404,7 +1457,7 @@ where
         .enumerate()
         .map(|(index, tensor_type)| {
             let mut attributes = HashMap::new();
-            if let Some(sharding) = result_sharding_attributes.as_ref().and_then(|shardings| shardings.get(index)) {
+            if let Some(sharding) = result_sharding_attributes.get(index).and_then(Option::as_ref) {
                 attributes.insert("sdy.sharding".into(), sharding.as_ref());
             }
             if let Some(r#type) = physical_output_types.get(index).filter(|r#type| r#type.memory() != Memory::Device) {
@@ -2019,11 +2072,21 @@ where
     // Every StableHLO operation generated from this one Ryft instruction inherits the instruction's provenance
     // through the lowerer's shared location, with the ambient location as its base.
     let location = collective_state.instruction_location(context, instruction.provenance(), location);
-    let regions = instruction
-        .regions()
-        .iter()
-        .map(|region| program.region_ref(*region).map(|region| region.to_program()))
-        .collect::<Result<Vec<_>, _>>()?;
+    let regions = if crate::operations::composites::lowers_without_regions(
+        instruction.operation(),
+        &input_types,
+        &output_types,
+        nested_functions,
+        collective_state.target_platform(),
+    ) {
+        Vec::new()
+    } else {
+        instruction
+            .regions()
+            .iter()
+            .map(|region| program.region_ref(*region).map(|region| region.to_program()))
+            .collect::<Result<Vec<_>, _>>()?
+    };
     let mut lowerer = XlaLowerer::new(*block, context, location)
         .with_regions(regions)
         .with_nested_functions(nested_functions.cloned())

@@ -70,12 +70,13 @@ pub use complex::{
 };
 pub use composites::{
     AccumulatingVjp, BatchedComposite, BroadcastInvariantBatching, BroadcastSensitiveBatching,
-    COMPOSITE_OPERATION_NAME, COMPOSITE_TRANSPOSE_OPERATION_NAME, Composite, CompositeBatching, CompositeCallContext,
-    CompositeConversion, CompositeJvp, CompositeJvpRule, CompositeOperation, CompositeTransposeOperation, CompositeVjp,
+    COMPOSITE_OPERATION_NAME, COMPOSITE_TRANSPOSE_OPERATION_NAME, Composite, CompositeAttribute, CompositeBatching,
+    CompositeBodyRule, CompositeCallContext, CompositeConversion, CompositeImplementation, CompositeJvp,
+    CompositeJvpRule, CompositeKey, CompositeOperation, CompositeTransposeOperation, CompositeVjp,
     CustomRuleDefinition, CustomRuleReference, CustomRuleRegistration, CustomRuleSource, CustomRuleTracer,
     CustomVjpOperation, DefaultBatching, DefaultJvp, DefaultVjp, ExplicitJvp, ExplicitVjp, JvpComposite, JvpFromPrimal,
-    LiftedCustomRules, SequentialBatching, SymbolicZeroJvp, SymbolicZeroVjp, UnavailableCustomRules, VjpComposite,
-    WeakCustomRuleReference, composite,
+    LiftedCustomRules, NamedComposite, SequentialBatching, SymbolicZeroJvp, SymbolicZeroVjp, UnavailableCustomRules,
+    VjpComposite, WeakCustomRuleReference, composite,
 };
 pub use constants::{
     CONSTANT_OPERATION_NAME, Constant, ConstantOperation, ConstantOperations, DimensionConstant, DynamicFill,
