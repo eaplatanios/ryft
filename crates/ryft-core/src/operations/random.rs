@@ -1105,8 +1105,6 @@ impl<
     }
 }
 
-// TODO(eaplatanios): Review from here onwards.
-
 /// Canonical operation name for [`DropoutOperation`].
 pub const DROPOUT_OPERATION_NAME: &str = "dropout";
 
@@ -1118,13 +1116,13 @@ pub const DROPOUT_OPERATION_NAME: &str = "dropout";
 /// Only the distribution of the dropout mask is specified, while the exact mask is implementation-defined, which lets
 /// backends use their own random streams (e.g., the fused dropout of cuDNN attention kernels):
 ///
-///   - **With a random state**, the mask is a deterministic function of the state, the mask shape (refer to
+///   - **With a random state**, the mask is a deterministic function of the state, the mask shape (i.e.,
 ///     [`mask_type`](Self::mask_type)), and the rate, and a backend never replaces this operation with a fused kernel
 ///     that draws its own mask.
 ///   - **Without a random state**, a backend may replace this operation, possibly together with the computation around
 ///     it, by a fused kernel that draws its own mask. Ryft's own implementations use a fixed state instead, and so
-///     every call with the same mask shape and rate applies the same mask (e.g., at every training step). Provide a
-///     state when fresh masks are needed.
+///     every call with the same mask shape and rate applies the same mask (e.g., at every training step). Provide
+///     a state when fresh masks are needed.
 ///
 /// Either way, every implementation draws its mask deterministically, so applying this operation to two arrays with the
 /// same mask shape applies the same mask to both. Differentiation relies on this, since the tangent of the output is
@@ -1250,6 +1248,7 @@ impl DropoutOperation {
 }
 
 impl PartialEq for DropoutOperation {
+    #[inline]
     fn eq(&self, other: &Self) -> bool {
         self.rate.to_bits() == other.rate.to_bits() && self.broadcast_axes == other.broadcast_axes
     }
@@ -1258,6 +1257,7 @@ impl PartialEq for DropoutOperation {
 impl Eq for DropoutOperation {}
 
 impl Hash for DropoutOperation {
+    #[inline]
     fn hash<H: Hasher>(&self, state: &mut H) {
         self.rate.to_bits().hash(state);
         self.broadcast_axes.hash(state);
@@ -1290,8 +1290,8 @@ impl Operation for DropoutOperation {
             [input_type, state_type] => (input_type, Some(state_type)),
             _ => {
                 return Err(TypeError::invalid(format!(
-                    "`{DROPOUT_OPERATION_NAME}` expects an input followed by an optional random state, but got {} \
-                     inputs",
+                    "`{DROPOUT_OPERATION_NAME}` expects an input followed by an optional random state, \
+                     but got {} inputs",
                     input_types.len(),
                 )));
             }
@@ -1321,12 +1321,14 @@ impl Operation for DropoutOperation {
                 sharding.dimensions().iter().any(|dimension| matches!(dimension, ShardingDimension::Sharded(_)))
             })
         };
+
         if is_sharded(&self.mask_type(input_type)?) || state_type.is_some_and(is_sharded) {
             return Err(TypeError::invalid(format!(
-                "`{DROPOUT_OPERATION_NAME}` supports sharding only along the broadcast axes of its input and never for \
-                 its random state, so apply it inside `shard_map` instead",
+                "`{DROPOUT_OPERATION_NAME}` supports sharding only along the broadcast axes of its input \
+                 and never for its random state, so apply it inside `shard_map` instead",
             )));
         }
+
         if let Some(state_type) = state_type {
             check_types!(@no_unreduced, DROPOUT_OPERATION_NAME, &[state_type]);
             RandomAlgorithm::from_state_type(state_type)?;
@@ -1337,10 +1339,12 @@ impl Operation for DropoutOperation {
         let Some(state_type) = state_type else {
             return Ok(vec![input_type.clone()]);
         };
+
         let Some(state_sharding) = state_type.sharding().filter(|sharding| !sharding.varying_manual_axes().is_empty())
         else {
             return Ok(vec![input_type.clone(), state_type.clone()]);
         };
+
         let mut output_sharding = match input_type.sharding() {
             Some(sharding) => sharding.clone(),
             None => Sharding::replicated(state_sharding.mesh().clone(), input_type.rank()),
@@ -1353,6 +1357,7 @@ impl Operation for DropoutOperation {
                      its random state: {error}",
                 ))
             })?;
+
         let output_type = input_type
             .clone()
             .with_sharding(output_sharding)
@@ -1439,6 +1444,7 @@ where
         let Some((input, state)) = inputs.split_first() else {
             return Err(ProgramError::InvalidInputCount { expected: 1, actual: 0 }.into());
         };
+
         if state.len() > 1 {
             return Err(ProgramError::InvalidInputCount { expected: 2, actual: inputs.len() }.into());
         }
@@ -1452,7 +1458,7 @@ where
                 .chain(state.map(|_| BatchAxis::replicated()))
                 .collect::<Vec<_>>();
             let Some(batch_axis) = input.batch_axis_position() else {
-                return Ok(self.interpret_with_batch_axes(context, inputs, &output_axes)?);
+                return self.interpret_with_batch_axes(context, inputs, &output_axes);
             };
             let broadcast_axes = self
                 .broadcast_axes
@@ -1462,17 +1468,17 @@ where
                 .map(|axis| if axis >= batch_axis { axis + 1 } else { axis })
                 .chain(std::iter::once(batch_axis))
                 .collect::<Vec<_>>();
-            return Ok(DropoutOperation::new(self.rate, broadcast_axes).interpret_with_batch_axes(
+            return DropoutOperation::new(self.rate, broadcast_axes).interpret_with_batch_axes(
                 context,
                 inputs,
                 &output_axes,
-            )?);
+            );
         }
 
-        // A mapped state is realigned to batch axis 0, the input is moved or broadcast to batch axis 0, and one
+        // A mapped state is realigned to batch axis `0`, the input is moved or broadcast to batch axis `0`, and one
         // carry-free scan is staged over both, whose body applies this same operation to one per-item input and state.
         // Iteration `i` therefore applies exactly the mask that state row `i` draws unbatched, and the scan stacks the
-        // per-item outputs and advanced states at batch axis 0. Binding the scan through the parent context lets an
+        // per-item outputs and advanced states at batch axis `0`. Binding the scan through the parent context lets an
         // enclosing batching context batch it structurally.
         let state = state.unwrap();
         let input_type = input.unbatched_type();
@@ -1577,26 +1583,23 @@ impl_differentiable_operation! {
 /// elements so that the expected value of every element is preserved. Each element of a random mask is kept with
 /// probability `1 - rate`, and the result multiplies every kept element by `1 / (1 - rate)`, rounded to the input data
 /// type, and sets every dropped element to zero (including non-finite ones). The elements along the broadcast axes
-/// share their mask element. This is the dropout of [Srivastava et al.][dropout], and the broadcast axes are the
-/// `broadcast_dims` of [`flax.linen.Dropout`][flax-dropout].
+/// share their mask element. This is the dropout of [Srivastava et al.](https://jmlr.org/papers/v15/srivastava14a.html)
+/// and the broadcast axes are the `broadcast_dims` of
+/// [`flax.linen.Dropout`](https://flax.readthedocs.io/en/latest/api_reference/flax.linen/layers.html#flax.linen.Dropout).
 ///
 /// Only the distribution of the mask is specified, while the exact mask is implementation-defined. With a random state,
 /// the mask is a deterministic function of the state, the shape of the input with every broadcast axis replaced by one,
-/// and the rate, and the advanced state is returned for drawing further random values. Without a random state,
-/// backends may replace the dropout, possibly together with the computation around it, by a fused kernel that draws
-/// its own mask (e.g., the fused dropout of cuDNN attention kernels), while Ryft's own implementations draw the mask
-/// from a fixed state, so that every call with the same mask shape and rate applies the same mask. Refer to
-/// [`DropoutOperation`] for how Ryft's implementations draw the mask and how dropout is batched and differentiated.
-/// Concrete [`Array`]s apply the dropout immediately, while context-carrying values bind a [`DropoutOperation`]
-/// through their own context.
+/// and the rate, and the advanced state is returned for drawing further random values. Without a random state, backends
+/// may replace the dropout, possibly together with the computation around it, by a fused kernel that draws its own mask
+/// (e.g., the fused dropout of cuDNN attention kernels), while Ryft's own implementations draw the mask from a fixed
+/// state, so that every call with the same mask shape and rate applies the same mask. Refer to [`DropoutOperation`]
+/// for how Ryft's implementations draw the mask and how dropout is batched and differentiated. Concrete [`Array`]s
+/// apply the dropout immediately, while context-carrying values bind a [`DropoutOperation`] through their own context.
 ///
 /// The universe parameter `T` defaults to the [`Capability`] universe of the implementor, so that homogeneous array
 /// values implement this capability for [`ArrayType`] and array IR values implement it for [`ArrayIrType`].
 ///
 /// Note that array IR values apply dropout through their array views.
-///
-/// [dropout]: https://jmlr.org/papers/v15/srivastava14a.html
-/// [flax-dropout]: https://flax.readthedocs.io/en/latest/api_reference/flax.linen/layers.html#flax.linen.Dropout
 ///
 /// # Example
 ///
@@ -1679,7 +1682,7 @@ impl Dropout for Array {
                 (RandomAlgorithm::ThreeFry, &fixed_state)
             }
         };
-        //
+
         // The mask is computed on views whose types carry neither the varying manual axes of the state, which the words
         // inherit from it, nor the pending reductions of the input, which dropout commutes with. The output then takes
         // the inferred type, which restores both.
@@ -3192,8 +3195,9 @@ mod tests {
         assert_eq!(
             DropoutOperation::new(0.5, [1]).mask_type(&input_type),
             Err(TypeError::invalid(format!(
-                "`dropout` requires static extents along the axes that are not broadcast axes, but axis 0 of \
-                 `{input_type}` has extent `{}`",
+                "`dropout` requires static extents along the axes that are not broadcast axes, \
+                 but axis 0 of `{}` has extent `{}`",
+                input_type,
                 input_type.dimension(0),
             ))),
         );
@@ -3262,8 +3266,8 @@ mod tests {
 
     #[test]
     fn test_dropout_type_inference_sharding() {
-        // A sharded mask would draw the same words on every shard, while sharded broadcast axes only replicate the
-        // mask.
+        // A sharded mask would draw the same words on every shard, while sharded broadcast axes
+        // only replicate the mask.
         let mesh = LogicalMesh::new(vec![MeshAxis::new("x", 2, MeshAxisType::Explicit).unwrap()]).unwrap();
         let sharded_type = ArrayType::new_static(DataType::F32, [4, 2])
             .with_sharding(
@@ -3292,8 +3296,8 @@ mod tests {
 
     #[test]
     fn test_dropout_type_inference_unreduced_axes() {
-        // For a fixed state, dropout commutes with the pending reduction of an unreduced input, which it keeps, while
-        // unreduced states are rejected.
+        // For a fixed state, dropout commutes with the pending reduction of an unreduced input, which it keeps,
+        // while unreduced states are rejected.
         let mesh = LogicalMesh::new(vec![MeshAxis::new("x", 2, MeshAxisType::Explicit).unwrap()]).unwrap();
         let unreduced_type = ArrayType::new_static(DataType::F32, [4])
             .with_sharding(Sharding::replicated(mesh.clone(), 1).with_unreduced_axes(["x"]).unwrap())
@@ -3388,7 +3392,7 @@ mod tests {
         let (output, output_state) = input.dropout(0.25, Some(&state)).unwrap();
         assert_eq!(output.elements::<f32>(), Ok(expected.clone()));
         assert_eq!(output_state, Some(advanced_state));
-        assert!(expected.iter().any(|element| *element == 0.0) && expected.iter().any(|element| *element != 0.0));
+        assert!(expected.contains(&0.0) && expected.iter().any(|element| *element != 0.0));
 
         // The same state always applies the same mask, while different states and algorithms apply different ones.
         assert_eq!(input.dropout(0.25, Some(&state)).unwrap().0, output);
@@ -3513,8 +3517,8 @@ mod tests {
 
     #[test]
     fn test_dropout_batching() {
-        // A replicated or absent state applies the same mask to every batch item, as unbatched dropout does, while a
-        // mapped state applies the mask of each item's own state.
+        // A replicated or absent state applies the same mask to every batch item, as unbatched dropout does,
+        // while a mapped state applies the mask of each item's own state.
         let first_state = threefry_state(42, 7);
         let second_state = threefry_state(3, 11);
         let first_input = Array::vector(vec![1.0f32, 2.0, 3.0, 4.0, 5.0, 6.0]).unwrap();
