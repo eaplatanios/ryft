@@ -1336,10 +1336,11 @@ where
     fn derived(&self, key: CustomRuleDerivedDefinitionKey) -> Result<Self, DifferentiationError> {
         // The member definition derives in its own family, and the derived rules follow the call like the member's
         // rules do. Unavailable rules stay unavailable, so the derived call reports the same error on its first
-        // request.
+        // request. A derived call computes a derivative rather than the named computation of its source, so it
+        // has no key, as for derived member definitions.
         match self {
             Self::Member(rules) => Ok(Self::Member(rules.derived(key)?)),
-            Self::Unavailable(rules) => Ok(Self::Unavailable(rules.clone())),
+            Self::Unavailable(rules) => Ok(Self::Unavailable(UnavailableCustomRules { key: None, ..rules.clone() })),
         }
     }
 }
@@ -3023,6 +3024,17 @@ mod tests {
         );
         assert!(matches!(derive(&unavailable), LiftedCustomRules::Unavailable(_)));
         assert_eq!(derive(&unavailable), unavailable);
+
+        // A derived call computes a derivative rather than the named computation, so it has no key.
+        let composite_key = CompositeKey::new("ryft.tests.lifted_custom_rules_derived", 1);
+        let named = CustomRuleRegistration::new(
+            named_cube_definition(composite_key.clone(), &Arc::new(AtomicUsize::new(0))).with_jvp_from_primal(),
+        );
+        let unavailable = LiftedCustomRules::<Array, ArrayOperation<Array>>::Unavailable(
+            UnavailableCustomRules::from_source(&named.reference()),
+        );
+        assert!(matches!(&unavailable, LiftedCustomRules::Unavailable(rules) if rules.key == Some(composite_key)));
+        assert!(matches!(derive(&unavailable), LiftedCustomRules::Unavailable(rules) if rules.key.is_none()));
     }
 
     #[test]

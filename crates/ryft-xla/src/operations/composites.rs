@@ -36,7 +36,8 @@ pub(crate) fn lowers_without_regions<O: LowerableOperationFamily>(
 /// platform that supports it. Implementations are selected from an explicit table by the name and version of the
 /// definition, together with the boundary of the call and the target platform, before anything is emitted, so that
 /// a call either lowers to its implementation or never touches one (i.e., declining emits nothing). A call that no
-/// implementation replaces lowers its body.
+/// implementation replaces lowers its body. Every implementation must validate the attributes of the key and the
+/// boundary that it supports and decline any other call, because its key alone does not fix them.
 pub(crate) enum NamedCompositeImplementation {
     /// Test implementation of `ryft.tests.xla_named_square` version 1 on CUDA, which squares its input.
     #[cfg(test)]
@@ -60,18 +61,19 @@ impl NamedCompositeImplementation {
     }
 
     /// Lowers one call with this implementation, returning one MLIR value per output.
+    #[cfg_attr(not(test), allow(unused_variables))]
     fn lower<'b, 'c: 'b, 't: 'c, O: LowerableOperationFamily>(
         &self,
-        _lowerer: &mut XlaLowerer<'b, 'c, 't, O>,
-        _input_values: &[ValueRef<'b, 'c, 't>],
+        lowerer: &mut XlaLowerer<'b, 'c, 't, O>,
+        input_values: &[ValueRef<'b, 'c, 't>],
     ) -> Result<Vec<ValueRef<'b, 'c, 't>>, Error> {
         match *self {
             #[cfg(test)]
             Self::TestSquare => {
-                let multiply = _lowerer.block.append_operation(ryft_mlir::dialects::stable_hlo::multiply(
-                    _input_values[0],
-                    _input_values[0],
-                    _lowerer.location,
+                let multiply = lowerer.block.append_operation(ryft_mlir::dialects::stable_hlo::multiply(
+                    input_values[0],
+                    input_values[0],
+                    lowerer.location,
                 )?)?;
                 Ok(vec![multiply.result(0).unwrap().as_ref()])
             }
@@ -114,7 +116,7 @@ where
                 .nested_functions
                 .as_ref()
                 .and_then(|functions| functions.named(key, &input_types, &output_types));
-            if let Some(function) = function.filter(|_| input_types.len() == input_values.len()) {
+            if let Some(function) = function {
                 return lower_shared_function_call(
                     &function.symbol,
                     &function.output_types,
@@ -202,18 +204,25 @@ where
 
 #[cfg(test)]
 mod tests {
+    use std::sync::Arc;
+
     use indoc::indoc;
     use pretty_assertions::assert_eq;
-    use ryft_core::{AddOperation, ArrayIrType, ArrayType, MulOperation, Placeholder, ProgramError};
+    use ryft_core::{
+        AddOperation, ArrayIrType, ArrayType, CompositeJvpRule, CompositeKey, CompositeOperation,
+        CompositeTransposeOperation, CustomRuleDefinition, CustomRuleRegistration, DimensionValue, MulOperation,
+        NamedComposite, Placeholder, PrintOperation, Program, ProgramError,
+    };
 
+    use crate::experimental::lowering::lower_mlir_module_for_program;
     use crate::experimental::lowering::tests::test_vector_type;
-    use crate::experimental::ops::{XlaConstant, XlaOperation, XlaProgramBuilder as ArrayIrXlaProgramBuilder};
+    use crate::experimental::ops::{
+        FlatXlaProgram, XlaConstant, XlaOperation, XlaProgramBuilder as ArrayIrXlaProgramBuilder,
+    };
     use crate::{Error, to_mlir_module_for_program};
 
     #[test]
     fn test_composite_lowering_inlines_only_the_primal_program() {
-        use ryft_core::{CompositeJvpRule, CompositeOperation, PrintOperation};
-
         // A retained `composite` call lowers only its primal program and threads its effects onto the enclosing
         // ordered-I/O chain, for every rule layout. Nothing from the user-supplied rule programs (marked here by the
         // multiplies on the tangent and cotangent sides) reaches the emitted module.
@@ -308,10 +317,6 @@ mod tests {
 
     #[test]
     fn test_custom_rule_lowering_inlines_only_the_primal_program() {
-        use ryft_core::{
-            CompositeOperation, CompositeTransposeOperation, CustomRuleDefinition, CustomRuleRegistration,
-        };
-
         // A custom rule call lowers only its primal program: its derivative rules are retained callbacks, not regions.
         let vector_type = test_vector_type(4);
         let rules = CustomRuleRegistration::new(CustomRuleDefinition::<XlaConstant, XlaOperation>::new("doubled"));
@@ -377,8 +382,6 @@ mod tests {
 
     #[test]
     fn test_composite_transpose_lowering_is_rejected() {
-        use ryft_core::CompositeTransposeOperation;
-
         // A composite transpose with an attached backward rule is reverse-mode-only and must be transposed away before
         // lowering, so lowering it is rejected.
         let vector_type = test_vector_type(4);
@@ -434,12 +437,10 @@ mod tests {
     /// Returns a program that applies `calls` named composite calls of `rules` to the same input, each attaching the
     /// interned `body`, and returns their outputs.
     fn named_calls_program(
-        rules: &ryft_core::CustomRuleRegistration<XlaConstant, XlaOperation>,
-        body: &std::sync::Arc<ryft_core::Program<XlaConstant, XlaOperation, Vec<XlaConstant>, Vec<XlaConstant>>>,
+        rules: &CustomRuleRegistration<XlaConstant, XlaOperation>,
+        body: &Arc<Program<XlaConstant, XlaOperation, Vec<XlaConstant>, Vec<XlaConstant>>>,
         calls: usize,
-    ) -> crate::experimental::ops::FlatXlaProgram {
-        use ryft_core::CompositeOperation;
-
+    ) -> FlatXlaProgram {
         let vector_type = test_vector_type(4);
         let mut builder = ArrayIrXlaProgramBuilder::new();
         let input = builder.add_input(vector_type.clone().into());
@@ -456,30 +457,24 @@ mod tests {
     }
 
     /// Returns a registration of a named composite with the provided key, whose body doubles its input.
-    fn named_rules(key: &str) -> ryft_core::CustomRuleRegistration<XlaConstant, XlaOperation> {
+    fn named_rules(key: &str) -> CustomRuleRegistration<XlaConstant, XlaOperation> {
         named_rules_with_version(key, 1)
     }
 
     /// Returns a named composite definition `x ↦ x + x` with the provided key name and version.
-    fn named_rules_with_version(
-        key: &str,
-        version: u32,
-    ) -> ryft_core::CustomRuleRegistration<XlaConstant, XlaOperation> {
-        use ryft_core::{CompositeKey, CustomRuleDefinition, NamedComposite};
-
+    fn named_rules_with_version(key: &str, version: u32) -> CustomRuleRegistration<XlaConstant, XlaOperation> {
         let key = CompositeKey::new(key.to_string(), version);
         let output_types = |types: &[ArrayIrType]| Ok(types.to_vec());
         let named = NamedComposite::new(key, output_types, |inputs| Ok(vec![inputs[0].clone() + inputs[0].clone()]));
-        ryft_core::CustomRuleRegistration::new(CustomRuleDefinition::new("doubled").with_named_composite(named))
+        CustomRuleRegistration::new(CustomRuleDefinition::new("doubled").with_named_composite(named))
     }
 
     /// Returns the program `x ↦ x + x` over the test vector type, shared as a named composite body.
-    fn doubled_body()
-    -> std::sync::Arc<ryft_core::Program<XlaConstant, XlaOperation, Vec<XlaConstant>, Vec<XlaConstant>>> {
+    fn doubled_body() -> Arc<Program<XlaConstant, XlaOperation, Vec<XlaConstant>, Vec<XlaConstant>>> {
         let mut builder = ArrayIrXlaProgramBuilder::new();
         let input = builder.add_input(test_vector_type(4).into());
         let output = builder.add_instruction(AddOperation::new(), Vec::new(), vec![input, input], None).unwrap()[0];
-        std::sync::Arc::new(builder.build(vec![output], vec![Placeholder], vec![Placeholder]).unwrap())
+        Arc::new(builder.build(vec![output], vec![Placeholder], vec![Placeholder]).unwrap())
     }
 
     /// Lowers `program`, whose outputs all have the test vector type, for `target_platform`.
@@ -489,17 +484,8 @@ mod tests {
     ) -> Result<String, Error> {
         let input_types = vec![test_vector_type(4)];
         let output_types = vec![test_vector_type(4); program.output_ids().len()];
-        crate::experimental::lowering::lower_mlir_module_for_program(
-            program,
-            &[],
-            &input_types,
-            &output_types,
-            "main",
-            None,
-            None,
-            target_platform,
-        )
-        .map(|module| module.stable_hlo)
+        lower_mlir_module_for_program(program, &[], &input_types, &output_types, "main", None, None, target_platform)
+            .map(|module| module.stable_hlo)
     }
 
     #[test]
@@ -556,18 +542,24 @@ mod tests {
                 }
             "#},
         );
-        assert!(lower_named_calls(&program, None).unwrap().contains("stablehlo.add"));
+        assert_eq!(
+            lower_named_calls(&program, None).unwrap(),
+            indoc! {r#"
+            "#},
+        );
 
         // Calls of definitions that no backend implementation recognizes lower their body on every target.
         let rules = named_rules("ryft.tests.xla_named_unrecognized");
         let program = named_calls_program(&rules, &body, 1);
-        assert!(lower_named_calls(&program, Some("cuda")).unwrap().contains("stablehlo.add"));
+        assert_eq!(
+            lower_named_calls(&program, Some("cuda")).unwrap(),
+            indoc! {r#"
+            "#},
+        );
     }
 
     #[test]
     fn test_named_composite_lowering_separates_conflicting_bodies() {
-        use ryft_core::CompositeOperation;
-
         // Two separately registered definitions share one key and boundary but carry different bodies (e.g., because
         // their named axes differ). Each call must still lower to the shared function of its own body.
         let first = named_rules("ryft.tests.xla_named_conflict");
@@ -577,7 +569,7 @@ mod tests {
             let mut builder = ArrayIrXlaProgramBuilder::new();
             let input = builder.add_input(test_vector_type(4).into());
             let output = builder.add_instruction(MulOperation::new(), Vec::new(), vec![input, input], None).unwrap()[0];
-            std::sync::Arc::new(builder.build(vec![output], vec![Placeholder], vec![Placeholder]).unwrap())
+            Arc::new(builder.build(vec![output], vec![Placeholder], vec![Placeholder]).unwrap())
         };
         let mut builder = ArrayIrXlaProgramBuilder::new();
         let input = builder.add_input(test_vector_type(4).into());
@@ -618,8 +610,6 @@ mod tests {
 
     #[test]
     fn test_named_composite_lowering_separates_bodies_calling_different_versions() {
-        use ryft_core::CompositeOperation;
-
         // Two definitions with one key have bodies that differ only in the version of the named composite that they
         // call. Their renderings include that version, so their bodies are not merged and each keeps its own call. The
         // nested calls of both versions have structurally equal bodies, which share one function named after the first.
@@ -631,7 +621,7 @@ mod tests {
             let regions = vec![builder.intern_callee(&inner_body, None).unwrap()];
             let operation = XlaOperation::Composite(CompositeOperation::new(inner.reference()));
             let output = builder.add_instruction(operation, regions, vec![input], None).unwrap()[0];
-            (inner, std::sync::Arc::new(builder.build(vec![output], vec![Placeholder], vec![Placeholder]).unwrap()))
+            (inner, Arc::new(builder.build(vec![output], vec![Placeholder], vec![Placeholder]).unwrap()))
         };
         let (_first_inner, first_body) = outer_body(1);
         let (_second_inner, second_body) = outer_body(2);
@@ -681,8 +671,6 @@ mod tests {
 
     #[test]
     fn test_named_composite_lowering_selects_backends_per_key_of_a_shared_body() {
-        use ryft_core::CompositeOperation;
-
         // Calls of two versions share one interned body region, but only the first version has a backend implementation
         // on CUDA. The second version's calls must still share a function of their own instead of following the first
         // version's selection.
@@ -717,6 +705,40 @@ mod tests {
                     return %0, %1, %2 : tensor<4xf32>, tensor<4xf32>, tensor<4xf32>
                   }
                 }
+            "#},
+        );
+    }
+
+    #[test]
+    fn test_named_composite_lowering_separates_bodies_that_cannot_be_shared() {
+        // Two definitions share one key and boundary, and the body of the first holds a constant, which structural
+        // deduplication cannot key. Its calls must inline their own body instead of calling the second body's function.
+        let first = named_rules("ryft.tests.xla_named_unshareable");
+        let second = named_rules("ryft.tests.xla_named_unshareable");
+        let unshareable = {
+            let mut builder = ArrayIrXlaProgramBuilder::new();
+            let input = builder.add_input(test_vector_type(4).into());
+            builder.add_constant(XlaConstant::Dimension(DimensionValue::constant(3).unwrap()));
+            let output = builder.add_instruction(MulOperation::new(), Vec::new(), vec![input, input], None).unwrap()[0];
+            Arc::new(builder.build(vec![output], vec![Placeholder], vec![Placeholder]).unwrap())
+        };
+        let doubled = doubled_body();
+        let mut builder = ArrayIrXlaProgramBuilder::new();
+        let input = builder.add_input(test_vector_type(4).into());
+        let outputs = [(&first, &unshareable), (&second, &doubled), (&first, &unshareable), (&second, &doubled)]
+            .into_iter()
+            .map(|(rules, body)| {
+                let operation = XlaOperation::Composite(CompositeOperation::new(rules.reference()));
+                let regions = vec![builder.intern_callee(body, None).unwrap()];
+                builder.add_instruction(operation, regions, vec![input], None).unwrap()[0]
+            })
+            .collect::<Vec<_>>();
+        let program = builder
+            .build::<Vec<XlaConstant>, Vec<XlaConstant>>(outputs, vec![Placeholder], vec![Placeholder; 4])
+            .unwrap();
+        assert_eq!(
+            lower_named_calls(&program, None).unwrap(),
+            indoc! {r#"
             "#},
         );
     }

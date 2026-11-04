@@ -1072,11 +1072,11 @@ impl<Extension: Operation<Type = ArrayIrType>> KernelDefinition<Extension> {
     }
 
     /// Encodes the semantic identity of a `composite` call with retained rules, which only a call of a named
-    /// definition has (refer to [`NamedComposite`](ryft_core::NamedComposite)): its key and implementation
-    /// requirement identify its rules across processes. The key's [`Debug`](std::fmt::Debug) representation encodes
-    /// floating-point attributes by their IEEE bits. Its body, if any, is encoded with the other regions of the kernel.
-    /// Calls of other definitions are rejected, because the identity of their rules is local to the process, and calls
-    /// with attached rules need no fields beyond their regions.
+    /// definition has (refer to [`NamedComposite`](ryft_core::NamedComposite)), because its key identifies its rules
+    /// across processes. The key's [`Debug`](std::fmt::Debug) representation encodes floating-point attributes by
+    /// their IEEE bits, and its body is encoded with the other regions of the kernel. Calls of other definitions are
+    /// rejected, because the identity of their rules is local to the process, and calls with attached rules need no
+    /// fields beyond their regions.
     fn composite_semantic_fields<V: Typed<Type: DifferentiableType + Eq + Hash> + Parameter, O, S>(
         key: &mut String,
         operation: &CompositeOperation<V, O, S>,

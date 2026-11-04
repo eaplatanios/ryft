@@ -8,11 +8,11 @@ use std::sync::Arc;
 
 use ryft_core::macros::check_count;
 use ryft_core::{
-    ArrayBatch, ArrayBatchingPolicy, ArrayIrBatch, ArrayIrBatchingPolicy, ArrayIrType, ArrayType, AttachedRegions,
-    BatchAxis, BatchableOperation, BatchedProgram, BatchingContext, BatchingDriver, BatchingError, CaptureConstant,
-    CompositeKey, Concretizable, Context, CotangentDestinations, DifferentiableOperation, DifferentiableType,
-    DifferentiationContext, DifferentiationDriver, DifferentiationDual, DifferentiationError, DifferentiationPolicy,
-    InputRegionProvenance, InterpretableOperation, InterpretationDriver, MaybeZero, Operation,
+    ArrayBatch, ArrayBatchingPolicy, ArrayIrBatch, ArrayIrBatchingPolicy, ArrayIrType, ArrayType, AtomId,
+    AttachedRegions, BatchAxis, BatchableOperation, BatchedProgram, BatchingContext, BatchingDriver, BatchingError,
+    CaptureConstant, CompositeKey, Concretizable, Context, CotangentDestinations, DifferentiableOperation,
+    DifferentiableType, DifferentiationContext, DifferentiationDriver, DifferentiationDual, DifferentiationError,
+    DifferentiationPolicy, InputRegionProvenance, InterpretableOperation, InterpretationDriver, MaybeZero, Operation,
     OperationBoundaryPruning, OperationFormatter, OutputRegionProvenance, Parameterized, PartialEvaluationContext,
     PartialEvaluationDriver, PartialEvaluationValue, PartialValue, PartiallyEvaluatableOperation,
     ProgramBatchingOutputAxesPolicy, ProgramError, ReferenceDischargeContext, ReferenceDischargeDriver,
@@ -272,37 +272,54 @@ where
                 walk(program, nested, target_platform, counts, order, memo, named_calls, visited)?;
             }
 
-            // Calls that a backend implementation replaces, and calls without a body, need no shared function. Calls that
-            // share an interned body region and a key also share their boundary and backend selection, so only the
-            // first such call computes them, and the others only count. Calls of different keys (e.g., of different
-            // versions) may share one body region but not their backend selection, so they are grouped separately.
+            // Calls that a backend implementation replaces need no shared function. Calls that share an interned body
+            // region, a key, and a boundary also share their backend selection, so only the first such call computes
+            // it, and the others only count. Calls of different keys (e.g., of different versions) or boundaries may
+            // share one body region but not their backend selection, so they are grouped separately.
             if let Some(composite_key) = instruction.operation().composite_key() {
                 let Some(&body_region) = instruction.regions().first() else {
                     continue;
                 };
+                let atom_type = |atom: &AtomId| region_ref.atoms()[atom.index()].r#type();
+                let has_boundary = |call: &NamedRegionCall| {
+                    call.input_types.len() == instruction.inputs().len()
+                        && call.output_types.len() == instruction.outputs().len()
+                        && instruction
+                            .inputs()
+                            .iter()
+                            .zip(&call.input_types)
+                            .all(|(atom, r#type)| *atom_type(atom) == *r#type)
+                        && instruction
+                            .outputs()
+                            .iter()
+                            .zip(&call.output_types)
+                            .all(|(atom, r#type)| *atom_type(atom) == *r#type)
+                };
                 let grouped = named_calls.index.get(&body_region).and_then(|indices| {
-                    indices.iter().copied().find(|index| &named_calls.calls[*index].composite == composite_key)
+                    indices.iter().copied().find(|index| {
+                        let call = &named_calls.calls[*index];
+                        &call.composite == composite_key && has_boundary(call)
+                    })
                 });
                 if let Some(index) = grouped {
                     named_calls.calls[index].count += 1;
                     continue;
                 }
-                let atom_types = |atoms: &[ryft_core::AtomId]| {
-                    atoms.iter().map(|atom| region_ref.atoms()[atom.index()].r#type().into_owned()).collect::<Vec<_>>()
-                };
-                let input_types = atom_types(instruction.inputs());
-                let output_types = atom_types(instruction.outputs());
+                let input_types =
+                    instruction.inputs().iter().map(|atom| atom_type(atom).into_owned()).collect::<Vec<_>>();
+                let output_types =
+                    instruction.outputs().iter().map(|atom| atom_type(atom).into_owned()).collect::<Vec<_>>();
                 let replaced =
                     NamedCompositeImplementation::select(composite_key, &input_types, &output_types, target_platform)
                         .is_some();
-                let key =
-                    (!replaced).then(|| NamedFunctionKey { key: composite_key.clone(), input_types, output_types });
                 named_calls.index.entry(body_region).or_default().push(named_calls.calls.len());
                 named_calls.calls.push(NamedRegionCall {
                     region: body_region,
                     composite: composite_key.clone(),
+                    input_types,
+                    output_types,
                     count: 1,
-                    key,
+                    replaced,
                 });
                 continue;
             }
@@ -343,9 +360,11 @@ where
 
     // Each named composite body region is rendered and counted once, with the number of calls that share it.
     for call in named_calls.calls {
-        let Some(named_key) = call.key else {
+        if call.replaced {
             continue;
-        };
+        }
+        let named_key =
+            NamedFunctionKey { key: call.composite, input_types: call.input_types, output_types: call.output_types };
         let key = memo
             .entry(call.region)
             .or_insert_with(|| {
@@ -354,7 +373,10 @@ where
                 )
             })
             .clone();
+        // A body that structural deduplication cannot key (e.g., one with constants) has no shared function, and it
+        // marks its key and boundary as conflicting, so that its calls never resolve to another body's function.
         let Some(key) = key else {
+            named.insert(named_key, None);
             continue;
         };
         let entry = counts.entry(key.clone()).or_insert_with(|| {
@@ -383,37 +405,46 @@ where
     Ok(())
 }
 
-/// Named composite calls found by [`count_jit_calls`], grouped by the interned body region and the key that they share.
+/// Named composite calls found by [`count_jit_calls`], grouped by the interned body region, the key, and the boundary
+/// that they share.
 #[derive(Default)]
 struct NamedRegionCalls {
-    /// Positions in [`Self::calls`] of the groups of each body region, one per key that calls it.
+    /// Positions in [`Self::calls`] of the groups of each body region, one per key and boundary that call it.
     index: HashMap<RegionId, Vec<usize>>,
 
     /// Body regions in first-occurrence order.
     calls: Vec<NamedRegionCall>,
 }
 
-/// Named composite calls that share one interned body region and one key.
+/// Named composite calls that share one interned body region, one key, and one boundary.
 struct NamedRegionCall {
     /// Body region of the calls.
     region: RegionId,
 
-    /// Semantic identity of the calls, including when a backend implementation replaces them.
+    /// Semantic identity of the calls.
     composite: CompositeKey,
+
+    /// Input types of the calls.
+    input_types: Vec<ArrayIrType>,
+
+    /// Output types of the calls.
+    output_types: Vec<ArrayIrType>,
 
     /// Number of calls.
     count: usize,
 
-    /// Semantic identity and boundary of the calls, or [`None`] when a backend implementation replaces them.
-    key: Option<NamedFunctionKey>,
+    /// Whether a backend implementation replaces the calls.
+    replaced: bool,
 }
 
 /// Builds the [`JitCallFunctionMap`] for a module by emitting a shared private function for every `jit_call` callee
 /// that occurs at least twice (per [`JitCallProgramKey`] identity), and for every named composite body that no
 /// backend implementation replaces on `target_platform` and that occurs at least twice. Single-occurrence callees are
-/// left to inline, so modules without repeated calls lower exactly as before. A shared function first reached through
-/// named composite calls is named after the name and version of their definition (e.g., `ryft.example.v1`, with a
-/// numeric suffix for other specializations), which no `jit_call` or named-composition function name can match.
+/// left to inline, so modules without repeated calls lower exactly as before. A shared function that named composite
+/// calls reach is named after the name and version of the first such definition (e.g., `ryft.example.v1`, with a
+/// numeric suffix for other specializations), even when a `jit_call` also reaches it, and no `jit_call` or
+/// named-composition function name can match such a name. A named composite boundary is indexed only when it equals
+/// the boundary of its shared function, so that the emitted call signature matches the function.
 ///
 /// # Errors
 ///
@@ -461,6 +492,9 @@ where
         let Some(function) = key.and_then(|key| map.functions.get(&key)) else {
             continue;
         };
+        if function.input_types != named_key.input_types || function.output_types != named_key.output_types {
+            continue;
+        }
         let NamedFunctionKey { key: composite_key, input_types, output_types } = named_key;
         let symbol = function.symbol.clone();
         map.named
