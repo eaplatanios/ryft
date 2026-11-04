@@ -12,13 +12,14 @@ use crate::operations::composites::configurations::{
     CompositeVjp, DefaultBatching, DefaultJvp, DefaultVjp, ExplicitJvp, ExplicitVjp, JvpFromPrimal, SequentialBatching,
     SymbolicZeroJvp, SymbolicZeroVjp,
 };
+use crate::operations::composites::describe_composite;
 use crate::operations::composites::operations::{COMPOSITE_OPERATION_NAME, CompositeOperation};
 use crate::operations::composites::rules::{
-    CustomRuleDefinition, CustomRuleReference, CustomRuleRegistration, CustomRuleTracer,
+    CompositeKey, CustomRuleDefinition, CustomRuleReference, CustomRuleRegistration, CustomRuleTracer, NamedComposite,
 };
 use crate::operations::custom_call::{CustomCall, CustomCallOperation};
-use crate::parameters::{Parameter, Parameterized, ParameterizedFamily};
-use crate::programs::{MaybeZero, Operation, ProgramError, Type, TypeError, Typed, Value};
+use crate::parameters::{Parameter, ParameterPath, Parameterized, ParameterizedFamily, Placeholder};
+use crate::programs::{AttachedRegions, MaybeZero, Operation, ProgramError, Type, TypeError, Typed, Value};
 use crate::tracing::{DomainTracingContext, TracingContext};
 
 #[cfg(doc)]
@@ -73,6 +74,10 @@ impl<C> CompositeCallContext for C where
 {
 }
 
+/// Maximum number of typed call signatures for which a named [`Composite`] remembers the output structure that its
+/// output type rule returned. Refer to [`CompositeRegistrations::get_by_input_types`] for more information.
+const NAMED_OUTPUT_STRUCTURE_CAPACITY: usize = 16;
+
 /// Retained definitions registered by a [`Composite`] in its selected operation family, one per input and output
 /// parameter structure and visible named axes. Their handles live as long as the composite, so calls with the same
 /// structure and named axes share specialization caches. The mutex synchronizes access to the registration handles,
@@ -80,6 +85,11 @@ impl<C> CompositeCallContext for C where
 struct CompositeRegistrations<V: Typed + Parameter, O, InputStructure, OutputStructure> {
     /// Registrations for the selected family and parameter structure types.
     entries: Mutex<Vec<CompositeRegistration<V, O, InputStructure, OutputStructure>>>,
+
+    /// Output structures that the output type rule of a named composite returned for recent typed call signatures,
+    /// together with the definitions registered for them, most recent last. The output structure of a named composite
+    /// may depend on the types of its inputs and not only on their structure, so it is remembered per types.
+    named_outputs: Mutex<Vec<NamedCompositeOutputCacheEntry<V, O, InputStructure, OutputStructure>>>,
 }
 
 impl<V: Typed<Type: Eq + Hash> + Parameter, O, InputStructure, OutputStructure>
@@ -98,6 +108,27 @@ impl<V: Typed<Type: Eq + Hash> + Parameter, O, InputStructure, OutputStructure>
         InputStructure: Clone + PartialEq,
         OutputStructure: Clone + PartialEq,
     {
+        let registration = self.get_or_try_register(input_structure, output_structure, named_axes, || {
+            Ok::<_, ProgramError>(CustomRuleRegistration::new(register_fn()))
+        });
+
+        // Infallible registration functions never fail.
+        registration.unwrap()
+    }
+
+    /// Returns a reference to the definition registered for the provided call structure and named axes, retaining
+    /// the registration returned by `register_fn` if there is none yet, and propagating its error otherwise.
+    fn get_or_try_register<F: FnOnce() -> Result<CustomRuleRegistration<V, O>, ProgramError>>(
+        &self,
+        input_structure: &InputStructure,
+        output_structure: &OutputStructure,
+        named_axes: &[(String, NamedAxis)],
+        register_fn: F,
+    ) -> Result<CustomRuleReference<V, O>, ProgramError>
+    where
+        InputStructure: Clone + PartialEq,
+        OutputStructure: Clone + PartialEq,
+    {
         let mut entries = self.entries.lock().expect("composite registration mutex is poisoned");
         let existing = entries
             .iter()
@@ -107,17 +138,67 @@ impl<V: Typed<Type: Eq + Hash> + Parameter, O, InputStructure, OutputStructure>
                     && entry.named_axes == named_axes
             })
             .map(|entry| entry.registration.reference());
-        existing.unwrap_or_else(|| {
-            let registration = CustomRuleRegistration::new(register_fn());
-            let reference = registration.reference();
-            entries.push(CompositeRegistration {
-                input_structure: input_structure.clone(),
-                output_structure: output_structure.clone(),
-                named_axes: named_axes.to_vec(),
-                registration,
-            });
-            reference
-        })
+        if let Some(existing) = existing {
+            return Ok(existing);
+        }
+        let registration = register_fn()?;
+        let reference = registration.reference();
+        entries.push(CompositeRegistration {
+            input_structure: input_structure.clone(),
+            output_structure: output_structure.clone(),
+            named_axes: named_axes.to_vec(),
+            registration,
+        });
+        Ok(reference)
+    }
+
+    /// Returns a reference to the definition registered for named calls with the provided flattened input types, input
+    /// structure, and named axes, together with the output structure of those calls, if a call with that signature
+    /// was recorded recently with [`Self::record_input_types`].
+    fn get_by_input_types(
+        &self,
+        input_types: &[V::Type],
+        input_structure: &InputStructure,
+        named_axes: &[(String, NamedAxis)],
+    ) -> Option<(CustomRuleReference<V, O>, OutputStructure)>
+    where
+        InputStructure: PartialEq,
+        OutputStructure: Clone,
+    {
+        let outputs = self.named_outputs.lock().expect("composite registration mutex is poisoned");
+        outputs
+            .iter()
+            .rev()
+            .find(|output| {
+                output.input_types == input_types
+                    && &output.input_structure == input_structure
+                    && output.reference.definition().named_axes() == named_axes
+            })
+            .map(|output| (output.reference.clone(), output.output_structure.clone()))
+    }
+
+    /// Records the output structure and definition of named calls with the provided flattened input types and input
+    /// structure, evicting the least recently recorded signature beyond [`NAMED_OUTPUT_STRUCTURE_CAPACITY`].
+    fn record_input_types(
+        &self,
+        input_types: &[V::Type],
+        input_structure: &InputStructure,
+        output_structure: &OutputStructure,
+        reference: &CustomRuleReference<V, O>,
+    ) where
+        InputStructure: Clone,
+        OutputStructure: Clone,
+    {
+        let mut outputs = self.named_outputs.lock().expect("composite registration mutex is poisoned");
+        if outputs.len() == NAMED_OUTPUT_STRUCTURE_CAPACITY {
+            outputs.remove(0);
+        }
+        outputs.push(NamedCompositeOutputCacheEntry {
+            input_types: input_types.to_vec(),
+            input_structure: input_structure.clone(),
+            output_structure: output_structure.clone(),
+            reference: reference.clone(),
+        });
     }
 }
 
@@ -126,7 +207,7 @@ impl<V: Typed + Parameter, O, InputStructure, OutputStructure> Default
 {
     #[inline]
     fn default() -> Self {
-        Self { entries: Mutex::new(Vec::new()) }
+        Self { entries: Mutex::new(Vec::new()), named_outputs: Mutex::new(Vec::new()) }
     }
 }
 
@@ -143,6 +224,32 @@ struct CompositeRegistration<V: Typed + Parameter, O, InputStructure, OutputStru
 
     /// Registration handle, which owns the definition's specialization caches.
     registration: CustomRuleRegistration<V, O>,
+}
+
+/// Cache entry for the output structure that a named [`Composite`]'s output type rule returned for one typed call
+/// signature, together with the definition registered for calls with that signature.
+struct NamedCompositeOutputCacheEntry<V: Typed + Parameter, O, InputStructure, OutputStructure> {
+    /// Flattened types of the calls' inputs.
+    input_types: Vec<V::Type>,
+
+    /// Structure of the calls' inputs.
+    input_structure: InputStructure,
+
+    /// Structure of the calls' outputs.
+    output_structure: OutputStructure,
+
+    /// Definition registered for calls with this input and output structure.
+    reference: CustomRuleReference<V, O>,
+}
+
+/// Named composite configuration of a [`Composite`]. Refer to [`Composite::with_named_composite`] for more information.
+struct NamedCompositeConfiguration<T, InputStructure, OutputStructure> {
+    /// Semantic identity of the function.
+    key: CompositeKey,
+
+    /// Output type rule over the parameter structure and flattened types of a call's inputs, returning the parameter
+    /// structure and flattened types of its outputs.
+    output_types: Arc<dyn Fn(&InputStructure, &[T]) -> Result<(OutputStructure, Vec<T>), ProgramError> + Send + Sync>,
 }
 
 /// Function with custom derivative or batching rules, built by [`composite`]. It stores a primal closure together with
@@ -171,7 +278,8 @@ struct CompositeRegistration<V: Typed + Parameter, O, InputStructure, OutputStru
 ///
 /// Reconfiguring this function discards its registered definitions because they retain the previous configuration.
 /// Calls staged earlier keep their definitions, but lose the caches owned by this function and retrace their rules on
-/// later derivative requests.
+/// later derivative requests. For named functions, the semantic key must still describe the computation and its rules.
+/// Refer to [`Self::with_named_composite`] for more information on named functions.
 ///
 /// Each configuration (i.e., `Jvp`, `Vjp`, and `Batching`) is part of the type, and its configuration functions exist
 /// only while it still holds its default (i.e., [`DefaultJvp`], [`DefaultVjp`], or [`DefaultBatching`]). Each mode is
@@ -189,6 +297,11 @@ pub struct Composite<
 > where
     TracingContext<V, O>: StagingContext<Type = V::Type, Constant = V, Operation = O>,
 {
+    /// Optional named composite configuration of this function. Without it, calls are identified by their
+    /// registrations alone.
+    named_configuration:
+        Option<NamedCompositeConfiguration<V::Type, Input::ParameterStructure, Output::ParameterStructure>>,
+
     /// Closure computing the primal output value from the primal input value. The [`Context`] whose universe the
     /// primal and the rules are traced into belongs to the operation family `(V, O)`. Each call recovers its live
     /// context from the input values, so the function stores no context value.
@@ -257,6 +370,48 @@ impl<
 where
     TracingContext<V, O>: StagingContext<Type = V::Type, Constant = V, Operation = O>,
 {
+    /// Returns this function configured as a [`NamedComposite`] with the provided semantic identity and output type
+    /// rule, whose primal closure is its body. The output type rule validates the types of a call's inputs and returns
+    /// the types of its outputs, and it must agree with the body for every input it accepts.
+    ///
+    /// Calls of a named function share one definition per call structure and visible named axes, together with its
+    /// rules and its specialization caches, for as long as the caller holds this [`Composite`] value (refer to
+    /// [`CustomRuleRegistration`]). The body is traced once per input types and cached with the definition, and each
+    /// call attaches it as a shared region, which a staging program imports once however many calls attach it, rather
+    /// than tracing the primal on every call. Callers should therefore construct a named function once and reuse it,
+    /// because a new value traces its body again. Distinct values never share a definition, even with equal keys, and
+    /// reconfiguring a function (e.g., with [`Self::with_jvp_from_primal`]) returns a new value with fresh caches.
+    ///
+    /// The key is an _obligation_ meaning that functions with equal keys must compute the same function and have the
+    /// same rules, because backends may replace calls by their key (e.g., with a fused kernel) and index the functions
+    /// that they emit for calls by key, while calls that no backend replaces lower their body. Changing a computation
+    /// therefore requires a new key (e.g., a new version). A backend that lowers the calls of distinct values with an
+    /// equal key to shared functions keeps structurally different bodies apart, but it cannot detect rules that differ.
+    ///
+    /// Unlike other functions, a named function without derivative rules does not derive its forward mode rule
+    /// from its primal, so it rejects differentiation like an operation without derivative rules. Configure
+    /// [`Self::with_jvp_from_primal`] to differentiate its body explicitly.
+    pub fn with_named_composite<R>(self, key: CompositeKey, output_types: R) -> Self
+    where
+        R: 'static + Fn(Input::To<V::Type>) -> Result<Output::To<V::Type>, ProgramError> + Send + Sync,
+        Input::Family: ParameterizedFamily<V::Type>,
+        Input::To<V::Type>: Parameterized<V::Type, Family = Input::Family, To<CustomRuleTracer<V, O>> = Input>,
+        Output::Family: ParameterizedFamily<V::Type>,
+        Output::To<V::Type>: Parameterized<V::Type, Family = Output::Family, To<CustomRuleTracer<V, O>> = Output>,
+    {
+        let output_types = Arc::new(move |input_structure: &Input::ParameterStructure, input_types: &[V::Type]| {
+            let input_types =
+                Input::To::<V::Type>::from_parameters(input_structure.clone(), input_types.iter().cloned())?;
+            let output_types = output_types(input_types)?;
+            Ok((output_types.parameter_structure(), output_types.into_parameters().collect()))
+        });
+        Self {
+            named_configuration: Some(NamedCompositeConfiguration { key, output_types }),
+            registrations: CompositeRegistrations::default(),
+            ..self
+        }
+    }
+
     /// Returns this function with the leading `non_differentiated_count` flattened input leaves treated as
     /// non-differentiated _plumbing_ inputs. Refer to the documentation of the [`composite`] function for the semantics
     /// of non-differentiated inputs. Calls staged before this reconfiguration keep their original rules. The rules
@@ -309,8 +464,9 @@ where
     /// ```
     #[inline]
     pub fn with_non_differentiated_count(self, non_differentiated_count: usize) -> Self {
-        let Self { primal, jvp, vjp, batching, batched_output_axes, name, .. } = self;
+        let Self { named_configuration, primal, jvp, vjp, batching, batched_output_axes, name, .. } = self;
         Composite {
+            named_configuration,
             primal,
             jvp,
             vjp,
@@ -326,8 +482,11 @@ where
     /// Calls staged before this reconfiguration keep their original name.
     #[inline]
     pub fn with_name<N: Into<Cow<'static, str>>>(self, name: N) -> Self {
-        let Self { primal, jvp, vjp, batching, batched_output_axes, non_differentiated_count, .. } = self;
+        let Self {
+            named_configuration, primal, jvp, vjp, batching, batched_output_axes, non_differentiated_count, ..
+        } = self;
         Composite {
+            named_configuration,
             primal,
             jvp,
             vjp,
@@ -414,9 +573,19 @@ where
         self,
         jvp: Jvp,
     ) -> Composite<V, O, Input, Output, ExplicitJvp<Input, Output>, Vjp, Batching> {
-        let Self { primal, vjp, batching, batched_output_axes, non_differentiated_count, name, .. } = self;
+        let Self {
+            named_configuration,
+            primal,
+            vjp,
+            batching,
+            batched_output_axes,
+            non_differentiated_count,
+            name,
+            ..
+        } = self;
         let jvp = ExplicitJvp { jvp: Arc::new(jvp) };
         Composite {
+            named_configuration,
             primal,
             jvp,
             vjp,
@@ -432,11 +601,23 @@ where
     /// differentiates the primal, reusable linearization partitions that derivative once, and reverse mode transposes
     /// it unless reverse mode rules are configured as well). A function without derivative rules already derives its
     /// forward mode differentiation rule from its primal, so this configuration is needed only to pair reverse mode
-    /// rules with the derived forward mode rule, which would otherwise make forward mode reject the calls.
+    /// rules with the derived forward mode rule, which would otherwise make forward mode reject the calls. Named
+    /// functions are the exception, because they never derive a rule implicitly, so they need this configuration
+    /// to differentiate their body. Refer to [`Self::with_named_composite`] for more information.
     #[inline]
     pub fn with_jvp_from_primal(self) -> Composite<V, O, Input, Output, JvpFromPrimal, Vjp, Batching> {
-        let Self { primal, vjp, batching, batched_output_axes, non_differentiated_count, name, .. } = self;
+        let Self {
+            named_configuration,
+            primal,
+            vjp,
+            batching,
+            batched_output_axes,
+            non_differentiated_count,
+            name,
+            ..
+        } = self;
         Composite {
+            named_configuration,
             primal,
             jvp: JvpFromPrimal,
             vjp,
@@ -510,9 +691,19 @@ where
             + Send
             + Sync,
     {
-        let Self { primal, vjp, batching, batched_output_axes, non_differentiated_count, name, .. } = self;
+        let Self {
+            named_configuration,
+            primal,
+            vjp,
+            batching,
+            batched_output_axes,
+            non_differentiated_count,
+            name,
+            ..
+        } = self;
         let jvp = SymbolicZeroJvp { jvp: Arc::new(jvp) };
         Composite {
+            named_configuration,
             primal,
             jvp,
             vjp,
@@ -635,9 +826,19 @@ where
         Forward: 'static + Fn(Input) -> Result<(Output, Residual), ProgramError> + Send + Sync,
         Backward: 'static + Fn(Residual, Output) -> Result<Input, ProgramError> + Send + Sync,
     {
-        let Self { primal, jvp, batching, batched_output_axes, non_differentiated_count, name, .. } = self;
+        let Self {
+            named_configuration,
+            primal,
+            jvp,
+            batching,
+            batched_output_axes,
+            non_differentiated_count,
+            name,
+            ..
+        } = self;
         let vjp = ExplicitVjp { forward: Arc::new(forward), backward: Arc::new(backward), deferred_forward: false };
         Composite {
+            named_configuration,
             primal,
             jvp,
             vjp,
@@ -711,9 +912,19 @@ where
             + Send
             + Sync,
     {
-        let Self { primal, jvp, batching, batched_output_axes, non_differentiated_count, name, .. } = self;
+        let Self {
+            named_configuration,
+            primal,
+            jvp,
+            batching,
+            batched_output_axes,
+            non_differentiated_count,
+            name,
+            ..
+        } = self;
         let vjp = SymbolicZeroVjp { forward: Arc::new(forward), backward: Arc::new(backward), deferred_forward: false };
         Composite {
+            named_configuration,
             primal,
             jvp,
             vjp,
@@ -766,9 +977,19 @@ where
             + Send
             + Sync,
     {
-        let Self { primal, jvp, batching, batched_output_axes, non_differentiated_count, name, .. } = self;
+        let Self {
+            named_configuration,
+            primal,
+            jvp,
+            batching,
+            batched_output_axes,
+            non_differentiated_count,
+            name,
+            ..
+        } = self;
         let vjp = AccumulatingVjp { forward: Arc::new(forward), backward: Arc::new(backward), deferred_forward: false };
         Composite {
+            named_configuration,
             primal,
             jvp,
             vjp,
@@ -979,9 +1200,10 @@ where
             + Send
             + Sync,
     {
-        let Self { primal, jvp, vjp, non_differentiated_count, name, .. } = self;
+        let Self { named_configuration, primal, jvp, vjp, non_differentiated_count, name, .. } = self;
         let batching = BroadcastInvariantBatching { rule: Arc::new(rule) };
         Composite {
+            named_configuration,
             primal,
             jvp,
             vjp,
@@ -1025,9 +1247,10 @@ where
             + Send
             + Sync,
     {
-        let Self { primal, jvp, vjp, non_differentiated_count, name, .. } = self;
+        let Self { named_configuration, primal, jvp, vjp, non_differentiated_count, name, .. } = self;
         let batching = BroadcastSensitiveBatching { rule: Arc::new(rule) };
         Composite {
+            named_configuration,
             primal,
             jvp,
             vjp,
@@ -1083,8 +1306,9 @@ where
     /// ```
     #[inline]
     pub fn with_sequential_batching(self) -> Composite<V, O, Input, Output, Jvp, Vjp, SequentialBatching> {
-        let Self { primal, jvp, vjp, non_differentiated_count, name, .. } = self;
+        let Self { named_configuration, primal, jvp, vjp, non_differentiated_count, name, .. } = self;
         Composite {
+            named_configuration,
             primal,
             jvp,
             vjp,
@@ -1109,8 +1333,9 @@ where
     ///   - `output_axes`: Batch axis of each flattened output leaf, in leaf order.
     #[inline]
     pub fn with_batched_output_axes(self, output_axes: Vec<BatchAxis>) -> Self {
-        let Self { primal, jvp, vjp, batching, non_differentiated_count, name, .. } = self;
+        let Self { named_configuration, primal, jvp, vjp, batching, non_differentiated_count, name, .. } = self;
         Composite {
+            named_configuration,
             primal,
             jvp,
             vjp,
@@ -1159,6 +1384,10 @@ where
         input: InputValues,
     ) -> Result<<Output::To<C::Type> as Parameterized<C::Type>>::To<InputValue>, ProgramError>
     where
+        V: 'static,
+        O: 'static,
+        Input: 'static,
+        Output: 'static,
         V::Type: BatchableType,
         Input::Family: ParameterizedFamily<C::Type> + ParameterizedFamily<V>,
         Input::To<C::Type>: Clone + Parameterized<C::Type, Family = Input::Family, To<CustomRuleTracer<V, O>> = Input>,
@@ -1188,6 +1417,118 @@ where
                 self.name, self.non_differentiated_count, input_count,
             ))
             .into());
+        }
+
+        // Named composite calls attach the cached body of their definition as a shared region, which the staging
+        // program imports once, instead of tracing the primal on every call. The output type rule validates the inputs
+        // and determines the output structure.
+        if let Some(named_configuration) = &self.named_configuration {
+            let named_axes = first.domain().named_axes();
+            let input_structure = input_types.parameter_structure();
+            let flat_input_types = input_values.iter().map(|value| value.r#type().into_owned()).collect::<Vec<_>>();
+
+            // The output type rule determines the output structure, which may depend on the input types, once per typed
+            // call signature, and calls whose output structures differ use different definitions.
+            let (rules, output_structure) =
+                match self.registrations.get_by_input_types(&flat_input_types, &input_structure, &named_axes) {
+                    Some(registered) => registered,
+                    None => {
+                        let (output_structure, _) =
+                            (named_configuration.output_types)(&input_structure, &flat_input_types)?;
+                        let rules = self.registrations.get_or_try_register(
+                        &input_structure,
+                        &output_structure,
+                        &named_axes,
+                        || {
+                            let paths = |structure: Vec<(ParameterPath, &Placeholder)>| {
+                                structure.into_iter().map(|(path, _)| path).collect::<Vec<_>>()
+                            };
+                            let output_paths = paths(output_structure.named_parameters().collect());
+                            let definition = {
+                                // Parameter structures need not be `Sync`, so the retained rules clone the input
+                                // structure through a mutex and compare output structures by their parameter paths.
+                                let shared_input_structure = Arc::new(Mutex::new(input_structure.clone()));
+                                let rule_input_structure = shared_input_structure.clone();
+                                let output_type_rule = named_configuration.output_types.clone();
+                                let output_types = move |input_types: &[V::Type]| {
+                                    let input_structure = rule_input_structure
+                                        .lock()
+                                        .expect("composite structure mutex is poisoned")
+                                        .clone();
+                                    output_type_rule(&input_structure, input_types)
+                                        .map(|(_, output_types)| output_types)
+                                };
+                                let named_definition = {
+                                    let (primal, name) =
+                                        (self.primal.clone(), named_configuration.key.name().to_owned());
+                                    let body_input_structure = shared_input_structure;
+                                    NamedComposite::new(
+                                        named_configuration.key.clone(),
+                                        output_types,
+                                        move |inputs: &[CustomRuleTracer<V, O>]| {
+                                            let input_structure = body_input_structure
+                                                .lock()
+                                                .expect("composite structure mutex is poisoned")
+                                                .clone();
+                                            let output = primal(Input::from_parameters(
+                                                input_structure,
+                                                inputs.iter().cloned(),
+                                            )?)?;
+                                            let paths =
+                                                output.named_parameters().map(|(path, _)| path).collect::<Vec<_>>();
+                                            if paths != output_paths {
+                                                let name = describe_composite(COMPOSITE_OPERATION_NAME, &name);
+                                                let message = format!(
+                                                    "{name} body output structure differs from its output type rule",
+                                                );
+                                                return Err(TypeError::invalid(message).into());
+                                            }
+                                            Ok(output.into_parameters().collect())
+                                        },
+                                    )
+                                };
+                                let definition = CustomRuleDefinition::new(self.name.clone())
+                                    .with_named_axes(named_axes.clone())
+                                    .with_batching_support()
+                                    .with_named_composite(named_definition);
+                                let definition = definition.configure_jvp(
+                                    &self.jvp,
+                                    &input_structure,
+                                    &output_structure,
+                                    self.non_differentiated_count,
+                                );
+                                let definition = definition.configure_vjp(
+                                    &self.vjp,
+                                    &input_structure,
+                                    &output_structure,
+                                    self.non_differentiated_count,
+                                );
+                                let definition = match &self.batched_output_axes {
+                                    Some(output_axes) => definition.with_batched_output_axes(output_axes.clone()),
+                                    None => definition,
+                                };
+                                definition.configure_batching(&self.batching, &input_structure, &output_structure)
+                            };
+                            Ok::<_, ProgramError>(CustomRuleRegistration::new(definition))
+                        },
+                    )?;
+                        self.registrations.record_input_types(
+                            &flat_input_types,
+                            &input_structure,
+                            &output_structure,
+                            &rules,
+                        );
+                        (rules, output_structure)
+                    }
+                };
+            let operation =
+                CompositeOperation::new(rules.clone()).with_non_differentiated_count(self.non_differentiated_count)?;
+            let body = rules.body(&flat_input_types)?;
+            let outputs =
+                first
+                    .domain()
+                    .bind(operation, AttachedRegions::Callees(std::slice::from_ref(&body)), &input_values)?;
+            return Ok(Parameterized::from_parameters(output_structure, outputs)?);
         }
 
         // Only the primal is traced now. The rules are registered with the call structure and traced lazily. The primal
@@ -1460,6 +1801,7 @@ where
     TracingContext<V, O>: StagingContext<Type = V::Type, Constant = V, Operation = O>,
 {
     Composite {
+        named_configuration: None,
         primal: Arc::new(primal),
         jvp: DefaultJvp,
         vjp: DefaultVjp,
@@ -1559,6 +1901,20 @@ mod tests {
             Array::vector(x.iter().map(|x| 2.0 * f64::sin(*x)).collect()).unwrap(),
             Array::vector(x.iter().map(|x| 2.0 * f64::cos(*x)).collect()).unwrap(),
         )
+    }
+
+    /// Returns a named `x ↦ x³` with the provided key, whose primal counts its traces in `traces`.
+    fn named_cube(
+        key: &'static str,
+        traces: &Arc<AtomicUsize>,
+    ) -> Composite<Array, ArrayOperation<Array>, ArrayTracer, ArrayTracer> {
+        let traces = traces.clone();
+        composite(move |x: ArrayTracer| {
+            traces.fetch_add(1, Ordering::SeqCst);
+            Ok(x.clone() * x.clone() * x)
+        })
+        .with_name("cube")
+        .with_named_composite(CompositeKey::new(key, 1), |x: ArrayType| Ok(x))
     }
 
     #[test]
@@ -1722,6 +2078,181 @@ mod tests {
                 .gradient(|x| function.call(vec![x]).map(|outputs| outputs.into_iter().next().unwrap())),
             Err(DifferentiationError::Program(ProgramError::UnsupportedOperation { message })) if message == rejection,
         ));
+    }
+
+    #[test]
+    fn test_composite_with_named_composite() {
+        // Calls of one named function share one definition, and every call in a program attaches the body for its
+        // input types as one shared region, which is traced once per input types.
+        let traces = Arc::new(AtomicUsize::new(0));
+        let first = named_cube("ryft.tests.composite_named", &traces);
+        let (_, program) = ArrayContext::trace(
+            |(x, y): (ArrayTracer, ArrayTracer)| Ok((first.call(x.clone())?, first.call(x)?, first.call(y)?)),
+            (ArrayType::scalar(DataType::F64), ArrayType::new_static(DataType::F64, [2])),
+        )
+        .unwrap();
+        assert_eq!(traces.load(Ordering::SeqCst), 2);
+        assert_eq!(
+            program.to_string(),
+            indoc! {"
+                lambda %0:f64[], %1:f64[2] .
+                let %2:f64[] = composite [key=\"ryft.tests.composite_named.v1\"] %0 [
+                    primal=^0={
+                        lambda %0:f64[] .
+                        let %1:f64[] = mul %0 %0
+                            %2:f64[] = mul %1 %0
+                        in (%2)
+                    },
+                ]
+                    %3:f64[] = composite [key=\"ryft.tests.composite_named.v1\"] %0 [
+                        primal=^0,
+                    ]
+                    %4:f64[2] = composite [key=\"ryft.tests.composite_named.v1\"] %1 [
+                        primal={
+                            lambda %0:f64[2] .
+                            let %1:f64[2] = mul %0 %0
+                                %2:f64[2] = mul %1 %0
+                            in (%2)
+                        },
+                    ]
+                in (%2, %3, %4)
+            "}
+            .trim_end(),
+        );
+        assert_eq!(
+            program.interpret((Array::scalar(2.0).unwrap(), Array::vector(vec![1.0, 3.0]).unwrap())),
+            Ok((Array::scalar(8.0).unwrap(), Array::scalar(8.0).unwrap(), Array::vector(vec![1.0, 27.0]).unwrap())),
+        );
+
+        // Another value with an equal key owns another definition, so it traces its body again.
+        let second = named_cube("ryft.tests.composite_named", &traces);
+        ArrayContext::trace(|x| second.call(x), ArrayType::scalar(DataType::F64)).unwrap();
+        assert_eq!(traces.load(Ordering::SeqCst), 3);
+
+        // Batching structurally batches the shared body.
+        assert_eq!(
+            batch(
+                |x| first.call(x),
+                Array::vector(vec![1.0, 2.0]).unwrap(),
+                BatchAxis::new(0),
+                BatchAxis::new(0),
+                None
+            ),
+            Ok(Array::vector(vec![1.0, 8.0]).unwrap()),
+        );
+
+        // The output type rule validates every call.
+        let rejecting = composite(|x: ArrayTracer| Ok(x))
+            .with_named_composite(CompositeKey::new("ryft.tests.composite_named_rejecting", 1), |_: ArrayType| {
+                Err(TypeError::invalid("rejected").into())
+            });
+        assert_eq!(
+            ArrayContext::trace(|x| rejecting.call(x), ArrayType::scalar(DataType::F64)).map(|_| ()),
+            Err(ProgramError::from(TypeError::invalid("rejected"))),
+        );
+    }
+
+    #[test]
+    fn test_composite_with_named_composite_type_dependent_output_structure() {
+        // The output structure may depend on the input types and not only on their structure, even when the structures
+        // have the same (i.e., no) leaves, so it is determined for every typed call signature.
+        let nested = composite(|x: ArrayTracer| -> Result<Vec<Vec<ArrayTracer>>, ProgramError> {
+            Ok(if x.r#type().rank() == 0 { vec![Vec::new()] } else { Vec::new() })
+        })
+        .with_named_composite(CompositeKey::new("ryft.tests.composite_named_type_dependent", 1), |x: ArrayType| {
+            Ok(if x.rank() == 0 { vec![Vec::new()] } else { Vec::new() })
+        });
+        let ((scalar, vector), _) = ArrayContext::trace(
+            |(x, y): (ArrayTracer, ArrayTracer)| Ok((nested.call(x)?, nested.call(y)?)),
+            (ArrayType::scalar(DataType::F64), ArrayType::new_static(DataType::F64, [2])),
+        )
+        .unwrap();
+        assert_eq!((scalar, vector), (vec![Vec::new()], Vec::new()));
+    }
+
+    #[test]
+    fn test_composite_with_named_composite_differentiation() {
+        // Named functions without rules reject differentiation, like operations without derivative rules.
+        let traces = Arc::new(AtomicUsize::new(0));
+        let cube = named_cube("ryft.tests.composite_named_differentiation", &traces);
+        let error = differentiate_at(Array::scalar(2.0).unwrap()).jvp(Array::scalar(1.0).unwrap(), |x| cube.call(x));
+        assert_eq!(
+            error.map(|_| ()),
+            Err(DifferentiationError::Program(ProgramError::UnsupportedOperation {
+                message:
+                    "cannot differentiate a `composite` call of `ryft.tests.composite_named_differentiation` that has \
+                          no derivative rule"
+                        .to_string(),
+            })),
+        );
+
+        // An explicitly derived forward mode rule differentiates the body, in forward and reverse mode.
+        let cube = named_cube("ryft.tests.composite_named_differentiation_derived", &traces).with_jvp_from_primal();
+        assert_eq!(
+            differentiate_at(Array::scalar(2.0).unwrap()).jvp(Array::scalar(1.0).unwrap(), |x| cube.call(x)),
+            Ok((Array::scalar(8.0).unwrap(), Array::scalar(12.0).unwrap())),
+        );
+        assert_eq!(
+            differentiate_at(Array::scalar(2.0).unwrap()).value_and_gradient(|x| cube.call(x).unwrap()),
+            Ok((Array::scalar(8.0).unwrap(), Array::scalar(12.0).unwrap())),
+        );
+
+        // Reverse mode rules apply as for any other function.
+        let cube = named_cube("ryft.tests.composite_named_differentiation_vjp", &traces).with_vjp(
+            |x: ArrayTracer| Ok((x.clone() * x.clone() * x.clone(), x)),
+            |x: ArrayTracer, cotangent: ArrayTracer| Ok(x.clone() * x * cotangent),
+        );
+        assert_eq!(
+            differentiate_at(Array::scalar(2.0).unwrap()).gradient(|x| cube.call(x)),
+            Ok(Array::scalar(4.0).unwrap()),
+        );
+    }
+
+    #[test]
+    fn test_composite_with_named_composite_identity() {
+        let scalar_type = ArrayType::scalar(DataType::F64);
+
+        // Calls keep their named identity only while their region is the definition's body.
+        fn named<I: Parameterized<Array>, O: Parameterized<Array>>(
+            program: &crate::programs::Program<Array, ArrayOperation<Array>, I, O>,
+        ) -> Option<CompositeKey> {
+            program
+                .entry_region_ref()
+                .instructions()
+                .iter()
+                .find_map(|instruction| match instruction.operation() {
+                    ArrayOperation::Composite(operation) => Some(operation.key().cloned()),
+                    _ => None,
+                })
+                .unwrap()
+        }
+        let cube = named_cube("ryft.tests.composite_named_shared_definition_cube", &Arc::new(AtomicUsize::new(0)));
+        let (_, program) = ArrayContext::trace(|x| cube.call(x), scalar_type).unwrap();
+        assert_eq!(named(&program), Some(CompositeKey::new("ryft.tests.composite_named_shared_definition_cube", 1)),);
+        let (_, program) = ArrayContext::trace(
+            |x: ArrayTracer| {
+                batch(|x| cube.call(x), x, BatchAxis::new(0), BatchAxis::new(0), None).map_err(ProgramError::from)
+            },
+            ArrayType::new_static(DataType::F64, [2]),
+        )
+        .unwrap();
+        assert_eq!(named(&program), None);
+    }
+
+    #[test]
+    fn test_composite_with_named_composite_reconfiguration() {
+        // A reconfigured function is a new value with its own definition, so its rules take effect immediately,
+        // even while calls of the original function are alive.
+        let traces = Arc::new(AtomicUsize::new(0));
+        let scalar_type = ArrayType::scalar(DataType::F64);
+        let cube = named_cube("ryft.tests.composite_named_reconfiguration", &traces);
+        let (_, program) = ArrayContext::trace(|x| cube.call(x), scalar_type).unwrap();
+        let derived = cube.with_jvp_from_primal();
+        assert_eq!(
+            differentiate_at(Array::scalar(2.0).unwrap()).jvp(Array::scalar(1.0).unwrap(), |x| derived.call(x)),
+            Ok((Array::scalar(8.0).unwrap(), Array::scalar(12.0).unwrap())),
+        );
+        assert_eq!(program.interpret(Array::scalar(2.0).unwrap()), Ok(Array::scalar(8.0).unwrap()));
     }
 
     #[test]
