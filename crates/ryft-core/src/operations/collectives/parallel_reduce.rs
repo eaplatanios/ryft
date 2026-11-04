@@ -5,7 +5,7 @@ use ryft_macros::capability;
 use crate::arrays::{
     Array, ArrayBatch, ArrayBatchingPolicy, ArrayExtentBatchingPolicy, ArrayIrType, ArrayType, LogicalMesh,
 };
-use crate::axes::{Axis, AxisError, NamedAxes, NamedAxis};
+use crate::axes::{Axis, AxisError, NamedAxes};
 use crate::batching::{BatchAxis, BatchableOperation, BatchingContext, BatchingDriver, BatchingError};
 use crate::contexts::{Context, Domain};
 use crate::differentiation::DifferentiationDual;
@@ -473,24 +473,28 @@ impl_differentiable_operation! {
 /// Integer means truncate toward zero in the input's own type, whereas JAX's `pmean` promotes them to a floating-point
 /// type through its division, so a fractional mean requires converting the input first.
 ///
-/// Inside a manual region, every value is a per-device local shard and its type records over which manual axes the
-/// shards may differ. A value that varies over the axis holds a different shard on every device along it, and reducing
-/// it stages a [`ParallelReduceOperation`] carrying the region's mesh, which combines those shards over the whole axis
-/// and hands every device the same result, so the output is _invariant_ over the axis. This is what JAX stages as its
-/// `psum_invariant` primitive. A value that is invariant over the axis holds the same shard on every device. Reducing
-/// it counts that shard once per device, which is why the operation only accepts varying inputs: an invariant value is
-/// first passed through [`parallel_vary`](ParallelVary::parallel_vary), which makes the multiplication by the device
-/// count an explicit, differentiable step rather than an accident. [`parallel_reduce`](Self::parallel_reduce) inserts
-/// that step itself, so summing an invariant constant `c` over an axis of size `n` yields `n · c` here as well.
-/// The sum and the variation transition are adjoints of each other, which is what makes gradients through a manual
-/// region correct without any bookkeeping at the region boundary: the transpose of the mesh-form sum is a
-/// [`ParallelVaryOperation`], because the cotangent of a shared total is the same value handed to every device,
-/// and the transpose of a [`ParallelVaryOperation`] is the mesh-form sum. A mean over a manual axis is the mesh-form
-/// sum divided by the axis size, as `jax.lax.pmean` is `psum(x) / n`. A logarithmic sum of exponentials over a manual
-/// axis is composed of a mesh-form maximum and a mesh-form sum with the same guarded shift as the corresponding
-/// single-device reduction (refer to [`ReductionKind::LogSumExp`]), which keeps it numerically stable for large,
-/// infinite, and NaN inputs, and differentiable, because the shift is computed under a [`stop_gradient`](StopGradient).
-/// The other kinds are not differentiable.
+/// Inside a manual region that tracks variation, every value is a per-device local shard and its type records over
+/// which manual axes the shards may differ. A value that varies over the axis holds a different shard on every device
+/// along it. Reducing it stages a [`ParallelReduceOperation`] carrying the region's mesh, which combines those shards
+/// over the whole axis and hands every device the same result, so the output is _invariant_ over the axis. This is what
+/// JAX stages as its `psum_invariant` primitive. A value that is invariant over the axis holds the same shard on every
+/// device. Reducing it counts that shard once per device, which is why the operation only accepts varying inputs:
+/// an invariant value is first passed through [`parallel_vary`](ParallelVary::parallel_vary), which makes the
+/// multiplication by the device count an explicit, differentiable step rather than an accident.
+/// [`parallel_reduce`](Self::parallel_reduce) inserts that step itself, so summing an invariant constant `c` over an
+/// axis of size `n` yields `n · c` here as well. The sum and the variation transition are adjoints of each other, which
+/// is what makes gradients through a manual region correct without any bookkeeping at the region boundary: the
+/// transpose of the mesh-form sum is a [`ParallelVaryOperation`], because the cotangent of a shared total is the same
+/// value handed to every device, and the transpose of a [`ParallelVaryOperation`] is the mesh-form sum. A mean over a
+/// manual axis is the mesh-form sum divided by the axis size, as `jax.lax.pmean` is `psum(x) / n`. A logarithmic sum of
+/// exponentials over a manual axis is composed of a mesh-form maximum and a mesh-form sum with the same guarded shift
+/// as the corresponding single-device reduction (refer to [`ReductionKind::LogSumExp`]), which keeps it numerically
+/// stable for large, infinite, and NaN inputs, and differentiable, because the shift is computed under
+/// a [`stop_gradient`](StopGradient). The other kinds are not differentiable.
+///
+/// An unchecked manual region performs the same physical communication through ordinary collective primitives,
+/// so local types gain no variation metadata. Sums are then self-adjoint, and the enclosing shard map supplies the
+/// defensive boundary reductions and seed normalization. Means and logarithmic sums retain their compositions above.
 ///
 /// Participant subgroups retain the ordinary collective contract: the staged operation carries no mesh and preserves
 /// the input variation, because distinct groups can produce distinct results.
@@ -514,7 +518,7 @@ impl_differentiable_operation! {
 /// let invariant = ArrayType::scalar(DataType::F32).with_sharding(Sharding::replicated(mesh.clone(), 0))?;
 /// let varying = ArrayType::scalar(DataType::F32)
 ///     .with_sharding(Sharding::replicated(mesh.clone(), 0).with_varying_manual_axes(["x"])?)?;
-/// let axes = vec![("x".to_string(), NamedAxis::Mesh { mesh, axis: 0, size: 2 })];
+/// let axes = vec![("x".to_string(), NamedAxis::Mesh { mesh, axis: 0, size: 2, checks_manual_variation: true })];
 /// let (output, program) = TracingContext::<Array, ArrayOperation<Array>>::trace_with_named_axes(
 ///     |weight| weight.parallel_reduce(ReductionKind::Sum, "x"),
 ///     varying.clone(),
@@ -637,17 +641,21 @@ impl<
         let named_axis = context
             .named_axis(axis_name)
             .ok_or_else(|| AxisError::UnboundAxisName { name: axis_name.to_string() })?;
-        let NamedAxis::Mesh { mesh, size, .. } = named_axis else {
+        let Some(mesh) = named_axis.mesh().cloned() else {
             let operation = ParallelReduceOperation::new(kind, axis_name.to_string());
             let mut outputs = context.bind(operation, Vec::new(), std::slice::from_ref(self))?;
             check_count!("output", outputs, 1, ProgramError);
             return Ok(outputs.remove(0));
         };
+        let size = named_axis.size().unwrap();
+        let check_manual_variation = named_axis.checks_manual_variation();
 
         // Reducing an invariant value counts its shard once per device, so the value is first made varying,
         // which records that multiplication as an explicit, differentiable step.
         let mut input = self.clone();
-        if !input.r#type().sharding().is_some_and(|sharding| sharding.varying_manual_axes().contains(axis_name)) {
+        if check_manual_variation
+            && !input.r#type().sharding().is_some_and(|sharding| sharding.varying_manual_axes().contains(axis_name))
+        {
             input = input.parallel_vary(axis_name)?;
         }
 
@@ -678,7 +686,8 @@ impl<
                 return sum.log()?.add(&shift);
             }
             kind => {
-                let operation = ParallelReduceOperation::new(kind, axis_name.to_string()).with_mesh(mesh);
+                let operation = ParallelReduceOperation::new(kind, axis_name.to_string());
+                let operation = if check_manual_variation { operation.with_mesh(mesh) } else { operation };
                 let mut outputs = context.bind(operation, Vec::new(), &[input])?;
                 check_count!("output", outputs, 1, ProgramError);
                 return Ok(outputs.remove(0));
@@ -687,7 +696,8 @@ impl<
 
         // A mean over a manual mesh axis is the mesh-form sum divided by the axis size, exactly as JAX's `pmean` is
         // `psum(x) / n` at the wrapper level with no `pmean` primitive. The division happens in the element data type.
-        let operation = ParallelReduceOperation::new(ReductionKind::Sum, axis_name.to_string()).with_mesh(mesh);
+        let operation = ParallelReduceOperation::new(ReductionKind::Sum, axis_name.to_string());
+        let operation = if check_manual_variation { operation.with_mesh(mesh) } else { operation };
         let mut outputs = context.bind(operation, Vec::new(), &[input])?;
         check_count!("output", outputs, 1, ProgramError);
         let output = outputs.remove(0);
@@ -731,6 +741,7 @@ mod tests {
         ArrayIrOperation, ArrayIrValue, ArrayOperation, DataType, Dimension, DimensionBounds, DimensionType,
         DimensionVariable, DynamicArrayExtentBatchingPolicy, MeshAxis, MeshAxisType, Shape, Sharding,
     };
+    use crate::axes::NamedAxis;
     use crate::batching::{BatchAxisSpecification, BatchingTracer, batch};
     use crate::contexts::{EagerContext, ProjectedContext, StagingContext};
     use crate::differentiation::{
@@ -765,7 +776,15 @@ mod tests {
 
     /// Binds `"m"` as a manual axis of `mesh` for [`TracingContext::trace_with_named_axes`].
     fn manual_mesh_axes(mesh: &LogicalMesh) -> Vec<(String, NamedAxis)> {
-        vec![("m".to_string(), NamedAxis::Mesh { axis: 0, size: mesh.axis_size("m").unwrap(), mesh: mesh.clone() })]
+        vec![(
+            "m".to_string(),
+            NamedAxis::Mesh {
+                axis: 0,
+                size: mesh.axis_size("m").unwrap(),
+                mesh: mesh.clone(),
+                checks_manual_variation: true,
+            },
+        )]
     }
 
     #[test]
@@ -2221,6 +2240,56 @@ mod tests {
         assert_eq!(
             Array::scalar(1.0).unwrap().parallel_reduce(ReductionKind::Sum, "i"),
             Err(ProgramError::Axis(AxisError::UnboundAxisName { name: "i".to_string() })),
+        );
+    }
+
+    #[test]
+    fn test_parallel_reduce_parallel_reduce_unchecked_mesh() {
+        let mesh = LogicalMesh::new(vec![MeshAxis::new("m", 4, MeshAxisType::Manual).unwrap()]).unwrap();
+        let (output, program) = TracingContext::<Array, ArrayOperation<Array>>::trace_with_named_axes(
+            |input| input.parallel_reduce(ReductionKind::Mean, "m"),
+            ArrayType::scalar(DataType::F32),
+            vec![(
+                "m".to_string(),
+                NamedAxis::Mesh { mesh: mesh.clone(), axis: 0, size: 4, checks_manual_variation: false },
+            )],
+        )
+        .unwrap();
+        assert_eq!(output, ArrayType::scalar(DataType::F32));
+        assert_eq!(
+            program.to_string(),
+            indoc! {"
+                lambda %0:f32[] .
+                let %1:f32[] = parallel_reduce [kind=sum, axis_name=\"m\"] %0
+                    %2:f32[] = constant [value=4.0]
+                    %3:f32[] = div %1 %2
+                in (%3)"},
+        );
+
+        let (output, program) = TracingContext::<Array, ArrayOperation<Array>>::trace_with_named_axes(
+            |input| input.parallel_reduce(ReductionKind::LogSumExp, "m"),
+            ArrayType::scalar(DataType::F32),
+            vec![("m".to_string(), NamedAxis::Mesh { mesh, axis: 0, size: 4, checks_manual_variation: false })],
+        )
+        .unwrap();
+        assert_eq!(output, ArrayType::scalar(DataType::F32));
+        assert_eq!(
+            program.to_string(),
+            indoc! {"
+                lambda %0:f32[] .
+                let %1:f32[] = stop_gradient %0
+                    %2:f32[] = parallel_reduce [kind=max, axis_name=\"m\"] %1
+                    %3:f32[] = zero_like %2
+                    %4:f32[] = sub %2 %2
+                    %5:bool[] = compare [direction=Equal] %4 %3
+                    %6:f32[] = select %5 %2 %3
+                    %7:f32[] = stop_gradient %6
+                    %8:f32[] = sub %0 %7
+                    %9:f32[] = exp %8
+                    %10:f32[] = parallel_reduce [kind=sum, axis_name=\"m\"] %9
+                    %11:f32[] = log %10
+                    %12:f32[] = add %11 %7
+                in (%12)"},
         );
     }
 

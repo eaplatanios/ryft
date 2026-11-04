@@ -1104,7 +1104,7 @@ where
             options.clone(),
         );
 
-        if let Some(NamedAxis::Mesh { mesh, .. }) = context.named_axis(axis_name) {
+        if let Some(NamedAxis::Mesh { mesh, checks_manual_variation: true, .. }) = context.named_axis(axis_name) {
             let array = ValueProjection::<ArrayType>::into_projected(self.clone())?;
             if array.r#type().unreduced_axes().contains(axis_name) {
                 return Err(TypeError::invalid(format!(
@@ -1228,7 +1228,7 @@ impl<
         let mut input = self.clone();
         let mut operation =
             ParallelAllToAllOperation::new(axis_name.to_string(), axis_size, split_axis, concatenation_axis, options);
-        if let Some(NamedAxis::Mesh { mesh, .. }) = context.named_axis(axis_name) {
+        if let Some(NamedAxis::Mesh { mesh, checks_manual_variation: true, .. }) = context.named_axis(axis_name) {
             if input.r#type().unreduced_axes().contains(axis_name) {
                 return Err(TypeError::invalid(format!(
                     "`{PARALLEL_ALL_TO_ALL_OPERATION_NAME}` does not support unreduced inputs",
@@ -2207,7 +2207,10 @@ mod tests {
                 ArrayIrType::Array(
                     ArrayType::new_static(DataType::F32, [2, 2, 3]).with_sharding(input_sharding).unwrap(),
                 ),
-                vec![("x".to_string(), NamedAxis::Mesh { axis: 0, size: 2, mesh: mesh.clone() })],
+                vec![(
+                    "x".to_string(),
+                    NamedAxis::Mesh { axis: 0, size: 2, mesh: mesh.clone(), checks_manual_variation: true },
+                )],
             )
             .unwrap_err()
         };
@@ -2247,7 +2250,10 @@ mod tests {
                 Ok(outputs.remove(0).into_value())
             },
             input_type.clone(),
-            vec![("x".to_string(), NamedAxis::Mesh { axis: 0, size: 2, mesh: mesh.clone() })],
+            vec![(
+                "x".to_string(),
+                NamedAxis::Mesh { axis: 0, size: 2, mesh: mesh.clone(), checks_manual_variation: true },
+            )],
         )
         .unwrap();
         assert_eq!(output_type, expected_type);
@@ -2284,7 +2290,10 @@ mod tests {
                     .map_err(Into::into)
                 },
                 ArrayIrType::Array(input_type),
-                vec![("x".to_string(), NamedAxis::Mesh { axis: 0, size: 2, mesh: mesh.clone() })],
+                vec![(
+                    "x".to_string(),
+                    NamedAxis::Mesh { axis: 0, size: 2, mesh: mesh.clone(), checks_manual_variation: true },
+                )],
             )
             .unwrap();
         assert_eq!(output_type, ArrayIrType::Array(expected_type));
@@ -2345,7 +2354,10 @@ mod tests {
                     .map_err(Into::into)
                 },
                 ArrayIrType::Array(input_type),
-                vec![("x".to_string(), NamedAxis::Mesh { axis: 0, size: 2, mesh: mesh.clone() })],
+                vec![(
+                    "x".to_string(),
+                    NamedAxis::Mesh { axis: 0, size: 2, mesh: mesh.clone(), checks_manual_variation: true },
+                )],
             )
             .unwrap();
         assert_eq!(output_type, ArrayIrType::Array(expected_type));
@@ -2625,7 +2637,10 @@ mod tests {
                 Ok(output.primal().clone().into_batch().into_value())
             },
             input_type.clone(),
-            vec![("x".to_string(), NamedAxis::Mesh { axis: 0, size: 2, mesh: mesh.clone() })],
+            vec![(
+                "x".to_string(),
+                NamedAxis::Mesh { axis: 0, size: 2, mesh: mesh.clone(), checks_manual_variation: true },
+            )],
         )
         .unwrap();
         assert_eq!(output_type, expected_type);
@@ -2662,7 +2677,10 @@ mod tests {
                     Ok(output.primal().clone().into_batch().into_value())
                 },
                 ArrayIrType::Array(input_type),
-                vec![("x".to_string(), NamedAxis::Mesh { axis: 0, size: 2, mesh: mesh.clone() })],
+                vec![(
+                    "x".to_string(),
+                    NamedAxis::Mesh { axis: 0, size: 2, mesh: mesh.clone(), checks_manual_variation: true },
+                )],
             )
             .unwrap();
         assert_eq!(output_type, ArrayIrType::Array(expected_type));
@@ -3171,7 +3189,7 @@ mod tests {
         let (_, program) = TracingContext::<Array, ArrayOperation<Array>>::trace_with_named_axes(
             |input| input.parallel_all_to_all_tiled("x", 0, 0),
             varying_type,
-            vec![("x".to_string(), NamedAxis::Mesh { axis: 0, size: 2, mesh })],
+            vec![("x".to_string(), NamedAxis::Mesh { axis: 0, size: 2, mesh, checks_manual_variation: true })],
         )
         .unwrap();
         assert_eq!(
@@ -3217,7 +3235,10 @@ mod tests {
         let (_, program) = TracingContext::<Array, ArrayOperation<Array>>::trace_with_named_axes(
             |input| input.parallel_all_to_all_with_options("x", 0, 0, options.clone()),
             varying_type.clone(),
-            vec![("x".to_string(), NamedAxis::Mesh { axis: 0, size: 4, mesh: mesh.clone() })],
+            vec![(
+                "x".to_string(),
+                NamedAxis::Mesh { axis: 0, size: 4, mesh: mesh.clone(), checks_manual_variation: true },
+            )],
         )
         .unwrap();
         assert_eq!(
@@ -3244,7 +3265,10 @@ mod tests {
                 ArrayType::new_static(DataType::F32, [4])
                     .with_sharding(Sharding::replicated(mesh.clone(), 1))
                     .unwrap(),
-                vec![("x".to_string(), NamedAxis::Mesh { axis: 0, size: 4, mesh: mesh.clone() })],
+                vec![(
+                    "x".to_string(),
+                    NamedAxis::Mesh { axis: 0, size: 4, mesh: mesh.clone(), checks_manual_variation: true }
+                )],
             )
             .map(|(output_type, _)| output_type),
             Ok(varying_type),
@@ -3257,7 +3281,7 @@ mod tests {
                 ArrayType::new_static(DataType::F32, [4])
                     .with_sharding(Sharding::replicated(mesh.clone(), 1).with_unreduced_axes(["x"]).unwrap())
                     .unwrap(),
-                vec![("x".to_string(), NamedAxis::Mesh { axis: 0, size: 4, mesh })],
+                vec![("x".to_string(), NamedAxis::Mesh { axis: 0, size: 4, mesh, checks_manual_variation: true })],
             )
             .map(|(output_type, _)| output_type),
             Err(ProgramError::Type(TypeError::invalid("`parallel_all_to_all` does not support unreduced inputs"))),
@@ -3350,7 +3374,10 @@ mod tests {
                 ArrayIrType::Array(
                     ArrayType::new_static(DataType::F32, [2, 3]).with_sharding(sharding.clone()).unwrap(),
                 ),
-                vec![("x".to_string(), NamedAxis::Mesh { axis: 0, size: 2, mesh: mesh.clone() })],
+                vec![(
+                    "x".to_string(),
+                    NamedAxis::Mesh { axis: 0, size: 2, mesh: mesh.clone(), checks_manual_variation: true }
+                )],
             )
             .map(|(output_type, _)| output_type),
             Ok(ArrayIrType::Array(
@@ -3367,7 +3394,7 @@ mod tests {
                         .with_sharding(Sharding::replicated(mesh.clone(), 2).with_unreduced_axes(["x"]).unwrap())
                         .unwrap(),
                 ),
-                vec![("x".to_string(), NamedAxis::Mesh { axis: 0, size: 2, mesh })],
+                vec![("x".to_string(), NamedAxis::Mesh { axis: 0, size: 2, mesh, checks_manual_variation: true })],
             )
             .map(|(output_type, _)| output_type),
             Err(ProgramError::Type(TypeError::invalid("`parallel_all_to_all` does not support unreduced inputs"))),
@@ -3648,6 +3675,7 @@ mod tests {
                     mesh: LogicalMesh::new(vec![MeshAxis::new("x", 2, MeshAxisType::Manual).unwrap()]).unwrap(),
                     axis: 0,
                     size: 2,
+                    checks_manual_variation: true,
                 },
             )],
         )

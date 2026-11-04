@@ -12917,7 +12917,7 @@ mod tests {
                 bind_while(WhileOperation::new().with_iteration_bound(3)?, vec![condition, body], &inputs)
             },
             vec![counter_type, state_type],
-            vec![("x".to_string(), NamedAxis::Mesh { axis: 0, size: 2, mesh })],
+            vec![("x".to_string(), NamedAxis::Mesh { axis: 0, size: 2, mesh, checks_manual_variation: true })],
         )
         .unwrap();
         let jvp = program.to_flat_program().jvp_with_respect_to(&[1]).unwrap();
@@ -13574,7 +13574,7 @@ mod tests {
                 bind_while(WhileOperation::new().with_iteration_bound(3)?, vec![condition, body], &inputs)
             },
             vec![state_type],
-            vec![("x".to_string(), NamedAxis::Mesh { axis: 0, size: 2, mesh })],
+            vec![("x".to_string(), NamedAxis::Mesh { axis: 0, size: 2, mesh, checks_manual_variation: true })],
         )
         .unwrap();
         assert_eq!(
@@ -13628,7 +13628,7 @@ mod tests {
                 bind_while(WhileOperation::new().with_iteration_bound(3)?, vec![condition, body], &inputs)
             },
             vec![counter_type, state_type],
-            vec![("x".to_string(), NamedAxis::Mesh { axis: 0, size: 2, mesh })],
+            vec![("x".to_string(), NamedAxis::Mesh { axis: 0, size: 2, mesh, checks_manual_variation: true })],
         )
         .unwrap();
         let jvp = program.to_flat_program().jvp_with_respect_to(&[1]).unwrap();
@@ -13726,7 +13726,7 @@ mod tests {
                 bind_while(WhileOperation::new().with_iteration_bound(3)?, vec![condition, body], &inputs)
             },
             vec![state_type.clone()],
-            vec![("x".to_string(), NamedAxis::Mesh { axis: 0, size: 2, mesh })],
+            vec![("x".to_string(), NamedAxis::Mesh { axis: 0, size: 2, mesh, checks_manual_variation: true })],
         )
         .unwrap();
         let program = program.to_flat_program();
@@ -16435,7 +16435,10 @@ mod tests {
                     ArrayIrType::Array(invariant_type.clone()),
                     ArrayIrType::Array(varying_type.clone()),
                 ],
-                vec![("m".to_string(), NamedAxis::Mesh { axis: 0, size: 2, mesh: mesh.clone() })],
+                vec![(
+                    "m".to_string(),
+                    NamedAxis::Mesh { axis: 0, size: 2, mesh: mesh.clone(), checks_manual_variation: true },
+                )],
             )
             .unwrap();
             assert_eq!(
@@ -16527,7 +16530,10 @@ mod tests {
                 Ok(vec![counter, value])
             },
             vec![ArrayIrType::Array(varying_type.clone()), ArrayIrType::Array(invariant_type.clone())],
-            vec![("m".to_string(), NamedAxis::Mesh { axis: 0, size: 2, mesh: mesh.clone() })],
+            vec![(
+                "m".to_string(),
+                NamedAxis::Mesh { axis: 0, size: 2, mesh: mesh.clone(), checks_manual_variation: true },
+            )],
         )
         .unwrap();
         assert_eq!(
@@ -16605,7 +16611,7 @@ mod tests {
                 ArrayIrType::Array(varying_type.clone()),
                 ArrayIrType::Reference(ReferenceType::new(invariant_type.clone())),
             ],
-            vec![("m".to_string(), NamedAxis::Mesh { axis: 0, size: 2, mesh })],
+            vec![("m".to_string(), NamedAxis::Mesh { axis: 0, size: 2, mesh, checks_manual_variation: true })],
         );
         assert_eq!(
             result.map(|_| ()),
@@ -16689,6 +16695,7 @@ mod tests {
                     axis: 0,
                     size: 2,
                     mesh: LogicalMesh::new(vec![MeshAxis::new("m", 2, MeshAxisType::Manual).unwrap()]).unwrap(),
+                    checks_manual_variation: true,
                 })
             }
 

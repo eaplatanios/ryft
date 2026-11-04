@@ -18905,7 +18905,7 @@ mod tests {
                 inputs[0].domain().bind(TestOperation::Scan(TestScanOperation::new(1, 2)), vec![body], &inputs)
             },
             vec![scalar_type.clone(), stacked_type.clone()],
-            vec![("x".to_string(), NamedAxis::Mesh { axis: 0, size: 2, mesh })],
+            vec![("x".to_string(), NamedAxis::Mesh { axis: 0, size: 2, mesh, checks_manual_variation: true })],
         )
         .unwrap();
         let linearization = program.to_flat_program().linearize().unwrap();
@@ -18988,7 +18988,7 @@ mod tests {
                 inputs[0].domain().bind(TestOperation::Scan(TestScanOperation::new(1, 3)), vec![body], &inputs)
             },
             vec![scalar_type.clone(), stacked_type.clone()],
-            vec![("x".to_string(), NamedAxis::Mesh { axis: 0, size: 2, mesh })],
+            vec![("x".to_string(), NamedAxis::Mesh { axis: 0, size: 2, mesh, checks_manual_variation: true })],
         )
         .unwrap();
         let jvp = program.to_flat_program().jvp_with_respect_to(&[1]).unwrap();
@@ -23972,7 +23972,10 @@ mod tests {
                     ArrayIrType::Array(invariant_type.clone()),
                     ArrayIrType::Array(varying_type.clone()),
                 ],
-                vec![("m".to_string(), NamedAxis::Mesh { axis: 0, size: 2, mesh: mesh.clone() })],
+                vec![(
+                    "m".to_string(),
+                    NamedAxis::Mesh { axis: 0, size: 2, mesh: mesh.clone(), checks_manual_variation: true },
+                )],
             )
             .unwrap();
             let scan_attributes = format!("carry_count=3, iteration_count={iteration_count}, reverse=false");
@@ -24056,7 +24059,10 @@ mod tests {
                 Ok(vec![carry])
             },
             vec![ArrayIrType::Array(invariant_type), ArrayIrType::Array(varying_stack_type)],
-            vec![("m".to_string(), NamedAxis::Mesh { axis: 0, size: 2, mesh: mesh.clone() })],
+            vec![(
+                "m".to_string(),
+                NamedAxis::Mesh { axis: 0, size: 2, mesh: mesh.clone(), checks_manual_variation: true },
+            )],
         )
         .unwrap();
         assert_eq!(
@@ -24192,6 +24198,7 @@ mod tests {
                     axis: 0,
                     size: 2,
                     mesh: LogicalMesh::new(vec![MeshAxis::new("m", 2, MeshAxisType::Manual).unwrap()]).unwrap(),
+                    checks_manual_variation: true,
                 })
             }
 

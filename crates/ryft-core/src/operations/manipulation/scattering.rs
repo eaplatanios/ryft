@@ -2703,7 +2703,7 @@ mod tests {
                 input.scatter(&indices, &updates, operation.dimensions(), operation.kind(), operation.options())
             },
             (input, indices, updates),
-            vec![("m".to_string(), NamedAxis::Mesh { axis: 0, size: 2, mesh })],
+            vec![("m".to_string(), NamedAxis::Mesh { axis: 0, size: 2, mesh, checks_manual_variation: true })],
         )
         .unwrap();
         assert_eq!(
@@ -6035,7 +6035,10 @@ mod tests {
                 )
             },
             (varying(DataType::F64, &[4]), varying(DataType::I32, &[2, 1]), varying(DataType::F64, &[2])),
-            vec![("m".to_string(), NamedAxis::Mesh { axis: 0, size: 2, mesh: mesh.clone() })],
+            vec![(
+                "m".to_string(),
+                NamedAxis::Mesh { axis: 0, size: 2, mesh: mesh.clone(), checks_manual_variation: true },
+            )],
         )
         .unwrap();
         let jvp = program.to_flat_program().jvp_with_respect_to(&[0, 2]).unwrap();

@@ -3006,7 +3006,10 @@ mod tests {
         let (output_types, _) = TracingContext::<Array, ArrayOperation<Array>>::trace_with_named_axes(
             |state| state.random_uniform(&sample_type),
             state_type.clone(),
-            vec![("x".to_string(), NamedAxis::Mesh { axis: 0, size: 2, mesh: mesh.clone() })],
+            vec![(
+                "x".to_string(),
+                NamedAxis::Mesh { axis: 0, size: 2, mesh: mesh.clone(), checks_manual_variation: true },
+            )],
         )
         .unwrap();
         let varying_sample_type = sample_type
@@ -3464,7 +3467,10 @@ mod tests {
                     Ok((output, input_cotangent))
                 },
                 (input_type.clone(), state_type.clone()),
-                vec![("x".to_string(), NamedAxis::Mesh { axis: 0, size: 2, mesh: mesh.clone() })],
+                vec![(
+                    "x".to_string(),
+                    NamedAxis::Mesh { axis: 0, size: 2, mesh: mesh.clone(), checks_manual_variation: true },
+                )],
             )
             .unwrap();
             assert_eq!(output_types, (varying_input_type.clone(), input_type.clone()));

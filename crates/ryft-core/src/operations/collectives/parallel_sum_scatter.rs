@@ -901,7 +901,7 @@ impl<
         let scatter_axis = scatter_axis.into().normalize(self.r#type().rank())?;
         let mut input = self.clone();
         let mut operation = ParallelSumScatterOperation::new(axis_name.to_string(), axis_size, scatter_axis, options);
-        if let Some(NamedAxis::Mesh { mesh, .. }) = context.named_axis(axis_name) {
+        if let Some(NamedAxis::Mesh { mesh, checks_manual_variation: true, .. }) = context.named_axis(axis_name) {
             if !input.r#type().sharding().is_some_and(|sharding| {
                 sharding.varying_manual_axes().contains(axis_name) || sharding.unreduced_axes().contains(axis_name)
             }) {
@@ -966,7 +966,7 @@ where
         let mut input = self.clone();
         let mut operation =
             ParallelSumScatterOperation::new(axis_name.to_string(), axis_size, scatter_axis, options.clone());
-        if let Some(NamedAxis::Mesh { mesh, .. }) = context.named_axis(axis_name) {
+        if let Some(NamedAxis::Mesh { mesh, checks_manual_variation: true, .. }) = context.named_axis(axis_name) {
             let array = ValueProjection::<ArrayType>::into_projected(self.clone())?;
             if !array.r#type().sharding().is_some_and(|sharding| {
                 sharding.varying_manual_axes().contains(axis_name) || sharding.unreduced_axes().contains(axis_name)
@@ -1848,7 +1848,10 @@ mod tests {
                 Ok(outputs.remove(0).into_value())
             },
             input_type.clone(),
-            vec![("x".to_string(), NamedAxis::Mesh { axis: 0, size: 2, mesh: mesh.clone() })],
+            vec![(
+                "x".to_string(),
+                NamedAxis::Mesh { axis: 0, size: 2, mesh: mesh.clone(), checks_manual_variation: true },
+            )],
         )
         .unwrap();
         assert_eq!(output_type, expected_type);
@@ -1868,7 +1871,10 @@ mod tests {
                     .map_err(Into::into)
                 },
                 ArrayIrType::Array(input_type),
-                vec![("x".to_string(), NamedAxis::Mesh { axis: 0, size: 2, mesh: mesh.clone() })],
+                vec![(
+                    "x".to_string(),
+                    NamedAxis::Mesh { axis: 0, size: 2, mesh: mesh.clone(), checks_manual_variation: true },
+                )],
             )
             .unwrap();
         assert_eq!(output_type, ArrayIrType::Array(expected_type));
@@ -1918,7 +1924,10 @@ mod tests {
                 Ok(outputs.remove(0).into_value())
             },
             input_type.clone(),
-            vec![("x".to_string(), NamedAxis::Mesh { axis: 0, size: 2, mesh: mesh.clone() })],
+            vec![(
+                "x".to_string(),
+                NamedAxis::Mesh { axis: 0, size: 2, mesh: mesh.clone(), checks_manual_variation: true },
+            )],
         )
         .unwrap();
         assert_eq!(output_type, expected_type);
@@ -1938,7 +1947,10 @@ mod tests {
                     .map_err(Into::into)
                 },
                 ArrayIrType::Array(input_type),
-                vec![("x".to_string(), NamedAxis::Mesh { axis: 0, size: 2, mesh: mesh.clone() })],
+                vec![(
+                    "x".to_string(),
+                    NamedAxis::Mesh { axis: 0, size: 2, mesh: mesh.clone(), checks_manual_variation: true },
+                )],
             )
             .unwrap();
         assert_eq!(output_type, ArrayIrType::Array(expected_type));
@@ -2119,7 +2131,10 @@ mod tests {
                     Ok(output.primal().clone().into_batch().into_value())
                 },
                 input_type.clone(),
-                vec![("x".to_string(), NamedAxis::Mesh { axis: 0, size: 2, mesh: mesh.clone() })],
+                vec![(
+                    "x".to_string(),
+                    NamedAxis::Mesh { axis: 0, size: 2, mesh: mesh.clone(), checks_manual_variation: true },
+                )],
             )
             .unwrap();
         assert_eq!(differentiated_output_type, expected_type);
@@ -2159,7 +2174,10 @@ mod tests {
                     Ok(output.primal().clone().into_batch().into_value())
                 },
                 input_type.clone(),
-                vec![("x".to_string(), NamedAxis::Mesh { axis: 0, size: 2, mesh: mesh.clone() })],
+                vec![(
+                    "x".to_string(),
+                    NamedAxis::Mesh { axis: 0, size: 2, mesh: mesh.clone(), checks_manual_variation: true },
+                )],
             )
             .unwrap();
         assert_eq!(differentiated_output_type, expected_type);
@@ -2667,7 +2685,10 @@ mod tests {
             ArrayType::new_static(DataType::F32, [4])
                 .with_sharding(sharding.clone().with_varying_manual_axes(["x"]).unwrap())
                 .unwrap(),
-            vec![("x".to_string(), NamedAxis::Mesh { axis: 0, size: 2, mesh: mesh.clone() })],
+            vec![(
+                "x".to_string(),
+                NamedAxis::Mesh { axis: 0, size: 2, mesh: mesh.clone(), checks_manual_variation: true },
+            )],
         )
         .unwrap();
         assert_eq!(
@@ -2691,7 +2712,10 @@ mod tests {
         let (_, program) = TracingContext::<Array, ArrayOperation<Array>>::trace_with_named_axes(
             |input| input.parallel_sum_scatter_with_options("x", 0, CollectiveOptions::tiled()),
             ArrayType::new_static(DataType::F32, [4]).with_sharding(sharding.clone()).unwrap(),
-            vec![("x".to_string(), NamedAxis::Mesh { axis: 0, size: 2, mesh: mesh.clone() })],
+            vec![(
+                "x".to_string(),
+                NamedAxis::Mesh { axis: 0, size: 2, mesh: mesh.clone(), checks_manual_variation: true },
+            )],
         )
         .unwrap();
         assert_eq!(
@@ -2719,7 +2743,7 @@ mod tests {
             ArrayType::new_static(DataType::F32, [4])
                 .with_sharding(sharding.with_unreduced_axes(["x"]).unwrap())
                 .unwrap(),
-            vec![("x".to_string(), NamedAxis::Mesh { axis: 0, size: 2, mesh })],
+            vec![("x".to_string(), NamedAxis::Mesh { axis: 0, size: 2, mesh, checks_manual_variation: true })],
         )
         .unwrap();
         assert_eq!(
@@ -2752,7 +2776,10 @@ mod tests {
                     .with_sharding(sharding.clone().with_varying_manual_axes(["x"]).unwrap())
                     .unwrap(),
             ),
-            vec![("x".to_string(), NamedAxis::Mesh { axis: 0, size: 2, mesh: mesh.clone() })],
+            vec![(
+                "x".to_string(),
+                NamedAxis::Mesh { axis: 0, size: 2, mesh: mesh.clone(), checks_manual_variation: true },
+            )],
         )
         .unwrap();
         assert_eq!(
@@ -2779,7 +2806,10 @@ mod tests {
         let (_, program) = TracingContext::<ArrayIrValue<Array>, ArrayIrOperation<Array>>::trace_with_named_axes(
             |input| input.parallel_sum_scatter_with_options("x", 0, CollectiveOptions::tiled()),
             ArrayIrType::Array(ArrayType::new_static(DataType::F32, [4]).with_sharding(sharding.clone()).unwrap()),
-            vec![("x".to_string(), NamedAxis::Mesh { axis: 0, size: 2, mesh: mesh.clone() })],
+            vec![(
+                "x".to_string(),
+                NamedAxis::Mesh { axis: 0, size: 2, mesh: mesh.clone(), checks_manual_variation: true },
+            )],
         )
         .unwrap();
         assert_eq!(
@@ -2812,7 +2842,7 @@ mod tests {
                     .with_sharding(sharding.with_unreduced_axes(["x"]).unwrap())
                     .unwrap(),
             ),
-            vec![("x".to_string(), NamedAxis::Mesh { axis: 0, size: 2, mesh })],
+            vec![("x".to_string(), NamedAxis::Mesh { axis: 0, size: 2, mesh, checks_manual_variation: true })],
         )
         .unwrap();
         assert_eq!(
@@ -2844,7 +2874,10 @@ mod tests {
         let (_, program) = TracingContext::<ArrayIrValue<Array>, ArrayIrOperation<Array>>::trace_with_named_axes(
             |input| input.parallel_sum_scatter_with_options("x", 0, CollectiveOptions::tiled()),
             ArrayIrType::Array(input_type),
-            vec![("x".to_string(), NamedAxis::Mesh { axis: 0, size: 2, mesh: manual_mesh() })],
+            vec![(
+                "x".to_string(),
+                NamedAxis::Mesh { axis: 0, size: 2, mesh: manual_mesh(), checks_manual_variation: true },
+            )],
         )
         .unwrap();
         assert_eq!(

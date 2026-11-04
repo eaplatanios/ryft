@@ -3198,7 +3198,10 @@ mod tests {
                 Ok(())
             },
             (ArrayIrType::Dimension(extent_type.clone()), varying(DataType::Boolean), varying(DataType::I32)),
-            vec![("x".to_string(), NamedAxis::Mesh { mesh: mesh.clone(), axis: 0, size: 2 })],
+            vec![(
+                "x".to_string(),
+                NamedAxis::Mesh { mesh: mesh.clone(), axis: 0, size: 2, checks_manual_variation: true },
+            )],
         )
         .unwrap();
         assert_eq!(
@@ -3756,7 +3759,10 @@ mod tests {
                 Ok(())
             },
             (condition_type, observation_type),
-            vec![("x".to_string(), NamedAxis::Mesh { mesh: mesh.clone(), axis: 0, size: 2 })],
+            vec![(
+                "x".to_string(),
+                NamedAxis::Mesh { mesh: mesh.clone(), axis: 0, size: 2, checks_manual_variation: true },
+            )],
         )
         .unwrap();
         assert_eq!(

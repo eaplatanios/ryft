@@ -3413,7 +3413,10 @@ mod tests {
                 )
                 .unwrap()
         };
-        let named_axes = vec![("m".to_string(), NamedAxis::Mesh { axis: 0, size: 2, mesh: mesh.clone() })];
+        let named_axes = vec![(
+            "m".to_string(),
+            NamedAxis::Mesh { axis: 0, size: 2, mesh: mesh.clone(), checks_manual_variation: true },
+        )];
         let invariant = ArrayType::scalar(DataType::F32).with_sharding(Sharding::replicated(mesh.clone(), 0)).unwrap();
         let (output_type, program) = TracingContext::<Array, ArrayOperation<Array>>::trace_with_named_axes(
             |(input, padding_value): (Tracer<TracingContext<Array, ArrayOperation<Array>>>, _)| {
@@ -5823,7 +5826,7 @@ mod tests {
                     ),
                     DimensionType::from(output_size.clone()).into(),
                 ],
-                vec![("m".to_string(), NamedAxis::Mesh { axis: 0, size: 2, mesh })],
+                vec![("m".to_string(), NamedAxis::Mesh { axis: 0, size: 2, mesh, checks_manual_variation: true })],
             )
             .unwrap();
         assert_eq!(
@@ -6106,7 +6109,7 @@ mod tests {
                     DimensionType::from(low).into(),
                     DimensionType::from(extent.clone()).into(),
                 ],
-                vec![("m".to_string(), NamedAxis::Mesh { axis: 0, size: 2, mesh })],
+                vec![("m".to_string(), NamedAxis::Mesh { axis: 0, size: 2, mesh, checks_manual_variation: true })],
             )
             .unwrap();
         assert_eq!(

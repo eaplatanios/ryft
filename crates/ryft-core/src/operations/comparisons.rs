@@ -1615,7 +1615,7 @@ mod tests {
         let (_, program) = DomainTracingContext::<EagerContext<Array, ArrayOperation<Array>>>::trace_with_named_axes(
             |(invariant, varying): (_, _)| invariant.less_than(&varying),
             (ArrayType::scalar(DataType::F32), varying_type),
-            vec![("m".to_string(), NamedAxis::Mesh { axis: 0, size: 2, mesh })],
+            vec![("m".to_string(), NamedAxis::Mesh { axis: 0, size: 2, mesh, checks_manual_variation: true })],
         )
         .unwrap();
         assert_eq!(

@@ -4014,7 +4014,10 @@ mod tests {
                 Ok(vec![elements, scales])
             },
             varying(DataType::F32, 8),
-            vec![("x".to_string(), NamedAxis::Mesh { mesh: mesh.clone(), axis: 0, size: 2 })],
+            vec![(
+                "x".to_string(),
+                NamedAxis::Mesh { mesh: mesh.clone(), axis: 0, size: 2, checks_manual_variation: true },
+            )],
         )
         .unwrap();
         assert_eq!(output_types, vec![varying(DataType::F4E2M1FN, 8), varying(DataType::F8E4M3FN, 2)]);
@@ -4147,7 +4150,10 @@ mod tests {
                 Ok(vec![elements, scales])
             },
             varying(DataType::F32, 8),
-            vec![("x".to_string(), NamedAxis::Mesh { mesh: mesh.clone(), axis: 0, size: 2 })],
+            vec![(
+                "x".to_string(),
+                NamedAxis::Mesh { mesh: mesh.clone(), axis: 0, size: 2, checks_manual_variation: true },
+            )],
         )
         .unwrap();
         assert_eq!(output_types, vec![varying(DataType::F8E4M3FN, 8), varying(DataType::F8E8M0FNU, 2)]);
@@ -4918,7 +4924,10 @@ mod tests {
                     Ok(vec![elements, scales])
                 },
                 (ArrayIrType::Array(input_type.clone()), ArrayIrType::Array(global_scale_type)),
-                vec![("x".to_string(), NamedAxis::Mesh { mesh: mesh.clone(), axis: 0, size: 2 })],
+                vec![(
+                    "x".to_string(),
+                    NamedAxis::Mesh { mesh: mesh.clone(), axis: 0, size: 2, checks_manual_variation: true },
+                )],
             )
             .unwrap();
         assert_eq!(

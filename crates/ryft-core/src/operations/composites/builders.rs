@@ -5800,7 +5800,8 @@ mod tests {
         let invariant_indices = placed(DataType::I64, &[3, 1], false);
         let varying_indices = placed(DataType::I64, &[3, 1], true);
         let varying_matrix_sharding = varying_matrix.sharding().unwrap();
-        let named_axes = vec![("m".to_string(), NamedAxis::Mesh { mesh, axis: 0, size: 2 })];
+        let named_axes =
+            vec![("m".to_string(), NamedAxis::Mesh { mesh, axis: 0, size: 2, checks_manual_variation: true })];
         let function = composite(|(x, y): (ArrayTracer, ArrayTracer)| Ok(x + y)).with_broadcast_sensitive_batching(
             |(x, y): (ArrayTracer, ArrayTracer),
              (x_axis, y_axis): (BatchAxis, BatchAxis),

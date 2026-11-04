@@ -401,7 +401,7 @@ impl ParallelRaggedAllToAllOperation {
         let context = inputs[0].domain();
         let mut inputs = inputs.map(Clone::clone);
         let axis_name = self.axis_name.clone();
-        if let Some(NamedAxis::Mesh { mesh, .. }) = context.named_axis(&axis_name) {
+        if let Some(NamedAxis::Mesh { mesh, checks_manual_variation: true, .. }) = context.named_axis(&axis_name) {
             if inputs.iter().any(|input| input.r#type().unreduced_axes().contains(axis_name.as_str())) {
                 return Err(TypeError::invalid(format!(
                     "`{PARALLEL_RAGGED_ALL_TO_ALL_OPERATION_NAME}` does not support unreduced inputs",
@@ -3239,7 +3239,10 @@ mod tests {
                 Ok(exchanged.into_batch().into_value())
             },
             vec![typed(DataType::F32, [2, 3]), typed(DataType::F32, [2, 4])],
-            vec![("x".to_string(), NamedAxis::Mesh { axis: 0, size: 2, mesh: mesh.clone() })],
+            vec![(
+                "x".to_string(),
+                NamedAxis::Mesh { axis: 0, size: 2, mesh: mesh.clone(), checks_manual_variation: true },
+            )],
         )
         .unwrap();
         assert_eq!(output_type, typed(DataType::F32, [2, 4]));
@@ -3477,7 +3480,10 @@ mod tests {
                 typed(DataType::I32, [2, 2]),
                 typed(DataType::I32, [2, 2]),
             ],
-            vec![("x".to_string(), NamedAxis::Mesh { axis: 0, size: 2, mesh: mesh.clone() })],
+            vec![(
+                "x".to_string(),
+                NamedAxis::Mesh { axis: 0, size: 2, mesh: mesh.clone(), checks_manual_variation: true },
+            )],
         )
         .unwrap();
         assert_eq!(output_type, typed(DataType::F32, [2, 4]));
@@ -4886,8 +4892,8 @@ mod tests {
         let mesh = manual_mesh();
         let sharding = Sharding::replicated(mesh.clone(), 1);
         let axes = vec![
-            ("x".to_string(), NamedAxis::Mesh { axis: 0, size: 2, mesh: mesh.clone() }),
-            ("y".to_string(), NamedAxis::Mesh { axis: 1, size: 2, mesh: mesh.clone() }),
+            ("x".to_string(), NamedAxis::Mesh { axis: 0, size: 2, mesh: mesh.clone(), checks_manual_variation: true }),
+            ("y".to_string(), NamedAxis::Mesh { axis: 1, size: 2, mesh: mesh.clone(), checks_manual_variation: true }),
         ];
         let typed = |data_type, extent: usize, varying_manual_axes: &[&str]| {
             ArrayType::new_static(data_type, [extent])
@@ -5082,7 +5088,10 @@ mod tests {
             typed(DataType::I32, 2),
             typed(DataType::I32, 2),
         ];
-        let axes = vec![("x".to_string(), NamedAxis::Mesh { axis: 0, size: 2, mesh: mesh.clone() })];
+        let axes = vec![(
+            "x".to_string(),
+            NamedAxis::Mesh { axis: 0, size: 2, mesh: mesh.clone(), checks_manual_variation: true },
+        )];
         let (output_type, program) = TracingContext::<Array, ArrayOperation<Array>>::trace_with_named_axes(
             |inputs: Vec<_>| {
                 inputs[0].parallel_ragged_all_to_all_with_axis_index_groups(

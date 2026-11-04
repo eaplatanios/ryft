@@ -264,6 +264,10 @@ pub enum NamedAxis {
 
         /// Number of shards along this mesh axis.
         size: usize,
+
+        /// Whether this binding checks manual variation. With `false`, collective operations retain their physical
+        /// communication semantics without adding variation metadata to local values.
+        checks_manual_variation: bool,
     },
 }
 
@@ -275,6 +279,26 @@ impl NamedAxis {
         match self {
             Self::Batched { size } => *size,
             Self::Mesh { size, .. } => Some(*size),
+        }
+    }
+
+    /// Returns the logical mesh that owns this binding, for both checked and unchecked mesh axes. Batched axes have
+    /// no mesh.
+    #[inline]
+    pub fn mesh(&self) -> Option<&LogicalMesh> {
+        match self {
+            Self::Mesh { mesh, .. } => Some(mesh),
+            Self::Batched { .. } => None,
+        }
+    }
+
+    /// Returns whether this binding enables manual-variation checks. Batched axes and unchecked mesh axes return
+    /// `false`, so their collective operations use ordinary array types.
+    #[inline]
+    pub fn checks_manual_variation(&self) -> bool {
+        match self {
+            Self::Mesh { checks_manual_variation, .. } => *checks_manual_variation,
+            Self::Batched { .. } => false,
         }
     }
 }
@@ -544,23 +568,42 @@ mod tests {
         assert_ne!(NamedAxis::Batched { size: Some(3) }, NamedAxis::Batched { size: Some(4) });
         assert_ne!(NamedAxis::Batched { size: Some(3) }, NamedAxis::Batched { size: None });
         assert_eq!(
-            NamedAxis::Mesh { mesh: mesh.clone(), axis: 1, size: 2 },
-            NamedAxis::Mesh { mesh: mesh.clone(), axis: 1, size: 2 }
+            NamedAxis::Mesh { mesh: mesh.clone(), axis: 1, size: 2, checks_manual_variation: true },
+            NamedAxis::Mesh { mesh: mesh.clone(), axis: 1, size: 2, checks_manual_variation: true }
         );
         assert_ne!(
-            NamedAxis::Mesh { mesh: mesh.clone(), axis: 0, size: 2 },
-            NamedAxis::Mesh { mesh: mesh.clone(), axis: 1, size: 2 }
+            NamedAxis::Mesh { mesh: mesh.clone(), axis: 0, size: 2, checks_manual_variation: true },
+            NamedAxis::Mesh { mesh: mesh.clone(), axis: 1, size: 2, checks_manual_variation: true }
         );
 
         // A batched axis never equals a mesh axis, even when their sizes match.
-        assert_ne!(NamedAxis::Batched { size: Some(2) }, NamedAxis::Mesh { mesh: mesh.clone(), axis: 0, size: 2 });
+        assert_ne!(
+            NamedAxis::Batched { size: Some(2) },
+            NamedAxis::Mesh { mesh: mesh.clone(), axis: 0, size: 2, checks_manual_variation: true }
+        );
+        assert_ne!(
+            NamedAxis::Mesh { mesh: mesh.clone(), axis: 0, size: 2, checks_manual_variation: true },
+            NamedAxis::Mesh { mesh: mesh.clone(), axis: 0, size: 2, checks_manual_variation: false },
+        );
 
         let axes = HashSet::from([
             NamedAxis::Batched { size: Some(3) },
-            NamedAxis::Mesh { mesh: mesh.clone(), axis: 1, size: 2 },
+            NamedAxis::Mesh { mesh: mesh.clone(), axis: 1, size: 2, checks_manual_variation: true },
+            NamedAxis::Mesh { mesh: mesh.clone(), axis: 1, size: 2, checks_manual_variation: false },
         ]);
         assert!(axes.contains(&NamedAxis::Batched { size: Some(3) }));
-        assert!(axes.contains(&NamedAxis::Mesh { mesh: mesh.clone(), axis: 1, size: 2 }));
+        assert!(axes.contains(&NamedAxis::Mesh {
+            mesh: mesh.clone(),
+            axis: 1,
+            size: 2,
+            checks_manual_variation: true
+        }));
+        assert!(axes.contains(&NamedAxis::Mesh {
+            mesh: mesh.clone(),
+            axis: 1,
+            size: 2,
+            checks_manual_variation: false
+        }));
         assert!(!axes.contains(&NamedAxis::Batched { size: Some(2) }));
     }
 
@@ -569,6 +612,35 @@ mod tests {
         let mesh = LogicalMesh::new(vec![MeshAxis::new("x", 2, MeshAxisType::Manual).unwrap()]).unwrap();
         assert_eq!(NamedAxis::Batched { size: Some(3) }.size(), Some(3));
         assert_eq!(NamedAxis::Batched { size: None }.size(), None);
-        assert_eq!(NamedAxis::Mesh { mesh, axis: 0, size: 2 }.size(), Some(2));
+        assert_eq!(
+            NamedAxis::Mesh { mesh: mesh.clone(), axis: 0, size: 2, checks_manual_variation: true }.size(),
+            Some(2)
+        );
+        assert_eq!(NamedAxis::Mesh { mesh, axis: 0, size: 2, checks_manual_variation: false }.size(), Some(2));
+    }
+
+    #[test]
+    fn test_named_axis_mesh() {
+        let mesh = LogicalMesh::new(vec![MeshAxis::new("x", 2, MeshAxisType::Manual).unwrap()]).unwrap();
+        assert_eq!(NamedAxis::Batched { size: Some(2) }.mesh(), None);
+        assert_eq!(
+            NamedAxis::Mesh { mesh: mesh.clone(), axis: 0, size: 2, checks_manual_variation: true }.mesh(),
+            Some(&mesh)
+        );
+        assert_eq!(
+            NamedAxis::Mesh { mesh: mesh.clone(), axis: 0, size: 2, checks_manual_variation: false }.mesh(),
+            Some(&mesh)
+        );
+    }
+
+    #[test]
+    fn test_named_axis_checks_manual_variation() {
+        let mesh = LogicalMesh::new(vec![MeshAxis::new("x", 2, MeshAxisType::Manual).unwrap()]).unwrap();
+        assert!(!NamedAxis::Batched { size: Some(2) }.checks_manual_variation());
+        assert!(
+            NamedAxis::Mesh { mesh: mesh.clone(), axis: 0, size: 2, checks_manual_variation: true }
+                .checks_manual_variation()
+        );
+        assert!(!NamedAxis::Mesh { mesh, axis: 0, size: 2, checks_manual_variation: false }.checks_manual_variation());
     }
 }

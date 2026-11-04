@@ -94,7 +94,7 @@
 //! # fn main() -> Result<(), Box<dyn std::error::Error>> {
 //! let mesh = LogicalMesh::new(vec![MeshAxis::new("x", 2, MeshAxisType::Manual)?])?;
 //! let invariant = ArrayType::new_static(DataType::F32, [3]).with_sharding(Sharding::replicated(mesh.clone(), 1))?;
-//! let axes = vec![("x".to_string(), NamedAxis::Mesh { mesh, axis: 0, size: 2 })];
+//! let axes = vec![("x".to_string(), NamedAxis::Mesh { mesh, axis: 0, size: 2, checks_manual_variation: true })];
 //! let (_, program) = TracingContext::<Array, ArrayOperation<Array>>::trace_with_named_axes(
 //!     |input| input.parallel_all_gather_tiled("x", 0),
 //!     invariant,

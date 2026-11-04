@@ -521,7 +521,7 @@ impl<
         let axis_size = resolve_named_axis_size(&context, axis_name)?;
         let mut operation = ParallelPermuteOperation::new(axis_name.to_string(), axis_size, source_target_pairs);
         let mut input = self.clone();
-        if let Some(NamedAxis::Mesh { mesh, .. }) = context.named_axis(axis_name) {
+        if let Some(NamedAxis::Mesh { mesh, checks_manual_variation: true, .. }) = context.named_axis(axis_name) {
             if input.r#type().unreduced_axes().contains(axis_name) {
                 return Err(TypeError::invalid(format!(
                     "`{PARALLEL_PERMUTE_OPERATION_NAME}` does not support unreduced inputs",
@@ -681,7 +681,10 @@ mod tests {
                 Ok(input.parallel_permute("x", source_target_pairs)?.into_batch().into_value())
             },
             input_type,
-            vec![("x".to_string(), NamedAxis::Mesh { axis: 0, size: 2, mesh: manual_mesh() })],
+            vec![(
+                "x".to_string(),
+                NamedAxis::Mesh { axis: 0, size: 2, mesh: manual_mesh(), checks_manual_variation: true },
+            )],
         )
         .unwrap()
     }
@@ -1389,7 +1392,10 @@ mod tests {
         // Over a manual mesh axis, a varying value is permuted directly, while an invariant value, and a value without
         // a sharding, are first made varying, because the permuted participants generally hold different values.
         let mesh = manual_mesh();
-        let axes = vec![("x".to_string(), NamedAxis::Mesh { axis: 0, size: 2, mesh: mesh.clone() })];
+        let axes = vec![(
+            "x".to_string(),
+            NamedAxis::Mesh { axis: 0, size: 2, mesh: mesh.clone(), checks_manual_variation: true },
+        )];
         let sharding = Sharding::replicated(mesh, 0);
         let varying = ArrayType::scalar(DataType::F32)
             .with_sharding(sharding.clone().with_varying_manual_axes(["x"]).unwrap())
@@ -1507,7 +1513,10 @@ mod tests {
             MeshAxis::new("y", 2, MeshAxisType::Manual).unwrap(),
         ])
         .unwrap();
-        let axes = vec![("x".to_string(), NamedAxis::Mesh { axis: 0, size: 2, mesh: mesh.clone() })];
+        let axes = vec![(
+            "x".to_string(),
+            NamedAxis::Mesh { axis: 0, size: 2, mesh: mesh.clone(), checks_manual_variation: true },
+        )];
         let pending_y = Sharding::replicated(mesh.clone(), 1).with_unreduced_axes(["y"]).unwrap();
         let input_type = ArrayType::new_static(DataType::F32, [4]).with_sharding(pending_y.clone()).unwrap();
         let output_type = ArrayType::new_static(DataType::F32, [4])

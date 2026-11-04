@@ -2055,7 +2055,7 @@ mod tests {
     #[test]
     fn test_tracing_context_trace_with_context_and_named_axes_axis_index() {
         let mesh = LogicalMesh::new(vec![MeshAxis::new("devices", 2, MeshAxisType::Manual).unwrap()]).unwrap();
-        let axis = NamedAxis::Mesh { mesh: mesh.clone(), axis: 0, size: 2 };
+        let axis = NamedAxis::Mesh { mesh: mesh.clone(), axis: 0, size: 2, checks_manual_variation: true };
         let (output_type, program) = TracingContext::<Array, ArrayOperation<Array>>::trace_with_context_and_named_axes(
             |context, ()| {
                 assert_eq!(context.named_axis("devices"), Some(axis.clone()));

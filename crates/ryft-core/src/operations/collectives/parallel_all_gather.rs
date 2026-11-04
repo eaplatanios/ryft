@@ -1211,7 +1211,9 @@ pub trait ParallelAllGather<T = <Self as Capability>::Universe>: Capability + Si
     ///   - `options`: [`CollectiveMode`] and optional participant groups of the collective (refer to the
     ///     documentation of [`CollectiveOptions::with_axis_index_groups`] for how the groups route the data).
     ///   - `output_variance`: Manual variation of the result over a manual mesh axis. An ordinary all-gather
-    ///     preserves the mesh state of this value.
+    ///     preserves the mesh state of this value. An unchecked manual region uses the ordinary varying-output
+    ///     collective for every selection, retaining its shape and physical communication without adding variance
+    ///     or reduction metadata.
     ///
     /// # Errors
     ///
@@ -1302,6 +1304,16 @@ impl<
         // concatenation axis is a position in the result, whose rank is one more than the rank of the input.
         let context = self.domain();
         let axis_size = resolve_named_axis_size(&context, axis_name)?;
+        let named_axis = context.named_axis(axis_name);
+
+        // Unchecked manual regions use the ordinary collective and its defensive transpose regardless of the
+        // requested variance optimization. The physical participants and shape transformation are unchanged.
+        let output_variance = if matches!(named_axis, Some(NamedAxis::Mesh { checks_manual_variation: false, .. })) {
+            ParallelAllGatherOutputVariance::Varying
+        } else {
+            output_variance
+        };
+
         let result_rank = self.r#type().rank() + usize::from(options.mode == CollectiveMode::Untiled);
         let concatenation_axis = concatenation_axis.into().normalize(result_rank)?;
         let mut operation = ParallelAllGatherOperation::new(
@@ -1313,7 +1325,10 @@ impl<
         );
         operation.effective_axis_size()?;
         let mut input = self.clone();
-        if let Some(NamedAxis::Mesh { mesh, .. }) = context.named_axis(axis_name) {
+        if let Some(binding) = named_axis.as_ref()
+            && binding.checks_manual_variation()
+            && let Some(mesh) = binding.mesh().cloned()
+        {
             operation.validate_input_reduction_state(self.r#type().as_ref())?;
             if !self.r#type().sharding().is_some_and(|sharding| sharding.varying_manual_axes().contains(axis_name)) {
                 input = input.parallel_vary(axis_name)?;
@@ -1357,6 +1372,15 @@ where
         // result extents are derived from the input extents.
         let context = self.domain();
         let axis_size = resolve_named_axis_size(&context, axis_name)?;
+        let named_axis = context.named_axis(axis_name);
+
+        // The unchecked binder owns physical communication while the primitive keeps ordinary array typing.
+        let output_variance = if matches!(named_axis, Some(NamedAxis::Mesh { checks_manual_variation: false, .. })) {
+            ParallelAllGatherOutputVariance::Varying
+        } else {
+            output_variance
+        };
+
         let input_type = self.r#type();
         let input_type = <&ArrayType>::try_from(input_type.as_ref())?;
         let rank = input_type.rank();
@@ -1372,7 +1396,10 @@ where
 
         let effective_axis_size = operation.effective_axis_size()?;
         let mut input = self.clone();
-        if let Some(NamedAxis::Mesh { mesh, .. }) = context.named_axis(axis_name) {
+        if let Some(binding) = named_axis.as_ref()
+            && binding.checks_manual_variation()
+            && let Some(mesh) = binding.mesh().cloned()
+        {
             operation.validate_input_reduction_state(input_type)?;
             if !input_type.sharding().is_some_and(|sharding| sharding.varying_manual_axes().contains(axis_name)) {
                 let array = ValueProjection::<ArrayType>::into_projected(self.clone())?;
@@ -2052,7 +2079,7 @@ mod tests {
         let (_, program) = TracingContext::<ArrayIrValue<Array>, ArrayIrOperation<Array>>::trace_with_named_axes(
             |input| input.parallel_all_gather_tiled("devices", 0),
             ArrayIrType::Array(input_type),
-            vec![("devices".to_string(), NamedAxis::Mesh { mesh, axis: 0, size: 2 })],
+            vec![("devices".to_string(), NamedAxis::Mesh { mesh, axis: 0, size: 2, checks_manual_variation: true })],
         )
         .unwrap();
         assert_eq!(
@@ -2594,7 +2621,10 @@ mod tests {
                 Ok(outputs.remove(0).into_value())
             },
             input_type,
-            vec![("x".to_string(), NamedAxis::Mesh { axis: 0, size: 2, mesh: mesh.clone() })],
+            vec![(
+                "x".to_string(),
+                NamedAxis::Mesh { axis: 0, size: 2, mesh: mesh.clone(), checks_manual_variation: true },
+            )],
         )
         .unwrap();
         assert_eq!(
@@ -3321,7 +3351,7 @@ mod tests {
                 )
             },
             ArrayIrType::Array(input_type),
-            vec![("x".to_string(), NamedAxis::Mesh { axis: 0, size: 2, mesh })],
+            vec![("x".to_string(), NamedAxis::Mesh { axis: 0, size: 2, mesh, checks_manual_variation: true })],
         )
         .unwrap();
         let pullback = program.to_flat_program().linearize().unwrap().pullback().unwrap().into_program();
@@ -3796,7 +3826,7 @@ mod tests {
         let (_, program) = TracingContext::<Array, ArrayOperation<Array>>::trace_with_named_axes(
             |input| input.parallel_all_gather_tiled("x", 0),
             invariant_type,
-            vec![("x".to_string(), NamedAxis::Mesh { axis: 0, size: 2, mesh })],
+            vec![("x".to_string(), NamedAxis::Mesh { axis: 0, size: 2, mesh, checks_manual_variation: true })],
         )
         .unwrap();
         assert_eq!(
@@ -3831,7 +3861,7 @@ mod tests {
         let (output, program) = TracingContext::<ArrayIrValue<Array>, ArrayIrOperation<Array>>::trace_with_named_axes(
             |input| input.parallel_all_gather_tiled("x", 0),
             ArrayIrType::Array(ArrayType::new_static(DataType::F32, [4]).with_sharding(sharding.clone()).unwrap()),
-            vec![("x".to_string(), NamedAxis::Mesh { axis: 0, size: 2, mesh })],
+            vec![("x".to_string(), NamedAxis::Mesh { axis: 0, size: 2, mesh, checks_manual_variation: true })],
         )
         .unwrap();
         assert_eq!(
@@ -3884,7 +3914,10 @@ mod tests {
                 )
             },
             varying_type.clone(),
-            vec![("x".to_string(), NamedAxis::Mesh { axis: 0, size: 2, mesh: mesh.clone() })],
+            vec![(
+                "x".to_string(),
+                NamedAxis::Mesh { axis: 0, size: 2, mesh: mesh.clone(), checks_manual_variation: true },
+            )],
         )
         .unwrap();
         assert_eq!(output_type, ArrayType::new_static(DataType::F32, [6]).with_sharding(sharding.clone()).unwrap());
@@ -3915,7 +3948,10 @@ mod tests {
                 )
             },
             varying_type.clone(),
-            vec![("x".to_string(), NamedAxis::Mesh { axis: 0, size: 2, mesh: mesh.clone() })],
+            vec![(
+                "x".to_string(),
+                NamedAxis::Mesh { axis: 0, size: 2, mesh: mesh.clone(), checks_manual_variation: true },
+            )],
         )
         .unwrap();
         assert_eq!(
@@ -3968,7 +4004,7 @@ mod tests {
                     )
                 },
                 varying_type.clone(),
-                vec![("x".to_string(), NamedAxis::Mesh { axis: 0, size: 2, mesh: mesh.clone() })],
+                vec![("x".to_string(), NamedAxis::Mesh { axis: 0, size: 2, mesh: mesh.clone(), checks_manual_variation: true })],
             ),
             Err(ProgramError::Type(TypeError::Invalid { message }))
                 if message == "`parallel_all_gather` axis index groups are not supported with invariant or reduced \
@@ -3992,7 +4028,7 @@ mod tests {
                         )
                     },
                     input_type.clone(),
-                    vec![("x".to_string(), NamedAxis::Mesh { axis: 0, size: 2, mesh: mesh.clone() })],
+                    vec![("x".to_string(), NamedAxis::Mesh { axis: 0, size: 2, mesh: mesh.clone(), checks_manual_variation: true })],
                 ),
                 Err(ProgramError::Type(TypeError::Invalid { message }))
                     if message == "`parallel_all_gather` input must not carry reduction state over manual axis `x`",
@@ -4008,7 +4044,7 @@ mod tests {
                         )
                     },
                     ArrayIrType::Array(input_type),
-                    vec![("x".to_string(), NamedAxis::Mesh { axis: 0, size: 2, mesh: mesh.clone() })],
+                    vec![("x".to_string(), NamedAxis::Mesh { axis: 0, size: 2, mesh: mesh.clone(), checks_manual_variation: true })],
                 ),
                 Err(ProgramError::Type(TypeError::Invalid { message }))
                     if message == "`parallel_all_gather` input must not carry reduction state over manual axis `x`",
@@ -4027,7 +4063,7 @@ mod tests {
                     )
                 },
                 ArrayIrType::Array(varying_type.clone()),
-                vec![("x".to_string(), NamedAxis::Mesh { axis: 0, size: 2, mesh: mesh.clone() })],
+                vec![("x".to_string(), NamedAxis::Mesh { axis: 0, size: 2, mesh: mesh.clone(), checks_manual_variation: true })],
             ),
             Err(ProgramError::Type(TypeError::Invalid { message }))
                 if message == "`parallel_all_gather` axis index groups are not supported with invariant or reduced \
@@ -4047,10 +4083,44 @@ mod tests {
                     )
                 },
                 ArrayIrType::Array(varying_type),
-                vec![("x".to_string(), NamedAxis::Mesh { axis: 0, size: 2, mesh })],
+                vec![("x".to_string(), NamedAxis::Mesh { axis: 0, size: 2, mesh, checks_manual_variation: true })],
             ),
             Err(ProgramError::Axis(AxisError::OutOfBounds { axis, rank: 1 })) if axis == Axis::from(1),
         ));
+    }
+
+    #[test]
+    fn test_parallel_all_gather_parallel_all_gather_with_options_unchecked_mesh() {
+        let mesh = LogicalMesh::new(vec![MeshAxis::new("x", 2, MeshAxisType::Manual).unwrap()]).unwrap();
+        for output_variance in [
+            ParallelAllGatherOutputVariance::Varying,
+            ParallelAllGatherOutputVariance::Invariant,
+            ParallelAllGatherOutputVariance::Reduced,
+        ] {
+            let (output, program) = TracingContext::<Array, ArrayOperation<Array>>::trace_with_named_axes(
+                |input| input.parallel_all_gather_with_options("x", 0, CollectiveOptions::tiled(), output_variance),
+                ArrayType::new_static(DataType::F32, [3]),
+                vec![(
+                    "x".to_string(),
+                    NamedAxis::Mesh { mesh: mesh.clone(), axis: 0, size: 2, checks_manual_variation: false },
+                )],
+            )
+            .unwrap();
+            assert_eq!(output, ArrayType::new_static(DataType::F32, [6]));
+            assert_eq!(
+                program.to_string(),
+                indoc! {"
+                    lambda %0:f32[3] .
+                    let %1:f32[6] = parallel_all_gather [
+                        axis_name=\"x\",
+                        axis_size=2,
+                        concatenation_axis=0,
+                        options=Tiled,
+                        output_variance=Varying,
+                    ] %0
+                    in (%1)"},
+            );
+        }
     }
 
     #[test]

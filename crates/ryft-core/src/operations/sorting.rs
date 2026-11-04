@@ -1331,7 +1331,7 @@ mod tests {
             DomainTracingContext::<EagerContext<Array, ArrayOperation<Array>>>::trace_with_named_axes(
                 |inputs| Sort::sort(&inputs, 0, SortDirection::Ascending),
                 vec![varying_type.clone(), invariant_type],
-                vec![("x".to_string(), NamedAxis::Mesh { mesh, axis: 0, size: 2 })],
+                vec![("x".to_string(), NamedAxis::Mesh { mesh, axis: 0, size: 2, checks_manual_variation: true })],
             )
             .unwrap();
         assert_eq!(outputs, vec![varying_type.clone(), varying_type]);
@@ -1798,7 +1798,7 @@ mod tests {
                     Ok(vec![values, indices])
                 },
                 vec![input_type],
-                vec![("x".to_string(), NamedAxis::Mesh { mesh, axis: 0, size: 2 })],
+                vec![("x".to_string(), NamedAxis::Mesh { mesh, axis: 0, size: 2, checks_manual_variation: true })],
             )
             .unwrap();
         assert_eq!(outputs, vec![values_type, indices_type]);

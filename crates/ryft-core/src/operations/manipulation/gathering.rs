@@ -2506,7 +2506,7 @@ mod tests {
                 input.gather(&indices, operation.dimensions(), operation.slice_sizes(), operation.options())
             },
             (input, indices),
-            vec![("m".to_string(), NamedAxis::Mesh { axis: 0, size: 2, mesh })],
+            vec![("m".to_string(), NamedAxis::Mesh { axis: 0, size: 2, mesh, checks_manual_variation: true })],
         )
         .unwrap();
         assert_eq!(
@@ -4781,7 +4781,10 @@ mod tests {
         let indices = ArrayType::new_static(DataType::I32, [0])
             .with_sharding(Sharding::replicated(mesh.clone(), 1))
             .unwrap();
-        let named_axes = vec![("m".to_string(), NamedAxis::Mesh { axis: 0, size: 2, mesh: mesh.clone() })];
+        let named_axes = vec![(
+            "m".to_string(),
+            NamedAxis::Mesh { axis: 0, size: 2, mesh: mesh.clone(), checks_manual_variation: true },
+        )];
         let (output_types, program) =
             TracingContext::<ArrayIrValue<Array>, ArrayIrOperation<Array>>::trace_with_named_axes(
                 |inputs: Vec<Tracer<TracingContext<ArrayIrValue<Array>, ArrayIrOperation<Array>>>>| {

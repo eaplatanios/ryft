@@ -10177,7 +10177,7 @@ mod tests {
                 Ok(outputs.into_iter().next().unwrap().into_batch().into_value())
             },
             vec![predicate_type, value_type.clone()],
-            vec![("x".to_string(), NamedAxis::Mesh { axis: 0, size: 2, mesh })],
+            vec![("x".to_string(), NamedAxis::Mesh { axis: 0, size: 2, mesh, checks_manual_variation: true })],
         )
         .unwrap();
         assert_eq!(output_type, value_type);
@@ -11203,7 +11203,7 @@ mod tests {
                 Ok(outputs.into_iter().next().unwrap().into_batch().into_value())
             },
             vec![ArrayIrType::Array(predicate_type), ArrayIrType::Array(value_type.clone())],
-            vec![("x".to_string(), NamedAxis::Mesh { axis: 0, size: 2, mesh })],
+            vec![("x".to_string(), NamedAxis::Mesh { axis: 0, size: 2, mesh, checks_manual_variation: true })],
         )
         .unwrap();
         assert_eq!(output_type, ArrayIrType::Array(value_type));
@@ -15658,8 +15658,10 @@ mod tests {
         // the constant output of the `false` branch at its end, so every branch value is typed as the per-device value
         // that it is, while the input that already varies passes through unchanged.
         let (predicate_type, invariant_type, varying_type) = devices_varying_predicate_types();
-        let named_axes =
-            vec![("devices".to_string(), NamedAxis::Mesh { axis: 0, size: 2, mesh: devices_manual_mesh() })];
+        let named_axes = vec![(
+            "devices".to_string(),
+            NamedAxis::Mesh { axis: 0, size: 2, mesh: devices_manual_mesh(), checks_manual_variation: true },
+        )];
         let (_, program) = TracingContext::<Array, ArrayOperation<Array>>::trace_with_named_axes(
             |inputs: Vec<Tracer<_>>| {
                 inputs[0].condition(
@@ -15740,7 +15742,8 @@ mod tests {
         let (invariant_referent_type, predicate_type) = manual_mutation_types(false);
         let (varying_referent_type, _) = manual_mutation_types(true);
         let mesh = predicate_type.sharding().unwrap().mesh().clone();
-        let named_axes = vec![("x".to_string(), NamedAxis::Mesh { axis: 0, size: 2, mesh })];
+        let named_axes =
+            vec![("x".to_string(), NamedAxis::Mesh { axis: 0, size: 2, mesh, checks_manual_variation: true })];
         let input_types = vec![
             ArrayIrType::Array(predicate_type),
             ArrayIrType::Reference(ReferenceType::new(invariant_referent_type)),
@@ -15834,7 +15837,10 @@ mod tests {
                 )
             },
             vec![predicate_type, invariant_type.clone(), varying_type.clone()],
-            vec![("devices".to_string(), NamedAxis::Mesh { axis: 0, size: 2, mesh: devices_manual_mesh() })],
+            vec![(
+                "devices".to_string(),
+                NamedAxis::Mesh { axis: 0, size: 2, mesh: devices_manual_mesh(), checks_manual_variation: true },
+            )],
         )
         .unwrap();
         assert_eq!(output_types, vec![invariant_type, varying_type]);
@@ -15877,7 +15883,10 @@ mod tests {
                 )
             },
             vec![predicate_type, invariant_type, varying_type],
-            vec![("devices".to_string(), NamedAxis::Mesh { axis: 0, size: 2, mesh: devices_manual_mesh() })],
+            vec![(
+                "devices".to_string(),
+                NamedAxis::Mesh { axis: 0, size: 2, mesh: devices_manual_mesh(), checks_manual_variation: true },
+            )],
         )
         .unwrap();
         let linearization = program.linearize_with_respect_to(&[1]).unwrap();
@@ -15960,7 +15969,10 @@ mod tests {
                 )
             },
             vec![predicate_type, varying_type],
-            vec![("devices".to_string(), NamedAxis::Mesh { axis: 0, size: 2, mesh: devices_manual_mesh() })],
+            vec![(
+                "devices".to_string(),
+                NamedAxis::Mesh { axis: 0, size: 2, mesh: devices_manual_mesh(), checks_manual_variation: true },
+            )],
         )
         .unwrap();
         let linearization = program.linearize_with_respect_to(&[1]).unwrap();

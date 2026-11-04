@@ -6181,7 +6181,7 @@ mod tests {
         let (_, program) = DomainTracingContext::<EagerContext<Array, ArrayOperation<Array>>>::trace_with_named_axes(
             |(input, indices)| input.dynamic_slice(&[indices], &[1]),
             (input, indices),
-            vec![("m".to_string(), NamedAxis::Mesh { axis: 0, size: 2, mesh })],
+            vec![("m".to_string(), NamedAxis::Mesh { axis: 0, size: 2, mesh, checks_manual_variation: true })],
         )
         .unwrap();
         assert_eq!(
@@ -6728,7 +6728,10 @@ mod tests {
                 )
                 .unwrap()
         };
-        let named_axes = vec![("m".to_string(), NamedAxis::Mesh { axis: 0, size: 2, mesh: mesh.clone() })];
+        let named_axes = vec![(
+            "m".to_string(),
+            NamedAxis::Mesh { axis: 0, size: 2, mesh: mesh.clone(), checks_manual_variation: true },
+        )];
         let (output_type, program) = TracingContext::<Array, ArrayOperation<Array>>::trace_with_named_axes(
             |(source, starts): (Tracer<TracingContext<Array, ArrayOperation<Array>>>, _)| {
                 let context = BatchingContext::<_, ArrayBatchingPolicy>::new(source.domain(), 2);

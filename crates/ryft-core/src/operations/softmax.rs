@@ -2137,7 +2137,7 @@ mod tests {
         let (output_type, program) = TracingContext::<Array, ArrayOperation<Array>>::trace_with_named_axes(
             |(logits, targets)| logits.softmax_cross_entropy(&targets, 0),
             (varying.clone(), invariant.clone()),
-            vec![("x".to_string(), NamedAxis::Mesh { axis: 0, size: 2, mesh })],
+            vec![("x".to_string(), NamedAxis::Mesh { axis: 0, size: 2, mesh, checks_manual_variation: true })],
         )
         .unwrap();
         let (_, expected_type, _) = manual_types(ArrayType::scalar(DataType::F32));
@@ -2723,7 +2723,10 @@ mod tests {
         // coordinates, which carry the logits' variation, are compared with the labels.
         let (mesh, varying, invariant) = manual_types(ArrayType::new_static(DataType::F32, [2]));
         let (_, varying_labels, invariant_labels) = manual_types(ArrayType::scalar(DataType::I32));
-        let named_axes = vec![("x".to_string(), NamedAxis::Mesh { axis: 0, size: 2, mesh: mesh.clone() })];
+        let named_axes = vec![(
+            "x".to_string(),
+            NamedAxis::Mesh { axis: 0, size: 2, mesh: mesh.clone(), checks_manual_variation: true },
+        )];
         let (output_type, program) = TracingContext::<Array, ArrayOperation<Array>>::trace_with_named_axes(
             |(logits, labels)| logits.softmax_cross_entropy_with_integer_labels(&labels, 0),
             (varying, invariant_labels),
@@ -3304,7 +3307,7 @@ mod tests {
             TracingContext::<Array, ArrayOperation<Array>>::trace_with_named_axes(
                 |(student, teacher): (_, _)| function.call(student, teacher),
                 (varying, reduced),
-                vec![("x".to_string(), NamedAxis::Mesh { axis: 0, size: 2, mesh })],
+                vec![("x".to_string(), NamedAxis::Mesh { axis: 0, size: 2, mesh, checks_manual_variation: true })],
             )
             .map(|(output_type, _)| output_type),
             Err(ProgramError::Type(TypeError::invalid(
@@ -3485,7 +3488,8 @@ mod tests {
         // constants they create carry it.
         let function = softmax_cross_entropy_with_target_logits::<ArrayContext>(-1);
         let (mesh, varying, invariant) = manual_types(ArrayType::new_static(DataType::F32, [2]));
-        let named_axes = vec![("x".to_string(), NamedAxis::Mesh { axis: 0, size: 2, mesh })];
+        let named_axes =
+            vec![("x".to_string(), NamedAxis::Mesh { axis: 0, size: 2, mesh, checks_manual_variation: true })];
         let (output_type, program) = TracingContext::<Array, ArrayOperation<Array>>::trace_with_named_axes(
             |(student, teacher): (_, _)| function.call(student, teacher),
             (varying.clone(), invariant.clone()),
