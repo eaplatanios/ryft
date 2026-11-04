@@ -16,24 +16,27 @@ use crate::differentiation::{
 use crate::interpretation::{InterpretableOperation, InterpretationDriver};
 use crate::macros::{check_count, check_types};
 use crate::operations::arithmetic::AddOperation;
-use crate::operations::composites::derive_bijective_identity_renaming;
-use crate::operations::composites::describe_composite;
 use crate::operations::composites::operations::composite_transpose::{
     CompositeTransposeOperation, CompositeTransposeRules,
 };
 use crate::operations::composites::operations::{CompositeConversion, transpose_carrier_batching};
+use crate::operations::composites::rules::definitions::CompositeKey;
 use crate::operations::composites::rules::specializations::CustomRuleSpecializer;
 use crate::operations::composites::rules::{
     CustomRuleBatching, CustomRuleBatchingLevel, CustomRuleBatchingSpecializationKey, CustomRuleDerivationKind,
     CustomRuleDerivedDefinitionKey, CustomRuleForwardSpecializationKey, CustomRuleReference, CustomRuleSource,
     CustomRuleTracer,
 };
+use crate::operations::composites::{derive_bijective_identity_renaming, describe_composite};
 use crate::operations::constants::zero::Zero;
 use crate::parameters::{Parameter, Placeholder};
-use crate::partial::{PartialValue, PartiallyEvaluatableOperation};
+use crate::partial::{
+    PartialEvaluationContext, PartialEvaluationDriver, PartialEvaluationValue, PartialValue,
+    PartiallyEvaluatableOperation,
+};
 use crate::programs::{
-    EffectsSummary, InputRegionProvenance, MaybeZero, Operation, OperationBoundaryPruning, OperationFormatter,
-    OperationProvider, OutputRegionProvenance, ProgramBuilder, ProgramError, ReferenceBoundary,
+    AttachedRegions, EffectsSummary, InputRegionProvenance, MaybeZero, Operation, OperationBoundaryPruning,
+    OperationFormatter, OperationProvider, OutputRegionProvenance, ProgramBuilder, ProgramError, ReferenceBoundary,
     ReferenceDischargeContext, ReferenceDischargeDriver, ReferenceDischargePolicy, ReferenceDischargeValue,
     ReferenceDischargeableOperation, RegionDataFlow, RegionInterface, RegionLiveness, RegionRef, RegionSlot, Type,
     TypeError, TypeIdentityRenaming, Typed, TypedProgram, Value,
@@ -164,6 +167,13 @@ pub const COMPOSITE_OPERATION_NAME: &str = "composite";
 /// primal boundary, stays whole, and so does a call whose forward mode rule is derived from its primal while its rules
 /// have a custom batching rule, because the derived calls that its derivatives stage apply that rule to every output.
 ///
+/// # Named Composite Calls
+///
+/// A call of a [`NamedComposite`](crate::NamedComposite) attaches the definition's cached body for its input types as
+/// its primal region, shared through [`AttachedRegions::Callees`], so a program imports each body once however many
+/// calls attach it, and every transform treats the call like any other call with retained rules. Refer to the
+/// documentation of [`Self::key`] for more information.
+///
 /// Equality and hashing of calls with retained rules use the identity of the shared definition (i.e.,
 /// [`Arc::ptr_eq`](std::sync::Arc::ptr_eq)), while rendering prints its human-readable name.
 pub struct CompositeOperation<V: Typed + Parameter, O, S = CustomRuleReference<V, O>> {
@@ -241,6 +251,18 @@ impl<V: Typed<Type: DifferentiableType + Eq + Hash> + Parameter, O, S: CustomRul
         match &self.rules {
             CompositeRules::Attached { .. } => None,
             CompositeRules::Retained { rules, .. } => Some(rules),
+        }
+    }
+
+    /// Returns the semantic identity of this call if it is a call of a [`NamedComposite`](crate::NamedComposite) whose
+    /// primal region is still the definition's body, and [`None`] otherwise. Batching, pruning, and reference discharge
+    /// rewrite the region of a call into another computation, so such calls keep the rules of their definition but no
+    /// longer call the definition itself, and backends must not replace them by its key.
+    #[inline]
+    pub fn key(&self) -> Option<&CompositeKey> {
+        match &self.rules {
+            CompositeRules::Retained { rules, batching: None, discharged: false, kept_outputs: None } => rules.key(),
+            _ => None,
         }
     }
 
@@ -972,13 +994,35 @@ impl<
     }
 }
 
-// The default partial-evaluation rule is the desired one here as it interprets the primal region when every input is
-// known and otherwise residualizes the complete call, so that its rules remain available to later differentiation.
+// The default partial-evaluation semantics are the desired ones here, as they fold the call when every input is known
+// and otherwise residualize the complete call, so that its rules remain available to later differentiation. A call
+// whose primal region is an interned shared callee (e.g., a named composite call) folds or residualizes with that
+// callee instead of a materialized copy of its body, so that partial evaluation keeps sharing it rather than copying
+// it per call.
 impl<C: Context<Type: DifferentiableType + Eq + Hash>, S: CustomRuleSource<C::Constant, C::Operation>>
     PartiallyEvaluatableOperation<C> for CompositeOperation<C::Constant, C::Operation, S>
 where
     C::Operation: From<CompositeOperation<C::Constant, C::Operation, S>>,
 {
+    fn partially_evaluate<D: PartialEvaluationDriver<C>>(
+        &self,
+        context: &PartialEvaluationContext<C>,
+        driver: &D,
+        inputs: &[PartialEvaluationValue<C::Value>],
+    ) -> Result<Vec<PartialEvaluationValue<C::Value>>, ProgramError> {
+        let callee = match driver.region_count() {
+            1 => driver.region(0).ok().and_then(|region| region.interned_callee().cloned()),
+            _ => None,
+        };
+        match callee {
+            Some(callee) => context.fold_or_residualize_using_attached_regions(
+                self.clone(),
+                AttachedRegions::Callees(std::slice::from_ref(&callee)),
+                inputs,
+            ),
+            None => context.fold_or_residualize(self.clone(), driver.region_programs(), inputs),
+        }
+    }
 }
 
 impl<C, P, S> BatchableOperation<C, P> for CompositeOperation<C::Constant, C::Operation, S>

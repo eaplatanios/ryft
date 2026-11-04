@@ -356,10 +356,12 @@ where
 /// Named computation that a [`CustomRuleDefinition`] optionally specifies, analogous to a StableHLO `composite`,
 /// which consists of a [`CompositeKey`] that gives it semantic identity, an output type rule, and a body (i.e.,
 /// its decomposition). Definitions with equal keys in one operation family and with equal named axes are the same
-/// computation. Their bodies and rules implement one contract, which is an obligation on whoever constructs them that
-/// the key cannot verify. [`CustomRuleRegistration::named`] relies on it to share one definition and its specialization
-/// caches across every construction with an equal key, and backends rely on it to replace calls by key. A display label
-/// never establishes this identity, and neither does a matching body.
+/// computation. Their bodies and rules implement one contract, which is an obligation on whoever constructs them
+/// that the key cannot verify. Backends rely on it to replace calls by key. A display label never establishes this
+/// identity, and neither does a matching body. Equal keys do not share definitions, though. Whoever constructs a
+/// definition registers it (refer to [`CustomRuleRegistration`] for more information) and owns its body and
+/// specialization caches, so calls share them by reusing that registration (e.g., by holding one
+/// [`Composite`](crate::Composite) value across calls).
 ///
 /// Any backend may replace the calls of a named computation with its own implementation of that contract (e.g., a
 /// fused kernel), and calls that no backend replaces run or lower their body. A computation that should only ever run
@@ -995,9 +997,9 @@ where
 /// first request of each specialization, and which optionally specifies a named computation that its calls compute
 /// (i.e., a [`NamedComposite`]). A definition is registered once (refer to [`CustomRuleRegistration`]) and shared by
 /// every call that uses it, and two definitions are the same rule set exactly when they are the same definition (i.e.,
-/// identity is a process-unique identifier assigned at construction rather than structural). Definitions of named
-/// computations are registered through [`CustomRuleRegistration::named`], which shares one definition per key.
-/// [`Self::name`] is a display label for rendering and diagnostics only, and distinct definitions may share it.
+/// identity is a process-unique identifier assigned at construction rather than structural), including definitions of
+/// named computations with equal keys. [`Self::name`] is a display label for rendering and diagnostics only, and
+/// distinct definitions may share it.
 ///
 /// Specialization is deterministic and repeatable but not exactly-once: eviction, retries after a failed
 /// specialization, concurrent cold requests, and requests made after the registration handle was dropped may invoke
@@ -1149,9 +1151,7 @@ impl<V: Typed<Type: Eq + Hash> + Parameter, O> CustomRuleDefinition<V, O> {
 
     /// Returns this [`CustomRuleDefinition`] with the provided named computation (refer to [`NamedComposite`]),
     /// whose calls this definition then describes, and with the name of its key as the definition's label, so that
-    /// the rendering of its calls does not depend on which construction registered it. Named composites are registered
-    /// through [`CustomRuleRegistration::named`], which shares one definition across every construction with an equal
-    /// key.
+    /// the rendering of its calls depends on the key rather than on the construction.
     #[inline]
     pub fn with_named_composite(mut self, named_composite: NamedComposite<V, O>) -> Self {
         self.name = Cow::Owned(named_composite.key().name().to_owned());
