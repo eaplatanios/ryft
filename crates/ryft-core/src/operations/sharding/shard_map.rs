@@ -1,20 +1,18 @@
-//! Contains the `shard_map` operation [`ShardMapOperation`], which runs its local `body` [`Region`] once per device of
-//! a manual SPMD computation, together with its logical boundary metadata [`ShardMapBoundary`], its logical error type
-//! [`ShardMapError`], and its reference discharge, interpretation, partial evaluation, batching, forward mode
-//! differentiation, and transposition rules. This is the analogue of
-//! [`jax.shard_map`](https://docs.jax.dev/en/latest/_autosummary/jax.shard_map.html) (refer to the
-//! [JAX `shard_map` guide](https://docs.jax.dev/en/latest/notebooks/shard_map.html) for the programming model), and
-//! backends lower it, for example, to Shardy's
-//! [`sdy.manual_computation`](https://openxla.org/shardy/sdy_dialect#sdymanual_computation-sdymanualcomputationop).
+//! Contains [`ShardMapOperation`], which runs its local `body` [`Region`] once per device of a manual Single Program
+//! Multiple Data (SPMD) computation, together with its logical boundary metadata [`ShardMapBoundary`], its logical
+//! error type [`ShardMapError`], and its reference discharge, interpretation, partial evaluation, batching, forward
+//! mode differentiation, and transposition rules. This is the Ryft analogue of JAX's
+//! [`shard_map` guide](https://docs.jax.dev/en/latest/notebooks/shard_map.html), and backends lower it (e.g., to
+//! [`sdy.manual_computation`](https://openxla.org/shardy/sdy_dialect#sdymanual_computation-sdymanualcomputationop)).
 //!
-//! Functions construct shard maps by tracing an array-only local body over [`ShardMapTracer`]s. The [`ShardMap`]
+//! Functions construct shard maps by tracing array-only local bodies over [`ShardMapTracer`]s. The [`ShardMap`]
 //! capability binds a shard map in an explicitly provided context on input values, and its body function also receives
 //! the body context, so that bodies without inputs can create values. The global [`shard_map()`](fn@shard_map) function
 //! binds it in the context of its first input instead. Both take [`ShardMapOptions`], which select the active manual
 //! mesh axes. Like any other operation, a shard map is traced for types rather than values by binding it on tracers
 //! (e.g., through [`trace`](crate::trace) or the [`Trace`](crate::Trace) capability of a [`Domain`]), which is the
-//! analogue of applying JAX's [`make_jaxpr`](https://docs.jax.dev/en/latest/_autosummary/jax.make_jaxpr.html) to a
-//! function that calls `jax.shard_map`. These functions accept array leaves only, so bodies with reference boundaries
+//! Ryft analogue of applying JAX's [`make_jaxpr`](https://docs.jax.dev/en/latest/_autosummary/jax.make_jaxpr.html) to
+//! a function that calls `jax.shard_map`. These functions accept array leaves only, so bodies with reference boundaries
 //! are traced explicitly and checked through [`ShardMapOperation::from_program`]. Every boundary position is an array
 //! or a reference, so first-class dimensions may appear only inside a body.
 //!
@@ -26,12 +24,12 @@
 //! Manual variation is always tracked and checked. Unlike JAX, whose `shard_map` can disable these checks with
 //! `check_vma=False`, there is deliberately no unchecked mode, because the boundary validation and the transform rules
 //! rely on the recorded variation for their correctness (e.g., transposition derives cross-device sums from the
-//! adjoints of the variation operations of the body, and the boundary rejects outputs that vary along manual axes that
-//! their output shardings do not tile).
+//! adjoints of the variation operations of the body, and the boundary rejects outputs that vary along manual
+//! axes that their output shardings do not tile).
 //!
 //! Batching makes the batch axis a dimension of every mapped boundary value and batches the local body structurally,
-//! and it may place the batch axis on mesh axes (refer to the batching rule in the documentation of
-//! [`ShardMapOperation`]).
+//! and it may place the batch axis on mesh axes. Refer to the batching rule in the documentation of
+//! [`ShardMapOperation`] for more information.
 //!
 //! # Example
 //!
@@ -43,8 +41,7 @@
 //! # use pretty_assertions::assert_eq;
 //! # use ryft_core::{
 //! #     Array, ArrayIrOperation, ArrayIrType, ArrayIrValue, ArrayType, DataType, LogicalMesh, MeshAxis, MeshAxisType,
-//! #     ProgramError, ShardMapOptions, ShardMapTracer, Sharding, ShardingDimension, TracingContext, ValueProjection,
-//! #     shard_map,
+//! #     ProgramError, ShardMapOptions, Sharding, ShardingDimension, TracingContext, ValueProjection, shard_map,
 //! # };
 //! # fn main() -> Result<(), Box<dyn std::error::Error>> {
 //! type IrContext = TracingContext<ArrayIrValue<Array>, ArrayIrOperation<Array>>;
@@ -53,8 +50,14 @@
 //! let (_, program) = IrContext::trace(
 //!     |input| {
 //!         let input = ValueProjection::<ArrayType>::into_projected(input).map_err(ProgramError::from)?;
-//!         let double = |x: ShardMapTracer<IrContext>| Ok(x.clone() + x);
-//!         let output = shard_map(double, input, mesh, sharding.clone(), sharding, ShardMapOptions::new())?;
+//!         let output = shard_map(
+//!             |x| Ok(x.clone() + x),
+//!             input,
+//!             mesh,
+//!             sharding.clone(),
+//!             sharding,
+//!             ShardMapOptions::new(),
+//!         )?;
 //!         Ok(output.into_value())
 //!     },
 //!     ArrayIrType::Array(ArrayType::new_static(DataType::F32, [8])),
@@ -92,8 +95,8 @@
 //! # References Under `shard_map`
 //!
 //! This section is the per-shard ownership contract for mutable references crossing a `shard_map` boundary. The
-//! discharge, forward mode, partial evaluation, and reverse mode rules of [`ShardMapOperation`] implement it, and they
-//! check the body against it before doing any work. Construct operations with reference boundaries through
+//! discharge, forward mode, partial evaluation, and reverse mode rules of [`ShardMapOperation`] implement it, and
+//! they check the body against it before doing any work. Construct operations with reference boundaries through
 //! [`ShardMapOperation::from_program`], which derives output types and reference forwarding from the body, and then
 //! bind the operation with the checked local body through a tracing context or program builder. Global referent shapes
 //! must be static and divisible by the manual partition counts.
@@ -114,15 +117,15 @@
 //!     and interpretation reject. The final state of such a reference is therefore invariant along the axis, which is
 //!     what the derivation of its replicated final-state output requires when the map is discharged (as JAX checks the
 //!     manual variation of the discharged final states).
-//!   - **Ordering is per device.** Accesses through one local reference follow the body's program order, exactly as on
-//!     a single device. Accesses on different devices touch disjoint owned shards or identical copies and have no
+//!   - **Ordering is per device.** Accesses through one local reference follow the body's program order, exactly as
+//!     on a single device. Accesses on different devices touch disjoint owned shards or identical copies and have no
 //!     defined mutual order. A reference is never an input of a collective, so only a value read from it can cross
 //!     devices.
 //!   - **Captured references are rejected.** A reference must be an explicit `shard_map` input with an input sharding.
 //!     A reference reaching the body as a captured constant has no sharding and therefore no owner.
 //!   - **Outputs forward inputs only.** A reference output must forward a reference input by identity, with an output
-//!     sharding equal to that input's sharding. A reference allocated inside the body cannot escape as an output and is
-//!     rejected. Transform paths belong to the accesses that use them, so a view is never a returnable value.
+//!     sharding equal to that input's sharding. A reference allocated inside the body cannot escape as an output and
+//!     is rejected. Transform paths belong to the accesses that use them, so a view is never a returnable value.
 //!   - **Discharge threads owned shards.** Discharging a shard map with reference inputs turns each reference into a
 //!     state carry sharded by its input sharding. The body's local state threads through the local program as local
 //!     arrays, the hidden final-state output of a mutated reference carries the input sharding, and the stateful ABI
@@ -132,27 +135,28 @@
 //!   - **Differentiation preserves local state and residuals.** Tangent references retain their primal input shardings.
 //!     Forwarded inactive references keep their primal identity and have no tangent slot. Nonlinear derivatives pass
 //!     ordinary residual values between the primal and tangent maps. A residual that is a primal input or output
-//!     reaches the tangent map as that boundary value, under its own sharding, and a reference residual that denotes a
-//!     reference input is that input, which it forwards by identity. A reference residual allocated inside the body
+//!     reaches the tangent map as that boundary value, under its own sharding, and a reference residual that denotes
+//!     a reference input is that input, which it forwards by identity. A reference residual allocated inside the body
 //!     cannot cross by identity, so it crosses as a snapshot of its final state, from which the tangent body allocates
-//!     its own reference. The tangent body thus observes the state that a tangent program observes outside
-//!     `shard_map`, since it runs after the whole primal program, and every invocation of it starts from that state.
-//!     Other varying residuals are tiled along their varying manual axes (a varying scalar gains a leading dimension
-//!     first), which preserves the distinct per-device values, while other replicated residuals keep their shape.
-//!   - **Replicated gradients aggregate once.** Reverse mode uses fresh local accumulators for the replicated
-//!     reference inputs that the body only reads and adds the resulting value into the caller's cotangent reference
-//!     once, so existing destination contents are retained exactly once. Bodies track manual variation, so
-//!     cross-device sums come from the adjoints of their variation operations (e.g., an invariant read passed through
-//!     `parallel_vary` transposes to a sum over the manual axis), and the boundary performs no output seed
-//!     normalization or reduction of its own. Fully sharded destinations accumulate into each device's owned shard,
-//!     and so do the destinations of the replicated reference inputs that the body mutates, whose cotangent references
-//!     cross the transposed boundary by identity. The transposed body mutates them with invariant values at invariant
-//!     indices only, so every device's copy stays identical, and a mutation that kills the incoming cotangent (e.g.,
-//!     the transpose of a write, which zeroes the cotangent of the overwritten state) applies to the caller's
-//!     destination itself, which a fresh accumulator could not express. A read of a replicated reference at a
-//!     device-varying index transposes into a cross-device sum. Each device scatters its cotangent into a local buffer
-//!     that varies along the index's axes, the buffer is summed over those axes, and the invariant sum is added into
-//!     the replicated cotangent reference (refer to [`ReferenceReadTransposition`](crate::ReferenceReadTransposition)).
+//!     its own reference. The tangent body thus observes the state that a tangent program observes outside `shard_map`,
+//!     since it runs after the whole primal program, and every invocation of it starts from that state. Other varying
+//!     residuals are tiled along their varying manual axes (a varying scalar gains a leading dimension first), which
+//!     preserves the distinct per-device values, while other replicated residuals keep their shape.
+//!   - **Replicated gradients aggregate once.** Reverse mode uses fresh local accumulators for the replicated reference
+//!     inputs that the body only reads and adds the resulting value into the caller's cotangent reference once, so
+//!     existing destination contents are retained exactly once. Bodies track manual variation, so cross-device sums
+//!     come from the adjoints of their variation operations (e.g., an invariant read passed through `parallel_vary`
+//!     transposes to a sum over the manual axis), and the boundary performs no output seed normalization or reduction
+//!     of its own. Fully sharded destinations accumulate into each device's owned shard, and so do the destinations of
+//!     the replicated reference inputs that the body mutates, whose cotangent references cross the transposed boundary
+//!     by identity. The transposed body mutates them with invariant values at invariant indices only, so every device's
+//!     copy stays identical, and a mutation that kills the incoming cotangent (e.g., the transpose of a write, which
+//!     zeroes the cotangent of the overwritten state) applies to the caller's destination itself, which a fresh
+//!     accumulator could not express. A read of a replicated reference at a device-varying index transposes into a
+//!     cross-device sum. Each device scatters its cotangent into a local buffer that varies along the index's axes,
+//!     the buffer is summed over those axes, and the invariant sum is added into the replicated cotangent reference.
+//!     Refer to the documentation of [`ReferenceReadTransposition`](crate::ReferenceReadTransposition) for more
+//!     information.
 //!   - **Rules may assume** that distinct reference inputs are distinct allocations (reference discharge rejects a
 //!     repeated allocation, and runtime alias validation checks this at execution boundaries), that each device's
 //!     lifecycle over its owned shards is independent of every other device's, and that the reference analysis of the
@@ -171,8 +175,8 @@
 //!     [`Array`] stores its logical value, i.e., the pending sum, as `Reshard for Array` does) contributes that value
 //!     on the device at coordinate zero along those axes and zeros elsewhere. Every global output is assembled at its
 //!     declared global type from the body outputs. Tiles along the active manual axes that its output sharding names
-//!     are placed in mesh order, untiled invariant axes (including reduced ones) take the value of coordinate zero, and
-//!     unreduced axes are summed.
+//!     are placed in mesh order, untiled invariant axes (including reduced ones) take the value of coordinate zero,
+//!     and unreduced axes are summed.
 //!   - **References are copied in and written back.** The current referent of a reference input is split like an
 //!     array input, and each device receives its shard as a fresh local [`ArrayReference`] root that it owns. After
 //!     the body, the final local shards are assembled like an output at the input sharding and written back into the
@@ -189,8 +193,8 @@
 //!     with exactly the local values of that device, so effects such as `print` occur per device, in device order.
 //!   - **Collectives communicate across device groups.** A collective over an emulated axis (i.e., `axis_index`,
 //!     `parallel_reduce`, `parallel_vary`, `parallel_all_gather`, `parallel_sum_scatter`, `parallel_all_to_all`,
-//!     `parallel_ragged_all_to_all`, and `parallel_permute`) is computed across the participants of each device group
-//!     directly. Every other collective binds per device like an ordinary operation.
+//!     `parallel_ragged_all_to_all`, and `parallel_permute`) is computed across the participants of each device
+//!     group directly. Every other collective binds per device like an ordinary operation.
 //!   - **Region operations that communicate run in lockstep.** An operation whose region closure contains no collective
 //!     over an emulated axis binds per device, so its regions run through the ordinary eager rules. Otherwise, its
 //!     regions run in lockstep. `while`, `condition`, and `scan` run their eager rules over values that hold the value
@@ -204,15 +208,15 @@
 //!     in lockstep, and every other region operation that needs lockstep execution is rejected, both with
 //!     [`ProgramError::UnsupportedOperation`].
 //!
-//! These rejections are deliberate limitations of the emulation rather than of `shard_map`. Running a region
-//! operation in lockstep requires knowing how its regions are sequenced (e.g., how many times and with which inputs),
-//! which the emulator knows only for the operations above, because the eager rule of any other region operation runs
-//! its regions on one device's values at a time, which cannot compute a collective across devices. Requiring every
-//! device to take the same path through a lockstep region is also stricter than necessary when a predicate varies only
-//! along axes that the collectives of the region do not use. For example, a `condition` on `axis_index('y') == 0`
-//! whose one branch reduces with `parallel_reduce` over `x` while the other returns its input unchanged is valid on a
-//! device runtime, because the devices along `x` that reduce together take the same branch, but the emulator rejects
-//! it. Backends with a device runtime execute all of these bodies.
+//! These rejections are deliberate limitations of the emulation rather than of `shard_map`. Running a region operation
+//! in lockstep requires knowing how its regions are sequenced (e.g., how many times and with which inputs), which the
+//! emulator knows only for the operations above, because the eager rule of any other region operation runs its regions
+//! on one device's values at a time, which cannot compute a collective across devices. Requiring every device to take
+//! the same path through a lockstep region is also stricter than necessary when a predicate varies only along axes that
+//! the collectives of the region do not use. For example, a `condition` on `axis_index('y') == 0` whose one branch
+//! reduces with `parallel_reduce` over `x` while the other returns its input unchanged is valid on a device runtime,
+//! because the devices along `x` that reduce together take the same branch, but the emulator rejects it. Backends
+//! with a device runtime execute all of these bodies.
 
 use std::borrow::Cow;
 use std::collections::{BTreeSet, HashSet};
@@ -286,7 +290,7 @@ use crate::programs::{
 };
 use crate::tracing::{DomainTracer, DomainTracingContext, Tracer, TracingContext};
 
-// TODO(eaplatanios): Review this module.
+// TODO(eaplatanios): Review from here onwards.
 
 /// Logical error type for `shard_map` boundaries, covering mesh and specification validation, global and local
 /// boundary derivation, manual variation, and the semantic restrictions on `shard_map` bodies. It carries no backend
