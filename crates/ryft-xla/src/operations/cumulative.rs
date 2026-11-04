@@ -16,7 +16,7 @@ use crate::operations::exponential::lower_log_add_exp_to_mlir;
 use crate::operations::reductions::{
     build_reduce_body_region, build_reduction_identity_constant, lower_product_combiner_to_mlir,
 };
-use crate::{Error, LowerableOperation, LowerableOperationFamily, XlaLowerer};
+use crate::{Error, LowerableOperation, LowerableOperationFamily, LoweringError, XlaLowerer};
 
 /// Builds the scalar `tensor<{element_type}>` value seeding every window of a prefix scan's `reduce_window`, which is
 /// the identity of the combining operator selected by `kind`, so that the padded positions of a window cannot change
@@ -197,9 +197,10 @@ pub(crate) fn lower_cumulative_to_mlir<'b, 'c: 'b, 't: 'c>(
     let extent = match output_array_type.shape().dimensions().get(axis) {
         Some(Dimension::Static(extent)) => *extent,
         _ => {
-            return Err(Error::UnsupportedOperation {
-                op: format!("`{CUMULATIVE_OPERATION_NAME}` with kind `{kind}` over dynamically sized axis {axis}"),
-            });
+            return Err(Error::Lowering(LoweringError::UnsupportedOperation {
+                operation: CUMULATIVE_OPERATION_NAME.to_string(),
+                reason: format!("`{CUMULATIVE_OPERATION_NAME}` with kind `{kind}` over dynamically sized axis {axis}"),
+            }));
         }
     };
     // An empty scanned axis accumulates nothing, and a zero-extent window is not a valid `reduce_window`.
@@ -261,12 +262,13 @@ pub(crate) fn lower_cumulative_to_mlir<'b, 'c: 'b, 't: 'c>(
     }
     // Rounded pairwise identities stay neutral in any binary tree, independent of the window extent.
     if matches!(kind, CumulativeKind::LogSumExp) && matches!(element_type, DataType::F8E8M0FNU | DataType::F6E2M3FN) {
-        return Err(Error::UnsupportedOperation {
-            op: format!(
+        return Err(Error::Lowering(LoweringError::UnsupportedOperation {
+            operation: CUMULATIVE_OPERATION_NAME.to_string(),
+            reason: format!(
                 "`{CUMULATIVE_OPERATION_NAME}` with kind `{kind}` over `{element_type}`, whose lowest value is not a \
                  `log_add_exp` identity",
             ),
-        });
+        }));
     }
     let initial_value = build_cumulative_initial_value(kind, element_type, block, context, location)?;
     let body_region = build_cumulative_body_region(kind, element_type, context, location)?;
@@ -589,7 +591,7 @@ mod tests {
             .unwrap();
         assert!(matches!(
             to_mlir_module_for_plain_program(&program, "main"),
-            Err(Error::UnsupportedOperation { op })
+            Err(Error::Lowering(LoweringError::UnsupportedOperation { reason: op, .. }))
                 if op == "`cumulative` with kind `log_sum_exp` over dynamically sized axis 0",
         ));
     }
@@ -757,7 +759,7 @@ mod tests {
                 .unwrap();
             assert!(matches!(
                 to_mlir_module_for_plain_program(&program, "main"),
-                Err(Error::UnsupportedOperation { op })
+                Err(Error::Lowering(LoweringError::UnsupportedOperation { reason: op, .. }))
                     if op == format!(
                            "`cumulative` with kind `log_sum_exp` over `{element_type}`, whose lowest value is not a \
                             `log_add_exp` identity",

@@ -21,7 +21,7 @@ use crate::operations::jit_call::JitCallFunctionMap;
 #[cfg(test)]
 use crate::experimental::lowering::types::lower_literal_value;
 #[cfg(test)]
-use crate::experimental::lowering::{LowerableOperation, MlirLowerableValue};
+use crate::experimental::lowering::{LowerableOperation, LoweringError, MlirLowerableValue};
 #[cfg(test)]
 use crate::experimental::ops::XlaOperation;
 #[cfg(test)]
@@ -298,13 +298,14 @@ where
                 .map(|output| program.atoms()[output.index()].r#type().into_owned())
                 .collect::<Vec<_>>();
             if !instruction.regions().is_empty() {
-                return Err(Error::UnsupportedOperation {
-                    op: format!(
+                return Err(Error::Lowering(LoweringError::UnsupportedOperation {
+                    operation: instruction.operation().name().to_string(),
+                    reason: format!(
                         "plain-program lowering does not support attached regions for `{}`; use the production \
                          array IR XLA lowerer",
                         instruction.operation().name(),
                     ),
-                });
+                }));
             }
             let location = collective_state.instruction_location(context, instruction.provenance(), location);
             let mut lowerer: XlaLowerer<'_, '_, '_, XlaOperation> = XlaLowerer::new(*block, context, location)

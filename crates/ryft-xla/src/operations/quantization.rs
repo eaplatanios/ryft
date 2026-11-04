@@ -2,7 +2,7 @@ use std::collections::HashMap;
 
 use ryft_core::macros::check_count;
 use ryft_core::{
-    ArrayType, CompositeAttribute, CompositeKey, DataType, Dimension, DomainTracingContext, EmptyRegionDriver,
+    ArrayType, CompositeKey, DataType, Dimension, DomainTracingContext, EmptyRegionDriver,
     MemberInterpretableOperation, Operation, ProgramError, ScaledDotOperation, Shape, Value,
 };
 use ryft_mlir::dialects::stable_hlo;
@@ -353,7 +353,7 @@ pub(crate) fn lower_scaled_dot_to_mlir<'b, 'c: 'b, 't: 'c>(
         )?]);
     }
 
-    Err(Error::UnsupportedOperation { op: format!("missing typed decomposition for `{}`", operation.name()) })
+    Err(ProgramError::MalformedProgram(format!("missing typed decomposition for `{}`", operation.name())).into())
 }
 
 /// Places an optimization barrier on the scaled-dot inputs whose element types are narrow floating-point types. The
@@ -493,15 +493,15 @@ pub(crate) fn scaled_dot_composition_key(
         composite: CompositeKey::new("xla.scaled_dot", 0)
             .with_attribute(
                 "dimension_numbers",
-                CompositeAttribute::AxisLists(vec![
+                vec![
                     vec![
                         dimensions.lhs_contracting_dimensions().to_vec(),
                         dimensions.rhs_contracting_dimensions().to_vec(),
                     ],
                     vec![dimensions.lhs_batching_dimensions().to_vec(), dimensions.rhs_batching_dimensions().to_vec()],
-                ]),
+                ],
             )
-            .with_attribute("preferred_element_type", CompositeAttribute::DataType(operation.accumulation_type())),
+            .with_attribute("preferred_element_type", operation.accumulation_type()),
         input_types: scaled_dot_composite_input_types(operation, input_types)?,
         output_types: output_types.to_vec(),
     })
@@ -531,6 +531,7 @@ impl LowerableOperation for ScaledDotOperation {
 
 #[cfg(test)]
 mod tests {
+    use crate::LoweringError;
     use std::sync::Arc;
 
     use indoc::indoc;
@@ -956,7 +957,7 @@ mod tests {
             if block_bound == 3 {
                 assert!(matches!(
                     module.err().unwrap(),
-                    Error::UnsupportedOperation { op }
+                    Error::Lowering(LoweringError::UnsupportedOperation { reason: op, .. })
                         if op == "reshape with unequal physical capacities (input 128, output 64); dynamic bounds must \
                            preserve the physical element count",
                 ));

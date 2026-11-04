@@ -2,9 +2,9 @@ use std::hash::Hash;
 use std::rc::Rc;
 
 use ryft_core::{
-    ArrayIrType, COMPOSITE_OPERATION_NAME, COMPOSITE_TRANSPOSE_OPERATION_NAME, CompositeImplementation, CompositeKey,
-    CompositeOperation, CompositeTransposeOperation, CustomRuleSource, DifferentiableType, Operation, Parameter,
-    ProgramError, RematerializationOptimizationBarrier, Typed,
+    ArrayIrType, COMPOSITE_OPERATION_NAME, COMPOSITE_TRANSPOSE_OPERATION_NAME, CompositeKey, CompositeOperation,
+    CompositeTransposeOperation, CustomRuleSource, DifferentiableType, Operation, Parameter, ProgramError,
+    RematerializationOptimizationBarrier, Typed,
 };
 use ryft_mlir::ValueRef;
 #[cfg(test)]
@@ -16,7 +16,7 @@ use crate::{Error, LowerableOperation, LowerableOperationFamily, XlaLowerer};
 
 /// Returns `true` if lowering `operation` at the provided boundary never reads its attached regions, because it is a
 /// named composite call (refer to [`LowerableOperation::named_composite`]) that a backend implementation
-/// replaces, that requires an implementation that the target lacks, or whose body lowers to a shared function. The
+/// replaces or whose body lowers to a shared function. The
 /// lowering loops skip materializing the regions of such instructions, which would otherwise copy the body per call.
 pub(crate) fn lowers_without_regions<O: LowerableOperationFamily>(
     operation: &O,
@@ -25,12 +25,10 @@ pub(crate) fn lowers_without_regions<O: LowerableOperationFamily>(
     nested_functions: Option<&Rc<JitCallFunctionMap<O>>>,
     target_platform: Option<&str>,
 ) -> bool {
-    let Some((key, implementation)) = operation.named_composite() else {
+    let Some(key) = operation.named_composite() else {
         return false;
     };
-    implementation == CompositeImplementation::Required
-        || NamedCompositeImplementation::select(key, implementation, input_types, output_types, target_platform)
-            .is_some()
+    NamedCompositeImplementation::select(key, input_types, output_types, target_platform).is_some()
         || nested_functions.is_some_and(|functions| functions.named(key, input_types, output_types).is_some())
 }
 
@@ -38,7 +36,7 @@ pub(crate) fn lowers_without_regions<O: LowerableOperationFamily>(
 /// platform that supports it. Implementations are selected from an explicit table by the name and version of the
 /// definition, together with the boundary of the call and the target platform, before anything is emitted, so that
 /// a call either lowers to its implementation or never touches one (i.e., declining emits nothing). A call that no
-/// implementation replaces lowers its body, unless its definition requires a backend implementation.
+/// implementation replaces lowers its body.
 pub(crate) enum NamedCompositeImplementation {
     /// Test implementation of `ryft.tests.xla_named_square` version 1 on CUDA, which squares its input.
     #[cfg(test)]
@@ -48,17 +46,12 @@ pub(crate) enum NamedCompositeImplementation {
 impl NamedCompositeImplementation {
     /// Returns the implementation that replaces the calls of the named composite `key` with the provided input
     /// and output types when lowering for `target_platform`, or [`None`] when the calls lower their body.
-    /// Definitions whose requirement is [`CompositeImplementation::Primal`] are never replaced.
     pub(crate) fn select(
         key: &CompositeKey,
-        implementation: CompositeImplementation,
         _input_types: &[ArrayIrType],
         _output_types: &[ArrayIrType],
         target_platform: Option<&str>,
     ) -> Option<Self> {
-        if implementation == CompositeImplementation::Primal {
-            return None;
-        }
         match (key.name(), key.version(), target_platform) {
             #[cfg(test)]
             ("ryft.tests.xla_named_square", 1, Some("cuda")) => Some(Self::TestSquare),
@@ -95,7 +88,7 @@ where
     Self: Operation<Type = V::Type>,
 {
     #[inline]
-    fn named_composite(&self) -> Option<(&CompositeKey, CompositeImplementation)> {
+    fn named_composite(&self) -> Option<&CompositeKey> {
         self.named()
     }
 
@@ -108,24 +101,14 @@ where
     ) -> Result<Vec<ValueRef<'b, 'c, 't>>, Error> {
         // A named composite call lowers to the backend implementation that replaces it, if any, and otherwise to a call of the
         // shared function that implements its body, if it has one, before falling back to inlining its body.
-        if let Some((key, implementation)) = self.named() {
+        if let Some(key) = self.named() {
             let input_types = input_types.iter().cloned().map(Into::into).collect::<Vec<ArrayIrType>>();
             let output_types = output_types.iter().cloned().map(Into::into).collect::<Vec<ArrayIrType>>();
             let target_platform = lowerer.collective_state.target_platform();
             if let Some(backend) =
-                NamedCompositeImplementation::select(key, implementation, &input_types, &output_types, target_platform)
+                NamedCompositeImplementation::select(key, &input_types, &output_types, target_platform)
             {
                 return backend.lower(lowerer, input_values);
-            }
-            if implementation == CompositeImplementation::Required {
-                return Err(ProgramError::UnsupportedOperation {
-                    message: format!(
-                        "named composite `{key}` requires a backend implementation, which XLA does not provide \
-                         for target platform `{}`",
-                        target_platform.unwrap_or("default"),
-                    ),
-                }
-                .into());
             }
             let function = lowerer
                 .nested_functions
@@ -161,19 +144,17 @@ where
         }
 
         let [primal, ..] = lowerer.regions.as_slice() else {
-            return Err(Error::UnsupportedOperation {
-                op: format!("{COMPOSITE_OPERATION_NAME} expected a primal region but got no regions"),
-            });
+            return Err(Error::from(ProgramError::MalformedProgram(format!(
+                "{COMPOSITE_OPERATION_NAME} expected a primal region but got no regions"
+            ))));
         };
         if lowerer.regions.len() != self.region_slots().len() {
-            return Err(Error::UnsupportedOperation {
-                op: format!(
-                    "{} expected {} attached regions but got {}",
-                    COMPOSITE_OPERATION_NAME,
-                    self.region_slots().len(),
-                    lowerer.regions.len(),
-                ),
-            });
+            return Err(Error::from(ProgramError::MalformedProgram(format!(
+                "{} expected {} attached regions but got {}",
+                COMPOSITE_OPERATION_NAME,
+                self.region_slots().len(),
+                lowerer.regions.len(),
+            ))));
         }
         // Composite call regions are traced through fresh-root contexts whose local capture tables are discarded, so
         // they can never legally reference the enclosing function's captures (the trace boundary rejects bodies that
@@ -474,19 +455,13 @@ mod tests {
             .unwrap()
     }
 
-    /// Returns a registration of a named composite with the provided key and requirement, whose body doubles its
-    /// input.
-    fn named_rules(
-        key: &str,
-        implementation: ryft_core::CompositeImplementation,
-    ) -> ryft_core::CustomRuleRegistration<XlaConstant, XlaOperation> {
+    /// Returns a registration of a named composite with the provided key, whose body doubles its input.
+    fn named_rules(key: &str) -> ryft_core::CustomRuleRegistration<XlaConstant, XlaOperation> {
         use ryft_core::{CompositeKey, CustomRuleDefinition, NamedComposite};
 
         let key = CompositeKey::new(key.to_string(), 1);
         let output_types = |types: &[ArrayIrType]| Ok(types.to_vec());
-        let named = NamedComposite::new(key, implementation, output_types, |inputs| {
-            Ok(vec![inputs[0].clone() + inputs[0].clone()])
-        });
+        let named = NamedComposite::new(key, output_types, |inputs| Ok(vec![inputs[0].clone() + inputs[0].clone()]));
         ryft_core::CustomRuleRegistration::new(CustomRuleDefinition::new("doubled").with_named(named))
     }
 
@@ -523,7 +498,7 @@ mod tests {
     fn test_named_composite_lowering_shares_one_function_per_specialization() {
         // Repeated named composite calls with one body specialization lower to calls of one shared private function named
         // after the definition, while a single call inlines its body.
-        let rules = named_rules("ryft.tests.xla_named_shared", ryft_core::CompositeImplementation::Primal);
+        let rules = named_rules("ryft.tests.xla_named_shared");
         let body = doubled_body();
         assert_eq!(
             lower_named_calls(&named_calls_program(&rules, &body, 2), None).unwrap(),
@@ -558,7 +533,7 @@ mod tests {
     fn test_named_composite_lowering_selects_backend_implementations() {
         // A backend implementation replaces the calls on its target, which then need no shared function, and calls
         // lower their body elsewhere.
-        let rules = named_rules("ryft.tests.xla_named_square", ryft_core::CompositeImplementation::Replaceable);
+        let rules = named_rules("ryft.tests.xla_named_square");
         let body = doubled_body();
         let program = named_calls_program(&rules, &body, 2);
         assert_eq!(
@@ -575,27 +550,10 @@ mod tests {
         );
         assert!(lower_named_calls(&program, None).unwrap().contains("stablehlo.add"));
 
-        // Calls of a definition that requires a backend implementation never lower their body.
-        let rules = named_rules("ryft.tests.xla_named_square", ryft_core::CompositeImplementation::Required);
-        let program = named_calls_program(&rules, &body, 1);
-        assert!(lower_named_calls(&program, Some("cuda")).unwrap().contains("stablehlo.multiply"));
-        assert_eq!(
-            lower_named_calls(&program, None).map(|_| ()).unwrap_err().to_string(),
-            "named composite `ryft.tests.xla_named_square.v1` requires a backend implementation, which XLA \
-             does not provide for target platform `default`",
-        );
-
-        // Definitions whose body is their implementation are never replaced.
-        let rules = named_rules("ryft.tests.xla_named_square", ryft_core::CompositeImplementation::Primal);
+        // Calls of definitions that no backend implementation recognizes lower their body on every target.
+        let rules = named_rules("ryft.tests.xla_named_unrecognized");
         let program = named_calls_program(&rules, &body, 1);
         assert!(lower_named_calls(&program, Some("cuda")).unwrap().contains("stablehlo.add"));
-        let rules = named_rules("ryft.tests.xla_named_required", ryft_core::CompositeImplementation::Required);
-        let program = named_calls_program(&rules, &body, 1);
-        assert_eq!(
-            lower_named_calls(&program, Some("cuda")).map(|_| ()).unwrap_err().to_string(),
-            "named composite `ryft.tests.xla_named_required.v1` requires a backend implementation, which XLA \
-             does not provide for target platform `cuda`",
-        );
     }
 
     #[test]
@@ -604,8 +562,8 @@ mod tests {
 
         // Two separately registered definitions share one key and boundary but carry different bodies (e.g., because
         // their named axes differ). Each call must still lower to the shared function of its own body.
-        let first = named_rules("ryft.tests.xla_named_conflict", ryft_core::CompositeImplementation::Primal);
-        let second = named_rules("ryft.tests.xla_named_conflict", ryft_core::CompositeImplementation::Primal);
+        let first = named_rules("ryft.tests.xla_named_conflict");
+        let second = named_rules("ryft.tests.xla_named_conflict");
         let doubled = doubled_body();
         let squared = {
             let mut builder = ArrayIrXlaProgramBuilder::new();

@@ -20,6 +20,14 @@ use ryft_core::{
 use ryft_xla::Error;
 use ryft_xla::experimental::{TracedXlaProgram, XlaArrayTracer, trace};
 
+/// A requested structural-statistics case is absent from this binary's registry.
+#[derive(Debug, thiserror::Error)]
+#[error("unknown program statistics case `{case_id}`")]
+struct UnknownProgramStatisticsCase {
+    /// Exact unknown registry identifier.
+    case_id: String,
+}
+
 /// One emitted program statistics record.
 #[derive(Clone, Debug, Serialize, PartialEq, Eq)]
 struct ProgramStatisticsRecord {
@@ -132,7 +140,7 @@ fn collect_records(case_ids: &[String]) -> Result<Vec<ProgramStatisticsRecord>, 
                     .iter()
                     .copied()
                     .find(|case| case.case_id == case_id)
-                    .ok_or_else(|| Error::UnknownProgramStatisticsCase { case_id: case_id.clone() })
+                    .ok_or_else(|| Error::custom(UnknownProgramStatisticsCase { case_id: case_id.clone() }))
             })
             .collect::<Result<Vec<_>, _>>()?
     };
@@ -438,6 +446,7 @@ mod tests {
     fn test_collect_records_rejects_unknown_case() {
         let error = collect_records(&["missing_case".to_string()]).unwrap_err();
         assert_eq!(error.to_string(), "unknown program statistics case `missing_case`");
+        assert_eq!(error.downcast_custom::<UnknownProgramStatisticsCase>().unwrap().case_id, "missing_case");
     }
 
     /// Verifies the exact expected statistics for every scalar case. These values are the primary structural

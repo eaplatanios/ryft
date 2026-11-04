@@ -10,8 +10,8 @@ use ryft_mlir::{
 
 use crate::experimental::lowering::EffectTokens;
 use crate::experimental::lowering::types::{
-    lower_constant_output, lower_physical_bound_value, lower_restore_dynamic_dimensions, lower_static_index_constants,
-    physical_bound_type, reshape_dimension_i32, reshape_dimension_i64,
+    dimension_extent_i32, dimension_extent_i64, lower_constant_output, lower_physical_bound_value,
+    lower_restore_dynamic_dimensions, lower_static_index_constants, physical_bound_type,
 };
 use crate::operations::assertions::{
     ASSERT_ACTOR_ATTRIBUTE, ASSERT_CONCATENATE_KIND, ASSERT_DETAIL_ATTRIBUTE, ASSERT_KIND_ATTRIBUTE,
@@ -163,7 +163,7 @@ impl LowerableOperation for ConcatenateOperation<ArrayIrType> {
             let inferred_type = output_type.clone().with_shape(Shape::new(inferred_dimensions));
             let physical_input_type = physical_bound_type(&inferred_type)?;
             let physical_output_type = physical_bound_type(output_type)?;
-            reshape_dimension_i32(physical_output_type.dimension(self.axis()).value().unwrap())?;
+            dimension_extent_i32(physical_output_type.dimension(self.axis()).value().unwrap())?;
             let logical_result = result;
             // Concatenate has already packed logical input extents contiguously. Expose its bounded storage,
             // resize only its trailing padding, then restore the logical dimensions. Reshape cannot change an
@@ -173,8 +173,8 @@ impl LowerableOperation for ConcatenateOperation<ArrayIrType> {
                 lower_physical_bound_value(result, &inferred_type, padding_value as f64, block, context, location)?;
             let mut high_padding = vec![0; output_type.rank()];
             high_padding[self.axis()] =
-                reshape_dimension_i64(physical_output_type.dimension(self.axis()).value().unwrap())?
-                    - reshape_dimension_i64(physical_input_type.dimension(self.axis()).value().unwrap())?;
+                dimension_extent_i64(physical_output_type.dimension(self.axis()).value().unwrap())?
+                    - dimension_extent_i64(physical_input_type.dimension(self.axis()).value().unwrap())?;
             if high_padding[self.axis()] != 0 {
                 // Padding is outside the logical extent; choose a representable value even for the exponent-only
                 // float format, which has no zero encoding.

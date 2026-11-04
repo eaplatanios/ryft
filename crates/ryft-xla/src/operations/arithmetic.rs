@@ -1,6 +1,6 @@
 use ryft_core::macros::check_count;
 use ryft_core::{
-    AbsOperation, AddOperation, ArrayType, DataType, DivOperation, MulOperation, NegOperation, PowOperation,
+    AbsOperation, AddOperation, ArrayType, DataType, DivOperation, MulOperation, NegOperation, Operation, PowOperation,
     RemOperation, RsqrtOperation, SaturatingSubOperation, SignOperation, SqrtOperation, SubOperation,
 };
 use ryft_mlir::dialects::stable_hlo;
@@ -10,7 +10,7 @@ use crate::experimental::lowering::types::{
     lower_constant_elements_attribute, lower_signed_one_bit_to_mlir, lower_tensor_type,
 };
 use crate::operations::{lower_accuracy, normalize_binary_elementwise_operands};
-use crate::{Error, LowerableOperation, LowerableOperationFamily, XlaLowerer};
+use crate::{Error, LowerableOperation, LowerableOperationFamily, LoweringError, XlaLowerer};
 
 /// Recovers signed one-bit values before promotion and computes one-bit arithmetic in a byte carrier.
 fn normalize_arithmetic_inputs<'b, 'c: 'b, 't: 'c, O: LowerableOperationFamily>(
@@ -125,7 +125,10 @@ impl LowerableOperation for SaturatingSubOperation<ArrayType> {
             )?]);
         }
         if !data_type.is_signed() {
-            return Err(Error::UnsupportedDataType { data_type });
+            return Err(Error::Lowering(LoweringError::UnsupportedElementType {
+                data_type,
+                context: format!("`{}` operation", self.name()),
+            }));
         }
 
         let carrier_data_type = if data_type == DataType::I1 { DataType::I8 } else { data_type };

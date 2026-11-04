@@ -1,7 +1,8 @@
 use ryft_core::macros::check_count;
 use ryft_core::{
-    ArrayIrType, ArrayType, CAST_OPERATION_NAME, CastOperation, CastType, ConvertElementTypeOperation, DataType,
-    Dimension, MeshAxisType, Operation, ProgramError, ReducePrecisionOperation, ReductionKind, Shape, Sharding,
+    ArrayIrType, ArrayType, CAST_OPERATION_NAME, CONVERT_ELEMENT_TYPE_OPERATION_NAME, CastOperation, CastType,
+    ConvertElementTypeOperation, DataType, Dimension, MeshAxisType, ProgramError, ReducePrecisionOperation,
+    ReductionKind, Shape, Sharding,
 };
 use ryft_mlir::dialects::stable_hlo;
 use ryft_mlir::{
@@ -18,7 +19,7 @@ use crate::operations::constants::lower_layout_constraint;
 use crate::operations::control_flow::{lower_refined_region_input, lower_refined_region_outputs};
 use crate::operations::reductions::lower_reduce_to_mlir;
 use crate::operations::sharding::constrain_sharding::lower_sharding_constraint;
-use crate::{Error, LowerableOperation, LowerableOperationFamily, XlaLowerer};
+use crate::{Error, LowerableOperation, LowerableOperationFamily, LoweringError, XlaLowerer};
 
 impl LowerableOperation for ConvertElementTypeOperation<ArrayType> {
     fn lower<'b, 'c: 'b, 't: 'c, O: LowerableOperationFamily>(
@@ -271,7 +272,9 @@ fn lower_cast_operation<'b, 'c: 'b, 't: 'c, T: CastType + Into<ArrayIrType>, O: 
 ) -> Result<Vec<ValueRef<'b, 'c, 't>>, Error> {
     check_count!("output", output_types, 1, ProgramError);
     if input_values.is_empty() || input_types.is_empty() {
-        return Err(Error::UnsupportedOperation { op: format!("`{}` expects at least 1 input", operation.name()) });
+        return Err(
+            ProgramError::InvalidInputCount { expected: 1, actual: input_values.len().min(input_types.len()) }.into()
+        );
     }
     // A checked cast is ordered after preceding assertions even when the actual types prove its relationship and no
     // check is emitted (binding normalizes proven casts to unchecked ones, so this only affects casts staged directly
@@ -427,22 +430,24 @@ pub(crate) fn lower_cast_shape<'b, 'c: 'b, 't: 'c>(
         };
         if let Some(changed_axis) = changed_axis {
             if let Some(dimension) = unbounded_dimension(changed_axis) {
-                return Err(Error::UnsupportedOperation {
-                    op: format!(
+                return Err(Error::Lowering(LoweringError::UnsupportedOperation {
+                    operation: CAST_OPERATION_NAME.to_string(),
+                    reason: format!(
                         "shape conversion along axis {changed_axis} requires a finite physical bound, but that axis \
                          has unbounded dimension `{dimension}`",
                     ),
-                });
+                }));
             }
             if let Some((axis, dimension)) =
                 (0..dimension_pairs.len()).find_map(|axis| unbounded_dimension(axis).map(|dimension| (axis, dimension)))
             {
-                return Err(Error::UnsupportedOperation {
-                    op: format!(
+                return Err(Error::Lowering(LoweringError::UnsupportedOperation {
+                    operation: CAST_OPERATION_NAME.to_string(),
+                    reason: format!(
                         "shape conversion along axis {changed_axis} requires finite physical bounds for every axis, \
                          but axis {axis} has unbounded dimension `{dimension}`",
                     ),
-                });
+                }));
             }
         }
     }
@@ -682,8 +687,14 @@ fn lower_bitcast_to_mlir<'b, 'c: 'b, 't: 'c>(
         return Ok(result.result(0).unwrap().as_ref());
     }
     // Width-changing bitcasts need physical bounds for XLA's dynamic padding pass.
-    let physical_input_type = physical_bound_type(input_type).map_err(|_| Error::UnsupportedOperation {
-        op: "width-changing bitcast with an unbounded dynamic dimension".to_string(),
+    let physical_input_type = physical_bound_type(input_type).map_err(|error| match error {
+        Error::Lowering(LoweringError::UnsupportedOperation { .. }) => {
+            Error::Lowering(LoweringError::UnsupportedOperation {
+                operation: CONVERT_ELEMENT_TYPE_OPERATION_NAME.to_string(),
+                reason: "width-changing bitcast with an unbounded dynamic dimension".to_string(),
+            })
+        }
+        error => error,
     })?;
     let padding = if input_type.data_type() == DataType::F8E8M0FNU { 1.0 } else { 0.0 };
     let carrier_input_type =
@@ -1030,7 +1041,7 @@ mod tests {
     use indoc::{formatdoc, indoc};
     use pretty_assertions::assert_eq;
 
-    use ryft_core::{DimensionBounds, DimensionType, GuardOperation, Placeholder, TypeError};
+    use ryft_core::{DimensionBounds, DimensionType, GuardOperation, Operation, Placeholder, TypeError};
 
     use crate::experimental::lowering::tests::{XlaProgramBuilder, dynamic_dimension};
     use crate::experimental::lowering::to_mlir_module_for_plain_program;
@@ -1152,7 +1163,7 @@ mod tests {
             .unwrap();
         assert!(matches!(
             to_mlir_module_for_plain_program(&program, "main"),
-            Err(Error::UnsupportedOperation { op })
+            Err(Error::Lowering(LoweringError::UnsupportedOperation { reason: op, .. }))
                 if op == "width-changing bitcast with an unbounded dynamic dimension",
         ));
     }
@@ -2735,7 +2746,7 @@ mod tests {
                     None,
                     None,
                 ),
-                Err(Error::UnsupportedOperation { op })
+                Err(Error::Lowering(LoweringError::UnsupportedOperation { reason: op, .. }))
                     if op == "non-row-major bounded-dynamic output layout `tiled{0,1}`",
             ));
         }
@@ -3005,7 +3016,7 @@ mod tests {
                     .unwrap();
                 assert!(matches!(
                     to_mlir_module_for_plain_program(&program, "main"),
-                    Err(Error::UnsupportedOperation { op }) if op == expected,
+                    Err(Error::Lowering(LoweringError::UnsupportedOperation { reason: op, .. })) if op == expected,
                 ));
                 let program = program.into_unprojected::<XlaConstant, XlaOperation>().unwrap();
                 assert!(matches!(
@@ -3018,7 +3029,7 @@ mod tests {
                         None,
                         None,
                     ),
-                    Err(Error::UnsupportedOperation { op }) if op == expected,
+                    Err(Error::Lowering(LoweringError::UnsupportedOperation { reason: op, .. })) if op == expected,
                 ));
             }
         }
@@ -3886,7 +3897,10 @@ mod tests {
                 &[output_type],
             );
             match expected {
-                Some(expected) => assert!(matches!(result, Err(Error::UnsupportedOperation { op }) if op == expected)),
+                Some(expected) => assert!(matches!(
+                    result,
+                    Err(Error::Lowering(LoweringError::UnsupportedOperation { reason, .. })) if reason == expected,
+                )),
                 None => assert_eq!(result.unwrap(), vec![source]),
             }
         }

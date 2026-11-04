@@ -27,7 +27,7 @@ use ryft_mlir::ValueRef;
 
 use crate::experimental::ops::{FlatXlaProgram, XlaConstant, XlaOperation};
 use crate::kernels::{CompiledKernel, KernelEmbeddingError, KernelOutputEmbedding, validate_kernel_sharding};
-use crate::{Error, LowerableOperation, LowerableOperationFamily, XlaLowerer, XlaTarget};
+use crate::{Error, LowerableOperation, LowerableOperationFamily, LoweringError, XlaLowerer, XlaTarget};
 
 /// Adapter operation families enabled in this XLA integration.
 ///
@@ -533,9 +533,11 @@ impl LowerableOperation for XlaKernelOperation {
         _input_types: &[ArrayIrType],
         _output_types: &[ArrayIrType],
     ) -> Result<Vec<ValueRef<'b, 'c, 't>>, Error> {
-        Err(Error::UnsupportedOperation {
-            op: format!("unselected kernel operation `{}` requires an explicit XLA compiler binding", self.name()),
-        })
+        Err(LoweringError::UnsupportedOperation {
+            operation: self.name().to_string(),
+            reason: "unselected kernel operation requires an explicit XLA compiler binding".to_string(),
+        }
+        .into())
     }
 }
 

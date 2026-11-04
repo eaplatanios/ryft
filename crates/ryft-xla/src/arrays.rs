@@ -5,9 +5,9 @@ use std::ops::Range;
 use std::sync::{Arc, Mutex, OnceLock};
 
 use ryft_core::{
-    ArrayType, DataType, Device, DeviceId, DeviceMesh, Layout, LayoutError, Memory, Parameter, Parameterized,
-    ProjectedContext, Sharding, ShardingDimension, ShardingError, StaticShape, Typed, Value, ValueDomainDispatch,
-    check_sharding,
+    ArrayType, DataType, Device, DeviceId, DeviceMesh, DimensionError, Layout, LayoutError, Memory, Parameter,
+    Parameterized, ProjectedContext, Shape, Sharding, ShardingDimension, ShardingError, StaticShape, Typed, Value,
+    ValueDomainDispatch, check_sharding,
 };
 use ryft_macros::Parameter;
 use ryft_pjrt::{Buffer, BufferType, Client, Error as PjrtError, ExecutionFence};
@@ -17,6 +17,115 @@ use crate::arrays_v0::{
     LOGICAL_EXTENT_SCALAR_CACHE_CAPACITY,
 };
 use crate::{Error, FromPjrt, ToPjrt, XlaDomain};
+
+/// Errors owned by distributed array metadata, placement, buffer validation, and host materialization.
+///
+/// Array APIs return [`Error`], which retains these conditions in [`Error::Array`]. Foreign core and PJRT failures
+/// keep their root carriers unless a condition adds useful array context. [`Self::InvalidShardDimension`] retains
+/// its canonical core cause together with the shard and axis that failed transport encoding.
+#[derive(Clone, Debug, thiserror::Error)]
+pub enum ArrayError {
+    /// An array type is missing required sharding metadata.
+    #[error("missing required sharding metadata")]
+    MissingSharding,
+
+    /// An operation requires a domain with a device mesh.
+    #[error("domain was constructed without a device mesh")]
+    MissingMesh,
+
+    /// An operation requires a static array shape.
+    #[error("expected static shape but got {shape}")]
+    DynamicShape { shape: Shape },
+
+    /// Default placement could not select a local device.
+    #[error("device_put needs a default local device, but the PJRT client has no addressable devices")]
+    MissingDefaultDevice,
+
+    /// An explicit source placement differs from the array's current placement.
+    #[error(
+        "device_put src mesh {expected_mesh:?} with sharding {expected_sharding:?} does not match the array's current \
+         mesh {actual_mesh:?} with sharding {actual_sharding:?}"
+    )]
+    SourcePlacementMismatch {
+        expected_mesh: DeviceMesh,
+        expected_sharding: Sharding,
+        actual_mesh: DeviceMesh,
+        actual_sharding: Sharding,
+    },
+
+    /// The current PJRT client cannot address a required device.
+    #[error("device {device_id} is not addressable by the PJRT client in process {process_index}")]
+    NonAddressableDevice { device_id: DeviceId, process_index: usize },
+
+    /// A buffer's owning device is absent from the array mesh.
+    #[error("device {device_id} is not present in the device mesh")]
+    DeviceNotInMesh { device_id: DeviceId },
+
+    /// A buffer's owning process differs from the corresponding mesh device.
+    #[error("device {device_id} reports process index {actual_process_index}, but expected {expected_process_index}")]
+    DeviceProcessIndexMismatch { device_id: DeviceId, expected_process_index: usize, actual_process_index: usize },
+
+    /// A device has no memory matching the requested placement.
+    #[error("device {device_id} has no addressable memory for `{memory}`")]
+    UnsupportedMemory { device_id: DeviceId, memory: Memory },
+
+    /// Compiled resharding cannot handle an axis already owned by a manual computation.
+    #[error("compiled reshard does not support `Manual` mesh axis {axis_name}")]
+    ManualReshardingAxis { axis_name: String },
+
+    /// Multiple buffers were supplied for one device.
+    #[error("got multiple buffers for device {device_id}")]
+    MultipleBuffersOnDevice { device_id: DeviceId },
+
+    /// A physical buffer has a different array type than its declared shard.
+    #[error("buffer has type {actual}, but expected {expected}")]
+    BufferTypeMismatch { expected: ArrayType, actual: ArrayType },
+
+    /// A physical buffer occupies a different memory tier than its declared shard.
+    #[error("buffer on device {device_id} uses memory kind `{actual}`, but expected `{expected}`")]
+    BufferMemoryMismatch { device_id: DeviceId, expected: Memory, actual: String },
+
+    /// A zero-space buffer contains an observable nonzero physical carrier value.
+    #[error("zero-space buffer on device {device_id} contains a nonzero physical carrier value")]
+    NonCanonicalZeroBuffer { device_id: DeviceId },
+
+    /// Supplied host bytes do not match the declared array type.
+    #[error("expected {expected} byte(s) but got {actual}")]
+    ByteCountMismatch { expected: usize, actual: usize },
+
+    /// A shard slice has a different rank than its array shape.
+    #[error("shape rank {shape_rank} does not match shard slice rank {slice_rank}")]
+    ShardSliceRankMismatch { shape_rank: usize, slice_rank: usize },
+
+    /// Array placement or host materialization requires a shard that has no local buffer.
+    #[error("array shard #{shard_index} on device {device_id} has no addressable buffer")]
+    MissingShardBuffer { shard_index: ShardIndex, device_id: DeviceId },
+
+    /// A shard dimension cannot be encoded by the transfer ABI, retaining its canonical core cause.
+    #[error("cross-host transfer for shard #{shard_index}, dimension #{dimension}: {source}")]
+    InvalidShardDimension {
+        shard_index: ShardIndex,
+        dimension: usize,
+        #[source]
+        source: DimensionError,
+    },
+
+    /// Downloaded shard bytes do not match the expected logical shard size.
+    #[error(
+        "copied shard #{shard_index} from device {device_id} to host and got {actual_byte_count} byte(s), but expected \
+         {expected_byte_count}"
+    )]
+    ShardByteCountMismatch {
+        shard_index: ShardIndex,
+        device_id: DeviceId,
+        expected_byte_count: usize,
+        actual_byte_count: usize,
+    },
+
+    /// Overlapping physical shard slices contain different values.
+    #[error("array move found inconsistent overlapping data while materializing shard #{shard_index}")]
+    InconsistentOverlappingShardData { shard_index: ShardIndex },
+}
 
 // TODO(eaplatanios): Is `ArrayType::memory` being set, handled, and propagated correctly throughout this crate?
 
@@ -142,14 +251,14 @@ impl<'o> XlaArray<'o> {
     /// only when exactly one addressable buffer is provided; in that case the array is treated as replicated over the
     /// provided `mesh`.
     ///
-    /// Each [`Buffer`] is assigned to a global shard based on the [`DeviceId`] of its owning device. This function will
-    /// return an [`Error::MultipleBuffersOnDevice`] if there are multiple buffers provided that are owned by the same
-    /// device. It will also return an [`Error::DeviceNotInMesh`] if there are buffer whose device is not present in
-    /// `mesh`, an [`Error::NonAddressableDevice`] for buffers whose device belongs to a different process than the
-    /// corresponding mesh device, and an [`Error::BufferTypeMismatch`] for buffers whose data type or static shape
-    /// does not match the shard type derived from `r#type`, `mesh`, and the effective sharding. A buffer whose physical
-    /// memory differs from `r#type.memory()` produces [`Error::BufferMemoryMismatch`]. [`Memory::Device`] denotes the
-    /// owning device's default memory; host placements require the corresponding pinned or unpinned memory kind.
+    /// Each [`Buffer`] is assigned to a global shard based on the [`DeviceId`] of its owning device. Failures use
+    /// [`Error::Array`] with [`ArrayError::MultipleBuffersOnDevice`] when multiple buffers belong to the same device,
+    /// [`ArrayError::DeviceNotInMesh`] when a buffer's device is absent from `mesh`, and
+    /// [`ArrayError::DeviceProcessIndexMismatch`] when a buffer's process differs from the corresponding mesh device.
+    /// [`ArrayError::BufferTypeMismatch`] reports a data type or static shape that differs from the shard type derived
+    /// from `r#type`, `mesh`, and the effective sharding. A buffer whose physical memory differs from `r#type.memory()`
+    /// produces [`ArrayError::BufferMemoryMismatch`]. [`Memory::Device`] denotes the owning device's default memory.
+    /// Host placements require the corresponding pinned or unpinned memory kind.
     /// Shards without a local/addressable buffer are retained as non-addressable [`XlaArrayShard`]s. For a logical
     /// [`DataType::Zero`] array, every private predicate carrier must contain only false bits; a noncanonical buffer is
     /// rejected so that its physical payload cannot become observable through the logical zero-space value. Valid
@@ -199,13 +308,15 @@ impl<'o> XlaArray<'o> {
             Some(_) => r#type,
             None if buffers.len() == 1 => r#type.replicated(&mesh)?,
             None => {
-                return Err(Error::MissingSharding);
+                return Err(Error::Array(ArrayError::MissingSharding));
             }
         };
 
         // Compute the global `ShardLayout` implied by the normalized array type and concrete device mesh.
-        let shape = r#type.static_shape().ok_or_else(|| Error::DynamicShape { shape: r#type.shape().clone() })?;
-        let sharding = r#type.sharding().ok_or(Error::MissingSharding)?;
+        let shape = r#type
+            .static_shape()
+            .ok_or_else(|| Error::Array(ArrayError::DynamicShape { shape: r#type.shape().clone() }))?;
+        let sharding = r#type.sharding().ok_or(Error::Array(ArrayError::MissingSharding))?;
         let layout = ShardLayout::new(&shape, &mesh, sharding)?;
         let (descriptors, shard_index_by_device) = layout.into_parts();
 
@@ -222,7 +333,7 @@ impl<'o> XlaArray<'o> {
                 validate_zero_carriers,
             )?;
             if buffers_by_device.contains_key(&device_id) {
-                return Err(Error::MultipleBuffersOnDevice { device_id });
+                return Err(Error::Array(ArrayError::MultipleBuffersOnDevice { device_id }));
             }
             buffers_by_device.insert(device_id, Arc::new(buffer));
         }
@@ -265,8 +376,10 @@ impl<'o> XlaArray<'o> {
             Some(_) => r#type,
             None => r#type.replicated(&mesh)?,
         };
-        let shape = r#type.static_shape().ok_or_else(|| Error::DynamicShape { shape: r#type.shape().clone() })?;
-        let sharding = r#type.sharding().ok_or(Error::MissingSharding)?;
+        let shape = r#type
+            .static_shape()
+            .ok_or_else(|| Error::Array(ArrayError::DynamicShape { shape: r#type.shape().clone() }))?;
+        let sharding = r#type.sharding().ok_or(Error::Array(ArrayError::MissingSharding))?;
         let layout = ShardLayout::new(&shape, &mesh, sharding)?;
         let (descriptors, shard_index_by_device) = layout.into_parts();
         let client = domain.client();
@@ -278,7 +391,10 @@ impl<'o> XlaArray<'o> {
             .map(|descriptor| -> Result<_, Error> {
                 if descriptor.device().process_index() == process_index {
                     if !addressable_device_ids.contains(&descriptor.device().id()) {
-                        return Err(Error::NonAddressableDevice { device_id: descriptor.device().id(), process_index });
+                        return Err(Error::Array(ArrayError::NonAddressableDevice {
+                            device_id: descriptor.device().id(),
+                            process_index,
+                        }));
                     }
                     Ok(XlaArrayShard::new_zero(descriptor))
                 } else {
@@ -303,7 +419,7 @@ impl<'o> XlaArray<'o> {
     ///
     /// Each addressable shard is uploaded to the memory requested by `r#type`. [`Memory::Device`] uses the device's
     /// default memory; host placements select its `pinned_host` or `unpinned_host` memory. A device without the requested
-    /// host space produces [`Error::UnsupportedMemory`]. Bufferless structural-zero arrays require no allocation.
+    /// host space produces [`ArrayError::UnsupportedMemory`]. Bufferless structural-zero arrays require no allocation.
     ///
     /// # Parameters
     ///
@@ -329,7 +445,11 @@ impl<'o> XlaArray<'o> {
         let buffer = buffer.as_ref();
         let expected_byte_count = r#type.size_in_bytes()?;
         if buffer.len() != expected_byte_count {
-            return Err(Error::ByteCountMismatch { expected: expected_byte_count, actual: buffer.len() }.into());
+            return Err(Error::Array(ArrayError::ByteCountMismatch {
+                expected: expected_byte_count,
+                actual: buffer.len(),
+            })
+            .into());
         }
         if r#type.data_type().is_zero() {
             return Ok(Self::from_zero_space(domain, r#type, mesh)?);
@@ -348,7 +468,9 @@ impl<'o> XlaArray<'o> {
         // represented by metadata when `Self::from_addressable_buffers` materializes the final array.
         let data_type = r#type.data_type();
         let device_layout = r#type.layout().map(ToPjrt::to_pjrt).transpose()?;
-        let shape = r#type.static_shape().ok_or_else(|| Error::DynamicShape { shape: r#type.shape().clone() })?;
+        let shape = r#type
+            .static_shape()
+            .ok_or_else(|| Error::Array(ArrayError::DynamicShape { shape: r#type.shape().clone() }))?;
         let sharding = r#type.sharding().unwrap();
         let layout = ShardLayout::new(&shape, &mesh, &sharding)?;
         let mut addressable_buffers = Vec::new();
@@ -359,10 +481,9 @@ impl<'o> XlaArray<'o> {
             }
 
             let shard_device_id = shard_device.id();
-            let device = addressable_device_by_id.get(&shard_device_id).ok_or(Error::NonAddressableDevice {
-                device_id: shard_device_id,
-                process_index: client_process_index,
-            })?;
+            let device = addressable_device_by_id.get(&shard_device_id).ok_or(Error::Array(
+                ArrayError::NonAddressableDevice { device_id: shard_device_id, process_index: client_process_index },
+            ))?;
 
             // Resolve the requested space explicitly; passing the device itself would always upload to its default
             // memory and could silently mislabel a host-resident array as pinned or unpinned memory.
@@ -377,7 +498,10 @@ impl<'o> XlaArray<'o> {
                             break;
                         }
                     }
-                    selected.ok_or(Error::UnsupportedMemory { device_id: shard_device_id, memory: requested })?
+                    selected.ok_or(Error::Array(ArrayError::UnsupportedMemory {
+                        device_id: shard_device_id,
+                        memory: requested,
+                    }))?
                 }
             };
 
@@ -786,17 +910,19 @@ impl<'o> XlaArray<'o> {
         }
         let device_id = device.id();
 
-        let shard_index = shard_index_by_device.get(&device_id).ok_or(Error::DeviceNotInMesh { device_id })?;
+        let shard_index = shard_index_by_device
+            .get(&device_id)
+            .ok_or(Error::Array(ArrayError::DeviceNotInMesh { device_id }))?;
         let descriptor = descriptors.get(*shard_index).unwrap();
 
         // Validate that each buffer is owned by the process expected for the corresponding mesh device.
         let process_index = device.process_index();
         if process_index != descriptor.device().process_index() {
-            return Err(Error::DeviceProcessIndexMismatch {
+            return Err(Error::Array(ArrayError::DeviceProcessIndexMismatch {
                 device_id,
                 expected_process_index: descriptor.device().process_index(),
                 actual_process_index: process_index,
-            });
+            }));
         }
 
         // A type's placement must describe the actual buffer, not merely relabel its storage. Device placement
@@ -809,11 +935,11 @@ impl<'o> XlaArray<'o> {
             Memory::Host { pinned: false } => buffer_memory.kind()? == "unpinned_host",
         };
         if !memory_matches {
-            return Err(Error::BufferMemoryMismatch {
+            return Err(Error::Array(ArrayError::BufferMemoryMismatch {
                 device_id,
                 expected: r#type.memory(),
                 actual: buffer_memory.kind()?.to_string(),
-            });
+            }));
         }
 
         if let Some(expected) = r#type.layout() {
@@ -850,21 +976,24 @@ impl<'o> XlaArray<'o> {
                 .collect::<Result<Vec<_>, _>>()?,
         );
         if buffer_type != expected_buffer_type && matches!(r#type.data_type(), DataType::I1 | DataType::U1) {
-            return Err(Error::BufferTypeMismatch {
+            return Err(Error::Array(ArrayError::BufferTypeMismatch {
                 expected: ArrayType::new(DataType::Boolean, shape.clone().into()),
                 actual: ArrayType::new(data_type, shape.into()),
-            });
+            }));
         }
         let array_type = ArrayType::new(data_type, shape.into());
         let expected_array_type = ArrayType::new(r#type.data_type(), descriptor.shape().into());
         if array_type != expected_array_type {
-            return Err(Error::BufferTypeMismatch { expected: expected_array_type, actual: array_type });
+            return Err(Error::Array(ArrayError::BufferTypeMismatch {
+                expected: expected_array_type,
+                actual: array_type,
+            }));
         }
         if validate_zero_carriers
             && r#type.data_type().is_zero()
             && buffer.copy_to_host(None)?.r#await()?.iter().any(|value| *value != 0)
         {
-            return Err(Error::NonCanonicalZeroBuffer { device_id });
+            return Err(Error::Array(ArrayError::NonCanonicalZeroBuffer { device_id }));
         }
         Ok(device_id)
     }
@@ -972,8 +1101,10 @@ impl ArrayOutputLayout {
         mesh: Arc<DeviceMesh>,
         addressable_device_ids: &[DeviceId],
     ) -> Result<Self, Error> {
-        let shape = r#type.static_shape().ok_or_else(|| Error::DynamicShape { shape: r#type.shape().clone() })?;
-        let sharding = r#type.sharding().ok_or(Error::MissingSharding)?;
+        let shape = r#type
+            .static_shape()
+            .ok_or_else(|| Error::Array(ArrayError::DynamicShape { shape: r#type.shape().clone() }))?;
+        let sharding = r#type.sharding().ok_or(Error::Array(ArrayError::MissingSharding))?;
         let (descriptors, shard_index_by_device) = ShardLayout::new(&shape, &mesh, sharding)?.into_parts();
         let buffer_positions = descriptors
             .iter()
@@ -1200,13 +1331,16 @@ impl ShardDescriptor {
     ///
     /// # Errors
     ///
-    /// Returns [`Error::ShardSliceRankMismatch`] if `shape` has a different rank than [`Self::slice`],
+    /// Returns [`ArrayError::ShardSliceRankMismatch`] if `shape` has a different rank than [`Self::slice`],
     /// or [`Error::SizeLimitExceeded`] if the absorbed block element count overflows [`usize`].
     pub fn contiguous_inner_block(&self, shape: &StaticShape) -> Result<(usize, usize), Error> {
         let rank = self.slice.len();
 
         if shape.rank() != rank {
-            return Err(Error::ShardSliceRankMismatch { shape_rank: shape.rank(), slice_rank: rank });
+            return Err(Error::Array(ArrayError::ShardSliceRankMismatch {
+                shape_rank: shape.rank(),
+                slice_rank: rank,
+            }));
         }
 
         if rank == 0 {
@@ -1379,7 +1513,9 @@ impl ArrayTypeExtension for ArrayType {
         if self.data_type().is_zero() {
             return Ok(0);
         }
-        let element_count = self.element_count()?.ok_or_else(|| Error::DynamicShape { shape: self.shape().clone() })?;
+        let element_count = self
+            .element_count()?
+            .ok_or_else(|| Error::Array(ArrayError::DynamicShape { shape: self.shape().clone() }))?;
         let element_size_in_bytes = self.data_type().to_pjrt().element_size_in_bytes()?;
         element_count.checked_mul(element_size_in_bytes).ok_or_else(|| Error::SizeLimitExceeded {
             message: format!(
@@ -1409,7 +1545,8 @@ mod tests {
     use crate::{Error, FromPjrt, ToPjrt, XlaSession};
 
     use super::{
-        ArrayOutputLayout, ArrayTypeExtension, ShardDescriptor, ShardLayout, XlaArray, XlaArrayShard, block_until_ready,
+        ArrayError, ArrayOutputLayout, ArrayTypeExtension, ShardDescriptor, ShardLayout, XlaArray, XlaArrayShard,
+        block_until_ready,
     };
 
     fn assert_send_sync<T: Send + Sync>() {}
@@ -1573,11 +1710,11 @@ mod tests {
                 vec![buffer],
             )
             ,
-            Err(Error::BufferMemoryMismatch {
+            Err(Error::Array(ArrayError::BufferMemoryMismatch {
                 device_id,
                 expected: Memory::Host { pinned: true },
                 actual: reported,
-            }) if device_id == device.id().unwrap() && reported == actual,
+            })) if device_id == device.id().unwrap() && reported == actual,
         ));
     }
 
@@ -1834,7 +1971,7 @@ mod tests {
 
         let error = XlaArray::from_addressable_buffers(&domain, r#type, mesh, vec![buffer]).unwrap_err();
 
-        assert!(matches!(error, Error::NonCanonicalZeroBuffer { .. }));
+        assert!(matches!(error, Error::Array(ArrayError::NonCanonicalZeroBuffer { .. })));
     }
 
     #[test]
@@ -1896,7 +2033,7 @@ mod tests {
             let buffer = client.buffer(&[1], data_type.to_pjrt(), [], None, device.clone(), None).unwrap();
             assert!(matches!(
                 XlaArray::from_addressable_buffers(&domain, array_type, mesh.clone(), vec![buffer]),
-                Err(Error::BufferTypeMismatch { expected, actual })
+                Err(Error::Array(ArrayError::BufferTypeMismatch { expected, actual }))
                     if expected == ArrayType::scalar(DataType::Boolean) && actual == ArrayType::scalar(data_type),
             ));
         }
@@ -2101,7 +2238,7 @@ mod tests {
         // A shape whose rank does not match the descriptor's slice rank reports a rank-mismatch error.
         assert!(matches!(
             descriptor.contiguous_inner_block(&StaticShape::new(vec![8, 4, 2])),
-            Err(Error::ShardSliceRankMismatch { shape_rank: 3, slice_rank: 2 }),
+            Err(Error::Array(ArrayError::ShardSliceRankMismatch { shape_rank: 3, slice_rank: 2 })),
         ));
 
         // A rank-one descriptor always reports a single block over its slice.
@@ -2295,7 +2432,7 @@ mod tests {
             Shape::new(vec![DimensionVariable::new("dynamic", DimensionBounds::unbounded()).into()]),
         );
         let error = dynamic_type.size_in_bytes().unwrap_err();
-        assert!(matches!(&error, Error::DynamicShape { shape } if shape == dynamic_type.shape()));
+        assert!(matches!(&error, Error::Array(ArrayError::DynamicShape { shape }) if shape == dynamic_type.shape()));
         assert_eq!(error.to_string(), "expected static shape but got [dynamic]");
 
         let oversized_type = ArrayType::new(DataType::U16, Shape::new(vec![Dimension::Static(usize::MAX)]));

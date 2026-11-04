@@ -34,7 +34,7 @@ use crate::experimental::lowering::{CollectiveLoweringState, EffectTokens};
 use crate::experimental::ops::{FlatXlaProgram, XlaConstant, XlaOperation, XlaProgram};
 use crate::operations::composites::NamedCompositeImplementation;
 use crate::operations::control_flow::lowered_effect_classes;
-use crate::{Error, LowerableOperation, LowerableOperationFamily, XlaDomain, XlaLowerer, XlaValue};
+use crate::{Error, LowerableOperation, LowerableOperationFamily, LoweringError, XlaDomain, XlaLowerer, XlaValue};
 
 /// Structural identity of a flat callee program attached behind a `jit_call`, used to deduplicate repeated nested
 /// programs into shared private `func.func`s at lowering time.
@@ -275,7 +275,7 @@ where
             // Calls that a backend implementation replaces, and calls without a body, need no shared function. Calls that
             // share an interned body region also share their key, boundary and backend selection, so only the first
             // call of each region computes them, and the others only count.
-            if let Some((composite_key, implementation)) = instruction.operation().named_composite() {
+            if let Some(composite_key) = instruction.operation().named_composite() {
                 let Some(&body_region) = instruction.regions().first() else {
                     continue;
                 };
@@ -288,14 +288,9 @@ where
                 };
                 let input_types = atom_types(instruction.inputs());
                 let output_types = atom_types(instruction.outputs());
-                let replaced = NamedCompositeImplementation::select(
-                    composite_key,
-                    implementation,
-                    &input_types,
-                    &output_types,
-                    target_platform,
-                )
-                .is_some();
+                let replaced =
+                    NamedCompositeImplementation::select(composite_key, &input_types, &output_types, target_platform)
+                        .is_some();
                 let key =
                     (!replaced).then(|| NamedFunctionKey { key: composite_key.clone(), input_types, output_types });
                 named_calls.index.insert(body_region, named_calls.calls.len());
@@ -578,7 +573,7 @@ pub(crate) fn lower_jit_call<'b, 'c: 'b, 't: 'c, O: LowerableOperationFamily>(
         }
     }
     if input_values.len() < capture_count {
-        return Err(Error::MissingCapturedConstant { index: capture_count.saturating_sub(1) });
+        return Err(Error::Lowering(LoweringError::MissingCapturedConstant { index: capture_count.saturating_sub(1) }));
     }
     let captured_values = input_values[..capture_count].to_vec();
     lower_nested_program_inline(
@@ -1793,11 +1788,8 @@ impl LowerableOperation for JitCallOperation<ArrayIrType> {
         _input_types: &[ArrayIrType],
         _output_types: &[ArrayIrType],
     ) -> Result<Vec<ValueRef<'b, 'c, 't>>, Error> {
-        let [callee] = lowerer.regions.as_slice() else {
-            return Err(Error::UnsupportedOperation {
-                op: format!("jit_call expected 1 attached region but got {}", lowerer.regions.len()),
-            });
-        };
+        self.validate_region_count(lowerer.regions.len())?;
+        let [callee] = lowerer.regions.as_slice() else { unreachable!("validated jit_call region count") };
         lower_jit_call(
             callee,
             self.capture_count(),

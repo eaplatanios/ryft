@@ -7,8 +7,8 @@ use ryft_core::operations::attention::{
     dot_product_attention_backward_ir_composition, dot_product_attention_ir_composition,
 };
 use ryft_core::{
-    ArrayType, CompositeAttribute, CompositeKey, DataType, Dimension, DomainTracingContext, Operation, ProgramError,
-    ProjectedValue, ReductionKind, Shape,
+    ArrayType, CompositeKey, DataType, Dimension, DomainTracingContext, Operation, ProgramError, ProjectedValue,
+    ReductionKind, Shape,
 };
 use ryft_mlir::dialects::stable_hlo;
 use ryft_mlir::dialects::stable_hlo::{CustomCallApiVersion, CustomCallMemoryLayouts};
@@ -28,7 +28,7 @@ use crate::experimental::lowering::types::{
 };
 use crate::experimental::ops::FlatXlaProgram;
 use crate::operations::reductions::lower_reduce_to_mlir;
-use crate::{Error, LowerableOperation, LowerableOperationFamily, XlaDomain, XlaLowerer};
+use crate::{Error, LowerableOperation, LowerableOperationFamily, LoweringError, XlaDomain, XlaLowerer};
 
 /// Traces the canonical portable attention composition for one validated operation boundary.
 pub(crate) fn trace_attention_composition(
@@ -86,30 +86,16 @@ pub(crate) fn attention_composition_key(
     let signature = operation.signature();
     NamedCompositionKey {
         composite: CompositeKey::new("ryft.dot_product_attention", 0)
-            .with_attribute("scale", CompositeAttribute::OptionalFloat64(configuration.scale().map(f64::to_bits)))
-            .with_attribute("causal", CompositeAttribute::Boolean(configuration.causal()))
-            .with_attribute(
-                "local_window_left",
-                CompositeAttribute::OptionalUnsigned(configuration.local_window().map(|window| window.0)),
-            )
-            .with_attribute(
-                "local_window_right",
-                CompositeAttribute::OptionalUnsigned(configuration.local_window().map(|window| window.1)),
-            )
-            .with_attribute(
-                "dropout",
-                CompositeAttribute::OptionalFloat64Unsigned(
-                    configuration.dropout().map(|(rate, seed)| (rate.to_bits(), seed)),
-                ),
-            )
-            .with_attribute("residual", CompositeAttribute::Boolean(configuration.return_residual()))
-            .with_attribute("bias", CompositeAttribute::Boolean(signature.has_bias()))
-            .with_attribute("mask", CompositeAttribute::Boolean(signature.has_mask()))
-            .with_attribute("query_lengths", CompositeAttribute::Boolean(signature.has_query_sequence_lengths()))
-            .with_attribute(
-                "key_value_lengths",
-                CompositeAttribute::Boolean(signature.has_key_value_sequence_lengths()),
-            ),
+            .with_attribute("scale", configuration.scale())
+            .with_attribute("causal", configuration.causal())
+            .with_attribute("local_window_left", configuration.local_window().map(|window| window.0))
+            .with_attribute("local_window_right", configuration.local_window().map(|window| window.1))
+            .with_attribute("dropout", configuration.dropout())
+            .with_attribute("residual", configuration.return_residual())
+            .with_attribute("bias", signature.has_bias())
+            .with_attribute("mask", signature.has_mask())
+            .with_attribute("query_lengths", signature.has_query_sequence_lengths())
+            .with_attribute("key_value_lengths", signature.has_key_value_sequence_lengths()),
         input_types: input_types.to_vec(),
         output_types: output_types.to_vec(),
     }
@@ -125,29 +111,15 @@ pub(crate) fn attention_backward_composition_key(
     let signature = operation.signature();
     NamedCompositionKey {
         composite: CompositeKey::new("ryft.dot_product_attention_backward", 0)
-            .with_attribute("scale", CompositeAttribute::OptionalFloat64(configuration.scale().map(f64::to_bits)))
-            .with_attribute("causal", CompositeAttribute::Boolean(configuration.causal()))
-            .with_attribute(
-                "local_window_left",
-                CompositeAttribute::OptionalUnsigned(configuration.local_window().map(|window| window.0)),
-            )
-            .with_attribute(
-                "local_window_right",
-                CompositeAttribute::OptionalUnsigned(configuration.local_window().map(|window| window.1)),
-            )
-            .with_attribute(
-                "dropout",
-                CompositeAttribute::OptionalFloat64Unsigned(
-                    configuration.dropout().map(|(rate, seed)| (rate.to_bits(), seed)),
-                ),
-            )
-            .with_attribute("bias", CompositeAttribute::Boolean(signature.has_bias()))
-            .with_attribute("mask", CompositeAttribute::Boolean(signature.has_mask()))
-            .with_attribute("query_lengths", CompositeAttribute::Boolean(signature.has_query_sequence_lengths()))
-            .with_attribute(
-                "key_value_lengths",
-                CompositeAttribute::Boolean(signature.has_key_value_sequence_lengths()),
-            ),
+            .with_attribute("scale", configuration.scale())
+            .with_attribute("causal", configuration.causal())
+            .with_attribute("local_window_left", configuration.local_window().map(|window| window.0))
+            .with_attribute("local_window_right", configuration.local_window().map(|window| window.1))
+            .with_attribute("dropout", configuration.dropout())
+            .with_attribute("bias", signature.has_bias())
+            .with_attribute("mask", signature.has_mask())
+            .with_attribute("query_lengths", signature.has_query_sequence_lengths())
+            .with_attribute("key_value_lengths", signature.has_key_value_sequence_lengths()),
         input_types: input_types.to_vec(),
         output_types: output_types.to_vec(),
     }
@@ -162,13 +134,14 @@ fn attention_dimensions(input_type: &ArrayType) -> Result<[Dimension; 4], Error>
         [batch, sequence, heads, head_dimension] => {
             Ok([batch.clone(), sequence.clone(), heads.clone(), head_dimension.clone()])
         }
-        _ => Err(Error::UnsupportedOperation {
-            op: format!(
+        _ => Err(Error::Lowering(LoweringError::UnsupportedOperation {
+            operation: DOT_PRODUCT_ATTENTION_OPERATION_NAME.to_string(),
+            reason: format!(
                 "{} operand must have rank 3 or 4 but got rank {}",
                 DOT_PRODUCT_ATTENTION_OPERATION_NAME,
                 input_type.rank(),
             ),
-        }),
+        })),
     }
 }
 
@@ -178,12 +151,13 @@ fn attention_physical_extent(dimension: &Dimension) -> Result<usize, Error> {
         Dimension::Static(extent) => Ok(*extent),
         Dimension::Dynamic(variable) => {
             variable.bounds().upper().and_then(|upper| upper.checked_sub(1)).ok_or_else(|| {
-                Error::UnsupportedOperation {
-                    op: format!(
+                Error::Lowering(LoweringError::UnsupportedOperation {
+                    operation: DOT_PRODUCT_ATTENTION_OPERATION_NAME.to_string(),
+                    reason: format!(
                         "{DOT_PRODUCT_ATTENTION_OPERATION_NAME} dimension {variable} needs a finite positive physical \
                          bound",
                     ),
-                }
+                })
             })
         }
     }
@@ -527,34 +501,42 @@ pub(crate) fn lower_dot_product_attention_to_mlir<'b, 'c: 'b, 't: 'c>(
     {
         if configuration.implementation() == AttentionImplementation::Fused {
             if configuration.dropout().is_some() {
-                return Err(Error::UnsupportedOperation {
-                    op: format!(
+                return Err(Error::Lowering(LoweringError::UnsupportedOperation {
+                    operation: operation.name().to_string(),
+                    reason: format!(
                         "`{DOT_PRODUCT_ATTENTION_OPERATION_NAME}` dropout is only supported by the fused CUDA lowering",
                     ),
-                });
+                }));
             }
             let FmhaEligibility::Ineligible(reason) = eligibility else { unreachable!() };
-            return Err(Error::UnsupportedOperation {
-                op: format!("the fused attention implementation is unavailable because {reason}"),
-            });
+            return Err(Error::Lowering(LoweringError::UnsupportedOperation {
+                operation: operation.name().to_string(),
+                reason: format!("the fused attention implementation is unavailable because {reason}"),
+            }));
         }
         let decomposition = collective_state
             .named_compositions
             .as_ref()
             .and_then(|functions| functions.get_attention(operation, input_types, output_types))
-            .ok_or_else(|| Error::UnsupportedOperation {
-                op: format!("missing typed decomposition for `{}`", operation.name()),
+            .ok_or_else(|| {
+                ProgramError::MalformedProgram(format!("missing typed decomposition for `{}`", operation.name()))
             })?;
         return lower_decomposition_call(decomposition, input_values, output_types, block, context, location);
     }
     let data_type = input_types[0].data_type();
     let [batch, query_sequence, heads, head_dimension] = attention_dimensions(&input_types[0])?;
     let [_, key_value_sequence, _, _] = attention_dimensions(&input_types[1])?;
-    let heads = heads.value().ok_or_else(|| Error::UnsupportedOperation {
-        op: format!("{DOT_PRODUCT_ATTENTION_OPERATION_NAME} heads dimension must be static"),
+    let heads = heads.value().ok_or_else(|| {
+        Error::Lowering(LoweringError::UnsupportedOperation {
+            operation: operation.name().to_string(),
+            reason: format!("{DOT_PRODUCT_ATTENTION_OPERATION_NAME} heads dimension must be static"),
+        })
     })?;
-    let head_dimension = head_dimension.value().ok_or_else(|| Error::UnsupportedOperation {
-        op: format!("{DOT_PRODUCT_ATTENTION_OPERATION_NAME} head dimension must be static"),
+    let head_dimension = head_dimension.value().ok_or_else(|| {
+        Error::Lowering(LoweringError::UnsupportedOperation {
+            operation: operation.name().to_string(),
+            reason: format!("{DOT_PRODUCT_ATTENTION_OPERATION_NAME} head dimension must be static"),
+        })
     })?;
     let physical_batch = attention_physical_extent(&batch)?;
     let physical_query_sequence = attention_physical_extent(&query_sequence)?;
@@ -765,38 +747,49 @@ pub(crate) fn lower_dot_product_attention_backward_to_mlir<'b, 'c: 'b, 't: 'c>(
     {
         if configuration.implementation() == AttentionImplementation::Fused {
             if configuration.dropout().is_some() {
-                return Err(Error::UnsupportedOperation {
-                    op: format!(
+                return Err(Error::Lowering(LoweringError::UnsupportedOperation {
+                    operation: operation.name().to_string(),
+                    reason: format!(
                         "`{DOT_PRODUCT_ATTENTION_BACKWARD_OPERATION_NAME}` dropout is only supported by the fused CUDA \
                          lowering",
                     ),
-                });
+                }));
             }
             let FmhaEligibility::Ineligible(reason) = eligibility else { unreachable!() };
-            return Err(Error::UnsupportedOperation {
-                op: format!("the fused attention backward implementation is unavailable because {reason}"),
-            });
+            return Err(Error::Lowering(LoweringError::UnsupportedOperation {
+                operation: operation.name().to_string(),
+                reason: format!("the fused attention backward implementation is unavailable because {reason}"),
+            }));
         }
         let decomposition = collective_state
             .named_compositions
             .as_ref()
             .and_then(|functions| functions.get_attention_backward(operation, input_types, output_types))
-            .ok_or_else(|| Error::UnsupportedOperation {
-                op: format!("missing typed decomposition for `{}`", operation.name()),
+            .ok_or_else(|| {
+                ProgramError::MalformedProgram(format!("missing typed decomposition for `{}`", operation.name()))
             })?;
         return lower_decomposition_call(decomposition, input_values, output_types, block, context, location);
     }
     let data_type = input_types[0].data_type();
     let [batch, query_sequence, heads, head_dimension] = attention_dimensions(&input_types[0])?;
     let [_, key_value_sequence, key_value_heads, _] = attention_dimensions(&input_types[1])?;
-    let heads = heads.value().ok_or_else(|| Error::UnsupportedOperation {
-        op: format!("{DOT_PRODUCT_ATTENTION_BACKWARD_OPERATION_NAME} heads dimension must be static"),
+    let heads = heads.value().ok_or_else(|| {
+        Error::Lowering(LoweringError::UnsupportedOperation {
+            operation: operation.name().to_string(),
+            reason: format!("{DOT_PRODUCT_ATTENTION_BACKWARD_OPERATION_NAME} heads dimension must be static"),
+        })
     })?;
-    let key_value_heads = key_value_heads.value().ok_or_else(|| Error::UnsupportedOperation {
-        op: format!("{DOT_PRODUCT_ATTENTION_BACKWARD_OPERATION_NAME} key/value heads dimension must be static"),
+    let key_value_heads = key_value_heads.value().ok_or_else(|| {
+        Error::Lowering(LoweringError::UnsupportedOperation {
+            operation: operation.name().to_string(),
+            reason: format!("{DOT_PRODUCT_ATTENTION_BACKWARD_OPERATION_NAME} key/value heads dimension must be static"),
+        })
     })?;
-    let head_dimension = head_dimension.value().ok_or_else(|| Error::UnsupportedOperation {
-        op: format!("{DOT_PRODUCT_ATTENTION_BACKWARD_OPERATION_NAME} head dimension must be static"),
+    let head_dimension = head_dimension.value().ok_or_else(|| {
+        Error::Lowering(LoweringError::UnsupportedOperation {
+            operation: operation.name().to_string(),
+            reason: format!("{DOT_PRODUCT_ATTENTION_BACKWARD_OPERATION_NAME} head dimension must be static"),
+        })
     })?;
     let physical_batch = attention_physical_extent(&batch)?;
     let physical_query_sequence = attention_physical_extent(&query_sequence)?;
@@ -1072,6 +1065,7 @@ mod tests {
     use pretty_assertions::assert_eq;
     use ryft_core::operations::attention::AttentionInputSignature;
     use ryft_core::{AtomId, DimensionBounds, DimensionVariable, Placeholder, Typed};
+    use ryft_mlir::Location;
 
     use crate::experimental::lowering::lower_mlir_module_for_program;
     use crate::experimental::lowering::tests::{XlaProgramBuilder, unproject_plain_program};
@@ -1118,6 +1112,79 @@ mod tests {
             .unwrap();
         let input_types = vec![operand_type.clone(), operand_type.clone(), operand_type.clone()];
         (unproject_plain_program(program), input_types, vec![operand_type])
+    }
+
+    #[test]
+    fn test_lower_dot_product_attention_to_mlir_requires_typed_decomposition() {
+        let operation =
+            attention_operation(AttentionConfiguration::new().with_implementation(AttentionImplementation::Portable));
+        let input_types = vec![attention_array_type(DataType::F32, &[1, 4, 2, 8]); 3];
+        let output_types = operation.infer_output_types(&input_types, &[]).unwrap();
+        let context = MlirContext::new();
+        let location = context.unknown_location().as_ref();
+        let arguments = input_types
+            .iter()
+            .map(|r#type| (lower_tensor_type(r#type, &context, location).unwrap(), location))
+            .collect::<Vec<_>>();
+        let block = context.block(&arguments);
+        let inputs = (0..input_types.len())
+            .map(|index| block.as_ref().argument(index).unwrap().as_ref())
+            .collect::<Vec<_>>();
+        assert!(matches!(
+            lower_dot_product_attention_to_mlir(
+                &operation,
+                &CollectiveLoweringState::new(),
+                &inputs,
+                &input_types,
+                &output_types,
+                &mut block.as_ref(),
+                &context,
+                location,
+            ),
+            Err(Error::Core(ryft_core::Error::Program(ProgramError::MalformedProgram(message))))
+                if message == "missing typed decomposition for `dot_product_attention`",
+        ));
+    }
+
+    #[test]
+    fn test_lower_dot_product_attention_backward_to_mlir_requires_typed_decomposition() {
+        let operation = attention_backward_operation(
+            AttentionConfiguration::new().with_implementation(AttentionImplementation::Portable),
+        );
+        let operand_type = attention_array_type(DataType::F32, &[1, 4, 2, 8]);
+        let input_types = vec![
+            operand_type.clone(),
+            operand_type.clone(),
+            operand_type.clone(),
+            operand_type.clone(),
+            attention_array_type(DataType::F32, &[1, 4, 2]),
+            operand_type,
+        ];
+        let output_types = operation.infer_output_types(&input_types, &[]).unwrap();
+        let context = MlirContext::new();
+        let location = context.unknown_location().as_ref();
+        let arguments = input_types
+            .iter()
+            .map(|r#type| (lower_tensor_type(r#type, &context, location).unwrap(), location))
+            .collect::<Vec<_>>();
+        let block = context.block(&arguments);
+        let inputs = (0..input_types.len())
+            .map(|index| block.as_ref().argument(index).unwrap().as_ref())
+            .collect::<Vec<_>>();
+        assert!(matches!(
+            lower_dot_product_attention_backward_to_mlir(
+                &operation,
+                &CollectiveLoweringState::new(),
+                &inputs,
+                &input_types,
+                &output_types,
+                &mut block.as_ref(),
+                &context,
+                location,
+            ),
+            Err(Error::Core(ryft_core::Error::Program(ProgramError::MalformedProgram(message))))
+                if message == "missing typed decomposition for `dot_product_attention_backward`",
+        ));
     }
 
     #[test]

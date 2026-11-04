@@ -79,8 +79,8 @@ impl LowerableOperation for DimensionSizeOperation {
         match input_type.shape().dimensions()[self.axis()] {
             Dimension::Static(extent) => {
                 let output_type = lower_tensor_type(&ArrayType::scalar(DataType::I64), context, location)?;
-                let extent = i64::try_from(extent).map_err(|_| Error::UnsupportedOperation {
-                    op: format!("dimension extent {extent} does not fit StableHLO i64"),
+                let extent = i64::try_from(extent).map_err(|_| {
+                    ryft_core::DimensionError::ExtentExceedsBackendWidth { value: extent, maximum: i64::MAX as usize }
                 })?;
                 let elements = lower_constant_elements_attribute(DataType::I64, output_type, extent, context)?;
                 let constant = block.append_operation(stable_hlo::constant(elements, location)?)?;

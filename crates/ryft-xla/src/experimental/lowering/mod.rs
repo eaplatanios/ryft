@@ -19,6 +19,7 @@ use ryft_mlir::{
     ValueRef,
 };
 
+use crate::experimental::domains::CompilationError;
 use crate::experimental::lowering::compositions::{
     NamedCompositionFunctionMap, collect_named_composition_functions, emit_named_composition_function,
 };
@@ -41,6 +42,49 @@ use crate::{Error, RaggedDotLoweringStrategy, ToMlir};
 use crate::experimental::lowering::regions::lower_plain_program_outputs;
 #[cfg(test)]
 use ryft_core::Program;
+
+/// XLA-owned failures while admitting a program, constructing its StableHLO representation, or verifying it.
+///
+/// Public lowering entry points return [`Error`], which wraps these failures in [`Error::Lowering`]. Core program
+/// errors and native MLIR errors retain their own carriers instead of being wrapped by this enum.
+#[derive(Clone, Debug, thiserror::Error)]
+pub enum LoweringError {
+    /// The caller selected an empty function symbol or one containing whitespace.
+    #[error("invalid function name `{function_name}` used during XLA lowering")]
+    InvalidFunctionName { function_name: String },
+
+    /// A captured constant has no binding in the capture namespace available to this lowering.
+    #[error("missing captured constant #{index} during XLA lowering")]
+    MissingCapturedConstant { index: usize },
+
+    /// References reached a lowering boundary that requires their discharge.
+    #[error("unresolved reference construct `{construct}` must be discharged before XLA lowering")]
+    UnresolvedReference { construct: String },
+
+    /// Mutable state reached a lowering boundary that requires its discharge.
+    #[error("unresolved state in `{construct}` must be discharged before XLA lowering")]
+    UnresolvedState { construct: String },
+
+    /// The logical reference-state metadata cannot produce a valid physical executable alias.
+    #[error("invalid XLA reference-state ABI: {message}")]
+    InvalidReferenceStateAbi { message: String },
+
+    /// A shared mesh axis was declared with different sizes by programs lowered into one module.
+    #[error("mesh axis `{axis_name}` has size {actual}, but an earlier declaration requires {expected}")]
+    ConflictingMeshAxisSize { axis_name: String, expected: usize, actual: usize },
+
+    /// A valid operation requests behavior this backend cannot lower.
+    #[error("cannot lower `{operation}`: {reason}")]
+    UnsupportedOperation { operation: String, reason: String },
+
+    /// A valid element type cannot be represented in the selected lowering context.
+    #[error("cannot lower element type `{data_type}` for {context}")]
+    UnsupportedElementType { data_type: DataType, context: String },
+
+    /// The constructed MLIR module failed verification without returning a native error value.
+    #[error("constructed MLIR module failed verification during XLA lowering")]
+    VerificationFailure,
+}
 
 /// Named StableHLO compositions shared by composite operation lowerings (e.g., scaled dot and attention).
 pub(crate) mod compositions;
@@ -289,8 +333,8 @@ impl<'b, 'c: 'b, 't: 'c, O> XlaLowerer<'b, 'c, 't, O> {
     ///
     /// # Errors
     ///
-    /// Returns [`Error::InvalidTensorType`] or [`Error::UnsupportedDataType`] when `array_type` has no
-    /// StableHLO tensor representation.
+    /// Returns [`LoweringError::UnsupportedElementType`] when an element type has no StableHLO tensor representation,
+    /// and propagates native construction failures through [`Error::Mlir`].
     pub fn lower_tensor_type(&self, array_type: &ArrayType) -> Result<ryft_mlir::TensorTypeRef<'c, 't>, Error> {
         lower_tensor_type(array_type, self.context, self.location)
     }
@@ -330,7 +374,7 @@ impl<'b, 'c: 'b, 't: 'c, O> XlaLowerer<'b, 'c, 't, O> {
     ///
     /// # Errors
     ///
-    /// Returns [`Error::UnsupportedOperation`] when the instruction being lowered has no region at `index`, and
+    /// Returns [`ProgramError::MalformedProgram`] when the instruction being lowered has no region at `index`, and
     /// propagates the errors of lowering the region.
     pub fn lower_region_inline(
         &mut self,
@@ -341,9 +385,11 @@ impl<'b, 'c: 'b, 't: 'c, O> XlaLowerer<'b, 'c, 't, O> {
         O: LowerableOperationFamily,
     {
         let Some(region) = self.regions.get(index) else {
-            return Err(Error::UnsupportedOperation {
-                op: format!("region #{index} of an instruction with {} attached regions", self.regions.len()),
-            });
+            return Err(ProgramError::MalformedProgram(format!(
+                "region #{index} requested from an instruction with {} attached regions",
+                self.regions.len()
+            ))
+            .into());
         };
         lower_nested_program_inline(
             region,
@@ -391,13 +437,12 @@ pub trait LowerableOperation: Operation {
         output_types: &[Self::Type],
     ) -> Result<Vec<ValueRef<'b, 'c, 't>>, Error>;
 
-    /// Returns the semantic identity and implementation requirement of this operation if it is a call of a named
-    /// composite (refer to [`NamedComposite`](ryft_core::NamedComposite)), and [`None`] otherwise. Module-level
+    /// Returns the semantic identity of this operation if it is a call of a named composite (refer to [`NamedComposite`](ryft_core::NamedComposite)), and [`None`] otherwise. Module-level
     /// lowering passes use it to emit one shared function per specialization of a named composite body and to
     /// skip the bodies that a backend implementation replaces. Families forward it to the variants that can hold such
     /// calls, and the calls of a family that does not are lowered without sharing their bodies.
     #[inline]
-    fn named_composite(&self) -> Option<(&ryft_core::CompositeKey, ryft_core::CompositeImplementation)> {
+    fn named_composite(&self) -> Option<&ryft_core::CompositeKey> {
         None
     }
 }
@@ -592,7 +637,7 @@ impl<V: MlirLowerableValue> LowerableOperation for ArrayOperation<V> {
             Select, Transpose, Reverse, Reshape, Broadcast, Pad, Concatenate, Gather, Scatter, Slice, UpdateSlice,
             DynamicSlice, DynamicUpdateSlice, ConvertElementType, ReducePrecision, TransferToMemory, Reshard,
             ConstrainSharding, Condition, While, Scan, StopGradient, Tag, Rematerialize, LinearCall, RngBitGenerator,
-            Print, Assert, Guard, Cast, CustomCall, Composite, CompositeTranspose,
+            Dropout, Print, Assert, Guard, Cast, CustomCall, Composite, CompositeTranspose,
         )
     }
 }
@@ -614,7 +659,7 @@ impl LowerableOperation for DimensionOperation<DimensionValue> {
 
 impl LowerableOperation for XlaOperation {
     #[inline]
-    fn named_composite(&self) -> Option<(&ryft_core::CompositeKey, ryft_core::CompositeImplementation)> {
+    fn named_composite(&self) -> Option<&ryft_core::CompositeKey> {
         match self {
             Self::Composite(operation) => operation.named_composite(),
             Self::LiftedComposite(operation) => operation.named_composite(),
@@ -986,8 +1031,8 @@ pub(crate) fn serialize_lowered_module(
 ///
 /// # Errors
 ///
-/// Returns [`Error::UnresolvedReference`] or [`Error::UnresolvedState`] for programs with undischarged
-/// references or state, [`Error::InvalidFunctionName`] for an invalid `function_name`, and other
+/// Returns [`LoweringError::UnresolvedReference`] or [`LoweringError::UnresolvedState`] for programs with undischarged
+/// references or state, [`LoweringError::InvalidFunctionName`] for an invalid `function_name`, and other
 /// [`Error`]s for operations or types that cannot be lowered.
 pub fn to_mlir_module_for_program<'o, Input, Output, ProgramInput, ProgramOutput, S, O: LowerableOperationFamily>(
     program: &XlaProgram<ProgramInput, ProgramOutput, O>,
@@ -1194,10 +1239,10 @@ where
     S: AsRef<str>,
 {
     if contains_unresolved_references(program) {
-        return Err(Error::UnresolvedReference { construct: "program".to_string() });
+        return Err(Error::Lowering(LoweringError::UnresolvedReference { construct: "program".to_string() }));
     }
     if contains_unresolved_state(program) {
-        return Err(Error::UnresolvedState { construct: "program".to_string() });
+        return Err(Error::Lowering(LoweringError::UnresolvedState { construct: "program".to_string() }));
     }
     let function_name = normalize_function_name(function_name.as_ref())?;
     let global_input_types = global_input_types.parameters().cloned().collect::<Vec<_>>();
@@ -1214,97 +1259,98 @@ where
             !effects.contains(EffectClass::OrderedIo),
         );
     if argument_shardings.len() != logical_argument_types.len() {
-        return Err(Error::InvalidShardingCount {
+        return Err(Error::Compilation(CompilationError::ShardingCountMismatch {
             kind: "argument",
             expected: logical_argument_types.len(),
             actual: argument_shardings.len(),
-        });
+        }));
     }
     if result_shardings.len() != global_output_types.len() {
-        return Err(Error::InvalidShardingCount {
+        return Err(Error::Compilation(CompilationError::ShardingCountMismatch {
             kind: "result",
             expected: global_output_types.len(),
             actual: result_shardings.len(),
-        });
+        }));
     }
     let mut aliases = HashMap::with_capacity(reference_states.len());
     let mut state_inputs = HashSet::with_capacity(reference_states.len());
     let mut aliased_outputs = HashSet::with_capacity(reference_states.len());
     for state in reference_states {
-        let logical_input_index = state
-            .source()
-            .flat_input_index(capture_types.len())
-            .map_err(|error| Error::InvalidReferenceStateAbi { message: error.to_string() })?;
+        let logical_input_index = state.source().flat_input_index(capture_types.len())?;
         if !state_inputs.insert(logical_input_index) {
-            return Err(Error::InvalidReferenceStateAbi {
+            return Err(Error::Lowering(LoweringError::InvalidReferenceStateAbi {
                 message: format!("logical state input {logical_input_index} appears more than once"),
-            });
+            }));
         }
-        let input_type =
-            logical_argument_types.get(logical_input_index).ok_or_else(|| Error::InvalidReferenceStateAbi {
+        let input_type = logical_argument_types.get(logical_input_index).ok_or_else(|| {
+            Error::Lowering(LoweringError::InvalidReferenceStateAbi {
                 message: format!("logical input index {logical_input_index} is out of range"),
-            })?;
-        let physical_input_index =
-            signature.input_mapping()[logical_input_index].ok_or_else(|| Error::InvalidReferenceStateAbi {
+            })
+        })?;
+        let physical_input_index = signature.input_mapping()[logical_input_index].ok_or_else(|| {
+            Error::Lowering(LoweringError::InvalidReferenceStateAbi {
                 message: format!("logical state input {logical_input_index} is erased from the executable boundary"),
-            })?;
+            })
+        })?;
         if let Some(logical_output_index) = state.output_index() {
-            let output_type =
-                global_output_types.get(logical_output_index).ok_or_else(|| Error::InvalidReferenceStateAbi {
+            let output_type = global_output_types.get(logical_output_index).ok_or_else(|| {
+                Error::Lowering(LoweringError::InvalidReferenceStateAbi {
                     message: format!("logical output index {logical_output_index} is out of range"),
-                })?;
-            let physical_output_index =
-                signature.output_mapping()[logical_output_index].ok_or_else(|| Error::InvalidReferenceStateAbi {
+                })
+            })?;
+            let physical_output_index = signature.output_mapping()[logical_output_index].ok_or_else(|| {
+                Error::Lowering(LoweringError::InvalidReferenceStateAbi {
                     message: format!(
                         "logical state output {logical_output_index} is erased from the executable boundary",
                     ),
-                })?;
+                })
+            })?;
             if input_type.static_shape().is_none() || output_type.static_shape().is_none() {
-                return Err(Error::InvalidReferenceStateAbi {
+                return Err(Error::Lowering(LoweringError::InvalidReferenceStateAbi {
                     message: format!(
                         "state input {logical_input_index} and output {logical_output_index} must be static because \
                          bounded-dynamic mutation alias compatibility is unsupported",
                     ),
-                });
+                }));
             }
             if input_type.memory() != Memory::Device || output_type.memory() != Memory::Device {
-                return Err(Error::InvalidReferenceStateAbi {
+                return Err(Error::Lowering(LoweringError::InvalidReferenceStateAbi {
                     message: format!(
                         "state input {logical_input_index} and output {logical_output_index} must use device \
                          memory",
                     ),
-                });
+                }));
             }
             if input_type != output_type {
-                return Err(Error::InvalidReferenceStateAbi {
+                return Err(Error::Lowering(LoweringError::InvalidReferenceStateAbi {
                     message: format!(
                         "state input {logical_input_index} type `{input_type}` is incompatible with output \
                          {logical_output_index} type `{output_type}`",
                     ),
-                });
+                }));
             }
             match (&argument_shardings[logical_input_index], &result_shardings[logical_output_index]) {
                 (Some(argument_sharding), Some(result_sharding)) if argument_sharding != result_sharding => {
-                    return Err(Error::InvalidReferenceStateAbi {
+                    return Err(Error::Lowering(LoweringError::InvalidReferenceStateAbi {
                         message: format!(
                             "state input {logical_input_index} and output {logical_output_index} must use the same \
                              sharding",
                         ),
-                    });
+                    }));
                 }
                 (Some(_), None) | (None, Some(_)) => {
-                    return Err(Error::InvalidReferenceStateAbi {
+                    return Err(Error::Lowering(LoweringError::InvalidReferenceStateAbi {
                         message:
                             "reference-state aliases require both argument and result sharding metadata or neither"
                                 .to_string(),
-                    });
+                    }));
                 }
                 _ => {}
             }
             if !aliased_outputs.insert(physical_output_index) {
-                return Err(Error::InvalidReferenceStateAbi {
+                return Err(Error::Lowering(LoweringError::InvalidReferenceStateAbi {
                     message: "reference-state aliases must be injective".to_string(),
-                });
+                }));
             }
             // Distinct logical inputs (enforced through `state_inputs` above) map to distinct physical inputs, so
             // this insertion can never displace an earlier alias.
@@ -1618,7 +1664,7 @@ where
 
     remove_unused_constants(&module)?;
     if !module.verify()? {
-        return Err(Error::MlirVerificationFailure);
+        return Err(Error::Lowering(LoweringError::VerificationFailure));
     }
     // Preserve the source effect classification explicitly. Persistent cache loads no longer have the core program
     // available, and scanning rendered StableHLO for a target name would be a brittle substitute for typed metadata.
@@ -1676,7 +1722,13 @@ impl MlirLowerableValue for XlaArrayConstant {
         context: &'c MlirContext<'t>,
     ) -> Result<DenseElementsAttributeRef<'c, 't>, Error> {
         match self {
-            Self::Captured(value) => Err(Error::MissingCapturedConstant { index: value.index() }),
+            Self::Captured(value) => Err(ProgramError::Concretization {
+                message: format!(
+                    "captured constant #{} cannot be materialized as a literal without capture bindings",
+                    value.index()
+                ),
+            }
+            .into()),
             Self::Boolean(value) => Array::scalar(*value)?.to_dense_elements_attribute(tensor_type, context),
         }
     }
@@ -1708,7 +1760,10 @@ impl MlirLowerableValue for ArrayType {
         _tensor_type: ryft_mlir::TensorTypeRef<'c, 't>,
         _context: &'c MlirContext<'t>,
     ) -> Result<DenseElementsAttributeRef<'c, 't>, Error> {
-        Err(Error::AbstractValueLiteral { array_type: self.clone() })
+        Err(ProgramError::Concretization {
+            message: format!("abstract XLA value `{self}` cannot be materialized as a StableHLO literal"),
+        }
+        .into())
     }
 }
 
@@ -1724,7 +1779,10 @@ impl MlirLowerableValue for Array {
             return types::lower_f64_scalar_elements_attribute(data_type, tensor_type, 0.0, context);
         }
         if data_type == DataType::Token {
-            return Err(Error::UnsupportedDataType { data_type });
+            return Err(Error::Lowering(LoweringError::UnsupportedElementType {
+                data_type,
+                context: "dense literal materialization".to_string(),
+            }));
         }
 
         // Layout-free arrays already store values in MLIR's logical row-major order. Explicit layouts instead require
@@ -1755,19 +1813,16 @@ impl MlirLowerableValue for Array {
         // MLIR's typed constructors own the required packing for one-bit values. Ryft deliberately keeps these values
         // byte-padded in host arrays, so decode only their low bit at this representation boundary.
         if matches!(data_type, DataType::Boolean | DataType::I1 | DataType::U1) {
-            return context
+            return Ok(context
                 .dense_bool_elements_attribute(
                     tensor_type,
                     bytes.iter().map(|value| value & 1 != 0).collect::<Vec<_>>().as_slice(),
-                )
-                .map_err(|_| Error::InvalidDenseElementsAttribute { data_type })?
+                )?
                 .cast::<DenseElementsAttributeRef>()
-                .ok_or(Error::InvalidDenseElementsAttribute { data_type });
+                .unwrap());
         }
 
-        context
-            .dense_elements_attribute_from_raw_buffer(tensor_type, bytes.as_ref())
-            .map_err(|_| Error::InvalidDenseElementsAttribute { data_type })
+        context.dense_elements_attribute_from_raw_buffer(tensor_type, bytes.as_ref()).map_err(Error::from)
     }
 }
 
@@ -1901,7 +1956,7 @@ pub(crate) fn to_mlir_module_for_plain_program_with_ragged_dot_lowering_strategy
 
     remove_unused_constants(&module)?;
     if !module.verify()? {
-        return Err(Error::MlirVerificationFailure);
+        return Err(Error::Lowering(LoweringError::VerificationFailure));
     }
 
     serialize_lowered_module(&module, &collective_state)
@@ -1999,7 +2054,11 @@ fn merge_logical_meshes(existing: &LogicalMesh, incoming: &LogicalMesh) -> Resul
     for incoming_axis in incoming.axes() {
         match existing.axis_size(incoming_axis.name()) {
             Some(existing_size) if existing_size != incoming_axis.size() => {
-                return Err(Error::IncompatibleNestedMeshes);
+                return Err(Error::Lowering(LoweringError::ConflictingMeshAxisSize {
+                    axis_name: incoming_axis.name().to_string(),
+                    expected: existing_size,
+                    actual: incoming_axis.size(),
+                }));
             }
             Some(_) => {}
             None => merged_axes.push(incoming_axis.clone()),
@@ -2107,10 +2166,11 @@ where
 /// Normalizes a user-provided MLIR symbol name.
 pub(crate) fn normalize_function_name(function_name: &str) -> Result<String, Error> {
     let function_name = function_name.trim();
+    let function_name = function_name.strip_prefix('@').unwrap_or(function_name);
     if function_name.is_empty() || function_name.chars().any(char::is_whitespace) {
-        return Err(Error::InvalidFunctionName { function_name: function_name.to_string() });
+        return Err(Error::Lowering(LoweringError::InvalidFunctionName { function_name: function_name.to_string() }));
     }
-    Ok(function_name.strip_prefix('@').unwrap_or(function_name).to_string())
+    Ok(function_name.to_string())
 }
 
 #[cfg(test)]

@@ -15,7 +15,7 @@ use ryft_mlir::{
 use crate::experimental::lowering::types::{lower_physical_storage, lower_tensor_type, lower_unplaced_constant_output};
 use crate::experimental::lowering::{EffectTokens, current_or_new_token};
 use crate::operations::assertions::lower_output_extent_validation;
-use crate::{Error, LowerableOperation, LowerableOperationFamily, MemberLowerableOperation, XlaLowerer};
+use crate::{Error, LowerableOperation, LowerableOperationFamily, LoweringError, MemberLowerableOperation, XlaLowerer};
 
 /// Returns the minor-to-major layout required by one custom-call array type.
 fn lower_custom_call_layout(r#type: &ArrayType) -> Result<Vec<usize>, Error> {
@@ -23,28 +23,31 @@ fn lower_custom_call_layout(r#type: &ArrayType) -> Result<Vec<usize>, Error> {
         return Ok((0..r#type.rank()).rev().collect());
     };
     let Layout::Tiled(layout) = layout else {
-        return Err(Error::UnsupportedOperation {
-            op: format!("{CUSTOM_CALL_OPERATION_NAME} with strided array layout `{layout}`"),
-        });
+        return Err(Error::Lowering(LoweringError::UnsupportedOperation {
+            operation: CUSTOM_CALL_OPERATION_NAME.to_string(),
+            reason: format!("{CUSTOM_CALL_OPERATION_NAME} with strided array layout `{layout}`"),
+        }));
     };
     if !layout.tiles().is_empty() {
-        return Err(Error::UnsupportedOperation {
-            op: format!("{CUSTOM_CALL_OPERATION_NAME} with tiled array layout `{layout}`"),
-        });
+        return Err(Error::Lowering(LoweringError::UnsupportedOperation {
+            operation: CUSTOM_CALL_OPERATION_NAME.to_string(),
+            reason: format!("{CUSTOM_CALL_OPERATION_NAME} with tiled array layout `{layout}`"),
+        }));
     }
     if layout.rank() != r#type.rank()
         || layout.minor_to_major().iter().any(|axis| *axis >= r#type.rank())
         || layout.minor_to_major().iter().collect::<HashSet<_>>().len() != r#type.rank()
     {
-        return Err(Error::UnsupportedOperation {
-            op: format!(
+        return Err(Error::Lowering(LoweringError::UnsupportedOperation {
+            operation: CUSTOM_CALL_OPERATION_NAME.to_string(),
+            reason: format!(
                 "{} with invalid array layout `{}` for rank-{} type `{}`",
                 CUSTOM_CALL_OPERATION_NAME,
                 layout,
                 r#type.rank(),
                 r#type,
             ),
-        });
+        }));
     }
     Ok(layout.minor_to_major().to_vec())
 }
@@ -158,7 +161,7 @@ fn lower_custom_call_attribute<'c, 't: 'c>(
 ///
 /// # Errors
 ///
-/// Returns [`Error::UnsupportedOperation`] for a dynamic dimension without a finite upper bound.
+/// Returns [`LoweringError::UnsupportedOperation`] for a dynamic dimension without a finite upper bound.
 fn custom_call_physical_type(r#type: &ArrayType, role: &str) -> Result<ArrayType, Error> {
     let dimensions = r#type
         .shape()
@@ -166,16 +169,20 @@ fn custom_call_physical_type(r#type: &ArrayType, role: &str) -> Result<ArrayType
         .iter()
         .map(|dimension| match dimension {
             Dimension::Static(extent) => Ok(Dimension::Static(*extent)),
-            Dimension::Dynamic(variable) => {
-                variable.bounds().upper().and_then(|upper| upper.checked_sub(1)).map(Dimension::Static).ok_or_else(
-                    || Error::UnsupportedOperation {
-                        op: format!(
+            Dimension::Dynamic(variable) => variable
+                .bounds()
+                .upper()
+                .and_then(|upper| upper.checked_sub(1))
+                .map(Dimension::Static)
+                .ok_or_else(|| {
+                    Error::Lowering(LoweringError::UnsupportedOperation {
+                        operation: CUSTOM_CALL_OPERATION_NAME.to_string(),
+                        reason: format!(
                             "custom-call {role} dimension `{variable}` needs a finite upper bound for physical buffer \
                          allocation",
                         ),
-                    },
-                )
-            }
+                    })
+                }),
         })
         .collect::<Result<Vec<_>, _>>()?;
     Ok(r#type.clone().with_shape(Shape::new(dimensions)))
@@ -187,16 +194,16 @@ fn custom_call_physical_type(r#type: &ArrayType, role: &str) -> Result<ArrayType
 ///
 /// # Errors
 ///
-/// Returns [`Error::UnresolvedState`] for [`EffectClass::OrderedState`], whose state must be resolved before
+/// Returns [`LoweringError::UnresolvedState`] for [`EffectClass::OrderedState`], whose state must be resolved before
 /// lowering.
 fn custom_call_token_class(operation: &CustomCallOperation) -> Result<Option<EffectClass>, Error> {
     match operation.effect_class() {
         None | Some(EffectClass::UnorderedIo) => Ok(None),
         Some(EffectClass::OrderedAssertion) => Ok(Some(EffectClass::OrderedAssertion)),
         Some(EffectClass::OrderedIo | EffectClass::DeviceOrderedIo) => Ok(Some(EffectClass::OrderedIo)),
-        Some(EffectClass::OrderedState) => Err(Error::UnresolvedState {
+        Some(EffectClass::OrderedState) => Err(Error::Lowering(LoweringError::UnresolvedState {
             construct: format!("{CUSTOM_CALL_OPERATION_NAME} {}", operation.target_name()),
-        }),
+        })),
     }
 }
 
@@ -240,8 +247,7 @@ pub(crate) fn lower_custom_call_to_mlir<'b, 'c: 'b, 't: 'c>(
     #[cfg(feature = "mosaic-gpu")]
     let memory_layouts = if operation.target_name() == ryft_xla_sys::mlir::dialects::mosaic::gpu::MOSAIC_GPU_FFI_TARGET
     {
-        let mut layouts = crate::kernels::dense_memory_layouts(input_types, output_types, "mosaic GPU")
-            .map_err(|error| Error::UnsupportedOperation { op: error.to_string() })?;
+        let mut layouts = crate::kernels::dense_memory_layouts(input_types, output_types, "mosaic GPU")?;
         if has_token {
             layouts.operands.push(Vec::new());
             layouts.results.push(Vec::new());
@@ -255,8 +261,7 @@ pub(crate) fn lower_custom_call_to_mlir<'b, 'c: 'b, 't: 'c>(
         matches!(name.as_str(), "ryft.cuda.row_major" | "ryft.rocm.row_major")
             && *value == CustomCallAttribute::Boolean(true)
     }) {
-        let mut layouts = crate::kernels::dense_memory_layouts(input_types, output_types, "kernel")
-            .map_err(|error| Error::UnsupportedOperation { op: error.to_string() })?;
+        let mut layouts = crate::kernels::dense_memory_layouts(input_types, output_types, "kernel")?;
         if has_token {
             layouts.operands.push(Vec::new());
             layouts.results.push(Vec::new());
@@ -494,9 +499,7 @@ impl MemberLowerableOperation<ArrayIrType> for CustomCallOperation {
                 location,
             )?
         };
-        let i32_scalar_type = context
-            .tensor_type(context.signless_integer_type(32), &[], None, location)
-            .map_err(|_| Error::InvalidTensorType { array_type: ArrayType::scalar(DataType::I32) })?;
+        let i32_scalar_type = context.tensor_type(context.signless_integer_type(32), &[], None, location)?;
         let mut output_extents = output_extents.iter();
         for (output_index, output_type) in self.output_types().iter().enumerate() {
             let mut refined_type = physical_output_types[output_index].clone();
@@ -539,7 +542,7 @@ mod tests {
     use pretty_assertions::assert_eq;
     use ryft_core::{
         ArrayIrType, DataType, Dimension, DimensionBounds, DimensionSizeOperation, DimensionType, DimensionValue,
-        DimensionVariable, Memory, Placeholder, Shape, TypedProgram,
+        DimensionVariable, Memory, Placeholder, Shape, TiledLayout, TypedProgram,
     };
     use ryft_mlir::{Operation as MlirOperation, Value as MlirValue};
     use ryft_pjrt::extensions::ffi::{
@@ -552,6 +555,7 @@ mod tests {
         MixedValue, XlaProgramBuilder, execute_mixed_program, test_matrix_type, unproject_plain_program,
     };
     use crate::experimental::ops::{XlaArrayConstant, XlaConstant, XlaProgramBuilder as ArrayIrXlaProgramBuilder};
+    use crate::kernels::KernelEmbeddingError;
     use crate::operations::assertions::ensure_assertion_handler_registered;
     use crate::to_mlir_module_for_program;
 
@@ -666,14 +670,14 @@ mod tests {
                 None,
                 None,
             ),
-            Err(Error::UnsupportedOperation { op })
+            Err(Error::Lowering(LoweringError::UnsupportedOperation { reason: op, .. }))
                 if op == "strided input layout `strided{12,4}`",
         ));
         let invalid_permutation_type =
             test_matrix_type(2, 3).with_layout(Some(TiledLayout::new(vec![0, 0], Vec::new()).into()));
         assert!(matches!(
             lower_custom_call_layout(&invalid_permutation_type),
-            Err(Error::UnsupportedOperation { op })
+            Err(Error::Lowering(LoweringError::UnsupportedOperation { reason: op, .. }))
                 if op == "custom_call with invalid array layout `tiled{0,0}` for rank-2 type \
                    `f32[2, 3][layout=tiled{0,0}]`",
         ));
@@ -681,7 +685,7 @@ mod tests {
             .with_layout(Some(TiledLayout::new(vec![1, 0], vec![Tile::new(vec![TileDimension::Sized(2)])]).into()));
         assert!(matches!(
             lower_custom_call_layout(&tiled_type),
-            Err(Error::UnsupportedOperation { op })
+            Err(Error::Lowering(LoweringError::UnsupportedOperation { reason: op, .. }))
                 if op == "custom_call with tiled array layout `tiled{1,0:T(2)}`",
         ));
     }
@@ -751,6 +755,49 @@ mod tests {
                 }
             "#},
         );
+    }
+
+    #[test]
+    fn test_to_mlir_module_for_program_preserves_kernel_layout_error() {
+        let input_type = test_matrix_type(2, 3);
+        let output_type = input_type.clone().with_layout(Some(TiledLayout::new(vec![0, 1], Vec::new()).into()));
+        let cases = [
+            ("ryft.test.row_major", Some("ryft.cuda.row_major"), "kernel"),
+            ("ryft.test.row_major", Some("ryft.rocm.row_major"), "kernel"),
+            #[cfg(feature = "mosaic-gpu")]
+            (ryft_xla_sys::mlir::dialects::mosaic::gpu::MOSAIC_GPU_FFI_TARGET, None, "mosaic GPU"),
+        ];
+        for (target, row_major, owner) in cases {
+            let mut builder = XlaProgramBuilder::new();
+            let input = builder.add_input(input_type.clone());
+            let mut operation = CustomCallOperation::new(target, vec![output_type.clone()]);
+            if let Some(row_major) = row_major {
+                operation = operation.with_attribute(row_major, true);
+            }
+            let output = builder.add_instruction(operation, Vec::new(), vec![input], None).unwrap()[0];
+            let program = builder
+                .build::<Vec<XlaArrayConstant>, Vec<XlaArrayConstant>>(
+                    vec![output],
+                    vec![Placeholder],
+                    vec![Placeholder],
+                )
+                .unwrap();
+            let error = to_mlir_module_for_program(
+                &unproject_plain_program(program),
+                &[],
+                &vec![input_type.clone()],
+                &vec![output_type.clone()],
+                "main",
+                None,
+                None,
+            )
+            .unwrap_err();
+            assert!(matches!(
+                error.downcast_custom::<KernelEmbeddingError>(),
+                Some(KernelEmbeddingError::Invalid { message })
+                    if message == &format!("{owner} requires untiled dense row-major array layouts"),
+            ));
+        }
     }
 
     #[test]
@@ -944,7 +991,7 @@ mod tests {
             .unwrap();
         assert!(matches!(
             to_mlir_module_for_program(&program, &[], &vec![input_type], &vec![output_type], "main", None, None),
-            Err(Error::UnsupportedOperation { op })
+            Err(Error::Lowering(LoweringError::UnsupportedOperation { reason: op, .. }))
                 if op == "custom-call input dimension `size` needs a finite upper bound for physical buffer allocation",
         ));
     }

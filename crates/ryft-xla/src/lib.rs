@@ -16,15 +16,18 @@ pub mod telemetry;
 pub mod types;
 pub mod values;
 
-pub use arrays::{ShardDescriptor, ShardIndex, ShardLayout, XlaArray, XlaArrayShard, block_until_ready, ready};
+pub use arrays::{
+    ArrayError, ShardDescriptor, ShardIndex, ShardLayout, XlaArray, XlaArrayShard, block_until_ready, ready,
+};
 pub use distributed::DistributedRuntime;
 pub use errors::Error;
 pub use experimental::domains::{
-    XlaAnalysisValue, XlaCompilationAnalysis, XlaDomain, XlaFeedbackDirectedProfile, XlaInputBoundBucketing,
-    XlaMemoryAnalysis, XlaOptimizedProgram, XlaOptions, XlaSession, XlaTarget, XlaTargetDevice,
+    CompilationError, ExecutionError, XlaAnalysisValue, XlaCompilationAnalysis, XlaDomain, XlaFeedbackDirectedProfile,
+    XlaInputBoundBucketing, XlaMemoryAnalysis, XlaOptimizedProgram, XlaOptions, XlaSession, XlaTarget, XlaTargetDevice,
 };
 pub use experimental::lowering::{
-    LowerableOperation, LowerableOperationFamily, MemberLowerableOperation, XlaLowerer, to_mlir_module_for_program,
+    LowerableOperation, LowerableOperationFamily, LoweringError, MemberLowerableOperation, XlaLowerer,
+    to_mlir_module_for_program,
 };
 pub use jit::{
     CompiledXlaFunction, ExecutableXlaFunction, JittedXlaFunction, StagedXlaFunction, StatefulCompiledXlaFunction,

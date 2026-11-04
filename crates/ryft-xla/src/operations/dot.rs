@@ -1,7 +1,7 @@
 use ryft_core::macros::check_count;
 use ryft_core::{
-    ArrayType, ComparisonDirection, DataType, DotDimensionNumbers, DotOperation, ProgramError, RaggedDotMode,
-    RaggedDotOperation, Shape,
+    ArrayType, ComparisonDirection, DataType, DotDimensionNumbers, DotOperation, ProgramError,
+    RAGGED_DOT_OPERATION_NAME, RaggedDotMode, RaggedDotOperation, Shape,
 };
 use ryft_mlir::dialects::stable_hlo::Precision;
 use ryft_mlir::dialects::{chlo, stable_hlo};
@@ -15,7 +15,7 @@ use crate::experimental::lowering::types::{
     lower_unplaced_constant_output, physical_bound_type,
 };
 use crate::operations::comparisons::lower_compare_to_mlir;
-use crate::{Error, LowerableOperation, LowerableOperationFamily, XlaLowerer};
+use crate::{Error, LowerableOperation, LowerableOperationFamily, LoweringError, XlaLowerer};
 
 /// XLA representation used when lowering ragged dots. Selection is compilation-wide through
 /// [`XlaOptions::with_ragged_dot_lowering_strategy`](crate::XlaOptions::with_ragged_dot_lowering_strategy).
@@ -71,8 +71,11 @@ fn lower_ragged_dot_group_intervals<'b, 'c: 'b, 't: 'c>(
     location: LocationRef<'c, 't>,
 ) -> Result<(ValueRef<'b, 'c, 't>, ValueRef<'b, 'c, 't>), Error> {
     let group_axis = group_sizes_type.rank() - 1;
-    let group_count = group_sizes_type.dimension(group_axis).value().ok_or_else(|| Error::UnsupportedOperation {
-        op: "`ragged_dot` with a dynamically sized group axis".to_string(),
+    let group_count = group_sizes_type.dimension(group_axis).value().ok_or_else(|| {
+        Error::Lowering(LoweringError::UnsupportedOperation {
+            operation: RAGGED_DOT_OPERATION_NAME.to_string(),
+            reason: "`ragged_dot` with a dynamically sized group axis".to_string(),
+        })
     })?;
     let group_sizes = if group_sizes_type.data_type().is_signed() {
         // Subtracting the value from itself constructs a shape-identical zero in the source integer type. That avoids
@@ -96,8 +99,11 @@ fn lower_ragged_dot_group_intervals<'b, 'c: 'b, 't: 'c>(
     };
     let wide_group_sizes =
         lower_physical_bound_value(wide_group_sizes, &wide_group_sizes_type, 0.0, block, context, location)?;
-    let physical_ragged_extent = u64::try_from(physical_ragged_extent).map_err(|_| Error::UnsupportedOperation {
-        op: "`ragged_dot` whose physical ragged extent cannot be represented as `u64`".to_string(),
+    let physical_ragged_extent = u64::try_from(physical_ragged_extent).map_err(|_| {
+        Error::Lowering(LoweringError::UnsupportedOperation {
+            operation: RAGGED_DOT_OPERATION_NAME.to_string(),
+            reason: "`ragged_dot` whose physical ragged extent cannot be represented as `u64`".to_string(),
+        })
     })?;
     if group_count == 0 {
         return Ok((wide_group_sizes, wide_group_sizes));

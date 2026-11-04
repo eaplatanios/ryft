@@ -45,7 +45,7 @@ use crate::operations::control_flow::{
     threaded_effect_token_values, validate_unthreaded_effect_tokens,
 };
 use crate::operations::jit_call::JitCallFunctionMap;
-use crate::{Error, LowerableOperation, LowerableOperationFamily, XlaLowerer};
+use crate::{Error, LowerableOperation, LowerableOperationFamily, LoweringError, XlaLowerer};
 
 /// Trip count of the loops that lower one scan.
 #[derive(Copy, Clone)]
@@ -116,14 +116,15 @@ impl<'o, 'b, 'c: 'b, 't: 'c, O: LowerableOperationFamily> ScanLoopInputs<'o, 'b,
             let length = &physical_dimensions[0];
             let physical_length = match length {
                 Dimension::Static(length) => *length,
-                Dimension::Dynamic(_) => {
-                    stable_hlo_dynamic_dimension_bound(length).ok_or_else(|| Error::UnsupportedOperation {
-                        op: format!(
+                Dimension::Dynamic(_) => stable_hlo_dynamic_dimension_bound(length).ok_or_else(|| {
+                    Error::Lowering(LoweringError::UnsupportedOperation {
+                        operation: SCAN_OPERATION_NAME.to_string(),
+                        reason: format!(
                             "`{SCAN_OPERATION_NAME}` iteration count `{length}` needs a finite upper bound \
                              to allocate its stacked outputs",
                         ),
-                    })?
-                }
+                    })
+                })?,
             };
             physical_dimensions[0] = Dimension::Static(physical_length);
             let physical_type = stack_type.clone().with_shape(Shape::new(physical_dimensions));
@@ -475,13 +476,14 @@ impl LowerableOperation for ScanOperation<ArrayIrType> {
                 if let ArrayIrType::Array(slice_type) = slice_type
                     && slice_type.shape().dimensions().iter().any(|dimension| dimension.value().is_none())
                 {
-                    return Err(Error::UnsupportedOperation {
-                        op: format!(
+                    return Err(Error::Lowering(LoweringError::UnsupportedOperation {
+                        operation: self.name().to_string(),
+                        reason: format!(
                             "`{SCAN_OPERATION_NAME}` with the dynamic slice type `{slice_type}` for stacked {role} \
                              {index}; lowering requires static slice types, so specialize the body to the scan's \
                              input types",
                         ),
-                    });
+                    }));
                 }
             }
         }
@@ -493,9 +495,10 @@ impl LowerableOperation for ScanOperation<ArrayIrType> {
             .or_else(|| stable_hlo_dynamic_dimension_bound(length))
             .map_or(self.unroll(), |maximum_length| self.unroll().min(maximum_length.max(1)));
         if unroll > i64::MAX as usize {
-            return Err(Error::UnsupportedOperation {
-                op: format!("`{SCAN_OPERATION_NAME}` unroll factor {unroll} must be at most {}", i64::MAX),
-            });
+            return Err(Error::Lowering(LoweringError::UnsupportedOperation {
+                operation: self.name().to_string(),
+                reason: format!("`{SCAN_OPERATION_NAME}` unroll factor {unroll} must be at most {}", i64::MAX),
+            }));
         }
         let array_types = |types: &[ArrayIrType]| {
             types
@@ -862,7 +865,7 @@ mod tests {
                 &input_types,
                 &output_types,
             ),
-            Err(Error::UnsupportedOperation { op })
+            Err(Error::Lowering(LoweringError::UnsupportedOperation { reason: op, .. }))
                 if op == "`scan` iteration count `length` needs a finite upper bound to allocate its stacked outputs",
         ));
     }
@@ -904,7 +907,7 @@ mod tests {
         };
         assert!(matches!(
             scan_program(2),
-            Err(Error::UnsupportedOperation { op })
+            Err(Error::Lowering(LoweringError::UnsupportedOperation { reason: op, .. }))
                 if op == "`scan` with the dynamic slice type `f64[rows]` for stacked input 0; lowering requires static \
                    slice types, so specialize the body to the scan's input types",
         ));

@@ -15,7 +15,7 @@ use crate::experimental::lowering::types::{
 use crate::operations::assertions::lower_output_extent_validation;
 use crate::operations::manipulation::memory::annotate_output_memory;
 use crate::operations::sharding::constrain_sharding::lower_sharding_constraint;
-use crate::{Error, LowerableOperation, LowerableOperationFamily, MemberLowerableOperation, XlaLowerer};
+use crate::{Error, LowerableOperation, LowerableOperationFamily, LoweringError, MemberLowerableOperation, XlaLowerer};
 
 impl LowerableOperation for IotaOperation<ArrayType> {
     fn lower<'b, 'c: 'b, 't: 'c, O: LowerableOperationFamily>(
@@ -131,17 +131,26 @@ pub(crate) fn lower_layout_constraint<'b, 'c: 'b, 't: 'c>(
         return Ok(value);
     };
     let Layout::Tiled(tiled) = layout else {
-        return Err(Error::UnsupportedOperation { op: format!("strided output layout `{layout}`") });
+        return Err(Error::Lowering(LoweringError::UnsupportedOperation {
+            operation: "lower_layout_constraint".to_string(),
+            reason: format!("strided output layout `{layout}`"),
+        }));
     };
     if !tiled.tiles().is_empty() {
-        return Err(Error::UnsupportedOperation { op: format!("tiled output layout `{layout}`") });
+        return Err(Error::Lowering(LoweringError::UnsupportedOperation {
+            operation: "lower_layout_constraint".to_string(),
+            reason: format!("tiled output layout `{layout}`"),
+        }));
     }
     let axes = tiled.minor_to_major();
     if axes.len() != r#type.rank()
         || axes.iter().any(|axis| *axis >= r#type.rank())
         || axes.iter().collect::<std::collections::HashSet<_>>().len() != r#type.rank()
     {
-        return Err(Error::UnsupportedOperation { op: format!("invalid output layout `{layout}` for type `{type}`") });
+        return Err(Error::Lowering(LoweringError::UnsupportedOperation {
+            operation: "lower_layout_constraint".to_string(),
+            reason: format!("invalid output layout `{layout}` for type `{type}`"),
+        }));
     }
     // XLA recognizes this custom call as a physical layout constraint. Apply it to the allocation's static shape:
     // runtime extents are attached afterward, so the call needs no separate dynamic result-shape arguments.
@@ -188,12 +197,19 @@ pub(crate) fn dynamic_constructor_types(
         .map(|dimension| match dimension {
             Dimension::Static(extent) => Ok(Dimension::Static(*extent)),
             Dimension::Dynamic(variable) => {
-                let bound = stable_hlo_dynamic_dimension_bound(dimension).ok_or_else(|| Error::UnsupportedOperation {
-                    op: format!(
-                        "{name} output dimension `{variable}` needs a finite upper bound for physical buffer allocation",
-                    ),
+                let bound = stable_hlo_dynamic_dimension_bound(dimension).ok_or_else(|| {
+                    Error::Lowering(LoweringError::UnsupportedOperation {
+                        operation: name.to_string(),
+                        reason: format!(
+                            "{name} output dimension `{variable}` needs a finite upper bound for physical buffer \
+                             allocation",
+                        ),
+                    })
                 })?;
-                i32::try_from(bound).map_err(|_| Error::DynamicDimensionOutOfRange { value: bound })?;
+                i32::try_from(bound).map_err(|_| ryft_core::DimensionError::ExtentExceedsBackendWidth {
+                    value: bound,
+                    maximum: i32::MAX as usize,
+                })?;
                 Ok(Dimension::Static(bound))
             }
         })
@@ -213,9 +229,7 @@ pub(crate) fn refine_dynamic_constructor_result<'b, 'c: 'b, 't: 'c>(
     location: ryft_mlir::LocationRef<'c, 't>,
 ) -> Result<Vec<ValueRef<'b, 'c, 't>>, Error> {
     result = lower_layout_constraint(result, &refined_type, block, location)?;
-    let i32_scalar_type = context
-        .tensor_type(context.signless_integer_type(32), &[], None, location)
-        .map_err(|_| Error::InvalidTensorType { array_type: ArrayType::scalar(DataType::I32) })?;
+    let i32_scalar_type = context.tensor_type(context.signless_integer_type(32), &[], None, location)?;
     // The dimension operands are compact (one per dynamic axis, in axis order), so advance the operand iterator only
     // when a dynamic axis is encountered rather than indexing by the physical axis number.
     let mut operands = input_values.iter();
@@ -968,7 +982,7 @@ mod tests {
                 .unwrap();
             assert!(matches!(
                 to_mlir_module_for_plain_program(&program, "main"),
-                Err(Error::UnsupportedOperation { op })
+                Err(Error::Lowering(LoweringError::UnsupportedOperation { reason: op, .. }))
                     if op == format!(
                            "{name} output dimension `size` needs a finite upper bound for physical buffer allocation",
                        ),
@@ -983,11 +997,15 @@ mod tests {
         let program = builder
             .build::<Vec<XlaArrayConstant>, Vec<XlaArrayConstant>>(vec![output], vec![Placeholder], vec![Placeholder])
             .unwrap();
-        assert!(matches!(
-            to_mlir_module_for_plain_program(&program, "main"),
-            Err(Error::DynamicDimensionOutOfRange { value })
-                if value == i32::MAX as usize + 1,
-        ));
+        let error = to_mlir_module_for_plain_program(&program, "main").unwrap_err();
+        let Error::Core(ryft_core::Error::Type(error)) = error else { unreachable!() };
+        assert_eq!(
+            error.downcast_custom::<ryft_core::DimensionError>(),
+            Some(&ryft_core::DimensionError::ExtentExceedsBackendWidth {
+                value: i32::MAX as usize + 1,
+                maximum: i32::MAX as usize,
+            }),
+        );
     }
 
     #[test]
@@ -1415,7 +1433,7 @@ mod tests {
         let token = Array::from_logical_bytes(ArrayType::new_static(DataType::Token, [2]), &[]).unwrap();
         assert!(matches!(
             token.to_dense_elements_attribute(tensor_type, &context),
-            Err(Error::UnsupportedDataType { data_type: DataType::Token }),
+            Err(Error::Lowering(LoweringError::UnsupportedElementType { data_type: DataType::Token, .. })),
         ));
     }
 

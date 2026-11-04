@@ -5,7 +5,7 @@ use ryft_core::{
 use ryft_mlir::ValueRef;
 
 use crate::experimental::lowering::regions::lower_nested_program_inline;
-use crate::{Error, LowerableOperation, LowerableOperationFamily, XlaLowerer};
+use crate::{Error, LowerableOperation, LowerableOperationFamily, LoweringError, XlaLowerer};
 
 impl LowerableOperation for StopGradientOperation<ArrayType> {
     fn lower<'b, 'c: 'b, 't: 'c, O: LowerableOperationFamily>(
@@ -64,13 +64,14 @@ impl LowerableOperation for RematerializeOperation<ArrayIrType> {
         _output_types: &[ArrayIrType],
     ) -> Result<Vec<ValueRef<'b, 'c, 't>>, Error> {
         let [body] = lowerer.regions.as_slice() else {
-            return Err(Error::UnsupportedOperation {
-                op: format!(
+            return Err(Error::Lowering(LoweringError::UnsupportedOperation {
+                operation: self.name().to_string(),
+                reason: format!(
                     "{} expected 1 attached region but got {}",
                     REMATERIALIZE_OPERATION_NAME,
                     lowerer.regions.len(),
                 ),
-            });
+            }));
         };
         // Rematerialized bodies are traced through fresh-root contexts and lower with an empty capture namespace; refer
         // to the `CompositeOperation` lowering for the rationale. A differentiated call recomputes values that the
@@ -106,12 +107,13 @@ impl LowerableOperation for LinearCallOperation<ArrayIrType> {
         // The forward region is nested-traced, so it shares the enclosing capture scope. The transpose region is
         // dormant under lowering.
         if lowerer.regions().len() != 2 {
-            return Err(Error::UnsupportedOperation {
-                op: format!(
+            return Err(Error::Lowering(LoweringError::UnsupportedOperation {
+                operation: self.name().to_string(),
+                reason: format!(
                     "`{LINEAR_CALL_OPERATION_NAME}` expected 2 attached regions but got {}",
                     lowerer.regions().len(),
                 ),
-            });
+            }));
         }
         lowerer.lower_region_inline(0, input_values)
     }
@@ -132,7 +134,7 @@ mod tests {
     use crate::experimental::ops::{
         XlaConstant, XlaOperation, XlaProgram, XlaProgramBuilder as ArrayIrXlaProgramBuilder,
     };
-    use crate::{Error, XlaDomain, to_mlir_module_for_program};
+    use crate::{Error, LoweringError, XlaDomain, to_mlir_module_for_program};
 
     #[test]
     fn test_rematerialize_lowering_inlines_body_effects_on_the_enclosing_token_chain() {
@@ -230,7 +232,7 @@ mod tests {
             None,
             None,
         );
-        assert!(matches!(result, Err(Error::MissingCapturedConstant { index: 0 }),));
+        assert!(matches!(result, Err(Error::Lowering(LoweringError::MissingCapturedConstant { index: 0 })),));
     }
 
     #[test]

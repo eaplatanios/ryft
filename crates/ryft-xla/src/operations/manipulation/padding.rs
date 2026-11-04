@@ -42,7 +42,9 @@ impl LowerableOperation for PadOperation<ArrayType> {
 
 /// Validates that one pad interior amount can be represented by StableHLO's signed 64-bit attribute storage.
 fn validate_pad_interior_padding(value: usize) -> Result<(), Error> {
-    i64::try_from(value).map(|_| ()).map_err(|_| Error::PadInteriorPaddingOutOfRange { value })
+    i64::try_from(value).map(|_| ()).map_err(|_| Error::SizeLimitExceeded {
+        message: format!("pad interior amount {value} exceeds StableHLO maximum {}", i64::MAX),
+    })
 }
 
 /// Lowers a pad through the shared StableHLO path used by plain, generic-array, and shard-map dispatch.
@@ -345,7 +347,8 @@ mod tests {
 
         assert!(matches!(
             validate_pad_interior_padding(usize::MAX),
-            Err(Error::PadInteriorPaddingOutOfRange { value: usize::MAX }),
+            Err(Error::SizeLimitExceeded { message })
+                if message == format!("pad interior amount {} exceeds StableHLO maximum {}", usize::MAX, i64::MAX),
         ));
     }
 

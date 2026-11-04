@@ -14,7 +14,10 @@ use ryft_pjrt::protos::{ProfileDeviceType, ProfileOptions};
 
 use crate::experimental::domains::XlaLoweredProgram;
 use crate::experimental::ops::XlaConstant;
-use crate::{Error, ExecutableXlaFunction, XlaArray, XlaDomain, XlaFeedbackDirectedProfile, XlaOptions, XlaValue};
+use crate::{
+    CompilationError, Error, ExecutableXlaFunction, XlaArray, XlaDomain, XlaFeedbackDirectedProfile, XlaOptions,
+    XlaValue,
+};
 
 const ADAPTIVE_PROFILE_CACHE_NAMESPACE: &str = "xla-adaptive-profile-v1";
 
@@ -32,14 +35,14 @@ impl AdaptiveProfileGuidedOptions {
     /// `maximum_profile_attempts` selected executions.
     pub fn new(sample_count: usize, maximum_profile_attempts: usize) -> Result<Self, Error> {
         if sample_count == 0 {
-            return Err(Error::InvalidCompilationOptions {
+            return Err(Error::Compilation(CompilationError::InvalidOptions {
                 reason: "adaptive profile sample_count must be greater than zero".to_string(),
-            });
+            }));
         }
         if maximum_profile_attempts < sample_count {
-            return Err(Error::InvalidCompilationOptions {
+            return Err(Error::Compilation(CompilationError::InvalidOptions {
                 reason: "adaptive maximum_profile_attempts must be at least sample_count".to_string(),
-            });
+            }));
         }
         Ok(Self { sample_count, maximum_profile_attempts, aggregation_percentile: 90, profile_version: 0 })
     }
@@ -47,9 +50,9 @@ impl AdaptiveProfileGuidedOptions {
     /// Sets the OpenXLA instruction-cost aggregation percentile.
     pub fn with_aggregation_percentile(mut self, percentile: u8) -> Result<Self, Error> {
         if percentile > 100 {
-            return Err(Error::InvalidCompilationOptions {
+            return Err(Error::Compilation(CompilationError::InvalidOptions {
                 reason: "adaptive aggregation percentile must be in 0..=100".to_string(),
-            });
+            }));
         }
         self.aggregation_percentile = percentile;
         Ok(self)
@@ -308,12 +311,12 @@ fn validate_adaptive_profile_guided_platform(platform_name: &str) -> Result<(), 
     if matches!(platform_name.to_ascii_lowercase().as_str(), "cuda" | "rocm") {
         Ok(())
     } else {
-        Err(Error::InvalidCompilationOptions {
+        Err(Error::Compilation(CompilationError::InvalidOptions {
             reason: format!(
                 "adaptive profile-guided recompilation requires a CUDA or ROCm PJRT platform, but found \
                  {platform_name}",
             ),
-        })
+        }))
     }
 }
 
@@ -330,14 +333,18 @@ fn adaptive_profile_sidecar_key<'c>(
     let Some(baseline_key) = domain.persistent_cache_key(&compilation_key) else {
         return Ok(None);
     };
-    let baseline_key_length = u64::try_from(baseline_key.len()).map_err(|_| Error::InvalidCompilationOptions {
-        reason: "baseline persistent key length does not fit in u64".to_string(),
+    let baseline_key_length = u64::try_from(baseline_key.len()).map_err(|_| Error::SizeLimitExceeded {
+        message: "baseline persistent key length does not fit in u64".to_string(),
     })?;
-    let sample_count = u64::try_from(options.sample_count).map_err(|_| Error::InvalidCompilationOptions {
-        reason: "adaptive sample count does not fit in u64".to_string(),
+    let sample_count = u64::try_from(options.sample_count).map_err(|_| {
+        Error::Compilation(CompilationError::InvalidOptions {
+            reason: "adaptive sample count does not fit in u64".to_string(),
+        })
     })?;
     let maximum_profile_attempts = u64::try_from(options.maximum_profile_attempts).map_err(|_| {
-        Error::InvalidCompilationOptions { reason: "adaptive maximum profile attempts does not fit in u64".to_string() }
+        Error::Compilation(CompilationError::InvalidOptions {
+            reason: "adaptive maximum profile attempts does not fit in u64".to_string(),
+        })
     })?;
     let mut key = Vec::with_capacity(baseline_key.len() + 48);
     key.extend_from_slice(b"RYFT-ADAPTIVE-PROFILE\0");
@@ -404,9 +411,9 @@ where
         options: AdaptiveProfileGuidedOptions,
     ) -> Result<Self, Error> {
         if compilation_options.feedback_directed_profile.is_some() {
-            return Err(Error::InvalidCompilationOptions {
+            return Err(Error::Compilation(CompilationError::InvalidOptions {
                 reason: "adaptive profile-guided recompilation requires an unprofiled baseline".to_string(),
-            });
+            }));
         }
         let client = domain.client();
         validate_adaptive_profile_guided_platform(client.platform_name()?.as_ref())?;

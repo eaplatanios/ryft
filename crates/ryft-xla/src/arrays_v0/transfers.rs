@@ -213,14 +213,27 @@ pub(crate) fn exact_shard_transfer_key(
     let transfer_key = source_shard_index
         .checked_mul(destination_shard_count)
         .and_then(|key| key.checked_add(destination_shard_index))
-        .ok_or(Error::CrossHostTransferKeyTooLarge { source_shard_index, destination_shard_index })?;
-    i64::try_from(transfer_key)
-        .map_err(|_| Error::CrossHostTransferKeyTooLarge { source_shard_index, destination_shard_index })
+        .ok_or_else(|| Error::SizeLimitExceeded {
+            message: format!(
+                "cross-host transfer key for source shard #{source_shard_index} and destination shard \
+                 #{destination_shard_index} exceeds the maximum allowed size of {}",
+                usize::MAX,
+            ),
+        })?;
+    i64::try_from(transfer_key).map_err(|_| Error::SizeLimitExceeded {
+        message: format!(
+            "cross-host transfer key {transfer_key} for source shard #{source_shard_index} and destination shard \
+             #{destination_shard_index} exceeds the maximum allowed size of {}",
+            i64::MAX,
+        ),
+    })
 }
 
 /// Returns the PJRT cross-host global device ID for `device_id`.
 pub(crate) fn cross_host_global_device_id(device_id: DeviceId) -> Result<GlobalDeviceId, Error> {
-    i32::try_from(device_id).map_err(|_| Error::CrossHostTransferDeviceIdTooLarge { device_id })
+    i32::try_from(device_id).map_err(|_| Error::SizeLimitExceeded {
+        message: format!("cross-host transfer device ID {device_id} exceeds the maximum allowed value of {}", i32::MAX),
+    })
 }
 
 /// Returns the PJRT cross-host shape for one destination shard.
@@ -230,10 +243,15 @@ fn cross_host_shape(plan: &CrossHostShardReceivePlan) -> Result<Vec<i64>, Error>
         .iter()
         .enumerate()
         .map(|(dimension, &size)| {
-            i64::try_from(size).map_err(|_| Error::CrossHostTransferShapeDimensionTooLarge {
-                shard_index: plan.destination_shard_index(),
-                dimension,
-                size,
+            i64::try_from(size).map_err(|_| {
+                Error::Array(ArrayError::InvalidShardDimension {
+                    shard_index: plan.destination_shard_index(),
+                    dimension,
+                    source: ryft_core::DimensionError::ExtentExceedsBackendWidth {
+                        value: size,
+                        maximum: i64::MAX as usize,
+                    },
+                })
             })
         })
         .collect()
@@ -380,10 +398,10 @@ pub(crate) fn copy_addressable_destination_shards_from_exact_source_shards<'o>(
         for send_plan in plan.cross_host_sends() {
             let source_buffer = array
                 .addressable_device_shard(send_plan.source_device_id())
-                .ok_or(Error::MissingAddressableShardForMove {
+                .ok_or(Error::Array(ArrayError::MissingShardBuffer {
                     shard_index: send_plan.source_shard_index(),
                     device_id: send_plan.source_device_id(),
-                })?
+                }))?
                 .buffer()
                 .map(|buffer| buffer.as_ref())
                 .expect("addressable shard lookups should always return a local buffer");
@@ -403,18 +421,18 @@ pub(crate) fn copy_addressable_destination_shards_from_exact_source_shards<'o>(
     for local_copy_plan in plan.local_copies() {
         let source_buffer = array
             .addressable_device_shard(local_copy_plan.source_device_id())
-            .ok_or(Error::MissingAddressableShardForMove {
+            .ok_or(Error::Array(ArrayError::MissingShardBuffer {
                 shard_index: local_copy_plan.source_shard_index(),
                 device_id: local_copy_plan.source_device_id(),
-            })?
+            }))?
             .buffer()
             .map(|buffer| buffer.as_ref())
             .expect("addressable shard lookups should always return a local buffer");
         let destination_device = addressable_device_by_id.get(&local_copy_plan.destination_device_id()).ok_or(
-            Error::NonAddressableDevice {
+            Error::Array(ArrayError::NonAddressableDevice {
                 device_id: local_copy_plan.destination_device_id(),
                 process_index: client_process_index,
-            },
+            }),
         )?;
         // Always copy via PJRT, even when source and destination are on the same device. Bitcast
         // would alias the source buffer's underlying storage, which interacts badly with later
@@ -434,9 +452,13 @@ pub(crate) fn copy_addressable_destination_shards_from_exact_source_shards<'o>(
         let receive_plans = receive_plans_by_device
             .get(&receive_device_id)
             .expect("grouped receive plans should exist for every grouped destination device");
-        let destination_device = addressable_device_by_id
-            .get(&receive_device_id)
-            .ok_or(Error::NonAddressableDevice { device_id: receive_device_id, process_index: client_process_index })?;
+        let destination_device =
+            addressable_device_by_id
+                .get(&receive_device_id)
+                .ok_or(Error::Array(ArrayError::NonAddressableDevice {
+                    device_id: receive_device_id,
+                    process_index: client_process_index,
+                }))?;
         let element_types = receive_plans.iter().map(|_| array.data_type().to_pjrt()).collect::<Vec<_>>();
         let dimensions = receive_plans
             .iter()
@@ -460,4 +482,63 @@ pub(crate) fn copy_addressable_destination_shards_from_exact_source_shards<'o>(
     }
 
     Ok(Some(addressable_buffers))
+}
+
+#[cfg(test)]
+mod tests {
+    use pretty_assertions::assert_eq;
+    use ryft_core::DimensionError;
+
+    use super::*;
+
+    #[test]
+    fn test_exact_shard_transfer_key() {
+        assert_eq!(exact_shard_transfer_key(2, 1, 3).unwrap(), 7);
+        let error = exact_shard_transfer_key(usize::MAX, 0, 2).unwrap_err();
+        assert!(matches!(&error, Error::SizeLimitExceeded { .. }));
+        assert_eq!(
+            error.to_string(),
+            format!(
+                "cross-host transfer key for source shard #{} and destination shard #0 exceeds the maximum allowed \
+                 size of {}",
+                usize::MAX,
+                usize::MAX,
+            ),
+        );
+    }
+
+    #[test]
+    fn test_cross_host_global_device_id() {
+        assert_eq!(cross_host_global_device_id(1).unwrap(), 1);
+        let device_id = i32::MAX as usize + 1;
+        let error = cross_host_global_device_id(device_id).unwrap_err();
+        assert!(matches!(&error, Error::SizeLimitExceeded { .. }));
+        assert_eq!(
+            error.to_string(),
+            format!("cross-host transfer device ID {device_id} exceeds the maximum allowed value of {}", i32::MAX),
+        );
+    }
+
+    #[cfg(target_pointer_width = "64")]
+    #[test]
+    fn test_cross_host_shape_retains_dimension_error_and_shard_context() {
+        let plan = CrossHostShardReceivePlan::new(0, 0, 2, 1, StaticShape::new(vec![usize::MAX]), 0);
+        let error = cross_host_shape(&plan).unwrap_err();
+        assert!(matches!(
+            &error,
+            Error::Array(ArrayError::InvalidShardDimension {
+                shard_index: 2,
+                dimension: 0,
+                source: DimensionError::ExtentExceedsBackendWidth { value, maximum },
+            }) if *value == usize::MAX && *maximum == i64::MAX as usize,
+        ));
+        assert_eq!(
+            error.to_string(),
+            format!(
+                "cross-host transfer for shard #2, dimension #0: dimension extent {} exceeds backend maximum {}",
+                usize::MAX,
+                i64::MAX,
+            ),
+        );
+    }
 }

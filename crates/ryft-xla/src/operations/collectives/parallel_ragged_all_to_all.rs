@@ -36,16 +36,12 @@ fn emit_parallel_ragged_all_to_all_custom_call<'b, 'c: 'b, 't: 'c>(
         )
         .into());
     }
-    let replica_group_type = context
-        .tensor_type(
-            context.signless_integer_type(64),
-            &[MlirSize::Static(replica_groups.len()), MlirSize::Static(group_size)],
-            None,
-            location,
-        )
-        .map_err(|_| Error::InvalidTensorType {
-            array_type: ArrayType::new_static(DataType::I64, [replica_groups.len(), group_size]),
-        })?;
+    let replica_group_type = context.tensor_type(
+        context.signless_integer_type(64),
+        &[MlirSize::Static(replica_groups.len()), MlirSize::Static(group_size)],
+        None,
+        location,
+    )?;
     let replica_group_values = replica_groups
         .iter()
         .flatten()
@@ -58,9 +54,7 @@ fn emit_parallel_ragged_all_to_all_custom_call<'b, 'c: 'b, 't: 'c>(
             })
         })
         .collect::<Result<Vec<_>, _>>()?;
-    let replica_groups = context
-        .dense_i64_elements_attribute(replica_group_type, replica_group_values.as_slice())
-        .map_err(|_| Error::InvalidDenseElementsAttribute { data_type: DataType::I64 })?;
+    let replica_groups = context.dense_i64_elements_attribute(replica_group_type, replica_group_values.as_slice())?;
     let channel_id = collective_state.next_channel_id();
     let channel_id = i64::try_from(channel_id).map_err(|_| {
         ProgramError::MalformedProgram(format!(
@@ -407,9 +401,7 @@ fn lower_unbatched_parallel_ragged_all_to_all<'b, 'c: 'b, 't: 'c>(
         }
         let positions_type =
             lower_tensor_type(&ArrayType::new_static(DataType::I64, [operation.axis_size()]), context, location)?;
-        let positions = context
-            .dense_i64_elements_attribute(positions_type, positions.as_slice())
-            .map_err(|_| Error::InvalidDenseElementsAttribute { data_type: DataType::I64 })?;
+        let positions = context.dense_i64_elements_attribute(positions_type, positions.as_slice())?;
         let positions = block.append_operation(stable_hlo::constant(positions, location)?)?;
         let positions = positions.result(0).expect("stablehlo.constant should return one result").as_ref();
         let position =

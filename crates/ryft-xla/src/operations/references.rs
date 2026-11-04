@@ -5,7 +5,7 @@ use ryft_core::{
 };
 use ryft_mlir::ValueRef;
 
-use crate::{Error, LowerableOperation, LowerableOperationFamily, XlaLowerer};
+use crate::{Error, LowerableOperation, LowerableOperationFamily, LoweringError, XlaLowerer};
 
 impl LowerableOperation for ReferenceNewOperation<ArrayType, ArrayIrType> {
     fn lower<'b, 'c: 'b, 't: 'c, O: LowerableOperationFamily>(
@@ -15,7 +15,7 @@ impl LowerableOperation for ReferenceNewOperation<ArrayType, ArrayIrType> {
         _input_types: &[ArrayIrType],
         _output_types: &[ArrayIrType],
     ) -> Result<Vec<ValueRef<'b, 'c, 't>>, Error> {
-        Err(Error::UnresolvedReference { construct: self.name().to_string() })
+        Err(Error::Lowering(LoweringError::UnresolvedReference { construct: self.name().to_string() }))
     }
 }
 
@@ -27,7 +27,7 @@ impl LowerableOperation for ReferenceReadOperation<ArrayType, ArrayIrType, Array
         _input_types: &[ArrayIrType],
         _output_types: &[ArrayIrType],
     ) -> Result<Vec<ValueRef<'b, 'c, 't>>, Error> {
-        Err(Error::UnresolvedReference { construct: self.name().to_string() })
+        Err(Error::Lowering(LoweringError::UnresolvedReference { construct: self.name().to_string() }))
     }
 }
 
@@ -39,7 +39,7 @@ impl LowerableOperation for ReferenceWriteOperation<ArrayType, ArrayIrType, Arra
         _input_types: &[ArrayIrType],
         _output_types: &[ArrayIrType],
     ) -> Result<Vec<ValueRef<'b, 'c, 't>>, Error> {
-        Err(Error::UnresolvedReference { construct: self.name().to_string() })
+        Err(Error::Lowering(LoweringError::UnresolvedReference { construct: self.name().to_string() }))
     }
 }
 
@@ -51,7 +51,7 @@ impl LowerableOperation for ReferenceSwapOperation<ArrayType, ArrayIrType, Array
         _input_types: &[ArrayIrType],
         _output_types: &[ArrayIrType],
     ) -> Result<Vec<ValueRef<'b, 'c, 't>>, Error> {
-        Err(Error::UnresolvedReference { construct: self.name().to_string() })
+        Err(Error::Lowering(LoweringError::UnresolvedReference { construct: self.name().to_string() }))
     }
 }
 
@@ -63,7 +63,7 @@ impl LowerableOperation for ReferenceAddUpdateOperation<ArrayType, ArrayIrType, 
         _input_types: &[ArrayIrType],
         _output_types: &[ArrayIrType],
     ) -> Result<Vec<ValueRef<'b, 'c, 't>>, Error> {
-        Err(Error::UnresolvedReference { construct: self.name().to_string() })
+        Err(Error::Lowering(LoweringError::UnresolvedReference { construct: self.name().to_string() }))
     }
 }
 
@@ -75,7 +75,7 @@ impl LowerableOperation for ReferenceAtomicAddUpdateOperation<ArrayType, ArrayIr
         _input_types: &[ArrayIrType],
         _output_types: &[ArrayIrType],
     ) -> Result<Vec<ValueRef<'b, 'c, 't>>, Error> {
-        Err(Error::UnresolvedReference { construct: self.name().to_string() })
+        Err(Error::Lowering(LoweringError::UnresolvedReference { construct: self.name().to_string() }))
     }
 }
 
@@ -87,6 +87,6 @@ impl LowerableOperation for ReferenceFreezeOperation<ArrayType, ArrayIrType> {
         _input_types: &[ArrayIrType],
         _output_types: &[ArrayIrType],
     ) -> Result<Vec<ValueRef<'b, 'c, 't>>, Error> {
-        Err(Error::UnresolvedReference { construct: self.name().to_string() })
+        Err(Error::Lowering(LoweringError::UnresolvedReference { construct: self.name().to_string() }))
     }
 }

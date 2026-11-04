@@ -13,7 +13,7 @@ use ryft_core::{
     CustomCallOperation, DataType, DimensionAddOperation, DimensionDivOperation, DimensionFromScalarOperation,
     DimensionMaxOperation, DimensionMinOperation, DimensionMulOperation, DimensionOperation, DimensionPowOperation,
     DimensionRemOperation, DimensionSizeOperation, DimensionSubOperation, DimensionToScalarOperation, DimensionType,
-    DimensionValue, DivOperation, DotOperation, DynamicBroadcastOperation, DynamicReshapeOperation,
+    DimensionValue, DivOperation, DotOperation, DropoutOperation, DynamicBroadcastOperation, DynamicReshapeOperation,
     DynamicSliceOperation, DynamicUpdateSliceOperation, EagerContext, ErfOperation, ExpM1Operation, ExpOperation,
     FloorOperation, GatherOperation, GuardOperation, ImaginaryOperation, IotaOperation, LiftedCustomRules,
     LinearCallOperation, LiteralIdentity, Ln1pOperation, LogAddExpOperation, LogOperation, LogisticOperation,
@@ -890,6 +890,7 @@ impl_array_operation_conversion!(
     ConstrainShardingOperation,
     StopGradientOperation<ArrayType>,
     TagOperation<ArrayType>,
+    DropoutOperation,
     PrintOperation<ArrayType>,
 );
 

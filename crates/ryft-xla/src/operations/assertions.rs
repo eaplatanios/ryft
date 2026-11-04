@@ -24,7 +24,7 @@ use crate::experimental::lowering::types::{
 use crate::experimental::lowering::{EffectTokens, current_or_new_token};
 use crate::operations::comparisons::lower_compare_to_mlir;
 use crate::operations::manipulation::conversions::lower_cast_shape;
-use crate::{Error, LowerableOperation, LowerableOperationFamily, XlaLowerer};
+use crate::{Error, LowerableOperation, LowerableOperationFamily, LoweringError, XlaLowerer};
 
 #[cfg(any(feature = "cuda-12", feature = "cuda-13"))]
 use ryft_pjrt::extensions::ffi::FfiStream;
@@ -1357,11 +1357,12 @@ pub(crate) fn lower_type_relationship_checks<'b, 'c: 'b, 't: 'c>(
                 }
             }
             (declared, actual) => {
-                return Err(Error::UnsupportedOperation {
-                    op: format!(
+                return Err(Error::Lowering(LoweringError::UnsupportedOperation {
+                    operation: actor.to_string(),
+                    reason: format!(
                         "`{actor}` cannot check actual type `{actual}` against declared type `{declared}` {site}"
                     ),
-                });
+                }));
             }
         }
     }

@@ -47,14 +47,14 @@ impl<'o> ExecuteArguments<'o> {
         donation_flags: &[bool],
     ) -> Result<Self, Error> {
         if donation_flags.len() != arrays.len() {
-            return Err(Error::DonationFlagCountMismatch {
+            return Err(Error::Execution(ExecutionError::DonationFlagCountMismatch {
                 expected_count: arrays.len(),
                 actual_count: donation_flags.len(),
-            });
+            }));
         }
         for (position, &device_id) in addressable_device_ids.iter().enumerate() {
             if addressable_device_ids[..position].contains(&device_id) {
-                return Err(Error::DuplicateExecutionDeviceId { device_id });
+                return Err(ryft_core::ShardingError::DuplicateDeviceId { id: device_id }.into());
             }
         }
 
@@ -69,7 +69,7 @@ impl<'o> ExecuteArguments<'o> {
                 let buffer = array
                     .device_shard(device_id)
                     .and_then(XlaArrayShard::buffer)
-                    .ok_or(Error::MissingArrayShardForDevice { array_index, device_id })?;
+                    .ok_or(Error::Execution(ExecutionError::MissingArrayShardForDevice { array_index, device_id }))?;
                 device_inputs.push(ExecutionInput { buffer: Arc::clone(buffer), donatable });
             }
             if array.shards().iter().filter(|shard| shard.buffer().is_some()).count() != addressable_device_ids.len() {
@@ -80,7 +80,7 @@ impl<'o> ExecuteArguments<'o> {
                     .map(|shard| shard.device().id())
                     .find(|device_id| !addressable_device_ids.contains(device_id))
                     .unwrap();
-                return Err(Error::UnexpectedArrayShardDevice { array_index, device_id });
+                return Err(Error::Execution(ExecutionError::UnexpectedArrayShardDevice { array_index, device_id }));
             }
         }
 
@@ -98,5 +98,28 @@ impl std::fmt::Debug for ExecuteArguments<'_> {
             .field("addressable_device_ids", &self.addressable_device_ids)
             .field("input_counts_per_device", &input_counts)
             .finish()
+    }
+}
+
+#[cfg(test)]
+mod tests {
+    use ryft_core::{Error as CoreError, ShardingError};
+
+    use super::*;
+
+    #[test]
+    fn test_execute_arguments_from_arrays_with_donation_rejects_flag_count() {
+        assert!(matches!(
+            ExecuteArguments::from_arrays_with_donation(Vec::new(), Arc::from([]), &[true]),
+            Err(Error::Execution(ExecutionError::DonationFlagCountMismatch { expected_count: 0, actual_count: 1 })),
+        ));
+    }
+
+    #[test]
+    fn test_execute_arguments_from_arrays_with_donation_reuses_duplicate_device_error() {
+        assert!(matches!(
+            ExecuteArguments::from_arrays_with_donation(Vec::new(), Arc::from([7, 7]), &[]),
+            Err(Error::Core(CoreError::Sharding(ShardingError::DuplicateDeviceId { id: 7 }))),
+        ));
     }
 }

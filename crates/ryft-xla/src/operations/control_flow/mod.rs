@@ -1,5 +1,6 @@
 use std::rc::Rc;
 
+use ryft_core::macros::check_count;
 use ryft_core::{
     ArrayIrType, ArrayType, CONDITION_OPERATION_NAME, ConditionOperation, CustomCallOperation, DataType, Dimension,
     EffectClass, EffectClasses, GuardOperation, IotaOperation, MeshAxisType, OneOperation, Parameterized, ProgramError,
@@ -14,8 +15,8 @@ use ryft_mlir::{
 
 use crate::experimental::lowering::regions::lower_nested_program_inline;
 use crate::experimental::lowering::types::{
-    lower_physical_storage, lower_tensor_type, lower_unplaced_constant_output, physical_bound_type,
-    reshape_dimension_i64,
+    dimension_extent_i64, lower_physical_storage, lower_tensor_type, lower_unplaced_constant_output,
+    physical_bound_type,
 };
 use crate::experimental::lowering::{
     CollectiveLoweringState, EffectTokens, current_or_new_token, token_threaded_effects,
@@ -202,7 +203,7 @@ pub(crate) fn lower_refined_region_input<'b, 'c: 'b, 't: 'c>(
             (Dimension::Dynamic(_), Dimension::Static(extent)) => Some(
                 lower_unplaced_constant_output(
                     &[ArrayType::scalar(DataType::I32)],
-                    reshape_dimension_i64(*extent)?,
+                    dimension_extent_i64(*extent)?,
                     block,
                     context,
                     location,
@@ -226,7 +227,7 @@ pub(crate) fn lower_refined_region_input<'b, 'c: 'b, 't: 'c>(
     for axis in 0..rank {
         let bound = physical_type.shape().dimensions()[axis].value().unwrap();
         let extent = physical_input_type.shape().dimensions()[axis].value().unwrap();
-        high_padding[axis] = reshape_dimension_i64(bound)? - reshape_dimension_i64(extent)?;
+        high_padding[axis] = dimension_extent_i64(bound)? - dimension_extent_i64(extent)?;
     }
     let padding_value =
         lower_unplaced_constant_output(&[ArrayType::scalar(declared_type.data_type())], 0, block, context, location)?
@@ -272,16 +273,8 @@ pub(crate) fn lower_refined_region_outputs<'b, 'c: 'b, 't: 'c>(
     context: &'c MlirContext<'t>,
     location: LocationRef<'c, 't>,
 ) -> Result<Vec<ValueRef<'b, 'c, 't>>, Error> {
-    if values.len() != region_output_types.len() || values.len() != output_types.len() {
-        return Err(Error::UnsupportedOperation {
-            op: format!(
-                "control-flow lowering produced {} results for {} region output types and {} output types",
-                values.len(),
-                region_output_types.len(),
-                output_types.len(),
-            ),
-        });
-    }
+    check_count!("output", values, region_output_types.len(), ProgramError);
+    check_count!("output", region_output_types, output_types.len(), ProgramError);
     let mut converted = Vec::with_capacity(values.len());
     for ((value, region_output_type), output_type) in values.into_iter().zip(region_output_types).zip(output_types) {
         let (ArrayIrType::Array(declared_type), ArrayIrType::Array(output_type)) = (region_output_type, output_type)
@@ -621,6 +614,36 @@ mod tests {
                     .collect()
             })
             .collect()
+    }
+
+    #[test]
+    fn test_lower_refined_region_outputs_validates_counts() {
+        let context = MlirContext::new();
+        let location = context.unknown_location().as_ref();
+        let block = context.block_with_no_arguments();
+        let output_type = ArrayType::scalar(DataType::F32).into();
+        assert!(matches!(
+            lower_refined_region_outputs(
+                Vec::new(),
+                std::slice::from_ref(&output_type),
+                std::slice::from_ref(&output_type),
+                &mut block.as_ref(),
+                &context,
+                location,
+            ),
+            Err(Error::Core(ryft_core::Error::Program(ProgramError::InvalidOutputCount { expected: 1, actual: 0 }))),
+        ));
+        assert!(matches!(
+            lower_refined_region_outputs(
+                Vec::new(),
+                &[],
+                std::slice::from_ref(&output_type),
+                &mut block.as_ref(),
+                &context,
+                location,
+            ),
+            Err(Error::Core(ryft_core::Error::Program(ProgramError::InvalidOutputCount { expected: 1, actual: 0 }))),
+        ));
     }
 
     #[test]

@@ -13,6 +13,7 @@ use ryft_mlir::{Attribute, Operation as MlirOperation, Region, Size as MlirSize}
 use ryft_pjrt::{BufferType, ExecutionDeviceInputs, ExecutionInput, Program as PjrtProgram};
 
 use crate::experimental::domains::XlaDomain;
+use crate::experimental::lowering::LoweringError;
 use crate::experimental::lowering::types::lower_array_ir_type;
 use crate::experimental::ops::{FlatXlaProgram, XlaProgramBuilder as ArrayIrXlaProgramBuilder};
 use crate::experimental::tracing::{TracedXlaProgram, XlaArrayTracer, trace_with_context};
@@ -321,7 +322,8 @@ fn test_collect_nested_sharding_mesh() {
     let incompatible = LogicalMesh::new(vec![MeshAxis::new("x", 3, MeshAxisType::Explicit).unwrap()]).unwrap();
     assert!(matches!(
         collect_nested_sharding_mesh(&program, Some(incompatible.clone())),
-        Err(Error::IncompatibleNestedMeshes)
+        Err(Error::Lowering(LoweringError::ConflictingMeshAxisSize { axis_name, expected: 3, actual: 2 }))
+            if axis_name == "x",
     ));
     assert!(matches!(
         to_mlir_module_for_program(
@@ -333,7 +335,8 @@ fn test_collect_nested_sharding_mesh() {
             Some(&[Sharding::replicated(incompatible, 1)]),
             None,
         ),
-        Err(Error::IncompatibleNestedMeshes)
+        Err(Error::Lowering(LoweringError::ConflictingMeshAxisSize { axis_name, expected: 3, actual: 2 }))
+            if axis_name == "x",
     ));
 
     // Cast placement can be the module's only mesh use, including when its result is internal.
@@ -386,7 +389,8 @@ fn test_array_ir_lowering_rejects_unresolved_reference_type() {
     let reference_type = ArrayIrType::Reference(ReferenceType::new(ArrayType::scalar(DataType::F32)));
     assert!(matches!(
         lower_array_ir_type(&reference_type, &context, location),
-        Err(Error::UnresolvedReference { construct }) if construct == reference_type.to_string(),
+        Err(Error::Lowering(LoweringError::UnresolvedReference { construct }))
+            if construct == reference_type.to_string(),
     ));
 }
 
@@ -471,7 +475,7 @@ fn test_xla_lowering_rejects_unresolved_reference_state_before_token_threading()
             None,
             None,
         ),
-        Err(Error::UnresolvedReference { construct }) if construct == "program",
+        Err(Error::Lowering(LoweringError::UnresolvedReference { construct })) if construct == "program",
     ));
 }
 
@@ -551,7 +555,7 @@ fn test_reference_state_aliases_use_physical_indices_and_preserve_shardings() {
             std::slice::from_ref(&invalid_state),
             RaggedDotLoweringStrategy::default(),
         ),
-        Err(Error::InvalidReferenceStateAbi { message })
+        Err(Error::Lowering(LoweringError::InvalidReferenceStateAbi { message }))
             if message == "logical state input 0 is erased from the executable boundary",
     ));
 
@@ -573,7 +577,7 @@ fn test_reference_state_aliases_use_physical_indices_and_preserve_shardings() {
                 &states,
                 RaggedDotLoweringStrategy::default(),
             ),
-            Err(Error::InvalidReferenceStateAbi { message })
+            Err(Error::Lowering(LoweringError::InvalidReferenceStateAbi { message }))
                 if message == asymmetric_sharding_message,
         ));
     }
@@ -592,7 +596,7 @@ fn test_reference_state_aliases_use_physical_indices_and_preserve_shardings() {
             &states,
             RaggedDotLoweringStrategy::default(),
         ),
-        Err(Error::InvalidReferenceStateAbi { message })
+        Err(Error::Lowering(LoweringError::InvalidReferenceStateAbi { message }))
             if message == "state input 1 and output 0 must use the same sharding",
     ));
 }
@@ -623,7 +627,7 @@ fn test_bounded_dynamic_reference_state_alias_is_rejected_before_lowering() {
             std::slice::from_ref(&reference_state),
             RaggedDotLoweringStrategy::default(),
         ),
-        Err(Error::InvalidReferenceStateAbi { message })
+        Err(Error::Lowering(LoweringError::InvalidReferenceStateAbi { message }))
             if message == "state input 0 and output 0 must be static because bounded-dynamic mutation alias \
                            compatibility is unsupported",
     ));
@@ -1317,6 +1321,38 @@ fn test_xla_lowering_rejects_preserved_reference_entries() {
             None,
             None,
         ),
-        Err(Error::UnresolvedReference { construct }) if construct == "program",
+        Err(Error::Lowering(LoweringError::UnresolvedReference { construct })) if construct == "program",
+    ));
+}
+
+#[test]
+fn test_mlir_lowerable_value_to_dense_elements_attribute_rejects_symbolic_values() {
+    let context = MlirContext::new();
+    let array_type = ArrayType::scalar(DataType::F32);
+    let tensor_type = lower_tensor_type(&array_type, &context, context.unknown_location()).unwrap();
+    assert!(matches!(
+        array_type.to_dense_elements_attribute(tensor_type, &context),
+        Err(Error::Core(ryft_core::Error::Program(ProgramError::Concretization { message })))
+            if message == "abstract XLA value `f32[]` cannot be materialized as a StableHLO literal",
+    ));
+    let captured = XlaArrayConstant::Captured(CaptureReference::new(3, array_type));
+    assert!(matches!(
+        captured.to_dense_elements_attribute(tensor_type, &context),
+        Err(Error::Core(ryft_core::Error::Program(ProgramError::Concretization { message })))
+            if message == "captured constant #3 cannot be materialized as a literal without capture bindings",
+    ));
+}
+
+#[test]
+fn test_normalize_function_name() {
+    assert_eq!(normalize_function_name(" main ").unwrap(), "main");
+    assert_eq!(normalize_function_name(" @main ").unwrap(), "main");
+    assert!(matches!(
+        normalize_function_name(" @ "),
+        Err(Error::Lowering(LoweringError::InvalidFunctionName { function_name })) if function_name.is_empty(),
+    ));
+    assert!(matches!(
+        normalize_function_name("main function"),
+        Err(Error::Lowering(LoweringError::InvalidFunctionName { function_name })) if function_name == "main function",
     ));
 }

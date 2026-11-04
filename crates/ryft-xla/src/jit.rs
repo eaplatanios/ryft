@@ -97,7 +97,8 @@ use ryft_pjrt::Execution;
 use crate::experimental::domains::{XlaCompiledProgram, with_input_shardings};
 use crate::experimental::ops::{XlaConstant, XlaOperation};
 use crate::{
-    AdaptiveProfileGuidedOptions, AdaptiveProfileGuidedXlaFunction, Error, XlaArray, XlaDomain, XlaOptions, XlaValue,
+    AdaptiveProfileGuidedOptions, AdaptiveProfileGuidedXlaFunction, Error, ExecutionError, XlaArray, XlaDomain,
+    XlaOptions, XlaValue,
 };
 
 /// Array IR tracer retained by the experimental stateful XLA program.
@@ -878,9 +879,7 @@ impl<'c> XlaDomain<'c> {
             Parameterized<XlaArray<'c>, Family = Out::Family, ParameterStructure = Out::ParameterStructure>,
     {
         if executable.function.compiled_program().requires_stateful_call() {
-            return Err(Error::UnsupportedReferenceAbi {
-                reason: "external reference state requires `execute_statefully`".to_string(),
-            });
+            return Err(ExecutionError::StatefulInvocationRequired.into());
         }
         let flat_inputs = lift_arrays::<In>(inputs)?.into_parameters().collect::<Vec<_>>();
         executable.function.validate_input_count(flat_inputs.len())?;
@@ -1781,8 +1780,8 @@ mod tests {
     use crate::operations::jit_call::JitCallOperation;
     use crate::tests::{execution_client, values_from_bytes, values_to_bytes};
     use crate::{
-        AdaptiveProfileGuidedOptions, Error, FromPjrt, XlaArray, XlaDomain, XlaOptions, XlaReference, XlaSession,
-        XlaValue,
+        AdaptiveProfileGuidedOptions, ArrayError, CompilationError, Error, ExecutionError, FromPjrt, XlaArray,
+        XlaDomain, XlaOptions, XlaReference, XlaSession, XlaValue,
     };
 
     /// Deterministic completion gate used by stateful asynchronous integration tests.
@@ -2671,12 +2670,14 @@ mod tests {
             XlaArray::from_host_buffer(&domain, array_type.clone(), mesh.clone(), 2.0f32.to_ne_bytes().as_slice())
                 .unwrap();
         assert!(matches!(
-            compiled.executable_function().execute(&domain, (
+            compiled.executable_function().execute(
+                &domain,
+                (
                     XlaValue::Reference(XlaReference::new(reference.clone(), domain.clone())),
                     XlaValue::Array(rejected_update),
-                )),
-            Err(Error::UnsupportedReferenceAbi { reason })
-                if reason == "external reference state requires `execute_statefully`",
+                )
+            ),
+            Err(Error::Execution(ExecutionError::StatefulInvocationRequired)),
         ));
         assert_eq!(read_f32_array(&client, &reference.read().unwrap()), vec![1.0]);
 
@@ -3042,7 +3043,7 @@ mod tests {
         .unwrap();
         assert!(matches!(
             error,
-            Error::UnsupportedReferenceAbi { reason }
+            Error::Compilation(CompilationError::UnsupportedReferenceAbi { reason })
                 if reason == "output 0 is a reference allocated inside the program and cannot be returned through the \
                               stateful XLA ABI, which has no protocol to turn a backend array into a host reference",
         ));
@@ -3059,7 +3060,7 @@ mod tests {
         .unwrap();
         assert!(matches!(
             error,
-            Error::UnsupportedReferenceAbi { reason }
+            Error::Compilation(CompilationError::UnsupportedReferenceAbi { reason })
                 if reason == "output 0 forwards the external reference bound at input 0, and the stateful XLA ABI \
                               does not return forwarded references; read the reference after the call instead",
         ));
@@ -3097,7 +3098,7 @@ mod tests {
         let error = staged.lower(&domain).err().unwrap();
         assert!(matches!(
             error,
-            Error::UnsupportedReferenceAbi { reason }
+            Error::Compilation(CompilationError::UnsupportedReferenceAbi { reason })
                 if reason == "output 0 is a reference allocated inside the program and cannot be returned through the \
                               stateful XLA ABI, which has no protocol to turn a backend array into a host reference",
         ));
@@ -3375,8 +3376,7 @@ mod tests {
         let input = XlaArray::from_host_buffer(&domain, array_type, mesh, 7.0f32.to_ne_bytes().as_slice()).unwrap();
         assert!(matches!(
             domain.interpret_async(&executable, input),
-            Err(Error::UnsupportedReferenceAbi { reason })
-                if reason == "external reference state requires `execute_statefully`",
+            Err(Error::Execution(ExecutionError::StatefulInvocationRequired)),
         ));
     }
 
@@ -3529,8 +3529,8 @@ mod tests {
         for execution in [first, second] {
             assert!(matches!(
                 execution.r#await(),
-                Err(Error::AsynchronousReferenceExecution { reason })
-                    if reason == "injected predecessor failure",
+                Err(Error::Execution(ExecutionError::AsynchronousFailure { reason }))
+                    if reason.as_ref() == "injected predecessor failure",
             ));
         }
         let error = reference.read().unwrap_err();
@@ -3604,7 +3604,7 @@ mod tests {
             .unwrap();
         assert!(matches!(
             compiled.call_statefully(&domain, XlaValue::Reference(XlaReference::new(view, domain.clone()))),
-            Err(Error::UnsupportedReferenceAbi { reason })
+            Err(Error::Core(ryft_core::Error::Program(ProgramError::InvalidArgument { message: reason })))
                 if reason
                     == "external state input 0 must be a root reference handle that uses its allocation's stored \
                         type identities",
@@ -3675,7 +3675,7 @@ mod tests {
                 &domain,
                 (XlaValue::Reference(XlaReference::new(reference.clone(), domain.clone())), XlaValue::Array(update)),
             ),
-            Err(Error::UnsupportedReferenceAbi { reason })
+            Err(Error::Core(ryft_core::Error::Program(ProgramError::InvalidArgument { message: reason })))
                 if reason == format!(
                     "external state input 0 reference type `{alternate_type}` does not refine effective compiled state \
                      type `{replicated_type}`",
@@ -3762,7 +3762,7 @@ mod tests {
                     XlaValue::Array(update),
                 ),
             ),
-            Err(Error::UnsupportedReferenceAbi { reason })
+            Err(Error::Core(ryft_core::Error::Program(ProgramError::InvalidArgument { message: reason })))
                 if reason == "external state input 0 reference mesh does not match the compiled device mesh",
         ));
         assert_eq!(read_sharded_f32_array(&reversed_reference.read().unwrap()), vec![1.0, 2.0, 3.0, 4.0],);
@@ -4182,7 +4182,7 @@ mod tests {
         );
         assert!(matches!(
             mutation,
-            Err(Error::UnsupportedReferenceAbi { reason })
+            Err(Error::Compilation(CompilationError::UnsupportedReferenceAbi { reason }))
                 if reason == "mutated bounded-dynamic external state input 0 is unsupported because backend alias \
                               compatibility has not been verified",
         ));
@@ -4575,8 +4575,8 @@ mod tests {
                     XlaValue::Array(update),
                 ),
             ),
-            Err(Error::InvalidCompilationOptions { reason })
-                if reason == "injected failure before execution submission",
+            Err(Error::Pjrt(ryft_pjrt::Error::Internal { message, .. }))
+                if message == "injected failure before execution submission",
         ));
         assert_eq!(read_f32_array(&client, &pre_submission_first.read().unwrap()), vec![1.0]);
         assert_eq!(read_f32_array(&client, &pre_submission_second.read().unwrap()), vec![10.0]);
@@ -4601,15 +4601,15 @@ mod tests {
                     XlaValue::Array(update),
                 ),
             ),
-            Err(Error::InvalidCompilationOptions { reason })
-                if reason == "injected failure after execution handoff",
+            Err(Error::Pjrt(ryft_pjrt::Error::Internal { message, .. }))
+                if message == "injected failure after execution handoff",
         ));
         for reference in [&post_handoff_first, &post_handoff_second] {
             let Err(error) = reference.read() else { panic!("mutated holder must be poisoned after handoff") };
             assert_eq!(
                 error.downcast_custom::<ReferenceError>(),
                 Some(&ReferenceError::ExecutionPoisoned {
-                    reason: "invalid compilation options: injected failure after execution handoff".to_string(),
+                    reason: "injected failure after execution handoff".to_string(),
                 }),
             );
         }
@@ -4635,16 +4635,15 @@ mod tests {
                     XlaValue::Array(update),
                 ),
             ),
-            Err(Error::InvalidCompilationOptions { reason })
-                if reason == "injected failure before hidden state replacement commit",
+            Err(Error::Pjrt(ryft_pjrt::Error::Internal { message, .. }))
+                if message == "injected failure before hidden state replacement commit",
         ));
         for reference in [&pre_commit_first, &pre_commit_second] {
             let Err(error) = reference.read() else { panic!("mutated reference must be poisoned before commit") };
             assert_eq!(
                 error.downcast_custom::<ReferenceError>(),
                 Some(&ReferenceError::ExecutionPoisoned {
-                    reason: "invalid compilation options: injected failure before hidden state replacement commit"
-                        .to_string(),
+                    reason: "injected failure before hidden state replacement commit".to_string(),
                 }),
             );
         }
@@ -4666,8 +4665,8 @@ mod tests {
                     XlaValue::Array(update),
                 ),
             ),
-            Err(Error::InvalidCompilationOptions { reason })
-                if reason == "injected failure before public output reconstruction",
+            Err(Error::Pjrt(ryft_pjrt::Error::Internal { message, .. }))
+                if message == "injected failure before public output reconstruction",
         ));
         assert_eq!(read_f32_array(&client, &committed_first.read().unwrap()), vec![3.0]);
         assert_eq!(read_f32_array(&client, &committed_second.read().unwrap()), vec![12.0]);
@@ -4938,21 +4937,27 @@ mod tests {
         let input =
             XlaArray::from_host_buffer(&domain, input_type, mesh, values_to_bytes::<f32>(&[0.5]).as_slice()).unwrap();
 
-        assert!(matches!(other_domain.interpret(&executable, input.clone()), Err(Error::ExecutableClientMismatch),));
-        assert!(matches!(other_domain.interpret_async(&executable, input), Err(Error::ExecutableClientMismatch),));
+        assert!(matches!(
+            other_domain.interpret(&executable, input.clone()),
+            Err(Error::Execution(ExecutionError::ClientMismatch)),
+        ));
+        assert!(matches!(
+            other_domain.interpret_async(&executable, input),
+            Err(Error::Execution(ExecutionError::ClientMismatch)),
+        ));
         assert!(matches!(
             domain.validate_xla_replacement(
                 executable.function.compiled_program(),
                 other_executable.function.compiled_program(),
             ),
-            Err(Error::ExecutableClientMismatch),
+            Err(Error::Execution(ExecutionError::ClientMismatch)),
         ));
         assert!(matches!(
             other_domain.validate_xla_replacement(
                 executable.function.compiled_program(),
                 other_executable.function.compiled_program(),
             ),
-            Err(Error::ExecutableClientMismatch),
+            Err(Error::Execution(ExecutionError::ClientMismatch)),
         ));
     }
 
@@ -5004,7 +5009,7 @@ mod tests {
 
         assert!(matches!(
             domain.adaptive_profile_guided_recompilation(&compiled, AdaptiveProfileGuidedOptions::default()),
-            Err(Error::InvalidCompilationOptions { reason }) if reason.contains("CUDA or ROCm"),
+            Err(Error::Compilation(CompilationError::InvalidOptions { reason })) if reason.contains("CUDA or ROCm"),
         ));
     }
 
@@ -5141,7 +5146,7 @@ mod tests {
                 assert!(!available);
                 assert!(matches!(
                     XlaArray::from_host_buffer(&engine, host_type, mesh.clone(), values_to_bytes(&values).as_slice()),
-                    Err(Error::UnsupportedMemory { device_id: actual_device, memory: actual_memory })
+                    Err(Error::Array(ArrayError::UnsupportedMemory { device_id: actual_device, memory: actual_memory }))
                         if actual_device == device_id && actual_memory == memory,
                 ));
                 continue;
@@ -6773,7 +6778,10 @@ mod tests {
         let options = xla_options;
         let result: Result<CompiledXlaFunction<'_, ArrayType, ArrayType>, Error> =
             compile_with_options(|x| x.sin().unwrap(), input_type, &engine, options);
-        assert!(matches!(result, Err(Error::InvalidCompilationOptions { .. })));
+        assert!(matches!(
+            result,
+            Err(Error::Execution(ExecutionError::DonationFlagCountMismatch { expected_count: 1, actual_count: 3 })),
+        ));
     }
 
     /// Unused non-parameter input metadata does not partition compilation when the complete lowering is identical.
@@ -6875,7 +6883,10 @@ mod tests {
         let options = xla_options;
         let result: Result<CompiledXlaFunction<'_, ArrayType, ArrayType>, Error> =
             compile_with_options(|x| x.sin().unwrap(), input_type, &engine, options);
-        assert!(matches!(result, Err(Error::InvalidCompilationOptions { .. })));
+        assert!(matches!(
+            result,
+            Err(Error::Compilation(CompilationError::ShardingCountMismatch { kind: "input", expected: 1, actual: 2 })),
+        ));
     }
 
     #[test]
@@ -6993,7 +7004,10 @@ mod tests {
         let options = xla_options;
         let result: Result<CompiledXlaFunction<'_, ArrayType, ArrayType>, Error> =
             compile_with_options(|x| x.sin().unwrap(), input_type, &engine, options);
-        assert!(matches!(result, Err(Error::InvalidCompilationOptions { .. })));
+        assert!(matches!(
+            result,
+            Err(Error::Compilation(CompilationError::ShardingCountMismatch { kind: "output", expected: 1, actual: 2 })),
+        ));
     }
 
     #[test]

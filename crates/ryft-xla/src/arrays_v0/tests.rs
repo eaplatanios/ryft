@@ -56,7 +56,7 @@ fn test_array_new_requires_sharding_without_single_buffer() {
 
     assert!(matches!(
         XlaArray::from_addressable_buffers(&domain, array_type, mesh, Vec::new()),
-        Err(Error::MissingSharding),
+        Err(Error::Array(ArrayError::MissingSharding)),
     ));
 }
 
@@ -111,7 +111,7 @@ fn test_array_new_rejects_dynamic_shape() {
 
     assert!(matches!(
         XlaArray::from_addressable_buffers(&domain, array_type, mesh, Vec::new()),
-        Err(Error::DynamicShape { shape }) if shape == Shape::new(vec![Dimension::Dynamic(dynamic)]),
+        Err(Error::Array(ArrayError::DynamicShape { shape })) if shape == Shape::new(vec![Dimension::Dynamic(dynamic)]),
     ));
 }
 
@@ -463,7 +463,7 @@ fn test_array_put_rejects_non_addressable_source_shards() {
             &engine,
             crate::arrays_v0::DevicePutTarget::Placement { mesh: target_mesh, sharding: target_sharding }
         ),
-        Err(Error::MissingAddressableShardForMove { shard_index: 0, device_id: 0 }),
+        Err(Error::Array(ArrayError::MissingShardBuffer { shard_index: 0, device_id: 0 })),
     ));
 }
 
@@ -701,12 +701,12 @@ fn test_device_put_rejects_mismatched_src_for_array_leaf() {
                 Option::<Option<bool>>::None,
             ),
         ),
-        Err(Error::SourcePlacementMismatch {
+        Err(Error::Array(ArrayError::SourcePlacementMismatch {
             expected_mesh: reported_expected_mesh,
             expected_sharding: reported_expected_sharding,
             actual_mesh: reported_actual_mesh,
             actual_sharding: reported_actual_sharding,
-        }) if &reported_expected_mesh == &expected_src.0
+        })) if &reported_expected_mesh == &expected_src.0
             && &reported_expected_sharding == &expected_src.1
             && &reported_actual_mesh == &actual_src.0
             && &reported_actual_sharding == &actual_src.1,
@@ -1298,7 +1298,7 @@ fn test_compilation_context_preserves_custom_base_options() {
 }
 
 #[test]
-fn test_to_placement_rejects_non_addressable_destination_device() {
+fn test_to_placement_preserves_missing_cross_host_extension() {
     let plugin = load_cpu_plugin().unwrap();
     let client = plugin
         .client(ClientOptions::CPU(CpuClientOptions { device_count: Some(1), ..Default::default() }))
@@ -1322,9 +1322,8 @@ fn test_to_placement_rejects_non_addressable_destination_device() {
         XlaArray::from_host_buffer(&engine, source_type, source_mesh, values_to_bytes::<f32>(&values).as_slice())
             .unwrap();
 
-    // Destination mesh contains a device on a remote process (process_index 1) that is not
-    // addressable from the current client. The compiled cross-mesh path surfaces this as a typed
-    // error rather than silently failing inside PJRT.
+    // Sending to the remote destination requires the extension even though local copies are possible.
+    assert!(matches!(client.cross_host_transfers_extension(), Err(PjrtError::Unimplemented { .. })));
     let target_mesh = DeviceMesh::new(
         LogicalMesh::new(vec![MeshAxis::new("x", 2, MeshAxisType::Auto).unwrap()]).unwrap(),
         vec![Device::new(local_device_id, local_device.process_index().unwrap()), Device::new(remote_device_id, 1)],
@@ -1336,16 +1335,46 @@ fn test_to_placement_rejects_non_addressable_destination_device() {
         &engine,
         crate::arrays_v0::DevicePutTarget::Placement { mesh: target_mesh, sharding: target_sharding },
     );
-    assert!(
-        matches!(
-            result,
-            Err(Error::NonAddressableDestinationDevice {
-                device_id,
-                process_index: 1,
-            }) if device_id == remote_device_id
-        ),
-        "expected NonAddressableDestinationDevice, got {result:?}"
-    );
+    assert!(matches!(
+        result,
+        Err(Error::Pjrt(PjrtError::Unimplemented { message, .. }))
+            if message == "the cross-host transfers extension is not provided by the PJRT plugin",
+    ));
+}
+
+#[test]
+fn test_to_placement_preserves_missing_cross_host_extension_for_receiver() {
+    let plugin = load_cpu_plugin().unwrap();
+    let client = plugin
+        .client(ClientOptions::CPU(CpuClientOptions { device_count: Some(1), ..Default::default() }))
+        .unwrap();
+    assert!(matches!(client.cross_host_transfers_extension(), Err(PjrtError::Unimplemented { .. })));
+    let domain = XlaSession::new(&client).domain();
+    let local_device = Device::from_pjrt(&client.addressable_devices().unwrap()[0]).unwrap();
+    let source_mesh = DeviceMesh::new(
+        LogicalMesh::new(vec![MeshAxis::new("source", 1, MeshAxisType::Auto).unwrap()]).unwrap(),
+        vec![Device::new(local_device.id() + 1, local_device.process_index() + 1)],
+    )
+    .unwrap();
+    let source_type = ArrayType::new_static(DataType::F32, [4])
+        .with_sharding(Sharding::replicated(source_mesh.logical_mesh().clone(), 1))
+        .unwrap();
+    let source = XlaArray::from_addressable_buffers(&domain, source_type, source_mesh, Vec::new()).unwrap();
+    assert_eq!(source.addressable_shards().count(), 0);
+    let target_mesh = DeviceMesh::new(
+        LogicalMesh::new(vec![MeshAxis::new("destination", 1, MeshAxisType::Auto).unwrap()]).unwrap(),
+        vec![local_device],
+    )
+    .unwrap();
+    let target_sharding = Sharding::replicated(target_mesh.logical_mesh().clone(), 1);
+
+    // This process only receives. Every destination is local, so there is no remote destination to blame for the
+    // missing extension. Preserve that error instead of searching for a nonexistent remote destination and panicking.
+    assert!(matches!(
+        source.to_placement(&domain, DevicePutTarget::Placement { mesh: target_mesh, sharding: target_sharding }),
+        Err(Error::Pjrt(PjrtError::Unimplemented { message, .. }))
+            if message == "the cross-host transfers extension is not provided by the PJRT plugin",
+    ));
 }
 
 #[test]

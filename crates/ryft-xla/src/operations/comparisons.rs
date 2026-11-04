@@ -17,9 +17,7 @@ pub(crate) fn comparison_operand_type(
 ) -> Result<ArrayType, Error> {
     check_count!("input", input_types, 2, ProgramError);
     check_count!("output", output_types, 1, ProgramError);
-    let data_type = DataType::promoted(&[input_types[0].data_type(), input_types[1].data_type()]).map_err(|error| {
-        Error::UnsupportedOperation { op: format!("cannot normalize comparison operands: {error}") }
-    })?;
+    let data_type = DataType::promoted(&[input_types[0].data_type(), input_types[1].data_type()])?;
     Ok(output_types[0].clone().with_data_type(data_type))
 }
 
@@ -127,5 +125,24 @@ impl LowerableOperation for CompareOperation<ArrayIrType> {
         // Dimension atoms already lower to scalar `i64` SSA values, so the ordinary comparison lowering can
         // consume them directly without a data gateway or host-side shape reconstruction.
         Ok(vec![lower_compare_to_mlir(self.direction(), *left, *right, block, location)?])
+    }
+}
+
+#[cfg(test)]
+mod tests {
+    use ryft_core::{DataTypeError, Error as CoreError};
+
+    use super::*;
+
+    #[test]
+    fn test_comparison_operand_type_preserves_promotion_error() {
+        assert!(matches!(
+            comparison_operand_type(
+                &[ArrayType::scalar(DataType::F6E2M3FN), ArrayType::scalar(DataType::F32)],
+                &[ArrayType::scalar(DataType::Boolean)],
+            ),
+            Err(Error::Core(CoreError::DataType(DataTypeError::InvalidPromotion { message, .. })))
+                if message == "cannot promote types `f6e2m3fn` and `f32` to a common type",
+        ));
     }
 }

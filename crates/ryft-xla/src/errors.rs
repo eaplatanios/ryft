@@ -1,19 +1,19 @@
 use std::sync::Arc;
 
 use ryft_core::{
-    ArrayType, BatchingError, BroadcastingError, DataType, DataTypeError, DeviceMesh, DifferentiationError,
-    Error as CoreError, LayoutError, Memory, MeshAxisType, ParameterError, ProgramError, ReferenceError, Shape,
-    Sharding, ShardingError, TypeError,
+    BatchingError, BroadcastingError, DataTypeError, DifferentiationError, DimensionError, Error as CoreError,
+    LayoutError, ParameterError, ProgramError, ReferenceError, ShardingError, TypeError,
 };
 use ryft_mlir::Error as MlirError;
-use ryft_pjrt::{DeviceId, Error as PjrtError};
+use ryft_pjrt::Error as PjrtError;
 
-use crate::arrays::ShardIndex;
 use crate::kernels::KernelEmbeddingError;
+use crate::{ArrayError, CompilationError, ExecutionError, LoweringError};
 
-/// Errors returned by array preparation, tracing, lowering, compilation, and execution in `ryft-xla`. Foreign Ryft core
-/// errors have one canonical [`Core`](Self::Core) carrier. Batching and differentiation errors first convert through
-/// [`ProgramError`], preserving the core pipeline's normalized typed payloads.
+/// Errors returned by array preparation, tracing, lowering, compilation, and execution in `ryft-xla`. XLA-owned
+/// conditions are grouped by their owning contracts, while foreign errors keep their canonical carriers. Public entry
+/// points return this type even when their failure is owned by a more specific group. Batching and differentiation
+/// errors first convert through [`ProgramError`], preserving normalized core payloads.
 #[derive(Clone, Debug, thiserror::Error)]
 pub enum Error {
     #[error(transparent)]
@@ -26,258 +26,23 @@ pub enum Error {
     Mlir(#[from] MlirError),
 
     #[error(transparent)]
+    Array(#[from] ArrayError),
+
+    #[error(transparent)]
+    Lowering(#[from] LoweringError),
+
+    #[error(transparent)]
+    Compilation(#[from] CompilationError),
+
+    #[error(transparent)]
+    Execution(#[from] ExecutionError),
+
+    #[error(transparent)]
     Io(Arc<std::io::Error>),
 
     #[error("{message}")]
     SizeLimitExceeded { message: String },
 
-    #[error("expected {expected} byte(s) but got {actual}")]
-    ByteCountMismatch { expected: usize, actual: usize },
-
-    #[error("missing required sharding metadata")]
-    MissingSharding,
-
-    #[error("domain was constructed without a device mesh")]
-    MissingMesh,
-
-    #[error("expected static shape but got {shape}")]
-    DynamicShape { shape: Shape },
-
-    #[error("device {device_id} is not addressable by the PJRT client in process {process_index}")]
-    NonAddressableDevice { device_id: DeviceId, process_index: usize },
-
-    #[error("got multiple buffers for device {device_id}")]
-    MultipleBuffersOnDevice { device_id: DeviceId },
-
-    #[error("device {device_id} is not present in the device mesh")]
-    DeviceNotInMesh { device_id: DeviceId },
-
-    #[error("device {device_id} reports process index {actual_process_index}, but expected {expected_process_index}")]
-    DeviceProcessIndexMismatch { device_id: DeviceId, expected_process_index: usize, actual_process_index: usize },
-
-    #[error("buffer has type {actual}, but expected {expected}")]
-    BufferTypeMismatch { expected: ArrayType, actual: ArrayType },
-
-    #[error("device {device_id} has no addressable memory for `{memory}`")]
-    UnsupportedMemory { device_id: DeviceId, memory: Memory },
-
-    #[error("buffer on device {device_id} uses memory kind `{actual}`, but expected `{expected}`")]
-    BufferMemoryMismatch { device_id: DeviceId, expected: Memory, actual: String },
-
-    #[error("zero-space buffer on device {device_id} contains a nonzero physical carrier value")]
-    NonCanonicalZeroBuffer { device_id: DeviceId },
-
-    #[error("shape rank {shape_rank} does not match shard slice rank {slice_rank}")]
-    ShardSliceRankMismatch { shape_rank: usize, slice_rank: usize },
-
-    // TODO(eaplatanios): Review from here onwards.
-    /// Error returned when `device_put` is asked to shard an element type without a supported dense host encoding.
-    #[error("device_put does not support dense host bytes for element type {element_type}")]
-    UnsupportedDevicePutElementType { element_type: DataType },
-
-    /// Error returned when the higher-level [`device_put`](fn@crate::arrays_v0::device_put) API needs a default device
-    /// but the client has no local devices.
-    #[error("device_put needs a default local device, but the PJRT client has no addressable devices")]
-    MissingDefaultDevice,
-
-    /// Error returned when a provided `src` placement does not match an array leaf's current placement.
-    #[error(
-        "device_put src mesh {expected_mesh:?} with sharding {expected_sharding:?} does not match the array's current \
-         mesh {actual_mesh:?} with sharding {actual_sharding:?}"
-    )]
-    SourcePlacementMismatch {
-        expected_mesh: DeviceMesh,
-        expected_sharding: Sharding,
-        actual_mesh: DeviceMesh,
-        actual_sharding: Sharding,
-    },
-
-    /// Error returned when a device ID cannot be represented by the PJRT cross-host transfers extension.
-    #[error("device {device_id} cannot be represented as a PJRT global device ID for cross-host transfers")]
-    CrossHostTransferDeviceIdTooLarge { device_id: DeviceId },
-
-    /// Error returned when a shard dimension cannot be represented by the PJRT cross-host transfers extension.
-    #[error(
-        "cross-host transfer for shard #{shard_index} has shape dimension #{dimension}={size}, which does not fit \
-         in i64"
-    )]
-    CrossHostTransferShapeDimensionTooLarge { shard_index: ShardIndex, dimension: usize, size: usize },
-
-    /// Error returned when an exact-shard cross-host transfer key cannot be represented in PJRT.
-    #[error(
-        "exact-shard transfer key for source shard #{source_shard_index} and destination shard \
-         #{destination_shard_index} does not fit in i64"
-    )]
-    CrossHostTransferKeyTooLarge { source_shard_index: ShardIndex, destination_shard_index: ShardIndex },
-
-    /// Error returned when [`XlaArray::to_placement`](crate::XlaArray::to_placement) needs a source shard that is not
-    /// addressable locally.
-    #[error(
-        "array move requires shard #{shard_index} on device {device_id} to be addressable from the current process"
-    )]
-    MissingAddressableShardForMove { shard_index: ShardIndex, device_id: DeviceId },
-
-    /// Error returned when copying a source shard to host yields an unexpected byte count.
-    #[error(
-        "copied shard #{shard_index} from device {device_id} to host and got {actual_byte_count} byte(s), but expected \
-         {expected_byte_count}"
-    )]
-    CopiedShardByteCountMismatch {
-        shard_index: ShardIndex,
-        device_id: DeviceId,
-        expected_byte_count: usize,
-        actual_byte_count: usize,
-    },
-
-    /// Error returned when overlapping source shards disagree while materializing a dense host array.
-    #[error("array move found inconsistent overlapping data while materializing shard #{shard_index}")]
-    InconsistentOverlappingShardData { shard_index: ShardIndex },
-
-    /// Error returned when the destination [`DeviceMesh`] has a mesh axis with
-    /// [`MeshAxisType::Manual`]. `Manual` axes are
-    /// managed explicitly by the user (e.g. inside
-    /// [`shard_map`](fn@ryft_core::shard_map)); the compiled reshard path uses the SPMD
-    /// partitioner from the top level and can only plan `Auto` and `Explicit` axes.
-    #[error("compiled reshard does not support `Manual` mesh axis {axis_name} (type {axis_type:?})")]
-    UnsupportedMeshAxisType { axis_name: String, axis_type: MeshAxisType },
-
-    /// Error returned when a destination device of a compiled reshard is not addressable from the
-    /// current process. Cross-host destinations are not yet supported.
-    #[error(
-        "compiled reshard destination device {device_id} is not addressable from the current process (its process \
-         index is {process_index})"
-    )]
-    NonAddressableDestinationDevice { device_id: DeviceId, process_index: usize },
-
-    /// Error returned when the number of donation flags does not match the number of arrays.
-    #[error("got {actual_count} donation flag(s), but expected {expected_count}")]
-    DonationFlagCountMismatch { expected_count: usize, actual_count: usize },
-
-    /// Error returned when the device list for execution contains duplicate IDs.
-    #[error("device {device_id} appears multiple times in the execution device order")]
-    DuplicateExecutionDeviceId { device_id: DeviceId },
-
-    /// Error returned when an array does not have an addressable shard for a required device.
-    #[error("input array #{array_index} has no addressable shard for device {device_id}")]
-    MissingArrayShardForDevice { array_index: usize, device_id: DeviceId },
-
-    /// Error returned when an array has an addressable shard for a device that is not in the execution device order.
-    #[error("input array #{array_index} has an unexpected addressable shard for device {device_id}")]
-    UnexpectedArrayShardDevice { array_index: usize, device_id: DeviceId },
-
-    /// Error returned when a lowered function name is empty or contains whitespace.
-    #[error("invalid function name `{function_name}` used during XLA lowering")]
-    InvalidFunctionName { function_name: String },
-
-    /// Error returned when lowering encounters a traced tensor type that MLIR rejects.
-    #[error("invalid tensor type `{array_type}` used during XLA lowering")]
-    InvalidTensorType { array_type: ArrayType },
-
-    /// Error returned when a reshape dimension cannot be represented by StableHLO's signed shape element type.
-    #[error("reshape dimension {value} cannot be represented as a StableHLO i{bit_width} shape value")]
-    ReshapeDimensionOutOfRange { value: usize, bit_width: u8 },
-
-    /// Error returned when a dynamic allocation bound exceeds StableHLO's signed runtime size carrier.
-    #[error("dynamic dimension bound {value} cannot be represented as a StableHLO i32 size value")]
-    DynamicDimensionOutOfRange { value: usize },
-
-    /// Error returned when a pad interior amount cannot be represented by StableHLO's signed attribute type.
-    #[error("pad interior padding {value} cannot be represented as a StableHLO i64 attribute")]
-    PadInteriorPaddingOutOfRange { value: usize },
-
-    /// Error returned when lowering encounters a staged op that does not yet have StableHLO support.
-    #[error("unsupported staged op `{op}` during XLA lowering")]
-    UnsupportedOperation { op: String },
-
-    /// Error returned when unresolved reference semantics reach XLA lowering before functionalization.
-    #[error("unresolved reference construct `{construct}` must be discharged before XLA lowering")]
-    UnresolvedReference { construct: String },
-
-    /// Error returned when unresolved mutable state reaches ordinary XLA lowering before functionalization.
-    #[error("unresolved state in `{construct}` must be discharged before XLA lowering")]
-    UnresolvedState { construct: String },
-
-    /// Error returned when lowering encounters a captured constant reference without a matching hidden argument.
-    #[error("missing captured constant #{index} during XLA lowering")]
-    MissingCapturedConstant { index: usize },
-
-    /// Error returned when lowering tries to materialize abstract XLA type metadata as a literal value.
-    #[error("abstract XLA value `{array_type}` cannot be materialized as a StableHLO literal")]
-    AbstractValueLiteral { array_type: ArrayType },
-
-    /// Error returned when signature sharding metadata does not match the lowered function signature.
-    #[error("invalid {kind} sharding count during XLA lowering: expected {expected}, got {actual}")]
-    InvalidShardingCount {
-        /// Name of the sharding group being validated.
-        kind: &'static str,
-
-        /// Number of shardings required by the signature.
-        expected: usize,
-
-        /// Number of shardings provided.
-        actual: usize,
-    },
-
-    /// Error returned when lowering encounters a type that does not have StableHLO support yet.
-    #[error("unsupported data type `{data_type}` during XLA lowering")]
-    UnsupportedDataType { data_type: DataType },
-
-    /// Error returned when MLIR rejects the constructed dense-elements attribute.
-    #[error("invalid dense elements attribute for data type `{data_type}` during XLA lowering")]
-    InvalidDenseElementsAttribute { data_type: DataType },
-
-    /// Error returned when the constructed MLIR module fails verification.
-    #[error("constructed MLIR module failed verification during XLA lowering")]
-    MlirVerificationFailure,
-
-    /// Error returned when one traced XLA program mixes shard maps from incompatible meshes.
-    #[error("traced XLA lowering requires all nested shard maps to use compatible logical meshes")]
-    IncompatibleNestedMeshes,
-
-    /// Error returned when logical reference-state metadata cannot map to a safe executable alias.
-    #[error("invalid XLA reference-state ABI: {message}")]
-    InvalidReferenceStateAbi { message: String },
-
-    /// Error surfaced when [`compile_with_options`](crate::jit::compile_with_options) is given options
-    /// that do not match the traced function's arity or shape — for example a
-    /// `donate_argnums` index outside the flat input range, or an `input_shardings` length that
-    /// doesn't match the number of flat inputs.
-    #[error("invalid compilation options: {reason}")]
-    InvalidCompilationOptions { reason: String },
-
-    /// The runtime domain does not own the PJRT executable it was asked to invoke or install.
-    #[error("xla executable belongs to a different PJRT client")]
-    ExecutableClientMismatch,
-
-    /// Error surfaced while encoding or decoding persistent compilation metadata.
-    #[error("invalid persistent XLA executable: {reason}")]
-    InvalidPersistentExecutable { reason: String },
-
-    /// Error surfaced while normalizing backend analysis data.
-    #[error("invalid XLA compilation analysis: {reason}")]
-    InvalidCompilationAnalysis { reason: String },
-
-    /// Runtime assertion host callbacks currently require host-accessible scalar buffers.
-    #[error("compiled runtime assertions are not supported on XLA platform `{platform}`")]
-    UnsupportedRuntimeAssertionPlatform { platform: String },
-
-    /// The selected XLA invocation or reference ABI does not support the requested external-state configuration.
-    #[error("unsupported XLA reference ABI: {reason}")]
-    UnsupportedReferenceAbi { reason: String },
-
-    /// Ordering, completion observation, or recovery of an effect scope failed.
-    #[error("effect scope: {reason}")]
-    EffectScope { reason: String },
-
-    /// A submitted asynchronous XLA reference execution failed before its pending state became ready.
-    #[error("asynchronous XLA reference execution failed: {reason}")]
-    AsynchronousReferenceExecution { reason: String },
-
-    /// A program statistics request names a case that is absent from the registry.
-    #[error("unknown program statistics case `{case_id}`")]
-    UnknownProgramStatisticsCase { case_id: String },
-
-    /// Typed extension or experimental subsystem error, retaining its diagnostic and source chain.
     #[error("{0}")]
     Custom(#[source] Arc<dyn std::error::Error + Send + Sync>),
 }
@@ -301,6 +66,8 @@ impl Error {
         }
     }
 }
+
+// TODO(eaplatanios): Review from here onwards.
 
 impl From<ParameterError> for Error {
     fn from(error: ParameterError) -> Self {
@@ -335,6 +102,12 @@ impl From<BroadcastingError> for Error {
 impl From<ShardingError> for Error {
     fn from(error: ShardingError) -> Self {
         Self::Core(error.into())
+    }
+}
+
+impl From<DimensionError> for Error {
+    fn from(error: DimensionError) -> Self {
+        Self::Core(TypeError::from(error).into())
     }
 }
 
@@ -434,7 +207,7 @@ mod tests {
         assert_eq!(payload.kind(), io::ErrorKind::PermissionDenied);
         assert_eq!(payload.to_string(), "extension is unreadable");
         assert!(error.downcast_custom::<PjrtError>().is_none());
-        assert!(Error::MissingMesh.downcast_custom::<io::Error>().is_none());
+        assert!(Error::from(ArrayError::MissingMesh).downcast_custom::<io::Error>().is_none());
         assert!(Error::from(io::Error::other("ordinary I/O failure")).downcast_custom::<io::Error>().is_none());
     }
 
@@ -462,6 +235,47 @@ mod tests {
         assert!(matches!(mlir, Error::Mlir(MlirError::InvalidArgument { .. })));
         assert_eq!(mlir.to_string(), "invalid tensor type");
         assert_eq!(format!("{mlir:?}"), debug);
+    }
+
+    #[test]
+    fn test_error_from_grouped_errors() {
+        let dimension =
+            DimensionError::ExtentExceedsBackendWidth { value: i32::MAX as usize + 1, maximum: i32::MAX as usize };
+        let array =
+            Error::from(ArrayError::InvalidShardDimension { shard_index: 3, dimension: 1, source: dimension.clone() });
+        assert!(matches!(&array,
+            Error::Array(ArrayError::InvalidShardDimension { shard_index: 3, dimension: 1, source })
+                if source == &dimension,
+        ));
+        assert_eq!(array.source().unwrap().downcast_ref::<DimensionError>(), Some(&dimension));
+        assert!(array.downcast_custom::<DimensionError>().is_none());
+
+        let lowering = Error::from(LoweringError::InvalidFunctionName { function_name: "bad name".into() });
+        assert!(matches!(lowering,
+            Error::Lowering(LoweringError::InvalidFunctionName { function_name }) if function_name == "bad name",
+        ));
+
+        let compilation =
+            Error::from(CompilationError::ShardingCountMismatch { kind: "argument", expected: 2, actual: 1 });
+        assert!(matches!(
+            compilation,
+            Error::Compilation(CompilationError::ShardingCountMismatch { kind: "argument", expected: 2, actual: 1 }),
+        ));
+
+        let execution = Error::from(ExecutionError::DonationFlagCountMismatch { expected_count: 2, actual_count: 1 });
+        assert!(matches!(
+            execution,
+            Error::Execution(ExecutionError::DonationFlagCountMismatch { expected_count: 2, actual_count: 1 }),
+        ));
+    }
+
+    #[test]
+    fn test_error_from_dimension_error() {
+        let dimension =
+            DimensionError::ExtentExceedsBackendWidth { value: i32::MAX as usize + 1, maximum: i32::MAX as usize };
+        let error = Error::from(dimension.clone());
+        let Error::Core(CoreError::Type(type_error)) = error else { unreachable!() };
+        assert_eq!(type_error.downcast_custom::<DimensionError>(), Some(&dimension));
     }
 
     #[test]

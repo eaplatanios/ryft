@@ -12,7 +12,7 @@ use ryft_mlir::Block;
 use ryft_pjrt::extensions::cross_host_transfers::{CrossHostTransferKey, GlobalDeviceId};
 use ryft_pjrt::{Buffer, Client, DeviceId, Error as PjrtError, ExecutionDeviceInputs, ExecutionInput};
 
-use crate::Error;
+use crate::{ArrayError, Error, ExecutionError};
 
 pub mod array;
 pub mod compiled_reshard;

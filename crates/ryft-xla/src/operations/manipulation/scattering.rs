@@ -1,6 +1,6 @@
 use ryft_core::macros::check_count;
 use ryft_core::{
-    ArrayType, ComparisonDirection, DataType, Dimension, ReductionKind, ScatterMode, ScatterOperation,
+    ArrayType, ComparisonDirection, DataType, Dimension, Operation, ReductionKind, ScatterMode, ScatterOperation,
     ScatterReductionKind, Shape,
 };
 use ryft_mlir::dialects::stable_hlo;
@@ -18,7 +18,7 @@ use crate::operations::comparisons::lower_compare_to_mlir;
 use crate::operations::extrema::lower_extremum_to_mlir;
 use crate::operations::reductions::build_reduce_body_region;
 use crate::operations::sharding::constrain_sharding::lower_sharding_constraint;
-use crate::{Error, LowerableOperation, LowerableOperationFamily, XlaLowerer};
+use crate::{Error, LowerableOperation, LowerableOperationFamily, LoweringError, XlaLowerer};
 
 /// Builds the scalar combiner region of a `stablehlo.scatter` for the given [`ScatterReductionKind`], modeled on
 /// [`build_reduce_body_region`]. The region's block takes the existing operand scalar and the update scalar and
@@ -153,12 +153,13 @@ pub(crate) fn lower_scatter_to_mlir<'b, 'c: 'b, 't: 'c>(
     for (&axis, &update_axis) in window_axes.iter().zip(dimensions.update_window_dimensions()) {
         let update_dimension = input_types[2].dimension(update_axis);
         if matches!(update_dimension, Dimension::Dynamic(_)) && update_dimension != input_types[0].dimension(axis) {
-            return Err(Error::UnsupportedOperation {
-                op: format!(
+            return Err(Error::Lowering(LoweringError::UnsupportedOperation {
+                operation: operation.name().to_string(),
+                reason: format!(
                     "`scatter` dynamic update window axis {update_axis} must match input axis {axis}; independently \
                      sized dynamic windows are unsupported by XLA",
                 ),
-            });
+            }));
         }
     }
     let index_vector_dimension = input_types[1].rank() - 1;
@@ -757,7 +758,7 @@ mod tests {
             .unwrap();
         assert!(matches!(
             to_mlir_module_for_plain_program(&program, "main"),
-            Err(Error::UnsupportedOperation { op })
+            Err(Error::Lowering(LoweringError::UnsupportedOperation { reason: op, .. }))
                 if op == "`scatter` dynamic update window axis 1 must match input axis 0; independently sized dynamic \
                    windows are unsupported by XLA",
         ));

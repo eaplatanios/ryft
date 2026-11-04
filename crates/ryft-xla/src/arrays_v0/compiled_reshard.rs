@@ -5,7 +5,7 @@ use ryft_pjrt::extensions::cross_host_transfers::{CrossHostTransferKey, GlobalDe
 use ryft_pjrt::{Buffer, DeviceId};
 
 use crate::arrays_v0::transfers::{cross_host_global_device_id, exact_shard_transfer_key};
-use crate::{Error, ToPjrt, XlaArray, XlaDomain, XlaOptions};
+use crate::{ArrayError, Error, ToPjrt, XlaArray, XlaDomain, XlaOptions};
 
 /// Performs the compiled-XLA resharding path for [`XlaArray::to_placement`](crate::XlaArray::to_placement).
 ///
@@ -27,14 +27,16 @@ use crate::{Error, ToPjrt, XlaArray, XlaDomain, XlaOptions};
 ///     then the replicated cross-mesh path broadcasts the result to `dst_mesh` and applies the
 ///     final `dst_sharding`.
 ///
-/// Unsupported requests return typed [`Error`] variants:
+/// Unsupported requests return typed [`ArrayError`] variants through [`Error::Array`].
 ///
-///   - [`Error::UnsupportedMeshAxisType`] when the destination mesh has any non-`Auto` axis.
-///   - [`Error::NonAddressableDestinationDevice`] when a destination device is on a
-///     different process than the wrapped [`Client`](ryft_pjrt::Client).
-///   - [`Error::MissingAddressableShardForMove`] when the source has no addressable shard.
+///   - [`ArrayError::ManualReshardingAxis`] when the destination mesh has a `Manual` axis. `Auto` and `Explicit`
+///     axes are supported.
+///   - [`ArrayError::NonAddressableDevice`] when a required local device is not addressable by the wrapped
+///     [`Client`](ryft_pjrt::Client).
+///   - [`ArrayError::MissingShardBuffer`] when a required local source shard has no buffer.
 ///
-/// Tracing, compilation, and execution failures propagate through [`Error`] without losing their typed payloads.
+/// Cross-host extension, tracing, compilation, and execution failures propagate through [`Error`] without losing
+/// their typed payloads.
 ///
 /// # Parameters
 ///
@@ -75,7 +77,7 @@ pub(crate) fn reshard_with_donation<'o>(
     // planned by the SPMD partitioner from the top level. `Auto` and `Explicit` axes both go
     // through SPMD partitioning, so allow both.
     if let Some(axis) = dst_mesh.logical_mesh().axes().iter().find(|axis| axis.r#type() == MeshAxisType::Manual) {
-        return Err(Error::UnsupportedMeshAxisType { axis_name: axis.name().to_string(), axis_type: axis.r#type() });
+        return Err(ArrayError::ManualReshardingAxis { axis_name: axis.name().to_string() }.into());
     }
 
     // Source shards on the current process must carry a local buffer (a missing one indicates a
@@ -84,10 +86,10 @@ pub(crate) fn reshard_with_donation<'o>(
     let client_process_index = engine.client().process_index()?;
     for shard in source.shards() {
         if shard.device().process_index() == client_process_index && shard.buffer().is_none() {
-            return Err(Error::MissingAddressableShardForMove {
+            return Err(Error::Array(ArrayError::MissingShardBuffer {
                 shard_index: shard.index(),
                 device_id: shard.device().id(),
-            });
+            }));
         }
     }
 
@@ -161,12 +163,10 @@ fn try_replicated_cross_mesh<'o>(
     // For a fully-replicated source, the data is present on every src_mesh device. Pick a
     // canonical sender — the first src_mesh device — to drive all cross-host sends from this
     // process. Receiving processes use the same device id as their cross-host source.
-    let canonical_src_device = source
-        .mesh()
-        .devices()
-        .first()
-        .copied()
-        .ok_or_else(|| Error::MissingAddressableShardForMove { shard_index: 0, device_id: 0 })?;
+    let canonical_src_device =
+        source.mesh().devices().first().copied().ok_or_else(|| ryft_core::ProgramError::InvalidArgument {
+            message: "cannot reshard an array on an empty source device mesh".to_string(),
+        })?;
     let canonical_src_global_id = cross_host_global_device_id(canonical_src_device.id())?;
     let this_process_is_canonical_sender = canonical_src_device.process_index() == client_process_index;
     let local_source_buffer = source.addressable_shards().find_map(|shard| shard.buffer().cloned());
@@ -190,9 +190,9 @@ fn try_replicated_cross_mesh<'o>(
         let dst_global_id = cross_host_global_device_id(dst_device_id)?;
 
         if dst_local {
-            let pjrt_device = dst_device_by_id.get(&dst_device_id).ok_or(Error::NonAddressableDestinationDevice {
+            let pjrt_device = dst_device_by_id.get(&dst_device_id).ok_or(ArrayError::NonAddressableDevice {
                 device_id: dst_device_id,
-                process_index: dst_device.process_index(),
+                process_index: client_process_index,
             })?;
             if let Some(local_source) = local_source_buffer.as_ref() {
                 let buffer = local_source.copy_to_device(pjrt_device.clone())?;
@@ -204,10 +204,10 @@ fn try_replicated_cross_mesh<'o>(
                     .push((canonical_src_global_id, transfer_key));
             }
         } else if this_process_is_canonical_sender {
-            let local_source = local_source_buffer.as_ref().ok_or(Error::MissingAddressableShardForMove {
+            let local_source = local_source_buffer.as_ref().ok_or(Error::Array(ArrayError::MissingShardBuffer {
                 shard_index: 0,
                 device_id: canonical_src_device.id(),
-            })?;
+            }))?;
             send_buffers.push(local_source.as_ref());
             send_dst_devices.push(dst_global_id);
             send_transfer_keys.push(transfer_key);
@@ -215,21 +215,10 @@ fn try_replicated_cross_mesh<'o>(
         // Otherwise: remote destination served by some other process; nothing to do here.
     }
 
-    // If any cross-host transfer is required, verify the PJRT plugin exposes the extension. On
-    // backends without it, return a clear `NonAddressableDestinationDevice` error rather than
-    // letting the send/receive call fail later with a generic `Unimplemented`.
+    // A receiver may have only local destinations, so an unavailable extension cannot be attributed to a remote
+    // destination device. Preserve the plugin's actual extension error before issuing any transfers.
     if !send_buffers.is_empty() || !receive_plans_by_device.is_empty() {
-        if client.cross_host_transfers_extension().is_err() {
-            let blocking_dst = dst_mesh
-                .devices()
-                .iter()
-                .find(|device| device.process_index() != client_process_index)
-                .expect("cross-host transfer planned but no remote destination found");
-            return Err(Error::NonAddressableDestinationDevice {
-                device_id: blocking_dst.id(),
-                process_index: blocking_dst.process_index(),
-            });
-        }
+        client.cross_host_transfers_extension()?;
     }
 
     // Issue cross-host sends, if any.
@@ -250,7 +239,7 @@ fn try_replicated_cross_mesh<'o>(
     receive_device_ids.sort_unstable();
     for dst_device_id in receive_device_ids {
         let plans = receive_plans_by_device.get(&dst_device_id).expect("receive plans present after sort");
-        let pjrt_device = dst_device_by_id.get(&dst_device_id).ok_or(Error::NonAddressableDestinationDevice {
+        let pjrt_device = dst_device_by_id.get(&dst_device_id).ok_or(ArrayError::NonAddressableDevice {
             device_id: dst_device_id,
             process_index: client_process_index,
         })?;

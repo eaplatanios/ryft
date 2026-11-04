@@ -304,13 +304,11 @@ impl LowerableOperation for ShardMapOperation {
         _output_types: &[ArrayIrType],
     ) -> Result<Vec<ValueRef<'b, 'c, 't>>, Error> {
         let [body] = lowerer.regions.as_slice() else {
-            return Err(Error::UnsupportedOperation {
-                op: format!(
-                    "{} expected 1 attached region but got {}",
-                    SHARD_MAP_OPERATION_NAME,
-                    lowerer.regions.len()
-                ),
-            });
+            return Err(Error::from(ProgramError::MalformedProgram(format!(
+                "{} expected 1 attached region but got {}",
+                SHARD_MAP_OPERATION_NAME,
+                lowerer.regions.len()
+            ))));
         };
         let simplified_body = body.simplified()?;
         let local_input_types = simplified_body

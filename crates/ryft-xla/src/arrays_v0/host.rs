@@ -88,12 +88,12 @@ impl DenseArrayHostCopy {
                 let PendingDenseShardHostCopy { event, shard_index, device_id, expected_byte_count, slices } = shard;
                 let bytes = event.r#await()?;
                 if bytes.len() != expected_byte_count {
-                    return Err(Error::CopiedShardByteCountMismatch {
+                    return Err(Error::Array(ArrayError::ShardByteCountMismatch {
                         shard_index,
                         device_id,
                         expected_byte_count,
                         actual_byte_count: bytes.len(),
-                    });
+                    }));
                 }
                 Ok((shard_index, slices, bytes))
             })
@@ -173,7 +173,7 @@ pub(crate) fn begin_materialize_dense_array_bytes(array: &XlaArray<'_>) -> Resul
             let buffer = shard
                 .buffer()
                 .map(|buffer| buffer.as_ref())
-                .ok_or(Error::MissingAddressableShardForMove { shard_index, device_id: device.id() })?;
+                .ok_or(Error::Array(ArrayError::MissingShardBuffer { shard_index, device_id: device.id() }))?;
             let shard_shape = shard.shape();
             Ok(PendingDenseShardHostCopy {
                 // The merge consumes row-major bytes even when the device buffer has another physical layout.
@@ -312,7 +312,7 @@ fn merge_dense_byte_segment(
         if overlap.start < overlap.end {
             let source_offset = overlap.start - range.start;
             if global_bytes[overlap.clone()] != source_bytes[source_offset..source_offset + overlap.len()] {
-                return Err(Error::InconsistentOverlappingShardData { shard_index });
+                return Err(Error::Array(ArrayError::InconsistentOverlappingShardData { shard_index }));
             }
         }
         overlap_index += 1;

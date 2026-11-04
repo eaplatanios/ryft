@@ -10,8 +10,8 @@ use ryft_mlir::{
 
 use crate::experimental::lowering::EffectTokens;
 use crate::experimental::lowering::types::{
-    lower_explicit_reshape_shape, lower_runtime_dimension_size_i64, lower_static_index_constants, lower_tensor_type,
-    physical_bound_type, reshape_dimension_i32, reshape_dimension_i64, stable_hlo_dynamic_dimension_bound,
+    dimension_extent_i32, dimension_extent_i64, lower_explicit_reshape_shape, lower_runtime_dimension_size_i64,
+    lower_static_index_constants, lower_tensor_type, physical_bound_type, stable_hlo_dynamic_dimension_bound,
     static_dimensions,
 };
 use crate::operations::assertions::{
@@ -19,7 +19,7 @@ use crate::operations::assertions::{
     lower_assertion_custom_call, lower_deliberately_false_assertion_predicate,
 };
 use crate::operations::sharding::constrain_sharding::lower_sharding_constraint;
-use crate::{Error, LowerableOperation, LowerableOperationFamily, XlaLowerer};
+use crate::{Error, LowerableOperation, LowerableOperationFamily, LoweringError, XlaLowerer};
 
 impl LowerableOperation for ReshapeOperation {
     fn lower<'b, 'c: 'b, 't: 'c, O: LowerableOperationFamily>(
@@ -85,12 +85,15 @@ fn lower_reshape_to_mlir<'b, 'c: 'b, 't: 'c>(
                         lower_static_index_constants(&[*extent], block, context, location)?[0]
                     }
                     Dimension::Dynamic(_) => {
-                        let axis = input_axes.next().ok_or_else(|| Error::UnsupportedOperation {
-                            op: format!(
-                                "reshape from {} to {} does not preserve the non-singleton dimensions in order",
-                                input_type.shape(),
-                                output_types[0].shape(),
-                            ),
+                        let axis = input_axes.next().ok_or_else(|| {
+                            Error::Lowering(LoweringError::UnsupportedOperation {
+                                operation: operation.name().to_string(),
+                                reason: format!(
+                                    "reshape from {} to {} does not preserve the non-singleton dimensions in order",
+                                    input_type.shape(),
+                                    output_types[0].shape(),
+                                ),
+                            })
                         })?;
                         lower_runtime_dimension_size_i64(input, axis, block, context, location)?
                     }
@@ -107,7 +110,7 @@ fn lower_reshape_to_mlir<'b, 'c: 'b, 't: 'c>(
                 })
                 .collect::<Vec<_>>();
             for bound in output_bounds.iter().flatten() {
-                reshape_dimension_i32(*bound)?;
+                dimension_extent_i32(*bound)?;
             }
             let reshape =
                 block.append_operation(stable_hlo::dynamic_reshape(input, shape, &output_bounds, location)?)?;
@@ -123,7 +126,7 @@ fn lower_reshape_to_mlir<'b, 'c: 'b, 't: 'c>(
     } else {
         let output_shape = static_dimensions(&output_types[0])?;
         for dimension in &output_shape {
-            reshape_dimension_i64(*dimension)?;
+            dimension_extent_i64(*dimension)?;
         }
         let reshape = block.append_operation(stable_hlo::reshape(input, output_shape.as_slice(), location)?)?;
         reshape.result(0).expect("stablehlo.reshape should return one result").as_ref()
@@ -200,21 +203,28 @@ impl LowerableOperation for DynamicReshapeOperation {
 
         // Native reshape requires equal allocation capacities even when the runtime logical products agree.
         // Reject unsupported bound combinations here rather than letting HLO import fail with a static-count error.
-        let physical_input = physical_bound_type(input_type).map_err(|_| Error::UnsupportedOperation {
-            op: "reshape requires finite physical bounds for every dynamic input dimension".to_string(),
+        let physical_input = physical_bound_type(input_type).map_err(|_| {
+            Error::Lowering(LoweringError::UnsupportedOperation {
+                operation: self.name().to_string(),
+                reason: "reshape requires finite physical bounds for every dynamic input dimension".to_string(),
+            })
         })?;
-        let physical_output = physical_bound_type(output_type).map_err(|_| Error::UnsupportedOperation {
-            op: "reshape requires finite physical bounds for every dynamic output dimension".to_string(),
+        let physical_output = physical_bound_type(output_type).map_err(|_| {
+            Error::Lowering(LoweringError::UnsupportedOperation {
+                operation: self.name().to_string(),
+                reason: "reshape requires finite physical bounds for every dynamic output dimension".to_string(),
+            })
         })?;
         let input_capacity = physical_input.element_count().map_err(ProgramError::from)?.unwrap();
         let output_capacity = physical_output.element_count().map_err(ProgramError::from)?.unwrap();
         if input_capacity != output_capacity {
-            return Err(Error::UnsupportedOperation {
-                op: format!(
+            return Err(Error::Lowering(LoweringError::UnsupportedOperation {
+                operation: self.name().to_string(),
+                reason: format!(
                     "reshape with unequal physical capacities (input {input_capacity}, output {output_capacity}); \
                      dynamic bounds must preserve the physical element count",
                 ),
-            });
+            }));
         }
 
         if self.effects().classes().contains(EffectClass::OrderedAssertion) {
@@ -241,7 +251,7 @@ impl LowerableOperation for DynamicReshapeOperation {
         let result = if output_type.static_shape().is_some() {
             let output_shape = static_dimensions(output_type)?;
             for dimension in &output_shape {
-                reshape_dimension_i64(*dimension)?;
+                dimension_extent_i64(*dimension)?;
             }
             let reshape = block.append_operation(stable_hlo::reshape(input, output_shape.as_slice(), location)?)?;
             reshape.result(0).expect("stablehlo.reshape should return one result").as_ref()
@@ -257,7 +267,7 @@ impl LowerableOperation for DynamicReshapeOperation {
                 })
                 .collect::<Vec<_>>();
             for bound in output_bounds.iter().flatten() {
-                reshape_dimension_i32(*bound)?;
+                dimension_extent_i32(*bound)?;
             }
             let reshape =
                 block.append_operation(stable_hlo::dynamic_reshape(input, shape, &output_bounds, location)?)?;
@@ -504,7 +514,7 @@ mod tests {
         let input_types = vec![input_type, ArrayType::scalar(DataType::I64)];
         assert!(matches!(
             to_mlir_module_for_program(&program, &[], &input_types, &vec![output_type], "main", None, None),
-            Err(Error::UnsupportedOperation { op })
+            Err(Error::Lowering(LoweringError::UnsupportedOperation { reason: op, .. }))
                 if op == "reshape with unequal physical capacities (input 4, output 6); dynamic bounds must \
                    preserve the physical element count",
         ));

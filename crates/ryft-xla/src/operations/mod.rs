@@ -7,9 +7,9 @@ use ryft_mlir::{
     ValueRef,
 };
 
-use crate::Error;
 use crate::experimental::lowering::types::{lower_restore_dynamic_dimensions, lower_tensor_type, physical_bound_type};
 use crate::operations::constants::lower_layout_constraint;
+use crate::{Error, LoweringError};
 
 /// StableHLO lowering of arithmetic operations.
 pub(crate) mod arithmetic;
@@ -94,8 +94,11 @@ where
     L: Copy + Location<'c, 't>,
 {
     let input_type = input.r#type()?;
-    let input_tensor_type = input_type.cast::<TensorTypeRef>().ok_or_else(|| Error::UnsupportedOperation {
-        op: format!("elementwise operand has non-tensor MLIR type `{input_type}`"),
+    let input_tensor_type = input_type.cast::<TensorTypeRef>().ok_or_else(|| {
+        Error::Lowering(LoweringError::UnsupportedOperation {
+            operation: "normalize_elementwise_operand".to_string(),
+            reason: format!("elementwise operand has non-tensor MLIR type `{input_type}`"),
+        })
     })?;
     let output_tensor_type = lower_tensor_type(output_type, context, location)?;
     let output_element_type = output_tensor_type.element_type()?;
@@ -109,8 +112,11 @@ where
     if input_tensor_type.dimensions().ne(output_tensor_type.dimensions()) {
         let output_rank = output_tensor_type.rank();
         let input_rank = input_tensor_type.rank();
-        let first_dimension = output_rank.checked_sub(input_rank).ok_or_else(|| Error::UnsupportedOperation {
-            op: format!("cannot broadcast rank-{input_rank} elementwise operand to rank-{output_rank} output"),
+        let first_dimension = output_rank.checked_sub(input_rank).ok_or_else(|| {
+            Error::Lowering(LoweringError::UnsupportedOperation {
+                operation: "normalize_elementwise_operand".to_string(),
+                reason: format!("cannot broadcast rank-{input_rank} elementwise operand to rank-{output_rank} output"),
+            })
         })?;
         let dimensions = (first_dimension..output_rank).collect::<Vec<_>>();
         let broadcast = block.append_operation(stable_hlo::broadcast(

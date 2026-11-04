@@ -1,4 +1,4 @@
-use ryft_core::{ArrayType, DataType, Dimension, ProgramError, SHARD_MAP_OPERATION_NAME};
+use ryft_core::{ArrayType, Dimension, ProgramError, SHARD_MAP_OPERATION_NAME};
 use ryft_mlir::dialects::stable_hlo;
 use ryft_mlir::{
     Block, BlockRef, Context as MlirContext, LocationRef, Operation as MlirOperation, Value as MlirValue, ValueRef,
@@ -135,9 +135,7 @@ pub(crate) fn refine_collective_result_dimensions<'b, 'c: 'b, 't: 'c>(
     if output_type.rank() != extents.len() {
         return Err(ProgramError::InvalidInputCount { expected: output_type.rank(), actual: extents.len() }.into());
     }
-    let i32_scalar_type = context
-        .tensor_type(context.signless_integer_type(32), &[], None, location)
-        .map_err(|_| Error::InvalidTensorType { array_type: ArrayType::scalar(DataType::I32) })?;
+    let i32_scalar_type = context.tensor_type(context.signless_integer_type(32), &[], None, location)?;
     let output_tensor_type = lower_tensor_type(output_type, context, location)?;
     for (axis, &extent) in extents.iter().enumerate() {
         if !matches!(output_type.shape().dimensions()[axis], Dimension::Dynamic(_)) {
@@ -161,8 +159,8 @@ pub(crate) fn refine_collective_result_dimensions<'b, 'c: 'b, 't: 'c>(
 mod tests {
     use pretty_assertions::assert_eq;
     use ryft_core::{
-        Array, ArrayOperation, DimensionBounds, DimensionType, ParallelAllToAllOperation, ParallelPermuteOperation,
-        Shape, ShardMapBoundary, Sharding,
+        Array, ArrayOperation, DataType, DimensionBounds, DimensionType, ParallelAllToAllOperation,
+        ParallelPermuteOperation, Shape, ShardMapBoundary, Sharding,
     };
     use ryft_mlir::{Block, Location, Value as MlirValue};
 

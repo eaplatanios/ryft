@@ -1,5 +1,5 @@
 use ryft_core::macros::check_count;
-use ryft_core::{ArrayType, DataType, Dimension, SelectOperation};
+use ryft_core::{ArrayType, DataType, Dimension, SELECT_OPERATION_NAME, SelectOperation};
 use ryft_mlir::dialects::stable_hlo;
 use ryft_mlir::{
     Block, Context as MlirContext, Location, Operation as MlirOperation, TensorTypeRef, Type, Value as MlirValue,
@@ -12,7 +12,7 @@ use crate::experimental::lowering::types::{
 };
 use crate::operations::constants::lower_layout_constraint;
 use crate::operations::normalize_elementwise_operand;
-use crate::{Error, LowerableOperation, LowerableOperationFamily, XlaLowerer};
+use crate::{Error, LowerableOperation, LowerableOperationFamily, LoweringError, XlaLowerer};
 
 /// Normalizes a select condition and both branches to the exact tensor descriptors required by StableHLO.
 pub(crate) fn normalize_select_operands<'b, 'c: 'b, 't: 'c, B, L>(
@@ -53,8 +53,11 @@ where
                 (input_type.shape().dimensions().get(input_axis) == Some(dimension))
                     .then_some((input_values[index], input_axis))
             });
-            sources[output_axis] = source.ok_or_else(|| Error::UnsupportedOperation {
-                op: format!("cannot recover select output axis {output_axis} extent from its inputs"),
+            sources[output_axis] = source.ok_or_else(|| {
+                Error::Lowering(LoweringError::UnsupportedOperation {
+                    operation: SELECT_OPERATION_NAME.to_string(),
+                    reason: format!("cannot recover select output axis {output_axis} extent from its inputs"),
+                })
             })?;
         }
     }
@@ -84,14 +87,16 @@ where
                 location.as_ref(),
             )?;
             let physical_type = physical_bound_type(&target_type)?;
-            let first_axis =
-                target_type.rank().checked_sub(converted_type.rank()).ok_or_else(|| Error::UnsupportedOperation {
-                    op: format!(
+            let first_axis = target_type.rank().checked_sub(converted_type.rank()).ok_or_else(|| {
+                Error::Lowering(LoweringError::UnsupportedOperation {
+                    operation: SELECT_OPERATION_NAME.to_string(),
+                    reason: format!(
                         "cannot broadcast rank-{} select input to rank-{} output",
                         converted_type.rank(),
                         target_type.rank(),
                     ),
-                })?;
+                })
+            })?;
             let output_axes = (first_axis..target_type.rank()).collect::<Vec<_>>();
             let broadcast = block.append_operation(stable_hlo::broadcast(
                 physical_input,

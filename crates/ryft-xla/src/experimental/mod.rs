@@ -9,8 +9,8 @@ pub mod ops;
 pub mod tracing;
 
 pub use domains::{
-    XlaAnalysisValue, XlaCompilationAnalysis, XlaDomain, XlaFeedbackDirectedProfile, XlaMemoryAnalysis,
-    XlaOptimizedProgram, XlaSession,
+    CompilationError, ExecutionError, XlaAnalysisValue, XlaCompilationAnalysis, XlaDomain, XlaFeedbackDirectedProfile,
+    XlaMemoryAnalysis, XlaOptimizedProgram, XlaSession,
 };
 
 pub use tracing::{TracedXlaProgram, XlaArrayTracer, trace, trace_with_context};

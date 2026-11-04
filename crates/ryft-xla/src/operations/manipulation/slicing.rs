@@ -11,15 +11,15 @@ use ryft_mlir::{
 
 use crate::experimental::lowering::EffectTokens;
 use crate::experimental::lowering::types::{
-    lower_constant_output, lower_physical_bound_value, lower_restore_dynamic_dimensions,
+    dimension_extent_i32, lower_constant_output, lower_physical_bound_value, lower_restore_dynamic_dimensions,
     lower_runtime_dimension_size_i64, lower_static_index_constants, lower_tensor_type, lower_unplaced_constant_output,
-    physical_bound_type, reshape_dimension_i32, static_dimensions,
+    physical_bound_type, static_dimensions,
 };
 use crate::operations::assertions::{
     ASSERT_ACTOR_ATTRIBUTE, ASSERT_DETAIL_ATTRIBUTE, ASSERT_DYNAMIC_SHAPE_SLICE_KIND, ASSERT_KIND_ATTRIBUTE,
     lower_assertion_custom_call, lower_deliberately_false_assertion_predicate,
 };
-use crate::{Error, LowerableOperation, LowerableOperationFamily, XlaLowerer};
+use crate::{Error, LowerableOperation, LowerableOperationFamily, LoweringError, XlaLowerer};
 
 /// Normalizes scalar slice starts against logical input dimensions before native allocation-based clamping. Signed
 /// starts count from the end of their axis once when `allow_negative_indices` is set, unsigned indices are widened
@@ -205,10 +205,8 @@ pub(crate) fn lower_slice_to_mlir<'b, 'c: 'b, 't: 'c>(
         if physical_dimensions[axis] == *dimension {
             continue;
         }
-        let extent = reshape_dimension_i32(dimension.value().unwrap())?;
-        let elements = context
-            .dense_i32_elements_attribute(size_type, &[extent])
-            .map_err(|_| Error::InvalidDenseElementsAttribute { data_type: DataType::I32 })?;
+        let extent = dimension_extent_i32(dimension.value().unwrap())?;
+        let elements = context.dense_i32_elements_attribute(size_type, &[extent])?;
         let size = block.append_operation(stable_hlo::constant(elements, location)?)?.result(0).unwrap().as_ref();
         physical_dimensions[axis] = dimension.clone();
         let physical_type = input_type.clone().with_shape(Shape::new(physical_dimensions.clone()));
@@ -300,35 +298,41 @@ pub(crate) fn plan_dynamic_slice_axis(
     size_type: &DimensionType,
 ) -> Result<DynamicSliceAxisPlan, Error> {
     let Some(size_upper) = size_type.bounds().upper() else {
-        return Err(Error::UnsupportedOperation {
-            op: format!("{DYNAMIC_SLICE_OPERATION_NAME} size on axis {axis} needs a finite upper bound",),
-        });
+        return Err(Error::Lowering(LoweringError::UnsupportedOperation {
+            operation: DYNAMIC_SLICE_OPERATION_NAME.to_string(),
+            reason: format!("{DYNAMIC_SLICE_OPERATION_NAME} size on axis {axis} needs a finite upper bound",),
+        }));
     };
     let size = size_upper - 1;
     let span = if size == 0 {
         0
     } else {
         (size - 1).checked_mul(stride).and_then(|size| size.checked_add(1)).ok_or_else(|| {
-            Error::UnsupportedOperation {
-                op: format!("{DYNAMIC_SLICE_OPERATION_NAME} physical span overflows on axis {axis}"),
-            }
+            Error::Lowering(LoweringError::UnsupportedOperation {
+                operation: DYNAMIC_SLICE_OPERATION_NAME.to_string(),
+                reason: format!("{DYNAMIC_SLICE_OPERATION_NAME} physical span overflows on axis {axis}"),
+            })
         })?
     };
     let (input_minimum, input_physical_size) = match input_dimension {
         Dimension::Static(extent) => (*extent, *extent),
         Dimension::Dynamic(variable) => {
             let Some(upper) = variable.bounds().upper() else {
-                return Err(Error::UnsupportedOperation {
-                    op: format!("{DYNAMIC_SLICE_OPERATION_NAME} input on axis {axis} needs a finite upper bound",),
-                });
+                return Err(Error::Lowering(LoweringError::UnsupportedOperation {
+                    operation: DYNAMIC_SLICE_OPERATION_NAME.to_string(),
+                    reason: format!("{DYNAMIC_SLICE_OPERATION_NAME} input on axis {axis} needs a finite upper bound",),
+                }));
             };
             (variable.bounds().lower(), upper - 1)
         }
     };
-    let padded_size = input_physical_size.checked_add(span).ok_or_else(|| Error::UnsupportedOperation {
-        op: format!("{DYNAMIC_SLICE_OPERATION_NAME} padded input size overflows on axis {axis}"),
+    let padded_size = input_physical_size.checked_add(span).ok_or_else(|| {
+        Error::Lowering(LoweringError::UnsupportedOperation {
+            operation: DYNAMIC_SLICE_OPERATION_NAME.to_string(),
+            reason: format!("{DYNAMIC_SLICE_OPERATION_NAME} padded input size overflows on axis {axis}"),
+        })
     })?;
-    reshape_dimension_i32(padded_size)?;
+    dimension_extent_i32(padded_size)?;
     let bounds_prove_runtime_in_bounds = start_type
         .bounds()
         .upper()
@@ -591,9 +595,7 @@ impl LowerableOperation for DynamicSliceOperation<ArrayIrType> {
             result = slice.result(0).expect("stablehlo.slice should return one result").as_ref();
         }
 
-        let i32_scalar_type = context
-            .tensor_type(context.signless_integer_type(32), &[], None, location)
-            .map_err(|_| Error::InvalidTensorType { array_type: ArrayType::scalar(DataType::I32) })?;
+        let i32_scalar_type = context.tensor_type(context.signless_integer_type(32), &[], None, location)?;
         let mut refined_type = output_type
             .clone()
             .with_shape(Shape::new(physical_sizes.iter().copied().map(Dimension::Static).collect()));
@@ -1186,7 +1188,7 @@ mod tests {
 
     /// Extracts the unsupported-operation diagnostic produced by the physical slice planner.
     fn unsupported_operation(error: Error) -> String {
-        let Error::UnsupportedOperation { op } = error else {
+        let Error::Lowering(LoweringError::UnsupportedOperation { reason: op, .. }) = error else {
             panic!("expected an unsupported-operation error but received {error}");
         };
         op
@@ -1205,18 +1207,19 @@ mod tests {
         let output_type = ArrayType::new(DataType::F32, Shape::new(vec![size.into()]));
         assert!(matches!(
             dynamic_constructor_types("zero_like", 1, &[output_type.into()]),
-            Err(Error::UnsupportedOperation { op })
+            Err(Error::Lowering(LoweringError::UnsupportedOperation { reason: op, .. }))
                 if op == "zero_like output dimension `size` needs a finite upper bound for physical buffer allocation",
         ));
 
         let bound = i32::MAX as usize + 1;
         let size = DimensionVariable::new("size", DimensionBounds::non_negative(Some(bound + 1)).unwrap());
         let output_type = ArrayType::new(DataType::F32, Shape::new(vec![size.into()]));
-        assert!(matches!(
-            dynamic_constructor_types("one_like", 1, &[output_type.into()]),
-            Err(Error::DynamicDimensionOutOfRange { value })
-                if value == bound,
-        ));
+        let error = dynamic_constructor_types("one_like", 1, &[output_type.into()]).unwrap_err();
+        let Error::Core(ryft_core::Error::Type(error)) = error else { unreachable!() };
+        assert_eq!(
+            error.downcast_custom::<ryft_core::DimensionError>(),
+            Some(&ryft_core::DimensionError::ExtentExceedsBackendWidth { value: bound, maximum: i32::MAX as usize }),
+        );
     }
 
     #[test]

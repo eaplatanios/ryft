@@ -10,15 +10,15 @@ use ryft_mlir::{
 };
 
 use crate::experimental::lowering::types::{
-    lower_explicit_shape, lower_physical_bound_value, lower_physical_storage, lower_restore_dynamic_dimensions,
-    lower_runtime_dimension_size_i64, lower_static_index_constants, lower_tensor_type, physical_bound_type,
-    reshape_dimension_i64,
+    dimension_extent_i64, lower_explicit_shape, lower_physical_bound_value, lower_physical_storage,
+    lower_restore_dynamic_dimensions, lower_runtime_dimension_size_i64, lower_static_index_constants,
+    lower_tensor_type, physical_bound_type,
 };
 use crate::operations::constants::{
     dynamic_constructor_types, lower_layout_constraint, refine_dynamic_constructor_result,
 };
 use crate::operations::sharding::constrain_sharding::lower_sharding_constraint;
-use crate::{Error, LowerableOperation, LowerableOperationFamily, XlaLowerer};
+use crate::{Error, LowerableOperation, LowerableOperationFamily, LoweringError, XlaLowerer};
 
 impl LowerableOperation for BroadcastOperation {
     fn lower<'b, 'c: 'b, 't: 'c, O: LowerableOperationFamily>(
@@ -117,9 +117,10 @@ fn lower_broadcast_to_mlir<'b, 'c: 'b, 't: 'c>(
     };
     let result = if output_type.static_shape().is_none() && physical_bound_type(output_type).is_err() {
         if output_type.layout().is_some() {
-            return Err(Error::UnsupportedOperation {
-                op: "dynamic broadcast with explicit output layout needs finite allocation bounds".to_owned(),
-            });
+            return Err(Error::Lowering(LoweringError::UnsupportedOperation {
+                operation: operation.name().to_string(),
+                reason: "dynamic broadcast with explicit output layout needs finite allocation bounds".to_owned(),
+            }));
         }
         // Every dynamic result axis is a passthrough of a mapped input axis, so obtain its runtime extent there.
         let extents = output_type
@@ -129,7 +130,7 @@ fn lower_broadcast_to_mlir<'b, 'c: 'b, 't: 'c>(
             .enumerate()
             .map(|(axis, dimension)| {
                 if let Dimension::Static(extent) = dimension {
-                    reshape_dimension_i64(*extent)?;
+                    dimension_extent_i64(*extent)?;
                     Ok(lower_static_index_constants(&[*extent], block, context, location)?.remove(0))
                 } else {
                     let input_axis =
@@ -267,9 +268,10 @@ impl LowerableOperation for DynamicBroadcastOperation {
             .remove(0)
         } else {
             if output_type.layout().is_some() {
-                return Err(Error::UnsupportedOperation {
-                    op: "dynamic broadcast with explicit output layout needs finite allocation bounds".to_owned(),
-                });
+                return Err(Error::Lowering(LoweringError::UnsupportedOperation {
+                    operation: self.name().to_string(),
+                    reason: "dynamic broadcast with explicit output layout needs finite allocation bounds".to_owned(),
+                }));
             }
             let shape = lower_explicit_shape(output_extents, block, context, location)?;
             let broadcast = block.append_operation(stable_hlo::dynamic_broadcast(
@@ -620,7 +622,7 @@ mod tests {
                 builder.build::<Vec<Array>, Vec<Array>>(vec![output], vec![Placeholder], vec![Placeholder]).unwrap();
             assert!(matches!(
                 to_mlir_module_for_plain_program(&program, "main"),
-                Err(Error::UnsupportedOperation { op })
+                Err(Error::Lowering(LoweringError::UnsupportedOperation { reason: op, .. }))
                     if op == format!("{kind} output layout `{layout}`"),
             ));
         }
@@ -1103,7 +1105,7 @@ mod tests {
                 None,
                 None,
             ),
-            Err(Error::UnsupportedOperation { op })
+            Err(Error::Lowering(LoweringError::UnsupportedOperation { reason: op, .. }))
                 if op == "non-row-major bounded-dynamic output layout `tiled{0,1}`",
         ));
         // An unspecified executable result layout still permits the internal constraint.
@@ -1157,7 +1159,7 @@ mod tests {
                     None,
                     None,
                 ),
-                Err(Error::UnsupportedOperation { op })
+                Err(Error::Lowering(LoweringError::UnsupportedOperation { reason: op, .. }))
                     if op == format!("{kind} output layout `{layout}`"),
             ));
         }
