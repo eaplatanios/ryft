@@ -920,6 +920,15 @@ impl<V: Typed + Parameter, O> CustomRuleBatching<V, O> {
         matches!(self.rule, CustomRuleBatchingRule::Derived(_))
     }
 
+    /// Returns whether broadcast-sensitive handling was configured for this rule through
+    /// [`CustomRuleDefinition::with_broadcast_sensitive_batching_rule`]. Derived rules inherit this setting, which
+    /// enables them to recover exact per-item tangents when broadcasting replicated inputs changes the source rule's
+    /// per-item numerical behavior. This reports the configuration without inspecting the callback's behavior.
+    #[inline]
+    pub fn is_broadcast_sensitive(&self) -> bool {
+        self.broadcast_sensitivity.is_some()
+    }
+
     /// Returns the derivation that a derived definition's batching rule applies, or [`None`] for a retained custom
     /// callback. The derivation remains internal because its specialization keys are internal.
     #[inline]
@@ -1709,35 +1718,6 @@ impl<V: Typed<Type: Eq + Hash> + Parameter, O> CustomRuleDefinition<V, O> {
         self.batching_rule.as_ref()
     }
 
-    // TODO(eaplatanios): Why do we need this?
-    /// Returns the kinds of the rules that this definition configures (refer to [`CustomRuleKinds`]).
-    pub(in crate::operations::composites) fn rule_kinds(&self) -> CustomRuleKinds {
-        CustomRuleKinds {
-            jvp: self.jvp.as_ref().map(|jvp| match jvp {
-                CustomRuleJvp::Rule(_) => "rule",
-                CustomRuleJvp::SymbolicZeroRule(_) => "symbolic zero rule",
-                CustomRuleJvp::Derived => "derived from the primal",
-            }),
-            vjp: self.vjp.as_ref().map(|vjp| match (vjp.backward(), self.deferred_forward) {
-                (CustomRuleVjpBackward::Pure(_), false) => "rules",
-                (CustomRuleVjpBackward::Pure(_), true) => "rules with deferred forward rule",
-                (CustomRuleVjpBackward::PureWithSymbolicZeros(_), false) => "symbolic zero rules",
-                (CustomRuleVjpBackward::PureWithSymbolicZeros(_), true) => {
-                    "symbolic zero rules with deferred forward rule"
-                }
-                (CustomRuleVjpBackward::Accumulating(_), false) => "accumulating rules",
-                (CustomRuleVjpBackward::Accumulating(_), true) => "accumulating rules with deferred forward rule",
-            }),
-            batching: match &self.batching_rule {
-                Some(rule) if rule.is_derived() => "derived rule",
-                Some(rule) if rule.broadcast_sensitivity.is_some() => "broadcast sensitive rule",
-                Some(_) => "rule",
-                None if self.sequential_batching_scan.is_some() => "sequential",
-                None => "structural",
-            },
-        }
-    }
-
     /// Returns the retained callback for discharging a rule program's reference state, or [`None`] when reference
     /// discharge support is not configured. The callback replaces local reference state with explicitly threaded
     /// values and rejects external references.
@@ -1831,24 +1811,6 @@ impl<V: Typed<Type: Eq + Hash> + Parameter, O> Debug for CustomRuleDefinition<V,
         }
         debug.finish_non_exhaustive()
     }
-}
-
-// TODO(eaplatanios): Why do we need this?
-/// Kinds of the rules that a [`CustomRuleDefinition`] configures. Rules are retained closures that cannot be compared,
-/// so the registration of a named [`Composite`](crate::Composite) compares these kinds with those of the live
-/// definition with an equal key, which rejects a differently configured function with that key (e.g., one
-/// reconfigured with [`Composite::with_jvp_from_primal`](crate::Composite::with_jvp_from_primal) after its first
-/// call).
-#[derive(Clone, Debug, PartialEq, Eq)]
-pub(in crate::operations::composites) struct CustomRuleKinds {
-    /// Kind of the forward mode rule, if any.
-    jvp: Option<&'static str>,
-
-    /// Kind of the reverse mode rules, including whether their forward rule is deferred to the backward pass, if any.
-    vjp: Option<&'static str>,
-
-    /// Kind of batching that applies to calls.
-    batching: &'static str,
 }
 
 /// Transposes the source program of an unbatched backward-rule specialization with respect to the inputs at
