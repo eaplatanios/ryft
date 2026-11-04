@@ -17,13 +17,13 @@
 //! elementwise arithmetic. Backend operations such as StableHLO's [`add`](https://openxla.org/stablehlo/spec#add)
 //! require these input types and shapes to have already been aligned. Array inputs that carry partial sums over
 //! unreduced mesh axes are accepted only where the output remains a valid partial sum: negation preserves them, sums
-//! and differences require both inputs to be unreduced over the same axes, products permit one unreduced input when the
-//! other is reduced over those same axes, and division permits an unreduced numerator with a denominator reduced over
-//! those axes. Every other operation rejects such inputs. Refer to the documentation of each operation for the element
-//! types it supports. [`Neg`], [`Add`], [`Sub`], [`Mul`], [`Div`], and [`Rem`] are the fallible counterparts of the
-//! corresponding [`std::ops`] operators, which values additionally implement as panicking sugar. Ordinary integer
-//! arithmetic wraps at the element width for eager arrays and reports overflow for host primitives. Saturating
-//! subtraction instead clamps integer arrays and host integers to their numeric bounds.
+//! and differences require both inputs to be unreduced over the same axes, products pair each unreduced axis with a
+//! reduced peer while preserving shared reduced axes, and division requires a denominator reduced over every unreduced
+//! or reduced axis of its numerator. Every other operation rejects such inputs. Refer to the documentation of each
+//! operation for the element types it supports. [`Neg`], [`Add`], [`Sub`], [`Mul`], [`Div`], and [`Rem`] are the
+//! fallible counterparts of the corresponding [`std::ops`] operators, which values additionally implement as panicking
+//! sugar. Ordinary integer arithmetic wraps at the element width for eager arrays and reports overflow for host
+//! primitives. Saturating subtraction instead clamps integer arrays and host integers to their numeric bounds.
 //!
 //! Negation, addition, and subtraction are linear. Multiplication is linear in either input when the other one is
 //! known, and division is linear in its numerator when its denominator is known, so all of them can be transposed.
@@ -52,7 +52,9 @@ use crate::arrays::{
     NumericArrayElement, RealArrayElement, i1, i2, i4, u1, u2, u4,
 };
 use crate::contexts::StagingContext;
-use crate::differentiation::{DifferentiableType, DifferentiationDual, ElementwiseDerivativeAlignment};
+use crate::differentiation::{
+    DifferentiableType, DifferentiationDual, DifferentiationError, ElementwiseDerivativeAlignment,
+};
 use crate::macros::{
     check_count, check_types, define_elementwise_capability, define_elementwise_operation,
     dispatch_on_array_element_type, impl_array_elementwise_operation, impl_differentiable_elementwise_operation,
@@ -888,8 +890,8 @@ pub const MUL_OPERATION_NAME: &str = "mul";
 define_elementwise_operation!(
     @binary
     /// [`Operation`] that multiplies two numeric values elementwise, promoting their element types and broadcasting
-    /// their shapes. Its bilinear reduction-state rule permits one unreduced input only when the other input is reduced
-    /// over exactly the same mesh axes.
+    /// their shapes. On each mesh axis, an unreduced input requires the other input to be reduced over that axis.
+    /// Shared reduced axes are preserved, and two inputs unreduced over the same axis are rejected.
     MulOperation,
     MUL_OPERATION_NAME,
     Mul,
@@ -906,52 +908,35 @@ define_elementwise_operation!(
         let right_unreduced = input_types[1].unreduced_axes();
         let right_reduced = input_types[1].reduced_axes();
 
-        // An input unreduced over some axes is a partial sum still awaiting an all-reduce over them. The product of two
-        // partial sums is not a partial sum, so at most one input may be unreduced. The other must then be reduced over
-        // exactly those axes, and the product stays unreduced over them (its matching reduced marker is consumed when
-        // the reduced set is computed below).
-        let output_unreduced = match (left_unreduced.is_empty(), right_unreduced.is_empty()) {
-            (false, false) => {
-                return Err(TypeError::invalid(format!(
-                    "`{MUL_OPERATION_NAME}` cannot multiply two inputs that are both unreduced",
-                )));
-            }
-            (false, true) => {
-                if left_unreduced != right_reduced {
-                    return Err(TypeError::invalid(format!(
-                        "`{MUL_OPERATION_NAME}` requires the second input to be reduced over the axes \
-                         the first is unreduced over",
-                    )));
-                }
-                left_unreduced.clone()
-            }
-            (true, false) => {
-                if right_unreduced != left_reduced {
-                    return Err(TypeError::invalid(format!(
-                        "`{MUL_OPERATION_NAME}` requires the first input to be reduced over the axes \
-                         the second is unreduced over",
-                    )));
-                }
-                right_unreduced.clone()
-            }
-            (true, true) => BTreeSet::new(),
-        };
+        // Partial sums can be multiplied along independent axes, provided each peer is reduced over the other's
+        // unreduced axes. Two partial sums along the same axis would omit cross terms, so that case is rejected.
+        if !left_unreduced.is_disjoint(right_unreduced) {
+            return Err(TypeError::invalid(format!(
+                "`{MUL_OPERATION_NAME}` cannot multiply inputs that are unreduced over the same mesh axis",
+            )));
+        }
+        if !left_unreduced.is_subset(right_reduced) {
+            return Err(TypeError::invalid(format!(
+                "`{MUL_OPERATION_NAME}` requires the second input to be reduced over the axes \
+                 the first is unreduced over",
+            )));
+        }
+        if !right_unreduced.is_subset(left_reduced) {
+            return Err(TypeError::invalid(format!(
+                "`{MUL_OPERATION_NAME}` requires the first input to be reduced over the axes \
+                 the second is unreduced over",
+            )));
+        }
+        let output_unreduced = left_unreduced.union(right_unreduced).cloned().collect::<BTreeSet<_>>();
 
-        // Plain reduced axes must agree. The only one-sided reduced marker that is valid is the marker consumed by the
-        // partial-sum-times-reduced case above. A one-sided marker without a matching unreduced input would incorrectly
-        // propagate reduction state from only one input.
-        let mut output_reduced = if left_reduced == right_reduced {
-            left_reduced.clone()
-        } else if left_reduced.is_empty() && right_reduced == &output_unreduced {
-            right_reduced.clone()
-        } else if right_reduced.is_empty() && left_reduced == &output_unreduced {
-            left_reduced.clone()
-        } else {
+        // One-sided reduced markers are consumed only by matching partial sums. All other reduced markers must agree,
+        // and remain reduced in the result.
+        let output_reduced = left_reduced.difference(right_unreduced).cloned().collect::<BTreeSet<_>>();
+        if output_reduced != right_reduced.difference(left_unreduced).cloned().collect() {
             return Err(TypeError::invalid(format!(
                 "`{MUL_OPERATION_NAME}` inputs must be reduced over the same axes",
             )));
-        };
-        output_reduced.retain(|axis| !output_unreduced.contains(axis));
+        }
 
         // A non-empty result reduction state means some input was sharded, so the broadcast output (already stripped of
         // reduction axes) carries a sharding onto which the recomputed state is reattached. Otherwise, it is already
@@ -971,15 +956,64 @@ define_elementwise_operation!(
     check_data_types = [@numeric],
 );
 
-impl_differentiable_elementwise_operation! {
-    @binary
-    MulOperation,
-    jvp<C> where C::Value: Mul {
-        |(_, left_tangent), (right, _)| right.mul(&left_tangent)?;
-        |(left, _), (_, right_tangent)| left.mul(&right_tangent)?;
+impl_differentiable_operation! {
+    <T> MulOperation<T>,
+    jvp<C>
+    where
+        T: Type,
+        C::Type: DifferentiableType,
+        C::Operation: From<MulOperation<T>>,
+        C::Value: Add + Mul + ElementwiseDerivativeAlignment<C::Type>,
+    {
+        |operation, context, _driver, inputs| {
+            check_count!("input", inputs, 2, ProgramError);
+            let mut outputs = context.primal().bind(
+                operation.clone(),
+                Vec::new(),
+                &[inputs[0].primal().clone(), inputs[1].primal().clone()],
+            )?;
+            check_count!("output", outputs, 1, ProgramError);
+            let primal = outputs.remove(0);
+            let target = primal.r#type().tangent()?;
+            if inputs.iter().all(|input| input.tangent().is_zero()) {
+                return Ok(vec![DifferentiationDual::new(primal, MaybeZero::Zero(target))?]);
+            }
+            if target.is_zero_space() {
+                return Err(ProgramError::UnsupportedOperation {
+                    message: format!("`{MUL_OPERATION_NAME}` output type {target} has no tangent space"),
+                }.into());
+            }
+
+            // Bilinear inputs can have different reduction states, so coefficients preserve their own placement
+            // while widening to the output tangent's element representation. Multiplication broadcasts their shapes.
+            let coefficient = |value: &C::Value| -> Result<C::Value, DifferentiationError> {
+                context.primal_to_tangent(value.clone())?.align_coefficient(&target)
+            };
+            let left = inputs[0]
+                .tangent()
+                .as_value()
+                .map(|tangent| -> Result<_, DifferentiationError> {
+                    Ok(coefficient(inputs[1].primal())?.mul(tangent)?)
+                })
+                .transpose()?;
+            let right = inputs[1]
+                .tangent()
+                .as_value()
+                .map(|tangent| -> Result<_, DifferentiationError> {
+                    Ok(coefficient(inputs[0].primal())?.mul(tangent)?)
+                })
+                .transpose()?;
+            let tangent = match (left, right) {
+                (Some(left), Some(right)) => MaybeZero::Value(left.add(&right)?),
+                (Some(tangent), None) | (None, Some(tangent)) => MaybeZero::Value(tangent),
+                (None, None) => MaybeZero::Zero(target),
+            };
+            Ok(vec![DifferentiationDual::new(primal, tangent)?])
+        }
     },
     transpose<V, O>
     where
+        T: Type,
         V::Type: DifferentiableType,
         O: From<MulOperation<V::Type>>,
         Tracer<TracingContext<V, O>>: ElementwiseDerivativeAlignment<V::Type>,
@@ -1019,13 +1053,16 @@ impl_differentiable_elementwise_operation! {
                         }.into());
                     }
 
-                    // The coefficient is a primal value. Keep its reduction state when multiplying the dual
-                    // cotangent. Broadcasting and promotion happen in multiplication's own inference.
-                    let coefficient = inputs[known].as_known().unwrap();
+                    // The coefficient is a primal value. Keep its reduction state while matching the output
+                    // cotangent's element representation, then let multiplication broadcast their shapes.
+                    let coefficient = inputs[known]
+                        .as_known()
+                        .unwrap()
+                        .align_coefficient(cotangent.r#type().as_ref())?;
                     let mut contribution = context.stage_operation(
                         MulOperation::new(),
                         Vec::new(),
-                        &[coefficient.clone(), cotangent.clone()],
+                        &[coefficient, cotangent.clone()],
                     )?;
                     check_count!("output", contribution, 1, ProgramError);
                     MaybeZero::Value(contribution.remove(0).unalign_cotangent(&target)?)
@@ -1081,10 +1118,29 @@ impl std::ops::Mul<f64> for Array {
 
     fn mul(self, right: f64) -> Self::Output {
         // Scales every element by `right`, converting `right` into this array's element data type first so that scaling
-        // preserves the array's type (e.g., scaling an `f32` array does not promote it to `f64`).
-        let data_type = self.r#type().data_type();
+        // preserves its data type. The literal coefficient matches the array's memory and manual variation and is
+        // reduced over all of its reduction axes, so multiplying preserves pending and completed reductions.
+        let input_type = self.r#type();
+        let data_type = input_type.data_type();
+        let sharding = input_type
+            .sharding()
+            .map(|sharding| {
+                let reduced_axes =
+                    sharding.unreduced_axes().union(sharding.reduced_axes()).cloned().collect::<Vec<_>>();
+                sharding
+                    .with_dimensions(Vec::new())?
+                    .with_unreduced_axes(Vec::<String>::new())?
+                    .with_reduced_axes(reduced_axes)
+            })
+            .transpose()
+            .unwrap_or_else(|error| panic!("{error}"));
+        let factor_type = ArrayType::scalar(data_type)
+            .with_memory(input_type.memory())
+            .with_sharding(sharding)
+            .unwrap_or_else(|error| panic!("{error}"));
         let factor = dispatch_on_array_element_type!(data_type, |Element| {
-            Self::scalar(Element::from_real(right).unwrap_or_else(|error| panic!("{error}"))).unwrap()
+            Self::from_elements(factor_type, &[Element::from_real(right).unwrap_or_else(|error| panic!("{error}"))])
+                .unwrap()
         });
         Mul::mul(&self, &factor).unwrap_or_else(|error| panic!("{error}"))
     }
@@ -1142,70 +1198,155 @@ define_elementwise_operation!(
     /// [`Operation`] that divides two numeric values elementwise, promoting their element types and broadcasting their
     /// shapes. Integer division truncates toward zero. A zero integer divisor produces `-1` for signed integers or
     /// the maximum value for unsigned integers; signed minimum divided by `-1` wraps to itself. A numerator carrying
-    /// partial sums requires a denominator reduced over exactly those axes. Otherwise, reduced-axis markers must agree.
-    /// Denominators carrying partial sums are rejected.
+    /// partial sums requires a denominator reduced over those axes and every reduced axis of the numerator. The output
+    /// preserves both sets of numerator axes. Denominators carrying partial sums are rejected.
     DivOperation,
     DIV_OPERATION_NAME,
     Div,
     div,
     infer_array_types = |input_types: &[ArrayType]| {
-        // Division is linear only in its numerator. A partial sum can be divided by a value reduced
-        // over the same axes; the denominator itself must never carry partial sums.
+        // Division is linear only in its numerator. Each partial-sum axis requires a reduced denominator, while every
+        // other reduced axis must agree. The denominator itself must never carry partial sums.
         let numerator = &input_types[0];
         let denominator = &input_types[1];
         if !denominator.unreduced_axes().is_empty() {
             return Err(TypeError::invalid(format!("`{DIV_OPERATION_NAME}` denominator must not be unreduced")));
         }
+
         let unreduced = numerator.unreduced_axes();
-        if unreduced.is_empty() {
-            check_types!(@same_reduced_axes, DIV_OPERATION_NAME, input_types);
-            return Ok(vec![DivOperation::<ArrayType>::new().infer_elementwise_broadcast_type(input_types)?]);
-        }
-        if unreduced != denominator.reduced_axes() {
+        if !unreduced.is_subset(denominator.reduced_axes()) {
             return Err(TypeError::invalid(format!(
                 "`{DIV_OPERATION_NAME}` requires the denominator to be reduced over the axes the numerator \
                  is unreduced over",
             )));
         }
-        if !numerator.reduced_axes().is_empty() && numerator.reduced_axes() != denominator.reduced_axes() {
+
+        let reduced = numerator.reduced_axes();
+        let denominator_reduced = unreduced.union(reduced).cloned().collect::<BTreeSet<_>>();
+        if denominator.reduced_axes() != &denominator_reduced {
             return Err(TypeError::invalid(format!(
                 "`{DIV_OPERATION_NAME}` inputs must be reduced over the same axes",
             )));
         }
+
         let stripped = [numerator.without_reduction_axes(), denominator.without_reduction_axes()];
         let output = DivOperation::<ArrayType>::new().infer_elementwise_broadcast_type(&stripped)?;
+        if unreduced.is_empty() && reduced.is_empty() {
+            return Ok(vec![output]);
+        }
 
         // Non-empty reduction state guarantees that broadcasting retained a mesh.
         let sharding = output.sharding().unwrap().clone()
             .with_unreduced_axes(unreduced.clone())
+            .map_err(|error| TypeError::invalid(error.to_string()))?
+            .with_reduced_axes(reduced.clone())
             .map_err(|error| TypeError::invalid(error.to_string()))?;
         Ok(vec![output.with_sharding(sharding).map_err(|error| TypeError::invalid(error.to_string()))?])
     },
     check_data_types = [@numeric],
 );
 
-impl_differentiable_elementwise_operation! {
-    @binary
-    DivOperation,
+impl_differentiable_operation! {
+    <T> DivOperation<T>,
     jvp<C>
     where
-        C::Value: Neg + Mul + Div,
+        T: Type,
+        C::Type: DifferentiableType,
+        C::Value: Add + Neg + Mul + Div + ElementwiseDerivativeAlignment<C::Type>,
+        C::Operation: From<DivOperation<T>>,
     {
-        |(_, left_tangent), (right, _)| left_tangent.div(&right)?;
-        |(left, _), (right, right_tangent)| {
-            let coefficient = left.div(&right.mul(&right)?)?.neg()?;
-            coefficient.mul(&right_tangent)?
-        };
+        |operation, context, _driver, inputs| {
+            check_count!("input", inputs, 2, ProgramError);
+            let mut outputs = context.primal().bind(
+                operation.clone(),
+                Vec::new(),
+                &[inputs[0].primal().clone(), inputs[1].primal().clone()],
+            )?;
+            check_count!("output", outputs, 1, ProgramError);
+            let primal = outputs.remove(0);
+            let target = primal.r#type().tangent()?;
+            if inputs.iter().all(|input| input.tangent().is_zero()) {
+                return Ok(vec![DifferentiationDual::new(primal, MaybeZero::Zero(target))?]);
+            }
+            if target.is_zero_space() {
+                return Err(ProgramError::UnsupportedOperation {
+                    message: format!("`{DIV_OPERATION_NAME}` output type {target} has no tangent space"),
+                }.into());
+            }
+
+            // A reduced denominator scales the numerator's partial sums. Keep each coefficient's reduction state
+            // while widening its element type before arithmetic. Squaring a narrow denominator first can underflow
+            // even when the promoted directional derivative is finite.
+            let coefficient = |value: &C::Value| -> Result<C::Value, DifferentiationError> {
+                context.primal_to_tangent(value.clone())?.align_coefficient(&target)
+            };
+            let numerator = inputs[0]
+                .tangent()
+                .as_value()
+                .map(|tangent| -> Result<_, DifferentiationError> {
+                    Ok(tangent.div(&coefficient(inputs[1].primal())?)?)
+                })
+                .transpose()?;
+            let denominator = inputs[1]
+                .tangent()
+                .as_value()
+                .map(|tangent| -> Result<_, DifferentiationError> {
+                    let numerator = coefficient(inputs[0].primal())?;
+                    let denominator = coefficient(inputs[1].primal())?;
+                    Ok(numerator.div(&denominator.mul(&denominator)?)?.neg()?.mul(tangent)?)
+                })
+                .transpose()?;
+            let tangent = match (numerator, denominator) {
+                (Some(numerator), Some(denominator)) => MaybeZero::Value(numerator.add(&denominator)?),
+                (Some(tangent), None) | (None, Some(tangent)) => MaybeZero::Value(tangent),
+                (None, None) => MaybeZero::Zero(target),
+            };
+            Ok(vec![DifferentiationDual::new(primal, tangent)?])
+        }
     },
     transpose<V, O>
     where
+        T: Type,
         V::Type: DifferentiableType,
         O: From<DivOperation<V::Type>>,
         Tracer<TracingContext<V, O>>: ElementwiseDerivativeAlignment<V::Type>,
     {
-        // Transposition accepts a linear numerator and a known denominator.
-        [numerator = @linear, denominator = @known] =>
-            |output_cotangent| output_cotangent.binary(&denominator, DivOperation::new());
+        |_operation, context, _driver, inputs, outputs, accumulators| {
+            check_count!("input", inputs, 2, ProgramError);
+            check_count!("output", outputs, 1, ProgramError);
+            check_count!("accumulator", accumulators, 2, DifferentiationError);
+            let numerator_is_linear = inputs[0].is_unknown();
+            let denominator_is_linear = inputs[1].is_unknown();
+            if !numerator_is_linear || denominator_is_linear {
+                return Err(ProgramError::UnsupportedOperation {
+                    message: format!(
+                        "operation `{}` does not support transposition for input pattern \
+                         [numerator = {}, denominator = {}]",
+                        DIV_OPERATION_NAME,
+                        if numerator_is_linear { "linear" } else { "known" },
+                        if denominator_is_linear { "linear" } else { "known" },
+                    ),
+                }.into());
+            }
+            let target = inputs[0].r#type().cotangent()?;
+            let contribution = match &outputs[0] {
+                MaybeZero::Zero(_) => MaybeZero::Zero(target),
+                MaybeZero::Value(cotangent) => {
+                    if target.is_zero_space() {
+                        return Err(ProgramError::UnsupportedOperation {
+                            message: format!(
+                                "linear input `numerator` of operation `{DIV_OPERATION_NAME}` has no cotangent space",
+                            ),
+                        }.into());
+                    }
+                    let denominator = inputs[1].as_known().unwrap();
+                    let denominator = denominator.align_coefficient(cotangent.r#type().as_ref())?;
+                    let contribution = cotangent.binary(&denominator, DivOperation::new());
+                    MaybeZero::Value(contribution.unalign_cotangent(&target)?)
+                }
+            };
+            accumulators[0].accumulate(context, contribution)
+        }
     },
 }
 
@@ -1694,15 +1835,15 @@ mod tests {
 
     use approx::assert_abs_diff_eq;
     use half::{bf16, f16};
-    use indoc::indoc;
+    use indoc::{formatdoc, indoc};
     use num_complex::Complex as ComplexNumber;
     use pretty_assertions::assert_eq;
 
     use crate::arrays::{
         Array, ArrayIrBatchingPolicy, ArrayIrOperation, ArrayIrType, ArrayIrValue, ArrayOperation, ArrayType, DataType,
         Dimension, DimensionBounds, DimensionError, DimensionOperation, DimensionType, DimensionValue, Layout,
-        LogicalMesh, MAX_DIMENSION_EXTENT, MeshAxis, MeshAxisType, Shape, Sharding, ShardingDimension, StridedLayout,
-        f4e2m1fn, f8e4m3fn, f8e8m0fnu, i2, i4,
+        LogicalMesh, MAX_DIMENSION_EXTENT, Memory, MeshAxis, MeshAxisType, Shape, Sharding, ShardingDimension,
+        StridedLayout, f4e2m1fn, f8e4m3fn, f8e8m0fnu, i2, i4,
     };
     use crate::axes::NamedAxis;
     use crate::batching::{BatchAxis, BatchAxisSpecification, BatchingTracer, batch};
@@ -1727,6 +1868,19 @@ mod tests {
     use crate::tracing::Trace;
 
     use super::*;
+
+    /// Returns a rank-0 `f64` type carrying the specified pending and completed reductions.
+    fn f64_reduction_type(mesh: &LogicalMesh, unreduced: &[&str], reduced: &[&str]) -> ArrayType {
+        ArrayType::scalar(DataType::F64)
+            .with_sharding(
+                Sharding::replicated(mesh.clone(), 0)
+                    .with_unreduced_axes(unreduced.iter().copied())
+                    .unwrap()
+                    .with_reduced_axes(reduced.iter().copied())
+                    .unwrap(),
+            )
+            .unwrap()
+    }
 
     #[test]
     fn test_sign_type_inference() {
@@ -2731,7 +2885,7 @@ mod tests {
         let (output, program) = TracingContext::<Array, ArrayOperation<Array>>::trace_with_named_axes(
             |(left, right)| Add::add(&left, &right),
             (invariant, varying.clone()),
-            vec![("devices".to_string(), NamedAxis::Mesh { axis: 0, size: 2, mesh })],
+            vec![("devices".to_string(), NamedAxis::Mesh { axis: 0, size: 2, mesh, checks_manual_variation: true })],
         )
         .unwrap();
         assert_eq!(output, varying);
@@ -3764,12 +3918,12 @@ mod tests {
         assert_eq!(output[0].sharding().unwrap().unreduced_axes(), &BTreeSet::from(["x".to_string()]));
         assert_eq!(output[0].sharding().unwrap().reduced_axes(), &BTreeSet::new());
 
-        // Two inputs both unreduced cannot be multiplied (the product of two partial sums is not a partial sum).
+        // Two inputs unreduced over the same axis cannot be multiplied because their product would omit cross terms.
         check_operation_type_inference!(
             operation = MulOperation::<ArrayType>::new(),
             cases = [{
                 input_types = [unreduced_x.clone(), unreduced_x.clone()],
-                error = format!("`{MUL_OPERATION_NAME}` cannot multiply two inputs that are both unreduced"),
+                error = format!("`{MUL_OPERATION_NAME}` cannot multiply inputs that are unreduced over the same mesh axis"),
             }],
         );
 
@@ -3800,6 +3954,53 @@ mod tests {
                 input_types = [reduced_x.clone(), vector_type.clone()],
                 error = format!("`{MUL_OPERATION_NAME}` inputs must be reduced over the same axes"),
             }],
+        );
+    }
+
+    #[test]
+    fn test_mul_type_inference_mixed_reduction_axes() {
+        let mesh = LogicalMesh::new(vec![
+            MeshAxis::new("x", 2, MeshAxisType::Explicit).unwrap(),
+            MeshAxis::new("y", 2, MeshAxisType::Explicit).unwrap(),
+            MeshAxis::new("z", 2, MeshAxisType::Explicit).unwrap(),
+        ])
+        .unwrap();
+        let partial = f64_reduction_type(&mesh, &["x"], &["y"]);
+        let reduced = f64_reduction_type(&mesh, &[], &["x", "y"]);
+        let independent_left = f64_reduction_type(&mesh, &["x"], &["y", "z"]);
+        let independent_right = f64_reduction_type(&mesh, &["y"], &["x", "z"]);
+        let independent_output = f64_reduction_type(&mesh, &["x", "y"], &["z"]);
+        let missing_shared_reduced = f64_reduction_type(&mesh, &[], &["x"]);
+        check_operation_type_inference!(
+            operation = MulOperation::<ArrayType>::new(),
+            cases = [
+                {
+                    input_types = [partial.clone(), reduced.clone()],
+                    output_types = [partial.clone()],
+                },
+                {
+                    input_types = [reduced, partial.clone()],
+                    output_types = [partial.clone()],
+                },
+                {
+                    input_types = [independent_left.clone(), independent_right.clone()],
+                    output_types = [independent_output.clone()],
+                },
+                {
+                    input_types = [independent_right, independent_left],
+                    output_types = [independent_output],
+                },
+                {
+                    input_types = [partial.clone(), missing_shared_reduced],
+                    error = format!("`{MUL_OPERATION_NAME}` inputs must be reduced over the same axes"),
+                },
+                {
+                    input_types = [partial.clone(), partial],
+                    error = format!(
+                        "`{MUL_OPERATION_NAME}` cannot multiply inputs that are unreduced over the same mesh axis",
+                    ),
+                },
+            ],
         );
     }
 
@@ -3884,6 +4085,50 @@ mod tests {
     }
 
     #[test]
+    fn test_mul_differentiation_mixed_reduction_axes() {
+        let mesh = LogicalMesh::new(vec![
+            MeshAxis::new("x", 2, MeshAxisType::Explicit).unwrap(),
+            MeshAxis::new("y", 2, MeshAxisType::Explicit).unwrap(),
+            MeshAxis::new("z", 2, MeshAxisType::Explicit).unwrap(),
+        ])
+        .unwrap();
+        let left_type = f64_reduction_type(&mesh, &["x"], &["y", "z"]);
+        let right_type = f64_reduction_type(&mesh, &["y"], &["x", "z"]);
+        let output_type = f64_reduction_type(&mesh, &["x", "y"], &["z"]);
+        let left = Array::from_elements(left_type.clone(), &[6f64]).unwrap();
+        let right = Array::from_elements(right_type.clone(), &[2f64]).unwrap();
+        check_operation_differentiation!(
+            @approx(step = 1e-6, epsilon = 1e-6),
+            operation = MulOperation::new(),
+            cases = [{
+                primals = [left.clone(), right.clone()],
+                tangents = [
+                    Array::from_elements(left_type.clone(), &[3f64]).unwrap(),
+                    Array::from_elements(right_type.clone(), &[4f64]).unwrap(),
+                ],
+                primal_outputs = [Array::from_elements(output_type.clone(), &[12f64]).unwrap()],
+                tangent_outputs = [Array::from_elements(output_type.clone(), &[30f64]).unwrap()],
+                jvp = formatdoc! {"
+                    lambda %0:{left_type}, %1:{right_type}, %2:{left_type}, %3:{right_type} .
+                    let %4:{output_type} = mul %0 %1
+                        %5:{output_type} = mul %1 %2
+                        %6:{output_type} = mul %0 %3
+                        %7:{output_type} = add %5 %6
+                    in (%4, %7)"},
+            }],
+        );
+        let (primal, pullback) = differentiate_at((left, right)).vjp(|(left, right)| left.mul(&right)).unwrap();
+        assert_eq!(primal, Array::from_elements(output_type.clone(), &[12f64]).unwrap());
+        assert_eq!(
+            pullback.apply(Array::from_elements(output_type.cotangent().unwrap(), &[5f64]).unwrap()),
+            Ok((
+                MaybeZero::Value(Array::from_elements(left_type.cotangent().unwrap(), &[10f64]).unwrap()),
+                MaybeZero::Value(Array::from_elements(right_type.cotangent().unwrap(), &[30f64]).unwrap()),
+            )),
+        );
+    }
+
+    #[test]
     fn test_mul_differentiation_complex() {
         // Complex arrays differentiate through the same rule: the eager JVP computes `l·dr + dl·r` elementwise over
         // `c128` payloads, and the reverse mode pullback applies the bilinear (conjugation-free) transpose pairing.
@@ -3907,6 +4152,20 @@ mod tests {
         let (left_cotangent, right_cotangent) = pullback.apply(Array::vector(vec![cotangent]).unwrap()).unwrap();
         assert_eq!(left_cotangent, MaybeZero::Value(Array::vector(vec![cotangent * right]).unwrap()));
         assert_eq!(right_cotangent, MaybeZero::Value(Array::vector(vec![cotangent * left]).unwrap()));
+    }
+
+    #[test]
+    fn test_mul_differentiation_mixed_precision_coefficients() {
+        let small = 2f32.powi(-13);
+        let left = Array::scalar(small).unwrap();
+        let right = Array::scalar(f16::from_f32(small)).unwrap();
+        assert_eq!(
+            differentiate_at((left, right))
+                .jvp((Array::scalar(0f32).unwrap(), Array::scalar(f16::from_f32(small)).unwrap()), |(left, right)| {
+                    left.mul(&right)
+                },),
+            Ok((Array::scalar(small * small).unwrap(), Array::scalar(small * small).unwrap())),
+        );
     }
 
     #[test]
@@ -3975,12 +4234,80 @@ mod tests {
     }
 
     #[test]
+    fn test_mul_transposition_mixed_reduction_axes() {
+        let mesh = LogicalMesh::new(vec![
+            MeshAxis::new("x", 2, MeshAxisType::Explicit).unwrap(),
+            MeshAxis::new("y", 2, MeshAxisType::Explicit).unwrap(),
+        ])
+        .unwrap();
+        let partial_type = f64_reduction_type(&mesh, &["x"], &["y"]);
+        let reduced_type = f64_reduction_type(&mesh, &[], &["x", "y"]);
+        let partial_cotangent_type = partial_type.cotangent().unwrap();
+        let reduced_cotangent_type = reduced_type.cotangent().unwrap();
+        check_operation_transposition!(
+            @exact,
+            operation = MulOperation::new(),
+            cases = [
+                {
+                    inputs = [
+                        (@linear(type = partial_type.clone())),
+                        (@known, Array::from_elements(reduced_type.clone(), &[2f64]).unwrap()),
+                    ],
+                    output_cotangents = [Array::from_elements(partial_cotangent_type.clone(), &[5f64]).unwrap()],
+                    input_cotangents = [Array::from_elements(partial_cotangent_type.clone(), &[10f64]).unwrap()],
+                    pullback = formatdoc! {"
+                        lambda %0:{partial_cotangent_type}, %1:{reduced_type} .
+                        let %2:{partial_cotangent_type} = mul %1 %0
+                        in (%2)"},
+                },
+                {
+                    inputs = [
+                        (@known, Array::from_elements(partial_type.clone(), &[6f64]).unwrap()),
+                        (@linear(type = reduced_type.clone())),
+                    ],
+                    output_cotangents = [Array::from_elements(partial_cotangent_type.clone(), &[5f64]).unwrap()],
+                    input_cotangents = [Array::from_elements(reduced_cotangent_type.clone(), &[30f64]).unwrap()],
+                    pullback = formatdoc! {"
+                        lambda %0:{partial_cotangent_type}, %1:{partial_type} .
+                        let %2:{reduced_cotangent_type} = mul %1 %0
+                        in (%2)"},
+                },
+            ],
+        );
+    }
+
+    #[test]
     fn test_array_mul() {
         let vector = Array::vector(vec![1.0, 2.0, 3.0]).unwrap();
         assert_eq!(Mul::mul(&vector, &vector).unwrap(), Array::vector(vec![1.0, 4.0, 9.0]).unwrap());
         // Scaling by an `f64` preserves the array's element data type.
         let scaled = Array::vector(vec![1.0f32, 2.0]).unwrap() * 2.0;
         assert_eq!(scaled, Array::vector(vec![2.0f32, 4.0]).unwrap());
+    }
+
+    #[test]
+    fn test_array_mul_scalar_preserves_reduction_state_and_placement() {
+        let mesh = LogicalMesh::new(vec![
+            MeshAxis::new("varying", 2, MeshAxisType::Manual).unwrap(),
+            MeshAxis::new("partial", 2, MeshAxisType::Explicit).unwrap(),
+            MeshAxis::new("reduced", 2, MeshAxisType::Explicit).unwrap(),
+            MeshAxis::new("sharded", 2, MeshAxisType::Explicit).unwrap(),
+        ])
+        .unwrap();
+        let sharding = Sharding::new(mesh, vec![ShardingDimension::sharded(["sharded"])])
+            .unwrap()
+            .with_unreduced_axes(["partial"])
+            .unwrap()
+            .with_reduced_axes(["reduced"])
+            .unwrap()
+            .with_varying_manual_axes(["varying"])
+            .unwrap();
+        let input_type = ArrayType::new_static(DataType::F32, [2])
+            .with_memory(Memory::Host { pinned: true })
+            .with_sharding(sharding)
+            .unwrap();
+        let input = Array::from_elements(input_type.clone(), &[2f32, 3.]).unwrap();
+        assert_eq!(input * 2.0, Array::from_elements(input_type, &[4f32, 6.]).unwrap());
     }
 
     #[test]
@@ -4005,14 +4332,14 @@ mod tests {
         assert!(matches!(
             Mul::mul(&left, &left),
             Err(ProgramError::Type(TypeError::Invalid { message, .. }))
-                if message == "`mul` cannot multiply two inputs that are both unreduced",
+                if message == "`mul` cannot multiply inputs that are unreduced over the same mesh axis",
         ));
         let empty_type = left.r#type().into_owned().with_shape(Shape::new(vec![Dimension::Static(0)]));
         let empty = Array::from_elements(empty_type, &[] as &[f32]).unwrap();
         assert!(matches!(
             Mul::mul(&empty, &empty),
             Err(ProgramError::Type(TypeError::Invalid { message, .. }))
-                if message == "`mul` cannot multiply two inputs that are both unreduced",
+                if message == "`mul` cannot multiply inputs that are unreduced over the same mesh axis",
         ));
     }
 
@@ -4156,6 +4483,49 @@ mod tests {
     }
 
     #[test]
+    fn test_div_type_inference_mixed_reduction_axes() {
+        let mesh = LogicalMesh::new(vec![
+            MeshAxis::new("x", 2, MeshAxisType::Explicit).unwrap(),
+            MeshAxis::new("y", 2, MeshAxisType::Explicit).unwrap(),
+            MeshAxis::new("z", 2, MeshAxisType::Explicit).unwrap(),
+        ])
+        .unwrap();
+        let numerator = f64_reduction_type(&mesh, &["x"], &["y"]);
+        let denominator = f64_reduction_type(&mesh, &[], &["x", "y"]);
+        let missing_shared_reduced = f64_reduction_type(&mesh, &[], &["x"]);
+        let missing_partial_axis = f64_reduction_type(&mesh, &[], &["y"]);
+        let extra_reduced = f64_reduction_type(&mesh, &[], &["x", "y", "z"]);
+        check_operation_type_inference!(
+            operation = DivOperation::<ArrayType>::new(),
+            cases = [
+                {
+                    input_types = [numerator.clone(), denominator],
+                    output_types = [numerator.clone()],
+                },
+                {
+                    input_types = [numerator.clone(), missing_shared_reduced],
+                    error = format!("`{DIV_OPERATION_NAME}` inputs must be reduced over the same axes"),
+                },
+                {
+                    input_types = [numerator.clone(), missing_partial_axis],
+                    error = format!(
+                        "`{DIV_OPERATION_NAME}` requires the denominator to be reduced over the axes the numerator \
+                         is unreduced over",
+                    ),
+                },
+                {
+                    input_types = [numerator.clone(), extra_reduced],
+                    error = format!("`{DIV_OPERATION_NAME}` inputs must be reduced over the same axes"),
+                },
+                {
+                    input_types = [numerator.clone(), numerator],
+                    error = format!("`{DIV_OPERATION_NAME}` denominator must not be unreduced"),
+                },
+            ],
+        );
+    }
+
+    #[test]
     fn test_div_interpretation() {
         let operation = DivOperation::<ArrayType>::new();
 
@@ -4243,6 +4613,53 @@ mod tests {
     }
 
     #[test]
+    fn test_div_differentiation_mixed_reduction_axes() {
+        let mesh = LogicalMesh::new(vec![
+            MeshAxis::new("x", 2, MeshAxisType::Explicit).unwrap(),
+            MeshAxis::new("y", 2, MeshAxisType::Explicit).unwrap(),
+        ])
+        .unwrap();
+        let numerator_type = f64_reduction_type(&mesh, &["x"], &["y"]);
+        let denominator_type = f64_reduction_type(&mesh, &[], &["x", "y"]);
+        let numerator = Array::from_elements(numerator_type.clone(), &[6f64]).unwrap();
+        let denominator = Array::from_elements(denominator_type.clone(), &[2f64]).unwrap();
+        check_operation_differentiation!(
+            @approx(step = 1e-6, epsilon = 1e-6),
+            operation = DivOperation::new(),
+            cases = [{
+                primals = [numerator.clone(), denominator.clone()],
+                tangents = [
+                    Array::from_elements(numerator_type.clone(), &[3f64]).unwrap(),
+                    Array::from_elements(denominator_type.clone(), &[4f64]).unwrap(),
+                ],
+                primal_outputs = [Array::from_elements(numerator_type.clone(), &[3f64]).unwrap()],
+                tangent_outputs = [Array::from_elements(numerator_type.clone(), &[-4.5f64]).unwrap()],
+                jvp = formatdoc! {"
+                    lambda %0:{numerator_type}, %1:{denominator_type}, %2:{numerator_type}, %3:{denominator_type} .
+                    let %4:{numerator_type} = div %0 %1
+                        %5:{numerator_type} = div %2 %1
+                        %6:{denominator_type} = mul %1 %1
+                        %7:{numerator_type} = div %0 %6
+                        %8:{numerator_type} = neg %7
+                        %9:{numerator_type} = mul %8 %3
+                        %10:{numerator_type} = add %5 %9
+                    in (%4, %10)"},
+            }],
+        );
+        let (primal, pullback) = differentiate_at((numerator, denominator))
+            .vjp(|(numerator, denominator)| numerator.div(&denominator))
+            .unwrap();
+        assert_eq!(primal, Array::from_elements(numerator_type.clone(), &[3f64]).unwrap());
+        assert_eq!(
+            pullback.apply(Array::from_elements(numerator_type.cotangent().unwrap(), &[8f64]).unwrap()),
+            Ok((
+                MaybeZero::Value(Array::from_elements(numerator_type.cotangent().unwrap(), &[4f64]).unwrap()),
+                MaybeZero::Value(Array::from_elements(denominator_type.cotangent().unwrap(), &[-12f64]).unwrap()),
+            )),
+        );
+    }
+
+    #[test]
     fn test_div_differentiation_preserves_small_tangents() {
         let context = EagerContext::<Array, ArrayOperation<Array>>::new();
         let smallest_positive = f64::from_bits(1);
@@ -4272,6 +4689,142 @@ mod tests {
             .unwrap();
         assert_eq!(primal, Array::scalar(2.0f32).unwrap().convert_element_type(DataType::F8E8M0FNU).unwrap());
         assert_eq!(tangent, Array::scalar(-0.5f32).unwrap());
+    }
+
+    #[test]
+    fn test_div_differentiation_mixed_precision_coefficients() {
+        // The denominator's square underflows in f16, while both the f32 primal and directional derivative are exact.
+        let small = 2f32.powi(-13);
+        let mesh = LogicalMesh::new(vec![
+            MeshAxis::new("x", 2, MeshAxisType::Explicit).unwrap(),
+            MeshAxis::new("y", 2, MeshAxisType::Explicit).unwrap(),
+        ])
+        .unwrap();
+        for (numerator_type, denominator_type) in [
+            (ArrayType::scalar(DataType::F32), ArrayType::scalar(DataType::F16)),
+            (
+                f64_reduction_type(&mesh, &["x"], &["y"]).with_data_type(DataType::F32),
+                f64_reduction_type(&mesh, &[], &["x", "y"]).with_data_type(DataType::F16),
+            ),
+        ] {
+            let numerator = Array::from_elements(numerator_type.clone(), &[small]).unwrap();
+            let denominator = Array::from_elements(denominator_type.clone(), &[f16::from_f32(small)]).unwrap();
+            assert_eq!(
+                differentiate_at((numerator.clone(), denominator.clone())).jvp(
+                    (
+                        Array::from_elements(numerator_type.clone(), &[0f32]).unwrap(),
+                        Array::from_elements(denominator_type.clone(), &[f16::from_f32(small)]).unwrap(),
+                    ),
+                    |(numerator, denominator)| numerator.div(&denominator),
+                ),
+                Ok((
+                    Array::from_elements(numerator_type.clone(), &[1f32]).unwrap(),
+                    Array::from_elements(numerator_type.clone(), &[-1f32]).unwrap(),
+                )),
+            );
+
+            let (_, pullback) = differentiate_at((numerator, denominator))
+                .vjp(|(numerator, denominator)| numerator.div(&denominator))
+                .unwrap();
+            assert_eq!(
+                pullback.apply(Array::from_elements(numerator_type.cotangent().unwrap(), &[small]).unwrap()),
+                Ok((
+                    MaybeZero::Value(Array::from_elements(numerator_type.cotangent().unwrap(), &[1f32]).unwrap()),
+                    MaybeZero::Value(
+                        Array::from_elements(denominator_type.cotangent().unwrap(), &[f16::from_f32(-1.0)]).unwrap(),
+                    ),
+                )),
+            );
+        }
+    }
+
+    #[test]
+    fn test_div_differentiation_promotes_extreme_mixed_precision_coefficients() {
+        // Squaring in f32 overflows at 2^80 and underflows at 2^-80. The promoted f64 computation is exact in both
+        // cases, including the denominator's f32 cotangent.
+        for exponent in [80, -80] {
+            let numerator = Array::scalar(2f64.powi(2 * exponent)).unwrap();
+            let denominator = Array::scalar(2f32.powi(exponent)).unwrap();
+            assert_eq!(
+                differentiate_at((numerator.clone(), denominator.clone()))
+                    .jvp((Array::scalar(0f64).unwrap(), Array::scalar(1f32).unwrap()), |(numerator, denominator)| {
+                        numerator.div(&denominator)
+                    },),
+                Ok((Array::scalar(2f64.powi(exponent)).unwrap(), Array::scalar(-1f64).unwrap())),
+            );
+
+            let (_, pullback) = differentiate_at((numerator, denominator))
+                .vjp(|(numerator, denominator)| numerator.div(&denominator))
+                .unwrap();
+            assert_eq!(
+                pullback.apply(Array::scalar(1f64).unwrap()),
+                Ok((
+                    MaybeZero::Value(Array::scalar(2f64.powi(-exponent)).unwrap()),
+                    MaybeZero::Value(Array::scalar(-1f32).unwrap()),
+                )),
+            );
+        }
+    }
+
+    #[test]
+    fn test_div_differentiation_broadcasts_mixed_precision_and_reduction_axes() {
+        let mesh = LogicalMesh::new(vec![
+            MeshAxis::new("x", 2, MeshAxisType::Explicit).unwrap(),
+            MeshAxis::new("y", 2, MeshAxisType::Explicit).unwrap(),
+        ])
+        .unwrap();
+        let numerator_type = ArrayType::new_static(DataType::F64, [2, 1])
+            .with_sharding(
+                Sharding::replicated(mesh.clone(), 2)
+                    .with_unreduced_axes(["x"])
+                    .unwrap()
+                    .with_reduced_axes(["y"])
+                    .unwrap(),
+            )
+            .unwrap();
+        let denominator_type = ArrayType::new_static(DataType::F32, [1, 2])
+            .with_sharding(Sharding::replicated(mesh, 2).with_reduced_axes(["x", "y"]).unwrap())
+            .unwrap();
+        let output_type = numerator_type.clone().with_shape(vec![2usize, 2]);
+        let numerator = Array::from_elements(numerator_type.clone(), &[8f64, 16.]).unwrap();
+        let denominator = Array::from_elements(denominator_type.clone(), &[2f32, 4.]).unwrap();
+        assert_eq!(
+            differentiate_at((numerator.clone(), denominator.clone())).jvp(
+                (
+                    Array::from_elements(numerator_type.clone(), &[2f64, 4.]).unwrap(),
+                    Array::from_elements(denominator_type.clone(), &[1f32, 2.]).unwrap(),
+                ),
+                |(numerator, denominator)| numerator.div(&denominator),
+            ),
+            Ok((
+                Array::from_elements(output_type.clone(), &[4f64, 2., 8., 4.]).unwrap(),
+                Array::from_elements(output_type.clone(), &[-1f64, -0.5, -2., -1.]).unwrap(),
+            )),
+        );
+
+        let (_, pullback) = differentiate_at((numerator, denominator))
+            .vjp(|(numerator, denominator)| numerator.div(&denominator))
+            .unwrap();
+        assert_eq!(
+            pullback.apply(Array::from_elements(output_type.cotangent().unwrap(), &[1f64; 4]).unwrap()),
+            Ok((
+                MaybeZero::Value(Array::from_elements(numerator_type.cotangent().unwrap(), &[0.75f64, 0.75]).unwrap(),),
+                MaybeZero::Value(Array::from_elements(denominator_type.cotangent().unwrap(), &[-6f32, -1.5]).unwrap(),),
+            )),
+        );
+    }
+
+    #[test]
+    fn test_div_differentiation_mixed_precision_second_derivatives() {
+        // Differentiating the denominator gradient -x/y^2 gives -1/y^2 with respect to x and 2x/y^3 with respect to y.
+        assert_eq!(
+            differentiate_at((Array::scalar(8f64).unwrap(), Array::scalar(2f32).unwrap())).gradient(|inputs| {
+                let (_, denominator_gradient) =
+                    differentiate_at(inputs).gradient(|(numerator, denominator)| Ok(numerator.div(&denominator)?))?;
+                Ok(denominator_gradient)
+            }),
+            Ok((Array::scalar(-0.25f64).unwrap(), Array::scalar(2f32).unwrap())),
+        );
     }
 
     #[test]
@@ -4357,6 +4910,34 @@ mod tests {
                 ],
                 output_cotangents = [Array::from_elements(unreduced.clone(), &[8.0f64]).unwrap()],
                 input_cotangents = [Array::from_elements(unreduced, &[2.0f64]).unwrap()],
+            }],
+        );
+    }
+
+    #[test]
+    fn test_div_transposition_mixed_reduction_axes() {
+        let mesh = LogicalMesh::new(vec![
+            MeshAxis::new("x", 2, MeshAxisType::Explicit).unwrap(),
+            MeshAxis::new("y", 2, MeshAxisType::Explicit).unwrap(),
+        ])
+        .unwrap();
+        let numerator_type = f64_reduction_type(&mesh, &["x"], &["y"]);
+        let denominator_type = f64_reduction_type(&mesh, &[], &["x", "y"]);
+        let cotangent_type = numerator_type.cotangent().unwrap();
+        check_operation_transposition!(
+            @exact,
+            operation = DivOperation::new(),
+            cases = [{
+                inputs = [
+                    (@linear(type = numerator_type)),
+                    (@known, Array::from_elements(denominator_type.clone(), &[4f64]).unwrap()),
+                ],
+                output_cotangents = [Array::from_elements(cotangent_type.clone(), &[8f64]).unwrap()],
+                input_cotangents = [Array::from_elements(cotangent_type.clone(), &[2f64]).unwrap()],
+                pullback = formatdoc! {"
+                    lambda %0:{cotangent_type}, %1:{denominator_type} .
+                    let %2:{cotangent_type} = div %0 %1
+                    in (%2)"},
             }],
         );
     }

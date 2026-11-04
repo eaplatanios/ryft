@@ -1,5 +1,5 @@
 //! Contains shared differentiation scaffolding for [`ElementwiseOperation`](crate::ElementwiseOperation)s. Elementwise
-//! arithmetic rules all follow the same shape. They first compute the primal through the operation's own value-level
+//! arithmetic rules follow a common shape. They first compute the primal through the operation's own value-level
 //! capability. Then, they resolve the tangent target type of the primal output, convert and broadcast every live input
 //! tangent (and any primal coefficients) into that widened differential representation, and combine the per-input
 //! contributions. Finally, they pair the primal with the combined tangent. This module owns that scaffolding
@@ -8,6 +8,11 @@
 //! (i.e., the primal computation and the per-input tangent terms), and the [`ElementwiseDerivativeAlignment`] trait
 //! those rules (and the broadcasting, selection, and reduction rules) use to align derivative contributions between
 //! input types and the common type inferred for an implicitly broadcasting result.
+//!
+//! Bilinear rules can use [`ElementwiseDerivativeAlignment::align_coefficient`] to promote a coefficient's element
+//! representation while preserving its own shape, placement, manual variation, and reduction state. This keeps
+//! intermediate arithmetic in the output's differential precision without turning a reduced coefficient into a
+//! partial sum.
 
 use crate::arrays::{ArrayType, DataType, Dimension};
 use crate::contexts::Context;
@@ -21,12 +26,19 @@ use crate::operations::{
 use crate::programs::{MaybeZero, Operation, ProgramError, TypeError, Typed, Value};
 
 /// [`Value`] whose derivative contributions can be _aligned_ with the common [`Type`](crate::Type) inferred for an
-/// implicitly broadcasting elementwise result and _unaligned_ back to an input type. The two methods form an adjoint
-/// pair: [`align_tangent`](Self::align_tangent) applies the implicit element-type promotion, broadcast, and resharding
-/// an [`ElementwiseOperation`](crate::ElementwiseOperation) performs on an input, and
-/// [`unalign_cotangent`](Self::unalign_cotangent) applies the adjoint of that linear map
-/// (i.e., demotion, sum-reduction over broadcasting axes, and the reverse reshard).
+/// implicitly broadcasting elementwise result and _unaligned_ back to an input type. Tangent alignment and cotangent
+/// unalignment form an adjoint pair. [`align_tangent`](Self::align_tangent) applies the implicit element-type promotion,
+/// broadcast, and resharding of an [`ElementwiseOperation`](crate::ElementwiseOperation).
+/// [`unalign_cotangent`](Self::unalign_cotangent) applies the adjoint of that linear map (i.e., demotion, sum-reduction
+/// over broadcasting axes, and the reverse reshard).
 pub trait ElementwiseDerivativeAlignment<T: DifferentiableType>: Value<Type = T> {
+    /// Converts this primal coefficient to `target`'s element representation while preserving its own shape,
+    /// placement, manual variation, and reduction state. Unlike tangent alignment, this function does not broadcast
+    /// or reshard the coefficient. Element conversion may clear a storage layout that cannot survive that conversion.
+    /// Binary derivative rules use this before composing coefficients so intermediate arithmetic uses the promoted
+    /// differential representation without changing the input's reduction semantics.
+    fn align_coefficient(&self, target: &T) -> Result<Self, DifferentiationError>;
+
     /// Aligns this tangent [`Value`] (or primal coefficient) with `target`, converting and broadcasting it
     /// into that [`Type`](crate::Type).
     ///
@@ -60,6 +72,11 @@ pub trait ElementwiseDerivativeAlignment<T: DifferentiableType>: Value<Type = T>
 
 impl<V: Value<Type = DataType> + ConvertElementType> ElementwiseDerivativeAlignment<DataType> for V {
     #[inline]
+    fn align_coefficient(&self, target: &DataType) -> Result<Self, DifferentiationError> {
+        if self.r#type().as_ref() == target { Ok(self.clone()) } else { Ok(self.convert_element_type(*target)?) }
+    }
+
+    #[inline]
     fn align_tangent(&self, target: &DataType, _exemplar: &Self) -> Result<Self, DifferentiationError> {
         if self.r#type().as_ref() == target { Ok(self.clone()) } else { Ok(self.convert_element_type(*target)?) }
     }
@@ -74,6 +91,15 @@ impl<
     V: Value<Type = ArrayType> + ZeroLike + Add + Broadcast + ConvertElementType + Reshape + Transpose + Reduce + Reshard,
 > ElementwiseDerivativeAlignment<ArrayType> for V
 {
+    #[inline]
+    fn align_coefficient(&self, target: &ArrayType) -> Result<Self, DifferentiationError> {
+        if self.r#type().data_type() == target.data_type() {
+            Ok(self.clone())
+        } else {
+            Ok(self.convert_element_type(target.data_type())?)
+        }
+    }
+
     fn align_tangent(&self, target: &ArrayType, exemplar: &Self) -> Result<Self, DifferentiationError> {
         let mut value = if self.r#type().data_type() == target.data_type() {
             self.clone()
@@ -567,7 +593,7 @@ mod tests {
 
     use crate::arrays::{
         Array, ArrayIrOperation, ArrayIrValue, ArrayOperation, ArrayType, DataType, Dimension, DimensionBounds,
-        DimensionVariable, LogicalMesh, MeshAxis, MeshAxisType, Shape, Sharding, ShardingDimension,
+        DimensionVariable, LogicalMesh, Memory, MeshAxis, MeshAxisType, Shape, Sharding, ShardingDimension,
     };
     use crate::contexts::{EagerContext, StagingContext};
     use crate::differentiation::{Differentiate, differentiate_at};
@@ -580,6 +606,36 @@ mod tests {
     use crate::tracing::TracingContext;
 
     use super::*;
+
+    #[test]
+    fn test_array_elementwise_derivative_coefficient_alignment() {
+        let mesh = LogicalMesh::new(vec![
+            MeshAxis::new("varying", 2, MeshAxisType::Manual).unwrap(),
+            MeshAxis::new("partial", 2, MeshAxisType::Explicit).unwrap(),
+            MeshAxis::new("reduced", 2, MeshAxisType::Explicit).unwrap(),
+            MeshAxis::new("sharded", 2, MeshAxisType::Explicit).unwrap(),
+        ])
+        .unwrap();
+        let sharding = Sharding::new(mesh, vec![ShardingDimension::sharded(["sharded"])])
+            .unwrap()
+            .with_unreduced_axes(["partial"])
+            .unwrap()
+            .with_reduced_axes(["reduced"])
+            .unwrap()
+            .with_varying_manual_axes(["varying"])
+            .unwrap();
+        let source = ArrayType::new_static(DataType::F32, [2])
+            .with_memory(Memory::Host { pinned: true })
+            .with_sharding(sharding)
+            .unwrap();
+        let coefficient = Array::from_elements(source.clone(), &[1.5f32, 2.5]).unwrap();
+        let target = ArrayType::new_static(DataType::F64, [3, 4]);
+        assert_eq!(
+            coefficient.align_coefficient(&target),
+            Ok(Array::from_elements(source.with_data_type(DataType::F64), &[1.5f64, 2.5]).unwrap()),
+        );
+        assert_eq!(coefficient.align_coefficient(&target.with_data_type(DataType::F32)), Ok(coefficient));
+    }
 
     #[test]
     fn test_rank_zero_array_elementwise_derivative_alignment() {
