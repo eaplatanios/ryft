@@ -34,8 +34,7 @@ pub mod registrations;
 pub mod specializations;
 
 pub use definitions::{
-    CompositeAttribute, CompositeBodyRule, CompositeImplementation, CompositeKey, CustomRuleDefinition,
-    CustomVjpOperation, NamedComposite,
+    CompositeAttribute, CompositeBody, CompositeKey, CustomRuleDefinition, CustomVjpOperation, NamedComposite,
 };
 pub use registrations::{CustomRuleReference, CustomRuleRegistration, WeakCustomRuleReference};
 pub use specializations::{CustomRuleSource, LiftedCustomRules, UnavailableCustomRules};

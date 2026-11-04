@@ -56,8 +56,9 @@ static NEXT_CUSTOM_RULE_DEFINITION_ID: AtomicU64 = AtomicU64::new(0);
 /// distinct. Their [`Debug`] representation also preserves those bits for semantic-key encoding, while [`Display`]
 /// prints their numerical values.
 ///
-/// [`From`] conversions compose through vectors, pairs, and optional values. For example, an optional dropout rate and
-/// seed becomes an optional sequence without requiring an attribute variant dedicated to dropout.
+/// [`From`] conversions compose through vectors, tuples of up to 12 elements, and optional values. Tuples become
+/// sequences in element order, and `()` becomes an empty sequence. For example, an optional dropout rate and seed
+/// becomes an optional sequence without requiring an attribute variant dedicated to dropout.
 ///
 /// ```rust
 /// # use ryft_core::CompositeAttribute;
@@ -197,13 +198,42 @@ impl<T: Into<CompositeAttribute>> From<Vec<T>> for CompositeAttribute {
     }
 }
 
-// TODO(eaplatanios): Can we use a macro and implement this for all possible tuple types?
-impl<A: Into<CompositeAttribute>, B: Into<CompositeAttribute>> From<(A, B)> for CompositeAttribute {
-    #[inline]
-    fn from((first, second): (A, B)) -> Self {
-        Self::Sequence(vec![first.into(), second.into()])
-    }
+/// Implements conversion from a tuple into an ordered [`CompositeAttribute::Sequence`].
+macro_rules! impl_composite_attribute_from_tuple {
+    // This branch converts the empty tuple into an empty sequence.
+    () => {
+        impl From<()> for CompositeAttribute {
+            #[inline]
+            fn from(_: ()) -> Self {
+                Self::Sequence(Vec::new())
+            }
+        }
+    };
+
+    // This branch converts each element of one non-empty tuple in order.
+    ($($type:ident:$index:tt),+ $(,)?) => {
+        impl<$($type: Into<CompositeAttribute>),+> From<($($type,)+)> for CompositeAttribute {
+            #[inline]
+            fn from(values: ($($type,)+)) -> Self {
+                Self::Sequence(vec![$(values.$index.into()),+])
+            }
+        }
+    };
 }
+
+impl_composite_attribute_from_tuple!();
+impl_composite_attribute_from_tuple!(T0:0);
+impl_composite_attribute_from_tuple!(T0:0, T1:1);
+impl_composite_attribute_from_tuple!(T0:0, T1:1, T2:2);
+impl_composite_attribute_from_tuple!(T0:0, T1:1, T2:2, T3:3);
+impl_composite_attribute_from_tuple!(T0:0, T1:1, T2:2, T3:3, T4:4);
+impl_composite_attribute_from_tuple!(T0:0, T1:1, T2:2, T3:3, T4:4, T5:5);
+impl_composite_attribute_from_tuple!(T0:0, T1:1, T2:2, T3:3, T4:4, T5:5, T6:6);
+impl_composite_attribute_from_tuple!(T0:0, T1:1, T2:2, T3:3, T4:4, T5:5, T6:6, T7:7);
+impl_composite_attribute_from_tuple!(T0:0, T1:1, T2:2, T3:3, T4:4, T5:5, T6:6, T7:7, T8:8);
+impl_composite_attribute_from_tuple!(T0:0, T1:1, T2:2, T3:3, T4:4, T5:5, T6:6, T7:7, T8:8, T9:9);
+impl_composite_attribute_from_tuple!(T0:0, T1:1, T2:2, T3:3, T4:4, T5:5, T6:6, T7:7, T8:8, T9:9, T10:10);
+impl_composite_attribute_from_tuple!(T0:0, T1:1, T2:2, T3:3, T4:4, T5:5, T6:6, T7:7, T8:8, T9:9, T10:10, T11:11);
 
 impl<T: Into<CompositeAttribute>> From<Option<T>> for CompositeAttribute {
     #[inline]
@@ -294,8 +324,17 @@ impl Display for CompositeKey {
 /// definition traces it lazily, once per specialization, only for the consumers that need it. Keeping operation bounds
 /// on [`Self::apply`] lets a definition retain the body without an `O: Operation` bound, avoiding a cycle with the
 /// operation family that contains its calls.
-pub(super) trait CompositeBody<V, O>: Send + Sync {
-    /// Applies this body to the provided inputs.
+///
+/// Note that closures with the corresponding signature implement this trait automatically. Consumers can use
+/// [`NamedComposite::body`] to access the retained callback for custom tracing.
+pub trait CompositeBody<V, O>: Send + Sync {
+    /// Applies this body to the provided inputs in their tracing context. The caller supplies any named-axis bindings
+    /// and validates the outputs against [`NamedComposite::output_types`]. Calling this function directly does not
+    /// consult or populate the definition's specialization caches.
+    ///
+    /// # Errors
+    ///
+    /// Returns the [`ProgramError`] reported by the body.
     fn apply(&self, inputs: &[CustomRuleTracer<V, O>]) -> Result<Vec<CustomRuleTracer<V, O>>, ProgramError>
     where
         V: Value,
@@ -373,9 +412,11 @@ impl<V: Typed + Parameter, O> NamedComposite<V, O> {
         (self.output_types)(input_types)
     }
 
-    /// Returns the body of this [`NamedComposite`].
+    /// Returns the retained body callback of this [`NamedComposite`] for custom tracing. The [`Arc`] can be cloned
+    /// to retain the callback independently. Applying it directly requires the caller to supply any named-axis
+    /// bindings and validate its outputs against [`Self::output_types`], and does not use specialization caches.
     #[inline]
-    pub(super) fn body(&self) -> &Arc<dyn CompositeBody<V, O>> {
+    pub fn body(&self) -> &Arc<dyn CompositeBody<V, O>> {
         &self.body
     }
 }
@@ -1960,6 +2001,48 @@ mod tests {
         );
         assert_ne!(CompositeAttribute::from(3), CompositeAttribute::from(Some(3)));
         assert_ne!(CompositeAttribute::from(None::<u64>), CompositeAttribute::from(Some(None::<u64>)));
+    }
+
+    #[test]
+    fn test_composite_attribute_from_tuple() {
+        // Every supported arity preserves element order, including the empty and singleton tuples.
+        let tuples = [
+            CompositeAttribute::from(()),
+            CompositeAttribute::from((0,)),
+            CompositeAttribute::from((0, 1)),
+            CompositeAttribute::from((0, 1, 2)),
+            CompositeAttribute::from((0, 1, 2, 3)),
+            CompositeAttribute::from((0, 1, 2, 3, 4)),
+            CompositeAttribute::from((0, 1, 2, 3, 4, 5)),
+            CompositeAttribute::from((0, 1, 2, 3, 4, 5, 6)),
+            CompositeAttribute::from((0, 1, 2, 3, 4, 5, 6, 7)),
+            CompositeAttribute::from((0, 1, 2, 3, 4, 5, 6, 7, 8)),
+            CompositeAttribute::from((0, 1, 2, 3, 4, 5, 6, 7, 8, 9)),
+            CompositeAttribute::from((0, 1, 2, 3, 4, 5, 6, 7, 8, 9, 10)),
+            CompositeAttribute::from((0, 1, 2, 3, 4, 5, 6, 7, 8, 9, 10, 11)),
+        ];
+        for (length, attribute) in tuples.into_iter().enumerate() {
+            assert_eq!(
+                attribute,
+                CompositeAttribute::Sequence(
+                    (0..length).map(|value| CompositeAttribute::Integer(value as i128)).collect()
+                ),
+            );
+        }
+
+        // Heterogeneous tuples compose recursively with optional values and nested tuples.
+        assert_eq!(
+            CompositeAttribute::from((true, Some((DataType::F32, 0.5f64, u64::MAX)), None::<()>)),
+            CompositeAttribute::Sequence(vec![
+                CompositeAttribute::Boolean(true),
+                CompositeAttribute::Optional(Some(Box::new(CompositeAttribute::Sequence(vec![
+                    CompositeAttribute::DataType(DataType::F32),
+                    CompositeAttribute::Float(0.5),
+                    CompositeAttribute::Integer(18446744073709551615),
+                ])))),
+                CompositeAttribute::Optional(None),
+            ]),
+        );
     }
 
     #[test]
