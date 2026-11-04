@@ -17,8 +17,7 @@ use crate::operations::{
     DimensionDivOperation, DimensionFromScalar, DimensionFromScalarOperation, DimensionMax, DimensionMaxOperation,
     DimensionMin, DimensionMinOperation, DimensionMulOperation, DimensionPow, DimensionPowOperation,
     DimensionRemOperation, DimensionSize, DimensionSizeOperation, DimensionSubOperation, DimensionToScalar,
-    DimensionToScalarOperation, Div, DivOperation, DotOperation, DotOperations, DotProductAttention,
-    DotProductAttentionBackwardOperation, DotProductAttentionOperation, Dropout, DropoutOperation,
+    DimensionToScalarOperation, Div, DivOperation, DotOperation, DotOperations, Dropout, DropoutOperation,
     DynamicBroadcastOperation, DynamicManipulationOperations, DynamicReshapeOperation, DynamicRngBitGenerator,
     DynamicSliceOperation, DynamicUpdateSliceOperation, Erf, ErfOperation, ExpM1Operation, ExpOperation,
     ExponentialOperations, ExtremaOperations, FloorOperation, GatherOperation, GuardOperation, ImaginaryOperation,
@@ -98,8 +97,6 @@ pub enum ArrayOperation<V: Value<Type = ArrayType>> {
     Dot(DotOperation),
     RaggedDot(RaggedDotOperation),
     ScaledDot(ScaledDotOperation),
-    DotProductAttention(DotProductAttentionOperation),
-    DotProductAttentionBackward(DotProductAttentionBackwardOperation),
     AxisIndex(AxisIndexOperation),
     ParallelReduce(ParallelReduceOperation),
     ParallelVary(ParallelVaryOperation),
@@ -183,7 +180,6 @@ pub trait ArrayOperations<T = <Self as Capability>::Universe>:
     + Cumulative<T>
     + Sort<T>
     + DotOperations<T>
-    + DotProductAttention<T>
     + CollectiveOperations<T>
     + Compare<Self, T>
     + Select<T>
@@ -217,7 +213,6 @@ impl<
         + Cumulative<T>
         + Sort<T>
         + DotOperations<T>
-        + DotProductAttention<T>
         + CollectiveOperations<T>
         + Compare<V, T>
         + Select<T>
