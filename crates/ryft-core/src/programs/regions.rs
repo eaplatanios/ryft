@@ -846,6 +846,21 @@ impl<'r, V: Value, O: Operation<Type = V::Type>> RegionRef<'r, V, O> {
         self.arena
     }
 
+    /// Returns the shared callee [`Program`] recorded for this root by [`ProgramBuilder::intern_callee`], if any.
+    /// Operation and transform rules can clone the returned [`Arc`] and supply it through [`AttachedRegions::Callees`]
+    /// to preserve sharing without materializing the root through [`Self::to_program`]. The returned program represents
+    /// the same rooted computation with the same input and output type identities. Cloning its [`Arc`] keeps it alive
+    /// independently of this region's arena.
+    ///
+    /// Returns [`None`] when no shared callee is recorded. Availability depends on construction history and
+    /// preservation through transforms, so callers must support this case (e.g., by materializing the root with
+    /// [`Self::to_program`]). The recorded allocation identity does not establish semantic equivalence with other
+    /// programs or eligibility for backend replacement.
+    #[inline]
+    pub fn interned_callee(self) -> Option<&'r Arc<Program<V, O, Vec<V>, Vec<V>>>> {
+        self.arena.callee(self.id())
+    }
+
     /// Returns the rooted [`Region`].
     #[inline]
     pub fn region(self) -> &'r Region<V, O> {
