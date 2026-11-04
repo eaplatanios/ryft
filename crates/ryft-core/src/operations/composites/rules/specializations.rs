@@ -3138,9 +3138,8 @@ mod tests {
             indoc! {"
                 lambda %0:f64[3], %1:f64[], %2:f64[3] .
                 let %3:f64[3] = mul %0 %1
-                    %4:f64[3] = broadcast [output_type=f64[3], output_axes=[]] %1
-                    %5:f64[3] = mul %4 %2
-                in (%3, %5)
+                    %4:f64[3] = mul %1 %2
+                in (%3, %4)
             "}
             .trim_end(),
         );
@@ -3186,9 +3185,8 @@ mod tests {
                 lambda %0:f64[3, 2], %1:f64[], %2:f64[2, 3] .
                 let %3:f64[3, 2] = transpose [permutation=[1, 0]] %2
                     %4:f64[3, 2] = mul %0 %1
-                    %5:f64[3, 2] = broadcast [output_type=f64[3, 2], output_axes=[]] %1
-                    %6:f64[3, 2] = mul %5 %3
-                in (%4, %6)
+                    %5:f64[3, 2] = mul %1 %3
+                in (%4, %5)
             "}
             .trim_end(),
         );
@@ -3390,18 +3388,17 @@ mod tests {
             indoc! {"
                 lambda %0:f64[3], %1:f64[], %2:f64[3], %3:f64[3] .
                 let %4:f64[3] = mul %0 %1
-                    %5:f64[3] = broadcast [output_type=f64[3], output_axes=[]] %1
-                    %6:f64[3] = mul %5 %2
-                    %7:f64[3, 3] = broadcast [output_type=f64[3, 3], output_axes=[1]] %0
-                    %8:f64[3, 3] = broadcast [output_type=f64[3, 3], output_axes=[0]] %3
-                    %9:f64[3, 3] = mul %7 %8
-                    %10:i64[3, 1] = iota [type=i64[3, 1], dimension=0]
-                    %11:f64[3] = gather [
+                    %5:f64[3] = mul %1 %2
+                    %6:f64[3, 3] = broadcast [output_type=f64[3, 3], output_axes=[1]] %0
+                    %7:f64[3, 3] = broadcast [output_type=f64[3, 3], output_axes=[0]] %3
+                    %8:f64[3, 3] = mul %6 %7
+                    %9:i64[3, 1] = iota [type=i64[3, 1], dimension=0]
+                    %10:f64[3] = gather [
                         dimensions=(offset=[], collapsed_slice=[0], start_index_map=[0], batching=[(1, 0)]),
                         slice_sizes=[1, 1],
-                    ] %9 %10
-                    %12:f64[3] = add %6 %11
-                in (%4, %12)
+                    ] %8 %9
+                    %11:f64[3] = add %5 %10
+                in (%4, %11)
             "}
             .trim_end(),
         );

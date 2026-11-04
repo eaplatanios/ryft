@@ -676,8 +676,8 @@ impl LowerableOperation for XlaOperation {
         output_types: &[ArrayIrType],
     ) -> Result<Vec<ValueRef<'b, 'c, 't>>, Error> {
         // Every variant, including the projected array operations, has its local output placement validated here
-        // exactly once. A nested `shard_map` instead validates its boundary specifications against the enclosing
-        // manual axes itself, reporting the more specific `ShardMapError::SpecificationNamesEnclosingManualAxis`.
+        // exactly once. A nested `shard_map` instead validates its boundary shardings against the enclosing
+        // manual axes itself, reporting the more specific `ShardMapError::ShardingNamesEnclosingManualAxis`.
         if !matches!(self, Self::ShardMap(_)) {
             validate_local_output_placement(self.name(), output_types, &lowerer.collective_state.bound_manual_axes)?;
         }

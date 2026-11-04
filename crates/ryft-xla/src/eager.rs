@@ -49,6 +49,18 @@ fn shard_host_bytes(shard: &XlaArrayShard<'_>) -> Result<Vec<u8>, ProgramError> 
         .map_err(|error| concretization(error.to_string()))
 }
 
+/// Copies the dense payload bytes of the rank-zero `array` to the host from its addressable `shard`, unless the
+/// sharding of `array` has unreduced axes, along which the devices hold summands of the value, in which case every
+/// shard is copied and the summands are added (refer to `materialize_dense_array_bytes`).
+fn scalar_host_bytes(array: &XlaArray<'_>, shard: &XlaArrayShard<'_>) -> Result<Vec<u8>, ProgramError> {
+    if array.sharding().unreduced_axes().is_empty() {
+        shard_host_bytes(shard)
+    } else {
+        materialize_dense_array_bytes(array)
+            .map_err(|error| ProgramError::Concretization { message: error.to_string() })
+    }
+}
+
 impl Concretizable<bool> for XlaArray<'_> {
     /// Extracts a concrete scalar Rust Boolean by copying one addressable shard of a rank-0 Boolean-typed [`XlaArray`]
     /// to the host. Higher-rank or non-Boolean arrays error because they cannot collapse to a single Boolean, and
@@ -83,7 +95,7 @@ impl Concretizable<i128> for XlaArray<'_> {
         })?;
         // Decode through the CPU capability to preserve every signed and unsigned integer value. Rank-zero
         // arrays are replicated, so reading one addressable shard provides the complete scalar.
-        ryft_core::Array::new(self.r#type().into_owned(), shard_host_bytes(shard)?)?.concretize()
+        ryft_core::Array::new(self.r#type().into_owned(), scalar_host_bytes(self, shard)?)?.concretize()
     }
 }
 
@@ -101,7 +113,7 @@ impl AssertionValue for XlaArray<'_> {
                 self.r#type()
             ),
         })?;
-        ryft_core::Array::new(self.r#type().into_owned(), shard_host_bytes(shard)?)?.assertion_observation()
+        ryft_core::Array::new(self.r#type().into_owned(), scalar_host_bytes(self, shard)?)?.assertion_observation()
     }
 }
 
@@ -135,7 +147,7 @@ impl DimensionFromScalar<DimensionValue, ArrayType> for XlaArray<'_> {
                 self.r#type().as_ref(),
             ),
         })?;
-        let bytes = shard_host_bytes(shard)?;
+        let bytes = scalar_host_bytes(self, shard)?;
         let invalid_extent = |value: String| ProgramError::InvalidArgument {
             message: format!(
                 "`{}` scalar input must be a nonnegative host-representable extent but is {value}",

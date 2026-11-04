@@ -420,6 +420,8 @@ impl<'o> XlaArray<'o> {
     /// Each addressable shard is uploaded to the memory requested by `r#type`. [`Memory::Device`] uses the device's
     /// default memory; host placements select its `pinned_host` or `unpinned_host` memory. A device without the requested
     /// host space produces [`ArrayError::UnsupportedMemory`]. Bufferless structural-zero arrays require no allocation.
+    /// Along an unreduced axis of the sharding, the devices hold summands of the logical value, so the devices at
+    /// coordinate zero along every unreduced axis receive their shards of the host value and the others receive zeros.
     ///
     /// # Parameters
     ///
@@ -473,6 +475,16 @@ impl<'o> XlaArray<'o> {
             .ok_or_else(|| Error::Array(ArrayError::DynamicShape { shape: r#type.shape().clone() }))?;
         let sharding = r#type.sharding().unwrap();
         let layout = ShardLayout::new(&shape, &mesh, &sharding)?;
+        // Along an unreduced axis, the devices hold summands of the logical value. The devices at coordinate zero along
+        // every unreduced axis receive the host value and the others receive zeros, so the summands add up to it.
+        let unreduced_axis_indices = mesh
+            .logical_mesh()
+            .axes()
+            .iter()
+            .enumerate()
+            .filter(|(_, axis)| sharding.unreduced_axes().contains(axis.name()))
+            .map(|(axis_index, _)| axis_index)
+            .collect::<Vec<_>>();
         let mut addressable_buffers = Vec::new();
         for shard in layout.descriptors() {
             let shard_device = shard.device();
@@ -512,7 +524,20 @@ impl<'o> XlaArray<'o> {
             let shard_dimensions = shard_shape.as_slice().iter().map(|&dimension| dimension as u64).collect::<Vec<_>>();
             let shard_slice = shard.slice();
             let buffer_type = Self::physical_buffer_type(data_type);
-            if shard_slice.is_empty() {
+            let zero_summand = mesh
+                .device_coordinates(shard.index())
+                .is_some_and(|coordinates| unreduced_axis_indices.iter().any(|&axis| coordinates[axis] != 0));
+            if zero_summand {
+                let byte_count = ArrayType::new(data_type, shard_shape.clone().into()).size_in_bytes()?;
+                addressable_buffers.push(client.buffer(
+                    Arc::<[u8]>::from(vec![0u8; byte_count]),
+                    buffer_type,
+                    shard_dimensions.as_slice(),
+                    None,
+                    memory,
+                    device_layout.clone(),
+                )?);
+            } else if shard_slice.is_empty() {
                 addressable_buffers.push(client.buffer(
                     buffer,
                     buffer_type,
@@ -1824,6 +1849,78 @@ mod tests {
                 assert_eq!(buffer.copy_to_host(None).unwrap().r#await().unwrap().as_slice(), &values[..count * 8]);
             }
         }
+    }
+
+    #[test]
+    fn test_unreduced_array_host_transfers() {
+        // Along the unreduced axis `x`, the devices hold summands of the logical value, and `y` tiles its only
+        // dimension. A host upload places the whole value on the devices at coordinate zero along `x` and zeros on the
+        // others, and host materialization sums the summands of each tile.
+        let plugin = load_cpu_plugin().unwrap();
+        let client = plugin
+            .client(ClientOptions::CPU(CpuClientOptions { device_count: Some(4), ..Default::default() }))
+            .unwrap();
+        let domain = XlaSession::new(&client).domain();
+        let devices = client.addressable_devices().unwrap();
+        let logical_mesh = LogicalMesh::new(vec![
+            MeshAxis::new("x", 2, MeshAxisType::Explicit).unwrap(),
+            MeshAxis::new("y", 2, MeshAxisType::Explicit).unwrap(),
+        ])
+        .unwrap();
+        let mesh = DeviceMesh::new(
+            logical_mesh.clone(),
+            devices.iter().map(|device| Device::from_pjrt(device).unwrap()).collect(),
+        )
+        .unwrap();
+        let sharding = Sharding::new(logical_mesh, vec![ShardingDimension::sharded(["y"])])
+            .unwrap()
+            .with_unreduced_axes(["x"])
+            .unwrap();
+        let r#type = ArrayType::new_static(DataType::F32, [4]).with_sharding(sharding).unwrap();
+        let device_values = |array: &XlaArray<'_>| {
+            array
+                .shards()
+                .iter()
+                .map(|shard| {
+                    let bytes = shard.buffer().unwrap().copy_to_host(None).unwrap().r#await().unwrap();
+                    values_from_bytes::<f32>(bytes.as_slice())
+                })
+                .collect::<Vec<_>>()
+        };
+        let materialize = |array: &XlaArray<'_>| {
+            values_from_bytes::<f32>(crate::arrays_v0::host::materialize_dense_array_bytes(array).unwrap().as_slice())
+        };
+
+        let uploaded =
+            XlaArray::from_host_buffer(&domain, r#type.clone(), mesh.clone(), values_to_bytes(&[1f32, 2., 3., 4.]))
+                .unwrap();
+        assert_eq!(device_values(&uploaded), vec![vec![1., 2.], vec![3., 4.], vec![0., 0.], vec![0., 0.]]);
+        assert_eq!(materialize(&uploaded), vec![1., 2., 3., 4.]);
+
+        let buffers = [[1f32, 2.], [3., 4.], [10., 20.], [30., 40.]]
+            .iter()
+            .zip(&devices)
+            .map(|(values, device)| {
+                client
+                    .buffer(values_to_bytes(values).as_slice(), BufferType::F32, [2], None, device.clone(), None)
+                    .unwrap()
+            })
+            .collect();
+        let summands = XlaArray::from_addressable_buffers(&domain, r#type, mesh, buffers).unwrap();
+        assert_eq!(materialize(&summands), vec![11., 22., 33., 44.]);
+
+        // A host relayout keeps every device's summand, while a dense host round trip, which would replace them, is
+        // rejected.
+        let layout = Layout::Tiled(TiledLayout::new(vec![0], vec![]));
+        let relaid = crate::arrays_v0::host::relayout_shards_through_host(&domain, &summands, &layout).unwrap();
+        assert_eq!(relaid.layout(), Some(&layout));
+        assert_eq!(device_values(&relaid), vec![vec![1., 2.], vec![3., 4.], vec![10., 20.], vec![30., 40.]]);
+        assert_eq!(
+            crate::arrays_v0::host::reject_unreduced_host_round_trip(&summands, "pad").unwrap_err().to_string(),
+            "cannot pad an array of type `f32[4][sharding={mesh<['x'=2:explicit, 'y'=2:explicit]>, [{'y'}], \
+             unreduced={'x'}}]` through the host, because its devices hold separate summands along its unreduced \
+             axes, which a dense host copy would not preserve",
+        );
     }
 
     #[test]

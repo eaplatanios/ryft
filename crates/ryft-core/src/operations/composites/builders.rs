@@ -5396,23 +5396,22 @@ mod tests {
                         lambda %0:f64[3], %1:f64[], %2:f64[], %3:f64[3], %4:f64[3], %5:f64[] .
                         let %6:f64[3] = mul %0 %1
                             %7:f64[] = mul %1 %2
-                            %8:f64[3] = broadcast [output_type=f64[3], output_axes=[]] %1
-                            %9:f64[3] = mul %8 %3
-                            %10:f64[3, 3] = broadcast [output_type=f64[3, 3], output_axes=[1]] %0
-                            %11:f64[3, 3] = broadcast [output_type=f64[3, 3], output_axes=[0]] %4
-                            %12:f64[3, 3] = mul %10 %11
-                            %13:i64[3, 1] = iota [type=i64[3, 1], dimension=0]
-                            %14:f64[3] = gather [
+                            %8:f64[3] = mul %1 %3
+                            %9:f64[3, 3] = broadcast [output_type=f64[3, 3], output_axes=[1]] %0
+                            %10:f64[3, 3] = broadcast [output_type=f64[3, 3], output_axes=[0]] %4
+                            %11:f64[3, 3] = mul %9 %10
+                            %12:i64[3, 1] = iota [type=i64[3, 1], dimension=0]
+                            %13:f64[3] = gather [
                                 dimensions=(offset=[], collapsed_slice=[0], start_index_map=[0], batching=[(1, 0)]),
                                 slice_sizes=[1, 1],
-                            ] %12 %13
-                            %15:f64[3] = add %9 %14
-                            %16:f64[] = mul %1 %5
-                            %17:f64[3] = broadcast [output_type=f64[3], output_axes=[]] %16
-                            %18:f64[3] = broadcast [output_type=f64[3], output_axes=[]] %2
-                            %19:f64[3] = mul %18 %4
-                            %20:f64[3] = add %17 %19
-                        in (%6, %7, %15, %20)
+                            ] %11 %12
+                            %14:f64[3] = add %8 %13
+                            %15:f64[] = mul %1 %5
+                            %16:f64[3] = broadcast [output_type=f64[3], output_axes=[]] %15
+                            %17:f64[3] = broadcast [output_type=f64[3], output_axes=[]] %2
+                            %18:f64[3] = mul %17 %4
+                            %19:f64[3] = add %16 %18
+                        in (%6, %7, %14, %19)
                     },
                 ]
                 in (%6, %7, %8, %9)

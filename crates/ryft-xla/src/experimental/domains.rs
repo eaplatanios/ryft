@@ -42,7 +42,10 @@ use super::lowering::signature::XlaExecutableSignature;
 use super::lowering::{contains_unresolved_references, contains_unresolved_state};
 use super::ops::{FlatXlaProgram, XlaConstant, XlaOperation, XlaProgramBuilder};
 use crate::arrays::{ArrayOutputLayout, ArrayTypeExtension};
-use crate::arrays_v0::host::{DenseArrayHostCopy, begin_materialize_dense_array_bytes, materialize_dense_array_bytes};
+use crate::arrays_v0::host::{
+    DenseArrayHostCopy, begin_materialize_dense_array_bytes, materialize_dense_array_bytes,
+    reject_unreduced_host_round_trip, relayout_shards_through_host,
+};
 use crate::arrays_v0::{
     BoundedMaterializationKey, BoundedMaterializationProbe, BoundedMaterializationProducer,
     BoundedMaterializationWaiter, ExecuteArguments,
@@ -3937,7 +3940,10 @@ impl<'c> XlaDomain<'c> {
                         break;
                     }
                 }
-                if needs_conversion {
+                if needs_conversion && !input.sharding().unreduced_axes().is_empty() {
+                    // The devices of an unreduced array hold separate summands, which a dense round trip would replace.
+                    *input = relayout_shards_through_host(self, input, expected)?;
+                } else if needs_conversion {
                     let bytes = materialize_dense_array_bytes(input)?;
                     *input = XlaArray::from_host_buffer(
                         self,
@@ -6434,6 +6440,7 @@ fn materialize_bounded_dynamic_inputs_with_readiness<'c>(
                     physical_inputs[physical_input_index] = physical;
                 }
                 BoundedMaterializationProbe::Produce(producer) => {
+                    reject_unreduced_host_round_trip(input, "pad")?;
                     report.retained_misses += 1;
                     pending_host_copies.push(PendingBoundedInputHostCopy {
                         logical_input_index,
@@ -6495,6 +6502,7 @@ fn materialize_bounded_dynamic_inputs_with_readiness<'c>(
                 // copy necessarily starts after that failure; the ordinary all-miss path above stays fully concurrent.
                 report.retained_misses += 1;
                 let input = &inputs[logical_input_index];
+                reject_unreduced_host_round_trip(input, "pad")?;
                 let pending = PendingBoundedInputHostCopy {
                     logical_input_index,
                     physical_input_index,

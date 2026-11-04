@@ -35,10 +35,13 @@
 //! intermediate states differ across devices. Replicated outputs and final reference states must still agree, including
 //! in differentiated computations. Residuals conservatively retain every active device axis, and reverse mode divides
 //! output seeds and sums input cotangents along the axes on which their boundaries replicate them. Shape, data type,
-//! ownership, alias, and reference-forwarding checks remain active. Active axes cannot carry unreduced or reduced
-//! boundary state in this mode: the reference backend stores logical arrays and cannot preserve arbitrary physical
-//! partials when their reduction metadata is reinterpreted. Reduction state on free or enclosing axes remains
-//! supported.
+//! ownership, alias, and reference-forwarding checks remain active. Along active axes, array inputs and outputs may be
+//! unreduced or reduced, and the body sees neither state, same as under JAX's `check_vma=False`: each device receives
+//! its own summand of an unreduced input and the whole value of a reduced input, and returns its own summand of an
+//! unreduced output and a copy of a reduced output. The body can observe the summands of an unreduced input, which only
+//! backends whose arrays keep one buffer per device (e.g., XLA) retain, so the reference backend rejects such inputs
+//! when it interprets the map ([`ShardMapError::UnreducedInputEmulationNotSupported`]). References may carry no
+//! reduction state along active axes. Reduction state on free or enclosing axes remains supported.
 //!
 //! Batching makes the batch axis a dimension of every mapped boundary value and batches the local body structurally,
 //! and it may place the batch axis on mesh axes. Refer to the batching rule in the documentation of
@@ -240,6 +243,7 @@
 use std::borrow::Cow;
 use std::collections::{BTreeSet, HashSet};
 use std::fmt::{Debug, Display};
+use std::hash::{Hash, Hasher};
 use std::marker::PhantomData;
 use std::sync::Arc;
 
@@ -316,19 +320,19 @@ use crate::tracing::{DomainTracer, DomainTracingContext, Tracer, TracingContext}
 
 // TODO(eaplatanios): Review from here onwards.
 
-/// Logical error type for `shard_map` boundaries, covering mesh and specification validation, global and local
+/// Logical error type for `shard_map` boundaries, covering mesh and sharding validation, global and local
 /// boundary derivation, manual variation, and the semantic restrictions on `shard_map` bodies. It carries no backend
 /// state, so backend tracing and lowering errors can wrap it.
 ///
 /// It converts into [`ProgramError`] for operation and transform rules. Its [`Program`](ShardMapError::Program) variant
 /// passes through unchanged, and every other variant becomes [`ProgramError::custom`], from which callers can recover
-/// it with [`ProgramError::downcast_custom`]. The conversion from [`ProgramError`] is its inverse on custom errors. A
-/// [`ProgramError::Custom`] that holds a [`ShardMapError`], or a [`ProgramError::Type`] whose [`TypeError::Custom`]
+/// it with [`ProgramError::downcast_custom`]. The conversion from [`ProgramError`] is its inverse on custom errors.
+/// A [`ProgramError::Custom`] that holds a [`ShardMapError`], or a [`ProgramError::Type`] whose [`TypeError::Custom`]
 /// holds one (which is how type inference reports it), converts back into that [`ShardMapError`], and every other
 /// [`ProgramError`] becomes the [`Program`](ShardMapError::Program) variant. The two conversions therefore form a
-/// normalizing cycle, so a `shard_map` error that crosses a [`ProgramError`] boundary (e.g., one raised while tracing
-/// or binding a nested `shard_map`) is reported as itself rather than wrapped in a [`ProgramError`].
-#[derive(Error, Clone, Debug, PartialEq, Eq, Hash)]
+/// normalizing cycle, so a `shard_map` error that crosses a [`ProgramError`] boundary (e.g., one raised while
+/// tracing or binding a nested `shard_map`) is reported as itself rather than wrapped in a [`ProgramError`].
+#[derive(Clone, Debug, PartialEq, Eq, Hash, Error)]
 pub enum ShardMapError {
     #[error("{0}")]
     Sharding(#[from] ShardingError),
@@ -352,7 +356,7 @@ pub enum ShardMapError {
         "{value_kind} sharding #{value_index} names mesh axis `{axis_name}`, which is already manual in an \
          enclosing manual region"
     )]
-    SpecificationNamesEnclosingManualAxis { value_kind: &'static str, value_index: usize, axis_name: String },
+    ShardingNamesEnclosingManualAxis { value_kind: &'static str, value_index: usize, axis_name: String },
 
     #[error(
         "mesh axis `{axis_name}` is manual in an enclosing manual region, but the `{SHARD_MAP_OPERATION_NAME}` mesh \
@@ -454,6 +458,29 @@ pub enum ShardMapError {
          mention it"
     )]
     OutputVaryingAlongUntiledManualAxis { output_index: usize, axis_name: String },
+
+    /// A reference input of a boundary without manual-variation checking reaches its body without its reduction state
+    /// along the active manual axes, and its final state leaves the map through a reference output of the same
+    /// sharding, so the per-device summands of such a reference would have no well-defined final state.
+    #[error(
+        "reference input #{input_index} of a `{SHARD_MAP_OPERATION_NAME}` without manual-variation checking is \
+         {state_kind} along active manual axis `{axis_name}`, but such a `{SHARD_MAP_OPERATION_NAME}` does not \
+         support reduction state on references along its active manual axes"
+    )]
+    UncheckedReferenceReductionStateNotSupported { input_index: usize, state_kind: &'static str, axis_name: String },
+
+    /// An input of a boundary without manual-variation checking that is unreduced along an active manual axis reaches
+    /// each device as its own physical summand, which the body can observe (e.g., by squaring it, `[1, 2]` and `[3, 0]`
+    /// have the same sum but give `5` and `9`). The reference backend stores one logical value per array, so it cannot
+    /// recover the summands of the caller and rejects such inputs when it interprets the map. Compiled backends whose
+    /// arrays keep one buffer per device (e.g., XLA) support them.
+    #[error(
+        "the reference backend cannot interpret input #{input_index} of a `{SHARD_MAP_OPERATION_NAME}` without \
+         manual-variation checking, which is unreduced along active manual axis `{axis_name}`, because its arrays \
+         store logical values rather than the per-device summands that the body observes; use a backend whose arrays \
+         keep per-device buffers (e.g., XLA) instead"
+    )]
+    UnreducedInputEmulationNotSupported { input_index: usize, axis_name: String },
 
     /// The boundary governs reduction state along its active manual axes and the axes its sharding names. State along
     /// other axes crosses the boundary unchanged.
@@ -558,43 +585,52 @@ impl From<ShardMapError> for ProgramError {
     }
 }
 
-/// Static manual-variation checking policy shared by the boundary and closure options.
-#[derive(Copy, Clone, Debug, Default, PartialEq, Eq, Hash)]
-enum ManualVariationChecks {
-    /// Track body variation and prove output replication.
-    #[default]
-    Checked,
+/// Static manual-variation checking policy shared by the boundary and closure options. Its two switches are stored
+/// independently, so the builders that set them commute. Output replication is proven only when the body's manual
+/// variation is checked as well, because an unchecked body carries no variation from which to prove it, so the policy
+/// compares and hashes by the effective checks only (i.e., every policy without manual-variation checking is equal).
+#[derive(Copy, Clone, Debug)]
+struct ManualVariationChecks {
+    /// Whether the body tracks variation over the active manual axes.
+    manual_variation: bool,
 
-    /// Track body variation while trusting the output replication promise.
-    TrustOutputReplication,
-
-    /// Use ordinary body types and conservative transforms, trusting final output and reference replication.
-    Unchecked,
+    /// Whether array output replication must be proven, which takes effect only when `manual_variation` is set.
+    output_replication: bool,
 }
 
 impl ManualVariationChecks {
-    /// Selects output proof without implicitly weakening internal variation checks.
-    fn with_output_replication(self, checked: bool) -> Self {
-        match (self, checked) {
-            (_, true) => Self::Checked,
-            (Self::Unchecked, false) => Self::Unchecked,
-            (_, false) => Self::TrustOutputReplication,
-        }
-    }
-
-    /// Selects complete manual-variation checking or its unchecked alternative.
-    fn with_manual_variation(checked: bool) -> Self {
-        if checked { Self::Checked } else { Self::Unchecked }
-    }
+    /// Policy that tracks body variation and proves output replication, which is the default.
+    const CHECKED: Self = Self { manual_variation: true, output_replication: true };
 
     /// Returns whether the body's manual variation is checked.
     fn check_manual_variation(self) -> bool {
-        self != Self::Unchecked
+        self.manual_variation
     }
 
     /// Returns whether output replication is statically proven.
     fn check_output_replication(self) -> bool {
-        self == Self::Checked
+        self.manual_variation && self.output_replication
+    }
+}
+
+impl Default for ManualVariationChecks {
+    fn default() -> Self {
+        Self::CHECKED
+    }
+}
+
+impl PartialEq for ManualVariationChecks {
+    fn eq(&self, other: &Self) -> bool {
+        (self.check_manual_variation(), self.check_output_replication())
+            == (other.check_manual_variation(), other.check_output_replication())
+    }
+}
+
+impl Eq for ManualVariationChecks {}
+
+impl Hash for ManualVariationChecks {
+    fn hash<H: Hasher>(&self, state: &mut H) {
+        (self.check_manual_variation(), self.check_output_replication()).hash(state);
     }
 }
 
@@ -678,7 +714,7 @@ impl ShardMapBoundary {
     /// `manual_axes` selects only the manual mesh axes that are not already manual (and fails with
     /// [`ShardMapError::AllManualAxesAlreadyManual`] when the mesh has manual axes but none remains), an explicitly
     /// requested axis that is already manual is rejected with [`ShardMapError::AxisAlreadyManual`], and a sharding that
-    /// names an already manual axis is rejected with [`ShardMapError::SpecificationNamesEnclosingManualAxis`]. Making
+    /// names an already manual axis is rejected with [`ShardMapError::ShardingNamesEnclosingManualAxis`]. Making
     /// an axis manual twice would drop the variation that the values of the enclosing region carry along it, so a
     /// per-device value could leave the nested region typed as replicated, and backends could not represent the nested
     /// manual computation either.
@@ -706,7 +742,7 @@ impl ShardMapBoundary {
             input_shardings,
             output_shardings,
             manual_axes,
-            manual_variation_checks: ManualVariationChecks::Checked,
+            manual_variation_checks: ManualVariationChecks::CHECKED,
         })
     }
 
@@ -724,7 +760,7 @@ impl ShardMapBoundary {
             input_shardings,
             output_shardings,
             manual_axes,
-            manual_variation_checks: ManualVariationChecks::Checked,
+            manual_variation_checks: ManualVariationChecks::CHECKED,
         }
     }
 
@@ -739,12 +775,12 @@ impl ShardMapBoundary {
     /// identical logical output bytes for every valid input. The reference backend verifies the promise at runtime,
     /// while compiled backends trust it. A violated promise can produce incorrect compiled results. Differentiation
     /// additionally requires the promise to hold for the tangent computation, rather than just at one primal input.
-    /// Internal variation, reduction state, shapes, and reference contracts remain checked unless
-    /// [`Self::with_check_manual_variation(false)`](Self::with_check_manual_variation) was selected. Setting this option
-    /// to `true` restores manual-variation checking as well.
+    /// Internal variation, reduction state, shapes, and reference contracts remain checked. This option is independent
+    /// of [`Self::with_check_manual_variation`], so the two can be set in either order, but it takes effect only while
+    /// manual variation is checked, because a body without variation tracking cannot prove output replication.
     #[inline]
     pub fn with_check_output_replication(mut self, check_output_replication: bool) -> Self {
-        self.manual_variation_checks = self.manual_variation_checks.with_output_replication(check_output_replication);
+        self.manual_variation_checks.output_replication = check_output_replication;
         self
     }
 
@@ -754,13 +790,17 @@ impl ShardMapBoundary {
     /// temporarily differ between devices. Shape, data type, reduction-state, ownership, alias, and forwarding
     /// contracts remain checked. Reference execution verifies final copies before committing reference state.
     /// Compiled execution trusts these promises. Reverse mode conservatively normalizes output seeds and aggregates
-    /// input cotangents; replicated mutated gradient-reference destinations are unsupported. Boundary shardings cannot
-    /// carry unreduced or reduced state along active manual axes, because logical reference arrays cannot preserve
-    /// arbitrary physical partials under such reinterpretations. Enabling checking restores output replication
-    /// checking as well.
+    /// input cotangents; replicated mutated gradient-reference destinations are unsupported. Along active manual axes,
+    /// array inputs and outputs may be unreduced or reduced, which the body does not see. The reference backend rejects
+    /// unreduced inputs when it interprets the map ([`ShardMapError::UnreducedInputEmulationNotSupported`]), because
+    /// the body could observe their physical summands, which logical reference arrays do not retain, and reference
+    /// inputs may carry no reduction state along those axes
+    /// ([`ShardMapError::UncheckedReferenceReductionStateNotSupported`]). Output replication is not checked while this
+    /// option is `false`, whatever [`Self::with_check_output_replication`] selects, and is checked again as that option
+    /// selects once this option is `true`, so the two can be set in either order.
     #[inline]
     pub fn with_check_manual_variation(mut self, check_manual_variation: bool) -> Self {
-        self.manual_variation_checks = ManualVariationChecks::with_manual_variation(check_manual_variation);
+        self.manual_variation_checks.manual_variation = check_manual_variation;
         self
     }
 
@@ -869,13 +909,13 @@ impl ShardMapBoundary {
         input_index: usize,
         global_input_type: &ArrayType,
     ) -> Result<ArrayType, ShardMapError> {
-        self.validate_unchecked_reduction_state()?;
         let boundary_sharding = &self.input_shardings[input_index];
         let carried_state =
             self.carried_reduction_state(boundary_sharding, global_input_type.sharding(), "input", input_index)?;
         let global_shape = Self::static_dimensions(global_input_type, "input", input_index)?;
         let local_shape = self.local_input_shape(input_index, &global_shape)?;
-        let local_sharding = boundary_sharding.local_sharding(self.manual_axes())?;
+        let local_sharding =
+            self.without_unchecked_reduction_state(boundary_sharding.local_sharding(self.manual_axes())?)?;
         let local_varying_axes = global_input_type
             .sharding()
             .map(|sharding| sharding.varying_manual_axes().clone())
@@ -910,12 +950,21 @@ impl ShardMapBoundary {
         self.manual_axes.iter().filter(|axis| !sharded_axes.contains(axis.as_str())).cloned().collect()
     }
 
-    /// Returns manual axes whose copies represent one logical cotangent rather than tiles or pending summands.
+    /// Returns the active manual axes along which the copies of a value that `sharding` places are plain replicas,
+    /// which are the axes that it neither tiles nor marks as unreduced or reduced. The reverse rule of an unchecked
+    /// boundary divides an output seed and sums an input cotangent along exactly these axes. Along an unreduced axis,
+    /// each device holds a separate summand, whose cotangent is the whole replicated seed, and along a reduced axis,
+    /// each device holds the whole value, whose cotangent is one summand of an unreduced cotangent, so neither needs a
+    /// division or a sum.
     fn cotangent_replication_axes(&self, sharding: &Sharding) -> Vec<String> {
         let tiled = Self::sharded_manual_axes(sharding, &self.manual_axis_names());
         self.manual_axes
             .iter()
-            .filter(|axis| !tiled.contains(axis.as_str()) && !sharding.unreduced_axes().contains(*axis))
+            .filter(|axis| {
+                !tiled.contains(axis.as_str())
+                    && !sharding.unreduced_axes().contains(*axis)
+                    && !sharding.reduced_axes().contains(*axis)
+            })
             .cloned()
             .collect()
     }
@@ -1000,7 +1049,7 @@ impl ShardMapBoundary {
                     .chain(sharding.reduced_axes());
                 for axis_name in named_axes {
                     if enclosing_manual_axes.contains(axis_name.as_str()) {
-                        return Err(ShardMapError::SpecificationNamesEnclosingManualAxis {
+                        return Err(ShardMapError::ShardingNamesEnclosingManualAxis {
                             value_kind,
                             value_index,
                             axis_name: axis_name.clone(),
@@ -1158,24 +1207,32 @@ impl ShardMapBoundary {
             .collect()
     }
 
-    /// Rejects unchecked physical partial-sum reinterpretations that a logical reference array cannot preserve.
-    fn validate_unchecked_reduction_state(&self) -> Result<(), ShardMapError> {
-        if !self.check_manual_variation()
-            && let Some(axis) = self.manual_axes.iter().find(|axis| {
-                self.input_shardings.iter().chain(&self.output_shardings).any(|sharding| {
-                    sharding.unreduced_axes().contains(*axis) || sharding.reduced_axes().contains(*axis)
-                })
+    /// Returns whether output `output_index` of a boundary without manual-variation checking carries reduction state
+    /// along an active manual axis. Forwarding such an output as a residual would pass it back to the residual body
+    /// with that state (e.g., an unreduced output as an unreduced input, which the reference backend cannot interpret),
+    /// so transforms keep a separate residual edge, tiled along every active manual axis, instead.
+    fn has_unchecked_output_reduction_state(&self, output_index: usize) -> bool {
+        let sharding = &self.output_shardings[output_index];
+        !self.check_manual_variation()
+            && self.manual_axes.iter().any(|axis_name| {
+                sharding.unreduced_axes().contains(axis_name) || sharding.reduced_axes().contains(axis_name)
             })
-        {
-            return Err(ProgramError::UnsupportedOperation {
-                message: format!(
-                    "`{SHARD_MAP_OPERATION_NAME}` with unchecked manual variation cannot preserve physical reduction \
-                     state along active manual axis `{axis}`",
-                ),
-            }
-            .into());
+    }
+
+    /// Returns `sharding` without its reduction state along the active manual axes when the body of this boundary does
+    /// not track manual variation, whose values therefore carry no reduction state along those axes (as JAX's
+    /// `_shard_shaped_array` drops the reduction state of a specification when `check_vma` is disabled), and returns
+    /// `sharding` unchanged otherwise.
+    fn without_unchecked_reduction_state(&self, sharding: Sharding) -> Result<Sharding, ShardingError> {
+        if self.check_manual_variation() {
+            return Ok(sharding);
         }
-        Ok(())
+        let retained = |axes: &BTreeSet<String>| {
+            axes.iter().filter(|axis_name| !self.manual_axes.contains(*axis_name)).cloned().collect::<Vec<_>>()
+        };
+        let unreduced_axes = retained(sharding.unreduced_axes());
+        let reduced_axes = retained(sharding.reduced_axes());
+        sharding.with_unreduced_axes(unreduced_axes)?.with_reduced_axes(reduced_axes)
     }
 
     /// Returns the active manual axes along which the local output may vary even though its output sharding promises
@@ -1210,7 +1267,6 @@ impl ShardMapBoundary {
         output_index: usize,
         local_output_type: &ArrayType,
     ) -> Result<ArrayType, ShardMapError> {
-        self.validate_unchecked_reduction_state()?;
         let manual_axis_names = self.manual_axis_names();
         let local_shape = Self::static_dimensions(local_output_type, "output", output_index)?;
         let output_sharding = &self.output_shardings[output_index];
@@ -1227,8 +1283,14 @@ impl ShardMapBoundary {
                 axis_name: axis_name.clone(),
             });
         }
-        let carried_state =
-            self.carried_reduction_state(output_sharding, local_output_type.sharding(), "output", output_index)?;
+        // An unchecked body carries no reduction state along the active manual axes, so its outputs are compared with
+        // the output sharding without that state, which the output sharding then contributes to the global type.
+        let carried_state = self.carried_reduction_state(
+            &self.without_unchecked_reduction_state(output_sharding.clone())?,
+            local_output_type.sharding(),
+            "output",
+            output_index,
+        )?;
         for axis_name in &effective_local_varying_axes {
             if self.check_output_replication()
                 && manual_axis_names.contains(axis_name.as_str())
@@ -1361,16 +1423,18 @@ impl ShardMapBoundary {
     /// sharding, while free axes (i.e., axes that are not active manual axes) are kept. Active manual axes are kept as
     /// well, but they are no longer active in the batched map, which is only correct when `body` (the local body of
     /// this map) neither varies along them nor communicates along them, when another active manual axis remains, and
-    /// when `body` has no [`EffectClass::DeviceOrderedIo`] effect.
+    /// when `body` has no [`EffectClass::DeviceOrderedIo`] effect. An unchecked body carries no variation labels, so
+    /// only its communication and effects are checked, which suffices because no input or output sharding names a
+    /// released axis.
     ///
     /// # Errors
     ///
     /// Returns [`ShardMapError::Sharding`] for a placement axis that is not an axis of the mesh,
     /// [`ShardMapError::BatchAxisPlacedOnSpecifiedAxis`] for a placement axis that an input or output sharding names,
     /// [`ShardMapError::BatchAxisPlacedOnEveryManualAxis`] when the placement names every active manual axis,
-    /// [`ShardMapError::BatchAxisPlacedOnUsedManualAxis`] for an active manual placement axis that some value of `body`
-    /// (including the values of its nested regions) varies along or that a collective or an `axis_index` of `body`
-    /// (again including its nested regions) names, and
+    /// [`ShardMapError::BatchAxisPlacedOnUsedManualAxis`] for an active manual placement axis that some value of a
+    /// checked `body` (including the values of its nested regions) varies along or that a collective or an `axis_index`
+    /// of `body` (again including its nested regions) names, and
     /// [`ShardMapError::BatchAxisPlacedOnManualAxisWithDeviceOrderedIo`] for an active manual placement axis when
     /// `body` has the [`EffectClass::DeviceOrderedIo`] effect.
     fn batched_placement<V: Value<Type = ArrayIrType>, O>(
@@ -1416,23 +1480,28 @@ impl ShardMapBoundary {
             if manual_axes.is_empty() {
                 return Err(ShardMapError::BatchAxisPlacedOnEveryManualAxis);
             }
-            if !self.check_manual_variation() {
-                return Err(ShardMapError::BatchAxisPlacedOnUsedManualAxis { axis_name: released_axis.clone() });
-            }
-            for region_id in body.region_ids_in_closure() {
-                for atom in body.arena()[region_id.index()].atoms() {
-                    let atom_type = atom.r#type();
-                    let sharding = match atom_type.as_ref() {
-                        ArrayIrType::Array(array_type) => array_type.sharding(),
-                        ArrayIrType::Reference(reference_type) => reference_type.referent().sharding(),
-                        ArrayIrType::Dimension(_) => None,
-                    };
-                    let varying_axes = sharding.map(Sharding::varying_manual_axes);
-                    if let Some(axis_name) = released_axes
-                        .iter()
-                        .find(|axis_name| varying_axes.is_some_and(|axes| axes.contains(*axis_name)))
-                    {
-                        return Err(ShardMapError::BatchAxisPlacedOnUsedManualAxis { axis_name: axis_name.clone() });
+            // An unchecked body carries no variation labels, so only the syntactic checks below apply to it. They
+            // suffice, because no boundary sharding names a released axis (every input is replicated along it), the
+            // body captures no reference, and so only a collective or an `axis_index` naming the axis, or a
+            // `DeviceOrderedIo` effect, can make the devices along it compute different values.
+            if self.check_manual_variation() {
+                for region_id in body.region_ids_in_closure() {
+                    for atom in body.arena()[region_id.index()].atoms() {
+                        let atom_type = atom.r#type();
+                        let sharding = match atom_type.as_ref() {
+                            ArrayIrType::Array(array_type) => array_type.sharding(),
+                            ArrayIrType::Reference(reference_type) => reference_type.referent().sharding(),
+                            ArrayIrType::Dimension(_) => None,
+                        };
+                        let varying_axes = sharding.map(Sharding::varying_manual_axes);
+                        if let Some(axis_name) = released_axes
+                            .iter()
+                            .find(|axis_name| varying_axes.is_some_and(|axes| axes.contains(*axis_name)))
+                        {
+                            return Err(ShardMapError::BatchAxisPlacedOnUsedManualAxis {
+                                axis_name: axis_name.clone(),
+                            });
+                        }
                     }
                 }
             }
@@ -1502,7 +1571,9 @@ pub const SHARD_MAP_OPERATION_NAME: &str = "shard_map";
 /// Batching makes the batch axis a dimension of every mapped input and output (of its referent, for a reference), with
 /// the static batch extent, and batches the body structurally at the same batching level, as JAX's `shard_map` batching
 /// rule does, so that the level that binds a named batch axis consumes the collectives over that name inside the body.
-/// An anonymous level preserves the boundary when all inputs are unbatched. The batch dimension is unpartitioned for a
+/// A level named like an axis of the mesh is shadowed by that axis inside the body, which is therefore batched at an
+/// anonymous level, so its collectives over that name keep communicating along the mesh axis. An anonymous or shadowed
+/// level preserves the boundary when all inputs are unbatched. The batch dimension is unpartitioned for a
 /// replicated batch axis and is otherwise placed on the mesh axes that the batching level places the batch axis on.
 /// Those axes are free in the batched map, so the batch dimension keeps its global extent inside the body, and an
 /// active manual axis among them (the analogue of JAX's `spmd_axis_name`) stops being manual. Batching a map with
@@ -1511,8 +1582,9 @@ pub const SHARD_MAP_OPERATION_NAME: &str = "shard_map";
 /// ([`ShardMapError::BatchAxisPlacedOnEveryManualAxis`]), and a placement on an active manual axis along which the body
 /// varies or communicates ([`ShardMapError::BatchAxisPlacedOnUsedManualAxis`]) or of a body with the
 /// [`EffectClass::DeviceOrderedIo`] effect ([`ShardMapError::BatchAxisPlacedOnManualAxisWithDeviceOrderedIo`]). With
-/// manual-variation checking disabled, every placement on an active manual axis is rejected, because absent variation
-/// labels cannot prove that the body is independent of that axis. It also
+/// manual-variation checking disabled, the body carries no variation labels, so a placement on an active manual axis is
+/// accepted exactly when no collective or `axis_index` of the body names that axis and the body has no
+/// [`EffectClass::DeviceOrderedIo`] effect, which suffices because every input is replicated along the axis. It also
 /// rejects a dynamic batch extent whenever a boundary position is mapped or the body uses the extent
 /// ([`ShardMapError::DynamicBatchExtentNotSupported`]), because boundary types are static (refer to the
 /// `# Static Boundaries` section below). A forwarded reference output keeps the batch axis of the reference input that
@@ -1655,6 +1727,23 @@ impl ShardMapOperation {
                 Ok(if r#type.is_reference() { ReferenceType::new(global).into() } else { global.into() })
             })
             .collect::<Result<Vec<ArrayIrType>, ShardMapError>>()?;
+        // A reference input reaches an unchecked body without its reduction state along the active manual axes, so its
+        // per-device final states would have no well-defined global state with that reduction state.
+        if !boundary.check_manual_variation() {
+            for (input_index, _) in global_input_types.iter().enumerate().filter(|(_, r#type)| r#type.is_reference()) {
+                let sharding = &boundary.input_shardings()[input_index];
+                let states = [("unreduced", sharding.unreduced_axes()), ("reduced", sharding.reduced_axes())];
+                for (state_kind, axes) in states {
+                    if let Some(axis_name) = boundary.manual_axes().iter().find(|axis_name| axes.contains(*axis_name)) {
+                        return Err(ShardMapError::UncheckedReferenceReductionStateNotSupported {
+                            input_index,
+                            state_kind,
+                            axis_name: axis_name.clone(),
+                        });
+                    }
+                }
+            }
+        }
         let local_input_types = body.input_types().into_owned();
         check_count!("input", local_input_types, global_input_types.len(), ProgramError);
         for (index, (global, local)) in global_input_types.iter().zip(&local_input_types).enumerate() {
@@ -2500,9 +2589,12 @@ where
 // batched body maps, at the position that the batched body reports. The body is batched at the same batching level
 // (only its placement may differ, as explained below), so a collective over the name of this level inside the body
 // (which the body inherits from the enclosing named axes, refer to the `ShardMap` capability) is consumed by this
-// level, exactly as JAX traces the body under its `BatchTrace`. A call whose inputs are all unbatched computes the same
-// values for every batch item unless its body refers to this level by name, so only an anonymous level keeps such a
-// call's boundary and binds it unchanged. A named level batches the body structurally even then. An output that the
+// level, exactly as JAX traces the body under its `BatchTrace`. The body does not inherit a level named like an axis of
+// the mesh, though, because the mesh axis shadows it (as the innermost binding of a name does in JAX's axis
+// environment), so the body is batched at an anonymous level then, and its collectives over that name keep
+// communicating along the mesh axis. A call whose inputs are all unbatched computes the same values for every batch
+// item unless its body refers to this level by name, so only an anonymous or shadowed level keeps such a call's
+// boundary and binds it unchanged. Any other named level batches the body structurally even then. An output that the
 // consumed collectives map (e.g., the `axis_index` of this level) takes the mapped path, while a body whose outputs all
 // stay unbatched keeps the boundary of the call. The errors of this rule therefore also apply to a call whose inputs
 // are all unbatched but whose body maps an output.
@@ -2535,8 +2627,12 @@ where
 // along it and no collective or `axis_index` of the body names it (which excludes communication along it even between
 // invariant values, such as a meshless permutation, whose output is typed by its input), and when the body has no
 // `DeviceOrderedIo` effect, whose per-device executions would change. Recognizing those collectives is why the
-// operation family must support payload projection. Each violation is rejected with its own `ShardMapError`, as is a
-// placement on every active manual axis, because the batched map must keep one. No manual placement axis is manual
+// operation family must support payload projection. An unchecked body carries no variation labels, so the variation
+// condition is skipped for it, which is sound because its inputs are replicated along the axis and only the other two
+// conditions could make its devices diverge. Each violation is rejected with its own `ShardMapError`, as is a
+// placement on every active manual axis, because the batched map must keep one. (Binding the batched body inline would
+// avoid that rejection, but region replay requires the caller's values to carry exactly the declared input shardings of
+// the body, which the batch placement changes.) No manual placement axis is manual
 // inside the batched body, but a batched value placed on a manual axis would vary along it, so the body is batched with
 // a context whose placement keeps only the `Explicit` placement axes (boundary validation compares local types up to
 // their placement, so the local types still match). The batched boundary is validated through
@@ -2571,10 +2667,17 @@ where
         }
         let input_values = inputs.iter().map(|input| input.value().clone()).collect::<Vec<_>>();
 
+        // The body cannot refer to a level named like an axis of the mesh, because that axis shadows it (refer to
+        // `shard_map_within_named_axes`), so a body collective over that name communicates along the mesh axis and the
+        // body is batched at an anonymous level. Batching it at the named level would let the batching rule of such a
+        // collective consume it as a reduction over batch items, which, for the mesh-free collectives of unchecked
+        // manual axes, would silently drop the communication across devices.
+        let axis_name = context.axis_name().filter(|axis_name| self.boundary.mesh().axis_index(axis_name).is_none());
+
         // A call whose inputs are all unbatched computes the same values for every batch item when no collective in its
-        // body can refer to this level, which holds for an anonymous level, so it keeps its boundary.
+        // body can refer to this level, which holds for an anonymous or shadowed level, so it keeps its boundary.
         let input_positions = inputs.iter().map(ArrayIrBatch::batch_axis_position).collect::<Vec<_>>();
-        if context.axis_name().is_none() && input_positions.iter().all(Option::is_none) {
+        if axis_name.is_none() && input_positions.iter().all(Option::is_none) {
             let outputs = context.parent().bind(self.clone(), vec![driver.region(0)?.to_program()], &input_values)?;
             return Ok(outputs.into_iter().map(ArrayIrBatch::replicated).collect::<Vec<_>>());
         }
@@ -2627,7 +2730,8 @@ where
                 context.clone().with_axis_sharding(body_placement)
             }
             ShardingDimension::Replicated | ShardingDimension::Unconstrained => context.clone(),
-        };
+        }
+        .with_axis_name(axis_name.map(str::to_string));
         let (batched_body, output_axes) = driver
             .batch_program(&body_context, body, input_axes.as_slice(), ProgramBatchingOutputAxesPolicy::Natural)?
             .into_parts();
@@ -3000,7 +3104,7 @@ pub struct ShardMapOptions {
 
 impl Default for ShardMapOptions {
     fn default() -> Self {
-        Self { manual_axes: Vec::new(), manual_variation_checks: ManualVariationChecks::Checked }
+        Self { manual_axes: Vec::new(), manual_variation_checks: ManualVariationChecks::CHECKED }
     }
 }
 
@@ -3024,10 +3128,12 @@ impl ShardMapOptions {
     /// Selects whether array outputs require static proof of replication, as described by
     /// [`ShardMapBoundary::with_check_output_replication`]. The default is `true`. With `false`, the caller promises
     /// equal output copies, including in differentiated computations, and the reference backend checks that promise
-    /// at runtime. Compiled backends trust it. Internal variation and all reference contracts remain checked.
+    /// at runtime. Compiled backends trust it. Internal variation and all reference contracts remain checked. It takes
+    /// effect only while manual variation is checked (refer to [`Self::with_check_manual_variation`]), independently
+    /// of the order in which the two options are set.
     #[inline]
     pub fn with_check_output_replication(mut self, check_output_replication: bool) -> Self {
-        self.manual_variation_checks = self.manual_variation_checks.with_output_replication(check_output_replication);
+        self.manual_variation_checks.output_replication = check_output_replication;
         self
     }
 
@@ -3036,10 +3142,12 @@ impl ShardMapOptions {
     /// variation over active manual axes, and transforms use conservative device-wise rules. The caller promises
     /// that final replicated array outputs and reference states agree. The reference backend validates final copies,
     /// while compiled execution trusts the promise. Shape, data type, ownership, and reduction-state checks remain
-    /// active.
+    /// active. Array inputs and outputs may be unreduced or reduced along active manual axes, but the reference backend
+    /// cannot interpret unreduced inputs. Output replication is not checked while this option is `false`, whatever
+    /// [`Self::with_check_output_replication`] selects, and the two can be set in either order.
     #[inline]
     pub fn with_check_manual_variation(mut self, check_manual_variation: bool) -> Self {
-        self.manual_variation_checks = ManualVariationChecks::with_manual_variation(check_manual_variation);
+        self.manual_variation_checks.manual_variation = check_manual_variation;
         self
     }
 
@@ -3155,7 +3263,7 @@ pub trait ShardMap: Context + NamedAxes {
     /// outputs of `function` do not have the structure of `output_shardings`, the errors of [`ShardMapBoundary::new`]
     /// for invalid mesh, sharding, and manual axis combinations, [`ShardMapError::AllManualAxesAlreadyManual`] when
     /// every manual mesh axis is already manual in an enclosing manual region, [`ShardMapError::AxisAlreadyManual`] or
-    /// [`ShardMapError::SpecificationNamesEnclosingManualAxis`] when the selection of manual axes or a sharding names
+    /// [`ShardMapError::ShardingNamesEnclosingManualAxis`] when the selection of manual axes or a sharding names
     /// such an axis, [`ShardMapError::EnclosingManualAxisNotManual`] when `mesh` does not type such an axis
     /// [`Manual`](MeshAxisType::Manual), [`ShardMapError::EnclosingManualAxisMeshMismatch`] when such an axis belongs
     /// to another device mesh, the boundary derivation errors (e.g., [`ShardMapError::InputMeshMismatch`],
@@ -3530,6 +3638,28 @@ where
         let mut body_inputs = Vec::with_capacity(inputs.len());
         let mut reference_inputs = Vec::new();
         for (index, values) in inputs.iter().enumerate() {
+            // An unchecked body observes the physical summands of an input that is unreduced along an active manual
+            // axis, which the logical arrays of this backend do not retain.
+            // TODO(eaplatanios): Support unreduced inputs of unchecked maps on the reference backend, which XLA already
+            //  supports because its arrays keep one buffer per device. That needs a reference value that owns the
+            //  per-device summands of an unreduced array, which `split_global_input` hands to the devices along its
+            //  unreduced axes, `assemble_global_value` keeps for unreduced outputs (instead of summing them), and the
+            //  dense operations that produce unreduced types (e.g., the dense dot) keep rather than fully reduce. Once
+            //  it exists, delete this rejection, `ShardMapError::UnreducedInputEmulationNotSupported`, and its test
+            //  `test_shard_map_interpretation_without_manual_variation_rejects_unreduced_inputs`, and test reverse mode
+            //  through reduced outputs of unchecked maps (whose seeds are unreduced) on this backend.
+            if !boundary.check_manual_variation()
+                && let Some(axis_name) = boundary
+                    .manual_axes()
+                    .iter()
+                    .find(|axis_name| boundary.input_shardings()[index].unreduced_axes().contains(*axis_name))
+            {
+                return Err(ShardMapError::UnreducedInputEmulationNotSupported {
+                    input_index: index,
+                    axis_name: axis_name.clone(),
+                }
+                .into());
+            }
             let global_type = boundary_array_type(&operation.global_input_types()[index])?;
             let local_type = boundary.local_input_type(index, global_type)?;
             let mut local_values = Vec::with_capacity(values.len() * local_device_count);
@@ -4950,13 +5080,17 @@ where
     // An output whose replication is trusted loses local variation at its public boundary. Forwarding that output as
     // a residual would then feed an invariant local input into a residual body that expects a varying one. Keep the
     // original residual edges in that case, so that their tiled shardings preserve every per-device residual value.
-    let loses_output_variation = !operation.boundary.check_output_replication()
-        && partition.outputs().iter().enumerate().any(|(index, output)| {
-            output.is_known()
-                && boundary_array_type(&body.output_types()[index])
-                    .is_ok_and(|r#type| !operation.boundary.unproven_output_replication_axes(index, r#type).is_empty())
-        });
-    let partition = if loses_output_variation { partition } else { partition.forward_residuals()? };
+    // The same holds for an unchecked output with reduction state along an active manual axis, whose summands could
+    // only return as an unreduced input, which an unchecked map does not accept.
+    let keeps_residual_edges = partition.outputs().iter().enumerate().any(|(index, output)| {
+        output.is_known()
+            && ((!operation.boundary.check_output_replication()
+                && boundary_array_type(&body.output_types()[index]).is_ok_and(|r#type| {
+                    !operation.boundary.unproven_output_replication_axes(index, r#type).is_empty()
+                }))
+                || operation.boundary.has_unchecked_output_reduction_state(index))
+    });
+    let partition = if keeps_residual_edges { partition } else { partition.forward_residuals()? };
     let known_output_indices = partition
         .outputs()
         .iter()
@@ -5296,6 +5430,7 @@ where
             .filter(|&index| {
                 boundary_array_type(&primal_output_types[index])
                     .is_ok_and(|r#type| operation.boundary.unproven_output_replication_axes(index, r#type).is_empty())
+                    && !operation.boundary.has_unchecked_output_reduction_state(index)
             });
         let residual = match (input_index, output_index) {
             (Some(index), _) => ShardMapResidual::Input(index),
@@ -6301,10 +6436,9 @@ where
         output_shardings,
         boundary.manual_axes().to_vec(),
     )
-    .with_manual_variation_checks(if operation.boundary.check_manual_variation() {
-        ManualVariationChecks::Checked
-    } else {
-        ManualVariationChecks::Unchecked
+    .with_manual_variation_checks(ManualVariationChecks {
+        manual_variation: operation.boundary.check_manual_variation(),
+        output_replication: true,
     });
     // A trusted replicated output is the same logical result on several devices, while the typed body transpose
     // expects a separate seed for each potentially varying copy. Split its seed equally between precisely the axes
@@ -6319,9 +6453,9 @@ where
             Ok(if operation.boundary.check_manual_variation() {
                 operation.boundary.unproven_output_replication_axes(index, boundary_array_type(r#type)?)
             } else {
-                operation
-                    .boundary
-                    .cotangent_replication_axes(&operation.boundary.output_shardings()[index].cotangent())
+                // The devices along an axis that the output is unreduced along hold separate summands of the output,
+                // each of which receives the whole cotangent, so only the other untiled axes divide the seed.
+                operation.boundary.cotangent_replication_axes(&operation.boundary.output_shardings()[index])
             })
         })
         .collect::<Result<Vec<_>, ProgramError>>()?;
@@ -7832,31 +7966,34 @@ mod tests {
         let unchecked = boundary.clone().with_check_manual_variation(false);
         assert!(!unchecked.check_manual_variation());
         assert!(!unchecked.check_output_replication());
+
+        // The two options commute, and output replication is checked only while manual variation is checked.
+        let trusted = boundary.clone().with_check_output_replication(false);
+        assert_eq!(unchecked.clone().with_check_output_replication(true), unchecked);
         assert_eq!(unchecked.clone().with_check_output_replication(false), unchecked);
         assert_eq!(unchecked.clone().with_check_manual_variation(true), boundary);
-        assert_eq!(unchecked.with_check_output_replication(true), boundary);
-        let options = ShardMapOptions::new().with_check_manual_variation(false);
-        assert!(!options.check_manual_variation());
-        assert!(!options.check_output_replication());
-        assert_eq!(options.with_check_manual_variation(true), ShardMapOptions::new());
+        assert_eq!(unchecked.with_check_output_replication(false).with_check_manual_variation(true), trusted);
+        assert_eq!(trusted.clone().with_check_manual_variation(false).with_check_manual_variation(true), trusted);
     }
 
     #[test]
-    fn test_shard_map_boundary_without_manual_variation_rejects_active_reduction_state() {
+    fn test_shard_map_boundary_without_manual_variation_drops_active_reduction_state() {
+        // The body of an unchecked map sees no reduction state along its active manual axes: each device receives its
+        // own summand of an unreduced input or the whole value of a reduced input, and returns its own summand of an
+        // unreduced output or a copy of a reduced output.
         let mesh = manual_mesh();
-        let partial = Sharding::replicated(mesh.clone(), 0).with_unreduced_axes(["x"]).unwrap();
-        let boundary = ShardMapBoundary::new(mesh, vec![partial], Vec::new(), Vec::new())
-            .unwrap()
-            .with_check_manual_variation(false);
-        let error = ProgramError::from(boundary.local_input_type(0, &ArrayType::scalar(DataType::F32)).unwrap_err());
-        assert_eq!(
-            error,
-            ProgramError::UnsupportedOperation {
-                message: "`shard_map` with unchecked manual variation cannot preserve physical reduction state along \
-                      active manual axis `x`"
-                    .to_string(),
-            }
-        );
+        let replicated = Sharding::replicated(mesh.clone(), 0);
+        let unreduced = replicated.clone().with_unreduced_axes(["x"]).unwrap();
+        let reduced = replicated.clone().with_reduced_axes(["x"]).unwrap();
+        let local_type = f32_scalar_type().with_sharding(replicated).unwrap();
+        for state in [unreduced, reduced] {
+            let boundary = ShardMapBoundary::new(mesh.clone(), vec![state.clone()], vec![state.clone()], Vec::new())
+                .unwrap()
+                .with_check_manual_variation(false);
+            let global_type = f32_scalar_type().with_sharding(state).unwrap();
+            assert_eq!(boundary.local_input_type(0, &global_type), Ok(local_type.clone()));
+            assert_eq!(boundary.global_output_type(0, &local_type), Ok(global_type));
+        }
     }
 
     #[test]
@@ -8995,6 +9132,29 @@ mod tests {
                  reference output must forward a reference input"
                     .to_string(),
             ))),
+        );
+    }
+
+    #[test]
+    fn test_shard_map_operation_without_manual_variation_rejects_reduced_reference_inputs() {
+        // A reference input would reach an unchecked body without its reduced state, so its per-device final states
+        // would have no well-defined reduced global state, and it is rejected even though a reduced array input is
+        // accepted.
+        let mesh = manual_mesh();
+        let reduced = Sharding::replicated(mesh.clone(), 0).with_reduced_axes(["x"]).unwrap();
+        let boundary = ShardMapBoundary::new(mesh, vec![reduced.clone()], Vec::new(), Vec::new())
+            .unwrap()
+            .with_check_manual_variation(false);
+        let global_type = f32_scalar_type().with_sharding(reduced).unwrap();
+        let local_type = boundary.local_input_type(0, &global_type).unwrap();
+        let body = build_program(vec![ReferenceType::new(local_type).into()], |_, _| Vec::new());
+        assert_eq!(
+            ShardMapOperation::from_program(&body, vec![ReferenceType::new(global_type).into()], boundary),
+            Err(ShardMapError::UncheckedReferenceReductionStateNotSupported {
+                input_index: 0,
+                state_kind: "reduced",
+                axis_name: "x".to_string(),
+            }),
         );
     }
 
@@ -12958,6 +13118,88 @@ mod tests {
     }
 
     #[test]
+    fn test_shard_map_interpretation_without_manual_variation_sums_unreduced_outputs() {
+        // Each device squares its shard of `[1, 2, 3, 4]` without any variation tracking, and the unreduced output sums
+        // the two squared shards, giving `[1 + 9, 4 + 16]`.
+        let mesh = manual_mesh();
+        let unreduced = Sharding::replicated(mesh.clone(), 1).with_unreduced_axes(["x"]).unwrap();
+        let program = trace_test_program(
+            |inputs| {
+                vec![
+                    shard_map(
+                        |x: TestTracer| Ok(x.clone() * x),
+                        inputs[0].clone(),
+                        mesh.clone(),
+                        sharded_along_x(),
+                        unreduced.clone(),
+                        ShardMapOptions::new().with_check_manual_variation(false),
+                    )
+                    .unwrap(),
+                ]
+            },
+            vec![f32_vector_type(4)],
+            Vec::new(),
+        );
+        assert_eq!(
+            program.to_string(),
+            indoc! {"
+                lambda %0:f32[4] .
+                let %1:f32[2][sharding={mesh<['x'=2:manual]>, [{}], unreduced={'x'}}] = shard_map [
+                    mesh=['x'=2:manual],
+                    input_shardings=[{mesh<['x'=2:manual]>, [{'x'}]}],
+                    output_shardings=[{mesh<['x'=2:manual]>, [{}], unreduced={'x'}}],
+                    manual_axes=['x'],
+                    check_manual_variation=false,
+                    global_input_types=[f32[4][sharding={mesh<['x'=2:manual]>, [{'x'}]}]],
+                    global_output_types=[f32[2][sharding={mesh<['x'=2:manual]>, [{}], unreduced={'x'}}]],
+                ] %0 [
+                    body={
+                        lambda %0:f32[2][sharding={mesh<['x'=2:manual]>, [{}]}] .
+                        let %1:f32[2][sharding={mesh<['x'=2:manual]>, [{}]}] = mul %0 %0
+                        in (%1)
+                    },
+                ]
+                in (%1)"
+            },
+        );
+        assert_eq!(
+            arrays_f64(program.interpret(vec![f32_value(f32_vector_type(4), &[1.0, 2.0, 3.0, 4.0])]).unwrap()),
+            vec![vec![10.0, 20.0]],
+        );
+    }
+
+    #[test]
+    fn test_shard_map_interpretation_without_manual_variation_rejects_unreduced_inputs() {
+        // Each device of an unchecked map receives its own summand of an unreduced input, which the body can observe,
+        // but the reference backend stores only the logical value, so it rejects the input rather than invent its
+        // summands.
+        let mesh = manual_mesh();
+        let unreduced = Sharding::replicated(mesh.clone(), 0).with_unreduced_axes(["x"]).unwrap();
+        let boundary = ShardMapBoundary::new(mesh, vec![unreduced.clone()], vec![unreduced.clone()], Vec::new())
+            .unwrap()
+            .with_check_manual_variation(false);
+        let global_type = f32_scalar_type().with_sharding(unreduced).unwrap();
+        let local_type = boundary.local_input_type(0, &global_type).unwrap();
+        let body = build_program(vec![local_type.into()], |builder, inputs| {
+            builder
+                .add_instruction(ArrayOperation::Mul(MulOperation::new()), Vec::new(), vec![inputs[0], inputs[0]], None)
+                .unwrap()
+                .to_vec()
+        });
+        let program = caller_typed_shard_map_program(body, vec![global_type.clone().into()], boundary);
+        let expected =
+            ShardMapError::UnreducedInputEmulationNotSupported { input_index: 0, axis_name: "x".to_string() };
+        assert_eq!(program.interpret(vec![f32_value(global_type, &[3.0])]), Err(ProgramError::from(expected.clone())));
+        assert_eq!(
+            expected.to_string(),
+            "the reference backend cannot interpret input #0 of a `shard_map` without manual-variation checking, which \
+             is unreduced along active manual axis `x`, because its arrays store logical values rather than the \
+             per-device summands that the body observes; use a backend whose arrays keep per-device buffers (e.g., \
+             XLA) instead",
+        );
+    }
+
+    #[test]
     fn test_shard_map_interpretation_without_manual_variation_binds_unchecked_coordinate_readers() {
         let mesh = manual_mesh();
         let output_sharding = sharded_along_x();
@@ -16432,6 +16674,147 @@ mod tests {
     }
 
     #[test]
+    fn test_shard_map_batching_places_batch_axes_on_unused_manual_axes_of_unchecked_maps() {
+        // Without manual-variation checking, the body carries no variation labels, but a body that neither
+        // communicates along `y` nor reads its coordinate along `y` still computes the same values on every device
+        // along `y`, because no sharding names `y`, so `y` becomes free in the batched map, as for a checked map.
+        let mesh = manual_mesh_2x2();
+        let sharded = Sharding::new(mesh.clone(), vec![ShardingDimension::sharded(["x"])]).unwrap();
+        let program = trace_test_program(
+            |inputs| {
+                vec![
+                    shard_map(
+                        |x: TestTracer| Ok(x.clone() + x),
+                        inputs[0].clone(),
+                        mesh.clone(),
+                        sharded.clone(),
+                        sharded.clone(),
+                        ShardMapOptions::new().with_check_manual_variation(false),
+                    )
+                    .unwrap(),
+                ]
+            },
+            vec![f32_vector_type(4)],
+            Vec::new(),
+        );
+        let batched = program
+            .batched_with_threaded_extent(
+                DimensionValue::constant(3).unwrap().r#type().into_owned(),
+                ShardingDimension::sharded(["y"]),
+                &[BatchAxis::new(0)],
+                ProgramBatchingOutputAxesPolicy::Natural,
+            )
+            .unwrap()
+            .into_parts()
+            .0;
+        assert_eq!(
+            batched.to_string(),
+            indoc! {"
+                lambda %0:dimension<3>, %1:f32[3, 4] .
+                let %2:f32[3, 4][sharding={mesh<['x'=2:manual, 'y'=2:manual]>, [{'y'}, {'x'}]}] = shard_map [
+                    mesh=['x'=2:manual, 'y'=2:manual],
+                    input_shardings=[{mesh<['x'=2:manual, 'y'=2:manual]>, [{'y'}, {'x'}]}],
+                    output_shardings=[{mesh<['x'=2:manual, 'y'=2:manual]>, [{'y'}, {'x'}]}],
+                    manual_axes=['x'],
+                    check_manual_variation=false,
+                    global_input_types=[f32[3, 4][sharding={mesh<['x'=2:manual, 'y'=2:manual]>, [{'y'}, {'x'}]}]],
+                    global_output_types=[f32[3, 4][sharding={mesh<['x'=2:manual, 'y'=2:manual]>, [{'y'}, {'x'}]}]],
+                ] %1 [
+                    body={
+                        lambda %0:f32[3, 2][sharding={mesh<['x'=2:manual, 'y'=2:manual]>, [{}, {}]}] .
+                        let %1:f32[3, 2][sharding={mesh<['x'=2:manual, 'y'=2:manual]>, [{}, {}]}] = add %0 %0
+                        in (%1)
+                    },
+                ]
+                in (%0, %2)"
+            },
+        );
+        let elements = (0..12).map(|element| element as f32).collect::<Vec<_>>();
+        let outputs = batched
+            .interpret(vec![
+                TestValue::Dimension(DimensionValue::constant(3).unwrap()),
+                f32_value(ArrayType::new_static(DataType::F32, [3, 4]), &elements),
+            ])
+            .unwrap();
+        let expected = elements.iter().map(|element| 2.0 * f64::from(*element)).collect::<Vec<_>>();
+        assert_eq!(arrays_f64(outputs[1..].to_vec()), vec![expected]);
+    }
+
+    #[test]
+    fn test_shard_map_batching_without_manual_variation_of_reduced_inputs_and_unreduced_outputs() {
+        // The reduction state along `x` passes through the batched boundary unchanged. Each device squares the whole
+        // reduced input, and the unreduced output sums the two squares, so every item `e` maps to `2 * e * e`, as
+        // without batching.
+        let mesh = manual_mesh();
+        let reduced = Sharding::replicated(mesh.clone(), 1).with_reduced_axes(["x"]).unwrap();
+        let unreduced = Sharding::replicated(mesh.clone(), 1).with_unreduced_axes(["x"]).unwrap();
+        let program = trace_test_program(
+            |inputs| {
+                vec![
+                    shard_map(
+                        |x: TestTracer| Ok(x.clone() * x),
+                        inputs[0].clone(),
+                        mesh.clone(),
+                        reduced.clone(),
+                        unreduced.clone(),
+                        ShardMapOptions::new().with_check_manual_variation(false),
+                    )
+                    .unwrap(),
+                ]
+            },
+            vec![f32_vector_type(2).with_sharding(reduced.clone()).unwrap()],
+            Vec::new(),
+        );
+        let batched = program
+            .batched_with_threaded_extent(
+                DimensionValue::constant(3).unwrap().r#type().into_owned(),
+                ShardingDimension::Replicated,
+                &[BatchAxis::new(0)],
+                ProgramBatchingOutputAxesPolicy::Natural,
+            )
+            .unwrap()
+            .into_parts()
+            .0;
+        let input_sharding = "{mesh<['x'=2:manual]>, [{}, {}], reduced={'x'}}";
+        let output_sharding = "{mesh<['x'=2:manual]>, [{}, {}], unreduced={'x'}}";
+        let local = "f32[3, 2][sharding={mesh<['x'=2:manual]>, [{}, {}]}]";
+        assert_eq!(
+            batched.to_string(),
+            formatdoc! {"
+                lambda %0:dimension<3>, %1:f32[3, 2][sharding={input_sharding}] .
+                let %2:f32[3, 2][sharding={output_sharding}] = shard_map [
+                    mesh=['x'=2:manual],
+                    input_shardings=[{input_sharding}],
+                    output_shardings=[{output_sharding}],
+                    manual_axes=['x'],
+                    check_manual_variation=false,
+                    global_input_types=[f32[3, 2][sharding={input_sharding}]],
+                    global_output_types=[f32[3, 2][sharding={output_sharding}]],
+                ] %1 [
+                    body={{
+                        lambda %0:{local} .
+                        let %1:{local} = mul %0 %0
+                        in (%1)
+                    }},
+                ]
+                in (%0, %2)"
+            },
+        );
+        let elements = (0..6).map(|element| element as f32).collect::<Vec<_>>();
+        let input_type = ArrayType::new_static(DataType::F32, [3, 2])
+            .with_sharding(Sharding::replicated(mesh, 2).with_reduced_axes(["x"]).unwrap())
+            .unwrap();
+        let outputs = batched
+            .interpret(vec![
+                TestValue::Dimension(DimensionValue::constant(3).unwrap()),
+                f32_value(input_type, &elements),
+            ])
+            .unwrap();
+        let expected = elements.iter().map(|element| 2.0 * f64::from(*element).powi(2)).collect::<Vec<_>>();
+        assert_eq!(arrays_f64(outputs[1..].to_vec()), vec![expected]);
+    }
+
+    #[test]
     fn test_shard_map_batching_drops_batch_axes_placed_on_auto_mesh_axes() {
         // The boundary drops `Auto` axes from every sharding, so it also drops the `Auto` axes of the batch placement:
         // a placement on the `Auto` axis `a` alone leaves the batch dimension replicated, and a placement on `a` and
@@ -16739,6 +17122,42 @@ mod tests {
     }
 
     #[test]
+    fn test_shard_map_batching_rejects_batch_axes_placed_on_axes_that_unchecked_bodies_communicate_along() {
+        // An unchecked body carries no variation labels, so its `parallel_reduce` over `y` is what reveals that the
+        // devices along `y` communicate, and a batch axis placed on `y` is rejected.
+        let mesh = manual_mesh_2x2();
+        let sharded = Sharding::new(mesh.clone(), vec![ShardingDimension::sharded(["x"])]).unwrap();
+        let program = trace_test_program(
+            |inputs| {
+                vec![
+                    shard_map(
+                        |x: TestTracer| Ok(x.parallel_reduce(ReductionKind::Sum, "y")?),
+                        inputs[0].clone(),
+                        mesh.clone(),
+                        sharded.clone(),
+                        sharded.clone(),
+                        ShardMapOptions::new().with_check_manual_variation(false),
+                    )
+                    .unwrap(),
+                ]
+            },
+            vec![f32_vector_type(4)],
+            Vec::new(),
+        );
+        let result = program.batched_with_threaded_extent(
+            DimensionValue::constant(3).unwrap().r#type().into_owned(),
+            ShardingDimension::sharded(["y"]),
+            &[BatchAxis::new(0)],
+            ProgramBatchingOutputAxesPolicy::Natural,
+        );
+        let expected = ShardMapError::BatchAxisPlacedOnUsedManualAxis { axis_name: "y".to_string() };
+        assert!(matches!(
+            &result,
+            Err(BatchingError::Program(error)) if error.downcast_custom::<ShardMapError>() == Some(&expected),
+        ));
+    }
+
+    #[test]
     fn test_shard_map_batching_rejects_batch_axes_placed_on_every_manual_axis() {
         // A batch axis placed on every active manual axis would leave the batched map without a manual axis, so it is
         // rejected even though no sharding names `x` and the body does not use it.
@@ -16883,7 +17302,7 @@ mod tests {
 
         // A batch axis placed on `y` would partition the boundary values along an axis along which they are already
         // the per-device shards of the enclosing region.
-        let expected = ShardMapError::SpecificationNamesEnclosingManualAxis {
+        let expected = ShardMapError::ShardingNamesEnclosingManualAxis {
             value_kind: "input",
             value_index: 0,
             axis_name: "y".to_string(),
@@ -17167,6 +17586,102 @@ mod tests {
                 in (%2)"
             },
         );
+    }
+
+    #[test]
+    fn test_shard_map_batching_shadows_batch_axes_named_like_mesh_axes() {
+        // The manual mesh axis `x` shadows the enclosing `batch` level named `x` inside the body, so that level batches
+        // the body anonymously and the `parallel_reduce` over `x` stays a reduction across the devices along the mesh
+        // axis rather than becoming a reduction over batch items (JAX resolves the name to its innermost binding too).
+        // Manual variation is unchecked here, so the body's `parallel_reduce` carries no mesh that could tell it apart
+        // from a reduction over a batch axis.
+        let mesh = manual_mesh();
+        let sharded = Sharding::new(mesh.clone(), vec![ShardingDimension::sharded(["x"])]).unwrap();
+        let replicated = Sharding::replicated(mesh.clone(), 1);
+        let program = trace_test_program(
+            |inputs| {
+                let output = batch(
+                    |item| {
+                        let item = ValueProjection::<ArrayType>::into_projected(item)?;
+                        let output = shard_map(
+                            |x: TestTracer| Ok(x.parallel_reduce(ReductionKind::Sum, "x")?),
+                            item,
+                            mesh.clone(),
+                            sharded.clone(),
+                            replicated.clone(),
+                            ShardMapOptions::new().with_check_manual_variation(false),
+                        )?;
+                        Ok(output.into_value())
+                    },
+                    inputs[0].value().clone(),
+                    BatchAxis::new(0),
+                    BatchAxis::new(0),
+                    BatchAxisSpecification::named("x"),
+                )
+                .unwrap();
+                vec![ValueProjection::<ArrayType>::into_projected(output).unwrap()]
+            },
+            vec![ArrayType::new_static(DataType::F32, [3, 4])],
+            Vec::new(),
+        );
+        assert_eq!(
+            program.to_string(),
+            indoc! {"
+                lambda %0:f32[3, 4] .
+                let %1:dimension<3> = constant [value=3]
+                    %2:f32[3, 2][sharding={mesh<['x'=2:manual]>, [{}, {}]}] = shard_map [
+                        mesh=['x'=2:manual],
+                        input_shardings=[{mesh<['x'=2:manual]>, [{}, {'x'}]}],
+                        output_shardings=[{mesh<['x'=2:manual]>, [{}, {}]}],
+                        manual_axes=['x'],
+                        check_manual_variation=false,
+                        global_input_types=[f32[3, 4][sharding={mesh<['x'=2:manual]>, [{}, {'x'}]}]],
+                        global_output_types=[f32[3, 2][sharding={mesh<['x'=2:manual]>, [{}, {}]}]],
+                    ] %0 [
+                        body={
+                            lambda %0:f32[3, 2][sharding={mesh<['x'=2:manual]>, [{}, {}]}] .
+                            let %1:f32[3, 2][sharding={mesh<['x'=2:manual]>, [{}, {}]}] = \
+                                parallel_reduce [kind=sum, axis_name=\"x\"] %0
+                            in (%1)
+                        },
+                    ]
+                in (%2)"
+            },
+        );
+    }
+
+    #[test]
+    fn test_shard_map_batching_of_collectives_over_mesh_axes_named_like_the_batch_axis() {
+        // Each batch item `[4i, 4i + 1, 4i + 2, 4i + 3]` is split across the two devices along `x`, and the body's
+        // `parallel_reduce` over `x` adds their shards, giving `[8i + 2, 8i + 4]`, whether or not manual variation is
+        // checked, even though the enclosing `batch` level is also named `x`.
+        let mesh = manual_mesh();
+        let sharded = Sharding::new(mesh.clone(), vec![ShardingDimension::sharded(["x"])]).unwrap();
+        let replicated = Sharding::replicated(mesh.clone(), 1);
+        let elements = (0..12).map(|element| element as f32).collect::<Vec<_>>();
+        let input = Array::from_elements(ArrayType::new_static(DataType::F32, [3, 4]), &elements).unwrap();
+        for check_manual_variation in [true, false] {
+            let output = batch(
+                |item| {
+                    let item = ValueProjection::<ArrayType>::into_projected(item)?;
+                    let output = shard_map(
+                        |x: TestTracer| Ok(x.parallel_reduce(ReductionKind::Sum, "x")?),
+                        item,
+                        mesh.clone(),
+                        sharded.clone(),
+                        replicated.clone(),
+                        ShardMapOptions::new().with_check_manual_variation(check_manual_variation),
+                    )?;
+                    Ok(output.into_value())
+                },
+                TestValue::Array(input.clone()),
+                BatchAxis::new(0),
+                BatchAxis::new(0),
+                BatchAxisSpecification::named("x"),
+            )
+            .unwrap();
+            assert_eq!(arrays_f64(vec![output]), vec![vec![2.0, 4.0, 10.0, 12.0, 18.0, 20.0]]);
+        }
     }
 
     #[test]
@@ -17498,6 +18013,112 @@ mod tests {
     }
 
     #[test]
+    fn test_shard_map_differentiation_without_manual_variation_of_unreduced_outputs() {
+        // The unreduced output sums `exp(x)` over the two devices, so its value and gradient at zero are both two. Each
+        // device holds one summand, which receives the whole seed, so the seed is not divided along `x`, while the
+        // contributions to the replicated input are summed along `x`.
+        let (value, gradient) = differentiate_at(TestValue::Array(Array::scalar(0f32).unwrap()))
+            .value_and_gradient(|input| {
+                let input = ValueProjection::<ArrayType>::into_projected(input)?;
+                let replicated = Sharding::replicated(manual_mesh(), 0);
+                let output = shard_map(
+                    |input: TestTracer| input.exp(),
+                    input,
+                    manual_mesh(),
+                    replicated.clone(),
+                    replicated.with_unreduced_axes(["x"]).unwrap(),
+                    ShardMapOptions::new().with_check_manual_variation(false),
+                )?;
+                Ok(output.into_value())
+            })
+            .unwrap();
+        assert_eq!(arrays_f64(vec![value, gradient]), vec![vec![2.0], vec![2.0]]);
+    }
+
+    #[test]
+    fn test_shard_map_differentiation_without_manual_variation_of_reduced_inputs() {
+        // Every device receives the whole reduced input and returns `exp(x)` as a replicated output, so the gradient at
+        // zero is one. The seed is divided along `x`, and the cotangent of the reduced input is unreduced along `x`, so
+        // its two halves are summed by the boundary rather than by an explicit reduction.
+        let reduced = Sharding::replicated(manual_mesh(), 0).with_reduced_axes(["x"]).unwrap();
+        let input_type = f32_scalar_type().with_sharding(reduced.clone()).unwrap();
+        let (value, gradient) = differentiate_at(f32_value(input_type, &[0.0]))
+            .value_and_gradient(|input| {
+                let input = ValueProjection::<ArrayType>::into_projected(input)?;
+                let output = shard_map(
+                    |input: TestTracer| input.exp(),
+                    input,
+                    manual_mesh(),
+                    reduced.clone(),
+                    Sharding::replicated(manual_mesh(), 0),
+                    ShardMapOptions::new().with_check_manual_variation(false),
+                )?;
+                Ok(output.into_value())
+            })
+            .unwrap();
+        assert_eq!(arrays_f64(vec![value, gradient]), vec![vec![1.0], vec![1.0]]);
+    }
+
+    #[test]
+    fn test_shard_map_jvp_without_manual_variation_of_reduced_inputs_and_unreduced_outputs() {
+        // Each device squares the whole reduced input, and the unreduced output sums the two squares, so the map is
+        // `x -> 2 * x * x`. The fused forward mode map keeps the reduction state of both boundaries for the tangents,
+        // and its output tangent at `x = 3` along a unit tangent is `4 * x = 12`.
+        let mesh = manual_mesh();
+        let reduced = Sharding::replicated(mesh.clone(), 0).with_reduced_axes(["x"]).unwrap();
+        let unreduced = Sharding::replicated(mesh.clone(), 0).with_unreduced_axes(["x"]).unwrap();
+        let input_type = f32_scalar_type().with_sharding(reduced.clone()).unwrap();
+        let program = trace_test_program(
+            |inputs| {
+                vec![
+                    shard_map(
+                        |x: TestTracer| Ok(x.clone() * x),
+                        inputs[0].clone(),
+                        mesh.clone(),
+                        reduced.clone(),
+                        unreduced.clone(),
+                        ShardMapOptions::new().with_check_manual_variation(false),
+                    )
+                    .unwrap(),
+                ]
+            },
+            vec![input_type.clone()],
+            Vec::new(),
+        );
+        let reduced = "f32[][sharding={mesh<['x'=2:manual]>, [], reduced={'x'}}]";
+        let unreduced = "f32[][sharding={mesh<['x'=2:manual]>, [], unreduced={'x'}}]";
+        let local = "f32[][sharding={mesh<['x'=2:manual]>, []}]";
+        let reduced_sharding = "{mesh<['x'=2:manual]>, [], reduced={'x'}}";
+        let unreduced_sharding = "{mesh<['x'=2:manual]>, [], unreduced={'x'}}";
+        assert_eq!(
+            program.jvp().unwrap().to_string(),
+            formatdoc! {"
+                lambda %0:{reduced}, %1:{reduced} .
+                let %2:{unreduced}, %3:{unreduced} = shard_map [
+                    mesh=['x'=2:manual],
+                    input_shardings=[{reduced_sharding}, {reduced_sharding}],
+                    output_shardings=[{unreduced_sharding}, {unreduced_sharding}],
+                    manual_axes=['x'],
+                    check_manual_variation=false,
+                    global_input_types=[{reduced}, {reduced}],
+                    global_output_types=[{unreduced}, {unreduced}],
+                ] %0 %1 [
+                    body={{
+                        lambda %0:{local}, %1:{local} .
+                        let %2:{local} = mul %0 %0
+                            %3:{local} = mul %0 %1
+                            %4:{local} = mul %0 %1
+                            %5:{local} = add %3 %4
+                        in (%2, %5)
+                    }},
+                ]
+                in (%2, %3)"
+            },
+        );
+        assert_eq!(evaluate_pushforward(&program, f32_value(input_type, &[3.0])), vec![vec![18.0], vec![12.0]]);
+    }
+
+    #[test]
     fn test_shard_map_differentiation_without_manual_variation_transposes_collectives() {
         // The collective receives invariant metadata but still sums the physical copies. For two devices the map is
         // x -> 2*x*x, so both the collective transpose and the boundary's replicated-input sum must be retained.
@@ -17620,6 +18241,54 @@ mod tests {
         let seed = Array::vector(vec![1f32]).unwrap().converted_to(DataType::F8E4M3FN).unwrap();
         let seed = with_array_type(&seed, <&ArrayType>::try_from(&pullback.input_types()[0]).unwrap()).unwrap();
         assert_eq!(arrays_f64(pullback.interpret(vec![TestValue::Array(seed)]).unwrap()), vec![vec![1.0 / 512.0; 512]],);
+    }
+
+    #[test]
+    fn test_shard_map_transposition_without_manual_variation_of_reduced_boundaries() {
+        // A reduced input and output of an unchecked map transpose to an unreduced seed and an unreduced input
+        // cotangent. Each device holds one summand of the seed, which its copy of the output receives whole, and
+        // returns one summand of the input cotangent, so the transposed body neither divides the seed nor sums the
+        // cotangent. The reference backend cannot interpret the unreduced seed, which only compiled backends retain per
+        // device.
+        let mesh = manual_mesh();
+        let reduced = Sharding::replicated(mesh.clone(), 0).with_reduced_axes(["x"]).unwrap();
+        let boundary = ShardMapBoundary::new(mesh, vec![reduced.clone()], vec![reduced.clone()], Vec::new())
+            .unwrap()
+            .with_check_manual_variation(false);
+        let global_type = f32_scalar_type().with_sharding(reduced).unwrap();
+        let local_type = boundary.local_input_type(0, &global_type).unwrap();
+        let body = build_program(vec![local_type.into()], |_, inputs| inputs.to_vec());
+        let program = caller_typed_shard_map_program(body, vec![global_type.into()], boundary);
+        let pullback = program.transpose_with_respect_to(&[0], &[CotangentDestinationKind::Return]).unwrap();
+        assert_eq!(
+            pullback.to_string(),
+            indoc! {"
+                lambda %0:f32[][sharding={mesh<['x'=2:manual]>, [], unreduced={'x'}}] .
+                let %1:f32[][sharding={mesh<['x'=2:manual]>, [], unreduced={'x'}}] = shard_map [
+                    mesh=['x'=2:manual],
+                    input_shardings=[{mesh<['x'=2:manual]>, [], unreduced={'x'}}],
+                    output_shardings=[{mesh<['x'=2:manual]>, [], unreduced={'x'}}],
+                    manual_axes=['x'],
+                    check_manual_variation=false,
+                    global_input_types=[f32[][sharding={mesh<['x'=2:manual]>, [], unreduced={'x'}}]],
+                    global_output_types=[f32[][sharding={mesh<['x'=2:manual]>, [], unreduced={'x'}}]],
+                ] %0 [
+                    body={
+                        lambda %0:f32[][sharding={mesh<['x'=2:manual]>, []}] .
+                        in (%0)
+                    },
+                ]
+                in (%1)"
+            },
+        );
+        let seed_type = <&ArrayType>::try_from(&pullback.input_types()[0]).unwrap().clone();
+        assert_eq!(
+            pullback.interpret(vec![f32_value(seed_type, &[1.0])]),
+            Err(ProgramError::from(ShardMapError::UnreducedInputEmulationNotSupported {
+                input_index: 0,
+                axis_name: "x".to_string(),
+            })),
+        );
     }
 
     #[test]
@@ -22083,6 +22752,20 @@ mod tests {
     }
 
     #[test]
+    fn test_shard_map_options_with_check_manual_variation() {
+        let unchecked = ShardMapOptions::new().with_check_manual_variation(false);
+        assert!(!unchecked.check_manual_variation());
+        assert!(!unchecked.check_output_replication());
+
+        // The two options commute, and output replication is checked only while manual variation is checked.
+        let trusted = ShardMapOptions::new().with_check_output_replication(false);
+        assert_eq!(unchecked.clone().with_check_output_replication(true), unchecked);
+        assert_eq!(unchecked.clone().with_check_manual_variation(true), ShardMapOptions::new());
+        assert_eq!(unchecked.with_check_output_replication(false).with_check_manual_variation(true), trusted);
+        assert_eq!(trusted.clone().with_check_manual_variation(false).with_check_manual_variation(true), trusted);
+    }
+
+    #[test]
     fn test_shard_map_options_manual_axes() {
         let options = ShardMapOptions::new().with_manual_axes(["x", "y"]);
         assert_eq!(options.manual_axes(), &["x".to_string(), "y".to_string()]);
@@ -22714,7 +23397,7 @@ mod tests {
             },
         );
 
-        // Specifications over the already manual axis `x` are rejected instead of making `x` manual again, which would
+        // Shardings over the already manual axis `x` are rejected instead of making `x` manual again, which would
         // drop the variation of the input along `x` and type the per-device output as replicated.
         let program = trace_test_program(
             |inputs| {
@@ -22729,7 +23412,7 @@ mod tests {
                                 outer_sharding.clone(),
                                 ShardMapOptions::new(),
                             );
-                            let expected = ShardMapError::SpecificationNamesEnclosingManualAxis {
+                            let expected = ShardMapError::ShardingNamesEnclosingManualAxis {
                                 value_kind: "input",
                                 value_index: 0,
                                 axis_name: "x".to_string(),

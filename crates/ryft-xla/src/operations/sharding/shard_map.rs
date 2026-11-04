@@ -90,7 +90,7 @@ where
         return Err(ProgramError::from(ShardMapError::AxisAlreadyManual { axis_name: axis_name.clone() }).into());
     }
     // For the same reason, an input or output sharding must not name such an axis (the closure entry points reject
-    // these specifications too), so it is rejected here rather than silently dropped from the Shardy shardings.
+    // these shardings too), so it is rejected here rather than silently dropped from the Shardy shardings.
     for (value_kind, shardings) in [("input", boundary.input_shardings()), ("output", boundary.output_shardings())] {
         for (value_index, sharding) in shardings.iter().enumerate() {
             let axis_name = sharding
@@ -104,7 +104,7 @@ where
                 .chain(sharding.reduced_axes())
                 .find(|axis_name| collective_state.bound_manual_axes.contains(*axis_name));
             if let Some(axis_name) = axis_name {
-                let error = ShardMapError::SpecificationNamesEnclosingManualAxis {
+                let error = ShardMapError::ShardingNamesEnclosingManualAxis {
                     value_kind,
                     value_index,
                     axis_name: axis_name.clone(),
@@ -250,7 +250,7 @@ fn shardy_tensor_sharding_per_value<'c, 't>(
 /// axes of enclosing manual regions are omitted from the replicated axes, because they are already bound outside this
 /// manual computation, and the dimension shardings are built by [`manual_computation_dimension_shardings`]. `sharding`
 /// must not name such an axis in its dimension shardings or reduction state, which [`lower_manual_computation`] rejects
-/// with [`ShardMapError::SpecificationNamesEnclosingManualAxis`] before building these attributes.
+/// with [`ShardMapError::ShardingNamesEnclosingManualAxis`] before building these attributes.
 fn manual_computation_tensor_sharding<'c, 't>(
     sharding: &Sharding,
     manual_axes: &[String],
@@ -798,7 +798,7 @@ mod tests {
     }
 
     #[test]
-    fn test_to_mlir_module_for_program_rejects_specifications_naming_already_manual_axes() {
+    fn test_to_mlir_module_for_program_rejects_shardings_naming_already_manual_axes() {
         // A nested map over `y` built from its boundary (e.g., as a transformation could) bypasses the checks of the
         // frontend, so its input and output shardings can shard along the axis `x` of the enclosing manual region.
         // Shardy cannot represent those shardings inside that region, so lowering rejects them instead of silently
@@ -822,7 +822,7 @@ mod tests {
             replicated.clone(),
             ShardMapOptions::new().with_manual_axes(["x"]),
         );
-        let expected = ShardMapError::SpecificationNamesEnclosingManualAxis {
+        let expected = ShardMapError::ShardingNamesEnclosingManualAxis {
             value_kind: "input",
             value_index: 0,
             axis_name: "x".to_string(),
@@ -1256,6 +1256,319 @@ mod tests {
             let bytes = output.outputs[0].copy_to_host(None).unwrap().r#await().unwrap();
             assert_eq!(values_from_bytes::<f32>(&bytes), vec![12.0]);
         }
+    }
+
+    #[test]
+    fn test_to_mlir_module_for_program_without_manual_variation_executes_unreduced_outputs_on_cpu() {
+        use ryft_pjrt::{ExecutionDeviceInputs, ExecutionInput};
+
+        // Each device multiplies its shard of `x = [1, 2, 3, 4]` by the whole reduced input `r = [5, 6]` and returns
+        // the product as its summand of the unreduced output, so the devices hold `[5, 12]` and `[15, 24]`, which sum
+        // to the logical output.
+        let mesh = test_manual_mesh("x", 2);
+        let sharded = Sharding::new(mesh.clone(), vec![ShardingDimension::sharded(["x"])]).unwrap();
+        let replicated = Sharding::replicated(mesh.clone(), 1);
+        let module = shard_map_module::<_, (ArrayType, ArrayType), ArrayType>(
+            |_, (x, r)| Ok(x * r),
+            (ArrayType::new_static(DataType::F32, [4]), ArrayType::new_static(DataType::F32, [2])),
+            mesh,
+            (sharded, replicated.clone().with_reduced_axes(["x"]).unwrap()),
+            replicated.with_unreduced_axes(["x"]).unwrap(),
+            ShardMapOptions::new().with_check_manual_variation(false),
+        )
+        .unwrap();
+        assert_eq!(
+            module,
+            indoc! {"
+                module {
+                  sdy.mesh @mesh = <[\"x\"=2]>
+                  func.func @main(%arg0: tensor<4xf32> {sdy.sharding = #sdy.sharding<@mesh, [{\"x\"}]>}, \
+                      %arg1: tensor<2xf32> {sdy.sharding = #sdy.sharding<@mesh, [{}]>}) -> (tensor<2xf32> \
+                      {sdy.sharding = #sdy.sharding<@mesh, [{}], unreduced={\"x\"}>}) {
+                    %0 = sdy.manual_computation(%arg0, %arg1) in_shardings=[<@mesh, [{\"x\"}]>, <@mesh, [{}]>] \
+                        out_shardings=[<@mesh, [{}], unreduced={\"x\"}>] manual_axes={\"x\"} \
+                        (%arg2: tensor<2xf32>, %arg3: tensor<2xf32>) {
+                      %1 = stablehlo.multiply %arg2, %arg3 : tensor<2xf32>
+                      sdy.return %1 : tensor<2xf32>
+                    } : (tensor<4xf32>, tensor<2xf32>) -> tensor<2xf32>
+                    return %0 : tensor<2xf32>
+                  }
+                }
+            "},
+        );
+
+        let plugin = load_cpu_plugin().unwrap();
+        let client = plugin
+            .client(ClientOptions::CPU(CpuClientOptions { device_count: Some(2), ..Default::default() }))
+            .unwrap();
+        let executable = client
+            .compile(&PjrtProgram::Mlir { bytecode: module.into_bytes() }, &test_spmd_compilation_options(2))
+            .unwrap();
+        let inputs = executable
+            .addressable_devices()
+            .unwrap()
+            .into_iter()
+            .zip([[1f32, 2.], [3., 4.]])
+            .map(|(device, x)| {
+                [x.as_slice(), &[5f32, 6.]]
+                    .into_iter()
+                    .map(|values| ExecutionInput {
+                        buffer: Arc::new(
+                            client
+                                .buffer(
+                                    values_to_bytes(values).as_slice(),
+                                    BufferType::F32,
+                                    [2],
+                                    None,
+                                    device.clone(),
+                                    None,
+                                )
+                                .unwrap(),
+                        ),
+                        donatable: false,
+                    })
+                    .collect::<Vec<_>>()
+            })
+            .collect::<Vec<_>>();
+        let outputs = executable
+            .execute(
+                inputs.iter().map(|inputs| ExecutionDeviceInputs { inputs, ..Default::default() }).collect(),
+                Vec::new(),
+                0,
+                None,
+                None,
+                None,
+                None,
+                &[],
+            )
+            .unwrap()
+            .block_until_ready()
+            .unwrap();
+        let summands = outputs
+            .into_iter()
+            .map(|output| values_from_bytes::<f32>(&output.outputs[0].copy_to_host(None).unwrap().r#await().unwrap()))
+            .collect::<Vec<_>>();
+        assert_eq!(summands, vec![vec![5.0, 12.0], vec![15.0, 24.0]]);
+    }
+
+    #[test]
+    fn test_to_mlir_module_for_program_without_manual_variation_passes_unreduced_summands_between_maps_on_cpu() {
+        use ryft_pjrt::{ExecutionDeviceInputs, ExecutionInput};
+
+        use crate::experimental::tracing::{TracedXlaProgram, trace_with_context};
+
+        // The first map returns each device's shard of `x = [1, 2]` as its summand of an unreduced output, and the
+        // second map squares each summand of its unreduced input. The summands survive between the maps, so the
+        // devices return `[1]` and `[4]`, whose sum is `5`, while the canonical decomposition of their sum (`[3]` on
+        // the first device and `[0]` on the second) would give `9`.
+        let mesh = test_manual_mesh("x", 2);
+        let sharded = Sharding::new(mesh.clone(), vec![ShardingDimension::sharded(["x"])]).unwrap();
+        let unreduced = Sharding::replicated(mesh.clone(), 1).with_unreduced_axes(["x"]).unwrap();
+        let options = ShardMapOptions::new().with_check_manual_variation(false);
+        let traced: TracedXlaProgram<ArrayType, ArrayType> = trace_with_context(
+            |_, x: XlaArrayTracer| {
+                let summands = shard_map(
+                    |x: XlaArrayTracer| Ok(x),
+                    x,
+                    mesh.clone(),
+                    sharded.clone(),
+                    unreduced.clone(),
+                    options.clone(),
+                )?;
+                Ok(shard_map(
+                    |summand: XlaArrayTracer| Ok(summand.clone() * summand),
+                    summands,
+                    mesh.clone(),
+                    unreduced.clone(),
+                    unreduced.clone(),
+                    options.clone(),
+                )?)
+            },
+            ArrayType::new_static(DataType::F32, [2]).with_sharding(sharded.clone()).unwrap(),
+        )
+        .unwrap();
+        let module = traced.to_mlir_module("main").unwrap();
+        assert_eq!(
+            module,
+            indoc! {"
+                module {
+                  sdy.mesh @mesh = <[\"x\"=2]>
+                  func.func @main(%arg0: tensor<2xf32> {sdy.sharding = #sdy.sharding<@mesh, [{\"x\"}]>}) -> \
+                      (tensor<1xf32> {sdy.sharding = #sdy.sharding<@mesh, [{}], unreduced={\"x\"}>}) {
+                    %0 = sdy.manual_computation(%arg0) in_shardings=[<@mesh, [{\"x\"}]>] \
+                        out_shardings=[<@mesh, [{}], unreduced={\"x\"}>] manual_axes={\"x\"} (%arg1: tensor<1xf32>) {
+                      sdy.return %arg1 : tensor<1xf32>
+                    } : (tensor<2xf32>) -> tensor<1xf32>
+                    %1 = sdy.manual_computation(%0) in_shardings=[<@mesh, [{}], unreduced={\"x\"}>] \
+                        out_shardings=[<@mesh, [{}], unreduced={\"x\"}>] manual_axes={\"x\"} (%arg1: tensor<1xf32>) {
+                      %2 = stablehlo.multiply %arg1, %arg1 : tensor<1xf32>
+                      sdy.return %2 : tensor<1xf32>
+                    } : (tensor<1xf32>) -> tensor<1xf32>
+                    return %1 : tensor<1xf32>
+                  }
+                }
+            "},
+        );
+
+        let plugin = load_cpu_plugin().unwrap();
+        let client = plugin
+            .client(ClientOptions::CPU(CpuClientOptions { device_count: Some(2), ..Default::default() }))
+            .unwrap();
+        let executable = client
+            .compile(&PjrtProgram::Mlir { bytecode: module.into_bytes() }, &test_spmd_compilation_options(2))
+            .unwrap();
+        let inputs = executable
+            .addressable_devices()
+            .unwrap()
+            .into_iter()
+            .zip([1f32, 2.])
+            .map(|(device, x)| {
+                vec![ExecutionInput {
+                    buffer: Arc::new(
+                        client
+                            .buffer(values_to_bytes(&[x]).as_slice(), BufferType::F32, [1], None, device, None)
+                            .unwrap(),
+                    ),
+                    donatable: false,
+                }]
+            })
+            .collect::<Vec<_>>();
+        let outputs = executable
+            .execute(
+                inputs.iter().map(|inputs| ExecutionDeviceInputs { inputs, ..Default::default() }).collect(),
+                Vec::new(),
+                0,
+                None,
+                None,
+                None,
+                None,
+                &[],
+            )
+            .unwrap()
+            .block_until_ready()
+            .unwrap();
+        let summands = outputs
+            .into_iter()
+            .map(|output| values_from_bytes::<f32>(&output.outputs[0].copy_to_host(None).unwrap().r#await().unwrap()))
+            .collect::<Vec<_>>();
+        assert_eq!(summands, vec![vec![1.0], vec![4.0]]);
+    }
+
+    #[test]
+    fn test_to_mlir_module_for_program_without_manual_variation_transposes_reduced_boundaries_on_cpu() {
+        use ryft_core::CotangentDestinationKind;
+        use ryft_pjrt::{ExecutionDeviceInputs, ExecutionInput};
+
+        use crate::experimental::lowering::to_mlir_module_for_program;
+
+        // The primal is `x -> 2x` over a reduced input and output. Its pullback receives one summand of the unreduced
+        // seed on each device, here `[1]` and `[2]` for the seed `3`, and returns one summand of the unreduced input
+        // cotangent on each device without dividing the seed or summing the cotangent, so the devices return `[2]`
+        // and `[4]`, whose sum is the cotangent `6`. Dividing the seed would give `[1]` and `[2]`, and summing the
+        // cotangent along `x` would give `[6]` on both devices.
+        let mesh = test_manual_mesh("x", 2);
+        let reduced = Sharding::replicated(mesh.clone(), 1).with_reduced_axes(["x"]).unwrap();
+        let global_type = ArrayType::new_static(DataType::F32, [1]).with_sharding(reduced.clone()).unwrap();
+        let (_, program) = DomainTracingContext::<XlaDomain<'static>>::trace(
+            |inputs: Vec<XlaTracer<'static>>| {
+                let input = ValueProjection::<ArrayType>::into_projected(inputs[0].clone())?;
+                let output = shard_map(
+                    |input: XlaArrayTracer| Ok(input.clone() + input),
+                    input,
+                    mesh,
+                    reduced.clone(),
+                    reduced.clone(),
+                    ShardMapOptions::new().with_check_manual_variation(false),
+                )?;
+                Ok(vec![output.into_value()])
+            },
+            vec![ArrayIrType::Array(global_type)],
+        )
+        .unwrap();
+        let pullback = program.transpose_with_respect_to(&[0], &[CotangentDestinationKind::Return]).unwrap();
+        let array_types = |types: Vec<ArrayIrType>| {
+            types
+                .iter()
+                .map(|r#type| <&ArrayType>::try_from(r#type).cloned())
+                .collect::<Result<Vec<_>, _>>()
+                .unwrap()
+        };
+        let input_types = array_types(pullback.input_types().into_owned());
+        let output_types = array_types(pullback.output_types().into_owned());
+        let shardings = |types: &[ArrayType]| types.iter().map(|r#type| r#type.sharding().unwrap().clone()).collect();
+        let input_shardings: Vec<Sharding> = shardings(&input_types);
+        let output_shardings: Vec<Sharding> = shardings(&output_types);
+        let module = to_mlir_module_for_program(
+            &pullback,
+            &[],
+            &input_types,
+            &output_types,
+            "main",
+            Some(&input_shardings),
+            Some(&output_shardings),
+        )
+        .unwrap();
+        assert_eq!(
+            module,
+            indoc! {"
+                module {
+                  sdy.mesh @mesh = <[\"x\"=2]>
+                  func.func @main(%arg0: tensor<1xf32> {sdy.sharding = \
+                      #sdy.sharding<@mesh, [{}], unreduced={\"x\"}>}) -> (tensor<1xf32> {sdy.sharding = \
+                      #sdy.sharding<@mesh, [{}], unreduced={\"x\"}>}) {
+                    %0 = sdy.manual_computation(%arg0) in_shardings=[<@mesh, [{}], unreduced={\"x\"}>] \
+                        out_shardings=[<@mesh, [{}], unreduced={\"x\"}>] manual_axes={\"x\"} (%arg1: tensor<1xf32>) {
+                      %1 = stablehlo.add %arg1, %arg1 : tensor<1xf32>
+                      sdy.return %1 : tensor<1xf32>
+                    } : (tensor<1xf32>) -> tensor<1xf32>
+                    return %0 : tensor<1xf32>
+                  }
+                }
+            "},
+        );
+
+        let plugin = load_cpu_plugin().unwrap();
+        let client = plugin
+            .client(ClientOptions::CPU(CpuClientOptions { device_count: Some(2), ..Default::default() }))
+            .unwrap();
+        let executable = client
+            .compile(&PjrtProgram::Mlir { bytecode: module.into_bytes() }, &test_spmd_compilation_options(2))
+            .unwrap();
+        let inputs = executable
+            .addressable_devices()
+            .unwrap()
+            .into_iter()
+            .zip([1f32, 2.])
+            .map(|(device, seed)| {
+                vec![ExecutionInput {
+                    buffer: Arc::new(
+                        client
+                            .buffer(values_to_bytes(&[seed]).as_slice(), BufferType::F32, [1], None, device, None)
+                            .unwrap(),
+                    ),
+                    donatable: false,
+                }]
+            })
+            .collect::<Vec<_>>();
+        let outputs = executable
+            .execute(
+                inputs.iter().map(|inputs| ExecutionDeviceInputs { inputs, ..Default::default() }).collect(),
+                Vec::new(),
+                0,
+                None,
+                None,
+                None,
+                None,
+                &[],
+            )
+            .unwrap()
+            .block_until_ready()
+            .unwrap();
+        let summands = outputs
+            .into_iter()
+            .map(|output| values_from_bytes::<f32>(&output.outputs[0].copy_to_host(None).unwrap().r#await().unwrap()))
+            .collect::<Vec<_>>();
+        assert_eq!(summands, vec![vec![2.0], vec![4.0]]);
     }
 
     #[test]
