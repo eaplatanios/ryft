@@ -1023,10 +1023,9 @@ pub struct CustomRuleDefinition<V: Typed + Parameter, O> {
     /// Named axes with which every rule is traced.
     named_axes: Vec<(String, NamedAxis)>,
 
-    // TODO(eaplatanios): Used "named" as a name here is a bit awkward, no? Also, `with_named()` and `named()`.
     /// Optional named computation that the calls of this definition compute, which definitions derived from
     /// this definition never inherit because they describe other computations.
-    named: Option<NamedComposite<V, O>>,
+    named_composite: Option<NamedComposite<V, O>>,
 
     /// Optional forward mode differentiation rule.
     jvp: Option<CustomRuleJvp<V, O>>,
@@ -1109,7 +1108,7 @@ impl<V: Typed<Type: Eq + Hash> + Parameter, O> CustomRuleDefinition<V, O> {
             id: NEXT_CUSTOM_RULE_DEFINITION_ID.fetch_add(1, Ordering::Relaxed),
             name: name.into(),
             named_axes: Vec::new(),
-            named: None,
+            named_composite: None,
             jvp: None,
             vjp: None,
             deferred_forward: false,
@@ -1154,9 +1153,9 @@ impl<V: Typed<Type: Eq + Hash> + Parameter, O> CustomRuleDefinition<V, O> {
     /// through [`CustomRuleRegistration::named`], which shares one definition across every construction with an equal
     /// key.
     #[inline]
-    pub fn with_named(mut self, named: NamedComposite<V, O>) -> Self {
-        self.name = Cow::Owned(named.key().name().to_owned());
-        self.named = Some(named);
+    pub fn with_named_composite(mut self, named_composite: NamedComposite<V, O>) -> Self {
+        self.name = Cow::Owned(named_composite.key().name().to_owned());
+        self.named_composite = Some(named_composite);
         self
     }
 
@@ -1624,7 +1623,7 @@ impl<V: Typed<Type: Eq + Hash> + Parameter, O> CustomRuleDefinition<V, O> {
 
     /// Returns the display label of this [`CustomRuleDefinition`], borrowed without cloning it, which rendering and
     /// diagnostics use. It never identifies the definition: distinct definitions may share it, and the label of a named
-    /// computation is the name of its key. Refer to [`Self::with_named`] for more information.
+    /// computation is the name of its key. Refer to [`Self::with_named_composite`] for more information.
     #[inline]
     pub fn name(&self) -> &str {
         self.name.as_ref()
@@ -1639,8 +1638,8 @@ impl<V: Typed<Type: Eq + Hash> + Parameter, O> CustomRuleDefinition<V, O> {
     /// Returns the named computation that the calls of this [`CustomRuleDefinition`] compute, or [`None`]
     /// for a definition whose identity is its process-unique [`Self::id`] only.
     #[inline]
-    pub fn named(&self) -> Option<&NamedComposite<V, O>> {
-        self.named.as_ref()
+    pub fn named_composite(&self) -> Option<&NamedComposite<V, O>> {
+        self.named_composite.as_ref()
     }
 
     /// Returns the configured forward mode rule, or [`None`] when no forward mode rule is configured. An explicit
@@ -1800,16 +1799,15 @@ impl<V: Typed<Type: Eq + Hash> + Parameter, O> CustomRuleDefinition<V, O> {
 impl<V: Typed<Type: Eq + Hash> + Parameter, O> Debug for CustomRuleDefinition<V, O> {
     fn fmt(&self, formatter: &mut std::fmt::Formatter<'_>) -> std::fmt::Result {
         let mut debug = formatter.debug_struct("CustomRuleDefinition");
+        debug.field("name", &self.name);
+        if let Some(named_composite) = &self.named_composite {
+            debug.field("key", named_composite.key());
+        }
         debug
-            .field("name", &self.name)
             .field("has_jvp", &matches!(self.jvp, Some(CustomRuleJvp::Rule(_) | CustomRuleJvp::SymbolicZeroRule(_))))
             .field("derives_jvp_from_primal", &matches!(self.jvp, Some(CustomRuleJvp::Derived)))
-            .field("has_vjp", &self.vjp.is_some());
-        // TODO(eaplatanios): This is weirdly named as "named". Also, shouldn't it appear before `has_jvp`?
-        if let Some(named) = &self.named {
-            debug.field("named", named.key());
-        }
-        debug.finish_non_exhaustive()
+            .field("has_vjp", &self.vjp.is_some())
+            .finish_non_exhaustive()
     }
 }
 

@@ -1,8 +1,3 @@
-//! Rule sources for registered ([`CustomRuleReference`]), unavailable ([`UnavailableCustomRules`]), and lifted
-//! ([`LiftedCustomRules`]) rule sets, which composite calls and carriers inspect through the sealed [`CustomRuleSource`]
-//! interface, together with the internal specialization machinery that traces, batches, and transposes retained rules
-//! into cached programs.
-
 use std::borrow::Cow;
 use std::collections::HashSet;
 use std::fmt::Debug;
@@ -17,13 +12,11 @@ use crate::differentiation::{
     CotangentDestinationKind, DifferentiableType, DifferentiationError, ResidualZeroProvider,
     TransposedProgramCotangent,
 };
-use crate::operations::composites::derive_bijective_identity_renaming;
-use crate::operations::composites::describe_composite;
 use crate::operations::composites::operations::{
     COMPOSITE_OPERATION_NAME, COMPOSITE_TRANSPOSE_OPERATION_NAME, CompositeTransposeOperation,
 };
 use crate::operations::composites::rules::definitions::{
-    CustomRuleBroadcastSensitivity, CustomRuleDefinition, CustomRuleJvp, CustomRuleJvpRule, CustomRuleVjp,
+    CompositeKey, CustomRuleBroadcastSensitivity, CustomRuleDefinition, CustomRuleJvp, CustomRuleJvpRule, CustomRuleVjp,
 };
 use crate::operations::composites::rules::registrations::CustomRuleReference;
 use crate::operations::composites::rules::{
@@ -31,6 +24,7 @@ use crate::operations::composites::rules::{
     CustomRuleBatchingSpecializationKey, CustomRuleDerivationKind, CustomRuleDerivedDefinitionKey,
     CustomRuleForwardSpecializationKey, CustomRuleSpecialization, CustomRuleSpecializationRequest, CustomRuleTracer,
 };
+use crate::operations::composites::{derive_bijective_identity_renaming, describe_composite};
 use crate::parameters::{Parameter, Placeholder};
 use crate::programs::{
     MaybeZero, Operation, Program, ProgramBuilder, ProgramError, Type, TypeError, Typed, TypedProgram, Value,
@@ -78,6 +72,10 @@ pub trait CustomRuleSource<V: Typed<Type: Eq + Hash> + Parameter, O>:
     /// Returns the process-unique identity of the source's definition.
     fn id(&self) -> u64;
 
+    /// Returns the semantic identity of the source's definition, or [`None`] for a definition that is not named.
+    /// Refer to [`NamedComposite`](crate::NamedComposite) for more information.
+    fn key(&self) -> Option<&CompositeKey>;
+
     /// Returns the human-readable label of the source's definition.
     fn name(&self) -> &str;
 
@@ -121,6 +119,11 @@ impl<V: Typed<Type: Eq + Hash> + Parameter, O> CustomRuleSource<V, O> for Custom
     #[inline]
     fn id(&self) -> u64 {
         self.definition().id()
+    }
+
+    #[inline]
+    fn key(&self) -> Option<&CompositeKey> {
+        self.definition().named_composite().map(|named_composite| named_composite.key())
     }
 
     #[inline]
@@ -844,6 +847,9 @@ pub struct UnavailableCustomRules {
     /// Process-unique identity of the original definition.
     id: u64,
 
+    /// Semantic identity of the original definition, if it is named.
+    key: Option<CompositeKey>,
+
     /// Human-readable label of the original definition.
     name: Cow<'static, str>,
 
@@ -876,6 +882,7 @@ impl UnavailableCustomRules {
     pub fn from_source<V: Typed<Type: Eq + Hash> + Parameter, O, S: CustomRuleSource<V, O>>(rules: &S) -> Self {
         Self {
             id: rules.id(),
+            key: rules.key().cloned(),
             name: Cow::Owned(rules.name().to_owned()),
             has_jvp: rules.has_jvp(),
             derives_jvp_from_primal: rules.derives_jvp_from_primal(),
@@ -1062,6 +1069,14 @@ where
     #[inline]
     fn id(&self) -> u64 {
         self.id()
+    }
+
+    #[inline]
+    fn key(&self) -> Option<&CompositeKey> {
+        match self {
+            Self::Member(rules) => rules.key(),
+            Self::Unavailable(rules) => rules.key.as_ref(),
+        }
     }
 
     #[inline]
@@ -1998,6 +2013,58 @@ where
     }
 }
 
+impl<V: Value<Type: Eq + Hash>, O: Operation<Type = V::Type>> CustomRuleReference<V, O>
+where
+    TracingContext<V, O>: StagingContext<Type = V::Type, Constant = V, Operation = O>,
+{
+    /// Returns a validated specialization of this reference's named composite body for `input_types`, ready to attach
+    /// as the primal region of a composite call. The body is traced with the definition's named axes, and its outputs
+    /// have exactly the types, including the type identities, that the definition's output type rule assigns to those
+    /// calls. The returned [`Arc`] lets callers share the program across calls without copying it.
+    ///
+    /// Repeated requests reuse the program while it remains in the caches owned by a live
+    /// [`CustomRuleRegistration`](crate::CustomRuleRegistration). Requests after eviction or after every registration
+    /// handle is dropped trace the body again, so tracing is not guaranteed to run exactly once.
+    ///
+    /// # Errors
+    ///
+    /// Returns a [`ProgramError`] when the definition is not named, when its output type rule rejects `input_types`,
+    /// when tracing the body fails or produces outputs that the rule does not describe, or when the same body
+    /// specialization is requested recursively on the same thread while it is being produced.
+    pub fn body(&self, input_types: &[V::Type]) -> Result<Arc<Program<V, O, Vec<V>, Vec<V>>>, ProgramError> {
+        let Some(named_composite) = self.definition().named_composite() else {
+            return Err(ProgramError::UnsupportedOperation {
+                message: format!(
+                    "{} is not a named composite and has no retained body",
+                    describe_composite(COMPOSITE_OPERATION_NAME, self.name()),
+                ),
+            });
+        };
+        let body = named_composite.body();
+        self.body_specialization(input_types, || {
+            let output_types = named_composite.output_types(input_types)?;
+            let (_, program) = TracingContext::<V, O>::trace_with_named_axes(
+                |values: Vec<CustomRuleTracer<V, O>>| {
+                    let outputs = body.apply(&values)?;
+                    if outputs.len() != output_types.len() {
+                        return Err(TypeError::invalid(format!(
+                            "named composite `{}` body returned {} outputs but its output type rule describes {}",
+                            named_composite.key(),
+                            outputs.len(),
+                            output_types.len(),
+                        ))
+                        .into());
+                    }
+                    Ok(outputs)
+                },
+                input_types.to_vec(),
+                self.definition().named_axes().to_vec(),
+            )?;
+            Ok(Arc::new(align_rule_output_type_identities(self.name(), "body", program, &output_types, None)?))
+        })
+    }
+}
+
 /// Validates that `program`, a retained rule of the custom rule set named `name` traced in its own trace, returns the
 /// `expected` types as its leading outputs (or as its outputs at the `selected` positions, when provided), and returns
 /// it with its type identities renamed onto those of `expected`. The trace establishes fresh identities for the extents
@@ -2061,8 +2128,11 @@ mod tests {
     };
     use crate::contexts::Context;
     use crate::operations::arithmetic::MulOperation;
+    use crate::operations::composites::rules::definitions::{CompositeKey, NamedComposite};
     use crate::operations::composites::rules::registrations::CustomRuleRegistration;
-    use crate::operations::composites::tests::{MemberDefinition, RuleCounters, member_cube_definition};
+    use crate::operations::composites::tests::{
+        MemberDefinition, RuleCounters, member_cube_definition, named_cube_definition,
+    };
     use crate::programs::ReferenceType;
     use crate::tests::hash_of;
 
@@ -2710,7 +2780,7 @@ mod tests {
         assert_eq!(
             format!("{unavailable:?}"),
             format!(
-                "Unavailable(UnavailableCustomRules {{ id: {id}, name: \"cube\", has_jvp: false, \
+                "Unavailable(UnavailableCustomRules {{ id: {id}, key: None, name: \"cube\", has_jvp: false, \
                  derives_jvp_from_primal: false, has_vjp: false, defers_forward: false, batched_output_axes: None, \
                  has_batching_rule: false, has_sequential_batching: false }})",
             ),
@@ -3356,5 +3426,85 @@ mod tests {
                 if message == "`composite` `pair` JVP rule output type signature mismatch: expected [f32[n], f32[n]] \
                                but got [f32[n], f32[n]] with different type identities",
         ));
+    }
+
+    #[test]
+    fn test_custom_rule_reference_body() {
+        // The body is traced on the first request for each input types and cached, and every registration of the
+        // same named composite shares that cache.
+        let key = CompositeKey::new("ryft.tests.body", 1);
+        let traces = Arc::new(AtomicUsize::new(0));
+        let register = || {
+            CustomRuleRegistration::named(&key, &[], (), || Ok(named_cube_definition(key.clone(), &traces))).unwrap()
+        };
+        let registration = register();
+        let scalar_type = ArrayType::scalar(DataType::F64);
+        let body = registration.reference().body(std::slice::from_ref(&scalar_type)).unwrap();
+        assert_eq!(
+            body.to_string(),
+            indoc! {"
+                lambda %0:f64[] .
+                let %1:f64[] = mul %0 %0
+                    %2:f64[] = mul %1 %0
+                in (%2)
+            "}
+            .trim_end(),
+        );
+        let repeated = register().reference().body(std::slice::from_ref(&scalar_type)).unwrap();
+        assert!(Arc::ptr_eq(&body, &repeated));
+        assert_eq!(traces.load(Ordering::SeqCst), 1);
+
+        // Other input types are traced separately.
+        let vector_type = ArrayType::new_static(DataType::F64, [3]);
+        let vector_body = registration.reference().body(std::slice::from_ref(&vector_type)).unwrap();
+        assert_eq!(vector_body.output_types(), vec![vector_type]);
+        assert_eq!(traces.load(Ordering::SeqCst), 2);
+    }
+
+    #[test]
+    fn test_custom_rule_reference_body_errors() {
+        let scalar_type = ArrayType::scalar(DataType::F64);
+        let error = |registration: &CustomRuleRegistration<Array, ArrayOperation<Array>>| {
+            registration.reference().body(std::slice::from_ref(&scalar_type)).unwrap_err()
+        };
+        let unsupported = |message: &str| ProgramError::UnsupportedOperation { message: message.to_string() };
+
+        // Only named composites have bodies.
+        let counters = Arc::new(RuleCounters::default());
+        let closure = CustomRuleRegistration::new(member_cube_definition(&counters));
+        assert_eq!(
+            error(&closure),
+            unsupported("`composite` `cube` is not a named composite and has no retained body")
+        );
+
+        // Output type rules that reject the inputs, and bodies whose outputs the rules do not describe, are rejected.
+        let key = CompositeKey::new("ryft.tests.body_errors", 1);
+        let cube = |output_types: fn(&[ArrayType]) -> Result<Vec<ArrayType>, ProgramError>| {
+            CustomRuleRegistration::new(MemberDefinition::new("cube").with_named_composite(NamedComposite::new(
+                key.clone(),
+                output_types,
+                |inputs: &[CustomRuleTracer<Array, ArrayOperation<Array>>]| {
+                    Ok(vec![inputs[0].clone() * inputs[0].clone()])
+                },
+            )))
+        };
+        assert_eq!(
+            error(&cube(|_| Err(TypeError::invalid("rejected").into()))),
+            ProgramError::from(TypeError::invalid("rejected")),
+        );
+        assert_eq!(
+            error(&cube(|types| Ok([types, types].concat()))),
+            ProgramError::from(TypeError::invalid(
+                "named composite `ryft.tests.body_errors.v1` body returned 1 outputs but its output type rule \
+                 describes 2",
+            )),
+        );
+        assert_eq!(
+            error(&cube(|_| Ok(vec![ArrayType::scalar(DataType::F32)]))),
+            ProgramError::from(TypeError::invalid(
+                "`composite` `ryft.tests.body_errors` body rule output type signature mismatch: \
+                 expected [f32[]] but got [f64[]]",
+            )),
+        );
     }
 }
