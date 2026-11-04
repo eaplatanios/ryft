@@ -537,14 +537,17 @@ enum TransformCachePolicy {
     Preserve,
 }
 
-/// Append-only arena of sealed [`Region`]s and their immutable derived metadata. [`RegionId`]s are stable indexes into
-/// this arena. A region may reference only entries that precede it, allowing construction to validate and derive
+/// Append-only arena of sealed [`Region`]s and their immutable derived metadata. [`RegionId`]s are stable indexes
+/// into this arena. A region may reference only entries that precede it, allowing construction to validate and derive
 /// recursive metadata like [`EffectClasses`] and [`TypeIdentitySignature`]s in one ascending pass. Built [`Program`]s
 /// retain this arena without exposing mutable access to either regions or metadata.
 #[derive(Clone, Debug)]
 pub struct RegionArena<V: Typed + Parameter, O> {
     /// Sealed [`Region`]s and their derived metadata, in [`RegionId`] order.
     regions: Vec<RegionWithMetadata<V, O>>,
+
+    /// Shared callee [`Program`]s whose entry regions this arena holds as plain interned roots.
+    callees: RegionArenaCallees<V, O>,
 }
 
 impl<V: Value, O: Operation<Type = V::Type>> RegionArena<V, O> {
@@ -670,6 +673,25 @@ impl<V: Value, O: Operation<Type = V::Type>> RegionArena<V, O> {
         Ok(id)
     }
 
+    /// Returns the shared callee [`Program`] whose entry region is the root `id` of this arena, if `id` is an interned
+    /// callee root. Refer to the documentation of [`RegionArenaCallees`] for more information.
+    #[inline]
+    pub(super) fn callee(&self, id: RegionId) -> Option<&Arc<Program<V, O, Vec<V>, Vec<V>>>> {
+        self.callees.entries.iter().find_map(|(region, callee)| (*region == id).then_some(callee))
+    }
+
+    /// Returns `true` if this arena holds any interned callee root.
+    #[inline]
+    pub(super) fn has_callees(&self) -> bool {
+        !self.callees.entries.is_empty()
+    }
+
+    /// Records that the root `id` of this arena is the entry region of the shared `callee`.
+    #[inline]
+    pub(super) fn record_callee(&mut self, id: RegionId, callee: Arc<Program<V, O, Vec<V>, Vec<V>>>) {
+        self.callees.entries.push((id, callee));
+    }
+
     /// Appends every sealed [`Region`] in `other` to this [`RegionArena`], rebasing its internal [`RegionId`]
     /// references by this arena's original length, and returns that offset. The derived metadata remains valid because
     /// rebasing preserves the complete source graph's topology and does not change any region boundary, [`Operation`],
@@ -684,20 +706,30 @@ impl<V: Value, O: Operation<Type = V::Type>> RegionArena<V, O> {
             }
         }
         self.regions.append(&mut other.regions);
+        self.callees.entries.extend(
+            other
+                .callees
+                .entries
+                .into_iter()
+                .map(|(region, callee)| (RegionId::new(region.index() + offset), callee)),
+        );
         offset
     }
 
     /// Removes and returns the last [`Region`] in this [`RegionArena`].
     #[inline]
     pub fn pop(&mut self) -> Option<Region<V, O>> {
-        self.regions.pop().map(|region| region.region)
+        let region = self.regions.pop()?;
+        let removed_id = RegionId::new(self.regions.len());
+        self.callees.entries.retain(|(id, _)| *id != removed_id);
+        Some(region.region)
     }
 }
 
 impl<V: Typed + Parameter, O> Default for RegionArena<V, O> {
     #[inline]
     fn default() -> Self {
-        Self { regions: Vec::new() }
+        Self { regions: Vec::new(), callees: RegionArenaCallees::default() }
     }
 }
 
@@ -717,6 +749,32 @@ impl<'r, V: Typed + Parameter, O> IntoIterator for &'r RegionArena<V, O> {
     #[inline]
     fn into_iter(self) -> Self::IntoIter {
         RegionArenaIterator { regions: self.regions.iter() }
+    }
+}
+
+/// Shared callee [`Program`]s whose entry regions a [`RegionArena`] holds as plain interned roots (and which were
+/// interned using [`ProgramBuilder::intern_callee`]), keyed by the root's [`RegionId`]. Importing such a root into
+/// another builder interns the same callee there instead of copying it, so the callee stays shared when a program
+/// that interns it is replayed or imported (e.g., when a transform replays a cached rule program that calls a named
+/// composite). Each entry holds its callee alive, so the provenance can never refer to a later allocation. Renamed
+/// or partially materialized arenas do not inherit these entries, so their roots are copied.
+#[derive(Clone)]
+struct RegionArenaCallees<V: Typed + Parameter, O> {
+    /// Interned roots and the callee [`Program`]s whose entry regions they are.
+    entries: Vec<(RegionId, Arc<Program<V, O, Vec<V>, Vec<V>>>)>,
+}
+
+impl<V: Typed + Parameter, O> Default for RegionArenaCallees<V, O> {
+    #[inline]
+    fn default() -> Self {
+        Self { entries: Vec::new() }
+    }
+}
+
+impl<V: Typed + Parameter, O> Debug for RegionArenaCallees<V, O> {
+    #[inline]
+    fn fmt(&self, formatter: &mut std::fmt::Formatter<'_>) -> std::fmt::Result {
+        formatter.debug_list().entries(self.entries.iter().map(|(region, _)| region)).finish()
     }
 }
 
@@ -1673,6 +1731,14 @@ impl<'r, V: Value, O: Operation<Type = V::Type>> ReplayRegionDriver<'r, V, O> {
                     Some(source) => RegionRef::new(&source.arena, *root)?,
                     None => self.source.with_id(*root)?,
                 };
+
+                // A root that interns a shared callee is interned again through the builder's own instantiation cache,
+                // which every replay of the root reuses instead of deriving its formal input renaming again. Renamed
+                // source views hold no interned callees, so only replays without a substitution reach this path.
+                if let Some(callee) = region.arena().callee(*root) {
+                    let callee = callee.clone();
+                    return builder.intern_callee(&callee, input_types.as_deref());
+                }
 
                 // No requested input signature and no replay substitution. Import directly through the shared
                 // region ID map. It records descendants too, so two attached roots can reuse one imported child.

@@ -543,6 +543,15 @@ impl<V: Value, O: Operation<Type = V::Type>> ProgramBuilder<V, O> {
             return *mapped;
         }
 
+        // A root that interns a shared callee in its source arena interns the same callee here, so that every program
+        // that replays or imports it shares one root rather than copying the callee each time.
+        if let Some(callee) = region.arena().callee(region.id()) {
+            let callee = callee.clone();
+            let imported = self.intern_callee_without_type_renaming(&callee);
+            remapping.insert(region.id(), imported);
+            return imported;
+        }
+
         let source_id = region.id();
         let mut imported = region.region().clone();
         for instruction in &mut imported.instructions {
@@ -569,6 +578,11 @@ impl<V: Value, O: Operation<Type = V::Type>> ProgramBuilder<V, O> {
         &mut self,
         program: Program<V, O, Input, Output>,
     ) -> RegionId {
+        // A program that interns shared callees is imported region by region instead, so that this builder shares those
+        // callees with its other imports rather than holding another copy of each.
+        if program.regions.has_callees() {
+            return self.import_region_with_remapping(program.entry_region_ref(), &mut HashMap::new());
+        }
         let Program { regions, entry, .. } = program;
         let offset = self.regions.append(regions);
         RegionId::new(entry.index() + offset)
@@ -590,7 +604,7 @@ impl<V: Value, O: Operation<Type = V::Type>> ProgramBuilder<V, O> {
         O: Clone,
     {
         // An exact repeated instantiation can immediately reuse its previously imported root. Keep this lookup
-        // separate from the plain-callee cache below because the caller input types are part of this cache key.
+        // separate from the callee cache below because the caller input types are part of this cache key.
         let cached_region = input_types.and_then(|input_types| {
             self.callee_instantiations.iter().find_map(|instantiation| {
                 let same_callee = Arc::ptr_eq(&instantiation.callee, callee);
@@ -613,18 +627,8 @@ impl<V: Value, O: Operation<Type = V::Type>> ProgramBuilder<V, O> {
             // A non-identity renaming is embedded in the imported region's types, so it requires its own root.
             self.import_program(callee.rename_type_identities(renaming)?)
         } else {
-            // No renaming, or an identity renaming, can reuse the one plain root interned for this exact `Arc` callee.
-            let existing_region = self.callees.iter().find_map(|(interned, region)| {
-                let same_callee = Arc::ptr_eq(interned, callee);
-                same_callee.then_some(*region)
-            });
-            if let Some(region) = existing_region {
-                region
-            } else {
-                let region = self.import_region(callee.entry_region_ref());
-                self.callees.push((callee.clone(), region));
-                region
-            }
+            // No renaming, or an identity renaming, can reuse the root interned for this exact `Arc` callee.
+            self.intern_callee_without_type_renaming(callee)
         };
 
         if let Some(input_types) = input_types {
@@ -637,6 +641,22 @@ impl<V: Value, O: Operation<Type = V::Type>> ProgramBuilder<V, O> {
         }
 
         Ok(region)
+    }
+
+    /// Interns `callee` by [`Arc`] identity without renaming its type identities, importing its entry region on first
+    /// use and returning the imported root.
+    fn intern_callee_without_type_renaming(&mut self, callee: &Arc<Program<V, O, Vec<V>, Vec<V>>>) -> RegionId
+    where
+        O: Clone,
+    {
+        let existing_region =
+            self.callees.iter().find_map(|(interned, region)| Arc::ptr_eq(interned, callee).then_some(*region));
+        if let Some(region) = existing_region {
+            return region;
+        }
+        let region = self.import_region(callee.entry_region_ref());
+        self.callees.push((callee.clone(), region));
+        region
     }
 
     /// Finalizes this [`ProgramBuilder`] into a [`Program`] with the provided input and output structures.
@@ -666,6 +686,11 @@ impl<V: Value, O: Operation<Type = V::Type>> ProgramBuilder<V, O> {
         // to previously sealed regions. The same checks keep the entry region unreferenced, since its identifier is
         // assigned last.
         let mut regions = self.regions;
+        for (callee, region) in self.callees {
+            // Interned callee roots stay recognizable in the built program, so that importing or replaying
+            // it elsewhere interns those callees again (refer to `RegionArena::callee`).
+            regions.record_callee(region, callee);
+        }
         regions.push(Region::new(self.atoms, self.input_ids, output_ids, self.instructions))?;
         let reachable = reachable_region_mask(regions.len(), [entry], |id| &regions[id.index()]);
         if let Some(unreachable) = reachable.iter().position(|is_reachable| !is_reachable) {
@@ -1245,6 +1270,47 @@ mod tests {
             Err(ProgramError::MalformedProgram(message))
                 if message == format!("instruction output atom {output} is produced by more than one instruction")
         ));
+    }
+
+    #[test]
+    fn test_program_builder_interns_callees_of_imported_programs() {
+        // A program that interns a callee keeps it recognizable, so importing that program elsewhere, whether moved
+        // or borrowed, interns the same callee again instead of copying it.
+        let scalar_type = ArrayType::scalar(DataType::F64);
+        let mut callee_builder = ProgramBuilder::<Array, TestRegionOperation>::new();
+        let callee_input = callee_builder.add_input(scalar_type.clone());
+        let callee = Arc::new(
+            callee_builder
+                .build::<Vec<Array>, Vec<Array>>(vec![callee_input], vec![Placeholder], vec![Placeholder])
+                .unwrap(),
+        );
+        let mut caller_builder = ProgramBuilder::<Array, TestRegionOperation>::new();
+        let interned = caller_builder.intern_callee(&callee, None).unwrap();
+        let input = caller_builder.add_input(scalar_type);
+        let output = caller_builder
+            .add_instruction(
+                TestRegionOperation::WithRegions(const { &[RegionSlot::computation("body")] }),
+                vec![interned],
+                vec![input],
+                None,
+            )
+            .unwrap()[0];
+        let caller = caller_builder
+            .build::<Vec<Array>, Vec<Array>>(vec![output], vec![Placeholder], vec![Placeholder])
+            .unwrap();
+        assert!(caller.regions.callee(interned).is_some_and(|recorded| Arc::ptr_eq(recorded, &callee)));
+
+        let mut destination = ProgramBuilder::<Array, TestRegionOperation>::new();
+        let roots = [
+            destination.import_program(caller.clone()),
+            destination.import_program(caller.clone()),
+            destination.import_region(caller.entry_region_ref()),
+        ];
+        let callee_root = destination.intern_callee(&callee, None).unwrap();
+        for root in roots {
+            assert_eq!(destination.regions[root.index()].instructions()[0].regions(), &[callee_root]);
+        }
+        assert_eq!(destination.regions.len(), 4);
     }
 
     #[test]
