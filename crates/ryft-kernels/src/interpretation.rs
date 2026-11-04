@@ -960,13 +960,11 @@ where
 #[cfg(test)]
 mod tests {
     use pretty_assertions::assert_eq;
-    use ryft_core::operations::attention::{AttentionConfiguration, AttentionImplementation, AttentionInputSignature};
     use ryft_core::{
         AddOperation, ArrayIrOperation, ArrayReferenceTransformIndex, ArrayType, ConditionOperation, Context, DataType,
-        Dimension, DimensionBounds, DimensionMulOperation, DimensionToScalarOperation, DimensionType,
-        DotProductAttentionOperation, Layout, Memory, Placeholder, ProgramBuilder, ReduceOperation, ReductionKind,
-        ReferenceRead, ReferenceWrite, ReferenceWriteOperation, ScaledDotOperation, StridedLayout, TracingContext,
-        WhileOperation,
+        Dimension, DimensionBounds, DimensionMulOperation, DimensionToScalarOperation, DimensionType, Layout, Memory,
+        Placeholder, ProgramBuilder, ReduceOperation, ReductionKind, ReferenceRead, ReferenceWrite,
+        ReferenceWriteOperation, ScaledDotOperation, StridedLayout, TracingContext, WhileOperation,
     };
 
     use crate::authoring::whole_array_parameter;
@@ -1153,27 +1151,6 @@ mod tests {
             &inputs.iter().map(|input| input.r#type().into_owned()).collect::<Vec<_>>(),
         );
         let expected = vec![Array::matrix(1, 1, vec![62f32]).unwrap()];
-        assert_eq!(definition.interpret(inputs.clone(), 1), Ok(expected.clone()));
-        assert_eq!(definition.simplified().unwrap().interpret(inputs, 1), Ok(expected));
-    }
-
-    #[test]
-    fn test_kernel_definition_interpret_attention() {
-        // Zero logits give an exact uniform distribution, providing an independent arithmetic oracle.
-        let inputs = vec![
-            Array::from_elements(ArrayType::new_static(DataType::F32, [1, 1, 2]), &[0f32, 0.]).unwrap(),
-            Array::from_elements(ArrayType::new_static(DataType::F32, [2, 1, 2]), &[0f32, 0., 0., 0.]).unwrap(),
-            Array::from_elements(ArrayType::new_static(DataType::F32, [2, 1, 2]), &[2f32, 4., 4., 6.]).unwrap(),
-        ];
-        let definition = value_definition(
-            ArrayOperation::DotProductAttention(DotProductAttentionOperation::new(
-                AttentionConfiguration::new().with_implementation(AttentionImplementation::Portable),
-                AttentionInputSignature::new(false, false, false, false),
-            )),
-            &inputs.iter().map(|input| input.r#type().into_owned()).collect::<Vec<_>>(),
-        );
-        let expected =
-            vec![Array::from_elements(ArrayType::new_static(DataType::F32, [1, 1, 2]), &[3f32, 5.]).unwrap()];
         assert_eq!(definition.interpret(inputs.clone(), 1), Ok(expected.clone()));
         assert_eq!(definition.simplified().unwrap().interpret(inputs, 1), Ok(expected));
     }

@@ -11,7 +11,7 @@ use std::error::Error;
 use serde::Serialize;
 
 use ryft_core::operations::attention::{
-    AttentionConfiguration, AttentionImplementation, AttentionInputs, DotProductAttention,
+    AttentionConfiguration, AttentionImplementation, AttentionInputs, dot_product_attention,
 };
 use ryft_core::{
     Array, ArrayIrBatch, ArrayIrBatchingPolicy, ArrayIrOperation, ArrayIrType, ArrayIrValue, ArrayOperation, ArrayType,
@@ -734,30 +734,34 @@ fn emit_dot_product_attention() -> Result<DifferentialObservation, Box<dyn Error
         mask: Some(Array::from_elements(mask_type.clone(), &[true, false, false, true])?),
         query_sequence_lengths: Some(Array::from_elements(lengths_type.clone(), &[2_i32])?),
         key_value_sequence_lengths: Some(Array::from_elements(lengths_type.clone(), &[2_i32])?),
+        dropout_state: None,
     };
-    let (output, residual) = Array::dot_product_attention(inputs, configuration)?;
+    let (output, residual) =
+        dot_product_attention::<EagerContext<Array, ArrayOperation<Array>>>(configuration).call(inputs)?;
     let values = |value: Array| vec![value.to_f64s().into_iter().map(|value| value as f32).collect::<Vec<_>>()];
     let gqa_query_type = ArrayType::new_static(DataType::F32, [1, 2, 4, 1]);
     let gqa_key_value_type = ArrayType::new_static(DataType::F32, [1, 3, 2, 1]);
-    let (gqa_output, _) = Array::dot_product_attention(
-        AttentionInputs {
-            query: Array::from_elements::<f32>(gqa_query_type, &[0.0; 8])?,
-            key: Array::from_elements::<f32>(gqa_key_value_type.clone(), &[0.0; 6])?,
-            value: Array::from_elements::<f32>(gqa_key_value_type, &[1.0, 10.0, 2.0, 20.0, 4.0, 40.0])?,
-            bias: None,
-            mask: None,
-            query_sequence_lengths: None,
-            key_value_sequence_lengths: Some(Array::from_elements(lengths_type.clone(), &[2_i32])?),
-        },
+    let (gqa_output, _) = dot_product_attention::<EagerContext<Array, ArrayOperation<Array>>>(
         AttentionConfiguration::new()
             .with_local_window((1, 1))
             .with_implementation(AttentionImplementation::Portable),
-    )?;
+    )
+    .call(AttentionInputs {
+        query: Array::from_elements::<f32>(gqa_query_type, &[0.0; 8])?,
+        key: Array::from_elements::<f32>(gqa_key_value_type.clone(), &[0.0; 6])?,
+        value: Array::from_elements::<f32>(gqa_key_value_type, &[1.0, 10.0, 2.0, 20.0, 4.0, 40.0])?,
+        bias: None,
+        mask: None,
+        query_sequence_lengths: None,
+        key_value_sequence_lengths: Some(Array::from_elements(lengths_type.clone(), &[2_i32])?),
+        dropout_state: None,
+    })?;
     let observations = BTreeMap::from([
         ("output", values(output)),
         ("residual", values(residual.expect("the configuration requests a residual"))),
         ("rank_four_gqa", values(gqa_output)),
     ]);
+    let attention = dot_product_attention::<ProjectedContext<XlaDomain<'static>, ArrayType>>(configuration);
     let traced: TracedXlaProgram<
         (ArrayType, ArrayType, ArrayType, ArrayType, ArrayType, ArrayType, ArrayType),
         (ArrayType, ArrayType),
@@ -771,8 +775,8 @@ fn emit_dot_product_attention() -> Result<DifferentialObservation, Box<dyn Error
             XlaArrayTracer,
             XlaArrayTracer,
         )| {
-            let (output, residual) = XlaArrayTracer::dot_product_attention(
-                AttentionInputs {
+            let (output, residual) = attention
+                .call(AttentionInputs {
                     query,
                     key,
                     value,
@@ -780,10 +784,9 @@ fn emit_dot_product_attention() -> Result<DifferentialObservation, Box<dyn Error
                     mask: Some(mask),
                     query_sequence_lengths: Some(query_sequence_lengths),
                     key_value_sequence_lengths: Some(key_value_sequence_lengths),
-                },
-                configuration,
-            )
-            .unwrap();
+                    dropout_state: None,
+                })
+                .unwrap();
             (output, residual.expect("the configuration requests a residual"))
         },
         (query_type, key_value_type.clone(), key_value_type, bias_type, mask_type, lengths_type.clone(), lengths_type),

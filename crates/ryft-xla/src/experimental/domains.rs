@@ -14,13 +14,13 @@ use prost::Message;
 use ryft_core::macros::check_count;
 use ryft_core::{
     AnalyzableCompilationDomain, ArrayIrType, ArrayIrValue, ArrayOperation, ArrayReference, ArrayType, AttachedRegions,
-    Cast, CastType, Compare, CompilationCacheDomain, CompilationContext, CompilationDomain, Concretizable, Constant,
-    ConstantOperation, Context, DataType, Device, DeviceId, DeviceMesh, Dimension, DimensionBounds,
-    DimensionFromScalar, DimensionOperation, DimensionSize, DimensionType, DimensionValue, DimensionVariable,
-    DiskCache, Domain, DomainTracer, EagerContext, EffectClass, EmptyRegionDriver, ExternalReferenceBinding,
-    FlatProgram, InterpretableOperation, Layout, LogicalMesh, Memory, MeshAxis, MeshAxisType, ONE_OPERATION_NAME,
-    Operation, OperationProvider, Parameterized, Placeholder, ProgramError, Provenance, ProvenanceScope,
-    ReadyOrPendingReferenceGuard, ReductionKind, ReferenceCompletion, ReferenceCompletionBackend,
+    COMPOSITE_OPERATION_NAME, Cast, CastType, Compare, CompilationCacheDomain, CompilationContext, CompilationDomain,
+    Concretizable, Constant, ConstantOperation, Context, DataType, Device, DeviceId, DeviceMesh, Dimension,
+    DimensionBounds, DimensionFromScalar, DimensionOperation, DimensionSize, DimensionType, DimensionValue,
+    DimensionVariable, DiskCache, Domain, DomainTracer, EagerContext, EffectClass, EmptyRegionDriver,
+    ExternalReferenceBinding, FlatProgram, InterpretableOperation, Layout, LogicalMesh, Memory, MeshAxis, MeshAxisType,
+    ONE_OPERATION_NAME, Operation, OperationProvider, Parameterized, Placeholder, ProgramError, Provenance,
+    ProvenanceScope, ReadyOrPendingReferenceGuard, ReductionKind, ReferenceCompletion, ReferenceCompletionBackend,
     ReferenceDischargeResult, ReferenceId, ReferenceReplacementPreparation, ReferenceSource, ReferenceType,
     RegionDriver, RegionKey, RegionRef, ScatterMode, ScatterReductionKind, Shape, Sharding, ShardingDimension,
     SortDirection, SpecializationCache, SpecializationCacheEntry, SpecializationCacheStatistics, StagedProgram,
@@ -50,6 +50,7 @@ use crate::arrays_v0::{
 use crate::kernels::CudaKernelRuntime;
 #[cfg(feature = "rocm")]
 use crate::kernels::RocmKernelRuntime;
+use crate::operations::composites::NamedCompositeImplementation;
 use crate::{
     ArrayError, Error, FromPjrt, RaggedDotLoweringStrategy, ShardDescriptor, ShardLayout, ToPjrt, XlaArray,
     XlaDimension, XlaValue,
@@ -1457,6 +1458,38 @@ impl<'c> XlaDomain<'c> {
                 Compare::<ArrayIrValue<ryft_core::Array>>::compare(left.value(), right.value(), operation.direction())?;
             let output = Concretizable::<bool>::concretize(&output)?;
             return Ok(vec![XlaValue::Array(self.eager_scalar(DataType::Boolean, &[u8::from(output)])?)]);
+        }
+
+        // A composite call whose concrete inputs refine the types that its primal region was traced over (e.g., a named
+        // call staged in a bounded-dynamic program) replays its primal region, exactly as the interpretation rule of
+        // composites does, because that region describes the call at its traced types rather than at the exact types
+        // of its inputs. Calls at their traced types compile as one program, so backend implementations of named
+        // composites (e.g., fused kernels) still apply to them. A named call that explicitly requests a backend
+        // implementation reports that it cannot use it instead of silently replaying its body.
+        if operation.name() == COMPOSITE_OPERATION_NAME
+            && let Some(primal) = regions.regions().next()
+            && primal
+                .interface()
+                .input_types()
+                .iter()
+                .zip(inputs)
+                .any(|(declared, input)| *declared != *input.r#type())
+        {
+            if let Some(key) = crate::LowerableOperation::composite_key(&operation) {
+                let input_types = inputs.iter().map(|input| input.r#type().into_owned()).collect::<Vec<_>>();
+                let target_platform = self.target().ok().map(XlaTarget::platform_name);
+                let implementation = NamedCompositeImplementation::select(
+                    key,
+                    input_types.as_slice(),
+                    primal.interface().output_types(),
+                    target_platform,
+                );
+                if let Some(error) = implementation.and_then(|implementation| implementation.body_substitution_error())
+                {
+                    return Err(ProgramError::UnsupportedOperation { message: error.to_string() });
+                }
+            }
+            return primal.interpret_in_context(self, inputs.to_vec());
         }
 
         let array_inputs = inputs
@@ -5749,7 +5782,6 @@ fn array_data_dependent_padding_discipline(
             Unsupported { reason: "group-size metadata may describe positions in bounded physical padding" }
         }
         ArrayOperation::ScaledDot(_) => RyftMasked,
-        ArrayOperation::DotProductAttention(_) | ArrayOperation::DotProductAttentionBackward(_) => RyftMasked,
         ArrayOperation::RngBitGenerator(_) => Unsupported {
             reason: "random generation advances state according to physical rather than logical element count",
         },
@@ -6966,9 +6998,10 @@ mod tests {
     use indoc::indoc;
     use pretty_assertions::assert_eq;
 
+    #[cfg(feature = "cuda-13")]
+    use ryft_core::operations::attention::dot_product_attention;
     use ryft_core::operations::attention::{
-        AttentionConfiguration, AttentionImplementation, AttentionInputSignature, DotProductAttentionBackwardOperation,
-        DotProductAttentionOperation,
+        AttentionConfiguration, AttentionImplementation, AttentionInputs, differentiable_dot_product_attention,
     };
     use ryft_core::operations::manipulation::indexing::index;
     use ryft_core::{
@@ -6979,23 +7012,24 @@ mod tests {
         CompareOperation, ComparisonDirection, CompilationTracer, Compile, CompiledFunctionDispatcher,
         CompositeJvpRule, CompositeOperation, ConcatenateOperation, ConditionOperation, ConstantOperation,
         ConvertElementTypeOperation, CotangentDestinationKind, CumulativeKind, CumulativeOperation,
-        CustomCallOperation, Dimension, DimensionAddOperation, DimensionDivOperation, DimensionFromScalarOperation,
-        DimensionMulOperation, DimensionRemOperation, DimensionSize, DimensionSizeOperation, DimensionSubOperation,
-        DimensionToScalarOperation, DivOperation, DomainTracingContext, DotDimensionNumbers, DotOperation,
-        DynamicArrayExtentBatchingPolicy, DynamicBroadcastOperation, DynamicGather, DynamicReshape,
-        DynamicReshapeOperation, DynamicScatter, DynamicSlice, DynamicSliceOperation, DynamicSliceWithDimensions,
-        DynamicUpdateSlice, DynamicUpdateSliceOperation, EmptyRegionDriver, Fill, Gather, GatherDimensionNumbers,
-        GatherMode, GatherOperation, GatherOptions, Indexing, IotaOperation, Linearization, MulOperation, NegOperation,
-        OneOperation, ParallelAllGatherOperation, ParallelAllGatherOutputVariance, ParallelAllToAllOperation,
-        ParallelPermuteOperation, ParallelReduceOperation, ParallelVaryOperation, PrintOperation, Program,
-        ProgramBuilder, RaggedDotDimensionNumbers, RaggedDotOperation, RandomAlgorithm, ReduceOperation, ReductionKind,
-        ReferenceAddUpdate, ReferenceAddUpdateOperation, ReferenceFreeze, ReferenceFreezeOperation, ReferenceNew,
-        ReferenceNewOperation, ReferenceRead, ReferenceReadOperation, ReferenceSwapOperation, ReferenceType,
-        ReferenceWrite, ReferenceWriteOperation, Reshape, ReshapeOperation, RngBitGeneratorOperation,
-        ScaledDotOperation, ScanOperation, Scatter, ScatterDimensionNumbers, ScatterMode, ScatterOperation,
-        ScatterOptions, SelectOperation, ShardMapBoundary, ShardMapOperation, ShardMapOptions, Sharding,
-        ShardingDimension, SliceOperation, SortDirection, SortOperation, StagedFunction, StagingContext, StaticShape,
-        SubOperation, TracingContext, Value, WhileOperation, ZeroOperation, batch, shard_map,
+        CustomCallOperation, Differentiate, Dimension, DimensionAddOperation, DimensionDivOperation,
+        DimensionFromScalarOperation, DimensionMulOperation, DimensionRemOperation, DimensionSize,
+        DimensionSizeOperation, DimensionSubOperation, DimensionToScalarOperation, DivOperation, DomainTracingContext,
+        DotDimensionNumbers, DotOperation, DynamicArrayExtentBatchingPolicy, DynamicBroadcastOperation, DynamicGather,
+        DynamicReshape, DynamicReshapeOperation, DynamicScatter, DynamicSlice, DynamicSliceOperation,
+        DynamicSliceWithDimensions, DynamicUpdateSlice, DynamicUpdateSliceOperation, EmptyRegionDriver, Fill, Gather,
+        GatherDimensionNumbers, GatherMode, GatherOperation, GatherOptions, Indexing, IotaOperation, Linearization,
+        MulOperation, NegOperation, OneOperation, OperationPayloadProjection, ParallelAllGatherOperation,
+        ParallelAllGatherOutputVariance, ParallelAllToAllOperation, ParallelPermuteOperation, ParallelReduceOperation,
+        ParallelVaryOperation, PrintOperation, Program, ProgramBuilder, RaggedDotDimensionNumbers, RaggedDotOperation,
+        RandomAlgorithm, ReduceOperation, ReductionKind, ReferenceAddUpdate, ReferenceAddUpdateOperation,
+        ReferenceFreeze, ReferenceFreezeOperation, ReferenceNew, ReferenceNewOperation, ReferenceRead,
+        ReferenceReadOperation, ReferenceSwapOperation, ReferenceType, ReferenceWrite, ReferenceWriteOperation,
+        Reshape, ReshapeOperation, RngBitGeneratorOperation, ScaledDotOperation, ScanOperation, Scatter,
+        ScatterDimensionNumbers, ScatterMode, ScatterOperation, ScatterOptions, SelectOperation, ShardMapBoundary,
+        ShardMapOperation, ShardMapOptions, Sharding, ShardingDimension, SliceOperation, SortDirection, SortOperation,
+        StagedFunction, StagingContext, StaticShape, SubOperation, TracingContext, Value, WhileOperation,
+        ZeroOperation, batch, shard_map,
     };
     use ryft_pjrt::{ClientOptions, CpuClientOptions, load_cpu_plugin};
     #[cfg(feature = "cuda-13")]
@@ -7135,48 +7169,6 @@ mod tests {
             execute(&[1., 2., 3., 4., 5.]),
             vec![vec![2., 2., 5.], vec![1., 32., 3., 4., 35.], vec![2., 2., 5.]]
         );
-    }
-
-    fn attention_operation(
-        scale: f64,
-        causal: bool,
-        residual: bool,
-        dropout: Option<(f64, u64)>,
-        signature: AttentionInputSignature,
-    ) -> DotProductAttentionOperation {
-        DotProductAttentionOperation::new(
-            AttentionConfiguration::new()
-                .with_scale(scale)
-                .with_causal(causal)
-                .with_residual(residual)
-                .with_dropout(dropout)
-                .with_implementation(if dropout.is_some() {
-                    AttentionImplementation::Fused
-                } else {
-                    AttentionImplementation::Automatic
-                }),
-            signature,
-        )
-    }
-
-    fn attention_backward_operation(
-        scale: f64,
-        causal: bool,
-        dropout: Option<(f64, u64)>,
-        signature: AttentionInputSignature,
-    ) -> DotProductAttentionBackwardOperation {
-        DotProductAttentionBackwardOperation::new(
-            AttentionConfiguration::new()
-                .with_scale(scale)
-                .with_causal(causal)
-                .with_dropout(dropout)
-                .with_implementation(if dropout.is_some() {
-                    AttentionImplementation::Fused
-                } else {
-                    AttentionImplementation::Automatic
-                }),
-            signature,
-        )
     }
 
     fn domain_mesh(client: &Client<'_>, axis: &str, axis_size: usize) -> DeviceMesh {
@@ -7499,13 +7491,25 @@ mod tests {
     }
 
     /// Builds the bounded-dynamic scaled-dot and attention proof fixture. The attention values vary along the
-    /// key/value sequence axis, so including any physical suffix lane changes every valid output row.
+    /// key/value sequence axis, so including any physical suffix lane changes every valid output row. Attention is
+    /// staged by the training function with the provided implementation, whose reverse mode differentiation calls the
+    /// forward attention definition with its residual and the backward attention definition.
     fn data_derived_scaled_dot_attention_fixture(
         size_type: ArrayType,
         extent: DimensionVariable,
         scaled_element_type: DataType,
         scaled_scale_type: DataType,
+        attention_implementation: AttentionImplementation,
     ) -> FlatXlaProgram {
+        /// Binds `operation` to `inputs` in the context of `value` and returns its only output.
+        fn bind<O: Into<XlaOperation>>(
+            value: &XlaTracer<'static>,
+            operation: O,
+            inputs: &[XlaTracer<'static>],
+        ) -> XlaTracer<'static> {
+            value.domain().bind(operation, Vec::<FlatXlaProgram>::new(), inputs).unwrap().remove(0)
+        }
+
         let scaled_block_size = match scaled_element_type {
             DataType::F8E4M3FN | DataType::F8E5M2 => 32,
             _ => 16,
@@ -7534,121 +7538,66 @@ mod tests {
                 Dimension::Static(8),
             ]),
         );
+        let attention = differentiable_dot_product_attention::<XlaDomain<'static>>(
+            AttentionConfiguration::new().with_scale(1.0).with_implementation(attention_implementation),
+        );
+        let (_, program) = DomainTracingContext::<XlaDomain<'static>>::trace(
+            |inputs: Vec<XlaTracer<'static>>| {
+                let size = &inputs[0];
+                let dimension = bind(size, DimensionFromScalarOperation::new(extent.clone().into()), &[size.clone()]);
+                let batch_dimension =
+                    bind(size, DimensionFromScalarOperation::new(attention_batch.clone().into()), &[size.clone()]);
 
-        let mut builder = XlaProgramBuilder::new();
-        let size = builder.add_input(size_type.into());
-        let dimension = builder
-            .add_instruction(DimensionFromScalarOperation::new(extent.into()), Vec::new(), vec![size], None)
-            .unwrap()[0];
-        let batch_dimension = builder
-            .add_instruction(DimensionFromScalarOperation::new(attention_batch.into()), Vec::new(), vec![size], None)
-            .unwrap()[0];
+                // `scaled_dot`: the runtime row extent is non-contracting. Both dynamic element/scale operands share
+                // it, while the static right operand fixes one output column and the static block shape fixes
+                // `k = 16`.
+                let scaled_lhs = bind(size, OneOperation::new(scaled_lhs_type.clone()), &[dimension.clone()]);
+                let scaled_lhs_scales =
+                    bind(size, OneOperation::new(scaled_lhs_scale_type.clone()), &[dimension.clone()]);
+                let scaled_rhs = bind(size, OneOperation::new(scaled_rhs_type.clone()), &[]);
+                let scaled_rhs_scales = bind(size, OneOperation::new(scaled_rhs_scale_type.clone()), &[]);
+                let scaled_dot = bind(
+                    size,
+                    ScaledDotOperation::new(
+                        DotDimensionNumbers::new(vec![1], vec![1], Vec::new(), Vec::new()),
+                        DataType::F32,
+                        true,
+                        true,
+                    ),
+                    &[scaled_lhs, scaled_rhs, scaled_lhs_scales, scaled_rhs_scales],
+                );
 
-        // `scaled_dot`: the runtime row extent is non-contracting. Both dynamic element/scale operands share it, while
-        // the static right operand fixes one output column and the static block shape fixes `k = 16`.
-        let scaled_lhs = builder
-            .add_instruction(OneOperation::new(scaled_lhs_type), Vec::new(), vec![dimension], None)
-            .unwrap()[0];
-        let scaled_lhs_scales = builder
-            .add_instruction(OneOperation::new(scaled_lhs_scale_type), Vec::new(), vec![dimension], None)
-            .unwrap()[0];
-        let scaled_rhs =
-            builder.add_instruction(OneOperation::new(scaled_rhs_type), Vec::new(), Vec::new(), None).unwrap()[0];
-        let scaled_rhs_scales = builder
-            .add_instruction(OneOperation::new(scaled_rhs_scale_type), Vec::new(), Vec::new(), None)
-            .unwrap()[0];
-        let scaled_dot = builder
-            .add_instruction(
-                ScaledDotOperation::new(
-                    DotDimensionNumbers::new(vec![1], vec![1], Vec::new(), Vec::new()),
-                    DataType::F32,
-                    true,
-                    true,
-                ),
-                Vec::new(),
-                vec![scaled_lhs, scaled_rhs, scaled_lhs_scales, scaled_rhs_scales],
-                None,
-            )
-            .unwrap()[0];
-
-        // Attention: equal query/key scores make the live softmax uniform, while values equal their sequence index.
-        // Explicit lengths of `extent - 1` exercise the supported further-restriction contract: visible query rows
-        // return the mean `(extent - 2) / 2`, while the final logical row and all physical suffix lanes stay zero.
-        // Backward has exact `dQ = 0`, `dK[j] = 8 * (j - mean)`, and `dV = 1` on visible rows and zeros elsewhere.
-        let query = builder
-            .add_instruction(
-                OneOperation::new(attention_type.clone()),
-                Vec::new(),
-                vec![batch_dimension, dimension],
-                None,
-            )
-            .unwrap()[0];
-        let key = builder
-            .add_instruction(
-                OneOperation::new(attention_type.clone()),
-                Vec::new(),
-                vec![batch_dimension, dimension],
-                None,
-            )
-            .unwrap()[0];
-        let value = builder
-            .add_instruction(
-                IotaOperation::new(attention_type.clone(), 1).unwrap(),
-                Vec::new(),
-                vec![batch_dimension, dimension],
-                None,
-            )
-            .unwrap()[0];
-        let output_cotangent = builder
-            .add_instruction(OneOperation::new(attention_type), Vec::new(), vec![batch_dimension, dimension], None)
-            .unwrap()[0];
-        let logical_length =
-            builder.add_instruction(DimensionToScalarOperation, Vec::new(), vec![dimension], None).unwrap()[0];
-        let logical_length = builder
-            .add_instruction(
-                ConvertElementTypeOperation::new(DataType::I32, false),
-                Vec::new(),
-                vec![logical_length],
-                None,
-            )
-            .unwrap()[0];
-        let one = Array::from_elements(ArrayType::scalar(DataType::I32), &[1_i32]).unwrap();
-        let one = builder.add_instruction(ConstantOperation::new(one), Vec::new(), Vec::new(), None).unwrap()[0];
-        let length =
-            builder.add_instruction(SubOperation::new(), Vec::new(), vec![logical_length, one], None).unwrap()[0];
-        let lengths = builder
-            .add_instruction(
-                DynamicBroadcastOperation::new(Vec::new()),
-                Vec::new(),
-                vec![length, batch_dimension],
-                None,
-            )
-            .unwrap()[0];
-        let forward = builder
-            .add_instruction(
-                attention_operation(1.0, false, true, None, AttentionInputSignature::new(false, false, true, true)),
-                Vec::new(),
-                vec![query, key, value, lengths, lengths],
-                None,
-            )
-            .unwrap()
-            .to_vec();
-        let backward = builder
-            .add_instruction(
-                attention_backward_operation(1.0, false, None, AttentionInputSignature::new(false, false, true, true)),
-                Vec::new(),
-                vec![query, key, value, lengths, lengths, forward[0], forward[1], output_cotangent],
-                None,
-            )
-            .unwrap()
-            .to_vec();
-        builder
-            .build::<Vec<XlaConstant>, Vec<XlaConstant>>(
-                vec![scaled_dot, forward[0], backward[0], backward[1], backward[2]],
-                vec![Placeholder],
-                vec![Placeholder; 5],
-            )
-            .unwrap()
+                // Attention: equal query/key scores make the live softmax uniform, while values equal their sequence
+                // index. Explicit lengths of `extent - 1` exercise the supported further-restriction contract: visible
+                // query rows return the mean `(extent - 2) / 2`, while the final logical row and all physical suffix
+                // lanes stay zero. Backward has exact `dQ = 0`, `dK[j] = 8 * (j - mean)`, and `dV = 1` on visible
+                // rows and zeros elsewhere.
+                let extents = [batch_dimension.clone(), dimension.clone()];
+                let query = bind(size, OneOperation::new(attention_type.clone()), &extents);
+                let key = bind(size, OneOperation::new(attention_type.clone()), &extents);
+                let value = bind(size, IotaOperation::new(attention_type.clone(), 1).unwrap(), &extents);
+                let output_cotangent = bind(size, OneOperation::new(attention_type.clone()), &extents);
+                let logical_length = bind(size, DimensionToScalarOperation, &[dimension.clone()]);
+                let logical_length =
+                    bind(size, ConvertElementTypeOperation::<ArrayType>::new(DataType::I32, false), &[logical_length]);
+                let one = Array::from_elements(ArrayType::scalar(DataType::I32), &[1_i32]).unwrap();
+                let one = bind(size, ConstantOperation::new(one), &[]);
+                let length = bind(size, SubOperation::new(), &[logical_length, one]);
+                let lengths =
+                    bind(size, DynamicBroadcastOperation::new(Vec::new()), &[length, batch_dimension.clone()]);
+                let inputs = AttentionInputs {
+                    query_sequence_lengths: Some(lengths.clone()),
+                    key_value_sequence_lengths: Some(lengths),
+                    ..AttentionInputs::new(query, key, value)
+                };
+                let (output, pullback) = size.domain().differentiate_at(inputs).vjp(|inputs| attention.call(inputs))?;
+                let cotangents = pullback.apply_materialized(output_cotangent)?;
+                Ok(vec![scaled_dot, output, cotangents.query, cotangents.key, cotangents.value])
+            },
+            vec![ArrayIrType::from(size_type)],
+        )
+        .unwrap();
+        program.into_flat_program()
     }
 
     /// Kind of `shard_map` program that [`shard_map_differential_program`] builds to compare the reference backend's
@@ -7705,7 +7654,7 @@ mod tests {
     where
         A: Value<Type = ArrayType>,
         V: Value<Type = ArrayIrType>,
-        O: Operation<Type = ArrayIrType> + From<ArrayIrOperation<A>>,
+        O: Operation<Type = ArrayIrType> + OperationPayloadProjection + From<ArrayIrOperation<A>>,
     {
         let array_operation = ArrayIrOperation::<A>::from;
         let mesh = match case {
@@ -12175,23 +12124,6 @@ mod tests {
             ))),
             RyftMasked,
         );
-        for operation in [
-            ArrayOperation::DotProductAttention(attention_operation(
-                1.0,
-                false,
-                false,
-                None,
-                AttentionInputSignature::default(),
-            )),
-            ArrayOperation::DotProductAttentionBackward(attention_backward_operation(
-                1.0,
-                false,
-                None,
-                AttentionInputSignature::default(),
-            )),
-        ] {
-            assert_eq!(array_data_dependent_padding_discipline(&operation), RyftMasked);
-        }
 
         // A log-sum-exp `reduce` expands into maximum and summation reductions, so it carries the same masking
         // contract as those two reduction kinds.
@@ -12359,8 +12291,13 @@ mod tests {
         let domain = XlaSession::new(&client).domain().with_mesh(mesh.clone());
         let size_type = replicated_scalar_type(&mesh, DataType::I64);
         let extent = DimensionVariable::new("extent", DimensionBounds::new(1, Some(5)).unwrap());
-        let program =
-            data_derived_scaled_dot_attention_fixture(size_type.clone(), extent, DataType::F32, DataType::F32);
+        let program = data_derived_scaled_dot_attention_fixture(
+            size_type.clone(),
+            extent,
+            DataType::F32,
+            DataType::F32,
+            AttentionImplementation::Automatic,
+        );
         let lowered = domain.lower_xla_program(&program, 0, &XlaOptions::new(mesh.clone())).unwrap();
         assert!(lowered.stable_hlo().contains("stablehlo.composite \"xla.scaled_dot\""));
         assert!(!lowered.stable_hlo().contains("__cudnn$fmha"));
@@ -12442,12 +12379,33 @@ mod tests {
             [1.0, 1.0, 1.0, 0.0].into_iter().cycle().take(16).flat_map(|value| [value; 8]).collect::<Vec<_>>(),
         );
 
-        let zero = XlaArray::from_host_buffer(&domain, size_type, mesh, 0_i64.to_ne_bytes().as_slice()).unwrap();
+        let zero = XlaArray::from_host_buffer(&domain, size_type.clone(), mesh.clone(), 0_i64.to_ne_bytes().as_slice())
+            .unwrap();
         let error = domain.execute_xla_program(&compiled, vec![zero]).unwrap_err();
         assert!(
             error.to_string().contains(
                 "`dimension_from_scalar` failed: input dimension `extent` = 0 is outside its declared bounds [1, 5)"
             ),
+            "{error}",
+        );
+
+        // Eager execution replays the attention calls of the bounded-dynamic program at the exact types of their inputs,
+        // so a program that explicitly requests the fused kernels reports that it cannot use them instead of silently
+        // computing the portable result.
+        let extent = DimensionVariable::new("extent", DimensionBounds::new(1, Some(5)).unwrap());
+        let fused = data_derived_scaled_dot_attention_fixture(
+            size_type.clone(),
+            extent,
+            DataType::F32,
+            DataType::F32,
+            AttentionImplementation::Fused,
+        );
+        let input = XlaArray::from_host_buffer(&domain, size_type, mesh, 2_i64.to_ne_bytes().as_slice()).unwrap();
+        let error = fused.interpret_in_context(&domain, vec![XlaValue::Array(input)]).unwrap_err();
+        assert!(
+            error
+                .to_string()
+                .contains("the fused attention implementation is unavailable because the target platform is not CUDA"),
             "{error}",
         );
     }
@@ -12541,6 +12499,7 @@ mod tests {
                 extent,
                 scaled_element_type,
                 scaled_scale_type,
+                AttentionImplementation::Fused,
             );
             let lowered = domain.lower_xla_program(&program, 0, &XlaOptions::new(mesh.clone())).unwrap();
             // cuDNN accepts the NVFP4 and `f8e4m3fn` MXFP8 pairs, which lower to the block-scaled-dot custom call, but
@@ -12632,27 +12591,19 @@ mod tests {
         )
         .with_sharding(Sharding::replicated(mesh.logical_mesh().clone(), 4))
         .unwrap();
-        let mut builder = XlaProgramBuilder::new();
-        let query = builder.add_input(r#type.clone().into());
-        let key = builder.add_input(r#type.clone().into());
-        let value = builder.add_input(r#type.clone().into());
-        let output = builder
-            .add_instruction(
-                attention_operation(
-                    1.0 / (head_dimension as f64).sqrt(),
-                    false,
-                    false,
-                    None,
-                    AttentionInputSignature::default(),
-                ),
-                Vec::new(),
-                vec![query, key, value],
-                None,
-            )
-            .unwrap()[0];
-        let program = builder
-            .build::<Vec<XlaConstant>, Vec<XlaConstant>>(vec![output], vec![Placeholder; 3], vec![Placeholder])
-            .unwrap();
+        let attention = dot_product_attention::<XlaDomain<'static>>(
+            AttentionConfiguration::new().with_scale(1.0 / (head_dimension as f64).sqrt()),
+        );
+        let (_, program) = DomainTracingContext::<XlaDomain<'static>>::trace(
+            |inputs: Vec<XlaTracer<'static>>| {
+                let (output, _) =
+                    attention.call(AttentionInputs::new(inputs[0].clone(), inputs[1].clone(), inputs[2].clone()))?;
+                Ok(vec![output])
+            },
+            vec![ArrayIrType::from(r#type.clone()); 3],
+        )
+        .unwrap();
+        let program = program.into_flat_program();
         let lowered = domain.lower_xla_program(&program, 0, &XlaOptions::new(mesh.clone())).unwrap();
         assert!(lowered.stable_hlo().contains("__cudnn$fmhaSoftmax"));
         let compilation_start = Instant::now();

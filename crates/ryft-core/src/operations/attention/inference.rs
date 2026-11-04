@@ -23,6 +23,9 @@ pub(super) struct AttentionInputTypes<'a> {
     /// Optional key/value-length type.
     pub(super) key_value_sequence_lengths: Option<&'a ArrayType>,
 
+    /// Optional dropout random state type.
+    pub(super) dropout_state: Option<&'a ArrayType>,
+
     /// Forward output type in a backward boundary.
     pub(super) output: Option<&'a ArrayType>,
 
@@ -55,7 +58,12 @@ impl<'a> AttentionInputTypes<'a> {
             index += 1;
             value
         });
-        let key_value_sequence_lengths = signature.has_key_value_sequence_lengths().then(|| &optional[index]);
+        let key_value_sequence_lengths = signature.has_key_value_sequence_lengths().then(|| {
+            let value = &optional[index];
+            index += 1;
+            value
+        });
+        let dropout_state = signature.has_dropout_state().then(|| &optional[index]);
         Ok(Self {
             query,
             key,
@@ -64,6 +72,7 @@ impl<'a> AttentionInputTypes<'a> {
             mask,
             query_sequence_lengths,
             key_value_sequence_lengths,
+            dropout_state,
             output: None,
             activation: None,
             output_cotangent: None,
@@ -128,7 +137,7 @@ pub(super) struct AttentionDimensions {
 /// Validates the shared input contract of the attention operations — the `BTNH` query/key/value shapes and data
 /// types (including the grouped-query heads divisibility), the optional broadcastable bias, and the sliding-window
 /// attribute — and returns the validated [`AttentionDimensions`]. Refer to the documentation of
-/// [`DotProductAttentionOperation`] for the contract itself.
+/// [`DotProductAttention`] for the contract itself.
 pub(super) fn validated_attention_inputs(
     operation_name: &str,
     query_type: &ArrayType,
@@ -277,7 +286,7 @@ pub(super) fn validated_attention_inputs(
 
 /// Validates the optional trailing pair of `i32[batch]` sequence-length inputs shared by the attention operations:
 /// each sequence-length input must be a rank-1 `i32` vector whose dimension exactly matches the shared batch
-/// dimension. Refer to the documentation of [`DotProductAttentionOperation`] for the padding semantics.
+/// dimension. Refer to the documentation of [`DotProductAttention`] for the padding semantics.
 pub(super) fn validated_sequence_length_inputs(
     operation_name: &str,
     query_lengths_type: Option<&ArrayType>,
@@ -314,15 +323,28 @@ pub(super) fn validated_sequence_length_inputs(
     Ok(())
 }
 
-/// Validates the optional `(rate, seed)` dropout attribute shared by the attention operations: the rate must lie in
-/// the open interval `(0, 1)` (a zero rate is expressed by omitting dropout altogether).
-pub(super) fn validated_dropout(operation_name: &str, dropout: Option<(f64, u64)>) -> Result<(), TypeError> {
-    if let Some((rate, _)) = dropout {
-        if !(rate > 0.0 && rate < 1.0) {
+/// Validates the optional dropout rate and random state shared by the attention definitions. The rate must lie in the
+/// open interval `(0, 1)` (a zero rate is expressed by omitting dropout altogether), a random state is only accepted
+/// together with a rate, and it must have the state type of a [`RandomAlgorithm`].
+pub(super) fn validated_dropout(
+    operation_name: &str,
+    dropout: Option<f64>,
+    dropout_state_type: Option<&ArrayType>,
+) -> Result<(), TypeError> {
+    if let Some(rate) = dropout
+        && !(rate > 0.0 && rate < 1.0)
+    {
+        return Err(TypeError::invalid(format!(
+            "`{operation_name}` dropout rate must lie in the open interval (0, 1) but got {rate}",
+        )));
+    }
+    if let Some(state_type) = dropout_state_type {
+        if dropout.is_none() {
             return Err(TypeError::invalid(format!(
-                "`{operation_name}` dropout rate must lie in the open interval (0, 1) but got {rate}",
+                "`{operation_name}` received a dropout random state without a dropout rate",
             )));
         }
+        RandomAlgorithm::from_state_type(state_type)?;
     }
     Ok(())
 }
@@ -352,4 +374,117 @@ pub(super) fn attention_activation_type(
         .and_then(|sharding| activation_type.with_sharding(sharding))
         .map_err(|error| TypeError::invalid(error.to_string()))?;
     Ok(sharding)
+}
+
+/// Validates one forward attention boundary (i.e., the [`AttentionInputs`] of `signature` in canonical order) and
+/// returns the types of its outputs: the attended output, which is query-shaped at the query data type and propagates
+/// the query's metadata (e.g., its sharding), followed by the log-sum-exp residual when `configuration` requests it.
+/// Every input must have matching manual variation, and reduced and unreduced inputs are rejected, because softmax and
+/// the log-sum-exp residual do not preserve partial-sum or zero-filled replica representations.
+pub(super) fn attention_forward_output_types(
+    operation_name: &str,
+    configuration: AttentionConfiguration,
+    signature: AttentionInputSignature,
+    input_types: &[ArrayType],
+) -> Result<Vec<ArrayType>, TypeError> {
+    if input_types.len() != 3 + signature.count() {
+        return Err(TypeError::invalid(format!(
+            "`{operation_name}` expects {} inputs for its optional-input signature but got {}",
+            3 + signature.count(),
+            input_types.len(),
+        )));
+    }
+    let types = AttentionInputTypes::forward(signature, input_types)?;
+    let dimensions = validated_attention_boundary(operation_name, configuration, &types, input_types)?;
+    let mut output_types = vec![types.query.clone()];
+    if configuration.return_residual() {
+        output_types.push(attention_activation_type(&dimensions, types.query)?);
+    }
+    Ok(output_types)
+}
+
+/// Validates one backward attention boundary (i.e., the [`AttentionInputs`] of `signature` in canonical order,
+/// followed by the forward output, the log-sum-exp residual, and the output cotangent) and returns the types of its
+/// outputs: the cotangents of the query, key, and value, followed by that of a present bias whose cotangent space is
+/// not zero-dimensional. The forward output, residual, and output cotangent are compared by data type and shape only,
+/// so that per-input metadata such as sharding never fails the structural contract.
+pub(super) fn attention_backward_output_types(
+    operation_name: &str,
+    configuration: AttentionConfiguration,
+    signature: AttentionInputSignature,
+    input_types: &[ArrayType],
+) -> Result<Vec<ArrayType>, TypeError> {
+    if input_types.len() != 6 + signature.count() {
+        return Err(TypeError::invalid(format!(
+            "`{operation_name}` expects {} inputs for its optional-input signature but got {}",
+            6 + signature.count(),
+            input_types.len(),
+        )));
+    }
+    let types = AttentionInputTypes::backward(signature, input_types)?;
+    let dimensions = validated_attention_boundary(operation_name, configuration, &types, input_types)?;
+    let matches_expected = |actual: &ArrayType, expected: &ArrayType| -> bool {
+        actual.data_type() == expected.data_type() && actual.shape() == expected.shape()
+    };
+    if !matches_expected(types.output.unwrap(), types.query) {
+        return Err(TypeError::invalid(format!(
+            "`{operation_name}` output type {} does not match the expected forward output type {}",
+            types.output.unwrap(),
+            types.query,
+        )));
+    }
+    let expected_output_cotangent_type = types.query.cotangent()?;
+    if !matches_expected(types.output_cotangent.unwrap(), &expected_output_cotangent_type) {
+        return Err(TypeError::invalid(format!(
+            "`{operation_name}` output cotangent type {} does not match the expected cotangent type \
+             {expected_output_cotangent_type}",
+            types.output_cotangent.unwrap(),
+        )));
+    }
+    let expected_activation_type = attention_activation_type(&dimensions, types.query)?;
+    if !matches_expected(types.activation.unwrap(), &expected_activation_type) {
+        return Err(TypeError::invalid(format!(
+            "`{operation_name}` activation type {} does not match the expected activation type \
+             {expected_activation_type}",
+            types.activation.unwrap(),
+        )));
+    }
+    let mut output_types = vec![types.query.cotangent()?, types.key.cotangent()?, types.value.cotangent()?];
+    if let Some(bias) = types.bias {
+        let bias_cotangent = bias.cotangent()?;
+        if !bias_cotangent.is_zero_space() {
+            output_types.push(bias_cotangent);
+        }
+    }
+    Ok(output_types)
+}
+
+/// Validates the contract shared by the forward and backward attention boundaries (i.e., matching manual variation,
+/// the query, key, value, bias, and mask shapes and data types, the sequence lengths, the dropout rate and random
+/// state, and the absence of reduced and unreduced inputs) and returns the validated [`AttentionDimensions`].
+fn validated_attention_boundary(
+    operation_name: &str,
+    configuration: AttentionConfiguration,
+    types: &AttentionInputTypes<'_>,
+    input_types: &[ArrayType],
+) -> Result<AttentionDimensions, TypeError> {
+    ArrayType::check_matching_manual_variation(operation_name, &input_types.iter().collect::<Vec<_>>())?;
+    let dimensions =
+        validated_attention_inputs(operation_name, types.query, types.key, types.value, types.bias, types.mask)?;
+    validated_sequence_length_inputs(
+        operation_name,
+        types.query_sequence_lengths,
+        types.key_value_sequence_lengths,
+        &dimensions.batch,
+    )?;
+    validated_dropout(operation_name, configuration.dropout(), types.dropout_state)?;
+    for input_type in input_types {
+        if !input_type.reduced_axes().is_empty() {
+            return Err(TypeError::invalid(format!("`{operation_name}` does not support reduced inputs")));
+        }
+        if !input_type.unreduced_axes().is_empty() {
+            return Err(TypeError::invalid(format!("`{operation_name}` does not support unreduced inputs")));
+        }
+    }
+    Ok(dimensions)
 }

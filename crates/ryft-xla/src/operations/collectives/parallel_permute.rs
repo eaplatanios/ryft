@@ -51,7 +51,13 @@ impl LowerableOperation for ParallelPermuteOperation {
             self.axis_size(),
             self.mesh(),
             output_types,
-            |mesh| self.clone().with_mesh(mesh.clone()).infer_output_types(input_types, &[]),
+            |mesh| {
+                let operation = match mesh {
+                    Some(mesh) => self.clone().with_mesh(mesh.clone()),
+                    None => self.clone(),
+                };
+                operation.infer_output_types(input_types, &[])
+            },
         )?;
         lower_parallel_permute_to_mlir(self, &collective_state, input_values[0], &mut lowerer.block, lowerer.location)
     }

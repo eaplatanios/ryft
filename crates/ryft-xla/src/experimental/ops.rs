@@ -2,7 +2,6 @@ use std::borrow::Cow;
 use std::fmt::Display;
 use std::hash::{Hash, Hasher};
 
-use ryft_core::operations::attention::{DotProductAttentionBackwardOperation, DotProductAttentionOperation};
 use ryft_core::{
     AbsOperation, AddOperation, AndOperation, ArgMaxOperation, ArgMinOperation, Array, ArrayIrOperation, ArrayIrType,
     ArrayOperation, ArrayReferenceTransform, ArrayType, AssertOperation, AssertionValue, Atan2Operation,
@@ -862,8 +861,6 @@ impl_array_operation_conversion!(
     DotOperation,
     RaggedDotOperation,
     ScaledDotOperation,
-    DotProductAttentionOperation,
-    DotProductAttentionBackwardOperation,
     ReduceOperation,
     ArgMaxOperation,
     ArgMinOperation,

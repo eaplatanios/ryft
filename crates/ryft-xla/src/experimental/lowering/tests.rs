@@ -286,6 +286,120 @@ pub(crate) fn unproject_plain_program(program: PlainXlaProgram) -> FlatXlaProgra
 }
 
 #[test]
+fn test_collective_lowering_state_check_manual_collective_uses_owner_policy() {
+    let mesh = test_manual_mesh("x", 2);
+    let boundary = ShardMapBoundary::new(mesh.clone(), Vec::new(), Vec::new(), Vec::new()).unwrap();
+    let checked = CollectiveLoweringState::new().enter_manual_region(boundary.clone());
+    checked
+        .check_manual_collective("parallel_permute", "x", 2, None, &[1usize], |inference_mesh| {
+            assert_eq!(inference_mesh, Some(&mesh));
+            Ok(vec![1])
+        })
+        .unwrap();
+    let unchecked = CollectiveLoweringState::new().enter_manual_region(boundary.with_check_manual_variation(false));
+    unchecked
+        .check_manual_collective("parallel_permute", "x", 2, None, &[1usize], |inference_mesh| {
+            assert_eq!(inference_mesh, None);
+            Ok(vec![1])
+        })
+        .unwrap();
+}
+
+#[test]
+fn test_collective_lowering_state_check_manual_collective_uses_each_axis_owner() {
+    let mesh = LogicalMesh::new(vec![
+        MeshAxis::new("x", 2, MeshAxisType::Manual).unwrap(),
+        MeshAxis::new("y", 2, MeshAxisType::Manual).unwrap(),
+    ])
+    .unwrap();
+    let outer = ShardMapBoundary::new(mesh.clone(), Vec::new(), Vec::new(), vec!["x".to_string()]).unwrap();
+    let inner = ShardMapBoundary::new(mesh.clone(), Vec::new(), Vec::new(), vec!["y".to_string()]).unwrap();
+    let state = CollectiveLoweringState::new()
+        .enter_manual_region(outer.clone())
+        .enter_manual_region(inner.clone().with_check_manual_variation(false));
+    state
+        .check_manual_collective("parallel_permute", "x", 2, None, &[1usize], |inference_mesh| {
+            assert_eq!(inference_mesh, Some(&mesh));
+            Ok(vec![1])
+        })
+        .unwrap();
+    state
+        .check_manual_collective("parallel_permute", "y", 2, None, &[1usize], |inference_mesh| {
+            assert_eq!(inference_mesh, None);
+            Ok(vec![1])
+        })
+        .unwrap();
+
+    let state = CollectiveLoweringState::new()
+        .enter_manual_region(outer.with_check_manual_variation(false))
+        .enter_manual_region(inner);
+    state
+        .check_manual_collective("parallel_permute", "x", 2, None, &[1usize], |inference_mesh| {
+            assert_eq!(inference_mesh, None);
+            Ok(vec![1])
+        })
+        .unwrap();
+    state
+        .check_manual_collective("parallel_permute", "y", 2, None, &[1usize], |inference_mesh| {
+            assert_eq!(inference_mesh, Some(&mesh));
+            Ok(vec![1])
+        })
+        .unwrap();
+}
+
+#[test]
+fn test_collective_lowering_state_check_manual_collective_rejects_tracked_unchecked_payload() {
+    let mesh = test_manual_mesh("x", 2);
+    let boundary = ShardMapBoundary::new(mesh.clone(), Vec::new(), Vec::new(), Vec::new())
+        .unwrap()
+        .with_check_manual_variation(false);
+    let state = CollectiveLoweringState::new().enter_manual_region(boundary);
+    let result = state.check_manual_collective("parallel_permute", "x", 2, Some(&mesh), &[1usize], |_| {
+        panic!("tracked payload must be rejected before ordinary inference");
+    });
+    assert!(matches!(
+        result,
+        Err(Error::Core(ryft_core::Error::Program(ProgramError::MalformedProgram(message))))
+            if message == "`parallel_permute` cannot use tracked mesh metadata inside an unchecked manual binding",
+    ));
+}
+
+#[test]
+fn test_collective_lowering_state_check_manual_collective_retains_unchecked_validation() {
+    let mesh = test_manual_mesh("x", 2);
+    let boundary = ShardMapBoundary::new(mesh.clone(), Vec::new(), Vec::new(), Vec::new())
+        .unwrap()
+        .with_check_manual_variation(false);
+    let state = CollectiveLoweringState::new().enter_manual_region(boundary);
+    let wrong_size = state.check_manual_collective("parallel_permute", "x", 3, None, &[1usize], |_| {
+        panic!("axis size must be validated before ordinary inference");
+    });
+    assert!(matches!(
+        wrong_size,
+        Err(Error::Core(ryft_core::Error::Program(ProgramError::MalformedProgram(message))))
+            if message == "collective over axis `x` records size 3, but the enclosing mesh axis has size 2",
+    ));
+
+    let other_mesh = test_manual_mesh("x", 3);
+    let wrong_mesh = state.check_manual_collective("parallel_permute", "x", 2, Some(&other_mesh), &[1usize], |_| {
+        panic!("payload mesh must be validated before ordinary inference");
+    });
+    assert!(matches!(
+        wrong_mesh,
+        Err(Error::Core(ryft_core::Error::Program(ProgramError::MalformedProgram(message))))
+            if message == "`parallel_permute` operation mesh does not match the enclosing manual axis `x` mesh",
+    ));
+
+    let wrong_outputs =
+        state.check_manual_collective("parallel_permute", "x", 2, None, &[1usize], |_| Ok(vec![2usize]));
+    assert!(matches!(
+        wrong_outputs,
+        Err(Error::Core(ryft_core::Error::Program(ProgramError::MalformedProgram(message))))
+            if message == "`parallel_permute` output types do not match the enclosing manual mesh contract",
+    ));
+}
+
+#[test]
 fn test_collect_nested_sharding_mesh() {
     let mesh = LogicalMesh::new(vec![MeshAxis::new("x", 2, MeshAxisType::Explicit).unwrap()]).unwrap();
     let sharding = Sharding::replicated(mesh.clone(), 2);

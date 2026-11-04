@@ -1,6 +1,5 @@
 use std::collections::{HashMap, HashSet};
 
-use ryft_core::operations::attention::{DotProductAttentionBackwardOperation, DotProductAttentionOperation};
 use ryft_core::{
     ArrayIrType, ArrayType, CompositeKey, Parameterized, ProgramError, RegionId, RegionRef,
     RematerializationOptimizationBarrier, ScaledDotOperation, Typed, TypedProgram,
@@ -16,10 +15,6 @@ use crate::experimental::lowering::regions::lower_nested_program_inline;
 use crate::experimental::lowering::types::{lower_array_ir_type, lower_tensor_type};
 use crate::experimental::lowering::{CollectiveLoweringState, EffectTokens, LowerableOperationFamily};
 use crate::experimental::ops::{FlatXlaProgram, XlaConstant, XlaProgram};
-use crate::operations::attention::{
-    attention_backward_composition_key, attention_composition_key, trace_attention_backward_composition,
-    trace_attention_composition,
-};
 use crate::operations::quantization::{
     scaled_dot_composition_key, scaled_dot_composition_types, trace_scaled_dot_composition,
 };
@@ -139,26 +134,6 @@ impl NamedCompositionFunctionMap {
     ) -> Result<Option<&NamedCompositionFunction>, Error> {
         Ok(self.functions.get(&scaled_dot_composition_key(operation, input_types, output_types)?))
     }
-
-    /// Returns the registered portable decomposition for `operation` at the provided typed boundary.
-    pub(crate) fn get_attention(
-        &self,
-        operation: &DotProductAttentionOperation,
-        input_types: &[ArrayType],
-        output_types: &[ArrayType],
-    ) -> Option<&NamedCompositionFunction> {
-        self.functions.get(&attention_composition_key(operation, input_types, output_types))
-    }
-
-    /// Returns the registered portable backward decomposition for `operation` at the provided typed boundary.
-    pub(crate) fn get_attention_backward(
-        &self,
-        operation: &DotProductAttentionBackwardOperation,
-        input_types: &[ArrayType],
-        output_types: &[ArrayType],
-    ) -> Option<&NamedCompositionFunction> {
-        self.functions.get(&attention_backward_composition_key(operation, input_types, output_types))
-    }
 }
 
 /// Collects every named semantic composition required by `program` and traces each distinct typed decomposition once.
@@ -187,11 +162,9 @@ where
             // compositions.
             let operation = instruction.operation();
             let scaled_dot = operation.projected_payload::<ScaledDotOperation>();
-            let attention = operation.projected_payload::<DotProductAttentionOperation>();
-            let attention_backward = operation.projected_payload::<DotProductAttentionBackwardOperation>();
-            if scaled_dot.is_none() && attention.is_none() && attention_backward.is_none() {
+            let Some(operation) = scaled_dot else {
                 continue;
-            }
+            };
             let input_types = instruction
                 .inputs()
                 .iter()
@@ -208,35 +181,20 @@ where
                     <&ArrayType>::try_from(r#type.as_ref()).cloned().map_err(ProgramError::from)
                 })
                 .collect::<Result<Vec<_>, _>>()?;
-            if let Some(operation) = scaled_dot {
-                // Calls that lower to the block-scaled-dot custom call need no composition.
-                if let Some((composition_input_types, composition_output_types)) = scaled_dot_composition_types(
-                    operation,
-                    input_types.as_slice(),
-                    output_types.as_slice(),
-                    target_platform,
-                )? {
-                    map.register(
-                        scaled_dot_composition_key(
-                            operation,
-                            composition_input_types.as_slice(),
-                            composition_output_types.as_slice(),
-                        )?,
-                        || trace_scaled_dot_composition(operation, composition_input_types.as_slice()),
-                    )?;
-                }
-            } else if let Some(operation) = attention.filter(|operation| operation.configuration().dropout().is_none())
-            {
+            // Calls that lower to the block-scaled-dot custom call need no composition.
+            if let Some((composition_input_types, composition_output_types)) = scaled_dot_composition_types(
+                operation,
+                input_types.as_slice(),
+                output_types.as_slice(),
+                target_platform,
+            )? {
                 map.register(
-                    attention_composition_key(operation, input_types.as_slice(), output_types.as_slice()),
-                    || trace_attention_composition(operation, input_types.as_slice()),
-                )?;
-            } else if let Some(operation) =
-                attention_backward.filter(|operation| operation.configuration().dropout().is_none())
-            {
-                map.register(
-                    attention_backward_composition_key(operation, input_types.as_slice(), output_types.as_slice()),
-                    || trace_attention_backward_composition(operation, input_types.as_slice()),
+                    scaled_dot_composition_key(
+                        operation,
+                        composition_input_types.as_slice(),
+                        composition_output_types.as_slice(),
+                    )?,
+                    || trace_scaled_dot_composition(operation, composition_input_types.as_slice()),
                 )?;
             }
         }

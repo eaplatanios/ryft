@@ -1,18 +1,25 @@
 use std::hash::Hash;
 use std::rc::Rc;
 
+use ryft_core::operations::attention::{
+    AttentionConfiguration, AttentionImplementation, AttentionInputSignature,
+    DOT_PRODUCT_ATTENTION_BACKWARD_COMPOSITE_NAME, DOT_PRODUCT_ATTENTION_COMPOSITE_NAME,
+};
 use ryft_core::{
-    ArrayIrType, COMPOSITE_OPERATION_NAME, COMPOSITE_TRANSPOSE_OPERATION_NAME, CompositeKey, CompositeOperation,
-    CompositeTransposeOperation, CustomRuleSource, DifferentiableType, Operation, Parameter, ProgramError,
-    RematerializationOptimizationBarrier, Typed,
+    ArrayIrType, ArrayType, COMPOSITE_OPERATION_NAME, COMPOSITE_TRANSPOSE_OPERATION_NAME, CompositeKey,
+    CompositeOperation, CompositeTransposeOperation, CustomRuleSource, DifferentiableType, Operation, Parameter,
+    ProgramError, RematerializationOptimizationBarrier, Typed,
 };
 use ryft_mlir::ValueRef;
 #[cfg(test)]
 use ryft_mlir::{Block as _, Operation as _, Value as _};
 
 use crate::experimental::lowering::regions::lower_nested_program_inline;
+use crate::operations::attention::{
+    lower_fused_attention, lower_fused_attention_backward, select_attention_implementation,
+};
 use crate::operations::jit_call::{JitCallFunctionMap, lower_shared_function_call};
-use crate::{Error, LowerableOperation, LowerableOperationFamily, XlaLowerer};
+use crate::{Error, LowerableOperation, LowerableOperationFamily, LoweringError, XlaLowerer};
 
 /// Returns `true` if lowering `operation` at the provided boundary never reads its attached regions, because it is a
 /// named composite call (refer to [`LowerableOperation::composite_key`]) that a backend implementation
@@ -39,6 +46,36 @@ pub(crate) fn lowers_without_regions<O: LowerableOperationFamily>(
 /// implementation replaces lowers its body. Every implementation must validate the attributes of the key and the
 /// boundary that it supports and decline any other call, because its key alone does not fix them.
 pub(crate) enum NamedCompositeImplementation {
+    /// cuDNN fused attention kernels for a call of the forward attention definition (refer to
+    /// [`select_attention_implementation`]).
+    Attention {
+        /// Configuration of the definition.
+        configuration: AttentionConfiguration,
+
+        /// Optional-input signature of the definition.
+        signature: AttentionInputSignature,
+    },
+
+    /// cuDNN fused attention backward kernels for a call of the backward attention definition (refer to
+    /// [`select_attention_implementation`]).
+    AttentionBackward {
+        /// Configuration of the definition.
+        configuration: AttentionConfiguration,
+
+        /// Optional-input signature of the definition.
+        signature: AttentionInputSignature,
+    },
+
+    /// Implementation of an attention definition that requests the fused kernels for a call that they cannot
+    /// implement, which reports why instead of silently lowering the portable body.
+    FusedAttentionUnavailable {
+        /// Name of the definition.
+        name: &'static str,
+
+        /// Reason why the fused kernels are unavailable.
+        reason: String,
+    },
+
     /// Test implementation of `ryft.tests.xla_named_square` version 1 on CUDA, which squares its input.
     #[cfg(test)]
     TestSquare,
@@ -49,25 +86,87 @@ impl NamedCompositeImplementation {
     /// and output types when lowering for `target_platform`, or [`None`] when the calls lower their body.
     pub(crate) fn select(
         key: &CompositeKey,
-        _input_types: &[ArrayIrType],
-        _output_types: &[ArrayIrType],
+        input_types: &[ArrayIrType],
+        output_types: &[ArrayIrType],
         target_platform: Option<&str>,
     ) -> Option<Self> {
         match (key.name(), key.version(), target_platform) {
             #[cfg(test)]
             ("ryft.tests.xla_named_square", 1, Some("cuda")) => Some(Self::TestSquare),
-            _ => None,
+            _ => select_attention_implementation(key, input_types, output_types, target_platform),
         }
     }
 
-    /// Lowers one call with this implementation, returning one MLIR value per output.
-    #[cfg_attr(not(test), allow(unused_variables))]
+    /// Returns the error that a call with this implementation reports when it cannot use the implementation and would
+    /// otherwise lower its portable body instead (e.g., when eager execution replays the body of a call whose concrete
+    /// inputs refine the types at which it was staged), or [`None`] when the body is an acceptable substitute. Calls
+    /// that explicitly request a backend implementation (e.g., fused attention) never silently use their body.
+    pub(crate) fn body_substitution_error(&self) -> Option<Error> {
+        let (name, reason) = match self {
+            Self::Attention { configuration, .. } | Self::AttentionBackward { configuration, .. }
+                if configuration.implementation() != AttentionImplementation::Fused =>
+            {
+                return None;
+            }
+            Self::Attention { .. } => (DOT_PRODUCT_ATTENTION_COMPOSITE_NAME, None),
+            Self::AttentionBackward { .. } => (DOT_PRODUCT_ATTENTION_BACKWARD_COMPOSITE_NAME, None),
+            Self::FusedAttentionUnavailable { name, reason } => (*name, Some(reason.as_str())),
+            #[cfg(test)]
+            Self::TestSquare => return None,
+        };
+        let reason = reason.unwrap_or(
+            "eager execution replays the body of a call whose inputs refine the types at which it was staged; \
+             execute the compiled program instead",
+        );
+        Some(Error::Lowering(LoweringError::UnsupportedOperation {
+            operation: name.to_string(),
+            reason: format!("the fused attention implementation is unavailable because {reason}"),
+        }))
+    }
+
+    /// Lowers one call with this implementation, whose boundary has the provided input and output types, returning
+    /// one MLIR value per output.
     fn lower<'b, 'c: 'b, 't: 'c, O: LowerableOperationFamily>(
         &self,
         lowerer: &mut XlaLowerer<'b, 'c, 't, O>,
         input_values: &[ValueRef<'b, 'c, 't>],
+        input_types: &[ArrayIrType],
+        output_types: &[ArrayIrType],
     ) -> Result<Vec<ValueRef<'b, 'c, 't>>, Error> {
-        match *self {
+        let array_types = |types: &[ArrayIrType]| {
+            types
+                .iter()
+                .map(|r#type| <&ArrayType>::try_from(r#type).cloned())
+                .collect::<Result<Vec<_>, _>>()
+                .map_err(ProgramError::from)
+        };
+        match self {
+            Self::Attention { configuration, signature } => lower_fused_attention(
+                *configuration,
+                *signature,
+                input_values,
+                array_types(input_types)?.as_slice(),
+                array_types(output_types)?.as_slice(),
+                &mut lowerer.block,
+                lowerer.context,
+                lowerer.location,
+            ),
+            Self::AttentionBackward { configuration, signature } => lower_fused_attention_backward(
+                *configuration,
+                *signature,
+                input_values,
+                array_types(input_types)?.as_slice(),
+                array_types(output_types)?.as_slice(),
+                &mut lowerer.block,
+                lowerer.context,
+                lowerer.location,
+            ),
+            Self::FusedAttentionUnavailable { name, reason } => {
+                Err(Error::Lowering(LoweringError::UnsupportedOperation {
+                    operation: name.to_string(),
+                    reason: format!("the fused attention implementation is unavailable because {reason}"),
+                }))
+            }
             #[cfg(test)]
             Self::TestSquare => {
                 let multiply = lowerer.block.append_operation(ryft_mlir::dialects::stable_hlo::multiply(
@@ -110,7 +209,7 @@ where
             if let Some(backend) =
                 NamedCompositeImplementation::select(key, &input_types, &output_types, target_platform)
             {
-                return backend.lower(lowerer, input_values);
+                return backend.lower(lowerer, input_values, &input_types, &output_types);
             }
             let function = lowerer
                 .nested_functions

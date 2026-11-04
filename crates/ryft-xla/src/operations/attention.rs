@@ -1,15 +1,18 @@
-//! cuDNN fused-attention adaptation for canonical Ryft attention boundaries.
+//! cuDNN fused-attention implementations of the named attention definitions.
+//!
+//! The named attention definitions (refer to [`AttentionKey`]) carry their portable bodies, which every backend can
+//! lower. On CUDA targets, this module replaces eligible calls with cuDNN's fused multi-head attention custom calls,
+//! selected by [`select_attention_implementation`] from the decoded key and the boundary of each call. This module
+//! owns only the fused kernels' eligibility, physical-bound materialization, ABI configuration, and output refinement.
+//! The attention mathematics (e.g., grouped-head expansion, masking, and softmax) remain exclusively in the core
+//! bodies.
 
 use ryft_core::macros::check_count;
 use ryft_core::operations::attention::{
-    AttentionConfiguration, AttentionImplementation, AttentionInputs, DOT_PRODUCT_ATTENTION_BACKWARD_OPERATION_NAME,
-    DOT_PRODUCT_ATTENTION_OPERATION_NAME, DotProductAttentionBackwardOperation, DotProductAttentionOperation,
-    dot_product_attention_backward_ir_composition, dot_product_attention_ir_composition,
+    AttentionConfiguration, AttentionDefinitionKind, AttentionImplementation, AttentionInputSignature, AttentionInputs,
+    AttentionKey, DOT_PRODUCT_ATTENTION_BACKWARD_COMPOSITE_NAME, DOT_PRODUCT_ATTENTION_COMPOSITE_NAME,
 };
-use ryft_core::{
-    ArrayType, CompositeKey, DataType, Dimension, DomainTracingContext, Operation, ProgramError, ProjectedValue,
-    ReductionKind, Shape,
-};
+use ryft_core::{ArrayIrType, ArrayType, CompositeKey, DataType, Dimension, ProgramError, ReductionKind, Shape};
 use ryft_mlir::dialects::stable_hlo;
 use ryft_mlir::dialects::stable_hlo::{CustomCallApiVersion, CustomCallMemoryLayouts};
 use ryft_mlir::{
@@ -17,111 +20,76 @@ use ryft_mlir::{
     Value as MlirValue, ValueRef,
 };
 
-use crate::experimental::domains::XlaTracer;
-use crate::experimental::lowering::CollectiveLoweringState;
-use crate::experimental::lowering::compositions::{
-    NamedCompositionKey, lower_decomposition_call, named_composition_input_types,
-};
 use crate::experimental::lowering::types::{
     lower_f64_constant_splat, lower_physical_bound_value, lower_restore_dynamic_dimensions, lower_tensor_type,
     physical_bound_type, static_dimensions,
 };
-use crate::experimental::ops::FlatXlaProgram;
+use crate::operations::composites::NamedCompositeImplementation;
 use crate::operations::reductions::lower_reduce_to_mlir;
-use crate::{Error, LowerableOperation, LowerableOperationFamily, LoweringError, XlaDomain, XlaLowerer};
+use crate::{Error, LoweringError};
 
-/// Traces the canonical portable attention composition for one validated operation boundary.
-pub(crate) fn trace_attention_composition(
-    operation: &DotProductAttentionOperation,
-    input_types: &[ArrayType],
-) -> Result<FlatXlaProgram, Error> {
-    let input_types = named_composition_input_types(input_types)?;
-    let (_, program) = DomainTracingContext::<XlaDomain<'static>>::trace(
-        |inputs: Vec<XlaTracer<'static>>| {
-            let signature = operation.signature();
-            let attention_inputs = AttentionInputs::from_values(signature, &inputs)?;
-            let (output, activation) =
-                dot_product_attention_ir_composition(&attention_inputs, operation.configuration())?;
-            Ok(std::iter::once(output.into_value())
-                .chain(activation.map(ProjectedValue::into_value))
-                .collect::<Vec<_>>())
-        },
-        input_types,
-    )?;
-    Ok(program.simplified()?)
-}
+/// Seed of the dropout masks of the fused attention kernels. Calls with dropout but without a dropout state have an
+/// implementation-defined mask (refer to [`AttentionInputs::dropout_state`]), and this fixed seed makes the forward and
+/// backward kernels of one boundary apply the same mask.
+const FMHA_DROPOUT_SEED: u64 = 42;
 
-/// Traces the canonical portable attention-backward composition for one validated operation boundary.
-pub(crate) fn trace_attention_backward_composition(
-    operation: &DotProductAttentionBackwardOperation,
-    input_types: &[ArrayType],
-) -> Result<FlatXlaProgram, Error> {
-    let input_types = named_composition_input_types(input_types)?;
-    let (_, program) = DomainTracingContext::<XlaDomain<'static>>::trace(
-        |inputs: Vec<XlaTracer<'static>>| {
-            let signature = operation.signature();
-            let optional_count = signature.count();
-            let attention_inputs = AttentionInputs::from_values(signature, &inputs[..3 + optional_count])?;
-            dot_product_attention_backward_ir_composition(
-                &attention_inputs,
-                &inputs[3 + optional_count],
-                &inputs[4 + optional_count],
-                &inputs[5 + optional_count],
-                operation.configuration(),
-            )
-            .map(|outputs| outputs.into_iter().map(ProjectedValue::into_value).collect::<Vec<_>>())
-        },
-        input_types,
-    )?;
-    Ok(program.simplified()?)
-}
-
-/// Builds the canonical identity of one portable attention composition.
-pub(crate) fn attention_composition_key(
-    operation: &DotProductAttentionOperation,
-    input_types: &[ArrayType],
-    output_types: &[ArrayType],
-) -> NamedCompositionKey {
-    let configuration = operation.configuration();
-    let signature = operation.signature();
-    NamedCompositionKey {
-        composite: CompositeKey::new("ryft.dot_product_attention", 0)
-            .with_attribute("scale", configuration.scale())
-            .with_attribute("causal", configuration.causal())
-            .with_attribute("local_window_left", configuration.local_window().map(|window| window.0))
-            .with_attribute("local_window_right", configuration.local_window().map(|window| window.1))
-            .with_attribute("dropout", configuration.dropout())
-            .with_attribute("residual", configuration.return_residual())
-            .with_attribute("bias", signature.has_bias())
-            .with_attribute("mask", signature.has_mask())
-            .with_attribute("query_lengths", signature.has_query_sequence_lengths())
-            .with_attribute("key_value_lengths", signature.has_key_value_sequence_lengths()),
-        input_types: input_types.to_vec(),
-        output_types: output_types.to_vec(),
+/// Returns the implementation that replaces the calls of the named attention definition `key` with the provided
+/// input and output types when lowering for `target_platform`, or [`None`] when the calls lower their portable body.
+///
+/// Keys that do not name an attention definition, malformed attention keys, and boundaries that are not array-typed
+/// are declined. [`AttentionImplementation::Portable`] always lowers the body, and so does a call with a dropout state,
+/// because the fused kernels cannot reproduce the mask of a caller-provided random state.
+/// [`AttentionImplementation::Automatic`] selects the fused kernels when [`fmha_eligibility`] accepts the boundary and
+/// the body otherwise. [`AttentionImplementation::Fused`] selects the fused kernels when they are eligible and an
+/// implementation that reports why they are not otherwise, so that it never silently changes the requested numerics.
+pub(crate) fn select_attention_implementation(
+    key: &CompositeKey,
+    input_types: &[ArrayIrType],
+    output_types: &[ArrayIrType],
+    target_platform: Option<&str>,
+) -> Option<NamedCompositeImplementation> {
+    let key = AttentionKey::from_composite_key(key).ok()??;
+    let configuration = key.configuration();
+    let signature = key.signature();
+    let implementation = configuration.implementation();
+    if implementation == AttentionImplementation::Portable {
+        return None;
     }
-}
-
-/// Builds the canonical identity of one portable attention-backward composition.
-pub(crate) fn attention_backward_composition_key(
-    operation: &DotProductAttentionBackwardOperation,
-    input_types: &[ArrayType],
-    output_types: &[ArrayType],
-) -> NamedCompositionKey {
-    let configuration = operation.configuration();
-    let signature = operation.signature();
-    NamedCompositionKey {
-        composite: CompositeKey::new("ryft.dot_product_attention_backward", 0)
-            .with_attribute("scale", configuration.scale())
-            .with_attribute("causal", configuration.causal())
-            .with_attribute("local_window_left", configuration.local_window().map(|window| window.0))
-            .with_attribute("local_window_right", configuration.local_window().map(|window| window.1))
-            .with_attribute("dropout", configuration.dropout())
-            .with_attribute("bias", signature.has_bias())
-            .with_attribute("mask", signature.has_mask())
-            .with_attribute("query_lengths", signature.has_query_sequence_lengths())
-            .with_attribute("key_value_lengths", signature.has_key_value_sequence_lengths()),
-        input_types: input_types.to_vec(),
-        output_types: output_types.to_vec(),
+    let array_types = |types: &[ArrayIrType]| {
+        types.iter().map(|r#type| <&ArrayType>::try_from(r#type).ok().cloned()).collect::<Option<Vec<_>>>()
+    };
+    let input_types = array_types(input_types)?;
+    array_types(output_types)?;
+    let name = match key.kind() {
+        AttentionDefinitionKind::Forward => DOT_PRODUCT_ATTENTION_COMPOSITE_NAME,
+        AttentionDefinitionKind::Backward => DOT_PRODUCT_ATTENTION_BACKWARD_COMPOSITE_NAME,
+    };
+    let unavailable = |reason: String| match implementation {
+        AttentionImplementation::Fused => {
+            Some(NamedCompositeImplementation::FusedAttentionUnavailable { name, reason })
+        }
+        AttentionImplementation::Automatic | AttentionImplementation::Portable => None,
+    };
+    if signature.has_dropout_state() {
+        return unavailable(
+            "the fused kernels cannot reproduce the dropout mask of a dropout state; omit the dropout state to use \
+             the fused kernels' own mask"
+                .to_string(),
+        );
+    }
+    let expected_input_count = 3 + signature.count() + 3 * usize::from(key.kind() == AttentionDefinitionKind::Backward);
+    if input_types.len() != expected_input_count {
+        return None;
+    }
+    match fmha_eligibility(configuration, signature, input_types.as_slice(), target_platform) {
+        Ok(FmhaEligibility::Eligible) => Some(match key.kind() {
+            AttentionDefinitionKind::Forward => NamedCompositeImplementation::Attention { configuration, signature },
+            AttentionDefinitionKind::Backward => {
+                NamedCompositeImplementation::AttentionBackward { configuration, signature }
+            }
+        }),
+        Ok(FmhaEligibility::Ineligible(reason)) => unavailable(reason.to_string()),
+        Err(error) => unavailable(error.to_string()),
     }
 }
 
@@ -135,10 +103,10 @@ fn attention_dimensions(input_type: &ArrayType) -> Result<[Dimension; 4], Error>
             Ok([batch.clone(), sequence.clone(), heads.clone(), head_dimension.clone()])
         }
         _ => Err(Error::Lowering(LoweringError::UnsupportedOperation {
-            operation: DOT_PRODUCT_ATTENTION_OPERATION_NAME.to_string(),
+            operation: DOT_PRODUCT_ATTENTION_COMPOSITE_NAME.to_string(),
             reason: format!(
                 "{} operand must have rank 3 or 4 but got rank {}",
-                DOT_PRODUCT_ATTENTION_OPERATION_NAME,
+                DOT_PRODUCT_ATTENTION_COMPOSITE_NAME,
                 input_type.rank(),
             ),
         })),
@@ -152,9 +120,9 @@ fn attention_physical_extent(dimension: &Dimension) -> Result<usize, Error> {
         Dimension::Dynamic(variable) => {
             variable.bounds().upper().and_then(|upper| upper.checked_sub(1)).ok_or_else(|| {
                 Error::Lowering(LoweringError::UnsupportedOperation {
-                    operation: DOT_PRODUCT_ATTENTION_OPERATION_NAME.to_string(),
+                    operation: DOT_PRODUCT_ATTENTION_COMPOSITE_NAME.to_string(),
                     reason: format!(
-                        "{DOT_PRODUCT_ATTENTION_OPERATION_NAME} dimension {variable} needs a finite positive physical \
+                        "{DOT_PRODUCT_ATTENTION_COMPOSITE_NAME} dimension {variable} needs a finite positive physical \
                          bound",
                     ),
                 })
@@ -199,22 +167,22 @@ const FMHA_BACKWARD_DOT_DIMENSION_NUMBERS: &str = "\"bmm1_grad_gemm1_dot_dimensi
 /// (not typed-FFI dictionaries) that XLA's cuDNN custom-call compiler parses — with the score scale, the
 /// intermediate `[batch, q_heads, q_seq, kv_seq]` score shape at the operand element type (load-bearing on the
 /// backward path, where the `P` descriptor and statistic strides derive from it), the mask kind, the
-/// forward or backward dot-dimension-number block, the dropout rate and seed (the hardware-validated defaults
-/// `0.0`/`42` when dropout is off), and the sliding-window length.
+/// forward or backward dot-dimension-number block, the dropout rate and the fixed seed [`FMHA_DROPOUT_SEED`] (the
+/// rate is the hardware-validated default `0.0` when dropout is off), and the sliding-window length.
 fn fmha_backend_config(
     element_type: &str,
     intermediate_dimensions: [usize; 4],
     scale: f64,
     mask_type: &str,
     dot_dimension_numbers: &str,
-    dropout: Option<(f64, u64)>,
+    dropout: Option<f64>,
     sliding_window_length: usize,
 ) -> String {
     let [batch, heads, query_sequence, key_value_sequence] = intermediate_dimensions;
     // The `{:?}` rate formatting keeps the validated `0.0` spelling for the off state while rendering set rates
     // with their shortest round-trip form.
-    let dropout_rate = dropout.map_or(0.0, |(rate, _)| rate);
-    let seed = dropout.map_or(42, |(_, seed)| seed);
+    let dropout_rate = dropout.unwrap_or(0.0);
+    let seed = FMHA_DROPOUT_SEED;
     format!(
         "{{\"operation_queue_id\":\"0\",\"cudnn_fmha_backend_config\":{{\
          \"algorithm\":{{\"algo_id\":\"0\",\"math_type\":\"TENSOR_OP_MATH\",\"tuning_knobs\":\
@@ -271,9 +239,9 @@ enum FmhaEligibility {
 /// Checks one attention boundary against the semantic and physical requirements of the cuDNN fMHA adapter.
 fn fmha_eligibility(
     configuration: AttentionConfiguration,
-    signature: ryft_core::operations::attention::AttentionInputSignature,
+    signature: AttentionInputSignature,
     input_types: &[ArrayType],
-    collective_state: &CollectiveLoweringState,
+    target_platform: Option<&str>,
 ) -> Result<FmhaEligibility, Error> {
     if configuration.local_window().is_some_and(|(_, right)| {
         right != 0
@@ -285,7 +253,7 @@ fn fmha_eligibility(
             "a nonzero right local-window radius requires causal masking without sequence-length padding",
         ));
     }
-    if !collective_state.target_platform().is_some_and(|platform| platform == "cuda") {
+    if target_platform != Some("cuda") {
         return Ok(FmhaEligibility::Ineligible("the target platform is not CUDA"));
     }
     if !matches!(input_types[0].data_type(), DataType::BF16 | DataType::F16) {
@@ -308,9 +276,7 @@ fn fmha_eligibility(
 }
 
 /// Canonical operand indices of one attention boundary.
-fn attention_input_indices(
-    signature: ryft_core::operations::attention::AttentionInputSignature,
-) -> AttentionInputs<usize> {
+fn attention_input_indices(signature: AttentionInputSignature) -> AttentionInputs<usize> {
     let indices = (0..3 + signature.count()).collect::<Vec<_>>();
     AttentionInputs::from_values(signature, indices.as_slice())
         .expect("the generated index list exactly matches the attention operand signature")
@@ -463,22 +429,16 @@ fn synthesize_fmha_sequence_lengths<'b, 'c: 'b, 't: 'c>(
     Ok(lengths)
 }
 
-/// Lowers one [`DotProductAttentionOperation`] through either its canonical typed decomposition or the cuDNN fused ABI.
+/// Lowers one call of the forward attention definition with the provided configuration and optional-input signature
+/// to cuDNN's fused ABI, for a boundary that [`fmha_eligibility`] accepts.
 ///
-/// Portable mode always calls the private decomposition registered for the operation. Automatic mode does the same
-/// when [`fmha_eligibility`] rejects the fused ABI. Forced fused mode instead reports the eligibility reason, so it
-/// never silently changes semantics. An eligible `bf16`/`f16` CUDA operation emits
-/// `__cudnn$fmha[ScaleBias]Softmax[Dropout]` with physical `BNTH` inputs and restores the operation's logical rank and
-/// dynamic dimensions on its results. Optional bias and sequence-length operands retain the canonical
-/// [`AttentionInputs`] order until the final ABI assembly.
-///
-/// This function owns only fused-kernel eligibility, physical-bound materialization, ABI configuration, and result
-/// refinement. Grouped-head expansion, visibility, softmax, and portable attention mathematics remain exclusively in
-/// the core decomposition.
+/// An eligible `bf16`/`f16` CUDA call emits `__cudnn$fmha[ScaleBias]Softmax[Dropout]` with physical `BNTH` inputs and
+/// restores the logical rank and dynamic dimensions of its outputs. Optional bias and sequence-length inputs retain the
+/// canonical [`AttentionInputs`] order until the final ABI assembly.
 #[allow(clippy::too_many_arguments)]
-pub(crate) fn lower_dot_product_attention_to_mlir<'b, 'c: 'b, 't: 'c>(
-    operation: &DotProductAttentionOperation,
-    collective_state: &CollectiveLoweringState,
+pub(crate) fn lower_fused_attention<'b, 'c: 'b, 't: 'c>(
+    configuration: AttentionConfiguration,
+    signature: AttentionInputSignature,
     input_values: &[ValueRef<'b, 'c, 't>],
     input_types: &[ArrayType],
     output_types: &[ArrayType],
@@ -486,56 +446,28 @@ pub(crate) fn lower_dot_product_attention_to_mlir<'b, 'c: 'b, 't: 'c>(
     context: &'c MlirContext<'t>,
     location: LocationRef<'c, 't>,
 ) -> Result<Vec<ValueRef<'b, 'c, 't>>, Error> {
-    let signature = operation.signature();
     if input_values.len() != 3 + signature.count() || input_values.len() != input_types.len() {
-        return Err(ProgramError::InvalidInputCount { expected: 3, actual: input_values.len() }.into());
+        return Err(
+            ProgramError::InvalidInputCount { expected: 3 + signature.count(), actual: input_values.len() }.into()
+        );
     }
-    let configuration = operation.configuration();
     let expected_output_count = if configuration.return_residual() { 2 } else { 1 };
     check_count!("output", output_types, expected_output_count, ProgramError);
     let indices = attention_input_indices(signature);
     let uses_sequence_lengths = signature.has_query_sequence_lengths() || signature.has_key_value_sequence_lengths();
-    let eligibility = fmha_eligibility(configuration, signature, input_types, collective_state)?;
-    if configuration.implementation() == AttentionImplementation::Portable
-        || matches!(eligibility, FmhaEligibility::Ineligible(_))
-    {
-        if configuration.implementation() == AttentionImplementation::Fused {
-            if configuration.dropout().is_some() {
-                return Err(Error::Lowering(LoweringError::UnsupportedOperation {
-                    operation: operation.name().to_string(),
-                    reason: format!(
-                        "`{DOT_PRODUCT_ATTENTION_OPERATION_NAME}` dropout is only supported by the fused CUDA lowering",
-                    ),
-                }));
-            }
-            let FmhaEligibility::Ineligible(reason) = eligibility else { unreachable!() };
-            return Err(Error::Lowering(LoweringError::UnsupportedOperation {
-                operation: operation.name().to_string(),
-                reason: format!("the fused attention implementation is unavailable because {reason}"),
-            }));
-        }
-        let decomposition = collective_state
-            .named_compositions
-            .as_ref()
-            .and_then(|functions| functions.get_attention(operation, input_types, output_types))
-            .ok_or_else(|| {
-                ProgramError::MalformedProgram(format!("missing typed decomposition for `{}`", operation.name()))
-            })?;
-        return lower_decomposition_call(decomposition, input_values, output_types, block, context, location);
-    }
     let data_type = input_types[0].data_type();
     let [batch, query_sequence, heads, head_dimension] = attention_dimensions(&input_types[0])?;
     let [_, key_value_sequence, _, _] = attention_dimensions(&input_types[1])?;
     let heads = heads.value().ok_or_else(|| {
         Error::Lowering(LoweringError::UnsupportedOperation {
-            operation: operation.name().to_string(),
-            reason: format!("{DOT_PRODUCT_ATTENTION_OPERATION_NAME} heads dimension must be static"),
+            operation: DOT_PRODUCT_ATTENTION_COMPOSITE_NAME.to_string(),
+            reason: "the heads dimension must be static".to_string(),
         })
     })?;
     let head_dimension = head_dimension.value().ok_or_else(|| {
         Error::Lowering(LoweringError::UnsupportedOperation {
-            operation: operation.name().to_string(),
-            reason: format!("{DOT_PRODUCT_ATTENTION_OPERATION_NAME} head dimension must be static"),
+            operation: DOT_PRODUCT_ATTENTION_COMPOSITE_NAME.to_string(),
+            reason: "the head dimension must be static".to_string(),
         })
     })?;
     let physical_batch = attention_physical_extent(&batch)?;
@@ -704,22 +636,18 @@ pub(crate) fn lower_dot_product_attention_to_mlir<'b, 'c: 'b, 't: 'c>(
     }
 }
 
-/// Lowers one [`DotProductAttentionBackwardOperation`] through its canonical typed decomposition or the cuDNN fused
-/// backward ABI.
+/// Lowers one call of the backward attention definition with the provided configuration and optional-input signature
+/// to cuDNN's fused backward ABI, for a boundary that [`fmha_eligibility`] accepts.
 ///
-/// Portable and ineligible automatic configurations call the registered private decomposition. Eligible fused
-/// configurations reorder the canonical input boundary into cuDNN's `(Q, K, V, residual, dO[, bias], O[, query
-/// lengths, key/value lengths])` ABI, emit `__cudnn$fmha[ScaleBias]Softmax[Dropout]Backward`, and restore each
-/// cotangent's logical layout, data type, and dynamic dimensions. Forced fused mode reports a precise eligibility
-/// failure instead of falling back.
-///
-/// This function does not reproduce the analytical backward. It owns only the fused adapter's physical padding,
-/// operand ordering, backend configuration, and result refinement; the portable mathematics remain exclusively in
-/// the core backward decomposition.
+/// The canonical input boundary is reordered into cuDNN's `(Q, K, V, residual, dO[, bias], O[, query lengths,
+/// key/value lengths])` ABI, the call emits `__cudnn$fmha[ScaleBias]Softmax[Dropout]Backward`, and each cotangent's
+/// logical layout, data type, and dynamic dimensions are restored. This function does not reproduce the analytical
+/// backward pass. It owns only the fused kernel's physical padding, input ordering, backend configuration, and output
+/// refinement, while the portable mathematics remain exclusively in the core backward body.
 #[allow(clippy::too_many_arguments)]
-pub(crate) fn lower_dot_product_attention_backward_to_mlir<'b, 'c: 'b, 't: 'c>(
-    operation: &DotProductAttentionBackwardOperation,
-    collective_state: &CollectiveLoweringState,
+pub(crate) fn lower_fused_attention_backward<'b, 'c: 'b, 't: 'c>(
+    configuration: AttentionConfiguration,
+    signature: AttentionInputSignature,
     input_values: &[ValueRef<'b, 'c, 't>],
     input_types: &[ArrayType],
     output_types: &[ArrayType],
@@ -727,11 +655,11 @@ pub(crate) fn lower_dot_product_attention_backward_to_mlir<'b, 'c: 'b, 't: 'c>(
     context: &'c MlirContext<'t>,
     location: LocationRef<'c, 't>,
 ) -> Result<Vec<ValueRef<'b, 'c, 't>>, Error> {
-    let signature = operation.signature();
     if input_values.len() != 6 + signature.count() || input_values.len() != input_types.len() {
-        return Err(ProgramError::InvalidInputCount { expected: 6, actual: input_values.len() }.into());
+        return Err(
+            ProgramError::InvalidInputCount { expected: 6 + signature.count(), actual: input_values.len() }.into()
+        );
     }
-    let configuration = operation.configuration();
     let indices = attention_input_indices(signature);
     let uses_sequence_lengths = signature.has_query_sequence_lengths() || signature.has_key_value_sequence_lengths();
     if output_types.len() < 3 || output_types.len() > 3 + usize::from(signature.has_bias()) {
@@ -741,54 +669,25 @@ pub(crate) fn lower_dot_product_attention_backward_to_mlir<'b, 'c: 'b, 't: 'c>(
         }
         .into());
     }
-    let eligibility = fmha_eligibility(configuration, signature, input_types, collective_state)?;
-    if configuration.implementation() == AttentionImplementation::Portable
-        || matches!(eligibility, FmhaEligibility::Ineligible(_))
-    {
-        if configuration.implementation() == AttentionImplementation::Fused {
-            if configuration.dropout().is_some() {
-                return Err(Error::Lowering(LoweringError::UnsupportedOperation {
-                    operation: operation.name().to_string(),
-                    reason: format!(
-                        "`{DOT_PRODUCT_ATTENTION_BACKWARD_OPERATION_NAME}` dropout is only supported by the fused CUDA \
-                         lowering",
-                    ),
-                }));
-            }
-            let FmhaEligibility::Ineligible(reason) = eligibility else { unreachable!() };
-            return Err(Error::Lowering(LoweringError::UnsupportedOperation {
-                operation: operation.name().to_string(),
-                reason: format!("the fused attention backward implementation is unavailable because {reason}"),
-            }));
-        }
-        let decomposition = collective_state
-            .named_compositions
-            .as_ref()
-            .and_then(|functions| functions.get_attention_backward(operation, input_types, output_types))
-            .ok_or_else(|| {
-                ProgramError::MalformedProgram(format!("missing typed decomposition for `{}`", operation.name()))
-            })?;
-        return lower_decomposition_call(decomposition, input_values, output_types, block, context, location);
-    }
     let data_type = input_types[0].data_type();
     let [batch, query_sequence, heads, head_dimension] = attention_dimensions(&input_types[0])?;
     let [_, key_value_sequence, key_value_heads, _] = attention_dimensions(&input_types[1])?;
     let heads = heads.value().ok_or_else(|| {
         Error::Lowering(LoweringError::UnsupportedOperation {
-            operation: operation.name().to_string(),
-            reason: format!("{DOT_PRODUCT_ATTENTION_BACKWARD_OPERATION_NAME} heads dimension must be static"),
+            operation: DOT_PRODUCT_ATTENTION_BACKWARD_COMPOSITE_NAME.to_string(),
+            reason: "the heads dimension must be static".to_string(),
         })
     })?;
     let key_value_heads = key_value_heads.value().ok_or_else(|| {
         Error::Lowering(LoweringError::UnsupportedOperation {
-            operation: operation.name().to_string(),
-            reason: format!("{DOT_PRODUCT_ATTENTION_BACKWARD_OPERATION_NAME} key/value heads dimension must be static"),
+            operation: DOT_PRODUCT_ATTENTION_BACKWARD_COMPOSITE_NAME.to_string(),
+            reason: "the key/value heads dimension must be static".to_string(),
         })
     })?;
     let head_dimension = head_dimension.value().ok_or_else(|| {
         Error::Lowering(LoweringError::UnsupportedOperation {
-            operation: operation.name().to_string(),
-            reason: format!("{DOT_PRODUCT_ATTENTION_BACKWARD_OPERATION_NAME} head dimension must be static"),
+            operation: DOT_PRODUCT_ATTENTION_BACKWARD_COMPOSITE_NAME.to_string(),
+            reason: "the head dimension must be static".to_string(),
         })
     })?;
     let physical_batch = attention_physical_extent(&batch)?;
@@ -1016,622 +915,415 @@ pub(crate) fn lower_dot_product_attention_backward_to_mlir<'b, 'c: 'b, 't: 'c>(
     }
 }
 
-impl LowerableOperation for DotProductAttentionOperation {
-    fn lower<'b, 'c: 'b, 't: 'c, O: LowerableOperationFamily>(
-        &self,
-        lowerer: &mut XlaLowerer<'b, 'c, 't, O>,
-        input_values: &[ValueRef<'b, 'c, 't>],
-        input_types: &[ArrayType],
-        output_types: &[ArrayType],
-    ) -> Result<Vec<ValueRef<'b, 'c, 't>>, Error> {
-        let collective_state = lowerer.collective_state.clone();
-        lower_dot_product_attention_to_mlir(
-            self,
-            &collective_state,
-            input_values,
-            input_types,
-            output_types,
-            &mut lowerer.block,
-            lowerer.context,
-            lowerer.location,
-        )
-    }
-}
-
-impl LowerableOperation for DotProductAttentionBackwardOperation {
-    fn lower<'b, 'c: 'b, 't: 'c, O: LowerableOperationFamily>(
-        &self,
-        lowerer: &mut XlaLowerer<'b, 'c, 't, O>,
-        input_values: &[ValueRef<'b, 'c, 't>],
-        input_types: &[ArrayType],
-        output_types: &[ArrayType],
-    ) -> Result<Vec<ValueRef<'b, 'c, 't>>, Error> {
-        let collective_state = lowerer.collective_state.clone();
-        lower_dot_product_attention_backward_to_mlir(
-            self,
-            &collective_state,
-            input_values,
-            input_types,
-            output_types,
-            &mut lowerer.block,
-            lowerer.context,
-            lowerer.location,
-        )
-    }
-}
-
 #[cfg(test)]
 mod tests {
     use pretty_assertions::assert_eq;
-    use ryft_core::operations::attention::AttentionInputSignature;
-    use ryft_core::{AtomId, DimensionBounds, DimensionVariable, Placeholder, Typed};
-    use ryft_mlir::Location;
+    use ryft_core::operations::attention::{
+        DOT_PRODUCT_ATTENTION_COMPOSITE_VERSION, DOT_PRODUCT_ATTENTION_TRAINING_COMPOSITE_NAME,
+        differentiable_dot_product_attention, dot_product_attention,
+    };
+    use ryft_core::{Differentiate, DimensionBounds, DimensionVariable, DomainTracingContext, Typed, Value};
 
+    use crate::experimental::domains::XlaTracer;
     use crate::experimental::lowering::lower_mlir_module_for_program;
-    use crate::experimental::lowering::tests::{XlaProgramBuilder, unproject_plain_program};
-    use crate::experimental::ops::{XlaArrayConstant, XlaConstant, XlaProgram};
-    use crate::to_mlir_module_for_program;
+    use crate::experimental::ops::FlatXlaProgram;
+    use crate::{XlaDomain, to_mlir_module_for_program};
 
     use super::*;
 
-    fn attention_operation(configuration: AttentionConfiguration) -> DotProductAttentionOperation {
-        DotProductAttentionOperation::new(configuration, AttentionInputSignature::default())
+    /// Staged program together with its input and output types.
+    type StagedProgram = (FlatXlaProgram, Vec<ArrayType>, Vec<ArrayType>);
+
+    /// Returns the array types of `types`.
+    fn array_types(types: &[ArrayIrType]) -> Vec<ArrayType> {
+        types.iter().map(|r#type| <&ArrayType>::try_from(r#type).unwrap().clone()).collect()
     }
 
-    fn attention_backward_operation(configuration: AttentionConfiguration) -> DotProductAttentionBackwardOperation {
-        DotProductAttentionBackwardOperation::new(configuration, AttentionInputSignature::default())
+    /// Stages `calls` consecutive calls of one inference function with the provided configuration over inputs with
+    /// the provided optional-input signature and types, where each call attends the output of the previous one.
+    fn forward_program(
+        configuration: AttentionConfiguration,
+        signature: AttentionInputSignature,
+        input_types: Vec<ArrayType>,
+        calls: usize,
+    ) -> StagedProgram {
+        let attention = dot_product_attention::<XlaDomain<'static>>(configuration);
+        let (output_types, program) = DomainTracingContext::<XlaDomain<'static>>::trace(
+            |inputs: Vec<XlaTracer<'static>>| {
+                let mut inputs = AttentionInputs::from_values(signature, &inputs)?;
+                let mut outputs = Vec::new();
+                for _ in 0..calls {
+                    let (output, residual) = attention.call(inputs.clone())?;
+                    inputs.query = output.clone();
+                    outputs = std::iter::once(output).chain(residual).collect();
+                }
+                Ok(outputs)
+            },
+            input_types.iter().cloned().map(ArrayIrType::from).collect::<Vec<_>>(),
+        )
+        .unwrap();
+        (program.into_flat_program(), input_types, array_types(&output_types))
     }
 
-    /// Builds the attention program shared by the platform-gated lowering fixtures below.
-    fn dot_product_attention_fixture_program(
+    /// Stages the reverse mode differentiation of one call of a training function with the provided configuration
+    /// over inputs with the provided optional-input signature and types, followed by the output cotangent. The program
+    /// calls the forward definition with its residual and the backward definition, and its outputs are the attended
+    /// output followed by the cotangents of the query, key, and value, and of a floating-point bias.
+    fn training_program(
+        configuration: AttentionConfiguration,
+        signature: AttentionInputSignature,
+        input_types: Vec<ArrayType>,
+    ) -> StagedProgram {
+        let attention = differentiable_dot_product_attention::<XlaDomain<'static>>(configuration);
+        let input_types = input_types.iter().cloned().chain([input_types[0].clone()]).collect::<Vec<_>>();
+        let (output_types, program) = DomainTracingContext::<XlaDomain<'static>>::trace(
+            |inputs: Vec<XlaTracer<'static>>| {
+                let (output_cotangent, inputs) = inputs.split_last().unwrap();
+                let inputs = AttentionInputs::from_values(signature, inputs)?;
+                let has_bias = inputs.bias.as_ref().is_some_and(|bias| {
+                    <&ArrayType>::try_from(bias.r#type().as_ref()).unwrap().data_type().is_floating_point()
+                });
+                let (output, pullback) =
+                    output_cotangent.domain().differentiate_at(inputs).vjp(|inputs| attention.call(inputs))?;
+                let cotangents = pullback.apply_materialized(output_cotangent.clone())?;
+                Ok([output, cotangents.query, cotangents.key, cotangents.value]
+                    .into_iter()
+                    .chain(cotangents.bias.filter(|_| has_bias))
+                    .collect::<Vec<_>>())
+            },
+            input_types.iter().cloned().map(ArrayIrType::from).collect::<Vec<_>>(),
+        )
+        .unwrap();
+        (program.into_flat_program(), input_types, array_types(&output_types))
+    }
+
+    /// Returns the `[2, 4, heads, 8]` input types of attention over `data_type` arrays with `query_heads` query heads
+    /// and `key_value_heads` key/value heads, followed by an optional broadcast-batch bias `[1, query_heads, 4, 4]`
+    /// and an optional pair of `i32[2]` sequence lengths.
+    fn extended_input_types(
         data_type: DataType,
-        head_dimension: usize,
-        causal: bool,
-    ) -> (XlaProgram<Vec<XlaConstant>, Vec<XlaConstant>>, Vec<ArrayType>, Vec<ArrayType>) {
-        let operand_type = attention_array_type(data_type, &[1, 4, 2, head_dimension]);
-        let mut builder = XlaProgramBuilder::new();
-        let inputs = vec![
-            builder.add_input(operand_type.clone()),
-            builder.add_input(operand_type.clone()),
-            builder.add_input(operand_type.clone()),
+        query_heads: usize,
+        key_value_heads: usize,
+        bias: bool,
+        sequence_lengths: bool,
+    ) -> (AttentionInputSignature, Vec<ArrayType>) {
+        let mut input_types = vec![
+            attention_array_type(data_type, &[2, 4, query_heads, 8]),
+            attention_array_type(data_type, &[2, 4, key_value_heads, 8]),
+            attention_array_type(data_type, &[2, 4, key_value_heads, 8]),
         ];
-        let output = builder
-            .add_instruction(
-                attention_operation(AttentionConfiguration::new().with_scale(0.125).with_causal(causal)),
-                Vec::new(),
-                inputs,
-                None,
+        if bias {
+            input_types.push(attention_array_type(data_type, &[1, query_heads, 4, 4]));
+        }
+        if sequence_lengths {
+            input_types.extend([attention_array_type(DataType::I32, &[2]), attention_array_type(DataType::I32, &[2])]);
+        }
+        (AttentionInputSignature::new(bias, false, sequence_lengths, sequence_lengths), input_types)
+    }
+
+    /// Lowers `program` for `target_platform`, returning its StableHLO module or the lowering error.
+    fn lower(
+        (program, input_types, output_types): &StagedProgram,
+        target_platform: Option<&str>,
+    ) -> Result<String, Error> {
+        lower_mlir_module_for_program(program, &[], input_types, output_types, "main", None, None, target_platform)
+            .map(|module| module.stable_hlo)
+    }
+
+    #[test]
+    fn test_select_attention_implementation() {
+        let operand_type = ArrayIrType::from(attention_array_type(DataType::BF16, &[1, 4, 2, 8]));
+        let f32_operand_type = ArrayIrType::from(attention_array_type(DataType::F32, &[1, 4, 2, 8]));
+        let state_type = ArrayIrType::from(attention_array_type(DataType::U64, &[2]));
+        let forward_types = vec![operand_type.clone(); 3];
+        let select = |implementation: AttentionImplementation,
+                      configuration: AttentionConfiguration,
+                      signature: AttentionInputSignature,
+                      input_types: &[ArrayIrType],
+                      target_platform: Option<&str>| {
+            let key = AttentionKey::new(
+                AttentionDefinitionKind::Forward,
+                configuration.with_implementation(implementation),
+                signature,
+            );
+            select_attention_implementation(
+                &key.to_composite_key(),
+                input_types,
+                std::slice::from_ref(&operand_type),
+                target_platform,
             )
-            .unwrap()[0];
-        let program = builder
-            .build::<Vec<XlaArrayConstant>, Vec<XlaArrayConstant>>(
-                vec![output],
-                vec![Placeholder; 3],
-                vec![Placeholder],
+        };
+        let configuration = AttentionConfiguration::new().with_causal(true);
+        let signature = AttentionInputSignature::default();
+
+        // Eligible CUDA calls use the fused kernels unless the portable implementation is requested.
+        for implementation in [AttentionImplementation::Automatic, AttentionImplementation::Fused] {
+            assert!(matches!(
+                select(implementation, configuration, signature, &forward_types, Some("cuda")),
+                Some(NamedCompositeImplementation::Attention { configuration: selected, signature: selected_signature })
+                    if selected == configuration.with_implementation(implementation)
+                        && selected_signature == signature,
+            ));
+        }
+        assert!(
+            select(AttentionImplementation::Portable, configuration, signature, &forward_types, Some("cuda")).is_none()
+        );
+
+        // Ineligible calls lower their body unless the fused kernels are requested, which reports why they are not.
+        let f32_types = vec![f32_operand_type; 3];
+        for (input_types, target_platform, reason) in [
+            (&forward_types, None, "the target platform is not CUDA"),
+            (&forward_types, Some("cpu"), "the target platform is not CUDA"),
+            (&f32_types, Some("cuda"), "the operand data type is not `f16` or `bf16`"),
+        ] {
+            assert!(
+                select(AttentionImplementation::Automatic, configuration, signature, input_types, target_platform)
+                    .is_none()
+            );
+            assert!(matches!(
+                select(AttentionImplementation::Fused, configuration, signature, input_types, target_platform),
+                Some(NamedCompositeImplementation::FusedAttentionUnavailable { name, reason: selected_reason })
+                    if name == DOT_PRODUCT_ATTENTION_COMPOSITE_NAME && selected_reason == reason,
+            ));
+        }
+
+        // Calls with a dropout state always lower their body, because the fused kernels cannot reproduce its mask.
+        let dropout = configuration.with_dropout(0.5);
+        let stateful = signature.with_dropout_state(true);
+        let stateful_types = forward_types.iter().cloned().chain([state_type]).collect::<Vec<_>>();
+        assert!(select(AttentionImplementation::Automatic, dropout, stateful, &stateful_types, Some("cuda")).is_none());
+        assert!(matches!(
+            select(AttentionImplementation::Fused, dropout, stateful, &stateful_types, Some("cuda")),
+            Some(NamedCompositeImplementation::FusedAttentionUnavailable { reason, .. })
+                if reason.starts_with("the fused kernels cannot reproduce the dropout mask of a dropout state"),
+        ));
+        assert!(matches!(
+            select(AttentionImplementation::Automatic, dropout, signature, &forward_types, Some("cuda")),
+            Some(NamedCompositeImplementation::Attention { .. }),
+        ));
+
+        // Backward definitions select the fused backward kernels.
+        let backward_types = forward_types
+            .iter()
+            .cloned()
+            .chain([
+                operand_type.clone(),
+                ArrayIrType::from(attention_array_type(DataType::BF16, &[1, 4, 2])),
+                operand_type.clone(),
+            ])
+            .collect::<Vec<_>>();
+        let backward_key =
+            AttentionKey::new(AttentionDefinitionKind::Backward, configuration, signature).to_composite_key();
+        assert!(matches!(
+            select_attention_implementation(&backward_key, &backward_types, &forward_types, Some("cuda")),
+            Some(NamedCompositeImplementation::AttentionBackward { .. }),
+        ));
+
+        // Other composites, malformed attention keys, and boundaries that do not match their key are declined.
+        assert!(
+            select_attention_implementation(
+                &CompositeKey::new("ryft.other", 1),
+                &forward_types,
+                &forward_types,
+                Some("cuda")
+            )
+            .is_none()
+        );
+        let malformed =
+            CompositeKey::new(DOT_PRODUCT_ATTENTION_COMPOSITE_NAME, DOT_PRODUCT_ATTENTION_COMPOSITE_VERSION);
+        assert!(select_attention_implementation(&malformed, &forward_types, &forward_types, Some("cuda")).is_none());
+        assert!(
+            select(AttentionImplementation::Automatic, configuration, signature, &forward_types[..2], Some("cuda"))
+                .is_none()
+        );
+        let training_key = CompositeKey::new(DOT_PRODUCT_ATTENTION_TRAINING_COMPOSITE_NAME, 1);
+        assert!(select_attention_implementation(&training_key, &forward_types, &forward_types, Some("cuda")).is_none());
+    }
+
+    #[test]
+    fn test_fused_attention_on_cuda() {
+        // Qualifying causal BF16 attention uses the cuDNN fMHA ABI and preserves the causal mask, while the unmasked
+        // F16 form uses the same target with `NO_MASK`.
+        for (data_type, causal, mask_type, element_type) in
+            [(DataType::BF16, true, "CAUSAL", "BF16"), (DataType::F16, false, "NO_MASK", "F16")]
+        {
+            let configuration = AttentionConfiguration::new().with_scale(0.125).with_causal(causal);
+            let input_types = vec![attention_array_type(data_type, &[1, 4, 2, 8]); 3];
+            let module = lower(
+                &forward_program(configuration, AttentionInputSignature::default(), input_types, 1),
+                Some("cuda"),
             )
             .unwrap();
-        let input_types = vec![operand_type.clone(), operand_type.clone(), operand_type.clone()];
-        (unproject_plain_program(program), input_types, vec![operand_type])
+            assert!(module.contains("stablehlo.custom_call @__cudnn$fmhaSoftmax("));
+            assert!(module.contains(mask_type));
+            assert!(module.contains(element_type));
+            assert!(module.contains("\\22dropout_rate\\22:0.0,\\22seed\\22:42"));
+            assert!(!module.contains("stablehlo.exponential"));
+        }
+
+        // A broadcastable bias is expanded to the physical score shape before entering the `ScaleBias` ABI.
+        let (signature, input_types) = extended_input_types(DataType::BF16, 2, 2, true, false);
+        let configuration = AttentionConfiguration::new().with_scale(0.125).with_causal(true);
+        let module = lower(&forward_program(configuration, signature, input_types, 1), Some("cuda")).unwrap();
+        assert!(module.contains("stablehlo.broadcast_in_dim %arg3"));
+        assert!(module.contains("stablehlo.custom_call @__cudnn$fmhaScaleBiasSoftmax("));
+        assert!(module.contains("tensor<2x2x4x4xbf16>"));
+
+        // Residual attention carries both length vectors and converts the `f32` kernel statistic to the residual.
+        let (signature, input_types) = extended_input_types(DataType::BF16, 2, 2, false, true);
+        let module =
+            lower(&forward_program(configuration.with_residual(true), signature, input_types, 1), Some("cuda"))
+                .unwrap();
+        assert!(module.contains("stablehlo.custom_call @__cudnn$fmhaSoftmax("));
+        assert!(module.contains("PADDING_CAUSAL"));
+        assert!(module.contains("tensor<2x2x4xf32>"));
+        assert!(module.contains("stablehlo.convert"));
+
+        // Dropout without a dropout state selects the dropout target with the fixed seed, and a left local window
+        // records its exclusive length.
+        let (signature, input_types) = extended_input_types(DataType::BF16, 2, 2, false, false);
+        let dropout = configuration.with_local_window((1, 0)).with_dropout(0.5);
+        let module = lower(&forward_program(dropout, signature, input_types, 1), Some("cuda")).unwrap();
+        assert!(module.contains("stablehlo.custom_call @__cudnn$fmhaSoftmaxDropout("));
+        assert!(module.contains("\\22dropout_rate\\22:0.5,\\22seed\\22:42,\\22sliding_window_length\\22:2"));
     }
 
     #[test]
-    fn test_lower_dot_product_attention_to_mlir_requires_typed_decomposition() {
-        let operation =
-            attention_operation(AttentionConfiguration::new().with_implementation(AttentionImplementation::Portable));
-        let input_types = vec![attention_array_type(DataType::F32, &[1, 4, 2, 8]); 3];
-        let output_types = operation.infer_output_types(&input_types, &[]).unwrap();
-        let context = MlirContext::new();
-        let location = context.unknown_location().as_ref();
-        let arguments = input_types
-            .iter()
-            .map(|r#type| (lower_tensor_type(r#type, &context, location).unwrap(), location))
-            .collect::<Vec<_>>();
-        let block = context.block(&arguments);
-        let inputs = (0..input_types.len())
-            .map(|index| block.as_ref().argument(index).unwrap().as_ref())
-            .collect::<Vec<_>>();
-        assert!(matches!(
-            lower_dot_product_attention_to_mlir(
-                &operation,
-                &CollectiveLoweringState::new(),
-                &inputs,
-                &input_types,
-                &output_types,
-                &mut block.as_ref(),
-                &context,
-                location,
-            ),
-            Err(Error::Core(ryft_core::Error::Program(ProgramError::MalformedProgram(message))))
-                if message == "missing typed decomposition for `dot_product_attention`",
-        ));
-    }
-
-    #[test]
-    fn test_lower_dot_product_attention_backward_to_mlir_requires_typed_decomposition() {
-        let operation = attention_backward_operation(
-            AttentionConfiguration::new().with_implementation(AttentionImplementation::Portable),
+    fn test_fused_attention_backward_on_cuda() {
+        // Fused training stages the forward kernels with their statistic and the backward kernels, which restore the
+        // input cotangents and sum the score-shaped bias cotangent to the bias shape.
+        let (signature, input_types) = extended_input_types(DataType::BF16, 2, 2, true, false);
+        let configuration = AttentionConfiguration::new()
+            .with_scale(0.125)
+            .with_causal(true)
+            .with_implementation(AttentionImplementation::Fused);
+        let program = training_program(configuration, signature, input_types.clone());
+        assert_eq!(
+            program.2,
+            vec![
+                input_types[0].clone(),
+                input_types[0].clone(),
+                input_types[1].clone(),
+                input_types[2].clone(),
+                input_types[3].clone(),
+            ],
         );
-        let operand_type = attention_array_type(DataType::F32, &[1, 4, 2, 8]);
-        let input_types = vec![
-            operand_type.clone(),
-            operand_type.clone(),
-            operand_type.clone(),
-            operand_type.clone(),
-            attention_array_type(DataType::F32, &[1, 4, 2]),
-            operand_type,
-        ];
-        let output_types = operation.infer_output_types(&input_types, &[]).unwrap();
-        let context = MlirContext::new();
-        let location = context.unknown_location().as_ref();
-        let arguments = input_types
-            .iter()
-            .map(|r#type| (lower_tensor_type(r#type, &context, location).unwrap(), location))
-            .collect::<Vec<_>>();
-        let block = context.block(&arguments);
-        let inputs = (0..input_types.len())
-            .map(|index| block.as_ref().argument(index).unwrap().as_ref())
-            .collect::<Vec<_>>();
+        let module = lower(&program, Some("cuda")).unwrap();
+        assert!(module.contains("stablehlo.custom_call @__cudnn$fmhaScaleBiasSoftmax("));
+        assert!(module.contains("stablehlo.custom_call @__cudnn$fmhaScaleBiasSoftmaxBackward("));
+        assert!(module.contains("stablehlo.reduce"));
+        assert!(module.contains("tensor<1x2x4x4xbf16>"));
+        assert!(!module.contains("stablehlo.exponential"));
+
+        // The automatic training implementation is portable, so it never uses the fused kernels.
+        let configuration = configuration.with_implementation(AttentionImplementation::Automatic);
+        let module = lower(&training_program(configuration, signature, input_types), Some("cuda")).unwrap();
+        assert!(!module.contains("__cudnn$fmha"));
+        assert!(module.contains("stablehlo.exponential"));
+    }
+
+    #[test]
+    fn test_fused_attention_unavailable() {
+        // Requesting the fused kernels for calls that they cannot implement reports why instead of silently lowering
+        // the portable body (e.g., `f32` operands on CUDA, any operands without a CUDA target, a dropout state, or a
+        // padded right local window).
+        let fused = AttentionConfiguration::new()
+            .with_scale(0.125)
+            .with_causal(true)
+            .with_implementation(AttentionImplementation::Fused);
+        let (signature, input_types) = extended_input_types(DataType::F32, 2, 2, false, false);
+        let program = forward_program(fused, signature, input_types.clone(), 1);
+        for (target_platform, reason) in
+            [(Some("cuda"), "the operand data type is not `f16` or `bf16`"), (None, "the target platform is not CUDA")]
+        {
+            assert!(matches!(
+                lower(&program, target_platform),
+                Err(Error::Lowering(LoweringError::UnsupportedOperation { operation, reason: message }))
+                    if operation == DOT_PRODUCT_ATTENTION_COMPOSITE_NAME
+                        && message == format!("the fused attention implementation is unavailable because {reason}"),
+            ));
+        }
         assert!(matches!(
-            lower_dot_product_attention_backward_to_mlir(
-                &operation,
-                &CollectiveLoweringState::new(),
-                &inputs,
-                &input_types,
-                &output_types,
-                &mut block.as_ref(),
-                &context,
-                location,
-            ),
-            Err(Error::Core(ryft_core::Error::Program(ProgramError::MalformedProgram(message))))
-                if message == "missing typed decomposition for `dot_product_attention_backward`",
+            lower(&training_program(fused, signature, input_types), Some("cuda")),
+            Err(Error::Lowering(LoweringError::UnsupportedOperation { reason, .. }))
+                if reason.contains("the operand data type is not `f16` or `bf16`"),
+        ));
+
+        let (signature, input_types) = extended_input_types(DataType::BF16, 2, 2, false, false);
+        let state_type = attention_array_type(DataType::U64, &[2]);
+        let stateful_types = input_types.into_iter().chain([state_type]).collect::<Vec<_>>();
+        let program = forward_program(fused.with_dropout(0.5), signature.with_dropout_state(true), stateful_types, 1);
+        assert!(matches!(
+            lower(&program, Some("cuda")),
+            Err(Error::Lowering(LoweringError::UnsupportedOperation { reason, .. }))
+                if reason.contains("the fused kernels cannot reproduce the dropout mask of a dropout state"),
+        ));
+
+        // The pinned cuDNN ABI supports a nonzero right radius only for the unpadded causal mask kind.
+        let (signature, input_types) = extended_input_types(DataType::BF16, 2, 2, false, true);
+        let program = forward_program(fused.with_local_window((2, 1)), signature, input_types, 1);
+        assert!(matches!(
+            lower(&program, Some("cuda")),
+            Err(Error::Lowering(LoweringError::UnsupportedOperation { reason, .. }))
+                if reason.contains(
+                    "a nonzero right local-window radius requires causal masking without sequence-length padding",
+                ),
         ));
     }
 
     #[test]
-    fn test_lower_mlir_module_for_program_emits_fmha_softmax_on_cuda() {
-        // Qualifying causal BF16 attention uses the cuDNN fMHA ABI and preserves the causal mask.
-        let (program, input_types, output_types) = dot_product_attention_fixture_program(DataType::BF16, 8, true);
-        let module =
-            lower_mlir_module_for_program(&program, &[], &input_types, &output_types, "main", None, None, Some("cuda"))
-                .unwrap()
-                .stable_hlo;
-
-        assert!(module.contains("stablehlo.custom_call @__cudnn$fmhaSoftmax"));
-        assert!(module.contains("CAUSAL"));
-        assert!(module.contains("BF16"));
-    }
-
-    #[test]
-    fn test_lower_mlir_module_for_program_emits_fmha_softmax_without_mask_on_cuda() {
-        // The unmasked F16 form uses the same fMHA target with NO_MASK and the F16 element contract.
-        let (program, input_types, output_types) = dot_product_attention_fixture_program(DataType::F16, 8, false);
-        let module =
-            lower_mlir_module_for_program(&program, &[], &input_types, &output_types, "main", None, None, Some("cuda"))
-                .unwrap()
-                .stable_hlo;
-
-        assert!(module.contains("stablehlo.custom_call @__cudnn$fmhaSoftmax"));
-        assert!(module.contains("NO_MASK"));
-        assert!(module.contains("F16"));
-    }
-
-    #[test]
-    fn test_to_mlir_module_for_program_lowers_dot_product_attention_composition_without_target_platform() {
-        // Without target information, the entry function calls the one private typed decomposition containing the
-        // score dot, causal mask, stable softmax, value dot, and final layout restoration.
-        let (program, input_types, output_types) = dot_product_attention_fixture_program(DataType::F32, 8, true);
-        let module =
-            to_mlir_module_for_program(&program, &[], &input_types, &output_types, "main", None, None).unwrap();
-
-        assert_eq!(module.matches("func.func private @ryft.dot_product_attention").count(), 1);
-        assert_eq!(module.matches("call @ryft.dot_product_attention").count(), 1);
+    fn test_portable_attention() {
+        // Without target information, repeated calls share one function that contains the portable body: the score
+        // dot, causal mask, stable softmax, value dot, and final layout restoration.
+        let configuration = AttentionConfiguration::new().with_scale(0.125).with_causal(true);
+        let input_types = vec![attention_array_type(DataType::F32, &[1, 4, 2, 8]); 3];
+        let program = forward_program(configuration, AttentionInputSignature::default(), input_types.clone(), 2);
+        let module = to_mlir_module_for_program(&program.0, &[], &program.1, &program.2, "main", None, None).unwrap();
+        assert_eq!(module.matches("func.func private @ryft.dot_product_attention.v1(").count(), 1);
+        assert_eq!(module.matches("call @ryft.dot_product_attention.v1(").count(), 2);
         assert_eq!(module.matches("stablehlo.dot_general").count(), 2);
         assert!(module.contains("stablehlo.compare LE"));
         assert!(module.contains("stablehlo.exponential"));
         assert!(!module.contains("__cudnn$fmha"));
-    }
 
-    #[test]
-    fn test_lower_mlir_module_for_program_lowers_dot_product_attention_composition_for_f32_on_cuda() {
-        // `f32` operands do not qualify for the cuDNN flash-attention call, so even a CUDA target lowers the
-        // portable composition.
-        let (program, input_types, output_types) = dot_product_attention_fixture_program(DataType::F32, 8, true);
-        let module =
-            lower_mlir_module_for_program(&program, &[], &input_types, &output_types, "main", None, None, Some("cuda"))
-                .unwrap()
-                .stable_hlo;
-        assert!(!module.contains("fmhaSoftmax"));
-        assert!(module.contains("stablehlo.dot_general"));
-    }
-
-    #[test]
-    fn test_lower_mlir_module_for_program_lowers_dot_product_attention_composition_for_unaligned_head_dim_on_cuda() {
-        // A head dimension that is not a multiple of 8 fails cuDNN's compile-time gate, so a CUDA target with `bf16`
-        // operands still lowers the portable composition (which upcasts its softmax to `f32`).
-        let (program, input_types, output_types) = dot_product_attention_fixture_program(DataType::BF16, 4, true);
-        let module =
-            lower_mlir_module_for_program(&program, &[], &input_types, &output_types, "main", None, None, Some("cuda"))
-                .unwrap()
-                .stable_hlo;
-        assert!(!module.contains("fmhaSoftmax"));
-        assert!(module.contains("stablehlo.dot_general"));
-        assert!(module.contains("stablehlo.convert"));
-    }
-
-    /// Returns the inferred output [`ArrayType`]s of the provided staged output atoms.
-    fn builder_output_types(builder: &XlaProgramBuilder, outputs: &[AtomId]) -> Vec<ArrayType> {
-        outputs.iter().map(|output| builder.atoms()[output.index()].r#type().into_owned()).collect()
-    }
-
-    /// Builds an extended dot-product attention fixture program: `query [2, 4, query_heads, 8]` over
-    /// `key`/`value [2, 4, key_value_heads, 8]` at the provided data type, with an optional broadcast-batch bias
-    /// `[1, query_heads, 4, 4]` and an optional trailing `i32[2]` sequence-length pair.
-    fn dot_product_attention_extended_fixture_program(
-        data_type: DataType,
-        query_heads: usize,
-        key_value_heads: usize,
-        bias: bool,
-        sequence_lengths: bool,
-        operation: DotProductAttentionOperation,
-    ) -> (XlaProgram<Vec<XlaConstant>, Vec<XlaConstant>>, Vec<ArrayType>, Vec<ArrayType>) {
-        let query_type = ArrayType::new(
-            data_type,
-            Shape::new(vec![
-                Dimension::Static(2),
-                Dimension::Static(4),
-                Dimension::Static(query_heads),
-                Dimension::Static(8),
-            ]),
-        );
-        let key_value_type = ArrayType::new(
-            data_type,
-            Shape::new(vec![
-                Dimension::Static(2),
-                Dimension::Static(4),
-                Dimension::Static(key_value_heads),
-                Dimension::Static(8),
-            ]),
-        );
-        let mut builder = XlaProgramBuilder::new();
-        let mut input_types = vec![query_type.clone(), key_value_type.clone(), key_value_type];
-        if bias {
-            input_types.push(ArrayType::new(
-                data_type,
-                Shape::new(vec![
-                    Dimension::Static(1),
-                    Dimension::Static(query_heads),
-                    Dimension::Static(4),
-                    Dimension::Static(4),
-                ]),
-            ));
+        // `f32` operands, unaligned head dimensions, and `f8` operands do not qualify for the fused kernels, so even
+        // CUDA targets lower the portable body, which converts narrow operands for its `f32` softmax.
+        for (data_type, head_dimension) in [(DataType::F32, 8), (DataType::BF16, 4), (DataType::F8E4M3FN, 8)] {
+            let input_types = vec![attention_array_type(data_type, &[1, 4, 2, head_dimension]); 3];
+            let program = forward_program(configuration, AttentionInputSignature::default(), input_types, 1);
+            let module = lower(&program, Some("cuda")).unwrap();
+            assert!(!module.contains("fmha"));
+            assert!(module.contains("stablehlo.dot_general"));
         }
-        if sequence_lengths {
-            let lengths_type = ArrayType::new(DataType::I32, Shape::new(vec![Dimension::Static(2)]));
-            input_types.push(lengths_type.clone());
-            input_types.push(lengths_type);
-        }
-        let operation = DotProductAttentionOperation::new(
-            operation.configuration(),
-            AttentionInputSignature::new(bias, false, sequence_lengths, sequence_lengths),
-        );
-        let inputs = input_types.iter().map(|input_type| builder.add_input(input_type.clone())).collect::<Vec<_>>();
-        let outputs = builder.add_instruction(operation, Vec::new(), inputs, None).unwrap().to_vec();
-        let output_count = outputs.len();
-        let output_types = builder_output_types(&builder, outputs.as_slice());
-        let program = builder
-            .build::<Vec<XlaArrayConstant>, Vec<XlaArrayConstant>>(
-                outputs,
-                vec![Placeholder; input_types.len()],
-                vec![Placeholder; output_count],
-            )
-            .unwrap();
-        (unproject_plain_program(program), input_types, output_types)
-    }
 
-    /// Builds the matching backward fixture program for [`dot_product_attention_extended_fixture_program`]'s
-    /// canonical operand order: `(query, key, value[, bias][, query lengths, key/value lengths], output, residual,
-    /// output cotangent)`.
-    fn dot_product_attention_backward_fixture_program(
-        data_type: DataType,
-        query_heads: usize,
-        key_value_heads: usize,
-        bias: bool,
-        sequence_lengths: bool,
-        operation: DotProductAttentionBackwardOperation,
-    ) -> (XlaProgram<Vec<XlaConstant>, Vec<XlaConstant>>, Vec<ArrayType>, Vec<ArrayType>) {
-        let query_type = ArrayType::new(
-            data_type,
-            Shape::new(vec![
-                Dimension::Static(2),
-                Dimension::Static(4),
-                Dimension::Static(query_heads),
-                Dimension::Static(8),
-            ]),
-        );
-        let key_value_type = ArrayType::new(
-            data_type,
-            Shape::new(vec![
-                Dimension::Static(2),
-                Dimension::Static(4),
-                Dimension::Static(key_value_heads),
-                Dimension::Static(8),
-            ]),
-        );
-        let activation_type = ArrayType::new(
-            data_type,
-            Shape::new(vec![Dimension::Static(2), Dimension::Static(4), Dimension::Static(query_heads)]),
-        );
-        let mut builder = XlaProgramBuilder::new();
-        let mut input_types = vec![query_type.clone(), key_value_type.clone(), key_value_type];
-        if bias {
-            input_types.push(ArrayType::new(
-                data_type,
-                Shape::new(vec![
-                    Dimension::Static(1),
-                    Dimension::Static(query_heads),
-                    Dimension::Static(4),
-                    Dimension::Static(4),
-                ]),
-            ));
-        }
-        if sequence_lengths {
-            let lengths_type = ArrayType::new(DataType::I32, Shape::new(vec![Dimension::Static(2)]));
-            input_types.push(lengths_type.clone());
-            input_types.push(lengths_type);
-        }
-        input_types.extend([query_type.clone(), activation_type, query_type]);
-        let operation = DotProductAttentionBackwardOperation::new(
-            operation.configuration(),
-            AttentionInputSignature::new(bias, false, sequence_lengths, sequence_lengths),
-        );
-        let inputs = input_types.iter().map(|input_type| builder.add_input(input_type.clone())).collect::<Vec<_>>();
-        let outputs = builder.add_instruction(operation, Vec::new(), inputs, None).unwrap().to_vec();
-        let output_count = outputs.len();
-        let output_types = builder_output_types(&builder, outputs.as_slice());
-        let program = builder
-            .build::<Vec<XlaArrayConstant>, Vec<XlaArrayConstant>>(
-                outputs,
-                vec![Placeholder; input_types.len()],
-                vec![Placeholder; output_count],
-            )
-            .unwrap();
-        (unproject_plain_program(program), input_types, output_types)
-    }
-
-    #[test]
-    fn test_lower_mlir_module_for_program_emits_fmha_scale_bias_softmax_on_cuda() {
-        // A broadcastable user bias is expanded to the physical score shape before entering the ScaleBias ABI.
-        let (program, input_types, output_types) = dot_product_attention_extended_fixture_program(
-            DataType::BF16,
-            2,
-            2,
-            true,
-            false,
-            attention_operation(AttentionConfiguration::new().with_scale(0.125).with_causal(true)),
-        );
-        let module =
-            lower_mlir_module_for_program(&program, &[], &input_types, &output_types, "main", None, None, Some("cuda"))
-                .unwrap()
-                .stable_hlo;
-
-        assert!(module.contains("stablehlo.broadcast_in_dim %arg3"));
-        assert!(module.contains("stablehlo.custom_call @__cudnn$fmhaScaleBiasSoftmax"));
-        assert!(module.contains("tensor<2x2x4x4xbf16>"));
-    }
-
-    #[test]
-    fn test_lower_mlir_module_for_program_emits_fmha_training_forward_with_padding_on_cuda() {
-        // Training attention carries both length vectors and converts the f32 kernel statistic to the public residual.
-        let (program, input_types, output_types) = dot_product_attention_extended_fixture_program(
-            DataType::BF16,
-            2,
-            2,
-            false,
-            true,
-            attention_operation(AttentionConfiguration::new().with_scale(0.125).with_causal(true).with_residual(true)),
-        );
-        let module =
-            lower_mlir_module_for_program(&program, &[], &input_types, &output_types, "main", None, None, Some("cuda"))
-                .unwrap()
-                .stable_hlo;
-
-        assert!(module.contains("stablehlo.custom_call @__cudnn$fmhaSoftmax"));
-        assert!(module.contains("PADDING_CAUSAL"));
-        assert!(module.contains("tensor<2x2x4xf32>"));
-        assert!(module.contains("stablehlo.convert"));
-    }
-
-    #[test]
-    fn test_lower_mlir_module_for_program_emits_fmha_dropout_with_sliding_window_on_cuda() {
-        // Dropout selects its target and records the deterministic seed and exclusive left-window length.
-        let (program, input_types, output_types) = dot_product_attention_extended_fixture_program(
-            DataType::BF16,
-            2,
-            2,
-            false,
-            false,
-            attention_operation(
-                AttentionConfiguration::new()
-                    .with_scale(0.125)
-                    .with_causal(true)
-                    .with_local_window((1, 0))
-                    .with_implementation(AttentionImplementation::Fused)
-                    .with_dropout((0.5, 123)),
-            ),
-        );
-        let module =
-            lower_mlir_module_for_program(&program, &[], &input_types, &output_types, "main", None, None, Some("cuda"))
-                .unwrap()
-                .stable_hlo;
-
-        assert!(module.contains("stablehlo.custom_call @__cudnn$fmhaSoftmaxDropout"));
-        assert!(module.contains("dropout_rate"));
-        assert!(module.contains("123"));
-        assert!(module.contains("sliding_window_length"));
-    }
-
-    #[test]
-    fn test_lower_mlir_module_for_program_emits_fmha_backward_with_bias_on_cuda() {
-        // The fused backward restores operand gradients and sums the score-shaped gradient to the user bias shape.
-        let (program, input_types, output_types) = dot_product_attention_backward_fixture_program(
-            DataType::BF16,
-            2,
-            2,
-            true,
-            false,
-            attention_backward_operation(AttentionConfiguration::new().with_scale(0.125).with_causal(true)),
-        );
-        let module =
-            lower_mlir_module_for_program(&program, &[], &input_types, &output_types, "main", None, None, Some("cuda"))
-                .unwrap()
-                .stable_hlo;
-
-        assert!(module.contains("stablehlo.custom_call @__cudnn$fmhaScaleBiasSoftmaxBackward"));
-        assert!(module.matches("stablehlo.transpose").count() >= 3);
-        assert!(module.contains("stablehlo.reduce"));
-        assert!(module.contains("tensor<1x2x4x4xbf16>"));
-    }
-
-    #[test]
-    fn test_to_mlir_module_for_program_lowers_dot_product_attention_composition_with_extensions() {
-        // GQA expansion, broadcast bias, causal/local masking, and residual production all live in one private typed
-        // decomposition rather than in the backend adapter.
-        let (program, input_types, output_types) = dot_product_attention_extended_fixture_program(
-            DataType::F32,
-            4,
-            2,
-            true,
-            false,
-            attention_operation(
-                AttentionConfiguration::new()
-                    .with_scale(0.125)
-                    .with_causal(true)
-                    .with_local_window((1, 0))
-                    .with_residual(true),
-            ),
-        );
-        let module =
-            to_mlir_module_for_program(&program, &[], &input_types, &output_types, "main", None, None).unwrap();
-
-        assert_eq!(module.matches("func.func private @ryft.dot_product_attention").count(), 1);
-        assert_eq!(module.matches("call @ryft.dot_product_attention").count(), 1);
+        // Grouped-query expansion, a broadcast bias, causal and local masking, and the residual all live in the body.
+        let (signature, input_types) = extended_input_types(DataType::F32, 4, 2, true, false);
+        let program =
+            forward_program(configuration.with_local_window((1, 0)).with_residual(true), signature, input_types, 1);
+        let module = lower(&program, None).unwrap();
         assert!(module.contains("stablehlo.broadcast_in_dim"));
         assert!(module.contains("stablehlo.reshape"));
         assert!(module.contains("stablehlo.and"));
         assert!(module.contains("stablehlo.log"));
-        assert!(module.contains("-> (tensor<2x4x4x8xf32>, tensor<2x4x4xf32>)"));
-    }
-
-    #[test]
-    fn test_to_mlir_module_for_program_lowers_dot_product_attention_backward_composition() {
-        // The private typed backward decomposition recomputes normalized probabilities and emits the query, grouped
-        // key/value, and broadcast-bias cotangent reductions.
-        let (program, input_types, output_types) = dot_product_attention_backward_fixture_program(
-            DataType::F32,
-            4,
-            2,
-            true,
-            false,
-            attention_backward_operation(AttentionConfiguration::new().with_scale(0.125).with_causal(true)),
+        assert_eq!(
+            program.2,
+            vec![attention_array_type(DataType::F32, &[2, 4, 4, 8]), attention_array_type(DataType::F32, &[2, 4, 4])],
         );
-        let module =
-            to_mlir_module_for_program(&program, &[], &input_types, &output_types, "main", None, None).unwrap();
 
-        assert_eq!(module.matches("func.func private @ryft.dot_product_attention_backward").count(), 1);
-        assert_eq!(module.matches("call @ryft.dot_product_attention_backward").count(), 1);
-        assert!(module.matches("stablehlo.dot_general").count() >= 4);
+        // The backward body recomputes the normalized probabilities and reduces the grouped key and value cotangents
+        // and the broadcast bias cotangent.
+        let (signature, input_types) = extended_input_types(DataType::F32, 4, 2, true, false);
+        let module = lower(&training_program(configuration, signature, input_types), None).unwrap();
+        assert!(module.matches("stablehlo.dot_general").count() >= 6);
         assert!(module.contains("stablehlo.exponential"));
-        assert!(module.contains("stablehlo.reduce"));
         assert!(module.contains("tensor<1x4x4x4xf32>"));
         assert!(!module.contains("__cudnn$fmha"));
     }
 
     #[test]
-    fn test_lower_mlir_module_for_program_rejects_dot_product_attention_dropout_off_the_fast_path() {
-        // No composition implements dropout, so a dropout-carrying operation that misses the fused fast-path gate
-        // (here: `f32` operands on CUDA, and any operands without a target platform) reports an explicit error
-        // instead of silently computing dropout-free attention, for both the forward and the backward operations.
-        let (program, input_types, output_types) = dot_product_attention_extended_fixture_program(
-            DataType::F32,
-            2,
-            2,
-            false,
-            false,
-            attention_operation(
-                AttentionConfiguration::new()
-                    .with_scale(0.125)
-                    .with_causal(true)
-                    .with_implementation(AttentionImplementation::Fused)
-                    .with_dropout((0.5, 123)),
-            ),
-        );
-        for platform in [Some("cuda"), None] {
-            let result =
-                lower_mlir_module_for_program(&program, &[], &input_types, &output_types, "main", None, None, platform);
-            assert!(matches!(
-                result,
-                Err(error) if error.to_string().contains(
-                    "`dot_product_attention` dropout is only supported by the fused CUDA lowering",
-                ),
-            ));
-        }
-        let (program, input_types, output_types) = dot_product_attention_backward_fixture_program(
-            DataType::F32,
-            2,
-            2,
-            false,
-            false,
-            attention_backward_operation(
-                AttentionConfiguration::new()
-                    .with_scale(0.125)
-                    .with_causal(true)
-                    .with_implementation(AttentionImplementation::Fused)
-                    .with_dropout((0.5, 123)),
-            ),
-        );
-        let result =
-            lower_mlir_module_for_program(&program, &[], &input_types, &output_types, "main", None, None, Some("cuda"));
-        assert!(matches!(
-            result,
-            Err(error) if error.to_string().contains(
-                "`dot_product_attention_backward` dropout is only supported by the fused CUDA lowering",
-            ),
-        ));
-    }
-
-    #[test]
-    fn test_lower_mlir_module_for_program_rejects_padded_fmha_with_a_right_local_window() {
-        // The pinned cuDNN ABI supports a nonzero right radius only for the unpadded causal mask kind. Forced fused
-        // selection therefore reports this semantic limitation instead of silently dropping the right radius.
-        let (program, input_types, output_types) = dot_product_attention_extended_fixture_program(
-            DataType::BF16,
-            2,
-            2,
-            false,
-            true,
-            attention_operation(
-                AttentionConfiguration::new()
-                    .with_causal(true)
-                    .with_local_window((2, 1))
-                    .with_implementation(AttentionImplementation::Fused),
-            ),
-        );
-
-        let result =
-            lower_mlir_module_for_program(&program, &[], &input_types, &output_types, "main", None, None, Some("cuda"));
-
-        assert!(matches!(
-            result,
-            Err(error) if error.to_string().contains(
-                "a nonzero right local-window radius requires causal masking without sequence-length padding",
-            ),
-        ));
-    }
-
-    #[test]
-    fn test_lower_mlir_module_for_program_lowers_dynamically_shaped_attention_compositions() {
-        // Portable attention obtains every logical extent from the mixed array IR, so bounded-dynamic programs do
-        // not need to expose physical padding as sequence-length operands and support the same GQA and window
+    fn test_portable_attention_with_dynamic_extents() {
+        // Portable attention obtains every logical extent from the mixed array IR, so bounded-dynamic programs do not
+        // need to expose physical padding as sequence-length inputs and support the same grouped-query and window
         // configurations as static programs. Explicit lengths remain an independent semantic mask when provided.
         let batch = DimensionVariable::new("batch", DimensionBounds::new(1, Some(4)).unwrap());
         let operand_type = |heads: usize| {
@@ -1645,269 +1337,95 @@ mod tests {
                 ]),
             )
         };
-        let activation_type = ArrayType::new(
-            DataType::BF16,
-            Shape::new(vec![Dimension::Dynamic(batch.clone()), Dimension::Static(4), Dimension::Static(2)]),
-        );
         let lengths_type = ArrayType::new(DataType::I32, Shape::new(vec![Dimension::Dynamic(batch.clone())]));
-        let build_forward = |key_value_heads: usize,
-                             sequence_lengths: bool,
-                             operation: DotProductAttentionOperation| {
+        let boundary = |key_value_heads: usize, sequence_lengths: bool| {
             let mut input_types = vec![operand_type(2), operand_type(key_value_heads), operand_type(key_value_heads)];
             if sequence_lengths {
-                input_types.push(lengths_type.clone());
-                input_types.push(lengths_type.clone());
+                input_types.extend([lengths_type.clone(), lengths_type.clone()]);
             }
-            let operation = DotProductAttentionOperation::new(
-                operation.configuration(),
-                AttentionInputSignature::new(false, false, sequence_lengths, sequence_lengths),
-            );
-            let mut builder = XlaProgramBuilder::new();
-            let inputs = input_types.iter().map(|input_type| builder.add_input(input_type.clone())).collect::<Vec<_>>();
-            let outputs = builder.add_instruction(operation, Vec::new(), inputs, None).unwrap().to_vec();
-            let output_count = outputs.len();
-            let output_types = builder_output_types(&builder, outputs.as_slice());
-            let program = builder
-                .build::<Vec<XlaArrayConstant>, Vec<XlaArrayConstant>>(
-                    outputs,
-                    vec![Placeholder; input_types.len()],
-                    vec![Placeholder; output_count],
-                )
-                .unwrap();
-            (unproject_plain_program(program), input_types, output_types)
+            (AttentionInputSignature::new(false, false, sequence_lengths, sequence_lengths), input_types)
         };
-        let build_backward = |key_value_heads: usize,
-                              sequence_lengths: bool,
-                              operation: DotProductAttentionBackwardOperation| {
-            let mut input_types = vec![operand_type(2), operand_type(key_value_heads), operand_type(key_value_heads)];
-            if sequence_lengths {
-                input_types.push(lengths_type.clone());
-                input_types.push(lengths_type.clone());
-            }
-            input_types.extend([operand_type(2), activation_type.clone(), operand_type(2)]);
-            let operation = DotProductAttentionBackwardOperation::new(
-                operation.configuration(),
-                AttentionInputSignature::new(false, false, sequence_lengths, sequence_lengths),
-            );
-            let mut builder = XlaProgramBuilder::new();
-            let inputs = input_types.iter().map(|input_type| builder.add_input(input_type.clone())).collect::<Vec<_>>();
-            let outputs = builder.add_instruction(operation, Vec::new(), inputs, None).unwrap().to_vec();
-            let output_count = outputs.len();
-            let output_types = builder_output_types(&builder, outputs.as_slice());
-            let program = builder
-                .build::<Vec<XlaArrayConstant>, Vec<XlaArrayConstant>>(
-                    outputs,
-                    vec![Placeholder; input_types.len()],
-                    vec![Placeholder; output_count],
-                )
-                .unwrap();
-            (unproject_plain_program(program), input_types, output_types)
-        };
-
-        // Dynamic forward attention without explicit sequence lengths uses the tensor's logical dimensions.
-        let (program, input_types, output_types) =
-            build_forward(2, false, attention_operation(AttentionConfiguration::new().with_scale(0.125)));
-        lower_mlir_module_for_program(&program, &[], &input_types, &output_types, "main", None, None, None).unwrap();
-
-        // Sliding-window masking and grouped-query head expansion are ordinary semantic operations.
-        for (key_value_heads, operation) in [
-            (
-                2,
-                attention_operation(
-                    AttentionConfiguration::new().with_scale(0.125).with_causal(true).with_local_window((1, 0)),
-                ),
-            ),
-            (1, attention_operation(AttentionConfiguration::new().with_scale(0.125))),
-        ] {
-            let (program, input_types, output_types) = build_forward(key_value_heads, true, operation);
-            lower_mlir_module_for_program(&program, &[], &input_types, &output_types, "main", None, None, None)
-                .unwrap();
+        let configuration = AttentionConfiguration::new().with_scale(0.125);
+        let windowed = configuration.with_causal(true).with_local_window((1, 0));
+        for (key_value_heads, sequence_lengths, configuration) in
+            [(2, false, configuration), (2, true, windowed), (1, true, configuration)]
+        {
+            let (signature, input_types) = boundary(key_value_heads, sequence_lengths);
+            let program = forward_program(configuration, signature, input_types, 1);
+            assert_eq!(program.2, vec![operand_type(2)]);
+            lower(&program, None).unwrap();
         }
 
         // The analytical backward uses the same first-class dimensions and mask construction.
-        let (program, input_types, output_types) =
-            build_backward(2, false, attention_backward_operation(AttentionConfiguration::new().with_scale(0.125)));
-        lower_mlir_module_for_program(&program, &[], &input_types, &output_types, "main", None, None, None).unwrap();
+        for (sequence_lengths, configuration) in [(false, configuration), (true, windowed)] {
+            let (signature, input_types) = boundary(2, sequence_lengths);
+            lower(&training_program(configuration, signature, input_types), None).unwrap();
+        }
 
-        let (program, input_types, output_types) = build_backward(
-            2,
-            true,
-            attention_backward_operation(
-                AttentionConfiguration::new().with_scale(0.125).with_causal(true).with_local_window((1, 0)),
-            ),
-        );
-        lower_mlir_module_for_program(&program, &[], &input_types, &output_types, "main", None, None, None).unwrap();
+        // Bounded-dynamic fused attention requires sequence lengths, which mask the physical padding.
+        let fused = configuration.with_implementation(AttentionImplementation::Fused);
+        let (signature, input_types) = boundary(2, true);
+        let module = lower(&forward_program(fused, signature, input_types, 1), Some("cuda")).unwrap();
+        assert!(module.contains("stablehlo.custom_call @__cudnn$fmhaSoftmax("));
+        assert!(module.contains("PADDING"));
+        let (signature, input_types) = boundary(2, false);
+        assert!(matches!(
+            lower(&forward_program(fused, signature, input_types, 1), Some("cuda")),
+            Err(Error::Lowering(LoweringError::UnsupportedOperation { reason, .. }))
+                if reason.contains("bounded-dynamic operands require query or key/value sequence lengths"),
+        ));
     }
 
     #[test]
-    fn test_lower_mlir_module_for_program_lowers_jax_attention_surface() {
-        use ryft_core::operations::attention::AttentionConfiguration;
-
-        // Rank-three attention, an arbitrary Boolean mask, one independently present sequence-length operand, an
-        // asymmetric local window, default scaling, and a residual all lower through the typed portable composition.
+    fn test_attention_jax_surface() {
+        // Rank-three attention, an arbitrary Boolean mask, one independently present sequence-length input, an
+        // asymmetric local window, default scaling, and a residual all lower through the portable body.
         let query_type = attention_array_type(DataType::F32, &[2, 1, 2]);
         let key_value_type = attention_array_type(DataType::F32, &[3, 1, 2]);
         let mask_type = attention_array_type(DataType::Boolean, &[1, 2, 3]);
         let lengths_type = attention_array_type(DataType::I32, &[1]);
         let signature = AttentionInputSignature::new(false, true, true, false);
-        let operation = DotProductAttentionOperation::new(
-            AttentionConfiguration::new()
-                .with_local_window(Some((2, 1)))
-                .with_implementation(AttentionImplementation::Portable)
-                .with_residual(true),
-            signature,
-        );
+        let configuration = AttentionConfiguration::new()
+            .with_local_window(Some((2, 1)))
+            .with_implementation(AttentionImplementation::Portable)
+            .with_residual(true);
         let input_types = vec![query_type.clone(), key_value_type.clone(), key_value_type, mask_type, lengths_type];
-        let mut builder = XlaProgramBuilder::new();
-        let inputs = input_types.iter().map(|r#type| builder.add_input(r#type.clone())).collect::<Vec<_>>();
-        let outputs = builder.add_instruction(operation, Vec::new(), inputs, None).unwrap().to_vec();
-        let output_types = builder_output_types(&builder, outputs.as_slice());
-        let program = builder
-            .build::<Vec<XlaArrayConstant>, Vec<XlaArrayConstant>>(
-                outputs,
-                vec![Placeholder; input_types.len()],
-                vec![Placeholder; 2],
-            )
-            .unwrap();
-        let module = lower_mlir_module_for_program(
-            &unproject_plain_program(program),
-            &[],
-            &input_types,
-            &output_types,
-            "main",
-            None,
-            None,
-            None,
-        )
-        .unwrap()
-        .stable_hlo;
-
-        assert!(module.contains("func.func private @ryft.dot_product_attention"));
+        let program = forward_program(configuration, signature, input_types, 1);
+        let module = lower(&program, None).unwrap();
         assert!(module.contains("stablehlo.and"));
         assert!(module.contains("stablehlo.exponential"));
         assert!(!module.contains("__cudnn$fmha"));
-        assert_eq!(output_types[0], query_type);
-        assert_eq!(output_types[1].shape(), &Shape::new(vec![2.into(), 1.into()]));
-    }
+        assert_eq!(program.2, vec![query_type, attention_array_type(DataType::F32, &[2, 1])]);
 
-    #[test]
-    fn test_lower_mlir_module_for_program_fuses_jax_attention_surface_on_cuda() {
-        // The cuDNN adapter normalizes TNH inputs, turns an arbitrary Boolean mask into additive bias, and synthesizes
-        // the absent key/value length vector while preserving a supported causal left window.
+        // The cuDNN adapter normalizes `TNH` inputs, turns an arbitrary Boolean mask into an additive bias, and
+        // synthesizes the absent key/value length vector while preserving a supported causal left window. The
+        // matching backward discards the synthetic mask-bias cotangent and returns the three input cotangents.
         let query_type = attention_array_type(DataType::F16, &[4, 2, 8]);
         let key_value_type = attention_array_type(DataType::F16, &[4, 2, 8]);
-        let mask_type = attention_array_type(DataType::Boolean, &[1, 4, 4]);
-        let lengths_type = attention_array_type(DataType::I32, &[1]);
-        let residual_type = attention_array_type(DataType::F16, &[4, 2]);
-        let signature = AttentionInputSignature::new(false, true, true, false);
+        let input_types = vec![
+            query_type.clone(),
+            key_value_type.clone(),
+            key_value_type.clone(),
+            attention_array_type(DataType::Boolean, &[1, 4, 4]),
+            attention_array_type(DataType::I32, &[1]),
+        ];
         let configuration = AttentionConfiguration::new()
             .with_causal(true)
             .with_local_window((2, 0))
             .with_implementation(AttentionImplementation::Fused)
             .with_residual(true);
-        let forward_input_types = vec![
-            query_type.clone(),
-            key_value_type.clone(),
-            key_value_type.clone(),
-            mask_type.clone(),
-            lengths_type.clone(),
-        ];
-        let mut builder = XlaProgramBuilder::new();
-        let inputs = forward_input_types.iter().map(|r#type| builder.add_input(r#type.clone())).collect::<Vec<_>>();
-        let outputs = builder
-            .add_instruction(DotProductAttentionOperation::new(configuration, signature), Vec::new(), inputs, None)
-            .unwrap()
-            .to_vec();
-        let forward_output_types = builder_output_types(&builder, outputs.as_slice());
-        let program = builder
-            .build::<Vec<XlaArrayConstant>, Vec<XlaArrayConstant>>(
-                outputs,
-                vec![Placeholder; forward_input_types.len()],
-                vec![Placeholder; 2],
-            )
-            .unwrap();
-        let forward = lower_mlir_module_for_program(
-            &unproject_plain_program(program),
-            &[],
-            &forward_input_types,
-            &forward_output_types,
-            "main",
-            None,
-            None,
-            Some("cuda"),
-        )
-        .unwrap()
-        .stable_hlo;
-
-        assert!(forward.contains("stablehlo.custom_call @__cudnn$fmhaScaleBiasSoftmax"));
+        let program = forward_program(configuration, signature, input_types.clone(), 1);
+        let forward = lower(&program, Some("cuda")).unwrap();
+        assert!(forward.contains("stablehlo.custom_call @__cudnn$fmhaScaleBiasSoftmax("));
         assert!(forward.contains("PADDING_CAUSAL"));
         assert!(forward.contains("stablehlo.select"));
         assert!(forward.contains("stablehlo.get_dimension_size %arg1, dim = 0"));
         assert!(forward.contains("tensor<4x2x8xf16>"));
-        assert_eq!(forward_output_types, vec![query_type.clone(), residual_type.clone()]);
+        assert_eq!(program.2, vec![query_type.clone(), attention_array_type(DataType::F16, &[4, 2])]);
 
-        // The matching backward consumes the same canonical optional prefix and discards the synthetic mask-bias
-        // cotangent while preserving the three differentiable operand cotangents.
-        let backward_input_types = forward_input_types
-            .iter()
-            .cloned()
-            .chain([query_type.clone(), residual_type, query_type.clone()])
-            .collect::<Vec<_>>();
-        let mut builder = XlaProgramBuilder::new();
-        let inputs = backward_input_types.iter().map(|r#type| builder.add_input(r#type.clone())).collect::<Vec<_>>();
-        let outputs = builder
-            .add_instruction(
-                DotProductAttentionBackwardOperation::new(configuration, signature),
-                Vec::new(),
-                inputs,
-                None,
-            )
-            .unwrap()
-            .to_vec();
-        let backward_output_types = builder_output_types(&builder, outputs.as_slice());
-        let program = builder
-            .build::<Vec<XlaArrayConstant>, Vec<XlaArrayConstant>>(
-                outputs,
-                vec![Placeholder; backward_input_types.len()],
-                vec![Placeholder; 3],
-            )
-            .unwrap();
-        let backward = lower_mlir_module_for_program(
-            &unproject_plain_program(program),
-            &[],
-            &backward_input_types,
-            &backward_output_types,
-            "main",
-            None,
-            None,
-            Some("cuda"),
-        )
-        .unwrap()
-        .stable_hlo;
-
-        assert!(backward.contains("stablehlo.custom_call @__cudnn$fmhaScaleBiasSoftmaxBackward"));
-        assert_eq!(backward_output_types, vec![query_type.clone(), key_value_type.clone(), key_value_type]);
-    }
-
-    #[test]
-    fn test_lower_mlir_module_for_program_never_emits_fmha_for_f8_attention() {
-        // F8 attention is a validated NO-GO on the pinned cuDNN (the fused kernels reject F8 I/O at compile time),
-        // so `f8` operands never qualify for the fMHA fast path and take the ordinary composition route even on
-        // CUDA targets.
-        let (program, input_types, output_types) = dot_product_attention_extended_fixture_program(
-            DataType::F8E4M3FN,
-            2,
-            2,
-            false,
-            false,
-            attention_operation(AttentionConfiguration::new().with_scale(0.125).with_causal(true)),
-        );
-        let module =
-            lower_mlir_module_for_program(&program, &[], &input_types, &output_types, "main", None, None, Some("cuda"))
-                .unwrap()
-                .stable_hlo;
-        assert!(!module.contains("fmha"));
-        assert!(module.contains("stablehlo.dot_general"));
-        assert!(module.contains("stablehlo.convert"));
+        let program = training_program(configuration.with_residual(false), signature, input_types);
+        let backward = lower(&program, Some("cuda")).unwrap();
+        assert!(backward.contains("stablehlo.custom_call @__cudnn$fmhaScaleBiasSoftmaxBackward("));
+        assert_eq!(program.2, vec![query_type.clone(), query_type, key_value_type.clone(), key_value_type]);
     }
 }

@@ -9,7 +9,6 @@ use std::borrow::Cow;
 use std::fmt::{Display, Write};
 use std::hash::Hash;
 
-use ryft_core::operations::attention::AttentionConfiguration;
 use ryft_core::{
     Array, ArrayIrOperation, ArrayIrType, ArrayIrValue, ArrayOperation, ArrayReferenceTransform, ArraySliceAxis,
     ArrayType, ArrayTypeRefinements, Atom, COMPOSITE_OPERATION_NAME, COMPOSITE_TRANSPOSE_OPERATION_NAME,
@@ -1044,24 +1043,6 @@ impl<Extension: Operation<Type = ArrayIrType>> KernelDefinition<Extension> {
         }
     }
 
-    /// Encodes all floating attention configuration using IEEE bits; optional/default choices remain distinct.
-    fn attention_semantic_fields(key: &mut String, configuration: AttentionConfiguration) {
-        Self::semantic_field(
-            key,
-            &format!(
-                "attention {:?}",
-                (
-                    configuration.scale().map(f64::to_bits),
-                    configuration.causal(),
-                    configuration.local_window(),
-                    configuration.implementation(),
-                    configuration.return_residual(),
-                    configuration.dropout().map(|(rate, seed)| (rate.to_bits(), seed)),
-                )
-            ),
-        );
-    }
-
     /// Returns the error that rejects the kernel semantic descriptor encoding of the composite operation named `name`
     /// with retained rules, whose identity is local to the process.
     fn retained_composite_encoding_error(name: &str) -> TypeError {
@@ -1106,12 +1087,6 @@ impl<Extension: Operation<Type = ArrayIrType>> KernelDefinition<Extension> {
                     Self::semantic_field(key, &format!("constant bytes {:02x?}", operation.value().logical_bytes()))
                 }
                 ArrayOperation::CustomCall(operation) => Self::custom_call_semantic_fields(key, operation),
-                ArrayOperation::DotProductAttention(operation) => {
-                    Self::attention_semantic_fields(key, operation.configuration())
-                }
-                ArrayOperation::DotProductAttentionBackward(operation) => {
-                    Self::attention_semantic_fields(key, operation.configuration())
-                }
                 ArrayOperation::Dropout(operation) => {
                     Self::semantic_field(key, &format!("dropout rate bits {:016x}", operation.rate().to_bits()))
                 }
@@ -1276,6 +1251,9 @@ impl<Extension: Operation<Type = ArrayIrType>> KernelDefinition<Extension> {
 #[cfg(test)]
 mod tests {
     use pretty_assertions::assert_eq;
+    use ryft_core::operations::attention::{
+        AttentionConfiguration, AttentionDefinitionKind, AttentionInputSignature, AttentionKey,
+    };
     use ryft_core::{
         ArrayIrOperation, ArrayOperation, ArrayReferenceTransformIndex, AtomId, CompositeAttribute, CompositeJvpRule,
         CompositeKey, CompositeOperation, CompositeTransposeOperation, ConditionOperation, Context,
@@ -2435,20 +2413,23 @@ mod tests {
 
     #[test]
     fn test_kernel_definition_semantic_key_preserves_attention_bits() {
+        // Named attention calls are encoded by their composite keys, whose floating attributes keep their IEEE bits.
         for configurations in [
             [
                 AttentionConfiguration::new().with_scale(f64::from_bits(0x7ff8_0000_0000_0001)),
                 AttentionConfiguration::new().with_scale(f64::from_bits(0x7ff8_0000_0000_0002)),
             ],
-            [
-                AttentionConfiguration::new().with_dropout((0.0, 1)),
-                AttentionConfiguration::new().with_dropout((-0.0, 1)),
-            ],
+            [AttentionConfiguration::new().with_dropout(0.5), AttentionConfiguration::new().with_dropout(0.25)],
+            [AttentionConfiguration::new().with_scale(0.0), AttentionConfiguration::new().with_scale(-0.0)],
         ] {
             let keys = configurations.map(|configuration| {
-                let mut key = String::new();
-                KernelDefinition::<NoKernelExtension>::attention_semantic_fields(&mut key, configuration);
-                key
+                let key = AttentionKey::new(
+                    AttentionDefinitionKind::Forward,
+                    configuration,
+                    AttentionInputSignature::default(),
+                )
+                .to_composite_key();
+                format!("{key:?}")
             });
             assert_ne!(keys[0], keys[1]);
         }

@@ -49,8 +49,8 @@ pub struct AttentionConfiguration {
     /// Whether the forward operation also returns its log-sum-exp residual.
     return_residual: bool,
 
-    /// Optional fused-only `(rate, seed)` dropout extension.
-    dropout: Option<(f64, u64)>,
+    /// Optional probability with which dropout drops each attention probability.
+    dropout: Option<f64>,
 }
 
 impl AttentionConfiguration {
@@ -103,9 +103,12 @@ impl AttentionConfiguration {
         self
     }
 
-    /// Sets the fused-only `(rate, seed)` dropout extension.
+    /// Sets the probability with which dropout drops each attention probability, which must lie in the open interval
+    /// `(0, 1)`. Passing [`None`] disables dropout. Dropout applies a [`DropoutOperation`](crate::DropoutOperation) to
+    /// the normalized attention probabilities, whose random state is the optional
+    /// [`AttentionInputs::dropout_state`] input. Refer to that input for how the state selects the dropout mask.
     #[inline]
-    pub fn with_dropout<D: Into<Option<(f64, u64)>>>(mut self, dropout: D) -> Self {
+    pub fn with_dropout<D: Into<Option<f64>>>(mut self, dropout: D) -> Self {
         self.dropout = dropout.into();
         self
     }
@@ -140,9 +143,9 @@ impl AttentionConfiguration {
         self.return_residual
     }
 
-    /// Returns the optional fused-only `(rate, seed)` dropout extension.
+    /// Returns the optional probability with which dropout drops each attention probability.
     #[inline]
-    pub fn dropout(&self) -> Option<(f64, u64)> {
+    pub fn dropout(&self) -> Option<f64> {
         self.dropout
     }
 }
@@ -154,8 +157,7 @@ impl PartialEq for AttentionConfiguration {
             && self.local_window == other.local_window
             && self.implementation == other.implementation
             && self.return_residual == other.return_residual
-            && self.dropout.map(|(rate, seed)| (rate.to_bits(), seed))
-                == other.dropout.map(|(rate, seed)| (rate.to_bits(), seed))
+            && self.dropout.map(f64::to_bits) == other.dropout.map(f64::to_bits)
     }
 }
 
@@ -168,11 +170,12 @@ impl Hash for AttentionConfiguration {
         self.local_window.hash(state);
         self.implementation.hash(state);
         self.return_residual.hash(state);
-        self.dropout.map(|(rate, seed)| (rate.to_bits(), seed)).hash(state);
+        self.dropout.map(f64::to_bits).hash(state);
     }
 }
 
-/// Presence metadata for the optional attention inputs (bias, mask, and sequence lengths) in their canonical order.
+/// Presence metadata for the optional attention inputs (bias, mask, sequence lengths, and dropout state) in their
+/// canonical order.
 #[derive(Copy, Clone, Debug, Default, PartialEq, Eq, Hash)]
 pub struct AttentionInputSignature {
     /// Whether an additive bias follows query, key, and value.
@@ -186,13 +189,23 @@ pub struct AttentionInputSignature {
 
     /// Whether per-batch key/value sequence lengths follow query sequence lengths.
     key_value_sequence_lengths: bool,
+
+    /// Whether a dropout random state follows key/value sequence lengths.
+    dropout_state: bool,
 }
 
 impl AttentionInputSignature {
-    /// Creates an optional-input signature.
+    /// Creates an optional-input signature without a dropout random state.
     #[inline]
     pub fn new(bias: bool, mask: bool, query_sequence_lengths: bool, key_value_sequence_lengths: bool) -> Self {
-        Self { bias, mask, query_sequence_lengths, key_value_sequence_lengths }
+        Self { bias, mask, query_sequence_lengths, key_value_sequence_lengths, dropout_state: false }
+    }
+
+    /// Returns this signature with the provided presence of a dropout random state.
+    #[inline]
+    pub fn with_dropout_state(mut self, dropout_state: bool) -> Self {
+        self.dropout_state = dropout_state;
+        self
     }
 
     /// Returns whether an additive bias is present.
@@ -219,6 +232,12 @@ impl AttentionInputSignature {
         self.key_value_sequence_lengths
     }
 
+    /// Returns whether a dropout random state is present.
+    #[inline]
+    pub fn has_dropout_state(&self) -> bool {
+        self.dropout_state
+    }
+
     /// Returns the number of optional inputs described by this signature.
     #[inline]
     pub fn count(&self) -> usize {
@@ -226,6 +245,7 @@ impl AttentionInputSignature {
             + usize::from(self.mask)
             + usize::from(self.query_sequence_lengths)
             + usize::from(self.key_value_sequence_lengths)
+            + usize::from(self.dropout_state)
     }
 }
 
@@ -252,6 +272,14 @@ pub struct AttentionInputs<P: Parameter> {
 
     /// Optional per-batch key/value sequence lengths.
     pub key_value_sequence_lengths: Option<P>,
+
+    /// Optional random generator state of the dropout mask (refer to [`AttentionConfiguration::with_dropout`]), with
+    /// the [`RandomAlgorithm::state_type`](crate::RandomAlgorithm::state_type) of its algorithm. With a state, the
+    /// mask is a deterministic function of that state and backends never replace the dropout with a fused kernel that
+    /// draws its own mask. Without a state, backends may fuse the dropout (e.g., into the cuDNN attention kernel),
+    /// while Ryft's own implementations draw the mask from a fixed state (refer to
+    /// [`DropoutOperation`](crate::DropoutOperation)). It is only accepted together with a dropout rate.
+    pub dropout_state: Option<P>,
 }
 
 impl<P: Parameter> AttentionInputs<P> {
@@ -266,6 +294,7 @@ impl<P: Parameter> AttentionInputs<P> {
             mask: None,
             query_sequence_lengths: None,
             key_value_sequence_lengths: None,
+            dropout_state: None,
         }
     }
 
@@ -278,6 +307,7 @@ impl<P: Parameter> AttentionInputs<P> {
             self.query_sequence_lengths.is_some(),
             self.key_value_sequence_lengths.is_some(),
         )
+        .with_dropout_state(self.dropout_state.is_some())
     }
 
     /// Parses values in canonical attention input order according to `signature`.
@@ -306,6 +336,7 @@ impl<P: Parameter> AttentionInputs<P> {
             mask: signature.has_mask().then(|| values.next().unwrap()),
             query_sequence_lengths: signature.has_query_sequence_lengths().then(|| values.next().unwrap()),
             key_value_sequence_lengths: signature.has_key_value_sequence_lengths().then(|| values.next().unwrap()),
+            dropout_state: signature.has_dropout_state().then(|| values.next().unwrap()),
         })
     }
 
@@ -317,6 +348,7 @@ impl<P: Parameter> AttentionInputs<P> {
             .chain(self.mask)
             .chain(self.query_sequence_lengths)
             .chain(self.key_value_sequence_lengths)
+            .chain(self.dropout_state)
             .collect()
     }
 }

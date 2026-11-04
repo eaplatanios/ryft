@@ -93,11 +93,19 @@ impl LowerableOperation for AxisIndexOperation {
         check_count!("input", input_values, 0, ProgramError);
         check_count!("output", output_types, 1, ProgramError);
         let collective_state = lowerer.collective_state.clone();
-        if self.mesh().is_none() && collective_state.manual_axis_region(self.axis_name()).is_some() {
-            return Err(ProgramError::MalformedProgram(
-                "`axis_index` requires mesh metadata inside a manual region".to_string(),
-            )
-            .into());
+        if let Some(boundary) = collective_state.manual_axis_region(self.axis_name()) {
+            if boundary.check_manual_variation() && self.mesh().is_none() {
+                return Err(ProgramError::MalformedProgram(
+                    "`axis_index` requires mesh metadata inside a manual region".to_string(),
+                )
+                .into());
+            }
+            if !boundary.check_manual_variation() && self.mesh().is_some() {
+                return Err(ProgramError::MalformedProgram(
+                    "`axis_index` cannot use tracked mesh metadata inside an unchecked manual binding".to_string(),
+                )
+                .into());
+            }
         }
         let result = lower_axis_index_to_coordinate(
             self,

@@ -3886,7 +3886,11 @@ mod tests {
 
     #[test]
     fn test_eager_dot_product_attention_parity_with_reference_backend() {
-        use ryft_core::operations::attention::{AttentionConfiguration, AttentionInputs, DotProductAttention};
+        use ryft_core::operations::attention::{AttentionConfiguration, AttentionInputs, dot_product_attention};
+        use ryft_core::{ArrayOperation, EagerContext, ProjectedContext};
+
+        type ArrayXlaDomain<'c> = ProjectedContext<XlaDomain<'c>, ArrayType>;
+        type ReferenceContext = EagerContext<Array, ArrayOperation<Array>>;
 
         let plugin = load_cpu_plugin().unwrap();
         let client = plugin
@@ -3911,18 +3915,14 @@ mod tests {
             AttentionConfiguration::new().with_scale(0.5),
             AttentionConfiguration::new().with_scale(0.5).with_causal(true).with_local_window((1, 0)),
         ] {
-            let device_output = XlaArray::dot_product_attention(
-                AttentionInputs::new(device(&query_values), device(&key_values), device(&value_values)),
-                configuration,
-            )
-            .unwrap()
-            .0;
-            let reference_output = Array::dot_product_attention(
-                AttentionInputs::new(reference(&query_values), reference(&key_values), reference(&value_values)),
-                configuration,
-            )
-            .unwrap()
-            .0;
+            let device_output = dot_product_attention::<ArrayXlaDomain<'_>>(configuration)
+                .call(AttentionInputs::new(device(&query_values), device(&key_values), device(&value_values)))
+                .unwrap()
+                .0;
+            let reference_output = dot_product_attention::<ReferenceContext>(configuration)
+                .call(AttentionInputs::new(reference(&query_values), reference(&key_values), reference(&value_values)))
+                .unwrap()
+                .0;
 
             read_f32s(&device_output).iter().zip(reference_output.to_f64s()).for_each(|(actual, expected)| {
                 assert!((f64::from(*actual) - expected).abs() < 1e-5, "expected {expected} but got {actual}");
@@ -3959,6 +3959,7 @@ mod tests {
             mask: Some(device_value(&reference_mask, &[3, 3])),
             query_sequence_lengths: Some(device_value(&reference_query_lengths, &[1])),
             key_value_sequence_lengths: Some(device_value(&reference_key_value_lengths, &[1])),
+            dropout_state: None,
         };
         let reference_inputs = AttentionInputs {
             query: reference(&query_values),
@@ -3968,10 +3969,12 @@ mod tests {
             mask: Some(reference_mask),
             query_sequence_lengths: Some(reference_query_lengths),
             key_value_sequence_lengths: Some(reference_key_value_lengths),
+            dropout_state: None,
         };
-        let (device_output, device_residual) = XlaArray::dot_product_attention(device_inputs, configuration).unwrap();
+        let (device_output, device_residual) =
+            dot_product_attention::<ArrayXlaDomain<'_>>(configuration).call(device_inputs).unwrap();
         let (reference_output, reference_residual) =
-            Array::dot_product_attention(reference_inputs, configuration).unwrap();
+            dot_product_attention::<ReferenceContext>(configuration).call(reference_inputs).unwrap();
         for (actual, expected) in [
             (read_f32s(&device_output), reference_output.to_f64s()),
             (read_f32s(&device_residual.unwrap()), reference_residual.unwrap().to_f64s()),

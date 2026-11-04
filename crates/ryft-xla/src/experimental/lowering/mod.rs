@@ -86,7 +86,7 @@ pub enum LoweringError {
     VerificationFailure,
 }
 
-/// Named StableHLO compositions shared by composite operation lowerings (e.g., scaled dot and attention).
+/// Named StableHLO compositions shared by composite operation lowerings (e.g., scaled dot).
 pub(crate) mod compositions;
 /// Lowering of nested programs and regions inline into an enclosing block.
 pub(crate) mod regions;
@@ -633,7 +633,7 @@ impl<V: MlirLowerableValue> LowerableOperation for ArrayOperation<V> {
             Mul, Div, Rem, Pow, Sqrt, Rsqrt, Abs, Sin, Cos, Tan, Tanh, Atan2, Exp, ExpM1, Log, Ln1p, LogAddExp, Logistic, Erf,
             Floor, Ceil, Round, Not,
             And, Or, Xor, Complex, Real, Imaginary, Conjugate, Reduce, ArgMax, ArgMin, Cumulative, Sort, Dot, RaggedDot,
-            ScaledDot, DotProductAttention, DotProductAttentionBackward, AxisIndex, ParallelReduce, ParallelVary,
+            ScaledDot, AxisIndex, ParallelReduce, ParallelVary,
             ParallelAllGather, ParallelSumScatter, ParallelPermute, ParallelAllToAll, ParallelRaggedAllToAll, Compare,
             Select, Transpose, Reverse, Reshape, Broadcast, Pad, Concatenate, Gather, Scatter, Slice, UpdateSlice,
             DynamicSlice, DynamicUpdateSlice, ConvertElementType, ReducePrecision, TransferToMemory, Reshard,
@@ -902,15 +902,17 @@ impl CollectiveLoweringState {
         Ok(mesh)
     }
 
-    /// Revalidates a collective against the manual mesh of its actual enclosing binder before it emits cross-device
-    /// communication. Raw payloads can describe batch-bound collectives without a mesh, so the operation's own type
-    /// inference, re-run over that mesh by `infer_output_types`, must reproduce the recorded `output_types`. This keeps
-    /// a mesh-free payload from bypassing the manual variation and pending-sum contract.
+    /// Revalidates a collective against the policy of its actual enclosing binder before it emits cross-device
+    /// communication. A checked binder passes its mesh to `infer_output_types`, so a mesh-free payload cannot bypass
+    /// its variation and pending-sum contract. An unchecked binder requires an ordinary mesh-free payload and passes
+    /// `None`, preserving ordinary collective inference and adjoints. In either mode, inference must reproduce the
+    /// recorded `output_types`, and the physical mesh and participant count remain checked.
     ///
     /// # Errors
     ///
     /// Returns a [`Error`] if no enclosing manual region binds `axis_name`, if the recorded axis size or a
-    /// payload mesh disagrees with that region, if re-inference fails, or if it produces different output types.
+    /// payload mesh disagrees with that region, if a tracked payload is used in an unchecked binding, if re-inference
+    /// fails, or if it produces different output types.
     pub(crate) fn check_manual_collective<T: PartialEq>(
         &self,
         operation_name: &str,
@@ -918,10 +920,17 @@ impl CollectiveLoweringState {
         axis_size: usize,
         payload_mesh: Option<&LogicalMesh>,
         output_types: &[T],
-        infer_output_types: impl FnOnce(&LogicalMesh) -> Result<Vec<T>, TypeError>,
+        infer_output_types: impl FnOnce(Option<&LogicalMesh>) -> Result<Vec<T>, TypeError>,
     ) -> Result<(), Error> {
         let mesh = self.checked_collective_mesh(operation_name, axis_name, axis_size, payload_mesh)?;
-        if infer_output_types(mesh).map_err(ProgramError::from)? != output_types {
+        let checked = self.manual_axis_region(axis_name).unwrap().check_manual_variation();
+        if !checked && payload_mesh.is_some() {
+            return Err(ProgramError::MalformedProgram(format!(
+                "`{operation_name}` cannot use tracked mesh metadata inside an unchecked manual binding",
+            ))
+            .into());
+        }
+        if infer_output_types(checked.then_some(mesh)).map_err(ProgramError::from)? != output_types {
             return Err(ProgramError::MalformedProgram(format!(
                 "`{operation_name}` output types do not match the enclosing manual mesh contract",
             ))

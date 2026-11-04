@@ -488,7 +488,13 @@ impl LowerableOperation for ParallelRaggedAllToAllOperation {
             self.axis_size(),
             self.mesh(),
             output_types,
-            |mesh| self.clone().with_mesh(mesh.clone()).infer_output_types(input_types, &[]),
+            |mesh| {
+                let operation = match mesh {
+                    Some(mesh) => self.clone().with_mesh(mesh.clone()),
+                    None => self.clone(),
+                };
+                operation.infer_output_types(input_types, &[])
+            },
         )?;
         lower_parallel_ragged_all_to_all_to_mlir(
             self,
@@ -520,7 +526,13 @@ impl MemberLowerableOperation<ArrayIrType> for ParallelRaggedAllToAllOperation {
             self.axis_size(),
             self.mesh(),
             output_types,
-            |mesh| self.clone().with_mesh(mesh.clone()).infer_parent_output_types(input_types, &[]),
+            |mesh| {
+                let operation = match mesh {
+                    Some(mesh) => self.clone().with_mesh(mesh.clone()),
+                    None => self.clone(),
+                };
+                operation.infer_parent_output_types(input_types, &[])
+            },
         )?;
         if input_values.len() != 6 {
             return Err(ProgramError::InvalidInputCount { expected: 6, actual: input_values.len() }.into());

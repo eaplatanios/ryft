@@ -101,7 +101,13 @@ impl LowerableOperation for ParallelAllToAllOperation {
             self.axis_size(),
             self.mesh(),
             output_types,
-            |mesh| self.clone().with_mesh(mesh.clone()).infer_output_types(input_types, &[]),
+            |mesh| {
+                let operation = match mesh {
+                    Some(mesh) => self.clone().with_mesh(mesh.clone()),
+                    None => self.clone(),
+                };
+                operation.infer_output_types(input_types, &[])
+            },
         )?;
         lower_parallel_all_to_all_to_mlir(
             self,
@@ -134,7 +140,13 @@ impl MemberLowerableOperation<ArrayIrType> for ParallelAllToAllOperation {
             self.axis_size(),
             self.mesh(),
             output_types,
-            |mesh| self.clone().with_mesh(mesh.clone()).infer_parent_output_types(input_types, &[]),
+            |mesh| {
+                let operation = match mesh {
+                    Some(mesh) => self.clone().with_mesh(mesh.clone()),
+                    None => self.clone(),
+                };
+                operation.infer_parent_output_types(input_types, &[])
+            },
         )?;
         let Some(input) = input_values.first() else {
             return Err(ProgramError::InvalidInputCount { expected: 1, actual: 0 }.into());

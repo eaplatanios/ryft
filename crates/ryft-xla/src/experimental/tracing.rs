@@ -2124,7 +2124,10 @@ mod tests {
                 Ok(vec![output, gradient.query])
             },
             local_input_types,
-            vec![("x".to_string(), NamedAxis::Mesh { mesh: mesh.clone(), axis: 0, size: 2 })],
+            vec![(
+                "x".to_string(),
+                NamedAxis::Mesh { mesh: mesh.clone(), axis: 0, size: 2, checks_manual_variation: true },
+            )],
         )
         .unwrap();
         let body = body.into_flat_program().into_unprojected::<XlaConstant, XlaOperation>().unwrap();
