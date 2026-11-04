@@ -273,13 +273,17 @@ where
             }
 
             // Calls that a backend implementation replaces, and calls without a body, need no shared function. Calls that
-            // share an interned body region also share their key, boundary and backend selection, so only the first
-            // call of each region computes them, and the others only count.
-            if let Some(composite_key) = instruction.operation().named_composite() {
+            // share an interned body region and a key also share their boundary and backend selection, so only the
+            // first such call computes them, and the others only count. Calls of different keys (e.g., of different
+            // versions) may share one body region but not their backend selection, so they are grouped separately.
+            if let Some(composite_key) = instruction.operation().composite_key() {
                 let Some(&body_region) = instruction.regions().first() else {
                     continue;
                 };
-                if let Some(&index) = named_calls.index.get(&body_region) {
+                let grouped = named_calls.index.get(&body_region).and_then(|indices| {
+                    indices.iter().copied().find(|index| &named_calls.calls[*index].composite == composite_key)
+                });
+                if let Some(index) = grouped {
                     named_calls.calls[index].count += 1;
                     continue;
                 }
@@ -293,8 +297,13 @@ where
                         .is_some();
                 let key =
                     (!replaced).then(|| NamedFunctionKey { key: composite_key.clone(), input_types, output_types });
-                named_calls.index.insert(body_region, named_calls.calls.len());
-                named_calls.calls.push(NamedRegionCall { region: body_region, count: 1, key });
+                named_calls.index.entry(body_region).or_default().push(named_calls.calls.len());
+                named_calls.calls.push(NamedRegionCall {
+                    region: body_region,
+                    composite: composite_key.clone(),
+                    count: 1,
+                    key,
+                });
                 continue;
             }
             if instruction.operation().projected_payload::<JitCallOperation<ArrayIrType>>().is_some() {
@@ -374,20 +383,23 @@ where
     Ok(())
 }
 
-/// Named composite calls found by [`count_jit_calls`], grouped by the interned body region that they share.
+/// Named composite calls found by [`count_jit_calls`], grouped by the interned body region and the key that they share.
 #[derive(Default)]
 struct NamedRegionCalls {
-    /// Position of each body region in [`Self::calls`].
-    index: HashMap<RegionId, usize>,
+    /// Positions in [`Self::calls`] of the groups of each body region, one per key that calls it.
+    index: HashMap<RegionId, Vec<usize>>,
 
     /// Body regions in first-occurrence order.
     calls: Vec<NamedRegionCall>,
 }
 
-/// Named composite calls that share one interned body region.
+/// Named composite calls that share one interned body region and one key.
 struct NamedRegionCall {
     /// Body region of the calls.
     region: RegionId,
+
+    /// Semantic identity of the calls, including when a backend implementation replaces them.
+    composite: CompositeKey,
 
     /// Number of calls.
     count: usize,

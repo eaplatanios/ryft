@@ -682,17 +682,16 @@ impl<C: Context> PartialEvaluationContext<C> {
             || !self.can_fold_effects(effects)
             || must_defer_references()
         {
-            return self.residualize_with_effects(operation, regions.region_programs(), inputs, effects);
+            return self.residualize_with_effects(operation, regions, inputs, effects);
         }
 
         let known = inputs.iter().map(|value| value.as_known().cloned().unwrap()).collect::<Vec<_>>();
         let outputs = if self.parent.is_eager() && can_defer_unsupported && effects.is_empty() {
             // Unsupported pure work can remain residual without repeating observable work. The validation above
             // excludes references; execution errors other than unsupported kernels remain failures.
-            let programs = regions.region_programs();
-            match self.parent.bind(operation.clone(), programs.clone(), &known) {
+            match self.parent.bind(operation.clone(), regions.region_programs(), &known) {
                 Err(ProgramError::UnsupportedOperation { .. }) => {
-                    return self.residualize_with_effects(operation, programs, inputs, effects);
+                    return self.residualize_with_effects(operation, regions, inputs, effects);
                 }
                 outputs => outputs?,
             }
@@ -767,7 +766,7 @@ impl<C: Context> PartialEvaluationContext<C> {
             .fold(operation.effects().summary(), |effects, (_, region)| effects.union(region.effects()))
             .classes();
 
-        self.residualize_with_effects(operation, regions, inputs, effects)
+        self.residualize_with_effects(operation, AttachedRegions::from(regions), inputs, effects)
     }
 
     /// Residualizes `operation` using its already computed [`EffectClasses`]. This is the emission behind
@@ -775,7 +774,7 @@ impl<C: Context> PartialEvaluationContext<C> {
     fn residualize_with_effects(
         &self,
         operation: C::Operation,
-        regions: Vec<Program<C::Constant, C::Operation, Vec<C::Constant>, Vec<C::Constant>>>,
+        regions: AttachedRegions<'_, C::Constant, C::Operation>,
         inputs: &[PartialEvaluationValue<C::Value>],
         effects: EffectClasses,
     ) -> Result<Vec<PartialEvaluationValue<C::Value>>, ProgramError> {
@@ -786,6 +785,13 @@ impl<C: Context> PartialEvaluationContext<C> {
             self.defer_ordered_effects.set(true);
         }
 
+        // Replayed regions import through mappings that belong to their replay's destination builder, so they are
+        // materialized before they are imported into the residual builder.
+        let regions = match regions {
+            AttachedRegions::Replay(_) => AttachedRegions::Owned(regions.region_programs()),
+            regions => regions,
+        };
+
         // Materialize each known input into a residual-program atom. The deduplication fast-paths return early,
         // and a genuine error rides `?` out through the `collect` into `residualize`.
         let input_atoms =
@@ -794,10 +800,14 @@ impl<C: Context> PartialEvaluationContext<C> {
         // Propagate the materialized inputs' refinements through attached regions, just as replay into a trace does.
         // Release the builder borrow before specialization replays any body into its own fresh trace. Keep the original
         // effect-based deferral restriction: replay can fold away effects, so that restriction is conservative.
-        let regions = if regions.is_empty() {
-            regions
+        // Regions that need no specialization are imported as attached (e.g., shared callees are interned by `Arc`
+        // identity, as when staging), so that residualized calls of one shared body keep sharing one region, while
+        // specialized regions are new programs that are moved into the residual builder.
+        let specialized = if regions.region_count() == 0 {
+            None
         } else {
-            operation.validate_region_interfaces(&regions.iter().map(Program::interface).collect::<Vec<_>>())?;
+            let interfaces = regions.regions().map(|region| region.interface()).collect::<Vec<_>>();
+            operation.validate_region_interfaces(&interfaces)?;
             let input_types = {
                 let builder = self.builder.borrow();
                 input_atoms
@@ -811,28 +821,34 @@ impl<C: Context> PartialEvaluationContext<C> {
                     })
                     .collect::<Result<Vec<_>, _>>()?
             };
-            FlatProgram::<C>::specialize_attached_regions(
-                &operation,
-                &input_types,
-                regions.iter().map(Program::entry_region_ref),
-            )?
-            .unwrap_or(regions)
+            FlatProgram::<C>::specialize_attached_regions(&operation, &input_types, regions.regions())?
         };
 
         // Specialization replays the regions, which may introduce ordered work that their original effects did not
         // declare (e.g., an entry guard for a relationship that the specialized inputs leave unproven). Later ordered
         // operations must not move ahead of it either.
-        let specialized_effects_are_ordered = regions.iter().enumerate().any(|(index, region)| {
-            operation.region_role(index) == Some(RegionRole::Computation) && region.effects().classes().is_ordered()
-        });
+        let specialized_effects_are_ordered = match &specialized {
+            Some(specialized) => specialized.iter().enumerate().any(|(index, region)| {
+                operation.region_role(index) == Some(RegionRole::Computation) && region.effects().classes().is_ordered()
+            }),
+            None => regions.regions().enumerate().any(|(index, region)| {
+                operation.region_role(index) == Some(RegionRole::Computation) && region.effects().classes().is_ordered()
+            }),
+        };
         if specialized_effects_are_ordered {
             self.defer_ordered_effects.set(true);
         }
 
-        // Residualized regions splice into the residual builder's arena directly (i.e., owned move), in region order.
-        let region_ids = {
-            let mut builder = self.builder.borrow_mut();
-            regions.into_iter().map(|region| builder.import_program(region)).collect::<Vec<_>>()
+        // Residualized regions splice into the residual builder's arena in region order.
+        let region_ids = match specialized {
+            Some(specialized) => {
+                let mut builder = self.builder.borrow_mut();
+                specialized.into_iter().map(|region| builder.import_program(region)).collect::<Vec<_>>()
+            }
+            None => {
+                let region_count = regions.region_count();
+                regions.import_into(&self.builder, &vec![None; region_count])?
+            }
         };
         let output_atoms = self
             .builder

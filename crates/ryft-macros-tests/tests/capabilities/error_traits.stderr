@@ -46,8 +46,8 @@ error: projected capability functions must return a `Result`
 25 |     fn infallible(&self) -> Self;
    |                             ^^^^
 
-error: projected capability functions must return `Self`, `Vec<Self>`, tuples of those, or types that do not mention `Self`
-  --> tests/capabilities/error_traits.rs:27:34
+error: projected capability functions must return `Self`, `Option<Self>`, `Vec<Self>`, tuples of those, or types that do not mention `Self`
+  --> tests/capabilities/error_traits.rs:27:31
    |
-27 |     fn optional(&self) -> Result<Option<Self>, ProgramError>;
-   |                                  ^^^^^^^^^^^^
+27 |     fn boxed(&self) -> Result<Box<Self>, ProgramError>;
+   |                               ^^^^^^^^^

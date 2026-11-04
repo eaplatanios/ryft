@@ -533,19 +533,15 @@ mod tests {
                     %c_0 = stablehlo.constant dense<2147483648> : tensor<ui32>
                     %1 = stablehlo.broadcast_in_dim %c_0, dims = [] : (tensor<ui32>) -> tensor<4xui32>
                     %2 = stablehlo.compare GE, %output, %1, UNSIGNED : (tensor<4xui32>, tensor<4xui32>) -> tensor<4xi1>
-                    %cst = stablehlo.constant dense<2.000000e+00> : tensor<f32>
+                    %cst = stablehlo.constant dense<0.000000e+00> : tensor<f32>
                     %3 = stablehlo.broadcast_in_dim %cst, dims = [] : (tensor<f32>) -> tensor<4xf32>
-                    %cst_1 = stablehlo.constant dense<0.000000e+00> : tensor<f32>
+                    %cst_1 = stablehlo.constant dense<2.000000e+00> : tensor<f32>
                     %4 = stablehlo.broadcast_in_dim %cst_1, dims = [] : (tensor<f32>) -> tensor<4xf32>
-                    %5 = stablehlo.complex %3, %4 : tensor<4xcomplex<f32>>
-                    %cst_2 = stablehlo.constant dense<0.000000e+00> : tensor<f32>
-                    %6 = stablehlo.broadcast_in_dim %cst_2, dims = [] : (tensor<f32>) -> tensor<4xf32>
-                    %cst_3 = stablehlo.constant dense<0.000000e+00> : tensor<f32>
-                    %7 = stablehlo.broadcast_in_dim %cst_3, dims = [] : (tensor<f32>) -> tensor<4xf32>
-                    %8 = stablehlo.complex %6, %7 : tensor<4xcomplex<f32>>
-                    %9 = stablehlo.multiply %arg0, %5 : tensor<4xcomplex<f32>>
-                    %10 = stablehlo.select %2, %9, %8 : tensor<4xi1>, tensor<4xcomplex<f32>>
-                    return %10 : tensor<4xcomplex<f32>>
+                    %5 = stablehlo.complex %4, %3 : tensor<4xcomplex<f32>>
+                    %6 = stablehlo.complex %3, %3 : tensor<4xcomplex<f32>>
+                    %7 = stablehlo.multiply %arg0, %5 : tensor<4xcomplex<f32>>
+                    %8 = stablehlo.select %2, %7, %6 : tensor<4xi1>, tensor<4xcomplex<f32>>
+                    return %8 : tensor<4xcomplex<f32>>
                   }
                 }
             "#},

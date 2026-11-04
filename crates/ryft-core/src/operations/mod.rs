@@ -71,12 +71,12 @@ pub use complex::{
 pub use composites::{
     AccumulatingVjp, BatchedComposite, BroadcastInvariantBatching, BroadcastSensitiveBatching,
     COMPOSITE_OPERATION_NAME, COMPOSITE_TRANSPOSE_OPERATION_NAME, Composite, CompositeAttribute, CompositeBatching,
-    CompositeBodyRule, CompositeCallContext, CompositeConversion, CompositeImplementation, CompositeJvp,
-    CompositeJvpRule, CompositeKey, CompositeOperation, CompositeTransposeOperation, CompositeVjp,
-    CustomRuleDefinition, CustomRuleReference, CustomRuleRegistration, CustomRuleSource, CustomRuleTracer,
-    CustomVjpOperation, DefaultBatching, DefaultJvp, DefaultVjp, ExplicitJvp, ExplicitVjp, JvpComposite, JvpFromPrimal,
-    LiftedCustomRules, NamedComposite, SequentialBatching, SymbolicZeroJvp, SymbolicZeroVjp, UnavailableCustomRules,
-    VjpComposite, WeakCustomRuleReference, composite,
+    CompositeBody, CompositeCallContext, CompositeConversion, CompositeJvp, CompositeJvpRule, CompositeKey,
+    CompositeOperation, CompositeTransposeOperation, CompositeVjp, CustomRuleDefinition, CustomRuleReference,
+    CustomRuleRegistration, CustomRuleSource, CustomRuleTracer, CustomVjpOperation, DefaultBatching, DefaultJvp,
+    DefaultVjp, ExplicitJvp, ExplicitVjp, JvpComposite, JvpFromPrimal, LiftedCustomRules, NamedComposite,
+    SequentialBatching, SymbolicZeroJvp, SymbolicZeroVjp, UnavailableCustomRules, VjpComposite,
+    WeakCustomRuleReference, composite,
 };
 pub use constants::{
     CONSTANT_OPERATION_NAME, Constant, ConstantOperation, ConstantOperations, DimensionConstant, DynamicFill,
@@ -152,8 +152,8 @@ pub use quantization::{
     BlockScaledGlobalScaling, SCALED_DOT_OPERATION_NAME, ScaledDot, ScaledDotOperation, block_scaled_dot,
 };
 pub use random::{
-    CategoricalSamplingMode, DynamicRngBitGenerator, RNG_BIT_GENERATOR_OPERATION_NAME, Random, RandomAlgorithm,
-    RngBitGenerator, RngBitGeneratorOperation,
+    CategoricalSamplingMode, DROPOUT_OPERATION_NAME, Dropout, DropoutOperation, DynamicRngBitGenerator,
+    RNG_BIT_GENERATOR_OPERATION_NAME, Random, RandomAlgorithm, RngBitGenerator, RngBitGeneratorOperation,
 };
 pub use reductions::{
     ARG_MAX_OPERATION_NAME, ARG_MIN_OPERATION_NAME, ArgMax, ArgMaxOperation, ArgMin, ArgMinOperation,

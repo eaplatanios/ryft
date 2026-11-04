@@ -437,12 +437,13 @@ pub trait LowerableOperation: Operation {
         output_types: &[Self::Type],
     ) -> Result<Vec<ValueRef<'b, 'c, 't>>, Error>;
 
-    /// Returns the semantic identity of this operation if it is a call of a named composite (refer to [`NamedComposite`](ryft_core::NamedComposite)), and [`None`] otherwise. Module-level
-    /// lowering passes use it to emit one shared function per specialization of a named composite body and to
-    /// skip the bodies that a backend implementation replaces. Families forward it to the variants that can hold such
-    /// calls, and the calls of a family that does not are lowered without sharing their bodies.
+    /// Returns the semantic identity of this operation if it is a call of a named composite (refer to
+    /// [`NamedComposite`](ryft_core::NamedComposite)), and [`None`] otherwise. Module-level lowering passes use it to
+    /// emit one shared function per specialization of a named composite body and to skip the bodies that a backend
+    /// implementation replaces. Families forward it to the variants that can hold such calls, and the calls of a family
+    /// that does not are lowered without sharing their bodies.
     #[inline]
-    fn named_composite(&self) -> Option<&ryft_core::CompositeKey> {
+    fn composite_key(&self) -> Option<&ryft_core::CompositeKey> {
         None
     }
 }
@@ -659,10 +660,10 @@ impl LowerableOperation for DimensionOperation<DimensionValue> {
 
 impl LowerableOperation for XlaOperation {
     #[inline]
-    fn named_composite(&self) -> Option<&ryft_core::CompositeKey> {
+    fn composite_key(&self) -> Option<&ryft_core::CompositeKey> {
         match self {
-            Self::Composite(operation) => operation.named_composite(),
-            Self::LiftedComposite(operation) => operation.named_composite(),
+            Self::Composite(operation) => operation.key(),
+            Self::LiftedComposite(operation) => operation.key(),
             _ => None,
         }
     }

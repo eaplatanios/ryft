@@ -18,13 +18,13 @@ use crate::operations::{
     DimensionMin, DimensionMinOperation, DimensionMulOperation, DimensionPow, DimensionPowOperation,
     DimensionRemOperation, DimensionSize, DimensionSizeOperation, DimensionSubOperation, DimensionToScalar,
     DimensionToScalarOperation, Div, DivOperation, DotOperation, DotOperations, DotProductAttention,
-    DotProductAttentionBackwardOperation, DotProductAttentionOperation, DynamicBroadcastOperation,
-    DynamicManipulationOperations, DynamicReshapeOperation, DynamicRngBitGenerator, DynamicSliceOperation,
-    DynamicUpdateSliceOperation, Erf, ErfOperation, ExpM1Operation, ExpOperation, ExponentialOperations,
-    ExtremaOperations, FloorOperation, GatherOperation, GuardOperation, ImaginaryOperation, IotaOperation,
-    LiftedCustomRules, LinearCallOperation, Ln1pOperation, LogAddExpOperation, LogOperation, LogicalOperations,
-    LogisticOperation, ManipulationOperations, MaxOperation, MinOperation, Mul, MulOperation, NegOperation,
-    NotOperation, OneLikeOperation, OneOperation, OrOperation, PadOperation, ParallelAllGatherOperation,
+    DotProductAttentionBackwardOperation, DotProductAttentionOperation, Dropout, DropoutOperation,
+    DynamicBroadcastOperation, DynamicManipulationOperations, DynamicReshapeOperation, DynamicRngBitGenerator,
+    DynamicSliceOperation, DynamicUpdateSliceOperation, Erf, ErfOperation, ExpM1Operation, ExpOperation,
+    ExponentialOperations, ExtremaOperations, FloorOperation, GatherOperation, GuardOperation, ImaginaryOperation,
+    IotaOperation, LiftedCustomRules, LinearCallOperation, Ln1pOperation, LogAddExpOperation, LogOperation,
+    LogicalOperations, LogisticOperation, ManipulationOperations, MaxOperation, MinOperation, Mul, MulOperation,
+    NegOperation, NotOperation, OneLikeOperation, OneOperation, OrOperation, PadOperation, ParallelAllGatherOperation,
     ParallelAllToAllOperation, ParallelPermuteOperation, ParallelRaggedAllToAllOperation, ParallelReduceOperation,
     ParallelSumScatterOperation, ParallelVaryOperation, PowOperation, Print, PrintOperation, RaggedDotOperation,
     RealOperation, ReduceOperation, ReducePrecisionOperation, ReductionOperations, ReferenceAddUpdateOperation,
@@ -135,6 +135,7 @@ pub enum ArrayOperation<V: Value<Type = ArrayType>> {
     Rematerialize(RematerializeOperation<ArrayType>),
     LinearCall(LinearCallOperation<ArrayType>),
     RngBitGenerator(RngBitGeneratorOperation<ArrayType>),
+    Dropout(DropoutOperation),
     Print(PrintOperation<ArrayType>),
     Assert(AssertOperation<ArrayType>),
     Guard(GuardOperation<ArrayType>),
@@ -191,6 +192,7 @@ pub trait ArrayOperations<T = <Self as Capability>::Universe>:
     + StopGradient<T>
     + Tag<T>
     + RngBitGenerator<T>
+    + Dropout<T>
     + Print<T>
     + Assert<T>
     + CustomCall<T>
@@ -224,6 +226,7 @@ impl<
         + StopGradient<T>
         + Tag<T>
         + RngBitGenerator<T>
+        + Dropout<T>
         + Print<T>
         + Assert<T>
         + CustomCall<T>,

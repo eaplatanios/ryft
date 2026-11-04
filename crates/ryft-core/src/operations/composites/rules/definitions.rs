@@ -357,11 +357,12 @@ where
 /// which consists of a [`CompositeKey`] that gives it semantic identity, an output type rule, and a body (i.e.,
 /// its decomposition). Definitions with equal keys in one operation family and with equal named axes are the same
 /// computation. Their bodies and rules implement one contract, which is an obligation on whoever constructs them
-/// that the key cannot verify. Backends rely on it to replace calls by key. A display label never establishes this
-/// identity, and neither does a matching body. Equal keys do not share definitions, though. Whoever constructs a
-/// definition registers it (refer to [`CustomRuleRegistration`] for more information) and owns its body and
-/// specialization caches, so calls share them by reusing that registration (e.g., by holding one
-/// [`Composite`](crate::Composite) value across calls).
+/// that the key cannot verify. Backends rely on it to replace calls by key and to index the functions that they emit
+/// for calls by key (e.g., the XLA backend), so a computation whose body or rules change requires a new key (e.g., a
+/// new version). A display label never establishes this identity, and neither does a matching body. Equal keys do not
+/// share definitions, though. Whoever constructs a definition registers it (refer to [`CustomRuleRegistration`] for
+/// more information) and owns its body and specialization caches, so calls share them by reusing that registration
+/// (e.g., by holding one [`Composite`](crate::Composite) value across calls).
 ///
 /// Any backend may replace the calls of a named computation with its own implementation of that contract (e.g., a
 /// fused kernel), and calls that no backend replaces run or lower their body. A computation that should only ever run

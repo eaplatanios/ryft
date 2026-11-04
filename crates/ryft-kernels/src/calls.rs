@@ -1073,10 +1073,10 @@ impl<Extension: Operation<Type = ArrayIrType>> KernelDefinition<Extension> {
 
     /// Encodes the semantic identity of a `composite` call with retained rules, which only a call of a named
     /// definition has (refer to [`NamedComposite`](ryft_core::NamedComposite)): its key and implementation
-    /// requirement identify its rules across processes, and the derived rendering of its key encodes floating-point
-    /// attributes by their IEEE bits. Its body, if any, is encoded with the other regions of the kernel. Calls of other
-    /// definitions are rejected, because the identity of their rules is local to the process, and calls with attached
-    /// rules need no fields beyond their regions.
+    /// requirement identify its rules across processes. The key's [`Debug`](std::fmt::Debug) representation encodes
+    /// floating-point attributes by their IEEE bits. Its body, if any, is encoded with the other regions of the kernel.
+    /// Calls of other definitions are rejected, because the identity of their rules is local to the process, and calls
+    /// with attached rules need no fields beyond their regions.
     fn composite_semantic_fields<V: Typed<Type: DifferentiableType + Eq + Hash> + Parameter, O, S>(
         key: &mut String,
         operation: &CompositeOperation<V, O, S>,
@@ -1087,10 +1087,10 @@ impl<Extension: Operation<Type = ArrayIrType>> KernelDefinition<Extension> {
         let Some(rules) = operation.rules() else {
             return Ok(());
         };
-        let Some((composite, implementation)) = rules.named() else {
+        let Some(composite) = rules.key() else {
             return Err(Self::retained_composite_encoding_error(COMPOSITE_OPERATION_NAME));
         };
-        Self::semantic_field(key, &format!("named composite {composite:?} {implementation:?}"));
+        Self::semantic_field(key, &format!("named composite {composite:?}"));
         Ok(())
     }
 
@@ -1111,6 +1111,9 @@ impl<Extension: Operation<Type = ArrayIrType>> KernelDefinition<Extension> {
                 }
                 ArrayOperation::DotProductAttentionBackward(operation) => {
                     Self::attention_semantic_fields(key, operation.configuration())
+                }
+                ArrayOperation::Dropout(operation) => {
+                    Self::semantic_field(key, &format!("dropout rate bits {:016x}", operation.rate().to_bits()))
                 }
                 ArrayOperation::Composite(operation) => Self::composite_semantic_fields(key, operation)?,
                 ArrayOperation::CompositeTranspose(operation) if operation.rules().is_some() => {
@@ -1274,13 +1277,13 @@ impl<Extension: Operation<Type = ArrayIrType>> KernelDefinition<Extension> {
 mod tests {
     use pretty_assertions::assert_eq;
     use ryft_core::{
-        ArrayIrOperation, ArrayOperation, ArrayReferenceTransformIndex, AtomId, CompositeAttribute,
-        CompositeImplementation, CompositeJvpRule, CompositeKey, CompositeOperation, CompositeTransposeOperation,
-        ConditionOperation, Context, CustomRuleDefinition, CustomRuleRegistration, DataType, DimensionError,
-        DimensionType, DimensionValue, EffectClasses, Layout, LogicalMesh, Memory, MeshAxis, MeshAxisType,
-        NamedComposite, Placeholder, ProgramBuilder, ReferenceAddUpdateOperation, ReferenceAtomicAddUpdateOperation,
-        ReferenceRead, ReferenceReadOperation, ReferenceWrite, ReferenceWriteOperation, RegionId, Shape,
-        ShardMapBoundary, ShardMapOperation, Sharding, TiledLayout, TypedProgram, ZeroOperation,
+        ArrayIrOperation, ArrayOperation, ArrayReferenceTransformIndex, AtomId, CompositeAttribute, CompositeJvpRule,
+        CompositeKey, CompositeOperation, CompositeTransposeOperation, ConditionOperation, Context,
+        CustomRuleDefinition, CustomRuleRegistration, DataType, DimensionError, DimensionType, DimensionValue,
+        EffectClasses, Layout, LogicalMesh, Memory, MeshAxis, MeshAxisType, NamedComposite, Placeholder,
+        ProgramBuilder, ReferenceAddUpdateOperation, ReferenceAtomicAddUpdateOperation, ReferenceRead,
+        ReferenceReadOperation, ReferenceWrite, ReferenceWriteOperation, RegionId, Shape, ShardMapBoundary,
+        ShardMapOperation, Sharding, TiledLayout, TypedProgram, ZeroOperation,
     };
 
     use crate::authoring::whole_array_parameter;
@@ -2560,39 +2563,58 @@ mod tests {
             retained("composite_transpose"),
         );
 
-        // Calls of named composites are encoded by their keys and requirements, so separately registered
+        // Calls of named composites are encoded by their keys, so separately registered
         // definitions with equal keys encode equally, in either family.
-        let named = |attribute: bool| {
-            let key = CompositeKey::new("ryft.tests.kernel_named", 1)
-                .with_attribute("flag", CompositeAttribute::Boolean(attribute));
+        let named = |attribute: CompositeAttribute| {
+            let key = CompositeKey::new("ryft.tests.kernel_named", 1).with_attribute("attribute", attribute);
             CustomRuleRegistration::new(
-                CustomRuleDefinition::<ArrayIrValue<Array>, ArrayIrOperation<Array>>::new("named").with_named(
-                    NamedComposite::new(
+                CustomRuleDefinition::<ArrayIrValue<Array>, ArrayIrOperation<Array>>::new("named")
+                    .with_named_composite(NamedComposite::new(
                         key,
-                        CompositeImplementation::Primal,
                         |types: &[ArrayIrType]| Ok(types.to_vec()),
                         |inputs: &[Tracer<TracingContext<ArrayIrValue<Array>, ArrayIrOperation<Array>>>]| {
                             Ok(inputs.to_vec())
                         },
-                    ),
-                ),
+                    )),
             )
         };
         let named_key = |rules: &CustomRuleRegistration<ArrayIrValue<Array>, ArrayIrOperation<Array>>| {
             definition(ArrayIrOperation::Composite(CompositeOperation::new(rules.reference())), 1).semantic_key()
         };
-        let (first, second, other) = (named(true), named(true), named(false));
+        let (first, second, other) = (named(true.into()), named(true.into()), named(false.into()));
         assert!(first.definition().id() != second.definition().id());
         assert_eq!(named_key(&first).unwrap(), named_key(&second).unwrap());
         assert!(named_key(&first).unwrap() != named_key(&other).unwrap());
+
+        // Semantic descriptors preserve scalar kinds, optional structure, and float bits at every nesting level.
+        for [left, right] in [
+            [CompositeAttribute::Float(0.0), CompositeAttribute::Float(-0.0)],
+            [
+                CompositeAttribute::Float(f64::from_bits(0x7ff8_0000_0000_0001)),
+                CompositeAttribute::Float(f64::from_bits(0x7ff8_0000_0000_0002)),
+            ],
+            [
+                CompositeAttribute::from(Some((f64::from_bits(0x7ff8_0000_0000_0001), u64::MAX))),
+                CompositeAttribute::from(Some((f64::from_bits(0x7ff8_0000_0000_0002), u64::MAX))),
+            ],
+            [CompositeAttribute::Integer(1), CompositeAttribute::Float(1.0)],
+            [CompositeAttribute::from(None::<u64>), CompositeAttribute::from(Some(None::<u64>))],
+            [CompositeAttribute::from(vec![1, 2]), CompositeAttribute::from(vec![2, 1])],
+        ] {
+            let (first, repeated, other) = (named(left.clone()), named(left), named(right));
+            assert_eq!(named_key(&first).unwrap(), named_key(&repeated).unwrap());
+            assert_ne!(named_key(&first).unwrap(), named_key(&other).unwrap());
+        }
+
         let member_key = CompositeKey::new("ryft.tests.kernel_named_member", 1);
         let member_rules = CustomRuleRegistration::new(
-            CustomRuleDefinition::<Array, ArrayOperation<Array>>::new("member").with_named(NamedComposite::new(
-                member_key,
-                CompositeImplementation::Primal,
-                |types: &[ArrayType]| Ok(types.to_vec()),
-                |inputs: &[Tracer<TracingContext<Array, ArrayOperation<Array>>>]| Ok(inputs.to_vec()),
-            )),
+            CustomRuleDefinition::<Array, ArrayOperation<Array>>::new("member").with_named_composite(
+                NamedComposite::new(
+                    member_key,
+                    |types: &[ArrayType]| Ok(types.to_vec()),
+                    |inputs: &[Tracer<TracingContext<Array, ArrayOperation<Array>>>]| Ok(inputs.to_vec()),
+                ),
+            ),
         );
         assert!(
             definition(

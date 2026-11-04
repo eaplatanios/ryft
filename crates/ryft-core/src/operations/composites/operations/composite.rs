@@ -878,7 +878,10 @@ impl<V: Typed<Type: DifferentiableType + Eq + Hash> + Parameter, O, S: CustomRul
     fn render(&self, formatter: &mut std::fmt::Formatter<'_>, indentation: usize) -> std::fmt::Result {
         // Attached rule regions render under their slot names, so their fields appear only for the non-differentiated
         // split and for a forward mode rule derived from the primal region, both exactly where they exist. Retained
-        // rules render the name of their definition and the state of the call that their specializations depend on.
+        // rules render the complete key of a named definition (i.e., including its version and attributes), so that
+        // renderings, and the structural deduplication of the regions that contain such calls, distinguish calls of
+        // different named computations, or the name of any other definition, followed by the state of the call that
+        // their specializations depend on.
         let operation = OperationFormatter::new(formatter, indentation, COMPOSITE_OPERATION_NAME)?;
         match &self.rules {
             CompositeRules::Attached { jvp_rule, .. } => {
@@ -897,7 +900,10 @@ impl<V: Typed<Type: DifferentiableType + Eq + Hash> + Parameter, O, S: CustomRul
             }
             CompositeRules::Retained { rules, batching, discharged, kept_outputs } => {
                 operation.bracketed(|operation| {
-                    operation.field("name", format_args!("{:?}", rules.name()))?;
+                    match rules.key() {
+                        Some(key) => operation.field("key", format_args!("{:?}", key.to_string()))?,
+                        None => operation.field("name", format_args!("{:?}", rules.name()))?,
+                    }
                     if self.non_differentiated_count > 0 {
                         operation.field("non_differentiated_count", self.non_differentiated_count)?;
                     }
@@ -2345,7 +2351,7 @@ mod tests {
     use crate::operations::composites::rules::{CustomRuleRegistration, LiftedCustomRules};
     use crate::operations::composites::tests::{
         MemberDefinition, RuleCounters, TestContext, TestDefinition, TestRegistration, call_jvp, cube_definition,
-        cube_program, custom_rule_program, member_cube_definition, ownership_probe,
+        cube_program, custom_rule_program, member_cube_definition, named_cube_definition, ownership_probe,
     };
     use crate::operations::control_flow::condition::ConditionOperation;
     use crate::operations::control_flow::scan::ScanOperation;
@@ -4599,6 +4605,48 @@ mod tests {
             Ok(vec![Array::scalar(8f64).unwrap(), Array::scalar(4f64).unwrap()]),
         );
         assert_eq!(counters.counts(), (1, 0, 0));
+    }
+
+    #[test]
+    fn test_composite_partial_evaluation_shared_body() {
+        // Residualizing named calls that share one interned body keeps sharing it, rather than copying it per call.
+        let traces = Arc::new(AtomicUsize::new(0));
+        let key = CompositeKey::new("ryft.tests.partial_evaluation_shared_body", 1);
+        let registration = CustomRuleRegistration::new(named_cube_definition(key, &traces));
+        let scalar_type = ArrayType::scalar(DataType::F64);
+        let body = registration.reference().body(std::slice::from_ref(&scalar_type)).unwrap();
+        let mut builder = ProgramBuilder::<Array, ArrayOperation<Array>>::new();
+        let mut value = builder.add_input(scalar_type.clone());
+        let mut outputs = Vec::new();
+        for _ in 0..2 {
+            let region = builder.intern_callee(&body, None).unwrap();
+            let operation = CompositeOperation::new(registration.reference());
+            value = builder.add_instruction(operation, vec![region], vec![value], None).unwrap()[0];
+            outputs.push(value);
+        }
+        let program =
+            builder.build::<Vec<Array>, Vec<Array>>(outputs, vec![Placeholder], vec![Placeholder; 2]).unwrap();
+        let evaluation = program.partially_evaluate(&[PartialValue::Unknown(scalar_type)]).unwrap();
+        assert_eq!(
+            evaluation.program().to_string(),
+            indoc! {"
+                lambda %0:f64[] .
+                let %1:f64[] = composite [key=\"ryft.tests.partial_evaluation_shared_body.v1\"] %0 [
+                    primal=^0={
+                        lambda %0:f64[] .
+                        let %1:f64[] = mul %0 %0
+                            %2:f64[] = mul %1 %0
+                        in (%2)
+                    },
+                ]
+                    %2:f64[] = composite [key=\"ryft.tests.partial_evaluation_shared_body.v1\"] %1 [
+                        primal=^0,
+                    ]
+                in (%1, %2)
+            "}
+            .trim_end(),
+        );
+        assert_eq!(traces.load(Ordering::SeqCst), 1);
     }
 
     #[test]

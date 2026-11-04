@@ -524,8 +524,8 @@ fn single_type_argument<'t>(r#type: &'t syn::Type, name: &str) -> Option<&'t syn
 
 /// Lifts the projected output value of the provided expression, whose type is `type` with `Self` read as the
 /// projected member, back into the heterogeneous universe. `Self` is lifted through `ValueProjection::from_projected`,
-/// `Vec<Self>` is lifted element by element, tuples are lifted component by component, and types that do not mention
-/// `Self` are passed through unchanged. Returns an error for all other types that mention `Self`.
+/// `Option<Self>` and `Vec<Self>` are lifted element by element, tuples are lifted component by component, and types
+/// that do not mention `Self` are passed through unchanged. Returns an error for all other types that mention `Self`.
 ///
 /// # Parameters
 ///
@@ -548,6 +548,12 @@ fn lift_projected_output(
     }
     match r#type {
         r#type
+            if single_type_argument(r#type, "Option")
+                .is_some_and(|element| element.matches_ident(&SELF_TYPE.into())) =>
+        {
+            Ok(quote!(#expression.map(#from_projected)))
+        }
+        r#type
             if single_type_argument(r#type, "Vec").is_some_and(|element| element.matches_ident(&SELF_TYPE.into())) =>
         {
             Ok(quote!(#expression.into_iter().map(#from_projected).collect()))
@@ -567,8 +573,8 @@ fn lift_projected_output(
         }
         _ => Err(syn::Error::new_spanned(
             r#type,
-            "projected capability functions must return `Self`, `Vec<Self>`, tuples of those, or types that do not \
-             mention `Self`",
+            "projected capability functions must return `Self`, `Option<Self>`, `Vec<Self>`, tuples of those, or \
+             types that do not mention `Self`",
         )),
     }
 }
@@ -1043,8 +1049,12 @@ mod tests {
         );
         assert_eq!(
             lift(syn::parse_quote!(Option<Self>)),
-            Err("projected capability functions must return `Self`, `Vec<Self>`, tuples of those, or types that do \
-                 not mention `Self`"
+            Ok(rendering(&quote!(value.map(<Self as ryft::ValueProjection<ArrayType>>::from_projected)))),
+        );
+        assert_eq!(
+            lift(syn::parse_quote!(Box<Self>)),
+            Err("projected capability functions must return `Self`, `Option<Self>`, `Vec<Self>`, tuples of those, or \
+                 types that do not mention `Self`"
                 .to_string(),),
         );
     }
