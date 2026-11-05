@@ -13072,6 +13072,143 @@ mod tests {
     }
 
     #[test]
+    fn test_shard_map_interpretation_unreduced_kinds() {
+        // An unchecked map returns each device's tile of `v` as its per-device value of an output that is unreduced
+        // along `x` with kind `max` (respectively, `min`), whose logical value is the elementwise maximum (respectively,
+        // minimum) of the tiles. A checked map then completes it with the reduction of that kind, while a sum of it
+        // is rejected, as are reverse mode cotangents of it. The expected values are those of JAX's `unreduced_pmax`
+        // and `unreduced_pmin` (`.tasks/shard_map_jax_parity_gaps/m4_oracles.py`).
+        let mesh = manual_mesh();
+        let sharded = sharded_along_x();
+        let replicated = Sharding::replicated(mesh.clone(), 1);
+        let unreduced = |kind: UnreducedKind| {
+            replicated.clone().with_unreduced_axes(["x"]).unwrap().with_unreduced_kind(kind).unwrap()
+        };
+        let pending = |kind: UnreducedKind, complete: Option<ReductionKind>| {
+            trace_test_program(
+                |inputs| {
+                    let pending = shard_map(
+                        |v: TestTracer| Ok(v),
+                        inputs[0].clone(),
+                        mesh.clone(),
+                        sharded.clone(),
+                        unreduced(kind),
+                        ShardMapOptions::new().with_check_manual_variation(false),
+                    )
+                    .unwrap();
+                    match complete {
+                        None => vec![pending],
+                        Some(reduction) => vec![
+                            shard_map(
+                                |u: TestTracer| Ok(u.parallel_reduce(reduction, "x")?),
+                                pending,
+                                mesh.clone(),
+                                unreduced(kind),
+                                replicated.clone(),
+                                ShardMapOptions::new(),
+                            )
+                            .unwrap(),
+                        ],
+                    }
+                },
+                vec![f32_vector_type(4)],
+                Vec::new(),
+            )
+        };
+        let v = f32_value(f32_vector_type(4), &[1.0, 7.0, 5.0, 2.0]);
+        for (kind, reduction, expected) in
+            [(UnreducedKind::Max, ReductionKind::Max, [5.0, 7.0]), (UnreducedKind::Min, ReductionKind::Min, [1.0, 2.0])]
+        {
+            assert_eq!(
+                pending(kind, None).interpret(vec![v.clone()]),
+                Ok(vec![f32_value(f32_type(&[2], Some(unreduced(kind))), &expected)]),
+            );
+            assert_eq!(
+                pending(kind, Some(reduction)).interpret(vec![v.clone()]),
+                Ok(vec![f32_value(f32_type(&[2], Some(replicated.clone())), &expected)]),
+            );
+        }
+
+        // Every device receives the whole logical value of an input that is unreduced with kind `max`, rather than
+        // the zeros that a sum hands to all but one device, so a negative maximum survives the completion.
+        let complete = trace_test_program(
+            |inputs| {
+                vec![
+                    shard_map(
+                        |u: TestTracer| Ok(u.parallel_reduce(ReductionKind::Max, "x")?),
+                        inputs[0].clone(),
+                        mesh.clone(),
+                        unreduced(UnreducedKind::Max),
+                        replicated.clone(),
+                        ShardMapOptions::new(),
+                    )
+                    .unwrap(),
+                ]
+            },
+            vec![f32_type(&[2], Some(unreduced(UnreducedKind::Max))).into()],
+            Vec::new(),
+        );
+        assert_eq!(
+            complete.interpret(vec![f32_value(f32_type(&[2], Some(unreduced(UnreducedKind::Max))), &[-5.0, -7.0])]),
+            Ok(vec![f32_value(f32_type(&[2], Some(replicated.clone())), &[-5.0, -7.0])]),
+        );
+
+        // A sum does not complete a pending maximum, and a boundary rejects a value of another kind.
+        let complete_with = |reduction: ReductionKind, input_sharding: Sharding| {
+            TestContext::trace_with_named_axes(
+                |inputs: Vec<Tracer<TestContext>>| {
+                    let input = ValueProjection::<ArrayType>::into_projected(inputs[0].clone())?;
+                    let output = shard_map(
+                        |u: TestTracer| Ok(u.parallel_reduce(reduction, "x")?),
+                        input,
+                        mesh.clone(),
+                        input_sharding,
+                        replicated.clone(),
+                        ShardMapOptions::new(),
+                    )?;
+                    Ok(vec![output.into_value()])
+                },
+                vec![ArrayIrType::Array(f32_type(&[2], Some(unreduced(UnreducedKind::Max))))],
+                Vec::new(),
+            )
+            .map(|_| ())
+        };
+        assert_eq!(
+            complete_with(ReductionKind::Sum, unreduced(UnreducedKind::Max)),
+            Err(ProgramError::Type(TypeError::invalid(
+                "`parallel_reduce` with kind `sum` cannot reduce an input that is unreduced along manual axis `x` with \
+                 kind `max`; only a reduction of that kind completes it",
+            ))),
+        );
+        assert_eq!(
+            complete_with(ReductionKind::Min, unreduced(UnreducedKind::Min)),
+            Err(ShardMapError::UnreducedKindMismatch {
+                value_kind: ShardMapValueKind::Input,
+                value_index: 0,
+                expected: UnreducedKind::Min,
+                actual: UnreducedKind::Max,
+            }
+            .into()),
+        );
+
+        // Reverse mode supports only sums, so the gradient through a pending maximum is rejected.
+        let maximum = f32_value(f32_type(&[2], Some(unreduced(UnreducedKind::Max))), &[5.0, 7.0]);
+        let gradient = differentiate_at(maximum).gradient(|u| {
+            let u = ValueProjection::<ArrayType>::into_projected(u)?;
+            let output = shard_map(
+                |u: TestTracer| Ok(u.parallel_reduce(ReductionKind::Max, "x")?),
+                u,
+                mesh.clone(),
+                unreduced(UnreducedKind::Max),
+                replicated.clone(),
+                ShardMapOptions::new(),
+            )?;
+            Ok(output.reduce(&[0], ReductionKind::Sum)?.into_value())
+        });
+        assert!(gradient.is_err());
+    }
+
+    #[test]
     fn test_shard_map_interpretation_parallel_arg_extrema() {
         // Device 0 holds `[3, 1, 2]` and device 1 holds `[3, 5, 0]`, so the first element ties and resolves to the lowest
         // position. The expected positions are those of JAX's `pargmax` and `pargmin`

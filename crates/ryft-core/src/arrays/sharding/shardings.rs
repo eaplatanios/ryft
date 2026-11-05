@@ -1483,5 +1483,90 @@ mod tests {
 
         // A difference confined to the varying-manual-axis set is ignored entirely.
         assert!(!with_reduction_axes(vec![], vec![], vec!["manual"]).conflicts_on_explicit_axes_with(&replicated));
+
+        // A kind difference is a conflict only when either side is unreduced along an explicit axis.
+        let explicit_sum = with_reduction_axes(vec!["x"], vec![], vec![]);
+        let explicit_max = explicit_sum.clone().with_unreduced_kind(UnreducedKind::Max).unwrap();
+        let manual_sum = with_reduction_axes(vec!["manual"], vec![], vec![]);
+        let manual_max = manual_sum.clone().with_unreduced_kind(UnreducedKind::Max).unwrap();
+        assert!(explicit_max.conflicts_on_explicit_axes_with(&explicit_sum));
+        assert!(!manual_max.conflicts_on_explicit_axes_with(&manual_sum));
+    }
+
+    #[test]
+    fn test_sharding_unreduced_kind() {
+        let mesh = LogicalMesh::new(vec![
+            MeshAxis::new("x", 2, MeshAxisType::Explicit).unwrap(),
+            MeshAxis::new("y", 2, MeshAxisType::Explicit).unwrap(),
+            MeshAxis::new("m", 2, MeshAxisType::Manual).unwrap(),
+        ])
+        .unwrap();
+        let replicated = Sharding::replicated(mesh.clone(), 1);
+        let unreduced = replicated.clone().with_unreduced_axes(["y", "m"]).unwrap();
+
+        // Every sharding starts with kind `sum`, and a kind other than a sum requires unreduced axes.
+        assert_eq!(UnreducedKind::default(), UnreducedKind::Sum);
+        assert_eq!(replicated.unreduced_kind(), UnreducedKind::Sum);
+        assert_eq!(unreduced.unreduced_kind(), UnreducedKind::Sum);
+        assert_eq!(replicated.clone().with_unreduced_kind(UnreducedKind::Sum), Ok(replicated.clone()));
+        assert_eq!(
+            replicated.clone().with_unreduced_kind(UnreducedKind::Max),
+            Err(ShardingError::UnreducedKindWithoutUnreducedAxes { kind: UnreducedKind::Max }),
+        );
+
+        // The kind renders after the unreduced axes unless it is a sum, and it distinguishes otherwise equal shardings.
+        let maximum = unreduced.clone().with_unreduced_kind(UnreducedKind::Max).unwrap();
+        let minimum = unreduced.clone().with_unreduced_kind(UnreducedKind::Min).unwrap();
+        assert_eq!(maximum.unreduced_kind(), UnreducedKind::Max);
+        assert_eq!(
+            unreduced.to_string(),
+            "{mesh<['x'=2:explicit, 'y'=2:explicit, 'm'=2:manual]>, [{}], unreduced={'m', 'y'}}",
+        );
+        assert_eq!(
+            maximum.to_string(),
+            "{mesh<['x'=2:explicit, 'y'=2:explicit, 'm'=2:manual]>, [{}], unreduced={'m', 'y'}, unreduced_kind=max}",
+        );
+        assert_eq!(
+            minimum.to_string(),
+            "{mesh<['x'=2:explicit, 'y'=2:explicit, 'm'=2:manual]>, [{}], unreduced={'m', 'y'}, unreduced_kind=min}",
+        );
+        assert_ne!(maximum, unreduced);
+        assert_ne!(maximum, minimum);
+
+        // Structural derivations keep the kind, and replacing the unreduced axes keeps it unless none remain.
+        let dimensions = vec![ShardingDimension::sharded(["x"])];
+        assert_eq!(maximum.with_dimensions(dimensions.clone()).unwrap().unreduced_kind(), UnreducedKind::Max);
+        assert_eq!(
+            maximum.with_inserted_dimension(0, ShardingDimension::sharded(["x"])).unwrap().unreduced_kind(),
+            UnreducedKind::Max,
+        );
+        assert_eq!(maximum.with_broadcasted_dimensions(2, &[1]).unwrap().unreduced_kind(), UnreducedKind::Max);
+        assert_eq!(maximum.without_dimension(0).unwrap().unreduced_kind(), UnreducedKind::Max);
+        assert_eq!(maximum.local_sharding(&["m".to_string()]).unwrap().unreduced_kind(), UnreducedKind::Max);
+        assert_eq!(maximum.clone().with_unreduced_axes(["y"]).unwrap().unreduced_kind(), UnreducedKind::Max);
+        assert_eq!(maximum.clone().with_unreduced_axes(Vec::<String>::new()).unwrap(), replicated);
+
+        // Projections that remove every unreduced axis reset the kind to a sum, so the result equals the sharding
+        // that never had unreduced axes.
+        let manual_maximum = replicated
+            .clone()
+            .with_unreduced_axes(["m"])
+            .unwrap()
+            .with_unreduced_kind(UnreducedKind::Max)
+            .unwrap();
+        assert_eq!(manual_maximum.without_manual_reduction_axes(), replicated);
+        assert_eq!(maximum.without_manual_reduction_axes().unreduced_kind(), UnreducedKind::Max);
+
+        // Only sums have cotangents, whose unreduced axes are always sums.
+        assert_eq!(maximum.cotangent(), Err(ShardingError::UndefinedUnreducedCotangent { kind: UnreducedKind::Max }));
+        assert_eq!(minimum.cotangent(), Err(ShardingError::UndefinedUnreducedCotangent { kind: UnreducedKind::Min }));
+        assert_eq!(unreduced.cotangent().unwrap().unreduced_kind(), UnreducedKind::Sum);
+        assert_eq!(
+            ShardingError::UndefinedUnreducedCotangent { kind: UnreducedKind::Max }.to_string(),
+            "a value that is unreduced with kind `max` has no cotangent, because reverse mode supports only `sum` \
+             unreduced axes",
+        );
+        assert_eq!(UnreducedKind::Sum.to_string(), "sum");
+        assert_eq!(UnreducedKind::Min.to_string(), "min");
     }
 }
