@@ -20,7 +20,8 @@ use crate::differentiation::{
 };
 use crate::interpretation::{InterpretableOperation, InterpretationDriver};
 use crate::macros::{
-    check_count, dispatch_on_array_element_type, impl_differentiable_operation, impl_reference_dischargeable_operation,
+    check_count, check_types, dispatch_on_array_element_type, impl_differentiable_operation,
+    impl_reference_dischargeable_operation,
 };
 use crate::operations::Capability;
 use crate::operations::arithmetic::{Add, Div, Mul};
@@ -1873,6 +1874,22 @@ impl Scatter for ArrayType {
             .into());
         }
 
+        // An overwrite selects values and so commutes with any pending reduction whose kind both sides share, whereas
+        // the additive and multiplicative combiners commute only with pending sums.
+        let unreduced_kind = input.unreduced_kind();
+        if !linear_multiplication && updates.unreduced_kind() != unreduced_kind {
+            return Err(TypeError::invalid(format!(
+                "`{}` input and updates must be unreduced with the same kind but got `{}` and `{}`",
+                SCATTER_OPERATION_NAME,
+                unreduced_kind,
+                updates.unreduced_kind(),
+            ))
+            .into());
+        }
+        if kind != ScatterReductionKind::Overwrite {
+            check_types!(@sum_unreduced, SCATTER_OPERATION_NAME, [input]);
+        }
+
         if !linear_multiplication
             && !unreduced_axes.is_empty()
             && !matches!(kind, ScatterReductionKind::Add | ScatterReductionKind::Overwrite)
@@ -1923,6 +1940,7 @@ impl Scatter for ArrayType {
             }
 
             if requested.unreduced_axes() != &unreduced_axes
+                || requested.unreduced_kind() != unreduced_kind
                 || requested.reduced_axes() != &reduced_axes
                 || requested.varying_manual_axes() != &varying_manual_axes
             {

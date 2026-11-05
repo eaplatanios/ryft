@@ -1392,6 +1392,15 @@ fn infer_reshape_output_type(
                 )));
             }
 
+            if requested.unreduced_kind() != input.unreduced_kind() {
+                return Err(TypeError::invalid(format!(
+                    "`{}` requested output sharding changes the unreduced kind from `{}` to `{}`",
+                    RESHAPE_OPERATION_NAME,
+                    input.unreduced_kind(),
+                    requested.unreduced_kind(),
+                )));
+            }
+
             let input_reduced = input.sharding().map(Sharding::reduced_axes).cloned().unwrap_or_default();
             if requested.reduced_axes() != &input_reduced {
                 return Err(TypeError::invalid(format!(
@@ -1630,17 +1639,9 @@ fn infer_reshape_output_type(
             }
 
             // Only dimension placement changes; retain the input mesh, reduction state, and manual-axis variation.
-            Some(
-                Sharding::new(sharding.mesh().clone(), output_sharding_dimensions)
-                    .and_then(|output| output.with_unreduced_axes(sharding.unreduced_axes().clone()))
-                    .and_then(|output| output.with_reduced_axes(sharding.reduced_axes().clone()))
-                    .and_then(|output| output.with_varying_manual_axes(sharding.varying_manual_axes().clone()))
-                    .map_err(|error| {
-                        TypeError::invalid(format!(
-                            "`{RESHAPE_OPERATION_NAME}` inferred output sharding is invalid: {error}",
-                        ))
-                    })?,
-            )
+            Some(sharding.with_dimensions(output_sharding_dimensions).map_err(|error| {
+                TypeError::invalid(format!("`{RESHAPE_OPERATION_NAME}` inferred output sharding is invalid: {error}"))
+            })?)
         }
         (None, None) => None,
     };

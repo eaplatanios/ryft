@@ -16,8 +16,11 @@
 //! floating-point values propagate NaNs and order negative zero below positive zero. Complex values compare their real
 //! parts first and their imaginary parts second, and select the right input on exact ties and whenever a NaN makes the
 //! deciding comparison unordered. Imaginary NaNs do not affect selection between unequal real components and may
-//! therefore remain in the selected input. Array inputs that carry partial sums over unreduced mesh axes are
-//! rejected, and the reduced-axis markers of the inputs must agree.
+//! therefore remain in the selected input. A minimum (respectively, maximum) accepts array inputs that are unreduced
+//! along the same mesh axes with kind [`UnreducedKind::Min`](crate::UnreducedKind::Min) (respectively,
+//! [`UnreducedKind::Max`](crate::UnreducedKind::Max)), because it commutes with the reduction that completes them, and
+//! returns a value unreduced along those axes with that kind, same as JAX does. Every other unreduced input is rejected
+//! (e.g., a partial sum, or any unreduced input of a clamp), and the reduced-axis markers of the inputs must agree.
 //!
 //! The tangent of an extremum weighs each input's tangent by `1` where that input is strictly selected, by `0.5` where
 //! the inputs tie, and by `0` where the other input is selected or the deciding comparison is unordered. Complex inputs
@@ -77,8 +80,9 @@ define_elementwise_operation!(
     /// types and broadcasting their shapes. Boolean minima are conjunctions. Real floating-point inputs propagate NaNs
     /// and order negative zero below positive zero. Complex inputs compare real components first, then imaginary
     /// components when the real components are equal, and select one whole input, namely the right input on exact
-    /// ties and whenever a NaN makes the deciding comparison unordered. Array inputs that still carry partial sums
-    /// are rejected, and their reduced-axis markers must agree.
+    /// ties and whenever a NaN makes the deciding comparison unordered. Array inputs may be unreduced only along the
+    /// same mesh axes with kind [`UnreducedKind::Min`](crate::UnreducedKind::Min), which the output keeps, and their
+    /// reduced-axis markers must agree.
     ///
     /// The tangent weighs each input tangent by `1` where that input is strictly smaller, by `0.5` where the inputs
     /// tie, and by `0` where the other input is smaller or the deciding comparison is unordered. Complex inputs use
@@ -88,7 +92,7 @@ define_elementwise_operation!(
     Min,
     min,
     check_data_types = [@boolean_or_numeric],
-    check_array_types = [@no_unreduced, @same_reduced_axes],
+    check_array_types = [@same_unreduced_axes, @min_unreduced, @same_reduced_axes],
 );
 
 impl_differentiable_elementwise_operation! {
@@ -125,7 +129,7 @@ impl_array_elementwise_operation!(
     min,
     operation = "min",
     inputs = @boolean_or_numeric,
-    checks = [@no_unreduced, @same_reduced_axes],
+    checks = [@same_unreduced_axes, @min_unreduced, @same_reduced_axes],
     |left, right| Ok(ArrayElement::min(&left, &right)),
 );
 
@@ -196,8 +200,9 @@ define_elementwise_operation!(
     /// types and broadcasting their shapes. Boolean maxima are disjunctions. Real floating-point inputs propagate NaNs
     /// and order negative zero below positive zero. Complex inputs compare real components first, then imaginary
     /// components when the real components are equal, and select one whole input, namely the right input on exact
-    /// ties and whenever a NaN makes the deciding comparison unordered. Array inputs that still carry partial sums are
-    /// rejected, and their reduced-axis markers must agree.
+    /// ties and whenever a NaN makes the deciding comparison unordered. Array inputs may be unreduced only along the
+    /// same mesh axes with kind [`UnreducedKind::Max`](crate::UnreducedKind::Max), which the output keeps, and their
+    /// reduced-axis markers must agree.
     ///
     /// The tangent weighs each input tangent by `1` where that input is strictly larger, by `0.5` where the inputs
     /// tie, and by `0` where the other input is larger or the deciding comparison is unordered. Complex inputs use
@@ -207,7 +212,7 @@ define_elementwise_operation!(
     Max,
     max,
     check_data_types = [@boolean_or_numeric],
-    check_array_types = [@no_unreduced, @same_reduced_axes],
+    check_array_types = [@same_unreduced_axes, @max_unreduced, @same_reduced_axes],
 );
 
 impl_differentiable_elementwise_operation! {
@@ -244,7 +249,7 @@ impl_array_elementwise_operation!(
     max,
     operation = "max",
     inputs = @boolean_or_numeric,
-    checks = [@no_unreduced, @same_reduced_axes],
+    checks = [@same_unreduced_axes, @max_unreduced, @same_reduced_axes],
     |left, right| Ok(ArrayElement::max(&left, &right)),
 );
 

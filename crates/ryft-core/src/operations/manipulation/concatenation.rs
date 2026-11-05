@@ -1386,9 +1386,10 @@ fn validate_concatenation_inputs(inputs: &[&ArrayType], axis: usize) -> Result<O
     Ok(all_static.then_some(concatenated_static))
 }
 
-/// Infers the output [`Sharding`] for a concatenation operation by requiring identical spatial placement and varying
-/// manual axes. Non-empty reduced and unreduced axis sets must agree independently. Reduction-state transitions require
-/// their own semantic operations and cannot be supplied by concatenation.
+/// Infers the output [`Sharding`] for a concatenation operation by requiring identical spatial placement
+/// and varying manual axes. Non-empty reduced and unreduced axis sets must agree independently, and so must the
+/// [`UnreducedKind`](crate::UnreducedKind)s of the inputs with non-empty unreduced axis sets. Reduction-state
+/// transitions require their own semantic operations and cannot be supplied by concatenation.
 fn infer_concatenation_sharding(inputs: &[&ArrayType]) -> Result<Option<Sharding>, TypeError> {
     /// Merges one non-empty reduced or unreduced axis set into the corresponding concatenation result state.
     fn merge_concatenation_axis_set(
@@ -1418,11 +1419,25 @@ fn infer_concatenation_sharding(inputs: &[&ArrayType]) -> Result<Option<Sharding
         .unwrap_or_default();
     let mut spatial_sharding: Option<&Sharding> = None;
     let mut unreduced_axes = None;
+    let mut unreduced_kind = None;
     let mut reduced_axes = None;
     for input in inputs {
         let normalized_reduced_axes = input.reduced_axes().clone();
         unreduced_axes = merge_concatenation_axis_set(unreduced_axes, input.unreduced_axes(), "unreduced")?;
         reduced_axes = merge_concatenation_axis_set(reduced_axes, &normalized_reduced_axes, "reduced")?;
+        if !input.unreduced_axes().is_empty() {
+            match unreduced_kind {
+                Some(kind) if kind != input.unreduced_kind() => {
+                    return Err(TypeError::invalid(format!(
+                        "`{}` inputs must be unreduced with the same kind but got `{}` and `{}`",
+                        CONCATENATE_OPERATION_NAME,
+                        kind,
+                        input.unreduced_kind(),
+                    )));
+                }
+                _ => unreduced_kind = Some(input.unreduced_kind()),
+            }
+        }
 
         let Some(sharding) = input.sharding().filter(|sharding| sharding.mesh().rank() > 0) else {
             continue;
@@ -1445,6 +1460,7 @@ fn infer_concatenation_sharding(inputs: &[&ArrayType]) -> Result<Option<Sharding
     let Some(spatial_sharding) = spatial_sharding else { return Ok(None) };
     Sharding::new(spatial_sharding.mesh().clone(), spatial_sharding.dimensions().to_vec())
         .and_then(|sharding| sharding.with_unreduced_axes(unreduced_axes.unwrap_or_default()))
+        .and_then(|sharding| sharding.with_unreduced_kind(unreduced_kind.unwrap_or_default()))
         .and_then(|sharding| sharding.with_reduced_axes(reduced_axes.unwrap_or_default()))
         .and_then(|sharding| sharding.with_varying_manual_axes(varying_manual_axes))
         .map(Some)

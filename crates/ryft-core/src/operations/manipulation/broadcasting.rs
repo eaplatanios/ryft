@@ -1652,7 +1652,12 @@ fn validate_broadcast_manual_state(input: Option<&Sharding>, output: Option<&Sha
             .collect::<BTreeSet<_>>()
     };
 
-    if reduction_state(input) != reduction_state(output) {
+    let input_reduction_state = reduction_state(input);
+    let unreduced_kind = |sharding: Option<&Sharding>| sharding.map(Sharding::unreduced_kind).unwrap_or_default();
+    if input_reduction_state != reduction_state(output)
+        || (input_reduction_state.iter().any(|(_, unreduced)| *unreduced)
+            && unreduced_kind(input) != unreduced_kind(output))
+    {
         return Err(TypeError::invalid("broadcasting cannot change manual reduction state"));
     }
 

@@ -604,11 +604,7 @@ impl Sharding {
             return Ok(self.clone());
         }
         let dimensions = permutation.iter().map(|axis| self.dimensions()[*axis].clone()).collect();
-        Sharding::new(self.mesh().clone(), dimensions)
-            .and_then(|sharding| sharding.with_unreduced_axes(self.unreduced_axes().clone()))
-            .and_then(|sharding| sharding.with_reduced_axes(self.reduced_axes().clone()))
-            .and_then(|sharding| sharding.with_varying_manual_axes(self.varying_manual_axes().clone()))
-            .map_err(|error| TypeError::invalid(error.to_string()).into())
+        self.with_dimensions(dimensions).map_err(|error| TypeError::invalid(error.to_string()).into())
     }
 }
 

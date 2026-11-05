@@ -1870,6 +1870,7 @@ impl CastType for ArrayIrType {
                 // Arrays preserve the input value properties and static extents. Layout and explicit placement may
                 // change, while auto/manual placement, manual variation, and reduction state remain constrained.
                 if declared.unreduced_axes() != input.unreduced_axes()
+                    || declared.unreduced_kind() != input.unreduced_kind()
                     || declared.reduced_axes() != input.reduced_axes()
                 {
                     return Err(TypeError::invalid(format!(
@@ -1881,6 +1882,7 @@ impl CastType for ArrayIrType {
                     || input.rank() != output.rank()
                     || input.memory() != output.memory()
                     || input.unreduced_axes() != output.unreduced_axes()
+                    || input.unreduced_kind() != output.unreduced_kind()
                     || input.reduced_axes() != output.reduced_axes()
                     || input.shape().dimensions().iter().zip(output.shape().dimensions()).any(|(input, output)| {
                         matches!(

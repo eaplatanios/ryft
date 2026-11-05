@@ -719,7 +719,9 @@ impl Operation for ParallelRaggedAllToAllOperation {
                 .unwrap_or_default()
         };
         let (unreduced, reduced) = reduction_state(output);
-        if reduction_state(operand) != (unreduced.clone(), reduced.clone()) {
+        if reduction_state(operand) != (unreduced.clone(), reduced.clone())
+            || operand.unreduced_kind() != output.unreduced_kind()
+        {
             return Err(TypeError::invalid(format!(
                 "`{PARALLEL_RAGGED_ALL_TO_ALL_OPERATION_NAME}` `operand` and `output` must carry identical reduction \
                  state",

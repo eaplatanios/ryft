@@ -16,7 +16,7 @@ use crate::differentiation::{
     TransposableOperation, TranspositionContext, TranspositionDriver,
 };
 use crate::interpretation::{InterpretableOperation, InterpretationDriver, MemberInterpretableOperation};
-use crate::macros::check_count;
+use crate::macros::{check_count, check_types};
 use crate::operations::Capability;
 use crate::operations::arithmetic::{AddOperation, Div, Mul, Rem};
 use crate::operations::assertions::Assert;
@@ -295,6 +295,13 @@ impl ParallelAllGatherOperation {
         // Reduction state is diagnosed before the variation check below, whose diagnostic suggests a `parallel_vary`
         // transition that would also reject it.
         self.validate_input_reduction_state(input_type)?;
+
+        // A reduced output is the cotangent dual of a pending sum (i.e., this gather transposes a sum scatter),
+        // so, as in JAX, the pending reductions that it keeps over the other axes must be sums as well.
+        if matches!(self.output_variance, ParallelAllGatherOutputVariance::Reduced) {
+            check_types!(@sum_unreduced, PARALLEL_ALL_GATHER_OPERATION_NAME, [input_type]);
+        }
+
         let input_sharding = input_type.sharding().unwrap();
 
         // Gathering an input that is still invariant over an axis would concatenate identical copies under a type that

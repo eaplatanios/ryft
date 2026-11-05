@@ -1542,6 +1542,7 @@ impl<Stored: Value<Type = ArrayType>> Gather<Stored> for ArrayType {
         }
 
         let unreduced_axes = input_sharding.map(Sharding::unreduced_axes).cloned().unwrap_or_default();
+        let unreduced_kind = input.unreduced_kind();
         let reduced_axes = input_sharding.map(Sharding::reduced_axes).cloned().unwrap_or_default();
         let mut varying_manual_axes = input_sharding.map(Sharding::varying_manual_axes).cloned().unwrap_or_default();
         if let Some(sharding) = indices_sharding {
@@ -1577,6 +1578,7 @@ impl<Stored: Value<Type = ArrayType>> Gather<Stored> for ArrayType {
             }
 
             if requested.unreduced_axes() != &unreduced_axes
+                || requested.unreduced_kind() != unreduced_kind
                 || requested.reduced_axes() != &reduced_axes
                 || requested.varying_manual_axes() != &varying_manual_axes
             {
@@ -1694,6 +1696,8 @@ impl<Stored: Value<Type = ArrayType>> Gather<Stored> for ArrayType {
             let sharding = Sharding::new(mesh, placement)
                 .map_err(&map_sharding_error)?
                 .with_unreduced_axes(unreduced_axes)
+                .map_err(&map_sharding_error)?
+                .with_unreduced_kind(unreduced_kind)
                 .map_err(&map_sharding_error)?
                 .with_reduced_axes(reduced_axes)
                 .map_err(&map_sharding_error)?

@@ -4103,7 +4103,10 @@ fn infer_update_slice_output_sharding(
     let input_reduced = input.sharding().map(Sharding::reduced_axes).cloned().unwrap_or_default();
     let update_unreduced = update.sharding().map(Sharding::unreduced_axes).cloned().unwrap_or_default();
     let update_reduced = update.sharding().map(Sharding::reduced_axes).cloned().unwrap_or_default();
-    if input_unreduced != update_unreduced || input_reduced != update_reduced {
+    if input_unreduced != update_unreduced
+        || input.unreduced_kind() != update.unreduced_kind()
+        || input_reduced != update_reduced
+    {
         return Err(TypeError::invalid(format!(
             "`{operation_name}` input and update must carry identical reduction state",
         )));

@@ -21,7 +21,7 @@ use crate::differentiation::{
     ResidualZeroProvider, TransposableOperation,
 };
 use crate::interpretation::{InterpretableOperation, InterpretationDriver};
-use crate::macros::{check_count, impl_differentiable_operation, impl_reference_dischargeable_operation};
+use crate::macros::{check_count, check_types, impl_differentiable_operation, impl_reference_dischargeable_operation};
 use crate::operations::Capability;
 use crate::operations::arithmetic::{Add, SaturatingSubOperation};
 use crate::operations::assertions::Assert;
@@ -2090,6 +2090,9 @@ fn validate_padding_value_sharding(input: &ArrayType, padding_value: &ArrayType)
         ))
         .into());
     }
+
+    // Padding is jointly linear in the input and the padding value, so (as in JAX) it commutes only with pending sums.
+    check_types!(@sum_unreduced, PAD_OPERATION_NAME, [input, padding_value]);
 
     let input_varying_manual_axes = input.sharding().map(|sharding| sharding.varying_manual_axes());
     let padding_varying_manual_axes = padding_value.sharding().map(|sharding| sharding.varying_manual_axes());
