@@ -833,10 +833,11 @@ mod tests {
             .with_reduced_axes(["reduced"])
             .unwrap();
         let invariant = ArrayType::new_static(DataType::F64, [4, 3])
-            .with_layout(Layout::Strided(StridedLayout::new(vec![1, 4])))
+            .with_layout(Layout::Strided(StridedLayout::new(vec![8, 32])))
             .with_memory(Memory::Host { pinned: true })
             .with_sharding(sharding.clone())
             .unwrap();
+        assert_eq!(invariant.validate_layout(), Ok(()));
         let reduced = invariant
             .clone()
             .with_sharding(sharding.clone().with_reduced_axes(["m", "reduced"]).unwrap())
@@ -872,7 +873,8 @@ mod tests {
             ),
             Err(ProgramError::UnsupportedOperation {
                 message: format!(
-                    "`{PARALLEL_CAST_OPERATION_NAME}` along manual mesh axis `m` requires an execution backend owning the mesh",
+                    "`{PARALLEL_CAST_OPERATION_NAME}` along manual mesh axis `m` requires an execution backend \
+                     owning the mesh",
                 ),
             }),
         );
@@ -887,10 +889,10 @@ mod tests {
         assert_eq!(
             program.to_string(),
             formatdoc! {"
-            lambda %0:{INVARIANT} .
-            let %1:{REDUCED} = parallel_cast [axis_name=\"m\", target=reduced] %0
-            in (%1)"
-            }
+                lambda %0:{INVARIANT} .
+                let %1:{REDUCED} = parallel_cast [axis_name=\"m\", target=reduced] %0
+                in (%1)"
+            },
         );
         let constant = Array::from_elements(invariant, &[2f32]).unwrap();
         let evaluation = program.to_flat_program().partially_evaluate(&[PartialValue::Known(constant)]).unwrap();
@@ -899,10 +901,10 @@ mod tests {
         assert_eq!(
             evaluation.program().to_string(),
             formatdoc! {"
-            lambda %0:{INVARIANT} .
-            let %1:{REDUCED} = parallel_cast [axis_name=\"m\", target=reduced] %0
-            in (%1)"
-            }
+                lambda %0:{INVARIANT} .
+                let %1:{REDUCED} = parallel_cast [axis_name=\"m\", target=reduced] %0
+                in (%1)"
+            },
         );
     }
 
@@ -931,10 +933,10 @@ mod tests {
         assert_eq!(
             program.to_string(),
             formatdoc! {"
-            lambda %0:{INVARIANT} .
-            let %1:{REDUCED} = parallel_cast [axis_name=\"m\", target=reduced] %0
-            in (%1)"
-            }
+                lambda %0:{INVARIANT} .
+                let %1:{REDUCED} = parallel_cast [axis_name=\"m\", target=reduced] %0
+                in (%1)"
+            },
         );
     }
 
@@ -969,10 +971,10 @@ mod tests {
         assert_eq!(
             program.to_string(),
             formatdoc! {"
-            lambda %0:{INVARIANT} .
-            let %1:{REDUCED} = parallel_cast [axis_name=\"m\", target=reduced] %0
-            in (%1)"
-            }
+                lambda %0:{INVARIANT} .
+                let %1:{REDUCED} = parallel_cast [axis_name=\"m\", target=reduced] %0
+                in (%1)"
+            },
         );
     }
 
@@ -1005,12 +1007,12 @@ mod tests {
         assert_eq!(
             program.to_string(),
             formatdoc! {"
-            lambda %0:f32[3, 2][sharding={{mesh<['m'=2:manual, 'outer'=2:manual]>, [{{}}, {{}}]}}], %1:{INVARIANT} .
-            let %2:f32[3, 2][sharding={{mesh<['m'=2:manual, 'outer'=2:manual]>, [{{}}, {{}}], reduced={{'m'}}}}] = \
-                    parallel_cast [axis_name=\"m\", target=reduced] %0
-                %3:{REDUCED} = parallel_cast [axis_name=\"m\", target=reduced] %1
-            in (%2, %3)"
-            }
+                lambda %0:f32[3, 2][sharding={{mesh<['m'=2:manual, 'outer'=2:manual]>, [{{}}, {{}}]}}], %1:{INVARIANT} .
+                let %2:f32[3, 2][sharding={{mesh<['m'=2:manual, 'outer'=2:manual]>, [{{}}, {{}}], reduced={{'m'}}}}] = \
+                        parallel_cast [axis_name=\"m\", target=reduced] %0
+                    %3:{REDUCED} = parallel_cast [axis_name=\"m\", target=reduced] %1
+                in (%2, %3)"
+            },
         );
     }
 
@@ -1048,11 +1050,12 @@ mod tests {
         assert_eq!(
             program.to_string(),
             indoc! {"
-            lambda %0:dimension<items ∈ [0, 4)>, %1:f32[items][sharding={mesh<['m'=2:manual, 'outer'=2:manual]>, [{}]}] .
-            let %2:f32[items][sharding={mesh<['m'=2:manual, 'outer'=2:manual]>, [{}], reduced={'m'}}] = \
-                    parallel_cast [axis_name=\"m\", target=reduced] %1
-            in (%2)"
-            }
+                lambda %0:dimension<items ∈ [0, 4)>, \
+                %1:f32[items][sharding={mesh<['m'=2:manual, 'outer'=2:manual]>, [{}]}] .
+                let %2:f32[items][sharding={mesh<['m'=2:manual, 'outer'=2:manual]>, [{}], reduced={'m'}}] = \
+                        parallel_cast [axis_name=\"m\", target=reduced] %1
+                in (%2)"
+            },
         );
     }
 
@@ -1085,21 +1088,21 @@ mod tests {
             assert_eq!(
                 program.to_string(),
                 formatdoc! {"
-                lambda %0:{source} .
-                let %1:{output} = parallel_cast [axis_name=\"m\", target={target}] %0
-                in (%1)"
-                }
+                    lambda %0:{source} .
+                    let %1:{output} = parallel_cast [axis_name=\"m\", target={target}] %0
+                    in (%1)"
+                },
             );
             let differentiated = program.to_flat_program().jvp().unwrap();
             assert_eq!(differentiated.output_types(), vec![case.output_type.clone(), case.output_type]);
             assert_eq!(
                 differentiated.to_string(),
                 formatdoc! {"
-                lambda %0:{source}, %1:{source} .
-                let %2:{output} = parallel_cast [axis_name=\"m\", target={target}] %0
-                    %3:{output} = parallel_cast [axis_name=\"m\", target={target}] %1
-                in (%2, %3)"
-                }
+                    lambda %0:{source}, %1:{source} .
+                    let %2:{output} = parallel_cast [axis_name=\"m\", target={target}] %0
+                        %3:{output} = parallel_cast [axis_name=\"m\", target={target}] %1
+                    in (%2, %3)"
+                },
             );
         }
     }
@@ -1114,21 +1117,21 @@ mod tests {
             assert_eq!(
                 program.to_string(),
                 formatdoc! {"
-                lambda %0:{source} .
-                let %1:{output} = parallel_cast [axis_name=\"m\", target={target}] %0
-                in (%1)"
-                }
+                    lambda %0:{source} .
+                    let %1:{output} = parallel_cast [axis_name=\"m\", target={target}] %0
+                    in (%1)"
+                },
             );
             let differentiated = program.to_flat_program().jvp_with_respect_to(&[]).unwrap();
             assert_eq!(differentiated.output_types(), vec![case.output_type.clone(), case.output_type]);
             assert_eq!(
                 differentiated.to_string(),
                 formatdoc! {"
-                lambda %0:{source} .
-                let %1:{output} = parallel_cast [axis_name=\"m\", target={target}] %0
-                    %2:{output} = zero [type={output}]
-                in (%1, %2)"
-                }
+                    lambda %0:{source} .
+                    let %1:{output} = parallel_cast [axis_name=\"m\", target={target}] %0
+                        %2:{output} = zero [type={output}]
+                    in (%1, %2)"
+                },
             );
         }
     }
@@ -1210,9 +1213,9 @@ mod tests {
         assert_eq!(
             program.to_string(),
             formatdoc! {"
-            lambda %0:{UNREDUCED} .
-            in (%0)"
-            }
+                lambda %0:{UNREDUCED} .
+                in (%0)"
+            },
         );
     }
 
@@ -1233,10 +1236,10 @@ mod tests {
             assert_eq!(
                 program.to_string(),
                 formatdoc! {"
-                lambda %0:{source} .
-                let %1:{output} = parallel_cast [axis_name=\"m\", target={target}] %0
-                in (%1)"
-                }
+                    lambda %0:{source} .
+                    let %1:{output} = parallel_cast [axis_name=\"m\", target={target}] %0
+                    in (%1)"
+                },
             );
         }
     }
@@ -1265,10 +1268,10 @@ mod tests {
         assert_eq!(
             program.to_string(),
             formatdoc! {"
-            lambda %0:{INVARIANT} .
-            let %1:{VARYING} = parallel_vary [axis_name=\"m\"] %0
-            in (%1)"
-            }
+                lambda %0:{INVARIANT} .
+                let %1:{VARYING} = parallel_vary [axis_name=\"m\"] %0
+                in (%1)"
+            },
         );
     }
 
@@ -1286,14 +1289,14 @@ mod tests {
         assert_eq!(
             program.to_string(),
             formatdoc! {"
-            lambda %0:f32[] .
-            let %1:{INVARIANT} = broadcast [
-                output_type={INVARIANT},
-                output_axes=[],
-            ] %0
-                %2:{REDUCED} = parallel_cast [axis_name=\"m\", target=reduced] %1
-            in (%2)"
-            }
+                lambda %0:f32[] .
+                let %1:{INVARIANT} = broadcast [
+                    output_type={INVARIANT},
+                    output_axes=[],
+                ] %0
+                    %2:{REDUCED} = parallel_cast [axis_name=\"m\", target=reduced] %1
+                in (%2)"
+            },
         );
     }
 
@@ -1320,9 +1323,9 @@ mod tests {
                 assert_eq!(
                     program.to_string(),
                     formatdoc! {"
-                    lambda %0:{input_text} .
-                    in (%0)"
-                    }
+                        lambda %0:{input_text} .
+                        in (%0)"
+                    },
                 );
             }
         }
@@ -1396,10 +1399,10 @@ mod tests {
         assert_eq!(
             program.to_string(),
             formatdoc! {"
-            lambda %0:{INVARIANT} .
-            let %1:{REDUCED} = parallel_cast [axis_name=\"m\", target=reduced] %0
-            in (%1)"
-            }
+                lambda %0:{INVARIANT} .
+                let %1:{REDUCED} = parallel_cast [axis_name=\"m\", target=reduced] %0
+                in (%1)"
+            },
         );
     }
 

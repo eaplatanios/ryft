@@ -1595,7 +1595,7 @@ mod tests {
                     )?;
                     Ok(output.into_value())
                 })?;
-                ValueProjection::<ArrayType>::into_projected(gradient)
+                Ok(ValueProjection::<ArrayType>::into_projected(gradient)?)
             },
             ArrayType::scalar(DataType::F32).with_sharding(replicated).unwrap(),
         )
