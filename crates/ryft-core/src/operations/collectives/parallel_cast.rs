@@ -523,23 +523,58 @@ impl<
 
 #[cfg(test)]
 mod tests {
-    use indoc::indoc;
+    use std::collections::HashMap;
+
+    use indoc::{formatdoc, indoc};
     use pretty_assertions::assert_eq;
 
-    use crate::arrays::{ArrayIrValue, DataType, LogicalMesh, MeshAxis};
+    use crate::arrays::{
+        ArrayIrValue, ArrayReference, DataType, Dimension, DimensionBounds, DimensionType, DimensionValue,
+        DimensionVariable, DynamicArrayExtentBatchingPolicy, Layout, LogicalMesh, Memory, MeshAxis, Shape,
+        ShardingDimension, StridedLayout,
+    };
     use crate::batching::BatchAxis;
-    use crate::contexts::{EagerContext, StagingContext};
-    use crate::differentiation::DifferentiableType;
+    use crate::contexts::{EagerContext, ProjectedContext, StagingContext};
+    use crate::differentiation::{DifferentiableType, TransposableOperation, TranspositionContext};
     use crate::macros::check_operation_type_inference;
     use crate::parameters::Placeholder;
-    use crate::partial::{PartialEvaluationOutput, PartialValue};
-    use crate::programs::{EmptyRegionDriver, ProgramBuilder, TypedProgram};
-    use crate::tracing::TracingContext;
+    use crate::partial::{PartialEvaluationContext, PartialEvaluationOutput, PartialEvaluationValue, PartialValue};
+    use crate::programs::{EmptyRegionDriver, Program, ProgramBuilder, TypedProgram, ValueProjection};
+    use crate::tracing::{Tracer, TracingContext};
 
     use super::*;
 
-    /// Creates the invariant, varying, reduced, and unreduced types of one local scalar along the manual axis `m` of
-    /// a mesh that also has a manual axis `outer`.
+    /// Expected scalar annotations kept independent of the inferred types used to construct each fixture.
+    const INVARIANT: &str = "f32[][sharding={mesh<['m'=2:manual, 'outer'=2:manual]>, []}]";
+    const VARYING: &str = "f32[][sharding={mesh<['m'=2:manual, 'outer'=2:manual]>, [], varying_manual={'m'}}]";
+    const REDUCED: &str = "f32[][sharding={mesh<['m'=2:manual, 'outer'=2:manual]>, [], reduced={'m'}}]";
+    const UNREDUCED: &str = "f32[][sharding={mesh<['m'=2:manual, 'outer'=2:manual]>, [], unreduced={'m'}}]";
+
+    /// One supported primitive transition and its independently specified rendered boundary types.
+    struct CastCase {
+        /// Target selected by the primitive.
+        target: ParallelCastTarget,
+
+        /// Source type accepted by that target.
+        input_type: ArrayType,
+
+        /// Result type produced by that target.
+        output_type: ArrayType,
+
+        /// Expected source annotation in a complete program snapshot.
+        input_text: &'static str,
+
+        /// Expected result annotation in a complete program snapshot.
+        output_text: &'static str,
+
+        /// Expected incoming cotangent annotation in the transposed program.
+        output_cotangent_text: &'static str,
+
+        /// Expected outgoing cotangent annotation in the transposed program.
+        input_cotangent_text: &'static str,
+    }
+
+    /// Creates the invariant, varying, reduced, and unreduced types of a scalar along manual axis `m`.
     fn scalar_types() -> (ArrayType, ArrayType, ArrayType, ArrayType) {
         let mesh = LogicalMesh::new(vec![
             MeshAxis::new("m", 2, MeshAxisType::Manual).unwrap(),
@@ -547,31 +582,73 @@ mod tests {
         ])
         .unwrap();
         let sharding = Sharding::replicated(mesh, 0);
-        let scalar = |sharding: Sharding| ArrayType::scalar(DataType::F32).with_sharding(sharding).unwrap();
         (
-            scalar(sharding.clone()),
-            scalar(sharding.clone().with_varying_manual_axes(["m"]).unwrap()),
-            scalar(sharding.clone().with_reduced_axes(["m"]).unwrap()),
-            scalar(sharding.with_unreduced_axes(["m"]).unwrap()),
+            ArrayType::scalar(DataType::F32).with_sharding(sharding.clone()).unwrap(),
+            ArrayType::scalar(DataType::F32)
+                .with_sharding(sharding.clone().with_varying_manual_axes(["m"]).unwrap())
+                .unwrap(),
+            ArrayType::scalar(DataType::F32)
+                .with_sharding(sharding.clone().with_reduced_axes(["m"]).unwrap())
+                .unwrap(),
+            ArrayType::scalar(DataType::F32)
+                .with_sharding(sharding.with_unreduced_axes(["m"]).unwrap())
+                .unwrap(),
         )
     }
 
-    /// Binds `"m"` and `"outer"` as manual axes of `mesh`, optionally without manual-variation checks.
+    /// Lists the three primitive transitions and their cotangent boundary contracts.
+    fn cast_cases() -> [CastCase; 3] {
+        let (invariant, varying, reduced, unreduced) = scalar_types();
+        [
+            CastCase {
+                target: ParallelCastTarget::Reduced,
+                input_type: invariant,
+                output_type: reduced.clone(),
+                input_text: INVARIANT,
+                output_text: REDUCED,
+                output_cotangent_text: UNREDUCED,
+                input_cotangent_text: INVARIANT,
+            },
+            CastCase {
+                target: ParallelCastTarget::Varying,
+                input_type: reduced,
+                output_type: varying.clone(),
+                input_text: REDUCED,
+                output_text: VARYING,
+                output_cotangent_text: VARYING,
+                input_cotangent_text: UNREDUCED,
+            },
+            CastCase {
+                target: ParallelCastTarget::Unreduced,
+                input_type: varying,
+                output_type: unreduced,
+                input_text: VARYING,
+                output_text: UNREDUCED,
+                output_cotangent_text: REDUCED,
+                input_cotangent_text: VARYING,
+            },
+        ]
+    }
+
+    /// Binds both axes of the scalar fixture's mesh, with the requested variation-checking policy.
     fn manual_mesh_axes(mesh: &LogicalMesh, checks_manual_variation: bool) -> Vec<(String, NamedAxis)> {
-        ["m", "outer"]
-            .into_iter()
+        mesh.axes()
+            .iter()
             .enumerate()
-            .map(|(axis, name)| {
-                (name.to_string(), NamedAxis::Mesh { mesh: mesh.clone(), axis, size: 2, checks_manual_variation })
+            .map(|(axis, metadata)| {
+                (
+                    metadata.name().to_string(),
+                    NamedAxis::Mesh { mesh: mesh.clone(), axis, size: metadata.size(), checks_manual_variation },
+                )
             })
             .collect()
     }
 
-    /// Builds a program that applies `operation` to one input of type `input_type`.
+    /// Builds the single-instruction source program for operation and transform assertions.
     fn cast_program(
         operation: ParallelCastOperation,
         input_type: ArrayType,
-    ) -> crate::Program<Array, ArrayOperation<Array>, Array, Array> {
+    ) -> Program<Array, ArrayOperation<Array>, Array, Array> {
         let mut builder = ProgramBuilder::<Array, ArrayOperation<Array>>::new();
         let input = builder.add_input(input_type);
         let output = builder.add_instruction(operation, Vec::new(), vec![input], None).unwrap()[0];
@@ -579,19 +656,70 @@ mod tests {
     }
 
     #[test]
-    fn test_parallel_cast() {
-        for (target, rendered) in [
-            (ParallelCastTarget::Reduced, "reduced"),
+    fn test_parallel_cast_target_display() {
+        for (target, display, debug) in [
+            (ParallelCastTarget::Reduced, "reduced", "Reduced"),
+            (ParallelCastTarget::Varying, "varying", "Varying"),
+            (ParallelCastTarget::Unreduced, "unreduced", "Unreduced"),
+        ] {
+            assert_eq!(target.to_string(), display);
+            assert_eq!(format!("{target:?}"), debug);
+        }
+    }
+
+    #[test]
+    fn test_parallel_cast_target_equality_and_hash() {
+        let target = ParallelCastTarget::Reduced;
+        assert_eq!(target, target);
+        assert_ne!(target, ParallelCastTarget::Varying);
+        assert_ne!(target, ParallelCastTarget::Unreduced);
+        assert_ne!(ParallelCastTarget::Varying, ParallelCastTarget::Unreduced);
+        let targets = HashMap::from([
+            (target, "reduced"),
             (ParallelCastTarget::Varying, "varying"),
             (ParallelCastTarget::Unreduced, "unreduced"),
-        ] {
-            let operation = ParallelCastOperation::new("m".to_string(), target);
-            assert_eq!(operation.name(), PARALLEL_CAST_OPERATION_NAME);
-            assert_eq!(operation.axis_name(), "m");
-            assert_eq!(operation.target(), target);
-            assert_eq!(target.to_string(), rendered);
-            assert_eq!(operation.to_string(), format!("parallel_cast [axis_name=\"m\", target={rendered}]"));
-        }
+        ]);
+        assert_eq!(targets.len(), 3);
+        assert_eq!(targets.get(&ParallelCastTarget::Reduced), Some(&"reduced"));
+        assert_eq!(targets.get(&ParallelCastTarget::Varying), Some(&"varying"));
+        assert_eq!(targets.get(&ParallelCastTarget::Unreduced), Some(&"unreduced"));
+    }
+
+    #[test]
+    fn test_parallel_cast() {
+        let (invariant, _, _, _) = scalar_types();
+        let operation = ParallelCastOperation::new("m".to_string(), ParallelCastTarget::Reduced);
+        assert_eq!(operation.name(), PARALLEL_CAST_OPERATION_NAME);
+        assert_eq!(operation.axis_name(), "m");
+        assert_eq!(operation.target(), ParallelCastTarget::Reduced);
+        assert_eq!(operation.to_string(), "parallel_cast [axis_name=\"m\", target=reduced]");
+        assert_eq!(format!("{operation:?}"), "ParallelCastOperation { axis_name: \"m\", target: Reduced }",);
+        let program = cast_program(operation, invariant);
+        assert_eq!(
+            program.to_string(),
+            indoc! {"
+                lambda %0:f32[][sharding={mesh<['m'=2:manual, 'outer'=2:manual]>, []}] .
+                let %1:f32[][sharding={mesh<['m'=2:manual, 'outer'=2:manual]>, [], reduced={'m'}}] = \
+                        parallel_cast [axis_name=\"m\", target=reduced] %0
+                in (%1)"
+            },
+        );
+    }
+
+    #[test]
+    fn test_parallel_cast_equality_and_hash() {
+        let operation = ParallelCastOperation::new("m".to_string(), ParallelCastTarget::Reduced);
+        let same = ParallelCastOperation::new("m".to_string(), ParallelCastTarget::Reduced);
+        let other_axis = ParallelCastOperation::new("outer".to_string(), ParallelCastTarget::Reduced);
+        let other_target = ParallelCastOperation::new("m".to_string(), ParallelCastTarget::Varying);
+        assert_eq!(operation, operation);
+        assert_eq!(operation, same);
+        assert_ne!(operation, other_axis);
+        assert_ne!(operation, other_target);
+        let operations = HashMap::from([(operation, 0), (other_axis.clone(), 1), (other_target.clone(), 2)]);
+        assert_eq!(operations.get(&same), Some(&0));
+        assert_eq!(operations.get(&other_axis), Some(&1));
+        assert_eq!(operations.get(&other_target), Some(&2));
     }
 
     #[test]
@@ -600,340 +728,662 @@ mod tests {
         check_operation_type_inference!(
             operation = ParallelCastOperation::new("m".to_string(), ParallelCastTarget::Reduced),
             cases = [{
-                input_types = [invariant.clone()],
-                output_types = [reduced.clone()],
+                input_types = [invariant.clone()], output_types = [reduced.clone()],
             }, {
                 input_types = [varying.clone()],
-                error = "`parallel_cast` to `reduced` requires an input that is invariant along manual axis `m` but got \
-                         one that is varying",
+                error = format!("`{PARALLEL_CAST_OPERATION_NAME}` to `reduced` requires an input that is invariant \
+                                 along manual axis `m` but got one that is varying"),
             }, {
                 input_types = [reduced.clone()],
-                error = "`parallel_cast` to `reduced` requires an input that is invariant along manual axis `m` but got \
-                         one that is reduced",
+                error = format!("`{PARALLEL_CAST_OPERATION_NAME}` to `reduced` requires an input that is invariant \
+                                 along manual axis `m` but got one that is reduced"),
             }, {
-                input_types = [ArrayType::scalar(DataType::F32)],
-                error = "`parallel_cast` input must carry a mesh containing manual axis `m`",
-            }, {
-                input_types = [],
-                error = "expected 1 input but got 0",
+                input_types = [unreduced.clone()],
+                error = format!("`{PARALLEL_CAST_OPERATION_NAME}` to `reduced` requires an input that is invariant \
+                                 along manual axis `m` but got one that is unreduced"),
             }],
         );
         check_operation_type_inference!(
             operation = ParallelCastOperation::new("m".to_string(), ParallelCastTarget::Varying),
             cases = [{
-                input_types = [reduced.clone()],
-                output_types = [varying.clone()],
+                input_types = [reduced.clone()], output_types = [varying.clone()],
             }, {
                 input_types = [invariant.clone()],
-                error = "`parallel_cast` to `varying` requires an input that is reduced along manual axis `m` but got \
-                         one that is invariant; use `parallel_vary` to make an invariant value varying",
+                error = format!("`{PARALLEL_CAST_OPERATION_NAME}` to `varying` requires an input that is reduced \
+                                 along manual axis `m` but got one that is invariant; use `parallel_vary` to make an \
+                                 invariant value varying"),
+            }, {
+                input_types = [varying.clone()],
+                error = format!("`{PARALLEL_CAST_OPERATION_NAME}` to `varying` requires an input that is reduced \
+                                 along manual axis `m` but got one that is varying"),
             }, {
                 input_types = [unreduced.clone()],
-                error = "`parallel_cast` to `varying` requires an input that is reduced along manual axis `m` but got \
-                         one that is unreduced",
+                error = format!("`{PARALLEL_CAST_OPERATION_NAME}` to `varying` requires an input that is reduced \
+                                 along manual axis `m` but got one that is unreduced"),
             }],
         );
         check_operation_type_inference!(
             operation = ParallelCastOperation::new("m".to_string(), ParallelCastTarget::Unreduced),
             cases = [{
-                input_types = [varying.clone()],
-                output_types = [unreduced.clone()],
+                input_types = [varying], output_types = [unreduced.clone()],
             }, {
-                input_types = [invariant.clone()],
-                error = "`parallel_cast` to `unreduced` requires an input that is varying along manual axis `m` but got \
-                         one that is invariant",
+                input_types = [invariant],
+                error = format!("`{PARALLEL_CAST_OPERATION_NAME}` to `unreduced` requires an input that is varying \
+                                 along manual axis `m` but got one that is invariant"),
+            }, {
+                input_types = [reduced],
+                error = format!("`{PARALLEL_CAST_OPERATION_NAME}` to `unreduced` requires an input that is varying \
+                                 along manual axis `m` but got one that is reduced"),
+            }, {
+                input_types = [unreduced],
+                error = format!("`{PARALLEL_CAST_OPERATION_NAME}` to `unreduced` requires an input that is varying \
+                                 along manual axis `m` but got one that is unreduced"),
             }],
         );
+    }
 
-        // The axis must be a manual axis of the input's mesh.
+    #[test]
+    fn test_parallel_cast_type_inference_rejects_invalid_axes() {
+        let (invariant, _, _, _) = scalar_types();
         check_operation_type_inference!(
             operation = ParallelCastOperation::new("missing".to_string(), ParallelCastTarget::Reduced),
-            cases = [{ input_types = [invariant], error = "`parallel_cast` axis `missing` must be manual" }],
+            cases = [{
+                input_types = [invariant],
+                error = format!("`{PARALLEL_CAST_OPERATION_NAME}` axis `missing` must be manual"),
+            }],
+        );
+        let explicit = LogicalMesh::new(vec![MeshAxis::new("m", 2, MeshAxisType::Explicit).unwrap()]).unwrap();
+        let automatic = LogicalMesh::new(vec![MeshAxis::new("m", 2, MeshAxisType::Auto).unwrap()]).unwrap();
+        check_operation_type_inference!(
+            operation = ParallelCastOperation::new("m".to_string(), ParallelCastTarget::Reduced),
+            cases = [{
+                input_types = [ArrayType::scalar(DataType::F32)],
+                error = format!("`{PARALLEL_CAST_OPERATION_NAME}` input must carry a mesh containing manual axis `m`"),
+            }, {
+                input_types = [ArrayType::scalar(DataType::F32)
+                    .with_sharding(Sharding::replicated(explicit, 0)).unwrap()],
+                error = format!("`{PARALLEL_CAST_OPERATION_NAME}` axis `m` must be manual"),
+            }, {
+                input_types = [ArrayType::scalar(DataType::F32)
+                    .with_sharding(Sharding::replicated(automatic, 0)).unwrap()],
+                error = format!("`{PARALLEL_CAST_OPERATION_NAME}` axis `m` must be manual"),
+            }, {
+                input_types = [], error = "expected 1 input but got 0",
+            }],
         );
     }
 
     #[test]
     fn test_parallel_cast_type_inference_preserves_unrelated_state() {
-        // Only the state of the selected axis changes. Placement, local shape, and the state of other axes are kept.
-        let (invariant, _, _, _) = scalar_types();
-        let sharding = invariant.sharding().unwrap().clone();
-        let with = |sharding: Sharding| ArrayType::new_static(DataType::F32, [3]).with_sharding(sharding).unwrap();
-        let base = Sharding::replicated(sharding.mesh().clone(), 1).with_unreduced_axes(["outer"]).unwrap();
+        // The selected axis changes state while nontrivial placement, storage metadata, and all other states survive.
+        let mesh = LogicalMesh::new(vec![
+            MeshAxis::new("m", 2, MeshAxisType::Manual).unwrap(),
+            MeshAxis::new("varying", 2, MeshAxisType::Manual).unwrap(),
+            MeshAxis::new("unreduced", 2, MeshAxisType::Manual).unwrap(),
+            MeshAxis::new("reduced", 2, MeshAxisType::Manual).unwrap(),
+            MeshAxis::new("data", 2, MeshAxisType::Explicit).unwrap(),
+        ])
+        .unwrap();
+        let sharding = Sharding::new(mesh, vec![ShardingDimension::sharded(["data"]), ShardingDimension::replicated()])
+            .unwrap()
+            .with_varying_manual_axes(["varying"])
+            .unwrap()
+            .with_unreduced_axes(["unreduced"])
+            .unwrap()
+            .with_reduced_axes(["reduced"])
+            .unwrap();
+        let invariant = ArrayType::new_static(DataType::F64, [4, 3])
+            .with_layout(Layout::Strided(StridedLayout::new(vec![1, 4])))
+            .with_memory(Memory::Host { pinned: true })
+            .with_sharding(sharding.clone())
+            .unwrap();
+        let reduced = invariant
+            .clone()
+            .with_sharding(sharding.clone().with_reduced_axes(["m", "reduced"]).unwrap())
+            .unwrap();
+        let varying = invariant
+            .clone()
+            .with_sharding(sharding.clone().with_varying_manual_axes(["m", "varying"]).unwrap())
+            .unwrap();
+        let unreduced =
+            invariant.clone().with_sharding(sharding.with_unreduced_axes(["m", "unreduced"]).unwrap()).unwrap();
         check_operation_type_inference!(
             operation = ParallelCastOperation::new("m".to_string(), ParallelCastTarget::Reduced),
-            cases = [{
-                input_types = [with(base.clone())],
-                output_types = [with(base.clone().with_reduced_axes(["m"]).unwrap())],
-            }],
+            cases = [{ input_types = [invariant], output_types = [reduced.clone()] }],
         );
-        let base = Sharding::replicated(sharding.mesh().clone(), 1).with_varying_manual_axes(["outer"]).unwrap();
+        check_operation_type_inference!(
+            operation = ParallelCastOperation::new("m".to_string(), ParallelCastTarget::Varying),
+            cases = [{ input_types = [reduced], output_types = [varying.clone()] }],
+        );
         check_operation_type_inference!(
             operation = ParallelCastOperation::new("m".to_string(), ParallelCastTarget::Unreduced),
-            cases = [{
-                input_types = [with(base.clone().with_varying_manual_axes(["m", "outer"]).unwrap())],
-                output_types = [with(base.with_unreduced_axes(["m"]).unwrap())],
-            }],
+            cases = [{ input_types = [varying], output_types = [unreduced] }],
         );
     }
 
     #[test]
     fn test_parallel_cast_interpretation() {
-        // A concrete `Array` never executes inside a manual region, so eager interpretation reports unsupported
-        // execution.
         let (invariant, _, _, _) = scalar_types();
         assert_eq!(
             ParallelCastOperation::new("m".to_string(), ParallelCastTarget::Reduced).interpret(
                 &EagerContext::<Array>::new(),
                 &EmptyRegionDriver,
-                &[Array::from_elements(invariant, &[2.0f32]).unwrap()],
+                &[Array::from_elements(invariant, &[2f32]).unwrap()],
             ),
             Err(ProgramError::UnsupportedOperation {
-                message: "`parallel_cast` along manual mesh axis `m` requires an execution backend owning the mesh"
-                    .to_string(),
+                message: format!(
+                    "`{PARALLEL_CAST_OPERATION_NAME}` along manual mesh axis `m` requires an execution backend owning the mesh",
+                ),
             }),
         );
     }
 
     #[test]
     fn test_parallel_cast_partial_evaluation() {
-        // Folding a known input would interpret the cast eagerly, which a concrete `Array` does not support, so partial
-        // evaluation retains the cast for the backend that owns the mesh.
+        // Eager known values cannot execute a manual cast, so the known input becomes a residual input.
         let (invariant, _, reduced, _) = scalar_types();
         let program =
             cast_program(ParallelCastOperation::new("m".to_string(), ParallelCastTarget::Reduced), invariant.clone());
-        let constant = Array::from_elements(invariant, &[2.0f32]).unwrap();
+        assert_eq!(
+            program.to_string(),
+            formatdoc! {"
+            lambda %0:{INVARIANT} .
+            let %1:{REDUCED} = parallel_cast [axis_name=\"m\", target=reduced] %0
+            in (%1)"
+            }
+        );
+        let constant = Array::from_elements(invariant, &[2f32]).unwrap();
         let evaluation = program.to_flat_program().partially_evaluate(&[PartialValue::Known(constant)]).unwrap();
         assert_eq!(evaluation.program().output_types(), vec![reduced]);
+        assert_eq!(evaluation.outputs(), &[PartialEvaluationOutput::Unknown(0)]);
         assert_eq!(
             evaluation.program().to_string(),
-            indoc! {"
-                lambda %0:f32[][sharding={mesh<['m'=2:manual, 'outer'=2:manual]>, []}] .
-                let %1:f32[][sharding={mesh<['m'=2:manual, 'outer'=2:manual]>, [], reduced={'m'}}] = \
-                        parallel_cast [axis_name=\"m\", target=reduced] %0
-                in (%1)"
-            },
+            formatdoc! {"
+            lambda %0:{INVARIANT} .
+            let %1:{REDUCED} = parallel_cast [axis_name=\"m\", target=reduced] %0
+            in (%1)"
+            }
         );
-        assert_eq!(evaluation.outputs(), &[PartialEvaluationOutput::Unknown(0)]);
     }
 
     #[test]
-    fn test_parallel_cast_batching() {
-        // A `batch` level that does not bind the axis name forwards the cast to its parent, preserving the mapped axis.
-        let (invariant, _, _, _) = scalar_types();
+    fn test_parallel_cast_partial_evaluation_known_staging() {
+        // A known tracer stages into its outer context and remains known, unlike an eager Array.
+        let (invariant, _, reduced, _) = scalar_types();
         let trace = TracingContext::<Array, ArrayOperation<Array>>::new();
-        let packed_type = ArrayType::new_static(DataType::F32, [2, 3])
-            .with_sharding(Sharding::replicated(invariant.sharding().unwrap().mesh().clone(), 2))
+        let input = PartialEvaluationValue::known(trace.input(invariant));
+        let context = PartialEvaluationContext::new(trace.clone());
+        let outputs = ParallelCastOperation::new("m".to_string(), ParallelCastTarget::Reduced)
+            .partially_evaluate(&context, &EmptyRegionDriver, &[input])
             .unwrap();
-        let input = ArrayBatch::new(trace.input(packed_type), BatchAxis::new(0)).unwrap();
-        let context = BatchingContext::<_, ArrayBatchingPolicy>::new(trace.clone(), 2);
-        let operation = ParallelCastOperation::new("m".to_string(), ParallelCastTarget::Reduced);
-        let outputs = operation.batch(&context, &EmptyRegionDriver, std::slice::from_ref(&input)).unwrap();
-        assert_eq!(outputs[0].batch_axis(), input.batch_axis());
-        let builder = trace.builder().borrow().clone();
-        let program = builder
+        assert!(outputs[0].is_known());
+        assert_eq!(outputs[0].r#type().as_ref(), &reduced);
+        let program = trace
+            .builder()
+            .borrow()
+            .clone()
             .build::<Vec<Array>, Vec<Array>>(
-                vec![outputs[0].value().atom_id().unwrap()],
+                vec![outputs[0].as_known().unwrap().atom_id().unwrap()],
                 vec![Placeholder],
                 vec![Placeholder],
             )
             .unwrap();
         assert_eq!(
             program.to_string(),
-            indoc! {"
-                lambda %0:f32[2, 3][sharding={mesh<['m'=2:manual, 'outer'=2:manual]>, [{}, {}]}] .
-                let %1:f32[2, 3][sharding={mesh<['m'=2:manual, 'outer'=2:manual]>, [{}, {}], reduced={'m'}}] = \
-                        parallel_cast [axis_name=\"m\", target=reduced] %0
-                in (%1)"
-            },
+            formatdoc! {"
+            lambda %0:{INVARIANT} .
+            let %1:{REDUCED} = parallel_cast [axis_name=\"m\", target=reduced] %0
+            in (%1)"
+            }
         );
+    }
 
-        // A `batch` level that binds the same name has no reduction state to change, so it rejects the cast.
+    #[test]
+    fn test_parallel_cast_partial_evaluation_array_ir() {
+        let (invariant, _, reduced, _) = scalar_types();
+        let operation =
+            ArrayIrOperation::<Array>::from(ParallelCastOperation::new("m".to_string(), ParallelCastTarget::Reduced));
+        let eager = PartialEvaluationContext::new(EagerContext::<ArrayIrValue<Array>, ArrayIrOperation<Array>>::new());
+        let input = PartialEvaluationValue::known(ArrayIrValue::Array(
+            Array::from_elements(invariant.clone(), &[2f32]).unwrap(),
+        ));
+        let outputs = operation.partially_evaluate(&eager, &EmptyRegionDriver, &[input]).unwrap();
+        assert!(outputs[0].is_unknown());
+        assert_eq!(outputs[0].r#type().as_ref(), &ArrayIrType::from(reduced.clone()));
+        let trace = TracingContext::<ArrayIrValue<Array>, ArrayIrOperation<Array>>::new();
+        let input = PartialEvaluationValue::known(trace.input(invariant.into()));
+        let context = PartialEvaluationContext::new(trace.clone());
+        let outputs = operation.partially_evaluate(&context, &EmptyRegionDriver, &[input]).unwrap();
+        assert!(outputs[0].is_known());
+        assert_eq!(outputs[0].r#type().as_ref(), &ArrayIrType::from(reduced));
+        let program = trace
+            .builder()
+            .borrow()
+            .clone()
+            .build::<Vec<ArrayIrValue<Array>>, Vec<ArrayIrValue<Array>>>(
+                vec![outputs[0].as_known().unwrap().atom_id().unwrap()],
+                vec![Placeholder],
+                vec![Placeholder],
+            )
+            .unwrap();
+        assert_eq!(
+            program.to_string(),
+            formatdoc! {"
+            lambda %0:{INVARIANT} .
+            let %1:{REDUCED} = parallel_cast [axis_name=\"m\", target=reduced] %0
+            in (%1)"
+            }
+        );
+    }
+
+    #[test]
+    fn test_parallel_cast_batching() {
+        // Forward both mapped and replicated inputs without introducing or consuming a batch dimension.
+        let (invariant, _, _, _) = scalar_types();
+        let trace = TracingContext::<Array, ArrayOperation<Array>>::new();
+        let packed_type = ArrayType::new_static(DataType::F32, [3, 2])
+            .with_sharding(Sharding::replicated(invariant.sharding().unwrap().mesh().clone(), 2))
+            .unwrap();
+        let mapped = ArrayBatch::new(trace.input(packed_type), BatchAxis::new(1)).unwrap();
+        let replicated = ArrayBatch::replicated(trace.input(invariant));
+        let context = BatchingContext::<_, ArrayBatchingPolicy>::new(trace.clone(), 2).with_axis_name("items".into());
+        let operation = ParallelCastOperation::new("m".to_string(), ParallelCastTarget::Reduced);
+        let mapped = operation.batch(&context, &EmptyRegionDriver, &[mapped]).unwrap().remove(0);
+        let replicated = operation.batch(&context, &EmptyRegionDriver, &[replicated]).unwrap().remove(0);
+        assert_eq!(mapped.batch_axis(), BatchAxis::new(1));
+        assert_eq!(replicated.batch_axis(), BatchAxis::replicated());
+        let program = trace
+            .builder()
+            .borrow()
+            .clone()
+            .build::<Vec<Array>, Vec<Array>>(
+                vec![mapped.value().atom_id().unwrap(), replicated.value().atom_id().unwrap()],
+                vec![Placeholder; 2],
+                vec![Placeholder; 2],
+            )
+            .unwrap();
+        assert_eq!(
+            program.to_string(),
+            formatdoc! {"
+            lambda %0:f32[3, 2][sharding={{mesh<['m'=2:manual, 'outer'=2:manual]>, [{{}}, {{}}]}}], %1:{INVARIANT} .
+            let %2:f32[3, 2][sharding={{mesh<['m'=2:manual, 'outer'=2:manual]>, [{{}}, {{}}], reduced={{'m'}}}}] = \
+                    parallel_cast [axis_name=\"m\", target=reduced] %0
+                %3:{REDUCED} = parallel_cast [axis_name=\"m\", target=reduced] %1
+            in (%2, %3)"
+            }
+        );
+    }
+
+    #[test]
+    fn test_parallel_cast_batching_dynamic_extent() {
+        let (invariant, _, _, _) = scalar_types();
+        let trace = TracingContext::<ArrayIrValue<Array>, ArrayIrOperation<Array>>::new();
+        let length = DimensionVariable::new("items", DimensionBounds::new(0, Some(4)).unwrap());
+        let extent = trace.input(DimensionType::from(length.clone()).into());
+        let packed_type = ArrayType::new(DataType::F32, Shape::new(vec![Dimension::Dynamic(length)]))
+            .with_sharding(Sharding::replicated(invariant.sharding().unwrap().mesh().clone(), 1))
+            .unwrap();
+        let packed = trace.input(packed_type.into());
+        let input = ArrayBatch::new(packed.into_projected().unwrap(), BatchAxis::new(0)).unwrap();
+        let context = BatchingContext::<_, ArrayBatchingPolicy<DynamicArrayExtentBatchingPolicy>>::with_policy(
+            ProjectedContext::new(trace.clone()),
+            extent,
+        );
+        let output = ParallelCastOperation::new("m".to_string(), ParallelCastTarget::Reduced)
+            .batch(&context, &EmptyRegionDriver, &[input])
+            .unwrap()
+            .remove(0);
+        assert_eq!(output.batch_axis(), BatchAxis::new(0));
+        let value: Tracer<_> = ValueProjection::<ArrayType>::from_projected(output.into_value());
+        let program = trace
+            .builder()
+            .borrow()
+            .clone()
+            .build::<Vec<ArrayIrValue<Array>>, Vec<ArrayIrValue<Array>>>(
+                vec![value.atom_id().unwrap()],
+                vec![Placeholder; 2],
+                vec![Placeholder],
+            )
+            .unwrap();
+        assert_eq!(
+            program.to_string(),
+            indoc! {"
+            lambda %0:dimension<items ∈ [0, 4)>, %1:f32[items][sharding={mesh<['m'=2:manual, 'outer'=2:manual]>, [{}]}] .
+            let %2:f32[items][sharding={mesh<['m'=2:manual, 'outer'=2:manual]>, [{}], reduced={'m'}}] = \
+                    parallel_cast [axis_name=\"m\", target=reduced] %1
+            in (%2)"
+            }
+        );
+    }
+
+    #[test]
+    fn test_parallel_cast_batching_rejects_named_batch_axis() {
+        let (invariant, _, _, _) = scalar_types();
+        let trace = TracingContext::<Array, ArrayOperation<Array>>::new();
+        let input = ArrayBatch::replicated(trace.input(invariant));
         let context = BatchingContext::<_, ArrayBatchingPolicy>::new(trace, 2).with_axis_name("m".to_string());
         assert_eq!(
-            operation.batch(&context, &EmptyRegionDriver, &[input]).map(|_| ()),
+            ParallelCastOperation::new("m".to_string(), ParallelCastTarget::Reduced)
+                .batch(&context, &EmptyRegionDriver, &[input])
+                .map(|_| ()),
             Err(BatchingError::Program(ProgramError::UnsupportedOperation {
-                message: "`parallel_cast` requires a manual mesh axis, not a named batch axis".to_string(),
+                message: format!(
+                    "`{PARALLEL_CAST_OPERATION_NAME}` requires a manual mesh axis, not a named batch axis"
+                ),
             })),
         );
     }
 
     #[test]
     fn test_parallel_cast_differentiation() {
-        // Forward mode differentiation repeats the cast on the tangent, and a structural zero tangent receives the
-        // cast output type.
-        let (invariant, _, reduced, _) = scalar_types();
-        let mesh = invariant.sharding().unwrap().mesh().clone();
-        let (_, program) = TracingContext::<Array, ArrayOperation<Array>>::trace_with_named_axes(
-            |input| input.parallel_cast("m", ParallelCastTarget::Reduced),
-            invariant,
-            manual_mesh_axes(&mesh, true),
-        )
-        .unwrap();
-        let differentiated = program.to_flat_program().jvp().unwrap();
-        assert_eq!(differentiated.output_types(), vec![reduced.clone(), reduced.clone()]);
-        assert_eq!(
-            differentiated.to_string(),
-            indoc! {"
-                lambda %0:f32[][sharding={mesh<['m'=2:manual, 'outer'=2:manual]>, []}], \
-                %1:f32[][sharding={mesh<['m'=2:manual, 'outer'=2:manual]>, []}] .
-                let %2:f32[][sharding={mesh<['m'=2:manual, 'outer'=2:manual]>, [], reduced={'m'}}] = \
-                        parallel_cast [axis_name=\"m\", target=reduced] %0
-                    %3:f32[][sharding={mesh<['m'=2:manual, 'outer'=2:manual]>, [], reduced={'m'}}] = \
-                        parallel_cast [axis_name=\"m\", target=reduced] %1
+        // Each primitive is linear on local values, so it applies the same state transition to a live tangent.
+        for case in cast_cases() {
+            let program = cast_program(ParallelCastOperation::new("m".to_string(), case.target), case.input_type);
+            let source = case.input_text;
+            let output = case.output_text;
+            let target = case.target;
+            assert_eq!(
+                program.to_string(),
+                formatdoc! {"
+                lambda %0:{source} .
+                let %1:{output} = parallel_cast [axis_name=\"m\", target={target}] %0
+                in (%1)"
+                }
+            );
+            let differentiated = program.to_flat_program().jvp().unwrap();
+            assert_eq!(differentiated.output_types(), vec![case.output_type.clone(), case.output_type]);
+            assert_eq!(
+                differentiated.to_string(),
+                formatdoc! {"
+                lambda %0:{source}, %1:{source} .
+                let %2:{output} = parallel_cast [axis_name=\"m\", target={target}] %0
+                    %3:{output} = parallel_cast [axis_name=\"m\", target={target}] %1
                 in (%2, %3)"
-            },
-        );
-        let zero_tangent = program.to_flat_program().jvp_with_respect_to(&[]).unwrap();
-        assert_eq!(zero_tangent.output_types(), vec![reduced.clone(), reduced]);
+                }
+            );
+        }
+    }
+
+    #[test]
+    fn test_parallel_cast_differentiation_structural_zero() {
+        for case in cast_cases() {
+            let program = cast_program(ParallelCastOperation::new("m".to_string(), case.target), case.input_type);
+            let source = case.input_text;
+            let output = case.output_text;
+            let target = case.target;
+            assert_eq!(
+                program.to_string(),
+                formatdoc! {"
+                lambda %0:{source} .
+                let %1:{output} = parallel_cast [axis_name=\"m\", target={target}] %0
+                in (%1)"
+                }
+            );
+            let differentiated = program.to_flat_program().jvp_with_respect_to(&[]).unwrap();
+            assert_eq!(differentiated.output_types(), vec![case.output_type.clone(), case.output_type]);
+            assert_eq!(
+                differentiated.to_string(),
+                formatdoc! {"
+                lambda %0:{source} .
+                let %1:{output} = parallel_cast [axis_name=\"m\", target={target}] %0
+                    %2:{output} = zero [type={output}]
+                in (%1, %2)"
+                }
+            );
+        }
     }
 
     #[test]
     fn test_parallel_cast_transposition() {
-        // The casts transpose as JAX's do: `Reduced` to a sum of the unreduced cotangent, and `Varying` and `Unreduced`
-        // to each other. Transposing twice recovers each original program.
-        let (invariant, varying, reduced, unreduced) = scalar_types();
-        for (target, input_type, cotangent_type, expected) in [
-            (
-                ParallelCastTarget::Reduced,
-                invariant.clone(),
-                unreduced.clone(),
-                indoc! {"
-                    lambda %0:f32[][sharding={mesh<['m'=2:manual, 'outer'=2:manual]>, [], unreduced={'m'}}] .
-                    let %1:f32[][sharding={mesh<['m'=2:manual, 'outer'=2:manual]>, []}] = \
-                            parallel_reduce [kind=sum, axis_name=\"m\", mesh=['m'=2:manual, 'outer'=2:manual]] %0
-                    in (%1)"
-                },
-            ),
-            (
-                ParallelCastTarget::Varying,
-                reduced.clone(),
-                varying.clone(),
-                indoc! {"
-                    lambda %0:f32[][sharding={mesh<['m'=2:manual, 'outer'=2:manual]>, [], varying_manual={'m'}}] .
-                    let %1:f32[][sharding={mesh<['m'=2:manual, 'outer'=2:manual]>, [], unreduced={'m'}}] = \
-                            parallel_cast [axis_name=\"m\", target=unreduced] %0
-                    in (%1)"
-                },
-            ),
-            (
-                ParallelCastTarget::Unreduced,
-                varying.clone(),
-                reduced.clone(),
-                indoc! {"
-                    lambda %0:f32[][sharding={mesh<['m'=2:manual, 'outer'=2:manual]>, [], reduced={'m'}}] .
-                    let %1:f32[][sharding={mesh<['m'=2:manual, 'outer'=2:manual]>, [], varying_manual={'m'}}] = \
-                            parallel_cast [axis_name=\"m\", target=varying] %0
-                    in (%1)"
-                },
-            ),
-        ] {
-            let program = cast_program(ParallelCastOperation::new("m".to_string(), target), input_type.clone());
+        for case in cast_cases() {
+            let program =
+                cast_program(ParallelCastOperation::new("m".to_string(), case.target), case.input_type.clone());
+            let source = case.input_text;
+            let output = case.output_text;
+            let target = case.target;
+            let original = formatdoc! {"
+                lambda %0:{source} .
+                let %1:{output} = parallel_cast [axis_name=\"m\", target={target}] %0
+                in (%1)"
+            };
+            assert_eq!(program.to_string(), original);
             let transposed = program.transpose_with_respect_to(&[0], &[]).unwrap();
-            assert_eq!(transposed.input_types(), vec![cotangent_type]);
-            assert_eq!(transposed.output_types(), vec![input_type.cotangent().unwrap()]);
+            assert_eq!(transposed.input_types(), vec![case.output_type.cotangent().unwrap()]);
+            assert_eq!(transposed.output_types(), vec![case.input_type.cotangent().unwrap()]);
+            let incoming = case.output_cotangent_text;
+            let outgoing = case.input_cotangent_text;
+            let expected = match target {
+                ParallelCastTarget::Reduced => formatdoc! {"
+                    lambda %0:{incoming} .
+                    let %1:{outgoing} = \
+                        parallel_reduce [kind=sum, axis_name=\"m\", mesh=['m'=2:manual, 'outer'=2:manual]] %0
+                    in (%1)"
+                },
+                ParallelCastTarget::Varying => formatdoc! {"
+                    lambda %0:{incoming} .
+                    let %1:{outgoing} = parallel_cast [axis_name=\"m\", target=unreduced] %0
+                    in (%1)"
+                },
+                ParallelCastTarget::Unreduced => formatdoc! {"
+                    lambda %0:{incoming} .
+                    let %1:{outgoing} = parallel_cast [axis_name=\"m\", target=varying] %0
+                    in (%1)"
+                },
+            };
             assert_eq!(transposed.to_string(), expected);
-            assert_eq!(transposed.transpose_with_respect_to(&[0], &[]).unwrap().to_string(), program.to_string());
+            let transposed_twice = transposed.transpose_with_respect_to(&[0], &[]).unwrap();
+            assert_eq!(transposed_twice.to_string(), original);
         }
+    }
+
+    #[test]
+    fn test_parallel_cast_transposition_skips_zero_and_unrequested_cotangents() {
+        // Neither structural zeros nor dead destinations should stage the otherwise communicating adjoint.
+        let (invariant, _, reduced, _) = scalar_types();
+        let trace = TracingContext::<Array, ArrayOperation<Array>>::new();
+        let inputs = [PartialValue::Unknown(invariant.clone())];
+        let operation = ParallelCastOperation::new("m".to_string(), ParallelCastTarget::Reduced);
+        let mut context = TranspositionContext::new(trace.clone());
+        let accumulators = context.cotangent_accumulators(&inputs, &[]).unwrap();
+        operation
+            .transpose(
+                &mut context,
+                &EmptyRegionDriver,
+                &inputs,
+                &[MaybeZero::Zero(reduced.cotangent().unwrap())],
+                &accumulators,
+            )
+            .unwrap();
+        assert_eq!(context.take_cotangents(&accumulators).unwrap(), vec![MaybeZero::Zero(invariant.clone())]);
+        let incoming = trace.input(reduced.cotangent().unwrap());
+        let accumulators = context.cotangent_accumulators(&inputs, &[false]).unwrap();
+        operation
+            .transpose(&mut context, &EmptyRegionDriver, &inputs, &[MaybeZero::Value(incoming.clone())], &accumulators)
+            .unwrap();
+        assert_eq!(context.take_cotangents(&accumulators).unwrap(), vec![MaybeZero::Zero(invariant)]);
+        let program = trace
+            .builder()
+            .borrow()
+            .clone()
+            .build::<Array, Array>(vec![incoming.atom_id().unwrap()], Placeholder, Placeholder)
+            .unwrap();
+        assert_eq!(
+            program.to_string(),
+            formatdoc! {"
+            lambda %0:{UNREDUCED} .
+            in (%0)"
+            }
+        );
     }
 
     #[test]
     fn test_parallel_cast_parallel_cast() {
-        let (invariant, varying, reduced, unreduced) = scalar_types();
-        let mesh = invariant.sharding().unwrap().mesh().clone();
-        let trace = |input_type: ArrayType, target: ParallelCastTarget, checks_manual_variation: bool| {
-            TracingContext::<Array, ArrayOperation<Array>>::trace_with_named_axes(
-                |input| input.parallel_cast("m", target),
-                input_type,
-                manual_mesh_axes(&mesh, checks_manual_variation),
+        for case in cast_cases() {
+            let mesh = case.input_type.sharding().unwrap().mesh().clone();
+            let (output_type, program) = TracingContext::<Array, ArrayOperation<Array>>::trace_with_named_axes(
+                |input| input.parallel_cast("m", case.target),
+                case.input_type,
+                manual_mesh_axes(&mesh, true),
             )
-        };
-
-        // Each target is reached from its source state through a cast, except that an invariant value becomes varying
-        // through `parallel_vary`, as JAX's `pcast` dispatches to `pvary`.
-        for (input_type, target, output_type) in [
-            (invariant.clone(), ParallelCastTarget::Reduced, reduced.clone()),
-            (reduced.clone(), ParallelCastTarget::Varying, varying.clone()),
-            (varying.clone(), ParallelCastTarget::Unreduced, unreduced.clone()),
-            (invariant.clone(), ParallelCastTarget::Varying, varying.clone()),
-        ] {
-            let (output, _) = trace(input_type, target, true).unwrap();
-            assert_eq!(output, output_type);
-        }
-        let (_, program) = trace(invariant.clone(), ParallelCastTarget::Varying, true).unwrap();
-        assert_eq!(
-            program.to_string(),
-            indoc! {"
-                lambda %0:f32[][sharding={mesh<['m'=2:manual, 'outer'=2:manual]>, []}] .
-                let %1:f32[][sharding={mesh<['m'=2:manual, 'outer'=2:manual]>, [], varying_manual={'m'}}] = \
-                        parallel_vary [axis_name=\"m\"] %0
+            .unwrap();
+            assert_eq!(output_type, case.output_type);
+            let source = case.input_text;
+            let output = case.output_text;
+            let target = case.target;
+            assert_eq!(
+                program.to_string(),
+                formatdoc! {"
+                lambda %0:{source} .
+                let %1:{output} = parallel_cast [axis_name=\"m\", target={target}] %0
                 in (%1)"
-            },
-        );
+                }
+            );
+        }
+    }
 
-        // A value without a sharding is first placed on the axis's mesh.
-        let (output, program) = trace(ArrayType::scalar(DataType::F32), ParallelCastTarget::Reduced, true).unwrap();
-        assert_eq!(output, reduced);
+    #[test]
+    fn test_parallel_cast_parallel_cast_array() {
         assert_eq!(
-            program.to_string(),
-            indoc! {"
-                lambda %0:f32[] .
-                let %1:f32[][sharding={mesh<['m'=2:manual, 'outer'=2:manual]>, []}] = broadcast [
-                    output_type=f32[][sharding={mesh<['m'=2:manual, 'outer'=2:manual]>, []}],
-                    output_axes=[],
-                ] %0
-                    %2:f32[][sharding={mesh<['m'=2:manual, 'outer'=2:manual]>, [], reduced={'m'}}] = \
-                            parallel_cast [axis_name=\"m\", target=reduced] %1
-                in (%2)"
-            },
-        );
-
-        // An unchecked binding carries no reduction state, so the value is returned unchanged.
-        let (output, program) = trace(invariant.clone(), ParallelCastTarget::Reduced, false).unwrap();
-        assert_eq!(output, invariant);
-        assert_eq!(
-            program.to_string(),
-            indoc! {"
-                lambda %0:f32[][sharding={mesh<['m'=2:manual, 'outer'=2:manual]>, []}] .
-                in (%0)"
-            },
-        );
-
-        // A value in the wrong source state, an unbound axis, and a value on another mesh are rejected.
-        assert_eq!(
-            trace(unreduced, ParallelCastTarget::Reduced, true).map(|_| ()),
-            Err(ProgramError::Type(TypeError::invalid(
-                "`parallel_cast` to `reduced` requires an input that is invariant along manual axis `m` but got one \
-                 that is unreduced",
-            ))),
-        );
-        assert_eq!(
-            TracingContext::<Array, ArrayOperation<Array>>::trace_with_named_axes(
-                |input| input.parallel_cast("m", ParallelCastTarget::Reduced),
-                invariant,
-                Vec::new(),
-            )
-            .map(|_| ()),
-            Err(ProgramError::Type(TypeError::invalid(
-                "`parallel_cast` requires an active non-empty manual mesh axis `m`",
-            ))),
-        );
-        let other_mesh = LogicalMesh::new(vec![MeshAxis::new("m", 2, MeshAxisType::Manual).unwrap()]).unwrap();
-        assert_eq!(
-            trace(
-                ArrayType::scalar(DataType::F32).with_sharding(Sharding::replicated(other_mesh, 0)).unwrap(),
-                ParallelCastTarget::Reduced,
-                true,
-            )
-            .map(|_| ()),
-            Err(ProgramError::Type(TypeError::invalid(
-                "`parallel_cast` input mesh does not match the mesh of manual axis `m`",
-            ))),
+            Array::scalar(2f32).unwrap().parallel_cast("m", ParallelCastTarget::Reduced),
+            Err(ProgramError::UnsupportedOperation {
+                message: format!("`{PARALLEL_CAST_OPERATION_NAME}` requires an active non-empty manual mesh axis `m`"),
+            }),
         );
     }
 
     #[test]
+    fn test_parallel_cast_parallel_cast_invariant_to_varying() {
+        let (invariant, varying, _, _) = scalar_types();
+        let mesh = invariant.sharding().unwrap().mesh().clone();
+        let (output, program) = TracingContext::<Array, ArrayOperation<Array>>::trace_with_named_axes(
+            |input| input.parallel_cast("m", ParallelCastTarget::Varying),
+            invariant,
+            manual_mesh_axes(&mesh, true),
+        )
+        .unwrap();
+        assert_eq!(output, varying);
+        assert_eq!(
+            program.to_string(),
+            formatdoc! {"
+            lambda %0:{INVARIANT} .
+            let %1:{VARYING} = parallel_vary [axis_name=\"m\"] %0
+            in (%1)"
+            }
+        );
+    }
+
+    #[test]
+    fn test_parallel_cast_parallel_cast_attaches_missing_sharding() {
+        let (invariant, _, reduced, _) = scalar_types();
+        let mesh = invariant.sharding().unwrap().mesh().clone();
+        let (output, program) = TracingContext::<Array, ArrayOperation<Array>>::trace_with_named_axes(
+            |input| input.parallel_cast("m", ParallelCastTarget::Reduced),
+            ArrayType::scalar(DataType::F32),
+            manual_mesh_axes(&mesh, true),
+        )
+        .unwrap();
+        assert_eq!(output, reduced);
+        assert_eq!(
+            program.to_string(),
+            formatdoc! {"
+            lambda %0:f32[] .
+            let %1:{INVARIANT} = broadcast [
+                output_type={INVARIANT},
+                output_axes=[],
+            ] %0
+                %2:{REDUCED} = parallel_cast [axis_name=\"m\", target=reduced] %1
+            in (%2)"
+            }
+        );
+    }
+
+    #[test]
+    fn test_parallel_cast_parallel_cast_unchecked() {
+        // Disabled tracking is an identity even for otherwise invalid transitions and inputs with no mesh metadata.
+        let (invariant, varying, reduced, unreduced) = scalar_types();
+        let mesh = invariant.sharding().unwrap().mesh().clone();
+        for (input_type, input_text) in [
+            (ArrayType::scalar(DataType::F32), "f32[]"),
+            (invariant, INVARIANT),
+            (varying, VARYING),
+            (reduced, REDUCED),
+            (unreduced, UNREDUCED),
+        ] {
+            for target in [ParallelCastTarget::Reduced, ParallelCastTarget::Varying, ParallelCastTarget::Unreduced] {
+                let (output, program) = TracingContext::<Array, ArrayOperation<Array>>::trace_with_named_axes(
+                    |input| input.parallel_cast("m", target),
+                    input_type.clone(),
+                    manual_mesh_axes(&mesh, false),
+                )
+                .unwrap();
+                assert_eq!(output, input_type);
+                assert_eq!(
+                    program.to_string(),
+                    formatdoc! {"
+                    lambda %0:{input_text} .
+                    in (%0)"
+                    }
+                );
+            }
+        }
+    }
+
+    #[test]
+    fn test_parallel_cast_parallel_cast_rejects_invalid_binders() {
+        let (invariant, _, _, _) = scalar_types();
+        let mesh = invariant.sharding().unwrap().mesh().clone();
+        let error = ProgramError::Type(TypeError::invalid(format!(
+            "`{PARALLEL_CAST_OPERATION_NAME}` requires an active non-empty manual mesh axis `m`",
+        )));
+        for checks_manual_variation in [true, false] {
+            let explicit = LogicalMesh::new(vec![MeshAxis::new("m", 2, MeshAxisType::Explicit).unwrap()]).unwrap();
+            let automatic = LogicalMesh::new(vec![MeshAxis::new("m", 2, MeshAxisType::Auto).unwrap()]).unwrap();
+            for axes in [
+                Vec::new(),
+                vec![("m".to_string(), NamedAxis::Batched { size: Some(2) })],
+                vec![(
+                    "m".to_string(),
+                    NamedAxis::Mesh { mesh: mesh.clone(), axis: 0, size: 0, checks_manual_variation },
+                )],
+                vec![("m".to_string(), NamedAxis::Mesh { mesh: explicit, axis: 0, size: 2, checks_manual_variation })],
+                vec![("m".to_string(), NamedAxis::Mesh { mesh: automatic, axis: 0, size: 2, checks_manual_variation })],
+            ] {
+                assert_eq!(
+                    TracingContext::<Array, ArrayOperation<Array>>::trace_with_named_axes(
+                        |input| input.parallel_cast("m", ParallelCastTarget::Reduced),
+                        ArrayType::scalar(DataType::F32),
+                        axes,
+                    )
+                    .map(|_| ()),
+                    Err(error.clone()),
+                );
+            }
+        }
+    }
+
+    #[test]
+    fn test_parallel_cast_parallel_cast_rejects_foreign_mesh() {
+        let (invariant, _, _, _) = scalar_types();
+        let mesh = invariant.sharding().unwrap().mesh().clone();
+        let other = LogicalMesh::new(vec![MeshAxis::new("m", 2, MeshAxisType::Manual).unwrap()]).unwrap();
+        let input = ArrayType::scalar(DataType::F32).with_sharding(Sharding::replicated(other, 0)).unwrap();
+        for checks_manual_variation in [true, false] {
+            assert_eq!(
+                TracingContext::<Array, ArrayOperation<Array>>::trace_with_named_axes(
+                    |input| input.parallel_cast("m", ParallelCastTarget::Reduced),
+                    input.clone(),
+                    manual_mesh_axes(&mesh, checks_manual_variation),
+                )
+                .map(|_| ()),
+                Err(ProgramError::Type(TypeError::invalid(format!(
+                    "`{PARALLEL_CAST_OPERATION_NAME}` input mesh does not match the mesh of manual axis `m`",
+                )))),
+            );
+        }
+    }
+
+    #[test]
     fn test_parallel_cast_parallel_cast_array_ir() {
-        // Array IR values cast through the projection of the capability and stage the same operation.
         let (invariant, _, reduced, _) = scalar_types();
         let mesh = invariant.sharding().unwrap().mesh().clone();
         let (output, program) = TracingContext::<ArrayIrValue<Array>, ArrayIrOperation<Array>>::trace_with_named_axes(
@@ -945,12 +1395,25 @@ mod tests {
         assert_eq!(output, ArrayIrType::from(reduced));
         assert_eq!(
             program.to_string(),
-            indoc! {"
-                lambda %0:f32[][sharding={mesh<['m'=2:manual, 'outer'=2:manual]>, []}] .
-                let %1:f32[][sharding={mesh<['m'=2:manual, 'outer'=2:manual]>, [], reduced={'m'}}] = \
-                        parallel_cast [axis_name=\"m\", target=reduced] %0
-                in (%1)"
-            },
+            formatdoc! {"
+            lambda %0:{INVARIANT} .
+            let %1:{REDUCED} = parallel_cast [axis_name=\"m\", target=reduced] %0
+            in (%1)"
+            }
+        );
+    }
+
+    #[test]
+    fn test_parallel_cast_parallel_cast_array_ir_rejects_nonarrays() {
+        let dimension = ArrayIrValue::<Array>::Dimension(DimensionValue::constant(2).unwrap());
+        assert_eq!(
+            dimension.parallel_cast("m", ParallelCastTarget::Reduced),
+            Err(ProgramError::Type(TypeError::invalid("expected array type but got dimension type"))),
+        );
+        let reference = ArrayIrValue::Reference(ArrayReference::new(Array::scalar(2f32).unwrap()));
+        assert_eq!(
+            reference.parallel_cast("m", ParallelCastTarget::Reduced),
+            Err(ProgramError::Type(TypeError::invalid("expected array type but got reference type"))),
         );
     }
 }

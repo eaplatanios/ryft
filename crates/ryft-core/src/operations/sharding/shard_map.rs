@@ -2351,7 +2351,8 @@ where
         // operation families). Backends with a device runtime execute the whole boundary through their own
         // `Context::bind` instead (e.g., by compiling the manual computation for their devices).
         self.validate_region_interfaces(&driver.region_interfaces())?;
-        let emulator = ShardMapEmulator { context, driver, grid: ManualDeviceGrid::default() };
+        let emulator =
+            ShardMapEmulator { context, driver, grid: ManualDeviceGrid::default(), manual_regions: Vec::new() };
         let outputs = emulator.run_shard_map(
             self,
             driver.region(0)?,
@@ -3651,6 +3652,9 @@ struct ShardMapEmulator<'o, C, D> {
 
     /// Devices of this emulation.
     grid: ManualDeviceGrid,
+
+    /// Enclosing manual boundaries, outermost first, which own each axis's physical mesh and checking policy.
+    manual_regions: Vec<ShardMapBoundary>,
 }
 
 impl<C, D> ShardMapEmulator<'_, C, D>
@@ -3791,8 +3795,14 @@ where
             body_inputs.push(local_values);
         }
 
-        let emulator =
-            ShardMapEmulator { context: self.context, driver: self.driver, grid: self.grid.with_axes(&manual_axes) };
+        let mut manual_regions = self.manual_regions.clone();
+        manual_regions.push(boundary.clone());
+        let emulator = ShardMapEmulator {
+            context: self.context,
+            driver: self.driver,
+            grid: self.grid.with_axes(&manual_axes),
+            manual_regions,
+        };
         let body_outputs = emulator.run_region(body, body_inputs)?;
         check_count!("output", body_outputs, operation.global_output_types().len(), ProgramError);
 
@@ -3962,6 +3972,38 @@ where
         Ok(false)
     }
 
+    /// Checks that a variation or reduction-state cast belongs to the actual checked manual binding of its axis.
+    /// The operation's inference has already validated the input's mesh and source state. A nested region that binds
+    /// other axes does not replace this axis's owning boundary, so ownership is resolved by axis, from the inside out.
+    fn validate_tracked_collective(
+        &self,
+        operation_name: &str,
+        axis_name: &str,
+        input_type: &ArrayType,
+    ) -> Result<(), ProgramError> {
+        let boundary = self
+            .manual_regions
+            .iter()
+            .rev()
+            .find(|boundary| boundary.manual_axes().iter().any(|axis| axis == axis_name))
+            .ok_or_else(|| {
+                ProgramError::MalformedProgram(format!(
+                    "`{operation_name}` manual axis `{axis_name}` has no enclosing manual binding",
+                ))
+            })?;
+        if input_type.sharding().unwrap().mesh() != boundary.mesh() {
+            return Err(ProgramError::MalformedProgram(format!(
+                "`{operation_name}` operation mesh does not match the enclosing manual axis `{axis_name}` mesh",
+            )));
+        }
+        if !boundary.check_manual_variation() {
+            return Err(ProgramError::MalformedProgram(format!(
+                "`{operation_name}` cannot use tracked mesh metadata inside an unchecked manual binding",
+            )));
+        }
+        Ok(())
+    }
+
     /// Computes `operation` across the devices when it is a collective over an emulated axis, and returns [`None`]
     /// otherwise. The trailing first-class dimension inputs of the mixed forms of the shape-changing collectives
     /// describe the result extents, which the emulator validates against the computed results.
@@ -4086,13 +4128,17 @@ where
         let outputs = if let Some(payload) = operation.projected_payload::<ParallelVaryOperation>() {
             // Varying an invariant value along an axis changes only its type, because every device already holds it.
             self.grid.map_devices(|device| {
-                with_array_type(arrays[device], &collective_output_type(payload, arrays[device], extents, device)?)
+                let output_type = collective_output_type(payload, arrays[device], extents, device)?;
+                self.validate_tracked_collective(name, payload.axis_name(), &arrays[device].r#type())?;
+                with_array_type(arrays[device], &output_type)
             })?
         } else if let Some(payload) = operation.projected_payload::<ParallelCastOperation>() {
             // Every cast changes only the state that the type records, so each device keeps its own value. In
             // particular, the per-device values of an unreduced value are its summands, which a later sum completes.
             self.grid.map_devices(|device| {
-                with_array_type(arrays[device], &collective_output_type(payload, arrays[device], extents, device)?)
+                let output_type = collective_output_type(payload, arrays[device], extents, device)?;
+                self.validate_tracked_collective(name, payload.axis_name(), &arrays[device].r#type())?;
+                with_array_type(arrays[device], &output_type)
             })?
         } else if let Some(payload) = operation.projected_payload::<ParallelReduceOperation>() {
             if let Some(payload_axis_size) = payload.axis_size() {
@@ -8069,10 +8115,12 @@ mod tests {
         operation: impl Into<TestOperation>,
         inputs: &[DeviceValues],
     ) -> Result<Option<Vec<DeviceValues>>, ProgramError> {
+        let mesh = LogicalMesh::new(vec![MeshAxis::new("x", axis_size, MeshAxisType::Manual).unwrap()]).unwrap();
         let emulator = ShardMapEmulator {
             context: &EagerContext::<TestValue, TestOperation>::new(),
             driver: &EmptyRegionDriver,
             grid: ManualDeviceGrid { axes: vec![("x".to_string(), axis_size)] },
+            manual_regions: vec![ShardMapBoundary::new(mesh, Vec::new(), Vec::new(), Vec::new()).unwrap()],
         };
         emulator.run_collective(&operation.into(), inputs)
     }
@@ -12759,6 +12807,131 @@ mod tests {
         assert_eq!(
             program.interpret(vec![f32_value(f32_vector_type(2), &[5.0, 6.0])]),
             Ok(vec![f32_value(f32_type(&[4], Some(sharded)), &[5.0, 6.0, 5.0, 6.0])]),
+        );
+    }
+
+    #[test]
+    fn test_shard_map_interpretation_tracked_collectives_validate_owning_bindings() {
+        // A raw cast uses the policy of the region that binds its axis, even through an inner region over another
+        // axis. Its input mesh must agree with that owner, rather than merely containing an axis with the same name.
+        let mesh = manual_mesh_2x2();
+        let input_type = f32_scalar_type().with_sharding(Sharding::replicated(mesh.clone(), 0)).unwrap();
+        let foreign_mesh = LogicalMesh::new(vec![
+            MeshAxis::new("x", 2, MeshAxisType::Manual).unwrap(),
+            MeshAxis::new("y", 3, MeshAxisType::Manual).unwrap(),
+        ])
+        .unwrap();
+        let foreign_type = f32_scalar_type().with_sharding(Sharding::replicated(foreign_mesh, 0)).unwrap();
+        let context = TestEagerContext::new();
+        for (outer_checked, inner_checked) in [(true, false), (false, true)] {
+            let boundary = |axis: &str, checked| {
+                ShardMapBoundary::new(mesh.clone(), Vec::new(), Vec::new(), vec![axis.to_string()])
+                    .unwrap()
+                    .with_check_manual_variation(checked)
+            };
+            let emulator = ShardMapEmulator {
+                context: &context,
+                driver: &EmptyRegionDriver,
+                grid: ManualDeviceGrid { axes: vec![("x".to_string(), 2), ("y".to_string(), 2)] },
+                manual_regions: vec![boundary("x", outer_checked), boundary("y", inner_checked)],
+            };
+            for (axis, checked) in [("x", outer_checked), ("y", inner_checked)] {
+                for operation in [
+                    ArrayOperation::ParallelVary(ParallelVaryOperation::new(axis.to_string())),
+                    ArrayOperation::ParallelCast(ParallelCastOperation::new(
+                        axis.to_string(),
+                        ParallelCastTarget::Reduced,
+                    )),
+                ] {
+                    let name = operation.name();
+                    let output_type = single_output_type(&operation, &[input_type.clone()]).unwrap();
+                    let operation = TestOperation::from(operation);
+                    let inputs = [vec![f32_value(input_type.clone(), &[2.0]); 4]];
+                    let expected = if checked {
+                        Ok(Some(vec![vec![f32_value(output_type, &[2.0]); 4]]))
+                    } else {
+                        Err(ProgramError::MalformedProgram(format!(
+                            "`{name}` cannot use tracked mesh metadata inside an unchecked manual binding",
+                        )))
+                    };
+                    assert_eq!(emulator.run_collective(&operation, &inputs), expected);
+                    let inputs = [vec![f32_value(foreign_type.clone(), &[2.0]); 4]];
+                    assert_eq!(
+                        emulator.run_collective(&operation, &inputs),
+                        Err(ProgramError::MalformedProgram(format!(
+                            "`{name}` operation mesh does not match the enclosing manual axis `{axis}` mesh",
+                        ))),
+                    );
+                }
+            }
+        }
+    }
+
+    #[test]
+    fn test_shard_map_interpretation_parallel_cast_rejects_raw_foreign_mesh() {
+        // The raw body is type-correct on its constant's own mesh. Its output boundary reconstructs the declared
+        // global mesh, so only checking the cast against the actual owning binder detects the foreign local mesh.
+        let mesh = manual_mesh();
+        let output_sharding = Sharding::replicated(mesh.clone(), 0).with_reduced_axes(["x"]).unwrap();
+        let output_type = f32_scalar_type().with_sharding(output_sharding.clone()).unwrap();
+        let foreign_mesh = LogicalMesh::new(vec![MeshAxis::new("x", 4, MeshAxisType::Manual).unwrap()]).unwrap();
+        let foreign_sharding = Sharding::replicated(foreign_mesh, 0);
+        let foreign_type = f32_scalar_type().with_sharding(foreign_sharding.clone()).unwrap();
+        let foreign_reduced =
+            f32_scalar_type().with_sharding(foreign_sharding.with_reduced_axes(["x"]).unwrap()).unwrap();
+        let body = build_program(Vec::new(), |builder, _| {
+            let constant = builder
+                .add_instruction(
+                    ArrayOperation::Constant(ConstantOperation::new(
+                        Array::from_elements(foreign_type.clone(), &[2f32]).unwrap(),
+                    )),
+                    Vec::new(),
+                    Vec::new(),
+                    None,
+                )
+                .unwrap()[0];
+            builder
+                .add_instruction(
+                    ArrayOperation::ParallelCast(ParallelCastOperation::new(
+                        "x".to_string(),
+                        ParallelCastTarget::Reduced,
+                    )),
+                    Vec::new(),
+                    vec![constant],
+                    None,
+                )
+                .unwrap()
+                .to_vec()
+        });
+        let boundary = ShardMapBoundary::new(mesh, Vec::new(), vec![output_sharding.clone()], Vec::new()).unwrap();
+        let operation = ShardMapOperation::from_program(&body, Vec::new(), boundary).unwrap();
+        let program = shard_map_program(operation, body).unwrap();
+        assert_eq!(
+            program.to_string(),
+            formatdoc! {"
+                lambda  .
+                let %0:{output_type} = shard_map [
+                    mesh=['x'=2:manual],
+                    input_shardings=[],
+                    output_shardings=[{output_sharding}],
+                    manual_axes=['x'],
+                    global_input_types=[],
+                    global_output_types=[{output_type}],
+                ] [
+                    body={{
+                        lambda  .
+                        let %0:{foreign_type} = constant [value=2.0]
+                            %1:{foreign_reduced} = parallel_cast [axis_name=\"x\", target=reduced] %0
+                        in (%1)
+                    }},
+                ]
+                in (%0)"},
+        );
+        assert_eq!(
+            program.interpret(Vec::new()),
+            Err(ProgramError::MalformedProgram(
+                "`parallel_cast` operation mesh does not match the enclosing manual axis `x` mesh".to_string(),
+            )),
         );
     }
 

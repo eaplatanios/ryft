@@ -401,10 +401,10 @@ mod tests {
     use ryft_core::{
         AxisIndexOperation, BatchAxis, Context, ConvertElementType, ConvertElementTypeOperation, CustomCallOperation,
         DataType, Device, DeviceMesh, Dimension as CoreDimension, DomainTracingContext, Dot, DotDimensionNumbers,
-        EffectClass, LogicalMesh, MeshAxis, MeshAxisType, ParallelAllGather, ParallelAllToAll, ParallelArgExtrema,
+        EffectClass, Exp, LogicalMesh, MeshAxis, MeshAxisType, ParallelAllGather, ParallelAllToAll, ParallelArgExtrema,
         ParallelCast, ParallelCastTarget, ParallelPermute, ParallelReduce, ParallelSumScatter, Placeholder,
-        ReductionKind, Shape, ShardMapOptions, ShardMapTracer, Typed, ValueProjection, batch, shard_map,
-        shard_map_along, shard_map_with_inferred_input_shardings,
+        ReductionKind, Shape, ShardMapOptions, ShardMapTracer, Typed, ValueProjection, batch, differentiate_at,
+        shard_map, shard_map_along, shard_map_with_inferred_input_shardings,
     };
     use ryft_mlir::Block;
     use ryft_pjrt::{BufferType, ClientOptions, CpuClientOptions, Program as PjrtProgram, load_cpu_plugin};
@@ -1568,6 +1568,41 @@ mod tests {
             "},
         );
         assert_eq!(execute_on_two_cpu_devices(module, &[2], [&[1.0, 2.0], &[3.0, 4.0]]), vec![vec![4.0, 6.0]; 2]);
+    }
+
+    #[test]
+    fn test_to_mlir_module_for_program_with_parallel_cast_gradient_executes_on_cpu() {
+        // Each device computes exp(w), casts it to a pending sum, and sums across x. The reverse pass must propagate
+        // through all three cast adjoints and sum the two device contributions, so the gradient at w=0 is 2.
+        let mesh = test_manual_mesh("x", 2);
+        let replicated = Sharding::replicated(mesh.clone(), 0);
+        let traced: TracedProgram<ArrayType, ArrayType> = trace_with_context(
+            |_, w: ArrayTracer| {
+                let gradient = differentiate_at(w.into_value()).gradient(|w| {
+                    let w = ValueProjection::<ArrayType>::into_projected(w)?;
+                    let output = shard_map(
+                        |w| {
+                            let w = w.parallel_cast("x", ParallelCastTarget::Reduced)?;
+                            let w = w.parallel_cast("x", ParallelCastTarget::Varying)?;
+                            let summand = w.exp()?.parallel_cast("x", ParallelCastTarget::Unreduced)?;
+                            Ok(summand.parallel_reduce(ReductionKind::Sum, "x")?)
+                        },
+                        w,
+                        mesh.clone(),
+                        replicated.clone(),
+                        replicated.clone(),
+                        ShardMapOptions::new(),
+                    )?;
+                    Ok(output.into_value())
+                })?;
+                ValueProjection::<ArrayType>::into_projected(gradient)
+            },
+            ArrayType::scalar(DataType::F32).with_sharding(replicated).unwrap(),
+        )
+        .unwrap();
+        let module = traced.to_mlir_module("main").unwrap();
+        assert_eq!(module, indoc! {"REPLACE_WITH_PARALLEL_CAST_GRADIENT_MLIR"});
+        assert_eq!(execute_on_two_cpu_devices(module, &[], [&[0.0], &[0.0]]), vec![vec![2.0]; 2]);
     }
 
     #[test]

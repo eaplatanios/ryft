@@ -109,7 +109,7 @@
 //!         let %1:f32[3][sharding={mesh<['x'=2:manual]>, [{}], varying_manual={'x'}}] = \
 //!             parallel_vary [axis_name=\"x\"] %0
 //!             %2:f32[6][sharding={mesh<['x'=2:manual]>, [{}], varying_manual={'x'}}] = parallel_all_gather [
-//!                 axis_name=\"x\",
+//!                 axes=\"x\",
 //!                 axis_size=2,
 //!                 concatenation_axis=0,
 //!                 options=Tiled,
@@ -1421,10 +1421,12 @@ fn resolve_collective_axes<C: NamedAxes>(
     axes: &CollectiveAxes,
 ) -> Result<(usize, Option<LogicalMesh>), ProgramError> {
     axes.validate(operation_name)?;
-    let mut axis_size = 1;
+    let mut axis_size = 1usize;
     let mut binding = None::<(LogicalMesh, bool)>;
     for name in axes.names() {
-        axis_size *= resolve_named_axis_size(context, name)?;
+        axis_size = axis_size.checked_mul(resolve_named_axis_size(context, name)?).ok_or_else(|| {
+            TypeError::invalid(format!("`{operation_name}` combined size of axes {axes} overflows `usize`"))
+        })?;
         let current = match context.named_axis(name).unwrap() {
             NamedAxis::Mesh { mesh, checks_manual_variation, .. } => Some((mesh, checks_manual_variation)),
             _ if axes.single().is_some() => None,
@@ -1468,10 +1470,12 @@ fn validate_manual_mesh_axes_input(
     if let Some(axis_name) = axes.single() {
         return validate_manual_mesh_input(operation_name, axis_name, Some(axis_size), mesh, input_type);
     }
-    let mut mesh_axis_size = 1;
+    let mut mesh_axis_size = 1usize;
     for axis_name in axes.names() {
         validate_manual_mesh_axis(operation_name, axis_name, None, mesh)?;
-        mesh_axis_size *= mesh.axis_size(axis_name).unwrap();
+        mesh_axis_size = mesh_axis_size.checked_mul(mesh.axis_size(axis_name).unwrap()).ok_or_else(|| {
+            TypeError::invalid(format!("`{operation_name}` combined size of manual mesh axes {axes} overflows `usize`"))
+        })?;
     }
     if mesh_axis_size != axis_size {
         return Err(TypeError::invalid(format!(
@@ -1666,9 +1670,9 @@ impl<C: Context<Type = ArrayIrType>> BatchingContext<C, ArrayIrBatchingPolicy> {
 }
 
 /// Group of the value-level collective capabilities [`ParallelReduce`], [`ParallelVary`], [`ParallelAllGather`],
-/// [`ParallelSumScatter`], [`ParallelPermute`], [`ParallelAllToAll`], and [`ParallelRaggedAllToAll`]. It is implemented
-/// automatically for every type that implements all of its members. The context-side [`AxisIndex`] is implemented by
-/// contexts rather than values and is therefore not a member.
+/// [`ParallelSumScatter`], [`ParallelPermute`], [`ParallelAllToAll`], [`ParallelRaggedAllToAll`], [`ParallelCast`],
+/// and [`ParallelArgExtrema`]. It is implemented automatically for every type that implements all of its members.
+/// The context-side [`AxisIndex`] is implemented by contexts rather than values and is therefore not a member.
 ///
 /// The universe parameter `T` defaults to the [`Capability`] universe of the implementor and is passed to every member,
 /// so that homogeneous array values implement this bundle for [`ArrayType`] and array IR values implement it for
@@ -1682,6 +1686,8 @@ pub trait CollectiveOperations<T = <Self as Capability>::Universe>:
     + ParallelPermute<T>
     + ParallelAllToAll<T>
     + ParallelRaggedAllToAll<T>
+    + ParallelCast<T>
+    + ParallelArgExtrema<T>
 {
 }
 
@@ -1693,7 +1699,9 @@ impl<
         + ParallelSumScatter<T>
         + ParallelPermute<T>
         + ParallelAllToAll<T>
-        + ParallelRaggedAllToAll<T>,
+        + ParallelRaggedAllToAll<T>
+        + ParallelCast<T>
+        + ParallelArgExtrema<T>,
 > CollectiveOperations<T> for V
 {
 }
@@ -3178,6 +3186,21 @@ mod tests {
             .map(|_| ()),
             Err(ProgramError::Type(TypeError::invalid(
                 "`parallel_permute` over several axes requires manual mesh axes, but `y` is not one",
+            ))),
+        );
+
+        // The combined size of several axes is checked for overflow.
+        let mut huge = axes(true);
+        huge[0].1 = NamedAxis::Mesh { mesh: mesh.clone(), axis: 0, size: usize::MAX, checks_manual_variation: true };
+        assert_eq!(
+            TracingContext::<Array, ArrayOperation<Array>>::trace_with_named_axes(
+                |input| input.parallel_permute(["x", "y"], Vec::new()),
+                two_axis_type(2, &[], &[]),
+                huge,
+            )
+            .map(|_| ()),
+            Err(ProgramError::Type(TypeError::invalid(
+                "`parallel_permute` combined size of axes (x, y) overflows `usize`",
             ))),
         );
 
