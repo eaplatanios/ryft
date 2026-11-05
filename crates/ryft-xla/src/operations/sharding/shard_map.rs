@@ -68,12 +68,12 @@ where
             for instruction in region.instructions() {
                 if let Some(gather) = instruction.operation().projected_payload::<ParallelAllGatherOperation>()
                     && gather.output_variance() == ParallelAllGatherOutputVariance::Invariant
-                    && boundary.manual_axes().iter().any(|axis| gather.axis_name().contains(axis))
+                    && boundary.manual_axes().iter().any(|axis| gather.axes().contains(axis))
                 {
                     return Err(ProgramError::MalformedProgram(format!(
                         "`{SHARD_MAP_OPERATION_NAME}` with unchecked manual variation requires varying output \
                          variance for `{PARALLEL_ALL_GATHER_OPERATION_NAME}` over active manual axis `{}`",
-                        gather.axis_name(),
+                        gather.axes(),
                     ))
                     .into());
                 }

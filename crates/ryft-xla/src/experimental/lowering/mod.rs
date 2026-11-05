@@ -910,10 +910,10 @@ impl CollectiveLoweringState {
 
     /// Resolves a collective's actual manual binder and checks any payload mesh against it before communication.
     /// A payload without a mesh is valid only when the owning operation's inference accepts the actual binder.
-    pub(crate) fn checked_collective_mesh(
+    pub(crate) fn checked_collective_mesh<A: Into<CollectiveAxes>>(
         &self,
         operation_name: &str,
-        axis_name: impl Into<CollectiveAxes>,
+        axis_name: A,
         axis_size: usize,
         payload_mesh: Option<&LogicalMesh>,
     ) -> Result<&LogicalMesh, Error> {
@@ -943,10 +943,10 @@ impl CollectiveLoweringState {
     /// Returns a [`Error`] if no enclosing manual region binds `axis_name`, if the recorded axis size or a
     /// payload mesh disagrees with that region, if a tracked payload is used in an unchecked binding, if re-inference
     /// fails, or if it produces different output types.
-    pub(crate) fn check_manual_collective<T: PartialEq>(
+    pub(crate) fn check_manual_collective<T: PartialEq, A: Into<CollectiveAxes>>(
         &self,
         operation_name: &str,
-        axis_name: impl Into<CollectiveAxes>,
+        axis_name: A,
         axis_size: usize,
         payload_mesh: Option<&LogicalMesh>,
         output_types: &[T],

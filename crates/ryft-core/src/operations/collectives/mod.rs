@@ -13,8 +13,10 @@
 //!   - **Reducing and Varying Values:** [`ParallelReduce`] combines the values of all participants with
 //!     a [`ReductionKind`](crate::ReductionKind), so that every participant receives the same result, and
 //!     [`ParallelVary`] marks a value that is invariant over a manual mesh axis as varying over it, which is the
-//!     transpose of a sum over that axis. [`ManualVariationAlignment`] aligns the manual variation of several inputs
-//!     before an operation combines them.
+//!     transpose of a sum over that axis. [`ParallelCast`] moves a value between the remaining variation and reduction
+//!     states of a manual mesh axis (e.g., marking per-device summands as unreduced, which a sum then completes), and
+//!     [`ManualVariationAlignment`] aligns the manual variation of several inputs before an operation combines them.
+//!     [`ParallelArgExtrema`] composes reductions and [`AxisIndex`] to find the participant that holds an extremum.
 //!   - **Resizing Array Axes:** [`ParallelAllGather`] gives every participant the values of all participants,
 //!     [`ParallelSumScatter`] sums them and gives every participant one chunk of the sum, and [`ParallelAllToAll`]
 //!     splits an axis into one chunk per participant and concatenates the chunks that it receives along another axis.
@@ -142,14 +144,14 @@
 //! # }
 //! ```
 
-use std::fmt::Debug;
+use std::fmt::{Debug, Display};
 
 use crate::arrays::{
     ArrayBatch, ArrayBatchingPolicy, ArrayExtentBatchingPolicy, ArrayIrBatch, ArrayIrBatchingPolicy, ArrayIrType,
     ArrayType, Dimension, DimensionType, DimensionValue, DynamicArrayExtentBatchingPolicy, LinearResiduals,
     LogicalMesh, MeshAxisType, Shape, Sharding, StaticArrayExtentBatchingPolicy,
 };
-use crate::axes::{AxisError, NamedAxes};
+use crate::axes::{AxisError, NamedAxes, NamedAxis};
 use crate::batching::{BatchAxis, BatchingContext, BatchingError, BatchingPolicy, BatchingTracer};
 use crate::contexts::{Context, ContextProjection, Domain, ProjectedContext, StagingContext};
 use crate::differentiation::{
@@ -177,6 +179,8 @@ use crate::tracing::{Tracer, TracingContext};
 pub mod axis_index;
 pub mod parallel_all_gather;
 pub mod parallel_all_to_all;
+pub mod parallel_arg_extrema;
+pub mod parallel_cast;
 pub mod parallel_permute;
 pub mod parallel_ragged_all_to_all;
 pub mod parallel_reduce;
@@ -188,6 +192,8 @@ pub use parallel_all_gather::{
     PARALLEL_ALL_GATHER_OPERATION_NAME, ParallelAllGather, ParallelAllGatherOperation, ParallelAllGatherOutputVariance,
 };
 pub use parallel_all_to_all::{PARALLEL_ALL_TO_ALL_OPERATION_NAME, ParallelAllToAll, ParallelAllToAllOperation};
+pub use parallel_arg_extrema::ParallelArgExtrema;
+pub use parallel_cast::{PARALLEL_CAST_OPERATION_NAME, ParallelCast, ParallelCastOperation, ParallelCastTarget};
 pub use parallel_permute::{PARALLEL_PERMUTE_OPERATION_NAME, ParallelPermute, ParallelPermuteOperation};
 pub use parallel_ragged_all_to_all::{
     PARALLEL_RAGGED_ALL_TO_ALL_OPERATION_NAME, ParallelRaggedAllToAll, ParallelRaggedAllToAllOperation,
@@ -195,6 +201,129 @@ pub use parallel_ragged_all_to_all::{
 pub use parallel_reduce::{PARALLEL_REDUCE_OPERATION_NAME, ParallelReduce, ParallelReduceOperation};
 pub use parallel_sum_scatter::{PARALLEL_SUM_SCATTER_OPERATION_NAME, ParallelSumScatter, ParallelSumScatterOperation};
 pub use parallel_vary::{ManualVariationAlignment, PARALLEL_VARY_OPERATION_NAME, ParallelVary, ParallelVaryOperation};
+
+/// Names of the axes over which a collective exchanges values (i.e., the analogue of a JAX `axis_name`, which may be
+/// a tuple). One name selects one named axis. Several names select their _combined axis_, whose participants are the
+/// combinations of positions along the named axes, linearized in the given order with the first name major, which is
+/// how JAX interprets a tuple of axis names. For example, with sizes `2` and `3` for `x` and `y`, the participant at
+/// `x = 1` and `y = 0` has position `1 · 3 + 0 = 3` along `("x", "y")` but position `0 · 2 + 1 = 1` along `("y", "x")`.
+/// Several names must be distinct manual mesh axes of one mesh. A `batch` level that binds any of them rejects the
+/// collective, because a batch level binds a single axis.
+///
+/// The [`Display`](std::fmt::Display) form names the axes for diagnostics (e.g., `x` or `(x, y)`), and the
+/// [`Debug`] form renders them as they appear in programs (e.g., `"x"` or `("x", "y")`).
+#[derive(Clone, PartialEq, Eq, Hash)]
+pub struct CollectiveAxes(Vec<String>);
+
+impl CollectiveAxes {
+    /// Returns the axis names, in the order that linearizes the combined axis.
+    #[inline]
+    pub fn names(&self) -> &[String] {
+        self.0.as_slice()
+    }
+
+    /// Returns the axis name when there is exactly one, and [`None`] otherwise.
+    #[inline]
+    pub fn single(&self) -> Option<&str> {
+        match self.0.as_slice() {
+            [name] => Some(name.as_str()),
+            _ => None,
+        }
+    }
+
+    /// Returns `true` if `name` is one of the axis names.
+    #[inline]
+    pub fn contains(&self, name: &str) -> bool {
+        self.0.iter().any(|axis_name| axis_name == name)
+    }
+
+    /// Validates that there is at least one axis name and that the names are distinct.
+    ///
+    /// # Errors
+    ///
+    /// Returns a [`TypeError`] naming `operation_name` otherwise.
+    fn validate(&self, operation_name: &str) -> Result<(), TypeError> {
+        if self.0.is_empty() {
+            return Err(TypeError::invalid(format!("`{operation_name}` requires at least one axis name")));
+        }
+        for (index, name) in self.0.iter().enumerate() {
+            if self.0[..index].contains(name) {
+                return Err(TypeError::invalid(format!("`{operation_name}` axis names repeat `{name}`")));
+            }
+        }
+        Ok(())
+    }
+}
+
+impl Display for CollectiveAxes {
+    fn fmt(&self, formatter: &mut std::fmt::Formatter<'_>) -> std::fmt::Result {
+        match self.single() {
+            Some(name) => write!(formatter, "{name}"),
+            None => write!(formatter, "({})", self.0.join(", ")),
+        }
+    }
+}
+
+impl Debug for CollectiveAxes {
+    fn fmt(&self, formatter: &mut std::fmt::Formatter<'_>) -> std::fmt::Result {
+        match self.single() {
+            Some(name) => write!(formatter, "{name:?}"),
+            None => {
+                let names = self.0.iter().map(|name| format!("{name:?}")).collect::<Vec<_>>();
+                write!(formatter, "({})", names.join(", "))
+            }
+        }
+    }
+}
+
+impl From<&str> for CollectiveAxes {
+    #[inline]
+    fn from(name: &str) -> Self {
+        Self(vec![name.to_string()])
+    }
+}
+
+impl From<String> for CollectiveAxes {
+    #[inline]
+    fn from(name: String) -> Self {
+        Self(vec![name])
+    }
+}
+
+impl From<&String> for CollectiveAxes {
+    #[inline]
+    fn from(name: &String) -> Self {
+        Self(vec![name.clone()])
+    }
+}
+
+impl From<&CollectiveAxes> for CollectiveAxes {
+    #[inline]
+    fn from(axes: &CollectiveAxes) -> Self {
+        axes.clone()
+    }
+}
+
+impl From<Vec<String>> for CollectiveAxes {
+    #[inline]
+    fn from(names: Vec<String>) -> Self {
+        Self(names)
+    }
+}
+
+impl From<&[&str]> for CollectiveAxes {
+    #[inline]
+    fn from(names: &[&str]) -> Self {
+        Self(names.iter().map(|name| name.to_string()).collect())
+    }
+}
+
+impl<const N: usize> From<[&str; N]> for CollectiveAxes {
+    #[inline]
+    fn from(names: [&str; N]) -> Self {
+        Self(names.iter().map(|name| name.to_string()).collect())
+    }
+}
 
 /// Shape semantics of the collectives that resize an array axis (e.g., [`ParallelAllGatherOperation`],
 /// [`ParallelSumScatterOperation`], and [`ParallelAllToAllOperation`]), which determine where the `n` participants of
@@ -389,14 +518,14 @@ impl<C: Context, P: DifferentiationPolicy<C>> ShapeChangingCollectiveValue for D
 /// such collective need and provides those rules on top of them. The collectives keep explicit trait implementations
 /// that delegate to the provided functions, so that every operation module reads the same way.
 ///
-/// The hooks named after a public accessor of the operation (e.g., [`axis_name`](Self::axis_name)) return the same
+/// The hooks named after a public accessor of the operation (e.g., [`axes`](Self::axes)) return the same
 /// values. They are repeated here because this trait is private, while the accessors are part of the public API.
 trait LinearCollectiveOperation: Operation<Type = ArrayType> {
     /// Collective operation type that transposition stages on the output cotangent.
     type Adjoint: Operation<Type = ArrayType>;
 
-    /// Returns the name of the axis that this collective exchanges values over.
-    fn axis_name(&self) -> &str;
+    /// Returns the names of the axes that this collective exchanges values over.
+    fn axes(&self) -> &CollectiveAxes;
 
     /// Returns the number of participants along the named axis, resolved when the collective was staged.
     fn axis_size(&self) -> usize;
@@ -440,6 +569,7 @@ trait LinearCollectiveOperation: Operation<Type = ArrayType> {
         region_interfaces: &[RegionInterface<ArrayType>],
     ) -> Result<&'o ArrayType, TypeError> {
         check_count!("region", region_interfaces, 0, TypeError);
+        self.axes().validate(self.name())?;
 
         // A zero-participant collective is rejected before any extent arithmetic divides by its size.
         if self.axis_size() == 0 {
@@ -468,7 +598,7 @@ trait LinearCollectiveOperation: Operation<Type = ArrayType> {
                 message: format!(
                     "cannot interpret `{}` over axis `{}` of size {} without an enclosing binder",
                     self.name(),
-                    self.axis_name(),
+                    self.axes(),
                     effective_axis_size,
                 ),
             });
@@ -491,6 +621,11 @@ trait LinearCollectiveOperation: Operation<Type = ArrayType> {
     ///
     /// Returns a [`BatchingError`] if this collective carries a mesh.
     fn reject_mesh_form(&self) -> Result<(), BatchingError> {
+        if self.axes().single().is_none() {
+            return Err(BatchingError::UnsupportedOperation {
+                message: format!("`{}` over several axes cannot bind a named batch axis", self.name()),
+            });
+        }
         if self.mesh().is_some() {
             return Err(BatchingError::UnsupportedOperation {
                 message: format!("`{}` over a manual mesh axis cannot bind a named batch axis", self.name()),
@@ -732,7 +867,7 @@ trait ShapeChangingCollectiveOperation: LinearCollectiveOperation {
     where
         Self: ShapeChangingCollectiveBatching<C>,
     {
-        if context.axis_name() != Some(self.axis_name()) {
+        if !context.axis_name().is_some_and(|axis_name| self.axes().contains(axis_name)) {
             return context.forward_collective(self, inputs);
         }
 
@@ -791,7 +926,7 @@ trait ShapeChangingCollectiveOperation: LinearCollectiveOperation {
         let mut logical_output_types = self.infer_array_ir_output_types(logical_input_types.as_slice())?;
         let logical_output_type = <&ArrayType>::try_from(&logical_output_types.remove(0))?.clone();
 
-        if context.axis_name() != Some(self.axis_name()) {
+        if !context.axis_name().is_some_and(|axis_name| self.axes().contains(axis_name)) {
             return Ok(context.forward_collective(self, array, output_extents)?);
         }
 
@@ -862,7 +997,7 @@ trait CollectiveArrayExtentBatchingPolicy<C: Context<Type = ArrayType>>: ArrayEx
     fn collective_axis_extent(
         context: &BatchingContext<C, ArrayBatchingPolicy<Self>>,
         operation_name: &str,
-        axis_name: &str,
+        axis_name: &CollectiveAxes,
         axis_size: usize,
     ) -> Result<Self::ShapeExtent, BatchingError>;
 
@@ -911,7 +1046,7 @@ where
     fn collective_axis_extent(
         context: &BatchingContext<C, ArrayBatchingPolicy<Self>>,
         operation_name: &str,
-        axis_name: &str,
+        axis_name: &CollectiveAxes,
         axis_size: usize,
     ) -> Result<Self::ShapeExtent, BatchingError> {
         let batch_size = *context.axis_extent();
@@ -991,7 +1126,7 @@ where
     fn collective_axis_extent(
         context: &BatchingContext<ProjectedContext<C, ArrayType>, ArrayBatchingPolicy<Self>>,
         _operation_name: &str,
-        _axis_name: &str,
+        _axis_name: &CollectiveAxes,
         axis_size: usize,
     ) -> Result<Self::ShapeExtent, BatchingError> {
         let axis_extent = ValueProjection::<DimensionType>::into_projected(context.axis_extent().clone())?;
@@ -1269,6 +1404,82 @@ fn resolve_named_axis_size<C: NamedAxes>(context: &C, axis_name: &str) -> Result
         }
         .into()),
     }
+}
+
+/// Resolves the combined size of the axes named by `axes` from the active [`NamedAxes`] environment, as
+/// [`resolve_named_axis_size`] does for one axis, together with the mesh of those axes when they are manual mesh axes
+/// whose binding checks manual variation, in which case the staged collective records that mesh. Several axes must be
+/// distinct manual mesh axes of one mesh that agree on whether they check manual variation.
+///
+/// # Errors
+///
+/// Returns a [`ProgramError`] naming `operation_name` if an axis is unbound, empty, or dynamically sized, or if several
+/// axes violate the requirements above.
+fn resolve_collective_axes<C: NamedAxes>(
+    context: &C,
+    operation_name: &str,
+    axes: &CollectiveAxes,
+) -> Result<(usize, Option<LogicalMesh>), ProgramError> {
+    axes.validate(operation_name)?;
+    let mut axis_size = 1;
+    let mut binding = None::<(LogicalMesh, bool)>;
+    for name in axes.names() {
+        axis_size *= resolve_named_axis_size(context, name)?;
+        let current = match context.named_axis(name).unwrap() {
+            NamedAxis::Mesh { mesh, checks_manual_variation, .. } => Some((mesh, checks_manual_variation)),
+            _ if axes.single().is_some() => None,
+            _ => {
+                return Err(TypeError::invalid(format!(
+                    "`{operation_name}` over several axes requires manual mesh axes, but `{name}` is not one",
+                ))
+                .into());
+            }
+        };
+        match (&binding, current) {
+            (_, None) => {}
+            (None, Some(current)) => binding = Some(current),
+            (Some(binding), Some(current)) if *binding == current => {}
+            (Some(_), Some(_)) => {
+                return Err(TypeError::invalid(format!(
+                    "`{operation_name}` axes {axes} must belong to one mesh and agree on manual-variation checks",
+                ))
+                .into());
+            }
+        }
+    }
+    Ok((axis_size, binding.and_then(|(mesh, checks_manual_variation)| checks_manual_variation.then_some(mesh))))
+}
+
+/// Validates the manual mesh axes of a collective over `axes` that carries a mesh, as [`validate_manual_mesh_input`]
+/// does for one axis: every axis must be a manual axis of `mesh`, their sizes must multiply to `axis_size`, and
+/// `input_type` must carry a sharding over `mesh`.
+///
+/// # Errors
+///
+/// Returns a [`TypeError`] naming `operation_name` if any of these requirements is violated.
+fn validate_manual_mesh_axes_input(
+    operation_name: &str,
+    axes: &CollectiveAxes,
+    axis_size: usize,
+    mesh: &LogicalMesh,
+    input_type: &ArrayType,
+) -> Result<(), TypeError> {
+    axes.validate(operation_name)?;
+    if let Some(axis_name) = axes.single() {
+        return validate_manual_mesh_input(operation_name, axis_name, Some(axis_size), mesh, input_type);
+    }
+    let mut mesh_axis_size = 1;
+    for axis_name in axes.names() {
+        validate_manual_mesh_axis(operation_name, axis_name, None, mesh)?;
+        mesh_axis_size *= mesh.axis_size(axis_name).unwrap();
+    }
+    if mesh_axis_size != axis_size {
+        return Err(TypeError::invalid(format!(
+            "`{operation_name}` axis size {axis_size} does not match the size {mesh_axis_size} \
+             of manual mesh axes {axes}",
+        )));
+    }
+    validate_manual_mesh_input(operation_name, &axes.names()[0], None, mesh, input_type)
 }
 
 /// Infers a linear collective's output type from its input and (possibly resized) dimensions, carrying the input
@@ -1586,6 +1797,22 @@ mod tests {
             )
             .unwrap();
         (output.batch_axis(), output.value().r#type().into_owned(), program.to_string())
+    }
+
+    /// Creates the type of a local `f32[size]` value on a 2x2 manual mesh over `x` and `y` that varies over `varying`
+    /// and is unreduced along `unreduced`.
+    fn two_axis_type(size: usize, varying: &[&str], unreduced: &[&str]) -> ArrayType {
+        let mesh = LogicalMesh::new(vec![
+            MeshAxis::new("x", 2, MeshAxisType::Manual).unwrap(),
+            MeshAxis::new("y", 2, MeshAxisType::Manual).unwrap(),
+        ])
+        .unwrap();
+        let sharding = Sharding::replicated(mesh, 1)
+            .with_varying_manual_axes(varying.iter().copied())
+            .unwrap()
+            .with_unreduced_axes(unreduced.iter().copied())
+            .unwrap();
+        ArrayType::new_static(DataType::F32, [size]).with_sharding(sharding).unwrap()
     }
 
     #[test]
@@ -1935,11 +2162,11 @@ mod tests {
     fn test_static_array_extent_batching_policy_collective_axis_extent() {
         let context = eager_collective_context("x", 2);
         assert_eq!(
-            StaticArrayExtentBatchingPolicy::collective_axis_extent(&context, "parallel_all_gather", "x", 2),
+            StaticArrayExtentBatchingPolicy::collective_axis_extent(&context, "parallel_all_gather", &"x".into(), 2),
             Ok(2),
         );
         assert_eq!(
-            StaticArrayExtentBatchingPolicy::collective_axis_extent(&context, "parallel_all_gather", "x", 3),
+            StaticArrayExtentBatchingPolicy::collective_axis_extent(&context, "parallel_all_gather", &"x".into(), 3),
             Err(BatchingError::UnsupportedOperation {
                 message:
                     "`parallel_all_gather` over axis `x` resolved axis size 3 but the mapped batch axis has size 2"
@@ -2004,13 +2231,13 @@ mod tests {
         let axis_extent = DimensionValue::constant(2).unwrap();
         let context = dynamic_collective_context(axis_extent.clone());
         assert_eq!(
-            DynamicArrayExtentBatchingPolicy::collective_axis_extent(&context, "parallel_all_gather", "x", 2),
+            DynamicArrayExtentBatchingPolicy::collective_axis_extent(&context, "parallel_all_gather", &"x".into(), 2),
             Ok(axis_extent),
         );
 
         // A mismatched participant count fails the staged assertion, which the eager parent evaluates immediately.
         let error = ProgramError::from(
-            DynamicArrayExtentBatchingPolicy::collective_axis_extent(&context, "parallel_all_gather", "x", 3)
+            DynamicArrayExtentBatchingPolicy::collective_axis_extent(&context, "parallel_all_gather", &"x".into(), 3)
                 .unwrap_err(),
         );
         assert_eq!(
@@ -2748,5 +2975,231 @@ mod tests {
         assert_eq!(projection.axis_name(), Some("x"));
         assert_eq!(projection.axis_extent(), &axis_extent);
         assert_eq!(projection.axis_sharding(), &ShardingDimension::sharded(["devices"]));
+    }
+
+    #[test]
+    fn test_collective_axes() {
+        let single = CollectiveAxes::from("x");
+        assert_eq!(single.names(), ["x".to_string()]);
+        assert_eq!(single.single(), Some("x"));
+        assert!(single.contains("x") && !single.contains("y"));
+        assert_eq!((single.to_string(), format!("{single:?}")), ("x".to_string(), "\"x\"".to_string()));
+        assert_eq!(CollectiveAxes::from("x".to_string()), single);
+        assert_eq!(CollectiveAxes::from(&"x".to_string()), single);
+
+        let several = CollectiveAxes::from(["y", "x"]);
+        assert_eq!(several.single(), None);
+        assert!(several.contains("x") && several.contains("y"));
+        assert_eq!((several.to_string(), format!("{several:?}")), ("(y, x)".to_string(), "(\"y\", \"x\")".to_string()));
+        assert_eq!(CollectiveAxes::from(vec!["y".to_string(), "x".to_string()]), several);
+        assert_eq!(CollectiveAxes::from(["y", "x"].as_slice()), several);
+        assert_eq!(CollectiveAxes::from(&several), several);
+
+        // Type inference rejects an empty or repeating list of axis names.
+        assert_eq!(
+            ParallelPermuteOperation::new(Vec::<String>::new(), 1, Vec::new())
+                .infer_output_types(&[two_axis_type(2, &[], &[])], &[]),
+            Err(TypeError::invalid("`parallel_permute` requires at least one axis name")),
+        );
+        assert_eq!(
+            ParallelPermuteOperation::new(["x", "x"], 4, Vec::new())
+                .infer_output_types(&[two_axis_type(2, &[], &[])], &[]),
+            Err(TypeError::invalid("`parallel_permute` axis names repeat `x`")),
+        );
+    }
+
+    #[test]
+    fn test_collectives_over_several_axes_type_inference() {
+        let mesh = two_axis_type(1, &[], &[]).sharding().unwrap().mesh().clone();
+        let varying = |size| two_axis_type(size, &["x", "y"], &[]);
+        let permute = ParallelPermuteOperation::new(["x", "y"], 4, vec![(0, 1), (1, 0)]).with_mesh(mesh.clone());
+        assert_eq!(
+            permute.to_string(),
+            indoc! {"
+                parallel_permute [
+                    axis_name=(\"x\", \"y\"),
+                    axis_size=4,
+                    source_target_pairs=[(0, 1), (1, 0)],
+                    mesh=['x'=2:manual, 'y'=2:manual],
+                ]"
+            },
+        );
+        assert_eq!(permute.infer_output_types(&[varying(2)], &[]), Ok(vec![varying(2)]));
+        assert_eq!(
+            permute.infer_output_types(&[two_axis_type(2, &["x"], &[])], &[]),
+            Err(TypeError::invalid(
+                "`parallel_permute` input must vary over manual axis `y`; pass an invariant value through \
+                 `parallel_vary` first so that the permuted output is typed as varying",
+            )),
+        );
+        assert_eq!(
+            ParallelPermuteOperation::new(["x", "y"], 3, Vec::new())
+                .with_mesh(mesh.clone())
+                .infer_output_types(&[varying(2)], &[]),
+            Err(TypeError::invalid(
+                "`parallel_permute` axis size 3 does not match the size 4 of manual mesh axes (x, y)"
+            )),
+        );
+
+        // A sum-scatter over several axes scatters varying inputs, or completes the pending sums of inputs that are
+        // unreduced along all of them, but not along some of them.
+        let tiled = CollectiveOptions::new(CollectiveMode::Tiled);
+        let scatter = ParallelSumScatterOperation::new(["x", "y"], 4, 0, tiled.clone()).with_mesh(mesh.clone());
+        assert_eq!(scatter.infer_output_types(&[varying(8)], &[]), Ok(vec![varying(2)]));
+        assert_eq!(scatter.infer_output_types(&[two_axis_type(8, &[], &["x", "y"])], &[]), Ok(vec![varying(2)]));
+        assert_eq!(
+            scatter.infer_output_types(&[two_axis_type(8, &["y"], &["x"])], &[]),
+            Err(TypeError::invalid(
+                "`parallel_sum_scatter` input must be unreduced along all or none of manual axes (x, y)",
+            )),
+        );
+
+        // An all-gather over several axes keeps varying over them or records them as reduced. An invariant result would
+        // need the combined position in its transpose, so it is gathered one axis at a time instead.
+        let gather = |variance| {
+            ParallelAllGatherOperation::new(["x", "y"], 4, 0, tiled.clone(), variance).with_mesh(mesh.clone())
+        };
+        assert_eq!(
+            gather(ParallelAllGatherOutputVariance::Varying).infer_output_types(&[varying(2)], &[]),
+            Ok(vec![varying(8)])
+        );
+        let reduced = two_axis_type(8, &[], &[]);
+        let reduced = reduced
+            .clone()
+            .with_sharding(reduced.sharding().unwrap().clone().with_reduced_axes(["x", "y"]).unwrap())
+            .unwrap();
+        assert_eq!(
+            gather(ParallelAllGatherOutputVariance::Reduced).infer_output_types(&[varying(2)], &[]),
+            Ok(vec![reduced])
+        );
+        assert_eq!(
+            gather(ParallelAllGatherOutputVariance::Invariant).infer_output_types(&[varying(2)], &[]),
+            Err(TypeError::invalid(
+                "`parallel_all_gather` over several axes does not support invariant output variance; gather one axis \
+                 at a time instead",
+            )),
+        );
+
+        let all_to_all = ParallelAllToAllOperation::new(["y", "x"], 4, 0, 0, tiled).with_mesh(mesh);
+        assert_eq!(all_to_all.infer_output_types(&[varying(8)], &[]), Ok(vec![varying(8)]));
+    }
+
+    #[test]
+    fn test_collectives_over_several_axes_staging() {
+        let mesh = two_axis_type(1, &[], &[]).sharding().unwrap().mesh().clone();
+        let axes = |checks_manual_variation| {
+            ["x", "y"]
+                .into_iter()
+                .enumerate()
+                .map(|(axis, name)| {
+                    (name.to_string(), NamedAxis::Mesh { mesh: mesh.clone(), axis, size: 2, checks_manual_variation })
+                })
+                .collect::<Vec<_>>()
+        };
+
+        // Over checked manual axes, an invariant input is made varying over each axis before it is exchanged, and the
+        // transpose of a sum-scatter is an all-gather over the same axes in the same order.
+        let (output, program) = TracingContext::<Array, ArrayOperation<Array>>::trace_with_named_axes(
+            |input| input.parallel_sum_scatter_tiled(["y", "x"], 0),
+            two_axis_type(8, &[], &[]),
+            axes(true),
+        )
+        .unwrap();
+        assert_eq!(output, two_axis_type(2, &["x", "y"], &[]));
+        assert_eq!(
+            program.to_string(),
+            indoc! {"
+                lambda %0:f32[8][sharding={mesh<['x'=2:manual, 'y'=2:manual]>, [{}]}] .
+                let %1:f32[8][sharding={mesh<['x'=2:manual, 'y'=2:manual]>, [{}], varying_manual={'y'}}] = \
+                        parallel_vary [axis_name=\"y\"] %0
+                    %2:f32[8][sharding={mesh<['x'=2:manual, 'y'=2:manual]>, [{}], varying_manual={'x', 'y'}}] = \
+                        parallel_vary [axis_name=\"x\"] %1
+                    %3:f32[2][sharding={mesh<['x'=2:manual, 'y'=2:manual]>, [{}], varying_manual={'x', 'y'}}] = \
+                    parallel_sum_scatter [
+                        axis_name=(\"y\", \"x\"),
+                        axis_size=4,
+                        scatter_axis=0,
+                        options=Tiled,
+                        mesh=['x'=2:manual, 'y'=2:manual],
+                    ] %2
+                in (%3)"
+            },
+        );
+        assert_eq!(
+            program.transpose_with_respect_to(&[0], &[]).unwrap().to_string(),
+            indoc! {"
+                lambda %0:f32[2][sharding={mesh<['x'=2:manual, 'y'=2:manual]>, [{}], varying_manual={'x', 'y'}}] .
+                let %1:f32[8][sharding={mesh<['x'=2:manual, 'y'=2:manual]>, [{}], varying_manual={'x', 'y'}}] = \
+                    parallel_all_gather [
+                    axis_name=(\"y\", \"x\"),
+                    axis_size=4,
+                    concatenation_axis=0,
+                    options=Tiled,
+                    output_variance=Varying,
+                    mesh=['x'=2:manual, 'y'=2:manual],
+                ] %0
+                    %2:f32[8][sharding={mesh<['x'=2:manual, 'y'=2:manual]>, [{}], varying_manual={'y'}}] = \
+                        parallel_reduce [kind=sum, axis_name=\"x\", mesh=['x'=2:manual, 'y'=2:manual]] %1
+                    %3:f32[8][sharding={mesh<['x'=2:manual, 'y'=2:manual]>, [{}]}] = \
+                        parallel_reduce [kind=sum, axis_name=\"y\", mesh=['x'=2:manual, 'y'=2:manual]] %2
+                in (%3)"
+            },
+        );
+
+        // Over unchecked manual axes, the ordinary collective carries no mesh.
+        let (_, program) = TracingContext::<Array, ArrayOperation<Array>>::trace_with_named_axes(
+            |input| input.parallel_permute(["x", "y"], vec![(0, 3)]),
+            two_axis_type(2, &[], &[]),
+            axes(false),
+        )
+        .unwrap();
+        assert_eq!(
+            program.to_string(),
+            indoc! {"
+                lambda %0:f32[2][sharding={mesh<['x'=2:manual, 'y'=2:manual]>, [{}]}] .
+                let %1:f32[2][sharding={mesh<['x'=2:manual, 'y'=2:manual]>, [{}]}] = \
+                        parallel_permute [axis_name=(\"x\", \"y\"), axis_size=4, source_target_pairs=[(0, 3)]] %0
+                in (%1)"
+            },
+        );
+
+        // Several axes must be manual mesh axes that agree on manual-variation checks.
+        let mut mixed = axes(true);
+        mixed[1].1 = NamedAxis::Mesh { mesh: mesh.clone(), axis: 1, size: 2, checks_manual_variation: false };
+        assert_eq!(
+            TracingContext::<Array, ArrayOperation<Array>>::trace_with_named_axes(
+                |input| input.parallel_permute(["x", "y"], Vec::new()),
+                two_axis_type(2, &[], &[]),
+                mixed,
+            )
+            .map(|_| ()),
+            Err(ProgramError::Type(TypeError::invalid(
+                "`parallel_permute` axes (x, y) must belong to one mesh and agree on manual-variation checks",
+            ))),
+        );
+        let mut batched = axes(true);
+        batched[1].1 = NamedAxis::Batched { size: Some(2) };
+        assert_eq!(
+            TracingContext::<Array, ArrayOperation<Array>>::trace_with_named_axes(
+                |input| input.parallel_permute(["x", "y"], Vec::new()),
+                two_axis_type(2, &[], &[]),
+                batched,
+            )
+            .map(|_| ()),
+            Err(ProgramError::Type(TypeError::invalid(
+                "`parallel_permute` over several axes requires manual mesh axes, but `y` is not one",
+            ))),
+        );
+
+        // A `batch` level binds a single axis, so it rejects a collective over several axes that names its axis, while
+        // a level that binds none of them forwards it.
+        let operation = ParallelPermuteOperation::new(["i", "j"], 4, Vec::new());
+        let input = ArrayBatch::new(Array::vector(vec![1.0f32, 2.0]).unwrap(), BatchAxis::new(0)).unwrap();
+        assert_eq!(
+            batch_collective(&operation, "i", 2, input).map(|_| ()),
+            Err(BatchingError::UnsupportedOperation {
+                message: "`parallel_permute` over several axes cannot bind a named batch axis".to_string(),
+            }),
+        );
     }
 }

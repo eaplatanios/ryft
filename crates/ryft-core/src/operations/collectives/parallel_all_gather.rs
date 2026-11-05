@@ -26,10 +26,10 @@ use crate::operations::collectives::parallel_vary::{
     PARALLEL_VARY_OPERATION_NAME, ParallelVary, ParallelVaryOperation,
 };
 use crate::operations::collectives::{
-    CollectiveArrayExtentBatchingPolicy, CollectiveMode, CollectiveOptions, LinearCollectiveOperation,
+    CollectiveArrayExtentBatchingPolicy, CollectiveAxes, CollectiveMode, CollectiveOptions, LinearCollectiveOperation,
     ShapeChangingCollectiveBatching, ShapeChangingCollectiveOperation, ShapeChangingCollectiveValue,
     infer_array_ir_shape_changing_collective_output_type, infer_linear_collective_operation_output_type,
-    resolve_named_axis_size, validate_manual_mesh_input,
+    resolve_collective_axes, validate_manual_mesh_axes_input,
 };
 use crate::operations::comparisons::Compare;
 use crate::operations::constants::constant::{ConstantOperation, DimensionConstant};
@@ -109,8 +109,8 @@ pub const PARALLEL_ALL_GATHER_OPERATION_NAME: &str = "parallel_all_gather";
 /// all-gathers over a manual mesh axis.
 #[derive(Clone, Debug, PartialEq, Eq, Hash)]
 pub struct ParallelAllGatherOperation {
-    /// Axis name referenced by this collective.
-    axis_name: String,
+    /// Names of the axes referenced by this collective.
+    axes: CollectiveAxes,
 
     /// Number of participants along the named axis, resolved from the active [`NamedAxes`] environment when the
     /// operation is staged.
@@ -137,38 +137,38 @@ impl ParallelAllGatherOperation {
     ///
     /// # Parameters
     ///
-    ///   - `axis_name`: Name of the axis whose participants' inputs are gathered.
-    ///   - `axis_size`: Number of participants along `axis_name`, resolved when the operation is staged.
+    ///   - `axes`: Name of the axis, or names of the axes, whose participants' inputs are gathered.
+    ///   - `axis_size`: Number of participants along `axes`, resolved when the operation is staged.
     ///   - `concatenation_axis`: Position of the inserted participant axis in the output in untiled mode,
     ///     or axis of the input along which the inputs are concatenated in tiled mode.
     ///   - `options`: [`CollectiveMode`] and optional participant groups of the collective (refer to the
     ///     documentation of [`CollectiveOptions::with_axis_index_groups`] for how the groups route the data).
     ///   - `output_variance`: [`ParallelAllGatherOutputVariance`] of the result over a manual mesh axis.
     #[inline]
-    pub fn new(
-        axis_name: String,
+    pub fn new<A: Into<CollectiveAxes>>(
+        axes: A,
         axis_size: usize,
         concatenation_axis: usize,
         options: CollectiveOptions,
         output_variance: ParallelAllGatherOutputVariance,
     ) -> Self {
-        Self { axis_name, axis_size, concatenation_axis, options, output_variance, mesh: None }
+        Self { axes: axes.into(), axis_size, concatenation_axis, options, output_variance, mesh: None }
     }
 
-    /// Returns this [`ParallelAllGatherOperation`] configured to gather over a manual axis of `mesh`. The input must
-    /// vary over [`axis_name`](Self::axis_name) on that mesh, whose size must equal [`axis_size`](Self::axis_size).
-    /// Type inference validates these requirements. [`ParallelAllGather::parallel_all_gather_with_options`] supplies
-    /// the mesh automatically from the enclosing manual region.
+    /// Returns this [`ParallelAllGatherOperation`] configured to gather over manual axes of `mesh`. The input
+    /// must vary over [`axes`](Self::axes) on that mesh, whose size must equal [`axis_size`](Self::axis_size). Type
+    /// inference validates these requirements. [`ParallelAllGather::parallel_all_gather_with_options`] supplies the
+    /// mesh automatically from the enclosing manual region.
     #[inline]
     pub fn with_mesh(mut self, mesh: LogicalMesh) -> Self {
         self.mesh = Some(mesh);
         self
     }
 
-    /// Returns the axis name referenced by this collective.
+    /// Returns the names of the axes referenced by this collective.
     #[inline]
-    pub fn axis_name(&self) -> &str {
-        &self.axis_name
+    pub fn axes(&self) -> &CollectiveAxes {
+        &self.axes
     }
 
     /// Returns the number of participants along the named axis.
@@ -203,16 +203,28 @@ impl ParallelAllGatherOperation {
         self.mesh.as_ref()
     }
 
+    /// Returns the single axis name of an invariant all-gather, whose transpose selects the current participant's chunk
+    /// by its index along that axis. Type inference rejects invariant gathers over several axes, so a program that
+    /// reaches the transpose with several axes is malformed.
+    fn invariant_axis_name(&self) -> Result<&str, ProgramError> {
+        self.axes.single().ok_or_else(|| {
+            ProgramError::MalformedProgram(format!(
+                "`{PARALLEL_ALL_GATHER_OPERATION_NAME}` over several axes does not support invariant output variance",
+            ))
+        })
+    }
+
     /// Rejects an input that carries reduction state (i.e., pending or completed sum) over the gathered manual mesh
     /// axis, because gathering across that sum would change its reduction semantics. Independent sums over other mesh
     /// axes commute with the gather and are preserved.
     fn validate_input_reduction_state(&self, input_type: &ArrayType) -> Result<(), TypeError> {
-        let axis_name = &self.axis_name;
-        if input_type.unreduced_axes().contains(axis_name) || input_type.reduced_axes().contains(axis_name) {
-            return Err(TypeError::invalid(format!(
-                "`{PARALLEL_ALL_GATHER_OPERATION_NAME}` input must not carry reduction state \
-                 over manual axis `{axis_name}`",
-            )));
+        for axis_name in self.axes.names() {
+            if input_type.unreduced_axes().contains(axis_name) || input_type.reduced_axes().contains(axis_name) {
+                return Err(TypeError::invalid(format!(
+                    "`{PARALLEL_ALL_GATHER_OPERATION_NAME}` input must not carry reduction state \
+                     over manual axis `{axis_name}`",
+                )));
+            }
         }
         Ok(())
     }
@@ -238,7 +250,7 @@ impl ParallelAllGatherOperation {
             return Err(ProgramError::UnsupportedOperation {
                 message: format!(
                     "cannot interpret `{}` over manual mesh axis `{}` without an enclosing binder",
-                    PARALLEL_ALL_GATHER_OPERATION_NAME, self.axis_name,
+                    PARALLEL_ALL_GATHER_OPERATION_NAME, self.axes,
                 ),
             });
         }
@@ -252,7 +264,17 @@ impl ParallelAllGatherOperation {
     /// the input must vary over the axis, and the output variance selects whether the result keeps varying over it,
     /// becomes invariant over it, or records it as reduced.
     fn finalize_output_type(&self, input_type: &ArrayType, output_type: ArrayType) -> Result<ArrayType, TypeError> {
-        let axis_name = self.axis_name.as_str();
+        let axis_names = &self.axes;
+
+        // The transpose of an invariant gather selects the chunk of the current participant by its index along one
+        // axis, so a gather over several axes must keep varying over them or record them as reduced.
+        if axis_names.single().is_none() && self.output_variance == ParallelAllGatherOutputVariance::Invariant {
+            return Err(TypeError::invalid(format!(
+                "`{PARALLEL_ALL_GATHER_OPERATION_NAME}` over several axes does not support invariant output variance; \
+                 gather one axis at a time instead",
+            )));
+        }
+
         let Some(mesh) = &self.mesh else {
             if self.output_variance == ParallelAllGatherOutputVariance::Reduced {
                 return Err(TypeError::invalid(format!(
@@ -262,10 +284,10 @@ impl ParallelAllGatherOperation {
             return Ok(output_type);
         };
 
-        validate_manual_mesh_input(
+        validate_manual_mesh_axes_input(
             PARALLEL_ALL_GATHER_OPERATION_NAME,
-            axis_name,
-            Some(self.axis_size),
+            axis_names,
+            self.axis_size,
             mesh,
             input_type,
         )?;
@@ -275,25 +297,26 @@ impl ParallelAllGatherOperation {
         self.validate_input_reduction_state(input_type)?;
         let input_sharding = input_type.sharding().unwrap();
 
-        // Gathering an input that is still invariant over the axis would concatenate identical copies under a type that
+        // Gathering an input that is still invariant over an axis would concatenate identical copies under a type that
         // cannot tell them apart from per-participant values, and its transpose would produce a varying cotangent.
-        if !input_sharding.varying_manual_axes().contains(axis_name) {
-            return Err(TypeError::invalid(format!(
-                "`{PARALLEL_ALL_GATHER_OPERATION_NAME}` input must vary over manual axis `{axis_name}`; pass an \
-                 invariant value through `{PARALLEL_VARY_OPERATION_NAME}` first so that every copy is gathered",
-            )));
-        }
-
         let mut varying_axes = input_sharding.varying_manual_axes().clone();
         let mut reduced_axes = input_sharding.reduced_axes().clone();
-        match self.output_variance {
-            ParallelAllGatherOutputVariance::Varying => {}
-            ParallelAllGatherOutputVariance::Invariant => {
-                varying_axes.remove(axis_name);
+        for axis_name in axis_names.names() {
+            if !input_sharding.varying_manual_axes().contains(axis_name) {
+                return Err(TypeError::invalid(format!(
+                    "`{PARALLEL_ALL_GATHER_OPERATION_NAME}` input must vary over manual axis `{axis_name}`; pass an \
+                     invariant value through `{PARALLEL_VARY_OPERATION_NAME}` first so that every copy is gathered",
+                )));
             }
-            ParallelAllGatherOutputVariance::Reduced => {
-                varying_axes.remove(axis_name);
-                reduced_axes.insert(axis_name.to_string());
+            match self.output_variance {
+                ParallelAllGatherOutputVariance::Varying => {}
+                ParallelAllGatherOutputVariance::Invariant => {
+                    varying_axes.remove(axis_name);
+                }
+                ParallelAllGatherOutputVariance::Reduced => {
+                    varying_axes.remove(axis_name);
+                    reduced_axes.insert(axis_name.to_string());
+                }
             }
         }
 
@@ -365,7 +388,7 @@ impl Operation for ParallelAllGatherOperation {
 
     fn render(&self, formatter: &mut std::fmt::Formatter<'_>, indentation: usize) -> std::fmt::Result {
         OperationFormatter::new(formatter, indentation, PARALLEL_ALL_GATHER_OPERATION_NAME)?.bracketed(|operation| {
-            operation.field("axis_name", format_args!("{:?}", self.axis_name))?;
+            operation.field("axis_name", format_args!("{:?}", self.axes))?;
             operation.field("axis_size", self.axis_size)?;
             operation.field("concatenation_axis", self.concatenation_axis)?;
             operation.field("options", format_args!("{:?}", self.options.mode()))?;
@@ -385,8 +408,8 @@ impl LinearCollectiveOperation for ParallelAllGatherOperation {
     type Adjoint = ParallelSumScatterOperation;
 
     #[inline]
-    fn axis_name(&self) -> &str {
-        &self.axis_name
+    fn axes(&self) -> &CollectiveAxes {
+        &self.axes
     }
 
     #[inline]
@@ -425,7 +448,7 @@ impl LinearCollectiveOperation for ParallelAllGatherOperation {
             });
         }
         let adjoint = ParallelSumScatterOperation::new(
-            self.axis_name.clone(),
+            self.axes.clone(),
             self.axis_size,
             self.concatenation_axis,
             self.options.clone(),
@@ -562,7 +585,7 @@ where
         }
 
         let axis_extent =
-            P::collective_axis_extent(context, PARALLEL_ALL_GATHER_OPERATION_NAME, &self.axis_name, self.axis_size)?;
+            P::collective_axis_extent(context, PARALLEL_ALL_GATHER_OPERATION_NAME, &self.axes, self.axis_size)?;
         let mut input_extents = output_extents.clone();
         match self.options.mode {
             CollectiveMode::Untiled => {
@@ -713,13 +736,14 @@ where
         // tangent itself (e.g., under nested differentiation), and so it is made varying with a real `parallel_vary`
         // transition, whose transpose is the cross-device sum, rather than by retyping the selected chunk.
         let mut cotangent = cotangent.clone();
+        let axis_name = self.invariant_axis_name()?;
         if self.mesh.is_some()
             && !cotangent
                 .r#type()
                 .sharding()
-                .is_some_and(|sharding| sharding.varying_manual_axes().contains(self.axis_name.as_str()))
+                .is_some_and(|sharding| sharding.varying_manual_axes().contains(axis_name))
         {
-            let operation = ParallelVaryOperation::new(self.axis_name.clone());
+            let operation = ParallelVaryOperation::new(axis_name.to_string());
             cotangent = context.bind(O::from(operation), Vec::new(), &[cotangent])?.remove(0);
         }
 
@@ -751,7 +775,7 @@ where
         let start = if self.axis_size == 1 {
             None
         } else {
-            let mut operation = AxisIndexOperation::new(self.axis_name.clone());
+            let mut operation = AxisIndexOperation::new(self.invariant_axis_name()?.to_string());
             if let Some(mesh) = &self.mesh {
                 operation = operation.with_mesh(mesh.clone());
             }
@@ -1007,13 +1031,13 @@ where
                             zero.clone()
                         } else {
                             let mut axis_index_operation =
-                                AxisIndexOperation::new(transpose_operation.axis_name().to_string());
+                                AxisIndexOperation::new(transpose_operation.invariant_axis_name()?.to_string());
                             if let Some(mesh) = transpose_operation.mesh() {
                                 axis_index_operation = axis_index_operation.with_mesh(mesh.clone());
                             }
                             let axis_index = transpose_context.bind_array(axis_index_operation, &[])?;
                             let axis_index_variable = DimensionVariable::new(
-                                format!("{}_index", transpose_operation.axis_name()),
+                                format!("{}_index", transpose_operation.axes()),
                                 DimensionBounds::non_negative(Some(transpose_operation.axis_size()))?,
                             );
                             let axis_index = transpose_context
@@ -1051,14 +1075,15 @@ where
                         // axis. The cotangent can carry a tangent itself (e.g., under nested differentiation), and so
                         // it is made varying with a real `parallel_vary` transition, whose transpose is the
                         // cross-device sum, rather than by retyping the selected chunk.
+                        let axis_name = transpose_operation.invariant_axis_name()?;
                         let output_cotangent = match transpose_operation.mesh() {
                             Some(_)
-                                if !output_cotangent_type.sharding().is_some_and(|sharding| {
-                                    sharding.varying_manual_axes().contains(transpose_operation.axis_name())
-                                }) =>
+                                if !output_cotangent_type
+                                    .sharding()
+                                    .is_some_and(|sharding| sharding.varying_manual_axes().contains(axis_name)) =>
                             {
                                 transpose_context.bind_array(
-                                    ParallelVaryOperation::new(transpose_operation.axis_name().to_string()),
+                                    ParallelVaryOperation::new(axis_name.to_string()),
                                     std::slice::from_ref(&output_cotangents[0]),
                                 )?
                             }
@@ -1143,13 +1168,14 @@ where
 /// ```
 #[capability]
 pub trait ParallelAllGather<T = <Self as Capability>::Universe>: Capability + Sized {
-    /// Returns the values of the participants of the named axis `axis_name`, stacked along a new axis that is inserted
+    /// Returns the values of the participants of the named axes `axes`, stacked along a new axis that is inserted
     /// at `concatenation_axis`, so that participant `i`'s value becomes row `i` of that axis. Over a manual mesh axis,
-    /// the result keeps varying over `axis_name`.
+    /// the result keeps varying over `axes`.
     ///
     /// # Parameters
     ///
-    ///   - `axis_name`: Name of an axis bound by an enclosing `batch` level or manual region.
+    ///   - `axes`: Name of an axis bound by an enclosing `batch` level or manual region, or names of several
+    ///     manual mesh axes whose combined axis is used.
     ///   - `concatenation_axis`: Position of the inserted axis in the result, whose rank is one more than the rank
     ///     of this value. Negative positions count from the end, so `-1` appends a new trailing axis.
     ///
@@ -1157,26 +1183,27 @@ pub trait ParallelAllGather<T = <Self as Capability>::Universe>: Capability + Si
     ///
     /// Returns the errors of [`ParallelAllGather::parallel_all_gather_with_options`].
     #[inline]
-    fn parallel_all_gather<ConcatenationAxis: Into<Axis>>(
+    fn parallel_all_gather<Axes: Into<CollectiveAxes>, ConcatenationAxis: Into<Axis>>(
         &self,
-        axis_name: &str,
+        axes: Axes,
         concatenation_axis: ConcatenationAxis,
     ) -> Result<Self, ProgramError> {
         self.parallel_all_gather_with_options(
-            axis_name,
+            axes,
             concatenation_axis,
             CollectiveOptions::default(),
             ParallelAllGatherOutputVariance::Varying,
         )
     }
 
-    /// Returns the values of the participants of the named axis `axis_name`, concatenated along the existing
+    /// Returns the values of the participants of the named axes `axes`, concatenated along the existing
     /// `concatenation_axis`, so that participant `i`'s value becomes chunk `i` of that axis. Over a manual mesh axis,
-    /// the result keeps varying over `axis_name`.
+    /// the result keeps varying over `axes`.
     ///
     /// # Parameters
     ///
-    ///   - `axis_name`: Name of an axis bound by an enclosing `batch` level or manual region.
+    ///   - `axes`: Name of an axis bound by an enclosing `batch` level or manual region, or names of several
+    ///     manual mesh axes whose combined axis is used.
     ///   - `concatenation_axis`: Axis of this value along which the values are concatenated.
     ///     Negative axes count from the end.
     ///
@@ -1184,26 +1211,27 @@ pub trait ParallelAllGather<T = <Self as Capability>::Universe>: Capability + Si
     ///
     /// Returns the errors of [`ParallelAllGather::parallel_all_gather_with_options`].
     #[inline]
-    fn parallel_all_gather_tiled<ConcatenationAxis: Into<Axis>>(
+    fn parallel_all_gather_tiled<Axes: Into<CollectiveAxes>, ConcatenationAxis: Into<Axis>>(
         &self,
-        axis_name: &str,
+        axes: Axes,
         concatenation_axis: ConcatenationAxis,
     ) -> Result<Self, ProgramError> {
         self.parallel_all_gather_with_options(
-            axis_name,
+            axes,
             concatenation_axis,
             CollectiveOptions::new(CollectiveMode::Tiled),
             ParallelAllGatherOutputVariance::Varying,
         )
     }
 
-    /// Returns the values of the participants of the named axis `axis_name`, gathered along `concatenation_axis` with
+    /// Returns the values of the participants of the named axes `axes`, gathered along `concatenation_axis` with
     /// the tiling mode and participant groups of `options` and with the manual variation that `output_variance`
     /// selects.
     ///
     /// # Parameters
     ///
-    ///   - `axis_name`: Name of an axis bound by an enclosing `batch` level or manual region.
+    ///   - `axes`: Name of an axis bound by an enclosing `batch` level or manual region, or names of several
+    ///     manual mesh axes whose combined axis is used.
     ///   - `concatenation_axis`: Position of the inserted axis in the result in untiled mode, or axis of this value
     ///     along which the values are concatenated in tiled mode. Negative axes count from the end of the result in
     ///     untiled mode, whose rank is one more than the rank of this value, and from the end of this value in tiled
@@ -1218,13 +1246,13 @@ pub trait ParallelAllGather<T = <Self as Capability>::Universe>: Capability + Si
     /// # Errors
     ///
     /// Returns a [`ProgramError::Axis`] error wrapping [`AxisError::UnboundAxisName`] when no enclosing binder binds
-    /// `axis_name` or [`AxisError::OutOfBounds`] when `concatenation_axis` is out of bounds, and a [`ProgramError`]
+    /// `axes` or [`AxisError::OutOfBounds`] when `concatenation_axis` is out of bounds, and a [`ProgramError`]
     /// if the participant groups are invalid or combined with invariant or reduced output variance, if reduced output
     /// variance is requested for an axis that is not a manual mesh axis, or if this value carries reduction state
     /// (i.e., is unreduced or reduced) over the gathered manual mesh axis.
-    fn parallel_all_gather_with_options<ConcatenationAxis: Into<Axis>>(
+    fn parallel_all_gather_with_options<Axes: Into<CollectiveAxes>, ConcatenationAxis: Into<Axis>>(
         &self,
-        axis_name: &str,
+        axes: Axes,
         concatenation_axis: ConcatenationAxis,
         options: CollectiveOptions,
         output_variance: ParallelAllGatherOutputVariance,
@@ -1233,24 +1261,26 @@ pub trait ParallelAllGather<T = <Self as Capability>::Universe>: Capability + Si
 
 impl ParallelAllGather<ArrayType> for Array {
     #[inline]
-    fn parallel_all_gather_with_options<ConcatenationAxis: Into<Axis>>(
+    fn parallel_all_gather_with_options<Axes: Into<CollectiveAxes>, ConcatenationAxis: Into<Axis>>(
         &self,
-        axis_name: &str,
+        axes: Axes,
         _concatenation_axis: ConcatenationAxis,
         _options: CollectiveOptions,
         _output_variance: ParallelAllGatherOutputVariance,
     ) -> Result<Self, ProgramError> {
         // A concrete `Array` never executes inside an axis binder, because the values under a `batch` level or inside
         // a manual region are tracers, so every axis name is unbound for it.
-        Err(AxisError::UnboundAxisName { name: axis_name.to_string() }.into())
+        let axes = axes.into();
+        axes.validate(PARALLEL_ALL_GATHER_OPERATION_NAME)?;
+        Err(AxisError::UnboundAxisName { name: axes.names()[0].clone() }.into())
     }
 }
 
 impl<A: Value<Type = ArrayType> + ParallelAllGather<ArrayType>> ParallelAllGather<ArrayIrType> for ArrayIrValue<A> {
     #[inline]
-    fn parallel_all_gather_with_options<ConcatenationAxis: Into<Axis>>(
+    fn parallel_all_gather_with_options<Axes: Into<CollectiveAxes>, ConcatenationAxis: Into<Axis>>(
         &self,
-        axis_name: &str,
+        axes: Axes,
         concatenation_axis: ConcatenationAxis,
         options: CollectiveOptions,
         output_variance: ParallelAllGatherOutputVariance,
@@ -1258,7 +1288,7 @@ impl<A: Value<Type = ArrayType> + ParallelAllGather<ArrayType>> ParallelAllGathe
         // A concrete array IR value performs the collective through its array member.
         let array = ValueProjection::<ArrayType>::into_projected(self.clone())?;
         Ok(<Self as ValueProjection<ArrayType>>::from_projected(array.parallel_all_gather_with_options(
-            axis_name,
+            axes,
             concatenation_axis,
             options,
             output_variance,
@@ -1270,15 +1300,15 @@ impl<V: ParallelAllGather<ArrayIrType> + ValueProjection<ArrayType, Projected = 
     ParallelAllGather<ArrayType> for ProjectedValue<ArrayType, V>
 {
     #[inline]
-    fn parallel_all_gather_with_options<ConcatenationAxis: Into<Axis>>(
+    fn parallel_all_gather_with_options<Axes: Into<CollectiveAxes>, ConcatenationAxis: Into<Axis>>(
         &self,
-        axis_name: &str,
+        axes: Axes,
         concatenation_axis: ConcatenationAxis,
         options: CollectiveOptions,
         output_variance: ParallelAllGatherOutputVariance,
     ) -> Result<Self, ProgramError> {
         self.value()
-            .parallel_all_gather_with_options(axis_name, concatenation_axis, options, output_variance)?
+            .parallel_all_gather_with_options(axes, concatenation_axis, options, output_variance)?
             .into_projected()
             .map_err(Into::into)
     }
@@ -1290,9 +1320,9 @@ impl<
         > + ParallelVary,
 > ParallelAllGather<ArrayType> for V
 {
-    fn parallel_all_gather_with_options<ConcatenationAxis: Into<Axis>>(
+    fn parallel_all_gather_with_options<Axes: Into<CollectiveAxes>, ConcatenationAxis: Into<Axis>>(
         &self,
-        axis_name: &str,
+        axes: Axes,
         concatenation_axis: ConcatenationAxis,
         options: CollectiveOptions,
         output_variance: ParallelAllGatherOutputVariance,
@@ -1302,36 +1332,27 @@ impl<
         // copy is gathered, while reduction state over the axis is rejected first, so that it is reported as an
         // all-gather error rather than as a `parallel_vary` error. An untiled gather inserts an axis, so its
         // concatenation axis is a position in the result, whose rank is one more than the rank of the input.
+        let axes = axes.into();
         let context = self.domain();
-        let axis_size = resolve_named_axis_size(&context, axis_name)?;
-        let named_axis = context.named_axis(axis_name);
+        let (axis_size, mesh) = resolve_collective_axes(&context, PARALLEL_ALL_GATHER_OPERATION_NAME, &axes)?;
 
         // Unchecked manual regions use the ordinary collective and its defensive transpose regardless of the
         // requested variance optimization. The physical participants and shape transformation are unchanged.
-        let output_variance = if matches!(named_axis, Some(NamedAxis::Mesh { checks_manual_variation: false, .. })) {
-            ParallelAllGatherOutputVariance::Varying
-        } else {
-            output_variance
-        };
+        let output_variance = unchecked_output_variance(&context, &axes, output_variance);
 
         let result_rank = self.r#type().rank() + usize::from(options.mode == CollectiveMode::Untiled);
         let concatenation_axis = concatenation_axis.into().normalize(result_rank)?;
-        let mut operation = ParallelAllGatherOperation::new(
-            axis_name.to_string(),
-            axis_size,
-            concatenation_axis,
-            options,
-            output_variance,
-        );
+        let mut operation =
+            ParallelAllGatherOperation::new(axes.clone(), axis_size, concatenation_axis, options, output_variance);
         operation.effective_axis_size()?;
         let mut input = self.clone();
-        if let Some(binding) = named_axis.as_ref()
-            && binding.checks_manual_variation()
-            && let Some(mesh) = binding.mesh().cloned()
-        {
+        if let Some(mesh) = mesh {
             operation.validate_input_reduction_state(self.r#type().as_ref())?;
-            if !self.r#type().sharding().is_some_and(|sharding| sharding.varying_manual_axes().contains(axis_name)) {
-                input = input.parallel_vary(axis_name)?;
+            for axis_name in axes.names() {
+                if !input.r#type().sharding().is_some_and(|sharding| sharding.varying_manual_axes().contains(axis_name))
+                {
+                    input = input.parallel_vary(axis_name)?;
+                }
             }
             operation = operation.with_mesh(mesh);
         }
@@ -1356,9 +1377,9 @@ where
     <V as ValueProjection<DimensionType>>::Projected: Value<Type = DimensionType> + Mul,
     <V as ValueProjection<ArrayType>>::Projected: ParallelVary,
 {
-    fn parallel_all_gather_with_options<ConcatenationAxis: Into<Axis>>(
+    fn parallel_all_gather_with_options<Axes: Into<CollectiveAxes>, ConcatenationAxis: Into<Axis>>(
         &self,
-        axis_name: &str,
+        axes: Axes,
         concatenation_axis: ConcatenationAxis,
         options: CollectiveOptions,
         output_variance: ParallelAllGatherOutputVariance,
@@ -1370,41 +1391,33 @@ where
         // than as a `parallel_vary` error. An untiled gather inserts an axis, so its concatenation axis is a position
         // in the result, whose rank is one more than the rank of the input. The axis is normalized before the explicit
         // result extents are derived from the input extents.
+        let axes = axes.into();
         let context = self.domain();
-        let axis_size = resolve_named_axis_size(&context, axis_name)?;
-        let named_axis = context.named_axis(axis_name);
+        let (axis_size, mesh) = resolve_collective_axes(&context, PARALLEL_ALL_GATHER_OPERATION_NAME, &axes)?;
 
         // The unchecked binder owns physical communication while the primitive keeps ordinary array typing.
-        let output_variance = if matches!(named_axis, Some(NamedAxis::Mesh { checks_manual_variation: false, .. })) {
-            ParallelAllGatherOutputVariance::Varying
-        } else {
-            output_variance
-        };
+        let output_variance = unchecked_output_variance(&context, &axes, output_variance);
 
         let input_type = self.r#type();
         let input_type = <&ArrayType>::try_from(input_type.as_ref())?;
         let rank = input_type.rank();
         let concatenation_axis =
             concatenation_axis.into().normalize(rank + usize::from(options.mode == CollectiveMode::Untiled))?;
-        let mut operation = ParallelAllGatherOperation::new(
-            axis_name.to_string(),
-            axis_size,
-            concatenation_axis,
-            options,
-            output_variance,
-        );
+        let mut operation =
+            ParallelAllGatherOperation::new(axes.clone(), axis_size, concatenation_axis, options, output_variance);
 
         let effective_axis_size = operation.effective_axis_size()?;
         let mut input = self.clone();
-        if let Some(binding) = named_axis.as_ref()
-            && binding.checks_manual_variation()
-            && let Some(mesh) = binding.mesh().cloned()
-        {
+        if let Some(mesh) = mesh {
             operation.validate_input_reduction_state(input_type)?;
-            if !input_type.sharding().is_some_and(|sharding| sharding.varying_manual_axes().contains(axis_name)) {
-                let array = ValueProjection::<ArrayType>::into_projected(self.clone())?;
-                input = <V as ValueProjection<ArrayType>>::from_projected(array.parallel_vary(axis_name)?);
+            let mut array = ValueProjection::<ArrayType>::into_projected(self.clone())?;
+            for axis_name in axes.names() {
+                if !array.r#type().sharding().is_some_and(|sharding| sharding.varying_manual_axes().contains(axis_name))
+                {
+                    array = array.parallel_vary(axis_name)?;
+                }
             }
+            input = <V as ValueProjection<ArrayType>>::from_projected(array);
             operation = operation.with_mesh(mesh);
         }
 
@@ -1424,6 +1437,23 @@ where
         let mut outputs = context.bind(operation, Vec::new(), inputs.as_slice())?;
         check_count!("output", outputs, 1, ProgramError);
         Ok(outputs.remove(0))
+    }
+}
+
+/// Returns `output_variance`, or [`ParallelAllGatherOutputVariance::Varying`] when the axes named by `axis_names` are
+/// manual mesh axes whose binding does not check manual variation, because such regions use the ordinary collective
+/// and its defensive transpose regardless of the requested variance optimization.
+fn unchecked_output_variance<C: NamedAxes>(
+    context: &C,
+    axis_names: &CollectiveAxes,
+    output_variance: ParallelAllGatherOutputVariance,
+) -> ParallelAllGatherOutputVariance {
+    if axis_names.names().iter().any(|axis_name| {
+        matches!(context.named_axis(axis_name), Some(NamedAxis::Mesh { checks_manual_variation: false, .. }))
+    }) {
+        ParallelAllGatherOutputVariance::Varying
+    } else {
+        output_variance
     }
 }
 
@@ -1468,7 +1498,7 @@ mod tests {
             ParallelAllGatherOutputVariance::Varying,
         );
         assert_eq!(operation.name(), PARALLEL_ALL_GATHER_OPERATION_NAME);
-        assert_eq!(operation.axis_name(), "x");
+        assert_eq!(operation.axes().single(), Some("x"));
         assert_eq!(operation.axis_size(), 4);
         assert_eq!(operation.concatenation_axis(), 0);
         assert_eq!(operation.options(), &CollectiveOptions::tiled());

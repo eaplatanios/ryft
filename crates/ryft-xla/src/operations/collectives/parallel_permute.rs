@@ -17,7 +17,7 @@ pub(crate) fn lower_parallel_permute_to_mlir<'b, 'c: 'b, 't: 'c>(
     location: LocationRef<'c, 't>,
 ) -> Result<Vec<ValueRef<'b, 'c, 't>>, Error> {
     let (replica_groups, _) =
-        collective_replica_groups(collective_state, operation.axis_name(), operation.axis_size(), None)?;
+        collective_replica_groups(collective_state, operation.axes(), operation.axis_size(), None)?;
     let mut source_target_pairs = Vec::with_capacity(replica_groups.len() * operation.source_target_pairs().len());
     for group in &replica_groups {
         for (source, target) in operation.source_target_pairs() {
@@ -47,7 +47,7 @@ impl LowerableOperation for ParallelPermuteOperation {
         let collective_state = lowerer.collective_state.clone();
         collective_state.check_manual_collective(
             self.name(),
-            self.axis_name(),
+            self.axes(),
             self.axis_size(),
             self.mesh(),
             output_types,

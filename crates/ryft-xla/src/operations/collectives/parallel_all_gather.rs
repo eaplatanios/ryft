@@ -26,7 +26,7 @@ pub(crate) fn lower_parallel_all_gather_to_mlir<'b, 'c: 'b, 't: 'c>(
 ) -> Result<Vec<ValueRef<'b, 'c, 't>>, Error> {
     let (replica_groups, _) = collective_replica_groups(
         collective_state,
-        operation.axis_name(),
+        operation.axes(),
         operation.axis_size(),
         operation.options().axis_index_groups(),
     )?;
@@ -77,7 +77,7 @@ impl LowerableOperation for ParallelAllGatherOperation {
         let collective_state = lowerer.collective_state.clone();
         collective_state.check_manual_collective(
             self.name(),
-            self.axis_name(),
+            self.axes(),
             self.axis_size(),
             self.mesh(),
             output_types,
@@ -115,7 +115,7 @@ impl MemberLowerableOperation<ArrayIrType> for ParallelAllGatherOperation {
         let block = &mut lowerer.block;
         collective_state.check_manual_collective(
             self.name(),
-            self.axis_name(),
+            self.axes(),
             self.axis_size(),
             self.mesh(),
             output_types,

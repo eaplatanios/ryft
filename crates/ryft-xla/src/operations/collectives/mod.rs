@@ -34,9 +34,9 @@ pub(crate) mod parallel_vary;
 /// combined axis, which linearizes the named axes in the given order with the first name major (refer to
 /// [`CollectiveAxes`]). Errors outside manual regions, for axes that no enclosing region binds as manual mesh axes,
 /// and for axes whose binding regions have different meshes.
-pub(crate) fn mesh_axis_replica_groups(
+pub(crate) fn mesh_axis_replica_groups<A: Into<CollectiveAxes>>(
     collective_state: &CollectiveLoweringState,
-    axis_name: impl Into<CollectiveAxes>,
+    axis_name: A,
 ) -> Result<(Vec<Vec<usize>>, usize), Error> {
     let axis_names = axis_name.into();
     if axis_names.names().is_empty() {
@@ -102,9 +102,9 @@ pub(crate) fn mesh_axis_replica_groups(
 
 /// Resolves the physical replica groups for one collective, expanding each logical subgroup within every fixed
 /// coordinate of the enclosing mesh's other axes.
-pub(crate) fn collective_replica_groups(
+pub(crate) fn collective_replica_groups<A: Into<CollectiveAxes>>(
     collective_state: &CollectiveLoweringState,
-    axis_name: impl Into<CollectiveAxes>,
+    axis_name: A,
     axis_size: usize,
     axis_index_groups: Option<&[Vec<usize>]>,
 ) -> Result<(Vec<Vec<usize>>, usize), Error> {

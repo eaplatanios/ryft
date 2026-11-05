@@ -27,8 +27,8 @@ use crate::operations::collectives::parallel_vary::{
     ManualVariationAlignment, PARALLEL_VARY_OPERATION_NAME, ParallelVary, ParallelVaryOperation,
 };
 use crate::operations::collectives::{
-    CollectiveArrayExtentBatchingPolicy, CollectiveOptions, effective_collective_axis_size, resolve_named_axis_size,
-    validate_manual_mesh_input,
+    CollectiveArrayExtentBatchingPolicy, CollectiveAxes, CollectiveOptions, effective_collective_axis_size,
+    resolve_named_axis_size, validate_manual_mesh_input,
 };
 use crate::operations::comparisons::{Compare, CompareOperation};
 use crate::operations::constants::one::{One, OneOperation};
@@ -1071,7 +1071,7 @@ impl<
         P::collective_axis_extent(
             context,
             PARALLEL_RAGGED_ALL_TO_ALL_OPERATION_NAME,
-            self.axis_name(),
+            &CollectiveAxes::from(self.axis_name()),
             self.axis_size,
         )?;
 
