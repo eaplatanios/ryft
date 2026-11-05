@@ -4,7 +4,7 @@ use std::iter::Peekable;
 use std::marker::PhantomData;
 use std::mem::{ManuallyDrop, MaybeUninit};
 use std::str::Chars;
-use std::sync::Arc;
+use std::sync::{Arc, Mutex};
 
 use crate::clients::ClientHandle;
 use crate::{
@@ -1324,17 +1324,104 @@ impl Buffer<'_> {
         .and_then(|handle| unsafe { Self::from_c_api(handle, self.api(), self.client.get()) })
     }
 
-    /// Copies the underlying data of this [`Buffer`] into a [`Vec`] that is allocated on host memory, with the
-    /// provided optional [`Layout`]. This is similar to [`Self::copy_to_host_buffer`], except that it allocates
-    /// a buffer for the result instead of taking in a reference to a pre-allocated buffer. Refer to the documentation
-    /// of that function for more information.
+    /// Copies the underlying data of this [`Buffer`] into a [`Vec`] that is allocated on host memory, with the provided
+    /// optional [`Layout`]. This is similar to [`Self::copy_to_host_buffer`], except that it allocates a buffer of the
+    /// required size for the result instead of taking one in. Refer to the documentation of that function for more
+    /// information.
+    #[allow(clippy::uninit_vec)]
     pub fn copy_to_host(&self, layout: Option<Layout>) -> Result<Event<Vec<u8>>, Error> {
+        let size = self.host_size_in_bytes(layout.as_ref())?;
+        let mut buffer = Vec::with_capacity(size);
+
+        // SAFETY: the copy writes all `size` bytes before the returned event completes, and the event returns the
+        // buffer only once it has completed successfully.
+        unsafe { buffer.set_len(size) };
+
+        self.copy_to_retained_host_buffer(layout.as_ref(), buffer)
+    }
+
+    /// Copies the underlying data of this [`Buffer`] into the provided host `buffer`, with the provided optional
+    /// [`Layout`], returning an [`Event`] that yields `buffer` back once the copy completes. If no layout is provided,
+    /// then the resulting data will have the same layout as this [`Buffer`]. Taking ownership of `buffer` lets callers
+    /// reuse host allocations across copies (e.g., pinned host memory) while keeping the copy safe: `buffer` is
+    /// retained until the copy completes, even if the returned [`Event`] is dropped first, and dropping that
+    /// [`Event`] never blocks.
+    ///
+    /// Note that this copy is an asynchronous (i.e., non-blocking) operation and this [`Buffer`] will be kept alive
+    /// for the duration of this operation. If the buffer is dropped while the copy is still taking place, the
+    /// underlying memory will not be freed by PJRT until the copy is completed.
+    ///
+    /// Returns an [`Error`] if `buffer` is smaller than the host representation of this [`Buffer`] in the requested
+    /// layout, before starting the copy.
+    pub fn copy_to_host_buffer<B: AsMut<[u8]> + Send + 'static>(
+        &self,
+        layout: Option<Layout>,
+        mut buffer: B,
+    ) -> Result<Event<B>, Error> {
+        let size = self.host_size_in_bytes(layout.as_ref())?;
+        let length = buffer.as_mut().len();
+        if length < size {
+            return Err(Error::invalid_argument(format!(
+                "the destination host buffer holds {length} bytes, but the copy needs {size}",
+            )));
+        }
+        self.copy_to_retained_host_buffer(layout.as_ref(), buffer)
+    }
+
+    /// Copies a slice of the raw underlying data of this [`Buffer`] into a [`Vec`] that is allocated on host memory.
+    /// This is similar to [`Self::copy_raw_to_host_buffer`], except that it allocates a buffer for the result with
+    /// the provided `size` instead of taking one in. Refer to the documentation of that function for more information.
+    #[allow(clippy::uninit_vec)]
+    pub fn copy_raw_to_host(&self, offset: usize, size: usize) -> Result<Event<Vec<u8>>, Error> {
+        let mut buffer = Vec::with_capacity(size);
+
+        // SAFETY: the copy writes all `size` bytes before the returned event completes, and the event returns the
+        // buffer only once it has completed successfully.
+        unsafe { buffer.set_len(size) };
+
+        self.copy_raw_to_host_buffer(buffer, offset)
+    }
+
+    /// Copies a slice of the raw underlying data of this [`Buffer`] into the provided host `buffer`, returning an
+    /// [`Event`] that yields `buffer` back once the copy completes. The slice is determined by the provided `offset`
+    /// and the length of `buffer`. Specifically, assuming the underling buffer data is represented as a contiguous byte
+    /// array, the slice that will be copied consists of the `buffer.as_mut().len()` bytes in that array starting at the
+    /// `offset` position, and PJRT reports a slice that exceeds that array through the returned [`Event`]. As for
+    /// [`Self::copy_to_host_buffer`], `buffer` is retained until the copy completes, even if the returned [`Event`]
+    /// is dropped first.
+    ///
+    /// Note that this copy is an asynchronous (i.e., non-blocking) operation and this [`Buffer`] will be kept alive
+    /// for the duration of this operation. If the buffer is dropped while the copy is still taking place, the
+    /// underlying memory will not be freed by PJRT until the copy is completed.
+    pub fn copy_raw_to_host_buffer<B: AsMut<[u8]> + Send + 'static>(
+        &self,
+        buffer: B,
+        offset: usize,
+    ) -> Result<Event<B>, Error> {
+        use ffi::PJRT_Buffer_CopyRawToHost_Args;
+        let (buffer, destination, length) = retained_host_destination(buffer);
+        let event = invoke_pjrt_api_error_fn!(
+            self.api(),
+            PJRT_Buffer_CopyRawToHost,
+            {
+                buffer = self.to_c_api(),
+                dst = destination as *mut _,
+                offset = offset as i64,
+                transfer_size = length as i64,
+            },
+            { event },
+        )?;
+        unsafe { Event::from_c_api_with_retained_output(event, self.api(), buffer) }
+    }
+
+    /// Returns the number of bytes that the host representation of this [`Buffer`] in `layout` occupies.
+    fn host_size_in_bytes(&self, layout: Option<&Layout>) -> Result<usize, Error> {
         use ffi::PJRT_Buffer_ToHostBuffer_Args;
-        let mut layout_handle = layout.as_ref().map(|layout| unsafe { layout.to_c_api() });
+        let mut layout_handle = layout.map(|layout| unsafe { layout.to_c_api() });
         let layout_handle = layout_handle.as_mut().map(|layout| layout as *mut _).unwrap_or(std::ptr::null_mut());
 
         // Invoke `PJRT_Buffer_ToHostBuffer` with `dst` set to a null pointer to get the required `dst_size`.
-        let mut size = invoke_pjrt_api_error_fn!(
+        let size = invoke_pjrt_api_error_fn!(
             self.api(),
             PJRT_Buffer_ToHostBuffer,
             {
@@ -1346,109 +1433,34 @@ impl Buffer<'_> {
             { dst_size },
         )?;
 
-        if size == 0 {
-            // Some plugins successfully handle the size-query call without populating `dst_size`. Use the reported
-            // storage size as a conservative fallback so the follow-up copy never receives an undersized buffer.
-            size = self.on_device_size_in_bytes()?;
-        }
-
-        // Allocate a buffer with the appropriate size and invoke `PJRT_Buffer_ToHostBuffer` again, passing that buffer.
-        let mut buffer = Vec::new();
-        buffer.reserve_exact(size);
-        unsafe { buffer.set_len(size) };
-        let event = invoke_pjrt_api_error_fn!(
-            self.api(),
-            PJRT_Buffer_ToHostBuffer,
-            {
-                src = self.to_c_api(),
-                host_layout = layout_handle,
-                dst = buffer.as_mut_ptr() as *mut _,
-                dst_size = buffer.len(),
-            },
-            { event },
-        )?;
-
-        unsafe { Event::from_c_api(event, self.api(), buffer) }
+        // Some plugins successfully handle the size-query call without populating `dst_size`. Use the reported
+        // storage size as a conservative fallback so that the copy never receives an undersized buffer.
+        if size == 0 { self.on_device_size_in_bytes() } else { Ok(size) }
     }
 
-    /// Copies the underlying data of this [`Buffer`] into a buffer that is allocated on host memory, with the
-    /// provided optional [`Layout`]. If no layout is provided, then the resulting data will have the same layout
-    /// as this [`Buffer`].
-    ///
-    /// Note that this copy is an asynchronous (i.e., non-blocking) operation and this [`Buffer`] will be kept alive
-    /// for the duration of this operation. If the buffer is dropped while the copy is still taking place, the
-    /// underlying memory will not be freed by PJRT until the copy is completed.
-    pub fn copy_to_host_buffer<'b, B: AsMut<[u8]>>(
+    /// Starts copying this [`Buffer`] in `layout` into `buffer`, which must hold at least its host representation,
+    /// and returns the [`Event`] that retains `buffer` until the copy completes.
+    fn copy_to_retained_host_buffer<B: AsMut<[u8]> + Send + 'static>(
         &self,
-        layout: Option<Layout>,
-        buffer: &'b mut B,
-    ) -> Result<Event<&'b mut B>, Error> {
+        layout: Option<&Layout>,
+        buffer: B,
+    ) -> Result<Event<B>, Error> {
         use ffi::PJRT_Buffer_ToHostBuffer_Args;
-        let mut layout_handle = layout.as_ref().map(|layout| unsafe { layout.to_c_api() });
+        let mut layout_handle = layout.map(|layout| unsafe { layout.to_c_api() });
         let layout_handle = layout_handle.as_mut().map(|layout| layout as *mut _).unwrap_or(std::ptr::null_mut());
-        invoke_pjrt_api_error_fn!(
+        let (buffer, destination, length) = retained_host_destination(buffer);
+        let event = invoke_pjrt_api_error_fn!(
             self.api(),
             PJRT_Buffer_ToHostBuffer,
             {
                 src = self.to_c_api(),
                 host_layout = layout_handle,
-                dst = buffer.as_mut() as *mut _ as *mut _,
-                dst_size = buffer.as_mut().len(),
-            },
-            { event },
-        )
-        .and_then(|handle| unsafe { Event::from_c_api(handle, self.api(), buffer) })
-    }
-
-    /// Copies a slice of the raw underlying data of this [`Buffer`] into a [`Vec`] that is allocated on host memory.
-    /// This is similar to [`Self::copy_raw_to_host_buffer`], except that it allocates a buffer for the result with
-    /// the provided `size` instead of taking in a reference to a pre-allocated buffer. Refer to the documentation of
-    /// that function for more information.
-    pub fn copy_raw_to_host(&self, offset: usize, size: usize) -> Result<Event<Vec<u8>>, Error> {
-        use ffi::PJRT_Buffer_CopyRawToHost_Args;
-        let mut buffer = Vec::new();
-        buffer.reserve_exact(size);
-        unsafe { buffer.set_len(size) };
-        let event = invoke_pjrt_api_error_fn!(
-            self.api(),
-            PJRT_Buffer_CopyRawToHost,
-            {
-                buffer = self.to_c_api(),
-                dst = buffer.as_mut_ptr() as *mut _,
-                offset = offset as i64,
-                transfer_size = size as i64,
+                dst = destination as *mut _,
+                dst_size = length,
             },
             { event },
         )?;
-        unsafe { Event::from_c_api(event, self.api(), buffer) }
-    }
-
-    /// Copies a slice of the raw underlying data of this [`Buffer`] into a buffer that is allocated on host memory.
-    /// The slice is determined by the provided `offset` and the length of the provided `buffer`. Specifically, assuming
-    /// the underling buffer data is represented as a contiguous byte array, the slice that will be copied consists of
-    /// the `buffer.as_ref().len()` bytes in that array starting at the `offset` position.
-    ///
-    /// Note that this copy is an asynchronous (i.e., non-blocking) operation and this [`Buffer`] will be kept alive
-    /// for the duration of this operation. If the buffer is dropped while the copy is still taking place, the
-    /// underlying memory will not be freed by PJRT until the copy is completed.
-    pub fn copy_raw_to_host_buffer<'b, B: AsMut<[u8]>>(
-        &self,
-        buffer: &'b mut B,
-        offset: usize,
-    ) -> Result<Event<&'b mut B>, Error> {
-        use ffi::PJRT_Buffer_CopyRawToHost_Args;
-        invoke_pjrt_api_error_fn!(
-            self.api(),
-            PJRT_Buffer_CopyRawToHost,
-            {
-                buffer = self.to_c_api(),
-                dst = buffer.as_mut() as *mut _ as *mut _,
-                offset = offset as i64,
-                transfer_size = buffer.as_mut().len() as i64,
-            },
-            { event },
-        )
-        .and_then(|handle| unsafe { Event::from_c_api(handle, self.api(), buffer) })
+        unsafe { Event::from_c_api_with_retained_output(event, self.api(), buffer) }
     }
 
     /// Performs the same operation as [`Buffer::copy_raw_to_host_buffer`] except that instead of requiring the host
@@ -1461,19 +1473,32 @@ impl Buffer<'_> {
     /// an [`Error`] occurs while preparing the destination host buffer, you must still call the closure with
     /// `Some(error)` (which forwards the error to PJRT) instead of skipping the call. Otherwise, the associated
     /// future/event may never be resolved by PJRT, thus never rendering this [`Buffer`] ready.
+    ///
+    /// # Safety
+    ///
+    /// PJRT copies into the host buffer passed to the closure asynchronously, until the returned [`Event`] completes,
+    /// and that [`Event`] does not borrow the buffer. The caller must therefore keep that buffer alive and must neither
+    /// read nor write it until the returned [`Event`] completes. The closure checks that the buffer can hold the
+    /// transfer (i.e., the on-device size of this [`Buffer`] minus `offset`) and otherwise fails the transfer
+    /// with an [`Error`] instead of passing the buffer to PJRT.
     #[allow(clippy::type_complexity)]
-    pub fn copy_raw_to_host_buffer_future<'b, B: AsMut<[u8]>>(
+    pub unsafe fn copy_raw_to_host_buffer_future<'b, B: AsMut<[u8]>>(
         &self,
         offset: usize,
     ) -> Result<(impl FnOnce(&'b mut B, Option<Error>), Event<()>), Error> {
         use ffi::PJRT_Buffer_CopyRawToHostFuture_Args;
+        // The transfer covers the bytes from `offset` to the end of the on-device buffer.
+        let transfer_size = self.on_device_size_in_bytes()?.checked_sub(offset).ok_or_else(|| {
+            Error::invalid_argument("the offset of a raw copy must not exceed the on-device size of the buffer")
+        })?;
+
         let (event_handle, callback_data, callback_fn) = invoke_pjrt_api_error_fn!(
             self.api(),
             PJRT_Buffer_CopyRawToHostFuture,
             {
                 buffer = self.to_c_api(),
                 offset = offset as i64,
-                transfer_size = self.on_device_size_in_bytes()? as i64,
+                transfer_size = transfer_size as i64,
             },
             { event, callback_data, future_ready_callback },
         )?;
@@ -1481,6 +1506,16 @@ impl Buffer<'_> {
         let callback = move |buffer: &'b mut B, error: Option<Error>| {
             if let Some(callback_fn) = callback_fn {
                 use ffi::PJRT_Buffer_CopyRawToHostFuture_Callback_Args;
+                let length = buffer.as_mut().len();
+                let error = error.or_else(|| {
+                    (length < transfer_size).then(|| {
+                        Error::invalid_argument(format!(
+                            "the destination host buffer holds {length} bytes, but the transfer needs {transfer_size}",
+                        ))
+                    })
+                });
+                let destination =
+                    if error.is_some() { std::ptr::null_mut() } else { buffer.as_mut() as *mut _ as *mut _ };
                 let (error_code, error_message) = match error {
                     Some(error) => (error.code(), error.message()),
                     None => (crate::errors::ffi::PJRT_Error_Code_OK, std::ffi::CString::new("").unwrap()),
@@ -1491,7 +1526,7 @@ impl Buffer<'_> {
                         error_code,
                         error_message.as_ptr(),
                         error_message.count_bytes(),
-                        buffer.as_mut() as *mut _ as *mut _,
+                        destination,
                     ) as *mut _)
                 };
             }
@@ -2624,6 +2659,20 @@ impl<'s> Client<'s> {
         )
         .map(|_| DmaMappedBuffer { ptr, len, api: self.api(), client, owner: PhantomData })
     }
+}
+
+/// Places `buffer` into the shared storage that the [`Event`] of a device-to-host copy into it retains, before its
+/// address is handed to PJRT, so that the address stays stable until the copy completes even when `buffer` stores its
+/// bytes inline. Returns that storage together with the address and length of the destination bytes. Refer to
+/// [`Event::from_c_api_with_retained_output`] for more information.
+fn retained_host_destination<B: AsMut<[u8]>>(buffer: B) -> (Arc<Mutex<Option<B>>>, *mut u8, usize) {
+    let buffer = Arc::new(Mutex::new(Some(buffer)));
+    let (destination, length) = {
+        let mut guard = buffer.lock().expect("PJRT host destination mutex poisoned");
+        let destination = guard.as_mut().unwrap().as_mut();
+        (destination.as_mut_ptr(), destination.len())
+    };
+    (buffer, destination, length)
 }
 
 #[allow(dead_code, non_camel_case_types, non_snake_case, non_upper_case_globals)]
@@ -4042,9 +4091,17 @@ mod tests {
             let buffer = client
                 .buffer(data.as_slice(), BufferType::U8, [data.len() as u64], None, device.clone(), None)
                 .unwrap();
-            let mut destination = vec![0u8; data.len()];
-            let _ = buffer.copy_to_host_buffer(None, &mut destination).unwrap().r#await().unwrap();
+            let destination = buffer.copy_to_host_buffer(None, vec![0u8; data.len()]).unwrap().r#await().unwrap();
             assert_eq!(destination.as_slice(), data.as_slice());
+
+            // An inline destination works as well, and an undersized one is rejected before the copy starts.
+            let destination = buffer.copy_to_host_buffer(None, [0u8; 4]).unwrap().r#await().unwrap();
+            assert_eq!(destination, data);
+            assert!(matches!(
+                buffer.copy_to_host_buffer(None, [0u8; 3]),
+                Err(Error::InvalidArgument { message, .. })
+                    if message == "the destination host buffer holds 3 bytes, but the copy needs 4",
+            ));
         });
     }
 
@@ -4080,19 +4137,18 @@ mod tests {
             let buffer = client
                 .buffer(data.as_slice(), BufferType::U8, [data.len() as u64], None, device.clone(), None)
                 .unwrap();
-            let mut destination = vec![0u8; 3];
             match platform {
                 TestPlatform::Mps => {
                     assert!(matches!(
-                        buffer.copy_raw_to_host_buffer(&mut destination, 1),
+                        buffer.copy_raw_to_host_buffer(vec![0u8; 3], 1),
                         Err(Error::MissingFunction { function_name: "PJRT_Buffer_CopyRawToHost", pjrt_version, .. })
                             if pjrt_version == client.version(),
                     ));
-                    assert_eq!(destination.as_slice(), vec![0u8; 3]);
                 }
                 _ => {
-                    let _ = buffer.copy_raw_to_host_buffer(&mut destination, 1).unwrap().r#await().unwrap();
+                    let destination = buffer.copy_raw_to_host_buffer(vec![0u8; 3], 1).unwrap().r#await().unwrap();
                     assert_eq!(destination.as_slice(), vec![72u8, 73u8, 74u8]);
+                    assert!(buffer.copy_raw_to_host_buffer(vec![0u8; 10], 1).unwrap().r#await().is_err());
                 }
             }
         });
@@ -4109,7 +4165,7 @@ mod tests {
                         .buffer(data.as_slice(), BufferType::U8, [data.len() as u64], None, device.clone(), None)
                         .unwrap();
                     assert!(matches!(
-                        buffer.copy_raw_to_host_buffer_future::<Vec<u8>>(0),
+                        unsafe { buffer.copy_raw_to_host_buffer_future::<Vec<u8>>(0) },
                         Err(
                             Error::MissingFunction {
                                 function_name: "PJRT_Buffer_CopyRawToHostFuture",
@@ -4124,7 +4180,7 @@ mod tests {
                     let buffer = client
                         .buffer(data.as_slice(), BufferType::U8, [data.len() as u64], None, device.clone(), None)
                         .unwrap();
-                    let (callback, event) = buffer.copy_raw_to_host_buffer_future::<Vec<u8>>(0).unwrap();
+                    let (callback, event) = unsafe { buffer.copy_raw_to_host_buffer_future::<Vec<u8>>(0) }.unwrap();
                     let mut destination = vec![0u8; data.len()];
                     callback(&mut destination, None);
                     assert_eq!(event.r#await(), Ok(()));
@@ -4134,7 +4190,7 @@ mod tests {
                     let buffer = client
                         .buffer(data.as_slice(), BufferType::U8, [data.len() as u64], None, device.clone(), None)
                         .unwrap();
-                    let (callback, event) = buffer.copy_raw_to_host_buffer_future::<Vec<u8>>(0).unwrap();
+                    let (callback, event) = unsafe { buffer.copy_raw_to_host_buffer_future::<Vec<u8>>(0) }.unwrap();
                     let mut destination = vec![0u8; data.len()];
                     callback(&mut destination, Some(Error::aborted("test error")));
                     assert!(matches!(
@@ -4142,6 +4198,20 @@ mod tests {
                         Err(Error::Aborted { message, .. }) if message == "test error",
                     ));
                     assert_eq!(destination.as_slice(), &[0u8; 4]);
+
+                    // Test that an undersized destination fails the transfer instead of reaching PJRT.
+                    let buffer = client
+                        .buffer(data.as_slice(), BufferType::U8, [data.len() as u64], None, device.clone(), None)
+                        .unwrap();
+                    let (callback, event) = unsafe { buffer.copy_raw_to_host_buffer_future::<Vec<u8>>(0) }.unwrap();
+                    let mut destination = vec![0u8; data.len() - 1];
+                    callback(&mut destination, None);
+                    assert!(matches!(
+                        event.r#await(),
+                        Err(Error::InvalidArgument { message, .. })
+                            if message == "the destination host buffer holds 3 bytes, but the transfer needs 4",
+                    ));
+                    assert_eq!(destination.as_slice(), &[0u8; 3]);
                 }
             }
         });
