@@ -64,7 +64,7 @@ use crate::batching::{
 use crate::contexts::{Context, Domain, StagingContext};
 use crate::differentiation::{DifferentiableType, DifferentiationDual};
 use crate::interpretation::{InterpretableOperation, InterpretationDriver};
-use crate::macros::{check_count, dispatch_on_array_element_type, impl_differentiable_operation};
+use crate::macros::{check_count, check_types, dispatch_on_array_element_type, impl_differentiable_operation};
 use crate::operations::Capability;
 use crate::operations::arithmetic::{Add, AddOperation, Mul, MulOperation};
 use crate::operations::collectives::parallel_vary::ParallelVaryOperation;
@@ -765,6 +765,9 @@ impl ArrayType {
                 "`{CUMULATIVE_OPERATION_NAME}` with kind `{kind}` cannot scan inputs with unreduced axes",
             )));
         }
+
+        // A cumulative sum commutes only with pending sums.
+        check_types!(@sum_unreduced, CUMULATIVE_OPERATION_NAME, [self]);
 
         Ok(self.clone())
     }

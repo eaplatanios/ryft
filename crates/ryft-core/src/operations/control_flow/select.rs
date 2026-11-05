@@ -206,6 +206,16 @@ impl ElementwiseOperation for SelectOperation<ArrayType> {
             )));
         }
 
+        let unreduced_kind = on_true.unreduced_kind();
+        if on_false.unreduced_kind() != unreduced_kind {
+            return Err(TypeError::invalid(format!(
+                "`{}` branches must be unreduced with the same kind but got `{}` and `{}`",
+                SELECT_OPERATION_NAME,
+                unreduced_kind,
+                on_false.unreduced_kind(),
+            )));
+        }
+
         if let Some(sharding) = condition.sharding() {
             if !sharding.unreduced_axes().is_empty() {
                 return Err(TypeError::invalid(format!(
@@ -239,6 +249,7 @@ impl ElementwiseOperation for SelectOperation<ArrayType> {
         if let Some(sharding) = output_type.sharding().cloned() {
             let sharding = sharding
                 .with_unreduced_axes(unreduced)
+                .and_then(|sharding| sharding.with_unreduced_kind(unreduced_kind))
                 .and_then(|sharding| sharding.with_reduced_axes(reduced))
                 .map_err(|error| TypeError::invalid(error.to_string()))?;
             output_type = output_type.with_sharding(sharding).map_err(|error| TypeError::invalid(error.to_string()))?;

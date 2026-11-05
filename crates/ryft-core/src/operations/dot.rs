@@ -34,7 +34,7 @@ use ryft_macros::capability;
 use crate::arrays::{
     Array, ArrayAddressing, ArrayBatch, ArrayBatchingPolicy, ArrayExtentBatchingPolicy, ArrayIrType, ArrayType,
     DataType, Dimension, DimensionSource, MeshAxisType, NumericArrayElement, Shape, Sharding, ShardingDimension,
-    StaticShape,
+    StaticShape, UnreducedKind,
 };
 use crate::axes::Axis;
 use crate::batching::{
@@ -45,7 +45,7 @@ use crate::differentiation::{
     DifferentiableType, DifferentiationContext, DifferentiationDual, DifferentiationError, DifferentiationPolicy,
 };
 use crate::interpretation::{InterpretableOperation, InterpretationDriver};
-use crate::macros::{check_count, dispatch_on_array_element_type, impl_differentiable_operation};
+use crate::macros::{check_count, check_types, dispatch_on_array_element_type, impl_differentiable_operation};
 use crate::operations::Capability;
 use crate::operations::arithmetic::Add;
 use crate::operations::collectives::parallel_vary::ManualVariationAlignment;
@@ -2059,6 +2059,9 @@ pub(crate) fn infer_dot_output_type(
         }
     }
 
+    // A dot product is bilinear, so it distributes only over pending sums, including manual ones.
+    check_types!(@sum_unreduced, operation_name, [lhs, rhs]);
+
     let mesh = match (lhs_sharding, rhs_sharding) {
         (Some(left), Some(right)) if left.mesh() != right.mesh() => {
             return Err(TypeError::invalid(format!("`{operation_name}` input shardings must use the same mesh")));
@@ -2115,6 +2118,15 @@ pub(crate) fn infer_dot_output_type(
         // operation instead of materializing it here, so the request is valid only when it names precisely the axes
         // that shard the (identically sharded) contracting dimensions. This is JAX's `_dot_general_unreduced_rule`.
         if !output_sharding.unreduced_axes().is_empty() {
+            if output_sharding.unreduced_kind() != UnreducedKind::Sum {
+                return Err(TypeError::invalid(format!(
+                    "`{}` output sharding supports only unreduced axes of kind `{}` but got kind `{}`",
+                    operation_name,
+                    UnreducedKind::Sum,
+                    output_sharding.unreduced_kind(),
+                )));
+            }
+
             let lhs_contracting_spec: Vec<ShardingDimension> =
                 lhs_contracting.iter().map(|axis| dimension_of(lhs_sharding, *axis)).collect();
             let rhs_contracting_spec: Vec<ShardingDimension> =

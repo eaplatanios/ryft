@@ -18,7 +18,7 @@ use crate::differentiation::{
     TranspositionContext, TranspositionDriver,
 };
 use crate::interpretation::{InterpretableOperation, InterpretationDriver, MemberInterpretableOperation};
-use crate::macros::check_count;
+use crate::macros::{check_count, check_types};
 use crate::operations::Capability;
 use crate::operations::arithmetic::{AddOperation, Div, Mul, Rem};
 use crate::operations::assertions::Assert;
@@ -249,6 +249,9 @@ impl ParallelSumScatterOperation {
             mesh,
             input_type,
         )?;
+
+        // Summing over the scattered axes commutes only with pending sums, whether over those axes or over others.
+        check_types!(@sum_unreduced, PARALLEL_SUM_SCATTER_OPERATION_NAME, [input_type]);
 
         let sharding = input_type.sharding().unwrap();
         let unreduced_count =

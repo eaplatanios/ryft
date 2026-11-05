@@ -12,7 +12,7 @@ use crate::batching::{BatchableOperation, BatchingContext, BatchingDriver, Batch
 use crate::contexts::{Context, Domain};
 use crate::differentiation::DifferentiationDual;
 use crate::interpretation::{InterpretableOperation, InterpretationDriver};
-use crate::macros::{check_count, impl_differentiable_operation};
+use crate::macros::{check_count, check_types, impl_differentiable_operation};
 use crate::operations::Capability;
 use crate::operations::collectives::parallel_reduce::ParallelReduceOperation;
 use crate::operations::collectives::parallel_vary::{PARALLEL_VARY_OPERATION_NAME, ParallelVary};
@@ -164,6 +164,10 @@ impl Operation for ParallelCastOperation {
                  manual axis `{axis_name}` but got one that is {source}{remedy}",
             )));
         }
+
+        // Each of these casts is one side of a cross-device sum and its transpose (i.e., reduced and unreduced state
+        // are sum duals), so, as in JAX, any pending reduction that the input carries must also be a sum.
+        check_types!(@sum_unreduced, PARALLEL_CAST_OPERATION_NAME, [input]);
 
         // Only the state of the selected axis changes. Each step removes the axis from its source set before adding
         // it to its target set, because a sharding never holds one axis in two of these sets.
