@@ -50,35 +50,48 @@ impl<O> Event<O> {
     /// computation finishes executing (e.g., it could be a buffer that is being populated asynchronously and the event
     /// represents the completion of the buffer population).
     pub(crate) unsafe fn from_c_api(handle: *mut ffi::PJRT_Event, api: Api, output: O) -> Result<Self, Error> {
+        unsafe { Self::from_c_api_with_output(handle, api, EventOutput::Owned(Some(output))) }
+    }
+
+    /// Constructs a new [`Event`] like [`Self::from_c_api`] whose underlying computation writes into the payload stored
+    /// in `output` (e.g., the host destination of a device-to-host copy), which must therefore stay at a stable address
+    /// from before the computation is launched until it completes. That is why the payload is placed into this shared
+    /// storage before its address is handed to PJRT, and why a native "on-ready" callback retains the storage until the
+    /// computation completes, so dropping the [`Event`] before then neither frees the payload nor blocks the dropping
+    /// thread. When the callback cannot be registered (e.g., because the plugin lacks `PJRT_Event_OnReady`), completion
+    /// can no longer be observed after the [`Event`] is dropped, so the storage is leaked instead.
+    pub(crate) unsafe fn from_c_api_with_retained_output(
+        handle: *mut ffi::PJRT_Event,
+        api: Api,
+        output: Arc<Mutex<Option<O>>>,
+    ) -> Result<Self, Error>
+    where
+        O: Send + 'static,
+    {
+        let event = unsafe { Self::from_c_api_with_output(handle, api, EventOutput::Retained(Arc::clone(&output))) }?;
+        let callback_output = Arc::clone(&output);
+        if event.on_ready(move |_| drop(callback_output)).is_err() {
+            std::mem::forget(output);
+        }
+        Ok(event)
+    }
+
+    /// Constructs a new [`Event`] from the provided [`PJRT_Event`] handle and payload storage.
+    unsafe fn from_c_api_with_output(
+        handle: *mut ffi::PJRT_Event,
+        api: Api,
+        output: EventOutput<O>,
+    ) -> Result<Self, Error> {
         if handle.is_null() {
             Err(Error::invalid_argument("the provided PJRT event handle is a null pointer"))
         } else {
             Ok(Self {
                 state: Arc::new(EventState { api, handle: EventHandle(handle), waker: OnceLock::new() }),
-                output: EventOutput::Owned(Some(output)),
+                output,
                 callback_registered: Cell::new(false),
                 marker: PhantomData,
             })
         }
-    }
-
-    /// Returns this [`Event`] with its payload moved into storage that the underlying computation keeps alive until it
-    /// completes, for payloads that the computation writes into (e.g., the owned host destination of a device-to-host
-    /// copy). The storage is shared with a native "on-ready" callback that releases it on completion, so dropping the
-    /// [`Event`] before then neither frees the payload while the computation may still write into it nor blocks the
-    /// dropping thread. When the callback cannot be registered (e.g., because the plugin lacks `PJRT_Event_OnReady`),
-    /// completion can no longer be observed after the [`Event`] is dropped, so the payload is leaked instead.
-    pub(crate) fn retain_output(mut self) -> Self
-    where
-        O: Send + 'static,
-    {
-        let output = Arc::new(Mutex::new(self.output.take()));
-        let retained = Arc::clone(&output);
-        if self.on_ready(move |_| drop(retained)).is_err() {
-            std::mem::forget(Arc::clone(&output));
-        }
-        self.output = EventOutput::Retained(output);
-        self
     }
 
     /// Checks if the underlying computation of this [`Event`] has finished executing and returns `true` if it has and
@@ -357,7 +370,7 @@ impl Drop for EventState {
 
 /// Payload of an [`Event`], which the [`Event`] either owns or shares with a native "on-ready" callback that keeps it
 /// alive until the underlying computation completes (e.g., the host destination of a device-to-host copy, which the
-/// computation writes into). Refer to [`Event::retain_output`] for more information.
+/// computation writes into). Refer to [`Event::from_c_api_with_retained_output`] for more information.
 enum EventOutput<O> {
     /// Payload owned by the [`Event`], which is [`None`] once it has been taken.
     Owned(Option<O>),
@@ -650,6 +663,18 @@ mod tests {
 
     fn assert_send<T: Send>() {}
 
+    /// Returns a pending [`Event`] that retains `output` (refer to [`Event::from_c_api_with_retained_output`]),
+    /// together with the [`EventPromise`] that completes it.
+    fn retained_event<O: Send + 'static>(api: Api, output: O) -> (Event<O>, EventPromise) {
+        use ffi::PJRT_Event_Create_Args;
+
+        let handle = invoke_pjrt_api_error_fn!(api, PJRT_Event_Create, {}, { event }).unwrap();
+        let event =
+            unsafe { Event::from_c_api_with_retained_output(handle, api, Arc::new(Mutex::new(Some(output)))) }.unwrap();
+        let promise = EventPromise { state: event.state.clone() };
+        (event, promise)
+    }
+
     fn assert_send_sync<T: Send + Sync>() {}
 
     #[test]
@@ -771,8 +796,7 @@ mod tests {
         // until the computation completes even when the event is dropped first, and dropping must not block.
         let client = test_cpu_client();
         let payload = Arc::new(());
-        let (event, promise) = client.event(Arc::clone(&payload)).unwrap();
-        let event = event.retain_output();
+        let (event, promise) = retained_event(client.api(), Arc::clone(&payload));
         drop(event);
         assert_eq!(Arc::strong_count(&payload), 2);
         promise.set(None).unwrap();
@@ -783,8 +807,7 @@ mod tests {
         assert_eq!(Arc::strong_count(&payload), 1);
 
         // A completed retained event returns its payload.
-        let (event, promise) = client.event(Arc::clone(&payload)).unwrap();
-        let event = event.retain_output();
+        let (event, promise) = retained_event(client.api(), Arc::clone(&payload));
         promise.set(None).unwrap();
         assert!(Arc::ptr_eq(&event.r#await().unwrap(), &payload));
     }
@@ -798,8 +821,8 @@ mod tests {
         table.PJRT_Event_OnReady = None;
         let api = unsafe { Api::from_c_api(&*table) }.unwrap();
         let payload = Arc::new(());
-        let (event, promise) = api.event(Arc::clone(&payload)).unwrap();
-        drop(event.retain_output());
+        let (event, promise) = retained_event(api, Arc::clone(&payload));
+        drop(event);
         promise.set(None).unwrap();
         assert_eq!(Arc::strong_count(&payload), 2);
     }

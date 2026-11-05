@@ -126,11 +126,15 @@ and this project adheres to [Semantic Versioning](https://semver.org/).
   before the copy completed, which freed the host destination while PJRT could still write into it. The destination
   is now retained by a native completion callback until the copy completes, so dropping the event neither frees it
   nor blocks. If that callback cannot be registered, the destination is leaked rather than freed.
-- Made `Buffer::copy_to_host_buffer`, `Buffer::copy_raw_to_host_buffer`, and `Buffer::copy_raw_to_host_buffer_future`
-  `unsafe`, because PJRT writes into their borrowed destinations until the copy completes, independently of their
-  returned events (which safe code may drop or leak). Their safety contracts state the lifetime, access, and capacity
-  requirements, and the closure of `Buffer::copy_raw_to_host_buffer_future` now fails the transfer with an error
-  instead of passing an undersized destination to PJRT.
+- Changed `Buffer::copy_to_host_buffer` and `Buffer::copy_raw_to_host_buffer` to take ownership of their host
+  destination (any `AsMut<[u8]> + Send + 'static` buffer, e.g., a reused or pinned allocation) and return it from
+  the completed event, instead of borrowing it. The borrowing versions were unsound, because PJRT writes into the
+  destination until the copy completes, independently of the returned event (which safe code may drop or leak). The
+  destination is retained like that of `Buffer::copy_to_host`, and `Buffer::copy_to_host_buffer` rejects an undersized
+  destination before starting the copy.
+- Made `Buffer::copy_raw_to_host_buffer_future` `unsafe`, because PJRT writes into the destination that its closure
+  receives until the copy completes, which nothing ties to the returned event. Its closure now fails the transfer with
+  an error instead of passing an undersized destination to PJRT.
 - Fixed `LoadedExecutable::execute` releasing launch resources early when a failure occurred after successful native
   submission. It now waits for every participating device to complete before returning the error.
 
