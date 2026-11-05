@@ -1,3 +1,4 @@
+use std::collections::BTreeSet;
 use std::fmt::Display;
 
 use ryft_macros::capability;
@@ -23,11 +24,8 @@ use crate::programs::{
     ValueDomainDispatch,
 };
 
-/// Name of [`ParallelCastOperation`]. The operation's [`ParallelCastTarget`] is rendered as its `target` attribute.
-pub const PARALLEL_CAST_OPERATION_NAME: &str = "parallel_cast";
-
 /// State along one manual mesh axis that a [`ParallelCastOperation`] moves a value into. Each target has exactly one
-/// source state from which the operation reaches it, so the source is implied:
+/// source state from which the operation reaches it, so the source is implied.
 ///
 ///   - [`Reduced`](Self::Reduced) is reached from an invariant value. It is JAX's `preduced`, and its adjoint is the
 ///     sum of an unreduced value (a mesh-form [`ParallelReduceOperation`] of kind [`ReductionKind::Sum`]).
@@ -38,7 +36,7 @@ pub const PARALLEL_CAST_OPERATION_NAME: &str = "parallel_cast";
 ///
 /// The fourth transition, from invariant to varying, is [`ParallelVaryOperation`](crate::ParallelVaryOperation),
 /// whose adjoint is a sum of a varying value. [`ParallelCast::parallel_cast`] dispatches to it for invariant inputs.
-#[derive(Clone, Copy, Debug, PartialEq, Eq, Hash)]
+#[derive(Copy, Clone, Debug, PartialEq, Eq, Hash)]
 pub enum ParallelCastTarget {
     /// Marks an invariant value as reduced, meaning that its reverse mode cotangent holds per-device summands
     /// (i.e., is unreduced) along the axis.
@@ -62,6 +60,9 @@ impl Display for ParallelCastTarget {
         }
     }
 }
+
+/// Name of [`ParallelCastOperation`]. The operation's [`ParallelCastTarget`] is rendered as its `target` attribute.
+pub const PARALLEL_CAST_OPERATION_NAME: &str = "parallel_cast";
 
 /// [`Operation`] that moves a value between the reduction and variation states of one active manual mesh axis
 /// without changing any local value, so that it lowers to nothing. Each [`ParallelCastTarget`] has one source
@@ -166,10 +167,9 @@ impl Operation for ParallelCastOperation {
 
         // Only the state of the selected axis changes. Each step removes the axis from its source set before adding
         // it to its target set, because a sharding never holds one axis in two of these sets.
-        let without = |axes: &std::collections::BTreeSet<String>| {
-            axes.iter().filter(|axis| *axis != axis_name).cloned().collect::<Vec<_>>()
-        };
-        let with = |axes: &std::collections::BTreeSet<String>| {
+        let without =
+            |axes: &BTreeSet<String>| axes.iter().filter(|axis| *axis != axis_name).cloned().collect::<Vec<_>>();
+        let with = |axes: &BTreeSet<String>| {
             axes.iter().cloned().chain(std::iter::once(axis_name.clone())).collect::<Vec<_>>()
         };
         let sharding = sharding.clone();
@@ -293,8 +293,8 @@ impl_differentiable_operation! {
         |operation, context, _driver, inputs, outputs, accumulators| {
             // A cast to `Reduced` marks an invariant value whose cotangent is unreduced, and the adjoint completes that
             // pending sum, yielding the invariant cotangent of the input. The casts between `Varying` and `Unreduced`
-            // are adjoint to each other: the cotangent of a reduced input is unreduced, and that of an unreduced input
-            // is reduced. Every cast is the identity on local values, so no adjoint changes any value either.
+            // are adjoint to each other, because the cotangent of a reduced input is unreduced, and that of an
+            // unreduced input is reduced. These two cast adjoints leave local values unchanged.
             check_count!("input", inputs, 1, ProgramError);
             check_count!("output", outputs, 1, ProgramError);
             check_count!("accumulator", accumulators, 1, DifferentiationError);
@@ -351,22 +351,24 @@ impl<A: Value<Type = ArrayType>> From<ParallelCastOperation> for ArrayIrOperatio
 /// unreduced). [`parallel_cast`](Self::parallel_cast) changes that state without changing any local value, so it lowers
 /// to nothing. It is the Ryft analogue of JAX's
 /// [`jax.lax.pcast`](https://docs.jax.dev/en/latest/_autosummary/jax.lax.pcast.html),
-/// and it supports the same four transitions:
+/// and, with manual variation checking enabled, supports the same four transitions.
 ///
 ///   - Invariant to [`Varying`](ParallelCastTarget::Varying) stages a
 ///     [`ParallelVaryOperation`](crate::ParallelVaryOperation), whose transpose sums the cotangents of the devices.
 ///   - Invariant to [`Reduced`](ParallelCastTarget::Reduced), reduced to [`Varying`](ParallelCastTarget::Varying),
 ///     and varying to [`Unreduced`](ParallelCastTarget::Unreduced) stage a [`ParallelCastOperation`].
 ///
-/// The remaining transition, from unreduced to invariant, communicates: it is the sum
+/// The remaining transition, from unreduced to invariant, communicates through the sum
 /// [`parallel_reduce`](crate::ParallelReduce::parallel_reduce) with [`ReductionKind::Sum`] of an unreduced value, and
 /// it is the transpose of the cast to [`Reduced`](ParallelCastTarget::Reduced). Every other combination of source state
-/// and target is an error, same as in JAX.
+/// and target is an error when manual variation checking is enabled, as in JAX.
 ///
 /// The axis must be bound by an enclosing manual region (i.e., a [`NamedAxis::Mesh`] binding). A binding that disables
-/// manual-variation checks returns the value unchanged without staging anything, as JAX's casts do without `check_vma`,
-/// because the bodies of such regions carry no variation or reduction state along their active axes. Named batch axes
-/// have no such state, so a `batch` level that binds the same name rejects the cast.
+/// manual variation checks returns the value unchanged for every target without staging anything, because the bodies
+/// of such regions carry no variation or reduction state along their active axes. This extends JAX's `pcast`
+/// convenience dispatch, which still validates the source-to-target combination before reaching an unchecked cast.
+/// The input mesh must still match the binding's mesh. Named batch axes have no reduction state, so a `batch` level
+/// that binds the same name rejects the cast.
 ///
 /// The universe parameter `T` defaults to the [`Capability`] universe of the implementor, so that homogeneous array
 /// values implement this capability for [`ArrayType`] and array IR values implement it for [`ArrayIrType`].
@@ -374,7 +376,7 @@ impl<A: Value<Type = ArrayType>> From<ParallelCastOperation> for ArrayIrOperatio
 /// # Example
 ///
 /// Each device holds a summand of a shared total. Casting it to unreduced and summing yields the total, and the
-/// transpose of that sum is a cast to reduced:
+/// transpose of that sum is a cast to reduced.
 ///
 /// ```rust
 /// # use indoc::indoc;
@@ -470,19 +472,19 @@ impl<
             ))
             .into());
         };
+        let input_type = self.r#type().into_owned();
+        if input_type.sharding().is_some_and(|sharding| sharding.mesh() != &mesh) {
+            return Err(TypeError::invalid(format!(
+                "`{PARALLEL_CAST_OPERATION_NAME}` input mesh does not match the mesh of manual axis `{axis_name}`",
+            ))
+            .into());
+        }
         if !checks_manual_variation {
             return Ok(self.clone());
         }
 
-        let input_type = self.r#type().into_owned();
         let mut input = self.clone();
         match input_type.sharding() {
-            Some(sharding) if sharding.mesh() != &mesh => {
-                return Err(TypeError::invalid(format!(
-                    "`{PARALLEL_CAST_OPERATION_NAME}` input mesh does not match the mesh of manual axis `{axis_name}`",
-                ))
-                .into());
-            }
             Some(_) => {}
             None => {
                 let rank = input_type.rank();
