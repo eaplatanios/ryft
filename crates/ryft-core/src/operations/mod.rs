@@ -55,14 +55,15 @@ pub use attention::{
     DifferentiableDotProductAttention, DotProductAttention, differentiable_dot_product_attention, dot_product_attention,
 };
 pub use collectives::{
-    AXIS_INDEX_OPERATION_NAME, AxisIndex, AxisIndexOperation, CollectiveMode, CollectiveOperations, CollectiveOptions,
-    ManualVariationAlignment, PARALLEL_ALL_GATHER_OPERATION_NAME, PARALLEL_ALL_TO_ALL_OPERATION_NAME,
-    PARALLEL_PERMUTE_OPERATION_NAME, PARALLEL_RAGGED_ALL_TO_ALL_OPERATION_NAME, PARALLEL_REDUCE_OPERATION_NAME,
-    PARALLEL_SUM_SCATTER_OPERATION_NAME, PARALLEL_VARY_OPERATION_NAME, ParallelAllGather, ParallelAllGatherOperation,
-    ParallelAllGatherOutputVariance, ParallelAllToAll, ParallelAllToAllOperation, ParallelPermute,
-    ParallelPermuteOperation, ParallelRaggedAllToAll, ParallelRaggedAllToAllOperation, ParallelReduce,
-    ParallelReduceOperation, ParallelSumScatter, ParallelSumScatterOperation, ParallelVary, ParallelVaryOperation,
-    ShapeChangingCollectiveValue,
+    AXIS_INDEX_OPERATION_NAME, AxisIndex, AxisIndexOperation, CollectiveAxes, CollectiveMode, CollectiveOperations,
+    CollectiveOptions, ManualVariationAlignment, PARALLEL_ALL_GATHER_OPERATION_NAME,
+    PARALLEL_ALL_TO_ALL_OPERATION_NAME, PARALLEL_CAST_OPERATION_NAME, PARALLEL_PERMUTE_OPERATION_NAME,
+    PARALLEL_RAGGED_ALL_TO_ALL_OPERATION_NAME, PARALLEL_REDUCE_OPERATION_NAME, PARALLEL_SUM_SCATTER_OPERATION_NAME,
+    PARALLEL_VARY_OPERATION_NAME, ParallelAllGather, ParallelAllGatherOperation, ParallelAllGatherOutputVariance,
+    ParallelAllToAll, ParallelAllToAllOperation, ParallelArgExtrema, ParallelCast, ParallelCastOperation,
+    ParallelCastTarget, ParallelPermute, ParallelPermuteOperation, ParallelRaggedAllToAll,
+    ParallelRaggedAllToAllOperation, ParallelReduce, ParallelReduceOperation, ParallelSumScatter,
+    ParallelSumScatterOperation, ParallelVary, ParallelVaryOperation, ShapeChangingCollectiveValue,
 };
 pub use comparisons::{COMPARE_OPERATION_NAME, Compare, CompareOperation, ComparisonDirection, ComparisonType};
 pub use complex::{

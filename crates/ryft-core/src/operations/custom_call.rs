@@ -523,7 +523,9 @@ const RESERVED_ATTRIBUTE_NAMES: [&str; 6] =
 /// [`Operation`] that calls a foreign kernel registered with the executing backend under a target name. It is the
 /// Ryft analogue of JAX's [`jax.ffi.ffi_call`](https://docs.jax.dev/en/latest/_autosummary/jax.ffi.ffi_call.html).
 /// This operation is opaque to Ryft: its output types are declared up front instead of inferred, and typed
-/// [`CustomCallAttribute`]s are forwarded verbatim to the kernel as its configuration.
+/// [`CustomCallAttribute`]s are forwarded verbatim to the kernel as its configuration, except for bookkeeping
+/// attributes in namespaces explicitly reserved by the executing backend. Such backend-owned metadata describes
+/// compilation or runtime requirements and does not enter the foreign kernel's attribute ABI.
 ///
 /// This is an [`ArrayType`] operation that participates in two input contracts. In homogeneous array programs it
 /// accepts only the foreign kernel's array inputs, so every declared output must have a static shape. As a mixed member

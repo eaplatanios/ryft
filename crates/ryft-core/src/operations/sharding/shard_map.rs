@@ -272,17 +272,18 @@ use crate::differentiation::{
 use crate::interpretation::{InterpretableOperation, InterpretationDriver};
 use crate::macros::check_count;
 use crate::operations::arithmetic::{AddOperation, DivOperation};
-use crate::operations::collectives::CollectiveMode;
 use crate::operations::collectives::axis_index::AxisIndexOperation;
 use crate::operations::collectives::parallel_all_gather::{
     PARALLEL_ALL_GATHER_OPERATION_NAME, ParallelAllGatherOperation, ParallelAllGatherOutputVariance,
 };
 use crate::operations::collectives::parallel_all_to_all::ParallelAllToAllOperation;
+use crate::operations::collectives::parallel_cast::ParallelCastOperation;
 use crate::operations::collectives::parallel_permute::ParallelPermuteOperation;
 use crate::operations::collectives::parallel_ragged_all_to_all::ParallelRaggedAllToAllOperation;
 use crate::operations::collectives::parallel_reduce::ParallelReduceOperation;
 use crate::operations::collectives::parallel_sum_scatter::ParallelSumScatterOperation;
 use crate::operations::collectives::parallel_vary::{ParallelVary, ParallelVaryOperation};
+use crate::operations::collectives::{CollectiveAxes, CollectiveMode};
 use crate::operations::composites::COMPOSITE_OPERATION_NAME;
 use crate::operations::constants::constant::ConstantOperation;
 use crate::operations::constants::fill::Fill;
@@ -1459,8 +1460,9 @@ impl ShardMapBoundary {
             // along it (e.g., a permutation of invariant values in the meshless form, which types its output by its
             // input), so the variation check above cannot detect it.
             for (_, instruction) in body.instructions_in_closure() {
-                if let Some(axis_name) = collective_axis_name(instruction.operation())
-                    && released_axes.iter().any(|released_axis| released_axis == axis_name)
+                if let Some(axis_names) = collective_axis_name(instruction.operation())
+                    && let Some(axis_name) =
+                        released_axes.iter().find(|released_axis| axis_names.contains(released_axis))
                 {
                     return Err(ShardMapError::BatchAxisPlacedOnUsedManualAxis { axis_name: axis_name.to_string() });
                 }
@@ -1846,12 +1848,12 @@ impl ShardMapOperation {
                 if let Some(gather) = instruction.operation().projected_payload::<ParallelAllGatherOperation>()
                     && gather.mesh().is_none()
                     && gather.output_variance() == ParallelAllGatherOutputVariance::Invariant
-                    && self.boundary.manual_axes().iter().any(|axis| axis == gather.axis_name())
+                    && self.boundary.manual_axes().iter().any(|axis| gather.axes().contains(axis))
                 {
                     return Err(ProgramError::MalformedProgram(format!(
                         "`{name}` with unchecked manual variation requires varying output variance for \
                          `{PARALLEL_ALL_GATHER_OPERATION_NAME}` over active manual axis `{}`",
-                        gather.axis_name(),
+                        gather.axes(),
                     )));
                 }
             }
@@ -3583,43 +3585,57 @@ impl ManualDeviceGrid {
         (0..self.device_count()).map(|device| Ok(ArrayIrValue::Array(function(device)?))).collect()
     }
 
-    /// Returns the devices that participate with `device` in a collective over the axis at position `axis`, ordered by
-    /// their positions in the collective, together with the position of `device` among them. Without participant
-    /// groups, the participants are the devices that differ from `device` only along `axis`, positioned by their
-    /// coordinates. With participant groups, they are the members of the group that contains the coordinate of
-    /// `device`, positioned by their order in that group.
+    /// Returns the position of `device` along the combined axis of the grid axes `axes`, which linearizes their
+    /// coordinates in the given order with the first axis major (refer to [`CollectiveAxes`]).
+    fn position(&self, device: usize, axes: &[usize]) -> usize {
+        let coordinates = self.coordinates(device);
+        axes.iter().fold(0, |position, axis| position * self.axes[*axis].1 + coordinates[*axis])
+    }
+
+    /// Returns the device that shares the coordinates of `device` along every grid axis other than `axes` and has
+    /// `position` along their combined axis (refer to [`position`](Self::position)).
+    fn device_at(&self, device: usize, axes: &[usize], mut position: usize) -> usize {
+        let mut coordinates = self.coordinates(device);
+        for axis in axes.iter().rev() {
+            coordinates[*axis] = position % self.axes[*axis].1;
+            position /= self.axes[*axis].1;
+        }
+        self.device(&coordinates)
+    }
+
+    /// Returns the devices that take part with `device` in a collective over the combined axis of the grid axes
+    /// `axes`, ordered by their positions along it, together with the position of `device` among them. Without
+    /// `axis_index_groups`, they are all devices that share the coordinates of `device` along the other grid axes.
+    /// With them, they are the members of the group that contains the position of `device`, in group order.
     fn participants(
         &self,
         device: usize,
-        axis: usize,
+        axes: &[usize],
         axis_index_groups: Option<&[Vec<usize>]>,
     ) -> Result<(Vec<usize>, usize), ProgramError> {
-        let (axis_name, axis_size) = &self.axes[axis];
-        let coordinates = self.coordinates(device);
+        let axis_size = axes.iter().map(|axis| self.axes[*axis].1).product::<usize>();
+        let position = self.position(device, axes);
         let members = match axis_index_groups {
-            None => (0..*axis_size).collect::<Vec<_>>(),
+            None => (0..axis_size).collect::<Vec<_>>(),
             Some(groups) => groups
                 .iter()
-                .find(|group| group.contains(&coordinates[axis]))
-                .filter(|group| group.iter().all(|member| member < axis_size))
+                .find(|group| group.contains(&position))
+                .filter(|group| group.iter().all(|member| *member < axis_size))
                 .cloned()
-                .ok_or_else(|| ProgramError::InvalidArgument {
-                    message: format!(
-                        "the participant groups `{groups:?}` of a collective over manual axis `{axis_name}` do not \
-                         partition its {axis_size} coordinates",
-                    ),
+                .ok_or_else(|| {
+                    let axis_names =
+                        CollectiveAxes::from(axes.iter().map(|axis| self.axes[*axis].0.clone()).collect::<Vec<_>>());
+                    ProgramError::InvalidArgument {
+                        message: format!(
+                            "the participant groups `{groups:?}` of a collective over manual axis `{axis_names}` do \
+                             not partition its {axis_size} coordinates",
+                        ),
+                    }
                 })?,
         };
-        let position = members.iter().position(|member| *member == coordinates[axis]).unwrap();
-        let devices = members
-            .iter()
-            .map(|member| {
-                let mut member_coordinates = coordinates.clone();
-                member_coordinates[axis] = *member;
-                self.device(&member_coordinates)
-            })
-            .collect();
-        Ok((devices, position))
+        let member_position = members.iter().position(|member| *member == position).unwrap();
+        let devices = members.iter().map(|member| self.device_at(device, axes, *member)).collect();
+        Ok((devices, member_position))
     }
 }
 
@@ -3937,7 +3953,8 @@ where
     ) -> Result<bool, ProgramError> {
         for id in instruction.regions() {
             if region.with_id(*id)?.instructions_in_closure().any(|(_, nested)| {
-                collective_axis_name(nested.operation()).is_some_and(|axis_name| self.grid.axis(axis_name).is_some())
+                collective_axis_name(nested.operation())
+                    .is_some_and(|axis_names| axis_names.names().iter().any(|name| self.grid.axis(name).is_some()))
             }) {
                 return Ok(true);
             }
@@ -3953,17 +3970,26 @@ where
         operation: &C::Operation,
         inputs: &[DeviceValues],
     ) -> Result<Option<Vec<DeviceValues>>, ProgramError> {
-        let Some(axis) = collective_axis_name(operation).and_then(|axis_name| self.grid.axis(axis_name)) else {
+        let Some(axis_names) = collective_axis_name(operation) else {
             return Ok(None);
         };
         let name = operation.name();
-        let (axis_name, axis_size) = &self.grid.axes[axis];
+        let axes = axis_names.names().iter().map(|axis_name| self.grid.axis(axis_name)).collect::<Vec<_>>();
+        if axes.iter().all(Option::is_none) {
+            return Ok(None);
+        }
+        let Some(axes) = axes.into_iter().collect::<Option<Vec<_>>>() else {
+            return Err(ProgramError::MalformedProgram(format!(
+                "`{name}` over manual axes `{axis_names}` combines emulated axes with axes of an enclosing region",
+            )));
+        };
+        let axis_size = axes.iter().map(|axis| self.grid.axes[*axis].1).product::<usize>();
         let validate_axis_size = |payload_axis_size: usize| {
-            if payload_axis_size == *axis_size {
+            if payload_axis_size == axis_size {
                 Ok(())
             } else {
                 Err(ProgramError::MalformedProgram(format!(
-                    "`{name}` was staged for {payload_axis_size} participants, but manual axis `{axis_name}` has \
+                    "`{name}` was staged for {payload_axis_size} participants, but manual axis `{axis_names}` has \
                      {axis_size} devices",
                 )))
             }
@@ -3972,7 +3998,7 @@ where
             check_count!("input", inputs, 0, ProgramError);
             let output_type = single_output_type(payload, &[])?;
             return Ok(Some(vec![self.grid.map_devices(|device| {
-                let position = Array::scalar(self.grid.coordinates(device)[axis] as u64)?;
+                let position = Array::scalar(self.grid.position(device, &axes) as u64)?;
                 with_array_type(&position.converted_to(output_type.data_type())?, &output_type)
             })?]));
         }
@@ -3984,8 +4010,8 @@ where
             validate_axis_size(payload.axis_size())?;
             check_count!("input", inputs, 6, ProgramError);
             let mut outputs = vec![None; self.grid.device_count()];
-            for device in (0..self.grid.device_count()).filter(|device| self.grid.coordinates(*device)[axis] == 0) {
-                let (participants, _) = self.grid.participants(device, axis, None)?;
+            for device in (0..self.grid.device_count()).filter(|device| self.grid.position(*device, &axes) == 0) {
+                let (participants, _) = self.grid.participants(device, &axes, None)?;
                 let participant_inputs = participants
                     .iter()
                     .map(|participant| {
@@ -4062,12 +4088,18 @@ where
             self.grid.map_devices(|device| {
                 with_array_type(arrays[device], &collective_output_type(payload, arrays[device], extents, device)?)
             })?
+        } else if let Some(payload) = operation.projected_payload::<ParallelCastOperation>() {
+            // Every cast changes only the state that the type records, so each device keeps its own value. In
+            // particular, the per-device values of an unreduced value are its summands, which a later sum completes.
+            self.grid.map_devices(|device| {
+                with_array_type(arrays[device], &collective_output_type(payload, arrays[device], extents, device)?)
+            })?
         } else if let Some(payload) = operation.projected_payload::<ParallelReduceOperation>() {
             if let Some(payload_axis_size) = payload.axis_size() {
                 validate_axis_size(payload_axis_size)?;
             }
             self.grid.map_devices(|device| {
-                let (participants, _) = self.grid.participants(device, axis, payload.axis_index_groups())?;
+                let (participants, _) = self.grid.participants(device, &axes, payload.axis_index_groups())?;
                 let participants = participants.iter().map(|participant| arrays[*participant]).collect::<Vec<_>>();
                 with_array_type(
                     &reduce_participants(name, &participants, payload.kind())?,
@@ -4078,7 +4110,7 @@ where
             validate_axis_size(payload.axis_size())?;
             self.grid.map_devices(|device| {
                 let output_type = collective_output_type(payload, arrays[device], extents, device)?;
-                let (participants, _) = self.grid.participants(device, axis, payload.options().axis_index_groups())?;
+                let (participants, _) = self.grid.participants(device, &axes, payload.options().axis_index_groups())?;
                 let participant_arrays =
                     participants.iter().map(|participant| arrays[*participant]).collect::<Vec<_>>();
                 validate_participant_types(name, &participant_arrays)?;
@@ -4107,7 +4139,7 @@ where
             self.grid.map_devices(|device| {
                 let output_type = collective_output_type(payload, arrays[device], extents, device)?;
                 let groups = payload.options().axis_index_groups();
-                let (participants, position) = self.grid.participants(device, axis, groups)?;
+                let (participants, position) = self.grid.participants(device, &axes, groups)?;
                 let participant_count = participants.len();
                 let participants = participants.iter().map(|participant| arrays[*participant]).collect::<Vec<_>>();
                 let sum = reduce_participants(name, &participants, ReductionKind::Sum)?;
@@ -4126,7 +4158,7 @@ where
             self.grid.map_devices(|device| {
                 let output_type = collective_output_type(payload, arrays[device], extents, device)?;
                 let groups = payload.options().axis_index_groups();
-                let (participants, position) = self.grid.participants(device, axis, groups)?;
+                let (participants, position) = self.grid.participants(device, &axes, groups)?;
                 let (split_axis, concatenation_axis) = (payload.split_axis(), payload.concatenation_axis());
                 let participant_arrays =
                     participants.iter().map(|participant| arrays[*participant]).collect::<Vec<_>>();
@@ -4171,12 +4203,10 @@ where
             self.grid.map_devices(|device| {
                 // A device that no pair targets receives zeros.
                 let output_type = collective_output_type(payload, arrays[device], extents, device)?;
-                let coordinates = self.grid.coordinates(device);
-                match payload.source_target_pairs().iter().find(|(_, target)| *target == coordinates[axis]) {
+                let position = self.grid.position(device, &axes);
+                match payload.source_target_pairs().iter().find(|(_, target)| *target == position) {
                     Some((source, _)) => {
-                        let mut source_coordinates = coordinates.clone();
-                        source_coordinates[axis] = *source;
-                        with_array_type(arrays[self.grid.device(&source_coordinates)], &output_type)
+                        with_array_type(arrays[self.grid.device_at(device, &axes, *source)], &output_type)
                     }
                     None => EagerContext::<Array, ArrayOperation<Array>>::new().zero(&output_type),
                 }
@@ -4611,32 +4641,24 @@ fn agreed_predicate(
     Ok(values[0])
 }
 
-/// Returns the name of the axis that `operation` communicates along when it is a collective (including `axis_index`,
-/// which observes the coordinate along that axis), and [`None`] otherwise.
-fn collective_axis_name<O: OperationPayloadProjection>(operation: &O) -> Option<&str> {
+/// Returns the names of the axes that `operation` communicates along when it is a collective (including `axis_index`,
+/// which observes the coordinate along its axis), and [`None`] otherwise.
+fn collective_axis_name<O: OperationPayloadProjection>(operation: &O) -> Option<CollectiveAxes> {
+    let single = |axis_name: &str| CollectiveAxes::from(axis_name);
     operation
         .projected_payload::<AxisIndexOperation>()
-        .map(AxisIndexOperation::axis_name)
-        .or_else(|| operation.projected_payload::<ParallelReduceOperation>().map(ParallelReduceOperation::axis_name))
-        .or_else(|| operation.projected_payload::<ParallelVaryOperation>().map(ParallelVaryOperation::axis_name))
-        .or_else(|| {
-            operation
-                .projected_payload::<ParallelAllGatherOperation>()
-                .map(ParallelAllGatherOperation::axis_name)
-        })
-        .or_else(|| {
-            operation
-                .projected_payload::<ParallelSumScatterOperation>()
-                .map(ParallelSumScatterOperation::axis_name)
-        })
-        .or_else(|| {
-            operation.projected_payload::<ParallelAllToAllOperation>().map(ParallelAllToAllOperation::axis_name)
-        })
-        .or_else(|| operation.projected_payload::<ParallelPermuteOperation>().map(ParallelPermuteOperation::axis_name))
+        .map(|payload| single(payload.axis_name()))
+        .or_else(|| operation.projected_payload::<ParallelReduceOperation>().map(|payload| single(payload.axis_name())))
+        .or_else(|| operation.projected_payload::<ParallelVaryOperation>().map(|payload| single(payload.axis_name())))
+        .or_else(|| operation.projected_payload::<ParallelCastOperation>().map(|payload| single(payload.axis_name())))
+        .or_else(|| operation.projected_payload::<ParallelAllGatherOperation>().map(|payload| payload.axes().clone()))
+        .or_else(|| operation.projected_payload::<ParallelSumScatterOperation>().map(|payload| payload.axes().clone()))
+        .or_else(|| operation.projected_payload::<ParallelAllToAllOperation>().map(|payload| payload.axes().clone()))
+        .or_else(|| operation.projected_payload::<ParallelPermuteOperation>().map(|payload| payload.axes().clone()))
         .or_else(|| {
             operation
                 .projected_payload::<ParallelRaggedAllToAllOperation>()
-                .map(ParallelRaggedAllToAllOperation::axis_name)
+                .map(|payload| single(payload.axis_name()))
         })
 }
 
@@ -7087,6 +7109,8 @@ mod tests {
     use crate::operations::collectives::axis_index::AxisIndex;
     use crate::operations::collectives::parallel_all_gather::ParallelAllGather;
     use crate::operations::collectives::parallel_all_to_all::ParallelAllToAll;
+    use crate::operations::collectives::parallel_arg_extrema::ParallelArgExtrema;
+    use crate::operations::collectives::parallel_cast::{ParallelCast, ParallelCastTarget};
     use crate::operations::collectives::parallel_permute::ParallelPermute;
     use crate::operations::collectives::parallel_ragged_all_to_all::ParallelRaggedAllToAll;
     use crate::operations::collectives::parallel_reduce::ParallelReduce;
@@ -12775,6 +12799,181 @@ mod tests {
     }
 
     #[test]
+    fn test_shard_map_interpretation_parallel_cast() {
+        // Each device scales its tile of `v` by the shared `w` after casting `w` to reduced and then to varying, and
+        // the products are cast to unreduced and summed. The casts change no values, so the result is `w · (v₀ + v₁)`,
+        // and the gradient follows the adjoint casts. The expected values are those of the same program in JAX
+        // (`.tasks/shard_map_jax_parity_gaps/m3_oracles.py`).
+        let mesh = manual_mesh();
+        let sharded = sharded_along_x();
+        let replicated = Sharding::replicated(mesh.clone(), 1);
+        let body = |(w, v): (TestTracer, TestTracer)| {
+            let w = w.parallel_cast("x", ParallelCastTarget::Reduced)?;
+            let w = w.parallel_cast("x", ParallelCastTarget::Varying)?;
+            let product = (w * v).parallel_cast("x", ParallelCastTarget::Unreduced)?;
+            Ok(product.parallel_reduce(ReductionKind::Sum, "x")?)
+        };
+        let shardings = (replicated.clone(), sharded.clone());
+        let program = trace_test_program(
+            |inputs| {
+                let inputs = (inputs[0].clone(), inputs[1].clone());
+                vec![
+                    shard_map(
+                        body,
+                        inputs,
+                        mesh.clone(),
+                        shardings.clone(),
+                        replicated.clone(),
+                        ShardMapOptions::new(),
+                    )
+                    .unwrap(),
+                ]
+            },
+            vec![f32_vector_type(2), f32_vector_type(4)],
+            Vec::new(),
+        );
+        let w = f32_value(f32_vector_type(2), &[2.0, 3.0]);
+        let v = f32_value(f32_vector_type(4), &[1.0, 4.0, 5.0, 7.0]);
+        assert_eq!(
+            program.interpret(vec![w.clone(), v.clone()]),
+            Ok(vec![f32_value(f32_type(&[2], Some(replicated.clone())), &[12.0, 33.0])]),
+        );
+
+        let gradient = differentiate_at((w, v))
+            .gradient(|(w, v)| {
+                let w = ValueProjection::<ArrayType>::into_projected(w)?;
+                let v = ValueProjection::<ArrayType>::into_projected(v)?;
+                let output = shard_map(
+                    body,
+                    (w, v),
+                    mesh.clone(),
+                    shardings.clone(),
+                    replicated.clone(),
+                    ShardMapOptions::new(),
+                )?;
+                Ok(output.reduce(&[0], ReductionKind::Sum)?.into_value())
+            })
+            .unwrap();
+        assert_eq!(arrays_f64(vec![gradient.0, gradient.1]), vec![vec![6.0, 11.0], vec![2.0, 3.0, 2.0, 3.0]]);
+    }
+
+    #[test]
+    fn test_shard_map_interpretation_parallel_arg_extrema() {
+        // Device 0 holds `[3, 1, 2]` and device 1 holds `[3, 5, 0]`, so the first element ties and resolves to the lowest
+        // position. The expected positions are those of JAX's `pargmax` and `pargmin`
+        // (`.tasks/shard_map_jax_parity_gaps/m3_oracles.py`).
+        let mesh = manual_mesh();
+        let sharded = sharded_along_x();
+        let replicated = Sharding::replicated(mesh.clone(), 1);
+        let positions = |argmax: bool| {
+            trace_test_program(
+                |inputs| {
+                    vec![
+                        shard_map(
+                            |x: TestTracer| Ok(if argmax { x.parallel_argmax("x")? } else { x.parallel_argmin("x")? }),
+                            inputs[0].clone(),
+                            mesh.clone(),
+                            sharded.clone(),
+                            replicated.clone(),
+                            ShardMapOptions::new(),
+                        )
+                        .unwrap(),
+                    ]
+                },
+                vec![f32_vector_type(6)],
+                Vec::new(),
+            )
+        };
+        let input = f32_value(f32_vector_type(6), &[3.0, 1.0, 2.0, 3.0, 5.0, 0.0]);
+        let output_type = ArrayType::new_static(DataType::U64, [3]).with_sharding(replicated.clone()).unwrap();
+        assert_eq!(
+            positions(true).interpret(vec![input.clone()]),
+            Ok(vec![ArrayIrValue::Array(Array::from_elements(output_type.clone(), &[0u64, 1, 0]).unwrap())]),
+        );
+        assert_eq!(
+            positions(false).interpret(vec![input]),
+            Ok(vec![ArrayIrValue::Array(Array::from_elements(output_type, &[0u64, 0, 1]).unwrap())]),
+        );
+    }
+
+    #[test]
+    fn test_shard_map_interpretation_multi_axis_collectives() {
+        // Over several manual axes, the participants are positioned along the combined axis, which linearizes the axes
+        // in the given order with the first axis major. Every device holds its tile of `0..n`, sharded along `("x", "y")`
+        // on a 2x2 mesh, so the expected values are those of JAX's collectives with tuple axis names
+        // (`.tasks/shard_map_jax_parity_gaps/m3_oracles.py`).
+        let mesh = manual_mesh_2x2();
+        let sharded = Sharding::new(mesh.clone(), vec![ShardingDimension::sharded(["x", "y"])]).unwrap();
+        let run = |n: usize, body: &dyn Fn(TestTracer) -> Result<TestTracer, ProgramError>| {
+            let program = trace_test_program(
+                |inputs| {
+                    let output = shard_map(
+                        |input: TestTracer| body(input),
+                        inputs[0].clone(),
+                        mesh.clone(),
+                        sharded.clone(),
+                        sharded.clone(),
+                        ShardMapOptions::new(),
+                    );
+                    vec![output.unwrap()]
+                },
+                vec![f32_vector_type(n)],
+                Vec::new(),
+            );
+            let input = (0..n).map(|value| value as f32).collect::<Vec<_>>();
+            arrays_f64(program.interpret(vec![f32_value(f32_vector_type(n), &input)]).unwrap())
+        };
+        for (axes, scatter, all_to_all, gather) in [
+            (
+                ["x", "y"],
+                vec![24.0, 28.0, 32.0, 36.0],
+                vec![0.0, 4.0, 8.0, 12.0, 1.0, 5.0, 9.0, 13.0, 2.0, 6.0, 10.0, 14.0, 3.0, 7.0, 11.0, 15.0],
+                [0.0, 1.0, 2.0, 3.0],
+            ),
+            (
+                ["y", "x"],
+                vec![24.0, 32.0, 28.0, 36.0],
+                vec![0.0, 8.0, 4.0, 12.0, 2.0, 10.0, 6.0, 14.0, 1.0, 9.0, 5.0, 13.0, 3.0, 11.0, 7.0, 15.0],
+                [0.0, 2.0, 1.0, 3.0],
+            ),
+        ] {
+            assert_eq!(run(16, &|input| input.parallel_sum_scatter_tiled(axes, 0)), vec![scatter]);
+            assert_eq!(run(16, &|input| input.parallel_all_to_all_tiled(axes, 0, 0)), vec![all_to_all]);
+            assert_eq!(run(4, &|input| input.parallel_all_gather_tiled(axes, 0)), vec![gather.repeat(4)]);
+        }
+
+        // A permutation over `("x", "y")` matches JAX, whose `ppermute` rejects `("y", "x")` by default. Ryft accepts
+        // that order with the same linearization, under which device `(x, y)` has position `2y + x`.
+        let pairs = vec![(0, 1), (1, 2), (2, 3), (3, 0)];
+        assert_eq!(run(4, &|input| input.parallel_permute(["x", "y"], pairs.clone())), vec![vec![3.0, 0.0, 1.0, 2.0]]);
+        assert_eq!(run(4, &|input| input.parallel_permute(["y", "x"], pairs.clone())), vec![vec![3.0, 2.0, 0.0, 1.0]]);
+
+        // The transpose of a sum-scatter is the all-gather of the output cotangent over the same axes, in the same
+        // order, so pulling back the cotangent `[0, 1, 2, 3]` hands every input tile the cotangent of its position.
+        for (axes, expected) in [(["x", "y"], [0.0, 1.0, 2.0, 3.0]), (["y", "x"], [0.0, 2.0, 1.0, 3.0])] {
+            let program = trace_test_program(
+                |inputs| {
+                    let output = shard_map(
+                        |input: TestTracer| Ok(input.parallel_sum_scatter_tiled(axes, 0)?),
+                        inputs[0].clone(),
+                        mesh.clone(),
+                        sharded.clone(),
+                        sharded.clone(),
+                        ShardMapOptions::new(),
+                    );
+                    vec![output.unwrap()]
+                },
+                vec![f32_vector_type(16)],
+                Vec::new(),
+            );
+            let pullback = program.transpose_with_respect_to(&[0], &[CotangentDestinationKind::Return]).unwrap();
+            let cotangent_type = <&ArrayType>::try_from(&pullback.input_types()[0]).unwrap().clone();
+            let cotangent = f32_value(cotangent_type, &[0.0, 1.0, 2.0, 3.0]);
+            assert_eq!(arrays_f64(pullback.interpret(vec![cotangent]).unwrap()), vec![expected.repeat(4)]);
+        }
+    }
+
+    #[test]
     fn test_shard_map_interpretation_parallel_reduce_axis_index_groups() {
         // A grouped reduction combines the values of the members of each participant group only, so the devices at
         // coordinates `0` and `1` receive the sum of their tiles, and the devices at coordinates `2` and `3` receive
@@ -12812,9 +13011,9 @@ mod tests {
         // The participants of a device are the members of its group, positioned by their order in that group, and
         // groups that leave a coordinate without a group do not partition the axis.
         let grid = ManualDeviceGrid { axes: vec![("x".to_string(), 4)] };
-        assert_eq!(grid.participants(2, 0, Some([vec![3, 2], vec![1, 0]].as_slice())), Ok((vec![3, 2], 1)));
+        assert_eq!(grid.participants(2, &[0], Some([vec![3, 2], vec![1, 0]].as_slice())), Ok((vec![3, 2], 1)));
         assert_eq!(
-            grid.participants(2, 0, Some([vec![0, 1]].as_slice())),
+            grid.participants(2, &[0], Some([vec![0, 1]].as_slice())),
             Err(ProgramError::InvalidArgument {
                 message: "the participant groups `[[0, 1]]` of a collective over manual axis `x` do not partition \
                           its 4 coordinates"
