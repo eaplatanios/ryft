@@ -42,10 +42,7 @@ impl ShardingDimension {
         Self::Unconstrained
     }
 
-    /// Returns the [`MeshAxisType::Manual`] axes of `mesh` that this [`ShardingDimension`] partitions along. Inside a
-    /// manual region, a value whose dimension is partitioned along a manual axis holds a different slice on each device
-    /// along that axis, so introducing such a placement there makes the value vary along those axes (refer to the
-    /// documentation of [`Sharding::varying_manual_axes`]).
+    /// Returns the [`MeshAxisType::Manual`] axes of `mesh` that this [`ShardingDimension`] partitions along.
     pub fn manual_axes(&self, mesh: &LogicalMesh) -> Vec<String> {
         match self {
             Self::Sharded(axis_names) => axis_names
@@ -560,10 +557,8 @@ impl Sharding {
     /// Returns a [`Sharding`] with the provided [`ShardingDimension`] inserted at dimension `index`, shifting all
     /// subsequent dimensions one position to the right. Batching rules use this to extend an explicit output sharding
     /// with an entry for a newly introduced batch dimension. The resulting sharding is revalidated, and so inserting
-    /// a [`ShardingDimension::Sharded`] entry that references unknown or already-used mesh axes fails.
-    ///
-    /// This is a placement-only insertion. A batch axis introduced inside a batched computation must be inserted with
-    /// [`Self::batched`] instead, which additionally records the variation the placement introduces along manual axes.
+    /// a [`ShardingDimension::Sharded`] entry that references unknown or already-used mesh axes fails. Batching rules
+    /// insert batch dimensions through [`Self::batched`], which reports [`BatchingError`](crate::BatchingError)s.
     pub fn with_inserted_dimension(&self, index: usize, dimension: ShardingDimension) -> Result<Self, ShardingError> {
         if index > self.dimensions.len() {
             return Err(ShardingError::DimensionOutOfBounds { dimension: index, rank: self.rank() });
@@ -738,8 +733,20 @@ impl Display for Sharding {
     }
 }
 
-/// Kind of reduction state that a [`Sharding`] carries along a mesh axis, which diagnostics use to name the set of axes
-/// that they refer to.
+/// Kind of reduction state that a [`Sharding`] records along a mesh axis. Besides placing dimensions, a sharding
+/// records two sets of mesh axes along which the devices hold a value in a particular relation to its logical value:
+/// [`Sharding::unreduced_axes`] and [`Sharding::reduced_axes`]. Code that treats both sets alike uses this enum to say
+/// which one it refers to, and diagnostics display it as `unreduced` or `reduced` (e.g., a single
+/// [`ShardMapError::ReductionStateMismatch`](crate::ShardMapError::ReductionStateMismatch) variant
+/// reports a mismatch in either set).
+///
+/// For example, consider a scalar on a mesh with a single axis `x` of size `2`, inside a `shard_map` over `x`:
+///
+///   - If each device computes a partial sum over its own shard of some data, and those partial sums are `1` and `2`,
+///     the scalar is _unreduced_ along `x`. Its logical value is `3`, which no single device holds.
+///   - If the devices then add their partial sums together, both hold `3`, and the scalar is _reduced_ along `x`. Every
+///     device holds the logical value, but the sharding still records that it came from a reduction along `x`, because
+///     its cotangent is unreduced along `x` (i.e., [`Sharding::cotangent`] swaps the two sets).
 #[derive(Copy, Clone, Debug, PartialEq, Eq, Hash)]
 pub enum ReductionStateKind {
     /// State along the [`Sharding::unreduced_axes`] of a sharding, along which the devices hold summands of the value.
