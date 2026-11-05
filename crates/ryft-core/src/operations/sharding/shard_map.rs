@@ -318,8 +318,6 @@ use crate::programs::{
 };
 use crate::tracing::{DomainTracer, DomainTracingContext, Tracer, TracingContext};
 
-// TODO(eaplatanios): Review from here onwards.
-
 /// Error type related to [`ShardMapOperation`], covering mesh and sharding validation, global and local boundary
 /// derivation, manual variation, and the semantic restrictions on `shard_map` bodies. It carries no backend state,
 /// so backend tracing and lowering errors can wrap it.
@@ -334,6 +332,12 @@ use crate::tracing::{DomainTracer, DomainTracingContext, Tracer, TracingContext}
 /// tracing or binding a nested `shard_map`) is reported as itself rather than wrapped in a [`ProgramError`].
 #[derive(Clone, Debug, PartialEq, Eq, Hash, Error)]
 pub enum ShardMapError {
+    #[error(transparent)]
+    Program(ProgramError),
+
+    #[error(transparent)]
+    Parameter(#[from] ParameterError),
+
     #[error(transparent)]
     Sharding(#[from] ShardingError),
 
@@ -501,11 +505,10 @@ pub enum ShardMapError {
     )]
     BatchAxisPlacedOnSpecifiedAxis { axis_name: String },
 
-    /// An axis is used when any body value varies along it or a collective or `axis_index` names it, including in a
-    /// nested region. A permutation of invariant values can use an axis without producing a varying value.
     #[error(
-        "batching a `{SHARD_MAP_OPERATION_NAME}` places the batch axis on active manual axis `{axis_name}`, \
-         which the `{SHARD_MAP_OPERATION_NAME}` body uses"
+        "batching a `{SHARD_MAP_OPERATION_NAME}` places the batch axis on active manual axis `{axis_name}`, but the \
+         `{SHARD_MAP_OPERATION_NAME}` body (including its nested regions) has a value that varies along `{axis_name}` \
+         or a collective or `axis_index` over `{axis_name}`"
     )]
     BatchAxisPlacedOnUsedManualAxis { axis_name: String },
 
@@ -515,12 +518,6 @@ pub enum ShardMapError {
          to remain manual"
     )]
     BatchAxisPlacedOnManualAxisWithDeviceOrderedIo { axis_name: String },
-
-    #[error(transparent)]
-    Program(ProgramError),
-
-    #[error(transparent)]
-    Parameter(#[from] ParameterError),
 }
 
 impl From<ProgramError> for ShardMapError {
@@ -541,6 +538,8 @@ impl From<ShardMapError> for ProgramError {
         }
     }
 }
+
+// TODO(eaplatanios): Review from here onwards.
 
 /// Kind of `shard_map` boundary value that a [`ShardMapError`] refers to.
 #[derive(Copy, Clone, Debug, PartialEq, Eq, Hash)]
@@ -17155,7 +17154,8 @@ mod tests {
         ));
         assert_eq!(
             expected.to_string(),
-            "batching a `shard_map` places the batch axis on active manual axis `y`, which the `shard_map` body uses",
+            "batching a `shard_map` places the batch axis on active manual axis `y`, but the `shard_map` body \
+             (including its nested regions) has a value that varies along `y` or a collective or `axis_index` over `y`",
         );
     }
 
