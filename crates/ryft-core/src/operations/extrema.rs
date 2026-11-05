@@ -699,7 +699,7 @@ mod tests {
 
     use crate::arrays::{
         Array, ArrayOperation, ArrayType, DataType, Dimension, DimensionBounds, DimensionVariable, LogicalMesh,
-        MeshAxis, MeshAxisType, Shape, Sharding,
+        MeshAxis, MeshAxisType, Shape, Sharding, UnreducedKind,
     };
     use crate::contexts::EagerContext;
     use crate::differentiation::{DifferentiableOperation, DifferentiationContext, differentiate_at};
@@ -712,6 +712,65 @@ mod tests {
     use crate::tracing::TracingContext;
 
     use super::*;
+
+    /// Checks that the binary extremum `operation`, which commutes with pending reductions of `kind`, accepts inputs
+    /// that are unreduced along the same axes with `kind` and keeps that state, while it rejects inputs that are
+    /// unreduced with any other kind (e.g., `other` or a sum) or along different axes (as JAX's `max` and `min` do).
+    fn check_extremum_unreduced_inputs<O: Operation<Type = ArrayType>>(
+        operation: O,
+        kind: UnreducedKind,
+        other: UnreducedKind,
+    ) {
+        let name = operation.name();
+        let mesh = LogicalMesh::new(vec![
+            MeshAxis::new("x", 2, MeshAxisType::Explicit).unwrap(),
+            MeshAxis::new("y", 2, MeshAxisType::Explicit).unwrap(),
+        ])
+        .unwrap();
+        let unreduced = |axis: &str, kind: UnreducedKind| {
+            ArrayType::scalar(DataType::F64)
+                .with_sharding(
+                    Sharding::replicated(mesh.clone(), 0)
+                        .with_unreduced_axes([axis])
+                        .unwrap()
+                        .with_unreduced_kind(kind)
+                        .unwrap(),
+                )
+                .unwrap()
+        };
+        let plain = ArrayType::scalar(DataType::F64).with_sharding(Sharding::replicated(mesh.clone(), 0)).unwrap();
+        check_operation_type_inference!(
+            operation = operation,
+            cases = [
+                {
+                    input_types = [unreduced("x", kind), unreduced("x", kind)],
+                    output_types = [unreduced("x", kind)],
+                },
+                {
+                    input_types = [unreduced("x", UnreducedKind::Sum), unreduced("x", UnreducedKind::Sum)],
+                    error = format!("`{name}` supports only unreduced inputs of kind `{kind}` but got kind `sum`"),
+                },
+                {
+                    input_types = [unreduced("x", other), unreduced("x", other)],
+                    error = format!("`{name}` supports only unreduced inputs of kind `{kind}` but got kind `{other}`"),
+                },
+                {
+                    input_types = [unreduced("x", kind), unreduced("x", UnreducedKind::Sum)],
+                    error = format!(
+                        "`{name}` inputs must be unreduced with the same kind but got `{kind}` and `sum`",
+                    ),
+                },
+                {
+                    input_types = [unreduced("x", kind), unreduced("y", kind)],
+                    error = format!("`{name}` inputs must be unreduced over the same axes"),
+                },
+                {
+                    input_types = [unreduced("x", kind), plain.clone()],
+                    error = format!("`{name}` inputs must be unreduced over the same axes"),
+                },
+            ],
+        );
+    }
 
     #[test]
     fn test_min_type_inference() {
@@ -741,11 +800,7 @@ mod tests {
                 },
             ],
         );
-        check_operation_type_inference!(
-            @reject @unreduced,
-            operation = MinOperation::<ArrayType>::new(),
-            input_types = [ArrayType::scalar(DataType::F64), ArrayType::scalar(DataType::F64)],
-        );
+        check_extremum_unreduced_inputs(MinOperation::<ArrayType>::new(), UnreducedKind::Min, UnreducedKind::Max);
         check_operation_type_inference!(
             @reject @mismatched_reduced,
             operation = MinOperation::<ArrayType>::new(),
@@ -1113,11 +1168,7 @@ mod tests {
                 },
             ],
         );
-        check_operation_type_inference!(
-            @reject @unreduced,
-            operation = MaxOperation::<ArrayType>::new(),
-            input_types = [ArrayType::scalar(DataType::F64), ArrayType::scalar(DataType::F64)],
-        );
+        check_extremum_unreduced_inputs(MaxOperation::<ArrayType>::new(), UnreducedKind::Max, UnreducedKind::Min);
         check_operation_type_inference!(
             @reject @mismatched_reduced,
             operation = MaxOperation::<ArrayType>::new(),

@@ -468,6 +468,8 @@ impl DistributedRuntime {
 
 #[cfg(test)]
 mod tests {
+    #[cfg(feature = "cuda-13")]
+    use std::fs::File;
     use std::io::{Read, Write};
     use std::net::TcpListener;
     use std::process::{Command, Stdio};
@@ -476,12 +478,25 @@ mod tests {
     use std::thread;
     use std::time::{Duration, Instant};
 
-    use ryft_core::{CompilationArtifactExchange, CompilationArtifactExchangeError};
+    use ryft_core::{
+        ArrayIrType, ArrayReference, ArrayType, BatchAxis, CompilationArtifactExchange,
+        CompilationArtifactExchangeError, DataType, Device, DeviceMesh, LogicalMesh, MeshAxis, MeshAxisType,
+        ParallelReduce, ReductionKind, ReferenceType, ShardMapOptions, ShardMapTracer, Sharding, ShardingDimension,
+        UnreducedKind, ValueProjection, batch, shard_map,
+    };
     use ryft_pjrt::{
-        ClientOptions, CpuClientOptions, DistributedRuntimeClientOptions, DistributedRuntimeServiceOptions,
+        Client, ClientOptions, CpuClientOptions, DistributedRuntimeClientOptions, DistributedRuntimeServiceOptions,
         KeyValueStore, load_cpu_plugin,
     };
+    #[cfg(feature = "cuda-13")]
+    use ryft_pjrt::{GpuClientOptions, GpuMemoryAllocator, GpuPlatform, load_cuda_13_plugin};
     use sha2::{Digest, Sha256};
+
+    use crate::arrays_v0::host::materialize_dense_array_bytes;
+    use crate::compilation::compile_statefully;
+    use crate::compilation::tests::doubling_reduced_reference_program;
+    use crate::tests::{values_from_bytes, values_to_bytes};
+    use crate::{Array, ArrayError, Domain, Error, FromPjrt, Options, Reference, Session, Value};
 
     use super::{
         ARTIFACT_EXCHANGE_SCHEMA_VERSION, CompilationArtifactManifest, DistributedCompilationArtifactExchange,
@@ -492,12 +507,188 @@ mod tests {
     const PROCESS_TEST_ADDRESS: &str = "RYFT_DISTRIBUTED_EXCHANGE_TEST_ADDRESS";
     const PROCESS_TEST_DIRECTORY: &str = "RYFT_DISTRIBUTED_EXCHANGE_TEST_DIRECTORY";
     const PROCESS_TEST_ACKNOWLEDGEMENT: &[u8] = b"ryft/test/artifact-consumed";
+    #[cfg(feature = "cuda-13")]
+    const MULTI_HOST_TEST_ROLE: &str = "RYFT_DISTRIBUTED_MULTI_HOST_TEST_ROLE";
+    #[cfg(feature = "cuda-13")]
+    const MULTI_HOST_TEST_ADDRESS: &str = "RYFT_DISTRIBUTED_MULTI_HOST_TEST_ADDRESS";
 
     /// Returns a `127.0.0.1` URL with an OS-assigned free port, or `None` if local-port binding
     /// is denied in this environment.
     fn loopback_address() -> Option<String> {
         let listener = TcpListener::bind("127.0.0.1:0").ok()?;
         Some(format!("127.0.0.1:{}", listener.local_addr().unwrap().port()))
+    }
+
+    /// Returns the elements of the buffer of every shard of `array` that the current process addresses, in mesh order.
+    fn read_addressable_f32s(array: &Array<'_>) -> Vec<Vec<f32>> {
+        array
+            .addressable_shards()
+            .map(|shard| {
+                let bytes = shard.buffer().unwrap().copy_to_host(None).unwrap().r#await().unwrap();
+                values_from_bytes::<f32>(bytes.as_slice())
+            })
+            .collect()
+    }
+
+    /// Checks `shard_map` pipelines over a mesh `x = 2` of the two global devices of `client`, reading only the shards
+    /// that the current process addresses, so that the same checks hold for one process that addresses both devices
+    /// and for two processes that address one device each (as JAX's multi-controller model requires). Every process of
+    /// a job must call this function, because each scenario executes collectives over both devices.
+    fn check_shard_map_multi_host_scenarios<'c>(client: &'c Client<'c>) {
+        let process_index = client.process_index().unwrap();
+        let devices = client
+            .devices()
+            .unwrap()
+            .iter()
+            .map(|device| Device::from_pjrt(device).unwrap())
+            .collect::<Vec<_>>();
+        assert_eq!(devices.len(), 2);
+        // Mesh positions of the devices that this process addresses select the expected per-device values below.
+        let local_positions = devices
+            .iter()
+            .enumerate()
+            .filter(|(_, device)| device.process_index() == process_index)
+            .map(|(position, _)| position)
+            .collect::<Vec<_>>();
+        let domain = Session::new(client).domain();
+        let manual_mesh = LogicalMesh::new(vec![MeshAxis::new("x", 2, MeshAxisType::Manual).unwrap()]).unwrap();
+        let mesh = DeviceMesh::new(manual_mesh.clone(), devices.clone()).unwrap();
+        let sharded = Sharding::new(manual_mesh.clone(), vec![ShardingDimension::sharded(["x"])]).unwrap();
+        let replicated = Sharding::replicated(manual_mesh.clone(), 1);
+
+        // Each process uploads only its own tiles of `[1, 2, 3, 4]` and reads them back.
+        let input_type = ArrayType::new_static(DataType::F32, [4]).with_sharding(sharded.clone()).unwrap();
+        let input =
+            Array::from_host_buffer(&domain, input_type, mesh.clone(), values_to_bytes(&[1f32, 2., 3., 4.])).unwrap();
+        let tiles = [vec![1.0, 2.0], vec![3.0, 4.0]];
+        assert_eq!(
+            read_addressable_f32s(&input),
+            local_positions.iter().map(|&position| tiles[position].clone()).collect::<Vec<_>>(),
+        );
+
+        // Dense host materialization needs every shard, so it succeeds only in a process that addresses both devices
+        // and otherwise names a shard of the other process, as JAX rejects fetching arrays that span non-addressable
+        // devices.
+        if local_positions.len() == 2 {
+            let materialized = materialize_dense_array_bytes(&input).unwrap();
+            assert_eq!(values_from_bytes::<f32>(materialized.as_slice()), vec![1.0, 2.0, 3.0, 4.0]);
+        } else {
+            let remote_position = 1 - local_positions[0];
+            assert!(matches!(
+                materialize_dense_array_bytes(&input),
+                Err(Error::Array(error)) if matches!(
+                    *error,
+                    ArrayError::MissingShardBuffer { shard_index, device_id }
+                        if shard_index == remote_position && device_id == devices[remote_position].id(),
+                ),
+            ));
+        }
+
+        // An unchecked map returns each tile as its candidate for an output that is unreduced along `x`, and a checked
+        // map completes it with an all-reduce of the matching kind, so every device holds the sum `[4, 6]` (or the
+        // maximum `[3, 4]`).
+        let complete = |kind: UnreducedKind, reduction: ReductionKind| {
+            let unreduced = replicated.clone().with_unreduced_axes(["x"]).unwrap().with_unreduced_kind(kind).unwrap();
+            let candidates = shard_map(
+                |x| Ok(x),
+                input.clone(),
+                manual_mesh.clone(),
+                sharded.clone(),
+                unreduced.clone(),
+                ShardMapOptions::new().with_check_manual_variation(false),
+            )
+            .unwrap();
+            assert_eq!(candidates.sharding(), &unreduced);
+            shard_map(
+                |candidates: ShardMapTracer<Domain<'_>>| Ok(candidates.parallel_reduce(reduction, "x")?),
+                candidates,
+                manual_mesh.clone(),
+                unreduced,
+                replicated.clone(),
+                ShardMapOptions::new(),
+            )
+            .unwrap()
+        };
+        let sum = complete(UnreducedKind::Sum, ReductionKind::Sum);
+        assert_eq!(read_addressable_f32s(&sum), vec![vec![4.0, 6.0]; local_positions.len()]);
+        let maximum = complete(UnreducedKind::Max, ReductionKind::Max);
+        assert_eq!(read_addressable_f32s(&maximum), vec![vec![3.0, 4.0]; local_positions.len()]);
+
+        // Batching a map along its only manual axis for a caller over an `Explicit` copy of the mesh places one item on
+        // each device, so each device holds its own item doubled.
+        let caller_mesh = LogicalMesh::new(vec![MeshAxis::new("x", 2, MeshAxisType::Explicit).unwrap()]).unwrap();
+        let explicit_mesh = DeviceMesh::new(caller_mesh.clone(), devices.clone()).unwrap();
+        let items_type = ArrayType::new_static(DataType::F32, [2, 3])
+            .with_sharding(
+                Sharding::new(caller_mesh, vec![ShardingDimension::sharded(["x"]), ShardingDimension::replicated()])
+                    .unwrap(),
+            )
+            .unwrap();
+        let staged = crate::stage::<_, ArrayType, ArrayType>(
+            |input| {
+                let output = batch(
+                    |item| {
+                        let item = ValueProjection::<ArrayType>::into_projected(item)?;
+                        let output = shard_map(
+                            |x| Ok(x.clone() + x),
+                            item,
+                            manual_mesh.clone(),
+                            replicated.clone(),
+                            replicated.clone(),
+                            ShardMapOptions::new(),
+                        )?;
+                        Ok(output.into_value())
+                    },
+                    input.into_value(),
+                    BatchAxis::new(0),
+                    BatchAxis::new(0),
+                    None,
+                )
+                .unwrap();
+                ValueProjection::<ArrayType>::into_projected(output).unwrap()
+            },
+            items_type.clone(),
+            Options::new(explicit_mesh.clone()),
+        )
+        .unwrap()
+        .into_inner();
+        let compiled = staged.lower(&domain).unwrap().compile(&domain).unwrap();
+        let items =
+            Array::from_host_buffer(&domain, items_type, explicit_mesh, values_to_bytes(&[1f32, 2., 3., 4., 5., 6.]))
+                .unwrap();
+        let Value::Array(doubled) = compiled.executable().execute(&domain, Value::Array(items)).unwrap() else {
+            panic!("the compiled function returned a dimension");
+        };
+        let doubled_items = [vec![2.0, 4.0, 6.0], vec![8.0, 10.0, 12.0]];
+        assert_eq!(
+            read_addressable_f32s(&doubled),
+            local_positions.iter().map(|&position| doubled_items[position].clone()).collect::<Vec<_>>(),
+        );
+
+        // An unchecked stateful map doubles every device's copy of a reference that is reduced along `x` and writes it
+        // back, so each process reads `[2, 4]` from its own shards of the referent afterwards.
+        let (program, referent_type) = doubling_reduced_reference_program(&manual_mesh);
+        let compiled = compile_statefully::<_, Vec<ArrayIrType>, Vec<ArrayIrType>>(
+            |inputs| {
+                let context = inputs[0].context().clone();
+                program.interpret_in_context(&context, inputs)?;
+                Ok(Vec::new())
+            },
+            vec![ArrayIrType::Reference(ReferenceType::new(referent_type.clone()))],
+            &domain,
+            Options::new(mesh.clone()),
+        )
+        .unwrap();
+        let reference = ArrayReference::new(
+            Array::from_host_buffer(&domain, referent_type, mesh, values_to_bytes(&[1f32, 2.0]).as_slice()).unwrap(),
+        );
+        compiled
+            .execute_statefully_and_wait(
+                &domain,
+                vec![Value::Reference(Reference::new(reference.clone(), domain.clone()))],
+            )
+            .unwrap();
+        assert_eq!(read_addressable_f32s(&reference.read().unwrap()), vec![vec![2.0, 4.0]; local_positions.len()]);
     }
 
     #[test]
@@ -812,5 +1003,207 @@ mod tests {
         assert_eq!(std::fs::read_to_string(directory.path().join("producers")).unwrap(), "producer\n");
         assert_eq!(std::fs::read(directory.path().join("process-0")).unwrap(), b"complete");
         assert_eq!(std::fs::read(directory.path().join("process-1")).unwrap(), b"complete");
+    }
+
+    #[test]
+    fn test_shard_map_multi_host_scenarios_on_one_process_with_two_cpu_devices() {
+        // The single-process baseline of the multi-host scenarios, which reads every shard because this process
+        // addresses both devices. The client is minted through a one-node runtime, as in a distributed job.
+        let Some(address) = loopback_address() else {
+            return;
+        };
+        let plugin = load_cpu_plugin().unwrap();
+        let runtime = DistributedRuntime::initialize(&plugin, &address, 1, 0).unwrap();
+        let client = runtime
+            .create_client(
+                &plugin,
+                ClientOptions::CPU(CpuClientOptions { device_count: Some(2), ..Default::default() }),
+            )
+            .unwrap();
+        check_shard_map_multi_host_scenarios(&client);
+    }
+
+    /// Worker of `test_shard_map_multi_host_scenarios_on_two_cuda_processes`, which returns immediately unless that
+    /// test launched it as one of its two ranks.
+    #[cfg(feature = "cuda-13")]
+    #[test]
+    fn test_shard_map_multi_host_scenarios_cuda_process_helper() {
+        let Ok(role) = std::env::var(MULTI_HOST_TEST_ROLE) else {
+            return;
+        };
+        let process_index = role.parse::<usize>().unwrap();
+        let address = std::env::var(MULTI_HOST_TEST_ADDRESS).unwrap();
+        let timeout = Duration::from_secs(60);
+        let plugin = load_cuda_13_plugin().unwrap();
+        let runtime = DistributedRuntime::initialize_with_options(
+            &plugin,
+            &address,
+            process_index as u32,
+            DistributedRuntimeServiceOptions {
+                num_nodes: 2,
+                heartbeat_timeout: timeout,
+                cluster_register_timeout: timeout,
+                shutdown_timeout: timeout,
+            },
+            DistributedRuntimeClientOptions {
+                node_id: process_index as u32,
+                rpc_timeout: timeout,
+                initialization_timeout: timeout,
+                shutdown_timeout: timeout,
+                heartbeat_timeout: timeout,
+                missed_heartbeat_callback: Some(Box::new(|error| {
+                    if let Some(error) = error {
+                        eprintln!("distributed heartbeat failed: {error}");
+                    }
+                })),
+                ..Default::default()
+            },
+        )
+        .unwrap();
+
+        // The client borrows the runtime's key-value store, so every array, executable, and the client are dropped
+        // before the coordination client shuts down, while rank zero keeps the coordination service alive.
+        {
+            let client = runtime
+                .create_client(
+                    &plugin,
+                    ClientOptions::GPU(GpuClientOptions {
+                        platform: Some(GpuPlatform::CUDA),
+                        visible_devices: Some(vec![0]),
+                        node_id: Some(process_index),
+                        node_count: Some(2),
+                        allocator: GpuMemoryAllocator::CudaAsync { memory_fraction_to_preallocate: None },
+                        collective_memory_size: Some(32 * 1024 * 1024),
+                        abort_collectives_on_failure: true,
+                        ..Default::default()
+                    }),
+                )
+                .unwrap();
+            assert_eq!(client.process_index().unwrap(), process_index);
+            assert_eq!(client.devices().unwrap().len(), 2);
+            assert_eq!(client.addressable_devices().unwrap().len(), 1);
+            check_shard_map_multi_host_scenarios(&client);
+        }
+        let completed = |rank: usize| format!("ryft/test/multi-host-scenarios/completed/{rank}");
+        runtime.key_value_store().put(completed(process_index).as_bytes(), b"ready").unwrap();
+        for rank in 0..2 {
+            assert_eq!(runtime.key_value_store().get(completed(rank).as_bytes(), timeout).unwrap(), b"ready");
+        }
+        runtime.key_value_store().client().shutdown().unwrap();
+    }
+
+    #[cfg(feature = "cuda-13")]
+    #[test]
+    #[ignore = "requires one CUDA GPU with NCCL multi-rank support and CUDA MPS"]
+    fn test_shard_map_multi_host_scenarios_on_two_cuda_processes() {
+        // The multi-host scenarios run in two processes that address one device each. The CPU plugin cannot host them,
+        // because a CPU client that joins a distributed runtime sees only its own devices (e.g., process 1 sees just
+        // device 2048), so it has no cross-process topology for collectives. Instead, both ranks share CUDA device 0
+        // through NCCL's multiple ranks per GPU, with CUDA MPS for concurrent progress, which mirrors the
+        // `cuda-distributed-collectives` differential suite (refer to `python/README.md`).
+
+        /// Private MPS control daemon, which is shut down on drop.
+        struct MpsDaemon {
+            environment: Vec<(&'static str, String)>,
+        }
+
+        impl Drop for MpsDaemon {
+            fn drop(&mut self) {
+                // Panicking here could abort a test that is already unwinding, so a failed shutdown is only reported.
+                let shutdown = Command::new("nvidia-cuda-mps-control")
+                    .envs(self.environment.iter().map(|(name, value)| (*name, value)))
+                    .stdin(Stdio::piped())
+                    .spawn()
+                    .and_then(|mut control| {
+                        control.stdin.take().unwrap().write_all(b"quit\n")?;
+                        control.wait()
+                    });
+                if !matches!(&shutdown, Ok(status) if status.success()) {
+                    eprintln!("private CUDA MPS daemon shutdown failed: {shutdown:?}");
+                }
+            }
+        }
+
+        let Some(address) = loopback_address() else {
+            return;
+        };
+        let directory = tempfile::tempdir().unwrap();
+        let mut environment = vec![
+            ("NCCL_MULTI_RANK_GPU_ENABLE", "1".to_string()),
+            ("NCCL_NVLS_ENABLE", "0".to_string()),
+            ("NCCL_MAX_CTAS", "1".to_string()),
+            ("CUDA_MPS_ACTIVE_THREAD_PERCENTAGE", "45".to_string()),
+            ("CUDA_VISIBLE_DEVICES", std::env::var("CUDA_VISIBLE_DEVICES").unwrap_or_else(|_| "0".to_string())),
+        ];
+        // A caller-owned MPS daemon is used as is. Otherwise, this test owns a private daemon for the two ranks.
+        let _daemon = if std::env::var_os("CUDA_MPS_PIPE_DIRECTORY").is_some() {
+            None
+        } else {
+            let pipes = directory.path().join("mps-pipes");
+            let logs = directory.path().join("mps-logs");
+            std::fs::create_dir(&pipes).unwrap();
+            std::fs::create_dir(&logs).unwrap();
+            let daemon_environment = vec![
+                ("CUDA_MPS_PIPE_DIRECTORY", pipes.display().to_string()),
+                ("CUDA_MPS_LOG_DIRECTORY", logs.display().to_string()),
+                ("CUDA_VISIBLE_DEVICES", environment[4].1.clone()),
+            ];
+            let status = Command::new("nvidia-cuda-mps-control")
+                .arg("-d")
+                .envs(daemon_environment.iter().map(|(name, value)| (*name, value)))
+                .status()
+                .unwrap();
+            assert!(status.success(), "private CUDA MPS daemon failed to start: {status}");
+            environment.extend(daemon_environment[..2].iter().cloned());
+            Some(MpsDaemon { environment: daemon_environment })
+        };
+
+        // Each rank writes its output to files rather than pipes, so verbose native logs cannot block it.
+        let executable = std::env::current_exe().unwrap();
+        let mut children = (0..2)
+            .map(|rank| {
+                Command::new(&executable)
+                    .args([
+                        "--exact",
+                        "distributed::tests::test_shard_map_multi_host_scenarios_cuda_process_helper",
+                        "--nocapture",
+                        "--test-threads=1",
+                    ])
+                    .envs(environment.iter().map(|(name, value)| (*name, value)))
+                    .env(MULTI_HOST_TEST_ROLE, rank.to_string())
+                    .env(MULTI_HOST_TEST_ADDRESS, &address)
+                    .stdout(File::create(directory.path().join(format!("rank-{rank}.stdout"))).unwrap())
+                    .stderr(File::create(directory.path().join(format!("rank-{rank}.stderr"))).unwrap())
+                    .spawn()
+                    .unwrap()
+            })
+            .collect::<Vec<_>>();
+        let deadline = Instant::now() + Duration::from_secs(300);
+        let mut statuses = [None, None];
+        while statuses.iter().any(Option::is_none) && Instant::now() < deadline {
+            for (status, child) in statuses.iter_mut().zip(&mut children) {
+                if status.is_none() {
+                    *status = child.try_wait().unwrap();
+                }
+            }
+            // A failed rank leaves its peer waiting on collectives or coordination, so it ends the whole job.
+            if statuses.iter().flatten().any(|status| !status.success()) {
+                break;
+            }
+            thread::sleep(Duration::from_millis(20));
+        }
+        for (status, child) in statuses.iter_mut().zip(&mut children) {
+            if status.is_none() {
+                child.kill().unwrap();
+                *status = Some(child.wait().unwrap());
+            }
+        }
+        for (rank, status) in statuses.into_iter().enumerate() {
+            let status = status.unwrap();
+            let stderr = std::fs::read_to_string(directory.path().join(format!("rank-{rank}.stderr"))).unwrap();
+            let stdout = std::fs::read_to_string(directory.path().join(format!("rank-{rank}.stdout"))).unwrap();
+            assert!(status.success(), "rank {rank} failed with {status}\nstdout:\n{stdout}\nstderr:\n{stderr}");
+            assert!(stdout.contains("1 passed"), "rank {rank} did not run its scenarios:\n{stdout}");
+        }
     }
 }

@@ -1562,7 +1562,7 @@ mod tests {
     use ryft_core::{
         ArrayType, DataType, Device, DeviceMesh, Dimension as CoreDimension, DimensionBounds, DimensionVariable,
         Error as CoreError, Layout, LogicalMesh, Memory, MeshAxis, MeshAxisType, Reference as CoreReference, Shape,
-        Sharding, ShardingDimension, ShardingError, StaticShape, TiledLayout, Typed,
+        Sharding, ShardingDimension, ShardingError, StaticShape, TiledLayout, Typed, UnreducedKind,
     };
     use ryft_pjrt::protos::{CompilationOptions, Precision};
     use ryft_pjrt::{BufferType, ClientOptions, CpuClientOptions, Error as PjrtError, ExecutionFence, load_cpu_plugin};
@@ -1879,7 +1879,7 @@ mod tests {
             .unwrap()
             .with_unreduced_axes(["x"])
             .unwrap();
-        let r#type = ArrayType::new_static(DataType::F32, [4]).with_sharding(sharding).unwrap();
+        let r#type = ArrayType::new_static(DataType::F32, [4]).with_sharding(sharding.clone()).unwrap();
         let device_values = |array: &Array<'_>| {
             array
                 .shards()
@@ -1909,8 +1909,33 @@ mod tests {
                     .unwrap()
             })
             .collect();
-        let summands = Array::from_addressable_buffers(&domain, r#type, mesh, buffers).unwrap();
+        let summands = Array::from_addressable_buffers(&domain, r#type, mesh.clone(), buffers).unwrap();
         assert_eq!(materialize(&summands), vec![11., 22., 33., 44.]);
+
+        // With kind `max` (respectively, `min`), the devices along `x` hold candidates whose maximum (respectively,
+        // minimum) is the logical value. A host upload places the whole value on every device, which is its own
+        // maximum, and host materialization takes the elementwise maximum of the candidates of each tile.
+        for (kind, expected) in [(UnreducedKind::Max, [10., 2., 30., 40.]), (UnreducedKind::Min, [1., -20., 3., 4.])] {
+            let r#type = ArrayType::new_static(DataType::F32, [4])
+                .with_sharding(sharding.clone().with_unreduced_kind(kind).unwrap())
+                .unwrap();
+            let uploaded =
+                Array::from_host_buffer(&domain, r#type.clone(), mesh.clone(), values_to_bytes(&[-1f32, -2., 3., 4.]))
+                    .unwrap();
+            assert_eq!(device_values(&uploaded), vec![vec![-1., -2.], vec![3., 4.], vec![-1., -2.], vec![3., 4.]]);
+            assert_eq!(materialize(&uploaded), vec![-1., -2., 3., 4.]);
+            let buffers = [[1f32, 2.], [3., 4.], [10., -20.], [30., 40.]]
+                .iter()
+                .zip(&devices)
+                .map(|(values, device)| {
+                    client
+                        .buffer(values_to_bytes(values).as_slice(), BufferType::F32, [2], None, device.clone(), None)
+                        .unwrap()
+                })
+                .collect();
+            let candidates = Array::from_addressable_buffers(&domain, r#type, mesh.clone(), buffers).unwrap();
+            assert_eq!(materialize(&candidates), expected.to_vec());
+        }
 
         // A host relayout keeps every device's summand, while a dense host round trip, which would replace them, is
         // rejected.
@@ -2283,7 +2308,7 @@ mod tests {
             concat!(
                 "Array { type: ArrayType { data_type: F32, shape: Shape { dimensions: [Static(2)] }, layout: None, ",
                 "sharding: Some(Sharding { mesh: LogicalMesh { axes: [MeshAxis { name: \"x\", size: 1, type: Auto }] }, ",
-                "dimensions: [Replicated], unreduced_axes: {}, reduced_axes: {}, ",
+                "dimensions: [Replicated], unreduced_axes: {}, unreduced_kind: Sum, reduced_axes: {}, ",
                 "varying_manual_axes: {} }), memory: Device }, shards: [ArrayShard { index: 0, device_id: 0, ",
                 "process_index: 1, ",
                 "shape: StaticShape { dimensions: [2] }, is_addressable: false }] }",

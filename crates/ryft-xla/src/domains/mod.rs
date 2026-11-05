@@ -7,12 +7,12 @@
 //!
 //! # Sessions and Domains
 //!
-//! A [`Session`] borrows one PJRT [`Client`] and owns its compilation cache, default effect scope, and runtime extension
-//! resources. Create a session with [`Session::new`] or one of its cache-configuring constructors, then obtain a domain
-//! through [`Session::domain`]. Domains derived from the same session share those resources. Creating another session
-//! gives an independent cache and effect scope, even when it borrows the same client. Configure built-in or downstream
-//! providers through [`RuntimeExtensions`] and [`Session::with_runtime_extensions`]. Each session initializes its own
-//! runtime instances lazily when an executable requires them.
+//! A [`Session`] borrows one PJRT [`Client`] and owns its compilation cache, default effect scope, and runtime
+//! extension resources. Create a session with [`Session::new`] or one of its cache-configuring constructors, then
+//! obtain a domain through [`Session::domain`]. Domains derived from the same session share those resources. Creating
+//! another session gives an independent cache and effect scope, even when it borrows the same client. Configure
+//! built-in or downstream providers through [`RuntimeExtensions`] and [`Session::with_runtime_extensions`]. Each
+//! session initializes its own runtime instances lazily when an executable requires them.
 //!
 //! [`Options`] supplies the execution [`DeviceMesh`], sharding overrides, donation flags, and backend compilation
 //! policies for a staged function. The domain's [`CompilationOptions`] supplies the underlying PJRT compiler settings.
@@ -26,10 +26,11 @@
 //! [`with_input_shardings`] to the input types first if the options specify input sharding overrides.
 //!
 //! [`LoweredProgram`] contains StableHLO and the metadata needed for compilation. [`CompiledProgram`] contains the
-//! loaded executable and its invocation contract. These flat artifacts are distinct from the typed function handles
-//! in [`crate::compilation`], which also retain input and output container structures. The session's [`CompilationContext`]
-//! coordinates artifact reuse, and [`CompilationKey`] records the exact computation and compilation configuration.
-//! [`CompilationAnalysis`] and [`OptimizedProgram`] expose compiler diagnostics for a compiled program.
+//! loaded executable and its invocation contract. These flat artifacts are distinct from the typed function handles in
+//! [`crate::compilation`], which also retain input and output container structures. The session's
+//! [`CompilationContext`] coordinates artifact reuse, and [`CompilationKey`] records the exact computation and
+//! compilation configuration. [`CompilationAnalysis`] and [`OptimizedProgram`] expose compiler diagnostics for a
+//! compiled program.
 //!
 //! # Effects and Completion
 //!
@@ -125,7 +126,7 @@ pub struct Domain<'c> {
 }
 
 /// Tracer shape used while staging XLA programs directly from types.
-pub(crate) type Tracer<'context> = DomainTracer<Domain<'context>>;
+pub(crate) type Tracer<'c> = DomainTracer<Domain<'c>>;
 
 impl<'c> Clone for Domain<'c> {
     fn clone(&self) -> Self {
@@ -139,13 +140,6 @@ impl<'c> Clone for Domain<'c> {
 }
 
 impl<'c> Domain<'c> {
-    /// Returns the shared default [`CompilationOptions`] template.
-    #[inline]
-    fn default_compilation_options() -> Arc<CompilationOptions> {
-        static DEFAULT: LazyLock<Arc<CompilationOptions>> = LazyLock::new(|| Arc::new(CompilationOptions::default()));
-        Arc::clone(&DEFAULT)
-    }
-
     /// Creates a domain over `session` using the session's default effect scope and the supplied execution
     /// configuration.
     fn from_session_configuration(
@@ -250,6 +244,13 @@ impl<'c> Domain<'c> {
     pub fn acknowledge_effect_errors(&self) -> Result<(), Error> {
         self.effect_scope.acknowledge()
     }
+
+    /// Returns the shared default [`CompilationOptions`] template.
+    #[inline]
+    fn default_compilation_options() -> Arc<CompilationOptions> {
+        static DEFAULT: LazyLock<Arc<CompilationOptions>> = LazyLock::new(|| Arc::new(CompilationOptions::default()));
+        Arc::clone(&DEFAULT)
+    }
 }
 
 impl<'c> CoreDomain for Domain<'c> {
@@ -342,6 +343,7 @@ pub(crate) mod tests {
         STATEFUL_COMPLETION_INJECTION.with(|injection| *injection.borrow_mut() = Some(completion));
     }
 
+    /// Builds a one-axis mesh from the client's addressable devices for domain tests.
     pub(crate) fn domain_mesh(client: &Client<'_>, axis: &str, axis_size: usize) -> DeviceMesh {
         let logical_mesh = LogicalMesh::new(vec![MeshAxis::new(axis, axis_size, MeshAxisType::Auto).unwrap()]).unwrap();
         let devices = client
@@ -353,6 +355,7 @@ pub(crate) mod tests {
         DeviceMesh::new(logical_mesh, devices).unwrap()
     }
 
+    /// Builds a flat program that reads and returns one externally supplied reference.
     pub(super) fn external_reference_read_program(referent_type: ArrayType) -> FlatProgram {
         let mut builder = ProgramBuilder::new();
         let reference = builder.add_input(ArrayIrType::Reference(ReferenceType::new(referent_type)));
@@ -363,39 +366,46 @@ pub(crate) mod tests {
             .unwrap()
     }
 
+    /// Creates an independent session and projects its domain to ordinary array values.
     pub(super) fn array_domain<'c>(client: &'c Client<'c>) -> ProjectedContext<Domain<'c>, ArrayType> {
         ProjectedContext::new(Session::new(client).domain())
     }
 
-    pub(super) fn program_array<'a, 'c>(value: &'a Value<'c>) -> &'a Array<'c> {
+    /// Borrows the array carried by a test value, requiring the array variant.
+    pub(super) fn program_array<'o, 'c>(value: &'o Value<'c>) -> &'o Array<'c> {
         let Value::Array(array) = value else {
             panic!("expected an array IR value");
         };
         array
     }
 
+    /// Constructs a rank-1 `f32` type replicated over `mesh`.
     pub(super) fn replicated_vector_type(mesh: &DeviceMesh, size: usize) -> ArrayType {
         ArrayType::new(DataType::F32, Shape::new(vec![CoreDimension::Static(size)]))
             .with_sharding(Sharding::replicated(mesh.logical_mesh().clone(), 1))
             .unwrap()
     }
 
+    /// Constructs a scalar of `data_type` replicated over `mesh`.
     pub(super) fn replicated_scalar_type(mesh: &DeviceMesh, data_type: DataType) -> ArrayType {
         ArrayType::scalar(data_type)
             .with_sharding(Sharding::replicated(mesh.logical_mesh().clone(), 0))
             .unwrap()
     }
 
+    /// Uploads a replicated rank-1 `f32` test array.
     pub(super) fn f32_vector<'c>(domain: &Domain<'c>, mesh: &DeviceMesh, values: &[f32]) -> Array<'c> {
         let r#type = replicated_vector_type(mesh, values.len());
         Array::from_host_buffer(domain, r#type, mesh.clone(), values_to_bytes::<f32>(values).as_slice()).unwrap()
     }
 
+    /// Uploads a replicated `f32` test scalar.
     pub(super) fn f32_scalar<'c>(domain: &Domain<'c>, mesh: &DeviceMesh, value: f32) -> Array<'c> {
         let r#type = replicated_scalar_type(mesh, DataType::F32);
         Array::from_host_buffer(domain, r#type, mesh.clone(), value.to_ne_bytes().as_slice()).unwrap()
     }
 
+    /// Uploads a replicated rank-1 `f64` test array.
     pub(super) fn f64_vector<'c>(domain: &Domain<'c>, mesh: &DeviceMesh, values: &[f64]) -> Array<'c> {
         let r#type = ArrayType::new(DataType::F64, Shape::new(vec![CoreDimension::Static(values.len())]))
             .with_sharding(Sharding::replicated(mesh.logical_mesh().clone(), 1))
@@ -403,6 +413,7 @@ pub(crate) mod tests {
         Array::from_host_buffer(domain, r#type, mesh.clone(), values_to_bytes::<f64>(values).as_slice()).unwrap()
     }
 
+    /// Uploads a replicated rank-1 Boolean test array using one byte per element.
     pub(super) fn boolean_vector<'c>(domain: &Domain<'c>, mesh: &DeviceMesh, values: &[bool]) -> Array<'c> {
         let r#type = ArrayType::new(DataType::Boolean, Shape::new(vec![CoreDimension::Static(values.len())]))
             .with_sharding(Sharding::replicated(mesh.logical_mesh().clone(), 1))
@@ -411,11 +422,13 @@ pub(crate) mod tests {
         Array::from_host_buffer(domain, r#type, mesh.clone(), values.as_slice()).unwrap()
     }
 
+    /// Uploads a replicated Boolean test scalar using one byte per element.
     pub(super) fn boolean_scalar<'c>(domain: &Domain<'c>, mesh: &DeviceMesh, value: bool) -> Array<'c> {
         let r#type = replicated_scalar_type(mesh, DataType::Boolean);
         Array::from_host_buffer(domain, r#type, mesh.clone(), &[u8::from(value)]).unwrap()
     }
 
+    /// Reads the first addressable shard as native-endian `f32` values.
     pub(crate) fn read_f32s(client: &Client<'_>, array: &Array<'_>) -> Vec<f32> {
         let device_id = client.addressable_devices().unwrap()[0].id().unwrap();
         let bytes = array
@@ -430,6 +443,7 @@ pub(crate) mod tests {
         values_from_bytes::<f32>(bytes.as_slice())
     }
 
+    /// Reads the first addressable shard as native-endian `f64` values.
     pub(crate) fn read_f64s(client: &Client<'_>, array: &Array<'_>) -> Vec<f64> {
         let device_id = client.addressable_devices().unwrap()[0].id().unwrap();
         let bytes = array
@@ -444,6 +458,7 @@ pub(crate) mod tests {
         values_from_bytes::<f64>(bytes.as_slice())
     }
 
+    /// Reads the first addressable shard as native-endian unsigned 64-bit integers.
     pub(super) fn read_u64s(client: &Client<'_>, array: &Array<'_>) -> Vec<u64> {
         let device_id = client.addressable_devices().unwrap()[0].id().unwrap();
         let bytes = array
@@ -458,6 +473,7 @@ pub(crate) mod tests {
         values_from_bytes::<u64>(bytes.as_slice())
     }
 
+    /// Reads the first addressable shard as native-endian signed 64-bit integers.
     pub(super) fn read_i64s(client: &Client<'_>, array: &Array<'_>) -> Vec<i64> {
         let device_id = client.addressable_devices().unwrap()[0].id().unwrap();
         let bytes = array
@@ -472,6 +488,7 @@ pub(crate) mod tests {
         values_from_bytes::<i64>(bytes.as_slice())
     }
 
+    /// Reads the first addressable shard, interpreting each nonzero byte as `true`.
     pub(super) fn read_booleans(client: &Client<'_>, array: &Array<'_>) -> Vec<bool> {
         let device_id = client.addressable_devices().unwrap()[0].id().unwrap();
         array

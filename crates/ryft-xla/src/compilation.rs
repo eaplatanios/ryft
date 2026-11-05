@@ -1738,7 +1738,7 @@ where
 }
 
 #[cfg(test)]
-mod tests {
+pub(crate) mod tests {
     use std::sync::{Arc, Barrier, Condvar, Mutex, mpsc};
     use std::time::{Duration, Instant};
 
@@ -3922,7 +3922,7 @@ mod tests {
 
     /// Builds the program `r -> shard_map(|r| r += read(r))(r)` for an unchecked map over a two-device mesh whose
     /// reference input is reduced along the manual axis `x`, together with the mesh, the domain, and the referent type.
-    fn doubling_reduced_reference_program(
+    pub(crate) fn doubling_reduced_reference_program(
         logical_mesh: &LogicalMesh,
     ) -> (ryft_core::Program<Constant, Operation, Vec<Constant>, Vec<Constant>>, ArrayType) {
         let reduced = Sharding::replicated(logical_mesh.clone(), 1).with_reduced_axes(["x"]).unwrap();

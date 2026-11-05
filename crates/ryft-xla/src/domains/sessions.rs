@@ -1,4 +1,12 @@
-//! Session ownership of XLA clients, caches, runtime resources, and completions.
+//! Shared ownership of XLA compilation and execution resources.
+//!
+//! A [`Session`] borrows one externally owned PJRT [`Client`] and owns its compilation caches, target snapshot, default
+//! effect scope, and runtime extension registry. Its constructors choose the cache policy, and [`Session::domain`]
+//! creates domains that share these resources.
+//!
+//! Domains and arrays retain their session, while cached executables retain no session or arrays. Separate sessions
+//! remain independent even when they borrow the same client. Observe outstanding effects through
+//! [`Session::effects_barrier`] before releasing the client when their completion must be checked.
 
 use std::sync::{Arc, OnceLock};
 
@@ -68,8 +76,8 @@ pub struct Session<'c> {
     /// Externally owned client, which outlives cached executables and effect carriers.
     client: &'c Client<'c>,
 
-    /// Compile target of [`Self::client`], read lazily on first use and retained (including a failed read) for the
-    /// lifetime of the session.
+    /// Compilation and execution target snapshot of [`Self::client`], read lazily and retained (including a failed
+    /// read) for the lifetime of the session.
     target: OnceLock<Result<Target, ryft_pjrt::Error>>,
 
     /// Cached artifacts contain no runtime execution association.
@@ -78,6 +86,7 @@ pub struct Session<'c> {
     /// Compiled programs of eager operation applications, keyed in front of tracing and lowering. Refer to the
     /// documentation of [`EagerDispatchKey`] for information on what the key captures.
     pub(super) eager_dispatch_cache: SpecializationCache<EagerDispatchKey, Arc<CompiledProgram<'c>>>,
+
     /// Default ordering and completion scope shared by domains and arrays created through this session.
     pub(super) default_effect_scope: Arc<EffectScope<'c>>,
 
@@ -259,13 +268,16 @@ mod tests {
             CudaKernelAbi::new("ryft.kernel.pointer", 1, vec![CudaKernelParameterType::DevicePointer]).unwrap(),
         )
         .unwrap();
+
         /// Hand-authored artifact fixture admitted only for the exact verified scalar increment body.
         struct IncrementCompiler {
             artifact: CudaKernelArtifact,
             semantic: String,
         }
+
         /// PTX fixture target requiring the actual CUDA platform, FFI ABI, and supported device architecture.
         struct IncrementTarget;
+
         impl crate::kernels::KernelTarget for IncrementTarget {
             fn admit_execution(
                 &self,
@@ -295,6 +307,7 @@ mod tests {
                 Ok(())
             }
         }
+
         impl KernelCompiler for IncrementCompiler {
             type Target = IncrementTarget;
             type Options = ();
@@ -315,6 +328,7 @@ mod tests {
                 }
                 Ok(())
             }
+
             fn configuration_key(
                 &self,
                 _target: &IncrementTarget,
@@ -325,6 +339,7 @@ mod tests {
                 key.extend_from_slice(self.artifact.bytes());
                 Ok(key)
             }
+
             fn compile(
                 &self,
                 _kernel: &VerifiedKernel<'_>,
@@ -364,9 +379,9 @@ mod tests {
         assert!(lowered.kernel_execution_facts.is_some());
         assert!(!lowered.signature.has_effects());
         let compiled = domain.compile_program(&lowered).unwrap();
-        let input = session.array(scalar, mesh, 42_i32.to_ne_bytes()).unwrap();
+        let input = session.array(scalar, mesh, 42i32.to_ne_bytes()).unwrap();
         let outputs = domain.execute_program(&compiled, vec![input.clone()]).unwrap();
-        let bytes = domain.serialize_compiled_program(&compiled).unwrap().unwrap();
+        let bytes = compiled.serialize().unwrap().unwrap();
         let restored_session = Session::new(&client);
         let restored_domain = restored_session.domain();
         let restored = restored_domain.deserialize_compiled_program(&bytes).unwrap().unwrap();
@@ -395,6 +410,7 @@ mod tests {
         drop(domain);
         drop(session);
     }
+
     #[test]
     fn test_session_domain() {
         let plugin = load_cpu_plugin().unwrap();

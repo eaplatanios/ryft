@@ -1,12 +1,19 @@
-//! XLA compilation options and specialization policies.
+//! Per-function XLA compilation options and specialization policies.
+//!
+//! [`Options`] selects the mesh, sharding overrides, donation, and lowering policies for a staged function. These
+//! settings supplement the PJRT compilation options configured on its [`Domain`](crate::Domain).
+//! [`FeedbackDirectedProfile`] supplies opaque compiler profile data, and [`InputBoundBucketing`] controls how a
+//! retained dispatcher groups runtime input extents into bounded specializations. Settings that affect compilation
+//! participate in its cache identity.
 
 use std::hash::Hash;
 use std::path::Path;
 use std::sync::Arc;
 
-use ryft_core::{DeviceMesh, Parameterized, Sharding};
+use ryft_core::{DeviceMesh, Parameterized, Sharding, current_device_mesh};
 use sha2::{Digest, Sha256};
 
+use crate::domains::compilation::CompilationError;
 use crate::{Error, RaggedDotLoweringStrategy};
 
 // TODO(eaplatanios): Review this module.
@@ -18,7 +25,10 @@ use crate::{Error, RaggedDotLoweringStrategy};
 /// distributed compilation identity because its bytes are encoded in the canonical compilation options.
 #[derive(Clone, Debug, PartialEq, Eq, Hash)]
 pub struct FeedbackDirectedProfile {
+    /// Opaque compiler profile payload passed to XLA.
     bytes: Arc<[u8]>,
+
+    /// XLA profile format version associated with the payload.
     version: i64,
 }
 
@@ -122,6 +132,19 @@ impl Options {
             input_bound_bucketing: None,
             ragged_dot_lowering_strategy: RaggedDotLoweringStrategy::default(),
         }
+    }
+
+    /// Constructs options like [`Self::new`] for the device mesh in scope (refer to
+    /// [`current_device_mesh`](ryft_core::current_device_mesh)), as JAX's compilation does under `jax.set_mesh`.
+    ///
+    /// # Errors
+    ///
+    /// Returns [`CompilationError::InvalidOptions`] when no device mesh is in scope (i.e., outside of every
+    /// [`with_mesh`](ryft_core::with_mesh) scope or inside a [`with_abstract_mesh`](ryft_core::with_abstract_mesh) scope).
+    pub fn from_current_mesh() -> Result<Self, CompilationError> {
+        current_device_mesh().map(Self::new).ok_or_else(|| CompilationError::InvalidOptions {
+            reason: "no device mesh is in scope; call within `with_mesh` or pass a mesh explicitly".to_string(),
+        })
     }
 
     /// Selects one immutable compiler and typed embedding for portable kernel calls in this compilation.

@@ -22,7 +22,7 @@ use crate::experimental::lowering::{
 };
 use crate::experimental::ops::{Constant, Program};
 use crate::operations::control_flow::lowered_effect_classes;
-use crate::sharding::SHARDY_MESH_SYMBOL_NAME;
+use crate::sharding::{SHARDY_MESH_SYMBOL_NAME, shardy_reduction_operation};
 use crate::{Error, LowerableOperation, LowerableOperationFamily, Lowerer};
 
 /// Lowers one `sdy.manual_computation` operation, threading per-device effect tokens across its boundary. Assertions
@@ -291,7 +291,7 @@ fn manual_computation_tensor_sharding<'c, 't>(
         dimension_shardings.as_slice(),
         replicated_axes.as_slice(),
         unreduced_axes.as_slice(),
-        shardy::ReductionOperation::Sum,
+        shardy_reduction_operation(sharding.unreduced_kind()),
     )?)
 }
 
@@ -403,8 +403,8 @@ mod tests {
         DataType, Device, DeviceMesh, Dimension as CoreDimension, DomainTracingContext, Dot, DotDimensionNumbers,
         EffectClass, Exp, LogicalMesh, MeshAxis, MeshAxisType, ParallelAllGather, ParallelAllToAll, ParallelArgExtrema,
         ParallelCast, ParallelCastTarget, ParallelPermute, ParallelReduce, ParallelSumScatter, Placeholder,
-        ReductionKind, Shape, ShardMapOptions, ShardMapTracer, Typed, ValueProjection, batch, differentiate_at,
-        shard_map, shard_map_along, shard_map_with_inferred_input_shardings,
+        ReductionKind, Shape, ShardMapOptions, ShardMapTracer, Typed, UnreducedKind, ValueProjection, batch,
+        current_mesh, differentiate_at, shard_map, shard_map_along, shard_map_with_inferred_input_shardings, with_mesh,
     };
     use ryft_mlir::Block;
     use ryft_pjrt::{BufferType, ClientOptions, CpuClientOptions, Program as PjrtProgram, load_cpu_plugin};
@@ -1571,6 +1571,77 @@ mod tests {
     }
 
     #[test]
+    fn test_to_mlir_module_for_program_with_unreduced_kinds_executes_on_cpu() {
+        // An unchecked map returns each device's tile as its candidate for an output that is unreduced along `x` with
+        // kind `max` (respectively, `min`), which lowers to Shardy's reduction operation of the unreduced axes, and a
+        // checked map completes it with an all-reduce of that kind. Device 0 holds `[1, 7]` and device 1 holds
+        // `[5, 2]`, so both devices end with `[5, 7]` (respectively, `[1, 2]`), as JAX's `unreduced_pmax` and
+        // `unreduced_pmin` do (`.tasks/shard_map_jax_parity_gaps/m4_oracles.py`).
+        let mesh = test_manual_mesh("x", 2);
+        let sharded = Sharding::new(mesh.clone(), vec![ShardingDimension::sharded(["x"])]).unwrap();
+        let replicated = Sharding::replicated(mesh.clone(), 1);
+        let module = |kind: UnreducedKind, reduction: ReductionKind| {
+            let unreduced = replicated.clone().with_unreduced_axes(["x"]).unwrap().with_unreduced_kind(kind).unwrap();
+            let traced: TracedProgram<ArrayType, ArrayType> = trace_with_context(
+                |_, x: ArrayTracer| {
+                    let candidates = shard_map(
+                        |x: ArrayTracer| Ok(x),
+                        x,
+                        mesh.clone(),
+                        sharded.clone(),
+                        unreduced.clone(),
+                        ShardMapOptions::new().with_check_manual_variation(false),
+                    )?;
+                    Ok(shard_map(
+                        |candidates: ArrayTracer| Ok(candidates.parallel_reduce(reduction, "x")?),
+                        candidates,
+                        mesh.clone(),
+                        unreduced.clone(),
+                        replicated.clone(),
+                        ShardMapOptions::new(),
+                    )?)
+                },
+                ArrayType::new_static(DataType::F32, [4]).with_sharding(sharded.clone()).unwrap(),
+            )
+            .unwrap();
+            traced.to_mlir_module("main").unwrap()
+        };
+        let maximum = module(UnreducedKind::Max, ReductionKind::Max);
+        assert_eq!(
+            maximum,
+            indoc! {"
+                module {
+                  sdy.mesh @mesh = <[\"x\"=2]>
+                  func.func @main(%arg0: tensor<4xf32> {sdy.sharding = #sdy.sharding<@mesh, [{\"x\"}]>}) -> \
+                      (tensor<2xf32> {sdy.sharding = #sdy.sharding<@mesh, [{}], replicated={\"x\"}>}) {
+                    %0 = sdy.manual_computation(%arg0) in_shardings=[<@mesh, [{\"x\"}]>] \
+                        out_shardings=[<@mesh, [{}], unreduced=max{\"x\"}>] manual_axes={\"x\"} \
+                        (%arg1: tensor<2xf32>) {
+                      sdy.return %arg1 : tensor<2xf32>
+                    } : (tensor<4xf32>) -> tensor<2xf32>
+                    %1 = sdy.sharding_constraint %0 <@mesh, [{}], unreduced=max{\"x\"}> : tensor<2xf32>
+                    %2 = sdy.manual_computation(%1) in_shardings=[<@mesh, [{}], unreduced=max{\"x\"}>] \
+                        out_shardings=[<@mesh, [{}], replicated={\"x\"}>] manual_axes={\"x\"} (%arg1: tensor<2xf32>) {
+                      %3 = \"stablehlo.all_reduce\"(%arg1) <{channel_handle = \
+                          #stablehlo.channel_handle<handle = 1, type = 1>, replica_groups = \
+                          dense<[[0, 1]]> : tensor<1x2xi64>, use_global_device_ids}> ({
+                      ^bb0(%arg2: tensor<f32>, %arg3: tensor<f32>):
+                        %4 = stablehlo.maximum %arg2, %arg3 : tensor<f32>
+                        stablehlo.return %4 : tensor<f32>
+                      }) : (tensor<2xf32>) -> tensor<2xf32>
+                      sdy.return %3 : tensor<2xf32>
+                    } : (tensor<2xf32>) -> tensor<2xf32>
+                    return %2 : tensor<2xf32>
+                  }
+                }
+            "},
+        );
+        assert_eq!(execute_on_two_cpu_devices(maximum, &[2], [&[1.0, 7.0], &[5.0, 2.0]]), vec![vec![5.0, 7.0]; 2]);
+        let minimum = module(UnreducedKind::Min, ReductionKind::Min);
+        assert_eq!(execute_on_two_cpu_devices(minimum, &[2], [&[1.0, 7.0], &[5.0, 2.0]]), vec![vec![1.0, 2.0]; 2]);
+    }
+
+    #[test]
     fn test_to_mlir_module_for_program_with_parallel_cast_gradient_executes_on_cpu() {
         // Each device computes exp(input), casts it to a pending sum, and sums across x. The reverse pass must
         // propagate through all three cast adjoints and sum the two device contributions, so the gradient at zero is 2.
@@ -2024,6 +2095,56 @@ mod tests {
         .unwrap();
         assert_eq!(doubled.r#type().sharding(), Some(&sharded));
         assert_eq!(read_device_f32s(&doubled), vec![vec![2.0, 4.0], vec![6.0, 8.0]]);
+    }
+
+    #[test]
+    fn test_eager_shard_map_uses_the_current_mesh_on_cpu() {
+        // Within a mesh scope, a map without a mesh is defined over the mesh in scope and its body sees that mesh as
+        // the current mesh, compilation options default to the device mesh in scope, and a given mesh must have its
+        // topology (JAX's `jax.set_mesh` with `shard_map(mesh=None)`).
+        let plugin = load_cpu_plugin().unwrap();
+        let client = plugin
+            .client(ClientOptions::CPU(CpuClientOptions { device_count: Some(2), ..Default::default() }))
+            .unwrap();
+        let domain = Session::new(&client).domain();
+        let logical_mesh = test_manual_mesh("x", 2);
+        let devices = client.addressable_devices().unwrap();
+        let mesh = DeviceMesh::new(
+            logical_mesh.clone(),
+            devices.iter().map(|device| Device::from_pjrt(device).unwrap()).collect(),
+        )
+        .unwrap();
+        let sharded = Sharding::new(logical_mesh.clone(), vec![ShardingDimension::sharded(["x"])]).unwrap();
+        let r#type = ArrayType::new_static(DataType::F32, [4]).with_sharding(sharded.clone()).unwrap();
+        let input =
+            Array::from_host_buffer(&domain, r#type, mesh.clone(), values_to_bytes(&[1f32, 2., 3., 4.])).unwrap();
+        let double = |mesh: Option<LogicalMesh>| {
+            shard_map(
+                |x: ShardMapTracer<Domain<'_>>| {
+                    assert_eq!(current_mesh(), Some(test_manual_mesh("x", 2)));
+                    Ok(x.clone() + x)
+                },
+                input.clone(),
+                mesh,
+                sharded.clone(),
+                sharded.clone(),
+                ShardMapOptions::new(),
+            )
+        };
+
+        assert!(matches!(double(None), Err(ShardMapError::MissingMesh)));
+        assert!(Options::from_current_mesh().is_err());
+        with_mesh(mesh.clone(), || {
+            assert_eq!(Options::from_current_mesh().unwrap(), Options::new(mesh.clone()));
+            let doubled = double(None).unwrap();
+            assert_eq!(read_device_f32s(&doubled), vec![vec![2.0, 4.0], vec![6.0, 8.0]]);
+            let other_mesh = test_manual_mesh("y", 2);
+            assert!(matches!(
+                double(Some(other_mesh.clone())),
+                Err(ShardMapError::CurrentMeshMismatch { current, actual })
+                    if current == logical_mesh && actual == other_mesh,
+            ));
+        });
     }
 
     #[test]

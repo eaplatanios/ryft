@@ -1,4 +1,12 @@
-//! XLA program preparation, lowering, compilation, and cache integration.
+//! Lowering, compilation, and cache integration for XLA domains.
+//!
+//! A [`Domain`] implements the backend stages of [`CompilationDomain`]. Lowering produces a [`LoweredProgram`] with
+//! StableHLO, effective compilation options, and the logical-to-physical invocation contract. Compilation loads that
+//! program through PJRT and retains the contract in a [`CompiledProgram`].
+//!
+//! [`DispatchKey`] identifies a retained dispatch specialization, while [`CompilationKey`] identifies the complete
+//! lowered computation and its target configuration. The [`CompilationCacheDomain`] implementation validates reused
+//! artifacts before execution and delegates their versioned transport to [`persistence`](crate::domains::persistence).
 
 use std::collections::HashSet;
 use std::sync::{Arc, OnceLock};
@@ -18,9 +26,7 @@ use crate::domains::Domain;
 use crate::domains::execution::{ExecutionError, ExecutionPlan};
 use crate::domains::options::{FeedbackDirectedProfile, InputBoundBucketing, Options};
 use crate::domains::persistence::COMPILER_IDENTITY;
-use crate::domains::programs::{
-    CompiledProgram, LoweredProgram, incompatible_invocation_field, validate_replacement_metadata,
-};
+use crate::domains::programs::{CompiledProgram, InvocationMetadata, LoweredProgram};
 use crate::experimental::lowering::{contains_unresolved_references, contains_unresolved_state};
 use crate::experimental::ops::{Constant, FlatProgram, Operation};
 use crate::{Error, Value};
@@ -64,6 +70,7 @@ pub enum CompilationError {
 /// effective staged types.
 #[derive(Clone, Debug, PartialEq, Eq, Hash)]
 pub struct DispatchKey(DispatchKeyKind);
+
 /// Internal representation of [`DispatchKey`].
 #[derive(Clone, Debug, PartialEq, Eq, Hash)]
 enum DispatchKeyKind {
@@ -112,7 +119,8 @@ enum BucketedDimensionKey {
 }
 
 impl BucketedDispatchSignature {
-    /// Builds a dispatch key from the already bucketed `input_types`, numbering dimension variables by first occurrence.
+    /// Builds a dispatch key from the already bucketed `input_types`, numbering dimension variables by first
+    /// occurrence.
     fn new(input_types: &[ArrayType]) -> Self {
         let mut variables = Vec::<DimensionVariable>::new();
         let input_types = input_types
@@ -150,6 +158,7 @@ impl BucketedDispatchSignature {
 /// artifacts are interchangeable, even when unrelated call sites happen to share the same input signature.
 #[derive(Clone, Debug, PartialEq, Eq, Hash)]
 pub struct CompilationKey {
+    /// Complete canonical compilation contract, compared and hashed without reducing it to a fingerprint.
     pub(super) canonical_bytes: Arc<[u8]>,
 }
 
@@ -265,6 +274,8 @@ impl<'c> CompilationDomain for Domain<'c> {
 }
 
 impl<'c> Domain<'c> {
+    /// Lowers a staged program to StableHLO and derives its complete logical and physical invocation contract for this
+    /// domain.
     pub(super) fn lower_program(
         &self,
         program: &FlatProgram,
@@ -614,6 +625,8 @@ impl<'c> Domain<'c> {
         })
     }
 
+    /// Compiles a lowering through this domain's client after resolving its runtime requirements, then derives the
+    /// reusable execution plan.
     pub(crate) fn compile_program(&self, program: &LoweredProgram) -> Result<CompiledProgram<'c>, Error> {
         self.ensure_runtime_requirements(&program.runtime_requirements)?;
         let pjrt_program = PjrtProgram::Mlir { bytecode: program.stable_hlo.as_bytes().to_vec() };
@@ -655,6 +668,7 @@ impl<'c> Domain<'c> {
         })
     }
 
+    /// Validates ownership and the complete invocation contract before replacing a compiled executable.
     pub(crate) fn validate_replacement(
         &self,
         current: &CompiledProgram<'c>,
@@ -662,7 +676,7 @@ impl<'c> Domain<'c> {
     ) -> Result<(), Error> {
         self.validate_program_owner(current)?;
         self.validate_program_owner(replacement)?;
-        validate_replacement_metadata(current.into(), replacement.into())
+        InvocationMetadata::from(current).validate_replacement(replacement.into())
     }
 }
 
@@ -671,7 +685,7 @@ impl<'c> CompilationCacheDomain for Domain<'c> {
 
     #[inline]
     fn compilation_key(&self, program: &Self::LoweredProgram) -> Result<Self::CacheKey, Self::Error> {
-        Self::canonical_compilation_key(program)
+        program.compilation_key()
     }
 
     #[inline]
@@ -688,7 +702,7 @@ impl<'c> CompilationCacheDomain for Domain<'c> {
         // contract does not match the requesting lowering (e.g., a corrupted or colliding persistent or exchanged
         // artifact). The stateful transaction trusts this metadata, so a mismatch must be caught before the first
         // call.
-        match incompatible_invocation_field(program.into(), compiled.into()) {
+        match InvocationMetadata::from(program).incompatible_field(compiled.into()) {
             Some(field) => Err(Error::Compilation(CompilationError::IncompatibleExecutable {
                 reason: format!("cached executable has incompatible {field}"),
             })),
@@ -698,12 +712,12 @@ impl<'c> CompilationCacheDomain for Domain<'c> {
 
     #[inline]
     fn persistent_cache_key(&self, key: &Self::CacheKey) -> Option<Vec<u8>> {
-        self.persistent_key_bytes(key)
+        Some(key.canonical_bytes.to_vec())
     }
 
     #[inline]
     fn serialize_program(&self, program: &Self::CompiledProgram) -> Result<Option<Vec<u8>>, Self::Error> {
-        self.serialize_compiled_program(program)
+        program.serialize()
     }
 
     #[inline]
@@ -805,6 +819,8 @@ fn validate_reference_outputs(
     };
     Err(Error::Compilation(CompilationError::UnsupportedReferenceAbi { reason }))
 }
+
+/// Validates backend output arity and refinement of the declared logical array types.
 pub(super) fn validate_output_types(declared: &[ArrayIrType], actual: &[ArrayType]) -> Result<(), Error> {
     if declared.len() != actual.len() {
         return Err(ProgramError::InvalidOutputCount { expected: declared.len(), actual: actual.len() }.into());
@@ -1254,16 +1270,16 @@ pub(super) fn jit_compilation_options(
 ) -> CompilationOptions {
     use ryft_pjrt::protos::ExecutableCompilationOptions;
     let mut options = base.clone();
-    let exec_options = options.executable_build_options.get_or_insert_with(ExecutableCompilationOptions::default);
-    if exec_options.device_ordinal == 0 {
-        exec_options.device_ordinal = -1;
+    let executable_options = options.executable_build_options.get_or_insert_with(ExecutableCompilationOptions::default);
+    if executable_options.device_ordinal == 0 {
+        executable_options.device_ordinal = -1;
     }
-    exec_options.replica_count = if use_shardy_partitioner { 1 } else { device_count as i64 };
-    exec_options.partition_count = if use_shardy_partitioner { device_count as i64 } else { 1 };
-    exec_options.use_spmd_partitioning = use_shardy_partitioner;
-    exec_options.use_shardy_partitioner = use_shardy_partitioner;
+    executable_options.replica_count = if use_shardy_partitioner { 1 } else { device_count as i64 };
+    executable_options.partition_count = if use_shardy_partitioner { device_count as i64 } else { 1 };
+    executable_options.use_spmd_partitioning = use_shardy_partitioner;
+    executable_options.use_shardy_partitioner = use_shardy_partitioner;
     if let Some(profile) = feedback_directed_profile {
-        exec_options.fdo_profile = profile.bytes().to_vec();
+        executable_options.fdo_profile = profile.bytes().to_vec();
         options.profile_version = profile.version();
     }
     options
@@ -1275,6 +1291,7 @@ pub(super) fn jit_compilation_options(
 pub(super) fn canonical_compilation_options_bytes(options: &CompilationOptions) -> Vec<u8> {
     use ryft_pjrt::protos::{AutoTuneReferenceKey, AutoTuneResultKey};
 
+    /// Appends one sorted protobuf-map record with an explicit path and length delimiters.
     fn append_record(output: &mut Vec<u8>, path: &[u8], mut entries: Vec<(Vec<u8>, Vec<u8>)>) {
         entries.sort_unstable();
         output.extend_from_slice(&(path.len() as u64).to_le_bytes());
@@ -1288,6 +1305,7 @@ pub(super) fn canonical_compilation_options_bytes(options: &CompilationOptions) 
         }
     }
 
+    /// Removes tuning knobs from a protobuf algorithm key and appends their sorted canonical record.
     fn drain_algorithm_map(output: &mut Vec<u8>, path: &[u8], algorithm: &mut ryft_pjrt::protos::AutoTuneAlgorithmKey) {
         append_record(
             output,
@@ -1442,6 +1460,7 @@ mod tests {
 
     use super::*;
 
+    /// Reads the first addressable shard as `bfloat16` values converted to `f32`.
     fn read_bf16s(client: &Client<'_>, array: &Array<'_>) -> Vec<f32> {
         let device_id = client.addressable_devices().unwrap()[0].id().unwrap();
         let bytes = array
@@ -1459,6 +1478,7 @@ mod tests {
             .collect()
     }
 
+    /// Reads the first addressable shard as native-endian signed 32-bit integers.
     fn read_i32s(client: &Client<'_>, array: &Array<'_>) -> Vec<i32> {
         let device_id = client.addressable_devices().unwrap()[0].id().unwrap();
         let bytes = array
@@ -1707,7 +1727,7 @@ mod tests {
                 let logical_length = bind(size, DimensionToScalarOperation, &[dimension.clone()]);
                 let logical_length =
                     bind(size, ConvertElementTypeOperation::<ArrayType>::new(DataType::I32, false), &[logical_length]);
-                let one = CoreArray::from_elements(ArrayType::scalar(DataType::I32), &[1_i32]).unwrap();
+                let one = CoreArray::from_elements(ArrayType::scalar(DataType::I32), &[1i32]).unwrap();
                 let one = bind(size, ConstantOperation::new(one), &[]);
                 let length = bind(size, SubOperation::new(), &[logical_length, one]);
                 let lengths =
@@ -3671,11 +3691,11 @@ mod tests {
 
     #[test]
     fn test_lowering_executes_shard_maps_batched_along_every_manual_axis() {
-        // The caller maps the leading dimension of its input, which it places along `x` over the mesh of the map itself,
-        // over a map whose only active manual axis is `x`. The placement adds no manual variation to the batch items,
-        // and batching releases `x`, which leaves a manual computation without manual axes that runs the batched body
-        // once on the global values, while the boundary keeps the batch dimension placed along `x`, so each of the two
-        // devices holds one batch item.
+        // The caller maps the leading dimension of its input, which it places along `x` over the mesh of the map
+        // itself, over a map whose only active manual axis is `x`. The placement adds no manual variation to the batch
+        // items, and batching releases `x`, which leaves a manual computation without manual axes that runs the batched
+        // body once on the global values, while the boundary keeps the batch dimension placed along `x`, so each of the
+        // two devices holds one batch item.
         let plugin = load_cpu_plugin().unwrap();
         let client = plugin
             .client(ClientOptions::CPU(CpuClientOptions { device_count: Some(2), ..Default::default() }))
@@ -4551,9 +4571,8 @@ mod tests {
 
         // Provenance does not affect numeric results.
         let compiled = domain.compile_program(&lowered).unwrap();
-        let value =
-            Array::from_host_buffer(&domain, input_type.clone(), mesh.clone(), 3.0_f64.to_ne_bytes().as_slice())
-                .unwrap();
+        let value = Array::from_host_buffer(&domain, input_type.clone(), mesh.clone(), 3.0f64.to_ne_bytes().as_slice())
+            .unwrap();
         let outputs = domain.execute_program(&compiled, vec![value]).unwrap();
         assert_eq!(read_f64s(&client, &outputs[0]), vec![-9.0]);
 
@@ -4563,10 +4582,7 @@ mod tests {
         let relabeled =
             build_program(&input_type, Provenance::scope(ProvenanceScope::new("other_label"), Provenance::unknown()));
         let relabeled = domain.lower_program(&relabeled, 0, &options).unwrap();
-        assert_ne!(
-            Domain::canonical_compilation_key(&lowered).unwrap(),
-            Domain::canonical_compilation_key(&relabeled).unwrap(),
-        );
+        assert_ne!(lowered.compilation_key().unwrap(), relabeled.compilation_key().unwrap(),);
         let unlabeled = build_program(&input_type, Provenance::unknown());
         let unlabeled = domain.lower_program(&unlabeled, 0, &options).unwrap();
         assert_eq!(
@@ -4909,18 +4925,17 @@ mod tests {
         let lowered = domain.lower_program(&combined, 0, &Options::new(mesh.clone())).unwrap();
         let compiled = domain.compile_program(&lowered).unwrap();
         let input =
-            Array::from_host_buffer(&domain, input_type, mesh.clone(), values_to_bytes(&[0_f32, 1., 2., 3., 4., 5.]))
+            Array::from_host_buffer(&domain, input_type, mesh.clone(), values_to_bytes(&[0f32, 1., 2., 3., 4., 5.]))
                 .unwrap();
-        let size =
-            Array::from_host_buffer(&domain, size_type.clone(), mesh.clone(), values_to_bytes(&[2_i64])).unwrap();
+        let size = Array::from_host_buffer(&domain, size_type.clone(), mesh.clone(), values_to_bytes(&[2i64])).unwrap();
         let outputs = domain.execute_program(&compiled, vec![input.clone(), size]).unwrap();
         assert_eq!(outputs[0].shape().as_slice(), &[2]);
         assert_eq!(read_f32s(&client, &outputs[0]), vec![3., 5.]);
         assert_eq!(read_f32s(&client, &outputs[1]), vec![0., 0., 0., 3., 0., 5.]);
-        let size = Array::from_host_buffer(&domain, size_type, mesh, values_to_bytes(&[0_i64])).unwrap();
+        let size = Array::from_host_buffer(&domain, size_type, mesh, values_to_bytes(&[0i64])).unwrap();
         let outputs = domain.execute_program(&compiled, vec![input, size]).unwrap();
         assert_eq!(outputs[0].shape().as_slice(), &[0]);
-        assert_eq!(read_f32s(&client, &outputs[1]), vec![0_f32; 6]);
+        assert_eq!(read_f32s(&client, &outputs[1]), vec![0f32; 6]);
     }
 
     #[test]
@@ -4994,7 +5009,7 @@ mod tests {
         let lowered = domain.lower_program(&combined, 0, &Options::new(mesh.clone())).unwrap();
         let compiled = domain.compile_program(&lowered).unwrap();
         let values = [
-            0_f32,
+            0f32,
             1.,
             2.,
             3.,
@@ -5017,9 +5032,9 @@ mod tests {
         ];
         let input = Array::from_host_buffer(&domain, input_type, mesh.clone(), values_to_bytes(&values)).unwrap();
         let rows =
-            Array::from_host_buffer(&domain, scalar_type.clone(), mesh.clone(), values_to_bytes(&[3_i64])).unwrap();
+            Array::from_host_buffer(&domain, scalar_type.clone(), mesh.clone(), values_to_bytes(&[3i64])).unwrap();
         let columns =
-            Array::from_host_buffer(&domain, scalar_type.clone(), mesh.clone(), values_to_bytes(&[4_i64])).unwrap();
+            Array::from_host_buffer(&domain, scalar_type.clone(), mesh.clone(), values_to_bytes(&[4i64])).unwrap();
         let outputs = domain.execute_program(&compiled, vec![input.clone(), rows, columns.clone()]).unwrap();
         assert_eq!(outputs[0].shape().as_slice(), &[2, 2]);
         assert_eq!(read_f32s(&client, &outputs[0]), vec![0., 2., 10., 12.]);
@@ -5027,10 +5042,10 @@ mod tests {
             read_f32s(&client, &outputs[1]),
             vec![0., 0., 2., 0., 0., 0., 0., 0., 0., 0., 10., 0., 12., 0., 0., 0., 0., 0., 0., 0.]
         );
-        let rows = Array::from_host_buffer(&domain, scalar_type, mesh, values_to_bytes(&[0_i64])).unwrap();
+        let rows = Array::from_host_buffer(&domain, scalar_type, mesh, values_to_bytes(&[0i64])).unwrap();
         let outputs = domain.execute_program(&compiled, vec![input, rows, columns]).unwrap();
         assert_eq!(outputs[0].shape().as_slice(), &[0, 2]);
-        assert_eq!(read_f32s(&client, &outputs[1]), vec![0_f32; 20]);
+        assert_eq!(read_f32s(&client, &outputs[1]), vec![0f32; 20]);
     }
 
     #[test]
@@ -5164,7 +5179,7 @@ mod tests {
                 Array::from_host_buffer(&domain, scalar_i64.clone(), mesh.clone(), size.to_ne_bytes().as_slice())
                     .unwrap();
             let value =
-                Array::from_host_buffer(&domain, scalar_f32.clone(), mesh.clone(), 2.0_f32.to_ne_bytes().as_slice())
+                Array::from_host_buffer(&domain, scalar_f32.clone(), mesh.clone(), 2.0f32.to_ne_bytes().as_slice())
                     .unwrap();
             function.execute((), vec![Value::Array(size), Value::Array(value)])
         };
@@ -5221,7 +5236,7 @@ mod tests {
                 Array::from_host_buffer(&domain, scalar_i64.clone(), mesh.clone(), size.to_ne_bytes().as_slice())
                     .unwrap();
             let value =
-                Array::from_host_buffer(&domain, scalar_f32.clone(), mesh.clone(), 2.0_f32.to_ne_bytes().as_slice())
+                Array::from_host_buffer(&domain, scalar_f32.clone(), mesh.clone(), 2.0f32.to_ne_bytes().as_slice())
                     .unwrap();
             function.execute((), vec![Value::Array(size), Value::Array(value)]).unwrap()
         };
@@ -5467,7 +5482,7 @@ mod tests {
         );
 
         let zero =
-            Array::from_host_buffer(&domain, size_type.clone(), mesh.clone(), 0_i64.to_ne_bytes().as_slice()).unwrap();
+            Array::from_host_buffer(&domain, size_type.clone(), mesh.clone(), 0i64.to_ne_bytes().as_slice()).unwrap();
         let error = domain.execute_program(&compiled, vec![zero]).unwrap_err();
         assert!(
             error.to_string().contains(
@@ -5476,9 +5491,9 @@ mod tests {
             "{error}",
         );
 
-        // Eager execution replays the attention calls of the bounded-dynamic program at the exact types of their inputs,
-        // so a program that explicitly requests the fused kernels reports that it cannot use them instead of silently
-        // computing the portable result.
+        // Eager execution replays the attention calls of the bounded-dynamic program at the exact types of their
+        // inputs, so a program that explicitly requests the fused kernels reports that it cannot use them instead of
+        // silently computing the portable result.
         let extent = DimensionVariable::new("extent", DimensionBounds::new(1, Some(5)).unwrap());
         let fused = data_derived_scaled_dot_attention_fixture(
             size_type.clone(),
@@ -5487,7 +5502,7 @@ mod tests {
             DataType::F32,
             AttentionImplementation::Fused,
         );
-        let input = Array::from_host_buffer(&domain, size_type, mesh, 2_i64.to_ne_bytes().as_slice()).unwrap();
+        let input = Array::from_host_buffer(&domain, size_type, mesh, 2i64.to_ne_bytes().as_slice()).unwrap();
         let error = fused.interpret_in_context(&domain, vec![Value::Array(input)]).unwrap_err();
         assert!(
             error
@@ -5641,7 +5656,7 @@ mod tests {
             });
 
             let zero =
-                Array::from_host_buffer(&domain, size_type, mesh.clone(), 0_i64.to_ne_bytes().as_slice()).unwrap();
+                Array::from_host_buffer(&domain, size_type, mesh.clone(), 0i64.to_ne_bytes().as_slice()).unwrap();
             let error = domain.execute_program(&compiled, vec![zero]).unwrap_err();
             assert!(
                 error.to_string().contains(
@@ -5655,7 +5670,7 @@ mod tests {
     #[cfg(feature = "cuda-13")]
     #[test]
     #[ignore = "hardware throughput benchmark; run explicitly on a CUDA system"]
-    fn bench_cuda_fused_attention_throughput() {
+    fn test_cuda_fused_attention_throughput() {
         let plugin = load_cuda_13_plugin().unwrap();
         let client = plugin
             .client(ClientOptions::GPU(GpuClientOptions {
@@ -5697,8 +5712,8 @@ mod tests {
         let compiled = domain.compile_program(&lowered).unwrap();
         let compilation_duration = compilation_start.elapsed();
 
-        let one = 0x3f80_u16.to_ne_bytes();
-        let mut bytes = vec![0_u8; batch * sequence * heads * head_dimension * size_of::<u16>()];
+        let one = 0x3f80u16.to_ne_bytes();
+        let mut bytes = vec![0u8; batch * sequence * heads * head_dimension * size_of::<u16>()];
         bytes.chunks_exact_mut(size_of::<u16>()).for_each(|element| element.copy_from_slice(&one));
         let input = Array::from_host_buffer(&domain, r#type, mesh, bytes.as_slice()).unwrap();
         input.block_until_ready().unwrap();

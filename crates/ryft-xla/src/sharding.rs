@@ -97,12 +97,17 @@ impl ToMlir for Sharding {
             dimensions.as_slice(),
             replicated_axes.as_slice(),
             unreduced_axes.as_slice(),
-            match self.unreduced_kind() {
-                UnreducedKind::Sum => shardy::ReductionOperation::Sum,
-                UnreducedKind::Max => shardy::ReductionOperation::Max,
-                UnreducedKind::Min => shardy::ReductionOperation::Min,
-            },
+            shardy_reduction_operation(self.unreduced_kind()),
         )
+    }
+}
+
+/// Returns the Shardy reduction operation of the unreduced axes of a sharding whose [`UnreducedKind`] is `kind`.
+pub(crate) fn shardy_reduction_operation(kind: UnreducedKind) -> shardy::ReductionOperation {
+    match kind {
+        UnreducedKind::Sum => shardy::ReductionOperation::Sum,
+        UnreducedKind::Max => shardy::ReductionOperation::Max,
+        UnreducedKind::Min => shardy::ReductionOperation::Min,
     }
 }
 
@@ -170,7 +175,7 @@ mod tests {
         let attribute = sharding.clone().with_unreduced_kind(UnreducedKind::Max).unwrap();
         let attribute = attribute.to_mlir(context.unknown_location()).unwrap();
         assert_eq!(attribute.reduction_operation().unwrap(), shardy::ReductionOperation::Max);
-        assert_eq!(attribute.to_string(), "");
+        assert_eq!(attribute.to_string(), "#sdy.sharding<@mesh, [{\"x\"}, {}], unreduced=max{\"y\"}>");
         let attribute = sharding.with_unreduced_kind(UnreducedKind::Min).unwrap();
         let attribute = attribute.to_mlir(context.unknown_location()).unwrap();
         assert_eq!(attribute.reduction_operation().unwrap(), shardy::ReductionOperation::Min);

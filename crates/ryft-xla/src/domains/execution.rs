@@ -1,4 +1,12 @@
-//! XLA invocation preparation, submission, stateful transactions, and materialization.
+//! Invocation of loaded XLA programs on their owning PJRT client.
+//!
+//! A [`CompiledProgram`] retains an execution plan for its physical arguments, results, device assignment, and effects.
+//! The invoking [`Domain`] validates logical inputs, resolves placement, materializes bounded dynamic arguments, and
+//! reconstructs logical outputs from the executable's physical boundary.
+//!
+//! Ordinary calls carry completion through their outputs. Stateful calls additionally coordinate external references
+//! through [`StatefulExecution`], publishing mutations only after submission and tracking the completion of the whole
+//! invocation. [`ExecutionError`] describes failures in these backend execution and effect protocols.
 
 use std::cell::RefCell;
 use std::collections::BTreeMap;
@@ -123,11 +131,6 @@ impl ReferenceCompletionBackend for ReferenceCompletion {
     fn is_ready(&self) -> Result<bool, Arc<str>> {
         self.fence.is_ready().map_err(|error| Arc::from(error.to_string()))
     }
-}
-
-/// Maps one backend-neutral completion failure into the XLA domain's public error type.
-fn reference_completion_error(reason: Arc<str>) -> Error {
-    Error::Execution(ExecutionError::AsynchronousFailure { reason })
 }
 
 /// Fully materialized physical arguments and logical refinements prepared before PJRT submission.
@@ -605,7 +608,7 @@ impl<'c> Domain<'c> {
                 Ok((output, fence)) => StatefulExecution::pending(
                     Ok(output),
                     CoreReferenceCompletion::new(ReferenceCompletion { fence }),
-                    reference_completion_error,
+                    |reason| Error::Execution(ExecutionError::AsynchronousFailure { reason }),
                 ),
                 Err(error) => StatefulExecution::ready(Err(error)),
             };
@@ -850,7 +853,9 @@ impl<'c> Domain<'c> {
                         transaction.poison(reason.clone());
                     }
                     drop(read_only_guards);
-                    return Ok(StatefulExecution::pending(Err(error), completion, reference_completion_error));
+                    return Ok(StatefulExecution::pending(Err(error), completion, |reason| {
+                        Error::Execution(ExecutionError::AsynchronousFailure { reason })
+                    }));
                 }
             };
             let (physical_outputs, fence) = execution.into_parts();
@@ -902,7 +907,9 @@ impl<'c> Domain<'c> {
                         transaction.poison(reason.clone());
                     }
                     drop(read_only_guards);
-                    return Ok(StatefulExecution::pending(Err(error), completion, reference_completion_error));
+                    return Ok(StatefulExecution::pending(Err(error), completion, |reason| {
+                        Error::Execution(ExecutionError::AsynchronousFailure { reason })
+                    }));
                 }
             };
             let mut submitted_replacements = replacement_transactions.into_iter().zip(replacements);
@@ -919,11 +926,9 @@ impl<'c> Domain<'c> {
                             transaction.poison(reason.clone());
                         }
                         drop(read_only_guards);
-                        return Ok(StatefulExecution::pending(
-                            Err(error.into()),
-                            completion,
-                            reference_completion_error,
-                        ));
+                        return Ok(StatefulExecution::pending(Err(error.into()), completion, |reason| {
+                            Error::Execution(ExecutionError::AsynchronousFailure { reason })
+                        }));
                     }
                 }
             }
@@ -960,7 +965,9 @@ impl<'c> Domain<'c> {
                 validate_runtime_outputs(program.output_types(), &public_outputs)?;
                 Ok(public_outputs.into_iter().map(Value::Array).collect())
             })();
-            Ok(StatefulExecution::pending(public_result, completion, reference_completion_error))
+            Ok(StatefulExecution::pending(public_result, completion, |reason| {
+                Error::Execution(ExecutionError::AsynchronousFailure { reason })
+            }))
         })();
         match prepared {
             Ok(execution) => execution,
@@ -980,6 +987,8 @@ impl<'c> StatefulCompilationDomain for Domain<'c> {
 }
 
 impl<'c> Domain<'c> {
+    /// Executes a program with array inputs. Output arrays retain completion, while an execution without outputs or
+    /// effects waits here so failures remain observable.
     pub(super) fn execute_program(
         &self,
         program: &CompiledProgram<'c>,
@@ -997,6 +1006,7 @@ impl<'c> Domain<'c> {
     }
 }
 
+/// Returns device IDs in replica-major, then computation-partition-major order.
 pub(super) fn flatten_device_assignment(assignment: &ryft_pjrt::DeviceAssignment) -> Result<Vec<u64>, Error> {
     let mut devices = Vec::with_capacity(assignment.replica_count() * assignment.computation_count());
     for replica in 0..assignment.replica_count() {
@@ -1007,6 +1017,8 @@ pub(super) fn flatten_device_assignment(assignment: &ryft_pjrt::DeviceAssignment
     Ok(devices)
 }
 
+/// Validates runtime refinement of a declared logical input type, excluding sharding because placement is resolved
+/// separately at the call boundary.
 pub(crate) fn validate_input_type(declared: &ArrayType, actual: &ArrayType) -> Result<(), Error> {
     // Calls of a specialization ordinarily pass inputs of exactly its declared types, which refine them trivially.
     if declared == actual {
@@ -1024,6 +1036,7 @@ pub(crate) fn validate_input_type(declared: &ArrayType, actual: &ArrayType) -> R
     }
 }
 
+/// Validates output arity and refinement of the declared logical output types, including sharding.
 pub(crate) fn validate_runtime_outputs(declared: &[ArrayType], outputs: &[Array<'_>]) -> Result<(), Error> {
     if declared.len() != outputs.len() {
         return Err(ProgramError::InvalidOutputCount { expected: declared.len(), actual: outputs.len() }.into());
@@ -1175,9 +1188,11 @@ enum BoundedInputPacking {
     Pad,
 }
 
-/// Determines the bounded-input packing tier from concrete runtime and executable shapes.
-fn bounded_input_packing(actual_shape: &StaticShape, physical_shape: &StaticShape) -> BoundedInputPacking {
-    if actual_shape == physical_shape { BoundedInputPacking::Reuse } else { BoundedInputPacking::Pad }
+impl BoundedInputPacking {
+    /// Determines the bounded-input packing tier from concrete runtime and executable shapes.
+    fn from_shapes(actual_shape: &StaticShape, physical_shape: &StaticShape) -> Self {
+        if actual_shape == physical_shape { Self::Reuse } else { Self::Pad }
+    }
 }
 
 /// Completes one already-issued host copy and issues its bound-shaped upload without publishing it.
@@ -1289,7 +1304,7 @@ fn materialize_bounded_dynamic_inputs_with_readiness<'c>(
             })?;
         report.actual_bytes += actual_types[logical_input_index].size_in_bytes()?;
         report.bound_bytes += physical_type.size_in_bytes()?;
-        if bounded_input_packing(&actual_shape, &physical_shape) == BoundedInputPacking::Reuse {
+        if BoundedInputPacking::from_shapes(&actual_shape, &physical_shape) == BoundedInputPacking::Reuse {
             report.at_bound_reuses += 1;
             continue;
         }
@@ -1810,6 +1825,7 @@ impl<'c> Domain<'c> {
                 "expected {output_count} output(s) per device, but got {actual}",
             ))));
         }
+
         #[cfg(test)]
         if take_stateful_failure_injection(StatefulFailureInjection::AfterHandoff) {
             return Err(Error::Pjrt(ryft_pjrt::Error::internal(
@@ -1908,6 +1924,7 @@ mod tests {
         assert_eq!(output.data_type(), DataType::Zero);
         assert!(output.addressable_shards().next().unwrap().buffer().is_none());
     }
+
     #[test]
     fn test_compiled_mixed_zero_space_signature_projects_and_reconstructs_logical_values() {
         let plugin = load_cpu_plugin().unwrap();
@@ -1971,6 +1988,7 @@ mod tests {
             .unwrap();
         assert_eq!(values_from_bytes::<f32>(value_bytes.as_slice()), vec![1.0, 2.0, 3.0]);
     }
+
     #[test]
     fn test_bounded_dynamic_input_padding_is_dense_row_major() {
         let source = values_to_bytes::<f32>(&[1.0, 2.0, 3.0, 4.0]);
@@ -1982,6 +2000,7 @@ mod tests {
             vec![1.0, 2.0, 0.0, 0.0, 3.0, 4.0, 0.0, 0.0, 0.0, 0.0, 0.0, 0.0],
         );
     }
+
     #[test]
     fn test_bounded_dynamic_input_packing_cost_guard() {
         let plugin = load_cpu_plugin().unwrap();
@@ -2009,7 +2028,7 @@ mod tests {
         )
         .unwrap();
         assert_eq!(
-            bounded_input_packing(&exact_type.static_shape().unwrap(), &StaticShape::new(vec![8])),
+            BoundedInputPacking::from_shapes(&exact_type.static_shape().unwrap(), &StaticShape::new(vec![8])),
             BoundedInputPacking::Reuse,
         );
         let exact_storage = exact.clone();
@@ -2039,7 +2058,7 @@ mod tests {
         // path-local counts avoid process-global allocator noise from PJRT and Rust's parallel test runner.
         let smaller_type = replicated_vector_type(&mesh, 4);
         assert_eq!(
-            bounded_input_packing(&smaller_type.static_shape().unwrap(), &StaticShape::new(vec![8])),
+            BoundedInputPacking::from_shapes(&smaller_type.static_shape().unwrap(), &StaticShape::new(vec![8])),
             BoundedInputPacking::Pad,
         );
         let smaller = Array::from_host_buffer(
@@ -2090,6 +2109,7 @@ mod tests {
             },
         );
     }
+
     #[test]
     fn test_independent_bounded_materialization_misses_share_one_issue_phase() {
         let plugin = load_cpu_plugin().unwrap();
@@ -2164,6 +2184,7 @@ mod tests {
             },
         );
     }
+
     #[test]
     fn test_sharded_bounded_materialization_reuses_every_device_buffer() {
         let plugin = load_cpu_plugin().unwrap();
@@ -2213,6 +2234,7 @@ mod tests {
         assert_eq!(warm.report.device_to_host_shard_copies, 0);
         assert_eq!(warm.report.host_to_device_shard_uploads, 0);
     }
+
     #[test]
     fn test_bounded_materialization_rejects_unreduced_inputs() {
         // Padding copies a bounded input through the host as one dense array, which would replace the separate
@@ -2260,6 +2282,7 @@ mod tests {
              would not preserve",
         );
     }
+
     #[test]
     fn test_execution_plan_rejects_compilation_options_with_conflicting_layouts() {
         use ryft_core::CastOperation;
@@ -2331,6 +2354,7 @@ mod tests {
         let outputs = domain.execute_program(&compiled, vec![input]).unwrap();
         assert_eq!(values_from_bytes::<f64>(&materialize_dense_array_bytes(&outputs[0]).unwrap()), values);
     }
+
     #[test]
     fn test_concurrent_bounded_materialization_is_single_flight() {
         let plugin = load_cpu_plugin().unwrap();
@@ -2390,6 +2414,7 @@ mod tests {
         assert_eq!(left.report.device_to_host_shard_copies + right.report.device_to_host_shard_copies, 1);
         assert_eq!(left.report.host_to_device_shard_uploads + right.report.host_to_device_shard_uploads, 1);
     }
+
     #[test]
     fn test_materialize_zero_space_carriers_allocate_the_bounded_physical_shape() {
         let plugin = load_cpu_plugin().unwrap();
@@ -2426,6 +2451,7 @@ mod tests {
             .unwrap();
         assert_eq!(carrier_bytes.as_slice(), &[0, 0, 0]);
     }
+
     #[test]
     fn test_below_bound_zero_space_inputs_skip_the_padding_tiers_and_carry_the_bounded_shape() {
         let plugin = load_cpu_plugin().unwrap();
@@ -2469,6 +2495,7 @@ mod tests {
         assert_eq!(carriers[0].shape().as_slice(), &[3]);
         assert_eq!(carriers[1].data_type(), DataType::I32);
     }
+
     #[test]
     fn test_reference_transaction_donation_respects_effective_buffer_ownership() {
         let plugin = load_cpu_plugin().unwrap();
@@ -2502,6 +2529,7 @@ mod tests {
         shared_taken.poison("test transaction consumed shared input");
         assert_eq!(read_f32s(&client, &retained), vec![2.0]);
     }
+
     #[test]
     fn test_stateful_compilation_domain_execute_uses_compiled_input_types() {
         let plugin = load_cpu_plugin().unwrap();
@@ -2524,7 +2552,7 @@ mod tests {
             .unwrap();
         let lowered = domain.lower_program(&program, 1, &Options::new(mesh.clone())).unwrap();
         let compiled = domain.compile_program(&lowered).unwrap();
-        let bytes = domain.serialize_compiled_program(&compiled).unwrap().unwrap();
+        let bytes = compiled.serialize().unwrap().unwrap();
         let restored = domain.deserialize_compiled_program(&bytes).unwrap().unwrap();
 
         for program in [&compiled, &restored] {
@@ -2872,7 +2900,7 @@ mod tests {
 
         let compiled = domain.compile_program(&lowered).unwrap();
         let size =
-            Array::from_host_buffer(&domain, size_type.clone(), mesh.clone(), 3_i64.to_ne_bytes().as_slice()).unwrap();
+            Array::from_host_buffer(&domain, size_type.clone(), mesh.clone(), 3i64.to_ne_bytes().as_slice()).unwrap();
         let value = Array::from_host_buffer(
             &domain,
             value_type.clone(),
@@ -3279,7 +3307,7 @@ mod tests {
             vec![
                 scalar(size_type.clone(), input_size.to_ne_bytes().as_slice()),
                 scalar(size_type.clone(), result_size.to_ne_bytes().as_slice()),
-                scalar(value_type.clone(), 7.0_f32.to_ne_bytes().as_slice()),
+                scalar(value_type.clone(), 7.0f32.to_ne_bytes().as_slice()),
             ]
         };
 
@@ -3330,11 +3358,11 @@ mod tests {
         assert!(compiled.requires_assertion_handler);
 
         let valid =
-            Array::from_host_buffer(&domain, input_type.clone(), mesh.clone(), 4_i64.to_ne_bytes().as_slice()).unwrap();
+            Array::from_host_buffer(&domain, input_type.clone(), mesh.clone(), 4i64.to_ne_bytes().as_slice()).unwrap();
         let valid = domain.execute_program(&compiled, vec![valid]).unwrap();
         assert_eq!(read_i64s(&client, &valid[0]), vec![4]);
 
-        let invalid = Array::from_host_buffer(&domain, input_type, mesh, 9_i64.to_ne_bytes().as_slice()).unwrap();
+        let invalid = Array::from_host_buffer(&domain, input_type, mesh, 9i64.to_ne_bytes().as_slice()).unwrap();
         let error = domain.execute_program(&compiled, vec![invalid]).unwrap_err();
         assert!(
             error.to_string().contains(
@@ -3442,7 +3470,7 @@ mod tests {
         let bounds = DimensionBounds::new(0, Some(20)).unwrap();
         let left_type = DimensionType::new("left", bounds);
         let right_type = DimensionType::new("right", bounds);
-        for (left_value, right_value, divisible) in [(3_i64, 4_i64, false), (7, 3, true), (7, 0, true)] {
+        for (left_value, right_value, divisible) in [(3i64, 4i64, false), (7, 3, true), (7, 0, true)] {
             let mut builder = ProgramBuilder::new();
             let left_input = builder.add_input(input_type.clone().into());
             let right_input = builder.add_input(input_type.clone().into());
@@ -3749,7 +3777,7 @@ mod tests {
             vec![
                 ("unsigned", DataType::U64, u64::MAX.to_ne_bytes().to_vec(), u64::MAX.to_string()),
                 ("signed", DataType::I64, i64::MIN.to_ne_bytes().to_vec(), i64::MIN.to_string()),
-                ("float", DataType::F32, (-0.5_f32).to_ne_bytes().to_vec(), "-0.5".to_owned()),
+                ("float", DataType::F32, (-0.5f32).to_ne_bytes().to_vec(), "-0.5".to_owned()),
                 ("boolean", DataType::Boolean, vec![1], "true".to_owned()),
             ],
         ] {
@@ -3897,7 +3925,7 @@ mod tests {
                 .unwrap();
             let lowered = domain.lower_program(&program, 0, &Options::new(mesh.clone())).unwrap();
             let compiled = domain.compile_program(&lowered).unwrap();
-            for (size, limit) in [(0_i64, 0_i64), (1, 1), (3, 3)] {
+            for (size, limit) in [(0i64, 0i64), (1, 1), (3, 3)] {
                 let inputs = [size, limit]
                     .into_iter()
                     .map(|value| {
@@ -3907,7 +3935,7 @@ mod tests {
                     .collect::<Vec<_>>();
                 assert!(domain.execute_program(&compiled, inputs).unwrap().is_empty());
             }
-            let inputs = [3_i64, 1_i64]
+            let inputs = [3i64, 1i64]
                 .into_iter()
                 .map(|value| {
                     Array::from_host_buffer(&domain, input_type.clone(), mesh.clone(), &value.to_ne_bytes()).unwrap()
@@ -3985,10 +4013,10 @@ mod tests {
             let lowered = domain.lower_program(&program, 0, &Options::new(mesh.clone())).unwrap();
             let compiled = domain.compile_program(&lowered).unwrap();
             let empty =
-                Array::from_host_buffer(&domain, input_type.clone(), mesh.clone(), &0_i64.to_ne_bytes()).unwrap();
+                Array::from_host_buffer(&domain, input_type.clone(), mesh.clone(), &0i64.to_ne_bytes()).unwrap();
             assert!(domain.execute_program(&compiled, vec![empty]).unwrap().is_empty());
             let nonempty =
-                Array::from_host_buffer(&domain, input_type.clone(), mesh.clone(), &3_i64.to_ne_bytes()).unwrap();
+                Array::from_host_buffer(&domain, input_type.clone(), mesh.clone(), &3i64.to_ne_bytes()).unwrap();
             let error = domain.execute_program(&compiled, vec![nonempty]).unwrap_err();
             let expected = if bounded {
                 ryft_core::AssertionError::FailedElements {

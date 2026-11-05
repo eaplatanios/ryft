@@ -1,4 +1,12 @@
-//! Ordered effect reservation, completion, and recovery.
+//! Effect ordering, completion, and recovery for XLA execution.
+//!
+//! Each [`Domain`](crate::Domain) selects a scope shared by its clones. Submissions reserve positions in that scope
+//! before dispatch, so ordered work observes its predecessors even when launches complete asynchronously. Completion
+//! records retain terminal diagnostics without retaining resources borrowed from the client.
+//!
+//! [`Domain::effects_barrier`](crate::Domain::effects_barrier) waits for earlier reservations and reports failures in
+//! submission order. Acknowledgment permits recovery only after the affected work has completed and its failures have
+//! been observed. Forking a domain's effect scope starts an independent sequence while retaining its session.
 
 use std::collections::HashSet;
 use std::sync::{Arc, Condvar, Mutex};
@@ -25,6 +33,7 @@ pub(super) fn format_effect_failures(failures: &[(u64, Arc<str>)]) -> String {
 pub(super) struct EffectCompletion {
     /// Immutable terminal outcome, published once after submission or cancellation.
     result: Mutex<Option<Result<(), Arc<str>>>>,
+
     /// Wakes barrier callers when the terminal outcome becomes available.
     ready: Condvar,
 }
@@ -69,12 +78,16 @@ enum EffectCarrier<'c> {
 pub(super) struct EffectSubmission<'c> {
     /// Monotonically increasing scope-local submission identity.
     identity: u64,
+
     /// Whether the invocation participates in the ordered I/O chain.
     ordered: bool,
+
     /// Buffer-free state retained by the completion observer.
     pub(super) completion: Arc<EffectCompletion>,
+
     /// Physical carrier publication or nonblocking forwarding of a cancelled reservation.
     carrier: Mutex<EffectCarrier<'c>>,
+
     /// Wakes submitting threads once the predecessor's physical result is available.
     published: Condvar,
 }
@@ -130,12 +143,16 @@ impl Drop for EffectSubmission<'_> {
 struct EffectScopeState<'c> {
     /// Identity of the next reserved invocation.
     next_identity: u64,
+
     /// Latest ordered invocation, retained even after its successful completion is retired.
     tail: Option<Arc<EffectSubmission<'c>>>,
+
     /// Outstanding invocations and unacknowledged failures, in reservation order.
     submissions: Vec<Arc<EffectSubmission<'c>>>,
+
     /// Failures reported by completed barriers.
     observed: HashSet<u64>,
+
     /// Ordered device assignment selected by the chain; changes require an explicit scope fork.
     device: Option<Vec<DeviceId>>,
 }
@@ -274,8 +291,10 @@ impl<'c> EffectScope<'c> {
 pub(super) struct EffectReservation<'c> {
     /// Invocation being prepared or published.
     pub(super) submission: Arc<EffectSubmission<'c>>,
+
     /// Predecessor whose carrier will be forwarded if submission fails before handoff.
     pub(super) predecessor: Option<Arc<EffectSubmission<'c>>>,
+
     /// Whether device work and its carrier have been published.
     pub(super) published: bool,
 }
@@ -299,6 +318,7 @@ std::thread_local! {
 
 /// Restores managed callback depth even when a callback returns an error or unwinds.
 pub(crate) struct EffectCallbackGuard;
+
 impl EffectCallbackGuard {
     /// Enters a managed callback, preventing reentrant submission and barriers on its PJRT thread.
     pub(crate) fn enter() -> Self {
@@ -340,7 +360,6 @@ mod tests {
 
     use crate::domains::compilation::CompilationError;
     use crate::domains::options::Options;
-    use crate::domains::persistence::tests::corrupt_ordered_io_metadata;
     use crate::domains::sessions::Session;
     use crate::domains::tests::*;
     use crate::experimental::ops::{Constant, Operation, ProgramBuilder};
@@ -348,6 +367,201 @@ mod tests {
     use crate::{Array, FromPjrt};
 
     use super::*;
+
+    /// Submits two prints through one session on one device of `client` and checks that they print in submission order.
+    /// With `hold_predecessor`, the two prints are additionally submitted behind an outstanding predecessor token (a
+    /// not-yet-transferred host-to-device token buffer) and must stay pending until it is released. That fixture only
+    /// works on plugins that submit executables without waiting for unrecorded input definition events on the host (the
+    /// CPU plugin); the CUDA plugin blocks the submitting thread until every input event is recorded, so there the
+    /// chain is proven through submission order and barrier completion alone.
+    fn assert_session_array_ordered_effects(client: &Client<'_>, hold_predecessor: bool) {
+        use ryft_core::Print;
+
+        use crate::operations::debugging::with_captured_prints;
+
+        let mesh = domain_mesh(client, "x", 1);
+        let session = Session::new(client);
+        let r#type = ArrayType::new(DataType::F64, Shape::from(StaticShape::new(vec![1])));
+        let first = session.array(r#type.clone(), mesh.clone(), 1.0f64.to_ne_bytes()).unwrap();
+        let second = session.array(r#type, mesh.clone(), 2.0f64.to_ne_bytes()).unwrap();
+        // Model an outstanding predecessor without relying on compiler cost heuristics or expensive dummy work.
+        let manager = hold_predecessor.then(|| {
+            let manager = client
+                .host_to_device_transfer_manager(
+                    vec![BufferSpecification::new(BufferType::Token, [])],
+                    client.addressable_devices().unwrap()[0].default_memory().unwrap(),
+                )
+                .unwrap();
+            let mut predecessor = session.default_effect_scope.reserve(Some(vec![mesh.devices()[0].id()])).unwrap();
+            predecessor.submission.publish(Ok(Some(vec![Arc::new(manager.retrieve_buffer(0).unwrap())])));
+            predecessor.submission.completion.complete(Ok(()));
+            predecessor.published = true;
+            manager
+        });
+        let tail_pending = || {
+            !session
+                .default_effect_scope
+                .state
+                .lock()
+                .unwrap()
+                .tail
+                .as_ref()
+                .unwrap()
+                .carrier()
+                .unwrap()
+                .unwrap()[0]
+                .ready()
+                .unwrap()
+                .ready()
+                .unwrap()
+        };
+        let ((first_pending, second_pending), lines) = with_captured_prints(|| {
+            drop(first.print("first").unwrap());
+            let first_pending = tail_pending();
+            drop(second.print("second").unwrap());
+            let second_pending = tail_pending();
+            if let Some(manager) = &manager {
+                manager.transfer_data(0, Arc::new([] as [u8; 0]), 0, true).unwrap().r#await().unwrap();
+            }
+            session.effects_barrier().unwrap();
+            (first_pending, second_pending)
+        });
+        if hold_predecessor {
+            assert!(first_pending);
+            assert!(second_pending);
+        }
+        assert_eq!(lines, vec!["first: [1.0]", "second: [2.0]"]);
+        assert_eq!(session.compilation_context().program_count(), 2);
+    }
+
+    /// Compiles ordered and unordered prints on `client`, checks the persisted effect metadata roundtrip and its
+    /// corruption detection, then executes the compiled, restored, and unordered programs and verifies the ordered
+    /// prints fire twice and the unordered print once. With `hold_predecessor`, the executions are submitted behind
+    /// an outstanding predecessor token that is released only afterwards; refer to
+    /// [`assert_session_array_ordered_effects`] for why that fixture is CPU-only.
+    fn assert_domain_effect_metadata_reload_and_unordered_completion(client: &Client<'_>, hold_predecessor: bool) {
+        use crate::operations::debugging::{ensure_print_handler_registered, with_captured_prints};
+
+        let mesh = domain_mesh(client, "x", 1);
+        let session = Session::new(client);
+        let domain = session.domain();
+        ensure_print_handler_registered(client).unwrap();
+        let input = f64_vector(&domain, &mesh, &[3.0]);
+        let mut builder = ProgramBuilder::new();
+        let argument = builder.add_input(input.r#type().into_owned().into());
+        builder
+            .add_instruction(PrintOperation::<ArrayType>::new("ordered"), Vec::new(), vec![argument], None)
+            .unwrap();
+        let source = builder.build::<Vec<Constant>, Vec<Constant>>(Vec::new(), vec![Placeholder], Vec::new()).unwrap();
+        let lowered = domain.lower_program(&source, 0, &Options::new(mesh.clone())).unwrap();
+        let compiled = domain.compile_program(&lowered).unwrap();
+        assert!(compiled.signature.has_ordered_io());
+        let serialized = compiled.serialize().unwrap().unwrap();
+        let restored = domain.deserialize_compiled_program(&serialized).unwrap().unwrap();
+        assert_eq!(restored.signature, compiled.signature);
+        let corrupted = corrupt_ordered_io_metadata(&serialized);
+        assert!(matches!(
+            domain.deserialize_compiled_program(&corrupted),
+            Err(Error::Compilation(CompilationError::InvalidPersistentExecutable { reason }))
+                if reason == "effect signature does not match executable physical outputs",
+        ));
+        let mut builder = ProgramBuilder::new();
+        let argument = builder.add_input(input.r#type().into_owned().into());
+        builder
+            .add_instruction(
+                PrintOperation::<ArrayType>::new("unordered").with_effect_class(EffectClass::UnorderedIo),
+                Vec::new(),
+                vec![argument],
+                None,
+            )
+            .unwrap();
+        let source = builder.build::<Vec<Constant>, Vec<Constant>>(Vec::new(), vec![Placeholder], Vec::new()).unwrap();
+        let lowered = domain.lower_program(&source, 0, &Options::new(mesh.clone())).unwrap();
+        let unordered = domain.compile_program(&lowered).unwrap();
+        assert!(unordered.signature.has_unordered_io());
+        assert!(!unordered.signature.has_ordered_io());
+        let manager = hold_predecessor.then(|| {
+            let manager = client
+                .host_to_device_transfer_manager(
+                    vec![BufferSpecification::new(BufferType::Token, [])],
+                    client.addressable_devices().unwrap()[0].default_memory().unwrap(),
+                )
+                .unwrap();
+            let mut predecessor = session.default_effect_scope.reserve(Some(vec![mesh.devices()[0].id()])).unwrap();
+            predecessor.submission.publish(Ok(Some(vec![Arc::new(manager.retrieve_buffer(0).unwrap())])));
+            predecessor.submission.completion.complete(Ok(()));
+            predecessor.published = true;
+            manager
+        });
+        let ((), lines) = with_captured_prints(|| {
+            assert!(domain.execute_program(&compiled, vec![input.clone()]).unwrap().is_empty());
+            assert!(domain.execute_program(&restored, vec![input.clone()]).unwrap().is_empty());
+            let independent = domain.execute_compiled_async(&unordered, vec![input]).unwrap();
+            if let Some(manager) = &manager {
+                manager.transfer_data(0, Arc::new([] as [u8; 0]), 0, true).unwrap().r#await().unwrap();
+            }
+            independent.fence().block_until_ready().unwrap();
+            domain.effects_barrier().unwrap();
+        });
+        assert_eq!(lines.iter().filter(|line| line.as_str() == "ordered: [3.0]").count(), 2);
+        assert_eq!(lines.iter().filter(|line| line.as_str() == "unordered: [3.0]").count(), 1);
+    }
+
+    /// Eagerly binds one `print` on `client` and verifies that the handler fires once with the device value and that
+    /// the payload passes through unchanged.
+    fn assert_eager_bind_executes_print_effect(client: &Client<'_>) {
+        use ryft_core::PrintOperation;
+
+        use crate::operations::debugging::{ensure_print_handler_registered, with_captured_prints};
+
+        let mesh = domain_mesh(client, "x", 1);
+        let domain = array_domain(client);
+        ensure_print_handler_registered(client).unwrap();
+
+        // The effectful `print` rides the compiled per-operation program as a token-threaded `@ryft.print` custom
+        // call: eagerly binding it fires the host callback once and passes the payload through unchanged.
+        let r#type = ArrayType::new(DataType::F64, Shape::new(vec![CoreDimension::Static(2)]))
+            .with_sharding(Sharding::replicated(mesh.logical_mesh().clone(), 1))
+            .unwrap();
+        let input = Array::from_host_buffer(
+            domain.parent(),
+            r#type,
+            mesh.clone(),
+            values_to_bytes::<f64>(&[1.5, 2.5]).as_slice(),
+        )
+        .unwrap();
+        let (outputs, lines) =
+            with_captured_prints(|| domain.bind(PrintOperation::<ArrayType>::new("x"), Vec::new(), &[input]).unwrap());
+
+        assert_eq!(lines, vec!["x: [1.5, 2.5]".to_string()]);
+        assert_eq!(outputs.len(), 1);
+        let device_id = client.addressable_devices().unwrap()[0].id().unwrap();
+        let bytes = outputs[0]
+            .device_shard(device_id)
+            .unwrap()
+            .buffer()
+            .unwrap()
+            .copy_to_host(None)
+            .unwrap()
+            .r#await()
+            .unwrap();
+        assert_eq!(values_from_bytes::<f64>(bytes.as_slice()), vec![1.5, 2.5]);
+    }
+
+    /// Clears the persisted ordered-I/O declaration while preserving the native executable bytes.
+    fn corrupt_ordered_io_metadata(serialized: &[u8]) -> Vec<u8> {
+        let header_size = 8 + size_of::<u64>();
+        let metadata_size = u64::from_le_bytes(serialized[8..header_size].try_into().unwrap()) as usize;
+        let metadata_end = header_size + metadata_size;
+        let mut metadata: serde_json::Value = serde_json::from_slice(&serialized[header_size..metadata_end]).unwrap();
+        metadata["ordered_io"] = false.into();
+        let metadata = serde_json::to_vec(&metadata).unwrap();
+        let mut corrupted = serialized[..8].to_vec();
+        corrupted.extend_from_slice(&(metadata.len() as u64).to_le_bytes());
+        corrupted.extend_from_slice(&metadata);
+        corrupted.extend_from_slice(&serialized[metadata_end..]);
+        corrupted
+    }
 
     #[test]
     fn test_session_array_ordered_effects() {
@@ -357,6 +571,7 @@ mod tests {
             .unwrap();
         assert_session_array_ordered_effects(&client, true);
     }
+
     #[cfg(feature = "cuda-13")]
     #[test]
     fn test_session_array_ordered_effects_on_cuda() {
@@ -372,6 +587,7 @@ mod tests {
             .unwrap();
         assert_session_array_ordered_effects(&client, false);
     }
+
     #[test]
     fn test_domain_effect_metadata_reload_and_unordered_completion() {
         let plugin = load_cpu_plugin().unwrap();
@@ -380,6 +596,7 @@ mod tests {
             .unwrap();
         assert_domain_effect_metadata_reload_and_unordered_completion(&client, true);
     }
+
     #[cfg(feature = "cuda-13")]
     #[test]
     fn test_domain_effect_metadata_reload_and_unordered_completion_on_cuda() {
@@ -393,6 +610,7 @@ mod tests {
             .unwrap();
         assert_domain_effect_metadata_reload_and_unordered_completion(&client, false);
     }
+
     #[test]
     fn test_domain_device_ordered_effects_preserve_per_device_dependencies() {
         use crate::operations::debugging::{
@@ -502,6 +720,7 @@ mod tests {
         assert!(position("effect: [0.0]") < position("effect: [2.0]"));
         assert!(position("effect: [1.0]") < position("effect: [3.0]"));
     }
+
     #[test]
     fn test_eager_bind_executes_print_effect() {
         let plugin = load_cpu_plugin().unwrap();
@@ -510,6 +729,7 @@ mod tests {
             .unwrap();
         assert_eager_bind_executes_print_effect(&client);
     }
+
     #[cfg(feature = "cuda-13")]
     #[test]
     fn test_eager_bind_executes_print_effect_on_cuda() {
@@ -523,6 +743,7 @@ mod tests {
             .unwrap();
         assert_eager_bind_executes_print_effect(&client);
     }
+
     #[test]
     fn test_batched_print_executes_on_cpu() {
         use ryft_core::Print;
@@ -566,6 +787,7 @@ mod tests {
         assert_eq!(outputs.len(), 1);
         assert_eq!(read_f64s(&client, &outputs[0]), vec![1.5, 2.5]);
     }
+
     #[test]
     fn test_effect_scope_reserve() {
         let scope = EffectScope::default();
@@ -602,6 +824,7 @@ mod tests {
         drop(unordered);
         assert!(scope.barrier().is_ok());
     }
+
     #[test]
     fn test_effect_reservation_cancelled_forwarding() {
         let scope = EffectScope::default();
@@ -627,6 +850,7 @@ mod tests {
         );
         assert!(matches!(scope.barrier(), Err(Error::Execution(ExecutionError::EffectSubmissionFailures { .. }))));
     }
+
     #[test]
     fn test_effect_submission_drop_cancelled_chain() {
         let scope = EffectScope::default();
@@ -641,6 +865,7 @@ mod tests {
         // The retained tail is the last owner of the entire cancelled chain.
         drop(tail);
     }
+
     #[test]
     fn test_effect_scope_reserve_device_assignment() {
         let scope = EffectScope::default();
@@ -654,6 +879,7 @@ mod tests {
         drop(successor);
         assert!(scope.barrier().is_ok());
     }
+
     #[test]
     fn test_effect_scope_barrier_snapshot() {
         let scope = EffectScope::default();
@@ -681,6 +907,7 @@ mod tests {
         });
         assert!(scope.barrier().is_ok());
     }
+
     #[test]
     fn test_effect_scope_acknowledge() {
         let scope = EffectScope::default();
@@ -716,6 +943,7 @@ mod tests {
         // Acknowledgment changes scope bookkeeping, not outcomes retained by callers.
         assert_eq!(first.submission.completion.result(), Some(Err(Arc::from("first effect failed"))));
     }
+
     #[test]
     fn test_effect_scope_acknowledge_preserves_pending() {
         let scope = EffectScope::default();
@@ -729,6 +957,7 @@ mod tests {
         assert!(scope.acknowledge().is_ok());
         assert_eq!(scope.state.lock().unwrap().submissions.len(), 0);
     }
+
     #[test]
     fn test_effect_scope_managed_callback_reentrancy() {
         let client = execution_client();
@@ -746,185 +975,6 @@ mod tests {
         ));
         drop(guard);
         assert!(scope.barrier().is_ok());
-    }
-
-    /// Submits two prints through one session on one device of `client` and checks that they print in submission order.
-    /// With `hold_predecessor`, the two prints are additionally submitted behind an outstanding predecessor token (a
-    /// not-yet-transferred host-to-device token buffer) and must stay pending until it is released. That fixture only
-    /// works on plugins that submit executables without waiting for unrecorded input definition events on the host (the
-    /// CPU plugin); the CUDA plugin blocks the submitting thread until every input event is recorded, so there the
-    /// chain is proven through submission order and barrier completion alone.
-    fn assert_session_array_ordered_effects(client: &Client<'_>, hold_predecessor: bool) {
-        use crate::operations::debugging::with_captured_prints;
-        use ryft_core::Print;
-
-        let mesh = domain_mesh(client, "x", 1);
-        let session = Session::new(client);
-        let r#type = ArrayType::new(DataType::F64, Shape::from(StaticShape::new(vec![1])));
-        let first = session.array(r#type.clone(), mesh.clone(), 1.0f64.to_ne_bytes()).unwrap();
-        let second = session.array(r#type, mesh.clone(), 2.0f64.to_ne_bytes()).unwrap();
-        // Model an outstanding predecessor without relying on compiler cost heuristics or expensive dummy work.
-        let manager = hold_predecessor.then(|| {
-            let manager = client
-                .host_to_device_transfer_manager(
-                    vec![BufferSpecification::new(BufferType::Token, [])],
-                    client.addressable_devices().unwrap()[0].default_memory().unwrap(),
-                )
-                .unwrap();
-            let mut predecessor = session.default_effect_scope.reserve(Some(vec![mesh.devices()[0].id()])).unwrap();
-            predecessor.submission.publish(Ok(Some(vec![Arc::new(manager.retrieve_buffer(0).unwrap())])));
-            predecessor.submission.completion.complete(Ok(()));
-            predecessor.published = true;
-            manager
-        });
-        let tail_pending = || {
-            !session
-                .default_effect_scope
-                .state
-                .lock()
-                .unwrap()
-                .tail
-                .as_ref()
-                .unwrap()
-                .carrier()
-                .unwrap()
-                .unwrap()[0]
-                .ready()
-                .unwrap()
-                .ready()
-                .unwrap()
-        };
-        let ((first_pending, second_pending), lines) = with_captured_prints(|| {
-            drop(first.print("first").unwrap());
-            let first_pending = tail_pending();
-            drop(second.print("second").unwrap());
-            let second_pending = tail_pending();
-            if let Some(manager) = &manager {
-                manager.transfer_data(0, Arc::new([] as [u8; 0]), 0, true).unwrap().r#await().unwrap();
-            }
-            session.effects_barrier().unwrap();
-            (first_pending, second_pending)
-        });
-        if hold_predecessor {
-            assert!(first_pending);
-            assert!(second_pending);
-        }
-        assert_eq!(lines, vec!["first: [1.0]", "second: [2.0]"]);
-        assert_eq!(session.compilation_context().program_count(), 2);
-    }
-
-    /// Compiles ordered and unordered prints on `client`, checks the persisted effect metadata roundtrip and its
-    /// corruption detection, then executes the compiled, restored, and unordered programs and verifies the ordered
-    /// prints fire twice and the unordered print once. With `hold_predecessor`, the executions are submitted behind
-    /// an outstanding predecessor token that is released only afterwards; refer to
-    /// [`assert_session_array_ordered_effects`] for why that fixture is CPU-only.
-    fn assert_domain_effect_metadata_reload_and_unordered_completion(client: &Client<'_>, hold_predecessor: bool) {
-        use crate::operations::debugging::{ensure_print_handler_registered, with_captured_prints};
-
-        let mesh = domain_mesh(client, "x", 1);
-        let session = Session::new(client);
-        let domain = session.domain();
-        ensure_print_handler_registered(client).unwrap();
-        let input = f64_vector(&domain, &mesh, &[3.0]);
-        let mut builder = ProgramBuilder::new();
-        let argument = builder.add_input(input.r#type().into_owned().into());
-        builder
-            .add_instruction(PrintOperation::<ArrayType>::new("ordered"), Vec::new(), vec![argument], None)
-            .unwrap();
-        let source = builder.build::<Vec<Constant>, Vec<Constant>>(Vec::new(), vec![Placeholder], Vec::new()).unwrap();
-        let lowered = domain.lower_program(&source, 0, &Options::new(mesh.clone())).unwrap();
-        let compiled = domain.compile_program(&lowered).unwrap();
-        assert!(compiled.signature.has_ordered_io());
-        let serialized = domain.serialize_compiled_program(&compiled).unwrap().unwrap();
-        let restored = domain.deserialize_compiled_program(&serialized).unwrap().unwrap();
-        assert_eq!(restored.signature, compiled.signature);
-        let corrupted = corrupt_ordered_io_metadata(&serialized);
-        assert!(matches!(
-            domain.deserialize_compiled_program(&corrupted),
-            Err(Error::Compilation(CompilationError::InvalidPersistentExecutable { reason }))
-                if reason == "effect signature does not match executable physical outputs",
-        ));
-        let mut builder = ProgramBuilder::new();
-        let argument = builder.add_input(input.r#type().into_owned().into());
-        builder
-            .add_instruction(
-                PrintOperation::<ArrayType>::new("unordered").with_effect_class(EffectClass::UnorderedIo),
-                Vec::new(),
-                vec![argument],
-                None,
-            )
-            .unwrap();
-        let source = builder.build::<Vec<Constant>, Vec<Constant>>(Vec::new(), vec![Placeholder], Vec::new()).unwrap();
-        let lowered = domain.lower_program(&source, 0, &Options::new(mesh.clone())).unwrap();
-        let unordered = domain.compile_program(&lowered).unwrap();
-        assert!(unordered.signature.has_unordered_io());
-        assert!(!unordered.signature.has_ordered_io());
-        let manager = hold_predecessor.then(|| {
-            let manager = client
-                .host_to_device_transfer_manager(
-                    vec![BufferSpecification::new(BufferType::Token, [])],
-                    client.addressable_devices().unwrap()[0].default_memory().unwrap(),
-                )
-                .unwrap();
-            let mut predecessor = session.default_effect_scope.reserve(Some(vec![mesh.devices()[0].id()])).unwrap();
-            predecessor.submission.publish(Ok(Some(vec![Arc::new(manager.retrieve_buffer(0).unwrap())])));
-            predecessor.submission.completion.complete(Ok(()));
-            predecessor.published = true;
-            manager
-        });
-        let ((), lines) = with_captured_prints(|| {
-            assert!(domain.execute_program(&compiled, vec![input.clone()]).unwrap().is_empty());
-            assert!(domain.execute_program(&restored, vec![input.clone()]).unwrap().is_empty());
-            let independent = domain.execute_compiled_async(&unordered, vec![input]).unwrap();
-            if let Some(manager) = &manager {
-                manager.transfer_data(0, Arc::new([] as [u8; 0]), 0, true).unwrap().r#await().unwrap();
-            }
-            independent.fence().block_until_ready().unwrap();
-            domain.effects_barrier().unwrap();
-        });
-        assert_eq!(lines.iter().filter(|line| line.as_str() == "ordered: [3.0]").count(), 2);
-        assert_eq!(lines.iter().filter(|line| line.as_str() == "unordered: [3.0]").count(), 1);
-    }
-
-    /// Eagerly binds one `print` on `client` and verifies that the handler fires once with the device value and that
-    /// the payload passes through unchanged.
-    fn assert_eager_bind_executes_print_effect(client: &Client<'_>) {
-        use ryft_core::PrintOperation;
-
-        use crate::operations::debugging::{ensure_print_handler_registered, with_captured_prints};
-
-        let mesh = domain_mesh(client, "x", 1);
-        let domain = array_domain(client);
-        ensure_print_handler_registered(client).unwrap();
-
-        // The effectful `print` rides the compiled per-operation program as a token-threaded `@ryft.print` custom
-        // call: eagerly binding it fires the host callback once and passes the payload through unchanged.
-        let r#type = ArrayType::new(DataType::F64, Shape::new(vec![CoreDimension::Static(2)]))
-            .with_sharding(Sharding::replicated(mesh.logical_mesh().clone(), 1))
-            .unwrap();
-        let input = Array::from_host_buffer(
-            domain.parent(),
-            r#type,
-            mesh.clone(),
-            values_to_bytes::<f64>(&[1.5, 2.5]).as_slice(),
-        )
-        .unwrap();
-        let (outputs, lines) =
-            with_captured_prints(|| domain.bind(PrintOperation::<ArrayType>::new("x"), Vec::new(), &[input]).unwrap());
-
-        assert_eq!(lines, vec!["x: [1.5, 2.5]".to_string()]);
-        assert_eq!(outputs.len(), 1);
-        let device_id = client.addressable_devices().unwrap()[0].id().unwrap();
-        let bytes = outputs[0]
-            .device_shard(device_id)
-            .unwrap()
-            .buffer()
-            .unwrap()
-            .copy_to_host(None)
-            .unwrap()
-            .r#await()
-            .unwrap();
-        assert_eq!(values_from_bytes::<f64>(bytes.as_slice()), vec![1.5, 2.5]);
     }
 
     #[test]

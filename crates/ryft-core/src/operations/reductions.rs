@@ -4413,11 +4413,18 @@ mod tests {
         assert_eq!(input.reduce(&[0], ReductionKind::Sum), Ok(output.clone()));
         assert_eq!(input.reduce(&[0], ReductionKind::Mean), Ok(output));
 
-        // Products, extrema, and logarithmic sums do not commute with that sum, and integer means truncate before it.
+        // Products and logarithmic sums do not commute with that sum, integer means truncate before it, and extrema
+        // commute only with pending extrema of their own kind.
+        for kind in [ReductionKind::Max, ReductionKind::Min] {
+            assert_eq!(
+                input.reduce(&[0], kind),
+                Err(TypeError::invalid(format!(
+                    "`reduce` with kind `{kind}` supports only unreduced inputs of kind `{kind}` but got kind `sum`"
+                ))),
+            );
+        }
         for (input, kind) in [
             (input.clone(), ReductionKind::Product),
-            (input.clone(), ReductionKind::Max),
-            (input.clone(), ReductionKind::Min),
             (input.clone(), ReductionKind::LogSumExp),
             (input.clone().with_data_type(DataType::I32), ReductionKind::Mean),
         ] {

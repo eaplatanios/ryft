@@ -1,4 +1,13 @@
-//! Lowered and compiled XLA artifacts and their invocation contracts.
+//! XLA program artifacts and their invocation contracts.
+//!
+//! [`LoweredProgram`] owns the StableHLO and metadata produced by lowering. [`CompiledProgram`] retains a loaded PJRT
+//! executable with the same logical inputs, outputs, captures, reference bindings, and physical boundary mapping. These
+//! flat artifacts carry no Rust container structure. Typed lifecycle handles in [`crate::compilation`] retain that
+//! structure separately.
+//!
+//! Both artifacts implement [`TypedProgram`] for their logical signatures. Hidden final reference states remain in the
+//! internal invocation metadata but are excluded from public output types. Reused and replacement executables must
+//! preserve the complete invocation contract before they can be called.
 
 use std::borrow::Cow;
 use std::sync::{Arc, OnceLock};
@@ -83,6 +92,23 @@ pub struct LoweredProgram {
 }
 
 impl LoweredProgram {
+    /// Returns this lowering with an opaque feedback-directed profile installed in its exact PJRT compilation
+    /// options.
+    ///
+    /// The StableHLO and runtime signature are unchanged. Because canonical compilation identity includes the
+    /// complete PJRT options, the returned lowering receives a distinct in-memory, persistent, and distributed cache
+    /// key from the baseline executable.
+    pub fn with_feedback_directed_profile(mut self, profile: FeedbackDirectedProfile) -> Self {
+        use ryft_pjrt::protos::ExecutableCompilationOptions;
+
+        self.compilation_options
+            .executable_build_options
+            .get_or_insert_with(ExecutableCompilationOptions::default)
+            .fdo_profile = profile.bytes().to_vec();
+        self.compilation_options.profile_version = profile.version();
+        self
+    }
+
     /// Returns the textual StableHLO/Shardy module.
     #[inline]
     pub fn stable_hlo(&self) -> &str {
@@ -106,23 +132,6 @@ impl LoweredProgram {
     #[inline]
     pub fn mesh(&self) -> &DeviceMesh {
         &self.mesh
-    }
-
-    /// Returns this lowering with an opaque feedback-directed profile installed in its exact PJRT compilation
-    /// options.
-    ///
-    /// The StableHLO and runtime signature are unchanged. Because canonical compilation identity includes the
-    /// complete PJRT options, the returned lowering receives a distinct in-memory, persistent, and distributed cache
-    /// key from the baseline executable.
-    pub fn with_feedback_directed_profile(mut self, profile: FeedbackDirectedProfile) -> Self {
-        use ryft_pjrt::protos::ExecutableCompilationOptions;
-
-        self.compilation_options
-            .executable_build_options
-            .get_or_insert_with(ExecutableCompilationOptions::default)
-            .fdo_profile = profile.bytes().to_vec();
-        self.compilation_options.profile_version = profile.version();
-        self
     }
 }
 
@@ -151,139 +160,71 @@ impl TypedProgram for LoweredProgram {
 /// Loaded PJRT executable plus the metadata required to invoke it safely.
 #[derive(Clone)]
 pub struct CompiledProgram<'c> {
+    /// Loaded PJRT executable, shared by cloned program handles.
     pub(super) executable: Arc<LoadedExecutable<'c>>,
+
+    /// Logical input types, including captures before public inputs.
     pub(super) input_types: Arc<[ArrayType]>,
+
+    /// Logical output types, including hidden final reference states after the public result.
     pub(super) output_types: Arc<[ArrayType]>,
+
+    /// Number of leading logical outputs exposed through the structured public result.
     pub(super) output_count: usize,
+
+    /// Logical external reference binding recipes in canonical source order.
     pub(super) reference_states: Arc<[ExternalReferenceBinding]>,
+
+    /// Mapping between logical arrays and physical executable arguments, results, extents, and effects.
     pub(super) signature: ExecutableSignature,
 
     /// Canonical runtime contracts resolved against the invoking session.
     pub(super) runtime_requirements: Arc<[RuntimeRequirement]>,
+
+    /// Whether execution requires the host runtime assertion handler.
     pub(super) requires_assertion_handler: bool,
+
+    /// Donation declarations for public inputs. Captures are always non-donatable.
     pub(super) donation_flags: Arc<[bool]>,
+
+    /// Number of leading logical inputs supplied by the staged capture table.
     pub(super) capture_count: usize,
+
+    /// Effective sharding of every physical executable argument, including materialized captures first.
     pub(super) expected_argument_shardings: Arc<[Sharding]>,
+
+    /// Concrete device mesh used for compilation and execution.
     pub(super) mesh: DeviceMesh,
+
+    /// Effective PJRT compilation options used to build the executable.
     pub(super) compilation_options: CompilationOptions,
+
+    /// PJRT platform name recorded at compilation.
     pub(super) platform_name: Arc<str>,
+
+    /// PJRT platform version recorded at compilation.
     pub(super) platform_version: Arc<str>,
+
+    /// Device kinds in the exact mesh order used for compilation.
     pub(super) device_kinds: Arc<[String]>,
 
     /// Exact live execution facts for selected kernels; ordinary executables leave this absent.
     pub(super) kernel_execution_facts: Option<Vec<u8>>,
+
+    /// Exact Ryft, OpenXLA, and JAX build identity used for compilation.
     pub(super) compiler_identity: Arc<str>,
+
+    /// Process-level XLA flags recorded at compilation.
     pub(super) xla_flags: Arc<str>,
+
+    /// Wall-clock duration of the PJRT compilation request, if retained by the artifact.
     pub(super) compilation_duration: Option<Duration>,
+
+    /// Shared lazy analysis result, retaining both successful queries and their original failures.
     pub(super) analysis: Arc<OnceLock<Result<CompilationAnalysis, Error>>>,
 
     /// Value-independent execution metadata, computed once when the program is compiled or loaded.
     pub(super) plan: Arc<ExecutionPlan>,
-}
-
-#[derive(Copy, Clone)]
-pub(super) struct InvocationMetadata<'a> {
-    input_types: &'a [ArrayType],
-    output_types: &'a [ArrayType],
-    output_count: usize,
-    reference_states: &'a [ExternalReferenceBinding],
-    signature: &'a ExecutableSignature,
-    runtime_requirements: &'a [RuntimeRequirement],
-    donation_flags: &'a [bool],
-    capture_count: usize,
-    expected_argument_shardings: &'a [Sharding],
-    mesh: &'a DeviceMesh,
-    requires_assertion_handler: bool,
-    kernel_execution_facts: Option<&'a [u8]>,
-}
-
-impl<'a, 'c> From<&'a CompiledProgram<'c>> for InvocationMetadata<'a> {
-    fn from(program: &'a CompiledProgram<'c>) -> Self {
-        Self {
-            input_types: &program.input_types,
-            output_types: &program.output_types,
-            output_count: program.output_count,
-            reference_states: &program.reference_states,
-            signature: &program.signature,
-            runtime_requirements: &program.runtime_requirements,
-            donation_flags: &program.donation_flags,
-            capture_count: program.capture_count,
-            expected_argument_shardings: &program.expected_argument_shardings,
-            mesh: &program.mesh,
-            requires_assertion_handler: program.requires_assertion_handler,
-            kernel_execution_facts: program.kernel_execution_facts.as_deref(),
-        }
-    }
-}
-
-impl<'a> From<&'a LoweredProgram> for InvocationMetadata<'a> {
-    fn from(program: &'a LoweredProgram) -> Self {
-        Self {
-            input_types: &program.input_types,
-            output_types: &program.output_types,
-            output_count: program.output_count,
-            reference_states: &program.reference_states,
-            signature: &program.signature,
-            runtime_requirements: &program.runtime_requirements,
-            donation_flags: &program.donation_flags,
-            capture_count: program.capture_count,
-            expected_argument_shardings: &program.expected_argument_shardings,
-            mesh: &program.mesh,
-            requires_assertion_handler: program.requires_assertion_handler,
-            kernel_execution_facts: program.kernel_execution_facts.as_deref(),
-        }
-    }
-}
-
-/// Returns the first invocation-metadata field on which the two programs disagree, if any.
-pub(super) fn incompatible_invocation_field(
-    current: InvocationMetadata<'_>,
-    other: InvocationMetadata<'_>,
-) -> Option<&'static str> {
-    // Structurally equal boundary types have equal canonical encodings, so only unequal ones pay for encoding both.
-    let equal_boundary_types = current.input_types == other.input_types && current.output_types == other.output_types;
-    if !equal_boundary_types
-        && canonical_boundary_types(current.input_types, current.output_types)
-            != canonical_boundary_types(other.input_types, other.output_types)
-    {
-        Some("boundary types")
-    } else if current.output_count != other.output_count {
-        Some("output count")
-    } else if current.reference_states != other.reference_states {
-        Some("reference-state signature")
-    } else if current.signature != other.signature {
-        Some("executable signature")
-    } else if current.runtime_requirements != other.runtime_requirements {
-        Some("runtime requirements")
-    } else if current.donation_flags != other.donation_flags {
-        Some("donation flags")
-    } else if current.capture_count != other.capture_count {
-        Some("capture count")
-    } else if current.expected_argument_shardings != other.expected_argument_shardings {
-        Some("argument shardings")
-    } else if current.mesh != other.mesh {
-        Some("device mesh")
-    } else if current.kernel_execution_facts != other.kernel_execution_facts {
-        Some("kernel execution facts")
-    } else if current.requires_assertion_handler != other.requires_assertion_handler {
-        Some("assertion-handler requirement")
-    } else {
-        None
-    }
-}
-
-/// Validates that `replacement` preserves `current`'s complete invocation contract, naming the first incompatible
-/// metadata field otherwise.
-pub(super) fn validate_replacement_metadata(
-    current: InvocationMetadata<'_>,
-    replacement: InvocationMetadata<'_>,
-) -> Result<(), Error> {
-    match incompatible_invocation_field(current, replacement) {
-        Some(field) => Err(Error::Compilation(CompilationError::IncompatibleExecutable {
-            reason: format!("replacement executable has incompatible {field}"),
-        })),
-        None => Ok(()),
-    }
 }
 
 impl<'c> CompiledProgram<'c> {
@@ -311,20 +252,6 @@ impl<'c> CompiledProgram<'c> {
         &self.output_types[..self.output_count]
     }
 
-    /// Returns whether this executable requires a stateful reference invocation boundary.
-    #[inline]
-    pub(crate) fn requires_stateful_call(&self) -> bool {
-        !self.reference_states.is_empty()
-    }
-
-    /// Checks a capture-free, stateless public boundary before an independently loaded executable is exposed.
-    pub(crate) fn matches_stateless_signature(&self, inputs: &[ArrayType], outputs: &[ArrayType]) -> bool {
-        self.capture_count == 0
-            && !self.requires_stateful_call()
-            && self.input_types.as_ref() == inputs
-            && self.output_types() == outputs
-    }
-
     /// Returns the mesh the compiled program runs against.
     #[inline]
     pub fn mesh(&self) -> &DeviceMesh {
@@ -338,6 +265,20 @@ impl<'c> CompiledProgram<'c> {
             PjrtProgram::Hlo { proto } => Ok(OptimizedProgram { format: "hlo", bytes: proto }),
             PjrtProgram::HloWithConfig { proto } => Ok(OptimizedProgram { format: "hlo_with_config", bytes: proto }),
         }
+    }
+
+    /// Returns whether this executable requires a stateful reference invocation boundary.
+    #[inline]
+    pub(crate) fn requires_stateful_call(&self) -> bool {
+        !self.reference_states.is_empty()
+    }
+
+    /// Checks a capture-free, stateless public boundary before an independently loaded executable is exposed.
+    pub(crate) fn matches_stateless_signature(&self, inputs: &[ArrayType], outputs: &[ArrayType]) -> bool {
+        self.capture_count == 0
+            && !self.requires_stateful_call()
+            && self.input_types.as_ref() == inputs
+            && self.output_types() == outputs
     }
 }
 
@@ -360,6 +301,131 @@ impl TypedProgram for CompiledProgram<'_> {
 
     fn output_types(&self) -> Cow<'_, [ArrayIrType]> {
         Cow::Owned(self.output_types[..self.output_count].iter().cloned().map(Into::into).collect())
+    }
+}
+
+/// Borrowed invocation contract shared by lowered and compiled artifacts for compatibility validation.
+#[derive(Copy, Clone)]
+pub(super) struct InvocationMetadata<'o> {
+    /// Logical input types, including captures before public inputs.
+    input_types: &'o [ArrayType],
+
+    /// Logical output types, including hidden final reference states after the public result.
+    output_types: &'o [ArrayType],
+
+    /// Number of leading logical outputs exposed through the structured public result.
+    output_count: usize,
+
+    /// Logical external reference binding recipes in canonical source order.
+    reference_states: &'o [ExternalReferenceBinding],
+
+    /// Mapping between logical arrays and physical executable arguments, results, extents, and effects.
+    signature: &'o ExecutableSignature,
+
+    /// Canonical runtime contracts that the invoking session must provide.
+    runtime_requirements: &'o [RuntimeRequirement],
+
+    /// Donation declarations for public inputs. Captures are always non-donatable.
+    donation_flags: &'o [bool],
+
+    /// Number of leading logical inputs supplied by the staged capture table.
+    capture_count: usize,
+
+    /// Effective sharding of every physical executable argument, including materialized captures first.
+    expected_argument_shardings: &'o [Sharding],
+
+    /// Concrete device mesh used for compilation and execution.
+    mesh: &'o DeviceMesh,
+
+    /// Whether execution requires the host runtime assertion handler.
+    requires_assertion_handler: bool,
+
+    /// Exact live execution facts for selected kernels, absent for ordinary executables.
+    kernel_execution_facts: Option<&'o [u8]>,
+}
+
+impl InvocationMetadata<'_> {
+    /// Returns the first invocation-metadata field on which the two programs disagree, if any.
+    pub(super) fn incompatible_field(self, other: Self) -> Option<&'static str> {
+        // Structurally equal boundary types have equal canonical encodings, so only unequal ones pay for encoding both.
+        let equal_boundary_types = self.input_types == other.input_types && self.output_types == other.output_types;
+        if !equal_boundary_types
+            && canonical_boundary_types(self.input_types, self.output_types)
+                != canonical_boundary_types(other.input_types, other.output_types)
+        {
+            Some("boundary types")
+        } else if self.output_count != other.output_count {
+            Some("output count")
+        } else if self.reference_states != other.reference_states {
+            Some("reference-state signature")
+        } else if self.signature != other.signature {
+            Some("executable signature")
+        } else if self.runtime_requirements != other.runtime_requirements {
+            Some("runtime requirements")
+        } else if self.donation_flags != other.donation_flags {
+            Some("donation flags")
+        } else if self.capture_count != other.capture_count {
+            Some("capture count")
+        } else if self.expected_argument_shardings != other.expected_argument_shardings {
+            Some("argument shardings")
+        } else if self.mesh != other.mesh {
+            Some("device mesh")
+        } else if self.kernel_execution_facts != other.kernel_execution_facts {
+            Some("kernel execution facts")
+        } else if self.requires_assertion_handler != other.requires_assertion_handler {
+            Some("assertion-handler requirement")
+        } else {
+            None
+        }
+    }
+
+    /// Validates that `replacement` preserves this program's complete invocation contract, naming the first
+    /// incompatible metadata field otherwise.
+    pub(super) fn validate_replacement(self, replacement: Self) -> Result<(), Error> {
+        match self.incompatible_field(replacement) {
+            Some(field) => Err(Error::Compilation(CompilationError::IncompatibleExecutable {
+                reason: format!("replacement executable has incompatible {field}"),
+            })),
+            None => Ok(()),
+        }
+    }
+}
+
+impl<'o, 'c> From<&'o CompiledProgram<'c>> for InvocationMetadata<'o> {
+    fn from(program: &'o CompiledProgram<'c>) -> Self {
+        Self {
+            input_types: &program.input_types,
+            output_types: &program.output_types,
+            output_count: program.output_count,
+            reference_states: &program.reference_states,
+            signature: &program.signature,
+            runtime_requirements: &program.runtime_requirements,
+            donation_flags: &program.donation_flags,
+            capture_count: program.capture_count,
+            expected_argument_shardings: &program.expected_argument_shardings,
+            mesh: &program.mesh,
+            requires_assertion_handler: program.requires_assertion_handler,
+            kernel_execution_facts: program.kernel_execution_facts.as_deref(),
+        }
+    }
+}
+
+impl<'o> From<&'o LoweredProgram> for InvocationMetadata<'o> {
+    fn from(program: &'o LoweredProgram) -> Self {
+        Self {
+            input_types: &program.input_types,
+            output_types: &program.output_types,
+            output_count: program.output_count,
+            reference_states: &program.reference_states,
+            signature: &program.signature,
+            runtime_requirements: &program.runtime_requirements,
+            donation_flags: &program.donation_flags,
+            capture_count: program.capture_count,
+            expected_argument_shardings: &program.expected_argument_shardings,
+            mesh: &program.mesh,
+            requires_assertion_handler: program.requires_assertion_handler,
+            kernel_execution_facts: program.kernel_execution_facts.as_deref(),
+        }
     }
 }
 
@@ -400,14 +466,14 @@ mod tests {
             kernel_execution_facts: None,
         };
         let replacement = InvocationMetadata { kernel_execution_facts: Some(b"changed"), ..current };
-        assert!(matches!(validate_replacement_metadata(current, replacement),
+        assert!(matches!(current.validate_replacement(replacement),
             Err(Error::Compilation(CompilationError::IncompatibleExecutable { reason }))
                 if reason == "replacement executable has incompatible kernel execution facts"));
         let requirements = [crate::domains::runtimes::builtin_requirement("test.runtime")];
         let replacement = InvocationMetadata { runtime_requirements: &requirements, ..current };
-        assert_eq!(incompatible_invocation_field(current, replacement), Some("runtime requirements"));
+        assert_eq!(current.incompatible_field(replacement), Some("runtime requirements"));
         assert!(matches!(
-            validate_replacement_metadata(current, replacement),
+            current.validate_replacement(replacement),
             Err(Error::Compilation(CompilationError::IncompatibleExecutable { reason }))
                 if reason == "replacement executable has incompatible runtime requirements",
         ));
@@ -415,26 +481,26 @@ mod tests {
         let replacement = InvocationMetadata { donation_flags: &[true], ..current };
 
         assert!(matches!(
-            validate_replacement_metadata(current, replacement),
+            current.validate_replacement(replacement),
             Err(Error::Compilation(CompilationError::IncompatibleExecutable { reason }))
                 if reason == "replacement executable has incompatible donation flags",
         ));
         let replacement = InvocationMetadata { output_count: 1, ..current };
         assert!(matches!(
-            validate_replacement_metadata(current, replacement),
+            current.validate_replacement(replacement),
             Err(Error::Compilation(CompilationError::IncompatibleExecutable { reason }))
                 if reason == "replacement executable has incompatible output count",
         ));
         let state = ExternalReferenceBinding::new(ReferenceSource::Input { index: 0 }, None);
         let replacement = InvocationMetadata { reference_states: std::slice::from_ref(&state), ..current };
         assert!(matches!(
-            validate_replacement_metadata(current, replacement),
+            current.validate_replacement(replacement),
             Err(Error::Compilation(CompilationError::IncompatibleExecutable { reason }))
                 if reason == "replacement executable has incompatible reference-state signature",
         ));
         let replacement = InvocationMetadata { requires_assertion_handler: true, ..current };
         assert!(matches!(
-            validate_replacement_metadata(current, replacement),
+            current.validate_replacement(replacement),
             Err(Error::Compilation(CompilationError::IncompatibleExecutable { reason }))
                 if reason == "replacement executable has incompatible assertion-handler requirement",
         ));
@@ -457,12 +523,12 @@ mod tests {
         assert_ne!(left_types, right_types);
         let left = InvocationMetadata { input_types: left_types.as_slice(), ..current };
         let right = InvocationMetadata { input_types: right_types.as_slice(), ..current };
-        assert!(validate_replacement_metadata(left, right).is_ok());
+        assert!(left.validate_replacement(right).is_ok());
         let static_types = vec![ArrayType::scalar(DataType::F32)];
         let left = InvocationMetadata { input_types: left_types.as_slice(), ..current };
         let different = InvocationMetadata { input_types: static_types.as_slice(), ..current };
         assert!(matches!(
-            validate_replacement_metadata(left, different),
+            left.validate_replacement(different),
             Err(Error::Compilation(CompilationError::IncompatibleExecutable { reason }))
                 if reason == "replacement executable has incompatible boundary types",
         ));

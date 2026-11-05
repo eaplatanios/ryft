@@ -500,10 +500,10 @@ impl<'c> ExecutionResources<'c> {
     ///
     /// # Safety
     ///
-    /// The pointer must have the type registered under its native type ID and remain stable until completion. Its
-    /// owner must be this session's runtime instance or be retained through [`Self::retain`]. Native handlers may access
-    /// it concurrently on several devices; the pointee must support those accesses. This boundary permits third-party
-    /// FFI integrations while keeping native pointer insertion explicit.
+    /// The pointer must have the type registered under its native type ID and remain stable until completion. Its owner
+    /// must be this session's runtime instance or be retained through [`Self::retain`]. Native handlers may access it
+    /// concurrently on several devices; the pointee must support those accesses. This boundary permits third-party FFI
+    /// integrations while keeping native pointer insertion explicit.
     pub unsafe fn add_ffi_user_data(&mut self, data: FfiUserData) -> Result<(), Error> {
         if !self.user_data.insert(data.type_id) {
             return Err(RuntimeError::DuplicateUserData { type_id: data.type_id.into() }.into());

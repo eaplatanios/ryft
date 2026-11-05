@@ -14,7 +14,7 @@ use std::collections::{BTreeMap, HashSet};
 use ryft_core::{Device, DeviceId, DeviceMesh};
 use ryft_pjrt::{Client, Value as PjrtValue};
 
-use crate::domains::persistence::persistent_error;
+use crate::domains::compilation::CompilationError;
 use crate::{Error, FromPjrt};
 
 // TODO(eaplatanios): Review this module.
@@ -175,14 +175,16 @@ impl Target {
     ///
     /// # Errors
     ///
-    /// Returns [`CompilationError::InvalidPersistentExecutable`](crate::CompilationError::InvalidPersistentExecutable)
-    /// wrapped in [`Error::Compilation`] if a mesh device identifier is absent from the snapshot.
+    /// Returns [`CompilationError::InvalidPersistentExecutable`] wrapped in [`Error::Compilation`] if a mesh device
+    /// identifier is absent from the snapshot.
     pub(super) fn mesh_device_kinds(&self, mesh: &DeviceMesh) -> Result<Vec<String>, Error> {
         mesh.devices()
             .iter()
             .map(|mesh_device| {
                 self.device(mesh_device.id()).map(|device| device.kind.clone()).ok_or_else(|| {
-                    persistent_error(format!("device {} is not visible to the live client", mesh_device.id()))
+                    Error::Compilation(CompilationError::InvalidPersistentExecutable {
+                        reason: format!("device {} is not visible to the live client", mesh_device.id()),
+                    })
                 })
             })
             .collect()

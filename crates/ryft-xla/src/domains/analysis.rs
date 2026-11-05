@@ -1,10 +1,15 @@
-//! Compiled XLA program inspection and analysis.
+//! Compiler diagnostics for loaded XLA executables.
+//!
+//! A [`CompilationAnalysis`] normalizes common PJRT cost and memory properties while retaining plugin-specific values
+//! as [`AnalysisValue`]s. Unsupported queries remain absent. The [`Domain`] caches both successful analyses and
+//! failures on the corresponding [`CompiledProgram`], so repeated inspection does not issue new backend queries.
+//! [`OptimizedProgram`] exposes the compiler's optimized representation separately, on explicit request.
 
 use std::collections::BTreeMap;
 use std::fmt::{Display, Formatter};
 use std::time::Duration;
 
-use ryft_core::{AnalyzableCompilationDomain, ArrayIrType, Parameterized};
+use ryft_core::{AnalyzableCompilationDomain, ArrayIrType, ExecutableFunction, Parameterized};
 use ryft_pjrt::Value as PjrtValue;
 use serde::Serialize;
 
@@ -21,51 +26,115 @@ use crate::domains::programs::CompiledProgram;
 pub enum AnalysisValue {
     /// Boolean property.
     Boolean(bool),
+
     /// Signed integer property.
     Integer(i64),
+
     /// Signed integer-list property.
     IntegerList(Vec<i64>),
+
     /// Floating-point property.
     Float(f64),
+
     /// String property.
     String(String),
 }
 
-/// Normalized memory requirements reported by PJRT for one XLA executable.
+impl From<&PjrtValue> for AnalysisValue {
+    fn from(value: &PjrtValue) -> Self {
+        match value {
+            PjrtValue::Bool(value) => Self::Boolean(*value),
+            PjrtValue::I64(value) => Self::Integer(*value),
+            PjrtValue::I64List(value) => Self::IntegerList(value.clone()),
+            PjrtValue::F32(value) => Self::Float(*value as f64),
+            PjrtValue::String(value) => Self::String(value.clone()),
+        }
+    }
+}
+
+/// Executable and allocator memory statistics reported by PJRT.
 #[derive(Copy, Clone, Debug, Serialize, PartialEq, Eq)]
 pub struct MemoryAnalysis {
+    /// Bytes occupied by generated code in device memory.
     pub device_generated_code_size_in_bytes: usize,
+
+    /// Bytes occupied by executable input buffers in device memory.
     pub device_input_size_in_bytes: usize,
+
+    /// Bytes occupied by executable output buffers in device memory.
     pub device_output_size_in_bytes: usize,
+
+    /// Device bytes shared by aliased input and output buffers.
     pub device_alias_size_in_bytes: usize,
+
+    /// Bytes required for temporary buffers in device memory.
     pub device_temporary_size_in_bytes: usize,
+
+    /// Peak device memory use reported by the backend.
     pub device_peak_memory_in_bytes: usize,
+
+    /// Total device memory capacity reported by the backend.
     pub device_total_memory_in_bytes: usize,
+
+    /// Bytes held by the device allocator, including retained memory pools.
     pub device_total_allocation_bytes: usize,
+
+    /// Number of device allocations without a bounded allocation/deallocation interval in the backend schedule.
     pub device_indefinite_allocations: usize,
+
+    /// Peak device heap use before allocator padding, in bytes.
     pub device_peak_unpadded_heap_bytes: usize,
+
+    /// Bytes occupied by generated code in host memory.
     pub host_generated_code_size_in_bytes: usize,
+
+    /// Bytes occupied by executable input buffers in host memory.
     pub host_input_size_in_bytes: usize,
+
+    /// Bytes occupied by executable output buffers in host memory.
     pub host_output_size_in_bytes: usize,
+
+    /// Host bytes shared by aliased input and output buffers.
     pub host_alias_size_in_bytes: usize,
+
+    /// Bytes required for temporary buffers in host memory.
     pub host_temporary_size_in_bytes: usize,
 }
 
-/// Backend-neutral-facing, typed analysis of one compiled XLA executable.
+/// Typed cost, memory, and executable metadata for one compiled XLA program.
 ///
 /// PJRT plugins expose different property sets. Common properties are normalized into optional fields and every raw
 /// property is retained in [`Self::properties`]. Unsupported optional queries remain `None`.
 #[derive(Clone, Debug, Serialize, PartialEq)]
 pub struct CompilationAnalysis {
+    /// Estimated floating-point operation count from the plugin cost analysis, when available.
     pub floating_point_operations: Option<f64>,
+
+    /// Estimated transcendental operation count from the plugin cost analysis, when available.
     pub transcendental_operations: Option<f64>,
+
+    /// Estimated number of bytes accessed according to the plugin cost analysis, when available.
     pub bytes_accessed: Option<f64>,
+
+    /// Executable memory statistics, when supported by the plugin.
     pub memory: Option<MemoryAnalysis>,
+
+    /// Size of generated executable code in bytes, when supported by the plugin.
     pub generated_code_size_in_bytes: Option<usize>,
+
+    /// Number of executable replicas, when supported by the plugin.
     pub replica_count: Option<usize>,
+
+    /// Number of executable computation partitions, when supported by the plugin.
     pub partition_count: Option<usize>,
+
+    /// Plugin-provided executable fingerprint, when supported.
     pub executable_fingerprint: Option<String>,
+
+    /// Wall-clock duration of the PJRT compilation request, retained across persistent transport when present.
     pub compilation_duration: Option<Duration>,
+
+    /// All plugin-specific cost-analysis properties, including those normalized into the fields above.
     pub properties: BTreeMap<String, AnalysisValue>,
 }
 
@@ -101,6 +170,7 @@ impl Display for CompilationAnalysis {
 pub struct OptimizedProgram {
     /// PJRT program format (`mlir`, `hlo`, or `hlo_with_config`).
     pub format: &'static str,
+
     /// Backend-owned optimized program bytes.
     pub bytes: Vec<u8>,
 }
@@ -110,71 +180,66 @@ impl<'c> AnalyzableCompilationDomain for Domain<'c> {
 
     fn analyze<Input: Parameterized<ArrayIrType>, Output: Parameterized<ArrayIrType>>(
         &self,
-        executable: &ryft_core::compilation::ExecutableFunction<Self, Input, Output>,
+        executable: &ExecutableFunction<Self, Input, Output>,
     ) -> Result<Self::Analysis, Self::Error> {
         let program = executable.compiled_program();
-        program.analysis.get_or_init(|| analyze_program(program)).clone()
+        program.analysis.get_or_init(|| program.analyze()).clone()
     }
-}
-pub(super) fn analyze_program(program: &CompiledProgram<'_>) -> Result<CompilationAnalysis, Error> {
-    let executable = program.executable.executable()?;
-    let properties = match executable.cost_analysis() {
-        Ok(properties) => properties
-            .iter()
-            .map(|(name, value)| (name.clone(), AnalysisValue::from(value)))
-            .collect::<BTreeMap<_, _>>(),
-        Err(ryft_pjrt::Error::Unimplemented { .. } | ryft_pjrt::Error::Unavailable { .. }) => BTreeMap::new(),
-        Err(error) => return Err(error.into()),
-    };
-    let memory = match executable.memory_statistics() {
-        Ok(statistics) => Some(MemoryAnalysis {
-            device_generated_code_size_in_bytes: statistics.device_generated_code_size_in_bytes,
-            device_input_size_in_bytes: statistics.device_input_size_in_bytes,
-            device_output_size_in_bytes: statistics.device_output_size_in_bytes,
-            device_alias_size_in_bytes: statistics.device_alias_size_in_bytes,
-            device_temporary_size_in_bytes: statistics.device_temporary_size_in_bytes,
-            device_peak_memory_in_bytes: statistics.device_peak_memory_in_bytes,
-            device_total_memory_in_bytes: statistics.device_total_memory_in_bytes,
-            device_total_allocation_bytes: statistics.device_total_allocation_bytes,
-            device_indefinite_allocations: statistics.device_indefinite_allocations,
-            device_peak_unpadded_heap_bytes: statistics.device_peak_unpadded_heap_bytes,
-            host_generated_code_size_in_bytes: statistics.host_generated_code_size_in_bytes,
-            host_input_size_in_bytes: statistics.host_input_size_in_bytes,
-            host_output_size_in_bytes: statistics.host_output_size_in_bytes,
-            host_alias_size_in_bytes: statistics.host_alias_size_in_bytes,
-            host_temporary_size_in_bytes: statistics.host_temporary_size_in_bytes,
-        }),
-        Err(ryft_pjrt::Error::Unimplemented { .. } | ryft_pjrt::Error::Unavailable { .. }) => None,
-        Err(error) => return Err(error.into()),
-    };
-    Ok(CompilationAnalysis {
-        floating_point_operations: numeric_analysis_property(&properties, &["flops", "floating_point_operations"])?,
-        transcendental_operations: numeric_analysis_property(
-            &properties,
-            &["transcendentals", "transcendental_operations"],
-        )?,
-        bytes_accessed: numeric_analysis_property(&properties, &["bytes accessed", "bytes_accessed"])?,
-        memory,
-        generated_code_size_in_bytes: optional_pjrt_analysis(executable.generated_code_size_in_bytes())?,
-        replica_count: optional_pjrt_analysis(executable.replica_count())?,
-        partition_count: optional_pjrt_analysis(executable.computation_count())?,
-        executable_fingerprint: optional_pjrt_analysis(executable.fingerprint().map(|value| value.into_owned()))?,
-        compilation_duration: program.compilation_duration,
-        properties,
-    })
 }
 
-impl From<&PjrtValue> for AnalysisValue {
-    fn from(value: &PjrtValue) -> Self {
-        match value {
-            PjrtValue::Bool(value) => Self::Boolean(*value),
-            PjrtValue::I64(value) => Self::Integer(*value),
-            PjrtValue::I64List(value) => Self::IntegerList(value.clone()),
-            PjrtValue::F32(value) => Self::Float(*value as f64),
-            PjrtValue::String(value) => Self::String(value.clone()),
-        }
+impl CompiledProgram<'_> {
+    /// Queries PJRT analysis without updating the shared analysis cache.
+    pub(super) fn analyze(&self) -> Result<CompilationAnalysis, Error> {
+        let executable = self.executable.executable()?;
+        let properties = match executable.cost_analysis() {
+            Ok(properties) => properties
+                .iter()
+                .map(|(name, value)| (name.clone(), AnalysisValue::from(value)))
+                .collect::<BTreeMap<_, _>>(),
+            Err(ryft_pjrt::Error::Unimplemented { .. } | ryft_pjrt::Error::Unavailable { .. }) => BTreeMap::new(),
+            Err(error) => return Err(error.into()),
+        };
+        let memory = match executable.memory_statistics() {
+            Ok(statistics) => Some(MemoryAnalysis {
+                device_generated_code_size_in_bytes: statistics.device_generated_code_size_in_bytes,
+                device_input_size_in_bytes: statistics.device_input_size_in_bytes,
+                device_output_size_in_bytes: statistics.device_output_size_in_bytes,
+                device_alias_size_in_bytes: statistics.device_alias_size_in_bytes,
+                device_temporary_size_in_bytes: statistics.device_temporary_size_in_bytes,
+                device_peak_memory_in_bytes: statistics.device_peak_memory_in_bytes,
+                device_total_memory_in_bytes: statistics.device_total_memory_in_bytes,
+                device_total_allocation_bytes: statistics.device_total_allocation_bytes,
+                device_indefinite_allocations: statistics.device_indefinite_allocations,
+                device_peak_unpadded_heap_bytes: statistics.device_peak_unpadded_heap_bytes,
+                host_generated_code_size_in_bytes: statistics.host_generated_code_size_in_bytes,
+                host_input_size_in_bytes: statistics.host_input_size_in_bytes,
+                host_output_size_in_bytes: statistics.host_output_size_in_bytes,
+                host_alias_size_in_bytes: statistics.host_alias_size_in_bytes,
+                host_temporary_size_in_bytes: statistics.host_temporary_size_in_bytes,
+            }),
+            Err(ryft_pjrt::Error::Unimplemented { .. } | ryft_pjrt::Error::Unavailable { .. }) => None,
+            Err(error) => return Err(error.into()),
+        };
+        Ok(CompilationAnalysis {
+            floating_point_operations: numeric_analysis_property(&properties, &["flops", "floating_point_operations"])?,
+            transcendental_operations: numeric_analysis_property(
+                &properties,
+                &["transcendentals", "transcendental_operations"],
+            )?,
+            bytes_accessed: numeric_analysis_property(&properties, &["bytes accessed", "bytes_accessed"])?,
+            memory,
+            generated_code_size_in_bytes: optional_pjrt_analysis(executable.generated_code_size_in_bytes())?,
+            replica_count: optional_pjrt_analysis(executable.replica_count())?,
+            partition_count: optional_pjrt_analysis(executable.computation_count())?,
+            executable_fingerprint: optional_pjrt_analysis(executable.fingerprint().map(|value| value.into_owned()))?,
+            compilation_duration: self.compilation_duration,
+            properties,
+        })
     }
 }
+
+/// Returns the first named numeric cost property, or `None` if every name is absent. A present property of another type
+/// is invalid analysis data.
 fn numeric_analysis_property(
     properties: &BTreeMap<String, AnalysisValue>,
     names: &[&str],
@@ -190,6 +255,8 @@ fn numeric_analysis_property(
         })),
     }
 }
+
+/// Maps unsupported or unavailable PJRT queries to `None`, preserving other backend errors.
 fn optional_pjrt_analysis<T>(result: Result<T, ryft_pjrt::Error>) -> Result<Option<T>, Error> {
     match result {
         Ok(value) => Ok(Some(value)),

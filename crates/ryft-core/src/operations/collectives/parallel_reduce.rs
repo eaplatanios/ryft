@@ -1088,7 +1088,20 @@ mod tests {
             ],
         );
 
-        for kind in [ReductionKind::Product, ReductionKind::LogSumExp, ReductionKind::Max, ReductionKind::Min] {
+        for kind in [ReductionKind::Max, ReductionKind::Min] {
+            check_operation_type_inference!(
+                operation = ParallelReduceOperation::new(kind, "i".to_string()),
+                cases = [{
+                    input_types = [unreduced_float.clone()],
+                    error = format!(
+                        "`parallel_reduce` with kind `{kind}` supports only unreduced inputs of kind `{kind}` \
+                         but got kind `sum`",
+                    ),
+                }],
+            );
+        }
+
+        for kind in [ReductionKind::Product, ReductionKind::LogSumExp] {
             check_operation_type_inference!(
                 operation = ParallelReduceOperation::new(kind, "i".to_string()),
                 cases = [{
@@ -1294,7 +1307,8 @@ mod tests {
                         .with_sharding(unreduced.with_varying_manual_axes(["m"]).unwrap())
                         .unwrap(),
                 ],
-                error = "`parallel_reduce` with kind `max` cannot reduce inputs with unreduced axes",
+                error = "`parallel_reduce` with kind `max` supports only unreduced inputs of kind `max` \
+                         but got kind `sum`",
             }],
         );
 

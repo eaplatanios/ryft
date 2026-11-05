@@ -12,7 +12,13 @@ use crate::operations::constants::constant::ConstantOperation;
 use crate::operations::control_flow::select::Select;
 use crate::operations::manipulation::memory::TransferToMemory;
 use crate::operations::reductions::ReductionKind;
-use crate::programs::{ProgramError, Value, ValueDomainDispatch};
+use crate::programs::{ProgramError, TypeError, Value, ValueDomainDispatch};
+
+/// Name of [`ParallelArgExtrema::parallel_argmax`] in diagnostics.
+const PARALLEL_ARGMAX_NAME: &str = "parallel_argmax";
+
+/// Name of [`ParallelArgExtrema::parallel_argmin`] in diagnostics.
+const PARALLEL_ARGMIN_NAME: &str = "parallel_argmin";
 
 /// Represents the ability to find, for every element, the position along a named axis of the participant that holds
 /// its maximum or minimum. Every participant (i.e., every batch item of a named `batch` level or every device shard of
@@ -72,9 +78,10 @@ pub trait ParallelArgExtrema<T = <Self as Capability>::Universe>: Capability + S
     ///
     /// # Errors
     ///
-    /// Returns a [`ProgramError`] if `axis_name` is unbound, if the mesh or reduction state is incompatible with the
-    /// composition, or if [`ReductionKind::Max`] does not support this value's data type. Delegated operations may
-    /// also reject an unsupported execution or transformation context.
+    /// Returns a [`ProgramError`] if `axis_name` is unbound, if this value is unreduced along any mesh axis, if the
+    /// mesh or reduction state is otherwise incompatible with the composition, or if [`ReductionKind::Max`] does not
+    /// support this value's data type. Delegated operations may also reject an unsupported execution or transformation
+    /// context.
     fn parallel_argmax(&self, axis_name: &str) -> Result<Self, ProgramError>;
 
     /// Returns, for every element, the lowest position along the named axis `axis_name` of a participant whose value
@@ -86,9 +93,10 @@ pub trait ParallelArgExtrema<T = <Self as Capability>::Universe>: Capability + S
     ///
     /// # Errors
     ///
-    /// Returns a [`ProgramError`] if `axis_name` is unbound, if the mesh or reduction state is incompatible with the
-    /// composition, or if [`ReductionKind::Min`] does not support this value's data type. Delegated operations may
-    /// also reject an unsupported execution or transformation context.
+    /// Returns a [`ProgramError`] if `axis_name` is unbound, if this value is unreduced along any mesh axis, if the
+    /// mesh or reduction state is otherwise incompatible with the composition, or if [`ReductionKind::Min`] does not
+    /// support this value's data type. Delegated operations may also reject an unsupported execution or transformation
+    /// context.
     fn parallel_argmin(&self, axis_name: &str) -> Result<Self, ProgramError>;
 }
 
@@ -120,16 +128,17 @@ impl<
 {
     #[inline]
     fn parallel_argmax(&self, axis_name: &str) -> Result<Self, ProgramError> {
-        parallel_arg_extremum(self, axis_name, ReductionKind::Max)
+        parallel_arg_extremum(self, PARALLEL_ARGMAX_NAME, axis_name, ReductionKind::Max)
     }
 
     #[inline]
     fn parallel_argmin(&self, axis_name: &str) -> Result<Self, ProgramError> {
-        parallel_arg_extremum(self, axis_name, ReductionKind::Min)
+        parallel_arg_extremum(self, PARALLEL_ARGMIN_NAME, axis_name, ReductionKind::Min)
     }
 }
 
-/// Returns the lowest position along `axis_name` of a participant attaining the `kind` extremum of `value`.
+/// Returns the lowest position along `axis_name` of a participant attaining the `kind` extremum of `value`, naming
+/// the capability function `name` in diagnostics.
 fn parallel_arg_extremum<
     V: Value<
             Dispatch = ValueDomainDispatch,
@@ -141,9 +150,17 @@ fn parallel_arg_extremum<
         + TransferToMemory,
 >(
     value: &V,
+    name: &str,
     axis_name: &str,
     kind: ReductionKind,
 ) -> Result<V, ProgramError> {
+    // Every participant compares its own value with the extremum, but no participant holds the logical value of an
+    // unreduced input (e.g., a maximum completes a pending maximum, yet a device holds only its own candidate), so
+    // such an input is rejected here rather than by the comparison that would fail later.
+    if !value.r#type().unreduced_axes().is_empty() {
+        return Err(TypeError::invalid(format!("`{name}` does not support unreduced inputs")).into());
+    }
+
     let context = value.domain();
     let extremum = value.parallel_reduce(kind, axis_name)?;
     let attains_extremum = extremum.equal(value)?;
@@ -174,7 +191,6 @@ mod tests {
     use crate::contexts::EagerContext;
     use crate::differentiation::DifferentiationError;
     use crate::operations::collectives::parallel_reduce::PARALLEL_REDUCE_OPERATION_NAME;
-    use crate::operations::comparisons::COMPARE_OPERATION_NAME;
     use crate::partial::{PartialEvaluationInput, PartialEvaluationOutput, PartialValue};
     use crate::programs::TypeError;
     use crate::tracing::TracingContext;
@@ -468,13 +484,25 @@ mod tests {
                     .unwrap(),
             )
             .unwrap();
-        // Completing the maximum is insufficient because comparing it with a local partial value is invalid.
+
+        // No participant holds the logical value of an unreduced input, of any kind, to compare with the extremum.
         assert!(matches!(
             TracingContext::<Array, ArrayOperation<Array>>::trace_with_named_axes(
-                |input| input.parallel_argmax("x"), unreduced, axes,
+                |input| input.parallel_argmax("x"), unreduced.clone(), axes.clone(),
             ),
             Err(ProgramError::Type(TypeError::Invalid { message }))
-                if message == format!("`{COMPARE_OPERATION_NAME}` does not support unreduced inputs"),
+                if message == format!("`{PARALLEL_ARGMAX_NAME}` does not support unreduced inputs"),
+        ));
+        let unreduced_sum = unreduced
+            .clone()
+            .with_sharding(unreduced.sharding().unwrap().clone().with_unreduced_kind(UnreducedKind::Sum).unwrap())
+            .unwrap();
+        assert!(matches!(
+            TracingContext::<Array, ArrayOperation<Array>>::trace_with_named_axes(
+                |input| input.parallel_argmin("x"), unreduced_sum, axes,
+            ),
+            Err(ProgramError::Type(TypeError::Invalid { message }))
+                if message == format!("`{PARALLEL_ARGMIN_NAME}` does not support unreduced inputs"),
         ));
     }
 
