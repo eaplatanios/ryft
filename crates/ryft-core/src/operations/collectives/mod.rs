@@ -137,7 +137,7 @@
 //!     program.transpose_with_respect_to(&[0], &[])?.to_string(),
 //!     indoc! {"
 //!         lambda %0:f32[4] .
-//!         let %1:f32[2] = parallel_sum_scatter [axis_name=\"rows\", axis_size=2, scatter_axis=0, options=Tiled] %0
+//!         let %1:f32[2] = parallel_sum_scatter [axes=\"rows\", axis_size=2, scatter_axis=0, options=Tiled] %0
 //!         in (%1)"},
 //! );
 //! # Ok(())
@@ -2841,7 +2841,7 @@ mod tests {
                 indoc! {"
                     lambda %0:dimension<5>, %1:f32[2, 3], %2:dimension<2>, %3:dimension<2>, %4:dimension<3> .
                     let %5:f32[2, 2, 3] = parallel_all_gather [
-                        axis_name=\"inner\",
+                        axes=\"inner\",
                         axis_size=2,
                         concatenation_axis=0,
                         options=Untiled,
@@ -2864,7 +2864,7 @@ mod tests {
                 indoc! {"
                     lambda %0:dimension<5>, %1:f32[2, 5, 3], %2:dimension<2>, %3:dimension<2>, %4:dimension<3> .
                     let %5:f32[2, 2, 5, 3] = parallel_all_gather [
-                        axis_name=\"inner\",
+                        axes=\"inner\",
                         axis_size=2,
                         concatenation_axis=0,
                         options=Untiled,
@@ -2885,7 +2885,7 @@ mod tests {
                 indoc! {"
                     lambda %0:dimension<5>, %1:f32[2, 3], %2:dimension<3> .
                     let %3:f32[3] = parallel_sum_scatter [\
-                            axis_name=\"inner\", \
+                            axes=\"inner\", \
                             axis_size=2, \
                             scatter_axis=0, \
                             options=Untiled\
@@ -2906,7 +2906,7 @@ mod tests {
                 indoc! {"
                     lambda %0:dimension<5>, %1:f32[2, 5, 3], %2:dimension<3> .
                     let %3:f32[5, 3] = parallel_sum_scatter [\
-                            axis_name=\"inner\", \
+                            axes=\"inner\", \
                             axis_size=2, \
                             scatter_axis=0, \
                             options=Untiled\
@@ -2925,13 +2925,8 @@ mod tests {
                 ArrayIrType::Array(ArrayType::new_static(DataType::F32, [3, 2])),
                 indoc! {"
                     lambda %0:dimension<5>, %1:f32[2, 3], %2:dimension<3>, %3:dimension<2> .
-                    let %4:f32[3, 2] = parallel_all_to_all [
-                        axis_name=\"inner\",
-                        axis_size=2,
-                        split_axis=0,
-                        concatenation_axis=1,
-                        options=Untiled,
-                    ] %1 %2 %3
+                    let %4:f32[3, 2] = parallel_all_to_all \
+                        [axes=\"inner\", axis_size=2, split_axis=0, concatenation_axis=1, options=Untiled] %1 %2 %3
                     in (%4)"
                 }
                 .to_string(),
@@ -2947,13 +2942,8 @@ mod tests {
                 ArrayIrType::Array(ArrayType::new_static(DataType::F32, [5, 3, 2])),
                 indoc! {"
                     lambda %0:dimension<5>, %1:f32[2, 5, 3], %2:dimension<3>, %3:dimension<2> .
-                    let %4:f32[5, 3, 2] = parallel_all_to_all [
-                        axis_name=\"inner\",
-                        axis_size=2,
-                        split_axis=0,
-                        concatenation_axis=2,
-                        options=Untiled,
-                    ] %1 %0 %2 %3
+                    let %4:f32[5, 3, 2] = parallel_all_to_all \
+                        [axes=\"inner\", axis_size=2, split_axis=0, concatenation_axis=2, options=Untiled] %1 %0 %2 %3
                     in (%4)"
                 }
                 .to_string(),
@@ -3017,7 +3007,7 @@ mod tests {
             permute.to_string(),
             indoc! {"
                 parallel_permute [
-                    axis_name=(\"x\", \"y\"),
+                    axes=(\"x\", \"y\"),
                     axis_size=4,
                     source_target_pairs=[(0, 1), (1, 0)],
                     mesh=['x'=2:manual, 'y'=2:manual],
@@ -3116,7 +3106,7 @@ mod tests {
                         parallel_vary [axis_name=\"x\"] %1
                     %3:f32[2][sharding={mesh<['x'=2:manual, 'y'=2:manual]>, [{}], varying_manual={'x', 'y'}}] = \
                     parallel_sum_scatter [
-                        axis_name=(\"y\", \"x\"),
+                        axes=(\"y\", \"x\"),
                         axis_size=4,
                         scatter_axis=0,
                         options=Tiled,
@@ -3131,7 +3121,7 @@ mod tests {
                 lambda %0:f32[2][sharding={mesh<['x'=2:manual, 'y'=2:manual]>, [{}], varying_manual={'x', 'y'}}] .
                 let %1:f32[8][sharding={mesh<['x'=2:manual, 'y'=2:manual]>, [{}], varying_manual={'x', 'y'}}] = \
                     parallel_all_gather [
-                    axis_name=(\"y\", \"x\"),
+                    axes=(\"y\", \"x\"),
                     axis_size=4,
                     concatenation_axis=0,
                     options=Tiled,
@@ -3158,7 +3148,7 @@ mod tests {
             indoc! {"
                 lambda %0:f32[2][sharding={mesh<['x'=2:manual, 'y'=2:manual]>, [{}]}] .
                 let %1:f32[2][sharding={mesh<['x'=2:manual, 'y'=2:manual]>, [{}]}] = \
-                        parallel_permute [axis_name=(\"x\", \"y\"), axis_size=4, source_target_pairs=[(0, 3)]] %0
+                        parallel_permute [axes=(\"x\", \"y\"), axis_size=4, source_target_pairs=[(0, 3)]] %0
                 in (%1)"
             },
         );

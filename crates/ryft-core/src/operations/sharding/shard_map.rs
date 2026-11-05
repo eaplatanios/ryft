@@ -9663,7 +9663,7 @@ mod tests {
                     body={{
                         lambda %0:{local_input} .
                         let %1:{global_output} = parallel_all_gather [
-                            axis_name=\"x\",
+                            axes=\"x\",
                             axis_size=2,
                             concatenation_axis=0,
                             options=Tiled,

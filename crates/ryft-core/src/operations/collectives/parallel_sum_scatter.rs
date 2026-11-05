@@ -335,7 +335,7 @@ impl Operation for ParallelSumScatterOperation {
 
     fn render(&self, formatter: &mut std::fmt::Formatter<'_>, indentation: usize) -> std::fmt::Result {
         OperationFormatter::new(formatter, indentation, PARALLEL_SUM_SCATTER_OPERATION_NAME)?.bracketed(|operation| {
-            operation.field("axis_name", format_args!("{:?}", self.axes))?;
+            operation.field("axes", format_args!("{:?}", self.axes))?;
             operation.field("axis_size", self.axis_size)?;
             operation.field("scatter_axis", format_args!("{:?}", &self.scatter_axis))?;
             operation.field("options", format_args!("{:?}", self.options.mode()))?;
@@ -1162,7 +1162,7 @@ mod tests {
         assert_eq!(operation.effective_axis_size(), Ok(4));
         assert_eq!(
             operation.to_string(),
-            "parallel_sum_scatter [axis_name=\"x\", axis_size=4, scatter_axis=1, options=Tiled]",
+            "parallel_sum_scatter [axes=\"x\", axis_size=4, scatter_axis=1, options=Tiled]",
         );
 
         // Participant groups restrict the effective axis size to the size of one group.
@@ -1185,7 +1185,7 @@ mod tests {
             mesh_operation.to_string(),
             indoc! {"
                 parallel_sum_scatter [
-                    axis_name=\"x\",
+                    axes=\"x\",
                     axis_size=2,
                     scatter_axis=0,
                     options=Tiled,
@@ -1646,7 +1646,7 @@ mod tests {
             program.to_string(),
             indoc! {"
                 lambda %0:f32[1, 2] .
-                let %1:f32[1, 1] = parallel_sum_scatter [axis_name=\"x\", axis_size=2, scatter_axis=1, options=Tiled] %0
+                let %1:f32[1, 1] = parallel_sum_scatter [axes=\"x\", axis_size=2, scatter_axis=1, options=Tiled] %0
                 in (%1)"
             },
         );
@@ -1664,7 +1664,7 @@ mod tests {
             evaluation.program().to_string(),
             indoc! {"
                 lambda %0:f32[1, 2] .
-                let %1:f32[1, 1] = parallel_sum_scatter [axis_name=\"x\", axis_size=2, scatter_axis=1, options=Tiled] %0
+                let %1:f32[1, 1] = parallel_sum_scatter [axes=\"x\", axis_size=2, scatter_axis=1, options=Tiled] %0
                 in (%1)"
             },
         );
@@ -1769,7 +1769,7 @@ mod tests {
             program.to_string(),
             indoc! {"
                 lambda %0:f32[3, 4] .
-                let %1:f32[3, 2] = parallel_sum_scatter [axis_name=\"x\", axis_size=2, scatter_axis=1, options=Tiled] %0
+                let %1:f32[3, 2] = parallel_sum_scatter [axes=\"x\", axis_size=2, scatter_axis=1, options=Tiled] %0
                 in (%1)"
             },
         );
@@ -1798,7 +1798,7 @@ mod tests {
             program.to_string(),
             indoc! {"
                 lambda %0:f32[2, 3] .
-                let %1:f32[3] = parallel_sum_scatter [axis_name=\"x\", axis_size=2, scatter_axis=0, options=Untiled] %0
+                let %1:f32[3] = parallel_sum_scatter [axes=\"x\", axis_size=2, scatter_axis=0, options=Untiled] %0
                 in (%1)"
             },
         );
@@ -1998,8 +1998,8 @@ mod tests {
             collective_program(operation, ArrayType::new_static(DataType::F32, [4])).jvp().unwrap().to_string(),
             indoc! {"
                 lambda %0:f32[4], %1:f32[4] .
-                let %2:f32[2] = parallel_sum_scatter [axis_name=\"x\", axis_size=2, scatter_axis=0, options=Tiled] %0
-                    %3:f32[2] = parallel_sum_scatter [axis_name=\"x\", axis_size=2, scatter_axis=0, options=Tiled] %1
+                let %2:f32[2] = parallel_sum_scatter [axes=\"x\", axis_size=2, scatter_axis=0, options=Tiled] %0
+                    %3:f32[2] = parallel_sum_scatter [axes=\"x\", axis_size=2, scatter_axis=0, options=Tiled] %1
                 in (%2, %3)"
             },
         );
@@ -2036,7 +2036,7 @@ mod tests {
             linearization.primal().to_string(),
             indoc! {"
                 lambda %0:f32[extent], %1:dimension<extent ∈ [1, 9)> .
-                let %2:f32[extent] = parallel_sum_scatter [axis_name=\"x\", axis_size=1, scatter_axis=0, \
+                let %2:f32[extent] = parallel_sum_scatter [axes=\"x\", axis_size=1, scatter_axis=0, \
                     options=Tiled] %0 %1
                 in (%2, %1)"
             },
@@ -2049,13 +2049,13 @@ mod tests {
                     forward={
                         lambda %0:dimension<extent ∈ [1, 9)>, %1:f32[extent] .
                         let %2:f32[extent] = \
-                                parallel_sum_scatter [axis_name=\"x\", axis_size=1, scatter_axis=0, options=Tiled] %1 %0
+                                parallel_sum_scatter [axes=\"x\", axis_size=1, scatter_axis=0, options=Tiled] %1 %0
                         in (%2)
                     },
                     transpose={
                         lambda %0:dimension<extent ∈ [1, 9)>, %1:f32[extent] .
                         let %2:f32[extent] = parallel_all_gather [
-                            axis_name=\"x\",
+                            axes=\"x\",
                             axis_size=1,
                             concatenation_axis=0,
                             options=Tiled,
@@ -2075,7 +2075,7 @@ mod tests {
                     forward={
                         lambda %0:dimension<extent ∈ [1, 9)>, %1:f32[extent] .
                         let %2:f32[extent] = parallel_all_gather [
-                            axis_name=\"x\",
+                            axes=\"x\",
                             axis_size=1,
                             concatenation_axis=0,
                             options=Tiled,
@@ -2086,7 +2086,7 @@ mod tests {
                     transpose={
                         lambda %0:dimension<extent ∈ [1, 9)>, %1:f32[extent] .
                         let %2:f32[extent] = \
-                                parallel_sum_scatter [axis_name=\"x\", axis_size=1, scatter_axis=0, options=Tiled] %1 %0
+                                parallel_sum_scatter [axes=\"x\", axis_size=1, scatter_axis=0, options=Tiled] %1 %0
                         in (%2)
                     },
                 ]
@@ -2232,7 +2232,7 @@ mod tests {
             indoc! {"
                 lambda %0:f32[4] .
                 let %1:f32[8] = parallel_all_gather [
-                    axis_name=\"x\",
+                    axes=\"x\",
                     axis_size=2,
                     concatenation_axis=0,
                     options=Tiled,
@@ -2254,7 +2254,7 @@ mod tests {
             indoc! {"
                 lambda %0:f32[3, 4] .
                 let %1:f32[3, 2, 4] = parallel_all_gather [
-                    axis_name=\"x\",
+                    axes=\"x\",
                     axis_size=2,
                     concatenation_axis=1,
                     options=Untiled,
@@ -2305,7 +2305,7 @@ mod tests {
             indoc! {"
                 lambda %0:f32[3] .
                 let %1:f32[3] = parallel_all_gather [
-                    axis_name=\"x\",
+                    axes=\"x\",
                     axis_size=1,
                     concatenation_axis=0,
                     options=Tiled,
@@ -2331,7 +2331,7 @@ mod tests {
                 lambda %0:f32[4][sharding={mesh<['x'=2:manual, 'y'=2:manual]>, [{}], varying_manual={'x'}}] .
                 let %1:f32[8][sharding={mesh<['x'=2:manual, 'y'=2:manual]>, [{}], varying_manual={'x'}}] = \
                     parallel_all_gather [
-                    axis_name=\"x\",
+                    axes=\"x\",
                     axis_size=2,
                     concatenation_axis=0,
                     options=Tiled,
@@ -2347,7 +2347,7 @@ mod tests {
                 lambda %0:f32[4][sharding={mesh<['x'=2:manual, 'y'=2:manual]>, [{}], varying_manual={'x'}}] .
                 let %1:f32[8][sharding={mesh<['x'=2:manual, 'y'=2:manual]>, [{}], reduced={'x'}}] = \
                     parallel_all_gather [
-                    axis_name=\"x\",
+                    axes=\"x\",
                     axis_size=2,
                     concatenation_axis=0,
                     options=Tiled,
@@ -2364,7 +2364,7 @@ mod tests {
                     varying_manual={'x'}}] .
                 let %1:f32[8][sharding={mesh<['x'=2:manual, 'y'=2:manual]>, [{}], reduced={'x', 'y'}}] = \
                     parallel_all_gather [
-                    axis_name=\"x\",
+                    axes=\"x\",
                     axis_size=2,
                     concatenation_axis=0,
                     options=Tiled,
@@ -2381,7 +2381,7 @@ mod tests {
                     varying_manual={'x'}}] .
                 let %1:f32[8][sharding={mesh<['x'=2:manual, 'y'=2:manual]>, [{}], unreduced={'y'}, reduced={'x'}}] \
                     = parallel_all_gather [
-                    axis_name=\"x\",
+                    axes=\"x\",
                     axis_size=2,
                     concatenation_axis=0,
                     options=Tiled,
@@ -2398,7 +2398,7 @@ mod tests {
                     varying_manual={'x'}}] .
                 let %1:f32[8][sharding={mesh<['x'=2:manual, 'y'=2:manual]>, [{}], reduced={'y'}, \
                     varying_manual={'x'}}] = parallel_all_gather [
-                    axis_name=\"x\",
+                    axes=\"x\",
                     axis_size=2,
                     concatenation_axis=0,
                     options=Tiled,
@@ -2447,7 +2447,7 @@ mod tests {
                 lambda %0:f32[2][sharding={mesh<['x'=2:manual, 'y'=2:manual]>, [{}], varying_manual={'x', 'y'}}] .
                 let %1:f32[4][sharding={mesh<['x'=2:manual, 'y'=2:manual]>, [{}], reduced={'y'}, \
                     varying_manual={'x'}}] = parallel_all_gather [
-                    axis_name=\"y\",
+                    axes=\"y\",
                     axis_size=2,
                     concatenation_axis=0,
                     options=Tiled,
@@ -2456,7 +2456,7 @@ mod tests {
                 ] %0
                     %2:f32[8][sharding={mesh<['x'=2:manual, 'y'=2:manual]>, [{}], reduced={'x', 'y'}}] = \
                         parallel_all_gather [
-                        axis_name=\"x\",
+                        axes=\"x\",
                         axis_size=2,
                         concatenation_axis=0,
                         options=Tiled,
@@ -2488,7 +2488,7 @@ mod tests {
                 let %1:dimension<2> = const 2
                     %2:f32[4][sharding={mesh<['x'=2:manual, 'y'=2:manual]>, [{}], reduced={'y'}, \
                         varying_manual={'x'}}] = parallel_all_gather [
-                        axis_name=\"y\",
+                        axes=\"y\",
                         axis_size=2,
                         concatenation_axis=0,
                         options=Tiled,
@@ -2498,7 +2498,7 @@ mod tests {
                     %3:dimension<4> = const 4
                     %4:f32[8][sharding={mesh<['x'=2:manual, 'y'=2:manual]>, [{}], reduced={'x', 'y'}}] = \
                         parallel_all_gather [
-                        axis_name=\"x\",
+                        axes=\"x\",
                         axis_size=2,
                         concatenation_axis=0,
                         options=Tiled,
@@ -2594,7 +2594,7 @@ mod tests {
                 lambda %0:f32[2, 3] .
                 let %1:dimension<3> = constant [value=3]
                     %2:f32[3] = parallel_sum_scatter [
-                        axis_name=\"x\",
+                        axes=\"x\",
                         axis_size=4,
                         scatter_axis=0,
                         options=Untiled,
@@ -2730,7 +2730,7 @@ mod tests {
                 lambda %0:f32[4][sharding={mesh<['x'=2:manual, 'y'=1:manual]>, [{}], varying_manual={'x'}}] .
                 let %1:f32[2][sharding={mesh<['x'=2:manual, 'y'=1:manual]>, [{}], varying_manual={'x'}}] = \
                     parallel_sum_scatter [
-                    axis_name=\"x\",
+                    axes=\"x\",
                     axis_size=2,
                     scatter_axis=0,
                     options=Tiled,
@@ -2759,7 +2759,7 @@ mod tests {
                     parallel_vary [axis_name=\"x\"] %0
                     %2:f32[2][sharding={mesh<['x'=2:manual, 'y'=1:manual]>, [{}], varying_manual={'x'}}] = \
                         parallel_sum_scatter [
-                        axis_name=\"x\",
+                        axes=\"x\",
                         axis_size=2,
                         scatter_axis=0,
                         options=Tiled,
@@ -2785,7 +2785,7 @@ mod tests {
                 lambda %0:f32[4][sharding={mesh<['x'=2:manual, 'y'=1:manual]>, [{}], unreduced={'x'}}] .
                 let %1:f32[2][sharding={mesh<['x'=2:manual, 'y'=1:manual]>, [{}], varying_manual={'x'}}] = \
                     parallel_sum_scatter [
-                    axis_name=\"x\",
+                    axes=\"x\",
                     axis_size=2,
                     scatter_axis=0,
                     options=Tiled,
@@ -2824,7 +2824,7 @@ mod tests {
                     %3:dimension<2> = dimension_div %1 %2
                     %4:f32[2][sharding={mesh<['x'=2:manual, 'y'=1:manual]>, [{}], varying_manual={'x'}}] = \
                         parallel_sum_scatter [
-                        axis_name=\"x\",
+                        axes=\"x\",
                         axis_size=2,
                         scatter_axis=0,
                         options=Tiled,
@@ -2856,7 +2856,7 @@ mod tests {
                     %4:dimension<2> = dimension_div %2 %3
                     %5:f32[2][sharding={mesh<['x'=2:manual, 'y'=1:manual]>, [{}], varying_manual={'x'}}] = \
                         parallel_sum_scatter [
-                        axis_name=\"x\",
+                        axes=\"x\",
                         axis_size=2,
                         scatter_axis=0,
                         options=Tiled,
@@ -2887,7 +2887,7 @@ mod tests {
                     %3:dimension<2> = dimension_div %1 %2
                     %4:f32[2][sharding={mesh<['x'=2:manual, 'y'=1:manual]>, [{}], varying_manual={'x'}}] = \
                         parallel_sum_scatter [
-                        axis_name=\"x\",
+                        axes=\"x\",
                         axis_size=2,
                         scatter_axis=0,
                         options=Tiled,
@@ -2935,7 +2935,7 @@ mod tests {
                     %8:dimension<items / 2 ∈ [0, 3)> = dimension_div %3 %4
                     %9:f32[items / 2][sharding={mesh<['x'=2:manual, 'y'=1:manual]>, [{}], varying_manual={'x'}}] = \
                         parallel_sum_scatter [
-                        axis_name=\"x\",
+                        axes=\"x\",
                         axis_size=2,
                         scatter_axis=0,
                         options=Tiled,
@@ -3019,7 +3019,7 @@ mod tests {
                     ] %3 %1 %2
                     %4:dimension<3> = constant [value=3]
                     %5:f32[3] = parallel_sum_scatter [
-                        axis_name=\"x\",
+                        axes=\"x\",
                         axis_size=4,
                         scatter_axis=0,
                         options=Untiled,
@@ -3074,7 +3074,7 @@ mod tests {
                     ] %6 %1 %3
                     %7:dimension<length / 2 ∈ [0, 5)> = dimension_div %1 %3
                     %8:f32[length / 2, 3] = parallel_sum_scatter [
-                        axis_name=\"x\",
+                        axes=\"x\",
                         axis_size=4,
                         scatter_axis=0,
                         options=Tiled,
@@ -3113,7 +3113,7 @@ mod tests {
                 let %1:dimension<4> = constant [value=4]
                     %2:dimension<2> = constant [value=2]
                     %3:dimension<2> = dimension_div %1 %2
-                    %4:f32[2] = parallel_sum_scatter [axis_name=\"x\", axis_size=2, scatter_axis=0, options=Tiled] %0 %3
+                    %4:f32[2] = parallel_sum_scatter [axes=\"x\", axis_size=2, scatter_axis=0, options=Tiled] %0 %3
                 in (%4)"
             },
         );

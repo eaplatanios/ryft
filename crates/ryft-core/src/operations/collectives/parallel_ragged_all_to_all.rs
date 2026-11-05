@@ -4241,7 +4241,7 @@ mod tests {
                     %3:i32[4] = const [0, 2, 1, 3]
                     %4:i32[4] = const [1, 0, 1, 1]
                     %5:i32[4] = parallel_all_to_all [
-                        axis_name=\"x\",
+                        axes=\"x\",
                         axis_size=4,
                         split_axis=0,
                         concatenation_axis=0,
@@ -4249,7 +4249,7 @@ mod tests {
                         axis_index_groups=[[0, 2], [3, 1]],
                     ] %3 ; provenance=ryft::differentiation::parallel_ragged_all_to_all_transpose
                     %6:i32[4] = parallel_all_to_all [
-                        axis_name=\"x\",
+                        axes=\"x\",
                         axis_size=4,
                         split_axis=0,
                         concatenation_axis=0,
@@ -4312,7 +4312,7 @@ mod tests {
                 let %2:i64[5] = zero [type=i64[5]]
                     %3:i32[4] = const [0, 2, 1, 3]
                     %4:i32[4] = parallel_all_to_all [
-                        axis_name=\"x\",
+                        axes=\"x\",
                         axis_size=4,
                         split_axis=0,
                         concatenation_axis=0,
@@ -4347,7 +4347,7 @@ mod tests {
                     %22:f32[3] = zero [type=f32[3]]
                     %23:i32[4] = const [0, 1, 0, 2]
                     %24:i32[4] = parallel_all_to_all [
-                        axis_name=\"x\",
+                        axes=\"x\",
                         axis_size=4,
                         split_axis=0,
                         concatenation_axis=0,
@@ -4356,7 +4356,7 @@ mod tests {
                     ] %23
                     %25:i32[4] = const [1, 1, 0, 1]
                     %26:i32[4] = parallel_all_to_all [
-                        axis_name=\"x\",
+                        axes=\"x\",
                         axis_size=4,
                         split_axis=0,
                         concatenation_axis=0,
@@ -4364,7 +4364,7 @@ mod tests {
                         axis_index_groups=[[0, 2], [3, 1]],
                     ] %24
                     %27:i32[4] = parallel_all_to_all [
-                        axis_name=\"x\",
+                        axes=\"x\",
                         axis_size=4,
                         split_axis=0,
                         concatenation_axis=0,
@@ -4498,7 +4498,7 @@ mod tests {
                     %4:i32[2][sharding={mesh<['x'=2:manual, 'y'=2:manual]>, [{}], varying_manual={'x'}}] .
                 let %5:i32[2][sharding={mesh<['x'=2:manual, 'y'=2:manual]>, [{}], varying_manual={'x'}}] = \
                     parallel_all_to_all [
-                    axis_name=\"x\",
+                    axes=\"x\",
                     axis_size=2,
                     split_axis=0,
                     concatenation_axis=0,
@@ -4507,7 +4507,7 @@ mod tests {
                 ] %3
                     %6:i32[2][sharding={mesh<['x'=2:manual, 'y'=2:manual]>, [{}], varying_manual={'x'}}] = \
                         parallel_all_to_all [
-                        axis_name=\"x\",
+                        axes=\"x\",
                         axis_size=2,
                         split_axis=0,
                         concatenation_axis=0,
@@ -4594,9 +4594,9 @@ mod tests {
                     %2:i32[1] = const [1]
                     %3:i32[1] = const [0]
                     %4:i32[1] = const [1]
-                    %5:i32[1] = parallel_all_to_all [axis_name=\"x\", axis_size=1, split_axis=0, concatenation_axis=0, \
+                    %5:i32[1] = parallel_all_to_all [axes=\"x\", axis_size=1, split_axis=0, concatenation_axis=0, \
                         options=Tiled] %3
-                    %6:i32[1] = parallel_all_to_all [axis_name=\"x\", axis_size=1, split_axis=0, concatenation_axis=0, \
+                    %6:i32[1] = parallel_all_to_all [axes=\"x\", axis_size=1, split_axis=0, concatenation_axis=0, \
                         options=Tiled] %1
                     %7:f32[3, 2][sharding={mesh<['data'=2:explicit]>, [{'data'}, {}]}] = zero \
                         [type=f32[3, 2][sharding={mesh<['data'=2:explicit]>, [{'data'}, {}]}]]

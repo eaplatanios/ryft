@@ -90,7 +90,8 @@ and this project adheres to [Semantic Versioning](https://semver.org/).
   - **References:** `ReferenceNew`, `ReferenceRead`, `ReferenceWrite`, `ReferenceSwap`, `ReferenceAddUpdate`,
     `ReferenceAtomicAddUpdate`, and `ReferenceFreeze`.
   - **Sharding & Collectives:** `Reshard`, `ConstrainSharding`, `AxisIndex`, `ParallelReduce`, `ParallelVary`,
-    `ParallelAllGather`, `ParallelSumScatter`, `ParallelPermute`, `ParallelAllToAll`, and `ParallelRaggedAllToAll`.
+    `ParallelCast`, `ParallelArgExtrema`, `ParallelAllGather`, `ParallelSumScatter`, `ParallelPermute`,
+    `ParallelAllToAll`, and `ParallelRaggedAllToAll`.
   - **Differentiation:** `StopGradient`, along with operations that support rematerialization and linear calls.
   - **Extensibility & Debugging:** `CustomCall`, `Assert`, `Print`, and `Tag`, along with composite operations that
     are created via `composite` and support custom JVP, VJP, and batching rules.

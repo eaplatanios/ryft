@@ -224,7 +224,7 @@ impl Operation for ParallelPermuteOperation {
 
     fn render(&self, formatter: &mut std::fmt::Formatter<'_>, indentation: usize) -> std::fmt::Result {
         OperationFormatter::new(formatter, indentation, PARALLEL_PERMUTE_OPERATION_NAME)?.bracketed(|operation| {
-            operation.field("axis_name", format_args!("{:?}", self.axes))?;
+            operation.field("axes", format_args!("{:?}", self.axes))?;
             operation.field("axis_size", self.axis_size)?;
             operation.field("source_target_pairs", format_args!("{:?}", &self.source_target_pairs))?;
             if let Some(value) = &self.mesh {
@@ -722,7 +722,7 @@ mod tests {
         assert_eq!(operation.mesh(), None);
         assert_eq!(
             operation.to_string(),
-            "parallel_permute [axis_name=\"x\", axis_size=3, source_target_pairs=[(0, 1), (2, 0)]]",
+            "parallel_permute [axes=\"x\", axis_size=3, source_target_pairs=[(0, 1), (2, 0)]]",
         );
     }
 
@@ -735,7 +735,7 @@ mod tests {
             mesh_permutation.to_string(),
             indoc! {"
                 parallel_permute [
-                    axis_name=\"x\",
+                    axes=\"x\",
                     axis_size=2,
                     source_target_pairs=[(0, 1)],
                     mesh=['x'=2:manual, 'y'=1:manual],
@@ -1022,7 +1022,7 @@ mod tests {
             program.to_string(),
             indoc! {"
                 lambda %0:f32[2] .
-                let %1:f32[2] = parallel_permute [axis_name=\"x\", axis_size=2, source_target_pairs=[(0, 1)]] %0
+                let %1:f32[2] = parallel_permute [axes=\"x\", axis_size=2, source_target_pairs=[(0, 1)]] %0
                 in (%1)"
             },
         );
@@ -1148,7 +1148,7 @@ mod tests {
             indoc! {"
                 lambda %0:f32[2, 3] .
                 let %1:f32[2, 3] = \
-                    parallel_permute [axis_name=\"x\", axis_size=2, source_target_pairs=[(0, 1), (1, 0)]] %0
+                    parallel_permute [axes=\"x\", axis_size=2, source_target_pairs=[(0, 1), (1, 0)]] %0
                 in (%1)"
             },
         );
@@ -1250,8 +1250,8 @@ mod tests {
                 .to_string(),
             indoc! {"
                 lambda %0:f32[2], %1:f32[2] .
-                let %2:f32[2] = parallel_permute [axis_name=\"x\", axis_size=2, source_target_pairs=[(0, 1)]] %0
-                    %3:f32[2] = parallel_permute [axis_name=\"x\", axis_size=2, source_target_pairs=[(0, 1)]] %1
+                let %2:f32[2] = parallel_permute [axes=\"x\", axis_size=2, source_target_pairs=[(0, 1)]] %0
+                    %3:f32[2] = parallel_permute [axes=\"x\", axis_size=2, source_target_pairs=[(0, 1)]] %1
                 in (%2, %3)"
             },
         );
@@ -1281,7 +1281,7 @@ mod tests {
             program.to_string(),
             indoc! {"
                 lambda %0:f32[2] .
-                let %1:f32[2] = parallel_permute [axis_name=\"x\", axis_size=2, source_target_pairs=[(0, 1)]] %0
+                let %1:f32[2] = parallel_permute [axes=\"x\", axis_size=2, source_target_pairs=[(0, 1)]] %0
                 in (%1)"
             },
         );
@@ -1340,7 +1340,7 @@ mod tests {
             transposed.to_string(),
             indoc! {"
                 lambda %0:f32[2] .
-                let %1:f32[2] = parallel_permute [axis_name=\"x\", axis_size=3, source_target_pairs=[(1, 0), (2, 1)]] %0
+                let %1:f32[2] = parallel_permute [axes=\"x\", axis_size=3, source_target_pairs=[(1, 0), (2, 1)]] %0
                 in (%1)"
             },
         );
@@ -1360,7 +1360,7 @@ mod tests {
                 lambda %0:f32[2][sharding={mesh<['x'=2:manual, 'y'=1:manual]>, [{}], varying_manual={'x'}}] .
                 let %1:f32[2][sharding={mesh<['x'=2:manual, 'y'=1:manual]>, [{}], varying_manual={'x'}}] = \
                     parallel_permute [
-                    axis_name=\"x\",
+                    axes=\"x\",
                     axis_size=2,
                     source_target_pairs=[(1, 0)],
                     mesh=['x'=2:manual, 'y'=1:manual],
@@ -1437,7 +1437,7 @@ mod tests {
                 lambda %0:f32[][sharding={mesh<['x'=2:manual, 'y'=1:manual]>, [], varying_manual={'x'}}] .
                 let %1:f32[][sharding={mesh<['x'=2:manual, 'y'=1:manual]>, [], varying_manual={'x'}}] = \
                     parallel_permute [
-                    axis_name=\"x\",
+                    axes=\"x\",
                     axis_size=2,
                     source_target_pairs=[(0, 1)],
                     mesh=['x'=2:manual, 'y'=1:manual],
@@ -1460,7 +1460,7 @@ mod tests {
                         parallel_vary [axis_name=\"x\"] %0
                     %2:f32[][sharding={mesh<['x'=2:manual, 'y'=1:manual]>, [], varying_manual={'x'}}] = \
                         parallel_permute [
-                        axis_name=\"x\",
+                        axes=\"x\",
                         axis_size=2,
                         source_target_pairs=[(0, 1)],
                         mesh=['x'=2:manual, 'y'=1:manual],
@@ -1487,7 +1487,7 @@ mod tests {
                         parallel_vary [axis_name=\"x\"] %1
                     %3:f32[][sharding={mesh<['x'=2:manual, 'y'=1:manual]>, [], varying_manual={'x'}}] = \
                         parallel_permute [
-                        axis_name=\"x\",
+                        axes=\"x\",
                         axis_size=2,
                         source_target_pairs=[(0, 1)],
                         mesh=['x'=2:manual, 'y'=1:manual],
@@ -1561,7 +1561,7 @@ mod tests {
                     %2:f32[4][sharding={mesh<['x'=2:manual, 'y'=2:manual]>, [{}], unreduced={'y'}, \
                         varying_manual={'x'}}] = \
                         parallel_permute [
-                        axis_name=\"x\",
+                        axes=\"x\",
                         axis_size=2,
                         source_target_pairs=[(0, 1), (1, 0)],
                         mesh=['x'=2:manual, 'y'=2:manual],

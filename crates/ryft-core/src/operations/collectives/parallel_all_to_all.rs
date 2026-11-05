@@ -302,7 +302,7 @@ impl Operation for ParallelAllToAllOperation {
 
     fn render(&self, formatter: &mut std::fmt::Formatter<'_>, indentation: usize) -> std::fmt::Result {
         OperationFormatter::new(formatter, indentation, PARALLEL_ALL_TO_ALL_OPERATION_NAME)?.bracketed(|operation| {
-            operation.field("axis_name", format_args!("{:?}", self.axes))?;
+            operation.field("axes", format_args!("{:?}", self.axes))?;
             operation.field("axis_size", self.axis_size)?;
             operation.field("split_axis", format_args!("{:?}", &self.split_axis))?;
             operation.field("concatenation_axis", format_args!("{:?}", &self.concatenation_axis))?;
@@ -1317,7 +1317,7 @@ mod tests {
         assert_eq!(operation.mesh(), None);
         assert_eq!(
             operation.to_string(),
-            "parallel_all_to_all [axis_name=\"x\", axis_size=4, split_axis=0, concatenation_axis=1, options=Tiled]",
+            "parallel_all_to_all [axes=\"x\", axis_size=4, split_axis=0, concatenation_axis=1, options=Tiled]",
         );
         assert_eq!(operation.effective_axis_size(), Ok(4));
 
@@ -1345,7 +1345,7 @@ mod tests {
             mesh_operation.to_string(),
             indoc! {"
                 parallel_all_to_all [
-                    axis_name=\"x\",
+                    axes=\"x\",
                     axis_size=4,
                     split_axis=0,
                     concatenation_axis=1,
@@ -2033,7 +2033,7 @@ mod tests {
             evaluation.program().to_string(),
             indoc! {"
                 lambda %0:f32[1, 3] .
-                let %1:f32[3, 1] = parallel_all_to_all [axis_name=\"x\", axis_size=3, split_axis=1, \
+                let %1:f32[3, 1] = parallel_all_to_all [axes=\"x\", axis_size=3, split_axis=1, \
                 concatenation_axis=0, options=Tiled] %0
                 in (%1)"
             },
@@ -2066,7 +2066,7 @@ mod tests {
             program.to_string(),
             indoc! {"
                 lambda %0:f32[1, 3] .
-                let %1:f32[3, 1] = parallel_all_to_all [axis_name=\"x\", axis_size=3, split_axis=1, \
+                let %1:f32[3, 1] = parallel_all_to_all [axes=\"x\", axis_size=3, split_axis=1, \
                 concatenation_axis=0, options=Tiled] %0
                 in (%1)"
             },
@@ -2584,14 +2584,14 @@ mod tests {
             indoc! {"
                 lambda %0:f32[4, 3], %1:f32[4, 3] .
                 let %2:f32[2, 6] = parallel_all_to_all [\
-                        axis_name=\"x\", \
+                        axes=\"x\", \
                         axis_size=2, \
                         split_axis=0, \
                         concatenation_axis=1, \
                         options=Tiled\
                     ] %0
                     %3:f32[2, 6] = parallel_all_to_all [\
-                        axis_name=\"x\", \
+                        axes=\"x\", \
                         axis_size=2, \
                         split_axis=0, \
                         concatenation_axis=1, \
@@ -2780,7 +2780,7 @@ mod tests {
             indoc! {"
                 lambda %0:f32[2, 3], %1:dimension<3>, %2:dimension<2> .
                 let %3:f32[3, 2] = parallel_all_to_all [\
-                    axis_name=\"x\", \
+                    axes=\"x\", \
                     axis_size=2, \
                     split_axis=0, \
                     concatenation_axis=1, \
@@ -2820,7 +2820,7 @@ mod tests {
                 lambda %0:f32[3] .
                 let %1:dimension<3> = const 3
                     %2:f32[3] = parallel_all_to_all [\
-                        axis_name=\"x\", \
+                        axes=\"x\", \
                         axis_size=1, \
                         split_axis=0, \
                         concatenation_axis=0, \
@@ -2838,7 +2838,7 @@ mod tests {
                         forward={
                             lambda %0:dimension<3>, %1:f32[3] .
                             let %2:f32[3] = parallel_all_to_all [\
-                                axis_name=\"x\", \
+                                axes=\"x\", \
                                 axis_size=1, \
                                 split_axis=0, \
                                 concatenation_axis=0, \
@@ -2850,7 +2850,7 @@ mod tests {
                             lambda %0:dimension<3>, %1:f32[3] .
                             let %2:dimension<3> = constant [value=3]
                                 %3:f32[3] = parallel_all_to_all [\
-                                    axis_name=\"x\", \
+                                    axes=\"x\", \
                                     axis_size=1, \
                                     split_axis=0, \
                                     concatenation_axis=0, \
@@ -2872,7 +2872,7 @@ mod tests {
                             lambda %0:dimension<3>, %1:f32[3] .
                             let %2:dimension<3> = constant [value=3]
                                 %3:f32[3] = parallel_all_to_all [\
-                                    axis_name=\"x\", \
+                                    axes=\"x\", \
                                     axis_size=1, \
                                     split_axis=0, \
                                     concatenation_axis=0, \
@@ -2883,7 +2883,7 @@ mod tests {
                         transpose={
                             lambda %0:dimension<3>, %1:f32[3] .
                             let %2:f32[3] = parallel_all_to_all [\
-                                axis_name=\"x\", \
+                                axes=\"x\", \
                                 axis_size=1, \
                                 split_axis=0, \
                                 concatenation_axis=0, \
@@ -2937,7 +2937,7 @@ mod tests {
                 lambda %0:f32[length, 1], %1:dimension<length ∈ [1, 9)> .
                 let %2:dimension<1> = const 1
                     %3:f32[1, length] = parallel_all_to_all [\
-                        axis_name=\"x\", \
+                        axes=\"x\", \
                         axis_size=1, \
                         split_axis=1, \
                         concatenation_axis=0, \
@@ -2955,7 +2955,7 @@ mod tests {
                         forward={
                             lambda %0:dimension<1>, %1:dimension<length ∈ [1, 9)>, %2:f32[length, 1] .
                             let %3:f32[1, length] = parallel_all_to_all [\
-                                axis_name=\"x\", \
+                                axes=\"x\", \
                                 axis_size=1, \
                                 split_axis=1, \
                                 concatenation_axis=0, \
@@ -2967,7 +2967,7 @@ mod tests {
                             lambda %0:dimension<1>, %1:dimension<length ∈ [1, 9)>, %2:f32[1, length] .
                             let %3:dimension<1> = constant [value=1]
                                 %4:f32[length, 1] = parallel_all_to_all [\
-                                    axis_name=\"x\", \
+                                    axes=\"x\", \
                                     axis_size=1, \
                                     split_axis=0, \
                                     concatenation_axis=1, \
@@ -2989,7 +2989,7 @@ mod tests {
                             lambda %0:dimension<1>, %1:dimension<length ∈ [1, 9)>, %2:f32[1, length] .
                             let %3:dimension<1> = constant [value=1]
                                 %4:f32[length, 1] = parallel_all_to_all [\
-                                    axis_name=\"x\", \
+                                    axes=\"x\", \
                                     axis_size=1, \
                                     split_axis=0, \
                                     concatenation_axis=1, \
@@ -3000,7 +3000,7 @@ mod tests {
                         transpose={
                             lambda %0:dimension<1>, %1:dimension<length ∈ [1, 9)>, %2:f32[length, 1] .
                             let %3:f32[1, length] = parallel_all_to_all [\
-                                axis_name=\"x\", \
+                                axes=\"x\", \
                                 axis_size=1, \
                                 split_axis=1, \
                                 concatenation_axis=0, \
@@ -3040,7 +3040,7 @@ mod tests {
             indoc! {"
                 lambda %0:f32[1, 6] .
                 let %1:f32[2, 3] = parallel_all_to_all [\
-                    axis_name=\"x\", \
+                    axes=\"x\", \
                     axis_size=2, \
                     split_axis=1, \
                     concatenation_axis=0, \
@@ -3061,7 +3061,7 @@ mod tests {
             indoc! {"
                 lambda %0:f32[3, 2] .
                 let %1:f32[2, 3] = parallel_all_to_all [\
-                    axis_name=\"x\", \
+                    axes=\"x\", \
                     axis_size=2, \
                     split_axis=1, \
                     concatenation_axis=0, \
@@ -3089,7 +3089,7 @@ mod tests {
             indoc! {"
                 lambda %0:f32[1, 6] .
                 let %1:f32[2, 3] = parallel_all_to_all [
-                    axis_name=\"x\",
+                    axes=\"x\",
                     axis_size=4,
                     split_axis=1,
                     concatenation_axis=0,
@@ -3117,7 +3117,7 @@ mod tests {
             indoc! {"
                 lambda %0:f32[3, 2] .
                 let %1:f32[2, 3] = parallel_all_to_all [
-                    axis_name=\"x\",
+                    axes=\"x\",
                     axis_size=4,
                     split_axis=1,
                     concatenation_axis=0,
@@ -3145,7 +3145,7 @@ mod tests {
                 lambda %0:f32[1, 6][sharding={mesh<['x'=2:manual]>, [{}, {}], varying_manual={'x'}}] .
                 let %1:f32[2, 3][sharding={mesh<['x'=2:manual]>, [{}, {}], varying_manual={'x'}}] = \
                 parallel_all_to_all [
-                    axis_name=\"x\",
+                    axes=\"x\",
                     axis_size=2,
                     split_axis=1,
                     concatenation_axis=0,
@@ -3231,7 +3231,7 @@ mod tests {
             indoc! {"
                 lambda %0:f32[4][sharding={mesh<['x'=2:manual]>, [{}], varying_manual={'x'}}] .
                 let %1:f32[4][sharding={mesh<['x'=2:manual]>, [{}], varying_manual={'x'}}] = parallel_all_to_all [
-                    axis_name=\"x\",
+                    axes=\"x\",
                     axis_size=2,
                     split_axis=0,
                     concatenation_axis=0,
@@ -3280,7 +3280,7 @@ mod tests {
             indoc! {"
                 lambda %0:f32[4][sharding={mesh<['x'=4:manual]>, [{}], varying_manual={'x'}}] .
                 let %1:f32[4][sharding={mesh<['x'=4:manual]>, [{}], varying_manual={'x'}}] = parallel_all_to_all [
-                    axis_name=\"x\",
+                    axes=\"x\",
                     axis_size=4,
                     split_axis=0,
                     concatenation_axis=0,
@@ -3482,7 +3482,7 @@ mod tests {
                     %4:dimension<3> = constant [value=3]
                     %5:dimension<2> = constant [value=2]
                     %6:f32[3, 2] = parallel_all_to_all [
-                        axis_name=\"x\",
+                        axes=\"x\",
                         axis_size=4,
                         split_axis=0,
                         concatenation_axis=1,
@@ -3539,7 +3539,7 @@ mod tests {
                     %7:dimension<length / 2 ∈ [0, 5)> = dimension_div %1 %3
                     %8:dimension<6> = dimension_mul %2 %3
                     %9:f32[length / 2, 6] = parallel_all_to_all [
-                        axis_name=\"x\",
+                        axes=\"x\",
                         axis_size=4,
                         split_axis=0,
                         concatenation_axis=1,
@@ -3591,7 +3591,7 @@ mod tests {
                         labels=[\"extent\", \"divisor\"],
                     ] %6 %1 %3
                     %7:f32[length, 3] = parallel_all_to_all [
-                        axis_name=\"x\",
+                        axes=\"x\",
                         axis_size=4,
                         split_axis=0,
                         concatenation_axis=0,
@@ -3624,7 +3624,7 @@ mod tests {
                 let %1:dimension<3> = constant [value=3]
                     %2:dimension<2> = constant [value=2]
                     %3:f32[3, 2] = parallel_all_to_all [\
-                        axis_name=\"x\", \
+                        axes=\"x\", \
                         axis_size=2, \
                         split_axis=0, \
                         concatenation_axis=1, \
@@ -3648,7 +3648,7 @@ mod tests {
                 let %1:dimension<4> = constant [value=4]
                     %2:dimension<3> = constant [value=3]
                     %3:f32[4, 3] = parallel_all_to_all [\
-                        axis_name=\"x\", \
+                        axes=\"x\", \
                         axis_size=2, \
                         split_axis=0, \
                         concatenation_axis=0, \
@@ -3684,7 +3684,7 @@ mod tests {
                     %4:dimension<2> = dimension_div %1 %3
                     %5:dimension<6> = dimension_mul %2 %3
                     %6:f32[2, 6] = parallel_all_to_all [\
-                        axis_name=\"x\", \
+                        axes=\"x\", \
                         axis_size=2, \
                         split_axis=0, \
                         concatenation_axis=1, \
@@ -3728,7 +3728,7 @@ mod tests {
                     %4:dimension<2> = constant [value=2]
                     %5:f32[2, 3][sharding={mesh<['x'=2:manual]>, [{}, {}], varying_manual={'x'}}] = \
                 parallel_all_to_all [
-                        axis_name=\"x\",
+                        axes=\"x\",
                         axis_size=2,
                         split_axis=0,
                         concatenation_axis=0,
@@ -3784,7 +3784,7 @@ mod tests {
             indoc! {"
                 lambda %0:f32[2, 3] .
                 let %1:f32[2, 3] = parallel_all_to_all [
-                    axis_name=\"x\",
+                    axes=\"x\",
                     axis_size=4,
                     split_axis=0,
                     concatenation_axis=0,
