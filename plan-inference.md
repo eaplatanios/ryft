@@ -159,9 +159,9 @@ but has almost none of the serving control plane.
 | Typed, backend-neutral programs and transformations | `crates/ryft-core/src/contexts.rs`, `crates/ryft-core/src/programs/programs.rs`, `crates/ryft-core/src/parameters.rs` | Shared model/state code, structured weights, reference execution, JIT, vmap, autodiff, checkpoint mapping. |
 | Broad inference primitives | `crates/ryft-core/src/operations`, `.tasks/plan_tier1_inference_primitives.md`, `.tasks/plan_inference_completeness.md` | Dot/quantized dot, control flow, RNG, sampling building blocks, dynamic slice/update, fused attention, custom calls, collectives. |
 | Real decode expressibility | Tiny greedy/top-k/custom-attention compiled decode-loop tests in `crates/ryft-xla/src/jit.rs` | Excellent correctness fixture and useful fixed-horizon RL path; not a continuous server. |
-| Retained and persistent compilation | `crates/ryft-core/src/compilation`, `crates/ryft-xla/src/experimental/domains.rs` | Precompiled profile families, single-flight compilation, AOT warmup, validated executable restore, distributed artifact exchange. |
-| Static and bounded symbolic dimensions | `ryft-core` array dimensions plus `XlaInputBoundBucketing` | Prefill profile bucketing and model polymorphism, subject to the current dynamic-boundary restrictions. |
-| Async PJRT execution | `crates/ryft-pjrt/src/events.rs`, `crates/ryft-pjrt/src/programs.rs`; `CompiledXlaFunction::interpret_async` | Enqueue model steps without waiting, chain pending buffers, attach completion fences. |
+| Retained and persistent compilation | `crates/ryft-core/src/compilation`, `crates/ryft-xla/src/domains` | Precompiled profile families, single-flight compilation, AOT warmup, validated executable restore, distributed artifact exchange. |
+| Static and bounded symbolic dimensions | `ryft-core` array dimensions plus `ryft_xla::InputBoundBucketing` | Prefill profile bucketing and model polymorphism, subject to the current dynamic-boundary restrictions. |
+| Async PJRT execution | `crates/ryft-pjrt/src/events.rs`, `crates/ryft-pjrt/src/programs.rs`; `ryft_xla::CompiledFunction::interpret_async` | Enqueue model steps without waiting, chain pending buffers, attach completion fences. |
 | Async external-reference execution | `crates/ryft-xla/src/jit.rs`; `call_statefully_async` | Existing read leases, pending mutation generations, and completion failure handling inform the serving protocol; they do not guarantee physical in-place state. |
 | Device-buffer lifecycle and interop | `crates/ryft-pjrt/src/buffers.rs`, `crates/ryft-pjrt/src/transfers.rs` | Uninitialized buffers, donation, aliases, DMA/pinned staging, external device pointers, zero-copy interop, asynchronous transfers. |
 | Stateful custom-kernel escape hatch | typed XLA FFI, GPU custom calls, Triton extension, Mosaic GPU bindings | Paged attention, cache writes, fused sampling, quantized kernels, MoE, custom communication. |
@@ -179,7 +179,7 @@ but has almost none of the serving control plane.
 - No request scheduler, page allocator, prefix index, sampler runtime, grammar engine, adapter manager, or server exists.
 - XLA bounded-dynamic input/output boundaries can synchronize with the host, and retained bound bucketing is currently
   single-device because the dynamic path is incompatible with the Shardy path.
-- `CompiledXlaFunction::batch` is currently unsupported. Serving batches must be assembled explicitly and dispatched to
+- `ryft_xla::CompiledFunction::batch` is currently unsupported. Serving batches must be assembled explicitly and dispatched to
   an already compiled profile; the design must not assume post-compilation vmap.
 - Requested donation may be downgraded when a buffer has another shared owner. Donation can remain an ordinary tensor
   optimization, but it must not be the correctness mechanism for shared sequence state.

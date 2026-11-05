@@ -380,8 +380,8 @@ fn test_attention_interpretation() {
 fn execute_aot_case<'c>(
     plugin: &crate::Plugin,
     client: &'c crate::Client<'c>,
-    binding: ryft_xla::kernels::XlaKernelCompilerBinding,
-    deployment_binding: ryft_xla::kernels::XlaKernelCompilerBinding,
+    binding: ryft_xla::kernels::KernelCompilerBinding,
+    deployment_binding: ryft_xla::kernels::KernelCompilerBinding,
     backend: &str,
 ) {
     use std::io::Read;
@@ -390,8 +390,8 @@ fn execute_aot_case<'c>(
     use ryft_core::{Device, DeviceMesh, LogicalMesh, MeshAxis, MeshAxisType};
     use sha2::{Digest, Sha256};
 
-    use ryft_xla::kernels::{KernelAotBundle, XlaKernelExecutionFacts};
-    use ryft_xla::{FromPjrt, XlaOptions, XlaSession};
+    use ryft_xla::kernels::{KernelAotBundle, KernelExecutionFacts};
+    use ryft_xla::{FromPjrt, Options, Session};
 
     /// Uses the portable source codec's whole-array subset with no hidden captures or runtime references.
     #[ryft_kernels::kernel(crate = "ryft_kernels")]
@@ -411,11 +411,11 @@ fn execute_aot_case<'c>(
         vec![Device::from_pjrt(&device).unwrap()],
     )
     .unwrap();
-    let producer = XlaSession::new(client);
+    let producer = Session::new(client);
     let bundle = KernelAotBundle::compile(
         &definition,
         &producer.domain(),
-        XlaOptions::new(mesh.clone()).with_kernel_compiler(binding.clone()),
+        Options::new(mesh.clone()).with_kernel_compiler(binding.clone()),
         1024,
     )
     .unwrap();
@@ -426,7 +426,7 @@ fn execute_aot_case<'c>(
     drop(bundle);
     drop(producer);
     let restored = KernelAotBundle::from_bytes(&bytes, 1024).unwrap();
-    let runtime = XlaSession::new(client);
+    let runtime = Session::new(client);
     let loaded = restored.load(&runtime.domain(), &deployment_binding, &mesh).unwrap();
     let inputs: Vec<_> = [1.0f32, 2.0]
         .into_iter()
@@ -455,7 +455,7 @@ fn execute_aot_case<'c>(
         samples.push(u64::try_from(start.elapsed().as_nanos()).unwrap());
     }
     if let Some(directory) = std::env::var_os("RYFT_KERNEL_PROFILE_DIRECTORY") {
-        let facts = XlaKernelExecutionFacts::from_target(runtime.target().unwrap(), &mesh).unwrap();
+        let facts = KernelExecutionFacts::from_target(runtime.target().unwrap(), &mesh).unwrap();
         let lowering: std::time::Duration = serde_json::from_value(report["lowering_duration"].clone()).unwrap();
         let compilation: std::time::Duration = serde_json::from_value(report["compilation_duration"].clone()).unwrap();
         let mut executable = std::fs::File::open(std::env::current_exe().unwrap()).unwrap();
@@ -582,12 +582,10 @@ mod gpu {
     use sha2::{Digest, Sha256};
 
     use ryft_core::{Device, DeviceMesh, LogicalMesh, MeshAxis, MeshAxisType, ProgramError, ProjectedValue, Typed};
-    use ryft_kernels::{KernelExtension, KernelOperation, KernelSchedule};
+    use ryft_kernels::{KernelExtension as PortableKernelExtension, KernelOperation, KernelSchedule};
     use ryft_mosaic::kernels::gpu::{Compiler, GpuOperation, Options, Target};
-    use ryft_xla::kernels::{MosaicGpuEmbedding, XlaKernelCompilerBinding, XlaKernelExtension, stage_kernel};
-    use ryft_xla::{
-        CompiledXlaFunction, Error, FromPjrt, XlaCompileTracer, XlaOptions, XlaSession, compile_with_options,
-    };
+    use ryft_xla::kernels::{KernelCompilerBinding, KernelExtension, MosaicGpuEmbedding, stage_kernel};
+    use ryft_xla::{CompileTracer, CompiledFunction, Error, FromPjrt, Options, Session, compile_with_options};
 
     use crate::tests::{TestPlatform, test_for_each_platform};
 
@@ -601,7 +599,7 @@ mod gpu {
         let mut executed = false;
         test_for_each_platform!(|_plugin, client, platform| {
             if matches!(platform, TestPlatform::Cuda12 | TestPlatform::Cuda13) {
-                let binding = XlaKernelCompilerBinding::new(
+                let binding = KernelCompilerBinding::new(
                     Compiler,
                     device_target(&client),
                     Options::default(),
@@ -662,16 +660,16 @@ mod gpu {
         Extension: 'static
             + Send
             + Sync
-            + KernelExtension
+            + PortableKernelExtension
             + Into<GpuOperation>
-            + Into<XlaKernelExtension>
-            + TryFrom<XlaKernelExtension, Error = ProgramError>,
+            + Into<KernelExtension>
+            + TryFrom<KernelExtension, Error = ProgramError>,
     {
         assert!((1..=128).contains(&iterations));
         let description = format!("{options:?}");
         let device = client.addressable_devices().unwrap().remove(0);
         assert_eq!(target.compute_capability(), device_target(client).compute_capability());
-        let binding = XlaKernelCompilerBinding::new_with_extensions::<_, _, Extension>(
+        let binding = KernelCompilerBinding::new_with_extensions::<_, _, Extension>(
             Compiler,
             target,
             options,
@@ -685,10 +683,10 @@ mod gpu {
             vec![Device::from_pjrt(&device).unwrap()],
         )
         .unwrap();
-        let session = XlaSession::new(client);
+        let session = Session::new(client);
         let domain = session.domain();
-        let compiled: CompiledXlaFunction<'_, Vec<ArrayType>, Vec<ArrayType>> = compile_with_options(
-            |inputs: Vec<XlaCompileTracer<'_>>| {
+        let compiled: CompiledFunction<'_, Vec<ArrayType>, Vec<ArrayType>> = compile_with_options(
+            |inputs: Vec<CompileTracer<'_>>| {
                 let values = inputs.into_iter().map(ProjectedValue::into_value).collect::<Vec<_>>();
                 stage_kernel(values[0].context(), definition, &values)
                     .unwrap()
@@ -703,7 +701,7 @@ mod gpu {
             },
             input_types.clone(),
             &domain,
-            XlaOptions::new(mesh.clone()).with_kernel_compiler(binding),
+            Options::new(mesh.clone()).with_kernel_compiler(binding),
         )
         .unwrap();
         let inputs = input_types
@@ -1262,12 +1260,12 @@ mod cutile {
 
     use ryft_core::{
         AddOperation, ArrayIrType, ArrayOperation, CompilationCacheDomain, ConstantOperation, Device, DeviceMesh,
-        LogicalMesh, MeshAxis, MeshAxisType, StagedFunction,
+        LogicalMesh, MeshAxis, MeshAxisType, StagedFunction as CoreStagedFunction,
     };
     use ryft_cuda::kernels::cutile::{CompiledKernel, Compiler, Options, Target};
     use ryft_kernels::{KernelSchedule, VerifiedKernel};
-    use ryft_xla::kernels::{CuTileEmbedding, XlaKernelCompilerBinding, stage_kernel};
-    use ryft_xla::{Error, FromPjrt, XlaDomain, XlaSession, XlaValue};
+    use ryft_xla::kernels::{CuTileEmbedding, KernelCompilerBinding, stage_kernel};
+    use ryft_xla::{Domain, Error, FromPjrt, Session, Value};
 
     use crate::tests::{TestPlatform, test_for_each_platform};
 
@@ -1287,7 +1285,7 @@ mod cutile {
                 };
                 let (major, minor) = capability.split_once('.').unwrap();
                 let python = PathBuf::from(env::var_os("RYFT_CUTILE_PYTHON").unwrap());
-                let binding = XlaKernelCompilerBinding::new(
+                let binding = KernelCompilerBinding::new(
                     Compiler::new(python),
                     Target::new(major.parse().unwrap(), minor.parse().unwrap()).unwrap(),
                     Options::default(),
@@ -1364,22 +1362,21 @@ mod cutile {
         );
         let verified = VerifiedKernel::new(&case.definition, 1024).unwrap();
         let output = verified.compile(&compiler, &target, &options, &schedule).unwrap();
-        let binding =
-            XlaKernelCompilerBinding::new(compiler, target, options, schedule, CuTileEmbedding, 1024).unwrap();
+        let binding = KernelCompilerBinding::new(compiler, target, options, schedule, CuTileEmbedding, 1024).unwrap();
         let mesh = DeviceMesh::new(
             LogicalMesh::new(vec![MeshAxis::new("device", 1, MeshAxisType::Auto).unwrap()]).unwrap(),
             vec![Device::from_pjrt(&device).unwrap()],
         )
         .unwrap();
-        let producer = XlaSession::new(client);
+        let producer = Session::new(client);
         let domain = producer.domain();
-        let staged = StagedFunction::<XlaDomain<'_>, Vec<ArrayIrType>, Vec<ArrayIrType>>::stage(
-            |_, _, inputs: Vec<ryft_core::CompilationTracer<XlaDomain<'c>>>| {
+        let staged = CoreStagedFunction::<Domain<'_>, Vec<ArrayIrType>, Vec<ArrayIrType>>::stage(
+            |_, _, inputs: Vec<ryft_core::CompilationTracer<Domain<'c>>>| {
                 Ok(stage_kernel(inputs[0].context(), &case.definition, &inputs)?)
             },
             vec![],
             case.input_types.iter().cloned().map(ArrayIrType::Array).collect(),
-            ryft_xla::XlaOptions::new(mesh.clone()).with_kernel_compiler(binding),
+            ryft_xla::Options::new(mesh.clone()).with_kernel_compiler(binding),
         )
         .unwrap();
         let compiled = staged.lower(&domain).unwrap().compile(&domain).unwrap();
@@ -1389,7 +1386,7 @@ mod cutile {
             CompiledKernel::from_manifest(&verified, output.manifest(), output.artifact().bytes().to_vec()).unwrap();
         assert_eq!(restored_output.artifact().bytes(), output.artifact().bytes());
         assert_eq!(restored_output.arguments(), output.arguments());
-        let runtime_session = XlaSession::new(client);
+        let runtime_session = Session::new(client);
         let runtime = runtime_session.domain();
         let restored = runtime.deserialize_program(&executable_bytes).unwrap().unwrap();
         let executable = compiled.executable().with_compiled_program(Arc::new(restored));
@@ -1411,8 +1408,8 @@ mod cutile {
             arrays[1] = arrays[0].clone();
         }
         let original = arrays[0].clone();
-        let results = executable.execute(&runtime, arrays.into_iter().map(XlaValue::Array).collect())?;
-        let XlaValue::Array(result) = &results[0] else { panic!("kernel output must be an array") };
+        let results = executable.execute(&runtime, arrays.into_iter().map(Value::Array).collect())?;
+        let Value::Array(result) = &results[0] else { panic!("kernel output must be an array") };
         let bytes =
             result.device_shard(device.id().unwrap()).unwrap().buffer().unwrap().copy_to_host(None)?.r#await()?;
         let values = bytes
@@ -1537,8 +1534,8 @@ mod cutile {
     #[test]
     fn test_shard_map_on_cuda() {
         use ryft_core::{ProjectedValue, ShardMapOptions, Sharding, ShardingDimension, Typed, shard_map};
-        use ryft_xla::experimental::XlaArrayTracer;
-        use ryft_xla::{CompiledXlaFunction, XlaCompileTracer, XlaOptions, compile_with_options};
+        use ryft_xla::experimental::ArrayTracer;
+        use ryft_xla::{CompileTracer, CompiledFunction, Options, compile_with_options};
 
         if env::var("RYFT_PJRT_RUN_CUTILE_KERNELS").ok().as_deref() != Some("1") {
             return;
@@ -1554,7 +1551,7 @@ mod cutile {
                 let (major, minor) = capability.split_once('.').unwrap();
                 let target = Target::new(major.parse().unwrap(), minor.parse().unwrap()).unwrap();
                 let compiler = Compiler::new(PathBuf::from(env::var_os("RYFT_CUTILE_PYTHON").unwrap()));
-                let binding = XlaKernelCompilerBinding::new(
+                let binding = KernelCompilerBinding::new(
                     compiler,
                     target,
                     Options::default(),
@@ -1569,12 +1566,12 @@ mod cutile {
                     Sharding::new(logical_mesh.clone(), vec![ShardingDimension::sharded(["device"])]).unwrap();
                 let r#type = ArrayType::new_static(DataType::F32, [17]).with_sharding(sharding.clone()).unwrap();
                 let mesh = DeviceMesh::new(logical_mesh.clone(), vec![Device::from_pjrt(&device).unwrap()]).unwrap();
-                let session = XlaSession::new(&client);
+                let session = Session::new(&client);
                 let domain = session.domain();
-                let compiled: CompiledXlaFunction<'_, ArrayType, ArrayType> = compile_with_options(
-                    |input: XlaCompileTracer<'_>| {
+                let compiled: CompiledFunction<'_, ArrayType, ArrayType> = compile_with_options(
+                    |input: CompileTracer<'_>| {
                         shard_map(
-                            |local: XlaArrayTracer| {
+                            |local: ArrayTracer| {
                                 let local_type = local.r#type().into_owned();
                                 let definition: KernelDefinition = KernelDefinition::trace(
                                     KernelCallOperation::new(
@@ -1602,7 +1599,7 @@ mod cutile {
                     },
                     r#type.clone(),
                     &domain,
-                    XlaOptions::new(mesh.clone()).with_kernel_compiler(binding),
+                    Options::new(mesh.clone()).with_kernel_compiler(binding),
                 )
                 .unwrap();
                 let expected = (0..17).map(|value| value as f32 - 8.0).collect::<Vec<_>>();
@@ -1707,15 +1704,15 @@ mod tuning {
 
     use pretty_assertions::assert_eq;
     use ryft_core::{
-        ArrayIrType, CompilationTracer, Device, DeviceMesh, ExecutableFunction, LogicalMesh, MeshAxis, MeshAxisType,
-        StagedFunction, StatefulCompilationDomain, StatefulExecution,
+        ArrayIrType, CompilationTracer, Device, DeviceMesh, ExecutableFunction as CoreExecutableFunction, LogicalMesh,
+        MeshAxis, MeshAxisType, StagedFunction as CoreStagedFunction, StatefulCompilationDomain, StatefulExecution,
     };
     use ryft_kernels::{KernelCompiler, KernelSchedule, VerifiedKernel};
     use ryft_xla::kernels::{
-        KernelOutputEmbedding, KernelTuner, KernelTuningBudget, KernelTuningError, KernelTuningRequest,
-        KernelTuningRunner, XlaKernelCompilerBinding, XlaKernelExecutionFacts, XlaKernelTarget, stage_kernel,
+        KernelCompilerBinding, KernelExecutionFacts, KernelOutputEmbedding, KernelTarget, KernelTuner,
+        KernelTuningBudget, KernelTuningError, KernelTuningRequest, KernelTuningRunner, stage_kernel,
     };
-    use ryft_xla::{FromPjrt, XlaDomain, XlaOptions, XlaSession, XlaValue};
+    use ryft_xla::{Domain, FromPjrt, Options, Session, Value};
 
     use crate::tests::{TestPlatform, test_for_each_platform};
 
@@ -1724,7 +1721,7 @@ mod tuning {
     /// One immutable workload with ordinary compiled-function ownership; no alternate execution engine is introduced.
     struct Runner<'c> {
         /// Existing XLA execution domain and session owner.
-        domain: XlaDomain<'c>,
+        domain: Domain<'c>,
 
         /// Fixed independent oracle and canonical input signature.
         case: KernelCase,
@@ -1733,31 +1730,31 @@ mod tuning {
         mesh: DeviceMesh,
 
         /// Ordinary typed bindings for the finite requested schedule list.
-        bindings: Vec<(KernelSchedule, XlaKernelCompilerBinding)>,
+        bindings: Vec<(KernelSchedule, KernelCompilerBinding)>,
 
         /// Prepared ordinary executable, replaced only between candidates.
-        executable: Option<ExecutableFunction<XlaDomain<'c>, Vec<ArrayIrType>, Vec<ArrayIrType>>>,
+        executable: Option<CoreExecutableFunction<Domain<'c>, Vec<ArrayIrType>, Vec<ArrayIrType>>>,
 
         /// Fixed functional inputs reused across all samples.
-        inputs: Vec<XlaValue<'c>>,
+        inputs: Vec<Value<'c>>,
     }
 
     impl<'c> KernelTuningRunner for Runner<'c> {
         fn prepare(&mut self, schedule: &KernelSchedule) -> Result<(), KernelTuningError> {
             for input in &self.inputs {
-                let XlaValue::Array(input) = input else {
+                let Value::Array(input) = input else {
                     unreachable!();
                 };
                 input.block_until_ready().map_err(error)?;
             }
             let binding = self.bindings.iter().find(|(candidate, _)| candidate == schedule).unwrap().1.clone();
-            let staged = StagedFunction::<XlaDomain<'_>, Vec<ArrayIrType>, Vec<ArrayIrType>>::stage(
-                |_, _, inputs: Vec<CompilationTracer<XlaDomain<'c>>>| {
+            let staged = CoreStagedFunction::<Domain<'_>, Vec<ArrayIrType>, Vec<ArrayIrType>>::stage(
+                |_, _, inputs: Vec<CompilationTracer<Domain<'c>>>| {
                     Ok(stage_kernel(inputs[0].context(), &self.case.definition, &inputs)?)
                 },
                 vec![],
                 self.case.input_types.iter().cloned().map(ArrayIrType::Array).collect(),
-                XlaOptions::new(self.mesh.clone()).with_kernel_compiler(binding),
+                Options::new(self.mesh.clone()).with_kernel_compiler(binding),
             )
             .map_err(error)?;
             // The existing lower/compile path performs real adapter admission before artifact lookup.
@@ -1774,7 +1771,7 @@ mod tuning {
                     .unwrap()
                     .execute_statefully_and_wait(&self.domain, self.inputs.clone())
                     .map_err(error)?;
-                let XlaValue::Array(output) = &outputs[0] else {
+                let Value::Array(output) = &outputs[0] else {
                     return Err(KernelTuningError::Invalid { message: "expected an ordinary array output".into() });
                 };
                 let bytes = output
@@ -1817,7 +1814,7 @@ mod tuning {
         cancellation: &AtomicBool,
     ) where
         Compiler: 'static + Clone + Send + Sync + KernelCompiler<Error: 'static + Send + Sync>,
-        Compiler::Target: 'static + Clone + Send + Sync + XlaKernelTarget,
+        Compiler::Target: 'static + Clone + Send + Sync + KernelTarget,
         Compiler::Options: 'static + Clone + Send + Sync,
         Embedding: 'static + Clone + Send + Sync + KernelOutputEmbedding<Compiler::Output>,
     {
@@ -1828,8 +1825,8 @@ mod tuning {
             vec![Device::from_pjrt(&device).unwrap()],
         )
         .unwrap();
-        let session = XlaSession::new(client);
-        let facts = XlaKernelExecutionFacts::from_target(session.target().unwrap(), &mesh).unwrap();
+        let session = Session::new(client);
+        let facts = KernelExecutionFacts::from_target(session.target().unwrap(), &mesh).unwrap();
         let candidates = vec![
             KernelSchedule::default().with_pipeline_stages(NonZeroUsize::new(1).unwrap()),
             KernelSchedule::default().with_pipeline_stages(NonZeroUsize::new(2).unwrap()),
@@ -1857,7 +1854,7 @@ mod tuning {
         let bindings = candidates
             .into_iter()
             .map(|schedule| {
-                let binding = XlaKernelCompilerBinding::new(
+                let binding = KernelCompilerBinding::new(
                     compiler.clone(),
                     target.clone(),
                     options.clone(),
@@ -1874,7 +1871,7 @@ mod tuning {
             .iter()
             .zip(&case.inputs)
             .map(|(r#type, values)| {
-                XlaValue::Array(
+                Value::Array(
                     session
                         .array(
                             r#type.clone(),
@@ -2259,12 +2256,13 @@ mod triton {
     use pretty_assertions::assert_eq;
 
     use ryft_core::{
-        ArrayIrType, CompilationCacheDomain, Device, DeviceMesh, LogicalMesh, MeshAxis, MeshAxisType, StagedFunction,
+        ArrayIrType, CompilationCacheDomain, Device, DeviceMesh, LogicalMesh, MeshAxis, MeshAxisType,
+        StagedFunction as CoreStagedFunction,
     };
     use ryft_kernels::{KernelCompiler, KernelSchedule};
     use ryft_triton::kernels::{Compiler, Options, Target};
-    use ryft_xla::kernels::{TritonEmbedding, XlaKernelCompilerBinding, stage_kernel};
-    use ryft_xla::{FromPjrt, XlaDomain, XlaOptions, XlaSession, XlaValue};
+    use ryft_xla::kernels::{KernelCompilerBinding, TritonEmbedding, stage_kernel};
+    use ryft_xla::{Domain, FromPjrt, Options, Session, Value};
 
     use crate::tests::{TestPlatform, test_for_each_platform};
 
@@ -2286,7 +2284,7 @@ mod triton {
         let semantic = case.definition.semantic_key().unwrap();
         let cancellation = Arc::new(AtomicBool::new(false));
         let compiler = Compiler::new().with_cancellation(cancellation.clone());
-        let binding = XlaKernelCompilerBinding::new(
+        let binding = KernelCompilerBinding::new(
             compiler,
             device_target(client),
             Options::default(),
@@ -2301,21 +2299,21 @@ mod triton {
             vec![Device::from_pjrt(&device).unwrap()],
         )
         .unwrap();
-        let producer = XlaSession::new(client);
+        let producer = Session::new(client);
         let domain = producer.domain();
-        let staged = StagedFunction::<XlaDomain<'_>, Vec<ArrayIrType>, Vec<ArrayIrType>>::stage(
-            |_, _, inputs: Vec<ryft_core::CompilationTracer<XlaDomain<'c>>>| {
+        let staged = CoreStagedFunction::<Domain<'_>, Vec<ArrayIrType>, Vec<ArrayIrType>>::stage(
+            |_, _, inputs: Vec<ryft_core::CompilationTracer<Domain<'c>>>| {
                 Ok(stage_kernel(inputs[0].context(), &case.definition, &inputs)?)
             },
             vec![],
             case.input_types.iter().cloned().map(ArrayIrType::Array).collect(),
-            XlaOptions::new(mesh.clone()).with_kernel_compiler(binding),
+            Options::new(mesh.clone()).with_kernel_compiler(binding),
         )
         .unwrap();
         let compiled = staged.lower(&domain).unwrap().compile(&domain).unwrap();
         let bytes = domain.serialize_program(compiled.compiled_program()).unwrap().unwrap();
         cancellation.store(true, Ordering::Release);
-        let session = XlaSession::new(client);
+        let session = Session::new(client);
         let runtime = session.domain();
         let restored = runtime.deserialize_program(&bytes).unwrap().unwrap();
         let executable = compiled.executable().with_compiled_program(Arc::new(restored));
@@ -2334,8 +2332,8 @@ mod triton {
             })
             .collect::<Vec<_>>();
         for _ in 0..3 {
-            let outputs = executable.execute(&runtime, inputs.iter().cloned().map(XlaValue::Array).collect()).unwrap();
-            let XlaValue::Array(output) = &outputs[0] else { panic!("expected array output") };
+            let outputs = executable.execute(&runtime, inputs.iter().cloned().map(Value::Array).collect()).unwrap();
+            let Value::Array(output) = &outputs[0] else { panic!("expected array output") };
             let bytes = output
                 .device_shard(device.id().unwrap())
                 .unwrap()
@@ -2458,7 +2456,7 @@ mod triton {
                 let schedule = KernelSchedule::default();
                 let configuration = compiler.configuration_key(&target, &options, &schedule).unwrap();
                 let deployment = Compiler::from_configuration(&configuration).unwrap();
-                let binding = XlaKernelCompilerBinding::new(
+                let binding = KernelCompilerBinding::new(
                     compiler,
                     target.clone(),
                     options.clone(),
@@ -2468,8 +2466,7 @@ mod triton {
                 )
                 .unwrap();
                 let deployment_binding =
-                    XlaKernelCompilerBinding::new(deployment, target, options, schedule, TritonEmbedding, 1024)
-                        .unwrap();
+                    KernelCompilerBinding::new(deployment, target, options, schedule, TritonEmbedding, 1024).unwrap();
                 assert_eq!(binding.configuration(), deployment_binding.configuration());
                 execute_aot_case(&_plugin, &client, binding, deployment_binding, "triton");
                 executed = true;

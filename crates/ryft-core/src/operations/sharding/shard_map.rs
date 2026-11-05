@@ -40,8 +40,10 @@
 //! its own summand of an unreduced input and the whole value of a reduced input, and returns its own summand of an
 //! unreduced output and a copy of a reduced output. The body can observe the summands of an unreduced input, which only
 //! backends whose arrays keep one buffer per device (e.g., XLA) retain, so the reference backend rejects such inputs
-//! when it interprets the map ([`ShardMapError::UnreducedInputEmulationNotSupported`]). References may carry no
-//! reduction state along active axes. Reduction state on free or enclosing axes remains supported.
+//! when it interprets the map ([`ShardMapError::UnreducedInputEmulationNotSupported`]). Reference inputs follow the
+//! same rules: each device writes back its own summand of an unreduced reference and its copy of a reduced one (e.g.,
+//! the gradient reference of a reduced reference, which reverse mode accumulates in place, is unreduced). Reduction
+//! state on free or enclosing axes remains supported.
 //!
 //! Batching makes the batch axis a dimension of every mapped boundary value and batches the local body structurally,
 //! and it may place the batch axis on mesh axes. Refer to the batching rule in the documentation of
@@ -442,16 +444,6 @@ pub enum ShardMapError {
     OutputVaryingAlongUntiledManualAxis { output_index: usize, axis_name: String },
 
     #[error(
-        "`{SHARD_MAP_OPERATION_NAME}` reference input #{input_index} is {state_kind} along active manual axis \
-         `{axis_name}`, which is not supported without manual-variation checking"
-    )]
-    UncheckedReferenceReductionStateNotSupported {
-        input_index: usize,
-        state_kind: ReductionStateKind,
-        axis_name: String,
-    },
-
-    #[error(
         "the reference backend does not support `{SHARD_MAP_OPERATION_NAME}` input #{input_index} without \
          manual-variation checking, because the input is unreduced along active manual axis `{axis_name}` and \
          reference arrays do not keep per-device summands (XLA arrays do)"
@@ -730,11 +722,11 @@ impl ShardMapBoundary {
     /// input cotangents; replicated mutated gradient-reference destinations are unsupported. Along active manual axes,
     /// array inputs and outputs may be unreduced or reduced, which the body does not see. The reference backend rejects
     /// unreduced inputs when it interprets the map ([`ShardMapError::UnreducedInputEmulationNotSupported`]), because
-    /// the body could observe their physical summands, which logical reference arrays do not retain, and reference
-    /// inputs may carry no reduction state along those axes
-    /// ([`ShardMapError::UncheckedReferenceReductionStateNotSupported`]). Output replication is not checked while this
-    /// option is `false`, whatever [`Self::with_check_output_replication`] selects, and is checked again as that option
-    /// selects once this option is `true`, so the two can be set in either order.
+    /// the body could observe their physical summands, which logical reference arrays do not retain. Reference inputs
+    /// follow the same rules, with each device writing back its own summand of an unreduced reference and its copy of
+    /// a reduced one. Output replication is not checked while this option is `false`, whatever
+    /// [`Self::with_check_output_replication`] selects, and is checked again as that option selects once this option is
+    /// `true`, so the two can be set in either order.
     #[inline]
     pub fn with_check_manual_variation(mut self, check_manual_variation: bool) -> Self {
         self.manual_variation_checks.manual_variation = check_manual_variation;
@@ -1041,7 +1033,7 @@ impl ShardMapBoundary {
     /// accepted.
     fn validate_input_mesh(&self, actual: Option<&Sharding>, input_index: usize) -> Result<(), ShardMapError> {
         match actual {
-            Some(actual) if !same_device_mesh(actual.mesh(), &self.mesh) => Err(ShardMapError::InputMeshMismatch {
+            Some(actual) if !actual.mesh().has_same_topology(&self.mesh) => Err(ShardMapError::InputMeshMismatch {
                 input_index,
                 expected: self.mesh.clone(),
                 actual: actual.mesh().clone(),
@@ -1654,26 +1646,6 @@ impl ShardMapOperation {
                 Ok(if r#type.is_reference() { ReferenceType::new(global).into() } else { global.into() })
             })
             .collect::<Result<Vec<ArrayIrType>, ShardMapError>>()?;
-        // A reference input reaches an unchecked body without its reduction state along the active manual axes, so its
-        // per-device final states would have no well-defined global state with that reduction state.
-        if !boundary.check_manual_variation() {
-            for (input_index, _) in global_input_types.iter().enumerate().filter(|(_, r#type)| r#type.is_reference()) {
-                let sharding = &boundary.input_shardings()[input_index];
-                let states = [
-                    (ReductionStateKind::Unreduced, sharding.unreduced_axes()),
-                    (ReductionStateKind::Reduced, sharding.reduced_axes()),
-                ];
-                for (state_kind, axes) in states {
-                    if let Some(axis_name) = boundary.manual_axes().iter().find(|axis_name| axes.contains(*axis_name)) {
-                        return Err(ShardMapError::UncheckedReferenceReductionStateNotSupported {
-                            input_index,
-                            state_kind,
-                            axis_name: axis_name.clone(),
-                        });
-                    }
-                }
-            }
-        }
         let local_input_types = body.input_types().into_owned();
         check_count!("input", local_input_types, global_input_types.len(), ProgramError);
         for (index, (global, local)) in global_input_types.iter().zip(&local_input_types).enumerate() {
@@ -3520,9 +3492,11 @@ where
             //  per-device summands of an unreduced array, which `split_global_input` hands to the devices along its
             //  unreduced axes, `assemble_global_value` keeps for unreduced outputs (instead of summing them), and the
             //  dense operations that produce unreduced types (e.g., the dense dot) keep rather than fully reduce. Once
-            //  it exists, delete this rejection, `ShardMapError::UnreducedInputEmulationNotSupported`, and its test
-            //  `test_shard_map_interpretation_without_manual_variation_rejects_unreduced_inputs`, and test reverse mode
-            //  through reduced outputs of unchecked maps (whose seeds are unreduced) on this backend.
+            //  it exists, delete this rejection, `ShardMapError::UnreducedInputEmulationNotSupported`, and its tests
+            //  `test_shard_map_interpretation_without_manual_variation_rejects_unreduced_inputs` and
+            //  `test_shard_map_interpretation_without_manual_variation_rejects_unreduced_reference_inputs`, and test
+            //  reverse mode through reduced outputs of unchecked maps (whose seeds are unreduced) and into mutated
+            //  reduced gradient references (whose destinations are unreduced) on this backend.
             if !boundary.check_manual_variation()
                 && let Some(axis_name) = boundary
                     .manual_axes()
@@ -4355,19 +4329,6 @@ fn shard_map_boundary_types_match(actual: &ArrayType, expected: &ArrayType) -> b
             == expected.sharding().map_or(&no_axes, Sharding::unreduced_axes)
         && actual.sharding().map_or(&no_axes, Sharding::reduced_axes)
             == expected.sharding().map_or(&no_axes, Sharding::reduced_axes)
-}
-
-/// Returns `true` when two meshes describe the same device mesh, i.e., when they have the same axes, with the same
-/// names and sizes in the same order, irrespective of their axis types. The mesh of a `shard_map` designates the axes
-/// that it makes manual through its axis types, so the mesh of a caller's value may differ from it in its axis types
-/// only (e.g., in an axis that is `Explicit` for the caller and `Manual` for the `shard_map`).
-fn same_device_mesh(left: &LogicalMesh, right: &LogicalMesh) -> bool {
-    left.axes().len() == right.axes().len()
-        && left
-            .axes()
-            .iter()
-            .zip(right.axes())
-            .all(|(left, right)| left.name() == right.name() && left.size() == right.size())
 }
 
 /// Returns the global boundary type that a `shard_map` input or output carries as an array, which is the type itself
@@ -6025,7 +5986,7 @@ where
         && actual_array.layout() == target_array.layout()
         && match (actual_array.sharding(), target_array.sharding()) {
             (Some(actual), Some(target)) => {
-                same_device_mesh(actual.mesh(), target.mesh())
+                actual.mesh().has_same_topology(target.mesh())
                     && actual.varying_manual_axes() == target.varying_manual_axes()
                     && actual.unreduced_axes() == target.unreduced_axes()
                     && actual.reduced_axes() == target.reduced_axes()
@@ -6170,7 +6131,10 @@ where
                 && operation.input_types[index].is_reference()
                 && destination_kinds[index] == CotangentDestinationKind::Reference
                 && !local_accumulators[index]
-                && !operation.boundary.input_replicated_manual_axes(index).is_empty()
+                && !operation
+                    .boundary
+                    .cotangent_replication_axes(&operation.boundary.input_shardings()[index])
+                    .is_empty()
         })
     {
         return Err(ProgramError::UnsupportedOperation {
@@ -6561,7 +6525,7 @@ fn shard_map_within_named_axes(
     for axis in mesh.axes() {
         match named_axes.iter().find(|(name, _)| name == axis.name()) {
             Some((name, binding @ NamedAxis::Mesh { mesh: enclosing_mesh, .. })) => {
-                if !same_device_mesh(enclosing_mesh, &mesh) {
+                if !enclosing_mesh.has_same_topology(&mesh) {
                     return Err(ShardMapError::EnclosingManualAxisMeshMismatch {
                         axis_name: name.clone(),
                         enclosing_mesh: enclosing_mesh.clone(),
@@ -9104,26 +9068,65 @@ mod tests {
     }
 
     #[test]
-    fn test_shard_map_operation_without_manual_variation_rejects_reduced_reference_inputs() {
-        // A reference input would reach an unchecked body without its reduced state, so its per-device final states
-        // would have no well-defined reduced global state, and it is rejected even though a reduced array input is
-        // accepted.
+    fn test_shard_map_interpretation_without_manual_variation_rejects_unreduced_reference_inputs() {
+        // Each device of an unchecked map keeps and writes back its own summand of an unreduced reference, which the
+        // boundary accepts, as for an unreduced array input, but the reference backend stores only the logical value,
+        // so it rejects the reference rather than invent its summands.
         let mesh = manual_mesh();
-        let reduced = Sharding::replicated(mesh.clone(), 0).with_reduced_axes(["x"]).unwrap();
+        let unreduced = Sharding::replicated(mesh.clone(), 0).with_unreduced_axes(["x"]).unwrap();
+        let boundary = ShardMapBoundary::new(mesh, vec![unreduced.clone()], Vec::new(), Vec::new())
+            .unwrap()
+            .with_check_manual_variation(false);
+        let global_type = f32_scalar_type().with_sharding(unreduced).unwrap();
+        let local_type = boundary.local_input_type(0, &global_type).unwrap();
+        let body = build_program(vec![ReferenceType::new(local_type).into()], |builder, inputs| {
+            let value =
+                builder.add_instruction(ReferenceReadOperation::new(), Vec::new(), vec![inputs[0]], None).unwrap()[0];
+            builder
+                .add_instruction(ReferenceAddUpdateOperation::new(), Vec::new(), vec![inputs[0], value], None)
+                .unwrap();
+            Vec::new()
+        });
+        let program =
+            caller_typed_shard_map_program(body, vec![ReferenceType::new(global_type.clone()).into()], boundary);
+        let reference = ArrayReference::new(Array::from_elements(global_type, &[3f32]).unwrap());
+        assert_eq!(
+            program.interpret(vec![ArrayIrValue::Reference(reference)]),
+            Err(ProgramError::from(ShardMapError::UnreducedInputEmulationNotSupported {
+                input_index: 0,
+                axis_name: "x".to_string(),
+            })),
+        );
+    }
+
+    #[test]
+    fn test_shard_map_interpretation_without_manual_variation_writes_back_reduced_references() {
+        // Every device receives the whole value of a reduced reference without its reduced state, doubles it, and
+        // writes it back as a replicated value, so the caller's reference receives the doubled value and keeps its
+        // reduced state, as under JAX's `check_vma=False`.
+        let mesh = manual_mesh();
+        let reduced = Sharding::replicated(mesh.clone(), 1).with_reduced_axes(["x"]).unwrap();
         let boundary = ShardMapBoundary::new(mesh, vec![reduced.clone()], Vec::new(), Vec::new())
             .unwrap()
             .with_check_manual_variation(false);
-        let global_type = f32_scalar_type().with_sharding(reduced).unwrap();
+        let global_type = f32_vector_type(2).with_sharding(reduced).unwrap();
         let local_type = boundary.local_input_type(0, &global_type).unwrap();
-        let body = build_program(vec![ReferenceType::new(local_type).into()], |_, _| Vec::new());
-        assert_eq!(
-            ShardMapOperation::from_program(&body, vec![ReferenceType::new(global_type).into()], boundary),
-            Err(ShardMapError::UncheckedReferenceReductionStateNotSupported {
-                input_index: 0,
-                state_kind: ReductionStateKind::Reduced,
-                axis_name: "x".to_string(),
-            }),
+        assert_eq!(local_type, f32_vector_type(2).with_sharding(Sharding::replicated(manual_mesh(), 1)).unwrap());
+        let body = build_program(vec![ArrayIrType::Reference(ReferenceType::new(local_type))], |builder, inputs| {
+            let value =
+                builder.add_instruction(ReferenceReadOperation::new(), Vec::new(), vec![inputs[0]], None).unwrap()[0];
+            let add_update = ReferenceAddUpdateOperation::new();
+            builder.add_instruction(add_update, Vec::new(), vec![inputs[0], value], None).unwrap();
+            Vec::new()
+        });
+        let program = caller_typed_shard_map_program(
+            body,
+            vec![ArrayIrType::Reference(ReferenceType::new(global_type.clone()))],
+            boundary,
         );
+        let reference = ArrayReference::new(Array::from_elements(global_type.clone(), &[1.0f32, 2.0]).unwrap());
+        assert_eq!(program.interpret(vec![ArrayIrValue::Reference(reference.clone())]), Ok(Vec::new()));
+        assert_eq!(reference.read(), Ok(Array::from_elements(global_type, &[2.0f32, 4.0]).unwrap()));
     }
 
     #[test]
@@ -22167,6 +22170,134 @@ mod tests {
             Ok(vec![ArrayIrValue::Reference(destination.clone())]),
         );
         assert_eq!(destination.read(), Ok(Array::scalar(12f32).unwrap()));
+    }
+
+    #[test]
+    fn test_shard_map_transposition_without_manual_variation_accumulates_read_only_reduced_references() {
+        // Each device reads the whole reduced scalar and returns one tile. The cotangent of a reduced reference is
+        // unreduced, so each device's contribution is its own summand of the cotangent, which the transposed map
+        // returns without summing it along `x`, and which the caller's unreduced gradient reference accumulates once.
+        let mesh = manual_mesh();
+        let reduced = Sharding::replicated(mesh.clone(), 0).with_reduced_axes(["x"]).unwrap();
+        let sharded = sharded_along_x();
+        let boundary = ShardMapBoundary::new(mesh.clone(), vec![reduced.clone()], vec![sharded.clone()], Vec::new())
+            .unwrap()
+            .with_check_manual_variation(false);
+        let global_type = f32_scalar_type().with_sharding(reduced.clone()).unwrap();
+        let scalar_type = boundary.local_input_type(0, &global_type).unwrap();
+        let tile_type = f32_vector_type(1).with_sharding(Sharding::replicated(mesh, 1)).unwrap();
+        let body = build_program(vec![ReferenceType::new(scalar_type.clone()).into()], |builder, inputs| {
+            let value =
+                builder.add_instruction(ReferenceReadOperation::new(), Vec::new(), inputs.to_vec(), None).unwrap()[0];
+            builder
+                .add_instruction(
+                    ArrayOperation::Reshape(
+                        ReshapeOperation::new(tile_type.shape().clone())
+                            .with_output_sharding(tile_type.sharding().cloned()),
+                    ),
+                    Vec::new(),
+                    vec![value],
+                    None,
+                )
+                .unwrap()
+                .to_vec()
+        });
+        let program = caller_typed_shard_map_program(body, vec![ReferenceType::new(global_type).into()], boundary);
+        let transposed = program.transpose_with_respect_to(&[0], &[CotangentDestinationKind::Reference]).unwrap();
+        let seed_type = f32_vector_type(2).with_sharding(sharded.clone()).unwrap();
+        let unreduced = reduced.cotangent();
+        let cotangent_type = f32_scalar_type().with_sharding(unreduced.clone()).unwrap();
+        let replicated = scalar_type.sharding().unwrap();
+        assert_eq!(
+            transposed.to_string(),
+            formatdoc! {"
+                lambda %0:{seed_type}, %1:ref<{cotangent_type}> .
+                let %2:{cotangent_type} = shard_map [
+                    mesh=['x'=2:manual],
+                    input_shardings=[{sharded}],
+                    output_shardings=[{unreduced}],
+                    manual_axes=['x'],
+                    check_manual_variation=false,
+                    global_input_types=[{seed_type}],
+                    global_output_types=[{cotangent_type}],
+                ] %0 [
+                    body={{
+                        lambda %0:{tile_type} .
+                        let %1:{scalar_type} = zero [type={scalar_type}]
+                            %2:ref<{scalar_type}> = reference_new %1
+                            %3:{scalar_type} = reshape [shape=[], output_sharding={replicated}] %0
+                            () = reference_add_update %2 %3
+                            %4:{scalar_type} = reference_freeze %2
+                        in (%4)
+                    }},
+                ]
+                    () = reference_add_update %1 %2
+                in (%1)"},
+        );
+        let destination = ArrayReference::new(Array::from_elements(cotangent_type.clone(), &[7f32]).unwrap());
+        assert_eq!(
+            transposed.interpret(vec![f32_value(seed_type, &[2.0, 3.0]), ArrayIrValue::Reference(destination.clone())]),
+            Ok(vec![ArrayIrValue::Reference(destination.clone())]),
+        );
+        assert_eq!(destination.read(), Ok(Array::from_elements(cotangent_type, &[12f32]).unwrap()));
+    }
+
+    #[test]
+    fn test_shard_map_transposition_without_manual_variation_of_mutated_reduced_gradient_references() {
+        // The body doubles a reduced reference in place. Its gradient reference is unreduced, so each device can
+        // accumulate its own summand of the cotangent in place, without the aggregation that a mutated replicated
+        // gradient reference would need, as under JAX's `check_vma=False`. The reference backend cannot hold those
+        // summands, so it rejects the transposed map, which compiled backends execute.
+        let mesh = manual_mesh();
+        let reduced = Sharding::replicated(mesh.clone(), 0).with_reduced_axes(["x"]).unwrap();
+        let boundary = ShardMapBoundary::new(mesh, vec![reduced.clone()], Vec::new(), Vec::new())
+            .unwrap()
+            .with_check_manual_variation(false);
+        let global_type = f32_scalar_type().with_sharding(reduced.clone()).unwrap();
+        let local_type = boundary.local_input_type(0, &global_type).unwrap();
+        let body = build_program(vec![ReferenceType::new(local_type.clone()).into()], |builder, inputs| {
+            let state =
+                builder.add_instruction(ReferenceReadOperation::new(), Vec::new(), vec![inputs[0]], None).unwrap()[0];
+            builder
+                .add_instruction(ReferenceAddUpdateOperation::new(), Vec::new(), vec![inputs[0], state], None)
+                .unwrap();
+            Vec::new()
+        });
+        let program = caller_typed_shard_map_program(body, vec![ReferenceType::new(global_type).into()], boundary);
+        let transposed = program.transpose_with_respect_to(&[0], &[CotangentDestinationKind::Reference]).unwrap();
+        let unreduced = reduced.cotangent();
+        let cotangent_type = f32_scalar_type().with_sharding(unreduced.clone()).unwrap();
+        assert_eq!(
+            transposed.to_string(),
+            formatdoc! {"
+                lambda %0:ref<{cotangent_type}> .
+                let %1:ref<{cotangent_type}> = shard_map [
+                    mesh=['x'=2:manual],
+                    input_shardings=[{unreduced}],
+                    output_shardings=[{unreduced}],
+                    manual_axes=['x'],
+                    check_manual_variation=false,
+                    global_input_types=[ref<{cotangent_type}>],
+                    global_output_types=[ref<{cotangent_type}>],
+                    output_forwarding=[0],
+                ] %0 [
+                    body={{
+                        lambda %0:ref<{local_type}> .
+                        let %1:{local_type} = reference_read %0
+                            () = reference_add_update %0 %1
+                        in (%0)
+                    }},
+                ]
+                in (%0)"},
+        );
+        let destination = ArrayReference::new(Array::from_elements(cotangent_type, &[3f32]).unwrap());
+        assert_eq!(
+            transposed.interpret(vec![ArrayIrValue::Reference(destination)]),
+            Err(ProgramError::from(ShardMapError::UnreducedInputEmulationNotSupported {
+                input_index: 0,
+                axis_name: "x".to_string(),
+            })),
+        );
     }
 
     #[test]

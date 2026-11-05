@@ -3569,18 +3569,18 @@ fn validate_scan_iteration_count<T: ScanType>(
 /// together with the scan dimension. A placement over [`Auto`](MeshAxisType::Auto) mesh axes on the scan axis is
 /// only a hint for the compiler, so the slice drops it: each iteration reads a single position of that axis, and the
 /// compiler remains free to place the slice. A placement over [`Manual`](MeshAxisType::Manual) mesh axes only
-/// distributes the stack, as for [`scan_stack_type`], so the slice drops it as well without varying along those axes.
-/// A scan axis sharded over [`Explicit`](MeshAxisType::Explicit) mesh axes is rejected, because only an explicit
-/// reshard can remove an explicit placement.
+/// distributes the stack, so the slice drops it without varying along those axes (refer to
+/// [`ArrayType::without_dimension`]). A scan axis sharded over [`Explicit`](MeshAxisType::Explicit)
+/// mesh axes is rejected, because only an explicit reshard can remove an explicit placement.
 fn scan_slice_type(stacked_type: &ArrayType, axis: usize) -> Result<(ArrayType, Dimension), TypeError> {
     let mut stacked_type = stacked_type.clone();
     if let Some(sharding) = stacked_type.sharding()
         && let Some(ShardingDimension::Sharded(axis_names)) = sharding.dimensions().get(axis)
-        && axis_names.iter().any(|name| sharding.mesh().axis_type(name) != Some(MeshAxisType::Explicit))
+        && axis_names.iter().any(|name| sharding.mesh().axis_type(name) == Some(MeshAxisType::Auto))
     {
         let axis_names = axis_names
             .iter()
-            .filter(|name| sharding.mesh().axis_type(name) == Some(MeshAxisType::Explicit))
+            .filter(|name| sharding.mesh().axis_type(name) != Some(MeshAxisType::Auto))
             .cloned()
             .collect::<Vec<_>>();
         let mut dimensions = sharding.dimensions().to_vec();

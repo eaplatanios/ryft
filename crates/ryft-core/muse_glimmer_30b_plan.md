@@ -377,7 +377,7 @@ amax tracker) are tracked in the Gemma plan §4.2 and apply here identically.
   the exact interface must come from [arXiv:2602.06036](https://arxiv.org/abs/2602.06036) and
   the released drafter weights — flagged as the M4 unknown.
 - **Shared gaps with the Gemma plan** (not Muse-specific): optimizer module, mixed-precision
-  policy, model crate, `CompiledXlaFunction::batch` stub (vmap-of-jit only).
+  policy, model crate, `CompiledFunction::batch` stub (vmap-of-jit only).
 
 ---
 
