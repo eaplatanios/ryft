@@ -1,13 +1,3 @@
-//! Immediate operation execution and constant materialization for XLA domains.
-//!
-//! A [`Domain`] implements [`Context`] over concrete [`Value`]s. Host reference operations update shared reference
-//! handles directly, and nullary identities upload constants without compiling a program. Other operations trace a
-//! single application and reuse a compiled artifact through the owning session's eager dispatch cache.
-//!
-//! Eager cache keys include the operation, attached regions, input types and dimension extents, selected mesh, and
-//! compilation options. A cache hit skips tracing and lowering while execution still uses the invoking domain's effect
-//! scope and runtime resources.
-
 use std::borrow::Cow;
 use std::cell::RefCell;
 use std::collections::HashMap;
@@ -56,7 +46,8 @@ pub(super) const EAGER_DISPATCH_CACHE_CAPACITY: usize = 4096;
 /// locations are those of the first application.
 ///
 /// Keys are compared and hashed through [`EagerDispatchKeyView`], which they share with the borrowed
-/// [`EagerDispatchQuery`] that eager dispatch uses to look up hits.
+/// [`EagerDispatchQuery`] that eager dispatch uses to look up hits. Cache hits skip tracing and lowering while
+/// execution still uses the invoking domain's effect scope and runtime resources.
 #[derive(Clone)]
 pub(super) struct EagerDispatchKey {
     /// Applied operation, compared and hashed with all of its attributes.

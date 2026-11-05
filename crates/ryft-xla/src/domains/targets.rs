@@ -1,14 +1,3 @@
-//! Owned descriptions of the platforms and devices used to compile and execute XLA programs.
-//!
-//! A [`Target`] captures platform, plugin, and device facts from a PJRT [`Client`]. Each [`TargetDevice`] combines
-//! a device's mesh identity with its capabilities and addressability relative to that client. Lowering uses these
-//! facts to select implementations, executable loading uses them to check compatibility, and execution uses them to
-//! validate device placement.
-//!
-//! [`Target::from_client`] copies the descriptions into Rust-owned data. [`Session::target`](crate::Session::target)
-//! captures them once on first use and shares the snapshot with its domains. Inspecting a snapshot performs no
-//! further PJRT queries. Live execution resources remain with the client and session.
-
 use std::collections::{BTreeMap, HashSet};
 
 use ryft_core::{Device, DeviceId, DeviceMesh};

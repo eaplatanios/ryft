@@ -28,10 +28,10 @@ pub struct Event<O> {
     /// Shared ownership and synchronization [`EventState`] for the underlying PJRT event.
     state: Arc<EventState>,
 
-    /// "Payload" that this [`Event`] carries. Specifically, this payload will be [`Some`] throughout the lifetime of
+    /// "Payload" that this [`Event`] carries. Specifically, this payload will be present throughout the lifetime of
     /// this [`Event`] and will be returned when it completes (i.e., when its underlying computation completes) via
-    /// [`Event::await`] or [`Event::poll`].
-    output: Option<O>,
+    /// [`Event::await`] or [`Event::poll`]. Refer to [`EventOutput`] for how it is stored.
+    output: EventOutput<O>,
 
     /// Indicates whether a native "on-ready" callback that wakes the [`Waker`] stored in [`EventState::waker`] has
     /// already been registered for the underlying PJRT event. This is only ever accessed by [`Event::poll`], whose
@@ -55,11 +55,30 @@ impl<O> Event<O> {
         } else {
             Ok(Self {
                 state: Arc::new(EventState { api, handle: EventHandle(handle), waker: OnceLock::new() }),
-                output: Some(output),
+                output: EventOutput::Owned(Some(output)),
                 callback_registered: Cell::new(false),
                 marker: PhantomData,
             })
         }
+    }
+
+    /// Returns this [`Event`] with its payload moved into storage that the underlying computation keeps alive until it
+    /// completes, for payloads that the computation writes into (e.g., the owned host destination of a device-to-host
+    /// copy). The storage is shared with a native "on-ready" callback that releases it on completion, so dropping the
+    /// [`Event`] before then neither frees the payload while the computation may still write into it nor blocks the
+    /// dropping thread. When the callback cannot be registered (e.g., because the plugin lacks `PJRT_Event_OnReady`),
+    /// completion can no longer be observed after the [`Event`] is dropped, so the payload is leaked instead.
+    pub(crate) fn retain_output(mut self) -> Self
+    where
+        O: Send + 'static,
+    {
+        let output = Arc::new(Mutex::new(self.output.take()));
+        let retained = Arc::clone(&output);
+        if self.on_ready(move |_| drop(retained)).is_err() {
+            std::mem::forget(Arc::clone(&output));
+        }
+        self.output = EventOutput::Retained(output);
+        self
     }
 
     /// Checks if the underlying computation of this [`Event`] has finished executing and returns `true` if it has and
@@ -112,7 +131,7 @@ impl<O> Event<O> {
         // this function has been called, and this function consumes `self`.
         let mut event = self;
         invoke_pjrt_api_error_fn!(event.state.api, PJRT_Event_Await, { event = event.state.handle.0 })
-            .map(|_| event.output.take().unwrap())
+            .map(|_| event.take_output())
     }
 
     /// Returns an [`Error`] that was encountered while waiting for the underlying computation of this [`Event`] to
@@ -137,6 +156,11 @@ impl<O> Event<O> {
         use ffi::PJRT_Event_Error_Args;
         invoke_pjrt_api_error_fn!(self.state.api, PJRT_Event_Error, { event = self.state.handle.0 }).err()
     }
+
+    /// Takes the payload of this [`Event`], which must not have been taken already.
+    fn take_output(&mut self) -> O {
+        self.output.take().unwrap()
+    }
 }
 
 impl<O> Future for Event<O> {
@@ -149,7 +173,7 @@ impl<O> Future for Event<O> {
         match self.ready() {
             Ok(true) => match self.error() {
                 Ok(Some(error)) => Poll::Ready(Err(error)),
-                Ok(None) => Poll::Ready(Ok(unsafe { self.get_unchecked_mut().output.take().unwrap() })),
+                Ok(None) => Poll::Ready(Ok(unsafe { self.get_unchecked_mut().take_output() })),
                 // `Err` is only ever returned by `self.error()` if `self.ready()` is `false` and therefore,
                 // the following branch is unreachable.
                 Err(_) => unreachable!(),
@@ -176,7 +200,7 @@ impl<O> Future for Event<O> {
                     Some(Ok(())) => match self.ready() {
                         Ok(true) => match self.error() {
                             Ok(Some(error)) => Poll::Ready(Err(error)),
-                            Ok(None) => Poll::Ready(Ok(unsafe { self.get_unchecked_mut().output.take().unwrap() })),
+                            Ok(None) => Poll::Ready(Ok(unsafe { self.get_unchecked_mut().take_output() })),
                             // `Err` is only ever returned by `self.error()` if `self.ready()` is `false` and therefore,
                             // the following branch is unreachable.
                             Err(_) => unreachable!(),
@@ -328,6 +352,28 @@ impl Drop for EventState {
         use ffi::PJRT_Event_Destroy_Args;
         invoke_pjrt_api_error_fn!(self.api, PJRT_Event_Destroy, { event = self.handle.0 })
             .expect("failed to destroy PJRT event");
+    }
+}
+
+/// Payload of an [`Event`], which the [`Event`] either owns or shares with a native "on-ready" callback that keeps it
+/// alive until the underlying computation completes (e.g., the host destination of a device-to-host copy, which the
+/// computation writes into). Refer to [`Event::retain_output`] for more information.
+enum EventOutput<O> {
+    /// Payload owned by the [`Event`], which is [`None`] once it has been taken.
+    Owned(Option<O>),
+
+    /// Payload shared with the native "on-ready" callback that retains it until the computation completes,
+    /// which is [`None`] once it has been taken.
+    Retained(Arc<Mutex<Option<O>>>),
+}
+
+impl<O> EventOutput<O> {
+    /// Takes the payload, returning [`None`] if it has already been taken.
+    fn take(&mut self) -> Option<O> {
+        match self {
+            Self::Owned(output) => output.take(),
+            Self::Retained(output) => output.lock().expect("PJRT event output mutex poisoned").take(),
+        }
     }
 }
 
@@ -717,6 +763,45 @@ mod tests {
             event.r#await(),
             Err(Error::Unimplemented { message, .. }) if message == "test terminal failure",
         ));
+    }
+
+    #[test]
+    fn test_retained_event_output_outlives_a_cancelled_pending_event() {
+        // The payload of a retained event stands in for the destination of an in-flight copy, which must stay alive
+        // until the computation completes even when the event is dropped first, and dropping must not block.
+        let client = test_cpu_client();
+        let payload = Arc::new(());
+        let (event, promise) = client.event(Arc::clone(&payload)).unwrap();
+        let event = event.retain_output();
+        drop(event);
+        assert_eq!(Arc::strong_count(&payload), 2);
+        promise.set(None).unwrap();
+        let deadline = std::time::Instant::now() + std::time::Duration::from_secs(1);
+        while Arc::strong_count(&payload) > 1 && std::time::Instant::now() < deadline {
+            std::thread::yield_now();
+        }
+        assert_eq!(Arc::strong_count(&payload), 1);
+
+        // A completed retained event returns its payload.
+        let (event, promise) = client.event(Arc::clone(&payload)).unwrap();
+        let event = event.retain_output();
+        promise.set(None).unwrap();
+        assert!(Arc::ptr_eq(&event.r#await().unwrap(), &payload));
+    }
+
+    #[test]
+    fn test_retained_event_output_is_leaked_without_completion_callbacks() {
+        // Without `PJRT_Event_OnReady`, completion cannot be observed once the event is dropped, so its payload is
+        // leaked rather than released while the computation may still write into it.
+        let client = test_cpu_client();
+        let mut table = Box::new(unsafe { std::ptr::read(client.api().to_c_api()) });
+        table.PJRT_Event_OnReady = None;
+        let api = unsafe { Api::from_c_api(&*table) }.unwrap();
+        let payload = Arc::new(());
+        let (event, promise) = api.event(Arc::clone(&payload)).unwrap();
+        drop(event.retain_output());
+        promise.set(None).unwrap();
+        assert_eq!(Arc::strong_count(&payload), 2);
     }
 
     #[test]

@@ -1,13 +1,3 @@
-//! Lowering, compilation, and cache integration for XLA domains.
-//!
-//! A [`Domain`] implements the backend stages of [`CompilationDomain`]. Lowering produces a [`LoweredProgram`] with
-//! StableHLO, effective compilation options, and the logical-to-physical invocation contract. Compilation loads that
-//! program through PJRT and retains the contract in a [`CompiledProgram`].
-//!
-//! [`DispatchKey`] identifies a retained dispatch specialization, while [`CompilationKey`] identifies the complete
-//! lowered computation and its target configuration. The [`CompilationCacheDomain`] implementation validates reused
-//! artifacts before execution and delegates their versioned transport to [`persistence`](crate::domains::persistence).
-
 use std::collections::HashSet;
 use std::sync::{Arc, OnceLock};
 use std::time::Instant;
@@ -156,6 +146,10 @@ impl BucketedDispatchSignature {
 /// Unlike the former call-site fingerprint, this key carries the complete StableHLO computation and every
 /// execution-relevant field retained by [`LoweredProgram`]. Equality therefore means that cached compiled
 /// artifacts are interchangeable, even when unrelated call sites happen to share the same input signature.
+///
+/// Dynamic dimensions are numbered by first occurrence, so diagnostic variable names do not affect identity.
+/// Compilation options, shardings, target facts, runtime requirements, and effect metadata remain part of the key.
+/// This complete compilation identity is distinct from a [`DispatchKey`], which selects a retained specialization.
 #[derive(Clone, Debug, PartialEq, Eq, Hash)]
 pub struct CompilationKey {
     /// Complete canonical compilation contract, compared and hashed without reducing it to a fingerprint.
@@ -196,6 +190,15 @@ impl<'c> CompilationDomain for Domain<'c> {
                             "input-bound bucketing only supports array inputs, but input {} has first-class dimension \
                              type {}",
                             input_index, r#type,
+                        ),
+                    }));
+                }
+                ArrayIrType::Future(_) => {
+                    return Err(Error::Compilation(CompilationError::InvalidOptions {
+                        reason: format!(
+                            "input-bound bucketing only supports array inputs, but input {input_index} has future type \
+                             {type}",
+                            type = r#type,
                         ),
                     }));
                 }
@@ -860,7 +863,7 @@ fn apply_signature_shardings(
     for (r#type, sharding) in types.iter_mut().zip(shardings) {
         *r#type = match r#type {
             ArrayIrType::Array(array_type) => array_type.clone().with_sharding(sharding.clone())?.into(),
-            ArrayIrType::Dimension(_) | ArrayIrType::Reference(_) => {
+            ArrayIrType::Dimension(_) | ArrayIrType::Reference(_) | ArrayIrType::Future(_) => {
                 return Err(ProgramError::from(TypeError::invalid(format!(
                     "cannot apply an array sharding to type `{type}`",
                 )))
@@ -884,6 +887,7 @@ fn has_only_static_array_types(program: &FlatProgram) -> bool {
             // firing first: a dynamically shaped referent counts as dynamic so that partitioner selection and its
             // guards stay correct even for programs whose only dynamic type is a reference referent.
             ArrayIrType::Reference(reference_type) => reference_type.referent().static_shape().is_some(),
+            ArrayIrType::Future(future_type) => future_type.eventual().static_shape().is_some(),
         })
     })
 }
@@ -1082,6 +1086,7 @@ fn array_data_dependent_padding_discipline(
         | ArrayOperation::ParallelAllGather(_)
         | ArrayOperation::ParallelSumScatter(_)
         | ArrayOperation::ParallelPermute(_)
+        | ArrayOperation::ParallelBroadcast(_)
         | ArrayOperation::ParallelAllToAll(_)
         | ArrayOperation::AxisIndex(_)
         | ArrayOperation::Reverse(_)
@@ -1161,6 +1166,8 @@ fn data_dependent_padding_discipline(operation: &Operation) -> DataDependentPadd
         | Operation::ParallelAllGather(_)
         | Operation::ParallelSumScatter(_)
         | Operation::ParallelAllToAll(_)
+        | Operation::ParallelStart(_)
+        | Operation::ParallelDone(_)
         | Operation::Condition(_)
         | Operation::While(_)
         | Operation::Scan(_)

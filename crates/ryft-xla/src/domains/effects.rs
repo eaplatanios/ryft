@@ -1,13 +1,3 @@
-//! Effect ordering, completion, and recovery for XLA execution.
-//!
-//! Each [`Domain`](crate::Domain) selects a scope shared by its clones. Submissions reserve positions in that scope
-//! before dispatch, so ordered work observes its predecessors even when launches complete asynchronously. Completion
-//! records retain terminal diagnostics without retaining resources borrowed from the client.
-//!
-//! [`Domain::effects_barrier`](crate::Domain::effects_barrier) waits for earlier reservations and reports failures in
-//! submission order. Acknowledgment permits recovery only after the affected work has completed and its failures have
-//! been observed. Forking a domain's effect scope starts an independent sequence while retaining its session.
-
 use std::collections::HashSet;
 use std::sync::{Arc, Condvar, Mutex};
 
@@ -158,6 +148,11 @@ struct EffectScopeState<'c> {
 }
 
 /// Session-owned ordering and completion scope, independent of numerical values and compilation artifacts.
+///
+/// Cloned domains share their selected scope, while forking a domain starts an independent sequence. Submissions
+/// reserve positions before dispatch so ordered work observes its predecessors even when launches complete
+/// asynchronously. [`Self::barrier`] waits for earlier reservations and reports failures in submission order.
+/// [`Self::acknowledge`] permits recovery only after affected work has completed and its failures have been observed.
 #[derive(Default)]
 pub(super) struct EffectScope<'c> {
     /// Reservation, observation, and recovery state; never held across PJRT calls or device waits.

@@ -1,14 +1,3 @@
-//! XLA program artifacts and their invocation contracts.
-//!
-//! [`LoweredProgram`] owns the StableHLO and metadata produced by lowering. [`CompiledProgram`] retains a loaded PJRT
-//! executable with the same logical inputs, outputs, captures, reference bindings, and physical boundary mapping. These
-//! flat artifacts carry no Rust container structure. Typed lifecycle handles in [`crate::compilation`] retain that
-//! structure separately.
-//!
-//! Both artifacts implement [`TypedProgram`] for their logical signatures. Hidden final reference states remain in the
-//! internal invocation metadata but are excluded from public output types. Reused and replacement executables must
-//! preserve the complete invocation contract before they can be called.
-
 use std::borrow::Cow;
 use std::sync::{Arc, OnceLock};
 use std::time::Duration;
@@ -29,6 +18,14 @@ use crate::experimental::lowering::signature::ExecutableSignature;
 // TODO(eaplatanios): Review this module.
 
 /// StableHLO lowering and call-boundary metadata produced before PJRT compilation.
+///
+/// A [`Domain`](crate::domains::Domain) lowers a staged program into this artifact with its effective compilation
+/// options and the mapping between logical values and physical executable slots. PJRT compilation produces a
+/// [`CompiledProgram`] retaining the same invocation contract.
+///
+/// This flat artifact implements [`TypedProgram`] for its logical signature. Typed function handles in
+/// [`crate::compilation`] additionally retain the Rust input and output container structures. Hidden final reference
+/// states remain in the internal metadata but are excluded from the public output types.
 #[derive(Clone, Debug)]
 pub struct LoweredProgram {
     /// Textual StableHLO/Shardy module accepted by PJRT.
@@ -158,6 +155,17 @@ impl TypedProgram for LoweredProgram {
 }
 
 /// Loaded PJRT executable plus the metadata required to invoke it safely.
+///
+/// Compilation retains the [`LoweredProgram`]'s logical inputs, outputs, captures, reference bindings, and physical
+/// boundary mapping alongside a reusable execution plan. This flat artifact implements [`TypedProgram`] for its
+/// logical signature, excluding hidden final reference states from public output types. Typed function handles in
+/// [`crate::compilation`] retain the Rust container structures separately. Reused and replacement executables must
+/// preserve the complete invocation contract before execution.
+///
+/// The invoking [`Domain`](crate::domains::Domain) validates inputs, resolves placement and runtime resources,
+/// materializes bounded dynamic arguments, and reconstructs logical outputs. Ordinary calls carry completion through
+/// their outputs. Stateful calls coordinate external references through [`ryft_core::StatefulExecution`], publishing
+/// mutations only after submission and tracking completion of the whole invocation.
 #[derive(Clone)]
 pub struct CompiledProgram<'c> {
     /// Loaded PJRT executable, shared by cloned program handles.

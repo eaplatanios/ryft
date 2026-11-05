@@ -1,64 +1,3 @@
-//! Runtime requirements and client-associated extensions used by XLA sessions.
-//!
-//! A [`RuntimeRequirement`] describes the versioned runtime contract needed by a lowered executable. A
-//! [`RuntimeProvider`] admits that contract for a live PJRT [`Client`] and creates a [`RuntimeExtension`]. Providers
-//! are configured through [`RuntimeExtensions`], while each session owns its own lazy instances. Compiled programs
-//! retain only requirements, so cached executables do not retain their producing session.
-//!
-//! Extensions contribute to one lazily created execution context through [`ExecutionResources`]. The session retains
-//! their resources until whole-execution completion, including after outputs are discarded. Ordinary execution and
-//! registration-only extensions create no execution context and introduce no additional destruction barrier.
-//!
-//! Providers register native types and handlers directly through PJRT during initialization. Types use explicit IDs
-//! from [`named_ffi_type_id`], which XLA registers idempotently, and XLA accepts re-registration of an identical
-//! handler. Each session's providers can therefore register again without process-global bookkeeping, and native
-//! handlers read their user data with the same constant ID.
-//!
-//! Providers may borrow the client without requiring a `'static` runtime. For example, a downstream crate can add a
-//! registration-only contract alongside the built-in providers and annotate its custom calls with the same requirement.
-//!
-//! ```no_run
-//! use std::sync::Arc;
-//!
-//! use ryft_core::{CompilationContext, CustomCallOperation};
-//! use ryft_pjrt::Client;
-//! use ryft_xla::domains::{
-//!     RuntimeExtension, RuntimeExtensions, RuntimeProvider, RuntimeRequirement, with_runtime_requirements,
-//! };
-//! use ryft_xla::{Error, RuntimeError, Session, Target};
-//!
-//! struct Provider;
-//! struct Runtime<'c> { client: &'c Client<'c> }
-//! impl<'c> RuntimeExtension<'c> for Runtime<'c> {}
-//!
-//! impl<'c> RuntimeProvider<'c> for Provider {
-//!     fn identifier(&self) -> &str { "example.runtime" }
-//!
-//!     fn initialize(
-//!         &self,
-//!         client: &'c Client<'c>,
-//!         target: &Target,
-//!         requirement: &RuntimeRequirement,
-//!     ) -> Result<Arc<dyn RuntimeExtension<'c> + 'c>, Error> {
-//!         if requirement.abi_version() != 1 {
-//!             return Err(RuntimeError::UnsupportedVersion {
-//!                 identifier: self.identifier().into(), version: requirement.abi_version(),
-//!             }.into());
-//!         }
-//!         // Validate configuration and target capabilities, then register this contract's native handlers here.
-//!         Ok(Arc::new(Runtime { client }))
-//!     }
-//! }
-//!
-//! fn configure<'c>(client: &'c Client<'c>) -> Result<Arc<Session<'c>>, Error> {
-//!     let providers = RuntimeExtensions::new().with_provider(Arc::new(Provider))?;
-//!     let requirement = RuntimeRequirement::new("example.runtime", 1, [])?;
-//!     let operation = with_runtime_requirements(CustomCallOperation::new("example.call", vec![]), [requirement])?;
-//!     // Apply `operation` in the staged program. XLA consumes its reserved runtime annotation during lowering.
-//!     Ok(Session::with_runtime_extensions(client, CompilationContext::new(), providers))
-//! }
-//! ```
-
 use std::collections::{BTreeMap, HashMap, HashSet};
 use std::fmt::{Debug, Formatter};
 use std::io::Write;
@@ -124,6 +63,9 @@ pub const MAX_RUNTIME_REQUIREMENTS_BYTES: usize = 1024 * 1024;
 /// Identifiers must be nonempty and contain no NUL. Providers own their ABI version and the interpretation of their
 /// canonical configuration bytes. Configuration describes runtime setup; per-kernel parameters remain in the kernel
 /// payload. Process-local registration IDs, pointers, and Rust type IDs must never appear here.
+///
+/// Compiled programs retain only these requirements. The invoking [`Session`](crate::Session) resolves them through
+/// its configured [`RuntimeProvider`]s, so cached executables retain no producing session or initialized extensions.
 #[derive(Clone, Debug, PartialEq, Eq, PartialOrd, Ord, Hash, Serialize)]
 pub struct RuntimeRequirement {
     /// Namespaced identity of the runtime contract.
@@ -347,6 +289,59 @@ pub const fn named_ffi_type_id(name: &str) -> FfiTypeId {
 /// and native capabilities before returning an instance. Instances must not retain an owning session handle.
 /// Reentry into an unfinished initializer is rejected. A nested initialization also cannot wait for another thread's
 /// initializer in the same session, which prevents dependency cycles between concurrent providers.
+///
+/// Providers register native types with explicit IDs from [`named_ffi_type_id`] and handlers through PJRT during
+/// initialization. Type registration is idempotent, and XLA accepts re-registration of an identical handler. Each
+/// session's providers can therefore register again without process-global bookkeeping, while native handlers look
+/// up their user data with the same constant ID.
+///
+/// Providers and extensions may borrow the client without requiring a `'static` runtime. For example, a downstream
+/// crate can add a registration-only contract alongside the built-in providers and annotate its custom calls with
+/// the same requirement.
+///
+/// # Example
+///
+/// ```no_run
+/// use std::sync::Arc;
+///
+/// use ryft_core::{CompilationContext, CustomCallOperation};
+/// use ryft_pjrt::Client;
+/// use ryft_xla::domains::{
+///     RuntimeExtension, RuntimeExtensions, RuntimeProvider, RuntimeRequirement, with_runtime_requirements,
+/// };
+/// use ryft_xla::{Error, RuntimeError, Session, Target};
+///
+/// struct Provider;
+/// struct Runtime<'c> { client: &'c Client<'c> }
+/// impl<'c> RuntimeExtension<'c> for Runtime<'c> {}
+///
+/// impl<'c> RuntimeProvider<'c> for Provider {
+///     fn identifier(&self) -> &str { "example.runtime" }
+///
+///     fn initialize(
+///         &self,
+///         client: &'c Client<'c>,
+///         target: &Target,
+///         requirement: &RuntimeRequirement,
+///     ) -> Result<Arc<dyn RuntimeExtension<'c> + 'c>, Error> {
+///         if requirement.abi_version() != 1 {
+///             return Err(RuntimeError::UnsupportedVersion {
+///                 identifier: self.identifier().into(), version: requirement.abi_version(),
+///             }.into());
+///         }
+///         // Validate configuration and target capabilities, then register this contract's native handlers here.
+///         Ok(Arc::new(Runtime { client }))
+///     }
+/// }
+///
+/// fn configure<'c>(client: &'c Client<'c>) -> Result<Arc<Session<'c>>, Error> {
+///     let providers = RuntimeExtensions::new().with_provider(Arc::new(Provider))?;
+///     let requirement = RuntimeRequirement::new("example.runtime", 1, [])?;
+///     let operation = with_runtime_requirements(CustomCallOperation::new("example.call", vec![]), [requirement])?;
+///     // Apply `operation` in the staged program. XLA consumes its reserved runtime annotation during lowering.
+///     Ok(Session::with_runtime_extensions(client, CompilationContext::new(), providers))
+/// }
+/// ```
 pub trait RuntimeProvider<'c>: Send + Sync {
     /// Returns the contract identifier this provider implements.
     fn identifier(&self) -> &str;
@@ -393,6 +388,9 @@ pub trait RuntimeExtension<'c>: Send + Sync {
 }
 
 /// Immutable provider configuration, independent of initialized session runtime instances.
+///
+/// Configure [`RuntimeProvider`]s before constructing a [`Session`](crate::Session). Each session initializes its own
+/// instances lazily when a compiled program requires them.
 #[derive(Clone)]
 pub struct RuntimeExtensions<'c> {
     /// Providers keyed by their public contract identifiers.
@@ -469,7 +467,9 @@ impl<T: Send + Sync> RetainedResource for T {}
 /// Invocation data and owners prepared before one native submission.
 ///
 /// Retain stable allocations such as `Arc<T>` before attaching pointers into them. On preparation failure, the context
-/// is destroyed before retained owners. After submission, the session retains owners through the joined fence.
+/// is destroyed before retained owners. After submission, the session retains owners through the joined fence,
+/// including when outputs are discarded. Extensions contribute to one lazily created execution context. Ordinary
+/// execution and registration-only extensions create no context and introduce no additional destruction barrier.
 pub struct ExecutionResources<'c> {
     /// Client receiving this invocation's context.
     client: &'c Client<'c>,

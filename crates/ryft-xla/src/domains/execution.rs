@@ -1,13 +1,3 @@
-//! Invocation of loaded XLA programs on their owning PJRT client.
-//!
-//! A [`CompiledProgram`] retains an execution plan for its physical arguments, results, device assignment, and effects.
-//! The invoking [`Domain`] validates logical inputs, resolves placement, materializes bounded dynamic arguments, and
-//! reconstructs logical outputs from the executable's physical boundary.
-//!
-//! Ordinary calls carry completion through their outputs. Stateful calls additionally coordinate external references
-//! through [`StatefulExecution`], publishing mutations only after submission and tracking the completion of the whole
-//! invocation. [`ExecutionError`] describes failures in these backend execution and effect protocols.
-
 use std::cell::RefCell;
 use std::collections::BTreeMap;
 use std::sync::Arc;

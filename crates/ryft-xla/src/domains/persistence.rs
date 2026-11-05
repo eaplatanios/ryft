@@ -1,14 +1,3 @@
-//! Versioned compilation identities and executable transport for XLA domains.
-//!
-//! A [`LoweredProgram`] encodes its complete compilation contract into a [`CompilationKey`]. Dynamic dimensions are
-//! numbered by first occurrence so diagnostic variable names do not affect canonical identity. Compilation options,
-//! shardings, target facts, runtime requirements, and effect metadata remain part of that identity.
-//!
-//! A [`CompiledProgram`] can serialize its invocation metadata alongside native PJRT executable bytes. The loading
-//! [`Domain`] validates the envelope, target, runtime contracts, and logical-to-physical signature before loading those
-//! bytes. Unsupported versions or target configurations are cache misses, while malformed supported metadata is an
-//! error. Persistent cache directories must therefore be trusted sources of executable code.
-
 use std::sync::{Arc, LazyLock, OnceLock};
 use std::time::Duration;
 
@@ -1206,6 +1195,10 @@ impl CompiledProgram<'_> {
 impl<'c> Domain<'c> {
     /// Validates and loads a versioned executable envelope for this domain. Unsupported schemas, target configurations,
     /// or PJRT loading return `None`. Malformed supported metadata returns an error.
+    ///
+    /// The envelope, target, runtime contracts, and signature mapping logical values to physical executable slots are
+    /// validated before loading the native PJRT executable bytes. Persistent cache directories must be trusted sources
+    /// of executable code.
     pub(super) fn deserialize_compiled_program(&self, bytes: &[u8]) -> Result<Option<CompiledProgram<'c>>, Error> {
         let header_size = PERSISTENT_EXECUTABLE_MAGIC.len() + size_of::<u64>();
         if bytes.len() < header_size {

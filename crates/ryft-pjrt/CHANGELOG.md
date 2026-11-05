@@ -122,6 +122,15 @@ and this project adheres to [Semantic Versioning](https://semver.org/).
 - Fixed `LoadedExecutable::execute` destroying its `ExecutionContext` when the call returned, even though PJRT only
   borrows the context while execution may still be running. The returned `ExecutionFence` now owns the context until
   every participating device completes and destroys it before reporting readiness.
+- Fixed a use-after-free when dropping the event of a pending `Buffer::copy_to_host` or `Buffer::copy_raw_to_host`
+  before the copy completed, which freed the host destination while PJRT could still write into it. The destination
+  is now retained by a native completion callback until the copy completes, so dropping the event neither frees it
+  nor blocks. If that callback cannot be registered, the destination is leaked rather than freed.
+- Made `Buffer::copy_to_host_buffer`, `Buffer::copy_raw_to_host_buffer`, and `Buffer::copy_raw_to_host_buffer_future`
+  `unsafe`, because PJRT writes into their borrowed destinations until the copy completes, independently of their
+  returned events (which safe code may drop or leak). Their safety contracts state the lifetime, access, and capacity
+  requirements, and the closure of `Buffer::copy_raw_to_host_buffer_future` now fails the transfer with an error
+  instead of passing an undersized destination to PJRT.
 - Fixed `LoadedExecutable::execute` releasing launch resources early when a failure occurred after successful native
   submission. It now waits for every participating device to complete before returning the error.
 

@@ -1,10 +1,3 @@
-//! Compiler diagnostics for loaded XLA executables.
-//!
-//! A [`CompilationAnalysis`] normalizes common PJRT cost and memory properties while retaining plugin-specific values
-//! as [`AnalysisValue`]s. Unsupported queries remain absent. The [`Domain`] caches both successful analyses and
-//! failures on the corresponding [`CompiledProgram`], so repeated inspection does not issue new backend queries.
-//! [`OptimizedProgram`] exposes the compiler's optimized representation separately, on explicit request.
-
 use std::collections::BTreeMap;
 use std::fmt::{Display, Formatter};
 use std::time::Duration;
@@ -105,6 +98,10 @@ pub struct MemoryAnalysis {
 ///
 /// PJRT plugins expose different property sets. Common properties are normalized into optional fields and every raw
 /// property is retained in [`Self::properties`]. Unsupported optional queries remain `None`.
+///
+/// [`AnalyzableCompilationDomain::analyze`] on a [`Domain`] caches both successful analyses and failures on the
+/// corresponding [`CompiledProgram`], so repeated inspection does not issue new backend queries. Optimized compiler
+/// representations are inspected separately through [`CompiledProgram::optimized_program`].
 #[derive(Clone, Debug, Serialize, PartialEq)]
 pub struct CompilationAnalysis {
     /// Estimated floating-point operation count from the plugin cost analysis, when available.

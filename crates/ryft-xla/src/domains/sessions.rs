@@ -1,13 +1,3 @@
-//! Shared ownership of XLA compilation and execution resources.
-//!
-//! A [`Session`] borrows one externally owned PJRT [`Client`] and owns its compilation caches, target snapshot, default
-//! effect scope, and runtime extension registry. Its constructors choose the cache policy, and [`Session::domain`]
-//! creates domains that share these resources.
-//!
-//! Domains and arrays retain their session, while cached executables retain no session or arrays. Separate sessions
-//! remain independent even when they borrow the same client. Observe outstanding effects through
-//! [`Session::effects_barrier`] before releasing the client when their completion must be checked.
-
 use std::sync::{Arc, OnceLock};
 
 use ryft_core::{ArrayType, CompilationContext, DeviceMesh, DiskCache, SpecializationCache};
