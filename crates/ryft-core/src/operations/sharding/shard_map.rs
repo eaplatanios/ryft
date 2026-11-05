@@ -21996,7 +21996,7 @@ mod tests {
         let operation =
             ShardMapOperation::from_boundary(boundary, vec![tangent_type.clone()], vec![tangent_type.clone()]);
         let cotangent_type = tangent_type.cotangent().unwrap();
-        let cotangent_sharding = tangent_sharding.cotangent();
+        let cotangent_sharding = tangent_sharding.cotangent().unwrap();
         let program = shard_map_program(operation, identity_body(tangent_type)).unwrap();
         let transposed = program.transpose_with_respect_to(&[0], &[CotangentDestinationKind::Reference]).unwrap();
         assert_eq!(
@@ -22042,7 +22042,7 @@ mod tests {
                 .unwrap();
         let local_cotangent_type = boundary.local_input_type(0, &tangent_type).unwrap().cotangent().unwrap();
         let cotangent_type = tangent_type.cotangent().unwrap();
-        let cotangent_sharding = tangent_sharding.cotangent();
+        let cotangent_sharding = tangent_sharding.cotangent().unwrap();
         let body = identity_body(boundary.local_input_type(0, &tangent_type).unwrap());
         let operation =
             ShardMapOperation::from_boundary(boundary, vec![tangent_type.clone()], vec![tangent_type.clone()]);
@@ -22338,7 +22338,7 @@ mod tests {
             vec![f32_vector_type(8).with_sharding(along_y.clone()).unwrap()],
             Vec::new(),
         );
-        let cotangent_sharding = along_x.cotangent();
+        let cotangent_sharding = along_x.cotangent().unwrap();
         let cotangent_type = f32_vector_type(8).with_sharding(cotangent_sharding.clone()).unwrap();
         let local_type = f32_vector_type(4)
             .with_sharding(
@@ -22349,7 +22349,7 @@ mod tests {
                     .unwrap(),
             )
             .unwrap();
-        let caller_cotangent_sharding = along_y.cotangent();
+        let caller_cotangent_sharding = along_y.cotangent().unwrap();
         let caller_cotangent_type = f32_vector_type(8).with_sharding(caller_cotangent_sharding.clone()).unwrap();
         assert_eq!(
             program.transpose_with_respect_to(&[0], &[CotangentDestinationKind::Return]).unwrap().to_string(),
@@ -22995,7 +22995,7 @@ mod tests {
         let program = caller_typed_shard_map_program(body, vec![ReferenceType::new(global_type).into()], boundary);
         let transposed = program.transpose_with_respect_to(&[0], &[CotangentDestinationKind::Reference]).unwrap();
         let seed_type = f32_vector_type(2).with_sharding(sharded.clone()).unwrap();
-        let unreduced = reduced.cotangent();
+        let unreduced = reduced.cotangent().unwrap();
         let cotangent_type = f32_scalar_type().with_sharding(unreduced.clone()).unwrap();
         let replicated = scalar_type.sharding().unwrap();
         assert_eq!(
@@ -23055,7 +23055,7 @@ mod tests {
         });
         let program = caller_typed_shard_map_program(body, vec![ReferenceType::new(global_type).into()], boundary);
         let transposed = program.transpose_with_respect_to(&[0], &[CotangentDestinationKind::Reference]).unwrap();
-        let unreduced = reduced.cotangent();
+        let unreduced = reduced.cotangent().unwrap();
         let cotangent_type = f32_scalar_type().with_sharding(unreduced.clone()).unwrap();
         assert_eq!(
             transposed.to_string(),
@@ -23651,7 +23651,7 @@ mod tests {
             )
             .unwrap();
         let cotangent_type = global_type.cotangent().unwrap();
-        let cotangent_sharding = unreduced.cotangent();
+        let cotangent_sharding = unreduced.cotangent().unwrap();
         assert_eq!(
             pullback.to_string(),
             formatdoc! {"

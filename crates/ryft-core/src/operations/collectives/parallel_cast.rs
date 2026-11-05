@@ -70,8 +70,8 @@ pub const PARALLEL_CAST_OPERATION_NAME: &str = "parallel_cast";
 /// [`Reduced`](ParallelCastTarget::Reduced) transposes to a sum of its unreduced cotangent (i.e., a mesh-form
 /// [`ParallelReduceOperation`]), and the casts to [`Varying`](ParallelCastTarget::Varying) and
 /// [`Unreduced`](ParallelCastTarget::Unreduced) transpose to each other. Placement, local shape, and the state
-/// of every other axis are preserved. Multiple axes use successive operations. Refer to the documentation of
-/// [`ParallelCast`] for more information.
+/// of every other axis are preserved. Pending reductions on any axis must be sums. Multiple axes use successive
+/// operations. Refer to the documentation of [`ParallelCast`] for more information.
 #[derive(Clone, Debug, PartialEq, Eq, Hash)]
 pub struct ParallelCastOperation {
     /// Refer to the documentation of [`axis_name`](Self::axis_name) for more information.
@@ -350,8 +350,8 @@ impl<A: Value<Type = ArrayType>> From<ParallelCastOperation> for ArrayIrOperatio
 /// Represents the ability to move a value between the variation and reduction states of a manual mesh axis. Inside
 /// a manual region (e.g., the body of a [`ShardMapOperation`](crate::ShardMapOperation)), the type of every per-device
 /// local value records one of four states for each manual axis. An _invariant_ value is the same on every device along
-/// the axis, while a _varying_ value may differ. An _unreduced_ value represents the logical sum of the per-device
-/// values, which a later sum completes. A _reduced_ value is invariant but its reverse mode cotangent is unreduced.
+/// the axis, while a _varying_ value may differ. An _unreduced_ value represents a pending reduction of the per-device
+/// values. A _reduced_ value is invariant but its reverse mode cotangent is unreduced.
 /// [`parallel_cast`](Self::parallel_cast) changes that state without changing any local value, so it lowers to
 /// nothing. It is the Ryft analogue of JAX's
 /// [`jax.lax.pcast`](https://docs.jax.dev/en/latest/301/sharding-ad.html),
@@ -362,10 +362,14 @@ impl<A: Value<Type = ArrayType>> From<ParallelCastOperation> for ArrayIrOperatio
 ///   - Invariant to [`Reduced`](ParallelCastTarget::Reduced), reduced to [`Varying`](ParallelCastTarget::Varying),
 ///     and varying to [`Unreduced`](ParallelCastTarget::Unreduced) stage a [`ParallelCastOperation`].
 ///
-/// The remaining transition, from unreduced to invariant, communicates through the sum
+/// The three [`ParallelCastOperation`] transitions support only pending reductions of kind
+/// [`Sum`](crate::UnreducedKind::Sum), because reduced and unreduced state are sum duals under transposition.
+/// These transitions reject inputs carrying another unreduced kind.
+///
+/// Completing an unreduced sum makes it invariant by communicating through
 /// [`parallel_reduce`](crate::ParallelReduce::parallel_reduce) with [`ReductionKind::Sum`] of an unreduced value, and
 /// it is the transpose of the cast to [`Reduced`](ParallelCastTarget::Reduced). Every other combination of source state
-/// and target is an error when manual variation checking is enabled, as in JAX.
+/// and target is an error when manual variation checking is enabled, same as in JAX.
 ///
 /// The axis must be bound by an enclosing manual region (i.e., a [`NamedAxis::Mesh`] binding). A binding that disables
 /// manual variation checks returns the value unchanged for every target without staging anything, because the bodies
@@ -438,7 +442,7 @@ pub trait ParallelCast<T = <Self as Capability>::Universe>: Capability + Sized {
     ///
     /// Returns a [`ProgramError`] if `axis_name` is not bound by an enclosing manual region, if this value carries
     /// a sharding on a mesh other than that of the region, or if its state along the axis is not the source state of
-    /// `target`.
+    /// `target`. A checked [`ParallelCastOperation`] transition also rejects non-sum unreduced state on any axis.
     fn parallel_cast(&self, axis_name: &str, target: ParallelCastTarget) -> Result<Self, ProgramError>;
 }
 

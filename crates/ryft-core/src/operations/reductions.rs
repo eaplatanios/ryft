@@ -2424,11 +2424,12 @@ mod tests {
         let mesh = LogicalMesh::new(vec![MeshAxis::new("x", 2, MeshAxisType::Explicit).unwrap()]).unwrap();
         let sharding = Sharding::replicated(mesh, 1);
 
-        // A sum accepts a requested output sharding, and passing `None` clears it again.
-        let operation =
-            ReduceOperation::new(vec![0], ReductionKind::Sum).with_output_sharding(sharding.clone()).unwrap();
-        assert_eq!(operation.output_sharding(), Some(&sharding));
-        assert_eq!(operation.with_output_sharding(None).unwrap().output_sharding(), None);
+        // Sums and extrema accept a requested output sharding, and passing `None` clears it again.
+        for kind in [ReductionKind::Sum, ReductionKind::Max, ReductionKind::Min] {
+            let operation = ReduceOperation::new(vec![0], kind).with_output_sharding(sharding.clone()).unwrap();
+            assert_eq!(operation.output_sharding(), Some(&sharding));
+            assert_eq!(operation.with_output_sharding(None).unwrap().output_sharding(), None);
+        }
 
         // Every other reduction kind rejects a requested output sharding when the operation is constructed, while
         // still accepting the absence of one.
@@ -2436,15 +2437,14 @@ mod tests {
             ReductionKind::Product,
             ReductionKind::Mean,
             ReductionKind::LogSumExp,
-            ReductionKind::Max,
-            ReductionKind::Min,
             ReductionKind::Any,
             ReductionKind::All,
         ] {
             assert_eq!(
                 ReduceOperation::new(vec![0], kind).with_output_sharding(sharding.clone()),
                 Err(TypeError::invalid(format!(
-                    "`reduce` with kind `{kind}` does not support a requested output sharding (only kind `sum` does)",
+                    "`reduce` with kind `{kind}` does not support a requested output sharding (only kinds `sum`, \
+                     `max`, and `min` do)",
                 ))),
             );
             assert_eq!(
@@ -2452,6 +2452,104 @@ mod tests {
                 Ok(ReduceOperation::new(vec![0], kind)),
             );
         }
+    }
+
+    #[test]
+    fn test_reduce_unreduced_kinds() {
+        // A reduction over a dimension sharded along `x` may leave its cross-device part pending, in which case its
+        // output is unreduced along `x` with the kind that this reduction defers (JAX's `reduce_max` and `reduce_min`
+        // with an unreduced `out_sharding`).
+        let mesh = LogicalMesh::new(vec![MeshAxis::new("x", 2, MeshAxisType::Explicit).unwrap()]).unwrap();
+        let sharded = ArrayType::new_static(DataType::F32, [4, 2])
+            .with_sharding(
+                Sharding::new(mesh.clone(), vec![ShardingDimension::sharded(["x"]), ShardingDimension::replicated()])
+                    .unwrap(),
+            )
+            .unwrap();
+        let unreduced = |rank: usize, kind: UnreducedKind| {
+            Sharding::replicated(mesh.clone(), rank)
+                .with_unreduced_axes(["x"])
+                .unwrap()
+                .with_unreduced_kind(kind)
+                .unwrap()
+        };
+        let unreduced_type = |shape: &[usize], kind: UnreducedKind| {
+            ArrayType::new_static(DataType::F32, shape.to_vec())
+                .with_sharding(unreduced(shape.len(), kind))
+                .unwrap()
+        };
+        for (reduction, kind) in [
+            (ReductionKind::Sum, UnreducedKind::Sum),
+            (ReductionKind::Max, UnreducedKind::Max),
+            (ReductionKind::Min, UnreducedKind::Min),
+        ] {
+            check_operation_type_inference!(
+                operation = ReduceOperation::new(vec![0], reduction).with_output_sharding(unreduced(1, kind)).unwrap(),
+                cases = [{ input_types = [sharded.clone()], output_types = [unreduced_type(&[2], kind)] }],
+            );
+        }
+        check_operation_type_inference!(
+            operation = ReduceOperation::new(vec![0], ReductionKind::Max)
+                .with_output_sharding(unreduced(1, UnreducedKind::Sum))
+                .unwrap(),
+            cases = [{
+                input_types = [sharded.clone()],
+                error = "`reduce` with kind `max` output sharding unreduced axes must have kind `max` but got kind \
+                         `sum`",
+            }],
+        );
+
+        // A reduction of an unreduced input must commute with the input's pending reduction, and its output keeps
+        // the input's unreduced axes and kind.
+        for (reduction, kind) in [
+            (ReductionKind::Sum, UnreducedKind::Sum),
+            (ReductionKind::Mean, UnreducedKind::Sum),
+            (ReductionKind::Max, UnreducedKind::Max),
+            (ReductionKind::Min, UnreducedKind::Min),
+        ] {
+            check_operation_type_inference!(
+                operation = ReduceOperation::new(vec![0], reduction),
+                cases = [{ input_types = [unreduced_type(&[2], kind)], output_types = [unreduced_type(&[], kind)] }],
+            );
+        }
+        for (reduction, kind, expected) in [
+            (ReductionKind::Sum, UnreducedKind::Max, "sum"),
+            (ReductionKind::Mean, UnreducedKind::Min, "sum"),
+            (ReductionKind::Max, UnreducedKind::Sum, "max"),
+            (ReductionKind::Min, UnreducedKind::Max, "min"),
+        ] {
+            check_operation_type_inference!(
+                operation = ReduceOperation::new(vec![0], reduction),
+                cases = [{
+                    input_types = [unreduced_type(&[2], kind)],
+                    error = format!(
+                        "`reduce` with kind `{reduction}` supports only unreduced inputs of kind `{expected}` but got \
+                         kind `{kind}`",
+                    ),
+                }],
+            );
+        }
+        for reduction in [ReductionKind::Product, ReductionKind::LogSumExp] {
+            check_operation_type_inference!(
+                operation = ReduceOperation::new(vec![0], reduction),
+                cases = [{
+                    input_types = [unreduced_type(&[2], UnreducedKind::Max)],
+                    error = format!("`reduce` with kind `{reduction}` cannot reduce inputs with unreduced axes"),
+                }],
+            );
+        }
+
+        // Concrete arrays evaluate the same rules and record the requested sharding.
+        let input = Array::from_logical_bytes(
+            sharded.clone(),
+            &Array::matrix(4, 2, vec![1.0f32, 7.0, 5.0, 2.0, 0.0, 3.0, 4.0, 6.0]).unwrap().logical_bytes(),
+        )
+        .unwrap();
+        let output = input
+            .reduce_with_output_sharding(&[0], ReductionKind::Max, Some(unreduced(1, UnreducedKind::Max)))
+            .unwrap();
+        assert_eq!(output.r#type().into_owned(), unreduced_type(&[2], UnreducedKind::Max));
+        assert_eq!(output.to_f64s(), vec![5.0, 7.0]);
     }
 
     #[test]

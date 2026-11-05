@@ -856,8 +856,8 @@ mod tests {
     use crate::arrays::DataType::*;
     use crate::arrays::{
         Array, ArrayBatch, ArrayOperation, ArrayType, Dimension, DimensionBounds, DimensionVariable, Layout,
-        LogicalMesh, Memory, MeshAxis, MeshAxisType, Shape, Sharding, ShardingDimension, StridedLayout, f6e2m3fn,
-        f8e8m0fnu,
+        LogicalMesh, Memory, MeshAxis, MeshAxisType, Shape, Sharding, ShardingDimension, ShardingError, StridedLayout,
+        UnreducedKind, f6e2m3fn, f8e8m0fnu,
     };
     use crate::batching::BatchAxis;
     use crate::contexts::EagerContext;
@@ -1062,18 +1062,27 @@ mod tests {
                 .unwrap();
 
         // The cotangent swaps the unreduced and reduced sets and keeps all other state unchanged.
-        let cotangent = sharding.cotangent();
+        let cotangent = sharding.cotangent().unwrap();
         assert_eq!(cotangent.dimensions(), sharding.dimensions());
         assert_eq!(cotangent.unreduced_axes(), &BTreeSet::new());
         assert_eq!(cotangent.reduced_axes(), &BTreeSet::from(["model".to_string()]));
         assert_eq!(cotangent.varying_manual_axes(), &BTreeSet::from(["manual".to_string()]));
 
         // The swap is an involution.
-        assert_eq!(cotangent.cotangent(), sharding);
+        assert_eq!(cotangent.cotangent().unwrap(), sharding);
 
         // Shardings without reduction state are their own cotangents.
         let replicated = Sharding::replicated(mesh, 2);
-        assert_eq!(replicated.cotangent(), replicated);
+        assert_eq!(replicated.cotangent().unwrap(), replicated);
+
+        // Only sums are self-dual, so a value that is unreduced with another kind has no cotangent.
+        let maximum = sharding.with_unreduced_kind(UnreducedKind::Max).unwrap();
+        assert_eq!(maximum.cotangent(), Err(ShardingError::UndefinedUnreducedCotangent { kind: UnreducedKind::Max }));
+        let maximum_type = ArrayType::new_static(F32, [4, 6]).with_sharding(maximum.clone()).unwrap();
+        assert_eq!(
+            maximum_type.cotangent(),
+            Err(DifferentiationError::UndefinedCotangentType { primal_type: maximum_type.to_string() }),
+        );
     }
 
     #[test]
