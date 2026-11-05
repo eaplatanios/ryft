@@ -326,9 +326,11 @@ mod tests {
 
     use pretty_assertions::assert_eq;
     use ryft_core::{
-        ArrayType, BatchAxis, Context, CustomCallOperation, DataType, Device, DeviceMesh, Dimension as CoreDimension,
-        EffectClass, LogicalMesh, MeshAxis, MeshAxisType, OneOperation, Placeholder, PrintOperation, ProgramError,
-        Shape, ShardMapBoundary, ShardMapOperation, Sharding, ShardingDimension, StaticShape, Typed, batch,
+        ArrayIrType, ArrayType, AssertOperation, BatchAxis, CompareOperation, ComparisonDirection, Context,
+        CustomCallOperation, DataType, Device, DeviceMesh, Dimension as CoreDimension, DimensionBounds,
+        DimensionFromScalarOperation, DimensionType, EffectClass, LogicalMesh, MeshAxis, MeshAxisType, OneOperation,
+        Placeholder, PrintOperation, ProgramError, Shape, ShardMapBoundary, ShardMapOperation, Sharding,
+        ShardingDimension, StaticShape, Typed, batch,
     };
     use ryft_pjrt::{BufferSpecification, BufferType, Client, ClientOptions, CpuClientOptions, load_cpu_plugin};
     #[cfg(feature = "cuda-13")]
@@ -921,5 +923,77 @@ mod tests {
             .r#await()
             .unwrap();
         assert_eq!(values_from_bytes::<f64>(bytes.as_slice()), vec![1.5, 2.5]);
+    }
+
+    #[test]
+    fn test_compiled_dimension_assertion_does_not_merge_ordered_io_chains_on_cpu() {
+        use crate::operations::debugging::{ensure_print_handler_registered, with_captured_prints};
+
+        let plugin = load_cpu_plugin().unwrap();
+        let client = plugin
+            .client(ClientOptions::CPU(CpuClientOptions { device_count: Some(1), ..Default::default() }))
+            .unwrap();
+        ensure_print_handler_registered(&client).unwrap();
+        let mesh = domain_mesh(&client, "x", 1);
+        let domain = Session::new(&client).domain().with_mesh(mesh.clone());
+        let input_type = replicated_scalar_type(&mesh, DataType::I64);
+        let bounds = DimensionBounds::new(0, Some(10)).unwrap();
+        let left_type = DimensionType::new("left", bounds);
+        let right_type = DimensionType::new("right", bounds);
+
+        let mut builder = ProgramBuilder::new();
+        let left_input = builder.add_input(input_type.clone().into());
+        let right_input = builder.add_input(input_type.clone().into());
+        builder
+            .add_instruction(PrintOperation::<ArrayType>::new("left"), Vec::new(), vec![left_input], None)
+            .unwrap();
+        let left = builder
+            .add_instruction(DimensionFromScalarOperation::new(left_type.clone()), Vec::new(), vec![left_input], None)
+            .unwrap()[0];
+        let right = builder
+            .add_instruction(DimensionFromScalarOperation::new(right_type.clone()), Vec::new(), vec![right_input], None)
+            .unwrap()[0];
+        let predicate = builder
+            .add_instruction(
+                CompareOperation::<ArrayIrType>::new(ComparisonDirection::LessThanOrEqual),
+                Vec::new(),
+                vec![left, right],
+                None,
+            )
+            .unwrap()[0];
+        builder
+            .add_instruction(
+                AssertOperation::<ArrayIrType>::new("`left` <= `right`")
+                    .with_labels(vec!["left".to_owned(), "right".to_owned()]),
+                Vec::new(),
+                vec![predicate, left, right],
+                None,
+            )
+            .unwrap();
+        let output = builder
+            .add_instruction(PrintOperation::<ArrayType>::new("right"), Vec::new(), vec![right_input], None)
+            .unwrap()[0];
+        let program = builder
+            .build::<Vec<Constant>, Vec<Constant>>(vec![output], vec![Placeholder, Placeholder], vec![Placeholder])
+            .unwrap();
+        let lowered = domain.lower_program(&program, 0, &Options::new(mesh.clone())).unwrap();
+        // Only assertions create a local chain; ordered I/O is seeded from the hidden executable argument.
+        assert!(lowered.signature.has_ordered_io());
+        assert!(lowered.signature.requires_assertion_handler());
+        assert_eq!(lowered.stable_hlo().matches("stablehlo.after_all").count(), 1, "{}", lowered.stable_hlo());
+        let compiled = domain.compile_program(&lowered).unwrap();
+        let input = |value: i64| {
+            Array::from_host_buffer(&domain, input_type.clone(), mesh.clone(), value.to_ne_bytes().as_slice()).unwrap()
+        };
+
+        let (output, lines) = with_captured_prints(|| {
+            let output = domain.execute_program(&compiled, vec![input(3), input(4)]).unwrap();
+            assert_eq!(read_i64s(&client, &output[0]), vec![4]);
+            output
+        });
+        assert_eq!(lines.len(), 2);
+        assert!(lines[0].starts_with("left: "), "{:?}", lines);
+        assert!(lines[1].starts_with("right: "), "{:?}", lines);
+        assert_eq!(read_i64s(&client, &output[0]), vec![4]);
     }
 }

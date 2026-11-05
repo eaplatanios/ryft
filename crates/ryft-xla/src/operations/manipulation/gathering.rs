@@ -258,26 +258,28 @@ impl LowerableOperation for GatherOperation {
 mod tests {
     use std::sync::Arc;
 
+    use indoc::indoc;
     use pretty_assertions::assert_eq;
+    #[cfg(test)]
+    use ryft_core::Complex as ComplexNumber;
     use ryft_core::{
-        Array as CoreArray, ArrayOperation, DimensionBounds, DimensionVariable, GatherDimensionNumbers, LogicalMesh,
-        MeshAxis, MeshAxisType, Placeholder, ProgramBuilder as CoreProgramBuilder, ScatterDimensionNumbers,
-        ScatterOperation, ScatterReductionKind, Shape, Sharding, ShardingDimension, Typed, i1,
+        Array as CoreArray, ArrayBatch, ArrayBatchingPolicy, ArrayIrType, ArrayOperation, ArrayType, BatchAxis,
+        BatchableOperation, BatchingContext, DataType, Dimension as CoreDimension, DimensionBounds, DimensionSize,
+        DimensionVariable, DynamicArrayExtentBatchingPolicy, EmptyRegionDriver, GatherDimensionNumbers, GatherMode,
+        GatherOperation, LogicalMesh, MeshAxis, MeshAxisType, Placeholder, ProgramBuilder as CoreProgramBuilder,
+        ProjectedContext, ScatterDimensionNumbers, ScatterOperation, ScatterReductionKind, Shape, Sharding,
+        ShardingDimension, Typed, TypedProgram, ValueProjection, i1,
     };
     use ryft_pjrt::{BufferType, ExecutionDeviceInputs, ExecutionInput, Program as PjrtProgram};
 
+    use crate::domains::tests::{domain_mesh, read_f64s};
     use crate::experimental::lowering::tests::{
         ProgramBuilder, ragged_dot_cpu_compilation_options, unproject_plain_program,
     };
     use crate::experimental::lowering::to_mlir_module_for_plain_program;
     use crate::experimental::ops::ArrayConstant;
     use crate::tests::{execution_client, values_from_bytes, values_to_bytes};
-    use crate::{Array, to_mlir_module_for_program};
-
-    use super::*;
-
-    #[cfg(test)]
-    use ryft_core::Complex as ComplexNumber;
+    use crate::{Array, Options, Session, to_mlir_module_for_program};
 
     #[test]
     fn test_to_mlir_module_for_plain_program_lowers_gather() {
@@ -635,5 +637,126 @@ mod tests {
             .unwrap();
         let module = to_mlir_module_for_plain_program(&program, "main").unwrap();
         assert_eq!(module.matches("sdy.sharding_constraint").count(), 2);
+    }
+
+    #[test]
+    fn test_compiled_jointly_mapped_gather_over_possibly_empty_extent() {
+        // Jointly mapping the input and the indices of a gather over a dynamic extent whose lower bound is zero
+        // stages one gather with paired batching axes and a zero batching window. This runs the transformed program
+        // on the CPU PJRT client used by the other tests (the `cutile` feature only enables compilation of the kernel
+        // module) at empty and nonempty mapped extents, through both the primal and its pullback.
+        let client = execution_client();
+        let mesh = domain_mesh(&client, "x", 1);
+        let domain = Session::new(&client).domain().with_mesh(mesh.clone());
+        let extent = CoreDimension::Dynamic(DimensionVariable::new("n", DimensionBounds::new(0, Some(6)).unwrap()));
+        let input_type = ArrayType::new(DataType::F64, Shape::new(vec![extent.clone(), CoreDimension::Static(4)]));
+        let indices_type = ArrayType::new(DataType::I32, Shape::new(vec![extent, CoreDimension::Static(1)]));
+        let operation = GatherOperation::new(GatherDimensionNumbers::new(vec![], vec![0], vec![0]), vec![1])
+            .with_mode(GatherMode::Clip);
+        // The public `batch` entry runs under the static extent policy, which rejects a dynamic mapped axis before any
+        // operation rule runs, so the joint rule is driven through the dynamic extent policy exactly as the ryft-core
+        // reproduction does, with the mapped extent read from the staged input.
+        let staged = crate::jit::stage::<_, Vec<ArrayType>, Vec<ArrayType>>(
+            |inputs| {
+                let extent = inputs[0].dimension_size(0).unwrap();
+                let context = BatchingContext::<_, ArrayBatchingPolicy<DynamicArrayExtentBatchingPolicy>>::with_policy(
+                    ProjectedContext::new(extent.context().clone()),
+                    extent,
+                );
+                let batches = [
+                    ArrayBatch::new(inputs[0].clone(), BatchAxis::new(0)).unwrap(),
+                    ArrayBatch::new(inputs[1].clone(), BatchAxis::new(0)).unwrap(),
+                ];
+                let outputs = operation.batch(&context, &EmptyRegionDriver, &batches).unwrap();
+                assert_eq!(outputs.len(), 1);
+                assert_eq!(outputs[0].batch_axis(), BatchAxis::new(0));
+                vec![outputs.into_iter().next().unwrap().into_value()]
+            },
+            vec![input_type, indices_type],
+            Options::new(mesh.clone()),
+        )
+        .unwrap()
+        .into_inner();
+        let program = staged.source_program().program().clone();
+        let rendered = program.to_string();
+        assert_eq!(
+            rendered,
+            indoc! {"
+                lambda %0:f64[n, 4], %1:i32[n, 1] .
+                let %2:f64[n] = gather [
+                    dimensions=(offset=[], collapsed_slice=[1], start_index_map=[1], batching=[(0, 0)]),
+                    slice_sizes=[0, 1],
+                    mode=clip,
+                ] %0 %1
+                in (%2)
+            "}
+            .trim_end(),
+        );
+        assert!(rendered.contains("slice_sizes=[0, 1]"));
+        assert!(rendered.contains("batching=[(0, 0)]"));
+        let linearization = program.linearize_with_respect_to(&[0]).unwrap();
+        let pullback = linearization.pullback().unwrap().into_program();
+        let all_indices = [1_i32, 3, 0, 2, 3];
+        for size in [0_usize, 4, 5] {
+            let values = (0..size * 4).map(|value| value as f64).collect::<Vec<_>>();
+            let indices = &all_indices[..size];
+            let expected =
+                indices.iter().enumerate().map(|(row, &index)| values[row * 4 + index as usize]).collect::<Vec<_>>();
+            let mut gradient = vec![0_f64; size * 4];
+            for (row, &index) in indices.iter().enumerate() {
+                gradient[row * 4 + index as usize] = 1.;
+            }
+            let input_type = ArrayType::new_static(DataType::F64, [size, 4]);
+            let output_type = ArrayType::new_static(DataType::F64, [size]);
+            let input_types =
+                vec![input_type.clone(), ArrayType::new_static(DataType::I32, [size, 1]), output_type.clone()];
+            let specialized = program
+                .clone()
+                .specialize(&input_types[..2].iter().cloned().map(ArrayIrType::from).collect::<Vec<_>>())
+                .unwrap();
+            assert_eq!(specialized.output_types(), vec![ArrayIrType::from(output_type.clone())], "n={size}");
+            let compiled = crate::jit::compile::<_, Vec<ArrayType>, Vec<ArrayType>>(
+                |inputs| {
+                    let mut inputs = inputs.into_iter().map(|input| input.into_value()).collect::<Vec<_>>();
+                    let cotangent = inputs.pop().unwrap();
+                    let context = inputs[0].context().clone();
+                    let mut outputs = linearization
+                        .primal()
+                        .interpret_in_context(&context, inputs)
+                        .unwrap_or_else(|error| panic!("n={size} primal: {error}\n{}", linearization.primal()));
+                    let mut pullback_inputs = vec![cotangent];
+                    pullback_inputs.extend(outputs.split_off(1));
+                    outputs.extend(
+                        pullback
+                            .interpret_in_context(&context, pullback_inputs)
+                            .unwrap_or_else(|error| panic!("n={size} pullback: {error}\n{pullback}")),
+                    );
+                    outputs
+                        .into_iter()
+                        .map(|output| ValueProjection::<ArrayType>::into_projected(output).unwrap())
+                        .collect()
+                },
+                input_types.clone(),
+                &domain,
+                mesh.clone(),
+            )
+            .unwrap_or_else(|error| panic!("n={size} native trace: {error}"));
+            let bytes = [values_to_bytes(&values), values_to_bytes(indices), values_to_bytes(&vec![1_f64; size])];
+            let inputs = input_types
+                .into_iter()
+                .zip(bytes)
+                .map(|(r#type, bytes)| Array::from_host_buffer(&domain, r#type, mesh.clone(), bytes).unwrap())
+                .collect();
+            let outputs = domain.interpret(&compiled.executable_function(), inputs).unwrap();
+            assert_eq!(outputs.len(), 2);
+            for output in &outputs {
+                assert_eq!(output.data_type(), DataType::F64);
+                assert_eq!(output.mesh(), &mesh);
+            }
+            assert_eq!(outputs[0].shape().as_slice(), output_type.static_shape().unwrap().as_slice());
+            assert_eq!(read_f64s(&client, &outputs[0]), expected, "n={size}");
+            assert_eq!(outputs[1].shape().as_slice(), &[size, 4]);
+            assert_eq!(read_f64s(&client, &outputs[1]), gradient, "pullback, n={size}");
+        }
     }
 }

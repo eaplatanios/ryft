@@ -8,6 +8,9 @@ Use this file as the single detailed reference for `ryft` testing conventions.
   cover behavior implemented in that module; move incidental downstream behavior coverage to the operation, transform,
   or helper module that owns it. When moving an implementation, move its owning tests and any exclusive fixtures with
   it, and update their names and order to follow the destination API. Keep shared integration fixtures with their owner.
+  When splitting production modules, put their tests in each owning source file's inline `tests` module rather than
+  creating a parallel `tests/` subtree. Keep helpers shared by those modules in the inline `tests` module of their
+  parent's `mod.rs`, with the narrowest visibility needed by actual consumers.
 - Order a module's unit tests by the production API surface they cover, following the production definitions' order.
   Give each public function a primary test named `test_<owning_type>_<function>` (e.g.,
   `test_program_discharge_references`). Place additional edge-case tests immediately after that primary test and suffix

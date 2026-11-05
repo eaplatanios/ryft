@@ -390,20 +390,25 @@ impl LowerableOperation for ScatterOperation {
 mod tests {
     use std::sync::Arc;
 
+    use indoc::indoc;
     use pretty_assertions::assert_eq;
     use ryft_core::{
-        Array as CoreArray, ArrayOperation, ConstantOperation, DimensionBounds, DimensionVariable, Placeholder,
-        ProgramBuilder as CoreProgramBuilder, ScatterDimensionNumbers, i1, u1,
+        Array as CoreArray, ArrayBatch, ArrayBatchingPolicy, ArrayIrType, ArrayOperation, ArrayType, BatchAxis,
+        BatchableOperation, BatchingContext, ConstantOperation, DataType, Dimension as CoreDimension, DimensionBounds,
+        DimensionSize, DimensionVariable, DynamicArrayExtentBatchingPolicy, EmptyRegionDriver, Linearization,
+        Placeholder, ProgramBuilder as CoreProgramBuilder, ProjectedContext, ScatterDimensionNumbers, ScatterMode,
+        ScatterOperation, ScatterReductionKind, Shape, TypedProgram, ValueProjection, i1, u1,
     };
     use ryft_pjrt::{BufferType, ExecutionDeviceInputs, ExecutionInput, Program as PjrtProgram};
 
+    use crate::domains::tests::{domain_mesh, read_f64s};
     use crate::experimental::lowering::tests::{
         ProgramBuilder, ragged_dot_cpu_compilation_options, unproject_plain_program,
     };
     use crate::experimental::lowering::{lower_mlir_module_for_program, to_mlir_module_for_plain_program};
-    use crate::experimental::ops::ArrayConstant;
+    use crate::experimental::ops::{ArrayConstant, Constant, FlatProgram, Operation};
     use crate::tests::{execution_client, values_from_bytes, values_to_bytes};
-    use crate::{ToPjrt, to_mlir_module_for_program};
+    use crate::{Array, Options, Session, ToPjrt, to_mlir_module_for_program};
 
     use super::*;
 
@@ -826,5 +831,220 @@ mod tests {
         assert_eq!(stablehlo.matches("stablehlo.imag").count(), 2, "{stablehlo}");
         assert_eq!(stablehlo.matches("stablehlo.compare").count(), 3, "{stablehlo}");
         assert_eq!(stablehlo.matches("stablehlo.select").count(), 2, "{stablehlo}");
+    }
+
+    #[test]
+    fn test_compiled_jointly_mapped_scatter_over_possibly_empty_extent() {
+        // Jointly mapping the input, the indices, and the updates of a scatter over a dynamic extent whose lower bound
+        // is zero stages one scatter with paired batching axes. Its dual gather, built by the scatter-add transpose
+        // and by the extremal JVP coefficient graph, then takes a zero batching window over that extent. This runs the
+        // transformed programs on the CPU PJRT client used by the other tests (the `cutile` feature only enables
+        // compilation of the kernel module) at empty and nonempty mapped extents, through both the primal and its
+        // pullback.
+        type DynamicPolicy = ArrayBatchingPolicy<DynamicArrayExtentBatchingPolicy>;
+        let client = execution_client();
+        let mesh = domain_mesh(&client, "x", 1);
+        let domain = Session::new(&client).domain().with_mesh(mesh.clone());
+        let extent = CoreDimension::Dynamic(DimensionVariable::new("n", DimensionBounds::new(0, Some(6)).unwrap()));
+        let staged_types = vec![
+            ArrayType::new(DataType::F64, Shape::new(vec![extent.clone(), CoreDimension::Static(4)])),
+            ArrayType::new(
+                DataType::I32,
+                Shape::new(vec![extent.clone(), CoreDimension::Static(1), CoreDimension::Static(1)]),
+            ),
+            ArrayType::new(DataType::F64, Shape::new(vec![extent, CoreDimension::Static(1)])),
+        ];
+        let dimensions = ScatterDimensionNumbers::new(vec![], vec![0], vec![0]);
+        // The public `batch` entry runs under the static extent policy, which rejects a dynamic mapped axis before any
+        // operation rule runs, so the joint rule is driven through the dynamic extent policy exactly as the ryft-core
+        // reproduction does, with the mapped extent read from the staged input.
+        let stage = |operation: ScatterOperation| -> FlatProgram {
+            crate::jit::stage::<_, Vec<ArrayType>, Vec<ArrayType>>(
+                |inputs| {
+                    let extent = inputs[0].dimension_size(0).unwrap();
+                    let context = BatchingContext::<_, DynamicPolicy>::with_policy(
+                        ProjectedContext::new(extent.context().clone()),
+                        extent,
+                    );
+                    let batches = inputs
+                        .iter()
+                        .map(|input| ArrayBatch::new(input.clone(), BatchAxis::new(0)).unwrap())
+                        .collect::<Vec<_>>();
+                    let outputs = operation.batch(&context, &EmptyRegionDriver, &batches).unwrap();
+                    assert_eq!(outputs.len(), 1);
+                    assert_eq!(outputs[0].batch_axis(), BatchAxis::new(0));
+                    vec![outputs.into_iter().next().unwrap().into_value()]
+                },
+                staged_types.clone(),
+                Options::new(mesh.clone()),
+            )
+            .unwrap()
+            .into_inner()
+            .source_program()
+            .program()
+            .clone()
+        };
+        // Specializes the primal at the concrete extent `size`, compiles the primal followed by its pullback at an
+        // all-ones cotangent, runs it on the client, and returns the primal output, the input gradient, and the
+        // updates gradient.
+        let execute = |linearization: &Linearization<Constant, Operation>,
+                       pullback: &FlatProgram,
+                       size: usize,
+                       values: &[f64],
+                       indices: &[i32],
+                       updates: &[f64]| {
+            let input_types = vec![
+                ArrayType::new_static(DataType::F64, [size, 4]),
+                ArrayType::new_static(DataType::I32, [size, 1, 1]),
+                ArrayType::new_static(DataType::F64, [size, 1]),
+                ArrayType::new_static(DataType::F64, [size, 4]),
+            ];
+            let specialized = linearization
+                .primal()
+                .as_ref()
+                .clone()
+                .specialize(&input_types[..3].iter().cloned().map(ArrayIrType::from).collect::<Vec<_>>())
+                .unwrap_or_else(|error| panic!("n={size} specialization: {error}\n{}", linearization.primal()));
+            assert_eq!(specialized.output_types()[0], ArrayIrType::from(input_types[0].clone()), "n={size}");
+            let compiled = crate::jit::compile::<_, Vec<ArrayType>, Vec<ArrayType>>(
+                |inputs| {
+                    let mut inputs = inputs.into_iter().map(|input| input.into_value()).collect::<Vec<_>>();
+                    let cotangent = inputs.pop().unwrap();
+                    let context = inputs[0].context().clone();
+                    let mut outputs = linearization
+                        .primal()
+                        .interpret_in_context(&context, inputs)
+                        .unwrap_or_else(|error| panic!("n={size} primal: {error}\n{}", linearization.primal()));
+                    let mut pullback_inputs = vec![cotangent];
+                    pullback_inputs.extend(outputs.split_off(1));
+                    outputs.extend(
+                        pullback
+                            .interpret_in_context(&context, pullback_inputs)
+                            .unwrap_or_else(|error| panic!("n={size} pullback: {error}\n{pullback}")),
+                    );
+                    outputs
+                        .into_iter()
+                        .map(|output| ValueProjection::<ArrayType>::into_projected(output).unwrap())
+                        .collect()
+                },
+                input_types.clone(),
+                &domain,
+                mesh.clone(),
+            )
+            .unwrap_or_else(|error| panic!("n={size} native trace: {error}"));
+            let bytes = [
+                values_to_bytes(values),
+                values_to_bytes(indices),
+                values_to_bytes(updates),
+                values_to_bytes(&vec![1_f64; size * 4]),
+            ];
+            let inputs = input_types
+                .into_iter()
+                .zip(bytes)
+                .map(|(r#type, bytes)| Array::from_host_buffer(&domain, r#type, mesh.clone(), bytes).unwrap())
+                .collect();
+            let outputs = domain.interpret(&compiled.executable_function(), inputs).unwrap();
+            assert_eq!(outputs.len(), 3, "n={size}");
+            for output in &outputs {
+                assert_eq!(output.data_type(), DataType::F64);
+                assert_eq!(output.mesh(), &mesh);
+            }
+            assert_eq!(outputs[0].shape().as_slice(), &[size, 4], "n={size}");
+            assert_eq!(outputs[1].shape().as_slice(), &[size, 4], "n={size}");
+            assert_eq!(outputs[2].shape().as_slice(), &[size, 1], "n={size}");
+            outputs.iter().map(|output| read_f64s(&client, output)).collect::<Vec<_>>()
+        };
+        let all_indices = [1_i32, 3, 0, 2, 3];
+
+        // The additive scatter is linear, so its pullback is the dual gather over the paired batching axes with the
+        // zero window, applied to the cotangent directly.
+        let add = ScatterOperation::new(dimensions.clone(), ScatterReductionKind::Add).with_mode(ScatterMode::Clip);
+        let program = stage(add);
+        assert_eq!(
+            program.to_string(),
+            indoc! {"
+                lambda %0:f64[n, 4], %1:i32[n, 1, 1], %2:f64[n, 1] .
+                let %3:f64[n, 4] = scatter [
+                    kind=add,
+                    dimensions=(update_window=[], inserted_window=[1], scatter_to_operand=[1], operand_batching=[0], \
+                        scatter_indices_batching=[0]),
+                    mode=clip,
+                ] %0 %1 %2
+                in (%3)
+            "}
+            .trim_end(),
+        );
+        let linearization = program.linearize_with_respect_to(&[0, 2]).unwrap();
+        let pullback = linearization.pullback().unwrap().into_program();
+        assert_eq!(
+            pullback.to_string(),
+            indoc! {"
+                lambda %0:f64[n, 4], %1:i32[n, 1, 1] .
+                let %2:f64[n, 1] = gather [
+                    dimensions=(offset=[], collapsed_slice=[1], start_index_map=[1], batching=[(0, 0)]),
+                    slice_sizes=[0, 1],
+                    mode=clip,
+                ] %0 %1
+                in (%0, %2)
+            "}
+            .trim_end(),
+        );
+        let all_add_updates = [10_f64, 20., 30., 40., 50.];
+        for size in [0_usize, 4, 5] {
+            let values = (0..size * 4).map(|value| value as f64).collect::<Vec<_>>();
+            let indices = &all_indices[..size];
+            let updates = &all_add_updates[..size];
+            let mut expected = values.clone();
+            for (row, &index) in indices.iter().enumerate() {
+                expected[row * 4 + index as usize] += updates[row];
+            }
+            let outputs = execute(&linearization, &pullback, size, &values, indices, updates);
+            assert_eq!(outputs[0], expected, "add primal, n={size}");
+            assert_eq!(outputs[1], vec![1_f64; size * 4], "add input gradient, n={size}");
+            assert_eq!(outputs[2], vec![1_f64; size], "add updates gradient, n={size}");
+        }
+
+        // The minimum scatter is nonlinear: its JVP coefficient graph reads each update's target back through the
+        // shared dual gather, so the pullback routes the cotangent to whichever of the input and the update won.
+        let minimum = ScatterOperation::new(dimensions, ScatterReductionKind::Min).with_mode(ScatterMode::Clip);
+        let program = stage(minimum);
+        assert_eq!(
+            program.to_string(),
+            indoc! {"
+                lambda %0:f64[n, 4], %1:i32[n, 1, 1], %2:f64[n, 1] .
+                let %3:f64[n, 4] = scatter [
+                    kind=min,
+                    dimensions=(update_window=[], inserted_window=[1], scatter_to_operand=[1], operand_batching=[0], \
+                        scatter_indices_batching=[0]),
+                    mode=clip,
+                ] %0 %1 %2
+                in (%3)
+            "}
+            .trim_end(),
+        );
+        let linearization = program.linearize_with_respect_to(&[0, 2]).unwrap();
+        let pullback = linearization.pullback().unwrap().into_program();
+        assert!(pullback.to_string().contains("slice_sizes=[0, 1]"));
+        let all_min_updates = [-1_f64, 100., -1., 100., -1.];
+        for size in [0_usize, 4, 5] {
+            let values = (0..size * 4).map(|value| value as f64).collect::<Vec<_>>();
+            let indices = &all_indices[..size];
+            let updates = &all_min_updates[..size];
+            let mut expected = values.clone();
+            let mut input_gradient = vec![1_f64; size * 4];
+            let mut updates_gradient = vec![0_f64; size];
+            for (row, &index) in indices.iter().enumerate() {
+                let position = row * 4 + index as usize;
+                if updates[row] < values[position] {
+                    expected[position] = updates[row];
+                    input_gradient[position] = 0.;
+                    updates_gradient[row] = 1.;
+                }
+            }
+            let outputs = execute(&linearization, &pullback, size, &values, indices, updates);
+            assert_eq!(outputs[0], expected, "min primal, n={size}");
+            assert_eq!(outputs[1], input_gradient, "min input gradient, n={size}");
+            assert_eq!(outputs[2], updates_gradient, "min updates gradient, n={size}");
+        }
     }
 }

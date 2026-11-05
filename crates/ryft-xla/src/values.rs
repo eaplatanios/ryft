@@ -40,7 +40,7 @@ use crate::{Array, Domain};
 /// materialized. This is the dimension member of [`Value`] and its projection onto [`DimensionType`].
 ///
 /// A [`Dimension`] is a runtime *value* that holds a checked [`DimensionValue`]. It is not a
-/// [`Dimension`](ryft_core::Dimension), which is a static or symbolic extent inside an [`ArrayType`]. Dimension
+/// [`ryft_core::Dimension`], which is a static or symbolic extent inside an [`ArrayType`]. Dimension
 /// arithmetic remains host integer work: it dispatches through this dimension's [`Domain`], whose eager binding
 /// evaluates dimension operations on the host without compiling programs. Only functions that produce arrays (e.g.,
 /// comparisons and [`DimensionToScalar`](ryft_core::DimensionToScalar)) upload their results, which are placed

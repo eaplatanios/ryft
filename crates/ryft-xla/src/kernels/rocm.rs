@@ -436,9 +436,9 @@ mod tests {
     /// Uses the same public portable macro and pointer order as the native vector fixture.
     #[ryft_kernels::kernel(crate = "ryft_kernels")]
     fn vector(
-        #[input(data_type = F32, rank = 1)] left: &CoreArray,
-        #[input(data_type = F32, rank = 1)] right: &CoreArray,
-        #[output(data_type = F32, shape = [256])] output: &mut CoreArray,
+        #[input(data_type = F32, rank = 1)] left: &ryft_core::Array,
+        #[input(data_type = F32, rank = 1)] right: &ryft_core::Array,
+        #[output(data_type = F32, shape = [256])] output: &mut ryft_core::Array,
     ) {
         output.store(left.load() + right.load());
     }

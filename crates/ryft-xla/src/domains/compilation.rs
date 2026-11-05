@@ -1356,32 +1356,47 @@ pub(super) fn canonical_compilation_options_bytes(options: &CompilationOptions) 
 #[cfg(test)]
 mod tests {
     use std::sync::Arc;
+    #[cfg(feature = "cuda-13")]
+    use std::time::Instant;
 
     use indoc::indoc;
     use pretty_assertions::assert_eq;
     #[cfg(test)]
     use ryft_core::Array as CoreArray;
+    #[cfg(feature = "cuda-13")]
+    use ryft_core::operations::attention::dot_product_attention;
+    use ryft_core::operations::attention::{
+        AttentionConfiguration, AttentionImplementation, AttentionInputs, differentiable_dot_product_attention,
+    };
     use ryft_core::{
-        AddOperation, ArgMaxOperation, ArgMinOperation, ArrayIrType, ArrayOperation, ArrayReferenceTransform,
-        ArrayReferenceTransformIndex, ArraySliceAxis, ArrayType, BatchAxis, CaptureReference, CompilationCacheDomain,
+        AddOperation, ArgMaxOperation, ArgMinOperation, ArrayIrOperation, ArrayIrType, ArrayIrValue, ArrayOperation,
+        ArrayReferenceTransform, ArrayReferenceTransformIndex, ArraySliceAxis, ArrayType, AtomId, AxisIndexOperation,
+        BatchAxis, CaptureReference, CollectiveOptions, CompareOperation, ComparisonDirection, CompilationCacheDomain,
         CompilationDomain, CompilationTracer, Compile, CompiledFunctionDispatcher, ConditionOperation,
-        ConstantOperation, Context, CotangentDestinationKind, CumulativeKind, CumulativeOperation, CustomCallOperation,
-        DataType, Device, DeviceMesh, Dimension as CoreDimension, DimensionAddOperation, DimensionBounds,
+        ConstantOperation, Context, ConvertElementTypeOperation, CotangentDestinationKind, CumulativeKind,
+        CumulativeOperation, CustomCallOperation, DataType, Device, DeviceMesh, Differentiate,
+        Dimension as CoreDimension, DimensionAddOperation, DimensionBounds, DimensionFromScalar,
         DimensionFromScalarOperation, DimensionOperation, DimensionSizeOperation, DimensionToScalarOperation,
-        DimensionType, DimensionValue, DimensionVariable, DomainTracingContext, DotDimensionNumbers,
-        DynamicBroadcastOperation, DynamicReshapeOperation, DynamicSliceOperation, IotaOperation, Layout, LogicalMesh,
-        Memory, MeshAxis, MeshAxisType, MulOperation, NegOperation, OneOperation, Operation as CoreOperation,
-        Placeholder, PrintOperation, ProgramError, Provenance, ProvenanceScope, RaggedDotDimensionNumbers,
+        DimensionType, DimensionValue, DimensionVariable, DomainTracingContext, DotDimensionNumbers, DotOperation,
+        DynamicBroadcastOperation, DynamicReshapeOperation, DynamicSliceOperation, DynamicSliceWithDimensions,
+        IotaOperation, Layout, LogicalMesh, Memory, MeshAxis, MeshAxisType, MulOperation, NegOperation, OneOperation,
+        Operation as CoreOperation, OperationPayloadProjection, ParallelAllGatherOperation,
+        ParallelAllGatherOutputVariance, ParallelAllToAllOperation, ParallelPermuteOperation, ParallelReduceOperation,
+        ParallelVaryOperation, Placeholder, PrintOperation, Program as CoreProgram,
+        ProgramBuilder as CoreProgramBuilder, ProgramError, Provenance, ProvenanceScope, RaggedDotDimensionNumbers,
         RaggedDotOperation, RandomAlgorithm, ReduceOperation, ReductionKind, ReferenceAddUpdate,
         ReferenceAddUpdateOperation, ReferenceFreeze, ReferenceFreezeOperation, ReferenceNew, ReferenceNewOperation,
         ReferenceRead, ReferenceReadOperation, ReferenceSwapOperation, ReferenceType, ReferenceWrite,
-        ReferenceWriteOperation, RngBitGeneratorOperation, ScaledDotOperation, ScanOperation, ScatterDimensionNumbers,
-        ScatterOperation, ScatterReductionKind, Shape, ShardMapBoundary, ShardMapOperation, ShardMapOptions, Sharding,
-        ShardingDimension, SliceOperation, SortDirection, StagedFunction as CoreStagedFunction, StaticShape,
-        TiledLayout, Typed, Value as CoreValue, ValueProjection, WhileOperation, batch, shard_map,
+        ReferenceWriteOperation, ReshapeOperation, RngBitGeneratorOperation, ScaledDotOperation, ScanOperation,
+        ScatterDimensionNumbers, ScatterOperation, ScatterReductionKind, Shape, ShardMapBoundary, ShardMapOperation,
+        ShardMapOptions, Sharding, ShardingDimension, SliceOperation, SortDirection, SortOperation,
+        StagedFunction as CoreStagedFunction, StagingContext, StaticShape, SubOperation, TiledLayout, TracingContext,
+        Type, Typed, TypedProgram, Value as CoreValue, ValueProjection, WhileOperation, batch, shard_map,
     };
     use ryft_pjrt::protos::CompilationOptions;
-    use ryft_pjrt::{ClientOptions, CpuClientOptions, load_cpu_plugin};
+    use ryft_pjrt::{Client, ClientOptions, CpuClientOptions, load_cpu_plugin};
+    #[cfg(feature = "cuda-13")]
+    use ryft_pjrt::{GpuClientOptions, GpuMemoryAllocator, GpuPlatform, load_cuda_13_plugin};
 
     use crate::arrays_v0::host::materialize_dense_array_bytes;
     use crate::domains::Tracer;
@@ -1395,6 +1410,709 @@ mod tests {
     use crate::{Array, Error, FromPjrt, RaggedDotLoweringStrategy, ToPjrt, Value};
 
     use super::*;
+
+    fn read_bf16s(client: &Client<'_>, array: &Array<'_>) -> Vec<f32> {
+        let device_id = client.addressable_devices().unwrap()[0].id().unwrap();
+        let bytes = array
+            .device_shard(device_id)
+            .unwrap()
+            .buffer()
+            .unwrap()
+            .copy_to_host(None)
+            .unwrap()
+            .r#await()
+            .unwrap();
+        values_from_bytes::<u16>(bytes.as_slice())
+            .into_iter()
+            .map(|bits| half::bf16::from_bits(bits).to_f32())
+            .collect()
+    }
+
+    fn read_i32s(client: &Client<'_>, array: &Array<'_>) -> Vec<i32> {
+        let device_id = client.addressable_devices().unwrap()[0].id().unwrap();
+        let bytes = array
+            .device_shard(device_id)
+            .unwrap()
+            .buffer()
+            .unwrap()
+            .copy_to_host(None)
+            .unwrap()
+            .r#await()
+            .unwrap();
+        values_from_bytes::<i32>(bytes.as_slice())
+    }
+
+    /// Builds the kind-sensitive bounded-dynamic padding fixture shared by CPU and CUDA execution tests.
+    fn data_derived_padding_fixture(size_type: ArrayType, extent: DimensionVariable) -> FlatProgram {
+        let dynamic_type = ArrayType::new(DataType::F32, Shape::new(vec![CoreDimension::Dynamic(extent.clone())]));
+        let index_type = dynamic_type.clone().with_data_type(DataType::U64);
+        let matrix_type = ArrayType::new(
+            DataType::F32,
+            Shape::new(vec![CoreDimension::Dynamic(extent.clone()), CoreDimension::Static(4)]),
+        );
+
+        // The iota and its negation make physical suffix lanes numerically distinguishable from every admitted live
+        // prefix. This catches both reduction identities and the opposite sentinels needed by ascending and descending
+        // sort. The boolean reductions cover their own false/true identities, and dot covers zero-padded contraction.
+        let mut builder = ProgramBuilder::new();
+        let size = builder.add_input(size_type.into());
+        let dimension = builder
+            .add_instruction(DimensionFromScalarOperation::new(extent.into()), Vec::new(), vec![size], None)
+            .unwrap()[0];
+        let iota = builder
+            .add_instruction(IotaOperation::new(dynamic_type.clone(), 0).unwrap(), Vec::new(), vec![dimension], None)
+            .unwrap()[0];
+        let indices = builder
+            .add_instruction(IotaOperation::new(index_type, 0).unwrap(), Vec::new(), vec![dimension], None)
+            .unwrap()[0];
+        let negative = builder.add_instruction(NegOperation::new(), Vec::new(), vec![iota], None).unwrap()[0];
+        let sorted_ascending = builder
+            .add_instruction(SortOperation::new(0, SortDirection::Ascending), Vec::new(), vec![negative], None)
+            .unwrap()[0];
+        let sorted_descending = builder
+            .add_instruction(SortOperation::new(0, SortDirection::Descending), Vec::new(), vec![iota], None)
+            .unwrap()[0];
+        let argmin_indices = builder
+            .add_instruction(SortOperation::new(0, SortDirection::Ascending), Vec::new(), vec![negative, indices], None)
+            .unwrap()[1];
+        let argmax_indices = builder
+            .add_instruction(SortOperation::new(0, SortDirection::Descending), Vec::new(), vec![iota, indices], None)
+            .unwrap()[1];
+        let sum = builder
+            .add_instruction(ReduceOperation::new(vec![0], ReductionKind::Sum), Vec::new(), vec![iota], None)
+            .unwrap()[0];
+        // Shift the iota to nonzero factors so including physical padding changes the product.
+        let ones =
+            builder.add_instruction(OneOperation::new(dynamic_type), Vec::new(), vec![dimension], None).unwrap()[0];
+        let factors = builder.add_instruction(AddOperation::new(), Vec::new(), vec![iota, ones], None).unwrap()[0];
+        let product = builder
+            .add_instruction(ReduceOperation::new(vec![0], ReductionKind::Product), Vec::new(), vec![factors], None)
+            .unwrap()[0];
+        let maximum = builder
+            .add_instruction(ReduceOperation::new(vec![0], ReductionKind::Max), Vec::new(), vec![iota], None)
+            .unwrap()[0];
+        let minimum = builder
+            .add_instruction(ReduceOperation::new(vec![0], ReductionKind::Min), Vec::new(), vec![negative], None)
+            .unwrap()[0];
+        let any_input = builder
+            .add_instruction(
+                ArrayOperation::Compare(CompareOperation::<ArrayType>::new(ComparisonDirection::LessThan)),
+                Vec::new(),
+                vec![negative, iota],
+                None,
+            )
+            .unwrap()[0];
+        let any = builder
+            .add_instruction(ReduceOperation::new(vec![0], ReductionKind::Any), Vec::new(), vec![any_input], None)
+            .unwrap()[0];
+        let all_input = builder
+            .add_instruction(
+                ArrayOperation::Compare(CompareOperation::<ArrayType>::new(ComparisonDirection::GreaterThanOrEqual)),
+                Vec::new(),
+                vec![iota, negative],
+                None,
+            )
+            .unwrap()[0];
+        let all = builder
+            .add_instruction(ReduceOperation::new(vec![0], ReductionKind::All), Vec::new(), vec![all_input], None)
+            .unwrap()[0];
+        let dot = builder
+            .add_instruction(
+                DotOperation::new(DotDimensionNumbers::inner_product()),
+                Vec::new(),
+                vec![iota, iota],
+                None,
+            )
+            .unwrap()[0];
+
+        // The rank-2 `i + j` matrix carries the data-derived extent on an axis that neither the reduction nor the scan
+        // touches, which is the configuration those two disciplines actually admit: a log-sum-exp `reduce` consumes
+        // the static axis and still produces a dynamically shaped output, and the prefix scan consumes the static
+        // axis while every row it emits keeps the dynamic extent.
+        let rows = builder
+            .add_instruction(IotaOperation::new(matrix_type.clone(), 0).unwrap(), Vec::new(), vec![dimension], None)
+            .unwrap()[0];
+        let columns = builder
+            .add_instruction(IotaOperation::new(matrix_type, 1).unwrap(), Vec::new(), vec![dimension], None)
+            .unwrap()[0];
+        let matrix = builder.add_instruction(AddOperation::new(), Vec::new(), vec![rows, columns], None).unwrap()[0];
+        let log_sum_exp = builder
+            .add_instruction(ReduceOperation::new(vec![1], ReductionKind::LogSumExp), Vec::new(), vec![matrix], None)
+            .unwrap()[0];
+        let cumulative_sum = builder
+            .add_instruction(CumulativeOperation::new(1, CumulativeKind::Sum), Vec::new(), vec![matrix], None)
+            .unwrap()[0];
+
+        // Index reductions over the data-derived axis would select a physical suffix lane if its padding were not
+        // masked, because the suffix lanes of the increasing iota are larger than every live lane and those of its
+        // negation are smaller. The matrix covers both a reduced data-derived axis and a data-derived axis that the
+        // reduction keeps.
+        let argmax = builder
+            .add_instruction(ArgMaxOperation::new(0, DataType::I32), Vec::new(), vec![iota], None)
+            .unwrap()[0];
+        let argmin = builder
+            .add_instruction(ArgMinOperation::new(0, DataType::I32), Vec::new(), vec![negative], None)
+            .unwrap()[0];
+        let row_argmax = builder
+            .add_instruction(ArgMaxOperation::new(1, DataType::I32), Vec::new(), vec![matrix], None)
+            .unwrap()[0];
+        let column_argmax = builder
+            .add_instruction(ArgMaxOperation::new(0, DataType::I32), Vec::new(), vec![matrix], None)
+            .unwrap()[0];
+        builder
+            .build::<Vec<Constant>, Vec<Constant>>(
+                vec![
+                    sorted_ascending,
+                    sorted_descending,
+                    argmin_indices,
+                    argmax_indices,
+                    sum,
+                    maximum,
+                    minimum,
+                    any,
+                    all,
+                    dot,
+                    log_sum_exp,
+                    cumulative_sum,
+                    product,
+                    argmax,
+                    argmin,
+                    row_argmax,
+                    column_argmax,
+                ],
+                vec![Placeholder],
+                vec![Placeholder; 17],
+            )
+            .unwrap()
+    }
+
+    /// Builds the bounded-dynamic scaled-dot and attention proof fixture. The attention values vary along the
+    /// key/value sequence axis, so including any physical suffix lane changes every valid output row. Attention is
+    /// staged by the training function with the provided implementation, whose reverse mode differentiation calls the
+    /// forward attention definition with its residual and the backward attention definition.
+    fn data_derived_scaled_dot_attention_fixture(
+        size_type: ArrayType,
+        extent: DimensionVariable,
+        scaled_element_type: DataType,
+        scaled_scale_type: DataType,
+        attention_implementation: AttentionImplementation,
+    ) -> FlatProgram {
+        /// Binds `operation` to `inputs` in the context of `value` and returns its only output.
+        fn bind<O: Into<Operation>>(
+            value: &Tracer<'static>,
+            operation: O,
+            inputs: &[Tracer<'static>],
+        ) -> Tracer<'static> {
+            value.domain().bind(operation, Vec::<FlatProgram>::new(), inputs).unwrap().remove(0)
+        }
+
+        let scaled_block_size = match scaled_element_type {
+            DataType::F8E4M3FN | DataType::F8E5M2 => 32,
+            _ => 16,
+        };
+        let attention_batch = DimensionVariable::new("attention_batch", extent.bounds().clone());
+        let scaled_lhs_type = ArrayType::new(
+            scaled_element_type,
+            Shape::new(vec![CoreDimension::Dynamic(extent.clone()), CoreDimension::Static(scaled_block_size)]),
+        );
+        let scaled_lhs_scale_type = ArrayType::new(
+            scaled_scale_type,
+            Shape::new(vec![CoreDimension::Dynamic(extent.clone()), CoreDimension::Static(1)]),
+        );
+        let scaled_rhs_type = ArrayType::new(
+            scaled_element_type,
+            Shape::new(vec![CoreDimension::Static(1), CoreDimension::Static(scaled_block_size)]),
+        );
+        let scaled_rhs_scale_type =
+            ArrayType::new(scaled_scale_type, Shape::new(vec![CoreDimension::Static(1), CoreDimension::Static(1)]));
+        let attention_type = ArrayType::new(
+            DataType::BF16,
+            Shape::new(vec![
+                CoreDimension::Dynamic(attention_batch.clone()),
+                CoreDimension::Dynamic(extent.clone()),
+                CoreDimension::Static(1),
+                CoreDimension::Static(8),
+            ]),
+        );
+        let attention = differentiable_dot_product_attention::<Domain<'static>>(
+            AttentionConfiguration::new().with_scale(1.0).with_implementation(attention_implementation),
+        );
+        let (_, program) = DomainTracingContext::<Domain<'static>>::trace(
+            |inputs: Vec<Tracer<'static>>| {
+                let size = &inputs[0];
+                let dimension = bind(size, DimensionFromScalarOperation::new(extent.clone().into()), &[size.clone()]);
+                let batch_dimension =
+                    bind(size, DimensionFromScalarOperation::new(attention_batch.clone().into()), &[size.clone()]);
+
+                // `scaled_dot`: the runtime row extent is non-contracting. Both dynamic element/scale operands share
+                // it, while the static right operand fixes one output column and the static block shape fixes
+                // `k = 16`.
+                let scaled_lhs = bind(size, OneOperation::new(scaled_lhs_type.clone()), &[dimension.clone()]);
+                let scaled_lhs_scales =
+                    bind(size, OneOperation::new(scaled_lhs_scale_type.clone()), &[dimension.clone()]);
+                let scaled_rhs = bind(size, OneOperation::new(scaled_rhs_type.clone()), &[]);
+                let scaled_rhs_scales = bind(size, OneOperation::new(scaled_rhs_scale_type.clone()), &[]);
+                let scaled_dot = bind(
+                    size,
+                    ScaledDotOperation::new(
+                        DotDimensionNumbers::new(vec![1], vec![1], Vec::new(), Vec::new()),
+                        DataType::F32,
+                        true,
+                        true,
+                    ),
+                    &[scaled_lhs, scaled_rhs, scaled_lhs_scales, scaled_rhs_scales],
+                );
+
+                // Attention: equal query/key scores make the live softmax uniform, while values equal their sequence
+                // index. Explicit lengths of `extent - 1` exercise the supported further-restriction contract: visible
+                // query rows return the mean `(extent - 2) / 2`, while the final logical row and all physical suffix
+                // lanes stay zero. Backward has exact `dQ = 0`, `dK[j] = 8 * (j - mean)`, and `dV = 1` on visible
+                // rows and zeros elsewhere.
+                let extents = [batch_dimension.clone(), dimension.clone()];
+                let query = bind(size, OneOperation::new(attention_type.clone()), &extents);
+                let key = bind(size, OneOperation::new(attention_type.clone()), &extents);
+                let value = bind(size, IotaOperation::new(attention_type.clone(), 1).unwrap(), &extents);
+                let output_cotangent = bind(size, OneOperation::new(attention_type.clone()), &extents);
+                let logical_length = bind(size, DimensionToScalarOperation, &[dimension.clone()]);
+                let logical_length =
+                    bind(size, ConvertElementTypeOperation::<ArrayType>::new(DataType::I32, false), &[logical_length]);
+                let one = CoreArray::from_elements(ArrayType::scalar(DataType::I32), &[1_i32]).unwrap();
+                let one = bind(size, ConstantOperation::new(one), &[]);
+                let length = bind(size, SubOperation::new(), &[logical_length, one]);
+                let lengths =
+                    bind(size, DynamicBroadcastOperation::new(Vec::new()), &[length, batch_dimension.clone()]);
+                let inputs = AttentionInputs {
+                    query_sequence_lengths: Some(lengths.clone()),
+                    key_value_sequence_lengths: Some(lengths),
+                    ..AttentionInputs::new(query, key, value)
+                };
+                let (output, pullback) = size.domain().differentiate_at(inputs).vjp(|inputs| attention.call(inputs))?;
+                let cotangents = pullback.apply_materialized(output_cotangent)?;
+                Ok(vec![scaled_dot, output, cotangents.query, cotangents.key, cotangents.value])
+            },
+            vec![ArrayIrType::from(size_type)],
+        )
+        .unwrap();
+        program.into_flat_program()
+    }
+
+    /// Kind of `shard_map` program that [`shard_map_differential_program`] builds to compare the reference backend's
+    /// emulation of `shard_map` with its execution through XLA.
+    #[derive(Copy, Clone, Debug)]
+    enum ShardMapDifferentialCase {
+        /// Tiled identity of an input sharded along the manual axis `x`, together with its sum across `x`.
+        IdentityAndSum,
+
+        /// Coordinate of every device along the manual axis `x`.
+        AxisIndex,
+
+        /// Invariant tiled all-gather across the manual axis `x`.
+        AllGather,
+
+        /// Tiled all-to-all across the manual axis `x` that moves a row-sharded matrix to a column-sharded one.
+        AllToAll,
+
+        /// Permutation across the manual axis `x` that sends the shard of device 0 to device 1 and zeros to device 0.
+        Permute,
+
+        /// Map over the manual axis `x` whose body maps over the manual axis `y` and sums across the enclosing axis
+        /// `x`.
+        Nested,
+
+        /// Map that adds its shard of an update into its shard of a caller-allocated reference and reads it back.
+        Reference,
+
+        /// Map that reads a reference replicated along the manual axis `x` at the coordinate of every device along `x`.
+        VaryingIndexReference,
+
+        /// Map that doubles a reference replicated along the manual axis `x` on every device and reads it back.
+        ReplicatedReference,
+    }
+
+    /// Builds a program over `input_types` whose outputs are the atoms that `build` adds to it.
+    fn build_differential_program<V: CoreValue<Type = ArrayIrType>, O: CoreOperation<Type = ArrayIrType>>(
+        input_types: Vec<ArrayIrType>,
+        build: impl FnOnce(&mut CoreProgramBuilder<V, O>, &[AtomId]) -> Vec<AtomId>,
+    ) -> CoreProgram<V, O, Vec<V>, Vec<V>> {
+        let mut builder = CoreProgramBuilder::<V, O>::new();
+        let inputs = input_types.into_iter().map(|r#type| builder.add_input(r#type)).collect::<Vec<_>>();
+        let outputs = build(&mut builder, &inputs);
+        let output_count = outputs.len();
+        builder.build(outputs, vec![Placeholder; inputs.len()], vec![Placeholder; output_count]).unwrap()
+    }
+
+    /// Builds the program of `case` over any operation family `O` that lifts the array IR family over `A`, so that the
+    /// reference backend's emulation (over [`ArrayIrOperation<Array>`]) and XLA execution (over [`Operation`]) run
+    /// the same program. Every program input and output is an array: the reference of
+    /// [`ShardMapDifferentialCase::Reference`] is allocated from a program input, and its final value is frozen into a
+    /// trailing program output.
+    fn shard_map_differential_program<A, V, O>(case: ShardMapDifferentialCase) -> CoreProgram<V, O, Vec<V>, Vec<V>>
+    where
+        A: CoreValue<Type = ArrayType>,
+        V: CoreValue<Type = ArrayIrType>,
+        O: CoreOperation<Type = ArrayIrType> + OperationPayloadProjection + From<ArrayIrOperation<A>>,
+    {
+        let array_operation = ArrayIrOperation::<A>::from;
+        let mesh = match case {
+            ShardMapDifferentialCase::Nested => LogicalMesh::new(vec![
+                MeshAxis::new("x", 2, MeshAxisType::Manual).unwrap(),
+                MeshAxis::new("y", 2, MeshAxisType::Manual).unwrap(),
+            ]),
+            _ => LogicalMesh::new(vec![MeshAxis::new("x", 2, MeshAxisType::Manual).unwrap()]),
+        }
+        .unwrap();
+        let sharded = |axis: &str| Sharding::new(mesh.clone(), vec![ShardingDimension::sharded([axis])]).unwrap();
+        let replicated = Sharding::replicated(mesh.clone(), 1);
+        let f32_type = |shape: &[usize], sharding: &Sharding| {
+            ArrayType::new_static(DataType::F32, shape.to_vec()).with_sharding(sharding.clone()).unwrap()
+        };
+        let sum_over_x = ParallelReduceOperation::new(ReductionKind::Sum, "x".to_string()).with_mesh(mesh.clone());
+        let (boundary, global_input_types, body) = match case {
+            ShardMapDifferentialCase::IdentityAndSum => {
+                let boundary = ShardMapBoundary::new(
+                    mesh.clone(),
+                    vec![sharded("x")],
+                    vec![sharded("x"), replicated],
+                    vec!["x".into()],
+                )
+                .unwrap();
+                let global_type = f32_type(&[4], &sharded("x"));
+                let local_type = boundary.local_input_type(0, &global_type).unwrap();
+                let body = build_differential_program::<V, O>(vec![local_type.into()], |builder, inputs| {
+                    let sum = array_operation(ArrayOperation::ParallelReduce(sum_over_x));
+                    vec![inputs[0], builder.add_instruction(sum, Vec::new(), vec![inputs[0]], None).unwrap()[0]]
+                });
+                (boundary, vec![global_type.into()], body)
+            }
+            ShardMapDifferentialCase::AxisIndex => {
+                let boundary =
+                    ShardMapBoundary::new(mesh.clone(), vec![sharded("x")], vec![sharded("x")], vec!["x".into()])
+                        .unwrap();
+                let global_type = f32_type(&[2], &sharded("x"));
+                let local_type = boundary.local_input_type(0, &global_type).unwrap();
+                let body = build_differential_program::<V, O>(vec![local_type.into()], |builder, _| {
+                    let index = AxisIndexOperation::new("x".to_string()).with_mesh(mesh.clone());
+                    let index = array_operation(ArrayOperation::AxisIndex(index));
+                    let index = builder.add_instruction(index, Vec::new(), Vec::new(), None).unwrap()[0];
+                    let reshape = ReshapeOperation::new(Shape::new(vec![CoreDimension::Static(1)]));
+                    let reshape = array_operation(ArrayOperation::Reshape(reshape));
+                    builder.add_instruction(reshape, Vec::new(), vec![index], None).unwrap().to_vec()
+                });
+                (boundary, vec![global_type.into()], body)
+            }
+            ShardMapDifferentialCase::AllGather => {
+                let boundary =
+                    ShardMapBoundary::new(mesh.clone(), vec![sharded("x")], vec![replicated], vec!["x".into()])
+                        .unwrap();
+                let global_type = f32_type(&[4], &sharded("x"));
+                let local_type = boundary.local_input_type(0, &global_type).unwrap();
+                let body = build_differential_program::<V, O>(vec![local_type.into()], |builder, inputs| {
+                    let gather = ParallelAllGatherOperation::new(
+                        "x".to_string(),
+                        2,
+                        0,
+                        CollectiveOptions::tiled(),
+                        ParallelAllGatherOutputVariance::Invariant,
+                    );
+                    let gather = array_operation(ArrayOperation::ParallelAllGather(gather.with_mesh(mesh.clone())));
+                    builder.add_instruction(gather, Vec::new(), vec![inputs[0]], None).unwrap().to_vec()
+                });
+                (boundary, vec![global_type.into()], body)
+            }
+            ShardMapDifferentialCase::AllToAll => {
+                let rows =
+                    Sharding::new(mesh.clone(), vec![ShardingDimension::sharded(["x"]), ShardingDimension::Replicated]);
+                let columns =
+                    Sharding::new(mesh.clone(), vec![ShardingDimension::Replicated, ShardingDimension::sharded(["x"])]);
+                let (rows, columns) = (rows.unwrap(), columns.unwrap());
+                let boundary =
+                    ShardMapBoundary::new(mesh.clone(), vec![rows.clone()], vec![columns], vec!["x".into()]).unwrap();
+                let global_type = f32_type(&[2, 4], &rows);
+                let local_type = boundary.local_input_type(0, &global_type).unwrap();
+                let body = build_differential_program::<V, O>(vec![local_type.into()], |builder, inputs| {
+                    let exchange = ParallelAllToAllOperation::new("x".to_string(), 2, 1, 0, CollectiveOptions::tiled());
+                    let exchange = array_operation(ArrayOperation::ParallelAllToAll(exchange.with_mesh(mesh.clone())));
+                    builder.add_instruction(exchange, Vec::new(), vec![inputs[0]], None).unwrap().to_vec()
+                });
+                (boundary, vec![global_type.into()], body)
+            }
+            ShardMapDifferentialCase::Permute => {
+                let boundary =
+                    ShardMapBoundary::new(mesh.clone(), vec![sharded("x")], vec![sharded("x")], vec!["x".into()])
+                        .unwrap();
+                let global_type = f32_type(&[4], &sharded("x"));
+                let local_type = boundary.local_input_type(0, &global_type).unwrap();
+                let body = build_differential_program::<V, O>(vec![local_type.into()], |builder, inputs| {
+                    let permute = ParallelPermuteOperation::new("x".to_string(), 2, vec![(0, 1)]);
+                    let permute = array_operation(ArrayOperation::ParallelPermute(permute.with_mesh(mesh.clone())));
+                    builder.add_instruction(permute, Vec::new(), vec![inputs[0]], None).unwrap().to_vec()
+                });
+                (boundary, vec![global_type.into()], body)
+            }
+            ShardMapDifferentialCase::Nested => {
+                let boundary =
+                    ShardMapBoundary::new(mesh.clone(), vec![sharded("x")], vec![replicated], vec!["x".into()])
+                        .unwrap();
+                let global_type = f32_type(&[4], &sharded("x"));
+                let outer_local_type = boundary.local_input_type(0, &global_type).unwrap();
+                let inner_boundary =
+                    ShardMapBoundary::new(mesh.clone(), vec![sharded("y")], vec![sharded("y")], vec!["y".into()])
+                        .unwrap();
+                let inner_local_type = inner_boundary.local_input_type(0, &outer_local_type).unwrap();
+                let inner_body =
+                    build_differential_program::<V, O>(vec![inner_local_type.into()], |builder, inputs| {
+                        let sum = array_operation(ArrayOperation::ParallelReduce(sum_over_x));
+                        builder.add_instruction(sum, Vec::new(), vec![inputs[0]], None).unwrap().to_vec()
+                    });
+                let inner_operation =
+                    ShardMapOperation::from_program(&inner_body, vec![outer_local_type.clone().into()], inner_boundary)
+                        .unwrap();
+                let body = build_differential_program::<V, O>(vec![outer_local_type.into()], |builder, inputs| {
+                    let inner_body = builder.import_program(inner_body);
+                    let inner_operation = ArrayIrOperation::<A>::from(inner_operation);
+                    builder.add_instruction(inner_operation, vec![inner_body], inputs.to_vec(), None).unwrap().to_vec()
+                });
+                (boundary, vec![global_type.into()], body)
+            }
+            ShardMapDifferentialCase::Reference => {
+                let boundary =
+                    ShardMapBoundary::new(mesh.clone(), vec![sharded("x"); 2], vec![sharded("x")], vec!["x".into()])
+                        .unwrap();
+                let global_type = f32_type(&[4], &sharded("x"));
+                let local_type = boundary.local_input_type(0, &global_type).unwrap();
+                let input_types = vec![ReferenceType::new(local_type.clone()).into(), local_type.into()];
+                let body = build_differential_program::<V, O>(input_types, |builder, inputs| {
+                    let add_update =
+                        ReferenceAddUpdateOperation::<ArrayType, ArrayIrType, ArrayReferenceTransform>::new();
+                    let add_update = ArrayIrOperation::<A>::from(add_update);
+                    builder.add_instruction(add_update, Vec::new(), inputs.to_vec(), None).unwrap();
+                    let read = ReferenceReadOperation::<ArrayType, ArrayIrType, ArrayReferenceTransform>::new();
+                    let read = ArrayIrOperation::<A>::from(read);
+                    builder.add_instruction(read, Vec::new(), vec![inputs[0]], None).unwrap().to_vec()
+                });
+                (boundary, vec![ReferenceType::new(global_type.clone()).into(), global_type.into()], body)
+            }
+            ShardMapDifferentialCase::VaryingIndexReference => {
+                let table_sharding = Sharding::replicated(mesh.clone(), 2);
+                let boundary = ShardMapBoundary::new(
+                    mesh.clone(),
+                    vec![table_sharding.clone()],
+                    vec![sharded("x")],
+                    vec!["x".into()],
+                )
+                .unwrap();
+                let global_type = f32_type(&[2, 3], &table_sharding);
+                let local_type = boundary.local_input_type(0, &global_type).unwrap();
+                let input_types = vec![ReferenceType::new(local_type).into()];
+                let body = build_differential_program::<V, O>(input_types, |builder, inputs| {
+                    let index = AxisIndexOperation::new("x".to_string()).with_mesh(mesh.clone());
+                    let index = array_operation(ArrayOperation::AxisIndex(index));
+                    let index = builder.add_instruction(index, Vec::new(), Vec::new(), None).unwrap()[0];
+                    let read = ReferenceReadOperation::<ArrayType, ArrayIrType, ArrayReferenceTransform>::new()
+                        .with_transforms(vec![ArrayReferenceTransform::Index {
+                            axis: 0,
+                            index: ArrayReferenceTransformIndex::Dynamic,
+                        }]);
+                    let read = ArrayIrOperation::<A>::from(read);
+                    builder.add_instruction(read, Vec::new(), vec![inputs[0], index], None).unwrap().to_vec()
+                });
+                (boundary, vec![ReferenceType::new(global_type).into()], body)
+            }
+            ShardMapDifferentialCase::ReplicatedReference => {
+                let boundary =
+                    ShardMapBoundary::new(mesh.clone(), vec![replicated.clone()], vec![sharded("x")], vec!["x".into()])
+                        .unwrap();
+                let global_type = f32_type(&[2], &replicated);
+                let local_type = boundary.local_input_type(0, &global_type).unwrap();
+                let input_types = vec![ReferenceType::new(local_type).into()];
+                let body = build_differential_program::<V, O>(input_types, |builder, inputs| {
+                    let read = ReferenceReadOperation::<ArrayType, ArrayIrType, ArrayReferenceTransform>::new();
+                    let read = ArrayIrOperation::<A>::from(read);
+                    let state = builder.add_instruction(read.clone(), Vec::new(), vec![inputs[0]], None).unwrap()[0];
+                    let add_update =
+                        ReferenceAddUpdateOperation::<ArrayType, ArrayIrType, ArrayReferenceTransform>::new();
+                    let add_update = ArrayIrOperation::<A>::from(add_update);
+                    builder.add_instruction(add_update, Vec::new(), vec![inputs[0], state], None).unwrap();
+                    let state = builder.add_instruction(read, Vec::new(), vec![inputs[0]], None).unwrap()[0];
+                    let vary = array_operation(ArrayOperation::ParallelVary(ParallelVaryOperation::new("x".into())));
+                    builder.add_instruction(vary, Vec::new(), vec![state], None).unwrap().to_vec()
+                });
+                (boundary, vec![ReferenceType::new(global_type).into()], body)
+            }
+        };
+        let operation = ShardMapOperation::from_program(&body, global_input_types, boundary).unwrap();
+
+        // Reference inputs of the map are allocated from the corresponding program inputs and frozen after the map.
+        let program_input_types = operation
+            .global_input_types()
+            .iter()
+            .map(|r#type| match r#type {
+                ArrayIrType::Reference(reference) => ArrayIrType::Array(reference.referent().clone()),
+                r#type => r#type.clone(),
+            })
+            .collect();
+        build_differential_program::<V, O>(program_input_types, |builder, inputs| {
+            let mut map_inputs = inputs.to_vec();
+            let mut references = Vec::new();
+            for (input, r#type) in map_inputs.iter_mut().zip(operation.global_input_types()) {
+                if r#type.is_reference() {
+                    let new = ArrayIrOperation::<A>::from(ReferenceNewOperation::<ArrayType, ArrayIrType>::new());
+                    *input = builder.add_instruction(new, Vec::new(), vec![*input], None).unwrap()[0];
+                    references.push(*input);
+                }
+            }
+            let body = builder.import_program(body);
+            let operation = ArrayIrOperation::<A>::from(operation);
+            let mut outputs = builder.add_instruction(operation, vec![body], map_inputs, None).unwrap().to_vec();
+            for reference in references {
+                let freeze = ArrayIrOperation::<A>::from(ReferenceFreezeOperation::<ArrayType, ArrayIrType>::new());
+                outputs.push(builder.add_instruction(freeze, Vec::new(), vec![reference], None).unwrap()[0]);
+            }
+            outputs
+        })
+    }
+
+    /// Runs the program of `case` (refer to [`shard_map_differential_program`]) through the reference backend's
+    /// emulation and through XLA execution on all devices of `client`, which must match the devices of the mesh of
+    /// `case`, over the same integer-valued inputs, and checks that both produce exactly the same outputs, including
+    /// their types.
+    fn assert_shard_map_emulation_matches_execution(client: &Client<'_>, case: ShardMapDifferentialCase) {
+        type ArrayMember = <Constant as ValueProjection<ArrayType>>::Projected;
+        let emulated_program =
+            shard_map_differential_program::<CoreArray, ArrayIrValue<CoreArray>, ArrayIrOperation<CoreArray>>(case);
+        let xla_program = shard_map_differential_program::<ArrayMember, Constant, Operation>(case);
+        let input_types = xla_program
+            .input_types()
+            .into_owned()
+            .into_iter()
+            .map(|r#type| match r#type {
+                ArrayIrType::Array(r#type) => r#type,
+                r#type => panic!("differential programs have array inputs only but got `{type}`"),
+            })
+            .collect::<Vec<_>>();
+        let input_bytes = input_types
+            .iter()
+            .enumerate()
+            .map(|(index, r#type)| {
+                let element_count = r#type.static_shape().unwrap().dimensions().iter().product::<usize>();
+                let elements = (0..element_count).map(|element| (100 * index + element + 1) as f32).collect::<Vec<_>>();
+                values_to_bytes::<f32>(&elements)
+            })
+            .collect::<Vec<_>>();
+
+        // The reference backend emulates every device of the map on the host.
+        let emulated_inputs = input_types
+            .iter()
+            .zip(&input_bytes)
+            .map(|(r#type, bytes)| ArrayIrValue::Array(CoreArray::from_logical_bytes(r#type.clone(), bytes).unwrap()))
+            .collect();
+        let emulated_outputs = emulated_program.interpret(emulated_inputs).unwrap();
+
+        // XLA compiles the map into one manual computation and executes it on the devices of `client`.
+        let devices = client.addressable_devices().unwrap();
+        let devices = devices.iter().map(|device| Device::from_pjrt(device).unwrap()).collect();
+        let mesh = DeviceMesh::new(input_types[0].sharding().unwrap().mesh().clone(), devices).unwrap();
+        let domain = Session::new(client).domain();
+        let inputs = input_types
+            .into_iter()
+            .zip(input_bytes)
+            .map(|(r#type, bytes)| Array::from_host_buffer(&domain, r#type, mesh.clone(), bytes).unwrap())
+            .collect();
+        let lowered = domain.lower_program(&xla_program, 0, &Options::new(mesh)).unwrap();
+        let compiled = domain.compile_program(&lowered).unwrap();
+        let outputs = domain.execute_program(&compiled, inputs).unwrap();
+        let outputs = outputs
+            .iter()
+            .map(|output| {
+                let bytes = materialize_dense_array_bytes(output).unwrap();
+                ArrayIrValue::Array(CoreArray::from_logical_bytes(output.r#type().into_owned(), &bytes).unwrap())
+            })
+            .collect::<Vec<_>>();
+        assert_eq!(outputs, emulated_outputs, "`{case:?}` outputs differ between XLA and the emulation");
+    }
+
+    /// Linearizes the program of `case` (refer to [`shard_map_differential_program`]) with respect to its first input
+    /// and runs its primal program and then its pullback through the reference backend's emulation and through XLA
+    /// execution on all devices of `client`, which must match the devices of the mesh of `case`, over the same
+    /// integer-valued inputs and output seeds, and checks that both produce exactly the same input cotangent, including
+    /// its type. The pullback consumes the residuals of the primal program of the same backend.
+    fn assert_shard_map_pullback_emulation_matches_execution(client: &Client<'_>, case: ShardMapDifferentialCase) {
+        type ArrayMember = <Constant as ValueProjection<ArrayType>>::Projected;
+        let emulated_program =
+            shard_map_differential_program::<CoreArray, ArrayIrValue<CoreArray>, ArrayIrOperation<CoreArray>>(case);
+        let xla_program = shard_map_differential_program::<ArrayMember, Constant, Operation>(case);
+        let emulated = emulated_program.entry_region_ref().linearize(&[0]).unwrap();
+        let xla = xla_program.entry_region_ref().linearize(&[0]).unwrap();
+        let array_types = |types: Vec<ArrayIrType>| {
+            types
+                .into_iter()
+                .map(|r#type| match r#type {
+                    ArrayIrType::Array(r#type) => r#type,
+                    r#type => panic!("differential programs have array inputs and outputs only but got `{type}`"),
+                })
+                .collect::<Vec<_>>()
+        };
+        let input_types = array_types(xla_program.input_types().into_owned());
+        let output_types = array_types(xla_program.output_types().into_owned());
+        let bytes = |offset: usize, r#type: &ArrayType| {
+            let element_count = r#type.static_shape().unwrap().dimensions().iter().product::<usize>();
+            let elements = (0..element_count).map(|element| (offset + element + 1) as f32).collect::<Vec<_>>();
+            values_to_bytes::<f32>(&elements)
+        };
+        let input_bytes =
+            input_types.iter().enumerate().map(|(index, r#type)| bytes(100 * index, r#type)).collect::<Vec<_>>();
+        let seed_bytes = output_types
+            .iter()
+            .enumerate()
+            .map(|(index, r#type)| bytes(1000 + 100 * index, r#type))
+            .collect::<Vec<_>>();
+
+        // The reference backend emulates every device of both maps on the host.
+        let emulated_values = |types: &[ArrayType], bytes: &[Vec<u8>]| {
+            types
+                .iter()
+                .zip(bytes)
+                .map(|(r#type, bytes)| {
+                    ArrayIrValue::Array(CoreArray::from_logical_bytes(r#type.clone(), bytes).unwrap())
+                })
+                .collect::<Vec<_>>()
+        };
+        let mut primal_outputs = emulated.primal().interpret(emulated_values(&input_types, &input_bytes)).unwrap();
+        let residuals = primal_outputs.split_off(primal_outputs.len() - emulated.residual_count());
+        let mut pullback_inputs = emulated_values(&output_types, &seed_bytes);
+        pullback_inputs.extend(residuals);
+        let emulated_cotangents = emulated.pullback().unwrap().program().interpret(pullback_inputs).unwrap();
+
+        // XLA compiles each map into one manual computation and executes it on the devices of `client`.
+        let devices = client.addressable_devices().unwrap();
+        let devices = devices.iter().map(|device| Device::from_pjrt(device).unwrap()).collect();
+        let mesh = DeviceMesh::new(input_types[0].sharding().unwrap().mesh().clone(), devices).unwrap();
+        let domain = Session::new(client).domain();
+        let xla_values = |types: &[ArrayType], bytes: &[Vec<u8>]| {
+            types
+                .iter()
+                .zip(bytes)
+                .map(|(r#type, bytes)| Array::from_host_buffer(&domain, r#type.clone(), mesh.clone(), bytes).unwrap())
+                .collect::<Vec<_>>()
+        };
+        let execute = |program: &FlatProgram, inputs: Vec<_>| {
+            let lowered = domain.lower_program(program, 0, &Options::new(mesh.clone())).unwrap();
+            let compiled = domain.compile_program(&lowered).unwrap();
+            domain.execute_program(&compiled, inputs).unwrap()
+        };
+        let mut primal_outputs = execute(xla.primal(), xla_values(&input_types, &input_bytes));
+        let residuals = primal_outputs.split_off(primal_outputs.len() - xla.residual_count());
+        let mut pullback_inputs = xla_values(&output_types, &seed_bytes);
+        pullback_inputs.extend(residuals);
+        let cotangents = execute(&xla.pullback().unwrap().into_program(), pullback_inputs)
+            .iter()
+            .map(|cotangent| {
+                let bytes = materialize_dense_array_bytes(cotangent).unwrap();
+                ArrayIrValue::Array(CoreArray::from_logical_bytes(cotangent.r#type().into_owned(), &bytes).unwrap())
+            })
+            .collect::<Vec<_>>();
+        assert_eq!(cotangents, emulated_cotangents, "`{case:?}` cotangents differ between XLA and the emulation");
+    }
 
     #[test]
     fn test_production_array_ir_lowering_executes_dynamic_dimension_arithmetic_broadcast_and_reshape() {
@@ -4059,5 +4777,884 @@ mod tests {
                 .unwrap();
             assert_eq!(read_f32s(&client, &outputs[0]), expected);
         }
+    }
+
+    #[test]
+    fn test_compiled_dynamic_slice_runtime_size_pullback() {
+        // The size comes from device data and changes without recompilation. Seed the pullback with the sliced
+        // values so this fixture tests both the strided forward and point-scatter adjoint, including an empty result.
+        let client = execution_client();
+        let mesh = domain_mesh(&client, "x", 1);
+        let domain = Session::new(&client).domain().with_mesh(mesh.clone());
+        let input_type = replicated_vector_type(&mesh, 6);
+        let size_type = replicated_scalar_type(&mesh, DataType::I64);
+        let mut builder = ProgramBuilder::new();
+        let input = builder.add_input(input_type.clone().into());
+        let size = builder.add_input(size_type.clone().into());
+        let size = builder
+            .add_instruction(
+                DimensionFromScalarOperation::new(
+                    DimensionVariable::new("size", DimensionBounds::new(0, Some(4)).unwrap()).into(),
+                ),
+                Vec::new(),
+                vec![size],
+                None,
+            )
+            .unwrap()[0];
+        let start = builder.add_constant(Constant::Dimension(DimensionValue::constant(9).unwrap()));
+        let output = builder
+            .add_instruction(
+                DynamicSliceOperation::<ArrayIrType>::from_rank(1)
+                    .with_strides(vec![2])
+                    .unwrap()
+                    .with_bounds(ryft_core::DynamicSliceBounds::Clamp),
+                Vec::new(),
+                vec![input, start, size],
+                None,
+            )
+            .unwrap()[0];
+        let program = builder
+            .build::<Vec<Constant>, Vec<Constant>>(vec![output], vec![Placeholder; 2], vec![Placeholder])
+            .unwrap();
+        let linearization = program.linearize_with_respect_to(&[0]).unwrap();
+        let pullback = linearization.pullback().unwrap().into_program();
+        let context = TracingContext::<Constant, Operation>::new();
+        let inputs = vec![context.input(input_type.clone().into()), context.input(size_type.clone().into())];
+        let mut outputs = linearization.primal().interpret_in_context(&context, inputs).unwrap();
+        let mut arguments = vec![outputs[0].clone()];
+        arguments.extend(outputs.split_off(1));
+        outputs.extend(pullback.interpret_in_context(&context, arguments).unwrap());
+        let combined = context
+            .builder()
+            .borrow()
+            .clone()
+            .build::<Vec<Constant>, Vec<Constant>>(
+                outputs.iter().map(|output| output.atom_id().unwrap()).collect(),
+                vec![Placeholder; 2],
+                vec![Placeholder; 2],
+            )
+            .unwrap();
+        let lowered = domain.lower_program(&combined, 0, &Options::new(mesh.clone())).unwrap();
+        let compiled = domain.compile_program(&lowered).unwrap();
+        let input =
+            Array::from_host_buffer(&domain, input_type, mesh.clone(), values_to_bytes(&[0_f32, 1., 2., 3., 4., 5.]))
+                .unwrap();
+        let size =
+            Array::from_host_buffer(&domain, size_type.clone(), mesh.clone(), values_to_bytes(&[2_i64])).unwrap();
+        let outputs = domain.execute_program(&compiled, vec![input.clone(), size]).unwrap();
+        assert_eq!(outputs[0].shape().as_slice(), &[2]);
+        assert_eq!(read_f32s(&client, &outputs[0]), vec![3., 5.]);
+        assert_eq!(read_f32s(&client, &outputs[1]), vec![0., 0., 0., 3., 0., 5.]);
+        let size = Array::from_host_buffer(&domain, size_type, mesh, values_to_bytes(&[0_i64])).unwrap();
+        let outputs = domain.execute_program(&compiled, vec![input, size]).unwrap();
+        assert_eq!(outputs[0].shape().as_slice(), &[0]);
+        assert_eq!(read_f32s(&client, &outputs[1]), vec![0_f32; 6]);
+    }
+
+    #[test]
+    fn test_compiled_dynamic_slice_runtime_input_pullback() {
+        use ryft_core::{Add, DimensionConstant, Div};
+
+        let client = execution_client();
+        let mesh = domain_mesh(&client, "x", 1);
+        let domain = Session::new(&client).domain().with_mesh(mesh.clone());
+        let input_type = ArrayType::new_static(DataType::F32, [4, 5]);
+        let scalar_type = ArrayType::scalar(DataType::I64);
+        let context = TracingContext::<Constant, Operation>::new();
+        let input = context.input(input_type.clone().into());
+        let rows = context
+            .input(scalar_type.clone().into())
+            .to_dimension(DimensionVariable::new("rows", DimensionBounds::new(0, Some(5)).unwrap()))
+            .unwrap();
+        let columns = context
+            .input(scalar_type.clone().into())
+            .to_dimension(DimensionVariable::new("columns", DimensionBounds::new(0, Some(6)).unwrap()))
+            .unwrap();
+        let zero = context.dimension_constant(0).unwrap();
+        let one = ValueProjection::<DimensionType>::into_projected(context.dimension_constant(1).unwrap()).unwrap();
+        let two = ValueProjection::<DimensionType>::into_projected(context.dimension_constant(2).unwrap()).unwrap();
+        let height = ValueProjection::<DimensionType>::into_projected(rows.clone()).unwrap();
+        let height = height.add(&one).unwrap().div(&two).unwrap().into_value();
+        let width = ValueProjection::<DimensionType>::into_projected(columns.clone()).unwrap();
+        let width = width.add(&one).unwrap().div(&two).unwrap().into_value();
+        // The inner slice receives a genuinely runtime-shaped array. Its pullback must allocate that exact shape,
+        // before the outer prefix slice embeds it back into the original static input shape.
+        let prefix = input
+            .dynamic_slice_with_dimensions(&[zero.clone(), zero.clone()], &[rows, columns], &[1, 1])
+            .unwrap();
+        let output = prefix.dynamic_slice_with_dimensions(&[zero.clone(), zero], &[height, width], &[2, 2]).unwrap();
+        let program = context
+            .builder()
+            .borrow()
+            .clone()
+            .build::<Vec<Constant>, Vec<Constant>>(
+                vec![output.atom_id().unwrap()],
+                vec![Placeholder; 3],
+                vec![Placeholder],
+            )
+            .unwrap();
+        let linearization = program.linearize_with_respect_to(&[0]).unwrap();
+        let pullback = linearization.pullback().unwrap().into_program();
+        let context = TracingContext::<Constant, Operation>::new();
+        let inputs = vec![
+            context.input(input_type.clone().into()),
+            context.input(scalar_type.clone().into()),
+            context.input(scalar_type.clone().into()),
+        ];
+        let mut outputs = linearization.primal().interpret_in_context(&context, inputs).unwrap();
+        let mut arguments = vec![outputs[0].clone()];
+        arguments.extend(outputs.split_off(1));
+        // Replaying arithmetic dimensions creates fresh identities. Instantiate this standalone pullback's
+        // formal dimension identities for the replayed residual signature before importing its operations.
+        let input_types = arguments.iter().map(|value| value.r#type().into_owned()).collect::<Vec<_>>();
+        let pullback = pullback.with_instantiated_type_identities(&input_types).unwrap();
+        outputs.extend(pullback.interpret_in_context(&context, arguments).unwrap());
+        let combined = context
+            .builder()
+            .borrow()
+            .clone()
+            .build::<Vec<Constant>, Vec<Constant>>(
+                outputs.iter().map(|output| output.atom_id().unwrap()).collect(),
+                vec![Placeholder; 3],
+                vec![Placeholder; 2],
+            )
+            .unwrap();
+        let lowered = domain.lower_program(&combined, 0, &Options::new(mesh.clone())).unwrap();
+        let compiled = domain.compile_program(&lowered).unwrap();
+        let values = [
+            0_f32,
+            1.,
+            2.,
+            3.,
+            f32::NAN,
+            5.,
+            6.,
+            7.,
+            8.,
+            f32::NAN,
+            10.,
+            11.,
+            12.,
+            13.,
+            f32::NAN,
+            f32::NAN,
+            f32::NAN,
+            f32::NAN,
+            f32::NAN,
+            f32::NAN,
+        ];
+        let input = Array::from_host_buffer(&domain, input_type, mesh.clone(), values_to_bytes(&values)).unwrap();
+        let rows =
+            Array::from_host_buffer(&domain, scalar_type.clone(), mesh.clone(), values_to_bytes(&[3_i64])).unwrap();
+        let columns =
+            Array::from_host_buffer(&domain, scalar_type.clone(), mesh.clone(), values_to_bytes(&[4_i64])).unwrap();
+        let outputs = domain.execute_program(&compiled, vec![input.clone(), rows, columns.clone()]).unwrap();
+        assert_eq!(outputs[0].shape().as_slice(), &[2, 2]);
+        assert_eq!(read_f32s(&client, &outputs[0]), vec![0., 2., 10., 12.]);
+        assert_eq!(
+            read_f32s(&client, &outputs[1]),
+            vec![0., 0., 2., 0., 0., 0., 0., 0., 0., 0., 10., 0., 12., 0., 0., 0., 0., 0., 0., 0.]
+        );
+        let rows = Array::from_host_buffer(&domain, scalar_type, mesh, values_to_bytes(&[0_i64])).unwrap();
+        let outputs = domain.execute_program(&compiled, vec![input, rows, columns]).unwrap();
+        assert_eq!(outputs[0].shape().as_slice(), &[0, 2]);
+        assert_eq!(read_f32s(&client, &outputs[1]), vec![0_f32; 20]);
+    }
+
+    #[test]
+    fn test_shard_map_emulation_matches_execution_on_cpu() {
+        // The reference backend's lockstep emulation of `shard_map` and XLA's manual computation agree exactly on
+        // boundary splitting and assembly, on every collective over the manual axis, and on reference accesses and
+        // write-back (including reads of a replicated reference at device-varying indices and invariant mutations of a
+        // replicated reference).
+        let plugin = load_cpu_plugin().unwrap();
+        let client = plugin
+            .client(ClientOptions::CPU(CpuClientOptions { device_count: Some(2), ..Default::default() }))
+            .unwrap();
+        assert_shard_map_emulation_matches_execution(&client, ShardMapDifferentialCase::IdentityAndSum);
+        assert_shard_map_emulation_matches_execution(&client, ShardMapDifferentialCase::AxisIndex);
+        assert_shard_map_emulation_matches_execution(&client, ShardMapDifferentialCase::AllGather);
+        assert_shard_map_emulation_matches_execution(&client, ShardMapDifferentialCase::AllToAll);
+        assert_shard_map_emulation_matches_execution(&client, ShardMapDifferentialCase::Permute);
+        assert_shard_map_emulation_matches_execution(&client, ShardMapDifferentialCase::Reference);
+        assert_shard_map_emulation_matches_execution(&client, ShardMapDifferentialCase::VaryingIndexReference);
+        assert_shard_map_emulation_matches_execution(&client, ShardMapDifferentialCase::ReplicatedReference);
+    }
+
+    #[test]
+    fn test_shard_map_pullback_emulation_matches_execution_on_cpu() {
+        // The pullback of a read of a replicated reference at device-varying indices scatters each device's cotangent
+        // into a local buffer that varies along `x`, sums the buffers across `x`, and adds the sum into the replicated
+        // cotangent reference, both in the emulation and in XLA's manual computation. The pullbacks of an update of a
+        // sharded reference and of an invariant mutation of a replicated reference agree as well.
+        let plugin = load_cpu_plugin().unwrap();
+        let client = plugin
+            .client(ClientOptions::CPU(CpuClientOptions { device_count: Some(2), ..Default::default() }))
+            .unwrap();
+        assert_shard_map_pullback_emulation_matches_execution(&client, ShardMapDifferentialCase::Reference);
+        let case = ShardMapDifferentialCase::VaryingIndexReference;
+        assert_shard_map_pullback_emulation_matches_execution(&client, case);
+        let case = ShardMapDifferentialCase::ReplicatedReference;
+        assert_shard_map_pullback_emulation_matches_execution(&client, case);
+    }
+
+    #[test]
+    fn test_nested_shard_map_emulation_matches_execution_on_cpu() {
+        // A nested map whose inner body sums across the enclosing manual axis runs on all four devices of a 2×2 mesh,
+        // both in the emulation and in XLA's nested manual computations.
+        let plugin = load_cpu_plugin().unwrap();
+        let client = plugin
+            .client(ClientOptions::CPU(CpuClientOptions { device_count: Some(4), ..Default::default() }))
+            .unwrap();
+        assert_shard_map_emulation_matches_execution(&client, ShardMapDifferentialCase::Nested);
+    }
+
+    #[cfg(feature = "cuda-13")]
+    #[test]
+    fn test_cuda_13_plugin_executes_bounded_dynamic_program_at_two_sizes() {
+        fn trace_data_derived<'c>(
+            extent: DimensionVariable,
+            inputs: Vec<CompilationTracer<Domain<'c>>>,
+        ) -> Result<CompilationTracer<Domain<'c>>, Error> {
+            let [size, value] = inputs.as_slice() else {
+                return Err(ProgramError::InvalidInputCount { expected: 2, actual: inputs.len() }.into());
+            };
+            let dimension = size.to_dimension(extent)?;
+            let broadcast = size
+                .context()
+                .bind(DynamicBroadcastOperation::new(Vec::new()), Vec::new(), &[value.clone(), dimension])?
+                .remove(0);
+            Ok(size
+                .context()
+                .bind(ReduceOperation::new(vec![0], ReductionKind::Sum), Vec::new(), &[broadcast])?
+                .remove(0))
+        }
+
+        let plugin = load_cuda_13_plugin().unwrap();
+        let client = plugin
+            .client(ClientOptions::GPU(GpuClientOptions {
+                platform: Some(GpuPlatform::CUDA),
+                allocator: GpuMemoryAllocator::CudaAsync { memory_fraction_to_preallocate: None },
+                ..Default::default()
+            }))
+            .unwrap();
+        let mesh = domain_mesh(&client, "x", 1);
+        let domain = Session::new(&client).domain().with_mesh(mesh.clone());
+        let extent = DimensionVariable::new("extent", DimensionBounds::new(1, Some(8)).unwrap());
+        let dynamic_type = ArrayType::new(DataType::F32, Shape::new(vec![extent.into()]))
+            .with_sharding(Sharding::replicated(mesh.logical_mesh().clone(), 1))
+            .unwrap();
+        let staged = crate::jit::stage::<_, ArrayType, ArrayType>(
+            |input| input.clone() + input,
+            dynamic_type,
+            Options::new(mesh.clone()),
+        )
+        .unwrap()
+        .into_inner();
+        let compiled: ryft_core::compilation::CompiledFunction<Domain<'_>, ArrayIrType, ArrayIrType> =
+            staged.lower(&domain).unwrap().compile(&domain).unwrap();
+        assert_eq!(domain.program_count(), 1);
+
+        for size in [4usize, 7] {
+            let input_type = replicated_vector_type(&mesh, size);
+            let values = (0..size).map(|value| value as f32).collect::<Vec<_>>();
+            let input = Array::from_host_buffer(
+                &domain,
+                input_type,
+                mesh.clone(),
+                values_to_bytes(values.as_slice()).as_slice(),
+            )
+            .unwrap();
+            for _ in 0..2 {
+                // Both launches use the same bounded executable. The second also proves that replay does not
+                // accidentally specialize or recompile the program for the concrete logical size.
+                let output = compiled.executable().execute(&domain, Value::Array(input.clone())).unwrap();
+                let Value::Array(output) = output else {
+                    panic!("array-only compiled function returned a first-class dimension");
+                };
+                output.block_until_ready().unwrap();
+                assert_eq!(output.shape().as_slice(), &[size]);
+                assert_eq!(read_f32s(&client, &output), values.iter().map(|value| value * 2.0).collect::<Vec<_>>());
+                assert_eq!(domain.program_count(), 1, "executing a loaded executable must not trigger recompilation");
+            }
+        }
+
+        // The same plugin route also accepts an extent born from device data inside the program. The gateway's
+        // ordered bounds assertion and the reduction's dynamic masking both survive compilation, and the scalar input
+        // values select different logical extents without producing another retained specialization.
+        let scalar_i64 = replicated_scalar_type(&mesh, DataType::I64);
+        let scalar_f32 = replicated_scalar_type(&mesh, DataType::F32);
+        let extent = DimensionVariable::new("data_extent", DimensionBounds::new(1, Some(8)).unwrap());
+        let function: CompiledFunctionDispatcher<Domain<'_>, (), Vec<ArrayIrType>, ArrayIrType, _> = domain
+            .jit_with_options(move |(), inputs| trace_data_derived(extent.clone(), inputs), Options::new(mesh.clone()));
+        let call = |size: i64| {
+            let size =
+                Array::from_host_buffer(&domain, scalar_i64.clone(), mesh.clone(), size.to_ne_bytes().as_slice())
+                    .unwrap();
+            let value =
+                Array::from_host_buffer(&domain, scalar_f32.clone(), mesh.clone(), 2.0_f32.to_ne_bytes().as_slice())
+                    .unwrap();
+            function.execute((), vec![Value::Array(size), Value::Array(value)])
+        };
+        assert_eq!(read_f32s(&client, program_array(&call(4).unwrap())), vec![8.0]);
+        assert_eq!(read_f32s(&client, program_array(&call(7).unwrap())), vec![14.0]);
+        let invalid = call(8).unwrap();
+        let error = program_array(&invalid).block_until_ready().unwrap_err();
+        assert!(
+            error.to_string().contains(
+                "`dimension_from_scalar` failed: input dimension `data_extent` = 8 is outside its declared bounds \
+                 [1, 8)",
+            ),
+            "{error}",
+        );
+        assert_eq!(function.specialization_count(), 1);
+        assert_eq!(function.statistics().dispatch_misses, 1);
+        assert_eq!(function.statistics().dispatch_hits, 2);
+    }
+
+    #[test]
+    fn test_data_derived_extent_retained_jit_reuses_one_specialization() {
+        fn trace<'c>(
+            extent: DimensionVariable,
+            inputs: Vec<CompilationTracer<Domain<'c>>>,
+        ) -> Result<CompilationTracer<Domain<'c>>, Error> {
+            let [size, value] = inputs.as_slice() else {
+                return Err(ProgramError::InvalidInputCount { expected: 2, actual: inputs.len() }.into());
+            };
+            let dimension = size.to_dimension(extent)?;
+            let broadcast = size
+                .context()
+                .bind(DynamicBroadcastOperation::new(Vec::new()), Vec::new(), &[value.clone(), dimension])?
+                .remove(0);
+            Ok(size
+                .context()
+                .bind(ReduceOperation::new(vec![0], ReductionKind::Sum), Vec::new(), &[broadcast])?
+                .remove(0))
+        }
+
+        let plugin = load_cpu_plugin().unwrap();
+        let client = plugin
+            .client(ClientOptions::CPU(CpuClientOptions { device_count: Some(1), ..Default::default() }))
+            .unwrap();
+        let mesh = domain_mesh(&client, "x", 1);
+        let domain = Session::new(&client).domain().with_mesh(mesh.clone());
+        let scalar_i64 = replicated_scalar_type(&mesh, DataType::I64);
+        let scalar_f32 = replicated_scalar_type(&mesh, DataType::F32);
+        let extent = DimensionVariable::new("extent", DimensionBounds::new(1, Some(5)).unwrap());
+        let function: CompiledFunctionDispatcher<Domain<'_>, (), Vec<ArrayIrType>, ArrayIrType, _> =
+            domain.jit_with_options(move |(), inputs| trace(extent.clone(), inputs), Options::new(mesh.clone()));
+
+        let call = |size: i64| {
+            let size =
+                Array::from_host_buffer(&domain, scalar_i64.clone(), mesh.clone(), size.to_ne_bytes().as_slice())
+                    .unwrap();
+            let value =
+                Array::from_host_buffer(&domain, scalar_f32.clone(), mesh.clone(), 2.0_f32.to_ne_bytes().as_slice())
+                    .unwrap();
+            function.execute((), vec![Value::Array(size), Value::Array(value)]).unwrap()
+        };
+
+        assert_eq!(read_f32s(&client, program_array(&call(2))), vec![4.0]);
+        assert_eq!(read_f32s(&client, program_array(&call(4))), vec![8.0]);
+        let statistics = function.statistics();
+        assert_eq!(statistics.dispatch_misses, 1);
+        assert_eq!(statistics.dispatch_hits, 1);
+        assert_eq!(statistics.traces, 1);
+        assert_eq!(statistics.lowerings, 1);
+        assert_eq!(statistics.compilation_requests, 1);
+        assert_eq!(function.specialization_count(), 1);
+        assert_eq!(domain.program_count(), 1);
+    }
+
+    #[test]
+    fn test_data_derived_padding_disciplines_execute_without_observable_padding() {
+        let plugin = load_cpu_plugin().unwrap();
+        let client = plugin
+            .client(ClientOptions::CPU(CpuClientOptions { device_count: Some(1), ..Default::default() }))
+            .unwrap();
+        let mesh = domain_mesh(&client, "x", 1);
+        let domain = Session::new(&client).domain().with_mesh(mesh.clone());
+        let size_type = replicated_scalar_type(&mesh, DataType::I64);
+        let extent = DimensionVariable::new("extent", DimensionBounds::new(1, Some(5)).unwrap());
+        let program = data_derived_padding_fixture(size_type.clone(), extent);
+
+        let lowered = domain.lower_program(&program, 0, &Options::new(mesh.clone())).unwrap();
+        let compiled = domain.compile_program(&lowered).unwrap();
+        let execute = |size: i64| {
+            let input =
+                Array::from_host_buffer(&domain, size_type.clone(), mesh.clone(), size.to_ne_bytes().as_slice())
+                    .unwrap();
+            let eager = program
+                .interpret_in_context(&domain, vec![Value::Array(input.clone())])
+                .unwrap()
+                .into_iter()
+                .map(|value| match value {
+                    Value::Array(array) => array,
+                    Value::Dimension(_) => panic!("padding fixture returned a first-class dimension"),
+                    Value::Reference(_) => panic!("padding fixture returned a reference"),
+                })
+                .collect::<Vec<_>>();
+            let compiled = domain.execute_program(&compiled, vec![input]).unwrap();
+            assert_eq!(compiled.len(), eager.len());
+            for (compiled, eager) in compiled.iter().zip(&eager) {
+                assert_eq!(compiled.shape(), eager.shape());
+                assert_eq!(compiled.data_type(), eager.data_type());
+                let device_id = client.addressable_devices().unwrap()[0].id().unwrap();
+                let compiled_bytes = compiled
+                    .device_shard(device_id)
+                    .unwrap()
+                    .buffer()
+                    .unwrap()
+                    .copy_to_host(None)
+                    .unwrap()
+                    .r#await()
+                    .unwrap();
+                let eager_bytes = eager
+                    .device_shard(device_id)
+                    .unwrap()
+                    .buffer()
+                    .unwrap()
+                    .copy_to_host(None)
+                    .unwrap()
+                    .r#await()
+                    .unwrap();
+                assert_eq!(compiled_bytes, eager_bytes);
+            }
+            compiled
+        };
+
+        let small = execute(2);
+        assert_eq!(small[0].shape(), StaticShape::new(vec![2]));
+        assert_eq!(read_f32s(&client, &small[0]), vec![-1.0, 0.0]);
+        assert_eq!(read_f32s(&client, &small[1]), vec![1.0, 0.0]);
+        assert_eq!(read_u64s(&client, &small[2]), vec![1, 0]);
+        assert_eq!(read_u64s(&client, &small[3]), vec![1, 0]);
+        assert_eq!(read_f32s(&client, &small[4]), vec![1.0]);
+        assert_eq!(read_f32s(&client, &small[5]), vec![1.0]);
+        assert_eq!(read_f32s(&client, &small[6]), vec![-1.0]);
+        assert_eq!(read_booleans(&client, &small[7]), vec![true]);
+        assert_eq!(read_booleans(&client, &small[8]), vec![true]);
+        assert_eq!(read_f32s(&client, &small[9]), vec![1.0]);
+        assert_eq!(read_f32s(&client, &small[12]), vec![2.0]);
+        assert_eq!(read_i32s(&client, &small[13]), vec![1]);
+        assert_eq!(read_i32s(&client, &small[14]), vec![1]);
+        assert_eq!(read_i32s(&client, &small[15]), vec![3, 3]);
+        assert_eq!(read_i32s(&client, &small[16]), vec![1, 1, 1, 1]);
+
+        // Row `i` of the `i + j` matrix reduces to `i + ln(1 + e + e² + e³)`, so exactly the live rows appear and a
+        // physical suffix row would show up as an extra element. The tolerance is here because the expansion runs
+        // `exp` and `log`, not because the discipline is approximate: the byte comparison against the reference
+        // kernel inside `execute` is exact.
+        assert_eq!(small[10].shape(), StaticShape::new(vec![2]));
+        let log_sum_exp = read_f32s(&client, &small[10]);
+        assert!((log_sum_exp[0] - 3.440_189_7).abs() < 1e-4, "{log_sum_exp:?}");
+        assert!((log_sum_exp[1] - 4.440_189_7).abs() < 1e-4, "{log_sum_exp:?}");
+
+        // The prefix scan runs along the static axis, so row `i` accumulates `[i, 2i + 1, 3i + 3, 4i + 6]` while the
+        // data-derived extent rides through on the rows it never mixes.
+        assert_eq!(small[11].shape(), StaticShape::new(vec![2, 4]));
+        assert_eq!(read_f32s(&client, &small[11]), vec![0.0, 1.0, 3.0, 6.0, 1.0, 3.0, 6.0, 10.0]);
+
+        // With a single live lane, every physical suffix lane of the data-derived axis is padding, which index
+        // reductions must still never select.
+        let single = execute(1);
+        assert_eq!(read_i32s(&client, &single[13]), vec![0]);
+        assert_eq!(read_i32s(&client, &single[14]), vec![0]);
+        assert_eq!(read_i32s(&client, &single[15]), vec![3]);
+        assert_eq!(read_i32s(&client, &single[16]), vec![0, 0, 0, 0]);
+
+        let at_bound = execute(4);
+        assert_eq!(at_bound[0].shape(), StaticShape::new(vec![4]));
+        assert_eq!(read_f32s(&client, &at_bound[0]), vec![-3.0, -2.0, -1.0, 0.0]);
+        assert_eq!(read_f32s(&client, &at_bound[1]), vec![3.0, 2.0, 1.0, 0.0]);
+        assert_eq!(read_u64s(&client, &at_bound[2]), vec![3, 2, 1, 0]);
+        assert_eq!(read_u64s(&client, &at_bound[3]), vec![3, 2, 1, 0]);
+        assert_eq!(read_f32s(&client, &at_bound[4]), vec![6.0]);
+        assert_eq!(read_f32s(&client, &at_bound[5]), vec![3.0]);
+        assert_eq!(read_f32s(&client, &at_bound[6]), vec![-3.0]);
+        assert_eq!(read_booleans(&client, &at_bound[7]), vec![true]);
+        assert_eq!(read_booleans(&client, &at_bound[8]), vec![true]);
+        assert_eq!(read_f32s(&client, &at_bound[9]), vec![14.0]);
+        assert_eq!(read_f32s(&client, &at_bound[12]), vec![24.0]);
+        assert_eq!(read_i32s(&client, &at_bound[13]), vec![3]);
+        assert_eq!(read_i32s(&client, &at_bound[14]), vec![3]);
+        assert_eq!(read_i32s(&client, &at_bound[15]), vec![3, 3, 3, 3]);
+        assert_eq!(read_i32s(&client, &at_bound[16]), vec![3, 3, 3, 3]);
+
+        // At the bound the reduction and the scan grow by exactly the two extra live rows, which is what rules out a
+        // padded row silently participating at the smaller size.
+        assert_eq!(at_bound[10].shape(), StaticShape::new(vec![4]));
+        let log_sum_exp = read_f32s(&client, &at_bound[10]);
+        assert!((log_sum_exp[0] - 3.440_189_7).abs() < 1e-4, "{log_sum_exp:?}");
+        assert!((log_sum_exp[1] - 4.440_189_7).abs() < 1e-4, "{log_sum_exp:?}");
+        assert!((log_sum_exp[2] - 5.440_189_7).abs() < 1e-4, "{log_sum_exp:?}");
+        assert!((log_sum_exp[3] - 6.440_189_7).abs() < 1e-4, "{log_sum_exp:?}");
+        assert_eq!(at_bound[11].shape(), StaticShape::new(vec![4, 4]));
+        assert_eq!(
+            read_f32s(&client, &at_bound[11]),
+            vec![0.0, 1.0, 3.0, 6.0, 1.0, 3.0, 6.0, 10.0, 2.0, 5.0, 9.0, 14.0, 3.0, 7.0, 12.0, 18.0],
+        );
+    }
+
+    #[test]
+    fn test_data_derived_scaled_dot_and_attention_execute_without_observable_padding() {
+        let plugin = load_cpu_plugin().unwrap();
+        let client = plugin
+            .client(ClientOptions::CPU(CpuClientOptions { device_count: Some(1), ..Default::default() }))
+            .unwrap();
+        let mesh = domain_mesh(&client, "x", 1);
+        let domain = Session::new(&client).domain().with_mesh(mesh.clone());
+        let size_type = replicated_scalar_type(&mesh, DataType::I64);
+        let extent = DimensionVariable::new("extent", DimensionBounds::new(1, Some(5)).unwrap());
+        let program = data_derived_scaled_dot_attention_fixture(
+            size_type.clone(),
+            extent,
+            DataType::F32,
+            DataType::F32,
+            AttentionImplementation::Automatic,
+        );
+        let lowered = domain.lower_program(&program, 0, &Options::new(mesh.clone())).unwrap();
+        assert!(lowered.stable_hlo().contains("stablehlo.composite \"xla.scaled_dot\""));
+        assert!(!lowered.stable_hlo().contains("__cudnn$fmha"));
+        let compiled = domain.compile_program(&lowered).unwrap();
+        let execute = |size: i64| {
+            let input =
+                Array::from_host_buffer(&domain, size_type.clone(), mesh.clone(), size.to_ne_bytes().as_slice())
+                    .unwrap();
+            let eager = program
+                .interpret_in_context(&domain, vec![Value::Array(input.clone())])
+                .unwrap()
+                .into_iter()
+                .map(|value| match value {
+                    Value::Array(array) => array,
+                    Value::Dimension(_) => panic!("attention fixture returned a first-class dimension"),
+                    Value::Reference(_) => panic!("attention fixture returned a reference"),
+                })
+                .collect::<Vec<_>>();
+            let compiled = domain.execute_program(&compiled, vec![input]).unwrap();
+            assert_eq!(compiled.len(), eager.len());
+            for (compiled, eager) in compiled.iter().zip(&eager) {
+                assert_eq!(compiled.shape(), eager.shape());
+                assert_eq!(compiled.data_type(), eager.data_type());
+                let device_id = client.addressable_devices().unwrap()[0].id().unwrap();
+                assert_eq!(
+                    compiled
+                        .device_shard(device_id)
+                        .unwrap()
+                        .buffer()
+                        .unwrap()
+                        .copy_to_host(None)
+                        .unwrap()
+                        .r#await()
+                        .unwrap(),
+                    eager
+                        .device_shard(device_id)
+                        .unwrap()
+                        .buffer()
+                        .unwrap()
+                        .copy_to_host(None)
+                        .unwrap()
+                        .r#await()
+                        .unwrap(),
+                );
+            }
+            compiled
+        };
+
+        let small = execute(2);
+        assert_eq!(small[0].shape(), StaticShape::new(vec![2, 1]));
+        assert_eq!(read_f32s(&client, &small[0]), vec![16.0; 2]);
+        assert_eq!(small[1].shape(), StaticShape::new(vec![2, 2, 1, 8]));
+        assert_eq!(read_bf16s(&client, &small[1]), vec![0.0; 32]);
+        assert_eq!(read_bf16s(&client, &small[2]), vec![0.0; 32]);
+        assert_eq!(read_bf16s(&client, &small[3]), vec![0.0; 32]);
+        assert_eq!(
+            read_bf16s(&client, &small[4]),
+            [1.0, 0.0].into_iter().cycle().take(4).flat_map(|value| [value; 8]).collect::<Vec<_>>(),
+        );
+
+        let at_bound = execute(4);
+        assert_eq!(at_bound[0].shape(), StaticShape::new(vec![4, 1]));
+        assert_eq!(read_f32s(&client, &at_bound[0]), vec![16.0; 4]);
+        assert_eq!(at_bound[1].shape(), StaticShape::new(vec![4, 4, 1, 8]));
+        assert_eq!(
+            read_bf16s(&client, &at_bound[1]),
+            [1.0, 1.0, 1.0, 0.0].into_iter().cycle().take(16).flat_map(|value| [value; 8]).collect::<Vec<_>>(),
+        );
+        assert_eq!(read_bf16s(&client, &at_bound[2]), vec![0.0; 128]);
+        // Three visible keys have equal scores and values 0, 1, 2. Each query contributes
+        // `dS[j] = (1 / 3) * 8 * (j - 1)`, so summing three visible queries gives `dK[j] = 8 * (j - 1)`
+        // and `dV[j] = 3 * (1 / 3) = 1`. The rounded BF16 residual must not rescale these probabilities.
+        assert_eq!(
+            read_bf16s(&client, &at_bound[3]),
+            [-8.0, 0.0, 8.0, 0.0].into_iter().cycle().take(16).flat_map(|value| [value; 8]).collect::<Vec<_>>(),
+        );
+        assert_eq!(
+            read_bf16s(&client, &at_bound[4]),
+            [1.0, 1.0, 1.0, 0.0].into_iter().cycle().take(16).flat_map(|value| [value; 8]).collect::<Vec<_>>(),
+        );
+
+        let zero =
+            Array::from_host_buffer(&domain, size_type.clone(), mesh.clone(), 0_i64.to_ne_bytes().as_slice()).unwrap();
+        let error = domain.execute_program(&compiled, vec![zero]).unwrap_err();
+        assert!(
+            error.to_string().contains(
+                "`dimension_from_scalar` failed: input dimension `extent` = 0 is outside its declared bounds [1, 5)"
+            ),
+            "{error}",
+        );
+
+        // Eager execution replays the attention calls of the bounded-dynamic program at the exact types of their inputs,
+        // so a program that explicitly requests the fused kernels reports that it cannot use them instead of silently
+        // computing the portable result.
+        let extent = DimensionVariable::new("extent", DimensionBounds::new(1, Some(5)).unwrap());
+        let fused = data_derived_scaled_dot_attention_fixture(
+            size_type.clone(),
+            extent,
+            DataType::F32,
+            DataType::F32,
+            AttentionImplementation::Fused,
+        );
+        let input = Array::from_host_buffer(&domain, size_type, mesh, 2_i64.to_ne_bytes().as_slice()).unwrap();
+        let error = fused.interpret_in_context(&domain, vec![Value::Array(input)]).unwrap_err();
+        assert!(
+            error
+                .to_string()
+                .contains("the fused attention implementation is unavailable because the target platform is not CUDA"),
+            "{error}",
+        );
+    }
+
+    #[cfg(feature = "cuda-13")]
+    #[test]
+    fn test_cuda_data_derived_padding_disciplines_execute_without_observable_padding() {
+        let plugin = load_cuda_13_plugin().unwrap();
+        let client = plugin
+            .client(ClientOptions::GPU(GpuClientOptions {
+                platform: Some(GpuPlatform::CUDA),
+                allocator: GpuMemoryAllocator::CudaAsync { memory_fraction_to_preallocate: None },
+                ..Default::default()
+            }))
+            .unwrap();
+        let mesh = domain_mesh(&client, "x", 1);
+        let domain = Session::new(&client).domain().with_mesh(mesh.clone());
+        let size_type = replicated_scalar_type(&mesh, DataType::I64);
+        let extent = DimensionVariable::new("extent", DimensionBounds::new(1, Some(5)).unwrap());
+        let program = data_derived_padding_fixture(size_type.clone(), extent);
+        let lowered = domain.lower_program(&program, 0, &Options::new(mesh.clone())).unwrap();
+        let compiled = domain.compile_program(&lowered).unwrap();
+        let execute = |size: i64| {
+            let input =
+                Array::from_host_buffer(&domain, size_type.clone(), mesh.clone(), size.to_ne_bytes().as_slice())
+                    .unwrap();
+            domain.execute_program(&compiled, vec![input]).unwrap()
+        };
+
+        let small = execute(2);
+        assert_eq!(read_f32s(&client, &small[0]), vec![-1.0, 0.0]);
+        assert_eq!(read_f32s(&client, &small[1]), vec![1.0, 0.0]);
+        assert_eq!(read_u64s(&client, &small[2]), vec![1, 0]);
+        assert_eq!(read_u64s(&client, &small[3]), vec![1, 0]);
+        assert_eq!(read_f32s(&client, &small[4]), vec![1.0]);
+        assert_eq!(read_f32s(&client, &small[5]), vec![1.0]);
+        assert_eq!(read_f32s(&client, &small[6]), vec![-1.0]);
+        assert_eq!(read_booleans(&client, &small[7]), vec![true]);
+        assert_eq!(read_booleans(&client, &small[8]), vec![true]);
+        assert_eq!(read_f32s(&client, &small[9]), vec![1.0]);
+        assert_eq!(read_f32s(&client, &small[12]), vec![2.0]);
+        assert_eq!(read_i32s(&client, &small[13]), vec![1]);
+        assert_eq!(read_i32s(&client, &small[14]), vec![1]);
+        assert_eq!(read_i32s(&client, &small[15]), vec![3, 3]);
+        assert_eq!(read_i32s(&client, &small[16]), vec![1, 1, 1, 1]);
+
+        let at_bound = execute(4);
+        assert_eq!(read_f32s(&client, &at_bound[0]), vec![-3.0, -2.0, -1.0, 0.0]);
+        assert_eq!(read_f32s(&client, &at_bound[1]), vec![3.0, 2.0, 1.0, 0.0]);
+        assert_eq!(read_u64s(&client, &at_bound[2]), vec![3, 2, 1, 0]);
+        assert_eq!(read_u64s(&client, &at_bound[3]), vec![3, 2, 1, 0]);
+        assert_eq!(read_f32s(&client, &at_bound[4]), vec![6.0]);
+        assert_eq!(read_f32s(&client, &at_bound[5]), vec![3.0]);
+        assert_eq!(read_f32s(&client, &at_bound[6]), vec![-3.0]);
+        assert_eq!(read_booleans(&client, &at_bound[7]), vec![true]);
+        assert_eq!(read_booleans(&client, &at_bound[8]), vec![true]);
+        assert_eq!(read_f32s(&client, &at_bound[9]), vec![14.0]);
+        assert_eq!(read_f32s(&client, &at_bound[12]), vec![24.0]);
+        assert_eq!(read_i32s(&client, &at_bound[13]), vec![3]);
+        assert_eq!(read_i32s(&client, &at_bound[14]), vec![3]);
+        assert_eq!(read_i32s(&client, &at_bound[15]), vec![3, 3, 3, 3]);
+        assert_eq!(read_i32s(&client, &at_bound[16]), vec![3, 3, 3, 3]);
+    }
+
+    #[cfg(feature = "cuda-13")]
+    #[test]
+    fn test_cuda_data_derived_scaled_dot_and_attention_execute_fused_without_observable_padding() {
+        let plugin = load_cuda_13_plugin().unwrap();
+        let client = plugin
+            .client(ClientOptions::GPU(GpuClientOptions {
+                platform: Some(GpuPlatform::CUDA),
+                allocator: GpuMemoryAllocator::CudaAsync { memory_fraction_to_preallocate: None },
+                ..Default::default()
+            }))
+            .unwrap();
+        let mesh = domain_mesh(&client, "x", 1);
+        let domain = Session::new(&client).domain().with_mesh(mesh.clone());
+        for (scaled_element_type, scaled_scale_type) in [
+            (DataType::F4E2M1FN, DataType::F8E4M3FN),
+            (DataType::F8E4M3FN, DataType::F8E8M0FNU),
+            (DataType::F8E5M2, DataType::F8E8M0FNU),
+        ] {
+            let scaled_dot_value = match scaled_element_type {
+                DataType::F8E4M3FN | DataType::F8E5M2 => 32.0,
+                _ => 16.0,
+            };
+            let size_type = replicated_scalar_type(&mesh, DataType::I64);
+            let extent = DimensionVariable::new("extent", DimensionBounds::new(1, Some(5)).unwrap());
+            let program = data_derived_scaled_dot_attention_fixture(
+                size_type.clone(),
+                extent,
+                scaled_element_type,
+                scaled_scale_type,
+                AttentionImplementation::Fused,
+            );
+            let lowered = domain.lower_program(&program, 0, &Options::new(mesh.clone())).unwrap();
+            // cuDNN accepts the NVFP4 and `f8e4m3fn` MXFP8 pairs, which lower to the block-scaled-dot custom call, but
+            // not `f8e5m2` on both sides, which keeps the composite.
+            let uses_custom_call = scaled_element_type != DataType::F8E5M2;
+            assert_eq!(lowered.stable_hlo().contains("stablehlo.custom_call @__op$block_scaled_dot"), uses_custom_call);
+            assert_eq!(lowered.stable_hlo().contains("stablehlo.composite \"xla.scaled_dot\""), !uses_custom_call);
+            assert!(lowered.stable_hlo().contains("__cudnn$fmhaSoftmax"));
+            assert!(lowered.stable_hlo().contains("__cudnn$fmhaSoftmaxBackward"));
+            let compiled = domain.compile_program(&lowered).unwrap();
+            let execute = |size: i64| {
+                let input =
+                    Array::from_host_buffer(&domain, size_type.clone(), mesh.clone(), size.to_ne_bytes().as_slice())
+                        .unwrap();
+                domain.execute_program(&compiled, vec![input]).unwrap()
+            };
+
+            let small = execute(2);
+            assert_eq!(small[0].shape(), StaticShape::new(vec![2, 1]));
+            assert_eq!(read_f32s(&client, &small[0]), vec![scaled_dot_value; 2]);
+            assert_eq!(small[1].shape(), StaticShape::new(vec![2, 2, 1, 8]));
+            assert_eq!(read_bf16s(&client, &small[1]), vec![0.0; 32]);
+            assert_eq!(read_bf16s(&client, &small[2]), vec![0.0; 32]);
+            assert_eq!(read_bf16s(&client, &small[3]), vec![0.0; 32]);
+            assert_eq!(
+                read_bf16s(&client, &small[4]),
+                [1.0, 0.0].into_iter().cycle().take(4).flat_map(|value| [value; 8]).collect::<Vec<_>>(),
+            );
+
+            let at_bound = execute(4);
+            assert_eq!(at_bound[0].shape(), StaticShape::new(vec![4, 1]));
+            assert_eq!(read_f32s(&client, &at_bound[0]), vec![scaled_dot_value; 4]);
+            assert_eq!(at_bound[1].shape(), StaticShape::new(vec![4, 4, 1, 8]));
+            assert_eq!(
+                read_bf16s(&client, &at_bound[1]),
+                [1.0, 1.0, 1.0, 0.0].into_iter().cycle().take(16).flat_map(|value| [value; 8]).collect::<Vec<_>>(),
+            );
+            assert_eq!(read_bf16s(&client, &at_bound[2]), vec![0.0; 128]);
+            let actual_query_gradient = read_bf16s(&client, &at_bound[3]);
+            let expected_query_gradient =
+                [-8.0, 0.0, 8.0, 0.0].into_iter().cycle().take(16).flat_map(|value| [value; 8]).collect::<Vec<_>>();
+            // cuDNN's fused BF16 backward-attention kernel is not bit-identical to the unfused reference
+            // composition, so compare its gradients with an explicit reduced-precision tolerance.
+            actual_query_gradient.iter().zip(&expected_query_gradient).for_each(|(actual, expected)| {
+                assert!((actual - expected).abs() <= 0.25, "expected {expected} within 0.25, but found {actual}");
+            });
+            let actual_value_gradient = read_bf16s(&client, &at_bound[4]);
+            let expected_value_gradient =
+                [1.0, 1.0, 1.0, 0.0].into_iter().cycle().take(16).flat_map(|value| [value; 8]).collect::<Vec<_>>();
+            actual_value_gradient.iter().zip(&expected_value_gradient).for_each(|(actual, expected)| {
+                assert!((actual - expected).abs() <= 0.25, "expected {expected} within 0.25, but found {actual}");
+            });
+
+            let zero =
+                Array::from_host_buffer(&domain, size_type, mesh.clone(), 0_i64.to_ne_bytes().as_slice()).unwrap();
+            let error = domain.execute_program(&compiled, vec![zero]).unwrap_err();
+            assert!(
+                error.to_string().contains(
+                    "`dimension_from_scalar` failed: input dimension `extent` = 0 is outside its declared bounds [1, 5)"
+                ),
+                "{error}",
+            );
+        }
+    }
+
+    #[cfg(feature = "cuda-13")]
+    #[test]
+    #[ignore = "hardware throughput benchmark; run explicitly on a CUDA system"]
+    fn bench_cuda_fused_attention_throughput() {
+        let plugin = load_cuda_13_plugin().unwrap();
+        let client = plugin
+            .client(ClientOptions::GPU(GpuClientOptions {
+                platform: Some(GpuPlatform::CUDA),
+                allocator: GpuMemoryAllocator::CudaAsync { memory_fraction_to_preallocate: None },
+                ..Default::default()
+            }))
+            .unwrap();
+        let mesh = domain_mesh(&client, "x", 1);
+        let domain = Session::new(&client).domain().with_mesh(mesh.clone());
+        let [batch, sequence, heads, head_dimension] = [4, 2048, 32, 128];
+        let r#type = ArrayType::new(
+            DataType::BF16,
+            Shape::new(vec![
+                CoreDimension::Static(batch),
+                CoreDimension::Static(sequence),
+                CoreDimension::Static(heads),
+                CoreDimension::Static(head_dimension),
+            ]),
+        )
+        .with_sharding(Sharding::replicated(mesh.logical_mesh().clone(), 4))
+        .unwrap();
+        let attention = dot_product_attention::<Domain<'static>>(
+            AttentionConfiguration::new().with_scale(1.0 / (head_dimension as f64).sqrt()),
+        );
+        let (_, program) = DomainTracingContext::<Domain<'static>>::trace(
+            |inputs: Vec<Tracer<'static>>| {
+                let (output, _) =
+                    attention.call(AttentionInputs::new(inputs[0].clone(), inputs[1].clone(), inputs[2].clone()))?;
+                Ok(vec![output])
+            },
+            vec![ArrayIrType::from(r#type.clone()); 3],
+        )
+        .unwrap();
+        let program = program.into_flat_program();
+        let lowered = domain.lower_program(&program, 0, &Options::new(mesh.clone())).unwrap();
+        assert!(lowered.stable_hlo().contains("__cudnn$fmhaSoftmax"));
+        let compilation_start = Instant::now();
+        let compiled = domain.compile_program(&lowered).unwrap();
+        let compilation_duration = compilation_start.elapsed();
+
+        let one = 0x3f80_u16.to_ne_bytes();
+        let mut bytes = vec![0_u8; batch * sequence * heads * head_dimension * size_of::<u16>()];
+        bytes.chunks_exact_mut(size_of::<u16>()).for_each(|element| element.copy_from_slice(&one));
+        let input = Array::from_host_buffer(&domain, r#type, mesh, bytes.as_slice()).unwrap();
+        input.block_until_ready().unwrap();
+        let execute = || {
+            let outputs = domain.execute_program(&compiled, vec![input.clone(), input.clone(), input.clone()])?;
+            outputs[0].block_until_ready()?;
+            Ok::<_, Error>(())
+        };
+        // The Spark idles at its lowest power state, so warm the fused kernel long enough for clocks to stabilize
+        // before collecting synchronized samples.
+        (0..20).for_each(|_| execute().unwrap());
+        let mut samples = (0..20)
+            .map(|_| {
+                let start = Instant::now();
+                execute().unwrap();
+                start.elapsed().as_nanos()
+            })
+            .collect::<Vec<_>>();
+        samples.sort_unstable();
+        let median_nanoseconds = samples[samples.len() / 2];
+        let floating_point_operations =
+            4.0 * batch as f64 * heads as f64 * sequence as f64 * sequence as f64 * head_dimension as f64;
+        let throughput_teraflops = floating_point_operations / (median_nanoseconds as f64 * 1e3);
+
+        eprintln!(
+            "fused attention b{batch} h{heads} s{sequence} d{head_dimension}: compile={compilation_duration:?}, \
+             median={:.3} ms, throughput={throughput_teraflops:.2} TFLOP/s",
+            median_nanoseconds as f64 / 1e6,
+        );
     }
 }

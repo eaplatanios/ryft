@@ -6811,9 +6811,8 @@ mod tests {
         // arity. `with_donate` enforces matching shape via the `Parameterized<bool>` bound on
         // its argument, so producing an arity mismatch requires setting `donation_flags`
         // directly on `Options`.
-        let mut xla_options = Options::new(mesh.clone());
-        xla_options.donation_flags = Some(vec![true, false, false]); // 3 entries, 1 input
-        let options = xla_options;
+        let mut options = Options::new(mesh.clone());
+        options.donation_flags = Some(vec![true, false, false]); // 3 entries, 1 input
         let result: Result<CompiledFunction<'_, ArrayType, ArrayType>, Error> =
             compile_with_options(|x| x.sin().unwrap(), input_type, &engine, options);
         assert!(matches!(
@@ -6870,8 +6869,7 @@ mod tests {
         let abstract_input_type =
             ArrayType::new(DataType::F32, shape.clone()).with_sharding(abstract_sharding).unwrap();
         let sharded = Sharding::new(mesh.logical_mesh().clone(), vec![ShardingDimension::sharded(["x"])]).unwrap();
-        let xla_options = Options::new(mesh.clone()).with_input_shardings(vec![sharded.clone()]);
-        let options = xla_options;
+        let options = Options::new(mesh.clone()).with_input_shardings(vec![sharded.clone()]);
         let compiled: CompiledFunction<'_, ArrayType, ArrayType> =
             compile_with_options(|x| x.sin().unwrap(), abstract_input_type, &engine, options).unwrap();
 
@@ -6917,8 +6915,7 @@ mod tests {
             .unwrap();
         let sharding = Sharding::replicated(mesh.logical_mesh().clone(), 1);
         // Two shardings for one flat input — should fail.
-        let xla_options = Options::new(mesh).with_input_shardings(vec![sharding.clone(), sharding]);
-        let options = xla_options;
+        let options = Options::new(mesh).with_input_shardings(vec![sharding.clone(), sharding]);
         let result: Result<CompiledFunction<'_, ArrayType, ArrayType>, Error> =
             compile_with_options(|x| x.sin().unwrap(), input_type, &engine, options);
         assert!(matches!(
@@ -6941,8 +6938,7 @@ mod tests {
         let input_type = ArrayType::new(DataType::F32, shape.clone()).with_sharding(sharded.clone()).unwrap();
         // Override the output sharding to the same 2-way shard along "x" so the partitioner
         // emits a fully-sharded output and `Array`'s sharding metadata matches.
-        let xla_options = Options::new(mesh.clone()).with_output_shardings(vec![sharded.clone()]);
-        let options = xla_options;
+        let options = Options::new(mesh.clone()).with_output_shardings(vec![sharded.clone()]);
         let compiled: CompiledFunction<'_, ArrayType, ArrayType> =
             compile_with_options(|x| x.sin().unwrap(), input_type.clone(), &engine, options).unwrap();
 
@@ -7038,8 +7034,7 @@ mod tests {
             .with_sharding(Sharding::replicated(mesh.logical_mesh().clone(), 1))
             .unwrap();
         let sharding = Sharding::replicated(mesh.logical_mesh().clone(), 1);
-        let xla_options = Options::new(mesh).with_output_shardings(vec![sharding.clone(), sharding]);
-        let options = xla_options;
+        let options = Options::new(mesh).with_output_shardings(vec![sharding.clone(), sharding]);
         let result: Result<CompiledFunction<'_, ArrayType, ArrayType>, Error> =
             compile_with_options(|x| x.sin().unwrap(), input_type, &engine, options);
         assert!(matches!(

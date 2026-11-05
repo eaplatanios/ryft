@@ -629,20 +629,24 @@ mod tests {
     use indoc::indoc;
     use pretty_assertions::assert_eq;
     use ryft_core::{
-        Array as CoreArray, ArrayIrType, ArrayOperation, Context, DimensionBounds, DimensionFromScalarOperation,
-        DimensionVariable, DynamicSlice, DynamicSliceOperation, DynamicUpdateSliceOperation, EagerContext, Placeholder,
-        ReverseModeDifferentiate, TypedProgram, UpdateSliceOperation,
+        Array as CoreArray, ArrayIrType, ArrayOperation, ArrayType, Context, DataType, Dimension as CoreDimension,
+        DimensionBounds, DimensionFromScalarOperation, DimensionVariable, DynamicSlice, DynamicSliceOperation,
+        DynamicUpdateSlice, DynamicUpdateSliceOperation, EagerContext, Linearization, Placeholder,
+        ReverseModeDifferentiate, Shape, TypedProgram, UpdateSliceOperation, ValueProjection,
     };
     use ryft_pjrt::{BufferType, ExecutionDeviceInputs, ExecutionInput, Program as PjrtProgram};
 
+    use crate::domains::tests::{domain_mesh, read_f64s};
     use crate::experimental::lowering::tests::{
         ProgramBuilder, ragged_dot_cpu_compilation_options, test_matrix_type, unproject_plain_program,
     };
     use crate::experimental::lowering::to_mlir_module_for_plain_program;
-    use crate::experimental::ops::{ArrayConstant, Constant, FlatProgram, ProgramBuilder as ArrayIrProgramBuilder};
+    use crate::experimental::ops::{
+        ArrayConstant, Constant, FlatProgram, Operation, ProgramBuilder as ArrayIrProgramBuilder,
+    };
     use crate::operations::constants::dynamic_constructor_types;
     use crate::tests::{execution_client, values_from_bytes, values_to_bytes};
-    use crate::{Array, to_mlir_module_for_program};
+    use crate::{Array, Options, Session, to_mlir_module_for_program};
 
     use super::*;
 
@@ -1269,6 +1273,219 @@ mod tests {
         assert_eq!(
             plan_dynamic_slice_axis(0, 1, &CoreDimension::Static(4), &proven_start, &proven_size).unwrap(),
             DynamicSliceAxisPlan { size: 3, span: 3, needs_runtime_assertion: false },
+        );
+    }
+
+    #[test]
+    fn test_compiled_dynamic_update_slice_partial_pullbacks() {
+        // `DynamicUpdateSliceOperation`'s transpose stages only the contributions whose accumulators are needed: with
+        // only the operand cotangent requested it stages one `dynamic_update_slice` of the cotangent with a zero
+        // update and no `dynamic_slice`, and with only the update cotangent requested it stages one `dynamic_slice`
+        // of the cotangent and no zero. The shared symbolic manipulation harness always differentiates with respect
+        // to every array input, so this runs both pruned pullbacks on the CPU PJRT client used by the other tests
+        // (the `cutile` feature only enables compilation of the kernel module) at symbolic operand extents, with an
+        // in-bounds start and a start that clamps to the last rows.
+        let client = execution_client();
+        let mesh = domain_mesh(&client, "x", 1);
+        let domain = Session::new(&client).domain().with_mesh(mesh.clone());
+        let extent = CoreDimension::Dynamic(DimensionVariable::new("n", DimensionBounds::new(4, Some(6)).unwrap()));
+        let staged = crate::jit::stage::<_, Vec<ArrayType>, Vec<ArrayType>>(
+            |inputs| vec![inputs[0].dynamic_update_slice(&inputs[1], &inputs[2..]).unwrap()],
+            vec![
+                ArrayType::new(DataType::F64, Shape::new(vec![extent, CoreDimension::Static(4)])),
+                ArrayType::new_static(DataType::F64, [2, 4]),
+                ArrayType::scalar(DataType::I32),
+                ArrayType::scalar(DataType::I32),
+            ],
+            Options::new(mesh.clone()),
+        )
+        .unwrap()
+        .into_inner();
+        let program = staged.source_program().program().clone();
+        assert_eq!(
+            program.to_string(),
+            indoc! {"
+                lambda %0:f64[n, 4], %1:f64[2, 4], %2:i32[], %3:i32[] .
+                let %4:f64[n, 4] = dynamic_update_slice %0 %1 %2 %3
+                in (%4)
+            "}
+            .trim_end(),
+        );
+        // Specializes the primal at the concrete extent `size`, compiles the primal followed by its pullback at an
+        // all-ones cotangent with an all-100 update and the given row start, runs it on the client, and returns the
+        // primal output and the single requested gradient, whose shape is checked against `gradient_shape`.
+        let execute = |linearization: &Linearization<Constant, Operation>,
+                       pullback: &FlatProgram,
+                       size: usize,
+                       values: &[f64],
+                       row: i32,
+                       gradient_shape: &[usize]| {
+            let input_types = vec![
+                ArrayType::new_static(DataType::F64, [size, 4]),
+                ArrayType::new_static(DataType::F64, [2, 4]),
+                ArrayType::scalar(DataType::I32),
+                ArrayType::scalar(DataType::I32),
+                ArrayType::new_static(DataType::F64, [size, 4]),
+            ];
+            let specialized = linearization
+                .primal()
+                .as_ref()
+                .clone()
+                .specialize(&input_types[..4].iter().cloned().map(ArrayIrType::from).collect::<Vec<_>>())
+                .unwrap_or_else(|error| panic!("n={size} specialization: {error}\n{}", linearization.primal()));
+            assert_eq!(specialized.output_types()[0], ArrayIrType::from(input_types[0].clone()), "n={size}");
+            let compiled = crate::jit::compile::<_, Vec<ArrayType>, Vec<ArrayType>>(
+                |inputs| {
+                    let mut inputs = inputs.into_iter().map(|input| input.into_value()).collect::<Vec<_>>();
+                    let cotangent = inputs.pop().unwrap();
+                    let context = inputs[0].context().clone();
+                    let mut outputs = linearization
+                        .primal()
+                        .interpret_in_context(&context, inputs)
+                        .unwrap_or_else(|error| panic!("n={size} primal: {error}\n{}", linearization.primal()));
+                    let mut pullback_inputs = vec![cotangent];
+                    pullback_inputs.extend(outputs.split_off(1));
+                    outputs.extend(
+                        pullback
+                            .interpret_in_context(&context, pullback_inputs)
+                            .unwrap_or_else(|error| panic!("n={size} pullback: {error}\n{pullback}")),
+                    );
+                    outputs
+                        .into_iter()
+                        .map(|output| ValueProjection::<ArrayType>::into_projected(output).unwrap())
+                        .collect()
+                },
+                input_types.clone(),
+                &domain,
+                mesh.clone(),
+            )
+            .unwrap_or_else(|error| panic!("n={size} native trace: {error}"));
+            let bytes = [
+                values_to_bytes(values),
+                values_to_bytes(&[100_f64; 8]),
+                values_to_bytes(&[row]),
+                values_to_bytes(&[0_i32]),
+                values_to_bytes(&vec![1_f64; size * 4]),
+            ];
+            let inputs = input_types
+                .into_iter()
+                .zip(bytes)
+                .map(|(r#type, bytes)| Array::from_host_buffer(&domain, r#type, mesh.clone(), bytes).unwrap())
+                .collect();
+            let outputs = domain.interpret(&compiled.executable_function(), inputs).unwrap();
+            assert_eq!(outputs.len(), 2, "n={size}, row={row}");
+            for output in &outputs {
+                assert_eq!(output.data_type(), DataType::F64);
+                assert_eq!(output.mesh(), &mesh);
+            }
+            assert_eq!(outputs[0].shape().as_slice(), &[size, 4], "n={size}, row={row}");
+            assert_eq!(outputs[1].shape().as_slice(), gradient_shape, "n={size}, row={row}");
+            outputs.iter().map(|output| read_f64s(&client, output)).collect::<Vec<_>>()
+        };
+        // Row start 1 updates rows 1 and 2; row start 9 clamps to the last two rows of the input.
+        let four_rows = [0., 1., 2., 3., 4., 5., 6., 7., 8., 9., 10., 11., 12., 13., 14., 15.];
+        let five_rows = [0., 1., 2., 3., 4., 5., 6., 7., 8., 9., 10., 11., 12., 13., 14., 15., 16., 17., 18., 19.];
+        let four_rows_in_bounds = [0., 1., 2., 3., 100., 100., 100., 100., 100., 100., 100., 100., 12., 13., 14., 15.];
+        let five_rows_in_bounds =
+            [0., 1., 2., 3., 100., 100., 100., 100., 100., 100., 100., 100., 12., 13., 14., 15., 16., 17., 18., 19.];
+        let four_rows_clamped = [0., 1., 2., 3., 4., 5., 6., 7., 100., 100., 100., 100., 100., 100., 100., 100.];
+        let five_rows_clamped =
+            [0., 1., 2., 3., 4., 5., 6., 7., 8., 9., 10., 11., 100., 100., 100., 100., 100., 100., 100., 100.];
+
+        // The symbolic input extent keeps the linearization inside a `linear_call`, so each pullback is the
+        // transposed call: its forward region runs the transpose rule, while its transpose region carries the
+        // original forward for re-transposition. Pinning both regions checks which contributions were pruned.
+
+        // Only the operand cotangent: the update accumulator is unneeded, so the transpose zeroes the updated window
+        // of the cotangent without slicing it.
+        let linearization = program.linearize_with_respect_to(&[0]).unwrap();
+        let pullback = linearization.pullback().unwrap().into_program();
+        assert_eq!(
+            pullback.to_string(),
+            indoc! {"
+                lambda %0:f64[n, 4], %1:i32[], %2:i32[] .
+                let %3:f64[n, 4] = linear_call [residual_count=2] %1 %2 %0 [
+                    forward={
+                        lambda %0:i32[], %1:i32[], %2:f64[n, 4] .
+                        let %3:f64[2, 4] = zero [type=f64[2, 4]]
+                            %4:f64[n, 4] = dynamic_update_slice %2 %3 %0 %1
+                        in (%4)
+                    },
+                    transpose={
+                        lambda %0:i32[], %1:i32[], %2:f64[n, 4] .
+                        let %3:f64[2, 4] = zero [type=f64[2, 4]]
+                            %4:f64[n, 4] = dynamic_update_slice %2 %3 %0 %1
+                        in (%4)
+                    },
+                ]
+                in (%3)
+            "}
+            .trim_end(),
+        );
+        assert_eq!(
+            execute(&linearization, &pullback, 4, &four_rows, 1, &[4, 4]),
+            vec![four_rows_in_bounds.to_vec(), vec![1., 1., 1., 1., 0., 0., 0., 0., 0., 0., 0., 0., 1., 1., 1., 1.]],
+        );
+        assert_eq!(
+            execute(&linearization, &pullback, 5, &five_rows, 1, &[5, 4]),
+            vec![
+                five_rows_in_bounds.to_vec(),
+                vec![1., 1., 1., 1., 0., 0., 0., 0., 0., 0., 0., 0., 1., 1., 1., 1., 1., 1., 1., 1.],
+            ],
+        );
+        assert_eq!(
+            execute(&linearization, &pullback, 4, &four_rows, 9, &[4, 4]),
+            vec![four_rows_clamped.to_vec(), vec![1., 1., 1., 1., 1., 1., 1., 1., 0., 0., 0., 0., 0., 0., 0., 0.]],
+        );
+        assert_eq!(
+            execute(&linearization, &pullback, 5, &five_rows, 9, &[5, 4]),
+            vec![
+                five_rows_clamped.to_vec(),
+                vec![1., 1., 1., 1., 1., 1., 1., 1., 1., 1., 1., 1., 0., 0., 0., 0., 0., 0., 0., 0.],
+            ],
+        );
+
+        // Only the update cotangent: the operand accumulator is unneeded, so the transpose slices the updated window
+        // out of the cotangent without materializing a zero update. The retained operand extent and the zero operand
+        // tangent belong to the original forward region, which materializes the missing operand tangent.
+        let linearization = program.linearize_with_respect_to(&[1]).unwrap();
+        let pullback = linearization.pullback().unwrap().into_program();
+        assert_eq!(
+            pullback.to_string(),
+            indoc! {"
+                lambda %0:f64[n, 4], %1:i32[], %2:i32[], %3:dimension<n ∈ [4, 6)> .
+                let %4:f64[2, 4] = linear_call [residual_count=3] %1 %2 %3 %0 [
+                    forward={
+                        lambda %0:i32[], %1:i32[], %2:dimension<n ∈ [4, 6)>, %3:f64[n, 4] .
+                        let %4:f64[2, 4] = dynamic_slice [sizes=[2, 4]] %3 %0 %1
+                        in (%4)
+                    },
+                    transpose={
+                        lambda %0:i32[], %1:i32[], %2:dimension<n ∈ [4, 6)>, %3:f64[2, 4] .
+                        let %4:f64[n, 4] = zero [type=f64[n, 4]] %2
+                            %5:f64[n, 4] = dynamic_update_slice %4 %3 %0 %1
+                        in (%5)
+                    },
+                ]
+                in (%4)
+            "}
+            .trim_end(),
+        );
+        assert_eq!(
+            execute(&linearization, &pullback, 4, &four_rows, 1, &[2, 4]),
+            vec![four_rows_in_bounds.to_vec(), vec![1.; 8]],
+        );
+        assert_eq!(
+            execute(&linearization, &pullback, 5, &five_rows, 1, &[2, 4]),
+            vec![five_rows_in_bounds.to_vec(), vec![1.; 8]],
+        );
+        assert_eq!(
+            execute(&linearization, &pullback, 4, &four_rows, 9, &[2, 4]),
+            vec![four_rows_clamped.to_vec(), vec![1.; 8]],
+        );
+        assert_eq!(
+            execute(&linearization, &pullback, 5, &five_rows, 9, &[2, 4]),
+            vec![five_rows_clamped.to_vec(), vec![1.; 8]],
         );
     }
 }

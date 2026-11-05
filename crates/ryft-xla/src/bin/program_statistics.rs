@@ -542,7 +542,7 @@ mod tests {
 
     /// Verifies the exact expected statistics for every shard-map case, including the nested case's shared-arena
     /// attachment edges. The `shard_map_basic` expectation is anchored against a program rendering by the
-    /// `test_traced_xla_program_statistics` owner-module test in `experimental::tracing`; the other two fixtures were
+    /// `test_traced_program_statistics` owner-module test in `experimental::tracing`; the other two fixtures were
     /// pinned from the binary's emitted values after checking them for internal consistency, so they serve as
     /// change detectors rather than independently derived ground truth.
     #[test]

@@ -328,12 +328,16 @@ mod tests {
     use indoc::indoc;
     use pretty_assertions::assert_eq;
     use ryft_core::{
-        ArrayOperation, CumulativeOperation, DimensionBounds, DimensionVariable, Instruction, Placeholder, Shape,
+        Array as CoreArray, ArrayIrType, ArrayOperation, ArrayType, CumulativeOperation, DataType,
+        Dimension as CoreDimension, DimensionBounds, DimensionVariable, Instruction, Placeholder, Shape, Sharding,
     };
 
+    use crate::domains::tests::{domain_mesh, read_f32s};
     use crate::experimental::lowering::tests::{ProgramBuilder, lowered_unary_module, unproject_plain_program};
     use crate::experimental::lowering::{lower_mlir_module_for_program, to_mlir_module_for_plain_program};
     use crate::experimental::ops::ArrayConstant;
+    use crate::tests::{execution_client, values_to_bytes};
+    use crate::{Array, Domain, Options, Session, Value};
 
     use super::*;
 
@@ -799,6 +803,52 @@ mod tests {
                 .unwrap();
             let jvp = program.jvp().unwrap();
             assert!(to_mlir_module_for_plain_program(&jvp, "main").is_ok(), "{kind}");
+        }
+    }
+
+    #[test]
+    fn test_compiled_associative_scan_over_dynamic_unscanned_axis() {
+        use ryft_core::{Cumulative, Max, associative_scan};
+
+        // `associative_scan` keeps every unscanned axis whole, so a bounded dynamic row axis survives its slices, pads,
+        // and interleaving, and one compiled program computes the prefix maxima of every row at each logical row
+        // count, exactly like the reference backend's cumulative maximum.
+        let client = execution_client();
+        let mesh = domain_mesh(&client, "x", 1);
+        let domain = Session::new(&client).domain().with_mesh(mesh.clone());
+        let sharding = Sharding::replicated(mesh.logical_mesh().clone(), 2);
+        let rows = DimensionVariable::new("rows", DimensionBounds::new(1, Some(5)).unwrap());
+        let dynamic_type =
+            ArrayType::new(DataType::F32, Shape::new(vec![CoreDimension::Dynamic(rows), CoreDimension::Static(5)]))
+                .with_sharding(sharding.clone())
+                .unwrap();
+        let staged = crate::jit::stage::<_, ArrayType, ArrayType>(
+            |input| associative_scan(&input, 1, false, &|left, right| left.max(right)).unwrap(),
+            dynamic_type,
+            Options::new(mesh.clone()),
+        )
+        .unwrap()
+        .into_inner();
+        let compiled: ryft_core::compilation::CompiledFunction<Domain<'_>, ArrayIrType, ArrayIrType> =
+            staged.lower(&domain).unwrap().compile(&domain).unwrap();
+        for rows in [2usize, 4] {
+            let values = (0..rows * 5).map(|value| ((value * 7) % 11) as f32).collect::<Vec<_>>();
+            let input = Array::from_host_buffer(
+                &domain,
+                ArrayType::new_static(DataType::F32, [rows, 5]).with_sharding(sharding.clone()).unwrap(),
+                mesh.clone(),
+                values_to_bytes(values.as_slice()).as_slice(),
+            )
+            .unwrap();
+            let output = compiled.executable().execute(&domain, Value::Array(input)).unwrap();
+            let Value::Array(output) = output else {
+                panic!("array-only compiled function returned a first-class dimension");
+            };
+            output.block_until_ready().unwrap();
+            assert_eq!(output.shape().as_slice(), &[rows, 5]);
+            let expected =
+                CoreArray::matrix(rows, 5, values).unwrap().cumulative_max(1).unwrap().elements::<f32>().unwrap();
+            assert_eq!(read_f32s(&client, &output), expected);
         }
     }
 }

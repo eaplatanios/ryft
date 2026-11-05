@@ -227,4 +227,197 @@ impl ryft_core::NamedAxes for Domain<'_> {
 }
 
 #[cfg(test)]
-mod tests;
+pub(crate) mod tests {
+    use std::sync::Arc;
+
+    use pretty_assertions::assert_eq;
+    use ryft_core::{
+        ArrayIrType, ArrayType, DataType, Device, DeviceMesh, Dimension as CoreDimension, LogicalMesh, MeshAxis,
+        MeshAxisType, Placeholder, ProjectedContext, ReferenceReadOperation, ReferenceType, Shape, Sharding,
+    };
+    use ryft_pjrt::protos::CompilationOptions;
+    use ryft_pjrt::{Client, ClientOptions, CpuClientOptions, load_cpu_plugin};
+
+    use crate::domains::sessions::Session;
+    use crate::experimental::ops::{Constant, FlatProgram, ProgramBuilder};
+    use crate::tests::{values_from_bytes, values_to_bytes};
+    use crate::{Array, FromPjrt, Value};
+
+    use super::*;
+
+    pub(crate) fn domain_mesh(client: &Client<'_>, axis: &str, axis_size: usize) -> DeviceMesh {
+        let logical_mesh = LogicalMesh::new(vec![MeshAxis::new(axis, axis_size, MeshAxisType::Auto).unwrap()]).unwrap();
+        let devices = client
+            .addressable_devices()
+            .unwrap()
+            .into_iter()
+            .map(|device| Device::from_pjrt(device).unwrap())
+            .collect::<Vec<_>>();
+        DeviceMesh::new(logical_mesh, devices).unwrap()
+    }
+
+    pub(super) fn external_reference_read_program(referent_type: ArrayType) -> FlatProgram {
+        let mut builder = ProgramBuilder::new();
+        let reference = builder.add_input(ArrayIrType::Reference(ReferenceType::new(referent_type)));
+        let output =
+            builder.add_instruction(ReferenceReadOperation::new(), Vec::new(), vec![reference], None).unwrap()[0];
+        builder
+            .build::<Vec<Constant>, Vec<Constant>>(vec![output], vec![Placeholder], vec![Placeholder])
+            .unwrap()
+    }
+
+    pub(super) fn array_domain<'c>(client: &'c Client<'c>) -> ProjectedContext<Domain<'c>, ArrayType> {
+        ProjectedContext::new(Session::new(client).domain())
+    }
+
+    pub(super) fn program_array<'a, 'c>(value: &'a Value<'c>) -> &'a Array<'c> {
+        let Value::Array(array) = value else {
+            panic!("expected an array IR value");
+        };
+        array
+    }
+
+    pub(super) fn replicated_vector_type(mesh: &DeviceMesh, size: usize) -> ArrayType {
+        ArrayType::new(DataType::F32, Shape::new(vec![CoreDimension::Static(size)]))
+            .with_sharding(Sharding::replicated(mesh.logical_mesh().clone(), 1))
+            .unwrap()
+    }
+
+    pub(super) fn replicated_scalar_type(mesh: &DeviceMesh, data_type: DataType) -> ArrayType {
+        ArrayType::scalar(data_type)
+            .with_sharding(Sharding::replicated(mesh.logical_mesh().clone(), 0))
+            .unwrap()
+    }
+
+    pub(super) fn f32_vector<'c>(domain: &Domain<'c>, mesh: &DeviceMesh, values: &[f32]) -> Array<'c> {
+        let r#type = replicated_vector_type(mesh, values.len());
+        Array::from_host_buffer(domain, r#type, mesh.clone(), values_to_bytes::<f32>(values).as_slice()).unwrap()
+    }
+
+    pub(super) fn f32_scalar<'c>(domain: &Domain<'c>, mesh: &DeviceMesh, value: f32) -> Array<'c> {
+        let r#type = replicated_scalar_type(mesh, DataType::F32);
+        Array::from_host_buffer(domain, r#type, mesh.clone(), value.to_ne_bytes().as_slice()).unwrap()
+    }
+
+    pub(super) fn f64_vector<'c>(domain: &Domain<'c>, mesh: &DeviceMesh, values: &[f64]) -> Array<'c> {
+        let r#type = ArrayType::new(DataType::F64, Shape::new(vec![CoreDimension::Static(values.len())]))
+            .with_sharding(Sharding::replicated(mesh.logical_mesh().clone(), 1))
+            .unwrap();
+        Array::from_host_buffer(domain, r#type, mesh.clone(), values_to_bytes::<f64>(values).as_slice()).unwrap()
+    }
+
+    pub(super) fn boolean_vector<'c>(domain: &Domain<'c>, mesh: &DeviceMesh, values: &[bool]) -> Array<'c> {
+        let r#type = ArrayType::new(DataType::Boolean, Shape::new(vec![CoreDimension::Static(values.len())]))
+            .with_sharding(Sharding::replicated(mesh.logical_mesh().clone(), 1))
+            .unwrap();
+        let values = values.iter().copied().map(u8::from).collect::<Vec<_>>();
+        Array::from_host_buffer(domain, r#type, mesh.clone(), values.as_slice()).unwrap()
+    }
+
+    pub(super) fn boolean_scalar<'c>(domain: &Domain<'c>, mesh: &DeviceMesh, value: bool) -> Array<'c> {
+        let r#type = replicated_scalar_type(mesh, DataType::Boolean);
+        Array::from_host_buffer(domain, r#type, mesh.clone(), &[u8::from(value)]).unwrap()
+    }
+
+    pub(crate) fn read_f32s(client: &Client<'_>, array: &Array<'_>) -> Vec<f32> {
+        let device_id = client.addressable_devices().unwrap()[0].id().unwrap();
+        let bytes = array
+            .device_shard(device_id)
+            .unwrap()
+            .buffer()
+            .unwrap()
+            .copy_to_host(None)
+            .unwrap()
+            .r#await()
+            .unwrap();
+        values_from_bytes::<f32>(bytes.as_slice())
+    }
+
+    pub(crate) fn read_f64s(client: &Client<'_>, array: &Array<'_>) -> Vec<f64> {
+        let device_id = client.addressable_devices().unwrap()[0].id().unwrap();
+        let bytes = array
+            .device_shard(device_id)
+            .unwrap()
+            .buffer()
+            .unwrap()
+            .copy_to_host(None)
+            .unwrap()
+            .r#await()
+            .unwrap();
+        values_from_bytes::<f64>(bytes.as_slice())
+    }
+
+    pub(super) fn read_u64s(client: &Client<'_>, array: &Array<'_>) -> Vec<u64> {
+        let device_id = client.addressable_devices().unwrap()[0].id().unwrap();
+        let bytes = array
+            .device_shard(device_id)
+            .unwrap()
+            .buffer()
+            .unwrap()
+            .copy_to_host(None)
+            .unwrap()
+            .r#await()
+            .unwrap();
+        values_from_bytes::<u64>(bytes.as_slice())
+    }
+
+    pub(super) fn read_i64s(client: &Client<'_>, array: &Array<'_>) -> Vec<i64> {
+        let device_id = client.addressable_devices().unwrap()[0].id().unwrap();
+        let bytes = array
+            .device_shard(device_id)
+            .unwrap()
+            .buffer()
+            .unwrap()
+            .copy_to_host(None)
+            .unwrap()
+            .r#await()
+            .unwrap();
+        values_from_bytes::<i64>(bytes.as_slice())
+    }
+
+    pub(super) fn read_booleans(client: &Client<'_>, array: &Array<'_>) -> Vec<bool> {
+        let device_id = client.addressable_devices().unwrap()[0].id().unwrap();
+        array
+            .device_shard(device_id)
+            .unwrap()
+            .buffer()
+            .unwrap()
+            .copy_to_host(None)
+            .unwrap()
+            .r#await()
+            .unwrap()
+            .into_iter()
+            .map(|value| value != 0)
+            .collect()
+    }
+
+    #[test]
+    fn test_domain_accessors_return_constructor_arguments() {
+        let plugin = load_cpu_plugin().unwrap();
+        let client = plugin
+            .client(ClientOptions::CPU(CpuClientOptions { device_count: Some(1), ..Default::default() }))
+            .unwrap();
+        let mesh = domain_mesh(&client, "x", 1);
+        let domain = Session::new(&client).domain().with_mesh(mesh.clone());
+        let cloned = domain.clone();
+
+        assert_eq!(domain.mesh().unwrap(), &mesh);
+        assert_eq!(domain.compilation_options(), &CompilationOptions::default());
+        assert!(Arc::ptr_eq(&domain.compilation_options, &cloned.compilation_options));
+        assert!(size_of::<Domain<'_>>() < size_of::<CompilationOptions>());
+    }
+
+    #[test]
+    fn test_domain_with_compilation_options() {
+        let plugin = load_cpu_plugin().unwrap();
+        let client = plugin.client(ClientOptions::CPU(CpuClientOptions::default())).unwrap();
+        let domain = Session::new(&client).domain();
+        let mut compilation_options = CompilationOptions::default();
+        compilation_options.compile_portable_executable = true;
+        let sibling = domain.with_compilation_options(compilation_options.clone());
+        assert!(Arc::ptr_eq(domain.session(), sibling.session()));
+        assert!(Arc::ptr_eq(&domain.effect_scope, &sibling.effect_scope));
+        assert_eq!(sibling.compilation_options(), &compilation_options);
+        assert_eq!(domain.compilation_options(), &CompilationOptions::default());
+    }
+}
