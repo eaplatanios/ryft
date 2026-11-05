@@ -15,7 +15,7 @@ use crate::interpretation::{InterpretableOperation, InterpretationDriver};
 use crate::macros::{check_count, impl_differentiable_operation};
 use crate::operations::Capability;
 use crate::operations::collectives::parallel_reduce::ParallelReduceOperation;
-use crate::operations::collectives::parallel_vary::ParallelVary;
+use crate::operations::collectives::parallel_vary::{PARALLEL_VARY_OPERATION_NAME, ParallelVary};
 use crate::operations::manipulation::broadcasting::BroadcastOperation;
 use crate::operations::reductions::ReductionKind;
 use crate::partial::PartiallyEvaluatableOperation;
@@ -155,9 +155,9 @@ impl Operation for ParallelCastOperation {
         };
         if source != expected_source {
             let remedy = if source == "invariant" && target == ParallelCastTarget::Varying {
-                "; use `parallel_vary` to make an invariant value varying"
+                format!("; use `{PARALLEL_VARY_OPERATION_NAME}` to make an invariant value varying")
             } else {
-                ""
+                String::new()
             };
             return Err(TypeError::invalid(format!(
                 "`{PARALLEL_CAST_OPERATION_NAME}` to `{target}` requires an input that is {expected_source} along \
@@ -345,11 +345,11 @@ impl<A: Value<Type = ArrayType>> From<ParallelCastOperation> for ArrayIrOperatio
 
 /// Represents the ability to move a value between the variation and reduction states of a manual mesh axis. Inside
 /// a manual region (e.g., the body of a [`ShardMapOperation`](crate::ShardMapOperation)), the type of every per-device
-/// local value records, for each manual axis, one of four states: _invariant_ (every device along the axis holds the
-/// same value), _varying_ (the devices may hold different values), _unreduced_ (the logical value is the sum of the
-/// per-device values, which a later sum completes), or _reduced_ (an invariant value whose reverse mode cotangent is
-/// unreduced). [`parallel_cast`](Self::parallel_cast) changes that state without changing any local value, so it lowers
-/// to nothing. It is the Ryft analogue of JAX's
+/// local value records one of four states for each manual axis. An _invariant_ value is the same on every device along
+/// the axis, while a _varying_ value may differ. An _unreduced_ value represents the logical sum of the per-device
+/// values, which a later sum completes. A _reduced_ value is invariant but its reverse mode cotangent is unreduced.
+/// [`parallel_cast`](Self::parallel_cast) changes that state without changing any local value, so it lowers to
+/// nothing. It is the Ryft analogue of JAX's
 /// [`jax.lax.pcast`](https://docs.jax.dev/en/latest/_autosummary/jax.lax.pcast.html),
 /// and, with manual variation checking enabled, supports the same four transitions.
 ///
@@ -750,7 +750,8 @@ mod tests {
             }, {
                 input_types = [invariant.clone()],
                 error = format!("`{PARALLEL_CAST_OPERATION_NAME}` to `varying` requires an input that is reduced \
-                                 along manual axis `m` but got one that is invariant; use `parallel_vary` to make an \
+                                 along manual axis `m` but got one that is invariant; use \
+                                 `{PARALLEL_VARY_OPERATION_NAME}` to make an \
                                  invariant value varying"),
             }, {
                 input_types = [varying.clone()],
@@ -988,7 +989,8 @@ mod tests {
             .unwrap();
         let mapped = ArrayBatch::new(trace.input(packed_type), BatchAxis::new(1)).unwrap();
         let replicated = ArrayBatch::replicated(trace.input(invariant));
-        let context = BatchingContext::<_, ArrayBatchingPolicy>::new(trace.clone(), 2).with_axis_name("items".into());
+        let context =
+            BatchingContext::<_, ArrayBatchingPolicy>::new(trace.clone(), 2).with_axis_name("items".to_string());
         let operation = ParallelCastOperation::new("m".to_string(), ParallelCastTarget::Reduced);
         let mapped = operation.batch(&context, &EmptyRegionDriver, &[mapped]).unwrap().remove(0);
         let replicated = operation.batch(&context, &EmptyRegionDriver, &[replicated]).unwrap().remove(0);
@@ -1124,15 +1126,24 @@ mod tests {
             );
             let differentiated = program.to_flat_program().jvp_with_respect_to(&[]).unwrap();
             assert_eq!(differentiated.output_types(), vec![case.output_type.clone(), case.output_type]);
-            assert_eq!(
-                differentiated.to_string(),
+            let expected = if target == ParallelCastTarget::Varying {
+                formatdoc! {"
+                    lambda %0:{source} .
+                    let %1:{output} = parallel_cast [axis_name=\"m\", target={target}] %0
+                        %2:{output} = zero [
+                            type={output},
+                        ]
+                    in (%1, %2)"
+                }
+            } else {
                 formatdoc! {"
                     lambda %0:{source} .
                     let %1:{output} = parallel_cast [axis_name=\"m\", target={target}] %0
                         %2:{output} = zero [type={output}]
                     in (%1, %2)"
-                },
-            );
+                }
+            };
+            assert_eq!(differentiated.to_string(), expected);
         }
     }
 
