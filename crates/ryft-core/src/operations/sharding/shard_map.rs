@@ -2907,6 +2907,12 @@ where
     }
 }
 
+/// Global value that the [`ShardMap`] capability of the [`Context`] `C` maps over and returns, which is the array
+/// member of a value of `C` (refer to [`ValueProjection`]). For array IR contexts and their tracers, this is a
+/// [`ProjectedValue`] of the context's values, and for a backend whose values project onto a dedicated array type (e.g.,
+/// the arrays of the XLA backend), it is that array type, so that the frontend applies to its concrete values directly.
+pub type ShardMapValue<C> = <<C as Domain>::Value as ValueProjection<ArrayType>>::Projected;
+
 /// Local value that a `shard_map` body function traced for the [`Domain`] `C` receives and returns, which is a
 /// [`DomainTracer`] of `C` projected onto its array member. The bodies that [`ShardMap`] and
 /// [`shard_map()`](fn@shard_map) trace are array-only, so every local input and output of such a body is one of these
@@ -3006,7 +3012,8 @@ impl ShardMapOptions {
 /// explicit context, which also lets a body without inputs create values. The global [`shard_map()`](fn@shard_map)
 /// function instead recovers its context from the first input.
 ///
-/// The inputs are array projections of array IR values (i.e., values of type [`ArrayIrType`]) of this context. The body
+/// The inputs are the array members of values of this context (i.e., [`ShardMapValue`]s, such as the arrays of the XLA
+/// backend or the array projections of array IR values, which are values of type [`ArrayIrType`]). The body
 /// function is traced once, in a fresh [`DomainTracingContext`] of this context, and receives the [`ShardMapContext`]
 /// of that trace together with [`ShardMapTracer`]s whose types are the local shards of the input types (refer to
 /// [`ShardMapBoundary::local_input_type`]). The resulting checked [`ShardMapOperation`] is bound in this context on the
@@ -3071,15 +3078,14 @@ impl ShardMapOptions {
 /// require tracing the body explicitly and constructing the operation through [`ShardMapOperation::from_program`], and
 /// first-class dimensions may appear only inside the body, since `shard_map` boundaries are array or reference
 /// positions only.
-pub trait ShardMap: Context + NamedAxes {
+pub trait ShardMap: Context<Value: ValueProjection<ArrayType, Projected: Parameter>> + NamedAxes {
     /// Traces `function` as the local body of a manual SPMD computation over `mesh` and binds it in this context on
     /// `inputs`, returning the global outputs that are assembled from the local outputs of every device.
     ///
     /// # Parameters
     ///
     ///   - `function`: Body function traced over the body context and the local shards of `inputs`.
-    ///   - `inputs`: Structured global input values, whose leaves are array projections of array IR values of this
-    ///     context.
+    ///   - `inputs`: Structured global input values, whose leaves are [`ShardMapValue`]s of this context.
     ///   - `mesh`: Logical mesh that the manual computation is defined over.
     ///   - `input_shardings`: Shardings of the global inputs (i.e., JAX's `in_specs`), with the same structure as
     ///     `inputs`.
@@ -3109,12 +3115,12 @@ pub trait ShardMap: Context + NamedAxes {
         input_shardings: Input::To<Sharding>,
         output_shardings: Output::To<Sharding>,
         options: ShardMapOptions,
-    ) -> Result<Output::To<ProjectedValue<ArrayType, Self::Value>>, ShardMapError>
+    ) -> Result<Output::To<ShardMapValue<Self>>, ShardMapError>
     where
-        Input: Parameterized<ProjectedValue<ArrayType, Self::Value>>,
+        Input: Parameterized<ShardMapValue<Self>>,
         Input::Family: ParameterizedFamily<Sharding> + ParameterizedFamily<ShardMapTracer<Self>>,
         Output: Parameterized<ShardMapTracer<Self>>,
-        Output::Family: ParameterizedFamily<Sharding> + ParameterizedFamily<ProjectedValue<ArrayType, Self::Value>>,
+        Output::Family: ParameterizedFamily<Sharding> + ParameterizedFamily<ShardMapValue<Self>>,
         F: FnOnce(&ShardMapContext<Self>, Input::To<ShardMapTracer<Self>>) -> Result<Output, ProgramError>;
 
     /// Like [`Self::shard_map`], but uses the sharding of each input's type as its input sharding (i.e., JAX's default
@@ -3136,12 +3142,12 @@ pub trait ShardMap: Context + NamedAxes {
         mesh: LogicalMesh,
         output_shardings: Output::To<Sharding>,
         options: ShardMapOptions,
-    ) -> Result<Output::To<ProjectedValue<ArrayType, Self::Value>>, ShardMapError>
+    ) -> Result<Output::To<ShardMapValue<Self>>, ShardMapError>
     where
-        Input: Parameterized<ProjectedValue<ArrayType, Self::Value>>,
+        Input: Parameterized<ShardMapValue<Self>>,
         Input::Family: ParameterizedFamily<Sharding> + ParameterizedFamily<ShardMapTracer<Self>>,
         Output: Parameterized<ShardMapTracer<Self>>,
-        Output::Family: ParameterizedFamily<Sharding> + ParameterizedFamily<ProjectedValue<ArrayType, Self::Value>>,
+        Output::Family: ParameterizedFamily<Sharding> + ParameterizedFamily<ShardMapValue<Self>>,
         F: FnOnce(&ShardMapContext<Self>, Input::To<ShardMapTracer<Self>>) -> Result<Output, ProgramError>,
     {
         let input_shardings = inputs
@@ -3175,13 +3181,12 @@ pub trait ShardMap: Context + NamedAxes {
         axis_name: &str,
         input_axes: Input::To<Option<usize>>,
         output_axes: Output::To<Option<usize>>,
-    ) -> Result<Output::To<ProjectedValue<ArrayType, Self::Value>>, ShardMapError>
+    ) -> Result<Output::To<ShardMapValue<Self>>, ShardMapError>
     where
-        Input: Parameterized<ProjectedValue<ArrayType, Self::Value>>,
+        Input: Parameterized<ShardMapValue<Self>>,
         Input::Family: ParameterizedFamily<Option<usize>> + ParameterizedFamily<ShardMapTracer<Self>>,
         Output: Parameterized<ShardMapTracer<Self>>,
-        Output::Family:
-            ParameterizedFamily<Option<usize>> + ParameterizedFamily<ProjectedValue<ArrayType, Self::Value>>,
+        Output::Family: ParameterizedFamily<Option<usize>> + ParameterizedFamily<ShardMapValue<Self>>,
         F: FnOnce(&ShardMapContext<Self>, Input::To<ShardMapTracer<Self>>) -> Result<Output, ProgramError>;
 }
 
@@ -3190,7 +3195,7 @@ where
     TracingContext<C::Constant, C::Operation>:
         StagingContext<Type = ArrayIrType, Constant = C::Constant, Operation = C::Operation>,
     C: Context<Type = ArrayIrType, Operation: From<ShardMapOperation> + OperationPayloadProjection> + NamedAxes,
-    C::Value: ValueProjection<ArrayType, Projected = ProjectedValue<ArrayType, C::Value>>,
+    C::Value: ValueProjection<ArrayType, Projected: Parameter>,
     ShardMapTracer<C>: ParallelVary,
 {
     fn shard_map<F, Input, Output>(
@@ -3201,12 +3206,12 @@ where
         input_shardings: Input::To<Sharding>,
         output_shardings: Output::To<Sharding>,
         options: ShardMapOptions,
-    ) -> Result<Output::To<ProjectedValue<ArrayType, Self::Value>>, ShardMapError>
+    ) -> Result<Output::To<ShardMapValue<Self>>, ShardMapError>
     where
-        Input: Parameterized<ProjectedValue<ArrayType, Self::Value>>,
+        Input: Parameterized<ShardMapValue<Self>>,
         Input::Family: ParameterizedFamily<Sharding> + ParameterizedFamily<ShardMapTracer<Self>>,
         Output: Parameterized<ShardMapTracer<Self>>,
-        Output::Family: ParameterizedFamily<Sharding> + ParameterizedFamily<ProjectedValue<ArrayType, Self::Value>>,
+        Output::Family: ParameterizedFamily<Sharding> + ParameterizedFamily<ShardMapValue<Self>>,
         F: FnOnce(&ShardMapContext<Self>, Input::To<ShardMapTracer<Self>>) -> Result<Output, ProgramError>,
     {
         validate_parameter_structure(&inputs.parameter_paths().collect::<Vec<_>>(), &input_shardings)?;
@@ -3235,13 +3240,12 @@ where
         axis_name: &str,
         input_axes: Input::To<Option<usize>>,
         output_axes: Output::To<Option<usize>>,
-    ) -> Result<Output::To<ProjectedValue<ArrayType, Self::Value>>, ShardMapError>
+    ) -> Result<Output::To<ShardMapValue<Self>>, ShardMapError>
     where
-        Input: Parameterized<ProjectedValue<ArrayType, Self::Value>>,
+        Input: Parameterized<ShardMapValue<Self>>,
         Input::Family: ParameterizedFamily<Option<usize>> + ParameterizedFamily<ShardMapTracer<Self>>,
         Output: Parameterized<ShardMapTracer<Self>>,
-        Output::Family:
-            ParameterizedFamily<Option<usize>> + ParameterizedFamily<ProjectedValue<ArrayType, Self::Value>>,
+        Output::Family: ParameterizedFamily<Option<usize>> + ParameterizedFamily<ShardMapValue<Self>>,
         F: FnOnce(&ShardMapContext<Self>, Input::To<ShardMapTracer<Self>>) -> Result<Output, ProgramError>,
     {
         validate_parameter_structure(&inputs.parameter_paths().collect::<Vec<_>>(), &input_axes)?;
@@ -3277,9 +3281,11 @@ where
 
 /// Invokes a manual SPMD computation over `mesh` on `inputs`, running `function` once per device on the local shards of
 /// the inputs and assembling the global outputs from its local outputs. This is the analogue of
-/// [`jax.shard_map`](https://docs.jax.dev/en/latest/_autosummary/jax.shard_map.html). It binds the computation in the
-/// [`Domain`](Value::Domain) of the first input through the `shard_map` function of [`ShardMap`], whose documentation
-/// describes the complete semantics, and its body function receives only its local values. A computation without
+/// [`jax.shard_map`](https://docs.jax.dev/en/latest/_autosummary/jax.shard_map.html). It binds the computation through
+/// the `shard_map` function of [`ShardMap`] in the context whose values project onto the first input (i.e., the parent
+/// of that input's [`Domain`](Value::Domain)), whose documentation describes the complete semantics, and its body
+/// function receives only its local values. The inputs may therefore be concrete arrays (e.g., the arrays of the XLA
+/// backend, which then executes the map eagerly) as well as tracers. A computation without
 /// inputs has no input to recover a context from, so it is invoked through the `shard_map` function of [`ShardMap`] on
 /// an explicitly provided context instead, whose body function also receives the body context through which it creates
 /// values.
@@ -3287,7 +3293,7 @@ where
 /// # Parameters
 ///
 ///   - `function`: Body function traced over the local shards of `inputs`.
-///   - `inputs`: Structured global input values, whose leaves are array projections of array IR values.
+///   - `inputs`: Structured global input values, whose leaves are [`ShardMapValue`]s of one context.
 ///   - `mesh`: Logical mesh that the manual computation is defined over.
 ///   - `input_shardings`: Shardings of the global inputs (i.e., JAX's `in_specs`), with the same structure as `inputs`.
 ///   - `output_shardings`: Shardings of the global outputs (i.e., JAX's `out_specs`), with the same structure as the
@@ -3298,26 +3304,27 @@ where
 ///
 /// Returns [`ShardMapError::MissingInputContext`] when `inputs` has no leaves, and the errors of the `shard_map`
 /// function of [`ShardMap`] otherwise.
-pub fn shard_map<V, F, Input, Output>(
+pub fn shard_map<V, C, F, Input, Output>(
     function: F,
     inputs: Input,
     mesh: LogicalMesh,
     input_shardings: Input::To<Sharding>,
     output_shardings: Output::To<Sharding>,
     options: ShardMapOptions,
-) -> Result<Output::To<ProjectedValue<ArrayType, V>>, ShardMapError>
+) -> Result<Output::To<V>, ShardMapError>
 where
-    V: Value<Domain: ShardMap<Value = V>>,
-    Input: Parameterized<ProjectedValue<ArrayType, V>>,
-    Input::Family: ParameterizedFamily<Sharding> + ParameterizedFamily<ShardMapTracer<V::Domain>>,
-    Output: Parameterized<ShardMapTracer<V::Domain>>,
-    Output::Family: ParameterizedFamily<Sharding> + ParameterizedFamily<ProjectedValue<ArrayType, V>>,
-    F: FnOnce(Input::To<ShardMapTracer<V::Domain>>) -> Result<Output, ProgramError>,
+    V: Value<Domain = ProjectedContext<C, ArrayType>>,
+    C: ShardMap<Value: ValueProjection<ArrayType, Projected = V>>,
+    Input: Parameterized<V>,
+    Input::Family: ParameterizedFamily<Sharding> + ParameterizedFamily<ShardMapTracer<C>>,
+    Output: Parameterized<ShardMapTracer<C>>,
+    Output::Family: ParameterizedFamily<Sharding> + ParameterizedFamily<V>,
+    F: FnOnce(Input::To<ShardMapTracer<C>>) -> Result<Output, ProgramError>,
 {
     let context = inputs
         .parameters()
         .next()
-        .map(|input| input.value().domain())
+        .map(|input| input.domain().parent().clone())
         .ok_or(ShardMapError::MissingInputContext)?;
     context.shard_map(
         |_, local_inputs| function(local_inputs),
@@ -3330,33 +3337,34 @@ where
 }
 
 /// Invokes a manual SPMD computation over `mesh` on `inputs` like [`shard_map`], using the sharding of each input's
-/// type as its input sharding (i.e., JAX's default `in_specs=Infer`). It binds the computation in the
-/// [`Domain`](Value::Domain) of the first input through the `shard_map_with_inferred_input_shardings` function of
-/// [`ShardMap`], whose documentation describes the inference.
+/// type as its input sharding (i.e., JAX's default `in_specs=Infer`). It binds the computation through the
+/// `shard_map_with_inferred_input_shardings` function of [`ShardMap`] in the context whose values project onto the
+/// first input, as [`shard_map`] does, and that function's documentation describes the inference.
 ///
 /// # Errors
 ///
 /// Returns [`ShardMapError::MissingInputContext`] when `inputs` has no leaves, and the errors of the
 /// `shard_map_with_inferred_input_shardings` function of [`ShardMap`] otherwise.
-pub fn shard_map_with_inferred_input_shardings<V, F, Input, Output>(
+pub fn shard_map_with_inferred_input_shardings<V, C, F, Input, Output>(
     function: F,
     inputs: Input,
     mesh: LogicalMesh,
     output_shardings: Output::To<Sharding>,
     options: ShardMapOptions,
-) -> Result<Output::To<ProjectedValue<ArrayType, V>>, ShardMapError>
+) -> Result<Output::To<V>, ShardMapError>
 where
-    V: Value<Domain: ShardMap<Value = V>>,
-    Input: Parameterized<ProjectedValue<ArrayType, V>>,
-    Input::Family: ParameterizedFamily<Sharding> + ParameterizedFamily<ShardMapTracer<V::Domain>>,
-    Output: Parameterized<ShardMapTracer<V::Domain>>,
-    Output::Family: ParameterizedFamily<Sharding> + ParameterizedFamily<ProjectedValue<ArrayType, V>>,
-    F: FnOnce(Input::To<ShardMapTracer<V::Domain>>) -> Result<Output, ProgramError>,
+    V: Value<Domain = ProjectedContext<C, ArrayType>>,
+    C: ShardMap<Value: ValueProjection<ArrayType, Projected = V>>,
+    Input: Parameterized<V>,
+    Input::Family: ParameterizedFamily<Sharding> + ParameterizedFamily<ShardMapTracer<C>>,
+    Output: Parameterized<ShardMapTracer<C>>,
+    Output::Family: ParameterizedFamily<Sharding> + ParameterizedFamily<V>,
+    F: FnOnce(Input::To<ShardMapTracer<C>>) -> Result<Output, ProgramError>,
 {
     let context = inputs
         .parameters()
         .next()
-        .map(|input| input.value().domain())
+        .map(|input| input.domain().parent().clone())
         .ok_or(ShardMapError::MissingInputContext)?;
     context.shard_map_with_inferred_input_shardings(
         |_, local_inputs| function(local_inputs),
@@ -3369,14 +3377,14 @@ where
 
 /// Invokes a manual SPMD computation over the single manual axis `axis_name` of `mesh` on `inputs`, placing the
 /// dimensions that `input_axes` and `output_axes` select along that axis. This is the analogue of
-/// [`jax.smap`](https://docs.jax.dev/en/latest/_autosummary/jax.smap.html). It binds the computation in the
-/// [`Domain`](Value::Domain) of the first input through the `shard_map_along` function of [`ShardMap`], whose
-/// documentation describes the complete semantics.
+/// [`jax.smap`](https://docs.jax.dev/en/latest/_autosummary/jax.smap.html). It binds the computation through the
+/// `shard_map_along` function of [`ShardMap`] in the context whose values project onto the first input, as
+/// [`shard_map`] does, and that function's documentation describes the complete semantics.
 ///
 /// # Parameters
 ///
 ///   - `function`: Body function traced over the local shards of `inputs`.
-///   - `inputs`: Structured global input values, whose leaves are array projections of array IR values.
+///   - `inputs`: Structured global input values, whose leaves are [`ShardMapValue`]s of one context.
 ///   - `mesh`: Logical mesh that the manual computation is defined over.
 ///   - `axis_name`: Manual axis of `mesh` that the computation makes manual.
 ///   - `input_axes`: Dimension of each input to place along `axis_name`, or [`None`] to replicate the input, with the
@@ -3388,26 +3396,27 @@ where
 ///
 /// Returns [`ShardMapError::MissingInputContext`] when `inputs` has no leaves, and the errors of the `shard_map_along`
 /// function of [`ShardMap`] otherwise.
-pub fn shard_map_along<V, F, Input, Output>(
+pub fn shard_map_along<V, C, F, Input, Output>(
     function: F,
     inputs: Input,
     mesh: LogicalMesh,
     axis_name: &str,
     input_axes: Input::To<Option<usize>>,
     output_axes: Output::To<Option<usize>>,
-) -> Result<Output::To<ProjectedValue<ArrayType, V>>, ShardMapError>
+) -> Result<Output::To<V>, ShardMapError>
 where
-    V: Value<Domain: ShardMap<Value = V>>,
-    Input: Parameterized<ProjectedValue<ArrayType, V>>,
-    Input::Family: ParameterizedFamily<Option<usize>> + ParameterizedFamily<ShardMapTracer<V::Domain>>,
-    Output: Parameterized<ShardMapTracer<V::Domain>>,
-    Output::Family: ParameterizedFamily<Option<usize>> + ParameterizedFamily<ProjectedValue<ArrayType, V>>,
-    F: FnOnce(Input::To<ShardMapTracer<V::Domain>>) -> Result<Output, ProgramError>,
+    V: Value<Domain = ProjectedContext<C, ArrayType>>,
+    C: ShardMap<Value: ValueProjection<ArrayType, Projected = V>>,
+    Input: Parameterized<V>,
+    Input::Family: ParameterizedFamily<Option<usize>> + ParameterizedFamily<ShardMapTracer<C>>,
+    Output: Parameterized<ShardMapTracer<C>>,
+    Output::Family: ParameterizedFamily<Option<usize>> + ParameterizedFamily<V>,
+    F: FnOnce(Input::To<ShardMapTracer<C>>) -> Result<Output, ProgramError>,
 {
     let context = inputs
         .parameters()
         .next()
-        .map(|input| input.value().domain())
+        .map(|input| input.domain().parent().clone())
         .ok_or(ShardMapError::MissingInputContext)?;
     context.shard_map_along(|_, local_inputs| function(local_inputs), inputs, mesh, axis_name, input_axes, output_axes)
 }
@@ -6778,23 +6787,23 @@ fn bind_shard_map<C, F, Input, Output>(
     input_shardings: Vec<Sharding>,
     outputs: ShardMapOutputs<Output::ParameterStructure>,
     options: ShardMapOptions,
-) -> Result<Output::To<ProjectedValue<ArrayType, C::Value>>, ShardMapError>
+) -> Result<Output::To<ShardMapValue<C>>, ShardMapError>
 where
     TracingContext<C::Constant, C::Operation>:
         StagingContext<Type = ArrayIrType, Constant = C::Constant, Operation = C::Operation>,
     C: Context<Type = ArrayIrType, Operation: From<ShardMapOperation> + OperationPayloadProjection> + NamedAxes,
-    C::Value: ValueProjection<ArrayType, Projected = ProjectedValue<ArrayType, C::Value>>,
+    C::Value: ValueProjection<ArrayType, Projected: Parameter>,
     ShardMapTracer<C>: ParallelVary,
-    Input: Parameterized<ProjectedValue<ArrayType, C::Value>>,
+    Input: Parameterized<ShardMapValue<C>>,
     Input::Family: ParameterizedFamily<ShardMapTracer<C>>,
     Output: Parameterized<ShardMapTracer<C>>,
-    Output::Family: ParameterizedFamily<ProjectedValue<ArrayType, C::Value>>,
+    Output::Family: ParameterizedFamily<ShardMapValue<C>>,
     F: FnOnce(&ShardMapContext<C>, Input::To<ShardMapTracer<C>>) -> Result<Output, ProgramError>,
 {
     let ShardMapOutputs { paths: output_paths, structure: output_structure, shardings: output_shardings } = outputs;
     let input_structure = inputs.parameter_structure();
     let global_input_types = inputs.parameters().map(|input| input.r#type().into_owned()).collect::<Vec<_>>();
-    let inputs = inputs.into_parameters().map(ProjectedValue::into_value).collect::<Vec<_>>();
+    let inputs = inputs.into_parameters().map(C::Value::from_projected).collect::<Vec<_>>();
     let named_axes = context.named_axes();
     let checks = options.manual_variation_checks;
     let (initial_output_shardings, output_axes) = match output_shardings {
@@ -6847,7 +6856,7 @@ where
         .into_iter()
         .map(|output| ValueProjection::<ArrayType>::into_projected(output).map_err(ProgramError::from))
         .collect::<Result<Vec<_>, _>>()?;
-    Ok(Output::To::<ProjectedValue<ArrayType, C::Value>>::from_parameters(output_structure, outputs)?)
+    Ok(Output::To::<ShardMapValue<C>>::from_parameters(output_structure, outputs)?)
 }
 
 /// Builds the [`ShardMapBoundary`] of a closure-traced `shard_map` that is bound in the scope of named axes

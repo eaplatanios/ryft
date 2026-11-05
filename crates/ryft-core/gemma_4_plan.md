@@ -204,7 +204,7 @@ The transform stack was rebuilt around a single builder entry point:
 | Jacobian / Hessian | curvature-aware optimizers (optional) | ✅ | `.jacobian_forward` / `.jacobian_reverse` / `.hessian` |
 | `vmap` | per-example losses | ✅ | `batch(function, input, in_axes, out_axes, axis)` in `batching.rs`; nests and composes with staging |
 | Activation checkpointing (`remat`) | memory pressure at long context | ✅ | `rematerialize(body)` with the full policy family (§1.7) |
-| JIT compile + execute | end-to-end JIT to PJRT | ✅ | backend-neutral `jit`/`stage_function` in `compilation/` (structural + disk caching); XLA side: `compile`/`stage`/`jitted` returning `CompiledFunction`/`JittedFunction`, with `.gradient(&domain)` and `.jvp(&domain)` on compiled functions |
+| JIT compile + execute | end-to-end JIT to PJRT | ✅ | backend-neutral `jit`/`stage_function` in `compilation/` (structural + disk caching); XLA side: `compile`/`stage`/`jit` returning `CompiledFunction`/`CompiledFunctionDispatcher`, with `.gradient(&domain)` and `.jvp(&domain)` on compiled functions |
 | Batching a *compiled* function | vmap-of-jit | ⚠️ | `CompiledFunction::batch` is a stub (`UnsupportedOperation`); direct `batch` of the uncompiled function works |
 | Stateful optimizer (Adam/AdamW) | training | ❌ | **still missing** — no optimizer module anywhere in the workspace |
 | Gradient clip-by-global-norm | training stability | ❌ | **still missing**; all ingredients (`reduce`, `sqrt`, `min`, `mul`) exist |
@@ -386,7 +386,7 @@ With the primitives done, the remaining work re-scopes to five focused phases:
 - **R3 — Gemma 4 model + training step.** The §3 implementation: config, `Parameterized`
   parameter tree, blocks on the fused `dot_product_attention`, loss, `train_step` via
   `differentiate_at(..).with_captures(..).value_and_gradient(..)` + R1's optimizer, JIT-compiled
-  through `ryft-xla`'s `jitted`. Wrap each block in `rematerialize(..)` with a
+  through `ryft-xla`'s `jit`. Wrap each block in `rematerialize(..)` with a
   `DotsWithNoBatchDimensionsSavable`-style policy for long-context memory.
 - **R4 — Validation.** Forward-logit parity against the DeepMind JAX reference on a published
   E2B checkpoint; one-optimizer-step parameter-delta parity; short-run loss-curve parity; then
@@ -925,7 +925,7 @@ where
 
 Because `ryft-xla`'s `Array` executes eagerly with a shared per-lineage executable cache, the
 training loop below already runs on-device without explicit JIT; wrapping the step with
-`ryft_xla::jitted` (or backend-neutral `ryft::jit`) fuses it into one compiled program with
+`ryft_xla::jit` (or backend-neutral `ryft::jit`) fuses it into one compiled program with
 retained-cache dispatch.
 
 ```rust
@@ -1594,7 +1594,7 @@ choices (attention projections FP8, MLP NVFP4, §4.4) so call sites stay clean.
 - **`erf` vs `tanh`-approx GELU.** Both primitives exist now; expose the choice as a config
   knob in the model crate. Default to exact (`erf`) GELU.
 - **Batching a compiled function.** `CompiledFunction::batch` is stubbed — deliberately, not
-  as an oversight (see the design note at [crates/ryft-xla/src/jit.rs:1031](crates/ryft-xla/src/jit.rs:1031)).
+  as an oversight (see the design note at [crates/ryft-xla/src/compilation.rs](crates/ryft-xla/src/compilation.rs)).
   Derived compiled functions are retained through a structural transform cache, and on this
   branch the batch extent is a first-class runtime `DimensionVariable` (batched sealed regions
   carry the `[extent, inputs...] ↦ [extent, outputs...]` boundary). The open design decision is
@@ -1783,8 +1783,8 @@ A consolidated list of every external source cited in this document, grouped by 
 - [`crates/ryft-xla/src/experimental/lowering.rs`](crates/ryft-xla/src/experimental/lowering.rs) —
   the StableHLO lowering rules, including `lower_scaled_dot_to_mlir`
   (`__op$block_scaled_dot` + portable fallback) and the cuDNN FMHA attention custom calls.
-- [`crates/ryft-xla/src/jit.rs`](crates/ryft-xla/src/jit.rs) and
-  [`crates/ryft-xla/src/eager.rs`](crates/ryft-xla/src/eager.rs) — XLA compile/stage/jitted
+- [`crates/ryft-xla/src/compilation.rs`](crates/ryft-xla/src/compilation.rs) and
+  [`crates/ryft-xla/src/eager.rs`](crates/ryft-xla/src/eager.rs) — XLA compile/stage/jit
   surface and eager op-by-op dispatch with the shared executable cache.
 - [`crates/ryft/examples/mlp.rs`](crates/ryft/examples/mlp.rs) — the canonical end-to-end
   training example whose idioms §3 follows (generic `A: ArrayOperations` model code,

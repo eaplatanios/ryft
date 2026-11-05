@@ -716,7 +716,7 @@ mod gpu {
             if iteration == warmup {
                 start = Instant::now();
             }
-            let outputs = domain.interpret(&compiled.executable_function(), inputs.clone())?;
+            let outputs = compiled.executable().execute(&domain, inputs.clone())?;
             assert_eq!(outputs.len(), 1);
             bytes = outputs[0]
                 .device_shard(device.id().unwrap())
@@ -1612,7 +1612,7 @@ mod cutile {
                 let input = session
                     .array(r#type, mesh, expected.iter().flat_map(|value| value.to_ne_bytes()).collect::<Vec<_>>())
                     .unwrap();
-                let output = domain.interpret(&compiled.executable_function(), input).unwrap();
+                let output = compiled.executable().execute(&domain, input).unwrap();
                 let bytes = output
                     .device_shard(device.id().unwrap())
                     .unwrap()

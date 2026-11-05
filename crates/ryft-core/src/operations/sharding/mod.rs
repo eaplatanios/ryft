@@ -106,7 +106,7 @@ pub use constrain_sharding::{
 pub use reshard::{RESHARD_OPERATION_NAME, Reshard, ReshardDispatch, ReshardOperation};
 pub use shard_map::{
     SHARD_MAP_OPERATION_NAME, ShardMap, ShardMapBoundary, ShardMapContext, ShardMapError, ShardMapOperation,
-    ShardMapOptions, ShardMapTracer, ShardMapValueKind, shard_map, shard_map_along,
+    ShardMapOptions, ShardMapTracer, ShardMapValue, ShardMapValueKind, shard_map, shard_map_along,
     shard_map_with_inferred_input_shardings,
 };
 
