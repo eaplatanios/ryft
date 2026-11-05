@@ -656,7 +656,7 @@ mod tests {
         // The public `batch` entry runs under the static extent policy, which rejects a dynamic mapped axis before any
         // operation rule runs, so the joint rule is driven through the dynamic extent policy exactly as the ryft-core
         // reproduction does, with the mapped extent read from the staged input.
-        let staged = crate::jit::stage::<_, Vec<ArrayType>, Vec<ArrayType>>(
+        let staged = crate::stage::<_, Vec<ArrayType>, Vec<ArrayType>>(
             |inputs| {
                 let extent = inputs[0].dimension_size(0).unwrap();
                 let context = BatchingContext::<_, ArrayBatchingPolicy<DynamicArrayExtentBatchingPolicy>>::with_policy(
@@ -715,7 +715,7 @@ mod tests {
                 .specialize(&input_types[..2].iter().cloned().map(ArrayIrType::from).collect::<Vec<_>>())
                 .unwrap();
             assert_eq!(specialized.output_types(), vec![ArrayIrType::from(output_type.clone())], "n={size}");
-            let compiled = crate::jit::compile::<_, Vec<ArrayType>, Vec<ArrayType>>(
+            let compiled = crate::compile::<_, Vec<ArrayType>, Vec<ArrayType>>(
                 |inputs| {
                     let mut inputs = inputs.into_iter().map(|input| input.into_value()).collect::<Vec<_>>();
                     let cotangent = inputs.pop().unwrap();
@@ -747,7 +747,7 @@ mod tests {
                 .zip(bytes)
                 .map(|(r#type, bytes)| Array::from_host_buffer(&domain, r#type, mesh.clone(), bytes).unwrap())
                 .collect();
-            let outputs = domain.interpret(&compiled.executable_function(), inputs).unwrap();
+            let outputs = compiled.executable().execute(&domain, inputs).unwrap();
             assert_eq!(outputs.len(), 2);
             for output in &outputs {
                 assert_eq!(output.data_type(), DataType::F64);

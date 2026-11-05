@@ -1959,7 +1959,7 @@ mod tests {
             .with_sharding(Sharding::replicated(mesh.logical_mesh().clone(), 1))
             .unwrap();
         let staged =
-            crate::jit::stage::<_, ArrayType, ArrayType>(|input| input, input_type.clone(), Options::new(mesh.clone()))
+            crate::stage::<_, ArrayType, ArrayType>(|input| input, input_type.clone(), Options::new(mesh.clone()))
                 .unwrap()
                 .into_inner();
         let compiled: ryft_core::compilation::CompiledFunction<Domain<'_>, ArrayIrType, ArrayIrType> =
@@ -1967,7 +1967,7 @@ mod tests {
         assert_eq!(compiled.compiled_program().output_types(), std::slice::from_ref(&input_type));
 
         let donated_staged: CoreStagedFunction<Domain<'_>, ArrayIrType, ArrayIrType> =
-            crate::jit::stage::<_, ArrayType, ArrayType>(
+            crate::stage::<_, ArrayType, ArrayType>(
                 |input| input,
                 input_type.clone(),
                 Options { donation_flags: Some(vec![true]), ..Options::new(mesh.clone()) },
@@ -1985,7 +1985,7 @@ mod tests {
         // signature. Their retained logical metadata also keeps their compilation identities distinct.
         let boolean_type = input_type.clone().with_data_type(DataType::Boolean);
         let boolean_staged: CoreStagedFunction<Domain<'_>, ArrayIrType, ArrayIrType> =
-            crate::jit::stage::<_, ArrayType, ArrayType>(|input| input, boolean_type, Options::new(mesh.clone()))
+            crate::stage::<_, ArrayType, ArrayType>(|input| input, boolean_type, Options::new(mesh.clone()))
                 .unwrap()
                 .into_inner();
         let boolean_lowered = boolean_staged.lower(&domain).unwrap();
@@ -2018,7 +2018,7 @@ mod tests {
             .with_sharding(sharding)
             .unwrap();
         let options = Options { donation_flags: Some(vec![false, true]), ..Options::new(mesh.clone()) };
-        let staged = crate::jit::stage::<_, (ArrayType, ArrayType), (ArrayType, ArrayType)>(
+        let staged = crate::stage::<_, (ArrayType, ArrayType), (ArrayType, ArrayType)>(
             |(value, zero)| (zero, value),
             (value_type.clone(), zero_type.clone()),
             options,
@@ -2842,7 +2842,7 @@ mod tests {
         let input_type = ArrayType::new(DataType::F32, Shape::new(vec![CoreDimension::Static(8)]))
             .with_sharding(sharding)
             .unwrap();
-        let staged = crate::jit::stage::<_, ArrayType, ArrayType>(
+        let staged = crate::stage::<_, ArrayType, ArrayType>(
             |input| input.clone() + input,
             input_type.clone(),
             Options::new(mesh.clone()),
@@ -2913,7 +2913,7 @@ mod tests {
         // XLA chooses the placement of outputs with open (`Unconstrained`) dimensions and of outputs without declared
         // shardings, so their programs plan no trusted output layouts and validate the returned buffers instead.
         for input_type in [unconstrained_type, unsharded_type] {
-            let staged = crate::jit::stage::<_, ArrayType, ArrayType>(
+            let staged = crate::stage::<_, ArrayType, ArrayType>(
                 |input| input.clone() + input,
                 input_type,
                 Options::new(mesh.clone()),
@@ -3025,7 +3025,7 @@ mod tests {
         )
         .with_sharding(sharding.clone())
         .unwrap();
-        let staged = crate::jit::stage::<_, ArrayType, ArrayType>(
+        let staged = crate::stage::<_, ArrayType, ArrayType>(
             |input| input.clone() + input,
             declared_type,
             Options::new(mesh.clone()),
@@ -3079,13 +3079,10 @@ mod tests {
                     .unwrap(),
                 )
                 .unwrap();
-        let staged = crate::jit::stage::<_, ArrayType, ArrayType>(
-            |input| input.clone() + input,
-            sharded_type,
-            Options::new(mesh),
-        )
-        .unwrap()
-        .into_inner();
+        let staged =
+            crate::stage::<_, ArrayType, ArrayType>(|input| input.clone() + input, sharded_type, Options::new(mesh))
+                .unwrap()
+                .into_inner();
         let Err(error) = staged.lower(&domain) else {
             panic!("bounded-dynamic sharded program unexpectedly lowered");
         };
@@ -3677,7 +3674,7 @@ mod tests {
         let domain = Session::new(&client).domain().with_mesh(mesh.clone());
         let values = f32_vector(&domain, &mesh, &[1., -2., 3., -4.]);
         let limits = f32_vector(&domain, &mesh, &[0., 0., 0., 0.]);
-        let staged = crate::jit::stage::<_, Vec<ArrayType>, Vec<ArrayType>>(
+        let staged = crate::stage::<_, Vec<ArrayType>, Vec<ArrayType>>(
             |inputs| vec![inputs[0].greater_than(&inputs[1]).unwrap()],
             vec![values.r#type().into_owned(), limits.r#type().into_owned()],
             Options::new(mesh.clone()),
@@ -3714,7 +3711,7 @@ mod tests {
         for mode in [0, 1, 2] {
             let predicates = boolean_vector(&domain, &mesh, &[true, false, false, false]);
             let observations = f32_vector(&domain, &mesh, &[10., 20., 30., 40.]);
-            let staged = crate::jit::stage::<_, Vec<ArrayType>, Vec<ArrayType>>(
+            let staged = crate::stage::<_, Vec<ArrayType>, Vec<ArrayType>>(
                 |inputs| {
                     if mode == 1 {
                         batch(
@@ -3794,7 +3791,7 @@ mod tests {
         ] {
             let predicates = boolean_vector(&domain, &mesh, &[false; 4]);
             let observations = f32_vector(&domain, &mesh, &values);
-            let staged = crate::jit::stage::<_, Vec<ArrayType>, Vec<ArrayType>>(
+            let staged = crate::stage::<_, Vec<ArrayType>, Vec<ArrayType>>(
                 |inputs| {
                     let observation = inputs[1].convert_element_type(data_type).unwrap();
                     inputs[0]
@@ -3907,7 +3904,7 @@ mod tests {
 
         let predicates = boolean_vector(&domain, &mesh, &[true, false, false]);
         let observations = f32_vector(&domain, &mesh, &[10., 20., 30.]);
-        let staged = crate::jit::stage::<_, Vec<ArrayType>, Vec<ArrayType>>(
+        let staged = crate::stage::<_, Vec<ArrayType>, Vec<ArrayType>>(
             |inputs| {
                 batch(
                     |(predicate, observation)| predicate.assert("mapped check", &[("value", observation)]),

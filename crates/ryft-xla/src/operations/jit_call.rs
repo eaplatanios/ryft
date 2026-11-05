@@ -667,7 +667,7 @@ pub(crate) fn lower_shared_function_call<'b, 'c: 'b, 't: 'c>(
 /// Canonical operation name for [`JitCallOperation`].
 pub const JIT_CALL_OPERATION_NAME: &str = "jit_call";
 
-/// Staged call to a flat jitted XLA program. The callee program is not part of this payload: it is a shared callee root
+/// Staged call to a flat XLA program. The callee program is not part of this payload: it is a shared callee root
 /// [`Region`](ryft_core::Region) attached to the [`Instruction`](ryft_core::Instruction) applying the operation (the
 /// single `["callee"]` slot), interned by [`Arc`] identity when the call is staged through the
 /// [`AttachedRegions`](ryft_core::AttachedRegions) passed to [`Context::bind`], so repeated calls staged from one
@@ -698,7 +698,7 @@ pub struct JitCallOperation<T: Type> {
 }
 
 impl<T: Type> JitCallOperation<T> {
-    /// Creates a staged jitted-call operation. The flat callee program is supplied as a shared region attachment to
+    /// Creates a staged `jit_call` operation. The flat callee program is supplied as a shared region attachment to
     /// [`Context::bind`], and `capture_count` identifies its exact leading lifted-capture prefix.
     #[inline]
     pub(crate) fn new(capture_count: usize) -> Self {
@@ -1149,7 +1149,7 @@ impl<T: Type> CoreOperation for JitCallOperation<T> {
     }
 }
 
-// A jitted call forwards its operands onto its callee's inputs one for one and reports the callee's outputs as its
+// A `jit_call` operation forwards its operands onto its callee's inputs one for one and reports the callee's outputs as its
 // own, which is the positionally forwarding shape the shared structured rewrite serves with no leading operands. The
 // callee's lifted capture prefix is unaffected: threaded state is appended after every declared operand, so the prefix
 // keeps its positions. Instantiated result types belong to the source callee signature, which discharge changes by
@@ -1189,7 +1189,7 @@ where
     }
 }
 
-// Online partial-evaluation rule for a staged jitted call — ryft's analogue of JAX's call partial-evaluation
+// Online partial-evaluation rule for a staged `jit_call` operation — ryft's analogue of JAX's call partial-evaluation
 // rules: it splits the callee against the caller's known-ness while preserving the `jit_call` boundary on both
 // sides.
 //
@@ -1466,7 +1466,7 @@ where
 // The callee program is materialized from the instruction's callee region in the context's constant universe `V`
 // (concretely [`Constant`] for staged XLA programs), so the split halves ride the fresh primal and tangent calls
 // as shared callee regions. Preserving both `jit_call` boundaries keeps the callee body out of the caller's program,
-// so forward mode over a jitted call stays compiled rather than inlined.
+// so forward mode over a `jit_call` operation stays compiled rather than inlined.
 //
 // # Parameters
 //
@@ -1667,7 +1667,7 @@ pub fn transpose_primal_jit_call<
     outputs: &[MaybeZero<CoreTracer<TracingContext<V, Operation<V>>>>],
     cotangents: &CotangentDestinations<CoreTracer<TracingContext<V, Operation<V>>>>,
 ) -> Result<Vec<MaybeZero<CoreTracer<TracingContext<V, Operation<V>>>>>, ProgramError> {
-    // A jitted call with no live output cotangents and no live reference operand is a zero linear map, so every
+    // A `jit_call` operation with no live output cotangents and no live reference operand is a zero linear map, so every
     // operand cotangent is zero. A live reference operand keeps the call live, because its accumulated state cotangent
     // flows through the transposed callee even when no ordinary output cotangent does. A callee with deferred work or
     // observable rule effects also keeps it live.
@@ -1797,11 +1797,11 @@ where
     }
 }
 
-// Eager interpretation of a staged jitted call over concrete [`Array`]s. Top-level flat programs containing
+// Eager interpretation of a staged `jit_call` operation over concrete [`Array`]s. Top-level flat programs containing
 // `jit_call` instructions (for example the pullbacks produced by eager `vjp`/`grad`) replay through
 // [`Program::interpret_in_context`](ryft_core::Program::interpret_in_context), whose bind channel hands the callee
 // region to [`Context::bind`] so the call is compiled whole through this domain's dispatch cache and executed on its
-// PJRT client — mirroring JAX dispatching a jitted function called from eager code straight to the compiled
+// PJRT client — mirroring JAX dispatching a JIT-compiled function called from eager code straight to the compiled
 // executable. This rule covers the remaining path — a `jit_call` nested inside another region being interpreted —
 // by re-entering the active interpreter on the callee region, which dispatches the callee's operations one by one
 // through this same domain.
@@ -2487,7 +2487,7 @@ mod tests {
 
     #[test]
     fn test_jit_call_reference_provenance_is_positional() {
-        // A jitted call forwards its operands to the callee positionally, so region provenance, capture counts, and
+        // A `jit_call` operation forwards its operands to the callee positionally, so region provenance, capture counts, and
         // output provenance are all index-preserving for the single callee region and absent for any other region.
         let operation = JitCallOperation::<ArrayIrType>::new(2);
         assert_eq!(operation.input_region_provenance(0, 3), InputRegionProvenance::Input { index: 3 });
@@ -3950,7 +3950,7 @@ mod tests {
 
     #[test]
     fn test_jit_call_transposition_keeps_dead_seeds_structural_across_rematerializations() {
-        // A rematerialization inside a jitted callee and a jitted call inside a rematerialization both map `x` to
+        // A rematerialization inside a `jit_call` operationee and a `jit_call` operation inside a rematerialization both map `x` to
         // `(x, x + x)`, and only `x + x` is live. In both nestings the dead output's seed stays a structural zero across
         // both boundaries: the outer transposed region consumes the live seed alone, the inner one receives it alone,
         // and `x̄ = ȳ₁ + ȳ₁`.
@@ -5242,9 +5242,10 @@ mod tests {
         let array = |r#type: &ArrayType, bytes: Vec<u8>| {
             Array::from_host_buffer(&domain, r#type.clone(), mesh.clone(), bytes).unwrap()
         };
-        let (previous, extent, state) = domain
-            .interpret(
-                &compiled.executable_function(),
+        let (previous, extent, state) = compiled
+            .executable()
+            .execute(
+                &domain,
                 (
                     array(&value_type, values_to_bytes(&[3f32])),
                     array(&value_type, values_to_bytes(&[4f32])),

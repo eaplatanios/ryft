@@ -822,7 +822,7 @@ mod tests {
             ArrayType::new(DataType::F32, Shape::new(vec![CoreDimension::Dynamic(rows), CoreDimension::Static(5)]))
                 .with_sharding(sharding.clone())
                 .unwrap();
-        let staged = crate::jit::stage::<_, ArrayType, ArrayType>(
+        let staged = crate::stage::<_, ArrayType, ArrayType>(
             |input| associative_scan(&input, 1, false, &|left, right| left.max(right)).unwrap(),
             dynamic_type,
             Options::new(mesh.clone()),

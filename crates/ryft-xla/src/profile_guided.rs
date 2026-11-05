@@ -490,11 +490,11 @@ where
             }
             AdaptiveDispatch::Baseline => {
                 self.inner.statistics.baseline_executions.fetch_add(1, Ordering::Relaxed);
-                self.inner.domain.interpret(&executable, inputs)
+                executable.execute(&self.inner.domain, inputs)
             }
             AdaptiveDispatch::Optimized => {
                 self.inner.statistics.optimized_executions.fetch_add(1, Ordering::Relaxed);
-                self.inner.domain.interpret(&executable, inputs)
+                executable.execute(&self.inner.domain, inputs)
             }
         }
     }
@@ -523,17 +523,17 @@ where
         let profiler = match self.inner.domain.client().profiler(&profiler_options) {
             Ok(profiler) => profiler,
             Err(error) => {
-                let outputs = self.inner.domain.interpret(&executable, inputs)?;
+                let outputs = executable.execute(&self.inner.domain, inputs)?;
                 self.record_profile_failure(error.to_string());
                 return Ok(outputs);
             }
         };
         if let Err(error) = profiler.start() {
-            let outputs = self.inner.domain.interpret(&executable, inputs)?;
+            let outputs = executable.execute(&self.inner.domain, inputs)?;
             self.record_profile_failure(error.to_string());
             return Ok(outputs);
         }
-        let execution = match self.inner.domain.interpret_async(&executable, inputs) {
+        let execution = match executable.execute_async(&self.inner.domain, inputs) {
             Ok(execution) => execution,
             Err(error) => {
                 let reason = match profiler.stop() {

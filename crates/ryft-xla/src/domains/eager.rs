@@ -527,7 +527,7 @@ impl<'c> Domain<'c> {
     }
 
     /// Validates that every input lives on this domain's PJRT client and that all inputs share one device placement,
-    /// mirroring JAX's "received incompatible devices for jitted computation" error for the eager path. Every
+    /// mirroring JAX's incompatible-device diagnostic for compiled computations on the eager path. Every
     /// [`Array`] belongs to a client-backed domain whose client owns its addressable shard buffers (validated at
     /// construction), so client identity is exact and also rejects same-device-id arrays owned by a *different* client.
     fn validate_eager_placement(&self, inputs: &[Array<'c>]) -> Result<(), ProgramError> {
@@ -1990,14 +1990,14 @@ mod tests {
     }
 
     /// Measures eager dispatch overhead for `.tasks/plan_eager_dispatch_front_cache.md`. Compares repeated eager `add`
-    /// calls against a warm jitted function over the same input, and then times each step of the eager dispatch path
+    /// calls against a warm JIT dispatcher over the same input, and then times each step of the eager dispatch path
     /// (tracing, lowering, compilation-key construction, compile-cache lookup, and execution) in isolation.
     #[test]
     #[ignore = "phase 0 baseline measurement"]
     fn test_baseline_eager_dispatch_overhead() {
         use std::time::Instant;
 
-        use crate::jit::{CompileTracer, JittedFunction, jitted};
+        use crate::{CompileTracer, CompiledFunctionDispatcher, jit};
 
         const REPETITIONS: usize = 10_000;
         let measure = |label: &str, function: &mut dyn FnMut()| {
@@ -2023,10 +2023,10 @@ mod tests {
         measure("eager add (end to end)", &mut || {
             ryft_core::Add::add(&input, &input).unwrap();
         });
-        let function: JittedFunction<'_, _, (), ArrayType, ArrayType> =
-            jitted(|_, value: CompileTracer<'_>| Ok(ryft_core::Add::add(&value, &value)?), &domain, mesh.clone());
-        measure("jitted add (warm dispatch)", &mut || {
-            function.call((), input.clone()).unwrap();
+        let function: CompiledFunctionDispatcher<'_, _, (), ArrayType, ArrayType> =
+            jit(|_, value: CompileTracer<'_>| Ok(ryft_core::Add::add(&value, &value)?), &domain, mesh.clone());
+        measure("JIT add (warm dispatch)", &mut || {
+            function.execute((), input.clone()).unwrap();
         });
         let vector_type = ArrayIrType::Array(input.r#type().into_owned());
         let branch = |operation: Operation| {
@@ -2609,8 +2609,8 @@ mod tests {
         let domain = Session::new(&client).domain();
         let vector_type = replicated_vector_type(&mesh, 4);
 
-        // A staged jitted callee `x -> x * x` bound eagerly on concrete arrays dispatches straight through the
-        // compiled per-operation path, mirroring JAX calling a jitted function from eager code.
+        // A staged `jit_call` operationee `x -> x * x` bound eagerly on concrete arrays dispatches straight through the
+        // compiled per-operation path, mirroring JAX calling a JIT-compiled function from eager code.
         let callee = {
             let mut builder = ProgramBuilder::new();
             let input = builder.add_input(vector_type.clone().into());

@@ -11,7 +11,7 @@ use ryft_core::{
     Sin, StagedFunction as CoreStagedFunction, ValueProjection,
 };
 use ryft_pjrt::{Client, ClientOptions, CpuClientOptions, load_cpu_plugin};
-use ryft_xla::{Array, CompileTracer, Domain, FromPjrt, JittedFunction, Options, Session, Value, jitted};
+use ryft_xla::{Array, CompileTracer, CompiledFunctionDispatcher, Domain, FromPjrt, Options, Session, Value, jit};
 use serde_json::{Value as JsonValue, json};
 
 type BenchmarkStagedFunction<'c> = CoreStagedFunction<Domain<'c>, ArrayIrType, ArrayIrType>;
@@ -272,18 +272,15 @@ fn main() -> Result<(), Box<dyn std::error::Error>> {
         synchronized_samples.push(duration_nanoseconds(start));
     }
 
-    let dispatcher: JittedFunction<'_, _, (), ArrayType, ArrayType> = jitted(
-        |(), input: CompileTracer<'_>| Ok((input.clone() * input.clone() + input).sin()?),
-        &domain,
-        mesh.clone(),
-    );
-    dispatcher.call((), input.clone())?.block_until_ready()?;
+    let dispatcher: CompiledFunctionDispatcher<'_, _, (), ArrayType, ArrayType> =
+        jit(|(), input: CompileTracer<'_>| Ok((input.clone() * input.clone() + input).sin()?), &domain, mesh.clone());
+    dispatcher.execute((), input.clone())?.block_until_ready()?;
     let cold_dispatch_statistics = dispatcher.statistics();
     let mut warm_dispatch_samples = Vec::with_capacity(arguments.iterations);
     let mut warm_outputs = Vec::with_capacity(arguments.iterations);
     for _ in 0..arguments.iterations {
         let start = Instant::now();
-        warm_outputs.push(dispatcher.call((), input.clone())?);
+        warm_outputs.push(dispatcher.execute((), input.clone())?);
         warm_dispatch_samples.push(duration_nanoseconds(start));
     }
     for output in warm_outputs {

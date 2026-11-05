@@ -655,7 +655,7 @@ mod tests {
             Array::from_host_buffer(&domain, input_type.clone(), mesh.clone(), values_to_bytes(&[1_i64, 2, 3, 4]))
                 .unwrap();
         let second = Array::from_host_buffer(&domain, input_type, mesh, values_to_bytes(&[5_i64, 6, 7, 8])).unwrap();
-        let output = domain.interpret(&compiled.executable_function(), (first, second)).unwrap();
+        let output = compiled.executable().execute(&domain, (first, second)).unwrap();
         assert_eq!(output.r#type().sharding(), Some(&sharding));
         for (index, device) in devices.iter().enumerate() {
             let bytes = output

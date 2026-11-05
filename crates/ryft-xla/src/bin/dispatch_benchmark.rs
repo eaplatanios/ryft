@@ -1,4 +1,4 @@
-//! Per-call dispatch latency benchmark for small eager and jitted operations, for comparison with JAX.
+//! Per-call dispatch latency benchmark for small eager operations and retained JIT dispatch, for comparison with JAX.
 //!
 //! Every case applies one tiny operation (an `f32[8]` add, a `condition` over such adds, a first-class dimension add,
 //! or an `f32[8]` reference read) on a single CPU device, so the measured time is dispatch overhead rather than
@@ -20,7 +20,7 @@ use ryft_core::{
 use ryft_pjrt::protos::{CompilationOptions, ExecutableCompilationOptions, Precision};
 use ryft_pjrt::{ClientOptions, CpuClientOptions, ExecutionDeviceInputs, ExecutionInput, Program, load_cpu_plugin};
 use ryft_xla::experimental::ops::{Constant, Operation, ProgramBuilder};
-use ryft_xla::{Array, CompileTracer, Dimension, FromPjrt, JittedFunction, Session, Value, jitted};
+use ryft_xla::{Array, CompileTracer, CompiledFunctionDispatcher, Dimension, FromPjrt, Session, Value, jit};
 use serde_json::json;
 
 /// Command-line arguments of this benchmark.
@@ -187,11 +187,11 @@ fn main() -> Result<(), Box<dyn std::error::Error>> {
         );
     }
 
-    // Warm jitted call of `x + x`.
-    let function: JittedFunction<'_, _, (), ArrayType, ArrayType> =
-        jitted(|_, value: CompileTracer<'_>| Ok(Add::add(&value, &value)?), &domain, mesh.clone());
+    // Warm JIT dispatch of `x + x`.
+    let function: CompiledFunctionDispatcher<'_, _, (), ArrayType, ArrayType> =
+        jit(|_, value: CompileTracer<'_>| Ok(Add::add(&value, &value)?), &domain, mesh.clone());
     if arguments.selects("jit_add") {
-        results.insert("jit_add", measure(&arguments, || drop(function.call((), input.clone()).unwrap())));
+        results.insert("jit_add", measure(&arguments, || drop(function.execute((), input.clone()).unwrap())));
     }
 
     // Raw PJRT execution floor: a precompiled add executed directly through `ryft-pjrt`.

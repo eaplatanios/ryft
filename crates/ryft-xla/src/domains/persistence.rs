@@ -1336,7 +1336,7 @@ pub(super) mod tests {
             DiskCache::open(directory.path()).unwrap().with_write_thresholds(Duration::ZERO, 0),
         )
         .domain();
-        let staged = crate::jit::stage::<_, ArrayType, ArrayType>(
+        let staged = crate::stage::<_, ArrayType, ArrayType>(
             |x| x.sin().unwrap(),
             input_type.clone(),
             Options::new(mesh.clone()),
@@ -1354,7 +1354,7 @@ pub(super) mod tests {
             DiskCache::open(directory.path()).unwrap().with_write_thresholds(Duration::ZERO, 0),
         )
         .domain();
-        let staged = crate::jit::stage::<_, ArrayType, ArrayType>(|x| x.sin().unwrap(), input_type, Options::new(mesh))
+        let staged = crate::stage::<_, ArrayType, ArrayType>(|x| x.sin().unwrap(), input_type, Options::new(mesh))
             .unwrap()
             .into_inner();
         let _restored: ryft_core::compilation::CompiledFunction<Domain<'_>, ArrayIrType, ArrayIrType> =
@@ -1414,7 +1414,7 @@ pub(super) mod tests {
         // The foreign executable keeps the requesting lowering's boundary types so that it loads and passes every
         // core-level output-type check, and differs only in the donation contract the runtime call path trusts.
         let producer = Session::new(&client).domain();
-        let staged = crate::jit::stage::<_, ArrayType, ArrayType>(
+        let staged = crate::stage::<_, ArrayType, ArrayType>(
             |x| x.sin().unwrap(),
             input_type.clone(),
             Options::new(mesh.clone()).with_donate(true),
@@ -1434,7 +1434,7 @@ pub(super) mod tests {
             )
             .domain()
         };
-        let staged = crate::jit::stage::<_, ArrayType, ArrayType>(|x| x.sin().unwrap(), input_type, Options::new(mesh))
+        let staged = crate::stage::<_, ArrayType, ArrayType>(|x| x.sin().unwrap(), input_type, Options::new(mesh))
             .unwrap()
             .into_inner();
 

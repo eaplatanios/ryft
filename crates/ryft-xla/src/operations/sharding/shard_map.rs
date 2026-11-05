@@ -390,8 +390,8 @@ mod tests {
     use ryft_core::{
         AxisIndexOperation, BatchAxis, Context, ConvertElementTypeOperation, CustomCallOperation, DataType, Device,
         DeviceMesh, Dimension as CoreDimension, DomainTracingContext, Dot, DotDimensionNumbers, EffectClass,
-        LogicalMesh, MeshAxis, MeshAxisType, Placeholder, Shape, ShardMapOptions, Typed, ValueProjection, batch,
-        shard_map, shard_map_along, shard_map_with_inferred_input_shardings,
+        LogicalMesh, MeshAxis, MeshAxisType, Placeholder, Shape, ShardMapOptions, ShardMapTracer, Typed,
+        ValueProjection, batch, shard_map, shard_map_along, shard_map_with_inferred_input_shardings,
     };
     use ryft_mlir::Block;
     use ryft_pjrt::{BufferType, ClientOptions, CpuClientOptions, Program as PjrtProgram, load_cpu_plugin};
@@ -408,6 +408,17 @@ mod tests {
     use crate::{Array, Domain, FromPjrt, Options, Session, ToMlir, Value};
 
     use super::*;
+
+    /// Returns the elements of the buffer that every addressable device holds for `array`, in device order.
+    fn read_device_f32s(array: &Array<'_>) -> Vec<Vec<f32>> {
+        array
+            .addressable_shards()
+            .map(|shard| {
+                let bytes = shard.buffer().unwrap().copy_to_host(None).unwrap().r#await().unwrap();
+                values_from_bytes::<f32>(bytes.as_slice())
+            })
+            .collect()
+    }
 
     /// Four-device mesh with the manual axes `x` and `y`.
     fn test_logical_mesh_2x2() -> LogicalMesh {
@@ -1594,45 +1605,10 @@ mod tests {
 
     #[test]
     fn test_eager_shard_map_without_manual_variation_passes_unreduced_summands_between_maps_on_cpu() {
-        /// Binds an unchecked map from `input_sharding` to `output_sharding` on `input` eagerly in `domain`, whose body
-        /// squares its local input when `square` is `true` and returns it unchanged otherwise.
-        fn bind_map<'c>(
-            domain: &Domain<'c>,
-            input: Array<'c>,
-            input_sharding: Sharding,
-            output_sharding: &Sharding,
-            square: bool,
-        ) -> Array<'c> {
-            let boundary = ShardMapBoundary::new(
-                input_sharding.mesh().clone(),
-                vec![input_sharding],
-                vec![output_sharding.clone()],
-                Vec::new(),
-            )
-            .unwrap()
-            .with_check_manual_variation(false);
-            let global_type = input.r#type().into_owned();
-            let local_type = boundary.local_input_type(0, &global_type).unwrap();
-            let (_, body) = DomainTracingContext::<Domain<'static>>::trace(
-                |inputs: Vec<Tracer<'static>>| {
-                    let x = ValueProjection::<ArrayType>::into_projected(inputs[0].clone())?;
-                    Ok(vec![if square { x.clone() * x } else { x }.into_value()])
-                },
-                vec![ArrayIrType::Array(local_type)],
-            )
-            .unwrap();
-            let operation = ShardMapOperation::from_program(&body, vec![global_type.into()], boundary).unwrap();
-            let mut outputs = domain.bind(operation, vec![body], &[Value::Array(input)]).unwrap();
-            let Value::Array(output) = outputs.remove(0) else {
-                panic!("the eager map returned a dimension");
-            };
-            output
-        }
-
-        // The pipeline of the previous test, with each map bound eagerly by the domain on concrete arrays: the first
-        // map returns each device's shard of `x = [1, 2]` as its summand of an unreduced output, and the second map
-        // squares each summand of that unreduced input. The devices return `[1]` and `[4]`, whose sum (`5`) host
-        // materialization recovers.
+        // The pipeline of the previous test, with each map applied eagerly to concrete arrays through the frontend:
+        // the first map returns each device's shard of `x = [1, 2]` as its summand of an unreduced output, and the
+        // second map squares each summand of that unreduced input. The devices return `[1]` and `[4]`, whose sum (`5`)
+        // host materialization recovers.
         let plugin = load_cpu_plugin().unwrap();
         let client = plugin
             .client(ClientOptions::CPU(CpuClientOptions { device_count: Some(2), ..Default::default() }))
@@ -1647,21 +1623,90 @@ mod tests {
         .unwrap();
         let sharded = Sharding::new(logical_mesh.clone(), vec![ShardingDimension::sharded(["x"])]).unwrap();
         let unreduced = Sharding::replicated(logical_mesh.clone(), 1).with_unreduced_axes(["x"]).unwrap();
+        let options = ShardMapOptions::new().with_check_manual_variation(false);
         let input_type = ArrayType::new_static(DataType::F32, [2]).with_sharding(sharded.clone()).unwrap();
         let input = Array::from_host_buffer(&domain, input_type, mesh, values_to_bytes(&[1f32, 2.])).unwrap();
-        let summands = bind_map(&domain, input, sharded, &unreduced, false);
-        let squares = bind_map(&domain, summands, unreduced.clone(), &unreduced, true);
+        let summands =
+            shard_map(|x| Ok(x), input, logical_mesh.clone(), sharded, unreduced.clone(), options.clone()).unwrap();
+        let squares = shard_map(
+            |summand: ShardMapTracer<Domain<'_>>| Ok(summand.clone() * summand),
+            summands,
+            logical_mesh,
+            unreduced.clone(),
+            unreduced.clone(),
+            options,
+        )
+        .unwrap();
         assert_eq!(squares.r#type().sharding(), Some(&unreduced));
-        let device_values = squares
-            .addressable_shards()
-            .map(|shard| {
-                let bytes = shard.buffer().unwrap().copy_to_host(None).unwrap().r#await().unwrap();
-                values_from_bytes::<f32>(bytes.as_slice())
-            })
-            .collect::<Vec<_>>();
-        assert_eq!(device_values, vec![vec![1.0], vec![4.0]]);
+        assert_eq!(read_device_f32s(&squares), vec![vec![1.0], vec![4.0]]);
         let materialized = crate::arrays_v0::host::materialize_dense_array_bytes(&squares).unwrap();
         assert_eq!(values_from_bytes::<f32>(materialized.as_slice()), vec![5.0]);
+    }
+
+    #[test]
+    fn test_eager_shard_map_functions_on_cpu() {
+        // The frontend functions apply to concrete arrays of the XLA backend, which executes each map eagerly. A sharded
+        // input meets a replicated one, the input shardings can be inferred from the input types, and a map along `x`
+        // places the dimension that its axes select. Repeating a map at the same signature hits the dispatch cache.
+        let plugin = load_cpu_plugin().unwrap();
+        let client = plugin
+            .client(ClientOptions::CPU(CpuClientOptions { device_count: Some(2), ..Default::default() }))
+            .unwrap();
+        let domain = Session::new(&client).domain();
+        let logical_mesh = test_manual_mesh("x", 2);
+        let devices = client.addressable_devices().unwrap();
+        let mesh = DeviceMesh::new(
+            logical_mesh.clone(),
+            devices.iter().map(|device| Device::from_pjrt(device).unwrap()).collect(),
+        )
+        .unwrap();
+        let sharded = Sharding::new(logical_mesh.clone(), vec![ShardingDimension::sharded(["x"])]).unwrap();
+        let replicated = Sharding::replicated(logical_mesh.clone(), 1);
+        let upload = |sharding: &Sharding, values: &[f32]| {
+            let r#type = ArrayType::new_static(DataType::F32, [values.len()]).with_sharding(sharding.clone()).unwrap();
+            Array::from_host_buffer(&domain, r#type, mesh.clone(), values_to_bytes(values)).unwrap()
+        };
+        let lhs = upload(&sharded, &[1.0, 2.0, 3.0, 4.0]);
+        let rhs = upload(&replicated, &[10.0, 20.0]);
+        let add = |lhs, rhs| {
+            shard_map(
+                |(lhs, rhs): (ShardMapTracer<Domain<'_>>, ShardMapTracer<Domain<'_>>)| Ok(lhs + rhs),
+                (lhs, rhs),
+                logical_mesh.clone(),
+                (sharded.clone(), replicated.clone()),
+                sharded.clone(),
+                ShardMapOptions::new(),
+            )
+            .unwrap()
+        };
+        let sum = add(lhs.clone(), rhs.clone());
+        assert_eq!(sum.r#type().sharding(), Some(&sharded));
+        assert_eq!(read_device_f32s(&sum), vec![vec![11.0, 22.0], vec![13.0, 24.0]]);
+        let program_count = domain.program_count();
+        assert_eq!(read_device_f32s(&add(lhs.clone(), rhs.clone())), vec![vec![11.0, 22.0], vec![13.0, 24.0]]);
+        assert_eq!(domain.program_count(), program_count);
+
+        let inferred = shard_map_with_inferred_input_shardings(
+            |(lhs, rhs): (ShardMapTracer<Domain<'_>>, ShardMapTracer<Domain<'_>>)| Ok(lhs * rhs),
+            (lhs.clone(), rhs),
+            logical_mesh.clone(),
+            sharded.clone(),
+            ShardMapOptions::new(),
+        )
+        .unwrap();
+        assert_eq!(read_device_f32s(&inferred), vec![vec![10.0, 40.0], vec![30.0, 80.0]]);
+
+        let doubled = shard_map_along(
+            |x: ShardMapTracer<Domain<'_>>| Ok(x.clone() + x),
+            lhs,
+            logical_mesh,
+            "x",
+            Some(0),
+            Some(0),
+        )
+        .unwrap();
+        assert_eq!(doubled.r#type().sharding(), Some(&sharded));
+        assert_eq!(read_device_f32s(&doubled), vec![vec![2.0, 4.0], vec![6.0, 8.0]]);
     }
 
     #[test]
@@ -1690,7 +1735,7 @@ mod tests {
                     .unwrap(),
             )
             .unwrap();
-        let staged = crate::jit::stage::<_, ArrayType, ArrayType>(
+        let staged = crate::stage::<_, ArrayType, ArrayType>(
             |input| {
                 let output = batch(
                     |item| {

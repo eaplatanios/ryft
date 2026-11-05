@@ -1365,7 +1365,7 @@ fn test_plain_scalar_bilinear_sin_vjp_pullback_standalone_stablehlo() {
 }
 
 #[test]
-fn test_plain_scalar_bilinear_sin_grad_jitted_stablehlo() {
+fn test_plain_scalar_bilinear_sin_grad_jit_stablehlo() {
     // grad(f) wrapped in JIT â€” symbolic, like JAX's jit(grad(f)).
     // Uses the traced value-and-gradient path that traces through vjp+pullback.
     let (_, compiled): (

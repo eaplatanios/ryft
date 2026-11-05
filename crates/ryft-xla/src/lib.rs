@@ -1,11 +1,11 @@
 pub mod arrays;
 pub mod arrays_v0;
+pub mod compilation;
 pub mod distributed;
 pub mod domains;
 pub mod eager;
 pub mod errors;
 pub mod experimental;
-pub mod jit;
 pub mod kernels;
 pub mod mlir;
 pub mod operations;
@@ -17,6 +17,12 @@ pub mod types;
 pub mod values;
 
 pub use arrays::{Array, ArrayError, ArrayShard, ShardDescriptor, ShardIndex, ShardLayout, block_until_ready, ready};
+pub use compilation::{
+    CompileTracer, CompiledFunction, CompiledFunctionDispatcher, ExecutableFunction, StagedFunction,
+    StatefulCompileTracer, StatefulCompiledFunction, StatefulCompiledFunctionDispatcher, StatefulValue, compile,
+    compile_statefully, compile_statefully_with_captures, compile_with_captures, compile_with_options,
+    infer_output_types, jit, jit_statefully, jit_statefully_with_options, jit_with_options, stage, stage_with_captures,
+};
 pub use distributed::DistributedRuntime;
 pub use domains::{
     AnalysisValue, CompilationAnalysis, CompilationError, Domain, ExecutionError, FeedbackDirectedProfile,
@@ -26,12 +32,6 @@ pub use errors::Error;
 pub use experimental::lowering::{
     LowerableOperation, LowerableOperationFamily, Lowerer, LoweringError, MemberLowerableOperation,
     to_mlir_module_for_program,
-};
-pub use jit::{
-    CompileTracer, CompiledFunction, ExecutableFunction, JittedFunction, StagedFunction, StatefulCompileTracer,
-    StatefulCompiledFunction, StatefulJittedFunction, StatefulValue, compile, compile_statefully,
-    compile_statefully_with_captures, compile_with_captures, compile_with_options, infer_output_types, jitted,
-    jitted_statefully, jitted_statefully_with_options, jitted_with_options, stage, stage_with_captures,
 };
 pub use mlir::ToMlir;
 pub use operations::dot::RaggedDotLoweringStrategy;

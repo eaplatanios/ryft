@@ -573,7 +573,7 @@ where
         >,
     ),
 
-    /// Call to a flat jitted XLA sub-program.
+    /// Call to a flat staged XLA program.
     JitCall(JitCallOperation<ArrayIrType>),
 
     /// Core `shard_map` operation (refer to [`ShardMapOperation`]), which lowering emits as a Shardy
@@ -1554,7 +1554,7 @@ pub(crate) mod tests {
     fn test_rematerialize_recomputes_known_jit_calls_in_its_body() {
         use ryft_core::{NothingSavable, rematerialize};
 
-        // A rematerialized body squares its input inside a jitted call and squares the result of the call outside of
+        // A rematerialized body squares its input inside a `jit_call` operation and squares the result of the call outside of
         // it. Linearizing it with the default policy, which saves nothing, saves only the input. Its pure all-known
         // call is inlined into the policy walk; the differentiated call recomputes that multiplication.
         let scalar_type = ArrayIrType::from(ArrayType::scalar(DataType::F64));

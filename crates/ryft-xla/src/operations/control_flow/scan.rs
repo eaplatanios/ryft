@@ -4086,7 +4086,7 @@ mod tests {
         );
         let carry = Array::from_host_buffer(&domain, scalar_type, mesh.clone(), values_to_bytes(&[0f64])).unwrap();
         let inputs = Array::from_host_buffer(&domain, inputs_type, mesh, values_to_bytes(&[1f64, 2.0, 3.0])).unwrap();
-        let (sum, prefixes) = domain.interpret(&compiled.executable_function(), (carry, inputs)).unwrap();
+        let (sum, prefixes) = compiled.executable().execute(&domain, (carry, inputs)).unwrap();
         let outputs = [sum, prefixes]
             .into_iter()
             .map(|output| {

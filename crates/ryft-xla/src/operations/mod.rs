@@ -55,7 +55,7 @@ pub mod dot;
 pub(crate) mod exponential;
 /// StableHLO lowering of extrema operations (`min`, `max`, and `clamp`).
 pub(crate) mod extrema;
-/// Backend-owned `jit_call` operation: lowering of staged calls to jitted XLA programs, including call-site
+/// Backend-owned `jit_call` operation: lowering of staged calls to staged XLA programs, including call-site
 /// deduplication.
 pub mod jit_call;
 /// StableHLO lowering of logical operations.

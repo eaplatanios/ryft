@@ -735,7 +735,7 @@ fn apply_input_shardings(input_types: Vec<ArrayIrType>, options: &Options) -> Re
 ///
 /// Call this before [`ryft_core::StagedFunction::stage`] when using the generic core staging API with XLA sharding
 /// overrides. Tracing must see the effective input shardings, and lowering rejects staged input types that disagree
-/// with the overrides. The staging entry points in [`crate::jit`] already apply this normalization.
+/// with the overrides. The staging entry points in [`crate::compilation`] already apply this normalization.
 ///
 /// # Errors
 ///
@@ -2315,7 +2315,7 @@ mod tests {
             .with_sharding(Sharding::replicated(mesh.logical_mesh().clone(), 1))
             .unwrap();
         let options = Options::new(mesh.clone());
-        let staged = crate::jit::stage::<_, ArrayType, ArrayType>(|x| x.sin().unwrap(), input_type.clone(), options)
+        let staged = crate::stage::<_, ArrayType, ArrayType>(|x| x.sin().unwrap(), input_type.clone(), options)
             .unwrap()
             .into_inner();
         let compiled: ryft_core::compilation::CompiledFunction<Domain<'_>, ArrayIrType, ArrayIrType> =
@@ -2354,7 +2354,7 @@ mod tests {
         // Equivalent lowerings share the entry populated by the first compilation, independent of source location.
         let program_count_before = engine.program_count();
         for _ in 0..3 {
-            let staged = crate::jit::stage::<_, ArrayType, ArrayType>(
+            let staged = crate::stage::<_, ArrayType, ArrayType>(
                 |x| x.sin().unwrap(),
                 input_type.clone(),
                 Options::new(mesh.clone()),
@@ -2385,7 +2385,7 @@ mod tests {
         let input =
             Array::from_host_buffer(&domain, actual_type.clone(), mesh.clone(), values_to_bytes(&values)).unwrap();
         let target = input.r#type().into_owned().with_layout(layout.clone());
-        let consumer = crate::jit::compile::<_, ArrayType, ArrayType>(
+        let consumer = crate::compile::<_, ArrayType, ArrayType>(
             |input| input.clone() + input,
             input.r#type().into_owned(),
             &domain,
@@ -2430,9 +2430,9 @@ mod tests {
                 ],
             )
             .unwrap();
-            let doubled = domain.interpret(&consumer.executable_function(), opaque).unwrap();
+            let doubled = consumer.executable().execute(&domain, opaque).unwrap();
             assert_eq!(read_f64s(&client, &doubled), vec![2., 4., 6., 8., 10., 12.]);
-            let doubled = domain.interpret(&consumer.executable_function(), output).unwrap();
+            let doubled = consumer.executable().execute(&domain, output).unwrap();
             assert_eq!(read_f64s(&client, &doubled), vec![2., 4., 6., 8., 10., 12.]);
         }
 
@@ -3013,7 +3013,7 @@ mod tests {
         let input_type = ArrayType::new(DataType::F32, Shape::new(vec![CoreDimension::Static(4)]))
             .with_sharding(Sharding::replicated(mesh.logical_mesh().clone(), 1))
             .unwrap();
-        let staged = crate::jit::stage::<_, ArrayType, ArrayType>(|x| x.sin().unwrap(), input_type, Options::new(mesh))
+        let staged = crate::stage::<_, ArrayType, ArrayType>(|x| x.sin().unwrap(), input_type, Options::new(mesh))
             .unwrap()
             .into_inner();
         let compiled: ryft_core::compilation::CompiledFunction<Domain<'_>, ArrayIrType, ArrayIrType> =
@@ -5073,7 +5073,7 @@ mod tests {
         let dynamic_type = ArrayType::new(DataType::F32, Shape::new(vec![extent.into()]))
             .with_sharding(Sharding::replicated(mesh.logical_mesh().clone(), 1))
             .unwrap();
-        let staged = crate::jit::stage::<_, ArrayType, ArrayType>(
+        let staged = crate::stage::<_, ArrayType, ArrayType>(
             |input| input.clone() + input,
             dynamic_type,
             Options::new(mesh.clone()),

@@ -55,7 +55,7 @@ mod tests {
             ArrayType::new_static(DataType::I64, [3]),
             ArrayType::new_static(DataType::F64, [2, 3]),
         ];
-        let compiled = crate::jit::compile::<_, Vec<ArrayType>, Vec<ArrayType>>(
+        let compiled = crate::compile::<_, Vec<ArrayType>, Vec<ArrayType>>(
             |inputs| {
                 let selection = index![&inputs[1], &inputs[2]];
                 vec![
@@ -81,7 +81,7 @@ mod tests {
             .zip(bytes)
             .map(|(r#type, bytes)| Array::from_host_buffer(&domain, r#type, mesh.clone(), bytes).unwrap())
             .collect::<Vec<_>>();
-        let outputs = domain.interpret(&compiled.executable_function(), inputs).unwrap();
+        let outputs = compiled.executable().execute(&domain, inputs).unwrap();
         assert_eq!(outputs[0].shape().as_slice(), &[3, 2]);
         assert_eq!(read_f64s(&client, &outputs[0]), vec![9., 11., 5., 7., 1., 3.]);
         assert_eq!(outputs[1].shape().as_slice(), &[2, 3]);
@@ -98,7 +98,7 @@ mod tests {
         let mesh = domain_mesh(&client, "x", 1);
         let domain = Session::new(&client).domain().with_mesh(mesh.clone());
         let extent = CoreDimension::Dynamic(DimensionVariable::new("n", DimensionBounds::new(4, Some(6)).unwrap()));
-        let staged = crate::jit::stage::<_, Vec<ArrayType>, Vec<ArrayType>>(
+        let staged = crate::stage::<_, Vec<ArrayType>, Vec<ArrayType>>(
             |inputs| {
                 // Runtime dimension operations live in the mixed IR family. Explicitly retain that family while
                 // indexing symbolic extents, and project the array results back to the public JIT signature.
@@ -130,7 +130,7 @@ mod tests {
                 ArrayType::new_static(DataType::F64, [3]),
                 ArrayType::new_static(DataType::F64, [values.len()]),
             ];
-            let compiled = crate::jit::compile::<_, Vec<ArrayType>, Vec<ArrayType>>(
+            let compiled = crate::compile::<_, Vec<ArrayType>, Vec<ArrayType>>(
                 |inputs| {
                     let mut inputs = inputs.into_iter().map(|input| input.into_value()).collect::<Vec<_>>();
                     let mut cotangents = inputs.split_off(3);
@@ -160,8 +160,9 @@ mod tests {
                 .zip(bytes)
                 .map(|(r#type, bytes)| Array::from_host_buffer(&domain, r#type, mesh.clone(), bytes).unwrap())
                 .collect::<Vec<_>>();
-            domain
-                .interpret(&compiled.executable_function(), inputs)
+            compiled
+                .executable()
+                .execute(&domain, inputs)
                 .unwrap()
                 .iter()
                 .map(|output| read_f64s(&client, output))
@@ -320,7 +321,7 @@ mod tests {
                 .unwrap();
             let program = if matches!(name, "gather_axis" | "scatter_axis" | "batched_slice" | "mapped_source_slice") {
                 // The axis conveniences and batching trace use the same symbolic boundary as the mixed graphs.
-                let staged = crate::jit::stage::<_, Vec<ArrayType>, Vec<ArrayType>>(
+                let staged = crate::stage::<_, Vec<ArrayType>, Vec<ArrayType>>(
                     |inputs| {
                         let indices = inputs[1].reshape(Shape::new(vec![CoreDimension::Static(index_count)])).unwrap();
                         vec![if name == "mapped_source_slice" {
@@ -508,7 +509,7 @@ mod tests {
                     vec![ArrayIrType::from(output_type.clone())],
                     "{name}, n={size}"
                 );
-                let compiled = crate::jit::compile::<_, Vec<ArrayType>, Vec<ArrayType>>(
+                let compiled = crate::compile::<_, Vec<ArrayType>, Vec<ArrayType>>(
                     |inputs| {
                         let mut inputs = inputs.into_iter().map(|input| input.into_value()).collect::<Vec<_>>();
                         let cotangent = inputs.pop().unwrap();
@@ -551,7 +552,7 @@ mod tests {
                     .zip(bytes)
                     .map(|(r#type, bytes)| Array::from_host_buffer(&domain, r#type, mesh.clone(), bytes).unwrap())
                     .collect();
-                let outputs = domain.interpret(&compiled.executable_function(), inputs).unwrap();
+                let outputs = compiled.executable().execute(&domain, inputs).unwrap();
                 assert_eq!(outputs.len(), 2);
                 for output in &outputs {
                     assert_eq!(output.data_type(), DataType::F64);

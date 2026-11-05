@@ -553,9 +553,8 @@ mod tests {
         MixedValue, ProgramBuilder, add_jit_call, execute_mixed_program, unproject_plain_program,
     };
     use crate::experimental::ops::{ArrayConstant, Constant, Program, ProgramBuilder as ArrayIrProgramBuilder};
-    use crate::jit::{CompiledFunction, compile};
     use crate::tests::{execution_client, values_from_bytes, values_to_bytes};
-    use crate::{Array, Domain, FromPjrt, Session, to_mlir_module_for_program};
+    use crate::{Array, CompiledFunction, Domain, FromPjrt, Session, compile, to_mlir_module_for_program};
 
     use super::*;
 
@@ -1115,9 +1114,10 @@ mod tests {
         let device = |data_type: DataType, shape: &[usize], bytes: Vec<u8>| {
             Array::from_host_buffer(&domain, placed(data_type, shape), mesh.clone(), bytes.as_slice()).unwrap()
         };
-        let outputs = domain
-            .interpret(
-                &compiled.executable_function(),
+        let outputs = compiled
+            .executable()
+            .execute(
+                &domain,
                 (
                     device(DataType::F32, &[32, 32], values_to_bytes(&lhs)),
                     device(DataType::F32, &[16, 32], values_to_bytes(&rhs)),

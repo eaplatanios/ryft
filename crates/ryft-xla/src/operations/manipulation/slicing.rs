@@ -1289,7 +1289,7 @@ mod tests {
         let mesh = domain_mesh(&client, "x", 1);
         let domain = Session::new(&client).domain().with_mesh(mesh.clone());
         let extent = CoreDimension::Dynamic(DimensionVariable::new("n", DimensionBounds::new(4, Some(6)).unwrap()));
-        let staged = crate::jit::stage::<_, Vec<ArrayType>, Vec<ArrayType>>(
+        let staged = crate::stage::<_, Vec<ArrayType>, Vec<ArrayType>>(
             |inputs| vec![inputs[0].dynamic_update_slice(&inputs[1], &inputs[2..]).unwrap()],
             vec![
                 ArrayType::new(DataType::F64, Shape::new(vec![extent, CoreDimension::Static(4)])),
@@ -1334,7 +1334,7 @@ mod tests {
                 .specialize(&input_types[..4].iter().cloned().map(ArrayIrType::from).collect::<Vec<_>>())
                 .unwrap_or_else(|error| panic!("n={size} specialization: {error}\n{}", linearization.primal()));
             assert_eq!(specialized.output_types()[0], ArrayIrType::from(input_types[0].clone()), "n={size}");
-            let compiled = crate::jit::compile::<_, Vec<ArrayType>, Vec<ArrayType>>(
+            let compiled = crate::compile::<_, Vec<ArrayType>, Vec<ArrayType>>(
                 |inputs| {
                     let mut inputs = inputs.into_iter().map(|input| input.into_value()).collect::<Vec<_>>();
                     let cotangent = inputs.pop().unwrap();
@@ -1372,7 +1372,7 @@ mod tests {
                 .zip(bytes)
                 .map(|(r#type, bytes)| Array::from_host_buffer(&domain, r#type, mesh.clone(), bytes).unwrap())
                 .collect();
-            let outputs = domain.interpret(&compiled.executable_function(), inputs).unwrap();
+            let outputs = compiled.executable().execute(&domain, inputs).unwrap();
             assert_eq!(outputs.len(), 2, "n={size}, row={row}");
             for output in &outputs {
                 assert_eq!(output.data_type(), DataType::F64);

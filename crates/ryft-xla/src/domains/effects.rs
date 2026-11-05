@@ -547,7 +547,7 @@ mod tests {
 
         // Batching under a staging parent keeps the print in the staged program, which prints the whole batch once
         // per execution.
-        let staged = crate::jit::stage::<_, Vec<ArrayType>, Vec<ArrayType>>(
+        let staged = crate::stage::<_, Vec<ArrayType>, Vec<ArrayType>>(
             |inputs| {
                 let output =
                     batch(|item| item.print("x"), inputs[0].clone(), BatchAxis::new(0), BatchAxis::new(0), None);

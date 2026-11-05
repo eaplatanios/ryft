@@ -1,19 +1,24 @@
-//! User-facing XLA compile-and-execute API.
+//! XLA function staging, retained JIT dispatch, compilation, and execution.
 //!
-//! This module wraps the backend-neutral lifecycle from [`ryft_core::compilation`] with XLA-flavored handles and entry
-//! points. [`jitted`] is the retained `jax.jit` analogue: it specializes on runtime-derived abstract signatures and
-//! dispatches warm calls through cached compiled functions. [`compile`] instead stages and compiles exactly one
-//! explicit abstract signature into a [`CompiledFunction`]. [`stage`] is the staging-only counterpart: it returns a
-//! [`StagedFunction`] that can be embedded into outer traces via [`StagedFunction::call`] and compiled later, so
-//! functions that are only ever composed into larger programs never pay for their own executable. Staged functions
-//! register runtime captures in their retained capture table instead of embedding runtime arrays in the IR, and every
-//! compilation shares the domain's [`CompilationContext`](ryft_core::compilation::CompilationContext) cache.
+//! This module wraps the lifecycle from [`ryft_core::compilation`] with XLA array projections and options. [`jit`]
+//! creates a [`CompiledFunctionDispatcher`] that selects specializations from runtime inputs. Its first invocation
+//! for a specialization stages, lowers, and requests compilation, while warm invocations reuse the retained executable.
+//! [`compile`] stages and obtains a [`CompiledFunction`] for one explicit abstract signature immediately. Both paths
+//! share the domain's [`CompilationContext`](ryft_core::CompilationContext) cache.
 //!
-//! [`jitted_statefully`] and [`compile_statefully`] expose the heterogeneous boundary used by external array
+//! [`stage`] returns a [`StagedFunction`] for functions that are composed into larger programs before compilation.
+//! [`StagedFunction::call`] and [`CompiledFunction::call`] embed a nested call into an outer trace. Runtime invocation
+//! uses [`CompiledFunctionDispatcher::execute`] or an [`ExecutableFunction`] obtained through
+//! [`CompiledFunction::executable`]. [`ExecutableFunction::execute`] returns structured array outputs, and
+//! [`ExecutableFunction::execute_async`] also retains whole-invocation completion. Staged functions register runtime
+//! captures in their retained capture table instead of embedding runtime arrays in the IR.
+//!
+//! [`jit_statefully`] and [`compile_statefully`] expose the heterogeneous boundary used by external array
 //! references. Asynchronous stateful calls atomically publish read leases and pending mutation generations immediately
 //! after submission, commit hidden final states without holding host mutexes through device execution, and return a
-//! [`StatefulExecution`] that reports completion failures. The blocking stateful surface is a thin await of that
-//! protocol.
+//! [`StatefulExecution`] that reports completion failures. [`StatefulCompiledFunctionDispatcher::execute_statefully`]
+//! returns that completion, and [`StatefulCompiledFunctionDispatcher::execute_statefully_and_wait`] waits for it before
+//! returning public outputs. [`StatefulCompiledFunction`] supplies the corresponding fixed-signature entry points.
 //!
 //! # External Reference ABI
 //!
@@ -47,7 +52,7 @@
 //!     return old                       // public result
 //! })
 //!
-//! call_statefully((reference, update))
+//! execute_statefully_and_wait((reference, update))
 //!     -> execute(array(reference), update)
 //!     -> receive(old, hidden_final_state)
 //!     -> commit hidden_final_state into reference
@@ -57,7 +62,7 @@
 //!     |captures, input| captures[0].add_update(input),
 //!     captures = [reference],
 //! )
-//! call_statefully(input)
+//! execute_statefully_and_wait(input)
 //!     -> lift reference as the leading executable input
 //!     -> commit its hidden final state through the same transaction
 //! ```
@@ -73,7 +78,7 @@
 //! state stays valid.
 //!
 //! Local references—including local views and references inside supported conditions, bounded loops, scans, and
-//! nested calls—use the ordinary [`jitted`] or [`compile`] surface: they are discharged to array SSA before StableHLO
+//! nested calls—use the ordinary [`jit`] or [`compile`] surface: they are discharged to array SSA before StableHLO
 //! lowering and do not change the public ABI. Local-reference batching and automatic differentiation likewise
 //! discharge first. Rematerialization recomputes local reference lifecycles inside its body, saves reads of external
 //! references, and never recomputes their mutations. External reference AD, mapped/shared reference batching,
@@ -203,7 +208,7 @@ where
 /// A first call for each `(static parameters, dynamic parameter structure, dynamic abstract types)` specialization
 /// stages, lowers, and requests compilation. Warm calls dispatch directly to the retained executable. Static values
 /// should be low-cardinality configuration such as axes, shapes, or Boolean branch choices; arrays remain dynamic.
-pub struct JittedFunction<
+pub struct CompiledFunctionDispatcher<
     'c,
     F,
     Static: Clone + Debug + Eq + Hash,
@@ -218,7 +223,7 @@ pub struct JittedFunction<
     function: CoreCompiledFunctionDispatcher<Domain<'c>, Static, ProgramParameters<In>, ProgramParameters<Out>, F>,
 }
 
-impl<'c, F, Static, In, Out> Clone for JittedFunction<'c, F, Static, In, Out>
+impl<'c, F, Static, In, Out> Clone for CompiledFunctionDispatcher<'c, F, Static, In, Out>
 where
     Static: Clone + Debug + Eq + Hash,
     In: Parameterized<ArrayType>,
@@ -234,7 +239,7 @@ where
     }
 }
 
-impl<'c, F, Static, In, Out> JittedFunction<'c, F, Static, In, Out>
+impl<'c, F, Static, In, Out> CompiledFunctionDispatcher<'c, F, Static, In, Out>
 where
     Static: Clone + Debug + Eq + Hash,
     In: Parameterized<ArrayType>,
@@ -251,8 +256,9 @@ where
         + ParameterizedFamily<StatefulValue<'c>>
         + ParameterizedFamily<StatefulCompileTracer<'c>>,
 {
-    /// Calls this dispatcher with public array inputs and projects its array IR runtime outputs back to arrays.
-    pub fn call(&self, static_parameters: Static, inputs: In::To<Array<'c>>) -> Result<Out::To<Array<'c>>, Error>
+    /// Executes a specialization with public array inputs, compiling it on a miss and reusing it on warm invocations.
+    /// The array IR runtime outputs are projected back to the input/output container family's array representation.
+    pub fn execute(&self, static_parameters: Static, inputs: In::To<Array<'c>>) -> Result<Out::To<Array<'c>>, Error>
     where
         Options: Clone,
         F: Fn(
@@ -284,11 +290,11 @@ where
 ///
 /// `function` is fallible so that it can reject its inputs while it is traced, and an infallible function returns its
 /// outputs wrapped in [`Ok`].
-pub fn jitted_with_options<'c, F, Static, In, Out>(
+pub fn jit_with_options<'c, F, Static, In, Out>(
     function: F,
     domain: &Domain<'c>,
     options: Options,
-) -> JittedFunction<
+) -> CompiledFunctionDispatcher<
     'c,
     impl Fn(
         Static,
@@ -317,7 +323,7 @@ where
         let outputs = function(static_parameters, project_tracers::<In>(inputs)?)?;
         lift_tracers::<Out>(outputs)
     };
-    JittedFunction { function: domain.jit_with_options(function, options) }
+    CompiledFunctionDispatcher { function: domain.jit_with_options(function, options) }
 }
 
 /// Constructs a retained dispatcher for `function` on `mesh` with otherwise default options.
@@ -325,11 +331,11 @@ where
 /// `function` is fallible so that it can reject its inputs while it is traced, and an infallible function returns its
 /// outputs wrapped in [`Ok`].
 #[inline]
-pub fn jitted<'c, F, Static, In, Out>(
+pub fn jit<'c, F, Static, In, Out>(
     function: F,
     domain: &Domain<'c>,
     mesh: DeviceMesh,
-) -> JittedFunction<
+) -> CompiledFunctionDispatcher<
     'c,
     impl Fn(
         Static,
@@ -354,7 +360,7 @@ where
         + ParameterizedFamily<StatefulCompileTracer<'c>>
         + ParameterizedFamily<CompileTracer<'c>>,
 {
-    jitted_with_options(function, domain, Options::new(mesh))
+    jit_with_options(function, domain, Options::new(mesh))
 }
 
 /// Retained heterogeneous XLA JIT dispatcher whose calls may bind external references.
@@ -369,9 +375,9 @@ where
 ///
 /// # Stability
 ///
-/// This external-state surface is experimental. Ordinary [`JittedFunction`] calls remain the stable array-only
+/// This external-state surface is experimental. Ordinary [`CompiledFunctionDispatcher`] calls remain the stable array-only
 /// boundary.
-pub struct StatefulJittedFunction<
+pub struct StatefulCompiledFunctionDispatcher<
     'c,
     F,
     Static: Clone + Debug + Eq + Hash,
@@ -386,7 +392,7 @@ pub struct StatefulJittedFunction<
     function: CoreCompiledFunctionDispatcher<Domain<'c>, Static, In, Out, F>,
 }
 
-impl<'c, F, Static, In, Out> Clone for StatefulJittedFunction<'c, F, Static, In, Out>
+impl<'c, F, Static, In, Out> Clone for StatefulCompiledFunctionDispatcher<'c, F, Static, In, Out>
 where
     Static: Clone + Debug + Eq + Hash,
     In: Parameterized<ArrayIrType>,
@@ -402,7 +408,7 @@ where
     }
 }
 
-impl<'c, F, Static, In, Out> StatefulJittedFunction<'c, F, Static, In, Out>
+impl<'c, F, Static, In, Out> StatefulCompiledFunctionDispatcher<'c, F, Static, In, Out>
 where
     Static: Clone + Debug + Eq + Hash,
     In: Parameterized<ArrayIrType>,
@@ -429,10 +435,10 @@ where
     ///
     /// The call snapshots every bound reference in ascending identity order, completes fallible preparation without
     /// retaining reference state locks, and revalidates reference generations before submission. It waits for the
-    /// completion returned by [`Self::call_statefully_async`], so completion errors are reported and read-only leases
+    /// completion returned by [`Self::execute_statefully`], so completion errors are reported and read-only leases
     /// have completed before it returns. Mutated references reconcile their ready or poisoned state lazily on their
     /// next access.
-    pub fn call_statefully(
+    pub fn execute_statefully_and_wait(
         &self,
         static_parameters: Static,
         inputs: In::To<StatefulValue<'c>>,
@@ -450,7 +456,7 @@ where
     /// values; awaiting it observes whole-invocation completion, including asynchronous execution errors that would
     /// otherwise surface only when the affected reference is next accessed. Dropping the result never cancels
     /// submitted work.
-    pub fn call_statefully_async(
+    pub fn execute_statefully(
         &self,
         static_parameters: Static,
         inputs: In::To<StatefulValue<'c>>,
@@ -477,11 +483,11 @@ where
 /// # Stability
 ///
 /// This external-state entry point is experimental.
-pub fn jitted_statefully_with_options<'c, F, Static, In, Out>(
+pub fn jit_statefully_with_options<'c, F, Static, In, Out>(
     function: F,
     domain: &Domain<'c>,
     options: Options,
-) -> StatefulJittedFunction<'c, F, Static, In, Out>
+) -> StatefulCompiledFunctionDispatcher<'c, F, Static, In, Out>
 where
     F: Fn(Static, In::To<StatefulCompileTracer<'c>>) -> Result<Out::To<StatefulCompileTracer<'c>>, Error>,
     Static: Clone + Debug + Eq + Hash,
@@ -495,7 +501,7 @@ where
             Family: ParameterizedFamily<Constant> + ParameterizedFamily<StatefulCompileTracer<'c>>,
         >,
 {
-    StatefulJittedFunction { function: domain.jit_with_options(function, options) }
+    StatefulCompiledFunctionDispatcher { function: domain.jit_with_options(function, options) }
 }
 
 /// Constructs a retained stateful dispatcher for a heterogeneous XLA `function` on `mesh` with otherwise default
@@ -508,11 +514,11 @@ where
 ///
 /// This external-state entry point is experimental.
 #[inline]
-pub fn jitted_statefully<'c, F, Static, In, Out>(
+pub fn jit_statefully<'c, F, Static, In, Out>(
     function: F,
     domain: &Domain<'c>,
     mesh: DeviceMesh,
-) -> StatefulJittedFunction<'c, F, Static, In, Out>
+) -> StatefulCompiledFunctionDispatcher<'c, F, Static, In, Out>
 where
     F: Fn(Static, In::To<StatefulCompileTracer<'c>>) -> Result<Out::To<StatefulCompileTracer<'c>>, Error>,
     Static: Clone + Debug + Eq + Hash,
@@ -526,12 +532,12 @@ where
             Family: ParameterizedFamily<Constant> + ParameterizedFamily<StatefulCompileTracer<'c>>,
         >,
 {
-    jitted_statefully_with_options(function, domain, Options::new(mesh))
+    jit_statefully_with_options(function, domain, Options::new(mesh))
 }
 
 /// Compiled heterogeneous XLA function whose invocation may bind external references.
 ///
-/// This is the ahead-of-time counterpart of [`StatefulJittedFunction`] for one fixed signature: reference-typed
+/// This is the fixed-signature counterpart of [`StatefulCompiledFunctionDispatcher`] for one fixed signature: reference-typed
 /// input leaves bind unrenamed root [`ryft_core::ArrayReference`] handles whose types refine the effective compiled
 /// boundary, including its declared sharding and memory. Read-only bounded-dynamic references may refine finite
 /// replicated declarations. Each invocation uses the same snapshot, generation-revalidation, asynchronous
@@ -562,7 +568,7 @@ where
 {
     /// Returns the runtime-only executable handle.
     #[inline]
-    pub fn executable_function(&self) -> &CoreExecutableFunction<Domain<'c>, In, Out> {
+    pub fn executable(&self) -> &CoreExecutableFunction<Domain<'c>, In, Out> {
         self.function.executable()
     }
 
@@ -570,8 +576,8 @@ where
     ///
     /// The call waits for the completion-bearing protocol after pending reference state and read leases are published.
     /// A failed completion therefore cannot leave silently stale reference state behind. Refer to the documentation of
-    /// [`StatefulJittedFunction::call_statefully`] for the complete transaction contract.
-    pub fn call_statefully(
+    /// [`StatefulCompiledFunctionDispatcher::execute_statefully_and_wait`] for the complete transaction contract.
+    pub fn execute_statefully_and_wait(
         &self,
         domain: &Domain<'c>,
         inputs: In::To<StatefulValue<'c>>,
@@ -581,9 +587,9 @@ where
 
     /// Submits a stateful call and returns its non-cancelling completion-bearing result.
     ///
-    /// Refer to the documentation of [`StatefulJittedFunction::call_statefully_async`] for the completion and
+    /// Refer to the documentation of [`StatefulCompiledFunctionDispatcher::execute_statefully`] for the completion and
     /// error-observation contract.
-    pub fn call_statefully_async(
+    pub fn execute_statefully(
         &self,
         domain: &Domain<'c>,
         inputs: In::To<StatefulValue<'c>>,
@@ -797,31 +803,17 @@ where
     pub fn mesh(&self) -> &DeviceMesh {
         self.function.compiled_program().mesh()
     }
-}
 
-impl<'c> Domain<'c> {
-    /// Lowers and compiles a staged XLA function using the options that it retained when it was staged.
-    pub fn compile_staged_function<In, Out>(
-        &self,
-        staged: StagedFunction<'c, In, Out>,
-    ) -> Result<CompiledFunction<'c, In, Out>, Error>
-    where
-        In: Parameterized<ArrayType>,
-        In::Family: ParameterizedFamily<ArrayType> + ParameterizedFamily<ArrayIrType> + ParameterizedFamily<Constant>,
-        Out: Parameterized<ArrayType>,
-        Out::Family: ParameterizedFamily<ArrayType> + ParameterizedFamily<ArrayIrType> + ParameterizedFamily<Constant>,
-    {
-        let function = staged.function.lower(self)?.compile(self)?;
-        Ok(CompiledFunction { function, derived: Arc::new(DerivedFunctionSlots::new()) })
-    }
-
-    /// Executes an XLA runtime program on concrete [`Array`] inputs.
+    /// Executes this function through `domain` on concrete [`Array`] inputs and reconstructs its structured outputs.
+    /// Returned arrays can still have pending device work. Use [`Self::execute_async`] when a whole-invocation
+    /// completion handle is needed, including for a function with no array outputs.
+    ///
+    /// # Errors
+    ///
+    /// Returns an error if the executable belongs to another client, input validation or output reconstruction fails,
+    /// or execution reports a failure. Deferred device failures can also surface when an output is awaited.
     #[inline]
-    pub fn interpret<In, Out>(
-        &self,
-        executable: &ExecutableFunction<'c, In, Out>,
-        inputs: In::To<Array<'c>>,
-    ) -> Result<Out::To<Array<'c>>, Error>
+    pub fn execute(&self, domain: &Domain<'c>, inputs: In::To<Array<'c>>) -> Result<Out::To<Array<'c>>, Error>
     where
         In: Parameterized<
                 ArrayType,
@@ -841,15 +833,24 @@ impl<'c> Domain<'c> {
             Parameterized<Array<'c>, Family = Out::Family, ParameterStructure = Out::ParameterStructure>,
     {
         let inputs = lift_arrays::<In>(inputs)?;
-        project_arrays::<Out>(executable.function.execute(self, inputs)?)
+        project_arrays::<Out>(self.function.execute(domain, inputs)?)
     }
 
-    /// Enqueues an XLA runtime program and retains whole-execution completion, including for zero-output calls.
+    /// Submits this function through `domain` and returns its structured outputs together with whole-invocation
+    /// completion, including for a function with no array outputs. Await the returned [`Execution`] to observe
+    /// asynchronous execution failures.
+    ///
     /// Erased zero-space inputs await producer completion before submission because no physical input buffer can
-    /// carry their dependency. Bounded-dynamic input preparation and output reconstruction can also wait for transfers.
-    pub fn interpret_async<In, Out>(
+    /// carry their dependency. Input preparation and output reconstruction for bounded dynamic shapes can also wait
+    /// for transfers.
+    ///
+    /// # Errors
+    ///
+    /// Returns an error if the executable requires stateful invocation, belongs to another client, or fails input
+    /// validation, submission, or output reconstruction.
+    pub fn execute_async(
         &self,
-        executable: &ExecutableFunction<'c, In, Out>,
+        domain: &Domain<'c>,
         inputs: In::To<Array<'c>>,
     ) -> Result<Execution<Out::To<Array<'c>>>, Error>
     where
@@ -870,34 +871,51 @@ impl<'c> Domain<'c> {
         Out::To<Array<'c>>:
             Parameterized<Array<'c>, Family = Out::Family, ParameterStructure = Out::ParameterStructure>,
     {
-        if executable.function.compiled_program().requires_stateful_call() {
+        if self.function.compiled_program().requires_stateful_call() {
             return Err(ExecutionError::StatefulInvocationRequired.into());
         }
         let flat_inputs = lift_arrays::<In>(inputs)?.into_parameters().collect::<Vec<_>>();
-        executable.function.validate_input_count(flat_inputs.len())?;
-        for (expected, actual) in executable.function.input_types().iter().zip(flat_inputs.iter().map(Typed::r#type)) {
+        self.function.validate_input_count(flat_inputs.len())?;
+        for (expected, actual) in self.function.input_types().iter().zip(flat_inputs.iter().map(Typed::r#type)) {
             validate_input_type(
                 <&ArrayType>::try_from(expected).map_err(ProgramError::from)?,
                 <&ArrayType>::try_from(actual.as_ref()).map_err(ProgramError::from)?,
             )?;
         }
 
-        let inputs = executable
+        let inputs = self
             .function
             .inputs_with_captures(flat_inputs)
             .into_iter()
             .map(ValueProjection::<ArrayType>::into_projected)
             .collect::<Result<Vec<_>, _>>()
             .map_err(ProgramError::from)?;
-        let execution = self.execute_compiled_async(executable.function.compiled_program(), inputs)?;
+        let execution = domain.execute_compiled_async(self.function.compiled_program(), inputs)?;
         let (flat_outputs, fence) = execution.into_parts();
-        validate_runtime_outputs(executable.function.compiled_program().output_types(), flat_outputs.as_slice())?;
+        validate_runtime_outputs(self.function.compiled_program().output_types(), flat_outputs.as_slice())?;
         let outputs = ProgramParameterValues::<Out, Value<'c>>::from_parameters(
-            executable.function.output_structure().clone(),
+            self.function.output_structure().clone(),
             flat_outputs.into_iter().map(Value::Array),
         )
         .map_err(ProgramError::from)?;
         Ok(Execution::new(project_arrays::<Out>(outputs)?, fence))
+    }
+}
+
+impl<'c> Domain<'c> {
+    /// Lowers and compiles a staged XLA function using the options that it retained when it was staged.
+    pub fn compile_staged_function<In, Out>(
+        &self,
+        staged: StagedFunction<'c, In, Out>,
+    ) -> Result<CompiledFunction<'c, In, Out>, Error>
+    where
+        In: Parameterized<ArrayType>,
+        In::Family: ParameterizedFamily<ArrayType> + ParameterizedFamily<ArrayIrType> + ParameterizedFamily<Constant>,
+        Out: Parameterized<ArrayType>,
+        Out::Family: ParameterizedFamily<ArrayType> + ParameterizedFamily<ArrayIrType> + ParameterizedFamily<Constant>,
+    {
+        let function = staged.function.lower(self)?.compile(self)?;
+        Ok(CompiledFunction { function, derived: Arc::new(DerivedFunctionSlots::new()) })
     }
 
     /// Replaces an executable program while preserving and validating its runtime signature.
@@ -934,7 +952,7 @@ impl<'c> Domain<'c> {
     {
         AdaptiveProfileGuidedFunction::new(
             self.clone(),
-            function.executable_function(),
+            function.executable(),
             function.function.lowered().lowered_program().clone(),
             function.function.lowered().options().clone(),
             options,
@@ -942,7 +960,7 @@ impl<'c> Domain<'c> {
     }
 }
 
-/// Just-in-time compiled function handle. Returned by [`compile`], [`compile_with_options`], and
+/// Compiled XLA function for one explicit abstract signature. Returned by [`compile`], [`compile_with_options`], and
 /// [`Domain::compile_staged_function`].
 ///
 /// Holds the cached PJRT-backed [`CompiledProgram`] plus the [`StagedFunction`] it was compiled from, whose
@@ -1053,13 +1071,13 @@ where
 
     /// Returns a runtime-only handle that omits staged and lowered transform metadata.
     #[inline]
-    pub fn executable_function(&self) -> ExecutableFunction<'c, In, Out> {
+    pub fn executable(&self) -> ExecutableFunction<'c, In, Out> {
         ExecutableFunction { function: self.function.executable().clone() }
     }
 
     /// Consumes this transformable handle and returns its runtime-only executable state.
     #[inline]
-    pub fn into_executable_function(self) -> ExecutableFunction<'c, In, Out> {
+    pub fn into_executable(self) -> ExecutableFunction<'c, In, Out> {
         ExecutableFunction { function: self.function.into_executable() }
     }
 
@@ -1386,7 +1404,7 @@ where
 }
 
 /// Compiles one explicit abstract signature of `function` and returns a [`CompiledFunction`] that executes that
-/// specialization on subsequent calls. Use [`jitted`] when runtime calls should select and retain specializations in
+/// specialization on subsequent calls. Use [`jit`] when runtime calls should select and retain specializations in
 /// the style of `jax.jit`.
 ///
 /// Equivalent to [`compile_with_options`] called with [`Options::new(mesh)`](Options::new).
@@ -1747,13 +1765,13 @@ mod tests {
     };
     use ryft_pjrt::{ClientOptions, CpuClientOptions, load_cpu_plugin};
 
+    use crate::compilation::{
+        CompileTracer, CompiledFunction, CompiledFunctionDispatcher, ExecutableFunction, StagedFunction,
+        StatefulCompileTracer, compile, compile_statefully, compile_statefully_with_captures, compile_with_captures,
+        compile_with_options, infer_output_types, jit, jit_statefully, stage, stage_with_captures,
+    };
     use crate::domains::tests::{StatefulFailureInjection, inject_stateful_completion, inject_stateful_failure};
     use crate::experimental::ops::{Constant, Operation};
-    use crate::jit::{
-        CompileTracer, CompiledFunction, ExecutableFunction, JittedFunction, StagedFunction, StatefulCompileTracer,
-        compile, compile_statefully, compile_statefully_with_captures, compile_with_captures, compile_with_options,
-        infer_output_types, jitted, jitted_statefully, stage, stage_with_captures,
-    };
     use crate::operations::jit_call::JitCallOperation;
     use crate::tests::{execution_client, values_from_bytes, values_to_bytes};
     use crate::{
@@ -1964,7 +1982,7 @@ mod tests {
         let source =
             Array::from_host_buffer(&engine, input_type, mesh.clone(), values_to_bytes::<f32>(&values).as_slice())
                 .unwrap();
-        let output = engine.interpret(&compiled.executable_function(), source).unwrap();
+        let output = compiled.executable().execute(&engine, source).unwrap();
 
         let device_id = client.addressable_devices().unwrap()[0].id().unwrap();
         let shard_bytes = output
@@ -2005,7 +2023,7 @@ mod tests {
         let input =
             Array::from_host_buffer(&engine, input_type, mesh.clone(), values_to_bytes(&[1f32, 2., 3.]).as_slice())
                 .unwrap();
-        let output = engine.interpret(&compiled.executable_function(), input).unwrap();
+        let output = compiled.executable().execute(&engine, input).unwrap();
         let device_id = client.addressable_devices().unwrap()[0].id().unwrap();
         let bytes = output
             .device_shard(device_id)
@@ -2047,7 +2065,7 @@ mod tests {
         assert_eq!(compiled.source_program().captures().len(), 1);
         assert_eq!(compiled.source_program().to_program_with_lifted_captures().unwrap().input_ids().len(), 2);
         let input = Array::from_host_buffer(&engine, input_type, mesh, values_to_bytes(&[9f32; 6]).as_slice()).unwrap();
-        let output = engine.interpret(&compiled.executable_function(), input).unwrap();
+        let output = compiled.executable().execute(&engine, input).unwrap();
         assert_eq!(read_f32_array(&client, &output), vec![4f32; 6]);
     }
 
@@ -2071,9 +2089,9 @@ mod tests {
         ] {
             let input =
                 Array::from_host_buffer(&engine, input_type.clone(), mesh.clone(), &values_to_bytes(&values)).unwrap();
-            let output = engine.interpret(&compiled.executable_function(), input.clone()).unwrap();
+            let output = compiled.executable().execute(&engine, input.clone()).unwrap();
             assert_eq!(read_f32_array(&client, &output), vec![expected]);
-            let output = engine.interpret(&gradient.executable_function(), input).unwrap();
+            let output = gradient.executable().execute(&engine, input).unwrap();
             assert_eq!(read_f32_array(&client, &output), expected_gradient);
         }
     }
@@ -2098,7 +2116,7 @@ mod tests {
         {
             let input =
                 Array::from_host_buffer(&engine, input_type.clone(), mesh.clone(), &values_to_bytes(&values)).unwrap();
-            let output = engine.interpret(&gradient.executable_function(), input).unwrap();
+            let output = gradient.executable().execute(&engine, input).unwrap();
             assert_eq!(output.sharding(), input_type.sharding().unwrap());
             let mut observed = Vec::new();
             for device in client.addressable_devices().unwrap().iter().take(2) {
@@ -2152,7 +2170,7 @@ mod tests {
             let input =
                 Array::from_host_buffer(&engine, input_type, mesh.clone(), &values_to_bytes(&vec![input; count]))
                     .unwrap();
-            let output = engine.interpret(&compiled.executable_function(), input).unwrap();
+            let output = compiled.executable().execute(&engine, input).unwrap();
             assert_eq!(read_f32_array(&client, &output), vec![expected]);
         }
     }
@@ -2173,7 +2191,7 @@ mod tests {
         )
         .unwrap();
         let input = Array::from_host_buffer(&engine, input_type, mesh, &[]).unwrap();
-        let output = engine.interpret(&compiled.executable_function(), input).unwrap();
+        let output = compiled.executable().execute(&engine, input).unwrap();
         assert!(read_f32_array(&client, &output)[0].is_nan());
     }
 
@@ -2198,7 +2216,7 @@ mod tests {
                 compile(|value| value.reduce(&[0], kind).unwrap(), input_type.clone(), &engine, mesh.clone()).unwrap();
             let input =
                 Array::from_host_buffer(&engine, input_type, mesh.clone(), &values_to_bytes(&components)).unwrap();
-            let output = engine.interpret(&compiled.executable_function(), input).unwrap();
+            let output = compiled.executable().execute(&engine, input).unwrap();
             assert_eq!(read_f32_array(&client, &output), expected);
         }
     }
@@ -2230,12 +2248,12 @@ mod tests {
         // direction the exact suffix sums.
         let forward: CompiledFunction<'_, ArrayType, ArrayType> =
             compile(|x| x.cumulative_sum(0).unwrap(), input_type.clone(), &engine, mesh.clone()).unwrap();
-        let output = engine.interpret(&forward.executable_function(), source()).unwrap();
+        let output = forward.executable().execute(&engine, source()).unwrap();
         assert_eq!(read_f32_array(&client, &output), vec![1.0, 3.0, 6.0, 10.0]);
 
         let reverse: CompiledFunction<'_, ArrayType, ArrayType> =
             compile(|x| x.reverse_cumulative_sum(0).unwrap(), input_type.clone(), &engine, mesh.clone()).unwrap();
-        let output = engine.interpret(&reverse.executable_function(), source()).unwrap();
+        let output = reverse.executable().execute(&engine, source()).unwrap();
         assert_eq!(read_f32_array(&client, &output), vec![10.0, 9.0, 7.0, 4.0]);
 
         // Reverse-mode differentiation through the compiled scan exercises the transposed direction end to end:
@@ -2249,7 +2267,7 @@ mod tests {
         )
         .unwrap();
         let gradient: CompiledFunction<'_, ArrayType, ArrayType> = total.gradient(&engine).unwrap();
-        let output = engine.interpret(&gradient.executable_function(), source()).unwrap();
+        let output = gradient.executable().execute(&engine, source()).unwrap();
         assert_eq!(read_f32_array(&client, &output), vec![4.0, 3.0, 2.0, 1.0]);
     }
 
@@ -2270,12 +2288,12 @@ mod tests {
         let input =
             Array::from_host_buffer(&engine, input_type.clone(), mesh.clone(), &values_to_bytes(&[1e20f64, 1e20]))
                 .unwrap();
-        let output = engine.interpret(&gradient.executable_function(), input).unwrap();
+        let output = gradient.executable().execute(&engine, input).unwrap();
         assert_eq!(read_f32_array(&client, &output.convert_element_type(DataType::F32).unwrap()), vec![0.5, 0.5]);
 
         // The compiled finite-shift guard must retain the undefined weight at an infinite input.
         let input = Array::from_host_buffer(&engine, input_type, mesh, &values_to_bytes(&[f64::INFINITY, 0.])).unwrap();
-        let output = engine.interpret(&gradient.executable_function(), input).unwrap();
+        let output = gradient.executable().execute(&engine, input).unwrap();
         let values = read_f32_array(&client, &output.convert_element_type(DataType::F32).unwrap());
         assert!(values[0].is_nan());
         assert_eq!(values[1], 0.);
@@ -2296,7 +2314,7 @@ mod tests {
         // The normalization count exceeds the largest finite `f16`, so derivative intermediates must stay widened.
         let input =
             Array::from_host_buffer(&engine, input_type, mesh, &values_to_bytes(&vec![0x3c00u16; 65536])).unwrap();
-        let (_, tangent) = engine.interpret(&differentiated.executable_function(), (input.clone(), input)).unwrap();
+        let (_, tangent) = differentiated.executable().execute(&engine, (input.clone(), input)).unwrap();
         assert_eq!(read_f32_array(&client, &tangent.convert_element_type(DataType::F32).unwrap()), vec![1.]);
     }
 
@@ -2338,9 +2356,9 @@ mod tests {
         // maximum for four equal thousands, where a shift-free `sum(exp(x))` would have overflowed `f32` outright.
         let reduced: CompiledFunction<'_, ArrayType, ArrayType> =
             compile(|x| x.reduce_log_sum_exp(&[0]).unwrap(), input_type.clone(), &engine, mesh.clone()).unwrap();
-        let output = engine.interpret(&reduced.executable_function(), source([0.0; 4])).unwrap();
+        let output = reduced.executable().execute(&engine, source([0.0; 4])).unwrap();
         assert_close(&read_f32_array(&client, &output), &[4.0f32.ln()]);
-        let output = engine.interpret(&reduced.executable_function(), source([1000.0; 4])).unwrap();
+        let output = reduced.executable().execute(&engine, source([1000.0; 4])).unwrap();
         assert_close(&read_f32_array(&client, &output), &[1000.0 + 4.0f32.ln()]);
 
         // The reverse prefix scan folds the pairwise stable `log_add_exp` over each suffix, so position `i` of an
@@ -2348,7 +2366,7 @@ mod tests {
         let scanned: CompiledFunction<'_, ArrayType, ArrayType> =
             compile(|x| x.reverse_cumulative_log_sum_exp(0).unwrap(), input_type.clone(), &engine, mesh.clone())
                 .unwrap();
-        let output = engine.interpret(&scanned.executable_function(), source([0.0; 4])).unwrap();
+        let output = scanned.executable().execute(&engine, source([0.0; 4])).unwrap();
         assert_close(&read_f32_array(&client, &output), &[4.0f32.ln(), 3.0f32.ln(), 2.0f32.ln(), 0.0]);
     }
 
@@ -2376,13 +2394,13 @@ mod tests {
             mesh.clone(),
         )
         .unwrap();
-        let executable = compiled.executable_function();
+        let executable = compiled.executable();
         assert_eq!(executable.function.input_types(), &[ArrayIrType::Array(input_type.clone())]);
         assert_eq!(executable.output_types(), &[input_type.clone()]);
 
         let input =
             Array::from_host_buffer(&domain, input_type, mesh, values_to_bytes::<f32>(&[3.0]).as_slice()).unwrap();
-        let output = domain.interpret(&executable, input).unwrap();
+        let output = executable.execute(&domain, input).unwrap();
         assert_eq!(read_f32_array(&client, &output), vec![6.0]);
     }
 
@@ -2423,7 +2441,7 @@ mod tests {
             mesh.clone(),
         )
         .unwrap();
-        let executable = compiled.executable_function();
+        let executable = compiled.executable();
         assert_eq!(executable.function.input_types(), &[ArrayIrType::Array(input_type.clone())]);
         assert_eq!(executable.output_types(), &[input_type.clone(), input_type.clone(), input_type.clone()]);
 
@@ -2439,7 +2457,7 @@ mod tests {
                 values_to_bytes::<f32>(&[initial]).as_slice(),
             )
             .unwrap();
-            let (value, state, gradient) = domain.interpret(&executable, input).unwrap();
+            let (value, state, gradient) = executable.execute(&domain, input).unwrap();
             assert_eq!(read_f32_array(&client, &value), vec![expected_value]);
             assert_eq!(read_f32_array(&client, &state), vec![expected_state]);
             assert_eq!(read_f32_array(&client, &gradient), vec![expected_gradient]);
@@ -2598,7 +2616,7 @@ mod tests {
             let input =
                 Array::from_host_buffer(&domain, input_type, mesh.clone(), values_to_bytes::<f32>(&values).as_slice())
                     .unwrap();
-            let (outputs, frozen) = domain.interpret(&compiled.executable_function(), input).unwrap();
+            let (outputs, frozen) = compiled.executable().execute(&domain, input).unwrap();
             assert_eq!(read_f32_array(&client, &outputs), expected);
             assert_eq!(read_f32_array(&client, &frozen), expected);
         }
@@ -2634,7 +2652,7 @@ mod tests {
             Array::from_host_buffer(&domain, array_type.clone(), mesh.clone(), 2.0f32.to_ne_bytes().as_slice())
                 .unwrap();
         assert!(matches!(
-            compiled.executable_function().execute(
+            compiled.executable().execute(
                 &domain,
                 (Value::Reference(Reference::new(reference.clone(), domain.clone())), Value::Array(rejected_update),)
             ),
@@ -2647,7 +2665,7 @@ mod tests {
                 Array::from_host_buffer(&domain, array_type.clone(), mesh.clone(), 2.0f32.to_ne_bytes().as_slice())
                     .unwrap();
             let output = compiled
-                .call_statefully(
+                .execute_statefully_and_wait(
                     &domain,
                     (Value::Reference(Reference::new(reference.clone(), domain.clone())), Value::Array(update)),
                 )
@@ -2730,7 +2748,7 @@ mod tests {
         let reference = ArrayReference::new(scalar(1.0));
         let tangent_reference = ArrayReference::new(scalar(10.0));
         let (primal, tangent) = compiled
-            .call_statefully(
+            .execute_statefully_and_wait(
                 &domain,
                 (
                     Value::Reference(Reference::new(reference.clone(), domain.clone())),
@@ -2794,7 +2812,7 @@ mod tests {
         };
         let cotangent_reference = ArrayReference::new(scalar(5.0));
         let input_cotangent = compiled
-            .call_statefully(
+            .execute_statefully_and_wait(
                 &domain,
                 (
                     Value::Reference(Reference::new(cotangent_reference.clone(), domain.clone())),
@@ -2966,7 +2984,7 @@ mod tests {
         .unwrap();
         let buffer = ArrayReference::new(array(&array_type, &[1.0, 1.0, 1.0, 1.0]));
         compiled
-            .call_statefully(
+            .execute_statefully_and_wait(
                 &domain,
                 (
                     Value::Reference(Reference::new(buffer.clone(), domain.clone())),
@@ -3158,7 +3176,7 @@ mod tests {
             Array::from_host_buffer(&domain, array_type, mesh, 7.0f32.to_ne_bytes().as_slice()).unwrap(),
         );
         let output = outer
-            .call_statefully(&domain, Value::Reference(Reference::new(reference.clone(), domain.clone())))
+            .execute_statefully_and_wait(&domain, Value::Reference(Reference::new(reference.clone(), domain.clone())))
             .unwrap();
         let Value::Array(output) = output else { panic!("stateful public output must be an array") };
         assert_eq!(read_f32_array(&client, &output), vec![7.0]);
@@ -3234,7 +3252,7 @@ mod tests {
         .unwrap();
         let input = Array::from_host_buffer(&domain, array_type, mesh, 3.0f32.to_ne_bytes().as_slice()).unwrap();
 
-        let output = compiled.call_statefully(&domain, Value::Array(input)).unwrap();
+        let output = compiled.execute_statefully_and_wait(&domain, Value::Array(input)).unwrap();
         let Value::Array(output) = output else { panic!("stateful all-array output must be an array") };
         assert_eq!(read_f32_array(&client, &output), vec![6.0]);
     }
@@ -3265,7 +3283,7 @@ mod tests {
         .unwrap();
         let input = Array::from_host_buffer(&domain, array_type, mesh, 3.0f32.to_ne_bytes().as_slice()).unwrap();
 
-        let output = compiled.call_statefully_async(&domain, Value::Array(input)).r#await().unwrap();
+        let output = compiled.execute_statefully(&domain, Value::Array(input)).r#await().unwrap();
         let Value::Array(output) = output else { panic!("stateful all-array output must be an array") };
         assert_eq!(read_f32_array(&client, &output), vec![6.0]);
     }
@@ -3293,7 +3311,10 @@ mod tests {
         );
         for _ in 0..2 {
             let output = compiled
-                .call_statefully(&domain, Value::Reference(Reference::new(reference.clone(), domain.clone())))
+                .execute_statefully_and_wait(
+                    &domain,
+                    Value::Reference(Reference::new(reference.clone(), domain.clone())),
+                )
                 .unwrap();
             let Value::Array(output) = output else { panic!("stateful public output must be an array") };
             assert_eq!(read_f32_array(&client, &output), vec![7.0]);
@@ -3302,7 +3323,7 @@ mod tests {
     }
 
     #[test]
-    fn test_interpret_async_rejects_a_reference_bearing_executable() {
+    fn test_executable_function_execute_async_rejects_a_reference_bearing_executable() {
         let plugin = load_cpu_plugin().unwrap();
         let client = plugin
             .client(ClientOptions::CPU(CpuClientOptions { device_count: Some(1), ..Default::default() }))
@@ -3324,10 +3345,10 @@ mod tests {
         // array-only asynchronous entry point is reachable and must refuse the holder transaction up front rather
         // than enqueueing an execution whose hidden final-state outputs nothing would publish.
         let executable: ExecutableFunction<'_, ArrayType, ArrayType> =
-            ExecutableFunction { function: compiled.executable_function().clone() };
+            ExecutableFunction { function: compiled.executable().clone() };
         let input = Array::from_host_buffer(&domain, array_type, mesh, 7.0f32.to_ne_bytes().as_slice()).unwrap();
         assert!(matches!(
-            domain.interpret_async(&executable, input),
+            executable.execute_async(&domain, input),
             Err(Error::Execution(ExecutionError::StatefulInvocationRequired)),
         ));
     }
@@ -3368,11 +3389,11 @@ mod tests {
         let first_gate = ControlledReferenceCompletion::with_await_notification("first read", await_started.clone());
         inject_stateful_completion(CoreReferenceCompletion::new(first_gate.clone()));
         let first_read =
-            read.call_statefully_async(&domain, Value::Reference(Reference::new(reference.clone(), domain.clone())));
+            read.execute_statefully(&domain, Value::Reference(Reference::new(reference.clone(), domain.clone())));
         let second_gate = ControlledReferenceCompletion::with_await_notification("second read", await_started);
         inject_stateful_completion(CoreReferenceCompletion::new(second_gate.clone()));
         let second_read =
-            read.call_statefully_async(&domain, Value::Reference(Reference::new(reference.clone(), domain.clone())));
+            read.execute_statefully(&domain, Value::Reference(Reference::new(reference.clone(), domain.clone())));
 
         std::thread::scope(|scope| {
             let (mutation_finished, mutation_result) = mpsc::channel();
@@ -3383,7 +3404,7 @@ mod tests {
                 let update =
                     Array::from_host_buffer(domain, array_type, mesh, 2.0f32.to_ne_bytes().as_slice()).unwrap();
                 mutation_finished
-                    .send(mutate.call_statefully(
+                    .send(mutate.execute_statefully_and_wait(
                         domain,
                         (Value::Reference(Reference::new(mutation_reference, domain.clone())), Value::Array(update)),
                     ))
@@ -3427,7 +3448,7 @@ mod tests {
         );
         let update = Array::from_host_buffer(&domain, array_type, mesh, 2.0f32.to_ne_bytes().as_slice()).unwrap();
         compiled
-            .call_statefully_async(
+            .execute_statefully(
                 &domain,
                 (Value::Reference(Reference::new(reference.clone(), domain.clone())), Value::Array(update)),
             )
@@ -3463,13 +3484,13 @@ mod tests {
         let first_update =
             Array::from_host_buffer(&domain, array_type.clone(), mesh.clone(), 2.0f32.to_ne_bytes().as_slice())
                 .unwrap();
-        let first = compiled.call_statefully_async(
+        let first = compiled.execute_statefully(
             &domain,
             (Value::Reference(Reference::new(reference.clone(), domain.clone())), Value::Array(first_update)),
         );
         let second_update =
             Array::from_host_buffer(&domain, array_type, mesh, 2.0f32.to_ne_bytes().as_slice()).unwrap();
-        let second = compiled.call_statefully_async(
+        let second = compiled.execute_statefully(
             &domain,
             (Value::Reference(Reference::new(reference.clone(), domain.clone())), Value::Array(second_update)),
         );
@@ -3514,7 +3535,7 @@ mod tests {
         let completion = ControlledReferenceCompletion::new();
         inject_stateful_completion(CoreReferenceCompletion::new(completion.clone()));
         let update = Array::from_host_buffer(&domain, array_type, mesh, 2.0f32.to_ne_bytes().as_slice()).unwrap();
-        drop(compiled.call_statefully_async(
+        drop(compiled.execute_statefully(
             &domain,
             (Value::Reference(Reference::new(reference.clone(), domain.clone())), Value::Array(update)),
         ));
@@ -3552,7 +3573,7 @@ mod tests {
             .with_transform(ArrayReferenceTransform::Index { axis: 0, index: ArrayReferenceTransformIndex::Static(1) })
             .unwrap();
         assert!(matches!(
-            compiled.call_statefully(&domain, Value::Reference(Reference::new(view, domain.clone()))),
+            compiled.execute_statefully_and_wait(&domain, Value::Reference(Reference::new(view, domain.clone()))),
             Err(Error::Core(ryft_core::Error::Program(ProgramError::InvalidArgument { message: reason })))
                 if reason
                     == "external state input 0 must be a root reference handle that uses its allocation's stored \
@@ -3593,7 +3614,7 @@ mod tests {
             .unwrap(),
         );
         let Value::Array(output) = sharded
-            .call_statefully(&domain, Value::Reference(Reference::new(reference.clone(), domain.clone())))
+            .execute_statefully_and_wait(&domain, Value::Reference(Reference::new(reference.clone(), domain.clone())))
             .unwrap()
         else {
             panic!("stateful read output must be an array")
@@ -3620,7 +3641,7 @@ mod tests {
         )
         .unwrap();
         assert!(matches!(
-            compiled.call_statefully(
+            compiled.execute_statefully_and_wait(
                 &domain,
                 (Value::Reference(Reference::new(reference.clone(), domain.clone())), Value::Array(update)),
             ),
@@ -3673,7 +3694,7 @@ mod tests {
         .unwrap();
 
         let Value::Array(output) = compiled
-            .call_statefully(
+            .execute_statefully_and_wait(
                 &domain,
                 (Value::Reference(Reference::new(reference.clone(), domain.clone())), Value::Array(update)),
             )
@@ -3704,7 +3725,7 @@ mod tests {
         )
         .unwrap();
         assert!(matches!(
-            compiled.call_statefully(
+            compiled.execute_statefully_and_wait(
                 &domain,
                 (
                     Value::Reference(Reference::new(reversed_reference.clone(), domain.clone())),
@@ -3743,7 +3764,7 @@ mod tests {
         let reference = ArrayReference::new(array(&[2.0, 3.0, 5.0, 7.0]));
         let tangent_reference = ArrayReference::new(array(&[23.0, 29.0, 31.0, 37.0]));
         let outputs = compiled
-            .call_statefully(
+            .execute_statefully_and_wait(
                 &domain,
                 vec![
                     Value::Reference(Reference::new(reference.clone(), domain.clone())),
@@ -3807,7 +3828,7 @@ mod tests {
         let reference = ArrayReference::new(array(&reference_type, &[2.0, 3.0]));
         let destination = ArrayReference::new(array(&reference_type, &[5.0, 7.0]));
         let outputs = compiled
-            .call_statefully(
+            .execute_statefully_and_wait(
                 &domain,
                 vec![
                     Value::Reference(Reference::new(reference.clone(), domain.clone())),
@@ -3888,7 +3909,7 @@ mod tests {
         };
         let destination = ArrayReference::new(array(&[5.0, 7.0]));
         compiled
-            .call_statefully(
+            .execute_statefully_and_wait(
                 &domain,
                 vec![
                     Value::Array(array(&[1.0, 2.0])),
@@ -3955,7 +3976,10 @@ mod tests {
             Array::from_host_buffer(&domain, referent_type, mesh, values_to_bytes(&[1f32, 2.0]).as_slice()).unwrap(),
         );
         compiled
-            .call_statefully(&domain, vec![Value::Reference(Reference::new(reference.clone(), domain.clone()))])
+            .execute_statefully_and_wait(
+                &domain,
+                vec![Value::Reference(Reference::new(reference.clone(), domain.clone()))],
+            )
             .unwrap();
         assert_eq!(read_sharded_f32_array(&reference.read().unwrap()), vec![2.0, 4.0, 2.0, 4.0]);
     }
@@ -3991,7 +4015,10 @@ mod tests {
             Array::from_host_buffer(&domain, cotangent_type, mesh, values_to_bytes(&[5f32, 7.0]).as_slice()).unwrap(),
         );
         compiled
-            .call_statefully(&domain, vec![Value::Reference(Reference::new(destination.clone(), domain.clone()))])
+            .execute_statefully_and_wait(
+                &domain,
+                vec![Value::Reference(Reference::new(destination.clone(), domain.clone()))],
+            )
             .unwrap();
         let destination = destination.read().unwrap();
         assert_eq!(read_sharded_f32_array(&destination), vec![10.0, 14.0, 0.0, 0.0]);
@@ -4083,7 +4110,7 @@ mod tests {
         )
         .unwrap();
         let Value::Array(output) = compiled
-            .call_statefully(
+            .execute_statefully_and_wait(
                 &domain,
                 (Value::Reference(Reference::new(reference.clone(), domain.clone())), Value::Array(update)),
             )
@@ -4189,7 +4216,7 @@ mod tests {
         )
         .unwrap();
         let Value::Array(output) = compiled
-            .call_statefully(
+            .execute_statefully_and_wait(
                 &domain,
                 (Value::Reference(Reference::new(reference.clone(), domain.clone())), Value::Array(update)),
             )
@@ -4251,7 +4278,10 @@ mod tests {
                 .unwrap(),
             );
             let Value::Array(output) = read
-                .call_statefully(&domain, Value::Reference(Reference::new(reference.clone(), domain.clone())))
+                .execute_statefully_and_wait(
+                    &domain,
+                    Value::Reference(Reference::new(reference.clone(), domain.clone())),
+                )
                 .unwrap()
             else {
                 panic!("stateful bounded-dynamic output must be an array")
@@ -4272,7 +4302,7 @@ mod tests {
         let array_type = ArrayType::scalar(DataType::F32)
             .with_sharding(Sharding::replicated(mesh.logical_mesh().clone(), 0))
             .unwrap();
-        let function = jitted_statefully::<_, (), (ArrayIrType, ArrayIrType), ArrayIrType>(
+        let function = jit_statefully::<_, (), (ArrayIrType, ArrayIrType), ArrayIrType>(
             |(), (reference, update): (StatefulCompileTracer<'_>, StatefulCompileTracer<'_>)| {
                 reference.add_update(&update)?;
                 Ok(reference.read()?)
@@ -4290,7 +4320,7 @@ mod tests {
                 Array::from_host_buffer(&domain, array_type.clone(), mesh.clone(), 2.0f32.to_ne_bytes().as_slice())
                     .unwrap();
             let output = function
-                .call_statefully(
+                .execute_statefully_and_wait(
                     (),
                     (Value::Reference(Reference::new(reference.clone(), domain.clone())), Value::Array(update)),
                 )
@@ -4330,7 +4360,7 @@ mod tests {
         )
         .unwrap();
         let update = Array::from_host_buffer(&domain, array_type, mesh, 2.0f32.to_ne_bytes().as_slice()).unwrap();
-        let output = compiled.call_statefully(&domain, Value::Array(update)).unwrap();
+        let output = compiled.execute_statefully_and_wait(&domain, Value::Array(update)).unwrap();
         let Value::Array(output) = output else { panic!("stateful public output must be an array") };
         assert_eq!(read_f32_array(&client, &output), vec![3.0]);
         assert_eq!(read_f32_array(&client, &reference.read().unwrap()), vec![3.0]);
@@ -4364,7 +4394,7 @@ mod tests {
         )
         .unwrap();
         let error = compiled
-            .call_statefully(&domain, Value::Reference(Reference::new(reference.clone(), domain.clone())))
+            .execute_statefully_and_wait(&domain, Value::Reference(Reference::new(reference.clone(), domain.clone())))
             .err();
         assert!(
             matches!(
@@ -4445,7 +4475,7 @@ mod tests {
         let update = Array::from_host_buffer(&domain, array_type, mesh, 2.0f32.to_ne_bytes().as_slice()).unwrap();
 
         let (higher_output, lower_output) = compiled
-            .call_statefully(
+            .execute_statefully_and_wait(
                 &domain,
                 (
                     Value::Reference(Reference::new(higher_reference.clone(), domain.clone())),
@@ -4518,7 +4548,7 @@ mod tests {
                 scope.spawn(move || {
                     start.wait();
                     finished
-                        .send(compiled.call_statefully(
+                        .send(compiled.execute_statefully_and_wait(
                             domain,
                             (
                                 Value::Reference(Reference::new(first, domain.clone())),
@@ -4579,13 +4609,13 @@ mod tests {
             .unwrap();
         let wrong_update =
             Array::from_host_buffer(&domain, wrong_update_type, mesh.clone(), 2.0f64.to_ne_bytes().as_slice()).unwrap();
-        let declared_update_type = <&ArrayType>::try_from(&compiled.executable_function().input_types()[3]).unwrap();
+        let declared_update_type = <&ArrayType>::try_from(&compiled.executable().input_types()[3]).unwrap();
         let expected_error = format!(
             "runtime input type {} does not refine declared type {declared_update_type}",
             wrong_update.r#type(),
         );
         assert!(matches!(
-            compiled.call_statefully(
+            compiled.execute_statefully_and_wait(
                 &domain,
                 (
                     Value::Reference(Reference::new(pre_handoff_first.clone(), domain.clone())),
@@ -4610,7 +4640,7 @@ mod tests {
                 .unwrap();
         inject_stateful_failure(StatefulFailureInjection::BeforeSubmission);
         assert!(matches!(
-            compiled.call_statefully(
+            compiled.execute_statefully_and_wait(
                 &domain,
                 (
                     Value::Reference(Reference::new(pre_submission_first.clone(), domain.clone())),
@@ -4636,7 +4666,7 @@ mod tests {
                 .unwrap();
         inject_stateful_failure(StatefulFailureInjection::AfterHandoff);
         assert!(matches!(
-            compiled.call_statefully(
+            compiled.execute_statefully_and_wait(
                 &domain,
                 (
                     Value::Reference(Reference::new(post_handoff_first.clone(), domain.clone())),
@@ -4670,7 +4700,7 @@ mod tests {
                 .unwrap();
         inject_stateful_failure(StatefulFailureInjection::BeforeHiddenReplacementCommit);
         assert!(matches!(
-            compiled.call_statefully(
+            compiled.execute_statefully_and_wait(
                 &domain,
                 (
                     Value::Reference(Reference::new(pre_commit_first.clone(), domain.clone())),
@@ -4700,7 +4730,7 @@ mod tests {
         let update = Array::from_host_buffer(&domain, array_type, mesh, 2.0f32.to_ne_bytes().as_slice()).unwrap();
         inject_stateful_failure(StatefulFailureInjection::BeforePublicReconstruction);
         assert!(matches!(
-            compiled.call_statefully(
+            compiled.execute_statefully_and_wait(
                 &domain,
                 (
                     Value::Reference(Reference::new(committed_first.clone(), domain.clone())),
@@ -4751,7 +4781,7 @@ mod tests {
         frozen.freeze().unwrap();
         let update = Array::from_host_buffer(&domain, array_type, mesh, 3.0f32.to_ne_bytes().as_slice()).unwrap();
         assert!(matches!(
-            compiled.call_statefully(
+            compiled.execute_statefully_and_wait(
                 &domain,
                 (
                     Value::Reference(Reference::new(first.clone(), domain.clone())),
@@ -4860,14 +4890,14 @@ mod tests {
             )
             .unwrap();
             let jacobian: Jacobian<ArrayType, Array<'_>, ArrayType, ArrayType> =
-                domain.interpret(&compiled.executable_function(), input).unwrap();
+                compiled.executable().execute(&domain, input).unwrap();
             assert_eq!(read_f32_array(&client, jacobian.iter_blocks().next().unwrap().value()), vec![expected]);
         }
 
         let input =
             Array::from_host_buffer(&domain, input_type, mesh, values_to_bytes::<f32>(&[3.0]).as_slice()).unwrap();
         let hessian: Hessian<ArrayType, Array<'_>, ArrayType, ArrayType> =
-            domain.interpret(&second.executable_function(), input).unwrap();
+            second.executable().execute(&domain, input).unwrap();
         assert_eq!(read_f32_array(&client, hessian.iter_blocks().next().unwrap().value()), vec![2.0]);
     }
 
@@ -4912,7 +4942,7 @@ mod tests {
             Array::from_host_buffer(&domain, vector_type, mesh, values_to_bytes::<f64>(&[1.0, 4.0]).as_slice())
                 .unwrap();
         let jacobian: Jacobian<ArrayType, Array<'_>, (ArrayType, ArrayType), ArrayType> =
-            domain.interpret(&forward.executable_function(), (scalar, vector)).unwrap();
+            forward.executable().execute(&domain, (scalar, vector)).unwrap();
         let blocks = jacobian.iter_blocks().collect::<Vec<_>>();
         assert_eq!(blocks.len(), 2);
         for (actual, expected) in read_f64_array(&client, blocks[0].value()).into_iter().zip([0.2, 0.2]) {
@@ -4938,12 +4968,12 @@ mod tests {
         let executable: ExecutableFunction<'_, ArrayType, ArrayType> =
             compile(|input| input.sin().unwrap(), input_type.clone(), &domain, mesh.clone())
                 .unwrap()
-                .into_executable_function();
+                .into_executable();
         let input =
             Array::from_host_buffer(&domain, input_type.clone(), mesh, values_to_bytes::<f32>(&[0.5]).as_slice())
                 .unwrap();
 
-        let output = domain.interpret(&executable, input).unwrap();
+        let output = executable.execute(&domain, input).unwrap();
 
         assert_eq!(executable.output_types(), &[input_type]);
         assert!((read_f32_array(&client, &output)[0] - 0.5_f32.sin()).abs() < 1e-5);
@@ -4968,23 +4998,23 @@ mod tests {
         let executable: ExecutableFunction<'_, ArrayType, ArrayType> =
             compile(|input| input.sin().unwrap(), input_type.clone(), &domain, mesh.clone())
                 .unwrap()
-                .into_executable_function();
+                .into_executable();
         let other_input_type = ArrayType::new(DataType::F32, Shape::new(vec![CoreDimension::Static(1)]))
             .with_sharding(Sharding::replicated(other_mesh.logical_mesh().clone(), 1))
             .unwrap();
         let other_executable: ExecutableFunction<'_, ArrayType, ArrayType> =
             compile(|input| input.sin().unwrap(), other_input_type, &other_domain, other_mesh)
                 .unwrap()
-                .into_executable_function();
+                .into_executable();
         let input =
             Array::from_host_buffer(&domain, input_type, mesh, values_to_bytes::<f32>(&[0.5]).as_slice()).unwrap();
 
         assert!(matches!(
-            other_domain.interpret(&executable, input.clone()),
+            executable.execute(&other_domain, input.clone()),
             Err(Error::Execution(ExecutionError::ClientMismatch)),
         ));
         assert!(matches!(
-            other_domain.interpret_async(&executable, input),
+            executable.execute_async(&other_domain, input),
             Err(Error::Execution(ExecutionError::ClientMismatch)),
         ));
         assert!(matches!(
@@ -5025,12 +5055,12 @@ mod tests {
         let executable: ExecutableFunction<'_, ArrayType, ArrayType> =
             compile(|input| input.sin().unwrap(), input_type.clone(), &domain, mesh.clone())
                 .unwrap()
-                .into_executable_function();
+                .into_executable();
         let input =
             Array::from_host_buffer(&domain, input_type, mesh, values_to_bytes::<f32>(&[0.5]).as_slice()).unwrap();
 
         let output =
-            std::thread::scope(|scope| scope.spawn(move || domain.interpret(&executable, input)).join().unwrap())
+            std::thread::scope(|scope| scope.spawn(move || executable.execute(&domain, input)).join().unwrap())
                 .unwrap();
         assert!((read_f32_array(&client, &output)[0] - 0.5_f32.sin()).abs() < 1e-5);
     }
@@ -5063,7 +5093,7 @@ mod tests {
             .unwrap();
         let mesh = single_device_mesh(&client);
         let domain = Session::new(&client).domain();
-        let function: JittedFunction<'_, _, bool, ArrayType, ArrayType> = jitted(
+        let function: CompiledFunctionDispatcher<'_, _, bool, ArrayType, ArrayType> = jit(
             |apply_sine, input: CompileTracer<'_>| Ok(if apply_sine { input.sin()? } else { input }),
             &domain,
             mesh.clone(),
@@ -5075,9 +5105,9 @@ mod tests {
         let source =
             Array::from_host_buffer(&domain, input_type, mesh, values_to_bytes::<f32>(&[0.5]).as_slice()).unwrap();
 
-        let sine = function.call(true, source.clone()).unwrap();
-        let warm_sine = function.call(true, source.clone()).unwrap();
-        let identity = function.call(false, source).unwrap();
+        let sine = function.execute(true, source.clone()).unwrap();
+        let warm_sine = function.execute(true, source.clone()).unwrap();
+        let identity = function.execute(false, source).unwrap();
         assert!((read_f32_array(&client, &sine)[0] - 0.5_f32.sin()).abs() < 1e-5);
         assert!((read_f32_array(&client, &warm_sine)[0] - 0.5_f32.sin()).abs() < 1e-5);
         assert!((read_f32_array(&client, &identity)[0] - 0.5).abs() < 1e-5);
@@ -5113,7 +5143,7 @@ mod tests {
             values_to_bytes::<f32>(&values).as_slice(),
         )
         .unwrap();
-        let output = engine.interpret(&compiled.executable_function(), source).unwrap();
+        let output = compiled.executable().execute(&engine, source).unwrap();
 
         let device_id = client.addressable_devices().unwrap()[0].id().unwrap();
         let shard_bytes = output
@@ -5156,7 +5186,7 @@ mod tests {
         let second =
             Array::from_host_buffer(&engine, input_type, mesh, values_to_bytes::<f32>(&other_values).as_slice())
                 .unwrap();
-        let (first, second) = engine.interpret(&variadic.executable_function(), (first, second)).unwrap();
+        let (first, second) = variadic.executable().execute(&engine, (first, second)).unwrap();
         assert_eq!(read_f32_array(&client, &first), values);
         assert_eq!(read_f32_array(&client, &second), other_values);
     }
@@ -5204,7 +5234,7 @@ mod tests {
             let to_host: CompiledFunction<'_, ArrayType, ArrayType> =
                 compile(|input| input.transfer_to_memory(memory).unwrap(), input_type.clone(), &engine, mesh.clone())
                     .unwrap();
-            let host = engine.interpret(&to_host.executable_function(), source.clone()).unwrap();
+            let host = to_host.executable().execute(&engine, source.clone()).unwrap();
             assert_eq!(host.r#type().as_ref(), &host_type);
             let buffer = host.device_shard(device_id).unwrap().buffer().unwrap();
             assert_eq!(buffer.memory().unwrap().kind().unwrap(), memory_kind);
@@ -5216,7 +5246,7 @@ mod tests {
             // Host placement survives an identity executable boundary, even without a transfer instruction.
             let identity: CompiledFunction<'_, ArrayType, ArrayType> =
                 compile(|input| input, host_type.clone(), &engine, mesh.clone()).unwrap();
-            let host = engine.interpret(&identity.executable_function(), host).unwrap();
+            let host = identity.executable().execute(&engine, host).unwrap();
             assert_eq!(host.r#type().as_ref(), &host_type);
             let buffer = host.device_shard(device_id).unwrap().buffer().unwrap();
             assert_eq!(buffer.memory().unwrap().kind().unwrap(), memory_kind);
@@ -5229,7 +5259,7 @@ mod tests {
             let to_device: CompiledFunction<'_, ArrayType, ArrayType> =
                 compile(|input| input.transfer_to_memory(Memory::Device).unwrap(), host_type, &engine, mesh.clone())
                     .unwrap();
-            let output = engine.interpret(&to_device.executable_function(), host).unwrap();
+            let output = to_device.executable().execute(&engine, host).unwrap();
             assert_eq!(output.r#type().as_ref(), &input_type);
             let buffer = output.device_shard(device_id).unwrap().buffer().unwrap();
             assert_eq!(buffer.memory().unwrap().kind().unwrap(), device_kind);
@@ -5245,7 +5275,7 @@ mod tests {
                 mesh.clone(),
             )
             .unwrap();
-            let output = engine.interpret(&round_trip.executable_function(), source).unwrap();
+            let output = round_trip.executable().execute(&engine, source).unwrap();
             assert_eq!(output.r#type().as_ref(), &input_type);
             let buffer = output.device_shard(device_id).unwrap().buffer().unwrap();
             assert_eq!(buffer.memory().unwrap().kind().unwrap(), device_kind);
@@ -5338,7 +5368,7 @@ mod tests {
         let teacher =
             Array::from_host_buffer(&domain, vector_type, mesh, &values_to_bytes(&[2.0f32, 1.0, 0.0])).unwrap();
         let (loss, hard_gradient, soft_gradient) =
-            domain.interpret(&compiled.executable_function(), (logits, labels, student, teacher)).unwrap();
+            compiled.executable().execute(&domain, (logits, labels, student, teacher)).unwrap();
 
         let tail = (-18.0f64).exp();
         let loss = read_f32_array(&client, &loss)[0] as f64;
@@ -5394,8 +5424,7 @@ mod tests {
         let values = [9.0f32, -9.0, 1.0, -9.0];
         let logits = Array::from_host_buffer(&engine, logits_type, mesh.clone(), &values_to_bytes(&values)).unwrap();
         let labels = Array::from_host_buffer(&engine, label_type, mesh, &values_to_bytes(&[2i32])).unwrap();
-        let (probabilities, loss, gradient) =
-            engine.interpret(&compiled.executable_function(), (logits, labels)).unwrap();
+        let (probabilities, loss, gradient) = compiled.executable().execute(&engine, (logits, labels)).unwrap();
         assert_eq!(probabilities.sharding(), &sharding);
         assert_eq!(gradient.sharding(), &sharding);
         let read_shards = |array: &Array<'_>| {
@@ -5429,7 +5458,7 @@ mod tests {
     }
 
     #[test]
-    fn test_interpret_async_retains_zero_output_completion() {
+    fn test_executable_function_execute_async_retains_zero_output_completion() {
         let plugin = load_cpu_plugin().unwrap();
         let client = plugin
             .client(ClientOptions::CPU(CpuClientOptions { device_count: Some(1), ..Default::default() }))
@@ -5445,7 +5474,7 @@ mod tests {
         let input =
             Array::from_host_buffer(&engine, input_type, mesh, values_to_bytes::<f32>(&[1.0]).as_slice()).unwrap();
 
-        let execution = engine.interpret_async(&compiled.executable_function(), input).unwrap();
+        let execution = compiled.executable().execute_async(&engine, input).unwrap();
         assert_eq!(execution.output(), &());
         execution.fence().block_until_ready().unwrap();
         execution.block_until_ready().unwrap();
@@ -5507,7 +5536,7 @@ mod tests {
             values_to_bytes::<f32>(&values).as_slice(),
         )
         .unwrap();
-        let output = engine.interpret(&outer.executable_function(), source).unwrap();
+        let output = outer.executable().execute(&engine, source).unwrap();
 
         let device_id = client.addressable_devices().unwrap()[0].id().unwrap();
         let shard_bytes = output
@@ -5565,7 +5594,7 @@ mod tests {
             values_to_bytes::<f32>(&[1.0, 2.0, 3.0, 4.0]).as_slice(),
         )
         .unwrap();
-        let output = engine.interpret(&compiled.executable_function(), input).unwrap();
+        let output = compiled.executable().execute(&engine, input).unwrap();
 
         assert_eq!(read_f32_array(&client, &output), vec![3.0, 4.0, 5.0, 6.0]);
     }
@@ -5592,7 +5621,7 @@ mod tests {
         .unwrap();
         let input = Array::from_host_buffer(&engine, input_type, mesh, values_to_bytes::<f32>(&[1.0])).unwrap();
 
-        let output = engine.interpret(&compiled.executable_function(), input).unwrap();
+        let output = compiled.executable().execute(&engine, input).unwrap();
 
         assert_eq!(output.r#type().as_ref(), &zero_type);
         assert!(output.addressable_shards().next().unwrap().buffer().is_none());
@@ -5638,7 +5667,7 @@ mod tests {
             values_to_bytes::<f32>(&[1.0, 2.0, 3.0, 4.0]).as_slice(),
         )
         .unwrap();
-        let output = engine.interpret(&outer.executable_function(), input).unwrap();
+        let output = outer.executable().execute(&engine, input).unwrap();
         let observed = read_f32_array(&client, &output);
         for (got, expected) in observed.iter().zip([3.0f32.sin(), 4.0f32.sin(), 5.0f32.sin(), 6.0f32.sin()]) {
             assert!((got - expected).abs() < 1e-5, "got {got}, expected ~{expected}");
@@ -5704,7 +5733,7 @@ mod tests {
             values_to_bytes::<f32>(&[1.0, 2.0, 3.0, 4.0]).as_slice(),
         )
         .unwrap();
-        let output = engine.interpret(&outer.executable_function(), input).unwrap();
+        let output = outer.executable().execute(&engine, input).unwrap();
         let observed = read_f32_array(&client, &output);
         for (got, expected) in observed.iter().zip([14.0, 16.0, 18.0, 20.0]) {
             assert!((got - expected).abs() < 1e-5, "got {got}, expected ~{expected}");
@@ -5752,8 +5781,7 @@ mod tests {
         let tangent =
             Array::from_host_buffer(&engine, input_type, mesh.clone(), values_to_bytes::<f32>(&[4.0]).as_slice())
                 .unwrap();
-        let (primal_output, tangent_output) =
-            engine.interpret(&jvp_compiled.executable_function(), (primal, tangent)).unwrap();
+        let (primal_output, tangent_output) = jvp_compiled.executable().execute(&engine, (primal, tangent)).unwrap();
 
         assert_eq!(read_f32_array(&client, &primal_output), vec![5.0]);
         assert_eq!(read_f32_array(&client, &tangent_output), vec![4.0]);
@@ -5790,7 +5818,7 @@ mod tests {
         .unwrap();
         let live =
             Array::from_host_buffer(&engine, scalar_type, mesh, values_to_bytes::<f32>(&[7.0]).as_slice()).unwrap();
-        let (zero, one) = engine.interpret(&gradient.executable_function(), (disconnected, live)).unwrap();
+        let (zero, one) = gradient.executable().execute(&engine, (disconnected, live)).unwrap();
         assert_eq!(read_f32_array(&client, &zero), vec![0.0; 3]);
         assert_eq!(read_f32_array(&client, &one), vec![1.0]);
     }
@@ -5890,7 +5918,7 @@ mod tests {
                 values_to_bytes::<f32>(&[value]).as_slice(),
             )
             .unwrap();
-            let (zero, derivative) = engine.interpret(&gradient.executable_function(), (dead.clone(), live)).unwrap();
+            let (zero, derivative) = gradient.executable().execute(&engine, (dead.clone(), live)).unwrap();
             assert_eq!(read_f32_array(&client, &zero), vec![0.0; 3]);
             assert_eq!(read_f32_array(&client, &derivative), vec![expected_derivative]);
         }
@@ -5995,7 +6023,7 @@ mod tests {
         .unwrap();
         let initial =
             Array::from_host_buffer(&engine, scalar_type, mesh, values_to_bytes::<f32>(&[7.0]).as_slice()).unwrap();
-        let (zero, derivative) = engine.interpret(&gradient.executable_function(), (elements, initial)).unwrap();
+        let (zero, derivative) = gradient.executable().execute(&engine, (elements, initial)).unwrap();
         assert_eq!(read_f32_array(&client, &zero), vec![0.0; 3]);
         assert_eq!(read_f32_array(&client, &derivative), vec![8.0]);
     }
@@ -6075,16 +6103,16 @@ mod tests {
         };
         let x = array(&concrete_type, &[2.0, 3.0, 4.0]);
         let s = array(&scalar_type, &[3.0]);
-        let (x_gradient, s_gradient) =
-            engine.interpret(&gradient.executable_function(), (x.clone(), s.clone())).unwrap();
+        let (x_gradient, s_gradient) = gradient.executable().execute(&engine, (x.clone(), s.clone())).unwrap();
         assert_eq!(read_f32_array(&client, &x_gradient), vec![0.0; 3]);
         assert_eq!(read_f32_array(&client, &s_gradient), vec![6.0]);
 
         // Forward over reverse: the tangent of the gradient `(0, 2s)` along `(ẋ, ṡ)` is `(0, 2ṡ)`.
         let forward_over_reverse = gradient.jvp(&engine).unwrap();
-        let ((x_gradient, s_gradient), (x_gradient_tangent, s_gradient_tangent)) = engine
-            .interpret(
-                &forward_over_reverse.executable_function(),
+        let ((x_gradient, s_gradient), (x_gradient_tangent, s_gradient_tangent)) = forward_over_reverse
+            .executable()
+            .execute(
+                &engine,
                 ((x.clone(), s.clone()), (array(&concrete_type, &[1.0, 1.0, 1.0]), array(&scalar_type, &[1.0]))),
             )
             .unwrap();
@@ -6097,7 +6125,7 @@ mod tests {
         let s_derivative: CompiledFunction<'_, (ArrayType, ArrayType), ArrayType> =
             compile(move |inputs| gradient.call(inputs).unwrap().1, input_types, &engine, mesh.clone()).unwrap();
         let reverse_over_reverse = s_derivative.gradient(&engine).unwrap();
-        let (x_second, s_second) = engine.interpret(&reverse_over_reverse.executable_function(), (x, s)).unwrap();
+        let (x_second, s_second) = reverse_over_reverse.executable().execute(&engine, (x, s)).unwrap();
         assert_eq!(read_f32_array(&client, &x_second), vec![0.0; 3]);
         assert_eq!(read_f32_array(&client, &s_second), vec![2.0]);
     }
@@ -6134,7 +6162,7 @@ mod tests {
 
         let input =
             Array::from_host_buffer(&engine, input_type, mesh, values_to_bytes::<f32>(&[3.0]).as_slice()).unwrap();
-        let output = engine.interpret(&gradient.executable_function(), input).unwrap();
+        let output = gradient.executable().execute(&engine, input).unwrap();
 
         assert_eq!(read_f32_array(&client, &output), vec![2.0]);
     }
@@ -6193,7 +6221,7 @@ mod tests {
         expected_gradient *= expected_value.cos();
         let input =
             Array::from_host_buffer(&engine, input_type, mesh, values_to_bytes::<f32>(&[0.5]).as_slice()).unwrap();
-        let output = engine.interpret(&gradient.executable_function(), input).unwrap();
+        let output = gradient.executable().execute(&engine, input).unwrap();
         assert!((read_f32_array(&client, &output)[0] as f64 - expected_gradient).abs() < 1e-3);
     }
 
@@ -6232,7 +6260,7 @@ mod tests {
                 values_to_bytes::<f32>([point].as_slice()).as_slice(),
             )
             .unwrap();
-            let output = engine.interpret(&second.executable_function(), input).unwrap();
+            let output = second.executable().execute(&engine, input).unwrap();
             assert_eq!(read_f32_array(&client, &output), vec![2.0 * point]);
         }
 
@@ -6280,8 +6308,7 @@ mod tests {
         .unwrap();
         let tangent =
             Array::from_host_buffer(&engine, input_type, mesh, values_to_bytes::<f32>(&[4.0]).as_slice()).unwrap();
-        let (primal_output, tangent_output) =
-            engine.interpret(&second.executable_function(), (primal, tangent)).unwrap();
+        let (primal_output, tangent_output) = second.executable().execute(&engine, (primal, tangent)).unwrap();
         assert_eq!(read_f32_array(&client, &primal_output), vec![9.0]);
         assert_eq!(read_f32_array(&client, &tangent_output), vec![24.0]);
     }
@@ -6352,8 +6379,7 @@ mod tests {
         let tangent =
             Array::from_host_buffer(&engine, input_type, mesh.clone(), values_to_bytes::<f32>(&[4.0]).as_slice())
                 .unwrap();
-        let (primal_output, tangent_output) =
-            engine.interpret(&jvp_compiled.executable_function(), (primal, tangent)).unwrap();
+        let (primal_output, tangent_output) = jvp_compiled.executable().execute(&engine, (primal, tangent)).unwrap();
 
         assert_eq!(read_f32_array(&client, &primal_output), vec![5.0]);
         assert_eq!(read_f32_array(&client, &tangent_output), vec![4.0]);
@@ -6414,7 +6440,7 @@ mod tests {
             )
             .unwrap();
             let (primal_out, tangent_out) =
-                engine.interpret(&jvp_compiled.executable_function(), (primal_array, tangent_array)).unwrap();
+                jvp_compiled.executable().execute(&engine, (primal_array, tangent_array)).unwrap();
             let device_id = client.addressable_devices().unwrap()[0].id().unwrap();
             let primal_observed = {
                 let shard_bytes = primal_out
@@ -6473,14 +6499,13 @@ mod tests {
 
         let primal_input = Array::from_host_buffer(&engine, primal_type.clone(), mesh.clone(), [1u8]).unwrap();
         let tangent_input = Array::from_host_buffer(&engine, tangent_type.clone(), mesh, []).unwrap();
-        let (primal_output, tangent_output) =
-            engine.interpret(&jvp.executable_function(), (primal_input, tangent_input)).unwrap();
+        let (primal_output, tangent_output) = jvp.executable().execute(&engine, (primal_input, tangent_input)).unwrap();
 
         assert_eq!(primal_output.r#type().as_ref(), &primal_type);
         assert_eq!(tangent_output.r#type().as_ref(), &tangent_type);
         assert!(tangent_output.addressable_shards().next().unwrap().buffer().is_none());
 
-        let chained_tangent = engine.interpret(&zero_identity.executable_function(), tangent_output).unwrap();
+        let chained_tangent = zero_identity.executable().execute(&engine, tangent_output).unwrap();
         assert_eq!(chained_tangent.r#type().as_ref(), &tangent_type);
         assert!(chained_tangent.addressable_shards().next().unwrap().buffer().is_none());
     }
@@ -6625,9 +6650,8 @@ mod tests {
                 values_to_bytes::<f32>([tangent].as_slice()).as_slice(),
             )
             .unwrap();
-            let (jvp_primal, jvp_tangent) = engine
-                .interpret(&jvp_compiled.executable_function(), (primal_array.clone(), tangent_array.clone()))
-                .unwrap();
+            let (jvp_primal, jvp_tangent) =
+                jvp_compiled.executable().execute(&engine, (primal_array.clone(), tangent_array.clone())).unwrap();
             let jvp_primal_value = read_f32_array(&client, &jvp_primal)[0];
             let jvp_tangent_value = read_f32_array(&client, &jvp_tangent)[0];
             let expected_primal = primal.sin();
@@ -6696,7 +6720,7 @@ mod tests {
         let b =
             Array::from_host_buffer(&engine, input_type, mesh.clone(), values_to_bytes::<f32>(&b_values).as_slice())
                 .unwrap();
-        let output = engine.interpret(&compiled.executable_function(), (a, b)).unwrap();
+        let output = compiled.executable().execute(&engine, (a, b)).unwrap();
 
         let device_id = client.addressable_devices().unwrap()[0].id().unwrap();
         let shard_bytes = output
@@ -6773,7 +6797,7 @@ mod tests {
         let source =
             Array::from_host_buffer(&engine, input_type, mesh.clone(), values_to_bytes::<f32>(&values).as_slice())
                 .unwrap();
-        let output = engine.interpret(&compiled.executable_function(), source).unwrap();
+        let output = compiled.executable().execute(&engine, source).unwrap();
 
         // The output remains independently readable after the donating call returns. Donation
         // is opaque from the host side — PJRT may reuse the input's device buffer for the
@@ -6878,7 +6902,7 @@ mod tests {
         let source =
             Array::from_host_buffer(&engine, input_type, mesh.clone(), values_to_bytes::<f32>(&values).as_slice())
                 .unwrap();
-        let output = engine.interpret(&compiled.executable_function(), source).unwrap();
+        let output = compiled.executable().execute(&engine, source).unwrap();
 
         // Reassemble values from both shards in device order.
         let mut observed: Vec<f32> = Vec::with_capacity(values.len());
@@ -6947,7 +6971,7 @@ mod tests {
         let source =
             Array::from_host_buffer(&engine, input_type, mesh.clone(), values_to_bytes::<f32>(&values).as_slice())
                 .unwrap();
-        let output = engine.interpret(&compiled.executable_function(), source).unwrap();
+        let output = compiled.executable().execute(&engine, source).unwrap();
         assert_eq!(output.sharding(), &sharded);
 
         let mut observed: Vec<f32> = Vec::with_capacity(values.len());
@@ -6998,7 +7022,7 @@ mod tests {
         .unwrap();
         // Calling with a replicated source against a sharded-expecting executable would error
         // without implicit reshard. With reshard it should succeed and produce correct output.
-        let output = engine.interpret(&compiled.executable_function(), source).unwrap();
+        let output = compiled.executable().execute(&engine, source).unwrap();
         assert_eq!(output.sharding(), &sharded);
 
         let mut observed: Vec<f32> = Vec::with_capacity(values.len());
@@ -7095,7 +7119,7 @@ mod tests {
         let source =
             Array::from_host_buffer(&engine, input_type, mesh.clone(), values_to_bytes::<f32>(&values).as_slice())
                 .unwrap();
-        let output = engine.interpret(&compiled.executable_function(), source).unwrap();
+        let output = compiled.executable().execute(&engine, source).unwrap();
         assert_eq!(output.sharding(), &sharded);
 
         let mut observed: Vec<f32> = Vec::with_capacity(values.len());
@@ -7171,7 +7195,7 @@ mod tests {
         let source =
             Array::from_host_buffer(&engine, input_type, mesh.clone(), values_to_bytes::<f32>(&values).as_slice())
                 .unwrap();
-        let output = engine.interpret(&compiled.executable_function(), source).unwrap();
+        let output = compiled.executable().execute(&engine, source).unwrap();
 
         // Final output is replicated (last constraint) — every device sees the full vector.
         let device_id = client.addressable_devices().unwrap()[0].id().unwrap();
@@ -7226,9 +7250,8 @@ mod tests {
             .unwrap()
         };
         let staged_output =
-            read_f32_array(&client, &engine.interpret(&staged_compiled.executable_function(), make_input()).unwrap());
-        let direct_output =
-            read_f32_array(&client, &engine.interpret(&direct.executable_function(), make_input()).unwrap());
+            read_f32_array(&client, &staged_compiled.executable().execute(&engine, make_input()).unwrap());
+        let direct_output = read_f32_array(&client, &direct.executable().execute(&engine, make_input()).unwrap());
         assert_eq!(staged_output, direct_output);
         assert!((staged_output[0] - input_value.sin()).abs() < 1e-6);
     }
@@ -7275,7 +7298,7 @@ mod tests {
             values_to_bytes::<f32>([input_value].as_slice()).as_slice(),
         )
         .unwrap();
-        let observed = read_f32_array(&client, &engine.interpret(&outer.executable_function(), input).unwrap());
+        let observed = read_f32_array(&client, &outer.executable().execute(&engine, input).unwrap());
         assert_eq!(observed.len(), 1);
         let expected = (input_value + 0.25).sin().cos();
         assert!((observed[0] - expected).abs() < 1e-5, "expected cos(sin(x + bias)) = {expected}, got {}", observed[0]);
@@ -7337,7 +7360,7 @@ mod tests {
                 values_to_bytes::<f32>([point].as_slice()).as_slice(),
             )
             .unwrap();
-            let observed = read_f32_array(&client, &engine.interpret(&outer.executable_function(), input).unwrap());
+            let observed = read_f32_array(&client, &outer.executable().execute(&engine, input).unwrap());
             assert_eq!(observed.len(), 1);
             let expected = 2.0 * point.sin();
             assert!((observed[0] - expected).abs() < 1e-5, "expected 2*sin({point}) = {expected}, got {}", observed[0]);
@@ -7451,7 +7474,7 @@ mod tests {
         print_baseline_compilation_statistics(&domain);
     }
 
-    /// Phase 0 caching-plan composition baseline: a jitted closure that internally runs an eager reverse-mode
+    /// Phase 0 caching-plan composition baseline: a retained JIT dispatcher closure that internally runs an eager reverse-mode
     /// gradient. The JIT boundary stages the eager transform exactly once per specialization, so repeated calls with
     /// same-shaped inputs are served entirely by retained dispatch. The recorded counters are the reference point the
     /// caching redesign must preserve, and they also show whether the current trace and lowering fallback tiers ever
@@ -7469,7 +7492,7 @@ mod tests {
         let input_type = ArrayType::scalar(DataType::F32)
             .with_sharding(Sharding::replicated(mesh.logical_mesh().clone(), 0))
             .unwrap();
-        let function: JittedFunction<'_, _, (), ArrayType, ArrayType> = jitted(
+        let function: CompiledFunctionDispatcher<'_, _, (), ArrayType, ArrayType> = jit(
             |_, input: CompileTracer<'_>| {
                 Ok(input.domain().differentiate_at(input).gradient(|value| Mul::mul(&value, &value))?)
             },
@@ -7488,7 +7511,7 @@ mod tests {
             )
             .unwrap();
             let start = Instant::now();
-            let output = function.call((), input).unwrap();
+            let output = function.execute((), input).unwrap();
             durations.push(start.elapsed());
             assert_eq!(read_f32_array(&client, &output), vec![2.0 * index as f32]);
         }
@@ -8201,7 +8224,7 @@ mod tests {
         ];
         device_inputs
             .extend(weights.iter().enumerate().map(|(index, values)| device_input(index + 6, values_to_bytes(values))));
-        let outputs = engine.interpret(&compiled.executable_function(), device_inputs).unwrap();
+        let outputs = compiled.executable().execute(&engine, device_inputs).unwrap();
         assert_eq!(outputs.len(), 3);
         let device_tokens = read_i32_array(&client, &outputs[0]);
         let device_cache_keys = read_f32_array(&client, &outputs[1]);

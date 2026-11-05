@@ -137,10 +137,10 @@ fn try_same_mesh<'o>(
         ragged_dot_lowering_strategy: Default::default(),
     };
 
-    let staged: crate::jit::StagedFunction<'_, ArrayType, ArrayType> =
-        crate::jit::stage(|input| input, bare_input_type, options)?;
+    let staged: crate::StagedFunction<'_, ArrayType, ArrayType> =
+        crate::stage(|input| input, bare_input_type, options)?;
     let compiled = engine.compile_staged_function(staged)?;
-    engine.interpret(&compiled.executable_function(), source.clone())
+    compiled.executable().execute(&engine, source.clone())
 }
 
 /// Broadcasts a fully-replicated `source` onto every device in `dst_mesh` via intra-host D2D

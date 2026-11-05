@@ -8,9 +8,9 @@
 //! # Sessions and Domains
 //!
 //! A [`Session`] borrows one PJRT [`Client`] and owns its compilation cache, default effect scope, and kernel runtime
-//! resources. Create a session with [`Session::new`] or one of its cache-configuring constructors, then obtain a
-//! domain through [`Session::domain`]. Domains derived from the same session share those resources. Creating another
-//! session gives an independent cache and effect scope, even when it borrows the same client.
+//! resources. Create a session with [`Session::new`] or one of its cache-configuring constructors, then obtain a domain
+//! through [`Session::domain`]. Domains derived from the same session share those resources. Creating another session
+//! gives an independent cache and effect scope, even when it borrows the same client.
 //!
 //! [`Options`] supplies the execution [`DeviceMesh`], sharding overrides, donation flags, and backend compilation
 //! policies for a staged function. The domain's [`CompilationOptions`] supplies the underlying PJRT compiler settings.
@@ -18,14 +18,14 @@
 //!
 //! # Compilation and Execution
 //!
-//! Use [`compile`](crate::compile) for a compiled function or [`jitted`](crate::jitted) for a retained dispatcher that
+//! Use [`compile`](crate::compile) for a compiled function or [`jit`](crate::jit) for a retained dispatcher that
 //! specializes on its runtime inputs. The backend also implements the generic lifecycle in
 //! [`ryft_core::compilation`]. When staging directly through [`ryft_core::StagedFunction::stage`], apply
 //! [`with_input_shardings`] to the input types first if the options specify input sharding overrides.
 //!
 //! [`LoweredProgram`] contains StableHLO and the metadata needed for compilation. [`CompiledProgram`] contains the
 //! loaded executable and its invocation contract. These flat artifacts are distinct from the typed function handles
-//! in [`crate::jit`], which also retain input and output container structures. The session's [`CompilationContext`]
+//! in [`crate::compilation`], which also retain input and output container structures. The session's [`CompilationContext`]
 //! coordinates artifact reuse, and [`CompilationKey`] records the exact computation and compilation configuration.
 //! [`CompilationAnalysis`] and [`OptimizedProgram`] expose compiler diagnostics for a compiled program.
 //!

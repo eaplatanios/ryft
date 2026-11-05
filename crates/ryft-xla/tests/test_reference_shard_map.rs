@@ -143,7 +143,7 @@ fn test_batched_shard_map_mutates_mapped_reference_items_on_cpu() {
     );
     let update = Array::from_host_buffer(&domain, batched_type, mesh, to_bytes(&update_values)).unwrap();
     let Value::Array(output) = compiled
-        .call_statefully(
+        .execute_statefully_and_wait(
             &domain,
             (Value::Reference(Reference::new(reference.clone(), domain.clone())), Value::Array(update)),
         )
