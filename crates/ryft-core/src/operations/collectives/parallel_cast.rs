@@ -465,12 +465,18 @@ impl<
         // replicated placement on the axis's mesh first when its type carries no sharding, exactly as `parallel_vary`
         // does.
         let context = self.domain();
-        let Some(NamedAxis::Mesh { mesh, size: 1.., checks_manual_variation, .. }) = context.named_axis(axis_name)
-        else {
-            return Err(TypeError::invalid(format!(
-                "`{PARALLEL_CAST_OPERATION_NAME}` requires an active non-empty manual mesh axis `{axis_name}`",
-            ))
-            .into());
+        let (mesh, checks_manual_variation) = match context.named_axis(axis_name) {
+            Some(NamedAxis::Mesh { mesh, size: 1.., checks_manual_variation, .. })
+                if mesh.axis_type(axis_name) == Some(MeshAxisType::Manual) =>
+            {
+                (mesh, checks_manual_variation)
+            }
+            _ => {
+                return Err(TypeError::invalid(format!(
+                    "`{PARALLEL_CAST_OPERATION_NAME}` requires an active non-empty manual mesh axis `{axis_name}`",
+                ))
+                .into());
+            }
         };
         let input_type = self.r#type().into_owned();
         if input_type.sharding().is_some_and(|sharding| sharding.mesh() != &mesh) {
