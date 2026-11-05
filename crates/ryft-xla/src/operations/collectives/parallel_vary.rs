@@ -1,8 +1,7 @@
 use ryft_core::macros::check_count;
-use ryft_core::{ArrayType, ParallelVaryOperation};
+use ryft_core::{ArrayType, Operation as CoreOperation, ParallelVaryOperation, ProgramError};
 use ryft_mlir::ValueRef;
 
-use crate::operations::collectives::mesh_axis_replica_groups;
 use crate::{Error, LowerableOperation, LowerableOperationFamily, Lowerer};
 
 impl LowerableOperation for ParallelVaryOperation {
@@ -10,13 +9,23 @@ impl LowerableOperation for ParallelVaryOperation {
         &self,
         lowerer: &mut Lowerer<'b, 'c, 't, O>,
         input_values: &[ValueRef<'b, 'c, 't>],
-        _input_types: &[ArrayType],
+        input_types: &[ArrayType],
         output_types: &[ArrayType],
     ) -> Result<Vec<ValueRef<'b, 'c, 't>>, Error> {
         check_count!("input", input_values, 1, ProgramError);
         check_count!("output", output_types, 1, ProgramError);
-        // The forward map only weakens invariance. Resolve its axis even though it emits no communication.
-        mesh_axis_replica_groups(&lowerer.collective_state, self.axis_name())?;
+        // Weakening invariance emits no communication, but its sum adjoint belongs to a checked physical binding.
+        // Inference guarantees this input mesh and axis exist before the owning binder is checked.
+        let inferred = self.infer_output_types(input_types, &[]).map_err(ProgramError::from)?;
+        let mesh = input_types[0].sharding().unwrap().mesh();
+        lowerer.collective_state.check_manual_collective(
+            self.name(),
+            self.axis_name(),
+            mesh.axis_size(self.axis_name()).unwrap(),
+            Some(mesh),
+            output_types,
+            |_| Ok(inferred),
+        )?;
         Ok(vec![input_values[0]])
     }
 }

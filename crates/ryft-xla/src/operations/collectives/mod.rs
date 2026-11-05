@@ -191,8 +191,9 @@ pub(crate) fn refine_collective_result_dimensions<'b, 'c: 'b, 't: 'c>(
 mod tests {
     use pretty_assertions::assert_eq;
     use ryft_core::{
-        Array as CoreArray, ArrayOperation, DataType, DimensionBounds, DimensionType, ParallelAllToAllOperation,
-        ParallelPermuteOperation, Shape, ShardMapBoundary, Sharding,
+        Array as CoreArray, ArrayOperation, DataType, DimensionBounds, DimensionType, LogicalMesh, MeshAxis,
+        MeshAxisType, Operation as CoreOperation, ParallelAllToAllOperation, ParallelCastOperation, ParallelCastTarget,
+        ParallelPermuteOperation, ParallelVaryOperation, Shape, ShardMapBoundary, Sharding,
     };
     use ryft_mlir::{Block, Location, Value as MlirValue};
 
@@ -202,6 +203,146 @@ mod tests {
     use crate::{LowerableOperation, Lowerer, MemberLowerableOperation};
 
     use super::*;
+
+    /// Lowers a local state cast and verifies that it remains the identity on the input SSA value without allocating
+    /// a collective channel or emitting a new instruction.
+    fn lower_state_cast(
+        operation: &ArrayOperation<CoreArray>,
+        state: CollectiveLoweringState,
+        input_type: ArrayType,
+        output_types: &[ArrayType],
+    ) -> Result<(), Error> {
+        let context = MlirContext::new();
+        let location = context.unknown_location();
+        let tensor_type = lower_tensor_type(&input_type, &context, location)?;
+        let block = context.block(&[(tensor_type, location)]);
+        let input = block.argument(0).unwrap().as_ref();
+        let mut lowerer: Lowerer<'_, '_, '_, Operation> =
+            Lowerer::new(block.as_ref(), &context, location.as_ref()).with_collective_state(state.clone());
+        let result = operation.lower(&mut lowerer, &[input], &[input_type], output_types);
+        assert_eq!(state.channel_ids.get(), 1);
+        assert!(block.operations()?.collect::<Result<Vec<_>, _>>()?.is_empty());
+        let outputs = result?;
+        assert_eq!(outputs, vec![input]);
+        Ok(())
+    }
+
+    #[test]
+    fn test_manual_state_cast_lowering_revalidates_bindings() {
+        let mesh = test_manual_mesh("x", 2);
+        let replicated = Sharding::replicated(mesh.clone(), 1);
+        let checked = ShardMapBoundary::new(mesh.clone(), Vec::new(), Vec::new(), Vec::new()).unwrap();
+        for (operation, input_sharding) in [
+            (
+                ArrayOperation::<CoreArray>::ParallelVary(ParallelVaryOperation::new("x".to_string())),
+                replicated.clone(),
+            ),
+            (
+                ArrayOperation::ParallelCast(ParallelCastOperation::new("x".to_string(), ParallelCastTarget::Reduced)),
+                replicated.clone(),
+            ),
+            (
+                ArrayOperation::ParallelCast(ParallelCastOperation::new("x".to_string(), ParallelCastTarget::Varying)),
+                replicated.clone().with_reduced_axes(["x"]).unwrap(),
+            ),
+            (
+                ArrayOperation::ParallelCast(ParallelCastOperation::new(
+                    "x".to_string(),
+                    ParallelCastTarget::Unreduced,
+                )),
+                replicated.clone().with_varying_manual_axes(["x"]).unwrap(),
+            ),
+        ] {
+            let input_type = test_vector_type(2).with_sharding(input_sharding).unwrap();
+            let output_types = operation.infer_output_types(std::slice::from_ref(&input_type), &[]).unwrap();
+            let state = CollectiveLoweringState::new().enter_manual_region(checked.clone());
+            lower_state_cast(&operation, state, input_type.clone(), &output_types).unwrap();
+
+            // A raw cast is tracked even though its payload carries no mesh. An unchecked frontend would omit it.
+            let state =
+                CollectiveLoweringState::new().enter_manual_region(checked.clone().with_check_manual_variation(false));
+            assert!(matches!(
+                lower_state_cast(&operation, state, input_type.clone(), &output_types),
+                Err(Error::Core(ryft_core::Error::Program(ProgramError::MalformedProgram(message))))
+                    if message == format!(
+                        "`{}` cannot use tracked mesh metadata inside an unchecked manual binding", operation.name(),
+                    ),
+            ));
+
+            let state = CollectiveLoweringState::new().enter_manual_region(checked.clone());
+            assert!(matches!(
+                lower_state_cast(&operation, state, input_type.clone(), &[input_type.clone()]),
+                Err(Error::Core(ryft_core::Error::Program(ProgramError::MalformedProgram(message))))
+                    if message == format!(
+                        "`{}` output types do not match the enclosing manual mesh contract", operation.name(),
+                    ),
+            ));
+
+            // The input's mesh participates in the binding contract even when the axis has the same size.
+            let foreign_mesh = LogicalMesh::new(vec![
+                MeshAxis::new("x", 2, MeshAxisType::Manual).unwrap(),
+                MeshAxis::new("y", 2, MeshAxisType::Manual).unwrap(),
+            ])
+            .unwrap();
+            let foreign = ShardMapBoundary::new(foreign_mesh, Vec::new(), Vec::new(), vec!["x".to_string()]).unwrap();
+            let state = CollectiveLoweringState::new().enter_manual_region(foreign);
+            assert!(matches!(
+                lower_state_cast(&operation, state, input_type.clone(), &output_types),
+                Err(Error::Core(ryft_core::Error::Program(ProgramError::MalformedProgram(message))))
+                    if message == format!(
+                        "`{}` operation mesh does not match the enclosing manual axis `x` mesh", operation.name(),
+                    ),
+            ));
+
+            let state = CollectiveLoweringState::new();
+            assert!(matches!(
+                lower_state_cast(&operation, state, input_type, &output_types),
+                Err(Error::Core(ryft_core::Error::Program(ProgramError::UnsupportedOperation { message })))
+                    if message == "collective over axis `x` can only be lowered inside a shard_map manual region",
+            ));
+        }
+    }
+
+    #[test]
+    fn test_manual_state_cast_lowering_uses_owning_binding() {
+        let mesh = LogicalMesh::new(vec![
+            MeshAxis::new("x", 2, MeshAxisType::Manual).unwrap(),
+            MeshAxis::new("y", 2, MeshAxisType::Manual).unwrap(),
+        ])
+        .unwrap();
+        let outer = ShardMapBoundary::new(mesh.clone(), Vec::new(), Vec::new(), vec!["x".to_string()]).unwrap();
+        let inner = ShardMapBoundary::new(mesh.clone(), Vec::new(), Vec::new(), vec!["y".to_string()]).unwrap();
+        let input_type = test_vector_type(2).with_sharding(Sharding::replicated(mesh, 1)).unwrap();
+        for operation in [
+            ArrayOperation::<CoreArray>::ParallelVary(ParallelVaryOperation::new("x".to_string())),
+            ArrayOperation::ParallelCast(ParallelCastOperation::new("x".to_string(), ParallelCastTarget::Reduced)),
+        ] {
+            let output_types = operation.infer_output_types(std::slice::from_ref(&input_type), &[]).unwrap();
+            let state = CollectiveLoweringState::new()
+                .enter_manual_region(outer.clone())
+                .enter_manual_region(inner.clone().with_check_manual_variation(false));
+            lower_state_cast(&operation, state, input_type.clone(), &output_types).unwrap();
+
+            let state = CollectiveLoweringState::new()
+                .enter_manual_region(outer.clone().with_check_manual_variation(false))
+                .enter_manual_region(inner.clone());
+            assert!(matches!(
+                lower_state_cast(&operation, state, input_type.clone(), &output_types),
+                Err(Error::Core(ryft_core::Error::Program(ProgramError::MalformedProgram(message))))
+                    if message == format!(
+                        "`{}` cannot use tracked mesh metadata inside an unchecked manual binding", operation.name(),
+                    ),
+            ));
+
+            let state = CollectiveLoweringState::new().enter_manual_region(inner.clone());
+            assert!(matches!(
+                lower_state_cast(&operation, state, input_type.clone(), &output_types),
+                Err(Error::Core(ryft_core::Error::Program(ProgramError::UnsupportedOperation { message })))
+                    if message == "collective over axis `x` cannot lower inside this shard_map manual region because \
+                                   the region does not bind that axis as a manual mesh axis",
+            ));
+        }
+    }
 
     #[test]
     fn test_manual_collective_lowering_revalidates_raw_bindings() {

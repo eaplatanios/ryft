@@ -1,8 +1,7 @@
 use ryft_core::macros::check_count;
-use ryft_core::{ArrayType, ParallelCastOperation};
+use ryft_core::{ArrayType, Operation as CoreOperation, ParallelCastOperation, ProgramError};
 use ryft_mlir::ValueRef;
 
-use crate::operations::collectives::mesh_axis_replica_groups;
 use crate::{Error, LowerableOperation, LowerableOperationFamily, Lowerer};
 
 impl LowerableOperation for ParallelCastOperation {
@@ -10,14 +9,23 @@ impl LowerableOperation for ParallelCastOperation {
         &self,
         lowerer: &mut Lowerer<'b, 'c, 't, O>,
         input_values: &[ValueRef<'b, 'c, 't>],
-        _input_types: &[ArrayType],
+        input_types: &[ArrayType],
         output_types: &[ArrayType],
     ) -> Result<Vec<ValueRef<'b, 'c, 't>>, Error> {
         check_count!("input", input_values, 1, ProgramError);
         check_count!("output", output_types, 1, ProgramError);
-        // A cast changes only the state that the types record, so it emits no communication. Its axis is still
-        // resolved, so that a cast over an axis that the enclosing manual region does not bind fails to lower.
-        mesh_axis_replica_groups(&lowerer.collective_state, self.axis_name())?;
+        // A cast emits no communication, but its state and adjoint belong to a checked physical binding. Inference
+        // validates the source state and guarantees this mesh and axis exist before the owning binder is checked.
+        let inferred = self.infer_output_types(input_types, &[]).map_err(ProgramError::from)?;
+        let mesh = input_types[0].sharding().unwrap().mesh();
+        lowerer.collective_state.check_manual_collective(
+            self.name(),
+            self.axis_name(),
+            mesh.axis_size(self.axis_name()).unwrap(),
+            Some(mesh),
+            output_types,
+            |_| Ok(inferred),
+        )?;
         Ok(vec![input_values[0]])
     }
 }
