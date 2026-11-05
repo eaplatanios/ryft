@@ -7,7 +7,7 @@ use crate::arrays::{
     DataType, Dimension, DimensionOperation, DimensionType, DimensionValue, DimensionVariable, LogicalMesh, Shape,
     Sharding,
 };
-use crate::axes::{Axis, AxisError, NamedAxes, NamedAxis};
+use crate::axes::{Axis, AxisError, NamedAxes};
 use crate::batching::{
     BatchAxis, BatchableOperation, BatchingContext, BatchingDriver, BatchingError, MemberBatchableOperation,
 };
@@ -27,10 +27,10 @@ use crate::operations::collectives::parallel_all_gather::{
 };
 use crate::operations::collectives::parallel_vary::{PARALLEL_VARY_OPERATION_NAME, ParallelVary};
 use crate::operations::collectives::{
-    CollectiveArrayExtentBatchingPolicy, CollectiveMode, CollectiveOptions, LinearCollectiveOperation,
+    CollectiveArrayExtentBatchingPolicy, CollectiveAxes, CollectiveMode, CollectiveOptions, LinearCollectiveOperation,
     ShapeChangingCollectiveBatching, ShapeChangingCollectiveOperation, ShapeChangingCollectiveValue,
     infer_array_ir_shape_changing_collective_output_type, infer_linear_collective_operation_output_type,
-    resolve_named_axis_size, validate_manual_mesh_input,
+    resolve_collective_axes, validate_manual_mesh_axes_input,
 };
 use crate::operations::comparisons::Compare;
 use crate::operations::constants::constant::{ConstantOperation, DimensionConstant};
@@ -87,8 +87,8 @@ pub const PARALLEL_SUM_SCATTER_OPERATION_NAME: &str = "parallel_sum_scatter";
 /// manual mesh axis.
 #[derive(Clone, Debug, PartialEq, Eq, Hash)]
 pub struct ParallelSumScatterOperation {
-    /// Axis name referenced by this collective.
-    axis_name: String,
+    /// Names of the axes referenced by this collective.
+    axes: CollectiveAxes,
 
     /// Number of participants along the named axis, resolved from the active [`NamedAxes`] environment
     /// when the operation is staged.
@@ -112,20 +112,25 @@ impl ParallelSumScatterOperation {
     ///
     /// # Parameters
     ///
-    ///   - `axis_name`: Name of the axis whose participants' inputs are summed and scattered.
-    ///   - `axis_size`: Number of participants along `axis_name`, resolved when the operation is staged.
+    ///   - `axes`: Name of the axis, or names of the axes, whose participants' inputs are summed and scattered.
+    ///   - `axis_size`: Number of participants along `axes`, resolved when the operation is staged.
     ///   - `scatter_axis`: Axis of the input along which the sum is scattered. In untiled mode its extent must
     ///     equal the number of participants and it is removed from the output, and in tiled mode its extent must
     ///     be divisible by that number and is divided by it.
     ///   - `options`: [`CollectiveMode`] and optional participant groups of the collective (refer to the
     ///     documentation of [`CollectiveOptions::with_axis_index_groups`] for how the groups route the data).
     #[inline]
-    pub fn new(axis_name: String, axis_size: usize, scatter_axis: usize, options: CollectiveOptions) -> Self {
-        Self { axis_name, axis_size, scatter_axis, options, mesh: None }
+    pub fn new<A: Into<CollectiveAxes>>(
+        axes: A,
+        axis_size: usize,
+        scatter_axis: usize,
+        options: CollectiveOptions,
+    ) -> Self {
+        Self { axes: axes.into(), axis_size, scatter_axis, options, mesh: None }
     }
 
-    /// Returns this [`ParallelSumScatterOperation`] configured to sum and scatter over a manual axis of `mesh`. The
-    /// input must vary over [`axis_name`](Self::axis_name) on that mesh, or be unreduced over it, and the axis size
+    /// Returns this [`ParallelSumScatterOperation`] configured to sum and scatter over manual axes of `mesh`.
+    /// The input must vary over [`axes`](Self::axes) on that mesh, or be unreduced over it, and the axis size
     /// must equal [`axis_size`](Self::axis_size). Type inference validates these requirements.
     /// [`ParallelSumScatter::parallel_sum_scatter_with_options`] supplies the mesh automatically
     /// from the enclosing manual region.
@@ -135,10 +140,10 @@ impl ParallelSumScatterOperation {
         self
     }
 
-    /// Returns the axis name referenced by this collective.
+    /// Returns the names of the axes referenced by this collective.
     #[inline]
-    pub fn axis_name(&self) -> &str {
-        &self.axis_name
+    pub fn axes(&self) -> &CollectiveAxes {
+        &self.axes
     }
 
     /// Returns the number of participants along the named axis.
@@ -236,27 +241,38 @@ impl ParallelSumScatterOperation {
             return Ok(output_type);
         };
 
-        let axis_name = self.axis_name();
-        validate_manual_mesh_input(
+        let axis_names = self.axes();
+        validate_manual_mesh_axes_input(
             PARALLEL_SUM_SCATTER_OPERATION_NAME,
-            axis_name,
-            Some(self.axis_size),
+            axis_names,
+            self.axis_size,
             mesh,
             input_type,
         )?;
 
         let sharding = input_type.sharding().unwrap();
-        if !input_type.unreduced_axes().contains(axis_name) {
+        let unreduced_count =
+            axis_names.names().iter().filter(|axis| input_type.unreduced_axes().contains(*axis)).count();
+        if unreduced_count == 0 {
             // Every participant of a manual mesh axis receives a different chunk, so an input that is still invariant
             // over that axis would yield an output whose type wrongly claims that it is invariant.
-            if !sharding.varying_manual_axes().contains(axis_name) {
-                return Err(TypeError::invalid(format!(
-                    "`{}` input must vary over manual axis `{}`; pass an invariant \
-                     value through `{}` first so that every copy is counted",
-                    PARALLEL_SUM_SCATTER_OPERATION_NAME, axis_name, PARALLEL_VARY_OPERATION_NAME,
-                )));
+            for axis_name in axis_names.names() {
+                if !sharding.varying_manual_axes().contains(axis_name) {
+                    return Err(TypeError::invalid(format!(
+                        "`{}` input must vary over manual axis `{}`; pass an invariant \
+                         value through `{}` first so that every copy is counted",
+                        PARALLEL_SUM_SCATTER_OPERATION_NAME, axis_name, PARALLEL_VARY_OPERATION_NAME,
+                    )));
+                }
             }
             return Ok(output_type);
+        }
+
+        if unreduced_count != axis_names.names().len() {
+            return Err(TypeError::invalid(format!(
+                "`{PARALLEL_SUM_SCATTER_OPERATION_NAME}` input must be unreduced along all or none of manual axes \
+                 {axis_names}",
+            )));
         }
 
         // Participant groups sum only within each group, so a grouped exchange would leave part of the pending sum
@@ -264,19 +280,19 @@ impl ParallelSumScatterOperation {
         if self.options.axis_index_groups.is_some() {
             return Err(TypeError::invalid(format!(
                 "`{PARALLEL_SUM_SCATTER_OPERATION_NAME}` with axis index groups cannot complete a pending sum over \
-                 manual axis `{axis_name}`",
+                 manual axis `{axis_names}`",
             )));
         }
 
-        // Complete only the participating axis's pending sum. Independent pending sums commute with this exchange
+        // Complete only the participating axes' pending sums. Independent pending sums commute with this exchange
         // and stay pending; the shape-only output type already preserves their sharding state.
         let mut varying_axes = sharding.varying_manual_axes().clone();
-        varying_axes.insert(self.axis_name().to_string());
+        varying_axes.extend(axis_names.names().iter().cloned());
         let output_sharding = output_type.sharding().unwrap().clone();
         Ok(output_type.with_sharding(
             output_sharding
                 .with_unreduced_axes(
-                    input_type.unreduced_axes().iter().filter(|axis| axis.as_str() != axis_name).cloned(),
+                    input_type.unreduced_axes().iter().filter(|axis| !axis_names.contains(axis)).cloned(),
                 )
                 .and_then(|sharding| sharding.with_varying_manual_axes(varying_axes))
                 .map_err(TypeError::from)?,
@@ -319,7 +335,7 @@ impl Operation for ParallelSumScatterOperation {
 
     fn render(&self, formatter: &mut std::fmt::Formatter<'_>, indentation: usize) -> std::fmt::Result {
         OperationFormatter::new(formatter, indentation, PARALLEL_SUM_SCATTER_OPERATION_NAME)?.bracketed(|operation| {
-            operation.field("axis_name", format_args!("{:?}", self.axis_name))?;
+            operation.field("axis_name", format_args!("{:?}", self.axes))?;
             operation.field("axis_size", self.axis_size)?;
             operation.field("scatter_axis", format_args!("{:?}", &self.scatter_axis))?;
             operation.field("options", format_args!("{:?}", self.options.mode()))?;
@@ -338,8 +354,8 @@ impl LinearCollectiveOperation for ParallelSumScatterOperation {
     type Adjoint = ParallelAllGatherOperation;
 
     #[inline]
-    fn axis_name(&self) -> &str {
-        &self.axis_name
+    fn axes(&self) -> &CollectiveAxes {
+        &self.axes
     }
 
     #[inline]
@@ -360,13 +376,15 @@ impl LinearCollectiveOperation for ParallelSumScatterOperation {
     fn adjoint(&self, input_type: &ArrayType) -> Result<ParallelAllGatherOperation, ProgramError> {
         // Completing a pending sum has a reduced cotangent, whereas varying inputs keep varying cotangents.
         // Ordinary batch-bound collectives preserve mesh state even when their name shadows a manual mesh axis.
-        let output_variance = if self.mesh.is_some() && input_type.unreduced_axes().contains(self.axis_name()) {
+        let output_variance = if self.mesh.is_some()
+            && self.axes.names().iter().all(|axis_name| input_type.unreduced_axes().contains(axis_name))
+        {
             ParallelAllGatherOutputVariance::Reduced
         } else {
             ParallelAllGatherOutputVariance::Varying
         };
         let adjoint = ParallelAllGatherOperation::new(
-            self.axis_name.clone(),
+            self.axes.clone(),
             self.axis_size,
             self.scatter_axis,
             self.options.clone(),
@@ -527,7 +545,7 @@ where
         }
 
         let axis_extent =
-            P::collective_axis_extent(context, PARALLEL_SUM_SCATTER_OPERATION_NAME, &self.axis_name, self.axis_size)?;
+            P::collective_axis_extent(context, PARALLEL_SUM_SCATTER_OPERATION_NAME, &self.axes, self.axis_size)?;
 
         let mut input_extents = output_extents.clone();
         match self.options.mode {
@@ -800,54 +818,57 @@ where
 /// ```
 #[capability]
 pub trait ParallelSumScatter<T = <Self as Capability>::Universe>: Capability + Sized {
-    /// Returns the sum of this value across the participants of the named axis `axis_name`, scattered along
-    /// `scatter_axis`. The extent of `scatter_axis` must equal the number of participants, and the axis is removed,
-    /// so that participant `i` receives row `i` of the sum.
+    /// Returns the sum of this value across the participants of the named axes `axes`, scattered along `scatter_axis`.
+    /// The extent of `scatter_axis` must equal the number of participants, and the axis is removed, so that participant
+    /// `i` receives row `i` of the sum.
     ///
     /// # Parameters
     ///
-    ///   - `axis_name`: Name of an axis bound by an enclosing `batch` level or manual region.
+    ///   - `axes`: Name of an axis bound by an enclosing `batch` level or manual region, or names of several
+    ///     manual mesh axes whose combined axis is used.
     ///   - `scatter_axis`: Axis of this value along which the sum is scattered. Negative axes count from the end.
     ///
     /// # Errors
     ///
     /// Returns the errors of [`ParallelSumScatter::parallel_sum_scatter_with_options`].
     #[inline]
-    fn parallel_sum_scatter<ScatterAxis: Into<Axis>>(
+    fn parallel_sum_scatter<Axes: Into<CollectiveAxes>, ScatterAxis: Into<Axis>>(
         &self,
-        axis_name: &str,
+        axes: Axes,
         scatter_axis: ScatterAxis,
     ) -> Result<Self, ProgramError> {
-        self.parallel_sum_scatter_with_options(axis_name, scatter_axis, CollectiveOptions::default())
+        self.parallel_sum_scatter_with_options(axes, scatter_axis, CollectiveOptions::default())
     }
 
-    /// Returns the sum of this value across the participants of the named axis `axis_name`, scattered in equal
+    /// Returns the sum of this value across the participants of the named axes `axes`, scattered in equal
     /// contiguous chunks along `scatter_axis`. The extent of `scatter_axis` must be divisible by the number of
     /// participants, and participant `i` receives chunk `i` of the sum.
     ///
     /// # Parameters
     ///
-    ///   - `axis_name`: Name of an axis bound by an enclosing `batch` level or manual region.
+    ///   - `axes`: Name of an axis bound by an enclosing `batch` level or manual region, or names of several
+    ///     manual mesh axes whose combined axis is used.
     ///   - `scatter_axis`: Axis of this value along which the sum is scattered. Negative axes count from the end.
     ///
     /// # Errors
     ///
     /// Returns the errors of [`ParallelSumScatter::parallel_sum_scatter_with_options`].
     #[inline]
-    fn parallel_sum_scatter_tiled<ScatterAxis: Into<Axis>>(
+    fn parallel_sum_scatter_tiled<Axes: Into<CollectiveAxes>, ScatterAxis: Into<Axis>>(
         &self,
-        axis_name: &str,
+        axes: Axes,
         scatter_axis: ScatterAxis,
     ) -> Result<Self, ProgramError> {
-        self.parallel_sum_scatter_with_options(axis_name, scatter_axis, CollectiveOptions::new(CollectiveMode::Tiled))
+        self.parallel_sum_scatter_with_options(axes, scatter_axis, CollectiveOptions::new(CollectiveMode::Tiled))
     }
 
-    /// Returns the sum of this value across the participants of the named axis `axis_name`, scattered along
+    /// Returns the sum of this value across the participants of the named axes `axes`, scattered along
     /// `scatter_axis` with the tiling mode and participant groups of `options`.
     ///
     /// # Parameters
     ///
-    ///   - `axis_name`: Name of an axis bound by an enclosing `batch` level or manual region.
+    ///   - `axes`: Name of an axis bound by an enclosing `batch` level or manual region, or names of several
+    ///     manual mesh axes whose combined axis is used.
     ///   - `scatter_axis`: Axis of this value along which the sum is scattered. Negative axes count from the end.
     ///   - `options`: [`CollectiveMode`] and optional participant groups of the collective (refer to the
     ///     documentation of [`CollectiveOptions::with_axis_index_groups`] for how the groups route the data).
@@ -855,12 +876,12 @@ pub trait ParallelSumScatter<T = <Self as Capability>::Universe>: Capability + S
     /// # Errors
     ///
     /// Returns a [`ProgramError::Axis`] error wrapping [`AxisError::UnboundAxisName`] when no enclosing binder binds
-    /// `axis_name` or [`AxisError::OutOfBounds`] when `scatter_axis` is out of bounds, and a [`ProgramError`] if the
+    /// `axes` or [`AxisError::OutOfBounds`] when `scatter_axis` is out of bounds, and a [`ProgramError`] if the
     /// extent of `scatter_axis` does not fit the tiling mode, if the participant groups are invalid, if this value is
     /// not numeric, or if its manual mesh state does not satisfy the input variation or pending-sum contract.
-    fn parallel_sum_scatter_with_options<ScatterAxis: Into<Axis>>(
+    fn parallel_sum_scatter_with_options<Axes: Into<CollectiveAxes>, ScatterAxis: Into<Axis>>(
         &self,
-        axis_name: &str,
+        axes: Axes,
         scatter_axis: ScatterAxis,
         options: CollectiveOptions,
     ) -> Result<Self, ProgramError>;
@@ -871,13 +892,15 @@ impl ParallelSumScatter<ArrayType> for Array {
     // a manual region are tracers, so every axis name is unbound for it.
 
     #[inline]
-    fn parallel_sum_scatter_with_options<ScatterAxis: Into<Axis>>(
+    fn parallel_sum_scatter_with_options<Axes: Into<CollectiveAxes>, ScatterAxis: Into<Axis>>(
         &self,
-        axis_name: &str,
+        axes: Axes,
         _scatter_axis: ScatterAxis,
         _options: CollectiveOptions,
     ) -> Result<Self, ProgramError> {
-        Err(AxisError::UnboundAxisName { name: axis_name.to_string() }.into())
+        let axes = axes.into();
+        axes.validate(PARALLEL_SUM_SCATTER_OPERATION_NAME)?;
+        Err(AxisError::UnboundAxisName { name: axes.names()[0].clone() }.into())
     }
 }
 
@@ -887,25 +910,22 @@ impl<
         > + ParallelVary,
 > ParallelSumScatter<ArrayType> for V
 {
-    fn parallel_sum_scatter_with_options<ScatterAxis: Into<Axis>>(
+    fn parallel_sum_scatter_with_options<Axes: Into<CollectiveAxes>, ScatterAxis: Into<Axis>>(
         &self,
-        axis_name: &str,
+        axes: Axes,
         scatter_axis: ScatterAxis,
         options: CollectiveOptions,
     ) -> Result<Self, ProgramError> {
         // Homogeneous values opt into direct staging, while projected values retain array IR extent delegation.
+        let axes = axes.into();
         let context = self.domain();
-        let axis_size = resolve_named_axis_size(&context, axis_name)?;
+        let (axis_size, mesh) = resolve_collective_axes(&context, PARALLEL_SUM_SCATTER_OPERATION_NAME, &axes)?;
         options.effective_axis_size(PARALLEL_SUM_SCATTER_OPERATION_NAME, axis_size)?;
         let scatter_axis = scatter_axis.into().normalize(self.r#type().rank())?;
         let mut input = self.clone();
-        let mut operation = ParallelSumScatterOperation::new(axis_name.to_string(), axis_size, scatter_axis, options);
-        if let Some(NamedAxis::Mesh { mesh, checks_manual_variation: true, .. }) = context.named_axis(axis_name) {
-            if !input.r#type().sharding().is_some_and(|sharding| {
-                sharding.varying_manual_axes().contains(axis_name) || sharding.unreduced_axes().contains(axis_name)
-            }) {
-                input = input.parallel_vary(axis_name)?;
-            }
+        let mut operation = ParallelSumScatterOperation::new(axes.clone(), axis_size, scatter_axis, options);
+        if let Some(mesh) = mesh {
+            input = vary_unless_unreduced(input, &axes)?;
             operation = operation.with_mesh(mesh);
         }
         let mut outputs = context.bind(operation, Vec::new(), &[input])?;
@@ -915,16 +935,16 @@ impl<
 }
 
 impl<A: Value<Type = ArrayType> + ParallelSumScatter<ArrayType>> ParallelSumScatter<ArrayIrType> for ArrayIrValue<A> {
-    fn parallel_sum_scatter_with_options<ScatterAxis: Into<Axis>>(
+    fn parallel_sum_scatter_with_options<Axes: Into<CollectiveAxes>, ScatterAxis: Into<Axis>>(
         &self,
-        axis_name: &str,
+        axes: Axes,
         scatter_axis: ScatterAxis,
         options: CollectiveOptions,
     ) -> Result<Self, ProgramError> {
         // A concrete array IR value performs the collective through its array member.
         let array = ValueProjection::<ArrayType>::into_projected(self.clone())?;
         Ok(<Self as ValueProjection<ArrayType>>::from_projected(array.parallel_sum_scatter_with_options(
-            axis_name,
+            axes.into(),
             scatter_axis,
             options,
         )?))
@@ -947,9 +967,9 @@ where
     <V as ValueProjection<DimensionType>>::Projected: Value<Type = DimensionType> + Div + Rem + Compare<V>,
     <V as ValueProjection<ArrayType>>::Projected: ParallelVary,
 {
-    fn parallel_sum_scatter_with_options<ScatterAxis: Into<Axis>>(
+    fn parallel_sum_scatter_with_options<Axes: Into<CollectiveAxes>, ScatterAxis: Into<Axis>>(
         &self,
-        axis_name: &str,
+        axes: Axes,
         scatter_axis: ScatterAxis,
         options: CollectiveOptions,
     ) -> Result<Self, ProgramError> {
@@ -957,21 +977,17 @@ where
         // extent value per output axis, which also asserts at runtime that dynamic extents fit the tiling mode. Over a
         // manual mesh axis, an input that neither varies over the axis nor is unreduced over it is first made varying
         // through its array view, exactly as JAX's `psum_scatter` does, so that every device's copy is counted.
+        let axes = axes.into();
         let context = self.domain();
-        let axis_size = resolve_named_axis_size(&context, axis_name)?;
+        let (axis_size, mesh) = resolve_collective_axes(&context, PARALLEL_SUM_SCATTER_OPERATION_NAME, &axes)?;
         let effective_axis_size = options.effective_axis_size(PARALLEL_SUM_SCATTER_OPERATION_NAME, axis_size)?;
         let self_type = self.r#type();
         let scatter_axis = scatter_axis.into().normalize(<&ArrayType>::try_from(self_type.as_ref())?.rank())?;
         let mut input = self.clone();
-        let mut operation =
-            ParallelSumScatterOperation::new(axis_name.to_string(), axis_size, scatter_axis, options.clone());
-        if let Some(NamedAxis::Mesh { mesh, checks_manual_variation: true, .. }) = context.named_axis(axis_name) {
+        let mut operation = ParallelSumScatterOperation::new(axes.clone(), axis_size, scatter_axis, options.clone());
+        if let Some(mesh) = mesh {
             let array = ValueProjection::<ArrayType>::into_projected(self.clone())?;
-            if !array.r#type().sharding().is_some_and(|sharding| {
-                sharding.varying_manual_axes().contains(axis_name) || sharding.unreduced_axes().contains(axis_name)
-            }) {
-                input = <V as ValueProjection<ArrayType>>::from_projected(array.parallel_vary(axis_name)?);
-            }
+            input = <V as ValueProjection<ArrayType>>::from_projected(vary_unless_unreduced(array, &axes)?);
             operation = operation.with_mesh(mesh);
         }
         let input_type = input.r#type();
@@ -1027,17 +1043,34 @@ impl<V: ParallelSumScatter<ArrayIrType> + ValueProjection<ArrayType, Projected =
     ParallelSumScatter<ArrayType> for ProjectedValue<ArrayType, V>
 {
     #[inline]
-    fn parallel_sum_scatter_with_options<ScatterAxis: Into<Axis>>(
+    fn parallel_sum_scatter_with_options<Axes: Into<CollectiveAxes>, ScatterAxis: Into<Axis>>(
         &self,
-        axis_name: &str,
+        axes: Axes,
         scatter_axis: ScatterAxis,
         options: CollectiveOptions,
     ) -> Result<Self, ProgramError> {
         self.value()
-            .parallel_sum_scatter_with_options(axis_name, scatter_axis, options)?
+            .parallel_sum_scatter_with_options(axes, scatter_axis, options)?
             .into_projected()
             .map_err(Into::into)
     }
+}
+
+/// Returns `input` made varying through [`ParallelVary`] over each of the manual mesh axes named by `axis_names` along
+/// which it neither varies nor is unreduced, exactly as JAX's `psum_scatter` does, so that every device's copy is
+/// counted. Type inference then requires the axes to be all unreduced or all varying.
+fn vary_unless_unreduced<V: Typed<Type = ArrayType> + ParallelVary>(
+    mut input: V,
+    axis_names: &CollectiveAxes,
+) -> Result<V, ProgramError> {
+    for axis_name in axis_names.names() {
+        if !input.r#type().sharding().is_some_and(|sharding| {
+            sharding.varying_manual_axes().contains(axis_name) || sharding.unreduced_axes().contains(axis_name)
+        }) {
+            input = input.parallel_vary(axis_name)?;
+        }
+    }
+    Ok(input)
 }
 
 #[cfg(test)]
@@ -1050,6 +1083,7 @@ mod tests {
         ArrayIrOperation, ArrayOperation, DimensionBounds, Layout, Memory, MeshAxis, MeshAxisType, ShardingDimension,
         StridedLayout,
     };
+    use crate::axes::NamedAxis;
     use crate::batching::{BatchAxisSpecification, BatchingTracer, batch};
     use crate::contexts::{EagerContext, StagingContext};
     use crate::differentiation::{DifferentiableType, DifferentiationTracer};
@@ -1120,7 +1154,7 @@ mod tests {
     fn test_parallel_sum_scatter() {
         let operation = ParallelSumScatterOperation::new("x".to_string(), 4, 1, CollectiveOptions::tiled());
         assert_eq!(operation.name(), PARALLEL_SUM_SCATTER_OPERATION_NAME);
-        assert_eq!(operation.axis_name(), "x");
+        assert_eq!(operation.axes().single(), Some("x"));
         assert_eq!(operation.axis_size(), 4);
         assert_eq!(operation.scatter_axis(), 1);
         assert_eq!(operation.options(), &CollectiveOptions::tiled());
