@@ -1,5 +1,5 @@
 use std::borrow::Cow;
-use std::sync::{Mutex, OnceLock, PoisonError};
+use std::sync::{Arc, Mutex, PoisonError};
 
 use ryft_core::macros::check_count;
 use ryft_core::{ArrayType, EffectClass, PrintOperation};
@@ -16,8 +16,10 @@ use ryft_pjrt::extensions::ffi::{
 use ryft_pjrt::{Client, Error as PjrtError};
 
 use crate::domains::effects::EffectCallbackGuard;
+use crate::domains::runtimes::{builtin_requirement, validate_builtin_requirement};
+use crate::domains::{RuntimeExtension, RuntimeProvider, RuntimeRequirement};
 use crate::experimental::lowering::{EffectTokens, current_or_new_token};
-use crate::{Error, LowerableOperation, LowerableOperationFamily, Lowerer};
+use crate::{Error, ExecutionError, LowerableOperation, LowerableOperationFamily, Lowerer, Target};
 
 #[cfg(any(feature = "cuda-12", feature = "cuda-13"))]
 use crate::operations::assertions::copy_cuda_bytes;
@@ -157,54 +159,100 @@ pub fn with_captured_prints<R, F: FnOnce() -> R>(body: F) -> (R, Vec<String>) {
 /// Registers the [`PRINT_CUSTOM_CALL_TARGET`] XLA FFI handler with the plugin backing the provided
 /// [`Client`], making `stablehlo.custom_call @ryft.print` operations executable by that plugin.
 ///
-/// Registration is lazy (i.e., performed at the first compile/execute touchpoint instead of at library load)
-/// because it requires a live PJRT plugin that exposes the FFI extension, and no plugin is loaded when this
-/// crate is initialized. It is also idempotent and thread-safe: the handler is registered into the XLA
-/// runtime's process-global registry at most once, guarded by a [`OnceLock`], because re-registering the same
-/// target name is rejected by the runtime. The registration outcome (including a failure, e.g., when the
-/// plugin does not provide the FFI extension) is cached for the lifetime of the process.
+/// Registration is lazy because it requires a live plugin exposing the FFI extension. It may be repeated, e.g., once
+/// per session, because XLA accepts re-registration of an identical handler for the same target and platform.
 ///
-/// The handler is selected by the platform reported by the provided client. The CPU handler (platform `"cpu"`,
-/// which the XLA runtime canonicalizes to its `"Host"` platform) renders its operand buffer directly from host
-/// memory. With a `cuda-*` feature enabled, the CUDA handler (platform `"cuda"`) first copies the operand through
-/// the invocation's CUDA stream, so the printed value reflects every device write ordered before the call, and the
-/// call completes only after that device work has finished. Other platforms are rejected with an unimplemented
-/// error, because the handler has no way to read their buffers.
+/// The handler is selected by the platform reported by the provided client. The CPU handler renders its operand
+/// buffer directly from host memory. With a `cuda-*` feature enabled, the CUDA handler copies the operand through
+/// the invocation's CUDA stream before rendering it. Other platforms are rejected because these handlers cannot
+/// read their buffers. An integration for another platform can provide its own runtime provider and handler.
 pub fn ensure_print_handler_registered(client: &Client<'_>) -> Result<(), Error> {
     let platform_name = client.platform_name()?.into_owned();
     if platform_name.eq_ignore_ascii_case("cpu") {
-        static CPU_PRINT_HANDLER_REGISTRATION: OnceLock<Result<(), PjrtError>> = OnceLock::new();
-        return CPU_PRINT_HANDLER_REGISTRATION
-            .get_or_init(|| {
-                client.register_ffi_handler(
-                    PRINT_CUSTOM_CALL_TARGET,
-                    platform_name,
-                    FfiHandler::from(print_handler as XLA_FFI_Handler),
-                    FfiHandlerTraits::NONE,
-                )
-            })
-            .clone()
-            .map_err(Error::from);
+        return Ok(client.register_ffi_handler(
+            PRINT_CUSTOM_CALL_TARGET,
+            platform_name,
+            FfiHandler::from(print_handler as XLA_FFI_Handler),
+            FfiHandlerTraits::NONE,
+        )?);
     }
     #[cfg(any(feature = "cuda-12", feature = "cuda-13"))]
     if platform_name.eq_ignore_ascii_case("cuda") {
-        static CUDA_PRINT_HANDLER_REGISTRATION: OnceLock<Result<(), PjrtError>> = OnceLock::new();
-        return CUDA_PRINT_HANDLER_REGISTRATION
-            .get_or_init(|| {
-                client.register_ffi_handler(
-                    PRINT_CUSTOM_CALL_TARGET,
-                    platform_name,
-                    FfiHandler::from(cuda_print_handler as XLA_FFI_Handler),
-                    FfiHandlerTraits::NONE,
-                )
-            })
-            .clone()
-            .map_err(Error::from);
+        return Ok(client.register_ffi_handler(
+            PRINT_CUSTOM_CALL_TARGET,
+            platform_name,
+            FfiHandler::from(cuda_print_handler as XLA_FFI_Handler),
+            FfiHandlerTraits::NONE,
+        )?);
     }
     Err(PjrtError::unimplemented(format!(
         "the `{PRINT_CUSTOM_CALL_TARGET}` handler cannot read operand buffers of the `{platform_name}` platform"
     ))
     .into())
+}
+
+/// Built-in platform admission and registration for printing.
+struct PrintRuntimeProvider;
+
+/// Printing needs native handler registration but no invocation-owned user data.
+struct PrintRuntime;
+
+impl<'c> RuntimeProvider<'c> for PrintRuntimeProvider {
+    fn identifier(&self) -> &str {
+        PRINT_CUSTOM_CALL_TARGET
+    }
+
+    fn initialize(
+        &self,
+        client: &'c Client<'c>,
+        _target: &Target,
+        requirement: &RuntimeRequirement,
+    ) -> Result<Arc<dyn RuntimeExtension<'c> + 'c>, Error> {
+        validate_builtin_requirement(requirement, self.identifier())?;
+        ensure_print_handler_registered(client)?;
+        Ok(Arc::new(PrintRuntime))
+    }
+}
+
+impl<'c> RuntimeExtension<'c> for PrintRuntime {}
+
+/// Verified native ordered-I/O token transport admission, independent of print registration.
+struct OrderedIoRuntimeProvider;
+
+/// Ordered-I/O admission introduces no per-invocation user data of its own.
+struct OrderedIoRuntime;
+
+impl<'c> RuntimeProvider<'c> for OrderedIoRuntimeProvider {
+    fn identifier(&self) -> &str {
+        "ryft.ordered-io"
+    }
+
+    fn initialize(
+        &self,
+        _client: &'c Client<'c>,
+        target: &Target,
+        requirement: &RuntimeRequirement,
+    ) -> Result<Arc<dyn RuntimeExtension<'c> + 'c>, Error> {
+        validate_builtin_requirement(requirement, self.identifier())?;
+        if !["cpu", "cuda"].iter().any(|platform| target.platform_name().eq_ignore_ascii_case(platform)) {
+            return Err(
+                ExecutionError::UnsupportedEffectPlatform { platform: target.platform_name().to_owned() }.into()
+            );
+        }
+        Ok(Arc::new(OrderedIoRuntime))
+    }
+}
+
+impl<'c> RuntimeExtension<'c> for OrderedIoRuntime {}
+
+/// Returns the built-in print provider without loading a PJRT plugin.
+pub(crate) fn runtime_provider<'c>() -> Arc<dyn RuntimeProvider<'c> + 'c> {
+    Arc::new(PrintRuntimeProvider)
+}
+
+/// Returns the built-in ordered-I/O transport provider without performing native initialization.
+pub(crate) fn ordered_io_runtime_provider<'c>() -> Arc<dyn RuntimeProvider<'c> + 'c> {
+    Arc::new(OrderedIoRuntimeProvider)
 }
 
 /// Memory location of the value buffer passed to one print callback.
@@ -461,6 +509,7 @@ impl LowerableOperation for PrintOperation<ArrayType> {
         // that consumes and produces a StableHLO token, so the effect ordering rides the scope's token chain instead of
         // the value data flow.
         check_count!("input", input_values, 1, ProgramError);
+        lowerer.require_runtime(builtin_requirement(PRINT_CUSTOM_CALL_TARGET))?;
         lower_print_to_custom_call(
             self.label(),
             self.effect_class().is_ordered(),
@@ -490,6 +539,7 @@ mod tests {
         BufferType, ClientOptions, CpuClientOptions, ExecutionDeviceInputs, ExecutionInput, Program, load_cpu_plugin,
     };
 
+    use crate::RuntimeError;
     use crate::experimental::lowering::lower_mlir_module_for_program_with_reference_state;
     use crate::experimental::lowering::tests::{ProgramBuilder, unproject_plain_program};
     use crate::experimental::ops::ArrayConstant;
@@ -581,10 +631,16 @@ mod tests {
             )
             .unwrap();
             assert_eq!(lowered.signature.has_ordered_io(), ordered);
+            let requirements = if ordered {
+                vec![builtin_requirement("ryft.ordered-io"), builtin_requirement(PRINT_CUSTOM_CALL_TARGET)]
+            } else {
+                vec![builtin_requirement(PRINT_CUSTOM_CALL_TARGET)]
+            };
+            assert_eq!(lowered.runtime_requirements.as_ref(), requirements);
             assert_eq!(lowered.signature.has_device_ordered_io(), effect_class == EffectClass::DeviceOrderedIo);
             assert_eq!(lowered.signature.has_unordered_io(), !ordered);
             assert!(lowered.signature.has_effects());
-            assert!(!lowered.signature.requires_assertion_handler());
+            assert!(!lowered.signature.requires_assertion_handler);
             assert_eq!(lowered.signature.ordered_io_input_index(), ordered.then_some(1));
             assert_eq!(lowered.signature.ordered_io_output_index(), ordered.then_some(0));
             assert_eq!(lowered.signature.physical_input_count(), 1 + usize::from(ordered));
@@ -598,6 +654,32 @@ mod tests {
                 assert!(lowered.stable_hlo.contains("func.func @main(%arg0: tensor<f32>) {"));
             }
         }
+    }
+
+    #[test]
+    fn test_print_runtime_provider_initialize() {
+        let client = load_cpu_plugin().unwrap().client(ClientOptions::CPU(CpuClientOptions::default())).unwrap();
+        let target = Target::from_client(&client).unwrap();
+        let provider = runtime_provider();
+        let requirement = builtin_requirement(PRINT_CUSTOM_CALL_TARGET);
+        assert!(provider.initialize(&client, &target, &requirement).is_ok());
+        assert!(provider.initialize(&client, &target, &requirement).is_ok());
+        let requirement = RuntimeRequirement::new(PRINT_CUSTOM_CALL_TARGET, 2, Vec::new()).unwrap();
+        assert!(matches!(provider.initialize(&client, &target, &requirement),
+            Err(Error::Runtime(RuntimeError::UnsupportedVersion { identifier, version: 2 }))
+                if identifier == PRINT_CUSTOM_CALL_TARGET));
+    }
+
+    #[test]
+    fn test_ordered_io_runtime_provider_initialize() {
+        let client = load_cpu_plugin().unwrap().client(ClientOptions::CPU(CpuClientOptions::default())).unwrap();
+        let target = Target::from_client(&client).unwrap();
+        let provider = ordered_io_runtime_provider();
+        assert!(provider.initialize(&client, &target, &builtin_requirement("ryft.ordered-io")).is_ok());
+        let requirement = RuntimeRequirement::new("ryft.ordered-io", 1, vec![1]).unwrap();
+        assert!(matches!(provider.initialize(&client, &target, &requirement),
+            Err(Error::Runtime(RuntimeError::InvalidConfiguration { identifier, reason }))
+                if identifier == "ryft.ordered-io" && reason == "built-in runtime configuration must be empty"));
     }
 
     #[test]

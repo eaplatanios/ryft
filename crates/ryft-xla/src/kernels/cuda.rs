@@ -1,11 +1,10 @@
 //! CUDA array/scalar ABI embedding and validated payload reconstruction.
 
-#[cfg(any(feature = "cuda-12", feature = "cuda-13"))]
-use std::sync::OnceLock;
+use std::sync::Arc;
 
 use ryft_core::{
-    ArrayIrType, CustomCallAttribute, CustomCallOperation, DataType, EffectClass, Memory, Operation as CoreOperation,
-    Typed,
+    ArrayIrType, CustomCallAttribute, CustomCallOperation, DataType, DeviceMesh, EffectClass, Memory,
+    Operation as CoreOperation, Typed,
 };
 use ryft_cuda::{
     CudaArtifactFormat, CudaKernelAbi, CudaKernelArtifact, CudaKernelLaunchDimensions, CudaKernelParameterType,
@@ -14,25 +13,32 @@ use ryft_cuda::{
 #[cfg(any(feature = "cuda-12", feature = "cuda-13"))]
 use ryft_cuda::{CudaKernelArgument, CudaKernelLauncher, CudaScalarValue};
 use ryft_kernels::{KernelParameterAccess, VerifiedKernel};
+use ryft_pjrt::Client;
 #[cfg(any(feature = "cuda-12", feature = "cuda-13"))]
 use ryft_pjrt::extensions::ffi::{
     FfiAttribute, FfiBufferType, FfiCallFrame, FfiError, FfiExecutionStage, FfiHandler, FfiHandlerTraits, FfiInput,
     FfiOutput, FfiTypeInformation, XLA_FFI_CallFrame, XLA_FFI_Error, XLA_FFI_Handler,
 };
 use ryft_pjrt::extensions::ffi::{FfiTypeId, FfiUserData};
-use ryft_pjrt::{Client, ExecutionContext};
 use serde::{Deserialize, Serialize};
 use sha2::{Digest, Sha256};
 
-use crate::ToPjrt;
+use crate::domains::runtimes::{builtin_requirement, validate_builtin_requirement};
+use crate::domains::{
+    ExecutionResources, RuntimeExtension, RuntimeProvider, RuntimeRequirement, named_ffi_type_id,
+    with_runtime_requirements,
+};
 use crate::kernels::{KernelEmbeddingError, KernelOutputEmbedding, dense_memory_layouts};
+use crate::{Error, Target, ToPjrt};
 
 /// Registered handler for versioned ready CUDA artifacts embedded in StableHLO.
 pub const CUDA_KERNEL_CUSTOM_CALL_TARGET: &str = "ryft.kernel.cuda";
 
-/// Native type identifier allocated by the same plugin registry as the CUDA handler.
-#[cfg(any(feature = "cuda-12", feature = "cuda-13"))]
-static CUDA_RUNTIME_REGISTRATION: OnceLock<Result<FfiTypeId, ryft_pjrt::Error>> = OnceLock::new();
+/// Name of the native type through which the built-in CUDA artifact handler recovers its session runtime.
+const CUDA_RUNTIME_TYPE_NAME: &str = "ryft.kernel.cuda.runtime";
+
+/// Explicit native type ID registered under [`CUDA_RUNTIME_TYPE_NAME`] and used to look up the session runtime.
+const CUDA_RUNTIME_TYPE_ID: FfiTypeId = named_ffi_type_id(CUDA_RUNTIME_TYPE_NAME);
 
 /// Custom-call buffer supplying one logical CUDA array parameter.
 #[derive(Copy, Clone, Debug, PartialEq, Eq, Serialize, Deserialize)]
@@ -359,6 +365,10 @@ impl<Extension: CoreOperation<Type = ArrayIrType>> KernelOutputEmbedding<CudaKer
         for (output, input) in logical.aliases() {
             operation = operation.with_input_output_alias(input, output)?;
         }
+        if self.target_name == CUDA_KERNEL_CUSTOM_CALL_TARGET {
+            operation = with_runtime_requirements(operation, [builtin_requirement(CUDA_KERNEL_CUSTOM_CALL_TARGET)])
+                .map_err(|error| KernelEmbeddingError::Invalid { message: error.to_string() })?;
+        }
         Ok(operation)
     }
 }
@@ -487,58 +497,78 @@ impl CudaEnvelope {
 
 /// Session-owned launcher borrowed by native execution contexts. The session waits its existing execution fences
 /// before dropping this object, so cached modules are released while the externally borrowed PJRT client is alive.
-pub(crate) struct CudaKernelRuntime {
+struct CudaKernelRuntime {
     /// Existing driver owner, including its canonical bounded module cache and cleanup reporting.
     #[cfg(any(feature = "cuda-12", feature = "cuda-13"))]
     launcher: CudaKernelLauncher,
-
-    /// Plugin-owned FFI type used to recover this stable session allocation.
-    type_id: FfiTypeId,
 }
 
 impl CudaKernelRuntime {
     /// Loads the driver and idempotently registers the shared handler for this CUDA plugin.
-    pub(crate) fn new(client: &Client<'_>) -> Result<Self, KernelEmbeddingError> {
+    fn new(client: &Client<'_>) -> Result<Self, Error> {
         #[cfg(not(any(feature = "cuda-12", feature = "cuda-13")))]
         {
             let _client = client;
             Err(KernelEmbeddingError::Invalid {
                 message: "cuda artifact execution requires the `cuda-12` or `cuda-13` feature".to_owned(),
-            })
+            }
+            .into())
         }
         #[cfg(any(feature = "cuda-12", feature = "cuda-13"))]
         {
             let launcher = client.cuda_kernel_launcher()?;
-            let type_id = CUDA_RUNTIME_REGISTRATION
-                .get_or_init(|| {
-                    let type_id = client.register_ffi_type(
-                        "ryft.kernel.cuda.runtime",
-                        FfiTypeId::UNKNOWN,
-                        FfiTypeInformation::new(None),
-                    )?;
-                    client.register_ffi_handler(
-                        CUDA_KERNEL_CUSTOM_CALL_TARGET,
-                        "CUDA",
-                        FfiHandler::from(cuda_kernel_handler as XLA_FFI_Handler),
-                        FfiHandlerTraits::NONE,
-                    )?;
-                    Ok(type_id)
-                })
-                .clone()?;
-            Ok(Self { launcher, type_id })
+            client.register_ffi_type(CUDA_RUNTIME_TYPE_NAME, CUDA_RUNTIME_TYPE_ID, FfiTypeInformation::new(None))?;
+            client.register_ffi_handler(
+                CUDA_KERNEL_CUSTOM_CALL_TARGET,
+                "CUDA",
+                FfiHandler::from(cuda_kernel_handler as XLA_FFI_Handler),
+                FfiHandlerTraits::NONE,
+            )?;
+            Ok(Self { launcher })
         }
     }
+}
 
-    /// Creates a native context borrowing this stable allocation until all submitted devices complete.
-    ///
-    /// # Safety
-    /// The owner must keep this object and its PJRT client alive until whole-execution completion, including when
-    /// outputs are dropped early. PJRT retains the native context, but its user-data insertion is non-owning.
-    pub(crate) unsafe fn execution_context(&self, client: &Client<'_>) -> Result<ExecutionContext, ryft_pjrt::Error> {
-        let context = client.execution_context()?;
-        unsafe { context.add_ffi_user_data(FfiUserData::new(self.type_id, (self as *const Self).cast_mut().cast())) }?;
-        Ok(context)
+/// Lazily initializes CUDA launch support for a selected PJRT client.
+struct CudaRuntimeProvider;
+
+impl<'c> RuntimeProvider<'c> for CudaRuntimeProvider {
+    fn identifier(&self) -> &str {
+        CUDA_KERNEL_CUSTOM_CALL_TARGET
     }
+
+    fn initialize(
+        &self,
+        client: &'c Client<'c>,
+        target: &Target,
+        requirement: &RuntimeRequirement,
+    ) -> Result<Arc<dyn RuntimeExtension<'c> + 'c>, Error> {
+        validate_builtin_requirement(requirement, self.identifier())?;
+        if !target.platform_name().eq_ignore_ascii_case("cuda") {
+            return Err(Error::custom(KernelEmbeddingError::Invalid {
+                message: "cuda artifact calls require a cuda platform".to_owned(),
+            }));
+        }
+        Ok(Arc::new(CudaKernelRuntime::new(client)?))
+    }
+}
+
+impl<'c> RuntimeExtension<'c> for CudaKernelRuntime {
+    fn validate_execution(&self, client: &Client<'_>, mesh: &DeviceMesh) -> Result<(), Error> {
+        crate::kernels::distributed::validate_kernel_participants(client, mesh)?;
+        Ok(())
+    }
+
+    fn prepare(&self, resources: &mut ExecutionResources<'c>) -> Result<(), Error> {
+        // The session owns this stable instance and retains its invocation lease through whole-launch completion.
+        let data = (self as *const Self).cast_mut().cast();
+        unsafe { resources.add_ffi_user_data(FfiUserData::new(CUDA_RUNTIME_TYPE_ID, data)) }
+    }
+}
+
+/// Returns the built-in CUDA provider without loading a driver or a PJRT plugin.
+pub(super) fn runtime_provider<'c>() -> Arc<dyn RuntimeProvider<'c> + 'c> {
+    Arc::new(CudaRuntimeProvider)
 }
 
 /// Decodes one ready artifact and submits it on the invocation's current CUDA stream.
@@ -567,17 +597,12 @@ fn launch_cuda_kernel(frame: &FfiCallFrame<'_>) -> Result<(), FfiError> {
     let artifact = envelope.artifact().map_err(|error| FfiError::invalid_argument(error.to_string()))?;
     envelope.validate_frame(frame)?;
     let context = frame.context()?;
-    let type_id = CUDA_RUNTIME_REGISTRATION
-        .get()
-        .ok_or_else(|| FfiError::internal("cuda runtime is not registered"))?
-        .as_ref()
-        .map_err(|error| FfiError::internal(error.to_string()))?;
-    let data = context.user_data(*type_id)?.data;
+    let data = context.user_data(CUDA_RUNTIME_TYPE_ID)?.data;
     if data.is_null() {
         return Err(FfiError::invalid_argument("missing session cuda runtime"));
     }
-    // The only producer is CudaKernelRuntime::execution_context; the session retains this exact allocation and
-    // waits every whole-program execution before destruction, including dropped output handles.
+    // The only producer is this runtime's preparation hook. The session retains its stable allocation through
+    // every whole-program execution, including calls whose output handles were dropped.
     let runtime = unsafe { &*data.cast::<CudaKernelRuntime>() };
     let mut buffers = Vec::with_capacity(envelope.argument_bindings.len());
     for (logical, binding) in envelope.argument_bindings.iter().enumerate() {
@@ -645,7 +670,10 @@ unsafe extern "C" fn cuda_kernel_handler(frame: *mut XLA_FFI_CallFrame) -> *mut 
 mod tests {
     use pretty_assertions::assert_eq;
     use ryft_kernels::VerifiedKernel;
+    use ryft_pjrt::{ClientOptions, CpuClientOptions, load_cpu_plugin};
 
+    use crate::RuntimeError;
+    use crate::domains::runtime_requirements;
     use crate::kernels::CompiledKernel;
     use crate::kernels::tests::definition;
 
@@ -737,6 +765,7 @@ mod tests {
         let artifact = artifact(vec![CudaKernelParameterType::DevicePointer]);
         let embedding = CudaKernelEmbedding::new("ryft.test.ready".to_owned(), vec![0]);
         let compiled = CompiledKernel::from_output(&verified, b"ready configuration", &artifact, &embedding).unwrap();
+        assert!(runtime_requirements(compiled.custom_call()).unwrap().is_empty());
         let (decoded_embedding, decoded) =
             CudaKernelEmbedding::from_custom_call(&verified, compiled.custom_call()).unwrap();
         assert_eq!(decoded_embedding, embedding);
@@ -781,9 +810,9 @@ mod tests {
             Some("cuda"),
         )
         .unwrap();
-        let (module, signature, assertions) = lowered.into_parts();
+        let (module, signature, assertions, requirements) = lowered.into_parts();
         assert!(module.contains("stablehlo.custom_call @ryft.kernel.cuda"));
-        assert!(signature.requires_cuda_kernel_runtime());
+        assert_eq!(requirements.as_ref(), &[builtin_requirement(CUDA_KERNEL_CUSTOM_CALL_TARGET)]);
         assert!(!signature.has_effects());
         assert!(!assertions);
     }
@@ -845,7 +874,7 @@ mod tests {
             Some("cuda"),
         )
         .unwrap();
-        let (module, _, _) = lowered.into_parts();
+        let (module, _, _, _) = lowered.into_parts();
         assert!(module.contains("operand_layouts = [dense<> : tensor<0xindex>]"));
         assert!(module.contains("result_layouts = [dense<> : tensor<0xindex>]"));
     }
@@ -884,6 +913,25 @@ mod tests {
             CompiledKernel::from_output(&verified, b"checked index", &artifact, &without_assertions),
             Err(KernelEmbeddingError::UnsupportedEffect { effect: EffectClass::OrderedAssertion }),
         ));
+    }
+
+    #[test]
+    fn test_cuda_runtime_provider_initialize() {
+        let client = load_cpu_plugin().unwrap().client(ClientOptions::CPU(CpuClientOptions::default())).unwrap();
+        let target = Target::from_client(&client).unwrap();
+        let provider = runtime_provider();
+        let error = provider
+            .initialize(&client, &target, &builtin_requirement(CUDA_KERNEL_CUSTOM_CALL_TARGET))
+            .err()
+            .unwrap();
+        assert!(
+            matches!(error.downcast_custom::<KernelEmbeddingError>(), Some(KernelEmbeddingError::Invalid { message })
+            if message == "cuda artifact calls require a cuda platform")
+        );
+        let requirement = RuntimeRequirement::new(CUDA_KERNEL_CUSTOM_CALL_TARGET, 2, Vec::new()).unwrap();
+        assert!(matches!(provider.initialize(&client, &target, &requirement),
+            Err(Error::Runtime(RuntimeError::UnsupportedVersion { identifier, version: 2 }))
+                if identifier == CUDA_KERNEL_CUSTOM_CALL_TARGET));
     }
 
     #[cfg(any(feature = "cuda-12", feature = "cuda-13"))]

@@ -1,4 +1,4 @@
-use ryft_core::{ArrayType, Dimension as CoreDimension, ProgramError, SHARD_MAP_OPERATION_NAME};
+use ryft_core::{ArrayType, CollectiveAxes, Dimension as CoreDimension, ProgramError, SHARD_MAP_OPERATION_NAME};
 use ryft_mlir::dialects::stable_hlo;
 use ryft_mlir::{
     Block, BlockRef, Context as MlirContext, LocationRef, Operation as MlirOperation, Value as MlirValue, ValueRef,
@@ -14,6 +14,8 @@ pub(crate) mod axis_index;
 pub(crate) mod parallel_all_gather;
 /// StableHLO lowering of `parallel_all_to_all`.
 pub(crate) mod parallel_all_to_all;
+/// StableHLO lowering of `parallel_cast`.
+pub(crate) mod parallel_cast;
 /// StableHLO lowering of `parallel_permute`.
 pub(crate) mod parallel_permute;
 /// StableHLO lowering of `parallel_ragged_all_to_all`.
@@ -25,45 +27,74 @@ pub(crate) mod parallel_sum_scatter;
 /// StableHLO lowering of `parallel_vary`.
 pub(crate) mod parallel_vary;
 
-/// Resolves the replica groups of one named mesh axis inside the innermost enclosing `shard_map` manual region,
-/// returning the groups together with the axis size. Devices are linearized row-major over the mesh axes, so the
-/// devices along the named axis with all other coordinates fixed form one replica group: the group base ids
-/// enumerate the other axes' coordinate combinations, and the group members step by the named axis's row-major
-/// stride. Errors outside manual regions and for axes the region does not bind as manual mesh axes.
+/// Resolves the replica groups of the named mesh axes `axis_name` inside the enclosing `shard_map` manual regions,
+/// returning the groups together with the combined axis size. Devices are linearized row-major over the mesh axes, so
+/// the devices whose coordinates differ only along the named axes form one replica group: the group bases enumerate
+/// the coordinate combinations of the other axes, and the group members are ordered by their positions along the
+/// combined axis, which linearizes the named axes in the given order with the first name major (refer to
+/// [`CollectiveAxes`]). Errors outside manual regions, for axes that no enclosing region binds as manual mesh axes,
+/// and for axes whose binding regions have different meshes.
 pub(crate) fn mesh_axis_replica_groups(
     collective_state: &CollectiveLoweringState,
-    axis_name: &str,
+    axis_name: impl Into<CollectiveAxes>,
 ) -> Result<(Vec<Vec<usize>>, usize), Error> {
-    let Some(boundary) = collective_state.manual_shard_map() else {
+    let axis_names = axis_name.into();
+    if axis_names.names().is_empty() {
+        return Err(ProgramError::MalformedProgram("collective requires at least one axis name".to_string()).into());
+    }
+    if collective_state.manual_shard_map().is_none() {
         return Err(ProgramError::UnsupportedOperation {
             message: format!(
-                "collective over axis `{axis_name}` can only be lowered inside a \
+                "collective over axis `{axis_names}` can only be lowered inside a \
                      {SHARD_MAP_OPERATION_NAME} manual region",
             ),
         }
         .into());
-    };
-    let axis_region = collective_state.manual_axis_region(axis_name);
-    let mesh = axis_region.unwrap_or(boundary).mesh();
-    if axis_region.is_none() {
-        return Err(ProgramError::UnsupportedOperation {
-            message: format!(
-                "collective over axis `{axis_name}` cannot lower inside this shard_map manual region because the \
-                region does not bind that axis as a manual mesh axis",
-            ),
-        }
-        .into());
     }
-    let axis_index = mesh.axis_index(axis_name).unwrap();
-    let axis_size = mesh.axis_size(axis_name).unwrap();
+    let mut mesh = None;
+    for axis_name in axis_names.names() {
+        let Some(axis_region) = collective_state.manual_axis_region(axis_name) else {
+            return Err(ProgramError::UnsupportedOperation {
+                message: format!(
+                    "collective over axis `{axis_name}` cannot lower inside this shard_map manual region because the \
+                    region does not bind that axis as a manual mesh axis",
+                ),
+            }
+            .into());
+        };
+        match mesh {
+            None => mesh = Some(axis_region.mesh()),
+            Some(mesh) if mesh == axis_region.mesh() => {}
+            Some(_) => {
+                return Err(ProgramError::MalformedProgram(format!(
+                    "collective over axes `{axis_names}` spans manual regions with different meshes",
+                ))
+                .into());
+            }
+        }
+    }
+    let mesh = mesh.unwrap();
     let axis_sizes: Vec<usize> = mesh.axes().iter().map(|axis| axis.size()).collect();
-    let stride: usize = axis_sizes[axis_index + 1..].iter().product();
+    let strides = (0..axis_sizes.len()).map(|axis| axis_sizes[axis + 1..].iter().product()).collect::<Vec<usize>>();
+    let named_axes = axis_names.names().iter().map(|name| mesh.axis_index(name).unwrap()).collect::<Vec<_>>();
+    let axis_size: usize = named_axes.iter().map(|axis| axis_sizes[*axis]).product();
     let device_count: usize = axis_sizes.iter().product();
     let mut replica_groups: Vec<Vec<usize>> = Vec::with_capacity(device_count / axis_size);
     for device in 0..device_count {
-        // A device is a group base exactly when its coordinate along the named axis is zero.
-        if (device / stride) % axis_size == 0 {
-            replica_groups.push((0..axis_size).map(|position| device + position * stride).collect());
+        // A device is a group base exactly when its coordinates along the named axes are zero.
+        if named_axes.iter().all(|axis| (device / strides[*axis]) % axis_sizes[*axis] == 0) {
+            replica_groups.push(
+                (0..axis_size)
+                    .map(|mut position| {
+                        let mut member = device;
+                        for axis in named_axes.iter().rev() {
+                            member += (position % axis_sizes[*axis]) * strides[*axis];
+                            position /= axis_sizes[*axis];
+                        }
+                        member
+                    })
+                    .collect(),
+            );
         }
     }
     Ok((replica_groups, axis_size))
@@ -73,11 +104,12 @@ pub(crate) fn mesh_axis_replica_groups(
 /// coordinate of the enclosing mesh's other axes.
 pub(crate) fn collective_replica_groups(
     collective_state: &CollectiveLoweringState,
-    axis_name: &str,
+    axis_name: impl Into<CollectiveAxes>,
     axis_size: usize,
     axis_index_groups: Option<&[Vec<usize>]>,
 ) -> Result<(Vec<Vec<usize>>, usize), Error> {
-    let (mesh_groups, mesh_axis_size) = mesh_axis_replica_groups(collective_state, axis_name)?;
+    let axis_name = axis_name.into();
+    let (mesh_groups, mesh_axis_size) = mesh_axis_replica_groups(collective_state, &axis_name)?;
     if axis_size != mesh_axis_size {
         return Err(ProgramError::MalformedProgram(format!(
             "collective over axis `{axis_name}` records size {axis_size}, but the enclosing mesh axis has size \

@@ -14,6 +14,7 @@ use crate::domains::compilation::CompilationError;
 use crate::domains::execution::ExecutionPlan;
 use crate::domains::options::FeedbackDirectedProfile;
 use crate::domains::persistence::canonical_boundary_types;
+use crate::domains::runtimes::RuntimeRequirement;
 use crate::experimental::lowering::signature::ExecutableSignature;
 
 // TODO(eaplatanios): Review this module.
@@ -43,6 +44,9 @@ pub struct LoweredProgram {
 
     /// Logical-to-physical StableHLO/PJRT boundary mapping.
     pub(super) signature: ExecutableSignature,
+
+    /// Canonical runtime contracts resolved against the invoking session.
+    pub(super) runtime_requirements: Arc<[RuntimeRequirement]>,
 
     /// Whether execution requires Ryft's host runtime assertion handler.
     pub(super) requires_assertion_handler: bool,
@@ -90,6 +94,12 @@ impl LoweredProgram {
     #[inline]
     pub fn output_types(&self) -> &[ArrayType] {
         &self.output_types[..self.output_count]
+    }
+
+    /// Returns the runtime contracts that the invoking session must provide before compilation or execution.
+    #[inline]
+    pub fn runtime_requirements(&self) -> &[RuntimeRequirement] {
+        &self.runtime_requirements
     }
 
     /// Returns the device mesh this lowering targets.
@@ -147,6 +157,9 @@ pub struct CompiledProgram<'c> {
     pub(super) output_count: usize,
     pub(super) reference_states: Arc<[ExternalReferenceBinding]>,
     pub(super) signature: ExecutableSignature,
+
+    /// Canonical runtime contracts resolved against the invoking session.
+    pub(super) runtime_requirements: Arc<[RuntimeRequirement]>,
     pub(super) requires_assertion_handler: bool,
     pub(super) donation_flags: Arc<[bool]>,
     pub(super) capture_count: usize,
@@ -175,6 +188,7 @@ pub(super) struct InvocationMetadata<'a> {
     output_count: usize,
     reference_states: &'a [ExternalReferenceBinding],
     signature: &'a ExecutableSignature,
+    runtime_requirements: &'a [RuntimeRequirement],
     donation_flags: &'a [bool],
     capture_count: usize,
     expected_argument_shardings: &'a [Sharding],
@@ -191,6 +205,7 @@ impl<'a, 'c> From<&'a CompiledProgram<'c>> for InvocationMetadata<'a> {
             output_count: program.output_count,
             reference_states: &program.reference_states,
             signature: &program.signature,
+            runtime_requirements: &program.runtime_requirements,
             donation_flags: &program.donation_flags,
             capture_count: program.capture_count,
             expected_argument_shardings: &program.expected_argument_shardings,
@@ -209,6 +224,7 @@ impl<'a> From<&'a LoweredProgram> for InvocationMetadata<'a> {
             output_count: program.output_count,
             reference_states: &program.reference_states,
             signature: &program.signature,
+            runtime_requirements: &program.runtime_requirements,
             donation_flags: &program.donation_flags,
             capture_count: program.capture_count,
             expected_argument_shardings: &program.expected_argument_shardings,
@@ -237,6 +253,8 @@ pub(super) fn incompatible_invocation_field(
         Some("reference-state signature")
     } else if current.signature != other.signature {
         Some("executable signature")
+    } else if current.runtime_requirements != other.runtime_requirements {
+        Some("runtime requirements")
     } else if current.donation_flags != other.donation_flags {
         Some("donation flags")
     } else if current.capture_count != other.capture_count {
@@ -269,6 +287,12 @@ pub(super) fn validate_replacement_metadata(
 }
 
 impl<'c> CompiledProgram<'c> {
+    /// Returns the runtime contracts resolved against the invoking session on every call.
+    #[inline]
+    pub fn runtime_requirements(&self) -> &[RuntimeRequirement] {
+        &self.runtime_requirements
+    }
+
     /// Returns the loaded PJRT executable.
     #[inline]
     pub fn executable(&self) -> &LoadedExecutable<'c> {
@@ -367,6 +391,7 @@ mod tests {
             output_count: 0,
             reference_states: &[],
             signature: &signature,
+            runtime_requirements: &[],
             donation_flags: &[false],
             capture_count: 0,
             expected_argument_shardings: &[],
@@ -378,16 +403,15 @@ mod tests {
         assert!(matches!(validate_replacement_metadata(current, replacement),
             Err(Error::Compilation(CompilationError::IncompatibleExecutable { reason }))
                 if reason == "replacement executable has incompatible kernel execution facts"));
-        let cuda_signature = signature.clone().with_cuda_kernel_runtime(true);
-        let replacement = InvocationMetadata { signature: &cuda_signature, ..current };
-        assert!(matches!(validate_replacement_metadata(current, replacement),
+        let requirements = [crate::domains::runtimes::builtin_requirement("test.runtime")];
+        let replacement = InvocationMetadata { runtime_requirements: &requirements, ..current };
+        assert_eq!(incompatible_invocation_field(current, replacement), Some("runtime requirements"));
+        assert!(matches!(
+            validate_replacement_metadata(current, replacement),
             Err(Error::Compilation(CompilationError::IncompatibleExecutable { reason }))
-                if reason == "replacement executable has incompatible executable signature"));
-        let rocm_signature = signature.clone().with_rocm_kernel_runtime(true);
-        let replacement = InvocationMetadata { signature: &rocm_signature, ..current };
-        assert!(matches!(validate_replacement_metadata(current, replacement),
-            Err(Error::Compilation(CompilationError::IncompatibleExecutable { reason }))
-                if reason == "replacement executable has incompatible executable signature"));
+                if reason == "replacement executable has incompatible runtime requirements",
+        ));
+
         let replacement = InvocationMetadata { donation_flags: &[true], ..current };
 
         assert!(matches!(

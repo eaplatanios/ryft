@@ -68,7 +68,7 @@ where
             for instruction in region.instructions() {
                 if let Some(gather) = instruction.operation().projected_payload::<ParallelAllGatherOperation>()
                     && gather.output_variance() == ParallelAllGatherOutputVariance::Invariant
-                    && boundary.manual_axes().iter().any(|axis| axis == gather.axis_name())
+                    && boundary.manual_axes().iter().any(|axis| gather.axis_name().contains(axis))
                 {
                     return Err(ProgramError::MalformedProgram(format!(
                         "`{SHARD_MAP_OPERATION_NAME}` with unchecked manual variation requires varying output \
@@ -135,6 +135,17 @@ where
         to_shardy_in_shardings(boundary, &collective_state.bound_manual_axes, context)?.shardings();
     let mut output_shardings =
         to_shardy_out_shardings(boundary, &collective_state.bound_manual_axes, context)?.shardings();
+    // Shardy rejects a manual computation whose result drops an unreduced axis of an input (e.g., a map that completes
+    // the pending sum of its unreduced input) unless a blessed operation marks that input unreduced, so every input with
+    // unreduced axes passes through a sharding constraint, as the output resharding of JAX's lowering emits.
+    for (index, sharding) in boundary.input_shardings().iter().enumerate() {
+        if !sharding.unreduced_axes().is_empty() {
+            let operation = shardy::sharding_constraint(manual_inputs[index], input_shardings[index], location)?;
+            let constraint = block.append_operation(operation)?;
+            manual_inputs[index] =
+                constraint.result(0).expect("sdy.sharding_constraint should return one result").as_ref();
+        }
+    }
     if !threaded_effects.is_empty() {
         let token_type = context.stable_hlo_token_type()?.as_ref();
         // Tokens have rank zero and no replicated/unreduced axes. Each device carries its own token, without
@@ -388,10 +399,12 @@ mod tests {
     use indoc::indoc;
     use pretty_assertions::assert_eq;
     use ryft_core::{
-        AxisIndexOperation, BatchAxis, Context, ConvertElementTypeOperation, CustomCallOperation, DataType, Device,
-        DeviceMesh, Dimension as CoreDimension, DomainTracingContext, Dot, DotDimensionNumbers, EffectClass,
-        LogicalMesh, MeshAxis, MeshAxisType, Placeholder, Shape, ShardMapOptions, ShardMapTracer, Typed,
-        ValueProjection, batch, shard_map, shard_map_along, shard_map_with_inferred_input_shardings,
+        AxisIndexOperation, BatchAxis, Context, ConvertElementType, ConvertElementTypeOperation, CustomCallOperation,
+        DataType, Device, DeviceMesh, Dimension as CoreDimension, DomainTracingContext, Dot, DotDimensionNumbers,
+        EffectClass, LogicalMesh, MeshAxis, MeshAxisType, ParallelAllGather, ParallelAllToAll, ParallelArgExtrema,
+        ParallelCast, ParallelCastTarget, ParallelPermute, ParallelReduce, ParallelSumScatter, Placeholder,
+        ReductionKind, Shape, ShardMapOptions, ShardMapTracer, Typed, ValueProjection, batch, shard_map,
+        shard_map_along, shard_map_with_inferred_input_shardings,
     };
     use ryft_mlir::Block;
     use ryft_pjrt::{BufferType, ClientOptions, CpuClientOptions, Program as PjrtProgram, load_cpu_plugin};
@@ -403,6 +416,7 @@ mod tests {
         test_spmd_compilation_options, test_vector_type,
     };
     use crate::experimental::ops::ProgramBuilder as ArrayIrProgramBuilder;
+    use crate::experimental::tracing::{TracedProgram, trace_with_context};
     use crate::operations::debugging::PRINT_CUSTOM_CALL_TARGET;
     use crate::tests::{values_from_bytes, values_to_bytes};
     use crate::{Array, Domain, FromPjrt, Options, Session, ToMlir, Value};
@@ -1370,25 +1384,48 @@ mod tests {
     /// Compiles `module` for two CPU devices, executes it with one `f32` input buffer of shape `local_shape` per device
     /// holding `device_inputs[device]`, and returns the elements of the first output of every device.
     fn execute_on_two_cpu_devices(module: String, local_shape: &[u64], device_inputs: [&[f32]; 2]) -> Vec<Vec<f32>> {
+        execute_inputs_on_two_cpu_devices(module, &[(local_shape, device_inputs)])
+    }
+
+    /// Compiles `module` for two CPU devices, executes it with one `f32` buffer per device for every `(local_shape,
+    /// device_inputs)` entry of `inputs`, holding `device_inputs[device]`, and returns the elements of the first output
+    /// of every device.
+    fn execute_inputs_on_two_cpu_devices(module: String, inputs: &[(&[u64], [&[f32]; 2])]) -> Vec<Vec<f32>> {
+        execute_inputs_on_cpu_devices(module, inputs)
+    }
+
+    /// Compiles `module` for `N` CPU devices, executes it with one `f32` buffer per device for every `(local_shape,
+    /// device_inputs)` entry of `inputs`, holding `device_inputs[device]`, and returns the elements of the first output
+    /// of every device.
+    fn execute_inputs_on_cpu_devices<const N: usize>(
+        module: String,
+        inputs: &[(&[u64], [&[f32]; N])],
+    ) -> Vec<Vec<f32>> {
         use ryft_pjrt::{ExecutionDeviceInputs, ExecutionInput};
 
         let plugin = load_cpu_plugin().unwrap();
         let client = plugin
-            .client(ClientOptions::CPU(CpuClientOptions { device_count: Some(2), ..Default::default() }))
+            .client(ClientOptions::CPU(CpuClientOptions { device_count: Some(N), ..Default::default() }))
             .unwrap();
         let executable = client
-            .compile(&PjrtProgram::Mlir { bytecode: module.into_bytes() }, &test_spmd_compilation_options(2))
+            .compile(&PjrtProgram::Mlir { bytecode: module.into_bytes() }, &test_spmd_compilation_options(N))
             .unwrap();
         let inputs = executable
             .addressable_devices()
             .unwrap()
             .into_iter()
-            .zip(device_inputs)
-            .map(|(device, values)| {
-                let buffer = client
-                    .buffer(values_to_bytes(values).as_slice(), BufferType::F32, local_shape, None, device, None)
-                    .unwrap();
-                vec![ExecutionInput { buffer: Arc::new(buffer), donatable: false }]
+            .enumerate()
+            .map(|(index, device)| {
+                inputs
+                    .iter()
+                    .map(|(local_shape, device_inputs)| {
+                        let bytes = values_to_bytes(device_inputs[index]);
+                        let buffer = client
+                            .buffer(bytes.as_slice(), BufferType::F32, *local_shape, None, device.clone(), None)
+                            .unwrap();
+                        ExecutionInput { buffer: Arc::new(buffer), donatable: false }
+                    })
+                    .collect::<Vec<_>>()
             })
             .collect::<Vec<_>>();
         executable
@@ -1408,6 +1445,216 @@ mod tests {
             .into_iter()
             .map(|output| values_from_bytes::<f32>(&output.outputs[0].copy_to_host(None).unwrap().r#await().unwrap()))
             .collect()
+    }
+
+    #[test]
+    fn test_to_mlir_module_for_program_with_parallel_casts_executes_on_cpu() {
+        // The body casts the shared `w` to reduced and then to varying, scales each device's tile of `v` by it, casts
+        // the products to unreduced, and sums them. The casts lower to nothing and the sum to an all-reduce, so both
+        // devices hold `w · (v₀ + v₁)`, as the same program does in JAX (`.tasks/shard_map_jax_parity_gaps/
+        // m3_oracles.py`).
+        let mesh = test_manual_mesh("x", 2);
+        let sharded = Sharding::new(mesh.clone(), vec![ShardingDimension::sharded(["x"])]).unwrap();
+        let replicated = Sharding::replicated(mesh.clone(), 1);
+        let traced: TracedProgram<(ArrayType, ArrayType), ArrayType> = trace_with_context(
+            |_, (w, v): (ArrayTracer, ArrayTracer)| {
+                Ok(shard_map(
+                    |(w, v): (ArrayTracer, ArrayTracer)| {
+                        let w = w.parallel_cast("x", ParallelCastTarget::Reduced)?;
+                        let w = w.parallel_cast("x", ParallelCastTarget::Varying)?;
+                        let product = (w * v).parallel_cast("x", ParallelCastTarget::Unreduced)?;
+                        Ok(product.parallel_reduce(ReductionKind::Sum, "x")?)
+                    },
+                    (w, v),
+                    mesh.clone(),
+                    (replicated.clone(), sharded.clone()),
+                    replicated.clone(),
+                    ShardMapOptions::new(),
+                )?)
+            },
+            (
+                ArrayType::new_static(DataType::F32, [2]).with_sharding(replicated.clone()).unwrap(),
+                ArrayType::new_static(DataType::F32, [4]).with_sharding(sharded.clone()).unwrap(),
+            ),
+        )
+        .unwrap();
+        let module = traced.to_mlir_module("main").unwrap();
+        assert_eq!(
+            module,
+            indoc! {"
+                module {
+                  sdy.mesh @mesh = <[\"x\"=2]>
+                  func.func @main(%arg0: tensor<2xf32> {sdy.sharding = #sdy.sharding<@mesh, [{}], replicated={\"x\"}>}, \
+                      %arg1: tensor<4xf32> {sdy.sharding = #sdy.sharding<@mesh, [{\"x\"}]>}) -> \
+                      (tensor<2xf32> {sdy.sharding = #sdy.sharding<@mesh, [{}], replicated={\"x\"}>}) {
+                    %0 = sdy.manual_computation(%arg0, %arg1) in_shardings=[<@mesh, [{}], replicated={\"x\"}>, \
+                        <@mesh, [{\"x\"}]>] out_shardings=[<@mesh, [{}], replicated={\"x\"}>] manual_axes={\"x\"} \
+                        (%arg2: tensor<2xf32>, %arg3: tensor<2xf32>) {
+                      %1 = stablehlo.multiply %arg2, %arg3 : tensor<2xf32>
+                      %2 = \"stablehlo.all_reduce\"(%1) <{channel_handle = \
+                          #stablehlo.channel_handle<handle = 1, type = 1>, replica_groups = \
+                          dense<[[0, 1]]> : tensor<1x2xi64>, use_global_device_ids}> ({
+                      ^bb0(%arg4: tensor<f32>, %arg5: tensor<f32>):
+                        %3 = stablehlo.add %arg4, %arg5 : tensor<f32>
+                        stablehlo.return %3 : tensor<f32>
+                      }) : (tensor<2xf32>) -> tensor<2xf32>
+                      sdy.return %2 : tensor<2xf32>
+                    } : (tensor<2xf32>, tensor<4xf32>) -> tensor<2xf32>
+                    return %0 : tensor<2xf32>
+                  }
+                }
+            "},
+        );
+        assert_eq!(
+            execute_inputs_on_two_cpu_devices(
+                module,
+                &[(&[2], [&[2.0, 3.0], &[2.0, 3.0]]), (&[2], [&[1.0, 4.0], &[5.0, 7.0]])],
+            ),
+            vec![vec![12.0, 33.0], vec![12.0, 33.0]],
+        );
+
+        // An unreduced output of one checked map carries the per-device summands into another checked map, whose sum
+        // completes them.
+        let unreduced = replicated.clone().with_unreduced_axes(["x"]).unwrap();
+        let traced: TracedProgram<ArrayType, ArrayType> = trace_with_context(
+            |_, x: ArrayTracer| {
+                let summands = shard_map(
+                    |x: ArrayTracer| Ok(x.parallel_cast("x", ParallelCastTarget::Unreduced)?),
+                    x,
+                    mesh.clone(),
+                    sharded.clone(),
+                    unreduced.clone(),
+                    ShardMapOptions::new(),
+                )?;
+                Ok(shard_map(
+                    |summands: ArrayTracer| Ok(summands.parallel_reduce(ReductionKind::Sum, "x")?),
+                    summands,
+                    mesh.clone(),
+                    unreduced.clone(),
+                    replicated.clone(),
+                    ShardMapOptions::new(),
+                )?)
+            },
+            ArrayType::new_static(DataType::F32, [4]).with_sharding(sharded.clone()).unwrap(),
+        )
+        .unwrap();
+        let module = traced.to_mlir_module("main").unwrap();
+        assert_eq!(
+            module,
+            indoc! {"
+                module {
+                  sdy.mesh @mesh = <[\"x\"=2]>
+                  func.func @main(%arg0: tensor<4xf32> {sdy.sharding = #sdy.sharding<@mesh, [{\"x\"}]>}) -> \
+                      (tensor<2xf32> {sdy.sharding = #sdy.sharding<@mesh, [{}], replicated={\"x\"}>}) {
+                    %0 = sdy.manual_computation(%arg0) in_shardings=[<@mesh, [{\"x\"}]>] \
+                        out_shardings=[<@mesh, [{}], unreduced={\"x\"}>] manual_axes={\"x\"} (%arg1: tensor<2xf32>) {
+                      sdy.return %arg1 : tensor<2xf32>
+                    } : (tensor<4xf32>) -> tensor<2xf32>
+                    %1 = sdy.sharding_constraint %0 <@mesh, [{}], unreduced={\"x\"}> : tensor<2xf32>
+                    %2 = sdy.manual_computation(%1) in_shardings=[<@mesh, [{}], unreduced={\"x\"}>] \
+                        out_shardings=[<@mesh, [{}], replicated={\"x\"}>] manual_axes={\"x\"} (%arg1: tensor<2xf32>) {
+                      %3 = \"stablehlo.all_reduce\"(%arg1) <{channel_handle = \
+                          #stablehlo.channel_handle<handle = 1, type = 1>, replica_groups = \
+                          dense<[[0, 1]]> : tensor<1x2xi64>, use_global_device_ids}> ({
+                      ^bb0(%arg2: tensor<f32>, %arg3: tensor<f32>):
+                        %4 = stablehlo.add %arg2, %arg3 : tensor<f32>
+                        stablehlo.return %4 : tensor<f32>
+                      }) : (tensor<2xf32>) -> tensor<2xf32>
+                      sdy.return %3 : tensor<2xf32>
+                    } : (tensor<2xf32>) -> tensor<2xf32>
+                    return %2 : tensor<2xf32>
+                  }
+                }
+            "},
+        );
+        assert_eq!(execute_on_two_cpu_devices(module, &[2], [&[1.0, 2.0], &[3.0, 4.0]]), vec![vec![4.0, 6.0]; 2]);
+    }
+
+    #[test]
+    fn test_to_mlir_module_for_program_with_parallel_arg_extrema_executes_on_cpu() {
+        // Device 0 holds `[3, 1, 2]` and device 1 holds `[3, 5, 0]`, so the first element ties and resolves to the lowest
+        // position, as JAX's `pargmax` and `pargmin` resolve it (`.tasks/shard_map_jax_parity_gaps/m3_oracles.py`). The
+        // positions are converted to `f32` outside the map only to read them back.
+        let mesh = test_manual_mesh("x", 2);
+        let sharded = Sharding::new(mesh.clone(), vec![ShardingDimension::sharded(["x"])]).unwrap();
+        let replicated = Sharding::replicated(mesh.clone(), 1);
+        for (argmax, expected) in [(true, [0.0, 1.0, 0.0]), (false, [0.0, 0.0, 1.0])] {
+            let traced: TracedProgram<ArrayType, ArrayType> = trace_with_context(
+                |_, x: ArrayTracer| {
+                    let positions = shard_map(
+                        |x: ArrayTracer| Ok(if argmax { x.parallel_argmax("x")? } else { x.parallel_argmin("x")? }),
+                        x,
+                        mesh.clone(),
+                        sharded.clone(),
+                        replicated.clone(),
+                        ShardMapOptions::new(),
+                    )?;
+                    Ok(positions.convert_element_type(DataType::F32)?)
+                },
+                ArrayType::new_static(DataType::F32, [6]).with_sharding(sharded.clone()).unwrap(),
+            )
+            .unwrap();
+            let module = traced.to_mlir_module("main").unwrap();
+            assert_eq!(
+                execute_on_two_cpu_devices(module, &[3], [&[3.0, 1.0, 2.0], &[3.0, 5.0, 0.0]]),
+                vec![expected.to_vec(); 2],
+            );
+        }
+    }
+
+    #[test]
+    fn test_to_mlir_module_for_program_with_multi_axis_collectives_executes_on_cpu() {
+        // Over several manual axes, the participants are positioned along the combined axis, which linearizes the axes
+        // in the given order with the first axis major. Every device holds its tile of `0..n`, sharded along `("x", "y")`
+        // on a 2x2 mesh, so the expected values are those of JAX's collectives with tuple axis names
+        // (`.tasks/shard_map_jax_parity_gaps/m3_oracles.py`).
+        let mesh = LogicalMesh::new(vec![
+            MeshAxis::new("x", 2, MeshAxisType::Manual).unwrap(),
+            MeshAxis::new("y", 2, MeshAxisType::Manual).unwrap(),
+        ])
+        .unwrap();
+        let sharded = Sharding::new(mesh.clone(), vec![ShardingDimension::sharded(["x", "y"])]).unwrap();
+        let run = |n: usize, body: &dyn Fn(ArrayTracer) -> Result<ArrayTracer, ProgramError>| {
+            let traced: TracedProgram<ArrayType, ArrayType> = trace_with_context(
+                |_, x: ArrayTracer| {
+                    Ok(shard_map(
+                        |x: ArrayTracer| body(x),
+                        x,
+                        mesh.clone(),
+                        sharded.clone(),
+                        sharded.clone(),
+                        ShardMapOptions::new(),
+                    )?)
+                },
+                ArrayType::new_static(DataType::F32, [n]).with_sharding(sharded.clone()).unwrap(),
+            )
+            .unwrap();
+            let tile = n / 4;
+            let values = (0..n).map(|value| value as f32).collect::<Vec<_>>();
+            let tiles: [&[f32]; 4] = std::array::from_fn(|device| &values[device * tile..(device + 1) * tile]);
+            execute_inputs_on_cpu_devices(traced.to_mlir_module("main").unwrap(), &[(&[tile as u64], tiles)]).concat()
+        };
+        for (axes, scatter, all_to_all, gather) in [
+            (
+                ["x", "y"],
+                vec![24.0, 28.0, 32.0, 36.0],
+                vec![0.0, 4.0, 8.0, 12.0, 1.0, 5.0, 9.0, 13.0, 2.0, 6.0, 10.0, 14.0, 3.0, 7.0, 11.0, 15.0],
+                [0.0, 1.0, 2.0, 3.0],
+            ),
+            (
+                ["y", "x"],
+                vec![24.0, 32.0, 28.0, 36.0],
+                vec![0.0, 8.0, 4.0, 12.0, 2.0, 10.0, 6.0, 14.0, 1.0, 9.0, 5.0, 13.0, 3.0, 11.0, 7.0, 15.0],
+                [0.0, 2.0, 1.0, 3.0],
+            ),
+        ] {
+            assert_eq!(run(16, &|x| Ok(x.parallel_sum_scatter_tiled(axes, 0)?)), scatter);
+            assert_eq!(run(16, &|x| Ok(x.parallel_all_to_all_tiled(axes, 0, 0)?)), all_to_all);
+            assert_eq!(run(4, &|x| Ok(x.parallel_all_gather_tiled(axes, 0)?)), gather.repeat(4));
+        }
+        let pairs = vec![(0, 1), (1, 2), (2, 3), (3, 0)];
+        assert_eq!(run(4, &|x| Ok(x.parallel_permute(["x", "y"], pairs.clone())?)), vec![3.0, 0.0, 1.0, 2.0]);
+        assert_eq!(run(4, &|x| Ok(x.parallel_permute(["y", "x"], pairs.clone())?)), vec![3.0, 2.0, 0.0, 1.0]);
     }
 
     #[test]
@@ -1548,12 +1795,13 @@ mod tests {
                         out_shardings=[<@mesh, [{}], unreduced={\"x\"}>] manual_axes={\"x\"} (%arg1: tensor<1xf32>) {
                       sdy.return %arg1 : tensor<1xf32>
                     } : (tensor<2xf32>) -> tensor<1xf32>
-                    %1 = sdy.manual_computation(%0) in_shardings=[<@mesh, [{}], unreduced={\"x\"}>] \
+                    %1 = sdy.sharding_constraint %0 <@mesh, [{}], unreduced={\"x\"}> : tensor<1xf32>
+                    %2 = sdy.manual_computation(%1) in_shardings=[<@mesh, [{}], unreduced={\"x\"}>] \
                         out_shardings=[<@mesh, [{}], unreduced={\"x\"}>] manual_axes={\"x\"} (%arg1: tensor<1xf32>) {
-                      %2 = stablehlo.multiply %arg1, %arg1 : tensor<1xf32>
-                      sdy.return %2 : tensor<1xf32>
+                      %3 = stablehlo.multiply %arg1, %arg1 : tensor<1xf32>
+                      sdy.return %3 : tensor<1xf32>
                     } : (tensor<1xf32>) -> tensor<1xf32>
-                    return %1 : tensor<1xf32>
+                    return %2 : tensor<1xf32>
                   }
                 }
             "},
@@ -1841,12 +2089,13 @@ mod tests {
                   func.func @main(%arg0: tensor<1xf32> {sdy.sharding = \
                       #sdy.sharding<@mesh, [{}], unreduced={\"x\"}>}) -> (tensor<1xf32> {sdy.sharding = \
                       #sdy.sharding<@mesh, [{}], unreduced={\"x\"}>}) {
-                    %0 = sdy.manual_computation(%arg0) in_shardings=[<@mesh, [{}], unreduced={\"x\"}>] \
+                    %0 = sdy.sharding_constraint %arg0 <@mesh, [{}], unreduced={\"x\"}> : tensor<1xf32>
+                    %1 = sdy.manual_computation(%0) in_shardings=[<@mesh, [{}], unreduced={\"x\"}>] \
                         out_shardings=[<@mesh, [{}], unreduced={\"x\"}>] manual_axes={\"x\"} (%arg1: tensor<1xf32>) {
-                      %1 = stablehlo.add %arg1, %arg1 : tensor<1xf32>
-                      sdy.return %1 : tensor<1xf32>
+                      %2 = stablehlo.add %arg1, %arg1 : tensor<1xf32>
+                      sdy.return %2 : tensor<1xf32>
                     } : (tensor<1xf32>) -> tensor<1xf32>
-                    return %0 : tensor<1xf32>
+                    return %1 : tensor<1xf32>
                   }
                 }
             "},

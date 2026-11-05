@@ -17,7 +17,7 @@ use ryft_core::{
     PartialEvaluationContext, PartialEvaluationDriver, PartialEvaluationValue, PartialValue,
     PartiallyEvaluatableOperation, ProgramBatchingOutputAxesPolicy, ProgramError, ReferenceDischargeContext,
     ReferenceDischargeDriver, ReferenceDischargePolicy, ReferenceDischargeValue, ReferenceDischargeableOperation,
-    RegionDataFlow, RegionId, RegionInterface, RegionLiveness, RegionRef, RegionSlot,
+    RegionDataFlow, RegionId, RegionInterface, RegionLiveness, RegionRef, RegionRole, RegionSlot,
     RematerializationOptimizationBarrier, ShardMapOperation, StagedCallOperation, Tracer as CoreTracer, TracingContext,
     TransposableOperation, TranspositionContext, TranspositionDriver, Type, TypeError, TypeIdentityRenaming,
     TypeRefinements, Typed, TypedProgram, Value as CoreValue, ValueProjection, ValueResolution, Zero,
@@ -263,14 +263,30 @@ where
             if instruction.operation().projected_payload::<ShardMapOperation>().is_some() {
                 continue;
             }
-            for &nested in instruction.regions() {
-                walk(program, nested, target_platform, counts, order, memo, named_calls, visited)?;
+            if let Some(key) = instruction.operation().composite_key() {
+                let types = |atoms: &[AtomId]| {
+                    atoms.iter().map(|atom| region_ref.atoms()[atom.index()].r#type().into_owned()).collect::<Vec<_>>()
+                };
+                if NamedCompositeImplementation::select(
+                    key,
+                    &types(instruction.inputs()),
+                    &types(instruction.outputs()),
+                    target_platform,
+                )
+                .is_some()
+                {
+                    continue;
+                }
+            }
+            for (index, &nested) in instruction.regions().iter().enumerate() {
+                if instruction.operation().region_role(index) == Some(RegionRole::Computation) {
+                    walk(program, nested, target_platform, counts, order, memo, named_calls, visited)?;
+                }
             }
 
-            // Calls that a backend implementation replaces need no shared function. Calls that share an interned body
-            // region, a key, and a boundary also share their backend selection, so only the first such call computes
-            // it, and the others only count. Calls of different keys (e.g., of different versions) or boundaries may
-            // share one body region but not their backend selection, so they are grouped separately.
+            // Calls that share an interned body region, a key, and a boundary share a function. Calls of different
+            // keys (e.g., of different versions) or boundaries are grouped separately because their definitions may
+            // require different backend implementations or emitted signatures.
             if let Some(composite_key) = instruction.operation().composite_key() {
                 let Some(&body_region) = instruction.regions().first() else {
                     continue;
@@ -304,9 +320,6 @@ where
                     instruction.inputs().iter().map(|atom| atom_type(atom).into_owned()).collect::<Vec<_>>();
                 let output_types =
                     instruction.outputs().iter().map(|atom| atom_type(atom).into_owned()).collect::<Vec<_>>();
-                let replaced =
-                    NamedCompositeImplementation::select(composite_key, &input_types, &output_types, target_platform)
-                        .is_some();
                 named_calls.index.entry(body_region).or_default().push(named_calls.calls.len());
                 named_calls.calls.push(NamedRegionCall {
                     region: body_region,
@@ -314,7 +327,6 @@ where
                     input_types,
                     output_types,
                     count: 1,
-                    replaced,
                 });
                 continue;
             }
@@ -355,9 +367,6 @@ where
 
     // Each named composite body region is rendered and counted once, with the number of calls that share it.
     for call in named_calls.calls {
-        if call.replaced {
-            continue;
-        }
         let named_key =
             NamedFunctionKey { key: call.composite, input_types: call.input_types, output_types: call.output_types };
         let key = memo
@@ -427,9 +436,6 @@ struct NamedRegionCall {
 
     /// Number of calls.
     count: usize,
-
-    /// Whether a backend implementation replaces the calls.
-    replaced: bool,
 }
 
 /// Builds the [`JitCallFunctionMap`] for a module by emitting a shared private function for every `jit_call` callee
@@ -1855,12 +1861,12 @@ mod tests {
     use ryft_core::{
         AddOperation, Array as CoreArray, ArrayIrType, ArrayOperation, ArrayType, AssertOperation, AtomId,
         AxisIndexOperation, BroadcastOperation, CaptureReference, CompareOperation, ComparisonDirection,
-        CompositeTransposeOperation, ConditionOperation, Context, CosOperation, CotangentDestinationKind,
-        CotangentDestinations, DataType, DifferentiableType, DifferentiationError, Dimension as CoreDimension,
-        DimensionBounds, DimensionFromScalarOperation, DimensionType, DimensionValue, DimensionVariable,
-        DotDimensionNumbers, DotOperation, DynamicBroadcastOperation, EffectClasses, InputRegionProvenance,
-        IotaOperation, LogicalMesh, MaybeZero, MeshAxis, MeshAxisType, MulOperation, NoStorage, NothingSavable,
-        Operation as CoreOperation, OutputRegionProvenance, PartialValue, Placeholder, PrintOperation,
+        CompositeJvpRule, CompositeOperation, CompositeTransposeOperation, ConditionOperation, Context, CosOperation,
+        CotangentDestinationKind, CotangentDestinations, CustomCallOperation, DataType, DifferentiableType,
+        DifferentiationError, Dimension as CoreDimension, DimensionBounds, DimensionFromScalarOperation, DimensionType,
+        DimensionValue, DimensionVariable, DotDimensionNumbers, DotOperation, DynamicBroadcastOperation, EffectClasses,
+        InputRegionProvenance, IotaOperation, LogicalMesh, MaybeZero, MeshAxis, MeshAxisType, MulOperation, NoStorage,
+        NothingSavable, Operation as CoreOperation, OutputRegionProvenance, PartialValue, Placeholder, PrintOperation,
         ProgramBuilder as CoreProgramBuilder, ProgramError, RecursiveBatchingDriver, ReferenceAddUpdateOperation,
         ReferenceFreezeOperation, ReferenceNewOperation, ReferenceReadOperation, ReferenceSource,
         ReferenceSwapOperation, ReferenceType, RegionDataFlow, RegionDriver, RegionInterface, RegionRef,
@@ -1872,6 +1878,9 @@ mod tests {
     };
     use ryft_macros::Operation;
 
+    use crate::domains::runtimes::builtin_requirement;
+    use crate::domains::with_runtime_requirements;
+    use crate::experimental::lowering::lower_mlir_module_for_program;
     use crate::experimental::lowering::tests::{
         MixedValue, ProgramBuilder, add_jit_call, execute_mixed_program, identity_branch,
         lower_replicated_shard_map_body, neg_branch, test_vector_type, unproject_plain_program,
@@ -2183,6 +2192,127 @@ mod tests {
                 }
             "#},
         );
+    }
+
+    #[test]
+    fn test_runtime_requirements_include_shared_callees_but_exclude_dormant_rules() {
+        use ryft_core::{CustomRuleDefinition, CustomRuleRegistration, NamedComposite};
+
+        let array_type = test_vector_type(4);
+        let callee = |identifier| {
+            let mut builder = ArrayIrProgramBuilder::new();
+            let input = builder.add_input(array_type.clone().into());
+            let operation = with_runtime_requirements(
+                CustomCallOperation::new(identifier, vec![array_type.clone()]),
+                [builtin_requirement(identifier)],
+            )
+            .unwrap();
+            let output = builder.add_instruction(operation, Vec::new(), vec![input], None).unwrap()[0];
+            Arc::new(
+                builder
+                    .build::<Vec<Constant>, Vec<Constant>>(vec![output], vec![Placeholder], vec![Placeholder])
+                    .unwrap(),
+            )
+        };
+        let active = callee("test.active");
+        let dormant = callee("test.dormant");
+        let primal = {
+            let mut builder = ArrayIrProgramBuilder::new();
+            let input = builder.add_input(array_type.clone().into());
+            let first = add_jit_call(&mut builder, &active, vec![input]);
+            let second = add_jit_call(&mut builder, &active, vec![input]);
+            let output =
+                builder.add_instruction(AddOperation::new(), Vec::new(), vec![first, second], None).unwrap()[0];
+            builder
+                .build::<Vec<Constant>, Vec<Constant>>(vec![output], vec![Placeholder], vec![Placeholder])
+                .unwrap()
+        };
+        let jvp = {
+            let mut builder = ArrayIrProgramBuilder::new();
+            let input = builder.add_input(array_type.clone().into());
+            let tangent = builder.add_input(array_type.clone().into());
+            let first = add_jit_call(&mut builder, &dormant, vec![tangent]);
+            let second = add_jit_call(&mut builder, &dormant, vec![tangent]);
+            let output_tangent =
+                builder.add_instruction(AddOperation::new(), Vec::new(), vec![first, second], None).unwrap()[0];
+            builder
+                .build::<Vec<Constant>, Vec<Constant>>(
+                    vec![input, output_tangent],
+                    vec![Placeholder; 2],
+                    vec![Placeholder; 2],
+                )
+                .unwrap()
+        };
+        let mut builder = ArrayIrProgramBuilder::new();
+        let input = builder.add_input(array_type.clone().into());
+        let primal_region = builder.import_region(primal.entry_region_ref());
+        let jvp = builder.import_region(jvp.entry_region_ref());
+        let output = builder
+            .add_instruction(
+                Operation::Composite(CompositeOperation::from_rule_regions(CompositeJvpRule::Explicit, false)),
+                vec![primal_region, jvp],
+                vec![input],
+                None,
+            )
+            .unwrap()[0];
+        let program = builder
+            .build::<Vec<Constant>, Vec<Constant>>(vec![output], vec![Placeholder], vec![Placeholder])
+            .unwrap();
+        let lowered = lower_mlir_module_for_program(
+            &program,
+            &[],
+            &vec![array_type.clone()],
+            &vec![array_type.clone()],
+            "main",
+            None,
+            None,
+            None,
+        )
+        .unwrap();
+
+        assert_eq!(lowered.runtime_requirements.as_ref(), &[builtin_requirement("test.active")]);
+        assert!(lowered.stable_hlo.contains("func.func private @jit_call_0"));
+        assert_eq!(lowered.stable_hlo.matches("call @jit_call_0").count(), 2);
+        assert!(!lowered.stable_hlo.contains("test.dormant"));
+
+        // Backend replacement also makes a source region dormant: helper discovery must not emit its callees.
+        let named = NamedComposite::new(
+            CompositeKey::new("ryft.tests.xla_named_square", 1),
+            |types: &[ArrayIrType]| Ok(types.to_vec()),
+            |inputs| Ok(vec![inputs[0].clone() + inputs[0].clone()]),
+        );
+        let rules: CustomRuleRegistration<Constant, Operation> =
+            CustomRuleRegistration::new(CustomRuleDefinition::new("replaced").with_named_composite(named));
+        let mut builder = ArrayIrProgramBuilder::new();
+        let input = builder.add_input(array_type.clone().into());
+        let body = builder.import_region(primal.entry_region_ref());
+        let output = builder
+            .add_instruction(
+                Operation::Composite(CompositeOperation::new(rules.reference())),
+                vec![body],
+                vec![input],
+                None,
+            )
+            .unwrap()[0];
+        let program = builder
+            .build::<Vec<Constant>, Vec<Constant>>(vec![output], vec![Placeholder], vec![Placeholder])
+            .unwrap();
+        let lowered = lower_mlir_module_for_program(
+            &program,
+            &[],
+            &vec![array_type.clone()],
+            &vec![array_type],
+            "main",
+            None,
+            None,
+            Some("cuda"),
+        )
+        .unwrap();
+
+        assert!(lowered.runtime_requirements.is_empty());
+        assert!(lowered.stable_hlo.contains("stablehlo.multiply"));
+        assert!(!lowered.stable_hlo.contains("test.active"));
+        assert!(!lowered.stable_hlo.contains("func.func private"));
     }
 
     #[test]

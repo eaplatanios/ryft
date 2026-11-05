@@ -28,14 +28,12 @@ use crate::domains::Domain;
 use crate::domains::compilation::CompilationError;
 use crate::domains::effects::{ensure_effect_dispatch_allowed, format_effect_failures};
 use crate::domains::programs::CompiledProgram;
+use crate::domains::runtimes::RuntimeRequirement;
 #[cfg(test)]
 use crate::domains::tests::{
     StatefulFailureInjection, take_stateful_completion_injection, take_stateful_failure_injection,
 };
 use crate::experimental::lowering::signature::ExecutableSignature;
-use crate::kernels::CudaKernelRuntime;
-#[cfg(feature = "rocm")]
-use crate::kernels::RocmKernelRuntime;
 use crate::{Array, ArrayError, Error, FromPjrt, ToPjrt, Value};
 
 // TODO(eaplatanios): Review this module.
@@ -310,61 +308,12 @@ impl ExecutionPlan {
 }
 
 impl<'c> Domain<'c> {
-    /// Ensures that process-local runtime support required by one compiled program is available.
-    pub(super) fn ensure_runtime_requirements(
-        &self,
-        signature: &ExecutableSignature,
-        platform_name: &str,
-    ) -> Result<(), Error> {
-        if signature.requires_cuda_kernel_runtime() {
-            if !platform_name.eq_ignore_ascii_case("cuda") {
-                return Err(Error::custom(crate::kernels::KernelEmbeddingError::Invalid {
-                    message: "cuda artifact calls require a cuda platform".to_owned(),
-                }));
-            }
-            let mut runtime = self.session.cuda_kernel_runtime.lock().expect("cuda runtime owner mutex poisoned");
-            if runtime.is_none() {
-                *runtime = Some(Box::new(CudaKernelRuntime::new(self.client())?));
-            }
-        }
-        if signature.requires_rocm_kernel_runtime() {
-            if !platform_name.eq_ignore_ascii_case("rocm") {
-                return Err(Error::custom(crate::kernels::KernelEmbeddingError::Invalid {
-                    message: "rocm artifact calls require a rocm platform".into(),
-                }));
-            }
-            #[cfg(not(feature = "rocm"))]
-            return Err(Error::custom(crate::kernels::KernelEmbeddingError::Invalid {
-                message: "rocm artifact execution requires the `rocm` feature".into(),
-            }));
-            #[cfg(feature = "rocm")]
-            {
-                let mut runtime = self.session.rocm_kernel_runtime.lock().expect("rocm runtime owner mutex poisoned");
-                if runtime.is_none() {
-                    *runtime = Some(Box::new(RocmKernelRuntime::new(self.client())?));
-                }
-            }
-        }
-        // I/O uses the shared registered-handler surface. Register the built-in print target at compilation and
-        // reload on the platforms whose handler exists (CPU, and CUDA with a `cuda-*` feature), so ordinary eager
-        // printing needs no separate process-global initialization by the caller.
-        let has_print_handler = platform_name.eq_ignore_ascii_case("cpu")
-            || (cfg!(any(feature = "cuda-12", feature = "cuda-13")) && platform_name.eq_ignore_ascii_case("cuda"));
-        if (signature.has_ordered_io() || signature.has_unordered_io()) && has_print_handler {
-            crate::operations::debugging::ensure_print_handler_registered(self.client())?;
-        }
-        if !signature.requires_assertion_handler() {
+    /// Initializes required extensions on the invoking session before compilation or native loading.
+    pub(super) fn ensure_runtime_requirements(&self, requirements: &[RuntimeRequirement]) -> Result<(), Error> {
+        if requirements.is_empty() {
             return Ok(());
         }
-        let supported = platform_name.eq_ignore_ascii_case("cpu")
-            || (cfg!(any(feature = "cuda-12", feature = "cuda-13")) && platform_name.eq_ignore_ascii_case("cuda"));
-        if !supported {
-            return Err(Error::Execution(ExecutionError::UnsupportedAssertionPlatform {
-                platform: platform_name.to_string(),
-            }));
-        }
-        crate::operations::assertions::ensure_assertion_handler_registered(self.client())?;
-        Ok(())
+        self.session.runtimes.ensure(requirements, self.target()?)
     }
 
     /// Validates that this domain's PJRT client owns `program`.
@@ -428,13 +377,10 @@ impl<'c> Domain<'c> {
     ) -> Result<PreparedExecution<'c>, Error> {
         ensure_effect_dispatch_allowed()?;
         self.validate_program_owner(program)?;
-        if program.kernel_execution_facts.is_some()
-            || program.signature.requires_cuda_kernel_runtime()
-            || program.signature.requires_rocm_kernel_runtime()
-        {
+        if program.kernel_execution_facts.is_some() {
             crate::kernels::distributed::validate_kernel_participants(self.client(), &program.mesh)?;
         }
-        self.ensure_runtime_requirements(&program.signature, &program.platform_name)?;
+        self.ensure_runtime_requirements(&program.runtime_requirements)?;
         if inputs.len() != program.input_types.len() {
             return Err(Error::from(ProgramError::InvalidInputCount {
                 expected: program.input_types.len(),
@@ -1754,18 +1700,6 @@ impl<'c> Domain<'c> {
         let addressable_device_count = arguments.addressable_device_ids().len();
         let ordered = program.signature.has_ordered_io();
         if ordered {
-            // Native ordered-I/O token transport is proven on these platforms: CPU through this module's CPU tests
-            // and CUDA through their `*_on_cuda` siblings (run with the `cuda-13` feature on a CUDA device). Other
-            // plugins are rejected until their transport is verified the same way.
-            const VERIFIED_ORDERED_IO_PLATFORMS: [&str; 2] = ["cpu", "cuda"];
-            if !VERIFIED_ORDERED_IO_PLATFORMS
-                .iter()
-                .any(|platform| program.platform_name.eq_ignore_ascii_case(platform))
-            {
-                return Err(
-                    ExecutionError::UnsupportedEffectPlatform { platform: program.platform_name.to_string() }.into()
-                );
-            }
             if !self.target()?.is_fully_addressable_single_process_mesh(&program.mesh) {
                 return Err(ExecutionError::UnsupportedEffectDeviceAssignment.into());
             }
@@ -1825,45 +1759,17 @@ impl<'c> Domain<'c> {
                 "injected failure before execution submission".to_string(),
             )));
         }
-        let context = if program.signature.requires_cuda_kernel_runtime() {
-            let session = &self.session;
-            let runtime = session.cuda_kernel_runtime.lock().expect("cuda runtime owner mutex poisoned");
-            // ensure_runtime_requirements initialized the stable boxed owner. This session cannot drop during this
-            // borrow; immediately after successful submission its existing fence is retained before output work.
-            Some(unsafe { runtime.as_ref().unwrap().execution_context(self.client()) }?)
-        } else if program.signature.requires_rocm_kernel_runtime() {
-            #[cfg(feature = "rocm")]
-            {
-                let session = &self.session;
-                let runtime = session.rocm_kernel_runtime.lock().expect("rocm runtime owner mutex poisoned");
-                // Preparation established the stable boxed allocation; the fence below retains it through completion.
-                Some(unsafe { runtime.as_ref().unwrap().execution_context(self.client()) }?)
-            }
-            #[cfg(not(feature = "rocm"))]
-            return Err(Error::custom(crate::kernels::KernelEmbeddingError::Invalid {
-                message: "rocm artifact execution requires the `rocm` feature".into(),
-            }));
-        } else {
-            None
-        };
+        let resources = self.session.runtimes.prepare(&program.runtime_requirements, self.target()?, &program.mesh)?;
+        let (context, retained_resources) = resources.into_parts();
+        // These leases stay in this stack frame on every error path. PJRT destroys the context before returning an
+        // error, and if submission succeeded it first waits for every device, so the leases outlive all native use.
         let (mut device_outputs, fence) = program
             .executable
             .execute(arguments.as_execution_device_inputs(), Vec::new(), 0, context, None, None, None, &[])?
             .into_parts();
-        if program.signature.requires_cuda_kernel_runtime() {
-            let session = &self.session;
-            let mut completions = session.cuda_kernel_completions.lock().expect("cuda completion owner mutex poisoned");
-            // Failed fences are terminal and retain their diagnostics in the caller's existing execution object.
-            completions.retain(|completion| matches!(completion.is_ready(), Ok(false)));
-            completions.push(fence.clone());
-        }
-        #[cfg(feature = "rocm")]
-        if program.signature.requires_rocm_kernel_runtime() {
-            let session = &self.session;
-            let mut completions = session.rocm_kernel_completions.lock().expect("rocm completion owner mutex poisoned");
-            completions.retain(|completion| matches!(completion.is_ready(), Ok(false)));
-            completions.push(fence.clone());
-        }
+        // The fence releases the context before it reports readiness, and the session releases these leases only after
+        // that, so pointees of the context's user data outlive native context destruction.
+        self.session.runtimes.retain(&fence, retained_resources);
         // Reference publication must happen after every successful handoff, including a subsequent marshalling error.
         after_submission(&fence);
         let output_count = program.signature.physical_output_count();

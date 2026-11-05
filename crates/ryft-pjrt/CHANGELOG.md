@@ -107,6 +107,10 @@ and this project adheres to [Semantic Versioning](https://semver.org/).
 - Switched to using `Error::MissingFunction` instead of `Error::Unimplemented` for PJRT dispatch failures,
   distinguishing unavailable functions from native calls that return an unimplemented status.
 - Error buffers now pass their layout through the new `device_layout` field.
+- Changed `LoadedExecutable::execute` to release send, receive, and HLO output callbacks only after every participating
+  device completes, instead of releasing per-device callbacks as each device completes. Executions that supply an
+  execution context or callbacks now require native `PJRT_Event_OnReady` or `PJRT_Event_Await` support and return
+  `Error::MissingFunction` before submission when neither is available.
 
 ### Fixed
 
@@ -115,6 +119,11 @@ and this project adheres to [Semantic Versioning](https://semver.org/).
 - Required the full function-pointer field to be present before reading it from PJRT API and extension tables,
   preventing out-of-bounds reads from truncated tables.
 - Omit array layouts for native `BufferType::Token` buffers in asynchronous host-to-device transfers.
+- Fixed `LoadedExecutable::execute` destroying its `ExecutionContext` when the call returned, even though PJRT only
+  borrows the context while execution may still be running. The returned `ExecutionFence` now owns the context until
+  every participating device completes and destroys it before reporting readiness.
+- Fixed `LoadedExecutable::execute` releasing launch resources early when a failure occurred after successful native
+  submission. It now waits for every participating device to complete before returning the error.
 
 ### Removed
 

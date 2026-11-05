@@ -36,12 +36,6 @@ pub(crate) struct ExecutableSignature {
 
     /// Whether lowering emitted a runtime assertion, including synthesized checks.
     pub(crate) requires_assertion_handler: bool,
-
-    /// Whether native CUDA artifact calls require the session launcher and execution-context user data.
-    pub(crate) requires_cuda_kernel_runtime: bool,
-
-    /// Whether native ROCm artifact calls require the separate HIP session owner.
-    pub(crate) requires_rocm_kernel_runtime: bool,
 }
 
 /// One bounded dynamic input axis transported as a hidden scalar executable argument.
@@ -159,8 +153,6 @@ impl ExecutableSignature {
             device_ordered_io: false,
             unordered_io: false,
             requires_assertion_handler: false,
-            requires_cuda_kernel_runtime: false,
-            requires_rocm_kernel_runtime: false,
         }
     }
 
@@ -194,33 +186,6 @@ impl ExecutableSignature {
     /// Returns whether this executable contains unordered I/O.
     pub(crate) fn has_unordered_io(&self) -> bool {
         self.unordered_io
-    }
-
-    /// Returns whether execution requires the runtime assertion handler.
-    pub(crate) fn requires_assertion_handler(&self) -> bool {
-        self.requires_assertion_handler
-    }
-
-    /// Returns whether execution needs session-owned CUDA artifact resources.
-    pub(crate) fn requires_cuda_kernel_runtime(&self) -> bool {
-        self.requires_cuda_kernel_runtime
-    }
-
-    /// Restores the persisted CUDA runtime requirement without changing the program's effect classes.
-    pub(crate) fn with_cuda_kernel_runtime(mut self, required: bool) -> Self {
-        self.requires_cuda_kernel_runtime = required;
-        self
-    }
-
-    /// Returns whether execution needs session-owned HIP artifact resources.
-    pub(crate) fn requires_rocm_kernel_runtime(&self) -> bool {
-        self.requires_rocm_kernel_runtime
-    }
-
-    /// Restores the persisted HIP owner requirement without changing the effect classification.
-    pub(crate) fn with_rocm_kernel_runtime(mut self, required: bool) -> Self {
-        self.requires_rocm_kernel_runtime = required;
-        self
     }
 
     /// Returns whether execution participates in the effect barrier.

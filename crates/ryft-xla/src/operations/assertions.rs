@@ -1,5 +1,5 @@
 use std::num::NonZeroUsize;
-use std::sync::OnceLock;
+use std::sync::Arc;
 
 use ryft_core::macros::check_count;
 use ryft_core::{
@@ -20,13 +20,15 @@ use ryft_pjrt::extensions::ffi::{
 use ryft_pjrt::{Client, Error as PjrtError};
 
 use crate::domains::effects::EffectCallbackGuard;
+use crate::domains::runtimes::{builtin_requirement, validate_builtin_requirement};
+use crate::domains::{RuntimeExtension, RuntimeProvider, RuntimeRequirement};
 use crate::experimental::lowering::types::{
     lower_physical_bound_value, lower_runtime_dimension_size_i64, lower_static_index_constants, lower_tensor_type,
 };
 use crate::experimental::lowering::{EffectTokens, current_or_new_token};
 use crate::operations::comparisons::lower_compare_to_mlir;
 use crate::operations::manipulation::conversions::lower_cast_shape;
-use crate::{Error, LowerableOperation, LowerableOperationFamily, Lowerer, LoweringError};
+use crate::{Error, ExecutionError, LowerableOperation, LowerableOperationFamily, Lowerer, LoweringError, Target};
 
 #[cfg(any(feature = "cuda-12", feature = "cuda-13"))]
 use ryft_pjrt::extensions::ffi::FfiStream;
@@ -417,44 +419,70 @@ enum AssertionBufferMemory {
 
 /// Registers the [`ASSERT_CUSTOM_CALL_TARGET`] handler with the plugin backing `client`.
 ///
-/// Registration is lazy and process-global because XLA's FFI registry rejects duplicate target registrations. The
-/// CPU handler reads scalar operands directly. The CUDA handler copies them through the invocation's CUDA stream
-/// before applying the same validation and diagnostic logic.
+/// Registration is lazy and repeated for each session. XLA accepts re-registration of an identical handler, so no
+/// process-global bookkeeping is needed. The CPU handler reads scalar operands directly. The CUDA handler copies them
+/// through the invocation's CUDA stream before applying the same validation and diagnostic logic.
 pub(crate) fn ensure_assertion_handler_registered(client: &Client<'_>) -> Result<(), Error> {
     let platform_name = client.platform_name()?.into_owned();
     if platform_name.eq_ignore_ascii_case("cpu") {
-        static CPU_ASSERTION_HANDLER_REGISTRATION: OnceLock<Result<(), PjrtError>> = OnceLock::new();
-        return CPU_ASSERTION_HANDLER_REGISTRATION
-            .get_or_init(|| {
-                client.register_ffi_handler(
-                    ASSERT_CUSTOM_CALL_TARGET,
-                    platform_name,
-                    FfiHandler::from(assertion_handler as XLA_FFI_Handler),
-                    FfiHandlerTraits::NONE,
-                )
-            })
-            .clone()
-            .map_err(Error::from);
+        return Ok(client.register_ffi_handler(
+            ASSERT_CUSTOM_CALL_TARGET,
+            platform_name,
+            FfiHandler::from(assertion_handler as XLA_FFI_Handler),
+            FfiHandlerTraits::NONE,
+        )?);
     }
     #[cfg(any(feature = "cuda-12", feature = "cuda-13"))]
     if platform_name.eq_ignore_ascii_case("cuda") {
-        static CUDA_ASSERTION_HANDLER_REGISTRATION: OnceLock<Result<(), PjrtError>> = OnceLock::new();
-        return CUDA_ASSERTION_HANDLER_REGISTRATION
-            .get_or_init(|| {
-                client.register_ffi_handler(
-                    ASSERT_CUSTOM_CALL_TARGET,
-                    platform_name,
-                    FfiHandler::from(cuda_assertion_handler as XLA_FFI_Handler),
-                    FfiHandlerTraits::NONE,
-                )
-            })
-            .clone()
-            .map_err(Error::from);
+        return Ok(client.register_ffi_handler(
+            ASSERT_CUSTOM_CALL_TARGET,
+            platform_name,
+            FfiHandler::from(cuda_assertion_handler as XLA_FFI_Handler),
+            FfiHandlerTraits::NONE,
+        )?);
     }
     Err(PjrtError::unimplemented(format!(
         "compiled runtime assertions are not supported on XLA platform `{platform_name}`",
     ))
     .into())
+}
+
+/// Built-in platform admission and registration for host runtime assertions.
+struct AssertionRuntimeProvider;
+
+/// Assertion callbacks require registration but no per-invocation user data.
+struct AssertionRuntime;
+
+impl<'c> RuntimeProvider<'c> for AssertionRuntimeProvider {
+    fn identifier(&self) -> &str {
+        ASSERT_CUSTOM_CALL_TARGET
+    }
+
+    fn initialize(
+        &self,
+        client: &'c Client<'c>,
+        target: &Target,
+        requirement: &RuntimeRequirement,
+    ) -> Result<Arc<dyn RuntimeExtension<'c> + 'c>, Error> {
+        validate_builtin_requirement(requirement, self.identifier())?;
+        let supported = target.platform_name().eq_ignore_ascii_case("cpu")
+            || (cfg!(any(feature = "cuda-12", feature = "cuda-13"))
+                && target.platform_name().eq_ignore_ascii_case("cuda"));
+        if !supported {
+            return Err(
+                ExecutionError::UnsupportedAssertionPlatform { platform: target.platform_name().to_owned() }.into()
+            );
+        }
+        ensure_assertion_handler_registered(client)?;
+        Ok(Arc::new(AssertionRuntime))
+    }
+}
+
+impl<'c> RuntimeExtension<'c> for AssertionRuntime {}
+
+/// Returns the built-in assertion provider without loading a PJRT plugin.
+pub(crate) fn runtime_provider<'c>() -> Arc<dyn RuntimeProvider<'c> + 'c> {
+    Arc::new(AssertionRuntimeProvider)
 }
 
 /// XLA FFI handler for host-resident assertion operands.
@@ -1509,6 +1537,7 @@ impl LowerableOperation for AssertOperation<ArrayType> {
         input_types: &[ArrayType],
         _output_types: &[ArrayType],
     ) -> Result<Vec<ValueRef<'b, 'c, 't>>, Error> {
+        lowerer.require_runtime(builtin_requirement(ASSERT_CUSTOM_CALL_TARGET))?;
         lower_assert_to_custom_call(
             self.name(),
             self.message(),
@@ -1533,6 +1562,7 @@ impl LowerableOperation for AssertOperation<ArrayIrType> {
         input_types: &[ArrayIrType],
         _output_types: &[ArrayIrType],
     ) -> Result<Vec<ValueRef<'b, 'c, 't>>, Error> {
+        lowerer.require_runtime(builtin_requirement(ASSERT_CUSTOM_CALL_TARGET))?;
         let context = lowerer.context;
         let location = lowerer.location;
         let effect_tokens = &mut lowerer.effect_tokens;
@@ -1571,7 +1601,9 @@ mod tests {
         DimensionVariable, Div, Placeholder, ProgramError, Rem, Shape, Sub, TypedProgram,
     };
     use ryft_pjrt::extensions::ffi::XLA_FFI_Buffer;
+    use ryft_pjrt::{ClientOptions, CpuClientOptions, load_cpu_plugin};
 
+    use crate::RuntimeError;
     use crate::experimental::lowering::lower_mlir_module_for_program_with_reference_state;
     use crate::experimental::ops::{Constant, ProgramBuilder as ArrayIrProgramBuilder};
     use crate::operations::dot::RaggedDotLoweringStrategy;
@@ -1628,7 +1660,8 @@ mod tests {
         )
         .unwrap();
         assert!(lowered.requires_assertion_handler);
-        assert!(lowered.signature.requires_assertion_handler());
+        assert_eq!(lowered.runtime_requirements.as_ref(), &[builtin_requirement(ASSERT_CUSTOM_CALL_TARGET)]);
+        assert!(lowered.signature.requires_assertion_handler);
         assert!(lowered.signature.has_effects());
         assert!(!lowered.signature.has_ordered_io());
         assert!(!lowered.signature.has_unordered_io());
@@ -1638,6 +1671,20 @@ mod tests {
         assert!(lowered.stable_hlo.contains("func.func @main(%arg0: tensor<i64>, %arg1: tensor<i64>) {"));
         assert!(lowered.stable_hlo.contains("stablehlo.after_all"));
         assert!(lowered.stable_hlo.contains("stablehlo.custom_call @ryft.assert"));
+    }
+
+    #[test]
+    fn test_assertion_runtime_provider_initialize() {
+        let client = load_cpu_plugin().unwrap().client(ClientOptions::CPU(CpuClientOptions::default())).unwrap();
+        let target = Target::from_client(&client).unwrap();
+        let provider = runtime_provider();
+        let requirement = builtin_requirement(ASSERT_CUSTOM_CALL_TARGET);
+        assert!(provider.initialize(&client, &target, &requirement).is_ok());
+        assert!(provider.initialize(&client, &target, &requirement).is_ok());
+        let requirement = RuntimeRequirement::new(ASSERT_CUSTOM_CALL_TARGET, 1, vec![1]).unwrap();
+        assert!(matches!(provider.initialize(&client, &target, &requirement),
+            Err(Error::Runtime(RuntimeError::InvalidConfiguration { identifier, reason }))
+                if identifier == ASSERT_CUSTOM_CALL_TARGET && reason == "built-in runtime configuration must be empty"));
     }
 
     #[test]

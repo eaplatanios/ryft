@@ -18,14 +18,15 @@ use crate::domains::Domain;
 use crate::domains::compilation::{CompilationError, CompilationKey, canonical_compilation_options_bytes};
 use crate::domains::execution::{ExecutionPlan, flatten_device_assignment};
 use crate::domains::programs::{CompiledProgram, LoweredProgram};
+use crate::domains::runtimes::{RuntimeRequirement, builtin_requirement, normalize_runtime_requirements};
 use crate::experimental::lowering::signature::ExecutableSignature;
 
 // TODO(eaplatanios): Review this module.
 
-const PERSISTENT_EXECUTABLE_MAGIC: &[u8; 8] = b"RYFTXLA8";
-const PERSISTENT_EXECUTABLE_SCHEMA_VERSION: u32 = 8;
+const PERSISTENT_EXECUTABLE_MAGIC: &[u8; 8] = b"RYFTXLA9";
+const PERSISTENT_EXECUTABLE_SCHEMA_VERSION: u32 = 9;
 const PERSISTENT_EXECUTABLE_FEATURE_FLAGS: u64 = 15;
-pub(super) const PERSISTENT_KEY_SCHEMA_VERSION: u32 = 8;
+pub(super) const PERSISTENT_KEY_SCHEMA_VERSION: u32 = 9;
 pub(super) static COMPILER_IDENTITY: LazyLock<String> = LazyLock::new(|| {
     format!(
         "ryft-xla/{}/openxla/{}/jax/{}",
@@ -34,9 +35,9 @@ pub(super) static COMPILER_IDENTITY: LazyLock<String> = LazyLock::new(|| {
         ryft_xla_sys::JAX_COMMIT,
     )
 });
-/// Stable cache-key payload for the V8 executable and external-reference ABI.
+/// Stable cache-key payload for the V9 executable and external-reference ABI.
 #[derive(Serialize)]
-struct PersistentKeyV8<'a> {
+struct PersistentKeyV9<'a> {
     schema_version: u32,
     stable_hlo: &'a str,
     compilation_options: &'a [u8],
@@ -49,12 +50,8 @@ struct PersistentKeyV8<'a> {
     reference_states: Vec<PersistentReferenceStateV6>,
     requires_assertion_handler: bool,
 
-    /// Native CUDA launcher requirement derived from selected calls.
-    requires_cuda_kernel_runtime: bool,
-
-    /// Native HIP launcher requirement; omitted when false to preserve existing V8 cache bytes.
-    #[serde(default, skip_serializing_if = "std::ops::Not::not")]
-    requires_rocm_kernel_runtime: bool,
+    /// Canonical runtime contracts resolved against the invoking session.
+    runtime_requirements: Vec<RuntimeRequirement>,
 
     /// Whether a native ordered-I/O slot is present after the array and extent slots.
     ordered_io: bool,
@@ -76,9 +73,9 @@ struct PersistentKeyV8<'a> {
     xla_flags: &'a str,
 }
 
-/// Stable V8 metadata envelope stored before serialized PJRT executable bytes.
+/// Stable V9 metadata envelope stored before serialized PJRT executable bytes.
 #[derive(Serialize, Deserialize)]
-struct PersistentExecutableMetadataV8 {
+struct PersistentExecutableMetadataV9 {
     schema_version: u32,
     feature_flags: u64,
     compilation_options: Vec<u8>,
@@ -91,13 +88,8 @@ struct PersistentExecutableMetadataV8 {
     reference_states: Vec<PersistentReferenceStateV6>,
     requires_assertion_handler: bool,
 
-    /// Native CUDA launcher requirement derived from selected calls.
-    #[serde(default)]
-    requires_cuda_kernel_runtime: bool,
-
-    /// Native HIP launcher requirement; omitted when false to preserve existing V8 cache bytes.
-    #[serde(default, skip_serializing_if = "std::ops::Not::not")]
-    requires_rocm_kernel_runtime: bool,
+    /// Canonical runtime contracts resolved against the invoking session.
+    runtime_requirements: Vec<RuntimeRequirement>,
 
     /// Whether a native ordered-I/O slot is present after the array and extent slots.
     ordered_io: bool,
@@ -740,7 +732,7 @@ pub(super) fn canonical_boundary_types(input_types: &[ArrayType], output_types: 
 impl<'c> Domain<'c> {
     pub(super) fn canonical_compilation_key(program: &LoweredProgram) -> Result<CompilationKey, Error> {
         let compilation_options = canonical_compilation_options_bytes(&program.compilation_options);
-        let key = PersistentKeyV8 {
+        let key = PersistentKeyV9 {
             schema_version: PERSISTENT_KEY_SCHEMA_VERSION,
             stable_hlo: &program.stable_hlo,
             compilation_options: compilation_options.as_slice(),
@@ -752,8 +744,7 @@ impl<'c> Domain<'c> {
             output_count: program.output_count as u64,
             reference_states: persistent_reference_states(&program.reference_states, program.capture_count)?,
             requires_assertion_handler: program.requires_assertion_handler,
-            requires_cuda_kernel_runtime: program.signature.requires_cuda_kernel_runtime(),
-            requires_rocm_kernel_runtime: program.signature.requires_rocm_kernel_runtime(),
+            runtime_requirements: program.runtime_requirements.to_vec(),
             ordered_io: program.signature.has_ordered_io(),
             unordered_io: program.signature.has_unordered_io(),
             device_ordered_io: program.signature.has_device_ordered_io(),
@@ -797,7 +788,7 @@ impl<'c> Domain<'c> {
             Err(error) => return Err(error.into()),
         };
         let device_assignment = program.executable.device_assignment()?;
-        let metadata = PersistentExecutableMetadataV8 {
+        let metadata = PersistentExecutableMetadataV9 {
             schema_version: PERSISTENT_EXECUTABLE_SCHEMA_VERSION,
             feature_flags: PERSISTENT_EXECUTABLE_FEATURE_FLAGS,
             compilation_options: program.compilation_options.encode_to_vec(),
@@ -809,8 +800,7 @@ impl<'c> Domain<'c> {
             output_count: program.output_count as u64,
             reference_states: persistent_reference_states(&program.reference_states, program.capture_count)?,
             requires_assertion_handler: program.requires_assertion_handler,
-            requires_cuda_kernel_runtime: program.signature.requires_cuda_kernel_runtime(),
-            requires_rocm_kernel_runtime: program.signature.requires_rocm_kernel_runtime(),
+            runtime_requirements: program.runtime_requirements.to_vec(),
             ordered_io: program.signature.has_ordered_io(),
             unordered_io: program.signature.has_unordered_io(),
             device_ordered_io: program.signature.has_device_ordered_io(),
@@ -867,7 +857,7 @@ impl<'c> Domain<'c> {
             .checked_add(metadata_size)
             .filter(|metadata_end| *metadata_end <= bytes.len())
             .ok_or_else(|| persistent_error("persistent executable metadata is truncated"))?;
-        let metadata: PersistentExecutableMetadataV8 = serde_json::from_slice(&bytes[header_size..metadata_end])
+        let metadata: PersistentExecutableMetadataV9 = serde_json::from_slice(&bytes[header_size..metadata_end])
             .map_err(|error| persistent_error(format!("failed to decode metadata: {error}")))?;
         if metadata.schema_version != PERSISTENT_EXECUTABLE_SCHEMA_VERSION
             || metadata.feature_flags != PERSISTENT_EXECUTABLE_FEATURE_FLAGS
@@ -884,12 +874,7 @@ impl<'c> Domain<'c> {
         }
 
         let mesh = DeviceMesh::try_from(metadata.mesh)?;
-        if metadata.requires_cuda_kernel_runtime && metadata.kernel_execution_facts.is_none() {
-            return Err(persistent_error("cuda kernel executable is missing execution facts"));
-        }
-        if metadata.requires_rocm_kernel_runtime && metadata.kernel_execution_facts.is_none() {
-            return Err(persistent_error("rocm kernel executable is missing execution facts"));
-        }
+        let runtime_requirements = normalize_runtime_requirements(metadata.runtime_requirements)?;
         if let Some(expected) = &metadata.kernel_execution_facts {
             let actual = crate::kernels::KernelExecutionFacts::from_target(target, &mesh)?.configuration_key()?;
             if expected != &actual {
@@ -974,15 +959,21 @@ impl<'c> Domain<'c> {
         if metadata.device_ordered_io && !metadata.ordered_io {
             return Err(persistent_error("device-ordered I/O metadata requires an ordered boundary slot"));
         }
-        let signature = ExecutableSignature::new(input_types.as_slice(), output_types.as_slice())
-            .with_effects(
-                metadata.ordered_io,
-                metadata.unordered_io,
-                metadata.requires_assertion_handler,
-                metadata.device_ordered_io,
-            )
-            .with_cuda_kernel_runtime(metadata.requires_cuda_kernel_runtime)
-            .with_rocm_kernel_runtime(metadata.requires_rocm_kernel_runtime);
+        for (required, identifier) in
+            [(metadata.requires_assertion_handler, "ryft.assert"), (metadata.ordered_io, "ryft.ordered-io")]
+        {
+            if required && !runtime_requirements.contains(&builtin_requirement(identifier)) {
+                return Err(persistent_error(format!(
+                    "effect metadata requires runtime extension `{identifier}` with ABI version 1 and empty configuration",
+                )));
+            }
+        }
+        let signature = ExecutableSignature::new(input_types.as_slice(), output_types.as_slice()).with_effects(
+            metadata.ordered_io,
+            metadata.unordered_io,
+            metadata.requires_assertion_handler,
+            metadata.device_ordered_io,
+        );
         if persistent_mapping(signature.input_mapping())? != metadata.input_mapping
             || persistent_mapping(signature.output_mapping())? != metadata.output_mapping
             || persistent_input_dimensions(&signature) != metadata.input_dimensions
@@ -1058,8 +1049,8 @@ impl<'c> Domain<'c> {
         let compilation_options = CompilationOptions::decode(metadata.compilation_options.as_slice())
             .map_err(|error| persistent_error(format!("failed to decode compilation options: {error}")))?;
         // Register before deserialization because loading an executable may resolve its custom-call target. The
-        // persisted flag is authoritative on cache hits, where the source program is no longer available to inspect.
-        self.ensure_runtime_requirements(&signature, metadata.platform_name.as_str())?;
+        // persisted requirements are authoritative on cache hits, where the source program is no longer available.
+        self.ensure_runtime_requirements(&runtime_requirements)?;
         let executable = self.client().deserialize_and_load_executable(
             &bytes[metadata_end..],
             Some(&compilation_options),
@@ -1098,6 +1089,7 @@ impl<'c> Domain<'c> {
             reference_states: reference_states.into(),
             signature,
             requires_assertion_handler: metadata.requires_assertion_handler,
+            runtime_requirements: runtime_requirements.into(),
             donation_flags: donation_flags.into(),
             capture_count,
             expected_argument_shardings: expected_argument_shardings.into(),
@@ -1148,7 +1140,7 @@ pub(super) mod tests {
         let header_size = PERSISTENT_EXECUTABLE_MAGIC.len() + size_of::<u64>();
         let metadata_size = u64::from_le_bytes(serialized[8..header_size].try_into().unwrap()) as usize;
         let metadata_end = header_size + metadata_size;
-        let mut metadata: PersistentExecutableMetadataV8 =
+        let mut metadata: PersistentExecutableMetadataV9 =
             serde_json::from_slice(&serialized[header_size..metadata_end]).unwrap();
         metadata.ordered_io = false;
         let metadata = serde_json::to_vec(&metadata).unwrap();
@@ -1204,6 +1196,7 @@ pub(super) mod tests {
         assert_eq!(restored.input_types, compiled.compiled_program().input_types);
         assert_eq!(restored.output_types, compiled.compiled_program().output_types);
         assert_eq!(restored.signature, compiled.compiled_program().signature);
+        assert_eq!(restored.runtime_requirements(), compiled.compiled_program().runtime_requirements());
         assert_eq!(restored.donation_flags, compiled.compiled_program().donation_flags);
         assert_eq!(restored.capture_count, compiled.compiled_program().capture_count);
         assert_eq!(restored.expected_argument_shardings, compiled.compiled_program().expected_argument_shardings);
@@ -1214,7 +1207,7 @@ pub(super) mod tests {
             u64::from_le_bytes(bytes[PERSISTENT_EXECUTABLE_MAGIC.len()..header_size].try_into().unwrap()) as usize;
         let metadata_end = header_size + metadata_size;
         // Reload validates the live facts before handing any native executable bytes to PJRT.
-        let encode = |metadata: PersistentExecutableMetadataV8| {
+        let encode = |metadata: PersistentExecutableMetadataV9| {
             let metadata = serde_json::to_vec(&metadata).unwrap();
             let mut encoded = PERSISTENT_EXECUTABLE_MAGIC.to_vec();
             encoded.extend_from_slice(&(metadata.len() as u64).to_le_bytes());
@@ -1222,42 +1215,45 @@ pub(super) mod tests {
             encoded.extend_from_slice(&bytes[metadata_end..]);
             encoded
         };
-        let mut matching: PersistentExecutableMetadataV8 =
+        let mut matching: PersistentExecutableMetadataV9 =
             serde_json::from_slice(&bytes[header_size..metadata_end]).unwrap();
         assert_eq!(matching.kernel_execution_facts, None);
         let facts = crate::kernels::KernelExecutionFacts::from_target(domain.target().unwrap(), &mesh).unwrap();
         matching.kernel_execution_facts = Some(facts.configuration_key().unwrap());
         let matching = domain.deserialize_program(&encode(matching)).unwrap().unwrap();
         assert_eq!(matching.kernel_execution_facts, Some(facts.configuration_key().unwrap()));
-        let mut mismatch: PersistentExecutableMetadataV8 =
+        let mut mismatch: PersistentExecutableMetadataV9 =
             serde_json::from_slice(&bytes[header_size..metadata_end]).unwrap();
         let mut changed_facts = facts;
         changed_facts.pjrt_version.minor += 1;
         mismatch.kernel_execution_facts = Some(changed_facts.configuration_key().unwrap());
         assert!(domain.deserialize_program(&encode(mismatch)).unwrap().is_none());
-        let mut corrupt: PersistentExecutableMetadataV8 =
+        let mut corrupt: PersistentExecutableMetadataV9 =
             serde_json::from_slice(&bytes[header_size..metadata_end]).unwrap();
         corrupt.kernel_execution_facts = Some(vec![255]);
         assert!(domain.deserialize_program(&encode(corrupt)).unwrap().is_none());
-        let mut missing: PersistentExecutableMetadataV8 =
+        let baseline: serde_json::Value = serde_json::from_slice(&bytes[header_size..metadata_end]).unwrap();
+        assert_eq!(baseline["runtime_requirements"], serde_json::json!([]));
+        let mut missing: PersistentExecutableMetadataV9 = serde_json::from_value(baseline).unwrap();
+        missing.runtime_requirements = vec![crate::domains::runtimes::builtin_requirement("test.missing-runtime")];
+        assert!(matches!(
+            domain.deserialize_program(&encode(missing)),
+            Err(Error::Runtime(crate::domains::runtimes::RuntimeError::MissingProvider { identifier }))
+                if identifier == "test.missing-runtime"
+        ));
+        let mut explicit: PersistentExecutableMetadataV9 =
             serde_json::from_slice(&bytes[header_size..metadata_end]).unwrap();
-        missing.requires_cuda_kernel_runtime = true;
-        assert!(matches!(domain.deserialize_program(&encode(missing)),
-            Err(Error::Compilation(CompilationError::InvalidPersistentExecutable { reason }))
-                if reason == "cuda kernel executable is missing execution facts"));
+        explicit.runtime_requirements =
+            vec![builtin_requirement("ryft.assert"), builtin_requirement("ryft.ordered-io")];
+        let explicit = domain.deserialize_program(&encode(explicit)).unwrap().unwrap();
+        assert_eq!(
+            explicit.runtime_requirements(),
+            &[builtin_requirement("ryft.assert"), builtin_requirement("ryft.ordered-io")],
+        );
+        assert!(!explicit.requires_assertion_handler);
+        assert!(!explicit.signature.has_ordered_io());
 
-        let legacy: serde_json::Value = serde_json::from_slice(&bytes[header_size..metadata_end]).unwrap();
-        assert!(legacy.get("requires_rocm_kernel_runtime").is_none());
-        let mut rocm: PersistentExecutableMetadataV8 = serde_json::from_value(legacy.clone()).unwrap();
-        assert!(!rocm.requires_rocm_kernel_runtime);
-        assert_eq!(serde_json::to_value(&rocm).unwrap(), legacy);
-        rocm.requires_rocm_kernel_runtime = true;
-        assert_eq!(serde_json::to_value(&rocm).unwrap()["requires_rocm_kernel_runtime"], true);
-        assert!(matches!(domain.deserialize_program(&encode(rocm)),
-            Err(Error::Compilation(CompilationError::InvalidPersistentExecutable { reason }))
-                if reason == "rocm kernel executable is missing execution facts"));
-
-        let mut invalid_signature_metadata: PersistentExecutableMetadataV8 =
+        let mut invalid_signature_metadata: PersistentExecutableMetadataV9 =
             serde_json::from_slice(&bytes[header_size..metadata_end]).unwrap();
         invalid_signature_metadata.input_mapping[0] = None;
         let invalid_signature_metadata = serde_json::to_vec(&invalid_signature_metadata).unwrap();
@@ -1270,7 +1266,7 @@ pub(super) mod tests {
             Err(Error::Compilation(CompilationError::InvalidPersistentExecutable { .. })),
         ));
 
-        let mut incompatible_metadata: PersistentExecutableMetadataV8 =
+        let mut incompatible_metadata: PersistentExecutableMetadataV9 =
             serde_json::from_slice(&bytes[header_size..metadata_end]).unwrap();
         incompatible_metadata.platform_version.push_str("-incompatible");
         let incompatible_metadata = serde_json::to_vec(&incompatible_metadata).unwrap();
@@ -1314,6 +1310,65 @@ pub(super) mod tests {
         assert_eq!(analyze_program(&restored).unwrap(), analysis);
         assert!(analysis.to_json().unwrap().contains("\"properties\""));
         assert!(!analysis.to_string().is_empty());
+    }
+
+    #[test]
+    fn test_persistent_executable_requires_runtime_contracts_for_effect_metadata() {
+        use ryft_core::{AssertOperation, PrintOperation};
+
+        let plugin = load_cpu_plugin().unwrap();
+        let client = plugin
+            .client(ClientOptions::CPU(CpuClientOptions { device_count: Some(1), ..Default::default() }))
+            .unwrap();
+        let mesh = domain_mesh(&client, "x", 1);
+        let domain = Session::new(&client).domain().with_mesh(mesh.clone());
+        let mut builder = ProgramBuilder::new();
+        let predicate = builder.add_input(replicated_scalar_type(&mesh, DataType::Boolean).into());
+        let value = builder.add_input(replicated_scalar_type(&mesh, DataType::F32).into());
+        builder
+            .add_instruction(AssertOperation::<ArrayIrType>::new("test predicate"), Vec::new(), vec![predicate], None)
+            .unwrap();
+        builder
+            .add_instruction(PrintOperation::<ArrayType>::new("test value"), Vec::new(), vec![value], None)
+            .unwrap();
+        let program = builder
+            .build::<Vec<Constant>, Vec<Constant>>(vec![value], vec![Placeholder; 2], vec![Placeholder])
+            .unwrap();
+        let lowered = domain.lower_program(&program, 0, &Options::new(mesh)).unwrap();
+        let compiled = domain.compile_program(&lowered).unwrap();
+        let bytes = domain.serialize_program(&compiled).unwrap().unwrap();
+        let header_size = PERSISTENT_EXECUTABLE_MAGIC.len() + size_of::<u64>();
+        let metadata_size = u64::from_le_bytes(bytes[8..header_size].try_into().unwrap()) as usize;
+        let metadata_end = header_size + metadata_size;
+        let baseline: PersistentExecutableMetadataV9 =
+            serde_json::from_slice(&bytes[header_size..metadata_end]).unwrap();
+        assert!(baseline.requires_assertion_handler);
+        assert!(baseline.ordered_io);
+        assert!(domain.deserialize_program(&bytes).unwrap().is_some());
+
+        for identifier in ["ryft.assert", "ryft.ordered-io"] {
+            for replacement in [None, Some((2, Vec::new())), Some((1, vec![1]))] {
+                let mut metadata: PersistentExecutableMetadataV9 =
+                    serde_json::from_slice(&bytes[header_size..metadata_end]).unwrap();
+                metadata.runtime_requirements.retain(|requirement| requirement.identifier() != identifier);
+                if let Some((version, configuration)) = replacement {
+                    metadata
+                        .runtime_requirements
+                        .push(RuntimeRequirement::new(identifier, version, configuration).unwrap());
+                }
+                let metadata = serde_json::to_vec(&metadata).unwrap();
+                let mut corrupt = PERSISTENT_EXECUTABLE_MAGIC.to_vec();
+                corrupt.extend_from_slice(&(metadata.len() as u64).to_le_bytes());
+                corrupt.extend_from_slice(&metadata);
+                corrupt.extend_from_slice(&bytes[metadata_end..]);
+
+                assert!(matches!(
+                    domain.deserialize_program(&corrupt),
+                    Err(Error::Compilation(CompilationError::InvalidPersistentExecutable { reason }))
+                        if reason == format!("effect metadata requires runtime extension `{identifier}` with ABI version 1 and empty configuration"),
+                ));
+            }
+        }
     }
 
     #[test]
@@ -1480,11 +1535,11 @@ pub(super) mod tests {
             domain.deserialize_program(b"truncated"),
             Err(Error::Compilation(CompilationError::InvalidPersistentExecutable { .. })),
         ));
-        let mut legacy = b"RYFTXLA5".to_vec();
+        let mut legacy = b"RYFTXLA8".to_vec();
         legacy.extend_from_slice(&0u64.to_le_bytes());
         assert!(domain.deserialize_program(legacy.as_slice()).unwrap().is_none());
 
-        let metadata = PersistentExecutableMetadataV8 {
+        let metadata = PersistentExecutableMetadataV9 {
             schema_version: PERSISTENT_EXECUTABLE_SCHEMA_VERSION + 1,
             feature_flags: 0,
             compilation_options: CompilationOptions::default().encode_to_vec(),
@@ -1496,8 +1551,7 @@ pub(super) mod tests {
             output_count: 0,
             reference_states: Vec::new(),
             requires_assertion_handler: false,
-            requires_cuda_kernel_runtime: false,
-            requires_rocm_kernel_runtime: false,
+            runtime_requirements: Vec::new(),
             ordered_io: false,
             unordered_io: false,
             device_ordered_io: false,
@@ -1577,7 +1631,7 @@ pub(super) mod tests {
         let metadata_size =
             u64::from_le_bytes(bytes[PERSISTENT_EXECUTABLE_MAGIC.len()..header_size].try_into().unwrap()) as usize;
         let metadata_end = header_size + metadata_size;
-        let corrupt = |metadata: PersistentExecutableMetadataV8| {
+        let corrupt = |metadata: PersistentExecutableMetadataV9| {
             let metadata = serde_json::to_vec(&metadata).unwrap();
             let mut corrupted = PERSISTENT_EXECUTABLE_MAGIC.to_vec();
             corrupted.extend_from_slice(&(metadata.len() as u64).to_le_bytes());
@@ -1585,7 +1639,7 @@ pub(super) mod tests {
             corrupted.extend_from_slice(&bytes[metadata_end..]);
             corrupted
         };
-        let mut metadata: PersistentExecutableMetadataV8 =
+        let mut metadata: PersistentExecutableMetadataV9 =
             serde_json::from_slice(&bytes[header_size..metadata_end]).unwrap();
         assert_eq!(metadata.reference_states[0].source, PersistentReferenceSourceV6::Capture { index: 0 });
         assert_eq!(metadata.reference_states[0].logical_input_index, 0);
@@ -1599,7 +1653,7 @@ pub(super) mod tests {
                 if reason == "reference-state source does not match its logical input",
         ));
 
-        let mut metadata: PersistentExecutableMetadataV8 =
+        let mut metadata: PersistentExecutableMetadataV9 =
             serde_json::from_slice(&bytes[header_size..metadata_end]).unwrap();
         metadata.reference_states[0].source = PersistentReferenceSourceV6::PublicInput { index: 1 };
         let corrupted = corrupt(metadata);
@@ -1610,7 +1664,7 @@ pub(super) mod tests {
         ));
 
         // An output count beyond the decoded complete output arity cannot name a hidden final-state suffix at all.
-        let mut invalid_outputs: PersistentExecutableMetadataV8 =
+        let mut invalid_outputs: PersistentExecutableMetadataV9 =
             serde_json::from_slice(&bytes[header_size..metadata_end]).unwrap();
         invalid_outputs.output_count = 3;
         let corrupted = corrupt(invalid_outputs);
@@ -1622,7 +1676,7 @@ pub(super) mod tests {
 
         // Dropping one expected argument sharding leaves the persisted list shorter than the physical boundary, so
         // no reference-state input could be checked against its own expected sharding.
-        let mut truncated_expected_shardings: PersistentExecutableMetadataV8 =
+        let mut truncated_expected_shardings: PersistentExecutableMetadataV9 =
             serde_json::from_slice(&bytes[header_size..metadata_end]).unwrap();
         assert_eq!(truncated_expected_shardings.expected_argument_shardings.len(), 2);
         truncated_expected_shardings.expected_argument_shardings.pop();
@@ -1633,7 +1687,7 @@ pub(super) mod tests {
                 if reason == "expected argument shardings do not match the physical input count",
         ));
 
-        let mut reordered: PersistentExecutableMetadataV8 =
+        let mut reordered: PersistentExecutableMetadataV9 =
             serde_json::from_slice(&bytes[header_size..metadata_end]).unwrap();
         reordered.reference_states.swap(0, 1);
         let corrupted = corrupt(reordered);
@@ -1643,7 +1697,7 @@ pub(super) mod tests {
                 if reason == "reference states are not in canonical logical input order",
         ));
 
-        let mut foreign_process_mesh: PersistentExecutableMetadataV8 =
+        let mut foreign_process_mesh: PersistentExecutableMetadataV9 =
             serde_json::from_slice(&bytes[header_size..metadata_end]).unwrap();
         foreign_process_mesh.mesh.devices[0].process_index += 1;
         let corrupted = corrupt(foreign_process_mesh);
@@ -1653,7 +1707,7 @@ pub(super) mod tests {
                 if reason == "reference-state mesh is not fully addressable by this process",
         ));
 
-        let mut mismatched_expected_sharding: PersistentExecutableMetadataV8 =
+        let mut mismatched_expected_sharding: PersistentExecutableMetadataV9 =
             serde_json::from_slice(&bytes[header_size..metadata_end]).unwrap();
         mismatched_expected_sharding.expected_argument_shardings[0].unreduced_axes.push("x".to_string());
         let corrupted = corrupt(mismatched_expected_sharding);
@@ -1663,7 +1717,7 @@ pub(super) mod tests {
                 if reason == "reference-state input 0 logical sharding does not match its expected argument sharding",
         ));
 
-        let mut mismatched_input: PersistentExecutableMetadataV8 =
+        let mut mismatched_input: PersistentExecutableMetadataV9 =
             serde_json::from_slice(&bytes[header_size..metadata_end]).unwrap();
         mismatched_input.signature.input_types[0]
             .sharding
@@ -1684,7 +1738,7 @@ pub(super) mod tests {
                 if reason == "reference-state input 0 logical sharding does not match its expected argument sharding",
         ));
 
-        let mut mismatched_output: PersistentExecutableMetadataV8 =
+        let mut mismatched_output: PersistentExecutableMetadataV9 =
             serde_json::from_slice(&bytes[header_size..metadata_end]).unwrap();
         mismatched_output.signature.output_types[1]
             .sharding
@@ -1699,7 +1753,7 @@ pub(super) mod tests {
                 if reason == "reference-state output 1 logical sharding does not match state input 0",
         ));
 
-        let mut zero_space: PersistentExecutableMetadataV8 =
+        let mut zero_space: PersistentExecutableMetadataV9 =
             serde_json::from_slice(&bytes[header_size..metadata_end]).unwrap();
         zero_space.signature.input_types[0].data_type = encode_data_type(DataType::Zero);
         let corrupted = corrupt(zero_space);
@@ -1709,7 +1763,7 @@ pub(super) mod tests {
                 if reason == "reference-state input has a zero-space type",
         ));
 
-        let mut host_memory: PersistentExecutableMetadataV8 =
+        let mut host_memory: PersistentExecutableMetadataV9 =
             serde_json::from_slice(&bytes[header_size..metadata_end]).unwrap();
         host_memory.signature.input_types[0].memory = PersistentMemoryV1::Host(true);
         let corrupted = corrupt(host_memory);
@@ -1719,7 +1773,7 @@ pub(super) mod tests {
                 if reason == "reference-state input is not in device memory",
         ));
 
-        let mut unbounded_dynamic: PersistentExecutableMetadataV8 =
+        let mut unbounded_dynamic: PersistentExecutableMetadataV9 =
             serde_json::from_slice(&bytes[header_size..metadata_end]).unwrap();
         unbounded_dynamic.signature.variables.push(PersistentDimensionVariableV3 {
             name: "unbounded".to_string(),
@@ -1736,7 +1790,7 @@ pub(super) mod tests {
                 if reason == "reference-state input has an unbounded dynamic dimension",
         ));
 
-        let mut mutated_dynamic: PersistentExecutableMetadataV8 =
+        let mut mutated_dynamic: PersistentExecutableMetadataV9 =
             serde_json::from_slice(&bytes[header_size..metadata_end]).unwrap();
         mutated_dynamic.signature.variables.push(PersistentDimensionVariableV3 {
             name: "bounded_mutation".to_string(),
@@ -1754,7 +1808,7 @@ pub(super) mod tests {
                               compatibility has not been verified",
         ));
 
-        let mut sharded_dynamic: PersistentExecutableMetadataV8 =
+        let mut sharded_dynamic: PersistentExecutableMetadataV9 =
             serde_json::from_slice(&bytes[header_size..metadata_end]).unwrap();
         sharded_dynamic.signature.variables.push(PersistentDimensionVariableV3 {
             name: "bounded_sharded".to_string(),

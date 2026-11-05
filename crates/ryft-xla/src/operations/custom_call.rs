@@ -12,6 +12,7 @@ use ryft_mlir::{
     Operation as MlirOperation, Region as MlirRegion, Size as MlirSize, StringRef, Type, Value as MlirValue, ValueRef,
 };
 
+use crate::domains::{RUNTIME_REQUIREMENTS_ATTRIBUTE, runtime_requirements};
 use crate::experimental::lowering::types::{lower_physical_storage, lower_tensor_type, lower_unplaced_constant_output};
 use crate::experimental::lowering::{EffectTokens, current_or_new_token};
 use crate::operations::assertions::lower_output_extent_validation;
@@ -69,13 +70,13 @@ fn lower_custom_call_memory_layouts(
 
 /// Lowers named custom-call attributes to MLIR named attributes, in declaration order. Refer to
 /// [`lower_custom_call_attribute`] for the encoding of each attribute kind.
-fn lower_custom_call_attributes<'c, 't: 'c>(
-    attributes: &[(String, CustomCallAttribute)],
+fn lower_custom_call_attributes<'a, 'c, 't: 'c>(
+    attributes: impl IntoIterator<Item = &'a (String, CustomCallAttribute)>,
     context: &'c MlirContext<'t>,
     location: LocationRef<'c, 't>,
 ) -> Result<Vec<NamedAttributeRef<'c, 't>>, Error> {
     attributes
-        .iter()
+        .into_iter()
         .map(|(name, value)| {
             let value = lower_custom_call_attribute(value, context, location)?;
             Ok(context.named_attribute(context.identifier(name.as_str()), value))
@@ -241,7 +242,11 @@ pub(crate) fn lower_custom_call_to_mlir<'b, 'c: 'b, 't: 'c>(
         })
         .collect::<Vec<_>>();
     let input_types = input_types.as_slice();
-    let attributes = lower_custom_call_attributes(operation.attributes(), context, location)?;
+    let attributes = lower_custom_call_attributes(
+        operation.attributes().iter().filter(|(name, _)| name != RUNTIME_REQUIREMENTS_ATTRIBUTE),
+        context,
+        location,
+    )?;
     let backend_config = context.dictionary_attribute(&attributes);
     let memory_layouts = Some(lower_custom_call_memory_layouts(input_types, output_types, has_token)?);
     #[cfg(feature = "mosaic-gpu")]
@@ -330,6 +335,9 @@ impl LowerableOperation for CustomCallOperation {
         input_types: &[ArrayType],
         output_types: &[ArrayType],
     ) -> Result<Vec<ValueRef<'b, 'c, 't>>, Error> {
+        for requirement in runtime_requirements(self)? {
+            lowerer.require_runtime(requirement)?;
+        }
         lower_custom_call_to_mlir(
             self,
             input_values,
@@ -351,6 +359,9 @@ impl MemberLowerableOperation<ArrayIrType> for CustomCallOperation {
         input_types: &[ArrayIrType],
         output_types: &[ArrayIrType],
     ) -> Result<Vec<ValueRef<'b, 'c, 't>>, Error> {
+        for requirement in runtime_requirements(self)? {
+            lowerer.require_runtime(requirement)?;
+        }
         let context = lowerer.context;
         let location = lowerer.location;
         let effect_tokens = &mut lowerer.effect_tokens;
@@ -551,15 +562,92 @@ mod tests {
     };
     use ryft_pjrt::{ClientOptions, CpuClientOptions, load_cpu_plugin};
 
+    use crate::domains::runtimes::builtin_requirement;
+    use crate::domains::{RuntimeRequirement, with_runtime_requirements};
+    use crate::experimental::lowering::lower_mlir_module_for_program;
     use crate::experimental::lowering::tests::{
         MixedValue, ProgramBuilder, execute_mixed_program, test_matrix_type, unproject_plain_program,
     };
     use crate::experimental::ops::{ArrayConstant, Constant, ProgramBuilder as ArrayIrProgramBuilder};
     use crate::kernels::KernelEmbeddingError;
     use crate::operations::assertions::ensure_assertion_handler_registered;
-    use crate::to_mlir_module_for_program;
+    use crate::{RuntimeError, to_mlir_module_for_program};
 
     use super::*;
+
+    #[test]
+    fn test_custom_call_runtime_metadata_is_consumed_without_changing_native_attributes() {
+        let array_type = test_matrix_type(2, 3);
+        let first = RuntimeRequirement::new("test.first", 2, vec![7, 8]).unwrap();
+        let second = RuntimeRequirement::new("test.second", 1, Vec::new()).unwrap();
+        let mut builder = ArrayIrProgramBuilder::new();
+        let input = builder.add_input(array_type.clone().into());
+        let operation = with_runtime_requirements(
+            CustomCallOperation::new("ryft.test.runtime", vec![array_type.clone()])
+                .with_attribute("scale", 2i64)
+                .with_attribute(
+                    "nested",
+                    CustomCallAttribute::Dictionary(vec![(
+                        RUNTIME_REQUIREMENTS_ATTRIBUTE.to_string(),
+                        "foreign-metadata".into(),
+                    )]),
+                ),
+            [second.clone(), first.clone(), first.clone()],
+        )
+        .unwrap();
+        let intermediate = builder.add_instruction(operation, Vec::new(), vec![input], None).unwrap()[0];
+        let operation = with_runtime_requirements(
+            CustomCallOperation::new("ryft.test.runtime", vec![array_type.clone()]),
+            [second.clone()],
+        )
+        .unwrap();
+        let output = builder.add_instruction(operation, Vec::new(), vec![intermediate], None).unwrap()[0];
+        let program = builder
+            .build::<Vec<Constant>, Vec<Constant>>(vec![output], vec![Placeholder], vec![Placeholder])
+            .unwrap();
+        let lowered = lower_mlir_module_for_program(
+            &program,
+            &[],
+            &vec![array_type.clone()],
+            &vec![array_type],
+            "main",
+            None,
+            None,
+            None,
+        )
+        .unwrap();
+
+        assert_eq!(lowered.runtime_requirements.as_ref(), &[first, second]);
+        assert_eq!(lowered.stable_hlo.matches(RUNTIME_REQUIREMENTS_ATTRIBUTE).count(), 1);
+        assert!(lowered.stable_hlo.contains("foreign-metadata"));
+        assert!(lowered.stable_hlo.contains("scale = 2 : i64"));
+        assert!(!lowered.stable_hlo.contains("abi_version"));
+    }
+
+    #[test]
+    fn test_custom_call_runtime_requirements_conflict_across_operations() {
+        let array_type = test_matrix_type(2, 3);
+        let mut builder = ArrayIrProgramBuilder::new();
+        let mut output = builder.add_input(array_type.clone().into());
+        for version in [1, 2] {
+            let operation = with_runtime_requirements(
+                CustomCallOperation::new("ryft.test.runtime", vec![array_type.clone()]),
+                [RuntimeRequirement::new("test.runtime", version, Vec::new()).unwrap()],
+            )
+            .unwrap();
+            output = builder.add_instruction(operation, Vec::new(), vec![output], None).unwrap()[0];
+        }
+        let program = builder
+            .build::<Vec<Constant>, Vec<Constant>>(vec![output], vec![Placeholder], vec![Placeholder])
+            .unwrap();
+
+        assert!(matches!(
+            lower_mlir_module_for_program(
+                &program, &[], &vec![array_type.clone()], &vec![array_type], "main", None, None, None,
+            ),
+            Err(Error::Runtime(RuntimeError::ConflictingRequirements { identifier })) if identifier == "test.runtime",
+        ));
+    }
 
     #[test]
     fn test_to_mlir_module_for_program_lowers_custom_call() {
@@ -1049,7 +1137,7 @@ mod tests {
         let program = builder
             .build::<Vec<Constant>, Vec<Constant>>(outputs, vec![Placeholder; 2], vec![Placeholder; 2])
             .unwrap();
-        let module = to_mlir_module_for_program(
+        let lowered = lower_mlir_module_for_program(
             &program,
             &[],
             &vec![alias_type.clone(), ArrayType::scalar(DataType::I64)],
@@ -1057,8 +1145,14 @@ mod tests {
             "main",
             None,
             None,
+            None,
         )
         .unwrap();
+        assert_eq!(lowered.runtime_requirements.as_ref(), &[builtin_requirement("ryft.assert")]);
+        // This direct lowering fixture has no ordered boundary slot and needs no transport admission.
+        assert!(!lowered.signature.has_ordered_io());
+        assert!(lowered.requires_assertion_handler);
+        let module = lowered.stable_hlo;
         assert_eq!(
             module,
             indoc! {r#"

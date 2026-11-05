@@ -1154,6 +1154,7 @@ impl<Extension: Operation<Type = ArrayIrType>> KernelDefinition<Extension> {
                 | ArrayOperation::RngBitGenerator(_)
                 | ArrayOperation::ParallelReduce(_)
                 | ArrayOperation::ParallelVary(_)
+                | ArrayOperation::ParallelCast(_)
                 | ArrayOperation::ParallelAllGather(_)
                 | ArrayOperation::ParallelSumScatter(_)
                 | ArrayOperation::ParallelPermute(_)

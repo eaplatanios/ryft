@@ -572,7 +572,7 @@ impl<'c> Domain<'c> {
             reference_states,
             options.ragged_dot_lowering_strategy,
         )?;
-        let (stable_hlo, signature, requires_assertion_handler) = lowered_module.into_parts();
+        let (stable_hlo, signature, requires_assertion_handler, runtime_requirements) = lowered_module.into_parts();
         for (mapping, donation) in signature.input_mapping()[capture_count..].iter().zip(donation_flags.iter_mut()) {
             if mapping.is_none() {
                 *donation = false;
@@ -589,6 +589,7 @@ impl<'c> Domain<'c> {
             reference_states: reference_states.into(),
             signature,
             requires_assertion_handler,
+            runtime_requirements,
             donation_flags: donation_flags.into(),
             capture_count,
             expected_argument_shardings: expected_argument_shardings.into(),
@@ -599,8 +600,7 @@ impl<'c> Domain<'c> {
             kernel_execution_facts: if program.entry_region_ref().computation_regions().any(|region| {
                 region.instructions().iter().any(|instruction| match instruction.operation() {
                     Operation::CustomCall(operation) | Operation::Array(ArrayOperation::CustomCall(operation)) => {
-                        operation.target_name() == crate::kernels::CUDA_KERNEL_CUSTOM_CALL_TARGET
-                            || operation.attributes().iter().any(|(name, _)| name == "ryft.kernel.schema")
+                        operation.attributes().iter().any(|(name, _)| name == "ryft.kernel.schema")
                     }
                     _ => false,
                 })
@@ -615,7 +615,7 @@ impl<'c> Domain<'c> {
     }
 
     pub(crate) fn compile_program(&self, program: &LoweredProgram) -> Result<CompiledProgram<'c>, Error> {
-        self.ensure_runtime_requirements(&program.signature, &program.platform_name)?;
+        self.ensure_runtime_requirements(&program.runtime_requirements)?;
         let pjrt_program = PjrtProgram::Mlir { bytecode: program.stable_hlo.as_bytes().to_vec() };
         let compilation_start = Instant::now();
         let executable = self.client().compile(&pjrt_program, &program.compilation_options)?;
@@ -636,6 +636,7 @@ impl<'c> Domain<'c> {
             output_count: program.output_count,
             reference_states: Arc::clone(&program.reference_states),
             signature: program.signature.clone(),
+            runtime_requirements: Arc::clone(&program.runtime_requirements),
             requires_assertion_handler: program.requires_assertion_handler,
             donation_flags: Arc::clone(&program.donation_flags),
             capture_count: program.capture_count,
@@ -1061,6 +1062,7 @@ fn array_data_dependent_padding_discipline(
         | ArrayOperation::Imaginary(_)
         | ArrayOperation::ParallelReduce(_)
         | ArrayOperation::ParallelVary(_)
+        | ArrayOperation::ParallelCast(_)
         | ArrayOperation::ParallelAllGather(_)
         | ArrayOperation::ParallelSumScatter(_)
         | ArrayOperation::ParallelPermute(_)
@@ -3026,13 +3028,54 @@ mod tests {
         assert_eq!(domain.persistent_cache_key(&key), Some(key.canonical_bytes.to_vec()));
         let decoded: serde_json::Value = serde_json::from_slice(&key.canonical_bytes).unwrap();
         assert_eq!(decoded["schema_version"], PERSISTENT_KEY_SCHEMA_VERSION);
-        assert!(decoded.get("requires_rocm_kernel_runtime").is_none());
+        assert_eq!(decoded["runtime_requirements"], serde_json::json!([]));
         assert_eq!(decoded["compiler_identity"], COMPILER_IDENTITY.as_str());
         assert!(decoded["compiler_identity"].as_str().unwrap().contains(ryft_xla_sys::XLA_COMMIT));
         assert!(decoded["compiler_identity"].as_str().unwrap().contains(ryft_xla_sys::JAX_COMMIT));
         assert_eq!(decoded["platform_name"], client.platform_name().unwrap().as_ref());
         assert!(decoded["compilation_options"].as_array().is_some_and(|bytes| !bytes.is_empty()));
         assert!(decoded["stable_hlo"].as_str().is_some_and(|module| module.contains("stablehlo.sine")));
+    }
+
+    #[test]
+    fn test_compilation_key_includes_runtime_abi_and_configuration() {
+        use crate::domains::runtimes::{RuntimeRequirement, with_runtime_requirements};
+
+        let plugin = load_cpu_plugin().unwrap();
+        let client = plugin
+            .client(ClientOptions::CPU(CpuClientOptions { device_count: Some(1), ..Default::default() }))
+            .unwrap();
+        let mesh = domain_mesh(&client, "x", 1);
+        let domain = Session::new(&client).domain().with_mesh(mesh.clone());
+        let array_type = ArrayType::new_static(DataType::F32, [4])
+            .with_sharding(Sharding::replicated(mesh.logical_mesh().clone(), 1))
+            .unwrap();
+        let lower = |requirements| {
+            let mut builder = ProgramBuilder::new();
+            let input = builder.add_input(array_type.clone().into());
+            let operation = with_runtime_requirements(
+                CustomCallOperation::new("ryft.test.runtime", vec![array_type.clone()]),
+                requirements,
+            )
+            .unwrap();
+            let output = builder.add_instruction(operation, Vec::new(), vec![input], None).unwrap()[0];
+            let program = builder
+                .build::<Vec<Constant>, Vec<Constant>>(vec![output], vec![Placeholder], vec![Placeholder])
+                .unwrap();
+            domain.lower_program(&program, 0, &Options::new(mesh.clone())).unwrap()
+        };
+        let requirement =
+            |version, configuration| RuntimeRequirement::new("test.runtime", version, configuration).unwrap();
+        let first = lower(vec![requirement(1, vec![7])]);
+        let duplicate = lower(vec![requirement(1, vec![7]), requirement(1, vec![7])]);
+        let changed_abi = lower(vec![requirement(2, vec![7])]);
+        let changed_configuration = lower(vec![requirement(1, vec![8])]);
+
+        assert_eq!(first.stable_hlo(), changed_abi.stable_hlo());
+        assert_eq!(first.stable_hlo(), changed_configuration.stable_hlo());
+        assert_eq!(domain.compilation_key(&first).unwrap(), domain.compilation_key(&duplicate).unwrap());
+        assert_ne!(domain.compilation_key(&first).unwrap(), domain.compilation_key(&changed_abi).unwrap());
+        assert_ne!(domain.compilation_key(&first).unwrap(), domain.compilation_key(&changed_configuration).unwrap());
     }
 
     #[test]

@@ -27,7 +27,7 @@
 //! See [`distributed`] for ordering, cancellation, topology admission and publication semantics.
 //!
 //! The optional `triton` feature adds direct typed-TTIR compilation with `TritonEmbedding`. CUDA artifacts reuse
-//! [`CudaKernelEmbedding`]; ROCm artifacts use a separate HIP session owner enabled by `rocm`. Both retain the same
+//! [`CudaKernelEmbedding`]; ROCm artifacts use a HIP runtime extension enabled by `rocm`. Both retain the same
 //! staging, persistence and whole-execution completion path. Compiler-free Triton AOT loading reconstructs the
 //! binding with recorded compiler configuration; it still requires a compatible runtime and device. AMD hardware
 //! execution remains unqualified, and unsupported portable operations fail before native compilation.
@@ -35,6 +35,7 @@
 // TODO(eaplatanios): Review this module.
 
 use std::collections::{BTreeMap, BTreeSet};
+use std::sync::Arc;
 
 use ryft_core::{
     ArrayIrType, ArrayType, Context, CustomCallOperation, DataType, EffectClass, Layout, Memory, MeshAxis,
@@ -47,6 +48,8 @@ use ryft_kernels::{
 use ryft_mlir::dialects::stable_hlo::CustomCallMemoryLayouts;
 use sha2::{Digest, Sha256};
 use thiserror::Error;
+
+use crate::domains::RuntimeProvider;
 
 mod aot;
 mod cuda;
@@ -84,16 +87,25 @@ pub use staging::{
 
 #[cfg(feature = "rocm")]
 pub use rocm::RocmKernelEmbedding;
-#[cfg(feature = "rocm")]
-pub(crate) use rocm::RocmKernelRuntime;
 
 /// Typed FFI target used by persisted ROCm kernel calls.
 pub const ROCM_KERNEL_CUSTOM_CALL_TARGET: &str = "ryft.kernel.rocm";
 
-pub(crate) use cuda::CudaKernelRuntime;
 pub use cuda::{
     CUDA_KERNEL_CUSTOM_CALL_TARGET, CudaKernelBufferBinding, CudaKernelEmbedding, CudaKernelParameterBinding,
 };
+
+/// Returns available native kernel providers without initializing their drivers.
+pub(crate) fn runtime_providers<'c>() -> Vec<Arc<dyn RuntimeProvider<'c> + 'c>> {
+    #[cfg(feature = "rocm")]
+    {
+        vec![cuda::runtime_provider(), rocm::runtime_provider()]
+    }
+    #[cfg(not(feature = "rocm"))]
+    {
+        vec![cuda::runtime_provider()]
+    }
+}
 
 // TODO(eaplatanios): Promote kernel embedding errors to dedicated `ryft_xla::Error` variants after
 // this support leaves experimental status.
@@ -712,7 +724,7 @@ pub(crate) mod tests {
             None,
         )
         .unwrap();
-        let (module, _signature, requires_assertion_handler) = lowered.into_parts();
+        let (module, _signature, requires_assertion_handler, _requirements) = lowered.into_parts();
         assert!(!requires_assertion_handler);
         let semantic = hex::encode(Sha256::digest(definition.semantic_key().unwrap().as_bytes()));
         let configuration = "6dea220b6278c1cf02bdf72bf1a7969892b830605f8a1a1baea5af53bfcad12e";

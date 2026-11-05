@@ -1,16 +1,17 @@
 use std::borrow::Cow;
-use std::cell::Cell;
+use std::cell::{Cell, RefCell};
 use std::collections::{HashMap, HashSet};
 use std::rc::Rc;
+use std::sync::Arc;
 
 use ryft_core::{
-    Array as CoreArray, ArrayIrType, ArrayOperation, ArrayType, BroadcastOperation, CastOperation,
-    ConstrainShardingOperation, CustomCallOperation, DataType, DimensionOperation, DimensionType, DimensionValue,
-    DynamicBroadcastOperation, DynamicReshapeOperation, EffectClass, EffectClasses, ExternalReferenceBinding,
-    GatherOperation, Instruction, LogicalMesh, Memory, OneLikeOperation, Operation as CoreOperation,
-    OperationPayloadProjection, Parameterized, ProgramError, Provenance, RematerializationOptimizationBarrier,
-    ReshapeOperation, ReshardOperation, ScatterOperation, Shape, ShardMapBoundary, ShardMapOperation, Sharding,
-    ShardingDimension, Type as RyftType, TypeError, Typed, TypedProgram, Value as CoreValue, ZeroLikeOperation,
+    Array as CoreArray, ArrayIrType, ArrayOperation, ArrayType, BroadcastOperation, CastOperation, CollectiveAxes,
+    ConstrainShardingOperation, DataType, DimensionOperation, DimensionType, DimensionValue, DynamicBroadcastOperation,
+    DynamicReshapeOperation, EffectClass, EffectClasses, ExternalReferenceBinding, GatherOperation, Instruction,
+    LogicalMesh, Memory, OneLikeOperation, Operation as CoreOperation, OperationPayloadProjection, Parameterized,
+    ProgramError, Provenance, RematerializationOptimizationBarrier, ReshapeOperation, ReshardOperation,
+    ScatterOperation, Shape, ShardMapBoundary, ShardMapOperation, Sharding, ShardingDimension, Type as RyftType,
+    TypeError, Typed, TypedProgram, Value as CoreValue, ZeroLikeOperation,
 };
 use ryft_mlir::dialects::{func, shardy, stable_hlo};
 use ryft_mlir::{
@@ -20,6 +21,8 @@ use ryft_mlir::{
 };
 
 use crate::CompilationError;
+use crate::domains::runtimes::builtin_requirement;
+use crate::domains::{RuntimeRequirement, normalize_runtime_requirements};
 use crate::experimental::lowering::compositions::{
     NamedCompositionFunctionMap, collect_named_composition_functions, emit_named_composition_function,
 };
@@ -105,13 +108,16 @@ pub(crate) struct LoweredModule {
 
     /// Whether execution requires the host runtime assertion handler.
     pub(crate) requires_assertion_handler: bool,
+
+    /// Canonical runtime contracts required by emitted calls and synthesized checks.
+    pub(crate) runtime_requirements: Arc<[RuntimeRequirement]>,
 }
 
 impl LoweredModule {
-    /// Consumes this lowering and returns its textual module, executable signature, and assertion-runtime requirement.
+    /// Consumes the textual module, executable signature, assertion classification, and runtime requirements.
     #[inline]
-    pub(crate) fn into_parts(self) -> (String, ExecutableSignature, bool) {
-        (self.stable_hlo, self.signature, self.requires_assertion_handler)
+    pub(crate) fn into_parts(self) -> (String, ExecutableSignature, bool, Arc<[RuntimeRequirement]>) {
+        (self.stable_hlo, self.signature, self.requires_assertion_handler, self.runtime_requirements)
     }
 }
 
@@ -306,6 +312,22 @@ impl<'b, 'c: 'b, 't: 'c, O> Lowerer<'b, 'c, 't, O> {
     pub(crate) fn with_collective_state(mut self, collective_state: CollectiveLoweringState) -> Self {
         self.collective_state = collective_state;
         self
+    }
+
+    /// Declares a runtime contract required by this emitted operation.
+    ///
+    /// Requirements are shared by every nested lowering scope and retained with the compiled artifact. Runtime
+    /// providers are resolved by the invoking session before compilation, loading, or execution.
+    ///
+    /// # Errors
+    ///
+    /// Returns an error when this declaration conflicts with an earlier requirement for the same identifier.
+    pub fn require_runtime(&mut self, requirement: RuntimeRequirement) -> Result<(), Error> {
+        let mut requirements = self.collective_state.runtime_requirements.borrow_mut();
+        let mut updated = requirements.clone();
+        updated.push(requirement);
+        *requirements = normalize_runtime_requirements(updated)?;
+        Ok(())
     }
 
     /// Returns the block that receives the StableHLO operations of the instruction being lowered. [`BlockRef`] is a
@@ -634,7 +656,7 @@ impl<V: MlirLowerableValue> LowerableOperation for ArrayOperation<V> {
             Mul, Div, Rem, Pow, Sqrt, Rsqrt, Abs, Sin, Cos, Tan, Tanh, Atan2, Exp, ExpM1, Log, Ln1p, LogAddExp, Logistic, Erf,
             Floor, Ceil, Round, Not,
             And, Or, Xor, Complex, Real, Imaginary, Conjugate, Reduce, ArgMax, ArgMin, Cumulative, Sort, Dot, RaggedDot,
-            ScaledDot, AxisIndex, ParallelReduce, ParallelVary,
+            ScaledDot, AxisIndex, ParallelReduce, ParallelVary, ParallelCast,
             ParallelAllGather, ParallelSumScatter, ParallelPermute, ParallelAllToAll, ParallelRaggedAllToAll, Compare,
             Select, Transpose, Reverse, Reshape, Broadcast, Pad, Concatenate, Gather, Scatter, Slice, UpdateSlice,
             DynamicSlice, DynamicUpdateSlice, ConvertElementType, ReducePrecision, TransferToMemory, Reshard,
@@ -797,6 +819,9 @@ pub(crate) struct CollectiveLoweringState {
 
     /// Whether any emitted instruction requires the runtime assertion handler.
     pub(crate) has_assertions: Rc<Cell<bool>>,
+
+    /// Runtime contracts declared by emitted operations across every nested lowering scope.
+    runtime_requirements: Rc<RefCell<Vec<RuntimeRequirement>>>,
 }
 
 impl CollectiveLoweringState {
@@ -811,6 +836,7 @@ impl CollectiveLoweringState {
             named_compositions: None,
             has_provenance: Rc::new(Cell::new(false)),
             has_assertions: Rc::new(Cell::new(false)),
+            runtime_requirements: Rc::new(RefCell::new(Vec::new())),
         }
     }
 
@@ -864,6 +890,7 @@ impl CollectiveLoweringState {
             named_compositions: self.named_compositions.clone(),
             has_provenance: self.has_provenance.clone(),
             has_assertions: self.has_assertions.clone(),
+            runtime_requirements: self.runtime_requirements.clone(),
         }
     }
 
@@ -886,14 +913,16 @@ impl CollectiveLoweringState {
     pub(crate) fn checked_collective_mesh(
         &self,
         operation_name: &str,
-        axis_name: &str,
+        axis_name: impl Into<CollectiveAxes>,
         axis_size: usize,
         payload_mesh: Option<&LogicalMesh>,
     ) -> Result<&LogicalMesh, Error> {
         // Resolve the binding and recorded size first, preserving the replica-group diagnostics and the nearest
-        // enclosing binder when another manual region shadows the axis name.
-        collective_replica_groups(self, axis_name, axis_size, None)?;
-        let mesh = self.manual_axis_region(axis_name).unwrap().mesh();
+        // enclosing binder when another manual region shadows the axis name. That resolution also requires every named
+        // axis to be bound on one mesh.
+        let axis_name = axis_name.into();
+        collective_replica_groups(self, &axis_name, axis_size, None)?;
+        let mesh = self.manual_axis_region(&axis_name.names()[0]).unwrap().mesh();
         if payload_mesh.is_some_and(|payload_mesh| payload_mesh != mesh) {
             return Err(ProgramError::MalformedProgram(format!(
                 "`{operation_name}` operation mesh does not match the enclosing manual axis `{axis_name}` mesh",
@@ -917,14 +946,25 @@ impl CollectiveLoweringState {
     pub(crate) fn check_manual_collective<T: PartialEq>(
         &self,
         operation_name: &str,
-        axis_name: &str,
+        axis_name: impl Into<CollectiveAxes>,
         axis_size: usize,
         payload_mesh: Option<&LogicalMesh>,
         output_types: &[T],
         infer_output_types: impl FnOnce(Option<&LogicalMesh>) -> Result<Vec<T>, TypeError>,
     ) -> Result<(), Error> {
-        let mesh = self.checked_collective_mesh(operation_name, axis_name, axis_size, payload_mesh)?;
-        let checked = self.manual_axis_region(axis_name).unwrap().check_manual_variation();
+        let axis_name = axis_name.into();
+        let mesh = self.checked_collective_mesh(operation_name, &axis_name, axis_size, payload_mesh)?;
+        let checked = self.manual_axis_region(&axis_name.names()[0]).unwrap().check_manual_variation();
+        if axis_name
+            .names()
+            .iter()
+            .any(|axis_name| self.manual_axis_region(axis_name).unwrap().check_manual_variation() != checked)
+        {
+            return Err(ProgramError::MalformedProgram(format!(
+                "`{operation_name}` axes `{axis_name}` must agree on whether their bindings check manual variation",
+            ))
+            .into());
+        }
         if !checked && payload_mesh.is_some() {
             return Err(ProgramError::MalformedProgram(format!(
                 "`{operation_name}` cannot use tracked mesh metadata inside an unchecked manual binding",
@@ -1677,26 +1717,21 @@ where
     if !module.verify()? {
         return Err(Error::Lowering(LoweringError::VerificationFailure));
     }
-    // Preserve the source effect classification explicitly. Persistent cache loads no longer have the core program
-    // available, and scanning rendered StableHLO for a target name would be a brittle substitute for typed metadata.
-    let calls_custom_call_target = |target_name: &str| {
-        program.entry_region_ref().computation_regions().any(|region| {
-            region.instructions().iter().any(|instruction| {
-                instruction
-                    .operation()
-                    .projected_payload::<CustomCallOperation>()
-                    .is_some_and(|operation| operation.target_name() == target_name)
-            })
-        })
-    };
-    signature.requires_cuda_kernel_runtime = calls_custom_call_target(crate::kernels::CUDA_KERNEL_CUSTOM_CALL_TARGET);
-    signature.requires_rocm_kernel_runtime = calls_custom_call_target(crate::kernels::ROCM_KERNEL_CUSTOM_CALL_TARGET);
     signature.requires_assertion_handler |= collective_state.has_assertions.get();
     let requires_assertion_handler = signature.requires_assertion_handler;
+    let mut runtime_requirements = collective_state.runtime_requirements.borrow().clone();
+    if requires_assertion_handler {
+        runtime_requirements.push(builtin_requirement("ryft.assert"));
+    }
+    if signature.has_ordered_io() {
+        runtime_requirements.push(builtin_requirement("ryft.ordered-io"));
+    }
+    let runtime_requirements = normalize_runtime_requirements(runtime_requirements)?.into();
     Ok(LoweredModule {
         stable_hlo: serialize_lowered_module(&module, &collective_state)?,
         signature,
         requires_assertion_handler,
+        runtime_requirements,
     })
 }
 

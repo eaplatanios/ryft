@@ -7,10 +7,12 @@
 //!
 //! # Sessions and Domains
 //!
-//! A [`Session`] borrows one PJRT [`Client`] and owns its compilation cache, default effect scope, and kernel runtime
+//! A [`Session`] borrows one PJRT [`Client`] and owns its compilation cache, default effect scope, and runtime extension
 //! resources. Create a session with [`Session::new`] or one of its cache-configuring constructors, then obtain a domain
 //! through [`Session::domain`]. Domains derived from the same session share those resources. Creating another session
-//! gives an independent cache and effect scope, even when it borrows the same client.
+//! gives an independent cache and effect scope, even when it borrows the same client. Configure built-in or downstream
+//! providers through [`RuntimeExtensions`] and [`Session::with_runtime_extensions`]. Each session initializes its own
+//! runtime instances lazily when an executable requires them.
 //!
 //! [`Options`] supplies the execution [`DeviceMesh`], sharding overrides, donation flags, and backend compilation
 //! policies for a staged function. The domain's [`CompilationOptions`] supplies the underlying PJRT compiler settings.
@@ -61,6 +63,7 @@ pub mod execution;
 pub mod options;
 pub mod persistence;
 pub mod programs;
+pub mod runtimes;
 pub mod sessions;
 pub mod targets;
 
@@ -69,6 +72,11 @@ pub use compilation::{CompilationError, CompilationKey, DispatchKey, with_input_
 pub use execution::ExecutionError;
 pub use options::{FeedbackDirectedProfile, InputBoundBucketing, Options};
 pub use programs::{CompiledProgram, LoweredProgram};
+pub use runtimes::{
+    ExecutionResources, MAX_RUNTIME_REQUIREMENTS_BYTES, RUNTIME_REQUIREMENTS_ATTRIBUTE, RuntimeError, RuntimeExtension,
+    RuntimeExtensions, RuntimeProvider, RuntimeRequirement, named_ffi_type_id, normalize_runtime_requirements,
+    runtime_requirements, with_runtime_requirements,
+};
 pub use sessions::Session;
 pub use targets::{Target, TargetDevice};
 

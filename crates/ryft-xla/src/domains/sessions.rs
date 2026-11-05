@@ -1,18 +1,16 @@
 //! Session ownership of XLA clients, caches, runtime resources, and completions.
 
-use std::sync::{Arc, Mutex, OnceLock};
+use std::sync::{Arc, OnceLock};
 
 use ryft_core::{ArrayType, CompilationContext, DeviceMesh, DiskCache, SpecializationCache};
-use ryft_pjrt::{Client, ExecutionFence};
+use ryft_pjrt::Client;
 
 use crate::domains::Domain;
 use crate::domains::eager::{EAGER_DISPATCH_CACHE_CAPACITY, EagerDispatchKey};
 use crate::domains::effects::EffectScope;
 use crate::domains::programs::CompiledProgram;
+use crate::domains::runtimes::{RuntimeExtensions, RuntimeRegistry};
 use crate::domains::targets::Target;
-use crate::kernels::CudaKernelRuntime;
-#[cfg(feature = "rocm")]
-use crate::kernels::RocmKernelRuntime;
 use crate::{Array, Error};
 
 // TODO(eaplatanios): Review this module.
@@ -23,11 +21,12 @@ use crate::{Array, Error};
 /// session, and every [`Array`] belongs to exactly one domain. Create one session per client and derive every domain
 /// from it (through [`Self::domain`], [`Domain::with_compilation_options`], or [`Domain::fork_effect_scope`]) so
 /// that all arrays and domains on that client share one compilation cache, one default effect scope, and one set of
-/// kernel runtimes, much like JAX's process-wide caches. Separate sessions remain independent, even on the same
+/// runtime extensions, much like JAX's process-wide caches. Separate sessions remain independent, even on the same
 /// client, so creating a second session is an explicit request for an isolated cache and effect ordering. Cached
 /// executables retain neither sessions nor arrays, so the ownership graph has no cache/session cycle. Call
-/// [`Self::effects_barrier`] before dropping the client when its effects must be observed; destruction adds no implicit
-/// barrier and backend behavior with unfinished device work is plugin-specific.
+/// [`Self::effects_barrier`] before dropping the client when its effects must be observed. Destruction waits for
+/// launches borrowing extension resources before releasing those resources. Ordinary execution adds no implicit
+/// destruction barrier, and backend behavior with unfinished device work is plugin-specific.
 ///
 /// # Compilation Caching
 ///
@@ -82,45 +81,8 @@ pub struct Session<'c> {
     /// Default ordering and completion scope shared by domains and arrays created through this session.
     pub(super) default_effect_scope: Arc<EffectScope<'c>>,
 
-    /// Stable allocation borrowed by CUDA FFI invocations; destroyed after all retained completions.
-    pub(super) cuda_kernel_runtime: Mutex<Option<Box<CudaKernelRuntime>>>,
-
-    /// Existing whole-execution fences protecting borrowed CUDA contexts even after outputs are dropped.
-    pub(super) cuda_kernel_completions: Mutex<Vec<ExecutionFence>>,
-
-    /// Separate HIP resources borrowed by ROCm execution contexts.
-    #[cfg(feature = "rocm")]
-    pub(super) rocm_kernel_runtime: Mutex<Option<Box<RocmKernelRuntime>>>,
-
-    /// Whole-program completions retaining HIP user data and loaded modules after dropped outputs.
-    #[cfg(feature = "rocm")]
-    pub(super) rocm_kernel_completions: Mutex<Vec<ExecutionFence>>,
-}
-
-impl Drop for Session<'_> {
-    fn drop(&mut self) {
-        let completions = self.cuda_kernel_completions.get_mut().expect("cuda completion owner mutex poisoned");
-        for completion in completions.drain(..) {
-            match completion.block_until_ready() {
-                // An execution error is terminal too. It belongs to the caller's existing fence/error channel;
-                // cleanup only needs to ensure no queued handler can still access the borrowed session resources.
-                Ok(()) | Err(_) => {}
-            }
-        }
-        // Drop uses the CUDA owner's existing cleanup/error retention policy while our client borrow is alive.
-        drop(self.cuda_kernel_runtime.get_mut().expect("cuda runtime owner mutex poisoned").take());
-        #[cfg(feature = "rocm")]
-        {
-            let completions = self.rocm_kernel_completions.get_mut().expect("rocm completion owner mutex poisoned");
-            for completion in completions.drain(..) {
-                match completion.block_until_ready() {
-                    Ok(()) | Err(_) => {}
-                }
-            }
-            // Keep the borrowed PJRT client alive while HIP releases its synchronized module cache.
-            drop(self.rocm_kernel_runtime.get_mut().expect("rocm runtime owner mutex poisoned").take());
-        }
-    }
+    /// Client-associated runtime extensions and ownership of launches borrowing their resources.
+    pub(super) runtimes: RuntimeRegistry<'c>,
 }
 
 impl<'c> Session<'c> {
@@ -131,18 +93,25 @@ impl<'c> Session<'c> {
 
     /// Creates a session with an explicitly configured compilation cache.
     pub fn with_compilation_context(client: &'c Client<'c>, cache: CompilationContext<'c, Domain<'c>>) -> Arc<Self> {
+        Self::with_runtime_extensions(client, cache, RuntimeExtensions::new())
+    }
+
+    /// Creates a session with an explicit compilation cache and immutable runtime-provider configuration.
+    ///
+    /// Initialized instances belong to this session, even when `extensions` was cloned from another configuration.
+    /// Providers initialize lazily when an executable requires them; this constructor does not load GPU drivers.
+    pub fn with_runtime_extensions(
+        client: &'c Client<'c>,
+        cache: CompilationContext<'c, Domain<'c>>,
+        extensions: RuntimeExtensions<'c>,
+    ) -> Arc<Self> {
         Arc::new(Self {
             client,
             target: OnceLock::new(),
             cache,
             eager_dispatch_cache: SpecializationCache::new(EAGER_DISPATCH_CACHE_CAPACITY),
             default_effect_scope: Arc::new(EffectScope::default()),
-            cuda_kernel_runtime: Mutex::new(None),
-            cuda_kernel_completions: Mutex::new(Vec::new()),
-            #[cfg(feature = "rocm")]
-            rocm_kernel_runtime: Mutex::new(None),
-            #[cfg(feature = "rocm")]
-            rocm_kernel_completions: Mutex::new(Vec::new()),
+            runtimes: RuntimeRegistry::new(client, extensions),
         })
     }
 
@@ -224,8 +193,6 @@ impl<'c> Session<'c> {
 
 #[cfg(test)]
 mod tests {
-    use std::time::Duration;
-
     #[cfg(feature = "cuda-13")]
     use pretty_assertions::assert_eq;
     #[cfg(feature = "cuda-13")]
@@ -238,7 +205,6 @@ mod tests {
     use crate::domains::options::Options;
     #[cfg(feature = "cuda-13")]
     use crate::domains::tests::*;
-    use crate::experimental::lowering::signature::ExecutableSignature;
     #[cfg(feature = "cuda-13")]
     use crate::experimental::ops::{Constant, Operation};
     #[cfg(feature = "cuda-13")]
@@ -389,7 +355,12 @@ mod tests {
         assert!(program.effects().classes().contains(EffectClass::OrderedState));
         let options = Options::new(mesh.clone()).with_kernel_compiler(compiler);
         let lowered = domain.lower_program(&program, 0, &options).unwrap();
-        assert!(lowered.signature.requires_cuda_kernel_runtime());
+        assert!(
+            lowered
+                .runtime_requirements()
+                .iter()
+                .any(|requirement| requirement.identifier() == "ryft.kernel.cuda")
+        );
         assert!(lowered.kernel_execution_facts.is_some());
         assert!(!lowered.signature.has_effects());
         let compiled = domain.compile_program(&lowered).unwrap();
@@ -399,8 +370,12 @@ mod tests {
         let restored_session = Session::new(&client);
         let restored_domain = restored_session.domain();
         let restored = restored_domain.deserialize_compiled_program(&bytes).unwrap().unwrap();
-        assert!(restored.signature.requires_cuda_kernel_runtime());
-        assert!(restored_session.cuda_kernel_runtime.lock().unwrap().is_some());
+        assert!(
+            restored
+                .runtime_requirements()
+                .iter()
+                .any(|requirement| requirement.identifier() == "ryft.kernel.cuda")
+        );
         let restored_outputs = restored_domain.execute_program(&restored, vec![outputs[0].clone()]).unwrap();
         let device = client.addressable_devices().unwrap()[0].id().unwrap();
         for (array, expected) in [(&input, 42), (&outputs[0], 43), (&restored_outputs[0], 44)] {
@@ -419,112 +394,6 @@ mod tests {
         drop(restored_session);
         drop(domain);
         drop(session);
-    }
-    #[test]
-    fn test_session_drop_retains_cuda_completion_after_dropped_outputs() {
-        let plugin = load_cpu_plugin().unwrap();
-        let client = plugin.client(ClientOptions::CPU(CpuClientOptions::default())).unwrap();
-        let session = Session::new(&client);
-        let (first, first_promise) = client.event(()).unwrap();
-        let (second, second_promise) = client.event(()).unwrap();
-        let fence = ExecutionFence::new(vec![first, second]);
-        session.cuda_kernel_completions.lock().unwrap().push(fence.clone());
-        drop(fence);
-        std::thread::scope(|threads| {
-            let (started, waiting) = std::sync::mpsc::channel();
-            let (released, completed) = std::sync::mpsc::channel();
-            threads.spawn(move || {
-                started.send(()).unwrap();
-                drop(session);
-                released.send(()).unwrap();
-            });
-            waiting.recv_timeout(Duration::from_secs(5)).unwrap();
-            assert!(matches!(
-                completed.recv_timeout(Duration::from_millis(100)),
-                Err(std::sync::mpsc::RecvTimeoutError::Timeout)
-            ));
-            first_promise.set(Some(ryft_pjrt::Error::aborted("terminal test failure"))).unwrap();
-            assert!(matches!(
-                completed.recv_timeout(Duration::from_millis(100)),
-                Err(std::sync::mpsc::RecvTimeoutError::Timeout)
-            ));
-            second_promise.set(None).unwrap();
-            completed.recv_timeout(Duration::from_secs(5)).unwrap();
-        });
-    }
-    #[cfg(feature = "rocm")]
-    #[test]
-    fn test_session_drop_retains_rocm_completion_after_dropped_outputs() {
-        let plugin = load_cpu_plugin().unwrap();
-        let client = plugin.client(ClientOptions::CPU(CpuClientOptions::default())).unwrap();
-        let session = Session::new(&client);
-        let (first, first_promise) = client.event(()).unwrap();
-        let (second, second_promise) = client.event(()).unwrap();
-        let fence = ExecutionFence::new(vec![first, second]);
-        session.rocm_kernel_completions.lock().unwrap().push(fence.clone());
-        drop(fence);
-        std::thread::scope(|threads| {
-            let (started, waiting) = std::sync::mpsc::channel();
-            let (released, completed) = std::sync::mpsc::channel();
-            threads.spawn(move || {
-                started.send(()).unwrap();
-                drop(session);
-                released.send(()).unwrap();
-            });
-            waiting.recv_timeout(Duration::from_secs(5)).unwrap();
-            assert!(matches!(
-                completed.recv_timeout(Duration::from_millis(100)),
-                Err(std::sync::mpsc::RecvTimeoutError::Timeout)
-            ));
-            first_promise.set(Some(ryft_pjrt::Error::aborted("terminal test failure"))).unwrap();
-            assert!(matches!(
-                completed.recv_timeout(Duration::from_millis(100)),
-                Err(std::sync::mpsc::RecvTimeoutError::Timeout)
-            ));
-            second_promise.set(None).unwrap();
-            completed.recv_timeout(Duration::from_secs(5)).unwrap();
-        });
-    }
-    #[test]
-    fn test_domain_cuda_runtime_rejects_cpu() {
-        let plugin = load_cpu_plugin().unwrap();
-        let client = plugin.client(ClientOptions::CPU(CpuClientOptions::default())).unwrap();
-        let session = Session::new(&client);
-        let signature = ExecutableSignature::new(&[], &[]).with_cuda_kernel_runtime(true);
-        assert!(!signature.has_effects());
-        assert!(matches!(
-            session.domain().ensure_runtime_requirements(&signature, "cpu"),
-            Err(error)
-                if matches!(error.downcast_custom::<crate::kernels::KernelEmbeddingError>(),
-                    Some(crate::kernels::KernelEmbeddingError::Invalid { message })
-                        if message == "cuda artifact calls require a cuda platform"),
-        ));
-        assert!(session.cuda_kernel_runtime.lock().unwrap().is_none());
-    }
-    #[test]
-    fn test_domain_rocm_runtime_rejects_cpu() {
-        let plugin = load_cpu_plugin().unwrap();
-        let client = plugin.client(ClientOptions::CPU(CpuClientOptions::default())).unwrap();
-        let session = Session::new(&client);
-        let signature = ExecutableSignature::new(&[], &[]).with_rocm_kernel_runtime(true);
-        assert!(!signature.has_effects());
-        assert!(matches!(
-            session.domain().ensure_runtime_requirements(&signature, "cpu"),
-            Err(error)
-                if matches!(error.downcast_custom::<crate::kernels::KernelEmbeddingError>(),
-                    Some(crate::kernels::KernelEmbeddingError::Invalid { message })
-                        if message == "rocm artifact calls require a rocm platform"),
-        ));
-        #[cfg(not(feature = "rocm"))]
-        assert!(matches!(
-            session.domain().ensure_runtime_requirements(&signature, "rocm"),
-            Err(error)
-                if matches!(error.downcast_custom::<crate::kernels::KernelEmbeddingError>(),
-                    Some(crate::kernels::KernelEmbeddingError::Invalid { message })
-                        if message == "rocm artifact execution requires the `rocm` feature"),
-        ));
-        #[cfg(feature = "rocm")]
-        assert!(session.rocm_kernel_runtime.lock().unwrap().is_none());
     }
     #[test]
     fn test_session_domain() {

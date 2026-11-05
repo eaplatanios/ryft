@@ -99,7 +99,7 @@ where
     if classes.contains(EffectClass::OrderedAssertion) {
         return Ok(classes);
     }
-    for region in program.regions().iter() {
+    for region in program.entry_region_ref().computation_regions() {
         for instruction in region.instructions() {
             let input_types = instruction
                 .inputs()
@@ -517,6 +517,7 @@ mod tests {
     use ryft_mlir::Location;
     use ryft_pjrt::{Client, ClientOptions, CpuClientOptions, Program as PjrtProgram, load_cpu_plugin};
 
+    use crate::experimental::lowering::lower_mlir_module_for_program;
     use crate::experimental::lowering::tests::{test_spmd_compilation_options, test_vector_type};
     use crate::experimental::ops::{Operation, ProgramBuilder as ArrayIrProgramBuilder};
     use crate::operations::jit_call::JitCallOperation;
@@ -524,6 +525,100 @@ mod tests {
     use crate::{Array, FromPjrt, Session, to_mlir_module_for_program};
 
     use super::*;
+
+    #[test]
+    fn test_synthesized_assertion_requirements_exclude_dormant_rule_regions() {
+        use ryft_core::{
+            CompositeJvpRule, CompositeOperation, DimensionBounds, DimensionFromScalarOperation, DimensionValue,
+            DimensionVariable,
+        };
+
+        let array_type = test_vector_type(4);
+        let mut builder = ArrayIrProgramBuilder::new();
+        let input = builder.add_input(array_type.clone().into());
+        let primal = builder
+            .build::<Vec<Constant>, Vec<Constant>>(vec![input], vec![Placeholder], vec![Placeholder])
+            .unwrap();
+        let mut builder = ArrayIrProgramBuilder::new();
+        let input = builder.add_input(array_type.clone().into());
+        let tangent = builder.add_input(array_type.clone().into());
+        let scalar = builder
+            .add_instruction(
+                CustomCallOperation::new("ryft.test.runtime_extent", vec![ArrayType::scalar(DataType::I64)]),
+                Vec::new(),
+                Vec::new(),
+                None,
+            )
+            .unwrap()[0];
+        let extent = DimensionVariable::new("extent", DimensionBounds::new(1, Some(9)).unwrap());
+        let symbolic = builder
+            .add_instruction(DimensionFromScalarOperation::new(extent.clone().into()), Vec::new(), vec![scalar], None)
+            .unwrap()[0];
+        let exact = builder.add_constant(Constant::Dimension(DimensionValue::constant(3).unwrap()));
+        builder
+            .add_instruction(
+                CustomCallOperation::new(
+                    "ryft.test.refined_extent",
+                    vec![ArrayType::new(DataType::F32, Shape::new(vec![extent.clone().into(), extent.into()]))],
+                ),
+                Vec::new(),
+                vec![symbolic, exact],
+                None,
+            )
+            .unwrap();
+        let jvp = builder
+            .build::<Vec<Constant>, Vec<Constant>>(vec![input, tangent], vec![Placeholder; 2], vec![Placeholder; 2])
+            .unwrap();
+        assert_eq!(lowered_effect_classes(&jvp).unwrap(), EffectClasses::single(EffectClass::OrderedAssertion));
+        let active = lower_mlir_module_for_program(
+            &jvp,
+            &[],
+            &vec![array_type.clone(); 2],
+            &vec![array_type.clone(); 2],
+            "main",
+            None,
+            None,
+            None,
+        )
+        .unwrap();
+        assert!(active.requires_assertion_handler);
+        assert_eq!(
+            active.runtime_requirements.as_ref(),
+            &[crate::domains::runtimes::builtin_requirement("ryft.assert")]
+        );
+
+        let mut builder = ArrayIrProgramBuilder::new();
+        let input = builder.add_input(array_type.clone().into());
+        let primal = builder.import_region(primal.entry_region_ref());
+        let jvp = builder.import_region(jvp.entry_region_ref());
+        let output = builder
+            .add_instruction(
+                Operation::Composite(CompositeOperation::from_rule_regions(CompositeJvpRule::Explicit, false)),
+                vec![primal, jvp],
+                vec![input],
+                None,
+            )
+            .unwrap()[0];
+        let program = builder
+            .build::<Vec<Constant>, Vec<Constant>>(vec![output], vec![Placeholder], vec![Placeholder])
+            .unwrap();
+        let dormant = lower_mlir_module_for_program(
+            &program,
+            &[],
+            &vec![array_type.clone()],
+            &vec![array_type],
+            "main",
+            None,
+            None,
+            None,
+        )
+        .unwrap();
+
+        assert!(lowered_effect_classes(&program).unwrap().is_empty());
+        assert!(!dormant.requires_assertion_handler);
+        assert!(dormant.runtime_requirements.is_empty());
+        assert!(!dormant.stable_hlo.contains("ryft.assert"));
+    }
 
     /// Returns the [`Operation`] that compares two arrays in `direction`.
     pub(super) fn compare(direction: ComparisonDirection) -> Operation {

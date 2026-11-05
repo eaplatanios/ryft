@@ -1,30 +1,38 @@
 //! Concrete HSACO embedding and session-owned HIP execution through XLA FFI.
 
-use std::sync::{Arc, OnceLock};
+use std::sync::Arc;
 
 use ryft_core::{
-    ArrayIrType, CustomCallAttribute, CustomCallOperation, DataType, Dimension as CoreDimension, EffectClass, Memory,
-    Operation as CoreOperation, Typed,
+    ArrayIrType, CustomCallAttribute, CustomCallOperation, DataType, DeviceMesh, Dimension as CoreDimension,
+    EffectClass, Memory, Operation as CoreOperation, Typed,
 };
 use ryft_kernels::{GridExecution, KernelParameterAccess, VerifiedKernel};
+use ryft_pjrt::Client;
 use ryft_pjrt::extensions::ffi::{
     FfiAttribute, FfiCallFrame, FfiError, FfiExecutionStage, FfiHandler, FfiHandlerTraits, FfiInput, FfiOutput,
     FfiTypeId, FfiTypeInformation, FfiUserData, XLA_FFI_CallFrame, XLA_FFI_Error, XLA_FFI_Handler,
 };
-use ryft_pjrt::{Client, ExecutionContext};
 use ryft_rocm::{
     RocmDevicePointer, RocmKernelArtifact, RocmKernelLaunch, RocmKernelLaunchDimensions, RocmKernelLauncher, RocmStream,
 };
 use serde::{Deserialize, Serialize};
 use sha2::{Digest, Sha256};
 
-use crate::ToPjrt;
+use crate::domains::runtimes::{builtin_requirement, validate_builtin_requirement};
+use crate::domains::{
+    ExecutionResources, RuntimeExtension, RuntimeProvider, RuntimeRequirement, named_ffi_type_id,
+    with_runtime_requirements,
+};
 use crate::kernels::{
     KernelEmbeddingError, KernelOutputEmbedding, ROCM_KERNEL_CUSTOM_CALL_TARGET, dense_memory_layouts,
 };
+use crate::{Error, Target, ToPjrt};
 
-/// Plugin-owned user-data type registered once with the ROCm handler.
-static ROCM_RUNTIME_REGISTRATION: OnceLock<Result<FfiTypeId, ryft_pjrt::Error>> = OnceLock::new();
+/// Name of the native type through which the built-in ROCm artifact handler recovers its session runtime.
+const ROCM_RUNTIME_TYPE_NAME: &str = "ryft.kernel.rocm.runtime";
+
+/// Explicit native type ID registered under [`ROCM_RUNTIME_TYPE_NAME`] and used to look up the session runtime.
+const ROCM_RUNTIME_TYPE_ID: FfiTypeId = named_ffi_type_id(ROCM_RUNTIME_TYPE_NAME);
 
 /// Custom-call buffer supplying one physical HIP pointer argument.
 #[derive(Copy, Clone, Debug, PartialEq, Eq, Serialize, Deserialize)]
@@ -191,10 +199,15 @@ impl<Extension: CoreOperation<Type = ArrayIrType>> KernelOutputEmbedding<RocmKer
         if payload.len() > RocmEnvelope::MAXIMUM_PAYLOAD_BYTES {
             return Err(KernelEmbeddingError::Invalid { message: "rocm payload exceeds its size limit".into() });
         }
-        Ok(CustomCallOperation::new(self.target_name.clone(), outputs)
+        let operation = CustomCallOperation::new(self.target_name.clone(), outputs)
             .with_attribute("ryft.rocm.sha256", hex::encode(Sha256::digest(payload.as_bytes())))
             .with_attribute("ryft.rocm.payload", payload)
-            .with_attribute("ryft.rocm.row_major", true))
+            .with_attribute("ryft.rocm.row_major", true);
+        if self.target_name == ROCM_KERNEL_CUSTOM_CALL_TARGET {
+            return with_runtime_requirements(operation, [builtin_requirement(ROCM_KERNEL_CUSTOM_CALL_TARGET)])
+                .map_err(|error| KernelEmbeddingError::Invalid { message: error.to_string() });
+        }
+        Ok(operation)
     }
 }
 
@@ -287,47 +300,66 @@ impl RocmEnvelope {
 }
 
 /// Stable session allocation borrowed by XLA until all whole-execution fences complete.
-pub(crate) struct RocmKernelRuntime {
+struct RocmKernelRuntime {
     /// Concrete bounded HIP module owner.
     launcher: RocmKernelLauncher,
-
-    /// Type registered in the selected plugin's FFI registry.
-    type_id: FfiTypeId,
 }
 
 impl RocmKernelRuntime {
     /// Creates the HIP owner and idempotently registers the concrete ROCm handler.
-    pub(crate) fn new(client: &Client<'_>) -> Result<Self, KernelEmbeddingError> {
+    fn new(client: &Client<'_>) -> Result<Self, Error> {
         let launcher = RocmKernelLauncher::new()?;
-        let type_id = ROCM_RUNTIME_REGISTRATION
-            .get_or_init(|| {
-                let type_id = client.register_ffi_type(
-                    "ryft.kernel.rocm.runtime",
-                    FfiTypeId::UNKNOWN,
-                    FfiTypeInformation::new(None),
-                )?;
-                client.register_ffi_handler(
-                    ROCM_KERNEL_CUSTOM_CALL_TARGET,
-                    "ROCM",
-                    FfiHandler::from(rocm_kernel_handler as XLA_FFI_Handler),
-                    FfiHandlerTraits::NONE,
-                )?;
-                Ok(type_id)
-            })
-            .clone()?;
-        Ok(Self { launcher, type_id })
+        client.register_ffi_type(ROCM_RUNTIME_TYPE_NAME, ROCM_RUNTIME_TYPE_ID, FfiTypeInformation::new(None))?;
+        client.register_ffi_handler(
+            ROCM_KERNEL_CUSTOM_CALL_TARGET,
+            "ROCM",
+            FfiHandler::from(rocm_kernel_handler as XLA_FFI_Handler),
+            FfiHandlerTraits::NONE,
+        )?;
+        Ok(Self { launcher })
+    }
+}
+
+/// Lazily initializes HIP launch support for a selected PJRT client.
+struct RocmRuntimeProvider;
+
+impl<'c> RuntimeProvider<'c> for RocmRuntimeProvider {
+    fn identifier(&self) -> &str {
+        ROCM_KERNEL_CUSTOM_CALL_TARGET
     }
 
-    /// Creates an execution context borrowing this session allocation.
-    ///
-    /// # Safety
-    /// This allocation and its PJRT client must outlive every queued whole-program execution, even if outputs are
-    /// dropped. User-data insertion borrows the pointer; the session's retained fences enforce the lifetime.
-    pub(crate) unsafe fn execution_context(&self, client: &Client<'_>) -> Result<ExecutionContext, ryft_pjrt::Error> {
-        let context = client.execution_context()?;
-        unsafe { context.add_ffi_user_data(FfiUserData::new(self.type_id, (self as *const Self).cast_mut().cast())) }?;
-        Ok(context)
+    fn initialize(
+        &self,
+        client: &'c Client<'c>,
+        target: &Target,
+        requirement: &RuntimeRequirement,
+    ) -> Result<Arc<dyn RuntimeExtension<'c> + 'c>, Error> {
+        validate_builtin_requirement(requirement, self.identifier())?;
+        if !target.platform_name().eq_ignore_ascii_case("rocm") {
+            return Err(Error::custom(KernelEmbeddingError::Invalid {
+                message: "rocm artifact calls require a rocm platform".to_owned(),
+            }));
+        }
+        Ok(Arc::new(RocmKernelRuntime::new(client)?))
     }
+}
+
+impl<'c> RuntimeExtension<'c> for RocmKernelRuntime {
+    fn validate_execution(&self, client: &Client<'_>, mesh: &DeviceMesh) -> Result<(), Error> {
+        crate::kernels::distributed::validate_kernel_participants(client, mesh)?;
+        Ok(())
+    }
+
+    fn prepare(&self, resources: &mut ExecutionResources<'c>) -> Result<(), Error> {
+        // The session owns this stable instance and retains its invocation lease through whole-launch completion.
+        let data = (self as *const Self).cast_mut().cast();
+        unsafe { resources.add_ffi_user_data(FfiUserData::new(ROCM_RUNTIME_TYPE_ID, data)) }
+    }
+}
+
+/// Returns the built-in ROCm provider without loading HIP or a PJRT plugin.
+pub(super) fn runtime_provider<'c>() -> Arc<dyn RuntimeProvider<'c> + 'c> {
+    Arc::new(RocmRuntimeProvider)
 }
 
 /// Decodes and validates the invocation before borrowing HIP buffer and stream handles.
@@ -359,16 +391,11 @@ fn launch_rocm_kernel(frame: &FfiCallFrame<'_>) -> Result<(), FfiError> {
         return Err(FfiError::invalid_argument("rocm frame buffer counts differ from the declared signature"));
     }
     let context = frame.context()?;
-    let type_id = ROCM_RUNTIME_REGISTRATION
-        .get()
-        .ok_or_else(|| FfiError::internal("rocm runtime is not registered"))?
-        .as_ref()
-        .map_err(|error| FfiError::internal(error.to_string()))?;
-    let data = context.user_data(*type_id)?.data;
+    let data = context.user_data(ROCM_RUNTIME_TYPE_ID)?.data;
     if data.is_null() {
         return Err(FfiError::invalid_argument("missing session rocm runtime"));
     }
-    // The only producer is execution_context. Its owning session drains all queued execution fences before drop.
+    // The runtime preparation hook inserts this pointer. Its session retains the stable instance through completion.
     let runtime = unsafe { &*data.cast::<RocmKernelRuntime>() };
     let mut arguments = Vec::new();
     for (binding, (element_type, dimensions)) in envelope.argument_bindings.iter().zip(&envelope.parameter_types) {
@@ -428,8 +455,11 @@ unsafe extern "C" fn rocm_kernel_handler(frame: *mut XLA_FFI_CallFrame) -> *mut 
 #[cfg(test)]
 mod tests {
     use pretty_assertions::assert_eq;
-
     use ryft_core::{Array as CoreArray, ArrayType};
+    use ryft_pjrt::{ClientOptions, CpuClientOptions, load_cpu_plugin};
+
+    use crate::RuntimeError;
+    use crate::domains::runtime_requirements;
 
     use super::*;
 
@@ -504,12 +534,35 @@ mod tests {
             .custom_call(&verified, &artifact())
             .unwrap();
         assert_eq!(operation.target_name(), ROCM_KERNEL_CUSTOM_CALL_TARGET);
+        assert_eq!(
+            runtime_requirements(&operation).unwrap(),
+            vec![builtin_requirement(ROCM_KERNEL_CUSTOM_CALL_TARGET)]
+        );
         assert_eq!(operation.output_types(), &[r#type]);
         assert!(operation.input_output_aliases().is_empty());
         assert_eq!(
             operation.attributes().iter().find(|(name, _)| name == "ryft.rocm.row_major"),
             Some(&("ryft.rocm.row_major".to_owned(), CustomCallAttribute::Boolean(true)))
         );
+    }
+
+    #[test]
+    fn test_rocm_runtime_provider_initialize() {
+        let client = load_cpu_plugin().unwrap().client(ClientOptions::CPU(CpuClientOptions::default())).unwrap();
+        let target = Target::from_client(&client).unwrap();
+        let provider = runtime_provider();
+        let error = provider
+            .initialize(&client, &target, &builtin_requirement(ROCM_KERNEL_CUSTOM_CALL_TARGET))
+            .err()
+            .unwrap();
+        assert!(
+            matches!(error.downcast_custom::<KernelEmbeddingError>(), Some(KernelEmbeddingError::Invalid { message })
+            if message == "rocm artifact calls require a rocm platform")
+        );
+        let requirement = RuntimeRequirement::new(ROCM_KERNEL_CUSTOM_CALL_TARGET, 2, Vec::new()).unwrap();
+        assert!(matches!(provider.initialize(&client, &target, &requirement),
+            Err(Error::Runtime(RuntimeError::UnsupportedVersion { identifier, version: 2 }))
+                if identifier == ROCM_KERNEL_CUSTOM_CALL_TARGET));
     }
 
     #[test]

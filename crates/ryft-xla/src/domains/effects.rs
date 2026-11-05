@@ -981,7 +981,7 @@ mod tests {
         let lowered = domain.lower_program(&program, 0, &Options::new(mesh.clone())).unwrap();
         // Only assertions create a local chain; ordered I/O is seeded from the hidden executable argument.
         assert!(lowered.signature.has_ordered_io());
-        assert!(lowered.signature.requires_assertion_handler());
+        assert!(lowered.signature.requires_assertion_handler);
         assert_eq!(lowered.stable_hlo().matches("stablehlo.after_all").count(), 1, "{}", lowered.stable_hlo());
         let compiled = domain.compile_program(&lowered).unwrap();
         let input = |value: i64| {
