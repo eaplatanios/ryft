@@ -5702,14 +5702,12 @@ mod tests {
         assert_eq!(outputs[0].r#type().sharding(), Some(&explicit_sharding));
         assert_eq!(outputs[0].value().to_f64s(), vec![0.0, 9.0, 9.0, 3.0, 4.0, 9.0, 9.0, 7.0]);
 
-        // A mapped input varying over a manual mesh axis keeps both its placement and its variation.
+        // A mapped input placed on a manual mesh axis keeps its placement, which adds no variation.
         let manual_mesh = LogicalMesh::new(vec![MeshAxis::new("x", 2, MeshAxisType::Manual).unwrap()]).unwrap();
         let manual_sharding = Sharding::new(
             manual_mesh.clone(),
             vec![ShardingDimension::sharded(["x"]), ShardingDimension::replicated()],
         )
-        .unwrap()
-        .with_varying_manual_axes(["x"])
         .unwrap();
         let input_type = ArrayType::new_static(DataType::F64, [2, 4]).with_sharding(manual_sharding.clone()).unwrap();
         let update_type = ArrayType::new_static(DataType::F64, [2])
@@ -9159,14 +9157,12 @@ mod tests {
         assert_eq!(outputs[0].r#type().sharding(), Some(&explicit_sharding));
         assert_eq!(outputs[0].value().to_f64s(), vec![0.0, 9.0, 9.0, 3.0, 4.0, 9.0, 9.0, 7.0]);
 
-        // A mapped input varying over a manual mesh axis keeps both its placement and its variation.
+        // A mapped input placed on a manual mesh axis keeps its placement, which adds no variation.
         let manual_mesh = LogicalMesh::new(vec![MeshAxis::new("x", 2, MeshAxisType::Manual).unwrap()]).unwrap();
         let manual_sharding = Sharding::new(
             manual_mesh.clone(),
             vec![ShardingDimension::sharded(["x"]), ShardingDimension::replicated()],
         )
-        .unwrap()
-        .with_varying_manual_axes(["x"])
         .unwrap();
         let input_type = ArrayType::new_static(DataType::F64, [2, 4]).with_sharding(manual_sharding.clone()).unwrap();
         let update_type = ArrayType::new_static(DataType::F64, [2])
@@ -9180,9 +9176,7 @@ mod tests {
         let update = ArrayBatch::replicated(Array::from_elements::<f64>(update_type, &[9.0, 9.0]).unwrap());
         let start = ArrayBatch::replicated(
             Array::from_elements(
-                ArrayType::scalar(DataType::I32)
-                    .with_sharding(Sharding::replicated(manual_mesh, 0).with_varying_manual_axes(["x"]).unwrap())
-                    .unwrap(),
+                ArrayType::scalar(DataType::I32).with_sharding(Sharding::replicated(manual_mesh, 0)).unwrap(),
                 &[1_i32],
             )
             .unwrap(),

@@ -1944,8 +1944,6 @@ mod tests {
             let mesh = LogicalMesh::new(vec![MeshAxis::new("x", 2, axis_type).unwrap()]).unwrap();
             let physical_sharding =
                 Sharding::new(mesh.clone(), vec![ShardingDimension::sharded(["x"]), ShardingDimension::replicated()])
-                    .unwrap()
-                    .with_varying_manual_axes((axis_type == MeshAxisType::Manual).then_some("x"))
                     .unwrap();
             let physical_type =
                 ArrayType::new(DataType::F64, Shape::new(vec![Dimension::Static(2), Dimension::Static(2)]))

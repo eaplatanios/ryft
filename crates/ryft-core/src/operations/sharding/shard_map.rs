@@ -253,8 +253,8 @@ use crate::arrays::sharding::meshes::render_mesh_axis_name;
 use crate::arrays::{
     Array, ArrayAddressing, ArrayIrBatch, ArrayIrBatchingPolicy, ArrayIrOperation, ArrayIrType, ArrayIrValue,
     ArrayOperation, ArrayReference, ArrayReferenceTransform, ArraySliceAxis, ArrayType, DataType, Dimension,
-    DimensionType, DimensionValue, DimensionVariable, LogicalMesh, MeshAxisType, Shape, Sharding, ShardingDimension,
-    ShardingError,
+    DimensionType, DimensionValue, DimensionVariable, LogicalMesh, MeshAxisType, ReductionStateKind, Shape, Sharding,
+    ShardingDimension, ShardingError,
 };
 use crate::axes::{NamedAxes, NamedAxis};
 use crate::batching::{
@@ -557,76 +557,6 @@ impl Display for ShardMapValueKind {
             Self::Input => write!(formatter, "input"),
             Self::Output => write!(formatter, "output"),
         }
-    }
-}
-
-/// Kind of reduction state that a [`ShardMapError`] refers to.
-#[derive(Copy, Clone, Debug, PartialEq, Eq, Hash)]
-pub enum ReductionStateKind {
-    /// State along the unreduced axes of a sharding (refer to [`Sharding::unreduced_axes`]), along which the devices
-    /// hold summands of the value.
-    Unreduced,
-
-    /// State along the reduced axes of a sharding (refer to [`Sharding::reduced_axes`]), along which the value is
-    /// replicated but its cotangent is unreduced.
-    Reduced,
-}
-
-impl Display for ReductionStateKind {
-    fn fmt(&self, formatter: &mut std::fmt::Formatter<'_>) -> std::fmt::Result {
-        match self {
-            Self::Unreduced => write!(formatter, "unreduced"),
-            Self::Reduced => write!(formatter, "reduced"),
-        }
-    }
-}
-
-/// Static manual-variation checking policy shared by the boundary and closure options. Its two switches are stored
-/// independently, so the builders that set them commute. Output replication is proven only when the body's manual
-/// variation is checked as well, because an unchecked body carries no variation from which to prove it, so the policy
-/// compares and hashes by the effective checks only (i.e., every policy without manual-variation checking is equal).
-#[derive(Copy, Clone, Debug)]
-struct ManualVariationChecks {
-    /// Whether the body tracks variation over the active manual axes.
-    manual_variation: bool,
-
-    /// Whether array output replication must be proven, which takes effect only when `manual_variation` is set.
-    output_replication: bool,
-}
-
-impl ManualVariationChecks {
-    /// Policy that tracks body variation and proves output replication, which is the default.
-    const CHECKED: Self = Self { manual_variation: true, output_replication: true };
-
-    /// Returns whether the body's manual variation is checked.
-    fn check_manual_variation(self) -> bool {
-        self.manual_variation
-    }
-
-    /// Returns whether output replication is statically proven.
-    fn check_output_replication(self) -> bool {
-        self.manual_variation && self.output_replication
-    }
-}
-
-impl Default for ManualVariationChecks {
-    fn default() -> Self {
-        Self::CHECKED
-    }
-}
-
-impl PartialEq for ManualVariationChecks {
-    fn eq(&self, other: &Self) -> bool {
-        (self.check_manual_variation(), self.check_output_replication())
-            == (other.check_manual_variation(), other.check_output_replication())
-    }
-}
-
-impl Eq for ManualVariationChecks {}
-
-impl Hash for ManualVariationChecks {
-    fn hash<H: Hasher>(&self, state: &mut H) {
-        (self.check_manual_variation(), self.check_output_replication()).hash(state);
     }
 }
 
@@ -1545,42 +1475,6 @@ impl ShardMapBoundary {
     }
 }
 
-/// Reduction state that a value carries through a `shard_map` boundary along the axes that the boundary sharding does
-/// not govern (refer to [`ShardMapBoundary::carried_reduction_state`]).
-struct CarriedReductionState {
-    /// Unreduced axes carried through the boundary.
-    unreduced_axes: BTreeSet<String>,
-
-    /// Reduced axes carried through the boundary.
-    reduced_axes: BTreeSet<String>,
-}
-
-impl CarriedReductionState {
-    /// Adds the carried reduction state to `sharding`, which already holds the state along the governed axes.
-    fn apply(self, sharding: Sharding) -> Result<Sharding, ShardingError> {
-        let unreduced_axes = sharding.unreduced_axes().iter().cloned().chain(self.unreduced_axes).collect::<Vec<_>>();
-        let reduced_axes = sharding.reduced_axes().iter().cloned().chain(self.reduced_axes).collect::<Vec<_>>();
-        sharding.with_unreduced_axes(unreduced_axes)?.with_reduced_axes(reduced_axes)
-    }
-}
-
-/// Active manual axes requested for a [`ShardMapBoundary`].
-enum ManualAxisSelection {
-    /// Every manual mesh axis that no enclosing manual region already made manual, which is what an empty list of
-    /// manual axes requests from [`ShardMapBoundary::new`] and [`shard_map`](fn@shard_map).
-    Remaining,
-
-    /// Exactly the listed manual mesh axes. Only the batching rule of [`ShardMapOperation`] lists none, when it places
-    /// the batch axis on every active manual axis of the source map.
-    Listed(Vec<String>),
-}
-
-impl From<Vec<String>> for ManualAxisSelection {
-    fn from(manual_axes: Vec<String>) -> Self {
-        if manual_axes.is_empty() { Self::Remaining } else { Self::Listed(manual_axes) }
-    }
-}
-
 /// Canonical operation name for [`ShardMapOperation`]. Program statistics and their cross-language test cases match
 /// this name, so it must not change.
 pub const SHARD_MAP_OPERATION_NAME: &str = "shard_map";
@@ -2276,20 +2170,6 @@ impl Operation for ShardMapOperation {
     }
 }
 
-// Reference discharge implements the "Discharge threads owned shards" bullet of the module documentation through the
-// driver's isolated region rebuild of the *local* body. Each reference input enters the rebuilt body as a boundary view
-// (refer to `ReferenceDischargeRegionInput::View`), because the body receives `ref<T_local>` while the caller
-// allocation holds `ref<T_global>`. The view is fresh local state typed by the body input and initialized from the
-// local shard, and every mutated view publishes its final local state through `ReferenceDischargeRegionOutput::View`.
-// The rebuilt boundary keeps every input position (a reference position becomes the global referent, an array sharded
-// by the same input sharding), drops the forwarded reference outputs (the caller already holds those handles), and
-// publishes each mutated input's final state as a trailing output whose output sharding is that input's input sharding.
-//
-// Two reference inputs naming one allocation would become two independent views, silently losing their aliasing, so
-// the rule rejects them with `ShardMapError::RepeatedReferenceInputAllocation`. It also refuses a preserved reference,
-// because a manual region threads state, not destination references, and it summarizes the body first so that the
-// shared access policy and consumption checks run exactly as for other structured rules. A body without references
-// replays verbatim.
 impl<C, P> ReferenceDischargeableOperation<C, P> for ShardMapOperation
 where
     C: Context<Type = ArrayIrType, Operation: From<ShardMapOperation> + OperationPayloadProjection>,
@@ -2301,6 +2181,11 @@ where
         driver: &D,
         inputs: &[ReferenceDischargeValue<C, P>],
     ) -> Result<Vec<ReferenceDischargeValue<C, P>>, ProgramError> {
+        // This rule implements the "Discharge threads owned shards" bullet of the module documentation by rebuilding
+        // the *local* body through the driver's isolated region rebuild. Each reference input enters the rebuilt body
+        // as a boundary view, the forwarded reference outputs are dropped, and the final state of each mutated input
+        // leaves the rebuilt map as a trailing output under its input sharding.
+
         let name = self.name();
         check_count!("input", inputs, self.input_types.len(), ProgramError);
         let body = driver.region(0)?;
@@ -2311,9 +2196,12 @@ where
         if !self.boundary.check_manual_variation() {
             self.validate_body(body)?;
         }
+        // A body without references replays verbatim.
         if allocations.iter().all(Option::is_none) && !body.contains_references_in_closure() {
             return context.discharge_reference_free_operation(self, driver, inputs);
         }
+        // Two reference inputs that denote one allocation would become two independent views, which would silently lose
+        // their aliasing.
         for (second_input_index, allocation) in allocations.iter().enumerate() {
             if let Some(allocation) = allocation
                 && let Some(first_input_index) =
@@ -2323,6 +2211,9 @@ where
                 return Err(error.into());
             }
         }
+        // The body is summarized first, so that the shared access policy and consumption checks run exactly as for
+        // other structured rules. A manual region threads state rather than destination references, so a preserved
+        // reference input is refused.
         self.validate_body(body)?;
         let summary = context.region_summary(self, 0, body, allocations.as_slice())?;
         for (index, allocation) in allocations.iter().enumerate() {
@@ -2365,8 +2256,10 @@ where
             None => body,
         };
 
-        // Every reference input enters as a boundary view, and the final local state of every input that the body
-        // mutates follows the value outputs, in input order.
+        // Every reference input enters as a boundary view (refer to `ReferenceDischargeRegionInput::View`), because the
+        // body receives `ref<T_local>` while the caller's allocation holds `ref<T_global>`. A view is fresh local state
+        // that the body input types and the local shard initializes, and the final local state of every input that the
+        // body mutates follows the value outputs, in input order (refer to `ReferenceDischargeRegionOutput::View`).
         let mutated_inputs = allocations
             .iter()
             .enumerate()
@@ -2389,8 +2282,9 @@ where
         );
         let program = driver.rebuild_region(context, normalized_body, &boundary)?.into_program();
 
-        // Rebuild the boundary. Every input keeps its position and input sharding, the value outputs keep theirs, and
-        // one final-state output per mutated reference input follows them under that input's input sharding. The
+        // Rebuild the boundary. Every input keeps its position and input sharding (a reference input becomes its
+        // global referent, an array placed by the same input sharding), the value outputs keep theirs, and one
+        // final-state output per mutated reference input follows them under that input's input sharding. The
         // final state is typed by the input it replaces (the allocation's current state) rather than by the declared
         // global referent, because the declared boundary type may omit sharding metadata that the allocation carries
         // and the discharged state must match the allocation's referent type exactly.
@@ -2447,14 +2341,6 @@ where
     }
 }
 
-// Interpretation of a `shard_map` over the reference backend's `Array` values runs the lockstep emulator that the
-// `# Reference Backend Emulation` section of the module documentation describes. Interpreting the local body once over
-// global values would ignore the per-device partitioning, so the body is never replayed through `interpret_region`. The
-// rule needs only payload projection from the operation family (i.e., the `OperationPayloadProjection` bound), to
-// recognize collectives and region operations inside the body, and it serves every domain over `ArrayIrValue<Array>`
-// (e.g., the eager context of `ArrayIrOperation<Array>` and of kernel operation families). Backends with a device
-// runtime execute the complete boundary through their own `Context::bind` instead (e.g., by compiling the whole manual
-// computation for their devices).
 impl<C> InterpretableOperation<C> for ShardMapOperation
 where
     C: Domain<
@@ -2470,6 +2356,13 @@ where
         driver: &D,
         inputs: &[C::Value],
     ) -> Result<Vec<C::Value>, ProgramError> {
+        // This rule runs the lockstep emulator that the `# Reference Backend Emulation` section of the module
+        // documentation describes, rather than replaying the local body once over the global values through
+        // `interpret_region`, which would ignore the partitioning across devices. It needs only payload projection from
+        // the operation family (to recognize collectives and region operations inside the body), so it serves every
+        // domain over `ArrayIrValue<Array>` (e.g., the eager contexts of `ArrayIrOperation<Array>` and of kernel
+        // operation families). Backends with a device runtime execute the whole boundary through their own
+        // `Context::bind` instead (e.g., by compiling the manual computation for their devices).
         self.validate_region_interfaces(&driver.region_interfaces())?;
         let emulator = ShardMapEmulator { context, driver, grid: ManualDeviceGrid::default() };
         let outputs = emulator.run_shard_map(
@@ -2481,40 +2374,6 @@ where
     }
 }
 
-// Online partial evaluation rule for a staged `shard_map`, which is the counterpart of the jitted call rule for map
-// boundaries. It splits the local body according to which of the caller's inputs are known, while preserving the
-// `shard_map` boundary, its mesh, and its shardings on both sides.
-//
-// The split fires whenever some inputs are known and some are not. Calls whose inputs are all known or all unknown
-// defer to the default fold or residualize behavior, which preserves the original boundary exactly. Whether the known
-// inputs are concrete values of an eager known side context or tracers into a live outer trace does not matter, as in
-// JAX's `_shard_map_partial_eval`, which always binds its known `shard_map`. The known half is bound into the known
-// side context through the default fold or residualize policy, which executes it under an eager context (e.g., through
-// the reference backend's emulation or a device runtime) and stages it into the outer program under a staging context.
-// An eager known side context therefore needs to execute the known `shard_map`, which is the same requirement that
-// binding a call whose inputs are all known through it imposes. The jitted call rule follows the same policy, so that
-// every operation with a region boundary feeds the shared `PartitionedProgram` protocol under the same contract for
-// known inputs.
-//
-// When the split fires, an output that merely forwards a known input (i.e., whose body output is that body input) under
-// an output sharding equal to the input sharding is that global input itself, so it is returned as the known input
-// whenever the input already has the declared output type, without any known side work, and the remaining outputs are
-// split as follows. This shortcut is a Ryft extension, since JAX's `_shard_map_partial_eval` returns every known output
-// from its known `shard_map`. The *local* body program is split through the shared `PartitionedProgram` machinery, and
-// the original boundary is kept whole only when the known half has neither instructions nor known outputs. Known
-// outputs that need no known instruction (e.g., forwarded inputs placed by another sharding) still get a known side
-// `shard_map`, so they stay known, as JAX always binds its known half. Residual edges that would merely repeat a known
-// value are forwarded (refer to `PartitionedProgram::forward_residuals`). An edge that the known half forwards from one
-// of its inputs is fed to the residual side directly from the corresponding known boundary input (JAX's `in_fwd`),
-// under that input's global type and input sharding, and an edge that is a known output is fed from that known boundary
-// output (JAX's `out_fwd`), under that output's global type and with its output sharding as the input sharding. Both
-// deliver exactly the local value that the edge carries, so the known half then neither returns the value a second time
-// nor, when nothing else uses a forwarded input, receives that input. The known side is rewrapped as a `shard_map`
-// whose global outputs are the fully known boundary outputs followed by the remaining residual edges from the known to
-// the unknown side (each edge's global type and sharding derived through `residual_edge`), bound into the enclosing
-// known side context over the known boundary inputs that it uses. The residual side is rewrapped as a `shard_map` over
-// the surviving unknown boundary inputs, the forwarded known boundary inputs and outputs, and those residual edges, and
-// emitted into the residual program.
 impl<C> PartiallyEvaluatableOperation<C> for ShardMapOperation
 where
     C: Context<
@@ -2534,6 +2393,13 @@ where
         driver: &D,
         inputs: &[PartialEvaluationValue<C::Value>],
     ) -> Result<Vec<PartialEvaluationValue<C::Value>>, ProgramError> {
+        // This rule is the counterpart of the jitted call rule for map boundaries. It splits the local body by which of
+        // the caller's inputs are known, keeping the `shard_map` boundary, its mesh, and its shardings on both sides,
+        // and binds the known half into the known side context through the default fold or residualize policy, whether
+        // that context executes it eagerly (e.g., through the reference backend's emulation or a device runtime) or
+        // stages it into the outer program, as JAX's `_shard_map_partial_eval` always binds its known `shard_map`.
+        // Every operation with a region boundary feeds the shared `PartitionedProgram` protocol under this contract for
+        // known inputs.
         if !self.boundary.check_manual_variation() {
             self.validate_body(driver.region(0)?)?;
         }
@@ -2555,9 +2421,10 @@ where
             self.validate_body(body_program)?;
             return context.fold_or_residualize(self.clone(), vec![body_program.to_program()], inputs);
         }
-        // Outputs that merely forward a known input are that input itself (a Ryft extension, as explained above). When
-        // the output sharding equals the input sharding and the input already has the declared output type, the global
-        // output is the global input, so it stays known without any known side `shard_map`. The remaining outputs are
+        // Outputs that merely forward a known input are that input itself. When the output sharding equals the input
+        // sharding and the input already has the declared output type, the global output is the global input, so it
+        // stays known without any known side `shard_map`. This shortcut is a Ryft extension, since JAX's
+        // `_shard_map_partial_eval` returns every known output from its known `shard_map`. The remaining outputs are
         // split below.
         let forwarded_inputs = (0..self.output_types.len())
             .map(|output_index| {
@@ -2608,82 +2475,6 @@ where
     }
 }
 
-// Batching rule for `ShardMapOperation`, following JAX's `_shard_map_batch`. The logical batch axis of a mapped input
-// or output is the axis that the batching context maps over, and it physically becomes one more dimension of that
-// value's global boundary type (of its referent, for a reference), at the value's batch axis and with the static batch
-// extent. For a replicated batch axis, that dimension is unpartitioned (JAX's `batch_spec(spec, axis, None)`), and
-// otherwise it is partitioned only along free axes (refer to the placement paragraph below), so the active manual axes
-// of the batched map keep partitioning exactly the dimensions that they partitioned before batching. The local type of
-// a mapped value is its unbatched local type with the whole batch dimension inserted at the same position, and every
-// device runs the structurally batched local body over all batch items of its own shards. Collectives over manual axes
-// inside the body combine those shards elementwise, so they pass the batch dimension through untouched.
-//
-// Unbatched inputs keep their boundary types and shardings and enter the batched body unbatched, where its structural
-// batching aligns them with the mapped values that they meet, so mapped and unbatched inputs mix freely. Once the body
-// is batched, the rule restores the boundary by inserting the batch dimension into the input sharding and declared
-// global type of every mapped input, and into the output sharding and declared global type of every output that the
-// batched body maps, at the position that the batched body reports. The body is batched at the same batching level
-// (only its placement may differ, as explained below), so a collective over the name of this level inside the body
-// (which the body inherits from the enclosing named axes, refer to the `ShardMap` capability) is consumed by this
-// level, exactly as JAX traces the body under its `BatchTrace`. The body does not inherit a level named like an axis of
-// the mesh, though, because the mesh axis shadows it (as the innermost binding of a name does in JAX's axis
-// environment), so the body is batched at an anonymous level then, and its collectives over that name keep
-// communicating along the mesh axis. A call whose inputs are all unbatched computes the same values for every batch
-// item unless its body refers to this level by name, so only an anonymous or shadowed level keeps such a call's
-// boundary and binds it unchanged. Any other named level batches the body structurally even then. An output that the
-// consumed collectives map (e.g., the `axis_index` of this level) takes the mapped path, while a body whose outputs all
-// stay unbatched keeps the boundary of the call. The errors of this rule therefore also apply to a call whose inputs
-// are all unbatched but whose body maps an output.
-//
-// References batch like arrays, through their referents. A mapped reference input `ref<T>` crosses as `ref<T'>`, where
-// `T'` is `T` with the batch dimension inserted, the body reads and writes per-item values at that axis, and a
-// forwarded reference output carries the batch axis of the input that it forwards (which the rule validates). An
-// unbatched reference input keeps its boundary and is shared by every batch item, so the reference rules of the body
-// reject any write of a batched value into it, as JAX's `_swap_vmap` does. The ownership contract of the boundary is
-// unchanged, because the batch dimension is never partitioned along an active manual axis.
-//
-// A batching level may place its batch axis on mesh axes (`BatchingContext::axis_sharding`, which batching infers from
-// the shardings of the mapped inputs), and the rule keeps that placement at the boundary, where it partitions the batch
-// dimension of every mapped input and output. An `Auto` placement axis is dropped, as the boundary drops `Auto` axes
-// from every sharding, and an unconstrained placement leaves the batch dimension unpartitioned, as a missing
-// `spmd_axis_name` does in JAX. When some input is mapped, the placement is validated before the body is batched. A
-// placement axis that an input or output sharding names is rejected (`ShardMapError::BatchAxisPlacedOnSpecifiedAxis`),
-// as JAX rejects a `spmd_axis_name` that its specifications mention, because the batch dimension would then be
-// partitioned along an axis that already partitions another dimension of a boundary value or that describes its
-// reduction state. Every other placement axis is free in the batched map, so the batch dimension keeps its global
-// extent inside the body (as JAX keeps the placement of an explicit axis in the outer sharding only), and collectives
-// over the batch axis inside the body still see every batch item. An `Explicit` axis or a manual axis that is not
-// active in this map is free already. An active manual axis is the analogue of JAX's `spmd_axis_name`, but JAX's design
-// (a local batch dimension that varies along that axis inside the body) needs batching rules at the operation level
-// that align manual variation, which this rule cannot provide. Instead, the rule removes such an axis from the active
-// manual axes of the batched map, so that it becomes free and carries the batch dimension. That leaves the semantics of
-// the body unchanged when every device along the axis computes the same values, which holds when no input or output
-// sharding names the axis (so every input is replicated along it and every output must be invariant along it), when no
-// value of the body varies along it and no collective or `axis_index` of the body names it (which excludes
-// communication along it even between invariant values, such as a meshless permutation, whose output is typed by its
-// input), and when the body has no `DeviceOrderedIo` effect, whose per-device executions would change. Recognizing
-// those collectives is why the operation family must support payload projection. An unchecked body carries no variation
-// labels, so the variation condition is skipped for it, which is sound because its inputs are replicated along the axis
-// and only the other two conditions could make its devices diverge. Each violation is rejected with its own
-// `ShardMapError`. A placement on every active manual axis leaves the batched map without active manual axes (requested
-// explicitly with `ManualAxisSelection::Listed`, because an empty list of manual axes otherwise selects all of them),
-// so its body runs once on the global values. That keeps the boundary types of the release design unchanged, whereas
-// binding the batched body inline would need its caller's values to carry exactly the body's declared shardings. No
-// manual placement axis is manual inside the batched body, but a batched value placed on a manual axis would vary along
-// it, so the body is batched with a context whose placement keeps only the `Explicit` placement axes (boundary
-// validation compares local types up to their placement, so the local types still match). The batched boundary is
-// validated through `ShardMapBoundary::new_within` against the enclosing manual axes that the inputs witness by varying
-// along them, which rejects a placement on such an axis whenever an input varies along it.
-//
-// `shard_map` boundaries are static (refer to the `# Static Boundaries` section of the documentation of
-// `ShardMapOperation`), so the batch extent must be static whenever a boundary position is mapped or the body uses it,
-// and is rejected with `ShardMapError::DynamicBatchExtentNotSupported` otherwise. That rejection is deliberate rather
-// than a gap, because padding the batch to a static bound would run the body on padding items, which effectful bodies
-// and bodies that write through references would observe, and JAX also supports only static batch sizes here (its
-// `_shard_map_batch` in `jax/_src/shard_map.py` computes them with integer arithmetic). The structurally batched body
-// receives the extent as a leading dimension input (refer to `ArrayIrBatchingPolicy`), which the rule replaces by a
-// constant of the same static type inside the body (or drops when the body does not use it), so that no dimension
-// crosses the boundary.
 impl<C> BatchableOperation<C, ArrayIrBatchingPolicy> for ShardMapOperation
 where
     C: Context<
@@ -2697,27 +2488,43 @@ where
         driver: &D,
         inputs: &[ArrayIrBatch<C::Value>],
     ) -> Result<Vec<ArrayIrBatch<C::Value>>, BatchingError> {
+        // This rule follows JAX's `_shard_map_batch`. Every device runs the structurally batched local body over all
+        // batch items of its own shards, and the batch axis becomes one more dimension of the global boundary type of
+        // every mapped input and output (of its referent, for a reference), which the active manual axes of the batched
+        // map never partition. Collectives over manual axes inside the body combine shards elementwise, so they pass
+        // the batch dimension through. References batch like arrays, through their referents. An unbatched reference
+        // input keeps its boundary and is shared by every batch item, so the reference rules of the body reject any
+        // write of a batched value into it, as JAX's `_swap_vmap` does.
         check_count!("input", inputs, self.input_types.len(), ProgramError);
         if !self.boundary.check_manual_variation() {
             self.validate_body(driver.region(0)?)?;
         }
         let input_values = inputs.iter().map(|input| input.value().clone()).collect::<Vec<_>>();
 
-        // The body cannot refer to a level named like an axis of the mesh, because that axis shadows it (refer to
-        // `shard_map_within_named_axes`), so a body collective over that name communicates along the mesh axis and the
-        // body is batched at an anonymous level. Batching it at the named level would let the batching rule of such a
-        // collective consume it as a reduction over batch items, which, for the mesh-free collectives of unchecked
-        // manual axes, would silently drop the communication across devices.
+        // The body is batched at this batching level, which it inherits from the enclosing named axes (refer to the
+        // `ShardMap` capability), so the batching rule of a collective over its name inside the body consumes that
+        // collective, as JAX traces the body under its `BatchTrace`. The body cannot refer to a level named like an
+        // axis of the mesh, though, because that axis shadows it (refer to `shard_map_within_named_axes`), so a body
+        // collective over that name communicates along the mesh axis and the body is batched at an anonymous level.
+        // Batching it at the named level would let the batching rule of such a collective consume it as a reduction
+        // over batch items, which, for the mesh-free collectives of unchecked manual axes, would silently drop the
+        // communication across devices.
         let axis_name = context.axis_name().filter(|axis_name| self.boundary.mesh().axis_index(axis_name).is_none());
 
         // A call whose inputs are all unbatched computes the same values for every batch item when no collective in its
-        // body can refer to this level, which holds for an anonymous or shadowed level, so it keeps its boundary.
+        // body can refer to this level, which holds for an anonymous or shadowed level, so it keeps its boundary. A
+        // named level batches the body structurally even then, and an output that the consumed collectives map (e.g.,
+        // the `axis_index` of this level) takes the mapped path, so the errors below also apply to such a call.
         let input_positions = inputs.iter().map(ArrayIrBatch::batch_axis_position).collect::<Vec<_>>();
         if axis_name.is_none() && input_positions.iter().all(Option::is_none) {
             let outputs = context.parent().bind(self.clone(), vec![driver.region(0)?.to_program()], &input_values)?;
             return Ok(outputs.into_iter().map(ArrayIrBatch::replicated).collect::<Vec<_>>());
         }
-        // Dynamic extents are rejected deliberately (refer to the rationale above).
+        // Boundary types are static (refer to the `# Static Boundaries` section of the documentation of
+        // `ShardMapOperation`), so the batch extent must be static whenever a boundary position is mapped or the body
+        // uses it. That rejection is deliberate rather than a gap, because padding the batch to a static bound would
+        // run the body on padding items, which effectful bodies and bodies that write through references would observe,
+        // and JAX also supports only static batch sizes here.
         let extent_type = <&DimensionType>::try_from(context.axis_extent().r#type().as_ref())?.clone();
         let static_extent = || {
             extent_type.extent().ok_or_else(|| {
@@ -2726,11 +2533,27 @@ where
                 }))
             })
         };
-        // When some input is mapped, the boundary placement of the batch axis is validated before the body is batched,
-        // because the body context
+        // A batching level may place its batch axis on mesh axes (refer to `BatchingContext::axis_sharding`), and the
+        // batched boundary keeps that placement, where it partitions the batch dimension of every mapped input and
+        // output. An unconstrained batch axis imposes no placement, so its dimension is unpartitioned at the boundary,
+        // as without `spmd_axis_name` in JAX's `_shard_map_batch`. Every placement axis is free in the batched map, so
+        // that the batch dimension keeps its global extent inside the body and collectives over the batch axis there
+        // still see every batch item. An active manual placement axis is therefore released from the active manual
+        // axes, which is sound only when every device along it computes the same values (refer to
+        // `ShardMapBoundary::batched_placement`). JAX instead keeps such an axis manual and batches the body at a local
+        // extent that varies along it, which needs batching rules at the operation level that align manual variation. A
+        // placement adds no manual variation anywhere (refer to `Sharding::batched`), so callers may type their values
+        // over the mesh of the map itself.
+        //
+        // A placement on every active manual axis leaves the batched map without active manual axes, which the boundary
+        // requests explicitly with `ManualAxisSelection::Listed` (because an empty list of manual axes otherwise
+        // selects all of them), so its body runs once on the global values. That keeps the boundary types of this
+        // design unchanged, whereas binding the batched body inline would need its caller's values to carry exactly the
+        // declared shardings of the body.
+        //
+        // When some input is mapped, the placement is validated before the body is batched, because the body context
         // keeps its explicit axes, so a placement that the boundary rejects would otherwise fail inside the batched
-        // body with a less precise error. An unconstrained batch axis imposes no placement, so its dimension is
-        // unpartitioned at the boundary, as without `spmd_axis_name` in JAX's `_shard_map_batch`.
+        // body with a less precise error.
         let placement_axes: &[String] = match context.axis_sharding() {
             ShardingDimension::Sharded(axis_names) => axis_names,
             ShardingDimension::Replicated | ShardingDimension::Unconstrained => &[],
@@ -2746,8 +2569,11 @@ where
         // Batch the local body at the mapped input axes, and replace its leading extent input and output by a constant
         // of the extent's own static type, so that the batched body keeps the boundary of the source body. A body that
         // does not use the extent (e.g., one whose values are all unbatched) drops it instead, so that it needs no
-        // static extent. Inside the body, the batch dimension keeps only the `Explicit` axes of its placement, because
-        // a placement on a manual axis would make the batched body values vary along it (refer to the rationale above).
+        // static extent. Unbatched inputs enter the batched body unbatched, where its structural batching aligns them
+        // with the mapped values that they meet. Inside the body, the batch dimension keeps only the `Explicit` axes of
+        // its placement, because no placement axis is manual there and the boundary already partitions the batch
+        // dimension along the released manual axes. Boundary validation compares local types up to their placement, so
+        // the local types still match.
         let body = driver.region(0)?;
         let input_axes = inputs.iter().map(ArrayIrBatch::batch_axis).collect::<Vec<_>>();
         let body_context = match context.axis_sharding() {
@@ -2825,6 +2651,9 @@ where
         // Restore the boundary by inserting the batch dimension, with the static extent and the boundary placement of
         // the batch axis, into the sharding and declared global type (or global referent) of every mapped input and
         // output at its physical batch axis position, while unbatched inputs and outputs keep their boundary unchanged.
+        // For a replicated batch axis, that dimension is unpartitioned (JAX's `batch_spec(spec, axis, None)`), and
+        // otherwise it is placed only on free axes, so the active manual axes of the batched map keep partitioning
+        // exactly the dimensions that they partitioned before batching.
         let mut boundary = self.boundary.clone();
         let mut input_types = self.input_types.clone();
         let mut output_types = self.output_types.clone();
@@ -2908,46 +2737,6 @@ where
     }
 }
 
-// Capture-free forward mode (JVP) rule for `ShardMapOperation`, binding either one fused `shard_map` or a primal
-// `shard_map` and a tangent `shard_map` as ordinary operations of the active context's operation family, so a staging
-// context stages them over its shared builder, while an eager context executes them immediately.
-//
-// Both forms realize the identity `jvp(shard_map(f)) = shard_map(jvp f)`. Rather than capturing the global primals as
-// residual factors and staging a linear `shard_map`, the rule keeps the manual region intact, and the two-map form
-// threads every residual as a plain primal input edge between its two `shard_map`s, so no symbolic capture is ever
-// introduced. The enclosing partial evaluation split then discovers the residual edges structurally, exactly as for the
-// jitted call rule.
-//
-// For the two-map form, the rule linearizes the body capture-free through `shard_map_bodies` under the inputs' activity
-// mask (an input with a live tangent is active, while an input with a structurally zero tangent and a plumbing
-// reference input that receives no tangent reference are not, as under JAX's `which_nz`), giving a primal body
-// `inputs -> [outputs..., residual_edges...]` and a tangent body
-// `[active(input_tangents)..., residuals...] -> [live(output_tangents)...]`, whose residuals cross the boundary as
-// `ShardMapResidual` describes. It then stages the primal `shard_map` over the input primals (recovering the primal
-// outputs followed by the residual edge values), stages the tangent `shard_map` over the active input tangents followed
-// by the residual values (recovering the live output tangents, including forwarded active tangent references), and
-// pairs each primal output with its tangent or a structural zero for an output without a live tangent. When no output
-// tangent is live and the tangent body has no observable effects, the tangent `shard_map` is not staged at all, and the
-// source `shard_map` is bound as the primal one. Both sub-programs are built over the context's own constant and
-// operation families, and every nested request goes through `driver`, so the rule carries no differentiation obligation
-// on its operation family.
-//
-// The two-map form above is what a partitioned differentiation context (i.e., a linearization, whose primal and tangent
-// work go to separate contexts) needs, as in JAX's `_shard_map_linearize`. A fused context (i.e., one whose primal and
-// tangent contexts are the same context, as for `jvp` and for the fused programs that the rules of higher-order
-// operations derive) instead binds one `shard_map`, as JAX's `_shard_map_jvp` does, whose body is the fused JVP program
-// of the body over `[inputs..., active(input_tangents)...]` (refer to `fused_shard_map_jvp`). Its outputs are the
-// outputs followed by the live output tangents, so an eager context runs one manual computation per `shard_map` and
-// materializes no residual edges, and a fused program that is later partitioned (e.g., by the `while`, `scan`,
-// `condition`, rematerialization, or composite rules) is split by the partial evaluation rule of this operation into a
-// known map (computing the outputs and the residuals) and a residual map (computing the output tangents). That split
-// must keep every output known, so a body that the partial evaluation rule keeps whole keeps the two-map form even in a
-// fused context. Those are a body with references (refer to `body_has_references`) and a body with a dynamically shaped
-// value anywhere in its region closure, which could be a residual that cannot cross the static boundary (refer to
-// `body_has_dynamically_shaped_values`). The latter binds the fused map after all when its two-map form needs such a
-// residual, because a fused map that the partial evaluation rule keeps whole is still a correct JVP, whereas the
-// two-map form cannot be built. A body none of whose output tangents is live also keeps the two-map form, which then
-// binds no tangent map at all.
 impl<C> DifferentiableOperation<C> for ShardMapOperation
 where
     TracingContext<C::Constant, C::Operation>:
@@ -2971,6 +2760,11 @@ where
         driver: &D,
         inputs: &[DifferentiationDual<C::Value>],
     ) -> Result<Vec<DifferentiationDual<C::Value>>, DifferentiationError> {
+        // This rule realizes `jvp(shard_map(f)) = shard_map(jvp f)` without captures. It keeps the manual region intact
+        // and binds either one fused `shard_map` or a primal and a tangent `shard_map` as ordinary operations of the
+        // active context's operation family, so a staging context stages them over its shared builder and an eager
+        // context executes them immediately. Every nested request goes through `driver`, so the rule carries no
+        // differentiation obligation on its operation family.
         let output_count = self.output_types.len();
         check_count!("input", inputs, self.input_types.len(), ProgramError);
 
@@ -2982,6 +2776,16 @@ where
             .iter()
             .map(|input| input.is_tangent_active() && !input.tangent().is_zero())
             .collect::<Vec<_>>();
+        // A fused context (i.e., one whose primal and tangent contexts are the same context, as for `jvp` and for the
+        // fused programs that the rules of higher-order operations derive) binds one `shard_map` whose body is the
+        // fused JVP program of the body (refer to `fused_shard_map_jvp`), as JAX's `_shard_map_jvp` does, so an eager
+        // context runs one manual computation and materializes no residual edges. A fused program that is later
+        // partitioned (e.g., by the `while`, `scan`, `condition`, rematerialization, or composite rules) is split by
+        // the partial evaluation rule of this operation, which must keep every output known. A body that the partial
+        // evaluation rule keeps whole therefore keeps the two-map form even in a fused context, which is a body with
+        // references or with a dynamically shaped value anywhere in its region closure (which could be a residual that
+        // cannot cross the static boundary). A body none of whose output tangents is live also keeps the two-map form,
+        // which then binds no tangent map at all.
         let fused = std::ptr::eq(context.primal(), context.tangent()) && !body_has_references(body_program);
         if fused
             && !body_has_dynamically_shaped_values(body_program)
@@ -2989,6 +2793,12 @@ where
         {
             return Ok(outputs);
         }
+        // The two-map form, which a partitioned differentiation context (i.e., a linearization) needs, as in JAX's
+        // `_shard_map_linearize`, linearizes the body through `shard_map_bodies` under the activity mask. That gives a
+        // primal body `inputs -> [outputs..., residual_edges...]` and a tangent body `[active(input_tangents)...,
+        // residuals...] -> [live(output_tangents)...]`, whose residuals cross between the two maps as plain primal
+        // edges (refer to `ShardMapResidual`), so no symbolic capture is introduced, and the enclosing partial
+        // evaluation split discovers them structurally, as for the jitted call rule.
         let ShardMapBodies { primal_operation, primal_body, tangent, output_activity } =
             match shard_map_bodies(self, driver, body_program, activity.as_slice()) {
                 // A dynamically shaped residual cannot cross the static boundary between two maps, but the fused map
@@ -3057,19 +2867,6 @@ where
     }
 }
 
-// Transpose rule for a primal tangent `ShardMapOperation`, forwarding to `transpose_primal_shard_map` with the
-// cotangent references of its linear reference inputs resolved (and allocated on first use) through the enclosing
-// `TranspositionContext`. The body transposition is requested through the instruction-scoped driver, so instantiating
-// this implementation for a closed operation family introduces no recursive `TransposableOperation` obligation on that
-// family.
-//
-// The forward boundary implicitly places each caller input by its input sharding and moves it into device memory, so
-// the assembled input cotangents are reconciled with the caller's cotangent types (refer to
-// `reconcile_input_cotangent`). That is why the array projection of `O` must provide `ReshardOperation`,
-// `BroadcastOperation`, and `TransferToMemoryOperation`, while `ResidualZeroProvider` serves the cotangent
-// destinations, and the reference operations serve the per-device accumulators of the replicated destinations that are
-// accumulated locally (i.e., those of inputs that the body does not mutate, as `local_accumulator_destinations` selects
-// them).
 impl<V, O> TransposableOperation<V, O> for ShardMapOperation
 where
     TracingContext<V, O>: StagingContext<Type = V::Type, Constant = V, Operation = O>,
@@ -3101,6 +2898,18 @@ where
         outputs: &[MaybeZero<Tracer<TracingContext<V, O>>>],
         accumulators: &[CotangentAccumulator],
     ) -> Result<(), DifferentiationError> {
+        // This rule forwards to `transpose_primal_shard_map` with the cotangent references of the linear reference
+        // inputs resolved (and allocated on first use) through the enclosing `TranspositionContext`. It requests the
+        // body transposition through the instruction-scoped driver, so instantiating it for a closed operation family
+        // introduces no recursive `TransposableOperation` obligation on that family.
+        //
+        // The forward boundary implicitly places each caller input by its input sharding and moves it into device
+        // memory, so the assembled input cotangents are reconciled with the caller's cotangent types (refer to
+        // `reconcile_input_cotangent`). That is why the array projection of `O` must provide `ReshardOperation`,
+        // `BroadcastOperation`, and `TransferToMemoryOperation`. `ResidualZeroProvider` serves the cotangent
+        // destinations, and the reference operations serve the per-device accumulators of the replicated destinations
+        // that are accumulated locally (i.e., those of inputs that the body does not mutate, as
+        // `local_accumulator_destinations` selects them).
         check_count!("output", outputs, self.output_types.len(), ProgramError);
         check_count!("accumulator", accumulators, inputs.len(), DifferentiationError);
         let cotangents = context.cotangent_destinations(driver, inputs, accumulators)?;
@@ -3436,59 +3245,89 @@ where
     )
 }
 
-/// Returns `true` when two `shard_map` boundary types agree apart from carried placement metadata, which is when their
-/// element types, shapes, and layouts are equal, and they vary along exactly the same mesh axes, including axes that
-/// are not manual axes of the mesh of `expected`, and have the same unreduced and reduced axes (a type without a
-/// sharding varies along none and has none). Dimension shardings and memory kinds are tolerated. Refer to the
-/// `# Boundary Validation` section of the documentation of [`ShardMapOperation`] for the rationale.
-fn shard_map_boundary_types_match(actual: &ArrayType, expected: &ArrayType) -> bool {
-    let no_axes = BTreeSet::new();
-    let actual_varying_axes = actual.sharding().map_or(&no_axes, Sharding::varying_manual_axes);
-    let expected_varying_axes = expected.sharding().map_or(&no_axes, Sharding::varying_manual_axes);
-    actual.data_type() == expected.data_type()
-        && actual.shape() == expected.shape()
-        && actual.layout() == expected.layout()
-        && actual_varying_axes == expected_varying_axes
-        && actual.sharding().map_or(&no_axes, Sharding::unreduced_axes)
-            == expected.sharding().map_or(&no_axes, Sharding::unreduced_axes)
-        && actual.sharding().map_or(&no_axes, Sharding::reduced_axes)
-            == expected.sharding().map_or(&no_axes, Sharding::reduced_axes)
+/// Static manual-variation checking policy shared by the boundary and closure options. Its two switches are stored
+/// independently, so the builders that set them commute. Output replication is proven only when the body's manual
+/// variation is checked as well, because an unchecked body carries no variation from which to prove it, so the policy
+/// compares and hashes by the effective checks only (i.e., every policy without manual-variation checking is equal).
+#[derive(Copy, Clone, Debug)]
+struct ManualVariationChecks {
+    /// Whether the body tracks variation over the active manual axes.
+    manual_variation: bool,
+
+    /// Whether array output replication must be proven, which takes effect only when `manual_variation` is set.
+    output_replication: bool,
 }
 
-/// Returns `true` when two meshes describe the same device mesh, i.e., when they have the same axes, with the same
-/// names and sizes in the same order, irrespective of their axis types. The mesh of a `shard_map` designates the axes
-/// that it makes manual through its axis types, so the mesh of a caller's value may differ from it in its axis types
-/// only (e.g., in an axis that is `Explicit` for the caller and `Manual` for the `shard_map`).
-fn same_device_mesh(left: &LogicalMesh, right: &LogicalMesh) -> bool {
-    left.axes().len() == right.axes().len()
-        && left
-            .axes()
-            .iter()
-            .zip(right.axes())
-            .all(|(left, right)| left.name() == right.name() && left.size() == right.size())
-}
+impl ManualVariationChecks {
+    /// Policy that tracks body variation and proves output replication, which is the default.
+    const CHECKED: Self = Self { manual_variation: true, output_replication: true };
 
-/// Returns the global boundary type that a `shard_map` input or output carries as an array, which is the type itself
-/// for an array position and the global referent for a reference position. A dimension has no `shard_map` boundary
-/// type.
-fn boundary_array_type(r#type: &ArrayIrType) -> Result<&ArrayType, TypeError> {
-    match r#type {
-        ArrayIrType::Reference(r#type) => Ok(r#type.referent()),
-        r#type => <&ArrayType>::try_from(r#type),
+    /// Returns whether the body's manual variation is checked.
+    fn check_manual_variation(self) -> bool {
+        self.manual_variation
+    }
+
+    /// Returns whether output replication is statically proven.
+    fn check_output_replication(self) -> bool {
+        self.manual_variation && self.output_replication
     }
 }
 
-/// Validates the interface of the single `body` region of a `shard_map` and returns it.
-fn shard_map_body_interface<T: Type>(
-    region_interfaces: &[RegionInterface<T>],
-    input_count: usize,
-    output_count: usize,
-) -> Result<&RegionInterface<T>, TypeError> {
-    check_count!("region", region_interfaces, 1, TypeError);
-    let interface = &region_interfaces[0];
-    check_count!("body input", interface.input_types(), input_count, TypeError);
-    check_count!("body output", interface.output_types(), output_count, TypeError);
-    Ok(interface)
+impl Default for ManualVariationChecks {
+    fn default() -> Self {
+        Self::CHECKED
+    }
+}
+
+impl PartialEq for ManualVariationChecks {
+    fn eq(&self, other: &Self) -> bool {
+        (self.check_manual_variation(), self.check_output_replication())
+            == (other.check_manual_variation(), other.check_output_replication())
+    }
+}
+
+impl Eq for ManualVariationChecks {}
+
+impl Hash for ManualVariationChecks {
+    fn hash<H: Hasher>(&self, state: &mut H) {
+        (self.check_manual_variation(), self.check_output_replication()).hash(state);
+    }
+}
+
+/// Active manual axes requested for a [`ShardMapBoundary`].
+enum ManualAxisSelection {
+    /// Every manual mesh axis that no enclosing manual region already made manual, which is what an empty list of
+    /// manual axes requests from [`ShardMapBoundary::new`] and [`shard_map`](fn@shard_map).
+    Remaining,
+
+    /// Exactly the listed manual mesh axes. Only the batching rule of [`ShardMapOperation`] lists none, when it places
+    /// the batch axis on every active manual axis of the source map.
+    Listed(Vec<String>),
+}
+
+impl From<Vec<String>> for ManualAxisSelection {
+    fn from(manual_axes: Vec<String>) -> Self {
+        if manual_axes.is_empty() { Self::Remaining } else { Self::Listed(manual_axes) }
+    }
+}
+
+/// Reduction state that a value carries through a `shard_map` boundary along the axes that the boundary sharding does
+/// not govern (refer to [`ShardMapBoundary::carried_reduction_state`]).
+struct CarriedReductionState {
+    /// Unreduced axes carried through the boundary.
+    unreduced_axes: BTreeSet<String>,
+
+    /// Reduced axes carried through the boundary.
+    reduced_axes: BTreeSet<String>,
+}
+
+impl CarriedReductionState {
+    /// Adds the carried reduction state to `sharding`, which already holds the state along the governed axes.
+    fn apply(self, sharding: Sharding) -> Result<Sharding, ShardingError> {
+        let unreduced_axes = sharding.unreduced_axes().iter().cloned().chain(self.unreduced_axes).collect::<Vec<_>>();
+        let reduced_axes = sharding.reduced_axes().iter().cloned().chain(self.reduced_axes).collect::<Vec<_>>();
+        sharding.with_unreduced_axes(unreduced_axes)?.with_reduced_axes(reduced_axes)
+    }
 }
 
 /// Values of one program atom on every emulated device, in row-major device order.
@@ -4393,6 +4232,167 @@ impl<O: Operation<Type = ArrayIrType>> ScanInterpretationDomain for LockstepDoma
     }
 }
 
+/// Residual edge that carries one residual across the `shard_map` boundary between the two bodies that splitting one
+/// body produces (refer to [`residual_edge`]).
+#[derive(Debug, PartialEq)]
+struct ResidualEdge {
+    /// Global type of the edge.
+    global_type: ArrayType,
+
+    /// Boundary sharding that places the edge, which records no manual variation.
+    sharding: Sharding,
+
+    /// Local type with which the edge leaves the producing body and enters the consuming one, which is the local shard
+    /// of [`Self::global_type`] that every device holds.
+    local_type: ArrayType,
+}
+
+/// Source of one residual input of the tangent `shard_map` that [`shard_map_bodies`] derives, which determines how the
+/// residual crosses the boundary between the primal and tangent maps. A residual that is a primal body input or a
+/// primal body output needs no residual edge, and a residual that repeats another one shares its tangent input, as
+/// under the residual forwarding (`in_fwd` and `out_fwd`) and deduplication of JAX's `_shard_map_linearize`. Only the
+/// remaining residuals become residual edges of the primal boundary, and a reference residual crosses either by
+/// identity, as the reference input that it denotes (directly or through an alias), or as a snapshot of its final
+/// state, when the body allocates it. Any other reference residual is rejected with
+/// [`ProgramError::MalformedProgram`], because every reference of a valid body is an input or an allocation.
+#[derive(Copy, Clone, Debug, PartialEq, Eq)]
+enum ShardMapResidual {
+    /// Residual that is primal body input `index` itself. The tangent `shard_map` receives it directly from the
+    /// corresponding primal boundary input, under that input's global type and input sharding. This is the only way
+    /// in which a reference residual crosses by identity, which includes a reference residual that aliases a reference
+    /// input.
+    Input(usize),
+
+    /// Residual that is primal body output `index` itself. The tangent `shard_map` receives it from the corresponding
+    /// primal boundary output, under that output's global type and output sharding.
+    Output(usize),
+
+    /// Residual computed inside the body, which the primal `shard_map` returns as its residual edge `index` (i.e., as
+    /// its output that follows the original outputs and the preceding residual edges), tiled along the manual axes
+    /// along which it varies (refer to [`residual_edge`]).
+    Edge(usize),
+
+    /// Residual that is a reference allocated inside the body, which crosses as a snapshot of its final state, since a
+    /// reference cannot be carried by a residual edge. The primal body reads the complete referent after its last
+    /// instruction, and the primal `shard_map` returns that value as its residual edge `index` (refer to
+    /// [`Self::Edge`]). The tangent body allocates a fresh reference from that edge before its first instruction and
+    /// uses it in place of the primal reference. Aliases of one allocation share one edge.
+    ///
+    /// The tangent body therefore observes the final primal state, which is also the state that a tangent program
+    /// observes through a reference residual outside `shard_map`, since it runs after the whole primal program (and
+    /// an allocation made inside the body cannot escape it, so nothing else accesses it in between). Because the
+    /// tangent body owns its reference, every invocation of the tangent `shard_map` (e.g., every application of a
+    /// pushforward or pullback) starts from that state, which is how partitioning for repeated residual calls treats
+    /// state that tangent work mutates (it allocates such state afresh for every residual call). This differs from the
+    /// behavior outside `shard_map` only when an opaque tangent rule mutates the reference, for example, a custom
+    /// backward rule that writes into a reference residual. Outside `shard_map`, that write updates the primal
+    /// allocation, so a later application observes it, while under `shard_map`, each application observes the final
+    /// primal state.
+    ReferenceSnapshot(usize),
+}
+
+/// Primal and tangent `shard_map` boundaries and bodies into which [`shard_map_bodies`] splits one `shard_map` body.
+struct ShardMapBodies<C: Domain> {
+    /// Primal boundary, which keeps every input and output of the source boundary and gains the residual edges as
+    /// trailing outputs.
+    primal_operation: ShardMapOperation,
+
+    /// Primal body, which maps the local inputs to the local outputs followed by the local residual edges.
+    primal_body: FlatProgram<C>,
+
+    /// Tangent `shard_map`, or [`None`] when no output tangent is live and the tangent body has no observable effects,
+    /// in which case there is nothing to bind and the primal boundary and body are the source ones.
+    tangent: Option<ShardMapTangent<C>>,
+
+    /// One entry per output recording whether the output has a live tangent, and therefore a tangent boundary slot.
+    output_activity: Vec<bool>,
+}
+
+/// Tangent `shard_map` boundary and body that [`shard_map_bodies`] derives, together with the sources of its residual
+/// inputs.
+struct ShardMapTangent<C: Domain> {
+    /// Tangent boundary, which consumes the active input tangents followed by the residuals and produces the live
+    /// output tangents.
+    operation: ShardMapOperation,
+
+    /// Tangent body, which maps the active local input tangents followed by the local residuals to the live local
+    /// output tangents.
+    body: FlatProgram<C>,
+
+    /// Source of each residual input of [`Self::operation`], in input order.
+    residuals: Vec<ShardMapResidual>,
+}
+
+/// Transposed `shard_map` boundary and body that [`transpose_shard_map_body`] derives for
+/// [`transpose_primal_shard_map`].
+struct TransposedShardMap<V: Value, O> {
+    /// Transposed boundary, whose outputs are the input cotangents that are not structural zeros.
+    operation: ShardMapOperation,
+
+    /// Transposed local body, bound as the shared handle that the transposition driver returned whenever it needs no
+    /// rebuilding.
+    body: Arc<Program<V, O, Vec<V>, Vec<V>>>,
+
+    /// One entry per input of the source boundary recording whether its cotangent is a structural zero, which is then
+    /// not an output of [`Self::operation`].
+    zero_input_cotangents: Vec<bool>,
+}
+
+/// Returns `true` when two `shard_map` boundary types agree apart from carried placement metadata, which is when their
+/// element types, shapes, and layouts are equal, and they vary along exactly the same mesh axes, including axes that
+/// are not manual axes of the mesh of `expected`, and have the same unreduced and reduced axes (a type without a
+/// sharding varies along none and has none). Dimension shardings and memory kinds are tolerated. Refer to the
+/// `# Boundary Validation` section of the documentation of [`ShardMapOperation`] for the rationale.
+fn shard_map_boundary_types_match(actual: &ArrayType, expected: &ArrayType) -> bool {
+    let no_axes = BTreeSet::new();
+    let actual_varying_axes = actual.sharding().map_or(&no_axes, Sharding::varying_manual_axes);
+    let expected_varying_axes = expected.sharding().map_or(&no_axes, Sharding::varying_manual_axes);
+    actual.data_type() == expected.data_type()
+        && actual.shape() == expected.shape()
+        && actual.layout() == expected.layout()
+        && actual_varying_axes == expected_varying_axes
+        && actual.sharding().map_or(&no_axes, Sharding::unreduced_axes)
+            == expected.sharding().map_or(&no_axes, Sharding::unreduced_axes)
+        && actual.sharding().map_or(&no_axes, Sharding::reduced_axes)
+            == expected.sharding().map_or(&no_axes, Sharding::reduced_axes)
+}
+
+/// Returns `true` when two meshes describe the same device mesh, i.e., when they have the same axes, with the same
+/// names and sizes in the same order, irrespective of their axis types. The mesh of a `shard_map` designates the axes
+/// that it makes manual through its axis types, so the mesh of a caller's value may differ from it in its axis types
+/// only (e.g., in an axis that is `Explicit` for the caller and `Manual` for the `shard_map`).
+fn same_device_mesh(left: &LogicalMesh, right: &LogicalMesh) -> bool {
+    left.axes().len() == right.axes().len()
+        && left
+            .axes()
+            .iter()
+            .zip(right.axes())
+            .all(|(left, right)| left.name() == right.name() && left.size() == right.size())
+}
+
+/// Returns the global boundary type that a `shard_map` input or output carries as an array, which is the type itself
+/// for an array position and the global referent for a reference position. A dimension has no `shard_map` boundary
+/// type.
+fn boundary_array_type(r#type: &ArrayIrType) -> Result<&ArrayType, TypeError> {
+    match r#type {
+        ArrayIrType::Reference(r#type) => Ok(r#type.referent()),
+        r#type => <&ArrayType>::try_from(r#type),
+    }
+}
+
+/// Validates the interface of the single `body` region of a `shard_map` and returns it.
+fn shard_map_body_interface<T: Type>(
+    region_interfaces: &[RegionInterface<T>],
+    input_count: usize,
+    output_count: usize,
+) -> Result<&RegionInterface<T>, TypeError> {
+    check_count!("region", region_interfaces, 1, TypeError);
+    let interface = &region_interfaces[0];
+    check_count!("body input", interface.input_types(), input_count, TypeError);
+    check_count!("body output", interface.output_types(), output_count, TypeError);
+    Ok(interface)
+}
+
 /// Returns the per-device `inputs` of the region operation named `operation_name` that runs in lockstep as
 /// [`LockstepValue`]s, after validating that the input of every device has the type of the input of device zero.
 /// Devices whose inputs differ in type (e.g., in the extent of the iteration count of a `scan`, which is its trip
@@ -4802,21 +4802,6 @@ fn body_has_dynamically_shaped_values<V: Value<Type = ArrayIrType>, O: Operation
     })
 }
 
-/// Residual edge that carries one residual across the `shard_map` boundary between the two bodies that splitting one
-/// body produces (refer to [`residual_edge`]).
-#[derive(Debug, PartialEq)]
-struct ResidualEdge {
-    /// Global type of the edge.
-    global_type: ArrayType,
-
-    /// Boundary sharding that places the edge, which records no manual variation.
-    sharding: Sharding,
-
-    /// Local type with which the edge leaves the producing body and enters the consuming one, which is the local shard
-    /// of [`Self::global_type`] that every device holds.
-    local_type: ArrayType,
-}
-
 /// Returns the edge that carries residual `residual_index` of local type `local_type` across a `shard_map` boundary.
 /// The local type of the edge is the residual's own type, except that the edge of a reference residual carries its
 /// referent (i.e., a snapshot of its state), that a first-class dimension crosses as its integer scalar value (refer
@@ -5069,11 +5054,14 @@ where
     builder.build(outputs, vec![Placeholder; inputs.len()], vec![Placeholder; output_types.len()])
 }
 
-/// Splits the `body` of a `shard_map` with mixed known and unknown inputs into a known side `shard_map`, bound in the
-/// known side context, and a residual `shard_map`, emitted into the residual program (refer to the comment on the
-/// [`PartiallyEvaluatableOperation`] implementation of [`ShardMapOperation`] for the protocol), and returns the
-/// reassembled outputs of `operation`. A split that would hoist no work or that would carry a dynamically shaped
-/// residual across the boundary keeps `operation` whole instead.
+/// Splits the *local* `body` of a `shard_map` with mixed known and unknown inputs through the shared
+/// `PartitionedProgram` machinery and returns the reassembled outputs of `operation`. The known side becomes a
+/// `shard_map` over the known boundary inputs that it uses, whose outputs are the fully known boundary outputs followed
+/// by the residual edges (each with the global type and sharding that `residual_edge` derives), and which is bound in
+/// the known side context. The residual side becomes a `shard_map` over the unknown boundary inputs, the forwarded
+/// known boundary inputs and outputs, and the residual edges, which is emitted into the residual program. A split that
+/// would hoist no work or that would carry a dynamically shaped residual across the boundary keeps `operation` whole
+/// instead.
 fn partially_evaluate_split_shard_map<C, D: PartialEvaluationDriver<C>>(
     operation: &ShardMapOperation,
     context: &PartialEvaluationContext<C>,
@@ -5265,82 +5253,6 @@ where
             (staged_operation, vec![residual_body])
         },
     )
-}
-
-/// Source of one residual input of the tangent `shard_map` that [`shard_map_bodies`] derives, which determines how the
-/// residual crosses the boundary between the primal and tangent maps. A residual that is a primal body input or a
-/// primal body output needs no residual edge, and a residual that repeats another one shares its tangent input, as
-/// under the residual forwarding (`in_fwd` and `out_fwd`) and deduplication of JAX's `_shard_map_linearize`. Only the
-/// remaining residuals become residual edges of the primal boundary, and a reference residual crosses either by
-/// identity, as the reference input that it denotes (directly or through an alias), or as a snapshot of its final
-/// state, when the body allocates it. Any other reference residual is rejected with
-/// [`ProgramError::MalformedProgram`], because every reference of a valid body is an input or an allocation.
-#[derive(Copy, Clone, Debug, PartialEq, Eq)]
-enum ShardMapResidual {
-    /// Residual that is primal body input `index` itself. The tangent `shard_map` receives it directly from the
-    /// corresponding primal boundary input, under that input's global type and input sharding. This is the only way
-    /// in which a reference residual crosses by identity, which includes a reference residual that aliases a reference
-    /// input.
-    Input(usize),
-
-    /// Residual that is primal body output `index` itself. The tangent `shard_map` receives it from the corresponding
-    /// primal boundary output, under that output's global type and output sharding.
-    Output(usize),
-
-    /// Residual computed inside the body, which the primal `shard_map` returns as its residual edge `index` (i.e., as
-    /// its output that follows the original outputs and the preceding residual edges), tiled along the manual axes
-    /// along which it varies (refer to [`residual_edge`]).
-    Edge(usize),
-
-    /// Residual that is a reference allocated inside the body, which crosses as a snapshot of its final state, since a
-    /// reference cannot be carried by a residual edge. The primal body reads the complete referent after its last
-    /// instruction, and the primal `shard_map` returns that value as its residual edge `index` (refer to
-    /// [`Self::Edge`]). The tangent body allocates a fresh reference from that edge before its first instruction and
-    /// uses it in place of the primal reference. Aliases of one allocation share one edge.
-    ///
-    /// The tangent body therefore observes the final primal state, which is also the state that a tangent program
-    /// observes through a reference residual outside `shard_map`, since it runs after the whole primal program (and
-    /// an allocation made inside the body cannot escape it, so nothing else accesses it in between). Because the
-    /// tangent body owns its reference, every invocation of the tangent `shard_map` (e.g., every application of a
-    /// pushforward or pullback) starts from that state, which is how partitioning for repeated residual calls treats
-    /// state that tangent work mutates (it allocates such state afresh for every residual call). This differs from the
-    /// behavior outside `shard_map` only when an opaque tangent rule mutates the reference, for example, a custom
-    /// backward rule that writes into a reference residual. Outside `shard_map`, that write updates the primal
-    /// allocation, so a later application observes it, while under `shard_map`, each application observes the final
-    /// primal state.
-    ReferenceSnapshot(usize),
-}
-
-/// Primal and tangent `shard_map` boundaries and bodies into which [`shard_map_bodies`] splits one `shard_map` body.
-struct ShardMapBodies<C: Domain> {
-    /// Primal boundary, which keeps every input and output of the source boundary and gains the residual edges as
-    /// trailing outputs.
-    primal_operation: ShardMapOperation,
-
-    /// Primal body, which maps the local inputs to the local outputs followed by the local residual edges.
-    primal_body: FlatProgram<C>,
-
-    /// Tangent `shard_map`, or [`None`] when no output tangent is live and the tangent body has no observable effects,
-    /// in which case there is nothing to bind and the primal boundary and body are the source ones.
-    tangent: Option<ShardMapTangent<C>>,
-
-    /// One entry per output recording whether the output has a live tangent, and therefore a tangent boundary slot.
-    output_activity: Vec<bool>,
-}
-
-/// Tangent `shard_map` boundary and body that [`shard_map_bodies`] derives, together with the sources of its residual
-/// inputs.
-struct ShardMapTangent<C: Domain> {
-    /// Tangent boundary, which consumes the active input tangents followed by the residuals and produces the live
-    /// output tangents.
-    operation: ShardMapOperation,
-
-    /// Tangent body, which maps the active local input tangents followed by the local residuals to the live local
-    /// output tangents.
-    body: FlatProgram<C>,
-
-    /// Source of each residual input of [`Self::operation`], in input order.
-    residuals: Vec<ShardMapResidual>,
 }
 
 /// Linearizes a `shard_map` body capture-free under the inputs' activity mask into a primal body and a tangent body
@@ -6186,21 +6098,6 @@ where
         contribution = context.bind(O::from(transfer), Vec::new(), &[contribution])?.remove(0);
     }
     Ok(contribution)
-}
-
-/// Transposed `shard_map` boundary and body that [`transpose_shard_map_body`] derives for
-/// [`transpose_primal_shard_map`].
-struct TransposedShardMap<V: Value, O> {
-    /// Transposed boundary, whose outputs are the input cotangents that are not structural zeros.
-    operation: ShardMapOperation,
-
-    /// Transposed local body, bound as the shared handle that the transposition driver returned whenever it needs no
-    /// rebuilding.
-    body: Arc<Program<V, O, Vec<V>, Vec<V>>>,
-
-    /// One entry per input of the source boundary recording whether its cotangent is a structural zero, which is then
-    /// not an output of [`Self::operation`].
-    zero_input_cotangents: Vec<bool>,
 }
 
 /// Transposes one tangent `shard_map` body into the reverse boundary and body consumed by
@@ -16084,6 +15981,40 @@ mod tests {
     }
 
     #[test]
+    fn test_shard_map_batching_of_invocations_placed_on_manual_axes() {
+        // Batching an invocation infers the batch placement on `x` from the mapped input, which the caller types over
+        // the mesh of the map. That placement adds no manual variation to the batch items, so the map accepts them,
+        // and its batched form releases `x`, its only active manual axis.
+        let mesh = manual_mesh();
+        let replicated = Sharding::replicated(mesh.clone(), 1);
+        let input_type = f32_vector_type(3)
+            .with_sharding(replicated.clone())
+            .unwrap()
+            .batched(0, Dimension::Static(2), ShardingDimension::sharded(["x"]))
+            .unwrap();
+        let output = batch(
+            |input| {
+                let input = ValueProjection::<ArrayType>::into_projected(input)?;
+                let output = shard_map(
+                    |x: TestTracer| Ok(x.clone() + x),
+                    input,
+                    mesh.clone(),
+                    replicated.clone(),
+                    replicated.clone(),
+                    ShardMapOptions::new(),
+                )?;
+                Ok(output.into_value())
+            },
+            f32_value(input_type, &[1.0, 2.0, 3.0, 4.0, 5.0, 6.0]),
+            BatchAxis::new(0),
+            BatchAxis::new(0),
+            BatchAxisSpecification::default(),
+        )
+        .unwrap();
+        assert_eq!(arrays_f64(vec![output]), vec![vec![2.0, 4.0, 6.0, 8.0, 10.0, 12.0]]);
+    }
+
+    #[test]
     fn test_shard_map_batching_of_invocations() {
         // Batching an invocation of `shard_map` on values (i.e., `vmap` of `shard_map`) stages the batched boundary of
         // the mapped batching rule into the enclosing trace.
@@ -16660,8 +16591,8 @@ mod tests {
             }
         );
 
-        // A manual axis `y` that the map does not make manual places only the boundary values, because a local value
-        // placed on a manual axis would vary along it.
+        // A manual axis `y` that the map does not make manual places only the boundary values, because the batched
+        // body keeps only the `Explicit` placement axes.
         assert_eq!(
             batched(manual_mesh_2x2(), vec!["x".to_string()]),
             indoc! {"
@@ -16813,10 +16744,11 @@ mod tests {
 
     #[test]
     fn test_shard_map_batching_without_manual_variation_of_reduced_inputs_and_unreduced_outputs() {
-        // The reduction state along `x` passes through the batched boundary unchanged. Each device squares the whole
-        // reduced input, and the unreduced output sums the two squares, so every item `e` maps to `2 * e * e`, as
-        // without batching.
-        let mesh = manual_mesh();
+        // The caller types its values over the mesh of the map, and the batch axis is placed on the active manual axis
+        // `y`, which becomes free, while the reduction state along `x` passes through the batched boundary unchanged.
+        // Each device along `x` squares the whole reduced input, and the unreduced output sums the two squares, so
+        // every item `e` maps to `2 * e * e`, as without batching.
+        let mesh = manual_mesh_2x2();
         let reduced = Sharding::replicated(mesh.clone(), 1).with_reduced_axes(["x"]).unwrap();
         let unreduced = Sharding::replicated(mesh.clone(), 1).with_unreduced_axes(["x"]).unwrap();
         let program = trace_test_program(
@@ -16839,22 +16771,22 @@ mod tests {
         let batched = program
             .batched_with_threaded_extent(
                 DimensionValue::constant(3).unwrap().r#type().into_owned(),
-                ShardingDimension::Replicated,
+                ShardingDimension::sharded(["y"]),
                 &[BatchAxis::new(0)],
                 ProgramBatchingOutputAxesPolicy::Natural,
             )
             .unwrap()
             .into_parts()
             .0;
-        let input_sharding = "{mesh<['x'=2:manual]>, [{}, {}], reduced={'x'}}";
-        let output_sharding = "{mesh<['x'=2:manual]>, [{}, {}], unreduced={'x'}}";
-        let local = "f32[3, 2][sharding={mesh<['x'=2:manual]>, [{}, {}]}]";
+        let input_sharding = "{mesh<['x'=2:manual, 'y'=2:manual]>, [{'y'}, {}], reduced={'x'}}";
+        let output_sharding = "{mesh<['x'=2:manual, 'y'=2:manual]>, [{'y'}, {}], unreduced={'x'}}";
+        let local = "f32[3, 2][sharding={mesh<['x'=2:manual, 'y'=2:manual]>, [{}, {}]}]";
         assert_eq!(
             batched.to_string(),
             formatdoc! {"
                 lambda %0:dimension<3>, %1:f32[3, 2][sharding={input_sharding}] .
                 let %2:f32[3, 2][sharding={output_sharding}] = shard_map [
-                    mesh=['x'=2:manual],
+                    mesh=['x'=2:manual, 'y'=2:manual],
                     input_shardings=[{input_sharding}],
                     output_shardings=[{output_sharding}],
                     manual_axes=['x'],
@@ -16872,8 +16804,10 @@ mod tests {
             },
         );
         let elements = (0..6).map(|element| element as f32).collect::<Vec<_>>();
-        let input_type = ArrayType::new_static(DataType::F32, [3, 2])
-            .with_sharding(Sharding::replicated(mesh, 2).with_reduced_axes(["x"]).unwrap())
+        let input_type = f32_vector_type(2)
+            .with_sharding(reduced)
+            .unwrap()
+            .batched(0, Dimension::Static(3), ShardingDimension::sharded(["y"]))
             .unwrap();
         let outputs = batched
             .interpret(vec![
@@ -17233,7 +17167,8 @@ mod tests {
     fn test_shard_map_batching_places_batch_axes_on_every_manual_axis() {
         // A batch axis placed on the only active manual axis `x` releases it, which leaves the batched map without
         // active manual axes, so its body runs once on the global values, which is what every device along `x`
-        // computed before, because no sharding names `x` and the body does not use it.
+        // computed before, because no sharding names `x` and the body does not use it. The caller types its values over
+        // the mesh of the map, whose batch placement on `x` adds no manual variation.
         let mesh = manual_mesh();
         let replicated = Sharding::replicated(mesh.clone(), 1);
         for check_manual_variation in [true, false] {
@@ -17251,7 +17186,7 @@ mod tests {
                         .unwrap(),
                     ]
                 },
-                vec![f32_vector_type(4)],
+                vec![f32_vector_type(4).with_sharding(replicated.clone()).unwrap()],
                 Vec::new(),
             );
             let batched = program
@@ -17271,7 +17206,7 @@ mod tests {
             assert_eq!(
                 batched.to_string(),
                 formatdoc! {"
-                    lambda %0:dimension<2>, %1:f32[2, 4] .
+                    lambda %0:dimension<2>, %1:{global} .
                     let %2:{global} = shard_map [
                         mesh=['x'=2:manual],
                         input_shardings=[{sharding}],
@@ -17293,7 +17228,14 @@ mod tests {
             let outputs = batched
                 .interpret(vec![
                     TestValue::Dimension(DimensionValue::constant(2).unwrap()),
-                    f32_value(ArrayType::new_static(DataType::F32, [2, 4]), &elements),
+                    f32_value(
+                        f32_vector_type(4)
+                            .with_sharding(replicated.clone())
+                            .unwrap()
+                            .batched(0, Dimension::Static(2), ShardingDimension::sharded(["x"]))
+                            .unwrap(),
+                        &elements,
+                    ),
                 ])
                 .unwrap();
             let expected = elements.iter().map(|element| 2.0 * f64::from(*element)).collect::<Vec<_>>();
@@ -17319,8 +17261,7 @@ mod tests {
                             in (%1)
                         }},
                     ]
-                        %4:f32[2, 4] = broadcast [output_type=f32[2, 4], output_axes=[0, 1]] %3
-                    in (%4)"
+                    in (%3)"
                 },
             );
         }

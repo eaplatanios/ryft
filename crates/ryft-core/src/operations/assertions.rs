@@ -4936,7 +4936,8 @@ mod tests {
     #[test]
     fn test_guard_batching_cast() {
         // Entry guards feed casts in replay and derivative programs. Both must lift the original declaration rather
-        // than reconstructing its layout or manual variation from the already packed operand.
+        // than reconstructing its layout or sharding from the already packed operand, so the batched cast to the
+        // unsharded type remains, while the cast that only drops a layout becomes an identity.
         let plain = ArrayType::new_static(DataType::F32, [2]);
         let mesh = LogicalMesh::new(vec![MeshAxis::new("x", 2, MeshAxisType::Manual).unwrap()]).unwrap();
         for (declared, output, axis_sharding) in [
@@ -4997,6 +4998,7 @@ mod tests {
                     .unwrap()
                     .into_parts();
                 assert_eq!(axes, vec![BatchAxis::new(0)]);
+                let packed_output = output.batched(0, Dimension::Static(extent), axis_sharding.clone()).unwrap();
                 let expected = if packed.sharding().is_some() {
                     formatdoc! {r#"
                         lambda %0:{packed} .
@@ -5004,7 +5006,8 @@ mod tests {
                             boundary="entry",
                             declared_types=[{packed}],
                         ] %0
-                        in (%1)"#}
+                            %2:{packed_output} = cast [type={packed_output}, inputs=[{packed}]] %1
+                        in (%2)"#}
                 } else {
                     formatdoc! {r#"
                         lambda %0:{packed} .
@@ -5012,8 +5015,10 @@ mod tests {
                         in (%1)"#}
                 };
                 assert_eq!(program.to_string(), expected);
-                let value = Array::from_elements(packed, &vec![1f32; extent * 2]).unwrap();
-                assert_eq!(program.interpret(vec![value.clone()]), Ok(vec![value]));
+                let value = Array::from_elements(packed.clone(), &vec![1f32; extent * 2]).unwrap();
+                let output_type = if packed.sharding().is_some() { packed_output } else { packed };
+                let output = Array::from_elements(output_type, &vec![1f32; extent * 2]).unwrap();
+                assert_eq!(program.interpret(vec![value]), Ok(vec![output]));
             }
         }
     }

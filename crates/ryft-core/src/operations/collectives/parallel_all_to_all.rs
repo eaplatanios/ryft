@@ -646,9 +646,8 @@ where
         let mut physical_output_extents = Vec::with_capacity(output_extents.len() + 1);
         physical_output_extents.push(axis_extent);
         physical_output_extents.extend(output_extents);
-        let physical_output_sharding = output_sharding
-            .map(|sharding| sharding.with_leading_batch_axis(context.axis_sharding().clone()))
-            .transpose()?;
+        let physical_output_sharding =
+            output_sharding.map(|sharding| sharding.batched(0, context.axis_sharding().clone())).transpose()?;
         let output =
             P::reshape_collective(context, received, physical_output_extents.as_slice(), physical_output_sharding)?;
         ArrayBatch::new(output, BatchAxis::from_position(0))

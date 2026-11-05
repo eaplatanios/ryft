@@ -788,7 +788,7 @@ where
 
         if let Some(output_sharding) = self.output_sharding() {
             operation.options.output_sharding =
-                Some(output_sharding.with_leading_batch_axis(ArrayBatch::sharding_for_inputs(inputs)?)?);
+                Some(output_sharding.batched(0, ArrayBatch::sharding_for_inputs(inputs)?)?);
         }
 
         Ok(operation.interpret_with_batch_axes(context, &aligned, &[BatchAxis::from_position(0)])?)

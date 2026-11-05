@@ -1558,9 +1558,9 @@ impl<C: Context<Type: CastType, Operation: From<CastOperation<C::Type>>>, P: Bat
         inputs: &[P::Batch],
     ) -> Result<Vec<P::Batch>, BatchingError> {
         // Validate the original declaration before lifting can erase its layout constraints. Reconstructed per-item
-        // types have already lost layout and may carry manual variation introduced by the batch axis, so they are not
-        // the original invocation's representations. The parent validates the supplied values against the lifted
-        // declaration, preserving source/witness shapes, layout and sharding unrelated to the mapped axes.
+        // types have already lost layout, so they are not the original invocation's representations. The parent
+        // validates the supplied values against the lifted declaration, preserving source/witness shapes, layout
+        // and sharding unrelated to the mapped axes.
         check_count!("input", inputs, self.input_types.len(), ProgramError);
         self.infer_output_types(&self.input_types, &driver.region_interfaces())?;
 
@@ -6532,9 +6532,9 @@ mod tests {
 
     #[test]
     fn test_cast_batching_manual_variation() {
-        // Batching over a manual mesh axis adds that axis's variation to every mapped value. An identity cast keeps
-        // the item's own variation, an unspecified output placement still receives the batch axis's variation, and
-        // existing variation on another axis cannot be dropped by the original cast.
+        // Batching over a manual mesh axis adds no variation to the mapped values. An identity cast keeps the item's
+        // own variation and disappears, a cast to an unspecified placement remains a cast, and existing variation on
+        // another axis cannot be dropped by the original cast.
         let mesh = LogicalMesh::new(vec![
             MeshAxis::new("x", 2, MeshAxisType::Manual).unwrap(),
             MeshAxis::new("y", 2, MeshAxisType::Manual).unwrap(),
@@ -6587,18 +6587,30 @@ mod tests {
                     .unwrap()
                     .into_parts();
                 assert_eq!(axes, vec![BatchAxis::new(0)]);
-                assert_eq!(
-                    program.to_string(),
+                let packed_output = output.batched(0, Dimension::Static(4), ShardingDimension::sharded(["x"])).unwrap();
+                let expected_batched = if item == output {
                     formatdoc! {"
                         lambda %0:{packed} .
-                        in (%0)"},
-                );
+                        in (%0)"}
+                } else {
+                    formatdoc! {"
+                        lambda %0:{packed} .
+                        let %1:{packed_output} = cast [
+                            type={packed_output},
+                            inputs=[{packed}],
+                        ] %0
+                        in (%1)"}
+                };
+                assert_eq!(program.to_string(), expected_batched);
                 let value = Array::from_elements(packed.clone(), &[1f32; 8]).unwrap();
-                assert_eq!(program.interpret(vec![value.clone()]), Ok(vec![value]));
+                let output = Array::from_elements(packed_output, &[1f32; 8]).unwrap();
+                assert_eq!(program.interpret(vec![value]), Ok(vec![output]));
             }
         }
 
-        // Only x belongs to this mapped axis. An unexpected change on y must remain an input-contract error.
+        // Variation that the declaration does not have, on `x` or `y`, remains an input-contract error, which the
+        // parent's validation of the lifted declaration reports for a sharded declaration and the cast itself reports
+        // for an unannotated one.
         let packed = plain.batched(0, Dimension::Static(4), ShardingDimension::sharded(["x"])).unwrap();
         let wrong_type = packed
             .clone()
@@ -6608,16 +6620,16 @@ mod tests {
             .with_axis_sharding(ShardingDimension::sharded(["x"]));
         let input =
             ArrayBatch::new(Array::from_elements(wrong_type.clone(), &[1f32; 8]).unwrap(), BatchAxis::new(0)).unwrap();
-        for declared in [plain, unannotated] {
+        for (declared, message) in [
+            (plain, format!("type {wrong_type} does not refine declared type {packed}")),
+            (unannotated, "`cast` supplied input changes the declared manual variation".to_string()),
+        ] {
             assert_eq!(
                 CastOperation::checked(declared.clone(), vec![declared])
                     .unwrap()
                     .batch(&context, &EmptyRegionDriver, &[input.clone()])
                     .map(|_| ()),
-                Err(ProgramError::Type(TypeError::invalid(format!(
-                    "type {wrong_type} does not refine declared type {packed}"
-                )))
-                .into()),
+                Err(ProgramError::Type(TypeError::invalid(message)).into()),
             );
         }
     }

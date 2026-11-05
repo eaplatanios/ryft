@@ -175,8 +175,8 @@ pub use rounding::{
 };
 pub use sharding::{
     CONSTRAIN_SHARDING_OPERATION_NAME, ConstrainSharding, ConstrainShardingDispatch, ConstrainShardingOperation,
-    RESHARD_OPERATION_NAME, ReductionStateKind, Reshard, ReshardDispatch, ReshardOperation, SHARD_MAP_OPERATION_NAME,
-    ShardMap, ShardMapBoundary, ShardMapContext, ShardMapError, ShardMapOperation, ShardMapOptions, ShardMapTracer,
+    RESHARD_OPERATION_NAME, Reshard, ReshardDispatch, ReshardOperation, SHARD_MAP_OPERATION_NAME, ShardMap,
+    ShardMapBoundary, ShardMapContext, ShardMapError, ShardMapOperation, ShardMapOptions, ShardMapTracer,
     ShardMapValueKind, ShardingOperations, shard_map,
 };
 pub use softmax::{Softmax, SoftmaxCrossEntropyWithTargetLogits, softmax_cross_entropy_with_target_logits};

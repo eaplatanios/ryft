@@ -514,10 +514,10 @@ pub trait ScanInterpretationDomain: Domain<Type: ScanType> {
     /// Returns the slice of `stack` that the body reads at `iteration`. For example, reading iteration `2` from an
     /// array of shape `[4, 2, 3]` returns `stack[2]`, an array of shape `[2, 3]`.
     ///
-    /// Removing the leading axis preserves the sharding of the remaining axes. Sharding of the removed axis over
-    /// [`Auto`](MeshAxisType::Auto) mesh axes is dropped; sharding over [`Manual`](MeshAxisType::Manual) mesh axes
-    /// makes the slice vary over those mesh axes. Sharding over [`Explicit`](MeshAxisType::Explicit) mesh axes must
-    /// be removed by resharding before the scan.
+    /// Removing the leading axis preserves the sharding of the remaining axes and the stack's manual variation.
+    /// Placement of the removed axis over [`Auto`](MeshAxisType::Auto) or [`Manual`](MeshAxisType::Manual) mesh axes is
+    /// dropped without adding manual variation. Placement over [`Explicit`](MeshAxisType::Explicit) mesh axes must be
+    /// removed by resharding before the scan.
     ///
     /// A reference input is returned unchanged: the body receives the same reference to the whole stack, preserving
     /// allocation identity and aliasing. It uses its separate index input to select a view of that reference.
@@ -532,18 +532,18 @@ pub trait ScanInterpretationDomain: Domain<Type: ScanType> {
     /// `[4, 2, 3]`.
     ///
     /// When `stack` is [`None`], allocate it using the actual type of `value`, prepending an axis of extent
-    /// `iteration_count`. If that type has sharding, the new axis uses `axis_sharding` on the same mesh; otherwise,
+    /// `iteration_count`. If that type has sharding, the new axis uses `axis_sharding` on the same mesh. Otherwise,
     /// the stack stays unsharded (refer to [`ScanOperation::with_stacked_axis_shardings`]). The actual value supplies
     /// runtime shape and sharding information that the body's declared output type may lack.
     ///
-    /// `iteration` selects the destination slice, independently of visit order: a reversed scan with four iterations
+    /// `iteration` selects the destination slice independently of visit order. A reversed scan with four iterations
     /// first writes slice `3`. Every write must preserve the slices written by earlier iterations.
     ///
     /// Slices from different iterations may vary over different manual mesh axes, even when the body's declared output
     /// type does not record that variation. If this domain can change variation metadata without changing elements,
     /// make both the stack and the new slice vary over the union of the mesh axes they vary over, as
-    /// [`ParallelVaryOperation`] does, including any variation introduced by `axis_sharding`. Otherwise, reject
-    /// incompatible variation. Carries do not pass through this function: each keeps the type returned by the last
+    /// [`ParallelVaryOperation`] does. Otherwise, reject incompatible variation. The placement in `axis_sharding` adds
+    /// no manual variation. Carries do not pass through this function. Each keeps the type returned by the last
     /// iteration, or its initial type when no iterations run.
     ///
     /// # Parameters
@@ -635,25 +635,12 @@ where
     ) -> Result<Self::Value, ProgramError> {
         // The values of this domain are generic and have no capability that only relabels their manual variation
         // (the `ParallelVary` capability of an eager array requires an active manual mesh), so a slice whose manual
-        // variation differs from that of the stack is rejected. The variation that the placement of the stacked axis
-        // introduces is left out of the comparison: the stack always varies over those axes, and a slice may or may
-        // not.
+        // variation differs from that of the stack is rejected. The placement of the stacked axis adds no variation
+        // (refer to `Sharding::batched`).
         let stack = match stack {
             Some(stack) => {
                 let variation = |value: &Self::Value| {
-                    value
-                        .r#type()
-                        .sharding()
-                        .map(|sharding| {
-                            let placed = axis_sharding.manual_axes(sharding.mesh());
-                            sharding
-                                .varying_manual_axes()
-                                .iter()
-                                .filter(|axis| !placed.contains(axis))
-                                .cloned()
-                                .collect::<BTreeSet<_>>()
-                        })
-                        .unwrap_or_default()
+                    value.r#type().sharding().map(|sharding| sharding.varying_manual_axes().clone()).unwrap_or_default()
                 };
                 let (stacked, returned) = (variation(&stack), variation(&value));
                 if stacked != returned {
@@ -678,27 +665,6 @@ where
             }
             None => self.zero(&scan_stack_type(&value.r#type(), iteration_count, axis_sharding)?)?,
         };
-
-        // A placement over manual mesh axes makes the stack vary over them, and so must every written slice, which
-        // this domain cannot relabel: a slice that does not vary over them is rejected before the in-place update
-        // would reject it with a less specific message.
-        if let Some(sharding) = value.r#type().sharding() {
-            let missing = axis_sharding
-                .manual_axes(sharding.mesh())
-                .into_iter()
-                .filter(|axis| !sharding.varying_manual_axes().contains(axis))
-                .collect::<Vec<_>>();
-            if !missing.is_empty() {
-                return Err(TypeError::invalid(format!(
-                    "`{}` cannot place the stacked axis of output {} over the manual \
-                     mesh axes `{}` for slices that do not vary over them",
-                    SCAN_OPERATION_NAME,
-                    output_index,
-                    missing.join("`, `"),
-                ))
-                .into());
-            }
-        }
 
         write_scan_iteration(stack, iteration, value, axis_sharding)
     }
@@ -792,9 +758,9 @@ impl<O: Operation<Type = ArrayIrType>> ScanInterpretationDomain for EagerContext
             }
         };
 
-        // Join manual variation across iterations (and the variation that the placement of the stacked axis gives
-        // the stack from its first write on) by relabeling both concrete arrays. An unsharded value first receives
-        // replicated placement on the missing axis's mesh; its elements stay unchanged.
+        // Join manual variation across iterations by relabeling both concrete arrays. An unsharded value first
+        // receives replicated placement on the missing axis's mesh, and its elements stay unchanged. The placement of
+        // the stacked axis adds no manual variation.
         let types = [stack.r#type().into_owned(), value.r#type().into_owned()];
         let axes = manual_variation_axes(&types);
         let mut joined = vary_over_missing_manual_axes(vec![stack, value], &types, &axes, |value, axis, mesh| {
@@ -940,9 +906,9 @@ impl<T: Type> ScanOperation<T> {
     /// batching rule that turns a mapped batch axis into the scan axis (e.g., the sequential batching of a foreign
     /// kernel call) declares the batch axis's placement for every stacked output here, so that the stacked results
     /// carry the same placement as the batch axis of every other batched value. A placement enters the stacked output
-    /// type through [`ArrayType::batched`], which also records the variation that a placement over manual mesh axes
-    /// introduces, mirroring how a stacked _input_ whose scan axis is sharded over manual mesh axes yields slices that
-    /// vary over them. Output type inference rejects a placement over mesh axes that a slice's sharding does not know,
+    /// type through [`ArrayType::batched`] and adds no manual variation, even over manual mesh axes, mirroring how a
+    /// stacked _input_ whose scan axis is sharded over manual mesh axes yields slices that drop that placement. Output
+    /// type inference rejects a placement over mesh axes that a slice's sharding does not know,
     /// a list with more entries than the body has stacked outputs, and a slice without a sharding stacks without
     /// placement. Eager interpretation assembles each stack at its placed type, so that an eager application produces
     /// the inferred output types. Rules that derive a scan place its stacked outputs by the values they stack:
@@ -1185,8 +1151,8 @@ impl<T: ScanType> ScanOperation<T> {
                 )));
             };
 
-            // Replicated insertion preserves the slice's placement without adding variation. Other placements use
-            // `batched`, which records manual-axis variation and rejects axes absent from the slice's mesh.
+            // Inserting the stacked dimension preserves the slice's manual variation. Non-replicated placements use
+            // `batched`, which validates the placement and rejects axes absent from the slice's mesh.
             let stacked_axis_sharding =
                 self.stacked_axis_shardings.get(index - carry_count).unwrap_or(&ShardingDimension::Replicated);
             let stacked_type = if *stacked_axis_sharding == ShardingDimension::Replicated {
@@ -3602,19 +3568,19 @@ fn validate_scan_iteration_count<T: ScanType>(
 /// Returns the per-iteration slice type of a stacked scan value of type `stacked_type` whose scan axis is `axis`,
 /// together with the scan dimension. A placement over [`Auto`](MeshAxisType::Auto) mesh axes on the scan axis is
 /// only a hint for the compiler, so the slice drops it: each iteration reads a single position of that axis, and the
-/// compiler remains free to place the slice. A scan axis sharded over [`Manual`](MeshAxisType::Manual) mesh axes makes
-/// those axes vary across the slice (refer to [`ArrayType::without_dimension`]), while one sharded over
-/// [`Explicit`](MeshAxisType::Explicit) mesh axes is rejected, because only an explicit reshard can
-/// remove an explicit placement.
+/// compiler remains free to place the slice. A placement over [`Manual`](MeshAxisType::Manual) mesh axes only
+/// distributes the stack, as for [`scan_stack_type`], so the slice drops it as well without varying along those axes.
+/// A scan axis sharded over [`Explicit`](MeshAxisType::Explicit) mesh axes is rejected, because only an explicit
+/// reshard can remove an explicit placement.
 fn scan_slice_type(stacked_type: &ArrayType, axis: usize) -> Result<(ArrayType, Dimension), TypeError> {
     let mut stacked_type = stacked_type.clone();
     if let Some(sharding) = stacked_type.sharding()
         && let Some(ShardingDimension::Sharded(axis_names)) = sharding.dimensions().get(axis)
-        && axis_names.iter().any(|name| sharding.mesh().axis_type(name) == Some(MeshAxisType::Auto))
+        && axis_names.iter().any(|name| sharding.mesh().axis_type(name) != Some(MeshAxisType::Explicit))
     {
         let axis_names = axis_names
             .iter()
-            .filter(|name| sharding.mesh().axis_type(name) != Some(MeshAxisType::Auto))
+            .filter(|name| sharding.mesh().axis_type(name) == Some(MeshAxisType::Explicit))
             .cloned()
             .collect::<Vec<_>>();
         let mut dimensions = sharding.dimensions().to_vec();
@@ -3668,11 +3634,11 @@ fn scan_entry_guard<T: ScanType>(
 }
 
 /// Writes `value` as slice `iteration` of `stack` by prepending a unit axis to `value`. If `value` is sharded, the
-/// unit axis uses `axis_sharding` on the same mesh. An in-place update must agree with the stack on explicit mesh axes
-/// and on the variation that manual mesh axes introduce, so the unit axis carries such sharding; sharding over auto
-/// mesh axes is a hint that the update need not repeat (and that a reshape cannot request).
+/// unit axis uses `axis_sharding` on the same mesh, retaining explicit and manual placement. An in-place update must
+/// agree with the stack on existing manual variation and explicit placement. Auto placement is a compiler hint that
+/// the update need not repeat and a reshape cannot request.
 ///
-/// The domains have different variation rules: a stack that starts unsharded may receive slices with mesh metadata
+/// The domains have different variation rules. A stack that starts unsharded may receive slices with mesh metadata
 /// under mixed auto/manual scan-axis sharding. The homogeneous writer's stricter checks would reject this case.
 fn write_scan_iteration<V: Value<Type = ArrayType> + UpdateSlice + Reshape>(
     stack: V,
@@ -5650,10 +5616,10 @@ mod tests {
 
     #[test]
     fn test_scan_with_stacked_axis_shardings() {
-        // Declared stacked-axis placements render (without trailing replicated entries, so that alike placements
-        // compare alike), and each stacked output gains its placement through `ArrayType::batched`, which records the
-        // variation that a placement over manual mesh axes introduces. Unsharded slices stack without placement, and
-        // a placement over a mesh axis that the slice's sharding does not know is rejected.
+        // Declared stacked-axis placements render without trailing replicated entries, so that alike placements
+        // compare alike. Each stacked output gains its placement through `ArrayType::batched`, which preserves the
+        // slice's manual variation. Unsharded slices stack without placement, and a placement over a mesh axis that
+        // the slice's sharding does not know is rejected.
         let mesh = LogicalMesh::new(vec![MeshAxis::new("m", 2, MeshAxisType::Manual).unwrap()]).unwrap();
         let operation = TestScanOperation::new(0, 2)
             .with_stacked_axis_shardings(vec![ShardingDimension::sharded(["m"]), ShardingDimension::Replicated]);
@@ -6106,8 +6072,9 @@ mod tests {
             ])]),
         );
 
-        // A scan axis sharded over a `Manual` mesh axis makes the slices vary over that axis, while one sharded over an
-        // `Explicit` mesh axis is rejected consistently by both type inference functions.
+        // A scan axis sharded over a `Manual` mesh axis only distributes the stack, so each slice drops that placement
+        // without varying over the axis, while one sharded over an `Explicit` mesh axis is rejected consistently by
+        // both type inference functions.
         let manual_mesh = LogicalMesh::new(vec![MeshAxis::new("m", 3, MeshAxisType::Manual).unwrap()]).unwrap();
         let manual_stacked_type = stacked_type
             .clone()
@@ -6121,10 +6088,7 @@ mod tests {
         let Some(region_input_types) = &region_input_types[0] else {
             panic!("expected the body to be requested at the refined input types");
         };
-        assert_eq!(
-            region_input_types[2].sharding().unwrap().varying_manual_axes().iter().collect::<Vec<_>>(),
-            vec!["m"],
-        );
+        assert_eq!(region_input_types[2].sharding(), Some(&Sharding::replicated(manual_mesh.clone(), 0)));
         let explicit_mesh = LogicalMesh::new(vec![MeshAxis::new("e", 3, MeshAxisType::Explicit).unwrap()]).unwrap();
         let explicit_stacked_type = stacked_type
             .clone()
@@ -10452,9 +10416,8 @@ mod tests {
 
     #[test]
     fn test_scan_interpretation_places_stacked_outputs_over_manual_axes() {
-        // A placement over a manual mesh axis makes the stack vary over it. Concrete array IR values relabel each
-        // written slice to vary over it as well, while the homogeneous family, whose values cannot be relabeled,
-        // rejects a slice that does not already vary over the axis.
+        // A placement over a manual mesh axis only distributes the stack along that axis and adds no variation, so both
+        // the array IR family and the homogeneous family, whose values cannot be relabeled, stack invariant slices.
         let mesh = LogicalMesh::new(vec![MeshAxis::new("m", 2, MeshAxisType::Manual).unwrap()]).unwrap();
         let scalar_type =
             ArrayType::scalar(DataType::F64).with_sharding(Sharding::replicated(mesh.clone(), 0)).unwrap();
@@ -10494,7 +10457,7 @@ mod tests {
             program.interpret(vec![array(initial.clone()), array(values.clone())]),
             Ok(vec![
                 array(Array::from_elements::<f64>(scalar_type.clone(), &[24.0]).unwrap()),
-                array(Array::from_elements::<f64>(placed_type, &[2.0, 6.0, 24.0]).unwrap()),
+                array(Array::from_elements::<f64>(placed_type.clone(), &[2.0, 6.0, 24.0]).unwrap()),
             ]),
         );
 
@@ -10509,11 +10472,10 @@ mod tests {
         };
         assert_eq!(
             initial.domain().bind(TestOperation::Scan(operation), vec![body], &[initial, values]),
-            Err(TypeError::invalid(format!(
-                "`{SCAN_OPERATION_NAME}` cannot place the stacked axis of output 1 over the manual mesh axes \
-                 `m` for slices that do not vary over them",
-            ),)
-            .into()),
+            Ok(vec![
+                Array::from_elements::<f64>(scalar_type, &[24.0]).unwrap(),
+                Array::from_elements::<f64>(placed_type, &[2.0, 6.0, 24.0]).unwrap(),
+            ]),
         );
     }
 
@@ -23468,7 +23430,7 @@ mod tests {
             .trim_end(),
         );
 
-        // Preserving the placement is necessary to preserve the stacked output type, including manual-axis variation.
+        // Lifting preserves the stacked-axis placement and the slice's existing manual variation in the output type.
         let mesh = LogicalMesh::new(vec![MeshAxis::new("m", 2, MeshAxisType::Manual).unwrap()]).unwrap();
         let carry_type = ArrayType::scalar(DataType::F32);
         let slice_type = ArrayType::new_static(DataType::F32, [3])
@@ -24260,9 +24222,8 @@ mod tests {
             Ok(Array::vector(vec![4.0, 0.0, 0.0]).unwrap()),
         );
 
-        // A stack whose leading axis is placed over a manual mesh axis varies over it, and so does the unit axis of
-        // a written slice that varies over it, so that the in-place update agrees with the stack; the slice keeps its
-        // elements.
+        // A slice that varies over a manual mesh axis is written into a stack that varies over it as well, whose leading
+        // axis is also placed over it, so that the in-place update agrees with the stack; the slice keeps its elements.
         let mesh = LogicalMesh::new(vec![MeshAxis::new("m", 2, MeshAxisType::Manual).unwrap()]).unwrap();
         let slice_type = ArrayType::scalar(DataType::F64)
             .with_sharding(Sharding::replicated(mesh.clone(), 0).with_varying_manual_axes(["m"]).unwrap())

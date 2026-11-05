@@ -1141,9 +1141,7 @@ where
             .with_unique_indices(self.unique_indices())
             .with_output_sharding(
                 self.output_sharding()
-                    .map(|output_sharding| {
-                        output_sharding.with_leading_batch_axis(ArrayBatch::sharding_for_inputs(inputs)?)
-                    })
+                    .map(|output_sharding| output_sharding.batched(0, ArrayBatch::sharding_for_inputs(inputs)?))
                     .transpose()?,
             );
 

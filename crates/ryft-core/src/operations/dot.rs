@@ -3739,22 +3739,31 @@ mod tests {
     }
 
     #[test]
-    fn test_dot_batching_preserves_materialized_batch_placement_manual_variation() -> Result<(), ProgramError> {
-        // Materializing the mapped axis on the replicated right-hand side also gives it the manual variation of the
-        // mapped left-hand side.
-        let mesh = LogicalMesh::new(vec![MeshAxis::new("x", 2, MeshAxisType::Manual).unwrap()]).unwrap();
+    fn test_dot_batching_aligns_materialized_batch_placement_with_manual_variation() -> Result<(), ProgramError> {
+        // Materializing the mapped axis on the replicated right-hand side gives it the batch placement on `y`, which
+        // adds no variation, so `parallel_vary` aligns it with the left-hand side, which varies along `x`.
+        let mesh = LogicalMesh::new(vec![
+            MeshAxis::new("x", 2, MeshAxisType::Manual).unwrap(),
+            MeshAxis::new("y", 2, MeshAxisType::Manual).unwrap(),
+        ])
+        .unwrap();
         let left_sharding = Sharding::new(
             mesh.clone(),
-            vec![ShardingDimension::sharded(["x"]), ShardingDimension::Replicated, ShardingDimension::Replicated],
+            vec![ShardingDimension::sharded(["y"]), ShardingDimension::Replicated, ShardingDimension::Replicated],
         )
         .unwrap()
         .with_varying_manual_axes(["x"])
         .unwrap();
-        let right_sharding = Sharding::replicated(mesh, 2);
+        let right_sharding = Sharding::replicated(mesh.clone(), 2);
+        let materialized_sharding = Sharding::new(
+            mesh,
+            vec![ShardingDimension::sharded(["y"]), ShardingDimension::Replicated, ShardingDimension::Replicated],
+        )
+        .unwrap();
         let (_, program) = TracingContext::<Array, ArrayOperation<Array>>::trace(
             |(left, right)| {
                 let context = BatchingContext::new(left.context().clone(), 2)
-                    .with_axis_sharding(ShardingDimension::sharded(["x"]));
+                    .with_axis_sharding(ShardingDimension::sharded(["y"]));
                 let mut outputs = DotOperation::matmul().batch(
                     &context,
                     &EmptyRegionDriver,
@@ -3771,14 +3780,15 @@ mod tests {
             program.to_string(),
             formatdoc! {"
                 lambda %0:f64[2, 2, 2][sharding={left_sharding}], %1:f64[2, 1][sharding={right_sharding}] .
-                let %2:f64[2, 2, 1][sharding={left_sharding}] = broadcast [
-                    output_type=f64[2, 2, 1][sharding={left_sharding}],
+                let %2:f64[2, 2, 1][sharding={materialized_sharding}] = broadcast [
+                    output_type=f64[2, 2, 1][sharding={materialized_sharding}],
                     output_axes=[1, 2],
                 ] %1
-                    %3:f64[2, 2, 1][sharding={left_sharding}] = dot [
+                    %3:f64[2, 2, 1][sharding={left_sharding}] = parallel_vary [axis_name=\"x\"] %2
+                    %4:f64[2, 2, 1][sharding={left_sharding}] = dot [
                         dimensions=(lhs_contracting=[2], rhs_contracting=[1], lhs_batching=[0], rhs_batching=[0]),
-                    ] %0 %2
-                in (%3)
+                    ] %0 %3
+                in (%4)
             "}
             .trim_end(),
         );

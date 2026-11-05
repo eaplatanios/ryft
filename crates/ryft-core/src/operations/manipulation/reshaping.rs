@@ -222,9 +222,8 @@ where
         lifted_output_dimensions.extend_from_slice(output_shape.dimensions());
         let mut lifted_operation = ReshapeOperation::new(Shape::new(lifted_output_dimensions));
         if let Some(output_sharding) = self.output_sharding() {
-            lifted_operation = lifted_operation.with_output_sharding(
-                output_sharding.with_leading_batch_axis(ArrayBatch::sharding_for_inputs(inputs)?)?,
-            );
+            lifted_operation = lifted_operation
+                .with_output_sharding(output_sharding.batched(0, ArrayBatch::sharding_for_inputs(inputs)?)?);
         }
         Ok(lifted_operation
             .interpret_with_batch_axes(context, &[moved_input], &[BatchAxis::from_position(0)])?
@@ -863,8 +862,7 @@ where
 
         let mut operation = Self::new();
         if let Some(output_sharding) = self.output_sharding() {
-            operation = operation
-                .with_output_sharding(output_sharding.with_leading_batch_axis(context.axis_sharding().clone())?);
+            operation = operation.with_output_sharding(output_sharding.batched(0, context.axis_sharding().clone())?);
         }
 
         let mut lifted_inputs = Vec::with_capacity(inputs.len() + 1);

@@ -902,8 +902,7 @@ where
         }
 
         if let Some(output_sharding) = self.output_sharding() {
-            operation = operation
-                .with_output_sharding(output_sharding.with_leading_batch_axis(context.axis_sharding().clone())?);
+            operation = operation.with_output_sharding(output_sharding.batched(0, context.axis_sharding().clone())?);
         }
 
         let mut lifted_inputs = Vec::with_capacity(inputs.len() + 1);

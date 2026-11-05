@@ -7039,14 +7039,11 @@ mod tests {
         StagedFunction, StagingContext, StaticShape, SubOperation, TracingContext, Value, WhileOperation,
         ZeroOperation, batch, shard_map,
     };
-    use ryft_pjrt::{
-        ClientOptions, CpuClientOptions, ExecutionDeviceInputs, ExecutionInput, Program as PjrtProgram, load_cpu_plugin,
-    };
+    use ryft_pjrt::{ClientOptions, CpuClientOptions, load_cpu_plugin};
     #[cfg(feature = "cuda-13")]
     use ryft_pjrt::{GpuClientOptions, GpuMemoryAllocator, GpuPlatform, load_cuda_13_plugin};
 
     use crate::XlaReference;
-    use crate::experimental::lowering::tests::test_spmd_compilation_options;
     use crate::experimental::tracing::XlaArrayTracer;
     use crate::tests::{execution_client, hash_of, values_from_bytes, values_to_bytes};
 
@@ -14919,21 +14916,31 @@ mod tests {
 
     #[test]
     fn test_xla_lowering_executes_shard_maps_batched_along_every_manual_axis() {
-        // The caller maps the leading dimension of its input, which it places along `x`, over a map whose only active
-        // manual axis is `x`. Batching releases `x`, which leaves a manual computation without manual axes that runs
-        // the batched body once on the global values, while the boundary keeps the batch dimension placed along `x`,
-        // so each of the two devices holds one batch item. The caller types its values over an `Explicit` copy of the
-        // mesh, so its batch placement adds no manual variation, and the lowered module is compiled directly because
-        // domain compilation requires the outputs to use the caller's mesh.
-        let map_mesh = LogicalMesh::new(vec![MeshAxis::new("x", 2, MeshAxisType::Manual).unwrap()]).unwrap();
-        let caller_mesh = LogicalMesh::new(vec![MeshAxis::new("x", 2, MeshAxisType::Explicit).unwrap()]).unwrap();
-        let replicated = Sharding::replicated(map_mesh.clone(), 1);
-        let caller_sharding = Sharding::new(
-            caller_mesh.clone(),
+        // The caller maps the leading dimension of its input, which it places along `x` over the mesh of the map itself,
+        // over a map whose only active manual axis is `x`. The placement adds no manual variation to the batch items,
+        // and batching releases `x`, which leaves a manual computation without manual axes that runs the batched body
+        // once on the global values, while the boundary keeps the batch dimension placed along `x`, so each of the two
+        // devices holds one batch item.
+        let plugin = load_cpu_plugin().unwrap();
+        let client = plugin
+            .client(ClientOptions::CPU(CpuClientOptions { device_count: Some(2), ..Default::default() }))
+            .unwrap();
+        let logical_mesh = LogicalMesh::new(vec![MeshAxis::new("x", 2, MeshAxisType::Manual).unwrap()]).unwrap();
+        let devices = client
+            .addressable_devices()
+            .unwrap()
+            .into_iter()
+            .map(|device| Device::from_pjrt(device).unwrap())
+            .collect::<Vec<_>>();
+        let mesh = DeviceMesh::new(logical_mesh.clone(), devices).unwrap();
+        let domain = XlaSession::new(&client).domain();
+        let replicated = Sharding::replicated(logical_mesh.clone(), 1);
+        let input_sharding = Sharding::new(
+            logical_mesh.clone(),
             vec![ShardingDimension::sharded(["x"]), ShardingDimension::replicated()],
         )
         .unwrap();
-        let caller_type = ArrayType::new_static(DataType::F32, [2, 3]).with_sharding(caller_sharding).unwrap();
+        let input_type = ArrayType::new_static(DataType::F32, [2, 3]).with_sharding(input_sharding).unwrap();
         let (_, program) = DomainTracingContext::<XlaDomain<'static>>::trace(
             |inputs: Vec<XlaTracer<'static>>| {
                 let output = batch(
@@ -14942,7 +14949,7 @@ mod tests {
                         let output = shard_map(
                             |x| Ok(x.clone() + x),
                             item,
-                            map_mesh.clone(),
+                            logical_mesh.clone(),
                             replicated.clone(),
                             replicated.clone(),
                             ShardMapOptions::new(),
@@ -14956,22 +14963,10 @@ mod tests {
                 )?;
                 Ok(vec![output])
             },
-            vec![ArrayIrType::Array(caller_type)],
+            vec![ArrayIrType::Array(input_type.clone())],
         )
         .unwrap();
-        let plugin = load_cpu_plugin().unwrap();
-        let client = plugin
-            .client(ClientOptions::CPU(CpuClientOptions { device_count: Some(2), ..Default::default() }))
-            .unwrap();
-        let devices = client
-            .addressable_devices()
-            .unwrap()
-            .into_iter()
-            .map(|device| Device::from_pjrt(device).unwrap())
-            .collect::<Vec<_>>();
-        let mesh = DeviceMesh::new(caller_mesh, devices).unwrap();
-        let domain = XlaSession::new(&client).domain();
-        let lowered = domain.lower_xla_program(&program, 0, &XlaOptions::new(mesh)).unwrap();
+        let lowered = domain.lower_xla_program(&program, 0, &XlaOptions::new(mesh.clone())).unwrap();
         assert_eq!(
             &*lowered.stable_hlo,
             indoc! {"
@@ -14989,45 +14984,21 @@ mod tests {
                 }
             "},
         );
-        let executable = client
-            .compile(
-                &PjrtProgram::Mlir { bytecode: lowered.stable_hlo.as_bytes().to_vec() },
-                &test_spmd_compilation_options(2),
-            )
-            .unwrap();
-        let inputs = executable
-            .addressable_devices()
-            .unwrap()
-            .into_iter()
-            .zip([[1f32, 2., 3.], [4., 5., 6.]])
-            .map(|(device, item)| {
-                vec![ExecutionInput {
-                    buffer: Arc::new(
-                        client
-                            .buffer(values_to_bytes(&item).as_slice(), BufferType::F32, [1, 3], None, device, None)
-                            .unwrap(),
-                    ),
-                    donatable: false,
-                }]
+        let compiled = domain.compile_xla_program(&lowered).unwrap();
+        let input = XlaArray::from_host_buffer(
+            &domain,
+            input_type,
+            mesh,
+            values_to_bytes::<f32>(&[1.0, 2.0, 3.0, 4.0, 5.0, 6.0]).as_slice(),
+        )
+        .unwrap();
+        let outputs = domain.execute_xla_program(&compiled, vec![input]).unwrap();
+        let items = outputs[0]
+            .addressable_shards()
+            .map(|shard| {
+                let bytes = shard.buffer().unwrap().copy_to_host(None).unwrap().r#await().unwrap();
+                values_from_bytes::<f32>(bytes.as_slice())
             })
-            .collect::<Vec<_>>();
-        let outputs = executable
-            .execute(
-                inputs.iter().map(|inputs| ExecutionDeviceInputs { inputs, ..Default::default() }).collect(),
-                Vec::new(),
-                0,
-                None,
-                None,
-                None,
-                None,
-                &[],
-            )
-            .unwrap()
-            .block_until_ready()
-            .unwrap();
-        let items = outputs
-            .into_iter()
-            .map(|output| values_from_bytes::<f32>(&output.outputs[0].copy_to_host(None).unwrap().r#await().unwrap()))
             .collect::<Vec<_>>();
         assert_eq!(items, vec![vec![2.0, 4.0, 6.0], vec![8.0, 10.0, 12.0]]);
     }
