@@ -179,8 +179,8 @@ pub use operations::{
     WHILE_OPERATION_NAME, WeakCustomRuleReference, While, WhileOperation, WhileOptions, WhilePredicate, WhileType,
     XOR_OPERATION_NAME, Xor, XorOperation, ZERO_LIKE_OPERATION_NAME, ZERO_OPERATION_NAME, Zero, ZeroLike,
     ZeroLikeOperation, ZeroOperation, associative_scan, block_scaled_dot, composite,
-    differentiable_dot_product_attention, dot_product_attention, scan, shard_map,
-    softmax_cross_entropy_with_target_logits, r#while,
+    differentiable_dot_product_attention, dot_product_attention, scan, shard_map, shard_map_along,
+    shard_map_with_inferred_input_shardings, softmax_cross_entropy_with_target_logits, r#while,
 };
 pub use parameters::{
     ArrayParameterizedFamily, BTreeMapParameterizedFamily, HashMapParameterizedFamily, Parameter, ParameterError,

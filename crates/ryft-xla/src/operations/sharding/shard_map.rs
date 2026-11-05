@@ -391,7 +391,7 @@ mod tests {
         AxisIndexOperation, BatchAxis, Context, ConvertElementTypeOperation, CustomCallOperation, DataType, Device,
         DeviceMesh, Dimension as CoreDimension, DomainTracingContext, Dot, DotDimensionNumbers, EffectClass,
         LogicalMesh, MeshAxis, MeshAxisType, Placeholder, Shape, ShardMapOptions, Typed, ValueProjection, batch,
-        shard_map,
+        shard_map, shard_map_along, shard_map_with_inferred_input_shardings,
     };
     use ryft_mlir::Block;
     use ryft_pjrt::{BufferType, ClientOptions, CpuClientOptions, Program as PjrtProgram, load_cpu_plugin};
@@ -1354,6 +1354,139 @@ mod tests {
             .map(|output| values_from_bytes::<f32>(&output.outputs[0].copy_to_host(None).unwrap().r#await().unwrap()))
             .collect::<Vec<_>>();
         assert_eq!(summands, vec![vec![5.0, 12.0], vec![15.0, 24.0]]);
+    }
+
+    /// Compiles `module` for two CPU devices, executes it with one `f32` input buffer of shape `local_shape` per device
+    /// holding `device_inputs[device]`, and returns the elements of the first output of every device.
+    fn execute_on_two_cpu_devices(module: String, local_shape: &[u64], device_inputs: [&[f32]; 2]) -> Vec<Vec<f32>> {
+        use ryft_pjrt::{ExecutionDeviceInputs, ExecutionInput};
+
+        let plugin = load_cpu_plugin().unwrap();
+        let client = plugin
+            .client(ClientOptions::CPU(CpuClientOptions { device_count: Some(2), ..Default::default() }))
+            .unwrap();
+        let executable = client
+            .compile(&PjrtProgram::Mlir { bytecode: module.into_bytes() }, &test_spmd_compilation_options(2))
+            .unwrap();
+        let inputs = executable
+            .addressable_devices()
+            .unwrap()
+            .into_iter()
+            .zip(device_inputs)
+            .map(|(device, values)| {
+                let buffer = client
+                    .buffer(values_to_bytes(values).as_slice(), BufferType::F32, local_shape, None, device, None)
+                    .unwrap();
+                vec![ExecutionInput { buffer: Arc::new(buffer), donatable: false }]
+            })
+            .collect::<Vec<_>>();
+        executable
+            .execute(
+                inputs.iter().map(|inputs| ExecutionDeviceInputs { inputs, ..Default::default() }).collect(),
+                Vec::new(),
+                0,
+                None,
+                None,
+                None,
+                None,
+                &[],
+            )
+            .unwrap()
+            .block_until_ready()
+            .unwrap()
+            .into_iter()
+            .map(|output| values_from_bytes::<f32>(&output.outputs[0].copy_to_host(None).unwrap().r#await().unwrap()))
+            .collect()
+    }
+
+    #[test]
+    fn test_to_mlir_module_for_program_with_inferred_input_shardings_executes_on_cpu() {
+        use crate::experimental::tracing::{TracedProgram, trace_with_context};
+
+        // The input sharding comes from the input type, which is sharded along `x`, and each device doubles its shard.
+        let mesh = test_manual_mesh("x", 2);
+        let sharded = Sharding::new(mesh.clone(), vec![ShardingDimension::sharded(["x"])]).unwrap();
+        let traced: TracedProgram<ArrayType, ArrayType> = trace_with_context(
+            |_, x: ArrayTracer| {
+                Ok(shard_map_with_inferred_input_shardings(
+                    |x: ArrayTracer| Ok(x.clone() + x),
+                    x,
+                    mesh.clone(),
+                    sharded.clone(),
+                    ShardMapOptions::new(),
+                )?)
+            },
+            ArrayType::new_static(DataType::F32, [4]).with_sharding(sharded.clone()).unwrap(),
+        )
+        .unwrap();
+        let module = traced.to_mlir_module("main").unwrap();
+        assert_eq!(
+            module,
+            indoc! {"
+                module {
+                  sdy.mesh @mesh = <[\"x\"=2]>
+                  func.func @main(%arg0: tensor<4xf32> {sdy.sharding = #sdy.sharding<@mesh, [{\"x\"}]>}) -> \
+                      (tensor<4xf32> {sdy.sharding = #sdy.sharding<@mesh, [{\"x\"}]>}) {
+                    %0 = sdy.manual_computation(%arg0) in_shardings=[<@mesh, [{\"x\"}]>] \
+                        out_shardings=[<@mesh, [{\"x\"}]>] manual_axes={\"x\"} (%arg1: tensor<2xf32>) {
+                      %1 = stablehlo.add %arg1, %arg1 : tensor<2xf32>
+                      sdy.return %1 : tensor<2xf32>
+                    } : (tensor<4xf32>) -> tensor<4xf32>
+                    return %0 : tensor<4xf32>
+                  }
+                }
+            "},
+        );
+        assert_eq!(
+            execute_on_two_cpu_devices(module, &[2], [&[1.0, 2.0], &[3.0, 4.0]]),
+            vec![vec![2.0, 4.0], vec![6.0, 8.0]]
+        );
+    }
+
+    #[test]
+    fn test_to_mlir_module_for_program_with_shard_map_along_executes_on_cpu() {
+        use crate::experimental::tracing::{TracedProgram, trace_with_context};
+
+        // Each device receives one row of the input mapped along `x` at dimension 0 and returns it doubled, placed along
+        // `x` at dimension 1 of the output, so the rows of the input become the column blocks of the output.
+        let mesh = test_manual_mesh("x", 2);
+        let traced: TracedProgram<ArrayType, ArrayType> = trace_with_context(
+            |_, x: ArrayTracer| {
+                Ok(shard_map_along(|x: ArrayTracer| Ok(x.clone() + x), x, mesh.clone(), "x", Some(0), Some(1))?)
+            },
+            ArrayType::new_static(DataType::F32, [2, 3])
+                .with_sharding(
+                    Sharding::new(
+                        mesh.clone(),
+                        vec![ShardingDimension::sharded(["x"]), ShardingDimension::replicated()],
+                    )
+                    .unwrap(),
+                )
+                .unwrap(),
+        )
+        .unwrap();
+        let module = traced.to_mlir_module("main").unwrap();
+        assert_eq!(
+            module,
+            indoc! {"
+                module {
+                  sdy.mesh @mesh = <[\"x\"=2]>
+                  func.func @main(%arg0: tensor<2x3xf32> {sdy.sharding = #sdy.sharding<@mesh, [{\"x\"}, {}]>}) -> \
+                      (tensor<1x6xf32> {sdy.sharding = #sdy.sharding<@mesh, [{}, {\"x\"}]>}) {
+                    %0 = sdy.manual_computation(%arg0) in_shardings=[<@mesh, [{\"x\"}, {}]>] \
+                        out_shardings=[<@mesh, [{}, {\"x\"}]>] manual_axes={\"x\"} (%arg1: tensor<1x3xf32>) {
+                      %1 = stablehlo.add %arg1, %arg1 : tensor<1x3xf32>
+                      sdy.return %1 : tensor<1x3xf32>
+                    } : (tensor<2x3xf32>) -> tensor<1x6xf32>
+                    return %0 : tensor<1x6xf32>
+                  }
+                }
+            "},
+        );
+        assert_eq!(
+            execute_on_two_cpu_devices(module, &[1, 3], [&[1.0, 2.0, 3.0], &[4.0, 5.0, 6.0]]),
+            vec![vec![2.0, 4.0, 6.0], vec![8.0, 10.0, 12.0]]
+        );
     }
 
     #[test]

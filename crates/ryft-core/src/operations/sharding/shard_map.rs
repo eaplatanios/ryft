@@ -243,6 +243,7 @@
 //! with a device runtime execute all of these bodies.
 
 use std::borrow::Cow;
+use std::cell::OnceCell;
 use std::collections::{BTreeSet, HashSet};
 use std::fmt::{Debug, Display};
 use std::hash::{Hash, Hasher};
@@ -387,6 +388,18 @@ pub enum ShardMapError {
          those of the `{SHARD_MAP_OPERATION_NAME}` mesh `{expected}`"
     )]
     InputMeshMismatch { input_index: usize, expected: LogicalMesh, actual: LogicalMesh },
+
+    #[error(
+        "the sharding of `{SHARD_MAP_OPERATION_NAME}` input #{input_index} cannot be inferred \
+         because its type `{input_type}` has no sharding"
+    )]
+    InputShardingNotInferable { input_index: usize, input_type: ArrayType },
+
+    #[error(
+        "`{SHARD_MAP_OPERATION_NAME}` {value_kind} #{value_index} has rank {rank}, so it has no \
+         dimension {axis} to place along its manual axis"
+    )]
+    MappedAxisOutOfBounds { value_kind: ShardMapValueKind, value_index: usize, axis: usize, rank: usize },
 
     #[error(
         "`{SHARD_MAP_OPERATION_NAME}` {value_kind} sharding #{value_index} lists axis `{free_axis_name}` before \
@@ -3103,6 +3116,73 @@ pub trait ShardMap: Context + NamedAxes {
         Output: Parameterized<ShardMapTracer<Self>>,
         Output::Family: ParameterizedFamily<Sharding> + ParameterizedFamily<ProjectedValue<ArrayType, Self::Value>>,
         F: FnOnce(&ShardMapContext<Self>, Input::To<ShardMapTracer<Self>>) -> Result<Output, ProgramError>;
+
+    /// Like [`Self::shard_map`], but uses the sharding of each input's type as its input sharding (i.e., JAX's default
+    /// `in_specs=Infer`). The type's sharding is re-expressed over `mesh`, whose axes it must share up to their types,
+    /// so that the boundary neither reshards the input nor drops its reduction state. Unlike JAX, which keeps only the
+    /// manual axes of the type's specification, the inferred sharding keeps the placement along free axes as well,
+    /// since the boundary shardings describe free axes too.
+    ///
+    /// # Errors
+    ///
+    /// Returns [`ShardMapError::InputShardingNotInferable`] for an input whose type has no sharding (the counterpart of
+    /// JAX's requirement that the manual axes be `Explicit` for the caller), [`ShardMapError::InputMeshMismatch`] for
+    /// an input sharded over a mesh whose axes differ from those of `mesh`, and the errors of [`Self::shard_map`]
+    /// otherwise.
+    fn shard_map_with_inferred_input_shardings<F, Input, Output>(
+        &self,
+        function: F,
+        inputs: Input,
+        mesh: LogicalMesh,
+        output_shardings: Output::To<Sharding>,
+        options: ShardMapOptions,
+    ) -> Result<Output::To<ProjectedValue<ArrayType, Self::Value>>, ShardMapError>
+    where
+        Input: Parameterized<ProjectedValue<ArrayType, Self::Value>>,
+        Input::Family: ParameterizedFamily<Sharding> + ParameterizedFamily<ShardMapTracer<Self>>,
+        Output: Parameterized<ShardMapTracer<Self>>,
+        Output::Family: ParameterizedFamily<Sharding> + ParameterizedFamily<ProjectedValue<ArrayType, Self::Value>>,
+        F: FnOnce(&ShardMapContext<Self>, Input::To<ShardMapTracer<Self>>) -> Result<Output, ProgramError>,
+    {
+        let input_shardings = inputs
+            .parameters()
+            .enumerate()
+            .map(|(input_index, input)| inferred_input_sharding(input_index, input.r#type().as_ref(), &mesh))
+            .collect::<Result<Vec<_>, _>>()?;
+        let input_shardings = Input::To::<Sharding>::from_parameters(inputs.parameter_structure(), input_shardings)?;
+        self.shard_map(function, inputs, mesh, input_shardings, output_shardings, options)
+    }
+
+    /// Like [`Self::shard_map`] over the single manual axis `axis_name` of `mesh`, placing the dimension of each input
+    /// that `input_axes` selects and the dimension of each output that `output_axes` selects along that axis, and
+    /// replicating every other dimension and every input or output whose axis is [`None`]. This is the analogue of
+    /// [`jax.smap`](https://docs.jax.dev/en/latest/_autosummary/jax.smap.html), whose `in_axes` and `out_axes` it
+    /// takes as `input_axes` and `output_axes` and whose manual variation it always checks. JAX takes the mesh from its
+    /// context, while this function takes it explicitly. The output shardings are derived from the output types of
+    /// the traced body, whose ranks are only known once it is traced.
+    ///
+    /// # Errors
+    ///
+    /// Returns [`ShardMapError::Parameter`] when `input_axes` does not have the structure of `inputs` or the outputs of
+    /// `function` do not have the structure of `output_axes`, [`ShardMapError::MappedAxisOutOfBounds`] for an axis
+    /// that the rank of its input or output does not have, and the errors of [`Self::shard_map`] otherwise (e.g.,
+    /// [`ShardMapError::Sharding`] when `axis_name` is not a manual axis of `mesh`).
+    fn shard_map_along<F, Input, Output>(
+        &self,
+        function: F,
+        inputs: Input,
+        mesh: LogicalMesh,
+        axis_name: &str,
+        input_axes: Input::To<Option<usize>>,
+        output_axes: Output::To<Option<usize>>,
+    ) -> Result<Output::To<ProjectedValue<ArrayType, Self::Value>>, ShardMapError>
+    where
+        Input: Parameterized<ProjectedValue<ArrayType, Self::Value>>,
+        Input::Family: ParameterizedFamily<Option<usize>> + ParameterizedFamily<ShardMapTracer<Self>>,
+        Output: Parameterized<ShardMapTracer<Self>>,
+        Output::Family:
+            ParameterizedFamily<Option<usize>> + ParameterizedFamily<ProjectedValue<ArrayType, Self::Value>>,
+        F: FnOnce(&ShardMapContext<Self>, Input::To<ShardMapTracer<Self>>) -> Result<Output, ProgramError>;
 }
 
 impl<C> ShardMap for C
@@ -3130,36 +3210,68 @@ where
         F: FnOnce(&ShardMapContext<Self>, Input::To<ShardMapTracer<Self>>) -> Result<Output, ProgramError>,
     {
         validate_parameter_structure(&inputs.parameter_paths().collect::<Vec<_>>(), &input_shardings)?;
-        let input_structure = inputs.parameter_structure();
-        let output_structure = output_shardings.parameter_structure();
         let output_paths = output_shardings.parameter_paths().collect::<Vec<_>>();
-        let global_input_types = inputs.parameters().map(|input| input.r#type().into_owned()).collect::<Vec<_>>();
-        let inputs = inputs.into_parameters().map(ProjectedValue::into_value).collect::<Vec<_>>();
-        let (boundary, outer_named_axes) = shard_map_within_named_axes(
+        let output_structure = output_shardings.parameter_structure();
+        bind_shard_map::<Self, F, Input, Output>(
+            self,
+            function,
+            inputs,
             mesh,
             input_shardings.into_parameters().collect(),
-            output_shardings.into_parameters().collect(),
-            options.manual_axes,
-            &self.named_axes(),
-        )?;
-        let boundary = boundary.with_manual_variation_checks(options.manual_variation_checks);
-        let (operation, body) = trace_shard_map_body::<Self, _>(
-            boundary,
-            |body_context, local_inputs| {
-                let local_inputs = Input::To::<ShardMapTracer<Self>>::from_parameters(input_structure, local_inputs)?;
-                let local_outputs = function(body_context, local_inputs)?;
-                validate_parameter_structure(&output_paths, &local_outputs)?;
-                Ok(local_outputs.into_parameters().collect())
+            ShardMapOutputs {
+                paths: output_paths,
+                structure: output_structure,
+                shardings: ShardMapOutputShardings::Given(output_shardings.into_parameters().collect()),
             },
-            global_input_types,
-            outer_named_axes,
-        )?;
-        let outputs = self
-            .bind(operation, vec![body], inputs.as_slice())?
-            .into_iter()
-            .map(|output| ValueProjection::<ArrayType>::into_projected(output).map_err(ProgramError::from))
+            options,
+        )
+    }
+
+    fn shard_map_along<F, Input, Output>(
+        &self,
+        function: F,
+        inputs: Input,
+        mesh: LogicalMesh,
+        axis_name: &str,
+        input_axes: Input::To<Option<usize>>,
+        output_axes: Output::To<Option<usize>>,
+    ) -> Result<Output::To<ProjectedValue<ArrayType, Self::Value>>, ShardMapError>
+    where
+        Input: Parameterized<ProjectedValue<ArrayType, Self::Value>>,
+        Input::Family: ParameterizedFamily<Option<usize>> + ParameterizedFamily<ShardMapTracer<Self>>,
+        Output: Parameterized<ShardMapTracer<Self>>,
+        Output::Family:
+            ParameterizedFamily<Option<usize>> + ParameterizedFamily<ProjectedValue<ArrayType, Self::Value>>,
+        F: FnOnce(&ShardMapContext<Self>, Input::To<ShardMapTracer<Self>>) -> Result<Output, ProgramError>,
+    {
+        validate_parameter_structure(&inputs.parameter_paths().collect::<Vec<_>>(), &input_axes)?;
+        let input_shardings = inputs
+            .parameters()
+            .zip(input_axes.into_parameters())
+            .enumerate()
+            .map(|(input_index, (input, axis))| {
+                let rank = input.r#type().rank();
+                sharding_along(&mesh, axis_name, axis, rank, ShardMapValueKind::Input, input_index)
+            })
             .collect::<Result<Vec<_>, _>>()?;
-        Ok(Output::To::<ProjectedValue<ArrayType, Self::Value>>::from_parameters(output_structure, outputs)?)
+        let output_paths = output_axes.parameter_paths().collect::<Vec<_>>();
+        let output_structure = output_axes.parameter_structure();
+        bind_shard_map::<Self, F, Input, Output>(
+            self,
+            function,
+            inputs,
+            mesh,
+            input_shardings,
+            ShardMapOutputs {
+                paths: output_paths,
+                structure: output_structure,
+                shardings: ShardMapOutputShardings::Along {
+                    axis_name: axis_name.to_string(),
+                    axes: output_axes.into_parameters().collect(),
+                },
+            },
+            ShardMapOptions::new().with_manual_axes([axis_name]),
+        )
     }
 }
 
@@ -3217,6 +3329,89 @@ where
     )
 }
 
+/// Invokes a manual SPMD computation over `mesh` on `inputs` like [`shard_map`], using the sharding of each input's
+/// type as its input sharding (i.e., JAX's default `in_specs=Infer`). It binds the computation in the
+/// [`Domain`](Value::Domain) of the first input through the `shard_map_with_inferred_input_shardings` function of
+/// [`ShardMap`], whose documentation describes the inference.
+///
+/// # Errors
+///
+/// Returns [`ShardMapError::MissingInputContext`] when `inputs` has no leaves, and the errors of the
+/// `shard_map_with_inferred_input_shardings` function of [`ShardMap`] otherwise.
+pub fn shard_map_with_inferred_input_shardings<V, F, Input, Output>(
+    function: F,
+    inputs: Input,
+    mesh: LogicalMesh,
+    output_shardings: Output::To<Sharding>,
+    options: ShardMapOptions,
+) -> Result<Output::To<ProjectedValue<ArrayType, V>>, ShardMapError>
+where
+    V: Value<Domain: ShardMap<Value = V>>,
+    Input: Parameterized<ProjectedValue<ArrayType, V>>,
+    Input::Family: ParameterizedFamily<Sharding> + ParameterizedFamily<ShardMapTracer<V::Domain>>,
+    Output: Parameterized<ShardMapTracer<V::Domain>>,
+    Output::Family: ParameterizedFamily<Sharding> + ParameterizedFamily<ProjectedValue<ArrayType, V>>,
+    F: FnOnce(Input::To<ShardMapTracer<V::Domain>>) -> Result<Output, ProgramError>,
+{
+    let context = inputs
+        .parameters()
+        .next()
+        .map(|input| input.value().domain())
+        .ok_or(ShardMapError::MissingInputContext)?;
+    context.shard_map_with_inferred_input_shardings(
+        |_, local_inputs| function(local_inputs),
+        inputs,
+        mesh,
+        output_shardings,
+        options,
+    )
+}
+
+/// Invokes a manual SPMD computation over the single manual axis `axis_name` of `mesh` on `inputs`, placing the
+/// dimensions that `input_axes` and `output_axes` select along that axis. This is the analogue of
+/// [`jax.smap`](https://docs.jax.dev/en/latest/_autosummary/jax.smap.html). It binds the computation in the
+/// [`Domain`](Value::Domain) of the first input through the `shard_map_along` function of [`ShardMap`], whose
+/// documentation describes the complete semantics.
+///
+/// # Parameters
+///
+///   - `function`: Body function traced over the local shards of `inputs`.
+///   - `inputs`: Structured global input values, whose leaves are array projections of array IR values.
+///   - `mesh`: Logical mesh that the manual computation is defined over.
+///   - `axis_name`: Manual axis of `mesh` that the computation makes manual.
+///   - `input_axes`: Dimension of each input to place along `axis_name`, or [`None`] to replicate the input, with the
+///     same structure as `inputs` (i.e., JAX's `in_axes`).
+///   - `output_axes`: Dimension of each output to place along `axis_name`, or [`None`] for a replicated output, with
+///     the same structure as the outputs of `function` (i.e., JAX's `out_axes`).
+///
+/// # Errors
+///
+/// Returns [`ShardMapError::MissingInputContext`] when `inputs` has no leaves, and the errors of the `shard_map_along`
+/// function of [`ShardMap`] otherwise.
+pub fn shard_map_along<V, F, Input, Output>(
+    function: F,
+    inputs: Input,
+    mesh: LogicalMesh,
+    axis_name: &str,
+    input_axes: Input::To<Option<usize>>,
+    output_axes: Output::To<Option<usize>>,
+) -> Result<Output::To<ProjectedValue<ArrayType, V>>, ShardMapError>
+where
+    V: Value<Domain: ShardMap<Value = V>>,
+    Input: Parameterized<ProjectedValue<ArrayType, V>>,
+    Input::Family: ParameterizedFamily<Option<usize>> + ParameterizedFamily<ShardMapTracer<V::Domain>>,
+    Output: Parameterized<ShardMapTracer<V::Domain>>,
+    Output::Family: ParameterizedFamily<Option<usize>> + ParameterizedFamily<ProjectedValue<ArrayType, V>>,
+    F: FnOnce(Input::To<ShardMapTracer<V::Domain>>) -> Result<Output, ProgramError>,
+{
+    let context = inputs
+        .parameters()
+        .next()
+        .map(|input| input.value().domain())
+        .ok_or(ShardMapError::MissingInputContext)?;
+    context.shard_map_along(|_, local_inputs| function(local_inputs), inputs, mesh, axis_name, input_axes, output_axes)
+}
+
 /// Static manual-variation checking policy shared by the boundary and closure options. Its two switches are stored
 /// independently, so the builders that set them commute. Output replication is proven only when the body's manual
 /// variation is checked as well, because an unchecked body carries no variation from which to prove it, so the policy
@@ -3264,6 +3459,28 @@ impl Hash for ManualVariationChecks {
     fn hash<H: Hasher>(&self, state: &mut H) {
         (self.check_manual_variation(), self.check_output_replication()).hash(state);
     }
+}
+
+/// Source of the output shardings of a closure-traced `shard_map` (refer to [`bind_shard_map`]).
+enum ShardMapOutputShardings {
+    /// Output shardings that the caller provides.
+    Given(Vec<Sharding>),
+
+    /// Output shardings that place the dimension `axes[index]` of output `index` along the manual axis `axis_name`, or
+    /// replicate the output when it is [`None`], which are derived from the output ranks once the body is traced.
+    Along { axis_name: String, axes: Vec<Option<usize>> },
+}
+
+/// Outputs of a closure-traced `shard_map` (refer to [`bind_shard_map`]).
+struct ShardMapOutputs<S> {
+    /// Parameter paths that the outputs of the body must have.
+    paths: Vec<ParameterPath>,
+
+    /// Parameter structure of the outputs, which assembles the global outputs.
+    structure: S,
+
+    /// Source of the output shardings.
+    shardings: ShardMapOutputShardings,
 }
 
 /// Active manual axes requested for a [`ShardMapBoundary`].
@@ -6502,6 +6719,137 @@ fn validate_parameter_structure<P: Parameter, Value: Parameterized<P>>(
     Ok(())
 }
 
+/// Returns the input sharding that the `shard_map_with_inferred_input_shardings` function of [`ShardMap`] infers for
+/// input `input_index` of type `input_type` over `mesh`, which is the sharding of that type re-expressed over `mesh`
+/// with its placement and reduction state but without its manual variation, which enclosing manual regions own.
+fn inferred_input_sharding(
+    input_index: usize,
+    input_type: &ArrayType,
+    mesh: &LogicalMesh,
+) -> Result<Sharding, ShardMapError> {
+    let Some(sharding) = input_type.sharding() else {
+        return Err(ShardMapError::InputShardingNotInferable { input_index, input_type: input_type.clone() });
+    };
+    if !sharding.mesh().has_same_topology(mesh) {
+        return Err(ShardMapError::InputMeshMismatch {
+            input_index,
+            expected: mesh.clone(),
+            actual: sharding.mesh().clone(),
+        });
+    }
+    Ok(Sharding::new(mesh.clone(), sharding.dimensions().to_vec())?
+        .with_unreduced_axes(sharding.unreduced_axes().clone())?
+        .with_reduced_axes(sharding.reduced_axes().clone())?)
+}
+
+/// Returns the sharding over `mesh` of a rank-`rank` value that the `shard_map_along` function of [`ShardMap`] places
+/// along `axis_name` at dimension `axis`, which replicates every other dimension, or replicates the whole value when
+/// `axis` is [`None`].
+fn sharding_along(
+    mesh: &LogicalMesh,
+    axis_name: &str,
+    axis: Option<usize>,
+    rank: usize,
+    value_kind: ShardMapValueKind,
+    value_index: usize,
+) -> Result<Sharding, ShardMapError> {
+    let mut dimensions = vec![ShardingDimension::Replicated; rank];
+    if let Some(axis) = axis {
+        let dimension = dimensions.get_mut(axis).ok_or(ShardMapError::MappedAxisOutOfBounds {
+            value_kind,
+            value_index,
+            axis,
+            rank,
+        })?;
+        *dimension = ShardingDimension::sharded([axis_name]);
+    }
+    Ok(Sharding::new(mesh.clone(), dimensions)?)
+}
+
+/// Traces `function` as the local body of a `shard_map` over `mesh` on `inputs` in `context` and binds it there,
+/// which is the shared implementation of the `shard_map` and `shard_map_along` functions of [`ShardMap`]. The boundary
+/// of a map whose output shardings are [`ShardMapOutputShardings::Along`] starts without outputs, since the output
+/// ranks are only known once the body is traced, and is rebuilt from the output types of the body.
+fn bind_shard_map<C, F, Input, Output>(
+    context: &C,
+    function: F,
+    inputs: Input,
+    mesh: LogicalMesh,
+    input_shardings: Vec<Sharding>,
+    outputs: ShardMapOutputs<Output::ParameterStructure>,
+    options: ShardMapOptions,
+) -> Result<Output::To<ProjectedValue<ArrayType, C::Value>>, ShardMapError>
+where
+    TracingContext<C::Constant, C::Operation>:
+        StagingContext<Type = ArrayIrType, Constant = C::Constant, Operation = C::Operation>,
+    C: Context<Type = ArrayIrType, Operation: From<ShardMapOperation> + OperationPayloadProjection> + NamedAxes,
+    C::Value: ValueProjection<ArrayType, Projected = ProjectedValue<ArrayType, C::Value>>,
+    ShardMapTracer<C>: ParallelVary,
+    Input: Parameterized<ProjectedValue<ArrayType, C::Value>>,
+    Input::Family: ParameterizedFamily<ShardMapTracer<C>>,
+    Output: Parameterized<ShardMapTracer<C>>,
+    Output::Family: ParameterizedFamily<ProjectedValue<ArrayType, C::Value>>,
+    F: FnOnce(&ShardMapContext<C>, Input::To<ShardMapTracer<C>>) -> Result<Output, ProgramError>,
+{
+    let ShardMapOutputs { paths: output_paths, structure: output_structure, shardings: output_shardings } = outputs;
+    let input_structure = inputs.parameter_structure();
+    let global_input_types = inputs.parameters().map(|input| input.r#type().into_owned()).collect::<Vec<_>>();
+    let inputs = inputs.into_parameters().map(ProjectedValue::into_value).collect::<Vec<_>>();
+    let named_axes = context.named_axes();
+    let checks = options.manual_variation_checks;
+    let (initial_output_shardings, output_axes) = match output_shardings {
+        ShardMapOutputShardings::Given(shardings) => (shardings, None),
+        ShardMapOutputShardings::Along { axis_name, axes } => (Vec::new(), Some((axis_name, axes))),
+    };
+    let (boundary, outer_named_axes) = shard_map_within_named_axes(
+        mesh.clone(),
+        input_shardings.clone(),
+        initial_output_shardings,
+        options.manual_axes.clone(),
+        &named_axes,
+    )?;
+    let boundary = boundary.with_manual_variation_checks(checks);
+    let rebuild_boundary = output_axes.map(|(axis_name, axes)| {
+        move |output_types: &[ArrayType]| -> Result<ShardMapBoundary, ShardMapError> {
+            let output_shardings = axes
+                .iter()
+                .zip(output_types)
+                .enumerate()
+                .map(|(output_index, (axis, output_type))| {
+                    let rank = output_type.rank();
+                    sharding_along(&mesh, &axis_name, *axis, rank, ShardMapValueKind::Output, output_index)
+                })
+                .collect::<Result<Vec<_>, _>>()?;
+            let (boundary, _) = shard_map_within_named_axes(
+                mesh.clone(),
+                input_shardings.clone(),
+                output_shardings,
+                options.manual_axes.clone(),
+                &named_axes,
+            )?;
+            Ok(boundary.with_manual_variation_checks(checks))
+        }
+    });
+    let (operation, body) = trace_shard_map_body::<C, _>(
+        boundary,
+        |body_context, local_inputs| {
+            let local_inputs = Input::To::<ShardMapTracer<C>>::from_parameters(input_structure, local_inputs)?;
+            let local_outputs = function(body_context, local_inputs)?;
+            validate_parameter_structure(&output_paths, &local_outputs)?;
+            Ok(local_outputs.into_parameters().collect())
+        },
+        rebuild_boundary.as_ref().map(|rebuild| rebuild as &dyn Fn(&[ArrayType]) -> Result<_, _>),
+        global_input_types,
+        outer_named_axes,
+    )?;
+    let outputs = context
+        .bind(operation, vec![body], inputs.as_slice())?
+        .into_iter()
+        .map(|output| ValueProjection::<ArrayType>::into_projected(output).map_err(ProgramError::from))
+        .collect::<Result<Vec<_>, _>>()?;
+    Ok(Output::To::<ProjectedValue<ArrayType, C::Value>>::from_parameters(output_structure, outputs)?)
+}
+
 /// Builds the [`ShardMapBoundary`] of a closure-traced `shard_map` that is bound in the scope of named axes
 /// `named_axes` (innermost first, as returned by [`NamedAxes::named_axes`]), and returns it together with the enclosing
 /// bindings that its body inherits. These are, first, the [`NamedAxis::Mesh`] bindings of `named_axes` whose names are
@@ -6570,6 +6918,9 @@ fn shard_map_within_named_axes(
 ///
 ///   - `boundary`: Boundary metadata of the traced body.
 ///   - `function`: Flat body closure over the body context and the local `shard_map` values.
+///   - `rebuild_boundary`: Optional function that rebuilds `boundary` from the local output types of the body, for a
+///     map whose output shardings depend on its output ranks (refer to the `shard_map_along` function of
+///     [`ShardMap`]). It replaces `boundary` once `function` returns.
 ///   - `global_input_types`: Caller's global input types, in the order of the input shardings.
 ///   - `outer_named_axes`: Enclosing bindings of named axes that the body inherits.
 #[inline]
@@ -6579,6 +6930,7 @@ fn trace_shard_map_body<
 >(
     boundary: ShardMapBoundary,
     function: F,
+    rebuild_boundary: Option<&dyn Fn(&[ArrayType]) -> Result<ShardMapBoundary, ShardMapError>>,
     global_input_types: Vec<ArrayType>,
     outer_named_axes: Vec<(String, NamedAxis)>,
 ) -> Result<(ShardMapOperation, FlatProgram<C>), ShardMapError>
@@ -6597,6 +6949,7 @@ where
             &ShardMapContext<C>,
             Vec<ShardMapTracer<C>>,
         ) -> Result<Vec<ShardMapTracer<C>>, ProgramError>,
+        rebuild_boundary: Option<&dyn Fn(&[ArrayType]) -> Result<ShardMapBoundary, ShardMapError>>,
         global_input_types: Vec<ArrayType>,
         mut outer_named_axes: Vec<(String, NamedAxis)>,
     ) -> Result<(ShardMapOperation, FlatProgram<C>), ShardMapError>
@@ -6638,15 +6991,28 @@ where
             (name.clone(), binding)
         }));
 
+        // The body's outputs determine the rebuilt boundary, which the checks below then use in place of `boundary`.
+        let rebuilt_boundary = OnceCell::new();
         let (_, body) = DomainTracingContext::<C>::trace_with_context_and_named_axes(
             |context: &DomainTracingContext<C>, local_inputs: Vec<DomainTracer<C>>| {
                 let local_inputs = local_inputs
                     .into_iter()
                     .map(|input| ValueProjection::<ArrayType>::into_projected(input).map_err(ProgramError::from))
                     .collect::<Result<Vec<_>, _>>()?;
+                let local_outputs = function(&ShardMapContext::<C>::new(context.clone()), local_inputs)?;
+                let boundary = match rebuild_boundary {
+                    Some(rebuild_boundary) => {
+                        let output_types =
+                            local_outputs.iter().map(|output| output.r#type().into_owned()).collect::<Vec<_>>();
+                        let _ = rebuilt_boundary.set(rebuild_boundary(&output_types)?);
+                        rebuilt_boundary.get().unwrap()
+                    }
+                    None => &boundary,
+                };
+
                 // Outputs beyond the output shardings are kept as they are, so that `from_program` reports the count
                 // mismatch below.
-                function(&ShardMapContext::<C>::new(context.clone()), local_inputs)?
+                local_outputs
                     .into_iter()
                     .enumerate()
                     .map(|(index, mut output)| {
@@ -6669,6 +7035,7 @@ where
             local_input_types.iter().cloned().map(ArrayIrType::Array).collect::<Vec<_>>(),
             outer_named_axes,
         )?;
+        let boundary = rebuilt_boundary.into_inner().unwrap_or(boundary);
         let body = body.simplified()?;
         let operation = ShardMapOperation::from_program(
             &body,
@@ -6682,6 +7049,7 @@ where
     inner::<C>(
         boundary,
         &mut |context, inputs| function.take().unwrap()(context, inputs),
+        rebuild_boundary,
         global_input_types,
         outer_named_axes,
     )
@@ -24028,6 +24396,364 @@ mod tests {
                 ]
                 in (%1)"
             },
+        );
+    }
+
+    #[test]
+    fn test_shard_map_with_inferred_input_shardings() {
+        // The inputs are typed over an `Explicit` copy of the mesh of the map, as under JAX's explicit sharding mode, and
+        // their shardings are re-expressed over the mesh of the map as its input shardings. The body adds the local
+        // shard of the sharded input to the whole replicated input.
+        let mesh = manual_mesh();
+        let caller_mesh = LogicalMesh::new(vec![MeshAxis::new("x", 2, MeshAxisType::Explicit).unwrap()]).unwrap();
+        let sharded_type = f32_vector_type(4)
+            .with_sharding(Sharding::new(caller_mesh.clone(), vec![ShardingDimension::sharded(["x"])]).unwrap())
+            .unwrap();
+        let replicated_type = f32_vector_type(2).with_sharding(Sharding::replicated(caller_mesh, 1)).unwrap();
+        let program = trace_test_program(
+            |inputs| {
+                vec![
+                    shard_map_with_inferred_input_shardings(
+                        |(lhs, rhs): (TestTracer, TestTracer)| Ok(lhs + rhs),
+                        (inputs[0].clone(), inputs[1].clone()),
+                        mesh.clone(),
+                        sharded_along_x(),
+                        ShardMapOptions::new(),
+                    )
+                    .unwrap(),
+                ]
+            },
+            vec![sharded_type.clone(), replicated_type.clone()],
+            Vec::new(),
+        );
+        let sharded = "{mesh<['x'=2:manual]>, [{'x'}]}";
+        let replicated = "{mesh<['x'=2:manual]>, [{}]}";
+        let local = "f32[2][sharding={mesh<['x'=2:manual]>, [{}], varying_manual={'x'}}]";
+        assert_eq!(
+            program.to_string(),
+            formatdoc! {"
+                lambda %0:{sharded_type}, %1:{replicated_type} .
+                let %2:f32[4][sharding={sharded}] = shard_map [
+                    mesh=['x'=2:manual],
+                    input_shardings=[{sharded}, {replicated}],
+                    output_shardings=[{sharded}],
+                    manual_axes=['x'],
+                    global_input_types=[f32[4][sharding={sharded}], f32[2][sharding={replicated}]],
+                    global_output_types=[f32[4][sharding={sharded}]],
+                ] %0 %1 [
+                    body={{
+                        lambda %0:{local}, %1:f32[2][sharding={replicated}] .
+                        let %2:{local} = parallel_vary [axis_name=\"x\"] %1
+                            %3:{local} = add %0 %2
+                        in (%3)
+                    }},
+                ]
+                in (%2)"
+            },
+        );
+        assert_eq!(
+            arrays_f64(
+                program
+                    .interpret(vec![
+                        f32_value(sharded_type, &[1.0, 2.0, 3.0, 4.0]),
+                        f32_value(replicated_type, &[10.0, 20.0]),
+                    ])
+                    .unwrap(),
+            ),
+            vec![vec![11.0, 22.0, 13.0, 24.0]],
+        );
+    }
+
+    #[test]
+    fn test_shard_map_with_inferred_input_shardings_keeps_reduction_state() {
+        // A reduced input keeps its reduced state in the inferred input sharding.
+        let mesh = manual_mesh();
+        let reduced = Sharding::replicated(mesh.clone(), 1).with_reduced_axes(["x"]).unwrap();
+        let program = trace_test_program(
+            |inputs| {
+                vec![
+                    shard_map_with_inferred_input_shardings(
+                        |x: TestTracer| Ok(x.exp()?),
+                        inputs[0].clone(),
+                        mesh.clone(),
+                        Sharding::replicated(mesh.clone(), 1),
+                        ShardMapOptions::new().with_check_manual_variation(false),
+                    )
+                    .unwrap(),
+                ]
+            },
+            vec![f32_vector_type(2).with_sharding(reduced).unwrap()],
+            Vec::new(),
+        );
+        let reduced = "{mesh<['x'=2:manual]>, [{}], reduced={'x'}}";
+        let replicated = "{mesh<['x'=2:manual]>, [{}]}";
+        assert_eq!(
+            program.to_string(),
+            formatdoc! {"
+                lambda %0:f32[2][sharding={reduced}] .
+                let %1:f32[2][sharding={replicated}] = shard_map [
+                    mesh=['x'=2:manual],
+                    input_shardings=[{reduced}],
+                    output_shardings=[{replicated}],
+                    manual_axes=['x'],
+                    check_manual_variation=false,
+                    global_input_types=[f32[2][sharding={reduced}]],
+                    global_output_types=[f32[2][sharding={replicated}]],
+                ] %0 [
+                    body={{
+                        lambda %0:f32[2][sharding={replicated}] .
+                        let %1:f32[2][sharding={replicated}] = exp %0
+                        in (%1)
+                    }},
+                ]
+                in (%1)"
+            },
+        );
+    }
+
+    #[test]
+    fn test_shard_map_with_inferred_input_shardings_rejects_uninferable_inputs() {
+        // An input type without a sharding has nothing to infer from, and one placed over another mesh has no
+        // placement over the mesh of the map.
+        let mesh = manual_mesh();
+        let other_mesh = LogicalMesh::new(vec![MeshAxis::new("y", 2, MeshAxisType::Explicit).unwrap()]).unwrap();
+        let other_type = f32_vector_type(4).with_sharding(Sharding::replicated(other_mesh.clone(), 1)).unwrap();
+        for (input_type, expected) in [
+            (
+                f32_vector_type(4),
+                ShardMapError::InputShardingNotInferable { input_index: 0, input_type: f32_vector_type(4) },
+            ),
+            (
+                other_type,
+                ShardMapError::InputMeshMismatch { input_index: 0, expected: mesh.clone(), actual: other_mesh.clone() },
+            ),
+        ] {
+            trace_test_program(
+                |inputs| {
+                    assert_eq!(
+                        shard_map_with_inferred_input_shardings(
+                            |x: TestTracer| Ok(x),
+                            inputs[0].clone(),
+                            mesh.clone(),
+                            sharded_along_x(),
+                            ShardMapOptions::new(),
+                        )
+                        .map(|_| ()),
+                        Err(expected.clone()),
+                    );
+                    vec![inputs[0].clone()]
+                },
+                vec![input_type.clone()],
+                Vec::new(),
+            );
+        }
+        assert_eq!(
+            ShardMapError::InputShardingNotInferable { input_index: 0, input_type: f32_vector_type(4) }.to_string(),
+            "the sharding of `shard_map` input #0 cannot be inferred because its type `f32[4]` has no sharding",
+        );
+    }
+
+    #[test]
+    fn test_shard_map_along() {
+        // The matrix is mapped along `x` at its dimension 0 and the vector is replicated. The body returns the local
+        // rows twice, placing them at dimension 0 and at dimension 1 of the two outputs, and returns the replicated
+        // vector as a replicated output.
+        let mesh = manual_mesh();
+        let matrix_type = ArrayType::new_static(DataType::F32, [4, 3]);
+        let program = trace_test_program(
+            |inputs| {
+                let (rows, columns, vector) = shard_map_along(
+                    |(matrix, vector): (TestTracer, TestTracer)| Ok((matrix.clone(), matrix, vector)),
+                    (inputs[0].clone(), inputs[1].clone()),
+                    mesh.clone(),
+                    "x",
+                    (Some(0), None),
+                    (Some(0), Some(1), None),
+                )
+                .unwrap();
+                vec![rows, columns, vector]
+            },
+            vec![matrix_type.clone(), f32_vector_type(3)],
+            Vec::new(),
+        );
+        let rows = "{mesh<['x'=2:manual]>, [{'x'}, {}]}";
+        let columns = "{mesh<['x'=2:manual]>, [{}, {'x'}]}";
+        let replicated = "{mesh<['x'=2:manual]>, [{}]}";
+        let local = "f32[2, 3][sharding={mesh<['x'=2:manual]>, [{}, {}], varying_manual={'x'}}]";
+        assert_eq!(
+            program.to_string(),
+            formatdoc! {"
+                lambda %0:f32[4, 3], %1:f32[3] .
+                let %2:f32[4, 3][sharding={rows}], %3:f32[2, 6][sharding={columns}], %4:f32[3][sharding={replicated}] = \
+                    shard_map [
+                    mesh=['x'=2:manual],
+                    input_shardings=[{rows}, {replicated}],
+                    output_shardings=[{rows}, {columns}, {replicated}],
+                    manual_axes=['x'],
+                    global_input_types=[f32[4, 3][sharding={rows}], f32[3][sharding={replicated}]],
+                    global_output_types=[f32[4, 3][sharding={rows}], f32[2, 6][sharding={columns}], \
+                        f32[3][sharding={replicated}]],
+                ] %0 %1 [
+                    body={{
+                        lambda %0:{local}, %1:f32[3][sharding={replicated}] .
+                        in (%0, %0, %1)
+                    }},
+                ]
+                in (%2, %3, %4)"
+            },
+        );
+        let elements = (0..12).map(|element| element as f32).collect::<Vec<_>>();
+        assert_eq!(
+            arrays_f64(
+                program
+                    .interpret(vec![f32_value(matrix_type, &elements), f32_value(f32_vector_type(3), &[7.0, 8.0, 9.0])])
+                    .unwrap(),
+            ),
+            vec![
+                (0..12).map(f64::from).collect::<Vec<_>>(),
+                vec![0.0, 1.0, 2.0, 6.0, 7.0, 8.0, 3.0, 4.0, 5.0, 9.0, 10.0, 11.0],
+                vec![7.0, 8.0, 9.0],
+            ],
+        );
+    }
+
+    #[test]
+    fn test_shard_map_along_selects_one_manual_axis() {
+        // Mapping along `y` of the 2x2 mesh makes only `y` manual, so `x` stays a free axis.
+        let mesh = manual_mesh_2x2();
+        let program = trace_test_program(
+            |inputs| {
+                vec![
+                    shard_map_along(
+                        |x: TestTracer| Ok(x.clone() + x),
+                        inputs[0].clone(),
+                        mesh.clone(),
+                        "y",
+                        Some(0),
+                        Some(0),
+                    )
+                    .unwrap(),
+                ]
+            },
+            vec![f32_vector_type(4)],
+            Vec::new(),
+        );
+        let sharding = "{mesh<['x'=2:manual, 'y'=2:manual]>, [{'y'}]}";
+        let local = "f32[2][sharding={mesh<['x'=2:manual, 'y'=2:manual]>, [{}], varying_manual={'y'}}]";
+        assert_eq!(
+            program.to_string(),
+            formatdoc! {"
+                lambda %0:f32[4] .
+                let %1:f32[4][sharding={sharding}] = shard_map [
+                    mesh=['x'=2:manual, 'y'=2:manual],
+                    input_shardings=[{sharding}],
+                    output_shardings=[{sharding}],
+                    manual_axes=['y'],
+                    global_input_types=[f32[4][sharding={sharding}]],
+                    global_output_types=[f32[4][sharding={sharding}]],
+                ] %0 [
+                    body={{
+                        lambda %0:{local} .
+                        let %1:{local} = add %0 %0
+                        in (%1)
+                    }},
+                ]
+                in (%1)"
+            },
+        );
+    }
+
+    #[test]
+    fn test_shard_map_along_rejects_out_of_range_axes() {
+        let mesh = manual_mesh();
+        for (input_axis, output_axis, expected) in [
+            (
+                Some(1),
+                Some(0),
+                ShardMapError::MappedAxisOutOfBounds {
+                    value_kind: ShardMapValueKind::Input,
+                    value_index: 0,
+                    axis: 1,
+                    rank: 1,
+                },
+            ),
+            (
+                Some(0),
+                Some(2),
+                ShardMapError::MappedAxisOutOfBounds {
+                    value_kind: ShardMapValueKind::Output,
+                    value_index: 0,
+                    axis: 2,
+                    rank: 1,
+                },
+            ),
+        ] {
+            trace_test_program(
+                |inputs| {
+                    assert_eq!(
+                        shard_map_along(
+                            |x: TestTracer| Ok(x),
+                            inputs[0].clone(),
+                            mesh.clone(),
+                            "x",
+                            input_axis,
+                            output_axis,
+                        )
+                        .map(|_| ()),
+                        Err(expected.clone()),
+                    );
+                    vec![inputs[0].clone()]
+                },
+                vec![f32_vector_type(4)],
+                Vec::new(),
+            );
+        }
+        assert_eq!(
+            ShardMapError::MappedAxisOutOfBounds {
+                value_kind: ShardMapValueKind::Output,
+                value_index: 0,
+                axis: 2,
+                rank: 1,
+            }
+            .to_string(),
+            "`shard_map` output #0 has rank 1, so it has no dimension 2 to place along its manual axis",
+        );
+    }
+
+    #[test]
+    fn test_shard_map_along_batching_and_differentiation() {
+        // Batching a map along `x` over three items matches the map applied to each item, and the gradient of the sum of
+        // `sin` mapped along `x` is `cos`.
+        let mesh = manual_mesh();
+        let elements = (0..12).map(|element| element as f32 / 4.0).collect::<Vec<_>>();
+        let items = f32_value(ArrayType::new_static(DataType::F32, [3, 4]), &elements);
+        let batched = batch(
+            |item| {
+                let item = ValueProjection::<ArrayType>::into_projected(item)?;
+                let output = shard_map_along(|x: TestTracer| x.sin(), item, mesh.clone(), "x", Some(0), Some(0))?;
+                Ok(output.into_value())
+            },
+            items,
+            BatchAxis::new(0),
+            BatchAxis::new(0),
+            BatchAxisSpecification::default(),
+        )
+        .unwrap();
+        assert_eq!(
+            arrays_f64(vec![batched]),
+            vec![elements.iter().map(|element| f64::from(f32::sin(*element))).collect::<Vec<_>>()],
+        );
+        let input = f32_value(f32_vector_type(4), &elements[..4]);
+        let gradient = differentiate_at(input)
+            .gradient(|input| {
+                let input = ValueProjection::<ArrayType>::into_projected(input)?;
+                let output = shard_map_along(|x: TestTracer| x.sin(), input, mesh.clone(), "x", Some(0), Some(0))?;
+                Ok(output.reduce(&[0], ReductionKind::Sum)?.into_value())
+            })
+            .unwrap();
+        assert_eq!(
+            arrays_f64(vec![gradient]),
+            vec![elements[..4].iter().map(|element| f64::from(f32::cos(*element))).collect::<Vec<_>>()],
         );
     }
 }

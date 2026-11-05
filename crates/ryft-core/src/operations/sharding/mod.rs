@@ -25,10 +25,12 @@
 //!     select these axes. The body receives the local shards that the input shardings assign to the executing device,
 //!     and the global outputs are assembled from its local outputs through the output shardings. The body function of
 //!     [`ShardMap`] also receives the [`ShardMapContext`] of the body, through which bodies without inputs can create
-//!     values (e.g., device coordinates along manual axes). Like every other operation, a `shard_map` is traced without
-//!     values by invoking it on tracers (e.g., through [`trace`](crate::trace)). Refer to the
-//!     [`shard_map`](mod@shard_map) module for its complete semantics, including the ownership
-//!     contract for references that cross its boundary.
+//!     values (e.g., device coordinates along manual axes). The global [`shard_map_with_inferred_input_shardings()`]
+//!     function takes the input shardings from the input types, and the global [`shard_map_along()`] function maps
+//!     over a single manual axis, placing selected dimensions of its inputs and outputs along it. Like every other
+//!     operation, a `shard_map` is traced without values by invoking it on tracers (e.g., through
+//!     [`trace`](crate::trace)). Refer to the [`shard_map`](mod@shard_map) module for its complete
+//!     semantics, including the ownership contract for references that cross its boundary.
 //!
 //! Batching lifts the reshard and the sharding constraint by inserting an entry for the new batch axis into the
 //! target sharding (i.e., a reshard takes the mapped axis's own sharding, whereas a constraint leaves the new axis
@@ -104,7 +106,8 @@ pub use constrain_sharding::{
 pub use reshard::{RESHARD_OPERATION_NAME, Reshard, ReshardDispatch, ReshardOperation};
 pub use shard_map::{
     SHARD_MAP_OPERATION_NAME, ShardMap, ShardMapBoundary, ShardMapContext, ShardMapError, ShardMapOperation,
-    ShardMapOptions, ShardMapTracer, ShardMapValueKind, shard_map,
+    ShardMapOptions, ShardMapTracer, ShardMapValueKind, shard_map, shard_map_along,
+    shard_map_with_inferred_input_shardings,
 };
 
 /// Group of the sharding-control capabilities [`Reshard`] and [`ConstrainSharding`]. It is implemented automatically
