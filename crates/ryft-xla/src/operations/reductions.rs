@@ -17,7 +17,7 @@ use crate::experimental::lowering::types::{
 };
 use crate::operations::comparisons::lower_compare_to_mlir;
 use crate::operations::extrema::lower_extremum_to_mlir;
-use crate::{Error, LowerableOperation, LowerableOperationFamily, LoweringError, XlaLowerer};
+use crate::{Error, LowerableOperation, LowerableOperationFamily, Lowerer, LoweringError};
 
 /// Lowers an [`ArgMaxOperation`] (when `maximize` is `true`) or an [`ArgMinOperation`] along `axis` to a variadic
 /// `stablehlo.reduce` over the input and a `stablehlo.iota` of its indices along `axis`, returning the reduced indices.
@@ -622,7 +622,7 @@ fn integer_reduction_identity_bounds(data_type: DataType) -> Option<(i64, i64)> 
 impl LowerableOperation for ReduceOperation {
     fn lower<'b, 'c: 'b, 't: 'c, O: LowerableOperationFamily>(
         &self,
-        lowerer: &mut XlaLowerer<'b, 'c, 't, O>,
+        lowerer: &mut Lowerer<'b, 'c, 't, O>,
         input_values: &[ValueRef<'b, 'c, 't>],
         _input_types: &[ArrayType],
         output_types: &[ArrayType],
@@ -644,7 +644,7 @@ impl LowerableOperation for ReduceOperation {
 impl LowerableOperation for ArgMaxOperation {
     fn lower<'b, 'c: 'b, 't: 'c, O: LowerableOperationFamily>(
         &self,
-        lowerer: &mut XlaLowerer<'b, 'c, 't, O>,
+        lowerer: &mut Lowerer<'b, 'c, 't, O>,
         input_values: &[ValueRef<'b, 'c, 't>],
         input_types: &[ArrayType],
         output_types: &[ArrayType],
@@ -667,7 +667,7 @@ impl LowerableOperation for ArgMaxOperation {
 impl LowerableOperation for ArgMinOperation {
     fn lower<'b, 'c: 'b, 't: 'c, O: LowerableOperationFamily>(
         &self,
-        lowerer: &mut XlaLowerer<'b, 'c, 't, O>,
+        lowerer: &mut Lowerer<'b, 'c, 't, O>,
         input_values: &[ValueRef<'b, 'c, 't>],
         input_types: &[ArrayType],
         output_types: &[ArrayType],
@@ -692,14 +692,15 @@ mod tests {
     use indoc::indoc;
     use pretty_assertions::assert_eq;
     use ryft_core::{
-        ArrayOperation, Dimension, DimensionBounds, DimensionVariable, Instruction, Placeholder, ReduceOperation, Shape,
+        ArrayOperation, Dimension as CoreDimension, DimensionBounds, DimensionVariable, Instruction, Placeholder,
+        ReduceOperation, Shape,
     };
 
     use crate::experimental::lowering::tests::{
-        XlaProgramBuilder, lowered_reduce_module, lowered_unary_module, unproject_plain_program,
+        ProgramBuilder, lowered_reduce_module, lowered_unary_module, unproject_plain_program,
     };
     use crate::experimental::lowering::to_mlir_module_for_plain_program;
-    use crate::experimental::ops::XlaArrayConstant;
+    use crate::experimental::ops::ArrayConstant;
     use crate::to_mlir_module_for_program;
 
     use super::*;
@@ -814,7 +815,7 @@ mod tests {
     #[test]
     fn test_to_mlir_module_for_plain_program_log_sum_exp_requires_negative_infinity() {
         // A valid pairwise identity is insufficient for max-shifted padding, including in unchecked programs.
-        let mut builder = XlaProgramBuilder::new();
+        let mut builder = ProgramBuilder::new();
         let input = builder.add_input(ArrayType::new_static(DataType::F8E4M3FN, [4]));
         let output = builder.add_variable(ArrayType::scalar(DataType::F8E4M3FN));
         builder.add_instruction_unchecked(Instruction::new(
@@ -824,7 +825,7 @@ mod tests {
             Vec::new(),
         ));
         let program = builder
-            .build::<Vec<XlaArrayConstant>, Vec<XlaArrayConstant>>(vec![output], vec![Placeholder], vec![Placeholder])
+            .build::<Vec<ArrayConstant>, Vec<ArrayConstant>>(vec![output], vec![Placeholder], vec![Placeholder])
             .unwrap();
         assert!(matches!(
             to_mlir_module_for_plain_program(&program, "main"),
@@ -837,8 +838,8 @@ mod tests {
     fn test_to_mlir_module_for_plain_program_preserves_dynamic_reduce_axes() {
         let batch = DimensionVariable::new("batch", DimensionBounds::new(1, Some(5)).unwrap());
         let input_type =
-            ArrayType::new(DataType::F32, Shape::new(vec![Dimension::Dynamic(batch), Dimension::Static(3)]));
-        let mut builder = XlaProgramBuilder::new();
+            ArrayType::new(DataType::F32, Shape::new(vec![CoreDimension::Dynamic(batch), CoreDimension::Static(3)]));
+        let mut builder = ProgramBuilder::new();
         let input = builder.add_input(input_type);
         let output = builder
             .add_instruction(
@@ -849,7 +850,7 @@ mod tests {
             )
             .unwrap()[0];
         let program = builder
-            .build::<Vec<XlaArrayConstant>, Vec<XlaArrayConstant>>(vec![output], vec![Placeholder], vec![Placeholder])
+            .build::<Vec<ArrayConstant>, Vec<ArrayConstant>>(vec![output], vec![Placeholder], vec![Placeholder])
             .unwrap();
         let stablehlo = to_mlir_module_for_plain_program(&program, "main").unwrap();
         assert!(stablehlo.contains("tensor<?x3xf32, #stablehlo.bounds<4, ?>>"), "{stablehlo}");
@@ -860,8 +861,8 @@ mod tests {
         // Phase 6/7 boundary rather than an operand added to the primal reduce instruction.
         let reduced = DimensionVariable::new("reduced", DimensionBounds::new(1, Some(5)).unwrap());
         let input_type =
-            ArrayType::new(DataType::F32, Shape::new(vec![Dimension::Dynamic(reduced), Dimension::Static(3)]));
-        let mut builder = XlaProgramBuilder::new();
+            ArrayType::new(DataType::F32, Shape::new(vec![CoreDimension::Dynamic(reduced), CoreDimension::Static(3)]));
+        let mut builder = ProgramBuilder::new();
         let input = builder.add_input(input_type);
         let output = builder
             .add_instruction(
@@ -872,7 +873,7 @@ mod tests {
             )
             .unwrap()[0];
         let program = builder
-            .build::<Vec<XlaArrayConstant>, Vec<XlaArrayConstant>>(vec![output], vec![Placeholder], vec![Placeholder])
+            .build::<Vec<ArrayConstant>, Vec<ArrayConstant>>(vec![output], vec![Placeholder], vec![Placeholder])
             .unwrap();
         assert!(matches!(
             to_mlir_module_for_plain_program(&program, "main"),
@@ -1156,16 +1157,17 @@ mod tests {
         // value paired with index zero. Its comparator picks the left pair when its value is greater or a NaN facing an
         // ordered value, or when the values are equivalent (i.e., equal under `FLOAT` semantics or both NaN) and the
         // left index is lower.
-        let input_type = ArrayType::new(DataType::F32, Shape::new(vec![Dimension::Static(2), Dimension::Static(3)]));
-        let output_type = ArrayType::new(DataType::I32, Shape::new(vec![Dimension::Static(2)]));
-        let mut builder = XlaProgramBuilder::new();
+        let input_type =
+            ArrayType::new(DataType::F32, Shape::new(vec![CoreDimension::Static(2), CoreDimension::Static(3)]));
+        let output_type = ArrayType::new(DataType::I32, Shape::new(vec![CoreDimension::Static(2)]));
+        let mut builder = ProgramBuilder::new();
         let input = builder.add_input(input_type.clone());
         let outputs = builder
             .add_instruction(ArgMaxOperation::new(1, DataType::I32), Vec::new(), vec![input], None)
             .unwrap()
             .to_vec();
         let program = builder
-            .build::<Vec<XlaArrayConstant>, Vec<XlaArrayConstant>>(outputs, vec![Placeholder], vec![Placeholder])
+            .build::<Vec<ArrayConstant>, Vec<ArrayConstant>>(outputs, vec![Placeholder], vec![Placeholder])
             .unwrap();
         let program = unproject_plain_program(program);
         let module =

@@ -1,16 +1,16 @@
 use ryft_core::{
-    ArrayIrType, ArrayType, LINEAR_CALL_OPERATION_NAME, LinearCallOperation, Operation, ProgramError,
+    ArrayIrType, ArrayType, LINEAR_CALL_OPERATION_NAME, LinearCallOperation, Operation as CoreOperation, ProgramError,
     REMATERIALIZE_OPERATION_NAME, RematerializationOptimizationBarrier, RematerializeOperation, StopGradientOperation,
 };
 use ryft_mlir::ValueRef;
 
 use crate::experimental::lowering::regions::lower_nested_program_inline;
-use crate::{Error, LowerableOperation, LowerableOperationFamily, LoweringError, XlaLowerer};
+use crate::{Error, LowerableOperation, LowerableOperationFamily, Lowerer, LoweringError};
 
 impl LowerableOperation for StopGradientOperation<ArrayType> {
     fn lower<'b, 'c: 'b, 't: 'c, O: LowerableOperationFamily>(
         &self,
-        _lowerer: &mut XlaLowerer<'b, 'c, 't, O>,
+        _lowerer: &mut Lowerer<'b, 'c, 't, O>,
         input_values: &[ValueRef<'b, 'c, 't>],
         _input_types: &[ArrayType],
         _output_types: &[ArrayType],
@@ -24,7 +24,7 @@ impl LowerableOperation for StopGradientOperation<ArrayType> {
 impl LowerableOperation for RematerializeOperation<ArrayType> {
     fn lower<'b, 'c: 'b, 't: 'c, O: LowerableOperationFamily>(
         &self,
-        _lowerer: &mut XlaLowerer<'b, 'c, 't, O>,
+        _lowerer: &mut Lowerer<'b, 'c, 't, O>,
         _input_values: &[ValueRef<'b, 'c, 't>],
         _input_types: &[ArrayType],
         _output_types: &[ArrayType],
@@ -40,7 +40,7 @@ impl LowerableOperation for RematerializeOperation<ArrayType> {
 impl LowerableOperation for LinearCallOperation<ArrayType> {
     fn lower<'b, 'c: 'b, 't: 'c, O: LowerableOperationFamily>(
         &self,
-        _lowerer: &mut XlaLowerer<'b, 'c, 't, O>,
+        _lowerer: &mut Lowerer<'b, 'c, 't, O>,
         _input_values: &[ValueRef<'b, 'c, 't>],
         _input_types: &[ArrayType],
         _output_types: &[ArrayType],
@@ -58,7 +58,7 @@ impl LowerableOperation for LinearCallOperation<ArrayType> {
 impl LowerableOperation for RematerializeOperation<ArrayIrType> {
     fn lower<'b, 'c: 'b, 't: 'c, O: LowerableOperationFamily>(
         &self,
-        lowerer: &mut XlaLowerer<'b, 'c, 't, O>,
+        lowerer: &mut Lowerer<'b, 'c, 't, O>,
         input_values: &[ValueRef<'b, 'c, 't>],
         _input_types: &[ArrayIrType],
         _output_types: &[ArrayIrType],
@@ -99,7 +99,7 @@ impl LowerableOperation for RematerializeOperation<ArrayIrType> {
 impl LowerableOperation for LinearCallOperation<ArrayIrType> {
     fn lower<'b, 'c: 'b, 't: 'c, O: LowerableOperationFamily>(
         &self,
-        lowerer: &mut XlaLowerer<'b, 'c, 't, O>,
+        lowerer: &mut Lowerer<'b, 'c, 't, O>,
         input_values: &[ValueRef<'b, 'c, 't>],
         _input_types: &[ArrayIrType],
         _output_types: &[ArrayIrType],
@@ -129,12 +129,10 @@ mod tests {
         SinOperation, TypedProgram,
     };
 
-    use crate::experimental::domains::XlaTracer;
+    use crate::domains::Tracer;
     use crate::experimental::lowering::tests::test_vector_type;
-    use crate::experimental::ops::{
-        XlaConstant, XlaOperation, XlaProgram, XlaProgramBuilder as ArrayIrXlaProgramBuilder,
-    };
-    use crate::{Error, LoweringError, XlaDomain, to_mlir_module_for_program};
+    use crate::experimental::ops::{Constant, Operation, Program, ProgramBuilder as ArrayIrProgramBuilder};
+    use crate::{Domain, Error, LoweringError, to_mlir_module_for_program};
 
     #[test]
     fn test_rematerialize_lowering_inlines_body_effects_on_the_enclosing_token_chain() {
@@ -144,16 +142,16 @@ mod tests {
         // immediately before, inside, and after the call must form one ordered-I/O token chain.
         let scalar_type = ArrayType::scalar(DataType::F64);
         let body = {
-            let mut builder = ArrayIrXlaProgramBuilder::new();
+            let mut builder = ArrayIrProgramBuilder::new();
             let input = builder.add_input(scalar_type.clone().into());
             let output = builder
                 .add_instruction(PrintOperation::<ArrayType>::new("body"), Vec::new(), vec![input], None)
                 .unwrap()[0];
             builder
-                .build::<Vec<XlaConstant>, Vec<XlaConstant>>(vec![output], vec![Placeholder], vec![Placeholder])
+                .build::<Vec<Constant>, Vec<Constant>>(vec![output], vec![Placeholder], vec![Placeholder])
                 .unwrap()
         };
-        let mut builder = ArrayIrXlaProgramBuilder::new();
+        let mut builder = ArrayIrProgramBuilder::new();
         let body = builder.import_region(body.entry_region_ref());
         let input = builder.add_input(scalar_type.clone().into());
         let before = builder
@@ -161,7 +159,7 @@ mod tests {
             .unwrap()[0];
         let rematerialized = builder
             .add_instruction(
-                XlaOperation::Rematerialize(RematerializeOperation::new(ResidualPolicyReference::new(NothingSavable))),
+                Operation::Rematerialize(RematerializeOperation::new(ResidualPolicyReference::new(NothingSavable))),
                 vec![body],
                 vec![before],
                 None,
@@ -171,7 +169,7 @@ mod tests {
             .add_instruction(PrintOperation::<ArrayType>::new("after"), Vec::new(), vec![rematerialized], None)
             .unwrap()[0];
         let program = builder
-            .build::<Vec<XlaConstant>, Vec<XlaConstant>>(vec![output], vec![Placeholder], vec![Placeholder])
+            .build::<Vec<Constant>, Vec<Constant>>(vec![output], vec![Placeholder], vec![Placeholder])
             .unwrap();
         let stablehlo =
             to_mlir_module_for_program(&program, &[], &scalar_type, &scalar_type, "main", None, None).unwrap();
@@ -196,29 +194,29 @@ mod tests {
         // value happens to occupy the referenced slot.
         let scalar_type = ArrayType::scalar(DataType::F64);
         let body = {
-            let mut builder = ArrayIrXlaProgramBuilder::new();
+            let mut builder = ArrayIrProgramBuilder::new();
             let input = builder.add_input(scalar_type.clone().into());
             let captured = builder
-                .add_constant(XlaConstant::Captured(CaptureReference::new(0, ArrayIrType::Array(scalar_type.clone()))));
+                .add_constant(Constant::Captured(CaptureReference::new(0, ArrayIrType::Array(scalar_type.clone()))));
             let output =
                 builder.add_instruction(AddOperation::new(), Vec::new(), vec![input, captured], None).unwrap()[0];
             builder
-                .build::<Vec<XlaConstant>, Vec<XlaConstant>>(vec![output], vec![Placeholder], vec![Placeholder])
+                .build::<Vec<Constant>, Vec<Constant>>(vec![output], vec![Placeholder], vec![Placeholder])
                 .unwrap()
         };
-        let mut builder = ArrayIrXlaProgramBuilder::new();
+        let mut builder = ArrayIrProgramBuilder::new();
         let body = builder.import_region(body.entry_region_ref());
         let input = builder.add_input(scalar_type.clone().into());
         let output = builder
             .add_instruction(
-                XlaOperation::Rematerialize(RematerializeOperation::new(ResidualPolicyReference::new(NothingSavable))),
+                Operation::Rematerialize(RematerializeOperation::new(ResidualPolicyReference::new(NothingSavable))),
                 vec![body],
                 vec![input],
                 None,
             )
             .unwrap()[0];
         let program = builder
-            .build::<Vec<XlaConstant>, Vec<XlaConstant>>(vec![output], vec![Placeholder], vec![Placeholder])
+            .build::<Vec<Constant>, Vec<Constant>>(vec![output], vec![Placeholder], vec![Placeholder])
             .unwrap();
 
         // The enclosing function's capture prefix has a matching slot #0, so before rematerialized bodies were scoped
@@ -243,22 +241,21 @@ mod tests {
         // XLA from merging the recomputation with the original computation.
         let scalar_type = ArrayType::scalar(DataType::F64);
         let body = {
-            let mut builder = ArrayIrXlaProgramBuilder::new();
+            let mut builder = ArrayIrProgramBuilder::new();
             let input = builder.add_input(scalar_type.clone().into());
             let output = builder.add_instruction(SinOperation::new(), Vec::new(), vec![input], None).unwrap()[0];
             builder
-                .build::<Vec<XlaConstant>, Vec<XlaConstant>>(vec![output], vec![Placeholder], vec![Placeholder])
+                .build::<Vec<Constant>, Vec<Constant>>(vec![output], vec![Placeholder], vec![Placeholder])
                 .unwrap()
         };
         let lower = |operation: RematerializeOperation<ArrayIrType>| {
-            let mut builder = ArrayIrXlaProgramBuilder::new();
+            let mut builder = ArrayIrProgramBuilder::new();
             let body = builder.import_region(body.entry_region_ref());
             let input = builder.add_input(scalar_type.clone().into());
-            let output = builder
-                .add_instruction(XlaOperation::Rematerialize(operation), vec![body], vec![input], None)
-                .unwrap()[0];
+            let output =
+                builder.add_instruction(Operation::Rematerialize(operation), vec![body], vec![input], None).unwrap()[0];
             let program = builder
-                .build::<Vec<XlaConstant>, Vec<XlaConstant>>(vec![output], vec![Placeholder], vec![Placeholder])
+                .build::<Vec<Constant>, Vec<Constant>>(vec![output], vec![Placeholder], vec![Placeholder])
                 .unwrap();
             to_mlir_module_for_program(&program, &[], &scalar_type, &scalar_type, "main", None, None).unwrap()
         };
@@ -304,15 +301,15 @@ mod tests {
         // the function, it still covers the cotangent that the backward computation receives.
         let scalar_type = ArrayType::scalar(DataType::F64);
         let lower = |optimization_barrier: RematerializationOptimizationBarrier| {
-            let function = rematerialize(|x: XlaTracer<'static>| -> Result<XlaTracer<'static>, ProgramError> {
+            let function = rematerialize(|x: Tracer<'static>| -> Result<Tracer<'static>, ProgramError> {
                 let context = x.context();
                 let square =
                     context.bind(ArrayOperation::Mul(MulOperation::new()), Vec::new(), &[x.clone(), x.clone()])?;
                 Ok(context.bind(ArrayOperation::Sin(SinOperation::new()), Vec::new(), &square)?.remove(0))
             })
             .with_optimization_barrier(optimization_barrier);
-            let (_, program) = DomainTracingContext::<XlaDomain<'static>>::trace(
-                |x: XlaTracer<'static>| Ok(differentiate_at(x).gradient(|x| function.call(x))?),
+            let (_, program) = DomainTracingContext::<Domain<'static>>::trace(
+                |x: Tracer<'static>| Ok(differentiate_at(x).gradient(|x| function.call(x))?),
                 ArrayIrType::from(scalar_type.clone()),
             )
             .unwrap();
@@ -387,18 +384,18 @@ mod tests {
         // forward-over-reverse Hessian-vector product) or in reverse mode (i.e., the gradient of the gradient), keeps
         // differentiated calls, whose recomputations therefore stay behind optimization barriers.
         let scalar_type = ArrayType::scalar(DataType::F64);
-        let function = rematerialize(|x: XlaTracer<'static>| -> Result<XlaTracer<'static>, ProgramError> {
+        let function = rematerialize(|x: Tracer<'static>| -> Result<Tracer<'static>, ProgramError> {
             let context = x.context();
             let square = context.bind(ArrayOperation::Mul(MulOperation::new()), Vec::new(), &[x.clone(), x.clone()])?;
             Ok(context.bind(ArrayOperation::Sin(SinOperation::new()), Vec::new(), &square)?.remove(0))
         });
-        let (_, gradient) = DomainTracingContext::<XlaDomain<'static>>::trace(
-            |x: XlaTracer<'static>| Ok(differentiate_at(x).gradient(|x| function.call(x))?),
+        let (_, gradient) = DomainTracingContext::<Domain<'static>>::trace(
+            |x: Tracer<'static>| Ok(differentiate_at(x).gradient(|x| function.call(x))?),
             ArrayIrType::from(scalar_type.clone()),
         )
         .unwrap();
         let gradient = gradient.into_flat_program();
-        let lower = |program: &XlaProgram<Vec<XlaConstant>, Vec<XlaConstant>>| {
+        let lower = |program: &Program<Vec<Constant>, Vec<Constant>>| {
             let array_types = |types: Vec<ArrayIrType>| {
                 types.iter().map(|r#type| <&ArrayType>::try_from(r#type).unwrap().clone()).collect::<Vec<_>>()
             };
@@ -483,14 +480,14 @@ mod tests {
         // It is rounded to `bf16` right after it is computed, so that XLA cannot use a more precise value for the
         // forward computation than the one that the backward computation receives.
         let scalar_type = ArrayType::scalar(DataType::BF16);
-        let function = rematerialize(|x: XlaTracer<'static>| -> Result<XlaTracer<'static>, ProgramError> {
+        let function = rematerialize(|x: Tracer<'static>| -> Result<Tracer<'static>, ProgramError> {
             let context = x.context().clone();
             let sine = context.bind(ArrayOperation::Sin(SinOperation::new()), Vec::new(), &[x])?.remove(0);
             Ok(context.bind(ArrayOperation::Mul(MulOperation::new()), Vec::new(), &[sine.clone(), sine])?.remove(0))
         })
         .with_policy(EverythingSavable);
-        let (_, gradient) = DomainTracingContext::<XlaDomain<'static>>::trace(
-            |x: XlaTracer<'static>| Ok(differentiate_at(x).gradient(|x| function.call(x))?),
+        let (_, gradient) = DomainTracingContext::<Domain<'static>>::trace(
+            |x: Tracer<'static>| Ok(differentiate_at(x).gradient(|x| function.call(x))?),
             ArrayIrType::from(scalar_type.clone()),
         )
         .unwrap();
@@ -523,7 +520,7 @@ mod tests {
         // Offloading the value tagged `sine` of `x ↦ cos(tag(sin(x), "sine"))` to pinned host memory moves it to the
         // host once it is computed and back to the device right before the backward computation uses it.
         let scalar_type = ArrayType::scalar(DataType::F32);
-        let function = rematerialize(|x: XlaTracer<'static>| -> Result<XlaTracer<'static>, ProgramError> {
+        let function = rematerialize(|x: Tracer<'static>| -> Result<Tracer<'static>, ProgramError> {
             let context = x.context().clone();
             let sine = context.bind(ArrayOperation::Sin(SinOperation::new()), Vec::new(), &[x])?;
             let sine = context.bind(ArrayOperation::Tag(TagOperation::new("sine")), Vec::new(), &sine)?;
@@ -532,8 +529,8 @@ mod tests {
         .with_policy(
             SaveAndOffloadOnlyTheseNames::new(Vec::<String>::new(), ["sine"], Memory::Host { pinned: true }).unwrap(),
         );
-        let (_, gradient) = DomainTracingContext::<XlaDomain<'static>>::trace(
-            |x: XlaTracer<'static>| Ok(differentiate_at(x).gradient(|x| function.call(x))?),
+        let (_, gradient) = DomainTracingContext::<Domain<'static>>::trace(
+            |x: Tracer<'static>| Ok(differentiate_at(x).gradient(|x| function.call(x))?),
             ArrayIrType::from(scalar_type.clone()),
         )
         .unwrap();
@@ -566,52 +563,40 @@ mod tests {
 
         let vector_type = test_vector_type(4);
         let forward = {
-            let mut builder = ArrayIrXlaProgramBuilder::new();
+            let mut builder = ArrayIrProgramBuilder::new();
             let tangent = builder.add_input(vector_type.clone().into());
             let residual = builder.add_input(vector_type.clone().into());
             let output =
                 builder.add_instruction(MulOperation::new(), Vec::new(), vec![tangent, residual], None).unwrap()[0];
             builder
-                .build::<Vec<XlaConstant>, Vec<XlaConstant>>(
-                    vec![output],
-                    vec![Placeholder, Placeholder],
-                    vec![Placeholder],
-                )
+                .build::<Vec<Constant>, Vec<Constant>>(vec![output], vec![Placeholder, Placeholder], vec![Placeholder])
                 .unwrap()
         };
         let transpose = {
-            let mut builder = ArrayIrXlaProgramBuilder::new();
+            let mut builder = ArrayIrProgramBuilder::new();
             let residual = builder.add_input(vector_type.clone().into());
             let cotangent = builder.add_input(vector_type.clone().into());
             let output =
                 builder.add_instruction(AddOperation::new(), Vec::new(), vec![residual, cotangent], None).unwrap()[0];
             builder
-                .build::<Vec<XlaConstant>, Vec<XlaConstant>>(
-                    vec![output],
-                    vec![Placeholder, Placeholder],
-                    vec![Placeholder],
-                )
+                .build::<Vec<Constant>, Vec<Constant>>(vec![output], vec![Placeholder, Placeholder], vec![Placeholder])
                 .unwrap()
         };
-        let mut builder = ArrayIrXlaProgramBuilder::new();
+        let mut builder = ArrayIrProgramBuilder::new();
         let forward = builder.import_region(forward.entry_region_ref());
         let transpose = builder.import_region(transpose.entry_region_ref());
         let tangent = builder.add_input(vector_type.clone().into());
         let residual = builder.add_input(vector_type.clone().into());
         let output = builder
             .add_instruction(
-                XlaOperation::LinearCall(LinearCallOperation::new(1)),
+                Operation::LinearCall(LinearCallOperation::new(1)),
                 vec![forward, transpose],
                 vec![tangent, residual],
                 None,
             )
             .unwrap()[0];
         let program = builder
-            .build::<Vec<XlaConstant>, Vec<XlaConstant>>(
-                vec![output],
-                vec![Placeholder, Placeholder],
-                vec![Placeholder],
-            )
+            .build::<Vec<Constant>, Vec<Constant>>(vec![output], vec![Placeholder, Placeholder], vec![Placeholder])
             .unwrap();
         let module = to_mlir_module_for_program(
             &program,

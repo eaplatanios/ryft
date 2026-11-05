@@ -1,8 +1,8 @@
 use std::rc::Rc;
 
 use ryft_core::{
-    AtomId, Instruction, Operation, Parameterized, Program, ProgramError, RegionRef,
-    RematerializationOptimizationBarrier, Type as RyftType, Typed, Value,
+    AtomId, Instruction, Operation as CoreOperation, Parameterized, Program as CoreProgram, ProgramError, RegionRef,
+    RematerializationOptimizationBarrier, Type as RyftType, Typed, Value as CoreValue,
 };
 use ryft_mlir::dialects::stable_hlo;
 use ryft_mlir::{
@@ -12,9 +12,9 @@ use ryft_mlir::{
 use crate::Error;
 use crate::experimental::lowering::types::lower_constant;
 use crate::experimental::lowering::{
-    CollectiveLoweringState, EffectTokens, LowerableOperationFamily, XlaLowerer, lower_instruction,
+    CollectiveLoweringState, EffectTokens, LowerableOperationFamily, Lowerer, lower_instruction,
 };
-use crate::experimental::ops::{FlatXlaProgram, XlaConstant, XlaProgram};
+use crate::experimental::ops::{Constant, FlatProgram, Program};
 use crate::operations::composites::lowers_without_regions;
 use crate::operations::jit_call::JitCallFunctionMap;
 
@@ -23,7 +23,7 @@ use crate::experimental::lowering::types::lower_literal_value;
 #[cfg(test)]
 use crate::experimental::lowering::{LowerableOperation, LoweringError, MlirLowerableValue};
 #[cfg(test)]
-use crate::experimental::ops::XlaOperation;
+use crate::experimental::ops::Operation;
 #[cfg(test)]
 use ryft_core::ArrayType;
 #[cfg(test)]
@@ -47,7 +47,7 @@ use ryft_mlir::Type;
 /// barrier. Unselected inputs and captured constants, which are not inputs of the body, do not go through the barrier.
 #[allow(clippy::too_many_arguments)]
 pub(crate) fn lower_nested_program_inline<'b, 'c: 'b, 't: 'c, O: LowerableOperationFamily>(
-    program: &FlatXlaProgram<O>,
+    program: &FlatProgram<O>,
     input_values: &[ValueRef<'b, 'c, 't>],
     block: &mut BlockRef<'b, 'c, 't>,
     context: &'c MlirContext<'t>,
@@ -76,7 +76,7 @@ pub(crate) fn lower_nested_program_inline<'b, 'c: 'b, 't: 'c, O: LowerableOperat
 /// documentation of [`lower_nested_program_inline`] for the effect-token and optimization-barrier contracts.
 #[allow(clippy::too_many_arguments)]
 fn lower_nested_region_inline<'b, 'c: 'b, 't: 'c, O: LowerableOperationFamily>(
-    region: RegionRef<'_, XlaConstant, O>,
+    region: RegionRef<'_, Constant, O>,
     input_values: &[ValueRef<'b, 'c, 't>],
     block: &mut BlockRef<'b, 'c, 't>,
     context: &'c MlirContext<'t>,
@@ -149,7 +149,7 @@ fn lower_nested_region_inline<'b, 'c: 'b, 't: 'c, O: LowerableOperationFamily>(
             // Every StableHLO operation generated from this one Ryft instruction inherits the instruction's
             // provenance through the lowerer's shared location, with the ambient location as its base.
             let location = collective_state.instruction_location(context, instruction.provenance(), location);
-            let mut lowerer = XlaLowerer::new(*block, context, location)
+            let mut lowerer = Lowerer::new(*block, context, location)
                 .with_regions(regions)
                 .with_nested_functions(nested_functions.cloned())
                 .with_captured_values(captured_values)
@@ -168,7 +168,8 @@ fn lower_nested_region_inline<'b, 'c: 'b, 't: 'c, O: LowerableOperationFamily>(
     )
 }
 
-/// Drives [`Program::interpret_with`] to lower a staged program into MLIR ops appended to `block`.
+/// Drives [`CoreProgram::interpret_with`](ryft_core::Program::interpret_with) to lower a staged program into MLIR ops
+/// appended to `block`.
 ///
 /// The two callbacks plug in lowering policies for [`Atom::Constant`](ryft_core::Atom::Constant)s and [`Instruction`]s
 /// respectively while the generic interpreter handles use-count tracking and atom bookkeeping. Each callback receives a
@@ -180,13 +181,13 @@ fn replay_program_into_block<
     't: 'c,
     T: RyftType,
     O,
-    V: Value<Type = T>,
+    V: CoreValue<Type = T>,
     Input,
     Output,
     LiftConstant,
     ApplyOp,
 >(
-    program: &Program<V, O, Input, Output>,
+    program: &CoreProgram<V, O, Input, Output>,
     input_values: Vec<ValueRef<'b, 'c, 't>>,
     block: &mut BlockRef<'b, 'c, 't>,
     context: &'c MlirContext<'t>,
@@ -195,7 +196,7 @@ fn replay_program_into_block<
     mut apply_op: ApplyOp,
 ) -> Result<Vec<ValueRef<'b, 'c, 't>>, Error>
 where
-    O: Operation<Type = T>,
+    O: CoreOperation<Type = T>,
     Input: Parameterized<V>,
     Output: Parameterized<V>,
     LiftConstant: FnMut(
@@ -233,8 +234,8 @@ fn replay_region_ref_into_block<'b, 'c: 'b, 't: 'c, O, V, LiftConstant, ApplyOp>
     mut apply_op: ApplyOp,
 ) -> Result<Vec<ValueRef<'b, 'c, 't>>, Error>
 where
-    V: Value,
-    O: Operation<Type = V::Type>,
+    V: CoreValue,
+    O: CoreOperation<Type = V::Type>,
     LiftConstant: FnMut(
         AtomId,
         &V,
@@ -262,7 +263,7 @@ where
 /// Lowers one plain traced program to values inside a block.
 #[cfg(test)]
 pub(crate) fn lower_plain_program_outputs<'b, 'c: 'b, 't: 'c, O, V, Input, Output>(
-    program: &Program<V, O, Input, Output>,
+    program: &CoreProgram<V, O, Input, Output>,
     block: &mut BlockRef<'b, 'c, 't>,
     context: &'c MlirContext<'t>,
     location: LocationRef<'c, 't>,
@@ -308,7 +309,7 @@ where
                 }));
             }
             let location = collective_state.instruction_location(context, instruction.provenance(), location);
-            let mut lowerer: XlaLowerer<'_, '_, '_, XlaOperation> = XlaLowerer::new(*block, context, location)
+            let mut lowerer: Lowerer<'_, '_, '_, Operation> = Lowerer::new(*block, context, location)
                 .with_effect_tokens(std::mem::take(&mut effect_tokens))
                 .with_collective_state(collective_state.clone());
             let outputs =
@@ -333,7 +334,7 @@ pub(crate) fn lower_program_outputs_with_inputs<
     ProgramOutput,
     O: LowerableOperationFamily,
 >(
-    program: &XlaProgram<ProgramInput, ProgramOutput, O>,
+    program: &Program<ProgramInput, ProgramOutput, O>,
     captured_values: &[ValueRef<'b, 'c, 't>],
     input_values: &[ValueRef<'b, 'c, 't>],
     block: &mut BlockRef<'b, 'c, 't>,
@@ -344,8 +345,8 @@ pub(crate) fn lower_program_outputs_with_inputs<
     effect_tokens: &mut EffectTokens<'b, 'c, 't>,
 ) -> Result<Vec<ValueRef<'b, 'c, 't>>, Error>
 where
-    ProgramInput: Parameterized<XlaConstant>,
-    ProgramOutput: Parameterized<XlaConstant>,
+    ProgramInput: Parameterized<Constant>,
+    ProgramOutput: Parameterized<Constant>,
 {
     if input_values.len() != program.input_ids().len() {
         return Err(ProgramError::InvalidInputCount {
@@ -406,9 +407,9 @@ mod tests {
     use ryft_mlir::dialects::func;
     use ryft_mlir::{Block, Location, Operation as MlirOperation, Region, TypeAndAttributes, Value as MlirValue};
 
-    use crate::experimental::lowering::tests::{XlaProgramBuilder, unproject_plain_program};
+    use crate::experimental::lowering::tests::{ProgramBuilder, unproject_plain_program};
     use crate::experimental::lowering::types::lower_tensor_type;
-    use crate::experimental::ops::XlaArrayConstant;
+    use crate::experimental::ops::ArrayConstant;
 
     use super::*;
 
@@ -416,7 +417,7 @@ mod tests {
     /// returns the inlined outputs from that function, and renders the verified module. When `ordered_io` is set, the
     /// enclosing scope already holds an ordered-I/O token when the program is inlined, so the barrier must thread it.
     fn lower_nested_program_inline_behind_input_barrier(
-        program: &FlatXlaProgram,
+        program: &FlatProgram,
         input_types: &[ArrayType],
         output_types: &[ArrayType],
         ordered_io: bool,
@@ -488,16 +489,12 @@ mod tests {
     fn test_lower_nested_program_inline_input_optimization_barrier() {
         // A pure body consumes the barrier's results instead of the enclosing scope's values.
         let array_type = ArrayType::new_static(DataType::F32, [2]);
-        let mut builder = XlaProgramBuilder::new();
+        let mut builder = ProgramBuilder::new();
         let left = builder.add_input(array_type.clone());
         let right = builder.add_input(array_type.clone());
         let output = builder.add_instruction(MulOperation::new(), Vec::new(), vec![left, right], None).unwrap()[0];
         let program = builder
-            .build::<Vec<XlaArrayConstant>, Vec<XlaArrayConstant>>(
-                vec![output],
-                vec![Placeholder; 2],
-                vec![Placeholder],
-            )
+            .build::<Vec<ArrayConstant>, Vec<ArrayConstant>>(vec![output], vec![Placeholder; 2], vec![Placeholder])
             .unwrap();
         let program = unproject_plain_program(program);
         assert_eq!(
@@ -526,14 +523,14 @@ mod tests {
         // The enclosing ordered-I/O token goes through the same barrier as the inputs, so the body's print consumes
         // the barrier's token result and is sequenced after the barrier.
         let array_type = ArrayType::new_static(DataType::F32, [2]);
-        let mut builder = XlaProgramBuilder::new();
+        let mut builder = ProgramBuilder::new();
         let input = builder.add_input(array_type.clone());
         let printed = builder
             .add_instruction(PrintOperation::<ArrayType>::new("body"), Vec::new(), vec![input], None)
             .unwrap()[0];
         let output = builder.add_instruction(AddOperation::new(), Vec::new(), vec![printed, printed], None).unwrap()[0];
         let program = builder
-            .build::<Vec<XlaArrayConstant>, Vec<XlaArrayConstant>>(vec![output], vec![Placeholder], vec![Placeholder])
+            .build::<Vec<ArrayConstant>, Vec<ArrayConstant>>(vec![output], vec![Placeholder], vec![Placeholder])
             .unwrap();
         let program = unproject_plain_program(program);
         assert_eq!(

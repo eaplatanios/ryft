@@ -4,15 +4,16 @@ use pretty_assertions::assert_eq;
 
 use ryft_core::{
     ArrayIrType, ArrayReference, ArrayType, BatchAxis, Context, DataType, Device, DeviceMesh, LogicalMesh, MeshAxis,
-    MeshAxisType, Placeholder, ProgramBuilder, ReferenceAddUpdateOperation, ReferenceReadOperation, ReferenceType,
-    ShardMapBoundary, ShardMapOperation, Sharding, ShardingDimension, TypedProgram, Value, batch,
+    MeshAxisType, Placeholder, ProgramBuilder as CoreProgramBuilder, ReferenceAddUpdateOperation,
+    ReferenceReadOperation, ReferenceType, ShardMapBoundary, ShardMapOperation, Sharding, ShardingDimension,
+    TypedProgram, Value as CoreValue, batch,
 };
 use ryft_pjrt::{ClientOptions, CpuClientOptions, load_cpu_plugin};
-use ryft_xla::experimental::ops::{XlaConstant, XlaOperation};
-use ryft_xla::{FromPjrt, XlaArray, XlaOptions, XlaReference, XlaSession, XlaValue, compile_statefully};
+use ryft_xla::experimental::ops::{Constant, Operation};
+use ryft_xla::{Array, FromPjrt, Options, Reference, Session, Value, compile_statefully};
 
 /// Returns the `f32` contents of the shard of `array` on each device of its mesh, in mesh order.
-fn device_shards(array: &XlaArray<'_>) -> Vec<Vec<f32>> {
+fn device_shards(array: &Array<'_>) -> Vec<Vec<f32>> {
     array
         .mesh()
         .devices()
@@ -34,11 +35,11 @@ fn test_shard_map_operation_from_program() {
         .unwrap();
     let global = ArrayType::new_static(DataType::F32, [4]).with_sharding(sharding.clone()).unwrap();
     let reference_type = ArrayIrType::Reference(ReferenceType::new(global.clone()));
-    let mut body = ProgramBuilder::<XlaConstant, XlaOperation>::new();
+    let mut body = CoreProgramBuilder::<Constant, Operation>::new();
     let reference = body.add_input(ReferenceType::new(local).into());
     let value = body.add_instruction(ReferenceReadOperation::new(), Vec::new(), vec![reference], None).unwrap()[0];
     let body = body
-        .build::<Vec<XlaConstant>, Vec<XlaConstant>>(vec![value, reference], vec![Placeholder], vec![Placeholder; 2])
+        .build::<Vec<Constant>, Vec<Constant>>(vec![value, reference], vec![Placeholder], vec![Placeholder; 2])
         .unwrap();
     let operation = ShardMapOperation::from_program(
         &body,
@@ -47,15 +48,15 @@ fn test_shard_map_operation_from_program() {
             .unwrap(),
     )
     .unwrap();
-    let mut builder = ProgramBuilder::<XlaConstant, XlaOperation>::new();
+    let mut builder = CoreProgramBuilder::<Constant, Operation>::new();
     let input = builder.add_input(reference_type.clone());
     let body = builder.import_program(body);
     let outputs = builder
-        .add_instruction(XlaOperation::ShardMap(Box::new(operation)), vec![body], vec![input], None)
+        .add_instruction(Operation::ShardMap(Box::new(operation)), vec![body], vec![input], None)
         .unwrap();
     let outputs = outputs.to_vec();
     let program = builder
-        .build::<Vec<XlaConstant>, Vec<XlaConstant>>(outputs, vec![Placeholder], vec![Placeholder; 2])
+        .build::<Vec<Constant>, Vec<Constant>>(outputs, vec![Placeholder], vec![Placeholder; 2])
         .unwrap();
     assert_eq!(program.output_types(), vec![ArrayIrType::Array(global.clone()), reference_type.clone()]);
     assert_eq!(program.jvp().unwrap().input_types(), vec![reference_type.clone(), reference_type.clone()]);
@@ -81,14 +82,14 @@ fn test_batched_shard_map_mutates_mapped_reference_items_on_cpu() {
     let devices = devices.iter().take(2).map(|device| Device::from_pjrt(device).unwrap()).collect();
     let logical_mesh = LogicalMesh::new(vec![MeshAxis::new("x", 2, MeshAxisType::Manual).unwrap()]).unwrap();
     let mesh = DeviceMesh::new(logical_mesh.clone(), devices).unwrap();
-    let domain = XlaSession::new(&client).domain();
+    let domain = Session::new(&client).domain();
     let sharded = Sharding::new(logical_mesh.clone(), vec![ShardingDimension::sharded(["x"])]).unwrap();
     let item_type = ArrayType::new_static(DataType::F32, [4]).with_sharding(sharded.clone()).unwrap();
     let boundary =
         ShardMapBoundary::new(logical_mesh.clone(), vec![sharded.clone(); 2], vec![sharded], vec!["x".to_string()])
             .unwrap();
     let body = {
-        let mut builder = ProgramBuilder::<XlaConstant, XlaOperation>::new();
+        let mut builder = CoreProgramBuilder::<Constant, Operation>::new();
         let local_type = boundary.local_input_type(0, &item_type).unwrap();
         let reference = builder.add_input(ArrayIrType::Reference(ReferenceType::new(local_type.clone())));
         let update = builder.add_input(ArrayIrType::Array(local_type));
@@ -98,7 +99,7 @@ fn test_batched_shard_map_mutates_mapped_reference_items_on_cpu() {
         let output =
             builder.add_instruction(ReferenceReadOperation::new(), Vec::new(), vec![reference], None).unwrap()[0];
         builder
-            .build::<Vec<XlaConstant>, Vec<XlaConstant>>(vec![output], vec![Placeholder; 2], vec![Placeholder])
+            .build::<Vec<Constant>, Vec<Constant>>(vec![output], vec![Placeholder; 2], vec![Placeholder])
             .unwrap()
     };
     let operation = ShardMapOperation::from_program(
@@ -107,7 +108,7 @@ fn test_batched_shard_map_mutates_mapped_reference_items_on_cpu() {
         boundary,
     )
     .unwrap();
-    let operation = XlaOperation::ShardMap(Box::new(operation));
+    let operation = Operation::ShardMap(Box::new(operation));
     let batched_sharding =
         Sharding::new(logical_mesh, vec![ShardingDimension::replicated(), ShardingDimension::sharded(["x"])]).unwrap();
     let batched_type = ArrayType::new_static(DataType::F32, [3, 4]).with_sharding(batched_sharding.clone()).unwrap();
@@ -127,7 +128,7 @@ fn test_batched_shard_map_mutates_mapped_reference_items_on_cpu() {
         },
         (ArrayIrType::Reference(ReferenceType::new(batched_type.clone())), ArrayIrType::Array(batched_type.clone())),
         &domain,
-        XlaOptions::new(mesh.clone()),
+        Options::new(mesh.clone()),
     )
     .unwrap();
 
@@ -138,13 +139,13 @@ fn test_batched_shard_map_mutates_mapped_reference_items_on_cpu() {
         (0..3).flat_map(|item| (1..=4).map(move |column| (10 * item + column) as f32)).collect::<Vec<_>>();
     let update_values = (0..3).flat_map(|item| [(100 * (item + 1)) as f32; 4]).collect::<Vec<_>>();
     let reference = ArrayReference::new(
-        XlaArray::from_host_buffer(&domain, batched_type.clone(), mesh.clone(), to_bytes(&reference_values)).unwrap(),
+        Array::from_host_buffer(&domain, batched_type.clone(), mesh.clone(), to_bytes(&reference_values)).unwrap(),
     );
-    let update = XlaArray::from_host_buffer(&domain, batched_type, mesh, to_bytes(&update_values)).unwrap();
-    let XlaValue::Array(output) = compiled
+    let update = Array::from_host_buffer(&domain, batched_type, mesh, to_bytes(&update_values)).unwrap();
+    let Value::Array(output) = compiled
         .call_statefully(
             &domain,
-            (XlaValue::Reference(XlaReference::new(reference.clone(), domain.clone())), XlaValue::Array(update)),
+            (Value::Reference(Reference::new(reference.clone(), domain.clone())), Value::Array(update)),
         )
         .unwrap()
     else {

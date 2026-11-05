@@ -14,7 +14,7 @@ use crate::Error;
 use crate::experimental::lowering::regions::lower_nested_program_inline;
 use crate::experimental::lowering::types::{lower_array_ir_type, lower_tensor_type};
 use crate::experimental::lowering::{CollectiveLoweringState, EffectTokens, LowerableOperationFamily};
-use crate::experimental::ops::{FlatXlaProgram, XlaConstant, XlaProgram};
+use crate::experimental::ops::{Constant, FlatProgram, Program};
 use crate::operations::quantization::{
     scaled_dot_composition_key, scaled_dot_composition_types, trace_scaled_dot_composition,
 };
@@ -90,7 +90,7 @@ pub(crate) struct NamedCompositionFunction {
     pub(crate) symbol: String,
 
     /// Canonical typed decomposition program.
-    pub(crate) program: FlatXlaProgram,
+    pub(crate) program: FlatProgram,
 }
 
 /// Module-owned registry of canonical named compositions and their private decomposition functions.
@@ -107,7 +107,7 @@ impl NamedCompositionFunctionMap {
     /// Registers one typed decomposition lazily, sharing an existing private function when the complete semantic key
     /// is already present. The registry is independent of the operation family that produced `key` and `program`;
     /// closed backend operation enums only decide when to call this seam.
-    fn register<F: FnOnce() -> Result<FlatXlaProgram, Error>>(
+    fn register<F: FnOnce() -> Result<FlatProgram, Error>>(
         &mut self,
         key: NamedCompositionKey,
         program: F,
@@ -138,15 +138,15 @@ impl NamedCompositionFunctionMap {
 
 /// Collects every named semantic composition required by `program` and traces each distinct typed decomposition once.
 pub(crate) fn collect_named_composition_functions<Input, Output, O: LowerableOperationFamily>(
-    program: &XlaProgram<Input, Output, O>,
+    program: &Program<Input, Output, O>,
     target_platform: Option<&str>,
 ) -> Result<NamedCompositionFunctionMap, Error>
 where
-    Input: Parameterized<XlaConstant>,
-    Output: Parameterized<XlaConstant>,
+    Input: Parameterized<Constant>,
+    Output: Parameterized<Constant>,
 {
     fn walk<O: LowerableOperationFamily>(
-        region: RegionRef<'_, XlaConstant, O>,
+        region: RegionRef<'_, Constant, O>,
         map: &mut NamedCompositionFunctionMap,
         visited: &mut HashSet<RegionId>,
         target_platform: Option<&str>,
@@ -284,7 +284,8 @@ mod tests {
         ShardingDimension,
     };
 
-    use crate::experimental::domains::{XlaDomain, XlaTracer};
+    use crate::Domain;
+    use crate::domains::Tracer;
 
     use super::*;
 
@@ -318,8 +319,8 @@ mod tests {
         // Registration consumes a semantic key and an ordinary typed program, not a Ryft operation enum variant.
         // Consequently a downstream lowerer can use the same sharing seam after performing its own family conversion.
         let boundary_type = ArrayType::scalar(DataType::F32);
-        let (_, program) = DomainTracingContext::<XlaDomain<'static>>::trace(
-            |inputs: Vec<XlaTracer<'static>>| Ok(inputs),
+        let (_, program) = DomainTracingContext::<Domain<'static>>::trace(
+            |inputs: Vec<Tracer<'static>>| Ok(inputs),
             vec![ArrayIrType::from(boundary_type.clone())],
         )
         .unwrap();

@@ -14,8 +14,8 @@
 //! placement. Reference state is discharged before lowering.
 
 use ryft_core::{
-    ArrayIrType, ArrayType, ComparisonDirection, DataType, EffectClasses, Operation, ProgramError, ReductionKind,
-    RematerializationOptimizationBarrier, TypedProgram, WhileOperation,
+    ArrayIrType, ArrayType, ComparisonDirection, DataType, EffectClasses, Operation as CoreOperation, ProgramError,
+    ReductionKind, RematerializationOptimizationBarrier, TypedProgram, WhileOperation,
 };
 use ryft_mlir::dialects::{stable_hlo, tensor};
 use ryft_mlir::{Block, Operation as MlirOperation, Region, Type, Value as MlirValue, ValueRef};
@@ -33,12 +33,12 @@ use crate::operations::control_flow::{
     set_threaded_effect_tokens, threaded_effect_token_values, validate_unthreaded_effect_tokens,
 };
 use crate::operations::reductions::lower_reduce_to_mlir;
-use crate::{Error, LowerableOperation, LowerableOperationFamily, XlaLowerer};
+use crate::{Error, LowerableOperation, LowerableOperationFamily, Lowerer};
 
 impl LowerableOperation for WhileOperation<ArrayType> {
     fn lower<'b, 'c: 'b, 't: 'c, O: LowerableOperationFamily>(
         &self,
-        _lowerer: &mut XlaLowerer<'b, 'c, 't, O>,
+        _lowerer: &mut Lowerer<'b, 'c, 't, O>,
         _input_values: &[ValueRef<'b, 'c, 't>],
         _input_types: &[ArrayType],
         _output_types: &[ArrayType],
@@ -56,7 +56,7 @@ impl LowerableOperation for WhileOperation<ArrayType> {
 impl LowerableOperation for WhileOperation<ArrayIrType> {
     fn lower<'b, 'c: 'b, 't: 'c, O: LowerableOperationFamily>(
         &self,
-        lowerer: &mut XlaLowerer<'b, 'c, 't, O>,
+        lowerer: &mut Lowerer<'b, 'c, 't, O>,
         input_values: &[ValueRef<'b, 'c, 't>],
         input_types: &[ArrayIrType],
         output_types: &[ArrayIrType],
@@ -504,15 +504,16 @@ mod tests {
     use indoc::{formatdoc, indoc};
     use pretty_assertions::assert_eq;
     use ryft_core::{
-        AddOperation, AssertOperation, CompareOperation, Dimension, DimensionBounds, DimensionSizeOperation,
-        DimensionType, DimensionVariable, DynamicBroadcastOperation, MeshAxisType, NegOperation, OneLikeOperation,
-        Placeholder, PrintOperation, Shape, Sharding, ShardingDimension, SubOperation, TypedProgram,
+        AddOperation, AssertOperation, CompareOperation, Dimension as CoreDimension, DimensionBounds,
+        DimensionSizeOperation, DimensionType, DimensionVariable, DynamicBroadcastOperation, MeshAxisType,
+        NegOperation, OneLikeOperation, Placeholder, PrintOperation, Shape, Sharding, ShardingDimension, SubOperation,
+        TypedProgram,
     };
 
     use crate::experimental::lowering::tests::{
-        MixedValue, dynamic_dimension, execute_mixed_program, unproject_plain_program, xla_identity_branch,
+        MixedValue, dynamic_dimension, execute_mixed_program, identity_branch, unproject_plain_program,
     };
-    use crate::experimental::ops::{XlaConstant, XlaOperation, XlaProgramBuilder as ArrayIrXlaProgramBuilder};
+    use crate::experimental::ops::{Constant, Operation, ProgramBuilder as ArrayIrProgramBuilder};
     use crate::operations::control_flow::tests::{
         compare, execute_on_two_devices, lowered_mixed_module, positive, two_device_mesh,
     };
@@ -527,20 +528,20 @@ mod tests {
         // An unbounded loop with a pure scalar condition evaluates its condition in the condition region and threads
         // only its states through the loop.
         let state_type = ArrayType::scalar(DataType::Boolean);
-        let mut builder = ArrayIrXlaProgramBuilder::new();
-        let condition_region = builder.import_program(unproject_plain_program(xla_identity_branch(state_type.clone())));
-        let body_region = builder.import_program(unproject_plain_program(xla_identity_branch(state_type.clone())));
+        let mut builder = ArrayIrProgramBuilder::new();
+        let condition_region = builder.import_program(unproject_plain_program(identity_branch(state_type.clone())));
+        let body_region = builder.import_program(unproject_plain_program(identity_branch(state_type.clone())));
         let state = builder.add_input(state_type.clone().into());
         let output = builder
             .add_instruction(
-                XlaOperation::While(WhileOperation::new()),
+                Operation::While(WhileOperation::new()),
                 vec![condition_region, body_region],
                 vec![state],
                 None,
             )
             .unwrap()[0];
         let program = builder
-            .build::<Vec<XlaConstant>, Vec<XlaConstant>>(vec![output], vec![Placeholder], vec![Placeholder])
+            .build::<Vec<Constant>, Vec<Constant>>(vec![output], vec![Placeholder], vec![Placeholder])
             .unwrap();
         let stablehlo =
             to_mlir_module_for_program(&program, &[], &state_type, &state_type, "main", None, None).unwrap();
@@ -570,20 +571,15 @@ mod tests {
         // remain the original state elements.
         let state_type = ArrayType::scalar(DataType::Boolean);
         let while_operation = WhileOperation::new().with_iteration_bound(3).unwrap();
-        let mut builder = ArrayIrXlaProgramBuilder::new();
-        let condition_region = builder.import_program(unproject_plain_program(xla_identity_branch(state_type.clone())));
-        let body_region = builder.import_program(unproject_plain_program(xla_identity_branch(state_type.clone())));
+        let mut builder = ArrayIrProgramBuilder::new();
+        let condition_region = builder.import_program(unproject_plain_program(identity_branch(state_type.clone())));
+        let body_region = builder.import_program(unproject_plain_program(identity_branch(state_type.clone())));
         let state = builder.add_input(state_type.clone().into());
         let output = builder
-            .add_instruction(
-                XlaOperation::While(while_operation),
-                vec![condition_region, body_region],
-                vec![state],
-                None,
-            )
+            .add_instruction(Operation::While(while_operation), vec![condition_region, body_region], vec![state], None)
             .unwrap()[0];
         let program = builder
-            .build::<Vec<XlaConstant>, Vec<XlaConstant>>(vec![output], vec![Placeholder], vec![Placeholder])
+            .build::<Vec<Constant>, Vec<Constant>>(vec![output], vec![Placeholder], vec![Placeholder])
             .unwrap();
         let stablehlo =
             to_mlir_module_for_program(&program, &[], &state_type, &state_type, "main", None, None).unwrap();
@@ -623,33 +619,34 @@ mod tests {
     fn test_while_lowering_forwards_dimension_carries() {
         let extent = DimensionVariable::new("extent", DimensionBounds::new(1, Some(9)).unwrap());
         let extent_type = DimensionType::from(extent.clone());
-        let dynamic_vector_type = ArrayType::new(DataType::F32, Shape::new(vec![Dimension::Dynamic(extent.clone())]));
+        let dynamic_vector_type =
+            ArrayType::new(DataType::F32, Shape::new(vec![CoreDimension::Dynamic(extent.clone())]));
         let scalar_type = ArrayType::scalar(DataType::F32);
 
         let condition = {
-            let mut builder = ArrayIrXlaProgramBuilder::new();
+            let mut builder = ArrayIrProgramBuilder::new();
             let extent = builder.add_input(extent_type.clone().into());
             let predicate = builder
                 .add_instruction(
-                    XlaOperation::Compare(CompareOperation::new(ComparisonDirection::LessThan)),
+                    Operation::Compare(CompareOperation::new(ComparisonDirection::LessThan)),
                     Vec::new(),
                     vec![extent, extent],
                     None,
                 )
                 .unwrap()[0];
             builder
-                .build::<Vec<XlaConstant>, Vec<XlaConstant>>(vec![predicate], vec![Placeholder], vec![Placeholder])
+                .build::<Vec<Constant>, Vec<Constant>>(vec![predicate], vec![Placeholder], vec![Placeholder])
                 .unwrap()
         };
         let body = {
-            let mut builder = ArrayIrXlaProgramBuilder::new();
+            let mut builder = ArrayIrProgramBuilder::new();
             let extent = builder.add_input(extent_type.into());
             builder
-                .build::<Vec<XlaConstant>, Vec<XlaConstant>>(vec![extent], vec![Placeholder], vec![Placeholder])
+                .build::<Vec<Constant>, Vec<Constant>>(vec![extent], vec![Placeholder], vec![Placeholder])
                 .unwrap()
         };
 
-        let mut builder = ArrayIrXlaProgramBuilder::new();
+        let mut builder = ArrayIrProgramBuilder::new();
         let condition_region = builder.import_region(condition.entry_region_ref());
         let body_region = builder.import_region(body.entry_region_ref());
         let vector = builder.add_input(dynamic_vector_type.clone().into());
@@ -664,7 +661,7 @@ mod tests {
             .unwrap()[0];
         let carried_extent = builder
             .add_instruction(
-                XlaOperation::While(WhileOperation::new()),
+                Operation::While(WhileOperation::new()),
                 vec![condition_region, body_region],
                 vec![extent],
                 None,
@@ -674,11 +671,7 @@ mod tests {
             .add_instruction(DynamicBroadcastOperation::new(Vec::new()), Vec::new(), vec![scalar, carried_extent], None)
             .unwrap()[0];
         let program = builder
-            .build::<Vec<XlaConstant>, Vec<XlaConstant>>(
-                vec![output],
-                vec![Placeholder, Placeholder],
-                vec![Placeholder],
-            )
+            .build::<Vec<Constant>, Vec<Constant>>(vec![output], vec![Placeholder, Placeholder], vec![Placeholder])
             .unwrap();
         let stablehlo = to_mlir_module_for_program(
             &program,
@@ -731,37 +724,33 @@ mod tests {
         let static_type = ArrayType::new_static(DataType::F64, [3]);
         let state_type = ArrayType::new(DataType::F64, Shape::new(vec![dynamic_dimension("rows", Some(5))]));
         let condition = {
-            let mut builder = ArrayIrXlaProgramBuilder::new();
+            let mut builder = ArrayIrProgramBuilder::new();
             builder.add_input(state_type.clone().into());
             builder.add_input(state_type.clone().into());
-            let predicate = builder.add_constant(XlaConstant::Boolean(true));
+            let predicate = builder.add_constant(Constant::Boolean(true));
             builder
-                .build::<Vec<XlaConstant>, Vec<XlaConstant>>(vec![predicate], vec![Placeholder; 2], vec![Placeholder])
+                .build::<Vec<Constant>, Vec<Constant>>(vec![predicate], vec![Placeholder; 2], vec![Placeholder])
                 .unwrap()
         };
         let body = {
-            let mut builder = ArrayIrXlaProgramBuilder::new();
+            let mut builder = ArrayIrProgramBuilder::new();
             let first = builder.add_input(state_type.clone().into());
             let second = builder.add_input(state_type.clone().into());
             let sum = builder
                 .add_instruction(AddOperation::<ArrayType>::new(), Vec::new(), vec![first, second], None)
                 .unwrap()[0];
             builder
-                .build::<Vec<XlaConstant>, Vec<XlaConstant>>(
-                    vec![first, sum],
-                    vec![Placeholder; 2],
-                    vec![Placeholder; 2],
-                )
+                .build::<Vec<Constant>, Vec<Constant>>(vec![first, sum], vec![Placeholder; 2], vec![Placeholder; 2])
                 .unwrap()
         };
-        let mut builder = ArrayIrXlaProgramBuilder::new();
+        let mut builder = ArrayIrProgramBuilder::new();
         let condition = builder.import_region(condition.entry_region_ref());
         let body = builder.import_region(body.entry_region_ref());
         let dynamic_input = builder.add_input(state_type.clone().into());
         let static_input = builder.add_input(static_type.clone().into());
         let outputs = builder
             .add_instruction(
-                XlaOperation::While(WhileOperation::new().with_iteration_bound(1).unwrap()),
+                Operation::While(WhileOperation::new().with_iteration_bound(1).unwrap()),
                 vec![condition, body],
                 vec![dynamic_input, static_input],
                 None,
@@ -769,7 +758,7 @@ mod tests {
             .unwrap()
             .to_vec();
         let program = builder
-            .build::<Vec<XlaConstant>, Vec<XlaConstant>>(outputs, vec![Placeholder; 2], vec![Placeholder; 2])
+            .build::<Vec<Constant>, Vec<Constant>>(outputs, vec![Placeholder; 2], vec![Placeholder; 2])
             .unwrap();
         assert_eq!(
             program.output_types(),
@@ -873,40 +862,36 @@ mod tests {
         );
         let input_type = ArrayType::new(
             DataType::F64,
-            Shape::new(vec![state_type.shape().dimensions()[0].clone(), Dimension::Static(3)]),
+            Shape::new(vec![state_type.shape().dimensions()[0].clone(), CoreDimension::Static(3)]),
         );
         let condition = {
-            let mut builder = ArrayIrXlaProgramBuilder::new();
+            let mut builder = ArrayIrProgramBuilder::new();
             builder.add_input(state_type.clone().into());
             builder.add_input(state_type.clone().into());
-            let predicate = builder.add_constant(XlaConstant::Boolean(true));
+            let predicate = builder.add_constant(Constant::Boolean(true));
             builder
-                .build::<Vec<XlaConstant>, Vec<XlaConstant>>(vec![predicate], vec![Placeholder; 2], vec![Placeholder])
+                .build::<Vec<Constant>, Vec<Constant>>(vec![predicate], vec![Placeholder; 2], vec![Placeholder])
                 .unwrap()
         };
         let body = {
-            let mut builder = ArrayIrXlaProgramBuilder::new();
+            let mut builder = ArrayIrProgramBuilder::new();
             let first = builder.add_input(state_type.clone().into());
             let second = builder.add_input(state_type.clone().into());
             let sum = builder
                 .add_instruction(AddOperation::<ArrayType>::new(), Vec::new(), vec![first, second], None)
                 .unwrap()[0];
             builder
-                .build::<Vec<XlaConstant>, Vec<XlaConstant>>(
-                    vec![first, sum],
-                    vec![Placeholder; 2],
-                    vec![Placeholder; 2],
-                )
+                .build::<Vec<Constant>, Vec<Constant>>(vec![first, sum], vec![Placeholder; 2], vec![Placeholder; 2])
                 .unwrap()
         };
-        let mut builder = ArrayIrXlaProgramBuilder::new();
+        let mut builder = ArrayIrProgramBuilder::new();
         let condition = builder.import_region(condition.entry_region_ref());
         let body = builder.import_region(body.entry_region_ref());
         let dynamic_input = builder.add_input(state_type.clone().into());
         let refined_input = builder.add_input(input_type.into());
         let outputs = builder
             .add_instruction(
-                XlaOperation::While(WhileOperation::new().with_iteration_bound(1).unwrap()),
+                Operation::While(WhileOperation::new().with_iteration_bound(1).unwrap()),
                 vec![condition, body],
                 vec![dynamic_input, refined_input],
                 None,
@@ -914,7 +899,7 @@ mod tests {
             .unwrap()
             .to_vec();
         let program = builder
-            .build::<Vec<XlaConstant>, Vec<XlaConstant>>(outputs, vec![Placeholder; 2], vec![Placeholder; 2])
+            .build::<Vec<Constant>, Vec<Constant>>(outputs, vec![Placeholder; 2], vec![Placeholder; 2])
             .unwrap();
         let first = [1.0, 2.0, 3.0, 0.0, 4.0, 5.0, 6.0, 0.0, 0.0, 0.0, 0.0, 0.0, 0.0, 0.0, 0.0, 0.0];
         let second = [10.0, 20.0, 30.0, 40.0, 50.0, 60.0, 0.0, 0.0, 0.0, 0.0, 0.0, 0.0];
@@ -942,7 +927,7 @@ mod tests {
         // state so assertions and prints remain on their independent enclosing effect chains.
         let state_type = ArrayType::scalar(DataType::Boolean);
         let condition = {
-            let mut builder = ArrayIrXlaProgramBuilder::new();
+            let mut builder = ArrayIrProgramBuilder::new();
             let state = builder.add_input(state_type.clone().into());
             builder
                 .add_instruction(
@@ -956,23 +941,23 @@ mod tests {
                 .add_instruction(PrintOperation::<ArrayType>::new("condition"), Vec::new(), vec![state], None)
                 .unwrap()[0];
             builder
-                .build::<Vec<XlaConstant>, Vec<XlaConstant>>(vec![predicate], vec![Placeholder], vec![Placeholder])
+                .build::<Vec<Constant>, Vec<Constant>>(vec![predicate], vec![Placeholder], vec![Placeholder])
                 .unwrap()
         };
-        let mut builder = ArrayIrXlaProgramBuilder::new();
+        let mut builder = ArrayIrProgramBuilder::new();
         let condition_region = builder.import_region(condition.entry_region_ref());
-        let body_region = builder.import_program(unproject_plain_program(xla_identity_branch(state_type.clone())));
+        let body_region = builder.import_program(unproject_plain_program(identity_branch(state_type.clone())));
         let state = builder.add_input(state_type.clone().into());
         let output = builder
             .add_instruction(
-                XlaOperation::While(WhileOperation::new().with_iteration_bound(1).unwrap()),
+                Operation::While(WhileOperation::new().with_iteration_bound(1).unwrap()),
                 vec![condition_region, body_region],
                 vec![state],
                 None,
             )
             .unwrap()[0];
         let program = builder
-            .build::<Vec<XlaConstant>, Vec<XlaConstant>>(vec![output], vec![Placeholder], vec![Placeholder])
+            .build::<Vec<Constant>, Vec<Constant>>(vec![output], vec![Placeholder], vec![Placeholder])
             .unwrap();
         let stablehlo =
             to_mlir_module_for_program(&program, &[], &state_type, &state_type, "main", None, None).unwrap();
@@ -1029,17 +1014,17 @@ mod tests {
         // and truncation at the bound runs it only before each permitted body execution.
         let state_type = ArrayType::scalar(DataType::F64);
         let condition = {
-            let mut builder = ArrayIrXlaProgramBuilder::new();
+            let mut builder = ArrayIrProgramBuilder::new();
             let state = builder.add_input(state_type.clone().into());
             let state = builder
                 .add_instruction(PrintOperation::<ArrayType>::new("condition"), Vec::new(), vec![state], None)
                 .unwrap()[0];
             let predicate = positive(&mut builder, state);
-            builder.build::<Vec<XlaConstant>, Vec<XlaConstant>>(vec![predicate], vec![Placeholder], vec![Placeholder])
+            builder.build::<Vec<Constant>, Vec<Constant>>(vec![predicate], vec![Placeholder], vec![Placeholder])
         }
         .unwrap();
         let body = {
-            let mut builder = ArrayIrXlaProgramBuilder::new();
+            let mut builder = ArrayIrProgramBuilder::new();
             let state = builder.add_input(state_type.clone().into());
             let one = builder
                 .add_instruction(OneLikeOperation::<ArrayType>::new(), Vec::new(), vec![state], None)
@@ -1048,23 +1033,23 @@ mod tests {
             let next = builder
                 .add_instruction(PrintOperation::<ArrayType>::new("body"), Vec::new(), vec![next], None)
                 .unwrap()[0];
-            builder.build::<Vec<XlaConstant>, Vec<XlaConstant>>(vec![next], vec![Placeholder], vec![Placeholder])
+            builder.build::<Vec<Constant>, Vec<Constant>>(vec![next], vec![Placeholder], vec![Placeholder])
         }
         .unwrap();
-        let mut builder = ArrayIrXlaProgramBuilder::new();
+        let mut builder = ArrayIrProgramBuilder::new();
         let condition_region = builder.import_region(condition.entry_region_ref());
         let body_region = builder.import_region(body.entry_region_ref());
         let state = builder.add_input(state_type.clone().into());
         let output = builder
             .add_instruction(
-                XlaOperation::While(WhileOperation::new().with_iteration_bound(2).unwrap()),
+                Operation::While(WhileOperation::new().with_iteration_bound(2).unwrap()),
                 vec![condition_region, body_region],
                 vec![state],
                 None,
             )
             .unwrap()[0];
         let program = builder
-            .build::<Vec<XlaConstant>, Vec<XlaConstant>>(vec![output], vec![Placeholder], vec![Placeholder])
+            .build::<Vec<Constant>, Vec<Constant>>(vec![output], vec![Placeholder], vec![Placeholder])
             .unwrap();
         let client = execution_client();
         ensure_print_handler_registered(&client).unwrap();
@@ -1090,38 +1075,38 @@ mod tests {
         // equals the state shape here, so no broadcast is needed for the mask. The countdown `while (x > 0) { x - 1 }`
         // over the items `[3, 1, 2]` terminates them after 3, 1, and 2 iterations, so all of them land at 0, whereas a
         // masking bug (or a rejoining finished item) would leave nonzero or negative items.
-        let state_type = ArrayType::new(DataType::F64, Shape::new(vec![Dimension::Static(3)]));
+        let state_type = ArrayType::new(DataType::F64, Shape::new(vec![CoreDimension::Static(3)]));
         let condition = {
-            let mut builder = ArrayIrXlaProgramBuilder::new();
+            let mut builder = ArrayIrProgramBuilder::new();
             let state = builder.add_input(state_type.clone().into());
             let predicate = positive(&mut builder, state);
-            builder.build::<Vec<XlaConstant>, Vec<XlaConstant>>(vec![predicate], vec![Placeholder], vec![Placeholder])
+            builder.build::<Vec<Constant>, Vec<Constant>>(vec![predicate], vec![Placeholder], vec![Placeholder])
         }
         .unwrap();
         let body = {
-            let mut builder = ArrayIrXlaProgramBuilder::new();
+            let mut builder = ArrayIrProgramBuilder::new();
             let state = builder.add_input(state_type.clone().into());
             let one = builder
                 .add_instruction(OneLikeOperation::<ArrayType>::new(), Vec::new(), vec![state], None)
                 .unwrap()[0];
             let next = builder.add_instruction(SubOperation::new(), Vec::new(), vec![state, one], None).unwrap()[0];
-            builder.build::<Vec<XlaConstant>, Vec<XlaConstant>>(vec![next], vec![Placeholder], vec![Placeholder])
+            builder.build::<Vec<Constant>, Vec<Constant>>(vec![next], vec![Placeholder], vec![Placeholder])
         }
         .unwrap();
-        let mut builder = ArrayIrXlaProgramBuilder::new();
+        let mut builder = ArrayIrProgramBuilder::new();
         let condition_region = builder.import_region(condition.entry_region_ref());
         let body_region = builder.import_region(body.entry_region_ref());
         let state = builder.add_input(state_type.clone().into());
         let output = builder
             .add_instruction(
-                XlaOperation::While(WhileOperation::new()),
+                Operation::While(WhileOperation::new()),
                 vec![condition_region, body_region],
                 vec![state],
                 None,
             )
             .unwrap()[0];
         let program = builder
-            .build::<Vec<XlaConstant>, Vec<XlaConstant>>(vec![output], vec![Placeholder], vec![Placeholder])
+            .build::<Vec<Constant>, Vec<Constant>>(vec![output], vec![Placeholder], vec![Placeholder])
             .unwrap();
         assert_eq!(
             lowered_mixed_module(&program),
@@ -1278,21 +1263,21 @@ mod tests {
                 "},
             ),
         ] {
-            let predicate_type = ArrayType::new(DataType::Boolean, Shape::new(vec![Dimension::Static(2)]));
+            let predicate_type = ArrayType::new(DataType::Boolean, Shape::new(vec![CoreDimension::Static(2)]));
             let state_type = ArrayType::new(
                 DataType::F32,
                 Shape::new(vec![
-                    Dimension::Static(2),
+                    CoreDimension::Static(2),
                     dynamic_dimension("rows", upper_bound),
                     dynamic_dimension("columns", upper_bound),
                 ]),
             );
             let condition = {
-                let mut builder = ArrayIrXlaProgramBuilder::new();
+                let mut builder = ArrayIrProgramBuilder::new();
                 let predicate = builder.add_input(predicate_type.clone().into());
                 builder.add_input(state_type.clone().into());
                 builder
-                    .build::<Vec<XlaConstant>, Vec<XlaConstant>>(
+                    .build::<Vec<Constant>, Vec<Constant>>(
                         vec![predicate],
                         vec![Placeholder, Placeholder],
                         vec![Placeholder],
@@ -1300,36 +1285,32 @@ mod tests {
                     .unwrap()
             };
             let body = {
-                let mut builder = ArrayIrXlaProgramBuilder::new();
+                let mut builder = ArrayIrProgramBuilder::new();
                 let predicate = builder.add_input(predicate_type.clone().into());
                 let state = builder.add_input(state_type.clone().into());
                 builder
-                    .build::<Vec<XlaConstant>, Vec<XlaConstant>>(
+                    .build::<Vec<Constant>, Vec<Constant>>(
                         vec![predicate, state],
                         vec![Placeholder, Placeholder],
                         vec![Placeholder, Placeholder],
                     )
                     .unwrap()
             };
-            let mut builder = ArrayIrXlaProgramBuilder::new();
+            let mut builder = ArrayIrProgramBuilder::new();
             let condition = builder.import_region(condition.entry_region_ref());
             let body = builder.import_region(body.entry_region_ref());
             let predicate = builder.add_input(predicate_type.clone().into());
             let state = builder.add_input(state_type.clone().into());
             let output = builder
                 .add_instruction(
-                    XlaOperation::While(WhileOperation::new().with_iteration_bound(2).unwrap()),
+                    Operation::While(WhileOperation::new().with_iteration_bound(2).unwrap()),
                     vec![condition, body],
                     vec![predicate, state],
                     None,
                 )
                 .unwrap()[1];
             let program = builder
-                .build::<Vec<XlaConstant>, Vec<XlaConstant>>(
-                    vec![output],
-                    vec![Placeholder, Placeholder],
-                    vec![Placeholder],
-                )
+                .build::<Vec<Constant>, Vec<Constant>>(vec![output], vec![Placeholder, Placeholder], vec![Placeholder])
                 .unwrap();
             let module = to_mlir_module_for_program(
                 &program,
@@ -1354,14 +1335,14 @@ mod tests {
         // region still `or`-reduces the per-item predicate into the scalar continuation decision.
         let extent = DimensionVariable::new("extent", DimensionBounds::new(1, Some(9)).unwrap());
         let extent_type = DimensionType::from(extent.clone());
-        let dynamic_vector_type = ArrayType::new(DataType::F32, Shape::new(vec![Dimension::Dynamic(extent)]));
-        let state_type = ArrayType::new(DataType::F64, Shape::new(vec![Dimension::Static(3)]));
+        let dynamic_vector_type = ArrayType::new(DataType::F32, Shape::new(vec![CoreDimension::Dynamic(extent)]));
+        let state_type = ArrayType::new(DataType::F64, Shape::new(vec![CoreDimension::Static(3)]));
         let condition = {
-            let mut builder = ArrayIrXlaProgramBuilder::new();
+            let mut builder = ArrayIrProgramBuilder::new();
             builder.add_input(extent_type.clone().into());
             let state = builder.add_input(state_type.clone().into());
             let predicate = positive(&mut builder, state);
-            builder.build::<Vec<XlaConstant>, Vec<XlaConstant>>(
+            builder.build::<Vec<Constant>, Vec<Constant>>(
                 vec![predicate],
                 vec![Placeholder, Placeholder],
                 vec![Placeholder],
@@ -1369,21 +1350,21 @@ mod tests {
         }
         .unwrap();
         let body = {
-            let mut builder = ArrayIrXlaProgramBuilder::new();
+            let mut builder = ArrayIrProgramBuilder::new();
             let carried_extent = builder.add_input(extent_type.into());
             let state = builder.add_input(state_type.clone().into());
             let one = builder
                 .add_instruction(OneLikeOperation::<ArrayType>::new(), Vec::new(), vec![state], None)
                 .unwrap()[0];
             let next = builder.add_instruction(SubOperation::new(), Vec::new(), vec![state, one], None).unwrap()[0];
-            builder.build::<Vec<XlaConstant>, Vec<XlaConstant>>(
+            builder.build::<Vec<Constant>, Vec<Constant>>(
                 vec![carried_extent, next],
                 vec![Placeholder, Placeholder],
                 vec![Placeholder, Placeholder],
             )
         }
         .unwrap();
-        let mut builder = ArrayIrXlaProgramBuilder::new();
+        let mut builder = ArrayIrProgramBuilder::new();
         let condition_region = builder.import_region(condition.entry_region_ref());
         let body_region = builder.import_region(body.entry_region_ref());
         let vector = builder.add_input(dynamic_vector_type.clone().into());
@@ -1398,18 +1379,14 @@ mod tests {
             .unwrap()[0];
         let output = builder
             .add_instruction(
-                XlaOperation::While(WhileOperation::new()),
+                Operation::While(WhileOperation::new()),
                 vec![condition_region, body_region],
                 vec![extent, state],
                 None,
             )
             .unwrap()[1];
         let program = builder
-            .build::<Vec<XlaConstant>, Vec<XlaConstant>>(
-                vec![output],
-                vec![Placeholder, Placeholder],
-                vec![Placeholder],
-            )
+            .build::<Vec<Constant>, Vec<Constant>>(vec![output], vec![Placeholder, Placeholder], vec![Placeholder])
             .unwrap();
         let stablehlo = to_mlir_module_for_program(
             &program,
@@ -1470,17 +1447,17 @@ mod tests {
         let vector_type = ArrayType::new_static(DataType::F32, [8]).with_sharding(vector_sharding.clone()).unwrap();
         let state_types = [scalar_type.clone(), scalar_type.clone(), vector_type.clone()];
         let loop_condition = {
-            let mut builder = ArrayIrXlaProgramBuilder::new();
+            let mut builder = ArrayIrProgramBuilder::new();
             let inputs = state_types.iter().map(|r#type| builder.add_input(r#type.clone().into())).collect::<Vec<_>>();
             let predicate = builder
                 .add_instruction(compare(ComparisonDirection::LessThan), Vec::new(), vec![inputs[0], inputs[1]], None)
                 .unwrap()[0];
             builder
-                .build::<Vec<XlaConstant>, Vec<XlaConstant>>(vec![predicate], vec![Placeholder; 3], vec![Placeholder])
+                .build::<Vec<Constant>, Vec<Constant>>(vec![predicate], vec![Placeholder; 3], vec![Placeholder])
                 .unwrap()
         };
         let loop_body = {
-            let mut builder = ArrayIrXlaProgramBuilder::new();
+            let mut builder = ArrayIrProgramBuilder::new();
             let inputs = state_types.iter().map(|r#type| builder.add_input(r#type.clone().into())).collect::<Vec<_>>();
             let (index, limit, vector) = (inputs[0], inputs[1], inputs[2]);
             let one = builder
@@ -1489,27 +1466,22 @@ mod tests {
             let index = builder.add_instruction(AddOperation::new(), Vec::new(), vec![index, one], None).unwrap()[0];
             let vector = builder.add_instruction(NegOperation::new(), Vec::new(), vec![vector], None).unwrap()[0];
             builder
-                .build::<Vec<XlaConstant>, Vec<XlaConstant>>(
+                .build::<Vec<Constant>, Vec<Constant>>(
                     vec![index, limit, vector],
                     vec![Placeholder; 3],
                     vec![Placeholder; 3],
                 )
                 .unwrap()
         };
-        let mut builder = ArrayIrXlaProgramBuilder::new();
+        let mut builder = ArrayIrProgramBuilder::new();
         let condition_region = builder.import_region(loop_condition.entry_region_ref());
         let body_region = builder.import_region(loop_body.entry_region_ref());
         let inputs = state_types.iter().map(|r#type| builder.add_input(r#type.clone().into())).collect::<Vec<_>>();
         let vector = builder
-            .add_instruction(
-                XlaOperation::While(WhileOperation::new()),
-                vec![condition_region, body_region],
-                inputs,
-                None,
-            )
+            .add_instruction(Operation::While(WhileOperation::new()), vec![condition_region, body_region], inputs, None)
             .unwrap()[2];
         let program = builder
-            .build::<Vec<XlaConstant>, Vec<XlaConstant>>(vec![vector], vec![Placeholder; 3], vec![Placeholder])
+            .build::<Vec<Constant>, Vec<Constant>>(vec![vector], vec![Placeholder; 3], vec![Placeholder])
             .unwrap();
         assert_eq!(
             program.to_string(),

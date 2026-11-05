@@ -16,7 +16,7 @@ use ryft_xla_sys::mlir::dialects::mosaic::gpu::{
 };
 use sha2::{Digest, Sha256};
 
-use crate::kernels::staging::{XlaKernelExecutionFacts, XlaKernelTarget};
+use crate::kernels::staging::{KernelExecutionFacts, KernelTarget};
 use crate::kernels::{KernelEmbeddingError, KernelOutputEmbedding, dense_memory_layouts};
 
 /// Embeds checked Mosaic GPU source using the pinned native binary-source and resource schemas.
@@ -104,8 +104,8 @@ impl<Extension: KernelExtension> KernelOutputEmbedding<CompiledKernel, Extension
     }
 }
 
-impl XlaKernelTarget for Target {
-    fn admit_execution(&self, facts: &XlaKernelExecutionFacts) -> Result<(), KernelEmbeddingError> {
+impl KernelTarget for Target {
+    fn admit_execution(&self, facts: &KernelExecutionFacts) -> Result<(), KernelEmbeddingError> {
         if !facts.platform_name.eq_ignore_ascii_case("cuda")
             || !facts.has_ffi_extension
             || facts.pjrt_version != ryft_pjrt::VERSION
@@ -159,19 +159,19 @@ mod tests {
     use ryft_kernels::{KernelSchedule, VerifiedKernel};
     use ryft_mosaic::kernels::gpu::{Compiler, Options};
 
-    use crate::kernels::staging::XlaKernelDeviceFacts;
+    use crate::kernels::staging::KernelDeviceFacts;
 
     use super::*;
 
     /// Complete deterministic live-device facts without loading a hardware plugin.
-    fn facts() -> XlaKernelExecutionFacts {
-        XlaKernelExecutionFacts {
+    fn facts() -> KernelExecutionFacts {
+        KernelExecutionFacts {
             platform_name: "CUDA".to_owned(),
             platform_version: "cuda 13020".to_owned(),
             pjrt_version: ryft_pjrt::VERSION,
             has_ffi_extension: true,
             attributes: BTreeMap::new(),
-            devices: vec![XlaKernelDeviceFacts {
+            devices: vec![KernelDeviceFacts {
                 kind: "fixture GPU".to_owned(),
                 attributes: BTreeMap::from([(
                     "compute_capability".to_owned(),

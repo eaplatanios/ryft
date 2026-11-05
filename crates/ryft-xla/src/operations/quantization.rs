@@ -2,8 +2,9 @@ use std::collections::HashMap;
 
 use ryft_core::macros::check_count;
 use ryft_core::{
-    ArrayType, CompositeKey, DataType, Dimension, DomainTracingContext, EmptyRegionDriver,
-    MemberInterpretableOperation, Operation, ProgramError, ScaledDotOperation, Shape, Value,
+    ArrayType, CompositeKey, DataType, Dimension as CoreDimension, DomainTracingContext, EmptyRegionDriver,
+    MemberInterpretableOperation, Operation as CoreOperation, ProgramError, ScaledDotOperation, Shape,
+    Value as CoreValue,
 };
 use ryft_mlir::dialects::stable_hlo;
 use ryft_mlir::dialects::stable_hlo::{CustomCallApiVersion, CustomCallMemoryLayouts};
@@ -12,7 +13,7 @@ use ryft_mlir::{
     Value as MlirValue, ValueRef,
 };
 
-use crate::experimental::domains::XlaTracer;
+use crate::domains::Tracer;
 use crate::experimental::lowering::CollectiveLoweringState;
 use crate::experimental::lowering::compositions::{
     NamedCompositionKey, lower_decomposition_call, named_composition_input_types,
@@ -21,17 +22,17 @@ use crate::experimental::lowering::types::{
     lower_element_type, lower_f64_constant_splat, lower_physical_bound_value, lower_restore_dynamic_dimensions,
     lower_tensor_type, physical_bound_type,
 };
-use crate::experimental::ops::FlatXlaProgram;
-use crate::{Error, LowerableOperation, LowerableOperationFamily, XlaDomain, XlaLowerer};
+use crate::experimental::ops::FlatProgram;
+use crate::{Domain, Error, LowerableOperation, LowerableOperationFamily, Lowerer};
 
 /// Traces the canonical scaled-dot decomposition for one validated operation boundary.
 pub(crate) fn trace_scaled_dot_composition(
     operation: &ScaledDotOperation,
     input_types: &[ArrayType],
-) -> Result<FlatXlaProgram, Error> {
+) -> Result<FlatProgram, Error> {
     let input_types = named_composition_input_types(&scaled_dot_composite_input_types(operation, input_types)?)?;
-    let (_, program) = DomainTracingContext::<XlaDomain<'static>>::trace(
-        |inputs: Vec<XlaTracer<'static>>| {
+    let (_, program) = DomainTracingContext::<Domain<'static>>::trace(
+        |inputs: Vec<Tracer<'static>>| {
             let [lhs, rhs, lhs_scale, rhs_scale] = inputs.as_slice() else {
                 return Err(ProgramError::InvalidInputCount { expected: 4, actual: inputs.len() });
             };
@@ -57,7 +58,11 @@ fn scaled_dot_dummy_scale_type(elements: &ArrayType, contracting_dimensions: &[u
                 .enumerate()
                 .map(
                     |(axis, dimension)| {
-                        if contracting_dimensions.contains(&axis) { Dimension::Static(1) } else { dimension.clone() }
+                        if contracting_dimensions.contains(&axis) {
+                            CoreDimension::Static(1)
+                        } else {
+                            dimension.clone()
+                        }
                     },
                 )
                 .collect(),
@@ -108,14 +113,14 @@ fn scaled_dot_uses_cuda_physical_boundary(
     ] {
         if contracting_dimensions
             .iter()
-            .any(|axis| matches!(input_types[element_index].dimension(*axis), Dimension::Dynamic(_)))
+            .any(|axis| matches!(input_types[element_index].dimension(*axis), CoreDimension::Dynamic(_)))
         {
             return Ok(false);
         }
         if has_scale {
             if contracting_dimensions
                 .iter()
-                .any(|axis| matches!(input_types[scale_index].dimension(*axis), Dimension::Dynamic(_)))
+                .any(|axis| matches!(input_types[scale_index].dimension(*axis), CoreDimension::Dynamic(_)))
             {
                 return Ok(false);
             }
@@ -166,7 +171,7 @@ fn block_scaled_dot_custom_call_permutations(
         if rank != batching_dimension_count + 2 {
             return Ok(None);
         }
-        let (Dimension::Static(element_extent), Dimension::Static(scale_extent)) =
+        let (CoreDimension::Static(element_extent), CoreDimension::Static(scale_extent)) =
             (elements.dimension(contracting_dimension), scales.dimension(contracting_dimension))
         else {
             return Ok(None);
@@ -510,7 +515,7 @@ pub(crate) fn scaled_dot_composition_key(
 impl LowerableOperation for ScaledDotOperation {
     fn lower<'b, 'c: 'b, 't: 'c, O: LowerableOperationFamily>(
         &self,
-        lowerer: &mut XlaLowerer<'b, 'c, 't, O>,
+        lowerer: &mut Lowerer<'b, 'c, 't, O>,
         input_values: &[ValueRef<'b, 'c, 't>],
         input_types: &[ArrayType],
         output_types: &[ArrayType],
@@ -537,7 +542,7 @@ mod tests {
     use indoc::indoc;
     use pretty_assertions::assert_eq;
     use ryft_core::{
-        AddOperation, Array, ArrayIrType, ArrayOperation, BlockQuantize, BlockQuantizedValue,
+        AddOperation, Array as CoreArray, ArrayIrType, ArrayOperation, BlockQuantize, BlockQuantizedValue,
         BlockScaledDotConfiguration, ConvertElementType, Device, DeviceMesh, DimensionBounds, DimensionVariable,
         DotDimensionNumbers, EagerContext, LogicalMesh, MeshAxis, MeshAxisType, Placeholder, ProjectedContext,
         RandomAlgorithm, Sharding, block_scaled_dot, differentiate_at,
@@ -545,29 +550,27 @@ mod tests {
 
     use crate::experimental::lowering::lower_mlir_module_for_program;
     use crate::experimental::lowering::tests::{
-        MixedValue, XlaProgramBuilder, add_xla_jit_call, execute_mixed_program, unproject_plain_program,
+        MixedValue, ProgramBuilder, add_jit_call, execute_mixed_program, unproject_plain_program,
     };
-    use crate::experimental::ops::{
-        XlaArrayConstant, XlaConstant, XlaProgram, XlaProgramBuilder as ArrayIrXlaProgramBuilder,
-    };
-    use crate::jit::{CompiledXlaFunction, compile};
+    use crate::experimental::ops::{ArrayConstant, Constant, Program, ProgramBuilder as ArrayIrProgramBuilder};
+    use crate::jit::{CompiledFunction, compile};
     use crate::tests::{execution_client, values_from_bytes, values_to_bytes};
-    use crate::{FromPjrt, XlaArray, XlaDomain, XlaSession, to_mlir_module_for_program};
+    use crate::{Array, Domain, FromPjrt, Session, to_mlir_module_for_program};
 
     use super::*;
 
     /// Builds the NVFP4 scaled-dot program shared by the platform-gated lowering fixtures below:
     /// `f4e2m1fn [2, 16]` operands with `f8e4m3fn [2, 1]` scales over blocks of 16.
-    fn scaled_dot_fixture_program() -> (XlaProgram<Vec<XlaConstant>, Vec<XlaConstant>>, Vec<ArrayType>, Vec<ArrayType>)
-    {
+    fn scaled_dot_fixture_program() -> (Program<Vec<Constant>, Vec<Constant>>, Vec<ArrayType>, Vec<ArrayType>) {
         use ryft_core::ScaledDotOperation;
 
         let element_type =
-            ArrayType::new(DataType::F4E2M1FN, Shape::new(vec![Dimension::Static(2), Dimension::Static(16)]));
+            ArrayType::new(DataType::F4E2M1FN, Shape::new(vec![CoreDimension::Static(2), CoreDimension::Static(16)]));
         let scale_type =
-            ArrayType::new(DataType::F8E4M3FN, Shape::new(vec![Dimension::Static(2), Dimension::Static(1)]));
-        let output_type = ArrayType::new(DataType::F32, Shape::new(vec![Dimension::Static(2), Dimension::Static(2)]));
-        let mut builder = XlaProgramBuilder::new();
+            ArrayType::new(DataType::F8E4M3FN, Shape::new(vec![CoreDimension::Static(2), CoreDimension::Static(1)]));
+        let output_type =
+            ArrayType::new(DataType::F32, Shape::new(vec![CoreDimension::Static(2), CoreDimension::Static(2)]));
+        let mut builder = ProgramBuilder::new();
         let inputs = vec![
             builder.add_input(element_type.clone()),
             builder.add_input(element_type.clone()),
@@ -588,11 +591,7 @@ mod tests {
             )
             .unwrap()[0];
         let program = builder
-            .build::<Vec<XlaArrayConstant>, Vec<XlaArrayConstant>>(
-                vec![output],
-                vec![Placeholder; 4],
-                vec![Placeholder],
-            )
+            .build::<Vec<ArrayConstant>, Vec<ArrayConstant>>(vec![output], vec![Placeholder; 4], vec![Placeholder])
             .unwrap();
         let input_types = vec![element_type.clone(), element_type, scale_type.clone(), scale_type];
         (unproject_plain_program(program), input_types, vec![output_type])
@@ -640,9 +639,10 @@ mod tests {
         // axes have size one, noncontracting axes retain the corresponding element extents, and the decomposition
         // ignores the identity operands rather than imposing block-ratio requirements on an absent scale.
         let element_type =
-            ArrayType::new(DataType::F8E4M3FN, Shape::new(vec![Dimension::Static(2), Dimension::Static(2)]));
-        let output_type = ArrayType::new(DataType::F32, Shape::new(vec![Dimension::Static(2), Dimension::Static(2)]));
-        let mut builder = XlaProgramBuilder::new();
+            ArrayType::new(DataType::F8E4M3FN, Shape::new(vec![CoreDimension::Static(2), CoreDimension::Static(2)]));
+        let output_type =
+            ArrayType::new(DataType::F32, Shape::new(vec![CoreDimension::Static(2), CoreDimension::Static(2)]));
+        let mut builder = ProgramBuilder::new();
         let inputs = vec![builder.add_input(element_type.clone()), builder.add_input(element_type.clone())];
         let output = builder
             .add_instruction(
@@ -659,11 +659,7 @@ mod tests {
             .unwrap()[0];
         let program = unproject_plain_program(
             builder
-                .build::<Vec<XlaArrayConstant>, Vec<XlaArrayConstant>>(
-                    vec![output],
-                    vec![Placeholder; 2],
-                    vec![Placeholder],
-                )
+                .build::<Vec<ArrayConstant>, Vec<ArrayConstant>>(vec![output], vec![Placeholder; 2], vec![Placeholder])
                 .unwrap(),
         );
         let module = to_mlir_module_for_program(
@@ -722,7 +718,7 @@ mod tests {
         let input_types =
             vec![element_type([1, 2, 32]), element_type([1, 32, 4]), scale_type([1, 2, 2]), scale_type([1, 2, 4])];
         let output_types = vec![ArrayType::new_static(DataType::BF16, [1, 2, 4])];
-        let mut builder = XlaProgramBuilder::new();
+        let mut builder = ProgramBuilder::new();
         let inputs = input_types.iter().cloned().map(|r#type| builder.add_input(r#type)).collect::<Vec<_>>();
         let output = builder
             .add_instruction(
@@ -739,11 +735,7 @@ mod tests {
             .unwrap()[0];
         let program = unproject_plain_program(
             builder
-                .build::<Vec<XlaArrayConstant>, Vec<XlaArrayConstant>>(
-                    vec![output],
-                    vec![Placeholder; 4],
-                    vec![Placeholder],
-                )
+                .build::<Vec<ArrayConstant>, Vec<ArrayConstant>>(vec![output], vec![Placeholder; 4], vec![Placeholder])
                 .unwrap(),
         );
         let module =
@@ -774,7 +766,7 @@ mod tests {
         let scale_type = ArrayType::new_static(DataType::F8E8M0FNU, [2, 1]);
         let input_types = vec![element_type.clone(), element_type, scale_type.clone(), scale_type];
         let output_types = vec![ArrayType::new_static(DataType::F32, [2, 2])];
-        let mut builder = XlaProgramBuilder::new();
+        let mut builder = ProgramBuilder::new();
         let inputs = input_types.iter().cloned().map(|r#type| builder.add_input(r#type)).collect::<Vec<_>>();
         let output = builder
             .add_instruction(
@@ -791,11 +783,7 @@ mod tests {
             .unwrap()[0];
         let program = unproject_plain_program(
             builder
-                .build::<Vec<XlaArrayConstant>, Vec<XlaArrayConstant>>(
-                    vec![output],
-                    vec![Placeholder; 4],
-                    vec![Placeholder],
-                )
+                .build::<Vec<ArrayConstant>, Vec<ArrayConstant>>(vec![output], vec![Placeholder; 4], vec![Placeholder])
                 .unwrap(),
         );
         let module =
@@ -816,21 +804,21 @@ mod tests {
         let rows = DimensionVariable::new("rows", DimensionBounds::new(1, Some(5)).unwrap());
         let lhs_type = ArrayType::new(
             DataType::F8E4M3FN,
-            Shape::new(vec![Dimension::Dynamic(rows.clone()), Dimension::Static(32)]),
+            Shape::new(vec![CoreDimension::Dynamic(rows.clone()), CoreDimension::Static(32)]),
         );
         let rhs_type =
-            ArrayType::new(DataType::F8E4M3FN, Shape::new(vec![Dimension::Static(1), Dimension::Static(32)]));
+            ArrayType::new(DataType::F8E4M3FN, Shape::new(vec![CoreDimension::Static(1), CoreDimension::Static(32)]));
         let lhs_scale_type = ArrayType::new(
             DataType::F8E8M0FNU,
-            Shape::new(vec![Dimension::Dynamic(rows.clone()), Dimension::Static(1)]),
+            Shape::new(vec![CoreDimension::Dynamic(rows.clone()), CoreDimension::Static(1)]),
         );
         let rhs_scale_type =
-            ArrayType::new(DataType::F8E8M0FNU, Shape::new(vec![Dimension::Static(1), Dimension::Static(1)]));
+            ArrayType::new(DataType::F8E8M0FNU, Shape::new(vec![CoreDimension::Static(1), CoreDimension::Static(1)]));
         let output_type =
-            ArrayType::new(DataType::F32, Shape::new(vec![Dimension::Dynamic(rows), Dimension::Static(1)]));
+            ArrayType::new(DataType::F32, Shape::new(vec![CoreDimension::Dynamic(rows), CoreDimension::Static(1)]));
         let input_types = vec![lhs_type, rhs_type, lhs_scale_type, rhs_scale_type];
         let output_types = vec![output_type];
-        let mut builder = XlaProgramBuilder::new();
+        let mut builder = ProgramBuilder::new();
         let inputs = input_types.iter().cloned().map(|r#type| builder.add_input(r#type)).collect::<Vec<_>>();
         let output = builder
             .add_instruction(
@@ -847,11 +835,7 @@ mod tests {
             .unwrap()[0];
         let program = unproject_plain_program(
             builder
-                .build::<Vec<XlaArrayConstant>, Vec<XlaArrayConstant>>(
-                    vec![output],
-                    vec![Placeholder; 4],
-                    vec![Placeholder],
-                )
+                .build::<Vec<ArrayConstant>, Vec<ArrayConstant>>(vec![output], vec![Placeholder; 4], vec![Placeholder])
                 .unwrap(),
         );
         let module =
@@ -908,19 +892,19 @@ mod tests {
             let blocks = DimensionVariable::new("blocks", DimensionBounds::new(1, Some(block_bound)).unwrap());
             let element_type = ArrayType::new(
                 DataType::F8E4M3FN,
-                Shape::new(vec![Dimension::Static(1), Dimension::Dynamic(elements)]),
+                Shape::new(vec![CoreDimension::Static(1), CoreDimension::Dynamic(elements)]),
             );
             let scale_type = ArrayType::new(
                 DataType::F8E8M0FNU,
                 Shape::new(vec![
-                    Dimension::Static(1),
-                    if block_bound == 2 { Dimension::Static(1) } else { Dimension::Dynamic(blocks) },
+                    CoreDimension::Static(1),
+                    if block_bound == 2 { CoreDimension::Static(1) } else { CoreDimension::Dynamic(blocks) },
                 ]),
             );
             let output_type =
-                ArrayType::new(DataType::F32, Shape::new(vec![Dimension::Static(1), Dimension::Static(1)]));
+                ArrayType::new(DataType::F32, Shape::new(vec![CoreDimension::Static(1), CoreDimension::Static(1)]));
             let input_types = vec![element_type.clone(), element_type, scale_type.clone(), scale_type];
-            let mut builder = XlaProgramBuilder::new();
+            let mut builder = ProgramBuilder::new();
             let inputs = input_types.iter().cloned().map(|r#type| builder.add_input(r#type)).collect::<Vec<_>>();
             let output = builder
                 .add_instruction(
@@ -937,7 +921,7 @@ mod tests {
                 .unwrap()[0];
             let program = unproject_plain_program(
                 builder
-                    .build::<Vec<XlaArrayConstant>, Vec<XlaArrayConstant>>(
+                    .build::<Vec<ArrayConstant>, Vec<ArrayConstant>>(
                         vec![output],
                         vec![Placeholder; 4],
                         vec![Placeholder],
@@ -978,11 +962,12 @@ mod tests {
         use ryft_core::ScaledDotOperation;
 
         let element_type =
-            ArrayType::new(DataType::F4E2M1FN, Shape::new(vec![Dimension::Static(2), Dimension::Static(16)]));
+            ArrayType::new(DataType::F4E2M1FN, Shape::new(vec![CoreDimension::Static(2), CoreDimension::Static(16)]));
         let scale_type =
-            ArrayType::new(DataType::F8E4M3FN, Shape::new(vec![Dimension::Static(2), Dimension::Static(1)]));
-        let output_type = ArrayType::new(DataType::F32, Shape::new(vec![Dimension::Static(2), Dimension::Static(2)]));
-        let mut callee_builder = XlaProgramBuilder::new();
+            ArrayType::new(DataType::F8E4M3FN, Shape::new(vec![CoreDimension::Static(2), CoreDimension::Static(1)]));
+        let output_type =
+            ArrayType::new(DataType::F32, Shape::new(vec![CoreDimension::Static(2), CoreDimension::Static(2)]));
+        let mut callee_builder = ProgramBuilder::new();
         let callee_inputs = vec![
             callee_builder.add_input(element_type.clone()),
             callee_builder.add_input(element_type.clone()),
@@ -1006,18 +991,18 @@ mod tests {
             callee_builder.build(vec![callee_output], vec![Placeholder; 4], vec![Placeholder]).unwrap(),
         ));
 
-        let mut builder = ArrayIrXlaProgramBuilder::new();
+        let mut builder = ArrayIrProgramBuilder::new();
         let inputs = vec![
             builder.add_input(element_type.clone().into()),
             builder.add_input(element_type.clone().into()),
             builder.add_input(scale_type.clone().into()),
             builder.add_input(scale_type.clone().into()),
         ];
-        let first = add_xla_jit_call(&mut builder, &callee, inputs.clone());
-        let second = add_xla_jit_call(&mut builder, &callee, inputs);
+        let first = add_jit_call(&mut builder, &callee, inputs.clone());
+        let second = add_jit_call(&mut builder, &callee, inputs);
         let output = builder.add_instruction(AddOperation::new(), Vec::new(), vec![first, second], None).unwrap()[0];
         let program = builder
-            .build::<Vec<XlaConstant>, Vec<XlaConstant>>(vec![output], vec![Placeholder; 4], vec![Placeholder])
+            .build::<Vec<Constant>, Vec<Constant>>(vec![output], vec![Placeholder; 4], vec![Placeholder])
             .unwrap();
         let input_types = vec![element_type.clone(), element_type, scale_type.clone(), scale_type];
         let module = lower_mlir_module_for_program(
@@ -1046,9 +1031,9 @@ mod tests {
             [(DataType::F8E4M3FN, DataType::F8E8M0FNU), (DataType::F4E2M1FN, DataType::F8E4M3FN)]
         {
             let extent = DimensionVariable::new("n", DimensionBounds::new(0, Some(9)).unwrap());
-            let input_type = ArrayType::new(DataType::F64, Shape::new(vec![Dimension::Dynamic(extent)]));
-            let (_, program) = DomainTracingContext::<XlaDomain<'static>>::trace(
-                |inputs: Vec<XlaTracer<'static>>| {
+            let input_type = ArrayType::new(DataType::F64, Shape::new(vec![CoreDimension::Dynamic(extent)]));
+            let (_, program) = DomainTracingContext::<Domain<'static>>::trace(
+                |inputs: Vec<Tracer<'static>>| {
                     let BlockQuantizedValue { elements, scales, .. } =
                         inputs[0].block_quantize(4, element_type, scale_type)?;
                     // Return ordinary floating-point arrays so that the mixed executable fixture can decode them.
@@ -1058,7 +1043,7 @@ mod tests {
             )
             .unwrap();
             let program = program.into_flat_program().simplified().unwrap();
-            let input = Array::vector(vec![3.0f64, 1.5, 0.5, 6.0]).unwrap();
+            let input = CoreArray::vector(vec![3.0f64, 1.5, 0.5, 6.0]).unwrap();
             let BlockQuantizedValue { elements, scales, .. } =
                 input.block_quantize(4, element_type, scale_type).unwrap();
             assert_eq!(
@@ -1091,7 +1076,7 @@ mod tests {
             vec![device],
         )
         .unwrap();
-        let domain = XlaSession::new(&client).domain();
+        let domain = Session::new(&client).domain();
         let placed = |data_type: DataType, shape: &[usize]| {
             ArrayType::new_static(data_type, shape.to_vec())
                 .with_sharding(Sharding::replicated(mesh.logical_mesh().clone(), shape.len()))
@@ -1099,8 +1084,8 @@ mod tests {
         };
         let dimensions = DotDimensionNumbers::new(vec![1], vec![1], Vec::new(), Vec::new());
         let configuration = BlockScaledDotConfiguration::nvfp4_training(dimensions);
-        let function = block_scaled_dot::<ProjectedContext<XlaDomain<'_>, ArrayType>>(configuration.clone()).unwrap();
-        let compiled: CompiledXlaFunction<
+        let function = block_scaled_dot::<ProjectedContext<Domain<'_>, ArrayType>>(configuration.clone()).unwrap();
+        let compiled: CompiledFunction<
             '_,
             (ArrayType, ArrayType, ArrayType, ArrayType),
             (ArrayType, ArrayType, ArrayType),
@@ -1128,7 +1113,7 @@ mod tests {
         };
         let (lhs, rhs, seed) = (values(32, 32, 0.1), values(16, 32, 0.7), values(32, 16, 1.3));
         let device = |data_type: DataType, shape: &[usize], bytes: Vec<u8>| {
-            XlaArray::from_host_buffer(&domain, placed(data_type, shape), mesh.clone(), bytes.as_slice()).unwrap()
+            Array::from_host_buffer(&domain, placed(data_type, shape), mesh.clone(), bytes.as_slice()).unwrap()
         };
         let outputs = domain
             .interpret(
@@ -1142,16 +1127,17 @@ mod tests {
             )
             .unwrap();
         let device_id = client.addressable_devices().unwrap()[0].id().unwrap();
-        let read = |array: &XlaArray<'_>| {
+        let read = |array: &Array<'_>| {
             let bytes = array.device_shard(device_id).unwrap().buffer().unwrap().copy_to_host(None).unwrap();
             values_from_bytes::<f32>(bytes.r#await().unwrap().as_slice())
         };
 
-        let reference_function = block_scaled_dot::<EagerContext<Array, ArrayOperation<Array>>>(configuration).unwrap();
+        let reference_function =
+            block_scaled_dot::<EagerContext<CoreArray, ArrayOperation<CoreArray>>>(configuration).unwrap();
         let host = |shape: [usize; 2], values: &[f32]| {
-            Array::from_elements::<f32>(ArrayType::new_static(DataType::F32, shape), values).unwrap()
+            CoreArray::from_elements::<f32>(ArrayType::new_static(DataType::F32, shape), values).unwrap()
         };
-        let state = Array::from_elements(RandomAlgorithm::ThreeFry.state_type(), &[7u64, 0]).unwrap();
+        let state = CoreArray::from_elements(RandomAlgorithm::ThreeFry.state_type(), &[7u64, 0]).unwrap();
         let (reference_output, pullback) = differentiate_at((host([32, 32], &lhs), host([16, 32], &rhs)))
             .with_captures(state)
             .vjp(|(lhs, rhs), state| reference_function.call(lhs, rhs, None, None, None, Some(state)))

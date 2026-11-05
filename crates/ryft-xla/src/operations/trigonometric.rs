@@ -5,7 +5,7 @@ use ryft_mlir::{Block, Context as MlirContext, Location, Operation as MlirOperat
 
 use crate::experimental::lowering::types::{lower_f64_constant_splat, lower_tensor_type};
 use crate::operations::{lower_accuracy, normalize_binary_elementwise_operands};
-use crate::{Error, LowerableOperation, LowerableOperationFamily, XlaLowerer};
+use crate::{Error, LowerableOperation, LowerableOperationFamily, Lowerer};
 
 /// Lowers complex sine or cosine through real operations while preserving an exact zero component for a zero real
 /// input. The direct StableHLO complex trigonometric operations can evaluate a mathematically zero product as
@@ -273,7 +273,7 @@ where
 impl LowerableOperation for SinOperation<ArrayType> {
     fn lower<'b, 'c: 'b, 't: 'c, O: LowerableOperationFamily>(
         &self,
-        lowerer: &mut XlaLowerer<'b, 'c, 't, O>,
+        lowerer: &mut Lowerer<'b, 'c, 't, O>,
         input_values: &[ValueRef<'b, 'c, 't>],
         _input_types: &[ArrayType],
         output_types: &[ArrayType],
@@ -300,7 +300,7 @@ impl LowerableOperation for SinOperation<ArrayType> {
 impl LowerableOperation for CosOperation<ArrayType> {
     fn lower<'b, 'c: 'b, 't: 'c, O: LowerableOperationFamily>(
         &self,
-        lowerer: &mut XlaLowerer<'b, 'c, 't, O>,
+        lowerer: &mut Lowerer<'b, 'c, 't, O>,
         input_values: &[ValueRef<'b, 'c, 't>],
         _input_types: &[ArrayType],
         output_types: &[ArrayType],
@@ -327,7 +327,7 @@ impl LowerableOperation for CosOperation<ArrayType> {
 impl LowerableOperation for TanOperation<ArrayType> {
     fn lower<'b, 'c: 'b, 't: 'c, O: LowerableOperationFamily>(
         &self,
-        lowerer: &mut XlaLowerer<'b, 'c, 't, O>,
+        lowerer: &mut Lowerer<'b, 'c, 't, O>,
         input_values: &[ValueRef<'b, 'c, 't>],
         _input_types: &[ArrayType],
         _output_types: &[ArrayType],
@@ -344,7 +344,7 @@ impl LowerableOperation for TanOperation<ArrayType> {
 impl LowerableOperation for Atan2Operation<ArrayType> {
     fn lower<'b, 'c: 'b, 't: 'c, O: LowerableOperationFamily>(
         &self,
-        lowerer: &mut XlaLowerer<'b, 'c, 't, O>,
+        lowerer: &mut Lowerer<'b, 'c, 't, O>,
         input_values: &[ValueRef<'b, 'c, 't>],
         _input_types: &[ArrayType],
         output_types: &[ArrayType],
@@ -364,7 +364,7 @@ impl LowerableOperation for Atan2Operation<ArrayType> {
 impl LowerableOperation for TanhOperation<ArrayType> {
     fn lower<'b, 'c: 'b, 't: 'c, O: LowerableOperationFamily>(
         &self,
-        lowerer: &mut XlaLowerer<'b, 'c, 't, O>,
+        lowerer: &mut Lowerer<'b, 'c, 't, O>,
         input_values: &[ValueRef<'b, 'c, 't>],
         _input_types: &[ArrayType],
         _output_types: &[ArrayType],
@@ -384,16 +384,16 @@ mod tests {
     use pretty_assertions::assert_eq;
     use ryft_core::{ArrayOperation, Placeholder};
 
-    use crate::experimental::lowering::tests::{XlaProgramBuilder, lowered_unary_module};
+    use crate::experimental::lowering::tests::{ProgramBuilder, lowered_unary_module};
     use crate::experimental::lowering::to_mlir_module_for_plain_program;
-    use crate::experimental::ops::XlaArrayConstant;
+    use crate::experimental::ops::ArrayConstant;
 
     use super::*;
 
     #[test]
     fn test_to_mlir_module_for_plain_program_lowers_complex_sine_and_cosine() {
         let complex_type = ArrayType::scalar(DataType::C64);
-        let mut builder = XlaProgramBuilder::new();
+        let mut builder = ProgramBuilder::new();
         let input = builder.add_input(complex_type);
         let sine = builder
             .add_instruction(ArrayOperation::Sin(SinOperation::new()), Vec::new(), vec![input], None)
@@ -402,7 +402,7 @@ mod tests {
             .add_instruction(ArrayOperation::Cos(CosOperation::new()), Vec::new(), vec![input], None)
             .unwrap()[0];
         let program = builder
-            .build::<Vec<XlaArrayConstant>, Vec<XlaArrayConstant>>(
+            .build::<Vec<ArrayConstant>, Vec<ArrayConstant>>(
                 vec![sine, cosine],
                 vec![Placeholder],
                 vec![Placeholder, Placeholder],

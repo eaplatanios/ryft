@@ -3,7 +3,7 @@
 //! Every case applies one tiny operation (an `f32[8]` add, a `condition` over such adds, a first-class dimension add,
 //! or an `f32[8]` reference read) on a single CPU device, so the measured time is dispatch overhead rather than
 //! computation. The dimension and reference cases come in pairs that compare dispatch through the session-carrying
-//! [`XlaValue`] members with the direct host implementations of the session-free `ArrayIrValue` members. Each case
+//! [`Value`] members with the direct host implementations of the session-free `ArrayIrValue` members. Each case
 //! runs warm-up calls and then several timed rounds without per-call synchronization (the same methodology as
 //! `python/scripts/compare_dispatch_performance_with_jax.py`), and reports the per-call mean of every round.
 
@@ -14,13 +14,13 @@ use std::time::Instant;
 
 use ryft_core::{
     Add, AddOperation, ArrayIrType, ArrayIrValue, ArrayType, ConditionOperation, Context, DataType, Device, DeviceMesh,
-    Dimension, DimensionValue, LogicalMesh, MeshAxis, MeshAxisType, MulOperation, Placeholder, ReferenceNew,
-    ReferenceRead, Shape, Sharding,
+    Dimension as CoreDimension, DimensionValue, LogicalMesh, MeshAxis, MeshAxisType, MulOperation, Placeholder,
+    ReferenceNew, ReferenceRead, Shape, Sharding,
 };
 use ryft_pjrt::protos::{CompilationOptions, ExecutableCompilationOptions, Precision};
 use ryft_pjrt::{ClientOptions, CpuClientOptions, ExecutionDeviceInputs, ExecutionInput, Program, load_cpu_plugin};
-use ryft_xla::experimental::ops::{XlaConstant, XlaOperation, XlaProgramBuilder};
-use ryft_xla::{FromPjrt, JittedXlaFunction, XlaArray, XlaCompileTracer, XlaDimension, XlaSession, XlaValue, jitted};
+use ryft_xla::experimental::ops::{Constant, Operation, ProgramBuilder};
+use ryft_xla::{Array, CompileTracer, Dimension, FromPjrt, JittedFunction, Session, Value, jitted};
 use serde_json::json;
 
 /// Command-line arguments of this benchmark.
@@ -124,11 +124,11 @@ fn main() -> Result<(), Box<dyn std::error::Error>> {
     let client = plugin.client(ClientOptions::CPU(CpuClientOptions { device_count: Some(1), ..Default::default() }))?;
     let device = Device::from_pjrt(&client.addressable_devices()?.remove(0))?;
     let mesh = DeviceMesh::new(LogicalMesh::new(vec![MeshAxis::new("x", 1, MeshAxisType::Auto)?])?, vec![device])?;
-    let domain = XlaSession::new(&client).domain();
-    let input_type = ArrayType::new(DataType::F32, Shape::new(vec![Dimension::Static(8)]))
+    let domain = Session::new(&client).domain();
+    let input_type = ArrayType::new(DataType::F32, Shape::new(vec![CoreDimension::Static(8)]))
         .with_sharding(Sharding::replicated(mesh.logical_mesh().clone(), 1))?;
     let bytes = (0..8).flat_map(|index| (index as f32).to_ne_bytes()).collect::<Vec<_>>();
-    let input = XlaArray::from_host_buffer(&domain, input_type.clone(), mesh.clone(), bytes.as_slice())?;
+    let input = Array::from_host_buffer(&domain, input_type.clone(), mesh.clone(), bytes.as_slice())?;
     input.block_until_ready()?;
 
     let mut results = HashMap::new();
@@ -138,10 +138,10 @@ fn main() -> Result<(), Box<dyn std::error::Error>> {
         results.insert("eager_add", measure(&arguments, || drop(Add::add(&input, &input).unwrap())));
     }
 
-    // First-class dimension addition through a session-carrying `XlaDimension`, which binds the operation through its
+    // First-class dimension addition through a session-carrying `Dimension`, which binds the operation through its
     // domain, and through a session-free `DimensionValue`, which adds the extents directly on the host.
     let extent = DimensionValue::constant(8)?;
-    let xla_extent = XlaDimension::new(extent.clone(), domain.clone());
+    let xla_extent = Dimension::new(extent.clone(), domain.clone());
     if arguments.selects("xla_dimension_add") {
         results.insert("xla_dimension_add", measure(&arguments, || drop(Add::add(&xla_extent, &xla_extent).unwrap())));
     }
@@ -149,9 +149,9 @@ fn main() -> Result<(), Box<dyn std::error::Error>> {
         results.insert("host_dimension_add", measure(&arguments, || drop(Add::add(&extent, &extent).unwrap())));
     }
 
-    // Reference reads through a session-carrying `XlaValue`, which binds the read through its domain, and through a
+    // Reference reads through a session-carrying `Value`, which binds the read through its domain, and through a
     // session-free `ArrayIrValue`, which reads the handle directly.
-    let xla_reference = XlaValue::Array(input.clone()).reference_new()?;
+    let xla_reference = Value::Array(input.clone()).reference_new()?;
     if arguments.selects("xla_reference_read") {
         results.insert("xla_reference_read", measure(&arguments, || drop(xla_reference.read().unwrap())));
     }
@@ -162,34 +162,34 @@ fn main() -> Result<(), Box<dyn std::error::Error>> {
 
     // Eager `condition` whose branch programs are rebuilt for every application, like closures traced per call.
     let branch_type = ArrayIrType::Array(input_type.clone());
-    let branch = |operation: XlaOperation| {
-        let mut builder = XlaProgramBuilder::new();
+    let branch = |operation: Operation| {
+        let mut builder = ProgramBuilder::new();
         let value = builder.add_input(branch_type.clone());
         let output = builder.add_instruction(operation, Vec::new(), vec![value, value], None).unwrap()[0];
         builder
-            .build::<Vec<XlaConstant>, Vec<XlaConstant>>(vec![output], vec![Placeholder], vec![Placeholder])
+            .build::<Vec<Constant>, Vec<Constant>>(vec![output], vec![Placeholder], vec![Placeholder])
             .unwrap()
     };
     let predicate_type = ArrayType::scalar(DataType::Boolean).replicated(&mesh)?;
-    let predicate = XlaArray::from_host_buffer(&domain, predicate_type, mesh.clone(), [1u8])?;
-    let condition_inputs = [XlaValue::Array(predicate), XlaValue::Array(input.clone())];
+    let predicate = Array::from_host_buffer(&domain, predicate_type, mesh.clone(), [1u8])?;
+    let condition_inputs = [Value::Array(predicate), Value::Array(input.clone())];
     if arguments.selects("eager_condition") {
         results.insert(
             "eager_condition",
             measure(&arguments, || {
                 let branches = [
-                    branch(XlaOperation::Array(AddOperation::new().into())),
-                    branch(XlaOperation::Array(MulOperation::new().into())),
+                    branch(Operation::Array(AddOperation::new().into())),
+                    branch(Operation::Array(MulOperation::new().into())),
                 ];
-                let operation = XlaOperation::Condition(ConditionOperation::new());
+                let operation = Operation::Condition(ConditionOperation::new());
                 drop(domain.bind(operation, branches, &condition_inputs).unwrap());
             }),
         );
     }
 
     // Warm jitted call of `x + x`.
-    let function: JittedXlaFunction<'_, _, (), ArrayType, ArrayType> =
-        jitted(|_, value: XlaCompileTracer<'_>| Ok(Add::add(&value, &value)?), &domain, mesh.clone());
+    let function: JittedFunction<'_, _, (), ArrayType, ArrayType> =
+        jitted(|_, value: CompileTracer<'_>| Ok(Add::add(&value, &value)?), &domain, mesh.clone());
     if arguments.selects("jit_add") {
         results.insert("jit_add", measure(&arguments, || drop(function.call((), input.clone()).unwrap())));
     }
@@ -214,7 +214,7 @@ fn main() -> Result<(), Box<dyn std::error::Error>> {
             "pjrt_add",
             measure(&arguments, || {
                 let inputs = vec![ExecutionDeviceInputs::from(&execution_inputs[..])];
-                drop(executable.execute(inputs, Vec::new(), 0, None, None, None, None).unwrap());
+                drop(executable.execute(inputs, Vec::new(), 0, None, None, None, None, &[]).unwrap());
             }),
         );
     }

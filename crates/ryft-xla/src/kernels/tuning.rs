@@ -16,7 +16,7 @@ use ryft_kernels::{KernelCompiler, KernelExtension, KernelSchedule, VerifiedKern
 use serde::{Deserialize, Serialize};
 use thiserror::Error;
 
-use crate::kernels::staging::{XlaKernelExecutionFacts, XlaKernelTarget};
+use crate::kernels::staging::{KernelExecutionFacts, KernelTarget};
 use crate::kernels::{KernelEmbeddingError, KernelOutputEmbedding};
 
 // TODO(eaplatanios): Promote kernel tuning errors to dedicated `ryft_xla::Error` variants after
@@ -134,7 +134,7 @@ impl KernelTuningRequest {
         target: &Compiler::Target,
         options: &Compiler::Options,
         embedding: &Embedding,
-        facts: &XlaKernelExecutionFacts,
+        facts: &KernelExecutionFacts,
         environment: &[u8],
         candidates: Vec<KernelSchedule>,
         budget: KernelTuningBudget,
@@ -142,7 +142,7 @@ impl KernelTuningRequest {
     where
         Extension: KernelExtension,
         Compiler: KernelCompiler<Extension>,
-        Compiler::Target: XlaKernelTarget,
+        Compiler::Target: KernelTarget,
         Embedding: KernelOutputEmbedding<Compiler::Output, Extension>,
     {
         if candidates.is_empty() || candidates.len() > budget.maximum_candidates || environment.is_empty() {
@@ -400,7 +400,7 @@ mod tests {
     use std::sync::atomic::AtomicUsize;
 
     use pretty_assertions::assert_eq;
-    use ryft_core::{CustomCallOperation, ReferenceCompletion, ReferenceCompletionBackend};
+    use ryft_core::{CustomCallOperation, ReferenceCompletion as CoreReferenceCompletion, ReferenceCompletionBackend};
     use ryft_kernels::{Grid, KernelCallOperation, KernelCompilationError, KernelDefinition};
 
     use super::*;
@@ -411,8 +411,8 @@ mod tests {
     /// Explicit local fixture execution target.
     struct Target;
 
-    impl XlaKernelTarget for Target {
-        fn admit_execution(&self, _facts: &XlaKernelExecutionFacts) -> Result<(), KernelEmbeddingError> {
+    impl KernelTarget for Target {
+        fn admit_execution(&self, _facts: &KernelExecutionFacts) -> Result<(), KernelEmbeddingError> {
             Ok(())
         }
     }
@@ -500,7 +500,7 @@ mod tests {
             &Target,
             &options,
             &Embedding(embedding),
-            &XlaKernelExecutionFacts {
+            &KernelExecutionFacts {
                 platform_name: "fixture".into(),
                 platform_version: platform_version.into(),
                 pjrt_version: ryft_pjrt::Version { major: 0, minor: 115 },
@@ -545,7 +545,7 @@ mod tests {
         fn execute(&mut self) -> StatefulExecution<(), KernelTuningError> {
             StatefulExecution::pending(
                 Ok(()),
-                ReferenceCompletion::new(Completion(self.completed.clone())),
+                CoreReferenceCompletion::new(Completion(self.completed.clone())),
                 |message| KernelTuningError::Invalid { message: message.to_string() },
             )
         }
@@ -749,7 +749,7 @@ mod tests {
             fn execute(&mut self) -> StatefulExecution<(), KernelTuningError> {
                 StatefulExecution::pending(
                     Ok(()),
-                    ReferenceCompletion::ready(Err("execution failed".into())),
+                    CoreReferenceCompletion::ready(Err("execution failed".into())),
                     |message| KernelTuningError::Invalid { message: message.to_string() },
                 )
             }
@@ -783,7 +783,7 @@ mod tests {
                 self.cancelled.store(true, Ordering::Release);
                 StatefulExecution::pending(
                     Ok(()),
-                    ReferenceCompletion::new(Completion(self.completed.clone())),
+                    CoreReferenceCompletion::new(Completion(self.completed.clone())),
                     |message| KernelTuningError::Invalid { message: message.to_string() },
                 )
             }

@@ -6,7 +6,7 @@ use ryft_mlir::{
     Attribute, Block, Context as MlirContext, Location, Operation as MlirOperation, Value as MlirValue, ValueRef,
 };
 
-use crate::{Error, LowerableOperation, LowerableOperationFamily, XlaLowerer};
+use crate::{Error, LowerableOperation, LowerableOperationFamily, Lowerer};
 
 /// Returns the XLA memory-kind string for `memory`, used by `mhlo.memory_kind` signature attributes and the
 /// `_xla_buffer_placement` frontend attribute on `annotate_device_placement` custom calls. This mapping is owned by the
@@ -84,7 +84,7 @@ pub(crate) fn lower_transfer_to_memory<'b, 'c: 'b, 't: 'c, B: Block<'b, 'c, 't>,
 impl LowerableOperation for TransferToMemoryOperation {
     fn lower<'b, 'c: 'b, 't: 'c, O: LowerableOperationFamily>(
         &self,
-        lowerer: &mut XlaLowerer<'b, 'c, 't, O>,
+        lowerer: &mut Lowerer<'b, 'c, 't, O>,
         input_values: &[ValueRef<'b, 'c, 't>],
         _input_types: &[ArrayType],
         _output_types: &[ArrayType],
@@ -104,12 +104,13 @@ mod tests {
     use indoc::indoc;
     use pretty_assertions::assert_eq;
     use ryft_core::{
-        Array, ArrayOperation, DataType, EagerContext, Placeholder, ReverseModeDifferentiate, Trace, ZeroOperation,
+        Array as CoreArray, ArrayOperation, DataType, EagerContext, Placeholder, ReverseModeDifferentiate, Trace,
+        ZeroOperation,
     };
 
-    use crate::experimental::lowering::tests::{XlaProgramBuilder, test_vector_type};
+    use crate::experimental::lowering::tests::{ProgramBuilder, test_vector_type};
     use crate::experimental::lowering::to_mlir_module_for_plain_program;
-    use crate::experimental::ops::{XlaArrayConstant, XlaConstant, XlaOperation};
+    use crate::experimental::ops::{ArrayConstant, Constant, Operation};
     use crate::to_mlir_module_for_program;
 
     use super::*;
@@ -123,8 +124,8 @@ mod tests {
         // identity-looking transfer back to device memory, which `HostOffloader` needs to see. The program mirrors
         // the JAX example in `python/scripts/dump_transfer_to_memory_mlir_from_jax.py`, and the asserted custom
         // calls are byte-identical to the ones JAX emits for it.
-        let (_, program) = EagerContext::<Array, ArrayOperation<Array>>::trace(
-            |x: ryft_core::tracing::DomainTracer<EagerContext<Array, ArrayOperation<Array>>>| {
+        let (_, program) = EagerContext::<CoreArray, ArrayOperation<CoreArray>>::trace(
+            |x: ryft_core::tracing::DomainTracer<EagerContext<CoreArray, ArrayOperation<CoreArray>>>| {
                 let y = x.clone() * x;
                 let on_host = y.transfer_to_memory(Memory::Host { pinned: true })?;
                 let back = on_host.transfer_to_memory(Memory::Device)?;
@@ -162,14 +163,10 @@ mod tests {
             [(Memory::Host { pinned: true }, "pinned_host"), (Memory::Host { pinned: false }, "unpinned_host")]
         {
             let r#type = ArrayType::new_static(DataType::I64, [2]).with_memory(memory);
-            let mut builder = XlaProgramBuilder::new();
+            let mut builder = ProgramBuilder::new();
             let input = builder.add_input(r#type.clone());
             let program = builder
-                .build::<Vec<XlaArrayConstant>, Vec<XlaArrayConstant>>(
-                    vec![input],
-                    vec![Placeholder],
-                    vec![Placeholder],
-                )
+                .build::<Vec<ArrayConstant>, Vec<ArrayConstant>>(vec![input], vec![Placeholder], vec![Placeholder])
                 .unwrap();
             let expected = indoc! {r#"
                 module {
@@ -179,7 +176,7 @@ mod tests {
                 }
             "#}.replace("KIND", kind);
             assert_eq!(to_mlir_module_for_plain_program(&program, "main").unwrap(), expected);
-            let program = program.into_unprojected::<XlaConstant, XlaOperation>().unwrap();
+            let program = program.into_unprojected::<Constant, Operation>().unwrap();
             let types = vec![r#type];
             assert_eq!(
                 to_mlir_module_for_program(&program, &[], &types, &types, "main", None, None).unwrap(),
@@ -196,11 +193,11 @@ mod tests {
             (Memory::Host { pinned: false }, Some("unpinned_host")),
         ] {
             let output_type = test_vector_type(4).with_memory(memory);
-            let mut builder = XlaProgramBuilder::new();
+            let mut builder = ProgramBuilder::new();
             let output =
                 builder.add_instruction(ZeroOperation::new(output_type), Vec::new(), Vec::new(), None).unwrap()[0];
             let program = builder
-                .build::<Vec<XlaArrayConstant>, Vec<XlaArrayConstant>>(vec![output], Vec::new(), vec![Placeholder])
+                .build::<Vec<ArrayConstant>, Vec<ArrayConstant>>(vec![output], Vec::new(), vec![Placeholder])
                 .unwrap();
 
             let stablehlo = to_mlir_module_for_plain_program(&program, "main").unwrap();
@@ -221,8 +218,8 @@ mod tests {
 
         // The pullback of a transfer moves the cotangent back to the operand's source memory (the default device
         // space here), so it lowers to an `annotate_device_placement` custom call targeting `device`.
-        let (_, pullback): (Array, _) = EagerContext::<Array, ArrayOperation<Array>>::new()
-            .vjp(|x, ()| x.transfer_to_memory(Memory::Host { pinned: true }), Array::scalar(2.0).unwrap(), ())
+        let (_, pullback): (CoreArray, _) = EagerContext::<CoreArray, ArrayOperation<CoreArray>>::new()
+            .vjp(|x, ()| x.transfer_to_memory(Memory::Host { pinned: true }), CoreArray::scalar(2.0).unwrap(), ())
             .unwrap();
         let (pullback, _residuals) = pullback.into_transposed_parts().unwrap();
         let pullback = pullback.into_program();

@@ -3,8 +3,9 @@ use std::sync::OnceLock;
 
 use ryft_core::macros::check_count;
 use ryft_core::{
-    ArrayIrType, ArrayType, AssertOperation, ComparisonDirection, DYNAMIC_SLICE_OPERATION_NAME, DataType, Dimension,
-    DimensionType, DimensionVariable, EffectClass, GUARD_OPERATION_NAME, GuardOperation, Operation,
+    ArrayIrType, ArrayType, AssertOperation, ComparisonDirection, DYNAMIC_SLICE_OPERATION_NAME, DataType,
+    Dimension as CoreDimension, DimensionType, DimensionVariable, EffectClass, GUARD_OPERATION_NAME, GuardOperation,
+    Operation as CoreOperation,
 };
 use ryft_mlir::dialects::stable_hlo;
 use ryft_mlir::dialects::stable_hlo::{CustomCallApiVersion, CustomCallMemoryLayouts};
@@ -24,7 +25,7 @@ use crate::experimental::lowering::types::{
 use crate::experimental::lowering::{EffectTokens, current_or_new_token};
 use crate::operations::comparisons::lower_compare_to_mlir;
 use crate::operations::manipulation::conversions::lower_cast_shape;
-use crate::{Error, LowerableOperation, LowerableOperationFamily, LoweringError, XlaLowerer};
+use crate::{Error, LowerableOperation, LowerableOperationFamily, Lowerer, LoweringError};
 
 #[cfg(any(feature = "cuda-12", feature = "cuda-13"))]
 use ryft_pjrt::extensions::ffi::FfiStream;
@@ -267,7 +268,7 @@ pub(crate) fn validates_output_extents(
     let dynamic_count = declared_types
         .iter()
         .flat_map(|r#type| r#type.shape().dimensions())
-        .filter_map(Dimension::variable)
+        .filter_map(CoreDimension::variable)
         .count();
     let Some(extent_offset) = input_types.len().checked_sub(dynamic_count) else {
         return Ok(false);
@@ -291,7 +292,7 @@ fn output_extent_checks<'d>(
     let dynamic_count = declared_types
         .iter()
         .flat_map(|r#type| r#type.shape().dimensions())
-        .filter_map(Dimension::variable)
+        .filter_map(CoreDimension::variable)
         .count();
     check_count!("input", input_types, dynamic_count, ProgramError);
     let mut inputs = input_types.iter().enumerate();
@@ -301,10 +302,10 @@ fn output_extent_checks<'d>(
         .zip(output_types)
         .flat_map(|(declared, output)| declared.shape().dimensions().iter().zip(output.shape().dimensions()));
     for (declared, output) in dimensions {
-        let Dimension::Dynamic(variable) = declared else { continue };
+        let CoreDimension::Dynamic(variable) = declared else { continue };
         let (index, input_type) = inputs.next().unwrap();
         let input_type = <&DimensionType>::try_from(input_type)?;
-        if let Dimension::Static(extent) = *output
+        if let CoreDimension::Static(extent) = *output
             && input_type.extent() != Some(extent)
         {
             checks.push((index, variable, extent));
@@ -475,7 +476,7 @@ unsafe fn assertion_handler_for_memory(
     call_frame: *mut XLA_FFI_CallFrame,
     memory: impl FnOnce(&FfiCallFrame<'_>) -> Result<AssertionBufferMemory, FfiError>,
 ) -> *mut XLA_FFI_Error {
-    let _callback_guard = crate::experimental::domains::EffectCallbackGuard::enter();
+    let _callback_guard = crate::domains::EffectCallbackGuard::enter();
     // SAFETY: XLA owns the call frame for this invocation. All access is localized in `FfiCallFrame` and the checked
     // scalar-buffer readers below.
     unsafe {
@@ -1307,8 +1308,8 @@ pub(crate) fn lower_type_relationship_checks<'b, 'c: 'b, 't: 'c>(
     // declarations can observe the same axis twice, or different values can carry the same actual identity. Retain
     // those actual dimensions so proven equalities require neither a query nor a host callback.
     let mut occurrences =
-        Vec::<(&DimensionVariable, &Dimension, Result<usize, (ValueRef<'b, 'c, 't>, Option<usize>)>)>::new();
-    let mut static_checks = Vec::<(usize, &Dimension, (ValueRef<'b, 'c, 't>, Option<usize>))>::new();
+        Vec::<(&DimensionVariable, &CoreDimension, Result<usize, (ValueRef<'b, 'c, 't>, Option<usize>)>)>::new();
+    let mut static_checks = Vec::<(usize, &CoreDimension, (ValueRef<'b, 'c, 't>, Option<usize>))>::new();
     for ((declared, &value), actual) in declared_types.iter().zip(values).zip(actual_types) {
         match (declared, actual) {
             (ArrayIrType::Array(declared), ArrayIrType::Array(actual)) if declared.rank() == actual.rank() => {
@@ -1317,9 +1318,9 @@ pub(crate) fn lower_type_relationship_checks<'b, 'c: 'b, 't: 'c>(
                 {
                     let extent = actual.bounds().extent().ok_or((value, Some(axis)));
                     match (declared, extent) {
-                        (Dimension::Dynamic(variable), extent) => occurrences.push((variable, actual, extent)),
-                        (Dimension::Static(_), Ok(_)) => {}
-                        (Dimension::Static(expected), Err((value, Some(axis)))) => {
+                        (CoreDimension::Dynamic(variable), extent) => occurrences.push((variable, actual, extent)),
+                        (CoreDimension::Static(_), Ok(_)) => {}
+                        (CoreDimension::Static(expected), Err((value, Some(axis)))) => {
                             if static_checks.iter().any(|(extent, dimension, observed)| {
                                 extent == expected
                                     && (*observed == (value, Some(axis)) || dimension.has_equal_extents(actual))
@@ -1332,7 +1333,7 @@ pub(crate) fn lower_type_relationship_checks<'b, 'c: 'b, 't: 'c>(
                             let message = format!("input dimension `{actual}` must have the declared extent {site}");
                             lower_check(expected, runtime, message, effect_tokens, block)?;
                         }
-                        (Dimension::Static(_), Err((_, None))) => unreachable!(),
+                        (CoreDimension::Static(_), Err((_, None))) => unreachable!(),
                     }
                 }
             }
@@ -1411,7 +1412,7 @@ pub(crate) fn lower_type_relationship_checks<'b, 'c: 'b, 't: 'c>(
 impl LowerableOperation for GuardOperation<ArrayType> {
     fn lower<'b, 'c: 'b, 't: 'c, O: LowerableOperationFamily>(
         &self,
-        lowerer: &mut XlaLowerer<'b, 'c, 't, O>,
+        lowerer: &mut Lowerer<'b, 'c, 't, O>,
         input_values: &[ValueRef<'b, 'c, 't>],
         input_types: &[ArrayType],
         output_types: &[ArrayType],
@@ -1426,7 +1427,7 @@ impl LowerableOperation for GuardOperation<ArrayType> {
 impl LowerableOperation for GuardOperation<ArrayIrType> {
     fn lower<'b, 'c: 'b, 't: 'c, O: LowerableOperationFamily>(
         &self,
-        lowerer: &mut XlaLowerer<'b, 'c, 't, O>,
+        lowerer: &mut Lowerer<'b, 'c, 't, O>,
         input_values: &[ValueRef<'b, 'c, 't>],
         input_types: &[ArrayIrType],
         output_types: &[ArrayIrType],
@@ -1470,7 +1471,7 @@ fn lower_guard_with_outputs<'b, 'c: 'b, 't: 'c, O: LowerableOperationFamily>(
     input_values: &[ValueRef<'b, 'c, 't>],
     input_types: &[ArrayIrType],
     output_types: &[ArrayIrType],
-    lowerer: &mut XlaLowerer<'b, 'c, 't, O>,
+    lowerer: &mut Lowerer<'b, 'c, 't, O>,
 ) -> Result<Vec<ValueRef<'b, 'c, 't>>, Error> {
     check_count!("output", output_types, input_values.len(), ProgramError);
     lower_guard(
@@ -1502,7 +1503,7 @@ fn lower_guard_with_outputs<'b, 'c: 'b, 't: 'c, O: LowerableOperationFamily>(
 impl LowerableOperation for AssertOperation<ArrayType> {
     fn lower<'b, 'c: 'b, 't: 'c, O: LowerableOperationFamily>(
         &self,
-        lowerer: &mut XlaLowerer<'b, 'c, 't, O>,
+        lowerer: &mut Lowerer<'b, 'c, 't, O>,
         input_values: &[ValueRef<'b, 'c, 't>],
         input_types: &[ArrayType],
         _output_types: &[ArrayType],
@@ -1526,7 +1527,7 @@ impl LowerableOperation for AssertOperation<ArrayType> {
 impl LowerableOperation for AssertOperation<ArrayIrType> {
     fn lower<'b, 'c: 'b, 't: 'c, O: LowerableOperationFamily>(
         &self,
-        lowerer: &mut XlaLowerer<'b, 'c, 't, O>,
+        lowerer: &mut Lowerer<'b, 'c, 't, O>,
         input_values: &[ValueRef<'b, 'c, 't>],
         input_types: &[ArrayIrType],
         _output_types: &[ArrayIrType],
@@ -1571,7 +1572,7 @@ mod tests {
     use ryft_pjrt::extensions::ffi::XLA_FFI_Buffer;
 
     use crate::experimental::lowering::lower_mlir_module_for_program_with_reference_state;
-    use crate::experimental::ops::{XlaConstant, XlaProgramBuilder as ArrayIrXlaProgramBuilder};
+    use crate::experimental::ops::{Constant, ProgramBuilder as ArrayIrProgramBuilder};
     use crate::operations::dot::RaggedDotLoweringStrategy;
     use crate::to_mlir_module_for_program;
 
@@ -1584,7 +1585,7 @@ mod tests {
         let scalar_type = ArrayType::scalar(DataType::I64);
         let left_variable = DimensionVariable::new("left", DimensionBounds::new(1, Some(9)).unwrap());
         let right_variable = DimensionVariable::new("right", DimensionBounds::new(1, Some(9)).unwrap());
-        let mut builder = ArrayIrXlaProgramBuilder::new();
+        let mut builder = ArrayIrProgramBuilder::new();
         let left = builder.add_input(scalar_type.clone().into());
         let right = builder.add_input(scalar_type.clone().into());
         let left_dimension = builder
@@ -1610,7 +1611,7 @@ mod tests {
             )
             .unwrap();
         let program = builder
-            .build::<Vec<XlaConstant>, Vec<XlaConstant>>(vec![], vec![Placeholder, Placeholder], vec![])
+            .build::<Vec<Constant>, Vec<Constant>>(vec![], vec![Placeholder, Placeholder], vec![])
             .unwrap();
         let lowered = lower_mlir_module_for_program_with_reference_state(
             &program,
@@ -1646,7 +1647,7 @@ mod tests {
         let left_variable = DimensionVariable::new("left", DimensionBounds::new(1, Some(9)).unwrap());
         let right_variable = DimensionVariable::new("right", DimensionBounds::new(1, Some(9)).unwrap());
 
-        let mut builder = ArrayIrXlaProgramBuilder::new();
+        let mut builder = ArrayIrProgramBuilder::new();
         let left = builder.add_input(scalar_type.clone().into());
         let right = builder.add_input(scalar_type.clone().into());
         let left_dimension = builder
@@ -1693,7 +1694,7 @@ mod tests {
             )
             .unwrap();
         let program = builder
-            .build::<Vec<XlaConstant>, Vec<XlaConstant>>(vec![left], vec![Placeholder, Placeholder], vec![Placeholder])
+            .build::<Vec<Constant>, Vec<Constant>>(vec![left], vec![Placeholder, Placeholder], vec![Placeholder])
             .unwrap();
         let module = to_mlir_module_for_program(
             &program,
@@ -1743,7 +1744,7 @@ mod tests {
         let declared: Vec<ArrayIrType> =
             vec![n.clone().into(), ArrayType::new(DataType::F64, Shape::new(vec![n.simplified_dimension()])).into()];
         let array_type = ArrayType::new_static(DataType::F64, [2]);
-        let mut builder = ArrayIrXlaProgramBuilder::new();
+        let mut builder = ArrayIrProgramBuilder::new();
         let dimension = builder.add_input(m.into());
         let array = builder.add_input(array_type.clone().into());
         builder
@@ -1753,7 +1754,7 @@ mod tests {
             .add_instruction(PrintOperation::<ArrayType>::new("value"), Vec::new(), vec![array], None)
             .unwrap()[0];
         let program = builder
-            .build::<Vec<XlaConstant>, Vec<XlaConstant>>(vec![printed], vec![Placeholder; 2], vec![Placeholder])
+            .build::<Vec<Constant>, Vec<Constant>>(vec![printed], vec![Placeholder; 2], vec![Placeholder])
             .unwrap();
         let module = to_mlir_module_for_program(
             &program,
@@ -1805,7 +1806,7 @@ mod tests {
         let vector = |dimension: &DimensionType| -> ArrayIrType {
             ArrayType::new(DataType::F64, Shape::new(vec![dimension.simplified_dimension()])).into()
         };
-        let mut builder = ArrayIrXlaProgramBuilder::new();
+        let mut builder = ArrayIrProgramBuilder::new();
         let first = builder.add_input(vector(&m));
         let second = builder.add_input(ArrayType::new_static(DataType::F64, [2]).into());
         let third = builder.add_input(vector(&k));
@@ -1821,7 +1822,7 @@ mod tests {
             .add_instruction(AddOperation::<ArrayType>::new(), Vec::new(), vec![partial, outputs[2]], None)
             .unwrap()[0];
         let program = builder
-            .build::<Vec<XlaConstant>, Vec<XlaConstant>>(vec![sum], vec![Placeholder; 3], vec![Placeholder])
+            .build::<Vec<Constant>, Vec<Constant>>(vec![sum], vec![Placeholder; 3], vec![Placeholder])
             .unwrap();
         let client = execution_client();
         let inputs = [
@@ -1854,7 +1855,7 @@ mod tests {
         let vector = |dimension: &DimensionType| -> ArrayIrType {
             ArrayType::new(DataType::F64, Shape::new(vec![dimension.simplified_dimension()])).into()
         };
-        let mut builder = ArrayIrXlaProgramBuilder::new();
+        let mut builder = ArrayIrProgramBuilder::new();
         let first = builder.add_input(vector(&m));
         let second = builder.add_input(vector(&k));
         let guard =
@@ -1863,7 +1864,7 @@ mod tests {
         assert_eq!(builder.atoms()[outputs[1].index()].r#type().as_ref(), &vector(&m));
         let sum = builder.add_instruction(AddOperation::<ArrayType>::new(), Vec::new(), outputs, None).unwrap()[0];
         let program = builder
-            .build::<Vec<XlaConstant>, Vec<XlaConstant>>(vec![sum], vec![Placeholder; 2], vec![Placeholder])
+            .build::<Vec<Constant>, Vec<Constant>>(vec![sum], vec![Placeholder; 2], vec![Placeholder])
             .unwrap();
         let client = execution_client();
         let inputs = [
@@ -1889,7 +1890,7 @@ mod tests {
         let array_type = ArrayType::new_static(DataType::F64, [3]);
         let left_variable = DimensionVariable::new("left", DimensionBounds::new(1, Some(9)).unwrap());
         let right_variable = DimensionVariable::new("right", DimensionBounds::new(1, Some(9)).unwrap());
-        let mut builder = ArrayIrXlaProgramBuilder::new();
+        let mut builder = ArrayIrProgramBuilder::new();
         let left = builder.add_input(scalar_type.clone().into());
         let right = builder.add_input(scalar_type.clone().into());
         let value = builder.add_input(array_type.clone().into());
@@ -1928,11 +1929,7 @@ mod tests {
             .add_instruction(PrintOperation::<ArrayType>::new("row"), Vec::new(), vec![row], None)
             .unwrap()[0];
         let program = builder
-            .build::<Vec<XlaConstant>, Vec<XlaConstant>>(
-                vec![guarded, printed],
-                vec![Placeholder; 4],
-                vec![Placeholder; 2],
-            )
+            .build::<Vec<Constant>, Vec<Constant>>(vec![guarded, printed], vec![Placeholder; 4], vec![Placeholder; 2])
             .unwrap();
         let module = to_mlir_module_for_program(
             &program,
@@ -1979,7 +1976,7 @@ mod tests {
         };
 
         use crate::experimental::lowering::tests::{MixedValue, execute_mixed_program};
-        use crate::experimental::ops::XlaOperation;
+        use crate::experimental::ops::Operation;
         use crate::tests::execution_client;
 
         let client = execution_client();
@@ -1994,7 +1991,7 @@ mod tests {
                 ArrayType::new(DataType::F64, Shape::new(vec![dimension.simplified_dimension()]))
             };
             let input_types = vec![vector(&retained), vector(&other)];
-            let mut builder = ArrayIrXlaProgramBuilder::new();
+            let mut builder = ArrayIrProgramBuilder::new();
             let first = builder.add_input(ReferenceType::new(input_types[0].clone()).into());
             let second = builder.add_input(ReferenceType::new(input_types[1].clone()).into());
             let reads = [first, second]
@@ -2004,7 +2001,7 @@ mod tests {
                         [0]
                 })
                 .collect();
-            let guard: XlaOperation = if array_ir {
+            let guard: Operation = if array_ir {
                 GuardOperation::<ArrayIrType>::new("region", vec![vector(&declared).into(), vector(&declared).into()])
                     .with_retained_identities(vec![retained.to_variable()])
                     .into()
@@ -2016,11 +2013,11 @@ mod tests {
             let guarded = builder.add_instruction(guard, Vec::new(), reads, None).unwrap().to_vec();
             let sum = builder.add_instruction(AddOperation::<ArrayType>::new(), Vec::new(), guarded, None).unwrap()[0];
             let source = builder
-                .build::<Vec<XlaConstant>, Vec<XlaConstant>>(vec![sum], vec![Placeholder; 2], vec![Placeholder])
+                .build::<Vec<Constant>, Vec<Constant>>(vec![sum], vec![Placeholder; 2], vec![Placeholder])
                 .unwrap();
             // Exercise the public specialization and reference-discharge boundaries before differentiating and
             // lowering. These read-only external bindings become the two explicit initial-state array arguments.
-            let context = TracingContext::<XlaConstant, XlaOperation>::new();
+            let context = TracingContext::<Constant, Operation>::new();
             let inputs = source.input_types().into_owned().into_iter().map(PartialValue::Unknown).collect::<Vec<_>>();
             let evaluation = source.partially_evaluate_in_context(&context, &inputs).unwrap();
             let discharged = evaluation.program().clone().discharge_references::<ArrayReferenceDischarge>(0).unwrap();

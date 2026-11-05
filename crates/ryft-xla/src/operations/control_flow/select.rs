@@ -1,5 +1,5 @@
 use ryft_core::macros::check_count;
-use ryft_core::{ArrayType, DataType, Dimension, SELECT_OPERATION_NAME, SelectOperation};
+use ryft_core::{ArrayType, DataType, Dimension as CoreDimension, SELECT_OPERATION_NAME, SelectOperation};
 use ryft_mlir::dialects::stable_hlo;
 use ryft_mlir::{
     Block, Context as MlirContext, Location, Operation as MlirOperation, TensorTypeRef, Type, Value as MlirValue,
@@ -12,7 +12,7 @@ use crate::experimental::lowering::types::{
 };
 use crate::operations::constants::lower_layout_constraint;
 use crate::operations::normalize_elementwise_operand;
-use crate::{Error, LowerableOperation, LowerableOperationFamily, LoweringError, XlaLowerer};
+use crate::{Error, LowerableOperation, LowerableOperationFamily, Lowerer, LoweringError};
 
 /// Normalizes a select condition and both branches to the exact tensor descriptors required by StableHLO.
 pub(crate) fn normalize_select_operands<'b, 'c: 'b, 't: 'c, B, L>(
@@ -36,7 +36,7 @@ where
         .shape()
         .dimensions()
         .iter()
-        .filter(|dimension| matches!(dimension, Dimension::Dynamic(_)))
+        .filter(|dimension| matches!(dimension, CoreDimension::Dynamic(_)))
         .count()
         > 1;
     // Each dynamic output extent is inherited from a right-aligned input dimension. Cross-broadcasts such as
@@ -44,7 +44,7 @@ where
     let mut sources = vec![(input_values[0], 0); output_type.rank()];
     if multiple_dynamic_axes {
         for (output_axis, dimension) in output_type.shape().dimensions().iter().enumerate() {
-            if matches!(dimension, Dimension::Static(_)) {
+            if matches!(dimension, CoreDimension::Static(_)) {
                 continue;
             }
             let source = input_types.iter().enumerate().find_map(|(index, input_type)| {
@@ -128,7 +128,7 @@ where
 impl LowerableOperation for SelectOperation<ArrayType> {
     fn lower<'b, 'c: 'b, 't: 'c, O: LowerableOperationFamily>(
         &self,
-        lowerer: &mut XlaLowerer<'b, 'c, 't, O>,
+        lowerer: &mut Lowerer<'b, 'c, 't, O>,
         input_values: &[ValueRef<'b, 'c, 't>],
         input_types: &[ArrayType],
         output_types: &[ArrayType],
@@ -155,9 +155,9 @@ mod tests {
     use ryft_core::{CompareOperation, ComparisonDirection, Placeholder, SelectOperation, Shape};
 
     use crate::experimental::lowering::tests::{
-        MixedValue, XlaProgramBuilder, dynamic_dimension, execute_mixed_program, unproject_plain_program,
+        MixedValue, ProgramBuilder, dynamic_dimension, execute_mixed_program, unproject_plain_program,
     };
-    use crate::experimental::ops::XlaArrayConstant;
+    use crate::experimental::ops::ArrayConstant;
     use crate::tests::execution_client;
 
     use super::*;
@@ -168,7 +168,7 @@ mod tests {
             DataType::F64,
             Shape::new(vec![dynamic_dimension("rows", Some(5)), dynamic_dimension("columns", Some(5))]),
         );
-        let mut builder = XlaProgramBuilder::new();
+        let mut builder = ProgramBuilder::new();
         let input = builder.add_input(input_type);
         let on_true = builder.add_input(ArrayType::scalar(DataType::F64));
         let on_false = builder.add_input(ArrayType::scalar(DataType::F64));
@@ -183,12 +183,12 @@ mod tests {
         let selected = builder
             .add_instruction(SelectOperation::new(), Vec::new(), vec![condition, on_true, on_false], None)
             .unwrap()[0];
-        let scalar_condition = builder.add_constant(XlaArrayConstant::Boolean(true));
+        let scalar_condition = builder.add_constant(ArrayConstant::Boolean(true));
         let identity = builder
             .add_instruction(SelectOperation::new(), Vec::new(), vec![scalar_condition, input, on_false], None)
             .unwrap()[0];
         let program = builder
-            .build::<Vec<XlaArrayConstant>, Vec<XlaArrayConstant>>(
+            .build::<Vec<ArrayConstant>, Vec<ArrayConstant>>(
                 vec![selected, identity],
                 vec![Placeholder; 3],
                 vec![Placeholder; 2],
@@ -232,7 +232,7 @@ mod tests {
     fn test_select_lowering_cross_broadcasts_multiple_dynamic_axes() {
         let rows = dynamic_dimension("rows", Some(5));
         let columns = dynamic_dimension("columns", Some(5));
-        let mut builder = XlaProgramBuilder::new();
+        let mut builder = ProgramBuilder::new();
         let row_values = builder.add_input(ArrayType::new(DataType::F64, Shape::new(vec![rows, 1.into()])));
         let on_true = builder.add_input(ArrayType::new(DataType::F64, Shape::new(vec![1.into(), columns])));
         let on_false = builder.add_input(ArrayType::scalar(DataType::F64));
@@ -248,11 +248,7 @@ mod tests {
             .add_instruction(SelectOperation::new(), Vec::new(), vec![condition, on_true, on_false], None)
             .unwrap()[0];
         let program = builder
-            .build::<Vec<XlaArrayConstant>, Vec<XlaArrayConstant>>(
-                vec![selected],
-                vec![Placeholder; 3],
-                vec![Placeholder],
-            )
+            .build::<Vec<ArrayConstant>, Vec<ArrayConstant>>(vec![selected], vec![Placeholder; 3], vec![Placeholder])
             .unwrap();
         let program = unproject_plain_program(program);
         let client = execution_client();

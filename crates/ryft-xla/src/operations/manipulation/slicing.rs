@@ -1,8 +1,8 @@
 use ryft_core::macros::check_count;
 use ryft_core::{
-    ArrayIrType, ArrayType, DYNAMIC_SLICE_OPERATION_NAME, DataType, Dimension, DimensionBounds, DimensionType,
-    DynamicSliceBounds, DynamicSliceOperation, DynamicUpdateSliceOperation, ProgramError, Shape, SliceOperation,
-    UpdateSliceOperation,
+    ArrayIrType, ArrayType, DYNAMIC_SLICE_OPERATION_NAME, DataType, Dimension as CoreDimension, DimensionBounds,
+    DimensionType, DynamicSliceBounds, DynamicSliceOperation, DynamicUpdateSliceOperation, ProgramError, Shape,
+    SliceOperation, UpdateSliceOperation,
 };
 use ryft_mlir::dialects::stable_hlo;
 use ryft_mlir::{
@@ -19,7 +19,7 @@ use crate::operations::assertions::{
     ASSERT_ACTOR_ATTRIBUTE, ASSERT_DETAIL_ATTRIBUTE, ASSERT_DYNAMIC_SHAPE_SLICE_KIND, ASSERT_KIND_ATTRIBUTE,
     lower_assertion_custom_call, lower_deliberately_false_assertion_predicate,
 };
-use crate::{Error, LowerableOperation, LowerableOperationFamily, LoweringError, XlaLowerer};
+use crate::{Error, LowerableOperation, LowerableOperationFamily, Lowerer, LoweringError};
 
 /// Normalizes scalar slice starts against logical input dimensions before native allocation-based clamping. Signed
 /// starts count from the end of their axis once when `allow_negative_indices` is set, unsigned indices are widened
@@ -184,7 +184,7 @@ pub(crate) fn lower_slice_to_mlir<'b, 'c: 'b, 't: 'c>(
     check_count!("input", input_values, 1, ProgramError);
     check_count!("input", input_types, 1, ProgramError);
     check_count!("output", output_types, 1, ProgramError);
-    let static_limits = operation.limits().iter().map(Dimension::value).collect::<Option<Vec<_>>>();
+    let static_limits = operation.limits().iter().map(CoreDimension::value).collect::<Option<Vec<_>>>();
     if let Some(limits) = static_limits {
         let result = block.append_operation(stable_hlo::slice(
             input_values[0],
@@ -293,7 +293,7 @@ pub(crate) struct DynamicSliceAxisPlan {
 pub(crate) fn plan_dynamic_slice_axis(
     axis: usize,
     stride: usize,
-    input_dimension: &Dimension,
+    input_dimension: &CoreDimension,
     start_type: &DimensionType,
     size_type: &DimensionType,
 ) -> Result<DynamicSliceAxisPlan, Error> {
@@ -315,8 +315,8 @@ pub(crate) fn plan_dynamic_slice_axis(
         })?
     };
     let (input_minimum, input_physical_size) = match input_dimension {
-        Dimension::Static(extent) => (*extent, *extent),
-        Dimension::Dynamic(variable) => {
+        CoreDimension::Static(extent) => (*extent, *extent),
+        CoreDimension::Dynamic(variable) => {
             let Some(upper) = variable.bounds().upper() else {
                 return Err(Error::Lowering(LoweringError::UnsupportedOperation {
                     operation: DYNAMIC_SLICE_OPERATION_NAME.to_string(),
@@ -345,7 +345,7 @@ pub(crate) fn plan_dynamic_slice_axis(
 impl LowerableOperation for SliceOperation {
     fn lower<'b, 'c: 'b, 't: 'c, O: LowerableOperationFamily>(
         &self,
-        lowerer: &mut XlaLowerer<'b, 'c, 't, O>,
+        lowerer: &mut Lowerer<'b, 'c, 't, O>,
         input_values: &[ValueRef<'b, 'c, 't>],
         input_types: &[ArrayType],
         output_types: &[ArrayType],
@@ -365,7 +365,7 @@ impl LowerableOperation for SliceOperation {
 impl LowerableOperation for UpdateSliceOperation {
     fn lower<'b, 'c: 'b, 't: 'c, O: LowerableOperationFamily>(
         &self,
-        lowerer: &mut XlaLowerer<'b, 'c, 't, O>,
+        lowerer: &mut Lowerer<'b, 'c, 't, O>,
         input_values: &[ValueRef<'b, 'c, 't>],
         _input_types: &[ArrayType],
         output_types: &[ArrayType],
@@ -387,7 +387,7 @@ impl LowerableOperation for UpdateSliceOperation {
 impl LowerableOperation for DynamicSliceOperation {
     fn lower<'b, 'c: 'b, 't: 'c, O: LowerableOperationFamily>(
         &self,
-        lowerer: &mut XlaLowerer<'b, 'c, 't, O>,
+        lowerer: &mut Lowerer<'b, 'c, 't, O>,
         input_values: &[ValueRef<'b, 'c, 't>],
         input_types: &[ArrayType],
         output_types: &[ArrayType],
@@ -419,7 +419,7 @@ impl LowerableOperation for DynamicSliceOperation {
 impl LowerableOperation for DynamicUpdateSliceOperation {
     fn lower<'b, 'c: 'b, 't: 'c, O: LowerableOperationFamily>(
         &self,
-        lowerer: &mut XlaLowerer<'b, 'c, 't, O>,
+        lowerer: &mut Lowerer<'b, 'c, 't, O>,
         input_values: &[ValueRef<'b, 'c, 't>],
         input_types: &[ArrayType],
         output_types: &[ArrayType],
@@ -452,7 +452,7 @@ impl LowerableOperation for DynamicUpdateSliceOperation {
 impl LowerableOperation for DynamicSliceOperation<ArrayIrType> {
     fn lower<'b, 'c: 'b, 't: 'c, O: LowerableOperationFamily>(
         &self,
-        lowerer: &mut XlaLowerer<'b, 'c, 't, O>,
+        lowerer: &mut Lowerer<'b, 'c, 't, O>,
         input_values: &[ValueRef<'b, 'c, 't>],
         input_types: &[ArrayIrType],
         output_types: &[ArrayIrType],
@@ -598,9 +598,9 @@ impl LowerableOperation for DynamicSliceOperation<ArrayIrType> {
         let i32_scalar_type = context.tensor_type(context.signless_integer_type(32), &[], None, location)?;
         let mut refined_type = output_type
             .clone()
-            .with_shape(Shape::new(physical_sizes.iter().copied().map(Dimension::Static).collect()));
+            .with_shape(Shape::new(physical_sizes.iter().copied().map(CoreDimension::Static).collect()));
         for (axis, dimension) in output_type.shape().dimensions().iter().cloned().enumerate() {
-            if !matches!(dimension, Dimension::Dynamic(_)) {
+            if !matches!(dimension, CoreDimension::Dynamic(_)) {
                 continue;
             }
             let size = block.append_operation(stable_hlo::convert(sizes[axis], i32_scalar_type, location)?)?;
@@ -629,22 +629,20 @@ mod tests {
     use indoc::indoc;
     use pretty_assertions::assert_eq;
     use ryft_core::{
-        Array, ArrayIrType, ArrayOperation, Context, DimensionBounds, DimensionFromScalarOperation, DimensionVariable,
-        DynamicSlice, DynamicSliceOperation, DynamicUpdateSliceOperation, EagerContext, Placeholder,
+        Array as CoreArray, ArrayIrType, ArrayOperation, Context, DimensionBounds, DimensionFromScalarOperation,
+        DimensionVariable, DynamicSlice, DynamicSliceOperation, DynamicUpdateSliceOperation, EagerContext, Placeholder,
         ReverseModeDifferentiate, TypedProgram, UpdateSliceOperation,
     };
     use ryft_pjrt::{BufferType, ExecutionDeviceInputs, ExecutionInput, Program as PjrtProgram};
 
     use crate::experimental::lowering::tests::{
-        XlaProgramBuilder, ragged_dot_cpu_compilation_options, test_matrix_type, unproject_plain_program,
+        ProgramBuilder, ragged_dot_cpu_compilation_options, test_matrix_type, unproject_plain_program,
     };
     use crate::experimental::lowering::to_mlir_module_for_plain_program;
-    use crate::experimental::ops::{
-        FlatXlaProgram, XlaArrayConstant, XlaConstant, XlaProgramBuilder as ArrayIrXlaProgramBuilder,
-    };
+    use crate::experimental::ops::{ArrayConstant, Constant, FlatProgram, ProgramBuilder as ArrayIrProgramBuilder};
     use crate::operations::constants::dynamic_constructor_types;
     use crate::tests::{execution_client, values_from_bytes, values_to_bytes};
-    use crate::{XlaArray, to_mlir_module_for_program};
+    use crate::{Array, to_mlir_module_for_program};
 
     use super::*;
 
@@ -658,14 +656,14 @@ mod tests {
         ] {
             let input_type = ArrayType::new(
                 DataType::I64,
-                Shape::new(vec![Dimension::Dynamic(DimensionVariable::new(
+                Shape::new(vec![CoreDimension::Dynamic(DimensionVariable::new(
                     "rows",
                     DimensionBounds::new(2, Some(5)).unwrap(),
                 ))]),
             );
             let update_type = ArrayType::new_static(DataType::I64, [1]);
             let index_type = ArrayType::scalar(index_type);
-            let mut builder = XlaProgramBuilder::new();
+            let mut builder = ProgramBuilder::new();
             let input = builder.add_input(input_type.clone());
             let update = builder.add_input(update_type.clone());
             let index = builder.add_input(index_type.clone());
@@ -677,7 +675,7 @@ mod tests {
                 .unwrap()[0];
             let program = unproject_plain_program(
                 builder
-                    .build::<Vec<XlaArrayConstant>, Vec<XlaArrayConstant>>(
+                    .build::<Vec<ArrayConstant>, Vec<ArrayConstant>>(
                         vec![sliced, updated],
                         vec![Placeholder; 3],
                         vec![Placeholder; 2],
@@ -703,7 +701,7 @@ mod tests {
                 let inputs = [
                     (values_to_bytes(&values), BufferType::I64, vec![4]),
                     (values_to_bytes(&[42_i64]), BufferType::I64, vec![1]),
-                    (index_bytes.clone(), XlaArray::physical_buffer_type(index_type.data_type()), vec![]),
+                    (index_bytes.clone(), Array::physical_buffer_type(index_type.data_type()), vec![]),
                     (values_to_bytes(&[size]), BufferType::I32, vec![]),
                 ]
                 .into_iter()
@@ -755,7 +753,7 @@ mod tests {
         crate::operations::assertions::ensure_assertion_handler_registered(&client).unwrap();
         let input_type = ArrayType::new_static(DataType::I64, [4]);
         let scalar_type = ArrayType::scalar(DataType::I64);
-        let mut builder = ArrayIrXlaProgramBuilder::new();
+        let mut builder = ArrayIrProgramBuilder::new();
         let input = builder.add_input(input_type.clone().into());
         let mut bounds = Vec::new();
         for name in ["start", "size"] {
@@ -782,7 +780,7 @@ mod tests {
             )
             .unwrap()[0];
         let program = builder
-            .build::<Vec<XlaConstant>, Vec<XlaConstant>>(vec![result], vec![Placeholder; 3], vec![Placeholder])
+            .build::<Vec<Constant>, Vec<Constant>>(vec![result], vec![Placeholder; 3], vec![Placeholder])
             .unwrap();
         let output_type = <&ArrayType>::try_from(&program.output_types()[0]).unwrap().clone();
         let module = to_mlir_module_for_program(
@@ -850,7 +848,7 @@ mod tests {
         let input_type = test_matrix_type(2, 3);
         let update_type = test_matrix_type(1, 2);
         let index_type = ArrayType::scalar(DataType::I32);
-        let mut builder = XlaProgramBuilder::new();
+        let mut builder = ProgramBuilder::new();
         let input = builder.add_input(input_type);
         let update = builder.add_input(update_type);
         let index_0 = builder.add_input(index_type.clone());
@@ -878,7 +876,7 @@ mod tests {
             )
             .unwrap()[0];
         let program = builder
-            .build::<Vec<XlaArrayConstant>, Vec<XlaArrayConstant>>(
+            .build::<Vec<ArrayConstant>, Vec<ArrayConstant>>(
                 vec![sliced, updated, dynamic_sliced, dynamic_updated],
                 vec![Placeholder, Placeholder, Placeholder, Placeholder],
                 vec![Placeholder, Placeholder, Placeholder, Placeholder],
@@ -927,9 +925,9 @@ mod tests {
         // dynamic-slice-size operand is needed.
         let rows = DimensionVariable::new("rows", DimensionBounds::new(1, Some(5)).unwrap());
         let input_type =
-            ArrayType::new(DataType::F32, Shape::new(vec![Dimension::Dynamic(rows), Dimension::Static(3)]));
+            ArrayType::new(DataType::F32, Shape::new(vec![CoreDimension::Dynamic(rows), CoreDimension::Static(3)]));
         let index_type = ArrayType::scalar(DataType::I32);
-        let mut builder = XlaProgramBuilder::new();
+        let mut builder = ProgramBuilder::new();
         let input = builder.add_input(input_type);
         let index_0 = builder.add_input(index_type.clone());
         let index_1 = builder.add_input(index_type);
@@ -937,11 +935,7 @@ mod tests {
             .add_instruction(DynamicSliceOperation::new(vec![1, 2]), Vec::new(), vec![input, index_0, index_1], None)
             .unwrap()[0];
         let program = builder
-            .build::<Vec<XlaArrayConstant>, Vec<XlaArrayConstant>>(
-                vec![output],
-                vec![Placeholder; 3],
-                vec![Placeholder],
-            )
+            .build::<Vec<ArrayConstant>, Vec<ArrayConstant>>(vec![output], vec![Placeholder; 3], vec![Placeholder])
             .unwrap();
         let stablehlo = to_mlir_module_for_plain_program(&program, "main").unwrap();
         assert!(stablehlo.contains("stablehlo.dynamic_slice"), "{stablehlo}");
@@ -954,13 +948,15 @@ mod tests {
         // A dynamic limit keeps its bounded dynamic axis whole: the lowering slices the physical allocation, whose
         // dynamic axis is widened to its bound, and then restores that axis's logical extent from the input.
         let batch = DimensionVariable::new("batch", DimensionBounds::new(1, Some(5)).unwrap());
-        let input_type =
-            ArrayType::new(DataType::F32, Shape::new(vec![Dimension::Dynamic(batch.clone()), Dimension::Static(4)]));
-        let mut builder = XlaProgramBuilder::new();
+        let input_type = ArrayType::new(
+            DataType::F32,
+            Shape::new(vec![CoreDimension::Dynamic(batch.clone()), CoreDimension::Static(4)]),
+        );
+        let mut builder = ProgramBuilder::new();
         let input = builder.add_input(input_type);
         let output = builder
             .add_instruction(
-                SliceOperation::new(vec![0, 1], vec![Dimension::Dynamic(batch), Dimension::Static(4)])
+                SliceOperation::new(vec![0, 1], vec![CoreDimension::Dynamic(batch), CoreDimension::Static(4)])
                     .with_strides(vec![1, 2])
                     .unwrap(),
                 Vec::new(),
@@ -969,7 +965,7 @@ mod tests {
             )
             .unwrap()[0];
         let program = builder
-            .build::<Vec<XlaArrayConstant>, Vec<XlaArrayConstant>>(vec![output], vec![Placeholder], vec![Placeholder])
+            .build::<Vec<ArrayConstant>, Vec<ArrayConstant>>(vec![output], vec![Placeholder], vec![Placeholder])
             .unwrap();
         assert_eq!(
             to_mlir_module_for_plain_program(&program, "main").unwrap(),
@@ -998,8 +994,12 @@ mod tests {
         // through the canonical zero path to a scalar constant broadcast to the array shape. The reverse path
         // stages the pullback over the primal operation family taking `[output_cotangents ++ residuals]`; this slice
         // pullback captures no residuals, so the pullback consumes only the single output cotangent.
-        let (_, pullback): (Array, _) = EagerContext::<Array, ArrayOperation<Array>>::new()
-            .vjp(|x, ()| Ok(x.slice(&[1], &[3], &[1]).unwrap()), Array::vector(vec![1.0, 2.0, 3.0, 4.0]).unwrap(), ())
+        let (_, pullback): (CoreArray, _) = EagerContext::<CoreArray, ArrayOperation<CoreArray>>::new()
+            .vjp(
+                |x, ()| Ok(x.slice(&[1], &[3], &[1]).unwrap()),
+                CoreArray::vector(vec![1.0, 2.0, 3.0, 4.0]).unwrap(),
+                (),
+            )
             .unwrap();
         let (pullback, _residuals) = pullback.into_transposed_parts().unwrap();
         let pullback = pullback.into_program();
@@ -1021,10 +1021,10 @@ mod tests {
 
         // The strided slice pullback pads the cotangent with a zero scalar using the inverse padding
         // (`low = start`, `interior = stride - 1`), which lowers to `stablehlo.pad`.
-        let (_, pullback): (Array, _) = EagerContext::<Array, ArrayOperation<Array>>::new()
+        let (_, pullback): (CoreArray, _) = EagerContext::<CoreArray, ArrayOperation<CoreArray>>::new()
             .vjp(
                 |x, ()| Ok(x.slice(&[1], &[6], &[2]).unwrap()),
-                Array::vector(vec![0.0, 1.0, 2.0, 3.0, 4.0, 5.0]).unwrap(),
+                CoreArray::vector(vec![0.0, 1.0, 2.0, 3.0, 4.0, 5.0]).unwrap(),
                 (),
             )
             .unwrap();
@@ -1047,13 +1047,13 @@ mod tests {
         // The pad pullback first edge-unpads the cotangent and then slices it with the non-unit interior stride for the
         // input. It constructs a Boolean padding-position mask for the padding-value cotangent so non-finite values at
         // input positions cannot contaminate its sum.
-        let (_, pullback): (Array, _) = EagerContext::<Array, ArrayOperation<Array>>::new()
+        let (_, pullback): (CoreArray, _) = EagerContext::<CoreArray, ArrayOperation<CoreArray>>::new()
             .vjp(
                 |(x, padding_value), ()| {
                     use ryft_core::Pad;
                     Ok(x.pad(&padding_value, &[1], &[2], &[1]).unwrap())
                 },
-                (Array::vector(vec![1.0, 2.0, 3.0]).unwrap(), Array::scalar(9.0).unwrap()),
+                (CoreArray::vector(vec![1.0, 2.0, 3.0]).unwrap(), CoreArray::scalar(9.0).unwrap()),
                 (),
             )
             .unwrap();
@@ -1085,16 +1085,16 @@ mod tests {
 
         // The dynamic slice pullback scatters the cotangent at the captured index factors, which materialize as
         // integer constants through `lower_literal_value`.
-        let (_, pullback): (Array, _) = EagerContext::<Array, ArrayOperation<Array>>::new()
+        let (_, pullback): (CoreArray, _) = EagerContext::<CoreArray, ArrayOperation<CoreArray>>::new()
             .vjp(
                 |x, ()| {
                     let start = x
                         .context()
-                        .lift(Array::from_elements::<i32>(ArrayType::scalar(DataType::I32), &[1]).unwrap())
+                        .lift(CoreArray::from_elements::<i32>(ArrayType::scalar(DataType::I32), &[1]).unwrap())
                         .unwrap();
                     Ok(x.dynamic_slice(&[start], &[2]).unwrap())
                 },
-                Array::vector(vec![1.0, 2.0, 3.0, 4.0]).unwrap(),
+                CoreArray::vector(vec![1.0, 2.0, 3.0, 4.0]).unwrap(),
                 (),
             )
             .unwrap();
@@ -1128,7 +1128,7 @@ mod tests {
 
         // The runtime index remains an input after transposition. Functionalizing the buffer update must keep
         // only the selected-block addition, without constructing a full-size zero cotangent first.
-        let mut builder = ArrayIrXlaProgramBuilder::new();
+        let mut builder = ArrayIrProgramBuilder::new();
         let input = builder.add_input(ArrayIrType::Array(ArrayType::new_static(DataType::F64, [5])));
         let start = builder.add_input(ArrayIrType::Array(ArrayType::scalar(DataType::I32)));
         let output = builder
@@ -1139,7 +1139,7 @@ mod tests {
                 None,
             )
             .unwrap()[0];
-        let program: FlatXlaProgram = builder.build(vec![output], vec![Placeholder; 2], vec![Placeholder]).unwrap();
+        let program: FlatProgram = builder.build(vec![output], vec![Placeholder; 2], vec![Placeholder]).unwrap();
         let pullback = program.transpose_with_respect_to(&[0], &[CotangentDestinationKind::Reference]).unwrap();
         let discharged = pullback.discharge_references(0).unwrap();
         let stablehlo = to_mlir_module_for_program(
@@ -1230,12 +1230,12 @@ mod tests {
 
         assert_eq!(
             unsupported_operation(
-                plan_dynamic_slice_axis(2, 1, &Dimension::Static(4), &bounded_start, &unbounded).unwrap_err(),
+                plan_dynamic_slice_axis(2, 1, &CoreDimension::Static(4), &bounded_start, &unbounded).unwrap_err(),
             ),
             "dynamic_slice size on axis 2 needs a finite upper bound",
         );
 
-        let unbounded_input = Dimension::Dynamic(DimensionVariable::new("input", DimensionBounds::unbounded()));
+        let unbounded_input = CoreDimension::Dynamic(DimensionVariable::new("input", DimensionBounds::unbounded()));
         assert_eq!(
             unsupported_operation(
                 plan_dynamic_slice_axis(1, 1, &unbounded_input, &bounded_start, &bounded_size).unwrap_err(),
@@ -1246,19 +1246,19 @@ mod tests {
         let overflowing_size = dimension_type("size", DimensionBounds::non_negative(Some(usize::MAX)).unwrap());
         assert_eq!(
             unsupported_operation(
-                plan_dynamic_slice_axis(3, 2, &Dimension::Static(usize::MAX), &bounded_start, &overflowing_size,)
+                plan_dynamic_slice_axis(3, 2, &CoreDimension::Static(usize::MAX), &bounded_start, &overflowing_size,)
                     .unwrap_err(),
             ),
             "dynamic_slice physical span overflows on axis 3",
         );
 
         assert_eq!(
-            plan_dynamic_slice_axis(0, 1, &Dimension::Static(3), &bounded_start, &bounded_size).unwrap(),
+            plan_dynamic_slice_axis(0, 1, &CoreDimension::Static(3), &bounded_start, &bounded_size).unwrap(),
             DynamicSliceAxisPlan { size: 4, span: 4, needs_runtime_assertion: true },
         );
 
         let bounded_input =
-            Dimension::Dynamic(DimensionVariable::new("input", DimensionBounds::positive(Some(5)).unwrap()));
+            CoreDimension::Dynamic(DimensionVariable::new("input", DimensionBounds::positive(Some(5)).unwrap()));
         assert_eq!(
             plan_dynamic_slice_axis(0, 1, &bounded_input, &bounded_start, &bounded_size).unwrap(),
             DynamicSliceAxisPlan { size: 4, span: 4, needs_runtime_assertion: true },
@@ -1267,7 +1267,7 @@ mod tests {
         let proven_start = dimension_type("start", DimensionBounds::non_negative(Some(1)).unwrap());
         let proven_size = dimension_type("size", DimensionBounds::non_negative(Some(4)).unwrap());
         assert_eq!(
-            plan_dynamic_slice_axis(0, 1, &Dimension::Static(4), &proven_start, &proven_size).unwrap(),
+            plan_dynamic_slice_axis(0, 1, &CoreDimension::Static(4), &proven_start, &proven_size).unwrap(),
             DynamicSliceAxisPlan { size: 3, span: 3, needs_runtime_assertion: false },
         );
     }

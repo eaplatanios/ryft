@@ -1,8 +1,8 @@
 use ryft_core::macros::check_count;
 use ryft_core::{
     ArrayIrType, ArrayType, CAST_OPERATION_NAME, CONVERT_ELEMENT_TYPE_OPERATION_NAME, CastOperation, CastType,
-    ConvertElementTypeOperation, DataType, Dimension, MeshAxisType, ProgramError, ReducePrecisionOperation,
-    ReductionKind, Shape, Sharding,
+    ConvertElementTypeOperation, DataType, Dimension as CoreDimension, MeshAxisType, ProgramError,
+    ReducePrecisionOperation, ReductionKind, Shape, Sharding,
 };
 use ryft_mlir::dialects::stable_hlo;
 use ryft_mlir::{
@@ -19,12 +19,12 @@ use crate::operations::constants::lower_layout_constraint;
 use crate::operations::control_flow::{lower_refined_region_input, lower_refined_region_outputs};
 use crate::operations::reductions::lower_reduce_to_mlir;
 use crate::operations::sharding::constrain_sharding::lower_sharding_constraint;
-use crate::{Error, LowerableOperation, LowerableOperationFamily, LoweringError, XlaLowerer};
+use crate::{Error, LowerableOperation, LowerableOperationFamily, Lowerer, LoweringError};
 
 impl LowerableOperation for ConvertElementTypeOperation<ArrayType> {
     fn lower<'b, 'c: 'b, 't: 'c, O: LowerableOperationFamily>(
         &self,
-        lowerer: &mut XlaLowerer<'b, 'c, 't, O>,
+        lowerer: &mut Lowerer<'b, 'c, 't, O>,
         input_values: &[ValueRef<'b, 'c, 't>],
         input_types: &[ArrayType],
         output_types: &[ArrayType],
@@ -218,7 +218,7 @@ impl LowerableOperation for ConvertElementTypeOperation<ArrayType> {
 impl LowerableOperation for ReducePrecisionOperation<ArrayType> {
     fn lower<'b, 'c: 'b, 't: 'c, O: LowerableOperationFamily>(
         &self,
-        lowerer: &mut XlaLowerer<'b, 'c, 't, O>,
+        lowerer: &mut Lowerer<'b, 'c, 't, O>,
         input_values: &[ValueRef<'b, 'c, 't>],
         _input_types: &[ArrayType],
         _output_types: &[ArrayType],
@@ -237,7 +237,7 @@ impl LowerableOperation for ReducePrecisionOperation<ArrayType> {
 impl LowerableOperation for CastOperation<ArrayType> {
     fn lower<'b, 'c: 'b, 't: 'c, O: LowerableOperationFamily>(
         &self,
-        lowerer: &mut XlaLowerer<'b, 'c, 't, O>,
+        lowerer: &mut Lowerer<'b, 'c, 't, O>,
         input_values: &[ValueRef<'b, 'c, 't>],
         input_types: &[ArrayType],
         output_types: &[ArrayType],
@@ -249,7 +249,7 @@ impl LowerableOperation for CastOperation<ArrayType> {
 impl LowerableOperation for CastOperation<ArrayIrType> {
     fn lower<'b, 'c: 'b, 't: 'c, O: LowerableOperationFamily>(
         &self,
-        lowerer: &mut XlaLowerer<'b, 'c, 't, O>,
+        lowerer: &mut Lowerer<'b, 'c, 't, O>,
         input_values: &[ValueRef<'b, 'c, 't>],
         input_types: &[ArrayIrType],
         output_types: &[ArrayIrType],
@@ -265,7 +265,7 @@ impl LowerableOperation for CastOperation<ArrayIrType> {
 /// unchecked cast never consumes that token.
 fn lower_cast_operation<'b, 'c: 'b, 't: 'c, T: CastType + Into<ArrayIrType>, O: LowerableOperationFamily>(
     operation: &CastOperation<T>,
-    lowerer: &mut XlaLowerer<'b, 'c, 't, O>,
+    lowerer: &mut Lowerer<'b, 'c, 't, O>,
     input_values: &[ValueRef<'b, 'c, 't>],
     input_types: &[T],
     output_types: &[T],
@@ -297,7 +297,7 @@ fn lower_cast_check<'b, 'c: 'b, 't: 'c, T: CastType + Into<ArrayIrType>, O: Lowe
     operation: &CastOperation<T>,
     input_values: &[ValueRef<'b, 'c, 't>],
     input_types: &[T],
-    lowerer: &mut XlaLowerer<'b, 'c, 't, O>,
+    lowerer: &mut Lowerer<'b, 'c, 't, O>,
 ) -> Result<(), Error> {
     if !operation.is_checked()
         || T::infer_cast_output_type(operation, input_types).map_err(ProgramError::from)?.1.is_some()
@@ -333,7 +333,7 @@ fn lower_cast<'b, 'c: 'b, 't: 'c, O: LowerableOperationFamily>(
     value: ValueRef<'b, 'c, 't>,
     input_type: &ArrayIrType,
     output_type: &ArrayIrType,
-    lowerer: &mut XlaLowerer<'b, 'c, 't, O>,
+    lowerer: &mut Lowerer<'b, 'c, 't, O>,
 ) -> Result<ValueRef<'b, 'c, 't>, Error> {
     let value =
         lower_cast_shape(value, input_type, output_type, &mut lowerer.block, lowerer.context, lowerer.location)?;
@@ -418,8 +418,8 @@ pub(crate) fn lower_cast_shape<'b, 'c: 'b, 't: 'c>(
     if let (ArrayIrType::Array(input), ArrayIrType::Array(output)) = (input_type, output_type) {
         let dimension_pairs = input.shape().dimensions().iter().zip(output.shape().dimensions()).collect::<Vec<_>>();
         let changed_axis = dimension_pairs.iter().position(|pair| match pair {
-            (Dimension::Static(_), Dimension::Static(_)) => false,
-            (Dimension::Dynamic(input), Dimension::Dynamic(output)) => {
+            (CoreDimension::Static(_), CoreDimension::Static(_)) => false,
+            (CoreDimension::Dynamic(input), CoreDimension::Dynamic(output)) => {
                 input.bounds().upper() != output.bounds().upper()
             }
             _ => true,
@@ -459,7 +459,7 @@ pub(crate) fn lower_cast_shape<'b, 'c: 'b, 't: 'c>(
                 .iter()
                 .zip(output.shape().dimensions())
                 .map(|(input, output)| match (input, output) {
-                    (Dimension::Dynamic(_), Dimension::Static(_)) => output.clone(),
+                    (CoreDimension::Dynamic(_), CoreDimension::Static(_)) => output.clone(),
                     _ => input.clone(),
                 })
                 .collect();
@@ -771,7 +771,7 @@ fn lower_bitcast_to_mlir<'b, 'c: 'b, 't: 'c>(
             shape.push(width / 2);
         }
         let groups_type =
-            ArrayType::new(DataType::U2, Shape::new(shape.iter().copied().map(Dimension::Static).collect()));
+            ArrayType::new(DataType::U2, Shape::new(shape.iter().copied().map(CoreDimension::Static).collect()));
         let groups = block.append_operation(stable_hlo::bitcast_convert(
             physical_input,
             lower_tensor_type(&groups_type, context, location)?,
@@ -785,7 +785,7 @@ fn lower_bitcast_to_mlir<'b, 'c: 'b, 't: 'c>(
         let group_rank = shape.len();
         shape.push(2);
         let expanded_type =
-            ArrayType::new(DataType::U8, Shape::new(shape.iter().copied().map(Dimension::Static).collect()));
+            ArrayType::new(DataType::U8, Shape::new(shape.iter().copied().map(CoreDimension::Static).collect()));
         let expanded_tensor_type = lower_tensor_type(&expanded_type, context, location)?;
         let expanded = block.append_operation(stable_hlo::broadcast(
             groups.result(0).unwrap().as_ref(),
@@ -822,7 +822,7 @@ fn lower_bitcast_to_mlir<'b, 'c: 'b, 't: 'c>(
         shape.push(2);
         let reshaped = block.append_operation(stable_hlo::reshape(physical_input, &shape, location)?)?;
         let expanded_type =
-            ArrayType::new(DataType::U8, Shape::new(shape.iter().copied().map(Dimension::Static).collect()));
+            ArrayType::new(DataType::U8, Shape::new(shape.iter().copied().map(CoreDimension::Static).collect()));
         let expanded_tensor_type = lower_tensor_type(&expanded_type, context, location)?;
         let expanded = block.append_operation(stable_hlo::convert(
             reshaped.result(0).unwrap().as_ref(),
@@ -837,7 +837,8 @@ fn lower_bitcast_to_mlir<'b, 'c: 'b, 't: 'c>(
             location,
         )?)?;
         shape.pop();
-        let groups_type = ArrayType::new(DataType::U8, Shape::new(shape.into_iter().map(Dimension::Static).collect()));
+        let groups_type =
+            ArrayType::new(DataType::U8, Shape::new(shape.into_iter().map(CoreDimension::Static).collect()));
         let groups = lower_reduce_to_mlir(
             ReductionKind::Sum,
             &[bit_axis],
@@ -1041,13 +1042,13 @@ mod tests {
     use indoc::{formatdoc, indoc};
     use pretty_assertions::assert_eq;
 
-    use ryft_core::{DimensionBounds, DimensionType, GuardOperation, Operation, Placeholder, TypeError};
-
-    use crate::experimental::lowering::tests::{XlaProgramBuilder, dynamic_dimension};
-    use crate::experimental::lowering::to_mlir_module_for_plain_program;
-    use crate::experimental::ops::{
-        XlaArrayConstant, XlaConstant, XlaOperation, XlaProgramBuilder as ArrayIrXlaProgramBuilder,
+    use ryft_core::{
+        DimensionBounds, DimensionType, GuardOperation, Operation as CoreOperation, Placeholder, TypeError,
     };
+
+    use crate::experimental::lowering::tests::{ProgramBuilder, dynamic_dimension};
+    use crate::experimental::lowering::to_mlir_module_for_plain_program;
+    use crate::experimental::ops::{ArrayConstant, Constant, Operation, ProgramBuilder as ArrayIrProgramBuilder};
     use crate::to_mlir_module_for_program;
 
     use super::*;
@@ -1124,7 +1125,7 @@ mod tests {
     #[test]
     fn test_lower_bitcast_to_mlir_unbounded_dimensions() {
         let input_type = ArrayType::new(DataType::F32, Shape::new(vec![dynamic_dimension("size", None)]));
-        let mut builder = XlaProgramBuilder::new();
+        let mut builder = ProgramBuilder::new();
         let input = builder.add_input(input_type.clone());
         let output = builder
             .add_instruction(
@@ -1135,7 +1136,7 @@ mod tests {
             )
             .unwrap()[0];
         let program = builder
-            .build::<Vec<XlaArrayConstant>, Vec<XlaArrayConstant>>(vec![output], vec![Placeholder], vec![Placeholder])
+            .build::<Vec<ArrayConstant>, Vec<ArrayConstant>>(vec![output], vec![Placeholder], vec![Placeholder])
             .unwrap();
         assert_eq!(
             to_mlir_module_for_plain_program(&program, "main").unwrap(),
@@ -1148,7 +1149,7 @@ mod tests {
             }
         "#},
         );
-        let mut builder = XlaProgramBuilder::new();
+        let mut builder = ProgramBuilder::new();
         let input = builder.add_input(input_type);
         let output = builder
             .add_instruction(
@@ -1159,7 +1160,7 @@ mod tests {
             )
             .unwrap()[0];
         let program = builder
-            .build::<Vec<XlaArrayConstant>, Vec<XlaArrayConstant>>(vec![output], vec![Placeholder], vec![Placeholder])
+            .build::<Vec<ArrayConstant>, Vec<ArrayConstant>>(vec![output], vec![Placeholder], vec![Placeholder])
             .unwrap();
         assert!(matches!(
             to_mlir_module_for_plain_program(&program, "main"),
@@ -1170,13 +1171,13 @@ mod tests {
 
     #[test]
     fn test_lower_reduce_precision() {
-        let mut builder = XlaProgramBuilder::new();
+        let mut builder = ProgramBuilder::new();
         let input = builder.add_input(ArrayType::new_static(DataType::F32, [3]));
         let output = builder
             .add_instruction(ReducePrecisionOperation::<ArrayType>::new(8, 7), Vec::new(), vec![input], None)
             .unwrap()[0];
         let program = builder
-            .build::<Vec<XlaArrayConstant>, Vec<XlaArrayConstant>>(vec![output], vec![Placeholder], vec![Placeholder])
+            .build::<Vec<ArrayConstant>, Vec<ArrayConstant>>(vec![output], vec![Placeholder], vec![Placeholder])
             .unwrap();
         assert_eq!(
             to_mlir_module_for_plain_program(&program, "main").unwrap(),
@@ -1193,7 +1194,7 @@ mod tests {
 
     #[test]
     fn test_lower_cast() {
-        use ryft_core::{Add, Cast, Shape, Tracer, TracingContext};
+        use ryft_core::{Add, Cast, Shape, Tracer as CoreTracer, TracingContext};
 
         use crate::experimental::lowering::tests::{MixedValue, execute_mixed_program};
         use crate::tests::execution_client;
@@ -1207,8 +1208,8 @@ mod tests {
         let client = execution_client();
         let symbolic_input = MixedValue::Array(vec![1.0, 2.0, 0.0, 0.0], vec![4]);
         for checked in [true, false] {
-            let (_, program) = TracingContext::<XlaConstant, XlaOperation>::trace(
-                |inputs: Vec<Tracer<_>>| {
+            let (_, program) = TracingContext::<Constant, Operation>::trace(
+                |inputs: Vec<CoreTracer<_>>| {
                     Ok(vec![if checked {
                         inputs[0].cast(exact.clone(), &[])?
                     } else {
@@ -1231,8 +1232,8 @@ mod tests {
             }
         }
 
-        let (_, program) = TracingContext::<XlaConstant, XlaOperation>::trace(
-            |inputs: Vec<Tracer<_>>| {
+        let (_, program) = TracingContext::<Constant, Operation>::trace(
+            |inputs: Vec<CoreTracer<_>>| {
                 let widened = inputs[0].cast(symbolic.clone(), std::slice::from_ref(&inputs[1]))?;
                 Ok(vec![widened.add(&inputs[1])?])
             },
@@ -1254,19 +1255,22 @@ mod tests {
         use crate::tests::execution_client;
 
         let n = DimensionType::new("n", DimensionBounds::positive(Some(8)).unwrap());
-        let mut builder = ArrayIrXlaProgramBuilder::new();
+        let mut builder = ArrayIrProgramBuilder::new();
         let value = builder.add_input(n.clone().into());
         let output = builder
             .add_instruction(
-                CastOperation::<ArrayIrType>::checked(DimensionType::from(Dimension::Static(2)).into(), vec![n.into()])
-                    .unwrap(),
+                CastOperation::<ArrayIrType>::checked(
+                    DimensionType::from(CoreDimension::Static(2)).into(),
+                    vec![n.into()],
+                )
+                .unwrap(),
                 vec![],
                 vec![value],
                 None,
             )
             .unwrap()[0];
         let program = builder
-            .build::<Vec<XlaConstant>, Vec<XlaConstant>>(vec![output], vec![Placeholder], vec![Placeholder])
+            .build::<Vec<Constant>, Vec<Constant>>(vec![output], vec![Placeholder], vec![Placeholder])
             .unwrap();
         let client = execution_client();
         assert_eq!(
@@ -1286,7 +1290,7 @@ mod tests {
 
         let n = DimensionType::new("n", DimensionBounds::positive(Some(5)).unwrap());
         let symbolic: ArrayIrType = ArrayType::new(DataType::F64, Shape::new(vec![n.simplified_dimension()])).into();
-        let (_, program) = TracingContext::<XlaConstant, XlaOperation>::trace(
+        let (_, program) = TracingContext::<Constant, Operation>::trace(
             |(value, witness)| value.cast_unchecked(symbolic.clone(), &[witness]),
             (ArrayIrType::from(ArrayType::new_static(DataType::F64, [2])), symbolic.clone()),
         )
@@ -1319,8 +1323,7 @@ mod tests {
         ]);
         let source = block.argument(0).unwrap().as_ref();
         let unrelated = block.argument(1).unwrap().as_ref();
-        let mut lowerer: XlaLowerer<'_, '_, '_, XlaOperation> =
-            XlaLowerer::new(block.as_ref(), &context, location.as_ref());
+        let mut lowerer: Lowerer<'_, '_, '_, Operation> = Lowerer::new(block.as_ref(), &context, location.as_ref());
         let guarded = CastOperation::checked(exact.clone(), vec![symbolic.clone()])
             .unwrap()
             .lower(&mut lowerer, &[source], &[symbolic], &[exact.clone()])
@@ -1410,7 +1413,7 @@ mod tests {
             ),
         ];
         for (constructor, expected) in cases {
-            let mut builder = XlaProgramBuilder::new();
+            let mut builder = ProgramBuilder::new();
             let predicate = builder.add_input(ArrayType::scalar(DataType::Boolean));
             let input = builder.add_input(input_type.clone());
             builder
@@ -1425,11 +1428,7 @@ mod tests {
                 )
                 .unwrap()[0];
             let program = builder
-                .build::<Vec<XlaArrayConstant>, Vec<XlaArrayConstant>>(
-                    vec![output],
-                    vec![Placeholder; 2],
-                    vec![Placeholder],
-                )
+                .build::<Vec<ArrayConstant>, Vec<ArrayConstant>>(vec![output], vec![Placeholder; 2], vec![Placeholder])
                 .unwrap();
             assert_eq!(to_mlir_module_for_plain_program(&program, "main").unwrap(), expected);
         }
@@ -1446,7 +1445,7 @@ mod tests {
         let n = DimensionType::new("n", DimensionBounds::positive(Some(5)).unwrap());
         let symbolic: ArrayIrType = ArrayType::new(DataType::F64, Shape::new(vec![n.simplified_dimension()])).into();
         let body = |index, checked| {
-            let mut builder = ArrayIrXlaProgramBuilder::new();
+            let mut builder = ArrayIrProgramBuilder::new();
             if index {
                 builder.add_input(ArrayType::scalar(DataType::I64).into());
             }
@@ -1466,7 +1465,7 @@ mod tests {
                     .unwrap();
             }
             builder
-                .build::<Vec<XlaConstant>, Vec<XlaConstant>>(
+                .build::<Vec<Constant>, Vec<Constant>>(
                     vec![value],
                     vec![Placeholder; if index { 2 } else { 1 }],
                     vec![Placeholder],
@@ -1481,7 +1480,7 @@ mod tests {
                 if wrapper == 0 && !entered {
                     continue;
                 }
-                let mut builder = ArrayIrXlaProgramBuilder::new();
+                let mut builder = ArrayIrProgramBuilder::new();
                 let input = builder.add_input(symbolic.clone());
                 let region = builder.import_program(body(wrapper >= 3, true));
                 let output = match wrapper {
@@ -1489,7 +1488,7 @@ mod tests {
                         for _ in 0..2 {
                             builder
                                 .add_instruction(
-                                    XlaOperation::JitCall(JitCallOperation::new(0)),
+                                    Operation::JitCall(JitCallOperation::new(0)),
                                     vec![region],
                                     vec![input],
                                     None,
@@ -1500,10 +1499,10 @@ mod tests {
                     }
                     1 => {
                         let other = builder.import_program(body(false, false));
-                        let predicate = builder.add_constant(XlaConstant::Boolean(entered));
+                        let predicate = builder.add_constant(Constant::Boolean(entered));
                         builder
                             .add_instruction(
-                                XlaOperation::Condition(ConditionOperation::new()),
+                                Operation::Condition(ConditionOperation::new()),
                                 vec![region, other],
                                 vec![predicate, input],
                                 None,
@@ -1511,11 +1510,11 @@ mod tests {
                             .unwrap()[0]
                     }
                     2 => {
-                        let mut condition = ArrayIrXlaProgramBuilder::new();
+                        let mut condition = ArrayIrProgramBuilder::new();
                         condition.add_input(symbolic.clone());
-                        let predicate = condition.add_constant(XlaConstant::Boolean(entered));
+                        let predicate = condition.add_constant(Constant::Boolean(entered));
                         let condition = condition
-                            .build::<Vec<XlaConstant>, Vec<XlaConstant>>(
+                            .build::<Vec<Constant>, Vec<Constant>>(
                                 vec![predicate],
                                 vec![Placeholder],
                                 vec![Placeholder],
@@ -1524,7 +1523,7 @@ mod tests {
                         let condition = builder.import_program(condition);
                         builder
                             .add_instruction(
-                                XlaOperation::While(WhileOperation::new().with_iteration_bound(1).unwrap()),
+                                Operation::While(WhileOperation::new().with_iteration_bound(1).unwrap()),
                                 vec![condition, region],
                                 vec![input],
                                 None,
@@ -1533,8 +1532,8 @@ mod tests {
                     }
                     _ => builder
                         .add_instruction(
-                            XlaOperation::Scan(
-                                ScanOperation::new(1, Dimension::Static(if entered { 2 } else { 0 }))
+                            Operation::Scan(
+                                ScanOperation::new(1, CoreDimension::Static(if entered { 2 } else { 0 }))
                                     .with_unroll(if wrapper == 4 { 3 } else { 1 })
                                     .unwrap(),
                             ),
@@ -1545,7 +1544,7 @@ mod tests {
                         .unwrap()[0],
                 };
                 let program = builder
-                    .build::<Vec<XlaConstant>, Vec<XlaConstant>>(vec![output], vec![Placeholder], vec![Placeholder])
+                    .build::<Vec<Constant>, Vec<Constant>>(vec![output], vec![Placeholder], vec![Placeholder])
                     .unwrap();
                 for extent in [2, 3] {
                     let result = execute_mixed_program(
@@ -1582,26 +1581,27 @@ mod tests {
             MeshAxis, MeshAxisType, ProgramError, ProjectedValue, ShardMap, ShardMapOptions, Sharding, ValueProjection,
         };
 
-        use crate::experimental::domains::{XlaDomain, XlaTracer};
+        use crate::Domain;
+        use crate::domains::Tracer;
         use crate::experimental::lowering::tests::{MixedValue, execute_mixed_program};
-        use crate::experimental::tracing::XlaArrayTracer;
+        use crate::experimental::tracing::ArrayTracer;
         use crate::tests::execution_client;
 
         let mesh = LogicalMesh::new(vec![MeshAxis::new("x", 1, MeshAxisType::Manual).unwrap()]).unwrap();
         let sharding = Sharding::replicated(mesh.clone(), 0);
         let scalar = ArrayType::scalar(DataType::F64);
         let extent = DimensionType::new("extent", DimensionBounds::positive(Some(8)).unwrap());
-        let (_, program) = DomainTracingContext::<XlaDomain<'static>>::trace_with_context_and_named_axes(
-            |context, inputs: Vec<XlaTracer<'static>>| {
+        let (_, program) = DomainTracingContext::<Domain<'static>>::trace_with_context_and_named_axes(
+            |context, inputs: Vec<Tracer<'static>>| {
                 let inputs = inputs
                     .into_iter()
                     .map(|input| ValueProjection::<ArrayType>::into_projected(input).map_err(ProgramError::from))
                     .collect::<Result<Vec<_>, _>>()?;
                 let outputs = context.shard_map(
-                    |_, inputs: Vec<XlaArrayTracer>| {
+                    |_, inputs: Vec<ArrayTracer>| {
                         let integer = inputs[0].convert_element_type(DataType::I64)?;
                         let dimension = integer.to_dimension(extent.to_variable())?;
-                        let checked = dimension.cast(DimensionType::from(Dimension::Static(2)).into(), &[])?;
+                        let checked = dimension.cast(DimensionType::from(CoreDimension::Static(2)).into(), &[])?;
                         let scalar = checked.to_scalar()?.convert_element_type(DataType::F64)?;
                         Ok(vec![scalar.into_projected()?])
                     },
@@ -1643,7 +1643,7 @@ mod tests {
             .with_sharding(Sharding::new(mesh.clone(), vec![ShardingDimension::sharded(["x"])]).unwrap())
             .unwrap();
         let output = ArrayType::new_static(DataType::F64, [2]).with_sharding(Sharding::replicated(mesh, 1)).unwrap();
-        let mut builder = ArrayIrXlaProgramBuilder::new();
+        let mut builder = ArrayIrProgramBuilder::new();
         let value = builder.add_input(input.clone().into());
         let result = builder
             .add_instruction(
@@ -1654,7 +1654,7 @@ mod tests {
             )
             .unwrap()[0];
         let program = builder
-            .build::<Vec<XlaConstant>, Vec<XlaConstant>>(vec![result], vec![Placeholder], vec![Placeholder])
+            .build::<Vec<Constant>, Vec<Constant>>(vec![result], vec![Placeholder], vec![Placeholder])
             .unwrap();
         let jvp = program.jvp().unwrap();
         assert_eq!(
@@ -1724,7 +1724,7 @@ mod tests {
         let n = DimensionType::new("n", DimensionBounds::positive(Some(5)).unwrap());
         let symbolic: ArrayIrType = ArrayType::new(DataType::F64, Shape::new(vec![n.simplified_dimension()])).into();
         let exact: ArrayIrType = ArrayType::new_static(DataType::F64, [2]).into();
-        let mut builder = ArrayIrXlaProgramBuilder::new();
+        let mut builder = ArrayIrProgramBuilder::new();
         let first = builder.add_input(exact);
         let second = builder.add_input(symbolic.clone());
         let narrowed = builder
@@ -1738,7 +1738,7 @@ mod tests {
             .to_vec();
         let sum = builder.add_instruction(AddOperation::<ArrayType>::new(), Vec::new(), narrowed, None).unwrap()[0];
         let program = builder
-            .build::<Vec<XlaConstant>, Vec<XlaConstant>>(vec![sum], vec![Placeholder; 2], vec![Placeholder])
+            .build::<Vec<Constant>, Vec<Constant>>(vec![sum], vec![Placeholder; 2], vec![Placeholder])
             .unwrap();
         let client = execution_client();
         let inputs = [MixedValue::Array(vec![1.0, 2.0], vec![2]), MixedValue::Array(vec![3.0, 4.0, 0.0, 0.0], vec![4])];
@@ -1821,7 +1821,7 @@ mod tests {
         let array = ArrayType::new(DataType::F64, Shape::new(vec![a.simplified_dimension(), b.simplified_dimension()]))
             .with_layout(Layout::Tiled(TiledLayout::new(vec![1, 0], vec![])));
         let relation = ArrayType::new(DataType::F64, Shape::new(vec![p.simplified_dimension(); 2]));
-        let mut builder = ArrayIrXlaProgramBuilder::new();
+        let mut builder = ArrayIrProgramBuilder::new();
         let input = builder.add_input(array.clone().into());
         let input = builder
             .add_instruction(
@@ -1837,7 +1837,7 @@ mod tests {
             .add_instruction(CastOperation::checked(array.clone(), vec![array]).unwrap(), Vec::new(), vec![input], None)
             .unwrap()[0];
         let program = builder
-            .build::<Vec<XlaConstant>, Vec<XlaConstant>>(vec![output], vec![Placeholder], vec![Placeholder])
+            .build::<Vec<Constant>, Vec<Constant>>(vec![output], vec![Placeholder], vec![Placeholder])
             .unwrap();
         let client = execution_client();
         let input = MixedValue::Array(vec![1f64; 16], vec![4, 4]);
@@ -1930,7 +1930,7 @@ mod tests {
         let [a, b, p] = ["a", "b", "p"].map(|name| DimensionType::new(name, bounds));
         let array = ArrayType::new(DataType::F64, Shape::new(vec![a.simplified_dimension(), b.simplified_dimension()]));
         let relation = ArrayType::new(DataType::F64, Shape::new(vec![p.simplified_dimension(); 2]));
-        let mut builder = ArrayIrXlaProgramBuilder::new();
+        let mut builder = ArrayIrProgramBuilder::new();
         let input = builder.add_input(array.clone().into());
         let input = builder
             .add_instruction(
@@ -1944,9 +1944,7 @@ mod tests {
         builder
             .add_instruction(CastOperation::checked(array.clone(), vec![array]).unwrap(), Vec::new(), vec![input], None)
             .unwrap();
-        let program = builder
-            .build::<Vec<XlaConstant>, Vec<XlaConstant>>(Vec::new(), vec![Placeholder], Vec::new())
-            .unwrap();
+        let program = builder.build::<Vec<Constant>, Vec<Constant>>(Vec::new(), vec![Placeholder], Vec::new()).unwrap();
         let client = execution_client();
         let input = MixedValue::Array(vec![1f64; 16], vec![4, 4]);
         assert_eq!(
@@ -1966,7 +1964,7 @@ mod tests {
         let input_type =
             ArrayType::new(DataType::F32, Shape::new(vec![a.simplified_dimension(), b.simplified_dimension()]));
         let output_type = input_type.clone().with_layout(Layout::Tiled(TiledLayout::new(vec![0, 1], vec![])));
-        let mut builder = XlaProgramBuilder::new();
+        let mut builder = ProgramBuilder::new();
         let value = builder.add_input(input_type.clone());
         // Keep an explicitly checked primitive to exercise backend proof, independently of public normalization.
         let output = builder
@@ -1978,7 +1976,7 @@ mod tests {
             )
             .unwrap()[0];
         let program = builder
-            .build::<Vec<XlaArrayConstant>, Vec<XlaArrayConstant>>(vec![output], vec![Placeholder], vec![Placeholder])
+            .build::<Vec<ArrayConstant>, Vec<ArrayConstant>>(vec![output], vec![Placeholder], vec![Placeholder])
             .unwrap();
         let module = to_mlir_module_for_plain_program(&program, "main").unwrap();
         assert_eq!(
@@ -2011,8 +2009,9 @@ mod tests {
         );
 
         let declared = ArrayType::new(DataType::F32, Shape::new(vec![a.simplified_dimension(); 2]));
-        let actual = ArrayType::new(DataType::F32, Shape::new(vec![a.simplified_dimension(), Dimension::Static(3)]));
-        let mut builder = XlaProgramBuilder::new();
+        let actual =
+            ArrayType::new(DataType::F32, Shape::new(vec![a.simplified_dimension(), CoreDimension::Static(3)]));
+        let mut builder = ProgramBuilder::new();
         let value = builder.add_input(actual);
         let output = builder
             .add_instruction(
@@ -2023,7 +2022,7 @@ mod tests {
             )
             .unwrap()[0];
         let program = builder
-            .build::<Vec<XlaArrayConstant>, Vec<XlaArrayConstant>>(vec![output], vec![Placeholder], vec![Placeholder])
+            .build::<Vec<ArrayConstant>, Vec<ArrayConstant>>(vec![output], vec![Placeholder], vec![Placeholder])
             .unwrap();
         let module = to_mlir_module_for_plain_program(&program, "main").unwrap();
         // The stored repeated-identity signature proves itself, but actual [a, 3] still needs a == 3. Source/output
@@ -2069,7 +2068,7 @@ mod tests {
         let fixed = DimensionType::new("fixed", DimensionBounds::new(2, Some(3)).unwrap());
         let source =
             ArrayType::new(DataType::F32, Shape::new(vec![fixed.dimension().clone(), b.simplified_dimension()]));
-        let mut builder = XlaProgramBuilder::new();
+        let mut builder = ProgramBuilder::new();
         let input = builder.add_input(source.clone());
         let output = builder
             .add_instruction(
@@ -2080,7 +2079,7 @@ mod tests {
             )
             .unwrap()[0];
         let program = builder
-            .build::<Vec<XlaArrayConstant>, Vec<XlaArrayConstant>>(vec![output], vec![Placeholder], vec![Placeholder])
+            .build::<Vec<ArrayConstant>, Vec<ArrayConstant>>(vec![output], vec![Placeholder], vec![Placeholder])
             .unwrap();
         let module = to_mlir_module_for_plain_program(&program, "main").unwrap();
         assert_eq!(
@@ -2118,13 +2117,13 @@ mod tests {
             ArrayType::new(DataType::F32, Shape::new(vec![a.simplified_dimension(), b.simplified_dimension()]));
         let target =
             ArrayType::new(DataType::F32, Shape::new(vec![b.simplified_dimension(), a.simplified_dimension()]));
-        let mut builder = XlaProgramBuilder::new();
+        let mut builder = ProgramBuilder::new();
         let input = builder.add_input(source.clone());
         let output = builder
             .add_instruction(CastOperation::checked(target, vec![source]).unwrap(), vec![], vec![input], None)
             .unwrap()[0];
         let program = builder
-            .build::<Vec<XlaArrayConstant>, Vec<XlaArrayConstant>>(vec![output], vec![Placeholder], vec![Placeholder])
+            .build::<Vec<ArrayConstant>, Vec<ArrayConstant>>(vec![output], vec![Placeholder], vec![Placeholder])
             .unwrap();
         let module = to_mlir_module_for_plain_program(&program, "main").unwrap();
         // Swapping axes states a == b twice, but requires just one runtime comparison.
@@ -2165,8 +2164,8 @@ mod tests {
         let input_type =
             ArrayType::new(DataType::F32, Shape::new(vec![a.simplified_dimension(), b.simplified_dimension()]));
         let output_type =
-            ArrayType::new(DataType::F32, Shape::new(vec![a.simplified_dimension(), Dimension::Static(2)]));
-        let mut builder = XlaProgramBuilder::new();
+            ArrayType::new(DataType::F32, Shape::new(vec![a.simplified_dimension(), CoreDimension::Static(2)]));
+        let mut builder = ProgramBuilder::new();
         let value = builder.add_input(input_type.clone());
         let witness = builder.add_input(input_type.clone());
         let output = builder
@@ -2178,11 +2177,7 @@ mod tests {
             )
             .unwrap()[0];
         let program = builder
-            .build::<Vec<XlaArrayConstant>, Vec<XlaArrayConstant>>(
-                vec![output],
-                vec![Placeholder; 2],
-                vec![Placeholder],
-            )
+            .build::<Vec<ArrayConstant>, Vec<ArrayConstant>>(vec![output], vec![Placeholder; 2], vec![Placeholder])
             .unwrap();
         assert_eq!(
             program.to_string(),
@@ -2240,7 +2235,7 @@ mod tests {
         let n = DimensionType::new("n", DimensionBounds::positive(Some(5)).unwrap());
         let input_type = ArrayType::new(DataType::F64, Shape::new(vec![n.simplified_dimension(); 2]));
         let output_type = ArrayType::new_static(DataType::F64, [2, 2]);
-        let mut builder = XlaProgramBuilder::new();
+        let mut builder = ProgramBuilder::new();
         let input = builder.add_input(input_type.clone());
         let output = builder
             .add_instruction(
@@ -2251,7 +2246,7 @@ mod tests {
             )
             .unwrap()[0];
         let program = builder
-            .build::<Vec<XlaArrayConstant>, Vec<XlaArrayConstant>>(vec![output], vec![Placeholder], vec![Placeholder])
+            .build::<Vec<ArrayConstant>, Vec<ArrayConstant>>(vec![output], vec![Placeholder], vec![Placeholder])
             .unwrap();
         assert_eq!(
             program.to_string(),
@@ -2291,7 +2286,7 @@ mod tests {
                 }
             "},
         );
-        let program = program.into_unprojected::<XlaConstant, XlaOperation>().unwrap();
+        let program = program.into_unprojected::<Constant, Operation>().unwrap();
         let input = MixedValue::Array(vec![1f64; 16], vec![4, 4]);
         let client = execution_client();
         assert_eq!(
@@ -2314,7 +2309,7 @@ mod tests {
         let input_type =
             ArrayType::new(DataType::F64, Shape::new(vec![a.simplified_dimension(), b.simplified_dimension()]));
         let output_type =
-            ArrayType::new(DataType::F64, Shape::new(vec![a.simplified_dimension(), Dimension::Static(2)]));
+            ArrayType::new(DataType::F64, Shape::new(vec![a.simplified_dimension(), CoreDimension::Static(2)]));
         let client = execution_client();
         // An array axis and a first-class dimension can share an actual identity, so a witness of the identity `b`
         // needs no comparison beyond the declared extent of `b`. Equal non-singleton bounds on an independent identity
@@ -2419,7 +2414,7 @@ mod tests {
             ),
         ];
         for (witness_type, expected_module) in cases {
-            let mut builder = ArrayIrXlaProgramBuilder::new();
+            let mut builder = ArrayIrProgramBuilder::new();
             let witness = builder.add_input(witness_type.clone().into());
             let value = builder.add_input(input_type.clone().into());
             let output = builder
@@ -2435,7 +2430,7 @@ mod tests {
                 )
                 .unwrap()[0];
             let program = builder
-                .build::<Vec<XlaConstant>, Vec<XlaConstant>>(vec![output], vec![Placeholder; 2], vec![Placeholder])
+                .build::<Vec<Constant>, Vec<Constant>>(vec![output], vec![Placeholder; 2], vec![Placeholder])
                 .unwrap();
             let expected = formatdoc! {"
             lambda %0:{witness_type}, %1:f64[a, b] .
@@ -2479,7 +2474,7 @@ mod tests {
         let array = ArrayType::new(DataType::F64, Shape::new(vec![a.simplified_dimension(), b.simplified_dimension()]));
         let swapped =
             ArrayType::new(DataType::F64, Shape::new(vec![b.simplified_dimension(), a.simplified_dimension()]));
-        let mut builder = ArrayIrXlaProgramBuilder::new();
+        let mut builder = ArrayIrProgramBuilder::new();
         let input = builder.add_input(array.clone().into());
         let output = builder
             .add_instruction(
@@ -2490,7 +2485,7 @@ mod tests {
             )
             .unwrap()[0];
         let program = builder
-            .build::<Vec<XlaConstant>, Vec<XlaConstant>>(vec![output], vec![Placeholder], vec![Placeholder])
+            .build::<Vec<Constant>, Vec<Constant>>(vec![output], vec![Placeholder], vec![Placeholder])
             .unwrap();
         let client = execution_client();
         let input = MixedValue::Array(vec![1f64; 16], vec![4, 4]);
@@ -2531,7 +2526,7 @@ mod tests {
         assert!(error.contains("must have one extent in `cast`"), "{error}");
 
         // Keeping the original source and output types accepts rectangular shapes.
-        let mut builder = ArrayIrXlaProgramBuilder::new();
+        let mut builder = ArrayIrProgramBuilder::new();
         let value = builder.add_input(array.clone().into());
         let output = builder
             .add_instruction(
@@ -2542,7 +2537,7 @@ mod tests {
             )
             .unwrap()[0];
         let program = builder
-            .build::<Vec<XlaConstant>, Vec<XlaConstant>>(vec![output], vec![Placeholder], vec![Placeholder])
+            .build::<Vec<Constant>, Vec<Constant>>(vec![output], vec![Placeholder], vec![Placeholder])
             .unwrap();
         assert_eq!(
             execute_mixed_program(&client, &program, &[input], &[2, 3]).unwrap(),
@@ -2560,11 +2555,11 @@ mod tests {
         let bounds = DimensionBounds::positive(Some(5)).unwrap();
         let [a, b] = ["a", "b"].map(|name| DimensionType::new(name, bounds));
         let input_type =
-            ArrayType::new(DataType::F64, Shape::new(vec![b.simplified_dimension(), Dimension::Static(3)]));
+            ArrayType::new(DataType::F64, Shape::new(vec![b.simplified_dimension(), CoreDimension::Static(3)]));
         let output_type =
-            ArrayType::new(DataType::F64, Shape::new(vec![Dimension::Static(3), a.simplified_dimension()]));
+            ArrayType::new(DataType::F64, Shape::new(vec![CoreDimension::Static(3), a.simplified_dimension()]));
         let witness_type = ArrayType::new(DataType::F64, Shape::new(vec![a.simplified_dimension()]));
-        let mut builder = ArrayIrXlaProgramBuilder::new();
+        let mut builder = ArrayIrProgramBuilder::new();
         let input = builder.add_input(input_type.clone().into());
         let witness = builder.add_input(witness_type.clone().into());
         let output = builder
@@ -2577,7 +2572,7 @@ mod tests {
             )
             .unwrap()[0];
         let program = builder
-            .build::<Vec<XlaConstant>, Vec<XlaConstant>>(vec![output], vec![Placeholder; 2], vec![Placeholder])
+            .build::<Vec<Constant>, Vec<Constant>>(vec![output], vec![Placeholder; 2], vec![Placeholder])
             .unwrap();
         let client = execution_client();
         let inputs = [MixedValue::Array(vec![1f64; 12], vec![4, 3]), MixedValue::Array(vec![1f64; 4], vec![4])];
@@ -2620,10 +2615,10 @@ mod tests {
         let bounds = DimensionBounds::positive(Some(5)).unwrap();
         let b = DimensionType::new("b", bounds);
         let input_type =
-            ArrayType::new(DataType::F64, Shape::new(vec![b.simplified_dimension(), Dimension::Static(3)]));
+            ArrayType::new(DataType::F64, Shape::new(vec![b.simplified_dimension(), CoreDimension::Static(3)]));
         let output_type = ArrayType::new_static(DataType::F64, [3, 3]);
         let witness_type = ArrayType::new(DataType::F64, Shape::new(vec![b.simplified_dimension()]));
-        let mut builder = ArrayIrXlaProgramBuilder::new();
+        let mut builder = ArrayIrProgramBuilder::new();
         let input = builder.add_input(input_type.clone().into());
         let witness = builder.add_input(ArrayType::new_static(DataType::F64, [3]).into());
         let output = builder
@@ -2639,7 +2634,7 @@ mod tests {
             )
             .unwrap()[0];
         let program = builder
-            .build::<Vec<XlaConstant>, Vec<XlaConstant>>(vec![output], vec![Placeholder; 2], vec![Placeholder])
+            .build::<Vec<Constant>, Vec<Constant>>(vec![output], vec![Placeholder; 2], vec![Placeholder])
             .unwrap();
         let module = to_mlir_module_for_program(
             &program,
@@ -2697,7 +2692,7 @@ mod tests {
         let input_type = ArrayType::new(DataType::F64, Shape::new(vec![dynamic_dimension("n", Some(5)), 3.into()]));
         let output_type = input_type.clone().with_layout(Layout::Tiled(TiledLayout::new(vec![0, 1], vec![])));
         for constructor in [CastOperation::checked, CastOperation::unchecked] {
-            let mut builder = XlaProgramBuilder::new();
+            let mut builder = ProgramBuilder::new();
             let input = builder.add_input(input_type.clone());
             let output = builder
                 .add_instruction(
@@ -2708,11 +2703,7 @@ mod tests {
                 )
                 .unwrap()[0];
             let program = builder
-                .build::<Vec<XlaArrayConstant>, Vec<XlaArrayConstant>>(
-                    vec![output],
-                    vec![Placeholder],
-                    vec![Placeholder],
-                )
+                .build::<Vec<ArrayConstant>, Vec<ArrayConstant>>(vec![output], vec![Placeholder], vec![Placeholder])
                 .unwrap();
             assert_eq!(
                 to_mlir_module_for_plain_program(&program, "main").unwrap(),
@@ -2735,7 +2726,7 @@ mod tests {
                     }
                 "},
             );
-            let program = program.into_unprojected::<XlaConstant, XlaOperation>().unwrap();
+            let program = program.into_unprojected::<Constant, Operation>().unwrap();
             assert!(matches!(
                 crate::to_mlir_module_for_program(
                     &program,
@@ -2764,9 +2755,10 @@ mod tests {
         // A second cast drops the layout again so that the executable boundary stays row-major.
         let n = DimensionType::new("n", DimensionBounds::positive(Some(5)).unwrap());
         let exact = ArrayType::new_static(DataType::F64, [2, 3]);
-        let symbolic = ArrayType::new(DataType::F64, Shape::new(vec![n.simplified_dimension(), Dimension::Static(3)]));
+        let symbolic =
+            ArrayType::new(DataType::F64, Shape::new(vec![n.simplified_dimension(), CoreDimension::Static(3)]));
         let laid_out = symbolic.clone().with_layout(Layout::Tiled(TiledLayout::new(vec![0, 1], vec![])));
-        let mut builder = ArrayIrXlaProgramBuilder::new();
+        let mut builder = ArrayIrProgramBuilder::new();
         let input = builder.add_input(exact.clone().into());
         let witness = builder.add_input(symbolic.clone().into());
         let widened = builder
@@ -2790,7 +2782,7 @@ mod tests {
             )
             .unwrap()[0];
         let program = builder
-            .build::<Vec<XlaConstant>, Vec<XlaConstant>>(vec![output], vec![Placeholder; 2], vec![Placeholder])
+            .build::<Vec<Constant>, Vec<Constant>>(vec![output], vec![Placeholder; 2], vec![Placeholder])
             .unwrap();
         let module =
             to_mlir_module_for_program(&program, &[], &[exact, symbolic.clone()], &[symbolic], "main", None, None)
@@ -2910,11 +2902,12 @@ mod tests {
             .unwrap();
         let n = DimensionType::new("n", DimensionBounds::positive(Some(5)).unwrap());
         let layout = Layout::Tiled(TiledLayout::new(vec![0, 1], vec![]));
-        let source = ArrayType::new(DataType::F64, Shape::new(vec![n.simplified_dimension(), Dimension::Static(3)]));
+        let source =
+            ArrayType::new(DataType::F64, Shape::new(vec![n.simplified_dimension(), CoreDimension::Static(3)]));
         let laid_out = source.clone().with_layout(layout.clone());
         let narrowed = ArrayType::new_static(DataType::F64, [2, 3]).with_layout(layout.clone());
         let copied = ArrayType::new_static(DataType::F64, [6]);
-        let mut builder = ArrayIrXlaProgramBuilder::new();
+        let mut builder = ArrayIrProgramBuilder::new();
         let input = builder.add_input(source.clone().into());
         let value = builder
             .add_instruction(
@@ -2941,7 +2934,7 @@ mod tests {
             )
             .unwrap()[0];
         let program = builder
-            .build::<Vec<XlaConstant>, Vec<XlaConstant>>(vec![output], vec![Placeholder], vec![Placeholder])
+            .build::<Vec<Constant>, Vec<Constant>>(vec![output], vec![Placeholder], vec![Placeholder])
             .unwrap();
         let module = to_mlir_module_for_program(&program, &[], &[source], &[copied], "main", None, None).unwrap();
         assert_eq!(
@@ -2997,7 +2990,7 @@ mod tests {
             let output_type = input_type.clone().with_layout(layout.clone());
             let expected = format!("{kind} output layout `{layout}`");
             for constructor in [CastOperation::checked, CastOperation::unchecked] {
-                let mut builder = XlaProgramBuilder::new();
+                let mut builder = ProgramBuilder::new();
                 let input = builder.add_input(input_type.clone());
                 let output = builder
                     .add_instruction(
@@ -3008,17 +3001,13 @@ mod tests {
                     )
                     .unwrap()[0];
                 let program = builder
-                    .build::<Vec<XlaArrayConstant>, Vec<XlaArrayConstant>>(
-                        vec![output],
-                        vec![Placeholder],
-                        vec![Placeholder],
-                    )
+                    .build::<Vec<ArrayConstant>, Vec<ArrayConstant>>(vec![output], vec![Placeholder], vec![Placeholder])
                     .unwrap();
                 assert!(matches!(
                     to_mlir_module_for_plain_program(&program, "main"),
                     Err(Error::Lowering(LoweringError::UnsupportedOperation { reason: op, .. })) if op == expected,
                 ));
-                let program = program.into_unprojected::<XlaConstant, XlaOperation>().unwrap();
+                let program = program.into_unprojected::<Constant, Operation>().unwrap();
                 assert!(matches!(
                     to_mlir_module_for_program(
                         &program,
@@ -3059,7 +3048,7 @@ mod tests {
 
         // Different specified representations are admitted before lowering materializes the requested output.
         for (input_type, output_type) in [(contiguous, strided), (sharded, replicated)] {
-            let mut builder = ArrayIrXlaProgramBuilder::new();
+            let mut builder = ArrayIrProgramBuilder::new();
             let input = builder.add_input(input_type.clone().into());
             let output = builder
                 .add_instruction(
@@ -3080,7 +3069,7 @@ mod tests {
             .clone()
             .with_sharding(Sharding::new(mesh, vec![ShardingDimension::replicated()]).unwrap())
             .unwrap();
-        let mut builder = ArrayIrXlaProgramBuilder::new();
+        let mut builder = ArrayIrProgramBuilder::new();
         let input = builder.add_input(input_type.clone().into());
         let output = builder
             .add_instruction(
@@ -3091,7 +3080,7 @@ mod tests {
             )
             .unwrap()[0];
         let program = builder
-            .build::<Vec<XlaConstant>, Vec<XlaConstant>>(vec![output], vec![Placeholder], vec![Placeholder])
+            .build::<Vec<Constant>, Vec<Constant>>(vec![output], vec![Placeholder], vec![Placeholder])
             .unwrap();
         let client = execution_client();
         assert_eq!(
@@ -3126,7 +3115,7 @@ mod tests {
             }
         "};
         for constructor in [CastOperation::checked, CastOperation::unchecked] {
-            let mut builder = XlaProgramBuilder::new();
+            let mut builder = ProgramBuilder::new();
             let input = builder.add_input(input_type.clone());
             let output = builder
                 .add_instruction(
@@ -3137,14 +3126,10 @@ mod tests {
                 )
                 .unwrap()[0];
             let program = builder
-                .build::<Vec<XlaArrayConstant>, Vec<XlaArrayConstant>>(
-                    vec![output],
-                    vec![Placeholder],
-                    vec![Placeholder],
-                )
+                .build::<Vec<ArrayConstant>, Vec<ArrayConstant>>(vec![output], vec![Placeholder], vec![Placeholder])
                 .unwrap();
             assert_eq!(to_mlir_module_for_plain_program(&program, "main").unwrap(), expected);
-            let program = program.into_unprojected::<XlaConstant, XlaOperation>().unwrap();
+            let program = program.into_unprojected::<Constant, Operation>().unwrap();
             assert_eq!(
                 to_mlir_module_for_program(
                     &program,
@@ -3247,7 +3232,7 @@ mod tests {
                 output_type.sharding() != input_type.sharding(),
             );
             for constructor in [CastOperation::checked, CastOperation::unchecked] {
-                let mut builder = XlaProgramBuilder::new();
+                let mut builder = ProgramBuilder::new();
                 let input = builder.add_input(input_type.clone());
                 let output = builder
                     .add_instruction(
@@ -3258,16 +3243,12 @@ mod tests {
                     )
                     .unwrap()[0];
                 let program = builder
-                    .build::<Vec<XlaArrayConstant>, Vec<XlaArrayConstant>>(
-                        vec![output],
-                        vec![Placeholder],
-                        vec![Placeholder],
-                    )
+                    .build::<Vec<ArrayConstant>, Vec<ArrayConstant>>(vec![output], vec![Placeholder], vec![Placeholder])
                     .unwrap();
                 assert_eq!(to_mlir_module_for_plain_program(&program, "main").unwrap(), expected);
                 // The executable entry point declares meshes only for casts that emit a constraint; the input's
                 // own placement is declared through the executable signature instead.
-                let program = program.into_unprojected::<XlaConstant, XlaOperation>().unwrap();
+                let program = program.into_unprojected::<Constant, Operation>().unwrap();
                 assert_eq!(
                     to_mlir_module_for_program(
                         &program,
@@ -3285,7 +3266,7 @@ mod tests {
         }
 
         // An explicit axis major to `a` changes which block of the array each auto shard holds.
-        let mut builder = XlaProgramBuilder::new();
+        let mut builder = ProgramBuilder::new();
         let input = builder.add_input(input_type.clone());
         assert!(matches!(
             builder.add_instruction(
@@ -3322,7 +3303,7 @@ mod tests {
         let input_type = ArrayType::new_static(DataType::F64, [4, 4]).with_sharding(sharding.clone()).unwrap();
         let layout = Layout::Tiled(TiledLayout::new(vec![0, 1], vec![]));
         let output_type = input_type.clone().with_layout(layout.clone());
-        let mut builder = XlaProgramBuilder::new();
+        let mut builder = ProgramBuilder::new();
         let input = builder.add_input(input_type.clone());
         let output = builder
             .add_instruction(
@@ -3333,9 +3314,9 @@ mod tests {
             )
             .unwrap()[0];
         let program = builder
-            .build::<Vec<XlaArrayConstant>, Vec<XlaArrayConstant>>(vec![output], vec![Placeholder], vec![Placeholder])
+            .build::<Vec<ArrayConstant>, Vec<ArrayConstant>>(vec![output], vec![Placeholder], vec![Placeholder])
             .unwrap()
-            .into_unprojected::<XlaConstant, XlaOperation>()
+            .into_unprojected::<Constant, Operation>()
             .unwrap();
         let module = to_mlir_module_for_program(
             &program,
@@ -3386,7 +3367,7 @@ mod tests {
         let replicated = Sharding::replicated(mesh, 2);
         let input_type = ArrayType::new_static(DataType::F64, [4, 2]).with_sharding(sharded.clone()).unwrap();
         let output_type = ArrayType::new_static(DataType::F64, [4, 2]).with_sharding(replicated.clone()).unwrap();
-        let mut builder = XlaProgramBuilder::new();
+        let mut builder = ProgramBuilder::new();
         let input = builder.add_input(input_type.clone());
         let output = builder
             .add_instruction(
@@ -3397,9 +3378,9 @@ mod tests {
             )
             .unwrap()[0];
         let program = builder
-            .build::<Vec<XlaArrayConstant>, Vec<XlaArrayConstant>>(vec![output], vec![Placeholder], vec![Placeholder])
+            .build::<Vec<ArrayConstant>, Vec<ArrayConstant>>(vec![output], vec![Placeholder], vec![Placeholder])
             .unwrap()
-            .into_unprojected::<XlaConstant, XlaOperation>()
+            .into_unprojected::<Constant, Operation>()
             .unwrap();
         let module = to_mlir_module_for_program(
             &program,
@@ -3500,7 +3481,7 @@ mod tests {
             let sharded = Sharding::new(mesh, vec![ShardingDimension::sharded(["x"])]).unwrap();
             let input_type = symbolic.clone().with_sharding(replicated.clone()).unwrap();
             let output_type = symbolic.clone().with_sharding(sharded.clone()).unwrap();
-            let mut builder = ArrayIrXlaProgramBuilder::new();
+            let mut builder = ArrayIrProgramBuilder::new();
             let input = builder.add_input(input_type.clone().into());
             let output = builder
                 .add_instruction(
@@ -3515,7 +3496,7 @@ mod tests {
                 )
                 .unwrap()[0];
             let program = builder
-                .build::<Vec<XlaConstant>, Vec<XlaConstant>>(vec![output], vec![Placeholder], vec![Placeholder])
+                .build::<Vec<Constant>, Vec<Constant>>(vec![output], vec![Placeholder], vec![Placeholder])
                 .unwrap();
             (program, input_type, output_type, replicated, sharded)
         };
@@ -3702,7 +3683,7 @@ mod tests {
         let target = ArrayType::new(DataType::F64, Shape::new(vec![m.simplified_dimension()]));
         let client = execution_client();
         for constructor in [CastOperation::<ArrayIrType>::checked, CastOperation::<ArrayIrType>::unchecked] {
-            let mut builder = ArrayIrXlaProgramBuilder::new();
+            let mut builder = ArrayIrProgramBuilder::new();
             let input = builder.add_input(source.clone().into());
             let witness = builder.add_input(target.clone().into());
             let output = builder
@@ -3714,7 +3695,7 @@ mod tests {
                 )
                 .unwrap()[0];
             let program = builder
-                .build::<Vec<XlaConstant>, Vec<XlaConstant>>(vec![output], vec![Placeholder; 2], vec![Placeholder])
+                .build::<Vec<Constant>, Vec<Constant>>(vec![output], vec![Placeholder; 2], vec![Placeholder])
                 .unwrap();
             assert_eq!(
                 execute_mixed_program(
@@ -3764,7 +3745,7 @@ mod tests {
         let target = ArrayType::new(DataType::F64, Shape::new(vec![m.simplified_dimension()]));
         let client = execution_client();
         for constructor in [CastOperation::<ArrayIrType>::checked, CastOperation::<ArrayIrType>::unchecked] {
-            let mut builder = ArrayIrXlaProgramBuilder::new();
+            let mut builder = ArrayIrProgramBuilder::new();
             let input = builder.add_input(source.clone().into());
             let witness = builder.add_input(target.clone().into());
             let output = builder
@@ -3776,7 +3757,7 @@ mod tests {
                 )
                 .unwrap()[0];
             let program = builder
-                .build::<Vec<XlaConstant>, Vec<XlaConstant>>(vec![output], vec![Placeholder; 2], vec![Placeholder])
+                .build::<Vec<Constant>, Vec<Constant>>(vec![output], vec![Placeholder; 2], vec![Placeholder])
                 .unwrap();
             let checked = program.instructions()[0]
                 .operation()
@@ -3863,7 +3844,7 @@ mod tests {
         let unbounded = ArrayType::new(DataType::F32, Shape::new(vec![n.simplified_dimension()]));
         let mixed = ArrayType::new(DataType::F32, Shape::new(vec![n.simplified_dimension(), m.simplified_dimension()]));
         let partially_exact =
-            ArrayType::new(DataType::F32, Shape::new(vec![n.simplified_dimension(), Dimension::Static(2)]));
+            ArrayType::new(DataType::F32, Shape::new(vec![n.simplified_dimension(), CoreDimension::Static(2)]));
         let cases = [
             (
                 unbounded.clone(),
@@ -3888,8 +3869,7 @@ mod tests {
             let location = context.unknown_location();
             let block = context.block(&[(lower_tensor_type(&input_type, &context, location).unwrap(), location)]);
             let source = block.argument(0).unwrap().as_ref();
-            let mut lowerer: XlaLowerer<'_, '_, '_, XlaOperation> =
-                XlaLowerer::new(block.as_ref(), &context, location.as_ref());
+            let mut lowerer: Lowerer<'_, '_, '_, Operation> = Lowerer::new(block.as_ref(), &context, location.as_ref());
             let result = CastOperation::unchecked(output_type.clone(), vec![input_type.clone()]).unwrap().lower(
                 &mut lowerer,
                 &[source],

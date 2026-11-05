@@ -7,7 +7,7 @@ use sha2::{Digest, Sha256};
 
 use crate::kernels::cuda::{CUDA_KERNEL_CUSTOM_CALL_TARGET, CudaKernelEmbedding, CudaKernelParameterBinding};
 use crate::kernels::rocm::RocmKernelEmbedding;
-use crate::kernels::staging::{XlaKernelExecutionFacts, XlaKernelTarget};
+use crate::kernels::staging::{KernelExecutionFacts, KernelTarget};
 use crate::kernels::{KernelEmbeddingError, KernelOutputEmbedding, ROCM_KERNEL_CUSTOM_CALL_TARGET};
 
 /// Validates direct Triton output against the logical boundary and delegates concrete artifact execution.
@@ -58,8 +58,8 @@ impl KernelOutputEmbedding<CompiledKernel> for TritonEmbedding {
     }
 }
 
-impl XlaKernelTarget for Target {
-    fn admit_execution(&self, facts: &XlaKernelExecutionFacts) -> Result<(), KernelEmbeddingError> {
+impl KernelTarget for Target {
+    fn admit_execution(&self, facts: &KernelExecutionFacts) -> Result<(), KernelEmbeddingError> {
         let capability = match self {
             Target::Cuda { major, minor } => {
                 if !matches!((*major, *minor), (8, 0) | (12, 1))
@@ -112,7 +112,7 @@ mod tests {
 
     use pretty_assertions::assert_eq;
 
-    use crate::kernels::staging::XlaKernelDeviceFacts;
+    use crate::kernels::staging::KernelDeviceFacts;
 
     use super::*;
 
@@ -179,13 +179,13 @@ mod tests {
 
     #[test]
     fn test_target_admit_execution() {
-        let mut facts = XlaKernelExecutionFacts {
+        let mut facts = KernelExecutionFacts {
             platform_name: "CUDA".into(),
             platform_version: "cuda 13020".into(),
             pjrt_version: ryft_pjrt::VERSION,
             has_ffi_extension: true,
             attributes: BTreeMap::new(),
-            devices: vec![XlaKernelDeviceFacts {
+            devices: vec![KernelDeviceFacts {
                 kind: "GB10".into(),
                 attributes: BTreeMap::from([("compute_capability".into(), ryft_pjrt::Value::String("12.1".into()))]),
             }],
@@ -202,13 +202,13 @@ mod tests {
 
     #[test]
     fn test_target_admit_execution_rocm() {
-        let mut facts = XlaKernelExecutionFacts {
+        let mut facts = KernelExecutionFacts {
             platform_name: "ROCM".into(),
             platform_version: "rocm 71300000".into(),
             pjrt_version: ryft_pjrt::VERSION,
             has_ffi_extension: true,
             attributes: BTreeMap::new(),
-            devices: vec![XlaKernelDeviceFacts {
+            devices: vec![KernelDeviceFacts {
                 kind: "AMD Instinct MI300X".into(),
                 attributes: BTreeMap::from([("compute_capability".into(), ryft_pjrt::Value::String("gfx942".into()))]),
             }],

@@ -9,11 +9,11 @@ use ryft_core::{
     ArrayType, AxisIndex, BatchAxis, Broadcast, ConvertElementType, Differentiate, LogicalMesh, MeshAxis, MeshAxisType,
     ParallelAllGather, ParallelAllGatherOutputVariance, ParallelAllToAll, ParallelPermute, ParallelReduce,
     ParallelSumScatter, ParallelVary, ProgramError, ReductionKind, ShardMapOptions, Sharding, ShardingDimension, Typed,
-    Value, ValueProjection, batch, shard_map,
+    Value as CoreValue, ValueProjection, batch, shard_map,
 };
 use ryft_pjrt::{ClientOptions, CpuClientOptions, load_cpu_plugin};
 use ryft_xla::FromPjrt;
-use ryft_xla::experimental::{TracedXlaProgram, XlaArrayTracer, trace};
+use ryft_xla::experimental::{ArrayTracer, TracedProgram, trace};
 
 use super::{DifferentialObservation, SCHEMA, execute_collective_inputs};
 
@@ -179,7 +179,7 @@ impl CollectiveCase {
     }
 
     /// Stages an actual transform within the mesh binder so named collectives survive to XLA execution.
-    fn transformed(&self, input: XlaArrayTracer, seed: XlaArrayTracer) -> Result<Vec<XlaArrayTracer>, ProgramError> {
+    fn transformed(&self, input: ArrayTracer, seed: ArrayTracer) -> Result<Vec<ArrayTracer>, ProgramError> {
         match self.transform.as_str() {
             "primal" if self.operation == "axis_index" => {
                 let index = input.domain().axis_index(&self.axis_name)?;
@@ -314,10 +314,10 @@ impl CollectiveCase {
         let mut seed_global_shape = seed_shape.clone();
         seed_global_shape[0] *= self.participants;
         let stablehlo = if output_count == 1 {
-            let traced: TracedXlaProgram<ArrayType, Vec<ArrayType>> = trace(
-                |input: XlaArrayTracer| {
+            let traced: TracedProgram<ArrayType, Vec<ArrayType>> = trace(
+                |input: ArrayTracer| {
                     shard_map(
-                        |input: XlaArrayTracer| self.transformed(input.clone(), input),
+                        |input: ArrayTracer| self.transformed(input.clone(), input),
                         input,
                         mesh.clone(),
                         input_sharding.clone(),
@@ -330,10 +330,10 @@ impl CollectiveCase {
             )?;
             traced.to_mlir_module("main")?
         } else {
-            let traced: TracedXlaProgram<(ArrayType, ArrayType), Vec<ArrayType>> = trace(
-                |inputs: (XlaArrayTracer, XlaArrayTracer)| {
+            let traced: TracedProgram<(ArrayType, ArrayType), Vec<ArrayType>> = trace(
+                |inputs: (ArrayTracer, ArrayTracer)| {
                     shard_map(
-                        |(input, seed): (XlaArrayTracer, XlaArrayTracer)| self.transformed(input, seed),
+                        |(input, seed): (ArrayTracer, ArrayTracer)| self.transformed(input, seed),
                         inputs,
                         mesh.clone(),
                         (input_sharding.clone(), seed_sharding.clone()),

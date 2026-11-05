@@ -32,7 +32,8 @@ use std::sync::{Arc, Mutex, TryLockError};
 use std::time::{Duration, Instant};
 
 use ryft_core::{
-    ArrayAddressing, Device, DeviceMesh, ReferenceCompletion, ReferenceCompletionBackend, StatefulExecution, Typed,
+    ArrayAddressing, Device, DeviceMesh, ReferenceCompletion as CoreReferenceCompletion, ReferenceCompletionBackend,
+    StatefulExecution, Typed,
 };
 use ryft_pjrt::{Client, Execution, ExecutionFence, KeyValueStore};
 use serde::{Deserialize, Serialize};
@@ -40,7 +41,7 @@ use sha2::{Digest, Sha256};
 
 use crate::kernels::KernelEmbeddingError;
 use crate::kernels::aot::{KernelAotError, LoadedKernel};
-use crate::{DistributedRuntime, Error, FromPjrt, XlaArray};
+use crate::{Array, DistributedRuntime, Error, FromPjrt};
 
 // TODO(eaplatanios): Promote distributed kernel errors to dedicated `ryft_xla::Error` variants after
 // this support leaves experimental status.
@@ -274,7 +275,7 @@ pub struct DistributedKernel<'r, 'c> {
     /// Canonical logical byte counts for each argument.
     sizes: Vec<usize>,
     /// Previous pending call; later setup cannot overtake its completion.
-    previous: Option<ReferenceCompletion>,
+    previous: Option<CoreReferenceCompletion>,
 }
 
 /// Metadata and existing runtime ownership shared with pending completion; no worker or registry is created.
@@ -314,8 +315,7 @@ impl<'r, 'c> DistributedKernel<'r, 'c> {
         if identity.len() > 64 * 1024 || execution.len() > 64 * 1024 {
             return Err(DistributedKernelError::invalid("kernel identity exceeds the coordination metadata budget"));
         }
-        let actual =
-            crate::kernels::XlaKernelExecutionFacts::from_target(domain.target()?, mesh)?.configuration_key()?;
+        let actual = crate::kernels::KernelExecutionFacts::from_target(domain.target()?, mesh)?.configuration_key()?;
         if actual != execution {
             return Err(DistributedKernelError::invalid("loaded kernel live execution identity changed"));
         }
@@ -375,10 +375,10 @@ impl<'r, 'c> DistributedKernel<'r, 'c> {
     /// and reports abandonment; dropping only the returned handle does not cancel work retained by the coordinator.
     pub fn call_async(
         &mut self,
-        inputs: Vec<XlaArray<'c>>,
+        inputs: Vec<Array<'c>>,
         sources: &[usize],
         cancelled: Arc<AtomicBool>,
-    ) -> Result<StatefulExecution<Vec<XlaArray<'c>>, DistributedKernelError>, DistributedKernelError> {
+    ) -> Result<StatefulExecution<Vec<Array<'c>>, DistributedKernelError>, DistributedKernelError> {
         if let Some(previous) = self.previous.take() {
             previous.r#await().map_err(|message| DistributedKernelError::Completion { message })?;
         }
@@ -398,7 +398,7 @@ impl<'r, 'c> DistributedKernel<'r, 'c> {
             Err(error) => return Err(self.coordination.report_failure(round, error)),
         };
         let outputs = execution.output().clone();
-        let completion = ReferenceCompletion::new(KernelCompletion {
+        let completion = CoreReferenceCompletion::new(KernelCompletion {
             coordination: Arc::clone(&self.coordination),
             round,
             deadline,
@@ -415,10 +415,10 @@ impl<'r, 'c> DistributedKernel<'r, 'c> {
     /// Waits for the existing pending call surface and returns only globally ready functional outputs.
     pub fn call(
         &mut self,
-        inputs: Vec<XlaArray<'c>>,
+        inputs: Vec<Array<'c>>,
         sources: &[usize],
         cancelled: Arc<AtomicBool>,
-    ) -> Result<Vec<XlaArray<'c>>, DistributedKernelError> {
+    ) -> Result<Vec<Array<'c>>, DistributedKernelError> {
         self.call_async(inputs, sources, cancelled)?.r#await()
     }
 
@@ -426,11 +426,11 @@ impl<'r, 'c> DistributedKernel<'r, 'c> {
     fn run(
         &self,
         round: u64,
-        inputs: Vec<XlaArray<'c>>,
+        inputs: Vec<Array<'c>>,
         sources: &[usize],
         cancelled: &AtomicBool,
         deadline: Instant,
-    ) -> Result<Execution<Vec<XlaArray<'c>>>, DistributedKernelError> {
+    ) -> Result<Execution<Vec<Array<'c>>>, DistributedKernelError> {
         self.coordination.check(cancelled, deadline)?;
         let (domain, types, mesh, identity, execution) = self.kernel.distributed_parts();
         if inputs.len() != types.len()
@@ -547,7 +547,7 @@ impl<'r, 'c> DistributedKernel<'r, 'c> {
             if Sha256::digest(&bytes).as_slice() != manifest.checksum {
                 return Err(DistributedKernelError::invalid("received input checksum mismatch"));
             }
-            let value = XlaArray::from_host_buffer(domain, r#type.clone(), mesh.clone(), bytes)?;
+            let value = Array::from_host_buffer(domain, r#type.clone(), mesh.clone(), bytes)?;
             value.block_until_ready()?;
             arguments.push(value);
         }
@@ -741,7 +741,7 @@ mod tests {
     use super::*;
 
     /// Produces a real CPU-loaded scalar identity through the existing AOT persistence fixture.
-    fn loaded<'c>(domain: &crate::XlaDomain<'c>, mesh: &DeviceMesh, compiler_options: u32) -> LoadedKernel<'c> {
+    fn loaded<'c>(domain: &crate::Domain<'c>, mesh: &DeviceMesh, compiler_options: u32) -> LoadedKernel<'c> {
         let compiler = crate::kernels::staging::tests::binding(compiler_options);
         crate::kernels::aot::tests::executable_bundle(domain, mesh, ryft_core::DataType::I32, false, &compiler)
             .load(domain, &compiler, mesh)
@@ -749,7 +749,7 @@ mod tests {
     }
 
     /// Downloads one completed scalar result for independent host assertions.
-    fn scalar(array: &XlaArray<'_>) -> i32 {
+    fn scalar(array: &Array<'_>) -> i32 {
         array.block_until_ready().unwrap();
         let bytes = array
             .addressable_shards()
@@ -908,13 +908,13 @@ mod tests {
             vec![Device::from_pjrt(client.addressable_devices().unwrap().remove(0)).unwrap()],
         )
         .unwrap();
-        let domain = crate::XlaSession::new(&client).domain().with_mesh(mesh.clone());
+        let domain = crate::Session::new(&client).domain().with_mesh(mesh.clone());
         let compiler_options = if mode == "configuration" { 1 + process as u32 } else { 1 };
         let kernel = loaded(&domain, &mesh, compiler_options);
         let options = DistributedKernelOptions::new(16, Duration::from_secs(5)).unwrap().with_chunk_bytes(2).unwrap();
         let mut coordinator = DistributedKernel::new(&runtime, &kernel, options.clone()).unwrap();
         let cancelled = Arc::new(AtomicBool::new(false));
-        let input = XlaArray::from_host_buffer(
+        let input = Array::from_host_buffer(
             &domain,
             ryft_core::ArrayType::scalar(ryft_core::DataType::I32),
             mesh.clone(),

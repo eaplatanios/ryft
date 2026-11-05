@@ -1,6 +1,6 @@
 //! Adaptive XLA profile-guided recompilation.
 //!
-//! [`AdaptiveProfileGuidedXlaFunction`] mirrors JAX's automatic Profile-Guided Latency Estimator flow while keeping
+//! [`AdaptiveProfileGuidedFunction`] mirrors JAX's automatic Profile-Guided Latency Estimator flow while keeping
 //! the policy and lifecycle explicit. One caller at a time profiles the baseline executable. Other callers continue
 //! dispatching without waiting, and compilation occurs outside all adaptive-state and dispatch locks. A compatible
 //! optimized executable is published only after compilation succeeds; every failure path is bounded and observable.
@@ -11,15 +11,12 @@ use std::sync::atomic::{AtomicUsize, Ordering};
 use std::sync::{Arc, Mutex, RwLock};
 
 use ryft_core::{ArrayIrType, ArrayType, CompilationCacheDomain, Parameterized, ParameterizedFamily};
-use ryft_pjrt::extensions::profiler::FeedbackDirectedProfile;
+use ryft_pjrt::extensions::profiler::FeedbackDirectedProfile as PjrtFeedbackDirectedProfile;
 use ryft_pjrt::protos::{ProfileDeviceType, ProfileOptions};
 
-use crate::experimental::domains::XlaLoweredProgram;
-use crate::experimental::ops::XlaConstant;
-use crate::{
-    CompilationError, Error, ExecutableXlaFunction, XlaArray, XlaDomain, XlaFeedbackDirectedProfile, XlaOptions,
-    XlaValue,
-};
+use crate::domains::LoweredProgram;
+use crate::experimental::ops::Constant;
+use crate::{Array, CompilationError, Domain, Error, ExecutableFunction, FeedbackDirectedProfile, Options, Value};
 
 const ADAPTIVE_PROFILE_CACHE_NAMESPACE: &str = "xla-adaptive-profile-v1";
 
@@ -116,7 +113,7 @@ pub enum AdaptiveProfileGuidedState {
     Failed { profiles_collected: usize, profile_attempts: usize, reason: String },
 }
 
-/// Lock-free activity snapshot for an [`AdaptiveProfileGuidedXlaFunction`].
+/// Lock-free activity snapshot for an [`AdaptiveProfileGuidedFunction`].
 #[derive(Copy, Clone, Debug, Default, PartialEq, Eq)]
 pub struct AdaptiveProfileGuidedStatistics {
     /// Total calls dispatched through this wrapper.
@@ -192,7 +189,7 @@ enum AdaptiveDispatch {
 
 struct AdaptiveProfileGuidedStateMachine {
     state: AdaptiveProfileGuidedState,
-    profiles: Vec<FeedbackDirectedProfile>,
+    profiles: Vec<PjrtFeedbackDirectedProfile>,
 }
 
 impl AdaptiveProfileGuidedStateMachine {
@@ -226,9 +223,9 @@ impl AdaptiveProfileGuidedStateMachine {
 
     fn profile_succeeded(
         &mut self,
-        profile: FeedbackDirectedProfile,
+        profile: PjrtFeedbackDirectedProfile,
         options: AdaptiveProfileGuidedOptions,
-    ) -> Option<Vec<FeedbackDirectedProfile>> {
+    ) -> Option<Vec<PjrtFeedbackDirectedProfile>> {
         let AdaptiveProfileGuidedState::Profiling { profile_attempts, profile_in_flight, .. } = &mut self.state else {
             return None;
         };
@@ -323,8 +320,8 @@ fn validate_adaptive_profile_guided_platform(platform_name: &str) -> Result<(), 
 }
 
 fn adaptive_profile_sidecar_key<'c>(
-    domain: &crate::experimental::domains::XlaDomain<'c>,
-    lowered_program: &XlaLoweredProgram,
+    domain: &Domain<'c>,
+    lowered_program: &LoweredProgram,
     options: AdaptiveProfileGuidedOptions,
 ) -> Result<Option<Vec<u8>>, Error> {
     let cache = domain.compilation_context();
@@ -365,23 +362,23 @@ fn adaptive_profile_sidecar_key<'c>(
 /// trace is complete. Concurrent calls copy the currently active executable handle and execute without holding the
 /// state or dispatch locks. Recompilation is single-flight and terminal: it either installs one compatible executable
 /// or records a permanent failure while continuing to serve the baseline.
-pub struct AdaptiveProfileGuidedXlaFunction<'c, In: Parameterized<ArrayType>, Out: Parameterized<ArrayType>>
+pub struct AdaptiveProfileGuidedFunction<'c, In: Parameterized<ArrayType>, Out: Parameterized<ArrayType>>
 where
-    In::Family: ParameterizedFamily<ArrayIrType> + ParameterizedFamily<XlaConstant>,
-    Out::Family: ParameterizedFamily<ArrayIrType> + ParameterizedFamily<XlaConstant>,
+    In::Family: ParameterizedFamily<ArrayIrType> + ParameterizedFamily<Constant>,
+    Out::Family: ParameterizedFamily<ArrayIrType> + ParameterizedFamily<Constant>,
 {
-    inner: Arc<AdaptiveProfileGuidedXlaFunctionInner<'c, In, Out>>,
+    inner: Arc<AdaptiveProfileGuidedFunctionInner<'c, In, Out>>,
 }
 
-struct AdaptiveProfileGuidedXlaFunctionInner<'c, In: Parameterized<ArrayType>, Out: Parameterized<ArrayType>>
+struct AdaptiveProfileGuidedFunctionInner<'c, In: Parameterized<ArrayType>, Out: Parameterized<ArrayType>>
 where
-    In::Family: ParameterizedFamily<ArrayIrType> + ParameterizedFamily<XlaConstant>,
-    Out::Family: ParameterizedFamily<ArrayIrType> + ParameterizedFamily<XlaConstant>,
+    In::Family: ParameterizedFamily<ArrayIrType> + ParameterizedFamily<Constant>,
+    Out::Family: ParameterizedFamily<ArrayIrType> + ParameterizedFamily<Constant>,
 {
-    domain: XlaDomain<'c>,
-    baseline: ExecutableXlaFunction<'c, In, Out>,
-    active: RwLock<ExecutableXlaFunction<'c, In, Out>>,
-    lowered_program: XlaLoweredProgram,
+    domain: Domain<'c>,
+    baseline: ExecutableFunction<'c, In, Out>,
+    active: RwLock<ExecutableFunction<'c, In, Out>>,
+    lowered_program: LoweredProgram,
     options: AdaptiveProfileGuidedOptions,
     profile_sidecar_key: Option<Vec<u8>>,
     state: Mutex<AdaptiveProfileGuidedStateMachine>,
@@ -389,10 +386,10 @@ where
 }
 
 impl<'c, In: Parameterized<ArrayType>, Out: Parameterized<ArrayType>> Clone
-    for AdaptiveProfileGuidedXlaFunction<'c, In, Out>
+    for AdaptiveProfileGuidedFunction<'c, In, Out>
 where
-    In::Family: ParameterizedFamily<ArrayIrType> + ParameterizedFamily<XlaConstant>,
-    Out::Family: ParameterizedFamily<ArrayIrType> + ParameterizedFamily<XlaConstant>,
+    In::Family: ParameterizedFamily<ArrayIrType> + ParameterizedFamily<Constant>,
+    Out::Family: ParameterizedFamily<ArrayIrType> + ParameterizedFamily<Constant>,
 {
     #[inline]
     fn clone(&self) -> Self {
@@ -400,16 +397,16 @@ where
     }
 }
 
-impl<'c, In: Parameterized<ArrayType>, Out: Parameterized<ArrayType>> AdaptiveProfileGuidedXlaFunction<'c, In, Out>
+impl<'c, In: Parameterized<ArrayType>, Out: Parameterized<ArrayType>> AdaptiveProfileGuidedFunction<'c, In, Out>
 where
-    In::Family: ParameterizedFamily<ArrayIrType> + ParameterizedFamily<XlaConstant>,
-    Out::Family: ParameterizedFamily<ArrayIrType> + ParameterizedFamily<XlaConstant>,
+    In::Family: ParameterizedFamily<ArrayIrType> + ParameterizedFamily<Constant>,
+    Out::Family: ParameterizedFamily<ArrayIrType> + ParameterizedFamily<Constant>,
 {
     pub(crate) fn new(
-        domain: XlaDomain<'c>,
-        baseline: ExecutableXlaFunction<'c, In, Out>,
-        lowered_program: XlaLoweredProgram,
-        compilation_options: XlaOptions,
+        domain: Domain<'c>,
+        baseline: ExecutableFunction<'c, In, Out>,
+        lowered_program: LoweredProgram,
+        compilation_options: Options,
         options: AdaptiveProfileGuidedOptions,
     ) -> Result<Self, Error> {
         if compilation_options.feedback_directed_profile.is_some() {
@@ -422,7 +419,7 @@ where
         client.profiler_extension()?;
         let profile_sidecar_key = adaptive_profile_sidecar_key(&domain, &lowered_program, options)?;
         let function = Self {
-            inner: Arc::new(AdaptiveProfileGuidedXlaFunctionInner {
+            inner: Arc::new(AdaptiveProfileGuidedFunctionInner {
                 domain,
                 active: RwLock::new(baseline.clone()),
                 baseline,
@@ -470,12 +467,12 @@ where
     }
 
     /// Executes with the active executable and advances adaptive profiling when this call wins ownership.
-    pub fn interpret(&self, inputs: In::To<XlaArray<'c>>) -> Result<Out::To<XlaArray<'c>>, Error>
+    pub fn interpret(&self, inputs: In::To<Array<'c>>) -> Result<Out::To<Array<'c>>, Error>
     where
-        In::Family: ParameterizedFamily<XlaArray<'c>> + ParameterizedFamily<XlaValue<'c>>,
-        Out::Family: ParameterizedFamily<XlaArray<'c>> + ParameterizedFamily<XlaValue<'c>>,
-        Out::To<XlaArray<'c>>:
-            Parameterized<XlaArray<'c>, Family = Out::Family, ParameterStructure = Out::ParameterStructure>,
+        In::Family: ParameterizedFamily<Array<'c>> + ParameterizedFamily<Value<'c>>,
+        Out::Family: ParameterizedFamily<Array<'c>> + ParameterizedFamily<Value<'c>>,
+        Out::To<Array<'c>>:
+            Parameterized<Array<'c>, Family = Out::Family, ParameterStructure = Out::ParameterStructure>,
     {
         self.inner.statistics.executions.fetch_add(1, Ordering::Relaxed);
         let dispatch = self
@@ -504,14 +501,14 @@ where
 
     fn profile_baseline(
         &self,
-        executable: ExecutableXlaFunction<'c, In, Out>,
-        inputs: In::To<XlaArray<'c>>,
-    ) -> Result<Out::To<XlaArray<'c>>, Error>
+        executable: ExecutableFunction<'c, In, Out>,
+        inputs: In::To<Array<'c>>,
+    ) -> Result<Out::To<Array<'c>>, Error>
     where
-        In::Family: ParameterizedFamily<XlaArray<'c>> + ParameterizedFamily<XlaValue<'c>>,
-        Out::Family: ParameterizedFamily<XlaArray<'c>> + ParameterizedFamily<XlaValue<'c>>,
-        Out::To<XlaArray<'c>>:
-            Parameterized<XlaArray<'c>, Family = Out::Family, ParameterStructure = Out::ParameterStructure>,
+        In::Family: ParameterizedFamily<Array<'c>> + ParameterizedFamily<Value<'c>>,
+        Out::Family: ParameterizedFamily<Array<'c>> + ParameterizedFamily<Value<'c>>,
+        Out::To<Array<'c>>:
+            Parameterized<Array<'c>, Family = Out::Family, ParameterStructure = Out::ParameterStructure>,
     {
         let profiler_options = ProfileOptions {
             version: 1,
@@ -561,7 +558,7 @@ where
         let profile = profiler
             .stop()
             .and_then(|()| profiler.results())
-            .and_then(|results| FeedbackDirectedProfile::from_x_space(&results));
+            .and_then(|results| PjrtFeedbackDirectedProfile::from_x_space(&results));
         match profile {
             Ok(profile) => {
                 let profiles = self
@@ -588,12 +585,12 @@ where
             .profile_failed(reason, self.inner.options);
     }
 
-    fn compile_profile(&self, profile: Vec<u8>) -> Result<ExecutableXlaFunction<'c, In, Out>, Error> {
-        let profile = XlaFeedbackDirectedProfile::new(profile).with_version(self.inner.options.profile_version);
+    fn compile_profile(&self, profile: Vec<u8>) -> Result<ExecutableFunction<'c, In, Out>, Error> {
+        let profile = FeedbackDirectedProfile::new(profile).with_version(self.inner.options.profile_version);
         let lowered_program = self.inner.lowered_program.clone().with_feedback_directed_profile(profile);
         let domain = &self.inner.domain;
         let program = domain.compilation_context().compile(domain, &lowered_program)?;
-        domain.replace_executable_xla_program(&self.inner.baseline, program)
+        domain.replace_executable_program(&self.inner.baseline, program)
     }
 
     fn restore_persisted_profile(&self) {
@@ -658,16 +655,18 @@ where
         }
     }
 
-    fn recompile(&self, profiles: Vec<FeedbackDirectedProfile>) {
+    fn recompile(&self, profiles: Vec<PjrtFeedbackDirectedProfile>) {
         self.inner.statistics.recompilations.fetch_add(1, Ordering::Relaxed);
-        let (profile, candidate) =
-            match FeedbackDirectedProfile::aggregated(profiles.as_slice(), self.inner.options.aggregation_percentile) {
-                Ok(profile) => {
-                    let candidate = self.compile_profile(profile.bytes().to_vec());
-                    (Some(profile), candidate)
-                }
-                Err(error) => (None, Err(Error::from(error))),
-            };
+        let (profile, candidate) = match PjrtFeedbackDirectedProfile::aggregated(
+            profiles.as_slice(),
+            self.inner.options.aggregation_percentile,
+        ) {
+            Ok(profile) => {
+                let candidate = self.compile_profile(profile.bytes().to_vec());
+                (Some(profile), candidate)
+            }
+            Err(error) => (None, Err(Error::from(error))),
+        };
         match candidate {
             Ok(candidate) => {
                 *self.inner.active.write().expect("adaptive executable lock should not be poisoned") = candidate;
@@ -747,11 +746,14 @@ mod tests {
         let mut machine = AdaptiveProfileGuidedStateMachine::new();
         let options = options(2, 3);
         assert!(matches!(machine.claim_dispatch(options), AdaptiveDispatch::Profile));
-        assert!(machine.profile_succeeded(FeedbackDirectedProfile::from_bytes(vec![1]), options).is_none());
+        assert!(machine.profile_succeeded(PjrtFeedbackDirectedProfile::from_bytes(vec![1]), options).is_none());
         assert!(matches!(machine.claim_dispatch(options), AdaptiveDispatch::Profile));
         assert_eq!(
-            machine.profile_succeeded(FeedbackDirectedProfile::from_bytes(vec![2]), options),
-            Some(vec![FeedbackDirectedProfile::from_bytes(vec![1]), FeedbackDirectedProfile::from_bytes(vec![2])]),
+            machine.profile_succeeded(PjrtFeedbackDirectedProfile::from_bytes(vec![2]), options),
+            Some(vec![
+                PjrtFeedbackDirectedProfile::from_bytes(vec![1]),
+                PjrtFeedbackDirectedProfile::from_bytes(vec![2])
+            ]),
         );
         assert!(matches!(machine.claim_dispatch(options), AdaptiveDispatch::Baseline));
         machine.compilation_succeeded();
@@ -764,8 +766,8 @@ mod tests {
         let options = options(1, 2);
         assert!(matches!(machine.claim_dispatch(options), AdaptiveDispatch::Profile));
         assert_eq!(
-            machine.profile_succeeded(FeedbackDirectedProfile::from_bytes(vec![1]), options),
-            Some(vec![FeedbackDirectedProfile::from_bytes(vec![1])]),
+            machine.profile_succeeded(PjrtFeedbackDirectedProfile::from_bytes(vec![1]), options),
+            Some(vec![PjrtFeedbackDirectedProfile::from_bytes(vec![1])]),
         );
         machine.compilation_failed("compile failed".to_string());
         assert_eq!(
@@ -786,7 +788,7 @@ mod tests {
         assert!(matches!(machine.claim_dispatch(options), AdaptiveDispatch::Profile));
         machine.profile_failed("first attempt failed".to_string(), options);
         assert!(matches!(machine.claim_dispatch(options), AdaptiveDispatch::Profile));
-        assert!(machine.profile_succeeded(FeedbackDirectedProfile::from_bytes(vec![1]), options).is_none());
+        assert!(machine.profile_succeeded(PjrtFeedbackDirectedProfile::from_bytes(vec![1]), options).is_none());
         assert_eq!(
             machine.state,
             AdaptiveProfileGuidedState::Failed {

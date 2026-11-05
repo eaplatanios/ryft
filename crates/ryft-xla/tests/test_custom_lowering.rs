@@ -4,21 +4,21 @@ use indoc::indoc;
 use pretty_assertions::assert_eq;
 
 use ryft_core::{
-    AddOperation, ArrayIrType, ArrayType, DataType, Operation, Placeholder, ProgramBuilder, RegionInterface, TypeError,
+    AddOperation, ArrayIrType, ArrayType, DataType, Operation as CoreOperation, Placeholder,
+    ProgramBuilder as CoreProgramBuilder, RegionInterface, TypeError,
 };
 use ryft_mlir::dialects::stable_hlo;
 use ryft_mlir::{Block, Operation as MlirOperation, Value as MlirValue, ValueRef};
-use ryft_xla::experimental::ops::{XlaConstant, XlaOperation};
+use ryft_xla::experimental::ops::{Constant, Operation};
 use ryft_xla::{
-    Error, LowerableOperation, LowerableOperationFamily, XlaLowerer, lower_operation_variants,
-    to_mlir_module_for_program,
+    Error, LowerableOperation, LowerableOperationFamily, Lowerer, lower_operation_variants, to_mlir_module_for_program,
 };
 
 /// Downstream operation that doubles its input, which `ryft-xla` knows nothing about.
 #[derive(Clone, Debug, PartialEq, Eq, Hash)]
 struct TwiceOperation;
 
-impl Operation for TwiceOperation {
+impl CoreOperation for TwiceOperation {
     type Type = ArrayIrType;
 
     fn name(&self) -> &'static str {
@@ -37,7 +37,7 @@ impl Operation for TwiceOperation {
 impl LowerableOperation for TwiceOperation {
     fn lower<'b, 'c: 'b, 't: 'c, O: LowerableOperationFamily>(
         &self,
-        lowerer: &mut XlaLowerer<'b, 'c, 't, O>,
+        lowerer: &mut Lowerer<'b, 'c, 't, O>,
         input_values: &[ValueRef<'b, 'c, 't>],
         _input_types: &[ArrayIrType],
         _output_types: &[ArrayIrType],
@@ -52,16 +52,16 @@ impl LowerableOperation for TwiceOperation {
 
 /// Downstream operation family that extends the backend-owned XLA operations with [`TwiceOperation`].
 #[derive(Clone, Debug, ryft_macros::Operation)]
-#[ryft(crate = "ryft_core", type(ArrayIrType), constant(XlaConstant))]
+#[ryft(crate = "ryft_core", type(ArrayIrType), constant(Constant))]
 enum ExtendedOperation {
-    Xla(Box<XlaOperation>),
+    Xla(Box<Operation>),
     Twice(TwiceOperation),
 }
 
 impl LowerableOperation for ExtendedOperation {
     fn lower<'b, 'c: 'b, 't: 'c, O: LowerableOperationFamily>(
         &self,
-        lowerer: &mut XlaLowerer<'b, 'c, 't, O>,
+        lowerer: &mut Lowerer<'b, 'c, 't, O>,
         input_values: &[ValueRef<'b, 'c, 't>],
         input_types: &[ArrayIrType],
         output_types: &[ArrayIrType],
@@ -77,21 +77,21 @@ impl LowerableOperation for ExtendedOperation {
 #[test]
 fn test_downstream_operation_family_lowers_through_the_public_api() {
     let vector_type = ArrayType::new_static(DataType::F32, [3]);
-    let mut builder = ProgramBuilder::<XlaConstant, ExtendedOperation>::new();
+    let mut builder = CoreProgramBuilder::<Constant, ExtendedOperation>::new();
     let input = builder.add_input(vector_type.clone().into());
     let doubled = builder
         .add_instruction(ExtendedOperation::Twice(TwiceOperation), Vec::new(), vec![input], None)
         .unwrap()[0];
     let sum = builder
         .add_instruction(
-            ExtendedOperation::Xla(Box::new(XlaOperation::from(AddOperation::<ArrayType>::new()))),
+            ExtendedOperation::Xla(Box::new(Operation::from(AddOperation::<ArrayType>::new()))),
             Vec::new(),
             vec![doubled, input],
             None,
         )
         .unwrap()[0];
     let program = builder
-        .build::<Vec<XlaConstant>, Vec<XlaConstant>>(vec![sum], vec![Placeholder], vec![Placeholder])
+        .build::<Vec<Constant>, Vec<Constant>>(vec![sum], vec![Placeholder], vec![Placeholder])
         .unwrap();
     let module =
         to_mlir_module_for_program(&program, &[], &vec![vector_type.clone()], &vec![vector_type], "main", None, None)

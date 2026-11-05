@@ -14,20 +14,21 @@ use ryft_core::operations::attention::{
     AttentionConfiguration, AttentionImplementation, AttentionInputs, dot_product_attention,
 };
 use ryft_core::{
-    Array, ArrayIrBatch, ArrayIrBatchingPolicy, ArrayIrOperation, ArrayIrType, ArrayIrValue, ArrayOperation, ArrayType,
-    BatchAxis, BatchingContext, BatchingTracer, BlockQuantizedValue, BlockScaleFormat, BlockScaledDotConfiguration,
-    CollectiveOptions, Compare, ComparisonDirection, Condition, Context, ConvertElementTypeOperation, DataType, Device,
-    DeviceMesh, Differentiate, Dimension, DimensionBounds, DimensionFromScalarOperation, DimensionValue,
-    DimensionVariable, DotDimensionNumbers, DynamicSlice, DynamicSliceOperation, DynamicUpdateSlice, EagerContext,
-    LogicalMesh, MeshAxis, MeshAxisType, ParallelAllGather, ParallelAllGatherOutputVariance, ParallelAllToAll,
-    ParallelPermute, ParallelReduce, ParallelSumScatter, Placeholder, ProgramBuilder, ProgramError, ProjectedContext,
-    Reduce, ReduceOperation, ReductionKind, ScaledDot, ScaledDotOperation, Shape, ShardMapOptions, Sharding,
-    ShardingDimension, TypedProgram, Value, ValueProjection, ZeroLike, block_scaled_dot, differentiate_at, shard_map,
+    Array as CoreArray, ArrayIrBatch, ArrayIrBatchingPolicy, ArrayIrOperation, ArrayIrType, ArrayIrValue,
+    ArrayOperation, ArrayType, BatchAxis, BatchingContext, BatchingTracer, BlockQuantizedValue, BlockScaleFormat,
+    BlockScaledDotConfiguration, CollectiveOptions, Compare, ComparisonDirection, Condition, Context,
+    ConvertElementTypeOperation, DataType, Device, DeviceMesh, Differentiate, Dimension as CoreDimension,
+    DimensionBounds, DimensionFromScalarOperation, DimensionValue, DimensionVariable, DotDimensionNumbers,
+    DynamicSlice, DynamicSliceOperation, DynamicUpdateSlice, EagerContext, LogicalMesh, MeshAxis, MeshAxisType,
+    ParallelAllGather, ParallelAllGatherOutputVariance, ParallelAllToAll, ParallelPermute, ParallelReduce,
+    ParallelSumScatter, Placeholder, ProgramBuilder as CoreProgramBuilder, ProgramError, ProjectedContext, Reduce,
+    ReduceOperation, ReductionKind, ScaledDot, ScaledDotOperation, Shape, ShardMapOptions, Sharding, ShardingDimension,
+    TypedProgram, Value as CoreValue, ValueProjection, ZeroLike, block_scaled_dot, differentiate_at, shard_map,
 };
 use ryft_pjrt::protos::{CompilationOptions, ExecutableCompilationOptions, Precision};
 use ryft_pjrt::{BufferType, Client, ClientOptions, CpuClientOptions, Program, load_cpu_plugin};
-use ryft_xla::experimental::{TracedXlaProgram, XlaArrayTracer, trace};
-use ryft_xla::{FromPjrt, XlaArray, XlaDomain, XlaSession};
+use ryft_xla::experimental::{ArrayTracer, TracedProgram, trace};
+use ryft_xla::{Array, Domain, FromPjrt, Session};
 
 #[path = "differential_testing/collectives.rs"]
 mod collectives;
@@ -229,8 +230,8 @@ fn execute_collective_inputs(
             })
             .collect::<Result<Vec<_>, _>>()?;
         let input_type = ArrayType::new_static(DataType::F32, global_shape.to_vec()).with_sharding(sharding.clone())?;
-        arrays.push(XlaArray::from_addressable_buffers(
-            &XlaSession::new(client).domain(),
+        arrays.push(Array::from_addressable_buffers(
+            &Session::new(client).domain(),
             input_type,
             device_mesh.clone(),
             buffers,
@@ -242,7 +243,7 @@ fn execute_collective_inputs(
     )?;
     let execution_device_ids =
         executable.addressable_devices()?.iter().map(|device| device.id()).collect::<Result<Vec<_>, _>>()?;
-    let arguments = XlaArray::into_execute_arguments(arrays, execution_device_ids.as_slice())?;
+    let arguments = Array::into_execute_arguments(arrays, execution_device_ids.as_slice())?;
     let outputs = executable
         .execute(arguments.as_execution_device_inputs(), Vec::new(), 0, None, Some(file!()), None, None, &[])?
         .block_until_ready()?;
@@ -296,12 +297,12 @@ fn collective_runtime() -> Result<(Client<'static>, DeviceMesh, Sharding), Box<d
 fn emit_grouped_collectives() -> Result<DifferentialObservation, Box<dyn Error>> {
     let (client, device_mesh, sharding) = collective_runtime()?;
     let mesh = device_mesh.logical_mesh().clone();
-    let traced: TracedXlaProgram<ArrayType, (ArrayType, ArrayType, ArrayType)> = trace(
+    let traced: TracedProgram<ArrayType, (ArrayType, ArrayType, ArrayType)> = trace(
         {
             let sharding = sharding.clone();
-            move |input: XlaArrayTracer| {
+            move |input: ArrayTracer| {
                 shard_map(
-                    |local_input: XlaArrayTracer| {
+                    |local_input: ArrayTracer| {
                         let options = CollectiveOptions::tiled().with_axis_index_groups(vec![vec![0, 2], vec![3, 1]]);
                         Ok((
                             local_input.parallel_all_gather_with_options(
@@ -323,7 +324,7 @@ fn emit_grouped_collectives() -> Result<DifferentialObservation, Box<dyn Error>>
                 .unwrap()
             }
         },
-        ArrayType::new(DataType::F32, Shape::new(vec![Dimension::Static(16)])),
+        ArrayType::new(DataType::F32, Shape::new(vec![CoreDimension::Static(16)])),
     )?;
     let stablehlo = traced.to_mlir_module("main")?;
     let input_values = (0..4)
@@ -357,12 +358,12 @@ fn emit_grouped_collectives() -> Result<DifferentialObservation, Box<dyn Error>>
 fn emit_parallel_shuffle() -> Result<DifferentialObservation, Box<dyn Error>> {
     let (client, device_mesh, sharding) = collective_runtime()?;
     let mesh = device_mesh.logical_mesh().clone();
-    let traced: TracedXlaProgram<ArrayType, ArrayType> = trace(
+    let traced: TracedProgram<ArrayType, ArrayType> = trace(
         {
             let sharding = sharding.clone();
-            move |input: XlaArrayTracer| {
+            move |input: ArrayTracer| {
                 shard_map(
-                    |local_input: XlaArrayTracer| local_input.parallel_shuffle("x", &[2, 0, 3, 1]),
+                    |local_input: ArrayTracer| local_input.parallel_shuffle("x", &[2, 0, 3, 1]),
                     input,
                     mesh.clone(),
                     sharding.clone(),
@@ -372,7 +373,7 @@ fn emit_parallel_shuffle() -> Result<DifferentialObservation, Box<dyn Error>> {
                 .unwrap()
             }
         },
-        ArrayType::new(DataType::F32, Shape::new(vec![Dimension::Static(8)])),
+        ArrayType::new(DataType::F32, Shape::new(vec![CoreDimension::Static(8)])),
     )?;
     let stablehlo = traced.to_mlir_module("main")?;
     let input_values = (0..4)
@@ -388,14 +389,14 @@ fn emit_parallel_shuffle() -> Result<DifferentialObservation, Box<dyn Error>> {
         input_values.as_slice(),
         &[vec![2]],
     )?;
-    type Parent = EagerContext<ArrayIrValue<Array>, ArrayIrOperation<Array>>;
+    type Parent = EagerContext<ArrayIrValue<CoreArray>, ArrayIrOperation<CoreArray>>;
     let context = BatchingContext::<_, ArrayIrBatchingPolicy>::new(
         Parent::new(),
         ArrayIrValue::Dimension(DimensionValue::constant(4)?),
     )
     .with_axis_name("x".to_string());
     let input = ArrayIrBatch::new(
-        ArrayIrValue::Array(Array::matrix(4, 2, (0..8).map(|value| value as f32).collect())?),
+        ArrayIrValue::Array(CoreArray::matrix(4, 2, (0..8).map(|value| value as f32).collect())?),
         BatchAxis::new(0),
     )?;
     let output = BatchingTracer::new(context, input).parallel_shuffle("x", &[2, 0, 3, 1])?.into_batch();
@@ -426,12 +427,12 @@ fn emit_parallel_swap_axes() -> Result<DifferentialObservation, Box<dyn Error>> 
     let mesh = device_mesh.logical_mesh().clone();
     let sharding =
         Sharding::new(mesh.clone(), vec![ShardingDimension::sharded(["x"]), ShardingDimension::replicated()])?;
-    let traced: TracedXlaProgram<ArrayType, ArrayType> = trace(
+    let traced: TracedProgram<ArrayType, ArrayType> = trace(
         {
             let sharding = sharding.clone();
-            move |input: XlaArrayTracer| {
+            move |input: ArrayTracer| {
                 shard_map(
-                    |local_input: XlaArrayTracer| local_input.parallel_swap_axes("x", 0),
+                    |local_input: ArrayTracer| local_input.parallel_swap_axes("x", 0),
                     input,
                     mesh.clone(),
                     sharding.clone(),
@@ -441,7 +442,7 @@ fn emit_parallel_swap_axes() -> Result<DifferentialObservation, Box<dyn Error>> 
                 .unwrap()
             }
         },
-        ArrayType::new(DataType::F32, Shape::new(vec![Dimension::Static(16), Dimension::Static(2)])),
+        ArrayType::new(DataType::F32, Shape::new(vec![CoreDimension::Static(16), CoreDimension::Static(2)])),
     )?;
     let stablehlo = traced.to_mlir_module("main")?;
     let input_values = (0..4)
@@ -469,16 +470,16 @@ fn emit_parallel_swap_axes() -> Result<DifferentialObservation, Box<dyn Error>> 
 /// Builds the bounded data-dependent prefix program shared by its eager and staged observations.
 fn data_dependent_prefix_program() -> Result<
     ryft_core::Program<
-        ArrayIrValue<Array>,
-        ArrayIrOperation<Array>,
-        Vec<ArrayIrValue<Array>>,
-        Vec<ArrayIrValue<Array>>,
+        ArrayIrValue<CoreArray>,
+        ArrayIrOperation<CoreArray>,
+        Vec<ArrayIrValue<CoreArray>>,
+        Vec<ArrayIrValue<CoreArray>>,
     >,
     ProgramError,
 > {
-    let mut builder = ProgramBuilder::<ArrayIrValue<Array>, ArrayIrOperation<Array>>::new();
-    let mask = builder.add_input(ArrayType::new(DataType::Boolean, Shape::new(vec![Dimension::Static(4)])).into());
-    let values = builder.add_input(ArrayType::new(DataType::F32, Shape::new(vec![Dimension::Static(4)])).into());
+    let mut builder = CoreProgramBuilder::<ArrayIrValue<CoreArray>, ArrayIrOperation<CoreArray>>::new();
+    let mask = builder.add_input(ArrayType::new(DataType::Boolean, Shape::new(vec![CoreDimension::Static(4)])).into());
+    let values = builder.add_input(ArrayType::new(DataType::F32, Shape::new(vec![CoreDimension::Static(4)])).into());
     let mask = builder.add_instruction(
         ArrayIrOperation::Array(ArrayOperation::from(ConvertElementTypeOperation::<ArrayType>::new(
             DataType::I64,
@@ -508,7 +509,7 @@ fn data_dependent_prefix_program() -> Result<
         vec![values, start, count],
         None,
     )?[0];
-    builder.build::<Vec<ArrayIrValue<Array>>, Vec<ArrayIrValue<Array>>>(
+    builder.build::<Vec<ArrayIrValue<CoreArray>>, Vec<ArrayIrValue<CoreArray>>>(
         vec![output],
         vec![Placeholder, Placeholder],
         vec![Placeholder],
@@ -519,10 +520,10 @@ fn data_dependent_prefix_program() -> Result<
 fn emit_data_dependent_prefix_take() -> Result<DifferentialObservation, Box<dyn Error>> {
     let program = data_dependent_prefix_program()?;
     let execute = |mask| -> Result<Vec<Vec<f32>>, Box<dyn Error>> {
-        let [ArrayIrValue::Array(output)]: [ArrayIrValue<Array>; 1] = program
+        let [ArrayIrValue::Array(output)]: [ArrayIrValue<CoreArray>; 1] = program
             .interpret(vec![
-                ArrayIrValue::Array(Array::vector(mask)?),
-                ArrayIrValue::Array(Array::vector(vec![10.0_f32, 20.0, 30.0, 40.0])?),
+                ArrayIrValue::Array(CoreArray::vector(mask)?),
+                ArrayIrValue::Array(CoreArray::vector(vec![10.0_f32, 20.0, 30.0, 40.0])?),
             ])?
             .try_into()
             .unwrap()
@@ -546,7 +547,7 @@ fn emit_data_dependent_prefix_take() -> Result<DifferentialObservation, Box<dyn 
 /// Emits generalized scaled-dot and rank-three scaled-matmul values plus the named-composite StableHLO contract.
 fn emit_scaled_dot_and_matmul() -> Result<DifferentialObservation, Box<dyn Error>> {
     /// Binds the primitive directly so the differential fixture covers its optional block-scale inputs.
-    fn bind_scaled_dot<V: Value<Type = ArrayType>>(
+    fn bind_scaled_dot<V: CoreValue<Type = ArrayType>>(
         lhs: &V,
         rhs: &V,
         lhs_scale: Option<&V>,
@@ -568,24 +569,25 @@ fn emit_scaled_dot_and_matmul() -> Result<DifferentialObservation, Box<dyn Error
         Ok(lhs.domain().bind(operation, Vec::new(), &inputs)?.remove(0))
     }
 
-    let lhs = Array::from_elements::<f32>(
+    let lhs = CoreArray::from_elements::<f32>(
         ArrayType::new_static(DataType::F32, [2, 4]),
         &(1..=8).map(|value| value as f32).collect::<Vec<_>>(),
     )?;
-    let rhs = Array::from_elements::<f32>(
+    let rhs = CoreArray::from_elements::<f32>(
         ArrayType::new_static(DataType::F32, [4, 3]),
         &(1..=12).map(|value| value as f32).collect::<Vec<_>>(),
     )?;
-    let lhs_scale = Array::from_elements::<f32>(ArrayType::new_static(DataType::F32, [2, 2]), &[1.0, 2.0, 0.5, 1.0])?;
+    let lhs_scale =
+        CoreArray::from_elements::<f32>(ArrayType::new_static(DataType::F32, [2, 2]), &[1.0, 2.0, 0.5, 1.0])?;
     let rhs_scale =
-        Array::from_elements::<f32>(ArrayType::new_static(DataType::F32, [2, 3]), &[1.0, 1.0, 1.0, 2.0, 2.0, 2.0])?;
+        CoreArray::from_elements::<f32>(ArrayType::new_static(DataType::F32, [2, 3]), &[1.0, 1.0, 1.0, 2.0, 2.0, 2.0])?;
     let dimensions = DotDimensionNumbers::new(vec![1], vec![0], Vec::new(), Vec::new());
-    let values = |value: Array| value.to_f64s().into_iter().map(|value| value as f32).collect::<Vec<_>>();
+    let values = |value: CoreArray| value.to_f64s().into_iter().map(|value| value as f32).collect::<Vec<_>>();
 
-    let matmul_lhs = Array::from_elements::<f32>(ArrayType::new_static(DataType::F32, [1, 1, 4]), &[1.0; 4])?;
-    let matmul_rhs = Array::from_elements::<f32>(ArrayType::new_static(DataType::F32, [1, 2, 4]), &[1.0; 8])?;
-    let matmul_lhs_scale = Array::from_elements::<f32>(ArrayType::new_static(DataType::F32, [1, 1, 2]), &[1.0; 2])?;
-    let matmul_rhs_scale = Array::from_elements::<f32>(ArrayType::new_static(DataType::F32, [1, 2, 2]), &[1.0; 4])?;
+    let matmul_lhs = CoreArray::from_elements::<f32>(ArrayType::new_static(DataType::F32, [1, 1, 4]), &[1.0; 4])?;
+    let matmul_rhs = CoreArray::from_elements::<f32>(ArrayType::new_static(DataType::F32, [1, 2, 4]), &[1.0; 8])?;
+    let matmul_lhs_scale = CoreArray::from_elements::<f32>(ArrayType::new_static(DataType::F32, [1, 1, 2]), &[1.0; 2])?;
+    let matmul_rhs_scale = CoreArray::from_elements::<f32>(ArrayType::new_static(DataType::F32, [1, 2, 2]), &[1.0; 4])?;
     let observations = BTreeMap::from([
         (
             "both_scales",
@@ -602,10 +604,10 @@ fn emit_scaled_dot_and_matmul() -> Result<DifferentialObservation, Box<dyn Error
             )],
         ),
     ]);
-    let traced: TracedXlaProgram<(ArrayType, ArrayType, ArrayType, ArrayType), ArrayType> = trace(
+    let traced: TracedProgram<(ArrayType, ArrayType, ArrayType, ArrayType), ArrayType> = trace(
         {
             let dimensions = dimensions.clone();
-            move |(lhs, rhs, lhs_scale, rhs_scale): (XlaArrayTracer, XlaArrayTracer, XlaArrayTracer, XlaArrayTracer)| {
+            move |(lhs, rhs, lhs_scale, rhs_scale): (ArrayTracer, ArrayTracer, ArrayTracer, ArrayTracer)| {
                 bind_scaled_dot(&lhs, &rhs, Some(&lhs_scale), Some(&rhs_scale), &dimensions, DataType::F32).unwrap()
             }
         },
@@ -628,11 +630,11 @@ fn emit_scaled_dot_and_matmul() -> Result<DifferentialObservation, Box<dyn Error
 /// Returns the shared `block_scaled_dot` inputs of the JAX registry, whose quantized arithmetic is exact in both
 /// frameworks. The NVFP4 left input clips at its global scale `2^-9`, and every MXFP8 block contains `4`, whose power of
 /// two scale is the same under the OCP and JAX scale rounding.
-fn block_scaled_dot_inputs() -> Result<[Array; 6], ProgramError> {
+fn block_scaled_dot_inputs() -> Result<[CoreArray; 6], ProgramError> {
     let values = |shape: &[usize], value: &dyn Fn(usize) -> f64| {
         let count = shape.iter().product::<usize>();
         let values = (0..count).map(|index| value(index) as f32).collect::<Vec<_>>();
-        Array::from_elements::<f32>(ArrayType::new_static(DataType::F32, shape.to_vec()), &values)
+        CoreArray::from_elements::<f32>(ArrayType::new_static(DataType::F32, shape.to_vec()), &values)
     };
     let modulo = |value: usize, modulus: usize| (value % modulus) as f64;
     let mx = |seed: &dyn Fn(usize, usize) -> f64, stride: usize| {
@@ -658,8 +660,8 @@ fn emit_block_scaled_dot() -> Result<DifferentialObservation, Box<dyn Error>> {
     let nvfp4_dimensions = DotDimensionNumbers::new(vec![2], vec![1], vec![0], vec![0]);
     let nvfp4 = BlockScaledDotConfiguration::new(nvfp4_dimensions, BlockScaleFormat::nvfp4());
     let mxfp8 = BlockScaledDotConfiguration::new(DotDimensionNumbers::matmul(), BlockScaleFormat::mxfp8());
-    let lhs_global_scale = Array::scalar(2.0f32.powi(-9))?;
-    let values = |value: Array| vec![value.to_f64s().into_iter().map(|value| value as f32).collect::<Vec<_>>()];
+    let lhs_global_scale = CoreArray::scalar(2.0f32.powi(-9))?;
+    let values = |value: CoreArray| vec![value.to_f64s().into_iter().map(|value| value as f32).collect::<Vec<_>>()];
     let mut observations = BTreeMap::new();
     for (names, configuration, lhs, rhs, seed, global_scale) in [
         (
@@ -672,7 +674,7 @@ fn emit_block_scaled_dot() -> Result<DifferentialObservation, Box<dyn Error>> {
         ),
         (["mxfp8_output", "mxfp8_lhs_gradient", "mxfp8_rhs_gradient"], mxfp8, mxfp8_lhs, mxfp8_rhs, mxfp8_seed, None),
     ] {
-        let function = block_scaled_dot::<EagerContext<Array, ArrayOperation<Array>>>(configuration)?;
+        let function = block_scaled_dot::<EagerContext<CoreArray, ArrayOperation<CoreArray>>>(configuration)?;
         let (output, (lhs_gradient, rhs_gradient)) = match global_scale {
             Some(global_scale) => {
                 let (output, pullback) = differentiate_at((lhs, rhs))
@@ -690,9 +692,9 @@ fn emit_block_scaled_dot() -> Result<DifferentialObservation, Box<dyn Error>> {
             observations.insert(name, values(value));
         }
     }
-    let function = block_scaled_dot::<ProjectedContext<XlaDomain<'static>, ArrayType>>(nvfp4)?;
-    let traced: TracedXlaProgram<(ArrayType, ArrayType, ArrayType), (ArrayType, ArrayType, ArrayType)> = trace(
-        move |(lhs, rhs, seed): (XlaArrayTracer, XlaArrayTracer, XlaArrayTracer)| {
+    let function = block_scaled_dot::<ProjectedContext<Domain<'static>, ArrayType>>(nvfp4)?;
+    let traced: TracedProgram<(ArrayType, ArrayType, ArrayType), (ArrayType, ArrayType, ArrayType)> = trace(
+        move |(lhs, rhs, seed): (ArrayTracer, ArrayTracer, ArrayTracer)| {
             let (output, pullback) = differentiate_at((lhs, rhs))
                 .vjp(|(lhs, rhs)| function.call(lhs, rhs, None, None, None, None))
                 .unwrap();
@@ -727,33 +729,33 @@ fn emit_dot_product_attention() -> Result<DifferentialObservation, Box<dyn Error
         .with_local_window((1, 0))
         .with_residual(true);
     let inputs = AttentionInputs {
-        query: Array::from_elements::<f32>(query_type.clone(), &[0.0; 4])?,
-        key: Array::from_elements::<f32>(key_value_type.clone(), &[0.0; 2])?,
-        value: Array::from_elements::<f32>(key_value_type.clone(), &[3.0, 9.0])?,
-        bias: Some(Array::from_elements::<f32>(bias_type.clone(), &[0.0])?),
-        mask: Some(Array::from_elements(mask_type.clone(), &[true, false, false, true])?),
-        query_sequence_lengths: Some(Array::from_elements(lengths_type.clone(), &[2_i32])?),
-        key_value_sequence_lengths: Some(Array::from_elements(lengths_type.clone(), &[2_i32])?),
+        query: CoreArray::from_elements::<f32>(query_type.clone(), &[0.0; 4])?,
+        key: CoreArray::from_elements::<f32>(key_value_type.clone(), &[0.0; 2])?,
+        value: CoreArray::from_elements::<f32>(key_value_type.clone(), &[3.0, 9.0])?,
+        bias: Some(CoreArray::from_elements::<f32>(bias_type.clone(), &[0.0])?),
+        mask: Some(CoreArray::from_elements(mask_type.clone(), &[true, false, false, true])?),
+        query_sequence_lengths: Some(CoreArray::from_elements(lengths_type.clone(), &[2_i32])?),
+        key_value_sequence_lengths: Some(CoreArray::from_elements(lengths_type.clone(), &[2_i32])?),
         dropout_state: None,
     };
     let (output, residual) =
-        dot_product_attention::<EagerContext<Array, ArrayOperation<Array>>>(configuration).call(inputs)?;
-    let values = |value: Array| vec![value.to_f64s().into_iter().map(|value| value as f32).collect::<Vec<_>>()];
+        dot_product_attention::<EagerContext<CoreArray, ArrayOperation<CoreArray>>>(configuration).call(inputs)?;
+    let values = |value: CoreArray| vec![value.to_f64s().into_iter().map(|value| value as f32).collect::<Vec<_>>()];
     let gqa_query_type = ArrayType::new_static(DataType::F32, [1, 2, 4, 1]);
     let gqa_key_value_type = ArrayType::new_static(DataType::F32, [1, 3, 2, 1]);
-    let (gqa_output, _) = dot_product_attention::<EagerContext<Array, ArrayOperation<Array>>>(
+    let (gqa_output, _) = dot_product_attention::<EagerContext<CoreArray, ArrayOperation<CoreArray>>>(
         AttentionConfiguration::new()
             .with_local_window((1, 1))
             .with_implementation(AttentionImplementation::Portable),
     )
     .call(AttentionInputs {
-        query: Array::from_elements::<f32>(gqa_query_type, &[0.0; 8])?,
-        key: Array::from_elements::<f32>(gqa_key_value_type.clone(), &[0.0; 6])?,
-        value: Array::from_elements::<f32>(gqa_key_value_type, &[1.0, 10.0, 2.0, 20.0, 4.0, 40.0])?,
+        query: CoreArray::from_elements::<f32>(gqa_query_type, &[0.0; 8])?,
+        key: CoreArray::from_elements::<f32>(gqa_key_value_type.clone(), &[0.0; 6])?,
+        value: CoreArray::from_elements::<f32>(gqa_key_value_type, &[1.0, 10.0, 2.0, 20.0, 4.0, 40.0])?,
         bias: None,
         mask: None,
         query_sequence_lengths: None,
-        key_value_sequence_lengths: Some(Array::from_elements(lengths_type.clone(), &[2_i32])?),
+        key_value_sequence_lengths: Some(CoreArray::from_elements(lengths_type.clone(), &[2_i32])?),
         dropout_state: None,
     })?;
     let observations = BTreeMap::from([
@@ -761,19 +763,19 @@ fn emit_dot_product_attention() -> Result<DifferentialObservation, Box<dyn Error
         ("residual", values(residual.expect("the configuration requests a residual"))),
         ("rank_four_gqa", values(gqa_output)),
     ]);
-    let attention = dot_product_attention::<ProjectedContext<XlaDomain<'static>, ArrayType>>(configuration);
-    let traced: TracedXlaProgram<
+    let attention = dot_product_attention::<ProjectedContext<Domain<'static>, ArrayType>>(configuration);
+    let traced: TracedProgram<
         (ArrayType, ArrayType, ArrayType, ArrayType, ArrayType, ArrayType, ArrayType),
         (ArrayType, ArrayType),
     > = trace(
         move |(query, key, value, bias, mask, query_sequence_lengths, key_value_sequence_lengths): (
-            XlaArrayTracer,
-            XlaArrayTracer,
-            XlaArrayTracer,
-            XlaArrayTracer,
-            XlaArrayTracer,
-            XlaArrayTracer,
-            XlaArrayTracer,
+            ArrayTracer,
+            ArrayTracer,
+            ArrayTracer,
+            ArrayTracer,
+            ArrayTracer,
+            ArrayTracer,
+            ArrayTracer,
         )| {
             let (output, residual) = attention
                 .call(AttentionInputs {
@@ -803,10 +805,10 @@ fn emit_dot_product_attention() -> Result<DifferentialObservation, Box<dyn Error
 /// Emits dynamic slicing values at negative and out-of-range starts under both negative-index policies, plus the
 /// StableHLO of a traced dynamic slice whose signed start wraps before the native clamp.
 fn emit_negative_dynamic_slice() -> Result<DifferentialObservation, Box<dyn Error>> {
-    let vector = Array::vector(vec![10.0_f32, 20.0, 30.0, 40.0])?;
-    let update = Array::vector(vec![1.0_f32, 2.0])?;
-    let start = |value: i32| -> Result<Array, ProgramError> { Array::scalar(value) };
-    let values = |value: Array| vec![value.to_f64s().into_iter().map(|value| value as f32).collect::<Vec<_>>()];
+    let vector = CoreArray::vector(vec![10.0_f32, 20.0, 30.0, 40.0])?;
+    let update = CoreArray::vector(vec![1.0_f32, 2.0])?;
+    let start = |value: i32| -> Result<CoreArray, ProgramError> { CoreArray::scalar(value) };
+    let values = |value: CoreArray| vec![value.to_f64s().into_iter().map(|value| value as f32).collect::<Vec<_>>()];
     let observations = BTreeMap::from([
         ("slice_minus_one", values(vector.dynamic_slice(&[start(-1)?], &[2])?)),
         ("slice_minus_nine", values(vector.dynamic_slice(&[start(-9)?], &[2])?)),
@@ -819,8 +821,8 @@ fn emit_negative_dynamic_slice() -> Result<DifferentialObservation, Box<dyn Erro
             values(vector.dynamic_update_slice_with_negative_indices(&update, &[start(-1)?], false)?),
         ),
     ]);
-    let traced: TracedXlaProgram<(ArrayType, ArrayType), ArrayType> = trace(
-        |(input, start): (XlaArrayTracer, XlaArrayTracer)| input.dynamic_slice(&[start], &[2]).unwrap(),
+    let traced: TracedProgram<(ArrayType, ArrayType), ArrayType> = trace(
+        |(input, start): (ArrayTracer, ArrayTracer)| input.dynamic_slice(&[start], &[2]).unwrap(),
         (ArrayType::new_static(DataType::F32, [4]), ArrayType::scalar(DataType::I32)),
     )?;
     Ok(DifferentialObservation {
@@ -844,11 +846,11 @@ fn emit_condition_varying_predicate_gradient() -> Result<DifferentialObservation
     let (client, device_mesh, sharded) = collective_runtime()?;
     let mesh = device_mesh.logical_mesh().clone();
     let replicated = Sharding::replicated(mesh.clone(), 1);
-    let traced: TracedXlaProgram<Vec<ArrayType>, Vec<ArrayType>> = trace(
+    let traced: TracedProgram<Vec<ArrayType>, Vec<ArrayType>> = trace(
         {
             let replicated = replicated.clone();
             let sharded = sharded.clone();
-            move |inputs: Vec<XlaArrayTracer>| {
+            move |inputs: Vec<ArrayTracer>| {
                 let (value, gradients) = inputs[0]
                     .clone()
                     .into_value()
@@ -858,7 +860,7 @@ fn emit_condition_varying_predicate_gradient() -> Result<DifferentialObservation
                         let weight = ValueProjection::<ArrayType>::into_projected(weight)?;
                         let values = ValueProjection::<ArrayType>::into_projected(values)?;
                         Ok(shard_map(
-                            |(weight, values): (XlaArrayTracer, XlaArrayTracer)| {
+                            |(weight, values): (ArrayTracer, ArrayTracer)| {
                                 let sum = values.reduce(&[0], ReductionKind::Sum)?;
                                 let predicate = sum.compare(&sum.zero_like()?, ComparisonDirection::GreaterThan)?;
                                 let mut outputs = predicate.into_value().condition(

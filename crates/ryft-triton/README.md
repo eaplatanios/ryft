@@ -64,7 +64,7 @@ let compiled = verified.compile(&compiler, &target, &options, &schedule)?;
 ```
 
 For XLA, enable the `triton` feature and pass these choices with `TritonEmbedding` to
-`XlaKernelCompilerBinding::new`, then select the binding through `XlaOptions::with_kernel_compiler`. The root `ryft`
+`KernelCompilerBinding::new`, then select the binding through `Options::with_kernel_compiler`. The root `ryft`
 crate forwards this feature. Compiler and target selection are explicit. `ryft_kernels` has no Triton or AMD
 operation family, and the macro-authored portable definition is unchanged.
 

@@ -1,7 +1,7 @@
 use ryft_core::macros::check_count;
 use ryft_core::{
-    ArrayIrType, ArrayType, AtomId, CaptureReference, ComparisonDirection, DataType, Dimension, DimensionValue, Layout,
-    ProgramError, Shape, Type as RyftType,
+    ArrayIrType, ArrayType, AtomId, CaptureReference, ComparisonDirection, DataType, Dimension as CoreDimension,
+    DimensionValue, Layout, ProgramError, Shape, Type as RyftType,
 };
 use ryft_mlir::dialects::stable_hlo;
 use ryft_mlir::{
@@ -11,7 +11,7 @@ use ryft_mlir::{
 };
 
 use crate::experimental::lowering::{LoweringError, MlirLowerableValue};
-use crate::experimental::ops::{XlaArrayConstant, XlaConstant};
+use crate::experimental::ops::{ArrayConstant, Constant};
 use crate::operations::comparisons::lower_compare_to_mlir;
 use crate::operations::manipulation::memory::annotate_output_memory;
 use crate::{ArrayError, Error, ToPjrt};
@@ -58,17 +58,18 @@ pub(crate) fn physical_bound_type(r#type: &ArrayType) -> Result<ArrayType, Error
         .dimensions()
         .iter()
         .map(|dimension| match dimension {
-            Dimension::Static(extent) => Ok(Dimension::Static(*extent)),
-            Dimension::Dynamic(variable) => {
-                variable.bounds().upper().and_then(|upper| upper.checked_sub(1)).map(Dimension::Static).ok_or_else(
-                    || {
-                        Error::Lowering(LoweringError::UnsupportedOperation {
-                            operation: "physical_bound_type".to_string(),
-                            reason: format!("dynamic dimension {variable} needs a finite positive physical bound"),
-                        })
-                    },
-                )
-            }
+            CoreDimension::Static(extent) => Ok(CoreDimension::Static(*extent)),
+            CoreDimension::Dynamic(variable) => variable
+                .bounds()
+                .upper()
+                .and_then(|upper| upper.checked_sub(1))
+                .map(CoreDimension::Static)
+                .ok_or_else(|| {
+                    Error::Lowering(LoweringError::UnsupportedOperation {
+                        operation: "physical_bound_type".to_string(),
+                        reason: format!("dynamic dimension {variable} needs a finite positive physical bound"),
+                    })
+                }),
         })
         .collect::<Result<Vec<_>, Error>>()?;
     Ok(r#type.clone().with_shape(Shape::new(dimensions)))
@@ -107,7 +108,7 @@ pub(crate) fn lower_physical_bound_value_with_padding<'b, 'c: 'b, 't: 'c>(
         .iter()
         .enumerate()
         .map(|(axis, dimension)| {
-            if matches!(dimension, Dimension::Static(_)) {
+            if matches!(dimension, CoreDimension::Static(_)) {
                 return Ok(None);
             }
             let size = block.append_operation(stable_hlo::get_dimension_size(value, axis, location)?)?;
@@ -119,7 +120,7 @@ pub(crate) fn lower_physical_bound_value_with_padding<'b, 'c: 'b, 't: 'c>(
     let mut data = value;
     let mut physicalized_dimensions = r#type.shape().dimensions().to_vec();
     for (axis, dimension) in r#type.shape().dimensions().iter().enumerate() {
-        if matches!(dimension, Dimension::Static(_)) {
+        if matches!(dimension, CoreDimension::Static(_)) {
             continue;
         }
         let physical_extent = physical_type.shape().dimensions()[axis].value().unwrap();
@@ -127,7 +128,7 @@ pub(crate) fn lower_physical_bound_value_with_padding<'b, 'c: 'b, 't: 'c>(
         let elements = context.dense_i32_elements_attribute(size_type, &[extent])?;
         let size = block.append_operation(stable_hlo::constant(elements, location)?)?;
         let size = size.result(0).expect("stablehlo.constant should return one result").as_ref();
-        physicalized_dimensions[axis] = Dimension::Static(physical_extent);
+        physicalized_dimensions[axis] = CoreDimension::Static(physical_extent);
         let physicalized_type = r#type.clone().with_shape(Shape::new(physicalized_dimensions.clone()));
         let physicalized = block.append_operation(stable_hlo::set_dimension_size(
             data,
@@ -142,7 +143,7 @@ pub(crate) fn lower_physical_bound_value_with_padding<'b, 'c: 'b, 't: 'c>(
     let index_tensor_type = lower_tensor_type(&index_type, context, location)?;
     let mut in_bounds = None;
     for (axis, dimension) in r#type.shape().dimensions().iter().enumerate() {
-        if matches!(dimension, Dimension::Static(_)) {
+        if matches!(dimension, CoreDimension::Static(_)) {
             continue;
         }
         let indices = block.append_operation(stable_hlo::iota(index_tensor_type, axis, location)?)?;
@@ -200,7 +201,7 @@ pub(crate) fn lower_restore_dynamic_dimensions<'b, 'c: 'b, 't: 'c>(
     }
     let mut dimensions = physical_bound_type(output_type)?.shape().dimensions().to_vec();
     for (axis, dimension) in output_type.shape().dimensions().iter().enumerate() {
-        if matches!(dimension, Dimension::Static(_)) {
+        if matches!(dimension, CoreDimension::Static(_)) {
             continue;
         }
         let size =
@@ -235,7 +236,7 @@ pub(crate) fn lower_physical_storage<'b, 'c: 'b, 't: 'c>(
     let mut dimensions = r#type.shape().dimensions().to_vec();
     let mut value = value;
     for (axis, dimension) in r#type.shape().dimensions().iter().enumerate() {
-        if matches!(dimension, Dimension::Static(_)) {
+        if matches!(dimension, CoreDimension::Static(_)) {
             continue;
         }
         let bound = physical_type.shape().dimensions()[axis].value().unwrap();
@@ -247,7 +248,7 @@ pub(crate) fn lower_physical_storage<'b, 'c: 'b, 't: 'c>(
             location,
         )?
         .remove(0);
-        dimensions[axis] = Dimension::Static(bound);
+        dimensions[axis] = CoreDimension::Static(bound);
         let exposed_type = r#type.clone().with_shape(Shape::new(dimensions.clone()));
         let exposed = block.append_operation(stable_hlo::set_dimension_size(
             value,
@@ -367,8 +368,10 @@ pub(crate) fn static_dimensions(array_type: &ArrayType) -> Result<Vec<usize>, Er
         .dimensions()
         .iter()
         .map(|size| match size {
-            Dimension::Static(value) => Ok(*value),
-            Dimension::Dynamic(_) => Err(Error::from(ArrayError::DynamicShape { shape: array_type.shape().clone() })),
+            CoreDimension::Static(value) => Ok(*value),
+            CoreDimension::Dynamic(_) => {
+                Err(Error::from(ArrayError::DynamicShape { shape: array_type.shape().clone() }))
+            }
         })
         .collect()
 }
@@ -405,7 +408,7 @@ pub(crate) fn lower_captured_constant<'b, 'c: 'b, 't: 'c, T: RyftType>(
 }
 
 /// Lowers one first-class dimension extent to the scalar `i64` [`stablehlo.constant`](stable_hlo::constant) that
-/// represents a dimension in StableHLO. Immediate [`XlaConstant::Dimension`] atoms and staged
+/// represents a dimension in StableHLO. Immediate [`Constant::Dimension`] atoms and staged
 /// [`DimensionOperation::Constant`](ryft_core::DimensionOperation::Constant) instructions must agree on this
 /// representation, and so both lowering paths route through this function.
 pub(crate) fn lower_dimension_extent<'b, 'c: 'b, 't: 'c, B, L>(
@@ -430,7 +433,7 @@ where
 /// exactly what makes extents usable inside a `shard_map` manual region, where no capture table is reachable.
 pub(crate) fn lower_constant<'b, 'c: 'b, 't: 'c, B, L>(
     _atom_id: AtomId,
-    value: &XlaConstant,
+    value: &Constant,
     captured_values: &[ValueRef<'b, 'c, 't>],
     block: &mut B,
     context: &'c MlirContext<'t>,
@@ -441,11 +444,9 @@ where
     L: Copy + Location<'c, 't>,
 {
     match value {
-        XlaConstant::Captured(value) => lower_captured_constant(value, captured_values),
-        XlaConstant::Dimension(value) => lower_dimension_extent(value, block, context, location),
-        XlaConstant::Boolean(value) => {
-            lower_literal_value(&XlaArrayConstant::Boolean(*value), block, context, location)
-        }
+        Constant::Captured(value) => lower_captured_constant(value, captured_values),
+        Constant::Dimension(value) => lower_dimension_extent(value, block, context, location),
+        Constant::Boolean(value) => lower_literal_value(&ArrayConstant::Boolean(*value), block, context, location),
     }
 }
 
@@ -533,8 +534,8 @@ pub(crate) fn lower_tensor_type<'c, 't, L: Location<'c, 't>>(
         .dimensions()
         .iter()
         .map(|size| match size {
-            Dimension::Static(value) => MlirSize::Static(*value),
-            Dimension::Dynamic(_) => MlirSize::Dynamic,
+            CoreDimension::Static(value) => MlirSize::Static(*value),
+            CoreDimension::Dynamic(_) => MlirSize::Dynamic,
         })
         .collect::<Vec<_>>();
     let bounds = array_type.shape().dimensions().iter().map(stable_hlo_dynamic_dimension_bound).collect::<Vec<_>>();
@@ -548,10 +549,10 @@ pub(crate) fn lower_tensor_type<'c, 't, L: Location<'c, 't>>(
 }
 
 /// Converts a Ryft exclusive dynamic dimension bound to StableHLO's inclusive maximum dimension size.
-pub(crate) fn stable_hlo_dynamic_dimension_bound(size: &Dimension) -> Option<usize> {
+pub(crate) fn stable_hlo_dynamic_dimension_bound(size: &CoreDimension) -> Option<usize> {
     match size {
-        Dimension::Static(_) => None,
-        Dimension::Dynamic(variable) => variable.bounds().upper().and_then(|upper| upper.checked_sub(1)),
+        CoreDimension::Static(_) => None,
+        CoreDimension::Dynamic(variable) => variable.bounds().upper().and_then(|upper| upper.checked_sub(1)),
     }
 }
 
@@ -871,14 +872,14 @@ mod tests {
     use pretty_assertions::assert_eq;
     use ryft_core::{ConvertElementTypeOperation, Placeholder};
 
-    use crate::experimental::lowering::tests::{XlaProgramBuilder, dynamic_dimension};
+    use crate::experimental::lowering::tests::{ProgramBuilder, dynamic_dimension};
     use crate::experimental::lowering::to_mlir_module_for_plain_program;
 
     use super::*;
 
     #[test]
     fn test_lower_signed_one_bit_to_mlir() {
-        let mut builder = XlaProgramBuilder::new();
+        let mut builder = ProgramBuilder::new();
         let input =
             builder.add_input(ArrayType::new(DataType::I1, Shape::new(vec![dynamic_dimension("size", Some(6))])));
         let output = builder
@@ -890,7 +891,7 @@ mod tests {
             )
             .unwrap()[0];
         let program = builder
-            .build::<Vec<XlaArrayConstant>, Vec<XlaArrayConstant>>(vec![output], vec![Placeholder], vec![Placeholder])
+            .build::<Vec<ArrayConstant>, Vec<ArrayConstant>>(vec![output], vec![Placeholder], vec![Placeholder])
             .unwrap();
         // Widening retains the physical bound as well as the runtime dimension before recovering the signed value.
         assert_eq!(
@@ -964,7 +965,7 @@ mod tests {
 
     #[test]
     fn test_stable_hlo_dynamic_dimension_bound_converts_exclusive_bounds() {
-        assert_eq!(stable_hlo_dynamic_dimension_bound(&Dimension::Static(4)), None);
+        assert_eq!(stable_hlo_dynamic_dimension_bound(&CoreDimension::Static(4)), None);
         assert_eq!(stable_hlo_dynamic_dimension_bound(&dynamic_dimension("unbounded", None)), None);
         assert_eq!(stable_hlo_dynamic_dimension_bound(&dynamic_dimension("bounded", Some(6))), Some(5));
     }

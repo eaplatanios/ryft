@@ -3,8 +3,8 @@ use std::fmt::Display;
 use std::hash::{Hash, Hasher};
 
 use ryft_core::{
-    AbsOperation, AddOperation, AndOperation, ArgMaxOperation, ArgMinOperation, Array, ArrayIrOperation, ArrayIrType,
-    ArrayOperation, ArrayReferenceTransform, ArrayType, AssertOperation, AssertionValue, Atan2Operation,
+    AbsOperation, AddOperation, AndOperation, ArgMaxOperation, ArgMinOperation, Array as CoreArray, ArrayIrOperation,
+    ArrayIrType, ArrayOperation, ArrayReferenceTransform, ArrayType, AssertOperation, AssertionValue, Atan2Operation,
     AxisIndexOperation, BroadcastOperation, CaptureConstant, CaptureReference, CastOperation, CeilOperation,
     ClampOperation, CompareOperation, ComplexOperation, CompositeConversion, CompositeOperation,
     CompositeTransposeOperation, ConcatenateOperation, Concretizable, ConditionOperation, ConjugateOperation,
@@ -16,32 +16,32 @@ use ryft_core::{
     DynamicSliceOperation, DynamicUpdateSliceOperation, EagerContext, ErfOperation, ExpM1Operation, ExpOperation,
     FloorOperation, GatherOperation, GuardOperation, ImaginaryOperation, IotaOperation, LiftedCustomRules,
     LinearCallOperation, LiteralIdentity, Ln1pOperation, LogAddExpOperation, LogOperation, LogisticOperation,
-    MaxOperation, MinOperation, MulOperation, NegOperation, NotOperation, OneLikeOperation, OneOperation, Operation,
-    OperationProvider, OrOperation, PadOperation, ParallelAllGatherOperation, ParallelAllToAllOperation,
-    ParallelPermuteOperation, ParallelRaggedAllToAllOperation, ParallelReduceOperation, ParallelSumScatterOperation,
-    ParallelVaryOperation, Parameter, PowOperation, PrintOperation, Program, ProgramBuilder, ProgramError,
-    ProjectedValue, RaggedDotOperation, RealOperation, ReduceOperation, ReducePrecisionOperation,
-    ReferenceAccessDescriptor, ReferenceAccessOperation, ReferenceAddUpdateOperation,
-    ReferenceAtomicAddUpdateOperation, ReferenceFreezeOperation, ReferenceNewOperation, ReferenceReadOperation,
-    ReferenceSwapOperation, ReferenceWriteOperation, RemOperation, RematerializeOperation, ReshapeOperation,
-    ReshardOperation, RngBitGeneratorOperation, RoundOperation, RsqrtOperation, SaturatingSubOperation,
-    ScaledDotOperation, ScanOperation, ScatterOperation, SelectOperation, ShardMapOperation, SignOperation,
-    SinOperation, SliceOperation, SortOperation, SqrtOperation, StopGradientOperation, SubOperation, TagOperation,
-    TanOperation, TanhOperation, TransferToMemoryOperation, TransposeOperation, Type, TypeError, TypeIdentityRenaming,
-    Typed, UnavailableCustomRules, UpdateSliceOperation, Value, ValueDirectDispatch, ValueProjection, WhileOperation,
-    XorOperation, ZeroLikeOperation, ZeroOperation,
+    MaxOperation, MinOperation, MulOperation, NegOperation, NotOperation, OneLikeOperation, OneOperation,
+    Operation as CoreOperation, OperationProvider, OrOperation, PadOperation, ParallelAllGatherOperation,
+    ParallelAllToAllOperation, ParallelPermuteOperation, ParallelRaggedAllToAllOperation, ParallelReduceOperation,
+    ParallelSumScatterOperation, ParallelVaryOperation, Parameter, PowOperation, PrintOperation,
+    Program as CoreProgram, ProgramBuilder as CoreProgramBuilder, ProgramError, ProjectedValue, RaggedDotOperation,
+    RealOperation, ReduceOperation, ReducePrecisionOperation, ReferenceAccessDescriptor, ReferenceAccessOperation,
+    ReferenceAddUpdateOperation, ReferenceAtomicAddUpdateOperation, ReferenceFreezeOperation, ReferenceNewOperation,
+    ReferenceReadOperation, ReferenceSwapOperation, ReferenceWriteOperation, RemOperation, RematerializeOperation,
+    ReshapeOperation, ReshardOperation, RngBitGeneratorOperation, RoundOperation, RsqrtOperation,
+    SaturatingSubOperation, ScaledDotOperation, ScanOperation, ScatterOperation, SelectOperation, ShardMapOperation,
+    SignOperation, SinOperation, SliceOperation, SortOperation, SqrtOperation, StopGradientOperation, SubOperation,
+    TagOperation, TanOperation, TanhOperation, TransferToMemoryOperation, TransposeOperation, Type, TypeError,
+    TypeIdentityRenaming, Typed, UnavailableCustomRules, UpdateSliceOperation, Value as CoreValue, ValueDirectDispatch,
+    ValueProjection, WhileOperation, XorOperation, ZeroLikeOperation, ZeroOperation,
 };
 use ryft_kernels::KernelReferenceOperation;
 use ryft_macros::Parameter;
 
-use crate::kernels::XlaKernelOperation;
+use crate::kernels::KernelOperation;
 use crate::operations::jit_call::JitCallOperation;
 
 /// Array constants retained by staged XLA programs. Captures refer to the enclosing capture table; Boolean
 /// literals preserve dimension-comparison proofs without allocating device storage or introducing a capture.
 /// Projection onto [`ArrayType`] is the identity and preserves both representations unchanged.
 #[derive(Clone, Debug, PartialEq, Eq, Hash, Parameter)]
-pub enum XlaArrayConstant {
+pub enum ArrayConstant {
     /// A reference to array data in the enclosing capture table.
     Captured(CaptureReference<ArrayType>),
 
@@ -49,13 +49,13 @@ pub enum XlaArrayConstant {
     Boolean(bool),
 }
 
-impl From<CaptureReference<ArrayType>> for XlaArrayConstant {
+impl From<CaptureReference<ArrayType>> for ArrayConstant {
     fn from(value: CaptureReference<ArrayType>) -> Self {
         Self::Captured(value)
     }
 }
 
-impl TryFrom<bool> for XlaArrayConstant {
+impl TryFrom<bool> for ArrayConstant {
     type Error = ProgramError;
 
     fn try_from(value: bool) -> Result<Self, ProgramError> {
@@ -63,7 +63,7 @@ impl TryFrom<bool> for XlaArrayConstant {
     }
 }
 
-impl Display for XlaArrayConstant {
+impl Display for ArrayConstant {
     fn fmt(&self, formatter: &mut std::fmt::Formatter<'_>) -> std::fmt::Result {
         match self {
             Self::Captured(value) => Display::fmt(value, formatter),
@@ -72,7 +72,7 @@ impl Display for XlaArrayConstant {
     }
 }
 
-impl Typed for XlaArrayConstant {
+impl Typed for ArrayConstant {
     type Type = ArrayType;
 
     fn r#type(&self) -> Cow<'_, ArrayType> {
@@ -83,7 +83,7 @@ impl Typed for XlaArrayConstant {
     }
 }
 
-impl Value for XlaArrayConstant {
+impl CoreValue for ArrayConstant {
     type Dispatch = ValueDirectDispatch;
     type Domain = EagerContext<Self>;
 
@@ -109,7 +109,7 @@ impl Value for XlaArrayConstant {
     }
 }
 
-impl ValueProjection<ArrayType> for XlaArrayConstant {
+impl ValueProjection<ArrayType> for ArrayConstant {
     type Projected = Self;
     type ProjectedRef<'v> = &'v Self;
 
@@ -132,7 +132,7 @@ impl ValueProjection<ArrayType> for XlaArrayConstant {
     }
 }
 
-impl CaptureConstant for XlaArrayConstant {
+impl CaptureConstant for ArrayConstant {
     fn map_capture_index<F: FnOnce(usize) -> usize>(&self, map: F) -> Self {
         match self {
             Self::Captured(value) => Self::Captured(value.map_capture_index(map)),
@@ -141,7 +141,7 @@ impl CaptureConstant for XlaArrayConstant {
     }
 }
 
-impl Concretizable<bool> for XlaArrayConstant {
+impl Concretizable<bool> for ArrayConstant {
     fn concretize(&self) -> Result<bool, ProgramError> {
         match self {
             Self::Captured(value) => value.concretize(),
@@ -150,11 +150,11 @@ impl Concretizable<bool> for XlaArrayConstant {
     }
 }
 
-impl AssertionValue for XlaArrayConstant {
-    fn assertion_array(&self) -> Result<Option<Array>, ProgramError> {
+impl AssertionValue for ArrayConstant {
+    fn assertion_array(&self) -> Result<Option<CoreArray>, ProgramError> {
         match self {
             Self::Captured(value) => value.assertion_array(),
-            Self::Boolean(value) => Ok(Some(Array::scalar(*value)?)),
+            Self::Boolean(value) => Ok(Some(CoreArray::scalar(*value)?)),
         }
     }
 
@@ -166,7 +166,7 @@ impl AssertionValue for XlaArrayConstant {
     }
 }
 
-/// Constant payload stored in the atom table of a staged XLA [`Program`].
+/// Constant payload stored in the atom table of a staged XLA [`CoreProgram`](ryft_core::Program).
 ///
 /// Staged XLA programs keep three kinds of constants apart, and this sum is the staged counterpart of the eager
 /// [`ArrayIrValue`](ryft_core::ArrayIrValue) universe:
@@ -183,7 +183,7 @@ impl AssertionValue for XlaArrayConstant {
 ///   - **Immediate Boolean predicates:** static dimension proofs remain concrete through array projection, logical
 ///     composition, and assertion folding without requiring a captured device buffer.
 #[derive(Clone, Debug, PartialEq, Eq, Hash, Parameter)]
-pub enum XlaConstant {
+pub enum Constant {
     /// Reference to a value held in the surrounding compiled function's capture table.
     Captured(CaptureReference<ArrayIrType>),
 
@@ -194,7 +194,7 @@ pub enum XlaConstant {
     Boolean(bool),
 }
 
-impl Display for XlaConstant {
+impl Display for Constant {
     #[inline]
     fn fmt(&self, formatter: &mut std::fmt::Formatter<'_>) -> std::fmt::Result {
         match self {
@@ -207,7 +207,7 @@ impl Display for XlaConstant {
 
 // XLA program constants carry only immediate scalars and typed capture slots, so their ordinary equality is already
 // exact and serves as their literal identity.
-impl LiteralIdentity for XlaConstant {
+impl LiteralIdentity for Constant {
     #[inline]
     fn literal_eq(&self, other: &Self) -> bool {
         self == other
@@ -219,7 +219,7 @@ impl LiteralIdentity for XlaConstant {
     }
 }
 
-impl Typed for XlaConstant {
+impl Typed for Constant {
     type Type = ArrayIrType;
 
     #[inline]
@@ -232,7 +232,7 @@ impl Typed for XlaConstant {
     }
 }
 
-impl Value for XlaConstant {
+impl CoreValue for Constant {
     type Dispatch = ValueDirectDispatch;
     type Domain = EagerContext<Self>;
 
@@ -262,7 +262,7 @@ impl Value for XlaConstant {
     }
 }
 
-impl CaptureConstant for XlaConstant {
+impl CaptureConstant for Constant {
     #[inline]
     fn map_capture_index<F: FnOnce(usize) -> usize>(&self, map: F) -> Self {
         match self {
@@ -273,15 +273,15 @@ impl CaptureConstant for XlaConstant {
     }
 }
 
-impl ValueProjection<ArrayType> for XlaConstant {
-    type Projected = XlaArrayConstant;
+impl ValueProjection<ArrayType> for Constant {
+    type Projected = ArrayConstant;
     type ProjectedRef<'v> = ProjectedValue<ArrayType, &'v Self>;
 
     #[inline]
-    fn from_projected(value: XlaArrayConstant) -> Self {
+    fn from_projected(value: ArrayConstant) -> Self {
         match value {
-            XlaArrayConstant::Captured(value) => Self::Captured(ValueProjection::<ArrayType>::from_projected(value)),
-            XlaArrayConstant::Boolean(value) => Self::Boolean(value),
+            ArrayConstant::Captured(value) => Self::Captured(ValueProjection::<ArrayType>::from_projected(value)),
+            ArrayConstant::Boolean(value) => Self::Boolean(value),
         }
     }
 
@@ -294,16 +294,16 @@ impl ValueProjection<ArrayType> for XlaConstant {
     }
 
     #[inline]
-    fn into_projected(self) -> Result<XlaArrayConstant, TypeError> {
+    fn into_projected(self) -> Result<ArrayConstant, TypeError> {
         match self {
-            Self::Captured(value) => value.into_projected().map(XlaArrayConstant::Captured),
-            Self::Boolean(value) => Ok(XlaArrayConstant::Boolean(value)),
+            Self::Captured(value) => value.into_projected().map(ArrayConstant::Captured),
+            Self::Boolean(value) => Ok(ArrayConstant::Boolean(value)),
             Self::Dimension(_) => Err(TypeError::invalid("expected array type but got dimension type")),
         }
     }
 }
 
-impl ValueProjection<DimensionType> for XlaConstant {
+impl ValueProjection<DimensionType> for Constant {
     type Projected = DimensionValue;
     type ProjectedRef<'v> = &'v DimensionValue;
 
@@ -334,21 +334,21 @@ impl ValueProjection<DimensionType> for XlaConstant {
     }
 }
 
-impl From<CaptureReference<ArrayIrType>> for XlaConstant {
+impl From<CaptureReference<ArrayIrType>> for Constant {
     #[inline]
     fn from(value: CaptureReference<ArrayIrType>) -> Self {
         Self::Captured(value)
     }
 }
 
-impl From<DimensionValue> for XlaConstant {
+impl From<DimensionValue> for Constant {
     #[inline]
     fn from(value: DimensionValue) -> Self {
         Self::Dimension(value)
     }
 }
 
-impl TryFrom<bool> for XlaConstant {
+impl TryFrom<bool> for Constant {
     type Error = ProgramError;
 
     fn try_from(value: bool) -> Result<Self, ProgramError> {
@@ -356,7 +356,7 @@ impl TryFrom<bool> for XlaConstant {
     }
 }
 
-impl Concretizable<bool> for XlaConstant {
+impl Concretizable<bool> for Constant {
     fn concretize(&self) -> Result<bool, ProgramError> {
         match self {
             Self::Boolean(value) => Ok(*value),
@@ -367,11 +367,11 @@ impl Concretizable<bool> for XlaConstant {
     }
 }
 
-impl AssertionValue for XlaConstant {
-    fn assertion_array(&self) -> Result<Option<Array>, ProgramError> {
+impl AssertionValue for Constant {
+    fn assertion_array(&self) -> Result<Option<CoreArray>, ProgramError> {
         match self {
             Self::Dimension(_) => Ok(None),
-            Self::Boolean(value) => Ok(Some(Array::scalar(*value)?)),
+            Self::Boolean(value) => Ok(Some(CoreArray::scalar(*value)?)),
             Self::Captured(_) => Err(ProgramError::Concretization {
                 message: "cannot read an assertion array from a captured constant reference".to_owned(),
             }),
@@ -396,26 +396,26 @@ impl AssertionValue for XlaConstant {
 /// contain backend-specific operations such as [`jit_call`](JitCallOperation) and
 /// [`shard_map`](ShardMapOperation).
 ///
-/// The [`Operation`] contract, the interpretation and partial-evaluation dispatchers, the forward-mode and
-/// transposition dispatchers, the member operation-family projections, and the payload conversions are all derived.
-/// The variant classes mirror [`ArrayIrOperation`] exactly for the payloads the two families share, so both
-/// dispatchers report identical semantics for every shared member and mixed payload. Only the backend-owned surfaces
-/// stay handwritten: the normalizing conversions that select between a member and a mixed carrier, the zero and
-/// residual-zero providers, the canonical core-operation view used by lowering, and the MLIR lowering dispatch.
+/// The [`CoreOperation`](ryft_core::Operation) contract, the interpretation and partial-evaluation dispatchers, the
+/// forward-mode and transposition dispatchers, the member operation-family projections, and the payload conversions are
+/// all derived. The variant classes mirror [`ArrayIrOperation`] exactly for the payloads the two families share, so
+/// both dispatchers report identical semantics for every shared member and mixed payload. Only the backend-owned
+/// surfaces stay handwritten: the normalizing conversions that select between a member and a mixed carrier, the zero
+/// and residual-zero providers, the canonical core-operation view used by lowering, and the MLIR lowering dispatch.
 #[derive(Clone, Debug, ryft_macros::Operation)]
 #[ryft(
     crate = "ryft_core",
     type(ArrayIrType),
-    constant(Constant),
+    constant(Payload),
     members(ArrayType, structural(DimensionType)),
     dispatch(identity, discharge, batching, differentiation, transposition)
 )]
-pub enum XlaOperation<Constant = XlaConstant>
+pub enum Operation<Payload = Constant>
 where
-    Constant: Value<Type = ArrayIrType> + ValueProjection<ArrayType, Projected: Value<Type = ArrayType>>,
+    Payload: CoreValue<Type = ArrayIrType> + ValueProjection<ArrayType, Projected: CoreValue<Type = ArrayType>>,
 {
     /// Portable kernel instruction whose actual body remains attached until explicit XLA compiler selection.
-    Kernel(XlaKernelOperation),
+    Kernel(KernelOperation),
 
     /// Mixed zero constructor whose explicit first-class dimension operands provide its dynamic result extents.
     /// This variant cannot be represented by the homogeneous array member because its signature crosses member
@@ -434,7 +434,7 @@ where
     /// Homogeneous array operation. Member zero constructors are promoted to their mixed array IR carrier when an
     /// array operation is lifted into this family.
     #[ryft(projected(ArrayType), skip_from)]
-    Array(ArrayOperation<<Constant as ValueProjection<ArrayType>>::Projected>),
+    Array(ArrayOperation<<Payload as ValueProjection<ArrayType>>::Projected>),
 
     /// Homogeneous first-class-dimension operation.
     #[ryft(projected(DimensionType, structural))]
@@ -532,11 +532,11 @@ where
 
     /// Backend-owned composite call whose primal region can contain XLA operations, with either attached rule regions
     /// that can contain XLA operations or retained rules registered in this family, which are traced lazily.
-    Composite(CompositeOperation<Constant, XlaOperation<Constant>>),
+    Composite(CompositeOperation<Payload, Operation<Payload>>),
 
     /// Reverse-mode carrier of a [`Composite`](Self::Composite) call, which transposition replaces with the call's
     /// backward rule.
-    CompositeTranspose(CompositeTransposeOperation<Constant, XlaOperation<Constant>>),
+    CompositeTranspose(CompositeTransposeOperation<Payload, Operation<Payload>>),
 
     /// Differentiation-owned call to an explicitly transposable linear map with ordinary trailing residual operands,
     /// which lowers by inlining its forward region.
@@ -551,11 +551,11 @@ where
     /// call into the [`Composite`](Self::Composite) variant instead.
     LiftedComposite(
         CompositeOperation<
-            Constant,
-            XlaOperation<Constant>,
+            Payload,
+            Operation<Payload>,
             LiftedCustomRules<
-                <Constant as ValueProjection<ArrayType>>::Projected,
-                ArrayOperation<<Constant as ValueProjection<ArrayType>>::Projected>,
+                <Payload as ValueProjection<ArrayType>>::Projected,
+                ArrayOperation<<Payload as ValueProjection<ArrayType>>::Projected>,
             >,
         >,
     ),
@@ -564,11 +564,11 @@ where
     /// the member definition and converted into this family.
     LiftedCompositeTranspose(
         CompositeTransposeOperation<
-            Constant,
-            XlaOperation<Constant>,
+            Payload,
+            Operation<Payload>,
             LiftedCustomRules<
-                <Constant as ValueProjection<ArrayType>>::Projected,
-                ArrayOperation<<Constant as ValueProjection<ArrayType>>::Projected>,
+                <Payload as ValueProjection<ArrayType>>::Projected,
+                ArrayOperation<<Payload as ValueProjection<ArrayType>>::Projected>,
             >,
         >,
     ),
@@ -581,9 +581,9 @@ where
     ShardMap(Box<ShardMapOperation>),
 }
 
-impl<Constant> ReferenceAccessOperation for XlaOperation<Constant>
+impl<Payload> ReferenceAccessOperation for Operation<Payload>
 where
-    Constant: Value<Type = ArrayIrType> + ValueProjection<ArrayType, Projected: Value<Type = ArrayType>>,
+    Payload: CoreValue<Type = ArrayIrType> + ValueProjection<ArrayType, Projected: CoreValue<Type = ArrayType>>,
 {
     type Transform = ArrayReferenceTransform;
 
@@ -649,9 +649,9 @@ where
     }
 }
 
-impl<Constant> KernelReferenceOperation for XlaOperation<Constant>
+impl<Payload> KernelReferenceOperation for Operation<Payload>
 where
-    Constant: Value<Type = ArrayIrType> + ValueProjection<ArrayType, Projected: Value<Type = ArrayType>>,
+    Payload: CoreValue<Type = ArrayIrType> + ValueProjection<ArrayType, Projected: CoreValue<Type = ArrayType>>,
 {
     fn swap_output_index(&self) -> Option<usize> {
         match self {
@@ -661,24 +661,24 @@ where
     }
 }
 
-impl<Constant> From<ArrayOperation<Constant::Projected>> for XlaOperation<Constant>
+impl<Payload> From<ArrayOperation<Payload::Projected>> for Operation<Payload>
 where
-    Constant: Value<Type = ArrayIrType> + ValueProjection<ArrayType, Projected: Value<Type = ArrayType>>,
+    Payload: CoreValue<Type = ArrayIrType> + ValueProjection<ArrayType, Projected: CoreValue<Type = ArrayType>>,
 {
     #[inline]
-    fn from(operation: ArrayOperation<Constant::Projected>) -> Self {
+    fn from(operation: ArrayOperation<Payload::Projected>) -> Self {
         // Delegating to the array IR family's conversion keeps constructor normalization and member control-flow
         // promotion identical across both families: `Condition`, `While`, and `Scan` must become array IR carriers
         // because the projected `Array` variant cannot own array IR regions.
-        ArrayIrOperation::<Constant::Projected>::from(operation).into()
+        ArrayIrOperation::<Payload::Projected>::from(operation).into()
     }
 }
 
-impl<Constant> From<ArrayIrOperation<Constant::Projected>> for XlaOperation<Constant>
+impl<Payload> From<ArrayIrOperation<Payload::Projected>> for Operation<Payload>
 where
-    Constant: Value<Type = ArrayIrType> + ValueProjection<ArrayType, Projected: Value<Type = ArrayType>>,
+    Payload: CoreValue<Type = ArrayIrType> + ValueProjection<ArrayType, Projected: CoreValue<Type = ArrayType>>,
 {
-    fn from(operation: ArrayIrOperation<Constant::Projected>) -> Self {
+    fn from(operation: ArrayIrOperation<Payload::Projected>) -> Self {
         match operation {
             ArrayIrOperation::Zero(operation) => Self::Zero(operation),
             ArrayIrOperation::One(operation) => Self::DynamicOne(operation),
@@ -746,9 +746,9 @@ where
 
 // Dimension constants additionally lift directly, so that generic staging code (e.g., `ExactShape::dimensions`)
 // can bound only `From<ConstantOperation<DimensionValue>>` without naming this family's dimension member.
-impl<Constant> From<ConstantOperation<DimensionValue>> for XlaOperation<Constant>
+impl<Payload> From<ConstantOperation<DimensionValue>> for Operation<Payload>
 where
-    Constant: Value<Type = ArrayIrType> + ValueProjection<ArrayType, Projected: Value<Type = ArrayType>>,
+    Payload: CoreValue<Type = ArrayIrType> + ValueProjection<ArrayType, Projected: CoreValue<Type = ArrayType>>,
 {
     #[inline]
     fn from(operation: ConstantOperation<DimensionValue>) -> Self {
@@ -762,13 +762,13 @@ macro_rules! impl_array_ir_operation_conversion {
     // homogeneous-array payload forms of mixed operations whose canonical array IR payload is type-promoted.
     ($($operation:ty),+ $(,)?) => {
         $(
-            impl<Constant> From<$operation> for XlaOperation<Constant>
+            impl<Payload> From<$operation> for Operation<Payload>
             where
-                Constant: Value<Type = ArrayIrType> + ValueProjection<ArrayType, Projected: Value<Type = ArrayType>>,
+                Payload: CoreValue<Type = ArrayIrType> + ValueProjection<ArrayType, Projected: CoreValue<Type = ArrayType>>,
             {
                 #[inline]
                 fn from(operation: $operation) -> Self {
-                    ArrayIrOperation::<Constant::Projected>::from(operation).into()
+                    ArrayIrOperation::<Payload::Projected>::from(operation).into()
                 }
             }
         )+
@@ -803,13 +803,13 @@ macro_rules! impl_array_operation_conversion {
     // Generates homogeneous array-operation conversions through the canonical projected member family.
     ($($operation:ty),+ $(,)?) => {
         $(
-            impl<Constant> From<$operation> for XlaOperation<Constant>
+            impl<Payload> From<$operation> for Operation<Payload>
             where
-                Constant: Value<Type = ArrayIrType> + ValueProjection<ArrayType, Projected: Value<Type = ArrayType>>,
+                Payload: CoreValue<Type = ArrayIrType> + ValueProjection<ArrayType, Projected: CoreValue<Type = ArrayType>>,
             {
                 #[inline]
                 fn from(operation: $operation) -> Self {
-                    ArrayOperation::<Constant::Projected>::from(operation).into()
+                    ArrayOperation::<Payload::Projected>::from(operation).into()
                 }
             }
         )+
@@ -819,7 +819,7 @@ macro_rules! impl_array_operation_conversion {
 impl_array_operation_conversion!(
     ZeroLikeOperation<ArrayType>,
     OneLikeOperation<ArrayType>,
-    ConstantOperation<Array>,
+    ConstantOperation<CoreArray>,
     AbsOperation<ArrayType>,
     NegOperation<ArrayType>,
     AddOperation<ArrayType>,
@@ -895,92 +895,92 @@ impl_array_operation_conversion!(AssertOperation<ArrayType>);
 impl_array_operation_conversion!(GuardOperation<ArrayType>);
 impl_array_operation_conversion!(CastOperation<ArrayType>);
 
-impl<Constant> OperationProvider<ArrayIrType, ZeroOperation<ArrayIrType>> for XlaOperation<Constant>
+impl<Payload> OperationProvider<ArrayIrType, ZeroOperation<ArrayIrType>> for Operation<Payload>
 where
-    Constant: Value<Type = ArrayIrType> + ValueProjection<ArrayType, Projected: Value<Type = ArrayType>>,
+    Payload: CoreValue<Type = ArrayIrType> + ValueProjection<ArrayType, Projected: CoreValue<Type = ArrayType>>,
 {
     type Operation = Self;
 
     fn provide(request: ZeroOperation<ArrayIrType>, input_types: &[&ArrayIrType]) -> Result<Self, ProgramError> {
-        Ok(ArrayIrOperation::<Constant::Projected>::provide(request, input_types)?.into())
+        Ok(ArrayIrOperation::<Payload::Projected>::provide(request, input_types)?.into())
     }
 }
 
-impl<Constant> OperationProvider<ArrayIrType, OneOperation<ArrayIrType>> for XlaOperation<Constant>
+impl<Payload> OperationProvider<ArrayIrType, OneOperation<ArrayIrType>> for Operation<Payload>
 where
-    Constant: Value<Type = ArrayIrType> + ValueProjection<ArrayType, Projected: Value<Type = ArrayType>>,
+    Payload: CoreValue<Type = ArrayIrType> + ValueProjection<ArrayType, Projected: CoreValue<Type = ArrayType>>,
 {
     type Operation = Self;
 
     fn provide(request: OneOperation<ArrayIrType>, input_types: &[&ArrayIrType]) -> Result<Self, ProgramError> {
-        Ok(ArrayIrOperation::<Constant::Projected>::provide(request, input_types)?.into())
+        Ok(ArrayIrOperation::<Payload::Projected>::provide(request, input_types)?.into())
     }
 }
 
 // Generic cotangent addition requests the dense array member without adding a second Add conversion.
-impl<Constant> OperationProvider<ArrayIrType, AddOperation<ArrayIrType>> for XlaOperation<Constant>
+impl<Payload> OperationProvider<ArrayIrType, AddOperation<ArrayIrType>> for Operation<Payload>
 where
-    Constant: Value<Type = ArrayIrType> + ValueProjection<ArrayType, Projected: Value<Type = ArrayType>>,
+    Payload: CoreValue<Type = ArrayIrType> + ValueProjection<ArrayType, Projected: CoreValue<Type = ArrayType>>,
 {
     type Operation = Self;
 
     #[inline]
     fn provide(request: AddOperation<ArrayIrType>, input_types: &[&ArrayIrType]) -> Result<Self, ProgramError> {
-        Ok(ArrayIrOperation::<Constant::Projected>::provide(request, input_types)?.into())
+        Ok(ArrayIrOperation::<Payload::Projected>::provide(request, input_types)?.into())
     }
 }
 
 // Array IR operations whose generic capabilities bind them through any context lift into the array member exactly as
 // they do in the core array IR family.
-impl<Constant> From<SelectOperation<ArrayIrType>> for XlaOperation<Constant>
+impl<Payload> From<SelectOperation<ArrayIrType>> for Operation<Payload>
 where
-    Constant: Value<Type = ArrayIrType> + ValueProjection<ArrayType, Projected: Value<Type = ArrayType>>,
+    Payload: CoreValue<Type = ArrayIrType> + ValueProjection<ArrayType, Projected: CoreValue<Type = ArrayType>>,
 {
     #[inline]
     fn from(operation: SelectOperation<ArrayIrType>) -> Self {
-        ArrayIrOperation::<Constant::Projected>::from(operation).into()
+        ArrayIrOperation::<Payload::Projected>::from(operation).into()
     }
 }
 
-impl<Constant> From<StopGradientOperation<ArrayIrType>> for XlaOperation<Constant>
+impl<Payload> From<StopGradientOperation<ArrayIrType>> for Operation<Payload>
 where
-    Constant: Value<Type = ArrayIrType> + ValueProjection<ArrayType, Projected: Value<Type = ArrayType>>,
+    Payload: CoreValue<Type = ArrayIrType> + ValueProjection<ArrayType, Projected: CoreValue<Type = ArrayType>>,
 {
     #[inline]
     fn from(operation: StopGradientOperation<ArrayIrType>) -> Self {
-        ArrayIrOperation::<Constant::Projected>::from(operation).into()
+        ArrayIrOperation::<Payload::Projected>::from(operation).into()
     }
 }
 
-impl<Constant> From<TagOperation<ArrayIrType>> for XlaOperation<Constant>
+impl<Payload> From<TagOperation<ArrayIrType>> for Operation<Payload>
 where
-    Constant: Value<Type = ArrayIrType> + ValueProjection<ArrayType, Projected: Value<Type = ArrayType>>,
+    Payload: CoreValue<Type = ArrayIrType> + ValueProjection<ArrayType, Projected: CoreValue<Type = ArrayType>>,
 {
     #[inline]
     fn from(operation: TagOperation<ArrayIrType>) -> Self {
-        ArrayIrOperation::<Constant::Projected>::from(operation).into()
+        ArrayIrOperation::<Payload::Projected>::from(operation).into()
     }
 }
 
-impl<Constant> From<PrintOperation<ArrayIrType>> for XlaOperation<Constant>
+impl<Payload> From<PrintOperation<ArrayIrType>> for Operation<Payload>
 where
-    Constant: Value<Type = ArrayIrType> + ValueProjection<ArrayType, Projected: Value<Type = ArrayType>>,
+    Payload: CoreValue<Type = ArrayIrType> + ValueProjection<ArrayType, Projected: CoreValue<Type = ArrayType>>,
 {
     #[inline]
     fn from(operation: PrintOperation<ArrayIrType>) -> Self {
-        ArrayIrOperation::<Constant::Projected>::from(operation).into()
+        ArrayIrOperation::<Payload::Projected>::from(operation).into()
     }
 }
 
 /// Staged XLA program over an operation family `O`, which defaults to the backend-owned XLA operation universe.
-pub type XlaProgram<Input, Output, O = XlaOperation> = Program<XlaConstant, O, Input, Output>;
+pub type Program<Input, Output, O = Operation> = CoreProgram<Constant, O, Input, Output>;
 
 /// Program builder specialized to the backend-owned XLA op universe.
-pub type XlaProgramBuilder = ProgramBuilder<XlaConstant, XlaOperation>;
+pub type ProgramBuilder = CoreProgramBuilder<Constant, Operation>;
 
 /// Flat XLA program over an operation family `O`, which defaults to the backend-owned XLA operation universe, used for
 /// materialized regions and shared callees.
-pub type FlatXlaProgram<O = XlaOperation> = XlaProgram<Vec<XlaConstant>, Vec<XlaConstant>, O>;
+pub type FlatProgram<O = Operation> = Program<Vec<Constant>, Vec<Constant>, O>;
 
 #[cfg(test)]
 pub(crate) mod tests {
@@ -991,34 +991,34 @@ pub(crate) mod tests {
         AddOperation, ArrayIrOperation, ArrayIrOperations, ArrayIrType, ArrayOperation, ArrayOperations,
         ArrayReferenceTransform, ArrayReferenceTransformIndex, ArrayType, Assert, AssertOperation, CaptureReference,
         CapturingContext, Compare, CompareOperation, ComparisonDirection, CompositeJvpRule, CompositeOperation,
-        CompositeTransposeOperation, ConditionOperation, Context, DataType, DifferentiableType, Dimension,
-        DimensionBounds, DimensionFromScalarOperation, DimensionType, DimensionValue, DimensionVariable,
-        DomainTracingContext, DynamicBroadcastOperation, EffectClass, EffectClasses, ErasedOperation,
-        ExternalReferenceBinding, MaybeZero, Memory, MulOperation, Operation, OperationPayloadProjection,
-        OperationProvider, PartialValue, Placeholder, ProgramBuilder, ProgramError, ReferenceAccessOperation,
-        ReferenceAddUpdateOperation, ReferenceAtomicAddUpdateOperation, ReferenceDischargeResult,
-        ReferenceDischargeTarget, ReferenceFreezeOperation, ReferenceNewOperation, ReferenceReadOperation,
-        ReferenceSource, ReferenceSwapOperation, ReferenceType, ReferenceWriteOperation,
+        CompositeTransposeOperation, ConditionOperation, Context, DataType, DifferentiableType,
+        Dimension as CoreDimension, DimensionBounds, DimensionFromScalarOperation, DimensionType, DimensionValue,
+        DimensionVariable, DomainTracingContext, DynamicBroadcastOperation, EffectClass, EffectClasses,
+        ErasedOperation, ExternalReferenceBinding, MaybeZero, Memory, MulOperation, Operation as CoreOperation,
+        OperationPayloadProjection, OperationProvider, PartialValue, Placeholder, ProgramBuilder as CoreProgramBuilder,
+        ProgramError, ReferenceAccessOperation, ReferenceAddUpdateOperation, ReferenceAtomicAddUpdateOperation,
+        ReferenceDischargeResult, ReferenceDischargeTarget, ReferenceFreezeOperation, ReferenceNewOperation,
+        ReferenceReadOperation, ReferenceSource, ReferenceSwapOperation, ReferenceType, ReferenceWriteOperation,
         RematerializationOptimizationBarrier, RematerializeOperation, ResidualZeroProvider, ScanOperation, Shape,
-        StagingContext, TagOperation, Tracer, TracingContext, TransferToMemoryOperation, TransposedProgramCotangent,
-        TypeError, TypeIdentityRenaming, Typed, TypedProgram, Value, ValueProjection, ValueResolution, WhileOperation,
-        ZeroOperation,
+        StagingContext, TagOperation, Tracer as CoreTracer, TracingContext, TransferToMemoryOperation,
+        TransposedProgramCotangent, TypeError, TypeIdentityRenaming, Typed, TypedProgram, Value as CoreValue,
+        ValueProjection, ValueResolution, WhileOperation, ZeroOperation,
     };
 
-    use crate::XlaArray;
-    use crate::experimental::domains::{XlaDomain, XlaTracer};
-    use crate::experimental::tracing::XlaArrayTracer;
+    use crate::domains::Tracer;
+    use crate::experimental::tracing::ArrayTracer;
+    use crate::{Array, Domain};
 
     use crate::operations::jit_call::JitCallOperation;
 
-    use super::{CaptureConstant, XlaArrayConstant, XlaConstant, XlaOperation, XlaProgram, XlaProgramBuilder};
+    use super::{ArrayConstant, CaptureConstant, Constant, Operation, Program, ProgramBuilder};
 
     pub(crate) fn vector_type() -> ArrayType {
-        ArrayType::new(DataType::F64, Shape::new(vec![Dimension::Static(4)]))
+        ArrayType::new(DataType::F64, Shape::new(vec![CoreDimension::Static(4)]))
     }
 
     #[test]
-    fn test_xla_operation_values_satisfy_the_core_capability_bundles() {
+    fn test_operation_values_satisfy_the_core_capability_bundles() {
         // Each bundle is satisfied exactly when every one of its member capabilities is, so instantiating these
         // functions is a compile-time assertion that the XLA value families expose the complete value-level surface
         // of the operation families they pair with.
@@ -1026,60 +1026,60 @@ pub(crate) mod tests {
         fn requires_array_ir_operations<V: ArrayIrOperations>() {}
         fn requires_dimension_operations<V: ryft_core::DimensionOperations>() {}
 
-        requires_array_operations::<XlaArray<'static>>();
-        requires_array_operations::<XlaArrayTracer>();
-        requires_array_operations::<crate::XlaValue<'static>>();
-        requires_array_ir_operations::<crate::XlaValue<'static>>();
-        requires_dimension_operations::<crate::XlaDimension<'static>>();
-        requires_array_operations::<XlaTracer<'static>>();
-        requires_array_ir_operations::<XlaTracer<'static>>();
-        requires_array_ir_operations::<Tracer<TracingContext<XlaConstant, XlaOperation>>>();
+        requires_array_operations::<Array<'static>>();
+        requires_array_operations::<ArrayTracer>();
+        requires_array_operations::<crate::Value<'static>>();
+        requires_array_ir_operations::<crate::Value<'static>>();
+        requires_dimension_operations::<crate::Dimension<'static>>();
+        requires_array_operations::<Tracer<'static>>();
+        requires_array_ir_operations::<Tracer<'static>>();
+        requires_array_ir_operations::<CoreTracer<TracingContext<Constant, Operation>>>();
     }
 
     #[test]
-    fn test_xla_operation_payload_projection_and_construction() {
+    fn test_operation_payload_projection_and_construction() {
         // Array payloads are reached through the projected array member in both directions, including tags, while
         // native payloads construct their own variants.
         let add = ErasedOperation::new(AddOperation::<ArrayType>::new());
-        let add = XlaOperation::<XlaConstant>::from_payload(add).unwrap();
-        assert!(matches!(add, XlaOperation::Array(ArrayOperation::Add(_))));
+        let add = Operation::<Constant>::from_payload(add).unwrap();
+        assert!(matches!(add, Operation::Array(ArrayOperation::Add(_))));
         assert!(add.projected_payload::<AddOperation<ArrayType>>().is_some());
         let reference = ErasedOperation::new(ReferenceNewOperation::<ArrayType, ArrayIrType>::new());
-        let reference = XlaOperation::<XlaConstant>::from_payload(reference).unwrap();
-        assert!(matches!(reference, XlaOperation::ReferenceNew(_)));
+        let reference = Operation::<Constant>::from_payload(reference).unwrap();
+        assert!(matches!(reference, Operation::ReferenceNew(_)));
         assert!(reference.projected_payload::<ReferenceNewOperation<ArrayType, ArrayIrType>>().is_some());
         assert!(reference.projected_payload::<AddOperation<ArrayType>>().is_none());
         let tag = ErasedOperation::new(TagOperation::<ArrayType>::new("residual"));
-        let tag = XlaOperation::<XlaConstant>::from_payload(tag).unwrap();
+        let tag = Operation::<Constant>::from_payload(tag).unwrap();
         assert_eq!(TagOperation::<ArrayIrType>::key_of(&tag), Some("residual"));
     }
 
     #[test]
-    fn test_xla_operation_provides_memory_transfers() {
+    fn test_operation_provides_memory_transfers() {
         // The XLA family provides memory transfers through its projected array member.
         let destination = Memory::Host { pinned: true };
         let input_type = ArrayIrType::Array(ArrayType::new_static(DataType::F32, [2]));
         let operation =
-            XlaOperation::<XlaConstant>::provide(TransferToMemoryOperation::new(destination), &[&input_type]).unwrap();
+            Operation::<Constant>::provide(TransferToMemoryOperation::new(destination), &[&input_type]).unwrap();
         assert!(matches!(
             &operation,
-            XlaOperation::Array(ArrayOperation::TransferToMemory(operation)) if operation.destination() == destination,
+            Operation::Array(ArrayOperation::TransferToMemory(operation)) if operation.destination() == destination,
         ));
         assert_eq!(operation.to_string(), "transfer_to_memory [destination=Host[Pinned]]");
         assert_eq!(
-            XlaOperation::<XlaConstant>::provide(TransferToMemoryOperation::new(destination), &[]).unwrap_err(),
+            Operation::<Constant>::provide(TransferToMemoryOperation::new(destination), &[]).unwrap_err(),
             ProgramError::InvalidInputCount { expected: 1, actual: 0 },
         );
     }
 
     #[test]
-    fn test_xla_dimension_assertion_proofs() {
+    fn test_dimension_assertion_proofs() {
         let dimension_type = DimensionType::new("extent", DimensionBounds::unbounded());
-        let context = TracingContext::<XlaConstant, XlaOperation>::new();
+        let context = TracingContext::<Constant, Operation>::new();
         let dimension = context.input(dimension_type.clone().into());
         let dimension = ValueProjection::<DimensionType>::into_projected(dimension).unwrap();
         let predicate = dimension.equal(&dimension).unwrap();
-        assert!(matches!(context.resolve(&predicate), ValueResolution::Constant(XlaConstant::Boolean(true))));
+        assert!(matches!(context.resolve(&predicate), ValueResolution::Constant(Constant::Boolean(true))));
         predicate.assert("identity must agree", &[]).unwrap();
         let predicate = dimension.not_equal(&dimension).unwrap();
         predicate.assert("identity must differ", &[]).unwrap();
@@ -1087,12 +1087,12 @@ pub(crate) mod tests {
             context.builder().borrow().instructions(),
             [instruction] if matches!(
                 instruction.operation(),
-                XlaOperation::Assert(operation) if operation.message() == "identity must differ",
+                Operation::Assert(operation) if operation.message() == "identity must differ",
             ),
         ));
 
-        let context = TracingContext::<XlaConstant, XlaOperation>::new();
-        let mut builder = XlaProgramBuilder::new();
+        let context = TracingContext::<Constant, Operation>::new();
+        let mut builder = ProgramBuilder::new();
         let dimension = builder.add_input(dimension_type.clone().into());
         let predicate = builder
             .add_instruction(
@@ -1105,7 +1105,7 @@ pub(crate) mod tests {
         builder
             .add_instruction(AssertOperation::<ArrayIrType>::new("identity must agree"), vec![], vec![predicate], None)
             .unwrap();
-        let program = builder.build::<Vec<XlaConstant>, Vec<XlaConstant>>(vec![], vec![Placeholder], vec![]).unwrap();
+        let program = builder.build::<Vec<Constant>, Vec<Constant>>(vec![], vec![Placeholder], vec![]).unwrap();
         assert_eq!(program.effects().classes(), EffectClasses::single(EffectClass::OrderedAssertion));
         let evaluation = program
             .partially_evaluate_in_context(&context, &[PartialValue::Unknown(dimension_type.into())])
@@ -1116,7 +1116,7 @@ pub(crate) mod tests {
     }
 
     #[test]
-    fn test_xla_operation_batch_dimension_member() {
+    fn test_operation_batch_dimension_member() {
         use ryft_core::{
             ArrayIrBatch, ArrayIrBatchingPolicy, BatchableOperation, BatchingContext, DimensionDivOperation,
             DimensionOperation, EmptyRegionDriver,
@@ -1127,12 +1127,12 @@ pub(crate) mod tests {
         // division keeps its replicated inputs and its ordered zero-divisor assertion.
         let dividend_type = DimensionType::new("dividend", DimensionBounds::new(0, Some(9)).unwrap());
         let divisor_type = DimensionType::new("divisor", DimensionBounds::new(0, Some(5)).unwrap());
-        let (_, program) = TracingContext::<XlaConstant, XlaOperation>::trace(
-            |inputs: Vec<Tracer<TracingContext<XlaConstant, XlaOperation>>>| {
+        let (_, program) = TracingContext::<Constant, Operation>::trace(
+            |inputs: Vec<CoreTracer<TracingContext<Constant, Operation>>>| {
                 let parent = inputs[0].context();
-                let extent = parent.constant(XlaConstant::Dimension(DimensionValue::constant(3).unwrap()));
+                let extent = parent.constant(Constant::Dimension(DimensionValue::constant(3).unwrap()));
                 let context = BatchingContext::<_, ArrayIrBatchingPolicy>::new(parent.clone(), extent);
-                let operation = XlaOperation::from(DimensionOperation::Div(DimensionDivOperation::new(
+                let operation = Operation::from(DimensionOperation::Div(DimensionDivOperation::new(
                     &dividend_type,
                     &divisor_type,
                 )?));
@@ -1159,28 +1159,28 @@ pub(crate) mod tests {
     }
 
     #[test]
-    fn test_xla_array_constant_value_projection() {
+    fn test_array_constant_value_projection() {
         let array_type = vector_type().with_memory(Memory::Host { pinned: true });
-        let captured = XlaArrayConstant::Captured(CaptureReference::new(2, array_type.clone()));
+        let captured = ArrayConstant::Captured(CaptureReference::new(2, array_type.clone()));
         let borrowed = ValueProjection::<ArrayType>::projected(&captured).unwrap();
         assert!(std::ptr::eq(borrowed, &captured));
         assert_eq!(borrowed.r#type().as_ref(), &array_type);
         assert_eq!(borrowed.capture_index(), Some(2));
         let owned = ValueProjection::<ArrayType>::into_projected(captured.clone()).unwrap();
         assert_eq!(owned, captured);
-        assert_eq!(<XlaArrayConstant as ValueProjection<ArrayType>>::from_projected(owned), captured);
+        assert_eq!(<ArrayConstant as ValueProjection<ArrayType>>::from_projected(owned), captured);
 
-        let predicate = XlaArrayConstant::Boolean(true);
+        let predicate = ArrayConstant::Boolean(true);
         let borrowed = ValueProjection::<ArrayType>::projected(&predicate).unwrap();
         assert!(std::ptr::eq(borrowed, &predicate));
         assert_eq!(borrowed.capture_index(), None);
         let owned = ValueProjection::<ArrayType>::into_projected(predicate.clone()).unwrap();
         assert_eq!(owned, predicate);
-        assert_eq!(<XlaArrayConstant as ValueProjection<ArrayType>>::from_projected(owned), predicate);
+        assert_eq!(<ArrayConstant as ValueProjection<ArrayType>>::from_projected(owned), predicate);
     }
 
     #[test]
-    fn test_xla_constant() {
+    fn test_constant() {
         let array_type = vector_type();
         let capture = CaptureReference::new(2, ArrayIrType::Array(array_type.clone()));
         let extent_type = DimensionType::new("extent", DimensionBounds::positive(Some(8)).unwrap());
@@ -1188,28 +1188,28 @@ pub(crate) mod tests {
 
         // Captures and dimensions are reachable through their payload conversions, report their member type, and render
         // exactly like the payload they wrap.
-        let captured = XlaConstant::from(capture.clone());
-        let immediate = XlaConstant::from(extent.clone());
-        assert_eq!(captured, XlaConstant::Captured(capture));
-        assert_eq!(immediate, XlaConstant::Dimension(extent.clone()));
+        let captured = Constant::from(capture.clone());
+        let immediate = Constant::from(extent.clone());
+        assert_eq!(captured, Constant::Captured(capture));
+        assert_eq!(immediate, Constant::Dimension(extent.clone()));
         assert_eq!(captured.r#type().into_owned(), ArrayIrType::Array(array_type.clone()));
         assert_eq!(immediate.r#type().into_owned(), ArrayIrType::Dimension(extent.r#type().into_owned()));
         assert_eq!(captured.to_string(), "capture#2:f64[4]");
         assert_eq!(immediate.to_string(), extent.to_string());
 
-        let predicate = XlaConstant::try_from(true).unwrap();
-        assert_eq!(predicate, XlaConstant::Boolean(true));
+        let predicate = Constant::try_from(true).unwrap();
+        assert_eq!(predicate, Constant::Boolean(true));
         assert_eq!(predicate.r#type().into_owned(), ArrayIrType::Array(ArrayType::scalar(DataType::Boolean)));
         assert_eq!(predicate.to_string(), "true");
         assert_eq!(ryft_core::Concretizable::<bool>::concretize(&predicate), Ok(true));
         assert_eq!(predicate.capture_index(), None);
         assert_eq!(predicate.map_capture_index(|_| 99), predicate);
         let projected = ValueProjection::<ArrayType>::into_projected(predicate.clone()).unwrap();
-        assert_eq!(projected, XlaArrayConstant::Boolean(true));
+        assert_eq!(projected, ArrayConstant::Boolean(true));
         assert_eq!(ryft_core::Concretizable::<bool>::concretize(&projected), Ok(true));
         assert_eq!(projected.capture_index(), None);
         assert_eq!(projected.map_capture_index(|_| 99), projected);
-        assert_eq!(<XlaConstant as ValueProjection<ArrayType>>::from_projected(projected), predicate);
+        assert_eq!(<Constant as ValueProjection<ArrayType>>::from_projected(projected), predicate);
 
         // Only the captured variant names a capture-table slot, and so only it is renumbered by capture bookkeeping.
         // An immediate is index-free and passes through every remapping unchanged.
@@ -1217,30 +1217,30 @@ pub(crate) mod tests {
         assert_eq!(immediate.capture_index(), None);
         assert_eq!(
             captured.map_capture_index(|index| index + 3),
-            XlaConstant::Captured(CaptureReference::new(5, ArrayIrType::Array(array_type.clone()))),
+            Constant::Captured(CaptureReference::new(5, ArrayIrType::Array(array_type.clone()))),
         );
         assert_eq!(immediate.map_capture_index(|_| 7), immediate);
 
         // The array-typed captured case and immediate-dimension case project to their corresponding member universes
         // and reject the other one.
         assert_eq!(
-            <XlaConstant as ValueProjection<ArrayType>>::into_projected(captured.clone()),
-            Ok(XlaArrayConstant::Captured(CaptureReference::new(2, array_type.clone()))),
+            <Constant as ValueProjection<ArrayType>>::into_projected(captured.clone()),
+            Ok(ArrayConstant::Captured(CaptureReference::new(2, array_type.clone()))),
         );
         assert_eq!(
-            <XlaConstant as ValueProjection<ArrayType>>::into_projected(immediate.clone()),
+            <Constant as ValueProjection<ArrayType>>::into_projected(immediate.clone()),
             Err(TypeError::invalid("expected array type but got dimension type")),
         );
         assert_eq!(
-            <XlaConstant as ValueProjection<ArrayType>>::from_projected(XlaArrayConstant::Captured(
-                CaptureReference::new(2, array_type)
-            )),
+            <Constant as ValueProjection<ArrayType>>::from_projected(ArrayConstant::Captured(CaptureReference::new(
+                2, array_type
+            ))),
             captured,
         );
-        assert_eq!(<XlaConstant as ValueProjection<DimensionType>>::projected(&immediate), Ok(&extent));
-        assert_eq!(<XlaConstant as ValueProjection<DimensionType>>::into_projected(immediate), Ok(extent),);
+        assert_eq!(<Constant as ValueProjection<DimensionType>>::projected(&immediate), Ok(&extent));
+        assert_eq!(<Constant as ValueProjection<DimensionType>>::into_projected(immediate), Ok(extent),);
         assert_eq!(
-            <XlaConstant as ValueProjection<DimensionType>>::projected(&captured),
+            <Constant as ValueProjection<DimensionType>>::projected(&captured),
             Err(TypeError::invalid("expected an immediate dimension but got a captured value")),
         );
 
@@ -1250,15 +1250,15 @@ pub(crate) mod tests {
         let source = DimensionVariable::new("source", DimensionBounds::positive(Some(8)).unwrap());
         let target = DimensionVariable::new("target", DimensionBounds::positive(Some(8)).unwrap());
         let reference_type =
-            ReferenceType::new(ArrayType::new(DataType::F32, Shape::new(vec![Dimension::Dynamic(source.clone())])));
-        let reference = XlaConstant::Captured(CaptureReference::new(7, ArrayIrType::Reference(reference_type.clone())));
+            ReferenceType::new(ArrayType::new(DataType::F32, Shape::new(vec![CoreDimension::Dynamic(source.clone())])));
+        let reference = Constant::Captured(CaptureReference::new(7, ArrayIrType::Reference(reference_type.clone())));
         assert_eq!(reference.capture_index(), Some(7));
         assert_eq!(
-            <XlaConstant as ValueProjection<ArrayType>>::projected(&reference).map(|value| value.r#type().into_owned()),
+            <Constant as ValueProjection<ArrayType>>::projected(&reference).map(|value| value.r#type().into_owned()),
             Err(TypeError::invalid("expected array type but got reference type")),
         );
         assert_eq!(
-            <XlaConstant as ValueProjection<DimensionType>>::projected(&reference),
+            <Constant as ValueProjection<DimensionType>>::projected(&reference),
             Err(TypeError::invalid("expected an immediate dimension but got a captured value")),
         );
         let mut renaming = TypeIdentityRenaming::new();
@@ -1269,73 +1269,68 @@ pub(crate) mod tests {
             renamed_reference.r#type().into_owned(),
             ArrayIrType::Reference(ReferenceType::new(ArrayType::new(
                 DataType::F32,
-                Shape::new(vec![Dimension::Dynamic(target)]),
+                Shape::new(vec![CoreDimension::Dynamic(target)]),
             ))),
         );
     }
 
     #[test]
-    fn test_core_reference_operations_promote_to_xla_reference_operations() {
-        let write: XlaOperation<XlaConstant> =
-            ArrayIrOperation::<XlaArrayConstant>::ReferenceWrite(ReferenceWriteOperation::new()).into();
-        assert!(matches!(&write, XlaOperation::ReferenceWrite(_)));
+    fn test_core_reference_operations_promote_to_reference_operations() {
+        let write: Operation<Constant> =
+            ArrayIrOperation::<ArrayConstant>::ReferenceWrite(ReferenceWriteOperation::new()).into();
+        assert!(matches!(&write, Operation::ReferenceWrite(_)));
 
-        let swap: XlaOperation<XlaConstant> =
-            ArrayIrOperation::<XlaArrayConstant>::ReferenceSwap(ReferenceSwapOperation::new()).into();
-        assert!(matches!(&swap, XlaOperation::ReferenceSwap(_)));
+        let swap: Operation<Constant> =
+            ArrayIrOperation::<ArrayConstant>::ReferenceSwap(ReferenceSwapOperation::new()).into();
+        assert!(matches!(&swap, Operation::ReferenceSwap(_)));
 
-        let add_update: XlaOperation<XlaConstant> =
-            ArrayIrOperation::<XlaArrayConstant>::ReferenceAddUpdate(ReferenceAddUpdateOperation::new()).into();
-        assert!(matches!(&add_update, XlaOperation::ReferenceAddUpdate(_)));
+        let add_update: Operation<Constant> =
+            ArrayIrOperation::<ArrayConstant>::ReferenceAddUpdate(ReferenceAddUpdateOperation::new()).into();
+        assert!(matches!(&add_update, Operation::ReferenceAddUpdate(_)));
 
-        let atomic_update: XlaOperation<XlaConstant> =
-            ArrayIrOperation::<XlaArrayConstant>::ReferenceAtomicAddUpdate(ReferenceAtomicAddUpdateOperation::new())
+        let atomic_update: Operation<Constant> =
+            ArrayIrOperation::<ArrayConstant>::ReferenceAtomicAddUpdate(ReferenceAtomicAddUpdateOperation::new())
                 .into();
-        assert!(matches!(&atomic_update, XlaOperation::ReferenceAtomicAddUpdate(_)));
+        assert!(matches!(&atomic_update, Operation::ReferenceAtomicAddUpdate(_)));
 
-        let freeze: XlaOperation<XlaConstant> =
-            ArrayIrOperation::<XlaArrayConstant>::ReferenceFreeze(ReferenceFreezeOperation::new()).into();
-        assert!(matches!(&freeze, XlaOperation::ReferenceFreeze(_)));
+        let freeze: Operation<Constant> =
+            ArrayIrOperation::<ArrayConstant>::ReferenceFreeze(ReferenceFreezeOperation::new()).into();
+        assert!(matches!(&freeze, Operation::ReferenceFreeze(_)));
     }
 
     #[test]
-    fn test_xla_reference_discharge_rewrites_the_flat_reference_language() {
+    fn test_reference_discharge_rewrites_the_flat_reference_language() {
         // The backend operation family participates in reference discharge through its generated `discharge`
         // dispatcher, so a flat backend program rewrites into explicit immutable state with its external root
         // entering at its own boundary position and publishing one hidden final-state output.
         let scalar_type = ArrayType::scalar(DataType::F32);
-        let mut builder = XlaProgramBuilder::new();
+        let mut builder = ProgramBuilder::new();
         let external = builder.add_input(ArrayIrType::Reference(ReferenceType::new(scalar_type.clone())));
         let initial = builder.add_input(ArrayIrType::Array(scalar_type.clone()));
         let update = builder.add_input(ArrayIrType::Array(scalar_type));
         let root = builder
-            .add_instruction(XlaOperation::ReferenceNew(ReferenceNewOperation::new()), Vec::new(), vec![initial], None)
+            .add_instruction(Operation::ReferenceNew(ReferenceNewOperation::new()), Vec::new(), vec![initial], None)
             .unwrap()[0];
         builder
             .add_instruction(
-                XlaOperation::ReferenceAddUpdate(ReferenceAddUpdateOperation::new()),
+                Operation::ReferenceAddUpdate(ReferenceAddUpdateOperation::new()),
                 Vec::new(),
                 vec![root, update],
                 None,
             )
             .unwrap();
         let local = builder
-            .add_instruction(
-                XlaOperation::ReferenceFreeze(ReferenceFreezeOperation::new()),
-                Vec::new(),
-                vec![root],
-                None,
-            )
+            .add_instruction(Operation::ReferenceFreeze(ReferenceFreezeOperation::new()), Vec::new(), vec![root], None)
             .unwrap()[0];
         let previous = builder
             .add_instruction(
-                XlaOperation::ReferenceSwap(ReferenceSwapOperation::new()),
+                Operation::ReferenceSwap(ReferenceSwapOperation::new()),
                 Vec::new(),
                 vec![external, local],
                 None,
             )
             .unwrap()[0];
-        let source: XlaProgram<Vec<XlaConstant>, Vec<XlaConstant>> =
+        let source: Program<Vec<Constant>, Vec<Constant>> =
             builder.build(vec![previous], vec![Placeholder; 3], vec![Placeholder]).unwrap();
 
         let discharged = source.discharge_references(0).unwrap();
@@ -1358,58 +1353,58 @@ pub(crate) mod tests {
     }
 
     #[test]
-    fn test_core_array_ir_control_flow_promotes_to_xla_control_flow() {
-        let condition: XlaOperation<XlaConstant> =
-            ArrayIrOperation::<XlaArrayConstant>::Condition(ConditionOperation::new()).into();
-        assert!(matches!(condition, XlaOperation::Condition(_)));
+    fn test_core_array_ir_control_flow_promotes_to_control_flow() {
+        let condition: Operation<Constant> =
+            ArrayIrOperation::<ArrayConstant>::Condition(ConditionOperation::new()).into();
+        assert!(matches!(condition, Operation::Condition(_)));
         assert_eq!(condition.region_slots(), ConditionOperation::<ArrayIrType>::new().region_slots());
 
-        let r#while: XlaOperation<XlaConstant> =
-            ArrayIrOperation::<XlaArrayConstant>::While(WhileOperation::new().with_iteration_bound(3).unwrap()).into();
-        assert!(matches!(r#while, XlaOperation::While(operation) if operation.iteration_bound() == Some(3)));
+        let r#while: Operation<Constant> =
+            ArrayIrOperation::<ArrayConstant>::While(WhileOperation::new().with_iteration_bound(3).unwrap()).into();
+        assert!(matches!(r#while, Operation::While(operation) if operation.iteration_bound() == Some(3)));
 
-        let scan: XlaOperation<XlaConstant> =
-            ArrayIrOperation::<XlaArrayConstant>::Scan(ScanOperation::new(2, 5).with_reverse(true)).into();
+        let scan: Operation<Constant> =
+            ArrayIrOperation::<ArrayConstant>::Scan(ScanOperation::new(2, 5).with_reverse(true)).into();
         assert!(matches!(
             scan,
-            XlaOperation::Scan(operation)
+            Operation::Scan(operation)
                 if operation.carry_count() == 2
-                    && operation.iteration_count() == &Dimension::Static(5)
+                    && operation.iteration_count() == &CoreDimension::Static(5)
                     && operation.reverse()
         ));
 
         let extent = DimensionVariable::new("extent", DimensionBounds::new(1, Some(5)).unwrap());
-        let zero: XlaOperation<XlaConstant> = ArrayOperation::Zero(ZeroOperation::new(ArrayType::new(
+        let zero: Operation<Constant> = ArrayOperation::Zero(ZeroOperation::new(ArrayType::new(
             DataType::F32,
-            Shape::new(vec![Dimension::Dynamic(extent)]),
+            Shape::new(vec![CoreDimension::Dynamic(extent)]),
         )))
         .into();
-        assert!(matches!(zero, XlaOperation::Zero(_)));
+        assert!(matches!(zero, Operation::Zero(_)));
 
         // Member control flow must also promote to the array IR carriers when it enters through the member family
         // conversion: the projected `Array` variant cannot own array IR regions, so landing there would make the
         // staged regions unprojectable.
-        let condition: XlaOperation<XlaConstant> =
-            ArrayOperation::<XlaArrayConstant>::Condition(ConditionOperation::new()).into();
-        assert!(matches!(condition, XlaOperation::Condition(_)));
-        let r#while: XlaOperation<XlaConstant> =
-            ArrayOperation::<XlaArrayConstant>::While(WhileOperation::new().with_iteration_bound(3).unwrap()).into();
-        assert!(matches!(r#while, XlaOperation::While(operation) if operation.iteration_bound() == Some(3)));
-        let scan: XlaOperation<XlaConstant> =
-            ArrayOperation::<XlaArrayConstant>::Scan(ScanOperation::new(2, 5).with_reverse(true)).into();
+        let condition: Operation<Constant> =
+            ArrayOperation::<ArrayConstant>::Condition(ConditionOperation::new()).into();
+        assert!(matches!(condition, Operation::Condition(_)));
+        let r#while: Operation<Constant> =
+            ArrayOperation::<ArrayConstant>::While(WhileOperation::new().with_iteration_bound(3).unwrap()).into();
+        assert!(matches!(r#while, Operation::While(operation) if operation.iteration_bound() == Some(3)));
+        let scan: Operation<Constant> =
+            ArrayOperation::<ArrayConstant>::Scan(ScanOperation::new(2, 5).with_reverse(true)).into();
         assert!(matches!(
             scan,
-            XlaOperation::Scan(operation)
+            Operation::Scan(operation)
                 if operation.carry_count() == 2
-                    && operation.iteration_count() == &Dimension::Static(5)
+                    && operation.iteration_count() == &CoreDimension::Static(5)
                     && operation.reverse()
         ));
     }
 
     #[test]
-    fn test_xla_operation_reference_access_descriptor() {
+    fn test_operation_reference_access_descriptor() {
         let transform = ArrayReferenceTransform::Index { axis: 0, index: ArrayReferenceTransformIndex::Dynamic };
-        let operation = XlaOperation::<XlaConstant>::ReferenceRead(
+        let operation = Operation::<Constant>::ReferenceRead(
             ReferenceReadOperation::new().with_transforms(vec![transform.clone()]),
         );
         let descriptor = operation.reference_access_descriptor(0).unwrap();
@@ -1440,11 +1435,10 @@ pub(crate) mod tests {
             let composite = CompositeOperation::from_rule_regions(jvp_rule, has_vjp_rule)
                 .with_non_differentiated_count(non_differentiated_count)
                 .unwrap();
-            let promoted: XlaOperation<XlaConstant> =
-                ArrayIrOperation::<XlaArrayConstant>::Composite(composite.clone()).into();
+            let promoted: Operation<Constant> = ArrayIrOperation::<ArrayConstant>::Composite(composite.clone()).into();
             assert!(matches!(
                 &promoted,
-                XlaOperation::Composite(operation)
+                Operation::Composite(operation)
                     if operation.rules().is_none()
                         && operation.jvp_rule() == jvp_rule
                         && operation.has_vjp_rule() == has_vjp_rule
@@ -1455,13 +1449,13 @@ pub(crate) mod tests {
 
             // A call with attached rules that reaches this family from the array member family follows its regions
             // into the native variant as well.
-            let promoted: XlaOperation<XlaConstant> = ArrayOperation::<XlaArrayConstant>::Composite(
+            let promoted: Operation<Constant> = ArrayOperation::<ArrayConstant>::Composite(
                 CompositeOperation::from_rule_regions(jvp_rule, has_vjp_rule),
             )
             .into();
             assert!(matches!(
                 &promoted,
-                XlaOperation::Composite(operation)
+                Operation::Composite(operation)
                     if operation.rules().is_none()
                         && operation.jvp_rule() == jvp_rule
                         && operation.has_vjp_rule() == has_vjp_rule,
@@ -1476,11 +1470,10 @@ pub(crate) mod tests {
             vec![tangent_type.clone()],
             vec![tangent_type.clone()],
         );
-        let promoted: XlaOperation<XlaConstant> =
-            ArrayIrOperation::<XlaArrayConstant>::CompositeTranspose(carrier).into();
+        let promoted: Operation<Constant> = ArrayIrOperation::<ArrayConstant>::CompositeTranspose(carrier).into();
         assert!(matches!(
             &promoted,
-            XlaOperation::CompositeTranspose(operation)
+            Operation::CompositeTranspose(operation)
                 if operation.rules().is_none()
                     && operation.leading_input_count() == 1
                     && operation.input_tangent_types() == std::slice::from_ref(&tangent_type)
@@ -1490,9 +1483,9 @@ pub(crate) mod tests {
         let rematerialize = RematerializeOperation::<ArrayIrType>::new(ResidualPolicyReference::new(DotsSavable))
             .with_optimization_barrier(RematerializationOptimizationBarrier::None)
             .with_differentiated(true);
-        let promoted: XlaOperation<XlaConstant> =
-            ArrayIrOperation::<XlaArrayConstant>::Rematerialize(rematerialize.clone()).into();
-        assert!(matches!(&promoted, XlaOperation::Rematerialize(operation) if operation == &rematerialize));
+        let promoted: Operation<Constant> =
+            ArrayIrOperation::<ArrayConstant>::Rematerialize(rematerialize.clone()).into();
+        assert!(matches!(&promoted, Operation::Rematerialize(operation) if operation == &rematerialize));
         assert_eq!(promoted.name(), rematerialize.name());
         assert_eq!(promoted.region_slots(), rematerialize.region_slots());
     }
@@ -1504,52 +1497,51 @@ pub(crate) mod tests {
         // Converted member calls and carriers keep their member definition, which specializes their rules for this
         // family on demand.
         let scalar_type = ArrayType::scalar(DataType::F32);
-        let member = CustomRuleRegistration::new(CustomRuleDefinition::<
-            XlaArrayConstant,
-            ArrayOperation<XlaArrayConstant>,
-        >::new("member"));
-        let promoted: XlaOperation<XlaConstant> =
-            ArrayOperation::<XlaArrayConstant>::Composite(CompositeOperation::new(member.reference())).into();
+        let member = CustomRuleRegistration::new(
+            CustomRuleDefinition::<ArrayConstant, ArrayOperation<ArrayConstant>>::new("member"),
+        );
+        let promoted: Operation<Constant> =
+            ArrayOperation::<ArrayConstant>::Composite(CompositeOperation::new(member.reference())).into();
         assert!(matches!(
             &promoted,
-            XlaOperation::LiftedComposite(operation)
+            Operation::LiftedComposite(operation)
                 if operation.rules() == Some(&LiftedCustomRules::Member(member.reference())),
         ));
         assert_eq!(promoted.to_string(), "composite [name=\"member\"]");
-        let promoted: XlaOperation<XlaConstant> =
-            ArrayOperation::<XlaArrayConstant>::CompositeTranspose(CompositeTransposeOperation::new(
+        let promoted: Operation<Constant> =
+            ArrayOperation::<ArrayConstant>::CompositeTranspose(CompositeTransposeOperation::new(
                 member.reference(),
                 0,
                 vec![scalar_type.clone()],
                 vec![scalar_type.clone()],
             ))
             .into();
-        assert!(matches!(&promoted, XlaOperation::LiftedCompositeTranspose(_)));
+        assert!(matches!(&promoted, Operation::LiftedCompositeTranspose(_)));
 
         // Calls registered in the array IR family itself cannot follow their program, because constants of this family
         // cannot represent array IR values. Their primal still executes, but their explicit rules are unavailable.
         let array_ir = CustomRuleRegistration::new(
-            CustomRuleDefinition::<ArrayIrValue<XlaArrayConstant>, ArrayIrOperation<XlaArrayConstant>>::new("array_ir")
+            CustomRuleDefinition::<ArrayIrValue<ArrayConstant>, ArrayIrOperation<ArrayConstant>>::new("array_ir")
                 .with_jvp(|primals, tangents| Ok((primals.to_vec(), tangents.to_vec()))),
         );
-        let promoted: XlaOperation<XlaConstant> =
-            ArrayIrOperation::<XlaArrayConstant>::Composite(CompositeOperation::new(array_ir.reference())).into();
+        let promoted: Operation<Constant> =
+            ArrayIrOperation::<ArrayConstant>::Composite(CompositeOperation::new(array_ir.reference())).into();
         assert!(matches!(
             &promoted,
-            XlaOperation::LiftedComposite(operation)
+            Operation::LiftedComposite(operation)
                 if matches!(operation.rules(), Some(LiftedCustomRules::Unavailable(_))),
         ));
-        let mut primal = XlaProgramBuilder::new();
+        let mut primal = ProgramBuilder::new();
         let input = primal.add_input(scalar_type.clone().into());
         let primal = primal
-            .build::<Vec<XlaConstant>, Vec<XlaConstant>>(vec![input], vec![Placeholder], vec![Placeholder])
+            .build::<Vec<Constant>, Vec<Constant>>(vec![input], vec![Placeholder], vec![Placeholder])
             .unwrap();
-        let mut builder = XlaProgramBuilder::new();
+        let mut builder = ProgramBuilder::new();
         let primal = builder.import_program(primal);
         let input = builder.add_input(scalar_type.into());
         let output = builder.add_instruction(promoted, vec![primal], vec![input], None).unwrap()[0];
         let program = builder
-            .build::<Vec<XlaConstant>, Vec<XlaConstant>>(vec![output], vec![Placeholder], vec![Placeholder])
+            .build::<Vec<Constant>, Vec<Constant>>(vec![output], vec![Placeholder], vec![Placeholder])
             .unwrap();
         assert_eq!(
             program.jvp().unwrap_err().to_string(),
@@ -1567,24 +1559,23 @@ pub(crate) mod tests {
         // call is inlined into the policy walk; the differentiated call recomputes that multiplication.
         let scalar_type = ArrayIrType::from(ArrayType::scalar(DataType::F64));
         let callee = {
-            let mut builder = XlaProgramBuilder::new();
+            let mut builder = ProgramBuilder::new();
             let input = builder.add_input(scalar_type.clone());
             let squared =
                 builder.add_instruction(MulOperation::new(), Vec::new(), vec![input, input], None).unwrap()[0];
             builder
-                .build::<Vec<XlaConstant>, Vec<XlaConstant>>(vec![squared], vec![Placeholder], vec![Placeholder])
+                .build::<Vec<Constant>, Vec<Constant>>(vec![squared], vec![Placeholder], vec![Placeholder])
                 .unwrap()
         };
-        let function = rematerialize(move |x: XlaTracer<'static>| -> Result<XlaTracer<'static>, ProgramError> {
+        let function = rematerialize(move |x: Tracer<'static>| -> Result<Tracer<'static>, ProgramError> {
             let context = x.context().clone();
-            let called = context.bind(XlaOperation::JitCall(JitCallOperation::new(0)), vec![callee.clone()], &[x])?;
+            let called = context.bind(Operation::JitCall(JitCallOperation::new(0)), vec![callee.clone()], &[x])?;
             let mut outputs = context.bind(MulOperation::new(), Vec::new(), &[called[0].clone(), called[0].clone()])?;
             Ok(outputs.remove(0))
         })
         .with_policy(NothingSavable);
         let (_, program) =
-            DomainTracingContext::<XlaDomain<'static>>::trace(|x: XlaTracer<'static>| function.call(x), scalar_type)
-                .unwrap();
+            DomainTracingContext::<Domain<'static>>::trace(|x: Tracer<'static>| function.call(x), scalar_type).unwrap();
         let linearization = program.into_flat_program().linearize().unwrap();
         assert_eq!(
             format!("{}\n{}", linearization.primal(), linearization.tangent()),
@@ -1625,34 +1616,30 @@ pub(crate) mod tests {
         // capturing body is rejected at trace time; refer to `TracingContext::trace_with_named_axes` for the full
         // silent-aliasing rationale.
         let scalar_type = ArrayIrType::from(ArrayType::scalar(DataType::F32));
-        let captured_value = XlaConstant::Captured(CaptureReference::new(0, scalar_type.clone()));
-        let function = rematerialize(move |x: XlaTracer<'static>| -> Result<XlaTracer<'static>, ProgramError> {
+        let captured_value = Constant::Captured(CaptureReference::new(0, scalar_type.clone()));
+        let function = rematerialize(move |x: Tracer<'static>| -> Result<Tracer<'static>, ProgramError> {
             let context = x.context().clone();
             let reference = context.capture(captured_value.clone())?;
             let captured = StagingContext::constant(&context, reference);
             let mut outputs = context.bind(AddOperation::new(), Vec::new(), &[x, captured])?;
             Ok(outputs.remove(0))
         });
-        let root = DomainTracingContext::<XlaDomain<'static>>::new();
+        let root = DomainTracingContext::<Domain<'static>>::new();
         let input = root.input(scalar_type);
         let result = function.call(input);
         assert!(matches!(result, Err(ProgramError::DiscardedCaptures { count: 1 })));
     }
 
     #[test]
-    fn test_xla_dynamic_disconnected_pullback_omits_structural_zero_cotangent() {
+    fn test_dynamic_disconnected_pullback_omits_structural_zero_cotangent() {
         let extent = DimensionVariable::new("extent", DimensionBounds::new(1, Some(5)).unwrap());
-        let dynamic_type = ArrayType::new(DataType::F8E8M0FNU, Shape::new(vec![Dimension::Dynamic(extent)]));
+        let dynamic_type = ArrayType::new(DataType::F8E8M0FNU, Shape::new(vec![CoreDimension::Dynamic(extent)]));
         let scalar_type = ArrayType::scalar(DataType::F64);
-        let mut builder = XlaProgramBuilder::new();
+        let mut builder = ProgramBuilder::new();
         builder.add_input(dynamic_type.into());
         let scalar = builder.add_input(scalar_type.into());
         let program = builder
-            .build::<Vec<XlaConstant>, Vec<XlaConstant>>(
-                vec![scalar],
-                vec![Placeholder, Placeholder],
-                vec![Placeholder],
-            )
+            .build::<Vec<Constant>, Vec<Constant>>(vec![scalar], vec![Placeholder, Placeholder], vec![Placeholder])
             .unwrap();
 
         // A disconnected cotangent remains structural and spends no extent residual or executable output.
@@ -1672,16 +1659,16 @@ pub(crate) mod tests {
     }
 
     #[test]
-    fn test_xla_residual_zero_provider_materializes_dynamic_zero_from_array_source() {
+    fn test_residual_zero_provider_materializes_dynamic_zero_from_array_source() {
         let extent = DimensionVariable::new("extent", DimensionBounds::new(1, Some(5)).unwrap());
-        let primal_type = ArrayType::new(DataType::F8E8M0FNU, Shape::new(vec![Dimension::Dynamic(extent.clone())]));
+        let primal_type = ArrayType::new(DataType::F8E8M0FNU, Shape::new(vec![CoreDimension::Dynamic(extent.clone())]));
         let tangent_type = primal_type.tangent().unwrap();
-        let context = TracingContext::<XlaConstant, XlaOperation>::new();
+        let context = TracingContext::<Constant, Operation>::new();
         let primal = context.input(ArrayIrType::Array(primal_type));
 
         // The shared array-IR blanket captures the named extent even when the source's element representation differs
         // from the dynamic tangent zero's. The XLA family uses the same identity-directed rule as the core family.
-        let zero = XlaOperation::<XlaConstant>::materialize_zero_from_residual_sources(
+        let zero = Operation::<Constant>::materialize_zero_from_residual_sources(
             &context,
             MaybeZero::Zero(ArrayIrType::Array(tangent_type.clone())),
             std::slice::from_ref(&primal),
@@ -1693,26 +1680,27 @@ pub(crate) mod tests {
         let [dimension_size, zero] = builder.instructions() else {
             panic!("expected one dimension-size instruction followed by one dynamic zero instruction");
         };
-        assert!(matches!(dimension_size.operation(), XlaOperation::DimensionSize(operation) if operation.axis() == 0));
+        assert!(matches!(dimension_size.operation(), Operation::DimensionSize(operation) if operation.axis() == 0));
         assert_eq!(dimension_size.inputs(), &[primal.atom_id().unwrap()]);
-        assert!(matches!(zero.operation(), XlaOperation::Zero(_)));
+        assert!(matches!(zero.operation(), Operation::Zero(_)));
         assert_eq!(zero.inputs(), &[dimension_size.outputs()[0]]);
     }
 
     #[test]
-    fn test_xla_residual_zero_provider_assembles_dynamic_zero_from_several_sources() {
+    fn test_residual_zero_provider_assembles_dynamic_zero_from_several_sources() {
         let rows = DimensionVariable::new("rows", DimensionBounds::new(1, Some(5)).unwrap());
         let columns = DimensionVariable::new("columns", DimensionBounds::new(1, Some(7)).unwrap());
         let zero_type = ArrayType::new(
             DataType::F32,
-            Shape::new(vec![Dimension::Dynamic(rows.clone()), Dimension::Dynamic(columns.clone())]),
+            Shape::new(vec![CoreDimension::Dynamic(rows.clone()), CoreDimension::Dynamic(columns.clone())]),
         );
-        let context = TracingContext::<XlaConstant, XlaOperation>::new();
+        let context = TracingContext::<Constant, Operation>::new();
         let sources = [
-            context.input(ArrayIrType::Array(ArrayType::new(DataType::F64, Shape::new(vec![Dimension::Static(3)])))),
+            context
+                .input(ArrayIrType::Array(ArrayType::new(DataType::F64, Shape::new(vec![CoreDimension::Static(3)])))),
             context.input(ArrayIrType::Array(ArrayType::new(
                 DataType::F8E8M0FNU,
-                Shape::new(vec![Dimension::Dynamic(rows)]),
+                Shape::new(vec![CoreDimension::Dynamic(rows)]),
             ))),
             context.input(ArrayIrType::Dimension(DimensionType::from(columns))),
         ];
@@ -1721,7 +1709,7 @@ pub(crate) mod tests {
         // candidate names neither identity and is skipped without staging anything, the dynamic array supplies the row
         // extent through a `dimension_size` read, and the first-class dimension supplies the column extent as itself.
         // The shared array-IR implementation emits XLA operations directly for the selected sources.
-        let zero = XlaOperation::<XlaConstant>::materialize_zero_from_residual_sources(
+        let zero = Operation::<Constant>::materialize_zero_from_residual_sources(
             &context,
             MaybeZero::Zero(ArrayIrType::Array(zero_type.clone())),
             &sources,
@@ -1733,9 +1721,9 @@ pub(crate) mod tests {
         let [dimension_size, zero] = builder.instructions() else {
             panic!("expected one dimension-size instruction followed by one dynamic zero instruction");
         };
-        assert!(matches!(dimension_size.operation(), XlaOperation::DimensionSize(operation) if operation.axis() == 0));
+        assert!(matches!(dimension_size.operation(), Operation::DimensionSize(operation) if operation.axis() == 0));
         assert_eq!(dimension_size.inputs(), &[sources[1].atom_id().unwrap()]);
-        assert!(matches!(zero.operation(), XlaOperation::Zero(_)));
+        assert!(matches!(zero.operation(), Operation::Zero(_)));
         assert_eq!(zero.inputs(), &[dimension_size.outputs()[0], sources[2].atom_id().unwrap()]);
     }
 
@@ -1743,28 +1731,24 @@ pub(crate) mod tests {
     fn test_gateway_region_program_imports_with_fresh_alpha_equivalent_identities() {
         let extent = DimensionVariable::new("extent", DimensionBounds::new(1, Some(9)).unwrap());
         let extent_type = DimensionType::from(extent.clone());
-        let output_type = ArrayType::new(DataType::F32, Shape::new(vec![Dimension::Dynamic(extent.clone())]));
+        let output_type = ArrayType::new(DataType::F32, Shape::new(vec![CoreDimension::Dynamic(extent.clone())]));
         let scalar_type = ArrayType::scalar(DataType::F32);
 
         let branch = || {
-            let mut builder = XlaProgramBuilder::new();
+            let mut builder = ProgramBuilder::new();
             let extent = builder.add_input(extent_type.clone().into());
             let scalar = builder.add_input(scalar_type.clone().into());
             let output = builder
                 .add_instruction(DynamicBroadcastOperation::new(Vec::new()), Vec::new(), vec![scalar, extent], None)
                 .unwrap()[0];
             builder
-                .build::<Vec<XlaConstant>, Vec<XlaConstant>>(
-                    vec![output],
-                    vec![Placeholder, Placeholder],
-                    vec![Placeholder],
-                )
+                .build::<Vec<Constant>, Vec<Constant>>(vec![output], vec![Placeholder, Placeholder], vec![Placeholder])
                 .unwrap()
         };
 
         let integer_type = ArrayType::scalar(DataType::I32);
         let predicate_type = ArrayType::scalar(DataType::Boolean);
-        let mut source_builder = XlaProgramBuilder::new();
+        let mut source_builder = ProgramBuilder::new();
         let true_region = source_builder.import_region(branch().entry_region_ref());
         let false_region = source_builder.import_region(branch().entry_region_ref());
         let integer = source_builder.add_input(integer_type.clone().into());
@@ -1775,14 +1759,14 @@ pub(crate) mod tests {
             .unwrap()[0];
         let output = source_builder
             .add_instruction(
-                XlaOperation::Condition(ConditionOperation::new()),
+                Operation::Condition(ConditionOperation::new()),
                 vec![true_region, false_region],
                 vec![predicate, gateway, scalar],
                 None,
             )
             .unwrap()[0];
         let source = source_builder
-            .build::<Vec<XlaConstant>, Vec<XlaConstant>>(
+            .build::<Vec<Constant>, Vec<Constant>>(
                 vec![output],
                 vec![Placeholder, Placeholder, Placeholder],
                 vec![Placeholder],
@@ -1795,7 +1779,7 @@ pub(crate) mod tests {
             std::slice::from_ref(extent_type.variable().unwrap())
         );
 
-        let mut destination = XlaProgramBuilder::new();
+        let mut destination = ProgramBuilder::new();
         let integer = destination.add_input(integer_type.into());
         let predicate = destination.add_input(predicate_type.into());
         let scalar = destination.add_input(scalar_type.into());
@@ -1828,7 +1812,7 @@ pub(crate) mod tests {
         }
 
         let destination = destination
-            .build::<Vec<XlaConstant>, Vec<XlaConstant>>(
+            .build::<Vec<Constant>, Vec<Constant>>(
                 vec![first, second],
                 vec![Placeholder, Placeholder, Placeholder],
                 vec![Placeholder, Placeholder],
@@ -1845,33 +1829,27 @@ pub(crate) mod tests {
     #[test]
     fn test_scan_reference_discharge_widens_carries_and_preserves_scan_metadata() {
         let reference_type = ReferenceType::new(vector_type());
-        let mut body_builder = ProgramBuilder::<XlaConstant, XlaOperation>::new();
+        let mut body_builder = CoreProgramBuilder::<Constant, Operation>::new();
         body_builder.add_input(ArrayType::scalar(DataType::I64).into());
         let body_carry = body_builder.add_input(vector_type().into());
         let reference =
-            body_builder.add_constant(XlaConstant::Captured(CaptureReference::new(0, reference_type.clone().into())));
+            body_builder.add_constant(Constant::Captured(CaptureReference::new(0, reference_type.clone().into())));
         let value = body_builder
             .add_instruction(ReferenceReadOperation::new(), Vec::new(), vec![reference], None)
             .unwrap()[0];
         let body = body_builder
-            .build::<Vec<XlaConstant>, Vec<XlaConstant>>(
-                vec![body_carry, value],
-                vec![Placeholder; 2],
-                vec![Placeholder; 2],
-            )
+            .build::<Vec<Constant>, Vec<Constant>>(vec![body_carry, value], vec![Placeholder; 2], vec![Placeholder; 2])
             .unwrap();
 
-        let mut builder = ProgramBuilder::<XlaConstant, XlaOperation>::new();
+        let mut builder = CoreProgramBuilder::<Constant, Operation>::new();
         let body = builder.import_region(body.entry_region_ref());
         builder.add_input(reference_type.into());
         let carry = builder.add_input(vector_type().into());
         let operation = ScanOperation::new(1, 3).with_reverse(true).with_unroll(3).unwrap();
-        let outputs = builder
-            .add_instruction(XlaOperation::Scan(operation), vec![body], vec![carry], None)
-            .unwrap()
-            .to_vec();
+        let outputs =
+            builder.add_instruction(Operation::Scan(operation), vec![body], vec![carry], None).unwrap().to_vec();
         let program = builder
-            .build::<Vec<XlaConstant>, Vec<XlaConstant>>(outputs, vec![Placeholder; 2], vec![Placeholder; 2])
+            .build::<Vec<Constant>, Vec<Constant>>(outputs, vec![Placeholder; 2], vec![Placeholder; 2])
             .unwrap();
 
         let targets = program.reference_discharge_targets(1).unwrap();
@@ -1883,7 +1861,7 @@ pub(crate) mod tests {
         let preserved = program.clone().partially_discharge_references_in_capture_lifted_program(1, &[]).unwrap();
         assert!(preserved.external_reference_bindings().is_empty());
         assert!(preserved.program().entry_region_ref().contains_references_in_closure());
-        let XlaOperation::Scan(scan) = preserved.program().entry_region_ref().instructions()[0].operation() else {
+        let Operation::Scan(scan) = preserved.program().entry_region_ref().instructions()[0].operation() else {
             panic!("expected a partially discharged scan operation");
         };
         assert_eq!(scan.carry_count(), 2);
@@ -1904,7 +1882,7 @@ pub(crate) mod tests {
         assert_eq!(discharged.external_reference_bindings().len(), 1);
         assert_eq!(discharged.external_reference_bindings()[0].source(), ReferenceSource::Capture { index: 0 });
         assert!(!discharged.external_reference_bindings()[0].is_mutated());
-        let XlaOperation::Scan(scan) = discharged.program().entry_region_ref().instructions()[0].operation() else {
+        let Operation::Scan(scan) = discharged.program().entry_region_ref().instructions()[0].operation() else {
             panic!("expected a discharged scan operation");
         };
         assert_eq!(scan.carry_count(), 2);
@@ -1913,7 +1891,7 @@ pub(crate) mod tests {
     }
 
     #[test]
-    fn test_rematerialization_policies_are_available_for_the_xla_operation_family() {
+    fn test_rematerialization_policies_are_available_for_the_operation_family() {
         use ryft_core::{
             DotsSavable, DotsWithNoBatchDimensionsSavable, EverythingSavable, Memory, NothingSavable,
             OffloadDotsWithNoBatchDimensions, ResidualPolicy, SaveAndOffloadOnlyTheseNames, SaveFromBothPolicies,
@@ -1921,7 +1899,7 @@ pub(crate) mod tests {
         };
 
         // The built-in rematerialization policies, including the offloading ones, classify candidates of the
-        // `ArrayIrType` universe of `XlaOperation`, whose producers they recognize through the derive-generated
+        // `ArrayIrType` universe of `Operation`, whose producers they recognize through the derive-generated
         // payload projection. This is a compile-time capability check: the assertions below fail to compile if a
         // policy is not available for the universe.
         fn assert_policy<P: ResidualPolicy<ArrayIrType>>(_policy: P) {}

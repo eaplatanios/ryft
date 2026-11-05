@@ -3,14 +3,14 @@ use ryft_mlir::dialects::{chlo, stable_hlo};
 use ryft_mlir::{Block, Operation as MlirOperation, Value as MlirValue, ValueRef};
 
 use crate::experimental::lowering::types::{lower_f64_constant_splat, lower_tensor_type};
-use crate::{Error, LowerableOperation, LowerableOperationFamily, XlaLowerer};
+use crate::{Error, LowerableOperation, LowerableOperationFamily, Lowerer};
 
 // [`ErfOperation`] lowers to `chlo.erf`, which the XLA compiler legalizes to a rational polynomial approximation
 // over StableHLO operations during compilation.
 impl LowerableOperation for ErfOperation<ArrayType> {
     fn lower<'b, 'c: 'b, 't: 'c, O: LowerableOperationFamily>(
         &self,
-        lowerer: &mut XlaLowerer<'b, 'c, 't, O>,
+        lowerer: &mut Lowerer<'b, 'c, 't, O>,
         input_values: &[ValueRef<'b, 'c, 't>],
         _input_types: &[ArrayType],
         output_types: &[ArrayType],

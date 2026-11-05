@@ -11,8 +11,8 @@ use serde::Deserialize;
 #[cfg(any(test, feature = "cuda-13"))]
 use ryft_core::{
     ArrayType, BatchAxis, BatchAxisSpecification, DataType, Differentiate, LogicalMesh, MeshAxis, MeshAxisType,
-    ParallelRaggedAllToAll, ProgramError, ShardMapOptions, Sharding, ShardingDimension, Value, ValueProjection, batch,
-    shard_map,
+    ParallelRaggedAllToAll, ProgramError, ShardMapOptions, Sharding, ShardingDimension, Value as CoreValue,
+    ValueProjection, batch, shard_map,
 };
 #[cfg(feature = "cuda-13")]
 use ryft_pjrt::{
@@ -20,7 +20,7 @@ use ryft_pjrt::{
     GpuPlatform, Program, load_cuda_13_plugin,
 };
 #[cfg(any(test, feature = "cuda-13"))]
-use ryft_xla::experimental::{TracedXlaProgram, XlaArrayTracer, trace};
+use ryft_xla::experimental::{ArrayTracer, TracedProgram, trace};
 
 use super::DifferentialObservation;
 #[cfg(feature = "cuda-13")]
@@ -120,7 +120,7 @@ impl RaggedCase {
 
     /// Stages a transform while retaining all four metadata arrays as runtime arguments.
     #[cfg(any(test, feature = "cuda-13"))]
-    fn transformed(&self, inputs: Vec<XlaArrayTracer>) -> Result<Vec<XlaArrayTracer>, ProgramError> {
+    fn transformed(&self, inputs: Vec<ArrayTracer>) -> Result<Vec<ArrayTracer>, ProgramError> {
         match self.transform.as_str() {
             "primal" => Ok(vec![
                 inputs[0]
@@ -145,7 +145,7 @@ impl RaggedCase {
             "jvp" => {
                 // Both floating data inputs are active; integer transfer metadata are fixed runtime captures.
                 let active = vec![inputs[0].clone().into_value(), inputs[1].clone().into_value()];
-                let captures = inputs[2..6].iter().cloned().map(XlaArrayTracer::into_value).collect::<Vec<_>>();
+                let captures = inputs[2..6].iter().cloned().map(ArrayTracer::into_value).collect::<Vec<_>>();
                 let (primal, tangent) =
                     inputs[0].clone().into_value().domain().differentiate_at(active).with_captures(captures).jvp(
                         vec![inputs[6].clone().into_value(), inputs[7].clone().into_value()],
@@ -177,7 +177,7 @@ impl RaggedCase {
             }
             "vjp" => {
                 let active = vec![inputs[0].clone().into_value(), inputs[1].clone().into_value()];
-                let captures = inputs[2..6].iter().cloned().map(XlaArrayTracer::into_value).collect::<Vec<_>>();
+                let captures = inputs[2..6].iter().cloned().map(ArrayTracer::into_value).collect::<Vec<_>>();
                 let (primal, pullback) =
                     inputs[0].clone().into_value().domain().differentiate_at(active).with_captures(captures).vjp(
                         |active, captures| {
@@ -247,8 +247,8 @@ impl RaggedCase {
             .collect::<Vec<_>>();
         let input_shardings = shapes.iter().map(|shape| sharding(shape)).collect::<Result<Vec<_>, _>>()?;
         let output_shardings = output_shapes.iter().map(|shape| sharding(shape)).collect::<Result<Vec<_>, _>>()?;
-        let traced: TracedXlaProgram<Vec<ArrayType>, Vec<ArrayType>> = trace(
-            |inputs: Vec<XlaArrayTracer>| {
+        let traced: TracedProgram<Vec<ArrayType>, Vec<ArrayType>> = trace(
+            |inputs: Vec<ArrayTracer>| {
                 shard_map(
                     |inputs| self.transformed(inputs),
                     inputs,

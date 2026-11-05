@@ -9,7 +9,7 @@
 //! result types, and both branches normalize their results to the refined output types of the condition. Results whose
 //! types place them over explicit mesh axes are constrained to that placement.
 
-use ryft_core::{ArrayIrType, ArrayType, ConditionOperation, Operation, ProgramError, TypedProgram};
+use ryft_core::{ArrayIrType, ArrayType, ConditionOperation, Operation as CoreOperation, ProgramError, TypedProgram};
 use ryft_mlir::dialects::stable_hlo;
 use ryft_mlir::{Block, Operation as MlirOperation, Value as MlirValue, ValueRef};
 
@@ -18,12 +18,12 @@ use crate::operations::control_flow::{
     lower_control_flow_region, lower_explicit_sharding_constraints, lower_refined_region_input, lower_region_guard,
     lowered_effect_classes, set_threaded_effect_tokens,
 };
-use crate::{Error, LowerableOperation, LowerableOperationFamily, XlaLowerer};
+use crate::{Error, LowerableOperation, LowerableOperationFamily, Lowerer};
 
 impl LowerableOperation for ConditionOperation<ArrayType> {
     fn lower<'b, 'c: 'b, 't: 'c, O: LowerableOperationFamily>(
         &self,
-        _lowerer: &mut XlaLowerer<'b, 'c, 't, O>,
+        _lowerer: &mut Lowerer<'b, 'c, 't, O>,
         _input_values: &[ValueRef<'b, 'c, 't>],
         _input_types: &[ArrayType],
         _output_types: &[ArrayType],
@@ -41,7 +41,7 @@ impl LowerableOperation for ConditionOperation<ArrayType> {
 impl LowerableOperation for ConditionOperation<ArrayIrType> {
     fn lower<'b, 'c: 'b, 't: 'c, O: LowerableOperationFamily>(
         &self,
-        lowerer: &mut XlaLowerer<'b, 'c, 't, O>,
+        lowerer: &mut Lowerer<'b, 'c, 't, O>,
         input_values: &[ValueRef<'b, 'c, 't>],
         input_types: &[ArrayIrType],
         output_types: &[ArrayIrType],
@@ -154,20 +154,21 @@ mod tests {
     use pretty_assertions::assert_eq;
     use ryft_core::{
         AddOperation, ArrayOperation, ArrayType, AssertOperation, BatchAxis, BatchedProgram, CompareOperation,
-        ComparisonDirection, CompositeTransposeOperation, ConditionOperation, DataType, Dimension, DimensionBounds,
-        DimensionSizeOperation, DimensionType, DimensionVariable, DynamicBroadcastOperation, GuardOperation,
-        MeshAxisType, MulOperation, NegOperation, OneLikeOperation, OneOperation, Placeholder, PrintOperation,
-        ProgramBatchingOutputAxesPolicy, ReduceOperation, ReductionKind, ScanOperation, Shape, Sharding,
-        ShardingDimension, SubOperation, TransposedProgramCotangent, TypedProgram, WhileOperation, ZeroOperation,
+        ComparisonDirection, CompositeTransposeOperation, ConditionOperation, DataType, Dimension as CoreDimension,
+        DimensionBounds, DimensionSizeOperation, DimensionType, DimensionVariable, DynamicBroadcastOperation,
+        GuardOperation, MeshAxisType, MulOperation, NegOperation, OneLikeOperation, OneOperation, Placeholder,
+        PrintOperation, ProgramBatchingOutputAxesPolicy, ReduceOperation, ReductionKind, ScanOperation, Shape,
+        Sharding, ShardingDimension, SubOperation, TransposedProgramCotangent, TypedProgram, WhileOperation,
+        ZeroOperation,
     };
     use ryft_mlir::{Context as MlirContext, Location};
     use ryft_pjrt::{BufferType, ExecutionDeviceInputs, ExecutionInput, Program as PjrtProgram};
 
     use crate::experimental::lowering::tests::{
-        MixedValue, dynamic_dimension, execute_mixed_program, ragged_dot_cpu_compilation_options,
-        unproject_plain_program, xla_identity_branch, xla_neg_branch,
+        MixedValue, dynamic_dimension, execute_mixed_program, identity_branch, neg_branch,
+        ragged_dot_cpu_compilation_options, unproject_plain_program,
     };
-    use crate::experimental::ops::{XlaConstant, XlaOperation, XlaProgramBuilder as ArrayIrXlaProgramBuilder};
+    use crate::experimental::ops::{Constant, Operation, ProgramBuilder as ArrayIrProgramBuilder};
     use crate::operations::assertions::ensure_assertion_handler_registered;
     use crate::operations::control_flow::tests::{
         compare, execute_on_two_devices, lowered_mixed_module, positive, two_device_mesh,
@@ -182,25 +183,21 @@ mod tests {
     fn test_condition_lowering() {
         let predicate_type = ArrayType::scalar(DataType::Boolean);
         let input_type = ArrayType::scalar(DataType::F32);
-        let mut builder = ArrayIrXlaProgramBuilder::new();
-        let true_region = builder.import_program(unproject_plain_program(xla_neg_branch(input_type.clone())));
-        let false_region = builder.import_program(unproject_plain_program(xla_identity_branch(input_type.clone())));
+        let mut builder = ArrayIrProgramBuilder::new();
+        let true_region = builder.import_program(unproject_plain_program(neg_branch(input_type.clone())));
+        let false_region = builder.import_program(unproject_plain_program(identity_branch(input_type.clone())));
         let predicate = builder.add_input(predicate_type.clone().into());
         let input = builder.add_input(input_type.clone().into());
         let output = builder
             .add_instruction(
-                XlaOperation::Condition(ConditionOperation::new()),
+                Operation::Condition(ConditionOperation::new()),
                 vec![true_region, false_region],
                 vec![predicate, input],
                 None,
             )
             .unwrap()[0];
         let program = builder
-            .build::<Vec<XlaConstant>, Vec<XlaConstant>>(
-                vec![output],
-                vec![Placeholder, Placeholder],
-                vec![Placeholder],
-            )
+            .build::<Vec<Constant>, Vec<Constant>>(vec![output], vec![Placeholder, Placeholder], vec![Placeholder])
             .unwrap();
         let stablehlo = to_mlir_module_for_program(
             &program,
@@ -240,7 +237,7 @@ mod tests {
         let m = DimensionType::new("m", DimensionBounds::positive(Some(8)).unwrap());
         let array_type = ArrayType::new_static(DataType::F64, [2]);
         let branch = || {
-            let mut builder = ArrayIrXlaProgramBuilder::new();
+            let mut builder = ArrayIrProgramBuilder::new();
             let dimension = builder.add_input(m.clone().into());
             let array = builder.add_input(array_type.clone().into());
             let declared: Vec<ArrayIrType> = vec![
@@ -251,10 +248,10 @@ mod tests {
                 .add_instruction(GuardOperation::new("branch", declared), Vec::new(), vec![dimension, array], None)
                 .unwrap();
             builder
-                .build::<Vec<XlaConstant>, Vec<XlaConstant>>(vec![array], vec![Placeholder; 2], vec![Placeholder])
+                .build::<Vec<Constant>, Vec<Constant>>(vec![array], vec![Placeholder; 2], vec![Placeholder])
                 .unwrap()
         };
-        let mut builder = ArrayIrXlaProgramBuilder::new();
+        let mut builder = ArrayIrProgramBuilder::new();
         let true_region = builder.import_region(branch().entry_region_ref());
         let false_region = builder.import_region(branch().entry_region_ref());
         let predicate = builder.add_input(ArrayType::scalar(DataType::Boolean).into());
@@ -262,7 +259,7 @@ mod tests {
         let array = builder.add_input(array_type.clone().into());
         let selected = builder
             .add_instruction(
-                XlaOperation::Condition(ConditionOperation::new()),
+                Operation::Condition(ConditionOperation::new()),
                 vec![true_region, false_region],
                 vec![predicate, dimension, array],
                 None,
@@ -272,7 +269,7 @@ mod tests {
             .add_instruction(PrintOperation::<ArrayType>::new("value"), Vec::new(), vec![selected], None)
             .unwrap()[0];
         let program = builder
-            .build::<Vec<XlaConstant>, Vec<XlaConstant>>(vec![printed], vec![Placeholder; 3], vec![Placeholder])
+            .build::<Vec<Constant>, Vec<Constant>>(vec![printed], vec![Placeholder; 3], vec![Placeholder])
             .unwrap();
         let module = to_mlir_module_for_program(
             &program,
@@ -324,16 +321,16 @@ mod tests {
         let m = DimensionType::new("m", DimensionBounds::positive(Some(8)).unwrap());
         let array_type = ArrayType::new_static(DataType::F64, [2]);
         let inner_branch = || {
-            let mut builder = ArrayIrXlaProgramBuilder::new();
+            let mut builder = ArrayIrProgramBuilder::new();
             builder.add_input(n.clone().into());
             let array =
                 builder.add_input(ArrayType::new(DataType::F64, Shape::new(vec![n.simplified_dimension()])).into());
             builder
-                .build::<Vec<XlaConstant>, Vec<XlaConstant>>(vec![array], vec![Placeholder; 2], vec![Placeholder])
+                .build::<Vec<Constant>, Vec<Constant>>(vec![array], vec![Placeholder; 2], vec![Placeholder])
                 .unwrap()
         };
         let outer_branch = || {
-            let mut builder = ArrayIrXlaProgramBuilder::new();
+            let mut builder = ArrayIrProgramBuilder::new();
             let true_region = builder.import_region(inner_branch().entry_region_ref());
             let false_region = builder.import_region(inner_branch().entry_region_ref());
             let predicate = builder.add_input(ArrayType::scalar(DataType::Boolean).into());
@@ -341,18 +338,18 @@ mod tests {
             let array = builder.add_input(array_type.clone().into());
             let selected = builder
                 .add_instruction(
-                    XlaOperation::Condition(ConditionOperation::new()),
+                    Operation::Condition(ConditionOperation::new()),
                     vec![true_region, false_region],
                     vec![predicate, dimension, array],
                     None,
                 )
                 .unwrap()[0];
             builder
-                .build::<Vec<XlaConstant>, Vec<XlaConstant>>(vec![selected], vec![Placeholder; 3], vec![Placeholder])
+                .build::<Vec<Constant>, Vec<Constant>>(vec![selected], vec![Placeholder; 3], vec![Placeholder])
                 .unwrap()
         };
         assert!(outer_branch().effects().classes().is_empty());
-        let mut builder = ArrayIrXlaProgramBuilder::new();
+        let mut builder = ArrayIrProgramBuilder::new();
         let true_region = builder.import_region(outer_branch().entry_region_ref());
         let false_region = builder.import_region(outer_branch().entry_region_ref());
         let predicate = builder.add_input(ArrayType::scalar(DataType::Boolean).into());
@@ -360,7 +357,7 @@ mod tests {
         let array = builder.add_input(array_type.clone().into());
         let selected = builder
             .add_instruction(
-                XlaOperation::Condition(ConditionOperation::new()),
+                Operation::Condition(ConditionOperation::new()),
                 vec![true_region, false_region],
                 vec![predicate, predicate, dimension, array],
                 None,
@@ -370,7 +367,7 @@ mod tests {
             .add_instruction(PrintOperation::<ArrayType>::new("after"), Vec::new(), vec![selected], None)
             .unwrap()[0];
         let program = builder
-            .build::<Vec<XlaConstant>, Vec<XlaConstant>>(vec![printed], vec![Placeholder; 3], vec![Placeholder])
+            .build::<Vec<Constant>, Vec<Constant>>(vec![printed], vec![Placeholder; 3], vec![Placeholder])
             .unwrap();
         let module = to_mlir_module_for_program(
             &program,
@@ -447,22 +444,22 @@ mod tests {
         // simplification), not ryft's.
         let predicate_type = ArrayType::scalar(DataType::Boolean);
         let input_type = ArrayType::scalar(DataType::F32);
-        let mut builder = ArrayIrXlaProgramBuilder::new();
-        let true_region = builder.import_program(unproject_plain_program(xla_neg_branch(input_type.clone())));
-        let false_region = builder.import_program(unproject_plain_program(xla_identity_branch(input_type.clone())));
+        let mut builder = ArrayIrProgramBuilder::new();
+        let true_region = builder.import_program(unproject_plain_program(neg_branch(input_type.clone())));
+        let false_region = builder.import_program(unproject_plain_program(identity_branch(input_type.clone())));
         let input = builder.add_input(input_type.clone().into());
         let predicate =
             builder.add_instruction(OneOperation::new(predicate_type), Vec::new(), vec![], None).unwrap()[0];
         let output = builder
             .add_instruction(
-                XlaOperation::Condition(ConditionOperation::new()),
+                Operation::Condition(ConditionOperation::new()),
                 vec![true_region, false_region],
                 vec![predicate, input],
                 None,
             )
             .unwrap()[0];
         let program = builder
-            .build::<Vec<XlaConstant>, Vec<XlaConstant>>(vec![output], vec![Placeholder], vec![Placeholder])
+            .build::<Vec<Constant>, Vec<Constant>>(vec![output], vec![Placeholder], vec![Placeholder])
             .unwrap();
         let stablehlo =
             to_mlir_module_for_program(&program, &[], &input_type, &input_type, "main", None, None).unwrap();
@@ -490,13 +487,14 @@ mod tests {
     fn test_condition_lowering_forwards_dimension_extents() {
         let extent = DimensionVariable::new("extent", DimensionBounds::new(1, Some(9)).unwrap());
         let extent_type = DimensionType::from(extent.clone());
-        let dynamic_vector_type = ArrayType::new(DataType::F32, Shape::new(vec![Dimension::Dynamic(extent.clone())]));
+        let dynamic_vector_type =
+            ArrayType::new(DataType::F32, Shape::new(vec![CoreDimension::Dynamic(extent.clone())]));
         let scalar_type = ArrayType::scalar(DataType::F32);
         let predicate_type = ArrayType::scalar(DataType::Boolean);
         let output_type = dynamic_vector_type.clone();
 
         let branch = |negate: bool| {
-            let mut builder = ArrayIrXlaProgramBuilder::new();
+            let mut builder = ArrayIrProgramBuilder::new();
             let branch_extent = builder.add_input(extent_type.clone().into());
             let scalar = builder.add_input(scalar_type.clone().into());
             let scalar = if negate {
@@ -513,15 +511,11 @@ mod tests {
                 )
                 .unwrap()[0];
             builder
-                .build::<Vec<XlaConstant>, Vec<XlaConstant>>(
-                    vec![output],
-                    vec![Placeholder, Placeholder],
-                    vec![Placeholder],
-                )
+                .build::<Vec<Constant>, Vec<Constant>>(vec![output], vec![Placeholder, Placeholder], vec![Placeholder])
                 .unwrap()
         };
 
-        let mut builder = ArrayIrXlaProgramBuilder::new();
+        let mut builder = ArrayIrProgramBuilder::new();
         let true_region = builder.import_region(branch(false).entry_region_ref());
         let false_region = builder.import_region(branch(true).entry_region_ref());
         let vector = builder.add_input(dynamic_vector_type.clone().into());
@@ -537,14 +531,14 @@ mod tests {
             .unwrap()[0];
         let output = builder
             .add_instruction(
-                XlaOperation::Condition(ConditionOperation::new()),
+                Operation::Condition(ConditionOperation::new()),
                 vec![true_region, false_region],
                 vec![predicate, extent, scalar],
                 None,
             )
             .unwrap()[0];
         let program = builder
-            .build::<Vec<XlaConstant>, Vec<XlaConstant>>(
+            .build::<Vec<Constant>, Vec<Constant>>(
                 vec![output],
                 vec![Placeholder, Placeholder, Placeholder],
                 vec![Placeholder],
@@ -597,35 +591,31 @@ mod tests {
         // returns its print custom call's token, and the pure branch returns the entry token unchanged.
         let predicate_type = ArrayType::scalar(DataType::Boolean);
         let input_type = ArrayType::scalar(DataType::F64);
-        let mut true_builder = ArrayIrXlaProgramBuilder::new();
+        let mut true_builder = ArrayIrProgramBuilder::new();
         let true_input = true_builder.add_input(input_type.clone().into());
         let printed = true_builder
             .add_instruction(PrintOperation::<ArrayType>::new("taken"), Vec::new(), vec![true_input], None)
             .unwrap()[0];
         let negated = true_builder.add_instruction(NegOperation::new(), Vec::new(), vec![printed], None).unwrap()[0];
         let true_branch = true_builder
-            .build::<Vec<XlaConstant>, Vec<XlaConstant>>(vec![negated], vec![Placeholder], vec![Placeholder])
+            .build::<Vec<Constant>, Vec<Constant>>(vec![negated], vec![Placeholder], vec![Placeholder])
             .unwrap();
 
-        let mut builder = ArrayIrXlaProgramBuilder::new();
+        let mut builder = ArrayIrProgramBuilder::new();
         let true_region = builder.import_region(true_branch.entry_region_ref());
-        let false_region = builder.import_program(unproject_plain_program(xla_identity_branch(input_type.clone())));
+        let false_region = builder.import_program(unproject_plain_program(identity_branch(input_type.clone())));
         let predicate = builder.add_input(predicate_type.clone().into());
         let input = builder.add_input(input_type.clone().into());
         let output = builder
             .add_instruction(
-                XlaOperation::Condition(ConditionOperation::new()),
+                Operation::Condition(ConditionOperation::new()),
                 vec![true_region, false_region],
                 vec![predicate, input],
                 None,
             )
             .unwrap()[0];
         let program = builder
-            .build::<Vec<XlaConstant>, Vec<XlaConstant>>(
-                vec![output],
-                vec![Placeholder, Placeholder],
-                vec![Placeholder],
-            )
+            .build::<Vec<Constant>, Vec<Constant>>(vec![output], vec![Placeholder, Placeholder], vec![Placeholder])
             .unwrap();
         let input_types = vec![predicate_type, input_type.clone()];
         let output_types = vec![input_type];
@@ -658,11 +648,11 @@ mod tests {
         // branches return the union's two tokens while forwarding the untouched entry token for the unused class.
         let scalar_type = ArrayType::scalar(DataType::I64);
         let true_branch = {
-            let mut builder = ArrayIrXlaProgramBuilder::new();
+            let mut builder = ArrayIrProgramBuilder::new();
             let input = builder.add_input(scalar_type.clone().into());
             let predicate = builder
                 .add_instruction(
-                    XlaOperation::Array(ArrayOperation::Compare(CompareOperation::<ArrayType>::new(
+                    Operation::Array(ArrayOperation::Compare(CompareOperation::<ArrayType>::new(
                         ComparisonDirection::Equal,
                     ))),
                     Vec::new(),
@@ -680,38 +670,34 @@ mod tests {
                 )
                 .unwrap();
             builder
-                .build::<Vec<XlaConstant>, Vec<XlaConstant>>(vec![input], vec![Placeholder], vec![Placeholder])
+                .build::<Vec<Constant>, Vec<Constant>>(vec![input], vec![Placeholder], vec![Placeholder])
                 .unwrap()
         };
         let false_branch = {
-            let mut builder = ArrayIrXlaProgramBuilder::new();
+            let mut builder = ArrayIrProgramBuilder::new();
             let input = builder.add_input(scalar_type.clone().into());
             let output = builder
                 .add_instruction(PrintOperation::<ArrayType>::new("false"), Vec::new(), vec![input], None)
                 .unwrap()[0];
             builder
-                .build::<Vec<XlaConstant>, Vec<XlaConstant>>(vec![output], vec![Placeholder], vec![Placeholder])
+                .build::<Vec<Constant>, Vec<Constant>>(vec![output], vec![Placeholder], vec![Placeholder])
                 .unwrap()
         };
-        let mut builder = ArrayIrXlaProgramBuilder::new();
+        let mut builder = ArrayIrProgramBuilder::new();
         let true_region = builder.import_region(true_branch.entry_region_ref());
         let false_region = builder.import_region(false_branch.entry_region_ref());
         let predicate = builder.add_input(ArrayType::scalar(DataType::Boolean).into());
         let input = builder.add_input(scalar_type.clone().into());
         let output = builder
             .add_instruction(
-                XlaOperation::Condition(ConditionOperation::new()),
+                Operation::Condition(ConditionOperation::new()),
                 vec![true_region, false_region],
                 vec![predicate, input],
                 None,
             )
             .unwrap()[0];
         let program = builder
-            .build::<Vec<XlaConstant>, Vec<XlaConstant>>(
-                vec![output],
-                vec![Placeholder, Placeholder],
-                vec![Placeholder],
-            )
+            .build::<Vec<Constant>, Vec<Constant>>(vec![output], vec![Placeholder, Placeholder], vec![Placeholder])
             .unwrap();
         let stablehlo = to_mlir_module_for_program(
             &program,
@@ -751,7 +737,7 @@ mod tests {
         let scalar_type = ArrayType::scalar(DataType::F64);
         let predicate_type = ArrayType::scalar(DataType::Boolean);
         let branch = |label| {
-            let mut backward = ArrayIrXlaProgramBuilder::new();
+            let mut backward = ArrayIrProgramBuilder::new();
             let seed = backward.add_input(scalar_type.clone().into());
             backward
                 .add_instruction(PrintOperation::<ArrayType>::new(label), Vec::new(), vec![seed], None)
@@ -759,14 +745,14 @@ mod tests {
             let zero =
                 backward.add_instruction(ZeroOperation::new(scalar_type.clone()), Vec::new(), vec![], None).unwrap()[0];
             let backward = backward
-                .build::<Vec<XlaConstant>, Vec<XlaConstant>>(vec![zero], vec![Placeholder], vec![Placeholder])
+                .build::<Vec<Constant>, Vec<Constant>>(vec![zero], vec![Placeholder], vec![Placeholder])
                 .unwrap();
-            let mut builder = ArrayIrXlaProgramBuilder::new();
+            let mut builder = ArrayIrProgramBuilder::new();
             let backward = builder.import_region(backward.entry_region_ref());
             let input = builder.add_input(scalar_type.clone().into());
             let output = builder
                 .add_instruction(
-                    CompositeTransposeOperation::<XlaConstant, XlaOperation>::from_backward_region(
+                    CompositeTransposeOperation::<Constant, Operation>::from_backward_region(
                         0,
                         vec![scalar_type.clone().into()],
                         vec![scalar_type.clone().into()],
@@ -777,24 +763,24 @@ mod tests {
                 )
                 .unwrap()[0];
             builder
-                .build::<Vec<XlaConstant>, Vec<XlaConstant>>(vec![output], vec![Placeholder], vec![Placeholder])
+                .build::<Vec<Constant>, Vec<Constant>>(vec![output], vec![Placeholder], vec![Placeholder])
                 .unwrap()
         };
-        let mut builder = ArrayIrXlaProgramBuilder::new();
+        let mut builder = ArrayIrProgramBuilder::new();
         let true_branch = builder.import_region(branch("true backward").entry_region_ref());
         let false_branch = builder.import_region(branch("false backward").entry_region_ref());
         let predicate = builder.add_input(predicate_type.clone().into());
         let input = builder.add_input(scalar_type.clone().into());
         let output = builder
             .add_instruction(
-                XlaOperation::Condition(ConditionOperation::new()),
+                Operation::Condition(ConditionOperation::new()),
                 vec![true_branch, false_branch],
                 vec![predicate, input],
                 None,
             )
             .unwrap()[0];
         let program = builder
-            .build::<Vec<XlaConstant>, Vec<XlaConstant>>(vec![output], vec![Placeholder; 2], vec![Placeholder])
+            .build::<Vec<Constant>, Vec<Constant>>(vec![output], vec![Placeholder; 2], vec![Placeholder])
             .unwrap();
         let transposed = program.entry_region_ref().transpose(&[1], &[], &[]).unwrap();
         assert_eq!(transposed.cotangents(), &[TransposedProgramCotangent::Zero]);
@@ -897,14 +883,14 @@ mod tests {
         // An empty data-flow boundary must retain the selected branch's effects and sequence later effects after it.
         let scalar_type = ArrayType::scalar(DataType::F64);
         let branch = |label| {
-            let mut builder = ArrayIrXlaProgramBuilder::new();
+            let mut builder = ArrayIrProgramBuilder::new();
             let input = builder.add_input(scalar_type.clone().into());
             builder
                 .add_instruction(PrintOperation::<ArrayType>::new(label), Vec::new(), vec![input], None)
                 .unwrap();
-            builder.build::<Vec<XlaConstant>, Vec<XlaConstant>>(vec![], vec![Placeholder], vec![]).unwrap()
+            builder.build::<Vec<Constant>, Vec<Constant>>(vec![], vec![Placeholder], vec![]).unwrap()
         };
-        let mut builder = ArrayIrXlaProgramBuilder::new();
+        let mut builder = ArrayIrProgramBuilder::new();
         let true_branch = builder.import_region(branch("true").entry_region_ref());
         let false_branch = builder.import_region(branch("false").entry_region_ref());
         let predicate_type = ArrayType::scalar(DataType::Boolean);
@@ -912,7 +898,7 @@ mod tests {
         let input = builder.add_input(scalar_type.clone().into());
         let outputs = builder
             .add_instruction(
-                XlaOperation::Condition(ConditionOperation::new()),
+                Operation::Condition(ConditionOperation::new()),
                 vec![true_branch, false_branch],
                 vec![predicate, input],
                 None,
@@ -922,8 +908,7 @@ mod tests {
         builder
             .add_instruction(PrintOperation::<ArrayType>::new("after"), Vec::new(), vec![input], None)
             .unwrap();
-        let program =
-            builder.build::<Vec<XlaConstant>, Vec<XlaConstant>>(vec![], vec![Placeholder; 2], vec![]).unwrap();
+        let program = builder.build::<Vec<Constant>, Vec<Constant>>(vec![], vec![Placeholder; 2], vec![]).unwrap();
         let module = to_mlir_module_for_program(
             &program,
             &[],
@@ -1006,7 +991,7 @@ mod tests {
         let static_type = ArrayType::new_static(DataType::F64, [3]);
         let branch_input_type = ArrayType::new(DataType::F64, Shape::new(vec![dynamic_dimension("rows", Some(5))]));
         let branch = |add: bool| {
-            let mut builder = ArrayIrXlaProgramBuilder::new();
+            let mut builder = ArrayIrProgramBuilder::new();
             let first = builder.add_input(branch_input_type.clone().into());
             let second = builder.add_input(branch_input_type.clone().into());
             let output = if add {
@@ -1017,25 +1002,25 @@ mod tests {
                 first
             };
             builder
-                .build::<Vec<XlaConstant>, Vec<XlaConstant>>(vec![output], vec![Placeholder; 2], vec![Placeholder])
+                .build::<Vec<Constant>, Vec<Constant>>(vec![output], vec![Placeholder; 2], vec![Placeholder])
                 .unwrap()
         };
-        let mut builder = ArrayIrXlaProgramBuilder::new();
+        let mut builder = ArrayIrProgramBuilder::new();
         let true_branch = builder.import_region(branch(true).entry_region_ref());
         let false_branch = builder.import_region(branch(false).entry_region_ref());
-        let predicate = builder.add_constant(XlaConstant::Boolean(true));
+        let predicate = builder.add_constant(Constant::Boolean(true));
         let dynamic_input = builder.add_input(branch_input_type.clone().into());
         let static_input = builder.add_input(static_type.into());
         let output = builder
             .add_instruction(
-                XlaOperation::Condition(ConditionOperation::new()),
+                Operation::Condition(ConditionOperation::new()),
                 vec![true_branch, false_branch],
                 vec![predicate, dynamic_input, static_input],
                 None,
             )
             .unwrap()[0];
         let program = builder
-            .build::<Vec<XlaConstant>, Vec<XlaConstant>>(vec![output], vec![Placeholder; 2], vec![Placeholder])
+            .build::<Vec<Constant>, Vec<Constant>>(vec![output], vec![Placeholder; 2], vec![Placeholder])
             .unwrap();
         assert_eq!(program.output_types(), vec![ArrayIrType::Array(ArrayType::new_static(DataType::F64, [3]))]);
         assert_eq!(
@@ -1060,38 +1045,38 @@ mod tests {
         let static_type = ArrayType::new_static(DataType::F64, [3]);
         let client = execution_client();
         ensure_assertion_handler_registered(&client).unwrap();
-        let mut builder = ArrayIrXlaProgramBuilder::new();
+        let mut builder = ArrayIrProgramBuilder::new();
         builder.add_input(extent_type.clone().into());
         let input = builder.add_input(dynamic_type.clone().into());
         let true_branch = builder
-            .build::<Vec<XlaConstant>, Vec<XlaConstant>>(vec![input], vec![Placeholder; 2], vec![Placeholder])
+            .build::<Vec<Constant>, Vec<Constant>>(vec![input], vec![Placeholder; 2], vec![Placeholder])
             .unwrap();
-        let mut builder = ArrayIrXlaProgramBuilder::new();
+        let mut builder = ArrayIrProgramBuilder::new();
         builder.add_input(extent_type.clone().into());
         builder.add_input(dynamic_type.into());
         let output = builder
             .add_instruction(ZeroOperation::new(static_type.clone().into()), Vec::new(), Vec::new(), None)
             .unwrap()[0];
         let false_branch = builder
-            .build::<Vec<XlaConstant>, Vec<XlaConstant>>(vec![output], vec![Placeholder; 2], vec![Placeholder])
+            .build::<Vec<Constant>, Vec<Constant>>(vec![output], vec![Placeholder; 2], vec![Placeholder])
             .unwrap();
         for predicate_value in [false, true] {
             // The broad first-class dimension and static array share an extent relationship that structural
             // specialization cannot replace. Direct construction retains both declared branch programs, whose declared
             // outputs (`f64[extent]` and `f64[3]`) agree only after input refinement.
-            let mut builder = ArrayIrXlaProgramBuilder::new();
+            let mut builder = ArrayIrProgramBuilder::new();
             let regions = vec![
                 builder.import_region(true_branch.entry_region_ref()),
                 builder.import_region(false_branch.entry_region_ref()),
             ];
-            let predicate = builder.add_constant(XlaConstant::Boolean(predicate_value));
+            let predicate = builder.add_constant(Constant::Boolean(predicate_value));
             let extent = builder.add_input(extent_type.clone().into());
             let input = builder.add_input(static_type.clone().into());
             let output = builder
                 .add_instruction(ConditionOperation::new(), regions, vec![predicate, extent, input], None)
                 .unwrap()[0];
             let program = builder
-                .build::<Vec<XlaConstant>, Vec<XlaConstant>>(vec![output], vec![Placeholder; 2], vec![Placeholder])
+                .build::<Vec<Constant>, Vec<Constant>>(vec![output], vec![Placeholder; 2], vec![Placeholder])
                 .unwrap();
             assert_eq!(program.output_types(), vec![ArrayIrType::Array(static_type.clone())]);
             let expected = if predicate_value { vec![1.0, 2.0, 3.0] } else { vec![0.0; 3] };
@@ -1129,10 +1114,10 @@ mod tests {
         let context = MlirContext::new();
         let location = context.unknown_location().as_ref();
         let block = context.block_with_no_arguments();
-        let branch = unproject_plain_program(xla_identity_branch(ArrayType::scalar(DataType::F32)));
+        let branch = unproject_plain_program(identity_branch(ArrayType::scalar(DataType::F32)));
 
         // The plain array family cannot carry branch regions, so conditions lower only from the array IR family.
-        let mut lowerer = XlaLowerer::new(block.as_ref(), &context, location).with_regions(vec![branch.clone(); 2]);
+        let mut lowerer = Lowerer::new(block.as_ref(), &context, location).with_regions(vec![branch.clone(); 2]);
         let expected_message = concat!(
             "higher-order operation `condition` must be stored directly ",
             "in the enclosing backend operation family",
@@ -1144,7 +1129,7 @@ mod tests {
         ));
 
         // An array IR condition needs exactly one region per branch.
-        let mut lowerer = XlaLowerer::new(block.as_ref(), &context, location).with_regions(vec![branch.clone()]);
+        let mut lowerer = Lowerer::new(block.as_ref(), &context, location).with_regions(vec![branch.clone()]);
         assert!(matches!(
             ConditionOperation::<ArrayIrType>::new().lower(&mut lowerer, &[], &[], &[]),
             Err(Error::Core(ryft_core::Error::Program(ProgramError::MalformedProgram(message))))
@@ -1152,7 +1137,7 @@ mod tests {
         ));
 
         // It also needs the predicate followed by one input per branch input.
-        let mut lowerer = XlaLowerer::new(block.as_ref(), &context, location).with_regions(vec![branch; 2]);
+        let mut lowerer = Lowerer::new(block.as_ref(), &context, location).with_regions(vec![branch; 2]);
         assert!(matches!(
             ConditionOperation::<ArrayIrType>::new().lower(&mut lowerer, &[], &[], &[]),
             Err(Error::Core(ryft_core::Error::Program(ProgramError::InvalidInputCount { expected: 2, actual: 0 }))),
@@ -1168,7 +1153,7 @@ mod tests {
         let scalar_type = ArrayType::scalar(DataType::F64);
         let empty_type = ArrayType::new_static(DataType::F64, [0]);
         let branch = |negate: bool| {
-            let mut builder = ArrayIrXlaProgramBuilder::new();
+            let mut builder = ArrayIrProgramBuilder::new();
             let extent = builder.add_input(extent_type.clone().into());
             let scalar = builder.add_input(scalar_type.clone().into());
             let (scalar, empty) = if negate {
@@ -1187,14 +1172,10 @@ mod tests {
                 .add_instruction(DynamicBroadcastOperation::new(Vec::new()), Vec::new(), vec![scalar, extent], None)
                 .unwrap()[0];
             builder
-                .build::<Vec<XlaConstant>, Vec<XlaConstant>>(
-                    vec![vector, empty],
-                    vec![Placeholder; 2],
-                    vec![Placeholder; 2],
-                )
+                .build::<Vec<Constant>, Vec<Constant>>(vec![vector, empty], vec![Placeholder; 2], vec![Placeholder; 2])
                 .unwrap()
         };
-        let mut builder = ArrayIrXlaProgramBuilder::new();
+        let mut builder = ArrayIrProgramBuilder::new();
         let true_region = builder.import_region(branch(false).entry_region_ref());
         let false_region = builder.import_region(branch(true).entry_region_ref());
         let selector = builder.add_input(scalar_type.clone().into());
@@ -1203,7 +1184,7 @@ mod tests {
         let predicate = positive(&mut builder, selector);
         let outputs = builder
             .add_instruction(
-                XlaOperation::Condition(ConditionOperation::new()),
+                Operation::Condition(ConditionOperation::new()),
                 vec![true_region, false_region],
                 vec![predicate, extent, scalar],
                 None,
@@ -1211,7 +1192,7 @@ mod tests {
             .unwrap()
             .to_vec();
         let program = builder
-            .build::<Vec<XlaConstant>, Vec<XlaConstant>>(outputs, vec![Placeholder; 3], vec![Placeholder; 2])
+            .build::<Vec<Constant>, Vec<Constant>>(outputs, vec![Placeholder; 3], vec![Placeholder; 2])
             .unwrap();
         assert_eq!(
             program.to_string(),
@@ -1298,7 +1279,7 @@ mod tests {
         let extent_type = DimensionType::new("extent", DimensionBounds::non_negative(Some(9)).unwrap());
         let scalar_type = ArrayType::scalar(DataType::F64);
         let branch = |negate: bool| {
-            let mut builder = ArrayIrXlaProgramBuilder::new();
+            let mut builder = ArrayIrProgramBuilder::new();
             let extent = builder.add_input(extent_type.clone().into());
             let scalar = builder.add_input(scalar_type.clone().into());
             let scalar = if negate {
@@ -1310,14 +1291,10 @@ mod tests {
                 .add_instruction(DynamicBroadcastOperation::new(Vec::new()), Vec::new(), vec![scalar, extent], None)
                 .unwrap()[0];
             builder
-                .build::<Vec<XlaConstant>, Vec<XlaConstant>>(
-                    vec![vector, vector],
-                    vec![Placeholder; 2],
-                    vec![Placeholder; 2],
-                )
+                .build::<Vec<Constant>, Vec<Constant>>(vec![vector, vector], vec![Placeholder; 2], vec![Placeholder; 2])
                 .unwrap()
         };
-        let mut builder = ArrayIrXlaProgramBuilder::new();
+        let mut builder = ArrayIrProgramBuilder::new();
         let true_region = builder.import_region(branch(false).entry_region_ref());
         let false_region = builder.import_region(branch(true).entry_region_ref());
         let selector = builder.add_input(scalar_type.clone().into());
@@ -1326,7 +1303,7 @@ mod tests {
         let predicate = positive(&mut builder, selector);
         let outputs = builder
             .add_instruction(
-                XlaOperation::Condition(ConditionOperation::new()),
+                Operation::Condition(ConditionOperation::new()),
                 vec![true_region, false_region],
                 vec![predicate, extent, scalar],
                 None,
@@ -1334,7 +1311,7 @@ mod tests {
             .unwrap()
             .to_vec();
         let program = builder
-            .build::<Vec<XlaConstant>, Vec<XlaConstant>>(outputs, vec![Placeholder; 3], vec![Placeholder; 2])
+            .build::<Vec<Constant>, Vec<Constant>>(outputs, vec![Placeholder; 3], vec![Placeholder; 2])
             .unwrap();
         assert_eq!(
             program.to_string(),
@@ -1416,14 +1393,14 @@ mod tests {
         // The assertion must not run when the `true` branch is selected.
         let scalar_type = ArrayType::scalar(DataType::F64);
         let true_branch = {
-            let mut builder = ArrayIrXlaProgramBuilder::new();
+            let mut builder = ArrayIrProgramBuilder::new();
             let selector = builder.add_input(scalar_type.clone().into());
             builder
-                .build::<Vec<XlaConstant>, Vec<XlaConstant>>(vec![selector], vec![Placeholder], vec![Placeholder])
+                .build::<Vec<Constant>, Vec<Constant>>(vec![selector], vec![Placeholder], vec![Placeholder])
                 .unwrap()
         };
         let false_branch = {
-            let mut builder = ArrayIrXlaProgramBuilder::new();
+            let mut builder = ArrayIrProgramBuilder::new();
             let selector = builder.add_input(scalar_type.clone().into());
             let predicate = positive(&mut builder, selector);
             builder
@@ -1436,24 +1413,24 @@ mod tests {
                 )
                 .unwrap();
             builder
-                .build::<Vec<XlaConstant>, Vec<XlaConstant>>(vec![selector], vec![Placeholder], vec![Placeholder])
+                .build::<Vec<Constant>, Vec<Constant>>(vec![selector], vec![Placeholder], vec![Placeholder])
                 .unwrap()
         };
-        let mut builder = ArrayIrXlaProgramBuilder::new();
+        let mut builder = ArrayIrProgramBuilder::new();
         let true_region = builder.import_region(true_branch.entry_region_ref());
         let false_region = builder.import_region(false_branch.entry_region_ref());
         let selector = builder.add_input(scalar_type.into());
         let predicate = positive(&mut builder, selector);
         let output = builder
             .add_instruction(
-                XlaOperation::Condition(ConditionOperation::new()),
+                Operation::Condition(ConditionOperation::new()),
                 vec![true_region, false_region],
                 vec![predicate, selector],
                 None,
             )
             .unwrap()[0];
         let program = builder
-            .build::<Vec<XlaConstant>, Vec<XlaConstant>>(vec![output], vec![Placeholder], vec![Placeholder])
+            .build::<Vec<Constant>, Vec<Constant>>(vec![output], vec![Placeholder], vec![Placeholder])
             .unwrap();
         assert_eq!(
             program.to_string(),
@@ -1516,28 +1493,28 @@ mod tests {
         // through the condition, so that the prints appear once per iteration and in iteration order.
         let scalar_type = ArrayType::scalar(DataType::F64);
         let print_branch = |label| {
-            let mut builder = ArrayIrXlaProgramBuilder::new();
+            let mut builder = ArrayIrProgramBuilder::new();
             let index = builder.add_input(scalar_type.clone().into());
             let index = builder
                 .add_instruction(PrintOperation::<ArrayType>::new(label), Vec::new(), vec![index], None)
                 .unwrap()[0];
             builder
-                .build::<Vec<XlaConstant>, Vec<XlaConstant>>(vec![index], vec![Placeholder], vec![Placeholder])
+                .build::<Vec<Constant>, Vec<Constant>>(vec![index], vec![Placeholder], vec![Placeholder])
                 .unwrap()
         };
         let loop_condition = {
-            let mut builder = ArrayIrXlaProgramBuilder::new();
+            let mut builder = ArrayIrProgramBuilder::new();
             let index = builder.add_input(scalar_type.clone().into());
             let limit = builder.add_input(scalar_type.clone().into());
             let predicate = builder
                 .add_instruction(compare(ComparisonDirection::LessThan), Vec::new(), vec![index, limit], None)
                 .unwrap()[0];
             builder
-                .build::<Vec<XlaConstant>, Vec<XlaConstant>>(vec![predicate], vec![Placeholder; 2], vec![Placeholder])
+                .build::<Vec<Constant>, Vec<Constant>>(vec![predicate], vec![Placeholder; 2], vec![Placeholder])
                 .unwrap()
         };
         let loop_body = {
-            let mut builder = ArrayIrXlaProgramBuilder::new();
+            let mut builder = ArrayIrProgramBuilder::new();
             let first_region = builder.import_region(print_branch("first").entry_region_ref());
             let later_region = builder.import_region(print_branch("later").entry_region_ref());
             let index = builder.add_input(scalar_type.clone().into());
@@ -1550,7 +1527,7 @@ mod tests {
                 .unwrap()[0];
             let index = builder
                 .add_instruction(
-                    XlaOperation::Condition(ConditionOperation::new()),
+                    Operation::Condition(ConditionOperation::new()),
                     vec![first_region, later_region],
                     vec![is_first, index],
                     None,
@@ -1558,28 +1535,24 @@ mod tests {
                 .unwrap()[0];
             let next = builder.add_instruction(AddOperation::new(), Vec::new(), vec![index, one], None).unwrap()[0];
             builder
-                .build::<Vec<XlaConstant>, Vec<XlaConstant>>(
-                    vec![next, limit],
-                    vec![Placeholder; 2],
-                    vec![Placeholder; 2],
-                )
+                .build::<Vec<Constant>, Vec<Constant>>(vec![next, limit], vec![Placeholder; 2], vec![Placeholder; 2])
                 .unwrap()
         };
-        let mut builder = ArrayIrXlaProgramBuilder::new();
+        let mut builder = ArrayIrProgramBuilder::new();
         let condition_region = builder.import_region(loop_condition.entry_region_ref());
         let body_region = builder.import_region(loop_body.entry_region_ref());
         let index = builder.add_input(scalar_type.clone().into());
         let limit = builder.add_input(scalar_type.into());
         let output = builder
             .add_instruction(
-                XlaOperation::While(WhileOperation::new()),
+                Operation::While(WhileOperation::new()),
                 vec![condition_region, body_region],
                 vec![index, limit],
                 None,
             )
             .unwrap()[0];
         let program = builder
-            .build::<Vec<XlaConstant>, Vec<XlaConstant>>(vec![output], vec![Placeholder; 2], vec![Placeholder])
+            .build::<Vec<Constant>, Vec<Constant>>(vec![output], vec![Placeholder; 2], vec![Placeholder])
             .unwrap();
         assert_eq!(
             program.to_string(),
@@ -1662,7 +1635,7 @@ mod tests {
         // order.
         let scalar_type = ArrayType::scalar(DataType::F64);
         let branch = |label, add: bool| {
-            let mut builder = ArrayIrXlaProgramBuilder::new();
+            let mut builder = ArrayIrProgramBuilder::new();
             let carry = builder.add_input(scalar_type.clone().into());
             let item = builder.add_input(scalar_type.clone().into());
             let item = builder
@@ -1674,11 +1647,11 @@ mod tests {
                 builder.add_instruction(SubOperation::new(), Vec::new(), vec![carry, item], None).unwrap()[0]
             };
             builder
-                .build::<Vec<XlaConstant>, Vec<XlaConstant>>(vec![carry], vec![Placeholder; 2], vec![Placeholder])
+                .build::<Vec<Constant>, Vec<Constant>>(vec![carry], vec![Placeholder; 2], vec![Placeholder])
                 .unwrap()
         };
         let body = {
-            let mut builder = ArrayIrXlaProgramBuilder::new();
+            let mut builder = ArrayIrProgramBuilder::new();
             let true_region = builder.import_region(branch("positive", true).entry_region_ref());
             let false_region = builder.import_region(branch("nonpositive", false).entry_region_ref());
             builder.add_input(ArrayType::scalar(DataType::I64).into());
@@ -1687,35 +1660,26 @@ mod tests {
             let predicate = positive(&mut builder, item);
             let carry = builder
                 .add_instruction(
-                    XlaOperation::Condition(ConditionOperation::new()),
+                    Operation::Condition(ConditionOperation::new()),
                     vec![true_region, false_region],
                     vec![predicate, carry, item],
                     None,
                 )
                 .unwrap()[0];
             builder
-                .build::<Vec<XlaConstant>, Vec<XlaConstant>>(
-                    vec![carry, carry],
-                    vec![Placeholder; 3],
-                    vec![Placeholder; 2],
-                )
+                .build::<Vec<Constant>, Vec<Constant>>(vec![carry, carry], vec![Placeholder; 3], vec![Placeholder; 2])
                 .unwrap()
         };
-        let mut builder = ArrayIrXlaProgramBuilder::new();
+        let mut builder = ArrayIrProgramBuilder::new();
         let body_region = builder.import_region(body.entry_region_ref());
         let initial = builder.add_input(scalar_type.into());
         let items = builder.add_input(ArrayType::new_static(DataType::F64, [3]).into());
         let outputs = builder
-            .add_instruction(
-                XlaOperation::Scan(ScanOperation::new(1, 3)),
-                vec![body_region],
-                vec![initial, items],
-                None,
-            )
+            .add_instruction(Operation::Scan(ScanOperation::new(1, 3)), vec![body_region], vec![initial, items], None)
             .unwrap()
             .to_vec();
         let program = builder
-            .build::<Vec<XlaConstant>, Vec<XlaConstant>>(outputs, vec![Placeholder; 2], vec![Placeholder; 2])
+            .build::<Vec<Constant>, Vec<Constant>>(outputs, vec![Placeholder; 2], vec![Placeholder; 2])
             .unwrap();
         assert_eq!(
             program.to_string(),
@@ -1806,7 +1770,7 @@ mod tests {
         // The condition negates its input when the selector is positive and doubles it otherwise.
         let scalar_type = ArrayType::scalar(DataType::F64);
         let branch = |negate: bool| {
-            let mut builder = ArrayIrXlaProgramBuilder::new();
+            let mut builder = ArrayIrProgramBuilder::new();
             let input = builder.add_input(scalar_type.clone().into());
             let output = if negate {
                 builder.add_instruction(NegOperation::new(), Vec::new(), vec![input], None).unwrap()[0]
@@ -1814,10 +1778,10 @@ mod tests {
                 builder.add_instruction(AddOperation::new(), Vec::new(), vec![input, input], None).unwrap()[0]
             };
             builder
-                .build::<Vec<XlaConstant>, Vec<XlaConstant>>(vec![output], vec![Placeholder], vec![Placeholder])
+                .build::<Vec<Constant>, Vec<Constant>>(vec![output], vec![Placeholder], vec![Placeholder])
                 .unwrap()
         };
-        let mut builder = ArrayIrXlaProgramBuilder::new();
+        let mut builder = ArrayIrProgramBuilder::new();
         let true_region = builder.import_region(branch(true).entry_region_ref());
         let false_region = builder.import_region(branch(false).entry_region_ref());
         let selector = builder.add_input(scalar_type.clone().into());
@@ -1825,17 +1789,17 @@ mod tests {
         let predicate = positive(&mut builder, selector);
         let output = builder
             .add_instruction(
-                XlaOperation::Condition(ConditionOperation::new()),
+                Operation::Condition(ConditionOperation::new()),
                 vec![true_region, false_region],
                 vec![predicate, input],
                 None,
             )
             .unwrap()[0];
         let program = builder
-            .build::<Vec<XlaConstant>, Vec<XlaConstant>>(vec![output], vec![Placeholder; 2], vec![Placeholder])
+            .build::<Vec<Constant>, Vec<Constant>>(vec![output], vec![Placeholder; 2], vec![Placeholder])
             .unwrap();
         let client = execution_client();
-        let batch_type = DimensionType::from(Dimension::Static(3));
+        let batch_type = DimensionType::from(CoreDimension::Static(3));
 
         // A replicated predicate selects one branch for the whole batch, so the batched program keeps the condition.
         let (batched, output_axes) = program
@@ -1937,7 +1901,7 @@ mod tests {
         let scalar_type = ArrayType::scalar(DataType::F64);
         let vector_type = ArrayType::new(DataType::F64, Shape::new(vec![n.dimension().clone()]));
         let true_branch = {
-            let mut builder = ArrayIrXlaProgramBuilder::new();
+            let mut builder = ArrayIrProgramBuilder::new();
             let input = builder.add_input(vector_type.clone().into());
             let sum = builder
                 .add_instruction(ReduceOperation::new(vec![0], ReductionKind::Sum), Vec::new(), vec![input], None)
@@ -1949,18 +1913,18 @@ mod tests {
                 .add_instruction(DynamicBroadcastOperation::new(Vec::new()), Vec::new(), vec![sum, extent], None)
                 .unwrap()[0];
             builder
-                .build::<Vec<XlaConstant>, Vec<XlaConstant>>(vec![output], vec![Placeholder], vec![Placeholder])
+                .build::<Vec<Constant>, Vec<Constant>>(vec![output], vec![Placeholder], vec![Placeholder])
                 .unwrap()
         };
         let false_branch = {
-            let mut builder = ArrayIrXlaProgramBuilder::new();
+            let mut builder = ArrayIrProgramBuilder::new();
             let input = builder.add_input(vector_type.clone().into());
             let output = builder.add_instruction(MulOperation::new(), Vec::new(), vec![input, input], None).unwrap()[0];
             builder
-                .build::<Vec<XlaConstant>, Vec<XlaConstant>>(vec![output], vec![Placeholder], vec![Placeholder])
+                .build::<Vec<Constant>, Vec<Constant>>(vec![output], vec![Placeholder], vec![Placeholder])
                 .unwrap()
         };
-        let mut builder = ArrayIrXlaProgramBuilder::new();
+        let mut builder = ArrayIrProgramBuilder::new();
         let true_region = builder.import_region(true_branch.entry_region_ref());
         let false_region = builder.import_region(false_branch.entry_region_ref());
         let selector = builder.add_input(scalar_type.clone().into());
@@ -1968,14 +1932,14 @@ mod tests {
         let predicate = positive(&mut builder, selector);
         let output = builder
             .add_instruction(
-                XlaOperation::Condition(ConditionOperation::new()),
+                Operation::Condition(ConditionOperation::new()),
                 vec![true_region, false_region],
                 vec![predicate, input],
                 None,
             )
             .unwrap()[0];
         let program = builder
-            .build::<Vec<XlaConstant>, Vec<XlaConstant>>(vec![output], vec![Placeholder; 2], vec![Placeholder])
+            .build::<Vec<Constant>, Vec<Constant>>(vec![output], vec![Placeholder; 2], vec![Placeholder])
             .unwrap();
         let linearization = program.linearize_with_respect_to(&[1]).unwrap();
         assert_eq!(
@@ -2040,7 +2004,7 @@ mod tests {
         );
 
         // The primal and the pullback run in one program, which keeps the boolean predicate residual inside it.
-        let mut builder = ArrayIrXlaProgramBuilder::new();
+        let mut builder = ArrayIrProgramBuilder::new();
         let selector = builder.add_input(scalar_type.into());
         let input = builder.add_input(vector_type.clone().into());
         let cotangent = builder.add_input(vector_type.into());
@@ -2049,7 +2013,7 @@ mod tests {
         pullback_inputs.extend_from_slice(&primal_outputs[1..]);
         let gradient = builder.splice_program(&pullback, &pullback_inputs).unwrap();
         let program = builder
-            .build::<Vec<XlaConstant>, Vec<XlaConstant>>(
+            .build::<Vec<Constant>, Vec<Constant>>(
                 vec![primal_outputs[0], gradient[0]],
                 vec![Placeholder; 3],
                 vec![Placeholder; 2],
@@ -2144,22 +2108,22 @@ mod tests {
             Sharding::new(mesh.logical_mesh().clone(), vec![ShardingDimension::sharded(["x"])]).unwrap();
         let selector_type = ArrayType::scalar(DataType::F32).with_sharding(selector_sharding.clone()).unwrap();
         let vector_type = ArrayType::new_static(DataType::F32, [8]).with_sharding(vector_sharding.clone()).unwrap();
-        let mut builder = ArrayIrXlaProgramBuilder::new();
-        let true_region = builder.import_program(unproject_plain_program(xla_neg_branch(vector_type.clone())));
-        let false_region = builder.import_program(unproject_plain_program(xla_identity_branch(vector_type.clone())));
+        let mut builder = ArrayIrProgramBuilder::new();
+        let true_region = builder.import_program(unproject_plain_program(neg_branch(vector_type.clone())));
+        let false_region = builder.import_program(unproject_plain_program(identity_branch(vector_type.clone())));
         let selector = builder.add_input(selector_type.clone().into());
         let input = builder.add_input(vector_type.clone().into());
         let predicate = positive(&mut builder, selector);
         let output = builder
             .add_instruction(
-                XlaOperation::Condition(ConditionOperation::new()),
+                Operation::Condition(ConditionOperation::new()),
                 vec![true_region, false_region],
                 vec![predicate, input],
                 None,
             )
             .unwrap()[0];
         let program = builder
-            .build::<Vec<XlaConstant>, Vec<XlaConstant>>(vec![output], vec![Placeholder; 2], vec![Placeholder])
+            .build::<Vec<Constant>, Vec<Constant>>(vec![output], vec![Placeholder; 2], vec![Placeholder])
             .unwrap();
         assert_eq!(
             program.to_string(),

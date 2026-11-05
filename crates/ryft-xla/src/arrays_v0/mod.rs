@@ -28,7 +28,7 @@ pub mod transfers;
 #[cfg(test)]
 pub mod tests;
 
-pub use crate::arrays::{ShardDescriptor, ShardIndex, ShardLayout, XlaArrayShard};
+pub use crate::arrays::{ArrayShard, ShardDescriptor, ShardIndex, ShardLayout};
 pub use device_put::{DevicePutLeaf, device_put};
 pub use execution::ExecuteArguments;
 pub(crate) use host::DenseHostDevicePutLeaf;

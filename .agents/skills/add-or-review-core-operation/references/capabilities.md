@@ -59,7 +59,7 @@ different role; inspect their existing contract instead of mechanically giving t
   project) bound the projected member by the capability (e.g., `V::Projected: Sort<ArrayType>`) and rebuild results
   through `from_projected`. Never pin `Projected = ProjectedValue<ArrayType, V>`: that serves only array IR tracers and
   forces concrete array IR values (e.g., `ArrayIrValue<A>` or a backend's array IR value) to duplicate the forwarding.
-- Backend array IR values that dispatch through a stateful rich domain (e.g., `ryft-xla`'s `XlaValue`) carry that state
+- Backend array IR values that dispatch through a stateful rich domain (e.g., `ryft_xla::Value`) carry that state
   (e.g., the session) in every member and in every projected representation, because `ValueProjection::from_projected`
   is infallible and receives no state. Host-side values enter such a domain through its constants (`Context::lift`),
   never through a state-less constructor, and host-side semantics that do not depend on the state (e.g., predicate and

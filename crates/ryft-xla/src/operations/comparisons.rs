@@ -8,7 +8,7 @@ use ryft_mlir::{
 
 use crate::experimental::lowering::types::lower_signed_one_bit_to_mlir;
 use crate::operations::normalize_binary_elementwise_operands;
-use crate::{Error, LowerableOperation, LowerableOperationFamily, ToMlir, XlaLowerer};
+use crate::{Error, LowerableOperation, LowerableOperationFamily, Lowerer, ToMlir};
 
 /// Returns the promoted numeric operand descriptor for one comparison result descriptor.
 pub(crate) fn comparison_operand_type(
@@ -80,7 +80,7 @@ fn comparison_type_for_mlir_type<'c, 't>(r#type: TypeRef<'c, 't>) -> Result<stab
 impl LowerableOperation for CompareOperation<ArrayType> {
     fn lower<'b, 'c: 'b, 't: 'c, O: LowerableOperationFamily>(
         &self,
-        lowerer: &mut XlaLowerer<'b, 'c, 't, O>,
+        lowerer: &mut Lowerer<'b, 'c, 't, O>,
         input_values: &[ValueRef<'b, 'c, 't>],
         input_types: &[ArrayType],
         output_types: &[ArrayType],
@@ -112,7 +112,7 @@ impl LowerableOperation for CompareOperation<ArrayType> {
 impl LowerableOperation for CompareOperation<ArrayIrType> {
     fn lower<'b, 'c: 'b, 't: 'c, O: LowerableOperationFamily>(
         &self,
-        lowerer: &mut XlaLowerer<'b, 'c, 't, O>,
+        lowerer: &mut Lowerer<'b, 'c, 't, O>,
         input_values: &[ValueRef<'b, 'c, 't>],
         _input_types: &[ArrayIrType],
         _output_types: &[ArrayIrType],

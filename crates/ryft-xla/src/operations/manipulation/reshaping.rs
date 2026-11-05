@@ -1,6 +1,7 @@
 use ryft_core::macros::check_count;
 use ryft_core::{
-    ArrayIrType, ArrayType, Dimension, DynamicReshapeOperation, EffectClass, Operation, ProgramError, ReshapeOperation,
+    ArrayIrType, ArrayType, Dimension as CoreDimension, DynamicReshapeOperation, EffectClass,
+    Operation as CoreOperation, ProgramError, ReshapeOperation,
 };
 use ryft_mlir::dialects::{stable_hlo, tensor};
 use ryft_mlir::{
@@ -19,12 +20,12 @@ use crate::operations::assertions::{
     lower_assertion_custom_call, lower_deliberately_false_assertion_predicate,
 };
 use crate::operations::sharding::constrain_sharding::lower_sharding_constraint;
-use crate::{Error, LowerableOperation, LowerableOperationFamily, LoweringError, XlaLowerer};
+use crate::{Error, LowerableOperation, LowerableOperationFamily, Lowerer, LoweringError};
 
 impl LowerableOperation for ReshapeOperation {
     fn lower<'b, 'c: 'b, 't: 'c, O: LowerableOperationFamily>(
         &self,
-        lowerer: &mut XlaLowerer<'b, 'c, 't, O>,
+        lowerer: &mut Lowerer<'b, 'c, 't, O>,
         input_values: &[ValueRef<'b, 'c, 't>],
         input_types: &[ArrayType],
         output_types: &[ArrayType],
@@ -74,17 +75,17 @@ fn lower_reshape_to_mlir<'b, 'c: 'b, 't: 'c>(
                 .dimensions()
                 .iter()
                 .enumerate()
-                .filter(|(_, dimension)| **dimension != Dimension::Static(1))
+                .filter(|(_, dimension)| **dimension != CoreDimension::Static(1))
                 .map(|(axis, _)| axis);
             let mut extents = Vec::with_capacity(output_types[0].rank());
             for dimension in output_types[0].shape().dimensions() {
                 extents.push(match dimension {
-                    Dimension::Static(1) => lower_static_index_constants(&[1], block, context, location)?[0],
-                    Dimension::Static(extent) => {
+                    CoreDimension::Static(1) => lower_static_index_constants(&[1], block, context, location)?[0],
+                    CoreDimension::Static(extent) => {
                         input_axes.next();
                         lower_static_index_constants(&[*extent], block, context, location)?[0]
                     }
-                    Dimension::Dynamic(_) => {
+                    CoreDimension::Dynamic(_) => {
                         let axis = input_axes.next().ok_or_else(|| {
                             Error::Lowering(LoweringError::UnsupportedOperation {
                                 operation: operation.name().to_string(),
@@ -105,8 +106,8 @@ fn lower_reshape_to_mlir<'b, 'c: 'b, 't: 'c>(
                 .dimensions()
                 .iter()
                 .map(|dimension| match dimension {
-                    Dimension::Static(extent) => Some(*extent),
-                    Dimension::Dynamic(_) => stable_hlo_dynamic_dimension_bound(dimension),
+                    CoreDimension::Static(extent) => Some(*extent),
+                    CoreDimension::Dynamic(_) => stable_hlo_dynamic_dimension_bound(dimension),
                 })
                 .collect::<Vec<_>>();
             for bound in output_bounds.iter().flatten() {
@@ -172,7 +173,7 @@ pub(crate) fn lower_reshape_element_count_assertion<'b, 'c: 'b, 't: 'c>(
 impl LowerableOperation for DynamicReshapeOperation {
     fn lower<'b, 'c: 'b, 't: 'c, O: LowerableOperationFamily>(
         &self,
-        lowerer: &mut XlaLowerer<'b, 'c, 't, O>,
+        lowerer: &mut Lowerer<'b, 'c, 't, O>,
         input_values: &[ValueRef<'b, 'c, 't>],
         input_types: &[ArrayIrType],
         output_types: &[ArrayIrType],
@@ -233,8 +234,12 @@ impl LowerableOperation for DynamicReshapeOperation {
             let mut input_extents = Vec::with_capacity(input_type.rank());
             for (axis, dimension) in input_type.shape().dimensions().iter().enumerate() {
                 let extent = match dimension {
-                    Dimension::Static(extent) => lower_static_index_constants(&[*extent], block, context, location)?[0],
-                    Dimension::Dynamic(_) => lower_runtime_dimension_size_i64(*input, axis, block, context, location)?,
+                    CoreDimension::Static(extent) => {
+                        lower_static_index_constants(&[*extent], block, context, location)?[0]
+                    }
+                    CoreDimension::Dynamic(_) => {
+                        lower_runtime_dimension_size_i64(*input, axis, block, context, location)?
+                    }
                 };
                 input_extents.push(extent);
             }
@@ -262,8 +267,8 @@ impl LowerableOperation for DynamicReshapeOperation {
                 .dimensions()
                 .iter()
                 .map(|dimension| match dimension {
-                    Dimension::Static(extent) => Some(*extent),
-                    Dimension::Dynamic(_) => stable_hlo_dynamic_dimension_bound(dimension),
+                    CoreDimension::Static(extent) => Some(*extent),
+                    CoreDimension::Dynamic(_) => stable_hlo_dynamic_dimension_bound(dimension),
                 })
                 .collect::<Vec<_>>();
             for bound in output_bounds.iter().flatten() {
@@ -297,25 +302,26 @@ mod tests {
     use indoc::indoc;
     use pretty_assertions::assert_eq;
     use ryft_core::{
-        Array, ArrayIrBatch, ArrayIrBatchingPolicy, ArrayOperation, BatchAxis, BatchableOperation, BatchedProgram,
-        BatchingContext, ConstantOperation, Context, DataType, DimensionBounds, DimensionFromScalarOperation,
-        DimensionOperation, DimensionType, DimensionValue, DimensionVariable, DynamicReshapeOperation, EffectClass,
-        EffectClasses, EmptyRegionDriver, LogicalMesh, MeshAxis, MeshAxisType, Operation, Placeholder,
-        ProgramBatchingOutputAxesPolicy, ProgramError, Reshape, Shape, ShardMapOptions, Sharding, ShardingDimension,
-        StagingContext, TracingContext, TransposeOperation, Typed, TypedProgram,
+        Array as CoreArray, ArrayIrBatch, ArrayIrBatchingPolicy, ArrayOperation, BatchAxis, BatchableOperation,
+        BatchedProgram, BatchingContext, ConstantOperation, Context, DataType, DimensionBounds,
+        DimensionFromScalarOperation, DimensionOperation, DimensionType, DimensionValue, DimensionVariable,
+        DynamicReshapeOperation, EffectClass, EffectClasses, EmptyRegionDriver, LogicalMesh, MeshAxis, MeshAxisType,
+        Operation as CoreOperation, Placeholder, ProgramBatchingOutputAxesPolicy, ProgramError, Reshape, Shape,
+        ShardMapOptions, Sharding, ShardingDimension, StagingContext, TracingContext, TransposeOperation, Typed,
+        TypedProgram,
     };
     use ryft_mlir::Location;
     use ryft_pjrt::{BufferType, ExecutionDeviceInputs, ExecutionInput, Program as PjrtProgram};
 
-    use crate::experimental::XlaArrayTracer;
+    use crate::experimental::ArrayTracer;
     use crate::experimental::lowering::tests::{
-        MixedValue, PlainXlaProgram, XlaProgramBuilder, dynamic_dimension, execute_mixed_program,
+        MixedValue, PlainProgram, ProgramBuilder, dynamic_dimension, execute_mixed_program,
         ragged_dot_cpu_compilation_options, shard_map_module, test_matrix_type, test_vector_type,
         unproject_plain_program,
     };
     use crate::experimental::lowering::to_mlir_module_for_plain_program;
     use crate::experimental::ops::{
-        FlatXlaProgram, XlaArrayConstant, XlaConstant, XlaOperation, XlaProgramBuilder as ArrayIrXlaProgramBuilder,
+        ArrayConstant, Constant, FlatProgram, Operation, ProgramBuilder as ArrayIrProgramBuilder,
     };
     use crate::tests::{execution_client, values_to_bytes};
     use crate::to_mlir_module_for_program;
@@ -323,28 +329,28 @@ mod tests {
     use super::*;
 
     /// Builds one homogeneous reshape program over an `f64` input for the dynamic singleton lowering tests.
-    fn plain_reshape_program(input_shape: Shape, output_shape: Shape) -> PlainXlaProgram {
-        let mut builder = XlaProgramBuilder::new();
+    fn plain_reshape_program(input_shape: Shape, output_shape: Shape) -> PlainProgram {
+        let mut builder = ProgramBuilder::new();
         let input = builder.add_input(ArrayType::new(DataType::F64, input_shape));
         let output =
             builder.add_instruction(ReshapeOperation::new(output_shape), Vec::new(), vec![input], None).unwrap()[0];
         builder
-            .build::<Vec<XlaArrayConstant>, Vec<XlaArrayConstant>>(vec![output], vec![Placeholder], vec![Placeholder])
+            .build::<Vec<ArrayConstant>, Vec<ArrayConstant>>(vec![output], vec![Placeholder], vec![Placeholder])
             .unwrap()
     }
 
     /// Builds the mixed reshape of a static `f64[6]` input to a dynamic `f64[rows]` output whose bound keeps the
     /// physical capacity at six elements, so only a runtime extent of six passes the element-count assertion.
-    fn static_input_dynamic_output_reshape_program() -> FlatXlaProgram {
+    fn static_input_dynamic_output_reshape_program() -> FlatProgram {
         let rows = DimensionVariable::new("rows", DimensionBounds::new(1, Some(7)).unwrap());
-        let mut builder = ArrayIrXlaProgramBuilder::new();
+        let mut builder = ArrayIrProgramBuilder::new();
         let input = builder.add_input(ArrayType::new_static(DataType::F64, [6]).into());
         let extent = builder.add_input(DimensionType::from(rows).into());
         let output = builder
             .add_instruction(DynamicReshapeOperation::new(), Vec::new(), vec![input, extent], None)
             .unwrap()[0];
         builder
-            .build::<Vec<XlaConstant>, Vec<XlaConstant>>(vec![output], vec![Placeholder; 2], vec![Placeholder])
+            .build::<Vec<Constant>, Vec<Constant>>(vec![output], vec![Placeholder; 2], vec![Placeholder])
             .unwrap()
     }
 
@@ -355,7 +361,7 @@ mod tests {
         for static_output in [false, true] {
             let input_type = ArrayType::new(DataType::I64, Shape::new(vec![dynamic_dimension("input", Some(5))]));
             let size_type = ArrayType::scalar(DataType::I64);
-            let mut builder = ArrayIrXlaProgramBuilder::new();
+            let mut builder = ArrayIrProgramBuilder::new();
             let input = builder.add_input(input_type.clone().into());
             let size = builder.add_input(size_type.clone().into());
             let dimension_type = if static_output {
@@ -387,7 +393,7 @@ mod tests {
                 .unwrap();
             let result = builder.add_instruction(operation, Vec::new(), vec![input, dimension], None).unwrap()[0];
             let program = builder
-                .build::<Vec<XlaConstant>, Vec<XlaConstant>>(vec![result], vec![Placeholder; 2], vec![Placeholder])
+                .build::<Vec<Constant>, Vec<Constant>>(vec![result], vec![Placeholder; 2], vec![Placeholder])
                 .unwrap();
             let output_type = <&ArrayType>::try_from(&program.output_types()[0]).unwrap().clone();
             let module = to_mlir_module_for_program(
@@ -492,7 +498,7 @@ mod tests {
     fn test_lower_reshape_physical_capacities() {
         let input_type = ArrayType::new_static(DataType::F32, [4]);
         let dimension_type = DimensionType::new("columns", DimensionBounds::new(0, Some(4)).unwrap());
-        let mut builder = ArrayIrXlaProgramBuilder::new();
+        let mut builder = ArrayIrProgramBuilder::new();
         let input = builder.add_input(input_type.clone().into());
         let rows = builder
             .add_instruction(
@@ -508,7 +514,7 @@ mod tests {
             .add_instruction(DynamicReshapeOperation::new(), Vec::new(), vec![input, rows, columns], None)
             .unwrap()[0];
         let program = builder
-            .build::<Vec<XlaConstant>, Vec<XlaConstant>>(vec![output], vec![Placeholder; 2], vec![Placeholder])
+            .build::<Vec<Constant>, Vec<Constant>>(vec![output], vec![Placeholder; 2], vec![Placeholder])
             .unwrap();
         let output_type = <&ArrayType>::try_from(&program.output_types()[0]).unwrap().clone();
         let input_types = vec![input_type, ArrayType::scalar(DataType::I64)];
@@ -523,20 +529,21 @@ mod tests {
     #[test]
     fn test_plain_transpose_then_reshape_lower_transpose_before_reshape() {
         let input_type = test_matrix_type(2, 3);
-        let mut builder = ryft_core::ProgramBuilder::<Array, ArrayOperation<Array>>::new();
+        let mut builder = ryft_core::ProgramBuilder::<CoreArray, ArrayOperation<CoreArray>>::new();
         let input = builder.add_input(input_type);
         let input =
             builder.add_instruction(TransposeOperation::new([-1, -2]), Vec::new(), vec![input], None).unwrap()[0];
         let output = builder
             .add_instruction(
-                ReshapeOperation::new(Shape::new(vec![Dimension::Static(6)])),
+                ReshapeOperation::new(Shape::new(vec![CoreDimension::Static(6)])),
                 Vec::new(),
                 vec![input],
                 None,
             )
             .unwrap()[0];
-        let program =
-            builder.build::<Vec<Array>, Vec<Array>>(vec![output], vec![Placeholder], vec![Placeholder]).unwrap();
+        let program = builder
+            .build::<Vec<CoreArray>, Vec<CoreArray>>(vec![output], vec![Placeholder], vec![Placeholder])
+            .unwrap();
 
         let stablehlo = to_mlir_module_for_plain_program(&program, "main").unwrap();
 
@@ -556,12 +563,13 @@ mod tests {
 
     #[test]
     fn test_plain_fixed_dynamic_identity_reshape_lowers_without_an_operation() {
-        let shape = Shape::new(vec![dynamic_dimension("rows", None), Dimension::Static(3)]);
-        let mut builder = ryft_core::ProgramBuilder::<Array, ReshapeOperation>::new();
+        let shape = Shape::new(vec![dynamic_dimension("rows", None), CoreDimension::Static(3)]);
+        let mut builder = ryft_core::ProgramBuilder::<CoreArray, ReshapeOperation>::new();
         let input = builder.add_input(ArrayType::new(DataType::F32, shape.clone()));
         let output = builder.add_instruction(ReshapeOperation::new(shape), Vec::new(), vec![input], None).unwrap()[0];
-        let program =
-            builder.build::<Vec<Array>, Vec<Array>>(vec![output], vec![Placeholder], vec![Placeholder]).unwrap();
+        let program = builder
+            .build::<Vec<CoreArray>, Vec<CoreArray>>(vec![output], vec![Placeholder], vec![Placeholder])
+            .unwrap();
 
         let stablehlo = to_mlir_module_for_plain_program(&program, "main").unwrap();
 
@@ -581,16 +589,17 @@ mod tests {
     fn test_plain_fixed_dynamic_transpose_then_identity_reshape_lowers_to_transpose() {
         let rows = DimensionVariable::new("rows", DimensionBounds::unbounded());
         let columns = DimensionVariable::new("columns", DimensionBounds::non_negative(Some(5)).unwrap());
-        let input_shape = Shape::new(vec![rows.clone().into(), Dimension::Static(3), columns.clone().into()]);
-        let output_shape = Shape::new(vec![columns.into(), rows.into(), Dimension::Static(3)]);
-        let mut builder = ryft_core::ProgramBuilder::<Array, ArrayOperation<Array>>::new();
+        let input_shape = Shape::new(vec![rows.clone().into(), CoreDimension::Static(3), columns.clone().into()]);
+        let output_shape = Shape::new(vec![columns.into(), rows.into(), CoreDimension::Static(3)]);
+        let mut builder = ryft_core::ProgramBuilder::<CoreArray, ArrayOperation<CoreArray>>::new();
         let input = builder.add_input(ArrayType::new(DataType::F32, input_shape));
         let input =
             builder.add_instruction(TransposeOperation::new([2, 0, 1]), Vec::new(), vec![input], None).unwrap()[0];
         let output =
             builder.add_instruction(ReshapeOperation::new(output_shape), Vec::new(), vec![input], None).unwrap()[0];
-        let program =
-            builder.build::<Vec<Array>, Vec<Array>>(vec![output], vec![Placeholder], vec![Placeholder]).unwrap();
+        let program = builder
+            .build::<Vec<CoreArray>, Vec<CoreArray>>(vec![output], vec![Placeholder], vec![Placeholder])
+            .unwrap();
 
         let stablehlo = to_mlir_module_for_plain_program(&program, "main").unwrap();
 
@@ -759,7 +768,7 @@ mod tests {
         // An explicit transpose moves the dynamic extent to its permuted axis and reorders the elements
         // before the singleton is inserted.
         let rows = dynamic_dimension("rows", Some(5));
-        let mut builder = XlaProgramBuilder::new();
+        let mut builder = ProgramBuilder::new();
         let input = builder.add_input(ArrayType::new(DataType::F64, Shape::new(vec![rows.clone(), 3.into()])));
         let transposed =
             builder.add_instruction(TransposeOperation::new([1, 0]), Vec::new(), vec![input], None).unwrap()[0];
@@ -772,7 +781,7 @@ mod tests {
             )
             .unwrap()[0];
         let program = builder
-            .build::<Vec<XlaArrayConstant>, Vec<XlaArrayConstant>>(vec![output], vec![Placeholder], vec![Placeholder])
+            .build::<Vec<ArrayConstant>, Vec<ArrayConstant>>(vec![output], vec![Placeholder], vec![Placeholder])
             .unwrap();
         assert_eq!(
             to_mlir_module_for_plain_program(&program, "main").unwrap(),
@@ -811,7 +820,7 @@ mod tests {
         );
 
         // The permutation may also move a singleton that the reshape then removes.
-        let mut builder = XlaProgramBuilder::new();
+        let mut builder = ProgramBuilder::new();
         let input =
             builder.add_input(ArrayType::new(DataType::F64, Shape::new(vec![1.into(), rows.clone(), 3.into()])));
         let transposed =
@@ -825,7 +834,7 @@ mod tests {
             )
             .unwrap()[0];
         let program = builder
-            .build::<Vec<XlaArrayConstant>, Vec<XlaArrayConstant>>(vec![output], vec![Placeholder], vec![Placeholder])
+            .build::<Vec<ArrayConstant>, Vec<ArrayConstant>>(vec![output], vec![Placeholder], vec![Placeholder])
             .unwrap();
         assert_eq!(
             to_mlir_module_for_plain_program(&program, "main").unwrap(),
@@ -1068,10 +1077,10 @@ mod tests {
     fn test_lower_batched_proven_reshape_omits_element_count_assertion() {
         // A proven, effect-free mixed reshape batched over a mapped input recomputes its proof on the lifted
         // signature, so the batched instruction lowers to a plain `stablehlo.reshape` without an assertion.
-        let parent = TracingContext::<XlaConstant, XlaOperation>::new();
+        let parent = TracingContext::<Constant, Operation>::new();
         let input = parent.input(ArrayType::new_static(DataType::F64, [2, 6]).into());
-        let two = parent.lift(XlaConstant::Dimension(DimensionValue::constant(2).unwrap())).unwrap();
-        let three = parent.lift(XlaConstant::Dimension(DimensionValue::constant(3).unwrap())).unwrap();
+        let two = parent.lift(Constant::Dimension(DimensionValue::constant(2).unwrap())).unwrap();
+        let three = parent.lift(Constant::Dimension(DimensionValue::constant(3).unwrap())).unwrap();
         let operation = DynamicReshapeOperation::new()
             .with_input_types(&[
                 ArrayType::new_static(DataType::F64, [6]).into(),
@@ -1096,7 +1105,7 @@ mod tests {
             .builder()
             .borrow()
             .clone()
-            .build::<Vec<XlaConstant>, Vec<XlaConstant>>(
+            .build::<Vec<Constant>, Vec<Constant>>(
                 vec![outputs[0].value().atom_id().unwrap()],
                 vec![Placeholder],
                 vec![Placeholder],
@@ -1136,7 +1145,7 @@ mod tests {
         // never uses the reshaped value and the executable still rejects mismatching runtime element counts.
         let client = execution_client();
         crate::operations::assertions::ensure_assertion_handler_registered(&client).unwrap();
-        let parent = TracingContext::<XlaConstant, XlaOperation>::new();
+        let parent = TracingContext::<Constant, Operation>::new();
         let input_type = ArrayType::new(DataType::F64, Shape::new(vec![2.into(), dynamic_dimension("input", Some(5))]));
         let input = parent.input(input_type.clone().into());
         let size = parent.input(ArrayType::scalar(DataType::I64).into());
@@ -1145,7 +1154,7 @@ mod tests {
             .bind(DimensionFromScalarOperation::new(output_type.clone()), Vec::new(), &[size])
             .unwrap()
             .remove(0);
-        let two = parent.lift(XlaConstant::Dimension(DimensionValue::constant(2).unwrap())).unwrap();
+        let two = parent.lift(Constant::Dimension(DimensionValue::constant(2).unwrap())).unwrap();
         let operation = DynamicReshapeOperation::new()
             .with_input_types(&[input_type.unbatched(BatchAxis::new(0)).unwrap().into(), output_type.into()])
             .unwrap();
@@ -1163,7 +1172,7 @@ mod tests {
             .builder()
             .borrow()
             .clone()
-            .build::<Vec<XlaConstant>, Vec<XlaConstant>>(
+            .build::<Vec<Constant>, Vec<Constant>>(
                 vec![input.atom_id().unwrap()],
                 vec![Placeholder; 2],
                 vec![Placeholder],
@@ -1213,7 +1222,7 @@ mod tests {
         let module = context.module(location).unwrap();
         let mut block = module.body().unwrap();
         let error = lower_reshape_to_mlir(
-            &ReshapeOperation::new(Shape::new(vec![Dimension::Static(4)])),
+            &ReshapeOperation::new(Shape::new(vec![CoreDimension::Static(4)])),
             &test_vector_type(4),
             &[],
             &[test_vector_type(4)],
@@ -1231,21 +1240,21 @@ mod tests {
     }
 
     #[test]
-    fn test_xla_operation_transpose_then_reshape_use_shared_lowering() {
+    fn test_operation_transpose_then_reshape_use_shared_lowering() {
         let input_type = test_matrix_type(2, 3);
-        let mut builder = XlaProgramBuilder::new();
+        let mut builder = ProgramBuilder::new();
         let input = builder.add_input(input_type);
         let input = builder.add_instruction(TransposeOperation::new([1, 0]), Vec::new(), vec![input], None).unwrap()[0];
         let output = builder
             .add_instruction(
-                ReshapeOperation::new(Shape::new(vec![Dimension::Static(6)])),
+                ReshapeOperation::new(Shape::new(vec![CoreDimension::Static(6)])),
                 Vec::new(),
                 vec![input],
                 None,
             )
             .unwrap()[0];
         let program = builder
-            .build::<Vec<XlaArrayConstant>, Vec<XlaArrayConstant>>(vec![output], vec![Placeholder], vec![Placeholder])
+            .build::<Vec<ArrayConstant>, Vec<ArrayConstant>>(vec![output], vec![Placeholder], vec![Placeholder])
             .unwrap();
 
         let stablehlo = to_mlir_module_for_plain_program(&program, "main").unwrap();
@@ -1269,19 +1278,20 @@ mod tests {
         let mesh = LogicalMesh::new(vec![MeshAxis::new("x", 2, MeshAxisType::Explicit).unwrap()]).unwrap();
         let output_sharding =
             Sharding::new(mesh, vec![ShardingDimension::sharded(["x"]), ShardingDimension::replicated()]).unwrap();
-        let mut builder = ryft_core::ProgramBuilder::<Array, ReshapeOperation>::new();
+        let mut builder = ryft_core::ProgramBuilder::<CoreArray, ReshapeOperation>::new();
         let input = builder.add_input(test_vector_type(4));
         let output = builder
             .add_instruction(
-                ReshapeOperation::new(Shape::new(vec![Dimension::Static(2), Dimension::Static(2)]))
+                ReshapeOperation::new(Shape::new(vec![CoreDimension::Static(2), CoreDimension::Static(2)]))
                     .with_output_sharding(output_sharding),
                 Vec::new(),
                 vec![input],
                 None,
             )
             .unwrap()[0];
-        let program =
-            builder.build::<Vec<Array>, Vec<Array>>(vec![output], vec![Placeholder], vec![Placeholder]).unwrap();
+        let program = builder
+            .build::<Vec<CoreArray>, Vec<CoreArray>>(vec![output], vec![Placeholder], vec![Placeholder])
+            .unwrap();
 
         let stablehlo = to_mlir_module_for_plain_program(&program, "main").unwrap();
 
@@ -1303,7 +1313,7 @@ mod tests {
     #[test]
     fn test_to_mlir_module_for_program_renders_reshape_singleton_axis_sharding_propagation() {
         let mesh = LogicalMesh::new(vec![MeshAxis::new("x", 4, MeshAxisType::Manual).unwrap()]).unwrap();
-        let global_input_type = ArrayType::new(DataType::F32, Shape::new(vec![Dimension::Static(8)]));
+        let global_input_type = ArrayType::new(DataType::F32, Shape::new(vec![CoreDimension::Static(8)]));
         let input_sharding = Sharding::new(mesh.clone(), vec![ShardingDimension::sharded(["x"])]).unwrap();
         let output_sharding = Sharding::new(
             mesh.clone(),
@@ -1312,8 +1322,12 @@ mod tests {
         .unwrap();
 
         let module = shard_map_module::<_, ArrayType, ArrayType>(
-            |_, x: XlaArrayTracer| {
-                x.reshape(Shape::new(vec![Dimension::Static(1), Dimension::Static(2), Dimension::Static(1)]))
+            |_, x: ArrayTracer| {
+                x.reshape(Shape::new(vec![
+                    CoreDimension::Static(1),
+                    CoreDimension::Static(2),
+                    CoreDimension::Static(1),
+                ]))
             },
             global_input_type,
             mesh.clone(),
@@ -1345,7 +1359,7 @@ mod tests {
         let mesh = LogicalMesh::new(vec![MeshAxis::new("x", 4, MeshAxisType::Manual).unwrap()]).unwrap();
         let global_input_type = ArrayType::new(
             DataType::F32,
-            Shape::new(vec![Dimension::Static(8), Dimension::Static(2), Dimension::Static(3)]),
+            Shape::new(vec![CoreDimension::Static(8), CoreDimension::Static(2), CoreDimension::Static(3)]),
         );
         let input_sharding = Sharding::new(
             mesh.clone(),
@@ -1357,7 +1371,7 @@ mod tests {
                 .unwrap();
 
         let module = shard_map_module::<_, ArrayType, ArrayType>(
-            |_, x: XlaArrayTracer| x.reshape(Shape::new(vec![Dimension::Static(2), Dimension::Static(6)])),
+            |_, x: ArrayTracer| x.reshape(Shape::new(vec![CoreDimension::Static(2), CoreDimension::Static(6)])),
             global_input_type,
             mesh.clone(),
             input_sharding.clone(),
@@ -1387,7 +1401,7 @@ mod tests {
     fn test_to_mlir_module_for_program_renders_reshape_replicated_split_sharding_propagation() {
         let mesh = LogicalMesh::new(vec![MeshAxis::new("x", 4, MeshAxisType::Manual).unwrap()]).unwrap();
         let global_input_type =
-            ArrayType::new(DataType::F32, Shape::new(vec![Dimension::Static(8), Dimension::Static(6)]));
+            ArrayType::new(DataType::F32, Shape::new(vec![CoreDimension::Static(8), CoreDimension::Static(6)]));
         let input_sharding =
             Sharding::new(mesh.clone(), vec![ShardingDimension::sharded(["x"]), ShardingDimension::replicated()])
                 .unwrap();
@@ -1398,8 +1412,12 @@ mod tests {
         .unwrap();
 
         let module = shard_map_module::<_, ArrayType, ArrayType>(
-            |_, x: XlaArrayTracer| {
-                x.reshape(Shape::new(vec![Dimension::Static(2), Dimension::Static(2), Dimension::Static(3)]))
+            |_, x: ArrayTracer| {
+                x.reshape(Shape::new(vec![
+                    CoreDimension::Static(2),
+                    CoreDimension::Static(2),
+                    CoreDimension::Static(3),
+                ]))
             },
             global_input_type,
             mesh.clone(),

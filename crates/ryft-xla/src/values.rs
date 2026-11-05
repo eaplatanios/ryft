@@ -1,20 +1,20 @@
-//! Session-carrying array IR values of the [`XlaDomain`].
+//! Session-carrying array IR values of the [`Domain`].
 //!
-//! [`XlaValue`] is the [`XlaDomain`] counterpart of [`ArrayIrValue`]: it holds an [`XlaArray`], a first-class runtime
-//! dimension ([`XlaDimension`]), or an array reference ([`XlaReference`]). Unlike [`ArrayIrValue`], whose dimension and
-//! reference members are session-free host values, every member of an [`XlaValue`] (and every projected representation
-//! of a member) owns the [`XlaDomain`] session that it belongs to. This has three consequences:
+//! [`Value`] is the [`Domain`] counterpart of [`ArrayIrValue`]: it holds an [`Array`], a first-class runtime
+//! dimension ([`Dimension`]), or an array reference ([`Reference`]). Unlike [`ArrayIrValue`], whose dimension and
+//! reference members are session-free host values, every member of a [`Value`] (and every projected representation
+//! of a member) owns the [`Domain`] session that it belongs to. This has three consequences:
 //!
 //!   - **Eager dimension-to-array functions.** Functions that turn first-class dimensions into arrays (e.g., comparing
 //!     two dimensions or [`DimensionToScalar`](ryft_core::DimensionToScalar)) materialize their results in the session
 //!     of their inputs, so they execute eagerly outside any explicit context.
-//!   - **Rich dispatch.** [`XlaValue`] dispatches and executes through its [`XlaDomain`], so its capabilities come from
+//!   - **Rich dispatch.** [`Value`] dispatches and executes through its [`Domain`], so its capabilities come from
 //!     the operation-binding blanket implementations in `ryft-core`, exactly like those of values staged over an
-//!     [`XlaDomain`], and free transform entry points (e.g., [`batch`](ryft_core::batch) or
-//!     [`differentiate_at`](ryft_core::differentiate_at)) recover the [`XlaDomain`] from the values themselves.
+//!     [`Domain`], and free transform entry points (e.g., [`batch`](ryft_core::batch) or
+//!     [`differentiate_at`](ryft_core::differentiate_at)) recover the [`Domain`] from the values themselves.
 //!   - **No session-less construction.** Because [`ValueProjection::from_projected`] is infallible and receives no
-//!     session, projected dimensions and references are the session-carrying [`XlaDimension`] and [`XlaReference`]
-//!     rather than [`DimensionValue`] and [`ArrayReference`]. Host-side dimension values enter an [`XlaDomain`] through
+//!     session, projected dimensions and references are the session-carrying [`Dimension`] and [`Reference`]
+//!     rather than [`DimensionValue`] and [`ArrayReference`]. Host-side dimension values enter a [`Domain`] through
 //!     its constants (i.e., [`Context::lift`]) instead.
 //!
 //! Host-side semantics that do not depend on the session (e.g., which members can act as `while` predicates, assertion
@@ -29,36 +29,36 @@ use std::fmt::{Debug, Display};
 use ryft_core::{
     Add, ArrayIrType, ArrayIrValue, ArrayReference, ArrayType, AssertionValue, Compare, CompareOperation,
     ComparisonDirection, Concretizable, Context, DimensionType, DimensionValue, Div, Mul, Neg, Parameter, ProgramError,
-    ProjectedContext, ReferenceId, ReferenceType, Sub, Type, TypeError, TypeIdentityRenaming, Typed, Value,
-    ValueDomainDispatch, ValueProjection, WhilePredicate,
+    ProjectedContext, ReferenceId, ReferenceType, Sub, Type, TypeError, TypeIdentityRenaming, Typed,
+    Value as CoreValue, ValueDomainDispatch, ValueProjection, WhilePredicate,
 };
 use ryft_macros::Parameter;
 
-use crate::{XlaArray, XlaDomain};
+use crate::{Array, Domain};
 
-/// First-class runtime dimension bound to the [`XlaDomain`] session in which array results derived from it are
-/// materialized. This is the dimension member of [`XlaValue`] and its projection onto [`DimensionType`].
+/// First-class runtime dimension bound to the [`Domain`] session in which array results derived from it are
+/// materialized. This is the dimension member of [`Value`] and its projection onto [`DimensionType`].
 ///
-/// An [`XlaDimension`] is a runtime *value* that holds a checked [`DimensionValue`]. It is not a
+/// A [`Dimension`] is a runtime *value* that holds a checked [`DimensionValue`]. It is not a
 /// [`Dimension`](ryft_core::Dimension), which is a static or symbolic extent inside an [`ArrayType`]. Dimension
-/// arithmetic remains host integer work: it dispatches through this dimension's [`XlaDomain`], whose eager binding
+/// arithmetic remains host integer work: it dispatches through this dimension's [`Domain`], whose eager binding
 /// evaluates dimension operations on the host without compiling programs. Only functions that produce arrays (e.g.,
 /// comparisons and [`DimensionToScalar`](ryft_core::DimensionToScalar)) upload their results, which are placed
-/// according to the mesh of the domain (refer to [`XlaValue`] for the placement policy).
+/// according to the mesh of the domain (refer to [`Value`] for the placement policy).
 ///
 /// Two dimensions are equal when their [`DimensionValue`]s are equal, regardless of their sessions.
 #[derive(Clone, Parameter)]
-pub struct XlaDimension<'c> {
+pub struct Dimension<'c> {
     /// Checked host-side dimension.
     value: DimensionValue,
 
-    /// [`XlaDomain`] in which array results computed from this dimension are materialized.
-    domain: XlaDomain<'c>,
+    /// [`Domain`] in which array results computed from this dimension are materialized.
+    domain: Domain<'c>,
 }
 
-impl<'c> XlaDimension<'c> {
-    /// Creates a new [`XlaDimension`] that materializes array results derived from `value` in `domain`.
-    pub fn new(value: DimensionValue, domain: XlaDomain<'c>) -> Self {
+impl<'c> Dimension<'c> {
+    /// Creates a new [`Dimension`] that materializes array results derived from `value` in `domain`.
+    pub fn new(value: DimensionValue, domain: Domain<'c>) -> Self {
         Self { value, domain }
     }
 
@@ -67,8 +67,8 @@ impl<'c> XlaDimension<'c> {
         &self.value
     }
 
-    /// Returns the [`XlaDomain`] in which array results computed from this dimension are materialized.
-    pub fn xla_domain(&self) -> &XlaDomain<'c> {
+    /// Returns the [`Domain`] in which array results computed from this dimension are materialized.
+    pub fn backend_domain(&self) -> &Domain<'c> {
         &self.domain
     }
 
@@ -78,32 +78,32 @@ impl<'c> XlaDimension<'c> {
     }
 }
 
-impl Debug for XlaDimension<'_> {
+impl Debug for Dimension<'_> {
     fn fmt(&self, formatter: &mut std::fmt::Formatter<'_>) -> std::fmt::Result {
-        formatter.debug_tuple("XlaDimension").field(&self.value).finish()
+        formatter.debug_tuple("Dimension").field(&self.value).finish()
     }
 }
 
-impl Display for XlaDimension<'_> {
+impl Display for Dimension<'_> {
     fn fmt(&self, formatter: &mut std::fmt::Formatter<'_>) -> std::fmt::Result {
         Display::fmt(&self.value, formatter)
     }
 }
 
 // Dimensions compare by value: the session only selects where derived arrays are materialized.
-impl PartialEq for XlaDimension<'_> {
+impl PartialEq for Dimension<'_> {
     fn eq(&self, other: &Self) -> bool {
         self.value == other.value
     }
 }
 
-impl Borrow<DimensionValue> for XlaDimension<'_> {
+impl Borrow<DimensionValue> for Dimension<'_> {
     fn borrow(&self) -> &DimensionValue {
         &self.value
     }
 }
 
-impl Typed for XlaDimension<'_> {
+impl Typed for Dimension<'_> {
     type Type = DimensionType;
 
     fn r#type(&self) -> Cow<'_, DimensionType> {
@@ -113,19 +113,19 @@ impl Typed for XlaDimension<'_> {
 
 // Comparing two dimensions yields a Boolean array, which is materialized in this dimension's domain by binding the
 // array IR comparison there. The domain decides the predicate on the host from the two extents.
-impl<'c> Compare<XlaValue<'c>, DimensionType> for XlaDimension<'c> {
-    fn compare(&self, other: &Self, direction: ComparisonDirection) -> Result<XlaValue<'c>, ProgramError> {
-        let inputs = [XlaValue::Dimension(self.clone()), XlaValue::Dimension(other.clone())];
+impl<'c> Compare<Value<'c>, DimensionType> for Dimension<'c> {
+    fn compare(&self, other: &Self, direction: ComparisonDirection) -> Result<Value<'c>, ProgramError> {
+        let inputs = [Value::Dimension(self.clone()), Value::Dimension(other.clone())];
         Ok(self.domain.bind(CompareOperation::<ArrayIrType>::new(direction), Vec::new(), &inputs)?.remove(0))
     }
 }
 
-impl<'c> Value for XlaDimension<'c> {
-    // Like `XlaArray`, a dimension dispatches and executes through the rich `XlaDomain` that it carries, projected onto
+impl<'c> CoreValue for Dimension<'c> {
+    // Like `Array`, a dimension dispatches and executes through the rich `Domain` that it carries, projected onto
     // the dimension member family. That domain evaluates dimension operations on the host and materializes array
     // results (e.g., `dimension_to_scalar`) in its session.
     type Dispatch = ValueDomainDispatch;
-    type Domain = ProjectedContext<XlaDomain<'c>, DimensionType>;
+    type Domain = ProjectedContext<Domain<'c>, DimensionType>;
 
     fn domain(&self) -> Self::Domain {
         ProjectedContext::new(self.domain.clone())
@@ -139,64 +139,64 @@ impl<'c> Value for XlaDimension<'c> {
     }
 }
 
-/// Handle to an XLA array reference, bound to the [`XlaDomain`] session that owns its referent. This is the reference
-/// member of [`XlaValue`] and its projection onto [`ReferenceType<ArrayType>`](ReferenceType).
+/// Handle to an XLA array reference, bound to the [`Domain`] session that owns its referent. This is the reference
+/// member of [`Value`] and its projection onto [`ReferenceType<ArrayType>`](ReferenceType).
 ///
 /// The session is retained next to the handle rather than recovered from the referent, because reading the referent
 /// locks its allocation and fails once the allocation is frozen, whereas the domain of a value must be available
 /// infallibly. Two references are equal when their handles are equal (i.e., when they name the same allocation and
 /// view), regardless of their sessions.
 #[derive(Clone)]
-pub struct XlaReference<'c> {
+pub struct Reference<'c> {
     /// Shared reference handle (i.e., the allocation, the view path, and the cached reference type).
-    reference: ArrayReference<XlaArray<'c>>,
+    reference: ArrayReference<Array<'c>>,
 
-    /// [`XlaDomain`] that owns the referent of this reference.
-    domain: XlaDomain<'c>,
+    /// [`Domain`] that owns the referent of this reference.
+    domain: Domain<'c>,
 }
 
-impl<'c> XlaReference<'c> {
-    /// Creates a new [`XlaReference`] that binds `reference` to `domain`.
-    pub fn new(reference: ArrayReference<XlaArray<'c>>, domain: XlaDomain<'c>) -> Self {
+impl<'c> Reference<'c> {
+    /// Creates a new [`Reference`] that binds `reference` to `domain`.
+    pub fn new(reference: ArrayReference<Array<'c>>, domain: Domain<'c>) -> Self {
         Self { reference, domain }
     }
 
     /// Returns the shared [`ArrayReference`] handle of this reference.
-    pub fn handle(&self) -> &ArrayReference<XlaArray<'c>> {
+    pub fn handle(&self) -> &ArrayReference<Array<'c>> {
         &self.reference
     }
 
-    /// Returns the [`XlaDomain`] that owns the referent of this reference.
-    pub fn xla_domain(&self) -> &XlaDomain<'c> {
+    /// Returns the [`Domain`] that owns the referent of this reference.
+    pub fn backend_domain(&self) -> &Domain<'c> {
         &self.domain
     }
 
     /// Consumes this reference and returns its shared [`ArrayReference`] handle.
-    pub fn into_handle(self) -> ArrayReference<XlaArray<'c>> {
+    pub fn into_handle(self) -> ArrayReference<Array<'c>> {
         self.reference
     }
 }
 
-impl Debug for XlaReference<'_> {
+impl Debug for Reference<'_> {
     fn fmt(&self, formatter: &mut std::fmt::Formatter<'_>) -> std::fmt::Result {
-        formatter.debug_tuple("XlaReference").field(&self.reference).finish()
+        formatter.debug_tuple("Reference").field(&self.reference).finish()
     }
 }
 
-impl Display for XlaReference<'_> {
+impl Display for Reference<'_> {
     fn fmt(&self, formatter: &mut std::fmt::Formatter<'_>) -> std::fmt::Result {
         Display::fmt(&self.reference, formatter)
     }
 }
 
 // References compare by handle identity, like `ArrayReference`.
-impl PartialEq for XlaReference<'_> {
+impl PartialEq for Reference<'_> {
     fn eq(&self, other: &Self) -> bool {
         self.reference == other.reference
     }
 }
 
-impl Typed for XlaReference<'_> {
+impl Typed for Reference<'_> {
     type Type = ReferenceType<ArrayType>;
 
     fn r#type(&self) -> Cow<'_, ReferenceType<ArrayType>> {
@@ -204,21 +204,21 @@ impl Typed for XlaReference<'_> {
     }
 }
 
-/// Array IR runtime value of the [`XlaDomain`] (i.e., its [`Domain::Value`](ryft_core::Domain::Value)), and the
-/// [`XlaDomain`] counterpart of [`ArrayIrValue`] in which every member carries the [`XlaDomain`] session that it
+/// Array IR runtime value of the [`Domain`] (i.e., its [`Domain::Value`](ryft_core::Domain::Value)), and the
+/// [`Domain`] counterpart of [`ArrayIrValue`] in which every member carries the [`Domain`] session that it
 /// belongs to. Refer to the [module documentation](self) for why the session is part of every member.
 ///
 /// # Dispatch and Transforms
 ///
-/// An [`XlaValue`] dispatches and executes through the [`XlaDomain`] of its member, so every capability binds an
-/// [`XlaOperation`](crate::experimental::ops::XlaOperation) that the domain executes eagerly (op by op, through its
+/// A [`Value`] dispatches and executes through the [`Domain`] of its member, so every capability binds an
+/// [`Operation`](crate::experimental::ops::Operation) that the domain executes eagerly (op by op, through its
 /// eager dispatch cache), and free transform entry points recover that domain from the values. When several inputs
 /// carry different sessions, the receiver's domain executes, and it validates that its array inputs belong to its
 /// client and placement. Dimension inputs are host data and need no such validation.
 ///
 /// # Placement
 ///
-/// Arrays that an [`XlaValue`] creates without array inputs (e.g., the scalar that converts a first-class dimension
+/// Arrays that a [`Value`] creates without array inputs (e.g., the scalar that converts a first-class dimension
 /// into array data) are placed on the mesh of the executing domain. When the domain of an array member has no mesh of
 /// its own, the domain recovered from that member adopts the array's mesh, so a statically known extent read from an
 /// array on some devices, and every scalar later derived from it, stays on those devices instead of moving to the
@@ -226,34 +226,34 @@ impl Typed for XlaReference<'_> {
 ///
 /// # Identity
 ///
-/// [`PartialEq`] ignores sessions: arrays compare by the storage identity of [`XlaArray`], dimensions by their
+/// [`PartialEq`] ignores sessions: arrays compare by the storage identity of [`Array`], dimensions by their
 /// [`DimensionValue`]s, and references by their handles.
 #[derive(Clone, Debug, PartialEq, Parameter)]
-pub enum XlaValue<'c> {
-    /// Device-resident [`XlaArray`], which carries its own domain.
-    Array(XlaArray<'c>),
+pub enum Value<'c> {
+    /// Device-resident [`Array`], which carries its own domain.
+    Array(Array<'c>),
 
     /// First-class runtime dimension.
-    Dimension(XlaDimension<'c>),
+    Dimension(Dimension<'c>),
 
     /// Array reference.
-    Reference(XlaReference<'c>),
+    Reference(Reference<'c>),
 }
 
-impl<'c> XlaValue<'c> {
-    /// Returns the [`XlaDomain`] of this value's member.
-    pub fn xla_domain(&self) -> &XlaDomain<'c> {
+impl<'c> Value<'c> {
+    /// Returns the [`Domain`] of this value's member.
+    pub fn backend_domain(&self) -> &Domain<'c> {
         match self {
-            Self::Array(value) => value.xla_domain(),
-            Self::Dimension(value) => value.xla_domain(),
-            Self::Reference(value) => value.xla_domain(),
+            Self::Array(value) => value.backend_domain(),
+            Self::Dimension(value) => value.backend_domain(),
+            Self::Reference(value) => value.backend_domain(),
         }
     }
 
     /// Converts this value into the session-free [`ArrayIrValue`] representation over XLA arrays, which drops the
     /// domains of dimension and reference members. Used to delegate host-side semantics (e.g., reference handles and
     /// predicates) to the generic [`ArrayIrValue`] implementations in `ryft-core`.
-    pub(crate) fn into_array_ir_value(self) -> ArrayIrValue<XlaArray<'c>> {
+    pub(crate) fn into_array_ir_value(self) -> ArrayIrValue<Array<'c>> {
         match self {
             Self::Array(value) => ArrayIrValue::Array(value),
             Self::Dimension(value) => ArrayIrValue::Dimension(value.into_value()),
@@ -261,16 +261,13 @@ impl<'c> XlaValue<'c> {
         }
     }
 
-    /// Converts a session-free [`ArrayIrValue`] over XLA arrays into an [`XlaValue`], binding dimension and reference
+    /// Converts a session-free [`ArrayIrValue`] over XLA arrays into a [`Value`], binding dimension and reference
     /// members to `domain`. Array members keep their own domain.
-    pub(crate) fn from_array_ir_value(
-        value: ArrayIrValue<XlaArray<'c>>,
-        domain: &XlaDomain<'c>,
-    ) -> Result<Self, TypeError> {
+    pub(crate) fn from_array_ir_value(value: ArrayIrValue<Array<'c>>, domain: &Domain<'c>) -> Result<Self, TypeError> {
         match value {
             ArrayIrValue::Array(value) => Ok(Self::Array(value)),
-            ArrayIrValue::Dimension(value) => Ok(Self::Dimension(XlaDimension::new(value, domain.clone()))),
-            ArrayIrValue::Reference(value) => Ok(Self::Reference(XlaReference::new(value, domain.clone()))),
+            ArrayIrValue::Dimension(value) => Ok(Self::Dimension(Dimension::new(value, domain.clone()))),
+            ArrayIrValue::Reference(value) => Ok(Self::Reference(Reference::new(value, domain.clone()))),
         }
     }
 
@@ -284,7 +281,7 @@ impl<'c> XlaValue<'c> {
     }
 }
 
-impl Display for XlaValue<'_> {
+impl Display for Value<'_> {
     fn fmt(&self, formatter: &mut std::fmt::Formatter<'_>) -> std::fmt::Result {
         match self {
             Self::Array(value) => Display::fmt(value, formatter),
@@ -294,7 +291,7 @@ impl Display for XlaValue<'_> {
     }
 }
 
-impl Typed for XlaValue<'_> {
+impl Typed for Value<'_> {
     type Type = ArrayIrType;
 
     fn r#type(&self) -> Cow<'_, ArrayIrType> {
@@ -306,21 +303,21 @@ impl Typed for XlaValue<'_> {
     }
 }
 
-impl<'c> Value for XlaValue<'c> {
-    // Every member carries its `XlaDomain`, so array IR values dispatch and execute through it directly: capability
-    // blankets in `ryft-core` bind `XlaOperation`s into this domain, and free transform entry points recover it here.
+impl<'c> CoreValue for Value<'c> {
+    // Every member carries its `Domain`, so array IR values dispatch and execute through it directly: capability
+    // blankets in `ryft-core` bind `Operation`s into this domain, and free transform entry points recover it here.
     type Dispatch = ValueDomainDispatch;
-    type Domain = XlaDomain<'c>;
+    type Domain = Domain<'c>;
 
     fn domain(&self) -> Self::Domain {
         // A mesh-less domain recovered from an array places the values that it creates without array inputs (e.g., a
         // folded static extent and the scalars later derived from it) on that array's mesh, rather than on the
         // client's default devices.
         match self {
-            Self::Array(value) if value.xla_domain().mesh().is_err() => {
-                value.xla_domain().with_mesh(value.mesh().clone())
+            Self::Array(value) if value.backend_domain().mesh().is_err() => {
+                value.backend_domain().with_mesh(value.mesh().clone())
             }
-            _ => self.xla_domain().clone(),
+            _ => self.backend_domain().clone(),
         }
     }
 
@@ -331,9 +328,9 @@ impl<'c> Value for XlaValue<'c> {
         match self {
             Self::Array(value) => Ok(Self::Array(value.rename_type_identities(renaming)?)),
             Self::Dimension(value) => Ok(Self::Dimension(value.rename_type_identities(renaming)?)),
-            Self::Reference(value) => Ok(Self::Reference(XlaReference::new(
+            Self::Reference(value) => Ok(Self::Reference(Reference::new(
                 value.handle().rename_type_identities(renaming)?,
-                value.xla_domain().clone(),
+                value.backend_domain().clone(),
             ))),
         }
     }
@@ -360,18 +357,18 @@ impl<'c> Value for XlaValue<'c> {
     }
 }
 
-impl<'c> ValueProjection<ArrayType> for XlaValue<'c> {
-    type Projected = XlaArray<'c>;
+impl<'c> ValueProjection<ArrayType> for Value<'c> {
+    type Projected = Array<'c>;
     type ProjectedRef<'v>
-        = &'v XlaArray<'c>
+        = &'v Array<'c>
     where
         Self: 'v;
 
-    fn from_projected(value: XlaArray<'c>) -> Self {
+    fn from_projected(value: Array<'c>) -> Self {
         Self::Array(value)
     }
 
-    fn projected<'v>(&'v self) -> Result<&'v XlaArray<'c>, TypeError>
+    fn projected<'v>(&'v self) -> Result<&'v Array<'c>, TypeError>
     where
         ArrayType: 'v,
     {
@@ -381,7 +378,7 @@ impl<'c> ValueProjection<ArrayType> for XlaValue<'c> {
         }
     }
 
-    fn into_projected(self) -> Result<XlaArray<'c>, TypeError> {
+    fn into_projected(self) -> Result<Array<'c>, TypeError> {
         match self {
             Self::Array(value) => Ok(value),
             other => Err(TypeError::invalid(format!("expected array type but got {} type", other.kind_name()))),
@@ -389,18 +386,18 @@ impl<'c> ValueProjection<ArrayType> for XlaValue<'c> {
     }
 }
 
-impl<'c> ValueProjection<DimensionType> for XlaValue<'c> {
-    type Projected = XlaDimension<'c>;
+impl<'c> ValueProjection<DimensionType> for Value<'c> {
+    type Projected = Dimension<'c>;
     type ProjectedRef<'v>
-        = &'v XlaDimension<'c>
+        = &'v Dimension<'c>
     where
         Self: 'v;
 
-    fn from_projected(value: XlaDimension<'c>) -> Self {
+    fn from_projected(value: Dimension<'c>) -> Self {
         Self::Dimension(value)
     }
 
-    fn projected<'v>(&'v self) -> Result<&'v XlaDimension<'c>, TypeError>
+    fn projected<'v>(&'v self) -> Result<&'v Dimension<'c>, TypeError>
     where
         DimensionType: 'v,
     {
@@ -410,7 +407,7 @@ impl<'c> ValueProjection<DimensionType> for XlaValue<'c> {
         }
     }
 
-    fn into_projected(self) -> Result<XlaDimension<'c>, TypeError> {
+    fn into_projected(self) -> Result<Dimension<'c>, TypeError> {
         match self {
             Self::Dimension(value) => Ok(value),
             other => Err(TypeError::invalid(format!("expected dimension type but got {} type", other.kind_name()))),
@@ -418,18 +415,18 @@ impl<'c> ValueProjection<DimensionType> for XlaValue<'c> {
     }
 }
 
-impl<'c> ValueProjection<ReferenceType<ArrayType>> for XlaValue<'c> {
-    type Projected = XlaReference<'c>;
+impl<'c> ValueProjection<ReferenceType<ArrayType>> for Value<'c> {
+    type Projected = Reference<'c>;
     type ProjectedRef<'v>
-        = &'v XlaReference<'c>
+        = &'v Reference<'c>
     where
         Self: 'v;
 
-    fn from_projected(value: XlaReference<'c>) -> Self {
+    fn from_projected(value: Reference<'c>) -> Self {
         Self::Reference(value)
     }
 
-    fn projected<'v>(&'v self) -> Result<&'v XlaReference<'c>, TypeError>
+    fn projected<'v>(&'v self) -> Result<&'v Reference<'c>, TypeError>
     where
         ReferenceType<ArrayType>: 'v,
     {
@@ -439,7 +436,7 @@ impl<'c> ValueProjection<ReferenceType<ArrayType>> for XlaValue<'c> {
         }
     }
 
-    fn into_projected(self) -> Result<XlaReference<'c>, TypeError> {
+    fn into_projected(self) -> Result<Reference<'c>, TypeError> {
         match self {
             Self::Reference(value) => Ok(value),
             other => Err(TypeError::invalid(format!("expected reference type but got {} type", other.kind_name()))),
@@ -447,20 +444,20 @@ impl<'c> ValueProjection<ReferenceType<ArrayType>> for XlaValue<'c> {
     }
 }
 
-impl<'c> From<XlaArray<'c>> for XlaValue<'c> {
-    fn from(value: XlaArray<'c>) -> Self {
+impl<'c> From<Array<'c>> for Value<'c> {
+    fn from(value: Array<'c>) -> Self {
         Self::Array(value)
     }
 }
 
-impl<'c> From<XlaDimension<'c>> for XlaValue<'c> {
-    fn from(value: XlaDimension<'c>) -> Self {
+impl<'c> From<Dimension<'c>> for Value<'c> {
+    fn from(value: Dimension<'c>) -> Self {
         Self::Dimension(value)
     }
 }
 
-impl<'c> From<XlaReference<'c>> for XlaValue<'c> {
-    fn from(value: XlaReference<'c>) -> Self {
+impl<'c> From<Reference<'c>> for Value<'c> {
+    fn from(value: Reference<'c>) -> Self {
         Self::Reference(value)
     }
 }
@@ -469,13 +466,13 @@ impl<'c> From<XlaReference<'c>> for XlaValue<'c> {
 // their member-kind semantics (e.g., which members can act as predicates and how equal dimension carries pass through
 // a batched selection) have a single source of truth.
 
-impl Concretizable<bool> for XlaValue<'_> {
+impl Concretizable<bool> for Value<'_> {
     fn concretize(&self) -> Result<bool, ProgramError> {
         self.clone().into_array_ir_value().concretize()
     }
 }
 
-impl WhilePredicate for XlaValue<'_> {
+impl WhilePredicate for Value<'_> {
     fn any_true(&self) -> Result<bool, ProgramError> {
         self.clone().into_array_ir_value().any_true()
     }
@@ -485,11 +482,11 @@ impl WhilePredicate for XlaValue<'_> {
             .clone()
             .into_array_ir_value()
             .select(&on_true.clone().into_array_ir_value(), &on_false.clone().into_array_ir_value())?;
-        Ok(Self::from_array_ir_value(output, on_true.xla_domain())?)
+        Ok(Self::from_array_ir_value(output, on_true.backend_domain())?)
     }
 }
 
-impl AssertionValue for XlaValue<'_> {
+impl AssertionValue for Value<'_> {
     fn assertion_observation(&self) -> Result<String, ProgramError> {
         self.clone().into_array_ir_value().assertion_observation()
     }
@@ -501,9 +498,9 @@ impl AssertionValue for XlaValue<'_> {
 
 // The `std::ops` operator traits are foreign, so the blanket tracer implementations in `ryft-core` cannot cover
 // concrete backend values; these implementations provide the panicking operator sugar that the array operation bundles
-// require by delegating to the fallible `ryft` capabilities, exactly like those of `XlaArray`.
+// require by delegating to the fallible `ryft` capabilities, exactly like those of `Array`.
 
-impl std::ops::Neg for XlaValue<'_> {
+impl std::ops::Neg for Value<'_> {
     type Output = Self;
 
     fn neg(self) -> Self {
@@ -511,7 +508,7 @@ impl std::ops::Neg for XlaValue<'_> {
     }
 }
 
-impl std::ops::Add for XlaValue<'_> {
+impl std::ops::Add for Value<'_> {
     type Output = Self;
 
     fn add(self, rhs: Self) -> Self {
@@ -519,7 +516,7 @@ impl std::ops::Add for XlaValue<'_> {
     }
 }
 
-impl std::ops::Sub for XlaValue<'_> {
+impl std::ops::Sub for Value<'_> {
     type Output = Self;
 
     fn sub(self, rhs: Self) -> Self {
@@ -527,7 +524,7 @@ impl std::ops::Sub for XlaValue<'_> {
     }
 }
 
-impl std::ops::Mul for XlaValue<'_> {
+impl std::ops::Mul for Value<'_> {
     type Output = Self;
 
     fn mul(self, rhs: Self) -> Self {
@@ -535,7 +532,7 @@ impl std::ops::Mul for XlaValue<'_> {
     }
 }
 
-impl std::ops::Div for XlaValue<'_> {
+impl std::ops::Div for Value<'_> {
     type Output = Self;
 
     fn div(self, rhs: Self) -> Self {
@@ -559,9 +556,9 @@ mod tests {
     };
     use ryft_pjrt::{Client, ClientOptions, CpuClientOptions, load_cpu_plugin};
 
-    use crate::experimental::ops::{XlaConstant, XlaOperation, XlaProgramBuilder};
+    use crate::experimental::ops::{Constant, Operation, ProgramBuilder};
     use crate::tests::{execution_client, values_from_bytes, values_to_bytes};
-    use crate::{FromPjrt, XlaSession};
+    use crate::{FromPjrt, Session};
 
     use super::*;
 
@@ -572,245 +569,245 @@ mod tests {
     }
 
     fn array<'c, T: Copy>(
-        domain: &XlaDomain<'c>,
+        domain: &Domain<'c>,
         mesh: &DeviceMesh,
         data_type: DataType,
         values: &[T],
         shape: &[usize],
-    ) -> XlaArray<'c> {
+    ) -> Array<'c> {
         let r#type = ArrayType::new(data_type, Shape::from(shape.to_vec()))
             .with_sharding(Sharding::replicated(mesh.logical_mesh().clone(), shape.len()))
             .unwrap();
-        XlaArray::from_host_buffer(domain, r#type, mesh.clone(), values_to_bytes::<T>(values).as_slice()).unwrap()
+        Array::from_host_buffer(domain, r#type, mesh.clone(), values_to_bytes::<T>(values).as_slice()).unwrap()
     }
 
-    fn read<T: Copy>(value: &XlaValue<'_>) -> Vec<T> {
-        let XlaValue::Array(array) = value else { panic!("expected an array value but got `{value}`") };
+    fn read<T: Copy>(value: &Value<'_>) -> Vec<T> {
+        let Value::Array(array) = value else { panic!("expected an array value but got `{value}`") };
         let shard = array.addressable_shards().next().unwrap();
         let bytes = shard.buffer().unwrap().copy_to_host(None).unwrap().r#await().unwrap();
         values_from_bytes::<T>(bytes.as_slice())
     }
 
-    fn dimension<'c>(domain: &XlaDomain<'c>, extent: usize) -> XlaValue<'c> {
-        domain.lift(XlaConstant::Dimension(DimensionValue::constant(extent).unwrap())).unwrap()
+    fn dimension<'c>(domain: &Domain<'c>, extent: usize) -> Value<'c> {
+        domain.lift(Constant::Dimension(DimensionValue::constant(extent).unwrap())).unwrap()
     }
 
-    fn same_session<'c>(left: &XlaDomain<'c>, right: &XlaDomain<'c>) -> bool {
+    fn same_session<'c>(left: &Domain<'c>, right: &Domain<'c>) -> bool {
         Arc::ptr_eq(left.session(), right.session())
     }
 
     #[test]
-    fn test_xla_dimension_new() {
+    fn test_dimension_new() {
         let client = execution_client();
-        let domain = XlaSession::new(&client).domain();
+        let domain = Session::new(&client).domain();
         let value = DimensionValue::constant(3).unwrap();
-        let dimension = XlaDimension::new(value.clone(), domain.clone());
+        let dimension = Dimension::new(value.clone(), domain.clone());
         assert_eq!(dimension.value(), &value);
-        assert!(same_session(dimension.xla_domain(), &domain));
+        assert!(same_session(dimension.backend_domain(), &domain));
         assert_eq!(dimension.into_value(), value);
     }
 
     #[test]
-    fn test_xla_dimension_display_and_debug() {
+    fn test_dimension_display_and_debug() {
         let client = execution_client();
         let value = DimensionValue::constant(3).unwrap();
-        let dimension = XlaDimension::new(value.clone(), XlaSession::new(&client).domain());
+        let dimension = Dimension::new(value.clone(), Session::new(&client).domain());
         assert_eq!(dimension.to_string(), "3");
-        assert_eq!(format!("{dimension:?}"), format!("XlaDimension({value:?})"));
+        assert_eq!(format!("{dimension:?}"), format!("Dimension({value:?})"));
     }
 
     #[test]
-    fn test_xla_dimension_equality() {
+    fn test_dimension_equality() {
         // Equality ignores the session, which only selects where derived arrays are materialized.
         let client = execution_client();
         let value = DimensionValue::constant(3).unwrap();
-        let first = XlaDimension::new(value.clone(), XlaSession::new(&client).domain());
-        let second = XlaDimension::new(value, XlaSession::new(&client).domain());
+        let first = Dimension::new(value.clone(), Session::new(&client).domain());
+        let second = Dimension::new(value, Session::new(&client).domain());
         assert_eq!(first, second);
-        assert_ne!(first, XlaDimension::new(DimensionValue::constant(4).unwrap(), XlaSession::new(&client).domain()));
+        assert_ne!(first, Dimension::new(DimensionValue::constant(4).unwrap(), Session::new(&client).domain()));
     }
 
     #[test]
-    fn test_xla_dimension_borrow() {
+    fn test_dimension_borrow() {
         let client = execution_client();
         let value = DimensionValue::constant(3).unwrap();
-        let dimension = XlaDimension::new(value.clone(), XlaSession::new(&client).domain());
+        let dimension = Dimension::new(value.clone(), Session::new(&client).domain());
         assert_eq!(Borrow::<DimensionValue>::borrow(&dimension), &value);
     }
 
     #[test]
-    fn test_xla_dimension_type() {
+    fn test_dimension_type() {
         let client = execution_client();
         let value = DimensionValue::constant(3).unwrap();
-        let dimension = XlaDimension::new(value.clone(), XlaSession::new(&client).domain());
+        let dimension = Dimension::new(value.clone(), Session::new(&client).domain());
         assert_eq!(dimension.r#type(), value.r#type());
     }
 
     #[test]
-    fn test_xla_dimension_compare() {
+    fn test_dimension_compare() {
         // The predicate is decided on the host, so only the Boolean result is uploaded and no program is compiled.
         let client = execution_client();
-        let domain = XlaSession::new(&client).domain();
-        let two = XlaDimension::new(DimensionValue::constant(2).unwrap(), domain.clone());
-        let three = XlaDimension::new(DimensionValue::constant(3).unwrap(), domain.clone());
+        let domain = Session::new(&client).domain();
+        let two = Dimension::new(DimensionValue::constant(2).unwrap(), domain.clone());
+        let three = Dimension::new(DimensionValue::constant(3).unwrap(), domain.clone());
         let program_count = domain.program_count();
         let less_than = two.compare(&three, ComparisonDirection::LessThan).unwrap();
         assert_eq!(read::<u8>(&less_than), vec![1]);
-        assert!(same_session(less_than.xla_domain(), &domain));
+        assert!(same_session(less_than.backend_domain(), &domain));
         assert_eq!(read::<u8>(&two.compare(&three, ComparisonDirection::Equal).unwrap()), vec![0]);
         assert_eq!(read::<u8>(&three.compare(&three, ComparisonDirection::GreaterThanOrEqual).unwrap()), vec![1]);
         assert_eq!(domain.program_count(), program_count);
     }
 
     #[test]
-    fn test_xla_dimension_domain() {
+    fn test_dimension_domain() {
         // Dimension arithmetic dispatches through the dimension's domain, which evaluates it on the host.
         let client = execution_client();
-        let domain = XlaSession::new(&client).domain();
-        let two = XlaDimension::new(DimensionValue::constant(2).unwrap(), domain.clone());
-        let three = XlaDimension::new(DimensionValue::constant(3).unwrap(), domain.clone());
+        let domain = Session::new(&client).domain();
+        let two = Dimension::new(DimensionValue::constant(2).unwrap(), domain.clone());
+        let three = Dimension::new(DimensionValue::constant(3).unwrap(), domain.clone());
         assert!(same_session(two.domain().parent(), &domain));
         assert!(same_session(two.domain().parent(), &domain));
         let program_count = domain.program_count();
         let five = Add::add(&two, &three).unwrap();
         assert_eq!(five.value().extent(), 5);
-        assert!(same_session(five.xla_domain(), &domain));
+        assert!(same_session(five.backend_domain(), &domain));
         assert_eq!(domain.program_count(), program_count);
     }
 
     #[test]
-    fn test_xla_dimension_rename_type_identities() {
+    fn test_dimension_rename_type_identities() {
         let client = execution_client();
         let bounds = DimensionBounds::positive(Some(9)).unwrap();
         let source = DimensionVariable::new("source", bounds);
         let target = DimensionVariable::new("target", bounds);
         let value = DimensionValue::new(source.clone().into(), 4).unwrap();
-        let dimension = XlaDimension::new(value, XlaSession::new(&client).domain());
+        let dimension = Dimension::new(value, Session::new(&client).domain());
         let mut renaming = TypeIdentityRenaming::new();
         renaming.insert(source, target.clone()).unwrap();
         let renamed = dimension.rename_type_identities(&renaming).unwrap();
         assert_eq!(renamed.value(), &DimensionValue::new(target.into(), 4).unwrap());
-        assert!(same_session(renamed.xla_domain(), dimension.xla_domain()));
+        assert!(same_session(renamed.backend_domain(), dimension.backend_domain()));
     }
 
     #[test]
-    fn test_xla_reference_new() {
+    fn test_reference_new() {
         let client = execution_client();
-        let domain = XlaSession::new(&client).domain();
+        let domain = Session::new(&client).domain();
         let mesh = mesh_on(&client, 0);
         let handle = ArrayReference::new(array(&domain, &mesh, DataType::F32, &[1.0f32], &[]));
-        let reference = XlaReference::new(handle.clone(), domain.clone());
+        let reference = Reference::new(handle.clone(), domain.clone());
         assert_eq!(reference.handle(), &handle);
-        assert!(same_session(reference.xla_domain(), &domain));
+        assert!(same_session(reference.backend_domain(), &domain));
         assert_eq!(reference.into_handle(), handle);
     }
 
     #[test]
-    fn test_xla_reference_display_and_debug() {
+    fn test_reference_display_and_debug() {
         let client = execution_client();
-        let domain = XlaSession::new(&client).domain();
+        let domain = Session::new(&client).domain();
         let mesh = mesh_on(&client, 0);
         let handle = ArrayReference::new(array(&domain, &mesh, DataType::F32, &[1.0f32], &[]));
-        let reference = XlaReference::new(handle.clone(), domain);
+        let reference = Reference::new(handle.clone(), domain);
         assert_eq!(reference.to_string(), handle.to_string());
-        assert_eq!(format!("{reference:?}"), format!("XlaReference({handle:?})"));
+        assert_eq!(format!("{reference:?}"), format!("Reference({handle:?})"));
     }
 
     #[test]
-    fn test_xla_reference_equality() {
+    fn test_reference_equality() {
         // References compare by handle identity, regardless of their sessions.
         let client = execution_client();
-        let domain = XlaSession::new(&client).domain();
+        let domain = Session::new(&client).domain();
         let mesh = mesh_on(&client, 0);
         let handle = ArrayReference::new(array(&domain, &mesh, DataType::F32, &[1.0f32], &[]));
-        let reference = XlaReference::new(handle.clone(), domain.clone());
-        assert_eq!(reference, XlaReference::new(handle, XlaSession::new(&client).domain()));
+        let reference = Reference::new(handle.clone(), domain.clone());
+        assert_eq!(reference, Reference::new(handle, Session::new(&client).domain()));
         let other = ArrayReference::new(array(&domain, &mesh, DataType::F32, &[1.0f32], &[]));
-        assert_ne!(reference, XlaReference::new(other, domain));
+        assert_ne!(reference, Reference::new(other, domain));
     }
 
     #[test]
-    fn test_xla_reference_type() {
+    fn test_reference_type() {
         let client = execution_client();
-        let domain = XlaSession::new(&client).domain();
+        let domain = Session::new(&client).domain();
         let mesh = mesh_on(&client, 0);
         let handle = ArrayReference::new(array(&domain, &mesh, DataType::F32, &[1.0f32], &[]));
-        let reference = XlaReference::new(handle.clone(), domain);
+        let reference = Reference::new(handle.clone(), domain);
         assert_eq!(reference.r#type(), handle.r#type());
     }
 
     #[test]
-    fn test_xla_value_xla_domain() {
+    fn test_value_backend_domain() {
         let client = execution_client();
-        let domain = XlaSession::new(&client).domain();
+        let domain = Session::new(&client).domain();
         let mesh = mesh_on(&client, 0);
         let array = array(&domain, &mesh, DataType::F32, &[1.0f32], &[]);
-        let reference = XlaReference::new(ArrayReference::new(array.clone()), domain.clone());
-        assert!(same_session(XlaValue::Array(array).xla_domain(), &domain));
-        assert!(same_session(dimension(&domain, 3).xla_domain(), &domain));
-        assert!(same_session(XlaValue::Reference(reference).xla_domain(), &domain));
+        let reference = Reference::new(ArrayReference::new(array.clone()), domain.clone());
+        assert!(same_session(Value::Array(array).backend_domain(), &domain));
+        assert!(same_session(dimension(&domain, 3).backend_domain(), &domain));
+        assert!(same_session(Value::Reference(reference).backend_domain(), &domain));
     }
 
     #[test]
-    fn test_xla_value_into_array_ir_value() {
+    fn test_value_into_array_ir_value() {
         // The conversion is lossless up to the sessions, which the inverse conversion binds to the provided domain.
         let client = execution_client();
-        let domain = XlaSession::new(&client).domain();
+        let domain = Session::new(&client).domain();
         let mesh = mesh_on(&client, 0);
         let array = array(&domain, &mesh, DataType::F32, &[1.0f32], &[]);
         let handle = ArrayReference::new(array.clone());
         let extent = DimensionValue::constant(3).unwrap();
         let values = [
-            XlaValue::Array(array.clone()),
-            XlaValue::Dimension(XlaDimension::new(extent.clone(), domain.clone())),
-            XlaValue::Reference(XlaReference::new(handle.clone(), domain.clone())),
+            Value::Array(array.clone()),
+            Value::Dimension(Dimension::new(extent.clone(), domain.clone())),
+            Value::Reference(Reference::new(handle.clone(), domain.clone())),
         ];
-        let converted = values.clone().map(XlaValue::into_array_ir_value);
+        let converted = values.clone().map(Value::into_array_ir_value);
         assert_eq!(
             converted,
             [ArrayIrValue::Array(array), ArrayIrValue::Dimension(extent), ArrayIrValue::Reference(handle),],
         );
-        let other_domain = XlaSession::new(&client).domain();
-        let restored = converted.map(|value| XlaValue::from_array_ir_value(value, &other_domain).unwrap());
+        let other_domain = Session::new(&client).domain();
+        let restored = converted.map(|value| Value::from_array_ir_value(value, &other_domain).unwrap());
         assert_eq!(restored, values);
-        assert!(same_session(restored[0].xla_domain(), &domain));
-        assert!(same_session(restored[1].xla_domain(), &other_domain));
-        assert!(same_session(restored[2].xla_domain(), &other_domain));
+        assert!(same_session(restored[0].backend_domain(), &domain));
+        assert!(same_session(restored[1].backend_domain(), &other_domain));
+        assert!(same_session(restored[2].backend_domain(), &other_domain));
     }
 
     #[test]
-    fn test_xla_value_display_and_debug() {
+    fn test_value_display_and_debug() {
         // Values render exactly like the corresponding `ArrayIrValue` members.
         let client = execution_client();
-        let domain = XlaSession::new(&client).domain();
+        let domain = Session::new(&client).domain();
         let mesh = mesh_on(&client, 0);
         let array = array(&domain, &mesh, DataType::F32, &[1.0f32], &[]);
-        let reference = XlaReference::new(ArrayReference::new(array.clone()), domain.clone());
-        for value in [XlaValue::Array(array), dimension(&domain, 3), XlaValue::Reference(reference)] {
+        let reference = Reference::new(ArrayReference::new(array.clone()), domain.clone());
+        for value in [Value::Array(array), dimension(&domain, 3), Value::Reference(reference)] {
             assert_eq!(value.to_string(), value.clone().into_array_ir_value().to_string());
         }
         let value = DimensionValue::constant(3).unwrap();
-        assert_eq!(format!("{:?}", dimension(&domain, 3)), format!("Dimension(XlaDimension({value:?}))"));
+        assert_eq!(format!("{:?}", dimension(&domain, 3)), format!("Dimension(Dimension({value:?}))"));
     }
 
     #[test]
-    fn test_xla_value_type() {
+    fn test_value_type() {
         let client = execution_client();
-        let domain = XlaSession::new(&client).domain();
+        let domain = Session::new(&client).domain();
         let mesh = mesh_on(&client, 0);
         let array = array(&domain, &mesh, DataType::F32, &[1.0f32], &[]);
-        let reference = XlaReference::new(ArrayReference::new(array.clone()), domain.clone());
-        for value in [XlaValue::Array(array), dimension(&domain, 3), XlaValue::Reference(reference)] {
+        let reference = Reference::new(ArrayReference::new(array.clone()), domain.clone());
+        for value in [Value::Array(array), dimension(&domain, 3), Value::Reference(reference)] {
             assert_eq!(value.r#type(), value.clone().into_array_ir_value().r#type());
         }
     }
 
     #[test]
-    fn test_xla_value_domain() {
+    fn test_value_domain() {
         let client = execution_client();
-        let domain = XlaSession::new(&client).domain();
+        let domain = Session::new(&client).domain();
         let mesh = mesh_on(&client, 0);
-        let array = XlaValue::Array(array(&domain, &mesh, DataType::F32, &[1.0f32], &[]));
+        let array = Value::Array(array(&domain, &mesh, DataType::F32, &[1.0f32], &[]));
         assert!(same_session(&array.domain(), &domain));
         assert!(same_session(&array.domain(), &domain));
         assert!(same_session(&dimension(&domain, 3).domain(), &domain));
@@ -820,32 +817,32 @@ mod tests {
         assert!(dimension(&domain, 3).domain().mesh().is_err());
         let other_mesh = mesh_on(&client, 0);
         let meshed_domain = domain.with_mesh(other_mesh.clone());
-        let meshed_array = XlaValue::Array(super::tests::array(&meshed_domain, &mesh, DataType::F32, &[1.0f32], &[]));
+        let meshed_array = Value::Array(super::tests::array(&meshed_domain, &mesh, DataType::F32, &[1.0f32], &[]));
         assert_eq!(meshed_array.domain().mesh().unwrap(), &other_mesh);
     }
 
     #[test]
-    fn test_xla_value_domain_places_dimension_derived_arrays_on_the_source_mesh() {
+    fn test_value_domain_places_dimension_derived_arrays_on_the_source_mesh() {
         let client = load_cpu_plugin()
             .unwrap()
             .client(ClientOptions::CPU(CpuClientOptions { device_count: Some(2), ..Default::default() }))
             .unwrap();
-        let domain = XlaSession::new(&client).domain();
+        let domain = Session::new(&client).domain();
         let mesh = mesh_on(&client, 1);
-        let input = XlaValue::Array(array(&domain, &mesh, DataType::F32, &[1.0f32, 2.0, 3.0], &[3]));
+        let input = Value::Array(array(&domain, &mesh, DataType::F32, &[1.0f32, 2.0, 3.0], &[3]));
         let size = input.dimension_size(0).unwrap();
-        let XlaValue::Array(scalar) = size.to_scalar().unwrap() else { panic!("expected an array") };
+        let Value::Array(scalar) = size.to_scalar().unwrap() else { panic!("expected an array") };
         assert_eq!(scalar.mesh(), &mesh);
-        let XlaValue::Array(comparison) = size.less_than(&dimension(&domain, 4)).unwrap() else {
+        let Value::Array(comparison) = size.less_than(&dimension(&domain, 4)).unwrap() else {
             panic!("expected an array")
         };
         assert_eq!(comparison.mesh(), &mesh);
     }
 
     #[test]
-    fn test_xla_value_rename_type_identities() {
+    fn test_value_rename_type_identities() {
         let client = execution_client();
-        let domain = XlaSession::new(&client).domain();
+        let domain = Session::new(&client).domain();
         let mesh = mesh_on(&client, 0);
         let bounds = DimensionBounds::positive(Some(9)).unwrap();
         let source = DimensionVariable::new("source", bounds);
@@ -854,32 +851,31 @@ mod tests {
         renaming.insert(source.clone(), target.clone()).unwrap();
 
         // Dimension members rename their types and keep their sessions.
-        let value =
-            XlaValue::Dimension(XlaDimension::new(DimensionValue::new(source.into(), 4).unwrap(), domain.clone()));
+        let value = Value::Dimension(Dimension::new(DimensionValue::new(source.into(), 4).unwrap(), domain.clone()));
         let renamed = value.rename_type_identities(&renaming).unwrap();
         assert_eq!(
             renamed,
-            XlaValue::Dimension(XlaDimension::new(DimensionValue::new(target.into(), 4).unwrap(), domain.clone()))
+            Value::Dimension(Dimension::new(DimensionValue::new(target.into(), 4).unwrap(), domain.clone()))
         );
-        assert!(same_session(renamed.xla_domain(), &domain));
+        assert!(same_session(renamed.backend_domain(), &domain));
 
         // Static array and reference members have no identities to rename, so they keep their storage and handles.
         let array = array(&domain, &mesh, DataType::F32, &[1.0f32], &[]);
-        let reference = XlaValue::Reference(XlaReference::new(ArrayReference::new(array.clone()), domain.clone()));
-        assert_eq!(XlaValue::Array(array.clone()).rename_type_identities(&renaming), Ok(XlaValue::Array(array)));
+        let reference = Value::Reference(Reference::new(ArrayReference::new(array.clone()), domain.clone()));
+        assert_eq!(Value::Array(array.clone()).rename_type_identities(&renaming), Ok(Value::Array(array)));
         let renamed = reference.rename_type_identities(&renaming).unwrap();
         assert_eq!(renamed, reference);
-        assert!(same_session(renamed.xla_domain(), &domain));
+        assert!(same_session(renamed.backend_domain(), &domain));
     }
 
     #[test]
-    fn test_xla_value_validate_as_constant() {
+    fn test_value_validate_as_constant() {
         let client = execution_client();
-        let domain = XlaSession::new(&client).domain();
+        let domain = Session::new(&client).domain();
         let mesh = mesh_on(&client, 0);
         let array = array(&domain, &mesh, DataType::F32, &[1.0f32], &[]);
-        let reference = XlaValue::Reference(XlaReference::new(ArrayReference::new(array.clone()), domain.clone()));
-        assert_eq!(XlaValue::Array(array).validate_as_constant(), Ok(()));
+        let reference = Value::Reference(Reference::new(ArrayReference::new(array.clone()), domain.clone()));
+        assert_eq!(Value::Array(array).validate_as_constant(), Ok(()));
         assert_eq!(dimension(&domain, 3).validate_as_constant(), Ok(()));
         assert_eq!(
             reference.validate_as_constant(),
@@ -891,104 +887,104 @@ mod tests {
     }
 
     #[test]
-    fn test_xla_value_is_zero() {
+    fn test_value_is_zero() {
         let client = execution_client();
-        let domain = XlaSession::new(&client).domain();
+        let domain = Session::new(&client).domain();
         let mesh = mesh_on(&client, 0);
         let array = array(&domain, &mesh, DataType::F32, &[0.0f32], &[]);
-        let reference = XlaValue::Reference(XlaReference::new(ArrayReference::new(array.clone()), domain.clone()));
-        assert_eq!(XlaValue::Array(array.clone()).is_zero(), array.is_zero());
+        let reference = Value::Reference(Reference::new(ArrayReference::new(array.clone()), domain.clone()));
+        assert_eq!(Value::Array(array.clone()).is_zero(), array.is_zero());
         assert!(!dimension(&domain, 0).is_zero());
         assert!(!reference.is_zero());
     }
 
     #[test]
-    fn test_xla_value_singleton() {
+    fn test_value_singleton() {
         // A static function cannot attach a session, so even a singleton dimension type has no singleton value.
         let singleton_type = DimensionValue::constant(3).unwrap().r#type().into_owned();
-        assert_eq!(XlaValue::singleton(&ArrayIrType::Dimension(singleton_type)), None);
-        assert_eq!(XlaValue::singleton(&ArrayIrType::Array(ArrayType::scalar(DataType::F32))), None);
+        assert_eq!(Value::singleton(&ArrayIrType::Dimension(singleton_type)), None);
+        assert_eq!(Value::singleton(&ArrayIrType::Array(ArrayType::scalar(DataType::F32))), None);
     }
 
     #[test]
-    fn test_xla_value_reference_id() {
+    fn test_value_reference_id() {
         let client = execution_client();
-        let domain = XlaSession::new(&client).domain();
+        let domain = Session::new(&client).domain();
         let mesh = mesh_on(&client, 0);
         let array = array(&domain, &mesh, DataType::F32, &[1.0f32], &[]);
         let handle = ArrayReference::new(array.clone());
-        let reference = XlaValue::Reference(XlaReference::new(handle.clone(), domain.clone()));
-        assert_eq!(XlaValue::Array(array).reference_id(), None);
+        let reference = Value::Reference(Reference::new(handle.clone(), domain.clone()));
+        assert_eq!(Value::Array(array).reference_id(), None);
         assert_eq!(dimension(&domain, 3).reference_id(), None);
         assert_eq!(reference.reference_id(), Some(handle.id()));
     }
 
     #[test]
-    fn test_xla_value_array_projection() {
+    fn test_value_array_projection() {
         let client = execution_client();
-        let domain = XlaSession::new(&client).domain();
+        let domain = Session::new(&client).domain();
         let mesh = mesh_on(&client, 0);
         let array = array(&domain, &mesh, DataType::F32, &[1.0f32], &[]);
-        let value = <XlaValue<'_> as ValueProjection<ArrayType>>::from_projected(array.clone());
-        assert_eq!(<XlaValue<'_> as ValueProjection<ArrayType>>::projected(&value), Ok(&array));
+        let value = <Value<'_> as ValueProjection<ArrayType>>::from_projected(array.clone());
+        assert_eq!(<Value<'_> as ValueProjection<ArrayType>>::projected(&value), Ok(&array));
         assert_eq!(ValueProjection::<ArrayType>::into_projected(value), Ok(array));
         assert_eq!(
-            <XlaValue<'_> as ValueProjection<ArrayType>>::projected(&dimension(&domain, 3)),
+            <Value<'_> as ValueProjection<ArrayType>>::projected(&dimension(&domain, 3)),
             Err(TypeError::invalid("expected array type but got dimension type")),
         );
     }
 
     #[test]
-    fn test_xla_value_dimension_projection() {
+    fn test_value_dimension_projection() {
         let client = execution_client();
-        let domain = XlaSession::new(&client).domain();
+        let domain = Session::new(&client).domain();
         let mesh = mesh_on(&client, 0);
-        let dimension = XlaDimension::new(DimensionValue::constant(3).unwrap(), domain.clone());
-        let value = <XlaValue<'_> as ValueProjection<DimensionType>>::from_projected(dimension.clone());
-        assert_eq!(<XlaValue<'_> as ValueProjection<DimensionType>>::projected(&value), Ok(&dimension));
+        let dimension = Dimension::new(DimensionValue::constant(3).unwrap(), domain.clone());
+        let value = <Value<'_> as ValueProjection<DimensionType>>::from_projected(dimension.clone());
+        assert_eq!(<Value<'_> as ValueProjection<DimensionType>>::projected(&value), Ok(&dimension));
         assert_eq!(ValueProjection::<DimensionType>::into_projected(value), Ok(dimension));
-        let array = XlaValue::Array(array(&domain, &mesh, DataType::F32, &[1.0f32], &[]));
+        let array = Value::Array(array(&domain, &mesh, DataType::F32, &[1.0f32], &[]));
         assert_eq!(
-            <XlaValue<'_> as ValueProjection<DimensionType>>::projected(&array),
+            <Value<'_> as ValueProjection<DimensionType>>::projected(&array),
             Err(TypeError::invalid("expected dimension type but got array type")),
         );
     }
 
     #[test]
-    fn test_xla_value_reference_projection() {
+    fn test_value_reference_projection() {
         let client = execution_client();
-        let domain = XlaSession::new(&client).domain();
+        let domain = Session::new(&client).domain();
         let mesh = mesh_on(&client, 0);
         let array = array(&domain, &mesh, DataType::F32, &[1.0f32], &[]);
-        let reference = XlaReference::new(ArrayReference::new(array.clone()), domain.clone());
-        let value = <XlaValue<'_> as ValueProjection<ReferenceType<ArrayType>>>::from_projected(reference.clone());
-        assert_eq!(<XlaValue<'_> as ValueProjection<ReferenceType<ArrayType>>>::projected(&value), Ok(&reference));
+        let reference = Reference::new(ArrayReference::new(array.clone()), domain.clone());
+        let value = <Value<'_> as ValueProjection<ReferenceType<ArrayType>>>::from_projected(reference.clone());
+        assert_eq!(<Value<'_> as ValueProjection<ReferenceType<ArrayType>>>::projected(&value), Ok(&reference));
         assert_eq!(ValueProjection::<ReferenceType<ArrayType>>::into_projected(value), Ok(reference));
         assert_eq!(
-            <XlaValue<'_> as ValueProjection<ReferenceType<ArrayType>>>::projected(&XlaValue::Array(array)),
+            <Value<'_> as ValueProjection<ReferenceType<ArrayType>>>::projected(&Value::Array(array)),
             Err(TypeError::invalid("expected reference type but got array type")),
         );
     }
 
     #[test]
-    fn test_xla_value_from() {
+    fn test_value_from() {
         let client = execution_client();
-        let domain = XlaSession::new(&client).domain();
+        let domain = Session::new(&client).domain();
         let mesh = mesh_on(&client, 0);
         let array = array(&domain, &mesh, DataType::F32, &[1.0f32], &[]);
-        let dimension = XlaDimension::new(DimensionValue::constant(3).unwrap(), domain.clone());
-        let reference = XlaReference::new(ArrayReference::new(array.clone()), domain);
-        assert_eq!(XlaValue::from(array.clone()), XlaValue::Array(array));
-        assert_eq!(XlaValue::from(dimension.clone()), XlaValue::Dimension(dimension));
-        assert_eq!(XlaValue::from(reference.clone()), XlaValue::Reference(reference));
+        let dimension = Dimension::new(DimensionValue::constant(3).unwrap(), domain.clone());
+        let reference = Reference::new(ArrayReference::new(array.clone()), domain);
+        assert_eq!(Value::from(array.clone()), Value::Array(array));
+        assert_eq!(Value::from(dimension.clone()), Value::Dimension(dimension));
+        assert_eq!(Value::from(reference.clone()), Value::Reference(reference));
     }
 
     #[test]
-    fn test_xla_value_concretize() {
+    fn test_value_concretize() {
         let client = execution_client();
-        let domain = XlaSession::new(&client).domain();
+        let domain = Session::new(&client).domain();
         let mesh = mesh_on(&client, 0);
-        let predicate = XlaValue::Array(array(&domain, &mesh, DataType::Boolean, &[1u8], &[]));
+        let predicate = Value::Array(array(&domain, &mesh, DataType::Boolean, &[1u8], &[]));
         assert_eq!(predicate.concretize(), Ok(true));
         assert!(matches!(
             dimension(&domain, 3).concretize(),
@@ -998,12 +994,12 @@ mod tests {
     }
 
     #[test]
-    fn test_xla_value_any_true() {
+    fn test_value_any_true() {
         let client = execution_client();
-        let domain = XlaSession::new(&client).domain();
+        let domain = Session::new(&client).domain();
         let mesh = mesh_on(&client, 0);
-        assert_eq!(XlaValue::Array(array(&domain, &mesh, DataType::Boolean, &[0u8, 1], &[2])).any_true(), Ok(true));
-        assert_eq!(XlaValue::Array(array(&domain, &mesh, DataType::Boolean, &[0u8, 0], &[2])).any_true(), Ok(false));
+        assert_eq!(Value::Array(array(&domain, &mesh, DataType::Boolean, &[0u8, 1], &[2])).any_true(), Ok(true));
+        assert_eq!(Value::Array(array(&domain, &mesh, DataType::Boolean, &[0u8, 0], &[2])).any_true(), Ok(false));
         assert!(matches!(
             dimension(&domain, 3).any_true(),
             Err(ProgramError::Concretization { message })
@@ -1012,29 +1008,29 @@ mod tests {
     }
 
     #[test]
-    fn test_xla_value_select() {
+    fn test_value_select() {
         let client = execution_client();
-        let domain = XlaSession::new(&client).domain();
+        let domain = Session::new(&client).domain();
         let mesh = mesh_on(&client, 0);
 
         // A scalar predicate selects whole values.
-        let falsity = XlaValue::Array(array(&domain, &mesh, DataType::Boolean, &[0u8], &[]));
-        let one = XlaValue::Array(array(&domain, &mesh, DataType::F32, &[1.0f32], &[]));
-        let two = XlaValue::Array(array(&domain, &mesh, DataType::F32, &[2.0f32], &[]));
+        let falsity = Value::Array(array(&domain, &mesh, DataType::Boolean, &[0u8], &[]));
+        let one = Value::Array(array(&domain, &mesh, DataType::F32, &[1.0f32], &[]));
+        let two = Value::Array(array(&domain, &mesh, DataType::F32, &[2.0f32], &[]));
         assert_eq!(read::<f32>(&falsity.select(&one, &two).unwrap()), vec![2.0]);
 
         // A batched (prefix-shaped) predicate selects per item: item 0 keeps the first row of `on_false` and item 1
         // takes the second row of `on_true`.
-        let mixed = XlaValue::Array(array(&domain, &mesh, DataType::Boolean, &[0u8, 1], &[2]));
-        let on_true = XlaValue::Array(array(&domain, &mesh, DataType::F32, &[1.0f32, 2.0, 3.0, 4.0], &[2, 2]));
-        let on_false = XlaValue::Array(array(&domain, &mesh, DataType::F32, &[5.0f32, 6.0, 7.0, 8.0], &[2, 2]));
+        let mixed = Value::Array(array(&domain, &mesh, DataType::Boolean, &[0u8, 1], &[2]));
+        let on_true = Value::Array(array(&domain, &mesh, DataType::F32, &[1.0f32, 2.0, 3.0, 4.0], &[2, 2]));
+        let on_false = Value::Array(array(&domain, &mesh, DataType::F32, &[5.0f32, 6.0, 7.0, 8.0], &[2, 2]));
         assert_eq!(read::<f32>(&mixed.select(&on_true, &on_false).unwrap()), vec![5.0, 6.0, 3.0, 4.0]);
 
         // Equal dimension carries pass through with their session, while dimensions are never predicates.
         let three = dimension(&domain, 3);
         let selected = mixed.select(&three, &three).unwrap();
         assert_eq!(selected, three);
-        assert!(same_session(selected.xla_domain(), &domain));
+        assert!(same_session(selected.backend_domain(), &domain));
         assert!(matches!(
             three.select(&one, &two),
             Err(ProgramError::Concretization { message })
@@ -1043,11 +1039,11 @@ mod tests {
     }
 
     #[test]
-    fn test_xla_value_assertion_value() {
+    fn test_value_assertion_value() {
         let client = execution_client();
-        let domain = XlaSession::new(&client).domain();
+        let domain = Session::new(&client).domain();
         let mesh = mesh_on(&client, 0);
-        let scalar = XlaValue::Array(array(&domain, &mesh, DataType::I32, &[42i32], &[]));
+        let scalar = Value::Array(array(&domain, &mesh, DataType::I32, &[42i32], &[]));
         assert_eq!(scalar.assertion_observation(), Ok("42".to_string()));
         assert_eq!(scalar.assertion_array(), Ok(Some(ryft_core::Array::scalar(42i32).unwrap())));
         assert_eq!(dimension(&domain, 3).assertion_observation(), Ok("3".to_string()));
@@ -1055,23 +1051,23 @@ mod tests {
     }
 
     #[test]
-    fn test_xla_value_assert() {
+    fn test_value_assert() {
         let client = execution_client();
-        let domain = XlaSession::new(&client).domain();
+        let domain = Session::new(&client).domain();
         let mesh = mesh_on(&client, 0);
-        let truth = XlaValue::Array(array(&domain, &mesh, DataType::Boolean, &[1u8], &[]));
-        let falsity = XlaValue::Array(array(&domain, &mesh, DataType::Boolean, &[0u8], &[]));
+        let truth = Value::Array(array(&domain, &mesh, DataType::Boolean, &[1u8], &[]));
+        let falsity = Value::Array(array(&domain, &mesh, DataType::Boolean, &[0u8], &[]));
         assert_eq!(truth.assert("predicate must hold", &[]), Ok(()));
         assert!(falsity.assert("predicate must hold", &[]).is_err());
     }
 
     #[test]
-    fn test_xla_value_operators() {
+    fn test_value_operators() {
         let client = execution_client();
-        let domain = XlaSession::new(&client).domain();
+        let domain = Session::new(&client).domain();
         let mesh = mesh_on(&client, 0);
-        let two = XlaValue::Array(array(&domain, &mesh, DataType::F32, &[2.0f32], &[]));
-        let four = XlaValue::Array(array(&domain, &mesh, DataType::F32, &[4.0f32], &[]));
+        let two = Value::Array(array(&domain, &mesh, DataType::F32, &[2.0f32], &[]));
+        let four = Value::Array(array(&domain, &mesh, DataType::F32, &[4.0f32], &[]));
         assert_eq!(read::<f32>(&-two.clone()), vec![-2.0]);
         assert_eq!(read::<f32>(&(two.clone() + four.clone())), vec![6.0]);
         assert_eq!(read::<f32>(&(two.clone() - four.clone())), vec![-2.0]);
@@ -1080,11 +1076,11 @@ mod tests {
     }
 
     #[test]
-    fn test_xla_value_compare_dimensions() {
+    fn test_value_compare_dimensions() {
         // Comparing first-class dimensions executes eagerly outside any context, without compiling a program, and
         // materializes the Boolean result in the session of the inputs.
         let client = execution_client();
-        let domain = XlaSession::new(&client).domain();
+        let domain = Session::new(&client).domain();
         let mesh = mesh_on(&client, 0);
         let (two, three) = (dimension(&domain, 2), dimension(&domain, 3));
         let program_count = domain.program_count();
@@ -1094,7 +1090,7 @@ mod tests {
         assert_eq!(domain.program_count(), program_count);
 
         // A dimension cannot be compared with an array.
-        let scalar = XlaValue::Array(array(&domain, &mesh, DataType::I64, &[2i64], &[]));
+        let scalar = Value::Array(array(&domain, &mesh, DataType::I64, &[2i64], &[]));
         assert!(matches!(
             two.less_than(&scalar),
             Err(ProgramError::Type(TypeError::Invalid { message }))
@@ -1103,9 +1099,9 @@ mod tests {
     }
 
     #[test]
-    fn test_xla_value_dimension_to_scalar() {
+    fn test_value_dimension_to_scalar() {
         let client = execution_client();
-        let domain = XlaSession::new(&client).domain();
+        let domain = Session::new(&client).domain();
         let program_count = domain.program_count();
         let scalar = dimension(&domain, 2).to_scalar().unwrap();
         assert!(matches!(
@@ -1117,17 +1113,17 @@ mod tests {
     }
 
     #[test]
-    fn test_xla_value_reference_capabilities() {
+    fn test_value_reference_capabilities() {
         // Top-level reference operations execute eagerly on their host-side handles, with the validation and locking of
         // the generic array IR reference implementations.
         let client = execution_client();
-        let domain = XlaSession::new(&client).domain();
+        let domain = Session::new(&client).domain();
         let mesh = mesh_on(&client, 0);
-        let vector = |values: &[f32]| XlaValue::Array(array(&domain, &mesh, DataType::F32, values, &[values.len()]));
-        let scalar = |value: f32| XlaValue::Array(array(&domain, &mesh, DataType::F32, &[value], &[]));
+        let vector = |values: &[f32]| Value::Array(array(&domain, &mesh, DataType::F32, values, &[values.len()]));
+        let scalar = |value: f32| Value::Array(array(&domain, &mesh, DataType::F32, &[value], &[]));
 
         let reference = vector(&[1.0, 2.0]).reference_new().unwrap();
-        assert!(same_session(reference.xla_domain(), &domain));
+        assert!(same_session(reference.backend_domain(), &domain));
         assert_eq!(read::<f32>(&reference.read().unwrap()), vec![1.0, 2.0]);
         reference.write(&vector(&[3.0, 4.0])).unwrap();
         assert_eq!(read::<f32>(&reference.swap(&vector(&[5.0, 6.0])).unwrap()), vec![3.0, 4.0]);
@@ -1156,57 +1152,57 @@ mod tests {
     }
 
     #[test]
-    fn test_xla_value_projected_capabilities() {
+    fn test_value_projected_capabilities() {
         // Capabilities without a receiver-shaped signature project onto the array member through the generalized
         // array IR implementations in `ryft-core`.
         let client = execution_client();
-        let domain = XlaSession::new(&client).domain();
+        let domain = Session::new(&client).domain();
         let mesh = mesh_on(&client, 0);
-        let input = XlaValue::Array(array(&domain, &mesh, DataType::F32, &[3.0f32, 1.0, 2.0], &[3]));
-        let sorted = XlaValue::sort(&[input.clone()], 0, SortDirection::Ascending).unwrap();
+        let input = Value::Array(array(&domain, &mesh, DataType::F32, &[3.0f32, 1.0, 2.0], &[3]));
+        let sorted = Value::sort(&[input.clone()], 0, SortDirection::Ascending).unwrap();
         assert_eq!(read::<f32>(&sorted[0]), vec![1.0, 2.0, 3.0]);
-        let indices = XlaValue::Array(array(&domain, &mesh, DataType::I32, &[2i32, 0], &[2]));
+        let indices = Value::Array(array(&domain, &mesh, DataType::I32, &[2i32, 0], &[2]));
         assert_eq!(read::<f32>(&input.gather_axis(&indices, 0, GatherMode::Clip).unwrap()), vec![2.0, 3.0]);
         assert!(input.parallel_permute("missing", vec![(0, 0)]).is_err());
     }
 
     #[test]
-    fn test_xla_value_program_replay_lifts_dimension_constants() {
+    fn test_value_program_replay_lifts_dimension_constants() {
         // Replaying a program over the domain lifts its dimension constants through the session-aware `lift`.
         let client = execution_client();
-        let domain = XlaSession::new(&client).domain();
+        let domain = Session::new(&client).domain();
         let mesh = mesh_on(&client, 0);
         let input = array(&domain, &mesh, DataType::F32, &[1.0f32, 2.0, 3.0], &[3]);
 
         // `dimension_size(x, 0) + 2` followed by `dimension_to_scalar`, with the `2` stored as a program constant.
-        let mut builder = XlaProgramBuilder::new();
+        let mut builder = ProgramBuilder::new();
         let x = builder.add_input(ArrayIrType::Array(input.r#type().into_owned()));
         let size_operation = DimensionSizeOperation::new(input.r#type().as_ref(), 0).unwrap();
         let size_type = size_operation.output_type().clone();
         let size = builder.add_instruction(size_operation, Vec::new(), vec![x], None).unwrap()[0];
         let constant = DimensionValue::constant(2).unwrap();
         let sum = ryft_core::DimensionAddOperation::new(&size_type, constant.r#type().as_ref()).unwrap();
-        let two = builder.add_constant(XlaConstant::Dimension(constant));
+        let two = builder.add_constant(Constant::Dimension(constant));
         let sum = builder
-            .add_instruction(XlaOperation::Dimension(DimensionOperation::Add(sum)), Vec::new(), vec![size, two], None)
+            .add_instruction(Operation::Dimension(DimensionOperation::Add(sum)), Vec::new(), vec![size, two], None)
             .unwrap()[0];
         let output = builder.add_instruction(DimensionToScalarOperation, Vec::new(), vec![sum], None).unwrap()[0];
         let program = builder
-            .build::<Vec<XlaConstant>, Vec<XlaConstant>>(vec![output], vec![Placeholder], vec![Placeholder])
+            .build::<Vec<Constant>, Vec<Constant>>(vec![output], vec![Placeholder], vec![Placeholder])
             .unwrap();
-        let outputs = program.interpret_in_context(&domain, vec![XlaValue::Array(input)]).unwrap();
+        let outputs = program.interpret_in_context(&domain, vec![Value::Array(input)]).unwrap();
         assert_eq!(read::<i64>(&outputs[0]), vec![5]);
     }
 
     #[test]
-    fn test_xla_value_free_transforms() {
+    fn test_value_free_transforms() {
         // Free transform entry points recover the domain from the values, so no explicit context is needed.
         let client = execution_client();
-        let domain = XlaSession::new(&client).domain();
+        let domain = Session::new(&client).domain();
         let mesh = mesh_on(&client, 0);
-        let input = XlaValue::Array(array(&domain, &mesh, DataType::F32, &[1.0f32, 2.0, 3.0], &[3]));
+        let input = Value::Array(array(&domain, &mesh, DataType::F32, &[1.0f32, 2.0, 3.0], &[3]));
 
-        let squared: XlaValue<'_> =
+        let squared: Value<'_> =
             batch(|x| Ok(x.clone() * x), input.clone(), BatchAxis::new(0), BatchAxis::new(0), None).unwrap();
         assert_eq!(read::<f32>(&squared), vec![1.0, 4.0, 9.0]);
 
@@ -1222,13 +1218,13 @@ mod tests {
     }
 
     #[test]
-    fn test_xla_value_free_transforms_replay_dimension_derived_values() {
+    fn test_value_free_transforms_replay_dimension_derived_values() {
         // Each item is scaled by its own folded extent, which the transforms replay as a dimension constant.
         let client = execution_client();
-        let domain = XlaSession::new(&client).domain();
+        let domain = Session::new(&client).domain();
         let mesh = mesh_on(&client, 0);
-        let input = XlaValue::Array(array(&domain, &mesh, DataType::F32, &[1.0f32, 2.0, 3.0, 4.0, 5.0, 6.0], &[2, 3]));
-        let scaled: XlaValue<'_> = batch(
+        let input = Value::Array(array(&domain, &mesh, DataType::F32, &[1.0f32, 2.0, 3.0, 4.0, 5.0, 6.0], &[2, 3]));
+        let scaled: Value<'_> = batch(
             |x| {
                 let extent = x.dimension_size(0)?.to_scalar()?.convert_element_type(DataType::F32)?;
                 Ok(x * extent)
@@ -1241,8 +1237,8 @@ mod tests {
         .unwrap();
         assert_eq!(read::<f32>(&scaled), vec![3.0, 6.0, 9.0, 12.0, 15.0, 18.0]);
 
-        let primal = XlaValue::Array(array(&domain, &mesh, DataType::F32, &[1.0f32, 2.0, 3.0], &[3]));
-        let tangent = XlaValue::Array(array(&domain, &mesh, DataType::F32, &[1.0f32, 1.0, 1.0], &[3]));
+        let primal = Value::Array(array(&domain, &mesh, DataType::F32, &[1.0f32, 2.0, 3.0], &[3]));
+        let tangent = Value::Array(array(&domain, &mesh, DataType::F32, &[1.0f32, 1.0, 1.0], &[3]));
         let (value, derivative) = differentiate_at(primal)
             .jvp(tangent, |x| {
                 let extent = x.dimension_size(0)?.to_scalar()?.convert_element_type(DataType::F32)?;
@@ -1254,45 +1250,45 @@ mod tests {
     }
 
     #[test]
-    fn test_xla_value_jvp_through_a_data_dependent_while() {
+    fn test_value_jvp_through_a_data_dependent_while() {
         // At concrete primals, the forward-mode `while` rule decides the loop condition on the host through the
-        // predicate contracts of `XlaValue` and unrolls the executed iterations.
+        // predicate contracts of `Value` and unrolls the executed iterations.
         let client = execution_client();
-        let domain = XlaSession::new(&client).domain();
+        let domain = Session::new(&client).domain();
         let mesh = mesh_on(&client, 0);
         let scalar_type = ArrayIrType::Array(ArrayType::scalar(DataType::F32));
         let condition = {
-            let mut builder = XlaProgramBuilder::new();
+            let mut builder = ProgramBuilder::new();
             let state = builder.add_input(scalar_type.clone());
-            let zero = XlaOperation::provide(ZeroOperation::new(scalar_type.clone()), &[]).unwrap();
+            let zero = Operation::provide(ZeroOperation::new(scalar_type.clone()), &[]).unwrap();
             let zero = builder.add_instruction(zero, Vec::new(), Vec::new(), None).unwrap()[0];
             let comparison = ryft_core::CompareOperation::<ArrayType>::new(ComparisonDirection::GreaterThan);
             let predicate = builder
-                .add_instruction(XlaOperation::Array(comparison.into()), Vec::new(), vec![state, zero], None)
+                .add_instruction(Operation::Array(comparison.into()), Vec::new(), vec![state, zero], None)
                 .unwrap()[0];
             builder
-                .build::<Vec<XlaConstant>, Vec<XlaConstant>>(vec![predicate], vec![Placeholder], vec![Placeholder])
+                .build::<Vec<Constant>, Vec<Constant>>(vec![predicate], vec![Placeholder], vec![Placeholder])
                 .unwrap()
         };
         let body = {
-            let mut builder = XlaProgramBuilder::new();
+            let mut builder = ProgramBuilder::new();
             let state = builder.add_input(scalar_type.clone());
-            let one = XlaOperation::provide(OneOperation::new(scalar_type.clone()), &[]).unwrap();
+            let one = Operation::provide(OneOperation::new(scalar_type.clone()), &[]).unwrap();
             let one = builder.add_instruction(one, Vec::new(), Vec::new(), None).unwrap()[0];
             let subtraction = ryft_core::SubOperation::<ArrayType>::new();
             let next = builder
-                .add_instruction(XlaOperation::Array(subtraction.into()), Vec::new(), vec![state, one], None)
+                .add_instruction(Operation::Array(subtraction.into()), Vec::new(), vec![state, one], None)
                 .unwrap()[0];
             builder
-                .build::<Vec<XlaConstant>, Vec<XlaConstant>>(vec![next], vec![Placeholder], vec![Placeholder])
+                .build::<Vec<Constant>, Vec<Constant>>(vec![next], vec![Placeholder], vec![Placeholder])
                 .unwrap()
         };
-        let primal = XlaValue::Array(array(&domain, &mesh, DataType::F32, &[3.5f32], &[]));
-        let tangent = XlaValue::Array(array(&domain, &mesh, DataType::F32, &[2.0f32], &[]));
+        let primal = Value::Array(array(&domain, &mesh, DataType::F32, &[3.5f32], &[]));
+        let tangent = Value::Array(array(&domain, &mesh, DataType::F32, &[2.0f32], &[]));
         let (value, derivative) = differentiate_at(primal)
             .jvp(tangent, |state| {
                 let mut outputs = state.domain().bind(
-                    XlaOperation::While(WhileOperation::new()),
+                    Operation::While(WhileOperation::new()),
                     vec![condition.clone(), body.clone()],
                     &[state.clone()],
                 )?;

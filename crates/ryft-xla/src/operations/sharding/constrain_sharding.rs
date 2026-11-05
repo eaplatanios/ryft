@@ -3,7 +3,7 @@ use ryft_core::{ArrayType, ConstrainShardingOperation, LogicalMesh, ProgramError
 use ryft_mlir::dialects::shardy;
 use ryft_mlir::{Block, BlockRef, LocationRef, Operation as MlirOperation, Value as MlirValue, ValueRef};
 
-use crate::{Error, LowerableOperation, LowerableOperationFamily, ToMlir, XlaLowerer};
+use crate::{Error, LowerableOperation, LowerableOperationFamily, Lowerer, ToMlir};
 
 /// Lowers a tensor placement constraint after excluding mesh axes bound by enclosing manual regions.
 pub(crate) fn lower_sharding_constraint<'b, 'c: 'b, 't: 'c>(
@@ -59,7 +59,7 @@ pub(crate) fn lower_sharding_constraint<'b, 'c: 'b, 't: 'c>(
 impl LowerableOperation for ConstrainShardingOperation {
     fn lower<'b, 'c: 'b, 't: 'c, O: LowerableOperationFamily>(
         &self,
-        lowerer: &mut XlaLowerer<'b, 'c, 't, O>,
+        lowerer: &mut Lowerer<'b, 'c, 't, O>,
         input_values: &[ValueRef<'b, 'c, 't>],
         _input_types: &[ArrayType],
         output_types: &[ArrayType],

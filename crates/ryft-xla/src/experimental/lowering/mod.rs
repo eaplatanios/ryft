@@ -4,13 +4,13 @@ use std::collections::{HashMap, HashSet};
 use std::rc::Rc;
 
 use ryft_core::{
-    Array, ArrayIrType, ArrayOperation, ArrayType, BroadcastOperation, CastOperation, ConstrainShardingOperation,
-    CustomCallOperation, DataType, DimensionOperation, DimensionType, DimensionValue, DynamicBroadcastOperation,
-    DynamicReshapeOperation, EffectClass, EffectClasses, ExternalReferenceBinding, GatherOperation, Instruction,
-    LogicalMesh, Memory, OneLikeOperation, Operation, OperationPayloadProjection, Parameterized, ProgramError,
-    Provenance, RematerializationOptimizationBarrier, ReshapeOperation, ReshardOperation, ScatterOperation, Shape,
-    ShardMapBoundary, ShardMapOperation, Sharding, ShardingDimension, Type as RyftType, TypeError, Typed, TypedProgram,
-    Value, ZeroLikeOperation,
+    Array as CoreArray, ArrayIrType, ArrayOperation, ArrayType, BroadcastOperation, CastOperation,
+    ConstrainShardingOperation, CustomCallOperation, DataType, DimensionOperation, DimensionType, DimensionValue,
+    DynamicBroadcastOperation, DynamicReshapeOperation, EffectClass, EffectClasses, ExternalReferenceBinding,
+    GatherOperation, Instruction, LogicalMesh, Memory, OneLikeOperation, Operation as CoreOperation,
+    OperationPayloadProjection, Parameterized, ProgramError, Provenance, RematerializationOptimizationBarrier,
+    ReshapeOperation, ReshardOperation, ScatterOperation, Shape, ShardMapBoundary, ShardMapOperation, Sharding,
+    ShardingDimension, Type as RyftType, TypeError, Typed, TypedProgram, Value as CoreValue, ZeroLikeOperation,
 };
 use ryft_mlir::dialects::{func, shardy, stable_hlo};
 use ryft_mlir::{
@@ -19,17 +19,17 @@ use ryft_mlir::{
     ValueRef,
 };
 
-use crate::experimental::domains::CompilationError;
+use crate::CompilationError;
 use crate::experimental::lowering::compositions::{
     NamedCompositionFunctionMap, collect_named_composition_functions, emit_named_composition_function,
 };
 use crate::experimental::lowering::regions::{lower_nested_program_inline, lower_program_outputs_with_inputs};
-use crate::experimental::lowering::signature::XlaExecutableSignature;
+use crate::experimental::lowering::signature::ExecutableSignature;
 use crate::experimental::lowering::types::{
     lower_boundary_layout, lower_captured_constant, lower_literal_value, lower_runtime_dimension_size_i64,
     lower_tensor_type, lower_unplaced_constant_output,
 };
-use crate::experimental::ops::{FlatXlaProgram, XlaArrayConstant, XlaConstant, XlaOperation, XlaProgram};
+use crate::experimental::ops::{ArrayConstant, Constant, FlatProgram, Operation, Program};
 use crate::operations::collectives::collective_replica_groups;
 use crate::operations::jit_call::{JitCallFunctionMap, collect_jit_call_functions, emit_jit_call_function};
 use crate::operations::manipulation::broadcasting::broadcast_changes_explicit_sharding;
@@ -41,7 +41,7 @@ use crate::{Error, RaggedDotLoweringStrategy, ToMlir};
 #[cfg(test)]
 use crate::experimental::lowering::regions::lower_plain_program_outputs;
 #[cfg(test)]
-use ryft_core::Program;
+use ryft_core::Program as CoreProgram;
 
 /// XLA-owned failures while admitting a program, constructing its StableHLO representation, or verifying it.
 ///
@@ -96,21 +96,21 @@ pub(crate) mod signature;
 pub(crate) mod types;
 
 /// Textual StableHLO module paired with the exact executable signature used to emit its entry function.
-pub(crate) struct LoweredXlaModule {
+pub(crate) struct LoweredModule {
     /// Textual StableHLO/Shardy module.
     pub(crate) stable_hlo: String,
 
     /// Logical-to-physical entry-function signature.
-    pub(crate) signature: XlaExecutableSignature,
+    pub(crate) signature: ExecutableSignature,
 
     /// Whether execution requires the host runtime assertion handler.
     pub(crate) requires_assertion_handler: bool,
 }
 
-impl LoweredXlaModule {
+impl LoweredModule {
     /// Consumes this lowering and returns its textual module, executable signature, and assertion-runtime requirement.
     #[inline]
-    pub(crate) fn into_parts(self) -> (String, XlaExecutableSignature, bool) {
+    pub(crate) fn into_parts(self) -> (String, ExecutableSignature, bool) {
         (self.stable_hlo, self.signature, self.requires_assertion_handler)
     }
 }
@@ -160,11 +160,11 @@ impl<'b, 'c: 'b, 't: 'c> EffectTokens<'b, 'c, 't> {
 /// excludes dormant rule regions. Ordinary XLA cannot preserve state in either computation or rule regions, so both
 /// must be rejected before lowering.
 pub(crate) fn contains_unresolved_state<ProgramInput, ProgramOutput, O: LowerableOperationFamily>(
-    program: &XlaProgram<ProgramInput, ProgramOutput, O>,
+    program: &Program<ProgramInput, ProgramOutput, O>,
 ) -> bool
 where
-    ProgramInput: Parameterized<XlaConstant>,
-    ProgramOutput: Parameterized<XlaConstant>,
+    ProgramInput: Parameterized<Constant>,
+    ProgramOutput: Parameterized<Constant>,
 {
     program.regions().iter().any(|region| {
         region
@@ -174,19 +174,19 @@ where
     })
 }
 
-/// Returns `true` if `program` contains a reference-typed atom or an [`Operation`] whose [effects](Operation::effects)
-/// declare a [`ReferenceEffect`](ryft_core::ReferenceEffect) in any region.
+/// Returns `true` if `program` contains a reference-typed atom or a [`CoreOperation`](ryft_core::Operation) whose
+/// [effects](ryft_core::Operation::effects) declare a [`ReferenceEffect`](ryft_core::ReferenceEffect) in any region.
 ///
 /// This check is independent from [`contains_unresolved_state`]: a pure reference pass-through or forwarded
 /// reference capture can carry reference values without executing a stateful instruction. Both predicates back
 /// the pre-compilation state checks and the two direct module-lowering entries; eager binding, dispatch, and staging
 /// enforce their corresponding boundary invariants separately.
 pub(crate) fn contains_unresolved_references<ProgramInput, ProgramOutput, O: LowerableOperationFamily>(
-    program: &XlaProgram<ProgramInput, ProgramOutput, O>,
+    program: &Program<ProgramInput, ProgramOutput, O>,
 ) -> bool
 where
-    ProgramInput: Parameterized<XlaConstant>,
-    ProgramOutput: Parameterized<XlaConstant>,
+    ProgramInput: Parameterized<Constant>,
+    ProgramOutput: Parameterized<Constant>,
 {
     // The atom scan dominates for every well-formed program (reference operations always touch a reference-typed
     // atom); the declaration scan is the independent-verifier arm that still catches a core discharge bug which
@@ -231,7 +231,7 @@ pub(crate) fn token_threaded_effects(effects: EffectClasses) -> impl Iterator<It
 /// scope-level effect tokens in and read the updated tokens back out after the instruction lowers, so effectful
 /// operations thread their tokens through [`Self::effect_token`] and [`Self::set_effect_token`] without knowing the
 /// enclosing scope. The lifetimes are those of the MLIR block (`'b`), context (`'c`), and thread pool (`'t`).
-pub struct XlaLowerer<'b, 'c: 'b, 't: 'c, O = XlaOperation> {
+pub struct Lowerer<'b, 'c: 'b, 't: 'c, O = Operation> {
     /// Owning block receiving the lowered operations.
     pub(crate) block: BlockRef<'b, 'c, 't>,
 
@@ -242,7 +242,7 @@ pub struct XlaLowerer<'b, 'c: 'b, 't: 'c, O = XlaOperation> {
     pub(crate) location: LocationRef<'c, 't>,
 
     /// Attached regions of the instruction currently being lowered, materialized as flat programs in region-slot order.
-    pub(crate) regions: Vec<FlatXlaProgram<O>>,
+    pub(crate) regions: Vec<FlatProgram<O>>,
 
     /// Shared private functions emitted for deduplicated `jit_call` callees, consulted at `jit_call` lowering sites.
     /// Shared via [`Rc`] so it threads through nested lowering scopes without lifetime entanglement.
@@ -259,7 +259,7 @@ pub struct XlaLowerer<'b, 'c: 'b, 't: 'c, O = XlaOperation> {
     pub(crate) collective_state: CollectiveLoweringState,
 }
 
-impl<'b, 'c: 'b, 't: 'c, O> XlaLowerer<'b, 'c, 't, O> {
+impl<'b, 'c: 'b, 't: 'c, O> Lowerer<'b, 'c, 't, O> {
     /// Creates an MLIR lowerer for operations emitted into `block`.
     pub(crate) fn new(
         block: BlockRef<'b, 'c, 't>,
@@ -279,7 +279,7 @@ impl<'b, 'c: 'b, 't: 'c, O> XlaLowerer<'b, 'c, 't, O> {
     }
 
     /// Attaches the materialized attached regions of the instruction currently being lowered.
-    pub(crate) fn with_regions(mut self, regions: Vec<FlatXlaProgram<O>>) -> Self {
+    pub(crate) fn with_regions(mut self, regions: Vec<FlatProgram<O>>) -> Self {
         self.regions = regions;
         self
     }
@@ -325,7 +325,7 @@ impl<'b, 'c: 'b, 't: 'c, O> XlaLowerer<'b, 'c, 't, O> {
     }
 
     /// Returns the attached regions of the instruction being lowered as flat programs, in region-slot order.
-    pub fn regions(&self) -> &[FlatXlaProgram<O>] {
+    pub fn regions(&self) -> &[FlatProgram<O>] {
         &self.regions
     }
 
@@ -408,18 +408,19 @@ impl<'b, 'c: 'b, 't: 'c, O> XlaLowerer<'b, 'c, 't, O> {
 
 /// Operations that can be lowered to StableHLO for XLA compilation.
 ///
-/// Each operation type implements this trait at the type universe of its [`Operation`] contract: homogeneous array
-/// operations at [`ArrayType`], array IR operations at [`ArrayIrType`], and first-class dimension operations at
-/// [`DimensionType`]. Operation families (e.g., [`ArrayOperation`] and [`XlaOperation`]) implement this trait by
-/// dispatching each variant to its payload through [`lower_operation_variants`](crate::lower_operation_variants), which
-/// also handles payloads that a family stores as projected or mixed members. A family whose type universe is
-/// [`ArrayIrType`] and that implements [`OperationPayloadProjection`] is a [`LowerableOperationFamily`] whose programs
-/// [`to_mlir_module_for_program`] lowers, so downstream crates extend lowering by implementing this trait for their own
-/// operations and families, just like they extend the transformation traits of `ryft-core`.
+/// Each operation type implements this trait at the type universe of its [`CoreOperation`](ryft_core::Operation)
+/// contract: homogeneous array operations at [`ArrayType`], array IR operations at [`ArrayIrType`], and first-class
+/// dimension operations at [`DimensionType`]. Operation families (e.g., [`ArrayOperation`] and [`Operation`]) implement
+/// this trait by dispatching each variant to its payload through
+/// [`lower_operation_variants`](crate::lower_operation_variants), which also handles payloads that a family stores as
+/// projected or mixed members. A family whose type universe is [`ArrayIrType`] and that implements
+/// [`OperationPayloadProjection`] is a [`LowerableOperationFamily`] whose programs [`to_mlir_module_for_program`]
+/// lowers, so downstream crates extend lowering by implementing this trait for their own operations and families, just
+/// like they extend the transformation traits of `ryft-core`.
 ///
-/// Operations with attached regions lower them through the lowerer (e.g., [`XlaLowerer::lower_region_inline`]) rather
+/// Operations with attached regions lower them through the lowerer (e.g., [`Lowerer::lower_region_inline`]) rather
 /// than through bounds on their own family, so the bounds of a family implementation stay finite.
-pub trait LowerableOperation: Operation {
+pub trait LowerableOperation: CoreOperation {
     /// Lowers this operation to one or more StableHLO operations emitted into the block of `lowerer`, returning one
     /// MLIR value per output.
     ///
@@ -431,7 +432,7 @@ pub trait LowerableOperation: Operation {
     ///   - `output_types`: Declared types of the instruction outputs, in output order.
     fn lower<'b, 'c: 'b, 't: 'c, O: LowerableOperationFamily>(
         &self,
-        lowerer: &mut XlaLowerer<'b, 'c, 't, O>,
+        lowerer: &mut Lowerer<'b, 'c, 't, O>,
         input_values: &[ValueRef<'b, 'c, 't>],
         input_types: &[Self::Type],
         output_types: &[Self::Type],
@@ -462,7 +463,7 @@ impl<O: LowerableOperation<Type = ArrayIrType> + OperationPayloadProjection> Low
 ///
 /// This is the lowering counterpart of [`MemberOperation`](ryft_core::MemberOperation), and families dispatch their
 /// mixed member variants to it through [`lower_operation_variants`](crate::lower_operation_variants).
-pub trait MemberLowerableOperation<T: RyftType>: Operation {
+pub trait MemberLowerableOperation<T: RyftType>: CoreOperation {
     /// Lowers this operation, applied by an instruction of the parent universe `T`, to one or more StableHLO
     /// operations emitted into the block of `lowerer`, returning one MLIR value per output.
     ///
@@ -474,7 +475,7 @@ pub trait MemberLowerableOperation<T: RyftType>: Operation {
     ///   - `output_types`: Declared parent-universe types of the instruction outputs, in output order.
     fn lower_in_parent<'b, 'c: 'b, 't: 'c, O: LowerableOperationFamily>(
         &self,
-        lowerer: &mut XlaLowerer<'b, 'c, 't, O>,
+        lowerer: &mut Lowerer<'b, 'c, 't, O>,
         input_values: &[ValueRef<'b, 'c, 't>],
         input_types: &[T],
         output_types: &[T],
@@ -487,7 +488,7 @@ pub trait MemberLowerableOperation<T: RyftType>: Operation {
 #[doc(hidden)]
 pub fn lower_projected_operation<'b, 'c: 'b, 't: 'c, U, T, P, O: LowerableOperationFamily>(
     operation: &P,
-    lowerer: &mut XlaLowerer<'b, 'c, 't, O>,
+    lowerer: &mut Lowerer<'b, 'c, 't, O>,
     input_values: &[ValueRef<'b, 'c, 't>],
     input_types: &[T],
     output_types: &[T],
@@ -510,7 +511,7 @@ where
 
 /// Dispatches [`LowerableOperation::lower`] for an operation family to the payload of its active variant.
 ///
-/// The macro takes the family value, the family's type name, the [`XlaLowerer`], the lowered input values, and the
+/// The macro takes the family value, the family's type name, the [`Lowerer`], the lowered input values, and the
 /// input and output types, followed by every variant of the family with the way its payload lowers:
 ///
 ///   - A bare variant lowers its payload at the family's own type universe.
@@ -524,13 +525,13 @@ where
 ///
 /// # Example
 ///
-/// A downstream family that extends [`XlaOperation`] with its own payload:
+/// A downstream family that extends [`Operation`] with its own payload:
 ///
 /// ```ignore
 /// impl LowerableOperation for MyOperation {
 ///     fn lower<'b, 'c: 'b, 't: 'c, O: LowerableOperationFamily>(
 ///         &self,
-///         lowerer: &mut XlaLowerer<'b, 'c, 't, O>,
+///         lowerer: &mut Lowerer<'b, 'c, 't, O>,
 ///         input_values: &[ValueRef<'b, 'c, 't>],
 ///         input_types: &[ArrayIrType],
 ///         output_types: &[ArrayIrType],
@@ -618,12 +619,12 @@ pub(crate) fn current_or_new_token<'b, 'c: 'b, 't: 'c>(
 impl<V: MlirLowerableValue> LowerableOperation for ArrayOperation<V> {
     fn lower<'b, 'c: 'b, 't: 'c, O: LowerableOperationFamily>(
         &self,
-        lowerer: &mut XlaLowerer<'b, 'c, 't, O>,
+        lowerer: &mut Lowerer<'b, 'c, 't, O>,
         input_values: &[ValueRef<'b, 'c, 't>],
         input_types: &[ArrayType],
         output_types: &[ArrayType],
     ) -> Result<Vec<ValueRef<'b, 'c, 't>>, Error> {
-        // This function does not validate the placement of local outputs. `XlaOperation::lower` validates it for every
+        // This function does not validate the placement of local outputs. `Operation::lower` validates it for every
         // variant, including this projected one, whereas downstream families that embed `ArrayOperation` must reject
         // outputs that shard a local dimension over a bound manual mesh axis themselves (refer to
         // `validate_local_output_placement`).
@@ -646,7 +647,7 @@ impl<V: MlirLowerableValue> LowerableOperation for ArrayOperation<V> {
 impl LowerableOperation for DimensionOperation<DimensionValue> {
     fn lower<'b, 'c: 'b, 't: 'c, O: LowerableOperationFamily>(
         &self,
-        lowerer: &mut XlaLowerer<'b, 'c, 't, O>,
+        lowerer: &mut Lowerer<'b, 'c, 't, O>,
         input_values: &[ValueRef<'b, 'c, 't>],
         input_types: &[DimensionType],
         output_types: &[DimensionType],
@@ -658,7 +659,7 @@ impl LowerableOperation for DimensionOperation<DimensionValue> {
     }
 }
 
-impl LowerableOperation for XlaOperation {
+impl LowerableOperation for Operation {
     #[inline]
     fn composite_key(&self) -> Option<&ryft_core::CompositeKey> {
         match self {
@@ -670,7 +671,7 @@ impl LowerableOperation for XlaOperation {
 
     fn lower<'b, 'c: 'b, 't: 'c, O: LowerableOperationFamily>(
         &self,
-        lowerer: &mut XlaLowerer<'b, 'c, 't, O>,
+        lowerer: &mut Lowerer<'b, 'c, 't, O>,
         input_values: &[ValueRef<'b, 'c, 't>],
         input_types: &[ArrayIrType],
         output_types: &[ArrayIrType],
@@ -682,7 +683,7 @@ impl LowerableOperation for XlaOperation {
             validate_local_output_placement(self.name(), output_types, &lowerer.collective_state.bound_manual_axes)?;
         }
         lower_operation_variants!(
-            self, XlaOperation, lowerer, input_values, input_types, output_types;
+            self, Operation, lowerer, input_values, input_types, output_types;
             Kernel,
             Zero => member,
             DynamicOne => member,
@@ -1045,7 +1046,7 @@ pub(crate) fn serialize_lowered_module(
 /// references or state, [`LoweringError::InvalidFunctionName`] for an invalid `function_name`, and other
 /// [`Error`]s for operations or types that cannot be lowered.
 pub fn to_mlir_module_for_program<'o, Input, Output, ProgramInput, ProgramOutput, S, O: LowerableOperationFamily>(
-    program: &XlaProgram<ProgramInput, ProgramOutput, O>,
+    program: &Program<ProgramInput, ProgramOutput, O>,
     capture_types: &[ArrayType],
     global_input_types: &Input,
     global_output_types: &Output,
@@ -1056,8 +1057,8 @@ pub fn to_mlir_module_for_program<'o, Input, Output, ProgramInput, ProgramOutput
 where
     Input: Parameterized<ArrayType>,
     Output: Parameterized<ArrayType>,
-    ProgramInput: Parameterized<XlaConstant>,
-    ProgramOutput: Parameterized<XlaConstant>,
+    ProgramInput: Parameterized<Constant>,
+    ProgramOutput: Parameterized<Constant>,
     S: AsRef<str>,
 {
     Ok(lower_mlir_module_for_program(
@@ -1083,7 +1084,7 @@ pub(crate) fn lower_mlir_module_for_program<
     S,
     O: LowerableOperationFamily,
 >(
-    program: &XlaProgram<ProgramInput, ProgramOutput, O>,
+    program: &Program<ProgramInput, ProgramOutput, O>,
     capture_types: &[ArrayType],
     global_input_types: &Input,
     global_output_types: &Output,
@@ -1091,12 +1092,12 @@ pub(crate) fn lower_mlir_module_for_program<
     argument_shardings: Option<&[Sharding]>,
     result_shardings: Option<&[Sharding]>,
     target_platform: Option<&str>,
-) -> Result<LoweredXlaModule, Error>
+) -> Result<LoweredModule, Error>
 where
     Input: Parameterized<ArrayType>,
     Output: Parameterized<ArrayType>,
-    ProgramInput: Parameterized<XlaConstant>,
-    ProgramOutput: Parameterized<XlaConstant>,
+    ProgramInput: Parameterized<Constant>,
+    ProgramOutput: Parameterized<Constant>,
     S: AsRef<str>,
 {
     let argument_count = capture_types.len() + global_input_types.parameter_count();
@@ -1127,19 +1128,19 @@ pub(crate) fn lower_mlir_module_for_program_with_value_shardings<
     S,
     O: LowerableOperationFamily,
 >(
-    program: &XlaProgram<ProgramInput, ProgramOutput, O>,
+    program: &Program<ProgramInput, ProgramOutput, O>,
     capture_types: &[ArrayType],
     global_input_types: &Input,
     global_output_types: &Output,
     function_name: S,
     argument_shardings: &[Option<Sharding>],
     result_shardings: &[Option<Sharding>],
-) -> Result<LoweredXlaModule, Error>
+) -> Result<LoweredModule, Error>
 where
     Input: Parameterized<ArrayType>,
     Output: Parameterized<ArrayType>,
-    ProgramInput: Parameterized<XlaConstant>,
-    ProgramOutput: Parameterized<XlaConstant>,
+    ProgramInput: Parameterized<Constant>,
+    ProgramOutput: Parameterized<Constant>,
     S: AsRef<str>,
 {
     lower_mlir_module_for_program_with_effect_boundary(
@@ -1176,7 +1177,7 @@ pub(crate) fn lower_mlir_module_for_program_with_reference_state<
     S,
     O: LowerableOperationFamily,
 >(
-    program: &XlaProgram<ProgramInput, ProgramOutput, O>,
+    program: &Program<ProgramInput, ProgramOutput, O>,
     capture_types: &[ArrayType],
     global_input_types: &Input,
     global_output_types: &Output,
@@ -1186,12 +1187,12 @@ pub(crate) fn lower_mlir_module_for_program_with_reference_state<
     target_platform: Option<&str>,
     reference_states: &[ExternalReferenceBinding],
     ragged_dot_lowering_strategy: RaggedDotLoweringStrategy,
-) -> Result<LoweredXlaModule, Error>
+) -> Result<LoweredModule, Error>
 where
     Input: Parameterized<ArrayType>,
     Output: Parameterized<ArrayType>,
-    ProgramInput: Parameterized<XlaConstant>,
-    ProgramOutput: Parameterized<XlaConstant>,
+    ProgramInput: Parameterized<Constant>,
+    ProgramOutput: Parameterized<Constant>,
     S: AsRef<str>,
 {
     let argument_count = capture_types.len() + global_input_types.parameter_count();
@@ -1229,7 +1230,7 @@ fn lower_mlir_module_for_program_with_effect_boundary<
     S,
     O: LowerableOperationFamily,
 >(
-    program: &XlaProgram<ProgramInput, ProgramOutput, O>,
+    program: &Program<ProgramInput, ProgramOutput, O>,
     capture_types: &[ArrayType],
     global_input_types: &Input,
     global_output_types: &Output,
@@ -1240,12 +1241,12 @@ fn lower_mlir_module_for_program_with_effect_boundary<
     reference_states: &[ExternalReferenceBinding],
     ragged_dot_lowering_strategy: RaggedDotLoweringStrategy,
     export_effects: bool,
-) -> Result<LoweredXlaModule, Error>
+) -> Result<LoweredModule, Error>
 where
     Input: Parameterized<ArrayType>,
     Output: Parameterized<ArrayType>,
-    ProgramInput: Parameterized<XlaConstant>,
-    ProgramOutput: Parameterized<XlaConstant>,
+    ProgramInput: Parameterized<Constant>,
+    ProgramOutput: Parameterized<Constant>,
     S: AsRef<str>,
 {
     if contains_unresolved_references(program) {
@@ -1261,7 +1262,7 @@ where
         capture_types.iter().cloned().chain(global_input_types.iter().cloned()).collect::<Vec<_>>();
     let effects = program.effects().classes();
     let ordered_io = effects.contains(EffectClass::OrderedIo) || effects.contains(EffectClass::DeviceOrderedIo);
-    let mut signature = XlaExecutableSignature::new(logical_argument_types.as_slice(), global_output_types.as_slice())
+    let mut signature = ExecutableSignature::new(logical_argument_types.as_slice(), global_output_types.as_slice())
         .with_effects(
             export_effects && ordered_io,
             effects.contains(EffectClass::UnorderedIo),
@@ -1692,7 +1693,7 @@ where
     signature.requires_rocm_kernel_runtime = calls_custom_call_target(crate::kernels::ROCM_KERNEL_CUSTOM_CALL_TARGET);
     signature.requires_assertion_handler |= collective_state.has_assertions.get();
     let requires_assertion_handler = signature.requires_assertion_handler;
-    Ok(LoweredXlaModule {
+    Ok(LoweredModule {
         stable_hlo: serialize_lowered_module(&module, &collective_state)?,
         signature,
         requires_assertion_handler,
@@ -1700,7 +1701,7 @@ where
 }
 
 /// Value type that can be materialized as a StableHLO dense constant during benchmark lowering.
-pub(crate) trait MlirLowerableValue: Value<Type = ArrayType> + 'static {
+pub(crate) trait MlirLowerableValue: CoreValue<Type = ArrayType> + 'static {
     /// Builds a dense-elements attribute containing this value.
     fn to_dense_elements_attribute<'c, 't>(
         &self,
@@ -1725,7 +1726,7 @@ pub(crate) trait MlirLowerableValue: Value<Type = ArrayType> + 'static {
     }
 }
 
-impl MlirLowerableValue for XlaArrayConstant {
+impl MlirLowerableValue for ArrayConstant {
     fn to_dense_elements_attribute<'c, 't>(
         &self,
         tensor_type: ryft_mlir::TensorTypeRef<'c, 't>,
@@ -1739,7 +1740,7 @@ impl MlirLowerableValue for XlaArrayConstant {
                 ),
             }
             .into()),
-            Self::Boolean(value) => Array::scalar(*value)?.to_dense_elements_attribute(tensor_type, context),
+            Self::Boolean(value) => CoreArray::scalar(*value)?.to_dense_elements_attribute(tensor_type, context),
         }
     }
 
@@ -1778,7 +1779,7 @@ impl MlirLowerableValue for ArrayType {
 }
 
 // Concrete host literal lowering used by [`ConstantOperation`] and MLIR snapshot tooling.
-impl MlirLowerableValue for Array {
+impl MlirLowerableValue for CoreArray {
     fn to_dense_elements_attribute<'c, 't>(
         &self,
         tensor_type: ryft_mlir::TensorTypeRef<'c, 't>,
@@ -1836,7 +1837,7 @@ impl MlirLowerableValue for Array {
     }
 }
 
-/// Lowers a plain traced [`Program`] to a textual StableHLO MLIR module.
+/// Lowers a plain traced [`CoreProgram`](ryft_core::Program) to a textual StableHLO MLIR module.
 #[cfg(test)]
 pub(crate) fn to_mlir_module_for_plain_program<
     V: MlirLowerableValue,
@@ -1845,7 +1846,7 @@ pub(crate) fn to_mlir_module_for_plain_program<
     O: LowerableOperation<Type = ArrayType>,
     S: AsRef<str>,
 >(
-    program: &Program<V, O, Input, Output>,
+    program: &CoreProgram<V, O, Input, Output>,
     function_name: S,
 ) -> Result<String, Error> {
     to_mlir_module_for_plain_program_with_ragged_dot_lowering_strategy(
@@ -1864,7 +1865,7 @@ pub(crate) fn to_mlir_module_for_plain_program_with_ragged_dot_lowering_strategy
     O: LowerableOperation<Type = ArrayType>,
     S: AsRef<str>,
 >(
-    program: &Program<V, O, Input, Output>,
+    program: &CoreProgram<V, O, Input, Output>,
     function_name: S,
     ragged_dot_lowering_strategy: RaggedDotLoweringStrategy,
 ) -> Result<String, Error> {
@@ -1974,12 +1975,12 @@ pub(crate) fn to_mlir_module_for_plain_program_with_ragged_dot_lowering_strategy
 
 /// Collects meshes referenced by emitted sharding constraints and nested-computation boundaries.
 pub(crate) fn collect_nested_sharding_mesh<ProgramInput, ProgramOutput, O: LowerableOperationFamily>(
-    program: &XlaProgram<ProgramInput, ProgramOutput, O>,
+    program: &Program<ProgramInput, ProgramOutput, O>,
     existing: Option<LogicalMesh>,
 ) -> Result<Option<LogicalMesh>, Error>
 where
-    ProgramInput: Parameterized<XlaConstant>,
-    ProgramOutput: Parameterized<XlaConstant>,
+    ProgramInput: Parameterized<Constant>,
+    ProgramOutput: Parameterized<Constant>,
 {
     // Attached computations share the canonical region arena. Type metadata alone does not require a mesh:
     // bounded-dynamic replica lowering retains that metadata without emitting Shardy operations.
@@ -2112,7 +2113,7 @@ fn remove_unused_constants_in_block<'b, 'c: 'b, 't: 'c>(block: BlockRef<'b, 'c, 
 /// Lowers one traced instruction to the corresponding StableHLO operation and returns its result value.
 #[allow(clippy::too_many_arguments)]
 pub(crate) fn lower_instruction<'b, 'c: 'b, 't: 'c, ProgramInput, ProgramOutput, O: LowerableOperationFamily>(
-    program: &XlaProgram<ProgramInput, ProgramOutput, O>,
+    program: &Program<ProgramInput, ProgramOutput, O>,
     instruction: &Instruction<O>,
     _atom_values: &[Option<ValueRef<'b, 'c, 't>>],
     input_values: &[ValueRef<'b, 'c, 't>],
@@ -2125,8 +2126,8 @@ pub(crate) fn lower_instruction<'b, 'c: 'b, 't: 'c, ProgramInput, ProgramOutput,
     effect_tokens: &mut EffectTokens<'b, 'c, 't>,
 ) -> Result<Vec<ValueRef<'b, 'c, 't>>, Error>
 where
-    ProgramInput: Parameterized<XlaConstant>,
-    ProgramOutput: Parameterized<XlaConstant>,
+    ProgramInput: Parameterized<Constant>,
+    ProgramOutput: Parameterized<Constant>,
 {
     let input_types = instruction
         .inputs()
@@ -2156,7 +2157,7 @@ where
             .map(|region| program.region_ref(*region).map(|region| region.to_program()))
             .collect::<Result<Vec<_>, _>>()?
     };
-    let mut lowerer = XlaLowerer::new(*block, context, location)
+    let mut lowerer = Lowerer::new(*block, context, location)
         .with_regions(regions)
         .with_nested_functions(nested_functions.cloned())
         .with_captured_values(captured_values)

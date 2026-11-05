@@ -1,0 +1,4063 @@
+//! XLA program preparation, lowering, compilation, and cache integration.
+
+use std::collections::HashSet;
+use std::sync::{Arc, OnceLock};
+use std::time::Instant;
+
+use prost::Message;
+use ryft_core::{
+    ArrayIrType, ArrayOperation, ArrayType, CompilationCacheDomain, CompilationDomain, Dimension as CoreDimension,
+    DimensionBounds, DimensionVariable, ExternalReferenceBinding, FlatProgram as CoreFlatProgram, Memory,
+    Operation as CoreOperation, Parameterized, ProgramError, ReductionKind, ReferenceDischargeResult, ScatterMode,
+    ScatterReductionKind, Shape, Sharding, SortDirection, StagedProgram, Type, TypeError, Typed, TypedProgram,
+};
+use ryft_pjrt::Program as PjrtProgram;
+use ryft_pjrt::protos::CompilationOptions;
+
+use crate::domains::Domain;
+use crate::domains::execution::{ExecutionError, ExecutionPlan};
+use crate::domains::options::{FeedbackDirectedProfile, InputBoundBucketing, Options};
+use crate::domains::persistence::COMPILER_IDENTITY;
+use crate::domains::programs::{
+    CompiledProgram, LoweredProgram, incompatible_invocation_field, validate_replacement_metadata,
+};
+use crate::experimental::lowering::{contains_unresolved_references, contains_unresolved_state};
+use crate::experimental::ops::{Constant, FlatProgram, Operation};
+use crate::{Error, Value};
+
+/// XLA option, executable compatibility, persistence, and analysis failures.
+#[derive(Clone, Debug, thiserror::Error)]
+pub enum CompilationError {
+    /// A requested compilation option combination is invalid.
+    #[error("invalid compilation options: {reason}")]
+    InvalidOptions { reason: String },
+
+    /// Signature sharding metadata has a different arity than the values it describes.
+    #[error("invalid {kind} sharding count; expected {expected} but got {actual}")]
+    ShardingCountMismatch { kind: &'static str, expected: usize, actual: usize },
+
+    /// A valid external-reference configuration cannot be represented by this backend's executable ABI.
+    #[error("unsupported XLA reference ABI: {reason}")]
+    UnsupportedReferenceAbi { reason: String },
+
+    /// A compiled executable does not preserve its declared invocation contract.
+    #[error("incompatible XLA executable: {reason}")]
+    IncompatibleExecutable { reason: String },
+
+    /// Persistent executable bytes or metadata violate their versioned transport contract.
+    #[error("invalid persistent XLA executable: {reason}")]
+    InvalidPersistentExecutable { reason: String },
+
+    /// Compiler analysis properties cannot be interpreted according to their declared schema.
+    #[error("invalid XLA compilation analysis: {reason}")]
+    InvalidAnalysis { reason: String },
+}
+
+/// Opaque retained-JIT specialization key derived by [`Domain`].
+///
+/// Exact dispatch preserves nominal [`DimensionVariable`] identity and shares its type slice with the effective staged
+/// signature, so keying a call costs no deep type clone. Dispatch with input-bound bucketing instead uses a structural
+/// physical-bound signature with dimension variables numbered by first occurrence, so calls routed to the same bucket
+/// share one staged and compiled specialization. Bucketed keys exclude diagnostic names, which survive only in the
+/// effective staged types.
+#[derive(Clone, Debug, PartialEq, Eq, Hash)]
+pub struct DispatchKey(DispatchKeyKind);
+/// Internal representation of [`DispatchKey`].
+#[derive(Clone, Debug, PartialEq, Eq, Hash)]
+enum DispatchKeyKind {
+    /// Exact runtime abstract signature used when bucketing is disabled, shared with the effective staged types.
+    Exact(Arc<[ArrayIrType]>),
+
+    /// Bounded signature using canonical variable indices when bucketing is enabled.
+    Bucketed(BucketedDispatchSignature),
+}
+
+/// Bounded input signature with dimension variables numbered by first occurrence, used as the retained-dispatch key.
+///
+/// Dimension variables are numbered by first occurrence across the whole input signature under
+/// [`DimensionVariable`] identity, and only their bounds are retained. Two bucketed signatures are therefore equal
+/// exactly when they agree on every input's data type, layout, sharding, memory space, rank, per-axis static extents,
+/// and per-axis variable-sharing pattern with matching bounds, regardless of how the variables are named.
+#[derive(Clone, Debug, PartialEq, Eq, Hash)]
+struct BucketedDispatchSignature {
+    /// `(lower, upper)` bounds of each distinct dimension variable, in first-occurrence order.
+    variables: Vec<(usize, Option<usize>)>,
+
+    /// Bucketed input array types with their shapes rewritten into variable-index patterns.
+    input_types: Vec<BucketedArrayTypeKey>,
+}
+
+/// One bucketed input array type split into a shape-free carrier and a shape pattern using canonical variable indices.
+#[derive(Clone, Debug, PartialEq, Eq, Hash)]
+struct BucketedArrayTypeKey {
+    /// Array type with an empty shape, retaining data type, layout, sharding, and memory identity.
+    carrier: ArrayType,
+
+    /// Per-axis static extents or canonical variable indices, which also fix the array's rank.
+    dimensions: Vec<BucketedDimensionKey>,
+}
+
+/// One static extent or canonical variable index of a [`BucketedArrayTypeKey`].
+#[derive(Copy, Clone, Debug, PartialEq, Eq, Hash)]
+enum BucketedDimensionKey {
+    /// Statically known extent. Bucketing rewrites every static input axis into a bounded dynamic axis, so this
+    /// variant is unreachable for signatures produced today; it is retained so the normalization stays total over
+    /// [`CoreDimension`](ryft_core::Dimension).
+    Static(usize),
+
+    /// Index of the axis' dimension variable in [`BucketedDispatchSignature::variables`].
+    Variable(usize),
+}
+
+impl BucketedDispatchSignature {
+    /// Builds a dispatch key from the already bucketed `input_types`, numbering dimension variables by first occurrence.
+    fn new(input_types: &[ArrayType]) -> Self {
+        let mut variables = Vec::<DimensionVariable>::new();
+        let input_types = input_types
+            .iter()
+            .map(|array_type| BucketedArrayTypeKey {
+                carrier: array_type.clone().with_shape(Shape::new(Vec::new())),
+                dimensions: array_type
+                    .shape()
+                    .dimensions()
+                    .iter()
+                    .map(|dimension| match dimension {
+                        CoreDimension::Static(extent) => BucketedDimensionKey::Static(*extent),
+                        CoreDimension::Dynamic(variable) => {
+                            let index =
+                                variables.iter().position(|existing| existing == variable).unwrap_or_else(|| {
+                                    variables.push(variable.clone());
+                                    variables.len() - 1
+                                });
+                            BucketedDimensionKey::Variable(index)
+                        }
+                    })
+                    .collect(),
+            })
+            .collect();
+        let variables =
+            variables.iter().map(|variable| (variable.bounds().lower(), variable.bounds().upper())).collect();
+        Self { variables, input_types }
+    }
+}
+
+/// Exact process-local compilation key for an XLA lowering.
+///
+/// Unlike the former call-site fingerprint, this key carries the complete StableHLO computation and every
+/// execution-relevant field retained by [`LoweredProgram`]. Equality therefore means that cached compiled
+/// artifacts are interchangeable, even when unrelated call sites happen to share the same input signature.
+#[derive(Clone, Debug, PartialEq, Eq, Hash)]
+pub struct CompilationKey {
+    pub(super) canonical_bytes: Arc<[u8]>,
+}
+
+impl<'c> CompilationDomain for Domain<'c> {
+    type DispatchKey = DispatchKey;
+    type LoweredProgram = LoweredProgram;
+    type CompiledProgram = CompiledProgram<'c>;
+    type Options = Options;
+    type Error = Error;
+
+    fn dispatch_signature(
+        &self,
+        input_types: Vec<ArrayIrType>,
+        options: &Self::Options,
+    ) -> Result<(Self::DispatchKey, Arc<[ArrayIrType]>), Self::Error> {
+        let input_types = apply_input_shardings(input_types, options)?;
+        let Some(bucketing) = options.input_bound_bucketing else {
+            let input_types: Arc<[ArrayIrType]> = input_types.into();
+            return Ok((DispatchKey(DispatchKeyKind::Exact(input_types.clone())), input_types));
+        };
+        if options.mesh.devices().len() > 1 {
+            return Err(Error::Compilation(CompilationError::InvalidOptions {
+                reason: "input-bound bucketing is unsupported on multi-device meshes because bucketed dynamic \
+                         signatures require disabling the Shardy partitioner"
+                    .to_string(),
+            }));
+        }
+        let mut bucketed_array_types = Vec::with_capacity(input_types.len());
+        for (input_index, r#type) in input_types.iter().enumerate() {
+            let array_type = match r#type {
+                ArrayIrType::Array(array_type) => array_type,
+                ArrayIrType::Dimension(_) => {
+                    return Err(Error::Compilation(CompilationError::InvalidOptions {
+                        reason: format!(
+                            "input-bound bucketing only supports array inputs, but input {} has first-class dimension \
+                             type {}",
+                            input_index, r#type,
+                        ),
+                    }));
+                }
+                ArrayIrType::Reference(_) => {
+                    return Err(Error::Compilation(CompilationError::UnsupportedReferenceAbi {
+                        reason: format!(
+                            "external reference input {input_index} does not support input-bound bucketing"
+                        ),
+                    }));
+                }
+            };
+            let dimensions = array_type
+                .shape()
+                .dimensions()
+                .iter()
+                .enumerate()
+                .map(|(axis, dimension)| match dimension {
+                    CoreDimension::Static(extent) => {
+                        let bound = match bucketing {
+                            InputBoundBucketing::PowerOfTwo => extent.checked_next_power_of_two(),
+                        }
+                        .and_then(|bound| bound.checked_add(1))
+                        .ok_or_else(|| ProgramError::InvalidArgument {
+                            message: format!(
+                                "cannot select a finite input-bound bucket for input {input_index} axis {axis} with \
+                                 extent {extent}",
+                            ),
+                        })?;
+                        let bounds = DimensionBounds::new(0, Some(bound))?;
+                        Ok(CoreDimension::Dynamic(DimensionVariable::new(
+                            format!("input_{input_index}_axis_{axis}"),
+                            bounds,
+                        )))
+                    }
+                    CoreDimension::Dynamic(variable) => Ok(CoreDimension::Dynamic(variable.clone())),
+                })
+                .collect::<Result<Vec<_>, ProgramError>>()?;
+            bucketed_array_types.push(array_type.clone().with_shape(Shape::new(dimensions)));
+        }
+        let key = BucketedDispatchSignature::new(bucketed_array_types.as_slice());
+        let input_types = bucketed_array_types.into_iter().map(ArrayIrType::Array).collect::<Vec<_>>();
+        Ok((DispatchKey(DispatchKeyKind::Bucketed(key)), input_types.into()))
+    }
+
+    fn lower(&self, staged: &StagedProgram<Self>) -> Result<LoweredProgram, Self::Error> {
+        let program = staged.lifted_program()?;
+        let capture_count = staged.source_program().captures().len();
+        let input_types = staged.input_types();
+        let output_types = staged.output_types();
+        let options = staged.options();
+        if apply_input_shardings(input_types.to_vec(), options)? != input_types {
+            return Err(Error::Compilation(CompilationError::InvalidOptions {
+                reason: "staged input types do not carry the shardings requested by `input_shardings`; apply them to \
+                         the input types before staging (e.g., with `with_input_shardings`)"
+                    .to_string(),
+            }));
+        }
+        validate_reference_outputs(program.as_ref(), capture_count, output_types)?;
+        let lowered_program = self.lower_program(program.as_ref(), capture_count, options)?;
+        let lowered_output_types = lowered_program.output_types().to_vec();
+        // Lowering applies the output sharding overrides to the program outputs, so the traced output types of the
+        // staged function are checked against the lowered ones with those same overrides applied.
+        let declared_output_types =
+            apply_signature_shardings(output_types.to_vec(), options.output_shardings.as_deref(), "output")?;
+        validate_output_types(&declared_output_types, &lowered_output_types)?;
+        Ok(lowered_program)
+    }
+
+    fn compile(&self, program: &LoweredProgram) -> Result<Arc<CompiledProgram<'c>>, Self::Error> {
+        self.compilation_context().compile(self, program)
+    }
+
+    fn execute(&self, program: &CompiledProgram<'c>, inputs: Vec<Value<'c>>) -> Result<Vec<Value<'c>>, Self::Error> {
+        self.execute_stateless(program, inputs).map(|(outputs, _)| outputs)
+    }
+}
+
+impl<'c> Domain<'c> {
+    pub(super) fn lower_program(
+        &self,
+        program: &FlatProgram,
+        capture_count: usize,
+        options: &Options,
+    ) -> Result<LoweredProgram, Error> {
+        // Kernel selection validates the actual attached body and discharges only its owned local state before the
+        // ordinary reference-discharge and effect gates. Existing lowering, caching, and runtime lifecycle then apply.
+        let selected = crate::kernels::select_kernels(program, options.kernel_compiler.as_ref(), || {
+            let target = self
+                .target()
+                .map_err(|error| crate::kernels::KernelEmbeddingError::Invalid { message: error.to_string() })?;
+            crate::kernels::KernelExecutionFacts::from_target(target, &options.mesh)
+        })?;
+        let program = selected.as_ref().unwrap_or(program);
+        if capture_count > program.input_count() {
+            return Err(ProgramError::InvalidArgument {
+                message: format!(
+                    "capture_count is {capture_count}, but the program has only {} flat input(s)",
+                    program.input_count(),
+                ),
+            }
+            .into());
+        }
+        // Avoid cloning the dominant reference-free program path. Discharge returns such a program untouched with an
+        // empty external-state list, so the same metadata can cross the lowering boundary by borrow instead.
+        if !contains_unresolved_references(program) {
+            return self.lower_verified_reference_free_program(
+                program,
+                capture_count,
+                program.output_count(),
+                &[],
+                options,
+            );
+        }
+        // Discharge the exact lifted program so attached-region capture references resolve against the same lexical
+        // capture prefixes used during staging. Programs that actually contain references are cloned because
+        // discharge consumes and rewrites them; the reference-free identity path above remains borrowed.
+        let discharged = program.clone().discharge_references_in_capture_lifted_program(capture_count)?;
+        self.lower_discharged_program(&discharged, options)
+    }
+
+    /// Lowers one validated reference-discharge artifact through the ordinary array-only XLA path.
+    fn lower_discharged_program(
+        &self,
+        discharged: &ReferenceDischargeResult<Constant, Operation>,
+        options: &Options,
+    ) -> Result<LoweredProgram, Error> {
+        // The backend verifier remains independent from core discharge and runs before boundary projection,
+        // partitioner selection, or StableHLO construction. The reference scan runs first so a malformed artifact
+        // containing both a reference and ordered state receives the more precise reference diagnostic.
+        if contains_unresolved_references(discharged.program()) {
+            return Err(ProgramError::UnsupportedOperation {
+                message: "discharged program still contains references, which XLA lowering cannot represent"
+                    .to_string(),
+            }
+            .into());
+        }
+        self.lower_verified_reference_free_program(
+            discharged.program(),
+            discharged.capture_count(),
+            discharged.output_count(),
+            discharged.external_reference_bindings(),
+            options,
+        )
+    }
+
+    /// Lowers one program after an independent verifier has established that it contains no references.
+    fn lower_verified_reference_free_program(
+        &self,
+        program: &FlatProgram,
+        capture_count: usize,
+        output_count: usize,
+        reference_states: &[ExternalReferenceBinding],
+        options: &Options,
+    ) -> Result<LoweredProgram, Error> {
+        if contains_unresolved_state(program) {
+            return Err(ProgramError::UnsupportedOperation {
+                message: "discharged program still contains ordered state, which XLA lowering cannot represent"
+                    .to_string(),
+            }
+            .into());
+        }
+        validate_data_dependent_compilation(program)?;
+        if output_count > program.output_count() {
+            return Err(ProgramError::MalformedProgram(format!(
+                "output count {output_count} exceeds the complete discharged output count {}",
+                program.output_count(),
+            ))
+            .into());
+        }
+        if !reference_states.is_empty() && !self.target()?.is_fully_addressable_single_process_mesh(&options.mesh) {
+            return Err(Error::Compilation(CompilationError::UnsupportedReferenceAbi {
+                reason: "external reference state requires a fully addressable single-process mesh".to_string(),
+            }));
+        }
+        if !reference_states.is_empty() && options.input_bound_bucketing.is_some() {
+            return Err(Error::Compilation(CompilationError::UnsupportedReferenceAbi {
+                reason: "external reference inputs do not support input-bound bucketing".to_string(),
+            }));
+        }
+        let input_types = program.input_types();
+        let (capture_types, public_input_types) = input_types.split_at(capture_count);
+        if let Some(donation_flags) = &options.donation_flags
+            && donation_flags.len() != public_input_types.len()
+        {
+            return Err(Error::Execution(ExecutionError::DonationFlagCountMismatch {
+                expected_count: public_input_types.len(),
+                actual_count: donation_flags.len(),
+            }));
+        }
+        let mut donation_flags =
+            options.donation_flags.clone().unwrap_or_else(|| vec![false; public_input_types.len()]);
+
+        let effective_capture_types = capture_types
+            .iter()
+            .map(|r#type| <&ArrayType>::try_from(r#type).cloned())
+            .collect::<Result<Vec<_>, _>>()
+            .map_err(ProgramError::from)?;
+        let effective_public_input_types = public_input_types
+            .iter()
+            .map(|r#type| <&ArrayType>::try_from(r#type).cloned())
+            .collect::<Result<Vec<_>, _>>()
+            .map_err(ProgramError::from)?;
+        let effective_input_types = effective_capture_types
+            .iter()
+            .cloned()
+            .chain(effective_public_input_types.iter().cloned())
+            .collect::<Vec<_>>();
+        let reference_state_input_indices = reference_states
+            .iter()
+            .map(|state| state.source().flat_input_index(capture_count))
+            .collect::<Result<Vec<_>, _>>()?;
+        if reference_state_input_indices.windows(2).any(|indices| indices[0] >= indices[1]) {
+            return Err(ProgramError::MalformedProgram(
+                "external reference states must follow strictly increasing logical input order".to_string(),
+            )
+            .into());
+        }
+        if !reference_states
+            .iter()
+            .filter_map(ExternalReferenceBinding::output_index)
+            .eq(output_count..program.output_count())
+        {
+            return Err(ProgramError::MalformedProgram(
+                "hidden discharged outputs must be covered exactly once by mutated external state".to_string(),
+            )
+            .into());
+        }
+        for &logical_input_index in &reference_state_input_indices {
+            let input_type = effective_input_types.get(logical_input_index).ok_or_else(|| {
+                ProgramError::MalformedProgram(format!(
+                    "external state logical input {logical_input_index} is out of range",
+                ))
+            })?;
+            if let Some(sharding) = input_type.sharding()
+                && !sharding.mesh().has_same_topology(options.mesh.logical_mesh())
+            {
+                return Err(ryft_core::ShardingError::MeshMismatch {
+                    expected: options.mesh.logical_mesh().clone(),
+                    actual: sharding.mesh().clone(),
+                }
+                .into());
+            }
+            if input_type.data_type().is_zero() {
+                return Err(Error::Compilation(CompilationError::UnsupportedReferenceAbi {
+                    reason: format!(
+                        "external reference state at logical input {logical_input_index} cannot use a zero-space type \
+                         because it has no executable buffer",
+                    ),
+                }));
+            }
+            if input_type.memory() != Memory::Device {
+                return Err(Error::Compilation(CompilationError::UnsupportedReferenceAbi {
+                    reason: format!(
+                        "external reference state at logical input {logical_input_index} must use device memory"
+                    ),
+                }));
+            }
+            if input_type
+                .shape()
+                .dimensions()
+                .iter()
+                .any(|dimension| dimension.value().is_none() && dimension.upper_bound().is_none())
+            {
+                return Err(Error::Compilation(CompilationError::UnsupportedReferenceAbi {
+                    reason: format!(
+                        "external reference state at logical input {logical_input_index} has an unbounded dynamic \
+                         dimension",
+                    ),
+                }));
+            }
+        }
+        let program_output_types = program.output_types();
+        let public_output_types = apply_signature_shardings(
+            program_output_types[..output_count].to_vec(),
+            options.output_shardings.as_deref(),
+            "output",
+        )?;
+        let logical_argument_shardings = effective_input_types
+            .iter()
+            .map(|array_type| {
+                array_type.sharding().cloned().unwrap_or_else(|| {
+                    Sharding::replicated(options.mesh.logical_mesh().clone(), array_type.shape().rank())
+                })
+            })
+            .collect::<Vec<_>>();
+        for (state, &logical_input_index) in reference_states.iter().zip(&reference_state_input_indices) {
+            if effective_input_types[logical_input_index].static_shape().is_none() {
+                if state.output_index().is_some() {
+                    return Err(Error::Compilation(CompilationError::UnsupportedReferenceAbi {
+                        reason: format!(
+                            "mutated bounded-dynamic external state input {logical_input_index} is unsupported because \
+                             backend alias compatibility has not been verified",
+                        ),
+                    }));
+                }
+                if !logical_argument_shardings[logical_input_index].is_replicated() {
+                    return Err(Error::Compilation(CompilationError::UnsupportedReferenceAbi {
+                        reason: format!(
+                            "bounded-dynamic external state input {logical_input_index} must use replicated sharding",
+                        ),
+                    }));
+                }
+            }
+        }
+        let mut output_types = public_output_types
+            .iter()
+            .map(|r#type| <&ArrayType>::try_from(r#type).cloned())
+            .collect::<Result<Vec<_>, _>>()
+            .map_err(ProgramError::from)?;
+        let result_shardings = if reference_states.is_empty() {
+            output_types.iter().map(|array_type| array_type.sharding().cloned()).collect::<Option<Vec<_>>>()
+        } else {
+            let mut shardings = output_types
+                .iter()
+                .map(|array_type| {
+                    array_type.sharding().cloned().unwrap_or_else(|| {
+                        Sharding::replicated(options.mesh.logical_mesh().clone(), array_type.shape().rank())
+                    })
+                })
+                .collect::<Vec<_>>();
+            // Mutated bindings cover the hidden output suffix in order, as validated above. Derive both the hidden
+            // state type and its placement from the same input binding in one pass.
+            for (state, &logical_input_index) in reference_states.iter().zip(&reference_state_input_indices) {
+                if state.is_mutated() {
+                    output_types.push(effective_input_types[logical_input_index].clone());
+                    shardings.push(logical_argument_shardings[logical_input_index].clone());
+                }
+            }
+            Some(shardings)
+        };
+        // Shardy rejects bounded-dynamic tensors anywhere in the module, not only at the computation boundary, so a
+        // program whose boundary is static but whose interior derives a dynamic extent through a gateway operation
+        // still has to take the replica path. This is why the whole region arena is inspected instead of just the
+        // boundary types, which it already subsumes.
+        let use_shardy_partitioner = has_only_static_array_types(program);
+        // A `shard_map` body only ever has static boundary types, so it can coexist with dynamic tensors staged
+        // elsewhere in the same program. Its `sdy.manual_computation` lowering is meaningless without Shardy on any
+        // device count, and bounded-dynamic tensors force Shardy off for the whole module.
+        if !use_shardy_partitioner && contains_shard_map(program) {
+            return Err(Error::Lowering(crate::LoweringError::UnsupportedOperation {
+                operation: ryft_core::SHARD_MAP_OPERATION_NAME.to_string(),
+                reason: "bounded-dynamic programs cannot contain shard_map regions because sdy.manual_computation \
+                         requires the Shardy partitioner"
+                    .to_string(),
+            }));
+        }
+        if !use_shardy_partitioner && options.mesh.devices().len() > 1 {
+            if logical_argument_shardings
+                .iter()
+                .chain(output_types.iter().filter_map(ArrayType::sharding))
+                .any(|sharding| !sharding.is_replicated())
+            {
+                return Err(Error::Compilation(CompilationError::InvalidOptions {
+                    reason: "bounded-dynamic multi-device programs currently require fully replicated shardings \
+                             because Shardy rejects dynamic tensors"
+                        .to_string(),
+                }));
+            }
+        }
+        let compilation_options = jit_compilation_options(
+            self.compilation_options.as_ref(),
+            options.mesh.devices().len(),
+            use_shardy_partitioner,
+            options.feedback_directed_profile.as_ref(),
+        );
+        // The target platform gates platform-specific lowerings such as fused attention; a failed
+        // platform query degrades to the portable lowerings instead of failing compilation.
+        let target = self.target()?;
+        let target_platform = Some(target.platform_name());
+        // Shardy currently rejects bounded-dynamic tensors. Fully replicated dynamic programs need no partitioning,
+        // so lower them without Shardy metadata and execute one replica per mesh device instead.
+        let lowered_argument_shardings = use_shardy_partitioner.then_some(logical_argument_shardings.as_slice());
+        let lowered_result_shardings = if use_shardy_partitioner { result_shardings.as_deref() } else { None };
+        let lowered_module = crate::experimental::lowering::lower_mlir_module_for_program_with_reference_state(
+            program,
+            effective_capture_types.as_slice(),
+            &effective_public_input_types,
+            &output_types,
+            "main",
+            lowered_argument_shardings,
+            lowered_result_shardings,
+            target_platform.as_deref(),
+            reference_states,
+            options.ragged_dot_lowering_strategy,
+        )?;
+        let (stable_hlo, signature, requires_assertion_handler) = lowered_module.into_parts();
+        for (mapping, donation) in signature.input_mapping()[capture_count..].iter().zip(donation_flags.iter_mut()) {
+            if mapping.is_none() {
+                *donation = false;
+            }
+        }
+        let expected_argument_shardings = signature.physical_input_shardings(logical_argument_shardings.as_slice());
+
+        Ok(LoweredProgram {
+            stable_hlo: stable_hlo.into(),
+            compilation_options,
+            input_types: effective_input_types.into(),
+            output_types: output_types.into(),
+            output_count,
+            reference_states: reference_states.into(),
+            signature,
+            requires_assertion_handler,
+            donation_flags: donation_flags.into(),
+            capture_count,
+            expected_argument_shardings: expected_argument_shardings.into(),
+            mesh: options.mesh.clone(),
+            platform_name: target.platform_name().into(),
+            platform_version: target.platform_version().into(),
+            device_kinds: target.mesh_device_kinds(&options.mesh)?.into(),
+            kernel_execution_facts: if program.entry_region_ref().computation_regions().any(|region| {
+                region.instructions().iter().any(|instruction| match instruction.operation() {
+                    Operation::CustomCall(operation) | Operation::Array(ArrayOperation::CustomCall(operation)) => {
+                        operation.target_name() == crate::kernels::CUDA_KERNEL_CUSTOM_CALL_TARGET
+                            || operation.attributes().iter().any(|(name, _)| name == "ryft.kernel.schema")
+                    }
+                    _ => false,
+                })
+            }) {
+                Some(crate::kernels::KernelExecutionFacts::from_target(target, &options.mesh)?.configuration_key()?)
+            } else {
+                None
+            },
+            compiler_identity: COMPILER_IDENTITY.as_str().into(),
+            xla_flags: std::env::var("XLA_FLAGS").unwrap_or_default().into(),
+        })
+    }
+
+    pub(crate) fn compile_program(&self, program: &LoweredProgram) -> Result<CompiledProgram<'c>, Error> {
+        self.ensure_runtime_requirements(&program.signature, &program.platform_name)?;
+        let pjrt_program = PjrtProgram::Mlir { bytecode: program.stable_hlo.as_bytes().to_vec() };
+        let compilation_start = Instant::now();
+        let executable = self.client().compile(&pjrt_program, &program.compilation_options)?;
+        let compilation_duration = compilation_start.elapsed();
+        let plan = ExecutionPlan::new(
+            &executable,
+            &program.input_types,
+            &program.output_types,
+            &program.signature,
+            &program.donation_flags,
+            program.capture_count,
+            &program.mesh,
+        )?;
+        Ok(CompiledProgram {
+            executable: Arc::new(executable),
+            input_types: Arc::clone(&program.input_types),
+            output_types: Arc::clone(&program.output_types),
+            output_count: program.output_count,
+            reference_states: Arc::clone(&program.reference_states),
+            signature: program.signature.clone(),
+            requires_assertion_handler: program.requires_assertion_handler,
+            donation_flags: Arc::clone(&program.donation_flags),
+            capture_count: program.capture_count,
+            expected_argument_shardings: Arc::clone(&program.expected_argument_shardings),
+            mesh: program.mesh.clone(),
+            compilation_options: program.compilation_options.clone(),
+            platform_name: Arc::clone(&program.platform_name),
+            platform_version: Arc::clone(&program.platform_version),
+            device_kinds: Arc::clone(&program.device_kinds),
+            kernel_execution_facts: program.kernel_execution_facts.clone(),
+            compiler_identity: Arc::clone(&program.compiler_identity),
+            xla_flags: Arc::clone(&program.xla_flags),
+            compilation_duration: Some(compilation_duration),
+            analysis: Arc::new(OnceLock::new()),
+            plan: Arc::new(plan),
+        })
+    }
+
+    pub(crate) fn validate_replacement(
+        &self,
+        current: &CompiledProgram<'c>,
+        replacement: &CompiledProgram<'c>,
+    ) -> Result<(), Error> {
+        self.validate_program_owner(current)?;
+        self.validate_program_owner(replacement)?;
+        validate_replacement_metadata(current.into(), replacement.into())
+    }
+}
+
+impl<'c> CompilationCacheDomain for Domain<'c> {
+    type CacheKey = CompilationKey;
+
+    #[inline]
+    fn compilation_key(&self, program: &Self::LoweredProgram) -> Result<Self::CacheKey, Self::Error> {
+        Self::canonical_compilation_key(program)
+    }
+
+    #[inline]
+    fn compile_uncached(&self, program: &Self::LoweredProgram) -> Result<Self::CompiledProgram, Self::Error> {
+        self.compile_program(program)
+    }
+
+    fn validate_cached_program(
+        &self,
+        program: &Self::LoweredProgram,
+        compiled: &Self::CompiledProgram,
+    ) -> Result<(), Self::Error> {
+        // Fresh compilations copy this metadata verbatim, so this rejects only reused programs whose invocation
+        // contract does not match the requesting lowering (e.g., a corrupted or colliding persistent or exchanged
+        // artifact). The stateful transaction trusts this metadata, so a mismatch must be caught before the first
+        // call.
+        match incompatible_invocation_field(program.into(), compiled.into()) {
+            Some(field) => Err(Error::Compilation(CompilationError::IncompatibleExecutable {
+                reason: format!("cached executable has incompatible {field}"),
+            })),
+            None => Ok(()),
+        }
+    }
+
+    #[inline]
+    fn persistent_cache_key(&self, key: &Self::CacheKey) -> Option<Vec<u8>> {
+        self.persistent_key_bytes(key)
+    }
+
+    #[inline]
+    fn serialize_program(&self, program: &Self::CompiledProgram) -> Result<Option<Vec<u8>>, Self::Error> {
+        self.serialize_compiled_program(program)
+    }
+
+    #[inline]
+    fn deserialize_program(&self, bytes: &[u8]) -> Result<Option<Self::CompiledProgram>, Self::Error> {
+        self.deserialize_compiled_program(bytes)
+    }
+}
+
+/// Returns `input_types` with the input sharding overrides of `options` (i.e., [`Options::input_shardings`])
+/// applied, or `input_types` unchanged when `options` has none. The overrides must be applied before tracing, because
+/// tracers carry their input types and sharding-aware operations read them. Retained dispatch applies them through
+/// [`CompilationDomain::dispatch_signature`], the staging entry points of this crate apply them through
+/// [`with_input_shardings`], and lowering rejects staged functions whose input types do not carry them. External
+/// reference inputs are rejected when overrides are present, because holder state derives its effective sharding from
+/// the compiled reference ABI.
+fn apply_input_shardings(input_types: Vec<ArrayIrType>, options: &Options) -> Result<Vec<ArrayIrType>, Error> {
+    let Some(input_shardings) = options.input_shardings.as_deref() else {
+        return Ok(input_types);
+    };
+    if input_types.iter().any(|r#type| r#type.is_reference()) {
+        return Err(Error::Compilation(CompilationError::UnsupportedReferenceAbi {
+            reason: "external reference inputs do not support explicit input shardings".to_string(),
+        }));
+    }
+    apply_signature_shardings(input_types, Some(input_shardings), "input")
+}
+
+/// Returns the structured `input_types` with the input sharding overrides of `options` applied (refer to
+/// [`apply_input_shardings`]). Call this before [`StagedFunction::stage`](ryft_core::StagedFunction::stage) when
+/// staging with options that may carry input sharding overrides.
+pub(crate) fn with_input_shardings<In: Parameterized<ArrayIrType>>(
+    input_types: In,
+    options: &Options,
+) -> Result<In, Error> {
+    if options.input_shardings.is_none() {
+        return Ok(input_types);
+    }
+    let input_structure = input_types.parameter_structure();
+    let input_types = apply_input_shardings(input_types.into_parameters().collect(), options)?;
+    Ok(In::from_parameters(input_structure, input_types).map_err(ProgramError::from)?)
+}
+
+/// Rejects every reference-typed output of a capture-lifted program before lowering it into an executable. The stateful
+/// XLA ABI opens and commits external input references and has no protocol for turning a backend-created array into a
+/// host reference with persistent identity, nor for handing an entering reference back through an output. The
+/// retained reference analysis of the capture-lifted program distinguishes the escaping local allocation from the
+/// forwarded external reference. References returned by nested calls inside a program never cross that ABI, so only
+/// the outputs of the lowered program itself are checked.
+fn validate_reference_outputs(
+    program: &CoreFlatProgram<Domain<'_>>,
+    capture_count: usize,
+    output_types: &[ArrayIrType],
+) -> Result<(), Error> {
+    let Some(output_index) = output_types.iter().position(|r#type| r#type.is_reference()) else {
+        return Ok(());
+    };
+    let analysis = program.reference_analysis(capture_count).map_err(ProgramError::from)?;
+    let root = analysis.output_roots().get(output_index).copied().flatten();
+    let reason = match root.map(|root| analysis.external_source(root)) {
+        Some(Some(source)) => format!(
+            "output {output_index} forwards the external reference bound at {source}, and the stateful XLA ABI does \
+             not return forwarded references; read the reference after the call instead",
+        ),
+        Some(None) => format!(
+            "output {output_index} is a reference allocated inside the program and cannot be returned through the \
+             stateful XLA ABI, which has no protocol to turn a backend array into a host reference",
+        ),
+        None => format!(
+            "output {output_index} is a reference whose root the reference analysis attributes to neither an input \
+             nor an allocation, and the stateful XLA ABI cannot return it",
+        ),
+    };
+    Err(Error::Compilation(CompilationError::UnsupportedReferenceAbi { reason }))
+}
+pub(super) fn validate_output_types(declared: &[ArrayIrType], actual: &[ArrayType]) -> Result<(), Error> {
+    if declared.len() != actual.len() {
+        return Err(ProgramError::InvalidOutputCount { expected: declared.len(), actual: actual.len() }.into());
+    }
+    for (declared, actual) in declared.iter().zip(actual) {
+        let declared = <&ArrayType>::try_from(declared).map_err(ProgramError::from)?;
+        if !declared.is_refined_by(actual) {
+            return Err(ProgramError::InvalidArgument {
+                message: format!("backend output type {actual} does not refine declared type {declared}"),
+            }
+            .into());
+        }
+    }
+    Ok(())
+}
+
+/// Applies an optional per-leaf sharding override to a public array IR signature. When overrides are provided, every
+/// overridden leaf must be an array: first-class dimensions are internal SSA values, and references must be discharged
+/// into explicit array state before either kind can cross the PJRT ABI. Note that without overrides the signature
+/// passes through unchecked here; non-array boundary leaves are rejected by the later array-only conversions on the
+/// compile path.
+fn apply_signature_shardings(
+    mut types: Vec<ArrayIrType>,
+    shardings: Option<&[Sharding]>,
+    kind: &'static str,
+) -> Result<Vec<ArrayIrType>, Error> {
+    let Some(shardings) = shardings else {
+        return Ok(types);
+    };
+    if shardings.len() != types.len() {
+        return Err(Error::Compilation(CompilationError::ShardingCountMismatch {
+            kind,
+            expected: types.len(),
+            actual: shardings.len(),
+        }));
+    }
+    for (r#type, sharding) in types.iter_mut().zip(shardings) {
+        *r#type = match r#type {
+            ArrayIrType::Array(array_type) => array_type.clone().with_sharding(sharding.clone())?.into(),
+            ArrayIrType::Dimension(_) | ArrayIrType::Reference(_) => {
+                return Err(ProgramError::from(TypeError::invalid(format!(
+                    "cannot apply an array sharding to type `{type}`",
+                )))
+                .into());
+            }
+        };
+    }
+    Ok(types)
+}
+
+/// Returns whether every array type that occurs anywhere in `program` has a static shape. The walk covers the whole
+/// region arena, and therefore every region boundary, constant, and instruction result, recursively through attached
+/// regions. First-class dimension-typed atoms are ignored because they lower to ordinary scalars; only dynamically
+/// shaped *array* types make the lowered module unacceptable to the Shardy partitioner.
+fn has_only_static_array_types(program: &FlatProgram) -> bool {
+    program.regions().iter().all(|region| {
+        region.atoms().iter().all(|atom| match atom.r#type().as_ref() {
+            ArrayIrType::Array(array_type) => array_type.static_shape().is_some(),
+            ArrayIrType::Dimension(_) => true,
+            // The predicate answers its own question rather than relying on the lowering-time reference rejection
+            // firing first: a dynamically shaped referent counts as dynamic so that partitioner selection and its
+            // guards stay correct even for programs whose only dynamic type is a reference referent.
+            ArrayIrType::Reference(reference_type) => reference_type.referent().static_shape().is_some(),
+        })
+    })
+}
+
+/// Returns whether `program` stages a `shard_map` anywhere, including inside nested regions. `shard_map` boundaries
+/// are required to be static (refer to the documentation of [`ShardMapOperation`](ryft_core::ShardMapOperation)), so
+/// a `shard_map` can still appear in a program that is bounded-dynamic elsewhere, which this predicate detects.
+fn contains_shard_map(program: &FlatProgram) -> bool {
+    program.regions().iter().any(|region| {
+        region
+            .instructions()
+            .iter()
+            .any(|instruction| matches!(instruction.operation(), Operation::ShardMap(_)))
+    })
+}
+
+/// Padding contract used when admitting one staged operation to data-dependent bounded-dynamic lowering.
+#[derive(Copy, Clone, Debug, PartialEq, Eq)]
+enum DataDependentPaddingDiscipline {
+    /// StableHLO propagates the operation's logical dynamic dimensions without inspecting physical padding lanes.
+    Propagated,
+
+    /// Ryft delegates identity- or sentinel-masking of padding lanes to XLA's bounded-dynamic legalizer.
+    XlaMasked,
+
+    /// Ryft delegates zero-padding of contraction lanes to XLA's bounded-dynamic legalizer.
+    XlaZeroPadded,
+
+    /// Ryft explicitly materializes bounded physical operands with operation-specific padding values or masks and
+    /// restores dynamic result metadata after the physical computation.
+    RyftMasked,
+
+    /// Ryft lacks sufficient semantic or execution evidence to admit this operation safely.
+    Unsupported { reason: &'static str },
+}
+
+/// Returns the XLA masking contract for one reduction kind. The exhaustive match makes adding a reduction kind a
+/// compile-time update to the data-dependent inventory instead of silently inheriting another kind's padding rule.
+fn reduction_data_dependent_padding_discipline(kind: ReductionKind) -> DataDependentPaddingDiscipline {
+    use DataDependentPaddingDiscipline::{Unsupported, XlaMasked};
+
+    match kind {
+        ReductionKind::Sum
+        | ReductionKind::Product
+        | ReductionKind::Max
+        | ReductionKind::Min
+        | ReductionKind::Any
+        | ReductionKind::All => XlaMasked,
+        // A log-sum-exp `reduce` expands into maximum and summation reductions over the same axes, so it inherits
+        // the masking contract of exactly those two reduction kinds: XLA masks each reduction's
+        // operand with that reduction's own identity, which wipes the padding lanes of the shifted exponentials
+        // before they are summed. The rank-2 arm of `data_derived_padding_fixture` executes that expansion with the
+        // data-derived extent on the kept axis, which is the admission's execution evidence.
+        ReductionKind::LogSumExp => XlaMasked,
+        ReductionKind::Mean => {
+            Unsupported { reason: "mean over a dynamically sized reduction axis is not supported by the XLA lowering" }
+        }
+    }
+}
+
+/// Returns the XLA masking contract for one sort direction. Keeping the match exhaustive makes sort-direction
+/// additions compile-forced inventory changes because ascending and descending sorts require opposite sentinels.
+fn sort_data_dependent_padding_discipline(direction: SortDirection) -> DataDependentPaddingDiscipline {
+    use DataDependentPaddingDiscipline::XlaMasked;
+
+    match direction {
+        SortDirection::Ascending | SortDirection::Descending => XlaMasked,
+    }
+}
+
+/// Rejects every scatter combiner until its padding behavior has kind-specific execution evidence. The exhaustive
+/// match deliberately forces new combiners through the same review rather than admitting them as ordinary shape-
+/// preserving operations.
+fn scatter_data_dependent_padding_discipline(kind: ScatterReductionKind) -> DataDependentPaddingDiscipline {
+    use DataDependentPaddingDiscipline::Unsupported;
+
+    match kind {
+        ScatterReductionKind::Overwrite => Unsupported {
+            reason: "overwrite-scatter padding semantics have not been verified for data-derived dimensions",
+        },
+        ScatterReductionKind::Add => {
+            Unsupported { reason: "add-scatter padding semantics have not been verified for data-derived dimensions" }
+        }
+        ScatterReductionKind::Mul => Unsupported {
+            reason: "multiply-scatter padding semantics have not been verified for data-derived dimensions",
+        },
+        ScatterReductionKind::Min => Unsupported {
+            reason: "minimum-scatter padding semantics have not been verified for data-derived dimensions",
+        },
+        ScatterReductionKind::Max => Unsupported {
+            reason: "maximum-scatter padding semantics have not been verified for data-derived dimensions",
+        },
+    }
+}
+
+/// Classifies every homogeneous array operation by the padding discipline required for data-derived dimensions.
+/// Keeping this match exhaustive makes a newly added operation a compile-time inventory update rather than silently
+/// assuming that arbitrary padding is safe.
+fn array_data_dependent_padding_discipline(
+    operation: &ArrayOperation<crate::experimental::ops::ArrayConstant>,
+) -> DataDependentPaddingDiscipline {
+    use DataDependentPaddingDiscipline::{Propagated, RyftMasked, Unsupported, XlaMasked, XlaZeroPadded};
+
+    match operation {
+        ArrayOperation::Reduce(operation) => reduction_data_dependent_padding_discipline(operation.kind()),
+        ArrayOperation::Sort(operation) => sort_data_dependent_padding_discipline(operation.direction()),
+        // XLA pads every input of the variadic reduction that these lower to with that input's own initial value along
+        // a dynamic reduced axis (i.e., the extremum identity paired with index zero), which never beats a live element
+        // and ties only when every live element equals the identity, where index zero is correct. Dynamic axes that
+        // are not reduced pass through. `data_derived_padding_fixture` executes both configurations.
+        ArrayOperation::ArgMax(_) | ArrayOperation::ArgMin(_) => XlaMasked,
+        // Runtime-sized slice pullbacks use unique, in-bounds point updates. XLA masks inactive update lanes;
+        // the compiled slice pullback fixture checks non-maximum and empty logical extents on CPU and CUDA.
+        // Other window shapes, modes, and combiners retain their independent admission requirements.
+        ArrayOperation::Scatter(operation)
+            if operation.kind() == ScatterReductionKind::Add
+                && operation.mode() == ScatterMode::PromiseInBounds
+                && operation.unique_indices()
+                && operation.dimensions().update_window_dimensions().is_empty() =>
+        {
+            XlaMasked
+        }
+        ArrayOperation::Scatter(operation) => scatter_data_dependent_padding_discipline(operation.kind()),
+        // A prefix scan mixes positions only along its scanned axis, and type inference already requires that axis to
+        // be static, so a data-derived extent can only sit on an axis the scan treats elementwise. That reasoning is
+        // the same for every combining operator, and the prefix sum in `data_derived_padding_fixture` executes this arm
+        // with the data-derived extent on the unscanned axis.
+        ArrayOperation::Cumulative(_) => Propagated,
+        ArrayOperation::Dot(_) => XlaZeroPadded,
+        ArrayOperation::RaggedDot(_) => {
+            Unsupported { reason: "group-size metadata may describe positions in bounded physical padding" }
+        }
+        ArrayOperation::ScaledDot(_) => RyftMasked,
+        ArrayOperation::RngBitGenerator(_) => Unsupported {
+            reason: "random generation advances state according to physical rather than logical element count",
+        },
+        ArrayOperation::Dropout(_) => {
+            Unsupported { reason: "dropout masks are drawn according to physical rather than logical extents" }
+        }
+        ArrayOperation::ParallelRaggedAllToAll(_) => {
+            Unsupported { reason: "ragged collective metadata may address physical padding lanes" }
+        }
+        ArrayOperation::CustomCall(_) => Unsupported { reason: "custom-call physical-padding semantics are opaque" },
+        ArrayOperation::Print(_) => Unsupported { reason: "print exposes the physical representation of its operand" },
+        // Entry guards and `cast`s narrow or widen bounded-dynamic values explicitly: the physical buffer is sliced or
+        // padded, and every axis that stays dynamic gets its logical size back.
+        ArrayOperation::Guard(_) | ArrayOperation::Cast(_) => RyftMasked,
+        ArrayOperation::Assert(_)
+        | ArrayOperation::Zero(_)
+        | ArrayOperation::ZeroLike(_)
+        | ArrayOperation::One(_)
+        | ArrayOperation::OneLike(_)
+        | ArrayOperation::Constant(_)
+        | ArrayOperation::Iota(_)
+        | ArrayOperation::Abs(_)
+        | ArrayOperation::Neg(_)
+        | ArrayOperation::Add(_)
+        | ArrayOperation::Sub(_)
+        | ArrayOperation::SaturatingSub(_)
+        | ArrayOperation::Mul(_)
+        | ArrayOperation::Div(_)
+        | ArrayOperation::Sin(_)
+        | ArrayOperation::Cos(_)
+        | ArrayOperation::Tan(_)
+        | ArrayOperation::Atan2(_)
+        | ArrayOperation::Exp(_)
+        | ArrayOperation::ExpM1(_)
+        | ArrayOperation::Log(_)
+        | ArrayOperation::Ln1p(_)
+        | ArrayOperation::LogAddExp(_)
+        | ArrayOperation::Sqrt(_)
+        | ArrayOperation::Rsqrt(_)
+        | ArrayOperation::Tanh(_)
+        | ArrayOperation::Logistic(_)
+        | ArrayOperation::Erf(_)
+        | ArrayOperation::Pow(_)
+        | ArrayOperation::Sign(_)
+        | ArrayOperation::Floor(_)
+        | ArrayOperation::Ceil(_)
+        | ArrayOperation::Round(_)
+        | ArrayOperation::Max(_)
+        | ArrayOperation::Min(_)
+        | ArrayOperation::Clamp(_)
+        | ArrayOperation::Rem(_)
+        | ArrayOperation::Not(_)
+        | ArrayOperation::And(_)
+        | ArrayOperation::Or(_)
+        | ArrayOperation::Xor(_)
+        | ArrayOperation::Complex(_)
+        | ArrayOperation::Conjugate(_)
+        | ArrayOperation::Real(_)
+        | ArrayOperation::Imaginary(_)
+        | ArrayOperation::ParallelReduce(_)
+        | ArrayOperation::ParallelVary(_)
+        | ArrayOperation::ParallelAllGather(_)
+        | ArrayOperation::ParallelSumScatter(_)
+        | ArrayOperation::ParallelPermute(_)
+        | ArrayOperation::ParallelAllToAll(_)
+        | ArrayOperation::AxisIndex(_)
+        | ArrayOperation::Reverse(_)
+        | ArrayOperation::Transpose(_)
+        | ArrayOperation::Reshape(_)
+        | ArrayOperation::Broadcast(_)
+        | ArrayOperation::Pad(_)
+        | ArrayOperation::Concatenate(_)
+        | ArrayOperation::Gather(_)
+        | ArrayOperation::Slice(_)
+        | ArrayOperation::UpdateSlice(_)
+        | ArrayOperation::DynamicSlice(_)
+        | ArrayOperation::DynamicUpdateSlice(_)
+        | ArrayOperation::Compare(_)
+        | ArrayOperation::Select(_)
+        | ArrayOperation::Condition(_)
+        | ArrayOperation::While(_)
+        | ArrayOperation::Scan(_)
+        | ArrayOperation::ConvertElementType(_)
+        | ArrayOperation::ReducePrecision(_)
+        | ArrayOperation::TransferToMemory(_)
+        | ArrayOperation::Reshard(_)
+        | ArrayOperation::ConstrainSharding(_)
+        | ArrayOperation::StopGradient(_)
+        | ArrayOperation::Tag(_)
+        | ArrayOperation::Rematerialize(_)
+        | ArrayOperation::Composite(_)
+        | ArrayOperation::CompositeTranspose(_)
+        | ArrayOperation::LinearCall(_) => Propagated,
+    }
+}
+
+/// Classifies every XLA operation by the bounded-dynamic padding discipline it requires.
+fn data_dependent_padding_discipline(operation: &Operation) -> DataDependentPaddingDiscipline {
+    use DataDependentPaddingDiscipline::{Propagated, RyftMasked, Unsupported};
+
+    match operation {
+        Operation::Array(operation) => array_data_dependent_padding_discipline(operation),
+        Operation::RngBitGenerator(_) => Unsupported {
+            reason: "random generation advances state according to physical rather than logical element count",
+        },
+        Operation::ParallelRaggedAllToAll(_) => {
+            Unsupported { reason: "ragged collective metadata may address physical padding lanes" }
+        }
+        Operation::CustomCall(_) => Unsupported { reason: "custom-call physical-padding semantics are opaque" },
+        Operation::ReferenceNew(_)
+        | Operation::ReferenceRead(_)
+        | Operation::ReferenceWrite(_)
+        | Operation::ReferenceSwap(_)
+        | Operation::ReferenceAddUpdate(_)
+        | Operation::ReferenceAtomicAddUpdate(_)
+        | Operation::ReferenceFreeze(_) => {
+            Unsupported { reason: "references must be discharged before bounded-dynamic XLA validation" }
+        }
+        Operation::Kernel(_) => {
+            Unsupported { reason: "kernel calls must be selected before bounded-dynamic XLA validation" }
+        }
+        // Entry guards and `cast`s narrow or widen bounded-dynamic values explicitly (refer to the array arms).
+        Operation::Guard(_) | Operation::Cast(_) => RyftMasked,
+        Operation::ShardMap(_) => {
+            Unsupported { reason: "shard-map lowering requires Shardy, which does not support bounded-dynamic tensors" }
+        }
+        Operation::Zero(_)
+        | Operation::DynamicOne(_)
+        | Operation::DynamicIota(_)
+        | Operation::Dimension(_)
+        | Operation::Compare(_)
+        | Operation::Assert(_)
+        | Operation::DimensionSize(_)
+        | Operation::DimensionFromScalar(_)
+        | Operation::DimensionToScalar(_)
+        | Operation::Reshape(_)
+        | Operation::Broadcast(_)
+        | Operation::Concatenate(_)
+        | Operation::Pad(_)
+        | Operation::DynamicSlice(_)
+        | Operation::ParallelAllGather(_)
+        | Operation::ParallelSumScatter(_)
+        | Operation::ParallelAllToAll(_)
+        | Operation::Condition(_)
+        | Operation::While(_)
+        | Operation::Scan(_)
+        | Operation::Composite(_)
+        | Operation::LinearCall(_)
+        | Operation::Rematerialize(_)
+        | Operation::CompositeTranspose(_)
+        | Operation::LiftedComposite(_)
+        | Operation::LiftedCompositeTranspose(_)
+        | Operation::JitCall(_) => Propagated,
+    }
+}
+
+/// Returns whether `r#type` carries an identity derived from `dimension_from_scalar`.
+fn references_data_derived_dimension(r#type: &ArrayIrType, variables: &HashSet<DimensionVariable>) -> bool {
+    r#type.identities().any(|(_, identity)| variables.contains(identity))
+}
+
+/// Validates the bounded-dynamic compilation contract for dimensions produced by `dimension_from_scalar`.
+///
+/// `XlaMasked` and `XlaZeroPadded` are explicit delegation decisions: the bounded-dynamic XLA legalizer owns those
+/// transformations. `RyftMasked` operations instead materialize their physical kernel inputs and restore logical
+/// extents in Ryft's lowering. Only configurations with execution evidence are admitted; unbounded gateways and
+/// unsupported consumers are rejected before MLIR construction.
+fn validate_data_dependent_compilation(program: &FlatProgram) -> Result<(), Error> {
+    let mut variables = HashSet::new();
+    for region in program.regions() {
+        for instruction in region.instructions() {
+            if let Operation::DimensionFromScalar(operation) = instruction.operation() {
+                // A static output defines no identity and is checked against its extent.
+                let Some(variable) = operation.output_type().variable() else {
+                    continue;
+                };
+                if variable.bounds().upper().is_none() {
+                    return Err(ProgramError::InvalidArgument {
+                        message: format!(
+                            "data-derived dimension `{variable}` with bounds {} needs a finite upper bound for XLA \
+                             compilation",
+                            variable.bounds(),
+                        ),
+                    }
+                    .into());
+                }
+                variables.insert(variable.clone());
+            }
+        }
+    }
+    if variables.is_empty() {
+        return Ok(());
+    }
+
+    // Dimension arithmetic produces fresh identities, so close the data-derived set transitively over dimension-typed
+    // instruction outputs before classifying the array operations that consume those identities.
+    loop {
+        let count = variables.len();
+        for region in program.regions() {
+            for instruction in region.instructions() {
+                if !instruction.inputs().iter().any(|input| {
+                    references_data_derived_dimension(region.atoms()[input.index()].r#type().as_ref(), &variables)
+                }) {
+                    continue;
+                }
+                for output in instruction.outputs() {
+                    if let ArrayIrType::Dimension(r#type) = region.atoms()[output.index()].r#type().as_ref() {
+                        variables.insert(r#type.variable().unwrap().clone());
+                    }
+                }
+            }
+        }
+        if variables.len() == count {
+            break;
+        }
+    }
+
+    for region in program.regions() {
+        for instruction in region.instructions() {
+            let consumes_data_derived_extent = instruction.inputs().iter().chain(instruction.outputs()).any(|atom| {
+                references_data_derived_dimension(region.atoms()[atom.index()].r#type().as_ref(), &variables)
+            });
+            if consumes_data_derived_extent {
+                if let DataDependentPaddingDiscipline::Unsupported { reason } =
+                    data_dependent_padding_discipline(instruction.operation())
+                {
+                    return Err(ProgramError::UnsupportedOperation {
+                        message: format!(
+                            "operation `{}` cannot consume data-derived dimensions during XLA lowering because \
+                             {reason}",
+                            instruction.operation().name(),
+                        ),
+                    }
+                    .into());
+                }
+            }
+        }
+    }
+    Ok(())
+}
+
+/// Overlays the selected multi-device execution mode on the base [`CompilationOptions`] template. Static programs
+/// use Shardy SPMD partitioning, while bounded-dynamic programs use one fully replicated executable replica per
+/// device because Shardy does not yet accept dynamic tensors.
+pub(super) fn jit_compilation_options(
+    base: &CompilationOptions,
+    device_count: usize,
+    use_shardy_partitioner: bool,
+    feedback_directed_profile: Option<&FeedbackDirectedProfile>,
+) -> CompilationOptions {
+    use ryft_pjrt::protos::ExecutableCompilationOptions;
+    let mut options = base.clone();
+    let exec_options = options.executable_build_options.get_or_insert_with(ExecutableCompilationOptions::default);
+    if exec_options.device_ordinal == 0 {
+        exec_options.device_ordinal = -1;
+    }
+    exec_options.replica_count = if use_shardy_partitioner { 1 } else { device_count as i64 };
+    exec_options.partition_count = if use_shardy_partitioner { device_count as i64 } else { 1 };
+    exec_options.use_spmd_partitioning = use_shardy_partitioner;
+    exec_options.use_shardy_partitioner = use_shardy_partitioner;
+    if let Some(profile) = feedback_directed_profile {
+        exec_options.fdo_profile = profile.bytes().to_vec();
+        options.profile_version = profile.version();
+    }
+    options
+}
+
+/// Encodes compilation options deterministically even though Prost represents protobuf maps as randomly seeded
+/// `HashMap`s. Map entries are removed from a clone before normal protobuf encoding and appended as length-delimited,
+/// path-qualified records sorted by their encoded keys and values.
+pub(super) fn canonical_compilation_options_bytes(options: &CompilationOptions) -> Vec<u8> {
+    use ryft_pjrt::protos::{AutoTuneReferenceKey, AutoTuneResultKey};
+
+    fn append_record(output: &mut Vec<u8>, path: &[u8], mut entries: Vec<(Vec<u8>, Vec<u8>)>) {
+        entries.sort_unstable();
+        output.extend_from_slice(&(path.len() as u64).to_le_bytes());
+        output.extend_from_slice(path);
+        output.extend_from_slice(&(entries.len() as u64).to_le_bytes());
+        for (key, value) in entries {
+            output.extend_from_slice(&(key.len() as u64).to_le_bytes());
+            output.extend_from_slice(key.as_slice());
+            output.extend_from_slice(&(value.len() as u64).to_le_bytes());
+            output.extend_from_slice(value.as_slice());
+        }
+    }
+
+    fn drain_algorithm_map(output: &mut Vec<u8>, path: &[u8], algorithm: &mut ryft_pjrt::protos::AutoTuneAlgorithmKey) {
+        append_record(
+            output,
+            path,
+            std::mem::take(&mut algorithm.tuning_knobs)
+                .into_iter()
+                .map(|(key, value)| (key.to_le_bytes().to_vec(), value.to_le_bytes().to_vec()))
+                .collect(),
+        );
+    }
+
+    let mut options = options.clone();
+    let mut maps = Vec::new();
+    append_record(
+        &mut maps,
+        b"compilation.environment_option_overrides",
+        std::mem::take(&mut options.environment_option_overrides)
+            .into_iter()
+            .map(|(key, value)| (key.into_bytes(), value.encode_to_vec()))
+            .collect(),
+    );
+    if let Some(debug_options) =
+        options.executable_build_options.as_mut().and_then(|options| options.debug_options.as_mut())
+    {
+        append_record(
+            &mut maps,
+            b"executable.debug.analytical_latency_estimator",
+            std::mem::take(&mut debug_options.xla_gpu_analytical_latency_estimator_options)
+                .into_iter()
+                .map(|(key, value)| (key.into_bytes(), value.into_bytes()))
+                .collect(),
+        );
+        append_record(
+            &mut maps,
+            b"executable.debug.experimental_cost_model_gemm_tiling",
+            std::mem::take(&mut debug_options.xla_gpu_experimental_cost_model_gemm_tiling_options)
+                .into_iter()
+                .map(|(key, value)| (key.into_bytes(), value.into_bytes()))
+                .collect(),
+        );
+        append_record(
+            &mut maps,
+            b"executable.debug.backend_extra_options",
+            std::mem::take(&mut debug_options.xla_backend_extra_options)
+                .into_iter()
+                .map(|(key, value)| (key.into_bytes(), value.into_bytes()))
+                .collect(),
+        );
+    }
+    if let Some(target) = options.target_config.as_mut() {
+        if let Some(device) = target.gpu_device_information.as_mut() {
+            for (name, description) in [
+                (b"target.device.scalar_rates".as_slice(), device.scalar_unit_description.as_mut()),
+                (b"target.device.matrix_rates".as_slice(), device.matrix_unit_description.as_mut()),
+            ] {
+                if let Some(description) = description {
+                    append_record(
+                        &mut maps,
+                        name,
+                        std::mem::take(&mut description.rate_information)
+                            .into_iter()
+                            .map(|(key, value)| (key.to_le_bytes().to_vec(), value.encode_to_vec()))
+                            .collect(),
+                    );
+                }
+            }
+        }
+        if let Some(autotune_results) = target.autotune_results.as_mut() {
+            for (index, entry) in autotune_results.results.iter_mut().enumerate() {
+                let Some(result) = entry.result.as_mut() else {
+                    continue;
+                };
+                if let Some(AutoTuneResultKey::Algorithm(algorithm)) = result.key.as_mut() {
+                    drain_algorithm_map(&mut maps, format!("target.autotune.{index}.algorithm").as_bytes(), algorithm);
+                }
+                if let Some(AutoTuneReferenceKey::ReferenceAlgorithm(algorithm)) =
+                    result.failure.as_mut().and_then(|failure| failure.key.as_mut())
+                {
+                    drain_algorithm_map(
+                        &mut maps,
+                        format!("target.autotune.{index}.reference_algorithm").as_bytes(),
+                        algorithm,
+                    );
+                }
+            }
+        }
+    }
+
+    let protobuf = options.encode_to_vec();
+    let mut bytes = b"RYFT_XLA_COMPILATION_OPTIONS_V1".to_vec();
+    bytes.extend_from_slice(&(protobuf.len() as u64).to_le_bytes());
+    bytes.extend_from_slice(protobuf.as_slice());
+    bytes.extend_from_slice(maps.as_slice());
+    bytes
+}
+
+#[cfg(test)]
+mod tests {
+    use std::sync::Arc;
+
+    use indoc::indoc;
+    use pretty_assertions::assert_eq;
+    #[cfg(test)]
+    use ryft_core::Array as CoreArray;
+    use ryft_core::{
+        AddOperation, ArgMaxOperation, ArgMinOperation, ArrayIrType, ArrayOperation, ArrayReferenceTransform,
+        ArrayReferenceTransformIndex, ArraySliceAxis, ArrayType, BatchAxis, CaptureReference, CompilationCacheDomain,
+        CompilationDomain, CompilationTracer, Compile, CompiledFunctionDispatcher, ConditionOperation,
+        ConstantOperation, Context, CotangentDestinationKind, CumulativeKind, CumulativeOperation, CustomCallOperation,
+        DataType, Device, DeviceMesh, Dimension as CoreDimension, DimensionAddOperation, DimensionBounds,
+        DimensionFromScalarOperation, DimensionOperation, DimensionSizeOperation, DimensionToScalarOperation,
+        DimensionType, DimensionValue, DimensionVariable, DomainTracingContext, DotDimensionNumbers,
+        DynamicBroadcastOperation, DynamicReshapeOperation, DynamicSliceOperation, IotaOperation, Layout, LogicalMesh,
+        Memory, MeshAxis, MeshAxisType, MulOperation, NegOperation, OneOperation, Operation as CoreOperation,
+        Placeholder, PrintOperation, ProgramError, Provenance, ProvenanceScope, RaggedDotDimensionNumbers,
+        RaggedDotOperation, RandomAlgorithm, ReduceOperation, ReductionKind, ReferenceAddUpdate,
+        ReferenceAddUpdateOperation, ReferenceFreeze, ReferenceFreezeOperation, ReferenceNew, ReferenceNewOperation,
+        ReferenceRead, ReferenceReadOperation, ReferenceSwapOperation, ReferenceType, ReferenceWrite,
+        ReferenceWriteOperation, RngBitGeneratorOperation, ScaledDotOperation, ScanOperation, ScatterDimensionNumbers,
+        ScatterOperation, ScatterReductionKind, Shape, ShardMapBoundary, ShardMapOperation, ShardMapOptions, Sharding,
+        ShardingDimension, SliceOperation, SortDirection, StagedFunction as CoreStagedFunction, StaticShape,
+        TiledLayout, Typed, Value as CoreValue, ValueProjection, WhileOperation, batch, shard_map,
+    };
+    use ryft_pjrt::protos::CompilationOptions;
+    use ryft_pjrt::{ClientOptions, CpuClientOptions, load_cpu_plugin};
+
+    use crate::arrays_v0::host::materialize_dense_array_bytes;
+    use crate::domains::Tracer;
+    use crate::domains::persistence::PERSISTENT_KEY_SCHEMA_VERSION;
+    use crate::domains::sessions::Session;
+    use crate::domains::tests::*;
+    use crate::experimental::ops::{Constant, FlatProgram, Operation, ProgramBuilder};
+    use crate::experimental::tracing::ArrayTracer;
+    use crate::operations::jit_call::JitCallOperation;
+    use crate::tests::{execution_client, values_from_bytes, values_to_bytes};
+    use crate::{Array, Error, FromPjrt, RaggedDotLoweringStrategy, ToPjrt, Value};
+
+    use super::*;
+
+    #[test]
+    fn test_production_array_ir_lowering_executes_dynamic_dimension_arithmetic_broadcast_and_reshape() {
+        let client = execution_client();
+        let mesh = domain_mesh(&client, "x", 1);
+        let domain = Session::new(&client).domain().with_mesh(mesh.clone());
+        let extent = DimensionVariable::new("extent", DimensionBounds::new(1, Some(8)).unwrap());
+        let vector_type = ArrayType::new(DataType::F32, Shape::new(vec![extent.into()]))
+            .with_sharding(Sharding::replicated(mesh.logical_mesh().clone(), 1))
+            .unwrap();
+        let scalar_type = replicated_scalar_type(&mesh, DataType::F32);
+        let build_program = |vector_type: &ArrayType, increment: usize| {
+            let mut builder = ProgramBuilder::new();
+            let vector = builder.add_input(vector_type.clone().into());
+            let scalar = builder.add_input(scalar_type.clone().into());
+            let size_operation = DimensionSizeOperation::new(vector_type, 0).unwrap();
+            let size = builder.add_instruction(size_operation.clone(), Vec::new(), vec![vector], None).unwrap()[0];
+            let increment_value = DimensionValue::constant(increment).unwrap();
+            let increment = builder
+                .add_instruction(
+                    Operation::Dimension(DimensionOperation::Constant(ConstantOperation::new(increment_value.clone()))),
+                    Vec::new(),
+                    Vec::new(),
+                    None,
+                )
+                .unwrap()[0];
+            let add =
+                DimensionAddOperation::new(size_operation.output_type(), increment_value.r#type().as_ref()).unwrap();
+            let output_extent = builder
+                .add_instruction(
+                    Operation::Dimension(DimensionOperation::Add(add)),
+                    Vec::new(),
+                    vec![size, increment],
+                    None,
+                )
+                .unwrap()[0];
+            let broadcast = builder
+                .add_instruction(
+                    DynamicBroadcastOperation::new(Vec::new()),
+                    Vec::new(),
+                    vec![scalar, output_extent],
+                    None,
+                )
+                .unwrap()[0];
+            let reshaped = builder
+                .add_instruction(DynamicReshapeOperation::new(), Vec::new(), vec![broadcast, output_extent], None)
+                .unwrap()[0];
+            builder
+                .build::<Vec<Constant>, Vec<Constant>>(
+                    vec![reshaped],
+                    vec![Placeholder, Placeholder],
+                    vec![Placeholder],
+                )
+                .unwrap()
+        };
+
+        let dynamic_program = build_program(&vector_type, 1);
+        let dynamic_lowering = domain.lower_program(&dynamic_program, 0, &Options::new(mesh.clone())).unwrap();
+        assert!(dynamic_lowering.stable_hlo().contains("stablehlo.get_dimension_size"));
+        assert!(dynamic_lowering.stable_hlo().contains("stablehlo.add"));
+        assert!(dynamic_lowering.stable_hlo().contains("stablehlo.broadcast_in_dim"));
+        assert!(dynamic_lowering.stable_hlo().contains("stablehlo.set_dimension_size"));
+        assert!(dynamic_lowering.stable_hlo().contains("stablehlo.dynamic_reshape"));
+
+        // Persistent compilation identity canonicalizes diagnostic-only variable names while retaining dimension-SSA
+        // semantics. Rebuilding the same graph over a fresh nominal identity therefore shares its compilation key,
+        // while changing the dimension arithmetic does not.
+        let renamed_extent = DimensionVariable::new("renamed_extent", DimensionBounds::new(1, Some(8)).unwrap());
+        let renamed_type = ArrayType::new(DataType::F32, Shape::new(vec![renamed_extent.into()]))
+            .with_sharding(Sharding::replicated(mesh.logical_mesh().clone(), 1))
+            .unwrap();
+        let renamed_program = build_program(&renamed_type, 1);
+        let renamed_lowering = domain.lower_program(&renamed_program, 0, &Options::new(mesh.clone())).unwrap();
+        let different_program = build_program(&vector_type, 2);
+        let different_lowering = domain.lower_program(&different_program, 0, &Options::new(mesh.clone())).unwrap();
+        let dynamic_key = domain.compilation_key(&dynamic_lowering).unwrap();
+        assert_eq!(dynamic_key, domain.compilation_key(&renamed_lowering).unwrap());
+        assert_ne!(dynamic_key, domain.compilation_key(&different_lowering).unwrap());
+
+        // CPU PJRT does not provide the bounded-input `PadToStatic` custom call. Execute the same first-class
+        // dimension graph with a static input axis; this changes only dimension-size lowering from a runtime read to
+        // its exact scalar constant and still exercises dimension SSA arithmetic and both mixed shape operations.
+        let static_vector_type = replicated_vector_type(&mesh, 3);
+        let static_program = build_program(&static_vector_type, 1);
+        let static_lowering = domain.lower_program(&static_program, 0, &Options::new(mesh.clone())).unwrap();
+        let compiled = domain.compile_program(&static_lowering).unwrap();
+        let vector = Array::from_host_buffer(
+            &domain,
+            static_vector_type,
+            mesh.clone(),
+            values_to_bytes::<f32>(&[1.0, 2.0, 3.0]),
+        )
+        .unwrap();
+        let scalar = f32_scalar(&domain, &mesh, 7.0);
+        let outputs = domain.execute_program(&compiled, vec![vector, scalar]).unwrap();
+        assert_eq!(outputs.len(), 1);
+        assert_eq!(outputs[0].shape().as_slice(), &[4]);
+        assert_eq!(read_f32s(&client, &outputs[0]), vec![7.0; 4]);
+    }
+
+    #[test]
+    fn test_production_array_ir_lowering_executes_dynamic_slice_with_dimensions() {
+        let client = execution_client();
+        let mesh = domain_mesh(&client, "x", 1);
+        let domain = Session::new(&client).domain().with_mesh(mesh.clone());
+        let input_type = replicated_vector_type(&mesh, 6);
+        let mut builder = ProgramBuilder::new();
+        let input = builder.add_input(input_type.clone().into());
+        let start = builder
+            .add_instruction(
+                Operation::Dimension(DimensionOperation::Constant(ConstantOperation::new(
+                    DimensionValue::constant(1).unwrap(),
+                ))),
+                Vec::new(),
+                Vec::new(),
+                None,
+            )
+            .unwrap()[0];
+        let size = builder
+            .add_instruction(
+                Operation::Dimension(DimensionOperation::Constant(ConstantOperation::new(
+                    DimensionValue::constant(3).unwrap(),
+                ))),
+                Vec::new(),
+                Vec::new(),
+                None,
+            )
+            .unwrap()[0];
+        let output = builder
+            .add_instruction(
+                Operation::DynamicSlice(
+                    DynamicSliceOperation::<ArrayIrType>::from_rank(1).with_strides(vec![2]).unwrap(),
+                ),
+                Vec::new(),
+                vec![input, start, size],
+                None,
+            )
+            .unwrap()[0];
+        let program = builder
+            .build::<Vec<Constant>, Vec<Constant>>(vec![output], vec![Placeholder], vec![Placeholder])
+            .unwrap();
+
+        let lowering = domain.lower_program(&program, 0, &Options::new(mesh.clone())).unwrap();
+        assert!(lowering.stable_hlo().contains("stablehlo.dynamic_slice"));
+        assert!(lowering.stable_hlo().contains("stablehlo.slice"));
+        assert!(!lowering.stable_hlo().contains("stablehlo.real_dynamic_slice"));
+        let compiled = domain.compile_program(&lowering).unwrap();
+        let input =
+            Array::from_host_buffer(&domain, input_type, mesh, values_to_bytes::<f32>(&[0.0, 1.0, 2.0, 3.0, 4.0, 5.0]))
+                .unwrap();
+        let outputs = domain.execute_program(&compiled, vec![input]).unwrap();
+
+        assert_eq!(outputs.len(), 1);
+        assert_eq!(outputs[0].shape().as_slice(), &[3]);
+        assert_eq!(read_f32s(&client, &outputs[0]), vec![1.0, 3.0, 5.0]);
+    }
+
+    #[test]
+    fn test_compilation_domain_impl_round_trips_through_core_pipeline() {
+        use crate::tests::{values_from_bytes, values_to_bytes};
+        use ryft_core::Sin;
+
+        let plugin = load_cpu_plugin().unwrap();
+        let client = plugin
+            .client(ClientOptions::CPU(CpuClientOptions { device_count: Some(1), ..Default::default() }))
+            .unwrap();
+        let mesh = domain_mesh(&client, "x", 1);
+        let engine = Session::new(&client).domain().with_mesh(mesh.clone());
+
+        let input_type = ArrayType::new(DataType::F32, Shape::new(vec![CoreDimension::Static(4)]))
+            .with_sharding(Sharding::replicated(mesh.logical_mesh().clone(), 1))
+            .unwrap();
+        let options = Options::new(mesh.clone());
+        let staged = crate::jit::stage::<_, ArrayType, ArrayType>(|x| x.sin().unwrap(), input_type.clone(), options)
+            .unwrap()
+            .into_inner();
+        let compiled: ryft_core::compilation::CompiledFunction<Domain<'_>, ArrayIrType, ArrayIrType> =
+            staged.lower(&engine).unwrap().compile(&engine).unwrap();
+
+        // Round-trip a small input through the new CompilationDomain-driven pipeline.
+        let values = [0.0f32, 0.5, 1.0, 1.5];
+        let source = Array::from_host_buffer(
+            &engine,
+            input_type.clone(),
+            mesh.clone(),
+            values_to_bytes::<f32>(&values).as_slice(),
+        )
+        .unwrap();
+        let array = compiled.executable().execute(&engine, Value::Array(source)).unwrap();
+        let Value::Array(array) = array else {
+            panic!("array-only compiled function returned a first-class dimension");
+        };
+        array.block_until_ready().unwrap();
+
+        let device_id = client.addressable_devices().unwrap()[0].id().unwrap();
+        let shard_bytes = array
+            .device_shard(device_id)
+            .unwrap()
+            .buffer()
+            .unwrap()
+            .copy_to_host(None)
+            .unwrap()
+            .r#await()
+            .unwrap();
+        let observed = values_from_bytes::<f32>(shard_bytes.as_slice());
+        for (got, &input) in observed.iter().zip(values.iter()) {
+            assert!((got - input.sin()).abs() < 1e-5, "got {got}, expected ~{}", input.sin());
+        }
+
+        // Equivalent lowerings share the entry populated by the first compilation, independent of source location.
+        let program_count_before = engine.program_count();
+        for _ in 0..3 {
+            let staged = crate::jit::stage::<_, ArrayType, ArrayType>(
+                |x| x.sin().unwrap(),
+                input_type.clone(),
+                Options::new(mesh.clone()),
+            )
+            .unwrap()
+            .into_inner();
+            let _: ryft_core::compilation::CompiledFunction<Domain<'_>, ArrayIrType, ArrayIrType> =
+                staged.lower(&engine).unwrap().compile(&engine).unwrap();
+        }
+        assert_eq!(
+            engine.program_count(),
+            program_count_before,
+            "equivalent repeat compilations should reuse the existing cache entry",
+        );
+    }
+
+    #[test]
+    #[allow(deprecated)] // Inspect the actual buffer, independently of the declared array type.
+    fn test_lowering_preserves_cast_layouts() {
+        use ryft_core::{Cast, CastOperation};
+
+        let client = execution_client();
+        let mesh = domain_mesh(&client, "x", 1);
+        let domain = Session::new(&client).domain().with_mesh(mesh.clone());
+        let layout = Layout::Tiled(TiledLayout::new(vec![0, 1], vec![]));
+        let actual_type = ArrayType::new_static(DataType::F64, [2, 3]);
+        let values = vec![1f64, 2., 3., 4., 5., 6.];
+        let input =
+            Array::from_host_buffer(&domain, actual_type.clone(), mesh.clone(), values_to_bytes(&values)).unwrap();
+        let target = input.r#type().into_owned().with_layout(layout.clone());
+        let consumer = crate::jit::compile::<_, ArrayType, ArrayType>(
+            |input| input.clone() + input,
+            input.r#type().into_owned(),
+            &domain,
+            mesh.clone(),
+        )
+        .unwrap();
+        for output in [input.cast(target.clone(), &[]).unwrap(), input.cast_unchecked(target, &[]).unwrap()] {
+            assert_eq!(
+                output.addressable_shards().next().unwrap().buffer().unwrap().layout(),
+                Ok(layout.to_pjrt().unwrap())
+            );
+            // The next executable must consume the actual column-major buffer and return dense logical values.
+            let consumed = output.cast(input.r#type().into_owned(), &[]).unwrap();
+            assert_eq!(read_f64s(&client, &consumed), values);
+            assert_eq!(values_from_bytes::<f64>(&materialize_dense_array_bytes(&output).unwrap()), values);
+            let destination_mesh = domain_mesh(&client, "destination", 1);
+            let moved = output
+                .to_placement(
+                    &domain,
+                    crate::arrays_v0::DevicePutTarget::Placement {
+                        sharding: Sharding::replicated(destination_mesh.logical_mesh().clone(), 2),
+                        mesh: destination_mesh,
+                    },
+                )
+                .unwrap();
+            assert_eq!(moved.layout(), Some(&layout));
+            assert_eq!(values_from_bytes::<f64>(&materialize_dense_array_bytes(&moved).unwrap()), values);
+            // A raw buffer may have a known physical layout even when its logical type leaves that field open.
+            let opaque = Array::from_addressable_buffers(
+                &domain,
+                output.r#type().into_owned().with_layout(None),
+                mesh.clone(),
+                vec![
+                    output
+                        .addressable_shards()
+                        .next()
+                        .unwrap()
+                        .buffer()
+                        .unwrap()
+                        .copy_to_device(client.addressable_devices().unwrap().remove(0))
+                        .unwrap(),
+                ],
+            )
+            .unwrap();
+            let doubled = domain.interpret(&consumer.executable_function(), opaque).unwrap();
+            assert_eq!(read_f64s(&client, &doubled), vec![2., 4., 6., 8., 10., 12.]);
+            let doubled = domain.interpret(&consumer.executable_function(), output).unwrap();
+            assert_eq!(read_f64s(&client, &doubled), vec![2., 4., 6., 8., 10., 12.]);
+        }
+
+        // A tuple mixes an erased zero, a constrained result and an unconstrained result. The dynamic case also
+        // appends hidden extent results. Check the actual buffers rather than trusting their reconstructed types.
+        let extent = DimensionVariable::new("extent", DimensionBounds::new(0, Some(5)).unwrap());
+        let zero_type = ArrayType::new_static(DataType::Zero, [2, 3]);
+        let zero = Array::from_host_buffer(&domain, zero_type.clone(), mesh.clone(), []).unwrap();
+        for source_type in [actual_type, ArrayType::new(DataType::F64, Shape::new(vec![extent.into(), 3.into()]))] {
+            for constructor in [CastOperation::<ArrayIrType>::checked, CastOperation::<ArrayIrType>::unchecked] {
+                let mut builder = ProgramBuilder::new();
+                let source = builder.add_input(source_type.clone().into());
+                let zero_input = builder.add_input(zero_type.clone().into());
+                let output = builder
+                    .add_instruction(
+                        constructor(
+                            input.r#type().into_owned().with_layout(layout.clone()).into(),
+                            vec![source_type.clone().into()],
+                        )
+                        .unwrap(),
+                        vec![],
+                        vec![source],
+                        None,
+                    )
+                    .unwrap()[0];
+                let program = builder
+                    .build::<Vec<Constant>, Vec<Constant>>(
+                        vec![zero_input, output, source],
+                        vec![Placeholder; 2],
+                        vec![Placeholder; 3],
+                    )
+                    .unwrap();
+                let lowered = domain.lower_program(&program, 0, &Options::new(mesh.clone())).unwrap();
+                assert_eq!(lowered.signature.input_mapping(), &[Some(0), None]);
+                assert_eq!(lowered.signature.output_mapping(), &[None, Some(0), Some(1)]);
+                let compiled = domain.compile_program(&lowered).unwrap();
+                let outputs = domain.execute_program(&compiled, vec![input.clone(), zero.clone()]).unwrap();
+                assert_eq!(outputs[1].shape().as_slice(), &[2, 3]);
+                assert_eq!(outputs[1].layout(), Some(&layout));
+                assert_eq!(
+                    outputs[1].addressable_shards().next().unwrap().buffer().unwrap().layout(),
+                    Ok(layout.to_pjrt().unwrap())
+                );
+                assert_eq!(values_from_bytes::<f64>(&materialize_dense_array_bytes(&outputs[1]).unwrap()), values);
+                assert_eq!(read_f64s(&client, &outputs[2]), values);
+                assert!(outputs[0].addressable_shards().all(|shard| shard.buffer().is_none()));
+            }
+        }
+    }
+
+    #[test]
+    #[allow(deprecated)] // Verify actual result storage alongside the hidden extent and effect-token ABI.
+    fn test_lowering_preserves_dynamic_row_major_layout_with_ordered_io() {
+        use ryft_core::CastOperation;
+
+        use crate::operations::debugging::with_captured_prints;
+
+        let client = execution_client();
+        let mesh = domain_mesh(&client, "x", 1);
+        let domain = Session::new(&client).domain().with_mesh(mesh.clone());
+        let extent = DimensionVariable::new("extent", DimensionBounds::new(0, Some(5)).unwrap());
+        let source_type = ArrayType::new(DataType::F64, Shape::new(vec![extent.into(), 3.into()]));
+        let layout = Layout::Tiled(TiledLayout::new(vec![1, 0], vec![]));
+        let mut builder = ProgramBuilder::new();
+        let input = builder.add_input(source_type.clone().into());
+        let output = builder
+            .add_instruction(
+                CastOperation::<ArrayIrType>::checked(
+                    source_type.clone().with_layout(layout.clone()).into(),
+                    vec![source_type.into()],
+                )
+                .unwrap(),
+                vec![],
+                vec![input],
+                None,
+            )
+            .unwrap()[0];
+        let scalar = builder.add_input(ArrayType::scalar(DataType::F64).into());
+        builder
+            .add_instruction(PrintOperation::<ArrayType>::new("layout"), vec![], vec![scalar], None)
+            .unwrap();
+        let program = builder
+            .build::<Vec<Constant>, Vec<Constant>>(vec![output], vec![Placeholder; 2], vec![Placeholder])
+            .unwrap();
+        let lowered = domain.lower_program(&program, 0, &Options::new(mesh.clone())).unwrap();
+        assert_eq!(lowered.signature.ordered_io_output_index(), Some(2));
+        let compiled = domain.compile_program(&lowered).unwrap();
+        for rows in [2, 0] {
+            let values = (1..=rows * 3).map(|value| value as f64).collect::<Vec<_>>();
+            let input = Array::from_host_buffer(
+                &domain,
+                ArrayType::new_static(DataType::F64, [rows, 3]),
+                mesh.clone(),
+                values_to_bytes(&values),
+            )
+            .unwrap();
+            let scalar = Array::from_host_buffer(
+                &domain,
+                ArrayType::scalar(DataType::F64),
+                mesh.clone(),
+                values_to_bytes(&[1f64]),
+            )
+            .unwrap();
+            let (outputs, prints) =
+                with_captured_prints(|| domain.execute_program(&compiled, vec![input, scalar]).unwrap());
+            assert_eq!(outputs[0].shape().as_slice(), &[rows, 3]);
+            assert_eq!(
+                outputs[0].addressable_shards().next().unwrap().buffer().unwrap().layout(),
+                Ok(layout.to_pjrt().unwrap()),
+            );
+            assert_eq!(values_from_bytes::<f64>(&materialize_dense_array_bytes(&outputs[0]).unwrap()), values);
+            assert_eq!(prints.len(), 1);
+        }
+    }
+
+    #[test]
+    #[allow(deprecated)] // Inspect per-device storage in addition to the global type.
+    fn test_lowering_preserves_cast_layouts_on_multiple_cpu_devices() {
+        use ryft_core::Cast;
+
+        let plugin = load_cpu_plugin().unwrap();
+        let client = plugin
+            .client(ClientOptions::CPU(CpuClientOptions { device_count: Some(2), ..Default::default() }))
+            .unwrap();
+        let mesh = domain_mesh(&client, "x", 2);
+        let domain = Session::new(&client).domain().with_mesh(mesh.clone());
+        let input_type = ArrayType::new_static(DataType::F64, [4, 3])
+            .with_sharding(
+                Sharding::new(
+                    mesh.logical_mesh().clone(),
+                    vec![ShardingDimension::sharded(["x"]), ShardingDimension::replicated()],
+                )
+                .unwrap(),
+            )
+            .unwrap();
+        let values = (1..=12).map(|value| value as f64).collect::<Vec<_>>();
+        let input =
+            Array::from_host_buffer(&domain, input_type.clone(), mesh.clone(), values_to_bytes(&values)).unwrap();
+        let layout = Layout::Tiled(TiledLayout::new(vec![0, 1], vec![]));
+        let target = input_type.with_layout(layout.clone());
+        let output = input.cast(target, &[]).unwrap();
+        for shard in output.addressable_shards() {
+            assert_eq!(shard.shape().as_slice(), &[2, 3]);
+            assert_eq!(shard.buffer().unwrap().layout(), Ok(layout.to_pjrt().unwrap()));
+        }
+        assert_eq!(values_from_bytes::<f64>(&materialize_dense_array_bytes(&output).unwrap()), values);
+    }
+
+    #[test]
+    fn test_data_derived_compilation_rejects_unbounded_and_opaque_consumers() {
+        let plugin = load_cpu_plugin().unwrap();
+        let client = plugin
+            .client(ClientOptions::CPU(CpuClientOptions { device_count: Some(1), ..Default::default() }))
+            .unwrap();
+        let mesh = domain_mesh(&client, "x", 1);
+        let domain = Session::new(&client).domain().with_mesh(mesh.clone());
+        let size_type = replicated_scalar_type(&mesh, DataType::I64);
+
+        let mut builder = ProgramBuilder::new();
+        let size = builder.add_input(size_type.clone().into());
+        let extent = DimensionVariable::new("unbounded", DimensionBounds::unbounded());
+        let dimension = builder
+            .add_instruction(DimensionFromScalarOperation::new(extent.into()), Vec::new(), vec![size], None)
+            .unwrap()[0];
+        let output = builder.add_instruction(DimensionToScalarOperation, Vec::new(), vec![dimension], None).unwrap()[0];
+        let program = builder
+            .build::<Vec<Constant>, Vec<Constant>>(vec![output], vec![Placeholder], vec![Placeholder])
+            .unwrap();
+        assert!(matches!(
+            domain.lower_program(&program, 0, &Options::new(mesh.clone())),
+            Err(Error::Core(ryft_core::Error::Program(ProgramError::InvalidArgument { message })))
+                if message == "data-derived dimension `unbounded` with bounds [0, ∞) needs a finite upper bound \
+                    for XLA compilation",
+        ));
+
+        let extent = DimensionVariable::new("extent", DimensionBounds::new(1, Some(5)).unwrap());
+        let dynamic_type = ArrayType::new(DataType::F32, Shape::new(vec![CoreDimension::Dynamic(extent.clone())]));
+        let mut builder = ProgramBuilder::new();
+        let size = builder.add_input(size_type.clone().into());
+        let dimension = builder
+            .add_instruction(DimensionFromScalarOperation::new(extent.into()), Vec::new(), vec![size], None)
+            .unwrap()[0];
+        let input = builder
+            .add_instruction(IotaOperation::new(dynamic_type.clone(), 0).unwrap(), Vec::new(), vec![dimension], None)
+            .unwrap()[0];
+        let output = builder
+            .add_instruction(
+                CustomCallOperation::new("ryft.test.opaque_dynamic", vec![dynamic_type]),
+                Vec::new(),
+                vec![input, dimension],
+                None,
+            )
+            .unwrap()[0];
+        let program = builder
+            .build::<Vec<Constant>, Vec<Constant>>(vec![output], vec![Placeholder], vec![Placeholder])
+            .unwrap();
+        assert!(matches!(
+            domain.lower_program(&program, 0, &Options::new(mesh.clone())),
+            Err(Error::Core(ryft_core::Error::Program(ProgramError::UnsupportedOperation { message })))
+                if message == "operation `custom_call` cannot consume data-derived dimensions during XLA lowering \
+                    because custom-call physical-padding semantics are opaque",
+        ));
+
+        let extent = DimensionVariable::new("extent", DimensionBounds::new(1, Some(5)).unwrap());
+        let dynamic_type = ArrayType::new(DataType::F32, Shape::new(vec![CoreDimension::Dynamic(extent.clone())]));
+        let mut builder = ProgramBuilder::new();
+        let size = builder.add_input(size_type.clone().into());
+        let dimension = builder
+            .add_instruction(DimensionFromScalarOperation::new(extent.into()), Vec::new(), vec![size], None)
+            .unwrap()[0];
+        let input = builder
+            .add_instruction(IotaOperation::new(dynamic_type, 0).unwrap(), Vec::new(), vec![dimension], None)
+            .unwrap()[0];
+        let output = builder
+            .add_instruction(ReduceOperation::new(vec![0], ReductionKind::Mean), Vec::new(), vec![input], None)
+            .unwrap()[0];
+        let program = builder
+            .build::<Vec<Constant>, Vec<Constant>>(vec![output], vec![Placeholder], vec![Placeholder])
+            .unwrap();
+        assert!(matches!(
+            domain.lower_program(&program, 0, &Options::new(mesh.clone())),
+            Err(Error::Core(ryft_core::Error::Program(ProgramError::UnsupportedOperation { message })))
+                if message == "operation `reduce` cannot consume data-derived dimensions during XLA lowering \
+                    because mean over a dynamically sized reduction axis is not supported by the XLA lowering",
+        ));
+
+        // `print` renders whatever the physical buffer holds, so the padded suffix of a bounded-dynamic operand would
+        // become observable.
+        let extent = DimensionVariable::new("extent", DimensionBounds::new(1, Some(5)).unwrap());
+        let dynamic_type = ArrayType::new(DataType::F32, Shape::new(vec![CoreDimension::Dynamic(extent.clone())]));
+        let mut builder = ProgramBuilder::new();
+        let size = builder.add_input(size_type.clone().into());
+        let dimension = builder
+            .add_instruction(DimensionFromScalarOperation::new(extent.into()), Vec::new(), vec![size], None)
+            .unwrap()[0];
+        let input = builder
+            .add_instruction(IotaOperation::new(dynamic_type, 0).unwrap(), Vec::new(), vec![dimension], None)
+            .unwrap()[0];
+        let output = builder
+            .add_instruction(PrintOperation::<ArrayType>::new("value"), Vec::new(), vec![input], None)
+            .unwrap()[0];
+        let program = builder
+            .build::<Vec<Constant>, Vec<Constant>>(vec![output], vec![Placeholder], vec![Placeholder])
+            .unwrap();
+        assert!(matches!(
+            domain.lower_program(&program, 0, &Options::new(mesh.clone())),
+            Err(Error::Core(ryft_core::Error::Program(ProgramError::UnsupportedOperation { message })))
+                if message == "operation `print` cannot consume data-derived dimensions during XLA lowering because \
+                    print exposes the physical representation of its operand",
+        ));
+
+        // Bit generation over a bounded-dynamic result would advance the functional generator state by the physical
+        // upper-bound element count rather than the logical one.
+        let extent = DimensionVariable::new("extent", DimensionBounds::new(1, Some(5)).unwrap());
+        let bits_type = ArrayType::new(DataType::U32, Shape::new(vec![CoreDimension::Dynamic(extent.clone())]));
+        let mut builder = ProgramBuilder::new();
+        let size = builder.add_input(size_type.clone().into());
+        let state = builder.add_input(RandomAlgorithm::ThreeFry.state_type().into());
+        let dimension = builder
+            .add_instruction(DimensionFromScalarOperation::new(extent.into()), Vec::new(), vec![size], None)
+            .unwrap()[0];
+        let output = builder
+            .add_instruction(
+                RngBitGeneratorOperation::<ArrayIrType>::new(RandomAlgorithm::ThreeFry, bits_type),
+                Vec::new(),
+                vec![state, dimension],
+                None,
+            )
+            .unwrap()[1];
+        let program = builder
+            .build::<Vec<Constant>, Vec<Constant>>(vec![output], vec![Placeholder, Placeholder], vec![Placeholder])
+            .unwrap();
+        assert!(matches!(
+            domain.lower_program(&program, 0, &Options::new(mesh.clone())),
+            Err(Error::Core(ryft_core::Error::Program(ProgramError::UnsupportedOperation { message })))
+                if message == "operation `rng_bit_generator` cannot consume data-derived dimensions during XLA \
+                    lowering because random generation advances state according to physical rather than logical \
+                    element count",
+        ));
+
+        // Every scatter combiner is unverified against physical padding, so a data-derived operand extent is rejected
+        // per kind rather than per operation name.
+        let extent = DimensionVariable::new("extent", DimensionBounds::new(1, Some(5)).unwrap());
+        let dynamic_type = ArrayType::new(DataType::F32, Shape::new(vec![CoreDimension::Dynamic(extent.clone())]));
+        let indices_type =
+            ArrayType::new(DataType::I32, Shape::new(vec![CoreDimension::Static(2), CoreDimension::Static(1)]));
+        let updates_type = ArrayType::new(DataType::F32, Shape::new(vec![CoreDimension::Static(2)]));
+        let mut builder = ProgramBuilder::new();
+        let size = builder.add_input(size_type.into());
+        let indices = builder.add_input(indices_type.into());
+        let updates = builder.add_input(updates_type.into());
+        let dimension = builder
+            .add_instruction(DimensionFromScalarOperation::new(extent.into()), Vec::new(), vec![size], None)
+            .unwrap()[0];
+        let operand = builder
+            .add_instruction(IotaOperation::new(dynamic_type, 0).unwrap(), Vec::new(), vec![dimension], None)
+            .unwrap()[0];
+        let output = builder
+            .add_instruction(
+                ScatterOperation::new(
+                    ScatterDimensionNumbers::new(Vec::new(), vec![0], vec![0]),
+                    ScatterReductionKind::Add,
+                ),
+                Vec::new(),
+                vec![operand, indices, updates],
+                None,
+            )
+            .unwrap()[0];
+        let program = builder
+            .build::<Vec<Constant>, Vec<Constant>>(
+                vec![output],
+                vec![Placeholder, Placeholder, Placeholder],
+                vec![Placeholder],
+            )
+            .unwrap();
+        assert!(matches!(
+            domain.lower_program(&program, 0, &Options::new(mesh)),
+            Err(Error::Core(ryft_core::Error::Program(ProgramError::UnsupportedOperation { message })))
+                if message == "operation `scatter` cannot consume data-derived dimensions during XLA lowering because \
+                    add-scatter padding semantics have not been verified for data-derived dimensions",
+        ));
+    }
+
+    #[test]
+    fn test_input_bound_bucketing_reuses_power_of_two_specializations() {
+        fn trace<'c>(input: CompilationTracer<Domain<'c>>) -> Result<CompilationTracer<Domain<'c>>, Error> {
+            let context = input.context().clone();
+            Ok(context.bind(AddOperation::new(), Vec::new(), &[input.clone(), input])?.remove(0))
+        }
+
+        let plugin = load_cpu_plugin().unwrap();
+        let client = plugin
+            .client(ClientOptions::CPU(CpuClientOptions { device_count: Some(1), ..Default::default() }))
+            .unwrap();
+        let mesh = domain_mesh(&client, "x", 1);
+        let domain = Session::new(&client).domain().with_mesh(mesh.clone());
+        let function: CompiledFunctionDispatcher<Domain<'_>, (), ArrayIrType, ArrayIrType, _> = domain
+            .jit_with_options(
+                |(), input| trace(input),
+                Options::new(mesh.clone()).with_input_bound_bucketing(InputBoundBucketing::PowerOfTwo),
+            );
+        let call = |values: &[f32]| {
+            let input = f32_vector(&domain, &mesh, values);
+            function.execute((), Value::Array(input)).unwrap()
+        };
+
+        let three = call(&[1.0, 2.0, 3.0]);
+        assert_eq!(program_array(&three).shape(), StaticShape::new(vec![3]));
+        assert_eq!(read_f32s(&client, program_array(&three)), vec![2.0, 4.0, 6.0]);
+        let four = call(&[1.0, 2.0, 3.0, 4.0]);
+        assert_eq!(program_array(&four).shape(), StaticShape::new(vec![4]));
+        assert_eq!(read_f32s(&client, program_array(&four)), vec![2.0, 4.0, 6.0, 8.0]);
+        let five = call(&[1.0, 2.0, 3.0, 4.0, 5.0]);
+        assert_eq!(program_array(&five).shape(), StaticShape::new(vec![5]));
+        assert_eq!(read_f32s(&client, program_array(&five)), vec![2.0, 4.0, 6.0, 8.0, 10.0]);
+
+        let statistics = function.statistics();
+        assert_eq!(statistics.dispatch_hits, 1);
+        assert_eq!(statistics.dispatch_misses, 2);
+        assert_eq!(statistics.traces, 2);
+        assert_eq!(statistics.lowerings, 2);
+        assert_eq!(statistics.compilation_requests, 2);
+        assert_eq!(function.specialization_count(), 2);
+        assert_eq!(domain.program_count(), 2);
+    }
+
+    #[test]
+    fn test_input_bound_bucketing_rejects_unsupported_signatures() {
+        let plugin = load_cpu_plugin().unwrap();
+        let single_device_client = plugin
+            .client(ClientOptions::CPU(CpuClientOptions { device_count: Some(1), ..Default::default() }))
+            .unwrap();
+        let single_device_mesh = domain_mesh(&single_device_client, "x", 1);
+        let single_device_domain = Session::new(&single_device_client).domain().with_mesh(single_device_mesh.clone());
+        let dimension_type = DimensionType::new("extent", DimensionBounds::new(1, Some(5)).unwrap());
+        assert!(matches!(
+            single_device_domain.dispatch_signature(
+                vec![dimension_type.clone().into()],
+                &Options::new(single_device_mesh.clone())
+                    .with_input_bound_bucketing(InputBoundBucketing::PowerOfTwo),
+            ),
+            Err(Error::Compilation(CompilationError::InvalidOptions { reason }))
+                if reason == format!(
+                    "input-bound bucketing only supports array inputs, but input 0 has first-class dimension type {}",
+                    dimension_type,
+                ),
+        ));
+        // Exact dispatch admits structural reference types for the opt-in stateful call surface, while bucketed
+        // dispatch rejects them because holder state is not part of the array-only bucketing model.
+        let reference_type = ReferenceType::new(ArrayType::scalar(DataType::F32));
+        let reference_input_types: Arc<[ArrayIrType]> = vec![ArrayIrType::Reference(reference_type.clone())].into();
+        assert_eq!(
+            single_device_domain
+                .dispatch_signature(reference_input_types.to_vec(), &Options::new(single_device_mesh.clone()))
+                .unwrap(),
+            (DispatchKey(DispatchKeyKind::Exact(reference_input_types.clone())), reference_input_types,),
+        );
+        assert!(matches!(
+            single_device_domain.dispatch_signature(
+                vec![ArrayIrType::Reference(reference_type.clone())],
+                &Options::new(single_device_mesh.clone())
+                    .with_input_bound_bucketing(InputBoundBucketing::PowerOfTwo),
+            ),
+            Err(Error::Compilation(CompilationError::UnsupportedReferenceAbi { reason }))
+                if reason == "external reference input 0 does not support input-bound bucketing",
+        ));
+        assert!(matches!(
+            single_device_domain.lower_program(
+                &external_reference_read_program(ArrayType::scalar(DataType::F32)),
+                1,
+                &Options::new(single_device_mesh.clone())
+                    .with_input_bound_bucketing(InputBoundBucketing::PowerOfTwo),
+            ),
+            Err(Error::Compilation(CompilationError::UnsupportedReferenceAbi { reason }))
+                if reason == "external reference inputs do not support input-bound bucketing",
+        ));
+
+        let multi_device_client = plugin
+            .client(ClientOptions::CPU(CpuClientOptions { device_count: Some(2), ..Default::default() }))
+            .unwrap();
+        let multi_device_mesh = domain_mesh(&multi_device_client, "x", 2);
+        let multi_device_domain = Session::new(&multi_device_client).domain().with_mesh(multi_device_mesh.clone());
+        assert!(matches!(
+            multi_device_domain.dispatch_signature(
+                vec![ArrayType::new(DataType::F32, Shape::new(vec![CoreDimension::Static(3)])).into()],
+                &Options::new(multi_device_mesh)
+                    .with_input_bound_bucketing(InputBoundBucketing::PowerOfTwo),
+            ),
+            Err(Error::Compilation(CompilationError::InvalidOptions { reason }))
+                if reason == "input-bound bucketing is unsupported on multi-device meshes because bucketed dynamic \
+                    signatures require disabling the Shardy partitioner",
+        ));
+
+        // Multi-device bucketing is rejected before inspecting individual input kinds.
+        assert!(matches!(
+            multi_device_domain.dispatch_signature(
+                vec![ArrayIrType::Reference(reference_type.clone())],
+                &Options::new(domain_mesh(&multi_device_client, "x", 2))
+                    .with_input_bound_bucketing(InputBoundBucketing::PowerOfTwo),
+            ),
+            Err(Error::Compilation(CompilationError::InvalidOptions { reason }))
+                if reason == "input-bound bucketing is unsupported on multi-device meshes because bucketed dynamic \
+                    signatures require disabling the Shardy partitioner",
+        ));
+    }
+
+    #[test]
+    fn test_input_bound_bucketing_alpha_normalizes_dispatch_keys() {
+        let plugin = load_cpu_plugin().unwrap();
+        let client = plugin
+            .client(ClientOptions::CPU(CpuClientOptions { device_count: Some(1), ..Default::default() }))
+            .unwrap();
+        let mesh = domain_mesh(&client, "x", 1);
+        let domain = Session::new(&client).domain().with_mesh(mesh.clone());
+        let options = Options::new(mesh).with_input_bound_bucketing(InputBoundBucketing::PowerOfTwo);
+        let bounds = DimensionBounds::new(0, Some(5)).unwrap();
+        let vector_type =
+            |dimension: CoreDimension| ArrayIrType::from(ArrayType::new(DataType::F32, Shape::new(vec![dimension])));
+        let key = |input_types: Vec<ArrayIrType>| domain.dispatch_signature(input_types, &options).unwrap().0;
+
+        // Two runtime signatures landing in the same power-of-two bucket share one key, and the effective staged
+        // types carry the generated per-axis variable names that the key itself excludes.
+        let (three_key, three_types) =
+            domain.dispatch_signature(vec![vector_type(CoreDimension::Static(3))], &options).unwrap();
+        assert_eq!(three_key, key(vec![vector_type(CoreDimension::Static(4))]));
+        assert_ne!(three_key, key(vec![vector_type(CoreDimension::Static(5))]));
+        let [ArrayIrType::Array(three_type)] = three_types.as_ref() else {
+            panic!("bucketing must stage exactly one array input type");
+        };
+        let [CoreDimension::Dynamic(variable)] = three_type.shape().dimensions() else {
+            panic!("bucketing must stage a rank-one bounded dynamic axis");
+        };
+        assert_eq!(variable.name(), "input_0_axis_0");
+        assert_eq!(variable.bounds(), bounds);
+
+        // Dimension variables are keyed by their bounds and first-occurrence sharing pattern, not by their names, so
+        // renaming a variable preserves the key while resharing it across inputs does not.
+        let first = DimensionVariable::new("first", bounds);
+        let second = DimensionVariable::new("second", bounds);
+        let renamed = DimensionVariable::new("renamed", bounds);
+        assert_eq!(
+            key(vec![vector_type(first.clone().into()), vector_type(first.clone().into())]),
+            key(vec![vector_type(renamed.clone().into()), vector_type(renamed.into())]),
+        );
+        assert_ne!(
+            key(vec![vector_type(first.clone().into()), vector_type(first.clone().into())]),
+            key(vec![vector_type(first.clone().into()), vector_type(second.into())]),
+        );
+
+        // Everything the shape-free carrier retains still discriminates: element data type, and here the rank too.
+        assert_ne!(
+            key(vec![vector_type(first.clone().into())]),
+            key(vec![ArrayType::new(DataType::F64, Shape::new(vec![first.clone().into()])).into()]),
+        );
+        assert_ne!(
+            key(vec![vector_type(first.clone().into())]),
+            key(vec![ArrayType::new(DataType::F32, Shape::new(vec![first.clone().into(), first.into()])).into()]),
+        );
+    }
+
+    #[test]
+    fn test_bounded_dynamic_programs_reject_shard_map_regions_before_device_count_matters() {
+        let plugin = load_cpu_plugin().unwrap();
+        let client = plugin
+            .client(ClientOptions::CPU(CpuClientOptions { device_count: Some(1), ..Default::default() }))
+            .unwrap();
+        let mesh = domain_mesh(&client, "x", 1);
+        let domain = Session::new(&client).domain().with_mesh(mesh.clone());
+        let manual_mesh = LogicalMesh::new(vec![MeshAxis::new("x", 1, MeshAxisType::Manual).unwrap()]).unwrap();
+        let extent = DimensionVariable::new("extent", DimensionBounds::new(1, Some(5)).unwrap());
+        let size_type = replicated_scalar_type(&mesh, DataType::I64);
+        let value_type = replicated_scalar_type(&mesh, DataType::F32);
+        let global_type = ArrayType::new(DataType::F32, Shape::new(vec![CoreDimension::Static(1)]))
+            .with_sharding(Sharding::replicated(mesh.logical_mesh().clone(), 1))
+            .unwrap();
+        let manual_sharding = Sharding::new(manual_mesh.clone(), vec![ShardingDimension::sharded(["x"])]).unwrap();
+        let boundary =
+            ShardMapBoundary::new(manual_mesh, vec![manual_sharding.clone()], vec![manual_sharding], Vec::new())
+                .unwrap();
+        let local_type = boundary.local_input_type(0, &global_type).unwrap();
+
+        // A `shard_map` body always has static boundary types, so it can coexist with dynamic tensors that are staged
+        // beside it. Here the gateway makes the program bounded-dynamic while the `shard_map` stays fully static.
+        let mut body_builder = ProgramBuilder::new();
+        let local = body_builder.add_input(local_type.into());
+        let doubled =
+            body_builder.add_instruction(AddOperation::new(), Vec::new(), vec![local, local], None).unwrap()[0];
+        let body = body_builder
+            .build::<Vec<Constant>, Vec<Constant>>(vec![doubled], vec![Placeholder], vec![Placeholder])
+            .unwrap();
+
+        let mut builder = ProgramBuilder::new();
+        let body_region = builder.import_region(body.entry_region_ref());
+        let size = builder.add_input(size_type.into());
+        let value = builder.add_input(value_type.into());
+        let global = builder.add_input(global_type.clone().into());
+        let dimension = builder
+            .add_instruction(DimensionFromScalarOperation::new(extent.into()), Vec::new(), vec![size], None)
+            .unwrap()[0];
+        let dynamic = builder
+            .add_instruction(DynamicBroadcastOperation::new(Vec::new()), Vec::new(), vec![value, dimension], None)
+            .unwrap()[0];
+        let operation = ShardMapOperation::from_program(&body, vec![global_type.into()], boundary).unwrap();
+        let mapped = builder
+            .add_instruction(Operation::ShardMap(Box::new(operation)), vec![body_region], vec![global], None)
+            .unwrap()[0];
+        let program = builder
+            .build::<Vec<Constant>, Vec<Constant>>(
+                vec![mapped, dynamic],
+                vec![Placeholder, Placeholder, Placeholder],
+                vec![Placeholder, Placeholder],
+            )
+            .unwrap();
+
+        let Err(error) = domain.lower_program(&program, 0, &Options::new(mesh)) else {
+            panic!("bounded-dynamic program containing a shard_map unexpectedly lowered");
+        };
+        assert!(matches!(&error,
+            Error::Lowering(crate::LoweringError::UnsupportedOperation { operation, .. }) if operation == "shard_map",
+        ));
+        assert_eq!(
+            error.to_string(),
+            "cannot lower `shard_map`: bounded-dynamic programs cannot contain shard_map regions because \
+             sdy.manual_computation requires the Shardy partitioner",
+        );
+    }
+
+    #[test]
+    fn test_compilation_key_is_canonical_and_stable() {
+        use ryft_core::Sin;
+
+        let plugin = load_cpu_plugin().unwrap();
+        let client = plugin
+            .client(ClientOptions::CPU(CpuClientOptions { device_count: Some(1), ..Default::default() }))
+            .unwrap();
+        let mesh = domain_mesh(&client, "x", 1);
+        let domain = Session::new(&client).domain().with_mesh(mesh.clone());
+        let input_type = ArrayType::new(DataType::F32, Shape::new(vec![CoreDimension::Static(4)]))
+            .with_sharding(Sharding::replicated(mesh.logical_mesh().clone(), 1))
+            .unwrap();
+        let staged = crate::jit::stage::<_, ArrayType, ArrayType>(|x| x.sin().unwrap(), input_type, Options::new(mesh))
+            .unwrap()
+            .into_inner();
+        let compiled: ryft_core::compilation::CompiledFunction<Domain<'_>, ArrayIrType, ArrayIrType> =
+            staged.lower(&domain).unwrap().compile(&domain).unwrap();
+        let key = domain.compilation_key(compiled.lowered().lowered_program()).unwrap();
+        let independent_domain = Session::new(&client).domain();
+        let repeated = independent_domain.compilation_key(compiled.lowered().lowered_program()).unwrap();
+
+        assert_eq!(key, repeated);
+        assert_eq!(domain.persistent_cache_key(&key), Some(key.canonical_bytes.to_vec()));
+        let decoded: serde_json::Value = serde_json::from_slice(&key.canonical_bytes).unwrap();
+        assert_eq!(decoded["schema_version"], PERSISTENT_KEY_SCHEMA_VERSION);
+        assert!(decoded.get("requires_rocm_kernel_runtime").is_none());
+        assert_eq!(decoded["compiler_identity"], COMPILER_IDENTITY.as_str());
+        assert!(decoded["compiler_identity"].as_str().unwrap().contains(ryft_xla_sys::XLA_COMMIT));
+        assert!(decoded["compiler_identity"].as_str().unwrap().contains(ryft_xla_sys::JAX_COMMIT));
+        assert_eq!(decoded["platform_name"], client.platform_name().unwrap().as_ref());
+        assert!(decoded["compilation_options"].as_array().is_some_and(|bytes| !bytes.is_empty()));
+        assert!(decoded["stable_hlo"].as_str().is_some_and(|module| module.contains("stablehlo.sine")));
+    }
+
+    #[test]
+    fn test_stage_enforces_reference_boundary_sharding_policy() {
+        let plugin = load_cpu_plugin().unwrap();
+        let client = plugin
+            .client(ClientOptions::CPU(CpuClientOptions { device_count: Some(1), ..Default::default() }))
+            .unwrap();
+        let mesh = domain_mesh(&client, "x", 1);
+        let domain = Session::new(&client).domain();
+        let scalar_sharding = Sharding::new(mesh.logical_mesh().clone(), Vec::new()).unwrap();
+        let reference_type = ArrayIrType::Reference(ReferenceType::new(ArrayType::scalar(DataType::F32)));
+
+        // Reference inputs are structurally valid for stateful staging, but user-provided input sharding overrides
+        // are not: holder state derives its effective sharding from the compiled reference ABI. Lowering rejects the
+        // overrides for staged functions whose input types did not receive them.
+        fn forward<'c>(
+            _: Vec<Constant>,
+            _: Vec<CompilationTracer<Domain<'c>>>,
+            input: CompilationTracer<Domain<'c>>,
+        ) -> Result<CompilationTracer<Domain<'c>>, Error> {
+            Ok(input)
+        }
+        assert!(matches!(
+            CoreStagedFunction::<Domain<'_>, ArrayIrType, ArrayIrType>::stage(forward,
+                Vec::new(),
+                reference_type.clone(),
+                Options::new(mesh.clone()).with_input_shardings(vec![scalar_sharding.clone()]),
+            )
+            .and_then(|staged| staged.lower(&domain))
+            .map(|_| ()),
+            Err(Error::Compilation(CompilationError::UnsupportedReferenceAbi { reason }))
+                if reason == "external reference inputs do not support explicit input shardings",
+        ));
+
+        // A reference output with `output_shardings` stages successfully and is rejected when lowered, by the
+        // reference-output contract of the ABI rather than by the output override, which never runs on a reference
+        // type.
+        fn allocate<'c>(
+            _: Vec<Constant>,
+            _: Vec<CompilationTracer<Domain<'c>>>,
+            input: CompilationTracer<Domain<'c>>,
+        ) -> Result<CompilationTracer<Domain<'c>>, Error> {
+            Ok(input.reference_new()?)
+        }
+        assert!(matches!(
+            CoreStagedFunction::<Domain<'_>, ArrayIrType, ArrayIrType>::stage(allocate,
+                Vec::new(),
+                ArrayIrType::Array(ArrayType::scalar(DataType::F32)),
+                Options::new(mesh.clone()).with_output_shardings(vec![scalar_sharding]),
+            )
+            .and_then(|staged| staged.lower(&domain))
+            .map(|_| ()),
+            Err(Error::Compilation(CompilationError::UnsupportedReferenceAbi { reason }))
+                if reason == "output 0 is a reference allocated inside the program and cannot be returned through \
+                              the stateful XLA ABI, which has no protocol to turn a backend array into a host \
+                              reference",
+        ));
+
+        // Forwarding an external reference through an output is rejected by the same contract when lowered, because
+        // the ABI has no protocol for handing an entering reference back through an output either.
+        assert!(matches!(
+            CoreStagedFunction::<Domain<'_>, ArrayIrType, ArrayIrType>::stage(forward,
+                Vec::new(),
+                reference_type,
+                Options::new(mesh.clone()),
+            )
+            .and_then(|staged| staged.lower(&domain))
+            .map(|_| ()),
+            Err(Error::Compilation(CompilationError::UnsupportedReferenceAbi { reason }))
+                if reason == "output 0 forwards the external reference bound at input 0, and the stateful XLA ABI \
+                              does not return forwarded references; read the reference after the call instead",
+        ));
+    }
+
+    #[test]
+    fn test_lower_requires_staged_input_types_to_carry_input_shardings() {
+        let plugin = load_cpu_plugin().unwrap();
+        let client = plugin
+            .client(ClientOptions::CPU(CpuClientOptions { device_count: Some(1), ..Default::default() }))
+            .unwrap();
+        let mesh = domain_mesh(&client, "x", 1);
+        let domain = Session::new(&client).domain();
+        let scalar_type = ArrayIrType::Array(ArrayType::scalar(DataType::F32));
+        let options = Options::new(mesh.clone())
+            .with_input_shardings(vec![Sharding::new(mesh.logical_mesh().clone(), Vec::new()).unwrap()]);
+
+        fn forward<'c>(
+            _: Vec<Constant>,
+            _: Vec<CompilationTracer<Domain<'c>>>,
+            input: CompilationTracer<Domain<'c>>,
+        ) -> Result<CompilationTracer<Domain<'c>>, Error> {
+            Ok(input)
+        }
+
+        // Staging traces exactly the input types that it receives, so lowering rejects a function whose input types
+        // did not receive the requested input shardings before staging.
+        let staged = CoreStagedFunction::<Domain<'_>, ArrayIrType, ArrayIrType>::stage(
+            forward,
+            Vec::new(),
+            scalar_type.clone(),
+            options.clone(),
+        )
+        .unwrap();
+        assert!(matches!(
+            staged.lower(&domain).map(|_| ()),
+            Err(Error::Compilation(CompilationError::InvalidOptions { reason }))
+                if reason == "staged input types do not carry the shardings requested by `input_shardings`; apply them \
+                              to the input types before staging (e.g., with `with_input_shardings`)",
+        ));
+
+        let input_types = with_input_shardings(scalar_type, &options).unwrap();
+        let staged = CoreStagedFunction::<Domain<'_>, ArrayIrType, ArrayIrType>::stage(
+            forward,
+            Vec::new(),
+            input_types,
+            options,
+        )
+        .unwrap();
+        assert!(staged.lower(&domain).is_ok());
+    }
+
+    #[test]
+    fn test_lowering_rejects_unsupported_external_reference_storage_classes() {
+        let plugin = load_cpu_plugin().unwrap();
+        let client = plugin
+            .client(ClientOptions::CPU(CpuClientOptions { device_count: Some(1), ..Default::default() }))
+            .unwrap();
+        let mesh = domain_mesh(&client, "x", 1);
+        let domain = Session::new(&client).domain();
+        let replicated = |rank| Sharding::replicated(mesh.logical_mesh().clone(), rank);
+
+        let zero_type = ArrayType::new(DataType::Zero, Shape::new(vec![CoreDimension::Static(2)]))
+            .with_sharding(replicated(1))
+            .unwrap();
+        assert!(matches!(
+            domain.lower_program(
+                &external_reference_read_program(zero_type),
+                0,
+                &Options::new(mesh.clone()),
+            ),
+            Err(Error::Compilation(CompilationError::UnsupportedReferenceAbi { reason }))
+                if reason == "external reference state at logical input 0 cannot use a zero-space type because it has \
+                              no executable buffer",
+        ));
+
+        let host_type = ArrayType::new(DataType::F32, Shape::new(vec![CoreDimension::Static(2)]))
+            .with_sharding(replicated(1))
+            .unwrap()
+            .with_memory(Memory::Host { pinned: true });
+        assert!(matches!(
+            domain.lower_program(
+                &external_reference_read_program(host_type),
+                0,
+                &Options::new(mesh.clone()),
+            ),
+            Err(Error::Compilation(CompilationError::UnsupportedReferenceAbi { reason }))
+                if reason == "external reference state at logical input 0 must use device memory",
+        ));
+
+        let unbounded = DimensionVariable::new("unbounded", DimensionBounds::unbounded());
+        let unbounded_type = ArrayType::new(DataType::F32, Shape::new(vec![CoreDimension::Dynamic(unbounded)]))
+            .with_sharding(replicated(1))
+            .unwrap();
+        assert!(matches!(
+            domain.lower_program(
+                &external_reference_read_program(unbounded_type),
+                0,
+                &Options::new(mesh.clone()),
+            ),
+            Err(Error::Compilation(CompilationError::UnsupportedReferenceAbi { reason }))
+                if reason == "external reference state at logical input 0 has an unbounded dynamic dimension",
+        ));
+
+        let bounded = DimensionVariable::new("bounded", DimensionBounds::new(1, Some(5)).unwrap());
+        let sharded_type = ArrayType::new(DataType::F32, Shape::new(vec![CoreDimension::Dynamic(bounded)]))
+            .with_sharding(Sharding::new(mesh.logical_mesh().clone(), vec![ShardingDimension::sharded(["x"])]).unwrap())
+            .unwrap();
+        assert!(matches!(
+            domain.lower_program(
+                &external_reference_read_program(sharded_type),
+                0,
+                &Options::new(mesh.clone()),
+            ),
+            Err(Error::Compilation(CompilationError::UnsupportedReferenceAbi { reason }))
+                if reason == "bounded-dynamic external state input 0 must use replicated sharding",
+        ));
+
+        let foreign_logical_mesh =
+            LogicalMesh::new(vec![MeshAxis::new("foreign", 1, MeshAxisType::Explicit).unwrap()]).unwrap();
+        let foreign_sharding_type = ArrayType::scalar(DataType::F32)
+            .with_sharding(Sharding::replicated(foreign_logical_mesh.clone(), 0))
+            .unwrap();
+        assert!(matches!(
+            domain.lower_program(
+                &external_reference_read_program(foreign_sharding_type),
+                0,
+                &Options::new(mesh.clone()),
+            ),
+            Err(Error::Core(ryft_core::Error::Sharding(ryft_core::ShardingError::MeshMismatch { expected, actual })))
+                if expected == *mesh.logical_mesh() && actual == foreign_logical_mesh,
+        ));
+
+        let local_device = &mesh.devices()[0];
+        let foreign_mesh = DeviceMesh::new(
+            mesh.logical_mesh().clone(),
+            vec![Device::new(local_device.id(), local_device.process_index() + 1)],
+        )
+        .unwrap();
+        let scalar_type = ArrayType::scalar(DataType::F32)
+            .with_sharding(Sharding::replicated(foreign_mesh.logical_mesh().clone(), 0))
+            .unwrap();
+        assert!(matches!(
+            domain.lower_program(
+                &external_reference_read_program(scalar_type),
+                0,
+                &Options::new(foreign_mesh),
+            ),
+            Err(Error::Compilation(CompilationError::UnsupportedReferenceAbi { reason }))
+                if reason == "external reference state requires a fully addressable single-process mesh",
+        ));
+
+        let non_addressable_mesh = DeviceMesh::new(
+            mesh.logical_mesh().clone(),
+            vec![Device::new(local_device.id() + 1_000, local_device.process_index())],
+        )
+        .unwrap();
+        let scalar_type = ArrayType::scalar(DataType::F32)
+            .with_sharding(Sharding::replicated(non_addressable_mesh.logical_mesh().clone(), 0))
+            .unwrap();
+        assert!(matches!(
+            domain.lower_program(
+                &external_reference_read_program(scalar_type),
+                0,
+                &Options::new(non_addressable_mesh),
+            ),
+            Err(Error::Compilation(CompilationError::UnsupportedReferenceAbi { reason }))
+                if reason == "external reference state requires a fully addressable single-process mesh",
+        ));
+    }
+
+    #[test]
+    fn test_lowering_discharges_and_executes_local_reference_state() {
+        let plugin = load_cpu_plugin().unwrap();
+        let client = plugin
+            .client(ClientOptions::CPU(CpuClientOptions { device_count: Some(1), ..Default::default() }))
+            .unwrap();
+        let mesh = domain_mesh(&client, "x", 1);
+        let domain = Session::new(&client).domain();
+        let scalar_type = replicated_scalar_type(&mesh, DataType::F32);
+
+        let mut builder = ProgramBuilder::new();
+        let input = builder.add_input(scalar_type.clone().into());
+        let replacement = builder.add_input(scalar_type.clone().into());
+        let reference =
+            builder.add_instruction(ReferenceNewOperation::new(), Vec::new(), vec![input], None).unwrap()[0];
+        builder
+            .add_instruction(ReferenceWriteOperation::new(), Vec::new(), vec![reference, replacement], None)
+            .unwrap();
+        let snapshot =
+            builder.add_instruction(ReferenceReadOperation::new(), Vec::new(), vec![reference], None).unwrap()[0];
+        builder
+            .add_instruction(ReferenceAddUpdateOperation::new(), Vec::new(), vec![reference, input], None)
+            .unwrap();
+        let final_value =
+            builder.add_instruction(ReferenceFreezeOperation::new(), Vec::new(), vec![reference], None).unwrap()[0];
+        let program: FlatProgram = builder
+            .build::<Vec<Constant>, Vec<Constant>>(
+                vec![snapshot, final_value],
+                vec![Placeholder; 2],
+                vec![Placeholder; 2],
+            )
+            .unwrap();
+
+        let lowered = domain.lower_program(&program, 0, &Options::new(mesh.clone())).unwrap();
+        assert_eq!(lowered.output_types(), &[scalar_type.clone(), scalar_type]);
+        let expected_signature = concat!(
+            "  func.func @main(%arg0: tensor<f32> {sdy.sharding = #sdy.sharding<@mesh, []>}, ",
+            "%arg1: tensor<f32> {sdy.sharding = #sdy.sharding<@mesh, []>}) -> ",
+            "(tensor<f32> {sdy.sharding = #sdy.sharding<@mesh, []>}, ",
+            "tensor<f32> {sdy.sharding = #sdy.sharding<@mesh, []>}) {",
+        );
+        let expected_stable_hlo = indoc! {r#"
+            module {
+              sdy.mesh @mesh = <["x"=1]>
+            @SIGNATURE@
+                %0 = stablehlo.add %arg1, %arg0 : tensor<f32>
+                return %arg1, %0 : tensor<f32>, tensor<f32>
+              }
+            }
+        "#}
+        .replace("@SIGNATURE@", expected_signature);
+        assert_eq!(lowered.stable_hlo(), expected_stable_hlo,);
+        let compiled = domain.compile_program(&lowered).unwrap();
+        let outputs = domain
+            .execute_program(&compiled, vec![f32_scalar(&domain, &mesh, 3.0), f32_scalar(&domain, &mesh, 5.0)])
+            .unwrap();
+        assert_eq!(read_f32s(&client, &outputs[0]), vec![5.0]);
+        assert_eq!(read_f32s(&client, &outputs[1]), vec![8.0]);
+
+        let eager_input = ryft_core::ArrayIrValue::Array(CoreArray::scalar(3.0f32).unwrap());
+        let eager_replacement = ryft_core::ArrayIrValue::Array(CoreArray::scalar(5.0f32).unwrap());
+        let eager_reference = eager_input.reference_new().unwrap();
+        eager_reference.write(&eager_replacement).unwrap();
+        let eager_snapshot = eager_reference.read().unwrap();
+        eager_reference.add_update(&eager_input).unwrap();
+        let eager_final = eager_reference.freeze().unwrap();
+        assert_eq!(eager_snapshot, ryft_core::ArrayIrValue::Array(CoreArray::scalar(5.0f32).unwrap()));
+        assert_eq!(eager_final, ryft_core::ArrayIrValue::Array(CoreArray::scalar(8.0f32).unwrap()));
+    }
+
+    #[test]
+    fn test_lowering_discharges_and_executes_pinned_host_reference_state_in_shard_maps() {
+        // A pinned-host allocation that a `shard_map` mutates through a sharded reference input discharges to a manual
+        // computation over its state: every device updates its own shard, the final state keeps the allocation's
+        // pinned-host placement, and the mapped output stays in device memory.
+        let plugin = load_cpu_plugin().unwrap();
+        let client = plugin
+            .client(ClientOptions::CPU(CpuClientOptions { device_count: Some(2), ..Default::default() }))
+            .unwrap();
+        let logical_mesh = LogicalMesh::new(vec![MeshAxis::new("x", 2, MeshAxisType::Manual).unwrap()]).unwrap();
+        let devices = client
+            .addressable_devices()
+            .unwrap()
+            .into_iter()
+            .map(|device| Device::from_pjrt(device).unwrap())
+            .collect::<Vec<_>>();
+        let mesh = DeviceMesh::new(logical_mesh.clone(), devices).unwrap();
+        let domain = Session::new(&client).domain();
+        let sharding = Sharding::new(logical_mesh.clone(), vec![ShardingDimension::sharded(["x"])]).unwrap();
+        let device_type = ArrayType::new_static(DataType::F32, [4]).with_sharding(sharding.clone()).unwrap();
+        let host_type = device_type.clone().with_memory(Memory::Host { pinned: true });
+        let boundary = ShardMapBoundary::new(
+            logical_mesh,
+            vec![sharding.clone(), sharding.clone()],
+            vec![sharding],
+            vec!["x".to_string()],
+        )
+        .unwrap();
+        let local_type = boundary.local_input_type(1, &device_type).unwrap();
+        let body = {
+            let mut builder = ProgramBuilder::new();
+            let reference = builder.add_input(ReferenceType::new(local_type.clone()).into());
+            let update = builder.add_input(local_type.into());
+            builder
+                .add_instruction(ReferenceAddUpdateOperation::new(), Vec::new(), vec![reference, update], None)
+                .unwrap();
+            let state =
+                builder.add_instruction(ReferenceReadOperation::new(), Vec::new(), vec![reference], None).unwrap()[0];
+            builder
+                .build::<Vec<Constant>, Vec<Constant>>(vec![state], vec![Placeholder; 2], vec![Placeholder])
+                .unwrap()
+        };
+        let operation = ShardMapOperation::from_program(
+            &body,
+            vec![ReferenceType::new(host_type.clone()).into(), device_type.clone().into()],
+            boundary,
+        )
+        .unwrap();
+        let program = {
+            let mut builder = ProgramBuilder::new();
+            let initial = builder.add_input(host_type.clone().into());
+            let update = builder.add_input(device_type.clone().into());
+            let reference =
+                builder.add_instruction(ReferenceNewOperation::new(), Vec::new(), vec![initial], None).unwrap()[0];
+            let body = builder.import_program(body);
+            let mapped = builder
+                .add_instruction(Operation::ShardMap(Box::new(operation)), vec![body], vec![reference, update], None)
+                .unwrap()[0];
+            let state =
+                builder.add_instruction(ReferenceFreezeOperation::new(), Vec::new(), vec![reference], None).unwrap()[0];
+            builder
+                .build::<Vec<Constant>, Vec<Constant>>(vec![mapped, state], vec![Placeholder; 2], vec![Placeholder; 2])
+                .unwrap()
+        };
+
+        let lowered = domain.lower_program(&program, 0, &Options::new(mesh.clone())).unwrap();
+        let compiled = domain.compile_program(&lowered).unwrap();
+        let initial = Array::from_host_buffer(
+            &domain,
+            host_type.clone(),
+            mesh.clone(),
+            values_to_bytes::<f32>(&[1.0, 2.0, 3.0, 4.0]).as_slice(),
+        )
+        .unwrap();
+        let update = Array::from_host_buffer(
+            &domain,
+            device_type.clone(),
+            mesh,
+            values_to_bytes::<f32>(&[10.0, 20.0, 30.0, 40.0]).as_slice(),
+        )
+        .unwrap();
+        let outputs = domain.execute_program(&compiled, vec![initial, update]).unwrap();
+        let shards = |array: &Array<'_>| {
+            array
+                .addressable_shards()
+                .map(|shard| {
+                    let buffer = shard.buffer().unwrap();
+                    let bytes = buffer.copy_to_host(None).unwrap().r#await().unwrap();
+                    (buffer.memory().unwrap().kind().unwrap().to_string(), values_from_bytes::<f32>(bytes.as_slice()))
+                })
+                .collect::<Vec<_>>()
+        };
+        assert_eq!(outputs[0].r#type().as_ref(), &device_type);
+        assert_eq!(
+            shards(&outputs[0]),
+            vec![("device".to_string(), vec![11.0, 22.0]), ("device".to_string(), vec![33.0, 44.0])],
+        );
+        assert_eq!(outputs[1].r#type().as_ref(), &host_type);
+        assert_eq!(
+            shards(&outputs[1]),
+            vec![("pinned_host".to_string(), vec![11.0, 22.0]), ("pinned_host".to_string(), vec![33.0, 44.0])],
+        );
+    }
+
+    #[test]
+    fn test_lowering_executes_gradients_through_body_allocated_reference_residuals_of_shard_maps() {
+        use ryft_core::{Cos, Differentiate, ParallelReduce, Reduce, Sin, composite};
+
+        // The body allocates `r = reference_new(x)`, calls a custom `sin` whose reverse-mode rule saves `r` as a
+        // residual and whose backward rule scales the cotangent by the state that it reads from `r`, and then writes
+        // `x * x` into `r`. The reference crosses from the primal `shard_map` to the tangent `shard_map` as a snapshot
+        // of its final state, from which the tangent body allocates its own reference, so the gradient of
+        // `sum(sin(x))` is `cos(x) * x * x`, as it is outside `shard_map`. Both bodies discharge their allocations.
+        let plugin = load_cpu_plugin().unwrap();
+        let client = plugin
+            .client(ClientOptions::CPU(CpuClientOptions { device_count: Some(2), ..Default::default() }))
+            .unwrap();
+        let logical_mesh = LogicalMesh::new(vec![MeshAxis::new("x", 2, MeshAxisType::Manual).unwrap()]).unwrap();
+        let devices = client
+            .addressable_devices()
+            .unwrap()
+            .into_iter()
+            .map(|device| Device::from_pjrt(device).unwrap())
+            .collect::<Vec<_>>();
+        let mesh = DeviceMesh::new(logical_mesh.clone(), devices).unwrap();
+        let domain = Session::new(&client).domain();
+        let replicated = Sharding::replicated(logical_mesh.clone(), 0);
+        let sharded = Sharding::new(logical_mesh.clone(), vec![ShardingDimension::sharded(["x"])]).unwrap();
+        let input_type = ArrayType::new_static(DataType::F32, [4]).with_sharding(sharded.clone()).unwrap();
+        type BodyTracer = Tracer<'static>;
+        let function = composite(|(_, x): (BodyTracer, BodyTracer)| {
+            Ok(ValueProjection::<ArrayType>::into_projected(x)?.sin()?.into_value())
+        })
+        .with_non_differentiated_count(1)
+        .with_vjp(
+            |(r, x): (BodyTracer, BodyTracer)| {
+                let x = ValueProjection::<ArrayType>::into_projected(x)?;
+                Ok((x.sin()?.into_value(), (r, x.cos()?.into_value())))
+            },
+            |(r, cosine): (BodyTracer, BodyTracer), cotangent: BodyTracer| {
+                let state = ValueProjection::<ArrayType>::into_projected(r.read()?)?;
+                let cosine = ValueProjection::<ArrayType>::into_projected(cosine)?;
+                let cotangent = ValueProjection::<ArrayType>::into_projected(cotangent)?;
+                Ok((r, (cosine * cotangent * state).into_value()))
+            },
+        );
+        let (_, program) = DomainTracingContext::<Domain<'static>>::trace(
+            |inputs: Vec<Tracer<'static>>| {
+                let (value, gradient) = inputs[0]
+                    .domain()
+                    .differentiate_at(inputs[0].clone())
+                    .value_and_gradient(|x| {
+                        let x = ValueProjection::<ArrayType>::into_projected(x)?;
+                        Ok(shard_map(
+                            |local_x: ArrayTracer| {
+                                let value = local_x.clone().into_value();
+                                let reference = value.reference_new()?;
+                                let output = function.call((reference.clone(), value))?;
+                                reference.write(&(local_x.clone() * local_x).into_value())?;
+                                ValueProjection::<ArrayType>::into_projected(output)?
+                                    .reduce(&[0], ReductionKind::Sum)?
+                                    .parallel_reduce(ReductionKind::Sum, "x")
+                            },
+                            x,
+                            logical_mesh.clone(),
+                            sharded.clone(),
+                            replicated.clone(),
+                            ShardMapOptions::new(),
+                        )
+                        .unwrap()
+                        .into_value())
+                    })
+                    .unwrap();
+                Ok(vec![value, gradient])
+            },
+            vec![ArrayIrType::Array(input_type.clone())],
+        )
+        .unwrap();
+        let lowered = domain.lower_program(&program, 0, &Options::new(mesh.clone())).unwrap();
+        let compiled = domain.compile_program(&lowered).unwrap();
+        let inputs = [0.25f32, 0.5, 1.0, 2.0];
+        let input =
+            Array::from_host_buffer(&domain, input_type, mesh, values_to_bytes::<f32>(&inputs).as_slice()).unwrap();
+        let outputs = domain.execute_program(&compiled, vec![input]).unwrap();
+        let shards = |array: &Array<'_>| {
+            array
+                .addressable_shards()
+                .map(|shard| {
+                    let bytes = shard.buffer().unwrap().copy_to_host(None).unwrap().r#await().unwrap();
+                    values_from_bytes::<f32>(bytes.as_slice())
+                })
+                .collect::<Vec<_>>()
+        };
+        let value = inputs.iter().map(|&input| f32::sin(input)).sum::<f32>();
+        for shard in shards(&outputs[0]) {
+            assert!((shard[0] - value).abs() <= 1e-5, "{shard:?}");
+        }
+        let gradient = shards(&outputs[1]).concat();
+        assert_eq!(gradient.len(), inputs.len());
+        for (gradient, input) in gradient.into_iter().zip(inputs) {
+            assert!((gradient - f32::cos(input) * input * input).abs() <= 1e-5, "{gradient} for {input}");
+        }
+    }
+
+    #[test]
+    fn test_lowering_executes_shard_map_transpositions_for_callers_placed_along_manual_axes() {
+        // The caller places its input along the manual axis `x` and the explicit axis `y`, while the map places it
+        // along `x` only, so the transposed map assembles the cotangent along `x`. One placement-only `broadcast`
+        // restores the caller's placement along both axes, which compiles to local slicing without any collective,
+        // and every device receives its shard of the identity map's cotangent.
+        let plugin = load_cpu_plugin().unwrap();
+        let client = plugin
+            .client(ClientOptions::CPU(CpuClientOptions { device_count: Some(4), ..Default::default() }))
+            .unwrap();
+        let logical_mesh = LogicalMesh::new(vec![
+            MeshAxis::new("x", 2, MeshAxisType::Manual).unwrap(),
+            MeshAxis::new("y", 2, MeshAxisType::Explicit).unwrap(),
+        ])
+        .unwrap();
+        let devices = client
+            .addressable_devices()
+            .unwrap()
+            .into_iter()
+            .map(|device| Device::from_pjrt(device).unwrap())
+            .collect::<Vec<_>>();
+        let mesh = DeviceMesh::new(logical_mesh.clone(), devices).unwrap();
+        let domain = Session::new(&client).domain();
+        let along_x = Sharding::new(logical_mesh.clone(), vec![ShardingDimension::sharded(["x"])]).unwrap();
+        let along_x_and_y = Sharding::new(logical_mesh.clone(), vec![ShardingDimension::sharded(["x", "y"])]).unwrap();
+        let caller_type = ArrayType::new_static(DataType::F32, [8]).with_sharding(along_x_and_y).unwrap();
+        let (_, program) = DomainTracingContext::<Domain<'static>>::trace(
+            |inputs: Vec<Tracer<'static>>| {
+                let input =
+                    ValueProjection::<ArrayType>::into_projected(inputs[0].clone()).map_err(ProgramError::from)?;
+                let output = shard_map(
+                    |x: ArrayTracer| Ok(x),
+                    input,
+                    logical_mesh.clone(),
+                    along_x.clone(),
+                    along_x.clone(),
+                    ShardMapOptions::new(),
+                )
+                .unwrap();
+                Ok(vec![output.into_value()])
+            },
+            vec![ArrayIrType::Array(caller_type.clone())],
+        )
+        .unwrap();
+        let pullback = program.transpose_with_respect_to(&[0], &[CotangentDestinationKind::Return]).unwrap();
+        let lowered = domain.lower_program(&pullback, 0, &Options::new(mesh.clone())).unwrap();
+        let compiled = domain.compile_program(&lowered).unwrap();
+
+        // The serialized optimized HLO module names the opcode of every instruction (e.g., of its `parameter`), so it
+        // names no collective opcode.
+        let optimized = compiled.optimized_program().unwrap();
+        let names_opcode =
+            |opcode: &str| optimized.bytes.windows(opcode.len()).any(|window| window == opcode.as_bytes());
+        assert!(names_opcode("parameter"));
+        for opcode in ["all-gather", "all-reduce", "all-to-all", "collective-permute", "reduce-scatter"] {
+            assert!(!names_opcode(opcode), "the optimized program contains a `{opcode}`");
+        }
+
+        let cotangent_type = ArrayType::new_static(DataType::F32, [8]).with_sharding(along_x).unwrap();
+        let cotangent = Array::from_host_buffer(
+            &domain,
+            cotangent_type,
+            mesh,
+            values_to_bytes::<f32>(&[1.0, 2.0, 3.0, 4.0, 5.0, 6.0, 7.0, 8.0]).as_slice(),
+        )
+        .unwrap();
+        let outputs = domain.execute_program(&compiled, vec![cotangent]).unwrap();
+        assert_eq!(outputs[0].r#type().as_ref(), &caller_type);
+        let shards = outputs[0]
+            .addressable_shards()
+            .map(|shard| {
+                let bytes = shard.buffer().unwrap().copy_to_host(None).unwrap().r#await().unwrap();
+                values_from_bytes::<f32>(bytes.as_slice())
+            })
+            .collect::<Vec<_>>();
+        assert_eq!(shards, vec![vec![1.0, 2.0], vec![3.0, 4.0], vec![5.0, 6.0], vec![7.0, 8.0]]);
+    }
+
+    #[test]
+    fn test_lowering_executes_shard_maps_batched_along_every_manual_axis() {
+        // The caller maps the leading dimension of its input, which it places along `x` over the mesh of the map itself,
+        // over a map whose only active manual axis is `x`. The placement adds no manual variation to the batch items,
+        // and batching releases `x`, which leaves a manual computation without manual axes that runs the batched body
+        // once on the global values, while the boundary keeps the batch dimension placed along `x`, so each of the two
+        // devices holds one batch item.
+        let plugin = load_cpu_plugin().unwrap();
+        let client = plugin
+            .client(ClientOptions::CPU(CpuClientOptions { device_count: Some(2), ..Default::default() }))
+            .unwrap();
+        let logical_mesh = LogicalMesh::new(vec![MeshAxis::new("x", 2, MeshAxisType::Manual).unwrap()]).unwrap();
+        let devices = client
+            .addressable_devices()
+            .unwrap()
+            .into_iter()
+            .map(|device| Device::from_pjrt(device).unwrap())
+            .collect::<Vec<_>>();
+        let mesh = DeviceMesh::new(logical_mesh.clone(), devices).unwrap();
+        let domain = Session::new(&client).domain();
+        let replicated = Sharding::replicated(logical_mesh.clone(), 1);
+        let input_sharding = Sharding::new(
+            logical_mesh.clone(),
+            vec![ShardingDimension::sharded(["x"]), ShardingDimension::replicated()],
+        )
+        .unwrap();
+        let input_type = ArrayType::new_static(DataType::F32, [2, 3]).with_sharding(input_sharding).unwrap();
+        let (_, program) = DomainTracingContext::<Domain<'static>>::trace(
+            |inputs: Vec<Tracer<'static>>| {
+                let output = batch(
+                    |item| {
+                        let item = ValueProjection::<ArrayType>::into_projected(item)?;
+                        let output = shard_map(
+                            |x| Ok(x.clone() + x),
+                            item,
+                            logical_mesh.clone(),
+                            replicated.clone(),
+                            replicated.clone(),
+                            ShardMapOptions::new(),
+                        )?;
+                        Ok(output.into_value())
+                    },
+                    inputs[0].clone(),
+                    BatchAxis::new(0),
+                    BatchAxis::new(0),
+                    None,
+                )?;
+                Ok(vec![output])
+            },
+            vec![ArrayIrType::Array(input_type.clone())],
+        )
+        .unwrap();
+        let lowered = domain.lower_program(&program, 0, &Options::new(mesh.clone())).unwrap();
+        assert_eq!(
+            &*lowered.stable_hlo,
+            indoc! {"
+                module {
+                  sdy.mesh @mesh = <[\"x\"=2]>
+                  func.func @main(%arg0: tensor<2x3xf32> {sdy.sharding = #sdy.sharding<@mesh, [{\"x\"}, {}]>}) -> \
+                      (tensor<2x3xf32> {sdy.sharding = #sdy.sharding<@mesh, [{\"x\"}, {}]>}) {
+                    %0 = sdy.manual_computation(%arg0) in_shardings=[<@mesh, [{\"x\", ?}, {}]>] \
+                        out_shardings=[<@mesh, [{\"x\", ?}, {}]>] manual_axes={} (%arg1: tensor<2x3xf32>) {
+                      %1 = stablehlo.add %arg1, %arg1 : tensor<2x3xf32>
+                      sdy.return %1 : tensor<2x3xf32>
+                    } : (tensor<2x3xf32>) -> tensor<2x3xf32>
+                    return %0 : tensor<2x3xf32>
+                  }
+                }
+            "},
+        );
+        let compiled = domain.compile_program(&lowered).unwrap();
+        let input = Array::from_host_buffer(
+            &domain,
+            input_type,
+            mesh,
+            values_to_bytes::<f32>(&[1.0, 2.0, 3.0, 4.0, 5.0, 6.0]).as_slice(),
+        )
+        .unwrap();
+        let outputs = domain.execute_program(&compiled, vec![input]).unwrap();
+        let items = outputs[0]
+            .addressable_shards()
+            .map(|shard| {
+                let bytes = shard.buffer().unwrap().copy_to_host(None).unwrap().r#await().unwrap();
+                values_from_bytes::<f32>(bytes.as_slice())
+            })
+            .collect::<Vec<_>>();
+        assert_eq!(items, vec![vec![2.0, 4.0, 6.0], vec![8.0, 10.0, 12.0]]);
+    }
+
+    #[test]
+    fn test_lowering_accumulates_slice_cotangents_into_existing_state() {
+        let client = execution_client();
+        let mesh = domain_mesh(&client, "x", 1);
+        let domain = Session::new(&client).domain();
+        let mut builder = ProgramBuilder::new();
+        let input = builder.add_input(replicated_vector_type(&mesh, 4).into());
+        let output = builder
+            .add_instruction(SliceOperation::new(vec![1], vec![3]), Vec::new(), vec![input], None)
+            .unwrap()[0];
+        let program = builder
+            .build::<Vec<Constant>, Vec<Constant>>(vec![output], vec![Placeholder], vec![Placeholder])
+            .unwrap();
+        let pullback = program.transpose_with_respect_to(&[0], &[CotangentDestinationKind::Reference]).unwrap();
+        assert_eq!(
+            pullback.instructions().iter().map(|instruction| instruction.operation().name()).collect::<Vec<_>>(),
+            vec!["reference_add_update"],
+        );
+
+        // Discharge reads only the selected buffer entries, adds the seed, and writes that slice back. The lowered
+        // graph contains no full-size zero gradient or dense addition before the indexed update.
+        let lowered = domain.lower_program(&pullback, 0, &Options::new(mesh)).unwrap();
+        let operations = lowered
+            .stable_hlo()
+            .lines()
+            .filter_map(|line| line.split_once(" = stablehlo."))
+            .map(|(_, operation)| operation.split_whitespace().next().unwrap())
+            .collect::<Vec<_>>();
+        assert_eq!(operations, vec!["slice", "add", "constant", "dynamic_update_slice"]);
+    }
+
+    #[test]
+    fn test_lowering_discharges_local_index_and_slice_reference_transforms() {
+        let plugin = load_cpu_plugin().unwrap();
+        let client = plugin
+            .client(ClientOptions::CPU(CpuClientOptions { device_count: Some(1), ..Default::default() }))
+            .unwrap();
+        let mesh = domain_mesh(&client, "x", 1);
+        let domain = Session::new(&client).domain();
+        let vector_type = replicated_vector_type(&mesh, 4);
+        let pair_type = replicated_vector_type(&mesh, 2);
+        let mut builder = ProgramBuilder::new();
+        let initial = builder.add_input(vector_type.into());
+        let replacement = builder.add_input(pair_type.clone().into());
+        let update = builder.add_input(pair_type.into());
+        let reference =
+            builder.add_instruction(ReferenceNewOperation::new(), Vec::new(), vec![initial], None).unwrap()[0];
+        let indexed_snapshot = builder
+            .add_instruction(
+                ReferenceReadOperation::new().with_transforms(vec![ArrayReferenceTransform::Index {
+                    axis: 0,
+                    index: ArrayReferenceTransformIndex::Static(3),
+                }]),
+                Vec::new(),
+                vec![reference],
+                None,
+            )
+            .unwrap()[0];
+        let transforms = vec![
+            ArrayReferenceTransform::Slice { axes: vec![ArraySliceAxis::new(1, 3, 1)] },
+            ArrayReferenceTransform::Slice { axes: vec![ArraySliceAxis::new(0, 2, 1)] },
+        ];
+        let old = builder
+            .add_instruction(
+                ReferenceSwapOperation::new().with_transforms(transforms.clone()),
+                Vec::new(),
+                vec![reference, replacement],
+                None,
+            )
+            .unwrap()[0];
+        builder
+            .add_instruction(
+                ReferenceAddUpdateOperation::new().with_transforms(transforms),
+                Vec::new(),
+                vec![reference, update],
+                None,
+            )
+            .unwrap();
+        let final_snapshot =
+            builder.add_instruction(ReferenceFreezeOperation::new(), Vec::new(), vec![reference], None).unwrap()[0];
+        let program = builder
+            .build::<Vec<Constant>, Vec<Constant>>(
+                vec![indexed_snapshot, old, final_snapshot],
+                vec![Placeholder; 3],
+                vec![Placeholder; 3],
+            )
+            .unwrap();
+
+        let lowered = domain.lower_program(&program, 0, &Options::new(mesh.clone())).unwrap();
+        let expected_signature = concat!(
+            "  func.func @main(%arg0: tensor<4xf32> {sdy.sharding = #sdy.sharding<@mesh, [{}]>}, ",
+            "%arg1: tensor<2xf32> {sdy.sharding = #sdy.sharding<@mesh, [{}]>}, ",
+            "%arg2: tensor<2xf32> {sdy.sharding = #sdy.sharding<@mesh, [{}]>}) -> ",
+            "(tensor<f32> {sdy.sharding = #sdy.sharding<@mesh, []>}, ",
+            "tensor<2xf32> {sdy.sharding = #sdy.sharding<@mesh, [{}]>}, ",
+            "tensor<4xf32> {sdy.sharding = #sdy.sharding<@mesh, [{}]>}) {",
+        );
+        let expected_update = |result, target, update, index, target_size, update_size| {
+            format!(
+                "    %{result} = stablehlo.dynamic_update_slice %{target}, %{update}, %{index} : \
+                 (tensor<{target_size}xf32>, tensor<{update_size}xf32>, tensor<i64>) -> \
+                 tensor<{target_size}xf32>",
+            )
+        };
+        assert_eq!(
+            lowered.stable_hlo(),
+            indoc! {r#"
+                module {
+                  sdy.mesh @mesh = <["x"=1]>
+                @SIGNATURE@
+                    %0 = stablehlo.slice %arg0 [3:4] : (tensor<4xf32>) -> tensor<1xf32>
+                    %1 = stablehlo.reshape %0 : (tensor<1xf32>) -> tensor<f32>
+                    %2 = stablehlo.slice %arg0 [1:4] : (tensor<4xf32>) -> tensor<3xf32>
+                    %3 = stablehlo.slice %2 [0:2] : (tensor<3xf32>) -> tensor<2xf32>
+                    %c = stablehlo.constant dense<0> : tensor<i64>
+                @UPDATE0@
+                    %c_0 = stablehlo.constant dense<1> : tensor<i64>
+                @UPDATE1@
+                    %6 = stablehlo.slice %5 [1:4] : (tensor<4xf32>) -> tensor<3xf32>
+                    %7 = stablehlo.slice %6 [0:2] : (tensor<3xf32>) -> tensor<2xf32>
+                    %8 = stablehlo.add %7, %arg2 : tensor<2xf32>
+                    %c_1 = stablehlo.constant dense<0> : tensor<i64>
+                @UPDATE2@
+                    %c_2 = stablehlo.constant dense<1> : tensor<i64>
+                @UPDATE3@
+                    return %1, %3, %10 : tensor<f32>, tensor<2xf32>, tensor<4xf32>
+                  }
+                }
+            "#}
+            .replace("@SIGNATURE@", expected_signature)
+            .replace("@UPDATE0@", &expected_update("4", "2", "arg1", "c", 3, 2))
+            .replace("@UPDATE1@", &expected_update("5", "arg0", "4", "c_0", 4, 3))
+            .replace("@UPDATE2@", &expected_update("9", "6", "8", "c_1", 3, 2))
+            .replace("@UPDATE3@", &expected_update("10", "5", "9", "c_2", 4, 3)),
+        );
+        let compiled = domain.compile_program(&lowered).unwrap();
+        let outputs = domain
+            .execute_program(
+                &compiled,
+                vec![
+                    f32_vector(&domain, &mesh, &[1.0, 2.0, 3.0, 4.0]),
+                    f32_vector(&domain, &mesh, &[10.0, 20.0]),
+                    f32_vector(&domain, &mesh, &[1.0, 2.0]),
+                ],
+            )
+            .unwrap();
+        assert_eq!(read_f32s(&client, &outputs[0]), vec![4.0]);
+        assert_eq!(read_f32s(&client, &outputs[1]), vec![2.0, 3.0]);
+        assert_eq!(read_f32s(&client, &outputs[2]), vec![1.0, 11.0, 22.0, 4.0]);
+    }
+
+    #[test]
+    fn test_lowering_discharges_and_executes_a_write_through_a_reference_view() {
+        let plugin = load_cpu_plugin().unwrap();
+        let client = plugin
+            .client(ClientOptions::CPU(CpuClientOptions { device_count: Some(1), ..Default::default() }))
+            .unwrap();
+        let mesh = domain_mesh(&client, "x", 1);
+        let domain = Session::new(&client).domain();
+        let vector_type = replicated_vector_type(&mesh, 4);
+        let pair_type = replicated_vector_type(&mesh, 2);
+        let mut builder = ProgramBuilder::new();
+        let initial = builder.add_input(vector_type.into());
+        let replacement = builder.add_input(pair_type.into());
+        let reference =
+            builder.add_instruction(ReferenceNewOperation::new(), Vec::new(), vec![initial], None).unwrap()[0];
+        builder
+            .add_instruction(
+                ReferenceWriteOperation::new()
+                    .with_transforms(vec![ArrayReferenceTransform::Slice { axes: vec![ArraySliceAxis::new(1, 2, 1)] }]),
+                Vec::new(),
+                vec![reference, replacement],
+                None,
+            )
+            .unwrap();
+        let output =
+            builder.add_instruction(ReferenceFreezeOperation::new(), Vec::new(), vec![reference], None).unwrap()[0];
+        let program: FlatProgram = builder
+            .build::<Vec<Constant>, Vec<Constant>>(vec![output], vec![Placeholder; 2], vec![Placeholder])
+            .unwrap();
+
+        let lowered = domain.lower_program(&program, 0, &Options::new(mesh.clone())).unwrap();
+        let compiled = domain.compile_program(&lowered).unwrap();
+        let outputs = domain
+            .execute_program(
+                &compiled,
+                vec![f32_vector(&domain, &mesh, &[1.0, 2.0, 3.0, 4.0]), f32_vector(&domain, &mesh, &[10.0, 20.0])],
+            )
+            .unwrap();
+        assert_eq!(read_f32s(&client, &outputs[0]), vec![1.0, 10.0, 20.0, 4.0]);
+    }
+
+    #[test]
+    fn test_lowering_executes_indexed_reference_mutation() {
+        let plugin = load_cpu_plugin().unwrap();
+        let client = plugin
+            .client(ClientOptions::CPU(CpuClientOptions { device_count: Some(1), ..Default::default() }))
+            .unwrap();
+        let mesh = domain_mesh(&client, "x", 1);
+        let domain = Session::new(&client).domain();
+        let vector_type = replicated_vector_type(&mesh, 3);
+        let scalar_type = replicated_scalar_type(&mesh, DataType::F32);
+        let mut builder = ProgramBuilder::new();
+        let initial = builder.add_input(vector_type.into());
+        let replacement = builder.add_input(scalar_type.clone().into());
+        let update = builder.add_input(scalar_type.into());
+        let reference =
+            builder.add_instruction(ReferenceNewOperation::new(), Vec::new(), vec![initial], None).unwrap()[0];
+        let transforms =
+            vec![ArrayReferenceTransform::Index { axis: 0, index: ArrayReferenceTransformIndex::Static(1) }];
+        let old = builder
+            .add_instruction(
+                ReferenceSwapOperation::new().with_transforms(transforms.clone()),
+                Vec::new(),
+                vec![reference, replacement],
+                None,
+            )
+            .unwrap()[0];
+        builder
+            .add_instruction(
+                ReferenceAddUpdateOperation::new().with_transforms(transforms),
+                Vec::new(),
+                vec![reference, update],
+                None,
+            )
+            .unwrap();
+        let final_snapshot =
+            builder.add_instruction(ReferenceFreezeOperation::new(), Vec::new(), vec![reference], None).unwrap()[0];
+        let program = builder
+            .build::<Vec<Constant>, Vec<Constant>>(
+                vec![old, final_snapshot],
+                vec![Placeholder; 3],
+                vec![Placeholder; 2],
+            )
+            .unwrap();
+
+        let lowered = domain.lower_program(&program, 0, &Options::new(mesh.clone())).unwrap();
+        let expected_signature = concat!(
+            "  func.func @main(%arg0: tensor<3xf32> {sdy.sharding = #sdy.sharding<@mesh, [{}]>}, ",
+            "%arg1: tensor<f32> {sdy.sharding = #sdy.sharding<@mesh, []>}, ",
+            "%arg2: tensor<f32> {sdy.sharding = #sdy.sharding<@mesh, []>}) -> ",
+            "(tensor<f32> {sdy.sharding = #sdy.sharding<@mesh, []>}, ",
+            "tensor<3xf32> {sdy.sharding = #sdy.sharding<@mesh, [{}]>}) {",
+        );
+        let expected_update = |result, target, update, index| {
+            format!(
+                "    %{result} = stablehlo.dynamic_update_slice %{target}, %{update}, %{index} : \
+                 (tensor<3xf32>, tensor<1xf32>, tensor<i64>) -> tensor<3xf32>",
+            )
+        };
+        assert_eq!(
+            lowered.stable_hlo(),
+            indoc! {r#"
+                module {
+                  sdy.mesh @mesh = <["x"=1]>
+                @SIGNATURE@
+                    %0 = stablehlo.slice %arg0 [1:2] : (tensor<3xf32>) -> tensor<1xf32>
+                    %1 = stablehlo.reshape %0 : (tensor<1xf32>) -> tensor<f32>
+                    %2 = stablehlo.reshape %arg1 : (tensor<f32>) -> tensor<1xf32>
+                    %c = stablehlo.constant dense<1> : tensor<i64>
+                @UPDATE0@
+                    %4 = stablehlo.slice %3 [1:2] : (tensor<3xf32>) -> tensor<1xf32>
+                    %5 = stablehlo.reshape %4 : (tensor<1xf32>) -> tensor<f32>
+                    %6 = stablehlo.add %5, %arg2 : tensor<f32>
+                    %7 = stablehlo.reshape %6 : (tensor<f32>) -> tensor<1xf32>
+                    %c_0 = stablehlo.constant dense<1> : tensor<i64>
+                @UPDATE1@
+                    return %1, %8 : tensor<f32>, tensor<3xf32>
+                  }
+                }
+            "#}
+            .replace("@SIGNATURE@", expected_signature)
+            .replace("@UPDATE0@", &expected_update("3", "arg0", "2", "c"))
+            .replace("@UPDATE1@", &expected_update("8", "3", "7", "c_0")),
+        );
+        let compiled = domain.compile_program(&lowered).unwrap();
+        let outputs = domain
+            .execute_program(
+                &compiled,
+                vec![
+                    f32_vector(&domain, &mesh, &[1.0, 2.0, 3.0]),
+                    f32_scalar(&domain, &mesh, 10.0),
+                    f32_scalar(&domain, &mesh, 3.0),
+                ],
+            )
+            .unwrap();
+        assert_eq!(read_f32s(&client, &outputs[0]), vec![2.0]);
+        assert_eq!(read_f32s(&client, &outputs[1]), vec![1.0, 13.0, 3.0]);
+    }
+
+    #[test]
+    fn test_lowering_preserves_lifted_capture_scope_inside_condition_regions() {
+        let plugin = load_cpu_plugin().unwrap();
+        let client = plugin
+            .client(ClientOptions::CPU(CpuClientOptions { device_count: Some(1), ..Default::default() }))
+            .unwrap();
+        let mesh = domain_mesh(&client, "x", 1);
+        let domain = Session::new(&client).domain();
+        let scalar_type = replicated_scalar_type(&mesh, DataType::F32);
+        let predicate_type = replicated_scalar_type(&mesh, DataType::Boolean);
+
+        let branch = || {
+            let mut builder = ProgramBuilder::new();
+            let capture =
+                builder.add_constant(Constant::Captured(CaptureReference::new(0, scalar_type.clone().into())));
+            builder.build::<Vec<Constant>, Vec<Constant>>(vec![capture], Vec::new(), vec![Placeholder]).unwrap()
+        };
+        let true_branch = branch();
+        let false_branch = branch();
+        let mut builder = ProgramBuilder::new();
+        builder.add_input(scalar_type.clone().into());
+        let predicate = builder.add_input(predicate_type.into());
+        let true_region = builder.import_region(true_branch.entry_region_ref());
+        let false_region = builder.import_region(false_branch.entry_region_ref());
+        let output = builder
+            .add_instruction(ConditionOperation::new(), vec![true_region, false_region], vec![predicate], None)
+            .unwrap()[0];
+        let program = builder
+            .build::<Vec<Constant>, Vec<Constant>>(vec![output], vec![Placeholder; 2], vec![Placeholder])
+            .unwrap();
+
+        let lowered = domain.lower_program(&program, 1, &Options::new(mesh.clone())).unwrap();
+        let compiled = domain.compile_program(&lowered).unwrap();
+        let outputs = domain
+            .execute_program(&compiled, vec![f32_scalar(&domain, &mesh, 7.0), boolean_scalar(&domain, &mesh, true)])
+            .unwrap();
+        assert_eq!(read_f32s(&client, &outputs[0]), vec![7.0]);
+    }
+
+    #[test]
+    fn test_lowering_validates_capture_count_before_reference_discharge() {
+        let plugin = load_cpu_plugin().unwrap();
+        let client = plugin
+            .client(ClientOptions::CPU(CpuClientOptions { device_count: Some(1), ..Default::default() }))
+            .unwrap();
+        let mesh = domain_mesh(&client, "x", 1);
+        let domain = Session::new(&client).domain();
+        let scalar_type = replicated_scalar_type(&mesh, DataType::F32);
+        let mut builder = ProgramBuilder::new();
+        let input = builder.add_input(scalar_type.into());
+        let program = builder
+            .build::<Vec<Constant>, Vec<Constant>>(vec![input], vec![Placeholder], vec![Placeholder])
+            .unwrap();
+
+        assert!(matches!(
+            domain.lower_program(&program, 2, &Options::new(mesh)),
+            Err(Error::Core(ryft_core::Error::Program(ProgramError::InvalidArgument { message })))
+                if message == "capture_count is 2, but the program has only 1 flat input(s)",
+        ));
+    }
+
+    #[test]
+    fn test_lowering_discharges_local_reference_state_through_condition() {
+        let plugin = load_cpu_plugin().unwrap();
+        let client = plugin
+            .client(ClientOptions::CPU(CpuClientOptions { device_count: Some(1), ..Default::default() }))
+            .unwrap();
+        let mesh = domain_mesh(&client, "x", 1);
+        let domain = Session::new(&client).domain();
+        let scalar_type = replicated_scalar_type(&mesh, DataType::F32);
+        let reference_type = ReferenceType::new(scalar_type.clone());
+
+        let true_branch = {
+            let mut builder = ProgramBuilder::new();
+            let reference = builder.add_input(reference_type.clone().into());
+            let replacement = builder.add_input(scalar_type.clone().into());
+            let snapshot = builder
+                .add_instruction(ReferenceSwapOperation::new(), Vec::new(), vec![reference, replacement], None)
+                .unwrap()[0];
+            builder
+                .build::<Vec<Constant>, Vec<Constant>>(vec![snapshot], vec![Placeholder; 2], vec![Placeholder])
+                .unwrap()
+        };
+        let false_branch = {
+            let mut builder = ProgramBuilder::new();
+            let reference = builder.add_input(reference_type.into());
+            builder.add_input(scalar_type.clone().into());
+            let snapshot =
+                builder.add_instruction(ReferenceReadOperation::new(), Vec::new(), vec![reference], None).unwrap()[0];
+            builder
+                .build::<Vec<Constant>, Vec<Constant>>(vec![snapshot], vec![Placeholder; 2], vec![Placeholder])
+                .unwrap()
+        };
+
+        let mut builder = ProgramBuilder::new();
+        let true_branch = builder.import_region(true_branch.entry_region_ref());
+        let false_branch = builder.import_region(false_branch.entry_region_ref());
+        let predicate = builder.add_input(replicated_scalar_type(&mesh, DataType::Boolean).into());
+        let initial = builder.add_input(scalar_type.clone().into());
+        let replacement = builder.add_input(scalar_type.clone().into());
+        let reference =
+            builder.add_instruction(ReferenceNewOperation::new(), Vec::new(), vec![initial], None).unwrap()[0];
+        let snapshot = builder
+            .add_instruction(
+                ConditionOperation::<ArrayIrType>::new(),
+                vec![true_branch, false_branch],
+                vec![predicate, reference, replacement],
+                None,
+            )
+            .unwrap()[0];
+        let final_value =
+            builder.add_instruction(ReferenceFreezeOperation::new(), Vec::new(), vec![reference], None).unwrap()[0];
+        let program = builder
+            .build::<Vec<Constant>, Vec<Constant>>(
+                vec![snapshot, final_value],
+                vec![Placeholder; 3],
+                vec![Placeholder; 2],
+            )
+            .unwrap();
+
+        let lowered = domain.lower_program(&program, 0, &Options::new(mesh.clone())).unwrap();
+        assert_eq!(lowered.output_types(), &[scalar_type.clone(), scalar_type]);
+        let expected_signature = concat!(
+            "  func.func @main(%arg0: tensor<i1> {sdy.sharding = #sdy.sharding<@mesh, []>}, ",
+            "%arg1: tensor<f32> {sdy.sharding = #sdy.sharding<@mesh, []>}, ",
+            "%arg2: tensor<f32> {sdy.sharding = #sdy.sharding<@mesh, []>}) -> ",
+            "(tensor<f32> {sdy.sharding = #sdy.sharding<@mesh, []>}, ",
+            "tensor<f32> {sdy.sharding = #sdy.sharding<@mesh, []>}) {",
+        );
+        let expected_stable_hlo = indoc! {r#"
+            module {
+              sdy.mesh @mesh = <["x"=1]>
+            @SIGNATURE@
+                %0:2 = "stablehlo.if"(%arg0) ({
+                  stablehlo.return %arg1, %arg2 : tensor<f32>, tensor<f32>
+                }, {
+                  stablehlo.return %arg1, %arg1 : tensor<f32>, tensor<f32>
+                }) : (tensor<i1>) -> (tensor<f32>, tensor<f32>)
+                return %0#0, %0#1 : tensor<f32>, tensor<f32>
+              }
+            }
+        "#}
+        .replace("@SIGNATURE@", expected_signature);
+        assert_eq!(lowered.stable_hlo(), expected_stable_hlo,);
+        let compiled = domain.compile_program(&lowered).unwrap();
+
+        let true_outputs = domain
+            .execute_program(
+                &compiled,
+                vec![
+                    boolean_scalar(&domain, &mesh, true),
+                    f32_scalar(&domain, &mesh, 10.0),
+                    f32_scalar(&domain, &mesh, 7.0),
+                ],
+            )
+            .unwrap();
+        assert_eq!(read_f32s(&client, &true_outputs[0]), vec![10.0]);
+        assert_eq!(read_f32s(&client, &true_outputs[1]), vec![7.0]);
+
+        let false_outputs = domain
+            .execute_program(
+                &compiled,
+                vec![
+                    boolean_scalar(&domain, &mesh, false),
+                    f32_scalar(&domain, &mesh, 10.0),
+                    f32_scalar(&domain, &mesh, 7.0),
+                ],
+            )
+            .unwrap();
+        assert_eq!(read_f32s(&client, &false_outputs[0]), vec![10.0]);
+        assert_eq!(read_f32s(&client, &false_outputs[1]), vec![10.0]);
+    }
+
+    #[test]
+    fn test_lowering_discharges_local_reference_state_through_while() {
+        let plugin = load_cpu_plugin().unwrap();
+        let client = plugin
+            .client(ClientOptions::CPU(CpuClientOptions { device_count: Some(1), ..Default::default() }))
+            .unwrap();
+        let mesh = domain_mesh(&client, "x", 1);
+        let domain = Session::new(&client).domain();
+        let scalar_type = replicated_scalar_type(&mesh, DataType::F32);
+        let reference_type = ReferenceType::new(scalar_type.clone());
+
+        let condition = {
+            let mut builder = ProgramBuilder::new();
+            let reference = builder.add_input(reference_type.clone().into());
+            builder.add_instruction(ReferenceReadOperation::new(), Vec::new(), vec![reference], None).unwrap();
+            let predicate =
+                CoreArray::from_elements(replicated_scalar_type(&mesh, DataType::Boolean), &[true]).unwrap();
+            let predicate =
+                builder.add_instruction(ConstantOperation::new(predicate), Vec::new(), Vec::new(), None).unwrap()[0];
+            builder
+                .build::<Vec<Constant>, Vec<Constant>>(vec![predicate], vec![Placeholder], vec![Placeholder])
+                .unwrap()
+        };
+        let body = {
+            let mut builder = ProgramBuilder::new();
+            let reference = builder.add_input(reference_type.into());
+            let update = builder
+                .add_instruction(OneOperation::new(scalar_type.clone()), Vec::new(), Vec::new(), None)
+                .unwrap()[0];
+            builder
+                .add_instruction(ReferenceAddUpdateOperation::new(), Vec::new(), vec![reference, update], None)
+                .unwrap();
+            builder
+                .build::<Vec<Constant>, Vec<Constant>>(vec![reference], vec![Placeholder], vec![Placeholder])
+                .unwrap()
+        };
+
+        let mut builder = ProgramBuilder::new();
+        let condition = builder.import_region(condition.entry_region_ref());
+        let body = builder.import_region(body.entry_region_ref());
+        let initial = builder.add_input(scalar_type.clone().into());
+        let reference =
+            builder.add_instruction(ReferenceNewOperation::new(), Vec::new(), vec![initial], None).unwrap()[0];
+        let operation = WhileOperation::<ArrayIrType>::new().with_iteration_bound(3).unwrap();
+        let reference = builder.add_instruction(operation, vec![condition, body], vec![reference], None).unwrap()[0];
+        let output =
+            builder.add_instruction(ReferenceFreezeOperation::new(), Vec::new(), vec![reference], None).unwrap()[0];
+        let program = builder
+            .build::<Vec<Constant>, Vec<Constant>>(vec![output], vec![Placeholder], vec![Placeholder])
+            .unwrap();
+
+        let lowered = domain.lower_program(&program, 0, &Options::new(mesh.clone())).unwrap();
+        assert_eq!(lowered.stable_hlo().matches("stablehlo.while").count(), 1, "{}", lowered.stable_hlo());
+        let compiled = domain.compile_program(&lowered).unwrap();
+        let outputs = domain.execute_program(&compiled, vec![f32_scalar(&domain, &mesh, 2.0)]).unwrap();
+
+        // Three bounded iterations accumulate the constant `1.0` into the initial `2.0` state.
+        assert_eq!(read_f32s(&client, &outputs[0]), vec![5.0]);
+    }
+
+    #[test]
+    fn test_lowering_discharges_local_reference_state_through_static_scan() {
+        let plugin = load_cpu_plugin().unwrap();
+        let client = plugin
+            .client(ClientOptions::CPU(CpuClientOptions { device_count: Some(1), ..Default::default() }))
+            .unwrap();
+        let mesh = domain_mesh(&client, "x", 1);
+        let domain = Session::new(&client).domain();
+        let scalar_type = replicated_scalar_type(&mesh, DataType::F32);
+        let reference_type = ReferenceType::new(scalar_type.clone());
+
+        let body = {
+            let mut builder = ProgramBuilder::new();
+            builder.add_input(ArrayType::scalar(DataType::I64).into());
+            let reference = builder.add_input(reference_type.into());
+            let update = builder
+                .add_instruction(OneOperation::new(scalar_type.clone()), Vec::new(), Vec::new(), None)
+                .unwrap()[0];
+            builder
+                .add_instruction(ReferenceAddUpdateOperation::new(), Vec::new(), vec![reference, update], None)
+                .unwrap();
+            let value =
+                builder.add_instruction(ReferenceReadOperation::new(), Vec::new(), vec![reference], None).unwrap()[0];
+            builder
+                .build::<Vec<Constant>, Vec<Constant>>(
+                    vec![reference, value],
+                    vec![Placeholder, Placeholder],
+                    vec![Placeholder; 2],
+                )
+                .unwrap()
+        };
+
+        let mut builder = ProgramBuilder::new();
+        let body = builder.import_region(body.entry_region_ref());
+        let initial = builder.add_input(scalar_type.into());
+        let reference =
+            builder.add_instruction(ReferenceNewOperation::new(), Vec::new(), vec![initial], None).unwrap()[0];
+        let scan_outputs = builder
+            .add_instruction(ScanOperation::new(1, 3), vec![body], vec![reference], None)
+            .unwrap()
+            .to_vec();
+        let final_value = builder
+            .add_instruction(ReferenceFreezeOperation::new(), Vec::new(), vec![scan_outputs[0]], None)
+            .unwrap()[0];
+        let program = builder
+            .build::<Vec<Constant>, Vec<Constant>>(
+                vec![final_value, scan_outputs[1]],
+                vec![Placeholder],
+                vec![Placeholder; 2],
+            )
+            .unwrap();
+
+        let lowered = domain.lower_program(&program, 0, &Options::new(mesh.clone())).unwrap();
+        assert_eq!(lowered.stable_hlo().matches("stablehlo.while").count(), 1, "{}", lowered.stable_hlo());
+        let compiled = domain.compile_program(&lowered).unwrap();
+        let outputs = domain.execute_program(&compiled, vec![f32_scalar(&domain, &mesh, 2.0)]).unwrap();
+
+        // Three scan iterations accumulate the constant `1.0` into the initial `2.0` state, and the body's second
+        // output stacks the state observed after each iteration.
+        assert_eq!(read_f32s(&client, &outputs[0]), vec![5.0]);
+        assert_eq!(read_f32s(&client, &outputs[1]), vec![3.0, 4.0, 5.0]);
+    }
+
+    #[test]
+    fn test_lowering_discharges_local_reference_state_through_dynamic_scan() {
+        let plugin = load_cpu_plugin().unwrap();
+        let client = plugin
+            .client(ClientOptions::CPU(CpuClientOptions { device_count: Some(1), ..Default::default() }))
+            .unwrap();
+        let mesh = domain_mesh(&client, "x", 1);
+        let domain = Session::new(&client).domain();
+        let scalar_type = replicated_scalar_type(&mesh, DataType::F32);
+        let reference_type = ReferenceType::new(scalar_type.clone());
+        let length_variable = DimensionVariable::new("length", DimensionBounds::new(0, Some(9)).unwrap());
+        let length = DimensionValue::new(DimensionType::from(length_variable.clone()), 3).unwrap();
+
+        let body = {
+            let mut builder = ProgramBuilder::new();
+            builder.add_input(ArrayType::scalar(DataType::I64).into());
+            let reference = builder.add_input(reference_type.into());
+            let update = builder
+                .add_instruction(OneOperation::new(scalar_type.clone()), Vec::new(), Vec::new(), None)
+                .unwrap()[0];
+            builder
+                .add_instruction(ReferenceAddUpdateOperation::new(), Vec::new(), vec![reference, update], None)
+                .unwrap();
+            builder
+                .build::<Vec<Constant>, Vec<Constant>>(
+                    vec![reference],
+                    vec![Placeholder, Placeholder],
+                    vec![Placeholder],
+                )
+                .unwrap()
+        };
+
+        let mut builder = ProgramBuilder::new();
+        let body = builder.import_region(body.entry_region_ref());
+        let initial = builder.add_input(scalar_type.into());
+        let reference =
+            builder.add_instruction(ReferenceNewOperation::new(), Vec::new(), vec![initial], None).unwrap()[0];
+        let runtime_length = builder.add_constant(Constant::Dimension(length.clone()));
+        let reference = builder
+            .add_instruction(
+                ScanOperation::new(1, CoreDimension::Dynamic(length_variable.clone())),
+                vec![body],
+                vec![reference, runtime_length],
+                None,
+            )
+            .unwrap()[0];
+        let output =
+            builder.add_instruction(ReferenceFreezeOperation::new(), Vec::new(), vec![reference], None).unwrap()[0];
+        let program = builder
+            .build::<Vec<Constant>, Vec<Constant>>(vec![output], vec![Placeholder], vec![Placeholder])
+            .unwrap();
+
+        let scan_instruction = &program.entry_region_ref().instructions()[1];
+        let Operation::Scan(scan) = scan_instruction.operation() else {
+            panic!("expected dynamic scan operation");
+        };
+        assert_eq!(scan.carry_count(), 1);
+        assert_eq!(scan.iteration_count(), &CoreDimension::Dynamic(length_variable));
+        let runtime_length = *scan_instruction.inputs().last().unwrap();
+        assert_eq!(
+            program.entry_region_ref().atoms()[runtime_length.index()].as_constant(),
+            Some(&Constant::Dimension(length)),
+        );
+        let lowered = domain.lower_program(&program, 0, &Options::new(mesh.clone())).unwrap();
+        assert_eq!(lowered.stable_hlo().matches("stablehlo.while").count(), 1, "{}", lowered.stable_hlo());
+        let compiled = domain.compile_program(&lowered).unwrap();
+        let outputs = domain.execute_program(&compiled, vec![f32_scalar(&domain, &mesh, 2.0)]).unwrap();
+
+        // The runtime length is three, so the scan accumulates the constant `1.0` into the initial `2.0` state three
+        // times.
+        assert_eq!(read_f32s(&client, &outputs[0]), vec![5.0]);
+    }
+
+    #[test]
+    fn test_lowering_discharges_local_reference_state_through_nested_jit_call() {
+        let plugin = load_cpu_plugin().unwrap();
+        let client = plugin
+            .client(ClientOptions::CPU(CpuClientOptions { device_count: Some(1), ..Default::default() }))
+            .unwrap();
+        let mesh = domain_mesh(&client, "x", 1);
+        let domain = Session::new(&client).domain();
+        let scalar_type = replicated_scalar_type(&mesh, DataType::F32);
+        let reference_type = ReferenceType::new(scalar_type.clone());
+
+        let callee = {
+            let mut builder = ProgramBuilder::new();
+            let reference = builder.add_input(reference_type.into());
+            let update = builder.add_input(scalar_type.clone().into());
+            builder
+                .add_instruction(ReferenceAddUpdateOperation::new(), Vec::new(), vec![reference, update], None)
+                .unwrap();
+            builder
+                .build::<Vec<Constant>, Vec<Constant>>(vec![reference], vec![Placeholder; 2], vec![Placeholder])
+                .unwrap()
+        };
+
+        let mut builder = ProgramBuilder::new();
+        let callee = builder.import_region(callee.entry_region_ref());
+        let initial = builder.add_input(scalar_type.clone().into());
+        let update = builder.add_input(scalar_type.into());
+        let reference =
+            builder.add_instruction(ReferenceNewOperation::new(), Vec::new(), vec![initial], None).unwrap()[0];
+        let reference = builder
+            .add_instruction(Operation::JitCall(JitCallOperation::new(0)), vec![callee], vec![reference, update], None)
+            .unwrap()[0];
+        let output =
+            builder.add_instruction(ReferenceFreezeOperation::new(), Vec::new(), vec![reference], None).unwrap()[0];
+        let program = builder
+            .build::<Vec<Constant>, Vec<Constant>>(vec![output], vec![Placeholder; 2], vec![Placeholder])
+            .unwrap();
+
+        assert!(matches!(
+            program.entry_region_ref().instructions()[1].operation(),
+            Operation::JitCall(operation) if operation.capture_count() == 0,
+        ));
+        let lowered = domain.lower_program(&program, 0, &Options::new(mesh.clone())).unwrap();
+        assert_eq!(lowered.stable_hlo().matches("stablehlo.add").count(), 1, "{}", lowered.stable_hlo());
+        let compiled = domain.compile_program(&lowered).unwrap();
+        let outputs = domain
+            .execute_program(&compiled, vec![f32_scalar(&domain, &mesh, 2.0), f32_scalar(&domain, &mesh, 4.0)])
+            .unwrap();
+
+        let immutable_oracle = 2.0f32 + 4.0;
+        assert_eq!(read_f32s(&client, &outputs[0]), vec![immutable_oracle]);
+    }
+
+    #[test]
+    fn test_lowering_carries_external_reference_state_metadata_after_discharge() {
+        let plugin = load_cpu_plugin().unwrap();
+        let client = plugin
+            .client(ClientOptions::CPU(CpuClientOptions { device_count: Some(1), ..Default::default() }))
+            .unwrap();
+        let mesh = domain_mesh(&client, "x", 1);
+        let domain = Session::new(&client).domain();
+
+        let mut builder = ProgramBuilder::new();
+        let input = builder.add_input(ArrayIrType::Reference(ReferenceType::new(ArrayType::scalar(DataType::F32))));
+        let output = builder.add_instruction(ReferenceReadOperation::new(), Vec::new(), vec![input], None).unwrap()[0];
+        let program: FlatProgram = builder
+            .build::<Vec<Constant>, Vec<Constant>>(vec![output], vec![Placeholder], vec![Placeholder])
+            .unwrap();
+        let lowered = domain.lower_program(&program, 0, &Options::new(mesh)).unwrap();
+        assert_eq!(lowered.output_count, 1);
+        assert_eq!(lowered.reference_states.len(), 1);
+        assert_eq!(lowered.reference_states[0].source().flat_input_index(lowered.capture_count).unwrap(), 0);
+        assert_eq!(lowered.reference_states[0].output_index(), None);
+        assert!(!lowered.stable_hlo.contains("reference"));
+    }
+
+    #[test]
+    fn test_lowering_preserves_provenance_locations_end_to_end() {
+        let plugin = load_cpu_plugin().unwrap();
+        let client = plugin
+            .client(ClientOptions::CPU(CpuClientOptions { device_count: Some(1), ..Default::default() }))
+            .unwrap();
+        let mesh = domain_mesh(&client, "x", 1);
+        let domain = Session::new(&client).domain().with_mesh(mesh.clone());
+        let input_type = replicated_scalar_type(&mesh, DataType::F64);
+
+        // Builds `-(x * x)` with the multiplication carrying the provided provenance.
+        fn build_program(
+            input_type: &ArrayType,
+            provenance: Provenance,
+        ) -> crate::experimental::ops::Program<Vec<Constant>, Vec<Constant>> {
+            let mut builder = ProgramBuilder::new();
+            let input = builder.add_input(input_type.clone().into());
+            let product = builder
+                .add_instruction(MulOperation::new(), Vec::new(), vec![input, input], Some(provenance))
+                .unwrap()[0];
+            let negated = builder.add_instruction(NegOperation::new(), Vec::new(), vec![product], None).unwrap()[0];
+            builder.build(vec![negated], vec![Placeholder], vec![Placeholder]).unwrap()
+        }
+
+        let coordinate_basis = Provenance::scope(
+            ProvenanceScope::new("ryft"),
+            Provenance::scope(
+                ProvenanceScope::new("differentiation"),
+                Provenance::scope(ProvenanceScope::new("coordinate_basis"), Provenance::unknown()),
+            ),
+        );
+        let scoped = build_program(&input_type, coordinate_basis);
+        let options = Options::new(mesh.clone());
+        let lowered = domain.lower_program(&scoped, 0, &options).unwrap();
+
+        // The nested framework scopes survive lowering as a chain of nested name locations that is visible in the
+        // serialized module (and therefore in dumped MLIR/HLO metadata), while the unknown-provenance negation and
+        // the module scaffolding keep the base location.
+        assert_eq!(
+            lowered.stable_hlo(),
+            indoc! {r#"
+                #loc = loc(unknown)
+                module {
+                  sdy.mesh @mesh = <["x"=1]> loc(#loc)
+                  func.func @main(%arg0: tensor<f64> {sdy.sharding = #sdy.sharding<@mesh, []>} loc(unknown)) -> (tensor<f64> {sdy.sharding = #sdy.sharding<@mesh, []>}) {
+                    %0 = stablehlo.multiply %arg0, %arg0 : tensor<f64> loc(#loc3)
+                    %1 = stablehlo.negate %0 : tensor<f64> loc(#loc)
+                    return %1 : tensor<f64> loc(#loc)
+                  } loc(#loc)
+                } loc(#loc)
+                #loc1 = loc("coordinate_basis")
+                #loc2 = loc("differentiation"(#loc1))
+                #loc3 = loc("ryft"(#loc2))
+            "#},
+        );
+
+        // Provenance does not affect numeric results.
+        let compiled = domain.compile_program(&lowered).unwrap();
+        let value =
+            Array::from_host_buffer(&domain, input_type.clone(), mesh.clone(), 3.0_f64.to_ne_bytes().as_slice())
+                .unwrap();
+        let outputs = domain.execute_program(&compiled, vec![value]).unwrap();
+        assert_eq!(read_f64s(&client, &outputs[0]), vec![-9.0]);
+
+        // Two semantically equal programs with different scope names serialize differently and therefore key
+        // differently, so neither can receive the other's labeled executable, while a provenance-free program keeps
+        // the location-free serialization (and hence its pre-provenance cache key) entirely.
+        let relabeled =
+            build_program(&input_type, Provenance::scope(ProvenanceScope::new("other_label"), Provenance::unknown()));
+        let relabeled = domain.lower_program(&relabeled, 0, &options).unwrap();
+        assert_ne!(
+            Domain::canonical_compilation_key(&lowered).unwrap(),
+            Domain::canonical_compilation_key(&relabeled).unwrap(),
+        );
+        let unlabeled = build_program(&input_type, Provenance::unknown());
+        let unlabeled = domain.lower_program(&unlabeled, 0, &options).unwrap();
+        assert_eq!(
+            unlabeled.stable_hlo(),
+            indoc! {r#"
+                module {
+                  sdy.mesh @mesh = <["x"=1]>
+                  func.func @main(%arg0: tensor<f64> {sdy.sharding = #sdy.sharding<@mesh, []>}) -> (tensor<f64> {sdy.sharding = #sdy.sharding<@mesh, []>}) {
+                    %0 = stablehlo.multiply %arg0, %arg0 : tensor<f64>
+                    %1 = stablehlo.negate %0 : tensor<f64>
+                    return %1 : tensor<f64>
+                  }
+                }
+            "#},
+        );
+    }
+
+    #[test]
+    fn test_canonical_compilation_options_sorts_protobuf_maps() {
+        use ryft_pjrt::protos::{DebugOptions, ExecutableCompilationOptions, OptionOverride};
+
+        let mut left = CompilationOptions::default();
+        left.environment_option_overrides.insert("z".into(), OptionOverride::default());
+        left.environment_option_overrides.insert("a".into(), OptionOverride::default());
+        left.executable_build_options = Some(ExecutableCompilationOptions {
+            debug_options: Some(DebugOptions {
+                xla_backend_extra_options: [("z".into(), "2".into()), ("a".into(), "1".into())].into_iter().collect(),
+                ..DebugOptions::default()
+            }),
+            ..ExecutableCompilationOptions::default()
+        });
+        let mut right = CompilationOptions::default();
+        right.environment_option_overrides.insert("a".into(), OptionOverride::default());
+        right.environment_option_overrides.insert("z".into(), OptionOverride::default());
+        right.executable_build_options = Some(ExecutableCompilationOptions {
+            debug_options: Some(DebugOptions {
+                xla_backend_extra_options: [("a".into(), "1".into()), ("z".into(), "2".into())].into_iter().collect(),
+                ..DebugOptions::default()
+            }),
+            ..ExecutableCompilationOptions::default()
+        });
+
+        assert_eq!(left, right);
+        assert_eq!(canonical_compilation_options_bytes(&left), canonical_compilation_options_bytes(&right));
+    }
+
+    #[test]
+    fn test_ragged_dot_lowering_strategy_is_compilation_policy() {
+        use std::collections::HashMap;
+
+        let plugin = load_cpu_plugin().unwrap();
+        let client = plugin
+            .client(ClientOptions::CPU(CpuClientOptions { device_count: Some(1), ..Default::default() }))
+            .unwrap();
+        let mesh = domain_mesh(&client, "x", 1);
+        let domain = Session::new(&client).domain().with_mesh(mesh.clone());
+        let lhs_type = ArrayType::new_static(DataType::F32, [5, 2]);
+        let rhs_type = ArrayType::new_static(DataType::F32, [3, 2, 1]);
+        let group_sizes_type = ArrayType::new_static(DataType::I32, [3]);
+        let mut builder = ProgramBuilder::new();
+        let lhs = builder.add_input(ArrayIrType::Array(lhs_type));
+        let rhs = builder.add_input(ArrayIrType::Array(rhs_type));
+        let group_sizes = builder.add_input(ArrayIrType::Array(group_sizes_type));
+        let output = builder
+            .add_instruction(
+                RaggedDotOperation::new(RaggedDotDimensionNumbers::matmul()),
+                Vec::new(),
+                vec![lhs, rhs, group_sizes],
+                None,
+            )
+            .unwrap()[0];
+        let program = builder
+            .build::<Vec<Constant>, Vec<Constant>>(vec![output], vec![Placeholder; 3], vec![Placeholder])
+            .unwrap();
+        let decomposition_options = Options::new(mesh.clone());
+        let instruction_options =
+            Options::new(mesh).with_ragged_dot_lowering_strategy(RaggedDotLoweringStrategy::Instruction);
+        let decomposition = domain.lower_program(&program, 0, &decomposition_options).unwrap();
+        let instruction = domain.lower_program(&program, 0, &instruction_options).unwrap();
+
+        assert!(decomposition.stable_hlo().contains("stablehlo.dot_general"));
+        assert!(!decomposition.stable_hlo().contains("chlo.ragged_dot"));
+        assert!(instruction.stable_hlo().contains("chlo.ragged_dot"));
+        assert_ne!(decomposition.stable_hlo(), instruction.stable_hlo());
+        assert_ne!(decomposition_options, instruction_options);
+        let options_by_representation = HashMap::from([
+            (decomposition_options.clone(), "decomposition"),
+            (instruction_options.clone(), "instruction"),
+        ]);
+        assert_eq!(options_by_representation.len(), 2);
+        assert_eq!(options_by_representation.get(&decomposition_options), Some(&"decomposition"));
+        assert_eq!(options_by_representation.get(&instruction_options), Some(&"instruction"));
+    }
+
+    #[test]
+    fn test_data_dependent_padding_inventory_is_kind_and_kernel_specific() {
+        use DataDependentPaddingDiscipline::{Propagated, RyftMasked, Unsupported, XlaMasked};
+
+        // Every reference operation shares one collapsed match arm, so one representative pins that arm.
+        assert_eq!(
+            data_dependent_padding_discipline(&Operation::ReferenceNew(ReferenceNewOperation::new())),
+            Unsupported { reason: "references must be discharged before bounded-dynamic XLA validation" },
+        );
+
+        for kind in [
+            ReductionKind::Sum,
+            ReductionKind::Product,
+            ReductionKind::LogSumExp,
+            ReductionKind::Max,
+            ReductionKind::Min,
+            ReductionKind::Any,
+            ReductionKind::All,
+        ] {
+            assert_eq!(reduction_data_dependent_padding_discipline(kind), XlaMasked);
+        }
+        assert_eq!(
+            reduction_data_dependent_padding_discipline(ReductionKind::Mean),
+            Unsupported { reason: "mean over a dynamically sized reduction axis is not supported by the XLA lowering" },
+        );
+        for direction in [SortDirection::Ascending, SortDirection::Descending] {
+            assert_eq!(sort_data_dependent_padding_discipline(direction), XlaMasked);
+        }
+        for operation in [
+            ArrayOperation::ArgMax(ArgMaxOperation::new(0, DataType::I32)),
+            ArrayOperation::ArgMin(ArgMinOperation::new(0, DataType::I32)),
+        ] {
+            assert_eq!(array_data_dependent_padding_discipline(&operation), XlaMasked);
+        }
+        for kind in [
+            ScatterReductionKind::Overwrite,
+            ScatterReductionKind::Add,
+            ScatterReductionKind::Mul,
+            ScatterReductionKind::Min,
+            ScatterReductionKind::Max,
+        ] {
+            assert!(matches!(
+                scatter_data_dependent_padding_discipline(kind),
+                Unsupported { reason } if reason.contains("scatter padding semantics have not been verified"),
+            ));
+        }
+
+        assert_eq!(
+            array_data_dependent_padding_discipline(&ArrayOperation::ScaledDot(ScaledDotOperation::new(
+                DotDimensionNumbers::new(vec![1], vec![1], Vec::new(), Vec::new()),
+                DataType::F32,
+                true,
+                true,
+            ))),
+            RyftMasked,
+        );
+
+        // A log-sum-exp `reduce` expands into maximum and summation reductions, so it carries the same masking
+        // contract as those two reduction kinds.
+        assert_eq!(
+            array_data_dependent_padding_discipline(&ArrayOperation::Reduce(ReduceOperation::new(
+                vec![0],
+                ReductionKind::LogSumExp,
+            ))),
+            XlaMasked,
+        );
+
+        // The prefix scans own their own arm rather than sharing the collapsed shape-preserving one, because the
+        // classification rests on type inference keeping the scanned axis static.
+        for kind in [
+            CumulativeKind::Sum,
+            CumulativeKind::Product,
+            CumulativeKind::Max,
+            CumulativeKind::Min,
+            CumulativeKind::LogSumExp,
+        ] {
+            assert_eq!(
+                array_data_dependent_padding_discipline(&ArrayOperation::Cumulative(CumulativeOperation::new(0, kind))),
+                Propagated,
+            );
+        }
+    }
+
+    #[test]
+    fn test_condition_recreates_reference_view_inside_branch() {
+        let plugin = load_cpu_plugin().unwrap();
+        let client = plugin
+            .client(ClientOptions::CPU(CpuClientOptions { device_count: Some(1), ..Default::default() }))
+            .unwrap();
+        let mesh = domain_mesh(&client, "x", 1);
+        let domain = Session::new(&client).domain();
+        let vector_type = replicated_vector_type(&mesh, 3);
+        let scalar_type = replicated_scalar_type(&mesh, DataType::F32);
+        let reference_type = ReferenceType::new(vector_type.clone());
+        let true_branch = {
+            let mut builder = ProgramBuilder::new();
+            let reference = builder.add_input(reference_type.clone().into());
+            let update =
+                builder.add_instruction(OneOperation::new(scalar_type), Vec::new(), Vec::new(), None).unwrap()[0];
+            builder
+                .add_instruction(
+                    ReferenceAddUpdateOperation::new().with_transforms(vec![ArrayReferenceTransform::Index {
+                        axis: 0,
+                        index: ArrayReferenceTransformIndex::Static(1),
+                    }]),
+                    Vec::new(),
+                    vec![reference, update],
+                    None,
+                )
+                .unwrap();
+            builder
+                .build::<Vec<Constant>, Vec<Constant>>(vec![reference], vec![Placeholder], vec![Placeholder])
+                .unwrap()
+        };
+        let false_branch = {
+            let mut builder = ProgramBuilder::new();
+            let reference = builder.add_input(reference_type.into());
+            builder
+                .build::<Vec<Constant>, Vec<Constant>>(vec![reference], vec![Placeholder], vec![Placeholder])
+                .unwrap()
+        };
+
+        let mut builder = ProgramBuilder::new();
+        let true_branch = builder.import_region(true_branch.entry_region_ref());
+        let false_branch = builder.import_region(false_branch.entry_region_ref());
+        let predicate = builder.add_input(replicated_scalar_type(&mesh, DataType::Boolean).into());
+        let initial = builder.add_input(vector_type.into());
+        let reference =
+            builder.add_instruction(ReferenceNewOperation::new(), Vec::new(), vec![initial], None).unwrap()[0];
+        let reference = builder
+            .add_instruction(
+                ConditionOperation::<ArrayIrType>::new(),
+                vec![true_branch, false_branch],
+                vec![predicate, reference],
+                None,
+            )
+            .unwrap()[0];
+        let output =
+            builder.add_instruction(ReferenceFreezeOperation::new(), Vec::new(), vec![reference], None).unwrap()[0];
+        let program = builder
+            .build::<Vec<Constant>, Vec<Constant>>(vec![output], vec![Placeholder; 2], vec![Placeholder])
+            .unwrap();
+
+        let lowered = domain.lower_program(&program, 0, &Options::new(mesh.clone())).unwrap();
+        let expected_signature = concat!(
+            "  func.func @main(%arg0: tensor<i1> {sdy.sharding = #sdy.sharding<@mesh, []>}, ",
+            "%arg1: tensor<3xf32> {sdy.sharding = #sdy.sharding<@mesh, [{}]>}) -> ",
+            "(tensor<3xf32> {sdy.sharding = #sdy.sharding<@mesh, [{}]>}) {",
+        );
+        let expected_update = concat!(
+            "      %5 = stablehlo.dynamic_update_slice %arg1, %4, %c : ",
+            "(tensor<3xf32>, tensor<1xf32>, tensor<i64>) -> tensor<3xf32>",
+        );
+        assert_eq!(
+            lowered.stable_hlo(),
+            indoc! {r#"
+                module {
+                  sdy.mesh @mesh = <["x"=1]>
+                @SIGNATURE@
+                    %0 = "stablehlo.if"(%arg0) ({
+                      %cst = stablehlo.constant dense<1.000000e+00> : tensor<f32>
+                      %1 = stablehlo.slice %arg1 [1:2] : (tensor<3xf32>) -> tensor<1xf32>
+                      %2 = stablehlo.reshape %1 : (tensor<1xf32>) -> tensor<f32>
+                      %3 = stablehlo.add %2, %cst : tensor<f32>
+                      %4 = stablehlo.reshape %3 : (tensor<f32>) -> tensor<1xf32>
+                      %c = stablehlo.constant dense<1> : tensor<i64>
+                @UPDATE@
+                      stablehlo.return %5 : tensor<3xf32>
+                    }, {
+                      stablehlo.return %arg1 : tensor<3xf32>
+                    }) : (tensor<i1>) -> tensor<3xf32>
+                    return %0 : tensor<3xf32>
+                  }
+                }
+            "#}
+            .replace("@SIGNATURE@", expected_signature)
+            .replace("@UPDATE@", expected_update),
+        );
+        let compiled = domain.compile_program(&lowered).unwrap();
+        for (predicate, expected) in [(true, vec![1.0, 3.0, 3.0]), (false, vec![1.0, 2.0, 3.0])] {
+            let outputs = domain
+                .execute_program(
+                    &compiled,
+                    vec![boolean_scalar(&domain, &mesh, predicate), f32_vector(&domain, &mesh, &[1.0, 2.0, 3.0])],
+                )
+                .unwrap();
+            assert_eq!(read_f32s(&client, &outputs[0]), expected);
+        }
+    }
+}

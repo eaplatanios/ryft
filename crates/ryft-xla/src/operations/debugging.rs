@@ -16,7 +16,7 @@ use ryft_pjrt::extensions::ffi::{
 use ryft_pjrt::{Client, Error as PjrtError};
 
 use crate::experimental::lowering::{EffectTokens, current_or_new_token};
-use crate::{Error, LowerableOperation, LowerableOperationFamily, XlaLowerer};
+use crate::{Error, LowerableOperation, LowerableOperationFamily, Lowerer};
 
 #[cfg(any(feature = "cuda-12", feature = "cuda-13"))]
 use crate::operations::assertions::copy_cuda_bytes;
@@ -236,7 +236,7 @@ unsafe fn print_handler_for_memory(
     call_frame: *mut XLA_FFI_CallFrame,
     memory: impl FnOnce(&FfiCallFrame<'_>) -> Result<PrintBufferMemory, FfiError>,
 ) -> *mut XLA_FFI_Error {
-    let _callback_guard = crate::experimental::domains::EffectCallbackGuard::enter();
+    let _callback_guard = crate::domains::EffectCallbackGuard::enter();
     // SAFETY: The XLA runtime passes a call frame that is valid for the duration of this invocation, and all
     // further unsafe access to it is localized in the safe `FfiCallFrame` wrapper and `handle_print_call_frame`.
     unsafe {
@@ -451,7 +451,7 @@ fn copy_value_to_outputs(
 impl LowerableOperation for PrintOperation<ArrayType> {
     fn lower<'b, 'c: 'b, 't: 'c, O: LowerableOperationFamily>(
         &self,
-        lowerer: &mut XlaLowerer<'b, 'c, 't, O>,
+        lowerer: &mut Lowerer<'b, 'c, 't, O>,
         input_values: &[ValueRef<'b, 'c, 't>],
         _input_types: &[ArrayType],
         _output_types: &[ArrayType],
@@ -481,7 +481,8 @@ mod tests {
     use indoc::indoc;
     use pretty_assertions::assert_eq;
     use ryft_core::{
-        AddOperation, ArrayType, DataType, Dimension, LogicalMesh, MeshAxis, MeshAxisType, Placeholder, Shape, Sharding,
+        AddOperation, ArrayType, DataType, Dimension as CoreDimension, LogicalMesh, MeshAxis, MeshAxisType,
+        Placeholder, Shape, Sharding,
     };
     use ryft_pjrt::protos::{CompilationOptions, ExecutableCompilationOptions, Precision};
     use ryft_pjrt::{
@@ -489,8 +490,8 @@ mod tests {
     };
 
     use crate::experimental::lowering::lower_mlir_module_for_program_with_reference_state;
-    use crate::experimental::lowering::tests::{XlaProgramBuilder, unproject_plain_program};
-    use crate::experimental::ops::XlaArrayConstant;
+    use crate::experimental::lowering::tests::{ProgramBuilder, unproject_plain_program};
+    use crate::experimental::ops::ArrayConstant;
     use crate::operations::dot::RaggedDotLoweringStrategy;
     use crate::tests::{values_from_bytes, values_to_bytes};
     use crate::to_mlir_module_for_program;
@@ -509,8 +510,8 @@ mod tests {
         // `stablehlo.after_all` at the first print, the second print consumes the first print's token result, and
         // each print's data flow output is its forwarded operand (the final add reads `%arg0` and `%0`, not custom
         // call results).
-        let array_type = ArrayType::new(DataType::F64, Shape::new(vec![Dimension::Static(2)]));
-        let mut builder = XlaProgramBuilder::new();
+        let array_type = ArrayType::new(DataType::F64, Shape::new(vec![CoreDimension::Static(2)]));
+        let mut builder = ProgramBuilder::new();
         let input = builder.add_input(array_type.clone());
         let doubled = builder.add_instruction(AddOperation::new(), Vec::new(), vec![input, input], None).unwrap()[0];
         let first = builder
@@ -521,7 +522,7 @@ mod tests {
             .unwrap()[0];
         let output = builder.add_instruction(AddOperation::new(), Vec::new(), vec![first, second], None).unwrap()[0];
         let program = builder
-            .build::<Vec<XlaArrayConstant>, Vec<XlaArrayConstant>>(vec![output], vec![Placeholder], vec![Placeholder])
+            .build::<Vec<ArrayConstant>, Vec<ArrayConstant>>(vec![output], vec![Placeholder], vec![Placeholder])
             .unwrap();
         let program = unproject_plain_program(program);
         let input_types = vec![array_type.clone()];
@@ -553,7 +554,7 @@ mod tests {
         for effect_class in [EffectClass::UnorderedIo, EffectClass::OrderedIo, EffectClass::DeviceOrderedIo] {
             let ordered = effect_class.is_ordered();
             let array_type = ArrayType::scalar(DataType::F32);
-            let mut builder = XlaProgramBuilder::new();
+            let mut builder = ProgramBuilder::new();
             let input = builder.add_input(array_type.clone());
             builder
                 .add_instruction(
@@ -563,9 +564,8 @@ mod tests {
                     None,
                 )
                 .unwrap();
-            let program = builder
-                .build::<Vec<XlaArrayConstant>, Vec<XlaArrayConstant>>(vec![], vec![Placeholder], vec![])
-                .unwrap();
+            let program =
+                builder.build::<Vec<ArrayConstant>, Vec<ArrayConstant>>(vec![], vec![Placeholder], vec![]).unwrap();
             let lowered = lower_mlir_module_for_program_with_reference_state(
                 &unproject_plain_program(program),
                 &[],
@@ -604,10 +604,10 @@ mod tests {
         use ryft_core::{Device, DeviceMesh, Print};
         use ryft_pjrt::{ClientOptions, CpuClientOptions, load_cpu_plugin};
 
-        use crate::XlaSession;
+        use crate::Session;
         use crate::operations::debugging::{ensure_print_handler_registered, with_captured_prints};
         use crate::tests::{values_from_bytes, values_to_bytes};
-        use crate::{CompiledXlaFunction, FromPjrt, XlaArray, compile};
+        use crate::{Array, CompiledFunction, FromPjrt, compile};
 
         let plugin = load_cpu_plugin().unwrap();
         let client = plugin
@@ -620,12 +620,12 @@ mod tests {
             vec![device],
         )
         .unwrap();
-        let engine = XlaSession::new(&client).domain();
+        let engine = Session::new(&client).domain();
 
-        let input_type = ArrayType::new(DataType::F64, Shape::new(vec![Dimension::Static(2)]))
+        let input_type = ArrayType::new(DataType::F64, Shape::new(vec![CoreDimension::Static(2)]))
             .with_sharding(Sharding::replicated(mesh.logical_mesh().clone(), 1))
             .unwrap();
-        let compiled: CompiledXlaFunction<'_, ArrayType, ArrayType> = compile(
+        let compiled: CompiledFunction<'_, ArrayType, ArrayType> = compile(
             |x| {
                 let x = x.print("x").unwrap();
                 (x.clone() + x).print("doubled").unwrap()
@@ -638,7 +638,7 @@ mod tests {
 
         let values = [1.5f64, 2.5];
         let source =
-            XlaArray::from_host_buffer(&engine, input_type, mesh.clone(), values_to_bytes::<f64>(&values).as_slice())
+            Array::from_host_buffer(&engine, input_type, mesh.clone(), values_to_bytes::<f64>(&values).as_slice())
                 .unwrap();
         let (output, lines) =
             with_captured_prints(|| engine.interpret(&compiled.executable_function(), source).unwrap());

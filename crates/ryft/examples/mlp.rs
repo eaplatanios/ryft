@@ -298,7 +298,7 @@ mod xla_backend {
     use ryft::pjrt::{ClientOptions, CpuClientOptions, Error as PjrtError, Plugin, load_cpu_plugin};
     #[cfg(any(feature = "cuda-12", feature = "cuda-13"))]
     use ryft::pjrt::{GpuClientOptions, GpuMemoryAllocator, GpuPlatform};
-    use ryft::xla::{FromPjrt, XlaArray, XlaDomain, XlaSession, XlaValue};
+    use ryft::xla::{Array, Domain, FromPjrt, Session, Value};
     use ryft::{
         ArrayType, DataType, Device, DeviceMesh, Dimension, LogicalMesh, MeshAxis, MeshAxisType, Parameterized,
         ProjectedContext, Shape, Sharding,
@@ -313,19 +313,19 @@ mod xla_backend {
 
     /// Constructs a replicated `f32` array on the selected XLA device.
     fn array<'c>(
-        domain: &XlaDomain<'c>,
+        domain: &Domain<'c>,
         mesh: &DeviceMesh,
         dimensions: &[usize],
         values: &[f32],
-    ) -> ExampleResult<XlaArray<'c>> {
+    ) -> ExampleResult<Array<'c>> {
         let shape = Shape::new(dimensions.iter().copied().map(Dimension::Static).collect());
         let r#type = ArrayType::new(DataType::F32, shape)
             .with_sharding(Sharding::replicated(mesh.logical_mesh().clone(), dimensions.len()))?;
-        Ok(XlaArray::from_host_buffer(domain, r#type, mesh.clone(), values_to_bytes(values))?)
+        Ok(Array::from_host_buffer(domain, r#type, mesh.clone(), values_to_bytes(values))?)
     }
 
     /// Copies a replicated `f32` XLA array back to the host.
-    fn read_f32s(array: &XlaArray<'_>) -> ExampleResult<Vec<f32>> {
+    fn read_f32s(array: &Array<'_>) -> ExampleResult<Vec<f32>> {
         let shard =
             array.addressable_shards().next().ok_or_else(|| "xla result has no addressable shard".to_string())?;
         let bytes = shard
@@ -406,7 +406,7 @@ mod xla_backend {
         let device = Device::from_pjrt(device)?;
         let logical_mesh = LogicalMesh::new(vec![MeshAxis::new("device", 1, MeshAxisType::Auto)?])?;
         let mesh = DeviceMesh::new(logical_mesh, vec![device])?;
-        let domain = XlaSession::new(&client).domain();
+        let domain = Session::new(&client).domain();
 
         let model = Mlp {
             layers: initial_layer_values()
@@ -440,13 +440,13 @@ mod xla_backend {
         super::train(
             "xla-ir",
             &domain,
-            model.map_parameters(XlaValue::Array)?,
-            XlaValue::Array(inputs),
-            XlaValue::Array(targets),
-            XlaValue::Array(learning_rate),
-            XlaValue::Array(mean_scale),
+            model.map_parameters(Value::Array)?,
+            Value::Array(inputs),
+            Value::Array(targets),
+            Value::Array(learning_rate),
+            Value::Array(mean_scale),
             |value| match value {
-                XlaValue::Array(array) => Ok(read_f32s(array)?.into_iter().map(f64::from).collect()),
+                Value::Array(array) => Ok(read_f32s(array)?.into_iter().map(f64::from).collect()),
                 _ => Err("xla-ir result is not an array".into()),
             },
         )

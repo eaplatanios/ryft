@@ -1,7 +1,7 @@
 use ryft_core::macros::check_count;
 use ryft_core::{
-    ArrayType, ComparisonDirection, DataType, Dimension, Operation, ReductionKind, ScatterMode, ScatterOperation,
-    ScatterReductionKind, Shape,
+    ArrayType, ComparisonDirection, DataType, Dimension as CoreDimension, Operation as CoreOperation, ReductionKind,
+    ScatterMode, ScatterOperation, ScatterReductionKind, Shape,
 };
 use ryft_mlir::dialects::stable_hlo;
 use ryft_mlir::{
@@ -18,7 +18,7 @@ use crate::operations::comparisons::lower_compare_to_mlir;
 use crate::operations::extrema::lower_extremum_to_mlir;
 use crate::operations::reductions::build_reduce_body_region;
 use crate::operations::sharding::constrain_sharding::lower_sharding_constraint;
-use crate::{Error, LowerableOperation, LowerableOperationFamily, LoweringError, XlaLowerer};
+use crate::{Error, LowerableOperation, LowerableOperationFamily, Lowerer, LoweringError};
 
 /// Builds the scalar combiner region of a `stablehlo.scatter` for the given [`ScatterReductionKind`], modeled on
 /// [`build_reduce_body_region`]. The region's block takes the existing operand scalar and the update scalar and
@@ -152,7 +152,7 @@ pub(crate) fn lower_scatter_to_mlir<'b, 'c: 'b, 't: 'c>(
         .collect::<Vec<_>>();
     for (&axis, &update_axis) in window_axes.iter().zip(dimensions.update_window_dimensions()) {
         let update_dimension = input_types[2].dimension(update_axis);
-        if matches!(update_dimension, Dimension::Dynamic(_)) && update_dimension != input_types[0].dimension(axis) {
+        if matches!(update_dimension, CoreDimension::Dynamic(_)) && update_dimension != input_types[0].dimension(axis) {
             return Err(Error::Lowering(LoweringError::UnsupportedOperation {
                 operation: operation.name().to_string(),
                 reason: format!(
@@ -199,7 +199,7 @@ pub(crate) fn lower_scatter_to_mlir<'b, 'c: 'b, 't: 'c>(
                 block.append_operation(stable_hlo::subtract(extent, window, location)?)?.result(0).unwrap().as_ref(),
             );
             if operation.mode() == ScatterMode::Drop {
-                let Dimension::Static(capacity) = physical_bound_type(&input_types[0])?.shape().dimensions()[axis]
+                let CoreDimension::Static(capacity) = physical_bound_type(&input_types[0])?.shape().dimensions()[axis]
                 else {
                     unreachable!()
                 };
@@ -357,7 +357,7 @@ pub(crate) fn lower_scatter_to_mlir<'b, 'c: 'b, 't: 'c>(
 impl LowerableOperation for ScatterOperation {
     fn lower<'b, 'c: 'b, 't: 'c, O: LowerableOperationFamily>(
         &self,
-        lowerer: &mut XlaLowerer<'b, 'c, 't, O>,
+        lowerer: &mut Lowerer<'b, 'c, 't, O>,
         input_values: &[ValueRef<'b, 'c, 't>],
         input_types: &[ArrayType],
         output_types: &[ArrayType],
@@ -392,16 +392,16 @@ mod tests {
 
     use pretty_assertions::assert_eq;
     use ryft_core::{
-        Array, ArrayOperation, ConstantOperation, DimensionBounds, DimensionVariable, Placeholder, ProgramBuilder,
-        ScatterDimensionNumbers, i1, u1,
+        Array as CoreArray, ArrayOperation, ConstantOperation, DimensionBounds, DimensionVariable, Placeholder,
+        ProgramBuilder as CoreProgramBuilder, ScatterDimensionNumbers, i1, u1,
     };
     use ryft_pjrt::{BufferType, ExecutionDeviceInputs, ExecutionInput, Program as PjrtProgram};
 
     use crate::experimental::lowering::tests::{
-        XlaProgramBuilder, ragged_dot_cpu_compilation_options, unproject_plain_program,
+        ProgramBuilder, ragged_dot_cpu_compilation_options, unproject_plain_program,
     };
     use crate::experimental::lowering::{lower_mlir_module_for_program, to_mlir_module_for_plain_program};
-    use crate::experimental::ops::XlaArrayConstant;
+    use crate::experimental::ops::ArrayConstant;
     use crate::tests::{execution_client, values_from_bytes, values_to_bytes};
     use crate::{ToPjrt, to_mlir_module_for_program};
 
@@ -418,7 +418,7 @@ mod tests {
                 let input_type = if dynamic_input {
                     ArrayType::new(
                         DataType::I64,
-                        Shape::new(vec![Dimension::Dynamic(DimensionVariable::new(
+                        Shape::new(vec![CoreDimension::Dynamic(DimensionVariable::new(
                             "rows",
                             DimensionBounds::new(2, Some(5)).unwrap(),
                         ))]),
@@ -427,15 +427,15 @@ mod tests {
                     ArrayType::new_static(DataType::I64, [4])
                 };
                 let query = if dynamic_query {
-                    Dimension::Dynamic(DimensionVariable::new("query", DimensionBounds::new(0, Some(5)).unwrap()))
+                    CoreDimension::Dynamic(DimensionVariable::new("query", DimensionBounds::new(0, Some(5)).unwrap()))
                 } else {
-                    Dimension::Static(4)
+                    CoreDimension::Static(4)
                 };
                 let index_data_type = if unsigned { DataType::U64 } else { DataType::I64 };
                 let indices_type =
-                    ArrayType::new(index_data_type, Shape::new(vec![query.clone(), Dimension::Static(1)]));
+                    ArrayType::new(index_data_type, Shape::new(vec![query.clone(), CoreDimension::Static(1)]));
                 let updates_type = ArrayType::new(DataType::I64, Shape::new(vec![query]));
-                let mut builder = XlaProgramBuilder::new();
+                let mut builder = ProgramBuilder::new();
                 let inputs = [input_type.clone(), indices_type.clone(), updates_type.clone()]
                     .into_iter()
                     .map(|r#type| builder.add_input(r#type))
@@ -448,7 +448,7 @@ mod tests {
                 let output = builder.add_instruction(operation, Vec::new(), inputs, None).unwrap()[0];
                 let program = unproject_plain_program(
                     builder
-                        .build::<Vec<XlaArrayConstant>, Vec<XlaArrayConstant>>(
+                        .build::<Vec<ArrayConstant>, Vec<ArrayConstant>>(
                             vec![output],
                             vec![Placeholder; 3],
                             vec![Placeholder],
@@ -540,9 +540,9 @@ mod tests {
         let mut literal_cases = Vec::new();
         for mode in [ScatterMode::Clip, ScatterMode::Drop] {
             literal_cases.push((
-                Array::vector(vec![0_i64; 3]).unwrap(),
-                Array::from_elements(ArrayType::new_static(DataType::I64, [1, 1]), &[2_i64]).unwrap(),
-                Array::from_elements(ArrayType::new_static(DataType::I64, [1, 2]), &[10_i64, 20]).unwrap(),
+                CoreArray::vector(vec![0_i64; 3]).unwrap(),
+                CoreArray::from_elements(ArrayType::new_static(DataType::I64, [1, 1]), &[2_i64]).unwrap(),
+                CoreArray::from_elements(ArrayType::new_static(DataType::I64, [1, 2]), &[10_i64, 20]).unwrap(),
                 ScatterOperation::new(
                     ScatterDimensionNumbers::new(vec![1], vec![], vec![0]),
                     ScatterReductionKind::Add,
@@ -561,14 +561,14 @@ mod tests {
                 ScatterReductionKind::Max,
             ] {
                 let input = if signed {
-                    Array::vector(vec![i1::new(0).unwrap(), i1::new(-1).unwrap(), i1::new(-1).unwrap()]).unwrap()
+                    CoreArray::vector(vec![i1::new(0).unwrap(), i1::new(-1).unwrap(), i1::new(-1).unwrap()]).unwrap()
                 } else {
-                    Array::vector(vec![u1::new(0).unwrap(), u1::new(1).unwrap(), u1::new(1).unwrap()]).unwrap()
+                    CoreArray::vector(vec![u1::new(0).unwrap(), u1::new(1).unwrap(), u1::new(1).unwrap()]).unwrap()
                 };
                 let updates = if signed {
-                    Array::vector(vec![i1::new(-1).unwrap(), i1::new(-1).unwrap(), i1::new(0).unwrap()]).unwrap()
+                    CoreArray::vector(vec![i1::new(-1).unwrap(), i1::new(-1).unwrap(), i1::new(0).unwrap()]).unwrap()
                 } else {
-                    Array::vector(vec![u1::new(1).unwrap(), u1::new(1).unwrap(), u1::new(0).unwrap()]).unwrap()
+                    CoreArray::vector(vec![u1::new(1).unwrap(), u1::new(1).unwrap(), u1::new(0).unwrap()]).unwrap()
                 };
                 let expected = match kind {
                     ScatterReductionKind::Overwrite => vec![1_u8, 1, 0],
@@ -580,7 +580,7 @@ mod tests {
                 };
                 literal_cases.push((
                     input,
-                    Array::from_elements(ArrayType::new_static(DataType::I64, [3, 1]), &[0_i64, 1, 2]).unwrap(),
+                    CoreArray::from_elements(ArrayType::new_static(DataType::I64, [3, 1]), &[0_i64, 1, 2]).unwrap(),
                     updates,
                     ScatterOperation::new(ScatterDimensionNumbers::new(vec![], vec![0], vec![0]), kind),
                     expected,
@@ -588,7 +588,7 @@ mod tests {
             }
         }
         for (input, indices, updates, operation, expected) in literal_cases {
-            let mut builder = ProgramBuilder::<Array, ArrayOperation<Array>>::new();
+            let mut builder = CoreProgramBuilder::<CoreArray, ArrayOperation<CoreArray>>::new();
             let inputs = [input, indices, updates]
                 .into_iter()
                 .map(|value| {
@@ -596,7 +596,8 @@ mod tests {
                 })
                 .collect::<Vec<_>>();
             let output = builder.add_instruction(operation, Vec::new(), inputs, None).unwrap()[0];
-            let program = builder.build::<Vec<Array>, Vec<Array>>(vec![output], vec![], vec![Placeholder]).unwrap();
+            let program =
+                builder.build::<Vec<CoreArray>, Vec<CoreArray>>(vec![output], vec![], vec![Placeholder]).unwrap();
             let module = to_mlir_module_for_plain_program(&program, "main").unwrap();
             let executable = client
                 .compile(&PjrtProgram::Mlir { bytecode: module.into_bytes() }, &ragged_dot_cpu_compilation_options())
@@ -634,7 +635,7 @@ mod tests {
                 ArrayType::new_static(data_type, [2]),
             ];
             let output_types = vec![input_types[0].clone()];
-            let mut builder = XlaProgramBuilder::new();
+            let mut builder = ProgramBuilder::new();
             let inputs = input_types.iter().cloned().map(|r#type| builder.add_input(r#type)).collect();
             let output = builder
                 .add_instruction(
@@ -648,11 +649,7 @@ mod tests {
                 )
                 .unwrap()[0];
             let program = builder
-                .build::<Vec<XlaArrayConstant>, Vec<XlaArrayConstant>>(
-                    vec![output],
-                    vec![Placeholder; 3],
-                    vec![Placeholder],
-                )
+                .build::<Vec<ArrayConstant>, Vec<ArrayConstant>>(vec![output], vec![Placeholder; 3], vec![Placeholder])
                 .unwrap();
             let module = lower_mlir_module_for_program(
                 &unproject_plain_program(program),
@@ -732,14 +729,14 @@ mod tests {
 
     #[test]
     fn test_lower_scatter_dynamic_window() {
-        let mut builder = ProgramBuilder::<Array, ArrayOperation<Array>>::new();
+        let mut builder = CoreProgramBuilder::<CoreArray, ArrayOperation<CoreArray>>::new();
         let input = builder.add_input(ArrayType::new_static(DataType::F32, [3]));
         let indices = builder.add_input(ArrayType::new_static(DataType::I32, [1, 1]));
         let updates = builder.add_input(ArrayType::new(
             DataType::F32,
             Shape::new(vec![
-                Dimension::Static(1),
-                Dimension::Dynamic(DimensionVariable::new("window", DimensionBounds::new(0, Some(3)).unwrap())),
+                CoreDimension::Static(1),
+                CoreDimension::Dynamic(DimensionVariable::new("window", DimensionBounds::new(0, Some(3)).unwrap())),
             ]),
         ));
         let output = builder
@@ -754,7 +751,7 @@ mod tests {
             )
             .unwrap()[0];
         let program = builder
-            .build::<Vec<Array>, Vec<Array>>(vec![output], vec![Placeholder; 3], vec![Placeholder])
+            .build::<Vec<CoreArray>, Vec<CoreArray>>(vec![output], vec![Placeholder; 3], vec![Placeholder])
             .unwrap();
         assert!(matches!(
             to_mlir_module_for_plain_program(&program, "main"),
@@ -766,16 +763,21 @@ mod tests {
 
     #[test]
     fn test_to_mlir_module_for_plain_program_lowers_scatter() {
-        use ryft_core::{Dimension, ScatterDimensionNumbers, ScatterOperation, ScatterReductionKind, Shape};
+        use ryft_core::{
+            Dimension as CoreDimension, ScatterDimensionNumbers, ScatterOperation, ScatterReductionKind, Shape,
+        };
 
         // Scatter-add row updates into a [3, 2] operand at the row indices in a [2, 1] index array. Output is [3, 2],
         // and the Add combiner lowers to a `stablehlo.add` inside the scatter region.
-        let operand_type = ArrayType::new(DataType::F32, Shape::new(vec![Dimension::Static(3), Dimension::Static(2)]));
-        let indices_type = ArrayType::new(DataType::I32, Shape::new(vec![Dimension::Static(2), Dimension::Static(1)]));
-        let updates_type = ArrayType::new(DataType::F32, Shape::new(vec![Dimension::Static(2), Dimension::Static(2)]));
+        let operand_type =
+            ArrayType::new(DataType::F32, Shape::new(vec![CoreDimension::Static(3), CoreDimension::Static(2)]));
+        let indices_type =
+            ArrayType::new(DataType::I32, Shape::new(vec![CoreDimension::Static(2), CoreDimension::Static(1)]));
+        let updates_type =
+            ArrayType::new(DataType::F32, Shape::new(vec![CoreDimension::Static(2), CoreDimension::Static(2)]));
         let operation =
             ScatterOperation::new(ScatterDimensionNumbers::new(vec![1], vec![0], vec![0]), ScatterReductionKind::Add);
-        let mut builder = XlaProgramBuilder::new();
+        let mut builder = ProgramBuilder::new();
         let operand = builder.add_input(operand_type);
         let indices = builder.add_input(indices_type);
         let updates = builder.add_input(updates_type);
@@ -783,7 +785,7 @@ mod tests {
             .add_instruction(ArrayOperation::Scatter(operation), Vec::new(), vec![operand, indices, updates], None)
             .unwrap()[0];
         let program = builder
-            .build::<Vec<XlaArrayConstant>, Vec<XlaArrayConstant>>(
+            .build::<Vec<ArrayConstant>, Vec<ArrayConstant>>(
                 vec![output],
                 vec![Placeholder, Placeholder, Placeholder],
                 vec![Placeholder],
@@ -797,12 +799,15 @@ mod tests {
         assert!(stablehlo.contains("tensor<3x2xf32>"), "{stablehlo}");
 
         // Complex scatter extrema share the explicit lexicographic combiner used by complex reductions.
-        let operand_type = ArrayType::new(DataType::C64, Shape::new(vec![Dimension::Static(3), Dimension::Static(2)]));
-        let indices_type = ArrayType::new(DataType::I32, Shape::new(vec![Dimension::Static(2), Dimension::Static(1)]));
-        let updates_type = ArrayType::new(DataType::C64, Shape::new(vec![Dimension::Static(2), Dimension::Static(2)]));
+        let operand_type =
+            ArrayType::new(DataType::C64, Shape::new(vec![CoreDimension::Static(3), CoreDimension::Static(2)]));
+        let indices_type =
+            ArrayType::new(DataType::I32, Shape::new(vec![CoreDimension::Static(2), CoreDimension::Static(1)]));
+        let updates_type =
+            ArrayType::new(DataType::C64, Shape::new(vec![CoreDimension::Static(2), CoreDimension::Static(2)]));
         let operation =
             ScatterOperation::new(ScatterDimensionNumbers::new(vec![1], vec![0], vec![0]), ScatterReductionKind::Max);
-        let mut builder = XlaProgramBuilder::new();
+        let mut builder = ProgramBuilder::new();
         let operand = builder.add_input(operand_type);
         let indices = builder.add_input(indices_type);
         let updates = builder.add_input(updates_type);
@@ -810,7 +815,7 @@ mod tests {
             .add_instruction(ArrayOperation::Scatter(operation), Vec::new(), vec![operand, indices, updates], None)
             .unwrap()[0];
         let program = builder
-            .build::<Vec<XlaArrayConstant>, Vec<XlaArrayConstant>>(
+            .build::<Vec<ArrayConstant>, Vec<ArrayConstant>>(
                 vec![output],
                 vec![Placeholder, Placeholder, Placeholder],
                 vec![Placeholder],

@@ -22,8 +22,9 @@
 use std::rc::Rc;
 
 use ryft_core::{
-    ArrayIrType, ArrayType, ComparisonDirection, DataType, Dimension, EffectClasses, Operation, ProgramError,
-    RematerializationOptimizationBarrier, SCAN_OPERATION_NAME, ScanOperation, Shape, TypedProgram,
+    ArrayIrType, ArrayType, ComparisonDirection, DataType, Dimension as CoreDimension, EffectClasses,
+    Operation as CoreOperation, ProgramError, RematerializationOptimizationBarrier, SCAN_OPERATION_NAME, ScanOperation,
+    Shape, TypedProgram,
 };
 use ryft_mlir::dialects::stable_hlo;
 use ryft_mlir::{
@@ -37,7 +38,7 @@ use crate::experimental::lowering::types::{
     stable_hlo_dynamic_dimension_bound, static_dimensions,
 };
 use crate::experimental::lowering::{CollectiveLoweringState, EffectTokens};
-use crate::experimental::ops::FlatXlaProgram;
+use crate::experimental::ops::FlatProgram;
 use crate::operations::comparisons::lower_compare_to_mlir;
 use crate::operations::control_flow::{
     append_loop_effect_tokens, lower_explicit_sharding_constraints, lower_refined_region_input,
@@ -45,7 +46,7 @@ use crate::operations::control_flow::{
     threaded_effect_token_values, validate_unthreaded_effect_tokens,
 };
 use crate::operations::jit_call::JitCallFunctionMap;
-use crate::{Error, LowerableOperation, LowerableOperationFamily, LoweringError, XlaLowerer};
+use crate::{Error, LowerableOperation, LowerableOperationFamily, Lowerer, LoweringError};
 
 /// Trip count of the loops that lower one scan.
 #[derive(Copy, Clone)]
@@ -60,7 +61,7 @@ enum ScanLoopLength<'b, 'c: 'b, 't: 'c> {
 /// Inputs of the lowering of one scan that its accumulators, its straight-line iterations, and its loops share.
 struct ScanLoopInputs<'o, 'b, 'c: 'b, 't: 'c, O> {
     /// Lowered body program over `[index, carries..., x_slices...]`.
-    body: &'o FlatXlaProgram<O>,
+    body: &'o FlatProgram<O>,
 
     /// Number of loop-carried state leaves.
     carry_count: usize,
@@ -115,8 +116,8 @@ impl<'o, 'b, 'c: 'b, 't: 'c, O: LowerableOperationFamily> ScanLoopInputs<'o, 'b,
             let mut physical_dimensions = stack_type.shape().dimensions().to_vec();
             let length = &physical_dimensions[0];
             let physical_length = match length {
-                Dimension::Static(length) => *length,
-                Dimension::Dynamic(_) => stable_hlo_dynamic_dimension_bound(length).ok_or_else(|| {
+                CoreDimension::Static(length) => *length,
+                CoreDimension::Dynamic(_) => stable_hlo_dynamic_dimension_bound(length).ok_or_else(|| {
                     Error::Lowering(LoweringError::UnsupportedOperation {
                         operation: SCAN_OPERATION_NAME.to_string(),
                         reason: format!(
@@ -126,7 +127,7 @@ impl<'o, 'b, 'c: 'b, 't: 'c, O: LowerableOperationFamily> ScanLoopInputs<'o, 'b,
                     })
                 })?,
             };
-            physical_dimensions[0] = Dimension::Static(physical_length);
+            physical_dimensions[0] = CoreDimension::Static(physical_length);
             let physical_type = stack_type.clone().with_shape(Shape::new(physical_dimensions));
             let accumulator =
                 lower_constant_output(std::slice::from_ref(&physical_type), 0, block, context, location)?.remove(0);
@@ -400,7 +401,7 @@ impl<'o, 'b, 'c: 'b, 't: 'c, O: LowerableOperationFamily> ScanLoopInputs<'o, 'b,
 impl LowerableOperation for ScanOperation<ArrayType> {
     fn lower<'b, 'c: 'b, 't: 'c, O: LowerableOperationFamily>(
         &self,
-        _lowerer: &mut XlaLowerer<'b, 'c, 't, O>,
+        _lowerer: &mut Lowerer<'b, 'c, 't, O>,
         _input_values: &[ValueRef<'b, 'c, 't>],
         _input_types: &[ArrayType],
         _output_types: &[ArrayType],
@@ -418,7 +419,7 @@ impl LowerableOperation for ScanOperation<ArrayType> {
 impl LowerableOperation for ScanOperation<ArrayIrType> {
     fn lower<'b, 'c: 'b, 't: 'c, O: LowerableOperationFamily>(
         &self,
-        lowerer: &mut XlaLowerer<'b, 'c, 't, O>,
+        lowerer: &mut Lowerer<'b, 'c, 't, O>,
         input_values: &[ValueRef<'b, 'c, 't>],
         input_types: &[ArrayIrType],
         output_types: &[ArrayIrType],
@@ -521,8 +522,8 @@ impl LowerableOperation for ScanOperation<ArrayIrType> {
             y_stack_types: array_types(y_stack_types)?,
             state_types,
             length: match length {
-                Dimension::Static(length) => ScanLoopLength::Static(*length),
-                Dimension::Dynamic(_) => ScanLoopLength::Dynamic(input_values[stack_end]),
+                CoreDimension::Static(length) => ScanLoopLength::Static(*length),
+                CoreDimension::Dynamic(_) => ScanLoopLength::Dynamic(input_values[stack_end]),
             },
             reverse: self.reverse(),
             threaded_effects: lowered_effect_classes(body)?,
@@ -655,26 +656,23 @@ mod tests {
     use crate::experimental::lowering::tests::{
         MixedValue, dynamic_dimension, execute_mixed_program, ragged_dot_cpu_compilation_options, test_vector_type,
     };
-    use crate::experimental::ops::{
-        FlatXlaProgram, XlaConstant, XlaOperation, XlaProgramBuilder as ArrayIrXlaProgramBuilder,
-    };
+    use crate::experimental::ops::{Constant, FlatProgram, Operation, ProgramBuilder as ArrayIrProgramBuilder};
     use crate::operations::control_flow::tests::{
         compare, execute_on_two_devices, lowered_mixed_module, positive, two_device_mesh,
     };
     use crate::operations::debugging::{ensure_print_handler_registered, with_captured_prints};
     use crate::tests::{execution_client, values_from_bytes, values_to_bytes};
     use crate::{
-        CompiledXlaFunction, FromPjrt, XlaArray, XlaOptions, XlaSession, compile, compile_statefully,
-        to_mlir_module_for_program,
+        Array, CompiledFunction, FromPjrt, Options, Session, compile, compile_statefully, to_mlir_module_for_program,
     };
 
     use super::*;
 
     /// Returns the scan body `(i, c, x) -> (c + x)` over `f64` scalars, which prints each item `x` with the label
     /// `item` before adding it to the sum `c`.
-    fn printing_sum_body() -> FlatXlaProgram {
+    fn printing_sum_body() -> FlatProgram {
         let scalar_type = ArrayType::scalar(DataType::F64);
-        let mut builder = ArrayIrXlaProgramBuilder::new();
+        let mut builder = ArrayIrProgramBuilder::new();
         builder.add_input(ArrayType::scalar(DataType::I64).into());
         let sum = builder.add_input(scalar_type.clone().into());
         let item = builder.add_input(scalar_type.into());
@@ -683,39 +681,39 @@ mod tests {
             .unwrap()[0];
         let sum = builder.add_instruction(AddOperation::new(), Vec::new(), vec![sum, item], None).unwrap()[0];
         builder
-            .build::<Vec<XlaConstant>, Vec<XlaConstant>>(vec![sum], vec![Placeholder; 3], vec![Placeholder])
+            .build::<Vec<Constant>, Vec<Constant>>(vec![sum], vec![Placeholder; 3], vec![Placeholder])
             .unwrap()
     }
 
     /// Returns a scan of the static `length` and `unroll` factor over the `f32` body `(i, c, x) -> (c * x, c * x)`,
     /// which takes its initial carry and its stacked items as inputs.
-    fn product_scan_program(length: usize, unroll: usize) -> FlatXlaProgram {
+    fn product_scan_program(length: usize, unroll: usize) -> FlatProgram {
         let scalar_type = ArrayType::scalar(DataType::F32);
         let body = {
-            let mut builder = ArrayIrXlaProgramBuilder::new();
+            let mut builder = ArrayIrProgramBuilder::new();
             builder.add_input(ArrayType::scalar(DataType::I64).into());
             let carry = builder.add_input(scalar_type.clone().into());
             let item = builder.add_input(scalar_type.clone().into());
             let product = builder.add_instruction(MulOperation::new(), Vec::new(), vec![carry, item], None).unwrap()[0];
             builder
-                .build::<Vec<XlaConstant>, Vec<XlaConstant>>(
+                .build::<Vec<Constant>, Vec<Constant>>(
                     vec![product, product],
                     vec![Placeholder; 3],
                     vec![Placeholder; 2],
                 )
                 .unwrap()
         };
-        let mut builder = ArrayIrXlaProgramBuilder::new();
+        let mut builder = ArrayIrProgramBuilder::new();
         let body_region = builder.import_region(body.entry_region_ref());
         let carry = builder.add_input(scalar_type.into());
         let items = builder.add_input(test_vector_type(length).into());
         let scan = ScanOperation::new(1, length).with_unroll(unroll).unwrap();
         let outputs = builder
-            .add_instruction(XlaOperation::Scan(scan), vec![body_region], vec![carry, items], None)
+            .add_instruction(Operation::Scan(scan), vec![body_region], vec![carry, items], None)
             .unwrap()
             .to_vec();
         builder
-            .build::<Vec<XlaConstant>, Vec<XlaConstant>>(outputs, vec![Placeholder; 2], vec![Placeholder; 2])
+            .build::<Vec<Constant>, Vec<Constant>>(outputs, vec![Placeholder; 2], vec![Placeholder; 2])
             .unwrap()
     }
 
@@ -723,10 +721,10 @@ mod tests {
     /// to its carry as a binary digit and stacks the carry that it received, so that both of its results depend on the
     /// order in which its iterations visit the items. The scan takes its initial carry and its stacked items as inputs,
     /// followed by its runtime length when its length is dynamic.
-    fn binary_digits_scan_program(length: Dimension, reverse: bool, unroll: usize) -> FlatXlaProgram {
+    fn binary_digits_scan_program(length: CoreDimension, reverse: bool, unroll: usize) -> FlatProgram {
         let scalar_type = ArrayType::scalar(DataType::F64);
         let body = {
-            let mut builder = ArrayIrXlaProgramBuilder::new();
+            let mut builder = ArrayIrProgramBuilder::new();
             builder.add_input(ArrayType::scalar(DataType::I64).into());
             let carry = builder.add_input(scalar_type.clone().into());
             let item = builder.add_input(scalar_type.clone().into());
@@ -734,27 +732,22 @@ mod tests {
                 builder.add_instruction(AddOperation::new(), Vec::new(), vec![carry, carry], None).unwrap()[0];
             let next = builder.add_instruction(AddOperation::new(), Vec::new(), vec![doubled, item], None).unwrap()[0];
             builder
-                .build::<Vec<XlaConstant>, Vec<XlaConstant>>(
-                    vec![next, carry],
-                    vec![Placeholder; 3],
-                    vec![Placeholder; 2],
-                )
+                .build::<Vec<Constant>, Vec<Constant>>(vec![next, carry], vec![Placeholder; 3], vec![Placeholder; 2])
                 .unwrap()
         };
-        let mut builder = ArrayIrXlaProgramBuilder::new();
+        let mut builder = ArrayIrProgramBuilder::new();
         let body_region = builder.import_region(body.entry_region_ref());
         let carry = builder.add_input(scalar_type.into());
         let items = builder.add_input(ArrayType::new(DataType::F64, Shape::new(vec![length.clone()])).into());
         let mut inputs = vec![carry, items];
-        if let Dimension::Dynamic(length) = &length {
+        if let CoreDimension::Dynamic(length) = &length {
             inputs.push(builder.add_input(DimensionType::from(length.clone()).into()));
         }
         let input_count = inputs.len();
         let scan = ScanOperation::new(1, length).with_reverse(reverse).with_unroll(unroll).unwrap();
-        let outputs =
-            builder.add_instruction(XlaOperation::Scan(scan), vec![body_region], inputs, None).unwrap().to_vec();
+        let outputs = builder.add_instruction(Operation::Scan(scan), vec![body_region], inputs, None).unwrap().to_vec();
         builder
-            .build::<Vec<XlaConstant>, Vec<XlaConstant>>(outputs, vec![Placeholder; input_count], vec![Placeholder; 2])
+            .build::<Vec<Constant>, Vec<Constant>>(outputs, vec![Placeholder; input_count], vec![Placeholder; 2])
             .unwrap()
     }
 
@@ -804,20 +797,16 @@ mod tests {
         let block = context.block_with_no_arguments();
         let scalar_type = ArrayType::scalar(DataType::F32);
         let body = {
-            let mut builder = ArrayIrXlaProgramBuilder::new();
+            let mut builder = ArrayIrProgramBuilder::new();
             builder.add_input(ArrayType::scalar(DataType::I64).into());
             let carry = builder.add_input(scalar_type.clone().into());
             builder
-                .build::<Vec<XlaConstant>, Vec<XlaConstant>>(
-                    vec![carry, carry],
-                    vec![Placeholder; 2],
-                    vec![Placeholder; 2],
-                )
+                .build::<Vec<Constant>, Vec<Constant>>(vec![carry, carry], vec![Placeholder; 2], vec![Placeholder; 2])
                 .unwrap()
         };
 
         // The plain array family cannot carry a body region, so scans lower only from the array IR family.
-        let mut lowerer = XlaLowerer::new(block.as_ref(), &context, location).with_regions(vec![body.clone()]);
+        let mut lowerer = Lowerer::new(block.as_ref(), &context, location).with_regions(vec![body.clone()]);
         let expected_message =
             "higher-order operation `scan` must be stored directly in the enclosing backend operation family";
         assert!(matches!(
@@ -827,8 +816,7 @@ mod tests {
         ));
 
         // An array IR scan needs exactly one body region.
-        let mut lowerer =
-            XlaLowerer::new(block.as_ref(), &context, location).with_regions(Vec::<FlatXlaProgram>::new());
+        let mut lowerer = Lowerer::new(block.as_ref(), &context, location).with_regions(Vec::<FlatProgram>::new());
         assert!(matches!(
             ScanOperation::<ArrayIrType>::new(1, 3).lower(&mut lowerer, &[], &[], &[]),
             Err(Error::Core(ryft_core::Error::Program(ProgramError::MalformedProgram(message))))
@@ -836,7 +824,7 @@ mod tests {
         ));
 
         // It also needs one input per carry and per stacked input.
-        let mut lowerer = XlaLowerer::new(block.as_ref(), &context, location).with_regions(vec![body.clone()]);
+        let mut lowerer = Lowerer::new(block.as_ref(), &context, location).with_regions(vec![body.clone()]);
         assert!(matches!(
             ScanOperation::<ArrayIrType>::new(1, 3).lower(&mut lowerer, &[], &[], &[]),
             Err(Error::Core(ryft_core::Error::Program(ProgramError::InvalidInputCount { expected: 1, actual: 0 }))),
@@ -848,7 +836,7 @@ mod tests {
             vec![scalar_type.clone().into(), DimensionType::from(length.clone()).into()];
         let output_types: Vec<ArrayIrType> = vec![
             scalar_type.clone().into(),
-            ArrayType::new(DataType::F32, Shape::new(vec![Dimension::Dynamic(length.clone())])).into(),
+            ArrayType::new(DataType::F32, Shape::new(vec![CoreDimension::Dynamic(length.clone())])).into(),
         ];
         let block = context.block(
             &input_types
@@ -857,9 +845,9 @@ mod tests {
                 .collect::<Vec<_>>(),
         );
         let input_values = (0..2).map(|index| block.as_ref().argument(index).unwrap().as_ref()).collect::<Vec<_>>();
-        let mut lowerer = XlaLowerer::new(block.as_ref(), &context, location).with_regions(vec![body]);
+        let mut lowerer = Lowerer::new(block.as_ref(), &context, location).with_regions(vec![body]);
         assert!(matches!(
-            ScanOperation::<ArrayIrType>::new(1, Dimension::Dynamic(length)).lower(
+            ScanOperation::<ArrayIrType>::new(1, CoreDimension::Dynamic(length)).lower(
                 &mut lowerer,
                 &input_values,
                 &input_types,
@@ -879,20 +867,20 @@ mod tests {
         let slice_type = ArrayType::new(DataType::F64, Shape::new(vec![dynamic_dimension("rows", Some(5))]));
         let scan_program = |length: usize| {
             let body = {
-                let mut builder = ArrayIrXlaProgramBuilder::new();
+                let mut builder = ArrayIrProgramBuilder::new();
                 builder.add_input(ArrayType::scalar(DataType::I64).into());
                 let slice = builder.add_input(slice_type.clone().into());
                 builder
-                    .build::<Vec<XlaConstant>, Vec<XlaConstant>>(vec![slice], vec![Placeholder; 2], vec![Placeholder])
+                    .build::<Vec<Constant>, Vec<Constant>>(vec![slice], vec![Placeholder; 2], vec![Placeholder])
                     .unwrap()
             };
-            let mut builder = ArrayIrXlaProgramBuilder::new();
+            let mut builder = ArrayIrProgramBuilder::new();
             let body = builder.import_region(body.entry_region_ref());
             let stacked_type = ArrayType::new_static(DataType::F64, [length, 3]);
             let stack = builder.add_input(stacked_type.clone().into());
             let outputs = builder
                 .add_instruction(
-                    XlaOperation::Scan(ScanOperation::new(0, Dimension::Static(length))),
+                    Operation::Scan(ScanOperation::new(0, CoreDimension::Static(length))),
                     vec![body],
                     vec![stack],
                     None,
@@ -900,7 +888,7 @@ mod tests {
                 .unwrap()
                 .to_vec();
             let program = builder
-                .build::<Vec<XlaConstant>, Vec<XlaConstant>>(outputs, vec![Placeholder], vec![Placeholder])
+                .build::<Vec<Constant>, Vec<Constant>>(outputs, vec![Placeholder], vec![Placeholder])
                 .unwrap();
             assert_eq!(program.output_types(), vec![ArrayIrType::Array(stacked_type.clone())]);
             to_mlir_module_for_program(&program, &[], &[stacked_type.clone()], &[stacked_type], "main", None, None)
@@ -939,14 +927,14 @@ mod tests {
         let scalar_type = ArrayType::scalar(DataType::F64);
         let stack_type = ArrayType::new_static(DataType::F64, [3]);
         let body = {
-            let mut builder = ArrayIrXlaProgramBuilder::new();
+            let mut builder = ArrayIrProgramBuilder::new();
             builder.add_input(ArrayType::scalar(DataType::I64).into());
             let slice = builder.add_input(scalar_type.clone().into());
             let slice = builder
                 .add_instruction(PrintOperation::<ArrayType>::new("slice"), Vec::new(), vec![slice], None)
                 .unwrap()[0];
             builder
-                .build::<Vec<XlaConstant>, Vec<XlaConstant>>(vec![slice], vec![Placeholder; 2], vec![Placeholder])
+                .build::<Vec<Constant>, Vec<Constant>>(vec![slice], vec![Placeholder; 2], vec![Placeholder])
                 .unwrap()
         };
         let state_types: Vec<ArrayIrType> =
@@ -1000,7 +988,7 @@ mod tests {
         let static_type = ArrayType::new_static(DataType::F64, [3]);
         let carry_type = ArrayType::new(DataType::F64, Shape::new(vec![dynamic_dimension("rows", Some(5))]));
         let body = {
-            let mut builder = ArrayIrXlaProgramBuilder::new();
+            let mut builder = ArrayIrProgramBuilder::new();
             builder.add_input(ArrayType::scalar(DataType::I64).into());
             let first = builder.add_input(carry_type.clone().into());
             let second = builder.add_input(carry_type.clone().into());
@@ -1008,24 +996,20 @@ mod tests {
                 .add_instruction(AddOperation::<ArrayType>::new(), Vec::new(), vec![first, second], None)
                 .unwrap()[0];
             builder
-                .build::<Vec<XlaConstant>, Vec<XlaConstant>>(
-                    vec![first, sum],
-                    vec![Placeholder; 3],
-                    vec![Placeholder; 2],
-                )
+                .build::<Vec<Constant>, Vec<Constant>>(vec![first, sum], vec![Placeholder; 3], vec![Placeholder; 2])
                 .unwrap()
         };
         let client = execution_client();
         for (length, unroll, expected) in
             [(0, 1, vec![10.0, 20.0, 30.0]), (2, 1, vec![12.0, 24.0, 36.0]), (2, 2, vec![12.0, 24.0, 36.0])]
         {
-            let mut builder = ArrayIrXlaProgramBuilder::new();
+            let mut builder = ArrayIrProgramBuilder::new();
             let region = builder.import_region(body.entry_region_ref());
             let dynamic_input = builder.add_input(carry_type.clone().into());
             let static_input = builder.add_input(static_type.clone().into());
             let outputs = builder
                 .add_instruction(
-                    XlaOperation::Scan(ScanOperation::new(2, Dimension::Static(length)).with_unroll(unroll).unwrap()),
+                    Operation::Scan(ScanOperation::new(2, CoreDimension::Static(length)).with_unroll(unroll).unwrap()),
                     vec![region],
                     vec![dynamic_input, static_input],
                     None,
@@ -1033,7 +1017,7 @@ mod tests {
                 .unwrap()
                 .to_vec();
             let program = builder
-                .build::<Vec<XlaConstant>, Vec<XlaConstant>>(outputs, vec![Placeholder; 2], vec![Placeholder; 2])
+                .build::<Vec<Constant>, Vec<Constant>>(outputs, vec![Placeholder; 2], vec![Placeholder; 2])
                 .unwrap();
             assert_eq!(
                 program.output_types(),
@@ -1064,24 +1048,24 @@ mod tests {
         // carry refines it only when the runtime length is 3. Neither input type proves that relationship, so an entry
         // guard checks it before the loop. The body `(i, c) -> (c + c)` doubles its carry once per iteration.
         let length = DimensionVariable::new("length", DimensionBounds::new(0, Some(6)).unwrap());
-        let carry_type = ArrayType::new(DataType::F64, Shape::new(vec![Dimension::Dynamic(length.clone())]));
+        let carry_type = ArrayType::new(DataType::F64, Shape::new(vec![CoreDimension::Dynamic(length.clone())]));
         let body = {
-            let mut builder = ArrayIrXlaProgramBuilder::new();
+            let mut builder = ArrayIrProgramBuilder::new();
             builder.add_input(ArrayType::scalar(DataType::I64).into());
             let carry = builder.add_input(carry_type.into());
             let doubled =
                 builder.add_instruction(AddOperation::new(), Vec::new(), vec![carry, carry], None).unwrap()[0];
             builder
-                .build::<Vec<XlaConstant>, Vec<XlaConstant>>(vec![doubled], vec![Placeholder; 2], vec![Placeholder])
+                .build::<Vec<Constant>, Vec<Constant>>(vec![doubled], vec![Placeholder; 2], vec![Placeholder])
                 .unwrap()
         };
-        let mut builder = ArrayIrXlaProgramBuilder::new();
+        let mut builder = ArrayIrProgramBuilder::new();
         let body_region = builder.import_region(body.entry_region_ref());
         let carry = builder.add_input(ArrayType::new_static(DataType::F64, [3]).into());
         let runtime_length = builder.add_input(DimensionType::from(length.clone()).into());
         let outputs = builder
             .add_instruction(
-                XlaOperation::Scan(ScanOperation::new(1, Dimension::Dynamic(length))),
+                Operation::Scan(ScanOperation::new(1, CoreDimension::Dynamic(length))),
                 vec![body_region],
                 vec![carry, runtime_length],
                 None,
@@ -1089,7 +1073,7 @@ mod tests {
             .unwrap()
             .to_vec();
         let program = builder
-            .build::<Vec<XlaConstant>, Vec<XlaConstant>>(outputs, vec![Placeholder; 2], vec![Placeholder])
+            .build::<Vec<Constant>, Vec<Constant>>(outputs, vec![Placeholder; 2], vec![Placeholder])
             .unwrap();
         assert_eq!(
             program.to_string(),
@@ -1167,27 +1151,23 @@ mod tests {
         let length = DimensionVariable::new("length", DimensionBounds::new(0, Some(6)).unwrap());
         let scalar_type = ArrayType::scalar(DataType::F64);
         let body = {
-            let mut builder = ArrayIrXlaProgramBuilder::new();
+            let mut builder = ArrayIrProgramBuilder::new();
             builder.add_input(ArrayType::scalar(DataType::I64).into());
             let carry = builder.add_input(scalar_type.clone().into());
             let item = builder.add_input(scalar_type.clone().into());
             let sum = builder.add_instruction(AddOperation::new(), Vec::new(), vec![carry, item], None).unwrap()[0];
             builder
-                .build::<Vec<XlaConstant>, Vec<XlaConstant>>(
-                    vec![sum, carry],
-                    vec![Placeholder; 3],
-                    vec![Placeholder; 2],
-                )
+                .build::<Vec<Constant>, Vec<Constant>>(vec![sum, carry], vec![Placeholder; 3], vec![Placeholder; 2])
                 .unwrap()
         };
-        let mut builder = ArrayIrXlaProgramBuilder::new();
+        let mut builder = ArrayIrProgramBuilder::new();
         let body_region = builder.import_region(body.entry_region_ref());
         let carry = builder.add_input(scalar_type.into());
         let stack = builder.add_input(ArrayType::new_static(DataType::F64, [3]).into());
         let runtime_length = builder.add_input(DimensionType::from(length.clone()).into());
         let outputs = builder
             .add_instruction(
-                XlaOperation::Scan(ScanOperation::new(1, Dimension::Dynamic(length))),
+                Operation::Scan(ScanOperation::new(1, CoreDimension::Dynamic(length))),
                 vec![body_region],
                 vec![carry, stack, runtime_length],
                 None,
@@ -1195,7 +1175,7 @@ mod tests {
             .unwrap()
             .to_vec();
         let program = builder
-            .build::<Vec<XlaConstant>, Vec<XlaConstant>>(outputs, vec![Placeholder; 3], vec![Placeholder; 2])
+            .build::<Vec<Constant>, Vec<Constant>>(outputs, vec![Placeholder; 3], vec![Placeholder; 2])
             .unwrap();
         assert_eq!(
             program.to_string(),
@@ -1291,28 +1271,25 @@ mod tests {
         let length = DimensionVariable::new("length", DimensionBounds::positive(Some(8)).unwrap());
         let scalar_type = ArrayType::scalar(DataType::F64);
         let body = {
-            let mut builder = ArrayIrXlaProgramBuilder::new();
+            let mut builder = ArrayIrProgramBuilder::new();
             builder.add_input(ArrayType::scalar(DataType::I64).into());
-            let related = builder
-                .add_input(ArrayType::new(DataType::F64, Shape::new(vec![Dimension::Dynamic(length.clone())])).into());
+            let related = builder.add_input(
+                ArrayType::new(DataType::F64, Shape::new(vec![CoreDimension::Dynamic(length.clone())])).into(),
+            );
             let sum = builder.add_input(scalar_type.clone().into());
             let sum = builder.add_instruction(AddOperation::new(), Vec::new(), vec![sum, sum], None).unwrap()[0];
             builder
-                .build::<Vec<XlaConstant>, Vec<XlaConstant>>(
-                    vec![related, sum],
-                    vec![Placeholder; 3],
-                    vec![Placeholder; 2],
-                )
+                .build::<Vec<Constant>, Vec<Constant>>(vec![related, sum], vec![Placeholder; 3], vec![Placeholder; 2])
                 .unwrap()
         };
-        let mut builder = ArrayIrXlaProgramBuilder::new();
+        let mut builder = ArrayIrProgramBuilder::new();
         let body_region = builder.import_region(body.entry_region_ref());
         let related = builder.add_input(ArrayType::new_static(DataType::F64, [3]).into());
         let sum = builder.add_input(scalar_type.into());
         let runtime_length = builder.add_input(DimensionType::from(length.clone()).into());
         let outputs = builder
             .add_instruction(
-                XlaOperation::Scan(ScanOperation::new(2, Dimension::Dynamic(length))),
+                Operation::Scan(ScanOperation::new(2, CoreDimension::Dynamic(length))),
                 vec![body_region],
                 vec![related, sum, runtime_length],
                 None,
@@ -1320,7 +1297,7 @@ mod tests {
             .unwrap()
             .to_vec();
         let program = builder
-            .build::<Vec<XlaConstant>, Vec<XlaConstant>>(outputs, vec![Placeholder; 3], vec![Placeholder; 2])
+            .build::<Vec<Constant>, Vec<Constant>>(outputs, vec![Placeholder; 3], vec![Placeholder; 2])
             .unwrap();
         let pruned = program.with_outputs(&[1]).unwrap().into_pruned().unwrap();
         assert_eq!(
@@ -1416,25 +1393,25 @@ mod tests {
         let length = DimensionVariable::new("length", DimensionBounds::new(0, Some(1)).unwrap());
         let length_type = DimensionType::from(length.clone());
         let scalar_type = ArrayType::scalar(DataType::F32);
-        let stacked_type = ArrayType::new(DataType::F32, Shape::new(vec![Dimension::Dynamic(length.clone())]));
-        let mut body_builder = ArrayIrXlaProgramBuilder::new();
+        let stacked_type = ArrayType::new(DataType::F32, Shape::new(vec![CoreDimension::Dynamic(length.clone())]));
+        let mut body_builder = ArrayIrProgramBuilder::new();
         body_builder.add_input(ArrayType::scalar(DataType::I64).into());
         let carry = body_builder.add_input(scalar_type.clone().into());
         let body = body_builder
-            .build::<Vec<XlaConstant>, Vec<XlaConstant>>(
+            .build::<Vec<Constant>, Vec<Constant>>(
                 vec![carry, carry],
                 vec![Placeholder, Placeholder],
                 vec![Placeholder, Placeholder],
             )
             .unwrap();
 
-        let mut builder = ArrayIrXlaProgramBuilder::new();
+        let mut builder = ArrayIrProgramBuilder::new();
         let body_region = builder.import_region(body.entry_region_ref());
         let carry = builder.add_input(scalar_type.clone().into());
         let runtime_length = builder.add_input(length_type.into());
         let outputs = builder
             .add_instruction(
-                XlaOperation::Scan(ScanOperation::new(1, Dimension::Dynamic(length)).with_unroll(3).unwrap()),
+                Operation::Scan(ScanOperation::new(1, CoreDimension::Dynamic(length)).with_unroll(3).unwrap()),
                 vec![body_region],
                 vec![carry, runtime_length],
                 None,
@@ -1442,7 +1419,7 @@ mod tests {
             .unwrap()
             .to_vec();
         let program = builder
-            .build::<Vec<XlaConstant>, Vec<XlaConstant>>(
+            .build::<Vec<Constant>, Vec<Constant>>(
                 outputs,
                 vec![Placeholder, Placeholder],
                 vec![Placeholder, Placeholder],
@@ -1626,7 +1603,7 @@ mod tests {
         // straight-line body copy, which reads and writes the stacks at the static index of its iteration: index 4 for
         // a forward scan and index 0 for a reversed scan.
         assert_eq!(
-            lowered_mixed_module(&binary_digits_scan_program(Dimension::Static(5), true, 2)),
+            lowered_mixed_module(&binary_digits_scan_program(CoreDimension::Static(5), true, 2)),
             indoc! {"
                 module {
                   func.func @main(%arg0: tensor<f64>, %arg1: tensor<5xf64>) -> (tensor<f64>, tensor<5xf64>) {
@@ -1689,7 +1666,7 @@ mod tests {
             assert_eq!(
                 execute_mixed_program(
                     &client,
-                    &binary_digits_scan_program(Dimension::Static(5), false, unroll),
+                    &binary_digits_scan_program(CoreDimension::Static(5), false, unroll),
                     &[MixedValue::Array(vec![0.0], vec![]), items.clone()],
                     &[],
                 )
@@ -1703,7 +1680,7 @@ mod tests {
             assert_eq!(
                 execute_mixed_program(
                     &client,
-                    &binary_digits_scan_program(Dimension::Static(5), true, unroll),
+                    &binary_digits_scan_program(CoreDimension::Static(5), true, unroll),
                     &[MixedValue::Array(vec![0.0], vec![]), items.clone()],
                     &[],
                 )
@@ -1723,23 +1700,23 @@ mod tests {
         // condition, adding two to its counter (`i64::MAX - 1`) would wrap and incorrectly continue the loop.
         // The body has only a scalar carry, so lowering this boundary case requires no enormous array allocations.
         let scalar_type = ArrayType::scalar(DataType::I64);
-        let mut body_builder = ArrayIrXlaProgramBuilder::new();
+        let mut body_builder = ArrayIrProgramBuilder::new();
         let index = body_builder.add_input(scalar_type.clone().into());
         body_builder.add_input(scalar_type.clone().into());
         let body = body_builder
-            .build::<Vec<XlaConstant>, Vec<XlaConstant>>(vec![index], vec![Placeholder, Placeholder], vec![Placeholder])
+            .build::<Vec<Constant>, Vec<Constant>>(vec![index], vec![Placeholder, Placeholder], vec![Placeholder])
             .unwrap();
         let scan = ScanOperation::new(1, i64::MAX as usize).with_unroll(3).unwrap();
 
-        let mut builder = ArrayIrXlaProgramBuilder::new();
+        let mut builder = ArrayIrProgramBuilder::new();
         let body_region = builder.import_region(body.entry_region_ref());
         let initial = builder.add_input(scalar_type.clone().into());
         let outputs = builder
-            .add_instruction(XlaOperation::Scan(scan), vec![body_region], vec![initial], None)
+            .add_instruction(Operation::Scan(scan), vec![body_region], vec![initial], None)
             .unwrap()
             .to_vec();
         let program = builder
-            .build::<Vec<XlaConstant>, Vec<XlaConstant>>(outputs, vec![Placeholder], vec![Placeholder])
+            .build::<Vec<Constant>, Vec<Constant>>(outputs, vec![Placeholder], vec![Placeholder])
             .unwrap();
         let stablehlo = to_mlir_module_for_program(
             &program,
@@ -1786,27 +1763,27 @@ mod tests {
         let length = DimensionVariable::new("length", DimensionBounds::new(0, Some(9)).unwrap());
         let length_type = DimensionType::from(length.clone());
         let scalar_type = ArrayType::scalar(DataType::F32);
-        let stacked_type = ArrayType::new(DataType::F32, Shape::new(vec![Dimension::Dynamic(length.clone())]));
+        let stacked_type = ArrayType::new(DataType::F32, Shape::new(vec![CoreDimension::Dynamic(length.clone())]));
 
         let body = {
-            let mut builder = ArrayIrXlaProgramBuilder::new();
+            let mut builder = ArrayIrProgramBuilder::new();
             builder.add_input(ArrayType::scalar(DataType::I64).into());
             let carry = builder.add_input(scalar_type.clone().into());
             builder
-                .build::<Vec<XlaConstant>, Vec<XlaConstant>>(
+                .build::<Vec<Constant>, Vec<Constant>>(
                     vec![carry, carry],
                     vec![Placeholder, Placeholder],
                     vec![Placeholder, Placeholder],
                 )
                 .unwrap()
         };
-        let mut builder = ArrayIrXlaProgramBuilder::new();
+        let mut builder = ArrayIrProgramBuilder::new();
         let body_region = builder.import_region(body.entry_region_ref());
         let carry = builder.add_input(scalar_type.clone().into());
         let runtime_length = builder.add_input(length_type.clone().into());
         let outputs = builder
             .add_instruction(
-                XlaOperation::Scan(ScanOperation::new(1, Dimension::Dynamic(length))),
+                Operation::Scan(ScanOperation::new(1, CoreDimension::Dynamic(length))),
                 vec![body_region],
                 vec![carry, runtime_length],
                 None,
@@ -1814,7 +1791,7 @@ mod tests {
             .unwrap()
             .to_vec();
         let program = builder
-            .build::<Vec<XlaConstant>, Vec<XlaConstant>>(
+            .build::<Vec<Constant>, Vec<Constant>>(
                 outputs,
                 vec![Placeholder, Placeholder],
                 vec![Placeholder, Placeholder],
@@ -1878,7 +1855,7 @@ mod tests {
         let scalar_type = ArrayType::scalar(DataType::F32);
         let empty_type = ArrayType::new_static(DataType::F32, [0]);
         let body = {
-            let mut builder = ArrayIrXlaProgramBuilder::new();
+            let mut builder = ArrayIrProgramBuilder::new();
             let index = builder.add_input(ArrayType::scalar(DataType::I64).into());
             let sum = builder.add_input(scalar_type.clone().into());
             let root = builder.add_input(ReferenceType::new(empty_type.clone()).into());
@@ -1889,14 +1866,10 @@ mod tests {
             let element = builder.add_instruction(read, Vec::new(), vec![root, index], None).unwrap()[0];
             let sum = builder.add_instruction(AddOperation::new(), Vec::new(), vec![sum, element], None).unwrap()[0];
             builder
-                .build::<Vec<XlaConstant>, Vec<XlaConstant>>(
-                    vec![sum, root],
-                    vec![Placeholder; 3],
-                    vec![Placeholder; 2],
-                )
+                .build::<Vec<Constant>, Vec<Constant>>(vec![sum, root], vec![Placeholder; 3], vec![Placeholder; 2])
                 .unwrap()
         };
-        let mut builder = ArrayIrXlaProgramBuilder::new();
+        let mut builder = ArrayIrProgramBuilder::new();
         let body_region = builder.import_region(body.entry_region_ref());
         let sum = builder.add_input(scalar_type.clone().into());
         let elements = builder.add_input(empty_type.clone().into());
@@ -1904,14 +1877,14 @@ mod tests {
         let root = builder.add_instruction(ReferenceNewOperation::new(), Vec::new(), vec![elements], None).unwrap()[0];
         let sum = builder
             .add_instruction(
-                XlaOperation::Scan(ScanOperation::new(2, Dimension::Dynamic(length.clone()))),
+                Operation::Scan(ScanOperation::new(2, CoreDimension::Dynamic(length.clone()))),
                 vec![body_region],
                 vec![sum, root, runtime_length],
                 None,
             )
             .unwrap()[0];
         let program = builder
-            .build::<Vec<XlaConstant>, Vec<XlaConstant>>(vec![sum], vec![Placeholder; 3], vec![Placeholder])
+            .build::<Vec<Constant>, Vec<Constant>>(vec![sum], vec![Placeholder; 3], vec![Placeholder])
             .unwrap();
         assert_eq!(
             program.to_string(),
@@ -1935,7 +1908,7 @@ mod tests {
             vec![device],
         )
         .unwrap();
-        let domain = XlaSession::new(&client).domain();
+        let domain = Session::new(&client).domain();
         // Staging succeeds, so the error comes from the discharge that precedes lowering.
         let mut staged = false;
         let error = compile_statefully::<_, (ArrayIrType, ArrayIrType, ArrayIrType), ArrayIrType>(
@@ -1947,7 +1920,7 @@ mod tests {
             },
             (scalar_type.into(), empty_type.into(), DimensionType::from(length).into()),
             &domain,
-            XlaOptions::new(mesh),
+            Options::new(mesh),
         )
         .err()
         .unwrap();
@@ -1965,7 +1938,8 @@ mod tests {
         // by a second loop with one body copy per trip) runs exactly the runtime number of iterations, from none up to
         // the largest number that the bound admits. A reversed scan visits the items backwards while it writes each
         // stacked output at its own iteration index.
-        let length = Dimension::Dynamic(DimensionVariable::new("length", DimensionBounds::new(0, Some(6)).unwrap()));
+        let length =
+            CoreDimension::Dynamic(DimensionVariable::new("length", DimensionBounds::new(0, Some(6)).unwrap()));
 
         // A reversed scan unrolled by 2 runs iterations `length - 1 - counter` and `length - 2 - counter` per trip of
         // its first loop, and the remaining iteration, if any, in its second loop.
@@ -2091,7 +2065,7 @@ mod tests {
         let length = DimensionVariable::new("length", DimensionBounds::new(0, Some(9)).unwrap());
         let scalar_type = ArrayType::scalar(DataType::F64);
         let body = {
-            let mut builder = ArrayIrXlaProgramBuilder::new();
+            let mut builder = ArrayIrProgramBuilder::new();
             builder.add_input(ArrayType::scalar(DataType::I64).into());
             let carry = builder.add_input(scalar_type.clone().into());
             let slice = builder.add_input(scalar_type.clone().into());
@@ -2099,18 +2073,18 @@ mod tests {
                 .add_instruction(AddOperation::<ArrayType>::new(), Vec::new(), vec![carry, slice], None)
                 .unwrap()[0];
             builder
-                .build::<Vec<XlaConstant>, Vec<XlaConstant>>(vec![sum, sum], vec![Placeholder; 3], vec![Placeholder; 2])
+                .build::<Vec<Constant>, Vec<Constant>>(vec![sum, sum], vec![Placeholder; 3], vec![Placeholder; 2])
                 .unwrap()
         };
-        let mut builder = ArrayIrXlaProgramBuilder::new();
+        let mut builder = ArrayIrProgramBuilder::new();
         let body = builder.import_region(body.entry_region_ref());
         let carry = builder.add_input(scalar_type.into());
         let stack = builder.add_input(ArrayType::new_static(DataType::F64, [4]).into());
         let runtime_length = builder
-            .add_constant(XlaConstant::Dimension(DimensionValue::new(DimensionType::from(length.clone()), 4).unwrap()));
+            .add_constant(Constant::Dimension(DimensionValue::new(DimensionType::from(length.clone()), 4).unwrap()));
         let outputs = builder
             .add_instruction(
-                XlaOperation::Scan(ScanOperation::new(1, Dimension::Dynamic(length))),
+                Operation::Scan(ScanOperation::new(1, CoreDimension::Dynamic(length))),
                 vec![body],
                 vec![carry, stack, runtime_length],
                 None,
@@ -2118,7 +2092,7 @@ mod tests {
             .unwrap()
             .to_vec();
         let program = builder
-            .build::<Vec<XlaConstant>, Vec<XlaConstant>>(outputs, vec![Placeholder; 2], vec![Placeholder; 2])
+            .build::<Vec<Constant>, Vec<Constant>>(outputs, vec![Placeholder; 2], vec![Placeholder; 2])
             .unwrap();
         assert_eq!(
             execute_mixed_program(
@@ -2138,15 +2112,16 @@ mod tests {
         // vector keeps its runtime extent at every extent that its bound admits.
         let extent = DimensionVariable::new("extent", DimensionBounds::new(1, Some(9)).unwrap());
         let extent_type = DimensionType::from(extent.clone());
-        let dynamic_vector_type = ArrayType::new(DataType::F64, Shape::new(vec![Dimension::Dynamic(extent.clone())]));
+        let dynamic_vector_type =
+            ArrayType::new(DataType::F64, Shape::new(vec![CoreDimension::Dynamic(extent.clone())]));
 
         let body = {
-            let mut builder = ArrayIrXlaProgramBuilder::new();
+            let mut builder = ArrayIrProgramBuilder::new();
             builder.add_input(ArrayType::scalar(DataType::I64).into());
             let extent = builder.add_input(extent_type.into());
             let value = builder.add_input(dynamic_vector_type.clone().into());
             builder
-                .build::<Vec<XlaConstant>, Vec<XlaConstant>>(
+                .build::<Vec<Constant>, Vec<Constant>>(
                     vec![extent, value],
                     vec![Placeholder, Placeholder, Placeholder],
                     vec![Placeholder, Placeholder],
@@ -2154,7 +2129,7 @@ mod tests {
                 .unwrap()
         };
 
-        let mut builder = ArrayIrXlaProgramBuilder::new();
+        let mut builder = ArrayIrProgramBuilder::new();
         let body_region = builder.import_region(body.entry_region_ref());
         let values = builder.add_input(dynamic_vector_type.clone().into());
         let extent = builder
@@ -2166,15 +2141,10 @@ mod tests {
             )
             .unwrap()[0];
         let output = builder
-            .add_instruction(
-                XlaOperation::Scan(ScanOperation::new(2, 3)),
-                vec![body_region],
-                vec![extent, values],
-                None,
-            )
+            .add_instruction(Operation::Scan(ScanOperation::new(2, 3)), vec![body_region], vec![extent, values], None)
             .unwrap()[1];
         let program = builder
-            .build::<Vec<XlaConstant>, Vec<XlaConstant>>(vec![output], vec![Placeholder], vec![Placeholder])
+            .build::<Vec<Constant>, Vec<Constant>>(vec![output], vec![Placeholder], vec![Placeholder])
             .unwrap();
         let stablehlo = to_mlir_module_for_program(
             &program,
@@ -2238,20 +2208,24 @@ mod tests {
         // length is the runtime batch size. Each item of the batch is generated independently of the others.
         let batch = DimensionVariable::new("batch", DimensionBounds::new(1, Some(9)).unwrap());
         let batch_type = DimensionType::from(batch.clone());
-        let state_type = ArrayType::new(DataType::U64, Shape::new(vec![Dimension::Static(2)]));
-        let stacked_state_type =
-            ArrayType::new(DataType::U64, Shape::new(vec![Dimension::Dynamic(batch.clone()), Dimension::Static(2)]));
-        let bits_type = ArrayType::new(DataType::U32, Shape::new(vec![Dimension::Static(2)]));
-        let stacked_bits_type =
-            ArrayType::new(DataType::U32, Shape::new(vec![Dimension::Dynamic(batch.clone()), Dimension::Static(2)]));
+        let state_type = ArrayType::new(DataType::U64, Shape::new(vec![CoreDimension::Static(2)]));
+        let stacked_state_type = ArrayType::new(
+            DataType::U64,
+            Shape::new(vec![CoreDimension::Dynamic(batch.clone()), CoreDimension::Static(2)]),
+        );
+        let bits_type = ArrayType::new(DataType::U32, Shape::new(vec![CoreDimension::Static(2)]));
+        let stacked_bits_type = ArrayType::new(
+            DataType::U32,
+            Shape::new(vec![CoreDimension::Dynamic(batch.clone()), CoreDimension::Static(2)]),
+        );
 
         let body = {
-            let mut builder = ArrayIrXlaProgramBuilder::new();
+            let mut builder = ArrayIrProgramBuilder::new();
             builder.add_input(ArrayType::scalar(DataType::I64).into());
             let state = builder.add_input(state_type.into());
             let outputs = builder
                 .add_instruction(
-                    XlaOperation::RngBitGenerator(RngBitGeneratorOperation::new(RandomAlgorithm::ThreeFry, bits_type)),
+                    Operation::RngBitGenerator(RngBitGeneratorOperation::new(RandomAlgorithm::ThreeFry, bits_type)),
                     Vec::new(),
                     vec![state],
                     None,
@@ -2259,20 +2233,20 @@ mod tests {
                 .unwrap()
                 .to_vec();
             builder
-                .build::<Vec<XlaConstant>, Vec<XlaConstant>>(
+                .build::<Vec<Constant>, Vec<Constant>>(
                     outputs,
                     vec![Placeholder, Placeholder],
                     vec![Placeholder, Placeholder],
                 )
                 .unwrap()
         };
-        let mut builder = ArrayIrXlaProgramBuilder::new();
+        let mut builder = ArrayIrProgramBuilder::new();
         let body_region = builder.import_region(body.entry_region_ref());
         let states = builder.add_input(stacked_state_type.clone().into());
         let runtime_batch = builder.add_input(batch_type.into());
         let outputs = builder
             .add_instruction(
-                XlaOperation::Scan(ScanOperation::new(0, Dimension::Dynamic(batch))),
+                Operation::Scan(ScanOperation::new(0, CoreDimension::Dynamic(batch))),
                 vec![body_region],
                 vec![states, runtime_batch],
                 None,
@@ -2280,7 +2254,7 @@ mod tests {
             .unwrap()
             .to_vec();
         let program = builder
-            .build::<Vec<XlaConstant>, Vec<XlaConstant>>(
+            .build::<Vec<Constant>, Vec<Constant>>(
                 outputs,
                 vec![Placeholder, Placeholder],
                 vec![Placeholder, Placeholder],
@@ -2428,7 +2402,7 @@ mod tests {
         // The scan body uses both ordered classes: the scalar check contributes an assertion and the print
         // contributes ordered I/O. The loop state carries two independent trailing tokens in canonical class order.
         let scalar_type = ArrayType::scalar(DataType::I64);
-        let mut body_builder = ArrayIrXlaProgramBuilder::new();
+        let mut body_builder = ArrayIrProgramBuilder::new();
         body_builder.add_input(ArrayType::scalar(DataType::I64).into());
         let carry = body_builder.add_input(scalar_type.clone().into());
         let value = body_builder.add_input(scalar_type.clone().into());
@@ -2448,7 +2422,7 @@ mod tests {
             .add_instruction(PrintOperation::<ArrayType>::new("iteration"), Vec::new(), vec![value], None)
             .unwrap();
         let body = body_builder
-            .build::<Vec<XlaConstant>, Vec<XlaConstant>>(
+            .build::<Vec<Constant>, Vec<Constant>>(
                 vec![carry],
                 vec![Placeholder, Placeholder, Placeholder],
                 vec![Placeholder],
@@ -2456,20 +2430,16 @@ mod tests {
             .unwrap();
         let scan = ScanOperation::new(1, 3);
 
-        let stacked_type = ArrayType::new(DataType::I64, Shape::new(vec![Dimension::Static(3)]));
-        let mut builder = ArrayIrXlaProgramBuilder::new();
+        let stacked_type = ArrayType::new(DataType::I64, Shape::new(vec![CoreDimension::Static(3)]));
+        let mut builder = ArrayIrProgramBuilder::new();
         let body_region = builder.import_region(body.entry_region_ref());
         let initial = builder.add_input(scalar_type.clone().into());
         let stacked = builder.add_input(stacked_type.clone().into());
         let output = builder
-            .add_instruction(XlaOperation::Scan(scan), vec![body_region], vec![initial, stacked], None)
+            .add_instruction(Operation::Scan(scan), vec![body_region], vec![initial, stacked], None)
             .unwrap()[0];
         let program = builder
-            .build::<Vec<XlaConstant>, Vec<XlaConstant>>(
-                vec![output],
-                vec![Placeholder, Placeholder],
-                vec![Placeholder],
-            )
+            .build::<Vec<Constant>, Vec<Constant>>(vec![output], vec![Placeholder, Placeholder], vec![Placeholder])
             .unwrap();
         let stablehlo = to_mlir_module_for_program(
             &program,
@@ -2528,15 +2498,15 @@ mod tests {
         // chain (unused here because the program ends right after the scan). Each iteration prints its item, in
         // iteration order.
         let scalar_type = ArrayType::scalar(DataType::F64);
-        let mut builder = ArrayIrXlaProgramBuilder::new();
+        let mut builder = ArrayIrProgramBuilder::new();
         let body_region = builder.import_region(printing_sum_body().entry_region_ref());
         let sum = builder.add_input(scalar_type.into());
         let items = builder.add_input(ArrayType::new_static(DataType::F64, [3]).into());
         let sum = builder
-            .add_instruction(XlaOperation::Scan(ScanOperation::new(1, 3)), vec![body_region], vec![sum, items], None)
+            .add_instruction(Operation::Scan(ScanOperation::new(1, 3)), vec![body_region], vec![sum, items], None)
             .unwrap()[0];
         let program = builder
-            .build::<Vec<XlaConstant>, Vec<XlaConstant>>(vec![sum], vec![Placeholder; 2], vec![Placeholder])
+            .build::<Vec<Constant>, Vec<Constant>>(vec![sum], vec![Placeholder; 2], vec![Placeholder])
             .unwrap();
         assert_eq!(
             lowered_mixed_module(&program),
@@ -2590,7 +2560,7 @@ mod tests {
         let length = DimensionVariable::new("length", DimensionBounds::new(0, Some(5)).unwrap());
         let scalar_type = ArrayType::scalar(DataType::F64);
         let body = {
-            let mut builder = ArrayIrXlaProgramBuilder::new();
+            let mut builder = ArrayIrProgramBuilder::new();
             builder.add_input(ArrayType::scalar(DataType::I64).into());
             let sum = builder.add_input(scalar_type.clone().into());
             let item = builder.add_input(scalar_type.clone().into());
@@ -2605,25 +2575,25 @@ mod tests {
                 .unwrap();
             let sum = builder.add_instruction(AddOperation::new(), Vec::new(), vec![sum, item], None).unwrap()[0];
             builder
-                .build::<Vec<XlaConstant>, Vec<XlaConstant>>(vec![sum], vec![Placeholder; 3], vec![Placeholder])
+                .build::<Vec<Constant>, Vec<Constant>>(vec![sum], vec![Placeholder; 3], vec![Placeholder])
                 .unwrap()
         };
-        let mut builder = ArrayIrXlaProgramBuilder::new();
+        let mut builder = ArrayIrProgramBuilder::new();
         let body_region = builder.import_region(body.entry_region_ref());
         let sum = builder.add_input(scalar_type.into());
         let items = builder
-            .add_input(ArrayType::new(DataType::F64, Shape::new(vec![Dimension::Dynamic(length.clone())])).into());
+            .add_input(ArrayType::new(DataType::F64, Shape::new(vec![CoreDimension::Dynamic(length.clone())])).into());
         let runtime_length = builder.add_input(DimensionType::from(length.clone()).into());
         let sum = builder
             .add_instruction(
-                XlaOperation::Scan(ScanOperation::new(1, Dimension::Dynamic(length))),
+                Operation::Scan(ScanOperation::new(1, CoreDimension::Dynamic(length))),
                 vec![body_region],
                 vec![sum, items, runtime_length],
                 None,
             )
             .unwrap()[0];
         let program = builder
-            .build::<Vec<XlaConstant>, Vec<XlaConstant>>(vec![sum], vec![Placeholder; 3], vec![Placeholder])
+            .build::<Vec<Constant>, Vec<Constant>>(vec![sum], vec![Placeholder; 3], vec![Placeholder])
             .unwrap();
         assert_eq!(
             program.to_string(),
@@ -2707,11 +2677,11 @@ mod tests {
         let memory = Memory::Host { pinned: true };
         let slice_type = ArrayType::new_static(DataType::F64, [3]).with_memory(memory);
         let body = {
-            let mut builder = ArrayIrXlaProgramBuilder::new();
+            let mut builder = ArrayIrProgramBuilder::new();
             builder.add_input(ArrayType::scalar(DataType::I64).into());
             let slice = builder.add_input(slice_type.clone().into());
             builder
-                .build::<Vec<XlaConstant>, Vec<XlaConstant>>(vec![slice], vec![Placeholder; 2], vec![Placeholder])
+                .build::<Vec<Constant>, Vec<Constant>>(vec![slice], vec![Placeholder; 2], vec![Placeholder])
                 .unwrap()
         };
         for (length, expected) in [
@@ -2768,12 +2738,12 @@ mod tests {
             ),
         ] {
             let stacked_type = ArrayType::new_static(DataType::F64, [length, 3]).with_memory(memory);
-            let mut builder = ArrayIrXlaProgramBuilder::new();
+            let mut builder = ArrayIrProgramBuilder::new();
             let region = builder.import_region(body.entry_region_ref());
             let stack = builder.add_input(stacked_type.clone().into());
             let outputs = builder
                 .add_instruction(
-                    XlaOperation::Scan(ScanOperation::new(0, Dimension::Static(length))),
+                    Operation::Scan(ScanOperation::new(0, CoreDimension::Static(length))),
                     vec![region],
                     vec![stack],
                     None,
@@ -2781,7 +2751,7 @@ mod tests {
                 .unwrap()
                 .to_vec();
             let program = builder
-                .build::<Vec<XlaConstant>, Vec<XlaConstant>>(outputs, vec![Placeholder], vec![Placeholder])
+                .build::<Vec<Constant>, Vec<Constant>>(outputs, vec![Placeholder], vec![Placeholder])
                 .unwrap();
             let module = to_mlir_module_for_program(
                 &program,
@@ -2805,11 +2775,11 @@ mod tests {
         let mesh = LogicalMesh::new(vec![MeshAxis::new("x", 2, MeshAxisType::Auto).unwrap()]).unwrap();
         let slice_type = ArrayType::scalar(DataType::F64).with_sharding(Sharding::replicated(mesh.clone(), 0)).unwrap();
         let body = {
-            let mut builder = ArrayIrXlaProgramBuilder::new();
+            let mut builder = ArrayIrProgramBuilder::new();
             builder.add_input(ArrayType::scalar(DataType::I64).into());
             let slice = builder.add_input(slice_type.clone().into());
             builder
-                .build::<Vec<XlaConstant>, Vec<XlaConstant>>(vec![slice], vec![Placeholder; 2], vec![Placeholder])
+                .build::<Vec<Constant>, Vec<Constant>>(vec![slice], vec![Placeholder; 2], vec![Placeholder])
                 .unwrap()
         };
         for (length, expected) in [
@@ -2859,12 +2829,12 @@ mod tests {
             let stacked_type = ArrayType::new_static(DataType::F64, [length])
                 .with_sharding(Sharding::new(mesh.clone(), vec![ShardingDimension::sharded(["x"])]).unwrap())
                 .unwrap();
-            let mut builder = ArrayIrXlaProgramBuilder::new();
+            let mut builder = ArrayIrProgramBuilder::new();
             let region = builder.import_region(body.entry_region_ref());
             let stack = builder.add_input(stacked_type.clone().into());
             let outputs = builder
                 .add_instruction(
-                    XlaOperation::Scan(ScanOperation::new(0, Dimension::Static(length))),
+                    Operation::Scan(ScanOperation::new(0, CoreDimension::Static(length))),
                     vec![region],
                     vec![stack],
                     None,
@@ -2872,7 +2842,7 @@ mod tests {
                 .unwrap()
                 .to_vec();
             let program = builder
-                .build::<Vec<XlaConstant>, Vec<XlaConstant>>(outputs, vec![Placeholder], vec![Placeholder])
+                .build::<Vec<Constant>, Vec<Constant>>(outputs, vec![Placeholder], vec![Placeholder])
                 .unwrap();
             let output_type = program.output_types().into_owned().remove(0);
             let output_type = <&ArrayType>::try_from(&output_type).unwrap().clone();
@@ -2898,22 +2868,22 @@ mod tests {
                 .unwrap();
         let stack_type = ArrayType::new_static(DataType::F32, [4, 8]).with_sharding(stack_sharding.clone()).unwrap();
         let body = {
-            let mut builder = ArrayIrXlaProgramBuilder::new();
+            let mut builder = ArrayIrProgramBuilder::new();
             builder.add_input(ArrayType::scalar(DataType::I64).into());
             let row = builder.add_input(slice_type.into());
             let row = builder.add_instruction(NegOperation::new(), Vec::new(), vec![row], None).unwrap()[0];
             builder
-                .build::<Vec<XlaConstant>, Vec<XlaConstant>>(vec![row], vec![Placeholder; 2], vec![Placeholder])
+                .build::<Vec<Constant>, Vec<Constant>>(vec![row], vec![Placeholder; 2], vec![Placeholder])
                 .unwrap()
         };
-        let mut builder = ArrayIrXlaProgramBuilder::new();
+        let mut builder = ArrayIrProgramBuilder::new();
         let body_region = builder.import_region(body.entry_region_ref());
         let rows = builder.add_input(stack_type.clone().into());
         let rows = builder
-            .add_instruction(XlaOperation::Scan(ScanOperation::new(0, 4)), vec![body_region], vec![rows], None)
+            .add_instruction(Operation::Scan(ScanOperation::new(0, 4)), vec![body_region], vec![rows], None)
             .unwrap()[0];
         let program = builder
-            .build::<Vec<XlaConstant>, Vec<XlaConstant>>(vec![rows], vec![Placeholder], vec![Placeholder])
+            .build::<Vec<Constant>, Vec<Constant>>(vec![rows], vec![Placeholder], vec![Placeholder])
             .unwrap();
         assert_eq!(
             program.to_string(),
@@ -3015,29 +2985,25 @@ mod tests {
                 .unwrap();
         let stack_type = ArrayType::new_static(DataType::F32, [4, 8]).with_sharding(stack_sharding.clone()).unwrap();
         let body = {
-            let mut builder = ArrayIrXlaProgramBuilder::new();
+            let mut builder = ArrayIrProgramBuilder::new();
             builder.add_input(ArrayType::scalar(DataType::I64).into());
             let carry = builder.add_input(carry_type.clone().into());
             let row = builder.add_input(slice_type.into());
             let row = builder.add_instruction(NegOperation::new(), Vec::new(), vec![row], None).unwrap()[0];
             builder
-                .build::<Vec<XlaConstant>, Vec<XlaConstant>>(
-                    vec![carry, row],
-                    vec![Placeholder; 3],
-                    vec![Placeholder; 2],
-                )
+                .build::<Vec<Constant>, Vec<Constant>>(vec![carry, row], vec![Placeholder; 3], vec![Placeholder; 2])
                 .unwrap()
         };
-        let mut builder = ArrayIrXlaProgramBuilder::new();
+        let mut builder = ArrayIrProgramBuilder::new();
         let body_region = builder.import_region(body.entry_region_ref());
         let carry = builder.add_input(carry_type.clone().into());
         let rows = builder.add_input(stack_type.clone().into());
         let outputs = builder
-            .add_instruction(XlaOperation::Scan(ScanOperation::new(1, 4)), vec![body_region], vec![carry, rows], None)
+            .add_instruction(Operation::Scan(ScanOperation::new(1, 4)), vec![body_region], vec![carry, rows], None)
             .unwrap()
             .to_vec();
         let program = builder
-            .build::<Vec<XlaConstant>, Vec<XlaConstant>>(outputs, vec![Placeholder; 2], vec![Placeholder; 2])
+            .build::<Vec<Constant>, Vec<Constant>>(outputs, vec![Placeholder; 2], vec![Placeholder; 2])
             .unwrap();
         assert_eq!(
             program.to_string(),
@@ -3143,23 +3109,23 @@ mod tests {
             .with_sharding(items_sharding.local_sharding(&manual_axes).unwrap())
             .unwrap();
         let scan_body = {
-            let mut builder = ArrayIrXlaProgramBuilder::new();
+            let mut builder = ArrayIrProgramBuilder::new();
             builder.add_input(ArrayType::scalar(DataType::I64).into());
             let sum = builder.add_input(local_sum_type.clone().into());
             let item = builder.add_input(local_sum_type.clone().into());
             let sum = builder.add_instruction(AddOperation::new(), Vec::new(), vec![sum, item], None).unwrap()[0];
             builder
-                .build::<Vec<XlaConstant>, Vec<XlaConstant>>(vec![sum, sum], vec![Placeholder; 3], vec![Placeholder; 2])
+                .build::<Vec<Constant>, Vec<Constant>>(vec![sum, sum], vec![Placeholder; 3], vec![Placeholder; 2])
                 .unwrap()
         };
         let shard_map_body = {
-            let mut builder = ArrayIrXlaProgramBuilder::new();
+            let mut builder = ArrayIrProgramBuilder::new();
             let scan_body_region = builder.import_region(scan_body.entry_region_ref());
             let sum = builder.add_input(local_sum_type.into());
             let items = builder.add_input(local_items_type.into());
             let outputs = builder
                 .add_instruction(
-                    XlaOperation::Scan(ScanOperation::new(1, 2)),
+                    Operation::Scan(ScanOperation::new(1, 2)),
                     vec![scan_body_region],
                     vec![sum, items],
                     None,
@@ -3167,7 +3133,7 @@ mod tests {
                 .unwrap()
                 .to_vec();
             builder
-                .build::<Vec<XlaConstant>, Vec<XlaConstant>>(outputs, vec![Placeholder; 2], vec![Placeholder; 2])
+                .build::<Vec<Constant>, Vec<Constant>>(outputs, vec![Placeholder; 2], vec![Placeholder; 2])
                 .unwrap()
         };
         let shardings = vec![sum_sharding, items_sharding];
@@ -3177,13 +3143,13 @@ mod tests {
             ShardMapBoundary::new(logical_mesh, shardings.clone(), shardings.clone(), manual_axes).unwrap(),
         )
         .unwrap();
-        let mut builder = ArrayIrXlaProgramBuilder::new();
+        let mut builder = ArrayIrProgramBuilder::new();
         let shard_map_body_region = builder.import_program(shard_map_body);
         let sum = builder.add_input(sum_type.clone().into());
         let items = builder.add_input(items_type.clone().into());
         let outputs = builder
             .add_instruction(
-                XlaOperation::ShardMap(Box::new(operation)),
+                Operation::ShardMap(Box::new(operation)),
                 vec![shard_map_body_region],
                 vec![sum, items],
                 None,
@@ -3191,7 +3157,7 @@ mod tests {
             .unwrap()
             .to_vec();
         let program = builder
-            .build::<Vec<XlaConstant>, Vec<XlaConstant>>(outputs, vec![Placeholder; 2], vec![Placeholder; 2])
+            .build::<Vec<Constant>, Vec<Constant>>(outputs, vec![Placeholder; 2], vec![Placeholder; 2])
             .unwrap();
         assert_eq!(
             program.to_string(),
@@ -3292,31 +3258,26 @@ mod tests {
         let scalar_type = ArrayType::scalar(DataType::F64);
         let items_type = ArrayType::new_static(DataType::F64, [3]);
         let true_branch = {
-            let mut builder = ArrayIrXlaProgramBuilder::new();
+            let mut builder = ArrayIrProgramBuilder::new();
             let body_region = builder.import_region(printing_sum_body().entry_region_ref());
             let sum = builder.add_input(scalar_type.clone().into());
             let items = builder.add_input(items_type.clone().into());
             let sum = builder
-                .add_instruction(
-                    XlaOperation::Scan(ScanOperation::new(1, 3)),
-                    vec![body_region],
-                    vec![sum, items],
-                    None,
-                )
+                .add_instruction(Operation::Scan(ScanOperation::new(1, 3)), vec![body_region], vec![sum, items], None)
                 .unwrap()[0];
             builder
-                .build::<Vec<XlaConstant>, Vec<XlaConstant>>(vec![sum], vec![Placeholder; 2], vec![Placeholder])
+                .build::<Vec<Constant>, Vec<Constant>>(vec![sum], vec![Placeholder; 2], vec![Placeholder])
                 .unwrap()
         };
         let false_branch = {
-            let mut builder = ArrayIrXlaProgramBuilder::new();
+            let mut builder = ArrayIrProgramBuilder::new();
             let sum = builder.add_input(scalar_type.clone().into());
             builder.add_input(items_type.clone().into());
             builder
-                .build::<Vec<XlaConstant>, Vec<XlaConstant>>(vec![sum], vec![Placeholder; 2], vec![Placeholder])
+                .build::<Vec<Constant>, Vec<Constant>>(vec![sum], vec![Placeholder; 2], vec![Placeholder])
                 .unwrap()
         };
-        let mut builder = ArrayIrXlaProgramBuilder::new();
+        let mut builder = ArrayIrProgramBuilder::new();
         let true_region = builder.import_region(true_branch.entry_region_ref());
         let false_region = builder.import_region(false_branch.entry_region_ref());
         let selector = builder.add_input(scalar_type.clone().into());
@@ -3325,14 +3286,14 @@ mod tests {
         let predicate = positive(&mut builder, selector);
         let sum = builder
             .add_instruction(
-                XlaOperation::Condition(ConditionOperation::new()),
+                Operation::Condition(ConditionOperation::new()),
                 vec![true_region, false_region],
                 vec![predicate, sum, items],
                 None,
             )
             .unwrap()[0];
         let program = builder
-            .build::<Vec<XlaConstant>, Vec<XlaConstant>>(vec![sum], vec![Placeholder; 3], vec![Placeholder])
+            .build::<Vec<Constant>, Vec<Constant>>(vec![sum], vec![Placeholder; 3], vec![Placeholder])
             .unwrap();
         assert_eq!(
             program.to_string(),
@@ -3430,17 +3391,17 @@ mod tests {
         let items_type = ArrayType::new_static(DataType::F64, [2]);
         let state_types = [scalar_type.clone(), scalar_type.clone(), scalar_type.clone(), items_type.clone()];
         let loop_condition = {
-            let mut builder = ArrayIrXlaProgramBuilder::new();
+            let mut builder = ArrayIrProgramBuilder::new();
             let inputs = state_types.iter().map(|r#type| builder.add_input(r#type.clone().into())).collect::<Vec<_>>();
             let predicate = builder
                 .add_instruction(compare(ComparisonDirection::LessThan), Vec::new(), vec![inputs[0], inputs[1]], None)
                 .unwrap()[0];
             builder
-                .build::<Vec<XlaConstant>, Vec<XlaConstant>>(vec![predicate], vec![Placeholder; 4], vec![Placeholder])
+                .build::<Vec<Constant>, Vec<Constant>>(vec![predicate], vec![Placeholder; 4], vec![Placeholder])
                 .unwrap()
         };
         let loop_body = {
-            let mut builder = ArrayIrXlaProgramBuilder::new();
+            let mut builder = ArrayIrProgramBuilder::new();
             let scan_body_region = builder.import_region(printing_sum_body().entry_region_ref());
             let inputs = state_types.iter().map(|r#type| builder.add_input(r#type.clone().into())).collect::<Vec<_>>();
             let (index, limit, sum, items) = (inputs[0], inputs[1], inputs[2], inputs[3]);
@@ -3450,34 +3411,29 @@ mod tests {
             let index = builder.add_instruction(AddOperation::new(), Vec::new(), vec![index, one], None).unwrap()[0];
             let sum = builder
                 .add_instruction(
-                    XlaOperation::Scan(ScanOperation::new(1, 2)),
+                    Operation::Scan(ScanOperation::new(1, 2)),
                     vec![scan_body_region],
                     vec![sum, items],
                     None,
                 )
                 .unwrap()[0];
             builder
-                .build::<Vec<XlaConstant>, Vec<XlaConstant>>(
+                .build::<Vec<Constant>, Vec<Constant>>(
                     vec![index, limit, sum, items],
                     vec![Placeholder; 4],
                     vec![Placeholder; 4],
                 )
                 .unwrap()
         };
-        let mut builder = ArrayIrXlaProgramBuilder::new();
+        let mut builder = ArrayIrProgramBuilder::new();
         let condition_region = builder.import_region(loop_condition.entry_region_ref());
         let body_region = builder.import_region(loop_body.entry_region_ref());
         let inputs = state_types.iter().map(|r#type| builder.add_input(r#type.clone().into())).collect::<Vec<_>>();
         let sum = builder
-            .add_instruction(
-                XlaOperation::While(WhileOperation::new()),
-                vec![condition_region, body_region],
-                inputs,
-                None,
-            )
+            .add_instruction(Operation::While(WhileOperation::new()), vec![condition_region, body_region], inputs, None)
             .unwrap()[2];
         let program = builder
-            .build::<Vec<XlaConstant>, Vec<XlaConstant>>(vec![sum], vec![Placeholder; 4], vec![Placeholder])
+            .build::<Vec<Constant>, Vec<Constant>>(vec![sum], vec![Placeholder; 4], vec![Placeholder])
             .unwrap();
         assert_eq!(
             program.to_string(),
@@ -3572,32 +3528,28 @@ mod tests {
         // The body `(i, c, x) -> (c + x, c)` sums the items and stacks the running sums that it received.
         let scalar_type = ArrayType::scalar(DataType::F64);
         let body = {
-            let mut builder = ArrayIrXlaProgramBuilder::new();
+            let mut builder = ArrayIrProgramBuilder::new();
             builder.add_input(ArrayType::scalar(DataType::I64).into());
             let sum = builder.add_input(scalar_type.clone().into());
             let item = builder.add_input(scalar_type.clone().into());
             let next = builder.add_instruction(AddOperation::new(), Vec::new(), vec![sum, item], None).unwrap()[0];
             builder
-                .build::<Vec<XlaConstant>, Vec<XlaConstant>>(
-                    vec![next, sum],
-                    vec![Placeholder; 3],
-                    vec![Placeholder; 2],
-                )
+                .build::<Vec<Constant>, Vec<Constant>>(vec![next, sum], vec![Placeholder; 3], vec![Placeholder; 2])
                 .unwrap()
         };
-        let mut builder = ArrayIrXlaProgramBuilder::new();
+        let mut builder = ArrayIrProgramBuilder::new();
         let body_region = builder.import_region(body.entry_region_ref());
         let sum = builder.add_input(scalar_type.into());
         let items = builder.add_input(ArrayType::new_static(DataType::F64, [3]).into());
         let outputs = builder
-            .add_instruction(XlaOperation::Scan(ScanOperation::new(1, 3)), vec![body_region], vec![sum, items], None)
+            .add_instruction(Operation::Scan(ScanOperation::new(1, 3)), vec![body_region], vec![sum, items], None)
             .unwrap()
             .to_vec();
         let program = builder
-            .build::<Vec<XlaConstant>, Vec<XlaConstant>>(outputs, vec![Placeholder; 2], vec![Placeholder; 2])
+            .build::<Vec<Constant>, Vec<Constant>>(outputs, vec![Placeholder; 2], vec![Placeholder; 2])
             .unwrap();
         let client = execution_client();
-        let batch_type = DimensionType::from(Dimension::Static(2));
+        let batch_type = DimensionType::from(CoreDimension::Static(2));
 
         // Mapped items make the sum a mapped carry, which the batched scan instantiates at the batch axis, and the
         // running sums stack along a trailing batch axis.
@@ -3700,7 +3652,7 @@ mod tests {
         let scalar_type = ArrayType::scalar(DataType::F64);
         let length = DimensionVariable::new("length", DimensionBounds::new(0, Some(5)).unwrap());
         let body = {
-            let mut builder = ArrayIrXlaProgramBuilder::new();
+            let mut builder = ArrayIrProgramBuilder::new();
             builder.add_input(ArrayType::scalar(DataType::I64).into());
             let carry = builder.add_input(scalar_type.clone().into());
             let item = builder.add_input(scalar_type.clone().into());
@@ -3709,30 +3661,26 @@ mod tests {
                 builder.add_instruction(OneLikeOperation::<ArrayType>::new(), Vec::new(), vec![item], None).unwrap()[0];
             let next = builder.add_instruction(AddOperation::new(), Vec::new(), vec![product, one], None).unwrap()[0];
             builder
-                .build::<Vec<XlaConstant>, Vec<XlaConstant>>(vec![next], vec![Placeholder; 3], vec![Placeholder])
+                .build::<Vec<Constant>, Vec<Constant>>(vec![next], vec![Placeholder; 3], vec![Placeholder])
                 .unwrap()
         };
         let value_and_gradient = |scan: ScanOperation<ArrayIrType>, items_type: ArrayType| {
-            let mut builder = ArrayIrXlaProgramBuilder::new();
+            let mut builder = ArrayIrProgramBuilder::new();
             let body_region = builder.import_region(body.entry_region_ref());
             let carry = builder.add_input(scalar_type.clone().into());
             let items = builder.add_input(items_type.clone().into());
             let mut inputs = vec![carry, items];
-            if let Dimension::Dynamic(length) = scan.iteration_count() {
+            if let CoreDimension::Dynamic(length) = scan.iteration_count() {
                 inputs.push(builder.add_input(DimensionType::from(length.clone()).into()));
             }
             let input_count = inputs.len();
-            let output = builder.add_instruction(XlaOperation::Scan(scan), vec![body_region], inputs, None).unwrap()[0];
+            let output = builder.add_instruction(Operation::Scan(scan), vec![body_region], inputs, None).unwrap()[0];
             let program = builder
-                .build::<Vec<XlaConstant>, Vec<XlaConstant>>(
-                    vec![output],
-                    vec![Placeholder; input_count],
-                    vec![Placeholder],
-                )
+                .build::<Vec<Constant>, Vec<Constant>>(vec![output], vec![Placeholder; input_count], vec![Placeholder])
                 .unwrap();
             let linearization = program.linearize_with_respect_to(&[1]).unwrap();
             let pullback = linearization.pullback().unwrap().into_program();
-            let mut builder = ArrayIrXlaProgramBuilder::new();
+            let mut builder = ArrayIrProgramBuilder::new();
             let inputs = program
                 .input_types()
                 .into_owned()
@@ -3745,7 +3693,7 @@ mod tests {
             pullback_inputs.extend_from_slice(&primal_outputs[1..]);
             let gradient = builder.splice_program(&pullback, &pullback_inputs).unwrap();
             builder
-                .build::<Vec<XlaConstant>, Vec<XlaConstant>>(
+                .build::<Vec<Constant>, Vec<Constant>>(
                     vec![primal_outputs[0], gradient[0]],
                     vec![Placeholder; input_count + 1],
                     vec![Placeholder; 2],
@@ -3824,8 +3772,9 @@ mod tests {
 
         // A dynamic length runs the same iterations at runtime length 3 and leaves the carry and an empty gradient at
         // runtime length 0.
-        let dynamic_items_type = ArrayType::new(DataType::F64, Shape::new(vec![Dimension::Dynamic(length.clone())]));
-        let program = value_and_gradient(ScanOperation::new(1, Dimension::Dynamic(length)), dynamic_items_type);
+        let dynamic_items_type =
+            ArrayType::new(DataType::F64, Shape::new(vec![CoreDimension::Dynamic(length.clone())]));
+        let program = value_and_gradient(ScanOperation::new(1, CoreDimension::Dynamic(length)), dynamic_items_type);
         assert_eq!(
             program.to_string(),
             indoc! {"
@@ -3883,7 +3832,7 @@ mod tests {
         // zero, so the transposed scan has no cotangent outputs and only its printing effect is observable.
         let scalar_type = ArrayType::scalar(DataType::F64);
         let backward = {
-            let mut builder = ArrayIrXlaProgramBuilder::new();
+            let mut builder = ArrayIrProgramBuilder::new();
             let seed = builder.add_input(scalar_type.clone().into());
             builder
                 .add_instruction(PrintOperation::<ArrayType>::new("backward"), Vec::new(), vec![seed], None)
@@ -3892,17 +3841,17 @@ mod tests {
                 .add_instruction(ZeroOperation::new(scalar_type.clone()), Vec::new(), Vec::new(), None)
                 .unwrap()[0];
             builder
-                .build::<Vec<XlaConstant>, Vec<XlaConstant>>(vec![zero], vec![Placeholder], vec![Placeholder])
+                .build::<Vec<Constant>, Vec<Constant>>(vec![zero], vec![Placeholder], vec![Placeholder])
                 .unwrap()
         };
         let body = {
-            let mut builder = ArrayIrXlaProgramBuilder::new();
+            let mut builder = ArrayIrProgramBuilder::new();
             let backward = builder.import_region(backward.entry_region_ref());
             builder.add_input(ArrayType::scalar(DataType::I64).into());
             let item = builder.add_input(scalar_type.clone().into());
             let output = builder
                 .add_instruction(
-                    CompositeTransposeOperation::<XlaConstant, XlaOperation>::from_backward_region(
+                    CompositeTransposeOperation::<Constant, Operation>::from_backward_region(
                         0,
                         vec![scalar_type.clone().into()],
                         vec![scalar_type.clone().into()],
@@ -3913,18 +3862,18 @@ mod tests {
                 )
                 .unwrap()[0];
             builder
-                .build::<Vec<XlaConstant>, Vec<XlaConstant>>(vec![output], vec![Placeholder; 2], vec![Placeholder])
+                .build::<Vec<Constant>, Vec<Constant>>(vec![output], vec![Placeholder; 2], vec![Placeholder])
                 .unwrap()
         };
-        let mut builder = ArrayIrXlaProgramBuilder::new();
+        let mut builder = ArrayIrProgramBuilder::new();
         let body_region = builder.import_region(body.entry_region_ref());
         let items = builder.add_input(ArrayType::new_static(DataType::F64, [3]).into());
         let outputs = builder
-            .add_instruction(XlaOperation::Scan(ScanOperation::new(0, 3)), vec![body_region], vec![items], None)
+            .add_instruction(Operation::Scan(ScanOperation::new(0, 3)), vec![body_region], vec![items], None)
             .unwrap()
             .to_vec();
         let program = builder
-            .build::<Vec<XlaConstant>, Vec<XlaConstant>>(outputs, vec![Placeholder], vec![Placeholder])
+            .build::<Vec<Constant>, Vec<Constant>>(outputs, vec![Placeholder], vec![Placeholder])
             .unwrap();
         let client = execution_client();
         ensure_print_handler_registered(&client).unwrap();
@@ -3986,7 +3935,7 @@ mod tests {
         for (reverse, sums, products) in
             [(false, vec![1.0, 3.0, 6.0], vec![1.0, 2.0, 6.0]), (true, vec![6.0, 5.0, 3.0], vec![6.0, 6.0, 3.0])]
         {
-            let (_, program) = TracingContext::<XlaConstant, XlaOperation>::trace(
+            let (_, program) = TracingContext::<Constant, Operation>::trace(
                 |(carry, inputs)| {
                     scan(
                         |_, (sum, product), value| {
@@ -4045,7 +3994,7 @@ mod tests {
         // The count value supplies the frontend's execution domain when there is no carry or stacked input. Its
         // runtime extent controls the output allocation's logical shape, including the empty result.
         let count_type = DimensionType::new("iterations", DimensionBounds::non_negative(Some(5)).unwrap());
-        let (_, program) = TracingContext::<XlaConstant, XlaOperation>::trace(
+        let (_, program) = TracingContext::<Constant, Operation>::trace(
             |count| {
                 let ((), outputs) = scan(
                     |index, (), ()| Ok(((), index.convert_element_type(DataType::F64)?)),
@@ -4095,14 +4044,14 @@ mod tests {
             vec![Device::from_pjrt(&device).unwrap()],
         )
         .unwrap();
-        let domain = XlaSession::new(&client).domain();
+        let domain = Session::new(&client).domain();
         let scalar_type = ArrayType::scalar(DataType::F64)
             .with_sharding(Sharding::replicated(mesh.logical_mesh().clone(), 0))
             .unwrap();
         let inputs_type = ArrayType::new_static(DataType::F64, [3])
             .with_sharding(Sharding::replicated(mesh.logical_mesh().clone(), 1))
             .unwrap();
-        let compiled: CompiledXlaFunction<'_, (ArrayType, ArrayType), (ArrayType, ArrayType)> = compile(
+        let compiled: CompiledFunction<'_, (ArrayType, ArrayType), (ArrayType, ArrayType)> = compile(
             |(carry, inputs)| {
                 scan(
                     |_, carry, item| {
@@ -4135,9 +4084,8 @@ mod tests {
                 ]
                 in (%2, %3)"},
         );
-        let carry = XlaArray::from_host_buffer(&domain, scalar_type, mesh.clone(), values_to_bytes(&[0f64])).unwrap();
-        let inputs =
-            XlaArray::from_host_buffer(&domain, inputs_type, mesh, values_to_bytes(&[1f64, 2.0, 3.0])).unwrap();
+        let carry = Array::from_host_buffer(&domain, scalar_type, mesh.clone(), values_to_bytes(&[0f64])).unwrap();
+        let inputs = Array::from_host_buffer(&domain, inputs_type, mesh, values_to_bytes(&[1f64, 2.0, 3.0])).unwrap();
         let (sum, prefixes) = domain.interpret(&compiled.executable_function(), (carry, inputs)).unwrap();
         let outputs = [sum, prefixes]
             .into_iter()

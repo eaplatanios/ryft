@@ -1,4 +1,4 @@
-use ryft_core::{ArrayType, Dimension, ProgramError, SHARD_MAP_OPERATION_NAME};
+use ryft_core::{ArrayType, Dimension as CoreDimension, ProgramError, SHARD_MAP_OPERATION_NAME};
 use ryft_mlir::dialects::stable_hlo;
 use ryft_mlir::{
     Block, BlockRef, Context as MlirContext, LocationRef, Operation as MlirOperation, Value as MlirValue, ValueRef,
@@ -138,7 +138,7 @@ pub(crate) fn refine_collective_result_dimensions<'b, 'c: 'b, 't: 'c>(
     let i32_scalar_type = context.tensor_type(context.signless_integer_type(32), &[], None, location)?;
     let output_tensor_type = lower_tensor_type(output_type, context, location)?;
     for (axis, &extent) in extents.iter().enumerate() {
-        if !matches!(output_type.shape().dimensions()[axis], Dimension::Dynamic(_)) {
+        if !matches!(output_type.shape().dimensions()[axis], CoreDimension::Dynamic(_)) {
             continue;
         }
         let extent = block.append_operation(stable_hlo::convert(extent, i32_scalar_type, location)?)?;
@@ -159,15 +159,15 @@ pub(crate) fn refine_collective_result_dimensions<'b, 'c: 'b, 't: 'c>(
 mod tests {
     use pretty_assertions::assert_eq;
     use ryft_core::{
-        Array, ArrayOperation, DataType, DimensionBounds, DimensionType, ParallelAllToAllOperation,
+        Array as CoreArray, ArrayOperation, DataType, DimensionBounds, DimensionType, ParallelAllToAllOperation,
         ParallelPermuteOperation, Shape, ShardMapBoundary, Sharding,
     };
     use ryft_mlir::{Block, Location, Value as MlirValue};
 
     use crate::experimental::lowering::tests::{test_manual_mesh, test_vector_type};
     use crate::experimental::lowering::types::lower_array_ir_type;
-    use crate::experimental::ops::XlaOperation;
-    use crate::{LowerableOperation, MemberLowerableOperation, XlaLowerer};
+    use crate::experimental::ops::Operation;
+    use crate::{LowerableOperation, Lowerer, MemberLowerableOperation};
 
     use super::*;
 
@@ -187,7 +187,7 @@ mod tests {
         let permute = ParallelPermuteOperation::new("x".to_string(), 2, vec![(0, 1), (1, 0)]);
         let incompatible_mesh = test_manual_mesh("x", 3);
         for operation in [
-            ArrayOperation::<Array>::ParallelAllToAll(exchange.clone()),
+            ArrayOperation::<CoreArray>::ParallelAllToAll(exchange.clone()),
             ArrayOperation::ParallelPermute(permute.clone()),
             ArrayOperation::ParallelAllToAll(exchange.with_mesh(incompatible_mesh.clone())),
             ArrayOperation::ParallelPermute(permute.with_mesh(incompatible_mesh)),
@@ -202,8 +202,8 @@ mod tests {
                 let tensor_type = lower_tensor_type(&input_type, &context, location).unwrap();
                 let block = context.block(&[(tensor_type, location)]);
                 let input = block.argument(0).unwrap().as_ref();
-                let mut lowerer: XlaLowerer<'_, '_, '_, XlaOperation> =
-                    XlaLowerer::new(block.as_ref(), &context, location.as_ref()).with_collective_state(state.clone());
+                let mut lowerer: Lowerer<'_, '_, '_, Operation> =
+                    Lowerer::new(block.as_ref(), &context, location.as_ref()).with_collective_state(state.clone());
                 let result = operation.lower(&mut lowerer, &[input], &[input_type], &output_types);
                 let matching_mesh = match &operation {
                     ArrayOperation::ParallelAllToAll(operation) => operation.mesh().is_none(),
@@ -249,8 +249,8 @@ mod tests {
             let block = context.block(&mlir_types);
             let inputs =
                 (0..input_types.len()).map(|index| block.argument(index).unwrap().as_ref()).collect::<Vec<_>>();
-            let mut lowerer: XlaLowerer<'_, '_, '_, XlaOperation> =
-                XlaLowerer::new(block.as_ref(), &context, location.as_ref()).with_collective_state(state.clone());
+            let mut lowerer: Lowerer<'_, '_, '_, Operation> =
+                Lowerer::new(block.as_ref(), &context, location.as_ref()).with_collective_state(state.clone());
             let result = operation.lower_in_parent(&mut lowerer, &inputs, &input_types, &output_types);
             assert_eq!(result.is_ok(), sharding == &varying, "{sharding}: {result:?}");
             if result.is_err() {

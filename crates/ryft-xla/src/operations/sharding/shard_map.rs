@@ -20,10 +20,10 @@ use crate::experimental::lowering::types::lower_tensor_type;
 use crate::experimental::lowering::{
     CollectiveLoweringState, EffectTokens, current_or_new_token, token_threaded_effects,
 };
-use crate::experimental::ops::{XlaConstant, XlaProgram};
+use crate::experimental::ops::{Constant, Program};
 use crate::operations::control_flow::lowered_effect_classes;
 use crate::sharding::SHARDY_MESH_SYMBOL_NAME;
-use crate::{Error, LowerableOperation, LowerableOperationFamily, XlaLowerer};
+use crate::{Error, LowerableOperation, LowerableOperationFamily, Lowerer};
 
 /// Lowers one `sdy.manual_computation` operation, threading per-device effect tokens across its boundary. Assertions
 /// remain local to an executable, and the only ordered I/O that reaches this function is per-device
@@ -33,7 +33,7 @@ pub(crate) fn lower_manual_computation<'b, 'c: 'b, 't: 'c, ProgramInput, Program
     block: &mut BlockRef<'b, 'c, 't>,
     outer_inputs: &[ValueRef<'b, 'c, 't>],
     boundary: &ShardMapBoundary,
-    program: &XlaProgram<ProgramInput, ProgramOutput, O>,
+    program: &Program<ProgramInput, ProgramOutput, O>,
     local_input_types: &[ArrayType],
     global_output_types: &[ArrayType],
     context: &'c MlirContext<'t>,
@@ -42,8 +42,8 @@ pub(crate) fn lower_manual_computation<'b, 'c: 'b, 't: 'c, ProgramInput, Program
     effect_tokens: &mut EffectTokens<'b, 'c, 't>,
 ) -> Result<Vec<ValueRef<'b, 'c, 't>>, Error>
 where
-    ProgramInput: Parameterized<XlaConstant>,
-    ProgramOutput: Parameterized<XlaConstant>,
+    ProgramInput: Parameterized<Constant>,
+    ProgramOutput: Parameterized<Constant>,
 {
     // Tracked variation adjoints would duplicate the conservative unchecked boundary's gradient reductions. Low-level
     // programs can bypass the closure constructor, so enforce ordinary active-axis types before lowering their bodies.
@@ -338,7 +338,7 @@ fn manual_computation_dimension_shardings<'c, 't>(
 impl LowerableOperation for ShardMapOperation {
     fn lower<'b, 'c: 'b, 't: 'c, O: LowerableOperationFamily>(
         &self,
-        lowerer: &mut XlaLowerer<'b, 'c, 't, O>,
+        lowerer: &mut Lowerer<'b, 'c, 't, O>,
         input_values: &[ValueRef<'b, 'c, 't>],
         _input_types: &[ArrayIrType],
         _output_types: &[ArrayIrType],
@@ -388,23 +388,24 @@ mod tests {
     use indoc::indoc;
     use pretty_assertions::assert_eq;
     use ryft_core::{
-        AxisIndexOperation, Context, ConvertElementTypeOperation, CustomCallOperation, DataType, Device, DeviceMesh,
-        Dimension, DomainTracingContext, Dot, DotDimensionNumbers, EffectClass, LogicalMesh, MeshAxis, MeshAxisType,
-        Placeholder, Shape, ShardMapOptions, Typed, ValueProjection, shard_map,
+        AxisIndexOperation, BatchAxis, Context, ConvertElementTypeOperation, CustomCallOperation, DataType, Device,
+        DeviceMesh, Dimension as CoreDimension, DomainTracingContext, Dot, DotDimensionNumbers, EffectClass,
+        LogicalMesh, MeshAxis, MeshAxisType, Placeholder, Shape, ShardMapOptions, Typed, ValueProjection, batch,
+        shard_map,
     };
     use ryft_mlir::Block;
     use ryft_pjrt::{BufferType, ClientOptions, CpuClientOptions, Program as PjrtProgram, load_cpu_plugin};
 
-    use crate::experimental::XlaArrayTracer;
-    use crate::experimental::domains::XlaTracer;
+    use crate::domains::Tracer;
+    use crate::experimental::ArrayTracer;
     use crate::experimental::lowering::tests::{
         lower_replicated_shard_map_body, shard_map_module, static_sharded_array_type, test_manual_mesh, test_sharding,
         test_spmd_compilation_options, test_vector_type,
     };
-    use crate::experimental::ops::XlaProgramBuilder as ArrayIrXlaProgramBuilder;
+    use crate::experimental::ops::ProgramBuilder as ArrayIrProgramBuilder;
     use crate::operations::debugging::PRINT_CUSTOM_CALL_TARGET;
     use crate::tests::{values_from_bytes, values_to_bytes};
-    use crate::{FromPjrt, ToMlir, XlaArray, XlaDomain, XlaSession, XlaValue};
+    use crate::{Array, Domain, FromPjrt, Options, Session, ToMlir, Value};
 
     use super::*;
 
@@ -420,11 +421,11 @@ mod tests {
     /// Binds a `shard_map` with `boundary` over `x` in the context of `x`, whose body doubles its local input. The map
     /// is built from its boundary through [`ShardMapOperation::from_program`], so it bypasses the checks that the
     /// frontend applies against the manual axes of enclosing manual regions (e.g., as a transformation could).
-    fn bind_doubling_shard_map(x: XlaArrayTracer, boundary: ShardMapBoundary) -> Result<XlaArrayTracer, ProgramError> {
+    fn bind_doubling_shard_map(x: ArrayTracer, boundary: ShardMapBoundary) -> Result<ArrayTracer, ProgramError> {
         let global_type = boundary.global_input_type(0, &x.r#type())?;
         let local_type = boundary.local_input_type(0, &global_type)?;
-        let (_, body) = DomainTracingContext::<XlaDomain<'static>>::trace(
-            |inputs: Vec<XlaTracer<'static>>| {
+        let (_, body) = DomainTracingContext::<Domain<'static>>::trace(
+            |inputs: Vec<Tracer<'static>>| {
                 let y = ValueProjection::<ArrayType>::into_projected(inputs[0].clone()).map_err(ProgramError::from)?;
                 Ok(vec![(y.clone() + y).into_value()])
             },
@@ -456,7 +457,7 @@ mod tests {
     #[test]
     fn test_device_ordered_effects_cross_manual_computation_boundary() {
         let vector_type = test_vector_type(4);
-        let mut builder = ArrayIrXlaProgramBuilder::new();
+        let mut builder = ArrayIrProgramBuilder::new();
         let input = builder.add_input(vector_type.into());
         for label in ["first", "second"] {
             builder
@@ -471,7 +472,7 @@ mod tests {
                 .unwrap();
         }
         let program = builder
-            .build::<Vec<XlaConstant>, Vec<XlaConstant>>(vec![input], vec![Placeholder], vec![Placeholder])
+            .build::<Vec<Constant>, Vec<Constant>>(vec![input], vec![Placeholder], vec![Placeholder])
             .unwrap();
         let module = lower_replicated_shard_map_body(program, 2).unwrap();
         assert!(module.contains("sdy.mesh @mesh = <[\"x\"=2]>"));
@@ -493,7 +494,7 @@ mod tests {
         use crate::operations::debugging::{ensure_print_handler_registered, with_captured_prints};
         use crate::tests::{values_from_bytes, values_to_bytes};
 
-        let mut builder = ArrayIrXlaProgramBuilder::new();
+        let mut builder = ArrayIrProgramBuilder::new();
         let input = builder.add_input(test_vector_type(4).into());
         let device_index = builder
             .add_instruction(
@@ -524,7 +525,7 @@ mod tests {
                 .unwrap();
         }
         let program = builder
-            .build::<Vec<XlaConstant>, Vec<XlaConstant>>(vec![input], vec![Placeholder], vec![Placeholder])
+            .build::<Vec<Constant>, Vec<Constant>>(vec![input], vec![Placeholder], vec![Placeholder])
             .unwrap();
         let module = lower_replicated_shard_map_body(program, 2).unwrap();
         let plugin = load_cpu_plugin().unwrap();
@@ -685,7 +686,7 @@ mod tests {
 
     #[test]
     fn test_to_mlir_module_for_program_renders_auto_axes_as_open_dimension_shardings() {
-        let global_input_type = ArrayType::new(DataType::F32, Shape::new(vec![Dimension::Static(16)]));
+        let global_input_type = ArrayType::new(DataType::F32, Shape::new(vec![CoreDimension::Static(16)]));
         let mesh = test_logical_mesh_data_model();
         let input_sharding = test_sharding(&mesh, vec![ShardingDimension::sharded(["data", "model"])], vec![]);
         let module = shard_map_module::<_, ArrayType, ArrayType>(
@@ -728,9 +729,9 @@ mod tests {
             {
                 let inner_mesh = inner_mesh.clone();
                 let inner_sharding = inner_sharding.clone();
-                move |_, x: XlaArrayTracer| {
-                    let nested: XlaArrayTracer = shard_map(
-                        |y: XlaArrayTracer| Ok(y.clone() + y),
+                move |_, x: ArrayTracer| {
+                    let nested: ArrayTracer = shard_map(
+                        |y: ArrayTracer| Ok(y.clone() + y),
                         x.clone(),
                         inner_mesh.clone(),
                         inner_sharding.clone(),
@@ -740,7 +741,7 @@ mod tests {
                     Ok(nested + x)
                 }
             },
-            ArrayType::new(DataType::F32, Shape::new(vec![Dimension::Static(8)])),
+            ArrayType::new(DataType::F32, Shape::new(vec![CoreDimension::Static(8)])),
             mesh,
             outer_sharding.clone(),
             outer_sharding,
@@ -778,7 +779,7 @@ mod tests {
         let mesh = LogicalMesh::new(vec![MeshAxis::new("x", 2, MeshAxisType::Manual).unwrap()]).unwrap();
         let replicated = test_sharding(&mesh, vec![ShardingDimension::replicated()], vec![]);
         let module = shard_map_module::<_, ArrayType, ArrayType>(
-            |_, x: XlaArrayTracer| {
+            |_, x: ArrayTracer| {
                 let boundary = ShardMapBoundary::new(
                     mesh.clone(),
                     vec![replicated.clone()],
@@ -811,7 +812,7 @@ mod tests {
         let replicated = test_sharding(&mesh, vec![ShardingDimension::replicated()], vec![]);
         let sharded = test_sharding(&mesh, vec![ShardingDimension::sharded(["x"])], vec![]);
         let module = shard_map_module::<_, ArrayType, ArrayType>(
-            |_, x: XlaArrayTracer| {
+            |_, x: ArrayTracer| {
                 let boundary = ShardMapBoundary::new(
                     mesh.clone(),
                     vec![sharded.clone()],
@@ -844,7 +845,7 @@ mod tests {
         let client = plugin
             .client(ClientOptions::CPU(CpuClientOptions { device_count: Some(4), ..Default::default() }))
             .expect("failed to create 4-device CPU client");
-        let domain = XlaSession::new(&client).domain();
+        let domain = Session::new(&client).domain();
         let client_devices = client.addressable_devices().unwrap();
         assert_eq!(client_devices.len(), 4);
 
@@ -857,7 +858,7 @@ mod tests {
 
         let sharding =
             Sharding::new(device_mesh.logical_mesh().clone(), vec![ShardingDimension::sharded(["x"])]).unwrap();
-        let global_input_type = ArrayType::new(DataType::F32, Shape::new(vec![Dimension::Static(8)]));
+        let global_input_type = ArrayType::new(DataType::F32, Shape::new(vec![CoreDimension::Static(8)]));
         let mlir_program = shard_map_module::<_, ArrayType, ArrayType>(
             |_, x| Ok(x.clone() + x),
             global_input_type,
@@ -886,7 +887,7 @@ mod tests {
             })
             .collect::<Vec<_>>();
 
-        let input_array = XlaArray::from_addressable_buffers(
+        let input_array = Array::from_addressable_buffers(
             &domain,
             static_sharded_array_type(DataType::F32, &[8], sharding),
             device_mesh,
@@ -908,7 +909,7 @@ mod tests {
         let execution_device_ids = execution_devices.iter().map(|device| device.id().unwrap()).collect::<Vec<_>>();
 
         let execute_arguments =
-            XlaArray::into_execute_arguments(vec![input_array], execution_device_ids.as_slice()).unwrap();
+            Array::into_execute_arguments(vec![input_array], execution_device_ids.as_slice()).unwrap();
         let outputs = executable
             .execute(
                 execute_arguments.as_execution_device_inputs(),
@@ -1027,8 +1028,8 @@ mod tests {
         let output_sharding = Sharding::new(mesh.clone(), vec![ShardingDimension::sharded(["y"])]).unwrap();
         let global_input_type =
             ArrayType::new_static(DataType::F32, [8]).with_sharding(input_sharding.clone()).unwrap();
-        let (_, program) = DomainTracingContext::<XlaDomain<'static>>::trace(
-            |inputs: Vec<XlaTracer<'static>>| {
+        let (_, program) = DomainTracingContext::<Domain<'static>>::trace(
+            |inputs: Vec<Tracer<'static>>| {
                 let input = ValueProjection::<ArrayType>::into_projected(inputs[0].clone())?;
                 let output = shard_map(
                     |input| Ok(input),
@@ -1144,11 +1145,11 @@ mod tests {
         let mesh = test_manual_mesh("x", 4);
         let replicated = Sharding::replicated(mesh.clone(), 0);
         let global_type = ArrayType::scalar(DataType::F32).with_sharding(replicated.clone()).unwrap();
-        let (_, program) = DomainTracingContext::<XlaDomain<'static>>::trace(
-            |inputs: Vec<XlaTracer<'static>>| {
+        let (_, program) = DomainTracingContext::<Domain<'static>>::trace(
+            |inputs: Vec<Tracer<'static>>| {
                 let input = ValueProjection::<ArrayType>::into_projected(inputs[0].clone())?;
                 let output = shard_map(
-                    |input: XlaArrayTracer| input.parallel_reduce(ReductionKind::Sum, "x"),
+                    |input: ArrayTracer| input.parallel_reduce(ReductionKind::Sum, "x"),
                     input,
                     mesh,
                     replicated.clone(),
@@ -1359,7 +1360,7 @@ mod tests {
     fn test_to_mlir_module_for_program_without_manual_variation_passes_unreduced_summands_between_maps_on_cpu() {
         use ryft_pjrt::{ExecutionDeviceInputs, ExecutionInput};
 
-        use crate::experimental::tracing::{TracedXlaProgram, trace_with_context};
+        use crate::experimental::tracing::{TracedProgram, trace_with_context};
 
         // The first map returns each device's shard of `x = [1, 2]` as its summand of an unreduced output, and the
         // second map squares each summand of its unreduced input. The summands survive between the maps, so the
@@ -1369,10 +1370,10 @@ mod tests {
         let sharded = Sharding::new(mesh.clone(), vec![ShardingDimension::sharded(["x"])]).unwrap();
         let unreduced = Sharding::replicated(mesh.clone(), 1).with_unreduced_axes(["x"]).unwrap();
         let options = ShardMapOptions::new().with_check_manual_variation(false);
-        let traced: TracedXlaProgram<ArrayType, ArrayType> = trace_with_context(
-            |_, x: XlaArrayTracer| {
+        let traced: TracedProgram<ArrayType, ArrayType> = trace_with_context(
+            |_, x: ArrayTracer| {
                 let summands = shard_map(
-                    |x: XlaArrayTracer| Ok(x),
+                    |x: ArrayTracer| Ok(x),
                     x,
                     mesh.clone(),
                     sharded.clone(),
@@ -1380,7 +1381,7 @@ mod tests {
                     options.clone(),
                 )?;
                 Ok(shard_map(
-                    |summand: XlaArrayTracer| Ok(summand.clone() * summand),
+                    |summand: ArrayTracer| Ok(summand.clone() * summand),
                     summands,
                     mesh.clone(),
                     unreduced.clone(),
@@ -1463,12 +1464,12 @@ mod tests {
         /// Binds an unchecked map from `input_sharding` to `output_sharding` on `input` eagerly in `domain`, whose body
         /// squares its local input when `square` is `true` and returns it unchanged otherwise.
         fn bind_map<'c>(
-            domain: &XlaDomain<'c>,
-            input: XlaArray<'c>,
+            domain: &Domain<'c>,
+            input: Array<'c>,
             input_sharding: Sharding,
             output_sharding: &Sharding,
             square: bool,
-        ) -> XlaArray<'c> {
+        ) -> Array<'c> {
             let boundary = ShardMapBoundary::new(
                 input_sharding.mesh().clone(),
                 vec![input_sharding],
@@ -1479,8 +1480,8 @@ mod tests {
             .with_check_manual_variation(false);
             let global_type = input.r#type().into_owned();
             let local_type = boundary.local_input_type(0, &global_type).unwrap();
-            let (_, body) = DomainTracingContext::<XlaDomain<'static>>::trace(
-                |inputs: Vec<XlaTracer<'static>>| {
+            let (_, body) = DomainTracingContext::<Domain<'static>>::trace(
+                |inputs: Vec<Tracer<'static>>| {
                     let x = ValueProjection::<ArrayType>::into_projected(inputs[0].clone())?;
                     Ok(vec![if square { x.clone() * x } else { x }.into_value()])
                 },
@@ -1488,8 +1489,8 @@ mod tests {
             )
             .unwrap();
             let operation = ShardMapOperation::from_program(&body, vec![global_type.into()], boundary).unwrap();
-            let mut outputs = domain.bind(operation, vec![body], &[XlaValue::Array(input)]).unwrap();
-            let XlaValue::Array(output) = outputs.remove(0) else {
+            let mut outputs = domain.bind(operation, vec![body], &[Value::Array(input)]).unwrap();
+            let Value::Array(output) = outputs.remove(0) else {
                 panic!("the eager map returned a dimension");
             };
             output
@@ -1503,7 +1504,7 @@ mod tests {
         let client = plugin
             .client(ClientOptions::CPU(CpuClientOptions { device_count: Some(2), ..Default::default() }))
             .unwrap();
-        let domain = XlaSession::new(&client).domain();
+        let domain = Session::new(&client).domain();
         let logical_mesh = test_manual_mesh("x", 2);
         let devices = client.addressable_devices().unwrap();
         let mesh = DeviceMesh::new(
@@ -1514,7 +1515,7 @@ mod tests {
         let sharded = Sharding::new(logical_mesh.clone(), vec![ShardingDimension::sharded(["x"])]).unwrap();
         let unreduced = Sharding::replicated(logical_mesh.clone(), 1).with_unreduced_axes(["x"]).unwrap();
         let input_type = ArrayType::new_static(DataType::F32, [2]).with_sharding(sharded.clone()).unwrap();
-        let input = XlaArray::from_host_buffer(&domain, input_type, mesh, values_to_bytes(&[1f32, 2.])).unwrap();
+        let input = Array::from_host_buffer(&domain, input_type, mesh, values_to_bytes(&[1f32, 2.])).unwrap();
         let summands = bind_map(&domain, input, sharded, &unreduced, false);
         let squares = bind_map(&domain, summands, unreduced.clone(), &unreduced, true);
         assert_eq!(squares.r#type().sharding(), Some(&unreduced));
@@ -1528,6 +1529,76 @@ mod tests {
         assert_eq!(device_values, vec![vec![1.0], vec![4.0]]);
         let materialized = crate::arrays_v0::host::materialize_dense_array_bytes(&squares).unwrap();
         assert_eq!(values_from_bytes::<f32>(materialized.as_slice()), vec![5.0]);
+    }
+
+    #[test]
+    fn test_shard_map_batched_along_every_manual_axis_executes_for_callers_over_explicit_meshes_on_cpu() {
+        // The caller types its input over an `Explicit` copy of the mesh of the map, which differs from it only in axis
+        // types, and maps its leading dimension along `x`, the only active manual axis of the map. Batching releases `x`,
+        // so the map has no active manual axes, and its outputs are typed over the `Manual` mesh of the map, which the
+        // caller's device mesh accepts because both meshes have the same topology. Each device holds one doubled item.
+        let plugin = load_cpu_plugin().unwrap();
+        let client = plugin
+            .client(ClientOptions::CPU(CpuClientOptions { device_count: Some(2), ..Default::default() }))
+            .unwrap();
+        let map_mesh = test_manual_mesh("x", 2);
+        let caller_mesh = LogicalMesh::new(vec![MeshAxis::new("x", 2, MeshAxisType::Explicit).unwrap()]).unwrap();
+        let devices = client.addressable_devices().unwrap();
+        let mesh = DeviceMesh::new(
+            caller_mesh.clone(),
+            devices.iter().map(|device| Device::from_pjrt(device).unwrap()).collect(),
+        )
+        .unwrap();
+        let domain = Session::new(&client).domain();
+        let replicated = Sharding::replicated(map_mesh.clone(), 1);
+        let input_type = ArrayType::new_static(DataType::F32, [2, 3])
+            .with_sharding(
+                Sharding::new(caller_mesh, vec![ShardingDimension::sharded(["x"]), ShardingDimension::replicated()])
+                    .unwrap(),
+            )
+            .unwrap();
+        let staged = crate::jit::stage::<_, ArrayType, ArrayType>(
+            |input| {
+                let output = batch(
+                    |item| {
+                        let item = ValueProjection::<ArrayType>::into_projected(item)?;
+                        let output = shard_map(
+                            |x| Ok(x.clone() + x),
+                            item,
+                            map_mesh.clone(),
+                            replicated.clone(),
+                            replicated.clone(),
+                            ShardMapOptions::new(),
+                        )?;
+                        Ok(output.into_value())
+                    },
+                    input.into_value(),
+                    BatchAxis::new(0),
+                    BatchAxis::new(0),
+                    None,
+                )
+                .unwrap();
+                ValueProjection::<ArrayType>::into_projected(output).unwrap()
+            },
+            input_type.clone(),
+            Options::new(mesh.clone()),
+        )
+        .unwrap()
+        .into_inner();
+        let compiled = staged.lower(&domain).unwrap().compile(&domain).unwrap();
+        let input =
+            Array::from_host_buffer(&domain, input_type, mesh, values_to_bytes(&[1f32, 2., 3., 4., 5., 6.])).unwrap();
+        let Value::Array(output) = compiled.executable().execute(&domain, Value::Array(input)).unwrap() else {
+            panic!("the compiled function returned a dimension");
+        };
+        let items = output
+            .addressable_shards()
+            .map(|shard| {
+                let bytes = shard.buffer().unwrap().copy_to_host(None).unwrap().r#await().unwrap();
+                values_from_bytes::<f32>(bytes.as_slice())
+            })
+            .collect::<Vec<_>>();
+        assert_eq!(items, vec![vec![2.0, 4.0, 6.0], vec![8.0, 10.0, 12.0]]);
     }
 
     #[test]
@@ -1545,11 +1616,11 @@ mod tests {
         let mesh = test_manual_mesh("x", 2);
         let reduced = Sharding::replicated(mesh.clone(), 1).with_reduced_axes(["x"]).unwrap();
         let global_type = ArrayType::new_static(DataType::F32, [1]).with_sharding(reduced.clone()).unwrap();
-        let (_, program) = DomainTracingContext::<XlaDomain<'static>>::trace(
-            |inputs: Vec<XlaTracer<'static>>| {
+        let (_, program) = DomainTracingContext::<Domain<'static>>::trace(
+            |inputs: Vec<Tracer<'static>>| {
                 let input = ValueProjection::<ArrayType>::into_projected(inputs[0].clone())?;
                 let output = shard_map(
-                    |input: XlaArrayTracer| Ok(input.clone() + input),
+                    |input: ArrayTracer| Ok(input.clone() + input),
                     input,
                     mesh,
                     reduced.clone(),
@@ -1722,7 +1793,7 @@ mod tests {
         let client = plugin
             .client(ClientOptions::CPU(CpuClientOptions { device_count: Some(8), ..Default::default() }))
             .expect("failed to create 8-device CPU client");
-        let domain = XlaSession::new(&client).domain();
+        let domain = Session::new(&client).domain();
         let client_devices = client.addressable_devices().unwrap();
         assert_eq!(client_devices.len(), 8);
 
@@ -1745,8 +1816,8 @@ mod tests {
         )
         .unwrap();
         let global_input_types = (
-            ArrayType::new(DataType::F32, Shape::new(vec![Dimension::Static(8), Dimension::Static(4)])),
-            ArrayType::new(DataType::F32, Shape::new(vec![Dimension::Static(4), Dimension::Static(2)])),
+            ArrayType::new(DataType::F32, Shape::new(vec![CoreDimension::Static(8), CoreDimension::Static(4)])),
+            ArrayType::new(DataType::F32, Shape::new(vec![CoreDimension::Static(4), CoreDimension::Static(2)])),
         );
         let mlir_program = shard_map_module::<_, (ArrayType, ArrayType), ArrayType>(
             |_, (lhs, rhs)| lhs.dot(&rhs, &DotDimensionNumbers::matmul()),
@@ -1808,14 +1879,14 @@ mod tests {
             })
             .collect::<Vec<_>>();
 
-        let lhs_array = XlaArray::from_addressable_buffers(
+        let lhs_array = Array::from_addressable_buffers(
             &domain,
             static_sharded_array_type(DataType::F32, &[8, 4], lhs_sharding.clone()),
             device_mesh.clone(),
             lhs_buffers,
         )
         .unwrap();
-        let rhs_array = XlaArray::from_addressable_buffers(
+        let rhs_array = Array::from_addressable_buffers(
             &domain,
             static_sharded_array_type(DataType::F32, &[4, 2], rhs_sharding),
             device_mesh,
@@ -1837,7 +1908,7 @@ mod tests {
             .collect::<HashMap<_, _>>();
 
         let execute_arguments =
-            XlaArray::into_execute_arguments(vec![lhs_array, rhs_array], execution_device_ids.as_slice()).unwrap();
+            Array::into_execute_arguments(vec![lhs_array, rhs_array], execution_device_ids.as_slice()).unwrap();
         let outputs = executable
             .execute(
                 execute_arguments.as_execution_device_inputs(),
@@ -2008,7 +2079,7 @@ mod tests {
         let client = plugin
             .client(ClientOptions::CPU(CpuClientOptions { device_count: Some(4), ..Default::default() }))
             .expect("failed to create 4-device CPU client");
-        let domain = XlaSession::new(&client).domain();
+        let domain = Session::new(&client).domain();
         let client_devices = client.addressable_devices().unwrap();
         assert_eq!(client_devices.len(), 4);
 
@@ -2030,7 +2101,7 @@ mod tests {
         .unwrap();
         assert_eq!(
             boundary.local_input_type(0, &ArrayType::new_static(DataType::F32, [8])).unwrap().shape(),
-            &Shape::new(vec![Dimension::Static(2)]),
+            &Shape::new(vec![CoreDimension::Static(2)]),
         );
 
         let context = MlirContext::new();
@@ -2081,7 +2152,7 @@ mod tests {
             })
             .collect::<Vec<_>>();
 
-        let input_array = XlaArray::from_addressable_buffers(
+        let input_array = Array::from_addressable_buffers(
             &domain,
             static_sharded_array_type(DataType::F32, &[8], sharding),
             device_mesh,
@@ -2103,7 +2174,7 @@ mod tests {
         let execution_device_ids = execution_devices.iter().map(|device| device.id().unwrap()).collect::<Vec<_>>();
 
         let execute_arguments =
-            XlaArray::into_execute_arguments(vec![input_array], execution_device_ids.as_slice()).unwrap();
+            Array::into_execute_arguments(vec![input_array], execution_device_ids.as_slice()).unwrap();
         let outputs = executable
             .execute(
                 execute_arguments.as_execution_device_inputs(),

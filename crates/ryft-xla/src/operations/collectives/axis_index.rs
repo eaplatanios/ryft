@@ -9,7 +9,7 @@ use ryft_mlir::{
 
 use crate::experimental::lowering::CollectiveLoweringState;
 use crate::experimental::lowering::types::{lower_tensor_type, lower_u64_scalar_constant};
-use crate::{Error, LowerableOperation, LowerableOperationFamily, XlaLowerer};
+use crate::{Error, LowerableOperation, LowerableOperationFamily, Lowerer};
 
 /// Lowers one [`AxisIndexOperation`] inside a `sdy.manual_computation` region to the executing device's coordinate
 /// along the named device mesh axis, as a scalar `u64`.
@@ -85,7 +85,7 @@ pub(crate) fn lower_axis_index_to_coordinate<'b, 'c: 'b, 't: 'c>(
 impl LowerableOperation for AxisIndexOperation {
     fn lower<'b, 'c: 'b, 't: 'c, O: LowerableOperationFamily>(
         &self,
-        lowerer: &mut XlaLowerer<'b, 'c, 't, O>,
+        lowerer: &mut Lowerer<'b, 'c, 't, O>,
         input_values: &[ValueRef<'b, 'c, 't>],
         _input_types: &[ArrayType],
         output_types: &[ArrayType],
@@ -120,7 +120,7 @@ impl LowerableOperation for AxisIndexOperation {
 
 #[cfg(test)]
 mod tests {
-    use ryft_core::{Context, ShardMapOptions, Sharding, Value};
+    use ryft_core::{Context, ShardMapOptions, Sharding, Value as CoreValue};
 
     use crate::experimental::lowering::tests::{shard_map_module, test_manual_mesh, test_vector_type};
 

@@ -1,6 +1,6 @@
 use ryft_core::{
-    ArrayType, DataType, Dimension, ExpM1Operation, ExpOperation, Ln1pOperation, LogAddExpOperation, LogOperation,
-    LogisticOperation,
+    ArrayType, DataType, Dimension as CoreDimension, ExpM1Operation, ExpOperation, Ln1pOperation, LogAddExpOperation,
+    LogOperation, LogisticOperation,
 };
 use ryft_mlir::dialects::stable_hlo::Accuracy;
 use ryft_mlir::dialects::{stable_hlo, tensor};
@@ -15,12 +15,12 @@ use crate::experimental::lowering::types::{
 use crate::operations::complex::lower_select_principal_phase_to_mlir;
 use crate::operations::extrema::lower_extremum_to_mlir;
 use crate::operations::{lower_accuracy, normalize_binary_elementwise_operands};
-use crate::{Error, LowerableOperation, LowerableOperationFamily, XlaLowerer};
+use crate::{Error, LowerableOperation, LowerableOperationFamily, Lowerer};
 
 impl LowerableOperation for ExpOperation<ArrayType> {
     fn lower<'b, 'c: 'b, 't: 'c, O: LowerableOperationFamily>(
         &self,
-        lowerer: &mut XlaLowerer<'b, 'c, 't, O>,
+        lowerer: &mut Lowerer<'b, 'c, 't, O>,
         input_values: &[ValueRef<'b, 'c, 't>],
         _input_types: &[ArrayType],
         _output_types: &[ArrayType],
@@ -37,7 +37,7 @@ impl LowerableOperation for ExpOperation<ArrayType> {
 impl LowerableOperation for ExpM1Operation<ArrayType> {
     fn lower<'b, 'c: 'b, 't: 'c, O: LowerableOperationFamily>(
         &self,
-        lowerer: &mut XlaLowerer<'b, 'c, 't, O>,
+        lowerer: &mut Lowerer<'b, 'c, 't, O>,
         input_values: &[ValueRef<'b, 'c, 't>],
         _input_types: &[ArrayType],
         output_types: &[ArrayType],
@@ -64,7 +64,7 @@ impl LowerableOperation for ExpM1Operation<ArrayType> {
 impl LowerableOperation for LogOperation<ArrayType> {
     fn lower<'b, 'c: 'b, 't: 'c, O: LowerableOperationFamily>(
         &self,
-        lowerer: &mut XlaLowerer<'b, 'c, 't, O>,
+        lowerer: &mut Lowerer<'b, 'c, 't, O>,
         input_values: &[ValueRef<'b, 'c, 't>],
         _input_types: &[ArrayType],
         _output_types: &[ArrayType],
@@ -81,7 +81,7 @@ impl LowerableOperation for LogOperation<ArrayType> {
 impl LowerableOperation for Ln1pOperation<ArrayType> {
     fn lower<'b, 'c: 'b, 't: 'c, O: LowerableOperationFamily>(
         &self,
-        lowerer: &mut XlaLowerer<'b, 'c, 't, O>,
+        lowerer: &mut Lowerer<'b, 'c, 't, O>,
         input_values: &[ValueRef<'b, 'c, 't>],
         _input_types: &[ArrayType],
         output_types: &[ArrayType],
@@ -109,7 +109,7 @@ impl LowerableOperation for Ln1pOperation<ArrayType> {
 impl LowerableOperation for LogAddExpOperation<ArrayType> {
     fn lower<'b, 'c: 'b, 't: 'c, O: LowerableOperationFamily>(
         &self,
-        lowerer: &mut XlaLowerer<'b, 'c, 't, O>,
+        lowerer: &mut Lowerer<'b, 'c, 't, O>,
         input_values: &[ValueRef<'b, 'c, 't>],
         _input_types: &[ArrayType],
         output_types: &[ArrayType],
@@ -136,7 +136,7 @@ impl LowerableOperation for LogAddExpOperation<ArrayType> {
 impl LowerableOperation for LogisticOperation<ArrayType> {
     fn lower<'b, 'c: 'b, 't: 'c, O: LowerableOperationFamily>(
         &self,
-        lowerer: &mut XlaLowerer<'b, 'c, 't, O>,
+        lowerer: &mut Lowerer<'b, 'c, 't, O>,
         input_values: &[ValueRef<'b, 'c, 't>],
         _input_types: &[ArrayType],
         output_types: &[ArrayType],
@@ -302,10 +302,10 @@ fn lower_exponential_constant_like<'b, 'c: 'b, 't: 'c>(
         .iter()
         .enumerate()
         .map(|(axis, dimension)| match dimension {
-            Dimension::Static(extent) => {
+            CoreDimension::Static(extent) => {
                 Ok(lower_static_index_constants(&[*extent], block, context, location)?.remove(0))
             }
-            Dimension::Dynamic(_) => lower_runtime_dimension_size_i64(input, axis, block, context, location),
+            CoreDimension::Dynamic(_) => lower_runtime_dimension_size_i64(input, axis, block, context, location),
         })
         .collect::<Result<Vec<_>, Error>>()?;
     let shape = lower_explicit_shape(&dimensions, block, context, location)?;
@@ -724,21 +724,21 @@ pub(crate) fn lower_log_add_exp_to_mlir<'b, 'c: 'b, 't: 'c>(
 mod tests {
     use indoc::indoc;
     use pretty_assertions::assert_eq;
-    use ryft_core::{ArrayOperation, Dimension, Placeholder, Shape};
+    use ryft_core::{ArrayOperation, Dimension as CoreDimension, Placeholder, Shape};
 
-    use crate::experimental::lowering::tests::{XlaProgramBuilder, dynamic_dimension, lowered_unary_module};
+    use crate::experimental::lowering::tests::{ProgramBuilder, dynamic_dimension, lowered_unary_module};
     use crate::experimental::lowering::to_mlir_module_for_plain_program;
-    use crate::experimental::ops::XlaArrayConstant;
+    use crate::experimental::ops::ArrayConstant;
 
     use super::*;
 
     /// Lowers one unary operation while retaining its bounded dynamic input and result shape.
-    fn lowered_dynamic_unary_module(operation: ArrayOperation<XlaArrayConstant>, data_type: DataType) -> String {
-        let mut builder = XlaProgramBuilder::new();
+    fn lowered_dynamic_unary_module(operation: ArrayOperation<ArrayConstant>, data_type: DataType) -> String {
+        let mut builder = ProgramBuilder::new();
         let input = builder.add_input(ArrayType::new(data_type, Shape::new(vec![dynamic_dimension("size", Some(5))])));
         let output = builder.add_instruction(operation, Vec::new(), vec![input], None).unwrap()[0];
         let program = builder
-            .build::<Vec<XlaArrayConstant>, Vec<XlaArrayConstant>>(vec![output], vec![Placeholder], vec![Placeholder])
+            .build::<Vec<ArrayConstant>, Vec<ArrayConstant>>(vec![output], vec![Placeholder], vec![Placeholder])
             .unwrap();
         to_mlir_module_for_plain_program(&program, "main").unwrap()
     }
@@ -900,14 +900,14 @@ mod tests {
         // `log_add_exp` has none, so it expands into the guarded max-shifted construction: the `NE` self-comparison
         // is the `isnan(a - b)` test that routes same-sign infinities and NaN operands through the plain `a + b`
         // sum, while the ordinary arm shifts by the larger operand so that the exponential never overflows.
-        let mut builder = XlaProgramBuilder::new();
-        let left = builder.add_input(ArrayType::new(DataType::F32, Shape::new(vec![Dimension::Static(4)])));
-        let right = builder.add_input(ArrayType::new(DataType::F32, Shape::new(vec![Dimension::Static(4)])));
+        let mut builder = ProgramBuilder::new();
+        let left = builder.add_input(ArrayType::new(DataType::F32, Shape::new(vec![CoreDimension::Static(4)])));
+        let right = builder.add_input(ArrayType::new(DataType::F32, Shape::new(vec![CoreDimension::Static(4)])));
         let output = builder
             .add_instruction(ArrayOperation::LogAddExp(LogAddExpOperation::new()), Vec::new(), vec![left, right], None)
             .unwrap()[0];
         let program = builder
-            .build::<Vec<XlaArrayConstant>, Vec<XlaArrayConstant>>(
+            .build::<Vec<ArrayConstant>, Vec<ArrayConstant>>(
                 vec![output],
                 vec![Placeholder, Placeholder],
                 vec![Placeholder],

@@ -1,5 +1,7 @@
 use ryft_core::macros::check_count;
-use ryft_core::{ArrayType, ComparisonDirection, DataType, Dimension, GatherMode, GatherOperation, ReductionKind};
+use ryft_core::{
+    ArrayType, ComparisonDirection, DataType, Dimension as CoreDimension, GatherMode, GatherOperation, ReductionKind,
+};
 use ryft_mlir::dialects::stable_hlo;
 use ryft_mlir::{
     Block, BlockRef, Context as MlirContext, LocationRef, Operation as MlirOperation, Value as MlirValue, ValueRef,
@@ -14,7 +16,7 @@ use crate::experimental::lowering::types::{
 use crate::operations::comparisons::lower_compare_to_mlir;
 use crate::operations::reductions::build_reduce_body_region;
 use crate::operations::sharding::constrain_sharding::lower_sharding_constraint;
-use crate::{Error, LowerableOperation, LowerableOperationFamily, XlaLowerer};
+use crate::{Error, LowerableOperation, LowerableOperationFamily, Lowerer};
 
 /// Lowers gather with its explicit index-vector axis. Fill mode masks whole out-of-bounds windows, and clip mode
 /// clamps against logical input sizes even when the allocation is larger. Comparisons preserve index signedness.
@@ -98,8 +100,10 @@ pub(crate) fn lower_gather_to_mlir<'b, 'c: 'b, 't: 'c>(
     let mut upper_bounds = Vec::with_capacity(dimensions.start_index_map().len());
     for &axis in dimensions.start_index_map() {
         let extent = match input_types[0].shape().dimensions()[axis] {
-            Dimension::Static(extent) => lower_static_index_constants(&[extent], block, context, location)?[0],
-            Dimension::Dynamic(_) => lower_runtime_dimension_size_i64(input_values[0], axis, block, context, location)?,
+            CoreDimension::Static(extent) => lower_static_index_constants(&[extent], block, context, location)?[0],
+            CoreDimension::Dynamic(_) => {
+                lower_runtime_dimension_size_i64(input_values[0], axis, block, context, location)?
+            }
         };
         let window = lower_static_index_constants(&[operation.slice_sizes()[axis]], block, context, location)?[0];
         upper_bounds
@@ -222,7 +226,7 @@ pub(crate) fn lower_gather_to_mlir<'b, 'c: 'b, 't: 'c>(
 impl LowerableOperation for GatherOperation {
     fn lower<'b, 'c: 'b, 't: 'c, O: LowerableOperationFamily>(
         &self,
-        lowerer: &mut XlaLowerer<'b, 'c, 't, O>,
+        lowerer: &mut Lowerer<'b, 'c, 't, O>,
         input_values: &[ValueRef<'b, 'c, 't>],
         input_types: &[ArrayType],
         output_types: &[ArrayType],
@@ -256,19 +260,19 @@ mod tests {
 
     use pretty_assertions::assert_eq;
     use ryft_core::{
-        Array, ArrayOperation, DimensionBounds, DimensionVariable, GatherDimensionNumbers, LogicalMesh, MeshAxis,
-        MeshAxisType, Placeholder, ProgramBuilder, ScatterDimensionNumbers, ScatterOperation, ScatterReductionKind,
-        Shape, Sharding, ShardingDimension, Typed, i1,
+        Array as CoreArray, ArrayOperation, DimensionBounds, DimensionVariable, GatherDimensionNumbers, LogicalMesh,
+        MeshAxis, MeshAxisType, Placeholder, ProgramBuilder as CoreProgramBuilder, ScatterDimensionNumbers,
+        ScatterOperation, ScatterReductionKind, Shape, Sharding, ShardingDimension, Typed, i1,
     };
     use ryft_pjrt::{BufferType, ExecutionDeviceInputs, ExecutionInput, Program as PjrtProgram};
 
     use crate::experimental::lowering::tests::{
-        XlaProgramBuilder, ragged_dot_cpu_compilation_options, unproject_plain_program,
+        ProgramBuilder, ragged_dot_cpu_compilation_options, unproject_plain_program,
     };
     use crate::experimental::lowering::to_mlir_module_for_plain_program;
-    use crate::experimental::ops::XlaArrayConstant;
+    use crate::experimental::ops::ArrayConstant;
     use crate::tests::{execution_client, values_from_bytes, values_to_bytes};
-    use crate::{XlaArray, to_mlir_module_for_program};
+    use crate::{Array, to_mlir_module_for_program};
 
     use super::*;
 
@@ -278,22 +282,25 @@ mod tests {
     #[test]
     fn test_to_mlir_module_for_plain_program_lowers_gather() {
         use ryft_core::{
-            Dimension, DimensionBounds, DimensionVariable, GatherDimensionNumbers, GatherOperation, Shape,
+            Dimension as CoreDimension, DimensionBounds, DimensionVariable, GatherDimensionNumbers, GatherOperation,
+            Shape,
         };
 
         // Take whole rows of a [3, 2] matrix at the row indices in a [2, 1] index array: offset axis 1 carries the
         // row (slice sizes [1, 2]); axis 0 is collapsed (start-index driven). Output is [2, 2].
-        let operand_type = ArrayType::new(DataType::F32, Shape::new(vec![Dimension::Static(3), Dimension::Static(2)]));
-        let indices_type = ArrayType::new(DataType::I32, Shape::new(vec![Dimension::Static(2), Dimension::Static(1)]));
+        let operand_type =
+            ArrayType::new(DataType::F32, Shape::new(vec![CoreDimension::Static(3), CoreDimension::Static(2)]));
+        let indices_type =
+            ArrayType::new(DataType::I32, Shape::new(vec![CoreDimension::Static(2), CoreDimension::Static(1)]));
         let operation = GatherOperation::new(GatherDimensionNumbers::new(vec![1], vec![0], vec![0]), vec![1, 2]);
-        let mut builder = XlaProgramBuilder::new();
+        let mut builder = ProgramBuilder::new();
         let operand = builder.add_input(operand_type);
         let indices = builder.add_input(indices_type);
         let output = builder
             .add_instruction(ArrayOperation::Gather(operation), Vec::new(), vec![operand, indices], None)
             .unwrap()[0];
         let program = builder
-            .build::<Vec<XlaArrayConstant>, Vec<XlaArrayConstant>>(
+            .build::<Vec<ArrayConstant>, Vec<ArrayConstant>>(
                 vec![output],
                 vec![Placeholder, Placeholder],
                 vec![Placeholder],
@@ -312,17 +319,19 @@ mod tests {
         // shape operand or lowered through `stablehlo.dynamic_gather`.
         let query = DimensionVariable::new("query", DimensionBounds::new(1, Some(5)).unwrap());
         let indices_type =
-            ArrayType::new(DataType::I32, Shape::new(vec![Dimension::Dynamic(query), Dimension::Static(1)]));
+            ArrayType::new(DataType::I32, Shape::new(vec![CoreDimension::Dynamic(query), CoreDimension::Static(1)]));
         let operation = GatherOperation::new(GatherDimensionNumbers::new(vec![1], vec![0], vec![0]), vec![1, 2]);
-        let mut builder = XlaProgramBuilder::new();
-        let operand = builder
-            .add_input(ArrayType::new(DataType::F32, Shape::new(vec![Dimension::Static(3), Dimension::Static(2)])));
+        let mut builder = ProgramBuilder::new();
+        let operand = builder.add_input(ArrayType::new(
+            DataType::F32,
+            Shape::new(vec![CoreDimension::Static(3), CoreDimension::Static(2)]),
+        ));
         let indices = builder.add_input(indices_type);
         let output = builder
             .add_instruction(ArrayOperation::Gather(operation), Vec::new(), vec![operand, indices], None)
             .unwrap()[0];
         let program = builder
-            .build::<Vec<XlaArrayConstant>, Vec<XlaArrayConstant>>(
+            .build::<Vec<ArrayConstant>, Vec<ArrayConstant>>(
                 vec![output],
                 vec![Placeholder, Placeholder],
                 vec![Placeholder],
@@ -338,23 +347,23 @@ mod tests {
     fn test_lower_gather_fill_windows() {
         let client = execution_client();
         let input =
-            Array::from_elements(ArrayType::new_static(DataType::I64, [300]), &(0_i64..300).collect::<Vec<_>>())
+            CoreArray::from_elements(ArrayType::new_static(DataType::I64, [300]), &(0_i64..300).collect::<Vec<_>>())
                 .unwrap();
         let fill = 9_007_199_254_740_993_i64;
         let windows = GatherOperation::new(GatherDimensionNumbers::new(vec![1], vec![], vec![0]), vec![3])
             .with_mode(GatherMode::Fill { value: None });
         let cases = [
             (
-                Array::scalar(7_i64).unwrap(),
-                Array::from_elements(ArrayType::new_static(DataType::I32, [2, 0]), &[] as &[i32]).unwrap(),
+                CoreArray::scalar(7_i64).unwrap(),
+                CoreArray::from_elements(ArrayType::new_static(DataType::I32, [2, 0]), &[] as &[i32]).unwrap(),
                 GatherOperation::new(GatherDimensionNumbers::new(vec![], vec![], vec![]), vec![])
                     .with_mode(GatherMode::Fill { value: None }),
                 values_to_bytes(&[7_i64, 7]),
             ),
             (
-                Array::from_elements(ArrayType::new_static(DataType::I64, [2, 3]), &[10_i64, 20, 30, 40, 50, 60])
+                CoreArray::from_elements(ArrayType::new_static(DataType::I64, [2, 3]), &[10_i64, 20, 30, 40, 50, 60])
                     .unwrap(),
-                Array::from_elements(ArrayType::new_static(DataType::I32, [2, 2, 1]), &[0_i32, 2, 1, 3]).unwrap(),
+                CoreArray::from_elements(ArrayType::new_static(DataType::I32, [2, 2, 1]), &[0_i32, 2, 1, 3]).unwrap(),
                 GatherOperation::new(
                     GatherDimensionNumbers::new(vec![], vec![1], vec![1]).with_batching_dimensions(vec![(0, 0)]),
                     vec![1, 1],
@@ -364,7 +373,7 @@ mod tests {
             ),
             (
                 input.clone(),
-                Array::from_elements(
+                CoreArray::from_elements(
                     ArrayType::new_static(DataType::I1, [2, 1]),
                     &[i1::new(-1).unwrap(), i1::new(0).unwrap()],
                 )
@@ -374,42 +383,48 @@ mod tests {
             ),
             (
                 input.clone(),
-                Array::from_elements(ArrayType::new_static(DataType::I8, [3, 1]), &[-1_i8, 0, 127]).unwrap(),
-                windows.clone().with_mode(GatherMode::Fill { value: Some(Box::new(Array::scalar(fill).unwrap())) }),
+                CoreArray::from_elements(ArrayType::new_static(DataType::I8, [3, 1]), &[-1_i8, 0, 127]).unwrap(),
+                windows
+                    .clone()
+                    .with_mode(GatherMode::Fill { value: Some(Box::new(CoreArray::scalar(fill).unwrap())) }),
                 values_to_bytes(&[fill, fill, fill, 0, 1, 2, 127, 128, 129]),
             ),
             (
                 input.clone(),
-                Array::from_elements(ArrayType::new_static(DataType::U64, [3, 1]), &[0_u64, 299, u64::MAX]).unwrap(),
+                CoreArray::from_elements(ArrayType::new_static(DataType::U64, [3, 1]), &[0_u64, 299, u64::MAX])
+                    .unwrap(),
                 windows.clone(),
                 values_to_bytes(&[0_i64, 1, 2, i64::MIN, i64::MIN, i64::MIN, i64::MIN, i64::MIN, i64::MIN]),
             ),
             (
                 input,
-                Array::from_elements(ArrayType::new_static(DataType::I64, [2, 1]), &[297_i64, 298]).unwrap(),
+                CoreArray::from_elements(ArrayType::new_static(DataType::I64, [2, 1]), &[297_i64, 298]).unwrap(),
                 windows,
                 values_to_bytes(&[297_i64, 298, 299, i64::MIN, i64::MIN, i64::MIN]),
             ),
             (
-                Array::from_elements(ArrayType::new_static(DataType::C64, [1]), &[ComplexNumber::new(2.0_f32, -3.0)])
-                    .unwrap(),
-                Array::from_elements(ArrayType::new_static(DataType::I32, [2, 1]), &[0_i32, 1]).unwrap(),
+                CoreArray::from_elements(
+                    ArrayType::new_static(DataType::C64, [1]),
+                    &[ComplexNumber::new(2.0_f32, -3.0)],
+                )
+                .unwrap(),
+                CoreArray::from_elements(ArrayType::new_static(DataType::I32, [2, 1]), &[0_i32, 1]).unwrap(),
                 GatherOperation::new(GatherDimensionNumbers::new(vec![], vec![0], vec![0]), vec![1]).with_mode(
                     GatherMode::Fill {
-                        value: Some(Box::new(Array::scalar(ComplexNumber::new(-0.0_f32, 7.0)).unwrap())),
+                        value: Some(Box::new(CoreArray::scalar(ComplexNumber::new(-0.0_f32, 7.0)).unwrap())),
                     },
                 ),
                 values_to_bytes(&[2.0_f32, -3.0, -0.0, 7.0]),
             ),
         ];
         for (input, indices, operation, expected) in cases {
-            let mut builder = ProgramBuilder::<Array, ArrayOperation<Array>>::new();
+            let mut builder = CoreProgramBuilder::<CoreArray, ArrayOperation<CoreArray>>::new();
             let input_atom = builder.add_input(input.r#type().into_owned());
             let indices_atom = builder.add_input(indices.r#type().into_owned());
             let output =
                 builder.add_instruction(operation, Vec::new(), vec![input_atom, indices_atom], None).unwrap()[0];
             let program = builder
-                .build::<Vec<Array>, Vec<Array>>(vec![output], vec![Placeholder; 2], vec![Placeholder])
+                .build::<Vec<CoreArray>, Vec<CoreArray>>(vec![output], vec![Placeholder; 2], vec![Placeholder])
                 .unwrap();
             let module = to_mlir_module_for_plain_program(&program, "main").unwrap();
             let executable = client
@@ -423,7 +438,7 @@ mod tests {
                         client
                             .buffer(
                                 value.storage_bytes(),
-                                XlaArray::physical_buffer_type(value.r#type().data_type()),
+                                Array::physical_buffer_type(value.r#type().data_type()),
                                 value
                                     .r#type()
                                     .static_shape()
@@ -463,14 +478,15 @@ mod tests {
         for mode in [GatherMode::Clip, GatherMode::Fill { value: None }] {
             let input_type = ArrayType::new(
                 DataType::I64,
-                Shape::new(vec![Dimension::Dynamic(DimensionVariable::new(
+                Shape::new(vec![CoreDimension::Dynamic(DimensionVariable::new(
                     "rows",
                     DimensionBounds::new(1, Some(5)).unwrap(),
                 ))]),
             );
-            let query = Dimension::Dynamic(DimensionVariable::new("query", DimensionBounds::new(0, Some(3)).unwrap()));
-            let indices_type = ArrayType::new(DataType::I64, Shape::new(vec![query.clone(), Dimension::Static(1)]));
-            let mut builder = XlaProgramBuilder::new();
+            let query =
+                CoreDimension::Dynamic(DimensionVariable::new("query", DimensionBounds::new(0, Some(3)).unwrap()));
+            let indices_type = ArrayType::new(DataType::I64, Shape::new(vec![query.clone(), CoreDimension::Static(1)]));
+            let mut builder = ProgramBuilder::new();
             let input = builder.add_input(input_type.clone());
             let indices = builder.add_input(indices_type.clone());
             let output = builder
@@ -484,7 +500,7 @@ mod tests {
                 .unwrap()[0];
             let program = unproject_plain_program(
                 builder
-                    .build::<Vec<XlaArrayConstant>, Vec<XlaArrayConstant>>(
+                    .build::<Vec<ArrayConstant>, Vec<ArrayConstant>>(
                         vec![output],
                         vec![Placeholder; 2],
                         vec![Placeholder],
@@ -552,22 +568,24 @@ mod tests {
 
     #[test]
     fn test_to_mlir_module_for_plain_program_lowers_clip_mode_gather_to_bare_op() {
-        use ryft_core::{Dimension, GatherDimensionNumbers, GatherMode, GatherOperation, Shape};
+        use ryft_core::{Dimension as CoreDimension, GatherDimensionNumbers, GatherMode, GatherOperation, Shape};
 
         // `Clip` is StableHLO `gather`'s default out-of-bounds behavior, so a `Clip`-mode gather lowers to the bare
         // `stablehlo.gather` (no extra clamp ops) just like the in-bounds default rather than erroring.
-        let operand_type = ArrayType::new(DataType::F32, Shape::new(vec![Dimension::Static(3), Dimension::Static(2)]));
-        let indices_type = ArrayType::new(DataType::I32, Shape::new(vec![Dimension::Static(2), Dimension::Static(1)]));
+        let operand_type =
+            ArrayType::new(DataType::F32, Shape::new(vec![CoreDimension::Static(3), CoreDimension::Static(2)]));
+        let indices_type =
+            ArrayType::new(DataType::I32, Shape::new(vec![CoreDimension::Static(2), CoreDimension::Static(1)]));
         let operation = GatherOperation::new(GatherDimensionNumbers::new(vec![1], vec![0], vec![0]), vec![1, 2])
             .with_mode(GatherMode::Clip);
-        let mut builder = XlaProgramBuilder::new();
+        let mut builder = ProgramBuilder::new();
         let operand = builder.add_input(operand_type);
         let indices = builder.add_input(indices_type);
         let output = builder
             .add_instruction(ArrayOperation::Gather(operation), Vec::new(), vec![operand, indices], None)
             .unwrap()[0];
         let program = builder
-            .build::<Vec<XlaArrayConstant>, Vec<XlaArrayConstant>>(
+            .build::<Vec<ArrayConstant>, Vec<ArrayConstant>>(
                 vec![output],
                 vec![Placeholder, Placeholder],
                 vec![Placeholder],
@@ -583,7 +601,7 @@ mod tests {
     fn test_lower_indexed_output_sharding() {
         let mesh = LogicalMesh::new(vec![MeshAxis::new("x", 2, MeshAxisType::Explicit).unwrap()]).unwrap();
         let sharding = Sharding::new(mesh, vec![ShardingDimension::sharded(["x"])]).unwrap();
-        let mut builder = ProgramBuilder::<Array, ArrayOperation<Array>>::new();
+        let mut builder = CoreProgramBuilder::<CoreArray, ArrayOperation<CoreArray>>::new();
         let input = builder.add_input(ArrayType::new_static(DataType::F32, [4]));
         let indices = builder.add_input(ArrayType::new_static(DataType::I32, [2, 1]));
         let updates = builder.add_input(ArrayType::new_static(DataType::F32, [2]));
@@ -609,7 +627,11 @@ mod tests {
             )
             .unwrap()[0];
         let program = builder
-            .build::<Vec<Array>, Vec<Array>>(vec![gathered, scattered], vec![Placeholder; 3], vec![Placeholder; 2])
+            .build::<Vec<CoreArray>, Vec<CoreArray>>(
+                vec![gathered, scattered],
+                vec![Placeholder; 3],
+                vec![Placeholder; 2],
+            )
             .unwrap();
         let module = to_mlir_module_for_plain_program(&program, "main").unwrap();
         assert_eq!(module.matches("sdy.sharding_constraint").count(), 2);

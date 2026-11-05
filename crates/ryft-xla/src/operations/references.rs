@@ -1,16 +1,16 @@
 use ryft_core::{
-    ArrayIrType, ArrayReferenceTransform, ArrayType, Operation, ReferenceAddUpdateOperation,
+    ArrayIrType, ArrayReferenceTransform, ArrayType, Operation as CoreOperation, ReferenceAddUpdateOperation,
     ReferenceAtomicAddUpdateOperation, ReferenceFreezeOperation, ReferenceNewOperation, ReferenceReadOperation,
     ReferenceSwapOperation, ReferenceWriteOperation,
 };
 use ryft_mlir::ValueRef;
 
-use crate::{Error, LowerableOperation, LowerableOperationFamily, LoweringError, XlaLowerer};
+use crate::{Error, LowerableOperation, LowerableOperationFamily, Lowerer, LoweringError};
 
 impl LowerableOperation for ReferenceNewOperation<ArrayType, ArrayIrType> {
     fn lower<'b, 'c: 'b, 't: 'c, O: LowerableOperationFamily>(
         &self,
-        _lowerer: &mut XlaLowerer<'b, 'c, 't, O>,
+        _lowerer: &mut Lowerer<'b, 'c, 't, O>,
         _input_values: &[ValueRef<'b, 'c, 't>],
         _input_types: &[ArrayIrType],
         _output_types: &[ArrayIrType],
@@ -22,7 +22,7 @@ impl LowerableOperation for ReferenceNewOperation<ArrayType, ArrayIrType> {
 impl LowerableOperation for ReferenceReadOperation<ArrayType, ArrayIrType, ArrayReferenceTransform> {
     fn lower<'b, 'c: 'b, 't: 'c, O: LowerableOperationFamily>(
         &self,
-        _lowerer: &mut XlaLowerer<'b, 'c, 't, O>,
+        _lowerer: &mut Lowerer<'b, 'c, 't, O>,
         _input_values: &[ValueRef<'b, 'c, 't>],
         _input_types: &[ArrayIrType],
         _output_types: &[ArrayIrType],
@@ -34,7 +34,7 @@ impl LowerableOperation for ReferenceReadOperation<ArrayType, ArrayIrType, Array
 impl LowerableOperation for ReferenceWriteOperation<ArrayType, ArrayIrType, ArrayReferenceTransform> {
     fn lower<'b, 'c: 'b, 't: 'c, O: LowerableOperationFamily>(
         &self,
-        _lowerer: &mut XlaLowerer<'b, 'c, 't, O>,
+        _lowerer: &mut Lowerer<'b, 'c, 't, O>,
         _input_values: &[ValueRef<'b, 'c, 't>],
         _input_types: &[ArrayIrType],
         _output_types: &[ArrayIrType],
@@ -46,7 +46,7 @@ impl LowerableOperation for ReferenceWriteOperation<ArrayType, ArrayIrType, Arra
 impl LowerableOperation for ReferenceSwapOperation<ArrayType, ArrayIrType, ArrayReferenceTransform> {
     fn lower<'b, 'c: 'b, 't: 'c, O: LowerableOperationFamily>(
         &self,
-        _lowerer: &mut XlaLowerer<'b, 'c, 't, O>,
+        _lowerer: &mut Lowerer<'b, 'c, 't, O>,
         _input_values: &[ValueRef<'b, 'c, 't>],
         _input_types: &[ArrayIrType],
         _output_types: &[ArrayIrType],
@@ -58,7 +58,7 @@ impl LowerableOperation for ReferenceSwapOperation<ArrayType, ArrayIrType, Array
 impl LowerableOperation for ReferenceAddUpdateOperation<ArrayType, ArrayIrType, ArrayReferenceTransform> {
     fn lower<'b, 'c: 'b, 't: 'c, O: LowerableOperationFamily>(
         &self,
-        _lowerer: &mut XlaLowerer<'b, 'c, 't, O>,
+        _lowerer: &mut Lowerer<'b, 'c, 't, O>,
         _input_values: &[ValueRef<'b, 'c, 't>],
         _input_types: &[ArrayIrType],
         _output_types: &[ArrayIrType],
@@ -70,7 +70,7 @@ impl LowerableOperation for ReferenceAddUpdateOperation<ArrayType, ArrayIrType, 
 impl LowerableOperation for ReferenceAtomicAddUpdateOperation<ArrayType, ArrayIrType, ArrayReferenceTransform> {
     fn lower<'b, 'c: 'b, 't: 'c, O: LowerableOperationFamily>(
         &self,
-        _lowerer: &mut XlaLowerer<'b, 'c, 't, O>,
+        _lowerer: &mut Lowerer<'b, 'c, 't, O>,
         _input_values: &[ValueRef<'b, 'c, 't>],
         _input_types: &[ArrayIrType],
         _output_types: &[ArrayIrType],
@@ -82,7 +82,7 @@ impl LowerableOperation for ReferenceAtomicAddUpdateOperation<ArrayType, ArrayIr
 impl LowerableOperation for ReferenceFreezeOperation<ArrayType, ArrayIrType> {
     fn lower<'b, 'c: 'b, 't: 'c, O: LowerableOperationFamily>(
         &self,
-        _lowerer: &mut XlaLowerer<'b, 'c, 't, O>,
+        _lowerer: &mut Lowerer<'b, 'c, 't, O>,
         _input_values: &[ValueRef<'b, 'c, 't>],
         _input_types: &[ArrayIrType],
         _output_types: &[ArrayIrType],

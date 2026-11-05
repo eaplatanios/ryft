@@ -1,7 +1,7 @@
 use ryft_core::macros::check_count;
 use ryft_core::{
-    ArrayIrType, ArrayType, DataType, Dimension, EffectClass, Operation, PadOperation, ProgramError, Shape,
-    Type as RyftType, TypeError,
+    ArrayIrType, ArrayType, DataType, Dimension as CoreDimension, EffectClass, Operation as CoreOperation,
+    PadOperation, ProgramError, Shape, Type as RyftType, TypeError,
 };
 use ryft_mlir::dialects::stable_hlo;
 use ryft_mlir::{
@@ -17,12 +17,12 @@ use crate::operations::assertions::{
     ASSERT_ACTOR_ATTRIBUTE, ASSERT_DETAIL_ATTRIBUTE, ASSERT_KIND_ATTRIBUTE, ASSERT_PAD_KIND,
     lower_assertion_custom_call, lower_deliberately_false_assertion_predicate,
 };
-use crate::{Error, LowerableOperation, LowerableOperationFamily, XlaLowerer};
+use crate::{Error, LowerableOperation, LowerableOperationFamily, Lowerer};
 
 impl LowerableOperation for PadOperation<ArrayType> {
     fn lower<'b, 'c: 'b, 't: 'c, O: LowerableOperationFamily>(
         &self,
-        lowerer: &mut XlaLowerer<'b, 'c, 't, O>,
+        lowerer: &mut Lowerer<'b, 'c, 't, O>,
         input_values: &[ValueRef<'b, 'c, 't>],
         input_types: &[ArrayType],
         output_types: &[ArrayType],
@@ -198,7 +198,7 @@ pub(crate) fn lower_pad_to_mlir<'b, 'c: 'b, 't: 'c, T: RyftType, B: Block<'b, 'c
     };
     let mut refined_type = physical_output_type;
     for (axis, dimension) in output_type.shape().dimensions().iter().enumerate() {
-        if matches!(dimension, Dimension::Static(_)) {
+        if matches!(dimension, CoreDimension::Static(_)) {
             continue;
         }
         let extent = match output_extents {
@@ -263,7 +263,7 @@ pub(crate) fn lower_pad_extent_assertion<'b, 'c: 'b, 't: 'c>(
 impl LowerableOperation for PadOperation<ArrayIrType> {
     fn lower<'b, 'c: 'b, 't: 'c, O: LowerableOperationFamily>(
         &self,
-        lowerer: &mut XlaLowerer<'b, 'c, 't, O>,
+        lowerer: &mut Lowerer<'b, 'c, 't, O>,
         input_values: &[ValueRef<'b, 'c, 't>],
         input_types: &[ArrayIrType],
         output_types: &[ArrayIrType],
@@ -329,11 +329,11 @@ mod tests {
     use ryft_pjrt::{BufferType, ExecutionDeviceInputs, ExecutionInput, Program as PjrtProgram};
 
     use crate::experimental::lowering::tests::{
-        XlaProgramBuilder, dynamic_dimension, ragged_dot_cpu_compilation_options, test_vector_type,
+        ProgramBuilder, dynamic_dimension, ragged_dot_cpu_compilation_options, test_vector_type,
     };
     use crate::experimental::lowering::to_mlir_module_for_plain_program;
     use crate::experimental::lowering::types::lower_static_index_constants;
-    use crate::experimental::ops::{XlaArrayConstant, XlaConstant, XlaProgramBuilder as ArrayIrXlaProgramBuilder};
+    use crate::experimental::ops::{ArrayConstant, Constant, ProgramBuilder as ArrayIrProgramBuilder};
     use crate::tests::{execution_client, values_from_bytes, values_to_bytes};
     use crate::{ToPjrt, to_mlir_module_for_program};
 
@@ -356,9 +356,9 @@ mod tests {
     fn test_lower_pad_to_mlir() {
         let context = MlirContext::new();
         let location = context.unknown_location();
-        let input_type = ArrayType::new(DataType::I64, Shape::new(vec![Dimension::Static(1)]));
+        let input_type = ArrayType::new(DataType::I64, Shape::new(vec![CoreDimension::Static(1)]));
         let padding_type = ArrayType::scalar(DataType::I64);
-        let output_type = input_type.clone().with_shape(Shape::new(vec![Dimension::Static(3)]));
+        let output_type = input_type.clone().with_shape(Shape::new(vec![CoreDimension::Static(3)]));
         let input_tensor = lower_tensor_type(&input_type, &context, location).unwrap();
         let padding_tensor = lower_tensor_type(&padding_type, &context, location).unwrap();
         let mut block = context.block(&[(input_tensor, location), (padding_tensor, location)]);
@@ -442,9 +442,9 @@ mod tests {
             (2, i64::MIN, i64::MAX, 0, vec![i64::MAX]),
             (2, i64::MIN, 0, i64::MAX as usize, vec![i64::MIN]),
         ] {
-            let input_type = ArrayType::new(DataType::I64, Shape::new(vec![Dimension::Static(size)]));
+            let input_type = ArrayType::new(DataType::I64, Shape::new(vec![CoreDimension::Static(size)]));
             let padding_type = ArrayType::scalar(DataType::I64);
-            let mut builder = XlaProgramBuilder::new();
+            let mut builder = ProgramBuilder::new();
             let input = builder.add_input(input_type);
             let padding = builder.add_input(padding_type);
             let result = builder
@@ -456,11 +456,7 @@ mod tests {
                 )
                 .unwrap()[0];
             let program = builder
-                .build::<Vec<XlaArrayConstant>, Vec<XlaArrayConstant>>(
-                    vec![result],
-                    vec![Placeholder; 2],
-                    vec![Placeholder],
-                )
+                .build::<Vec<ArrayConstant>, Vec<ArrayConstant>>(vec![result], vec![Placeholder; 2], vec![Placeholder])
                 .unwrap();
             let module = to_mlir_module_for_plain_program(&program, "main").unwrap();
             let executable = client
@@ -548,7 +544,7 @@ mod tests {
                     };
                     let input_type = ArrayType::new(data_type, Shape::new(vec![dynamic_dimension("input", Some(5))]));
                     let padding_type = ArrayType::scalar(data_type);
-                    let mut builder = ArrayIrXlaProgramBuilder::new();
+                    let mut builder = ArrayIrProgramBuilder::new();
                     let array = builder.add_input(input_type.clone().into());
                     let scalar = builder.add_input(padding_type.clone().into());
                     let extent = builder
@@ -563,11 +559,7 @@ mod tests {
                     let result =
                         builder.add_instruction(operation, Vec::new(), vec![array, scalar, extent], None).unwrap()[0];
                     let program = builder
-                        .build::<Vec<XlaConstant>, Vec<XlaConstant>>(
-                            vec![result],
-                            vec![Placeholder; 2],
-                            vec![Placeholder],
-                        )
+                        .build::<Vec<Constant>, Vec<Constant>>(vec![result], vec![Placeholder; 2], vec![Placeholder])
                         .unwrap();
                     let output_type = <&ArrayType>::try_from(&program.output_types()[0]).unwrap().clone();
                     let module = to_mlir_module_for_program(
@@ -716,7 +708,7 @@ mod tests {
         let vector_type = test_vector_type(6);
         let pad_input_type = test_vector_type(3);
         let padding_value_type = ArrayType::scalar(DataType::F32);
-        let mut builder = XlaProgramBuilder::new();
+        let mut builder = ProgramBuilder::new();
         let vector = builder.add_input(vector_type);
         let pad_input = builder.add_input(pad_input_type);
         let padding_value = builder.add_input(padding_value_type);
@@ -737,7 +729,7 @@ mod tests {
             )
             .unwrap()[0];
         let program = builder
-            .build::<Vec<XlaArrayConstant>, Vec<XlaArrayConstant>>(
+            .build::<Vec<ArrayConstant>, Vec<ArrayConstant>>(
                 vec![strided, padded],
                 vec![Placeholder, Placeholder, Placeholder],
                 vec![Placeholder, Placeholder],
@@ -763,7 +755,7 @@ mod tests {
     fn test_to_mlir_module_for_plain_program_lowers_negative_and_mixed_pad() {
         let input_type = test_vector_type(5);
         let padding_value_type = ArrayType::scalar(DataType::F32);
-        let mut builder = XlaProgramBuilder::new();
+        let mut builder = ProgramBuilder::new();
         let input = builder.add_input(input_type);
         let padding_value = builder.add_input(padding_value_type);
         let trimmed = builder
@@ -783,7 +775,7 @@ mod tests {
             )
             .unwrap()[0];
         let program = builder
-            .build::<Vec<XlaArrayConstant>, Vec<XlaArrayConstant>>(
+            .build::<Vec<ArrayConstant>, Vec<ArrayConstant>>(
                 vec![trimmed, mixed],
                 vec![Placeholder, Placeholder],
                 vec![Placeholder, Placeholder],
@@ -809,7 +801,7 @@ mod tests {
     fn test_to_mlir_module_for_plain_program_preserves_dynamic_pad_bound() {
         let input_type = ArrayType::new(DataType::F32, Shape::new(vec![dynamic_dimension("input", Some(5))]));
         let padding_value_type = ArrayType::scalar(DataType::F32);
-        let mut builder = XlaProgramBuilder::new();
+        let mut builder = ProgramBuilder::new();
         let input = builder.add_input(input_type);
         let padding_value = builder.add_input(padding_value_type);
         assert_eq!(

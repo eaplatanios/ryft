@@ -3,8 +3,8 @@
 //! This module wraps the backend-neutral lifecycle from [`ryft_core::compilation`] with XLA-flavored handles and entry
 //! points. [`jitted`] is the retained `jax.jit` analogue: it specializes on runtime-derived abstract signatures and
 //! dispatches warm calls through cached compiled functions. [`compile`] instead stages and compiles exactly one
-//! explicit abstract signature into a [`CompiledXlaFunction`]. [`stage`] is the staging-only counterpart: it returns a
-//! [`StagedXlaFunction`] that can be embedded into outer traces via [`StagedXlaFunction::call`] and compiled later, so
+//! explicit abstract signature into a [`CompiledFunction`]. [`stage`] is the staging-only counterpart: it returns a
+//! [`StagedFunction`] that can be embedded into outer traces via [`StagedFunction::call`] and compiled later, so
 //! functions that are only ever composed into larger programs never pay for their own executable. Staged functions
 //! register runtime captures in their retained capture table instead of embedding runtime arrays in the IR, and every
 //! compilation shares the domain's [`CompilationContext`](ryft_core::compilation::CompilationContext) cache.
@@ -88,19 +88,19 @@ use std::hash::Hash;
 use std::sync::{Arc, Mutex};
 
 use ryft_core::{
-    ArrayIrType, ArrayType, CapturingContext, ClosedProgram, Compile, CompiledFunction,
-    CompiledFunctionDispatcher as CoreCompiledFunctionDispatcher, Constant, Context, DeviceMesh, DifferentiableType,
-    DispatcherStatistics, DomainTracingContext, ExecutableFunction, ForwardModeDifferentiate, Parameterized,
-    ParameterizedFamily, ProgramError, ProjectedContext, ProjectedValue, ReverseModeDifferentiate, StagedFunction,
-    StatefulExecution, Tracer, Typed, Value, ValueProjection,
+    ArrayIrType, ArrayType, CapturingContext, ClosedProgram, Compile, CompiledFunction as CoreCompiledFunction,
+    CompiledFunctionDispatcher as CoreCompiledFunctionDispatcher, Constant as CoreConstant, Context, DeviceMesh,
+    DifferentiableType, DispatcherStatistics, DomainTracingContext, ExecutableFunction as CoreExecutableFunction,
+    ForwardModeDifferentiate, Parameterized, ParameterizedFamily, ProgramError, ProjectedContext, ProjectedValue,
+    ReverseModeDifferentiate, StagedFunction as CoreStagedFunction, StatefulExecution, Tracer as CoreTracer, Typed,
+    Value as CoreValue, ValueProjection,
 };
 use ryft_pjrt::Execution;
 
-use crate::experimental::domains::{XlaCompiledProgram, with_input_shardings};
-use crate::experimental::ops::{XlaConstant, XlaOperation};
+use crate::domains::{CompiledProgram, with_input_shardings};
+use crate::experimental::ops::{Constant, Operation};
 use crate::{
-    AdaptiveProfileGuidedOptions, AdaptiveProfileGuidedXlaFunction, Error, ExecutionError, XlaArray, XlaDomain,
-    XlaOptions, XlaValue,
+    AdaptiveProfileGuidedFunction, AdaptiveProfileGuidedOptions, Array, Domain, Error, ExecutionError, Options, Value,
 };
 
 /// Array IR tracer retained by the experimental stateful XLA program.
@@ -108,35 +108,35 @@ use crate::{
 /// # Stability
 ///
 /// This alias is experimental while the external-reference ABI is evolving.
-pub type XlaStatefulCompileTracer<'c> = Tracer<DomainTracingContext<XlaDomain<'c>, XlaValue<'c>>>;
+pub type StatefulCompileTracer<'c> = CoreTracer<DomainTracingContext<Domain<'c>, Value<'c>>>;
 
 /// Tracer leaf exposed by the public array-only XLA compilation facade.
-pub type XlaCompileTracer<'c> = ProjectedValue<ArrayType, XlaStatefulCompileTracer<'c>>;
+pub type CompileTracer<'c> = ProjectedValue<ArrayType, StatefulCompileTracer<'c>>;
 
 /// Internal reparameterization of one public array parameter tree into the production array IR type family.
-type XlaProgramParameters<P> = <P as Parameterized<ArrayType>>::To<ArrayIrType>;
+type ProgramParameters<P> = <P as Parameterized<ArrayType>>::To<ArrayIrType>;
 
 /// Internal value tree corresponding to one public array parameter tree.
-type XlaProgramParameterValues<P, V> = <XlaProgramParameters<P> as Parameterized<ArrayIrType>>::To<V>;
+type ProgramParameterValues<P, V> = <ProgramParameters<P> as Parameterized<ArrayIrType>>::To<V>;
 
 /// Captured-constant tree corresponding to one public array parameter tree.
-type XlaProgramConstants<P> = XlaProgramParameterValues<P, XlaConstant>;
+type ProgramConstants<P> = ProgramParameterValues<P, Constant>;
 
 /// Heterogeneous XLA runtime value used by the stateful compilation facade.
 ///
 /// # Stability
 ///
 /// This alias is experimental while the external-reference ABI is evolving.
-pub type XlaStatefulValue<'c> = XlaValue<'c>;
+pub type StatefulValue<'c> = Value<'c>;
 
 /// Projects one internal array IR tracer tree to the public array-only tracer tree.
 fn project_tracers<'c, P>(
-    values: XlaProgramParameterValues<P, XlaStatefulCompileTracer<'c>>,
-) -> Result<P::To<XlaCompileTracer<'c>>, Error>
+    values: ProgramParameterValues<P, StatefulCompileTracer<'c>>,
+) -> Result<P::To<CompileTracer<'c>>, Error>
 where
     P: Parameterized<ArrayType>,
-    P::Family: ParameterizedFamily<XlaStatefulCompileTracer<'c>>
-        + ParameterizedFamily<XlaCompileTracer<'c>>
+    P::Family: ParameterizedFamily<StatefulCompileTracer<'c>>
+        + ParameterizedFamily<CompileTracer<'c>>
         + ParameterizedFamily<ArrayIrType>,
 {
     let structure = values.parameter_structure();
@@ -144,59 +144,55 @@ where
         .into_parameters()
         .map(|value| ValueProjection::<ArrayType>::into_projected(value).map_err(ProgramError::from))
         .collect::<Result<Vec<_>, _>>()?;
-    P::To::<XlaCompileTracer<'c>>::from_parameters(structure, parameters)
+    P::To::<CompileTracer<'c>>::from_parameters(structure, parameters)
         .map_err(ProgramError::from)
         .map_err(Into::into)
 }
 
 /// Lifts one public array-only tracer tree back into the internal array IR tracer tree.
 fn lift_tracers<'c, P>(
-    values: P::To<XlaCompileTracer<'c>>,
-) -> Result<XlaProgramParameterValues<P, XlaStatefulCompileTracer<'c>>, Error>
+    values: P::To<CompileTracer<'c>>,
+) -> Result<ProgramParameterValues<P, StatefulCompileTracer<'c>>, Error>
 where
     P: Parameterized<ArrayType>,
     P::Family: ParameterizedFamily<ArrayIrType>
-        + ParameterizedFamily<XlaCompileTracer<'c>>
-        + ParameterizedFamily<XlaStatefulCompileTracer<'c>>,
+        + ParameterizedFamily<CompileTracer<'c>>
+        + ParameterizedFamily<StatefulCompileTracer<'c>>,
 {
     let structure = values.parameter_structure();
     let parameters = values.into_parameters().map(ProjectedValue::into_value);
-    XlaProgramParameterValues::<P, XlaStatefulCompileTracer<'c>>::from_parameters(structure, parameters)
+    ProgramParameterValues::<P, StatefulCompileTracer<'c>>::from_parameters(structure, parameters)
         .map_err(ProgramError::from)
         .map_err(Into::into)
 }
 
 /// Lifts one public runtime array tree into the production array IR value family.
-fn lift_arrays<'c, P>(values: P::To<XlaArray<'c>>) -> Result<XlaProgramParameterValues<P, XlaStatefulValue<'c>>, Error>
+fn lift_arrays<'c, P>(values: P::To<Array<'c>>) -> Result<ProgramParameterValues<P, StatefulValue<'c>>, Error>
 where
     P: Parameterized<ArrayType>,
-    P::Family: ParameterizedFamily<ArrayIrType>
-        + ParameterizedFamily<XlaArray<'c>>
-        + ParameterizedFamily<XlaStatefulValue<'c>>,
+    P::Family:
+        ParameterizedFamily<ArrayIrType> + ParameterizedFamily<Array<'c>> + ParameterizedFamily<StatefulValue<'c>>,
 {
     let structure = values.parameter_structure();
-    let parameters = values.into_parameters().map(XlaValue::Array);
-    XlaProgramParameterValues::<P, XlaStatefulValue<'c>>::from_parameters(structure, parameters)
+    let parameters = values.into_parameters().map(Value::Array);
+    ProgramParameterValues::<P, StatefulValue<'c>>::from_parameters(structure, parameters)
         .map_err(ProgramError::from)
         .map_err(Into::into)
 }
 
 /// Projects one production array IR output tree back to public runtime arrays.
-fn project_arrays<'c, P>(
-    values: XlaProgramParameterValues<P, XlaStatefulValue<'c>>,
-) -> Result<P::To<XlaArray<'c>>, Error>
+fn project_arrays<'c, P>(values: ProgramParameterValues<P, StatefulValue<'c>>) -> Result<P::To<Array<'c>>, Error>
 where
     P: Parameterized<ArrayType>,
-    P::Family: ParameterizedFamily<ArrayIrType>
-        + ParameterizedFamily<XlaStatefulValue<'c>>
-        + ParameterizedFamily<XlaArray<'c>>,
+    P::Family:
+        ParameterizedFamily<ArrayIrType> + ParameterizedFamily<StatefulValue<'c>> + ParameterizedFamily<Array<'c>>,
 {
     let structure = values.parameter_structure();
     let parameters = values
         .into_parameters()
         .map(|value| ValueProjection::<ArrayType>::into_projected(value).map_err(ProgramError::from))
         .collect::<Result<Vec<_>, _>>()?;
-    P::To::<XlaArray<'c>>::from_parameters(structure, parameters)
+    P::To::<Array<'c>>::from_parameters(structure, parameters)
         .map_err(ProgramError::from)
         .map_err(Into::into)
 }
@@ -206,7 +202,7 @@ where
 /// A first call for each `(static parameters, dynamic parameter structure, dynamic abstract types)` specialization
 /// stages, lowers, and requests compilation. Warm calls dispatch directly to the retained executable. Static values
 /// should be low-cardinality configuration such as axes, shapes, or Boolean branch choices; arrays remain dynamic.
-pub struct JittedXlaFunction<
+pub struct JittedFunction<
     'c,
     F,
     Static: Clone + Debug + Eq + Hash,
@@ -214,24 +210,22 @@ pub struct JittedXlaFunction<
     Out: Parameterized<ArrayType>,
 > where
     In::ParameterStructure: Eq + Hash,
-    In::Family: ParameterizedFamily<ArrayIrType> + ParameterizedFamily<XlaConstant>,
-    Out::Family: ParameterizedFamily<ArrayIrType> + ParameterizedFamily<XlaConstant>,
+    In::Family: ParameterizedFamily<ArrayIrType> + ParameterizedFamily<Constant>,
+    Out::Family: ParameterizedFamily<ArrayIrType> + ParameterizedFamily<Constant>,
 {
     /// Array IR domain dispatcher hidden behind the public array projection boundary.
-    function:
-        CoreCompiledFunctionDispatcher<XlaDomain<'c>, Static, XlaProgramParameters<In>, XlaProgramParameters<Out>, F>,
+    function: CoreCompiledFunctionDispatcher<Domain<'c>, Static, ProgramParameters<In>, ProgramParameters<Out>, F>,
 }
 
-impl<'c, F, Static, In, Out> Clone for JittedXlaFunction<'c, F, Static, In, Out>
+impl<'c, F, Static, In, Out> Clone for JittedFunction<'c, F, Static, In, Out>
 where
     Static: Clone + Debug + Eq + Hash,
     In: Parameterized<ArrayType>,
     In::ParameterStructure: Eq + Hash,
-    In::Family: ParameterizedFamily<ArrayIrType> + ParameterizedFamily<XlaConstant>,
+    In::Family: ParameterizedFamily<ArrayIrType> + ParameterizedFamily<Constant>,
     Out: Parameterized<ArrayType>,
-    Out::Family: ParameterizedFamily<ArrayIrType> + ParameterizedFamily<XlaConstant>,
-    CoreCompiledFunctionDispatcher<XlaDomain<'c>, Static, XlaProgramParameters<In>, XlaProgramParameters<Out>, F>:
-        Clone,
+    Out::Family: ParameterizedFamily<ArrayIrType> + ParameterizedFamily<Constant>,
+    CoreCompiledFunctionDispatcher<Domain<'c>, Static, ProgramParameters<In>, ProgramParameters<Out>, F>: Clone,
 {
     #[inline]
     fn clone(&self) -> Self {
@@ -239,39 +233,39 @@ where
     }
 }
 
-impl<'c, F, Static, In, Out> JittedXlaFunction<'c, F, Static, In, Out>
+impl<'c, F, Static, In, Out> JittedFunction<'c, F, Static, In, Out>
 where
     Static: Clone + Debug + Eq + Hash,
     In: Parameterized<ArrayType>,
     In::ParameterStructure: Eq + Hash,
     In::Family: ParameterizedFamily<ArrayIrType>
-        + ParameterizedFamily<XlaConstant>
-        + ParameterizedFamily<XlaArray<'c>>
-        + ParameterizedFamily<XlaStatefulValue<'c>>
-        + ParameterizedFamily<XlaStatefulCompileTracer<'c>>,
+        + ParameterizedFamily<Constant>
+        + ParameterizedFamily<Array<'c>>
+        + ParameterizedFamily<StatefulValue<'c>>
+        + ParameterizedFamily<StatefulCompileTracer<'c>>,
     Out: Parameterized<ArrayType>,
     Out::Family: ParameterizedFamily<ArrayIrType>
-        + ParameterizedFamily<XlaConstant>
-        + ParameterizedFamily<XlaArray<'c>>
-        + ParameterizedFamily<XlaStatefulValue<'c>>
-        + ParameterizedFamily<XlaStatefulCompileTracer<'c>>,
+        + ParameterizedFamily<Constant>
+        + ParameterizedFamily<Array<'c>>
+        + ParameterizedFamily<StatefulValue<'c>>
+        + ParameterizedFamily<StatefulCompileTracer<'c>>,
 {
     /// Calls this dispatcher with public array inputs and projects its array IR runtime outputs back to arrays.
-    pub fn call(&self, static_parameters: Static, inputs: In::To<XlaArray<'c>>) -> Result<Out::To<XlaArray<'c>>, Error>
+    pub fn call(&self, static_parameters: Static, inputs: In::To<Array<'c>>) -> Result<Out::To<Array<'c>>, Error>
     where
-        XlaOptions: Clone,
+        Options: Clone,
         F: Fn(
             Static,
-            XlaProgramParameterValues<In, XlaStatefulCompileTracer<'c>>,
-        ) -> Result<XlaProgramParameterValues<Out, XlaStatefulCompileTracer<'c>>, Error>,
-        XlaProgramParameters<In>: Parameterized<ArrayIrType, To<ArrayIrType> = XlaProgramParameters<In>>,
-        XlaProgramParameters<Out>: Parameterized<ArrayIrType, To<ArrayIrType> = XlaProgramParameters<Out>>,
-        XlaProgramParameterValues<In, XlaStatefulValue<'c>>:
-            Parameterized<XlaStatefulValue<'c>, To<ArrayIrType> = XlaProgramParameters<In>>,
-        XlaProgramParameterValues<Out, XlaStatefulCompileTracer<'c>>: Parameterized<
-                XlaStatefulCompileTracer<'c>,
-                To<ArrayIrType> = XlaProgramParameters<Out>,
-                To<XlaConstant> = XlaProgramConstants<Out>,
+            ProgramParameterValues<In, StatefulCompileTracer<'c>>,
+        ) -> Result<ProgramParameterValues<Out, StatefulCompileTracer<'c>>, Error>,
+        ProgramParameters<In>: Parameterized<ArrayIrType, To<ArrayIrType> = ProgramParameters<In>>,
+        ProgramParameters<Out>: Parameterized<ArrayIrType, To<ArrayIrType> = ProgramParameters<Out>>,
+        ProgramParameterValues<In, StatefulValue<'c>>:
+            Parameterized<StatefulValue<'c>, To<ArrayIrType> = ProgramParameters<In>>,
+        ProgramParameterValues<Out, StatefulCompileTracer<'c>>: Parameterized<
+                StatefulCompileTracer<'c>,
+                To<ArrayIrType> = ProgramParameters<Out>,
+                To<Constant> = ProgramConstants<Out>,
             >,
     {
         let inputs = lift_arrays::<In>(inputs)?;
@@ -291,38 +285,38 @@ where
 /// outputs wrapped in [`Ok`].
 pub fn jitted_with_options<'c, F, Static, In, Out>(
     function: F,
-    domain: &XlaDomain<'c>,
-    options: XlaOptions,
-) -> JittedXlaFunction<
+    domain: &Domain<'c>,
+    options: Options,
+) -> JittedFunction<
     'c,
     impl Fn(
         Static,
-        XlaProgramParameterValues<In, XlaStatefulCompileTracer<'c>>,
-    ) -> Result<XlaProgramParameterValues<Out, XlaStatefulCompileTracer<'c>>, Error>,
+        ProgramParameterValues<In, StatefulCompileTracer<'c>>,
+    ) -> Result<ProgramParameterValues<Out, StatefulCompileTracer<'c>>, Error>,
     Static,
     In,
     Out,
 >
 where
-    F: Fn(Static, In::To<XlaCompileTracer<'c>>) -> Result<Out::To<XlaCompileTracer<'c>>, Error>,
+    F: Fn(Static, In::To<CompileTracer<'c>>) -> Result<Out::To<CompileTracer<'c>>, Error>,
     Static: Clone + Debug + Eq + Hash,
     In: Parameterized<ArrayType>,
     In::ParameterStructure: Eq + Hash,
     In::Family: ParameterizedFamily<ArrayIrType>
-        + ParameterizedFamily<XlaConstant>
-        + ParameterizedFamily<XlaStatefulCompileTracer<'c>>
-        + ParameterizedFamily<XlaCompileTracer<'c>>,
+        + ParameterizedFamily<Constant>
+        + ParameterizedFamily<StatefulCompileTracer<'c>>
+        + ParameterizedFamily<CompileTracer<'c>>,
     Out: Parameterized<ArrayType>,
     Out::Family: ParameterizedFamily<ArrayIrType>
-        + ParameterizedFamily<XlaConstant>
-        + ParameterizedFamily<XlaStatefulCompileTracer<'c>>
-        + ParameterizedFamily<XlaCompileTracer<'c>>,
+        + ParameterizedFamily<Constant>
+        + ParameterizedFamily<StatefulCompileTracer<'c>>
+        + ParameterizedFamily<CompileTracer<'c>>,
 {
     let function = move |static_parameters, inputs| {
         let outputs = function(static_parameters, project_tracers::<In>(inputs)?)?;
         lift_tracers::<Out>(outputs)
     };
-    JittedXlaFunction { function: domain.jit_with_options(function, options) }
+    JittedFunction { function: domain.jit_with_options(function, options) }
 }
 
 /// Constructs a retained dispatcher for `function` on `mesh` with otherwise default options.
@@ -332,40 +326,40 @@ where
 #[inline]
 pub fn jitted<'c, F, Static, In, Out>(
     function: F,
-    domain: &XlaDomain<'c>,
+    domain: &Domain<'c>,
     mesh: DeviceMesh,
-) -> JittedXlaFunction<
+) -> JittedFunction<
     'c,
     impl Fn(
         Static,
-        XlaProgramParameterValues<In, XlaStatefulCompileTracer<'c>>,
-    ) -> Result<XlaProgramParameterValues<Out, XlaStatefulCompileTracer<'c>>, Error>,
+        ProgramParameterValues<In, StatefulCompileTracer<'c>>,
+    ) -> Result<ProgramParameterValues<Out, StatefulCompileTracer<'c>>, Error>,
     Static,
     In,
     Out,
 >
 where
-    F: Fn(Static, In::To<XlaCompileTracer<'c>>) -> Result<Out::To<XlaCompileTracer<'c>>, Error>,
+    F: Fn(Static, In::To<CompileTracer<'c>>) -> Result<Out::To<CompileTracer<'c>>, Error>,
     Static: Clone + Debug + Eq + Hash,
     In: Parameterized<ArrayType>,
     In::ParameterStructure: Eq + Hash,
     In::Family: ParameterizedFamily<ArrayIrType>
-        + ParameterizedFamily<XlaConstant>
-        + ParameterizedFamily<XlaStatefulCompileTracer<'c>>
-        + ParameterizedFamily<XlaCompileTracer<'c>>,
+        + ParameterizedFamily<Constant>
+        + ParameterizedFamily<StatefulCompileTracer<'c>>
+        + ParameterizedFamily<CompileTracer<'c>>,
     Out: Parameterized<ArrayType>,
     Out::Family: ParameterizedFamily<ArrayIrType>
-        + ParameterizedFamily<XlaConstant>
-        + ParameterizedFamily<XlaStatefulCompileTracer<'c>>
-        + ParameterizedFamily<XlaCompileTracer<'c>>,
+        + ParameterizedFamily<Constant>
+        + ParameterizedFamily<StatefulCompileTracer<'c>>
+        + ParameterizedFamily<CompileTracer<'c>>,
 {
-    jitted_with_options(function, domain, XlaOptions::new(mesh))
+    jitted_with_options(function, domain, Options::new(mesh))
 }
 
 /// Retained heterogeneous XLA JIT dispatcher whose calls may bind external references.
 ///
 /// The dispatcher retains one compiled specialization per static-parameter and input-type combination, exactly like
-/// the array-only JIT surface, but its boundary is the heterogeneous [`XlaStatefulValue`] family: reference-typed
+/// the array-only JIT surface, but its boundary is the heterogeneous [`StatefulValue`] family: reference-typed
 /// leaves bind live [`ryft_core::ArrayReference`] values at call time instead of immutable arrays. Every reference
 /// leaf must be an unrenamed root handle whose type refines the effective compiled boundary, including its declared
 /// sharding and memory. A read-only bounded-dynamic reference may refine its finite replicated declaration. The runtime
@@ -374,9 +368,9 @@ where
 ///
 /// # Stability
 ///
-/// This external-state surface is experimental. Ordinary [`JittedXlaFunction`] calls remain the stable array-only
+/// This external-state surface is experimental. Ordinary [`JittedFunction`] calls remain the stable array-only
 /// boundary.
-pub struct StatefulJittedXlaFunction<
+pub struct StatefulJittedFunction<
     'c,
     F,
     Static: Clone + Debug + Eq + Hash,
@@ -384,22 +378,22 @@ pub struct StatefulJittedXlaFunction<
     Out: Parameterized<ArrayIrType>,
 > where
     In::ParameterStructure: Eq + Hash,
-    In::Family: ParameterizedFamily<XlaConstant>,
-    Out::Family: ParameterizedFamily<XlaConstant>,
+    In::Family: ParameterizedFamily<Constant>,
+    Out::Family: ParameterizedFamily<Constant>,
 {
     /// Backend-neutral dispatcher retaining heterogeneous runtime values and compiled specializations.
-    function: CoreCompiledFunctionDispatcher<XlaDomain<'c>, Static, In, Out, F>,
+    function: CoreCompiledFunctionDispatcher<Domain<'c>, Static, In, Out, F>,
 }
 
-impl<'c, F, Static, In, Out> Clone for StatefulJittedXlaFunction<'c, F, Static, In, Out>
+impl<'c, F, Static, In, Out> Clone for StatefulJittedFunction<'c, F, Static, In, Out>
 where
     Static: Clone + Debug + Eq + Hash,
     In: Parameterized<ArrayIrType>,
     In::ParameterStructure: Eq + Hash,
-    In::Family: ParameterizedFamily<XlaConstant>,
+    In::Family: ParameterizedFamily<Constant>,
     Out: Parameterized<ArrayIrType>,
-    Out::Family: ParameterizedFamily<XlaConstant>,
-    CoreCompiledFunctionDispatcher<XlaDomain<'c>, Static, In, Out, F>: Clone,
+    Out::Family: ParameterizedFamily<Constant>,
+    CoreCompiledFunctionDispatcher<Domain<'c>, Static, In, Out, F>: Clone,
 {
     #[inline]
     fn clone(&self) -> Self {
@@ -407,28 +401,28 @@ where
     }
 }
 
-impl<'c, F, Static, In, Out> StatefulJittedXlaFunction<'c, F, Static, In, Out>
+impl<'c, F, Static, In, Out> StatefulJittedFunction<'c, F, Static, In, Out>
 where
     Static: Clone + Debug + Eq + Hash,
     In: Parameterized<ArrayIrType>,
     In::ParameterStructure: Eq + Hash,
-    In::Family: ParameterizedFamily<XlaConstant>
-        + ParameterizedFamily<XlaStatefulValue<'c>>
-        + ParameterizedFamily<XlaStatefulCompileTracer<'c>>,
-    In::To<XlaStatefulValue<'c>>: Parameterized<
-            XlaStatefulValue<'c>,
+    In::Family: ParameterizedFamily<Constant>
+        + ParameterizedFamily<StatefulValue<'c>>
+        + ParameterizedFamily<StatefulCompileTracer<'c>>,
+    In::To<StatefulValue<'c>>: Parameterized<
+            StatefulValue<'c>,
             Family = In::Family,
             ParameterStructure = In::ParameterStructure,
             To<ArrayIrType> = In,
         >,
     Out: Parameterized<ArrayIrType>,
-    Out::Family: ParameterizedFamily<XlaConstant>
-        + ParameterizedFamily<XlaStatefulValue<'c>>
-        + ParameterizedFamily<XlaStatefulCompileTracer<'c>>,
-    Out::To<XlaStatefulValue<'c>>:
-        Parameterized<XlaStatefulValue<'c>, Family = Out::Family, ParameterStructure = Out::ParameterStructure>,
-    Out::To<XlaStatefulCompileTracer<'c>>:
-        Parameterized<XlaStatefulCompileTracer<'c>, To<ArrayIrType> = Out, To<XlaConstant> = Out::To<XlaConstant>>,
+    Out::Family: ParameterizedFamily<Constant>
+        + ParameterizedFamily<StatefulValue<'c>>
+        + ParameterizedFamily<StatefulCompileTracer<'c>>,
+    Out::To<StatefulValue<'c>>:
+        Parameterized<StatefulValue<'c>, Family = Out::Family, ParameterStructure = Out::ParameterStructure>,
+    Out::To<StatefulCompileTracer<'c>>:
+        Parameterized<StatefulCompileTracer<'c>, To<ArrayIrType> = Out, To<Constant> = Out::To<Constant>>,
 {
     /// Executes one specialization statefully, compiling it on the first call and reusing it on warm calls.
     ///
@@ -440,11 +434,11 @@ where
     pub fn call_statefully(
         &self,
         static_parameters: Static,
-        inputs: In::To<XlaStatefulValue<'c>>,
-    ) -> Result<Out::To<XlaStatefulValue<'c>>, Error>
+        inputs: In::To<StatefulValue<'c>>,
+    ) -> Result<Out::To<StatefulValue<'c>>, Error>
     where
-        XlaOptions: Clone,
-        F: Fn(Static, In::To<XlaStatefulCompileTracer<'c>>) -> Result<Out::To<XlaStatefulCompileTracer<'c>>, Error>,
+        Options: Clone,
+        F: Fn(Static, In::To<StatefulCompileTracer<'c>>) -> Result<Out::To<StatefulCompileTracer<'c>>, Error>,
     {
         self.function.execute_statefully_and_wait(static_parameters, inputs)
     }
@@ -458,11 +452,11 @@ where
     pub fn call_statefully_async(
         &self,
         static_parameters: Static,
-        inputs: In::To<XlaStatefulValue<'c>>,
-    ) -> StatefulExecution<Out::To<XlaStatefulValue<'c>>, Error>
+        inputs: In::To<StatefulValue<'c>>,
+    ) -> StatefulExecution<Out::To<StatefulValue<'c>>, Error>
     where
-        XlaOptions: Clone,
-        F: Fn(Static, In::To<XlaStatefulCompileTracer<'c>>) -> Result<Out::To<XlaStatefulCompileTracer<'c>>, Error>,
+        Options: Clone,
+        F: Fn(Static, In::To<StatefulCompileTracer<'c>>) -> Result<Out::To<StatefulCompileTracer<'c>>, Error>,
     {
         self.function.execute_statefully(static_parameters, inputs)
     }
@@ -484,23 +478,23 @@ where
 /// This external-state entry point is experimental.
 pub fn jitted_statefully_with_options<'c, F, Static, In, Out>(
     function: F,
-    domain: &XlaDomain<'c>,
-    options: XlaOptions,
-) -> StatefulJittedXlaFunction<'c, F, Static, In, Out>
+    domain: &Domain<'c>,
+    options: Options,
+) -> StatefulJittedFunction<'c, F, Static, In, Out>
 where
-    F: Fn(Static, In::To<XlaStatefulCompileTracer<'c>>) -> Result<Out::To<XlaStatefulCompileTracer<'c>>, Error>,
+    F: Fn(Static, In::To<StatefulCompileTracer<'c>>) -> Result<Out::To<StatefulCompileTracer<'c>>, Error>,
     Static: Clone + Debug + Eq + Hash,
     In: Parameterized<
             ArrayIrType,
-            Family: ParameterizedFamily<XlaConstant> + ParameterizedFamily<XlaStatefulCompileTracer<'c>>,
+            Family: ParameterizedFamily<Constant> + ParameterizedFamily<StatefulCompileTracer<'c>>,
         >,
     In::ParameterStructure: Eq + Hash,
     Out: Parameterized<
             ArrayIrType,
-            Family: ParameterizedFamily<XlaConstant> + ParameterizedFamily<XlaStatefulCompileTracer<'c>>,
+            Family: ParameterizedFamily<Constant> + ParameterizedFamily<StatefulCompileTracer<'c>>,
         >,
 {
-    StatefulJittedXlaFunction { function: domain.jit_with_options(function, options) }
+    StatefulJittedFunction { function: domain.jit_with_options(function, options) }
 }
 
 /// Constructs a retained stateful dispatcher for a heterogeneous XLA `function` on `mesh` with otherwise default
@@ -515,28 +509,28 @@ where
 #[inline]
 pub fn jitted_statefully<'c, F, Static, In, Out>(
     function: F,
-    domain: &XlaDomain<'c>,
+    domain: &Domain<'c>,
     mesh: DeviceMesh,
-) -> StatefulJittedXlaFunction<'c, F, Static, In, Out>
+) -> StatefulJittedFunction<'c, F, Static, In, Out>
 where
-    F: Fn(Static, In::To<XlaStatefulCompileTracer<'c>>) -> Result<Out::To<XlaStatefulCompileTracer<'c>>, Error>,
+    F: Fn(Static, In::To<StatefulCompileTracer<'c>>) -> Result<Out::To<StatefulCompileTracer<'c>>, Error>,
     Static: Clone + Debug + Eq + Hash,
     In: Parameterized<
             ArrayIrType,
-            Family: ParameterizedFamily<XlaConstant> + ParameterizedFamily<XlaStatefulCompileTracer<'c>>,
+            Family: ParameterizedFamily<Constant> + ParameterizedFamily<StatefulCompileTracer<'c>>,
         >,
     In::ParameterStructure: Eq + Hash,
     Out: Parameterized<
             ArrayIrType,
-            Family: ParameterizedFamily<XlaConstant> + ParameterizedFamily<XlaStatefulCompileTracer<'c>>,
+            Family: ParameterizedFamily<Constant> + ParameterizedFamily<StatefulCompileTracer<'c>>,
         >,
 {
-    jitted_statefully_with_options(function, domain, XlaOptions::new(mesh))
+    jitted_statefully_with_options(function, domain, Options::new(mesh))
 }
 
 /// Compiled heterogeneous XLA function whose invocation may bind external references.
 ///
-/// This is the ahead-of-time counterpart of [`StatefulJittedXlaFunction`] for one fixed signature: reference-typed
+/// This is the ahead-of-time counterpart of [`StatefulJittedFunction`] for one fixed signature: reference-typed
 /// input leaves bind unrenamed root [`ryft_core::ArrayReference`] handles whose types refine the effective compiled
 /// boundary, including its declared sharding and memory. Read-only bounded-dynamic references may refine finite
 /// replicated declarations. Each invocation uses the same snapshot, generation-revalidation, asynchronous
@@ -544,30 +538,30 @@ where
 ///
 /// # Stability
 ///
-/// This external-state surface is experimental. Ordinary [`CompiledXlaFunction`] calls remain the stable array-only
+/// This external-state surface is experimental. Ordinary [`CompiledFunction`] calls remain the stable array-only
 /// boundary.
-pub struct StatefulCompiledXlaFunction<'c, In: Parameterized<ArrayIrType>, Out: Parameterized<ArrayIrType>>
+pub struct StatefulCompiledFunction<'c, In: Parameterized<ArrayIrType>, Out: Parameterized<ArrayIrType>>
 where
-    In::Family: ParameterizedFamily<XlaConstant>,
-    Out::Family: ParameterizedFamily<XlaConstant>,
+    In::Family: ParameterizedFamily<Constant>,
+    Out::Family: ParameterizedFamily<Constant>,
 {
     /// Backend-neutral compiled function retaining the array IR runtime boundary.
-    function: CompiledFunction<XlaDomain<'c>, In, Out>,
+    function: CoreCompiledFunction<Domain<'c>, In, Out>,
 }
 
-impl<'c, In, Out> StatefulCompiledXlaFunction<'c, In, Out>
+impl<'c, In, Out> StatefulCompiledFunction<'c, In, Out>
 where
     In: Parameterized<ArrayIrType>,
     Out: Parameterized<ArrayIrType>,
-    In::Family: ParameterizedFamily<XlaConstant> + ParameterizedFamily<XlaStatefulValue<'c>>,
-    Out::Family: ParameterizedFamily<XlaConstant> + ParameterizedFamily<XlaStatefulValue<'c>>,
-    In::To<XlaStatefulValue<'c>>: Parameterized<XlaStatefulValue<'c>>,
-    Out::To<XlaStatefulValue<'c>>:
-        Parameterized<XlaStatefulValue<'c>, Family = Out::Family, ParameterStructure = Out::ParameterStructure>,
+    In::Family: ParameterizedFamily<Constant> + ParameterizedFamily<StatefulValue<'c>>,
+    Out::Family: ParameterizedFamily<Constant> + ParameterizedFamily<StatefulValue<'c>>,
+    In::To<StatefulValue<'c>>: Parameterized<StatefulValue<'c>>,
+    Out::To<StatefulValue<'c>>:
+        Parameterized<StatefulValue<'c>, Family = Out::Family, ParameterStructure = Out::ParameterStructure>,
 {
     /// Returns the runtime-only executable handle.
     #[inline]
-    pub fn executable_function(&self) -> &ExecutableFunction<XlaDomain<'c>, In, Out> {
+    pub fn executable_function(&self) -> &CoreExecutableFunction<Domain<'c>, In, Out> {
         self.function.executable()
     }
 
@@ -575,24 +569,24 @@ where
     ///
     /// The call waits for the completion-bearing protocol after pending reference state and read leases are published.
     /// A failed completion therefore cannot leave silently stale reference state behind. Refer to the documentation of
-    /// [`StatefulJittedXlaFunction::call_statefully`] for the complete transaction contract.
+    /// [`StatefulJittedFunction::call_statefully`] for the complete transaction contract.
     pub fn call_statefully(
         &self,
-        domain: &XlaDomain<'c>,
-        inputs: In::To<XlaStatefulValue<'c>>,
-    ) -> Result<Out::To<XlaStatefulValue<'c>>, Error> {
+        domain: &Domain<'c>,
+        inputs: In::To<StatefulValue<'c>>,
+    ) -> Result<Out::To<StatefulValue<'c>>, Error> {
         self.function.executable().execute_statefully_and_wait(domain, inputs)
     }
 
     /// Submits a stateful call and returns its non-cancelling completion-bearing result.
     ///
-    /// Refer to the documentation of [`StatefulJittedXlaFunction::call_statefully_async`] for the completion and
+    /// Refer to the documentation of [`StatefulJittedFunction::call_statefully_async`] for the completion and
     /// error-observation contract.
     pub fn call_statefully_async(
         &self,
-        domain: &XlaDomain<'c>,
-        inputs: In::To<XlaStatefulValue<'c>>,
-    ) -> StatefulExecution<Out::To<XlaStatefulValue<'c>>, Error> {
+        domain: &Domain<'c>,
+        inputs: In::To<StatefulValue<'c>>,
+    ) -> StatefulExecution<Out::To<StatefulValue<'c>>, Error> {
         self.function.executable().execute_statefully(domain, inputs)
     }
 
@@ -612,18 +606,18 @@ where
 pub fn compile_statefully<'domain, 'c: 'domain, F, In, Out>(
     function: F,
     input_types: In,
-    domain: &'domain XlaDomain<'c>,
-    options: XlaOptions,
-) -> Result<StatefulCompiledXlaFunction<'c, In, Out>, Error>
+    domain: &'domain Domain<'c>,
+    options: Options,
+) -> Result<StatefulCompiledFunction<'c, In, Out>, Error>
 where
-    F: FnOnce(In::To<XlaStatefulCompileTracer<'c>>) -> Result<Out::To<XlaStatefulCompileTracer<'c>>, Error>,
+    F: FnOnce(In::To<StatefulCompileTracer<'c>>) -> Result<Out::To<StatefulCompileTracer<'c>>, Error>,
     In: Parameterized<ArrayIrType>,
-    In::Family: ParameterizedFamily<XlaConstant> + ParameterizedFamily<XlaStatefulCompileTracer<'c>>,
+    In::Family: ParameterizedFamily<Constant> + ParameterizedFamily<StatefulCompileTracer<'c>>,
     In::ParameterStructure: Hash,
     Out: Parameterized<ArrayIrType>,
-    Out::Family: ParameterizedFamily<XlaConstant> + ParameterizedFamily<XlaStatefulCompileTracer<'c>>,
-    Out::To<XlaStatefulCompileTracer<'c>>:
-        Parameterized<XlaStatefulCompileTracer<'c>, To<ArrayIrType> = Out, To<XlaConstant> = Out::To<XlaConstant>>,
+    Out::Family: ParameterizedFamily<Constant> + ParameterizedFamily<StatefulCompileTracer<'c>>,
+    Out::To<StatefulCompileTracer<'c>>:
+        Parameterized<StatefulCompileTracer<'c>, To<ArrayIrType> = Out, To<Constant> = Out::To<Constant>>,
 {
     compile_statefully_with_captures(move |_, inputs| function(inputs), Vec::new(), input_types, domain, options)
 }
@@ -636,67 +630,67 @@ where
 /// transaction as a public reference input and cannot alias any other capture or public argument in the invocation.
 pub fn compile_statefully_with_captures<'domain, 'c: 'domain, F, In, Out>(
     function: F,
-    captures: Vec<XlaStatefulValue<'c>>,
+    captures: Vec<StatefulValue<'c>>,
     input_types: In,
-    domain: &'domain XlaDomain<'c>,
-    options: XlaOptions,
-) -> Result<StatefulCompiledXlaFunction<'c, In, Out>, Error>
+    domain: &'domain Domain<'c>,
+    options: Options,
+) -> Result<StatefulCompiledFunction<'c, In, Out>, Error>
 where
     F: FnOnce(
-        Vec<XlaStatefulCompileTracer<'c>>,
-        In::To<XlaStatefulCompileTracer<'c>>,
-    ) -> Result<Out::To<XlaStatefulCompileTracer<'c>>, Error>,
+        Vec<StatefulCompileTracer<'c>>,
+        In::To<StatefulCompileTracer<'c>>,
+    ) -> Result<Out::To<StatefulCompileTracer<'c>>, Error>,
     In: Parameterized<ArrayIrType>,
-    In::Family: ParameterizedFamily<XlaConstant> + ParameterizedFamily<XlaStatefulCompileTracer<'c>>,
+    In::Family: ParameterizedFamily<Constant> + ParameterizedFamily<StatefulCompileTracer<'c>>,
     In::ParameterStructure: Hash,
     Out: Parameterized<ArrayIrType>,
-    Out::Family: ParameterizedFamily<XlaConstant> + ParameterizedFamily<XlaStatefulCompileTracer<'c>>,
-    Out::To<XlaStatefulCompileTracer<'c>>:
-        Parameterized<XlaStatefulCompileTracer<'c>, To<ArrayIrType> = Out, To<XlaConstant> = Out::To<XlaConstant>>,
+    Out::Family: ParameterizedFamily<Constant> + ParameterizedFamily<StatefulCompileTracer<'c>>,
+    Out::To<StatefulCompileTracer<'c>>:
+        Parameterized<StatefulCompileTracer<'c>, To<ArrayIrType> = Out, To<Constant> = Out::To<Constant>>,
 {
     let input_types = with_input_shardings(input_types, &options)?;
-    let staged = StagedFunction::<XlaDomain<'_>, In, Out>::stage(
+    let staged = CoreStagedFunction::<Domain<'_>, In, Out>::stage(
         |_, capture_tracers, inputs| function(capture_tracers, inputs),
         captures,
         input_types,
         options,
     )?;
     let lowered = staged.lower(&domain)?;
-    Ok(StatefulCompiledXlaFunction { function: lowered.compile(&domain)? })
+    Ok(StatefulCompiledFunction { function: lowered.compile(&domain)? })
 }
 
 /// Staged-but-uncompiled XLA function handle. Returned by [`stage`] and [`stage_with_captures`].
 ///
 /// Holds the traced source [`Program`](ryft_core::programs::Program) of one closure together with its captured
-/// runtime [`XlaArray`]s and input / output type metadata, **without** compiling a PJRT executable. This is the right
+/// runtime [`Array`]s and input / output type metadata, **without** compiling a PJRT executable. This is the right
 /// entry point for functions that are only ever composed into larger programs: [`Self::call`] embeds the staged
-/// program into an active outer trace as a `jit_call` boundary, and [`XlaDomain::compile_staged_function`] produces a
-/// [`CompiledXlaFunction`] when an executable is actually needed. Executable cache identity is derived from the
+/// program into an active outer trace as a `jit_call` boundary, and [`Domain::compile_staged_function`] produces a
+/// [`CompiledFunction`] when an executable is actually needed. Executable cache identity is derived from the
 /// complete lowered computation and compile-relevant backend state, so equivalent lowerings can share an executable
 /// even when they were produced at different Rust call sites.
-pub struct StagedXlaFunction<'c, In: Parameterized<ArrayType>, Out: Parameterized<ArrayType>>
+pub struct StagedFunction<'c, In: Parameterized<ArrayType>, Out: Parameterized<ArrayType>>
 where
-    In::Family: ParameterizedFamily<ArrayType> + ParameterizedFamily<ArrayIrType> + ParameterizedFamily<XlaConstant>,
-    Out::Family: ParameterizedFamily<ArrayType> + ParameterizedFamily<ArrayIrType> + ParameterizedFamily<XlaConstant>,
+    In::Family: ParameterizedFamily<ArrayType> + ParameterizedFamily<ArrayIrType> + ParameterizedFamily<Constant>,
+    Out::Family: ParameterizedFamily<ArrayType> + ParameterizedFamily<ArrayIrType> + ParameterizedFamily<Constant>,
 {
     /// Backend-neutral staged function carrying the source program, captures, structures, and retained options.
-    function: StagedFunction<XlaDomain<'c>, XlaProgramParameters<In>, XlaProgramParameters<Out>>,
+    function: CoreStagedFunction<Domain<'c>, ProgramParameters<In>, ProgramParameters<Out>>,
 }
 
-impl<'c, In: Parameterized<ArrayType>, Out: Parameterized<ArrayType>> Clone for StagedXlaFunction<'c, In, Out>
+impl<'c, In: Parameterized<ArrayType>, Out: Parameterized<ArrayType>> Clone for StagedFunction<'c, In, Out>
 where
-    In::Family: ParameterizedFamily<ArrayType> + ParameterizedFamily<ArrayIrType> + ParameterizedFamily<XlaConstant>,
-    Out::Family: ParameterizedFamily<ArrayType> + ParameterizedFamily<ArrayIrType> + ParameterizedFamily<XlaConstant>,
+    In::Family: ParameterizedFamily<ArrayType> + ParameterizedFamily<ArrayIrType> + ParameterizedFamily<Constant>,
+    Out::Family: ParameterizedFamily<ArrayType> + ParameterizedFamily<ArrayIrType> + ParameterizedFamily<Constant>,
 {
     fn clone(&self) -> Self {
         Self { function: self.function.clone() }
     }
 }
 
-impl<'c, In: Parameterized<ArrayType>, Out: Parameterized<ArrayType>> StagedXlaFunction<'c, In, Out>
+impl<'c, In: Parameterized<ArrayType>, Out: Parameterized<ArrayType>> StagedFunction<'c, In, Out>
 where
-    In::Family: ParameterizedFamily<ArrayType> + ParameterizedFamily<ArrayIrType> + ParameterizedFamily<XlaConstant>,
-    Out::Family: ParameterizedFamily<ArrayType> + ParameterizedFamily<ArrayIrType> + ParameterizedFamily<XlaConstant>,
+    In::Family: ParameterizedFamily<ArrayType> + ParameterizedFamily<ArrayIrType> + ParameterizedFamily<Constant>,
+    Out::Family: ParameterizedFamily<ArrayType> + ParameterizedFamily<ArrayIrType> + ParameterizedFamily<Constant>,
 {
     /// Returns the flat staged source [`Program`](ryft_core::Program) together with its captured runtime values.
     /// Use it for outer transforms (e.g., `grad`, `jvp`, `vjp`, and `batch`), staged `jit_call` payloads, and
@@ -704,7 +698,7 @@ where
     #[inline]
     pub fn source_program(
         &self,
-    ) -> &ClosedProgram<XlaStatefulValue<'c>, XlaConstant, XlaOperation, Vec<XlaConstant>, Vec<XlaConstant>> {
+    ) -> &ClosedProgram<StatefulValue<'c>, Constant, Operation, Vec<Constant>, Vec<Constant>> {
         self.function.source_program()
     }
 
@@ -712,7 +706,7 @@ where
     ///
     /// This does not execute anything. It records a trace boundary carrying this function's retained source program
     /// so enclosing transforms can rewrite the boundary through the ordinary XLA operation rules. The call is
-    /// value-generic: `V` is a plain [`Tracer`] under an ordinary trace, and a transform tracer (e.g. a
+    /// value-generic: `V` is a plain [`CoreTracer`](ryft_core::Tracer) under an ordinary trace, and a transform tracer (e.g. a
     /// forward-mode dual) when an enclosing transform differentiates or otherwise rewrites the boundary through the
     /// `jit_call` operation's own rules. Errors surface when capture registration or structured output reassembly
     /// fails in the active context.
@@ -722,15 +716,15 @@ where
         inputs: In::To<ProjectedValue<ArrayType, V>>,
     ) -> Result<Out::To<ProjectedValue<ArrayType, V>>, ProgramError>
     where
-        V: Value<Type = ArrayIrType> + ValueProjection<ArrayType, Projected = ProjectedValue<ArrayType, V>>,
-        V::Domain: Context<Type = ArrayIrType, Constant = XlaConstant, Operation = XlaOperation>
-            + CapturingContext<Capture = XlaStatefulValue<'c>>
-            + Constant<V, XlaConstant>,
+        V: CoreValue<Type = ArrayIrType> + ValueProjection<ArrayType, Projected = ProjectedValue<ArrayType, V>>,
+        V::Domain: Context<Type = ArrayIrType, Constant = Constant, Operation = Operation>
+            + CapturingContext<Capture = StatefulValue<'c>>
+            + CoreConstant<V, Constant>,
         In::Family: ParameterizedFamily<V> + ParameterizedFamily<ProjectedValue<ArrayType, V>>,
         Out::Family: ParameterizedFamily<V> + ParameterizedFamily<ProjectedValue<ArrayType, V>>,
     {
         let input_structure = inputs.parameter_structure();
-        let inputs = XlaProgramParameterValues::<In, V>::from_parameters(
+        let inputs = ProgramParameterValues::<In, V>::from_parameters(
             input_structure,
             inputs.into_parameters().map(ProjectedValue::into_value),
         )?;
@@ -745,43 +739,40 @@ where
 
     /// Consumes this facade and returns its array IR staged artifact for crate-internal verification.
     #[cfg(test)]
-    pub(crate) fn into_inner(
-        self,
-    ) -> StagedFunction<XlaDomain<'c>, XlaProgramParameters<In>, XlaProgramParameters<Out>> {
+    pub(crate) fn into_inner(self) -> CoreStagedFunction<Domain<'c>, ProgramParameters<In>, ProgramParameters<Out>> {
         self.function
     }
 }
 
 impl<'c, In: Parameterized<ArrayType>, Out: Parameterized<ArrayType>>
-    From<StagedFunction<XlaDomain<'c>, XlaProgramParameters<In>, XlaProgramParameters<Out>>>
-    for StagedXlaFunction<'c, In, Out>
+    From<CoreStagedFunction<Domain<'c>, ProgramParameters<In>, ProgramParameters<Out>>> for StagedFunction<'c, In, Out>
 where
-    In::Family: ParameterizedFamily<ArrayType> + ParameterizedFamily<ArrayIrType> + ParameterizedFamily<XlaConstant>,
-    Out::Family: ParameterizedFamily<ArrayType> + ParameterizedFamily<ArrayIrType> + ParameterizedFamily<XlaConstant>,
+    In::Family: ParameterizedFamily<ArrayType> + ParameterizedFamily<ArrayIrType> + ParameterizedFamily<Constant>,
+    Out::Family: ParameterizedFamily<ArrayType> + ParameterizedFamily<ArrayIrType> + ParameterizedFamily<Constant>,
 {
     #[inline]
-    fn from(function: StagedFunction<XlaDomain<'c>, XlaProgramParameters<In>, XlaProgramParameters<Out>>) -> Self {
+    fn from(function: CoreStagedFunction<Domain<'c>, ProgramParameters<In>, ProgramParameters<Out>>) -> Self {
         Self { function }
     }
 }
 
 /// Runtime-only XLA executable handle.
 ///
-/// Unlike [`CompiledXlaFunction`], this type does not retain the `Arc`-backed staged program or lowering metadata used
+/// Unlike [`CompiledFunction`], this type does not retain the `Arc`-backed staged program or lowering metadata used
 /// by transforms. It can only execute and inspect its runtime signature. Its thread-safety is derived from its
 /// backend state; no unsafe blanket implementation is used.
-pub struct ExecutableXlaFunction<'c, In: Parameterized<ArrayType>, Out: Parameterized<ArrayType>>
+pub struct ExecutableFunction<'c, In: Parameterized<ArrayType>, Out: Parameterized<ArrayType>>
 where
-    In::Family: ParameterizedFamily<ArrayIrType> + ParameterizedFamily<XlaConstant>,
-    Out::Family: ParameterizedFamily<ArrayIrType> + ParameterizedFamily<XlaConstant>,
+    In::Family: ParameterizedFamily<ArrayIrType> + ParameterizedFamily<Constant>,
+    Out::Family: ParameterizedFamily<ArrayIrType> + ParameterizedFamily<Constant>,
 {
-    function: ExecutableFunction<XlaDomain<'c>, XlaProgramParameters<In>, XlaProgramParameters<Out>>,
+    function: CoreExecutableFunction<Domain<'c>, ProgramParameters<In>, ProgramParameters<Out>>,
 }
 
-impl<'c, In: Parameterized<ArrayType>, Out: Parameterized<ArrayType>> Clone for ExecutableXlaFunction<'c, In, Out>
+impl<'c, In: Parameterized<ArrayType>, Out: Parameterized<ArrayType>> Clone for ExecutableFunction<'c, In, Out>
 where
-    In::Family: ParameterizedFamily<ArrayIrType> + ParameterizedFamily<XlaConstant>,
-    Out::Family: ParameterizedFamily<ArrayIrType> + ParameterizedFamily<XlaConstant>,
+    In::Family: ParameterizedFamily<ArrayIrType> + ParameterizedFamily<Constant>,
+    Out::Family: ParameterizedFamily<ArrayIrType> + ParameterizedFamily<Constant>,
 {
     #[inline]
     fn clone(&self) -> Self {
@@ -789,10 +780,10 @@ where
     }
 }
 
-impl<'c, In: Parameterized<ArrayType>, Out: Parameterized<ArrayType>> ExecutableXlaFunction<'c, In, Out>
+impl<'c, In: Parameterized<ArrayType>, Out: Parameterized<ArrayType>> ExecutableFunction<'c, In, Out>
 where
-    In::Family: ParameterizedFamily<ArrayIrType> + ParameterizedFamily<XlaConstant>,
-    Out::Family: ParameterizedFamily<ArrayIrType> + ParameterizedFamily<XlaConstant>,
+    In::Family: ParameterizedFamily<ArrayIrType> + ParameterizedFamily<Constant>,
+    Out::Family: ParameterizedFamily<ArrayIrType> + ParameterizedFamily<Constant>,
 {
     /// Returns the flat output [`ArrayType`]s in executor order.
     #[inline]
@@ -807,48 +798,46 @@ where
     }
 }
 
-impl<'c> XlaDomain<'c> {
+impl<'c> Domain<'c> {
     /// Lowers and compiles a staged XLA function using the options that it retained when it was staged.
     pub fn compile_staged_function<In, Out>(
         &self,
-        staged: StagedXlaFunction<'c, In, Out>,
-    ) -> Result<CompiledXlaFunction<'c, In, Out>, Error>
+        staged: StagedFunction<'c, In, Out>,
+    ) -> Result<CompiledFunction<'c, In, Out>, Error>
     where
         In: Parameterized<ArrayType>,
-        In::Family:
-            ParameterizedFamily<ArrayType> + ParameterizedFamily<ArrayIrType> + ParameterizedFamily<XlaConstant>,
+        In::Family: ParameterizedFamily<ArrayType> + ParameterizedFamily<ArrayIrType> + ParameterizedFamily<Constant>,
         Out: Parameterized<ArrayType>,
-        Out::Family:
-            ParameterizedFamily<ArrayType> + ParameterizedFamily<ArrayIrType> + ParameterizedFamily<XlaConstant>,
+        Out::Family: ParameterizedFamily<ArrayType> + ParameterizedFamily<ArrayIrType> + ParameterizedFamily<Constant>,
     {
         let function = staged.function.lower(self)?.compile(self)?;
-        Ok(CompiledXlaFunction { function, derived: Arc::new(DerivedFunctionSlots::new()) })
+        Ok(CompiledFunction { function, derived: Arc::new(DerivedFunctionSlots::new()) })
     }
 
-    /// Executes an XLA runtime program on concrete [`XlaArray`] inputs.
+    /// Executes an XLA runtime program on concrete [`Array`] inputs.
     #[inline]
     pub fn interpret<In, Out>(
         &self,
-        executable: &ExecutableXlaFunction<'c, In, Out>,
-        inputs: In::To<XlaArray<'c>>,
-    ) -> Result<Out::To<XlaArray<'c>>, Error>
+        executable: &ExecutableFunction<'c, In, Out>,
+        inputs: In::To<Array<'c>>,
+    ) -> Result<Out::To<Array<'c>>, Error>
     where
         In: Parameterized<
                 ArrayType,
                 Family: ParameterizedFamily<ArrayIrType>
-                            + ParameterizedFamily<XlaConstant>
-                            + ParameterizedFamily<XlaArray<'c>>
-                            + ParameterizedFamily<XlaStatefulValue<'c>>,
+                            + ParameterizedFamily<Constant>
+                            + ParameterizedFamily<Array<'c>>
+                            + ParameterizedFamily<StatefulValue<'c>>,
             >,
         Out: Parameterized<
                 ArrayType,
                 Family: ParameterizedFamily<ArrayIrType>
-                            + ParameterizedFamily<XlaConstant>
-                            + ParameterizedFamily<XlaArray<'c>>
-                            + ParameterizedFamily<XlaStatefulValue<'c>>,
+                            + ParameterizedFamily<Constant>
+                            + ParameterizedFamily<Array<'c>>
+                            + ParameterizedFamily<StatefulValue<'c>>,
             >,
-        Out::To<XlaArray<'c>>:
-            Parameterized<XlaArray<'c>, Family = Out::Family, ParameterStructure = Out::ParameterStructure>,
+        Out::To<Array<'c>>:
+            Parameterized<Array<'c>, Family = Out::Family, ParameterStructure = Out::ParameterStructure>,
     {
         let inputs = lift_arrays::<In>(inputs)?;
         project_arrays::<Out>(executable.function.execute(self, inputs)?)
@@ -859,26 +848,26 @@ impl<'c> XlaDomain<'c> {
     /// carry their dependency. Bounded-dynamic input preparation and output reconstruction can also wait for transfers.
     pub fn interpret_async<In, Out>(
         &self,
-        executable: &ExecutableXlaFunction<'c, In, Out>,
-        inputs: In::To<XlaArray<'c>>,
-    ) -> Result<Execution<Out::To<XlaArray<'c>>>, Error>
+        executable: &ExecutableFunction<'c, In, Out>,
+        inputs: In::To<Array<'c>>,
+    ) -> Result<Execution<Out::To<Array<'c>>>, Error>
     where
         In: Parameterized<
                 ArrayType,
                 Family: ParameterizedFamily<ArrayIrType>
-                            + ParameterizedFamily<XlaConstant>
-                            + ParameterizedFamily<XlaArray<'c>>
-                            + ParameterizedFamily<XlaStatefulValue<'c>>,
+                            + ParameterizedFamily<Constant>
+                            + ParameterizedFamily<Array<'c>>
+                            + ParameterizedFamily<StatefulValue<'c>>,
             >,
         Out: Parameterized<
                 ArrayType,
                 Family: ParameterizedFamily<ArrayIrType>
-                            + ParameterizedFamily<XlaConstant>
-                            + ParameterizedFamily<XlaArray<'c>>
-                            + ParameterizedFamily<XlaStatefulValue<'c>>,
+                            + ParameterizedFamily<Constant>
+                            + ParameterizedFamily<Array<'c>>
+                            + ParameterizedFamily<StatefulValue<'c>>,
             >,
-        Out::To<XlaArray<'c>>:
-            Parameterized<XlaArray<'c>, Family = Out::Family, ParameterStructure = Out::ParameterStructure>,
+        Out::To<Array<'c>>:
+            Parameterized<Array<'c>, Family = Out::Family, ParameterStructure = Out::ParameterStructure>,
     {
         if executable.function.compiled_program().requires_stateful_call() {
             return Err(ExecutionError::StatefulInvocationRequired.into());
@@ -886,7 +875,7 @@ impl<'c> XlaDomain<'c> {
         let flat_inputs = lift_arrays::<In>(inputs)?.into_parameters().collect::<Vec<_>>();
         executable.function.validate_input_count(flat_inputs.len())?;
         for (expected, actual) in executable.function.input_types().iter().zip(flat_inputs.iter().map(Typed::r#type)) {
-            crate::experimental::domains::validate_xla_input_type(
+            crate::domains::validate_input_type(
                 <&ArrayType>::try_from(expected).map_err(ProgramError::from)?,
                 <&ArrayType>::try_from(actual.as_ref()).map_err(ProgramError::from)?,
             )?;
@@ -901,32 +890,32 @@ impl<'c> XlaDomain<'c> {
             .map_err(ProgramError::from)?;
         let execution = self.execute_compiled_async(executable.function.compiled_program(), inputs)?;
         let (flat_outputs, fence) = execution.into_parts();
-        crate::experimental::domains::validate_runtime_outputs(
+        crate::domains::validate_runtime_outputs(
             executable.function.compiled_program().output_types(),
             flat_outputs.as_slice(),
         )?;
-        let outputs = XlaProgramParameterValues::<Out, XlaValue<'c>>::from_parameters(
+        let outputs = ProgramParameterValues::<Out, Value<'c>>::from_parameters(
             executable.function.output_structure().clone(),
-            flat_outputs.into_iter().map(XlaValue::Array),
+            flat_outputs.into_iter().map(Value::Array),
         )
         .map_err(ProgramError::from)?;
         Ok(Execution::new(project_arrays::<Out>(outputs)?, fence))
     }
 
     /// Replaces an executable program while preserving and validating its runtime signature.
-    pub(crate) fn replace_executable_xla_program<In, Out>(
+    pub(crate) fn replace_executable_program<In, Out>(
         &self,
-        executable: &ExecutableXlaFunction<'c, In, Out>,
-        program: std::sync::Arc<XlaCompiledProgram<'c>>,
-    ) -> Result<ExecutableXlaFunction<'c, In, Out>, Error>
+        executable: &ExecutableFunction<'c, In, Out>,
+        program: std::sync::Arc<CompiledProgram<'c>>,
+    ) -> Result<ExecutableFunction<'c, In, Out>, Error>
     where
         In: Parameterized<ArrayType>,
-        In::Family: ParameterizedFamily<ArrayIrType> + ParameterizedFamily<XlaConstant>,
+        In::Family: ParameterizedFamily<ArrayIrType> + ParameterizedFamily<Constant>,
         Out: Parameterized<ArrayType>,
-        Out::Family: ParameterizedFamily<ArrayIrType> + ParameterizedFamily<XlaConstant>,
+        Out::Family: ParameterizedFamily<ArrayIrType> + ParameterizedFamily<Constant>,
     {
-        self.validate_xla_replacement(executable.function.compiled_program(), &program)?;
-        Ok(ExecutableXlaFunction { function: executable.function.with_compiled_program(program.clone()) })
+        self.validate_replacement(executable.function.compiled_program(), &program)?;
+        Ok(ExecutableFunction { function: executable.function.with_compiled_program(program.clone()) })
     }
 
     /// Wraps a compiled function in an adaptive profile-guided dispatcher.
@@ -936,18 +925,16 @@ impl<'c> XlaDomain<'c> {
     /// atomically directs subsequent calls to the compatible optimized executable.
     pub fn adaptive_profile_guided_recompilation<In, Out>(
         &self,
-        function: &CompiledXlaFunction<'c, In, Out>,
+        function: &CompiledFunction<'c, In, Out>,
         options: AdaptiveProfileGuidedOptions,
-    ) -> Result<AdaptiveProfileGuidedXlaFunction<'c, In, Out>, Error>
+    ) -> Result<AdaptiveProfileGuidedFunction<'c, In, Out>, Error>
     where
         In: Parameterized<ArrayType>,
-        In::Family:
-            ParameterizedFamily<ArrayType> + ParameterizedFamily<ArrayIrType> + ParameterizedFamily<XlaConstant>,
+        In::Family: ParameterizedFamily<ArrayType> + ParameterizedFamily<ArrayIrType> + ParameterizedFamily<Constant>,
         Out: Parameterized<ArrayType>,
-        Out::Family:
-            ParameterizedFamily<ArrayType> + ParameterizedFamily<ArrayIrType> + ParameterizedFamily<XlaConstant>,
+        Out::Family: ParameterizedFamily<ArrayType> + ParameterizedFamily<ArrayIrType> + ParameterizedFamily<Constant>,
     {
-        AdaptiveProfileGuidedXlaFunction::new(
+        AdaptiveProfileGuidedFunction::new(
             self.clone(),
             function.executable_function(),
             function.function.lowered().lowered_program().clone(),
@@ -958,51 +945,51 @@ impl<'c> XlaDomain<'c> {
 }
 
 /// Just-in-time compiled function handle. Returned by [`compile`], [`compile_with_options`], and
-/// [`XlaDomain::compile_staged_function`].
+/// [`Domain::compile_staged_function`].
 ///
-/// Holds the cached PJRT-backed [`XlaCompiledProgram`] plus the [`StagedXlaFunction`] it was compiled from, whose
-/// input / output type metadata marshals a [`Parameterized`] tree of [`XlaArray`]s into the executable and reassembles
+/// Holds the cached PJRT-backed [`CompiledProgram`] plus the [`StagedFunction`] it was compiled from, whose
+/// input / output type metadata marshals a [`Parameterized`] tree of [`Array`]s into the executable and reassembles
 /// the outputs back into the user's expected output tree shape.
 ///
 /// The retained staged function also keeps the **source [`Program`](ryft_core::Program)** that the execution domain
 /// compiled into, exposed via [`Self::source_program`]. Useful for diagnostics (printing the traced IR, instruction
 /// counts, graph rendering), for outer transforms, and for inner staging via [`Self::call`] with trace inputs, which
 /// emits a `jit_call` boundary carrying the source program into the active outer trace context.
-pub struct CompiledXlaFunction<'c, In: Parameterized<ArrayType>, Out: Parameterized<ArrayType>>
+pub struct CompiledFunction<'c, In: Parameterized<ArrayType>, Out: Parameterized<ArrayType>>
 where
-    In::Family: ParameterizedFamily<ArrayType> + ParameterizedFamily<ArrayIrType> + ParameterizedFamily<XlaConstant>,
-    Out::Family: ParameterizedFamily<ArrayType> + ParameterizedFamily<ArrayIrType> + ParameterizedFamily<XlaConstant>,
+    In::Family: ParameterizedFamily<ArrayType> + ParameterizedFamily<ArrayIrType> + ParameterizedFamily<Constant>,
+    Out::Family: ParameterizedFamily<ArrayType> + ParameterizedFamily<ArrayIrType> + ParameterizedFamily<Constant>,
 {
     /// Backend-neutral compiled function backed by an XLA executable. Retains the staged source function,
     /// captured runtime buffers, output structure, and compilation options through its lowered metadata.
-    function: CompiledFunction<XlaDomain<'c>, XlaProgramParameters<In>, XlaProgramParameters<Out>>,
+    function: CoreCompiledFunction<Domain<'c>, ProgramParameters<In>, ProgramParameters<Out>>,
 
     /// Derived transformed functions retained by [`Self::gradient`] and [`Self::jvp`]. Shared across clones so a
     /// wrapper's clones reuse one retained derivative per transform.
-    derived: Arc<DerivedXlaFunctions<'c, In, Out>>,
+    derived: Arc<DerivedFunctions<'c, In, Out>>,
 }
 
-impl<'c, In: Parameterized<ArrayType>, Out: Parameterized<ArrayType>> Clone for CompiledXlaFunction<'c, In, Out>
+impl<'c, In: Parameterized<ArrayType>, Out: Parameterized<ArrayType>> Clone for CompiledFunction<'c, In, Out>
 where
-    In::Family: ParameterizedFamily<ArrayType> + ParameterizedFamily<ArrayIrType> + ParameterizedFamily<XlaConstant>,
-    Out::Family: ParameterizedFamily<ArrayType> + ParameterizedFamily<ArrayIrType> + ParameterizedFamily<XlaConstant>,
+    In::Family: ParameterizedFamily<ArrayType> + ParameterizedFamily<ArrayIrType> + ParameterizedFamily<Constant>,
+    Out::Family: ParameterizedFamily<ArrayType> + ParameterizedFamily<ArrayIrType> + ParameterizedFamily<Constant>,
 {
     fn clone(&self) -> Self {
         Self { function: self.function.clone(), derived: Arc::clone(&self.derived) }
     }
 }
 
-/// Retention slots for the derived functions of one [`CompiledXlaFunction`]: the reverse-mode gradient and the
+/// Retention slots for the derived functions of one [`CompiledFunction`]: the reverse-mode gradient and the
 /// forward-mode JVP compiled from its retained source program.
-type DerivedXlaFunctions<'c, In, Out> = DerivedFunctionSlots<
+type DerivedFunctions<'c, In, Out> = DerivedFunctionSlots<
     'c,
-    CompiledFunction<XlaDomain<'c>, XlaProgramParameters<In>, XlaProgramParameters<In>>,
-    CompiledFunction<XlaDomain<'c>, XlaProgramParameters<(In, In)>, XlaProgramParameters<(Out, Out)>>,
+    CoreCompiledFunction<Domain<'c>, ProgramParameters<In>, ProgramParameters<In>>,
+    CoreCompiledFunction<Domain<'c>, ProgramParameters<(In, In)>, ProgramParameters<(Out, Out)>>,
 >;
 
-/// One-entry retention slots for functions derived from a [`CompiledXlaFunction`].
+/// One-entry retention slots for functions derived from a [`CompiledFunction`].
 ///
-/// [`CompiledXlaFunction::gradient`] and [`CompiledXlaFunction::jvp`] take no per-call transform configuration, so
+/// [`CompiledFunction::gradient`] and [`CompiledFunction::jvp`] take no per-call transform configuration, so
 /// each derived function has exactly one valid form per domain identity: the slot retains the most recently produced
 /// artifact together with a witness of the domain that produced it. A later call with a matching domain reuses the
 /// retained artifact and skips source reconstruction, structural differentiation, staging, and lowering entirely; a
@@ -1016,10 +1003,10 @@ type DerivedXlaFunctions<'c, In, Out> = DerivedFunctionSlots<
 /// deduplicates the backend compilation those duplicate derivations request.
 struct DerivedFunctionSlots<'c, Gradient, Jvp> {
     /// Retained reverse-mode gradient function, if any.
-    gradient: Mutex<Option<(XlaDomainWitness<'c>, Gradient)>>,
+    gradient: Mutex<Option<(DomainWitness<'c>, Gradient)>>,
 
     /// Retained forward-mode JVP function, if any.
-    jvp: Mutex<Option<(XlaDomainWitness<'c>, Jvp)>>,
+    jvp: Mutex<Option<(DomainWitness<'c>, Jvp)>>,
 }
 
 impl<'c, Gradient, Jvp> DerivedFunctionSlots<'c, Gradient, Jvp> {
@@ -1029,25 +1016,25 @@ impl<'c, Gradient, Jvp> DerivedFunctionSlots<'c, Gradient, Jvp> {
     }
 }
 
-/// Identity of the [`XlaDomain`] that produced a retained derived function.
+/// Identity of the [`Domain`] that produced a retained derived function.
 ///
-/// [`XlaDomain`] handles are cheap clones of shared state, so two handles denote interchangeable compilation
+/// [`Domain`] handles are cheap clones of shared state, so two handles denote interchangeable compilation
 /// pipelines exactly when they share one compilation context, one client, equal compilation-option templates, and an
 /// equal mesh. The witness stores a full domain clone, which both provides those comparisons and keeps the shared
 /// compilation context alive so its address can never be reused by a later allocation.
-struct XlaDomainWitness<'c> {
+struct DomainWitness<'c> {
     /// Domain handle captured when the retained artifact was produced.
-    domain: XlaDomain<'c>,
+    domain: Domain<'c>,
 }
 
-impl<'c> XlaDomainWitness<'c> {
+impl<'c> DomainWitness<'c> {
     /// Captures the identity of `domain`.
-    fn new(domain: &XlaDomain<'c>) -> Self {
+    fn new(domain: &Domain<'c>) -> Self {
         Self { domain: domain.clone() }
     }
 
     /// Returns whether `domain` is interchangeable with the domain that produced the retained artifact.
-    fn matches(&self, domain: &XlaDomain<'c>) -> bool {
+    fn matches(&self, domain: &Domain<'c>) -> bool {
         std::ptr::eq(self.domain.compilation_context(), domain.compilation_context())
             && std::ptr::eq(self.domain.client(), domain.client())
             && self.domain.compilation_options() == domain.compilation_options()
@@ -1055,10 +1042,10 @@ impl<'c> XlaDomainWitness<'c> {
     }
 }
 
-impl<'c, In: Parameterized<ArrayType>, Out: Parameterized<ArrayType>> CompiledXlaFunction<'c, In, Out>
+impl<'c, In: Parameterized<ArrayType>, Out: Parameterized<ArrayType>> CompiledFunction<'c, In, Out>
 where
-    In::Family: ParameterizedFamily<ArrayType> + ParameterizedFamily<ArrayIrType> + ParameterizedFamily<XlaConstant>,
-    Out::Family: ParameterizedFamily<ArrayType> + ParameterizedFamily<ArrayIrType> + ParameterizedFamily<XlaConstant>,
+    In::Family: ParameterizedFamily<ArrayType> + ParameterizedFamily<ArrayIrType> + ParameterizedFamily<Constant>,
+    Out::Family: ParameterizedFamily<ArrayType> + ParameterizedFamily<ArrayIrType> + ParameterizedFamily<Constant>,
 {
     /// Returns the flat output [`ArrayType`]s in the order the executor produces them.
     #[inline]
@@ -1068,19 +1055,19 @@ where
 
     /// Returns a runtime-only handle that omits staged and lowered transform metadata.
     #[inline]
-    pub fn executable_function(&self) -> ExecutableXlaFunction<'c, In, Out> {
-        ExecutableXlaFunction { function: self.function.executable().clone() }
+    pub fn executable_function(&self) -> ExecutableFunction<'c, In, Out> {
+        ExecutableFunction { function: self.function.executable().clone() }
     }
 
     /// Consumes this transformable handle and returns its runtime-only executable state.
     #[inline]
-    pub fn into_executable_function(self) -> ExecutableXlaFunction<'c, In, Out> {
-        ExecutableXlaFunction { function: self.function.into_executable() }
+    pub fn into_executable_function(self) -> ExecutableFunction<'c, In, Out> {
+        ExecutableFunction { function: self.function.into_executable() }
     }
 
     /// Returns the staged function this executable was compiled from.
     #[inline]
-    pub fn staged(&self) -> StagedXlaFunction<'c, In, Out> {
+    pub fn staged(&self) -> StagedFunction<'c, In, Out> {
         self.function.staged().clone().into()
     }
 
@@ -1090,12 +1077,12 @@ where
     #[inline]
     pub fn source_program(
         &self,
-    ) -> &ClosedProgram<XlaStatefulValue<'c>, XlaConstant, XlaOperation, Vec<XlaConstant>, Vec<XlaConstant>> {
+    ) -> &ClosedProgram<StatefulValue<'c>, Constant, Operation, Vec<Constant>, Vec<Constant>> {
         self.function.source_program()
     }
 
     /// Returns the device mesh the compiled program runs against. Delegates to the cached
-    /// [`XlaCompiledProgram::mesh`](crate::experimental::domains::XlaCompiledProgram::mesh).
+    /// [`CompiledProgram::mesh`](crate::domains::CompiledProgram::mesh).
     #[inline]
     pub fn mesh(&self) -> &DeviceMesh {
         self.function.compiled_program().mesh()
@@ -1103,17 +1090,17 @@ where
 
     /// Stages a call to this compiled function into an active trace as a `jit_call` operation.
     ///
-    /// Refer to the documentation of [`StagedXlaFunction::call`] for more information.
+    /// Refer to the documentation of [`StagedFunction::call`] for more information.
     #[inline]
     pub fn call<V>(
         &self,
         inputs: In::To<ProjectedValue<ArrayType, V>>,
     ) -> Result<Out::To<ProjectedValue<ArrayType, V>>, ProgramError>
     where
-        V: Value<Type = ArrayIrType> + ValueProjection<ArrayType, Projected = ProjectedValue<ArrayType, V>>,
-        V::Domain: Context<Type = ArrayIrType, Constant = XlaConstant, Operation = XlaOperation>
-            + CapturingContext<Capture = XlaStatefulValue<'c>>
-            + Constant<V, XlaConstant>,
+        V: CoreValue<Type = ArrayIrType> + ValueProjection<ArrayType, Projected = ProjectedValue<ArrayType, V>>,
+        V::Domain: Context<Type = ArrayIrType, Constant = Constant, Operation = Operation>
+            + CapturingContext<Capture = StatefulValue<'c>>
+            + CoreConstant<V, Constant>,
         In::Family: ParameterizedFamily<V> + ParameterizedFamily<ProjectedValue<ArrayType, V>>,
         Out::Family: ParameterizedFamily<V> + ParameterizedFamily<ProjectedValue<ArrayType, V>>,
     {
@@ -1124,12 +1111,12 @@ where
 // Reverse-mode AD: compiles a new function that computes the gradient of a scalar-valued compiled function with
 // respect to its inputs. The original closure is never re-executed; [`Self::call`] emits a `jit_call` boundary, and
 // the active transform rewrites that operation through ordinary JVP and transpose rules.
-impl<'c, In: Parameterized<ArrayType, To<ArrayType> = In>> CompiledXlaFunction<'c, In, ArrayType>
+impl<'c, In: Parameterized<ArrayType, To<ArrayType> = In>> CompiledFunction<'c, In, ArrayType>
 where
     In::Family: ParameterizedFamily<ArrayType, To = In>
         + ParameterizedFamily<ArrayIrType>
-        + ParameterizedFamily<XlaConstant>
-        + ParameterizedFamily<XlaStatefulCompileTracer<'c>>,
+        + ParameterizedFamily<Constant>
+        + ParameterizedFamily<StatefulCompileTracer<'c>>,
     In::ParameterStructure: std::fmt::Debug + Hash + PartialEq,
 {
     /// Returns a new compiled function that computes the reverse-mode gradient of `self` with
@@ -1148,31 +1135,28 @@ where
     /// interchangeable the inserts are idempotent and the last one wins, while the shared
     /// [`CompilationContext`](ryft_core::compilation::CompilationContext) still deduplicates their backend compilation.
     #[track_caller]
-    pub fn gradient<'domain>(
-        &'domain self,
-        domain: &'domain XlaDomain<'c>,
-    ) -> Result<CompiledXlaFunction<'c, In, In>, Error>
+    pub fn gradient<'domain>(&'domain self, domain: &'domain Domain<'c>) -> Result<CompiledFunction<'c, In, In>, Error>
     where
         'c: 'domain,
-        In::Family: ParameterizedFamily<XlaCompileTracer<'c>, To = In::To<XlaCompileTracer<'c>>>,
-        In::To<XlaCompileTracer<'c>>: Parameterized<
-                XlaCompileTracer<'c>,
+        In::Family: ParameterizedFamily<CompileTracer<'c>, To = In::To<CompileTracer<'c>>>,
+        In::To<CompileTracer<'c>>: Parameterized<
+                CompileTracer<'c>,
                 Family = In::Family,
                 ParameterStructure = In::ParameterStructure,
                 To<ArrayType> = In,
-                To<XlaConstant> = In::To<XlaConstant>,
+                To<Constant> = In::To<Constant>,
             >,
-        XlaProgramParameterValues<In, XlaStatefulCompileTracer<'c>>: Parameterized<
-                XlaStatefulCompileTracer<'c>,
-                To<ArrayIrType> = XlaProgramParameters<In>,
-                To<XlaConstant> = XlaProgramConstants<In>,
+        ProgramParameterValues<In, StatefulCompileTracer<'c>>: Parameterized<
+                StatefulCompileTracer<'c>,
+                To<ArrayIrType> = ProgramParameters<In>,
+                To<Constant> = ProgramConstants<In>,
             >,
     {
         {
             let slot = self.derived.gradient.lock().expect("derived-gradient retention slot mutex poisoned");
             if let Some((witness, artifact)) = slot.as_ref() {
                 if witness.matches(domain) {
-                    return Ok(CompiledXlaFunction {
+                    return Ok(CompiledFunction {
                         function: artifact.clone(),
                         derived: Arc::new(DerivedFunctionSlots::new()),
                     });
@@ -1225,34 +1209,34 @@ where
                     .into_iter()
                     .map(|value| ValueProjection::<ArrayType>::into_projected(value).map_err(ProgramError::from))
                     .collect::<Result<Vec<_>, _>>()?;
-                In::To::<XlaCompileTracer<'c>>::from_parameters(input_structure, gradients)
+                In::To::<CompileTracer<'c>>::from_parameters(input_structure, gradients)
                     .map_err(ProgramError::from)
                     .map_err(Into::into)
             },
             captures,
             input_signature,
             domain,
-            XlaOptions::new(mesh),
+            Options::new(mesh),
         )?;
         *self.derived.gradient.lock().expect("derived-gradient retention slot mutex poisoned") =
-            Some((XlaDomainWitness::new(domain), compiled.function.clone()));
+            Some((DomainWitness::new(domain), compiled.function.clone()));
         Ok(compiled)
     }
 }
 
 // Forward-mode JVP packaged as a method. Mirrors `jax.jvp(jax.jit(f))`.
 impl<'c, In: Clone + Parameterized<ArrayType, To<ArrayType> = In>, Out: Parameterized<ArrayType>>
-    CompiledXlaFunction<'c, In, Out>
+    CompiledFunction<'c, In, Out>
 where
     In::Family: ParameterizedFamily<ArrayType, To = In>
         + ParameterizedFamily<ArrayIrType>
-        + ParameterizedFamily<XlaConstant>
-        + ParameterizedFamily<XlaStatefulCompileTracer<'c>>,
+        + ParameterizedFamily<Constant>
+        + ParameterizedFamily<StatefulCompileTracer<'c>>,
     In::ParameterStructure: std::fmt::Debug + Hash + PartialEq,
     Out::Family: ParameterizedFamily<ArrayType>
         + ParameterizedFamily<ArrayIrType>
-        + ParameterizedFamily<XlaConstant>
-        + ParameterizedFamily<XlaStatefulCompileTracer<'c>>,
+        + ParameterizedFamily<Constant>
+        + ParameterizedFamily<StatefulCompileTracer<'c>>,
 {
     /// Returns a new compiled function that computes the forward-mode JVP of `self`. Mirrors
     /// `jax.jvp(f, primals, tangents)` packaged into one compiled function: the returned handle
@@ -1272,32 +1256,32 @@ where
     #[track_caller]
     pub fn jvp<'domain>(
         &'domain self,
-        domain: &'domain XlaDomain<'c>,
-    ) -> Result<CompiledXlaFunction<'c, (In, In), (Out, Out)>, Error>
+        domain: &'domain Domain<'c>,
+    ) -> Result<CompiledFunction<'c, (In, In), (Out, Out)>, Error>
     where
         'c: 'domain,
-        In::Family: ParameterizedFamily<XlaCompileTracer<'c>, To = In::To<XlaCompileTracer<'c>>>,
-        In::To<XlaCompileTracer<'c>>:
-            Parameterized<XlaCompileTracer<'c>, Family = In::Family, ParameterStructure = In::ParameterStructure>,
-        Out::Family: ParameterizedFamily<XlaCompileTracer<'c>, To = Out::To<XlaCompileTracer<'c>>>,
-        Out::To<XlaCompileTracer<'c>>: Parameterized<
-                XlaCompileTracer<'c>,
+        In::Family: ParameterizedFamily<CompileTracer<'c>, To = In::To<CompileTracer<'c>>>,
+        In::To<CompileTracer<'c>>:
+            Parameterized<CompileTracer<'c>, Family = In::Family, ParameterStructure = In::ParameterStructure>,
+        Out::Family: ParameterizedFamily<CompileTracer<'c>, To = Out::To<CompileTracer<'c>>>,
+        Out::To<CompileTracer<'c>>: Parameterized<
+                CompileTracer<'c>,
                 Family = Out::Family,
                 ParameterStructure = Out::ParameterStructure,
                 To<ArrayType> = Out,
-                To<XlaConstant> = Out::To<XlaConstant>,
+                To<Constant> = Out::To<Constant>,
             >,
-        XlaProgramParameterValues<Out, XlaStatefulCompileTracer<'c>>: Parameterized<
-                XlaStatefulCompileTracer<'c>,
-                To<ArrayIrType> = XlaProgramParameters<Out>,
-                To<XlaConstant> = XlaProgramConstants<Out>,
+        ProgramParameterValues<Out, StatefulCompileTracer<'c>>: Parameterized<
+                StatefulCompileTracer<'c>,
+                To<ArrayIrType> = ProgramParameters<Out>,
+                To<Constant> = ProgramConstants<Out>,
             >,
     {
         {
             let slot = self.derived.jvp.lock().expect("derived-jvp retention slot mutex poisoned");
             if let Some((witness, artifact)) = slot.as_ref() {
                 if witness.matches(domain) {
-                    return Ok(CompiledXlaFunction {
+                    return Ok(CompiledFunction {
                         function: artifact.clone(),
                         derived: Arc::new(DerivedFunctionSlots::new()),
                     });
@@ -1356,10 +1340,10 @@ where
             captures,
             (input_signature, tangent_signature),
             domain,
-            XlaOptions::new(mesh),
+            Options::new(mesh),
         )?;
         *self.derived.jvp.lock().expect("derived-jvp retention slot mutex poisoned") =
-            Some((XlaDomainWitness::new(domain), compiled.function.clone()));
+            Some((DomainWitness::new(domain), compiled.function.clone()));
         Ok(compiled)
     }
 
@@ -1389,9 +1373,9 @@ where
     #[track_caller]
     pub fn batch<'domain>(
         &'domain self,
-        domain: &'domain XlaDomain<'c>,
+        domain: &'domain Domain<'c>,
         axis_size: usize,
-    ) -> Result<CompiledXlaFunction<'c, In, Out>, Error>
+    ) -> Result<CompiledFunction<'c, In, Out>, Error>
     where
         'c: 'domain,
     {
@@ -1403,11 +1387,11 @@ where
     }
 }
 
-/// Compiles one explicit abstract signature of `function` and returns a [`CompiledXlaFunction`] that executes that
+/// Compiles one explicit abstract signature of `function` and returns a [`CompiledFunction`] that executes that
 /// specialization on subsequent calls. Use [`jitted`] when runtime calls should select and retain specializations in
 /// the style of `jax.jit`.
 ///
-/// Equivalent to [`compile_with_options`] called with [`XlaOptions::new(mesh)`](XlaOptions::new).
+/// Equivalent to [`compile_with_options`] called with [`Options::new(mesh)`](Options::new).
 ///
 /// The function is traced against the supplied `domain`, which lets nested compiled functions register runtime
 /// captures in the same active trace. The resulting program is then compiled and executed against `domain`. Its
@@ -1417,65 +1401,63 @@ where
 pub fn compile<'domain, 'c: 'domain, F, In: Parameterized<ArrayType>, Out: Parameterized<ArrayType>>(
     function: F,
     input_types: In,
-    domain: &'domain XlaDomain<'c>,
+    domain: &'domain Domain<'c>,
     mesh: DeviceMesh,
-) -> Result<CompiledXlaFunction<'c, In, Out>, Error>
+) -> Result<CompiledFunction<'c, In, Out>, Error>
 where
-    F: FnOnce(In::To<XlaCompileTracer<'c>>) -> Out::To<XlaCompileTracer<'c>>,
+    F: FnOnce(In::To<CompileTracer<'c>>) -> Out::To<CompileTracer<'c>>,
     In::Family: ParameterizedFamily<ArrayType>
         + ParameterizedFamily<ArrayIrType>
-        + ParameterizedFamily<XlaConstant>
-        + ParameterizedFamily<XlaCompileTracer<'c>>
-        + ParameterizedFamily<XlaStatefulCompileTracer<'c>>,
+        + ParameterizedFamily<Constant>
+        + ParameterizedFamily<CompileTracer<'c>>
+        + ParameterizedFamily<StatefulCompileTracer<'c>>,
     In::ParameterStructure: Hash,
     Out::Family: ParameterizedFamily<ArrayType>
         + ParameterizedFamily<ArrayIrType>
-        + ParameterizedFamily<XlaConstant>
-        + ParameterizedFamily<XlaCompileTracer<'c>>
-        + ParameterizedFamily<XlaStatefulCompileTracer<'c>>,
-    Out::To<XlaCompileTracer<'c>>:
-        Parameterized<XlaCompileTracer<'c>, To<ArrayType> = Out, To<XlaConstant> = Out::To<XlaConstant>>,
-    XlaProgramParameterValues<Out, XlaStatefulCompileTracer<'c>>: Parameterized<
-            XlaStatefulCompileTracer<'c>,
-            To<ArrayIrType> = XlaProgramParameters<Out>,
-            To<XlaConstant> = XlaProgramConstants<Out>,
+        + ParameterizedFamily<Constant>
+        + ParameterizedFamily<CompileTracer<'c>>
+        + ParameterizedFamily<StatefulCompileTracer<'c>>,
+    Out::To<CompileTracer<'c>>: Parameterized<CompileTracer<'c>, To<ArrayType> = Out, To<Constant> = Out::To<Constant>>,
+    ProgramParameterValues<Out, StatefulCompileTracer<'c>>: Parameterized<
+            StatefulCompileTracer<'c>,
+            To<ArrayIrType> = ProgramParameters<Out>,
+            To<Constant> = ProgramConstants<Out>,
         >,
 {
-    compile_with_options(function, input_types, domain, XlaOptions::new(mesh))
+    compile_with_options(function, input_types, domain, Options::new(mesh))
 }
 
 /// Same as [`compile`] but makes runtime arrays explicit captures of the compiled program.
 ///
 /// The closure receives capture tracers first and ordinary input tracers second. Captures are compiled as hidden
-/// executable arguments and are supplied from the returned [`CompiledXlaFunction`] at execution time, so callers of the
+/// executable arguments and are supplied from the returned [`CompiledFunction`] at execution time, so callers of the
 /// compiled function still pass only `In` inputs.
 #[track_caller]
 pub fn compile_with_captures<'domain, 'c: 'domain, F, In: Parameterized<ArrayType>, Out: Parameterized<ArrayType>>(
     function: F,
-    captures: Vec<XlaArray<'c>>,
+    captures: Vec<Array<'c>>,
     input_types: In,
-    domain: &'domain XlaDomain<'c>,
+    domain: &'domain Domain<'c>,
     mesh: DeviceMesh,
-) -> Result<CompiledXlaFunction<'c, In, Out>, Error>
+) -> Result<CompiledFunction<'c, In, Out>, Error>
 where
-    F: FnOnce(Vec<XlaCompileTracer<'c>>, In::To<XlaCompileTracer<'c>>) -> Out::To<XlaCompileTracer<'c>>,
+    F: FnOnce(Vec<CompileTracer<'c>>, In::To<CompileTracer<'c>>) -> Out::To<CompileTracer<'c>>,
     In::Family: ParameterizedFamily<ArrayType>
         + ParameterizedFamily<ArrayIrType>
-        + ParameterizedFamily<XlaConstant>
-        + ParameterizedFamily<XlaCompileTracer<'c>>
-        + ParameterizedFamily<XlaStatefulCompileTracer<'c>>,
+        + ParameterizedFamily<Constant>
+        + ParameterizedFamily<CompileTracer<'c>>
+        + ParameterizedFamily<StatefulCompileTracer<'c>>,
     In::ParameterStructure: Hash,
     Out::Family: ParameterizedFamily<ArrayType>
         + ParameterizedFamily<ArrayIrType>
-        + ParameterizedFamily<XlaConstant>
-        + ParameterizedFamily<XlaCompileTracer<'c>>
-        + ParameterizedFamily<XlaStatefulCompileTracer<'c>>,
-    Out::To<XlaCompileTracer<'c>>:
-        Parameterized<XlaCompileTracer<'c>, To<ArrayType> = Out, To<XlaConstant> = Out::To<XlaConstant>>,
-    XlaProgramParameterValues<Out, XlaStatefulCompileTracer<'c>>: Parameterized<
-            XlaStatefulCompileTracer<'c>,
-            To<ArrayIrType> = XlaProgramParameters<Out>,
-            To<XlaConstant> = XlaProgramConstants<Out>,
+        + ParameterizedFamily<Constant>
+        + ParameterizedFamily<CompileTracer<'c>>
+        + ParameterizedFamily<StatefulCompileTracer<'c>>,
+    Out::To<CompileTracer<'c>>: Parameterized<CompileTracer<'c>, To<ArrayType> = Out, To<Constant> = Out::To<Constant>>,
+    ProgramParameterValues<Out, StatefulCompileTracer<'c>>: Parameterized<
+            StatefulCompileTracer<'c>,
+            To<ArrayIrType> = ProgramParameters<Out>,
+            To<Constant> = ProgramConstants<Out>,
         >,
 {
     compile_with_flat_captures(
@@ -1483,37 +1465,36 @@ where
         captures,
         input_types,
         domain,
-        XlaOptions::new(mesh),
+        Options::new(mesh),
     )
 }
 
-/// Same as [`compile`] but accepts an explicit [`XlaOptions`] payload.
+/// Same as [`compile`] but accepts an explicit [`Options`] payload.
 #[track_caller]
 pub fn compile_with_options<'domain, 'c: 'domain, F, In: Parameterized<ArrayType>, Out: Parameterized<ArrayType>>(
     function: F,
     input_types: In,
-    domain: &'domain XlaDomain<'c>,
-    options: XlaOptions,
-) -> Result<CompiledXlaFunction<'c, In, Out>, Error>
+    domain: &'domain Domain<'c>,
+    options: Options,
+) -> Result<CompiledFunction<'c, In, Out>, Error>
 where
-    F: FnOnce(In::To<XlaCompileTracer<'c>>) -> Out::To<XlaCompileTracer<'c>>,
+    F: FnOnce(In::To<CompileTracer<'c>>) -> Out::To<CompileTracer<'c>>,
     In::Family: ParameterizedFamily<ArrayType>
         + ParameterizedFamily<ArrayIrType>
-        + ParameterizedFamily<XlaConstant>
-        + ParameterizedFamily<XlaCompileTracer<'c>>
-        + ParameterizedFamily<XlaStatefulCompileTracer<'c>>,
+        + ParameterizedFamily<Constant>
+        + ParameterizedFamily<CompileTracer<'c>>
+        + ParameterizedFamily<StatefulCompileTracer<'c>>,
     In::ParameterStructure: Hash,
     Out::Family: ParameterizedFamily<ArrayType>
         + ParameterizedFamily<ArrayIrType>
-        + ParameterizedFamily<XlaConstant>
-        + ParameterizedFamily<XlaCompileTracer<'c>>
-        + ParameterizedFamily<XlaStatefulCompileTracer<'c>>,
-    Out::To<XlaCompileTracer<'c>>:
-        Parameterized<XlaCompileTracer<'c>, To<ArrayType> = Out, To<XlaConstant> = Out::To<XlaConstant>>,
-    XlaProgramParameterValues<Out, XlaStatefulCompileTracer<'c>>: Parameterized<
-            XlaStatefulCompileTracer<'c>,
-            To<ArrayIrType> = XlaProgramParameters<Out>,
-            To<XlaConstant> = XlaProgramConstants<Out>,
+        + ParameterizedFamily<Constant>
+        + ParameterizedFamily<CompileTracer<'c>>
+        + ParameterizedFamily<StatefulCompileTracer<'c>>,
+    Out::To<CompileTracer<'c>>: Parameterized<CompileTracer<'c>, To<ArrayType> = Out, To<Constant> = Out::To<Constant>>,
+    ProgramParameterValues<Out, StatefulCompileTracer<'c>>: Parameterized<
+            StatefulCompileTracer<'c>,
+            To<ArrayIrType> = ProgramParameters<Out>,
+            To<Constant> = ProgramConstants<Out>,
         >,
 {
     compile_with_flat_captures(|_, _, inputs| Ok(function(inputs)), Vec::new(), input_types, domain, options)
@@ -1522,72 +1503,70 @@ where
 #[track_caller]
 fn compile_with_flat_captures<'domain, 'c: 'domain, F, In: Parameterized<ArrayType>, Out: Parameterized<ArrayType>>(
     function: F,
-    captures: Vec<XlaArray<'c>>,
+    captures: Vec<Array<'c>>,
     input_types: In,
-    domain: &'domain XlaDomain<'c>,
-    options: XlaOptions,
-) -> Result<CompiledXlaFunction<'c, In, Out>, Error>
+    domain: &'domain Domain<'c>,
+    options: Options,
+) -> Result<CompiledFunction<'c, In, Out>, Error>
 where
     F: FnOnce(
-        Vec<XlaConstant>,
-        Vec<XlaCompileTracer<'c>>,
-        In::To<XlaCompileTracer<'c>>,
-    ) -> Result<Out::To<XlaCompileTracer<'c>>, Error>,
+        Vec<Constant>,
+        Vec<CompileTracer<'c>>,
+        In::To<CompileTracer<'c>>,
+    ) -> Result<Out::To<CompileTracer<'c>>, Error>,
     In::Family: ParameterizedFamily<ArrayType>
         + ParameterizedFamily<ArrayIrType>
-        + ParameterizedFamily<XlaConstant>
-        + ParameterizedFamily<XlaCompileTracer<'c>>
-        + ParameterizedFamily<XlaStatefulCompileTracer<'c>>,
+        + ParameterizedFamily<Constant>
+        + ParameterizedFamily<CompileTracer<'c>>
+        + ParameterizedFamily<StatefulCompileTracer<'c>>,
     In::ParameterStructure: Hash,
     Out::Family: ParameterizedFamily<ArrayType>
         + ParameterizedFamily<ArrayIrType>
-        + ParameterizedFamily<XlaConstant>
-        + ParameterizedFamily<XlaCompileTracer<'c>>
-        + ParameterizedFamily<XlaStatefulCompileTracer<'c>>,
-    Out::To<XlaCompileTracer<'c>>:
-        Parameterized<XlaCompileTracer<'c>, To<ArrayType> = Out, To<XlaConstant> = Out::To<XlaConstant>>,
-    XlaProgramParameterValues<Out, XlaStatefulCompileTracer<'c>>: Parameterized<
-            XlaStatefulCompileTracer<'c>,
-            To<ArrayIrType> = XlaProgramParameters<Out>,
-            To<XlaConstant> = XlaProgramConstants<Out>,
+        + ParameterizedFamily<Constant>
+        + ParameterizedFamily<CompileTracer<'c>>
+        + ParameterizedFamily<StatefulCompileTracer<'c>>,
+    Out::To<CompileTracer<'c>>: Parameterized<CompileTracer<'c>, To<ArrayType> = Out, To<Constant> = Out::To<Constant>>,
+    ProgramParameterValues<Out, StatefulCompileTracer<'c>>: Parameterized<
+            StatefulCompileTracer<'c>,
+            To<ArrayIrType> = ProgramParameters<Out>,
+            To<Constant> = ProgramConstants<Out>,
         >,
 {
     let staged = stage_with_flat_captures::<F, In, Out>(function, captures, input_types, options)?;
     domain.compile_staged_function(staged)
 }
 
-/// Traces `function` into a staged program and returns a [`StagedXlaFunction`] handle, without compiling a PJRT
+/// Traces `function` into a staged program and returns a [`StagedFunction`] handle, without compiling a PJRT
 /// executable.
 ///
 /// This is the staging-only counterpart of [`compile`]: use it for functions that are composed into larger programs
-/// via [`StagedXlaFunction::call`] rather than executed directly, so no executable is built for them. Compile the
-/// staged handle later with [`XlaDomain::compile_staged_function`] when direct execution is needed. `options` are
+/// via [`StagedFunction::call`] rather than executed directly, so no executable is built for them. Compile the
+/// staged handle later with [`Domain::compile_staged_function`] when direct execution is needed. `options` are
 /// applied to the abstract input signature before tracing and retained for subsequent lowering and compilation.
 #[track_caller]
 pub fn stage<'c, F, In: Parameterized<ArrayType>, Out: Parameterized<ArrayType>>(
     function: F,
     input_types: In,
-    options: XlaOptions,
-) -> Result<StagedXlaFunction<'c, In, Out>, Error>
+    options: Options,
+) -> Result<StagedFunction<'c, In, Out>, Error>
 where
-    F: FnOnce(In::To<XlaCompileTracer<'c>>) -> Out::To<XlaCompileTracer<'c>>,
+    F: FnOnce(In::To<CompileTracer<'c>>) -> Out::To<CompileTracer<'c>>,
     In::Family: ParameterizedFamily<ArrayType>
         + ParameterizedFamily<ArrayIrType>
-        + ParameterizedFamily<XlaConstant>
-        + ParameterizedFamily<XlaCompileTracer<'c>>
-        + ParameterizedFamily<XlaStatefulCompileTracer<'c>>,
+        + ParameterizedFamily<Constant>
+        + ParameterizedFamily<CompileTracer<'c>>
+        + ParameterizedFamily<StatefulCompileTracer<'c>>,
     In::ParameterStructure: Hash,
     Out::Family: ParameterizedFamily<ArrayType>
         + ParameterizedFamily<ArrayIrType>
-        + ParameterizedFamily<XlaConstant>
-        + ParameterizedFamily<XlaCompileTracer<'c>>
-        + ParameterizedFamily<XlaStatefulCompileTracer<'c>>,
-    Out::To<XlaCompileTracer<'c>>:
-        Parameterized<XlaCompileTracer<'c>, To<ArrayType> = Out, To<XlaConstant> = Out::To<XlaConstant>>,
-    XlaProgramParameterValues<Out, XlaStatefulCompileTracer<'c>>: Parameterized<
-            XlaStatefulCompileTracer<'c>,
-            To<ArrayIrType> = XlaProgramParameters<Out>,
-            To<XlaConstant> = XlaProgramConstants<Out>,
+        + ParameterizedFamily<Constant>
+        + ParameterizedFamily<CompileTracer<'c>>
+        + ParameterizedFamily<StatefulCompileTracer<'c>>,
+    Out::To<CompileTracer<'c>>: Parameterized<CompileTracer<'c>, To<ArrayType> = Out, To<Constant> = Out::To<Constant>>,
+    ProgramParameterValues<Out, StatefulCompileTracer<'c>>: Parameterized<
+            StatefulCompileTracer<'c>,
+            To<ArrayIrType> = ProgramParameters<Out>,
+            To<Constant> = ProgramConstants<Out>,
         >,
 {
     stage_with_flat_captures(|_, _, inputs| Ok(function(inputs)), Vec::new(), input_types, options)
@@ -1597,33 +1576,32 @@ where
 ///
 /// The closure receives capture tracers first and ordinary input tracers second, mirroring
 /// [`compile_with_captures`]. Captures are retained on the staged handle and threaded through `jit_call` boundaries
-/// when the handle is staged into outer traces via [`StagedXlaFunction::call`].
+/// when the handle is staged into outer traces via [`StagedFunction::call`].
 #[track_caller]
 pub fn stage_with_captures<'c, F, In: Parameterized<ArrayType>, Out: Parameterized<ArrayType>>(
     function: F,
-    captures: Vec<XlaArray<'c>>,
+    captures: Vec<Array<'c>>,
     input_types: In,
-    options: XlaOptions,
-) -> Result<StagedXlaFunction<'c, In, Out>, Error>
+    options: Options,
+) -> Result<StagedFunction<'c, In, Out>, Error>
 where
-    F: FnOnce(Vec<XlaCompileTracer<'c>>, In::To<XlaCompileTracer<'c>>) -> Out::To<XlaCompileTracer<'c>>,
+    F: FnOnce(Vec<CompileTracer<'c>>, In::To<CompileTracer<'c>>) -> Out::To<CompileTracer<'c>>,
     In::Family: ParameterizedFamily<ArrayType>
         + ParameterizedFamily<ArrayIrType>
-        + ParameterizedFamily<XlaConstant>
-        + ParameterizedFamily<XlaCompileTracer<'c>>
-        + ParameterizedFamily<XlaStatefulCompileTracer<'c>>,
+        + ParameterizedFamily<Constant>
+        + ParameterizedFamily<CompileTracer<'c>>
+        + ParameterizedFamily<StatefulCompileTracer<'c>>,
     In::ParameterStructure: Hash,
     Out::Family: ParameterizedFamily<ArrayType>
         + ParameterizedFamily<ArrayIrType>
-        + ParameterizedFamily<XlaConstant>
-        + ParameterizedFamily<XlaCompileTracer<'c>>
-        + ParameterizedFamily<XlaStatefulCompileTracer<'c>>,
-    Out::To<XlaCompileTracer<'c>>:
-        Parameterized<XlaCompileTracer<'c>, To<ArrayType> = Out, To<XlaConstant> = Out::To<XlaConstant>>,
-    XlaProgramParameterValues<Out, XlaStatefulCompileTracer<'c>>: Parameterized<
-            XlaStatefulCompileTracer<'c>,
-            To<ArrayIrType> = XlaProgramParameters<Out>,
-            To<XlaConstant> = XlaProgramConstants<Out>,
+        + ParameterizedFamily<Constant>
+        + ParameterizedFamily<CompileTracer<'c>>
+        + ParameterizedFamily<StatefulCompileTracer<'c>>,
+    Out::To<CompileTracer<'c>>: Parameterized<CompileTracer<'c>, To<ArrayType> = Out, To<Constant> = Out::To<Constant>>,
+    ProgramParameterValues<Out, StatefulCompileTracer<'c>>: Parameterized<
+            StatefulCompileTracer<'c>,
+            To<ArrayIrType> = ProgramParameters<Out>,
+            To<Constant> = ProgramConstants<Out>,
         >,
 {
     stage_with_flat_captures(
@@ -1637,45 +1615,42 @@ where
 #[track_caller]
 fn stage_with_flat_captures<'c, F, In: Parameterized<ArrayType>, Out: Parameterized<ArrayType>>(
     function: F,
-    captures: Vec<XlaArray<'c>>,
+    captures: Vec<Array<'c>>,
     input_types: In,
-    options: XlaOptions,
-) -> Result<StagedXlaFunction<'c, In, Out>, Error>
+    options: Options,
+) -> Result<StagedFunction<'c, In, Out>, Error>
 where
     F: FnOnce(
-        Vec<XlaConstant>,
-        Vec<XlaCompileTracer<'c>>,
-        In::To<XlaCompileTracer<'c>>,
-    ) -> Result<Out::To<XlaCompileTracer<'c>>, Error>,
+        Vec<Constant>,
+        Vec<CompileTracer<'c>>,
+        In::To<CompileTracer<'c>>,
+    ) -> Result<Out::To<CompileTracer<'c>>, Error>,
     In::Family: ParameterizedFamily<ArrayType>
         + ParameterizedFamily<ArrayIrType>
-        + ParameterizedFamily<XlaConstant>
-        + ParameterizedFamily<XlaCompileTracer<'c>>
-        + ParameterizedFamily<XlaStatefulCompileTracer<'c>>,
+        + ParameterizedFamily<Constant>
+        + ParameterizedFamily<CompileTracer<'c>>
+        + ParameterizedFamily<StatefulCompileTracer<'c>>,
     In::ParameterStructure: Hash,
     Out::Family: ParameterizedFamily<ArrayType>
         + ParameterizedFamily<ArrayIrType>
-        + ParameterizedFamily<XlaConstant>
-        + ParameterizedFamily<XlaCompileTracer<'c>>
-        + ParameterizedFamily<XlaStatefulCompileTracer<'c>>,
-    Out::To<XlaCompileTracer<'c>>:
-        Parameterized<XlaCompileTracer<'c>, To<ArrayType> = Out, To<XlaConstant> = Out::To<XlaConstant>>,
-    XlaProgramParameterValues<Out, XlaStatefulCompileTracer<'c>>: Parameterized<
-            XlaStatefulCompileTracer<'c>,
-            To<ArrayIrType> = XlaProgramParameters<Out>,
-            To<XlaConstant> = XlaProgramConstants<Out>,
+        + ParameterizedFamily<Constant>
+        + ParameterizedFamily<CompileTracer<'c>>
+        + ParameterizedFamily<StatefulCompileTracer<'c>>,
+    Out::To<CompileTracer<'c>>: Parameterized<CompileTracer<'c>, To<ArrayType> = Out, To<Constant> = Out::To<Constant>>,
+    ProgramParameterValues<Out, StatefulCompileTracer<'c>>: Parameterized<
+            StatefulCompileTracer<'c>,
+            To<ArrayIrType> = ProgramParameters<Out>,
+            To<Constant> = ProgramConstants<Out>,
         >,
 {
-    let captures = captures.into_iter().map(XlaValue::Array).collect();
+    let captures = captures.into_iter().map(Value::Array).collect();
     let input_structure = input_types.parameter_structure();
-    let input_types = XlaProgramParameters::<In>::from_parameters(
-        input_structure,
-        input_types.into_parameters().map(ArrayIrType::from),
-    )
-    .map_err(ProgramError::from)?;
+    let input_types =
+        ProgramParameters::<In>::from_parameters(input_structure, input_types.into_parameters().map(ArrayIrType::from))
+            .map_err(ProgramError::from)?;
     let function = move |capture_references,
-                         capture_tracers: Vec<XlaStatefulCompileTracer<'c>>,
-                         inputs: XlaProgramParameterValues<In, XlaStatefulCompileTracer<'c>>| {
+                         capture_tracers: Vec<StatefulCompileTracer<'c>>,
+                         inputs: ProgramParameterValues<In, StatefulCompileTracer<'c>>| {
         let capture_tracers = capture_tracers
             .into_iter()
             .map(ValueProjection::<ArrayType>::into_projected)
@@ -1685,13 +1660,13 @@ where
         lift_tracers::<Out>(function(capture_references, capture_tracers, inputs)?)
     };
     let input_types = with_input_shardings(input_types, &options)?;
-    let function = StagedFunction::<XlaDomain<'_>, XlaProgramParameters<In>, XlaProgramParameters<Out>>::stage(
+    let function = CoreStagedFunction::<Domain<'_>, ProgramParameters<In>, ProgramParameters<Out>>::stage(
         function,
         captures,
         input_types,
         options,
     )?;
-    Ok(StagedXlaFunction { function })
+    Ok(StagedFunction { function })
 }
 
 /// Traces `function` against `input_types` and returns the abstract output type tree, without
@@ -1702,35 +1677,35 @@ pub fn infer_output_types<F, In: Parameterized<ArrayType>, Out: Parameterized<Ar
     input_types: In,
 ) -> Result<Out, ProgramError>
 where
-    F: FnOnce(In::To<XlaCompileTracer<'static>>) -> Out::To<XlaCompileTracer<'static>>,
+    F: FnOnce(In::To<CompileTracer<'static>>) -> Out::To<CompileTracer<'static>>,
     In::Family: ParameterizedFamily<ArrayType>
         + ParameterizedFamily<ArrayIrType>
-        + ParameterizedFamily<XlaConstant>
-        + ParameterizedFamily<XlaCompileTracer<'static>>
-        + ParameterizedFamily<XlaStatefulCompileTracer<'static>>,
+        + ParameterizedFamily<Constant>
+        + ParameterizedFamily<CompileTracer<'static>>
+        + ParameterizedFamily<StatefulCompileTracer<'static>>,
     Out::Family: ParameterizedFamily<ArrayType>
         + ParameterizedFamily<ArrayIrType>
-        + ParameterizedFamily<XlaConstant>
-        + ParameterizedFamily<XlaCompileTracer<'static>>
-        + ParameterizedFamily<XlaStatefulCompileTracer<'static>>,
-    Out::To<XlaCompileTracer<'static>>: Parameterized<XlaCompileTracer<'static>, To<ArrayType> = Out>,
+        + ParameterizedFamily<Constant>
+        + ParameterizedFamily<CompileTracer<'static>>
+        + ParameterizedFamily<StatefulCompileTracer<'static>>,
+    Out::To<CompileTracer<'static>>: Parameterized<CompileTracer<'static>, To<ArrayType> = Out>,
 {
     let input_structure = input_types.parameter_structure();
-    let input_types = XlaProgramParameters::<In>::from_parameters(
+    let input_types = ProgramParameters::<In>::from_parameters(
         input_structure,
         input_types.into_parameters().map(ArrayIrType::from),
     )?;
-    let output_types = DomainTracingContext::<XlaDomain<'static>, XlaStatefulValue<'static>>::infer_output_type(
+    let output_types = DomainTracingContext::<Domain<'static>, StatefulValue<'static>>::infer_output_type(
         |tracers| {
             let input_structure = tracers.parameter_structure();
             let input_parameters = tracers
                 .into_parameters()
                 .map(|value| ValueProjection::<ArrayType>::into_projected(value).map_err(ProgramError::from))
                 .collect::<Result<Vec<_>, _>>()?;
-            let tracers = In::To::<XlaCompileTracer<'static>>::from_parameters(input_structure, input_parameters)?;
+            let tracers = In::To::<CompileTracer<'static>>::from_parameters(input_structure, input_parameters)?;
             let outputs = function(tracers);
             let output_structure = outputs.parameter_structure();
-            XlaProgramParameterValues::<Out, XlaStatefulCompileTracer<'static>>::from_parameters(
+            ProgramParameterValues::<Out, StatefulCompileTracer<'static>>::from_parameters(
                 output_structure,
                 outputs.into_parameters().map(ProjectedValue::into_value),
             )
@@ -1755,35 +1730,37 @@ mod tests {
     use pretty_assertions::assert_eq;
 
     use ryft_core::{
-        Add, AddOperation, ArgMax, Array, ArrayIrType, ArrayOperation, ArrayReference, ArrayReferenceTransform,
-        ArrayReferenceTransformIndex, ArrayType, Atan2, AttachedRegions, Broadcast, CaptureReference, Compare,
-        ComparisonDirection, Condition, ConstrainSharding, Context, ConvertElementType, Cos, CotangentDestinationKind,
-        Cumulative, CustomCall, CustomCallOperation, DataType, Device, DeviceMesh, DifferentiableType, Differentiate,
-        Dimension, DimensionBounds, DimensionSizeOperation, DimensionVariable, Div, DomainTracer, DomainTracingContext,
-        Dot, DotDimensionNumbers, DynamicSlice, DynamicUpdateSlice, EagerContext, Exp, Fill, ForwardModeDifferentiate,
-        Hessian, Iota, Jacobian, LogicalMesh, Logistic, Memory, MeshAxis, MeshAxisType, Mul, MulOperation, OneLike,
-        ParallelVaryOperation, Placeholder, ProgramBuilder, ProgramError, ProjectedValue, Random, Reduce,
-        ReductionKind, ReferenceAddUpdate, ReferenceAddUpdateOperation, ReferenceCompletion,
+        Add, AddOperation, ArgMax, Array as CoreArray, ArrayIrType, ArrayOperation, ArrayReference,
+        ArrayReferenceTransform, ArrayReferenceTransformIndex, ArrayType, Atan2, AttachedRegions, Broadcast,
+        CaptureReference, Compare, ComparisonDirection, Condition, ConstrainSharding, Context, ConvertElementType, Cos,
+        CotangentDestinationKind, Cumulative, CustomCall, CustomCallOperation, DataType, Device, DeviceMesh,
+        DifferentiableType, Differentiate, Dimension as CoreDimension, DimensionBounds, DimensionSizeOperation,
+        DimensionVariable, Div, DomainTracer, DomainTracingContext, Dot, DotDimensionNumbers, DynamicSlice,
+        DynamicUpdateSlice, EagerContext, Exp, Fill, ForwardModeDifferentiate, Hessian, Iota, Jacobian, LogicalMesh,
+        Logistic, Memory, MeshAxis, MeshAxisType, Mul, MulOperation, OneLike, ParallelVaryOperation, Placeholder,
+        ProgramBuilder as CoreProgramBuilder, ProgramError, ProjectedValue, Random, Reduce, ReductionKind,
+        ReferenceAddUpdate, ReferenceAddUpdateOperation, ReferenceCompletion as CoreReferenceCompletion,
         ReferenceCompletionBackend, ReferenceError, ReferenceFreeze, ReferenceFreezeOperation, ReferenceNew,
         ReferenceNewOperation, ReferenceRead, ReferenceReadOperation, ReferenceType, Reshape, Reshard, ScanOperation,
-        Select, Shape, ShardMapBoundary, ShardMapOperation, Sharding, ShardingDimension, Sin, Softmax, StagedFunction,
-        StopGradient, StopGradientOperation, Sub, Tanh, TopK, Trace, TransferToMemory, Typed, TypedProgram, Value,
-        ValueProjection, WhileOperation, ZeroLike, differentiate_at,
+        Select, Shape, ShardMapBoundary, ShardMapOperation, Sharding, ShardingDimension, Sin, Softmax,
+        StagedFunction as CoreStagedFunction, StopGradient, StopGradientOperation, Sub, Tanh, TopK, Trace,
+        TransferToMemory, Typed, TypedProgram, Value as CoreValue, ValueProjection, WhileOperation, ZeroLike,
+        differentiate_at,
     };
     use ryft_pjrt::{ClientOptions, CpuClientOptions, load_cpu_plugin};
 
-    use crate::experimental::domains::StatefulFailureInjection;
-    use crate::experimental::ops::{XlaConstant, XlaOperation};
+    use crate::domains::StatefulFailureInjection;
+    use crate::experimental::ops::{Constant, Operation};
     use crate::jit::{
-        CompiledXlaFunction, ExecutableXlaFunction, JittedXlaFunction, StagedXlaFunction, XlaCompileTracer,
-        XlaStatefulCompileTracer, compile, compile_statefully, compile_statefully_with_captures, compile_with_captures,
-        compile_with_options, infer_output_types, jitted, jitted_statefully, stage, stage_with_captures,
+        CompileTracer, CompiledFunction, ExecutableFunction, JittedFunction, StagedFunction, StatefulCompileTracer,
+        compile, compile_statefully, compile_statefully_with_captures, compile_with_captures, compile_with_options,
+        infer_output_types, jitted, jitted_statefully, stage, stage_with_captures,
     };
     use crate::operations::jit_call::JitCallOperation;
     use crate::tests::{execution_client, values_from_bytes, values_to_bytes};
     use crate::{
-        AdaptiveProfileGuidedOptions, ArrayError, CompilationError, Error, ExecutionError, FromPjrt, XlaArray,
-        XlaDomain, XlaOptions, XlaReference, XlaSession, XlaValue,
+        AdaptiveProfileGuidedOptions, Array, ArrayError, CompilationError, Domain, Error, ExecutionError, FromPjrt,
+        Options, Reference, Session, Value,
     };
 
     /// Deterministic completion gate used by stateful asynchronous integration tests.
@@ -1879,7 +1856,7 @@ mod tests {
         DeviceMesh::new(LogicalMesh::new(vec![MeshAxis::new("x", 2, axis_type).unwrap()]).unwrap(), devices).unwrap()
     }
 
-    fn read_f32_array(client: &ryft_pjrt::Client<'_>, array: &XlaArray<'_>) -> Vec<f32> {
+    fn read_f32_array(client: &ryft_pjrt::Client<'_>, array: &Array<'_>) -> Vec<f32> {
         let device_id = client.addressable_devices().unwrap()[0].id().unwrap();
         let shard_bytes = array
             .device_shard(device_id)
@@ -1893,7 +1870,7 @@ mod tests {
         values_from_bytes::<f32>(shard_bytes.as_slice())
     }
 
-    fn read_sharded_f32_array(array: &XlaArray<'_>) -> Vec<f32> {
+    fn read_sharded_f32_array(array: &Array<'_>) -> Vec<f32> {
         let mut values = Vec::new();
         for device in array.mesh().devices() {
             let shard_bytes = array
@@ -1910,7 +1887,7 @@ mod tests {
         values
     }
 
-    fn read_f64_array(client: &ryft_pjrt::Client<'_>, array: &XlaArray<'_>) -> Vec<f64> {
+    fn read_f64_array(client: &ryft_pjrt::Client<'_>, array: &Array<'_>) -> Vec<f64> {
         let device_id = client.addressable_devices().unwrap()[0].id().unwrap();
         let shard_bytes = array
             .device_shard(device_id)
@@ -1929,7 +1906,7 @@ mod tests {
     fn nonlinear_reference_shard_map_program(
         mesh: &LogicalMesh,
         replicated_reference: bool,
-    ) -> ryft_core::Program<XlaConstant, XlaOperation, Vec<XlaConstant>, Vec<XlaConstant>> {
+    ) -> ryft_core::Program<Constant, Operation, Vec<Constant>, Vec<Constant>> {
         let sharded = Sharding::new(mesh.clone(), vec![ShardingDimension::sharded(["x"])]).unwrap();
         let reference_sharding =
             if replicated_reference { Sharding::replicated(mesh.clone(), 1) } else { sharded.clone() };
@@ -1944,7 +1921,7 @@ mod tests {
             vec!["x".to_string()],
         )
         .unwrap();
-        let mut body = ProgramBuilder::<XlaConstant, XlaOperation>::new();
+        let mut body = CoreProgramBuilder::<Constant, Operation>::new();
         let reference =
             body.add_input(ReferenceType::new(boundary.local_input_type(0, &reference_type).unwrap()).into());
         let value = body.add_input(boundary.local_input_type(1, &value_type).unwrap().into());
@@ -1957,16 +1934,15 @@ mod tests {
         };
         let output = body.add_instruction(MulOperation::new(), Vec::new(), vec![state, value], None).unwrap()[0];
         let body = body
-            .build::<Vec<XlaConstant>, Vec<XlaConstant>>(vec![output], vec![Placeholder; 2], vec![Placeholder])
+            .build::<Vec<Constant>, Vec<Constant>>(vec![output], vec![Placeholder; 2], vec![Placeholder])
             .unwrap();
         let inputs = vec![ArrayIrType::Reference(ReferenceType::new(reference_type)), ArrayIrType::Array(value_type)];
         let operation = ShardMapOperation::from_program(&body, inputs.clone(), boundary).unwrap();
-        let mut builder = ProgramBuilder::<XlaConstant, XlaOperation>::new();
+        let mut builder = CoreProgramBuilder::<Constant, Operation>::new();
         let inputs = inputs.into_iter().map(|r#type| builder.add_input(r#type)).collect::<Vec<_>>();
         let body = builder.import_program(body);
-        let outputs = builder
-            .add_instruction(XlaOperation::ShardMap(Box::new(operation)), vec![body], inputs, None)
-            .unwrap();
+        let outputs =
+            builder.add_instruction(Operation::ShardMap(Box::new(operation)), vec![body], inputs, None).unwrap();
         let outputs = outputs.to_vec();
         builder.build(outputs, vec![Placeholder; 2], vec![Placeholder]).unwrap()
     }
@@ -1978,17 +1954,17 @@ mod tests {
             .client(ClientOptions::CPU(CpuClientOptions { device_count: Some(1), ..Default::default() }))
             .unwrap();
         let mesh = single_device_mesh(&client);
-        let engine = XlaSession::new(&client).domain();
+        let engine = Session::new(&client).domain();
 
-        let input_type = ArrayType::new(DataType::F32, Shape::new(vec![Dimension::Static(4)]))
+        let input_type = ArrayType::new(DataType::F32, Shape::new(vec![CoreDimension::Static(4)]))
             .with_sharding(Sharding::replicated(mesh.logical_mesh().clone(), 1))
             .unwrap();
-        let compiled: CompiledXlaFunction<'_, ArrayType, ArrayType> =
+        let compiled: CompiledFunction<'_, ArrayType, ArrayType> =
             compile(|x| x.sin().unwrap(), input_type.clone(), &engine, mesh.clone()).unwrap();
 
         let values = [0.0f32, 0.5, 1.0, 1.5];
         let source =
-            XlaArray::from_host_buffer(&engine, input_type, mesh.clone(), values_to_bytes::<f32>(&values).as_slice())
+            Array::from_host_buffer(&engine, input_type, mesh.clone(), values_to_bytes::<f32>(&values).as_slice())
                 .unwrap();
         let output = engine.interpret(&compiled.executable_function(), source).unwrap();
 
@@ -2012,14 +1988,14 @@ mod tests {
     fn test_compile_converted_broadcast() {
         let client = execution_client();
         let mesh = single_device_mesh(&client);
-        let engine = XlaSession::new(&client).domain();
+        let engine = Session::new(&client).domain();
         let input_type = ArrayType::new_static(DataType::F32, [3])
             .with_sharding(Sharding::replicated(mesh.logical_mesh().clone(), 1))
             .unwrap();
         let output_type = ArrayType::new_static(DataType::C64, [2, 3])
             .with_sharding(Sharding::replicated(mesh.logical_mesh().clone(), 2))
             .unwrap();
-        let compiled: CompiledXlaFunction<'_, ArrayType, ArrayType> = compile(
+        let compiled: CompiledFunction<'_, ArrayType, ArrayType> = compile(
             |value| value.convert_element_type(DataType::C64).unwrap().broadcast(output_type.clone(), &[1]).unwrap(),
             input_type.clone(),
             &engine,
@@ -2029,7 +2005,7 @@ mod tests {
         assert_eq!(compiled.source_program().program().input_ids().len(), 1);
         assert_eq!(compiled.source_program().captures().len(), 0);
         let input =
-            XlaArray::from_host_buffer(&engine, input_type, mesh.clone(), values_to_bytes(&[1f32, 2., 3.]).as_slice())
+            Array::from_host_buffer(&engine, input_type, mesh.clone(), values_to_bytes(&[1f32, 2., 3.]).as_slice())
                 .unwrap();
         let output = engine.interpret(&compiled.executable_function(), input).unwrap();
         let device_id = client.addressable_devices().unwrap()[0].id().unwrap();
@@ -2053,16 +2029,16 @@ mod tests {
             .client(ClientOptions::CPU(CpuClientOptions { device_count: Some(1), ..Default::default() }))
             .unwrap();
         let mesh = single_device_mesh(&client);
-        let engine = XlaSession::new(&client).domain();
+        let engine = Session::new(&client).domain();
         let scalar_type = ArrayType::scalar(DataType::F32)
             .with_sharding(Sharding::replicated(mesh.logical_mesh().clone(), 0))
             .unwrap();
         let input_type = ArrayType::new_static(DataType::F32, [2, 3])
             .with_sharding(Sharding::replicated(mesh.logical_mesh().clone(), 2))
             .unwrap();
-        let value = XlaArray::from_host_buffer(&engine, scalar_type, mesh.clone(), values_to_bytes(&[4f32]).as_slice())
-            .unwrap();
-        let compiled: CompiledXlaFunction<'_, ArrayType, ArrayType> = compile_with_captures(
+        let value =
+            Array::from_host_buffer(&engine, scalar_type, mesh.clone(), values_to_bytes(&[4f32]).as_slice()).unwrap();
+        let compiled: CompiledFunction<'_, ArrayType, ArrayType> = compile_with_captures(
             |captures, exemplar| captures[0].broadcast(exemplar.r#type().into_owned(), &[]).unwrap(),
             vec![value],
             input_type.clone(),
@@ -2072,8 +2048,7 @@ mod tests {
         .unwrap();
         assert_eq!(compiled.source_program().captures().len(), 1);
         assert_eq!(compiled.source_program().to_program_with_lifted_captures().unwrap().input_ids().len(), 2);
-        let input =
-            XlaArray::from_host_buffer(&engine, input_type, mesh, values_to_bytes(&[9f32; 6]).as_slice()).unwrap();
+        let input = Array::from_host_buffer(&engine, input_type, mesh, values_to_bytes(&[9f32; 6]).as_slice()).unwrap();
         let output = engine.interpret(&compiled.executable_function(), input).unwrap();
         assert_eq!(read_f32_array(&client, &output), vec![4f32; 6]);
     }
@@ -2082,11 +2057,11 @@ mod tests {
     fn test_compile_reduce_product() {
         let client = execution_client();
         let mesh = single_device_mesh(&client);
-        let engine = XlaSession::new(&client).domain();
+        let engine = Session::new(&client).domain();
         let input_type = ArrayType::new_static(DataType::F32, [3])
             .with_sharding(Sharding::replicated(mesh.logical_mesh().clone(), 1))
             .unwrap();
-        let compiled: CompiledXlaFunction<'_, ArrayType, ArrayType> =
+        let compiled: CompiledFunction<'_, ArrayType, ArrayType> =
             compile(|value| value.reduce_product(&[0]).unwrap(), input_type.clone(), &engine, mesh.clone()).unwrap();
         let gradient = compiled.gradient(&engine).unwrap();
 
@@ -2097,8 +2072,7 @@ mod tests {
             ([0f32, 0., 4.], 0., vec![0., 0., 0.]),
         ] {
             let input =
-                XlaArray::from_host_buffer(&engine, input_type.clone(), mesh.clone(), &values_to_bytes(&values))
-                    .unwrap();
+                Array::from_host_buffer(&engine, input_type.clone(), mesh.clone(), &values_to_bytes(&values)).unwrap();
             let output = engine.interpret(&compiled.executable_function(), input.clone()).unwrap();
             assert_eq!(read_f32_array(&client, &output), vec![expected]);
             let output = engine.interpret(&gradient.executable_function(), input).unwrap();
@@ -2113,10 +2087,10 @@ mod tests {
             .client(ClientOptions::CPU(CpuClientOptions { device_count: Some(2), ..Default::default() }))
             .unwrap();
         let mesh = two_device_mesh(&client, MeshAxisType::Explicit);
-        let engine = XlaSession::new(&client).domain();
+        let engine = Session::new(&client).domain();
         let sharding = Sharding::new(mesh.logical_mesh().clone(), vec![ShardingDimension::sharded(["x"])]).unwrap();
         let input_type = ArrayType::new_static(DataType::F32, [4]).with_sharding(sharding).unwrap();
-        let compiled: CompiledXlaFunction<'_, ArrayType, ArrayType> =
+        let compiled: CompiledFunction<'_, ArrayType, ArrayType> =
             compile(|value| value.reduce_product(&[0]).unwrap(), input_type.clone(), &engine, mesh.clone()).unwrap();
         let gradient = compiled.gradient(&engine).unwrap();
 
@@ -2125,8 +2099,7 @@ mod tests {
             [([2f32, 3., 4., 5.], vec![60f32, 40., 30., 24.]), ([0f32, 3., 4., 5.], vec![60f32, 0., 0., 0.])]
         {
             let input =
-                XlaArray::from_host_buffer(&engine, input_type.clone(), mesh.clone(), &values_to_bytes(&values))
-                    .unwrap();
+                Array::from_host_buffer(&engine, input_type.clone(), mesh.clone(), &values_to_bytes(&values)).unwrap();
             let output = engine.interpret(&gradient.executable_function(), input).unwrap();
             assert_eq!(output.sharding(), input_type.sharding().unwrap());
             let mut observed = Vec::new();
@@ -2150,7 +2123,7 @@ mod tests {
     fn test_compile_reduce_narrow_floating_point() {
         let client = execution_client();
         let mesh = single_device_mesh(&client);
-        let engine = XlaSession::new(&client).domain();
+        let engine = Session::new(&client).domain();
 
         // Product retains the small growth of each factor; the larger mean also needs a widened divisor.
         for (kind, count, input, expected) in [
@@ -2163,7 +2136,7 @@ mod tests {
             let input_type = ArrayType::new_static(DataType::F32, [count])
                 .with_sharding(Sharding::replicated(mesh.logical_mesh().clone(), 1))
                 .unwrap();
-            let compiled: CompiledXlaFunction<'_, ArrayType, ArrayType> = compile(
+            let compiled: CompiledFunction<'_, ArrayType, ArrayType> = compile(
                 |value| {
                     value
                         .convert_element_type(DataType::F16)
@@ -2179,7 +2152,7 @@ mod tests {
             )
             .unwrap();
             let input =
-                XlaArray::from_host_buffer(&engine, input_type, mesh.clone(), &values_to_bytes(&vec![input; count]))
+                Array::from_host_buffer(&engine, input_type, mesh.clone(), &values_to_bytes(&vec![input; count]))
                     .unwrap();
             let output = engine.interpret(&compiled.executable_function(), input).unwrap();
             assert_eq!(read_f32_array(&client, &output), vec![expected]);
@@ -2190,18 +2163,18 @@ mod tests {
     fn test_compile_reduce_mean_empty() {
         let client = execution_client();
         let mesh = single_device_mesh(&client);
-        let engine = XlaSession::new(&client).domain();
+        let engine = Session::new(&client).domain();
         let input_type = ArrayType::new_static(DataType::F32, [0])
             .with_sharding(Sharding::replicated(mesh.logical_mesh().clone(), 1))
             .unwrap();
-        let compiled: CompiledXlaFunction<'_, ArrayType, ArrayType> = compile(
+        let compiled: CompiledFunction<'_, ArrayType, ArrayType> = compile(
             |value| value.reduce(&[0], ReductionKind::Mean).unwrap(),
             input_type.clone(),
             &engine,
             mesh.clone(),
         )
         .unwrap();
-        let input = XlaArray::from_host_buffer(&engine, input_type, mesh, &[]).unwrap();
+        let input = Array::from_host_buffer(&engine, input_type, mesh, &[]).unwrap();
         let output = engine.interpret(&compiled.executable_function(), input).unwrap();
         assert!(read_f32_array(&client, &output)[0].is_nan());
     }
@@ -2210,7 +2183,7 @@ mod tests {
     fn test_compile_reduce_complex() {
         let client = execution_client();
         let mesh = single_device_mesh(&client);
-        let engine = XlaSession::new(&client).domain();
+        let engine = Session::new(&client).domain();
         // Complex storage interleaves the real and imaginary components. Infinite real components force extrema
         // to compare the imaginary component against the identity rather than deciding on the real component.
         for (kind, components, expected) in [
@@ -2223,10 +2196,10 @@ mod tests {
             let input_type = ArrayType::new_static(DataType::C64, [components.len() / 2])
                 .with_sharding(Sharding::replicated(mesh.logical_mesh().clone(), 1))
                 .unwrap();
-            let compiled: CompiledXlaFunction<'_, ArrayType, ArrayType> =
+            let compiled: CompiledFunction<'_, ArrayType, ArrayType> =
                 compile(|value| value.reduce(&[0], kind).unwrap(), input_type.clone(), &engine, mesh.clone()).unwrap();
             let input =
-                XlaArray::from_host_buffer(&engine, input_type, mesh.clone(), &values_to_bytes(&components)).unwrap();
+                Array::from_host_buffer(&engine, input_type, mesh.clone(), &values_to_bytes(&components)).unwrap();
             let output = engine.interpret(&compiled.executable_function(), input).unwrap();
             assert_eq!(read_f32_array(&client, &output), expected);
         }
@@ -2239,14 +2212,14 @@ mod tests {
             .client(ClientOptions::CPU(CpuClientOptions { device_count: Some(1), ..Default::default() }))
             .unwrap();
         let mesh = single_device_mesh(&client);
-        let engine = XlaSession::new(&client).domain();
+        let engine = Session::new(&client).domain();
 
-        let input_type = ArrayType::new(DataType::F32, Shape::new(vec![Dimension::Static(4)]))
+        let input_type = ArrayType::new(DataType::F32, Shape::new(vec![CoreDimension::Static(4)]))
             .with_sharding(Sharding::replicated(mesh.logical_mesh().clone(), 1))
             .unwrap();
         let values = [1.0f32, 2.0, 3.0, 4.0];
         let source = || {
-            XlaArray::from_host_buffer(
+            Array::from_host_buffer(
                 &engine,
                 input_type.clone(),
                 mesh.clone(),
@@ -2257,12 +2230,12 @@ mod tests {
 
         // The compiled `reduce_window` scan reproduces the exact prefix sums of the operand, and its reverse
         // direction the exact suffix sums.
-        let forward: CompiledXlaFunction<'_, ArrayType, ArrayType> =
+        let forward: CompiledFunction<'_, ArrayType, ArrayType> =
             compile(|x| x.cumulative_sum(0).unwrap(), input_type.clone(), &engine, mesh.clone()).unwrap();
         let output = engine.interpret(&forward.executable_function(), source()).unwrap();
         assert_eq!(read_f32_array(&client, &output), vec![1.0, 3.0, 6.0, 10.0]);
 
-        let reverse: CompiledXlaFunction<'_, ArrayType, ArrayType> =
+        let reverse: CompiledFunction<'_, ArrayType, ArrayType> =
             compile(|x| x.reverse_cumulative_sum(0).unwrap(), input_type.clone(), &engine, mesh.clone()).unwrap();
         let output = engine.interpret(&reverse.executable_function(), source()).unwrap();
         assert_eq!(read_f32_array(&client, &output), vec![10.0, 9.0, 7.0, 4.0]);
@@ -2270,14 +2243,14 @@ mod tests {
         // Reverse-mode differentiation through the compiled scan exercises the transposed direction end to end:
         // summing every prefix weights element `i` by the number of prefixes that contain it, so the gradient is
         // the reverse scan of ones.
-        let total: CompiledXlaFunction<'_, ArrayType, ArrayType> = compile(
+        let total: CompiledFunction<'_, ArrayType, ArrayType> = compile(
             |x| x.cumulative_sum(0).unwrap().reduce(&[0], ReductionKind::Sum).unwrap(),
             input_type.clone(),
             &engine,
             mesh.clone(),
         )
         .unwrap();
-        let gradient: CompiledXlaFunction<'_, ArrayType, ArrayType> = total.gradient(&engine).unwrap();
+        let gradient: CompiledFunction<'_, ArrayType, ArrayType> = total.gradient(&engine).unwrap();
         let output = engine.interpret(&gradient.executable_function(), source()).unwrap();
         assert_eq!(read_f32_array(&client, &output), vec![4.0, 3.0, 2.0, 1.0]);
     }
@@ -2286,25 +2259,24 @@ mod tests {
     fn test_compile_reduce_log_sum_exp_gradient() {
         let client = execution_client();
         let mesh = single_device_mesh(&client);
-        let engine = XlaSession::new(&client).domain();
+        let engine = Session::new(&client).domain();
         let input_type = ArrayType::new_static(DataType::F64, [2])
             .with_sharding(Sharding::replicated(mesh.logical_mesh().clone(), 1))
             .unwrap();
-        let compiled: CompiledXlaFunction<'_, ArrayType, ArrayType> =
+        let compiled: CompiledFunction<'_, ArrayType, ArrayType> =
             compile(|value| value.reduce_log_sum_exp(&[0]).unwrap(), input_type.clone(), &engine, mesh.clone())
                 .unwrap();
         let gradient = compiled.gradient(&engine).unwrap();
 
         // Rounding the primal output at a large offset must not erase the derivative's normalization.
         let input =
-            XlaArray::from_host_buffer(&engine, input_type.clone(), mesh.clone(), &values_to_bytes(&[1e20f64, 1e20]))
+            Array::from_host_buffer(&engine, input_type.clone(), mesh.clone(), &values_to_bytes(&[1e20f64, 1e20]))
                 .unwrap();
         let output = engine.interpret(&gradient.executable_function(), input).unwrap();
         assert_eq!(read_f32_array(&client, &output.convert_element_type(DataType::F32).unwrap()), vec![0.5, 0.5]);
 
         // The compiled finite-shift guard must retain the undefined weight at an infinite input.
-        let input =
-            XlaArray::from_host_buffer(&engine, input_type, mesh, &values_to_bytes(&[f64::INFINITY, 0.])).unwrap();
+        let input = Array::from_host_buffer(&engine, input_type, mesh, &values_to_bytes(&[f64::INFINITY, 0.])).unwrap();
         let output = engine.interpret(&gradient.executable_function(), input).unwrap();
         let values = read_f32_array(&client, &output.convert_element_type(DataType::F32).unwrap());
         assert!(values[0].is_nan());
@@ -2315,17 +2287,17 @@ mod tests {
     fn test_compile_reduce_log_sum_exp_narrow_jvp() {
         let client = execution_client();
         let mesh = single_device_mesh(&client);
-        let engine = XlaSession::new(&client).domain();
+        let engine = Session::new(&client).domain();
         let input_type = ArrayType::new_static(DataType::F16, [65536])
             .with_sharding(Sharding::replicated(mesh.logical_mesh().clone(), 1))
             .unwrap();
-        let compiled: CompiledXlaFunction<'_, ArrayType, ArrayType> =
+        let compiled: CompiledFunction<'_, ArrayType, ArrayType> =
             compile(|value| value.reduce_log_sum_exp(&[0]).unwrap(), input_type.clone(), &engine, mesh.clone())
                 .unwrap();
         let differentiated = compiled.jvp(&engine).unwrap();
         // The normalization count exceeds the largest finite `f16`, so derivative intermediates must stay widened.
         let input =
-            XlaArray::from_host_buffer(&engine, input_type, mesh, &values_to_bytes(&vec![0x3c00u16; 65536])).unwrap();
+            Array::from_host_buffer(&engine, input_type, mesh, &values_to_bytes(&vec![0x3c00u16; 65536])).unwrap();
         let (_, tangent) = engine.interpret(&differentiated.executable_function(), (input.clone(), input)).unwrap();
         assert_eq!(read_f32_array(&client, &tangent.convert_element_type(DataType::F32).unwrap()), vec![1.]);
     }
@@ -2337,13 +2309,13 @@ mod tests {
             .client(ClientOptions::CPU(CpuClientOptions { device_count: Some(1), ..Default::default() }))
             .unwrap();
         let mesh = single_device_mesh(&client);
-        let engine = XlaSession::new(&client).domain();
+        let engine = Session::new(&client).domain();
 
-        let input_type = ArrayType::new(DataType::F32, Shape::new(vec![Dimension::Static(4)]))
+        let input_type = ArrayType::new(DataType::F32, Shape::new(vec![CoreDimension::Static(4)]))
             .with_sharding(Sharding::replicated(mesh.logical_mesh().clone(), 1))
             .unwrap();
         let source = |values: [f32; 4]| {
-            XlaArray::from_host_buffer(
+            Array::from_host_buffer(
                 &engine,
                 input_type.clone(),
                 mesh.clone(),
@@ -2366,7 +2338,7 @@ mod tests {
 
         // The compiled guarded expansion returns `log(4)` for four equal zeros, and the same value shifted by the
         // maximum for four equal thousands, where a shift-free `sum(exp(x))` would have overflowed `f32` outright.
-        let reduced: CompiledXlaFunction<'_, ArrayType, ArrayType> =
+        let reduced: CompiledFunction<'_, ArrayType, ArrayType> =
             compile(|x| x.reduce_log_sum_exp(&[0]).unwrap(), input_type.clone(), &engine, mesh.clone()).unwrap();
         let output = engine.interpret(&reduced.executable_function(), source([0.0; 4])).unwrap();
         assert_close(&read_f32_array(&client, &output), &[4.0f32.ln()]);
@@ -2375,7 +2347,7 @@ mod tests {
 
         // The reverse prefix scan folds the pairwise stable `log_add_exp` over each suffix, so position `i` of an
         // all-zero operand holds `log(4 - i)` and the final position holds `log(1) = 0`.
-        let scanned: CompiledXlaFunction<'_, ArrayType, ArrayType> =
+        let scanned: CompiledFunction<'_, ArrayType, ArrayType> =
             compile(|x| x.reverse_cumulative_log_sum_exp(0).unwrap(), input_type.clone(), &engine, mesh.clone())
                 .unwrap();
         let output = engine.interpret(&scanned.executable_function(), source([0.0; 4])).unwrap();
@@ -2389,12 +2361,12 @@ mod tests {
             .client(ClientOptions::CPU(CpuClientOptions { device_count: Some(1), ..Default::default() }))
             .unwrap();
         let mesh = single_device_mesh(&client);
-        let domain = XlaSession::new(&client).domain();
+        let domain = Session::new(&client).domain();
         let input_type = ArrayType::scalar(DataType::F32)
             .with_sharding(Sharding::replicated(mesh.logical_mesh().clone(), 0))
             .unwrap();
 
-        let compiled: CompiledXlaFunction<'_, ArrayType, ArrayType> = compile(
+        let compiled: CompiledFunction<'_, ArrayType, ArrayType> = compile(
             |input| {
                 let input = input.into_value();
                 let reference = input.reference_new().unwrap();
@@ -2411,7 +2383,7 @@ mod tests {
         assert_eq!(executable.output_types(), &[input_type.clone()]);
 
         let input =
-            XlaArray::from_host_buffer(&domain, input_type, mesh, values_to_bytes::<f32>(&[3.0]).as_slice()).unwrap();
+            Array::from_host_buffer(&domain, input_type, mesh, values_to_bytes::<f32>(&[3.0]).as_slice()).unwrap();
         let output = domain.interpret(&executable, input).unwrap();
         assert_eq!(read_f32_array(&client, &output), vec![6.0]);
     }
@@ -2423,7 +2395,7 @@ mod tests {
             .client(ClientOptions::CPU(CpuClientOptions { device_count: Some(1), ..Default::default() }))
             .unwrap();
         let mesh = single_device_mesh(&client);
-        let domain = XlaSession::new(&client).domain();
+        let domain = Session::new(&client).domain();
         let input_type = ArrayType::scalar(DataType::F32)
             .with_sharding(Sharding::replicated(mesh.logical_mesh().clone(), 0))
             .unwrap();
@@ -2431,7 +2403,7 @@ mod tests {
         // The inner gradient differentiates reference contents at entry, while the outer compiled function returns
         // the scalar objective, the mutated primal state, and an ordinary gradient. Both local references discharge
         // before lowering, so the public executable retains its ordinary array boundary and placement metadata.
-        let compiled: CompiledXlaFunction<'_, ArrayType, (ArrayType, ArrayType, ArrayType)> = compile(
+        let compiled: CompiledFunction<'_, ArrayType, (ArrayType, ArrayType, ArrayType)> = compile(
             |input| {
                 let reference = input.into_value().reference_new().unwrap();
                 let (value, gradient) = differentiate_at(reference.clone())
@@ -2462,7 +2434,7 @@ mod tests {
         for (initial, expected_value, expected_state, expected_gradient) in
             [(3.0_f32, 36.0, 6.0, 24.0), (5.0, 100.0, 10.0, 40.0), (3.0, 36.0, 6.0, 24.0)]
         {
-            let input = XlaArray::from_host_buffer(
+            let input = Array::from_host_buffer(
                 &domain,
                 input_type.clone(),
                 mesh.clone(),
@@ -2483,18 +2455,18 @@ mod tests {
             .client(ClientOptions::CPU(CpuClientOptions { device_count: Some(1), ..Default::default() }))
             .unwrap();
         let mesh = single_device_mesh(&client);
-        let domain = XlaSession::new(&client).domain();
+        let domain = Session::new(&client).domain();
         for (length, nested) in [(3, false), (3, true), (256, false), (256, true)] {
-            let input_type = ArrayType::new(DataType::F32, Shape::new(vec![Dimension::Static(length)]));
+            let input_type = ArrayType::new(DataType::F32, Shape::new(vec![CoreDimension::Static(length)]));
             let reference_type = ArrayIrType::Reference(ReferenceType::new(input_type.clone()));
 
             // The callee captures the complete root and receives the scan index as an ordinary input. It forms its
             // scalar view locally, so no view crosses the call boundary. Capture 0 must still resolve to that same root
             // when reference discharge runs before compilation lifts the captured constant into an ordinary operand.
-            let mut builder = ProgramBuilder::<XlaConstant, XlaOperation>::new();
+            let mut builder = CoreProgramBuilder::<Constant, Operation>::new();
             builder.add_input(reference_type.clone());
             let index = builder.add_input(ArrayType::scalar(DataType::I64).into());
-            let root = builder.add_constant(XlaConstant::Captured(CaptureReference::new(0, reference_type.clone())));
+            let root = builder.add_constant(Constant::Captured(CaptureReference::new(0, reference_type.clone())));
             let current = builder
                 .add_instruction(
                     ReferenceReadOperation::new().with_transforms(vec![ArrayReferenceTransform::Index {
@@ -2529,9 +2501,9 @@ mod tests {
                 )
                 .unwrap()[0];
             let callee = builder
-                .build::<Vec<XlaConstant>, Vec<XlaConstant>>(vec![updated], vec![Placeholder; 2], vec![Placeholder])
+                .build::<Vec<Constant>, Vec<Constant>>(vec![updated], vec![Placeholder; 2], vec![Placeholder])
                 .unwrap();
-            let mut builder = ProgramBuilder::<XlaConstant, XlaOperation>::new();
+            let mut builder = CoreProgramBuilder::<Constant, Operation>::new();
             let index = builder.add_input(ArrayType::scalar(DataType::I64).into());
             let root = builder.add_input(ReferenceType::new(input_type.clone()).into());
             // Compare selection inside the call with the direct slice-sized discharge path.
@@ -2539,7 +2511,7 @@ mod tests {
                 let callee = builder.import_region(callee.entry_region_ref());
                 builder
                     .add_instruction(
-                        XlaOperation::JitCall(JitCallOperation::new(1)),
+                        Operation::JitCall(JitCallOperation::new(1)),
                         vec![callee],
                         vec![root, index],
                         None,
@@ -2583,18 +2555,18 @@ mod tests {
                     .to_vec()
             };
             let body = builder
-                .build::<Vec<XlaConstant>, Vec<XlaConstant>>(outputs, vec![Placeholder; 2], vec![Placeholder])
+                .build::<Vec<Constant>, Vec<Constant>>(outputs, vec![Placeholder; 2], vec![Placeholder])
                 .unwrap();
 
             // Discharge the source directly before compilation can lift captured constants into ordinary operands.
-            let mut builder = ProgramBuilder::<XlaConstant, XlaOperation>::new();
+            let mut builder = CoreProgramBuilder::<Constant, Operation>::new();
             let input = builder.add_input(input_type.clone().into());
             let reference =
                 builder.add_instruction(ReferenceNewOperation::new(), Vec::new(), vec![input], None).unwrap()[0];
             let body_region = builder.import_region(body.entry_region_ref());
             let outputs = builder
                 .add_instruction(
-                    XlaOperation::Scan(ScanOperation::new(0, length)),
+                    Operation::Scan(ScanOperation::new(0, length)),
                     vec![body_region],
                     vec![reference],
                     None,
@@ -2603,15 +2575,11 @@ mod tests {
             let frozen =
                 builder.add_instruction(ReferenceFreezeOperation::new(), Vec::new(), vec![reference], None).unwrap()[0];
             let source = builder
-                .build::<Vec<XlaConstant>, Vec<XlaConstant>>(
-                    vec![outputs, frozen],
-                    vec![Placeholder],
-                    vec![Placeholder; 2],
-                )
+                .build::<Vec<Constant>, Vec<Constant>>(vec![outputs, frozen], vec![Placeholder], vec![Placeholder; 2])
                 .unwrap();
             let program = source.discharge_references(0).unwrap().into_program_without_external_references().unwrap();
 
-            let compiled: CompiledXlaFunction<'_, ArrayType, (ArrayType, ArrayType)> = compile(
+            let compiled: CompiledFunction<'_, ArrayType, (ArrayType, ArrayType)> = compile(
                 |input| {
                     let input = input.into_value();
                     let outputs = program.interpret_in_context(input.context(), vec![input.clone()]).unwrap();
@@ -2629,13 +2597,9 @@ mod tests {
             // A larger root exercises repeated updates through the same compiled loop and nested call.
             let values = (1..=length).map(|value| value as f32).collect::<Vec<_>>();
             let expected = values.iter().map(|value| value * 2.0).collect::<Vec<_>>();
-            let input = XlaArray::from_host_buffer(
-                &domain,
-                input_type,
-                mesh.clone(),
-                values_to_bytes::<f32>(&values).as_slice(),
-            )
-            .unwrap();
+            let input =
+                Array::from_host_buffer(&domain, input_type, mesh.clone(), values_to_bytes::<f32>(&values).as_slice())
+                    .unwrap();
             let (outputs, frozen) = domain.interpret(&compiled.executable_function(), input).unwrap();
             assert_eq!(read_f32_array(&client, &outputs), expected);
             assert_eq!(read_f32_array(&client, &frozen), expected);
@@ -2649,7 +2613,7 @@ mod tests {
             .client(ClientOptions::CPU(CpuClientOptions { device_count: Some(1), ..Default::default() }))
             .unwrap();
         let mesh = single_device_mesh(&client);
-        let domain = XlaSession::new(&client).domain();
+        let domain = Session::new(&client).domain();
         let array_type = ArrayType::scalar(DataType::F32);
         let reference_type = ArrayIrType::Reference(ReferenceType::new(array_type.clone()));
         let compiled = compile_statefully::<_, (ArrayIrType, ArrayIrType), ArrayIrType>(
@@ -2659,25 +2623,22 @@ mod tests {
             },
             (reference_type, ArrayIrType::Array(array_type.clone())),
             &domain,
-            XlaOptions::new(mesh.clone()),
+            Options::new(mesh.clone()),
         )
         .unwrap();
         let initial =
-            XlaArray::from_host_buffer(&domain, array_type.clone(), mesh.clone(), 1.0f32.to_ne_bytes().as_slice())
+            Array::from_host_buffer(&domain, array_type.clone(), mesh.clone(), 1.0f32.to_ne_bytes().as_slice())
                 .unwrap();
         assert!(initial.r#type().sharding().is_some());
         let reference = ArrayReference::new(initial);
         let retained_snapshot = reference.read().unwrap();
         let rejected_update =
-            XlaArray::from_host_buffer(&domain, array_type.clone(), mesh.clone(), 2.0f32.to_ne_bytes().as_slice())
+            Array::from_host_buffer(&domain, array_type.clone(), mesh.clone(), 2.0f32.to_ne_bytes().as_slice())
                 .unwrap();
         assert!(matches!(
             compiled.executable_function().execute(
                 &domain,
-                (
-                    XlaValue::Reference(XlaReference::new(reference.clone(), domain.clone())),
-                    XlaValue::Array(rejected_update),
-                )
+                (Value::Reference(Reference::new(reference.clone(), domain.clone())), Value::Array(rejected_update),)
             ),
             Err(Error::Execution(ExecutionError::StatefulInvocationRequired)),
         ));
@@ -2685,18 +2646,15 @@ mod tests {
 
         for expected in [3.0f32, 5.0] {
             let update =
-                XlaArray::from_host_buffer(&domain, array_type.clone(), mesh.clone(), 2.0f32.to_ne_bytes().as_slice())
+                Array::from_host_buffer(&domain, array_type.clone(), mesh.clone(), 2.0f32.to_ne_bytes().as_slice())
                     .unwrap();
             let output = compiled
                 .call_statefully(
                     &domain,
-                    (
-                        XlaValue::Reference(XlaReference::new(reference.clone(), domain.clone())),
-                        XlaValue::Array(update),
-                    ),
+                    (Value::Reference(Reference::new(reference.clone(), domain.clone())), Value::Array(update)),
                 )
                 .unwrap();
-            let XlaValue::Array(output) = output else { panic!("stateful public output must be an array") };
+            let Value::Array(output) = output else { panic!("stateful public output must be an array") };
             assert_eq!(read_f32_array(&client, &output), vec![expected]);
             assert_eq!(read_f32_array(&client, &reference.read().unwrap()), vec![expected]);
         }
@@ -2709,9 +2667,9 @@ mod tests {
     fn accumulate_and_read_program(
         reference_type: &ArrayIrType,
         array_type: &ArrayType,
-    ) -> ryft_core::Program<XlaConstant, XlaOperation, Vec<XlaConstant>, Vec<XlaConstant>> {
-        let (_, program) = <XlaDomain<'_>>::trace(
-            |(reference, update): (DomainTracer<XlaDomain<'_>>, DomainTracer<XlaDomain<'_>>)| {
+    ) -> ryft_core::Program<Constant, Operation, Vec<Constant>, Vec<Constant>> {
+        let (_, program) = <Domain<'_>>::trace(
+            |(reference, update): (DomainTracer<Domain<'_>>, DomainTracer<Domain<'_>>)| {
                 reference.add_update(&update)?;
                 reference.read()
             },
@@ -2728,7 +2686,7 @@ mod tests {
             .client(ClientOptions::CPU(CpuClientOptions { device_count: Some(1), ..Default::default() }))
             .unwrap();
         let mesh = single_device_mesh(&client);
-        let domain = XlaSession::new(&client).domain();
+        let domain = Session::new(&client).domain();
         let array_type = ArrayType::scalar(DataType::F32);
         let reference_type = ArrayIrType::Reference(ReferenceType::new(array_type.clone()));
 
@@ -2762,15 +2720,14 @@ mod tests {
                     ArrayIrType::Array(array_type.clone()),
                 ),
                 &domain,
-                XlaOptions::new(mesh.clone()),
+                Options::new(mesh.clone()),
             )
             .unwrap();
 
         // Both references are committed after the call: the primal holder accumulates the update and the tangent
         // holder accumulates the tangent update, and the outputs read the committed states.
         let scalar = |value: f32| {
-            XlaArray::from_host_buffer(&domain, array_type.clone(), mesh.clone(), value.to_ne_bytes().as_slice())
-                .unwrap()
+            Array::from_host_buffer(&domain, array_type.clone(), mesh.clone(), value.to_ne_bytes().as_slice()).unwrap()
         };
         let reference = ArrayReference::new(scalar(1.0));
         let tangent_reference = ArrayReference::new(scalar(10.0));
@@ -2778,15 +2735,15 @@ mod tests {
             .call_statefully(
                 &domain,
                 (
-                    XlaValue::Reference(XlaReference::new(reference.clone(), domain.clone())),
-                    XlaValue::Array(scalar(3.0)),
-                    XlaValue::Reference(XlaReference::new(tangent_reference.clone(), domain.clone())),
-                    XlaValue::Array(scalar(100.0)),
+                    Value::Reference(Reference::new(reference.clone(), domain.clone())),
+                    Value::Array(scalar(3.0)),
+                    Value::Reference(Reference::new(tangent_reference.clone(), domain.clone())),
+                    Value::Array(scalar(100.0)),
                 ),
             )
             .unwrap();
-        let XlaValue::Array(primal) = primal else { panic!("stateful primal output must be an array") };
-        let XlaValue::Array(tangent) = tangent else { panic!("stateful tangent output must be an array") };
+        let Value::Array(primal) = primal else { panic!("stateful primal output must be an array") };
+        let Value::Array(tangent) = tangent else { panic!("stateful tangent output must be an array") };
         assert_eq!(read_f32_array(&client, &primal), vec![4.0]);
         assert_eq!(read_f32_array(&client, &tangent), vec![110.0]);
         assert_eq!(read_f32_array(&client, &reference.read().unwrap()), vec![4.0]);
@@ -2800,7 +2757,7 @@ mod tests {
             .client(ClientOptions::CPU(CpuClientOptions { device_count: Some(1), ..Default::default() }))
             .unwrap();
         let mesh = single_device_mesh(&client);
-        let domain = XlaSession::new(&client).domain();
+        let domain = Session::new(&client).domain();
         let array_type = ArrayType::scalar(DataType::F32);
         let reference_type = ArrayIrType::Reference(ReferenceType::new(array_type.clone()));
 
@@ -2828,27 +2785,26 @@ mod tests {
             },
             (reference_type, ArrayIrType::Array(array_type.clone())),
             &domain,
-            XlaOptions::new(mesh.clone()),
+            Options::new(mesh.clone()),
         )
         .unwrap();
 
         // The read accumulates `ȳ` into the destination and the accumulation hands the accumulated cotangent to `x̄`
         // while leaving the destination unchanged, so both end at `5 + 2`.
         let scalar = |value: f32| {
-            XlaArray::from_host_buffer(&domain, array_type.clone(), mesh.clone(), value.to_ne_bytes().as_slice())
-                .unwrap()
+            Array::from_host_buffer(&domain, array_type.clone(), mesh.clone(), value.to_ne_bytes().as_slice()).unwrap()
         };
         let cotangent_reference = ArrayReference::new(scalar(5.0));
         let input_cotangent = compiled
             .call_statefully(
                 &domain,
                 (
-                    XlaValue::Reference(XlaReference::new(cotangent_reference.clone(), domain.clone())),
-                    XlaValue::Array(scalar(2.0)),
+                    Value::Reference(Reference::new(cotangent_reference.clone(), domain.clone())),
+                    Value::Array(scalar(2.0)),
                 ),
             )
             .unwrap();
-        let XlaValue::Array(input_cotangent) = input_cotangent else {
+        let Value::Array(input_cotangent) = input_cotangent else {
             panic!("stateful cotangent output must be an array")
         };
         assert_eq!(read_f32_array(&client, &input_cotangent), vec![7.0]);
@@ -2856,7 +2812,7 @@ mod tests {
     }
 
     #[test]
-    fn test_array_ir_value_and_gradient_with_captures_on_the_xla_domain() {
+    fn test_array_ir_value_and_gradient_with_captures_on_the_domain() {
         use ryft_core::Add;
 
         // Array IR tracers dispatch `add` and `dot` through the array-IR capability universe without projecting to
@@ -2866,13 +2822,13 @@ mod tests {
             .client(ClientOptions::CPU(CpuClientOptions { device_count: Some(1), ..Default::default() }))
             .unwrap();
         let mesh = single_device_mesh(&client);
-        let domain = XlaSession::new(&client).domain();
+        let domain = Session::new(&client).domain();
         let array_type = ArrayType::new_static(DataType::F32, [2])
             .with_sharding(Sharding::replicated(mesh.logical_mesh().clone(), 1))
             .unwrap();
         let vector = |values: &[f32]| {
-            XlaValue::Array(
-                XlaArray::from_host_buffer(
+            Value::Array(
+                Array::from_host_buffer(
                     &domain,
                     array_type.clone(),
                     mesh.clone(),
@@ -2881,9 +2837,8 @@ mod tests {
                 .unwrap(),
             )
         };
-        let read = |value: XlaValue<'_>| {
-            read_f32_array(&client, &ValueProjection::<ArrayType>::into_projected(value).unwrap())
-        };
+        let read =
+            |value: Value<'_>| read_f32_array(&client, &ValueProjection::<ArrayType>::into_projected(value).unwrap());
         let (value, gradient) = domain
             .differentiate_at(vector(&[1.0, 2.0]))
             .with_captures(vector(&[3.0, 4.0]))
@@ -2894,7 +2849,7 @@ mod tests {
     }
 
     #[test]
-    fn test_rematerialized_function_differentiates_on_the_xla_domain() {
+    fn test_rematerialized_function_differentiates_on_the_domain() {
         use ryft_core::{DotsSavable, ResidualPolicy, SaveAndOffloadOnlyTheseNames, Tag, rematerialize};
 
         // `x ↦ sin(tag(x · x, "dot"))` executes its value and gradient on the XLA domain under a policy that saves the
@@ -2905,28 +2860,28 @@ mod tests {
             .client(ClientOptions::CPU(CpuClientOptions { device_count: Some(1), ..Default::default() }))
             .unwrap();
         let mesh = single_device_mesh(&client);
-        let domain = XlaSession::new(&client).domain();
+        let domain = Session::new(&client).domain();
         let array_type = ArrayType::new_static(DataType::F32, [3])
             .with_sharding(Sharding::replicated(mesh.logical_mesh().clone(), 1))
             .unwrap();
         let values = [0.1f32, 0.2, 0.3];
         let dot = values.iter().map(|value| value * value).sum::<f32>();
-        type Tracer<'c> = DomainTracer<XlaDomain<'c>>;
-        fn sine_of_dot(x: Tracer<'_>) -> Result<Tracer<'_>, ProgramError> {
+        type ProgramTracer<'c> = DomainTracer<Domain<'c>>;
+        fn sine_of_dot(x: ProgramTracer<'_>) -> Result<ProgramTracer<'_>, ProgramError> {
             let x = ValueProjection::<ArrayType>::into_projected(x)?;
             let dot = x.dot(&x, &DotDimensionNumbers::new(vec![0], vec![0], vec![], vec![]))?.tag("dot")?;
             Ok(dot.sin()?.into_value())
         }
         fn value_and_gradient<'c, P: Clone + ResidualPolicy<ArrayIrType>>(
-            domain: &XlaDomain<'c>,
-            input: XlaArray<'c>,
+            domain: &Domain<'c>,
+            input: Array<'c>,
             policy: P,
-        ) -> (XlaValue<'c>, XlaValue<'c>) {
+        ) -> (Value<'c>, Value<'c>) {
             let function = rematerialize(sine_of_dot).with_policy(policy);
-            domain.differentiate_at(XlaValue::Array(input)).value_and_gradient(|x| function.call(x)).unwrap()
+            domain.differentiate_at(Value::Array(input)).value_and_gradient(|x| function.call(x)).unwrap()
         }
         let input = || {
-            XlaArray::from_host_buffer(
+            Array::from_host_buffer(
                 &domain,
                 array_type.clone(),
                 mesh.clone(),
@@ -2939,7 +2894,7 @@ mod tests {
             [value_and_gradient(&domain, input(), DotsSavable), value_and_gradient(&domain, input(), offload.unwrap())]
         {
             // XLA's elementary functions may differ from the host ones in the last bit.
-            let assert_close = |actual: XlaValue<'_>, expected: Vec<f32>| {
+            let assert_close = |actual: Value<'_>, expected: Vec<f32>| {
                 let actual = read_f32_array(&client, &ValueProjection::<ArrayType>::into_projected(actual).unwrap());
                 assert!(actual.iter().zip(&expected).all(|(actual, expected)| (actual - expected).abs() < 1e-6));
                 assert_eq!(actual.len(), expected.len());
@@ -2958,20 +2913,20 @@ mod tests {
             .client(ClientOptions::CPU(CpuClientOptions { device_count: Some(1), ..Default::default() }))
             .unwrap();
         let mesh = single_device_mesh(&client);
-        let domain = XlaSession::new(&client).domain();
+        let domain = Session::new(&client).domain();
         let array_type = ArrayType::new_static(DataType::F32, [4]);
 
         // `x ↦ x[1]`, whose accumulating backward rule adds its seed to only the affected entry of the caller buffer.
         // The compiled pullback therefore updates the buffer in place, without a full-sized cotangent temporary.
-        type Tracer<'c> = DomainTracer<XlaDomain<'c>>;
-        let element = |x: &Tracer<'_>| -> Result<Tracer<'_>, ProgramError> {
+        type ProgramTracer<'c> = DomainTracer<Domain<'c>>;
+        let element = |x: &ProgramTracer<'_>| -> Result<ProgramTracer<'_>, ProgramError> {
             Ok(ValueProjection::<ArrayType>::into_projected(x.clone())?.slice(&[1], &[2usize], &[1])?.into_value())
         };
-        let function = composite(move |x: Tracer<'_>| element(&x)).with_accumulating_vjp(
-            move |x: Tracer<'_>| Ok((element(&x)?, ())),
-            |context: &mut TranspositionContext<XlaConstant, XlaOperation>,
+        let function = composite(move |x: ProgramTracer<'_>| element(&x)).with_accumulating_vjp(
+            move |x: ProgramTracer<'_>| Ok((element(&x)?, ())),
+            |context: &mut TranspositionContext<Constant, Operation>,
              (): (),
-             seed: MaybeZero<Tracer<'_>>,
+             seed: MaybeZero<ProgramTracer<'_>>,
              accumulator: CotangentAccumulator| {
                 let (MaybeZero::Value(seed), Some(buffer)) = (seed, accumulator.reference(context)?) else {
                     return Err(ProgramError::InvalidArgument { message: "expected a caller buffer".to_string() });
@@ -2982,9 +2937,9 @@ mod tests {
             },
         );
         let array = |r#type: &ArrayType, values: &[f32]| {
-            XlaArray::from_host_buffer(&domain, r#type.clone(), mesh.clone(), values_to_bytes::<f32>(values)).unwrap()
+            Array::from_host_buffer(&domain, r#type.clone(), mesh.clone(), values_to_bytes::<f32>(values)).unwrap()
         };
-        let input = XlaValue::Array(array(&array_type, &[1.0, 2.0, 3.0, 4.0]));
+        let input = Value::Array(array(&array_type, &[1.0, 2.0, 3.0, 4.0]));
         let (_, pullback) = domain.differentiate_at(input).vjp(|x| function.call(x)).unwrap();
         assert!(pullback.residuals().is_empty());
         let pullback = pullback.transposed_program(&[CotangentDestinationKind::Reference]).unwrap().into_program();
@@ -3008,7 +2963,7 @@ mod tests {
             },
             (buffer_type, seed_type),
             &domain,
-            XlaOptions::new(mesh.clone()),
+            Options::new(mesh.clone()),
         )
         .unwrap();
         let buffer = ArrayReference::new(array(&array_type, &[1.0, 1.0, 1.0, 1.0]));
@@ -3016,8 +2971,8 @@ mod tests {
             .call_statefully(
                 &domain,
                 (
-                    XlaValue::Reference(XlaReference::new(buffer.clone(), domain.clone())),
-                    XlaValue::Array(array(&ArrayType::new_static(DataType::F32, [1]), &[5.0])),
+                    Value::Reference(Reference::new(buffer.clone(), domain.clone())),
+                    Value::Array(array(&ArrayType::new_static(DataType::F32, [1]), &[5.0])),
                 ),
             )
             .unwrap();
@@ -3031,7 +2986,7 @@ mod tests {
             .client(ClientOptions::CPU(CpuClientOptions { device_count: Some(1), ..Default::default() }))
             .unwrap();
         let mesh = single_device_mesh(&client);
-        let domain = XlaSession::new(&client).domain();
+        let domain = Session::new(&client).domain();
         let array_type = ArrayType::scalar(DataType::F32);
 
         // A reference allocated inside the program has no host identity the ABI could hand back.
@@ -3039,7 +2994,7 @@ mod tests {
             |input| input.reference_new().map_err(Into::into),
             ArrayIrType::Array(array_type.clone()),
             &domain,
-            XlaOptions::new(mesh.clone()),
+            Options::new(mesh.clone()),
         )
         .err()
         .unwrap();
@@ -3056,7 +3011,7 @@ mod tests {
             Ok,
             ArrayIrType::Reference(ReferenceType::new(array_type)),
             &domain,
-            XlaOptions::new(mesh),
+            Options::new(mesh),
         )
         .err()
         .unwrap();
@@ -3075,26 +3030,26 @@ mod tests {
             .client(ClientOptions::CPU(CpuClientOptions { device_count: Some(1), ..Default::default() }))
             .unwrap();
         let mesh = single_device_mesh(&client);
-        let domain = XlaSession::new(&client).domain();
+        let domain = Session::new(&client).domain();
         let array_type = ArrayType::scalar(DataType::F32)
             .with_sharding(Sharding::replicated(mesh.logical_mesh().clone(), 0))
             .unwrap();
 
         fn allocate_reference<'c>(
-            _: Vec<XlaConstant>,
-            _: Vec<XlaStatefulCompileTracer<'c>>,
-            input: XlaStatefulCompileTracer<'c>,
-        ) -> Result<XlaStatefulCompileTracer<'c>, Error> {
+            _: Vec<Constant>,
+            _: Vec<StatefulCompileTracer<'c>>,
+            input: StatefulCompileTracer<'c>,
+        ) -> Result<StatefulCompileTracer<'c>, Error> {
             input.reference_new().map_err(Into::into)
         }
 
         // The stateful XLA ABI only restricts the outputs of a lowered program, so a function that returns a reference
         // stages successfully and is rejected when it is lowered on its own.
-        let staged = StagedFunction::<XlaDomain<'_>, ArrayIrType, ArrayIrType>::stage(
+        let staged = CoreStagedFunction::<Domain<'_>, ArrayIrType, ArrayIrType>::stage(
             allocate_reference,
             Vec::new(),
             ArrayIrType::Array(array_type),
-            XlaOptions::new(mesh),
+            Options::new(mesh),
         )
         .unwrap();
         let error = staged.lower(&domain).err().unwrap();
@@ -3110,17 +3065,16 @@ mod tests {
     fn test_staged_function_explicit_context_calls_without_input_leaves() {
         let client = execution_client();
         let mesh = single_device_mesh(&client);
-        let domain = XlaSession::new(&client).domain();
+        let domain = Session::new(&client).domain();
         let array_type = ArrayType::scalar(DataType::F32);
-        let capture = XlaValue::Array(
-            XlaArray::from_host_buffer(&domain, array_type.clone(), mesh.clone(), 7f32.to_ne_bytes().as_slice())
-                .unwrap(),
+        let capture = Value::Array(
+            Array::from_host_buffer(&domain, array_type.clone(), mesh.clone(), 7f32.to_ne_bytes().as_slice()).unwrap(),
         );
-        let inner = StagedFunction::<XlaDomain<'_>, (), ArrayIrType>::stage(
+        let inner = CoreStagedFunction::<Domain<'_>, (), ArrayIrType>::stage(
             |_, mut captures, ()| Ok(captures.remove(0)),
             vec![capture.clone()],
             (),
-            XlaOptions::new(mesh.clone()),
+            Options::new(mesh.clone()),
         )
         .unwrap();
         assert_eq!(
@@ -3130,15 +3084,15 @@ mod tests {
                 in (%0)"},
         );
 
-        let outer = StagedFunction::<XlaDomain<'_>, ArrayIrType, (ArrayIrType, ArrayIrType)>::stage(
+        let outer = CoreStagedFunction::<Domain<'_>, ArrayIrType, (ArrayIrType, ArrayIrType)>::stage(
             |capture_references, _, input| {
                 // Capture metadata cannot recover the enclosing trace when the callee has no public input leaves.
                 assert!(matches!(
-                    inner.call::<XlaStatefulCompileTracer<'_>>(()),
+                    inner.call::<StatefulCompileTracer<'_>>(()),
                     Err(ProgramError::InvalidInputCount { expected: 1, actual: 0 }),
                 ));
                 assert!(matches!(
-                    inner.call_flat_with_capture_references::<XlaStatefulCompileTracer<'_>>(
+                    inner.call_flat_with_capture_references::<StatefulCompileTracer<'_>>(
                         &capture_references,
                         Vec::new(),
                     ),
@@ -3152,15 +3106,13 @@ mod tests {
             },
             vec![capture],
             ArrayIrType::Array(array_type.clone()),
-            XlaOptions::new(mesh.clone()),
+            Options::new(mesh.clone()),
         )
         .unwrap();
         let compiled = outer.lower(&domain).unwrap().compile(&domain).unwrap();
-        let input = XlaValue::Array(
-            XlaArray::from_host_buffer(&domain, array_type, mesh, 1f32.to_ne_bytes().as_slice()).unwrap(),
-        );
-        let (XlaValue::Array(typed), XlaValue::Array(flat)) = compiled.executable().execute(&domain, input).unwrap()
-        else {
+        let input =
+            Value::Array(Array::from_host_buffer(&domain, array_type, mesh, 1f32.to_ne_bytes().as_slice()).unwrap());
+        let (Value::Array(typed), Value::Array(flat)) = compiled.executable().execute(&domain, input).unwrap() else {
             panic!("capture-only calls must return arrays");
         };
         assert_eq!(read_f32_array(&client, &typed), vec![7.0]);
@@ -3174,43 +3126,43 @@ mod tests {
             .client(ClientOptions::CPU(CpuClientOptions { device_count: Some(1), ..Default::default() }))
             .unwrap();
         let mesh = single_device_mesh(&client);
-        let domain = XlaSession::new(&client).domain();
+        let domain = Session::new(&client).domain();
         let array_type = ArrayType::scalar(DataType::F32)
             .with_sharding(Sharding::replicated(mesh.logical_mesh().clone(), 0))
             .unwrap();
         let reference_type = ArrayIrType::Reference(ReferenceType::new(array_type.clone()));
 
         fn forward<'c>(
-            _: Vec<XlaConstant>,
-            _: Vec<XlaStatefulCompileTracer<'c>>,
-            input: XlaStatefulCompileTracer<'c>,
-        ) -> Result<XlaStatefulCompileTracer<'c>, Error> {
+            _: Vec<Constant>,
+            _: Vec<StatefulCompileTracer<'c>>,
+            input: StatefulCompileTracer<'c>,
+        ) -> Result<StatefulCompileTracer<'c>, Error> {
             Ok(input)
         }
 
         // A nested call may return the external reference that it receives, because that reference never crosses the
         // ABI as an output of the enclosing program.
-        let inner = StagedFunction::<XlaDomain<'_>, ArrayIrType, ArrayIrType>::stage(
+        let inner = CoreStagedFunction::<Domain<'_>, ArrayIrType, ArrayIrType>::stage(
             forward,
             Vec::new(),
             reference_type.clone(),
-            XlaOptions::new(mesh.clone()),
+            Options::new(mesh.clone()),
         )
         .unwrap();
         let outer = compile_statefully::<_, ArrayIrType, ArrayIrType>(
             move |reference| inner.call(reference)?.read().map_err(Into::into),
             reference_type,
             &domain,
-            XlaOptions::new(mesh.clone()),
+            Options::new(mesh.clone()),
         )
         .unwrap();
         let reference = ArrayReference::new(
-            XlaArray::from_host_buffer(&domain, array_type, mesh, 7.0f32.to_ne_bytes().as_slice()).unwrap(),
+            Array::from_host_buffer(&domain, array_type, mesh, 7.0f32.to_ne_bytes().as_slice()).unwrap(),
         );
         let output = outer
-            .call_statefully(&domain, XlaValue::Reference(XlaReference::new(reference.clone(), domain.clone())))
+            .call_statefully(&domain, Value::Reference(Reference::new(reference.clone(), domain.clone())))
             .unwrap();
-        let XlaValue::Array(output) = output else { panic!("stateful public output must be an array") };
+        let Value::Array(output) = output else { panic!("stateful public output must be an array") };
         assert_eq!(read_f32_array(&client, &output), vec![7.0]);
         assert_eq!(read_f32_array(&client, &reference.read().unwrap()), vec![7.0]);
     }
@@ -3222,33 +3174,33 @@ mod tests {
             .client(ClientOptions::CPU(CpuClientOptions { device_count: Some(1), ..Default::default() }))
             .unwrap();
         let mesh = single_device_mesh(&client);
-        let domain = XlaSession::new(&client).domain();
+        let domain = Session::new(&client).domain();
         let array_type = ArrayType::scalar(DataType::F32)
             .with_sharding(Sharding::replicated(mesh.logical_mesh().clone(), 0))
             .unwrap();
 
         fn allocate_reference<'c>(
-            _: Vec<XlaConstant>,
-            _: Vec<XlaStatefulCompileTracer<'c>>,
-            input: XlaStatefulCompileTracer<'c>,
-        ) -> Result<XlaStatefulCompileTracer<'c>, Error> {
+            _: Vec<Constant>,
+            _: Vec<StatefulCompileTracer<'c>>,
+            input: StatefulCompileTracer<'c>,
+        ) -> Result<StatefulCompileTracer<'c>, Error> {
             input.reference_new().map_err(Into::into)
         }
 
         // A reference that a nested call allocates has no caller allocation that could receive it, so embedding the
         // call is rejected with a diagnostic that names the offending output.
-        let inner = StagedFunction::<XlaDomain<'_>, ArrayIrType, ArrayIrType>::stage(
+        let inner = CoreStagedFunction::<Domain<'_>, ArrayIrType, ArrayIrType>::stage(
             allocate_reference,
             Vec::new(),
             ArrayIrType::Array(array_type.clone()),
-            XlaOptions::new(mesh.clone()),
+            Options::new(mesh.clone()),
         )
         .unwrap();
         let error = compile_statefully::<_, ArrayIrType, ArrayIrType>(
             move |input| inner.call(input)?.freeze().map_err(Into::into),
             ArrayIrType::Array(array_type),
             &domain,
-            XlaOptions::new(mesh),
+            Options::new(mesh),
         )
         .err()
         .unwrap();
@@ -3268,7 +3220,7 @@ mod tests {
             .client(ClientOptions::CPU(CpuClientOptions { device_count: Some(1), ..Default::default() }))
             .unwrap();
         let mesh = single_device_mesh(&client);
-        let domain = XlaSession::new(&client).domain();
+        let domain = Session::new(&client).domain();
         let array_type = ArrayType::scalar(DataType::F32)
             .with_sharding(Sharding::replicated(mesh.logical_mesh().clone(), 0))
             .unwrap();
@@ -3279,13 +3231,13 @@ mod tests {
             },
             ArrayIrType::Array(array_type.clone()),
             &domain,
-            XlaOptions::new(mesh.clone()),
+            Options::new(mesh.clone()),
         )
         .unwrap();
-        let input = XlaArray::from_host_buffer(&domain, array_type, mesh, 3.0f32.to_ne_bytes().as_slice()).unwrap();
+        let input = Array::from_host_buffer(&domain, array_type, mesh, 3.0f32.to_ne_bytes().as_slice()).unwrap();
 
-        let output = compiled.call_statefully(&domain, XlaValue::Array(input)).unwrap();
-        let XlaValue::Array(output) = output else { panic!("stateful all-array output must be an array") };
+        let output = compiled.call_statefully(&domain, Value::Array(input)).unwrap();
+        let Value::Array(output) = output else { panic!("stateful all-array output must be an array") };
         assert_eq!(read_f32_array(&client, &output), vec![6.0]);
     }
 
@@ -3299,7 +3251,7 @@ mod tests {
             .client(ClientOptions::CPU(CpuClientOptions { device_count: Some(1), ..Default::default() }))
             .unwrap();
         let mesh = single_device_mesh(&client);
-        let domain = XlaSession::new(&client).domain();
+        let domain = Session::new(&client).domain();
         let array_type = ArrayType::scalar(DataType::F32)
             .with_sharding(Sharding::replicated(mesh.logical_mesh().clone(), 0))
             .unwrap();
@@ -3310,13 +3262,13 @@ mod tests {
             },
             ArrayIrType::Array(array_type.clone()),
             &domain,
-            XlaOptions::new(mesh.clone()),
+            Options::new(mesh.clone()),
         )
         .unwrap();
-        let input = XlaArray::from_host_buffer(&domain, array_type, mesh, 3.0f32.to_ne_bytes().as_slice()).unwrap();
+        let input = Array::from_host_buffer(&domain, array_type, mesh, 3.0f32.to_ne_bytes().as_slice()).unwrap();
 
-        let output = compiled.call_statefully_async(&domain, XlaValue::Array(input)).r#await().unwrap();
-        let XlaValue::Array(output) = output else { panic!("stateful all-array output must be an array") };
+        let output = compiled.call_statefully_async(&domain, Value::Array(input)).r#await().unwrap();
+        let Value::Array(output) = output else { panic!("stateful all-array output must be an array") };
         assert_eq!(read_f32_array(&client, &output), vec![6.0]);
     }
 
@@ -3327,7 +3279,7 @@ mod tests {
             .client(ClientOptions::CPU(CpuClientOptions { device_count: Some(1), ..Default::default() }))
             .unwrap();
         let mesh = single_device_mesh(&client);
-        let domain = XlaSession::new(&client).domain();
+        let domain = Session::new(&client).domain();
         let array_type = ArrayType::scalar(DataType::F32)
             .with_sharding(Sharding::replicated(mesh.logical_mesh().clone(), 0))
             .unwrap();
@@ -3335,17 +3287,17 @@ mod tests {
             |reference| reference.read().map_err(Into::into),
             ArrayIrType::Reference(ReferenceType::new(array_type.clone())),
             &domain,
-            XlaOptions::new(mesh.clone()),
+            Options::new(mesh.clone()),
         )
         .unwrap();
         let reference = ArrayReference::new(
-            XlaArray::from_host_buffer(&domain, array_type, mesh, 7.0f32.to_ne_bytes().as_slice()).unwrap(),
+            Array::from_host_buffer(&domain, array_type, mesh, 7.0f32.to_ne_bytes().as_slice()).unwrap(),
         );
         for _ in 0..2 {
             let output = compiled
-                .call_statefully(&domain, XlaValue::Reference(XlaReference::new(reference.clone(), domain.clone())))
+                .call_statefully(&domain, Value::Reference(Reference::new(reference.clone(), domain.clone())))
                 .unwrap();
-            let XlaValue::Array(output) = output else { panic!("stateful public output must be an array") };
+            let Value::Array(output) = output else { panic!("stateful public output must be an array") };
             assert_eq!(read_f32_array(&client, &output), vec![7.0]);
             assert_eq!(read_f32_array(&client, &reference.read().unwrap()), vec![7.0]);
         }
@@ -3358,7 +3310,7 @@ mod tests {
             .client(ClientOptions::CPU(CpuClientOptions { device_count: Some(1), ..Default::default() }))
             .unwrap();
         let mesh = single_device_mesh(&client);
-        let domain = XlaSession::new(&client).domain();
+        let domain = Session::new(&client).domain();
         let array_type = ArrayType::scalar(DataType::F32)
             .with_sharding(Sharding::replicated(mesh.logical_mesh().clone(), 0))
             .unwrap();
@@ -3366,16 +3318,16 @@ mod tests {
             |reference| reference.read().map_err(Into::into),
             ArrayIrType::Reference(ReferenceType::new(array_type.clone())),
             &domain,
-            XlaOptions::new(mesh.clone()),
+            Options::new(mesh.clone()),
         )
         .unwrap();
 
         // A stateful compilation produces an ordinary runtime executable over the same flat signature, so the
         // array-only asynchronous entry point is reachable and must refuse the holder transaction up front rather
         // than enqueueing an execution whose hidden final-state outputs nothing would publish.
-        let executable: ExecutableXlaFunction<'_, ArrayType, ArrayType> =
-            ExecutableXlaFunction { function: compiled.executable_function().clone() };
-        let input = XlaArray::from_host_buffer(&domain, array_type, mesh, 7.0f32.to_ne_bytes().as_slice()).unwrap();
+        let executable: ExecutableFunction<'_, ArrayType, ArrayType> =
+            ExecutableFunction { function: compiled.executable_function().clone() };
+        let input = Array::from_host_buffer(&domain, array_type, mesh, 7.0f32.to_ne_bytes().as_slice()).unwrap();
         assert!(matches!(
             domain.interpret_async(&executable, input),
             Err(Error::Execution(ExecutionError::StatefulInvocationRequired)),
@@ -3389,7 +3341,7 @@ mod tests {
             .client(ClientOptions::CPU(CpuClientOptions { device_count: Some(1), ..Default::default() }))
             .unwrap();
         let mesh = single_device_mesh(&client);
-        let domain = XlaSession::new(&client).domain();
+        let domain = Session::new(&client).domain();
         let array_type = ArrayType::scalar(DataType::F32)
             .with_sharding(Sharding::replicated(mesh.logical_mesh().clone(), 0))
             .unwrap();
@@ -3398,31 +3350,31 @@ mod tests {
             |reference| reference.read().map_err(Into::into),
             reference_type.clone(),
             &domain,
-            XlaOptions::new(mesh.clone()),
+            Options::new(mesh.clone()),
         )
         .unwrap();
         let mutate = compile_statefully::<_, (ArrayIrType, ArrayIrType), ()>(
             |(reference, update)| reference.add_update(&update).map_err(Into::into),
             (reference_type, ArrayIrType::Array(array_type.clone())),
             &domain,
-            XlaOptions::new(mesh.clone()),
+            Options::new(mesh.clone()),
         )
         .unwrap();
         let reference = ArrayReference::new(
-            XlaArray::from_host_buffer(&domain, array_type.clone(), mesh.clone(), 1.0f32.to_ne_bytes().as_slice())
+            Array::from_host_buffer(&domain, array_type.clone(), mesh.clone(), 1.0f32.to_ne_bytes().as_slice())
                 .unwrap(),
         );
         // Both gates report into one labelled channel, so the assertions below pin which read lease the mutation
         // blocks on first instead of silently depending on the order the transaction awaits its leases.
         let (await_started, await_observed) = mpsc::channel();
         let first_gate = ControlledReferenceCompletion::with_await_notification("first read", await_started.clone());
-        XlaDomain::inject_stateful_completion_for_test(ReferenceCompletion::new(first_gate.clone()));
-        let first_read = read
-            .call_statefully_async(&domain, XlaValue::Reference(XlaReference::new(reference.clone(), domain.clone())));
+        Domain::inject_stateful_completion_for_test(CoreReferenceCompletion::new(first_gate.clone()));
+        let first_read =
+            read.call_statefully_async(&domain, Value::Reference(Reference::new(reference.clone(), domain.clone())));
         let second_gate = ControlledReferenceCompletion::with_await_notification("second read", await_started);
-        XlaDomain::inject_stateful_completion_for_test(ReferenceCompletion::new(second_gate.clone()));
-        let second_read = read
-            .call_statefully_async(&domain, XlaValue::Reference(XlaReference::new(reference.clone(), domain.clone())));
+        Domain::inject_stateful_completion_for_test(CoreReferenceCompletion::new(second_gate.clone()));
+        let second_read =
+            read.call_statefully_async(&domain, Value::Reference(Reference::new(reference.clone(), domain.clone())));
 
         std::thread::scope(|scope| {
             let (mutation_finished, mutation_result) = mpsc::channel();
@@ -3431,14 +3383,11 @@ mod tests {
             let mutate = &mutate;
             scope.spawn(move || {
                 let update =
-                    XlaArray::from_host_buffer(domain, array_type, mesh, 2.0f32.to_ne_bytes().as_slice()).unwrap();
+                    Array::from_host_buffer(domain, array_type, mesh, 2.0f32.to_ne_bytes().as_slice()).unwrap();
                 mutation_finished
                     .send(mutate.call_statefully(
                         domain,
-                        (
-                            XlaValue::Reference(XlaReference::new(mutation_reference, domain.clone())),
-                            XlaValue::Array(update),
-                        ),
+                        (Value::Reference(Reference::new(mutation_reference, domain.clone())), Value::Array(update)),
                     ))
                     .unwrap();
             });
@@ -3463,7 +3412,7 @@ mod tests {
             .client(ClientOptions::CPU(CpuClientOptions { device_count: Some(1), ..Default::default() }))
             .unwrap();
         let mesh = single_device_mesh(&client);
-        let domain = XlaSession::new(&client).domain();
+        let domain = Session::new(&client).domain();
         let array_type = ArrayType::scalar(DataType::F32)
             .with_sharding(Sharding::replicated(mesh.logical_mesh().clone(), 0))
             .unwrap();
@@ -3471,18 +3420,18 @@ mod tests {
             |(reference, update)| reference.add_update(&update).map_err(Into::into),
             (ArrayIrType::Reference(ReferenceType::new(array_type.clone())), ArrayIrType::Array(array_type.clone())),
             &domain,
-            XlaOptions::new(mesh.clone()),
+            Options::new(mesh.clone()),
         )
         .unwrap();
         let reference = ArrayReference::new(
-            XlaArray::from_host_buffer(&domain, array_type.clone(), mesh.clone(), 1.0f32.to_ne_bytes().as_slice())
+            Array::from_host_buffer(&domain, array_type.clone(), mesh.clone(), 1.0f32.to_ne_bytes().as_slice())
                 .unwrap(),
         );
-        let update = XlaArray::from_host_buffer(&domain, array_type, mesh, 2.0f32.to_ne_bytes().as_slice()).unwrap();
+        let update = Array::from_host_buffer(&domain, array_type, mesh, 2.0f32.to_ne_bytes().as_slice()).unwrap();
         compiled
             .call_statefully_async(
                 &domain,
-                (XlaValue::Reference(XlaReference::new(reference.clone(), domain.clone())), XlaValue::Array(update)),
+                (Value::Reference(Reference::new(reference.clone(), domain.clone())), Value::Array(update)),
             )
             .r#await()
             .unwrap();
@@ -3496,7 +3445,7 @@ mod tests {
             .client(ClientOptions::CPU(CpuClientOptions { device_count: Some(1), ..Default::default() }))
             .unwrap();
         let mesh = single_device_mesh(&client);
-        let domain = XlaSession::new(&client).domain();
+        let domain = Session::new(&client).domain();
         let array_type = ArrayType::scalar(DataType::F32)
             .with_sharding(Sharding::replicated(mesh.logical_mesh().clone(), 0))
             .unwrap();
@@ -3504,27 +3453,27 @@ mod tests {
             |(reference, update)| reference.add_update(&update).map_err(Into::into),
             (ArrayIrType::Reference(ReferenceType::new(array_type.clone())), ArrayIrType::Array(array_type.clone())),
             &domain,
-            XlaOptions::new(mesh.clone()),
+            Options::new(mesh.clone()),
         )
         .unwrap();
         let reference = ArrayReference::new(
-            XlaArray::from_host_buffer(&domain, array_type.clone(), mesh.clone(), 1.0f32.to_ne_bytes().as_slice())
+            Array::from_host_buffer(&domain, array_type.clone(), mesh.clone(), 1.0f32.to_ne_bytes().as_slice())
                 .unwrap(),
         );
         let predecessor = ControlledReferenceCompletion::new();
-        XlaDomain::inject_stateful_completion_for_test(ReferenceCompletion::new(predecessor.clone()));
+        Domain::inject_stateful_completion_for_test(CoreReferenceCompletion::new(predecessor.clone()));
         let first_update =
-            XlaArray::from_host_buffer(&domain, array_type.clone(), mesh.clone(), 2.0f32.to_ne_bytes().as_slice())
+            Array::from_host_buffer(&domain, array_type.clone(), mesh.clone(), 2.0f32.to_ne_bytes().as_slice())
                 .unwrap();
         let first = compiled.call_statefully_async(
             &domain,
-            (XlaValue::Reference(XlaReference::new(reference.clone(), domain.clone())), XlaValue::Array(first_update)),
+            (Value::Reference(Reference::new(reference.clone(), domain.clone())), Value::Array(first_update)),
         );
         let second_update =
-            XlaArray::from_host_buffer(&domain, array_type, mesh, 2.0f32.to_ne_bytes().as_slice()).unwrap();
+            Array::from_host_buffer(&domain, array_type, mesh, 2.0f32.to_ne_bytes().as_slice()).unwrap();
         let second = compiled.call_statefully_async(
             &domain,
-            (XlaValue::Reference(XlaReference::new(reference.clone(), domain.clone())), XlaValue::Array(second_update)),
+            (Value::Reference(Reference::new(reference.clone(), domain.clone())), Value::Array(second_update)),
         );
 
         predecessor.complete(Err(Arc::from("injected predecessor failure")));
@@ -3549,7 +3498,7 @@ mod tests {
             .client(ClientOptions::CPU(CpuClientOptions { device_count: Some(1), ..Default::default() }))
             .unwrap();
         let mesh = single_device_mesh(&client);
-        let domain = XlaSession::new(&client).domain();
+        let domain = Session::new(&client).domain();
         let array_type = ArrayType::scalar(DataType::F32)
             .with_sharding(Sharding::replicated(mesh.logical_mesh().clone(), 0))
             .unwrap();
@@ -3557,19 +3506,19 @@ mod tests {
             |(reference, update)| reference.add_update(&update).map_err(Into::into),
             (ArrayIrType::Reference(ReferenceType::new(array_type.clone())), ArrayIrType::Array(array_type.clone())),
             &domain,
-            XlaOptions::new(mesh.clone()),
+            Options::new(mesh.clone()),
         )
         .unwrap();
         let reference = ArrayReference::new(
-            XlaArray::from_host_buffer(&domain, array_type.clone(), mesh.clone(), 1.0f32.to_ne_bytes().as_slice())
+            Array::from_host_buffer(&domain, array_type.clone(), mesh.clone(), 1.0f32.to_ne_bytes().as_slice())
                 .unwrap(),
         );
         let completion = ControlledReferenceCompletion::new();
-        XlaDomain::inject_stateful_completion_for_test(ReferenceCompletion::new(completion.clone()));
-        let update = XlaArray::from_host_buffer(&domain, array_type, mesh, 2.0f32.to_ne_bytes().as_slice()).unwrap();
+        Domain::inject_stateful_completion_for_test(CoreReferenceCompletion::new(completion.clone()));
+        let update = Array::from_host_buffer(&domain, array_type, mesh, 2.0f32.to_ne_bytes().as_slice()).unwrap();
         drop(compiled.call_statefully_async(
             &domain,
-            (XlaValue::Reference(XlaReference::new(reference.clone(), domain.clone())), XlaValue::Array(update)),
+            (Value::Reference(Reference::new(reference.clone(), domain.clone())), Value::Array(update)),
         ));
 
         completion.complete(Ok(()));
@@ -3583,8 +3532,8 @@ mod tests {
             .client(ClientOptions::CPU(CpuClientOptions { device_count: Some(1), ..Default::default() }))
             .unwrap();
         let mesh = single_device_mesh(&client);
-        let domain = XlaSession::new(&client).domain();
-        let vector_type = ArrayType::new(DataType::F32, Shape::new(vec![Dimension::Static(2)]))
+        let domain = Session::new(&client).domain();
+        let vector_type = ArrayType::new(DataType::F32, Shape::new(vec![CoreDimension::Static(2)]))
             .with_sharding(Sharding::replicated(mesh.logical_mesh().clone(), 1))
             .unwrap();
         let scalar_type = ArrayType::scalar(DataType::F32)
@@ -3594,18 +3543,18 @@ mod tests {
             |reference| reference.read().map_err(Into::into),
             ArrayIrType::Reference(ReferenceType::new(scalar_type)),
             &domain,
-            XlaOptions::new(mesh.clone()),
+            Options::new(mesh.clone()),
         )
         .unwrap();
         let root = ArrayReference::new(
-            XlaArray::from_host_buffer(&domain, vector_type, mesh, values_to_bytes::<f32>(&[4.0, 9.0]).as_slice())
+            Array::from_host_buffer(&domain, vector_type, mesh, values_to_bytes::<f32>(&[4.0, 9.0]).as_slice())
                 .unwrap(),
         );
         let view = root
             .with_transform(ArrayReferenceTransform::Index { axis: 0, index: ArrayReferenceTransformIndex::Static(1) })
             .unwrap();
         assert!(matches!(
-            compiled.call_statefully(&domain, XlaValue::Reference(XlaReference::new(view, domain.clone()))),
+            compiled.call_statefully(&domain, Value::Reference(Reference::new(view, domain.clone()))),
             Err(Error::Core(ryft_core::Error::Program(ProgramError::InvalidArgument { message: reason })))
                 if reason
                     == "external state input 0 must be a root reference handle that uses its allocation's stored \
@@ -3621,8 +3570,8 @@ mod tests {
             .client(ClientOptions::CPU(CpuClientOptions { device_count: Some(1), ..Default::default() }))
             .unwrap();
         let mesh = single_device_mesh(&client);
-        let domain = XlaSession::new(&client).domain();
-        let shape = Shape::new(vec![Dimension::Static(2)]);
+        let domain = Session::new(&client).domain();
+        let shape = Shape::new(vec![CoreDimension::Static(2)]);
         let replicated_type = ArrayType::new(DataType::F32, shape.clone())
             .with_sharding(Sharding::replicated(mesh.logical_mesh().clone(), 1))
             .unwrap();
@@ -3633,11 +3582,11 @@ mod tests {
             |reference| reference.read().map_err(Into::into),
             ArrayIrType::Reference(ReferenceType::new(alternate_type.clone())),
             &domain,
-            XlaOptions::new(mesh.clone()),
+            Options::new(mesh.clone()),
         )
         .unwrap();
         let reference = ArrayReference::new(
-            XlaArray::from_host_buffer(
+            Array::from_host_buffer(
                 &domain,
                 alternate_type.clone(),
                 mesh.clone(),
@@ -3645,8 +3594,8 @@ mod tests {
             )
             .unwrap(),
         );
-        let XlaValue::Array(output) = sharded
-            .call_statefully(&domain, XlaValue::Reference(XlaReference::new(reference.clone(), domain.clone())))
+        let Value::Array(output) = sharded
+            .call_statefully(&domain, Value::Reference(Reference::new(reference.clone(), domain.clone())))
             .unwrap()
         else {
             panic!("stateful read output must be an array")
@@ -3662,10 +3611,10 @@ mod tests {
                 ArrayIrType::Array(replicated_type.clone()),
             ),
             &domain,
-            XlaOptions::new(mesh.clone()),
+            Options::new(mesh.clone()),
         )
         .unwrap();
-        let update = XlaArray::from_host_buffer(
+        let update = Array::from_host_buffer(
             &domain,
             replicated_type.clone(),
             mesh,
@@ -3675,7 +3624,7 @@ mod tests {
         assert!(matches!(
             compiled.call_statefully(
                 &domain,
-                (XlaValue::Reference(XlaReference::new(reference.clone(), domain.clone())), XlaValue::Array(update)),
+                (Value::Reference(Reference::new(reference.clone(), domain.clone())), Value::Array(update)),
             ),
             Err(Error::Core(ryft_core::Error::Program(ProgramError::InvalidArgument { message: reason })))
                 if reason == format!(
@@ -3693,9 +3642,9 @@ mod tests {
             .client(ClientOptions::CPU(CpuClientOptions { device_count: Some(2), ..Default::default() }))
             .unwrap();
         let mesh = two_device_mesh(&client, MeshAxisType::Auto);
-        let domain = XlaSession::new(&client).domain();
+        let domain = Session::new(&client).domain();
         let sharding = Sharding::new(mesh.logical_mesh().clone(), vec![ShardingDimension::sharded(["x"])]).unwrap();
-        let array_type = ArrayType::new(DataType::F32, Shape::new(vec![Dimension::Static(4)]))
+        let array_type = ArrayType::new(DataType::F32, Shape::new(vec![CoreDimension::Static(4)]))
             .with_sharding(sharding)
             .unwrap();
         let compiled = compile_statefully::<_, (ArrayIrType, ArrayIrType), ArrayIrType>(
@@ -3705,11 +3654,11 @@ mod tests {
             },
             (ArrayIrType::Reference(ReferenceType::new(array_type.clone())), ArrayIrType::Array(array_type.clone())),
             &domain,
-            XlaOptions::new(mesh.clone()),
+            Options::new(mesh.clone()),
         )
         .unwrap();
         let reference = ArrayReference::new(
-            XlaArray::from_host_buffer(
+            Array::from_host_buffer(
                 &domain,
                 array_type.clone(),
                 mesh.clone(),
@@ -3717,7 +3666,7 @@ mod tests {
             )
             .unwrap(),
         );
-        let update = XlaArray::from_host_buffer(
+        let update = Array::from_host_buffer(
             &domain,
             array_type.clone(),
             mesh.clone(),
@@ -3725,10 +3674,10 @@ mod tests {
         )
         .unwrap();
 
-        let XlaValue::Array(output) = compiled
+        let Value::Array(output) = compiled
             .call_statefully(
                 &domain,
-                (XlaValue::Reference(XlaReference::new(reference.clone(), domain.clone())), XlaValue::Array(update)),
+                (Value::Reference(Reference::new(reference.clone(), domain.clone())), Value::Array(update)),
             )
             .unwrap()
         else {
@@ -3741,7 +3690,7 @@ mod tests {
         let reversed_mesh =
             DeviceMesh::new(mesh.logical_mesh().clone(), mesh.devices().iter().rev().cloned().collect()).unwrap();
         let reversed_reference = ArrayReference::new(
-            XlaArray::from_host_buffer(
+            Array::from_host_buffer(
                 &domain,
                 array_type.clone(),
                 reversed_mesh,
@@ -3749,7 +3698,7 @@ mod tests {
             )
             .unwrap(),
         );
-        let update = XlaArray::from_host_buffer(
+        let update = Array::from_host_buffer(
             &domain,
             array_type,
             mesh,
@@ -3760,8 +3709,8 @@ mod tests {
             compiled.call_statefully(
                 &domain,
                 (
-                    XlaValue::Reference(XlaReference::new(reversed_reference.clone(), domain.clone())),
-                    XlaValue::Array(update),
+                    Value::Reference(Reference::new(reversed_reference.clone(), domain.clone())),
+                    Value::Array(update),
                 ),
             ),
             Err(Error::Core(ryft_core::Error::Program(ProgramError::InvalidArgument { message: reason })))
@@ -3778,7 +3727,7 @@ mod tests {
             .unwrap();
         let mesh = two_device_mesh(&client, MeshAxisType::Manual);
         let logical_mesh = mesh.logical_mesh().clone();
-        let domain = XlaSession::new(&client).domain();
+        let domain = Session::new(&client).domain();
         let program = nonlinear_reference_shard_map_program(&logical_mesh, false).jvp().unwrap();
         let inputs = program.input_types().into_owned();
         let array_type = <&ReferenceType<ArrayType>>::try_from(&inputs[0]).unwrap().referent().clone();
@@ -3786,11 +3735,11 @@ mod tests {
             |inputs| program.interpret_in_context(inputs[0].context(), inputs.clone()).map_err(Into::into),
             inputs,
             &domain,
-            XlaOptions::new(mesh.clone()),
+            Options::new(mesh.clone()),
         )
         .unwrap();
         let array = |values: &[f32]| {
-            XlaArray::from_host_buffer(&domain, array_type.clone(), mesh.clone(), values_to_bytes(values).as_slice())
+            Array::from_host_buffer(&domain, array_type.clone(), mesh.clone(), values_to_bytes(values).as_slice())
                 .unwrap()
         };
         let reference = ArrayReference::new(array(&[2.0, 3.0, 5.0, 7.0]));
@@ -3799,17 +3748,17 @@ mod tests {
             .call_statefully(
                 &domain,
                 vec![
-                    XlaValue::Reference(XlaReference::new(reference.clone(), domain.clone())),
-                    XlaValue::Array(array(&[11.0, 13.0, 17.0, 19.0])),
-                    XlaValue::Reference(XlaReference::new(tangent_reference.clone(), domain.clone())),
-                    XlaValue::Array(array(&[41.0, 43.0, 47.0, 53.0])),
+                    Value::Reference(Reference::new(reference.clone(), domain.clone())),
+                    Value::Array(array(&[11.0, 13.0, 17.0, 19.0])),
+                    Value::Reference(Reference::new(tangent_reference.clone(), domain.clone())),
+                    Value::Array(array(&[41.0, 43.0, 47.0, 53.0])),
                 ],
             )
             .unwrap();
         let outputs = outputs
             .iter()
             .map(|output| match output {
-                XlaValue::Array(array) => read_sharded_f32_array(array),
+                Value::Array(array) => read_sharded_f32_array(array),
                 _ => panic!("nonlinear outputs are arrays"),
             })
             .collect::<Vec<_>>();
@@ -3826,7 +3775,7 @@ mod tests {
             .unwrap();
         let mesh = two_device_mesh(&client, MeshAxisType::Manual);
         let logical_mesh = mesh.logical_mesh().clone();
-        let domain = XlaSession::new(&client).domain();
+        let domain = Session::new(&client).domain();
         let program = nonlinear_reference_shard_map_program(&logical_mesh, true);
         let mut input_types = program.input_types().into_owned();
         let reference_type = <&ReferenceType<ArrayType>>::try_from(&input_types[0]).unwrap().referent().clone();
@@ -3851,12 +3800,11 @@ mod tests {
             },
             input_types,
             &domain,
-            XlaOptions::new(mesh.clone()),
+            Options::new(mesh.clone()),
         )
         .unwrap();
         let array = |r#type: &ArrayType, values: &[f32]| {
-            XlaArray::from_host_buffer(&domain, r#type.clone(), mesh.clone(), values_to_bytes(values).as_slice())
-                .unwrap()
+            Array::from_host_buffer(&domain, r#type.clone(), mesh.clone(), values_to_bytes(values).as_slice()).unwrap()
         };
         let reference = ArrayReference::new(array(&reference_type, &[2.0, 3.0]));
         let destination = ArrayReference::new(array(&reference_type, &[5.0, 7.0]));
@@ -3864,17 +3812,17 @@ mod tests {
             .call_statefully(
                 &domain,
                 vec![
-                    XlaValue::Reference(XlaReference::new(reference.clone(), domain.clone())),
-                    XlaValue::Array(array(&array_type, &[11.0, 13.0, 17.0, 19.0])),
-                    XlaValue::Reference(XlaReference::new(destination.clone(), domain.clone())),
-                    XlaValue::Array(array(&array_type, &[1.0, 2.0, 3.0, 4.0])),
+                    Value::Reference(Reference::new(reference.clone(), domain.clone())),
+                    Value::Array(array(&array_type, &[11.0, 13.0, 17.0, 19.0])),
+                    Value::Reference(Reference::new(destination.clone(), domain.clone())),
+                    Value::Array(array(&array_type, &[1.0, 2.0, 3.0, 4.0])),
                 ],
             )
             .unwrap();
         let outputs = outputs
             .iter()
             .map(|output| match output {
-                XlaValue::Array(array) => read_sharded_f32_array(array),
+                Value::Array(array) => read_sharded_f32_array(array),
                 _ => panic!("nonlinear outputs are arrays"),
             })
             .collect::<Vec<_>>();
@@ -3893,15 +3841,15 @@ mod tests {
             .unwrap();
         let mesh = two_device_mesh(&client, MeshAxisType::Manual);
         let logical_mesh = mesh.logical_mesh().clone();
-        let domain = XlaSession::new(&client).domain();
+        let domain = Session::new(&client).domain();
         let sharding = Sharding::replicated(logical_mesh.clone(), 1);
         let array_type = ArrayType::new_static(DataType::F32, [2]).with_sharding(sharding.clone()).unwrap();
         let reference_type = ArrayIrType::Reference(ReferenceType::new(array_type.clone()));
-        let mut body = ProgramBuilder::<XlaConstant, XlaOperation>::new();
+        let mut body = CoreProgramBuilder::<Constant, Operation>::new();
         let reference = body.add_input(reference_type.clone());
         let value = body.add_instruction(ReferenceReadOperation::new(), Vec::new(), vec![reference], None).unwrap()[0];
         let body = body
-            .build::<Vec<XlaConstant>, Vec<XlaConstant>>(vec![value], vec![Placeholder], vec![Placeholder])
+            .build::<Vec<Constant>, Vec<Constant>>(vec![value], vec![Placeholder], vec![Placeholder])
             .unwrap();
         let operation = ShardMapOperation::from_program(
             &body,
@@ -3915,14 +3863,14 @@ mod tests {
             .unwrap(),
         )
         .unwrap();
-        let mut builder = ProgramBuilder::<XlaConstant, XlaOperation>::new();
+        let mut builder = CoreProgramBuilder::<Constant, Operation>::new();
         let reference = builder.add_input(reference_type.clone());
         let body = builder.import_program(body);
         let output = builder
-            .add_instruction(XlaOperation::ShardMap(Box::new(operation)), vec![body], vec![reference], None)
+            .add_instruction(Operation::ShardMap(Box::new(operation)), vec![body], vec![reference], None)
             .unwrap()[0];
         let program = builder
-            .build::<Vec<XlaConstant>, Vec<XlaConstant>>(vec![output], vec![Placeholder], vec![Placeholder])
+            .build::<Vec<Constant>, Vec<Constant>>(vec![output], vec![Placeholder], vec![Placeholder])
             .unwrap();
         let pullback = program.transpose_with_respect_to(&[0], &[CotangentDestinationKind::Reference]).unwrap();
         let compiled = compile_statefully::<_, Vec<ArrayIrType>, Vec<ArrayIrType>>(
@@ -3933,11 +3881,11 @@ mod tests {
             },
             vec![ArrayIrType::Array(array_type.clone()), reference_type.clone()],
             &domain,
-            XlaOptions::new(mesh.clone()),
+            Options::new(mesh.clone()),
         )
         .unwrap();
         let array = |values: &[f32]| {
-            XlaArray::from_host_buffer(&domain, array_type.clone(), mesh.clone(), values_to_bytes(values).as_slice())
+            Array::from_host_buffer(&domain, array_type.clone(), mesh.clone(), values_to_bytes(values).as_slice())
                 .unwrap()
         };
         let destination = ArrayReference::new(array(&[5.0, 7.0]));
@@ -3945,12 +3893,114 @@ mod tests {
             .call_statefully(
                 &domain,
                 vec![
-                    XlaValue::Array(array(&[1.0, 2.0])),
-                    XlaValue::Reference(XlaReference::new(destination.clone(), domain.clone())),
+                    Value::Array(array(&[1.0, 2.0])),
+                    Value::Reference(Reference::new(destination.clone(), domain.clone())),
                 ],
             )
             .unwrap();
         assert_eq!(read_sharded_f32_array(&destination.read().unwrap()), vec![6.0, 9.0, 6.0, 9.0]);
+    }
+
+    /// Builds the program `r -> shard_map(|r| r += read(r))(r)` for an unchecked map over a two-device mesh whose
+    /// reference input is reduced along the manual axis `x`, together with the mesh, the domain, and the referent type.
+    fn doubling_reduced_reference_program(
+        logical_mesh: &LogicalMesh,
+    ) -> (ryft_core::Program<Constant, Operation, Vec<Constant>, Vec<Constant>>, ArrayType) {
+        let reduced = Sharding::replicated(logical_mesh.clone(), 1).with_reduced_axes(["x"]).unwrap();
+        let boundary = ShardMapBoundary::new(logical_mesh.clone(), vec![reduced.clone()], Vec::new(), Vec::new())
+            .unwrap()
+            .with_check_manual_variation(false);
+        let referent_type = ArrayType::new_static(DataType::F32, [2]).with_sharding(reduced).unwrap();
+        let reference_type = ArrayIrType::Reference(ReferenceType::new(referent_type.clone()));
+        let mut body = CoreProgramBuilder::<Constant, Operation>::new();
+        let local_type = boundary.local_input_type(0, &referent_type).unwrap();
+        let reference = body.add_input(ArrayIrType::Reference(ReferenceType::new(local_type)));
+        let value = body.add_instruction(ReferenceReadOperation::new(), Vec::new(), vec![reference], None).unwrap()[0];
+        body.add_instruction(ReferenceAddUpdateOperation::new(), Vec::new(), vec![reference, value], None)
+            .unwrap();
+        let body = body.build::<Vec<Constant>, Vec<Constant>>(Vec::new(), vec![Placeholder], Vec::new()).unwrap();
+        let operation = ShardMapOperation::from_program(&body, vec![reference_type.clone()], boundary).unwrap();
+        let mut builder = CoreProgramBuilder::<Constant, Operation>::new();
+        let reference = builder.add_input(reference_type);
+        let body = builder.import_program(body);
+        builder
+            .add_instruction(Operation::ShardMap(Box::new(operation)), vec![body], vec![reference], None)
+            .unwrap();
+        let program = builder.build::<Vec<Constant>, Vec<Constant>>(Vec::new(), vec![Placeholder], Vec::new()).unwrap();
+        (program, referent_type)
+    }
+
+    #[test]
+    fn test_stateful_unchecked_shard_map_writes_back_reduced_references() {
+        // Every device receives the whole reduced referent `[1, 2]`, doubles it, and writes back its copy, so both
+        // devices hold `[2, 4]` afterwards.
+        let plugin = load_cpu_plugin().unwrap();
+        let client = plugin
+            .client(ClientOptions::CPU(CpuClientOptions { device_count: Some(2), ..Default::default() }))
+            .unwrap();
+        let mesh = two_device_mesh(&client, MeshAxisType::Manual);
+        let domain = Session::new(&client).domain();
+        let (program, referent_type) = doubling_reduced_reference_program(mesh.logical_mesh());
+        let reference_type = ArrayIrType::Reference(ReferenceType::new(referent_type.clone()));
+        let compiled = compile_statefully::<_, Vec<ArrayIrType>, Vec<ArrayIrType>>(
+            |inputs| {
+                let context = inputs[0].context().clone();
+                program.interpret_in_context(&context, inputs)?;
+                Ok(Vec::new())
+            },
+            vec![reference_type],
+            &domain,
+            Options::new(mesh.clone()),
+        )
+        .unwrap();
+        let reference = ArrayReference::new(
+            Array::from_host_buffer(&domain, referent_type, mesh, values_to_bytes(&[1f32, 2.0]).as_slice()).unwrap(),
+        );
+        compiled
+            .call_statefully(&domain, vec![Value::Reference(Reference::new(reference.clone(), domain.clone()))])
+            .unwrap();
+        assert_eq!(read_sharded_f32_array(&reference.read().unwrap()), vec![2.0, 4.0, 2.0, 4.0]);
+    }
+
+    #[test]
+    fn test_stateful_unchecked_shard_map_reverse_accumulates_mutated_reduced_gradient_references() {
+        // The map doubles a reduced reference in place, so the cotangent of its initial state is twice that of its
+        // final state. The gradient reference is unreduced, so each device doubles its own summand in place: the
+        // logical destination `[5, 7]`, uploaded as the summands `[5, 7]` and `[0, 0]`, becomes `[10, 14]`.
+        let plugin = load_cpu_plugin().unwrap();
+        let client = plugin
+            .client(ClientOptions::CPU(CpuClientOptions { device_count: Some(2), ..Default::default() }))
+            .unwrap();
+        let mesh = two_device_mesh(&client, MeshAxisType::Manual);
+        let domain = Session::new(&client).domain();
+        let (program, referent_type) = doubling_reduced_reference_program(mesh.logical_mesh());
+        let pullback = program.transpose_with_respect_to(&[0], &[CotangentDestinationKind::Reference]).unwrap();
+        let cotangent_type =
+            referent_type.clone().with_sharding(referent_type.sharding().unwrap().cotangent()).unwrap();
+        let cotangent_reference_type = ArrayIrType::Reference(ReferenceType::new(cotangent_type.clone()));
+        let compiled = compile_statefully::<_, Vec<ArrayIrType>, Vec<ArrayIrType>>(
+            |inputs| {
+                let context = inputs[0].context().clone();
+                pullback.interpret_in_context(&context, inputs)?;
+                Ok(Vec::new())
+            },
+            vec![cotangent_reference_type],
+            &domain,
+            Options::new(mesh.clone()),
+        )
+        .unwrap();
+        let destination = ArrayReference::new(
+            Array::from_host_buffer(&domain, cotangent_type, mesh, values_to_bytes(&[5f32, 7.0]).as_slice()).unwrap(),
+        );
+        compiled
+            .call_statefully(&domain, vec![Value::Reference(Reference::new(destination.clone(), domain.clone()))])
+            .unwrap();
+        let destination = destination.read().unwrap();
+        assert_eq!(read_sharded_f32_array(&destination), vec![10.0, 14.0, 0.0, 0.0]);
+        assert_eq!(
+            values_from_bytes::<f32>(&crate::arrays_v0::host::materialize_dense_array_bytes(&destination).unwrap()),
+            vec![10.0, 14.0],
+        );
     }
 
     /// A manual `shard_map` over a reference sharded along its manual axis, run through the stateful ABI: each device
@@ -3964,9 +4014,9 @@ mod tests {
             .unwrap();
         let mesh = two_device_mesh(&client, MeshAxisType::Manual);
         let logical_mesh = mesh.logical_mesh().clone();
-        let domain = XlaSession::new(&client).domain();
+        let domain = Session::new(&client).domain();
         let sharded = Sharding::new(logical_mesh.clone(), vec![ShardingDimension::sharded(["x"])]).unwrap();
-        let global_type = ArrayType::new(DataType::F32, Shape::new(vec![Dimension::Static(4)]));
+        let global_type = ArrayType::new(DataType::F32, Shape::new(vec![CoreDimension::Static(4)]));
         let sharded_type = global_type.clone().with_sharding(sharded.clone()).unwrap();
 
         // The boundary is `[r: ref<f32[4]>, x: f32[4]] -> f32[4]`, everything sharded along `x`, and the local body
@@ -3979,7 +4029,7 @@ mod tests {
         )
         .unwrap();
         let body = {
-            let mut builder = ProgramBuilder::<XlaConstant, XlaOperation>::new();
+            let mut builder = CoreProgramBuilder::<Constant, Operation>::new();
             let local_referent = boundary.local_input_type(0, &global_type).unwrap();
             let reference = builder.add_input(ArrayIrType::Reference(ReferenceType::new(local_referent)));
             let update = builder.add_input(ArrayIrType::Array(boundary.local_input_type(1, &global_type).unwrap()));
@@ -3989,7 +4039,7 @@ mod tests {
             let output =
                 builder.add_instruction(ReferenceReadOperation::new(), Vec::new(), vec![reference], None).unwrap()[0];
             builder
-                .build::<Vec<XlaConstant>, Vec<XlaConstant>>(vec![output], vec![Placeholder; 2], vec![Placeholder])
+                .build::<Vec<Constant>, Vec<Constant>>(vec![output], vec![Placeholder; 2], vec![Placeholder])
                 .unwrap()
         };
         let operation = ShardMapOperation::from_program(
@@ -4002,7 +4052,7 @@ mod tests {
         )
         .unwrap();
         assert_eq!(operation.global_output_types(), &[ArrayIrType::Array(sharded_type.clone())]);
-        let operation = XlaOperation::ShardMap(Box::new(operation));
+        let operation = Operation::ShardMap(Box::new(operation));
         let compiled = compile_statefully::<_, (ArrayIrType, ArrayIrType), ArrayIrType>(
             |(reference, update)| {
                 let context = reference.domain();
@@ -4014,12 +4064,12 @@ mod tests {
                 ArrayIrType::Array(sharded_type.clone()),
             ),
             &domain,
-            XlaOptions::new(mesh.clone()),
+            Options::new(mesh.clone()),
         )
         .unwrap();
 
         let reference = ArrayReference::new(
-            XlaArray::from_host_buffer(
+            Array::from_host_buffer(
                 &domain,
                 sharded_type.clone(),
                 mesh.clone(),
@@ -4027,17 +4077,17 @@ mod tests {
             )
             .unwrap(),
         );
-        let update = XlaArray::from_host_buffer(
+        let update = Array::from_host_buffer(
             &domain,
             sharded_type,
             mesh,
             values_to_bytes::<f32>(&[10.0, 20.0, 30.0, 40.0]).as_slice(),
         )
         .unwrap();
-        let XlaValue::Array(output) = compiled
+        let Value::Array(output) = compiled
             .call_statefully(
                 &domain,
-                (XlaValue::Reference(XlaReference::new(reference.clone(), domain.clone())), XlaValue::Array(update)),
+                (Value::Reference(Reference::new(reference.clone(), domain.clone())), Value::Array(update)),
             )
             .unwrap()
         else {
@@ -4064,12 +4114,12 @@ mod tests {
             .unwrap();
         let mesh = two_device_mesh(&client, MeshAxisType::Manual);
         let logical_mesh = mesh.logical_mesh().clone();
-        let domain = XlaSession::new(&client).domain();
+        let domain = Session::new(&client).domain();
         let sharded = Sharding::new(logical_mesh.clone(), vec![ShardingDimension::sharded(["x"])]).unwrap();
         let replicated = Sharding::replicated(logical_mesh.clone(), 1);
-        let referent_type = ArrayType::new(DataType::F32, Shape::new(vec![Dimension::Static(2)]));
+        let referent_type = ArrayType::new(DataType::F32, Shape::new(vec![CoreDimension::Static(2)]));
         let replicated_type = referent_type.clone().with_sharding(replicated.clone()).unwrap();
-        let global_type = ArrayType::new(DataType::F32, Shape::new(vec![Dimension::Static(4)]));
+        let global_type = ArrayType::new(DataType::F32, Shape::new(vec![CoreDimension::Static(4)]));
         let sharded_type = global_type.clone().with_sharding(sharded.clone()).unwrap();
 
         // The boundary is `[r: ref<f32[2]>, x: f32[4]] -> f32[4]` with `r` replicated and `x` and the output sharded
@@ -4083,7 +4133,7 @@ mod tests {
         )
         .unwrap();
         let body = {
-            let mut builder = ProgramBuilder::<XlaConstant, XlaOperation>::new();
+            let mut builder = CoreProgramBuilder::<Constant, Operation>::new();
             let local_referent = boundary.local_input_type(0, &referent_type).unwrap();
             let reference = builder.add_input(ArrayIrType::Reference(ReferenceType::new(local_referent)));
             let update = builder.add_input(ArrayIrType::Array(boundary.local_input_type(1, &global_type).unwrap()));
@@ -4095,7 +4145,7 @@ mod tests {
             let output =
                 builder.add_instruction(AddOperation::new(), Vec::new(), vec![state, update], None).unwrap()[0];
             builder
-                .build::<Vec<XlaConstant>, Vec<XlaConstant>>(vec![output], vec![Placeholder; 2], vec![Placeholder])
+                .build::<Vec<Constant>, Vec<Constant>>(vec![output], vec![Placeholder; 2], vec![Placeholder])
                 .unwrap()
         };
         let operation = ShardMapOperation::from_program(
@@ -4108,7 +4158,7 @@ mod tests {
         )
         .unwrap();
         assert_eq!(operation.global_output_types(), &[ArrayIrType::Array(sharded_type.clone())]);
-        let operation = XlaOperation::ShardMap(Box::new(operation));
+        let operation = Operation::ShardMap(Box::new(operation));
         let compiled = compile_statefully::<_, (ArrayIrType, ArrayIrType), ArrayIrType>(
             |(reference, update)| {
                 let context = reference.domain();
@@ -4120,12 +4170,12 @@ mod tests {
                 ArrayIrType::Array(sharded_type.clone()),
             ),
             &domain,
-            XlaOptions::new(mesh.clone()),
+            Options::new(mesh.clone()),
         )
         .unwrap();
 
         let reference = ArrayReference::new(
-            XlaArray::from_host_buffer(
+            Array::from_host_buffer(
                 &domain,
                 replicated_type,
                 mesh.clone(),
@@ -4133,17 +4183,17 @@ mod tests {
             )
             .unwrap(),
         );
-        let update = XlaArray::from_host_buffer(
+        let update = Array::from_host_buffer(
             &domain,
             sharded_type,
             mesh,
             values_to_bytes::<f32>(&[1.0, 2.0, 3.0, 4.0]).as_slice(),
         )
         .unwrap();
-        let XlaValue::Array(output) = compiled
+        let Value::Array(output) = compiled
             .call_statefully(
                 &domain,
-                (XlaValue::Reference(XlaReference::new(reference.clone(), domain.clone())), XlaValue::Array(update)),
+                (Value::Reference(Reference::new(reference.clone(), domain.clone())), Value::Array(update)),
             )
             .unwrap()
         else {
@@ -4164,23 +4214,23 @@ mod tests {
             .client(ClientOptions::CPU(CpuClientOptions { device_count: Some(1), ..Default::default() }))
             .unwrap();
         let mesh = single_device_mesh(&client);
-        let domain = XlaSession::new(&client).domain();
+        let domain = Session::new(&client).domain();
         let extent = DimensionVariable::new("state_extent", DimensionBounds::new(1, Some(5)).unwrap());
-        let declared_type = ArrayType::new(DataType::F32, Shape::new(vec![Dimension::Dynamic(extent)]))
+        let declared_type = ArrayType::new(DataType::F32, Shape::new(vec![CoreDimension::Dynamic(extent)]))
             .with_sharding(Sharding::replicated(mesh.logical_mesh().clone(), 1))
             .unwrap();
         let read = compile_statefully::<_, ArrayIrType, ArrayIrType>(
             |reference| reference.read().map_err(Into::into),
             ArrayIrType::Reference(ReferenceType::new(declared_type.clone())),
             &domain,
-            XlaOptions::new(mesh.clone()),
+            Options::new(mesh.clone()),
         )
         .unwrap();
         let mutation = compile_statefully::<_, (ArrayIrType, ArrayIrType), ()>(
             |(reference, update)| reference.add_update(&update).map_err(Into::into),
             (ArrayIrType::Reference(ReferenceType::new(declared_type.clone())), ArrayIrType::Array(declared_type)),
             &domain,
-            XlaOptions::new(mesh.clone()),
+            Options::new(mesh.clone()),
         );
         assert!(matches!(
             mutation,
@@ -4190,11 +4240,11 @@ mod tests {
         ));
 
         for expected in [vec![1.0_f32, 2.0], vec![1.0_f32, 2.0, 3.0, 4.0]] {
-            let actual_type = ArrayType::new(DataType::F32, Shape::new(vec![Dimension::Static(expected.len())]))
+            let actual_type = ArrayType::new(DataType::F32, Shape::new(vec![CoreDimension::Static(expected.len())]))
                 .with_sharding(Sharding::replicated(mesh.logical_mesh().clone(), 1))
                 .unwrap();
             let reference = ArrayReference::new(
-                XlaArray::from_host_buffer(
+                Array::from_host_buffer(
                     &domain,
                     actual_type,
                     mesh.clone(),
@@ -4202,8 +4252,8 @@ mod tests {
                 )
                 .unwrap(),
             );
-            let XlaValue::Array(output) = read
-                .call_statefully(&domain, XlaValue::Reference(XlaReference::new(reference.clone(), domain.clone())))
+            let Value::Array(output) = read
+                .call_statefully(&domain, Value::Reference(Reference::new(reference.clone(), domain.clone())))
                 .unwrap()
             else {
                 panic!("stateful bounded-dynamic output must be an array")
@@ -4220,12 +4270,12 @@ mod tests {
             .client(ClientOptions::CPU(CpuClientOptions { device_count: Some(1), ..Default::default() }))
             .unwrap();
         let mesh = single_device_mesh(&client);
-        let domain = XlaSession::new(&client).domain();
+        let domain = Session::new(&client).domain();
         let array_type = ArrayType::scalar(DataType::F32)
             .with_sharding(Sharding::replicated(mesh.logical_mesh().clone(), 0))
             .unwrap();
         let function = jitted_statefully::<_, (), (ArrayIrType, ArrayIrType), ArrayIrType>(
-            |(), (reference, update): (XlaStatefulCompileTracer<'_>, XlaStatefulCompileTracer<'_>)| {
+            |(), (reference, update): (StatefulCompileTracer<'_>, StatefulCompileTracer<'_>)| {
                 reference.add_update(&update)?;
                 Ok(reference.read()?)
             },
@@ -4233,24 +4283,21 @@ mod tests {
             mesh.clone(),
         );
         let reference = ArrayReference::new(
-            XlaArray::from_host_buffer(&domain, array_type.clone(), mesh.clone(), 1.0f32.to_ne_bytes().as_slice())
+            Array::from_host_buffer(&domain, array_type.clone(), mesh.clone(), 1.0f32.to_ne_bytes().as_slice())
                 .unwrap(),
         );
 
         for expected in [3.0f32, 5.0] {
             let update =
-                XlaArray::from_host_buffer(&domain, array_type.clone(), mesh.clone(), 2.0f32.to_ne_bytes().as_slice())
+                Array::from_host_buffer(&domain, array_type.clone(), mesh.clone(), 2.0f32.to_ne_bytes().as_slice())
                     .unwrap();
             let output = function
                 .call_statefully(
                     (),
-                    (
-                        XlaValue::Reference(XlaReference::new(reference.clone(), domain.clone())),
-                        XlaValue::Array(update),
-                    ),
+                    (Value::Reference(Reference::new(reference.clone(), domain.clone())), Value::Array(update)),
                 )
                 .unwrap();
-            let XlaValue::Array(output) = output else { panic!("stateful public output must be an array") };
+            let Value::Array(output) = output else { panic!("stateful public output must be an array") };
             assert_eq!(read_f32_array(&client, &output), vec![expected]);
         }
         let statistics = function.statistics();
@@ -4265,12 +4312,12 @@ mod tests {
             .client(ClientOptions::CPU(CpuClientOptions { device_count: Some(1), ..Default::default() }))
             .unwrap();
         let mesh = single_device_mesh(&client);
-        let domain = XlaSession::new(&client).domain();
+        let domain = Session::new(&client).domain();
         let array_type = ArrayType::scalar(DataType::F32)
             .with_sharding(Sharding::replicated(mesh.logical_mesh().clone(), 0))
             .unwrap();
         let reference = ArrayReference::new(
-            XlaArray::from_host_buffer(&domain, array_type.clone(), mesh.clone(), 1.0f32.to_ne_bytes().as_slice())
+            Array::from_host_buffer(&domain, array_type.clone(), mesh.clone(), 1.0f32.to_ne_bytes().as_slice())
                 .unwrap(),
         );
         let compiled = compile_statefully_with_captures::<_, ArrayIrType, ArrayIrType>(
@@ -4278,15 +4325,15 @@ mod tests {
                 captures[0].add_update(&update)?;
                 captures[0].read().map_err(Into::into)
             },
-            vec![XlaValue::Reference(XlaReference::new(reference.clone(), domain.clone()))],
+            vec![Value::Reference(Reference::new(reference.clone(), domain.clone()))],
             ArrayIrType::Array(array_type.clone()),
             &domain,
-            XlaOptions::new(mesh.clone()),
+            Options::new(mesh.clone()),
         )
         .unwrap();
-        let update = XlaArray::from_host_buffer(&domain, array_type, mesh, 2.0f32.to_ne_bytes().as_slice()).unwrap();
-        let output = compiled.call_statefully(&domain, XlaValue::Array(update)).unwrap();
-        let XlaValue::Array(output) = output else { panic!("stateful public output must be an array") };
+        let update = Array::from_host_buffer(&domain, array_type, mesh, 2.0f32.to_ne_bytes().as_slice()).unwrap();
+        let output = compiled.call_statefully(&domain, Value::Array(update)).unwrap();
+        let Value::Array(output) = output else { panic!("stateful public output must be an array") };
         assert_eq!(read_f32_array(&client, &output), vec![3.0]);
         assert_eq!(read_f32_array(&client, &reference.read().unwrap()), vec![3.0]);
     }
@@ -4298,13 +4345,13 @@ mod tests {
             .client(ClientOptions::CPU(CpuClientOptions { device_count: Some(1), ..Default::default() }))
             .unwrap();
         let mesh = single_device_mesh(&client);
-        let domain = XlaSession::new(&client).domain();
+        let domain = Session::new(&client).domain();
         let array_type = ArrayType::scalar(DataType::F32)
             .with_sharding(Sharding::replicated(mesh.logical_mesh().clone(), 0))
             .unwrap();
         let reference_type = ArrayIrType::Reference(ReferenceType::new(array_type.clone()));
         let reference = ArrayReference::new(
-            XlaArray::from_host_buffer(&domain, array_type, mesh.clone(), 1.0f32.to_ne_bytes().as_slice()).unwrap(),
+            Array::from_host_buffer(&domain, array_type, mesh.clone(), 1.0f32.to_ne_bytes().as_slice()).unwrap(),
         );
         let compiled = compile_statefully_with_captures::<_, ArrayIrType, ArrayIrType>(
             |captures, public_reference| {
@@ -4312,14 +4359,14 @@ mod tests {
                 captures[0].add_update(&update)?;
                 captures[0].read().map_err(Into::into)
             },
-            vec![XlaValue::Reference(XlaReference::new(reference.clone(), domain.clone()))],
+            vec![Value::Reference(Reference::new(reference.clone(), domain.clone()))],
             reference_type.clone(),
             &domain,
-            XlaOptions::new(mesh),
+            Options::new(mesh),
         )
         .unwrap();
         let error = compiled
-            .call_statefully(&domain, XlaValue::Reference(XlaReference::new(reference.clone(), domain.clone())))
+            .call_statefully(&domain, Value::Reference(Reference::new(reference.clone(), domain.clone())))
             .err();
         assert!(
             matches!(
@@ -4339,23 +4386,23 @@ mod tests {
             .client(ClientOptions::CPU(CpuClientOptions { device_count: Some(1), ..Default::default() }))
             .unwrap();
         let mesh = single_device_mesh(&client);
-        let domain = XlaSession::new(&client).domain();
+        let domain = Session::new(&client).domain();
         let array_type = ArrayType::scalar(DataType::F32)
             .with_sharding(Sharding::replicated(mesh.logical_mesh().clone(), 0))
             .unwrap();
         let reference = ArrayReference::new(
-            XlaArray::from_host_buffer(&domain, array_type.clone(), mesh.clone(), 1.0f32.to_ne_bytes().as_slice())
+            Array::from_host_buffer(&domain, array_type.clone(), mesh.clone(), 1.0f32.to_ne_bytes().as_slice())
                 .unwrap(),
         );
         let result = compile_statefully_with_captures::<_, ArrayIrType, ArrayIrType>(
             |captures, _| captures[0].read().map_err(Into::into),
             vec![
-                XlaValue::Reference(XlaReference::new(reference.clone(), domain.clone())),
-                XlaValue::Reference(XlaReference::new(reference, domain.clone())),
+                Value::Reference(Reference::new(reference.clone(), domain.clone())),
+                Value::Reference(Reference::new(reference, domain.clone())),
             ],
             ArrayIrType::Array(array_type),
             &domain,
-            XlaOptions::new(mesh),
+            Options::new(mesh),
         );
         assert!(matches!(
             result,
@@ -4371,7 +4418,7 @@ mod tests {
             .client(ClientOptions::CPU(CpuClientOptions { device_count: Some(1), ..Default::default() }))
             .unwrap();
         let mesh = single_device_mesh(&client);
-        let domain = XlaSession::new(&client).domain();
+        let domain = Session::new(&client).domain();
         let array_type = ArrayType::scalar(DataType::F32)
             .with_sharding(Sharding::replicated(mesh.logical_mesh().clone(), 0))
             .unwrap();
@@ -4384,37 +4431,35 @@ mod tests {
             },
             (reference_type.clone(), reference_type, ArrayIrType::Array(array_type.clone())),
             &domain,
-            XlaOptions::new(mesh.clone()),
+            Options::new(mesh.clone()),
         )
         .unwrap();
         let first = ArrayReference::new(
-            XlaArray::from_host_buffer(&domain, array_type.clone(), mesh.clone(), 1.0f32.to_ne_bytes().as_slice())
+            Array::from_host_buffer(&domain, array_type.clone(), mesh.clone(), 1.0f32.to_ne_bytes().as_slice())
                 .unwrap(),
         );
         let second = ArrayReference::new(
-            XlaArray::from_host_buffer(&domain, array_type.clone(), mesh.clone(), 1.0f32.to_ne_bytes().as_slice())
+            Array::from_host_buffer(&domain, array_type.clone(), mesh.clone(), 1.0f32.to_ne_bytes().as_slice())
                 .unwrap(),
         );
         let (lower_reference, higher_reference) =
             if first.id() < second.id() { (first, second) } else { (second, first) };
-        let update = XlaArray::from_host_buffer(&domain, array_type, mesh, 2.0f32.to_ne_bytes().as_slice()).unwrap();
+        let update = Array::from_host_buffer(&domain, array_type, mesh, 2.0f32.to_ne_bytes().as_slice()).unwrap();
 
         let (higher_output, lower_output) = compiled
             .call_statefully(
                 &domain,
                 (
-                    XlaValue::Reference(XlaReference::new(higher_reference.clone(), domain.clone())),
-                    XlaValue::Reference(XlaReference::new(lower_reference.clone(), domain.clone())),
-                    XlaValue::Array(update),
+                    Value::Reference(Reference::new(higher_reference.clone(), domain.clone())),
+                    Value::Reference(Reference::new(lower_reference.clone(), domain.clone())),
+                    Value::Array(update),
                 ),
             )
             .unwrap();
-        let XlaValue::Array(higher_output) = higher_output else {
+        let Value::Array(higher_output) = higher_output else {
             panic!("first stateful public output must be an array")
         };
-        let XlaValue::Array(lower_output) = lower_output else {
-            panic!("second stateful public output must be an array")
-        };
+        let Value::Array(lower_output) = lower_output else { panic!("second stateful public output must be an array") };
         assert_eq!(read_f32_array(&client, &higher_output), vec![3.0]);
         assert_eq!(read_f32_array(&client, &lower_output), vec![3.0]);
         assert_eq!(read_f32_array(&client, &higher_reference.read().unwrap()), vec![3.0]);
@@ -4428,7 +4473,7 @@ mod tests {
             .client(ClientOptions::CPU(CpuClientOptions { device_count: Some(1), ..Default::default() }))
             .unwrap();
         let mesh = single_device_mesh(&client);
-        let domain = XlaSession::new(&client).domain();
+        let domain = Session::new(&client).domain();
         let array_type = ArrayType::scalar(DataType::F32)
             .with_sharding(Sharding::replicated(mesh.logical_mesh().clone(), 0))
             .unwrap();
@@ -4440,24 +4485,24 @@ mod tests {
             },
             (reference_type.clone(), reference_type, ArrayIrType::Array(array_type.clone())),
             &domain,
-            XlaOptions::new(mesh.clone()),
+            Options::new(mesh.clone()),
         )
         .unwrap();
         let first = ArrayReference::new(
-            XlaArray::from_host_buffer(&domain, array_type.clone(), mesh.clone(), 1.0f32.to_ne_bytes().as_slice())
+            Array::from_host_buffer(&domain, array_type.clone(), mesh.clone(), 1.0f32.to_ne_bytes().as_slice())
                 .unwrap(),
         );
         let second = ArrayReference::new(
-            XlaArray::from_host_buffer(&domain, array_type.clone(), mesh.clone(), 1.0f32.to_ne_bytes().as_slice())
+            Array::from_host_buffer(&domain, array_type.clone(), mesh.clone(), 1.0f32.to_ne_bytes().as_slice())
                 .unwrap(),
         );
         let (lower_reference, higher_reference) =
             if first.id() < second.id() { (first, second) } else { (second, first) };
         let higher_first_update =
-            XlaArray::from_host_buffer(&domain, array_type.clone(), mesh.clone(), 2.0f32.to_ne_bytes().as_slice())
+            Array::from_host_buffer(&domain, array_type.clone(), mesh.clone(), 2.0f32.to_ne_bytes().as_slice())
                 .unwrap();
         let lower_first_update =
-            XlaArray::from_host_buffer(&domain, array_type, mesh, 2.0f32.to_ne_bytes().as_slice()).unwrap();
+            Array::from_host_buffer(&domain, array_type, mesh, 2.0f32.to_ne_bytes().as_slice()).unwrap();
 
         // The two calls present the same holders in opposite argument order and start together. Both must finish:
         // internal identity ordering serializes their retained-guard windows without creating a lock cycle.
@@ -4478,9 +4523,9 @@ mod tests {
                         .send(compiled.call_statefully(
                             domain,
                             (
-                                XlaValue::Reference(XlaReference::new(first, domain.clone())),
-                                XlaValue::Reference(XlaReference::new(second, domain.clone())),
-                                XlaValue::Array(update),
+                                Value::Reference(Reference::new(first, domain.clone())),
+                                Value::Reference(Reference::new(second, domain.clone())),
+                                Value::Array(update),
                             ),
                         ))
                         .unwrap();
@@ -4503,7 +4548,7 @@ mod tests {
             .client(ClientOptions::CPU(CpuClientOptions { device_count: Some(1), ..Default::default() }))
             .unwrap();
         let mesh = single_device_mesh(&client);
-        let domain = XlaSession::new(&client).domain();
+        let domain = Session::new(&client).domain();
         let array_type = ArrayType::scalar(DataType::F32)
             .with_sharding(Sharding::replicated(mesh.logical_mesh().clone(), 0))
             .unwrap();
@@ -4517,12 +4562,12 @@ mod tests {
             },
             (reference_type.clone(), reference_type.clone(), reference_type, ArrayIrType::Array(array_type.clone())),
             &domain,
-            XlaOptions::new(mesh.clone()),
+            Options::new(mesh.clone()),
         )
         .unwrap();
         let reference_new = |value: f32| {
             ArrayReference::new(
-                XlaArray::from_host_buffer(&domain, array_type.clone(), mesh.clone(), value.to_ne_bytes().as_slice())
+                Array::from_host_buffer(&domain, array_type.clone(), mesh.clone(), value.to_ne_bytes().as_slice())
                     .unwrap(),
             )
         };
@@ -4535,8 +4580,7 @@ mod tests {
             .with_sharding(Sharding::replicated(mesh.logical_mesh().clone(), 0))
             .unwrap();
         let wrong_update =
-            XlaArray::from_host_buffer(&domain, wrong_update_type, mesh.clone(), 2.0f64.to_ne_bytes().as_slice())
-                .unwrap();
+            Array::from_host_buffer(&domain, wrong_update_type, mesh.clone(), 2.0f64.to_ne_bytes().as_slice()).unwrap();
         let declared_update_type = <&ArrayType>::try_from(&compiled.executable_function().input_types()[3]).unwrap();
         let expected_error = format!(
             "runtime input type {} does not refine declared type {declared_update_type}",
@@ -4546,10 +4590,10 @@ mod tests {
             compiled.call_statefully(
                 &domain,
                 (
-                    XlaValue::Reference(XlaReference::new(pre_handoff_first.clone(), domain.clone())),
-                    XlaValue::Reference(XlaReference::new(pre_handoff_second.clone(), domain.clone())),
-                    XlaValue::Reference(XlaReference::new(pre_handoff_read_only.clone(), domain.clone())),
-                    XlaValue::Array(wrong_update),
+                    Value::Reference(Reference::new(pre_handoff_first.clone(), domain.clone())),
+                    Value::Reference(Reference::new(pre_handoff_second.clone(), domain.clone())),
+                    Value::Reference(Reference::new(pre_handoff_read_only.clone(), domain.clone())),
+                    Value::Array(wrong_update),
                 ),
             ),
             Err(Error::Core(ryft_core::Error::Program(ProgramError::InvalidArgument { message })))
@@ -4564,17 +4608,17 @@ mod tests {
         let pre_submission_second = reference_new(10.0);
         let pre_submission_read_only = reference_new(20.0);
         let update =
-            XlaArray::from_host_buffer(&domain, array_type.clone(), mesh.clone(), 2.0f32.to_ne_bytes().as_slice())
+            Array::from_host_buffer(&domain, array_type.clone(), mesh.clone(), 2.0f32.to_ne_bytes().as_slice())
                 .unwrap();
-        XlaDomain::inject_stateful_failure_for_test(StatefulFailureInjection::BeforeSubmission);
+        Domain::inject_stateful_failure_for_test(StatefulFailureInjection::BeforeSubmission);
         assert!(matches!(
             compiled.call_statefully(
                 &domain,
                 (
-                    XlaValue::Reference(XlaReference::new(pre_submission_first.clone(), domain.clone())),
-                    XlaValue::Reference(XlaReference::new(pre_submission_second.clone(), domain.clone())),
-                    XlaValue::Reference(XlaReference::new(pre_submission_read_only.clone(), domain.clone())),
-                    XlaValue::Array(update),
+                    Value::Reference(Reference::new(pre_submission_first.clone(), domain.clone())),
+                    Value::Reference(Reference::new(pre_submission_second.clone(), domain.clone())),
+                    Value::Reference(Reference::new(pre_submission_read_only.clone(), domain.clone())),
+                    Value::Array(update),
                 ),
             ),
             Err(Error::Pjrt(ryft_pjrt::Error::Internal { message, .. }))
@@ -4590,17 +4634,17 @@ mod tests {
         let post_handoff_second = reference_new(10.0);
         let post_handoff_read_only = reference_new(20.0);
         let update =
-            XlaArray::from_host_buffer(&domain, array_type.clone(), mesh.clone(), 2.0f32.to_ne_bytes().as_slice())
+            Array::from_host_buffer(&domain, array_type.clone(), mesh.clone(), 2.0f32.to_ne_bytes().as_slice())
                 .unwrap();
-        XlaDomain::inject_stateful_failure_for_test(StatefulFailureInjection::AfterHandoff);
+        Domain::inject_stateful_failure_for_test(StatefulFailureInjection::AfterHandoff);
         assert!(matches!(
             compiled.call_statefully(
                 &domain,
                 (
-                    XlaValue::Reference(XlaReference::new(post_handoff_first.clone(), domain.clone())),
-                    XlaValue::Reference(XlaReference::new(post_handoff_second.clone(), domain.clone())),
-                    XlaValue::Reference(XlaReference::new(post_handoff_read_only.clone(), domain.clone())),
-                    XlaValue::Array(update),
+                    Value::Reference(Reference::new(post_handoff_first.clone(), domain.clone())),
+                    Value::Reference(Reference::new(post_handoff_second.clone(), domain.clone())),
+                    Value::Reference(Reference::new(post_handoff_read_only.clone(), domain.clone())),
+                    Value::Array(update),
                 ),
             ),
             Err(Error::Pjrt(ryft_pjrt::Error::Internal { message, .. }))
@@ -4624,17 +4668,17 @@ mod tests {
         let pre_commit_second = reference_new(10.0);
         let pre_commit_read_only = reference_new(20.0);
         let update =
-            XlaArray::from_host_buffer(&domain, array_type.clone(), mesh.clone(), 2.0f32.to_ne_bytes().as_slice())
+            Array::from_host_buffer(&domain, array_type.clone(), mesh.clone(), 2.0f32.to_ne_bytes().as_slice())
                 .unwrap();
-        XlaDomain::inject_stateful_failure_for_test(StatefulFailureInjection::BeforeHiddenReplacementCommit);
+        Domain::inject_stateful_failure_for_test(StatefulFailureInjection::BeforeHiddenReplacementCommit);
         assert!(matches!(
             compiled.call_statefully(
                 &domain,
                 (
-                    XlaValue::Reference(XlaReference::new(pre_commit_first.clone(), domain.clone())),
-                    XlaValue::Reference(XlaReference::new(pre_commit_second.clone(), domain.clone())),
-                    XlaValue::Reference(XlaReference::new(pre_commit_read_only.clone(), domain.clone())),
-                    XlaValue::Array(update),
+                    Value::Reference(Reference::new(pre_commit_first.clone(), domain.clone())),
+                    Value::Reference(Reference::new(pre_commit_second.clone(), domain.clone())),
+                    Value::Reference(Reference::new(pre_commit_read_only.clone(), domain.clone())),
+                    Value::Array(update),
                 ),
             ),
             Err(Error::Pjrt(ryft_pjrt::Error::Internal { message, .. }))
@@ -4655,16 +4699,16 @@ mod tests {
         let committed_first = reference_new(1.0);
         let committed_second = reference_new(10.0);
         let committed_read_only = reference_new(20.0);
-        let update = XlaArray::from_host_buffer(&domain, array_type, mesh, 2.0f32.to_ne_bytes().as_slice()).unwrap();
-        XlaDomain::inject_stateful_failure_for_test(StatefulFailureInjection::BeforePublicReconstruction);
+        let update = Array::from_host_buffer(&domain, array_type, mesh, 2.0f32.to_ne_bytes().as_slice()).unwrap();
+        Domain::inject_stateful_failure_for_test(StatefulFailureInjection::BeforePublicReconstruction);
         assert!(matches!(
             compiled.call_statefully(
                 &domain,
                 (
-                    XlaValue::Reference(XlaReference::new(committed_first.clone(), domain.clone())),
-                    XlaValue::Reference(XlaReference::new(committed_second.clone(), domain.clone())),
-                    XlaValue::Reference(XlaReference::new(committed_read_only.clone(), domain.clone())),
-                    XlaValue::Array(update),
+                    Value::Reference(Reference::new(committed_first.clone(), domain.clone())),
+                    Value::Reference(Reference::new(committed_second.clone(), domain.clone())),
+                    Value::Reference(Reference::new(committed_read_only.clone(), domain.clone())),
+                    Value::Array(update),
                 ),
             ),
             Err(Error::Pjrt(ryft_pjrt::Error::Internal { message, .. }))
@@ -4682,7 +4726,7 @@ mod tests {
             .client(ClientOptions::CPU(CpuClientOptions { device_count: Some(1), ..Default::default() }))
             .unwrap();
         let mesh = single_device_mesh(&client);
-        let domain = XlaSession::new(&client).domain();
+        let domain = Session::new(&client).domain();
         let array_type = ArrayType::scalar(DataType::F32)
             .with_sharding(Sharding::replicated(mesh.logical_mesh().clone(), 0))
             .unwrap();
@@ -4695,26 +4739,26 @@ mod tests {
             },
             (reference_type.clone(), reference_type, ArrayIrType::Array(array_type.clone())),
             &domain,
-            XlaOptions::new(mesh.clone()),
+            Options::new(mesh.clone()),
         )
         .unwrap();
         let first = ArrayReference::new(
-            XlaArray::from_host_buffer(&domain, array_type.clone(), mesh.clone(), 1.0f32.to_ne_bytes().as_slice())
+            Array::from_host_buffer(&domain, array_type.clone(), mesh.clone(), 1.0f32.to_ne_bytes().as_slice())
                 .unwrap(),
         );
         let frozen = ArrayReference::new(
-            XlaArray::from_host_buffer(&domain, array_type.clone(), mesh.clone(), 2.0f32.to_ne_bytes().as_slice())
+            Array::from_host_buffer(&domain, array_type.clone(), mesh.clone(), 2.0f32.to_ne_bytes().as_slice())
                 .unwrap(),
         );
         frozen.freeze().unwrap();
-        let update = XlaArray::from_host_buffer(&domain, array_type, mesh, 3.0f32.to_ne_bytes().as_slice()).unwrap();
+        let update = Array::from_host_buffer(&domain, array_type, mesh, 3.0f32.to_ne_bytes().as_slice()).unwrap();
         assert!(matches!(
             compiled.call_statefully(
                 &domain,
                 (
-                    XlaValue::Reference(XlaReference::new(first.clone(), domain.clone())),
-                    XlaValue::Reference(XlaReference::new(frozen, domain.clone())),
-                    XlaValue::Array(update),
+                    Value::Reference(Reference::new(first.clone(), domain.clone())),
+                    Value::Reference(Reference::new(frozen, domain.clone())),
+                    Value::Array(update),
                 ),
             ),
             Err(Error::Core(ryft_core::Error::Reference(ReferenceError::Frozen))),
@@ -4729,40 +4773,38 @@ mod tests {
             .client(ClientOptions::CPU(CpuClientOptions { device_count: Some(1), ..Default::default() }))
             .unwrap();
         let mesh = single_device_mesh(&client);
-        let domain = XlaSession::new(&client).domain();
+        let domain = Session::new(&client).domain();
         let input_type = ArrayType::scalar(DataType::F32)
             .with_sharding(Sharding::replicated(mesh.logical_mesh().clone(), 0))
             .unwrap();
 
-        let forward: CompiledXlaFunction<'_, ArrayType, Jacobian<ArrayType, ArrayType, ArrayType, ArrayType>> =
-            compile(
-                |input| {
-                    input
-                        .domain()
-                        .differentiate_at(input)
-                        .jacobian_forward(|value| Mul::mul(&value, &value))
-                        .expect("forward Jacobian should stage")
-                },
-                input_type.clone(),
-                &domain,
-                mesh.clone(),
-            )
-            .unwrap();
-        let reverse: CompiledXlaFunction<'_, ArrayType, Jacobian<ArrayType, ArrayType, ArrayType, ArrayType>> =
-            compile(
-                |input| {
-                    input
-                        .domain()
-                        .differentiate_at(input)
-                        .jacobian_reverse(|value| Mul::mul(&value, &value))
-                        .expect("reverse Jacobian should stage")
-                },
-                input_type.clone(),
-                &domain,
-                mesh.clone(),
-            )
-            .unwrap();
-        let second: CompiledXlaFunction<'_, ArrayType, Hessian<ArrayType, ArrayType, ArrayType, ArrayType>> = compile(
+        let forward: CompiledFunction<'_, ArrayType, Jacobian<ArrayType, ArrayType, ArrayType, ArrayType>> = compile(
+            |input| {
+                input
+                    .domain()
+                    .differentiate_at(input)
+                    .jacobian_forward(|value| Mul::mul(&value, &value))
+                    .expect("forward Jacobian should stage")
+            },
+            input_type.clone(),
+            &domain,
+            mesh.clone(),
+        )
+        .unwrap();
+        let reverse: CompiledFunction<'_, ArrayType, Jacobian<ArrayType, ArrayType, ArrayType, ArrayType>> = compile(
+            |input| {
+                input
+                    .domain()
+                    .differentiate_at(input)
+                    .jacobian_reverse(|value| Mul::mul(&value, &value))
+                    .expect("reverse Jacobian should stage")
+            },
+            input_type.clone(),
+            &domain,
+            mesh.clone(),
+        )
+        .unwrap();
+        let second: CompiledFunction<'_, ArrayType, Hessian<ArrayType, ArrayType, ArrayType, ArrayType>> = compile(
             |input| {
                 input
                     .domain()
@@ -4777,7 +4819,7 @@ mod tests {
         .unwrap();
 
         assert_eq!(domain.program_count(), 2);
-        let _: CompiledXlaFunction<'_, ArrayType, Jacobian<ArrayType, ArrayType, ArrayType, ArrayType>> = compile(
+        let _: CompiledFunction<'_, ArrayType, Jacobian<ArrayType, ArrayType, ArrayType, ArrayType>> = compile(
             |input| {
                 input
                     .domain()
@@ -4796,37 +4838,37 @@ mod tests {
             region
                 .instructions()
                 .iter()
-                .any(|instruction| matches!(instruction.operation(), XlaOperation::Array(ArrayOperation::Iota(_))))
+                .any(|instruction| matches!(instruction.operation(), Operation::Array(ArrayOperation::Iota(_))))
         }));
         assert!(reverse.source_program().program().regions().iter().any(|region| {
             region
                 .instructions()
                 .iter()
-                .any(|instruction| matches!(instruction.operation(), XlaOperation::Array(ArrayOperation::Iota(_))))
+                .any(|instruction| matches!(instruction.operation(), Operation::Array(ArrayOperation::Iota(_))))
         }));
         assert!(second.source_program().program().regions().iter().any(|region| {
             region
                 .instructions()
                 .iter()
-                .any(|instruction| matches!(instruction.operation(), XlaOperation::Array(ArrayOperation::Iota(_))))
+                .any(|instruction| matches!(instruction.operation(), Operation::Array(ArrayOperation::Iota(_))))
         }));
 
         for (compiled, expected) in [(forward, 6.0), (reverse, 6.0)] {
-            let input = XlaArray::from_host_buffer(
+            let input = Array::from_host_buffer(
                 &domain,
                 input_type.clone(),
                 mesh.clone(),
                 values_to_bytes::<f32>(&[3.0]).as_slice(),
             )
             .unwrap();
-            let jacobian: Jacobian<ArrayType, XlaArray<'_>, ArrayType, ArrayType> =
+            let jacobian: Jacobian<ArrayType, Array<'_>, ArrayType, ArrayType> =
                 domain.interpret(&compiled.executable_function(), input).unwrap();
             assert_eq!(read_f32_array(&client, jacobian.iter_blocks().next().unwrap().value()), vec![expected]);
         }
 
         let input =
-            XlaArray::from_host_buffer(&domain, input_type, mesh, values_to_bytes::<f32>(&[3.0]).as_slice()).unwrap();
-        let hessian: Hessian<ArrayType, XlaArray<'_>, ArrayType, ArrayType> =
+            Array::from_host_buffer(&domain, input_type, mesh, values_to_bytes::<f32>(&[3.0]).as_slice()).unwrap();
+        let hessian: Hessian<ArrayType, Array<'_>, ArrayType, ArrayType> =
             domain.interpret(&second.executable_function(), input).unwrap();
         assert_eq!(read_f32_array(&client, hessian.iter_blocks().next().unwrap().value()), vec![2.0]);
     }
@@ -4838,15 +4880,15 @@ mod tests {
             .client(ClientOptions::CPU(CpuClientOptions { device_count: Some(1), ..Default::default() }))
             .unwrap();
         let mesh = single_device_mesh(&client);
-        let domain = XlaSession::new(&client).domain();
+        let domain = Session::new(&client).domain();
         let scalar_type = ArrayType::scalar(DataType::F32)
             .with_sharding(Sharding::replicated(mesh.logical_mesh().clone(), 0))
             .unwrap();
-        let vector_type = ArrayType::new(DataType::F64, Shape::new(vec![Dimension::Static(2)]))
+        let vector_type = ArrayType::new(DataType::F64, Shape::new(vec![CoreDimension::Static(2)]))
             .with_sharding(Sharding::replicated(mesh.logical_mesh().clone(), 1))
             .unwrap();
 
-        let forward: CompiledXlaFunction<
+        let forward: CompiledFunction<
             '_,
             (ArrayType, ArrayType),
             Jacobian<ArrayType, ArrayType, (ArrayType, ArrayType), ArrayType>,
@@ -4866,12 +4908,12 @@ mod tests {
         .unwrap();
 
         let scalar =
-            XlaArray::from_host_buffer(&domain, scalar_type, mesh.clone(), values_to_bytes::<f32>(&[2.0]).as_slice())
+            Array::from_host_buffer(&domain, scalar_type, mesh.clone(), values_to_bytes::<f32>(&[2.0]).as_slice())
                 .unwrap();
         let vector =
-            XlaArray::from_host_buffer(&domain, vector_type, mesh, values_to_bytes::<f64>(&[1.0, 4.0]).as_slice())
+            Array::from_host_buffer(&domain, vector_type, mesh, values_to_bytes::<f64>(&[1.0, 4.0]).as_slice())
                 .unwrap();
-        let jacobian: Jacobian<ArrayType, XlaArray<'_>, (ArrayType, ArrayType), ArrayType> =
+        let jacobian: Jacobian<ArrayType, Array<'_>, (ArrayType, ArrayType), ArrayType> =
             domain.interpret(&forward.executable_function(), (scalar, vector)).unwrap();
         let blocks = jacobian.iter_blocks().collect::<Vec<_>>();
         assert_eq!(blocks.len(), 2);
@@ -4884,23 +4926,23 @@ mod tests {
     }
 
     #[test]
-    fn test_executable_xla_program_runs_without_transform_metadata() {
+    fn test_executable_program_runs_without_transform_metadata() {
         let plugin = load_cpu_plugin().unwrap();
         let client = plugin
             .client(ClientOptions::CPU(CpuClientOptions { device_count: Some(1), ..Default::default() }))
             .unwrap();
         let mesh = single_device_mesh(&client);
-        let domain = XlaSession::new(&client).domain();
+        let domain = Session::new(&client).domain();
 
-        let input_type = ArrayType::new(DataType::F32, Shape::new(vec![Dimension::Static(1)]))
+        let input_type = ArrayType::new(DataType::F32, Shape::new(vec![CoreDimension::Static(1)]))
             .with_sharding(Sharding::replicated(mesh.logical_mesh().clone(), 1))
             .unwrap();
-        let executable: ExecutableXlaFunction<'_, ArrayType, ArrayType> =
+        let executable: ExecutableFunction<'_, ArrayType, ArrayType> =
             compile(|input| input.sin().unwrap(), input_type.clone(), &domain, mesh.clone())
                 .unwrap()
                 .into_executable_function();
         let input =
-            XlaArray::from_host_buffer(&domain, input_type.clone(), mesh, values_to_bytes::<f32>(&[0.5]).as_slice())
+            Array::from_host_buffer(&domain, input_type.clone(), mesh, values_to_bytes::<f32>(&[0.5]).as_slice())
                 .unwrap();
 
         let output = domain.interpret(&executable, input).unwrap();
@@ -4910,7 +4952,7 @@ mod tests {
     }
 
     #[test]
-    fn test_executable_xla_program_rejects_foreign_client_before_enqueue() {
+    fn test_executable_program_rejects_foreign_client_before_enqueue() {
         let plugin = load_cpu_plugin().unwrap();
         let client = plugin
             .client(ClientOptions::CPU(CpuClientOptions { device_count: Some(1), ..Default::default() }))
@@ -4920,24 +4962,24 @@ mod tests {
             .unwrap();
         let mesh = single_device_mesh(&client);
         let other_mesh = single_device_mesh(&other_client);
-        let domain = XlaSession::new(&client).domain();
-        let other_domain = XlaSession::new(&other_client).domain();
-        let input_type = ArrayType::new(DataType::F32, Shape::new(vec![Dimension::Static(1)]))
+        let domain = Session::new(&client).domain();
+        let other_domain = Session::new(&other_client).domain();
+        let input_type = ArrayType::new(DataType::F32, Shape::new(vec![CoreDimension::Static(1)]))
             .with_sharding(Sharding::replicated(mesh.logical_mesh().clone(), 1))
             .unwrap();
-        let executable: ExecutableXlaFunction<'_, ArrayType, ArrayType> =
+        let executable: ExecutableFunction<'_, ArrayType, ArrayType> =
             compile(|input| input.sin().unwrap(), input_type.clone(), &domain, mesh.clone())
                 .unwrap()
                 .into_executable_function();
-        let other_input_type = ArrayType::new(DataType::F32, Shape::new(vec![Dimension::Static(1)]))
+        let other_input_type = ArrayType::new(DataType::F32, Shape::new(vec![CoreDimension::Static(1)]))
             .with_sharding(Sharding::replicated(other_mesh.logical_mesh().clone(), 1))
             .unwrap();
-        let other_executable: ExecutableXlaFunction<'_, ArrayType, ArrayType> =
+        let other_executable: ExecutableFunction<'_, ArrayType, ArrayType> =
             compile(|input| input.sin().unwrap(), other_input_type, &other_domain, other_mesh)
                 .unwrap()
                 .into_executable_function();
         let input =
-            XlaArray::from_host_buffer(&domain, input_type, mesh, values_to_bytes::<f32>(&[0.5]).as_slice()).unwrap();
+            Array::from_host_buffer(&domain, input_type, mesh, values_to_bytes::<f32>(&[0.5]).as_slice()).unwrap();
 
         assert!(matches!(
             other_domain.interpret(&executable, input.clone()),
@@ -4948,14 +4990,14 @@ mod tests {
             Err(Error::Execution(ExecutionError::ClientMismatch)),
         ));
         assert!(matches!(
-            domain.validate_xla_replacement(
+            domain.validate_replacement(
                 executable.function.compiled_program(),
                 other_executable.function.compiled_program(),
             ),
             Err(Error::Execution(ExecutionError::ClientMismatch)),
         ));
         assert!(matches!(
-            other_domain.validate_xla_replacement(
+            other_domain.validate_replacement(
                 executable.function.compiled_program(),
                 other_executable.function.compiled_program(),
             ),
@@ -4964,30 +5006,30 @@ mod tests {
     }
 
     #[test]
-    fn test_compiled_and_staged_xla_functions_are_send_and_sync() {
-        assert_send_sync::<CompiledXlaFunction<'static, ArrayType, ArrayType>>();
-        assert_send_sync::<StagedXlaFunction<'static, ArrayType, ArrayType>>();
+    fn test_compiled_and_staged_functions_are_send_and_sync() {
+        assert_send_sync::<CompiledFunction<'static, ArrayType, ArrayType>>();
+        assert_send_sync::<StagedFunction<'static, ArrayType, ArrayType>>();
     }
 
     #[test]
-    fn test_executable_xla_program_executes_across_threads() {
-        assert_send_sync::<ExecutableXlaFunction<'static, ArrayType, ArrayType>>();
+    fn test_executable_program_executes_across_threads() {
+        assert_send_sync::<ExecutableFunction<'static, ArrayType, ArrayType>>();
 
         let plugin = load_cpu_plugin().unwrap();
         let client = plugin
             .client(ClientOptions::CPU(CpuClientOptions { device_count: Some(1), ..Default::default() }))
             .unwrap();
         let mesh = single_device_mesh(&client);
-        let domain = XlaSession::new(&client).domain();
-        let input_type = ArrayType::new(DataType::F32, Shape::new(vec![Dimension::Static(1)]))
+        let domain = Session::new(&client).domain();
+        let input_type = ArrayType::new(DataType::F32, Shape::new(vec![CoreDimension::Static(1)]))
             .with_sharding(Sharding::replicated(mesh.logical_mesh().clone(), 1))
             .unwrap();
-        let executable: ExecutableXlaFunction<'_, ArrayType, ArrayType> =
+        let executable: ExecutableFunction<'_, ArrayType, ArrayType> =
             compile(|input| input.sin().unwrap(), input_type.clone(), &domain, mesh.clone())
                 .unwrap()
                 .into_executable_function();
         let input =
-            XlaArray::from_host_buffer(&domain, input_type, mesh, values_to_bytes::<f32>(&[0.5]).as_slice()).unwrap();
+            Array::from_host_buffer(&domain, input_type, mesh, values_to_bytes::<f32>(&[0.5]).as_slice()).unwrap();
 
         let output =
             std::thread::scope(|scope| scope.spawn(move || domain.interpret(&executable, input)).join().unwrap())
@@ -5002,11 +5044,11 @@ mod tests {
             .client(ClientOptions::CPU(CpuClientOptions { device_count: Some(1), ..Default::default() }))
             .unwrap();
         let mesh = single_device_mesh(&client);
-        let domain = XlaSession::new(&client).domain();
-        let input_type = ArrayType::new(DataType::F32, Shape::new(vec![Dimension::Static(1)]))
+        let domain = Session::new(&client).domain();
+        let input_type = ArrayType::new(DataType::F32, Shape::new(vec![CoreDimension::Static(1)]))
             .with_sharding(Sharding::replicated(mesh.logical_mesh().clone(), 1))
             .unwrap();
-        let compiled: CompiledXlaFunction<'_, ArrayType, ArrayType> =
+        let compiled: CompiledFunction<'_, ArrayType, ArrayType> =
             compile(|input| input.sin().unwrap(), input_type, &domain, mesh).unwrap();
 
         assert!(matches!(
@@ -5022,18 +5064,18 @@ mod tests {
             .client(ClientOptions::CPU(CpuClientOptions { device_count: Some(1), ..Default::default() }))
             .unwrap();
         let mesh = single_device_mesh(&client);
-        let domain = XlaSession::new(&client).domain();
-        let function: JittedXlaFunction<'_, _, bool, ArrayType, ArrayType> = jitted(
-            |apply_sine, input: XlaCompileTracer<'_>| Ok(if apply_sine { input.sin()? } else { input }),
+        let domain = Session::new(&client).domain();
+        let function: JittedFunction<'_, _, bool, ArrayType, ArrayType> = jitted(
+            |apply_sine, input: CompileTracer<'_>| Ok(if apply_sine { input.sin()? } else { input }),
             &domain,
             mesh.clone(),
         );
 
-        let input_type = ArrayType::new(DataType::F32, Shape::new(vec![Dimension::Static(1)]))
+        let input_type = ArrayType::new(DataType::F32, Shape::new(vec![CoreDimension::Static(1)]))
             .with_sharding(Sharding::replicated(mesh.logical_mesh().clone(), 1))
             .unwrap();
         let source =
-            XlaArray::from_host_buffer(&domain, input_type, mesh, values_to_bytes::<f32>(&[0.5]).as_slice()).unwrap();
+            Array::from_host_buffer(&domain, input_type, mesh, values_to_bytes::<f32>(&[0.5]).as_slice()).unwrap();
 
         let sine = function.call(true, source.clone()).unwrap();
         let warm_sine = function.call(true, source.clone()).unwrap();
@@ -5057,16 +5099,16 @@ mod tests {
             .client(ClientOptions::CPU(CpuClientOptions { device_count: Some(1), ..Default::default() }))
             .unwrap();
         let mesh = single_device_mesh(&client);
-        let engine = XlaSession::new(&client).domain();
+        let engine = Session::new(&client).domain();
 
-        let input_type = ArrayType::new(DataType::F32, Shape::new(vec![Dimension::Static(4)]))
+        let input_type = ArrayType::new(DataType::F32, Shape::new(vec![CoreDimension::Static(4)]))
             .with_sharding(Sharding::replicated(mesh.logical_mesh().clone(), 1))
             .unwrap();
-        let compiled: CompiledXlaFunction<'_, ArrayType, ArrayType> =
+        let compiled: CompiledFunction<'_, ArrayType, ArrayType> =
             compile(|x| x.clone() * x.stop_gradient().unwrap(), input_type.clone(), &engine, mesh.clone()).unwrap();
 
         let values = [0.0f32, 0.5, 1.0, 1.5];
-        let source = XlaArray::from_host_buffer(
+        let source = Array::from_host_buffer(
             &engine,
             input_type.clone(),
             mesh.clone(),
@@ -5092,7 +5134,7 @@ mod tests {
         }
 
         // Lowering preserves every result of one variadic barrier without materializing an MLIR operation.
-        let variadic: CompiledXlaFunction<'_, (ArrayType, ArrayType), (ArrayType, ArrayType)> = compile(
+        let variadic: CompiledFunction<'_, (ArrayType, ArrayType), (ArrayType, ArrayType)> = compile(
             |(first, second)| {
                 let context = first.domain();
                 let mut outputs = context.bind(StopGradientOperation::new(), Vec::new(), &[first, second]).unwrap();
@@ -5106,7 +5148,7 @@ mod tests {
         )
         .unwrap();
         let other_values = [4.0f32, 3.0, 2.0, 1.0];
-        let first = XlaArray::from_host_buffer(
+        let first = Array::from_host_buffer(
             &engine,
             input_type.clone(),
             mesh.clone(),
@@ -5114,7 +5156,7 @@ mod tests {
         )
         .unwrap();
         let second =
-            XlaArray::from_host_buffer(&engine, input_type, mesh, values_to_bytes::<f32>(&other_values).as_slice())
+            Array::from_host_buffer(&engine, input_type, mesh, values_to_bytes::<f32>(&other_values).as_slice())
                 .unwrap();
         let (first, second) = engine.interpret(&variadic.executable_function(), (first, second)).unwrap();
         assert_eq!(read_f32_array(&client, &first), values);
@@ -5129,7 +5171,7 @@ mod tests {
         let device_kind = device.default_memory().unwrap().kind().unwrap().into_owned();
         let device_id = device.id().unwrap();
         let mesh = single_device_mesh(&client);
-        let engine = XlaSession::new(&client).domain();
+        let engine = Session::new(&client).domain();
         let input_type = ArrayType::new_static(DataType::I64, [4])
             .with_sharding(Sharding::replicated(mesh.logical_mesh().clone(), 1))
             .unwrap();
@@ -5147,7 +5189,7 @@ mod tests {
             {
                 assert!(!available);
                 assert!(matches!(
-                    XlaArray::from_host_buffer(&engine, host_type, mesh.clone(), values_to_bytes(&values).as_slice()),
+                    Array::from_host_buffer(&engine, host_type, mesh.clone(), values_to_bytes(&values).as_slice()),
                     Err(Error::Array(error)) if matches!(error.as_ref(),
                         ArrayError::UnsupportedMemory { device_id: actual_device, memory: actual_memory }
                             if *actual_device == device_id && *actual_memory == memory,
@@ -5156,16 +5198,12 @@ mod tests {
                 continue;
             }
             assert!(available, "execution device does not expose required memory kind `{memory_kind}`");
-            let source = XlaArray::from_host_buffer(
-                &engine,
-                input_type.clone(),
-                mesh.clone(),
-                values_to_bytes(&values).as_slice(),
-            )
-            .unwrap();
+            let source =
+                Array::from_host_buffer(&engine, input_type.clone(), mesh.clone(), values_to_bytes(&values).as_slice())
+                    .unwrap();
 
             // A compiled host result must occupy the requested host memory, not just carry host metadata on a device buffer.
-            let to_host: CompiledXlaFunction<'_, ArrayType, ArrayType> =
+            let to_host: CompiledFunction<'_, ArrayType, ArrayType> =
                 compile(|input| input.transfer_to_memory(memory).unwrap(), input_type.clone(), &engine, mesh.clone())
                     .unwrap();
             let host = engine.interpret(&to_host.executable_function(), source.clone()).unwrap();
@@ -5178,7 +5216,7 @@ mod tests {
             );
 
             // Host placement survives an identity executable boundary, even without a transfer instruction.
-            let identity: CompiledXlaFunction<'_, ArrayType, ArrayType> =
+            let identity: CompiledFunction<'_, ArrayType, ArrayType> =
                 compile(|input| input, host_type.clone(), &engine, mesh.clone()).unwrap();
             let host = engine.interpret(&identity.executable_function(), host).unwrap();
             assert_eq!(host.r#type().as_ref(), &host_type);
@@ -5190,7 +5228,7 @@ mod tests {
             );
 
             // The host input signature must permit a real host input to return to device memory.
-            let to_device: CompiledXlaFunction<'_, ArrayType, ArrayType> =
+            let to_device: CompiledFunction<'_, ArrayType, ArrayType> =
                 compile(|input| input.transfer_to_memory(Memory::Device).unwrap(), host_type, &engine, mesh.clone())
                     .unwrap();
             let output = engine.interpret(&to_device.executable_function(), host).unwrap();
@@ -5202,7 +5240,7 @@ mod tests {
                 values,
             );
 
-            let round_trip: CompiledXlaFunction<'_, ArrayType, ArrayType> = compile(
+            let round_trip: CompiledFunction<'_, ArrayType, ArrayType> = compile(
                 |input| input.transfer_to_memory(memory).unwrap().transfer_to_memory(Memory::Device).unwrap(),
                 input_type.clone(),
                 &engine,
@@ -5223,7 +5261,7 @@ mod tests {
     /// Smoke test: after `compile` runs, the returned handle exposes the source
     /// [`Program`] that was traced. This is the foundation for diagnostics (printing the IR)
     /// and for transform composition / inner staging via
-    /// [`CompiledXlaFunction::call`].
+    /// [`CompiledFunction::call`].
     #[test]
     fn test_compiled_function_retains_source_program() {
         let plugin = load_cpu_plugin().unwrap();
@@ -5231,12 +5269,12 @@ mod tests {
             .client(ClientOptions::CPU(CpuClientOptions { device_count: Some(1), ..Default::default() }))
             .unwrap();
         let mesh = single_device_mesh(&client);
-        let engine = XlaSession::new(&client).domain();
+        let engine = Session::new(&client).domain();
 
-        let input_type = ArrayType::new(DataType::F32, Shape::new(vec![Dimension::Static(4)]))
+        let input_type = ArrayType::new(DataType::F32, Shape::new(vec![CoreDimension::Static(4)]))
             .with_sharding(Sharding::replicated(mesh.logical_mesh().clone(), 1))
             .unwrap();
-        let compiled: CompiledXlaFunction<'_, ArrayType, ArrayType> =
+        let compiled: CompiledFunction<'_, ArrayType, ArrayType> =
             compile(|x| x.sin().unwrap(), input_type.clone(), &engine, mesh.clone()).unwrap();
 
         // For `|x| x.sin()` with a single F32[4] input and a single F32[4] output, the program
@@ -5256,17 +5294,17 @@ mod tests {
 
         let client = execution_client();
         let mesh = single_device_mesh(&client);
-        let domain = XlaSession::new(&client).domain();
+        let domain = Session::new(&client).domain();
         let vector_type = ArrayType::new_static(DataType::F32, [3])
             .with_sharding(Sharding::replicated(mesh.logical_mesh().clone(), 1))
             .unwrap();
         let label_type = ArrayType::scalar(DataType::I32)
             .with_sharding(Sharding::replicated(mesh.logical_mesh().clone(), 0))
             .unwrap();
-        let soft_target = softmax_cross_entropy_with_target_logits::<ProjectedContext<XlaDomain<'_>, ArrayType>>(-1);
+        let soft_target = softmax_cross_entropy_with_target_logits::<ProjectedContext<Domain<'_>, ArrayType>>(-1);
         // Compile each complete stabilized derivative so optimizer rewrites cannot hide behind eager operation
         // boundaries. Integer labels and teacher logits parameterize their respective losses without differentiation.
-        let compiled: CompiledXlaFunction<
+        let compiled: CompiledFunction<
             '_,
             (ArrayType, ArrayType, ArrayType, ArrayType),
             (ArrayType, ArrayType, ArrayType),
@@ -5288,19 +5326,19 @@ mod tests {
         )
         .unwrap();
         let student_values = [2.0f32 - 1e-7, 1.0f32 + 1e-7, 0.0];
-        let logits = XlaArray::from_host_buffer(
+        let logits = Array::from_host_buffer(
             &domain,
             vector_type.clone(),
             mesh.clone(),
             &values_to_bytes(&[9.0f32, -9.0, -9.0]),
         )
         .unwrap();
-        let labels = XlaArray::from_host_buffer(&domain, label_type, mesh.clone(), &values_to_bytes(&[0i32])).unwrap();
+        let labels = Array::from_host_buffer(&domain, label_type, mesh.clone(), &values_to_bytes(&[0i32])).unwrap();
         let student =
-            XlaArray::from_host_buffer(&domain, vector_type.clone(), mesh.clone(), &values_to_bytes(&student_values))
+            Array::from_host_buffer(&domain, vector_type.clone(), mesh.clone(), &values_to_bytes(&student_values))
                 .unwrap();
         let teacher =
-            XlaArray::from_host_buffer(&domain, vector_type, mesh, &values_to_bytes(&[2.0f32, 1.0, 0.0])).unwrap();
+            Array::from_host_buffer(&domain, vector_type, mesh, &values_to_bytes(&[2.0f32, 1.0, 0.0])).unwrap();
         let (loss, hard_gradient, soft_gradient) =
             domain.interpret(&compiled.executable_function(), (logits, labels, student, teacher)).unwrap();
 
@@ -5335,13 +5373,13 @@ mod tests {
             .client(ClientOptions::CPU(CpuClientOptions { device_count: Some(2), ..Default::default() }))
             .unwrap();
         let mesh = two_device_mesh(&client, MeshAxisType::Explicit);
-        let engine = XlaSession::new(&client).domain();
+        let engine = Session::new(&client).domain();
         let sharding = Sharding::new(mesh.logical_mesh().clone(), vec![ShardingDimension::sharded(["x"])]).unwrap();
         let logits_type = ArrayType::new_static(DataType::F32, [4]).with_sharding(sharding.clone()).unwrap();
         let label_type = ArrayType::scalar(DataType::I32)
             .with_sharding(Sharding::replicated(mesh.logical_mesh().clone(), 0))
             .unwrap();
-        let compiled: CompiledXlaFunction<'_, (ArrayType, ArrayType), (ArrayType, ArrayType, ArrayType)> = compile(
+        let compiled: CompiledFunction<'_, (ArrayType, ArrayType), (ArrayType, ArrayType, ArrayType)> = compile(
             |(logits, labels)| {
                 let probabilities = logits.softmax(0).unwrap();
                 let (loss, gradient) = differentiate_at(logits)
@@ -5356,13 +5394,13 @@ mod tests {
         )
         .unwrap();
         let values = [9.0f32, -9.0, 1.0, -9.0];
-        let logits = XlaArray::from_host_buffer(&engine, logits_type, mesh.clone(), &values_to_bytes(&values)).unwrap();
-        let labels = XlaArray::from_host_buffer(&engine, label_type, mesh, &values_to_bytes(&[2i32])).unwrap();
+        let logits = Array::from_host_buffer(&engine, logits_type, mesh.clone(), &values_to_bytes(&values)).unwrap();
+        let labels = Array::from_host_buffer(&engine, label_type, mesh, &values_to_bytes(&[2i32])).unwrap();
         let (probabilities, loss, gradient) =
             engine.interpret(&compiled.executable_function(), (logits, labels)).unwrap();
         assert_eq!(probabilities.sharding(), &sharding);
         assert_eq!(gradient.sharding(), &sharding);
-        let read_shards = |array: &XlaArray<'_>| {
+        let read_shards = |array: &Array<'_>| {
             let mut observed = Vec::new();
             for device in client.addressable_devices().unwrap().iter().take(2) {
                 let bytes = array
@@ -5399,15 +5437,15 @@ mod tests {
             .client(ClientOptions::CPU(CpuClientOptions { device_count: Some(1), ..Default::default() }))
             .unwrap();
         let mesh = single_device_mesh(&client);
-        let engine = XlaSession::new(&client).domain();
+        let engine = Session::new(&client).domain();
 
-        let input_type = ArrayType::new(DataType::F32, Shape::new(vec![Dimension::Static(1)]))
+        let input_type = ArrayType::new(DataType::F32, Shape::new(vec![CoreDimension::Static(1)]))
             .with_sharding(Sharding::replicated(mesh.logical_mesh().clone(), 1))
             .unwrap();
-        let compiled: CompiledXlaFunction<'_, ArrayType, ()> =
+        let compiled: CompiledFunction<'_, ArrayType, ()> =
             compile(|_| (), input_type.clone(), &engine, mesh.clone()).unwrap();
         let input =
-            XlaArray::from_host_buffer(&engine, input_type, mesh, values_to_bytes::<f32>(&[1.0]).as_slice()).unwrap();
+            Array::from_host_buffer(&engine, input_type, mesh, values_to_bytes::<f32>(&[1.0]).as_slice()).unwrap();
 
         let execution = engine.interpret_async(&compiled.executable_function(), input).unwrap();
         assert_eq!(execution.output(), &());
@@ -5420,7 +5458,7 @@ mod tests {
     /// whole computation were a single closure. Mirrors JAX's
     /// `jit(lambda x: jit(f)(x).cos())` pattern.
     ///
-    /// Exercises [`CompiledXlaFunction::call`], which stages the retained source program behind a
+    /// Exercises [`CompiledFunction::call`], which stages the retained source program behind a
     /// `jit_call` boundary in the active outer trace.
     #[test]
     fn test_compiled_function_staged_inside_compile() {
@@ -5431,40 +5469,40 @@ mod tests {
             .client(ClientOptions::CPU(CpuClientOptions { device_count: Some(1), ..Default::default() }))
             .unwrap();
         let mesh = single_device_mesh(&client);
-        let engine = XlaSession::new(&client).domain();
+        let engine = Session::new(&client).domain();
 
-        let input_type = ArrayType::new(DataType::F32, Shape::new(vec![Dimension::Static(4)]))
+        let input_type = ArrayType::new(DataType::F32, Shape::new(vec![CoreDimension::Static(4)]))
             .with_sharding(Sharding::replicated(mesh.logical_mesh().clone(), 1))
             .unwrap();
 
         // Inner: compile `f = |x| x.sin()`.
-        let inner: CompiledXlaFunction<'_, ArrayType, ArrayType> =
+        let inner: CompiledFunction<'_, ArrayType, ArrayType> =
             compile(|x| x.sin().unwrap(), input_type.clone(), &engine, mesh.clone()).unwrap();
 
         // Outer: compile `g = |x| cos(inner(x))` by staging `inner` as one `jit_call` and applying `cos` to its
         // output.
-        let outer: CompiledXlaFunction<'_, ArrayType, ArrayType> =
+        let outer: CompiledFunction<'_, ArrayType, ArrayType> =
             compile(move |x| inner.call(x).unwrap().cos().unwrap(), input_type.clone(), &engine, mesh.clone()).unwrap();
         let jit_call_count = outer
             .source_program()
             .program()
             .instructions()
             .iter()
-            .filter(|instruction| matches!(instruction.operation(), XlaOperation::JitCall(_)))
+            .filter(|instruction| matches!(instruction.operation(), Operation::JitCall(_)))
             .count();
         let inlined_sin_count = outer
             .source_program()
             .program()
             .instructions()
             .iter()
-            .filter(|instruction| matches!(instruction.operation(), XlaOperation::Array(ArrayOperation::Sin(_))))
+            .filter(|instruction| matches!(instruction.operation(), Operation::Array(ArrayOperation::Sin(_))))
             .count();
         assert_eq!(jit_call_count, 1, "inner compiled function should stage as one jit_call");
         assert_eq!(inlined_sin_count, 0, "inner function body should not be inlined into the outer trace");
 
         // Execute and compare against the mathematical reference.
         let values = [0.0f32, 0.5, 1.0, 1.5];
-        let source = XlaArray::from_host_buffer(
+        let source = Array::from_host_buffer(
             &engine,
             input_type.clone(),
             mesh.clone(),
@@ -5497,12 +5535,12 @@ mod tests {
             .client(ClientOptions::CPU(CpuClientOptions { device_count: Some(1), ..Default::default() }))
             .unwrap();
         let mesh = single_device_mesh(&client);
-        let engine = XlaSession::new(&client).domain();
+        let engine = Session::new(&client).domain();
 
-        let input_type = ArrayType::new(DataType::F32, Shape::new(vec![Dimension::Static(4)]))
+        let input_type = ArrayType::new(DataType::F32, Shape::new(vec![CoreDimension::Static(4)]))
             .with_sharding(Sharding::replicated(mesh.logical_mesh().clone(), 1))
             .unwrap();
-        let bias = XlaArray::from_host_buffer(
+        let bias = Array::from_host_buffer(
             &engine,
             input_type.clone(),
             mesh.clone(),
@@ -5510,7 +5548,7 @@ mod tests {
         )
         .unwrap();
 
-        let compiled: CompiledXlaFunction<'_, ArrayType, ArrayType> = compile_with_captures(
+        let compiled: CompiledFunction<'_, ArrayType, ArrayType> = compile_with_captures(
             |captures, x| x + captures[0].clone(),
             vec![bias],
             input_type.clone(),
@@ -5522,7 +5560,7 @@ mod tests {
         assert_eq!(compiled.source_program().captures().len(), 1);
         assert_eq!(compiled.source_program().to_program_with_lifted_captures().unwrap().input_ids().len(), 2);
 
-        let input = XlaArray::from_host_buffer(
+        let input = Array::from_host_buffer(
             &engine,
             input_type,
             mesh.clone(),
@@ -5541,12 +5579,12 @@ mod tests {
             .client(ClientOptions::CPU(CpuClientOptions { device_count: Some(1), ..Default::default() }))
             .unwrap();
         let mesh = single_device_mesh(&client);
-        let engine = XlaSession::new(&client).domain();
+        let engine = Session::new(&client).domain();
         let sharding = Sharding::replicated(mesh.logical_mesh().clone(), 0);
         let input_type = ArrayType::new(DataType::F32, Shape::new(Vec::new())).with_sharding(sharding.clone()).unwrap();
         let zero_type = ArrayType::new(DataType::Zero, Shape::new(Vec::new())).with_sharding(sharding).unwrap();
-        let capture = XlaArray::from_host_buffer(&engine, zero_type.clone(), mesh.clone(), []).unwrap();
-        let compiled: CompiledXlaFunction<'_, ArrayType, ArrayType> = compile_with_captures(
+        let capture = Array::from_host_buffer(&engine, zero_type.clone(), mesh.clone(), []).unwrap();
+        let compiled: CompiledFunction<'_, ArrayType, ArrayType> = compile_with_captures(
             |captures, _| captures[0].clone(),
             vec![capture],
             input_type.clone(),
@@ -5554,7 +5592,7 @@ mod tests {
             mesh.clone(),
         )
         .unwrap();
-        let input = XlaArray::from_host_buffer(&engine, input_type, mesh, values_to_bytes::<f32>(&[1.0])).unwrap();
+        let input = Array::from_host_buffer(&engine, input_type, mesh, values_to_bytes::<f32>(&[1.0])).unwrap();
 
         let output = engine.interpret(&compiled.executable_function(), input).unwrap();
 
@@ -5570,19 +5608,19 @@ mod tests {
             .client(ClientOptions::CPU(CpuClientOptions { device_count: Some(1), ..Default::default() }))
             .unwrap();
         let mesh = single_device_mesh(&client);
-        let engine = XlaSession::new(&client).domain();
+        let engine = Session::new(&client).domain();
 
-        let input_type = ArrayType::new(DataType::F32, Shape::new(vec![Dimension::Static(4)]))
+        let input_type = ArrayType::new(DataType::F32, Shape::new(vec![CoreDimension::Static(4)]))
             .with_sharding(Sharding::replicated(mesh.logical_mesh().clone(), 1))
             .unwrap();
-        let bias = XlaArray::from_host_buffer(
+        let bias = Array::from_host_buffer(
             &engine,
             input_type.clone(),
             mesh.clone(),
             values_to_bytes::<f32>(&[2.0, 2.0, 2.0, 2.0]).as_slice(),
         )
         .unwrap();
-        let inner: CompiledXlaFunction<'_, ArrayType, ArrayType> = compile_with_captures(
+        let inner: CompiledFunction<'_, ArrayType, ArrayType> = compile_with_captures(
             |captures, x| x + captures[0].clone(),
             vec![bias],
             input_type.clone(),
@@ -5590,12 +5628,12 @@ mod tests {
             mesh.clone(),
         )
         .unwrap();
-        let outer: CompiledXlaFunction<'_, ArrayType, ArrayType> =
+        let outer: CompiledFunction<'_, ArrayType, ArrayType> =
             compile(move |x| inner.call(x).unwrap().sin().unwrap(), input_type.clone(), &engine, mesh.clone()).unwrap();
 
         assert_eq!(outer.source_program().captures().len(), 1);
 
-        let input = XlaArray::from_host_buffer(
+        let input = Array::from_host_buffer(
             &engine,
             input_type,
             mesh.clone(),
@@ -5616,26 +5654,26 @@ mod tests {
             .client(ClientOptions::CPU(CpuClientOptions { device_count: Some(1), ..Default::default() }))
             .unwrap();
         let mesh = single_device_mesh(&client);
-        let engine = XlaSession::new(&client).domain();
+        let engine = Session::new(&client).domain();
 
-        let input_type = ArrayType::new(DataType::F32, Shape::new(vec![Dimension::Static(4)]))
+        let input_type = ArrayType::new(DataType::F32, Shape::new(vec![CoreDimension::Static(4)]))
             .with_sharding(Sharding::replicated(mesh.logical_mesh().clone(), 1))
             .unwrap();
-        let left_bias = XlaArray::from_host_buffer(
+        let left_bias = Array::from_host_buffer(
             &engine,
             input_type.clone(),
             mesh.clone(),
             values_to_bytes::<f32>(&[2.0, 2.0, 2.0, 2.0]).as_slice(),
         )
         .unwrap();
-        let right_bias = XlaArray::from_host_buffer(
+        let right_bias = Array::from_host_buffer(
             &engine,
             input_type.clone(),
             mesh.clone(),
             values_to_bytes::<f32>(&[10.0, 10.0, 10.0, 10.0]).as_slice(),
         )
         .unwrap();
-        let left: CompiledXlaFunction<'_, ArrayType, ArrayType> = compile_with_captures(
+        let left: CompiledFunction<'_, ArrayType, ArrayType> = compile_with_captures(
             |captures, x| x + captures[0].clone(),
             vec![left_bias],
             input_type.clone(),
@@ -5643,7 +5681,7 @@ mod tests {
             mesh.clone(),
         )
         .unwrap();
-        let right: CompiledXlaFunction<'_, ArrayType, ArrayType> = compile_with_captures(
+        let right: CompiledFunction<'_, ArrayType, ArrayType> = compile_with_captures(
             |captures, x| x + captures[0].clone(),
             vec![right_bias],
             input_type.clone(),
@@ -5651,7 +5689,7 @@ mod tests {
             mesh.clone(),
         )
         .unwrap();
-        let outer: CompiledXlaFunction<'_, ArrayType, ArrayType> = compile(
+        let outer: CompiledFunction<'_, ArrayType, ArrayType> = compile(
             move |x| left.call(x.clone()).unwrap() + right.call(x).unwrap(),
             input_type.clone(),
             &engine,
@@ -5661,7 +5699,7 @@ mod tests {
 
         assert_eq!(outer.source_program().captures().len(), 2);
 
-        let input = XlaArray::from_host_buffer(
+        let input = Array::from_host_buffer(
             &engine,
             input_type,
             mesh.clone(),
@@ -5682,18 +5720,18 @@ mod tests {
             .client(ClientOptions::CPU(CpuClientOptions { device_count: Some(1), ..Default::default() }))
             .unwrap();
         let mesh = single_device_mesh(&client);
-        let engine = XlaSession::new(&client).domain();
+        let engine = Session::new(&client).domain();
 
         let sharding = Sharding::replicated(mesh.logical_mesh().clone(), 0);
         let input_type = ArrayType::new(DataType::F32, Shape::new(Vec::new())).with_sharding(sharding).unwrap();
-        let bias = XlaArray::from_host_buffer(
+        let bias = Array::from_host_buffer(
             &engine,
             input_type.clone(),
             mesh.clone(),
             values_to_bytes::<f32>(&[2.0]).as_slice(),
         )
         .unwrap();
-        let inner: CompiledXlaFunction<'_, ArrayType, ArrayType> = compile_with_captures(
+        let inner: CompiledFunction<'_, ArrayType, ArrayType> = compile_with_captures(
             |captures, x| x + captures[0].clone(),
             vec![bias],
             input_type.clone(),
@@ -5701,12 +5739,12 @@ mod tests {
             mesh.clone(),
         )
         .unwrap();
-        let jvp_compiled: CompiledXlaFunction<'_, (ArrayType, ArrayType), (ArrayType, ArrayType)> =
+        let jvp_compiled: CompiledFunction<'_, (ArrayType, ArrayType), (ArrayType, ArrayType)> =
             inner.jvp(&engine).unwrap();
 
         assert_eq!(jvp_compiled.source_program().captures().len(), 1);
 
-        let primal = XlaArray::from_host_buffer(
+        let primal = Array::from_host_buffer(
             &engine,
             input_type.clone(),
             mesh.clone(),
@@ -5714,7 +5752,7 @@ mod tests {
         )
         .unwrap();
         let tangent =
-            XlaArray::from_host_buffer(&engine, input_type, mesh.clone(), values_to_bytes::<f32>(&[4.0]).as_slice())
+            Array::from_host_buffer(&engine, input_type, mesh.clone(), values_to_bytes::<f32>(&[4.0]).as_slice())
                 .unwrap();
         let (primal_output, tangent_output) =
             engine.interpret(&jvp_compiled.executable_function(), (primal, tangent)).unwrap();
@@ -5730,22 +5768,22 @@ mod tests {
             .client(ClientOptions::CPU(CpuClientOptions { device_count: Some(1), ..Default::default() }))
             .unwrap();
         let mesh = single_device_mesh(&client);
-        let engine = XlaSession::new(&client).domain();
+        let engine = Session::new(&client).domain();
         let extent = DimensionVariable::new("extent", DimensionBounds::new(1, Some(5)).unwrap());
-        let dynamic_type = ArrayType::new(DataType::F32, Shape::new(vec![Dimension::Dynamic(extent)]))
+        let dynamic_type = ArrayType::new(DataType::F32, Shape::new(vec![CoreDimension::Dynamic(extent)]))
             .with_sharding(Sharding::replicated(mesh.logical_mesh().clone(), 1))
             .unwrap();
         let scalar_type = ArrayType::scalar(DataType::F32)
             .with_sharding(Sharding::replicated(mesh.logical_mesh().clone(), 0))
             .unwrap();
-        let compiled: CompiledXlaFunction<'_, (ArrayType, ArrayType), ArrayType> =
+        let compiled: CompiledFunction<'_, (ArrayType, ArrayType), ArrayType> =
             compile(|(_, live)| live, (dynamic_type, scalar_type.clone()), &engine, mesh.clone()).unwrap();
-        let gradient: CompiledXlaFunction<'_, (ArrayType, ArrayType), (ArrayType, ArrayType)> =
+        let gradient: CompiledFunction<'_, (ArrayType, ArrayType), (ArrayType, ArrayType)> =
             compiled.gradient(&engine).unwrap();
         let concrete_type = ArrayType::new(DataType::F32, Shape::new(vec![3.into()]))
             .with_sharding(Sharding::replicated(mesh.logical_mesh().clone(), 1))
             .unwrap();
-        let disconnected = XlaArray::from_host_buffer(
+        let disconnected = Array::from_host_buffer(
             &engine,
             concrete_type,
             mesh.clone(),
@@ -5753,7 +5791,7 @@ mod tests {
         )
         .unwrap();
         let live =
-            XlaArray::from_host_buffer(&engine, scalar_type, mesh, values_to_bytes::<f32>(&[7.0]).as_slice()).unwrap();
+            Array::from_host_buffer(&engine, scalar_type, mesh, values_to_bytes::<f32>(&[7.0]).as_slice()).unwrap();
         let (zero, one) = engine.interpret(&gradient.executable_function(), (disconnected, live)).unwrap();
         assert_eq!(read_f32_array(&client, &zero), vec![0.0; 3]);
         assert_eq!(read_f32_array(&client, &one), vec![1.0]);
@@ -5766,7 +5804,7 @@ mod tests {
             .client(ClientOptions::CPU(CpuClientOptions { device_count: Some(1), ..Default::default() }))
             .unwrap();
         let mesh = single_device_mesh(&client);
-        let engine = XlaSession::new(&client).domain();
+        let engine = Session::new(&client).domain();
         let extent = DimensionVariable::new("extent", DimensionBounds::new(1, Some(5)).unwrap());
         let dynamic_type = ArrayType::new(DataType::F32, Shape::new(vec![extent.into()]))
             .with_sharding(Sharding::replicated(mesh.logical_mesh().clone(), 1))
@@ -5774,7 +5812,7 @@ mod tests {
         let scalar_type = ArrayType::scalar(DataType::F32)
             .with_sharding(Sharding::replicated(mesh.logical_mesh().clone(), 0))
             .unwrap();
-        let compiled: CompiledXlaFunction<'_, (ArrayType, ArrayType), ArrayType> = compile(
+        let compiled: CompiledFunction<'_, (ArrayType, ArrayType), ArrayType> = compile(
             |(dead, live)| {
                 let predicate = live.compare(&(-live.clone()), ComparisonDirection::GreaterThan).unwrap();
                 predicate
@@ -5786,7 +5824,7 @@ mod tests {
             mesh.clone(),
         )
         .unwrap();
-        let gradient: CompiledXlaFunction<'_, (ArrayType, ArrayType), (ArrayType, ArrayType)> =
+        let gradient: CompiledFunction<'_, (ArrayType, ArrayType), (ArrayType, ArrayType)> =
             compiled.gradient(&engine).unwrap();
         assert_eq!(
             gradient.source_program().program().to_string(),
@@ -5839,7 +5877,7 @@ mod tests {
         let concrete_type = ArrayType::new_static(DataType::F32, [3])
             .with_sharding(Sharding::replicated(mesh.logical_mesh().clone(), 1))
             .unwrap();
-        let dead = XlaArray::from_host_buffer(
+        let dead = Array::from_host_buffer(
             &engine,
             concrete_type,
             mesh.clone(),
@@ -5847,7 +5885,7 @@ mod tests {
         )
         .unwrap();
         for (value, expected_derivative) in [(7.0, 14.0), (-7.0, 1.0)] {
-            let live = XlaArray::from_host_buffer(
+            let live = Array::from_host_buffer(
                 &engine,
                 scalar_type.clone(),
                 mesh.clone(),
@@ -5867,7 +5905,7 @@ mod tests {
             .client(ClientOptions::CPU(CpuClientOptions { device_count: Some(1), ..Default::default() }))
             .unwrap();
         let mesh = single_device_mesh(&client);
-        let engine = XlaSession::new(&client).domain();
+        let engine = Session::new(&client).domain();
         let extent = DimensionVariable::new("extent", DimensionBounds::new(1, Some(5)).unwrap());
         let scalar_type = ArrayType::scalar(DataType::F32)
             .with_sharding(Sharding::replicated(mesh.logical_mesh().clone(), 0))
@@ -5876,7 +5914,7 @@ mod tests {
         let stacked_type = ArrayType::new(DataType::F32, Shape::new(vec![extent.clone().into()]))
             .with_sharding(Sharding::replicated(mesh.logical_mesh().clone(), 1))
             .unwrap();
-        let mut body = ProgramBuilder::<XlaConstant, XlaOperation>::new();
+        let mut body = CoreProgramBuilder::<Constant, Operation>::new();
         body.add_input(ArrayType::scalar(DataType::I64).into());
         let carry = body.add_input(scalar_type.clone().into());
         body.add_input(slice_type.into());
@@ -5884,20 +5922,20 @@ mod tests {
             .add_instruction(AddOperation::<ArrayType>::new(), Vec::new(), vec![carry, carry], None)
             .unwrap()[0];
         let body = Arc::new(
-            body.build::<Vec<XlaConstant>, Vec<XlaConstant>>(vec![doubled], vec![Placeholder; 3], vec![Placeholder])
+            body.build::<Vec<Constant>, Vec<Constant>>(vec![doubled], vec![Placeholder; 3], vec![Placeholder])
                 .unwrap(),
         );
-        let compiled: CompiledXlaFunction<'_, (ArrayType, ArrayType), ArrayType> = compile(
+        let compiled: CompiledFunction<'_, (ArrayType, ArrayType), ArrayType> = compile(
             |(elements, initial)| {
                 let size = DimensionSizeOperation::new(elements.r#type().as_ref(), 0).unwrap();
                 let elements = elements.into_value();
                 let context = elements.context().clone();
                 let length =
-                    context.bind(XlaOperation::DimensionSize(size), Vec::new(), &[elements.clone()]).unwrap().remove(0);
+                    context.bind(Operation::DimensionSize(size), Vec::new(), &[elements.clone()]).unwrap().remove(0);
                 let inputs = vec![initial.into_value(), elements, length];
                 let outputs = context
                     .bind(
-                        XlaOperation::Scan(ScanOperation::new(1, Dimension::Dynamic(extent.clone()))),
+                        Operation::Scan(ScanOperation::new(1, CoreDimension::Dynamic(extent.clone()))),
                         AttachedRegions::Callees(std::slice::from_ref(&body)),
                         &inputs,
                     )
@@ -5909,7 +5947,7 @@ mod tests {
             mesh.clone(),
         )
         .unwrap();
-        let gradient: CompiledXlaFunction<'_, (ArrayType, ArrayType), (ArrayType, ArrayType)> =
+        let gradient: CompiledFunction<'_, (ArrayType, ArrayType), (ArrayType, ArrayType)> =
             compiled.gradient(&engine).unwrap();
         assert_eq!(
             gradient.source_program().program().to_string(),
@@ -5950,7 +5988,7 @@ mod tests {
         let concrete_type = ArrayType::new_static(DataType::F32, [3])
             .with_sharding(Sharding::replicated(mesh.logical_mesh().clone(), 1))
             .unwrap();
-        let elements = XlaArray::from_host_buffer(
+        let elements = Array::from_host_buffer(
             &engine,
             concrete_type,
             mesh.clone(),
@@ -5958,7 +5996,7 @@ mod tests {
         )
         .unwrap();
         let initial =
-            XlaArray::from_host_buffer(&engine, scalar_type, mesh, values_to_bytes::<f32>(&[7.0]).as_slice()).unwrap();
+            Array::from_host_buffer(&engine, scalar_type, mesh, values_to_bytes::<f32>(&[7.0]).as_slice()).unwrap();
         let (zero, derivative) = engine.interpret(&gradient.executable_function(), (elements, initial)).unwrap();
         assert_eq!(read_f32_array(&client, &zero), vec![0.0; 3]);
         assert_eq!(read_f32_array(&client, &derivative), vec![8.0]);
@@ -5976,20 +6014,20 @@ mod tests {
             .client(ClientOptions::CPU(CpuClientOptions { device_count: Some(1), ..Default::default() }))
             .unwrap();
         let mesh = single_device_mesh(&client);
-        let engine = XlaSession::new(&client).domain();
+        let engine = Session::new(&client).domain();
         let extent = DimensionVariable::new("extent", DimensionBounds::new(1, Some(5)).unwrap());
-        let dynamic_type = ArrayType::new(DataType::F32, Shape::new(vec![Dimension::Dynamic(extent)]))
+        let dynamic_type = ArrayType::new(DataType::F32, Shape::new(vec![CoreDimension::Dynamic(extent)]))
             .with_sharding(Sharding::replicated(mesh.logical_mesh().clone(), 1))
             .unwrap();
         let scalar_type = ArrayType::scalar(DataType::F32)
             .with_sharding(Sharding::replicated(mesh.logical_mesh().clone(), 0))
             .unwrap();
         let input_types = (dynamic_type, scalar_type.clone());
-        let inner: CompiledXlaFunction<'_, (ArrayType, ArrayType), (ArrayType, ArrayType)> =
+        let inner: CompiledFunction<'_, (ArrayType, ArrayType), (ArrayType, ArrayType)> =
             compile(|(x, s)| (x.clone() * x, s.clone() * s), input_types.clone(), &engine, mesh.clone()).unwrap();
-        let outer: CompiledXlaFunction<'_, (ArrayType, ArrayType), ArrayType> =
+        let outer: CompiledFunction<'_, (ArrayType, ArrayType), ArrayType> =
             compile(move |inputs| inner.call(inputs).unwrap().1, input_types.clone(), &engine, mesh.clone()).unwrap();
-        let gradient: CompiledXlaFunction<'_, (ArrayType, ArrayType), (ArrayType, ArrayType)> =
+        let gradient: CompiledFunction<'_, (ArrayType, ArrayType), (ArrayType, ArrayType)> =
             outer.gradient(&engine).unwrap();
         assert_eq!(
             gradient.source_program().program().to_string(),
@@ -6034,7 +6072,7 @@ mod tests {
             .with_sharding(Sharding::replicated(mesh.logical_mesh().clone(), 1))
             .unwrap();
         let array = |r#type: &ArrayType, values: &[f32]| {
-            XlaArray::from_host_buffer(&engine, r#type.clone(), mesh.clone(), values_to_bytes::<f32>(values).as_slice())
+            Array::from_host_buffer(&engine, r#type.clone(), mesh.clone(), values_to_bytes::<f32>(values).as_slice())
                 .unwrap()
         };
         let x = array(&concrete_type, &[2.0, 3.0, 4.0]);
@@ -6058,7 +6096,7 @@ mod tests {
         assert_eq!(read_f32_array(&client, &s_gradient_tangent), vec![2.0]);
 
         // Reverse over reverse: the gradient of `∂outer/∂s = 2s` is `(0, 2)`.
-        let s_derivative: CompiledXlaFunction<'_, (ArrayType, ArrayType), ArrayType> =
+        let s_derivative: CompiledFunction<'_, (ArrayType, ArrayType), ArrayType> =
             compile(move |inputs| gradient.call(inputs).unwrap().1, input_types, &engine, mesh.clone()).unwrap();
         let reverse_over_reverse = s_derivative.gradient(&engine).unwrap();
         let (x_second, s_second) = engine.interpret(&reverse_over_reverse.executable_function(), (x, s)).unwrap();
@@ -6073,18 +6111,18 @@ mod tests {
             .client(ClientOptions::CPU(CpuClientOptions { device_count: Some(1), ..Default::default() }))
             .unwrap();
         let mesh = single_device_mesh(&client);
-        let engine = XlaSession::new(&client).domain();
+        let engine = Session::new(&client).domain();
 
         let sharding = Sharding::replicated(mesh.logical_mesh().clone(), 0);
         let input_type = ArrayType::new(DataType::F32, Shape::new(Vec::new())).with_sharding(sharding).unwrap();
-        let bias = XlaArray::from_host_buffer(
+        let bias = Array::from_host_buffer(
             &engine,
             input_type.clone(),
             mesh.clone(),
             values_to_bytes::<f32>(&[2.0]).as_slice(),
         )
         .unwrap();
-        let inner: CompiledXlaFunction<'_, ArrayType, ArrayType> = compile_with_captures(
+        let inner: CompiledFunction<'_, ArrayType, ArrayType> = compile_with_captures(
             |captures, x| x * captures[0].clone(),
             vec![bias],
             input_type.clone(),
@@ -6092,12 +6130,12 @@ mod tests {
             mesh.clone(),
         )
         .unwrap();
-        let gradient: CompiledXlaFunction<'_, ArrayType, ArrayType> = inner.gradient(&engine).unwrap();
+        let gradient: CompiledFunction<'_, ArrayType, ArrayType> = inner.gradient(&engine).unwrap();
 
         assert_eq!(gradient.source_program().captures().len(), 1);
 
         let input =
-            XlaArray::from_host_buffer(&engine, input_type, mesh, values_to_bytes::<f32>(&[3.0]).as_slice()).unwrap();
+            Array::from_host_buffer(&engine, input_type, mesh, values_to_bytes::<f32>(&[3.0]).as_slice()).unwrap();
         let output = engine.interpret(&gradient.executable_function(), input).unwrap();
 
         assert_eq!(read_f32_array(&client, &output), vec![2.0]);
@@ -6116,11 +6154,11 @@ mod tests {
             .client(ClientOptions::CPU(CpuClientOptions { device_count: Some(1), ..Default::default() }))
             .unwrap();
         let mesh = single_device_mesh(&client);
-        let engine = XlaSession::new(&client).domain();
+        let engine = Session::new(&client).domain();
 
         let sharding = Sharding::replicated(mesh.logical_mesh().clone(), 0);
         let input_type = ArrayType::new(DataType::F32, Shape::new(Vec::new())).with_sharding(sharding).unwrap();
-        let callee: CompiledXlaFunction<'_, ArrayType, ArrayType> = compile(
+        let callee: CompiledFunction<'_, ArrayType, ArrayType> = compile(
             |x| {
                 let mut value = x;
                 for index in 0..CALLEE_OPERATIONS {
@@ -6133,13 +6171,13 @@ mod tests {
             mesh.clone(),
         )
         .unwrap();
-        let outer: CompiledXlaFunction<'_, ArrayType, ArrayType> =
+        let outer: CompiledFunction<'_, ArrayType, ArrayType> =
             compile(move |x| callee.call(x).unwrap().sin().unwrap(), input_type.clone(), &engine, mesh.clone())
                 .unwrap();
 
-        let jvp: CompiledXlaFunction<'_, (ArrayType, ArrayType), (ArrayType, ArrayType)> = outer.jvp(&engine).unwrap();
+        let jvp: CompiledFunction<'_, (ArrayType, ArrayType), (ArrayType, ArrayType)> = outer.jvp(&engine).unwrap();
         assert_eq!(jvp.output_types().len(), 2);
-        let gradient: CompiledXlaFunction<'_, ArrayType, ArrayType> = outer.gradient(&engine).unwrap();
+        let gradient: CompiledFunction<'_, ArrayType, ArrayType> = outer.gradient(&engine).unwrap();
         assert_eq!(gradient.output_types().len(), 1);
 
         // A reference chain evaluated in `f64` pins the gradient's value: each step contributes its local derivative
@@ -6156,7 +6194,7 @@ mod tests {
         }
         expected_gradient *= expected_value.cos();
         let input =
-            XlaArray::from_host_buffer(&engine, input_type, mesh, values_to_bytes::<f32>(&[0.5]).as_slice()).unwrap();
+            Array::from_host_buffer(&engine, input_type, mesh, values_to_bytes::<f32>(&[0.5]).as_slice()).unwrap();
         let output = engine.interpret(&gradient.executable_function(), input).unwrap();
         assert!((read_f32_array(&client, &output)[0] as f64 - expected_gradient).abs() < 1e-3);
     }
@@ -6171,14 +6209,14 @@ mod tests {
             .client(ClientOptions::CPU(CpuClientOptions { device_count: Some(1), ..Default::default() }))
             .unwrap();
         let mesh = single_device_mesh(&client);
-        let engine = XlaSession::new(&client).domain();
+        let engine = Session::new(&client).domain();
 
         let sharding = Sharding::replicated(mesh.logical_mesh().clone(), 0);
         let input_type = ArrayType::new(DataType::F32, Shape::new(Vec::new())).with_sharding(sharding).unwrap();
-        let compiled: CompiledXlaFunction<'_, ArrayType, ArrayType> =
+        let compiled: CompiledFunction<'_, ArrayType, ArrayType> =
             compile(|x| x.clone() * x, input_type.clone(), &engine, mesh.clone()).unwrap();
 
-        let first: CompiledXlaFunction<'_, ArrayType, ArrayType> = compiled.gradient(&engine).unwrap();
+        let first: CompiledFunction<'_, ArrayType, ArrayType> = compiled.gradient(&engine).unwrap();
         let statistics = engine.compilation_context().statistics();
         let second = compiled.gradient(&engine).unwrap();
 
@@ -6189,7 +6227,7 @@ mod tests {
         // The retained derived function keeps residuals as runtime values: different primals through the shared
         // executable produce different, correct value-dependent gradients (`d(x*x)/dx = 2x`).
         for point in [3.0f32, -5.0f32] {
-            let input = XlaArray::from_host_buffer(
+            let input = Array::from_host_buffer(
                 &engine,
                 input_type.clone(),
                 mesh.clone(),
@@ -6201,7 +6239,7 @@ mod tests {
         }
 
         // A different domain identity misses, produces a fresh derivative, and replaces the retained slot.
-        let other_engine = XlaSession::new(&client).domain();
+        let other_engine = Session::new(&client).domain();
         let third = compiled.gradient(&other_engine).unwrap();
         assert!(!std::ptr::eq(first.function.compiled_program(), third.function.compiled_program()));
         let other_statistics = other_engine.compilation_context().statistics();
@@ -6211,7 +6249,7 @@ mod tests {
     }
 
     /// Mirrors [`test_gradient_method_retains_derived_function_per_domain`] for the forward-mode
-    /// [`CompiledXlaFunction::jvp`] path.
+    /// [`CompiledFunction::jvp`] path.
     #[test]
     fn test_jvp_method_retains_derived_function_per_domain() {
         let plugin = load_cpu_plugin().unwrap();
@@ -6219,14 +6257,14 @@ mod tests {
             .client(ClientOptions::CPU(CpuClientOptions { device_count: Some(1), ..Default::default() }))
             .unwrap();
         let mesh = single_device_mesh(&client);
-        let engine = XlaSession::new(&client).domain();
+        let engine = Session::new(&client).domain();
 
         let sharding = Sharding::replicated(mesh.logical_mesh().clone(), 0);
         let input_type = ArrayType::new(DataType::F32, Shape::new(Vec::new())).with_sharding(sharding).unwrap();
-        let compiled: CompiledXlaFunction<'_, ArrayType, ArrayType> =
+        let compiled: CompiledFunction<'_, ArrayType, ArrayType> =
             compile(|x| x.clone() * x, input_type.clone(), &engine, mesh.clone()).unwrap();
 
-        let first: CompiledXlaFunction<'_, (ArrayType, ArrayType), (ArrayType, ArrayType)> =
+        let first: CompiledFunction<'_, (ArrayType, ArrayType), (ArrayType, ArrayType)> =
             compiled.jvp(&engine).unwrap();
         let statistics = engine.compilation_context().statistics();
         let second = compiled.jvp(&engine).unwrap();
@@ -6235,7 +6273,7 @@ mod tests {
         assert_eq!(engine.compilation_context().statistics(), statistics);
 
         // The retained JVP computes `(x * x, 2 * x * t)` for runtime `(x, t)` supplied per call.
-        let primal = XlaArray::from_host_buffer(
+        let primal = Array::from_host_buffer(
             &engine,
             input_type.clone(),
             mesh.clone(),
@@ -6243,7 +6281,7 @@ mod tests {
         )
         .unwrap();
         let tangent =
-            XlaArray::from_host_buffer(&engine, input_type, mesh, values_to_bytes::<f32>(&[4.0]).as_slice()).unwrap();
+            Array::from_host_buffer(&engine, input_type, mesh, values_to_bytes::<f32>(&[4.0]).as_slice()).unwrap();
         let (primal_output, tangent_output) =
             engine.interpret(&second.executable_function(), (primal, tangent)).unwrap();
         assert_eq!(read_f32_array(&client, &primal_output), vec![9.0]);
@@ -6257,18 +6295,18 @@ mod tests {
             .client(ClientOptions::CPU(CpuClientOptions { device_count: Some(1), ..Default::default() }))
             .unwrap();
         let mesh = single_device_mesh(&client);
-        let engine = XlaSession::new(&client).domain();
+        let engine = Session::new(&client).domain();
 
         let sharding = Sharding::replicated(mesh.logical_mesh().clone(), 0);
         let input_type = ArrayType::new(DataType::F32, Shape::new(Vec::new())).with_sharding(sharding).unwrap();
-        let bias = XlaArray::from_host_buffer(
+        let bias = Array::from_host_buffer(
             &engine,
             input_type.clone(),
             mesh.clone(),
             values_to_bytes::<f32>(&[2.0]).as_slice(),
         )
         .unwrap();
-        let inner: CompiledXlaFunction<'_, ArrayType, ArrayType> = compile_with_captures(
+        let inner: CompiledFunction<'_, ArrayType, ArrayType> = compile_with_captures(
             |captures, x| x + captures[0].clone(),
             vec![bias],
             input_type.clone(),
@@ -6276,7 +6314,7 @@ mod tests {
             mesh.clone(),
         )
         .unwrap();
-        let jvp_compiled: CompiledXlaFunction<'_, (ArrayType, ArrayType), (ArrayType, ArrayType)> = compile(
+        let jvp_compiled: CompiledFunction<'_, (ArrayType, ArrayType), (ArrayType, ArrayType)> = compile(
             move |(primal, tangent)| {
                 let primal = primal.into_value();
                 let tangent = tangent.into_value();
@@ -6306,7 +6344,7 @@ mod tests {
 
         assert_eq!(jvp_compiled.source_program().captures().len(), 1);
 
-        let primal = XlaArray::from_host_buffer(
+        let primal = Array::from_host_buffer(
             &engine,
             input_type.clone(),
             mesh.clone(),
@@ -6314,7 +6352,7 @@ mod tests {
         )
         .unwrap();
         let tangent =
-            XlaArray::from_host_buffer(&engine, input_type, mesh.clone(), values_to_bytes::<f32>(&[4.0]).as_slice())
+            Array::from_host_buffer(&engine, input_type, mesh.clone(), values_to_bytes::<f32>(&[4.0]).as_slice())
                 .unwrap();
         let (primal_output, tangent_output) =
             engine.interpret(&jvp_compiled.executable_function(), (primal, tangent)).unwrap();
@@ -6323,7 +6361,7 @@ mod tests {
         assert_eq!(read_f32_array(&client, &tangent_output), vec![4.0]);
     }
 
-    /// Outer-transform smoke test: applying `grad` to a `CompiledXlaFunction` produces a new compiled function that
+    /// Outer-transform smoke test: applying `grad` to a `CompiledFunction` produces a new compiled function that
     /// For `f = |x| x.sin()`, `f.jvp()` produces a compiled function for which interpreting its executable function at
     /// `(primal, tangent)` returns `(sin(primal), cos(primal) * tangent)` within `1e-5`.
     #[test]
@@ -6333,28 +6371,28 @@ mod tests {
             .client(ClientOptions::CPU(CpuClientOptions { device_count: Some(1), ..Default::default() }))
             .unwrap();
         let mesh = single_device_mesh(&client);
-        let engine = XlaSession::new(&client).domain();
+        let engine = Session::new(&client).domain();
 
         let sharding = Sharding::replicated(mesh.logical_mesh().clone(), 0);
         let input_type = ArrayType::new(DataType::F32, Shape::new(Vec::new())).with_sharding(sharding).unwrap();
 
-        let inner: CompiledXlaFunction<'_, ArrayType, ArrayType> =
+        let inner: CompiledFunction<'_, ArrayType, ArrayType> =
             compile(|x| x.sin().unwrap(), input_type.clone(), &engine, mesh.clone()).unwrap();
-        let jvp_compiled: CompiledXlaFunction<'_, (ArrayType, ArrayType), (ArrayType, ArrayType)> =
+        let jvp_compiled: CompiledFunction<'_, (ArrayType, ArrayType), (ArrayType, ArrayType)> =
             inner.jvp(&engine).unwrap();
         let jit_call_count = jvp_compiled
             .source_program()
             .program()
             .instructions()
             .iter()
-            .filter(|instruction| matches!(instruction.operation(), XlaOperation::JitCall(_)))
+            .filter(|instruction| matches!(instruction.operation(), Operation::JitCall(_)))
             .count();
         let inlined_sin_count = jvp_compiled
             .source_program()
             .program()
             .instructions()
             .iter()
-            .filter(|instruction| matches!(instruction.operation(), XlaOperation::Array(ArrayOperation::Sin(_))))
+            .filter(|instruction| matches!(instruction.operation(), Operation::Array(ArrayOperation::Sin(_))))
             .count();
         assert_eq!(
             jit_call_count, 2,
@@ -6363,14 +6401,14 @@ mod tests {
         assert_eq!(inlined_sin_count, 0, "the JVP of a compiled call should not inline the callee body");
 
         for &(primal, tangent) in &[(0.0f32, 1.0f32), (0.25, 2.0), (0.5, -0.5), (1.0, 0.7)] {
-            let primal_array = XlaArray::from_host_buffer(
+            let primal_array = Array::from_host_buffer(
                 &engine,
                 input_type.clone(),
                 mesh.clone(),
                 values_to_bytes::<f32>([primal].as_slice()).as_slice(),
             )
             .unwrap();
-            let tangent_array = XlaArray::from_host_buffer(
+            let tangent_array = Array::from_host_buffer(
                 &engine,
                 input_type.clone(),
                 mesh.clone(),
@@ -6424,19 +6462,19 @@ mod tests {
             .client(ClientOptions::CPU(CpuClientOptions { device_count: Some(1), ..Default::default() }))
             .unwrap();
         let mesh = single_device_mesh(&client);
-        let engine = XlaSession::new(&client).domain();
+        let engine = Session::new(&client).domain();
 
         let sharding = Sharding::replicated(mesh.logical_mesh().clone(), 0);
         let primal_type = ArrayType::new(DataType::Boolean, Shape::new(Vec::new())).with_sharding(sharding).unwrap();
         let tangent_type = primal_type.tangent().unwrap();
-        let primal: CompiledXlaFunction<'_, ArrayType, ArrayType> =
+        let primal: CompiledFunction<'_, ArrayType, ArrayType> =
             compile(|value| value, primal_type.clone(), &engine, mesh.clone()).unwrap();
-        let jvp: CompiledXlaFunction<'_, (ArrayType, ArrayType), (ArrayType, ArrayType)> = primal.jvp(&engine).unwrap();
-        let zero_identity: CompiledXlaFunction<'_, ArrayType, ArrayType> =
+        let jvp: CompiledFunction<'_, (ArrayType, ArrayType), (ArrayType, ArrayType)> = primal.jvp(&engine).unwrap();
+        let zero_identity: CompiledFunction<'_, ArrayType, ArrayType> =
             compile(|value| value, tangent_type.clone(), &engine, mesh.clone()).unwrap();
 
-        let primal_input = XlaArray::from_host_buffer(&engine, primal_type.clone(), mesh.clone(), [1u8]).unwrap();
-        let tangent_input = XlaArray::from_host_buffer(&engine, tangent_type.clone(), mesh, []).unwrap();
+        let primal_input = Array::from_host_buffer(&engine, primal_type.clone(), mesh.clone(), [1u8]).unwrap();
+        let tangent_input = Array::from_host_buffer(&engine, tangent_type.clone(), mesh, []).unwrap();
         let (primal_output, tangent_output) =
             engine.interpret(&jvp.executable_function(), (primal_input, tangent_input)).unwrap();
 
@@ -6457,13 +6495,13 @@ mod tests {
     /// For `f = |x| x.sin()` wrapped in an outer `jit_call`, the split's primal half is itself a single
     /// `jit_call` producing the primal output plus one residual (and no inlined `Sin`/`Cos`), and its tangent half is a
     /// single `jit_call` consuming that residual (and no inlined `Sin`/`Cos`). Re-wrapping the two halves as a compiled
-    /// `(x, dx) -> (primal, tangent)` function reproduces the legacy [`jvp`](CompiledXlaFunction::jvp) result —
+    /// `(x, dx) -> (primal, tangent)` function reproduces the legacy [`jvp`](CompiledFunction::jvp) result —
     /// `(sin(x), cos(x) * dx)` — within `1e-5`.
     #[test]
     fn test_jvp_of_jit_call_preserves_boundary_and_matches_legacy_jvp() {
         use ryft_core::StagingContext;
 
-        use crate::experimental::ops::FlatXlaProgram;
+        use crate::experimental::ops::FlatProgram;
         use crate::operations::jit_call::JitCallOperation;
 
         let plugin = load_cpu_plugin().unwrap();
@@ -6471,25 +6509,24 @@ mod tests {
             .client(ClientOptions::CPU(CpuClientOptions { device_count: Some(1), ..Default::default() }))
             .unwrap();
         let mesh = single_device_mesh(&client);
-        let engine = XlaSession::new(&client).domain();
+        let engine = Session::new(&client).domain();
 
         let sharding = Sharding::replicated(mesh.logical_mesh().clone(), 0);
         let input_type = ArrayType::new(DataType::F32, Shape::new(Vec::new())).with_sharding(sharding).unwrap();
 
         // Inner `jit(sin)` staged as one `jit_call` inside an outer program, so the outer source program holds exactly
         // one `jit_call` instruction for the replay to differentiate.
-        let inner: CompiledXlaFunction<'_, ArrayType, ArrayType> =
+        let inner: CompiledFunction<'_, ArrayType, ArrayType> =
             compile(|x| x.sin().unwrap(), input_type.clone(), &engine, mesh.clone()).unwrap();
         let inner_for_outer = inner.clone();
-        let outer: StagedXlaFunction<'_, ArrayType, ArrayType> =
-            stage(move |x| inner_for_outer.call(x).unwrap(), input_type.clone(), XlaOptions::new(mesh.clone()))
-                .unwrap();
+        let outer: StagedFunction<'_, ArrayType, ArrayType> =
+            stage(move |x| inner_for_outer.call(x).unwrap(), input_type.clone(), Options::new(mesh.clone())).unwrap();
         let outer_program = outer.source_program().program();
         assert_eq!(
             outer_program
                 .instructions()
                 .iter()
-                .filter(|instruction| matches!(instruction.operation(), XlaOperation::JitCall(_)))
+                .filter(|instruction| matches!(instruction.operation(), Operation::JitCall(_)))
                 .count(),
             1,
             "outer program should stage the inner compiled function as exactly one jit_call",
@@ -6503,20 +6540,17 @@ mod tests {
         assert!(linearization.residual_count() >= 1, "sin's pushforward needs at least one residual (cos(x))");
 
         // Both halves must keep the callee behind a `jit_call` boundary rather than inlining `sin`/`cos`.
-        let count_operations = |program: &FlatXlaProgram| {
+        let count_operations = |program: &FlatProgram| {
             let jit_calls = program
                 .instructions()
                 .iter()
-                .filter(|instruction| matches!(instruction.operation(), XlaOperation::JitCall(_)))
+                .filter(|instruction| matches!(instruction.operation(), Operation::JitCall(_)))
                 .count();
             let inlined = program
                 .instructions()
                 .iter()
                 .filter(|instruction| {
-                    matches!(
-                        instruction.operation(),
-                        XlaOperation::Array(ArrayOperation::Sin(_) | ArrayOperation::Cos(_))
-                    )
+                    matches!(instruction.operation(), Operation::Array(ArrayOperation::Sin(_) | ArrayOperation::Cos(_)))
                 })
                 .count();
             (jit_calls, inlined)
@@ -6542,12 +6576,12 @@ mod tests {
         // structure the value-level reroute will stage and exercises the real XLA lowering and execution of both
         // jit_call boundaries.
         let (primal_half, tangent_half, residual_count, _) = linearization.into_parts();
-        let jvp_compiled: CompiledXlaFunction<'_, (ArrayType, ArrayType), (ArrayType, ArrayType)> = compile(
+        let jvp_compiled: CompiledFunction<'_, (ArrayType, ArrayType), (ArrayType, ArrayType)> = compile(
             move |(primal_input, tangent_input)| {
                 let context = primal_input.value().context().clone();
                 let mut primal_outputs = context
                     .stage_operation(
-                        XlaOperation::JitCall(JitCallOperation::new(0)),
+                        Operation::JitCall(JitCallOperation::new(0)),
                         AttachedRegions::Callees(&[primal_half.clone()]),
                         &[primal_input.into_value()],
                     )
@@ -6559,7 +6593,7 @@ mod tests {
                 tangent_inputs.extend(residuals);
                 let tangent_output = context
                     .stage_operation(
-                        XlaOperation::JitCall(JitCallOperation::new(0)),
+                        Operation::JitCall(JitCallOperation::new(0)),
                         AttachedRegions::Callees(&[tangent_half.clone()]),
                         tangent_inputs.as_slice(),
                     )
@@ -6579,14 +6613,14 @@ mod tests {
         .unwrap();
 
         for &(primal, tangent) in &[(0.0f32, 1.0f32), (0.25, 2.0), (0.5, -0.5), (1.0, 0.7)] {
-            let primal_array = XlaArray::from_host_buffer(
+            let primal_array = Array::from_host_buffer(
                 &engine,
                 input_type.clone(),
                 mesh.clone(),
                 values_to_bytes::<f32>([primal].as_slice()).as_slice(),
             )
             .unwrap();
-            let tangent_array = XlaArray::from_host_buffer(
+            let tangent_array = Array::from_host_buffer(
                 &engine,
                 input_type.clone(),
                 mesh.clone(),
@@ -6622,13 +6656,13 @@ mod tests {
             .client(ClientOptions::CPU(CpuClientOptions { device_count: Some(1), ..Default::default() }))
             .unwrap();
         let mesh = single_device_mesh(&client);
-        let engine = XlaSession::new(&client).domain();
+        let engine = Session::new(&client).domain();
 
         let scalar_sharding = Sharding::replicated(mesh.logical_mesh().clone(), 0);
         let scalar_input_type =
             ArrayType::new(DataType::F32, Shape::new(Vec::new())).with_sharding(scalar_sharding).unwrap();
 
-        let inner: CompiledXlaFunction<'_, ArrayType, ArrayType> =
+        let inner: CompiledFunction<'_, ArrayType, ArrayType> =
             compile(|x| x.sin().unwrap(), scalar_input_type, &engine, mesh.clone()).unwrap();
         let error = match inner.batch(&engine, 4) {
             Ok(_) => panic!("compiled batching should reject unsupported array IR region boundaries"),
@@ -6644,17 +6678,17 @@ mod tests {
             .client(ClientOptions::CPU(CpuClientOptions { device_count: Some(1), ..Default::default() }))
             .unwrap();
         let mesh = single_device_mesh(&client);
-        let engine = XlaSession::new(&client).domain();
+        let engine = Session::new(&client).domain();
 
-        let shape = Shape::new(vec![Dimension::Static(3)]);
+        let shape = Shape::new(vec![CoreDimension::Static(3)]);
         let sharding = Sharding::replicated(mesh.logical_mesh().clone(), 1);
         let input_type = ArrayType::new(DataType::F32, shape.clone()).with_sharding(sharding.clone()).unwrap();
-        let compiled: CompiledXlaFunction<'_, (ArrayType, ArrayType), ArrayType> =
+        let compiled: CompiledFunction<'_, (ArrayType, ArrayType), ArrayType> =
             compile(|(a, b)| a + b, (input_type.clone(), input_type.clone()), &engine, mesh.clone()).unwrap();
 
         let a_values = [10.0f32, 20.0, 30.0];
         let b_values = [1.0f32, 2.0, 3.0];
-        let a = XlaArray::from_host_buffer(
+        let a = Array::from_host_buffer(
             &engine,
             input_type.clone(),
             mesh.clone(),
@@ -6662,7 +6696,7 @@ mod tests {
         )
         .unwrap();
         let b =
-            XlaArray::from_host_buffer(&engine, input_type, mesh.clone(), values_to_bytes::<f32>(&b_values).as_slice())
+            Array::from_host_buffer(&engine, input_type, mesh.clone(), values_to_bytes::<f32>(&b_values).as_slice())
                 .unwrap();
         let output = engine.interpret(&compiled.executable_function(), (a, b)).unwrap();
 
@@ -6687,15 +6721,15 @@ mod tests {
             .client(ClientOptions::CPU(CpuClientOptions { device_count: Some(1), ..Default::default() }))
             .unwrap();
         let mesh = single_device_mesh(&client);
-        let engine = XlaSession::new(&client).domain();
-        let input_type = ArrayType::new(DataType::F32, Shape::new(vec![Dimension::Static(4)]))
+        let engine = Session::new(&client).domain();
+        let input_type = ArrayType::new(DataType::F32, Shape::new(vec![CoreDimension::Static(4)]))
             .with_sharding(Sharding::replicated(mesh.logical_mesh().clone(), 1))
             .unwrap();
 
         assert_eq!(engine.program_count(), 0);
         // Equivalent lowerings share one executable, so the second invocation is a cache hit.
         for _ in 0..2 {
-            let _: CompiledXlaFunction<'_, ArrayType, ArrayType> =
+            let _: CompiledFunction<'_, ArrayType, ArrayType> =
                 compile(|x| x.sin().unwrap(), input_type.clone(), &engine, mesh.clone()).unwrap();
         }
         assert_eq!(engine.program_count(), 1, "an equivalent repeated lowering should hit the cache");
@@ -6708,16 +6742,16 @@ mod tests {
             .client(ClientOptions::CPU(CpuClientOptions { device_count: Some(1), ..Default::default() }))
             .unwrap();
         let mesh = single_device_mesh(&client);
-        let engine = XlaSession::new(&client).domain();
-        let input_type = ArrayType::new(DataType::F32, Shape::new(vec![Dimension::Static(4)]))
+        let engine = Session::new(&client).domain();
+        let input_type = ArrayType::new(DataType::F32, Shape::new(vec![CoreDimension::Static(4)]))
             .with_sharding(Sharding::replicated(mesh.logical_mesh().clone(), 1))
             .unwrap();
 
         assert_eq!(engine.program_count(), 0);
         // Cache identity is the complete lowering plus options and target, not the Rust source location.
-        let _: CompiledXlaFunction<'_, ArrayType, ArrayType> =
+        let _: CompiledFunction<'_, ArrayType, ArrayType> =
             compile(|x| x.sin().unwrap(), input_type.clone(), &engine, mesh.clone()).unwrap();
-        let _: CompiledXlaFunction<'_, ArrayType, ArrayType> =
+        let _: CompiledFunction<'_, ArrayType, ArrayType> =
             compile(|x| x.sin().unwrap(), input_type, &engine, mesh).unwrap();
         assert_eq!(engine.program_count(), 1);
     }
@@ -6729,23 +6763,23 @@ mod tests {
             .client(ClientOptions::CPU(CpuClientOptions { device_count: Some(1), ..Default::default() }))
             .unwrap();
         let mesh = single_device_mesh(&client);
-        let engine = XlaSession::new(&client).domain();
-        let input_type = ArrayType::new(DataType::F32, Shape::new(vec![Dimension::Static(3)]))
+        let engine = Session::new(&client).domain();
+        let input_type = ArrayType::new(DataType::F32, Shape::new(vec![CoreDimension::Static(3)]))
             .with_sharding(Sharding::replicated(mesh.logical_mesh().clone(), 1))
             .unwrap();
-        let options = XlaOptions::new(mesh.clone()).with_donate(true);
-        let compiled: CompiledXlaFunction<'_, ArrayType, ArrayType> =
+        let options = Options::new(mesh.clone()).with_donate(true);
+        let compiled: CompiledFunction<'_, ArrayType, ArrayType> =
             compile_with_options(|x| x.sin().unwrap(), input_type.clone(), &engine, options).unwrap();
 
         let values = [0.0f32, 0.5, 1.0];
         let source =
-            XlaArray::from_host_buffer(&engine, input_type, mesh.clone(), values_to_bytes::<f32>(&values).as_slice())
+            Array::from_host_buffer(&engine, input_type, mesh.clone(), values_to_bytes::<f32>(&values).as_slice())
                 .unwrap();
         let output = engine.interpret(&compiled.executable_function(), source).unwrap();
 
         // The output remains independently readable after the donating call returns. Donation
         // is opaque from the host side — PJRT may reuse the input's device buffer for the
-        // output, but the public API only observes the resulting `XlaArray`.
+        // output, but the public API only observes the resulting `Array`.
         let device_id = client.addressable_devices().unwrap()[0].id().unwrap();
         let shard_bytes = output
             .device_shard(device_id)
@@ -6769,18 +6803,18 @@ mod tests {
             .client(ClientOptions::CPU(CpuClientOptions { device_count: Some(1), ..Default::default() }))
             .unwrap();
         let mesh = single_device_mesh(&client);
-        let engine = XlaSession::new(&client).domain();
-        let input_type = ArrayType::new(DataType::F32, Shape::new(vec![Dimension::Static(2)]))
+        let engine = Session::new(&client).domain();
+        let input_type = ArrayType::new(DataType::F32, Shape::new(vec![CoreDimension::Static(2)]))
             .with_sharding(Sharding::replicated(mesh.logical_mesh().clone(), 1))
             .unwrap();
         // Build a `donation_flags` vec whose length does not match the function's flat input
         // arity. `with_donate` enforces matching shape via the `Parameterized<bool>` bound on
         // its argument, so producing an arity mismatch requires setting `donation_flags`
-        // directly on `XlaOptions`.
-        let mut xla_options = XlaOptions::new(mesh.clone());
+        // directly on `Options`.
+        let mut xla_options = Options::new(mesh.clone());
         xla_options.donation_flags = Some(vec![true, false, false]); // 3 entries, 1 input
         let options = xla_options;
-        let result: Result<CompiledXlaFunction<'_, ArrayType, ArrayType>, Error> =
+        let result: Result<CompiledFunction<'_, ArrayType, ArrayType>, Error> =
             compile_with_options(|x| x.sin().unwrap(), input_type, &engine, options);
         assert!(matches!(
             result,
@@ -6806,14 +6840,14 @@ mod tests {
             .client(ClientOptions::CPU(CpuClientOptions { device_count: Some(1), ..Default::default() }))
             .unwrap();
         let mesh = single_device_mesh(&client);
-        let engine = XlaSession::new(&client).domain();
-        let array_type = ArrayType::new(DataType::F32, Shape::new(vec![Dimension::Static(4)]))
+        let engine = Session::new(&client).domain();
+        let array_type = ArrayType::new(DataType::F32, Shape::new(vec![CoreDimension::Static(4)]))
             .with_sharding(Sharding::replicated(mesh.logical_mesh().clone(), 1))
             .unwrap();
 
         for batch_size in [32usize, 64usize] {
             let input = HyperparamInput { array: array_type.clone(), batch_size };
-            let _: CompiledXlaFunction<'_, HyperparamInput<ArrayType>, ArrayType> =
+            let _: CompiledFunction<'_, HyperparamInput<ArrayType>, ArrayType> =
                 compile(|input| input.array.sin().unwrap(), input, &engine, mesh.clone()).unwrap();
         }
         assert_eq!(engine.program_count(), 1);
@@ -6826,19 +6860,19 @@ mod tests {
             .client(ClientOptions::CPU(CpuClientOptions { device_count: Some(2), ..Default::default() }))
             .unwrap();
         let mesh = two_device_mesh(&client, MeshAxisType::Auto);
-        let engine = XlaSession::new(&client).domain();
+        let engine = Session::new(&client).domain();
 
         // input_type carries the abstract shape & dtype but a "wrong" sharding (replicated). The
         // `input_shardings` override replaces it with a 2-way shard along "x" before tracing, so
         // the compiled program shards the input across the 2-device mesh.
-        let shape = Shape::new(vec![Dimension::Static(4)]);
+        let shape = Shape::new(vec![CoreDimension::Static(4)]);
         let abstract_sharding = Sharding::replicated(mesh.logical_mesh().clone(), 1);
         let abstract_input_type =
             ArrayType::new(DataType::F32, shape.clone()).with_sharding(abstract_sharding).unwrap();
         let sharded = Sharding::new(mesh.logical_mesh().clone(), vec![ShardingDimension::sharded(["x"])]).unwrap();
-        let xla_options = XlaOptions::new(mesh.clone()).with_input_shardings(vec![sharded.clone()]);
+        let xla_options = Options::new(mesh.clone()).with_input_shardings(vec![sharded.clone()]);
         let options = xla_options;
-        let compiled: CompiledXlaFunction<'_, ArrayType, ArrayType> =
+        let compiled: CompiledFunction<'_, ArrayType, ArrayType> =
             compile_with_options(|x| x.sin().unwrap(), abstract_input_type, &engine, options).unwrap();
 
         // Build the input array under the overridden sharding so it matches the executable's
@@ -6846,7 +6880,7 @@ mod tests {
         let input_type = ArrayType::new(DataType::F32, shape).with_sharding(sharded).unwrap();
         let values = [0.0f32, 0.5, 1.0, 1.5];
         let source =
-            XlaArray::from_host_buffer(&engine, input_type, mesh.clone(), values_to_bytes::<f32>(&values).as_slice())
+            Array::from_host_buffer(&engine, input_type, mesh.clone(), values_to_bytes::<f32>(&values).as_slice())
                 .unwrap();
         let output = engine.interpret(&compiled.executable_function(), source).unwrap();
 
@@ -6877,15 +6911,15 @@ mod tests {
             .client(ClientOptions::CPU(CpuClientOptions { device_count: Some(1), ..Default::default() }))
             .unwrap();
         let mesh = single_device_mesh(&client);
-        let engine = XlaSession::new(&client).domain();
-        let input_type = ArrayType::new(DataType::F32, Shape::new(vec![Dimension::Static(2)]))
+        let engine = Session::new(&client).domain();
+        let input_type = ArrayType::new(DataType::F32, Shape::new(vec![CoreDimension::Static(2)]))
             .with_sharding(Sharding::replicated(mesh.logical_mesh().clone(), 1))
             .unwrap();
         let sharding = Sharding::replicated(mesh.logical_mesh().clone(), 1);
         // Two shardings for one flat input — should fail.
-        let xla_options = XlaOptions::new(mesh).with_input_shardings(vec![sharding.clone(), sharding]);
+        let xla_options = Options::new(mesh).with_input_shardings(vec![sharding.clone(), sharding]);
         let options = xla_options;
-        let result: Result<CompiledXlaFunction<'_, ArrayType, ArrayType>, Error> =
+        let result: Result<CompiledFunction<'_, ArrayType, ArrayType>, Error> =
             compile_with_options(|x| x.sin().unwrap(), input_type, &engine, options);
         assert!(matches!(
             result,
@@ -6900,16 +6934,16 @@ mod tests {
             .client(ClientOptions::CPU(CpuClientOptions { device_count: Some(2), ..Default::default() }))
             .unwrap();
         let mesh = two_device_mesh(&client, MeshAxisType::Auto);
-        let engine = XlaSession::new(&client).domain();
+        let engine = Session::new(&client).domain();
 
-        let shape = Shape::new(vec![Dimension::Static(4)]);
+        let shape = Shape::new(vec![CoreDimension::Static(4)]);
         let sharded = Sharding::new(mesh.logical_mesh().clone(), vec![ShardingDimension::sharded(["x"])]).unwrap();
         let input_type = ArrayType::new(DataType::F32, shape.clone()).with_sharding(sharded.clone()).unwrap();
         // Override the output sharding to the same 2-way shard along "x" so the partitioner
-        // emits a fully-sharded output and `XlaArray`'s sharding metadata matches.
-        let xla_options = XlaOptions::new(mesh.clone()).with_output_shardings(vec![sharded.clone()]);
+        // emits a fully-sharded output and `Array`'s sharding metadata matches.
+        let xla_options = Options::new(mesh.clone()).with_output_shardings(vec![sharded.clone()]);
         let options = xla_options;
-        let compiled: CompiledXlaFunction<'_, ArrayType, ArrayType> =
+        let compiled: CompiledFunction<'_, ArrayType, ArrayType> =
             compile_with_options(|x| x.sin().unwrap(), input_type.clone(), &engine, options).unwrap();
 
         // The returned Array should carry the overridden sharding.
@@ -6917,7 +6951,7 @@ mod tests {
 
         let values = [0.0f32, 0.5, 1.0, 1.5];
         let source =
-            XlaArray::from_host_buffer(&engine, input_type, mesh.clone(), values_to_bytes::<f32>(&values).as_slice())
+            Array::from_host_buffer(&engine, input_type, mesh.clone(), values_to_bytes::<f32>(&values).as_slice())
                 .unwrap();
         let output = engine.interpret(&compiled.executable_function(), source).unwrap();
         assert_eq!(output.sharding(), &sharded);
@@ -6948,20 +6982,20 @@ mod tests {
             .client(ClientOptions::CPU(CpuClientOptions { device_count: Some(2), ..Default::default() }))
             .unwrap();
         let mesh = two_device_mesh(&client, MeshAxisType::Auto);
-        let engine = XlaSession::new(&client).domain();
+        let engine = Session::new(&client).domain();
 
         // The executable expects a 2-way shard along "x", but the caller will pass a fully
-        // replicated array. `CompiledXlaFunction::interpret` should silently reshard before executing.
-        let shape = Shape::new(vec![Dimension::Static(4)]);
+        // replicated array. `CompiledFunction::interpret` should silently reshard before executing.
+        let shape = Shape::new(vec![CoreDimension::Static(4)]);
         let sharded = Sharding::new(mesh.logical_mesh().clone(), vec![ShardingDimension::sharded(["x"])]).unwrap();
         let input_type = ArrayType::new(DataType::F32, shape.clone()).with_sharding(sharded.clone()).unwrap();
-        let compiled: CompiledXlaFunction<'_, ArrayType, ArrayType> =
+        let compiled: CompiledFunction<'_, ArrayType, ArrayType> =
             compile(|x| x.sin().unwrap(), input_type.clone(), &engine, mesh.clone()).unwrap();
 
         let replicated = Sharding::replicated(mesh.logical_mesh().clone(), 1);
         let replicated_input_type = ArrayType::new(DataType::F32, shape).with_sharding(replicated).unwrap();
         let values = [0.0f32, 0.5, 1.0, 1.5];
-        let source = XlaArray::from_host_buffer(
+        let source = Array::from_host_buffer(
             &engine,
             replicated_input_type,
             mesh.clone(),
@@ -6999,14 +7033,14 @@ mod tests {
             .client(ClientOptions::CPU(CpuClientOptions { device_count: Some(1), ..Default::default() }))
             .unwrap();
         let mesh = single_device_mesh(&client);
-        let engine = XlaSession::new(&client).domain();
-        let input_type = ArrayType::new(DataType::F32, Shape::new(vec![Dimension::Static(2)]))
+        let engine = Session::new(&client).domain();
+        let input_type = ArrayType::new(DataType::F32, Shape::new(vec![CoreDimension::Static(2)]))
             .with_sharding(Sharding::replicated(mesh.logical_mesh().clone(), 1))
             .unwrap();
         let sharding = Sharding::replicated(mesh.logical_mesh().clone(), 1);
-        let xla_options = XlaOptions::new(mesh).with_output_shardings(vec![sharding.clone(), sharding]);
+        let xla_options = Options::new(mesh).with_output_shardings(vec![sharding.clone(), sharding]);
         let options = xla_options;
-        let result: Result<CompiledXlaFunction<'_, ArrayType, ArrayType>, Error> =
+        let result: Result<CompiledFunction<'_, ArrayType, ArrayType>, Error> =
             compile_with_options(|x| x.sin().unwrap(), input_type, &engine, options);
         assert!(matches!(
             result,
@@ -7021,8 +7055,8 @@ mod tests {
             .client(ClientOptions::CPU(CpuClientOptions { device_count: Some(1), ..Default::default() }))
             .unwrap();
         let mesh = single_device_mesh(&client);
-        let engine = XlaSession::new(&client).domain();
-        let input_type = ArrayType::new(DataType::F32, Shape::new(vec![Dimension::Static(7)]))
+        let engine = Session::new(&client).domain();
+        let input_type = ArrayType::new(DataType::F32, Shape::new(vec![CoreDimension::Static(7)]))
             .with_sharding(Sharding::replicated(mesh.logical_mesh().clone(), 1))
             .unwrap();
 
@@ -7043,16 +7077,16 @@ mod tests {
             .client(ClientOptions::CPU(CpuClientOptions { device_count: Some(2), ..Default::default() }))
             .unwrap();
         let mesh = two_device_mesh(&client, MeshAxisType::Auto);
-        let engine = XlaSession::new(&client).domain();
+        let engine = Session::new(&client).domain();
 
-        let shape = Shape::new(vec![Dimension::Static(4)]);
+        let shape = Shape::new(vec![CoreDimension::Static(4)]);
         let sharded = Sharding::new(mesh.logical_mesh().clone(), vec![ShardingDimension::sharded(["x"])]).unwrap();
         let input_type = ArrayType::new(DataType::F32, shape.clone()).with_sharding(sharded.clone()).unwrap();
         let target_sharding = sharded.clone();
 
         // The user invokes `constrain_sharding` directly inside the staged closure — it's compiled into the
         // same MLIR program as the rest of the function body.
-        let compiled: CompiledXlaFunction<'_, ArrayType, ArrayType> = compile(
+        let compiled: CompiledFunction<'_, ArrayType, ArrayType> = compile(
             move |x| {
                 let constrained =
                     x.constrain_sharding(&target_sharding).expect("staged sharding constraint should succeed");
@@ -7066,7 +7100,7 @@ mod tests {
 
         let values = [0.0f32, 0.5, 1.0, 1.5];
         let source =
-            XlaArray::from_host_buffer(&engine, input_type, mesh.clone(), values_to_bytes::<f32>(&values).as_slice())
+            Array::from_host_buffer(&engine, input_type, mesh.clone(), values_to_bytes::<f32>(&values).as_slice())
                 .unwrap();
         let output = engine.interpret(&compiled.executable_function(), source).unwrap();
         assert_eq!(output.sharding(), &sharded);
@@ -7113,9 +7147,9 @@ mod tests {
             devices,
         )
         .unwrap();
-        let engine = XlaSession::new(&client).domain();
+        let engine = Session::new(&client).domain();
 
-        let shape = Shape::new(vec![Dimension::Static(4)]);
+        let shape = Shape::new(vec![CoreDimension::Static(4)]);
         let sharded = Sharding::new(mesh.logical_mesh().clone(), vec![ShardingDimension::sharded(["x"])]).unwrap();
         let replicated = Sharding::replicated(mesh.logical_mesh().clone(), 1);
         let input_type = ArrayType::new(DataType::F32, shape.clone()).with_sharding(sharded.clone()).unwrap();
@@ -7125,7 +7159,7 @@ mod tests {
 
         // Three staged reshards compose inside one closure. Each emits a `sdy.sharding_constraint` op into
         // the same MLIR program. After trace+compile, the executable runs all three in one PJRT dispatch.
-        let compiled: CompiledXlaFunction<'_, ArrayType, ArrayType> = compile(
+        let compiled: CompiledFunction<'_, ArrayType, ArrayType> = compile(
             move |x| {
                 let a = x.reshard(&constraint_a).unwrap();
                 let b = a.sin().unwrap().reshard(&constraint_b).unwrap();
@@ -7142,7 +7176,7 @@ mod tests {
 
         let values = [0.1f32, 0.2, 0.3, 0.4];
         let source =
-            XlaArray::from_host_buffer(&engine, input_type, mesh.clone(), values_to_bytes::<f32>(&values).as_slice())
+            Array::from_host_buffer(&engine, input_type, mesh.clone(), values_to_bytes::<f32>(&values).as_slice())
                 .unwrap();
         let output = engine.interpret(&compiled.executable_function(), source).unwrap();
 
@@ -7173,24 +7207,24 @@ mod tests {
             .client(ClientOptions::CPU(CpuClientOptions { device_count: Some(1), ..Default::default() }))
             .unwrap();
         let mesh = single_device_mesh(&client);
-        let engine = XlaSession::new(&client).domain();
+        let engine = Session::new(&client).domain();
 
         let sharding = Sharding::replicated(mesh.logical_mesh().clone(), 0);
         let input_type = ArrayType::new(DataType::F32, Shape::new(Vec::new())).with_sharding(sharding).unwrap();
 
-        let staged: StagedXlaFunction<'_, ArrayType, ArrayType> =
-            stage(|x| x.sin().unwrap(), input_type.clone(), XlaOptions::new(mesh.clone())).unwrap();
+        let staged: StagedFunction<'_, ArrayType, ArrayType> =
+            stage(|x| x.sin().unwrap(), input_type.clone(), Options::new(mesh.clone())).unwrap();
         assert_eq!(engine.program_count(), 0, "staging must not compile a PJRT executable");
 
         let staged_compiled = engine.compile_staged_function(staged).unwrap();
         assert_eq!(engine.program_count(), 1, "compiling the staged handle should build exactly one executable");
 
-        let direct: CompiledXlaFunction<'_, ArrayType, ArrayType> =
+        let direct: CompiledFunction<'_, ArrayType, ArrayType> =
             compile(|x| x.sin().unwrap(), input_type.clone(), &engine, mesh.clone()).unwrap();
 
         let input_value = 0.5f32;
         let make_input = || {
-            XlaArray::from_host_buffer(
+            Array::from_host_buffer(
                 &engine,
                 input_type.clone(),
                 mesh.clone(),
@@ -7215,33 +7249,33 @@ mod tests {
             .client(ClientOptions::CPU(CpuClientOptions { device_count: Some(1), ..Default::default() }))
             .unwrap();
         let mesh = single_device_mesh(&client);
-        let engine = XlaSession::new(&client).domain();
+        let engine = Session::new(&client).domain();
 
         let sharding = Sharding::replicated(mesh.logical_mesh().clone(), 0);
         let input_type = ArrayType::new(DataType::F32, Shape::new(Vec::new())).with_sharding(sharding).unwrap();
-        let bias = XlaArray::from_host_buffer(
+        let bias = Array::from_host_buffer(
             &engine,
             input_type.clone(),
             mesh.clone(),
             values_to_bytes::<f32>(&[0.25]).as_slice(),
         )
         .unwrap();
-        let inner: StagedXlaFunction<'_, ArrayType, ArrayType> = stage_with_captures(
+        let inner: StagedFunction<'_, ArrayType, ArrayType> = stage_with_captures(
             |captures, x| (x + captures[0].clone()).sin().unwrap(),
             vec![bias],
             input_type.clone(),
-            XlaOptions::new(mesh.clone()),
+            Options::new(mesh.clone()),
         )
         .unwrap();
         assert_eq!(engine.program_count(), 0, "staging the inner function must not compile it");
 
-        let outer: CompiledXlaFunction<'_, ArrayType, ArrayType> =
+        let outer: CompiledFunction<'_, ArrayType, ArrayType> =
             compile(move |x| inner.call(x).unwrap().cos().unwrap(), input_type.clone(), &engine, mesh.clone()).unwrap();
         assert_eq!(engine.program_count(), 1, "only the outer program should be compiled");
         assert_eq!(outer.source_program().captures().len(), 1);
 
         let input_value = 0.5f32;
-        let input = XlaArray::from_host_buffer(
+        let input = Array::from_host_buffer(
             &engine,
             input_type,
             mesh.clone(),
@@ -7262,13 +7296,13 @@ mod tests {
             .client(ClientOptions::CPU(CpuClientOptions { device_count: Some(1), ..Default::default() }))
             .unwrap();
         let mesh = single_device_mesh(&client);
-        let engine = XlaSession::new(&client).domain();
+        let engine = Session::new(&client).domain();
 
         let sharding = Sharding::replicated(mesh.logical_mesh().clone(), 0);
         let input_type = ArrayType::new(DataType::F32, Shape::new(Vec::new())).with_sharding(sharding.clone()).unwrap();
 
-        let options = XlaOptions::new(mesh).with_input_shardings(vec![sharding]);
-        let staged: StagedXlaFunction<'_, ArrayType, ArrayType> =
+        let options = Options::new(mesh).with_input_shardings(vec![sharding]);
+        let staged: StagedFunction<'_, ArrayType, ArrayType> =
             stage(|x| x.sin().unwrap(), input_type, options).unwrap();
         let ArrayIrType::Array(staged_input_type) = &staged.source_program().program().input_types()[0] else {
             panic!("public staged input should remain an array");
@@ -7287,14 +7321,14 @@ mod tests {
             .client(ClientOptions::CPU(CpuClientOptions { device_count: Some(1), ..Default::default() }))
             .unwrap();
         let mesh = single_device_mesh(&client);
-        let engine = XlaSession::new(&client).domain();
+        let engine = Session::new(&client).domain();
 
         let sharding = Sharding::replicated(mesh.logical_mesh().clone(), 0);
         let input_type = ArrayType::new(DataType::F32, Shape::new(Vec::new())).with_sharding(sharding).unwrap();
 
-        let inner: StagedXlaFunction<'_, ArrayType, ArrayType> =
-            stage(|x| x.sin().unwrap(), input_type.clone(), XlaOptions::new(mesh.clone())).unwrap();
-        let outer: CompiledXlaFunction<'_, ArrayType, ArrayType> = compile(
+        let inner: StagedFunction<'_, ArrayType, ArrayType> =
+            stage(|x| x.sin().unwrap(), input_type.clone(), Options::new(mesh.clone())).unwrap();
+        let outer: CompiledFunction<'_, ArrayType, ArrayType> = compile(
             move |x| inner.call(x.clone()).unwrap() + inner.call(x).unwrap(),
             input_type.clone(),
             &engine,
@@ -7303,7 +7337,7 @@ mod tests {
         .unwrap();
 
         for &point in &[0.0f32, 0.25, 0.5, 1.0] {
-            let input = XlaArray::from_host_buffer(
+            let input = Array::from_host_buffer(
                 &engine,
                 input_type.clone(),
                 mesh.clone(),
@@ -7334,7 +7368,7 @@ mod tests {
     }
 
     /// Prints the domain compilation-cache counters observed across a Phase 0 baseline workload.
-    fn print_baseline_compilation_statistics(domain: &XlaDomain<'_>) {
+    fn print_baseline_compilation_statistics(domain: &Domain<'_>) {
         let statistics = domain.compilation_context().statistics();
         println!(
             "  compilation cache: memory_hits={} persistent_hits={} misses={} compilations={} waits={}",
@@ -7352,7 +7386,7 @@ mod tests {
         );
     }
 
-    /// Caching-plan measurement for repeated [`CompiledXlaFunction::jvp`] construction.
+    /// Caching-plan measurement for repeated [`CompiledFunction::jvp`] construction.
     ///
     /// Originally captured as the Phase 0 baseline, where every call reconstructed, re-traced, and re-lowered the
     /// derived forward-mode function with only backend compilation deduplicated through the shared
@@ -7368,29 +7402,30 @@ mod tests {
             .client(ClientOptions::CPU(CpuClientOptions { device_count: Some(1), ..Default::default() }))
             .unwrap();
         let mesh = single_device_mesh(&client);
-        let domain = XlaSession::new(&client).domain();
+        let domain = Session::new(&client).domain();
 
-        let input_type = ArrayType::new(DataType::F32, Shape::new(vec![Dimension::Static(4), Dimension::Static(4)]))
-            .with_sharding(Sharding::replicated(mesh.logical_mesh().clone(), 2))
-            .unwrap();
-        let compiled: CompiledXlaFunction<'_, ArrayType, ArrayType> =
+        let input_type =
+            ArrayType::new(DataType::F32, Shape::new(vec![CoreDimension::Static(4), CoreDimension::Static(4)]))
+                .with_sharding(Sharding::replicated(mesh.logical_mesh().clone(), 2))
+                .unwrap();
+        let compiled: CompiledFunction<'_, ArrayType, ArrayType> =
             compile(|x| x.sin().unwrap().cos().unwrap(), input_type, &domain, mesh).unwrap();
 
         domain.compilation_context().clear_statistics();
         let mut durations = Vec::with_capacity(BASELINE_REPETITIONS);
         for _ in 0..BASELINE_REPETITIONS {
             let start = Instant::now();
-            let derived: CompiledXlaFunction<'_, (ArrayType, ArrayType), (ArrayType, ArrayType)> =
+            let derived: CompiledFunction<'_, (ArrayType, ArrayType), (ArrayType, ArrayType)> =
                 compiled.jvp(&domain).unwrap();
             durations.push(start.elapsed());
             assert_eq!(derived.output_types().len(), 2);
         }
 
-        print_baseline_durations("repeated CompiledXlaFunction::jvp", &durations);
+        print_baseline_durations("repeated CompiledFunction::jvp", &durations);
         print_baseline_compilation_statistics(&domain);
     }
 
-    /// Caching-plan measurement for repeated [`CompiledXlaFunction::gradient`] construction. Mirrors
+    /// Caching-plan measurement for repeated [`CompiledFunction::gradient`] construction. Mirrors
     /// [`test_baseline_repeated_compiled_function_jvp`] for the reverse-mode path.
     #[test]
     #[ignore = "phase 0 baseline measurement"]
@@ -7400,12 +7435,13 @@ mod tests {
             .client(ClientOptions::CPU(CpuClientOptions { device_count: Some(1), ..Default::default() }))
             .unwrap();
         let mesh = single_device_mesh(&client);
-        let domain = XlaSession::new(&client).domain();
+        let domain = Session::new(&client).domain();
 
-        let input_type = ArrayType::new(DataType::F32, Shape::new(vec![Dimension::Static(4), Dimension::Static(4)]))
-            .with_sharding(Sharding::replicated(mesh.logical_mesh().clone(), 2))
-            .unwrap();
-        let compiled: CompiledXlaFunction<'_, ArrayType, ArrayType> =
+        let input_type =
+            ArrayType::new(DataType::F32, Shape::new(vec![CoreDimension::Static(4), CoreDimension::Static(4)]))
+                .with_sharding(Sharding::replicated(mesh.logical_mesh().clone(), 2))
+                .unwrap();
+        let compiled: CompiledFunction<'_, ArrayType, ArrayType> =
             compile(|x| x.sin().unwrap().reduce(&[0, 1], ReductionKind::Sum).unwrap(), input_type, &domain, mesh)
                 .unwrap();
 
@@ -7413,12 +7449,12 @@ mod tests {
         let mut durations = Vec::with_capacity(BASELINE_REPETITIONS);
         for _ in 0..BASELINE_REPETITIONS {
             let start = Instant::now();
-            let derived: CompiledXlaFunction<'_, ArrayType, ArrayType> = compiled.gradient(&domain).unwrap();
+            let derived: CompiledFunction<'_, ArrayType, ArrayType> = compiled.gradient(&domain).unwrap();
             durations.push(start.elapsed());
             assert_eq!(derived.output_types().len(), 1);
         }
 
-        print_baseline_durations("repeated CompiledXlaFunction::gradient", &durations);
+        print_baseline_durations("repeated CompiledFunction::gradient", &durations);
         print_baseline_compilation_statistics(&domain);
     }
 
@@ -7435,13 +7471,13 @@ mod tests {
             .client(ClientOptions::CPU(CpuClientOptions { device_count: Some(1), ..Default::default() }))
             .unwrap();
         let mesh = single_device_mesh(&client);
-        let domain = XlaSession::new(&client).domain();
+        let domain = Session::new(&client).domain();
 
         let input_type = ArrayType::scalar(DataType::F32)
             .with_sharding(Sharding::replicated(mesh.logical_mesh().clone(), 0))
             .unwrap();
-        let function: JittedXlaFunction<'_, _, (), ArrayType, ArrayType> = jitted(
-            |_, input: XlaCompileTracer<'_>| {
+        let function: JittedFunction<'_, _, (), ArrayType, ArrayType> = jitted(
+            |_, input: CompileTracer<'_>| {
                 Ok(input.domain().differentiate_at(input).gradient(|value| Mul::mul(&value, &value))?)
             },
             &domain,
@@ -7451,7 +7487,7 @@ mod tests {
         domain.compilation_context().clear_statistics();
         let mut durations = Vec::with_capacity(BASELINE_REPETITIONS);
         for index in 0..BASELINE_REPETITIONS {
-            let input = XlaArray::from_host_buffer(
+            let input = Array::from_host_buffer(
                 &domain,
                 input_type.clone(),
                 mesh.clone(),
@@ -7550,7 +7586,7 @@ mod tests {
             .client(ClientOptions::CPU(CpuClientOptions { device_count: Some(1), ..Default::default() }))
             .unwrap();
         let mesh = single_device_mesh(&client);
-        let domain = XlaSession::new(&client).domain();
+        let domain = Session::new(&client).domain();
 
         let input_type = ArrayType::new(DataType::F32, Shape::new(Vec::new()))
             .with_sharding(Sharding::replicated(mesh.logical_mesh().clone(), 0))
@@ -7568,7 +7604,7 @@ mod tests {
         // total elapsed time and the backend compilation time charged inside it.
         let mut measurements: Vec<(usize, [Vec<Duration>; 2], [Vec<Duration>; 2])> = Vec::new();
         for callee_operations in CALLEE_OPERATION_COUNTS {
-            let callee: CompiledXlaFunction<'_, ArrayType, ArrayType> = compile(
+            let callee: CompiledFunction<'_, ArrayType, ArrayType> = compile(
                 move |x| {
                     let mut value = x;
                     for index in 0..callee_operations {
@@ -7585,7 +7621,7 @@ mod tests {
             let mut outers = Vec::with_capacity(CALLEE_OUTER_SPECIALIZATIONS);
             for index in 0..CALLEE_OUTER_SPECIALIZATIONS {
                 let callee = callee.clone();
-                let outer: CompiledXlaFunction<'_, ArrayType, ArrayType> = compile(
+                let outer: CompiledFunction<'_, ArrayType, ArrayType> = compile(
                     move |x| {
                         let mut value = callee.call(x).unwrap();
                         for _ in 0..=index {
@@ -7605,13 +7641,11 @@ mod tests {
                 let instructions = outer.source_program().program().instructions();
                 let jit_call_count = instructions
                     .iter()
-                    .filter(|instruction| matches!(instruction.operation(), XlaOperation::JitCall(_)))
+                    .filter(|instruction| matches!(instruction.operation(), Operation::JitCall(_)))
                     .count();
                 let inlined_cosine_count = instructions
                     .iter()
-                    .filter(|instruction| {
-                        matches!(instruction.operation(), XlaOperation::Array(ArrayOperation::Cos(_)))
-                    })
+                    .filter(|instruction| matches!(instruction.operation(), Operation::Array(ArrayOperation::Cos(_))))
                     .count();
                 assert_eq!(jit_call_count, 1, "each outer specialization should stage one jit_call boundary");
                 assert_eq!(inlined_cosine_count, 0, "the outer program should not inline the callee body");
@@ -7623,7 +7657,7 @@ mod tests {
             for outer in &outers {
                 let before = domain.compilation_context().statistics().compilation_duration;
                 let start = Instant::now();
-                let derived: CompiledXlaFunction<'_, (ArrayType, ArrayType), (ArrayType, ArrayType)> =
+                let derived: CompiledFunction<'_, (ArrayType, ArrayType), (ArrayType, ArrayType)> =
                     outer.jvp(&domain).unwrap();
                 jvp_totals.push(start.elapsed());
                 let after = domain.compilation_context().statistics().compilation_duration;
@@ -7636,7 +7670,7 @@ mod tests {
             for outer in &outers {
                 let before = domain.compilation_context().statistics().compilation_duration;
                 let start = Instant::now();
-                let derived: CompiledXlaFunction<'_, ArrayType, ArrayType> = outer.gradient(&domain).unwrap();
+                let derived: CompiledFunction<'_, ArrayType, ArrayType> = outer.gradient(&domain).unwrap();
                 gradient_totals.push(start.elapsed());
                 let after = domain.compilation_context().statistics().compilation_duration;
                 gradient_backends.push(after - before);
@@ -7687,9 +7721,9 @@ mod tests {
     }
 
     /// Tracing context that stages the decode-loop demo's `While` condition and body region programs in the XLA
-    /// domain universe: its tracers are exactly [`XlaCompileTracer`]s, so the shared [`decode_step`] model runs
+    /// domain universe: its tracers are exactly [`CompileTracer`]s, so the shared [`decode_step`] model runs
     /// unchanged inside the staged regions and in the eager reference loop.
-    type DecodeTraceContext<'c> = DomainTracingContext<XlaDomain<'c>, XlaValue<'c>>;
+    type DecodeTraceContext<'c> = DomainTracingContext<Domain<'c>, Value<'c>>;
 
     /// Shape and sampling hyperparameters of the tiny decode-loop demo model.
     #[derive(Copy, Clone)]
@@ -7730,7 +7764,7 @@ mod tests {
 
     /// Returns a static [`Shape`] with the provided dimensions.
     fn static_shape(dimensions: &[usize]) -> Shape {
-        Shape::new(dimensions.iter().map(|&dimension| Dimension::Static(dimension)).collect())
+        Shape::new(dimensions.iter().map(|&dimension| CoreDimension::Static(dimension)).collect())
     }
 
     /// Returns `count` deterministic pseudo-random weight values in `[-0.5, 0.5)` derived from `seed` with an
@@ -7749,7 +7783,7 @@ mod tests {
 
     /// One decode step of the tiny gated-attention language model shared by the compiled decode-loop demo and its
     /// eager reference loop. The step is written once against `ryft`'s value-level capability traits, so the same
-    /// function executes eagerly over reference [`Array`]s and stages symbolically over [`XlaCompileTracer`]s
+    /// function executes eagerly over reference [`CoreArray`](ryft_core::Array)s and stages symbolically over [`CompileTracer`]s
     /// inside the compiled `While` body.
     ///
     /// The decode state is a thirteen-value vector: the current position and token (`i32` scalars), the `[steps,
@@ -7768,7 +7802,7 @@ mod tests {
     ) -> Result<Vec<V>, ProgramError>
     where
         V: Clone
-            + Value<Type = ArrayType>
+            + CoreValue<Type = ArrayType>
             + Add
             + Sub
             + Mul
@@ -7888,16 +7922,16 @@ mod tests {
     /// traced with [`decode_step`] and a `position < steps` condition through the public tracing API, and the
     /// staged loop returns the decoded tokens together with the final key/value caches.
     fn build_decode_loop<'c>(
-        inputs: Vec<XlaCompileTracer<'c>>,
+        inputs: Vec<CompileTracer<'c>>,
         configuration: &DecodeConfiguration,
         sampling: DecodeSampling,
         attention: DecodeAttention,
-    ) -> Vec<XlaCompileTracer<'c>> {
+    ) -> Vec<CompileTracer<'c>> {
         let context = inputs[0].value().context().clone();
         let carry_types = inputs.iter().map(|input| input.value().r#type().into_owned()).collect::<Vec<ArrayIrType>>();
         let steps = configuration.steps;
         let (_, condition) = <DecodeTraceContext<'c>>::trace(
-            |state: Vec<XlaStatefulCompileTracer<'c>>| {
+            |state: Vec<StatefulCompileTracer<'c>>| {
                 let state = state
                     .into_iter()
                     .map(|value| {
@@ -7913,7 +7947,7 @@ mod tests {
         )
         .unwrap();
         let (_, body) = <DecodeTraceContext<'c>>::trace(
-            |state: Vec<XlaStatefulCompileTracer<'c>>| {
+            |state: Vec<StatefulCompileTracer<'c>>| {
                 let state = state
                     .into_iter()
                     .map(|value| {
@@ -7932,7 +7966,7 @@ mod tests {
         .unwrap();
         let inputs = inputs.into_iter().map(ProjectedValue::into_value).collect::<Vec<_>>();
         let outputs = context
-            .bind(XlaOperation::While(WhileOperation::new()), vec![condition, body], inputs.as_slice())
+            .bind(Operation::While(WhileOperation::new()), vec![condition, body], inputs.as_slice())
             .unwrap();
         let outputs = outputs
             .into_iter()
@@ -7944,14 +7978,14 @@ mod tests {
         vec![outputs[4].clone(), outputs[2].clone(), outputs[3].clone()]
     }
 
-    /// Runs the decode-loop demo's eager reference: the same [`decode_step`] executed over reference [`Array`]
+    /// Runs the decode-loop demo's eager reference: the same [`decode_step`] executed over reference [`CoreArray`](ryft_core::Array)
     /// values in a plain Rust loop, with no `While` staging, compilation, or XLA involvement.
     fn reference_decode_loop(
-        initial_state: Vec<Array>,
+        initial_state: Vec<CoreArray>,
         configuration: &DecodeConfiguration,
         sampling: DecodeSampling,
-    ) -> Vec<Array> {
-        let context = EagerContext::<Array, ArrayOperation<Array>>::new();
+    ) -> Vec<CoreArray> {
+        let context = EagerContext::<CoreArray, ArrayOperation<CoreArray>>::new();
         let mut state = initial_state;
         for _ in 0..configuration.steps {
             state = decode_step(&context, &state, configuration, sampling, DecodeAttention::Composed).unwrap();
@@ -8092,7 +8126,7 @@ mod tests {
     }
 
     /// Reads a replicated `i32` array back from the single test device.
-    fn read_i32_array(client: &ryft_pjrt::Client<'_>, array: &XlaArray<'_>) -> Vec<i32> {
+    fn read_i32_array(client: &ryft_pjrt::Client<'_>, array: &Array<'_>) -> Vec<i32> {
         let device_id = client.addressable_devices().unwrap()[0].id().unwrap();
         let shard_bytes = array
             .device_shard(device_id)
@@ -8116,7 +8150,7 @@ mod tests {
             .client(ClientOptions::CPU(CpuClientOptions { device_count: Some(1), ..Default::default() }))
             .unwrap();
         let mesh = single_device_mesh(&client);
-        let engine = XlaSession::new(&client).domain();
+        let engine = Session::new(&client).domain();
         if attention == DecodeAttention::CustomCall {
             ensure_decode_attention_handler_registered(&client).unwrap();
         }
@@ -8153,7 +8187,7 @@ mod tests {
         ];
         input_types.extend(weight_dimensions.iter().map(|dimensions| replicated(DataType::F32, dimensions)));
 
-        let compiled: CompiledXlaFunction<'_, Vec<ArrayType>, Vec<ArrayType>> = compile(
+        let compiled: CompiledFunction<'_, Vec<ArrayType>, Vec<ArrayType>> = compile(
             |inputs| build_decode_loop(inputs, &configuration, sampling, attention),
             input_types.clone(),
             &engine,
@@ -8162,7 +8196,7 @@ mod tests {
         .unwrap();
 
         let device_input = |index: usize, bytes: Vec<u8>| {
-            XlaArray::from_host_buffer(&engine, input_types[index].clone(), mesh.clone(), bytes.as_slice()).unwrap()
+            Array::from_host_buffer(&engine, input_types[index].clone(), mesh.clone(), bytes.as_slice()).unwrap()
         };
         let mut device_inputs = vec![
             device_input(0, values_to_bytes::<i32>(&[0])),
@@ -8181,23 +8215,23 @@ mod tests {
         let device_cache_values = read_f32_array(&client, &outputs[2]);
 
         let mut reference_state = vec![
-            Array::from_elements(ArrayType::new_static(DataType::I32, []), &[0_i32]).unwrap(),
-            Array::from_elements(ArrayType::new_static(DataType::I32, []), &[3_i32]).unwrap(),
-            Array::from_elements(
+            CoreArray::from_elements(ArrayType::new_static(DataType::I32, []), &[0_i32]).unwrap(),
+            CoreArray::from_elements(ArrayType::new_static(DataType::I32, []), &[3_i32]).unwrap(),
+            CoreArray::from_elements(
                 ArrayType::new_static(DataType::F32, [steps, dimension]),
                 &vec![0.0_f32; steps * dimension],
             )
             .unwrap(),
-            Array::from_elements(
+            CoreArray::from_elements(
                 ArrayType::new_static(DataType::F32, [steps, dimension]),
                 &vec![0.0_f32; steps * dimension],
             )
             .unwrap(),
-            Array::from_elements(ArrayType::new_static(DataType::I32, [steps]), &vec![0_i32; steps]).unwrap(),
-            Array::from_elements(ArrayType::new_static(DataType::U64, [2]), &[42_u64, 0]).unwrap(),
+            CoreArray::from_elements(ArrayType::new_static(DataType::I32, [steps]), &vec![0_i32; steps]).unwrap(),
+            CoreArray::from_elements(ArrayType::new_static(DataType::U64, [2]), &[42_u64, 0]).unwrap(),
         ];
         reference_state.extend(weight_dimensions.iter().zip(&weights).map(|(dimensions, values)| {
-            Array::from_elements(ArrayType::new_static(DataType::F32, *dimensions), values).unwrap()
+            CoreArray::from_elements(ArrayType::new_static(DataType::F32, *dimensions), values).unwrap()
         }));
         let reference_state = reference_decode_loop(reference_state, &configuration, sampling);
         let reference_tokens = reference_state[4].elements::<i32>().unwrap();

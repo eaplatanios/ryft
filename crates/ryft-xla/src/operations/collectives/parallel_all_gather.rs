@@ -1,7 +1,7 @@
 use ryft_core::macros::check_count;
 use ryft_core::{
-    ArrayIrType, ArrayType, CollectiveMode, Dimension, MemberOperation, Operation, ParallelAllGatherOperation,
-    ProgramError, Shape,
+    ArrayIrType, ArrayType, CollectiveMode, Dimension as CoreDimension, MemberOperation, Operation as CoreOperation,
+    ParallelAllGatherOperation, ProgramError, Shape,
 };
 use ryft_mlir::dialects::stable_hlo;
 use ryft_mlir::{
@@ -11,7 +11,7 @@ use ryft_mlir::{
 use crate::experimental::lowering::CollectiveLoweringState;
 use crate::experimental::lowering::types::lower_tensor_type;
 use crate::operations::collectives::{collective_replica_groups, refine_collective_result_dimensions};
-use crate::{Error, LowerableOperation, LowerableOperationFamily, MemberLowerableOperation, XlaLowerer};
+use crate::{Error, LowerableOperation, LowerableOperationFamily, Lowerer, MemberLowerableOperation};
 
 /// Lowers one traced `parallel_all_gather` to a channeled `stablehlo.all_gather` over the named mesh axis's replica
 /// groups.
@@ -35,7 +35,7 @@ pub(crate) fn lower_parallel_all_gather_to_mlir<'b, 'c: 'b, 't: 'c>(
         CollectiveMode::Tiled => input_value,
         CollectiveMode::Untiled => {
             let mut dimensions = output_array_type.shape().dimensions().to_vec();
-            dimensions[operation.concatenation_axis()] = Dimension::Static(1);
+            dimensions[operation.concatenation_axis()] = CoreDimension::Static(1);
             let input_type =
                 lower_tensor_type(&output_array_type.clone().with_shape(Shape::new(dimensions)), context, location)?;
             let broadcast_dimensions = (0..output_array_type.rank())
@@ -67,7 +67,7 @@ pub(crate) fn lower_parallel_all_gather_to_mlir<'b, 'c: 'b, 't: 'c>(
 impl LowerableOperation for ParallelAllGatherOperation {
     fn lower<'b, 'c: 'b, 't: 'c, O: LowerableOperationFamily>(
         &self,
-        lowerer: &mut XlaLowerer<'b, 'c, 't, O>,
+        lowerer: &mut Lowerer<'b, 'c, 't, O>,
         input_values: &[ValueRef<'b, 'c, 't>],
         input_types: &[ArrayType],
         output_types: &[ArrayType],
@@ -104,7 +104,7 @@ impl LowerableOperation for ParallelAllGatherOperation {
 impl MemberLowerableOperation<ArrayIrType> for ParallelAllGatherOperation {
     fn lower_in_parent<'b, 'c: 'b, 't: 'c, O: LowerableOperationFamily>(
         &self,
-        lowerer: &mut XlaLowerer<'b, 'c, 't, O>,
+        lowerer: &mut Lowerer<'b, 'c, 't, O>,
         input_values: &[ValueRef<'b, 'c, 't>],
         input_types: &[ArrayIrType],
         output_types: &[ArrayIrType],

@@ -4,7 +4,8 @@
 use std::sync::OnceLock;
 
 use ryft_core::{
-    ArrayIrType, CustomCallAttribute, CustomCallOperation, DataType, EffectClass, Memory, Operation, Typed,
+    ArrayIrType, CustomCallAttribute, CustomCallOperation, DataType, EffectClass, Memory, Operation as CoreOperation,
+    Typed,
 };
 use ryft_cuda::{
     CudaArtifactFormat, CudaKernelAbi, CudaKernelArtifact, CudaKernelLaunchDimensions, CudaKernelParameterType,
@@ -106,7 +107,7 @@ impl CudaKernelEmbedding {
     /// Reconstructs and validates a serialized CUDA artifact and its argument mapping before any native loading.
     /// Unknown versions, corruption, invalid canonical artifact metadata, and disagreement with the verified
     /// logical signature or buffer mapping are rejected. This does not invoke a compiler or load native code.
-    pub fn from_custom_call<Extension: Operation<Type = ArrayIrType>>(
+    pub fn from_custom_call<Extension: CoreOperation<Type = ArrayIrType>>(
         kernel: &VerifiedKernel<'_, Extension>,
         operation: &CustomCallOperation,
     ) -> Result<(Self, CudaKernelArtifact), KernelEmbeddingError> {
@@ -190,7 +191,7 @@ impl CudaKernelEmbedding {
 
     /// Resolves each logical array, in declaration order, to the existing custom-call input/result buffer slots.
     /// Writable arguments use results so input liveness and donation remain XLA's ordinary functional alias policy.
-    pub fn argument_bindings<Extension: Operation<Type = ArrayIrType>>(
+    pub fn argument_bindings<Extension: CoreOperation<Type = ArrayIrType>>(
         &self,
         kernel: &VerifiedKernel<'_, Extension>,
     ) -> Result<Vec<CudaKernelBufferBinding>, KernelEmbeddingError> {
@@ -238,7 +239,7 @@ impl CudaKernelEmbedding {
     }
 }
 
-impl<Extension: Operation<Type = ArrayIrType>> KernelOutputEmbedding<CudaKernelArtifact, Extension>
+impl<Extension: CoreOperation<Type = ArrayIrType>> KernelOutputEmbedding<CudaKernelArtifact, Extension>
     for CudaKernelEmbedding
 {
     fn configuration_key(&self) -> Result<Vec<u8>, KernelEmbeddingError> {
@@ -755,7 +756,7 @@ mod tests {
         use ryft_core::{ArrayType, DataType, Placeholder};
 
         use crate::experimental::lowering::lower_mlir_module_for_program;
-        use crate::experimental::ops::{XlaConstant, XlaProgramBuilder};
+        use crate::experimental::ops::{Constant, ProgramBuilder};
 
         let definition = definition();
         let verified = VerifiedKernel::new(&definition, 1).unwrap();
@@ -763,11 +764,11 @@ mod tests {
         let embedding = CudaKernelEmbedding::new(CUDA_KERNEL_CUSTOM_CALL_TARGET.to_owned(), vec![0]);
         let compiled = CompiledKernel::from_output(&verified, b"identity", &artifact, &embedding).unwrap();
         let scalar = ArrayType::scalar(DataType::I32);
-        let mut builder = XlaProgramBuilder::new();
+        let mut builder = ProgramBuilder::new();
         let input = builder.add_input(scalar.clone().into());
         let output = builder.add_instruction(compiled.custom_call().clone(), vec![], vec![input], None).unwrap()[0];
         let program = builder
-            .build::<Vec<XlaConstant>, Vec<XlaConstant>>(vec![output], vec![Placeholder], vec![Placeholder])
+            .build::<Vec<Constant>, Vec<Constant>>(vec![output], vec![Placeholder], vec![Placeholder])
             .unwrap();
         let lowered = lower_mlir_module_for_program(
             &program,
@@ -805,7 +806,7 @@ mod tests {
         use ryft_core::{ArrayType, DataType, Placeholder};
 
         use crate::experimental::lowering::lower_mlir_module_for_program;
-        use crate::experimental::ops::{XlaConstant, XlaProgramBuilder};
+        use crate::experimental::ops::{Constant, ProgramBuilder};
 
         let definition = definition();
         let verified = VerifiedKernel::new(&definition, 1).unwrap();
@@ -827,11 +828,11 @@ mod tests {
 
         // The layout contract applies to caller-registered CUDA targets as well as the built-in target.
         let scalar = ArrayType::scalar(DataType::I32);
-        let mut builder = XlaProgramBuilder::new();
+        let mut builder = ProgramBuilder::new();
         let input = builder.add_input(scalar.clone().into());
         let output = builder.add_instruction(operation, vec![], vec![input], None).unwrap()[0];
         let program = builder
-            .build::<Vec<XlaConstant>, Vec<XlaConstant>>(vec![output], vec![Placeholder], vec![Placeholder])
+            .build::<Vec<Constant>, Vec<Constant>>(vec![output], vec![Placeholder], vec![Placeholder])
             .unwrap();
         let lowered = lower_mlir_module_for_program(
             &program,

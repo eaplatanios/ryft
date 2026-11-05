@@ -12,7 +12,9 @@ use ryft_core::operations::attention::{
     AttentionConfiguration, AttentionDefinitionKind, AttentionImplementation, AttentionInputSignature, AttentionInputs,
     AttentionKey, DOT_PRODUCT_ATTENTION_BACKWARD_COMPOSITE_NAME, DOT_PRODUCT_ATTENTION_COMPOSITE_NAME,
 };
-use ryft_core::{ArrayIrType, ArrayType, CompositeKey, DataType, Dimension, ProgramError, ReductionKind, Shape};
+use ryft_core::{
+    ArrayIrType, ArrayType, CompositeKey, DataType, Dimension as CoreDimension, ProgramError, ReductionKind, Shape,
+};
 use ryft_mlir::dialects::stable_hlo;
 use ryft_mlir::dialects::stable_hlo::{CustomCallApiVersion, CustomCallMemoryLayouts};
 use ryft_mlir::{
@@ -94,10 +96,10 @@ pub(crate) fn select_attention_implementation(
 }
 
 /// Canonical `[batch, sequence, heads, head_dimension]` dimensions of one rank-three or rank-four attention type.
-fn attention_dimensions(input_type: &ArrayType) -> Result<[Dimension; 4], Error> {
+fn attention_dimensions(input_type: &ArrayType) -> Result<[CoreDimension; 4], Error> {
     match input_type.shape().dimensions() {
         [sequence, heads, head_dimension] => {
-            Ok([Dimension::Static(1), sequence.clone(), heads.clone(), head_dimension.clone()])
+            Ok([CoreDimension::Static(1), sequence.clone(), heads.clone(), head_dimension.clone()])
         }
         [batch, sequence, heads, head_dimension] => {
             Ok([batch.clone(), sequence.clone(), heads.clone(), head_dimension.clone()])
@@ -114,10 +116,10 @@ fn attention_dimensions(input_type: &ArrayType) -> Result<[Dimension; 4], Error>
 }
 
 /// Returns the physical maximum extent of one attention dimension.
-fn attention_physical_extent(dimension: &Dimension) -> Result<usize, Error> {
+fn attention_physical_extent(dimension: &CoreDimension) -> Result<usize, Error> {
     match dimension {
-        Dimension::Static(extent) => Ok(*extent),
-        Dimension::Dynamic(variable) => {
+        CoreDimension::Static(extent) => Ok(*extent),
+        CoreDimension::Dynamic(variable) => {
             variable.bounds().upper().and_then(|upper| upper.checked_sub(1)).ok_or_else(|| {
                 Error::Lowering(LoweringError::UnsupportedOperation {
                     operation: DOT_PRODUCT_ATTENTION_COMPOSITE_NAME.to_string(),
@@ -132,7 +134,7 @@ fn attention_physical_extent(dimension: &Dimension) -> Result<usize, Error> {
 }
 
 /// Returns an [`ArrayType`] with the provided data type and dimensions used by the attention lowerings.
-pub(super) fn attention_array_type<D: Clone + Into<Dimension>>(data_type: DataType, dimensions: &[D]) -> ArrayType {
+pub(super) fn attention_array_type<D: Clone + Into<CoreDimension>>(data_type: DataType, dimensions: &[D]) -> ArrayType {
     ArrayType::new(data_type, Shape::new(dimensions.iter().cloned().map(Into::into).collect()))
 }
 
@@ -396,7 +398,7 @@ fn prepare_fmha_bias<'b, 'c: 'b, 't: 'c>(
 fn synthesize_fmha_sequence_lengths<'b, 'c: 'b, 't: 'c>(
     source: ValueRef<'b, 'c, 't>,
     source_axis: usize,
-    batch: &Dimension,
+    batch: &CoreDimension,
     physical_batch: usize,
     block: &mut BlockRef<'b, 'c, 't>,
     context: &'c MlirContext<'t>,
@@ -412,7 +414,7 @@ fn synthesize_fmha_sequence_lengths<'b, 'c: 'b, 't: 'c>(
         location,
     )?)?;
     let mut lengths = lengths.result(0).expect("stablehlo.broadcast_in_dim should return one result").as_ref();
-    if matches!(batch, Dimension::Dynamic(_)) {
+    if matches!(batch, CoreDimension::Dynamic(_)) {
         let batch_size = block.append_operation(stable_hlo::get_dimension_size(source, 0, location)?)?;
         let batch_size = batch_size.result(0).expect("stablehlo.get_dimension_size should return one result").as_ref();
         let logical_type = attention_array_type(DataType::I32, std::slice::from_ref(batch));
@@ -922,17 +924,19 @@ mod tests {
         DOT_PRODUCT_ATTENTION_COMPOSITE_VERSION, DOT_PRODUCT_ATTENTION_TRAINING_COMPOSITE_NAME,
         differentiable_dot_product_attention, dot_product_attention,
     };
-    use ryft_core::{Differentiate, DimensionBounds, DimensionVariable, DomainTracingContext, Typed, Value};
+    use ryft_core::{
+        Differentiate, DimensionBounds, DimensionVariable, DomainTracingContext, Typed, Value as CoreValue,
+    };
 
-    use crate::experimental::domains::XlaTracer;
+    use crate::domains::Tracer;
     use crate::experimental::lowering::lower_mlir_module_for_program;
-    use crate::experimental::ops::FlatXlaProgram;
-    use crate::{XlaDomain, to_mlir_module_for_program};
+    use crate::experimental::ops::FlatProgram;
+    use crate::{Domain, to_mlir_module_for_program};
 
     use super::*;
 
     /// Staged program together with its input and output types.
-    type StagedProgram = (FlatXlaProgram, Vec<ArrayType>, Vec<ArrayType>);
+    type StagedProgram = (FlatProgram, Vec<ArrayType>, Vec<ArrayType>);
 
     /// Returns the array types of `types`.
     fn array_types(types: &[ArrayIrType]) -> Vec<ArrayType> {
@@ -947,9 +951,9 @@ mod tests {
         input_types: Vec<ArrayType>,
         calls: usize,
     ) -> StagedProgram {
-        let attention = dot_product_attention::<XlaDomain<'static>>(configuration);
-        let (output_types, program) = DomainTracingContext::<XlaDomain<'static>>::trace(
-            |inputs: Vec<XlaTracer<'static>>| {
+        let attention = dot_product_attention::<Domain<'static>>(configuration);
+        let (output_types, program) = DomainTracingContext::<Domain<'static>>::trace(
+            |inputs: Vec<Tracer<'static>>| {
                 let mut inputs = AttentionInputs::from_values(signature, &inputs)?;
                 let mut outputs = Vec::new();
                 for _ in 0..calls {
@@ -974,10 +978,10 @@ mod tests {
         signature: AttentionInputSignature,
         input_types: Vec<ArrayType>,
     ) -> StagedProgram {
-        let attention = differentiable_dot_product_attention::<XlaDomain<'static>>(configuration);
+        let attention = differentiable_dot_product_attention::<Domain<'static>>(configuration);
         let input_types = input_types.iter().cloned().chain([input_types[0].clone()]).collect::<Vec<_>>();
-        let (output_types, program) = DomainTracingContext::<XlaDomain<'static>>::trace(
-            |inputs: Vec<XlaTracer<'static>>| {
+        let (output_types, program) = DomainTracingContext::<Domain<'static>>::trace(
+            |inputs: Vec<Tracer<'static>>| {
                 let (output_cotangent, inputs) = inputs.split_last().unwrap();
                 let inputs = AttentionInputs::from_values(signature, inputs)?;
                 let has_bias = inputs.bias.as_ref().is_some_and(|bias| {
@@ -1330,14 +1334,14 @@ mod tests {
             ArrayType::new(
                 DataType::BF16,
                 Shape::new(vec![
-                    Dimension::Dynamic(batch.clone()),
-                    Dimension::Static(4),
-                    Dimension::Static(heads),
-                    Dimension::Static(8),
+                    CoreDimension::Dynamic(batch.clone()),
+                    CoreDimension::Static(4),
+                    CoreDimension::Static(heads),
+                    CoreDimension::Static(8),
                 ]),
             )
         };
-        let lengths_type = ArrayType::new(DataType::I32, Shape::new(vec![Dimension::Dynamic(batch.clone())]));
+        let lengths_type = ArrayType::new(DataType::I32, Shape::new(vec![CoreDimension::Dynamic(batch.clone())]));
         let boundary = |key_value_heads: usize, sequence_lengths: bool| {
             let mut input_types = vec![operand_type(2), operand_type(key_value_heads), operand_type(key_value_heads)];
             if sequence_lengths {

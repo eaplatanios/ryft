@@ -1,7 +1,8 @@
 use ryft_core::macros::check_count;
 use ryft_core::{
-    AbsOperation, AddOperation, ArrayType, DataType, DivOperation, MulOperation, NegOperation, Operation, PowOperation,
-    RemOperation, RsqrtOperation, SaturatingSubOperation, SignOperation, SqrtOperation, SubOperation,
+    AbsOperation, AddOperation, ArrayType, DataType, DivOperation, MulOperation, NegOperation,
+    Operation as CoreOperation, PowOperation, RemOperation, RsqrtOperation, SaturatingSubOperation, SignOperation,
+    SqrtOperation, SubOperation,
 };
 use ryft_mlir::dialects::stable_hlo;
 use ryft_mlir::{Block, Operation as MlirOperation, TensorTypeRef, Type, Value as MlirValue, ValueRef};
@@ -10,14 +11,14 @@ use crate::experimental::lowering::types::{
     lower_constant_elements_attribute, lower_signed_one_bit_to_mlir, lower_tensor_type,
 };
 use crate::operations::{lower_accuracy, normalize_binary_elementwise_operands};
-use crate::{Error, LowerableOperation, LowerableOperationFamily, LoweringError, XlaLowerer};
+use crate::{Error, LowerableOperation, LowerableOperationFamily, Lowerer, LoweringError};
 
 /// Recovers signed one-bit values before promotion and computes one-bit arithmetic in a byte carrier.
 fn normalize_arithmetic_inputs<'b, 'c: 'b, 't: 'c, O: LowerableOperationFamily>(
     input_values: &[ValueRef<'b, 'c, 't>],
     input_types: &[ArrayType],
     output_types: &[ArrayType],
-    lowerer: &mut XlaLowerer<'b, 'c, 't, O>,
+    lowerer: &mut Lowerer<'b, 'c, 't, O>,
 ) -> Result<[ValueRef<'b, 'c, 't>; 2], Error> {
     check_count!("input", input_values, 2, ProgramError);
     check_count!("output", output_types, 1, ProgramError);
@@ -45,7 +46,7 @@ fn normalize_arithmetic_inputs<'b, 'c: 'b, 't: 'c, O: LowerableOperationFamily>(
 fn lower_arithmetic_output<'b, 'c: 'b, 't: 'c, O: LowerableOperationFamily>(
     output: ValueRef<'b, 'c, 't>,
     output_type: &ArrayType,
-    lowerer: &mut XlaLowerer<'b, 'c, 't, O>,
+    lowerer: &mut Lowerer<'b, 'c, 't, O>,
 ) -> Result<ValueRef<'b, 'c, 't>, Error> {
     if !matches!(output_type.data_type(), DataType::I1 | DataType::U1) {
         return Ok(output);
@@ -75,7 +76,7 @@ fn lower_arithmetic_output<'b, 'c: 'b, 't: 'c, O: LowerableOperationFamily>(
 impl LowerableOperation for AddOperation<ArrayType> {
     fn lower<'b, 'c: 'b, 't: 'c, O: LowerableOperationFamily>(
         &self,
-        lowerer: &mut XlaLowerer<'b, 'c, 't, O>,
+        lowerer: &mut Lowerer<'b, 'c, 't, O>,
         input_values: &[ValueRef<'b, 'c, 't>],
         input_types: &[ArrayType],
         output_types: &[ArrayType],
@@ -89,7 +90,7 @@ impl LowerableOperation for AddOperation<ArrayType> {
 impl LowerableOperation for SubOperation<ArrayType> {
     fn lower<'b, 'c: 'b, 't: 'c, O: LowerableOperationFamily>(
         &self,
-        lowerer: &mut XlaLowerer<'b, 'c, 't, O>,
+        lowerer: &mut Lowerer<'b, 'c, 't, O>,
         input_values: &[ValueRef<'b, 'c, 't>],
         input_types: &[ArrayType],
         output_types: &[ArrayType],
@@ -103,7 +104,7 @@ impl LowerableOperation for SubOperation<ArrayType> {
 impl LowerableOperation for SaturatingSubOperation<ArrayType> {
     fn lower<'b, 'c: 'b, 't: 'c, O: LowerableOperationFamily>(
         &self,
-        lowerer: &mut XlaLowerer<'b, 'c, 't, O>,
+        lowerer: &mut Lowerer<'b, 'c, 't, O>,
         input_values: &[ValueRef<'b, 'c, 't>],
         input_types: &[ArrayType],
         output_types: &[ArrayType],
@@ -188,7 +189,7 @@ impl LowerableOperation for SaturatingSubOperation<ArrayType> {
 impl LowerableOperation for MulOperation<ArrayType> {
     fn lower<'b, 'c: 'b, 't: 'c, O: LowerableOperationFamily>(
         &self,
-        lowerer: &mut XlaLowerer<'b, 'c, 't, O>,
+        lowerer: &mut Lowerer<'b, 'c, 't, O>,
         input_values: &[ValueRef<'b, 'c, 't>],
         input_types: &[ArrayType],
         output_types: &[ArrayType],
@@ -202,7 +203,7 @@ impl LowerableOperation for MulOperation<ArrayType> {
 impl LowerableOperation for DivOperation<ArrayType> {
     fn lower<'b, 'c: 'b, 't: 'c, O: LowerableOperationFamily>(
         &self,
-        lowerer: &mut XlaLowerer<'b, 'c, 't, O>,
+        lowerer: &mut Lowerer<'b, 'c, 't, O>,
         input_values: &[ValueRef<'b, 'c, 't>],
         input_types: &[ArrayType],
         output_types: &[ArrayType],
@@ -216,7 +217,7 @@ impl LowerableOperation for DivOperation<ArrayType> {
 impl LowerableOperation for NegOperation<ArrayType> {
     fn lower<'b, 'c: 'b, 't: 'c, O: LowerableOperationFamily>(
         &self,
-        lowerer: &mut XlaLowerer<'b, 'c, 't, O>,
+        lowerer: &mut Lowerer<'b, 'c, 't, O>,
         input_values: &[ValueRef<'b, 'c, 't>],
         _input_types: &[ArrayType],
         output_types: &[ArrayType],
@@ -232,7 +233,7 @@ impl LowerableOperation for NegOperation<ArrayType> {
 impl LowerableOperation for SqrtOperation<ArrayType> {
     fn lower<'b, 'c: 'b, 't: 'c, O: LowerableOperationFamily>(
         &self,
-        lowerer: &mut XlaLowerer<'b, 'c, 't, O>,
+        lowerer: &mut Lowerer<'b, 'c, 't, O>,
         input_values: &[ValueRef<'b, 'c, 't>],
         _input_types: &[ArrayType],
         _output_types: &[ArrayType],
@@ -249,7 +250,7 @@ impl LowerableOperation for SqrtOperation<ArrayType> {
 impl LowerableOperation for RsqrtOperation<ArrayType> {
     fn lower<'b, 'c: 'b, 't: 'c, O: LowerableOperationFamily>(
         &self,
-        lowerer: &mut XlaLowerer<'b, 'c, 't, O>,
+        lowerer: &mut Lowerer<'b, 'c, 't, O>,
         input_values: &[ValueRef<'b, 'c, 't>],
         _input_types: &[ArrayType],
         _output_types: &[ArrayType],
@@ -266,7 +267,7 @@ impl LowerableOperation for RsqrtOperation<ArrayType> {
 impl LowerableOperation for PowOperation<ArrayType> {
     fn lower<'b, 'c: 'b, 't: 'c, O: LowerableOperationFamily>(
         &self,
-        lowerer: &mut XlaLowerer<'b, 'c, 't, O>,
+        lowerer: &mut Lowerer<'b, 'c, 't, O>,
         input_values: &[ValueRef<'b, 'c, 't>],
         _input_types: &[ArrayType],
         output_types: &[ArrayType],
@@ -286,7 +287,7 @@ impl LowerableOperation for PowOperation<ArrayType> {
 impl LowerableOperation for SignOperation<ArrayType> {
     fn lower<'b, 'c: 'b, 't: 'c, O: LowerableOperationFamily>(
         &self,
-        lowerer: &mut XlaLowerer<'b, 'c, 't, O>,
+        lowerer: &mut Lowerer<'b, 'c, 't, O>,
         input_values: &[ValueRef<'b, 'c, 't>],
         _input_types: &[ArrayType],
         output_types: &[ArrayType],
@@ -302,7 +303,7 @@ impl LowerableOperation for SignOperation<ArrayType> {
 impl LowerableOperation for RemOperation<ArrayType> {
     fn lower<'b, 'c: 'b, 't: 'c, O: LowerableOperationFamily>(
         &self,
-        lowerer: &mut XlaLowerer<'b, 'c, 't, O>,
+        lowerer: &mut Lowerer<'b, 'c, 't, O>,
         input_values: &[ValueRef<'b, 'c, 't>],
         input_types: &[ArrayType],
         output_types: &[ArrayType],
@@ -316,7 +317,7 @@ impl LowerableOperation for RemOperation<ArrayType> {
 impl LowerableOperation for AbsOperation<ArrayType> {
     fn lower<'b, 'c: 'b, 't: 'c, O: LowerableOperationFamily>(
         &self,
-        lowerer: &mut XlaLowerer<'b, 'c, 't, O>,
+        lowerer: &mut Lowerer<'b, 'c, 't, O>,
         input_values: &[ValueRef<'b, 'c, 't>],
         _input_types: &[ArrayType],
         _output_types: &[ArrayType],
@@ -335,9 +336,9 @@ mod tests {
     use ryft_core::{ConvertElementTypeOperation, Placeholder};
     use ryft_pjrt::{BufferType, Client, ExecutionDeviceInputs, ExecutionInput, Program as PjrtProgram};
 
-    use crate::experimental::lowering::tests::{XlaProgramBuilder, test_spmd_compilation_options};
+    use crate::experimental::lowering::tests::{ProgramBuilder, test_spmd_compilation_options};
     use crate::experimental::lowering::to_mlir_module_for_plain_program;
-    use crate::experimental::ops::XlaArrayConstant;
+    use crate::experimental::ops::ArrayConstant;
     use crate::tests::{execution_client, values_from_bytes, values_to_bytes};
 
     use super::*;
@@ -351,7 +352,7 @@ mod tests {
         right: &[i64],
         scalar_right: bool,
     ) -> Vec<i64> {
-        let mut builder = XlaProgramBuilder::new();
+        let mut builder = ProgramBuilder::new();
         let left_input = builder.add_input(ArrayType::new_static(DataType::I64, [left.len()]));
         let right_input = builder.add_input(if scalar_right {
             ArrayType::scalar(DataType::I64)
@@ -376,11 +377,7 @@ mod tests {
             .add_instruction(ConvertElementTypeOperation::new(DataType::I64, false), Vec::new(), vec![difference], None)
             .unwrap()[0];
         let program = builder
-            .build::<Vec<XlaArrayConstant>, Vec<XlaArrayConstant>>(
-                vec![output],
-                vec![Placeholder; 2],
-                vec![Placeholder],
-            )
+            .build::<Vec<ArrayConstant>, Vec<ArrayConstant>>(vec![output], vec![Placeholder; 2], vec![Placeholder])
             .unwrap();
         let module = to_mlir_module_for_plain_program(&program, "main").unwrap();
         let executable = client
@@ -419,16 +416,12 @@ mod tests {
 
     #[test]
     fn test_normalize_arithmetic_inputs() {
-        let mut builder = XlaProgramBuilder::new();
+        let mut builder = ProgramBuilder::new();
         let left = builder.add_input(ArrayType::scalar(DataType::I1));
         let right = builder.add_input(ArrayType::scalar(DataType::I8));
         let output = builder.add_instruction(AddOperation::new(), Vec::new(), vec![left, right], None).unwrap()[0];
         let program = builder
-            .build::<Vec<XlaArrayConstant>, Vec<XlaArrayConstant>>(
-                vec![output],
-                vec![Placeholder; 2],
-                vec![Placeholder],
-            )
+            .build::<Vec<ArrayConstant>, Vec<ArrayConstant>>(vec![output], vec![Placeholder; 2], vec![Placeholder])
             .unwrap();
         assert_eq!(
             to_mlir_module_for_plain_program(&program, "main").unwrap(),
@@ -447,11 +440,11 @@ mod tests {
 
     #[test]
     fn test_lower_arithmetic_output() {
-        let mut builder = XlaProgramBuilder::new();
+        let mut builder = ProgramBuilder::new();
         let input = builder.add_input(ArrayType::scalar(DataType::I1));
         let output = builder.add_instruction(AddOperation::new(), Vec::new(), vec![input, input], None).unwrap()[0];
         let program = builder
-            .build::<Vec<XlaArrayConstant>, Vec<XlaArrayConstant>>(vec![output], vec![Placeholder], vec![Placeholder])
+            .build::<Vec<ArrayConstant>, Vec<ArrayConstant>>(vec![output], vec![Placeholder], vec![Placeholder])
             .unwrap();
         assert_eq!(
             to_mlir_module_for_plain_program(&program, "main").unwrap(),
@@ -475,17 +468,13 @@ mod tests {
 
     #[test]
     fn test_saturating_sub_operation_lower() {
-        let mut builder = XlaProgramBuilder::new();
+        let mut builder = ProgramBuilder::new();
         let left = builder.add_input(ArrayType::new_static(DataType::U8, [2]));
         let right = builder.add_input(ArrayType::scalar(DataType::U8));
         let output =
             builder.add_instruction(SaturatingSubOperation::new(), Vec::new(), vec![left, right], None).unwrap()[0];
         let program = builder
-            .build::<Vec<XlaArrayConstant>, Vec<XlaArrayConstant>>(
-                vec![output],
-                vec![Placeholder; 2],
-                vec![Placeholder],
-            )
+            .build::<Vec<ArrayConstant>, Vec<ArrayConstant>>(vec![output], vec![Placeholder; 2], vec![Placeholder])
             .unwrap();
         assert_eq!(
             to_mlir_module_for_plain_program(&program, "main").unwrap(),

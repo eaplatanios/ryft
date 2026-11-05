@@ -25,7 +25,7 @@ use ryft_pjrt::{
 #[cfg(feature = "cuda-13")]
 use ryft_xla::DistributedRuntime;
 #[cfg(any(test, feature = "cuda-13"))]
-use ryft_xla::experimental::{TracedXlaProgram, XlaArrayTracer, trace};
+use ryft_xla::experimental::{ArrayTracer, TracedProgram, trace};
 
 use super::DifferentialObservation;
 #[cfg(feature = "cuda-13")]
@@ -161,10 +161,10 @@ impl DistributedCollectiveCase {
             .collect::<Vec<_>>();
         let input_shardings = shapes.iter().map(|shape| sharding(shape)).collect::<Result<Vec<_>, _>>()?;
         let output_sharding = sharding(&self.output_shape)?;
-        let traced: TracedXlaProgram<Vec<ArrayType>, ArrayType> = trace(
-            |inputs: Vec<XlaArrayTracer>| {
+        let traced: TracedProgram<Vec<ArrayType>, ArrayType> = trace(
+            |inputs: Vec<ArrayTracer>| {
                 shard_map(
-                    |inputs: Vec<XlaArrayTracer>| match self.operation.as_str() {
+                    |inputs: Vec<ArrayTracer>| match self.operation.as_str() {
                         "sum" => inputs[0].parallel_reduce(ReductionKind::Sum, "x"),
                         "all_gather" => inputs[0].parallel_all_gather_with_options(
                             "x",

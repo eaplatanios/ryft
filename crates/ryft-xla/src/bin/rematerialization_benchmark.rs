@@ -23,21 +23,22 @@ use std::time::{Duration, Instant};
 
 use ryft_core::compilation::AnalyzableCompilationDomain;
 use ryft_core::{
-    ArrayIrType, ArrayType, Compile, CompiledFunction, Context, DataType, Device, DeviceMesh, Dimension,
-    DomainTracer, DomainTracingContext, Dot, DotDimensionNumbers, DotsSavable, LogicalMesh, Memory, MeshAxis,
-    MeshAxisType, NothingSavable, OffloadDotsWithNoBatchDimensions, ProgramError, Reduce, ReductionKind,
-    RematerializationOptimizationBarrier, ResidualPolicy, ScanOperation, Shape, Sharding, StagedFunction, Tanh, Typed,
-    Value, ValueProjection, differentiate_at, rematerialize,
+    ArrayIrType, ArrayType, Compile, CompiledFunction as CoreCompiledFunction, Context, DataType, Device, DeviceMesh,
+    Dimension as CoreDimension, DomainTracer, DomainTracingContext, Dot, DotDimensionNumbers, DotsSavable, LogicalMesh,
+    Memory, MeshAxis, MeshAxisType, NothingSavable, OffloadDotsWithNoBatchDimensions, ProgramError, Reduce,
+    ReductionKind, RematerializationOptimizationBarrier, ResidualPolicy, ScanOperation, Shape, Sharding,
+    StagedFunction as CoreStagedFunction, Tanh, Typed, Value as CoreValue, ValueProjection, differentiate_at,
+    rematerialize,
 };
 use ryft_pjrt::{Client, ClientOptions, CpuClientOptions, load_cpu_plugin};
-use ryft_xla::experimental::ops::XlaOperation;
-use ryft_xla::{FromPjrt, XlaArray, XlaDomain, XlaOptions, XlaSession, XlaValue};
+use ryft_xla::experimental::ops::Operation;
+use ryft_xla::{Array, Domain, FromPjrt, Options, Session, Value};
 
-type Tracer<'c> = DomainTracer<XlaDomain<'c>>;
+type Tracer<'c> = DomainTracer<Domain<'c>>;
 type BenchmarkInput = (ArrayIrType, ArrayIrType, ArrayIrType);
 type BenchmarkOutput = (ArrayIrType, ArrayIrType);
-type BenchmarkStagedFunction<'c> = StagedFunction<XlaDomain<'c>, BenchmarkInput, BenchmarkOutput>;
-type BenchmarkCompiledFunction<'c> = CompiledFunction<XlaDomain<'c>, BenchmarkInput, BenchmarkOutput>;
+type BenchmarkStagedFunction<'c> = CoreStagedFunction<Domain<'c>, BenchmarkInput, BenchmarkOutput>;
+type BenchmarkCompiledFunction<'c> = CoreCompiledFunction<Domain<'c>, BenchmarkInput, BenchmarkOutput>;
 
 /// Rematerialization of a layer.
 #[derive(Copy, Clone, Debug)]
@@ -107,7 +108,7 @@ struct Measurement<'c> {
     execution: Duration,
 
     /// Computed gradients.
-    gradients: Vec<XlaArray<'c>>,
+    gradients: Vec<Array<'c>>,
 }
 
 /// Returns the dot product dimensions of a matrix multiplication.
@@ -181,7 +182,7 @@ fn nested_layer<'c>(
 
 /// Returns the type of an `f32` array of the provided shape.
 fn array_type(shape: &[usize]) -> ArrayType {
-    ArrayType::new(DataType::F32, Shape::new(shape.iter().map(|size| Dimension::Static(*size)).collect()))
+    ArrayType::new(DataType::F32, Shape::new(shape.iter().map(|size| CoreDimension::Static(*size)).collect()))
 }
 
 /// Returns the type of an `f32` array of the provided shape that is replicated over `mesh`, which is the type of the
@@ -195,7 +196,7 @@ fn replicated_array_type(mesh: &DeviceMesh, shape: &[usize]) -> ArrayType {
 /// Returns an array replicated over `mesh` with deterministic centered values of variance `1 / fan_in`.
 /// Distinct seeds separate inputs and parameter matrices; the generator continues across stacked layers so that
 /// their weights differ. Reusing the same seed and shape reproduces identical inputs across benchmark variants.
-fn array<'c>(domain: &XlaDomain<'c>, mesh: &DeviceMesh, shape: &[usize], fan_in: usize, mut seed: u64) -> XlaArray<'c> {
+fn array<'c>(domain: &Domain<'c>, mesh: &DeviceMesh, shape: &[usize], fan_in: usize, mut seed: u64) -> Array<'c> {
     let size = shape.iter().product::<usize>();
     let scale = (3.0 / fan_in as f32).sqrt();
     let bytes = (0..size)
@@ -210,11 +211,11 @@ fn array<'c>(domain: &XlaDomain<'c>, mesh: &DeviceMesh, shape: &[usize], fan_in:
             ((2.0 * unit - 1.0) * scale).to_ne_bytes()
         })
         .collect::<Vec<_>>();
-    XlaArray::from_host_buffer(domain, replicated_array_type(mesh, shape), mesh.clone(), bytes.as_slice()).unwrap()
+    Array::from_host_buffer(domain, replicated_array_type(mesh, shape), mesh.clone(), bytes.as_slice()).unwrap()
 }
 
 /// Returns the values of `array`.
-fn values(client: &Client<'_>, array: &XlaArray<'_>) -> Vec<f32> {
+fn values(client: &Client<'_>, array: &Array<'_>) -> Vec<f32> {
     let device = client.addressable_devices().unwrap()[0].id().unwrap();
     let bytes = array.device_shard(device).unwrap().buffer().unwrap().copy_to_host(None).unwrap().r#await().unwrap();
     bytes.chunks_exact(4).map(|bytes| f32::from_ne_bytes(bytes.try_into().unwrap())).collect()
@@ -223,7 +224,7 @@ fn values(client: &Client<'_>, array: &XlaArray<'_>) -> Vec<f32> {
 /// Stages the gradient of the sum of the outputs of `apply` with respect to the parameters `(w₁, w₂)` of shapes
 /// `up_shape` and `down_shape`, at a hidden state of `model`.
 fn stage_gradient<'c, F>(
-    domain: &XlaDomain<'c>,
+    domain: &Domain<'c>,
     mesh: &DeviceMesh,
     model: Model,
     up_shape: &[usize],
@@ -234,43 +235,45 @@ where
     F: Fn(Tracer<'c>, Tracer<'c>, Tracer<'c>) -> Result<Tracer<'c>, ProgramError>,
 {
     let hidden_type = array_type(&[model.batch_size, model.width]);
-    domain.stage(
-        |(hidden, up, down)| {
-            // The hidden state is differentiated too, so that every input belongs to the differentiated function, and
-            // its gradient is discarded.
-            let (_, up, down) = differentiate_at((hidden, up, down))
-                .gradient(|(hidden, up, down)| {
-                    let (_, apply) = DomainTracingContext::<XlaDomain<'c>>::trace(
-                        |(hidden, up, down): (Tracer<'c>, Tracer<'c>, Tracer<'c>)| apply(hidden, up, down),
-                        (
-                            ArrayIrType::from(hidden_type.clone()),
-                            ArrayIrType::from(array_type(up_shape)),
-                            ArrayIrType::from(array_type(down_shape)),
-                        ),
-                    )?;
-                    let context = up.domain();
-                    let output = apply.into_flat_program().interpret_in_context(&context, vec![hidden, up, down])?;
-                    let output = ValueProjection::<ArrayType>::into_projected(output.into_iter().next().unwrap())?;
-                    Ok(output.reduce(&[0, 1], ReductionKind::Sum)?.into_value())
-                })
-                .unwrap();
-            (up, down)
-        },
-        (
-            ArrayIrType::from(replicated_array_type(mesh, &[model.batch_size, model.width])),
-            ArrayIrType::from(replicated_array_type(mesh, up_shape)),
-            ArrayIrType::from(replicated_array_type(mesh, down_shape)),
-        ),
-        XlaOptions::new(mesh.clone()),
-    )
-    .unwrap()
+    domain
+        .stage(
+            |(hidden, up, down)| {
+                // The hidden state is differentiated too, so that every input belongs to the differentiated function, and
+                // its gradient is discarded.
+                let (_, up, down) = differentiate_at((hidden, up, down))
+                    .gradient(|(hidden, up, down)| {
+                        let (_, apply) = DomainTracingContext::<Domain<'c>>::trace(
+                            |(hidden, up, down): (Tracer<'c>, Tracer<'c>, Tracer<'c>)| apply(hidden, up, down),
+                            (
+                                ArrayIrType::from(hidden_type.clone()),
+                                ArrayIrType::from(array_type(up_shape)),
+                                ArrayIrType::from(array_type(down_shape)),
+                            ),
+                        )?;
+                        let context = up.domain();
+                        let output =
+                            apply.into_flat_program().interpret_in_context(&context, vec![hidden, up, down])?;
+                        let output = ValueProjection::<ArrayType>::into_projected(output.into_iter().next().unwrap())?;
+                        Ok(output.reduce(&[0, 1], ReductionKind::Sum)?.into_value())
+                    })
+                    .unwrap();
+                (up, down)
+            },
+            (
+                ArrayIrType::from(replicated_array_type(mesh, &[model.batch_size, model.width])),
+                ArrayIrType::from(replicated_array_type(mesh, up_shape)),
+                ArrayIrType::from(replicated_array_type(mesh, down_shape)),
+            ),
+            Options::new(mesh.clone()),
+        )
+        .unwrap()
 }
 
 /// Stages the gradient of a model that scans over its stacked layer parameters, applying each layer with the provided
 /// rematerialization. Rematerialized layers disable their optimization barriers, because the scan already separates
 /// their recomputations from the forward computation.
 fn stage_scanned_gradient<'c>(
-    domain: &XlaDomain<'c>,
+    domain: &Domain<'c>,
     mesh: &DeviceMesh,
     model: Model,
     checkpointing: Checkpointing,
@@ -285,7 +288,7 @@ fn stage_scanned_gradient<'c>(
         &[model.layer_count, model.width, model.expanded_width],
         &[model.layer_count, model.expanded_width, model.width],
         move |hidden, up, down| {
-            let (_, body) = DomainTracingContext::<XlaDomain<'c>>::trace(
+            let (_, body) = DomainTracingContext::<Domain<'c>>::trace(
                 |(_index, hidden, up, down): (Tracer<'c>, Tracer<'c>, Tracer<'c>, Tracer<'c>)| {
                     checkpointed_layer(checkpointing, false, hidden, up, down)
                 },
@@ -297,7 +300,7 @@ fn stage_scanned_gradient<'c>(
                 ),
             )?;
             let context = hidden.context().clone();
-            let scan = XlaOperation::Scan(ScanOperation::new(1, model.layer_count));
+            let scan = Operation::Scan(ScanOperation::new(1, model.layer_count));
             Ok(context.bind(scan, vec![body.into_flat_program()], &[hidden, up, down])?.remove(0))
         },
     )
@@ -305,10 +308,10 @@ fn stage_scanned_gradient<'c>(
 
 /// Lowers, compiles, analyzes, and executes `staged` at `inputs`, whose staging took `trace`.
 fn measure<'c>(
-    domain: &XlaDomain<'c>,
+    domain: &Domain<'c>,
     staged: BenchmarkStagedFunction<'c>,
     trace: Duration,
-    inputs: (XlaArray<'c>, XlaArray<'c>, XlaArray<'c>),
+    inputs: (Array<'c>, Array<'c>, Array<'c>),
     execution_count: usize,
 ) -> Measurement<'c> {
     let start = Instant::now();
@@ -319,7 +322,7 @@ fn measure<'c>(
     let compiled: BenchmarkCompiledFunction<'c> = lowered.compile(&domain).unwrap();
     let compile = start.elapsed();
     let memory = domain.analyze(compiled.executable()).unwrap().memory;
-    let inputs = (XlaValue::Array(inputs.0), XlaValue::Array(inputs.1), XlaValue::Array(inputs.2));
+    let inputs = (Value::Array(inputs.0), Value::Array(inputs.1), Value::Array(inputs.2));
     let execute = || {
         let (up, down) = compiled.executable().execute(domain, inputs.clone()).unwrap();
         let gradients = [up, down].map(|gradient| ValueProjection::<ArrayType>::into_projected(gradient).unwrap());
@@ -513,7 +516,7 @@ fn main() -> Result<(), ProgramError> {
     let device = Device::from_pjrt(&client.addressable_devices().unwrap().remove(0)).unwrap();
     let logical_mesh = LogicalMesh::new(vec![MeshAxis::new("device", 1, MeshAxisType::Auto).unwrap()]).unwrap();
     let mesh = DeviceMesh::new(logical_mesh, vec![device]).unwrap();
-    let domain = XlaSession::new(client).domain();
+    let domain = Session::new(client).domain();
     println!("platform: {}", client.platform_name().unwrap());
 
     // Runtime of a model that scans over its layers.

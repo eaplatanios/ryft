@@ -12,13 +12,13 @@ use std::ops::{Add, Mul};
 use serde::Serialize;
 
 use ryft_core::{
-    Array, ArrayOperation, ArrayType, Context, DataType, Differentiate, DifferentiationError, Dimension, Dot,
-    DotDimensionNumbers, EagerContext, ForwardModeDifferentiate, LogicalMesh, MeshAxis, MeshAxisType, Program,
-    ProgramError, ProgramStatistics, ReverseModeDifferentiate, Shape, ShardMapOptions, Sharding, ShardingDimension,
-    Sin, shard_map,
+    Array as CoreArray, ArrayOperation, ArrayType, Context, DataType, Differentiate, DifferentiationError,
+    Dimension as CoreDimension, Dot, DotDimensionNumbers, EagerContext, ForwardModeDifferentiate, LogicalMesh,
+    MeshAxis, MeshAxisType, Program as CoreProgram, ProgramError, ProgramStatistics, ReverseModeDifferentiate, Shape,
+    ShardMapOptions, Sharding, ShardingDimension, Sin, shard_map,
 };
 use ryft_xla::Error;
-use ryft_xla::experimental::{TracedXlaProgram, XlaArrayTracer, trace};
+use ryft_xla::experimental::{ArrayTracer, TracedProgram, trace};
 
 /// A requested structural-statistics case is absent from this binary's registry.
 #[derive(Debug, thiserror::Error)]
@@ -169,19 +169,21 @@ fn quartic_plus_sin<T: Clone + Sin + Add<Output = T> + Mul<Output = T>>(x: T) ->
 
 /// Emits the plain JIT scalar bilinear case.
 fn emit_scalar_bilinear_sin_jit() -> Result<ProgramStatistics, Error> {
-    let (_, program): (Array, Program<Array, ArrayOperation<Array>, (Array, Array), Array>) =
-        EagerContext::<Array, ArrayOperation<Array>>::new().interpret_and_trace(
-            |inputs| Ok(inputs.0.clone() * inputs.1 + inputs.0.sin()?),
-            (Array::scalar(2.0)?, Array::scalar(3.0)?),
-        )?;
+    let (_, program): (
+        CoreArray,
+        CoreProgram<CoreArray, ArrayOperation<CoreArray>, (CoreArray, CoreArray), CoreArray>,
+    ) = EagerContext::<CoreArray, ArrayOperation<CoreArray>>::new().interpret_and_trace(
+        |inputs| Ok(inputs.0.clone() * inputs.1 + inputs.0.sin()?),
+        (CoreArray::scalar(2.0)?, CoreArray::scalar(3.0)?),
+    )?;
     Ok(program.statistics())
 }
 
 /// Emits the staged scalar bilinear pullback case.
 fn emit_scalar_bilinear_sin_vjp_pullback() -> Result<ProgramStatistics, Error> {
-    let (_, pullback): (Array, _) = EagerContext::<Array, ArrayOperation<Array>>::new().vjp(
+    let (_, pullback): (CoreArray, _) = EagerContext::<CoreArray, ArrayOperation<CoreArray>>::new().vjp(
         |inputs, ()| Ok(inputs.0.clone() * inputs.1 + inputs.0.sin()?),
-        (Array::scalar(2.0)?, Array::scalar(3.0)?),
+        (CoreArray::scalar(2.0)?, CoreArray::scalar(3.0)?),
         (),
     )?;
     let (pullback, _residuals) = pullback.into_transposed_parts()?;
@@ -191,8 +193,8 @@ fn emit_scalar_bilinear_sin_vjp_pullback() -> Result<ProgramStatistics, Error> {
 
 /// Emits the staged scalar reverse-mode gradient case.
 fn emit_scalar_quartic_plus_sin_grad() -> Result<ProgramStatistics, Error> {
-    let (_, program): (Array, Program<Array, ArrayOperation<Array>, Array, Array>) =
-        EagerContext::<Array, ArrayOperation<Array>>::new().interpret_and_trace(
+    let (_, program): (CoreArray, CoreProgram<CoreArray, ArrayOperation<CoreArray>, CoreArray, CoreArray>) =
+        EagerContext::<CoreArray, ArrayOperation<CoreArray>>::new().interpret_and_trace(
             |x| {
                 let context = x.context().clone();
                 // `interpret_and_trace` fixes its closure error to `ProgramError`, so fold the inner gradient's
@@ -203,36 +205,38 @@ fn emit_scalar_quartic_plus_sin_grad() -> Result<ProgramStatistics, Error> {
                     error => ProgramError::MalformedProgram(error.to_string()),
                 })
             },
-            Array::scalar(2.0)?,
+            CoreArray::scalar(2.0)?,
         )?;
     Ok(program.statistics())
 }
 
 /// Emits the staged scalar value-and-gradient case.
 fn emit_scalar_quartic_plus_sin_value_and_gradient() -> Result<ProgramStatistics, Error> {
-    let (_, program): ((Array, Array), Program<Array, ArrayOperation<Array>, Array, (Array, Array)>) =
-        EagerContext::<Array, ArrayOperation<Array>>::new().interpret_and_trace(
-            |x| {
-                let context = x.context().clone();
-                // `interpret_and_trace` fixes its closure error to `ProgramError`, so fold the inner gradient's
-                // differentiation error into a program error. A non-scalar gradient output cannot occur for this
-                // scalar case function.
-                context.differentiate_at(x).value_and_gradient(quartic_plus_sin).map_err(|error| match error {
-                    DifferentiationError::Program(error) => error,
-                    error => ProgramError::MalformedProgram(error.to_string()),
-                })
-            },
-            Array::scalar(2.0)?,
-        )?;
+    let (_, program): (
+        (CoreArray, CoreArray),
+        CoreProgram<CoreArray, ArrayOperation<CoreArray>, CoreArray, (CoreArray, CoreArray)>,
+    ) = EagerContext::<CoreArray, ArrayOperation<CoreArray>>::new().interpret_and_trace(
+        |x| {
+            let context = x.context().clone();
+            // `interpret_and_trace` fixes its closure error to `ProgramError`, so fold the inner gradient's
+            // differentiation error into a program error. A non-scalar gradient output cannot occur for this
+            // scalar case function.
+            context.differentiate_at(x).value_and_gradient(quartic_plus_sin).map_err(|error| match error {
+                DifferentiationError::Program(error) => error,
+                error => ProgramError::MalformedProgram(error.to_string()),
+            })
+        },
+        CoreArray::scalar(2.0)?,
+    )?;
     Ok(program.statistics())
 }
 
 /// Emits the directly linearized pushforward of `f(x) = x⁴ + sin(x)`, closed over its lifted residuals.
 fn emit_scalar_quartic_plus_sin_linearize_pushforward() -> Result<ProgramStatistics, Error> {
-    let context = EagerContext::<Array, ArrayOperation<Array>>::new();
+    let context = EagerContext::<CoreArray, ArrayOperation<CoreArray>>::new();
     let (_, pushforward) = context.linearize(
         |x, ()| Ok(x.clone() * x.clone() * x.clone() * x.clone() + x.sin()?),
-        Array::scalar(2.0)?,
+        CoreArray::scalar(2.0)?,
         (),
     )?;
     let (_, pushforward, residuals, ..) = pushforward.into_parts();
@@ -250,7 +254,7 @@ fn emit_scalar_quartic_plus_sin_linearize_pushforward() -> Result<ProgramStatist
             let mut outputs = pushforward.interpret_in_context(&tracing_context, inputs)?;
             Ok(outputs.remove(0))
         },
-        Array::scalar(1.0)?,
+        CoreArray::scalar(1.0)?,
     )?;
     Ok(closed_pushforward.statistics())
 }
@@ -266,7 +270,7 @@ fn shard_map_mesh() -> LogicalMesh {
 ///
 ///   - `size`: Static vector length.
 fn vector_type(size: usize) -> ArrayType {
-    ArrayType::new(DataType::F32, Shape::new(vec![Dimension::Static(size)]))
+    ArrayType::new(DataType::F32, Shape::new(vec![CoreDimension::Static(size)]))
 }
 
 /// Returns a rank-2 case array type.
@@ -276,19 +280,19 @@ fn vector_type(size: usize) -> ArrayType {
 ///   - `rows`: Matrix row count.
 ///   - `cols`: Matrix column count.
 fn matrix_type(rows: usize, cols: usize) -> ArrayType {
-    ArrayType::new(DataType::F32, Shape::new(vec![Dimension::Static(rows), Dimension::Static(cols)]))
+    ArrayType::new(DataType::F32, Shape::new(vec![CoreDimension::Static(rows), CoreDimension::Static(cols)]))
 }
 
 /// Emits the basic traced `shard_map` case.
 fn emit_shard_map_basic() -> Result<ProgramStatistics, Error> {
     let mesh = shard_map_mesh();
     let sharding = Sharding::new(mesh.clone(), vec![ShardingDimension::sharded(["x"])]).unwrap();
-    let traced: TracedXlaProgram<ArrayType, ArrayType> = trace(
+    let traced: TracedProgram<ArrayType, ArrayType> = trace(
         {
             let mesh = mesh.clone();
             move |x| {
                 shard_map(
-                    |local_x: XlaArrayTracer| local_x.sin(),
+                    |local_x: ArrayTracer| local_x.sin(),
                     x,
                     mesh.clone(),
                     sharding.clone(),
@@ -310,12 +314,12 @@ fn emit_shard_map_matmul() -> Result<ProgramStatistics, Error> {
         Sharding::new(mesh.clone(), vec![ShardingDimension::sharded(["x"]), ShardingDimension::replicated()]).unwrap();
     let rhs_sharding = Sharding::replicated(mesh.clone(), 2);
     let output_sharding = lhs_sharding.clone();
-    let traced: TracedXlaProgram<(ArrayType, ArrayType), ArrayType> = trace(
+    let traced: TracedProgram<(ArrayType, ArrayType), ArrayType> = trace(
         {
             let mesh = mesh.clone();
             move |inputs| {
                 shard_map(
-                    |(lhs, rhs): (XlaArrayTracer, XlaArrayTracer)| lhs.dot(&rhs, &DotDimensionNumbers::matmul()),
+                    |(lhs, rhs): (ArrayTracer, ArrayTracer)| lhs.dot(&rhs, &DotDimensionNumbers::matmul()),
                     inputs,
                     mesh.clone(),
                     (lhs_sharding.clone(), rhs_sharding.clone()),
@@ -340,16 +344,16 @@ fn emit_nested_shard_map() -> Result<ProgramStatistics, Error> {
     .unwrap();
     let outer_sharding = Sharding::new(mesh.clone(), vec![ShardingDimension::sharded(["x"])]).unwrap();
     let inner_sharding = Sharding::new(mesh.clone(), vec![ShardingDimension::sharded(["y"])]).unwrap();
-    let traced: TracedXlaProgram<ArrayType, ArrayType> = trace(
+    let traced: TracedProgram<ArrayType, ArrayType> = trace(
         {
             let mesh = mesh.clone();
             move |x| {
                 shard_map(
                     {
                         let mesh = mesh.clone();
-                        move |outer_x: XlaArrayTracer| {
+                        move |outer_x: ArrayTracer| {
                             let nested = shard_map(
-                                |inner_x: XlaArrayTracer| Ok(inner_x.clone() + inner_x),
+                                |inner_x: ArrayTracer| Ok(inner_x.clone() + inner_x),
                                 outer_x.clone(),
                                 mesh.clone(),
                                 inner_sharding.clone(),

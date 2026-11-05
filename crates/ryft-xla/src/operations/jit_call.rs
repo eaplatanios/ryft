@@ -12,15 +12,15 @@ use ryft_core::{
     AttachedRegions, BatchAxis, BatchableOperation, BatchedProgram, BatchingContext, BatchingDriver, BatchingError,
     CaptureConstant, CompositeKey, Concretizable, Context, CotangentDestinations, DifferentiableOperation,
     DifferentiableType, DifferentiationContext, DifferentiationDriver, DifferentiationDual, DifferentiationError,
-    DifferentiationPolicy, InputRegionProvenance, InterpretableOperation, InterpretationDriver, MaybeZero, Operation,
-    OperationBoundaryPruning, OperationFormatter, OutputRegionProvenance, Parameterized, PartialEvaluationContext,
-    PartialEvaluationDriver, PartialEvaluationValue, PartialValue, PartiallyEvaluatableOperation,
-    ProgramBatchingOutputAxesPolicy, ProgramError, ReferenceDischargeContext, ReferenceDischargeDriver,
-    ReferenceDischargePolicy, ReferenceDischargeValue, ReferenceDischargeableOperation, RegionDataFlow, RegionId,
-    RegionInterface, RegionLiveness, RegionRef, RegionSlot, RematerializationOptimizationBarrier, ShardMapOperation,
-    StagedCallOperation, Tracer, TracingContext, TransposableOperation, TranspositionContext, TranspositionDriver,
-    Type, TypeError, TypeIdentityRenaming, TypeRefinements, Typed, TypedProgram, Value, ValueProjection,
-    ValueResolution, Zero,
+    DifferentiationPolicy, InputRegionProvenance, InterpretableOperation, InterpretationDriver, MaybeZero,
+    Operation as CoreOperation, OperationBoundaryPruning, OperationFormatter, OutputRegionProvenance, Parameterized,
+    PartialEvaluationContext, PartialEvaluationDriver, PartialEvaluationValue, PartialValue,
+    PartiallyEvaluatableOperation, ProgramBatchingOutputAxesPolicy, ProgramError, ReferenceDischargeContext,
+    ReferenceDischargeDriver, ReferenceDischargePolicy, ReferenceDischargeValue, ReferenceDischargeableOperation,
+    RegionDataFlow, RegionId, RegionInterface, RegionLiveness, RegionRef, RegionSlot,
+    RematerializationOptimizationBarrier, ShardMapOperation, StagedCallOperation, Tracer as CoreTracer, TracingContext,
+    TransposableOperation, TranspositionContext, TranspositionDriver, Type, TypeError, TypeIdentityRenaming,
+    TypeRefinements, Typed, TypedProgram, Value as CoreValue, ValueProjection, ValueResolution, Zero,
 };
 use ryft_mlir::dialects::func;
 use ryft_mlir::{
@@ -31,10 +31,10 @@ use ryft_mlir::{
 use crate::experimental::lowering::regions::lower_nested_program_inline;
 use crate::experimental::lowering::types::lower_array_ir_type;
 use crate::experimental::lowering::{CollectiveLoweringState, EffectTokens};
-use crate::experimental::ops::{FlatXlaProgram, XlaConstant, XlaOperation, XlaProgram};
+use crate::experimental::ops::{Constant, FlatProgram, Operation, Program};
 use crate::operations::composites::NamedCompositeImplementation;
 use crate::operations::control_flow::lowered_effect_classes;
-use crate::{Error, LowerableOperation, LowerableOperationFamily, LoweringError, XlaDomain, XlaLowerer, XlaValue};
+use crate::{Domain, Error, LowerableOperation, LowerableOperationFamily, Lowerer, LoweringError, Value};
 
 /// Structural identity of a flat callee program attached behind a `jit_call`, used to deduplicate repeated nested
 /// programs into shared private `func.func`s at lowering time.
@@ -66,7 +66,7 @@ pub(crate) struct JitCallProgramKey {
 /// identifies a slot and type rather than the runtime value in the surrounding capture table, so programs with
 /// constants remain ineligible. `shard_map` also remains outside this deduplication path because its lowering owns a
 /// separate outlined boundary.
-fn supports_structural_dedup<O: LowerableOperationFamily>(program: &FlatXlaProgram<O>) -> bool {
+fn supports_structural_dedup<O: LowerableOperationFamily>(program: &FlatProgram<O>) -> bool {
     program.regions().iter().all(|region| {
         region.atoms().iter().all(|atom| !atom.is_constant())
             && region
@@ -77,11 +77,8 @@ fn supports_structural_dedup<O: LowerableOperationFamily>(program: &FlatXlaProgr
 }
 
 /// Returns whether a borrowed rooted region may be deduplicated by structural identity.
-fn supports_structural_dedup_region<O: LowerableOperationFamily>(region: RegionRef<'_, XlaConstant, O>) -> bool {
-    fn walk<O: LowerableOperationFamily>(
-        region: RegionRef<'_, XlaConstant, O>,
-        visited: &mut HashSet<RegionId>,
-    ) -> bool {
+fn supports_structural_dedup_region<O: LowerableOperationFamily>(region: RegionRef<'_, Constant, O>) -> bool {
+    fn walk<O: LowerableOperationFamily>(region: RegionRef<'_, Constant, O>, visited: &mut HashSet<RegionId>) -> bool {
         if !visited.insert(region.id()) {
             return true;
         }
@@ -102,8 +99,8 @@ fn supports_structural_dedup_region<O: LowerableOperationFamily>(region: RegionR
 /// Computes the deduplication key for a flat callee program, or [`None`] for programs that are not eligible for
 /// structural deduplication (see [`supports_structural_dedup`]) and therefore always inline. The key is generic over
 /// the program's constant universe so that lookups from the value-generic lowering path type-check; the map itself is
-/// only ever populated from the staged [`XlaConstant`]-keyed pipeline.
-fn jit_call_program_key<O: LowerableOperationFamily>(program: &FlatXlaProgram<O>) -> Option<JitCallProgramKey> {
+/// only ever populated from the staged [`Constant`]-keyed pipeline.
+fn jit_call_program_key<O: LowerableOperationFamily>(program: &FlatProgram<O>) -> Option<JitCallProgramKey> {
     supports_structural_dedup(program).then(|| JitCallProgramKey {
         rendered: program.to_string(),
         input_types: program.input_types().into_owned(),
@@ -112,9 +109,7 @@ fn jit_call_program_key<O: LowerableOperationFamily>(program: &FlatXlaProgram<O>
 }
 
 /// Computes the deduplication key for a borrowed callee region, materializing only after borrowed eligibility checks.
-fn jit_call_region_key<O: LowerableOperationFamily>(
-    region: RegionRef<'_, XlaConstant, O>,
-) -> Option<JitCallProgramKey> {
+fn jit_call_region_key<O: LowerableOperationFamily>(region: RegionRef<'_, Constant, O>) -> Option<JitCallProgramKey> {
     supports_structural_dedup_region(region).then(|| {
         let program = region.to_program();
         JitCallProgramKey {
@@ -126,13 +121,13 @@ fn jit_call_region_key<O: LowerableOperationFamily>(
 }
 
 /// One deduplicated callee emitted as a shared private `func.func`.
-pub(crate) struct JitCallFunction<O = XlaOperation> {
+pub(crate) struct JitCallFunction<O = Operation> {
     /// Symbol name of the emitted private function.
     pub(crate) symbol: String,
 
     /// Representative callee program for this key (materialized from its callee region), lowered once as the
     /// function body.
-    pub(crate) program: FlatXlaProgram<O>,
+    pub(crate) program: FlatProgram<O>,
 
     /// Flat input types of the callee, also the emitted function's argument types.
     pub(crate) input_types: Vec<ArrayIrType>,
@@ -146,7 +141,7 @@ pub(crate) struct JitCallFunction<O = XlaOperation> {
 /// Built once by [`collect_jit_call_functions`] before a module is lowered and threaded read-only through the
 /// lowering pass. At each `jit_call` lowering site, a callee whose key is present is emitted as a `func.call` to the
 /// shared function instead of being inlined; absent callees inline as before.
-pub(crate) struct JitCallFunctionMap<O = XlaOperation> {
+pub(crate) struct JitCallFunctionMap<O = Operation> {
     /// Shared functions keyed by callee identity.
     pub(crate) functions: HashMap<JitCallProgramKey, JitCallFunction<O>>,
 
@@ -191,7 +186,7 @@ impl<O> Default for JitCallFunctionMap<O> {
 
 impl<O: LowerableOperationFamily> JitCallFunctionMap<O> {
     /// Returns the shared function for `program`, if one was emitted for its identity.
-    pub(crate) fn get(&self, program: &FlatXlaProgram<O>) -> Option<&JitCallFunction<O>> {
+    pub(crate) fn get(&self, program: &FlatProgram<O>) -> Option<&JitCallFunction<O>> {
         self.functions.get(&jit_call_program_key(program)?)
     }
 
@@ -231,32 +226,32 @@ impl<O: LowerableOperationFamily> JitCallFunctionMap<O> {
 /// keys in first-occurrence order, and `memo` caches the (possibly expensive) key computation per callee root
 /// [`RegionId`] — interned shared callees repeat their root region id, so each shared callee is rendered once.
 fn count_jit_calls<Input, Output, O: LowerableOperationFamily>(
-    program: &XlaProgram<Input, Output, O>,
+    program: &Program<Input, Output, O>,
     target_platform: Option<&str>,
-    counts: &mut HashMap<JitCallProgramKey, (usize, FlatXlaProgram<O>)>,
+    counts: &mut HashMap<JitCallProgramKey, (usize, FlatProgram<O>)>,
     order: &mut Vec<JitCallProgramKey>,
     memo: &mut HashMap<RegionId, Option<JitCallProgramKey>>,
     named: &mut HashMap<NamedFunctionKey, Option<JitCallProgramKey>>,
     names: &mut HashMap<JitCallProgramKey, String>,
 ) -> Result<(), Error>
 where
-    Input: Parameterized<XlaConstant>,
-    Output: Parameterized<XlaConstant>,
+    Input: Parameterized<Constant>,
+    Output: Parameterized<Constant>,
 {
     #[allow(clippy::too_many_arguments)]
     fn walk<Input, Output, O: LowerableOperationFamily>(
-        program: &XlaProgram<Input, Output, O>,
+        program: &Program<Input, Output, O>,
         region: RegionId,
         target_platform: Option<&str>,
-        counts: &mut HashMap<JitCallProgramKey, (usize, FlatXlaProgram<O>)>,
+        counts: &mut HashMap<JitCallProgramKey, (usize, FlatProgram<O>)>,
         order: &mut Vec<JitCallProgramKey>,
         memo: &mut HashMap<RegionId, Option<JitCallProgramKey>>,
         named_calls: &mut NamedRegionCalls,
         visited: &mut HashSet<RegionId>,
     ) -> Result<(), Error>
     where
-        Input: Parameterized<XlaConstant>,
-        Output: Parameterized<XlaConstant>,
+        Input: Parameterized<Constant>,
+        Output: Parameterized<Constant>,
     {
         // Interned shared callees repeat their root region id; each region's instructions are walked once while
         // every referencing `jit_call` instruction still contributes one occurrence to the counts below.
@@ -451,14 +446,14 @@ struct NamedRegionCall {
 /// Returns an error when the effects that lowering a callee introduces cannot be determined (refer to
 /// [`lowered_effect_classes`]).
 pub(crate) fn collect_jit_call_functions<Input, Output, O: LowerableOperationFamily>(
-    program: &XlaProgram<Input, Output, O>,
+    program: &Program<Input, Output, O>,
     target_platform: Option<&str>,
 ) -> Result<JitCallFunctionMap<O>, Error>
 where
-    Input: Parameterized<XlaConstant>,
-    Output: Parameterized<XlaConstant>,
+    Input: Parameterized<Constant>,
+    Output: Parameterized<Constant>,
 {
-    let mut counts: HashMap<JitCallProgramKey, (usize, FlatXlaProgram<O>)> = HashMap::new();
+    let mut counts: HashMap<JitCallProgramKey, (usize, FlatProgram<O>)> = HashMap::new();
     let mut order: Vec<JitCallProgramKey> = Vec::new();
     let mut memo: HashMap<RegionId, Option<JitCallProgramKey>> = HashMap::new();
     let mut named = HashMap::new();
@@ -589,7 +584,7 @@ pub(crate) fn emit_jit_call_function<'b, 'c: 'b, 't: 'c, O: LowerableOperationFa
 /// exact leading lifted-capture prefix length; deriving it from capture-constant indices instead would conflate the
 /// independent capture namespaces of nested calls inside the callee arena.
 pub(crate) fn lower_jit_call<'b, 'c: 'b, 't: 'c, O: LowerableOperationFamily>(
-    program: &FlatXlaProgram<O>,
+    program: &FlatProgram<O>,
     capture_count: usize,
     input_values: &[ValueRef<'b, 'c, 't>],
     block: &mut BlockRef<'b, 'c, 't>,
@@ -672,19 +667,20 @@ pub(crate) fn lower_shared_function_call<'b, 'c: 'b, 't: 'c>(
 /// Canonical operation name for [`JitCallOperation`].
 pub const JIT_CALL_OPERATION_NAME: &str = "jit_call";
 
-/// Staged call to a flat jitted XLA program. The callee program is not part of this payload: it is a shared
-/// callee root [`Region`](ryft_core::Region) attached to the [`Instruction`](ryft_core::Instruction) applying the
-/// operation (the single `["callee"]` slot), interned by [`Arc`] identity when the call is staged through the
+/// Staged call to a flat jitted XLA program. The callee program is not part of this payload: it is a shared callee root
+/// [`Region`](ryft_core::Region) attached to the [`Instruction`](ryft_core::Instruction) applying the operation (the
+/// single `["callee"]` slot), interned by [`Arc`] identity when the call is staged through the
 /// [`AttachedRegions`](ryft_core::AttachedRegions) passed to [`Context::bind`], so repeated calls staged from one
-/// function handle share one callee root and remain identity-comparable for call-site deduplication at lowering.
-/// The `T` parameter fixes the callee boundary's type universe, allowing the reusable homogeneous-array batching form
-/// and the executable array IR form to remain distinct payload types with one [`Operation`] contract each.
-/// The retained `capture_count` names the callee's exact leading lifted-capture input prefix; it participates in
-/// operation equality and callee-deduplication identity and scopes reference-capture resolution during analysis.
+/// function handle share one callee root and remain identity-comparable for call-site deduplication at lowering. The
+/// `T` parameter fixes the callee boundary's type universe, allowing the reusable homogeneous-array batching form and
+/// the executable array IR form to remain distinct payload types with one [`CoreOperation`](ryft_core::Operation)
+/// contract each. The retained `capture_count` names the callee's exact leading lifted-capture input prefix; it
+/// participates in operation equality and callee-deduplication identity and scopes reference-capture resolution during
+/// analysis.
 ///
-/// [`Operation::region_data_flow`] declares ordinary callee data flow: callee inputs receive instruction inputs
-/// positionally and instruction outputs originate from the corresponding callee outputs. Capture-prefix retention
-/// remains an independent boundary-pruning requirement.
+/// [`CoreOperation::region_data_flow`](ryft_core::Operation::region_data_flow) declares ordinary callee data flow:
+/// callee inputs receive instruction inputs positionally and instruction outputs originate from the corresponding
+/// callee outputs. Capture-prefix retention remains an independent boundary-pruning requirement.
 ///
 /// Declare callee-local result identities through [`with_callee_type_signature`](Self::with_callee_type_signature)
 /// before binding the call. The operation allocates caller-owned result names once, so repeated inference retains them
@@ -986,7 +982,7 @@ impl<T: Type> CallTypeBindings<T> {
     }
 }
 
-impl StagedCallOperation<XlaConstant> for XlaOperation {
+impl StagedCallOperation<Constant> for Operation {
     #[inline]
     fn staged_call(capture_count: usize) -> Self {
         Self::JitCall(JitCallOperation::new(capture_count))
@@ -1034,7 +1030,7 @@ fn ensure_call_input_types<T: Type>(
     Ok(())
 }
 
-impl<T: Type> Operation for JitCallOperation<T> {
+impl<T: Type> CoreOperation for JitCallOperation<T> {
     type Type = T;
 
     #[inline]
@@ -1205,7 +1201,7 @@ where
 // call's known inputs are concrete values of an eager known-side context or tracers into a live
 // outer trace does not matter, as in JAX's call partial-evaluation rules, which always bind the known call: the known
 // side is bound through the default fold-or-residualize policy, which compiles and executes it under an eager context
-// (e.g., [`XlaDomain`](crate::XlaDomain)) and stages it into the outer program under a staging context. The `shard_map`
+// (e.g., [`Domain`](crate::Domain)) and stages it into the outer program under a staging context. The `shard_map`
 // rule follows the same policy.
 //
 // When the split fires, the callee is split through the shared
@@ -1218,11 +1214,11 @@ where
 impl<V, C> PartiallyEvaluatableOperation<C> for JitCallOperation<ArrayIrType>
 where
     V: PartialEq
-        + Value<Type = ArrayIrType>
-        + ValueProjection<ArrayType, Projected: Value<Type = ArrayType>>
+        + CoreValue<Type = ArrayIrType>
+        + ValueProjection<ArrayType, Projected: CoreValue<Type = ArrayType>>
         + CaptureConstant
         + Concretizable<bool>,
-    C: Context<Type = ArrayIrType, Constant = V, Operation = XlaOperation<V>>,
+    C: Context<Type = ArrayIrType, Constant = V, Operation = Operation<V>>,
 {
     fn partially_evaluate<D: PartialEvaluationDriver<C>>(
         &self,
@@ -1242,7 +1238,7 @@ where
             });
         if (all_known && !inline_known) || inputs.iter().all(PartialEvaluationValue::is_unknown) {
             return context.fold_or_residualize(
-                XlaOperation::JitCall(self.clone()),
+                Operation::JitCall(self.clone()),
                 driver.regions().map(|region| region.to_program()).collect(),
                 inputs,
             );
@@ -1265,7 +1261,7 @@ where
                 .instructions_in_closure()
                 .any(|(_, instruction)| instruction.operation().effects().has_accesses());
         if accesses_references {
-            return context.fold_or_residualize(XlaOperation::JitCall(self.clone()), vec![callee.to_program()], inputs);
+            return context.fold_or_residualize(Operation::JitCall(self.clone()), vec![callee.to_program()], inputs);
         }
         // Partitioning does not remap the absolute indices of capture constants retained in attached regions, so a
         // split boundary would leave them naming a compacted or absent capture prefix — failing lowering at best and
@@ -1274,7 +1270,7 @@ where
         if callee.contains_atom_in_closure(|atom| {
             atom.as_constant().is_some_and(|constant| constant.capture_index().is_some())
         }) {
-            return context.fold_or_residualize(XlaOperation::JitCall(self.clone()), vec![callee.to_program()], inputs);
+            return context.fold_or_residualize(Operation::JitCall(self.clone()), vec![callee.to_program()], inputs);
         }
         if all_known {
             // Keep effectful work and nominally scoped types behind their validated call boundary. The pure,
@@ -1285,7 +1281,7 @@ where
                 || callee.contains_atom_type_in_closure(|r#type| r#type.identities().next().is_some())
             {
                 return context.fold_or_residualize(
-                    XlaOperation::JitCall(self.clone()),
+                    Operation::JitCall(self.clone()),
                     vec![callee.to_program()],
                     inputs,
                 );
@@ -1298,7 +1294,7 @@ where
         // can only forward known inputs as residual edges), so keep the original boundary and let the default
         // materialize those knowns directly as residual feeders.
         if partition.known_program().instructions().is_empty() {
-            return context.fold_or_residualize(XlaOperation::JitCall(self.clone()), vec![callee.to_program()], inputs);
+            return context.fold_or_residualize(Operation::JitCall(self.clone()), vec![callee.to_program()], inputs);
         }
         // Feed the residual call directly from the known call inputs and known call outputs that residual edges would
         // merely repeat (JAX's `in_fwd` and `out_fwd`), so that the known-side call returns each value once.
@@ -1322,8 +1318,8 @@ where
             partition,
             Some(callee),
             inputs,
-            |known_program| (XlaOperation::JitCall(known_call), vec![known_program]),
-            |residual_program| (XlaOperation::JitCall(residual_call), vec![residual_program]),
+            |known_program| (Operation::JitCall(known_call), vec![known_program]),
+            |residual_program| (Operation::JitCall(residual_call), vec![residual_program]),
         )
     }
 }
@@ -1331,7 +1327,7 @@ where
 // Batching rule for [`JitCallOperation`]: the callee region is rebatched over the mapped input axes (via
 // [`BatchingDriver::batch_program`]) and the batched call is bound through `context.parent()` with the
 // batched callee re-attached. An eager
-// client-backed parent (e.g., [`XlaDomain`](crate::XlaDomain)) compiles and executes the batched call immediately, a
+// client-backed parent (e.g., [`Domain`](crate::Domain)) compiles and executes the batched call immediately, a
 // staging parent stages it into the enclosing trace, and a differentiation parent dispatches it through its own
 // `jit_call` JVP rule — which is what serves `vmap` nested inside `gradient`/`linearize` closures.
 impl<C> BatchableOperation<C, ArrayIrBatchingPolicy> for JitCallOperation<ArrayIrType>
@@ -1398,7 +1394,7 @@ where
         // batch extent, the axis name, and the surrounding nesting) whose complete key surface is not yet explicit,
         // so caching it against the callee region and its input axes alone would risk exactly the unsound key reuse
         // that cache is designed to avoid. The decided follow-up is to specify that key material when array IR
-        // batching lands behind the `CompiledXlaFunction::batch` stub, which has to define it anyway: batching then
+        // batching lands behind the `CompiledFunction::batch` stub, which has to define it anyway: batching then
         // joins the region transform cache behind a gate measurement, through a batching-policy hook returning
         // `Option<key>` where `None` keeps a policy uncached, so soundness stays opt-in per policy. See
         // `.tasks/plan_general_transform_caching_analysis.md`.
@@ -1438,7 +1434,7 @@ where
 
 // Capture-free forward-mode (JVP) rule for [`JitCallOperation`], binding a primal `jit_call` and a tangent
 // `jit_call` as ordinary XLA-enum operations through the active context: a staging context stages both calls over
-// its shared builder, while an eager context (e.g. a client-backed [`XlaDomain`](crate::XlaDomain)) compiles and
+// its shared builder, while an eager context (e.g. a client-backed [`Domain`](crate::Domain)) compiles and
 // executes them immediately, which is what powers top-level `jvp` over concrete arrays.
 //
 // This realizes the identity `jvp(jit(f)) = jit(jvp f)`: rather than capturing the primal inputs as residual factors
@@ -1468,7 +1464,7 @@ where
 //      without a live tangent, into a [`DifferentiationDual`].
 //
 // The callee program is materialized from the instruction's callee region in the context's constant universe `V`
-// (concretely [`XlaConstant`] for staged XLA programs), so the split halves ride the fresh primal and tangent calls
+// (concretely [`Constant`] for staged XLA programs), so the split halves ride the fresh primal and tangent calls
 // as shared callee regions. Preserving both `jit_call` boundaries keeps the callee body out of the caller's program,
 // so forward mode over a jitted call stays compiled rather than inlined.
 //
@@ -1479,10 +1475,10 @@ where
 //   - `inputs`: Primal and tangent values for the call operands.
 impl<C, V> DifferentiableOperation<C> for JitCallOperation<ArrayIrType>
 where
-    C: Context<Type = ArrayIrType, Constant = V, Operation = XlaOperation<V>> + Zero<C::Value>,
+    C: Context<Type = ArrayIrType, Constant = V, Operation = Operation<V>> + Zero<C::Value>,
     V: PartialEq
-        + Value<Type = ArrayIrType>
-        + ValueProjection<ArrayType, Projected: Value<Type = ArrayType>>
+        + CoreValue<Type = ArrayIrType>
+        + ValueProjection<ArrayType, Projected: CoreValue<Type = ArrayType>>
         + CaptureConstant
         + Concretizable<bool>,
 {
@@ -1559,7 +1555,7 @@ where
             let callee = Arc::new(callee.to_program());
             return context
                 .primal()
-                .bind(XlaOperation::JitCall(self.clone()), AttachedRegions::Callees(&[callee]), &primal_operands)?
+                .bind(Operation::JitCall(self.clone()), AttachedRegions::Callees(&[callee]), &primal_operands)?
                 .into_iter()
                 .map(DifferentiationDual::new_with_zero_tangent)
                 .collect();
@@ -1571,7 +1567,7 @@ where
         // repeated binds of one derived callee intern by `Arc` identity instead of copying it again.
         // The primal sub-program preserves the callee's inputs in order, so the original lifted-capture prefix
         // survives verbatim and its length carries over.
-        let primal_call = XlaOperation::JitCall(
+        let primal_call = Operation::JitCall(
             JitCallOperation::new(self.capture_count())
                 .with_callee_type_signature(&primal_program.input_types(), &primal_program.output_types())?,
         );
@@ -1606,7 +1602,7 @@ where
         // register captures (`ProgramError::DiscardedCaptures`), and a stale reference that slipped in anyway would
         // fail lowering loudly against the tangent callee's empty capture prefix instead of aliasing an unrelated
         // value.
-        let tangent_call = XlaOperation::JitCall(
+        let tangent_call = Operation::JitCall(
             JitCallOperation::new(0)
                 .with_callee_type_signature(&tangent_program.input_types(), &tangent_program.output_types())?,
         );
@@ -1661,16 +1657,16 @@ where
 ///     accumulates into it in place and returns it by identity, while a dead (`Ignore`-kind) reference operand has no
 ///     slot in the transposed callee at all.
 pub fn transpose_primal_jit_call<
-    V: Value<Type = ArrayIrType> + ValueProjection<ArrayType, Projected: Value<Type = ArrayType>>,
-    D: TranspositionDriver<V, XlaOperation<V>>,
+    V: CoreValue<Type = ArrayIrType> + ValueProjection<ArrayType, Projected: CoreValue<Type = ArrayType>>,
+    D: TranspositionDriver<V, Operation<V>>,
 >(
     _operation: &JitCallOperation<ArrayIrType>,
-    context: &mut TracingContext<V, XlaOperation<V>>,
+    context: &mut TracingContext<V, Operation<V>>,
     driver: &D,
-    inputs: &[PartialValue<Tracer<TracingContext<V, XlaOperation<V>>>>],
-    outputs: &[MaybeZero<Tracer<TracingContext<V, XlaOperation<V>>>>],
-    cotangents: &CotangentDestinations<Tracer<TracingContext<V, XlaOperation<V>>>>,
-) -> Result<Vec<MaybeZero<Tracer<TracingContext<V, XlaOperation<V>>>>>, ProgramError> {
+    inputs: &[PartialValue<CoreTracer<TracingContext<V, Operation<V>>>>],
+    outputs: &[MaybeZero<CoreTracer<TracingContext<V, Operation<V>>>>],
+    cotangents: &CotangentDestinations<CoreTracer<TracingContext<V, Operation<V>>>>,
+) -> Result<Vec<MaybeZero<CoreTracer<TracingContext<V, Operation<V>>>>>, ProgramError> {
     // A jitted call with no live output cotangents and no live reference operand is a zero linear map, so every
     // operand cotangent is zero. A live reference operand keeps the call live, because its accumulated state cotangent
     // flows through the transposed callee even when no ordinary output cotangent does. A callee with deferred work or
@@ -1736,7 +1732,7 @@ pub fn transpose_primal_jit_call<
     // The transposed callee's inputs are live output cotangents, cotangent references, and known input values — never
     // a lifted-capture prefix. Attached-region capture constants cannot appear in it because region bodies are traced
     // through fresh-root contexts.
-    let transposed_call = XlaOperation::JitCall(JitCallOperation::new(0).with_callee_type_signature(
+    let transposed_call = Operation::JitCall(JitCallOperation::new(0).with_callee_type_signature(
         &transposed_callee.program().input_types(),
         &transposed_callee.program().output_types(),
     )?);
@@ -1770,25 +1766,25 @@ pub fn transpose_primal_jit_call<
 
 // Transpose rule for a primal tangent [`JitCallOperation`], forwarding to [`transpose_primal_jit_call`] with the
 // cotangent references of its linear reference-typed operands resolved (and allocated on first use) through the
-// enclosing [`TranspositionContext`]. The callee transposition happens on the concretely [`XlaConstant`]-keyed
-// [`FlatXlaProgram`], so the recursion is resolved once at definition time and instantiating this implementation
-// introduces no recursive [`TransposableOperation`] obligation on [`XlaOperation`].
-impl<V> TransposableOperation<V, XlaOperation<V>> for JitCallOperation<ArrayIrType>
+// enclosing [`TranspositionContext`]. The callee transposition happens on the concretely [`Constant`]-keyed
+// [`FlatProgram`], so the recursion is resolved once at definition time and instantiating this implementation
+// introduces no recursive [`TransposableOperation`] obligation on [`Operation`].
+impl<V> TransposableOperation<V, Operation<V>> for JitCallOperation<ArrayIrType>
 where
-    V: Value<Type = ArrayIrType> + ValueProjection<ArrayType, Projected: Value<Type = ArrayType>>,
+    V: CoreValue<Type = ArrayIrType> + ValueProjection<ArrayType, Projected: CoreValue<Type = ArrayType>>,
 {
-    fn transpose<D: TranspositionDriver<V, XlaOperation<V>>>(
+    fn transpose<D: TranspositionDriver<V, Operation<V>>>(
         &self,
-        context: &mut TranspositionContext<V, XlaOperation<V>>,
+        context: &mut TranspositionContext<V, Operation<V>>,
         driver: &D,
-        inputs: &[PartialValue<Tracer<TracingContext<V, XlaOperation<V>>>>],
-        outputs: &[MaybeZero<Tracer<TracingContext<V, XlaOperation<V>>>>],
+        inputs: &[PartialValue<CoreTracer<TracingContext<V, Operation<V>>>>],
+        outputs: &[MaybeZero<CoreTracer<TracingContext<V, Operation<V>>>>],
         accumulators: &[ryft_core::CotangentAccumulator],
     ) -> Result<(), DifferentiationError> {
         check_count!("output", outputs, driver.region(0)?.output_types().len(), ProgramError);
         check_count!("accumulator", accumulators, inputs.len(), DifferentiationError);
         let contributions =
-            (|| -> Result<Vec<MaybeZero<Tracer<TracingContext<V, XlaOperation<V>>>>>, DifferentiationError> {
+            (|| -> Result<Vec<MaybeZero<CoreTracer<TracingContext<V, Operation<V>>>>>, DifferentiationError> {
                 let cotangents = context.cotangent_destinations(driver, inputs, accumulators)?;
                 transpose_primal_jit_call(self, context, driver, inputs, outputs, &cotangents)
                     .map_err(DifferentiationError::from)
@@ -1801,7 +1797,7 @@ where
     }
 }
 
-// Eager interpretation of a staged jitted call over concrete [`XlaArray`]s. Top-level flat programs containing
+// Eager interpretation of a staged jitted call over concrete [`Array`]s. Top-level flat programs containing
 // `jit_call` instructions (for example the pullbacks produced by eager `vjp`/`grad`) replay through
 // [`Program::interpret_in_context`](ryft_core::Program::interpret_in_context), whose bind channel hands the callee
 // region to [`Context::bind`] so the call is compiled whole through this domain's dispatch cache and executed on its
@@ -1809,13 +1805,13 @@ where
 // executable. This rule covers the remaining path — a `jit_call` nested inside another region being interpreted —
 // by re-entering the active interpreter on the callee region, which dispatches the callee's operations one by one
 // through this same domain.
-impl<'c> InterpretableOperation<XlaDomain<'c>> for JitCallOperation<ArrayIrType> {
-    fn interpret<D: InterpretationDriver<XlaDomain<'c>>>(
+impl<'c> InterpretableOperation<Domain<'c>> for JitCallOperation<ArrayIrType> {
+    fn interpret<D: InterpretationDriver<Domain<'c>>>(
         &self,
-        context: &XlaDomain<'c>,
+        context: &Domain<'c>,
         driver: &D,
-        inputs: &[XlaValue<'c>],
-    ) -> Result<Vec<XlaValue<'c>>, ProgramError> {
+        inputs: &[Value<'c>],
+    ) -> Result<Vec<Value<'c>>, ProgramError> {
         let callee = driver.region(0)?;
         let renaming = self.output_renaming(&callee.input_types(), &callee.output_types())?;
         driver
@@ -1829,7 +1825,7 @@ impl<'c> InterpretableOperation<XlaDomain<'c>> for JitCallOperation<ArrayIrType>
 impl LowerableOperation for JitCallOperation<ArrayIrType> {
     fn lower<'b, 'c: 'b, 't: 'c, O: LowerableOperationFamily>(
         &self,
-        lowerer: &mut XlaLowerer<'b, 'c, 't, O>,
+        lowerer: &mut Lowerer<'b, 'c, 't, O>,
         input_values: &[ValueRef<'b, 'c, 't>],
         _input_types: &[ArrayIrType],
         _output_types: &[ArrayIrType],
@@ -1857,64 +1853,66 @@ mod tests {
     use indoc::{formatdoc, indoc};
     use pretty_assertions::assert_eq;
     use ryft_core::{
-        AddOperation, Array, ArrayIrType, ArrayOperation, ArrayType, AssertOperation, AtomId, AxisIndexOperation,
-        BroadcastOperation, CaptureReference, CompareOperation, ComparisonDirection, CompositeTransposeOperation,
-        ConditionOperation, Context, CosOperation, CotangentDestinationKind, CotangentDestinations, DataType,
-        DifferentiableType, DifferentiationError, Dimension, DimensionBounds, DimensionFromScalarOperation,
-        DimensionType, DimensionValue, DimensionVariable, DotDimensionNumbers, DotOperation, DynamicBroadcastOperation,
-        EffectClasses, InputRegionProvenance, IotaOperation, LogicalMesh, MaybeZero, MeshAxis, MeshAxisType,
-        MulOperation, NoStorage, NothingSavable, Operation, OutputRegionProvenance, PartialValue, Placeholder,
-        PrintOperation, ProgramBuilder, ProgramError, RecursiveBatchingDriver, ReferenceAddUpdateOperation,
+        AddOperation, Array as CoreArray, ArrayIrType, ArrayOperation, ArrayType, AssertOperation, AtomId,
+        AxisIndexOperation, BroadcastOperation, CaptureReference, CompareOperation, ComparisonDirection,
+        CompositeTransposeOperation, ConditionOperation, Context, CosOperation, CotangentDestinationKind,
+        CotangentDestinations, DataType, DifferentiableType, DifferentiationError, Dimension as CoreDimension,
+        DimensionBounds, DimensionFromScalarOperation, DimensionType, DimensionValue, DimensionVariable,
+        DotDimensionNumbers, DotOperation, DynamicBroadcastOperation, EffectClasses, InputRegionProvenance,
+        IotaOperation, LogicalMesh, MaybeZero, MeshAxis, MeshAxisType, MulOperation, NoStorage, NothingSavable,
+        Operation as CoreOperation, OutputRegionProvenance, PartialValue, Placeholder, PrintOperation,
+        ProgramBuilder as CoreProgramBuilder, ProgramError, RecursiveBatchingDriver, ReferenceAddUpdateOperation,
         ReferenceFreezeOperation, ReferenceNewOperation, ReferenceReadOperation, ReferenceSource,
         ReferenceSwapOperation, ReferenceType, RegionDataFlow, RegionDriver, RegionInterface, RegionRef,
         RematerializeOperation, ResidualCandidate, ResidualDecision, ResidualPolicy, ResidualPolicyReference,
         ResidualRejection, ScanOperation, Shape, Sharding, ShardingDimension, SinOperation, StagingContext,
-        TagOperation, Tracer, TracingContext, TransposeOperation, TransposedProgram, TransposedProgramCotangent,
-        TranspositionDriver, TypeError, TypeIdentity, Typed, TypedProgram, Value, ZeroLikeOperation, ZeroOperation,
+        TagOperation, Tracer as CoreTracer, TracingContext, TransposeOperation, TransposedProgram,
+        TransposedProgramCotangent, TranspositionDriver, TypeError, TypeIdentity, Typed, TypedProgram,
+        Value as CoreValue, ZeroLikeOperation, ZeroOperation,
     };
     use ryft_macros::Operation;
 
     use crate::experimental::lowering::tests::{
-        MixedValue, XlaProgramBuilder, add_xla_jit_call, execute_mixed_program, lower_replicated_shard_map_body,
-        test_vector_type, unproject_plain_program, xla_identity_branch, xla_neg_branch,
+        MixedValue, ProgramBuilder, add_jit_call, execute_mixed_program, identity_branch,
+        lower_replicated_shard_map_body, neg_branch, test_vector_type, unproject_plain_program,
     };
     use crate::experimental::ops::tests::vector_type;
     use crate::experimental::ops::{
-        XlaArrayConstant, XlaConstant, XlaOperation, XlaProgram, XlaProgramBuilder as ArrayIrXlaProgramBuilder,
+        ArrayConstant, Constant, Operation, Program, ProgramBuilder as ArrayIrProgramBuilder,
     };
     use crate::operations::debugging::{ensure_print_handler_registered, with_captured_prints};
     use crate::tests::execution_client;
-    use crate::{XlaArray, to_mlir_module_for_program};
+    use crate::{Array, to_mlir_module_for_program};
 
     use super::*;
 
     /// Test-only driver that exposes one source callee and returns a predetermined transpose for it.
     struct TestTranspositionDriver {
         /// Source callee exposed to the JIT-call transpose rule.
-        source: XlaProgram<Vec<XlaConstant>, Vec<XlaConstant>>,
+        source: Program<Vec<Constant>, Vec<Constant>>,
 
         /// Predetermined transposed callee returned by the recursive request.
-        transposed: XlaProgram<Vec<XlaConstant>, Vec<XlaConstant>>,
+        transposed: Program<Vec<Constant>, Vec<Constant>>,
     }
 
-    impl RegionDriver<XlaConstant, XlaOperation> for TestTranspositionDriver {
-        fn regions<'r>(&'r self) -> impl Iterator<Item = RegionRef<'r, XlaConstant, XlaOperation>>
+    impl RegionDriver<Constant, Operation> for TestTranspositionDriver {
+        fn regions<'r>(&'r self) -> impl Iterator<Item = RegionRef<'r, Constant, Operation>>
         where
-            XlaConstant: 'r,
-            XlaOperation: 'r,
+            Constant: 'r,
+            Operation: 'r,
         {
             std::iter::once(self.source.entry_region_ref())
         }
     }
 
-    impl TranspositionDriver<XlaConstant, XlaOperation> for TestTranspositionDriver {
+    impl TranspositionDriver<Constant, Operation> for TestTranspositionDriver {
         fn transpose_program(
             &self,
-            region: RegionRef<'_, XlaConstant, XlaOperation>,
+            region: RegionRef<'_, Constant, Operation>,
             input_indices: &[usize],
             _materialize_zeros: &[bool],
             destination_kinds: &[CotangentDestinationKind],
-        ) -> Result<TransposedProgram<XlaConstant, XlaOperation>, DifferentiationError> {
+        ) -> Result<TransposedProgram<Constant, Operation>, DifferentiationError> {
             // The predetermined program must have the boundary of the requested region's transposition: one input per
             // non-reference output, per `Reference` destination, and per known input. The default zero-seed request
             // projects the region onto its unflagged outputs before calling this function, so this also pins the
@@ -1949,7 +1947,7 @@ mod tests {
     /// Compiles and executes an array-only `f32` fixture using its declared unsharded program signature.
     fn execute_f32_program(
         client: &ryft_pjrt::Client<'_>,
-        program: &XlaProgram<Vec<XlaConstant>, Vec<XlaConstant>>,
+        program: &Program<Vec<Constant>, Vec<Constant>>,
         values: Vec<Vec<f32>>,
     ) -> Vec<Vec<f32>> {
         use ryft_pjrt::protos::{CompilationOptions, ExecutableCompilationOptions};
@@ -2033,26 +2031,25 @@ mod tests {
         // and reject this program with a false missing-capture error; the operation payload is authoritative.
         let array_type = test_vector_type(4);
         let inner = {
-            let mut builder = ArrayIrXlaProgramBuilder::new();
+            let mut builder = ArrayIrProgramBuilder::new();
             let first_capture = builder.add_input(array_type.clone().into());
             let _second_capture = builder.add_input(array_type.clone().into());
-            let second =
-                builder.add_constant(XlaConstant::Captured(CaptureReference::new(1, array_type.clone().into())));
+            let second = builder.add_constant(Constant::Captured(CaptureReference::new(1, array_type.clone().into())));
             let output =
                 builder.add_instruction(AddOperation::new(), Vec::new(), vec![first_capture, second], None).unwrap()[0];
             Arc::new(
                 builder
-                    .build::<Vec<XlaConstant>, Vec<XlaConstant>>(vec![output], vec![Placeholder; 2], vec![Placeholder])
+                    .build::<Vec<Constant>, Vec<Constant>>(vec![output], vec![Placeholder; 2], vec![Placeholder])
                     .unwrap(),
             )
         };
         let outer = {
-            let mut builder = ArrayIrXlaProgramBuilder::new();
+            let mut builder = ArrayIrProgramBuilder::new();
             let input = builder.add_input(array_type.clone().into());
             let callee_region = builder.intern_callee(&inner, None).unwrap();
             let output = builder
                 .add_instruction(
-                    XlaOperation::JitCall(JitCallOperation::new(2)),
+                    Operation::JitCall(JitCallOperation::new(2)),
                     vec![callee_region],
                     vec![input, input],
                     None,
@@ -2060,18 +2057,18 @@ mod tests {
                 .unwrap()[0];
             Arc::new(
                 builder
-                    .build::<Vec<XlaConstant>, Vec<XlaConstant>>(vec![output], vec![Placeholder], vec![Placeholder])
+                    .build::<Vec<Constant>, Vec<Constant>>(vec![output], vec![Placeholder], vec![Placeholder])
                     .unwrap(),
             )
         };
-        let mut builder = ArrayIrXlaProgramBuilder::new();
+        let mut builder = ArrayIrProgramBuilder::new();
         let input = builder.add_input(array_type.clone().into());
         let callee_region = builder.intern_callee(&outer, None).unwrap();
         let output = builder
-            .add_instruction(XlaOperation::JitCall(JitCallOperation::new(0)), vec![callee_region], vec![input], None)
+            .add_instruction(Operation::JitCall(JitCallOperation::new(0)), vec![callee_region], vec![input], None)
             .unwrap()[0];
         let program = builder
-            .build::<Vec<XlaConstant>, Vec<XlaConstant>>(vec![output], vec![Placeholder], vec![Placeholder])
+            .build::<Vec<Constant>, Vec<Constant>>(vec![output], vec![Placeholder], vec![Placeholder])
             .unwrap();
         let input_types = vec![array_type.clone()];
         let output_types = vec![array_type];
@@ -2082,8 +2079,8 @@ mod tests {
 
     /// Builds the flat callee `f(x) = x + x` over a vector type, returned behind an [`Rc`] so callers control
     /// whether `jit_call` sites share one program (pointer identity) or use structurally-identical distinct programs.
-    fn xla_add_self_callee(input_type: ArrayType) -> Arc<FlatXlaProgram> {
-        let mut builder = ArrayIrXlaProgramBuilder::new();
+    fn add_self_callee(input_type: ArrayType) -> Arc<FlatProgram> {
+        let mut builder = ArrayIrProgramBuilder::new();
         let input = builder.add_input(input_type.into());
         let output = builder.add_instruction(AddOperation::new(), Vec::new(), vec![input, input], None).unwrap()[0];
         Arc::new(builder.build(vec![output], vec![Placeholder], vec![Placeholder]).unwrap())
@@ -2091,13 +2088,13 @@ mod tests {
 
     /// Lowers an outer program that calls `callees` (one `jit_call` each) and sums the results, returning the
     /// module text. Each callee is `f(x) = x + x`; the outer function is `g(x) = sum_i callee_i(x)`.
-    fn lower_two_jit_call_module(callees: Vec<Arc<FlatXlaProgram>>) -> String {
+    fn lower_two_jit_call_module(callees: Vec<Arc<FlatProgram>>) -> String {
         let array_type = test_vector_type(4);
-        let mut builder = ArrayIrXlaProgramBuilder::new();
+        let mut builder = ArrayIrProgramBuilder::new();
         let input = builder.add_input(array_type.clone().into());
         let mut accumulator: Option<AtomId> = None;
         for callee in callees {
-            let call_output = add_xla_jit_call(&mut builder, &callee, vec![input]);
+            let call_output = add_jit_call(&mut builder, &callee, vec![input]);
             accumulator = Some(match accumulator {
                 None => call_output,
                 Some(previous) => builder
@@ -2106,7 +2103,7 @@ mod tests {
             });
         }
         let program = builder
-            .build::<Vec<XlaConstant>, Vec<XlaConstant>>(
+            .build::<Vec<Constant>, Vec<Constant>>(
                 vec![accumulator.expect("at least one callee")],
                 vec![Placeholder],
                 vec![Placeholder],
@@ -2119,7 +2116,7 @@ mod tests {
 
     #[test]
     fn test_repeated_jit_call_sharing_one_program_emits_one_shared_function() {
-        let callee = xla_add_self_callee(test_vector_type(4));
+        let callee = add_self_callee(test_vector_type(4));
         let module = lower_two_jit_call_module(vec![callee.clone(), callee]);
 
         // Both calls of the one shared program collapse to a single private `func.func` plus two `func.call`s.
@@ -2147,10 +2144,8 @@ mod tests {
         // Two distinct programs (separate `Rc`s) with identical structure — the shape produced when a transform such
         // as `grad` linearizes each of several identical blocks into its own staged program — must still deduplicate
         // into the same single shared function as the pointer-identical case above.
-        let module = lower_two_jit_call_module(vec![
-            xla_add_self_callee(test_vector_type(4)),
-            xla_add_self_callee(test_vector_type(4)),
-        ]);
+        let module =
+            lower_two_jit_call_module(vec![add_self_callee(test_vector_type(4)), add_self_callee(test_vector_type(4))]);
 
         assert_eq!(
             module,
@@ -2175,7 +2170,7 @@ mod tests {
     fn test_single_jit_call_is_inlined() {
         // A single-occurrence callee stays below the dedup threshold and inlines, so no shared function is emitted
         // and the callee body appears directly in `@main`.
-        let module = lower_two_jit_call_module(vec![xla_add_self_callee(test_vector_type(4))]);
+        let module = lower_two_jit_call_module(vec![add_self_callee(test_vector_type(4))]);
 
         assert_eq!(
             module,
@@ -2196,16 +2191,16 @@ mod tests {
         // shard-map bodies, so a callee that occurs twice inside a `shard_map` body never gets a shared
         // `func.func private @jit_call_*` and both occurrences inline into the `sdy.manual_computation` region.
         let vector_type = test_vector_type(4);
-        let callee = xla_add_self_callee(vector_type.clone());
+        let callee = add_self_callee(vector_type.clone());
         let body_program = {
-            let mut builder = ArrayIrXlaProgramBuilder::new();
+            let mut builder = ArrayIrProgramBuilder::new();
             let input = builder.add_input(vector_type.clone().into());
-            let first = add_xla_jit_call(&mut builder, &callee, vec![input]);
-            let second = add_xla_jit_call(&mut builder, &callee, vec![input]);
+            let first = add_jit_call(&mut builder, &callee, vec![input]);
+            let second = add_jit_call(&mut builder, &callee, vec![input]);
             let output =
                 builder.add_instruction(AddOperation::new(), Vec::new(), vec![first, second], None).unwrap()[0];
             builder
-                .build::<Vec<XlaConstant>, Vec<XlaConstant>>(vec![output], vec![Placeholder], vec![Placeholder])
+                .build::<Vec<Constant>, Vec<Constant>>(vec![output], vec![Placeholder], vec![Placeholder])
                 .unwrap()
         };
         let module = lower_replicated_shard_map_body(body_program, 1).unwrap();
@@ -2232,16 +2227,16 @@ mod tests {
     /// Builds a flat callee whose body contains a `condition` instruction (`f(p, x) = if p { -x } else { x }`),
     /// making it ineligible for structural `jit_call` deduplication because its nested branch bodies do not render
     /// into the callee's canonical program text.
-    fn xla_condition_callee() -> Arc<FlatXlaProgram> {
+    fn condition_callee() -> Arc<FlatProgram> {
         let vector_type = test_vector_type(4);
-        let mut builder = ArrayIrXlaProgramBuilder::new();
-        let true_region = builder.import_program(unproject_plain_program(xla_neg_branch(vector_type.clone())));
-        let false_region = builder.import_program(unproject_plain_program(xla_identity_branch(vector_type.clone())));
+        let mut builder = ArrayIrProgramBuilder::new();
+        let true_region = builder.import_program(unproject_plain_program(neg_branch(vector_type.clone())));
+        let false_region = builder.import_program(unproject_plain_program(identity_branch(vector_type.clone())));
         let predicate = builder.add_input(ArrayType::scalar(DataType::Boolean).into());
         let input = builder.add_input(vector_type.into());
         let output = builder
             .add_instruction(
-                XlaOperation::Condition(ConditionOperation::new()),
+                Operation::Condition(ConditionOperation::new()),
                 vec![true_region, false_region],
                 vec![predicate, input],
                 None,
@@ -2257,15 +2252,15 @@ mod tests {
         // identity and merge into a single emitted function — exactly like the body-free callees of
         // `test_structurally_identical_jit_calls_share_one_function`. (Before first-class regions, nested bodies were
         // payloads hidden from rendering and such callees deduplicated only by pointer identity.)
-        let first = xla_condition_callee();
-        let second = xla_condition_callee();
+        let first = condition_callee();
+        let second = condition_callee();
         let vector_type = test_vector_type(4);
-        let mut builder = ArrayIrXlaProgramBuilder::new();
+        let mut builder = ArrayIrProgramBuilder::new();
         let predicate = builder.add_input(ArrayType::scalar(DataType::Boolean).into());
         let input = builder.add_input(vector_type.clone().into());
         let mut accumulator: Option<AtomId> = None;
         for callee in [first.clone(), first, second.clone(), second] {
-            let call_output = add_xla_jit_call(&mut builder, &callee, vec![predicate, input]);
+            let call_output = add_jit_call(&mut builder, &callee, vec![predicate, input]);
             accumulator = Some(match accumulator {
                 None => call_output,
                 Some(previous) => builder
@@ -2274,7 +2269,7 @@ mod tests {
             });
         }
         let program = builder
-            .build::<Vec<XlaConstant>, Vec<XlaConstant>>(
+            .build::<Vec<Constant>, Vec<Constant>>(
                 vec![accumulator.unwrap()],
                 vec![Placeholder, Placeholder],
                 vec![Placeholder],
@@ -2319,7 +2314,7 @@ mod tests {
         // call site, so both inlined prints chain onto the caller's ordered-I/O token in program order (a shared
         // token-free `func.func` could not preserve that ordering).
         let array_type = test_vector_type(4);
-        let mut callee_builder = XlaProgramBuilder::new();
+        let mut callee_builder = ProgramBuilder::new();
         let callee_input = callee_builder.add_input(array_type.clone());
         let printed = callee_builder
             .add_instruction(PrintOperation::<ArrayType>::new("callee"), Vec::new(), vec![callee_input], None)
@@ -2360,16 +2355,16 @@ mod tests {
         let m = DimensionType::new("m", DimensionBounds::positive(Some(8)).unwrap());
         let array_type = ArrayType::new_static(DataType::F64, [2]);
         let branch = || {
-            let mut builder = ArrayIrXlaProgramBuilder::new();
+            let mut builder = ArrayIrProgramBuilder::new();
             builder.add_input(n.clone().into());
             let array =
                 builder.add_input(ArrayType::new(DataType::F64, Shape::new(vec![n.simplified_dimension()])).into());
             builder
-                .build::<Vec<XlaConstant>, Vec<XlaConstant>>(vec![array], vec![Placeholder; 2], vec![Placeholder])
+                .build::<Vec<Constant>, Vec<Constant>>(vec![array], vec![Placeholder; 2], vec![Placeholder])
                 .unwrap()
         };
         let callee = {
-            let mut builder = ArrayIrXlaProgramBuilder::new();
+            let mut builder = ArrayIrProgramBuilder::new();
             let true_region = builder.import_region(branch().entry_region_ref());
             let false_region = builder.import_region(branch().entry_region_ref());
             let predicate = builder.add_input(ArrayType::scalar(DataType::Boolean).into());
@@ -2377,7 +2372,7 @@ mod tests {
             let array = builder.add_input(array_type.clone().into());
             let selected = builder
                 .add_instruction(
-                    XlaOperation::Condition(ConditionOperation::new()),
+                    Operation::Condition(ConditionOperation::new()),
                     vec![true_region, false_region],
                     vec![predicate, dimension, array],
                     None,
@@ -2385,26 +2380,22 @@ mod tests {
                 .unwrap()[0];
             Arc::new(
                 builder
-                    .build::<Vec<XlaConstant>, Vec<XlaConstant>>(
-                        vec![selected],
-                        vec![Placeholder; 3],
-                        vec![Placeholder],
-                    )
+                    .build::<Vec<Constant>, Vec<Constant>>(vec![selected], vec![Placeholder; 3], vec![Placeholder])
                     .unwrap(),
             )
         };
         assert!(callee.effects().classes().is_empty());
-        let mut builder = ArrayIrXlaProgramBuilder::new();
+        let mut builder = ArrayIrProgramBuilder::new();
         let predicate = builder.add_input(ArrayType::scalar(DataType::Boolean).into());
         let dimension = builder.add_input(m.clone().into());
         let array = builder.add_input(array_type.clone().into());
-        add_xla_jit_call(&mut builder, &callee, vec![predicate, dimension, array]);
-        let selected = add_xla_jit_call(&mut builder, &callee, vec![predicate, dimension, array]);
+        add_jit_call(&mut builder, &callee, vec![predicate, dimension, array]);
+        let selected = add_jit_call(&mut builder, &callee, vec![predicate, dimension, array]);
         let printed = builder
             .add_instruction(PrintOperation::<ArrayType>::new("after"), Vec::new(), vec![selected], None)
             .unwrap()[0];
         let program = builder
-            .build::<Vec<XlaConstant>, Vec<XlaConstant>>(vec![printed], vec![Placeholder; 3], vec![Placeholder])
+            .build::<Vec<Constant>, Vec<Constant>>(vec![printed], vec![Placeholder; 3], vec![Placeholder])
             .unwrap();
         let module = to_mlir_module_for_program(
             &program,
@@ -2433,12 +2424,12 @@ mod tests {
         // at both call sites, and the explicit assertion after them continues their assertion chain.
         let n = DimensionType::new("n", DimensionBounds::positive(Some(8)).unwrap());
         let callee = {
-            let mut builder = ArrayIrXlaProgramBuilder::new();
+            let mut builder = ArrayIrProgramBuilder::new();
             let symbolic = builder.add_input(n.clone().into());
-            let exact = builder.add_input(DimensionType::from(Dimension::Static(2)).into());
+            let exact = builder.add_input(DimensionType::from(CoreDimension::Static(2)).into());
             let zero = builder
                 .add_instruction(
-                    XlaOperation::Zero(ZeroOperation::new(ArrayType::new(
+                    Operation::Zero(ZeroOperation::new(ArrayType::new(
                         DataType::F64,
                         Shape::new(vec![n.simplified_dimension(), n.simplified_dimension()]),
                     ))),
@@ -2449,22 +2440,22 @@ mod tests {
                 .unwrap()[0];
             Arc::new(
                 builder
-                    .build::<Vec<XlaConstant>, Vec<XlaConstant>>(vec![zero], vec![Placeholder; 2], vec![Placeholder])
+                    .build::<Vec<Constant>, Vec<Constant>>(vec![zero], vec![Placeholder; 2], vec![Placeholder])
                     .unwrap(),
             )
         };
         assert!(callee.effects().classes().is_empty());
-        let mut builder = ArrayIrXlaProgramBuilder::new();
+        let mut builder = ArrayIrProgramBuilder::new();
         let symbolic = builder.add_input(n.clone().into());
-        let exact = builder.add_input(DimensionType::from(Dimension::Static(2)).into());
+        let exact = builder.add_input(DimensionType::from(CoreDimension::Static(2)).into());
         let predicate = builder.add_input(ArrayType::scalar(DataType::Boolean).into());
-        add_xla_jit_call(&mut builder, &callee, vec![symbolic, exact]);
-        let zero = add_xla_jit_call(&mut builder, &callee, vec![symbolic, exact]);
+        add_jit_call(&mut builder, &callee, vec![symbolic, exact]);
+        let zero = add_jit_call(&mut builder, &callee, vec![symbolic, exact]);
         builder
             .add_instruction(AssertOperation::<ArrayType>::new("required predicate"), Vec::new(), vec![predicate], None)
             .unwrap();
         let program = builder
-            .build::<Vec<XlaConstant>, Vec<XlaConstant>>(vec![zero], vec![Placeholder; 3], vec![Placeholder])
+            .build::<Vec<Constant>, Vec<Constant>>(vec![zero], vec![Placeholder; 3], vec![Placeholder])
             .unwrap();
         let output_type = ArrayType::new_static(DataType::F64, [2, 2]);
         let module = to_mlir_module_for_program(
@@ -2517,7 +2508,7 @@ mod tests {
     fn test_jit_call_region_data_flow() {
         let operation = JitCallOperation::<ArrayIrType>::new(2);
         assert!(matches!(operation.region_data_flow(), RegionDataFlow::Provenance));
-        let dispatched = XlaOperation::<XlaConstant>::from(operation);
+        let dispatched = Operation::<Constant>::from(operation);
         assert!(matches!(dispatched.region_data_flow(), RegionDataFlow::Provenance));
     }
 
@@ -2528,29 +2519,29 @@ mod tests {
         // it.
         let r#type = ArrayIrType::Array(vector_type());
         let callee = {
-            let mut builder = ProgramBuilder::<XlaConstant, XlaOperation>::new();
+            let mut builder = CoreProgramBuilder::<Constant, Operation>::new();
             let captured = builder.add_input(r#type.clone());
             let x = builder.add_input(r#type.clone());
             let y = builder.add_input(r#type.clone());
             let cosine = builder.add_instruction(CosOperation::new(), Vec::new(), vec![x], None).unwrap()[0];
             let product = builder.add_instruction(MulOperation::new(), Vec::new(), vec![captured, y], None).unwrap()[0];
             builder
-                .build::<Vec<XlaConstant>, Vec<XlaConstant>>(
+                .build::<Vec<Constant>, Vec<Constant>>(
                     vec![cosine, product],
                     vec![Placeholder; 3],
                     vec![Placeholder; 2],
                 )
                 .unwrap()
         };
-        let mut builder = ProgramBuilder::<XlaConstant, XlaOperation>::new();
+        let mut builder = CoreProgramBuilder::<Constant, Operation>::new();
         let callee = builder.import_region(callee.entry_region_ref());
         let inputs = (0..3).map(|_| builder.add_input(r#type.clone())).collect::<Vec<_>>();
         let outputs = builder
-            .add_instruction(XlaOperation::JitCall(JitCallOperation::new(1)), vec![callee], inputs, None)
+            .add_instruction(Operation::JitCall(JitCallOperation::new(1)), vec![callee], inputs, None)
             .unwrap()
             .to_vec();
         let program = builder
-            .build::<Vec<XlaConstant>, Vec<XlaConstant>>(vec![outputs[0]], vec![Placeholder; 3], vec![Placeholder])
+            .build::<Vec<Constant>, Vec<Constant>>(vec![outputs[0]], vec![Placeholder; 3], vec![Placeholder])
             .unwrap();
         assert_eq!(
             program.into_pruned().unwrap().to_string(),
@@ -2579,24 +2570,24 @@ mod tests {
         // input `y` outside of it, so the residual program needs the result of the call.
         let scalar_type = ArrayIrType::from(ArrayType::scalar(DataType::F64));
         let callee = {
-            let mut builder = ArrayIrXlaProgramBuilder::new();
+            let mut builder = ArrayIrProgramBuilder::new();
             let input = builder.add_input(scalar_type.clone());
             let squared =
                 builder.add_instruction(MulOperation::new(), Vec::new(), vec![input, input], None).unwrap()[0];
             builder
-                .build::<Vec<XlaConstant>, Vec<XlaConstant>>(vec![squared], vec![Placeholder], vec![Placeholder])
+                .build::<Vec<Constant>, Vec<Constant>>(vec![squared], vec![Placeholder], vec![Placeholder])
                 .unwrap()
         };
-        let mut builder = ArrayIrXlaProgramBuilder::new();
+        let mut builder = ArrayIrProgramBuilder::new();
         let callee = builder.import_program(callee);
         let x = builder.add_input(scalar_type.clone());
         let y = builder.add_input(scalar_type);
         let called = builder
-            .add_instruction(XlaOperation::JitCall(JitCallOperation::new(0)), vec![callee], vec![x], None)
+            .add_instruction(Operation::JitCall(JitCallOperation::new(0)), vec![callee], vec![x], None)
             .unwrap()[0];
         let output = builder.add_instruction(MulOperation::new(), Vec::new(), vec![called, y], None).unwrap()[0];
         let program = builder
-            .build::<Vec<XlaConstant>, Vec<XlaConstant>>(vec![output], vec![Placeholder; 2], vec![Placeholder])
+            .build::<Vec<Constant>, Vec<Constant>>(vec![output], vec![Placeholder; 2], vec![Placeholder])
             .unwrap();
         let names = Arc::new(Mutex::new(Vec::new()));
         let recorded = names.clone();
@@ -2642,7 +2633,7 @@ mod tests {
     fn test_jit_call_operation_batch_homogeneous_named_axis() {
         /// Array-only family for exercising the homogeneous JIT batching rule without array IR carriers.
         #[derive(Clone, Debug, Operation)]
-        #[ryft(crate = "ryft_core", type(ArrayType), constant(Array), dispatch(batching))]
+        #[ryft(crate = "ryft_core", type(ArrayType), constant(CoreArray), dispatch(batching))]
         enum NamedAxisCallOperation {
             AxisIndex(AxisIndexOperation),
             Iota(IotaOperation<ArrayType>),
@@ -2653,13 +2644,13 @@ mod tests {
         }
 
         for replicated in [false, true] {
-            let mut builder = ProgramBuilder::<Array, NamedAxisCallOperation>::new();
+            let mut builder = CoreProgramBuilder::<CoreArray, NamedAxisCallOperation>::new();
             let input = replicated.then(|| builder.add_input(ArrayType::scalar(DataType::F32)));
             let index =
                 builder.add_instruction(AxisIndexOperation::new("items".to_owned()), vec![], vec![], None).unwrap()[0];
             let outputs = std::iter::once(index).chain(input).collect::<Vec<_>>();
             let callee = builder
-                .build::<Vec<Array>, Vec<Array>>(
+                .build::<Vec<CoreArray>, Vec<CoreArray>>(
                     outputs,
                     vec![Placeholder; usize::from(replicated)],
                     vec![Placeholder; 1 + usize::from(replicated)],
@@ -2668,8 +2659,8 @@ mod tests {
             let callees = [Arc::new(callee)];
             let regions = AttachedRegions::Callees(&callees);
             let driver = RecursiveBatchingDriver::new(&regions);
-            let (_, program) = TracingContext::<Array, NamedAxisCallOperation>::trace_with_context_and_named_axes(
-                |parent, inputs: Vec<Tracer<TracingContext<Array, NamedAxisCallOperation>>>| {
+            let (_, program) = TracingContext::<CoreArray, NamedAxisCallOperation>::trace_with_context_and_named_axes(
+                |parent, inputs: Vec<CoreTracer<TracingContext<CoreArray, NamedAxisCallOperation>>>| {
                     let context = BatchingContext::<_, ArrayBatchingPolicy>::new(parent.clone(), 3)
                         .with_axis_name("items".to_owned());
                     let inputs = inputs.into_iter().map(ArrayBatch::replicated).collect::<Vec<_>>();
@@ -2719,19 +2710,19 @@ mod tests {
             RecursiveBatchingDriver,
         };
 
-        let mut builder = ArrayIrXlaProgramBuilder::new();
+        let mut builder = ArrayIrProgramBuilder::new();
         let input = builder.add_input(ArrayType::scalar(DataType::F32).into());
         let callee = builder
-            .build::<Vec<XlaConstant>, Vec<XlaConstant>>(vec![input], vec![Placeholder], vec![Placeholder])
+            .build::<Vec<Constant>, Vec<Constant>>(vec![input], vec![Placeholder], vec![Placeholder])
             .unwrap();
         let callees = [Arc::new(callee)];
         let regions = AttachedRegions::Callees(&callees);
         let driver = RecursiveBatchingDriver::new(&regions);
         let vector = ArrayIrType::Array(ArrayType::new_static(DataType::F32, [3]));
-        let (_, program) = TracingContext::<XlaConstant, XlaOperation>::trace(
-            |inputs: Vec<Tracer<TracingContext<XlaConstant, XlaOperation>>>| {
+        let (_, program) = TracingContext::<Constant, Operation>::trace(
+            |inputs: Vec<CoreTracer<TracingContext<Constant, Operation>>>| {
                 let parent = inputs[0].context();
-                let extent = parent.constant(XlaConstant::Dimension(DimensionValue::constant(3).unwrap()));
+                let extent = parent.constant(Constant::Dimension(DimensionValue::constant(3).unwrap()));
                 let context = BatchingContext::<_, ArrayIrBatchingPolicy>::new(parent.clone(), extent);
                 let outputs = JitCallOperation::<ArrayIrType>::new(0).batch(
                     &context,
@@ -2745,7 +2736,7 @@ mod tests {
         .unwrap();
         assert_eq!(program.input_types(), vec![vector.clone()]);
         assert_eq!(program.output_types(), vec![vector]);
-        let XlaOperation::JitCall(call) = program.instructions()[0].operation() else {
+        let Operation::JitCall(call) = program.instructions()[0].operation() else {
             panic!("expected jit_call");
         };
         assert_eq!(call.capture_count(), 1);
@@ -2760,32 +2751,23 @@ mod tests {
             ArrayIrType::Dimension(DimensionType::new("size", DimensionBounds::positive(Some(9)).unwrap()));
         let array_type = ArrayIrType::Array(ArrayType::scalar(DataType::F64));
 
-        let mut callee_builder = ArrayIrXlaProgramBuilder::new();
+        let mut callee_builder = ArrayIrProgramBuilder::new();
         let dimension = callee_builder.add_input(dimension_type.clone());
         let array = callee_builder.add_input(array_type.clone());
         let callee = callee_builder
-            .build::<Vec<XlaConstant>, Vec<XlaConstant>>(
-                vec![dimension, array],
-                vec![Placeholder; 2],
-                vec![Placeholder; 2],
-            )
+            .build::<Vec<Constant>, Vec<Constant>>(vec![dimension, array], vec![Placeholder; 2], vec![Placeholder; 2])
             .unwrap();
 
-        let mut builder = ArrayIrXlaProgramBuilder::new();
+        let mut builder = ArrayIrProgramBuilder::new();
         let dimension = builder.add_input(dimension_type.clone());
         let array = builder.add_input(array_type.clone());
         let callee = builder.import_region(callee.entry_region_ref());
         let outputs = builder
-            .add_instruction(
-                XlaOperation::JitCall(JitCallOperation::new(0)),
-                vec![callee],
-                vec![dimension, array],
-                None,
-            )
+            .add_instruction(Operation::JitCall(JitCallOperation::new(0)), vec![callee], vec![dimension, array], None)
             .unwrap()
             .to_vec();
         let program = builder
-            .build::<Vec<XlaConstant>, Vec<XlaConstant>>(outputs, vec![Placeholder; 2], vec![Placeholder; 2])
+            .build::<Vec<Constant>, Vec<Constant>>(outputs, vec![Placeholder; 2], vec![Placeholder; 2])
             .unwrap();
 
         let jvp = program.jvp().unwrap();
@@ -2800,40 +2782,40 @@ mod tests {
         // tangent followed by the residuals, and the primal callee keeps the capture prefix verbatim.
         let r#type = ArrayIrType::Array(vector_type());
         let callee = {
-            let mut builder = ProgramBuilder::<XlaConstant, XlaOperation>::new();
+            let mut builder = CoreProgramBuilder::<Constant, Operation>::new();
             let captured = builder.add_input(r#type.clone());
             let input = builder.add_input(r#type.clone());
             let product =
                 builder.add_instruction(MulOperation::new(), Vec::new(), vec![captured, input], None).unwrap()[0];
             builder
-                .build::<Vec<XlaConstant>, Vec<XlaConstant>>(vec![product], vec![Placeholder; 2], vec![Placeholder])
+                .build::<Vec<Constant>, Vec<Constant>>(vec![product], vec![Placeholder; 2], vec![Placeholder])
                 .unwrap()
         };
-        let mut builder = ProgramBuilder::<XlaConstant, XlaOperation>::new();
+        let mut builder = CoreProgramBuilder::<Constant, Operation>::new();
         let callee = builder.import_region(callee.entry_region_ref());
         let captured = builder.add_input(r#type.clone());
         let input = builder.add_input(r#type);
         let output = builder
-            .add_instruction(XlaOperation::JitCall(JitCallOperation::new(1)), vec![callee], vec![captured, input], None)
+            .add_instruction(Operation::JitCall(JitCallOperation::new(1)), vec![callee], vec![captured, input], None)
             .unwrap()[0];
         let program = builder
-            .build::<Vec<XlaConstant>, Vec<XlaConstant>>(vec![output], vec![Placeholder; 2], vec![Placeholder])
+            .build::<Vec<Constant>, Vec<Constant>>(vec![output], vec![Placeholder; 2], vec![Placeholder])
             .unwrap();
 
         let jvp = program.jvp().unwrap();
         let calls = jvp
             .instructions()
             .iter()
-            .filter(|instruction| matches!(instruction.operation(), XlaOperation::JitCall(_)))
+            .filter(|instruction| matches!(instruction.operation(), Operation::JitCall(_)))
             .collect::<Vec<_>>();
         assert_eq!(calls.len(), 2);
         let primal_callee = jvp.region_ref(calls[0].regions()[0]).unwrap();
-        assert!(matches!(calls[0].operation(), XlaOperation::JitCall(operation) if operation.capture_count() == 1));
+        assert!(matches!(calls[0].operation(), Operation::JitCall(operation) if operation.capture_count() == 1));
         assert_eq!(primal_callee.input_types().len(), 2);
         let residual_count = primal_callee.output_types().len() - 1;
         assert!(residual_count >= 1);
         let tangent_callee = jvp.region_ref(calls[1].regions()[0]).unwrap();
-        assert!(matches!(calls[1].operation(), XlaOperation::JitCall(operation) if operation.capture_count() == 0));
+        assert!(matches!(calls[1].operation(), Operation::JitCall(operation) if operation.capture_count() == 0));
         assert_eq!(tangent_callee.input_types().len(), 1 + residual_count);
         assert_eq!(calls[1].inputs().len(), 1 + residual_count);
     }
@@ -2845,13 +2827,13 @@ mod tests {
         let scalar_type = ArrayIrType::Array(ArrayType::scalar(DataType::F32));
         let reference_type = ArrayIrType::Reference(ReferenceType::new(ArrayType::scalar(DataType::F32)));
         let callee = {
-            let mut builder = ArrayIrXlaProgramBuilder::new();
+            let mut builder = ArrayIrProgramBuilder::new();
             let captured = builder.add_input(reference_type.clone());
             let reference = builder.add_input(reference_type.clone());
             let update = builder.add_input(scalar_type.clone());
             builder
                 .add_instruction(
-                    XlaOperation::ReferenceAddUpdate(ReferenceAddUpdateOperation::new()),
+                    Operation::ReferenceAddUpdate(ReferenceAddUpdateOperation::new()),
                     Vec::new(),
                     vec![reference, update],
                     None,
@@ -2859,7 +2841,7 @@ mod tests {
                 .unwrap();
             let state = builder
                 .add_instruction(
-                    XlaOperation::ReferenceRead(ReferenceReadOperation::new()),
+                    Operation::ReferenceRead(ReferenceReadOperation::new()),
                     Vec::new(),
                     vec![reference],
                     None,
@@ -2867,7 +2849,7 @@ mod tests {
                 .unwrap()[0];
             let scale = builder
                 .add_instruction(
-                    XlaOperation::ReferenceRead(ReferenceReadOperation::new()),
+                    Operation::ReferenceRead(ReferenceReadOperation::new()),
                     Vec::new(),
                     vec![captured],
                     None,
@@ -2875,24 +2857,24 @@ mod tests {
                 .unwrap()[0];
             let output = builder.add_instruction(MulOperation::new(), Vec::new(), vec![state, scale], None).unwrap()[0];
             builder
-                .build::<Vec<XlaConstant>, Vec<XlaConstant>>(vec![output], vec![Placeholder; 3], vec![Placeholder])
+                .build::<Vec<Constant>, Vec<Constant>>(vec![output], vec![Placeholder; 3], vec![Placeholder])
                 .unwrap()
         };
-        let mut builder = ArrayIrXlaProgramBuilder::new();
+        let mut builder = ArrayIrProgramBuilder::new();
         let callee = builder.import_region(callee.entry_region_ref());
         let captured = builder.add_input(reference_type.clone());
         let reference = builder.add_input(reference_type.clone());
         let update = builder.add_input(scalar_type.clone());
         let output = builder
             .add_instruction(
-                XlaOperation::JitCall(JitCallOperation::new(1)),
+                Operation::JitCall(JitCallOperation::new(1)),
                 vec![callee],
                 vec![captured, reference, update],
                 None,
             )
             .unwrap()[0];
         let program = builder
-            .build::<Vec<XlaConstant>, Vec<XlaConstant>>(vec![output], vec![Placeholder; 3], vec![Placeholder])
+            .build::<Vec<Constant>, Vec<Constant>>(vec![output], vec![Placeholder; 3], vec![Placeholder])
             .unwrap();
 
         // The plumbing capture is inactive and the active reference receives a tangent reference input, so the fused
@@ -2913,10 +2895,10 @@ mod tests {
         let calls = jvp
             .instructions()
             .iter()
-            .filter(|instruction| matches!(instruction.operation(), XlaOperation::JitCall(_)))
+            .filter(|instruction| matches!(instruction.operation(), Operation::JitCall(_)))
             .collect::<Vec<_>>();
         assert_eq!(calls.len(), 2);
-        assert!(matches!(calls[0].operation(), XlaOperation::JitCall(operation) if operation.capture_count() == 1));
+        assert!(matches!(calls[0].operation(), Operation::JitCall(operation) if operation.capture_count() == 1));
         assert_eq!(&calls[0].inputs()[..3], &jvp.input_ids()[..3]);
         let primal_callee = jvp.region_ref(calls[0].regions()[0]).unwrap();
         assert_eq!(
@@ -2924,7 +2906,7 @@ mod tests {
             vec![reference_type.clone(), reference_type.clone(), scalar_type.clone()]
         );
         let residual_count = primal_callee.output_types().len() - 1;
-        assert!(matches!(calls[1].operation(), XlaOperation::JitCall(operation) if operation.capture_count() == 0));
+        assert!(matches!(calls[1].operation(), Operation::JitCall(operation) if operation.capture_count() == 0));
         assert_eq!(&calls[1].inputs()[..2], &jvp.input_ids()[3..]);
         assert_eq!(calls[1].inputs().len(), 2 + residual_count);
         let tangent_callee = jvp.region_ref(calls[1].regions()[0]).unwrap();
@@ -2935,33 +2917,24 @@ mod tests {
     fn test_jit_call_jvp_omits_inactive_reference_output_tangents() {
         let reference_type = ArrayIrType::Reference(ReferenceType::new(ArrayType::scalar(DataType::F32)));
         let scalar_type = ArrayIrType::Array(ArrayType::scalar(DataType::F32));
-        let mut callee_builder = ArrayIrXlaProgramBuilder::new();
+        let mut callee_builder = ArrayIrProgramBuilder::new();
         let reference = callee_builder.add_input(reference_type.clone());
         let value = callee_builder.add_input(scalar_type.clone());
         let doubled =
             callee_builder.add_instruction(AddOperation::new(), Vec::new(), vec![value, value], None).unwrap()[0];
         let callee = callee_builder
-            .build::<Vec<XlaConstant>, Vec<XlaConstant>>(
-                vec![reference, doubled],
-                vec![Placeholder; 2],
-                vec![Placeholder; 2],
-            )
+            .build::<Vec<Constant>, Vec<Constant>>(vec![reference, doubled], vec![Placeholder; 2], vec![Placeholder; 2])
             .unwrap();
-        let mut builder = ArrayIrXlaProgramBuilder::new();
+        let mut builder = ArrayIrProgramBuilder::new();
         let reference = builder.add_input(reference_type.clone());
         let value = builder.add_input(scalar_type.clone());
         let callee = builder.import_region(callee.entry_region_ref());
         let outputs = builder
-            .add_instruction(
-                XlaOperation::JitCall(JitCallOperation::new(1)),
-                vec![callee],
-                vec![reference, value],
-                None,
-            )
+            .add_instruction(Operation::JitCall(JitCallOperation::new(1)), vec![callee], vec![reference, value], None)
             .unwrap()
             .to_vec();
         let program = builder
-            .build::<Vec<XlaConstant>, Vec<XlaConstant>>(outputs, vec![Placeholder; 2], vec![Placeholder; 2])
+            .build::<Vec<Constant>, Vec<Constant>>(outputs, vec![Placeholder; 2], vec![Placeholder; 2])
             .unwrap();
         let jvp = program.entry_region_ref().jvp(&[1]).unwrap();
         assert_eq!(jvp.input_types(), vec![reference_type.clone(), scalar_type.clone(), scalar_type.clone()]);
@@ -2969,7 +2942,7 @@ mod tests {
         let calls = jvp
             .instructions()
             .iter()
-            .filter(|instruction| matches!(instruction.operation(), XlaOperation::JitCall(_)))
+            .filter(|instruction| matches!(instruction.operation(), Operation::JitCall(_)))
             .collect::<Vec<_>>();
         assert_eq!(calls.len(), 2);
         assert_eq!(jvp.region_ref(calls[1].regions()[0]).unwrap().output_types().len(), 1);
@@ -2982,28 +2955,24 @@ mod tests {
         // structural zero that the tangent call does not return.
         let r#type = ArrayIrType::Array(vector_type());
         let callee = {
-            let mut builder = ArrayIrXlaProgramBuilder::new();
+            let mut builder = ArrayIrProgramBuilder::new();
             let x = builder.add_input(r#type.clone());
             let y = builder.add_input(r#type.clone());
             let sine = builder.add_instruction(SinOperation::new(), Vec::new(), vec![x], None).unwrap()[0];
             let cosine = builder.add_instruction(CosOperation::new(), Vec::new(), vec![y], None).unwrap()[0];
             builder
-                .build::<Vec<XlaConstant>, Vec<XlaConstant>>(
-                    vec![sine, cosine],
-                    vec![Placeholder; 2],
-                    vec![Placeholder; 2],
-                )
+                .build::<Vec<Constant>, Vec<Constant>>(vec![sine, cosine], vec![Placeholder; 2], vec![Placeholder; 2])
                 .unwrap()
         };
-        let mut builder = ArrayIrXlaProgramBuilder::new();
+        let mut builder = ArrayIrProgramBuilder::new();
         let callee = builder.import_region(callee.entry_region_ref());
         let inputs = (0..2).map(|_| builder.add_input(r#type.clone())).collect::<Vec<_>>();
         let outputs = builder
-            .add_instruction(XlaOperation::JitCall(JitCallOperation::new(0)), vec![callee], inputs, None)
+            .add_instruction(Operation::JitCall(JitCallOperation::new(0)), vec![callee], inputs, None)
             .unwrap()
             .to_vec();
         let program = builder
-            .build::<Vec<XlaConstant>, Vec<XlaConstant>>(outputs, vec![Placeholder; 2], vec![Placeholder; 2])
+            .build::<Vec<Constant>, Vec<Constant>>(outputs, vec![Placeholder; 2], vec![Placeholder; 2])
             .unwrap();
         assert_eq!(
             program.entry_region_ref().jvp(&[0]).unwrap().to_string(),
@@ -3036,24 +3005,24 @@ mod tests {
         // zero that the tangent call does not return.
         let r#type = ArrayIrType::Array(vector_type());
         let callee = {
-            let mut builder = ArrayIrXlaProgramBuilder::new();
+            let mut builder = ArrayIrProgramBuilder::new();
             let x = builder.add_input(r#type.clone());
             let sine = builder.add_instruction(SinOperation::new(), Vec::new(), vec![x], None).unwrap()[0];
             let zero =
                 builder.add_instruction(ZeroOperation::new(vector_type()), Vec::new(), Vec::new(), None).unwrap()[0];
             builder
-                .build::<Vec<XlaConstant>, Vec<XlaConstant>>(vec![sine, zero], vec![Placeholder], vec![Placeholder; 2])
+                .build::<Vec<Constant>, Vec<Constant>>(vec![sine, zero], vec![Placeholder], vec![Placeholder; 2])
                 .unwrap()
         };
-        let mut builder = ArrayIrXlaProgramBuilder::new();
+        let mut builder = ArrayIrProgramBuilder::new();
         let callee = builder.import_region(callee.entry_region_ref());
         let input = builder.add_input(r#type);
         let outputs = builder
-            .add_instruction(XlaOperation::JitCall(JitCallOperation::new(0)), vec![callee], vec![input], None)
+            .add_instruction(Operation::JitCall(JitCallOperation::new(0)), vec![callee], vec![input], None)
             .unwrap()
             .to_vec();
         let program = builder
-            .build::<Vec<XlaConstant>, Vec<XlaConstant>>(outputs, vec![Placeholder], vec![Placeholder; 2])
+            .build::<Vec<Constant>, Vec<Constant>>(outputs, vec![Placeholder], vec![Placeholder; 2])
             .unwrap();
         assert_eq!(
             program.jvp().unwrap().to_string(),
@@ -3086,28 +3055,24 @@ mod tests {
         // tangents aligned with their original primal outputs rather than pairing the final tangent with the zero.
         let r#type = ArrayIrType::Array(vector_type());
         let callee = {
-            let mut builder = ArrayIrXlaProgramBuilder::new();
+            let mut builder = ArrayIrProgramBuilder::new();
             let input = builder.add_input(r#type.clone());
             let sine = builder.add_instruction(SinOperation::new(), Vec::new(), vec![input], None).unwrap()[0];
             let zero =
                 builder.add_instruction(ZeroOperation::new(vector_type()), Vec::new(), Vec::new(), None).unwrap()[0];
             builder
-                .build::<Vec<XlaConstant>, Vec<XlaConstant>>(
-                    vec![sine, zero, input],
-                    vec![Placeholder],
-                    vec![Placeholder; 3],
-                )
+                .build::<Vec<Constant>, Vec<Constant>>(vec![sine, zero, input], vec![Placeholder], vec![Placeholder; 3])
                 .unwrap()
         };
-        let mut builder = ArrayIrXlaProgramBuilder::new();
+        let mut builder = ArrayIrProgramBuilder::new();
         let callee = builder.import_region(callee.entry_region_ref());
         let input = builder.add_input(r#type.clone());
         let outputs = builder
-            .add_instruction(XlaOperation::JitCall(JitCallOperation::new(0)), vec![callee], vec![input], None)
+            .add_instruction(Operation::JitCall(JitCallOperation::new(0)), vec![callee], vec![input], None)
             .unwrap()
             .to_vec();
         let program = builder
-            .build::<Vec<XlaConstant>, Vec<XlaConstant>>(outputs, vec![Placeholder], vec![Placeholder; 3])
+            .build::<Vec<Constant>, Vec<Constant>>(outputs, vec![Placeholder], vec![Placeholder; 3])
             .unwrap();
 
         let jvp = program.jvp().unwrap();
@@ -3115,7 +3080,7 @@ mod tests {
         let calls = jvp
             .instructions()
             .iter()
-            .filter(|instruction| matches!(instruction.operation(), XlaOperation::JitCall(_)))
+            .filter(|instruction| matches!(instruction.operation(), Operation::JitCall(_)))
             .collect::<Vec<_>>();
         assert_eq!(calls.len(), 2);
         assert_eq!(calls[1].outputs().len(), 2);
@@ -3133,22 +3098,22 @@ mod tests {
         // structural zero.
         let r#type = ArrayIrType::Array(vector_type());
         let callee = {
-            let mut builder = ArrayIrXlaProgramBuilder::new();
+            let mut builder = ArrayIrProgramBuilder::new();
             let x = builder.add_input(r#type.clone());
             builder.add_input(r#type.clone());
             let sine = builder.add_instruction(SinOperation::new(), Vec::new(), vec![x], None).unwrap()[0];
             builder
-                .build::<Vec<XlaConstant>, Vec<XlaConstant>>(vec![sine], vec![Placeholder; 2], vec![Placeholder])
+                .build::<Vec<Constant>, Vec<Constant>>(vec![sine], vec![Placeholder; 2], vec![Placeholder])
                 .unwrap()
         };
-        let mut builder = ArrayIrXlaProgramBuilder::new();
+        let mut builder = ArrayIrProgramBuilder::new();
         let callee = builder.import_region(callee.entry_region_ref());
         let inputs = (0..2).map(|_| builder.add_input(r#type.clone())).collect::<Vec<_>>();
         let output = builder
-            .add_instruction(XlaOperation::JitCall(JitCallOperation::new(0)), vec![callee], inputs, None)
+            .add_instruction(Operation::JitCall(JitCallOperation::new(0)), vec![callee], inputs, None)
             .unwrap()[0];
         let program = builder
-            .build::<Vec<XlaConstant>, Vec<XlaConstant>>(vec![output], vec![Placeholder; 2], vec![Placeholder])
+            .build::<Vec<Constant>, Vec<Constant>>(vec![output], vec![Placeholder; 2], vec![Placeholder])
             .unwrap();
         assert_eq!(
             program.entry_region_ref().jvp(&[1]).unwrap().to_string(),
@@ -3177,7 +3142,7 @@ mod tests {
         let size_type = ArrayIrType::Array(ArrayType::scalar(DataType::I64).with_sharding(sharding).unwrap());
         let rows = DimensionType::from(DimensionVariable::new("rows", DimensionBounds::non_negative(Some(8)).unwrap()));
         let callee = {
-            let mut builder = ArrayIrXlaProgramBuilder::new();
+            let mut builder = ArrayIrProgramBuilder::new();
             let value = builder.add_input(value_type.clone());
             let size = builder.add_input(size_type.clone());
             let dimension = builder
@@ -3187,18 +3152,18 @@ mod tests {
                 .add_instruction(DynamicBroadcastOperation::new(Vec::new()), Vec::new(), vec![value, dimension], None)
                 .unwrap()[0];
             builder
-                .build::<Vec<XlaConstant>, Vec<XlaConstant>>(vec![broadcast], vec![Placeholder; 2], vec![Placeholder])
+                .build::<Vec<Constant>, Vec<Constant>>(vec![broadcast], vec![Placeholder; 2], vec![Placeholder])
                 .unwrap()
         };
         let operation = JitCallOperation::new(0)
             .with_callee_type_signature(&callee.input_types(), &callee.output_types())
             .unwrap();
-        let mut builder = ArrayIrXlaProgramBuilder::new();
+        let mut builder = ArrayIrProgramBuilder::new();
         let callee = builder.import_region(callee.entry_region_ref());
         let inputs = vec![builder.add_input(value_type), builder.add_input(size_type)];
-        let output = builder.add_instruction(XlaOperation::JitCall(operation), vec![callee], inputs, None).unwrap()[0];
+        let output = builder.add_instruction(Operation::JitCall(operation), vec![callee], inputs, None).unwrap()[0];
         let program = builder
-            .build::<Vec<XlaConstant>, Vec<XlaConstant>>(vec![output], vec![Placeholder; 2], vec![Placeholder])
+            .build::<Vec<Constant>, Vec<Constant>>(vec![output], vec![Placeholder; 2], vec![Placeholder])
             .unwrap();
 
         let outputs = program.jvp().unwrap().output_types().into_owned();
@@ -3214,12 +3179,12 @@ mod tests {
         let scalar_type = ArrayIrType::Array(ArrayType::scalar(DataType::F32));
         let reference_type = ArrayIrType::Reference(ReferenceType::new(ArrayType::scalar(DataType::F32)));
         let callee = {
-            let mut builder = ArrayIrXlaProgramBuilder::new();
+            let mut builder = ArrayIrProgramBuilder::new();
             let reference = builder.add_input(reference_type.clone());
             let update = builder.add_input(scalar_type.clone());
             let before = builder
                 .add_instruction(
-                    XlaOperation::ReferenceRead(ReferenceReadOperation::new()),
+                    Operation::ReferenceRead(ReferenceReadOperation::new()),
                     Vec::new(),
                     vec![reference],
                     None,
@@ -3227,7 +3192,7 @@ mod tests {
                 .unwrap()[0];
             builder
                 .add_instruction(
-                    XlaOperation::ReferenceAddUpdate(ReferenceAddUpdateOperation::new()),
+                    Operation::ReferenceAddUpdate(ReferenceAddUpdateOperation::new()),
                     Vec::new(),
                     vec![reference, update],
                     None,
@@ -3235,7 +3200,7 @@ mod tests {
                 .unwrap();
             let after = builder
                 .add_instruction(
-                    XlaOperation::ReferenceRead(ReferenceReadOperation::new()),
+                    Operation::ReferenceRead(ReferenceReadOperation::new()),
                     Vec::new(),
                     vec![reference],
                     None,
@@ -3244,33 +3209,28 @@ mod tests {
             let output =
                 builder.add_instruction(MulOperation::new(), Vec::new(), vec![before, after], None).unwrap()[0];
             builder
-                .build::<Vec<XlaConstant>, Vec<XlaConstant>>(vec![output], vec![Placeholder; 2], vec![Placeholder])
+                .build::<Vec<Constant>, Vec<Constant>>(vec![output], vec![Placeholder; 2], vec![Placeholder])
                 .unwrap()
         };
-        let mut builder = ArrayIrXlaProgramBuilder::new();
+        let mut builder = ArrayIrProgramBuilder::new();
         let callee = builder.import_region(callee.entry_region_ref());
         let reference = builder.add_input(reference_type.clone());
         let update = builder.add_input(scalar_type.clone());
         let output = builder
-            .add_instruction(
-                XlaOperation::JitCall(JitCallOperation::new(0)),
-                vec![callee],
-                vec![reference, update],
-                None,
-            )
+            .add_instruction(Operation::JitCall(JitCallOperation::new(0)), vec![callee], vec![reference, update], None)
             .unwrap()[0];
         let program = builder
-            .build::<Vec<XlaConstant>, Vec<XlaConstant>>(vec![output], vec![Placeholder; 2], vec![Placeholder])
+            .build::<Vec<Constant>, Vec<Constant>>(vec![output], vec![Placeholder; 2], vec![Placeholder])
             .unwrap();
 
-        let outer = TracingContext::<XlaConstant, XlaOperation>::new();
+        let outer = TracingContext::<Constant, Operation>::new();
         let known = outer.input(reference_type);
         let evaluation = program
             .partially_evaluate_in_context(&outer, &[PartialValue::Known(known), PartialValue::Unknown(scalar_type)])
             .unwrap();
         let residual = evaluation.program();
         assert_eq!(residual.instructions().len(), 1);
-        assert!(matches!(residual.instructions()[0].operation(), XlaOperation::JitCall(_)));
+        assert!(matches!(residual.instructions()[0].operation(), Operation::JitCall(_)));
         assert_eq!(residual.instructions()[0].inputs().len(), 2);
         let residual_names = residual
             .entry_region_ref()
@@ -3289,7 +3249,7 @@ mod tests {
         // intrinsic state, and the call stays whole instead of hoisting the allocation into the known side.
         let r#type = ArrayIrType::Array(vector_type());
         let callee = {
-            let mut builder = ProgramBuilder::<XlaConstant, XlaOperation>::new();
+            let mut builder = CoreProgramBuilder::<Constant, Operation>::new();
             let known_input = builder.add_input(r#type.clone());
             let runtime_input = builder.add_input(r#type.clone());
             let reference =
@@ -3298,20 +3258,20 @@ mod tests {
                 .add_instruction(MulOperation::new(), Vec::new(), vec![known_input, runtime_input], None)
                 .unwrap()[0];
             builder
-                .build::<Vec<XlaConstant>, Vec<XlaConstant>>(
+                .build::<Vec<Constant>, Vec<Constant>>(
                     vec![reference, product],
                     vec![Placeholder; 2],
                     vec![Placeholder; 2],
                 )
                 .unwrap()
         };
-        let mut builder = ProgramBuilder::<XlaConstant, XlaOperation>::new();
+        let mut builder = CoreProgramBuilder::<Constant, Operation>::new();
         let known_input = builder.add_input(r#type.clone());
         let runtime_input = builder.add_input(r#type.clone());
         let callee_region = builder.intern_callee(&Arc::new(callee), None).unwrap();
         let outputs = builder
             .add_instruction(
-                XlaOperation::JitCall(JitCallOperation::new(0)),
+                Operation::JitCall(JitCallOperation::new(0)),
                 vec![callee_region],
                 vec![known_input, runtime_input],
                 None,
@@ -3319,16 +3279,16 @@ mod tests {
             .unwrap()
             .to_vec();
         let program = builder
-            .build::<Vec<XlaConstant>, Vec<XlaConstant>>(outputs, vec![Placeholder; 2], vec![Placeholder; 2])
+            .build::<Vec<Constant>, Vec<Constant>>(outputs, vec![Placeholder; 2], vec![Placeholder; 2])
             .unwrap();
-        let outer = TracingContext::<XlaConstant, XlaOperation>::new();
+        let outer = TracingContext::<Constant, Operation>::new();
         let known = outer.input(r#type.clone());
         let evaluation = program
             .partially_evaluate_in_context(&outer, &[PartialValue::Known(known), PartialValue::Unknown(r#type)])
             .unwrap();
         let residual = evaluation.program();
         assert_eq!(residual.instructions().len(), 1);
-        assert!(matches!(residual.instructions()[0].operation(), XlaOperation::JitCall(_)));
+        assert!(matches!(residual.instructions()[0].operation(), Operation::JitCall(_)));
         let residual_names = residual
             .entry_region_ref()
             .instructions_in_closure()
@@ -3347,35 +3307,35 @@ mod tests {
         let scalar_type = ArrayIrType::Array(ArrayType::scalar(DataType::F32));
         let reference_type = ArrayIrType::Reference(ReferenceType::new(ArrayType::scalar(DataType::F32)));
         let callee = {
-            let mut builder = ArrayIrXlaProgramBuilder::new();
+            let mut builder = ArrayIrProgramBuilder::new();
             let reference = builder.add_input(reference_type.clone());
             let update = builder.add_input(scalar_type.clone());
             builder
                 .add_instruction(
-                    XlaOperation::ReferenceAddUpdate(ReferenceAddUpdateOperation::new()),
+                    Operation::ReferenceAddUpdate(ReferenceAddUpdateOperation::new()),
                     Vec::new(),
                     vec![reference, update],
                     None,
                 )
                 .unwrap();
             builder
-                .build::<Vec<XlaConstant>, Vec<XlaConstant>>(vec![update], vec![Placeholder; 2], vec![Placeholder])
+                .build::<Vec<Constant>, Vec<Constant>>(vec![update], vec![Placeholder; 2], vec![Placeholder])
                 .unwrap()
         };
-        let mut builder = ArrayIrXlaProgramBuilder::new();
+        let mut builder = ArrayIrProgramBuilder::new();
         let callee_region = builder.import_region(callee.entry_region_ref());
         let reference = builder.add_input(reference_type.clone());
         let update = builder.add_input(scalar_type.clone());
         let output = builder
             .add_instruction(
-                XlaOperation::JitCall(JitCallOperation::new(0)),
+                Operation::JitCall(JitCallOperation::new(0)),
                 vec![callee_region],
                 vec![reference, update],
                 None,
             )
             .unwrap()[0];
         let program = builder
-            .build::<Vec<XlaConstant>, Vec<XlaConstant>>(vec![output], vec![Placeholder; 2], vec![Placeholder])
+            .build::<Vec<Constant>, Vec<Constant>>(vec![output], vec![Placeholder; 2], vec![Placeholder])
             .unwrap();
         let destination_kinds = [CotangentDestinationKind::Ignore, CotangentDestinationKind::Return];
         let transposed = program.transpose_with_respect_to(&[0, 1], &destination_kinds).unwrap();
@@ -3383,7 +3343,7 @@ mod tests {
         assert_eq!(transposed.output_types(), vec![scalar_type.clone()]);
         assert_eq!(transposed.instructions().len(), 1);
         let call = &transposed.instructions()[0];
-        assert!(matches!(call.operation(), XlaOperation::JitCall(_)));
+        assert!(matches!(call.operation(), Operation::JitCall(_)));
         assert_eq!(call.inputs(), transposed.input_ids());
         assert_eq!(call.outputs(), transposed.output_ids());
         let transposed_callee = transposed.region_ref(call.regions()[0]).unwrap().to_program();
@@ -3404,12 +3364,12 @@ mod tests {
         let scalar_type = ArrayIrType::Array(ArrayType::scalar(DataType::F32));
         let reference_type = ArrayIrType::Reference(ReferenceType::new(ArrayType::scalar(DataType::F32)));
         let callee = {
-            let mut builder = ArrayIrXlaProgramBuilder::new();
+            let mut builder = ArrayIrProgramBuilder::new();
             let reference = builder.add_input(reference_type.clone());
             let update = builder.add_input(scalar_type.clone());
             builder
                 .add_instruction(
-                    XlaOperation::ReferenceAddUpdate(ReferenceAddUpdateOperation::new()),
+                    Operation::ReferenceAddUpdate(ReferenceAddUpdateOperation::new()),
                     Vec::new(),
                     vec![reference, update],
                     None,
@@ -3417,30 +3377,30 @@ mod tests {
                 .unwrap();
             let output = builder
                 .add_instruction(
-                    XlaOperation::ReferenceRead(ReferenceReadOperation::new()),
+                    Operation::ReferenceRead(ReferenceReadOperation::new()),
                     Vec::new(),
                     vec![reference],
                     None,
                 )
                 .unwrap()[0];
             builder
-                .build::<Vec<XlaConstant>, Vec<XlaConstant>>(vec![output], vec![Placeholder; 2], vec![Placeholder])
+                .build::<Vec<Constant>, Vec<Constant>>(vec![output], vec![Placeholder; 2], vec![Placeholder])
                 .unwrap()
         };
-        let mut builder = ArrayIrXlaProgramBuilder::new();
+        let mut builder = ArrayIrProgramBuilder::new();
         let callee_region = builder.import_region(callee.entry_region_ref());
         let reference = builder.add_input(reference_type.clone());
         let update = builder.add_input(scalar_type.clone());
         let output = builder
             .add_instruction(
-                XlaOperation::JitCall(JitCallOperation::new(0)),
+                Operation::JitCall(JitCallOperation::new(0)),
                 vec![callee_region],
                 vec![reference, update],
                 None,
             )
             .unwrap()[0];
         let program = builder
-            .build::<Vec<XlaConstant>, Vec<XlaConstant>>(vec![output], vec![Placeholder; 2], vec![Placeholder])
+            .build::<Vec<Constant>, Vec<Constant>>(vec![output], vec![Placeholder; 2], vec![Placeholder])
             .unwrap();
 
         // Transposed under a `Reference` destination for the reference operand, the pullback consumes `[ȳ, r̄]` and
@@ -3454,7 +3414,7 @@ mod tests {
         assert_eq!(transposed.output_types(), vec![reference_type.clone(), scalar_type]);
         assert_eq!(transposed.instructions().len(), 1);
         let call = &transposed.instructions()[0];
-        assert!(matches!(call.operation(), XlaOperation::JitCall(operation) if operation.capture_count() == 0));
+        assert!(matches!(call.operation(), Operation::JitCall(operation) if operation.capture_count() == 0));
         assert_eq!(call.inputs(), transposed.input_ids());
         assert_eq!(call.outputs().len(), 2);
         assert_eq!(transposed.atoms()[call.outputs()[0].index()].r#type().as_ref(), &reference_type);
@@ -3467,7 +3427,7 @@ mod tests {
     #[test]
     fn test_jit_call_zero_transpose_uses_cotangent_descriptors() {
         let mesh = LogicalMesh::new(vec![MeshAxis::new("x", 2, MeshAxisType::Explicit).unwrap()]).unwrap();
-        let tangent_type = ArrayType::new(DataType::F32, Shape::new(vec![Dimension::Static(4)]))
+        let tangent_type = ArrayType::new(DataType::F32, Shape::new(vec![CoreDimension::Static(4)]))
             .with_sharding(
                 Sharding::new(mesh, vec![ShardingDimension::replicated()])
                     .unwrap()
@@ -3479,14 +3439,14 @@ mod tests {
         let tangent_type = ArrayIrType::Array(tangent_type);
         // Zero cotangents skip a pure callee only after its effects have been inspected. Supply the real
         // identity-region boundary rather than an empty driver that cannot answer that query.
-        let mut source_builder = ArrayIrXlaProgramBuilder::new();
+        let mut source_builder = ArrayIrProgramBuilder::new();
         let input = source_builder.add_input(tangent_type.clone());
         let source = source_builder.build(vec![input], vec![Placeholder], vec![Placeholder]).unwrap();
-        let mut transpose_builder = ArrayIrXlaProgramBuilder::new();
+        let mut transpose_builder = ArrayIrProgramBuilder::new();
         let input = transpose_builder.add_input(expected.clone());
         let transposed = transpose_builder.build(vec![input], vec![Placeholder], vec![Placeholder]).unwrap();
         let driver = TestTranspositionDriver { source, transposed };
-        let mut context = TracingContext::<XlaConstant, XlaOperation>::new();
+        let mut context = TracingContext::<Constant, Operation>::new();
         let cotangents = transpose_primal_jit_call(
             &JitCallOperation::new(0),
             &mut context,
@@ -3519,30 +3479,28 @@ mod tests {
         // `x̄` stays a structural zero, and `z̄` keeps the `live` identity of the caller's cotangent type.
         let dead = DimensionVariable::new("dead", DimensionBounds::new(1, Some(5)).unwrap());
         let live = DimensionVariable::new("live", DimensionBounds::new(1, Some(5)).unwrap());
-        let dead_type = ArrayIrType::Array(ArrayType::new(DataType::F64, Shape::new(vec![Dimension::Dynamic(dead)])));
-        let live_type = ArrayIrType::Array(ArrayType::new(DataType::F64, Shape::new(vec![Dimension::Dynamic(live)])));
+        let dead_type =
+            ArrayIrType::Array(ArrayType::new(DataType::F64, Shape::new(vec![CoreDimension::Dynamic(dead)])));
+        let live_type =
+            ArrayIrType::Array(ArrayType::new(DataType::F64, Shape::new(vec![CoreDimension::Dynamic(live)])));
         let callee = {
-            let mut builder = ArrayIrXlaProgramBuilder::new();
+            let mut builder = ArrayIrProgramBuilder::new();
             let dead = builder.add_input(dead_type.clone());
             let live = builder.add_input(live_type.clone());
             builder
-                .build::<Vec<XlaConstant>, Vec<XlaConstant>>(
-                    vec![dead, live],
-                    vec![Placeholder; 2],
-                    vec![Placeholder; 2],
-                )
+                .build::<Vec<Constant>, Vec<Constant>>(vec![dead, live], vec![Placeholder; 2], vec![Placeholder; 2])
                 .unwrap()
         };
-        let mut builder = ArrayIrXlaProgramBuilder::new();
+        let mut builder = ArrayIrProgramBuilder::new();
         let callee = builder.import_region(callee.entry_region_ref());
         let dead = builder.add_input(dead_type);
         let live = builder.add_input(live_type.clone());
         let outputs = builder
-            .add_instruction(XlaOperation::JitCall(JitCallOperation::new(0)), vec![callee], vec![dead, live], None)
+            .add_instruction(Operation::JitCall(JitCallOperation::new(0)), vec![callee], vec![dead, live], None)
             .unwrap()
             .to_vec();
         let program = builder
-            .build::<Vec<XlaConstant>, Vec<XlaConstant>>(vec![outputs[1]], vec![Placeholder; 2], vec![Placeholder])
+            .build::<Vec<Constant>, Vec<Constant>>(vec![outputs[1]], vec![Placeholder; 2], vec![Placeholder])
             .unwrap();
         let transposed = program.entry_region_ref().transpose(&[0, 1], &[], &[]).unwrap();
         assert_eq!(transposed.cotangents(), &[TransposedProgramCotangent::Zero, TransposedProgramCotangent::Output]);
@@ -3581,25 +3539,21 @@ mod tests {
         // live, the transposed callee receives both seeds and adds them.
         let scalar_type = ArrayIrType::Array(ArrayType::scalar(DataType::F64));
         let callee = {
-            let mut builder = ArrayIrXlaProgramBuilder::new();
+            let mut builder = ArrayIrProgramBuilder::new();
             let input = builder.add_input(scalar_type.clone());
             builder
-                .build::<Vec<XlaConstant>, Vec<XlaConstant>>(
-                    vec![input, input],
-                    vec![Placeholder],
-                    vec![Placeholder; 2],
-                )
+                .build::<Vec<Constant>, Vec<Constant>>(vec![input, input], vec![Placeholder], vec![Placeholder; 2])
                 .unwrap()
         };
-        let mut builder = ArrayIrXlaProgramBuilder::new();
+        let mut builder = ArrayIrProgramBuilder::new();
         let callee = builder.import_region(callee.entry_region_ref());
         let input = builder.add_input(scalar_type);
         let outputs = builder
-            .add_instruction(XlaOperation::JitCall(JitCallOperation::new(0)), vec![callee], vec![input], None)
+            .add_instruction(Operation::JitCall(JitCallOperation::new(0)), vec![callee], vec![input], None)
             .unwrap()
             .to_vec();
         let program = builder
-            .build::<Vec<XlaConstant>, Vec<XlaConstant>>(outputs, vec![Placeholder], vec![Placeholder; 2])
+            .build::<Vec<Constant>, Vec<Constant>>(outputs, vec![Placeholder], vec![Placeholder; 2])
             .unwrap();
         let client = execution_client();
 
@@ -3675,7 +3629,7 @@ mod tests {
         // run: the transposed call has no inputs, and its callee prints a materialized zero seed.
         let scalar_type = ArrayIrType::Array(ArrayType::scalar(DataType::F64));
         let backward = {
-            let mut builder = ArrayIrXlaProgramBuilder::new();
+            let mut builder = ArrayIrProgramBuilder::new();
             let seed = builder.add_input(scalar_type.clone());
             builder
                 .add_instruction(PrintOperation::<ArrayType>::new("backward"), Vec::new(), vec![seed], None)
@@ -3684,16 +3638,16 @@ mod tests {
                 .add_instruction(ZeroOperation::new(ArrayType::scalar(DataType::F64)), Vec::new(), Vec::new(), None)
                 .unwrap()[0];
             builder
-                .build::<Vec<XlaConstant>, Vec<XlaConstant>>(vec![zero], vec![Placeholder], vec![Placeholder])
+                .build::<Vec<Constant>, Vec<Constant>>(vec![zero], vec![Placeholder], vec![Placeholder])
                 .unwrap()
         };
         let callee = {
-            let mut builder = ArrayIrXlaProgramBuilder::new();
+            let mut builder = ArrayIrProgramBuilder::new();
             let backward = builder.import_region(backward.entry_region_ref());
             let input = builder.add_input(scalar_type.clone());
             let output = builder
                 .add_instruction(
-                    CompositeTransposeOperation::<XlaConstant, XlaOperation>::from_backward_region(
+                    CompositeTransposeOperation::<Constant, Operation>::from_backward_region(
                         0,
                         vec![scalar_type.clone()],
                         vec![scalar_type.clone()],
@@ -3704,18 +3658,16 @@ mod tests {
                 )
                 .unwrap()[0];
             builder
-                .build::<Vec<XlaConstant>, Vec<XlaConstant>>(vec![output], vec![Placeholder], vec![Placeholder])
+                .build::<Vec<Constant>, Vec<Constant>>(vec![output], vec![Placeholder], vec![Placeholder])
                 .unwrap()
         };
-        let mut builder = ArrayIrXlaProgramBuilder::new();
+        let mut builder = ArrayIrProgramBuilder::new();
         let callee = builder.import_region(callee.entry_region_ref());
         let input = builder.add_input(scalar_type);
         builder
-            .add_instruction(XlaOperation::JitCall(JitCallOperation::new(0)), vec![callee], vec![input], None)
+            .add_instruction(Operation::JitCall(JitCallOperation::new(0)), vec![callee], vec![input], None)
             .unwrap();
-        let program = builder
-            .build::<Vec<XlaConstant>, Vec<XlaConstant>>(Vec::new(), vec![Placeholder], Vec::new())
-            .unwrap();
+        let program = builder.build::<Vec<Constant>, Vec<Constant>>(Vec::new(), vec![Placeholder], Vec::new()).unwrap();
         let transposed = program.entry_region_ref().transpose(&[0], &[], &[]).unwrap();
         assert_eq!(transposed.cotangents(), &[TransposedProgramCotangent::Zero]);
         let pullback = transposed.into_program();
@@ -3750,12 +3702,12 @@ mod tests {
         let scalar_type = ArrayIrType::Array(ArrayType::scalar(DataType::F64));
         let reference_type = ArrayIrType::Reference(ReferenceType::new(ArrayType::scalar(DataType::F64)));
         let callee = {
-            let mut builder = ArrayIrXlaProgramBuilder::new();
+            let mut builder = ArrayIrProgramBuilder::new();
             let reference = builder.add_input(reference_type.clone());
             let update = builder.add_input(scalar_type.clone());
             builder
                 .add_instruction(
-                    XlaOperation::ReferenceAddUpdate(ReferenceAddUpdateOperation::new()),
+                    Operation::ReferenceAddUpdate(ReferenceAddUpdateOperation::new()),
                     Vec::new(),
                     vec![reference, update],
                     None,
@@ -3763,35 +3715,26 @@ mod tests {
                 .unwrap();
             let read = builder
                 .add_instruction(
-                    XlaOperation::ReferenceRead(ReferenceReadOperation::new()),
+                    Operation::ReferenceRead(ReferenceReadOperation::new()),
                     Vec::new(),
                     vec![reference],
                     None,
                 )
                 .unwrap()[0];
             builder
-                .build::<Vec<XlaConstant>, Vec<XlaConstant>>(
-                    vec![read, update],
-                    vec![Placeholder; 2],
-                    vec![Placeholder; 2],
-                )
+                .build::<Vec<Constant>, Vec<Constant>>(vec![read, update], vec![Placeholder; 2], vec![Placeholder; 2])
                 .unwrap()
         };
-        let mut builder = ArrayIrXlaProgramBuilder::new();
+        let mut builder = ArrayIrProgramBuilder::new();
         let callee = builder.import_region(callee.entry_region_ref());
         let reference = builder.add_input(reference_type.clone());
         let update = builder.add_input(scalar_type.clone());
         let outputs = builder
-            .add_instruction(
-                XlaOperation::JitCall(JitCallOperation::new(0)),
-                vec![callee],
-                vec![reference, update],
-                None,
-            )
+            .add_instruction(Operation::JitCall(JitCallOperation::new(0)), vec![callee], vec![reference, update], None)
             .unwrap()
             .to_vec();
         let program = builder
-            .build::<Vec<XlaConstant>, Vec<XlaConstant>>(vec![outputs[0]], vec![Placeholder; 2], vec![Placeholder])
+            .build::<Vec<Constant>, Vec<Constant>>(vec![outputs[0]], vec![Placeholder; 2], vec![Placeholder])
             .unwrap();
         let destination_kinds = [CotangentDestinationKind::Reference, CotangentDestinationKind::Return];
         let transposed = program.transpose_with_respect_to(&[0, 1], &destination_kinds).unwrap();
@@ -3842,42 +3785,38 @@ mod tests {
         let scalar_type = ArrayIrType::Array(ArrayType::scalar(DataType::F64));
         let stack_type = ArrayIrType::Array(ArrayType::new_static(DataType::F64, [3]));
         let body = {
-            let mut builder = ArrayIrXlaProgramBuilder::new();
+            let mut builder = ArrayIrProgramBuilder::new();
             builder.add_input(ArrayType::scalar(DataType::I64).into());
             let carry = builder.add_input(scalar_type.clone());
             let item = builder.add_input(scalar_type.clone());
             let next = builder.add_instruction(AddOperation::new(), Vec::new(), vec![carry, item], None).unwrap()[0];
             builder
-                .build::<Vec<XlaConstant>, Vec<XlaConstant>>(
-                    vec![next, carry],
-                    vec![Placeholder; 3],
-                    vec![Placeholder; 2],
-                )
+                .build::<Vec<Constant>, Vec<Constant>>(vec![next, carry], vec![Placeholder; 3], vec![Placeholder; 2])
                 .unwrap()
         };
         let callee = {
-            let mut builder = ArrayIrXlaProgramBuilder::new();
+            let mut builder = ArrayIrProgramBuilder::new();
             let body = builder.import_region(body.entry_region_ref());
             let carry = builder.add_input(scalar_type.clone());
             let items = builder.add_input(stack_type.clone());
             let outputs = builder
-                .add_instruction(XlaOperation::Scan(ScanOperation::new(1, 3)), vec![body], vec![carry, items], None)
+                .add_instruction(Operation::Scan(ScanOperation::new(1, 3)), vec![body], vec![carry, items], None)
                 .unwrap()
                 .to_vec();
             builder
-                .build::<Vec<XlaConstant>, Vec<XlaConstant>>(outputs, vec![Placeholder; 2], vec![Placeholder; 2])
+                .build::<Vec<Constant>, Vec<Constant>>(outputs, vec![Placeholder; 2], vec![Placeholder; 2])
                 .unwrap()
         };
-        let mut builder = ArrayIrXlaProgramBuilder::new();
+        let mut builder = ArrayIrProgramBuilder::new();
         let callee = builder.import_region(callee.entry_region_ref());
         let carry = builder.add_input(scalar_type);
         let items = builder.add_input(stack_type);
         let outputs = builder
-            .add_instruction(XlaOperation::JitCall(JitCallOperation::new(0)), vec![callee], vec![carry, items], None)
+            .add_instruction(Operation::JitCall(JitCallOperation::new(0)), vec![callee], vec![carry, items], None)
             .unwrap()
             .to_vec();
         let program = builder
-            .build::<Vec<XlaConstant>, Vec<XlaConstant>>(vec![outputs[0]], vec![Placeholder; 2], vec![Placeholder])
+            .build::<Vec<Constant>, Vec<Constant>>(vec![outputs[0]], vec![Placeholder; 2], vec![Placeholder])
             .unwrap();
         let transposed = program.transpose_with_respect_to(&[0, 1], &[]).unwrap();
         assert_eq!(
@@ -3914,17 +3853,17 @@ mod tests {
         // transposed branch consumes the live seed alone: `x̄ = ȳ₀` when `c > 0` and `x̄ = 2ȳ₀` otherwise.
         let scalar_type = ArrayIrType::Array(ArrayType::scalar(DataType::F64));
         let branch = |doubled_output: usize| {
-            let mut builder = ArrayIrXlaProgramBuilder::new();
+            let mut builder = ArrayIrProgramBuilder::new();
             let input = builder.add_input(scalar_type.clone());
             let doubled =
                 builder.add_instruction(AddOperation::new(), Vec::new(), vec![input, input], None).unwrap()[0];
             let outputs = if doubled_output == 0 { vec![doubled, input] } else { vec![input, doubled] };
             builder
-                .build::<Vec<XlaConstant>, Vec<XlaConstant>>(outputs, vec![Placeholder], vec![Placeholder; 2])
+                .build::<Vec<Constant>, Vec<Constant>>(outputs, vec![Placeholder], vec![Placeholder; 2])
                 .unwrap()
         };
         let callee = {
-            let mut builder = ArrayIrXlaProgramBuilder::new();
+            let mut builder = ArrayIrProgramBuilder::new();
             let true_branch = builder.import_region(branch(1).entry_region_ref());
             let false_branch = builder.import_region(branch(0).entry_region_ref());
             let selector = builder.add_input(scalar_type.clone());
@@ -3934,7 +3873,7 @@ mod tests {
                 .unwrap()[0];
             let predicate = builder
                 .add_instruction(
-                    XlaOperation::Array(ArrayOperation::Compare(CompareOperation::<ArrayType>::new(
+                    Operation::Array(ArrayOperation::Compare(CompareOperation::<ArrayType>::new(
                         ComparisonDirection::GreaterThan,
                     ))),
                     Vec::new(),
@@ -3944,7 +3883,7 @@ mod tests {
                 .unwrap()[0];
             let outputs = builder
                 .add_instruction(
-                    XlaOperation::Condition(ConditionOperation::new()),
+                    Operation::Condition(ConditionOperation::new()),
                     vec![true_branch, false_branch],
                     vec![predicate, input],
                     None,
@@ -3952,19 +3891,19 @@ mod tests {
                 .unwrap()
                 .to_vec();
             builder
-                .build::<Vec<XlaConstant>, Vec<XlaConstant>>(outputs, vec![Placeholder; 2], vec![Placeholder; 2])
+                .build::<Vec<Constant>, Vec<Constant>>(outputs, vec![Placeholder; 2], vec![Placeholder; 2])
                 .unwrap()
         };
-        let mut builder = ArrayIrXlaProgramBuilder::new();
+        let mut builder = ArrayIrProgramBuilder::new();
         let callee = builder.import_region(callee.entry_region_ref());
         let selector = builder.add_input(scalar_type.clone());
         let input = builder.add_input(scalar_type);
         let outputs = builder
-            .add_instruction(XlaOperation::JitCall(JitCallOperation::new(0)), vec![callee], vec![selector, input], None)
+            .add_instruction(Operation::JitCall(JitCallOperation::new(0)), vec![callee], vec![selector, input], None)
             .unwrap()
             .to_vec();
         let program = builder
-            .build::<Vec<XlaConstant>, Vec<XlaConstant>>(vec![outputs[0]], vec![Placeholder; 2], vec![Placeholder])
+            .build::<Vec<Constant>, Vec<Constant>>(vec![outputs[0]], vec![Placeholder; 2], vec![Placeholder])
             .unwrap();
         let transposed = program.transpose_with_respect_to(&[1], &[]).unwrap();
         assert_eq!(
@@ -4017,40 +3956,36 @@ mod tests {
         // and `x̄ = ȳ₁ + ȳ₁`.
         let scalar_type = ArrayIrType::Array(ArrayType::scalar(DataType::F64));
         let doubling = {
-            let mut builder = ArrayIrXlaProgramBuilder::new();
+            let mut builder = ArrayIrProgramBuilder::new();
             let input = builder.add_input(scalar_type.clone());
             let doubled =
                 builder.add_instruction(AddOperation::new(), Vec::new(), vec![input, input], None).unwrap()[0];
             builder
-                .build::<Vec<XlaConstant>, Vec<XlaConstant>>(
-                    vec![input, doubled],
-                    vec![Placeholder],
-                    vec![Placeholder; 2],
-                )
+                .build::<Vec<Constant>, Vec<Constant>>(vec![input, doubled], vec![Placeholder], vec![Placeholder; 2])
                 .unwrap()
         };
         let rematerialize = || RematerializeOperation::new(ResidualPolicyReference::new(NothingSavable));
-        let nest = |outer: XlaOperation, inner: XlaOperation| {
+        let nest = |outer: Operation, inner: Operation| {
             let inner_program = {
-                let mut builder = ArrayIrXlaProgramBuilder::new();
+                let mut builder = ArrayIrProgramBuilder::new();
                 let region = builder.import_region(doubling.entry_region_ref());
                 let input = builder.add_input(scalar_type.clone());
                 let outputs = builder.add_instruction(inner, vec![region], vec![input], None).unwrap().to_vec();
                 builder
-                    .build::<Vec<XlaConstant>, Vec<XlaConstant>>(outputs, vec![Placeholder], vec![Placeholder; 2])
+                    .build::<Vec<Constant>, Vec<Constant>>(outputs, vec![Placeholder], vec![Placeholder; 2])
                     .unwrap()
             };
-            let mut builder = ArrayIrXlaProgramBuilder::new();
+            let mut builder = ArrayIrProgramBuilder::new();
             let region = builder.import_region(inner_program.entry_region_ref());
             let input = builder.add_input(scalar_type.clone());
             let outputs = builder.add_instruction(outer, vec![region], vec![input], None).unwrap().to_vec();
             builder
-                .build::<Vec<XlaConstant>, Vec<XlaConstant>>(vec![outputs[1]], vec![Placeholder], vec![Placeholder])
+                .build::<Vec<Constant>, Vec<Constant>>(vec![outputs[1]], vec![Placeholder], vec![Placeholder])
                 .unwrap()
         };
         let client = execution_client();
 
-        let program = nest(XlaOperation::JitCall(JitCallOperation::new(0)), rematerialize().into());
+        let program = nest(Operation::JitCall(JitCallOperation::new(0)), rematerialize().into());
         let transposed = program.transpose_with_respect_to(&[0], &[]).unwrap();
         assert_eq!(
             transposed.to_string(),
@@ -4078,7 +4013,7 @@ mod tests {
             vec![MixedValue::Array(vec![4.0], vec![])],
         );
 
-        let program = nest(rematerialize().into(), XlaOperation::JitCall(JitCallOperation::new(0)));
+        let program = nest(rematerialize().into(), Operation::JitCall(JitCallOperation::new(0)));
         let transposed = program.transpose_with_respect_to(&[0], &[]).unwrap();
         assert_eq!(
             transposed.to_string(),
@@ -4110,29 +4045,24 @@ mod tests {
     #[test]
     fn test_jit_call_transpose_omits_disconnected_symbolic_cotangent() {
         let extent = DimensionVariable::new("extent", DimensionBounds::new(1, Some(5)).unwrap());
-        let dynamic_type = ArrayType::new(DataType::F32, Shape::new(vec![Dimension::Dynamic(extent)]));
+        let dynamic_type = ArrayType::new(DataType::F32, Shape::new(vec![CoreDimension::Dynamic(extent)]));
         let scalar_type = ArrayType::scalar(DataType::F32);
-        let mut callee_builder = ArrayIrXlaProgramBuilder::new();
+        let mut callee_builder = ArrayIrProgramBuilder::new();
         callee_builder.add_input(dynamic_type.clone().into());
         let live = callee_builder.add_input(scalar_type.clone().into());
         let callee = callee_builder
-            .build::<Vec<XlaConstant>, Vec<XlaConstant>>(vec![live], vec![Placeholder; 2], vec![Placeholder])
+            .build::<Vec<Constant>, Vec<Constant>>(vec![live], vec![Placeholder; 2], vec![Placeholder])
             .unwrap();
-        let mut builder = ArrayIrXlaProgramBuilder::new();
+        let mut builder = ArrayIrProgramBuilder::new();
         let disconnected = builder.add_input(dynamic_type.into());
         let live = builder.add_input(scalar_type.into());
         let callee = builder.import_region(callee.entry_region_ref());
         let outputs = builder
-            .add_instruction(
-                XlaOperation::JitCall(JitCallOperation::new(0)),
-                vec![callee],
-                vec![disconnected, live],
-                None,
-            )
+            .add_instruction(Operation::JitCall(JitCallOperation::new(0)), vec![callee], vec![disconnected, live], None)
             .unwrap()
             .to_vec();
         let program = builder
-            .build::<Vec<XlaConstant>, Vec<XlaConstant>>(outputs, vec![Placeholder; 2], vec![Placeholder])
+            .build::<Vec<Constant>, Vec<Constant>>(outputs, vec![Placeholder; 2], vec![Placeholder])
             .unwrap();
         let linearization = program.linearize().unwrap();
         assert_eq!(linearization.residual_count(), 0);
@@ -4158,36 +4088,28 @@ mod tests {
     fn test_jit_call_mixed_output_transpose_omits_zero_space_seeds() {
         // The predicate output's cotangent is a zero space that arrives as a structural zero, so the transposed callee
         // has no input for it and the transposed call consumes the value output's seed alone.
-        let value_type = ArrayType::new(DataType::F32, Shape::new(vec![Dimension::Static(4)]));
-        let predicate_type = ArrayType::new(DataType::Boolean, Shape::new(vec![Dimension::Static(4)]));
+        let value_type = ArrayType::new(DataType::F32, Shape::new(vec![CoreDimension::Static(4)]));
+        let predicate_type = ArrayType::new(DataType::Boolean, Shape::new(vec![CoreDimension::Static(4)]));
         let value_program_type = ArrayIrType::Array(value_type.clone());
         let predicate_program_type = ArrayIrType::Array(predicate_type.clone());
         let source = {
-            let mut builder = ArrayIrXlaProgramBuilder::new();
+            let mut builder = ArrayIrProgramBuilder::new();
             let value = builder.add_input(value_program_type.clone());
             let predicate =
-                builder.add_constant(XlaConstant::Captured(CaptureReference::new(0, predicate_program_type.clone())));
+                builder.add_constant(Constant::Captured(CaptureReference::new(0, predicate_program_type.clone())));
             builder
-                .build::<Vec<XlaConstant>, Vec<XlaConstant>>(
-                    vec![value, predicate],
-                    vec![Placeholder],
-                    vec![Placeholder; 2],
-                )
+                .build::<Vec<Constant>, Vec<Constant>>(vec![value, predicate], vec![Placeholder], vec![Placeholder; 2])
                 .unwrap()
         };
         let transposed = {
-            let mut builder = ArrayIrXlaProgramBuilder::new();
+            let mut builder = ArrayIrProgramBuilder::new();
             let value_cotangent = builder.add_input(value_program_type.clone());
             builder
-                .build::<Vec<XlaConstant>, Vec<XlaConstant>>(
-                    vec![value_cotangent],
-                    vec![Placeholder],
-                    vec![Placeholder],
-                )
+                .build::<Vec<Constant>, Vec<Constant>>(vec![value_cotangent], vec![Placeholder], vec![Placeholder])
                 .unwrap()
         };
         let driver = TestTranspositionDriver { source, transposed };
-        let mut context = TracingContext::<XlaConstant, XlaOperation>::new();
+        let mut context = TracingContext::<Constant, Operation>::new();
         let value_cotangent = context.input(value_program_type.clone());
 
         let contributions = transpose_primal_jit_call(
@@ -4210,7 +4132,7 @@ mod tests {
         let [call] = builder.instructions() else {
             panic!("expected the transposed call to be the only staged instruction");
         };
-        assert!(matches!(call.operation(), XlaOperation::JitCall(_)));
+        assert!(matches!(call.operation(), Operation::JitCall(_)));
         assert_eq!(call.inputs(), &[value_cotangent.atom_id().unwrap()]);
     }
 
@@ -4229,7 +4151,7 @@ mod tests {
         // deliberately absent: a capture-bearing callee preserves its boundary instead of splitting, which
         // `test_jit_call_partial_evaluation_preserves_boundary_for_capture_bearing_callees` pins.
         let callee = {
-            let mut builder = ProgramBuilder::<XlaConstant, XlaOperation>::new();
+            let mut builder = CoreProgramBuilder::<Constant, Operation>::new();
             let known_input = builder.add_input(r#type.clone());
             let runtime_input = builder.add_input(r#type.clone());
             let shifted = builder
@@ -4242,7 +4164,7 @@ mod tests {
                 .add_instruction(MulOperation::new(), Vec::new(), vec![shifted, runtime_input], None)
                 .unwrap()[0];
             builder
-                .build::<Vec<XlaConstant>, Vec<XlaConstant>>(
+                .build::<Vec<Constant>, Vec<Constant>>(
                     vec![shifted, scaled, product],
                     vec![Placeholder; 2],
                     vec![Placeholder; 3],
@@ -4251,20 +4173,20 @@ mod tests {
         };
 
         // Enclosing program staging one call to the callee over `[a, x]`.
-        let mut builder = ProgramBuilder::<XlaConstant, XlaOperation>::new();
+        let mut builder = CoreProgramBuilder::<Constant, Operation>::new();
         let known_input = builder.add_input(r#type.clone());
         let runtime_input = builder.add_input(r#type.clone());
         let callee_region = builder.intern_callee(&Arc::new(callee), None).unwrap();
-        let call = XlaOperation::JitCall(JitCallOperation::new(0));
+        let call = Operation::JitCall(JitCallOperation::new(0));
         let outputs = builder
             .add_instruction(call, vec![callee_region], vec![known_input, runtime_input], None)
             .unwrap()
             .to_vec();
         let program = builder
-            .build::<Vec<XlaConstant>, Vec<XlaConstant>>(outputs, vec![Placeholder; 2], vec![Placeholder; 3])
+            .build::<Vec<Constant>, Vec<Constant>>(outputs, vec![Placeholder; 2], vec![Placeholder; 3])
             .unwrap();
 
-        let outer = TracingContext::<XlaConstant, XlaOperation>::new();
+        let outer = TracingContext::<Constant, Operation>::new();
         let known = outer.input(r#type.clone());
         let evaluation = program
             .partially_evaluate_in_context(&outer, &[PartialValue::Known(known), PartialValue::Unknown(r#type.clone())])
@@ -4278,21 +4200,21 @@ mod tests {
             assert_eq!(outer_builder.instructions().len(), 1);
             let known_instruction = &outer_builder.instructions()[0];
             assert!(
-                matches!(known_instruction.operation(), XlaOperation::JitCall(_)),
+                matches!(known_instruction.operation(), Operation::JitCall(_)),
                 "expected the outer program to contain the known-side jit_call",
             );
             let known_callee = outer_builder.region_ref(known_instruction.regions()[0]).unwrap().to_program();
             assert_eq!(known_callee.input_ids().len(), 1);
             assert_eq!(known_callee.output_ids().len(), 1);
             assert_eq!(known_callee.instructions().len(), 1);
-            assert!(matches!(known_callee.instructions()[0].operation(), XlaOperation::Array(ArrayOperation::Add(_)),));
+            assert!(matches!(known_callee.instructions()[0].operation(), Operation::Array(ArrayOperation::Add(_)),));
         }
 
         // The unknown half stayed behind one residual `jit_call` over the unknown input plus the residual edge.
         assert_eq!(evaluation.program().instructions().len(), 1);
         let residual_instruction = &evaluation.program().instructions()[0];
         assert!(
-            matches!(residual_instruction.operation(), XlaOperation::JitCall(_)),
+            matches!(residual_instruction.operation(), Operation::JitCall(_)),
             "expected the residual program to contain the residual jit_call",
         );
         let residual_callee = evaluation.program().region_ref(residual_instruction.regions()[0]).unwrap().to_program();
@@ -4315,7 +4237,7 @@ mod tests {
         use ryft_core::{Device, DeviceMesh, PartialEvaluationInput, PartialEvaluationOutput};
 
         use crate::tests::{execution_client, values_from_bytes, values_to_bytes};
-        use crate::{FromPjrt, XlaSession, XlaValue};
+        use crate::{FromPjrt, Session, Value};
 
         // Partial evaluation splits a mixed `jit_call` whose known inputs are concrete arrays of the eager XLA domain
         // exactly as it splits one whose known inputs are symbolic: the known-side call compiles and executes
@@ -4325,43 +4247,43 @@ mod tests {
         let device = Device::from_pjrt(client.addressable_devices().unwrap().remove(0)).unwrap();
         let logical_mesh = LogicalMesh::new(vec![MeshAxis::new("x", 1, MeshAxisType::Auto).unwrap()]).unwrap();
         let mesh = DeviceMesh::new(logical_mesh.clone(), vec![device]).unwrap();
-        let domain = XlaSession::new(&client).domain();
+        let domain = Session::new(&client).domain();
         let array_type = vector_type().with_sharding(Sharding::replicated(logical_mesh, 1)).unwrap();
         let r#type = ArrayIrType::Array(array_type.clone());
 
         // Callee `f(a, x) = (a + a, (a + a) * x)` over a known `a` and an unknown `x`.
         let callee = {
-            let mut builder = ProgramBuilder::<XlaConstant, XlaOperation>::new();
+            let mut builder = CoreProgramBuilder::<Constant, Operation>::new();
             let a = builder.add_input(r#type.clone());
             let x = builder.add_input(r#type.clone());
             let doubled = builder.add_instruction(AddOperation::new(), Vec::new(), vec![a, a], None).unwrap()[0];
             let product = builder.add_instruction(MulOperation::new(), Vec::new(), vec![doubled, x], None).unwrap()[0];
             builder
-                .build::<Vec<XlaConstant>, Vec<XlaConstant>>(
+                .build::<Vec<Constant>, Vec<Constant>>(
                     vec![doubled, product],
                     vec![Placeholder; 2],
                     vec![Placeholder; 2],
                 )
                 .unwrap()
         };
-        let mut builder = ProgramBuilder::<XlaConstant, XlaOperation>::new();
+        let mut builder = CoreProgramBuilder::<Constant, Operation>::new();
         let a = builder.add_input(r#type.clone());
         let x = builder.add_input(r#type.clone());
         let callee_region = builder.intern_callee(&Arc::new(callee), None).unwrap();
         let outputs = builder
-            .add_instruction(XlaOperation::JitCall(JitCallOperation::new(0)), vec![callee_region], vec![a, x], None)
+            .add_instruction(Operation::JitCall(JitCallOperation::new(0)), vec![callee_region], vec![a, x], None)
             .unwrap()
             .to_vec();
         let program = builder
-            .build::<Vec<XlaConstant>, Vec<XlaConstant>>(outputs, vec![Placeholder; 2], vec![Placeholder; 2])
+            .build::<Vec<Constant>, Vec<Constant>>(outputs, vec![Placeholder; 2], vec![Placeholder; 2])
             .unwrap();
 
         let array = |values: &[f64]| {
             let bytes = values_to_bytes::<f64>(values);
-            XlaValue::Array(XlaArray::from_host_buffer(&domain, array_type.clone(), mesh.clone(), bytes).unwrap())
+            Value::Array(Array::from_host_buffer(&domain, array_type.clone(), mesh.clone(), bytes).unwrap())
         };
-        let read = |value: &XlaValue<'_>| {
-            let XlaValue::Array(array) = value else {
+        let read = |value: &Value<'_>| {
+            let Value::Array(array) = value else {
                 panic!("expected an array value");
             };
             let buffer = array.addressable_shards().next().unwrap().buffer().unwrap();
@@ -4410,29 +4332,25 @@ mod tests {
         // edge, because `Program::partition` keeps one edge per residual feeder.
         let r#type = ArrayIrType::Array(vector_type());
         let callee = {
-            let mut builder = ProgramBuilder::<XlaConstant, XlaOperation>::new();
+            let mut builder = CoreProgramBuilder::<Constant, Operation>::new();
             let a = builder.add_input(r#type.clone());
             let x = builder.add_input(r#type.clone());
             let sine = builder.add_instruction(SinOperation::new(), Vec::new(), vec![a], None).unwrap()[0];
             let product = builder.add_instruction(MulOperation::new(), Vec::new(), vec![sine, x], None).unwrap()[0];
             builder
-                .build::<Vec<XlaConstant>, Vec<XlaConstant>>(
-                    vec![sine, product],
-                    vec![Placeholder; 2],
-                    vec![Placeholder; 2],
-                )
+                .build::<Vec<Constant>, Vec<Constant>>(vec![sine, product], vec![Placeholder; 2], vec![Placeholder; 2])
                 .unwrap()
         };
-        let mut builder = ProgramBuilder::<XlaConstant, XlaOperation>::new();
+        let mut builder = CoreProgramBuilder::<Constant, Operation>::new();
         let a = builder.add_input(r#type.clone());
         let x = builder.add_input(r#type);
         let callee_region = builder.intern_callee(&Arc::new(callee), None).unwrap();
         let outputs = builder
-            .add_instruction(XlaOperation::JitCall(JitCallOperation::new(0)), vec![callee_region], vec![a, x], None)
+            .add_instruction(Operation::JitCall(JitCallOperation::new(0)), vec![callee_region], vec![a, x], None)
             .unwrap()
             .to_vec();
         let program = builder
-            .build::<Vec<XlaConstant>, Vec<XlaConstant>>(outputs, vec![Placeholder; 2], vec![Placeholder; 2])
+            .build::<Vec<Constant>, Vec<Constant>>(outputs, vec![Placeholder; 2], vec![Placeholder; 2])
             .unwrap();
         assert_eq!(
             program.partition(&[true, false]).unwrap().to_string(),
@@ -4474,30 +4392,30 @@ mod tests {
         // compacted or absent capture prefixes those indices would misname.
         let r#type = ArrayIrType::Array(vector_type());
         let callee = {
-            let mut builder = ProgramBuilder::<XlaConstant, XlaOperation>::new();
+            let mut builder = CoreProgramBuilder::<Constant, Operation>::new();
             let known_input = builder.add_input(r#type.clone());
             let runtime_input = builder.add_input(r#type.clone());
-            let captured = builder.add_constant(XlaConstant::Captured(CaptureReference::new(0, r#type.clone())));
+            let captured = builder.add_constant(Constant::Captured(CaptureReference::new(0, r#type.clone())));
             let shifted =
                 builder.add_instruction(AddOperation::new(), Vec::new(), vec![known_input, captured], None).unwrap()[0];
             let product = builder
                 .add_instruction(MulOperation::new(), Vec::new(), vec![shifted, runtime_input], None)
                 .unwrap()[0];
             builder
-                .build::<Vec<XlaConstant>, Vec<XlaConstant>>(
+                .build::<Vec<Constant>, Vec<Constant>>(
                     vec![shifted, product],
                     vec![Placeholder; 2],
                     vec![Placeholder; 2],
                 )
                 .unwrap()
         };
-        let mut builder = ProgramBuilder::<XlaConstant, XlaOperation>::new();
+        let mut builder = CoreProgramBuilder::<Constant, Operation>::new();
         let known_input = builder.add_input(r#type.clone());
         let runtime_input = builder.add_input(r#type.clone());
         let callee_region = builder.intern_callee(&Arc::new(callee), None).unwrap();
         let outputs = builder
             .add_instruction(
-                XlaOperation::JitCall(JitCallOperation::new(0)),
+                Operation::JitCall(JitCallOperation::new(0)),
                 vec![callee_region],
                 vec![known_input, runtime_input],
                 None,
@@ -4505,10 +4423,10 @@ mod tests {
             .unwrap()
             .to_vec();
         let program = builder
-            .build::<Vec<XlaConstant>, Vec<XlaConstant>>(outputs, vec![Placeholder; 2], vec![Placeholder; 2])
+            .build::<Vec<Constant>, Vec<Constant>>(outputs, vec![Placeholder; 2], vec![Placeholder; 2])
             .unwrap();
 
-        let outer = TracingContext::<XlaConstant, XlaOperation>::new();
+        let outer = TracingContext::<Constant, Operation>::new();
         let known = outer.input(r#type.clone());
         let evaluation = program
             .partially_evaluate_in_context(&outer, &[PartialValue::Known(known), PartialValue::Unknown(r#type)])
@@ -4519,7 +4437,7 @@ mod tests {
         assert!(outer.builder().borrow().instructions().is_empty());
         assert_eq!(evaluation.program().instructions().len(), 1);
         let residual_instruction = &evaluation.program().instructions()[0];
-        assert!(matches!(residual_instruction.operation(), XlaOperation::JitCall(_)));
+        assert!(matches!(residual_instruction.operation(), Operation::JitCall(_)));
         let residual_callee = evaluation.program().region_ref(residual_instruction.regions()[0]).unwrap().to_program();
         assert_eq!(residual_callee.instructions().len(), 2);
         assert!(
@@ -4534,7 +4452,7 @@ mod tests {
     fn test_jit_call_partial_evaluation_partitions_a_callee_with_a_dead_allocation() {
         let r#type = ArrayIrType::Array(vector_type());
         let callee = {
-            let mut builder = ProgramBuilder::<XlaConstant, XlaOperation>::new();
+            let mut builder = CoreProgramBuilder::<Constant, Operation>::new();
             let known_input = builder.add_input(r#type.clone());
             let runtime_input = builder.add_input(r#type.clone());
             builder.add_instruction(ReferenceNewOperation::new(), Vec::new(), vec![known_input], None).unwrap();
@@ -4545,7 +4463,7 @@ mod tests {
                 .add_instruction(MulOperation::new(), Vec::new(), vec![known_input, runtime_input], None)
                 .unwrap()[0];
             builder
-                .build::<Vec<XlaConstant>, Vec<XlaConstant>>(
+                .build::<Vec<Constant>, Vec<Constant>>(
                     vec![doubled, product],
                     vec![Placeholder; 2],
                     vec![Placeholder; 2],
@@ -4553,13 +4471,13 @@ mod tests {
                 .unwrap()
         };
 
-        let mut builder = ProgramBuilder::<XlaConstant, XlaOperation>::new();
+        let mut builder = CoreProgramBuilder::<Constant, Operation>::new();
         let known_input = builder.add_input(r#type.clone());
         let runtime_input = builder.add_input(r#type.clone());
         let callee_region = builder.intern_callee(&Arc::new(callee), None).unwrap();
         let outputs = builder
             .add_instruction(
-                XlaOperation::JitCall(JitCallOperation::new(0)),
+                Operation::JitCall(JitCallOperation::new(0)),
                 vec![callee_region],
                 vec![known_input, runtime_input],
                 None,
@@ -4567,13 +4485,13 @@ mod tests {
             .unwrap()
             .to_vec();
         let program = builder
-            .build::<Vec<XlaConstant>, Vec<XlaConstant>>(outputs, vec![Placeholder; 2], vec![Placeholder; 2])
+            .build::<Vec<Constant>, Vec<Constant>>(outputs, vec![Placeholder; 2], vec![Placeholder; 2])
             .unwrap();
 
         // The callee partitions like any other: its pure prefix over the known input folds into the known side
         // (staged into the outer trace) while the runtime-dependent product stays in the residual callee, and the
         // allocation, which nothing observes, is a dead intrinsic-state operation that neither side retains.
-        let outer = TracingContext::<XlaConstant, XlaOperation>::new();
+        let outer = TracingContext::<Constant, Operation>::new();
         let known = outer.input(r#type.clone());
         let evaluation = program
             .partially_evaluate_in_context(&outer, &[PartialValue::Known(known), PartialValue::Unknown(r#type)])
@@ -4591,7 +4509,7 @@ mod tests {
             .builder()
             .borrow()
             .clone()
-            .build::<Vec<XlaConstant>, Vec<XlaConstant>>(Vec::new(), vec![Placeholder], Vec::new())
+            .build::<Vec<Constant>, Vec<Constant>>(Vec::new(), vec![Placeholder], Vec::new())
             .unwrap();
         let known_names = known_program
             .entry_region_ref()
@@ -4628,33 +4546,33 @@ mod tests {
         // policy then plans the callee partition: the known call returns the dot product instead of its cosine, and
         // the residual call recomputes the cosine.
         let callee = {
-            let mut builder = ProgramBuilder::<XlaConstant, XlaOperation>::new();
+            let mut builder = CoreProgramBuilder::<Constant, Operation>::new();
             let x = builder.add_input(ArrayIrType::Array(vector_type()));
             let t = builder.add_input(ArrayIrType::Array(ArrayType::scalar(DataType::F64)));
-            let dot = ArrayOperation::<XlaArrayConstant>::from(DotOperation::new(DotDimensionNumbers::new(
+            let dot = ArrayOperation::<ArrayConstant>::from(DotOperation::new(DotDimensionNumbers::new(
                 vec![0],
                 vec![0],
                 vec![],
                 vec![],
             )));
             let product = builder.add_instruction(dot, Vec::new(), vec![x, x], None).unwrap()[0];
-            let cosine = ArrayOperation::<XlaArrayConstant>::from(CosOperation::<ArrayType>::new());
+            let cosine = ArrayOperation::<ArrayConstant>::from(CosOperation::<ArrayType>::new());
             let cosine = builder.add_instruction(cosine, Vec::new(), vec![product], None).unwrap()[0];
-            let tangent = ArrayOperation::<XlaArrayConstant>::from(MulOperation::<ArrayType>::new());
+            let tangent = ArrayOperation::<ArrayConstant>::from(MulOperation::<ArrayType>::new());
             let tangent = builder.add_instruction(tangent, Vec::new(), vec![cosine, t], None).unwrap()[0];
             builder
-                .build::<Vec<XlaConstant>, Vec<XlaConstant>>(vec![tangent], vec![Placeholder; 2], vec![Placeholder])
+                .build::<Vec<Constant>, Vec<Constant>>(vec![tangent], vec![Placeholder; 2], vec![Placeholder])
                 .unwrap()
         };
-        let mut builder = ProgramBuilder::<XlaConstant, XlaOperation>::new();
+        let mut builder = CoreProgramBuilder::<Constant, Operation>::new();
         let x = builder.add_input(ArrayIrType::Array(vector_type()));
         let t = builder.add_input(ArrayIrType::Array(ArrayType::scalar(DataType::F64)));
         let callee_region = builder.intern_callee(&Arc::new(callee), None).unwrap();
         let output = builder
-            .add_instruction(XlaOperation::JitCall(JitCallOperation::new(0)), vec![callee_region], vec![x, t], None)
+            .add_instruction(Operation::JitCall(JitCallOperation::new(0)), vec![callee_region], vec![x, t], None)
             .unwrap()[0];
         let program = builder
-            .build::<Vec<XlaConstant>, Vec<XlaConstant>>(vec![output], vec![Placeholder; 2], vec![Placeholder])
+            .build::<Vec<Constant>, Vec<Constant>>(vec![output], vec![Placeholder; 2], vec![Placeholder])
             .unwrap();
         let partition = program
             .partition_with_residual_policy(&[true, false], &ResidualPolicyReference::new(SaveDots))
@@ -4705,7 +4623,7 @@ mod tests {
         // scale to the policy, saving 4 KiB instead of 256 KiB and replaying only the broadcast.
         let compact_type = ArrayType::new_static(DataType::F32, [1024]);
         let expanded_type = ArrayType::new_static(DataType::F32, [64, 1024]);
-        let mut builder = ArrayIrXlaProgramBuilder::new();
+        let mut builder = ArrayIrProgramBuilder::new();
         let weights = builder.add_input(compact_type.clone().into());
         let scale = builder.add_instruction(SinOperation::new(), Vec::new(), vec![weights], None).unwrap()[0];
         let scale = builder
@@ -4715,24 +4633,24 @@ mod tests {
             .add_instruction(BroadcastOperation::new(expanded_type.clone(), vec![1]), Vec::new(), vec![scale], None)
             .unwrap()[0];
         let callee = builder
-            .build::<Vec<XlaConstant>, Vec<XlaConstant>>(vec![expanded], vec![Placeholder], vec![Placeholder])
+            .build::<Vec<Constant>, Vec<Constant>>(vec![expanded], vec![Placeholder], vec![Placeholder])
             .unwrap();
-        let mut builder = ArrayIrXlaProgramBuilder::new();
+        let mut builder = ArrayIrProgramBuilder::new();
         let input = builder.add_input(expanded_type.clone().into());
         let weights = builder.add_input(compact_type.clone().into());
         let callee = builder.import_program(callee);
         let scale = builder
-            .add_instruction(XlaOperation::JitCall(JitCallOperation::new(0)), vec![callee], vec![weights], None)
+            .add_instruction(Operation::JitCall(JitCallOperation::new(0)), vec![callee], vec![weights], None)
             .unwrap()[0];
         let output = builder.add_instruction(MulOperation::new(), Vec::new(), vec![input, scale], None).unwrap()[0];
         let program = builder
-            .build::<Vec<XlaConstant>, Vec<XlaConstant>>(vec![output], vec![Placeholder; 2], vec![Placeholder])
+            .build::<Vec<Constant>, Vec<Constant>>(vec![output], vec![Placeholder; 2], vec![Placeholder])
             .unwrap();
 
         // Ordinary partial evaluation preserves the original compiled-call boundary and expanded residual.
         let ordinary = program.partition(&[false, true]).unwrap();
         assert_eq!(ordinary.known_program().output_types(), vec![ArrayIrType::from(expanded_type.clone())]);
-        assert!(matches!(ordinary.known_program().instructions()[0].operation(), XlaOperation::JitCall(_)));
+        assert!(matches!(ordinary.known_program().instructions()[0].operation(), Operation::JitCall(_)));
         assert_eq!(expanded_type.element_count().unwrap().unwrap() * size_of::<f32>(), 262_144);
 
         let policy = ResidualPolicyReference::new(SaveOnlyTheseNames::new(["scale"]));
@@ -4763,7 +4681,7 @@ mod tests {
 
         // The same cut survives the rematerialization wrapper's linearization, where the original output remains a
         // known primal result and the expanded scale is needed only by the derivative with respect to the activation.
-        let mut builder = ArrayIrXlaProgramBuilder::new();
+        let mut builder = ArrayIrProgramBuilder::new();
         let input = builder.add_input(expanded_type.clone().into());
         let weights = builder.add_input(compact_type.clone().into());
         let plain_linearization = program.linearize_with_respect_to(&[0]).unwrap();
@@ -4772,7 +4690,7 @@ mod tests {
             .add_instruction(RematerializeOperation::new(policy), vec![body], vec![input, weights], None)
             .unwrap()[0];
         let program = builder
-            .build::<Vec<XlaConstant>, Vec<XlaConstant>>(vec![output], vec![Placeholder; 2], vec![Placeholder])
+            .build::<Vec<Constant>, Vec<Constant>>(vec![output], vec![Placeholder; 2], vec![Placeholder])
             .unwrap();
         let linearization = program.linearize_with_respect_to(&[0]).unwrap();
         assert_eq!(linearization.residual_count(), 1);
@@ -4805,7 +4723,7 @@ mod tests {
         let inputs = vec![vec![2f32; 64 * 1024], (0..1024).map(|index| 0.1f32 + index as f32 * 1e-4).collect()];
         let direction = vec![0.75f32; 64 * 1024];
         let cotangent = vec![1.5f32; 64 * 1024];
-        let evaluate = |linearization: &Linearization<XlaConstant, XlaOperation>| {
+        let evaluate = |linearization: &Linearization<Constant, Operation>| {
             let mut primal = execute_f32_program(&client, linearization.primal(), inputs.clone());
             let value = primal.remove(0);
             let tangent_inputs = std::iter::once(direction.clone()).chain(primal.clone()).collect();
@@ -4825,7 +4743,7 @@ mod tests {
         use ryft_core::{RematerializationPolicyFn, ResidualPolicyError};
 
         let scalar_type = ArrayIrType::from(ArrayType::scalar(DataType::F32));
-        let mut builder = ArrayIrXlaProgramBuilder::new();
+        let mut builder = ArrayIrProgramBuilder::new();
         let input = builder.add_input(scalar_type.clone());
         let sine = builder.add_instruction(SinOperation::new(), Vec::new(), vec![input], None).unwrap()[0];
         let needed = builder
@@ -4836,14 +4754,14 @@ mod tests {
             .add_instruction(TagOperation::<ArrayType>::new("unused"), Vec::new(), vec![cosine], None)
             .unwrap()[0];
         let callee = builder
-            .build::<Vec<XlaConstant>, Vec<XlaConstant>>(vec![needed, unused], vec![Placeholder], vec![Placeholder; 2])
+            .build::<Vec<Constant>, Vec<Constant>>(vec![needed, unused], vec![Placeholder], vec![Placeholder; 2])
             .unwrap();
-        let mut builder = ArrayIrXlaProgramBuilder::new();
+        let mut builder = ArrayIrProgramBuilder::new();
         let known = builder.add_input(scalar_type.clone());
         let unknown = builder.add_input(scalar_type.clone());
         let callee = builder.import_program(callee);
         let called = builder
-            .add_instruction(XlaOperation::JitCall(JitCallOperation::new(0)), vec![callee], vec![known], None)
+            .add_instruction(Operation::JitCall(JitCallOperation::new(0)), vec![callee], vec![known], None)
             .unwrap()
             .to_vec();
         let first =
@@ -4851,7 +4769,7 @@ mod tests {
         let second =
             builder.add_instruction(MulOperation::new(), Vec::new(), vec![called[1], unknown], None).unwrap()[0];
         let program = builder
-            .build::<Vec<XlaConstant>, Vec<XlaConstant>>(
+            .build::<Vec<Constant>, Vec<Constant>>(
                 vec![first, second, called[1]],
                 vec![Placeholder; 2],
                 vec![Placeholder; 3],
@@ -4915,8 +4833,8 @@ mod tests {
         use ryft_core::{NothingSavable, PartialEvaluationContext};
 
         let policy = ResidualPolicyReference::new(NothingSavable);
-        let check_boundary = |callee: XlaProgram<Vec<XlaConstant>, Vec<XlaConstant>>, capture_count: usize| {
-            let mut builder = ArrayIrXlaProgramBuilder::new();
+        let check_boundary = |callee: Program<Vec<Constant>, Vec<Constant>>, capture_count: usize| {
+            let mut builder = ArrayIrProgramBuilder::new();
             let inputs = callee
                 .input_types()
                 .into_owned()
@@ -4926,17 +4844,12 @@ mod tests {
             let input_count = inputs.len();
             let callee = builder.import_program(callee);
             let outputs = builder
-                .add_instruction(
-                    XlaOperation::JitCall(JitCallOperation::new(capture_count)),
-                    vec![callee],
-                    inputs,
-                    None,
-                )
+                .add_instruction(Operation::JitCall(JitCallOperation::new(capture_count)), vec![callee], inputs, None)
                 .unwrap()
                 .to_vec();
             let output_count = outputs.len();
             let program = builder
-                .build::<Vec<XlaConstant>, Vec<XlaConstant>>(
+                .build::<Vec<Constant>, Vec<Constant>>(
                     outputs,
                     vec![Placeholder; input_count],
                     vec![Placeholder; output_count],
@@ -4949,63 +4862,63 @@ mod tests {
 
         // Nominal dimensions remain scoped to the call, even when the callee is otherwise pure.
         let dimension = DimensionVariable::new("length", DimensionBounds::new(1, Some(8)).unwrap());
-        let dynamic_type = ArrayType::new(DataType::F32, Shape::new(vec![Dimension::Dynamic(dimension)]));
-        let mut builder = ArrayIrXlaProgramBuilder::new();
+        let dynamic_type = ArrayType::new(DataType::F32, Shape::new(vec![CoreDimension::Dynamic(dimension)]));
+        let mut builder = ArrayIrProgramBuilder::new();
         let input = builder.add_input(dynamic_type.into());
         let output = builder.add_instruction(SinOperation::new(), Vec::new(), vec![input], None).unwrap()[0];
         check_boundary(
             builder
-                .build::<Vec<XlaConstant>, Vec<XlaConstant>>(vec![output], vec![Placeholder], vec![Placeholder])
+                .build::<Vec<Constant>, Vec<Constant>>(vec![output], vec![Placeholder], vec![Placeholder])
                 .unwrap(),
             0,
         );
 
         // An ordered assertion must keep the same owning call and execution order.
         let predicate_type = ArrayIrType::from(ArrayType::scalar(DataType::Boolean));
-        let mut builder = ArrayIrXlaProgramBuilder::new();
+        let mut builder = ArrayIrProgramBuilder::new();
         let predicate = builder.add_input(predicate_type.clone());
         builder
             .add_instruction(AssertOperation::<ArrayType>::new("required predicate"), Vec::new(), vec![predicate], None)
             .unwrap();
         check_boundary(
             builder
-                .build::<Vec<XlaConstant>, Vec<XlaConstant>>(vec![predicate], vec![Placeholder], vec![Placeholder])
+                .build::<Vec<Constant>, Vec<Constant>>(vec![predicate], vec![Placeholder], vec![Placeholder])
                 .unwrap(),
             0,
         );
 
         // Reference handles and retained capture constants keep their existing boundary semantics too.
-        let mut builder = ArrayIrXlaProgramBuilder::new();
+        let mut builder = ArrayIrProgramBuilder::new();
         let reference = builder.add_input(ArrayIrType::Reference(ReferenceType::new(ArrayType::scalar(DataType::F32))));
         check_boundary(
             builder
-                .build::<Vec<XlaConstant>, Vec<XlaConstant>>(vec![reference], vec![Placeholder], vec![Placeholder])
+                .build::<Vec<Constant>, Vec<Constant>>(vec![reference], vec![Placeholder], vec![Placeholder])
                 .unwrap(),
             0,
         );
-        let mut builder = ArrayIrXlaProgramBuilder::new();
+        let mut builder = ArrayIrProgramBuilder::new();
         builder.add_input(predicate_type.clone());
-        let captured = builder.add_constant(XlaConstant::Captured(CaptureReference::new(0, predicate_type.clone())));
+        let captured = builder.add_constant(Constant::Captured(CaptureReference::new(0, predicate_type.clone())));
         check_boundary(
             builder
-                .build::<Vec<XlaConstant>, Vec<XlaConstant>>(vec![captured], vec![Placeholder], vec![Placeholder])
+                .build::<Vec<Constant>, Vec<Constant>>(vec![captured], vec![Placeholder], vec![Placeholder])
                 .unwrap(),
             1,
         );
 
         // A known value without a staged parent atom must not trigger per-operation replay. The same guard keeps
         // concrete eager calls whole; using a literal in a live trace makes the retained call directly observable.
-        let mut builder = ArrayIrXlaProgramBuilder::new();
+        let mut builder = ArrayIrProgramBuilder::new();
         let input = builder.add_input(predicate_type);
         let callee = builder
-            .build::<Vec<XlaConstant>, Vec<XlaConstant>>(vec![input], vec![Placeholder], vec![Placeholder])
+            .build::<Vec<Constant>, Vec<Constant>>(vec![input], vec![Placeholder], vec![Placeholder])
             .unwrap();
-        let outer = TracingContext::<XlaConstant, XlaOperation>::new();
+        let outer = TracingContext::<Constant, Operation>::new();
         let context = PartialEvaluationContext::new(outer.clone()).with_residual_policy(&policy);
-        let input = context.lift(XlaConstant::Boolean(true)).unwrap();
-        context.bind(XlaOperation::JitCall(JitCallOperation::new(0)), vec![callee], &[input]).unwrap();
+        let input = context.lift(Constant::Boolean(true)).unwrap();
+        context.bind(Operation::JitCall(JitCallOperation::new(0)), vec![callee], &[input]).unwrap();
         assert_eq!(outer.builder().borrow().instructions().len(), 1);
-        assert!(matches!(outer.builder().borrow().instructions()[0].operation(), XlaOperation::JitCall(_)));
+        assert!(matches!(outer.builder().borrow().instructions()[0].operation(), Operation::JitCall(_)));
     }
 
     #[test]
@@ -5015,18 +4928,18 @@ mod tests {
         // reference-typed atom anywhere in the resulting program.
         let reference_type = ReferenceType::new(vector_type());
         let inner_callee = {
-            let mut builder = ProgramBuilder::<XlaConstant, XlaOperation>::new();
+            let mut builder = CoreProgramBuilder::<Constant, Operation>::new();
             let reference = builder.add_input(reference_type.clone().into());
             let replacement = builder.add_input(vector_type().into());
             let snapshot = builder
                 .add_instruction(ReferenceSwapOperation::new(), Vec::new(), vec![reference, replacement], None)
                 .unwrap()[0];
             builder
-                .build::<Vec<XlaConstant>, Vec<XlaConstant>>(vec![snapshot], vec![Placeholder; 2], vec![Placeholder])
+                .build::<Vec<Constant>, Vec<Constant>>(vec![snapshot], vec![Placeholder; 2], vec![Placeholder])
                 .unwrap()
         };
         let callee = {
-            let mut builder = ProgramBuilder::<XlaConstant, XlaOperation>::new();
+            let mut builder = CoreProgramBuilder::<Constant, Operation>::new();
             let inner_callee = builder.import_region(inner_callee.entry_region_ref());
             let first_reference = builder.add_input(reference_type.clone().into());
             let first_replacement = builder.add_input(vector_type().into());
@@ -5034,7 +4947,7 @@ mod tests {
             let second_replacement = builder.add_input(vector_type().into());
             let first_snapshot = builder
                 .add_instruction(
-                    XlaOperation::JitCall(JitCallOperation::new(0)),
+                    Operation::JitCall(JitCallOperation::new(0)),
                     vec![inner_callee],
                     vec![first_reference, first_replacement],
                     None,
@@ -5042,14 +4955,14 @@ mod tests {
                 .unwrap()[0];
             let second_snapshot = builder
                 .add_instruction(
-                    XlaOperation::JitCall(JitCallOperation::new(0)),
+                    Operation::JitCall(JitCallOperation::new(0)),
                     vec![inner_callee],
                     vec![second_reference, second_replacement],
                     None,
                 )
                 .unwrap()[0];
             builder
-                .build::<Vec<XlaConstant>, Vec<XlaConstant>>(
+                .build::<Vec<Constant>, Vec<Constant>>(
                     vec![first_snapshot, second_snapshot],
                     vec![Placeholder; 4],
                     vec![Placeholder; 2],
@@ -5057,7 +4970,7 @@ mod tests {
                 .unwrap()
         };
 
-        let mut builder = ProgramBuilder::<XlaConstant, XlaOperation>::new();
+        let mut builder = CoreProgramBuilder::<Constant, Operation>::new();
         let callee = builder.import_region(callee.entry_region_ref());
         let first_reference = builder.add_input(reference_type.clone().into());
         let first_replacement = builder.add_input(vector_type().into());
@@ -5065,7 +4978,7 @@ mod tests {
         let second_replacement = builder.add_input(vector_type().into());
         let snapshots = builder
             .add_instruction(
-                XlaOperation::JitCall(JitCallOperation::new(0)),
+                Operation::JitCall(JitCallOperation::new(0)),
                 vec![callee],
                 vec![first_reference, first_replacement, second_reference, second_replacement],
                 None,
@@ -5073,7 +4986,7 @@ mod tests {
             .unwrap()
             .to_vec();
         let program = builder
-            .build::<Vec<XlaConstant>, Vec<XlaConstant>>(snapshots, vec![Placeholder; 4], vec![Placeholder; 2])
+            .build::<Vec<Constant>, Vec<Constant>>(snapshots, vec![Placeholder; 4], vec![Placeholder; 2])
             .unwrap();
 
         let discharged = program.discharge_references(0).unwrap();
@@ -5095,9 +5008,9 @@ mod tests {
         // the caller's second public input, and only that mutated state gains a final-state output.
         let reference_type = ReferenceType::new(vector_type());
         let branch = {
-            let mut builder = ProgramBuilder::<XlaConstant, XlaOperation>::new();
+            let mut builder = CoreProgramBuilder::<Constant, Operation>::new();
             let replacement = builder.add_input(vector_type().into());
-            let reference = builder.add_constant(XlaConstant::Captured(CaptureReference::new(
+            let reference = builder.add_constant(Constant::Captured(CaptureReference::new(
                 0,
                 ArrayIrType::Reference(reference_type.clone()),
             )));
@@ -5105,11 +5018,11 @@ mod tests {
                 .add_instruction(ReferenceSwapOperation::new(), Vec::new(), vec![reference, replacement], None)
                 .unwrap()[0];
             builder
-                .build::<Vec<XlaConstant>, Vec<XlaConstant>>(vec![snapshot], vec![Placeholder], vec![Placeholder])
+                .build::<Vec<Constant>, Vec<Constant>>(vec![snapshot], vec![Placeholder], vec![Placeholder])
                 .unwrap()
         };
         let callee = {
-            let mut builder = ProgramBuilder::<XlaConstant, XlaOperation>::new();
+            let mut builder = CoreProgramBuilder::<Constant, Operation>::new();
             let branch = builder.import_region(branch.entry_region_ref());
             builder.add_input(reference_type.clone().into());
             let replacement = builder.add_input(vector_type().into());
@@ -5118,11 +5031,11 @@ mod tests {
                 .add_instruction(ConditionOperation::new(), vec![branch, branch], vec![predicate, replacement], None)
                 .unwrap()[0];
             builder
-                .build::<Vec<XlaConstant>, Vec<XlaConstant>>(vec![snapshot], vec![Placeholder; 3], vec![Placeholder])
+                .build::<Vec<Constant>, Vec<Constant>>(vec![snapshot], vec![Placeholder; 3], vec![Placeholder])
                 .unwrap()
         };
 
-        let mut builder = ProgramBuilder::<XlaConstant, XlaOperation>::new();
+        let mut builder = CoreProgramBuilder::<Constant, Operation>::new();
         let callee = builder.import_region(callee.entry_region_ref());
         builder.add_input(reference_type.clone().into());
         let reference = builder.add_input(reference_type.into());
@@ -5130,14 +5043,14 @@ mod tests {
         let predicate = builder.add_input(ArrayType::scalar(DataType::Boolean).into());
         let snapshot = builder
             .add_instruction(
-                XlaOperation::JitCall(JitCallOperation::new(1)),
+                Operation::JitCall(JitCallOperation::new(1)),
                 vec![callee],
                 vec![reference, replacement, predicate],
                 None,
             )
             .unwrap()[0];
         let program = builder
-            .build::<Vec<XlaConstant>, Vec<XlaConstant>>(vec![snapshot], vec![Placeholder; 4], vec![Placeholder])
+            .build::<Vec<Constant>, Vec<Constant>>(vec![snapshot], vec![Placeholder; 4], vec![Placeholder])
             .unwrap();
 
         let discharged = program.discharge_references_in_capture_lifted_program(0).unwrap();
@@ -5155,22 +5068,22 @@ mod tests {
     #[test]
     fn test_jit_call_reference_discharge_preserves_forwarded_root_identity() {
         let reference_type = ReferenceType::new(vector_type());
-        let mut callee_builder = ProgramBuilder::<XlaConstant, XlaOperation>::new();
+        let mut callee_builder = CoreProgramBuilder::<Constant, Operation>::new();
         let reference = callee_builder.add_input(reference_type.clone().into());
         let callee = callee_builder
-            .build::<Vec<XlaConstant>, Vec<XlaConstant>>(vec![reference], vec![Placeholder], vec![Placeholder])
+            .build::<Vec<Constant>, Vec<Constant>>(vec![reference], vec![Placeholder], vec![Placeholder])
             .unwrap();
 
-        let mut builder = ProgramBuilder::<XlaConstant, XlaOperation>::new();
+        let mut builder = CoreProgramBuilder::<Constant, Operation>::new();
         let callee = builder.import_region(callee.entry_region_ref());
         let reference = builder.add_input(reference_type.into());
         let forwarded = builder
-            .add_instruction(XlaOperation::JitCall(JitCallOperation::new(0)), vec![callee], vec![reference], None)
+            .add_instruction(Operation::JitCall(JitCallOperation::new(0)), vec![callee], vec![reference], None)
             .unwrap()[0];
         let value =
             builder.add_instruction(ReferenceReadOperation::new(), Vec::new(), vec![forwarded], None).unwrap()[0];
         let program = builder
-            .build::<Vec<XlaConstant>, Vec<XlaConstant>>(vec![value], vec![Placeholder], vec![Placeholder])
+            .build::<Vec<Constant>, Vec<Constant>>(vec![value], vec![Placeholder], vec![Placeholder])
             .unwrap();
 
         // The callee only forwards its reference input, so discharge must keep the forwarded value bound to the same
@@ -5193,31 +5106,27 @@ mod tests {
         // operand and output contract. The callee mutates the root and returns only the previous snapshot, so the
         // final state is exactly what the call site would otherwise have lost.
         let reference_type = ReferenceType::new(ArrayType::scalar(DataType::F32));
-        let mut callee_builder = ProgramBuilder::<XlaConstant, XlaOperation>::new();
+        let mut callee_builder = CoreProgramBuilder::<Constant, Operation>::new();
         let callee_reference = callee_builder.add_input(reference_type.into());
         let callee_update = callee_builder.add_input(ArrayType::scalar(DataType::F32).into());
         let previous = callee_builder
             .add_instruction(ReferenceSwapOperation::new(), Vec::new(), vec![callee_reference, callee_update], None)
             .unwrap()[0];
         let callee = callee_builder
-            .build::<Vec<XlaConstant>, Vec<XlaConstant>>(vec![previous], vec![Placeholder; 2], vec![Placeholder])
+            .build::<Vec<Constant>, Vec<Constant>>(vec![previous], vec![Placeholder; 2], vec![Placeholder])
             .unwrap();
 
-        let mut builder = ProgramBuilder::<XlaConstant, XlaOperation>::new();
+        let mut builder = CoreProgramBuilder::<Constant, Operation>::new();
         let callee = builder.import_program(callee);
         let initial = builder.add_input(ArrayType::scalar(DataType::F32).into());
         let update = builder.add_input(ArrayType::scalar(DataType::F32).into());
         let root = builder.add_instruction(ReferenceNewOperation::new(), Vec::new(), vec![initial], None).unwrap()[0];
         let previous = builder
-            .add_instruction(XlaOperation::JitCall(JitCallOperation::new(0)), vec![callee], vec![root, update], None)
+            .add_instruction(Operation::JitCall(JitCallOperation::new(0)), vec![callee], vec![root, update], None)
             .unwrap()[0];
         let frozen = builder.add_instruction(ReferenceFreezeOperation::new(), Vec::new(), vec![root], None).unwrap()[0];
         let source = builder
-            .build::<Vec<XlaConstant>, Vec<XlaConstant>>(
-                vec![previous, frozen],
-                vec![Placeholder; 2],
-                vec![Placeholder; 2],
-            )
+            .build::<Vec<Constant>, Vec<Constant>>(vec![previous, frozen], vec![Placeholder; 2], vec![Placeholder; 2])
             .unwrap();
 
         // The callee's local root is allocated, mutated, and consumed inside the call, so widening the boundary
@@ -5235,7 +5144,7 @@ mod tests {
         };
 
         use crate::tests::{execution_client, values_from_bytes, values_to_bytes};
-        use crate::{CompiledXlaFunction, FromPjrt, XlaSession};
+        use crate::{CompiledFunction, FromPjrt, Session};
 
         // The callee mutates a reference and returns a dimension that it defines itself, so the call instantiates a
         // fresh result identity. Discharge widens the callee with the reference state, which must not leave the
@@ -5244,14 +5153,14 @@ mod tests {
         let device = Device::from_pjrt(client.addressable_devices().unwrap().remove(0)).unwrap();
         let logical_mesh = LogicalMesh::new(vec![MeshAxis::new("x", 1, MeshAxisType::Auto).unwrap()]).unwrap();
         let mesh = DeviceMesh::new(logical_mesh.clone(), vec![device]).unwrap();
-        let domain = XlaSession::new(&client).domain();
+        let domain = Session::new(&client).domain();
         let value_type = ArrayType::scalar(DataType::F32).with_sharding(Sharding::replicated(logical_mesh.clone(), 0));
         let value_type = value_type.unwrap();
         let extent_type = ArrayType::scalar(DataType::I64).with_sharding(Sharding::replicated(logical_mesh, 0));
         let extent_type = extent_type.unwrap();
         let rows = DimensionType::from(DimensionVariable::new("rows", DimensionBounds::non_negative(Some(8)).unwrap()));
 
-        let mut callee_builder = ProgramBuilder::<XlaConstant, XlaOperation>::new();
+        let mut callee_builder = CoreProgramBuilder::<Constant, Operation>::new();
         let reference = callee_builder.add_input(ReferenceType::new(value_type.clone()).into());
         let update = callee_builder.add_input(value_type.clone().into());
         let extent = callee_builder.add_input(extent_type.clone().into());
@@ -5262,7 +5171,7 @@ mod tests {
             .add_instruction(DimensionFromScalarOperation::new(rows.clone()), Vec::new(), vec![extent], None)
             .unwrap()[0];
         let callee = callee_builder
-            .build::<Vec<XlaConstant>, Vec<XlaConstant>>(
+            .build::<Vec<Constant>, Vec<Constant>>(
                 vec![previous, dimension],
                 vec![Placeholder; 3],
                 vec![Placeholder; 2],
@@ -5272,21 +5181,21 @@ mod tests {
             .with_callee_type_signature(&callee.input_types(), &callee.output_types())
             .unwrap();
 
-        let mut builder = ProgramBuilder::<XlaConstant, XlaOperation>::new();
+        let mut builder = CoreProgramBuilder::<Constant, Operation>::new();
         let callee = builder.import_program(callee);
         let initial = builder.add_input(value_type.clone().into());
         let update = builder.add_input(value_type.clone().into());
         let extent = builder.add_input(extent_type.clone().into());
         let root = builder.add_instruction(ReferenceNewOperation::new(), Vec::new(), vec![initial], None).unwrap()[0];
         let outputs = builder
-            .add_instruction(XlaOperation::JitCall(operation), vec![callee], vec![root, update, extent], None)
+            .add_instruction(Operation::JitCall(operation), vec![callee], vec![root, update, extent], None)
             .unwrap()
             .to_vec();
         let frozen = builder.add_instruction(ReferenceFreezeOperation::new(), Vec::new(), vec![root], None).unwrap()[0];
         let extent =
             builder.add_instruction(DimensionToScalarOperation, Vec::new(), vec![outputs[1]], None).unwrap()[0];
         let source = builder
-            .build::<Vec<XlaConstant>, Vec<XlaConstant>>(
+            .build::<Vec<Constant>, Vec<Constant>>(
                 vec![outputs[0], extent, frozen],
                 vec![Placeholder; 3],
                 vec![Placeholder; 3],
@@ -5315,7 +5224,7 @@ mod tests {
         assert_ne!(program.atoms()[call.outputs()[1].index()].r#type().as_ref(), &ArrayIrType::Dimension(rows));
 
         // Execute the discharged program on CPU, with the call staged inside one compiled function.
-        let compiled: CompiledXlaFunction<'_, (ArrayType, ArrayType, ArrayType), (ArrayType, ArrayType, ArrayType)> =
+        let compiled: CompiledFunction<'_, (ArrayType, ArrayType, ArrayType), (ArrayType, ArrayType, ArrayType)> =
             crate::compile(
                 |(initial, update, extent)| {
                     let initial = initial.into_value();
@@ -5331,7 +5240,7 @@ mod tests {
             )
             .unwrap();
         let array = |r#type: &ArrayType, bytes: Vec<u8>| {
-            XlaArray::from_host_buffer(&domain, r#type.clone(), mesh.clone(), bytes).unwrap()
+            Array::from_host_buffer(&domain, r#type.clone(), mesh.clone(), bytes).unwrap()
         };
         let (previous, extent, state) = domain
             .interpret(
@@ -5343,7 +5252,7 @@ mod tests {
                 ),
             )
             .unwrap();
-        let read = |array: &XlaArray<'_>| {
+        let read = |array: &Array<'_>| {
             array
                 .addressable_shards()
                 .next()

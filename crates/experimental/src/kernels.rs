@@ -583,7 +583,7 @@ mod gpu {
 
     use ryft_core::{Device, DeviceMesh, LogicalMesh, MeshAxis, MeshAxisType, ProgramError, ProjectedValue, Typed};
     use ryft_kernels::{KernelExtension as PortableKernelExtension, KernelOperation, KernelSchedule};
-    use ryft_mosaic::kernels::gpu::{Compiler, GpuOperation, Options, Target};
+    use ryft_mosaic::kernels::gpu::{Compiler, GpuOperation, Options as MosaicOptions, Target};
     use ryft_xla::kernels::{KernelCompilerBinding, KernelExtension, MosaicGpuEmbedding, stage_kernel};
     use ryft_xla::{CompileTracer, CompiledFunction, Error, FromPjrt, Options, Session, compile_with_options};
 
@@ -602,7 +602,7 @@ mod gpu {
                 let binding = KernelCompilerBinding::new(
                     Compiler,
                     device_target(&client),
-                    Options::default(),
+                    MosaicOptions::default(),
                     KernelSchedule::default(),
                     MosaicGpuEmbedding,
                     1024,
@@ -629,7 +629,7 @@ mod gpu {
     pub(super) fn execute_case<'c>(
         client: &'c crate::Client<'c>,
         case: KernelCase,
-        options: Options,
+        options: MosaicOptions,
     ) -> Result<Vec<f32>, Error> {
         eprintln!(
             "Mosaic {}: semantic={}",
@@ -653,7 +653,7 @@ mod gpu {
         input_types: Vec<ArrayType>,
         input_bytes: Vec<Vec<u8>>,
         target: Target,
-        options: Options,
+        options: MosaicOptions,
         iterations: usize,
     ) -> Result<Vec<f32>, Error>
     where
@@ -754,7 +754,7 @@ mod gpu {
                 };
                 interpret_case(&case);
                 let expected = case.expected.clone();
-                assert_eq!(execute_case(&client, case, Options::default()).unwrap(), expected, "{name}");
+                assert_eq!(execute_case(&client, case, MosaicOptions::default()).unwrap(), expected, "{name}");
             }
         });
     }
@@ -941,7 +941,7 @@ mod gpu {
                         input_types,
                         input_bytes,
                         device_target(&client),
-                        Options::default(),
+                        MosaicOptions::default(),
                         1,
                     );
                     if invalid_metadata {
@@ -976,7 +976,7 @@ mod gpu {
                 let case = async_copy_case(&[128]);
                 interpret_case(&case);
                 let expected = case.expected.clone();
-                assert_eq!(execute_case(&client, case, Options::default().with_tma(true)).unwrap(), expected);
+                assert_eq!(execute_case(&client, case, MosaicOptions::default().with_tma(true)).unwrap(), expected);
             }
         });
     }
@@ -1002,7 +1002,7 @@ mod gpu {
                         case.input_types,
                         bytes,
                         device_target(&client),
-                        Options::default().with_tma(tma),
+                        MosaicOptions::default().with_tma(tma),
                         32,
                     )
                     .unwrap();
@@ -1057,7 +1057,7 @@ mod gpu {
                         vec![r#type.clone()],
                         vec![bytes.clone()],
                         target,
-                        Options::default(),
+                        MosaicOptions::default(),
                         1,
                     )
                     .unwrap();
@@ -1075,7 +1075,7 @@ mod gpu {
                     case.input_types,
                     bytes,
                     device_target(&client).with_blocks_per_cluster(2).unwrap(),
-                    Options::default(),
+                    MosaicOptions::default(),
                     1,
                 )
                 .unwrap();
@@ -1113,7 +1113,7 @@ mod gpu {
                 for case in generated_vector_cases() {
                     let expected = case.expected.clone();
                     let name = case.name;
-                    let actual = execute_case(&client, case, Options::default()).unwrap();
+                    let actual = execute_case(&client, case, MosaicOptions::default()).unwrap();
                     assert_eq!(actual, expected, "{name}");
                 }
                 executed = true;
@@ -1157,7 +1157,7 @@ mod gpu {
             if matches!(platform, TestPlatform::Cuda12 | TestPlatform::Cuda13) {
                 let case = attention_case();
                 let expected = case.expected.clone();
-                let actual = execute_case(&client, case, Options::default()).unwrap();
+                let actual = execute_case(&client, case, MosaicOptions::default()).unwrap();
                 check_attention(&actual, &expected);
             }
         });
@@ -1179,7 +1179,13 @@ mod gpu {
             .with_maximum_shared_memory_bytes(192 * 1024)
             .unwrap();
         let module = Compiler
-            .module(&context, &kernel, &target, &Options::default().with_mma(Mma::Wgmma), &KernelSchedule::default())
+            .module(
+                &context,
+                &kernel,
+                &target,
+                &MosaicOptions::default().with_mma(Mma::Wgmma),
+                &KernelSchedule::default(),
+            )
             .unwrap();
         assert_eq!(module.verify(), Ok(true));
         let mut matrix_instructions = 0;
@@ -1238,7 +1244,7 @@ mod gpu {
                     inputs: vec![vec![1.0]],
                     expected: vec![],
                 };
-                let error = execute_case(&client, case, Options::default()).unwrap_err().to_string();
+                let error = execute_case(&client, case, MosaicOptions::default()).unwrap_err().to_string();
                 assert!(
                     error.contains("CUDA_ERROR_LAUNCH_FAILED") || error.contains("CUDA_ERROR_ILLEGAL_INSTRUCTION"),
                     "{error}",
@@ -1262,7 +1268,7 @@ mod cutile {
         AddOperation, ArrayIrType, ArrayOperation, CompilationCacheDomain, ConstantOperation, Device, DeviceMesh,
         LogicalMesh, MeshAxis, MeshAxisType, StagedFunction as CoreStagedFunction,
     };
-    use ryft_cuda::kernels::cutile::{CompiledKernel, Compiler, Options, Target};
+    use ryft_cuda::kernels::cutile::{CompiledKernel, Compiler, Options as CuTileOptions, Target};
     use ryft_kernels::{KernelSchedule, VerifiedKernel};
     use ryft_xla::kernels::{CuTileEmbedding, KernelCompilerBinding, stage_kernel};
     use ryft_xla::{Domain, Error, FromPjrt, Session, Value};
@@ -1288,7 +1294,7 @@ mod cutile {
                 let binding = KernelCompilerBinding::new(
                     Compiler::new(python),
                     Target::new(major.parse().unwrap(), minor.parse().unwrap()).unwrap(),
-                    Options::default(),
+                    CuTileOptions::default(),
                     KernelSchedule::default(),
                     CuTileEmbedding,
                     1024,
@@ -1354,7 +1360,7 @@ mod cutile {
         );
         let compiler = Compiler::new(python).with_cancellation(Arc::clone(&cancellation));
         let schedule = KernelSchedule::default();
-        let options = Options::default();
+        let options = CuTileOptions::default();
         eprintln!(
             "cuTile {}: semantic={}",
             case.name,
@@ -1554,7 +1560,7 @@ mod cutile {
                 let binding = KernelCompilerBinding::new(
                     compiler,
                     target,
-                    Options::default(),
+                    CuTileOptions::default(),
                     KernelSchedule::default(),
                     CuTileEmbedding,
                     1024,
@@ -2260,7 +2266,7 @@ mod triton {
         StagedFunction as CoreStagedFunction,
     };
     use ryft_kernels::{KernelCompiler, KernelSchedule};
-    use ryft_triton::kernels::{Compiler, Options, Target};
+    use ryft_triton::kernels::{Compiler, Options as TritonOptions, Target};
     use ryft_xla::kernels::{KernelCompilerBinding, TritonEmbedding, stage_kernel};
     use ryft_xla::{Domain, FromPjrt, Options, Session, Value};
 
@@ -2287,7 +2293,7 @@ mod triton {
         let binding = KernelCompilerBinding::new(
             compiler,
             device_target(client),
-            Options::default(),
+            TritonOptions::default(),
             KernelSchedule::default(),
             TritonEmbedding,
             1024,
@@ -2392,7 +2398,7 @@ mod triton {
                 .compile(
                     &compiler,
                     &Target::Rocm { architecture: architecture.into() },
-                    &Options::default(),
+                    &TritonOptions::default(),
                     &KernelSchedule::default(),
                 )
                 .unwrap();
@@ -2414,7 +2420,7 @@ mod triton {
         let verified = ryft_kernels::VerifiedKernel::new(&case.definition, 1024).unwrap();
         let compiler = Compiler::new();
         assert!(matches!(
-            compiler.admit(&verified, &Target::Cuda { major: 12, minor: 1 }, &Options::default(),
+            compiler.admit(&verified, &Target::Cuda { major: 12, minor: 1 }, &TritonOptions::default(),
                 &KernelSchedule::default()),
             Err(ryft_kernels::KernelCompilationError::Unsupported { operation: "scratch", requested, .. })
                 if requested == "operation is outside the portable Triton subset",
@@ -2452,7 +2458,7 @@ mod triton {
             if matches!(platform, TestPlatform::Cuda13) {
                 let compiler = Compiler::new();
                 let target = device_target(&client);
-                let options = Options::default();
+                let options = TritonOptions::default();
                 let schedule = KernelSchedule::default();
                 let configuration = compiler.configuration_key(&target, &options, &schedule).unwrap();
                 let deployment = Compiler::from_configuration(&configuration).unwrap();

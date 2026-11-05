@@ -2,12 +2,12 @@ use ryft_core::{ArrayType, ProgramError, TransposeOperation};
 use ryft_mlir::dialects::stable_hlo;
 use ryft_mlir::{Block, Operation as MlirOperation, Value as MlirValue, ValueRef};
 
-use crate::{Error, LowerableOperation, LowerableOperationFamily, XlaLowerer};
+use crate::{Error, LowerableOperation, LowerableOperationFamily, Lowerer};
 
 impl LowerableOperation for TransposeOperation {
     fn lower<'b, 'c: 'b, 't: 'c, O: LowerableOperationFamily>(
         &self,
-        lowerer: &mut XlaLowerer<'b, 'c, 't, O>,
+        lowerer: &mut Lowerer<'b, 'c, 't, O>,
         input_values: &[ValueRef<'b, 'c, 't>],
         _input_types: &[ArrayType],
         _output_types: &[ArrayType],
@@ -27,22 +27,20 @@ mod tests {
 
     use indoc::indoc;
     use pretty_assertions::assert_eq;
-    use ryft_core::{DataType, Dimension, Placeholder, Shape};
+    use ryft_core::{DataType, Dimension as CoreDimension, Placeholder, Shape};
     use ryft_pjrt::{BufferType, ExecutionDeviceInputs, ExecutionInput, Program as PjrtProgram};
 
-    use crate::experimental::lowering::tests::{
-        XlaProgramBuilder, dynamic_dimension, ragged_dot_cpu_compilation_options,
-    };
+    use crate::experimental::lowering::tests::{ProgramBuilder, dynamic_dimension, ragged_dot_cpu_compilation_options};
     use crate::experimental::lowering::to_mlir_module_for_plain_program;
-    use crate::experimental::ops::XlaArrayConstant;
+    use crate::experimental::ops::ArrayConstant;
     use crate::tests::{execution_client, values_from_bytes, values_to_bytes};
 
     use super::*;
 
     #[test]
     fn test_lower_transpose_executes_dynamic_shape() {
-        let shape = Shape::new(vec![dynamic_dimension("size", Some(5)), Dimension::Static(2)]);
-        let mut builder = XlaProgramBuilder::new();
+        let shape = Shape::new(vec![dynamic_dimension("size", Some(5)), CoreDimension::Static(2)]);
+        let mut builder = ProgramBuilder::new();
         let integer_input = builder.add_input(ArrayType::new(DataType::I64, shape.clone()));
         let complex_input = builder.add_input(ArrayType::new(DataType::C64, shape));
         let integer_output = builder
@@ -52,7 +50,7 @@ mod tests {
             .add_instruction(TransposeOperation::new([1, 0]), Vec::new(), vec![complex_input], None)
             .unwrap()[0];
         let program = builder
-            .build::<Vec<XlaArrayConstant>, Vec<XlaArrayConstant>>(
+            .build::<Vec<ArrayConstant>, Vec<ArrayConstant>>(
                 vec![integer_output, complex_output],
                 vec![Placeholder; 2],
                 vec![Placeholder; 2],

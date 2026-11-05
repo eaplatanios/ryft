@@ -1,5 +1,5 @@
 use ryft_core::macros::check_count;
-use ryft_core::{ArrayType, Operation, ParallelReduceOperation, ProgramError, ReductionKind};
+use ryft_core::{ArrayType, Operation as CoreOperation, ParallelReduceOperation, ProgramError, ReductionKind};
 use ryft_mlir::dialects::stable_hlo;
 use ryft_mlir::{
     Block, BlockRef, Context as MlirContext, LocationRef, Operation as MlirOperation, Region, Value as MlirValue,
@@ -9,7 +9,7 @@ use ryft_mlir::{
 use crate::experimental::lowering::CollectiveLoweringState;
 use crate::experimental::lowering::types::{lower_f64_constant_splat, lower_tensor_type};
 use crate::operations::collectives::{collective_replica_groups, mesh_axis_replica_groups};
-use crate::{Error, LowerableOperation, LowerableOperationFamily, XlaLowerer};
+use crate::{Error, LowerableOperation, LowerableOperationFamily, Lowerer};
 
 /// Lowers one [`ParallelReduceOperation`] inside a `sdy.manual_computation` region to a `stablehlo.all_reduce` over
 /// the device mesh axis the collective names.
@@ -148,7 +148,7 @@ pub(crate) fn lower_collective_to_all_reduce<'b, 'c: 'b, 't: 'c>(
 impl LowerableOperation for ParallelReduceOperation {
     fn lower<'b, 'c: 'b, 't: 'c, O: LowerableOperationFamily>(
         &self,
-        lowerer: &mut XlaLowerer<'b, 'c, 't, O>,
+        lowerer: &mut Lowerer<'b, 'c, 't, O>,
         input_values: &[ValueRef<'b, 'c, 't>],
         _input_types: &[ArrayType],
         output_types: &[ArrayType],

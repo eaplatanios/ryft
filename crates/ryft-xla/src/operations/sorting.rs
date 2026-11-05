@@ -6,7 +6,7 @@ use ryft_mlir::{
 };
 
 use crate::experimental::lowering::types::{lower_f64_constant_splat, lower_tensor_type};
-use crate::{Error, LowerableOperation, LowerableOperationFamily, XlaLowerer};
+use crate::{Error, LowerableOperation, LowerableOperationFamily, Lowerer};
 
 /// Lowers one traced sort to a `stablehlo.sort` with a synthesized comparator region: two scalar block arguments
 /// per operand, comparing the first `key_count` operand pairs lexicographically with the sort's direction (`LT`
@@ -205,7 +205,7 @@ fn lower_canonical_sort_key<'b, 'c: 'b, 't: 'c>(
 impl LowerableOperation for SortOperation {
     fn lower<'b, 'c: 'b, 't: 'c, O: LowerableOperationFamily>(
         &self,
-        lowerer: &mut XlaLowerer<'b, 'c, 't, O>,
+        lowerer: &mut Lowerer<'b, 'c, 't, O>,
         input_values: &[ValueRef<'b, 'c, 't>],
         _input_types: &[ArrayType],
         output_types: &[ArrayType],
@@ -220,10 +220,10 @@ mod tests {
 
     use indoc::indoc;
     use pretty_assertions::assert_eq;
-    use ryft_core::{Dimension, Placeholder, Shape};
+    use ryft_core::{Dimension as CoreDimension, Placeholder, Shape};
 
-    use crate::experimental::lowering::tests::{XlaProgramBuilder, unproject_plain_program};
-    use crate::experimental::ops::XlaArrayConstant;
+    use crate::experimental::lowering::tests::{ProgramBuilder, unproject_plain_program};
+    use crate::experimental::ops::ArrayConstant;
     use crate::to_mlir_module_for_program;
 
     use super::*;
@@ -235,9 +235,9 @@ mod tests {
         // A two-operand descending total-order sort (i.e., the top-k idiom) lowers to a stable `stablehlo.sort`
         // whose synthesized comparator compares the key pair with `GT` and `TOTALORDER` semantics, and whose index
         // passenger rides along unexamined.
-        let key_type = ArrayType::new(DataType::F32, Shape::new(vec![Dimension::Static(4)]));
-        let index_type = ArrayType::new(DataType::I32, Shape::new(vec![Dimension::Static(4)]));
-        let mut builder = XlaProgramBuilder::new();
+        let key_type = ArrayType::new(DataType::F32, Shape::new(vec![CoreDimension::Static(4)]));
+        let index_type = ArrayType::new(DataType::I32, Shape::new(vec![CoreDimension::Static(4)]));
+        let mut builder = ProgramBuilder::new();
         let keys = builder.add_input(key_type.clone());
         let indices = builder.add_input(index_type.clone());
         let outputs = builder
@@ -250,7 +250,7 @@ mod tests {
             .unwrap()
             .to_vec();
         let program = builder
-            .build::<Vec<XlaArrayConstant>, Vec<XlaArrayConstant>>(outputs, vec![Placeholder; 2], vec![Placeholder; 2])
+            .build::<Vec<ArrayConstant>, Vec<ArrayConstant>>(outputs, vec![Placeholder; 2], vec![Placeholder; 2])
             .unwrap();
         let program = unproject_plain_program(program);
         let input_types = vec![key_type.clone(), index_type.clone()];
@@ -285,10 +285,10 @@ mod tests {
         // so NaN ties fall through deterministically, and `SIGNED` for the `i32` secondary key), while the passenger
         // rides along unexamined. The `f32` key is first canonicalized like JAX's `lax.sort` comparator does it, so
         // that signed zeros and all NaNs compare equal.
-        let primary_type = ArrayType::new(DataType::F32, Shape::new(vec![Dimension::Static(4)]));
-        let secondary_type = ArrayType::new(DataType::I32, Shape::new(vec![Dimension::Static(4)]));
-        let passenger_type = ArrayType::new(DataType::F32, Shape::new(vec![Dimension::Static(4)]));
-        let mut builder = XlaProgramBuilder::new();
+        let primary_type = ArrayType::new(DataType::F32, Shape::new(vec![CoreDimension::Static(4)]));
+        let secondary_type = ArrayType::new(DataType::I32, Shape::new(vec![CoreDimension::Static(4)]));
+        let passenger_type = ArrayType::new(DataType::F32, Shape::new(vec![CoreDimension::Static(4)]));
+        let mut builder = ProgramBuilder::new();
         let primary = builder.add_input(primary_type.clone());
         let secondary = builder.add_input(secondary_type.clone());
         let passenger = builder.add_input(passenger_type.clone());
@@ -298,7 +298,7 @@ mod tests {
             .unwrap()
             .to_vec();
         let program = builder
-            .build::<Vec<XlaArrayConstant>, Vec<XlaArrayConstant>>(outputs, vec![Placeholder; 3], vec![Placeholder; 3])
+            .build::<Vec<ArrayConstant>, Vec<ArrayConstant>>(outputs, vec![Placeholder; 3], vec![Placeholder; 3])
             .unwrap();
         let program = unproject_plain_program(program);
         let input_types = vec![primary_type.clone(), secondary_type.clone(), passenger_type.clone()];
@@ -345,15 +345,15 @@ mod tests {
 
         // A complex key contributes its real part and then its imaginary part as two lexicographic comparison
         // components, each canonicalized like a real floating-point key.
-        let key_type = ArrayType::new(DataType::C64, Shape::new(vec![Dimension::Static(4)]));
-        let mut builder = XlaProgramBuilder::new();
+        let key_type = ArrayType::new(DataType::C64, Shape::new(vec![CoreDimension::Static(4)]));
+        let mut builder = ProgramBuilder::new();
         let keys = builder.add_input(key_type.clone());
         let outputs = builder
             .add_instruction(SortOperation::new(0, SortDirection::Ascending), Vec::new(), vec![keys], None)
             .unwrap()
             .to_vec();
         let program = builder
-            .build::<Vec<XlaArrayConstant>, Vec<XlaArrayConstant>>(outputs, vec![Placeholder], vec![Placeholder])
+            .build::<Vec<ArrayConstant>, Vec<ArrayConstant>>(outputs, vec![Placeholder], vec![Placeholder])
             .unwrap();
         let program = unproject_plain_program(program);
         let types = vec![key_type];

@@ -1,7 +1,8 @@
 use ryft_core::macros::check_count;
 use ryft_core::{
-    Array, ArrayIrType, ArrayType, ConstantOperation, DataType, Dimension, IotaOperation, Layout, OneLikeOperation,
-    OneOperation, Operation, ProgramError, Shape, TypeError, ZeroLikeOperation, ZeroOperation,
+    Array as CoreArray, ArrayIrType, ArrayType, ConstantOperation, DataType, Dimension as CoreDimension, IotaOperation,
+    Layout, OneLikeOperation, OneOperation, Operation as CoreOperation, ProgramError, Shape, TypeError,
+    ZeroLikeOperation, ZeroOperation,
 };
 use ryft_mlir::dialects::stable_hlo;
 use ryft_mlir::{
@@ -15,12 +16,12 @@ use crate::experimental::lowering::types::{
 use crate::operations::assertions::lower_output_extent_validation;
 use crate::operations::manipulation::memory::annotate_output_memory;
 use crate::operations::sharding::constrain_sharding::lower_sharding_constraint;
-use crate::{Error, LowerableOperation, LowerableOperationFamily, LoweringError, MemberLowerableOperation, XlaLowerer};
+use crate::{Error, LowerableOperation, LowerableOperationFamily, Lowerer, LoweringError, MemberLowerableOperation};
 
 impl LowerableOperation for IotaOperation<ArrayType> {
     fn lower<'b, 'c: 'b, 't: 'c, O: LowerableOperationFamily>(
         &self,
-        lowerer: &mut XlaLowerer<'b, 'c, 't, O>,
+        lowerer: &mut Lowerer<'b, 'c, 't, O>,
         input_values: &[ValueRef<'b, 'c, 't>],
         _input_types: &[ArrayType],
         output_types: &[ArrayType],
@@ -44,10 +45,10 @@ impl LowerableOperation for IotaOperation<ArrayType> {
     }
 }
 
-impl LowerableOperation for ConstantOperation<Array> {
+impl LowerableOperation for ConstantOperation<CoreArray> {
     fn lower<'b, 'c: 'b, 't: 'c, O: LowerableOperationFamily>(
         &self,
-        lowerer: &mut XlaLowerer<'b, 'c, 't, O>,
+        lowerer: &mut Lowerer<'b, 'c, 't, O>,
         input_values: &[ValueRef<'b, 'c, 't>],
         _input_types: &[ArrayType],
         output_types: &[ArrayType],
@@ -97,7 +98,7 @@ pub(crate) fn lower_like_constant<'b, 'c: 'b, 't: 'c>(
         // Allocation uses the declared bounds; logical sizes come from the exemplar, including zero extents.
         let mut dimensions = Vec::new();
         for (axis, dimension) in output_type.shape().dimensions().iter().enumerate() {
-            if matches!(dimension, Dimension::Dynamic(_)) {
+            if matches!(dimension, CoreDimension::Dynamic(_)) {
                 let size = block.append_operation(stable_hlo::get_dimension_size(input_values[0], axis, location)?)?;
                 dimensions.push(size.result(0).unwrap().as_ref());
             }
@@ -184,7 +185,7 @@ pub(crate) fn dynamic_constructor_types(
         .shape()
         .dimensions()
         .iter()
-        .filter(|dimension| matches!(dimension, Dimension::Dynamic(_)))
+        .filter(|dimension| matches!(dimension, CoreDimension::Dynamic(_)))
         .count();
     if input_count != dynamic_count {
         return Err(ProgramError::InvalidInputCount { expected: dynamic_count, actual: input_count }.into());
@@ -195,8 +196,8 @@ pub(crate) fn dynamic_constructor_types(
         .dimensions()
         .iter()
         .map(|dimension| match dimension {
-            Dimension::Static(extent) => Ok(Dimension::Static(*extent)),
-            Dimension::Dynamic(variable) => {
+            CoreDimension::Static(extent) => Ok(CoreDimension::Static(*extent)),
+            CoreDimension::Dynamic(variable) => {
                 let bound = stable_hlo_dynamic_dimension_bound(dimension).ok_or_else(|| {
                     Error::Lowering(LoweringError::UnsupportedOperation {
                         operation: name.to_string(),
@@ -210,7 +211,7 @@ pub(crate) fn dynamic_constructor_types(
                     value: bound,
                     maximum: i32::MAX as usize,
                 })?;
-                Ok(Dimension::Static(bound))
+                Ok(CoreDimension::Static(bound))
             }
         })
         .collect::<Result<Vec<_>, Error>>()?;
@@ -234,7 +235,7 @@ pub(crate) fn refine_dynamic_constructor_result<'b, 'c: 'b, 't: 'c>(
     // when a dynamic axis is encountered rather than indexing by the physical axis number.
     let mut operands = input_values.iter();
     for (axis, dimension) in output_type.shape().dimensions().iter().cloned().enumerate() {
-        if !matches!(dimension, Dimension::Dynamic(_)) {
+        if !matches!(dimension, CoreDimension::Dynamic(_)) {
             continue;
         }
         let operand = *operands.next().unwrap();
@@ -268,15 +269,17 @@ pub(crate) fn dynamic_constructor_inputs<'b, 'c: 'b, 't: 'c, O: LowerableOperati
     input_values: &[ValueRef<'b, 'c, 't>],
     input_types: &[ArrayIrType],
     output_types: &[ArrayIrType],
-    lowerer: &mut XlaLowerer<'b, 'c, 't, O>,
+    lowerer: &mut Lowerer<'b, 'c, 't, O>,
 ) -> Result<Vec<ValueRef<'b, 'c, 't>>, Error> {
     let [output_type] = output_types else {
         return Err(ProgramError::InvalidOutputCount { expected: 1, actual: output_types.len() }.into());
     };
     let output_type = <&ArrayType>::try_from(output_type)?;
     let declared_dimensions = declared_type.shape().dimensions();
-    let dynamic_count =
-        declared_dimensions.iter().filter(|dimension| matches!(dimension, Dimension::Dynamic(_))).count();
+    let dynamic_count = declared_dimensions
+        .iter()
+        .filter(|dimension| matches!(dimension, CoreDimension::Dynamic(_)))
+        .count();
     if input_values.len() != dynamic_count {
         return Err(ProgramError::InvalidInputCount { expected: dynamic_count, actual: input_values.len() }.into());
     }
@@ -302,10 +305,10 @@ pub(crate) fn dynamic_constructor_inputs<'b, 'c: 'b, 't: 'c, O: LowerableOperati
         .iter()
         .zip(output_type.shape().dimensions())
         .filter_map(|(declared, output)| match declared {
-            Dimension::Static(_) => None,
-            Dimension::Dynamic(_) => {
+            CoreDimension::Static(_) => None,
+            CoreDimension::Dynamic(_) => {
                 let input = *inputs.next().unwrap();
-                matches!(output, Dimension::Dynamic(_)).then_some(input)
+                matches!(output, CoreDimension::Dynamic(_)).then_some(input)
             }
         })
         .collect())
@@ -330,7 +333,7 @@ pub(crate) fn lower_dynamic_constructor<'b, 'c: 'b, 't: 'c>(
 impl LowerableOperation for ZeroOperation<ArrayType> {
     fn lower<'b, 'c: 'b, 't: 'c, O: LowerableOperationFamily>(
         &self,
-        lowerer: &mut XlaLowerer<'b, 'c, 't, O>,
+        lowerer: &mut Lowerer<'b, 'c, 't, O>,
         input_values: &[ValueRef<'b, 'c, 't>],
         _input_types: &[ArrayType],
         output_types: &[ArrayType],
@@ -345,7 +348,7 @@ impl LowerableOperation for ZeroOperation<ArrayType> {
 impl LowerableOperation for OneOperation<ArrayType> {
     fn lower<'b, 'c: 'b, 't: 'c, O: LowerableOperationFamily>(
         &self,
-        lowerer: &mut XlaLowerer<'b, 'c, 't, O>,
+        lowerer: &mut Lowerer<'b, 'c, 't, O>,
         input_values: &[ValueRef<'b, 'c, 't>],
         _input_types: &[ArrayType],
         output_types: &[ArrayType],
@@ -360,7 +363,7 @@ impl LowerableOperation for OneOperation<ArrayType> {
 impl LowerableOperation for ZeroLikeOperation<ArrayType> {
     fn lower<'b, 'c: 'b, 't: 'c, O: LowerableOperationFamily>(
         &self,
-        lowerer: &mut XlaLowerer<'b, 'c, 't, O>,
+        lowerer: &mut Lowerer<'b, 'c, 't, O>,
         input_values: &[ValueRef<'b, 'c, 't>],
         _input_types: &[ArrayType],
         output_types: &[ArrayType],
@@ -380,7 +383,7 @@ impl LowerableOperation for ZeroLikeOperation<ArrayType> {
 impl LowerableOperation for OneLikeOperation<ArrayType> {
     fn lower<'b, 'c: 'b, 't: 'c, O: LowerableOperationFamily>(
         &self,
-        lowerer: &mut XlaLowerer<'b, 'c, 't, O>,
+        lowerer: &mut Lowerer<'b, 'c, 't, O>,
         input_values: &[ValueRef<'b, 'c, 't>],
         _input_types: &[ArrayType],
         output_types: &[ArrayType],
@@ -400,7 +403,7 @@ impl LowerableOperation for OneLikeOperation<ArrayType> {
 impl MemberLowerableOperation<ArrayIrType> for ZeroOperation<ArrayType> {
     fn lower_in_parent<'b, 'c: 'b, 't: 'c, O: LowerableOperationFamily>(
         &self,
-        lowerer: &mut XlaLowerer<'b, 'c, 't, O>,
+        lowerer: &mut Lowerer<'b, 'c, 't, O>,
         input_values: &[ValueRef<'b, 'c, 't>],
         input_types: &[ArrayIrType],
         output_types: &[ArrayIrType],
@@ -417,7 +420,7 @@ impl MemberLowerableOperation<ArrayIrType> for ZeroOperation<ArrayType> {
 impl MemberLowerableOperation<ArrayIrType> for OneOperation<ArrayType> {
     fn lower_in_parent<'b, 'c: 'b, 't: 'c, O: LowerableOperationFamily>(
         &self,
-        lowerer: &mut XlaLowerer<'b, 'c, 't, O>,
+        lowerer: &mut Lowerer<'b, 'c, 't, O>,
         input_values: &[ValueRef<'b, 'c, 't>],
         input_types: &[ArrayIrType],
         output_types: &[ArrayIrType],
@@ -434,7 +437,7 @@ impl MemberLowerableOperation<ArrayIrType> for OneOperation<ArrayType> {
 impl MemberLowerableOperation<ArrayIrType> for IotaOperation<ArrayType> {
     fn lower_in_parent<'b, 'c: 'b, 't: 'c, O: LowerableOperationFamily>(
         &self,
-        lowerer: &mut XlaLowerer<'b, 'c, 't, O>,
+        lowerer: &mut Lowerer<'b, 'c, 't, O>,
         input_values: &[ValueRef<'b, 'c, 't>],
         input_types: &[ArrayIrType],
         output_types: &[ArrayIrType],
@@ -460,9 +463,9 @@ mod tests {
     use pretty_assertions::assert_eq;
     use ryft_core::{
         ArrayIrOperation, ArrayOperation, Context, DimensionBounds, DimensionType, DimensionValue, DimensionVariable,
-        Fill, LogicalMesh, Memory, MeshAxis, MeshAxisType, OneLikeOperation, OneOperation, Placeholder, ProgramBuilder,
-        Sharding, ShardingDimension, TiledLayout, TracingContext, Typed, TypedProgram, ZeroLikeOperation,
-        ZeroOperation, i1, i2, i4, u1, u2, u4,
+        Fill, LogicalMesh, Memory, MeshAxis, MeshAxisType, OneLikeOperation, OneOperation, Placeholder,
+        ProgramBuilder as CoreProgramBuilder, Sharding, ShardingDimension, TiledLayout, TracingContext, Typed,
+        TypedProgram, ZeroLikeOperation, ZeroOperation, i1, i2, i4, u1, u2, u4,
     };
     use ryft_mlir::dialects::builtin::attributes::DenseElementsAttribute;
     use ryft_mlir::{ElementsAttribute, Size as MlirSize};
@@ -472,11 +475,11 @@ mod tests {
     };
 
     use crate::experimental::lowering::tests::{
-        MixedValue, XlaProgramBuilder, dynamic_dimension, execute_mixed_program, ragged_dot_cpu_compilation_options,
+        MixedValue, ProgramBuilder, dynamic_dimension, execute_mixed_program, ragged_dot_cpu_compilation_options,
         test_vector_type,
     };
     use crate::experimental::lowering::{MlirLowerableValue, to_mlir_module_for_plain_program};
-    use crate::experimental::ops::{XlaArrayConstant, XlaConstant, XlaProgramBuilder as ArrayIrXlaProgramBuilder};
+    use crate::experimental::ops::{ArrayConstant, Constant, ProgramBuilder as ArrayIrProgramBuilder};
     use crate::operations::assertions::ensure_assertion_handler_registered;
     use crate::tests::{execution_client, values_from_bytes, values_to_bytes};
     use crate::to_mlir_module_for_program;
@@ -487,7 +490,7 @@ mod tests {
     use ryft_core::Complex as ComplexNumber;
 
     /// Copies the exact raw storage bytes from the MLIR dense attribute built for `literal`.
-    fn test_literal_dense_bytes(literal: &Array, byte_count: usize) -> Vec<u8> {
+    fn test_literal_dense_bytes(literal: &CoreArray, byte_count: usize) -> Vec<u8> {
         let context = MlirContext::new();
         let location = context.unknown_location();
         let tensor_type = lower_tensor_type(literal.r#type().as_ref(), &context, location).unwrap();
@@ -497,11 +500,11 @@ mod tests {
 
     #[test]
     fn test_zero_space_type_and_constant_lower_to_a_false_i1_carrier() {
-        let output_type = ArrayType::new(DataType::Zero, Shape::new(vec![Dimension::Static(3)]));
-        let mut builder = XlaProgramBuilder::new();
+        let output_type = ArrayType::new(DataType::Zero, Shape::new(vec![CoreDimension::Static(3)]));
+        let mut builder = ProgramBuilder::new();
         let output = builder.add_instruction(ZeroOperation::new(output_type), Vec::new(), Vec::new(), None).unwrap()[0];
         let program = builder
-            .build::<Vec<XlaArrayConstant>, Vec<XlaArrayConstant>>(vec![output], Vec::new(), vec![Placeholder])
+            .build::<Vec<ArrayConstant>, Vec<ArrayConstant>>(vec![output], Vec::new(), vec![Placeholder])
             .unwrap();
 
         let stablehlo = to_mlir_module_for_plain_program(&program, "main").unwrap();
@@ -517,11 +520,11 @@ mod tests {
         // (which a dimension constant would supply instead), so the constructors keep it dynamic.
         let size = DimensionVariable::new("size", DimensionBounds::new(3, Some(4)).unwrap());
         let output_type = ArrayType::new(DataType::F64, Shape::new(vec![size.clone().into()]));
-        let mut builder = ArrayIrXlaProgramBuilder::new();
+        let mut builder = ArrayIrProgramBuilder::new();
         let dimension = builder.add_input(DimensionType::from(size).into());
         let zero = builder
             .add_instruction(
-                ArrayIrOperation::<XlaArrayConstant>::Zero(ZeroOperation::new(output_type.clone())),
+                ArrayIrOperation::<ArrayConstant>::Zero(ZeroOperation::new(output_type.clone())),
                 Vec::new(),
                 vec![dimension],
                 None,
@@ -529,7 +532,7 @@ mod tests {
             .unwrap()[0];
         let one = builder
             .add_instruction(
-                ArrayIrOperation::<XlaArrayConstant>::One(OneOperation::new(output_type.clone())),
+                ArrayIrOperation::<ArrayConstant>::One(OneOperation::new(output_type.clone())),
                 Vec::new(),
                 vec![dimension],
                 None,
@@ -537,14 +540,14 @@ mod tests {
             .unwrap()[0];
         let iota = builder
             .add_instruction(
-                ArrayIrOperation::<XlaArrayConstant>::Iota(IotaOperation::new(output_type.clone(), 0).unwrap()),
+                ArrayIrOperation::<ArrayConstant>::Iota(IotaOperation::new(output_type.clone(), 0).unwrap()),
                 Vec::new(),
                 vec![dimension],
                 None,
             )
             .unwrap()[0];
         let program = builder
-            .build::<Vec<XlaConstant>, Vec<XlaConstant>>(vec![zero, one, iota], vec![Placeholder], vec![Placeholder; 3])
+            .build::<Vec<Constant>, Vec<Constant>>(vec![zero, one, iota], vec![Placeholder], vec![Placeholder; 3])
             .unwrap();
         assert_eq!(program.output_types(), vec![ArrayIrType::Array(output_type.clone()); 3]);
         let input_types = vec![ArrayType::scalar(DataType::I64)];
@@ -574,14 +577,14 @@ mod tests {
         // validate identities shared by boundary inputs. Both axes therefore stay dynamic without any assertion.
         let size = DimensionVariable::new("size", DimensionBounds::new(0, Some(9)).unwrap());
         let output_type = ArrayType::new(DataType::F64, Shape::new(vec![size.clone().into(), size.clone().into()]));
-        let mut builder = ArrayIrXlaProgramBuilder::new();
+        let mut builder = ArrayIrProgramBuilder::new();
         let first = builder.add_input(DimensionType::from(size.clone()).into());
         let second = builder.add_input(DimensionType::from(size).into());
         let output = builder
             .add_instruction(ZeroOperation::new(output_type.clone()), Vec::new(), vec![first, second], None)
             .unwrap()[0];
         let program = builder
-            .build::<Vec<XlaConstant>, Vec<XlaConstant>>(vec![output], vec![Placeholder; 2], vec![Placeholder])
+            .build::<Vec<Constant>, Vec<Constant>>(vec![output], vec![Placeholder; 2], vec![Placeholder])
             .unwrap();
         let module = to_mlir_module_for_program(
             &program,
@@ -630,13 +633,13 @@ mod tests {
         // Reusing one operand for every axis of a symbolic identity needs no assertion either.
         let size = DimensionVariable::new("size", DimensionBounds::new(0, Some(9)).unwrap());
         let output_type = ArrayType::new(DataType::F64, Shape::new(vec![size.clone().into(), size.clone().into()]));
-        let mut builder = ArrayIrXlaProgramBuilder::new();
+        let mut builder = ArrayIrProgramBuilder::new();
         let input = builder.add_input(DimensionType::from(size).into());
         let output = builder
             .add_instruction(ZeroOperation::new(output_type.clone()), Vec::new(), vec![input, input], None)
             .unwrap()[0];
         let program = builder
-            .build::<Vec<XlaConstant>, Vec<XlaConstant>>(vec![output], vec![Placeholder], vec![Placeholder])
+            .build::<Vec<Constant>, Vec<Constant>>(vec![output], vec![Placeholder], vec![Placeholder])
             .unwrap();
         let module = to_mlir_module_for_program(
             &program,
@@ -680,15 +683,13 @@ mod tests {
         // reach the lowered constructor.
         let size = DimensionVariable::new("size", DimensionBounds::new(0, Some(9)).unwrap());
         let output_type = ArrayType::new(DataType::F64, Shape::new(vec![size.clone().into(), size.into()]));
-        let mut builder = ArrayIrXlaProgramBuilder::new();
-        let first = builder.add_constant(XlaConstant::Dimension(DimensionValue::constant(3).unwrap()));
-        let second = builder.add_constant(XlaConstant::Dimension(DimensionValue::constant(3).unwrap()));
+        let mut builder = ArrayIrProgramBuilder::new();
+        let first = builder.add_constant(Constant::Dimension(DimensionValue::constant(3).unwrap()));
+        let second = builder.add_constant(Constant::Dimension(DimensionValue::constant(3).unwrap()));
         let output = builder
             .add_instruction(ZeroOperation::new(output_type), Vec::new(), vec![first, second], None)
             .unwrap()[0];
-        let program = builder
-            .build::<Vec<XlaConstant>, Vec<XlaConstant>>(vec![output], vec![], vec![Placeholder])
-            .unwrap();
+        let program = builder.build::<Vec<Constant>, Vec<Constant>>(vec![output], vec![], vec![Placeholder]).unwrap();
         let output_type = ArrayType::new_static(DataType::F64, [3, 3]);
         assert_eq!(program.output_types(), vec![ArrayIrType::Array(output_type.clone())]);
         let module =
@@ -718,12 +719,12 @@ mod tests {
         // constructors share the mixed boundary and cover both operand orders.
         let size = DimensionVariable::new("size", DimensionBounds::new(0, Some(9)).unwrap());
         let output_type = ArrayType::new(DataType::F64, Shape::new(vec![size.clone().into(), size.clone().into()]));
-        let mut builder = ArrayIrXlaProgramBuilder::new();
+        let mut builder = ArrayIrProgramBuilder::new();
         let symbolic = builder.add_input(DimensionType::from(size).into());
-        let exact = builder.add_constant(XlaConstant::Dimension(DimensionValue::constant(3).unwrap()));
+        let exact = builder.add_constant(Constant::Dimension(DimensionValue::constant(3).unwrap()));
         let zero = builder
             .add_instruction(
-                ArrayIrOperation::<XlaArrayConstant>::Zero(ZeroOperation::new(output_type.clone())),
+                ArrayIrOperation::<ArrayConstant>::Zero(ZeroOperation::new(output_type.clone())),
                 Vec::new(),
                 vec![symbolic, exact],
                 None,
@@ -731,7 +732,7 @@ mod tests {
             .unwrap()[0];
         let one = builder
             .add_instruction(
-                ArrayIrOperation::<XlaArrayConstant>::One(OneOperation::new(output_type.clone())),
+                ArrayIrOperation::<ArrayConstant>::One(OneOperation::new(output_type.clone())),
                 Vec::new(),
                 vec![exact, symbolic],
                 None,
@@ -739,14 +740,14 @@ mod tests {
             .unwrap()[0];
         let iota = builder
             .add_instruction(
-                ArrayIrOperation::<XlaArrayConstant>::Iota(IotaOperation::new(output_type, 0).unwrap()),
+                ArrayIrOperation::<ArrayConstant>::Iota(IotaOperation::new(output_type, 0).unwrap()),
                 Vec::new(),
                 vec![symbolic, exact],
                 None,
             )
             .unwrap()[0];
         let program = builder
-            .build::<Vec<XlaConstant>, Vec<XlaConstant>>(vec![zero, one, iota], vec![Placeholder], vec![Placeholder; 3])
+            .build::<Vec<Constant>, Vec<Constant>>(vec![zero, one, iota], vec![Placeholder], vec![Placeholder; 3])
             .unwrap();
         let output_type = ArrayType::new_static(DataType::F64, [3, 3]);
         assert_eq!(program.output_types(), vec![ArrayIrType::Array(output_type.clone()); 3]);
@@ -807,14 +808,14 @@ mod tests {
             DataType::F64,
             Shape::new(vec![size.clone().into(), size.clone().into(), size.clone().into()]),
         );
-        let mut builder = ArrayIrXlaProgramBuilder::new();
+        let mut builder = ArrayIrProgramBuilder::new();
         let symbolic = builder.add_input(DimensionType::from(size).into());
-        let exact = builder.add_constant(XlaConstant::Dimension(DimensionValue::constant(2).unwrap()));
+        let exact = builder.add_constant(Constant::Dimension(DimensionValue::constant(2).unwrap()));
         let output = builder
             .add_instruction(ZeroOperation::new(output_type), Vec::new(), vec![symbolic, symbolic, exact], None)
             .unwrap()[0];
         let program = builder
-            .build::<Vec<XlaConstant>, Vec<XlaConstant>>(vec![output], vec![Placeholder], vec![Placeholder])
+            .build::<Vec<Constant>, Vec<Constant>>(vec![output], vec![Placeholder], vec![Placeholder])
             .unwrap();
         let output_type = ArrayType::new_static(DataType::F64, [2, 2, 2]);
         assert_eq!(program.output_types(), vec![ArrayIrType::Array(output_type.clone())]);
@@ -861,22 +862,22 @@ mod tests {
         // output must nevertheless report its own logical extent.
         let size = DimensionVariable::new("size", DimensionBounds::new(0, Some(5)).unwrap());
         let output_type = ArrayType::new(DataType::F64, Shape::new(vec![size.clone().into()]));
-        let mut builder = ArrayIrXlaProgramBuilder::new();
+        let mut builder = ArrayIrProgramBuilder::new();
         let dimension = builder.add_input(DimensionType::from(size).into());
         let zero = builder
             .add_instruction(
-                ArrayIrOperation::<XlaArrayConstant>::Zero(ZeroOperation::new(output_type.clone())),
+                ArrayIrOperation::<ArrayConstant>::Zero(ZeroOperation::new(output_type.clone())),
                 Vec::new(),
                 vec![dimension],
                 None,
             )
             .unwrap()[0];
-        let one_like = ArrayIrOperation::<XlaArrayConstant>::from(OneLikeOperation::<ArrayIrType>::new());
+        let one_like = ArrayIrOperation::<ArrayConstant>::from(OneLikeOperation::<ArrayIrType>::new());
         let one_like = builder.add_instruction(one_like, Vec::new(), vec![zero], None).unwrap()[0];
-        let zero_like = ArrayIrOperation::<XlaArrayConstant>::from(ZeroLikeOperation::<ArrayIrType>::new());
+        let zero_like = ArrayIrOperation::<ArrayConstant>::from(ZeroLikeOperation::<ArrayIrType>::new());
         let zero_like = builder.add_instruction(zero_like, Vec::new(), vec![zero], None).unwrap()[0];
         let program = builder
-            .build::<Vec<XlaConstant>, Vec<XlaConstant>>(
+            .build::<Vec<Constant>, Vec<Constant>>(
                 vec![zero, one_like, zero_like],
                 vec![Placeholder],
                 vec![Placeholder; 3],
@@ -902,16 +903,12 @@ mod tests {
     #[test]
     fn test_lower_like_constant_dynamic_shape() {
         let input_type = ArrayType::new(DataType::F32, Shape::new(vec![dynamic_dimension("size", Some(5))]));
-        let mut builder = XlaProgramBuilder::new();
+        let mut builder = ProgramBuilder::new();
         let input = builder.add_input(input_type);
         let zero = builder.add_instruction(ZeroLikeOperation::new(), Vec::new(), vec![input], None).unwrap()[0];
         let one = builder.add_instruction(OneLikeOperation::new(), Vec::new(), vec![input], None).unwrap()[0];
         let program = builder
-            .build::<Vec<XlaArrayConstant>, Vec<XlaArrayConstant>>(
-                vec![zero, one],
-                vec![Placeholder],
-                vec![Placeholder; 2],
-            )
+            .build::<Vec<ArrayConstant>, Vec<ArrayConstant>>(vec![zero, one], vec![Placeholder], vec![Placeholder; 2])
             .unwrap();
         let module = to_mlir_module_for_plain_program(&program, "main").unwrap();
         assert_eq!(
@@ -944,16 +941,12 @@ mod tests {
             .with_layout(Some(TiledLayout::new(vec![0], Vec::new()).into()))
             .with_sharding(Sharding::new(mesh, vec![ShardingDimension::sharded(["x"])]).unwrap())
             .unwrap();
-        let mut builder = XlaProgramBuilder::new();
+        let mut builder = ProgramBuilder::new();
         let input = builder.add_input(input_type.clone());
         let zero = builder.add_instruction(ZeroLikeOperation::new(), Vec::new(), vec![input], None).unwrap()[0];
         let one = builder.add_instruction(OneLikeOperation::new(), Vec::new(), vec![input], None).unwrap()[0];
         let program = builder
-            .build::<Vec<XlaArrayConstant>, Vec<XlaArrayConstant>>(
-                vec![zero, one],
-                vec![Placeholder],
-                vec![Placeholder; 2],
-            )
+            .build::<Vec<ArrayConstant>, Vec<ArrayConstant>>(vec![zero, one], vec![Placeholder], vec![Placeholder; 2])
             .unwrap();
         assert_eq!(program.output_types(), vec![input_type.clone(), input_type]);
         let module = to_mlir_module_for_plain_program(&program, "main").unwrap();
@@ -970,15 +963,11 @@ mod tests {
             (ArrayOperation::OneLike(OneLikeOperation::new()), "one_like"),
         ] {
             let input_type = ArrayType::new(DataType::F32, Shape::new(vec![dynamic_dimension("size", None)]));
-            let mut builder = XlaProgramBuilder::new();
+            let mut builder = ProgramBuilder::new();
             let input = builder.add_input(input_type);
             let output = builder.add_instruction(operation, Vec::new(), vec![input], None).unwrap()[0];
             let program = builder
-                .build::<Vec<XlaArrayConstant>, Vec<XlaArrayConstant>>(
-                    vec![output],
-                    vec![Placeholder],
-                    vec![Placeholder],
-                )
+                .build::<Vec<ArrayConstant>, Vec<ArrayConstant>>(vec![output], vec![Placeholder], vec![Placeholder])
                 .unwrap();
             assert!(matches!(
                 to_mlir_module_for_plain_program(&program, "main"),
@@ -991,11 +980,11 @@ mod tests {
 
         let input_type =
             ArrayType::new(DataType::F32, Shape::new(vec![dynamic_dimension("size", Some(i32::MAX as usize + 2))]));
-        let mut builder = XlaProgramBuilder::new();
+        let mut builder = ProgramBuilder::new();
         let input = builder.add_input(input_type);
         let output = builder.add_instruction(ZeroLikeOperation::new(), Vec::new(), vec![input], None).unwrap()[0];
         let program = builder
-            .build::<Vec<XlaArrayConstant>, Vec<XlaArrayConstant>>(vec![output], vec![Placeholder], vec![Placeholder])
+            .build::<Vec<ArrayConstant>, Vec<ArrayConstant>>(vec![output], vec![Placeholder], vec![Placeholder])
             .unwrap();
         let error = to_mlir_module_for_plain_program(&program, "main").unwrap_err();
         let Error::Core(ryft_core::Error::Type(error)) = error else { unreachable!() };
@@ -1012,16 +1001,12 @@ mod tests {
     fn test_lower_like_constant_executes_dynamic_shape() {
         let input_type = ArrayType::new(DataType::C64, Shape::new(vec![dynamic_dimension("size", Some(5))]))
             .with_layout(Layout::Tiled(TiledLayout::new(vec![0], Vec::new())));
-        let mut builder = XlaProgramBuilder::new();
+        let mut builder = ProgramBuilder::new();
         let input = builder.add_input(input_type);
         let zero = builder.add_instruction(ZeroLikeOperation::new(), Vec::new(), vec![input], None).unwrap()[0];
         let one = builder.add_instruction(OneLikeOperation::new(), Vec::new(), vec![input], None).unwrap()[0];
         let program = builder
-            .build::<Vec<XlaArrayConstant>, Vec<XlaArrayConstant>>(
-                vec![zero, one],
-                vec![Placeholder],
-                vec![Placeholder; 2],
-            )
+            .build::<Vec<ArrayConstant>, Vec<ArrayConstant>>(vec![zero, one], vec![Placeholder], vec![Placeholder; 2])
             .unwrap();
         let module = to_mlir_module_for_plain_program(&program, "like_dynamic").unwrap();
         assert_eq!(module.matches("stablehlo.custom_call @LayoutConstraint").count(), 2, "{module}");
@@ -1123,8 +1108,8 @@ mod tests {
 
     #[test]
     fn test_zero_space_one_like_is_rejected() {
-        let input_type = ArrayType::new(DataType::Zero, Shape::new(vec![Dimension::Static(3)]));
-        let mut builder = XlaProgramBuilder::new();
+        let input_type = ArrayType::new(DataType::Zero, Shape::new(vec![CoreDimension::Static(3)]));
+        let mut builder = ProgramBuilder::new();
         let input = builder.add_input(input_type);
         // Unsupported identities are rejected during inference before invalid IR can reach lowering.
         assert_eq!(
@@ -1135,8 +1120,8 @@ mod tests {
 
     #[test]
     fn test_f8e8m0fnu_zero_like_is_rejected() {
-        let input_type = ArrayType::new(DataType::F8E8M0FNU, Shape::new(vec![Dimension::Static(3)]));
-        let mut builder = XlaProgramBuilder::new();
+        let input_type = ArrayType::new(DataType::F8E8M0FNU, Shape::new(vec![CoreDimension::Static(3)]));
+        let mut builder = ProgramBuilder::new();
         let input = builder.add_input(input_type);
         // Unsupported identities are rejected during inference before invalid IR can reach lowering.
         assert_eq!(
@@ -1152,13 +1137,15 @@ mod tests {
             (Memory::Host { pinned: true }, Some("pinned_host")),
             (Memory::Host { pinned: false }, Some("unpinned_host")),
         ] {
-            let value =
-                Array::from_elements::<f32>(test_vector_type(4).with_memory(memory), &[1.0, 2.0, 3.0, 4.0]).unwrap();
-            let mut builder = ProgramBuilder::<Array, ArrayOperation<Array>>::new();
+            let value = CoreArray::from_elements::<f32>(test_vector_type(4).with_memory(memory), &[1.0, 2.0, 3.0, 4.0])
+                .unwrap();
+            let mut builder = CoreProgramBuilder::<CoreArray, ArrayOperation<CoreArray>>::new();
             let output = builder
                 .add_instruction(ArrayOperation::Constant(ConstantOperation::new(value)), Vec::new(), Vec::new(), None)
                 .unwrap()[0];
-            let program = builder.build::<Vec<Array>, Vec<Array>>(vec![output], Vec::new(), vec![Placeholder]).unwrap();
+            let program = builder
+                .build::<Vec<CoreArray>, Vec<CoreArray>>(vec![output], Vec::new(), vec![Placeholder])
+                .unwrap();
 
             let stablehlo = to_mlir_module_for_plain_program(&program, "main").unwrap();
             assert_eq!(
@@ -1179,7 +1166,7 @@ mod tests {
             (Memory::Host { pinned: true }, Some("pinned_host")),
             (Memory::Host { pinned: false }, Some("unpinned_host")),
         ] {
-            let context = TracingContext::<Array, ArrayOperation<Array>>::new();
+            let context = TracingContext::<CoreArray, ArrayOperation<CoreArray>>::new();
             let output_type = test_vector_type(4).with_memory(memory);
             let output = context.fill(&output_type, 2.5f64).unwrap();
             assert_eq!(*output.r#type(), output_type);
@@ -1187,7 +1174,7 @@ mod tests {
                 .builder()
                 .borrow()
                 .clone()
-                .build::<Vec<Array>, Vec<Array>>(vec![output.atom_id().unwrap()], Vec::new(), vec![Placeholder])
+                .build::<Vec<CoreArray>, Vec<CoreArray>>(vec![output.atom_id().unwrap()], Vec::new(), vec![Placeholder])
                 .unwrap();
 
             let stablehlo = to_mlir_module_for_plain_program(&program, "main").unwrap();
@@ -1203,7 +1190,7 @@ mod tests {
                 assert!(stablehlo.contains(&format!("_xla_buffer_placement = \"{placement}\"")), "{stablehlo}");
             }
 
-            let context = TracingContext::<Array, ArrayOperation<Array>>::new();
+            let context = TracingContext::<CoreArray, ArrayOperation<CoreArray>>::new();
             let output_type = ArrayType::scalar(DataType::F32).with_memory(memory);
             let output = context.fill(&output_type, 2.5f64).unwrap();
             assert_eq!(*output.r#type(), output_type);
@@ -1211,7 +1198,7 @@ mod tests {
                 .builder()
                 .borrow()
                 .clone()
-                .build::<Vec<Array>, Vec<Array>>(vec![output.atom_id().unwrap()], Vec::new(), vec![Placeholder])
+                .build::<Vec<CoreArray>, Vec<CoreArray>>(vec![output.atom_id().unwrap()], Vec::new(), vec![Placeholder])
                 .unwrap();
             let stablehlo = to_mlir_module_for_plain_program(&program, "main").unwrap();
             assert_eq!(stablehlo.matches("stablehlo.constant").count(), 1, "{stablehlo}");
@@ -1229,14 +1216,14 @@ mod tests {
 
     #[test]
     fn test_rank_positive_literal_constant_preserves_signed_zero_elements() {
-        let context = TracingContext::<Array, ArrayOperation<Array>>::new();
-        let literal = Array::from_elements(test_vector_type(2), &[-0.0_f32, 0.0]).unwrap();
+        let context = TracingContext::<CoreArray, ArrayOperation<CoreArray>>::new();
+        let literal = CoreArray::from_elements(test_vector_type(2), &[-0.0_f32, 0.0]).unwrap();
         let output = context.bind(ConstantOperation::new(literal), Vec::new(), &[]).unwrap().remove(0);
         let program = context
             .builder()
             .borrow()
             .clone()
-            .build::<Vec<Array>, Vec<Array>>(vec![output.atom_id().unwrap()], Vec::new(), vec![Placeholder])
+            .build::<Vec<CoreArray>, Vec<CoreArray>>(vec![output.atom_id().unwrap()], Vec::new(), vec![Placeholder])
             .unwrap();
 
         let stablehlo = to_mlir_module_for_plain_program(&program, "main").unwrap();
@@ -1246,12 +1233,14 @@ mod tests {
 
         // A rank-positive one-element literal remains an ordinary shaped dense constant rather than being rewritten
         // as a rank-zero constant plus broadcast.
-        let literal = Array::from_elements(test_vector_type(1), &[2.5_f32]).unwrap();
-        let mut builder = ProgramBuilder::<Array, ArrayOperation<Array>>::new();
+        let literal = CoreArray::from_elements(test_vector_type(1), &[2.5_f32]).unwrap();
+        let mut builder = CoreProgramBuilder::<CoreArray, ArrayOperation<CoreArray>>::new();
         let output = builder
             .add_instruction(ArrayOperation::Constant(ConstantOperation::new(literal)), Vec::new(), Vec::new(), None)
             .unwrap()[0];
-        let program = builder.build::<Vec<Array>, Vec<Array>>(vec![output], Vec::new(), vec![Placeholder]).unwrap();
+        let program = builder
+            .build::<Vec<CoreArray>, Vec<CoreArray>>(vec![output], Vec::new(), vec![Placeholder])
+            .unwrap();
         let stablehlo = to_mlir_module_for_plain_program(&program, "main").unwrap();
         assert_eq!(stablehlo.matches("stablehlo.constant").count(), 1, "{stablehlo}");
         assert_eq!(stablehlo.matches("stablehlo.broadcast_in_dim").count(), 0, "{stablehlo}");
@@ -1261,7 +1250,7 @@ mod tests {
     #[test]
     fn test_rank_positive_literal_dense_attributes_preserve_exact_payloads() {
         // Boolean values retain their logical order through MLIR's bit-packed dense representation.
-        let boolean = Array::vector(vec![true, false, true]).unwrap();
+        let boolean = CoreArray::vector(vec![true, false, true]).unwrap();
         let context = MlirContext::new();
         let location = context.unknown_location();
         let tensor_type = lower_tensor_type(boolean.r#type().as_ref(), &context, location).unwrap();
@@ -1274,11 +1263,11 @@ mod tests {
         // One-bit integers use the same packed MLIR representation as Boolean while retaining their Ryft data type.
         for (literal, expected) in [
             (
-                Array::vector(vec![i1::new(-1).unwrap(), i1::new(0).unwrap(), i1::new(-1).unwrap()]).unwrap(),
+                CoreArray::vector(vec![i1::new(-1).unwrap(), i1::new(0).unwrap(), i1::new(-1).unwrap()]).unwrap(),
                 vec![true, false, true],
             ),
             (
-                Array::vector(vec![u1::new(1).unwrap(), u1::new(0).unwrap(), u1::new(1).unwrap()]).unwrap(),
+                CoreArray::vector(vec![u1::new(1).unwrap(), u1::new(0).unwrap(), u1::new(1).unwrap()]).unwrap(),
                 vec![true, false, true],
             ),
         ] {
@@ -1289,10 +1278,10 @@ mod tests {
 
         // Wider sub-byte integers occupy one MLIR raw-buffer byte per element and preserve only their declared bits.
         for (literal, expected) in [
-            (Array::vector(vec![i2::new(-2).unwrap(), i2::new(1).unwrap()]).unwrap(), vec![0x02, 0x01]),
-            (Array::vector(vec![i4::new(-8).unwrap(), i4::new(7).unwrap()]).unwrap(), vec![0x08, 0x07]),
-            (Array::vector(vec![u2::new(0).unwrap(), u2::new(3).unwrap()]).unwrap(), vec![0x00, 0x03]),
-            (Array::vector(vec![u4::new(1).unwrap(), u4::new(15).unwrap()]).unwrap(), vec![0x01, 0x0f]),
+            (CoreArray::vector(vec![i2::new(-2).unwrap(), i2::new(1).unwrap()]).unwrap(), vec![0x02, 0x01]),
+            (CoreArray::vector(vec![i4::new(-8).unwrap(), i4::new(7).unwrap()]).unwrap(), vec![0x08, 0x07]),
+            (CoreArray::vector(vec![u2::new(0).unwrap(), u2::new(3).unwrap()]).unwrap(), vec![0x00, 0x03]),
+            (CoreArray::vector(vec![u4::new(1).unwrap(), u4::new(15).unwrap()]).unwrap(), vec![0x01, 0x0f]),
         ] {
             assert_eq!(test_literal_dense_bytes(&literal, expected.len()), expected);
         }
@@ -1300,24 +1289,24 @@ mod tests {
         // Every byte-aligned integer family preserves signedness, magnitude, and source order without floating-point
         // conversion. The `u64` case deliberately exceeds f64's exact-integer range.
         let integer_cases = vec![
-            (Array::vector(vec![-127_i8, 126]).unwrap(), values_to_bytes(&[-127_i8, 126])),
-            (Array::vector(vec![-0x1234_i16, 0x2345]).unwrap(), values_to_bytes(&[-0x1234_i16, 0x2345])),
+            (CoreArray::vector(vec![-127_i8, 126]).unwrap(), values_to_bytes(&[-127_i8, 126])),
+            (CoreArray::vector(vec![-0x1234_i16, 0x2345]).unwrap(), values_to_bytes(&[-0x1234_i16, 0x2345])),
             (
-                Array::vector(vec![-0x1234_567_i32, 0x2345_678]).unwrap(),
+                CoreArray::vector(vec![-0x1234_567_i32, 0x2345_678]).unwrap(),
                 values_to_bytes(&[-0x1234_567_i32, 0x2345_678]),
             ),
             (
-                Array::vector(vec![-0x1234_5678_9abc_def_i64, 0x2345_6789_abcd_ef0]).unwrap(),
+                CoreArray::vector(vec![-0x1234_5678_9abc_def_i64, 0x2345_6789_abcd_ef0]).unwrap(),
                 values_to_bytes(&[-0x1234_5678_9abc_def_i64, 0x2345_6789_abcd_ef0]),
             ),
-            (Array::vector(vec![0x12_u8, 0xfe]).unwrap(), values_to_bytes(&[0x12_u8, 0xfe])),
-            (Array::vector(vec![0x1234_u16, 0xfedc]).unwrap(), values_to_bytes(&[0x1234_u16, 0xfedc])),
+            (CoreArray::vector(vec![0x12_u8, 0xfe]).unwrap(), values_to_bytes(&[0x12_u8, 0xfe])),
+            (CoreArray::vector(vec![0x1234_u16, 0xfedc]).unwrap(), values_to_bytes(&[0x1234_u16, 0xfedc])),
             (
-                Array::vector(vec![0x1234_5678_u32, 0xfedc_ba98]).unwrap(),
+                CoreArray::vector(vec![0x1234_5678_u32, 0xfedc_ba98]).unwrap(),
                 values_to_bytes(&[0x1234_5678_u32, 0xfedc_ba98]),
             ),
             (
-                Array::vector(vec![(1_u64 << 53) + 1, u64::MAX - 1]).unwrap(),
+                CoreArray::vector(vec![(1_u64 << 53) + 1, u64::MAX - 1]).unwrap(),
                 values_to_bytes(&[(1_u64 << 53) + 1, u64::MAX - 1]),
             ),
         ];
@@ -1344,13 +1333,13 @@ mod tests {
             (DataType::F8E5M2FNUZ, [0x07, 0x80], "dense<[5.340580e-05, 0x80]>"),
             (DataType::F8E8M0FNU, [0x08, 0xff], "dense<[1.504630e-36, 0xFF]>"),
         ] {
-            let literal = Array::from_logical_bytes(
-                ArrayType::new(data_type, Shape::new(vec![Dimension::Static(bits.len())])),
+            let literal = CoreArray::from_logical_bytes(
+                ArrayType::new(data_type, Shape::new(vec![CoreDimension::Static(bits.len())])),
                 &bits,
             )
             .unwrap();
             assert_eq!(test_literal_dense_bytes(&literal, bits.len()), bits, "low-precision literal type {data_type}");
-            let mut builder = ProgramBuilder::<Array, ArrayOperation<Array>>::new();
+            let mut builder = CoreProgramBuilder::<CoreArray, ArrayOperation<CoreArray>>::new();
             let output = builder
                 .add_instruction(
                     ArrayOperation::Constant(ConstantOperation::new(literal)),
@@ -1359,7 +1348,9 @@ mod tests {
                     None,
                 )
                 .unwrap()[0];
-            let program = builder.build::<Vec<Array>, Vec<Array>>(vec![output], Vec::new(), vec![Placeholder]).unwrap();
+            let program = builder
+                .build::<Vec<CoreArray>, Vec<CoreArray>>(vec![output], Vec::new(), vec![Placeholder])
+                .unwrap();
             let stablehlo = to_mlir_module_for_plain_program(&program, "main").unwrap();
             assert!(stablehlo.contains(rendered_values), "low-precision literal {data_type}: {stablehlo}");
         }
@@ -1371,10 +1362,10 @@ mod tests {
         let f64_values =
             [f64::from_bits(0x8000_0000_0000_0000), f64::NEG_INFINITY, f64::from_bits(0x7ff8_0000_0000_1234)];
         for (literal, expected) in [
-            (Array::vector(bf16_values.to_vec()).unwrap(), values_to_bytes(&bf16_values)),
-            (Array::vector(f16_values.to_vec()).unwrap(), values_to_bytes(&f16_values)),
-            (Array::vector(f32_values.to_vec()).unwrap(), values_to_bytes(&f32_values)),
-            (Array::vector(f64_values.to_vec()).unwrap(), values_to_bytes(&f64_values)),
+            (CoreArray::vector(bf16_values.to_vec()).unwrap(), values_to_bytes(&bf16_values)),
+            (CoreArray::vector(f16_values.to_vec()).unwrap(), values_to_bytes(&f16_values)),
+            (CoreArray::vector(f32_values.to_vec()).unwrap(), values_to_bytes(&f32_values)),
+            (CoreArray::vector(f64_values.to_vec()).unwrap(), values_to_bytes(&f64_values)),
         ] {
             assert_eq!(
                 test_literal_dense_bytes(&literal, expected.len()),
@@ -1387,7 +1378,7 @@ mod tests {
         // Complex storage interleaves independently exact real and imaginary components in source order.
         let c64_components =
             [f32::from_bits(0x8000_0000), f32::from_bits(0x7fc0_1234), f32::INFINITY, f32::NEG_INFINITY];
-        let c64 = Array::vector(vec![
+        let c64 = CoreArray::vector(vec![
             ComplexNumber::new(c64_components[0], c64_components[1]),
             ComplexNumber::new(c64_components[2], c64_components[3]),
         ])
@@ -1399,7 +1390,7 @@ mod tests {
             f64::INFINITY,
             f64::NEG_INFINITY,
         ];
-        let c128 = Array::vector(vec![
+        let c128 = CoreArray::vector(vec![
             ComplexNumber::new(c128_components[0], c128_components[1]),
             ComplexNumber::new(c128_components[2], c128_components[3]),
         ])
@@ -1407,14 +1398,15 @@ mod tests {
         assert_eq!(test_literal_dense_bytes(&c128, size_of_val(&c128_components)), values_to_bytes(&c128_components),);
 
         // Explicit physical layouts are traversed in logical row-major order before constructing the literal.
-        let layout_type = ArrayType::new(DataType::I16, Shape::new(vec![Dimension::Static(2), Dimension::Static(2)]))
-            .with_layout(Some(ryft_core::arrays::StridedLayout::new(vec![2, 4]).into()));
-        let layout_literal = Array::from_elements(layout_type, &[1_i16, 2, 3, 4]).unwrap();
+        let layout_type =
+            ArrayType::new(DataType::I16, Shape::new(vec![CoreDimension::Static(2), CoreDimension::Static(2)]))
+                .with_layout(Some(ryft_core::arrays::StridedLayout::new(vec![2, 4]).into()));
+        let layout_literal = CoreArray::from_elements(layout_type, &[1_i16, 2, 3, 4]).unwrap();
         assert_eq!(layout_literal.storage_bytes(), values_to_bytes(&[1_i16, 3, 2, 4]));
         assert_eq!(test_literal_dense_bytes(&layout_literal, 8), values_to_bytes(&[1_i16, 2, 3, 4]));
 
         // Empty tensors remain valid dense constants and carry no raw payload bytes.
-        let empty = Array::vector(Vec::<i32>::new()).unwrap();
+        let empty = CoreArray::vector(Vec::<i32>::new()).unwrap();
         let tensor_type = lower_tensor_type(empty.r#type().as_ref(), &context, location).unwrap();
         let attribute = empty.to_dense_elements_attribute(tensor_type, &context).unwrap();
         assert_eq!(attribute.elements_count(), 0);
@@ -1423,14 +1415,14 @@ mod tests {
         let tensor_type = context
             .tensor_type(context.signless_integer_type(1), &[MlirSize::Static(2)], None, location)
             .unwrap();
-        let zero = Array::from_logical_bytes(ArrayType::new_static(DataType::Zero, [2]), &[]).unwrap();
+        let zero = CoreArray::from_logical_bytes(ArrayType::new_static(DataType::Zero, [2]), &[]).unwrap();
         assert_eq!(
             zero.to_dense_elements_attribute(tensor_type, &context).unwrap().to_string(),
             "dense<false> : tensor<2xi1>"
         );
 
         // Tokens remain effect values and have no dense literal representation.
-        let token = Array::from_logical_bytes(ArrayType::new_static(DataType::Token, [2]), &[]).unwrap();
+        let token = CoreArray::from_logical_bytes(ArrayType::new_static(DataType::Token, [2]), &[]).unwrap();
         assert!(matches!(
             token.to_dense_elements_attribute(tensor_type, &context),
             Err(Error::Lowering(LoweringError::UnsupportedElementType { data_type: DataType::Token, .. })),
@@ -1452,18 +1444,18 @@ mod tests {
         let c128_components =
             [1.5_f64, -2.0, f64::from_bits(0x8000_0000_0000_0000), f64::from_bits(0x7ff8_0000_0000_1234)];
         let cases = vec![
-            (Array::vector(vec![true, false, true]).unwrap(), vec![1_u8, 0, 1]),
-            (Array::vector(vec![-0x1234_i16, 0x2345]).unwrap(), values_to_bytes(&[-0x1234_i16, 0x2345])),
+            (CoreArray::vector(vec![true, false, true]).unwrap(), vec![1_u8, 0, 1]),
+            (CoreArray::vector(vec![-0x1234_i16, 0x2345]).unwrap(), values_to_bytes(&[-0x1234_i16, 0x2345])),
             (
-                Array::vector(vec![(1_u64 << 53) + 1, u64::MAX - 1]).unwrap(),
+                CoreArray::vector(vec![(1_u64 << 53) + 1, u64::MAX - 1]).unwrap(),
                 values_to_bytes(&[(1_u64 << 53) + 1, u64::MAX - 1]),
             ),
-            (Array::vector(bf16_values.to_vec()).unwrap(), values_to_bytes(&bf16_values)),
-            (Array::vector(f16_values.to_vec()).unwrap(), values_to_bytes(&f16_values)),
-            (Array::vector(f32_values.to_vec()).unwrap(), values_to_bytes(&f32_values)),
-            (Array::vector(f64_values.to_vec()).unwrap(), values_to_bytes(&f64_values)),
+            (CoreArray::vector(bf16_values.to_vec()).unwrap(), values_to_bytes(&bf16_values)),
+            (CoreArray::vector(f16_values.to_vec()).unwrap(), values_to_bytes(&f16_values)),
+            (CoreArray::vector(f32_values.to_vec()).unwrap(), values_to_bytes(&f32_values)),
+            (CoreArray::vector(f64_values.to_vec()).unwrap(), values_to_bytes(&f64_values)),
             (
-                Array::vector(vec![
+                CoreArray::vector(vec![
                     ComplexNumber::new(c64_components[0], c64_components[1]),
                     ComplexNumber::new(c64_components[2], c64_components[3]),
                 ])
@@ -1471,23 +1463,23 @@ mod tests {
                 values_to_bytes(&c64_components),
             ),
             (
-                Array::vector(vec![
+                CoreArray::vector(vec![
                     ComplexNumber::new(c128_components[0], c128_components[1]),
                     ComplexNumber::new(c128_components[2], c128_components[3]),
                 ])
                 .unwrap(),
                 values_to_bytes(&c128_components),
             ),
-            (Array::vector(vec![i1::new(-1).unwrap(), i1::new(0).unwrap()]).unwrap(), vec![0x01, 0x00]),
-            (Array::vector(vec![i2::new(-2).unwrap(), i2::new(1).unwrap()]).unwrap(), vec![0x02, 0x01]),
-            (Array::vector(vec![i4::new(-8).unwrap(), i4::new(7).unwrap()]).unwrap(), vec![0x08, 0x07]),
-            (Array::vector(vec![u1::new(0).unwrap(), u1::new(1).unwrap()]).unwrap(), vec![0x00, 0x01]),
-            (Array::vector(vec![u2::new(0).unwrap(), u2::new(3).unwrap()]).unwrap(), vec![0x00, 0x03]),
-            (Array::vector(vec![u4::new(1).unwrap(), u4::new(15).unwrap()]).unwrap(), vec![0x01, 0x0f]),
-            (Array::vector(Vec::<i32>::new()).unwrap(), Vec::new()),
+            (CoreArray::vector(vec![i1::new(-1).unwrap(), i1::new(0).unwrap()]).unwrap(), vec![0x01, 0x00]),
+            (CoreArray::vector(vec![i2::new(-2).unwrap(), i2::new(1).unwrap()]).unwrap(), vec![0x02, 0x01]),
+            (CoreArray::vector(vec![i4::new(-8).unwrap(), i4::new(7).unwrap()]).unwrap(), vec![0x08, 0x07]),
+            (CoreArray::vector(vec![u1::new(0).unwrap(), u1::new(1).unwrap()]).unwrap(), vec![0x00, 0x01]),
+            (CoreArray::vector(vec![u2::new(0).unwrap(), u2::new(3).unwrap()]).unwrap(), vec![0x00, 0x03]),
+            (CoreArray::vector(vec![u4::new(1).unwrap(), u4::new(15).unwrap()]).unwrap(), vec![0x01, 0x0f]),
+            (CoreArray::vector(Vec::<i32>::new()).unwrap(), Vec::new()),
         ];
 
-        let mut builder = ProgramBuilder::<Array, ArrayOperation<Array>>::new();
+        let mut builder = CoreProgramBuilder::<CoreArray, ArrayOperation<CoreArray>>::new();
         let outputs = cases
             .iter()
             .map(|(literal, _)| {
@@ -1502,7 +1494,7 @@ mod tests {
             })
             .collect::<Vec<_>>();
         let program = builder
-            .build::<Vec<Array>, Vec<Array>>(outputs, Vec::new(), vec![Placeholder; cases.len()])
+            .build::<Vec<CoreArray>, Vec<CoreArray>>(outputs, Vec::new(), vec![Placeholder; cases.len()])
             .unwrap();
         let module = to_mlir_module_for_plain_program(&program, "main").unwrap();
         for literal in [
@@ -1573,11 +1565,13 @@ mod tests {
             (Memory::Host { pinned: true }, Some("pinned_host")),
             (Memory::Host { pinned: false }, Some("unpinned_host")),
         ] {
-            let value =
-                Array::from_elements::<f32>(test_vector_type(4).with_memory(memory), &[1.0, 2.0, 3.0, 4.0]).unwrap();
-            let mut builder = ProgramBuilder::<Array, ArrayOperation<Array>>::new();
+            let value = CoreArray::from_elements::<f32>(test_vector_type(4).with_memory(memory), &[1.0, 2.0, 3.0, 4.0])
+                .unwrap();
+            let mut builder = CoreProgramBuilder::<CoreArray, ArrayOperation<CoreArray>>::new();
             let output = builder.add_constant(value);
-            let program = builder.build::<Vec<Array>, Vec<Array>>(vec![output], Vec::new(), vec![Placeholder]).unwrap();
+            let program = builder
+                .build::<Vec<CoreArray>, Vec<CoreArray>>(vec![output], Vec::new(), vec![Placeholder])
+                .unwrap();
 
             let stablehlo = to_mlir_module_for_plain_program(&program, "main").unwrap();
             assert_eq!(

@@ -10,17 +10,17 @@ use std::time::{Duration, Instant};
 
 use ryft_core::{
     AnalyzableCompilationDomain, ArrayIrType, ArrayType, CompilationCacheDomain, CompilationTracer, DeviceMesh,
-    StagedFunction,
+    StagedFunction as CoreStagedFunction,
 };
 use ryft_kernels::{KernelDefinition, VerifiedKernel};
 use ryft_pjrt::Execution;
 use serde::{Deserialize, Serialize};
 use sha2::{Digest, Sha256};
 
-use crate::experimental::domains::XlaCompiledProgram;
+use crate::domains::CompiledProgram;
 use crate::kernels::KernelEmbeddingError;
-use crate::kernels::staging::{XlaKernelCompilerBinding, XlaKernelExecutionFacts, stage_kernel};
-use crate::{Error, XlaArray, XlaCompilationAnalysis, XlaDomain, XlaOptions};
+use crate::kernels::staging::{KernelCompilerBinding, KernelExecutionFacts, stage_kernel};
+use crate::{Array, CompilationAnalysis, Domain, Error, Options};
 
 // TODO(eaplatanios): Promote kernel AOT errors to dedicated `ryft_xla::Error` variants after
 // this support leaves experimental status.
@@ -77,7 +77,7 @@ pub struct KernelCompilationReport {
     /// Host time in the XLA compilation or executable cache lookup.
     pub compilation_duration: Duration,
     /// Existing typed PJRT analysis, preserving unsupported properties as absent.
-    pub analysis: XlaCompilationAnalysis,
+    pub analysis: CompilationAnalysis,
 }
 
 /// Private, versioned bundle metadata. Binary source/executable sections avoid JSON byte-array expansion.
@@ -127,8 +127,8 @@ impl KernelAotBundle {
     /// `maximum_programs` bounds source verification, not native compilation; adapter compiler deadlines remain active.
     pub fn compile<'c>(
         definition: &KernelDefinition,
-        domain: &XlaDomain<'c>,
-        options: XlaOptions,
+        domain: &Domain<'c>,
+        options: Options,
         maximum_programs: usize,
     ) -> Result<Self, KernelAotError> {
         VerifiedKernel::new(definition, maximum_programs).map_err(|error| Self::invalid(error.to_string()))?;
@@ -142,11 +142,11 @@ impl KernelAotBundle {
         let binding =
             options.kernel_compiler.as_ref().ok_or_else(|| Self::invalid("a compiler binding is required"))?;
         let configuration = binding.configuration().to_vec();
-        let facts = XlaKernelExecutionFacts::from_target(domain.target()?, &options.mesh)?;
+        let facts = KernelExecutionFacts::from_target(domain.target()?, &options.mesh)?;
         let execution = facts.configuration_key()?;
         let start = Instant::now();
-        let staged = StagedFunction::<XlaDomain<'_>, Vec<ArrayIrType>, Vec<ArrayIrType>>::stage(
-            |_, _, inputs: Vec<CompilationTracer<XlaDomain<'c>>>| {
+        let staged = CoreStagedFunction::<Domain<'_>, Vec<ArrayIrType>, Vec<ArrayIrType>>::stage(
+            |_, _, inputs: Vec<CompilationTracer<Domain<'c>>>| {
                 Ok(stage_kernel(inputs[0].context(), definition, &inputs)?)
             },
             vec![],
@@ -284,14 +284,14 @@ impl KernelAotBundle {
     /// devices in the same order. XLA additionally validates its build identity, flags, platform, and executable ABI.
     pub fn load<'c>(
         &self,
-        domain: &XlaDomain<'c>,
-        binding: &XlaKernelCompilerBinding,
+        domain: &Domain<'c>,
+        binding: &KernelCompilerBinding,
         mesh: &DeviceMesh,
     ) -> Result<LoadedKernel<'c>, KernelAotError> {
         if binding.configuration() != self.manifest.configuration {
             return Err(Self::invalid("compiler binding configuration mismatch"));
         }
-        let facts = XlaKernelExecutionFacts::from_target(domain.target()?, mesh)?;
+        let facts = KernelExecutionFacts::from_target(domain.target()?, mesh)?;
         if facts.configuration_key()? != self.manifest.execution {
             return Err(Self::invalid("live execution compatibility mismatch"));
         }
@@ -341,9 +341,9 @@ impl KernelAotBundle {
 #[derive(Clone)]
 pub struct LoadedKernel<'c> {
     /// Session owning CUDA resources and ordinary invocation/effect policy.
-    domain: XlaDomain<'c>,
+    domain: Domain<'c>,
     /// Existing PJRT executable and its validated invocation metadata.
-    program: Arc<XlaCompiledProgram<'c>>,
+    program: Arc<CompiledProgram<'c>>,
     /// Exact source and compiler-binding identity used by distributed preflight.
     identity: Vec<u8>,
     /// Live plugin and local topology identity checked by the AOT loader.
@@ -368,13 +368,13 @@ impl<'c> LoadedKernel<'c> {
     }
 
     /// Borrows the existing domain, canonical boundary and identities for host-coordinated execution.
-    pub(crate) fn distributed_parts(&self) -> (&XlaDomain<'c>, &[ArrayType], &DeviceMesh, &[u8], &[u8]) {
+    pub(crate) fn distributed_parts(&self) -> (&Domain<'c>, &[ArrayType], &DeviceMesh, &[u8], &[u8]) {
         (&self.domain, self.program.input_types(), self.program.mesh(), &self.identity, &self.execution)
     }
 
     /// Submits ordinary array inputs and returns the existing completion-bearing execution handle.
     /// Pending uploads, input retention, aliases, and device failures use XLA's canonical invocation path.
-    pub fn call(&self, inputs: Vec<XlaArray<'c>>) -> Result<Execution<Vec<XlaArray<'c>>>, KernelAotError> {
+    pub fn call(&self, inputs: Vec<Array<'c>>) -> Result<Execution<Vec<Array<'c>>>, KernelAotError> {
         Ok(self.domain.execute_compiled_async(&self.program, inputs)?)
     }
 }
@@ -387,7 +387,7 @@ pub(crate) mod tests {
 
     use crate::kernels::staging::tests::binding;
     use crate::kernels::tests::definition;
-    use crate::{FromPjrt, XlaSession};
+    use crate::{FromPjrt, Session};
 
     use super::*;
 
@@ -428,35 +428,35 @@ pub(crate) mod tests {
     /// Compiles a real ordinary CPU executable to isolate the AOT loader's stateless boundary checks.
     /// This fixture does not claim execution of a mock adapter's custom call.
     pub(crate) fn executable_bundle<'c>(
-        domain: &XlaDomain<'c>,
+        domain: &Domain<'c>,
         mesh: &DeviceMesh,
         data_type: DataType,
         capture: bool,
-        compiler: &XlaKernelCompilerBinding,
+        compiler: &KernelCompilerBinding,
     ) -> KernelAotBundle {
         let r#type = ArrayType::scalar(data_type);
         let captures = if capture {
-            vec![crate::XlaValue::Array(
-                XlaArray::from_host_buffer(domain, r#type.clone(), mesh.clone(), 7i32.to_ne_bytes()).unwrap(),
+            vec![crate::Value::Array(
+                Array::from_host_buffer(domain, r#type.clone(), mesh.clone(), 7i32.to_ne_bytes()).unwrap(),
             )]
         } else {
             vec![]
         };
-        let staged = StagedFunction::<XlaDomain<'_>, Vec<ArrayIrType>, Vec<ArrayIrType>>::stage(
-            |_, captures: Vec<CompilationTracer<XlaDomain<'c>>>, inputs| {
+        let staged = CoreStagedFunction::<Domain<'_>, Vec<ArrayIrType>, Vec<ArrayIrType>>::stage(
+            |_, captures: Vec<CompilationTracer<Domain<'c>>>, inputs| {
                 // Returning the capture retains a real capture slot without introducing unrelated operations.
                 Ok(if captures.is_empty() { inputs } else { captures })
             },
             captures,
             vec![ArrayIrType::Array(r#type)],
-            XlaOptions::new(mesh.clone()),
+            Options::new(mesh.clone()),
         )
         .unwrap();
         let compiled = staged.lower(&domain).unwrap().compile(&domain).unwrap();
         let mut bundle = bundle();
         bundle.manifest.configuration = compiler.configuration().to_vec();
         bundle.executable = domain.serialize_program(compiled.compiled_program()).unwrap().unwrap();
-        bundle.manifest.execution = XlaKernelExecutionFacts::from_target(domain.target().unwrap(), mesh)
+        bundle.manifest.execution = KernelExecutionFacts::from_target(domain.target().unwrap(), mesh)
             .unwrap()
             .configuration_key()
             .unwrap();
@@ -488,10 +488,10 @@ pub(crate) mod tests {
     #[test]
     fn test_kernel_aot_bundle_compile_missing_binding() {
         let client = load_cpu_plugin().unwrap().client(ClientOptions::CPU(CpuClientOptions::default())).unwrap();
-        let domain = XlaSession::new(&client).domain();
+        let domain = Session::new(&client).domain();
         let mesh = DeviceMesh::new(LogicalMesh::new(vec![]).unwrap(), vec![Device::new(0, 0)]).unwrap();
         assert!(matches!(
-            KernelAotBundle::compile(&definition(), &domain, XlaOptions::new(mesh), 1),
+            KernelAotBundle::compile(&definition(), &domain, Options::new(mesh), 1),
             Err(KernelAotError::Invalid { message }) if message == "a compiler binding is required",
         ));
     }
@@ -503,10 +503,10 @@ pub(crate) mod tests {
         let operation = KernelCallOperation::new(Grid::new(vec![]).unwrap(), vec![]).unwrap();
         let definition: KernelDefinition = KernelDefinition::trace(operation, |_| Ok(())).unwrap();
         let client = load_cpu_plugin().unwrap().client(ClientOptions::CPU(CpuClientOptions::default())).unwrap();
-        let domain = XlaSession::new(&client).domain();
+        let domain = Session::new(&client).domain();
         let mesh = DeviceMesh::new(LogicalMesh::new(vec![]).unwrap(), vec![Device::new(0, 0)]).unwrap();
         assert!(matches!(
-            KernelAotBundle::compile(&definition, &domain, XlaOptions::new(mesh), 1),
+            KernelAotBundle::compile(&definition, &domain, Options::new(mesh), 1),
             Err(KernelAotError::Invalid { message })
                 if message == "aot compilation requires at least one ordinary kernel input",
         ));
@@ -616,7 +616,7 @@ pub(crate) mod tests {
     #[test]
     fn test_kernel_aot_bundle_load_configuration() {
         let client = load_cpu_plugin().unwrap().client(ClientOptions::CPU(CpuClientOptions::default())).unwrap();
-        let domain = XlaSession::new(&client).domain();
+        let domain = Session::new(&client).domain();
         let mesh = DeviceMesh::new(LogicalMesh::new(vec![]).unwrap(), vec![Device::new(0, 0)]).unwrap();
         assert!(matches!(
             bundle().load(&domain, &binding(2), &mesh),
@@ -632,7 +632,7 @@ pub(crate) mod tests {
             vec![Device::from_pjrt(client.addressable_devices().unwrap().remove(0)).unwrap()],
         )
         .unwrap();
-        let domain = XlaSession::new(&client).domain().with_mesh(mesh.clone());
+        let domain = Session::new(&client).domain().with_mesh(mesh.clone());
         assert!(matches!(
             bundle().load(&domain, &binding(1), &mesh),
             Err(KernelAotError::Invalid { message }) if message == "live execution compatibility mismatch",
@@ -650,12 +650,12 @@ pub(crate) mod tests {
             vec![Device::from_pjrt(client.addressable_devices().unwrap().remove(0)).unwrap()],
         )
         .unwrap();
-        let domain = XlaSession::new(&client).domain().with_mesh(mesh.clone());
+        let domain = Session::new(&client).domain().with_mesh(mesh.clone());
         let original = executable_bundle(&domain, &mesh, DataType::I32, false, &binding(1));
         let decoded = KernelAotBundle::from_bytes(&original.to_bytes().unwrap(), 1).unwrap();
         let loaded = decoded.load(&domain, &binding(1), &mesh).unwrap();
         let input =
-            XlaArray::from_host_buffer(&domain, ArrayType::scalar(DataType::I32), mesh.clone(), 23i32.to_ne_bytes())
+            Array::from_host_buffer(&domain, ArrayType::scalar(DataType::I32), mesh.clone(), 23i32.to_ne_bytes())
                 .unwrap();
         let execution = loaded.call(vec![input]).unwrap();
         execution.fence().block_until_ready().unwrap();
@@ -695,7 +695,7 @@ pub(crate) mod tests {
             vec![Device::from_pjrt(client.addressable_devices().unwrap().remove(0)).unwrap()],
         )
         .unwrap();
-        let domain = XlaSession::new(&client).domain().with_mesh(mesh.clone());
+        let domain = Session::new(&client).domain().with_mesh(mesh.clone());
         let bundle = executable_bundle(&domain, &mesh, DataType::I32, false, &binding(1));
         let mut loaded = bundle.load(&domain, &binding(1), &mesh).unwrap();
         assert!(loaded.validate_distributed_effects().is_ok());

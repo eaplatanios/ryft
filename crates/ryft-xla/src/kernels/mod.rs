@@ -38,11 +38,11 @@ use std::collections::{BTreeMap, BTreeSet};
 
 use ryft_core::{
     ArrayIrType, ArrayType, Context, CustomCallOperation, DataType, EffectClass, Layout, Memory, MeshAxis,
-    MeshAxisType, Operation, ProgramError, ShardingDimension, TypeError, Typed,
+    MeshAxisType, Operation as CoreOperation, ProgramError, ShardingDimension, TypeError, Typed,
 };
 use ryft_kernels::{
-    KERNEL_SCHEMA_VERSION, KernelCompiler, KernelDefinition, KernelExtension, KernelSchedule, NoKernelExtension,
-    VerifiedKernel,
+    KERNEL_SCHEMA_VERSION, KernelCompiler, KernelDefinition, KernelExtension as PortableKernelExtension,
+    KernelSchedule, NoKernelExtension, VerifiedKernel,
 };
 use ryft_mlir::dialects::stable_hlo::CustomCallMemoryLayouts;
 use sha2::{Digest, Sha256};
@@ -78,9 +78,8 @@ pub use tuning::{
 
 pub(crate) use staging::select_kernels;
 pub use staging::{
-    XlaKernelCompilerBinding, XlaKernelDeviceFacts, XlaKernelExecutionFacts, XlaKernelExtension, XlaKernelOperation,
-    XlaKernelTarget, stage_kernel, stage_kernel_with_fallback, stage_kernel_with_jvp, stage_kernel_with_rules,
-    stage_kernel_with_vjp,
+    KernelCompilerBinding, KernelDeviceFacts, KernelExecutionFacts, KernelExtension, KernelOperation, KernelTarget,
+    stage_kernel, stage_kernel_with_fallback, stage_kernel_with_jvp, stage_kernel_with_rules, stage_kernel_with_vjp,
 };
 
 #[cfg(feature = "rocm")]
@@ -154,7 +153,7 @@ pub enum KernelEmbeddingError {
 /// request external reference-state slots or alter the kernel's logical inputs and results. An embedding implementing
 /// native checked assertions must return precisely [`EffectClass::OrderedAssertion`], preserving their token chain;
 /// a pure call cannot discharge or silently discard an observable assertion.
-pub trait KernelOutputEmbedding<Output, Extension: Operation<Type = ArrayIrType> = NoKernelExtension> {
+pub trait KernelOutputEmbedding<Output, Extension: CoreOperation<Type = ArrayIrType> = NoKernelExtension> {
     /// Returns deterministic bytes covering target names, physical mappings, payload schemas, and plugin ABI facts.
     fn configuration_key(&self) -> Result<Vec<u8>, KernelEmbeddingError>;
 
@@ -172,7 +171,7 @@ pub trait KernelOutputEmbedding<Output, Extension: Operation<Type = ArrayIrType>
 /// payload from masquerading as an unverified kernel. Binding emits the selected custom call only after validating
 /// the exact logical inputs. Its attributes participate in existing StableHLO-based compilation and persistence keys.
 #[derive(Clone, Debug)]
-pub struct CompiledKernel<Extension: Operation<Type = ArrayIrType> = NoKernelExtension> {
+pub struct CompiledKernel<Extension: CoreOperation<Type = ArrayIrType> = NoKernelExtension> {
     /// Immutable body and boundary that were verified before compilation and embedding.
     definition: KernelDefinition<Extension>,
 
@@ -182,7 +181,7 @@ pub struct CompiledKernel<Extension: Operation<Type = ArrayIrType> = NoKernelExt
 
 impl<Extension> CompiledKernel<Extension>
 where
-    Extension: KernelExtension,
+    Extension: PortableKernelExtension,
 {
     /// Admits and compiles the verified definition with one explicitly selected adapter, then embeds its typed output.
     /// Compiler configuration is recorded even when it does not alter the emitted native bytes.
@@ -405,8 +404,8 @@ pub(crate) mod tests {
     use indoc::formatdoc;
     use pretty_assertions::assert_eq;
     use ryft_core::{
-        Array, ArrayIrOperation, ArrayIrValue, Context, DataType, Placeholder, ProgramBuilder, ReferenceRead,
-        ReferenceWrite,
+        Array as CoreArray, ArrayIrOperation, ArrayIrValue, Context, DataType, Placeholder,
+        ProgramBuilder as CoreProgramBuilder, ReferenceRead, ReferenceWrite,
     };
     use ryft_kernels::{
         BlockMapping, BoundaryPolicy, Grid, KernelCallOperation, KernelCompilationError, KernelParameter,
@@ -414,14 +413,14 @@ pub(crate) mod tests {
     };
 
     use crate::experimental::lowering::lower_mlir_module_for_program;
-    use crate::experimental::ops::{XlaConstant, XlaProgramBuilder};
+    use crate::experimental::ops::{Constant, ProgramBuilder};
 
     use super::*;
 
     /// A scalar identity with a functional read-write alias and no external reference slot.
     pub(crate) fn definition() -> KernelDefinition {
         let mapping = BlockMapping::new(
-            ProgramBuilder::<ArrayIrValue<Array>, ArrayIrOperation<Array>>::new()
+            CoreProgramBuilder::<ArrayIrValue<CoreArray>, ArrayIrOperation<CoreArray>>::new()
                 .build(vec![], vec![], vec![])
                 .unwrap(),
             vec![],
@@ -657,15 +656,15 @@ pub(crate) mod tests {
     #[test]
     fn test_compiled_kernel_from_output_rejects_external_body_effects() {
         use ryft_core::ArrayOperation;
-        use ryft_kernels::KernelOperation;
+        use ryft_kernels::KernelOperation as PortableKernelOperation;
 
         for effect in [EffectClass::OrderedIo, EffectClass::OrderedState, EffectClass::OrderedAssertion] {
             let logical = definition().operation().clone();
-            let mut builder = ProgramBuilder::<ArrayIrValue<Array>, KernelOperation>::new();
+            let mut builder = CoreProgramBuilder::<ArrayIrValue<CoreArray>, PortableKernelOperation>::new();
             builder.add_input(logical.parameters()[0].body_type());
             builder
                 .add_instruction(
-                    ArrayOperation::<Array>::CustomCall(
+                    ArrayOperation::<CoreArray>::CustomCall(
                         CustomCallOperation::new("test.external", vec![]).with_effect_class(effect),
                     ),
                     vec![],
@@ -695,11 +694,11 @@ pub(crate) mod tests {
         )
         .unwrap();
         let scalar = ArrayType::scalar(DataType::I32);
-        let mut builder = XlaProgramBuilder::new();
+        let mut builder = ProgramBuilder::new();
         let input = builder.add_input(scalar.clone().into());
         let output = builder.add_instruction(compiled.custom_call().clone(), vec![], vec![input], None).unwrap()[0];
         let program = builder
-            .build::<Vec<XlaConstant>, Vec<XlaConstant>>(vec![output], vec![Placeholder], vec![Placeholder])
+            .build::<Vec<Constant>, Vec<Constant>>(vec![output], vec![Placeholder], vec![Placeholder])
             .unwrap();
         assert!(program.reference_analysis(0).unwrap().roots().next().is_none());
         let lowered = lower_mlir_module_for_program(

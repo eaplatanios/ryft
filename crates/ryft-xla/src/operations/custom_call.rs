@@ -3,7 +3,7 @@ use std::collections::HashSet;
 use ryft_core::macros::check_count;
 use ryft_core::{
     ArrayIrType, ArrayType, CUSTOM_CALL_OPERATION_NAME, CustomCallArrayAttribute, CustomCallAttribute,
-    CustomCallOperation, DataType, Dimension, EffectClass, Layout, ProgramError, Shape,
+    CustomCallOperation, DataType, Dimension as CoreDimension, EffectClass, Layout, ProgramError, Shape,
 };
 use ryft_mlir::dialects::stable_hlo;
 use ryft_mlir::dialects::stable_hlo::{CustomCallApiVersion, CustomCallMemoryLayouts};
@@ -15,7 +15,7 @@ use ryft_mlir::{
 use crate::experimental::lowering::types::{lower_physical_storage, lower_tensor_type, lower_unplaced_constant_output};
 use crate::experimental::lowering::{EffectTokens, current_or_new_token};
 use crate::operations::assertions::lower_output_extent_validation;
-use crate::{Error, LowerableOperation, LowerableOperationFamily, LoweringError, MemberLowerableOperation, XlaLowerer};
+use crate::{Error, LowerableOperation, LowerableOperationFamily, Lowerer, LoweringError, MemberLowerableOperation};
 
 /// Returns the minor-to-major layout required by one custom-call array type.
 fn lower_custom_call_layout(r#type: &ArrayType) -> Result<Vec<usize>, Error> {
@@ -168,12 +168,12 @@ fn custom_call_physical_type(r#type: &ArrayType, role: &str) -> Result<ArrayType
         .dimensions()
         .iter()
         .map(|dimension| match dimension {
-            Dimension::Static(extent) => Ok(Dimension::Static(*extent)),
-            Dimension::Dynamic(variable) => variable
+            CoreDimension::Static(extent) => Ok(CoreDimension::Static(*extent)),
+            CoreDimension::Dynamic(variable) => variable
                 .bounds()
                 .upper()
                 .and_then(|upper| upper.checked_sub(1))
-                .map(Dimension::Static)
+                .map(CoreDimension::Static)
                 .ok_or_else(|| {
                     Error::Lowering(LoweringError::UnsupportedOperation {
                         operation: CUSTOM_CALL_OPERATION_NAME.to_string(),
@@ -325,7 +325,7 @@ pub(crate) fn lower_custom_call_to_mlir<'b, 'c: 'b, 't: 'c>(
 impl LowerableOperation for CustomCallOperation {
     fn lower<'b, 'c: 'b, 't: 'c, O: LowerableOperationFamily>(
         &self,
-        lowerer: &mut XlaLowerer<'b, 'c, 't, O>,
+        lowerer: &mut Lowerer<'b, 'c, 't, O>,
         input_values: &[ValueRef<'b, 'c, 't>],
         input_types: &[ArrayType],
         output_types: &[ArrayType],
@@ -346,7 +346,7 @@ impl LowerableOperation for CustomCallOperation {
 impl MemberLowerableOperation<ArrayIrType> for CustomCallOperation {
     fn lower_in_parent<'b, 'c: 'b, 't: 'c, O: LowerableOperationFamily>(
         &self,
-        lowerer: &mut XlaLowerer<'b, 'c, 't, O>,
+        lowerer: &mut Lowerer<'b, 'c, 't, O>,
         input_values: &[ValueRef<'b, 'c, 't>],
         input_types: &[ArrayIrType],
         output_types: &[ArrayIrType],
@@ -359,7 +359,7 @@ impl MemberLowerableOperation<ArrayIrType> for CustomCallOperation {
             .output_types()
             .iter()
             .flat_map(|output_type| output_type.shape().dimensions())
-            .filter(|dimension| matches!(dimension, Dimension::Dynamic(_)))
+            .filter(|dimension| matches!(dimension, CoreDimension::Dynamic(_)))
             .count();
         let Some(array_input_count) = input_values.len().checked_sub(dynamic_output_dimension_count) else {
             return Err(ProgramError::InvalidInputCount {
@@ -505,11 +505,11 @@ impl MemberLowerableOperation<ArrayIrType> for CustomCallOperation {
             let mut refined_type = physical_output_types[output_index].clone();
             let refined_dimensions = refined_output_types[output_index].shape().dimensions();
             for (axis, dimension) in output_type.shape().dimensions().iter().enumerate() {
-                if !matches!(dimension, Dimension::Dynamic(_)) {
+                if !matches!(dimension, CoreDimension::Dynamic(_)) {
                     continue;
                 }
                 let extent = *output_extents.next().unwrap();
-                let Some(dimension @ Dimension::Dynamic(_)) = refined_dimensions.get(axis).cloned() else {
+                let Some(dimension @ CoreDimension::Dynamic(_)) = refined_dimensions.get(axis).cloned() else {
                     continue;
                 };
                 let extent = block.append_operation(stable_hlo::convert(extent, i32_scalar_type, location)?)?;
@@ -541,8 +541,8 @@ mod tests {
     use indoc::indoc;
     use pretty_assertions::assert_eq;
     use ryft_core::{
-        ArrayIrType, DataType, Dimension, DimensionBounds, DimensionSizeOperation, DimensionType, DimensionValue,
-        DimensionVariable, Memory, Placeholder, Shape, TiledLayout, TypedProgram,
+        ArrayIrType, DataType, Dimension as CoreDimension, DimensionBounds, DimensionSizeOperation, DimensionType,
+        DimensionValue, DimensionVariable, Memory, Placeholder, Shape, TiledLayout, TypedProgram,
     };
     use ryft_mlir::{Operation as MlirOperation, Value as MlirValue};
     use ryft_pjrt::extensions::ffi::{
@@ -552,9 +552,9 @@ mod tests {
     use ryft_pjrt::{ClientOptions, CpuClientOptions, load_cpu_plugin};
 
     use crate::experimental::lowering::tests::{
-        MixedValue, XlaProgramBuilder, execute_mixed_program, test_matrix_type, unproject_plain_program,
+        MixedValue, ProgramBuilder, execute_mixed_program, test_matrix_type, unproject_plain_program,
     };
-    use crate::experimental::ops::{XlaArrayConstant, XlaConstant, XlaProgramBuilder as ArrayIrXlaProgramBuilder};
+    use crate::experimental::ops::{ArrayConstant, Constant, ProgramBuilder as ArrayIrProgramBuilder};
     use crate::kernels::KernelEmbeddingError;
     use crate::operations::assertions::ensure_assertion_handler_registered;
     use crate::to_mlir_module_for_program;
@@ -568,9 +568,10 @@ mod tests {
         // An ordered-I/O custom call lowers its typed attributes, complete memory-layout lists, buffer alias, and one
         // hidden ordered-I/O token. A second ordered-I/O call consumes that token even though the first call's array
         // result is unused, while the final pure call remains token-free.
-        let array_type = ArrayType::new(DataType::F32, Shape::new(vec![Dimension::Static(2), Dimension::Static(3)]));
+        let array_type =
+            ArrayType::new(DataType::F32, Shape::new(vec![CoreDimension::Static(2), CoreDimension::Static(3)]));
         let column_major_type = array_type.clone().with_layout(Some(TiledLayout::new(vec![0, 1], Vec::new()).into()));
-        let mut builder = XlaProgramBuilder::new();
+        let mut builder = ProgramBuilder::new();
         let left = builder.add_input(column_major_type.clone());
         let right = builder.add_input(array_type.clone());
         let effectful =
@@ -599,11 +600,7 @@ mod tests {
         let pure = CustomCallOperation::new("ryft.test.add_one", vec![array_type.clone()]);
         let output = builder.add_instruction(pure, Vec::new(), vec![chained], None).unwrap()[0];
         let program = builder
-            .build::<Vec<XlaArrayConstant>, Vec<XlaArrayConstant>>(
-                vec![output],
-                vec![Placeholder; 2],
-                vec![Placeholder],
-            )
+            .build::<Vec<ArrayConstant>, Vec<ArrayConstant>>(vec![output], vec![Placeholder; 2], vec![Placeholder])
             .unwrap();
         let program = unproject_plain_program(program);
         let input_types = vec![column_major_type, array_type.clone()];
@@ -644,9 +641,10 @@ mod tests {
         );
 
         // Byte-strided descriptors cannot be represented by StableHLO's permutation-only custom-call layouts.
-        let strided_type = ArrayType::new(DataType::F32, Shape::new(vec![Dimension::Static(2), Dimension::Static(3)]))
-            .with_layout(Some(StridedLayout::new(vec![12, 4]).into()));
-        let mut builder = XlaProgramBuilder::new();
+        let strided_type =
+            ArrayType::new(DataType::F32, Shape::new(vec![CoreDimension::Static(2), CoreDimension::Static(3)]))
+                .with_layout(Some(StridedLayout::new(vec![12, 4]).into()));
+        let mut builder = ProgramBuilder::new();
         let input = builder.add_input(strided_type.clone());
         let output = builder
             .add_instruction(
@@ -657,7 +655,7 @@ mod tests {
             )
             .unwrap()[0];
         let program = builder
-            .build::<Vec<XlaArrayConstant>, Vec<XlaArrayConstant>>(vec![output], vec![Placeholder], vec![Placeholder])
+            .build::<Vec<ArrayConstant>, Vec<ArrayConstant>>(vec![output], vec![Placeholder], vec![Placeholder])
             .unwrap();
         let program = unproject_plain_program(program);
         assert!(matches!(
@@ -698,7 +696,7 @@ mod tests {
         // type, a declared input layout replaces the input's own (default) layout, and an unordered effectful call
         // is only marked `has_side_effect` without threading a token through its handler ABI.
         let array_type = test_matrix_type(2, 3);
-        let mut builder = XlaProgramBuilder::new();
+        let mut builder = ProgramBuilder::new();
         let input = builder.add_input(array_type.clone());
         let operation = CustomCallOperation::new("ryft.test.configured", vec![array_type.clone()])
             .with_attribute("string", "x")
@@ -738,7 +736,7 @@ mod tests {
             .with_effect_class(EffectClass::UnorderedIo);
         let output = builder.add_instruction(operation, Vec::new(), vec![input], None).unwrap()[0];
         let program = builder
-            .build::<Vec<XlaArrayConstant>, Vec<XlaArrayConstant>>(vec![output], vec![Placeholder], vec![Placeholder])
+            .build::<Vec<ArrayConstant>, Vec<ArrayConstant>>(vec![output], vec![Placeholder], vec![Placeholder])
             .unwrap();
         let program = unproject_plain_program(program);
         let module =
@@ -768,7 +766,7 @@ mod tests {
             (ryft_xla_sys::mlir::dialects::mosaic::gpu::MOSAIC_GPU_FFI_TARGET, None, "mosaic GPU"),
         ];
         for (target, row_major, owner) in cases {
-            let mut builder = XlaProgramBuilder::new();
+            let mut builder = ProgramBuilder::new();
             let input = builder.add_input(input_type.clone());
             let mut operation = CustomCallOperation::new(target, vec![output_type.clone()]);
             if let Some(row_major) = row_major {
@@ -776,11 +774,7 @@ mod tests {
             }
             let output = builder.add_instruction(operation, Vec::new(), vec![input], None).unwrap()[0];
             let program = builder
-                .build::<Vec<XlaArrayConstant>, Vec<XlaArrayConstant>>(
-                    vec![output],
-                    vec![Placeholder],
-                    vec![Placeholder],
-                )
+                .build::<Vec<ArrayConstant>, Vec<ArrayConstant>>(vec![output], vec![Placeholder], vec![Placeholder])
                 .unwrap();
             let error = to_mlir_module_for_program(
                 &unproject_plain_program(program),
@@ -804,7 +798,7 @@ mod tests {
     fn test_to_mlir_module_for_program_threads_custom_call_assertions() {
         use ryft_mlir::{DialectHandle, WalkOrder, WalkResult};
         let scalar = ArrayType::scalar(DataType::I64);
-        let mut builder = XlaProgramBuilder::new();
+        let mut builder = ProgramBuilder::new();
         let input = builder.add_input(scalar.clone());
         #[cfg(not(feature = "mosaic-gpu"))]
         let target = "ryft.test.assertion";
@@ -815,7 +809,7 @@ mod tests {
         let first = builder.add_instruction(call.clone(), vec![], vec![input], None).unwrap()[0];
         builder.add_instruction(call, vec![], vec![input], None).unwrap();
         let program = builder
-            .build::<Vec<XlaArrayConstant>, Vec<XlaArrayConstant>>(vec![first], vec![Placeholder], vec![Placeholder])
+            .build::<Vec<ArrayConstant>, Vec<ArrayConstant>>(vec![first], vec![Placeholder], vec![Placeholder])
             .unwrap();
         let program = unproject_plain_program(program);
         let text = to_mlir_module_for_program(&program, &[], &vec![scalar.clone()], &vec![scalar], "main", None, None)
@@ -850,12 +844,12 @@ mod tests {
     #[test]
     fn test_to_mlir_module_for_program_threads_assertions_without_array_results() {
         use ryft_mlir::{DialectHandle, WalkOrder, WalkResult};
-        let mut builder = XlaProgramBuilder::new();
+        let mut builder = ProgramBuilder::new();
         let call =
             CustomCallOperation::new("ryft.test.assertion", vec![]).with_effect_class(EffectClass::OrderedAssertion);
         builder.add_instruction(call.clone(), vec![], vec![], None).unwrap();
         builder.add_instruction(call, vec![], vec![], None).unwrap();
-        let program = builder.build::<Vec<XlaArrayConstant>, Vec<XlaArrayConstant>>(vec![], vec![], vec![]).unwrap();
+        let program = builder.build::<Vec<ArrayConstant>, Vec<ArrayConstant>>(vec![], vec![], vec![]).unwrap();
         let program = unproject_plain_program(program);
         let text = to_mlir_module_for_program(
             &program,
@@ -887,7 +881,7 @@ mod tests {
 
     #[test]
     fn test_to_mlir_module_for_program_lowers_binary_custom_call_attributes() {
-        let mut builder = XlaProgramBuilder::new();
+        let mut builder = ProgramBuilder::new();
         builder
             .add_instruction(
                 CustomCallOperation::new("ryft.test.binary", vec![])
@@ -898,7 +892,7 @@ mod tests {
                 None,
             )
             .unwrap();
-        let program = builder.build::<Vec<XlaArrayConstant>, Vec<XlaArrayConstant>>(vec![], vec![], vec![]).unwrap();
+        let program = builder.build::<Vec<ArrayConstant>, Vec<ArrayConstant>>(vec![], vec![], vec![]).unwrap();
         let program = unproject_plain_program(program);
         assert_eq!(
             to_mlir_module_for_program(
@@ -930,8 +924,8 @@ mod tests {
         // operand enters the FFI call, as its static buffer at the bound. An alias continues to refer to that leading
         // operand, and the static aliased result is refined with the trailing logical extent after the call.
         let extent = DimensionVariable::new("extent", DimensionBounds::new(1, Some(9)).unwrap());
-        let dynamic_type = ArrayType::new(DataType::F32, Shape::new(vec![Dimension::Dynamic(extent)]));
-        let mut builder = ArrayIrXlaProgramBuilder::new();
+        let dynamic_type = ArrayType::new(DataType::F32, Shape::new(vec![CoreDimension::Dynamic(extent)]));
+        let mut builder = ArrayIrProgramBuilder::new();
         let input = builder.add_input(dynamic_type.clone().into());
         let extent = builder
             .add_instruction(DimensionSizeOperation::new(&dynamic_type, 0).unwrap(), Vec::new(), vec![input], None)
@@ -941,7 +935,7 @@ mod tests {
             .unwrap();
         let output = builder.add_instruction(operation, Vec::new(), vec![input, extent], None).unwrap()[0];
         let program = builder
-            .build::<Vec<XlaConstant>, Vec<XlaConstant>>(vec![output], vec![Placeholder], vec![Placeholder])
+            .build::<Vec<Constant>, Vec<Constant>>(vec![output], vec![Placeholder], vec![Placeholder])
             .unwrap();
         let module = to_mlir_module_for_program(
             &program,
@@ -980,14 +974,14 @@ mod tests {
     fn test_to_mlir_module_for_program_rejects_unbounded_custom_call_input() {
         // An unbounded dynamic input has no static buffer that could cross the foreign boundary.
         let size = DimensionVariable::new("size", DimensionBounds::unbounded());
-        let input_type = ArrayType::new(DataType::F32, Shape::new(vec![Dimension::Dynamic(size)]));
+        let input_type = ArrayType::new(DataType::F32, Shape::new(vec![CoreDimension::Dynamic(size)]));
         let output_type = ArrayType::new_static(DataType::F32, [2]);
-        let mut builder = ArrayIrXlaProgramBuilder::new();
+        let mut builder = ArrayIrProgramBuilder::new();
         let input = builder.add_input(input_type.clone().into());
         let operation = CustomCallOperation::new("ryft.test.unbounded", vec![output_type.clone()]);
         let output = builder.add_instruction(operation, Vec::new(), vec![input], None).unwrap()[0];
         let program = builder
-            .build::<Vec<XlaConstant>, Vec<XlaConstant>>(vec![output], vec![Placeholder], vec![Placeholder])
+            .build::<Vec<Constant>, Vec<Constant>>(vec![output], vec![Placeholder], vec![Placeholder])
             .unwrap();
         assert!(matches!(
             to_mlir_module_for_program(&program, &[], &vec![input_type], &vec![output_type], "main", None, None),
@@ -1003,15 +997,13 @@ mod tests {
         // An exact extent refines the declared dynamic output axis to a static one, so the call allocates that exact
         // extent and its redundant extent operand does not refine the result.
         let extent = DimensionVariable::new("extent", DimensionBounds::new(1, Some(9)).unwrap());
-        let dynamic_type = ArrayType::new(DataType::F32, Shape::new(vec![Dimension::Dynamic(extent.clone())]));
-        let mut builder = ArrayIrXlaProgramBuilder::new();
+        let dynamic_type = ArrayType::new(DataType::F32, Shape::new(vec![CoreDimension::Dynamic(extent.clone())]));
+        let mut builder = ArrayIrProgramBuilder::new();
         let extent =
-            builder.add_constant(XlaConstant::Dimension(DimensionValue::new(DimensionType::from(extent), 3).unwrap()));
+            builder.add_constant(Constant::Dimension(DimensionValue::new(DimensionType::from(extent), 3).unwrap()));
         let operation = CustomCallOperation::new("ryft.test.exact", vec![dynamic_type]);
         let output = builder.add_instruction(operation, Vec::new(), vec![extent], None).unwrap()[0];
-        let program = builder
-            .build::<Vec<XlaConstant>, Vec<XlaConstant>>(vec![output], vec![], vec![Placeholder])
-            .unwrap();
+        let program = builder.build::<Vec<Constant>, Vec<Constant>>(vec![output], vec![], vec![Placeholder]).unwrap();
         let output_type = ArrayType::new_static(DataType::F32, [3]);
         assert_eq!(program.output_types(), vec![ArrayIrType::Array(output_type.clone())]);
         let module =
@@ -1039,13 +1031,13 @@ mod tests {
         let size = DimensionVariable::new("size", DimensionBounds::new(1, Some(9)).unwrap());
         let alias_type = ArrayType::new(DataType::F32, Shape::new(vec![extent.into()]));
         let mixed_type = ArrayType::new(DataType::F32, Shape::new(vec![size.clone().into(), size.clone().into()]));
-        let mut builder = ArrayIrXlaProgramBuilder::new();
+        let mut builder = ArrayIrProgramBuilder::new();
         let input = builder.add_input(alias_type.clone().into());
         let symbolic = builder.add_input(DimensionType::from(size).into());
         let alias_extent = builder
             .add_instruction(DimensionSizeOperation::new(&alias_type, 0).unwrap(), Vec::new(), vec![input], None)
             .unwrap()[0];
-        let exact = builder.add_constant(XlaConstant::Dimension(DimensionValue::constant(3).unwrap()));
+        let exact = builder.add_constant(Constant::Dimension(DimensionValue::constant(3).unwrap()));
         let operation = CustomCallOperation::new("ryft.test.dynamic_guard", vec![alias_type.clone(), mixed_type])
             .with_effect_class(EffectClass::OrderedIo)
             .with_input_output_alias(0, 0)
@@ -1055,7 +1047,7 @@ mod tests {
             .unwrap()
             .to_vec();
         let program = builder
-            .build::<Vec<XlaConstant>, Vec<XlaConstant>>(outputs, vec![Placeholder; 2], vec![Placeholder; 2])
+            .build::<Vec<Constant>, Vec<Constant>>(outputs, vec![Placeholder; 2], vec![Placeholder; 2])
             .unwrap();
         let module = to_mlir_module_for_program(
             &program,
@@ -1155,13 +1147,13 @@ mod tests {
         ] {
             let size = DimensionVariable::new("size", DimensionBounds::new(0, Some(9)).unwrap());
             let output_type = ArrayType::new(DataType::F64, Shape::new(vec![size.clone().into(), size.clone().into()]));
-            let mut builder = ArrayIrXlaProgramBuilder::new();
+            let mut builder = ArrayIrProgramBuilder::new();
             let symbolic = builder.add_input(DimensionType::from(size).into());
-            let exact = builder.add_constant(XlaConstant::Dimension(DimensionValue::constant(3).unwrap()));
+            let exact = builder.add_constant(Constant::Dimension(DimensionValue::constant(3).unwrap()));
             let operation = CustomCallOperation::new("ryft.test.guarded", vec![output_type]).with_effect_class(effect);
             let output = builder.add_instruction(operation, Vec::new(), vec![symbolic, exact], None).unwrap()[0];
             let program = builder
-                .build::<Vec<XlaConstant>, Vec<XlaConstant>>(vec![output], vec![Placeholder], vec![Placeholder])
+                .build::<Vec<Constant>, Vec<Constant>>(vec![output], vec![Placeholder], vec![Placeholder])
                 .unwrap();
             let module = to_mlir_module_for_program(
                 &program,
@@ -1184,13 +1176,13 @@ mod tests {
         let size = DimensionVariable::new("size", DimensionBounds::new(0, Some(9)).unwrap());
         let output_type = ArrayType::new(DataType::F64, Shape::new(vec![size.clone().into(), size.clone().into()]))
             .with_memory(Memory::Host { pinned: true });
-        let mut builder = ArrayIrXlaProgramBuilder::new();
+        let mut builder = ArrayIrProgramBuilder::new();
         let symbolic = builder.add_input(DimensionType::from(size).into());
-        let exact = builder.add_constant(XlaConstant::Dimension(DimensionValue::constant(3).unwrap()));
+        let exact = builder.add_constant(Constant::Dimension(DimensionValue::constant(3).unwrap()));
         let operation = CustomCallOperation::new("ryft.test.guarded", vec![output_type]);
         let output = builder.add_instruction(operation, Vec::new(), vec![symbolic, exact], None).unwrap()[0];
         let program = builder
-            .build::<Vec<XlaConstant>, Vec<XlaConstant>>(vec![output], vec![Placeholder], vec![Placeholder])
+            .build::<Vec<Constant>, Vec<Constant>>(vec![output], vec![Placeholder], vec![Placeholder])
             .unwrap();
         let module = to_mlir_module_for_program(
             &program,
@@ -1300,9 +1292,9 @@ mod tests {
                 let size = DimensionVariable::new("size", DimensionBounds::new(0, Some(9)).unwrap());
                 let output_type =
                     ArrayType::new(DataType::F64, Shape::new(vec![size.clone().into(), size.clone().into()]));
-                let mut builder = ArrayIrXlaProgramBuilder::new();
+                let mut builder = ArrayIrProgramBuilder::new();
                 let symbolic = builder.add_input(DimensionType::from(size).into());
-                let exact = builder.add_constant(XlaConstant::Dimension(DimensionValue::constant(3).unwrap()));
+                let exact = builder.add_constant(Constant::Dimension(DimensionValue::constant(3).unwrap()));
                 let inputs = if exact_first { vec![exact, symbolic] } else { vec![symbolic, exact] };
                 let operation = CustomCallOperation::new(TARGET, vec![output_type]);
                 let operation = match effect {
@@ -1311,7 +1303,7 @@ mod tests {
                 };
                 let output = builder.add_instruction(operation, Vec::new(), inputs, None).unwrap()[0];
                 let program = builder
-                    .build::<Vec<XlaConstant>, Vec<XlaConstant>>(vec![output], vec![Placeholder], vec![Placeholder])
+                    .build::<Vec<Constant>, Vec<Constant>>(vec![output], vec![Placeholder], vec![Placeholder])
                     .unwrap();
                 let before = CALLS.load(Ordering::SeqCst);
                 assert_eq!(
@@ -1330,10 +1322,10 @@ mod tests {
         let size = DimensionVariable::new("size", DimensionBounds::new(0, Some(9)).unwrap());
         let alias_type = ArrayType::new_static(DataType::F64, [4]);
         let mixed_type = ArrayType::new(DataType::F64, Shape::new(vec![size.clone().into(), size.clone().into()]));
-        let mut builder = ArrayIrXlaProgramBuilder::new();
+        let mut builder = ArrayIrProgramBuilder::new();
         let input = builder.add_input(alias_type.clone().into());
         let symbolic = builder.add_input(DimensionType::from(size).into());
-        let exact = builder.add_constant(XlaConstant::Dimension(DimensionValue::constant(3).unwrap()));
+        let exact = builder.add_constant(Constant::Dimension(DimensionValue::constant(3).unwrap()));
         let operation = CustomCallOperation::new(TARGET, vec![alias_type, mixed_type])
             .with_effect_class(EffectClass::OrderedIo)
             .with_input_output_alias(0, 0)
@@ -1341,7 +1333,7 @@ mod tests {
         let outputs =
             builder.add_instruction(operation, Vec::new(), vec![input, symbolic, exact], None).unwrap().to_vec();
         let program = builder
-            .build::<Vec<XlaConstant>, Vec<XlaConstant>>(outputs, vec![Placeholder; 2], vec![Placeholder; 2])
+            .build::<Vec<Constant>, Vec<Constant>>(outputs, vec![Placeholder; 2], vec![Placeholder; 2])
             .unwrap();
         let input = MixedValue::Array(vec![1.0, 2.0, 3.0, 4.0], vec![4]);
         let before = CALLS.load(Ordering::SeqCst);
@@ -1413,8 +1405,8 @@ mod tests {
         // A bounded dynamic aliased input reaches the handler as its static buffer at the bound, and the aliased
         // result regains the input's runtime extent after the call.
         let extent = DimensionVariable::new("extent", DimensionBounds::new(1, Some(9)).unwrap());
-        let dynamic_type = ArrayType::new(DataType::F64, Shape::new(vec![Dimension::Dynamic(extent)]));
-        let mut builder = ArrayIrXlaProgramBuilder::new();
+        let dynamic_type = ArrayType::new(DataType::F64, Shape::new(vec![CoreDimension::Dynamic(extent)]));
+        let mut builder = ArrayIrProgramBuilder::new();
         let input = builder.add_input(dynamic_type.clone().into());
         let extent = builder
             .add_instruction(DimensionSizeOperation::new(&dynamic_type, 0).unwrap(), Vec::new(), vec![input], None)
@@ -1422,7 +1414,7 @@ mod tests {
         let operation = CustomCallOperation::new(TARGET, vec![dynamic_type]).with_input_output_alias(0, 0).unwrap();
         let output = builder.add_instruction(operation, Vec::new(), vec![input, extent], None).unwrap()[0];
         let program = builder
-            .build::<Vec<XlaConstant>, Vec<XlaConstant>>(vec![output], vec![Placeholder], vec![Placeholder])
+            .build::<Vec<Constant>, Vec<Constant>>(vec![output], vec![Placeholder], vec![Placeholder])
             .unwrap();
         let input = MixedValue::Array((1..=8).map(f64::from).collect(), vec![8]);
         assert_eq!(

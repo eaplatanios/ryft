@@ -1,6 +1,6 @@
 use ryft_core::{
-    ArrayIrType, ArrayType, ConcatenateOperation, DataType, Dimension, DimensionAddOperation, DimensionSizeOperation,
-    DimensionType, EffectClass, Operation, ProgramError, Shape,
+    ArrayIrType, ArrayType, ConcatenateOperation, DataType, Dimension as CoreDimension, DimensionAddOperation,
+    DimensionSizeOperation, DimensionType, EffectClass, Operation as CoreOperation, ProgramError, Shape,
 };
 use ryft_mlir::dialects::stable_hlo;
 use ryft_mlir::{
@@ -18,7 +18,7 @@ use crate::operations::assertions::{
     lower_assertion_custom_call, lower_deliberately_false_assertion_predicate,
 };
 use crate::operations::lower_tensor_type;
-use crate::{Error, LowerableOperation, LowerableOperationFamily, XlaLowerer};
+use crate::{Error, LowerableOperation, LowerableOperationFamily, Lowerer};
 
 /// Joins inputs using a bounded fan-in tree so very wide concatenations do not create pathological compiler work.
 pub(crate) fn lower_concatenate_tree<'b, 'c: 'b, 't: 'c>(
@@ -73,7 +73,7 @@ pub(crate) fn lower_concatenate_extent_assertion<'b, 'c: 'b, 't: 'c>(
 impl LowerableOperation for ConcatenateOperation<ArrayType> {
     fn lower<'b, 'c: 'b, 't: 'c, O: LowerableOperationFamily>(
         &self,
-        lowerer: &mut XlaLowerer<'b, 'c, 't, O>,
+        lowerer: &mut Lowerer<'b, 'c, 't, O>,
         input_values: &[ValueRef<'b, 'c, 't>],
         _input_types: &[ArrayType],
         _output_types: &[ArrayType],
@@ -85,7 +85,7 @@ impl LowerableOperation for ConcatenateOperation<ArrayType> {
 impl LowerableOperation for ConcatenateOperation<ArrayIrType> {
     fn lower<'b, 'c: 'b, 't: 'c, O: LowerableOperationFamily>(
         &self,
-        lowerer: &mut XlaLowerer<'b, 'c, 't, O>,
+        lowerer: &mut Lowerer<'b, 'c, 't, O>,
         input_values: &[ValueRef<'b, 'c, 't>],
         input_types: &[ArrayIrType],
         output_types: &[ArrayIrType],
@@ -114,8 +114,10 @@ impl LowerableOperation for ConcatenateOperation<ArrayIrType> {
             for (input, r#type) in array_inputs.iter().zip(array_input_types) {
                 let r#type = <&ArrayType>::try_from(r#type)?;
                 let extent = match r#type.shape().dimensions()[self.axis()] {
-                    Dimension::Static(extent) => lower_static_index_constants(&[extent], block, context, location)?[0],
-                    Dimension::Dynamic(_) => {
+                    CoreDimension::Static(extent) => {
+                        lower_static_index_constants(&[extent], block, context, location)?[0]
+                    }
+                    CoreDimension::Dynamic(_) => {
                         let extent =
                             block.append_operation(stable_hlo::get_dimension_size(*input, self.axis(), location)?)?;
                         let extent =
@@ -159,7 +161,7 @@ impl LowerableOperation for ConcatenateOperation<ArrayIrType> {
             }
             let mut inferred_dimensions = output_type.shape().dimensions().to_vec();
             // Native concatenation keeps the axis dynamic even when its bounds prove a singleton extent.
-            inferred_dimensions[self.axis()] = Dimension::Dynamic(inferred_extent.to_variable());
+            inferred_dimensions[self.axis()] = CoreDimension::Dynamic(inferred_extent.to_variable());
             let inferred_type = output_type.clone().with_shape(Shape::new(inferred_dimensions));
             let physical_input_type = physical_bound_type(&inferred_type)?;
             let physical_output_type = physical_bound_type(output_type)?;
@@ -216,9 +218,9 @@ mod tests {
     use pretty_assertions::assert_eq;
     use ryft_core::{
         ArrayIrType, ArrayType, Concatenate, ConcatenateOperation, ConstantOperation, DataType, Device, DeviceMesh,
-        Dimension, DimensionAddOperation, DimensionBounds, DimensionOperation, DimensionSizeOperation, DimensionType,
-        DimensionValue, DimensionVariable, EffectClasses, LogicalMesh, MeshAxis, MeshAxisType, Placeholder, Shape,
-        Sharding, ShardingDimension, TypeError, Typed, TypedProgram,
+        Dimension as CoreDimension, DimensionAddOperation, DimensionBounds, DimensionOperation, DimensionSizeOperation,
+        DimensionType, DimensionValue, DimensionVariable, EffectClasses, LogicalMesh, MeshAxis, MeshAxisType,
+        Placeholder, Shape, Sharding, ShardingDimension, TypeError, Typed, TypedProgram,
     };
     use ryft_pjrt::{
         BufferType, ClientOptions, CpuClientOptions, ExecutionDeviceInputs, ExecutionInput, Program as PjrtProgram,
@@ -226,13 +228,13 @@ mod tests {
     };
 
     use crate::experimental::lowering::tests::{
-        XlaProgramBuilder, dynamic_dimension, ragged_dot_cpu_compilation_options, test_matrix_type, test_vector_type,
+        ProgramBuilder, dynamic_dimension, ragged_dot_cpu_compilation_options, test_matrix_type, test_vector_type,
     };
     use crate::experimental::lowering::to_mlir_module_for_plain_program;
     use crate::experimental::lowering::types::physical_bound_type;
-    use crate::experimental::ops::{XlaArrayConstant, XlaConstant, XlaProgramBuilder as ArrayIrXlaProgramBuilder};
+    use crate::experimental::ops::{ArrayConstant, Constant, ProgramBuilder as ArrayIrProgramBuilder};
     use crate::tests::{execution_client, values_from_bytes, values_to_bytes};
-    use crate::{CompiledXlaFunction, FromPjrt, ToPjrt, XlaArray, XlaSession, compile, to_mlir_module_for_program};
+    use crate::{Array, CompiledFunction, FromPjrt, Session, ToPjrt, compile, to_mlir_module_for_program};
 
     use super::*;
 
@@ -241,7 +243,7 @@ mod tests {
         // A static-shaped concatenate along axis 0 lowers to a single `stablehlo.concatenate` joining the operands.
         let first_type = test_matrix_type(1, 2);
         let second_type = test_matrix_type(3, 2);
-        let mut builder = XlaProgramBuilder::new();
+        let mut builder = ProgramBuilder::new();
         let first = builder.add_input(first_type);
         let second = builder.add_input(second_type);
         let joined = builder
@@ -253,7 +255,7 @@ mod tests {
             )
             .unwrap()[0];
         let program = builder
-            .build::<Vec<XlaArrayConstant>, XlaArrayConstant>(vec![joined], vec![Placeholder, Placeholder], Placeholder)
+            .build::<Vec<ArrayConstant>, ArrayConstant>(vec![joined], vec![Placeholder, Placeholder], Placeholder)
             .unwrap();
         let stablehlo = to_mlir_module_for_plain_program(&program, "main").unwrap();
         assert_eq!(
@@ -271,8 +273,8 @@ mod tests {
         // Dynamic concatenation requires its derived result extent as an explicit operand rather than manufacturing
         // an unstable result identity.
         let dynamic_type =
-            ArrayType::new(DataType::F32, Shape::new(vec![dynamic_dimension("rows", None), Dimension::Static(2)]));
-        let mut builder = XlaProgramBuilder::new();
+            ArrayType::new(DataType::F32, Shape::new(vec![dynamic_dimension("rows", None), CoreDimension::Static(2)]));
+        let mut builder = ProgramBuilder::new();
         let first = builder.add_input(dynamic_type.clone());
         let second = builder.add_input(dynamic_type);
         assert_eq!(
@@ -297,7 +299,7 @@ mod tests {
             &[first_type.clone().into(), second_type.clone().into(), result_extent.r#type().into_owned().into()],
         )
         .unwrap();
-        let mut builder = ArrayIrXlaProgramBuilder::new();
+        let mut builder = ArrayIrProgramBuilder::new();
         let first = builder.add_input(first_type.clone().into());
         let second = builder.add_input(second_type.clone().into());
         let result_extent = builder
@@ -311,11 +313,7 @@ mod tests {
         let joined =
             builder.add_instruction(operation, Vec::new(), vec![first, second, result_extent], None).unwrap()[0];
         let program = builder
-            .build::<Vec<XlaConstant>, Vec<XlaConstant>>(
-                vec![joined],
-                vec![Placeholder, Placeholder],
-                vec![Placeholder],
-            )
+            .build::<Vec<Constant>, Vec<Constant>>(vec![joined], vec![Placeholder, Placeholder], vec![Placeholder])
             .unwrap();
         assert_eq!(program.effects().classes(), EffectClasses::NONE);
         let output_type = <&ArrayType>::try_from(&program.output_types()[0]).unwrap().clone();
@@ -339,10 +337,14 @@ mod tests {
             DimensionVariable::new("first", DimensionBounds::new(0, Some(5)).expect("valid test bounds"));
         let second_variable =
             DimensionVariable::new("second", DimensionBounds::new(0, Some(5)).expect("valid test bounds"));
-        let first_type =
-            ArrayType::new(DataType::F32, Shape::new(vec![Dimension::Dynamic(first_variable), Dimension::Static(2)]));
-        let second_type =
-            ArrayType::new(DataType::F32, Shape::new(vec![Dimension::Dynamic(second_variable), Dimension::Static(2)]));
+        let first_type = ArrayType::new(
+            DataType::F32,
+            Shape::new(vec![CoreDimension::Dynamic(first_variable), CoreDimension::Static(2)]),
+        );
+        let second_type = ArrayType::new(
+            DataType::F32,
+            Shape::new(vec![CoreDimension::Dynamic(second_variable), CoreDimension::Static(2)]),
+        );
         let first_size_operation = DimensionSizeOperation::new(&first_type, 0).unwrap();
         let second_size_operation = DimensionSizeOperation::new(&second_type, 0).unwrap();
         let add_operation =
@@ -354,7 +356,7 @@ mod tests {
             &[first_type.clone().into(), second_type.clone().into(), result_extent_type.into()],
         )
         .unwrap();
-        let mut builder = ArrayIrXlaProgramBuilder::new();
+        let mut builder = ArrayIrProgramBuilder::new();
         let first = builder.add_input(first_type.clone().into());
         let second = builder.add_input(second_type.clone().into());
         let first_size = builder.add_instruction(first_size_operation, Vec::new(), vec![first], None).unwrap()[0];
@@ -366,11 +368,7 @@ mod tests {
             .add_instruction(concatenate_operation, Vec::new(), vec![first, second, result_extent], None)
             .unwrap()[0];
         let program = builder
-            .build::<Vec<XlaConstant>, Vec<XlaConstant>>(
-                vec![joined],
-                vec![Placeholder, Placeholder],
-                vec![Placeholder],
-            )
+            .build::<Vec<Constant>, Vec<Constant>>(vec![joined], vec![Placeholder, Placeholder], vec![Placeholder])
             .unwrap();
         let output_type = <&ArrayType>::try_from(&program.output_types()[0]).unwrap().clone();
         let stablehlo = to_mlir_module_for_program(
@@ -390,16 +388,17 @@ mod tests {
         // A dynamic non-concatenated dimension is shared by the output cotangent and every input, so the transpose
         // slices it whole through a dynamic slice limit instead of looking up a hidden runtime size.
         let columns = DimensionVariable::new("columns", DimensionBounds::unbounded());
-        let left_type = ArrayType::new(DataType::F32, Shape::new(vec![Dimension::Static(2), columns.clone().into()]));
-        let right_type = ArrayType::new(DataType::F32, Shape::new(vec![Dimension::Static(3), columns.into()]));
-        let mut builder = XlaProgramBuilder::new();
+        let left_type =
+            ArrayType::new(DataType::F32, Shape::new(vec![CoreDimension::Static(2), columns.clone().into()]));
+        let right_type = ArrayType::new(DataType::F32, Shape::new(vec![CoreDimension::Static(3), columns.into()]));
+        let mut builder = ProgramBuilder::new();
         let left = builder.add_input(left_type.clone());
         let right = builder.add_input(right_type.clone());
         let joined = builder
             .add_instruction(ConcatenateOperation::<ArrayType>::new(0, 2).unwrap(), Vec::new(), vec![left, right], None)
             .unwrap()[0];
         let program = builder
-            .build::<Vec<XlaArrayConstant>, XlaArrayConstant>(vec![joined], vec![Placeholder, Placeholder], Placeholder)
+            .build::<Vec<ArrayConstant>, ArrayConstant>(vec![joined], vec![Placeholder, Placeholder], Placeholder)
             .unwrap();
         assert_eq!(program.transpose().unwrap().output_types(), vec![left_type, right_type]);
     }
@@ -427,7 +426,7 @@ mod tests {
                     &[first_type.clone().into(), second_type.clone().into(), extent_type.into()],
                 )
                 .unwrap();
-                let mut builder = ArrayIrXlaProgramBuilder::new();
+                let mut builder = ArrayIrProgramBuilder::new();
                 let first = builder.add_input(first_type.clone().into());
                 let second = builder.add_input(second_type.clone().into());
                 let extent = builder
@@ -441,7 +440,7 @@ mod tests {
                 let result =
                     builder.add_instruction(operation, Vec::new(), vec![first, second, extent], None).unwrap()[0];
                 let program = builder
-                    .build::<Vec<XlaConstant>, Vec<XlaConstant>>(vec![result], vec![Placeholder; 2], vec![Placeholder])
+                    .build::<Vec<Constant>, Vec<Constant>>(vec![result], vec![Placeholder; 2], vec![Placeholder])
                     .unwrap();
                 let output_type = <&ArrayType>::try_from(&program.output_types()[0]).unwrap().clone();
                 let module = to_mlir_module_for_program(
@@ -617,13 +616,13 @@ mod tests {
 
     #[test]
     fn test_lower_concatenate_tree() {
-        let mut builder = XlaProgramBuilder::new();
+        let mut builder = ProgramBuilder::new();
         let inputs = (0..33).map(|_| builder.add_input(test_vector_type(1))).collect::<Vec<_>>();
         let joined = builder
             .add_instruction(ConcatenateOperation::<ArrayType>::new(0, 1).unwrap(), Vec::new(), inputs, None)
             .unwrap()[0];
         let program = builder
-            .build::<Vec<XlaArrayConstant>, XlaArrayConstant>(vec![joined], vec![Placeholder; 33], Placeholder)
+            .build::<Vec<ArrayConstant>, ArrayConstant>(vec![joined], vec![Placeholder; 33], Placeholder)
             .unwrap();
         let module = to_mlir_module_for_plain_program(&program, "main").unwrap();
         assert_eq!(module.matches("stablehlo.concatenate").count(), 3);
@@ -644,8 +643,8 @@ mod tests {
         .unwrap();
         let sharding = Sharding::new(mesh.logical_mesh().clone(), vec![ShardingDimension::sharded(["x"])]).unwrap();
         let input_type = ArrayType::new_static(DataType::I64, vec![4]).with_sharding(sharding.clone()).unwrap();
-        let domain = XlaSession::new(&client).domain();
-        let compiled: CompiledXlaFunction<'_, (ArrayType, ArrayType), ArrayType> = compile(
+        let domain = Session::new(&client).domain();
+        let compiled: CompiledFunction<'_, (ArrayType, ArrayType), ArrayType> = compile(
             |(first, second)| first.concatenate_with([&second], 0).unwrap(),
             (input_type.clone(), input_type.clone()),
             &domain,
@@ -653,9 +652,9 @@ mod tests {
         )
         .unwrap();
         let first =
-            XlaArray::from_host_buffer(&domain, input_type.clone(), mesh.clone(), values_to_bytes(&[1_i64, 2, 3, 4]))
+            Array::from_host_buffer(&domain, input_type.clone(), mesh.clone(), values_to_bytes(&[1_i64, 2, 3, 4]))
                 .unwrap();
-        let second = XlaArray::from_host_buffer(&domain, input_type, mesh, values_to_bytes(&[5_i64, 6, 7, 8])).unwrap();
+        let second = Array::from_host_buffer(&domain, input_type, mesh, values_to_bytes(&[5_i64, 6, 7, 8])).unwrap();
         let output = domain.interpret(&compiled.executable_function(), (first, second)).unwrap();
         assert_eq!(output.r#type().sharding(), Some(&sharding));
         for (index, device) in devices.iter().enumerate() {

@@ -1,6 +1,6 @@
-//! General XLA program tracing: the [`trace`] entry point stages an arbitrary function over [`XlaArrayTracer`]s in a
-//! fresh root tracing context of [`XlaDomain`], and its [`TracedXlaProgram`] result reports the statistics of the
-//! staged program and lowers it to a StableHLO/Shardy MLIR module through the [`lowering`] module.
+//! General XLA program tracing: the [`trace`] entry point stages an arbitrary function over [`ArrayTracer`]s in a
+//! fresh root tracing context of [`Domain`](crate::Domain), and its [`TracedProgram`] result reports the
+//! statistics of the staged program and lowers it to a StableHLO/Shardy MLIR module through the [`lowering`] module.
 //! [`Error`](crate::Error) reports the failures of both stages.
 //!
 //! Traced functions may compose `shard_map` with other transforms (e.g., differentiation or batching). The logical
@@ -9,7 +9,7 @@
 //! lower to Shardy `sdy.manual_computation` operations in the [`lowering`] module. A `shard_map` traced on its own is
 //! simply a traced function whose body binds one `shard_map` (e.g., through [`ShardMap`](ryft_core::ShardMap) on the
 //! context that [`trace_with_context`] passes to it). The lowered function signature carries the sharding of every
-//! global input and output type that has one (refer to [`TracedXlaProgram::to_mlir_module`]), so tracing it over
+//! global input and output type that has one (refer to [`TracedProgram::to_mlir_module`]), so tracing it over
 //! input types placed as its input shardings place them yields arguments and results placed as its boundary.
 //!
 //! Core failures use [`Error::Core`](crate::Error::Core), and concrete lowering failures have their own
@@ -24,22 +24,22 @@ use ryft_core::{
     ProjectedValue, Sharding, ValueProjection,
 };
 
-use crate::Error;
-use crate::experimental::domains::{XlaDomain, XlaTracer};
-use crate::experimental::ops::{XlaConstant, XlaProgram};
+use crate::domains::Tracer;
+use crate::experimental::ops::{Constant, Program};
+use crate::{Domain, Error};
 
 /// Array value that closures traced through [`trace`] receive and return: a [`DomainTracer`](ryft_core::DomainTracer)
-/// of [`XlaDomain`] projected onto its array member. It is also the [`ShardMapTracer`](ryft_core::ShardMapTracer) of
-/// [`XlaDomain`], so `shard_map` bodies traced in XLA programs (e.g., through [`ryft_core::shard_map()`] on values of
-/// type [`XlaArrayTracer`]) receive the same values. This alias is public so that callers (e.g., tooling binaries) can
+/// of [`Domain`] projected onto its array member. It is also the [`ShardMapTracer`](ryft_core::ShardMapTracer) of
+/// [`Domain`], so `shard_map` bodies traced in XLA programs (e.g., through [`ryft_core::shard_map()`] on values of
+/// type [`ArrayTracer`]) receive the same values. This alias is public so that callers (e.g., tooling binaries) can
 /// annotate traced closure parameters.
-pub type XlaArrayTracer = ProjectedValue<ArrayType, XlaTracer<'static>>;
+pub type ArrayTracer = ProjectedValue<ArrayType, Tracer<'static>>;
 
 /// Stages an arbitrary traced XLA function over global array types.
 ///
 /// This is the general XLA tracing entry point used when callers want to compose `shard_map` with differentiation
 /// transforms and then lower the resulting whole program to StableHLO/Shardy MLIR. `function` is traced once, in a
-/// fresh root tracing context of [`XlaDomain`] that binds no named axes, over [`XlaArrayTracer`]s of
+/// fresh root tracing context of [`Domain`] that binds no named axes, over [`ArrayTracer`]s of
 /// `global_input_types`, and the traced program is simplified. Functions that need that context (e.g., to create values
 /// that derive from no input) or that can fail are traced through [`trace_with_context`] instead.
 ///
@@ -51,19 +51,19 @@ pub type XlaArrayTracer = ProjectedValue<ArrayType, XlaTracer<'static>>;
 /// # Errors
 ///
 /// Returns the errors of [`trace_with_context`].
-pub fn trace<F, Input, Output>(function: F, global_input_types: Input) -> Result<TracedXlaProgram<Input, Output>, Error>
+pub fn trace<F, Input, Output>(function: F, global_input_types: Input) -> Result<TracedProgram<Input, Output>, Error>
 where
     Input: Parameterized<ArrayType>,
-    Input::Family: ParameterizedFamily<XlaConstant> + ParameterizedFamily<XlaArrayTracer>,
+    Input::Family: ParameterizedFamily<Constant> + ParameterizedFamily<ArrayTracer>,
     Output: Parameterized<ArrayType>,
-    Output::Family: ParameterizedFamily<XlaConstant> + ParameterizedFamily<XlaArrayTracer>,
-    F: FnOnce(Input::To<XlaArrayTracer>) -> Output::To<XlaArrayTracer>,
+    Output::Family: ParameterizedFamily<Constant> + ParameterizedFamily<ArrayTracer>,
+    F: FnOnce(Input::To<ArrayTracer>) -> Output::To<ArrayTracer>,
 {
     trace_with_context(|_, inputs| Ok(function(inputs)), global_input_types)
 }
 
 /// Stages a fallible XLA function over global array types like [`trace`], passing it the fresh root tracing context
-/// of [`XlaDomain`] together with its inputs. The context lets the function create values that derive from no input
+/// of [`Domain`] together with its inputs. The context lets the function create values that derive from no input
 /// (e.g., through [`Context::lift`](ryft_core::Context::lift)) and bind context capabilities directly (e.g., a
 /// `shard_map` without inputs through [`ShardMap`](ryft_core::ShardMap)), and the function must not retain it or its
 /// tracers after returning.
@@ -82,27 +82,27 @@ where
 pub fn trace_with_context<F, Input, Output>(
     function: F,
     global_input_types: Input,
-) -> Result<TracedXlaProgram<Input, Output>, Error>
+) -> Result<TracedProgram<Input, Output>, Error>
 where
     Input: Parameterized<ArrayType>,
-    Input::Family: ParameterizedFamily<XlaConstant> + ParameterizedFamily<XlaArrayTracer>,
+    Input::Family: ParameterizedFamily<Constant> + ParameterizedFamily<ArrayTracer>,
     Output: Parameterized<ArrayType>,
-    Output::Family: ParameterizedFamily<XlaConstant> + ParameterizedFamily<XlaArrayTracer>,
+    Output::Family: ParameterizedFamily<Constant> + ParameterizedFamily<ArrayTracer>,
     F: FnOnce(
-        &DomainTracingContext<XlaDomain<'static>>,
-        Input::To<XlaArrayTracer>,
-    ) -> Result<Output::To<XlaArrayTracer>, ProgramError>,
+        &DomainTracingContext<Domain<'static>>,
+        Input::To<ArrayTracer>,
+    ) -> Result<Output::To<ArrayTracer>, ProgramError>,
 {
     let input_structure = global_input_types.parameter_structure();
     let output_structure = RefCell::new(None);
-    let (output_types, program) = DomainTracingContext::<XlaDomain<'static>>::trace_with_context_and_named_axes(
-        |context, inputs: Vec<XlaTracer<'static>>| {
+    let (output_types, program) = DomainTracingContext::<Domain<'static>>::trace_with_context_and_named_axes(
+        |context, inputs: Vec<Tracer<'static>>| {
             let inputs = inputs
                 .into_iter()
                 .map(|input| ValueProjection::<ArrayType>::into_projected(input).map_err(ProgramError::from))
                 .collect::<Result<Vec<_>, _>>()?;
             let outputs =
-                function(context, Input::To::<XlaArrayTracer>::from_parameters(input_structure.clone(), inputs)?)?;
+                function(context, Input::To::<ArrayTracer>::from_parameters(input_structure.clone(), inputs)?)?;
             output_structure.replace(Some(outputs.parameter_structure()));
             Ok(outputs.into_parameters().map(ProjectedValue::into_value).collect::<Vec<_>>())
         },
@@ -122,15 +122,15 @@ where
     )?;
     let program = program
         .simplified()?
-        .restructured::<Input::To<XlaConstant>, Output::To<XlaConstant>>(input_structure, output_structure)?;
-    Ok(TracedXlaProgram { global_input_types, global_output_types, program })
+        .restructured::<Input::To<Constant>, Output::To<Constant>>(input_structure, output_structure)?;
+    Ok(TracedProgram { global_input_types, global_output_types, program })
 }
 
 /// Traced XLA program backed by a staged [`Program`](ryft_core::Program), as returned by [`trace`].
-pub struct TracedXlaProgram<Input: Parameterized<ArrayType>, Output: Parameterized<ArrayType>>
+pub struct TracedProgram<Input: Parameterized<ArrayType>, Output: Parameterized<ArrayType>>
 where
-    Input::Family: ParameterizedFamily<XlaConstant>,
-    Output::Family: ParameterizedFamily<XlaConstant>,
+    Input::Family: ParameterizedFamily<Constant>,
+    Output::Family: ParameterizedFamily<Constant>,
 {
     /// Global input types supplied to the traced function.
     global_input_types: Input,
@@ -139,13 +139,13 @@ where
     global_output_types: Output,
 
     /// Staged traced XLA program specialized to abstract array leaves.
-    program: XlaProgram<Input::To<XlaConstant>, Output::To<XlaConstant>>,
+    program: Program<Input::To<Constant>, Output::To<Constant>>,
 }
 
-impl<Input: Parameterized<ArrayType>, Output: Parameterized<ArrayType>> TracedXlaProgram<Input, Output>
+impl<Input: Parameterized<ArrayType>, Output: Parameterized<ArrayType>> TracedProgram<Input, Output>
 where
-    Input::Family: ParameterizedFamily<XlaConstant>,
-    Output::Family: ParameterizedFamily<XlaConstant>,
+    Input::Family: ParameterizedFamily<Constant>,
+    Output::Family: ParameterizedFamily<Constant>,
 {
     /// Returns backend-neutral structural statistics for the staged traced XLA program backing this handle. The
     /// statistics describe the program as [`trace`] stores it, which it has already simplified (refer to
@@ -187,7 +187,7 @@ where
     /// arguments and/or results. This is what the XLA SPMD partitioner reads to drive boundary slicing of per-device
     /// output buffers, including for shapes whose dimensions are not divisible by the partition count (e.g., shape
     /// `[5]` on 2 partitions producing `[3]` + `[2]`). A side without explicit shardings carries the sharding of each
-    /// of its global types that has one, as the compilation path of [`XlaDomain`] does. Unlike that path, which places
+    /// of its global types that has one, as the compilation path of [`Domain`] does. Unlike that path, which places
     /// a value whose type has no sharding as replicated because it lowers for concrete placed arrays, such a value is
     /// left unannotated here, so that Shardy propagates its placement from the program (as JAX does for unspecified
     /// shardings).
@@ -250,12 +250,12 @@ mod tests {
     use indoc::indoc;
     use pretty_assertions::assert_eq;
     use ryft_core::{
-        Array, BatchAxis, BatchAxisSpecification, CollectiveOptions, ConstrainSharding, Context, DataType, Device,
-        DeviceMesh, Differentiate, Dimension, EffectClass, LogicalMesh, MeshAxis, MeshAxisType, Mul, NamedAxis,
-        ParallelAllGather, ParallelAllGatherOutputVariance, ParallelRaggedAllToAll, ParallelVary, Placeholder, Print,
-        Reduce, ReductionKind, RegionRole, Reshape, Reshard, Shape, ShardMap, ShardMapBoundary, ShardMapContext,
-        ShardMapOperation, ShardMapOptions, Sharding, ShardingDimension, Sin, StagingContext, Typed, Value, batch,
-        shard_map,
+        Array as CoreArray, BatchAxis, BatchAxisSpecification, CollectiveOptions, ConstrainSharding, Context, DataType,
+        Device, DeviceMesh, Differentiate, Dimension as CoreDimension, EffectClass, LogicalMesh, MeshAxis,
+        MeshAxisType, Mul, NamedAxis, ParallelAllGather, ParallelAllGatherOutputVariance, ParallelRaggedAllToAll,
+        ParallelVary, Placeholder, Print, Reduce, ReductionKind, RegionRole, Reshape, Reshard, Shape, ShardMap,
+        ShardMapBoundary, ShardMapContext, ShardMapOperation, ShardMapOptions, Sharding, ShardingDimension, Sin,
+        StagingContext, Typed, Value as CoreValue, batch, shard_map,
     };
     use ryft_pjrt::{BufferType, ClientOptions, CpuClientOptions, Program, load_cpu_plugin};
     #[cfg(feature = "cuda-13")]
@@ -264,9 +264,9 @@ mod tests {
     use crate::experimental::lowering::tests::{
         static_sharded_array_type, test_sharding, test_spmd_compilation_options,
     };
-    use crate::experimental::ops::{XlaOperation, XlaProgramBuilder};
+    use crate::experimental::ops::{Operation, ProgramBuilder};
     use crate::tests::{values_from_bytes, values_to_bytes};
-    use crate::{FromPjrt, XlaArray, XlaSession};
+    use crate::{Array, FromPjrt, Session};
 
     use super::*;
 
@@ -286,19 +286,19 @@ mod tests {
         let client = plugin
             .client(ClientOptions::CPU(CpuClientOptions { device_count: Some(4), ..Default::default() }))
             .unwrap();
-        let domain = XlaSession::new(&client).domain();
+        let domain = Session::new(&client).domain();
         let devices = client.addressable_devices().unwrap();
         let mesh = LogicalMesh::new(vec![MeshAxis::new("x", 4, MeshAxisType::Manual).unwrap()]).unwrap();
         let device_mesh =
             DeviceMesh::new(mesh.clone(), devices.iter().map(|device| Device::from_pjrt(device).unwrap()).collect())
                 .unwrap();
         let sharding = Sharding::new(mesh.clone(), vec![ShardingDimension::sharded(["x"])]).unwrap();
-        let traced: TracedXlaProgram<ArrayType, ArrayType> = trace(
+        let traced: TracedProgram<ArrayType, ArrayType> = trace(
             {
                 let sharding = sharding.clone();
-                move |x: XlaArrayTracer| {
+                move |x: ArrayTracer| {
                     shard_map(
-                        |local_x: XlaArrayTracer| local_x.parallel_reduce(kind, "x"),
+                        |local_x: ArrayTracer| local_x.parallel_reduce(kind, "x"),
                         x,
                         mesh.clone(),
                         sharding.clone(),
@@ -322,7 +322,7 @@ mod tests {
                     .unwrap()
             })
             .collect();
-        let input = XlaArray::from_addressable_buffers(
+        let input = Array::from_addressable_buffers(
             &domain,
             static_sharded_array_type(data_type, &[4 * shard_size], sharding),
             device_mesh,
@@ -335,7 +335,7 @@ mod tests {
             .iter()
             .map(|device| device.id().unwrap())
             .collect::<Vec<_>>();
-        let arguments = XlaArray::into_execute_arguments(vec![input], &device_ids).unwrap();
+        let arguments = Array::into_execute_arguments(vec![input], &device_ids).unwrap();
         executable
             .execute(arguments.as_execution_device_inputs(), Vec::new(), 0, None, Some(file!()), None, None, &[])
             .unwrap()
@@ -349,15 +349,15 @@ mod tests {
     /// Traces a program over a sharded `f64[4]` input that invokes a `shard_map` over the two-device manual mesh, whose
     /// body prints its local shard with the `DeviceOrderedIo` effect and whose only output is dead, and that returns
     /// its input unchanged.
-    fn traced_effectful_dead_shard_map() -> (TracedXlaProgram<ArrayType, ArrayType>, Sharding) {
+    fn traced_effectful_dead_shard_map() -> (TracedProgram<ArrayType, ArrayType>, Sharding) {
         let mesh = LogicalMesh::new(vec![MeshAxis::new("x", 2, MeshAxisType::Manual).unwrap()]).unwrap();
         let sharding = Sharding::new(mesh.clone(), vec![ShardingDimension::sharded(["x"])]).unwrap();
         let traced = trace(
             {
                 let sharding = sharding.clone();
-                move |x: XlaArrayTracer| {
+                move |x: ArrayTracer| {
                     let _printed = shard_map(
-                        |local_x: XlaArrayTracer| local_x.print_with_effect_class("body", EffectClass::DeviceOrderedIo),
+                        |local_x: ArrayTracer| local_x.print_with_effect_class("body", EffectClass::DeviceOrderedIo),
                         x.clone(),
                         mesh.clone(),
                         sharding.clone(),
@@ -376,8 +376,8 @@ mod tests {
 
     #[test]
     fn test_trace() {
-        let traced: TracedXlaProgram<(ArrayType, ArrayType), ArrayType> = trace(
-            |(x, y): (XlaArrayTracer, XlaArrayTracer)| x.sin().unwrap() * y,
+        let traced: TracedProgram<(ArrayType, ArrayType), ArrayType> = trace(
+            |(x, y): (ArrayTracer, ArrayTracer)| x.sin().unwrap() * y,
             (ArrayType::new_static(DataType::F32, [4]), ArrayType::new_static(DataType::F32, [4])),
         )
         .unwrap();
@@ -402,12 +402,12 @@ mod tests {
     fn test_trace_reshard_renders_mlir() {
         let mesh = LogicalMesh::new(vec![MeshAxis::new("x", 4, MeshAxisType::Explicit).unwrap()]).unwrap();
         let sharding = test_sharding(&mesh, vec![ShardingDimension::sharded(["x"])], vec![]);
-        let global_input_type = ArrayType::new(DataType::F32, Shape::new(vec![Dimension::Static(8)]));
+        let global_input_type = ArrayType::new(DataType::F32, Shape::new(vec![CoreDimension::Static(8)]));
 
-        let traced: TracedXlaProgram<ArrayType, ArrayType> = trace(
+        let traced: TracedProgram<ArrayType, ArrayType> = trace(
             {
                 let sharding = sharding.clone();
-                move |x: XlaArrayTracer| {
+                move |x: ArrayTracer| {
                     x.sin().unwrap().reshard(&sharding).expect("reshard should stage on traced XLA values")
                 }
             },
@@ -433,16 +433,20 @@ mod tests {
     #[test]
     fn test_trace_reshard_then_reshape_renders_mlir() {
         let mesh = LogicalMesh::new(vec![MeshAxis::new("x", 4, MeshAxisType::Explicit).unwrap()]).unwrap();
-        let input_type = ArrayType::new(DataType::F32, Shape::new(vec![Dimension::Static(8)]));
+        let input_type = ArrayType::new(DataType::F32, Shape::new(vec![CoreDimension::Static(8)]));
         let sharding = Sharding::new(mesh.clone(), vec![ShardingDimension::sharded(["x"])]).unwrap();
 
-        let traced: TracedXlaProgram<ArrayType, ArrayType> = trace(
+        let traced: TracedProgram<ArrayType, ArrayType> = trace(
             {
                 let sharding = sharding.clone();
-                move |x: XlaArrayTracer| {
+                move |x: ArrayTracer| {
                     x.reshard(&sharding)
                         .expect("reshard should stage before reshape")
-                        .reshape(Shape::new(vec![Dimension::Static(1), Dimension::Static(8), Dimension::Static(1)]))
+                        .reshape(Shape::new(vec![
+                            CoreDimension::Static(1),
+                            CoreDimension::Static(8),
+                            CoreDimension::Static(1),
+                        ]))
                         .unwrap()
                 }
             },
@@ -477,14 +481,14 @@ mod tests {
         .unwrap();
         let tracked = test_sharding(&mesh, vec![ShardingDimension::sharded(["x"])], vec![]);
         let constraint = test_sharding(&mesh, vec![ShardingDimension::sharded(["a"])], vec![]);
-        let global_input_type = ArrayType::new(DataType::F32, Shape::new(vec![Dimension::Static(8)]))
+        let global_input_type = ArrayType::new(DataType::F32, Shape::new(vec![CoreDimension::Static(8)]))
             .with_sharding(tracked.clone())
             .unwrap();
 
-        let traced: TracedXlaProgram<ArrayType, ArrayType> = trace(
+        let traced: TracedProgram<ArrayType, ArrayType> = trace(
             {
                 let constraint = constraint.clone();
-                move |x: XlaArrayTracer| {
+                move |x: ArrayTracer| {
                     x.constrain_sharding(&constraint).expect("constraint should stage on traced XLA values")
                 }
             },
@@ -506,19 +510,19 @@ mod tests {
         );
     }
 
-    /// Verifies that [`TracedXlaProgram::statistics`] delegates to the stored (simplified) staged program. The asserted
+    /// Verifies that [`TracedProgram::statistics`] delegates to the stored (simplified) staged program. The asserted
     /// numbers are cross-checked against `traced.program.to_string()`, which renders the entry region as one
     /// `shard_map` instruction attaching a single-`sin` body region.
     #[test]
-    fn test_traced_xla_program_statistics() {
+    fn test_traced_program_statistics() {
         let mesh = LogicalMesh::new(vec![MeshAxis::new("x", 4, MeshAxisType::Manual).unwrap()]).unwrap();
         let sharding = Sharding::new(mesh.clone(), vec![ShardingDimension::sharded(["x"])]).unwrap();
-        let traced: TracedXlaProgram<ArrayType, ArrayType> = trace(
+        let traced: TracedProgram<ArrayType, ArrayType> = trace(
             {
                 let mesh = mesh.clone();
-                move |x: XlaArrayTracer| {
+                move |x: ArrayTracer| {
                     shard_map(
-                        |local_x: XlaArrayTracer| local_x.sin(),
+                        |local_x: ArrayTracer| local_x.sin(),
                         x,
                         mesh.clone(),
                         sharding.clone(),
@@ -528,7 +532,7 @@ mod tests {
                     .unwrap()
                 }
             },
-            ArrayType::new(DataType::F32, Shape::new(vec![Dimension::Static(8)])),
+            ArrayType::new(DataType::F32, Shape::new(vec![CoreDimension::Static(8)])),
         )
         .unwrap();
 
@@ -563,7 +567,7 @@ mod tests {
     /// Pruning keeps a `shard_map` whose ordinary results are all dead when its body has observable effects, with no
     /// ordinary results, so the lowered manual computation only threads the effect token of its body.
     #[test]
-    fn test_traced_xla_program_to_mlir_module_with_signature_shardings_keeps_effectful_dead_shard_maps() {
+    fn test_traced_program_to_mlir_module_with_signature_shardings_keeps_effectful_dead_shard_maps() {
         let (traced, sharding) = traced_effectful_dead_shard_map();
         assert_eq!(
             traced
@@ -590,7 +594,7 @@ mod tests {
     }
 
     #[test]
-    fn test_traced_xla_program_effectful_dead_shard_map_executes_on_cpu() {
+    fn test_traced_program_effectful_dead_shard_map_executes_on_cpu() {
         use ryft_pjrt::{ExecutionDeviceInputs, ExecutionInput};
 
         use crate::operations::debugging::{ensure_print_handler_registered, with_captured_prints};
@@ -667,13 +671,13 @@ mod tests {
             ArrayType::new_static(DataType::I32, [4]),
             ArrayType::new_static(DataType::I32, [4]),
         ];
-        let traced: TracedXlaProgram<Vec<ArrayType>, ArrayType> = trace(
+        let traced: TracedProgram<Vec<ArrayType>, ArrayType> = trace(
             {
                 let shardings = vec![sharding.clone(); 6];
                 let output_sharding = sharding;
-                move |inputs: Vec<XlaArrayTracer>| {
+                move |inputs: Vec<ArrayTracer>| {
                     shard_map(
-                        |inputs: Vec<XlaArrayTracer>| {
+                        |inputs: Vec<ArrayTracer>| {
                             inputs[0].parallel_ragged_all_to_all(
                                 "x", &inputs[1], &inputs[2], &inputs[3], &inputs[4], &inputs[5],
                             )
@@ -718,7 +722,7 @@ mod tests {
                 ..Default::default()
             }))
             .unwrap();
-        let domain = XlaSession::new(&client).domain();
+        let domain = Session::new(&client).domain();
         let client_devices = client.addressable_devices().unwrap();
         if client_devices.len() < 2 {
             return;
@@ -740,14 +744,14 @@ mod tests {
             ArrayType::new_static(DataType::I32, [4]),
             ArrayType::new_static(DataType::I32, [4]),
         ];
-        let traced: TracedXlaProgram<Vec<ArrayType>, ArrayType> = trace(
+        let traced: TracedProgram<Vec<ArrayType>, ArrayType> = trace(
             {
                 let mesh = device_mesh.logical_mesh().clone();
                 let shardings = vec![sharding.clone(); 6];
                 let output_sharding = sharding.clone();
-                move |inputs: Vec<XlaArrayTracer>| {
+                move |inputs: Vec<ArrayTracer>| {
                     shard_map(
-                        |inputs: Vec<XlaArrayTracer>| {
+                        |inputs: Vec<ArrayTracer>| {
                             inputs[0].parallel_ragged_all_to_all(
                                 "x", &inputs[1], &inputs[2], &inputs[3], &inputs[4], &inputs[5],
                             )
@@ -793,7 +797,7 @@ mod tests {
                             .unwrap()
                     })
                     .collect::<Vec<_>>();
-                XlaArray::from_addressable_buffers(
+                Array::from_addressable_buffers(
                     &domain,
                     static_sharded_array_type(DataType::I32, &[global_extent], sharding.clone()),
                     device_mesh.clone(),
@@ -811,8 +815,7 @@ mod tests {
             .iter()
             .map(|device| device.id().unwrap())
             .collect::<Vec<_>>();
-        let execute_arguments =
-            XlaArray::into_execute_arguments(input_arrays, execution_device_ids.as_slice()).unwrap();
+        let execute_arguments = Array::into_execute_arguments(input_arrays, execution_device_ids.as_slice()).unwrap();
         let outputs = executable
             .execute(
                 execute_arguments.as_execution_device_inputs(),
@@ -846,14 +849,14 @@ mod tests {
             ArrayType::new_static(DataType::I32, [4]),
             ArrayType::new_static(DataType::I32, [4]),
         ];
-        let gradient: TracedXlaProgram<Vec<ArrayType>, ArrayType> = trace(
+        let gradient: TracedProgram<Vec<ArrayType>, ArrayType> = trace(
             {
                 let mesh = device_mesh.logical_mesh().clone();
                 let shardings = vec![sharding.clone(); 6];
                 let output_sharding = sharding.clone();
-                move |inputs: Vec<XlaArrayTracer>| {
+                move |inputs: Vec<ArrayTracer>| {
                     shard_map(
-                        |inputs: Vec<XlaArrayTracer>| {
+                        |inputs: Vec<ArrayTracer>| {
                             let context = inputs[0].domain();
                             Ok(context
                                 .differentiate_at(inputs[0].clone())
@@ -914,7 +917,7 @@ mod tests {
                             .unwrap()
                     })
                     .collect::<Vec<_>>();
-                XlaArray::from_addressable_buffers(
+                Array::from_addressable_buffers(
                     &domain,
                     static_sharded_array_type(DataType::F32, &[global_extent], sharding.clone()),
                     device_mesh.clone(),
@@ -946,7 +949,7 @@ mod tests {
                         .unwrap()
                 })
                 .collect::<Vec<_>>();
-            XlaArray::from_addressable_buffers(
+            Array::from_addressable_buffers(
                 &domain,
                 static_sharded_array_type(DataType::I32, &[4], sharding.clone()),
                 device_mesh.clone(),
@@ -964,7 +967,7 @@ mod tests {
             .map(|device| device.id().unwrap())
             .collect::<Vec<_>>();
         let gradient_arguments =
-            XlaArray::into_execute_arguments(gradient_inputs, gradient_device_ids.as_slice()).unwrap();
+            Array::into_execute_arguments(gradient_inputs, gradient_device_ids.as_slice()).unwrap();
         let gradients = gradient_executable
             .execute(
                 gradient_arguments.as_execution_device_inputs(),
@@ -993,7 +996,7 @@ mod tests {
         let client = plugin
             .client(ClientOptions::CPU(CpuClientOptions { device_count: Some(4), ..Default::default() }))
             .expect("failed to create 4-device CPU client");
-        let domain = XlaSession::new(&client).domain();
+        let domain = Session::new(&client).domain();
         let client_devices = client.addressable_devices().unwrap();
         assert_eq!(client_devices.len(), 4);
 
@@ -1005,18 +1008,18 @@ mod tests {
         .unwrap();
         let sharding =
             Sharding::new(device_mesh.logical_mesh().clone(), vec![ShardingDimension::sharded(["x"])]).unwrap();
-        let global_input_type = ArrayType::new(DataType::F32, Shape::new(vec![Dimension::Static(8)]));
+        let global_input_type = ArrayType::new(DataType::F32, Shape::new(vec![CoreDimension::Static(8)]));
 
         // A sum `parallel_reduce` over the manual mesh axis `"x"` resolves against the seeded body trace and lowers to
         // a `stablehlo.all_reduce` whose replica group spans the four devices along `"x"`, so every shard receives the
         // elementwise sum of all four local shards.
-        let traced: TracedXlaProgram<ArrayType, ArrayType> = trace(
+        let traced: TracedProgram<ArrayType, ArrayType> = trace(
             {
                 let mesh = device_mesh.logical_mesh().clone();
                 let sharding = sharding.clone();
-                move |x: XlaArrayTracer| {
+                move |x: ArrayTracer| {
                     shard_map(
-                        |local_x: XlaArrayTracer| local_x.parallel_reduce(ReductionKind::Sum, "x"),
+                        |local_x: ArrayTracer| local_x.parallel_reduce(ReductionKind::Sum, "x"),
                         x,
                         mesh.clone(),
                         sharding.clone(),
@@ -1068,7 +1071,7 @@ mod tests {
                     .unwrap()
             })
             .collect::<Vec<_>>();
-        let input_array = XlaArray::from_addressable_buffers(
+        let input_array = Array::from_addressable_buffers(
             &domain,
             static_sharded_array_type(DataType::F32, &[8], sharding),
             device_mesh,
@@ -1082,7 +1085,7 @@ mod tests {
         assert_eq!(execution_devices.len(), 4);
         let execution_device_ids = execution_devices.iter().map(|device| device.id().unwrap()).collect::<Vec<_>>();
         let execute_arguments =
-            XlaArray::into_execute_arguments(vec![input_array], execution_device_ids.as_slice()).unwrap();
+            Array::into_execute_arguments(vec![input_array], execution_device_ids.as_slice()).unwrap();
         let outputs = executable
             .execute(
                 execute_arguments.as_execution_device_inputs(),
@@ -1196,7 +1199,7 @@ mod tests {
         let client = plugin
             .client(ClientOptions::CPU(CpuClientOptions { device_count: Some(4), ..Default::default() }))
             .unwrap();
-        let domain = XlaSession::new(&client).domain();
+        let domain = Session::new(&client).domain();
         let devices = client.addressable_devices().unwrap();
         let mesh = LogicalMesh::new(vec![MeshAxis::new("x", 4, MeshAxisType::Manual).unwrap()]).unwrap();
         let device_mesh =
@@ -1207,11 +1210,11 @@ mod tests {
 
         // The gradient of a logarithmic sum of exponentials is the softmax of its inputs. The composed mesh form
         // differentiates through its mesh sum alone, because its mesh maximum only shifts the exponents.
-        let traced: TracedXlaProgram<ArrayType, Vec<ArrayType>> = trace(
+        let traced: TracedProgram<ArrayType, Vec<ArrayType>> = trace(
             {
                 let replicated = replicated.clone();
                 let sharded = sharded.clone();
-                move |x: XlaArrayTracer| {
+                move |x: ArrayTracer| {
                     let (value, gradient) = x
                         .clone()
                         .into_value()
@@ -1220,7 +1223,7 @@ mod tests {
                         .value_and_gradient(|x| {
                             let x = ValueProjection::<ArrayType>::into_projected(x)?;
                             Ok(shard_map(
-                                |local_x: XlaArrayTracer| {
+                                |local_x: ArrayTracer| {
                                     local_x
                                         .reduce(&[0], ReductionKind::Sum)?
                                         .parallel_reduce(ReductionKind::LogSumExp, "x")
@@ -1264,7 +1267,7 @@ mod tests {
                     .unwrap()
             })
             .collect();
-        let input = XlaArray::from_addressable_buffers(
+        let input = Array::from_addressable_buffers(
             &domain,
             static_sharded_array_type(DataType::F32, &[4], sharded),
             device_mesh,
@@ -1277,7 +1280,7 @@ mod tests {
             .iter()
             .map(|device| device.id().unwrap())
             .collect::<Vec<_>>();
-        let arguments = XlaArray::into_execute_arguments(vec![input], &device_ids).unwrap();
+        let arguments = Array::into_execute_arguments(vec![input], &device_ids).unwrap();
         let outputs = executable
             .execute(arguments.as_execution_device_inputs(), Vec::new(), 0, None, Some(file!()), None, None, &[])
             .unwrap()
@@ -1303,7 +1306,7 @@ mod tests {
         let client = plugin
             .client(ClientOptions::CPU(CpuClientOptions { device_count: Some(4), ..Default::default() }))
             .unwrap();
-        let domain = XlaSession::new(&client).domain();
+        let domain = Session::new(&client).domain();
         let devices = client.addressable_devices().unwrap();
         let mesh = LogicalMesh::new(vec![MeshAxis::new("x", 4, MeshAxisType::Manual).unwrap()]).unwrap();
         let device_mesh =
@@ -1315,11 +1318,11 @@ mod tests {
         // The gradient of `sum(g * g)`, where `g` is the invariant all-gather of `x`, is `2 * x`. Linearizing the
         // all-gather keeps its gathered extent as a first-class dimension residual, which crosses the boundary between
         // the primal and the tangent `shard_map`s.
-        let traced: TracedXlaProgram<ArrayType, Vec<ArrayType>> = trace(
+        let traced: TracedProgram<ArrayType, Vec<ArrayType>> = trace(
             {
                 let replicated = replicated.clone();
                 let sharded = sharded.clone();
-                move |x: XlaArrayTracer| {
+                move |x: ArrayTracer| {
                     let (value, gradient) = x
                         .clone()
                         .into_value()
@@ -1328,7 +1331,7 @@ mod tests {
                         .value_and_gradient(|x| {
                             let x = ValueProjection::<ArrayType>::into_projected(x)?;
                             Ok(shard_map(
-                                |local_x: XlaArrayTracer| {
+                                |local_x: ArrayTracer| {
                                     let gathered = local_x.parallel_all_gather_with_options(
                                         "x",
                                         0,
@@ -1378,7 +1381,7 @@ mod tests {
                     .unwrap()
             })
             .collect();
-        let input = XlaArray::from_addressable_buffers(
+        let input = Array::from_addressable_buffers(
             &domain,
             static_sharded_array_type(DataType::F32, &[4], sharded),
             device_mesh,
@@ -1391,7 +1394,7 @@ mod tests {
             .iter()
             .map(|device| device.id().unwrap())
             .collect::<Vec<_>>();
-        let arguments = XlaArray::into_execute_arguments(vec![input], &device_ids).unwrap();
+        let arguments = Array::into_execute_arguments(vec![input], &device_ids).unwrap();
         let outputs = executable
             .execute(arguments.as_execution_device_inputs(), Vec::new(), 0, None, Some(file!()), None, None, &[])
             .unwrap()
@@ -1417,7 +1420,7 @@ mod tests {
             let client = plugin
                 .client(ClientOptions::CPU(CpuClientOptions { device_count: Some(device_count), ..Default::default() }))
                 .unwrap();
-            let domain = XlaSession::new(&client).domain();
+            let domain = Session::new(&client).domain();
             let client_devices = client.addressable_devices().unwrap();
             assert_eq!(client_devices.len(), device_count);
             let mesh = LogicalMesh::new(vec![MeshAxis::new("x", device_count, MeshAxisType::Manual).unwrap()]).unwrap();
@@ -1428,11 +1431,11 @@ mod tests {
             .unwrap();
             let replicated = Sharding::replicated(mesh.clone(), 0);
             let sharded = Sharding::new(mesh.clone(), vec![ShardingDimension::sharded(["x"])]).unwrap();
-            let traced: TracedXlaProgram<Vec<ArrayType>, Vec<ArrayType>> = trace(
+            let traced: TracedProgram<Vec<ArrayType>, Vec<ArrayType>> = trace(
                 {
                     let replicated = replicated.clone();
                     let sharded = sharded.clone();
-                    move |inputs: Vec<XlaArrayTracer>| {
+                    move |inputs: Vec<ArrayTracer>| {
                         let (value, gradient) = inputs[0]
                             .clone()
                             .into_value()
@@ -1442,7 +1445,7 @@ mod tests {
                                 let shared = ValueProjection::<ArrayType>::into_projected(shared)?;
                                 let weights = ValueProjection::<ArrayType>::into_projected(weights)?;
                                 Ok(shard_map(
-                                    |(shared, weights): (XlaArrayTracer, XlaArrayTracer)| {
+                                    |(shared, weights): (ArrayTracer, ArrayTracer)| {
                                         (shared.clone() * shared * weights)
                                             .reduce(&[0], ReductionKind::Sum)?
                                             .parallel_reduce(ReductionKind::Sum, "x")
@@ -1465,7 +1468,7 @@ mod tests {
                             .gradient(|varying| {
                                 let varying = ValueProjection::<ArrayType>::into_projected(varying)?;
                                 Ok(shard_map(
-                                    |varying: XlaArrayTracer| {
+                                    |varying: ArrayTracer| {
                                         (varying.clone() * varying)
                                             .reduce(&[0], ReductionKind::Sum)?
                                             .parallel_reduce(ReductionKind::Sum, "x")
@@ -1495,7 +1498,7 @@ mod tests {
                                         let shared = ValueProjection::<ArrayType>::into_projected(shared)?;
                                         let weights = ValueProjection::<ArrayType>::into_projected(weights)?;
                                         Ok(shard_map(
-                                            |(shared, weights): (XlaArrayTracer, XlaArrayTracer)| {
+                                            |(shared, weights): (ArrayTracer, ArrayTracer)| {
                                                 (shared.clone() * shared * weights)
                                                     .reduce(&[0], ReductionKind::Sum)?
                                                     .parallel_reduce(ReductionKind::Sum, "x")
@@ -1521,7 +1524,7 @@ mod tests {
                                 let shared = ValueProjection::<ArrayType>::into_projected(shared)?;
                                 let weights = ValueProjection::<ArrayType>::into_projected(weights)?;
                                 Ok(shard_map(
-                                    |(shared, weights): (XlaArrayTracer, XlaArrayTracer)| {
+                                    |(shared, weights): (ArrayTracer, ArrayTracer)| {
                                         Ok(shared.clone() * shared * weights)
                                     },
                                     (shared, weights),
@@ -1546,7 +1549,7 @@ mod tests {
                                     let shared = ValueProjection::<ArrayType>::into_projected(shared)?;
                                     let weights = ValueProjection::<ArrayType>::into_projected(weights)?;
                                     Ok(shard_map(
-                                        |(shared, weights): (XlaArrayTracer, XlaArrayTracer)| {
+                                        |(shared, weights): (ArrayTracer, ArrayTracer)| {
                                             Ok(shared.clone() * shared * weights)
                                         },
                                         (shared, weights),
@@ -1561,7 +1564,7 @@ mod tests {
                             )
                             .unwrap();
                         let inner_gradient = shard_map(
-                            |(shared, weights): (XlaArrayTracer, XlaArrayTracer)| {
+                            |(shared, weights): (ArrayTracer, ArrayTracer)| {
                                 let derivative = shared
                                     .clone()
                                     .into_value()
@@ -1586,8 +1589,8 @@ mod tests {
                         )
                         .unwrap();
                         let constant_sum = shard_map(
-                            |input: XlaArrayTracer| {
-                                let constant: XlaArrayTracer = input.domain().fill(&input.r#type(), 3.0_f32)?;
+                            |input: ArrayTracer| {
+                                let constant: ArrayTracer = input.domain().fill(&input.r#type(), 3.0_f32)?;
                                 constant.parallel_reduce(ReductionKind::Sum, "x")
                             },
                             inputs[0].clone(),
@@ -1655,14 +1658,14 @@ mod tests {
                 })
                 .collect();
             let inputs = vec![
-                XlaArray::from_addressable_buffers(
+                Array::from_addressable_buffers(
                     &domain,
                     static_sharded_array_type(DataType::F32, &[], replicated),
                     device_mesh.clone(),
                     shared_buffers,
                 )
                 .unwrap(),
-                XlaArray::from_addressable_buffers(
+                Array::from_addressable_buffers(
                     &domain,
                     static_sharded_array_type(DataType::F32, &[device_count], sharded),
                     device_mesh,
@@ -1676,7 +1679,7 @@ mod tests {
                 .iter()
                 .map(|device| device.id().unwrap())
                 .collect::<Vec<_>>();
-            let arguments = XlaArray::into_execute_arguments(inputs, &device_ids).unwrap();
+            let arguments = Array::into_execute_arguments(inputs, &device_ids).unwrap();
             let outputs = executable
                 .execute(arguments.as_execution_device_inputs(), Vec::new(), 0, None, Some(file!()), None, None, &[])
                 .unwrap()
@@ -1737,7 +1740,7 @@ mod tests {
         let client = plugin
             .client(ClientOptions::CPU(CpuClientOptions { device_count: Some(2), ..Default::default() }))
             .unwrap();
-        let domain = XlaSession::new(&client).domain();
+        let domain = Session::new(&client).domain();
         let devices = client.addressable_devices().unwrap();
         let mesh = LogicalMesh::new(vec![MeshAxis::new("x", 2, MeshAxisType::Manual).unwrap()]).unwrap();
         let device_mesh =
@@ -1750,12 +1753,12 @@ mod tests {
             ArrayType::new_static(DataType::I32, [4]).with_sharding(sharded.clone()).unwrap(),
             ArrayType::new_static(DataType::F32, [4]).with_sharding(sharded.clone()).unwrap(),
         ];
-        let traced: TracedXlaProgram<Vec<ArrayType>, Vec<ArrayType>> = trace(
+        let traced: TracedProgram<Vec<ArrayType>, Vec<ArrayType>> = trace(
             {
                 let mesh = mesh.clone();
                 let replicated = replicated.clone();
                 let sharded = sharded.clone();
-                move |inputs: Vec<XlaArrayTracer>| {
+                move |inputs: Vec<ArrayTracer>| {
                     let (output, pullback) = inputs[0]
                         .clone()
                         .into_value()
@@ -1766,7 +1769,7 @@ mod tests {
                             let data = ValueProjection::<ArrayType>::into_projected(data)?;
                             let indices = ValueProjection::<ArrayType>::into_projected(indices)?;
                             Ok(shard_map(
-                                |(data, indices): (XlaArrayTracer, XlaArrayTracer)| {
+                                |(data, indices): (ArrayTracer, ArrayTracer)| {
                                     data.gather_axis(&indices, 0, GatherMode::Clip)
                                 },
                                 (data, indices),
@@ -1781,7 +1784,7 @@ mod tests {
                         .unwrap();
                     let gradient = pullback.apply_materialized(inputs[2].clone().into_value()).unwrap();
                     let maxima = shard_map(
-                        |input: XlaArrayTracer| {
+                        |input: ArrayTracer| {
                             let maximum = input.parallel_reduce(ReductionKind::Max, "x")?;
                             let varying = maximum.parallel_vary("x")?;
                             Ok((maximum, varying))
@@ -1848,21 +1851,21 @@ mod tests {
             })
             .collect();
         let inputs = vec![
-            XlaArray::from_addressable_buffers(
+            Array::from_addressable_buffers(
                 &domain,
                 static_sharded_array_type(DataType::F32, &[3], replicated),
                 device_mesh.clone(),
                 data_buffers,
             )
             .unwrap(),
-            XlaArray::from_addressable_buffers(
+            Array::from_addressable_buffers(
                 &domain,
                 static_sharded_array_type(DataType::I32, &[4], sharded.clone()),
                 device_mesh.clone(),
                 index_buffers,
             )
             .unwrap(),
-            XlaArray::from_addressable_buffers(
+            Array::from_addressable_buffers(
                 &domain,
                 static_sharded_array_type(DataType::F32, &[4], sharded),
                 device_mesh,
@@ -1881,7 +1884,7 @@ mod tests {
             .iter()
             .map(|device| device.id().unwrap())
             .collect::<Vec<_>>();
-        let arguments = XlaArray::into_execute_arguments(inputs, &device_ids).unwrap();
+        let arguments = Array::into_execute_arguments(inputs, &device_ids).unwrap();
         let outputs = executable
             .execute(arguments.as_execution_device_inputs(), Vec::new(), 0, None, Some(file!()), None, None, &[])
             .unwrap()
@@ -1910,7 +1913,7 @@ mod tests {
         let client = plugin
             .client(ClientOptions::CPU(CpuClientOptions { device_count: Some(2), ..Default::default() }))
             .unwrap();
-        let domain = XlaSession::new(&client).domain();
+        let domain = Session::new(&client).domain();
         let devices = client.addressable_devices().unwrap();
         let mesh = LogicalMesh::new(vec![MeshAxis::new("x", 2, MeshAxisType::Manual).unwrap()]).unwrap();
         let device_mesh =
@@ -1923,12 +1926,12 @@ mod tests {
             ArrayType::new_static(DataType::I32, [4]).with_sharding(sharded.clone()).unwrap(),
             ArrayType::new_static(DataType::F32, [2]),
         ];
-        let traced: TracedXlaProgram<Vec<ArrayType>, Vec<ArrayType>> = trace(
+        let traced: TracedProgram<Vec<ArrayType>, Vec<ArrayType>> = trace(
             {
                 let mesh = mesh.clone();
                 let replicated = replicated.clone();
                 let sharded = sharded.clone();
-                move |inputs: Vec<XlaArrayTracer>| {
+                move |inputs: Vec<ArrayTracer>| {
                     let (output, tangent) = inputs[0]
                         .clone()
                         .into_value()
@@ -1939,7 +1942,7 @@ mod tests {
                             let data = ValueProjection::<ArrayType>::into_projected(data)?;
                             let indices = ValueProjection::<ArrayType>::into_projected(indices)?;
                             Ok(shard_map(
-                                |(data, indices): (XlaArrayTracer, XlaArrayTracer)| {
+                                |(data, indices): (ArrayTracer, ArrayTracer)| {
                                     Ok(Sort::sort(&[indices, data], 0, SortDirection::Ascending)?.remove(1))
                                 },
                                 (data, indices),
@@ -2005,21 +2008,21 @@ mod tests {
             })
             .collect();
         let inputs = vec![
-            XlaArray::from_addressable_buffers(
+            Array::from_addressable_buffers(
                 &domain,
                 static_sharded_array_type(DataType::F32, &[2], replicated.clone()),
                 device_mesh.clone(),
                 data_buffers,
             )
             .unwrap(),
-            XlaArray::from_addressable_buffers(
+            Array::from_addressable_buffers(
                 &domain,
                 static_sharded_array_type(DataType::I32, &[4], sharded.clone()),
                 device_mesh.clone(),
                 index_buffers,
             )
             .unwrap(),
-            XlaArray::from_addressable_buffers(
+            Array::from_addressable_buffers(
                 &domain,
                 static_sharded_array_type(DataType::F32, &[2], replicated),
                 device_mesh,
@@ -2043,7 +2046,7 @@ mod tests {
             .iter()
             .map(|device| device.id().unwrap())
             .collect::<Vec<_>>();
-        let arguments = XlaArray::into_execute_arguments(inputs, &device_ids).unwrap();
+        let arguments = Array::into_execute_arguments(inputs, &device_ids).unwrap();
         let outputs = executable
             .execute(arguments.as_execution_device_inputs(), Vec::new(), 0, None, Some(file!()), None, None, &[])
             .unwrap()
@@ -2068,15 +2071,15 @@ mod tests {
         };
         use ryft_core::{ArrayOperation, DomainTracer, EagerContext};
 
-        use crate::experimental::ops::XlaArrayConstant;
+        use crate::experimental::ops::ArrayConstant;
 
-        type AttentionDomain = EagerContext<XlaArrayConstant, ArrayOperation<XlaArrayConstant>>;
+        type AttentionDomain = EagerContext<ArrayConstant, ArrayOperation<ArrayConstant>>;
 
         let plugin = load_cpu_plugin().unwrap();
         let client = plugin
             .client(ClientOptions::CPU(CpuClientOptions { device_count: Some(2), ..Default::default() }))
             .unwrap();
-        let domain = XlaSession::new(&client).domain();
+        let domain = Session::new(&client).domain();
         let devices = client.addressable_devices().unwrap();
         let mesh = LogicalMesh::new(vec![MeshAxis::new("x", 2, MeshAxisType::Manual).unwrap()]).unwrap();
         let device_mesh =
@@ -2130,19 +2133,19 @@ mod tests {
             )],
         )
         .unwrap();
-        let body = body.into_flat_program().into_unprojected::<XlaConstant, XlaOperation>().unwrap();
+        let body = body.into_flat_program().into_unprojected::<Constant, Operation>().unwrap();
         let operation = ShardMapOperation::from_program(
             &body,
             input_types.iter().cloned().map(ArrayIrType::Array).collect(),
             boundary,
         )
         .unwrap();
-        let traced: TracedXlaProgram<Vec<ArrayType>, Vec<ArrayType>> = trace(
-            move |inputs: Vec<XlaArrayTracer>| {
+        let traced: TracedProgram<Vec<ArrayType>, Vec<ArrayType>> = trace(
+            move |inputs: Vec<ArrayTracer>| {
                 let inputs = inputs.into_iter().map(ProjectedValue::into_value).collect::<Vec<_>>();
                 inputs[0]
                     .domain()
-                    .bind(XlaOperation::ShardMap(Box::new(operation.clone())), vec![body.clone()], &inputs)
+                    .bind(Operation::ShardMap(Box::new(operation.clone())), vec![body.clone()], &inputs)
                     .unwrap()
                     .into_iter()
                     .map(|output| ValueProjection::<ArrayType>::into_projected(output).unwrap())
@@ -2162,17 +2165,17 @@ mod tests {
             .compile(&Program::Mlir { bytecode: program.into_bytes() }, &test_spmd_compilation_options(2))
             .unwrap();
         let inputs = vec![
-            XlaArray::from_host_buffer(&domain, query_type, device_mesh.clone(), &values_to_bytes(&[0.0_f32])).unwrap(),
-            XlaArray::from_host_buffer(
+            Array::from_host_buffer(&domain, query_type, device_mesh.clone(), &values_to_bytes(&[0.0_f32])).unwrap(),
+            Array::from_host_buffer(
                 &domain,
                 key_type,
                 device_mesh.clone(),
                 &values_to_bytes(&[0.0_f32, 1.0, 0.0, 3.0]),
             )
             .unwrap(),
-            XlaArray::from_host_buffer(&domain, value_type, device_mesh.clone(), &values_to_bytes(&[2.0_f32, 6.0]))
+            Array::from_host_buffer(&domain, value_type, device_mesh.clone(), &values_to_bytes(&[2.0_f32, 6.0]))
                 .unwrap(),
-            XlaArray::from_host_buffer(&domain, seed_type, device_mesh, &values_to_bytes(&[2.0_f32, 5.0])).unwrap(),
+            Array::from_host_buffer(&domain, seed_type, device_mesh, &values_to_bytes(&[2.0_f32, 5.0])).unwrap(),
         ];
         let device_ids = executable
             .addressable_devices()
@@ -2180,7 +2183,7 @@ mod tests {
             .iter()
             .map(|device| device.id().unwrap())
             .collect::<Vec<_>>();
-        let arguments = XlaArray::into_execute_arguments(inputs, &device_ids).unwrap();
+        let arguments = Array::into_execute_arguments(inputs, &device_ids).unwrap();
         let outputs = executable
             .execute(arguments.as_execution_device_inputs(), Vec::new(), 0, None, Some(file!()), None, None, &[])
             .unwrap()
@@ -2207,7 +2210,7 @@ mod tests {
         let client = plugin
             .client(ClientOptions::CPU(CpuClientOptions { device_count: Some(4), ..Default::default() }))
             .unwrap();
-        let domain = XlaSession::new(&client).domain();
+        let domain = Session::new(&client).domain();
         let client_devices = client.addressable_devices().unwrap();
         assert_eq!(client_devices.len(), 4);
         let mesh = LogicalMesh::new(vec![
@@ -2224,10 +2227,10 @@ mod tests {
         let outer = Sharding::new(mesh.clone(), vec![ShardingDimension::sharded(["x"])]).unwrap();
         let inner = Sharding::new(mesh.clone(), vec![ShardingDimension::sharded(["y"])]).unwrap();
         let global = Sharding::new(mesh.clone(), vec![ShardingDimension::sharded(["x", "y"])]).unwrap();
-        let traced: TracedXlaProgram<Vec<ArrayType>, Vec<ArrayType>> = trace(
+        let traced: TracedProgram<Vec<ArrayType>, Vec<ArrayType>> = trace(
             {
                 let replicated = replicated.clone();
-                move |inputs: Vec<XlaArrayTracer>| {
+                move |inputs: Vec<ArrayTracer>| {
                     let (value, gradient) = inputs[0]
                         .clone()
                         .into_value()
@@ -2237,9 +2240,9 @@ mod tests {
                             let shared = ValueProjection::<ArrayType>::into_projected(shared)?;
                             let weights = ValueProjection::<ArrayType>::into_projected(weights)?;
                             Ok(shard_map(
-                                |inputs: (XlaArrayTracer, XlaArrayTracer)| {
+                                |inputs: (ArrayTracer, ArrayTracer)| {
                                     shard_map(
-                                        |(shared, weights): (XlaArrayTracer, XlaArrayTracer)| {
+                                        |(shared, weights): (ArrayTracer, ArrayTracer)| {
                                             (shared.clone() * shared * weights.clone() * weights)
                                                 .reduce(&[0], ReductionKind::Sum)?
                                                 .parallel_reduce(ReductionKind::Sum, "y")
@@ -2296,14 +2299,14 @@ mod tests {
             })
             .collect();
         let inputs = vec![
-            XlaArray::from_addressable_buffers(
+            Array::from_addressable_buffers(
                 &domain,
                 static_sharded_array_type(DataType::F32, &[], replicated),
                 device_mesh.clone(),
                 shared_buffers,
             )
             .unwrap(),
-            XlaArray::from_addressable_buffers(
+            Array::from_addressable_buffers(
                 &domain,
                 static_sharded_array_type(DataType::F32, &[4], global),
                 device_mesh,
@@ -2317,7 +2320,7 @@ mod tests {
             .iter()
             .map(|device| device.id().unwrap())
             .collect::<Vec<_>>();
-        let arguments = XlaArray::into_execute_arguments(inputs, &device_ids).unwrap();
+        let arguments = Array::into_execute_arguments(inputs, &device_ids).unwrap();
         let outputs = executable
             .execute(arguments.as_execution_device_inputs(), Vec::new(), 0, None, Some(file!()), None, None, &[])
             .unwrap()
@@ -2347,7 +2350,7 @@ mod tests {
         let client = plugin
             .client(ClientOptions::CPU(CpuClientOptions { device_count: Some(4), ..Default::default() }))
             .unwrap();
-        let domain = XlaSession::new(&client).domain();
+        let domain = Session::new(&client).domain();
         let client_devices = client.addressable_devices().unwrap();
         assert_eq!(client_devices.len(), 4);
         let mesh = LogicalMesh::new(vec![
@@ -2365,12 +2368,12 @@ mod tests {
         let global =
             Sharding::new(mesh.clone(), vec![ShardingDimension::sharded(["x"]), ShardingDimension::sharded(["z"])])
                 .unwrap();
-        let traced: TracedXlaProgram<Vec<ArrayType>, Vec<ArrayType>> = trace(
+        let traced: TracedProgram<Vec<ArrayType>, Vec<ArrayType>> = trace(
             {
                 let replicated = replicated.clone();
                 let shared_sharding = shared_sharding.clone();
                 let global = global.clone();
-                move |inputs: Vec<XlaArrayTracer>| {
+                move |inputs: Vec<ArrayTracer>| {
                     let (value, gradient) = inputs[0]
                         .clone()
                         .into_value()
@@ -2380,7 +2383,7 @@ mod tests {
                             let shared = ValueProjection::<ArrayType>::into_projected(shared)?;
                             let weights = ValueProjection::<ArrayType>::into_projected(weights)?;
                             Ok(shard_map(
-                                |(shared, weights): (XlaArrayTracer, XlaArrayTracer)| {
+                                |(shared, weights): (ArrayTracer, ArrayTracer)| {
                                     (shared.clone() * shared * weights)
                                         .reduce(&[0, 1], ReductionKind::Sum)?
                                         .parallel_reduce(ReductionKind::Sum, "x")
@@ -2433,14 +2436,14 @@ mod tests {
             })
             .collect();
         let inputs = vec![
-            XlaArray::from_addressable_buffers(
+            Array::from_addressable_buffers(
                 &domain,
                 static_sharded_array_type(DataType::F32, &[2], shared_sharding),
                 device_mesh.clone(),
                 shared_buffers,
             )
             .unwrap(),
-            XlaArray::from_addressable_buffers(
+            Array::from_addressable_buffers(
                 &domain,
                 static_sharded_array_type(DataType::F32, &[2, 2], global),
                 device_mesh,
@@ -2454,7 +2457,7 @@ mod tests {
             .iter()
             .map(|device| device.id().unwrap())
             .collect::<Vec<_>>();
-        let arguments = XlaArray::into_execute_arguments(inputs, &device_ids).unwrap();
+        let arguments = Array::into_execute_arguments(inputs, &device_ids).unwrap();
         let outputs = executable
             .execute(arguments.as_execution_device_inputs(), Vec::new(), 0, None, Some(file!()), None, None, &[])
             .unwrap()
@@ -2490,7 +2493,7 @@ mod tests {
         let client = plugin
             .client(ClientOptions::CPU(CpuClientOptions { device_count: Some(4), ..Default::default() }))
             .unwrap();
-        let domain = XlaSession::new(&client).domain();
+        let domain = Session::new(&client).domain();
         let devices = client.addressable_devices().unwrap();
         let mesh = LogicalMesh::new(vec![MeshAxis::new("x", 4, MeshAxisType::Manual).unwrap()]).unwrap();
         let device_mesh =
@@ -2502,10 +2505,10 @@ mod tests {
         // Each device squares its shard while the shard is below `10`, so the loop predicate varies over `x` and the
         // devices run different numbers of iterations: inputs `1.5`, `2`, `3`, and `20` take three, two, two, and zero
         // iterations. Reverse mode stores per-device residual stacks and validity masks of the same variation.
-        let traced: TracedXlaProgram<ArrayType, Vec<ArrayType>> = trace(
+        let traced: TracedProgram<ArrayType, Vec<ArrayType>> = trace(
             {
                 let sharded = sharded.clone();
-                move |x: XlaArrayTracer| {
+                move |x: ArrayTracer| {
                     let (value, gradient) = x
                         .clone()
                         .into_value()
@@ -2514,7 +2517,7 @@ mod tests {
                         .value_and_gradient(|x| {
                             let x = ValueProjection::<ArrayType>::into_projected(x)?;
                             Ok(shard_map(
-                                |local_x: XlaArrayTracer| {
+                                |local_x: ArrayTracer| {
                                     let local_type = local_x.r#type().into_owned();
                                     // The limit is a non-differentiable constant, so it is created with the
                                     // variation of the state that it is compared against.
@@ -2525,7 +2528,7 @@ mod tests {
                                     let limit_type =
                                         ArrayType::scalar(DataType::F32).with_sharding(limit_sharding).unwrap();
                                     let condition = {
-                                        let mut builder = XlaProgramBuilder::new();
+                                        let mut builder = ProgramBuilder::new();
                                         let state = builder.add_input(ArrayIrType::Array(local_type.clone()));
                                         let state = builder
                                             .add_instruction(
@@ -2535,7 +2538,7 @@ mod tests {
                                                 None,
                                             )
                                             .unwrap()[0];
-                                        let limit = Array::from_elements(limit_type, &[10f32]).unwrap();
+                                        let limit = CoreArray::from_elements(limit_type, &[10f32]).unwrap();
                                         let limit = builder
                                             .add_instruction(
                                                 ConstantOperation::new(limit),
@@ -2546,7 +2549,7 @@ mod tests {
                                             .unwrap()[0];
                                         let predicate = builder
                                             .add_instruction(
-                                                XlaOperation::Array(ArrayOperation::Compare(CompareOperation::new(
+                                                Operation::Array(ArrayOperation::Compare(CompareOperation::new(
                                                     ComparisonDirection::LessThan,
                                                 ))),
                                                 Vec::new(),
@@ -2557,7 +2560,7 @@ mod tests {
                                         builder.build(vec![predicate], vec![Placeholder], vec![Placeholder]).unwrap()
                                     };
                                     let body = {
-                                        let mut builder = XlaProgramBuilder::new();
+                                        let mut builder = ProgramBuilder::new();
                                         let state = builder.add_input(ArrayIrType::Array(local_type));
                                         let next_state = builder
                                             .add_instruction(MulOperation::new(), Vec::new(), vec![state, state], None)
@@ -2566,7 +2569,7 @@ mod tests {
                                     };
                                     let context = local_x.value().context().clone();
                                     let mut outputs = context.stage_operation(
-                                        XlaOperation::While(WhileOperation::new().with_iteration_bound(4).unwrap()),
+                                        Operation::While(WhileOperation::new().with_iteration_bound(4).unwrap()),
                                         vec![condition, body],
                                         &[local_x.into_value()],
                                     )?;
@@ -2613,7 +2616,7 @@ mod tests {
                     .unwrap()
             })
             .collect();
-        let input = XlaArray::from_addressable_buffers(
+        let input = Array::from_addressable_buffers(
             &domain,
             static_sharded_array_type(DataType::F32, &[4], sharded),
             device_mesh,
@@ -2626,7 +2629,7 @@ mod tests {
             .iter()
             .map(|device| device.id().unwrap())
             .collect::<Vec<_>>();
-        let arguments = XlaArray::into_execute_arguments(vec![input], &device_ids).unwrap();
+        let arguments = Array::into_execute_arguments(vec![input], &device_ids).unwrap();
         let outputs = executable
             .execute(arguments.as_execution_device_inputs(), Vec::new(), 0, None, Some(file!()), None, None, &[])
             .unwrap()
@@ -2660,7 +2663,7 @@ mod tests {
         let client = plugin
             .client(ClientOptions::CPU(CpuClientOptions { device_count: Some(2), ..Default::default() }))
             .expect("failed to create 2-device CPU client");
-        let domain = XlaSession::new(&client).domain();
+        let domain = Session::new(&client).domain();
         ensure_add_one_handler_registered(&client).unwrap();
         let client_devices = client.addressable_devices().unwrap();
         assert_eq!(client_devices.len(), 2);
@@ -2673,17 +2676,17 @@ mod tests {
         .unwrap();
         let sharding =
             Sharding::new(device_mesh.logical_mesh().clone(), vec![ShardingDimension::sharded(["x"])]).unwrap();
-        let global_input_type = ArrayType::new(DataType::F32, Shape::new(vec![Dimension::Static(4)]));
+        let global_input_type = ArrayType::new(DataType::F32, Shape::new(vec![CoreDimension::Static(4)]));
 
         // The custom call executes per shard inside the manual region: its declared output type is the local
         // shard type, and the lowered `stablehlo.custom_call` appears inside the `sdy.manual_computation` body.
-        let traced: TracedXlaProgram<ArrayType, ArrayType> = trace(
+        let traced: TracedProgram<ArrayType, ArrayType> = trace(
             {
                 let mesh = device_mesh.logical_mesh().clone();
                 let sharding = sharding.clone();
-                move |x: XlaArrayTracer| {
+                move |x: ArrayTracer| {
                     shard_map(
-                        |local_x: XlaArrayTracer| {
+                        |local_x: ArrayTracer| {
                             let operation = CustomCallOperation::new(
                                 ADD_ONE_CUSTOM_CALL_TARGET,
                                 vec![local_x.r#type().into_owned()],
@@ -2737,7 +2740,7 @@ mod tests {
                     .unwrap()
             })
             .collect::<Vec<_>>();
-        let input_array = XlaArray::from_addressable_buffers(
+        let input_array = Array::from_addressable_buffers(
             &domain,
             static_sharded_array_type(DataType::F32, &[4], sharding),
             device_mesh,
@@ -2751,7 +2754,7 @@ mod tests {
         assert_eq!(execution_devices.len(), 2);
         let execution_device_ids = execution_devices.iter().map(|device| device.id().unwrap()).collect::<Vec<_>>();
         let execute_arguments =
-            XlaArray::into_execute_arguments(vec![input_array], execution_device_ids.as_slice()).unwrap();
+            Array::into_execute_arguments(vec![input_array], execution_device_ids.as_slice()).unwrap();
         let outputs = executable
             .execute(
                 execute_arguments.as_execution_device_inputs(),
@@ -2783,15 +2786,15 @@ mod tests {
 
         let mesh = LogicalMesh::new(vec![MeshAxis::new("x", 4, MeshAxisType::Manual).unwrap()]).unwrap();
         let sharding = Sharding::new(mesh.clone(), vec![ShardingDimension::sharded(["x"])]).unwrap();
-        let global_input_type = ArrayType::new(DataType::F32, Shape::new(vec![Dimension::Static(8)]));
+        let global_input_type = ArrayType::new(DataType::F32, Shape::new(vec![CoreDimension::Static(8)]));
 
-        let traced: TracedXlaProgram<ArrayType, ArrayType> = trace(
+        let traced: TracedProgram<ArrayType, ArrayType> = trace(
             {
                 let mesh = mesh.clone();
                 let sharding = sharding.clone();
-                move |x: XlaArrayTracer| {
+                move |x: ArrayTracer| {
                     shard_map(
-                        |local_x: XlaArrayTracer| local_x.parallel_reduce(ReductionKind::Mean, "x"),
+                        |local_x: ArrayTracer| local_x.parallel_reduce(ReductionKind::Mean, "x"),
                         x,
                         mesh.clone(),
                         sharding.clone(),
@@ -2835,12 +2838,12 @@ mod tests {
 
         let mesh = LogicalMesh::new(vec![MeshAxis::new("x", 4, MeshAxisType::Manual).unwrap()]).unwrap();
         let sharding = Sharding::new(mesh.clone(), vec![ShardingDimension::sharded(["x"])]).unwrap();
-        let traced: TracedXlaProgram<ArrayType, ArrayType> = trace(
+        let traced: TracedProgram<ArrayType, ArrayType> = trace(
             {
                 let sharding = sharding.clone();
-                move |x: XlaArrayTracer| {
+                move |x: ArrayTracer| {
                     shard_map(
-                        |local_x: XlaArrayTracer| {
+                        |local_x: ArrayTracer| {
                             local_x.parallel_reduce_with_axis_index_groups(
                                 ReductionKind::Mean,
                                 "x",
@@ -2856,7 +2859,7 @@ mod tests {
                     .unwrap()
                 }
             },
-            ArrayType::new(DataType::F32, Shape::new(vec![Dimension::Static(8)])),
+            ArrayType::new(DataType::F32, Shape::new(vec![CoreDimension::Static(8)])),
         )
         .unwrap();
 
@@ -2871,21 +2874,21 @@ mod tests {
 
         let mesh = LogicalMesh::new(vec![MeshAxis::new("x", 4, MeshAxisType::Manual).unwrap()]).unwrap();
         let sharding = Sharding::new(mesh.clone(), vec![ShardingDimension::sharded(["x"])]).unwrap();
-        let global_input_type = ArrayType::new(DataType::F32, Shape::new(vec![Dimension::Static(8)]));
+        let global_input_type = ArrayType::new(DataType::F32, Shape::new(vec![CoreDimension::Static(8)]));
 
         // A named `batch` level inside the shard_map body binds `"b"`, while the sum `parallel_reduce` names the *mesh*
         // axis `"x"`: the batching rule forwards the collective through the batch level to the seeded base trace (which
         // binds `"x"`), so it lands in the body program on the batched physical value and lowers to the same
         // `all_reduce` as a direct sum `parallel_reduce` — resolution composes across binder kinds.
-        let traced: TracedXlaProgram<ArrayType, ArrayType> = trace(
+        let traced: TracedProgram<ArrayType, ArrayType> = trace(
             {
                 let mesh = mesh.clone();
                 let sharding = sharding.clone();
-                move |x: XlaArrayTracer| {
+                move |x: ArrayTracer| {
                     shard_map(
-                        |local_x: XlaArrayTracer| {
+                        |local_x: ArrayTracer| {
                             let context = local_x.domain();
-                            let summed: XlaArrayTracer = Batch::batch(
+                            let summed: ArrayTracer = Batch::batch(
                                 &context,
                                 |item| item.parallel_reduce(ReductionKind::Sum, "x"),
                                 local_x,
@@ -2940,12 +2943,12 @@ mod tests {
         // dimension is an unpartitioned leading dimension of the boundary, so every device holds all three items of its
         // shard.
         type BatchedShardMapTracer =
-            ShardMapTracer<BatchingContext<DomainTracingContext<XlaDomain<'static>>, ArrayIrBatchingPolicy>>;
+            ShardMapTracer<BatchingContext<DomainTracingContext<Domain<'static>>, ArrayIrBatchingPolicy>>;
         let plugin = load_cpu_plugin().unwrap();
         let client = plugin
             .client(ClientOptions::CPU(CpuClientOptions { device_count: Some(4), ..Default::default() }))
             .unwrap();
-        let domain = XlaSession::new(&client).domain();
+        let domain = Session::new(&client).domain();
         let devices = client.addressable_devices().unwrap();
         let mesh = LogicalMesh::new(vec![MeshAxis::new("x", 4, MeshAxisType::Manual).unwrap()]).unwrap();
         let device_mesh =
@@ -2955,11 +2958,11 @@ mod tests {
         let batched_sharding =
             Sharding::new(mesh.clone(), vec![ShardingDimension::replicated(), ShardingDimension::sharded(["x"])])
                 .unwrap();
-        let traced: TracedXlaProgram<ArrayType, ArrayType> = trace(
+        let traced: TracedProgram<ArrayType, ArrayType> = trace(
             {
                 let mesh = mesh.clone();
                 let item_sharding = item_sharding.clone();
-                move |x: XlaArrayTracer| {
+                move |x: ArrayTracer| {
                     let output = batch(
                         |item| {
                             let item = ValueProjection::<ArrayType>::into_projected(item)?;
@@ -3026,7 +3029,7 @@ mod tests {
                     .unwrap()
             })
             .collect();
-        let input = XlaArray::from_addressable_buffers(
+        let input = Array::from_addressable_buffers(
             &domain,
             static_sharded_array_type(DataType::F32, &[3, 8], batched_sharding),
             device_mesh,
@@ -3042,7 +3045,7 @@ mod tests {
             .iter()
             .map(|device| device.id().unwrap())
             .collect::<Vec<_>>();
-        let arguments = XlaArray::into_execute_arguments(vec![input], &device_ids).unwrap();
+        let arguments = Array::into_execute_arguments(vec![input], &device_ids).unwrap();
         let outputs = executable
             .execute(arguments.as_execution_device_inputs(), Vec::new(), 0, None, Some(file!()), None, None, &[])
             .unwrap()
@@ -3079,12 +3082,12 @@ mod tests {
         // `spmd_axis_name`) makes `y` free in the batched `shard_map`: every device holds the two items of its
         // coordinate along `y`, and the result for every item is what the unbatched `shard_map` yields for that item.
         type BatchedShardMapTracer =
-            ShardMapTracer<BatchingContext<DomainTracingContext<XlaDomain<'static>>, ArrayIrBatchingPolicy>>;
+            ShardMapTracer<BatchingContext<DomainTracingContext<Domain<'static>>, ArrayIrBatchingPolicy>>;
         let plugin = load_cpu_plugin().unwrap();
         let client = plugin
             .client(ClientOptions::CPU(CpuClientOptions { device_count: Some(4), ..Default::default() }))
             .unwrap();
-        let domain = XlaSession::new(&client).domain();
+        let domain = Session::new(&client).domain();
         let devices = client.addressable_devices().unwrap();
         let mesh = LogicalMesh::new(vec![
             MeshAxis::new("x", 2, MeshAxisType::Manual).unwrap(),
@@ -3105,11 +3108,11 @@ mod tests {
         let batched_sharding =
             Sharding::new(caller_mesh, vec![ShardingDimension::sharded(["y"]), ShardingDimension::sharded(["x"])])
                 .unwrap();
-        let traced: TracedXlaProgram<ArrayType, ArrayType> = trace(
+        let traced: TracedProgram<ArrayType, ArrayType> = trace(
             {
                 let mesh = mesh.clone();
                 let item_sharding = item_sharding.clone();
-                move |x: XlaArrayTracer| {
+                move |x: ArrayTracer| {
                     let output = batch(
                         |item| {
                             let item = ValueProjection::<ArrayType>::into_projected(item)?;
@@ -3180,7 +3183,7 @@ mod tests {
                     .unwrap()
             })
             .collect();
-        let input = XlaArray::from_addressable_buffers(
+        let input = Array::from_addressable_buffers(
             &domain,
             static_sharded_array_type(DataType::F32, &[4, 8], batched_sharding),
             device_mesh,
@@ -3196,7 +3199,7 @@ mod tests {
             .iter()
             .map(|device| device.id().unwrap())
             .collect::<Vec<_>>();
-        let arguments = XlaArray::into_execute_arguments(vec![input], &device_ids).unwrap();
+        let arguments = Array::into_execute_arguments(vec![input], &device_ids).unwrap();
         let outputs = executable
             .execute(arguments.as_execution_device_inputs(), Vec::new(), 0, None, Some(file!()), None, None, &[])
             .unwrap()
@@ -3226,21 +3229,21 @@ mod tests {
 
         let mesh = LogicalMesh::new(vec![MeshAxis::new("x", 4, MeshAxisType::Manual).unwrap()]).unwrap();
         let sharding = Sharding::new(mesh.clone(), vec![ShardingDimension::sharded(["x"])]).unwrap();
-        let global_input_type = ArrayType::new(DataType::F32, Shape::new(vec![Dimension::Static(8)]));
+        let global_input_type = ArrayType::new(DataType::F32, Shape::new(vec![CoreDimension::Static(8)]));
 
         // The sum `parallel_reduce` sits inside a `condition` branch inside the shard_map body, so it lowers through
         // the nested control-flow path: the threaded collective lowering state resolves the manual mesh axis inside the
         // `stablehlo.if` region and emits the same `all_reduce` as a body-level sum `parallel_reduce` would.
-        let traced: TracedXlaProgram<ArrayType, ArrayType> = trace(
+        let traced: TracedProgram<ArrayType, ArrayType> = trace(
             {
                 let mesh = mesh.clone();
                 let sharding = sharding.clone();
-                move |x: XlaArrayTracer| {
+                move |x: ArrayTracer| {
                     shard_map(
-                        |local_x: XlaArrayTracer| {
+                        |local_x: ArrayTracer| {
                             let local_type = local_x.r#type().into_owned();
                             let parallel_sum_branch = {
-                                let mut builder = XlaProgramBuilder::new();
+                                let mut builder = ProgramBuilder::new();
                                 let input = builder.add_input(ArrayIrType::Array(local_type.clone()));
                                 let output = builder
                                     .add_instruction(
@@ -3253,14 +3256,14 @@ mod tests {
                                 builder.build(vec![output], vec![Placeholder], vec![Placeholder]).unwrap()
                             };
                             let identity_branch = {
-                                let mut builder = XlaProgramBuilder::new();
+                                let mut builder = ProgramBuilder::new();
                                 let input = builder.add_input(ArrayIrType::Array(local_type));
                                 builder.build(vec![input], vec![Placeholder], vec![Placeholder]).unwrap()
                             };
                             let context = local_x.value().context().clone();
-                            let predicate = context.lift(XlaConstant::Boolean(true))?;
+                            let predicate = context.lift(Constant::Boolean(true))?;
                             let mut outputs = context.stage_operation(
-                                XlaOperation::Condition(ConditionOperation::new()),
+                                Operation::Condition(ConditionOperation::new()),
                                 vec![parallel_sum_branch, identity_branch],
                                 &[predicate, local_x.into_value()],
                             )?;
@@ -3315,10 +3318,10 @@ mod tests {
         // reductions, so only a hand-staged ordinary reduction can reach the lowering, which has no combiner for it.
         let mesh = LogicalMesh::new(vec![MeshAxis::new("x", 4, MeshAxisType::Manual).unwrap()]).unwrap();
         let sharding = Sharding::new(mesh.clone(), vec![ShardingDimension::sharded(["x"])]).unwrap();
-        let traced: TracedXlaProgram<ArrayType, ArrayType> = trace(
-            move |x: XlaArrayTracer| {
+        let traced: TracedProgram<ArrayType, ArrayType> = trace(
+            move |x: ArrayTracer| {
                 shard_map(
-                    |local_x: XlaArrayTracer| {
+                    |local_x: ArrayTracer| {
                         let context = local_x.value().context().clone();
                         let mut outputs = context.stage_operation(
                             ParallelReduceOperation::new(ReductionKind::LogSumExp, "x".to_string()),
@@ -3351,17 +3354,17 @@ mod tests {
 
         let mesh = LogicalMesh::new(vec![MeshAxis::new("x", 4, MeshAxisType::Manual).unwrap()]).unwrap();
         let sharding = Sharding::new(mesh.clone(), vec![ShardingDimension::sharded(["x"])]).unwrap();
-        let global_input_type = ArrayType::new(DataType::F32, Shape::new(vec![Dimension::Static(8)]));
+        let global_input_type = ArrayType::new(DataType::F32, Shape::new(vec![CoreDimension::Static(8)]));
 
         // Two manual regions in one module each emit a channeled `all_reduce`: the module-scoped channel allocator
         // hands out distinct handles (1 and 2), which XLA requires across a module.
-        let traced: TracedXlaProgram<ArrayType, ArrayType> = trace(
+        let traced: TracedProgram<ArrayType, ArrayType> = trace(
             {
                 let mesh = mesh.clone();
                 let sharding = sharding.clone();
-                move |x: XlaArrayTracer| {
+                move |x: ArrayTracer| {
                     let first = shard_map(
-                        |local_x: XlaArrayTracer| local_x.parallel_reduce(ReductionKind::Sum, "x"),
+                        |local_x: ArrayTracer| local_x.parallel_reduce(ReductionKind::Sum, "x"),
                         x,
                         mesh.clone(),
                         sharding.clone(),
@@ -3370,7 +3373,7 @@ mod tests {
                     )
                     .expect("first shard_map should trace");
                     shard_map(
-                        |local_x: XlaArrayTracer| local_x.parallel_reduce(ReductionKind::Sum, "x"),
+                        |local_x: ArrayTracer| local_x.parallel_reduce(ReductionKind::Sum, "x"),
                         first,
                         mesh.clone(),
                         sharding.clone(),
@@ -3421,7 +3424,7 @@ mod tests {
         let client = plugin
             .client(ClientOptions::CPU(CpuClientOptions { device_count: Some(4), ..Default::default() }))
             .expect("failed to create 4-device CPU client");
-        let domain = XlaSession::new(&client).domain();
+        let domain = Session::new(&client).domain();
         let client_devices = client.addressable_devices().unwrap();
         assert_eq!(client_devices.len(), 4);
 
@@ -3433,17 +3436,17 @@ mod tests {
         .unwrap();
         let sharding =
             Sharding::new(device_mesh.logical_mesh().clone(), vec![ShardingDimension::sharded(["x"])]).unwrap();
-        let global_input_type = ArrayType::new(DataType::U64, Shape::new(vec![Dimension::Static(4)]));
+        let global_input_type = ArrayType::new(DataType::U64, Shape::new(vec![CoreDimension::Static(4)]));
 
         // `axis_index("x")` gives each device its own coordinate along the manual mesh axis `"x"`, added to the local
         // shard. The single-axis mesh has unit stride and full-size axis, so the coordinate is just `partition_id`.
-        let traced: TracedXlaProgram<ArrayType, ArrayType> = trace(
+        let traced: TracedProgram<ArrayType, ArrayType> = trace(
             {
                 let mesh = device_mesh.logical_mesh().clone();
                 let sharding = sharding.clone();
-                move |x: XlaArrayTracer| {
+                move |x: ArrayTracer| {
                     shard_map(
-                        |local_x: XlaArrayTracer| {
+                        |local_x: ArrayTracer| {
                             // `axis_index` is a scalar per device; broadcast it to the shard shape so the add has
                             // shape-congruent operands (StableHLO has no implicit broadcasting).
                             let local_type = local_x.r#type().into_owned();
@@ -3506,7 +3509,7 @@ mod tests {
                     .unwrap()
             })
             .collect::<Vec<_>>();
-        let input_array = XlaArray::from_addressable_buffers(
+        let input_array = Array::from_addressable_buffers(
             &domain,
             static_sharded_array_type(DataType::U64, &[4], sharding),
             device_mesh,
@@ -3519,7 +3522,7 @@ mod tests {
         let execution_devices = executable.addressable_devices().unwrap();
         let execution_device_ids = execution_devices.iter().map(|device| device.id().unwrap()).collect::<Vec<_>>();
         let execute_arguments =
-            XlaArray::into_execute_arguments(vec![input_array], execution_device_ids.as_slice()).unwrap();
+            Array::into_execute_arguments(vec![input_array], execution_device_ids.as_slice()).unwrap();
         let outputs = executable
             .execute(
                 execute_arguments.as_execution_device_inputs(),
@@ -3557,7 +3560,7 @@ mod tests {
         let client = plugin
             .client(ClientOptions::CPU(CpuClientOptions { device_count: Some(4), ..Default::default() }))
             .unwrap();
-        let domain = XlaSession::new(&client).domain();
+        let domain = Session::new(&client).domain();
         let client_devices = client.addressable_devices().unwrap();
         assert_eq!(client_devices.len(), 4);
         let mesh = LogicalMesh::new(vec![MeshAxis::new("x", 4, MeshAxisType::Manual).unwrap()]).unwrap();
@@ -3568,14 +3571,14 @@ mod tests {
         .unwrap();
         let replicated = Sharding::replicated(mesh.clone(), 0);
         let sharded = Sharding::new(mesh.clone(), vec![ShardingDimension::sharded(["x"])]).unwrap();
-        let traced: TracedXlaProgram<ArrayType, ArrayType> = trace(
+        let traced: TracedProgram<ArrayType, ArrayType> = trace(
             {
                 let sharded = sharded.clone();
-                move |x: XlaArrayTracer| {
+                move |x: ArrayTracer| {
                     x.value()
                         .context()
                         .shard_map(
-                            |context: &ShardMapContext<DomainTracingContext<XlaDomain<'static>>>, ()| {
+                            |context: &ShardMapContext<DomainTracingContext<Domain<'static>>>, ()| {
                                 context.axis_index("x")?.reshape([1])
                             },
                             (),
@@ -3618,7 +3621,7 @@ mod tests {
             .iter()
             .map(|device| client.buffer(&0f32.to_ne_bytes(), BufferType::F32, [], None, device.clone(), None).unwrap())
             .collect();
-        let input = XlaArray::from_addressable_buffers(
+        let input = Array::from_addressable_buffers(
             &domain,
             static_sharded_array_type(DataType::F32, &[], replicated),
             device_mesh,
@@ -3631,7 +3634,7 @@ mod tests {
             .iter()
             .map(|device| device.id().unwrap())
             .collect::<Vec<_>>();
-        let arguments = XlaArray::into_execute_arguments(vec![input], &device_ids).unwrap();
+        let arguments = Array::into_execute_arguments(vec![input], &device_ids).unwrap();
         let outputs = executable
             .execute(arguments.as_execution_device_inputs(), Vec::new(), 0, None, Some(file!()), None, None, &[])
             .unwrap()
@@ -3662,15 +3665,15 @@ mod tests {
         ])
         .unwrap();
         let sharding = Sharding::new(mesh.clone(), vec![ShardingDimension::sharded(["x", "y"])]).unwrap();
-        let global_input_type = ArrayType::new(DataType::U64, Shape::new(vec![Dimension::Static(4)]));
+        let global_input_type = ArrayType::new(DataType::U64, Shape::new(vec![CoreDimension::Static(4)]));
 
-        let traced: TracedXlaProgram<ArrayType, ArrayType> = trace(
+        let traced: TracedProgram<ArrayType, ArrayType> = trace(
             {
                 let mesh = mesh.clone();
                 let sharding = sharding.clone();
-                move |x: XlaArrayTracer| {
+                move |x: ArrayTracer| {
                     shard_map(
-                        |local_x: XlaArrayTracer| {
+                        |local_x: ArrayTracer| {
                             let local_type = local_x.r#type().into_owned();
                             let index = local_x.domain().axis_index("x")?;
                             let index_sharding = index
@@ -3725,7 +3728,7 @@ mod tests {
         let client = plugin
             .client(ClientOptions::CPU(CpuClientOptions { device_count: Some(2), ..Default::default() }))
             .expect("failed to create 2-device CPU client");
-        let domain = XlaSession::new(&client).domain();
+        let domain = Session::new(&client).domain();
         let client_devices = client.addressable_devices().unwrap();
         assert_eq!(client_devices.len(), 2);
 
@@ -3737,20 +3740,20 @@ mod tests {
         .unwrap();
         let sharding =
             Sharding::new(device_mesh.logical_mesh().clone(), vec![ShardingDimension::sharded(["x"])]).unwrap();
-        let global_input_type = ArrayType::new(DataType::F32, Shape::new(vec![Dimension::Static(4)]));
+        let global_input_type = ArrayType::new(DataType::F32, Shape::new(vec![CoreDimension::Static(4)]));
 
         // `parallel_all_gather` over the manual mesh axis `"x"` extends the local shard from `f32[2]` to the full
         // `f32[4]` concatenation on every device. Its output still varies along the manual axis for VMA purposes (a
         // replicated output sharding is rejected with `OutputVaryingAlongUntiledManualAxis`, mirroring JAX's vma
         // tracking), so the output stays sharded over `"x"`, giving the global `f32[8]` concatenation of the per-device
         // gathers. The staged collective lowers to a channeled `stablehlo.all_gather` over the two devices along `"x"`.
-        let traced: TracedXlaProgram<ArrayType, ArrayType> = trace(
+        let traced: TracedProgram<ArrayType, ArrayType> = trace(
             {
                 let mesh = device_mesh.logical_mesh().clone();
                 let sharding = sharding.clone();
-                move |x: XlaArrayTracer| {
+                move |x: ArrayTracer| {
                     shard_map(
-                        |local_x: XlaArrayTracer| {
+                        |local_x: ArrayTracer| {
                             local_x.parallel_all_gather_with_options(
                                 "x",
                                 0,
@@ -3808,7 +3811,7 @@ mod tests {
                     .unwrap()
             })
             .collect::<Vec<_>>();
-        let input_array = XlaArray::from_addressable_buffers(
+        let input_array = Array::from_addressable_buffers(
             &domain,
             static_sharded_array_type(DataType::F32, &[4], sharding),
             device_mesh,
@@ -3822,7 +3825,7 @@ mod tests {
         assert_eq!(execution_devices.len(), 2);
         let execution_device_ids = execution_devices.iter().map(|device| device.id().unwrap()).collect::<Vec<_>>();
         let execute_arguments =
-            XlaArray::into_execute_arguments(vec![input_array], execution_device_ids.as_slice()).unwrap();
+            Array::into_execute_arguments(vec![input_array], execution_device_ids.as_slice()).unwrap();
         let outputs = executable
             .execute(
                 execute_arguments.as_execution_device_inputs(),
@@ -3854,7 +3857,7 @@ mod tests {
         let client = plugin
             .client(ClientOptions::CPU(CpuClientOptions { device_count: Some(2), ..Default::default() }))
             .expect("failed to create 2-device CPU client");
-        let domain = XlaSession::new(&client).domain();
+        let domain = Session::new(&client).domain();
         let client_devices = client.addressable_devices().unwrap();
         let devices = client_devices.iter().map(|device| Device::from_pjrt(device).unwrap()).collect::<Vec<_>>();
         let device_mesh = DeviceMesh::new(
@@ -3867,13 +3870,13 @@ mod tests {
         let output_sharding =
             Sharding::new(mesh.clone(), vec![ShardingDimension::replicated(), ShardingDimension::sharded(["x"])])
                 .unwrap();
-        let traced: TracedXlaProgram<ArrayType, ArrayType> = trace(
+        let traced: TracedProgram<ArrayType, ArrayType> = trace(
             {
                 let input_sharding = input_sharding.clone();
                 let output_sharding = output_sharding.clone();
-                move |x: XlaArrayTracer| {
+                move |x: ArrayTracer| {
                     shard_map(
-                        |local_x: XlaArrayTracer| {
+                        |local_x: ArrayTracer| {
                             local_x.parallel_all_gather_with_options(
                                 "x",
                                 0,
@@ -3890,7 +3893,7 @@ mod tests {
                     .unwrap()
                 }
             },
-            ArrayType::new(DataType::F32, Shape::new(vec![Dimension::Static(4)])),
+            ArrayType::new(DataType::F32, Shape::new(vec![CoreDimension::Static(4)])),
         )
         .unwrap();
 
@@ -3919,7 +3922,7 @@ mod tests {
                     .unwrap()
             })
             .collect::<Vec<_>>();
-        let input_array = XlaArray::from_addressable_buffers(
+        let input_array = Array::from_addressable_buffers(
             &domain,
             static_sharded_array_type(DataType::F32, &[4], input_sharding),
             device_mesh,
@@ -3936,7 +3939,7 @@ mod tests {
             .map(|device| device.id().unwrap())
             .collect::<Vec<_>>();
         let execute_arguments =
-            XlaArray::into_execute_arguments(vec![input_array], execution_device_ids.as_slice()).unwrap();
+            Array::into_execute_arguments(vec![input_array], execution_device_ids.as_slice()).unwrap();
         let outputs = executable
             .execute(
                 execute_arguments.as_execution_device_inputs(),
@@ -3965,12 +3968,12 @@ mod tests {
         ])
         .unwrap();
         let sharding = Sharding::new(mesh.clone(), vec![ShardingDimension::sharded(["x"])]).unwrap();
-        let traced: TracedXlaProgram<ArrayType, ArrayType> = trace(
+        let traced: TracedProgram<ArrayType, ArrayType> = trace(
             {
                 let sharding = sharding.clone();
-                move |x: XlaArrayTracer| {
+                move |x: ArrayTracer| {
                     shard_map(
-                        |local_x: XlaArrayTracer| {
+                        |local_x: ArrayTracer| {
                             local_x.parallel_all_gather_with_options(
                                 "x",
                                 0,
@@ -3987,7 +3990,7 @@ mod tests {
                     .unwrap()
                 }
             },
-            ArrayType::new(DataType::F32, Shape::new(vec![Dimension::Static(8)])),
+            ArrayType::new(DataType::F32, Shape::new(vec![CoreDimension::Static(8)])),
         )
         .unwrap();
 
@@ -4007,7 +4010,7 @@ mod tests {
         let client = plugin
             .client(ClientOptions::CPU(CpuClientOptions { device_count: Some(4), ..Default::default() }))
             .expect("failed to create 4-device CPU client");
-        let domain = XlaSession::new(&client).domain();
+        let domain = Session::new(&client).domain();
         let client_devices = client.addressable_devices().unwrap();
         let devices = client_devices.iter().map(|device| Device::from_pjrt(device).unwrap()).collect::<Vec<_>>();
         let device_mesh = DeviceMesh::new(
@@ -4017,12 +4020,12 @@ mod tests {
         .unwrap();
         let mesh = device_mesh.logical_mesh().clone();
         let sharding = Sharding::new(mesh.clone(), vec![ShardingDimension::sharded(["x"])]).unwrap();
-        let traced: TracedXlaProgram<ArrayType, (ArrayType, ArrayType, ArrayType)> = trace(
+        let traced: TracedProgram<ArrayType, (ArrayType, ArrayType, ArrayType)> = trace(
             {
                 let sharding = sharding.clone();
-                move |x: XlaArrayTracer| {
+                move |x: ArrayTracer| {
                     shard_map(
-                        |local_x: XlaArrayTracer| {
+                        |local_x: ArrayTracer| {
                             let options =
                                 CollectiveOptions::tiled().with_axis_index_groups(vec![vec![0, 2], vec![3, 1]]);
                             Ok((
@@ -4045,7 +4048,7 @@ mod tests {
                     .unwrap()
                 }
             },
-            ArrayType::new(DataType::F32, Shape::new(vec![Dimension::Static(16)])),
+            ArrayType::new(DataType::F32, Shape::new(vec![CoreDimension::Static(16)])),
         )
         .unwrap();
 
@@ -4069,7 +4072,7 @@ mod tests {
                     .unwrap()
             })
             .collect::<Vec<_>>();
-        let input_array = XlaArray::from_addressable_buffers(
+        let input_array = Array::from_addressable_buffers(
             &domain,
             static_sharded_array_type(DataType::F32, &[16], sharding),
             device_mesh,
@@ -4086,7 +4089,7 @@ mod tests {
             .map(|device| device.id().unwrap())
             .collect::<Vec<_>>();
         let execute_arguments =
-            XlaArray::into_execute_arguments(vec![input_array], execution_device_ids.as_slice()).unwrap();
+            Array::into_execute_arguments(vec![input_array], execution_device_ids.as_slice()).unwrap();
         let outputs = executable
             .execute(
                 execute_arguments.as_execution_device_inputs(),
@@ -4144,7 +4147,7 @@ mod tests {
         let client = plugin
             .client(ClientOptions::CPU(CpuClientOptions { device_count: Some(2), ..Default::default() }))
             .expect("failed to create 2-device CPU client");
-        let domain = XlaSession::new(&client).domain();
+        let domain = Session::new(&client).domain();
         let client_devices = client.addressable_devices().unwrap();
         assert_eq!(client_devices.len(), 2);
 
@@ -4156,18 +4159,18 @@ mod tests {
         .unwrap();
         let sharding =
             Sharding::new(device_mesh.logical_mesh().clone(), vec![ShardingDimension::sharded(["x"])]).unwrap();
-        let global_input_type = ArrayType::new(DataType::F32, Shape::new(vec![Dimension::Static(8)]));
+        let global_input_type = ArrayType::new(DataType::F32, Shape::new(vec![CoreDimension::Static(8)]));
 
         // `parallel_sum_scatter` over the manual mesh axis `"x"` sums the two local `f32[4]` shards elementwise and
         // scatters the sum, leaving each device with its own `f32[2]` chunk, so the sharded global output is `f32[4]`.
         // The staged collective lowers to a channeled `stablehlo.reduce_scatter` with a sum reduction.
-        let traced: TracedXlaProgram<ArrayType, ArrayType> = trace(
+        let traced: TracedProgram<ArrayType, ArrayType> = trace(
             {
                 let mesh = device_mesh.logical_mesh().clone();
                 let sharding = sharding.clone();
-                move |x: XlaArrayTracer| {
+                move |x: ArrayTracer| {
                     shard_map(
-                        |local_x: XlaArrayTracer| {
+                        |local_x: ArrayTracer| {
                             local_x.parallel_sum_scatter_with_options("x", 0, CollectiveOptions::tiled())
                         },
                         x,
@@ -4225,7 +4228,7 @@ mod tests {
                     .unwrap()
             })
             .collect::<Vec<_>>();
-        let input_array = XlaArray::from_addressable_buffers(
+        let input_array = Array::from_addressable_buffers(
             &domain,
             static_sharded_array_type(DataType::F32, &[8], sharding),
             device_mesh,
@@ -4239,7 +4242,7 @@ mod tests {
         assert_eq!(execution_devices.len(), 2);
         let execution_device_ids = execution_devices.iter().map(|device| device.id().unwrap()).collect::<Vec<_>>();
         let execute_arguments =
-            XlaArray::into_execute_arguments(vec![input_array], execution_device_ids.as_slice()).unwrap();
+            Array::into_execute_arguments(vec![input_array], execution_device_ids.as_slice()).unwrap();
         let outputs = executable
             .execute(
                 execute_arguments.as_execution_device_inputs(),
@@ -4275,7 +4278,7 @@ mod tests {
         let client = plugin
             .client(ClientOptions::CPU(CpuClientOptions { device_count: Some(2), ..Default::default() }))
             .expect("failed to create 2-device CPU client");
-        let domain = XlaSession::new(&client).domain();
+        let domain = Session::new(&client).domain();
         let client_devices = client.addressable_devices().unwrap();
         let devices = client_devices.iter().map(|device| Device::from_pjrt(device).unwrap()).collect::<Vec<_>>();
         let device_mesh = DeviceMesh::new(
@@ -4288,13 +4291,13 @@ mod tests {
             Sharding::new(mesh.clone(), vec![ShardingDimension::sharded(["x"]), ShardingDimension::replicated()])
                 .unwrap();
         let output_sharding = Sharding::new(mesh.clone(), vec![ShardingDimension::sharded(["x"])]).unwrap();
-        let traced: TracedXlaProgram<ArrayType, ArrayType> = trace(
+        let traced: TracedProgram<ArrayType, ArrayType> = trace(
             {
                 let input_sharding = input_sharding.clone();
                 let output_sharding = output_sharding.clone();
-                move |x: XlaArrayTracer| {
+                move |x: ArrayTracer| {
                     shard_map(
-                        |local_x: XlaArrayTracer| {
+                        |local_x: ArrayTracer| {
                             local_x.parallel_sum_scatter_with_options(
                                 "x",
                                 1,
@@ -4356,7 +4359,7 @@ mod tests {
                     .unwrap()
             })
             .collect::<Vec<_>>();
-        let input_array = XlaArray::from_addressable_buffers(
+        let input_array = Array::from_addressable_buffers(
             &domain,
             static_sharded_array_type(DataType::F32, &[6, 2], input_sharding),
             device_mesh,
@@ -4373,7 +4376,7 @@ mod tests {
             .map(|device| device.id().unwrap())
             .collect::<Vec<_>>();
         let execute_arguments =
-            XlaArray::into_execute_arguments(vec![input_array], execution_device_ids.as_slice()).unwrap();
+            Array::into_execute_arguments(vec![input_array], execution_device_ids.as_slice()).unwrap();
         let outputs = executable
             .execute(
                 execute_arguments.as_execution_device_inputs(),
@@ -4405,7 +4408,7 @@ mod tests {
         let client = plugin
             .client(ClientOptions::CPU(CpuClientOptions { device_count: Some(2), ..Default::default() }))
             .expect("failed to create 2-device CPU client");
-        let domain = XlaSession::new(&client).domain();
+        let domain = Session::new(&client).domain();
         let client_devices = client.addressable_devices().unwrap();
         assert_eq!(client_devices.len(), 2);
 
@@ -4417,18 +4420,18 @@ mod tests {
         .unwrap();
         let sharding =
             Sharding::new(device_mesh.logical_mesh().clone(), vec![ShardingDimension::sharded(["x"])]).unwrap();
-        let global_input_type = ArrayType::new(DataType::F32, Shape::new(vec![Dimension::Static(4)]));
+        let global_input_type = ArrayType::new(DataType::F32, Shape::new(vec![CoreDimension::Static(4)]));
 
         // `parallel_permute` over the manual mesh axis `"x"` with the rotation pairs [(0, 1), (1, 0)] swaps the two
         // local shards without changing their shapes. The staged collective lowers to a channeled
         // `stablehlo.collective_permute` with the axis-local pairs expanded to global device pairs.
-        let traced: TracedXlaProgram<ArrayType, ArrayType> = trace(
+        let traced: TracedProgram<ArrayType, ArrayType> = trace(
             {
                 let mesh = device_mesh.logical_mesh().clone();
                 let sharding = sharding.clone();
-                move |x: XlaArrayTracer| {
+                move |x: ArrayTracer| {
                     shard_map(
-                        |local_x: XlaArrayTracer| local_x.parallel_permute("x", vec![(0, 1), (1, 0)]),
+                        |local_x: ArrayTracer| local_x.parallel_permute("x", vec![(0, 1), (1, 0)]),
                         x,
                         mesh.clone(),
                         sharding.clone(),
@@ -4476,7 +4479,7 @@ mod tests {
                     .unwrap()
             })
             .collect::<Vec<_>>();
-        let input_array = XlaArray::from_addressable_buffers(
+        let input_array = Array::from_addressable_buffers(
             &domain,
             static_sharded_array_type(DataType::F32, &[4], sharding.clone()),
             device_mesh.clone(),
@@ -4490,7 +4493,7 @@ mod tests {
         assert_eq!(execution_devices.len(), 2);
         let execution_device_ids = execution_devices.iter().map(|device| device.id().unwrap()).collect::<Vec<_>>();
         let execute_arguments =
-            XlaArray::into_execute_arguments(vec![input_array], execution_device_ids.as_slice()).unwrap();
+            Array::into_execute_arguments(vec![input_array], execution_device_ids.as_slice()).unwrap();
         let outputs = executable
             .execute(
                 execute_arguments.as_execution_device_inputs(),
@@ -4522,10 +4525,10 @@ mod tests {
         {
             let mesh = device_mesh.logical_mesh().clone();
             let sharding = sharding.clone();
-            let traced: TracedXlaProgram<ArrayType, ArrayType> = trace(
-                move |input: XlaArrayTracer| {
+            let traced: TracedProgram<ArrayType, ArrayType> = trace(
+                move |input: ArrayTracer| {
                     shard_map(
-                        |local_input: XlaArrayTracer| local_input.parallel_permute("x", pairs.clone()),
+                        |local_input: ArrayTracer| local_input.parallel_permute("x", pairs.clone()),
                         input,
                         mesh.clone(),
                         sharding.clone(),
@@ -4583,10 +4586,10 @@ mod tests {
         for (axis_size, pairs) in [(1, vec![(0, 0)]), (3, vec![(2, 0)])] {
             let mesh = mesh.clone();
             let sharding = sharding.clone();
-            let traced: TracedXlaProgram<ArrayType, ArrayType> = trace(
-                move |input: XlaArrayTracer| {
+            let traced: TracedProgram<ArrayType, ArrayType> = trace(
+                move |input: ArrayTracer| {
                     shard_map(
-                        |local_input: XlaArrayTracer| {
+                        |local_input: ArrayTracer| {
                             Ok(local_input
                                 .domain()
                                 .bind(
@@ -4626,7 +4629,7 @@ mod tests {
         let client = plugin
             .client(ClientOptions::CPU(CpuClientOptions { device_count: Some(2), ..Default::default() }))
             .expect("failed to create 2-device CPU client");
-        let domain = XlaSession::new(&client).domain();
+        let domain = Session::new(&client).domain();
         let client_devices = client.addressable_devices().unwrap();
         assert_eq!(client_devices.len(), 2);
 
@@ -4638,18 +4641,18 @@ mod tests {
         .unwrap();
         let sharding =
             Sharding::new(device_mesh.logical_mesh().clone(), vec![ShardingDimension::sharded(["x"])]).unwrap();
-        let global_input_type = ArrayType::new(DataType::F32, Shape::new(vec![Dimension::Static(8)]));
+        let global_input_type = ArrayType::new(DataType::F32, Shape::new(vec![CoreDimension::Static(8)]));
 
         // `parallel_all_to_all` over the manual mesh axis `"x"` with split and concat both at axis 0 keeps the local
         // `f32[4]` shape: each device splits its shard into two chunks, keeps its own chunk, and receives the peer's
         // matching chunk. The staged collective lowers to a channeled `stablehlo.all_to_all`.
-        let traced: TracedXlaProgram<ArrayType, ArrayType> = trace(
+        let traced: TracedProgram<ArrayType, ArrayType> = trace(
             {
                 let mesh = device_mesh.logical_mesh().clone();
                 let sharding = sharding.clone();
-                move |x: XlaArrayTracer| {
+                move |x: ArrayTracer| {
                     shard_map(
-                        |local_x: XlaArrayTracer| {
+                        |local_x: ArrayTracer| {
                             local_x.parallel_all_to_all_with_options("x", 0, 0, CollectiveOptions::tiled())
                         },
                         x,
@@ -4700,7 +4703,7 @@ mod tests {
                     .unwrap()
             })
             .collect::<Vec<_>>();
-        let input_array = XlaArray::from_addressable_buffers(
+        let input_array = Array::from_addressable_buffers(
             &domain,
             static_sharded_array_type(DataType::F32, &[8], sharding),
             device_mesh,
@@ -4714,7 +4717,7 @@ mod tests {
         assert_eq!(execution_devices.len(), 2);
         let execution_device_ids = execution_devices.iter().map(|device| device.id().unwrap()).collect::<Vec<_>>();
         let execute_arguments =
-            XlaArray::into_execute_arguments(vec![input_array], execution_device_ids.as_slice()).unwrap();
+            Array::into_execute_arguments(vec![input_array], execution_device_ids.as_slice()).unwrap();
         let outputs = executable
             .execute(
                 execute_arguments.as_execution_device_inputs(),
@@ -4750,7 +4753,7 @@ mod tests {
         let client = plugin
             .client(ClientOptions::CPU(CpuClientOptions { device_count: Some(2), ..Default::default() }))
             .expect("failed to create 2-device CPU client");
-        let domain = XlaSession::new(&client).domain();
+        let domain = Session::new(&client).domain();
         let client_devices = client.addressable_devices().unwrap();
         let devices = client_devices.iter().map(|device| Device::from_pjrt(device).unwrap()).collect::<Vec<_>>();
         let device_mesh = DeviceMesh::new(
@@ -4765,13 +4768,13 @@ mod tests {
         let output_sharding =
             Sharding::new(mesh.clone(), vec![ShardingDimension::sharded(["x"]), ShardingDimension::replicated()])
                 .unwrap();
-        let traced: TracedXlaProgram<ArrayType, (ArrayType, ArrayType)> = trace(
+        let traced: TracedProgram<ArrayType, (ArrayType, ArrayType)> = trace(
             {
                 let input_sharding = input_sharding.clone();
                 let output_sharding = output_sharding.clone();
-                move |x: XlaArrayTracer| {
+                move |x: ArrayTracer| {
                     shard_map(
-                        |local_x: XlaArrayTracer| {
+                        |local_x: ArrayTracer| {
                             // Removing split axis 0 puts the gathered participant axis at output axis 1.
                             // The inverse exchanges axis 1 back into output axis 0.
                             let exchanged = local_x.parallel_all_to_all("x", 0, 1)?;
@@ -4787,7 +4790,7 @@ mod tests {
                     .unwrap()
                 }
             },
-            ArrayType::new(DataType::F32, Shape::new(vec![Dimension::Static(2), Dimension::Static(6)])),
+            ArrayType::new(DataType::F32, Shape::new(vec![CoreDimension::Static(2), CoreDimension::Static(6)])),
         )
         .unwrap();
 
@@ -4831,7 +4834,7 @@ mod tests {
                     .unwrap()
             })
             .collect::<Vec<_>>();
-        let input_array = XlaArray::from_addressable_buffers(
+        let input_array = Array::from_addressable_buffers(
             &domain,
             static_sharded_array_type(DataType::F32, &[2, 6], input_sharding),
             device_mesh,
@@ -4848,7 +4851,7 @@ mod tests {
             .map(|device| device.id().unwrap())
             .collect::<Vec<_>>();
         let execute_arguments =
-            XlaArray::into_execute_arguments(vec![input_array], execution_device_ids.as_slice()).unwrap();
+            Array::into_execute_arguments(vec![input_array], execution_device_ids.as_slice()).unwrap();
         let outputs = executable
             .execute(
                 execute_arguments.as_execution_device_inputs(),

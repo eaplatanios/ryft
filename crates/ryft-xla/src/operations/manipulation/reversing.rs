@@ -2,12 +2,12 @@ use ryft_core::{ArrayType, ProgramError, ReverseOperation, TypeError};
 use ryft_mlir::dialects::stable_hlo;
 use ryft_mlir::{Block, Operation as MlirOperation, Value as MlirValue, ValueRef};
 
-use crate::{Error, LowerableOperation, LowerableOperationFamily, XlaLowerer};
+use crate::{Error, LowerableOperation, LowerableOperationFamily, Lowerer};
 
 impl LowerableOperation for ReverseOperation {
     fn lower<'b, 'c: 'b, 't: 'c, O: LowerableOperationFamily>(
         &self,
-        lowerer: &mut XlaLowerer<'b, 'c, 't, O>,
+        lowerer: &mut Lowerer<'b, 'c, 't, O>,
         input_values: &[ValueRef<'b, 'c, 't>],
         _input_types: &[ArrayType],
         output_types: &[ArrayType],
@@ -31,21 +31,21 @@ mod tests {
     use ryft_core::{DataType, Placeholder, Shape};
 
     use crate::experimental::lowering::tests::{
-        MixedValue, XlaProgramBuilder, dynamic_dimension, execute_mixed_program, unproject_plain_program,
+        MixedValue, ProgramBuilder, dynamic_dimension, execute_mixed_program, unproject_plain_program,
     };
     use crate::experimental::lowering::to_mlir_module_for_plain_program;
-    use crate::experimental::ops::XlaArrayConstant;
+    use crate::experimental::ops::ArrayConstant;
     use crate::tests::execution_client;
 
     use super::*;
 
     #[test]
     fn test_lower_reverse() {
-        let mut builder = XlaProgramBuilder::new();
+        let mut builder = ProgramBuilder::new();
         let input = builder.add_input(ArrayType::new_static(DataType::F64, [3]));
         let output = builder.add_instruction(ReverseOperation::new([-1]), Vec::new(), vec![input], None).unwrap()[0];
         let program = builder
-            .build::<Vec<XlaArrayConstant>, Vec<XlaArrayConstant>>(vec![output], vec![Placeholder], vec![Placeholder])
+            .build::<Vec<ArrayConstant>, Vec<ArrayConstant>>(vec![output], vec![Placeholder], vec![Placeholder])
             .unwrap();
         assert_eq!(
             to_mlir_module_for_plain_program(&program, "main").unwrap(),
@@ -72,17 +72,13 @@ mod tests {
 
     #[test]
     fn test_lower_reverse_dynamic_extent() {
-        let mut builder = XlaProgramBuilder::new();
+        let mut builder = ProgramBuilder::new();
         let input =
             builder.add_input(ArrayType::new(DataType::F64, Shape::new(vec![dynamic_dimension("length", Some(5))])));
         let output = builder.add_instruction(ReverseOperation::new([0]), Vec::new(), vec![input], None).unwrap()[0];
         let program = unproject_plain_program(
             builder
-                .build::<Vec<XlaArrayConstant>, Vec<XlaArrayConstant>>(
-                    vec![output],
-                    vec![Placeholder],
-                    vec![Placeholder],
-                )
+                .build::<Vec<ArrayConstant>, Vec<ArrayConstant>>(vec![output], vec![Placeholder], vec![Placeholder])
                 .unwrap(),
         );
         let client = execution_client();

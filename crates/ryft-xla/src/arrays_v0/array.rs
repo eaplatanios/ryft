@@ -1,4 +1,4 @@
-use ryft_core::{ArrayType, DeviceMesh, Dimension, Shape, Sharding, Typed, check_sharding};
+use ryft_core::{ArrayType, DeviceMesh, Dimension as CoreDimension, Shape, Sharding, Typed, check_sharding};
 use ryft_pjrt::DeviceId;
 
 use crate::arrays_v0::compiled_reshard;
@@ -6,11 +6,11 @@ use crate::arrays_v0::execution::ExecuteArguments;
 use crate::arrays_v0::host::materialize_dense_array_bytes;
 use crate::arrays_v0::placement::DevicePutTarget;
 use crate::arrays_v0::transfers::copy_addressable_destination_shards_from_exact_source_shards;
-use crate::{Error, ToMlir, XlaArray, XlaDomain};
+use crate::{Array, Domain, Error, ToMlir};
 
-impl<'o> XlaArray<'o> {
+impl<'o> Array<'o> {
     /// Moves or copies this array to the provided placement, **without** donating the source
-    /// buffers. The original [`XlaArray`] remains fully usable after the call returns. `ryft`'s
+    /// buffers. The original [`Array`] remains fully usable after the call returns. `ryft`'s
     /// analogue of JAX's `jax.device_put(arr, sharding, donate=False)`.
     ///
     /// `target` is resolved to a concrete [`DeviceMesh`] and [`Sharding`] via
@@ -26,7 +26,7 @@ impl<'o> XlaArray<'o> {
     ///    `cache`, and execute.
     /// 3. **Host fallback** — materialize the global array on host via per-shard `copy_to_host`,
     ///    merge shard bytes into a row-major buffer, and re-upload via
-    ///    [`XlaArray::from_host_buffer`]. Used only when the compiled path declines (Manual mesh
+    ///    [`Array::from_host_buffer`]. Used only when the compiled path declines (Manual mesh
     ///    axes, etc.) and both endpoints are fully addressable from this process. JAX's
     ///    host-roundtrip path has the same restriction.
     ///
@@ -40,9 +40,9 @@ impl<'o> XlaArray<'o> {
     ///
     /// # Parameters
     ///
-    ///   - `engine`: [`XlaDomain`] wrapping the PJRT client and the compile-program cache.
+    ///   - `engine`: [`Domain`] wrapping the PJRT client and the compile-program cache.
     ///   - `target`: Resolved into a destination [`DeviceMesh`] + [`Sharding`].
-    pub fn to_placement(&self, engine: &XlaDomain<'o>, target: DevicePutTarget) -> Result<Self, Error> {
+    pub fn to_placement(&self, engine: &Domain<'o>, target: DevicePutTarget) -> Result<Self, Error> {
         let (target_mesh, target_sharding) = target.resolve(self.sharding().rank())?;
         if self.mesh() == &target_mesh && self.sharding() == &target_sharding {
             return Ok(self.clone());
@@ -65,9 +65,9 @@ impl<'o> XlaArray<'o> {
     ///
     /// # Parameters
     ///
-    ///   - `engine`: [`XlaDomain`] wrapping the PJRT client and the compile-program cache.
+    ///   - `engine`: [`Domain`] wrapping the PJRT client and the compile-program cache.
     ///   - `target`: Resolved into a destination [`DeviceMesh`] + [`Sharding`].
-    pub fn into_placement(self, engine: &XlaDomain<'o>, target: DevicePutTarget) -> Result<Self, Error> {
+    pub fn into_placement(self, engine: &Domain<'o>, target: DevicePutTarget) -> Result<Self, Error> {
         let (target_mesh, target_sharding) = target.resolve(self.sharding().rank())?;
         if self.mesh() == &target_mesh && self.sharding() == &target_sharding {
             return Ok(self);
@@ -81,7 +81,7 @@ impl<'o> XlaArray<'o> {
     /// host roundtrip cannot reuse device buffers anyway).
     fn run_placement_dispatch(
         &self,
-        engine: &XlaDomain<'o>,
+        engine: &Domain<'o>,
         target_mesh: DeviceMesh,
         target_sharding: Sharding,
         donate: bool,
@@ -108,7 +108,7 @@ impl<'o> XlaArray<'o> {
             &target_mesh,
             &target_sharding,
         )? {
-            let shape = Shape::new(global_dimensions.iter().copied().map(Dimension::Static).collect());
+            let shape = Shape::new(global_dimensions.iter().copied().map(CoreDimension::Static).collect());
             let array_type = self.r#type().into_owned().with_shape(shape).with_sharding(target_sharding)?;
             return Ok(Self::from_addressable_buffers(engine, array_type, target_mesh, addressable_buffers)?);
         }
@@ -135,7 +135,7 @@ impl<'o> XlaArray<'o> {
             Ok(bytes) => bytes,
             Err(_) => return Err(compiled_error),
         };
-        let shape = Shape::new(global_dimensions.iter().copied().map(Dimension::Static).collect());
+        let shape = Shape::new(global_dimensions.iter().copied().map(CoreDimension::Static).collect());
         let host_type = ArrayType::new(self.data_type(), shape).with_sharding(target_sharding.clone())?;
         match Self::from_host_buffer(engine, host_type, target_mesh, host_bytes.as_slice()) {
             Ok(array) => Ok(array),
@@ -163,7 +163,7 @@ impl<'o> XlaArray<'o> {
         ExecuteArguments::from_arrays_with_donation(arrays, addressable_device_ids.into(), donation_flags.as_slice())
     }
 
-    /// Same as [`XlaArray::into_execute_arguments`] but with explicit per-input donation requests.
+    /// Same as [`Array::into_execute_arguments`] but with explicit per-input donation requests.
     ///
     /// A requested donation is effective only when the consumed logical array uniquely owns every shard buffer.
     /// Donation is disabled for the whole input when any shard is shared by an ordinary clone or a retained bounded

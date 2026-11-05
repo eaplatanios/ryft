@@ -1,7 +1,7 @@
 use ryft_core::macros::check_count;
 use ryft_core::{
-    ArrayIrType, ArrayType, AxisIndexOperation, DataType, Dimension, MemberOperation, Operation,
-    ParallelRaggedAllToAllOperation, ProgramError, ReductionKind, Shape,
+    ArrayIrType, ArrayType, AxisIndexOperation, DataType, Dimension as CoreDimension, MemberOperation,
+    Operation as CoreOperation, ParallelRaggedAllToAllOperation, ProgramError, ReductionKind, Shape,
 };
 use ryft_mlir::dialects::stable_hlo;
 use ryft_mlir::dialects::stable_hlo::CustomCallApiVersion;
@@ -18,7 +18,7 @@ use crate::experimental::lowering::types::{
 use crate::operations::collectives::axis_index::lower_axis_index_to_coordinate;
 use crate::operations::collectives::collective_replica_groups;
 use crate::operations::reductions::lower_reduce_to_mlir;
-use crate::{Error, LowerableOperation, LowerableOperationFamily, MemberLowerableOperation, XlaLowerer};
+use crate::{Error, LowerableOperation, LowerableOperationFamily, Lowerer, MemberLowerableOperation};
 
 /// Emits one overwrite-mode `parallel_ragged_all_to_all` typed-FFI custom call.
 fn emit_parallel_ragged_all_to_all_custom_call<'b, 'c: 'b, 't: 'c>(
@@ -211,7 +211,7 @@ fn lower_batched_parallel_ragged_all_to_all<'b, 'c: 'b, 't: 'c>(
         let flat_type = input_types[index].clone().with_shape(Shape::new(
             std::iter::once(flat_extent)
                 .chain(dimensions[batch_dimension_count + 1..].iter().copied())
-                .map(Dimension::Static)
+                .map(CoreDimension::Static)
                 .collect(),
         ));
         flat_values.push(reshape(input_values[index], &flat_type, block)?);
@@ -227,9 +227,10 @@ fn lower_batched_parallel_ragged_all_to_all<'b, 'c: 'b, 't: 'c>(
     for index in 2..6 {
         let mut value = input_values[index];
         if batch_dimension_count != 1 {
-            let item_type = input_types[index]
-                .clone()
-                .with_shape(Shape::new(vec![Dimension::Static(item_count), Dimension::Static(metadata_length)]));
+            let item_type = input_types[index].clone().with_shape(Shape::new(vec![
+                CoreDimension::Static(item_count),
+                CoreDimension::Static(metadata_length),
+            ]));
             value = reshape(value, &item_type, block)?;
         }
         if input_types[index].data_type() != DataType::U64 {
@@ -326,7 +327,7 @@ fn lower_unbatched_parallel_ragged_all_to_all<'b, 'c: 'b, 't: 'c>(
         )
     })?;
     let mut expanded_dimensions = input_types[1].shape().dimensions().to_vec();
-    expanded_dimensions[0] = Dimension::Static(expanded_extent);
+    expanded_dimensions[0] = CoreDimension::Static(expanded_extent);
     let expanded_output_type = input_types[1].clone().with_shape(Shape::new(expanded_dimensions));
     let expanded_output = if expanded_output_type.static_shape().is_some() {
         lower_constant_output(std::slice::from_ref(&expanded_output_type), 0, block, context, location)?.remove(0)
@@ -460,8 +461,8 @@ fn lower_unbatched_parallel_ragged_all_to_all<'b, 'c: 'b, 't: 'c>(
         location,
     )?;
     let mut lane_dimensions = input_types[1].shape().dimensions().to_vec();
-    lane_dimensions[0] = Dimension::Static(output_extent);
-    lane_dimensions.insert(0, Dimension::Static(metadata_length));
+    lane_dimensions[0] = CoreDimension::Static(output_extent);
+    lane_dimensions.insert(0, CoreDimension::Static(metadata_length));
     let lane_type =
         lower_tensor_type(&input_types[1].clone().with_shape(Shape::new(lane_dimensions)), context, location)?;
     let lanes = block.append_operation(stable_hlo::reshape_with_output_type(expanded, lane_type, location)?)?;
@@ -475,7 +476,7 @@ fn lower_unbatched_parallel_ragged_all_to_all<'b, 'c: 'b, 't: 'c>(
 impl LowerableOperation for ParallelRaggedAllToAllOperation {
     fn lower<'b, 'c: 'b, 't: 'c, O: LowerableOperationFamily>(
         &self,
-        lowerer: &mut XlaLowerer<'b, 'c, 't, O>,
+        lowerer: &mut Lowerer<'b, 'c, 't, O>,
         input_values: &[ValueRef<'b, 'c, 't>],
         input_types: &[ArrayType],
         output_types: &[ArrayType],
@@ -511,7 +512,7 @@ impl LowerableOperation for ParallelRaggedAllToAllOperation {
 impl MemberLowerableOperation<ArrayIrType> for ParallelRaggedAllToAllOperation {
     fn lower_in_parent<'b, 'c: 'b, 't: 'c, O: LowerableOperationFamily>(
         &self,
-        lowerer: &mut XlaLowerer<'b, 'c, 't, O>,
+        lowerer: &mut Lowerer<'b, 'c, 't, O>,
         input_values: &[ValueRef<'b, 'c, 't>],
         input_types: &[ArrayIrType],
         output_types: &[ArrayIrType],
@@ -565,14 +566,14 @@ mod tests {
     use indoc::indoc;
     use pretty_assertions::assert_eq;
     use ryft_core::{
-        Array, ArrayBatch, ArrayOperation, BatchAxis, BatchAxisSpecification, BatchableOperation, BatchingContext,
-        Context, Differentiate, DimensionBounds, DimensionVariable, EmptyRegionDriver, LogicalMesh, MeshAxis,
-        MeshAxisType, ParallelRaggedAllToAll, Reduce, ShardMapOptions, ShardingDimension, StagingContext,
-        TracingContext, Value, batch,
+        Array as CoreArray, ArrayBatch, ArrayOperation, BatchAxis, BatchAxisSpecification, BatchableOperation,
+        BatchingContext, Context, Differentiate, DimensionBounds, DimensionVariable, EmptyRegionDriver, LogicalMesh,
+        MeshAxis, MeshAxisType, ParallelRaggedAllToAll, Reduce, ShardMapOptions, ShardingDimension, StagingContext,
+        TracingContext, Value as CoreValue, batch,
     };
     use ryft_mlir::Location;
 
-    use crate::experimental::XlaArrayTracer;
+    use crate::experimental::ArrayTracer;
     use crate::experimental::lowering::tests::{shard_map_module, test_sharding};
 
     use super::*;
@@ -596,7 +597,7 @@ mod tests {
         let mesh = LogicalMesh::new(vec![MeshAxis::new("x", 2, MeshAxisType::Manual).unwrap()]).unwrap();
         let sharding = test_sharding(&mesh, vec![ShardingDimension::sharded(["x"])], vec![]);
         let module = shard_map_module::<_, Vec<ArrayType>, ArrayType>(
-            |_, inputs: Vec<XlaArrayTracer>| {
+            |_, inputs: Vec<ArrayTracer>| {
                 inputs[0].parallel_ragged_all_to_all("x", &inputs[1], &inputs[2], &inputs[3], &inputs[4], &inputs[5])
             },
             vec![
@@ -658,7 +659,7 @@ mod tests {
         let sharding =
             test_sharding(&mesh, vec![ShardingDimension::sharded(["x"]), ShardingDimension::replicated()], vec![]);
         let module = shard_map_module::<_, Vec<ArrayType>, ArrayType>(
-            |_, inputs: Vec<XlaArrayTracer>| {
+            |_, inputs: Vec<ArrayTracer>| {
                 Ok(batch(
                     |inputs: Vec<_>| {
                         inputs[0]
@@ -745,7 +746,7 @@ mod tests {
         let mesh = LogicalMesh::new(vec![MeshAxis::new("x", 4, MeshAxisType::Manual).unwrap()]).unwrap();
         let sharding = test_sharding(&mesh, vec![ShardingDimension::sharded(["x"])], vec![]);
         let module = shard_map_module::<_, Vec<ArrayType>, ArrayType>(
-            |_, inputs: Vec<XlaArrayTracer>| {
+            |_, inputs: Vec<ArrayTracer>| {
                 let input_offsets = inputs[2].clone();
                 let send_sizes = inputs[3].clone();
                 let output_offsets = inputs[4].clone();
@@ -914,7 +915,7 @@ mod tests {
         // Direct `u64` metadata: copy `operand` rows `1..3` into `output` rows `0..2`.
         let sharding = test_sharding(&mesh, vec![ShardingDimension::sharded(["x"])], vec![]);
         let module = shard_map_module::<_, Vec<ArrayType>, ArrayType>(
-            |_, inputs: Vec<XlaArrayTracer>| {
+            |_, inputs: Vec<ArrayTracer>| {
                 inputs[0].parallel_ragged_all_to_all("x", &inputs[1], &inputs[2], &inputs[3], &inputs[4], &inputs[5])
             },
             vec![
@@ -952,7 +953,7 @@ mod tests {
         let batched_sharding =
             test_sharding(&mesh, vec![ShardingDimension::sharded(["x"]), ShardingDimension::replicated()], vec![]);
         let program = shard_map_module::<_, Vec<ArrayType>, ArrayType>(
-            |_, inputs: Vec<XlaArrayTracer>| {
+            |_, inputs: Vec<ArrayTracer>| {
                 Ok(batch(
                     |inputs: Vec<_>| {
                         inputs[0]
@@ -1002,7 +1003,7 @@ mod tests {
         // The gradient of the summed exchange with respect to `operand` lowers through the additive transpose, whose
         // rebased metadata are `u64`. Only the sent rows `1..3` reach the sum.
         let program = shard_map_module::<_, Vec<ArrayType>, ArrayType>(
-            |_, inputs: Vec<XlaArrayTracer>| {
+            |_, inputs: Vec<ArrayTracer>| {
                 Ok(inputs[0]
                     .domain()
                     .differentiate_at(inputs[0].clone())
@@ -1060,10 +1061,10 @@ mod tests {
 
     /// Batches an exchange over the axis `x` at a named batch level and returns the exchange that it binds.
     fn bind_batched_parallel_ragged_all_to_all(batch_axis_name: &str) -> ParallelRaggedAllToAllOperation {
-        let context = TracingContext::<Array, ArrayOperation<Array>>::new();
+        let context = TracingContext::<CoreArray, ArrayOperation<CoreArray>>::new();
         let operand = context.input(ArrayType::new_static(DataType::F32, [2, 3]));
         let output = context.input(ArrayType::new_static(DataType::F32, [2, 4]));
-        let metadata = context.lift(Array::matrix(2, 2, vec![0_i32; 4]).unwrap()).unwrap();
+        let metadata = context.lift(CoreArray::matrix(2, 2, vec![0_i32; 4]).unwrap()).unwrap();
         let inputs = [operand, output, metadata.clone(), metadata.clone(), metadata.clone(), metadata]
             .into_iter()
             .map(|input| ArrayBatch::new(input, BatchAxis::new(0)).unwrap())
@@ -1118,7 +1119,7 @@ mod tests {
         assert_eq!(operation.batch_dimension_count(), 1);
         let rows = DimensionVariable::new("rows", DimensionBounds::new(0, Some(4)).unwrap());
         let operand_type =
-            ArrayType::new(DataType::F32, Shape::new(vec![Dimension::Static(2), Dimension::Dynamic(rows)]));
+            ArrayType::new(DataType::F32, Shape::new(vec![CoreDimension::Static(2), CoreDimension::Dynamic(rows)]));
         let metadata_type = ArrayType::new_static(DataType::I32, [2, 2]);
         let mlir_context = MlirContext::new();
         let location = mlir_context.unknown_location();

@@ -1,11 +1,11 @@
 use ryft_core::macros::check_count;
-use ryft_core::{ArrayType, Operation, ParallelPermuteOperation};
+use ryft_core::{ArrayType, Operation as CoreOperation, ParallelPermuteOperation};
 use ryft_mlir::dialects::stable_hlo;
 use ryft_mlir::{Block, BlockRef, LocationRef, Operation as MlirOperation, Value as MlirValue, ValueRef};
 
 use crate::experimental::lowering::CollectiveLoweringState;
 use crate::operations::collectives::collective_replica_groups;
-use crate::{Error, LowerableOperation, LowerableOperationFamily, XlaLowerer};
+use crate::{Error, LowerableOperation, LowerableOperationFamily, Lowerer};
 
 /// Lowers one traced `parallel_permute` to a channeled `stablehlo.collective_permute`, expanding the axis-local
 /// `(source, target)` pairs to global device pairs across the named mesh axis's replica groups.
@@ -37,7 +37,7 @@ pub(crate) fn lower_parallel_permute_to_mlir<'b, 'c: 'b, 't: 'c>(
 impl LowerableOperation for ParallelPermuteOperation {
     fn lower<'b, 'c: 'b, 't: 'c, O: LowerableOperationFamily>(
         &self,
-        lowerer: &mut XlaLowerer<'b, 'c, 't, O>,
+        lowerer: &mut Lowerer<'b, 'c, 't, O>,
         input_values: &[ValueRef<'b, 'c, 't>],
         input_types: &[ArrayType],
         output_types: &[ArrayType],

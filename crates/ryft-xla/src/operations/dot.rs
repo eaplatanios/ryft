@@ -15,14 +15,14 @@ use crate::experimental::lowering::types::{
     lower_unplaced_constant_output, physical_bound_type,
 };
 use crate::operations::comparisons::lower_compare_to_mlir;
-use crate::{Error, LowerableOperation, LowerableOperationFamily, LoweringError, XlaLowerer};
+use crate::{Error, LowerableOperation, LowerableOperationFamily, Lowerer, LoweringError};
 
 /// XLA representation used when lowering ragged dots. Selection is compilation-wide through
-/// [`XlaOptions::with_ragged_dot_lowering_strategy`](crate::XlaOptions::with_ragged_dot_lowering_strategy).
+/// [`Options::with_ragged_dot_lowering_strategy`](crate::Options::with_ragged_dot_lowering_strategy).
 #[derive(Copy, Clone, Debug, Default, PartialEq, Eq, Hash)]
 pub enum RaggedDotLoweringStrategy {
     /// Expand ragged dots into masking plus ordinary dense generalized dots. This is the default used by
-    /// [`XlaOptions::new`](crate::XlaOptions::new).
+    /// [`Options::new`](crate::Options::new).
     #[default]
     Decomposition,
 
@@ -33,7 +33,7 @@ pub enum RaggedDotLoweringStrategy {
 impl LowerableOperation for DotOperation {
     fn lower<'b, 'c: 'b, 't: 'c, O: LowerableOperationFamily>(
         &self,
-        lowerer: &mut XlaLowerer<'b, 'c, 't, O>,
+        lowerer: &mut Lowerer<'b, 'c, 't, O>,
         input_values: &[ValueRef<'b, 'c, 't>],
         _input_types: &[ArrayType],
         output_types: &[ArrayType],
@@ -311,7 +311,7 @@ impl LowerableOperation for RaggedDotOperation {
     // Lower a ragged dot either to its portable masked-dense decomposition or to the opt-in CHLO instruction.
     fn lower<'b, 'c: 'b, 't: 'c, O: LowerableOperationFamily>(
         &self,
-        lowerer: &mut XlaLowerer<'b, 'c, 't, O>,
+        lowerer: &mut Lowerer<'b, 'c, 't, O>,
         input_values: &[ValueRef<'b, 'c, 't>],
         input_types: &[ArrayType],
         output_types: &[ArrayType],
@@ -456,13 +456,13 @@ impl LowerableOperation for RaggedDotOperation {
 mod tests {
     use indoc::indoc;
     use pretty_assertions::assert_eq;
-    use ryft_core::{Array, ArrayOperation, Dimension, Placeholder, RaggedDot};
+    use ryft_core::{Array as CoreArray, ArrayOperation, Dimension as CoreDimension, Placeholder, RaggedDot};
 
     use crate::experimental::lowering::tests::{
-        XlaProgramBuilder, dynamic_dimension, ragged_dot_cpu_compilation_options, unproject_plain_program,
+        ProgramBuilder, dynamic_dimension, ragged_dot_cpu_compilation_options, unproject_plain_program,
     };
     use crate::experimental::lowering::to_mlir_module_for_plain_program_with_ragged_dot_lowering_strategy;
-    use crate::experimental::ops::XlaArrayConstant;
+    use crate::experimental::ops::ArrayConstant;
     use crate::tests::values_to_bytes;
     use crate::{ToPjrt, to_mlir_module_for_program};
 
@@ -479,7 +479,7 @@ mod tests {
         group_sizes_type: ArrayType,
         strategy: RaggedDotLoweringStrategy,
     ) -> Result<String, Error> {
-        let mut builder = XlaProgramBuilder::new();
+        let mut builder = ProgramBuilder::new();
         let lhs = builder.add_input(lhs_type);
         let rhs = builder.add_input(rhs_type);
         let group_sizes = builder.add_input(group_sizes_type);
@@ -492,11 +492,7 @@ mod tests {
             )
             .unwrap()[0];
         let program = builder
-            .build::<Vec<XlaArrayConstant>, Vec<XlaArrayConstant>>(
-                vec![output],
-                vec![Placeholder; 3],
-                vec![Placeholder],
-            )
+            .build::<Vec<ArrayConstant>, Vec<ArrayConstant>>(vec![output], vec![Placeholder; 3], vec![Placeholder])
             .unwrap();
         to_mlir_module_for_plain_program_with_ragged_dot_lowering_strategy(&program, "main", strategy)
     }
@@ -1189,12 +1185,13 @@ mod tests {
         let lhs_values = [1.0_f32, 2.0, 3.0, 4.0, 5.0, 6.0, 7.0, 8.0, 9.0, 10.0];
         let rhs_values = [10.0_f32, 1.0, 2.0, 3.0, 4.0, 5.0];
         let group_sizes_values = [1_i32, 0, 3];
-        let lhs = Array::matrix(5, 2, lhs_values.to_vec()).unwrap();
-        let rhs = Array::from_elements::<f32>(ArrayType::new_static(DataType::F32, [3, 2, 1]), &rhs_values).unwrap();
+        let lhs = CoreArray::matrix(5, 2, lhs_values.to_vec()).unwrap();
+        let rhs =
+            CoreArray::from_elements::<f32>(ArrayType::new_static(DataType::F32, [3, 2, 1]), &rhs_values).unwrap();
         let eager = lhs
             .ragged_dot(
                 &rhs,
-                &Array::vector(group_sizes_values.to_vec()).unwrap(),
+                &CoreArray::vector(group_sizes_values.to_vec()).unwrap(),
                 &RaggedDotDimensionNumbers::matmul(),
             )
             .unwrap();
@@ -1222,9 +1219,10 @@ mod tests {
         let lhs_values = [1.0_f32, 2.0, 3.0, 4.0, 5.0, 6.0, 7.0, 8.0, 9.0, 10.0];
         let rhs_values = [10.0_f32, 20.0, 30.0, 40.0, 50.0];
         let group_sizes_values = [2_i32, 0, 3];
-        let lhs = Array::matrix(2, 5, lhs_values.to_vec()).unwrap();
-        let rhs = Array::matrix(5, 1, rhs_values.to_vec()).unwrap();
-        let eager = lhs.ragged_dot(&rhs, &Array::vector(group_sizes_values.to_vec()).unwrap(), &dimensions).unwrap();
+        let lhs = CoreArray::matrix(2, 5, lhs_values.to_vec()).unwrap();
+        let rhs = CoreArray::matrix(5, 1, rhs_values.to_vec()).unwrap();
+        let eager =
+            lhs.ragged_dot(&rhs, &CoreArray::vector(group_sizes_values.to_vec()).unwrap(), &dimensions).unwrap();
         let expected = eager.to_f64s().into_iter().map(|value| value as f32).collect::<Vec<_>>();
         assert_eq!(expected, vec![50.0, 200.0, 0.0, 0.0, 500.0, 1_100.0]);
         let group_sizes_data = values_to_bytes(&group_sizes_values);
@@ -1247,12 +1245,13 @@ mod tests {
         let lhs_values = [1.0_f32, 0.0, 2.0, 0.0, 3.0, 0.0, 4.0, 0.0];
         let rhs_values = [2.0_f32, 0.0, 3.0, 0.0, 5.0, 0.0, 7.0, 0.0];
         let group_sizes_values = [u64::MAX, u64::MAX, 2, 1];
-        let lhs = Array::matrix(4, 2, lhs_values.to_vec()).unwrap();
-        let rhs = Array::from_elements::<f32>(ArrayType::new_static(DataType::F32, [4, 2, 1]), &rhs_values).unwrap();
+        let lhs = CoreArray::matrix(4, 2, lhs_values.to_vec()).unwrap();
+        let rhs =
+            CoreArray::from_elements::<f32>(ArrayType::new_static(DataType::F32, [4, 2, 1]), &rhs_values).unwrap();
         let eager = lhs
             .ragged_dot(
                 &rhs,
-                &Array::vector(group_sizes_values.to_vec()).unwrap(),
+                &CoreArray::vector(group_sizes_values.to_vec()).unwrap(),
                 &RaggedDotDimensionNumbers::matmul(),
             )
             .unwrap();
@@ -1321,19 +1320,16 @@ mod tests {
         // An accumulation-typed dot lowers to a `stablehlo.dot_general` whose result type is the accumulation type
         // (XLA's `preferred_element_type` contract), with the operands kept at their narrow element type.
         let operand_type =
-            ArrayType::new(DataType::F8E4M3FN, Shape::new(vec![Dimension::Static(2), Dimension::Static(2)]));
-        let output_type = ArrayType::new(DataType::F32, Shape::new(vec![Dimension::Static(2), Dimension::Static(2)]));
-        let mut builder = XlaProgramBuilder::new();
+            ArrayType::new(DataType::F8E4M3FN, Shape::new(vec![CoreDimension::Static(2), CoreDimension::Static(2)]));
+        let output_type =
+            ArrayType::new(DataType::F32, Shape::new(vec![CoreDimension::Static(2), CoreDimension::Static(2)]));
+        let mut builder = ProgramBuilder::new();
         let lhs = builder.add_input(operand_type.clone());
         let rhs = builder.add_input(operand_type.clone());
         let operation = DotOperation::new(DotDimensionNumbers::matmul()).with_accumulation_type(DataType::F32);
         let output = builder.add_instruction(operation, Vec::new(), vec![lhs, rhs], None).unwrap()[0];
         let program = builder
-            .build::<Vec<XlaArrayConstant>, Vec<XlaArrayConstant>>(
-                vec![output],
-                vec![Placeholder; 2],
-                vec![Placeholder],
-            )
+            .build::<Vec<ArrayConstant>, Vec<ArrayConstant>>(vec![output], vec![Placeholder; 2], vec![Placeholder])
             .unwrap();
         let program = unproject_plain_program(program);
         let input_types = vec![operand_type.clone(), operand_type];

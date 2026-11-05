@@ -1,9 +1,9 @@
 use ryft_core::{
-    ArrayIrType, ArrayType, ComparisonDirection, ConstantOperation, DataType, Dimension, DimensionAddOperation,
-    DimensionDivOperation, DimensionFromScalarOperation, DimensionMaxOperation, DimensionMinOperation,
-    DimensionMulOperation, DimensionOperation, DimensionPowOperation, DimensionRemOperation, DimensionSizeOperation,
-    DimensionSubOperation, DimensionToScalarOperation, DimensionType, DimensionValue, EffectClass, Operation,
-    ProgramError, SaturatingSubOperation,
+    ArrayIrType, ArrayType, ComparisonDirection, ConstantOperation, DataType, Dimension as CoreDimension,
+    DimensionAddOperation, DimensionDivOperation, DimensionFromScalarOperation, DimensionMaxOperation,
+    DimensionMinOperation, DimensionMulOperation, DimensionOperation, DimensionPowOperation, DimensionRemOperation,
+    DimensionSizeOperation, DimensionSubOperation, DimensionToScalarOperation, DimensionType, DimensionValue,
+    EffectClass, Operation as CoreOperation, ProgramError, SaturatingSubOperation,
 };
 use ryft_mlir::dialects::stable_hlo;
 use ryft_mlir::{
@@ -21,7 +21,7 @@ use crate::operations::assertions::{
 };
 use crate::operations::comparisons::lower_compare_to_mlir;
 use crate::operations::lower_tensor_type;
-use crate::{Error, LowerableOperation, LowerableOperationFamily, XlaLowerer};
+use crate::{Error, LowerableOperation, LowerableOperationFamily, Lowerer};
 
 /// Lowers one runtime safety check for dimension arithmetic whose declared bounds do not prove totality.
 pub(crate) fn lower_dimension_arithmetic_assertion<'b, 'c: 'b, 't: 'c>(
@@ -61,7 +61,7 @@ pub(crate) fn lower_dimension_arithmetic_assertion<'b, 'c: 'b, 't: 'c>(
 impl LowerableOperation for DimensionSizeOperation {
     fn lower<'b, 'c: 'b, 't: 'c, O: LowerableOperationFamily>(
         &self,
-        lowerer: &mut XlaLowerer<'b, 'c, 't, O>,
+        lowerer: &mut Lowerer<'b, 'c, 't, O>,
         input_values: &[ValueRef<'b, 'c, 't>],
         input_types: &[ArrayIrType],
         _output_types: &[ArrayIrType],
@@ -77,7 +77,7 @@ impl LowerableOperation for DimensionSizeOperation {
         };
         let input_type = <&ArrayType>::try_from(input_type)?;
         match input_type.shape().dimensions()[self.axis()] {
-            Dimension::Static(extent) => {
+            CoreDimension::Static(extent) => {
                 let output_type = lower_tensor_type(&ArrayType::scalar(DataType::I64), context, location)?;
                 let extent = i64::try_from(extent).map_err(|_| {
                     ryft_core::DimensionError::ExtentExceedsBackendWidth { value: extent, maximum: i64::MAX as usize }
@@ -86,7 +86,7 @@ impl LowerableOperation for DimensionSizeOperation {
                 let constant = block.append_operation(stable_hlo::constant(elements, location)?)?;
                 Ok(vec![constant.result(0).expect("stablehlo.constant should return one result").as_ref()])
             }
-            Dimension::Dynamic(_) => {
+            CoreDimension::Dynamic(_) => {
                 let size = block.append_operation(stable_hlo::get_dimension_size(*input, self.axis(), location)?)?;
                 let size = size.result(0).expect("stablehlo.get_dimension_size should return one result").as_ref();
                 let output_type = lower_tensor_type(&ArrayType::scalar(DataType::I64), context, location)?;
@@ -100,7 +100,7 @@ impl LowerableOperation for DimensionSizeOperation {
 impl LowerableOperation for DimensionFromScalarOperation {
     fn lower<'b, 'c: 'b, 't: 'c, O: LowerableOperationFamily>(
         &self,
-        lowerer: &mut XlaLowerer<'b, 'c, 't, O>,
+        lowerer: &mut Lowerer<'b, 'c, 't, O>,
         input_values: &[ValueRef<'b, 'c, 't>],
         _input_types: &[ArrayIrType],
         _output_types: &[ArrayIrType],
@@ -156,7 +156,7 @@ impl LowerableOperation for DimensionFromScalarOperation {
 impl LowerableOperation for DimensionToScalarOperation {
     fn lower<'b, 'c: 'b, 't: 'c, O: LowerableOperationFamily>(
         &self,
-        _lowerer: &mut XlaLowerer<'b, 'c, 't, O>,
+        _lowerer: &mut Lowerer<'b, 'c, 't, O>,
         input_values: &[ValueRef<'b, 'c, 't>],
         _input_types: &[ArrayIrType],
         _output_types: &[ArrayIrType],
@@ -171,7 +171,7 @@ impl LowerableOperation for DimensionToScalarOperation {
 impl LowerableOperation for ConstantOperation<DimensionValue> {
     fn lower<'b, 'c: 'b, 't: 'c, O: LowerableOperationFamily>(
         &self,
-        lowerer: &mut XlaLowerer<'b, 'c, 't, O>,
+        lowerer: &mut Lowerer<'b, 'c, 't, O>,
         input_values: &[ValueRef<'b, 'c, 't>],
         _input_types: &[DimensionType],
         _output_types: &[DimensionType],
@@ -186,7 +186,7 @@ impl LowerableOperation for ConstantOperation<DimensionValue> {
 impl LowerableOperation for DimensionMaxOperation {
     fn lower<'b, 'c: 'b, 't: 'c, O: LowerableOperationFamily>(
         &self,
-        lowerer: &mut XlaLowerer<'b, 'c, 't, O>,
+        lowerer: &mut Lowerer<'b, 'c, 't, O>,
         input_values: &[ValueRef<'b, 'c, 't>],
         input_types: &[DimensionType],
         _output_types: &[DimensionType],
@@ -198,7 +198,7 @@ impl LowerableOperation for DimensionMaxOperation {
 impl LowerableOperation for DimensionMinOperation {
     fn lower<'b, 'c: 'b, 't: 'c, O: LowerableOperationFamily>(
         &self,
-        lowerer: &mut XlaLowerer<'b, 'c, 't, O>,
+        lowerer: &mut Lowerer<'b, 'c, 't, O>,
         input_values: &[ValueRef<'b, 'c, 't>],
         input_types: &[DimensionType],
         _output_types: &[DimensionType],
@@ -210,7 +210,7 @@ impl LowerableOperation for DimensionMinOperation {
 impl LowerableOperation for DimensionAddOperation {
     fn lower<'b, 'c: 'b, 't: 'c, O: LowerableOperationFamily>(
         &self,
-        lowerer: &mut XlaLowerer<'b, 'c, 't, O>,
+        lowerer: &mut Lowerer<'b, 'c, 't, O>,
         input_values: &[ValueRef<'b, 'c, 't>],
         input_types: &[DimensionType],
         _output_types: &[DimensionType],
@@ -222,7 +222,7 @@ impl LowerableOperation for DimensionAddOperation {
 impl LowerableOperation for DimensionSubOperation {
     fn lower<'b, 'c: 'b, 't: 'c, O: LowerableOperationFamily>(
         &self,
-        lowerer: &mut XlaLowerer<'b, 'c, 't, O>,
+        lowerer: &mut Lowerer<'b, 'c, 't, O>,
         input_values: &[ValueRef<'b, 'c, 't>],
         input_types: &[DimensionType],
         _output_types: &[DimensionType],
@@ -234,7 +234,7 @@ impl LowerableOperation for DimensionSubOperation {
 impl LowerableOperation for SaturatingSubOperation<DimensionType> {
     fn lower<'b, 'c: 'b, 't: 'c, O: LowerableOperationFamily>(
         &self,
-        lowerer: &mut XlaLowerer<'b, 'c, 't, O>,
+        lowerer: &mut Lowerer<'b, 'c, 't, O>,
         input_values: &[ValueRef<'b, 'c, 't>],
         input_types: &[DimensionType],
         _output_types: &[DimensionType],
@@ -246,7 +246,7 @@ impl LowerableOperation for SaturatingSubOperation<DimensionType> {
 impl LowerableOperation for DimensionMulOperation {
     fn lower<'b, 'c: 'b, 't: 'c, O: LowerableOperationFamily>(
         &self,
-        lowerer: &mut XlaLowerer<'b, 'c, 't, O>,
+        lowerer: &mut Lowerer<'b, 'c, 't, O>,
         input_values: &[ValueRef<'b, 'c, 't>],
         input_types: &[DimensionType],
         _output_types: &[DimensionType],
@@ -258,7 +258,7 @@ impl LowerableOperation for DimensionMulOperation {
 impl LowerableOperation for DimensionDivOperation {
     fn lower<'b, 'c: 'b, 't: 'c, O: LowerableOperationFamily>(
         &self,
-        lowerer: &mut XlaLowerer<'b, 'c, 't, O>,
+        lowerer: &mut Lowerer<'b, 'c, 't, O>,
         input_values: &[ValueRef<'b, 'c, 't>],
         input_types: &[DimensionType],
         _output_types: &[DimensionType],
@@ -270,7 +270,7 @@ impl LowerableOperation for DimensionDivOperation {
 impl LowerableOperation for DimensionRemOperation {
     fn lower<'b, 'c: 'b, 't: 'c, O: LowerableOperationFamily>(
         &self,
-        lowerer: &mut XlaLowerer<'b, 'c, 't, O>,
+        lowerer: &mut Lowerer<'b, 'c, 't, O>,
         input_values: &[ValueRef<'b, 'c, 't>],
         input_types: &[DimensionType],
         _output_types: &[DimensionType],
@@ -282,7 +282,7 @@ impl LowerableOperation for DimensionRemOperation {
 impl LowerableOperation for DimensionPowOperation {
     fn lower<'b, 'c: 'b, 't: 'c, O: LowerableOperationFamily>(
         &self,
-        lowerer: &mut XlaLowerer<'b, 'c, 't, O>,
+        lowerer: &mut Lowerer<'b, 'c, 't, O>,
         input_values: &[ValueRef<'b, 'c, 't>],
         input_types: &[DimensionType],
         _output_types: &[DimensionType],
@@ -295,7 +295,7 @@ impl LowerableOperation for DimensionPowOperation {
 /// do not prove safe keeps the checked eager semantics through a runtime assertion on the ordered-assertion chain.
 fn lower_dimension_arithmetic<'b, 'c: 'b, 't: 'c, O: LowerableOperationFamily>(
     operation: &DimensionOperation<DimensionValue>,
-    lowerer: &mut XlaLowerer<'b, 'c, 't, O>,
+    lowerer: &mut Lowerer<'b, 'c, 't, O>,
     input_values: &[ValueRef<'b, 'c, 't>],
     input_types: &[DimensionType],
 ) -> Result<Vec<ValueRef<'b, 'c, 't>>, Error> {
@@ -387,7 +387,7 @@ mod tests {
     use ryft_core::{ArrayType, DataType, DimensionBounds, DimensionVariable, Placeholder};
 
     use crate::experimental::lowering::tests::{MixedValue, execute_mixed_program};
-    use crate::experimental::ops::{XlaConstant, XlaProgramBuilder as ArrayIrXlaProgramBuilder};
+    use crate::experimental::ops::{Constant, ProgramBuilder as ArrayIrProgramBuilder};
     use crate::tests::execution_client;
     use crate::to_mlir_module_for_program;
 
@@ -395,14 +395,14 @@ mod tests {
 
     #[test]
     fn test_saturating_sub_operation_lower() {
-        let mut builder = ArrayIrXlaProgramBuilder::new();
+        let mut builder = ArrayIrProgramBuilder::new();
         let left = builder.add_input(DimensionType::new("left", DimensionBounds::non_negative(None).unwrap()).into());
         let right = builder.add_input(DimensionType::new("right", DimensionBounds::non_negative(None).unwrap()).into());
         let output = builder
             .add_instruction(SaturatingSubOperation::<DimensionType>::new(), Vec::new(), vec![left, right], None)
             .unwrap()[0];
         let program = builder
-            .build::<Vec<XlaConstant>, Vec<XlaConstant>>(vec![output], vec![Placeholder; 2], vec![Placeholder])
+            .build::<Vec<Constant>, Vec<Constant>>(vec![output], vec![Placeholder; 2], vec![Placeholder])
             .unwrap();
         let boundary_type = ArrayType::scalar(DataType::I64);
         assert_eq!(
@@ -456,7 +456,7 @@ mod tests {
             let right_variable = DimensionVariable::new("right", right_bounds);
             let left_type = DimensionType::from(left_variable.clone());
             let right_type = DimensionType::from(right_variable.clone());
-            let mut builder = ArrayIrXlaProgramBuilder::new();
+            let mut builder = ArrayIrProgramBuilder::new();
             let left = builder.add_input(scalar_type.clone().into());
             let right = builder.add_input(scalar_type.clone().into());
             let left = builder
@@ -481,11 +481,7 @@ mod tests {
             let output =
                 builder.add_instruction(DimensionToScalarOperation, Vec::new(), vec![difference], None).unwrap()[0];
             let program = builder
-                .build::<Vec<XlaConstant>, Vec<XlaConstant>>(
-                    vec![output],
-                    vec![Placeholder, Placeholder],
-                    vec![Placeholder],
-                )
+                .build::<Vec<Constant>, Vec<Constant>>(vec![output], vec![Placeholder, Placeholder], vec![Placeholder])
                 .unwrap();
             to_mlir_module_for_program(
                 &program,

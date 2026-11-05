@@ -6,17 +6,16 @@ use std::process::Command;
 use std::time::{Duration, Instant};
 
 use ryft_core::{
-    ArrayIrType, ArrayType, Compile, CompiledFunction, DataType, Device, DeviceMesh, Dimension, DiskCache,
-    DispatcherStatistics, LogicalMesh, MeshAxis, MeshAxisType, Shape, Sharding, Sin, StagedFunction, ValueProjection,
+    ArrayIrType, ArrayType, Compile, CompiledFunction as CoreCompiledFunction, DataType, Device, DeviceMesh,
+    Dimension as CoreDimension, DiskCache, DispatcherStatistics, LogicalMesh, MeshAxis, MeshAxisType, Shape, Sharding,
+    Sin, StagedFunction as CoreStagedFunction, ValueProjection,
 };
 use ryft_pjrt::{Client, ClientOptions, CpuClientOptions, load_cpu_plugin};
-use ryft_xla::{
-    FromPjrt, JittedXlaFunction, XlaArray, XlaCompileTracer, XlaDomain, XlaOptions, XlaSession, XlaValue, jitted,
-};
-use serde_json::{Value, json};
+use ryft_xla::{Array, CompileTracer, Domain, FromPjrt, JittedFunction, Options, Session, Value, jitted};
+use serde_json::{Value as JsonValue, json};
 
-type BenchmarkStagedFunction<'c> = StagedFunction<XlaDomain<'c>, ArrayIrType, ArrayIrType>;
-type BenchmarkCompiledFunction<'c> = CompiledFunction<XlaDomain<'c>, ArrayIrType, ArrayIrType>;
+type BenchmarkStagedFunction<'c> = CoreStagedFunction<Domain<'c>, ArrayIrType, ArrayIrType>;
+type BenchmarkCompiledFunction<'c> = CoreCompiledFunction<Domain<'c>, ArrayIrType, ArrayIrType>;
 
 #[derive(Debug)]
 struct Arguments {
@@ -102,7 +101,7 @@ fn nanoseconds(duration: Duration) -> u64 {
     u64::try_from(duration.as_nanos()).unwrap_or(u64::MAX)
 }
 
-fn distribution(samples: &[u64]) -> Value {
+fn distribution(samples: &[u64]) -> JsonValue {
     let mut sorted = samples.to_vec();
     sorted.sort_unstable();
     let percentile = |percent: usize| {
@@ -119,7 +118,7 @@ fn distribution(samples: &[u64]) -> Value {
     })
 }
 
-fn dispatcher_statistics(statistics: DispatcherStatistics) -> Value {
+fn dispatcher_statistics(statistics: DispatcherStatistics) -> JsonValue {
     json!({
         "dispatch_hits": statistics.dispatch_hits,
         "dispatch_misses": statistics.dispatch_misses,
@@ -133,7 +132,7 @@ fn dispatcher_statistics(statistics: DispatcherStatistics) -> Value {
     })
 }
 
-fn compilation_statistics(domain: &XlaDomain<'_>) -> Value {
+fn compilation_statistics(domain: &Domain<'_>) -> JsonValue {
     let statistics = domain.compilation_context().statistics();
     json!({
         "memory_hits": statistics.memory_hits,
@@ -155,25 +154,25 @@ fn mesh(client: &Client<'_>) -> Result<DeviceMesh, Box<dyn std::error::Error>> {
 }
 
 fn input_type(mesh: &DeviceMesh, size: usize) -> Result<ArrayType, Box<dyn std::error::Error>> {
-    Ok(ArrayType::new(DataType::F32, Shape::new(vec![Dimension::Static(size)]))
+    Ok(ArrayType::new(DataType::F32, Shape::new(vec![CoreDimension::Static(size)]))
         .with_sharding(Sharding::replicated(mesh.logical_mesh().clone(), 1))?)
 }
 
 fn input_array<'c>(
-    domain: &XlaDomain<'c>,
+    domain: &Domain<'c>,
     mesh: &DeviceMesh,
     r#type: ArrayType,
     size: usize,
-) -> Result<XlaArray<'c>, Box<dyn std::error::Error>> {
+) -> Result<Array<'c>, Box<dyn std::error::Error>> {
     let mut bytes = Vec::with_capacity(size * size_of::<f32>());
     for index in 0..size {
         bytes.extend_from_slice(&((index % 1024) as f32 / 1024.0).to_ne_bytes());
     }
-    Ok(XlaArray::from_host_buffer(domain, r#type, mesh.clone(), bytes.as_slice())?)
+    Ok(Array::from_host_buffer(domain, r#type, mesh.clone(), bytes.as_slice())?)
 }
 
 fn stage_workload<'c>(
-    domain: &XlaDomain<'c>,
+    domain: &Domain<'c>,
     mesh: &DeviceMesh,
     r#type: ArrayType,
 ) -> Result<BenchmarkStagedFunction<'c>, Box<dyn std::error::Error>> {
@@ -183,19 +182,19 @@ fn stage_workload<'c>(
             (input.clone() * input.clone() + input).sin().unwrap().into_value()
         },
         ArrayIrType::Array(r#type),
-        XlaOptions::new(mesh.clone()),
+        Options::new(mesh.clone()),
     )?)
 }
 
 fn call_workload<'c>(
-    domain: &XlaDomain<'c>,
+    domain: &Domain<'c>,
     compiled: &BenchmarkCompiledFunction<'c>,
-    input: XlaArray<'c>,
-) -> Result<XlaArray<'c>, Box<dyn std::error::Error>> {
-    match compiled.executable().execute(domain, XlaValue::Array(input))? {
-        XlaValue::Array(output) => Ok(output),
-        XlaValue::Dimension(_) => Err("compilation benchmark produced a first-class dimension".into()),
-        XlaValue::Reference(_) => Err("compilation benchmark produced a reference".into()),
+    input: Array<'c>,
+) -> Result<Array<'c>, Box<dyn std::error::Error>> {
+    match compiled.executable().execute(domain, Value::Array(input))? {
+        Value::Array(output) => Ok(output),
+        Value::Dimension(_) => Err("compilation benchmark produced a first-class dimension".into()),
+        Value::Reference(_) => Err("compilation benchmark produced a reference".into()),
     }
 }
 
@@ -204,17 +203,15 @@ fn persistent_restore(
     mesh: &DeviceMesh,
     r#type: &ArrayType,
     directory: &Path,
-) -> Result<Value, Box<dyn std::error::Error>> {
+) -> Result<JsonValue, Box<dyn std::error::Error>> {
     let producer =
-        XlaSession::with_disk_cache(client, DiskCache::open(directory)?.with_write_thresholds(Duration::ZERO, 0))
-            .domain();
+        Session::with_disk_cache(client, DiskCache::open(directory)?.with_write_thresholds(Duration::ZERO, 0)).domain();
     let producer_staged = stage_workload(&producer, mesh, r#type.clone())?;
     let producer_lowered = producer_staged.lower(&producer)?;
     producer_lowered.compile(&producer)?;
 
     let restored =
-        XlaSession::with_disk_cache(client, DiskCache::open(directory)?.with_write_thresholds(Duration::ZERO, 0))
-            .domain();
+        Session::with_disk_cache(client, DiskCache::open(directory)?.with_write_thresholds(Duration::ZERO, 0)).domain();
     let restored_staged = stage_workload(&restored, mesh, r#type.clone())?;
     let restored_lowered = restored_staged.lower(&restored)?;
     let start = Instant::now();
@@ -239,7 +236,7 @@ fn main() -> Result<(), Box<dyn std::error::Error>> {
     let client = plugin.client(ClientOptions::CPU(CpuClientOptions { device_count: Some(1), ..Default::default() }))?;
     let mesh = mesh(&client)?;
     let r#type = input_type(&mesh, arguments.size)?;
-    let domain = XlaSession::new(&client).domain();
+    let domain = Session::new(&client).domain();
     let input = input_array(&domain, &mesh, r#type.clone(), arguments.size)?;
     input.block_until_ready()?;
     let start = Instant::now();
@@ -275,8 +272,8 @@ fn main() -> Result<(), Box<dyn std::error::Error>> {
         synchronized_samples.push(duration_nanoseconds(start));
     }
 
-    let dispatcher: JittedXlaFunction<'_, _, (), ArrayType, ArrayType> = jitted(
-        |(), input: XlaCompileTracer<'_>| Ok((input.clone() * input.clone() + input).sin()?),
+    let dispatcher: JittedFunction<'_, _, (), ArrayType, ArrayType> = jitted(
+        |(), input: CompileTracer<'_>| Ok((input.clone() * input.clone() + input).sin()?),
         &domain,
         mesh.clone(),
     );

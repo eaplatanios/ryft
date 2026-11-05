@@ -1,6 +1,7 @@
 pub mod arrays;
 pub mod arrays_v0;
 pub mod distributed;
+pub mod domains;
 pub mod eager;
 pub mod errors;
 pub mod experimental;
@@ -15,35 +16,32 @@ pub mod telemetry;
 pub mod types;
 pub mod values;
 
-pub use arrays::{
-    ArrayError, ShardDescriptor, ShardIndex, ShardLayout, XlaArray, XlaArrayShard, block_until_ready, ready,
-};
+pub use arrays::{Array, ArrayError, ArrayShard, ShardDescriptor, ShardIndex, ShardLayout, block_until_ready, ready};
 pub use distributed::DistributedRuntime;
-pub use errors::Error;
-pub use experimental::domains::{
-    CompilationError, ExecutionError, XlaAnalysisValue, XlaCompilationAnalysis, XlaDomain, XlaFeedbackDirectedProfile,
-    XlaInputBoundBucketing, XlaMemoryAnalysis, XlaOptimizedProgram, XlaOptions, XlaSession, XlaTarget, XlaTargetDevice,
+pub use domains::{
+    AnalysisValue, CompilationAnalysis, CompilationError, Domain, ExecutionError, FeedbackDirectedProfile,
+    InputBoundBucketing, MemoryAnalysis, OptimizedProgram, Options, Session, Target, TargetDevice,
 };
+pub use errors::Error;
 pub use experimental::lowering::{
-    LowerableOperation, LowerableOperationFamily, LoweringError, MemberLowerableOperation, XlaLowerer,
+    LowerableOperation, LowerableOperationFamily, Lowerer, LoweringError, MemberLowerableOperation,
     to_mlir_module_for_program,
 };
 pub use jit::{
-    CompiledXlaFunction, ExecutableXlaFunction, JittedXlaFunction, StagedXlaFunction, StatefulCompiledXlaFunction,
-    StatefulJittedXlaFunction, XlaCompileTracer, XlaStatefulCompileTracer, XlaStatefulValue, compile,
-    compile_statefully, compile_statefully_with_captures, compile_with_captures, compile_with_options,
-    infer_output_types, jitted, jitted_statefully, jitted_statefully_with_options, jitted_with_options, stage,
-    stage_with_captures,
+    CompileTracer, CompiledFunction, ExecutableFunction, JittedFunction, StagedFunction, StatefulCompileTracer,
+    StatefulCompiledFunction, StatefulJittedFunction, StatefulValue, compile, compile_statefully,
+    compile_statefully_with_captures, compile_with_captures, compile_with_options, infer_output_types, jitted,
+    jitted_statefully, jitted_statefully_with_options, jitted_with_options, stage, stage_with_captures,
 };
 pub use mlir::ToMlir;
 pub use operations::dot::RaggedDotLoweringStrategy;
 pub use pjrt::{FromPjrt, ToPjrt};
 pub use profile_guided::{
-    AdaptiveProfileGuidedOptions, AdaptiveProfileGuidedState, AdaptiveProfileGuidedStatistics,
-    AdaptiveProfileGuidedXlaFunction,
+    AdaptiveProfileGuidedFunction, AdaptiveProfileGuidedOptions, AdaptiveProfileGuidedState,
+    AdaptiveProfileGuidedStatistics,
 };
 pub use telemetry::{constructed_array_count, dropped_array_count, live_array_count};
-pub use values::{XlaDimension, XlaReference, XlaValue};
+pub use values::{Dimension, Reference, Value};
 
 // TODO(eaplatanios): Review this module.
 

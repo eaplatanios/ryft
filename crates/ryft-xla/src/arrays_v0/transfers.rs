@@ -1,8 +1,8 @@
-use crate::{Error, ToPjrt, XlaArray};
+use crate::{Array, Error, ToPjrt};
 
 use super::*;
 
-/// Deterministic exact-shard transfer plan for one [`XlaArray::to_placement`] call on the current process.
+/// Deterministic exact-shard transfer plan for one [`Array::to_placement`] call on the current process.
 #[derive(Clone, Debug, PartialEq, Eq)]
 pub(crate) struct ExactShardPutPlan {
     /// Local destination shards that can be satisfied via intra-host device-to-device copies.
@@ -265,9 +265,9 @@ fn cross_host_shape(plan: &CrossHostShardReceivePlan) -> Result<Vec<i64>, Error>
 /// 2. then prefer the same device ID as the destination shard, and
 /// 3. finally break ties by device ID and shard index.
 fn preferred_exact_source_shard<'a, 'o>(
-    source_shards: &[&'a XlaArrayShard<'o>],
+    source_shards: &[&'a ArrayShard<'o>],
     destination_shard: &ShardDescriptor,
-) -> &'a XlaArrayShard<'o> {
+) -> &'a ArrayShard<'o> {
     source_shards
         .iter()
         .min_by_key(|source_shard| {
@@ -284,18 +284,18 @@ fn preferred_exact_source_shard<'a, 'o>(
         .expect("preferred exact source shard selection requires at least one candidate")
 }
 
-/// Plans exact whole-shard moves for one [`XlaArray::to_placement`] call on the current process.
+/// Plans exact whole-shard moves for one [`Array::to_placement`] call on the current process.
 ///
 /// Returns `Ok(None)` when any destination shard requires repartitioning or concatenating multiple
 /// source shards, which means the exact-shard fast path cannot satisfy the requested sharding.
 pub(crate) fn plan_exact_shard_put<'o>(
-    array: &XlaArray<'o>,
+    array: &Array<'o>,
     client_process_index: usize,
     global_shape: &StaticShape,
     mesh: &DeviceMesh,
     sharding: &Sharding,
 ) -> Result<Option<ExactShardPutPlan>, Error> {
-    let mut source_shards_by_slices = HashMap::<Vec<Range<usize>>, Vec<&XlaArrayShard<'o>>>::new();
+    let mut source_shards_by_slices = HashMap::<Vec<Range<usize>>, Vec<&ArrayShard<'o>>>::new();
     for shard in array.shards() {
         source_shards_by_slices.entry(shard.slice().to_vec()).or_default().push(shard);
     }
@@ -363,9 +363,9 @@ pub(crate) fn plan_exact_shard_put<'o>(
 /// directly between devices, and remote source shards are transferred with the PJRT cross-host
 /// transfers extension when it is available. When the destination requires repartitioning or the
 /// cross-host extension is unavailable for a needed remote move, the function returns `Ok(None)`
-/// so that [`XlaArray::to_placement`] can fall back to the dense host path.
+/// so that [`Array::to_placement`] can fall back to the dense host path.
 pub(crate) fn copy_addressable_destination_shards_from_exact_source_shards<'o>(
-    array: &XlaArray<'o>,
+    array: &Array<'o>,
     client: &'o Client<'_>,
     global_shape: &StaticShape,
     mesh: &DeviceMesh,

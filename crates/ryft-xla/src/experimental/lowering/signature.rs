@@ -1,6 +1,6 @@
 use std::sync::Arc;
 
-use ryft_core::{ArrayType, DataType, Dimension, Shape, Sharding};
+use ryft_core::{ArrayType, DataType, Dimension as CoreDimension, Shape, Sharding};
 
 /// Logical-to-physical argument and result mapping of one XLA executable boundary.
 ///
@@ -10,7 +10,7 @@ use ryft_core::{ArrayType, DataType, Dimension, Shape, Sharding};
 /// zero-space leaves deliberately retain private `i1` carriers because the current executable ABI has no independent
 /// shape transport. Current XLA compilation may impose stricter limits on dynamic tensors than this projection layer.
 #[derive(Clone, Debug, PartialEq, Eq)]
-pub(crate) struct XlaExecutableSignature {
+pub(crate) struct ExecutableSignature {
     /// Physical argument ordinal for each logical flattened input.
     input_mapping: Arc<[Option<usize>]>,
 
@@ -18,10 +18,10 @@ pub(crate) struct XlaExecutableSignature {
     output_mapping: Arc<[Option<usize>]>,
 
     /// Hidden scalar arguments that restore bounded dynamic dimensions on physicalized input tensors.
-    input_dimensions: Arc<[XlaInputDimension]>,
+    input_dimensions: Arc<[InputDimension]>,
 
     /// Hidden scalar results that report bounded dynamic logical output extents.
-    output_dimensions: Arc<[XlaOutputDimension]>,
+    output_dimensions: Arc<[OutputDimension]>,
 
     /// Whether the executable carries the ordered-I/O boundary token, i.e., whether the program contains
     /// `OrderedIo` or `DeviceOrderedIo` effects.
@@ -46,7 +46,7 @@ pub(crate) struct XlaExecutableSignature {
 
 /// One bounded dynamic input axis transported as a hidden scalar executable argument.
 #[derive(Copy, Clone, Debug, PartialEq, Eq)]
-pub(crate) struct XlaInputDimension {
+pub(crate) struct InputDimension {
     /// Logical flattened input containing the dynamic axis.
     logical_input_index: usize,
 
@@ -57,7 +57,7 @@ pub(crate) struct XlaInputDimension {
     physical_input_index: usize,
 }
 
-impl XlaInputDimension {
+impl InputDimension {
     /// Returns the logical flattened input containing this dynamic axis.
     #[inline]
     pub(crate) fn logical_input_index(self) -> usize {
@@ -79,7 +79,7 @@ impl XlaInputDimension {
 
 /// One bounded dynamic output axis transported as a hidden scalar executable result.
 #[derive(Copy, Clone, Debug, PartialEq, Eq)]
-pub(crate) struct XlaOutputDimension {
+pub(crate) struct OutputDimension {
     /// Logical flattened output containing the dynamic axis.
     logical_output_index: usize,
 
@@ -90,7 +90,7 @@ pub(crate) struct XlaOutputDimension {
     physical_output_index: usize,
 }
 
-impl XlaOutputDimension {
+impl OutputDimension {
     /// Returns the logical flattened output containing this dynamic axis.
     #[inline]
     pub(crate) fn logical_output_index(self) -> usize {
@@ -110,7 +110,7 @@ impl XlaOutputDimension {
     }
 }
 
-impl XlaExecutableSignature {
+impl ExecutableSignature {
     /// Derives the executable boundary mapping for the provided logical input and output types.
     pub(crate) fn new(input_types: &[ArrayType], output_types: &[ArrayType]) -> Self {
         fn mapping(types: &[ArrayType]) -> Arc<[Option<usize>]> {
@@ -134,7 +134,7 @@ impl XlaExecutableSignature {
         for (logical_input_index, input_type) in input_types.iter().enumerate() {
             for (axis, dimension) in input_type.shape().dimensions().iter().enumerate() {
                 if dimension.value().is_none() && dimension.upper_bound().is_some() {
-                    input_dimensions.push(XlaInputDimension { logical_input_index, axis, physical_input_index });
+                    input_dimensions.push(InputDimension { logical_input_index, axis, physical_input_index });
                     physical_input_index += 1;
                 }
             }
@@ -145,7 +145,7 @@ impl XlaExecutableSignature {
         for (logical_output_index, output_type) in output_types.iter().enumerate() {
             for (axis, dimension) in output_type.shape().dimensions().iter().enumerate() {
                 if dimension.value().is_none() && dimension.upper_bound().is_some() {
-                    output_dimensions.push(XlaOutputDimension { logical_output_index, axis, physical_output_index });
+                    output_dimensions.push(OutputDimension { logical_output_index, axis, physical_output_index });
                     physical_output_index += 1;
                 }
             }
@@ -252,13 +252,13 @@ impl XlaExecutableSignature {
 
     /// Returns hidden bounded-dimension scalar arguments in physical executable order.
     #[inline]
-    pub(crate) fn input_dimensions(&self) -> &[XlaInputDimension] {
+    pub(crate) fn input_dimensions(&self) -> &[InputDimension] {
         &self.input_dimensions
     }
 
     /// Returns hidden bounded dynamic-output extent results in physical executable order.
     #[inline]
-    pub(crate) fn output_dimensions(&self) -> &[XlaOutputDimension] {
+    pub(crate) fn output_dimensions(&self) -> &[OutputDimension] {
         &self.output_dimensions
     }
 
@@ -316,7 +316,7 @@ impl XlaExecutableSignature {
                     dimension
                         .upper_bound()
                         .and_then(|upper| upper.checked_sub(1))
-                        .map_or_else(|| dimension.clone(), Dimension::Static)
+                        .map_or_else(|| dimension.clone(), CoreDimension::Static)
                 })
                 .collect::<Vec<_>>();
             physical[physical_index] = physical[physical_index].clone().with_shape(Shape::new(dimensions));
@@ -392,16 +392,16 @@ mod tests {
 
     use crate::experimental::lowering::tests::dynamic_dimension;
     use crate::experimental::lowering::to_mlir_module_for_program;
-    use crate::experimental::ops::{FlatXlaProgram, XlaProgramBuilder as ArrayIrXlaProgramBuilder};
+    use crate::experimental::ops::{FlatProgram, ProgramBuilder as ArrayIrProgramBuilder};
 
     use super::*;
 
     #[test]
-    fn test_xla_executable_signature_erases_only_static_zero_space_leaves() {
-        let static_zero = ArrayType::new(DataType::Zero, Shape::new(vec![Dimension::Static(3)]));
+    fn test_executable_signature_erases_only_static_zero_space_leaves() {
+        let static_zero = ArrayType::new(DataType::Zero, Shape::new(vec![CoreDimension::Static(3)]));
         let dynamic_zero = ArrayType::new(DataType::Zero, Shape::new(vec![dynamic_dimension("dynamic_zero", Some(3))]));
-        let boolean = ArrayType::new(DataType::Boolean, Shape::new(vec![Dimension::Static(3)]));
-        let signature = XlaExecutableSignature::new(
+        let boolean = ArrayType::new(DataType::Boolean, Shape::new(vec![CoreDimension::Static(3)]));
+        let signature = ExecutableSignature::new(
             &[static_zero.clone(), boolean.clone(), dynamic_zero.clone()],
             &[dynamic_zero, static_zero],
         );
@@ -423,10 +423,10 @@ mod tests {
 
     #[test]
     fn test_to_mlir_module_for_program_erases_static_zero_space_boundary() {
-        let zero_type = ArrayType::new(DataType::Zero, Shape::new(vec![Dimension::Static(3)]));
-        let mut builder = ArrayIrXlaProgramBuilder::new();
+        let zero_type = ArrayType::new(DataType::Zero, Shape::new(vec![CoreDimension::Static(3)]));
+        let mut builder = ArrayIrProgramBuilder::new();
         let input = builder.add_input(zero_type.clone().into());
-        let program: FlatXlaProgram = builder.build(vec![input], vec![Placeholder], vec![Placeholder]).unwrap();
+        let program: FlatProgram = builder.build(vec![input], vec![Placeholder], vec![Placeholder]).unwrap();
 
         let stablehlo = to_mlir_module_for_program(&program, &[], &zero_type, &zero_type, "main", None, None).unwrap();
 
@@ -448,13 +448,13 @@ mod tests {
     fn test_to_mlir_module_for_program_preserves_effects_that_produce_an_erased_output() {
         use ryft_core::PrintOperation;
 
-        let zero_type = ArrayType::new(DataType::Zero, Shape::new(vec![Dimension::Static(3)]));
-        let mut builder = ArrayIrXlaProgramBuilder::new();
+        let zero_type = ArrayType::new(DataType::Zero, Shape::new(vec![CoreDimension::Static(3)]));
+        let mut builder = ArrayIrProgramBuilder::new();
         let input = builder.add_input(zero_type.clone().into());
         let output = builder
             .add_instruction(PrintOperation::<ArrayType>::new("zero"), Vec::new(), vec![input], None)
             .unwrap()[0];
-        let program: FlatXlaProgram = builder.build(vec![output], vec![Placeholder], vec![Placeholder]).unwrap();
+        let program: FlatProgram = builder.build(vec![output], vec![Placeholder], vec![Placeholder]).unwrap();
 
         let stablehlo = to_mlir_module_for_program(&program, &[], &zero_type, &zero_type, "main", None, None).unwrap();
 
@@ -466,9 +466,9 @@ mod tests {
     #[test]
     fn test_to_mlir_module_for_program_preserves_dynamic_zero_space_shape_carrier() {
         let zero_type = ArrayType::new(DataType::Zero, Shape::new(vec![dynamic_dimension("zero", Some(3))]));
-        let mut builder = ArrayIrXlaProgramBuilder::new();
+        let mut builder = ArrayIrProgramBuilder::new();
         let input = builder.add_input(zero_type.clone().into());
-        let program: FlatXlaProgram = builder.build(vec![input], vec![Placeholder], vec![Placeholder]).unwrap();
+        let program: FlatProgram = builder.build(vec![input], vec![Placeholder], vec![Placeholder]).unwrap();
 
         let stablehlo = to_mlir_module_for_program(&program, &[], &zero_type, &zero_type, "main", None, None).unwrap();
 
@@ -490,11 +490,11 @@ mod tests {
     #[test]
     fn test_to_mlir_module_for_program_isolates_bounded_dynamic_results_behind_one_barrier() {
         let dynamic_type = ArrayType::new(DataType::F32, Shape::new(vec![dynamic_dimension("count", Some(4))]));
-        let static_type = ArrayType::new(DataType::F32, Shape::new(vec![Dimension::Static(2)]));
-        let mut builder = ArrayIrXlaProgramBuilder::new();
+        let static_type = ArrayType::new(DataType::F32, Shape::new(vec![CoreDimension::Static(2)]));
+        let mut builder = ArrayIrProgramBuilder::new();
         let dynamic = builder.add_input(dynamic_type.clone().into());
         let r#static = builder.add_input(static_type.clone().into());
-        let program: FlatXlaProgram =
+        let program: FlatProgram =
             builder.build(vec![dynamic, r#static, dynamic], vec![Placeholder; 2], vec![Placeholder; 3]).unwrap();
 
         let stablehlo = to_mlir_module_for_program(

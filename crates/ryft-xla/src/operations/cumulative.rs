@@ -1,6 +1,7 @@
 use ryft_core::macros::check_count;
 use ryft_core::{
-    ArrayType, CUMULATIVE_OPERATION_NAME, CumulativeKind, CumulativeOperation, DataType, Dimension, ReductionKind,
+    ArrayType, CUMULATIVE_OPERATION_NAME, CumulativeKind, CumulativeOperation, DataType, Dimension as CoreDimension,
+    ReductionKind,
 };
 use ryft_mlir::dialects::{chlo, stable_hlo};
 use ryft_mlir::{
@@ -16,7 +17,7 @@ use crate::operations::exponential::lower_log_add_exp_to_mlir;
 use crate::operations::reductions::{
     build_reduce_body_region, build_reduction_identity_constant, lower_product_combiner_to_mlir,
 };
-use crate::{Error, LowerableOperation, LowerableOperationFamily, LoweringError, XlaLowerer};
+use crate::{Error, LowerableOperation, LowerableOperationFamily, Lowerer, LoweringError};
 
 /// Builds the scalar `tensor<{element_type}>` value seeding every window of a prefix scan's `reduce_window`, which is
 /// the identity of the combining operator selected by `kind`, so that the padded positions of a window cannot change
@@ -195,7 +196,7 @@ pub(crate) fn lower_cumulative_to_mlir<'b, 'c: 'b, 't: 'c>(
     // The scanned extent is static by construction: `ryft-core` type inference rejects a dynamic scanned axis, so a
     // dynamic extent here means the staged program bypassed that rule.
     let extent = match output_array_type.shape().dimensions().get(axis) {
-        Some(Dimension::Static(extent)) => *extent,
+        Some(CoreDimension::Static(extent)) => *extent,
         _ => {
             return Err(Error::Lowering(LoweringError::UnsupportedOperation {
                 operation: CUMULATIVE_OPERATION_NAME.to_string(),
@@ -301,7 +302,7 @@ pub(crate) fn lower_cumulative_to_mlir<'b, 'c: 'b, 't: 'c>(
 impl LowerableOperation for CumulativeOperation {
     fn lower<'b, 'c: 'b, 't: 'c, O: LowerableOperationFamily>(
         &self,
-        lowerer: &mut XlaLowerer<'b, 'c, 't, O>,
+        lowerer: &mut Lowerer<'b, 'c, 't, O>,
         input_values: &[ValueRef<'b, 'c, 't>],
         _input_types: &[ArrayType],
         output_types: &[ArrayType],
@@ -330,9 +331,9 @@ mod tests {
         ArrayOperation, CumulativeOperation, DimensionBounds, DimensionVariable, Instruction, Placeholder, Shape,
     };
 
-    use crate::experimental::lowering::tests::{XlaProgramBuilder, lowered_unary_module, unproject_plain_program};
+    use crate::experimental::lowering::tests::{ProgramBuilder, lowered_unary_module, unproject_plain_program};
     use crate::experimental::lowering::{lower_mlir_module_for_program, to_mlir_module_for_plain_program};
-    use crate::experimental::ops::XlaArrayConstant;
+    use crate::experimental::ops::ArrayConstant;
 
     use super::*;
 
@@ -576,8 +577,8 @@ mod tests {
         // which is why reaching the lowering's own guard takes an unchecked instruction whose output type carries a
         // dynamic scanned dimension. The diagnostic names the scan the caller wrote, not the shared window helper.
         let scanned = DimensionVariable::new("scanned", DimensionBounds::new(1, Some(5)).unwrap());
-        let dynamic_type = ArrayType::new(DataType::F32, Shape::new(vec![Dimension::Dynamic(scanned)]));
-        let mut builder = XlaProgramBuilder::new();
+        let dynamic_type = ArrayType::new(DataType::F32, Shape::new(vec![CoreDimension::Dynamic(scanned)]));
+        let mut builder = ProgramBuilder::new();
         let input = builder.add_input(dynamic_type.clone());
         let output = builder.add_variable(dynamic_type);
         builder.add_instruction_unchecked(Instruction::new(
@@ -587,7 +588,7 @@ mod tests {
             Vec::new(),
         ));
         let program = builder
-            .build::<Vec<XlaArrayConstant>, Vec<XlaArrayConstant>>(vec![output], vec![Placeholder], vec![Placeholder])
+            .build::<Vec<ArrayConstant>, Vec<ArrayConstant>>(vec![output], vec![Placeholder], vec![Placeholder])
             .unwrap();
         assert!(matches!(
             to_mlir_module_for_plain_program(&program, "main"),
@@ -603,17 +604,13 @@ mod tests {
         // `reduce_window` form.
         let lower = |operation: CumulativeOperation, target_platform: &str| {
             let input_type = ArrayType::new_static(DataType::F32, [2, 4]);
-            let mut builder = XlaProgramBuilder::new();
+            let mut builder = ProgramBuilder::new();
             let input = builder.add_input(input_type.clone());
             let output = builder
                 .add_instruction(ArrayOperation::Cumulative(operation), Vec::new(), vec![input], None)
                 .unwrap()[0];
             let program = builder
-                .build::<Vec<XlaArrayConstant>, Vec<XlaArrayConstant>>(
-                    vec![output],
-                    vec![Placeholder],
-                    vec![Placeholder],
-                )
+                .build::<Vec<ArrayConstant>, Vec<ArrayConstant>>(vec![output], vec![Placeholder], vec![Placeholder])
                 .unwrap();
             let types = vec![input_type];
             let program = unproject_plain_program(program);
@@ -665,17 +662,13 @@ mod tests {
     fn test_lower_cumulative_one_bit_sum_on_gpu() {
         for data_type in [DataType::I1, DataType::U1] {
             let input_type = ArrayType::new_static(data_type, [2, 4]);
-            let mut builder = XlaProgramBuilder::new();
+            let mut builder = ProgramBuilder::new();
             let input = builder.add_input(input_type.clone());
             let output = builder
                 .add_instruction(CumulativeOperation::new(1, CumulativeKind::Sum), Vec::new(), vec![input], None)
                 .unwrap()[0];
             let program = builder
-                .build::<Vec<XlaArrayConstant>, Vec<XlaArrayConstant>>(
-                    vec![output],
-                    vec![Placeholder],
-                    vec![Placeholder],
-                )
+                .build::<Vec<ArrayConstant>, Vec<ArrayConstant>>(vec![output], vec![Placeholder], vec![Placeholder])
                 .unwrap();
             let program = unproject_plain_program(program);
             let types = vec![input_type];
@@ -740,8 +733,8 @@ mod tests {
     fn test_to_mlir_module_for_plain_program_cumulative_log_sum_exp_identities() {
         // Invalid unchecked programs still cannot seed a fold with a non-identity value.
         for element_type in [DataType::F8E8M0FNU, DataType::F6E2M3FN] {
-            let array_type = ArrayType::new(element_type, Shape::new(vec![Dimension::Static(4)]));
-            let mut builder = XlaProgramBuilder::new();
+            let array_type = ArrayType::new(element_type, Shape::new(vec![CoreDimension::Static(4)]));
+            let mut builder = ProgramBuilder::new();
             let input = builder.add_input(array_type.clone());
             let output = builder.add_variable(array_type);
             builder.add_instruction_unchecked(Instruction::new(
@@ -751,11 +744,7 @@ mod tests {
                 Vec::new(),
             ));
             let program = builder
-                .build::<Vec<XlaArrayConstant>, Vec<XlaArrayConstant>>(
-                    vec![output],
-                    vec![Placeholder],
-                    vec![Placeholder],
-                )
+                .build::<Vec<ArrayConstant>, Vec<ArrayConstant>>(vec![output], vec![Placeholder], vec![Placeholder])
                 .unwrap();
             assert!(matches!(
                 to_mlir_module_for_plain_program(&program, "main"),
@@ -793,9 +782,9 @@ mod tests {
         // a dynamic unscanned axis whole, so the whole derivative program lowers for every nonlinear kind.
         let batch = DimensionVariable::new("batch", DimensionBounds::new(1, Some(5)).unwrap());
         let input_type =
-            ArrayType::new(DataType::F32, Shape::new(vec![Dimension::Dynamic(batch), Dimension::Static(4)]));
+            ArrayType::new(DataType::F32, Shape::new(vec![CoreDimension::Dynamic(batch), CoreDimension::Static(4)]));
         for kind in [CumulativeKind::Product, CumulativeKind::Max, CumulativeKind::Min, CumulativeKind::LogSumExp] {
-            let mut builder = XlaProgramBuilder::new();
+            let mut builder = ProgramBuilder::new();
             let input = builder.add_input(input_type.clone());
             let output = builder
                 .add_instruction(
@@ -806,11 +795,7 @@ mod tests {
                 )
                 .unwrap()[0];
             let program = builder
-                .build::<Vec<XlaArrayConstant>, Vec<XlaArrayConstant>>(
-                    vec![output],
-                    vec![Placeholder],
-                    vec![Placeholder],
-                )
+                .build::<Vec<ArrayConstant>, Vec<ArrayConstant>>(vec![output], vec![Placeholder], vec![Placeholder])
                 .unwrap();
             let jvp = program.jvp().unwrap();
             assert!(to_mlir_module_for_plain_program(&jvp, "main").is_ok(), "{kind}");

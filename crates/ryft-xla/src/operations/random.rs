@@ -1,7 +1,8 @@
 use ryft_core::macros::check_count;
 use ryft_core::{
-    ArrayIrType, ArrayType, DROPOUT_OPERATION_NAME, DataType, Dimension, DropoutOperation, Operation, ProgramError,
-    RNG_BIT_GENERATOR_OPERATION_NAME, RandomAlgorithm, RngBitGeneratorOperation,
+    ArrayIrType, ArrayType, DROPOUT_OPERATION_NAME, DataType, Dimension as CoreDimension, DropoutOperation,
+    Operation as CoreOperation, ProgramError, RNG_BIT_GENERATOR_OPERATION_NAME, RandomAlgorithm,
+    RngBitGeneratorOperation,
 };
 use ryft_mlir::dialects::stable_hlo;
 use ryft_mlir::{
@@ -10,7 +11,7 @@ use ryft_mlir::{
 
 use crate::experimental::lowering::types::{lower_f64_constant_splat, lower_tensor_type};
 use crate::operations::assertions::lower_output_extent_validation;
-use crate::{Error, LowerableOperation, LowerableOperationFamily, LoweringError, XlaLowerer};
+use crate::{Error, LowerableOperation, LowerableOperationFamily, Lowerer, LoweringError};
 
 /// Lowers one traced random bit generation with `algorithm` to a `stablehlo.rng_bit_generator` that produces bits of
 /// type `bits_type`, mapping the algorithm to the corresponding StableHLO algorithm attribute. The two results are the
@@ -41,7 +42,7 @@ pub(crate) fn lower_rng_bit_generator_to_mlir<'b, 'c: 'b, 't: 'c>(
 impl LowerableOperation for RngBitGeneratorOperation<ArrayType> {
     fn lower<'b, 'c: 'b, 't: 'c, O: LowerableOperationFamily>(
         &self,
-        lowerer: &mut XlaLowerer<'b, 'c, 't, O>,
+        lowerer: &mut Lowerer<'b, 'c, 't, O>,
         input_values: &[ValueRef<'b, 'c, 't>],
         _input_types: &[ArrayType],
         _output_types: &[ArrayType],
@@ -60,7 +61,7 @@ impl LowerableOperation for RngBitGeneratorOperation<ArrayType> {
 impl LowerableOperation for RngBitGeneratorOperation<ArrayIrType> {
     fn lower<'b, 'c: 'b, 't: 'c, O: LowerableOperationFamily>(
         &self,
-        lowerer: &mut XlaLowerer<'b, 'c, 't, O>,
+        lowerer: &mut Lowerer<'b, 'c, 't, O>,
         input_values: &[ValueRef<'b, 'c, 't>],
         input_types: &[ArrayIrType],
         output_types: &[ArrayIrType],
@@ -89,7 +90,7 @@ impl LowerableOperation for RngBitGeneratorOperation<ArrayIrType> {
             .shape()
             .dimensions()
             .iter()
-            .filter(|dimension| matches!(dimension, Dimension::Dynamic(_)))
+            .filter(|dimension| matches!(dimension, CoreDimension::Dynamic(_)))
             .count();
         check_count!("input", input_values, expected_input_count, ProgramError);
         check_count!("input", input_types, expected_input_count, ProgramError);
@@ -111,7 +112,7 @@ impl LowerableOperation for RngBitGeneratorOperation<ArrayIrType> {
 impl LowerableOperation for DropoutOperation {
     fn lower<'b, 'c: 'b, 't: 'c, O: LowerableOperationFamily>(
         &self,
-        lowerer: &mut XlaLowerer<'b, 'c, 't, O>,
+        lowerer: &mut Lowerer<'b, 'c, 't, O>,
         input_values: &[ValueRef<'b, 'c, 't>],
         input_types: &[ArrayType],
         output_types: &[ArrayType],
@@ -231,14 +232,14 @@ mod tests {
     use indoc::indoc;
     use pretty_assertions::assert_eq;
     use ryft_core::{
-        Array, ArrayType, Axes, ConvertElementTypeOperation, DataType, Dimension, Dropout, DropoutOperation,
-        Placeholder, Shape, TypedProgram, ZeroOperation,
+        Array as CoreArray, ArrayType, Axes, ConvertElementTypeOperation, DataType, Dimension as CoreDimension,
+        Dropout, DropoutOperation, Placeholder, Shape, TypedProgram, ZeroOperation,
     };
 
     use crate::experimental::lowering::tests::{
-        MixedValue, XlaProgramBuilder, execute_mixed_program, unproject_plain_program,
+        MixedValue, ProgramBuilder, execute_mixed_program, unproject_plain_program,
     };
-    use crate::experimental::ops::{XlaArrayConstant, XlaConstant, XlaProgramBuilder as ArrayIrXlaProgramBuilder};
+    use crate::experimental::ops::{ArrayConstant, Constant, ProgramBuilder as ArrayIrProgramBuilder};
     use crate::tests::execution_client;
     use crate::to_mlir_module_for_program;
 
@@ -246,9 +247,9 @@ mod tests {
     fn test_to_mlir_module_for_program_lowers_rng_bit_generator() {
         use ryft_core::{RandomAlgorithm, RngBitGeneratorOperation};
 
-        let state_type = ArrayType::new(DataType::U64, Shape::new(vec![Dimension::Static(2)]));
-        let bits_type = ArrayType::new(DataType::U32, Shape::new(vec![Dimension::Static(4)]));
-        let mut builder = XlaProgramBuilder::new();
+        let state_type = ArrayType::new(DataType::U64, Shape::new(vec![CoreDimension::Static(2)]));
+        let bits_type = ArrayType::new(DataType::U32, Shape::new(vec![CoreDimension::Static(4)]));
+        let mut builder = ProgramBuilder::new();
         let state = builder.add_input(state_type.clone());
         let outputs = builder
             .add_instruction(
@@ -260,7 +261,7 @@ mod tests {
             .unwrap()
             .to_vec();
         let program = builder
-            .build::<Vec<XlaArrayConstant>, Vec<XlaArrayConstant>>(outputs, vec![Placeholder], vec![Placeholder; 2])
+            .build::<Vec<ArrayConstant>, Vec<ArrayConstant>>(outputs, vec![Placeholder], vec![Placeholder; 2])
             .unwrap();
         let program = unproject_plain_program(program);
         let input_types = vec![state_type.clone()];
@@ -288,20 +289,20 @@ mod tests {
             RngBitGeneratorOperation,
         };
 
-        use crate::experimental::ops::{XlaConstant, XlaOperation, XlaProgramBuilder as ArrayIrXlaProgramBuilder};
+        use crate::experimental::ops::{Constant, Operation, ProgramBuilder as ArrayIrProgramBuilder};
 
         // An exact extent refines the declared dynamic bits axis to a static one, so the generator lowers at that
         // static shape and its redundant extent operand does not reach `stablehlo.rng_bit_generator`.
         let extent = DimensionVariable::new("extent", DimensionBounds::new(1, Some(9)).unwrap());
-        let bits_type = ArrayType::new(DataType::U32, Shape::new(vec![Dimension::Dynamic(extent.clone())]));
+        let bits_type = ArrayType::new(DataType::U32, Shape::new(vec![CoreDimension::Dynamic(extent.clone())]));
         let state_type = RandomAlgorithm::ThreeFry.state_type();
-        let mut builder = ArrayIrXlaProgramBuilder::new();
+        let mut builder = ArrayIrProgramBuilder::new();
         let state = builder.add_input(state_type.clone().into());
         let extent =
-            builder.add_constant(XlaConstant::Dimension(DimensionValue::new(DimensionType::from(extent), 3).unwrap()));
+            builder.add_constant(Constant::Dimension(DimensionValue::new(DimensionType::from(extent), 3).unwrap()));
         let outputs = builder
             .add_instruction(
-                XlaOperation::RngBitGenerator(RngBitGeneratorOperation::new(RandomAlgorithm::ThreeFry, bits_type)),
+                Operation::RngBitGenerator(RngBitGeneratorOperation::new(RandomAlgorithm::ThreeFry, bits_type)),
                 Vec::new(),
                 vec![state, extent],
                 None,
@@ -309,7 +310,7 @@ mod tests {
             .unwrap()
             .to_vec();
         let program = builder
-            .build::<Vec<XlaConstant>, Vec<XlaConstant>>(outputs, vec![Placeholder], vec![Placeholder; 2])
+            .build::<Vec<Constant>, Vec<Constant>>(outputs, vec![Placeholder], vec![Placeholder; 2])
             .unwrap();
         let bits_type = ArrayType::new_static(DataType::U32, [3]);
         assert_eq!(program.output_types()[1], ArrayIrType::Array(bits_type.clone()));
@@ -338,7 +339,7 @@ mod tests {
         };
 
         use crate::experimental::lowering::tests::{MixedValue, execute_mixed_program};
-        use crate::experimental::ops::{XlaConstant, XlaOperation, XlaProgramBuilder as ArrayIrXlaProgramBuilder};
+        use crate::experimental::ops::{Constant, Operation, ProgramBuilder as ArrayIrProgramBuilder};
         use crate::operations::assertions::ensure_assertion_handler_registered;
         use crate::tests::execution_client;
 
@@ -346,9 +347,9 @@ mod tests {
         // The two generators cover both operand orders and consume the same state, so they produce the same bits.
         let size = DimensionVariable::new("size", DimensionBounds::new(0, Some(9)).unwrap());
         let bits_type = ArrayType::new(DataType::U32, Shape::new(vec![size.clone().into(), size.clone().into()]));
-        let mut builder = ArrayIrXlaProgramBuilder::new();
+        let mut builder = ArrayIrProgramBuilder::new();
         let symbolic = builder.add_input(DimensionType::from(size).into());
-        let exact = builder.add_constant(XlaConstant::Dimension(DimensionValue::constant(3).unwrap()));
+        let exact = builder.add_constant(Constant::Dimension(DimensionValue::constant(3).unwrap()));
         let state = builder
             .add_instruction(ZeroOperation::new(RandomAlgorithm::ThreeFry.state_type()), Vec::new(), Vec::new(), None)
             .unwrap()[0];
@@ -356,7 +357,7 @@ mod tests {
         for inputs in [vec![state, symbolic, exact], vec![state, exact, symbolic]] {
             let bits = builder
                 .add_instruction(
-                    XlaOperation::RngBitGenerator(RngBitGeneratorOperation::new(
+                    Operation::RngBitGenerator(RngBitGeneratorOperation::new(
                         RandomAlgorithm::ThreeFry,
                         bits_type.clone(),
                     )),
@@ -377,7 +378,7 @@ mod tests {
             );
         }
         let program = builder
-            .build::<Vec<XlaConstant>, Vec<XlaConstant>>(outputs, vec![Placeholder], vec![Placeholder; 2])
+            .build::<Vec<Constant>, Vec<Constant>>(outputs, vec![Placeholder], vec![Placeholder; 2])
             .unwrap();
         let module = to_mlir_module_for_program(
             &program,
@@ -442,8 +443,8 @@ mod tests {
         use ryft_mlir::{Block, Context as MlirContext, Location, Value as MlirValue};
 
         use crate::experimental::lowering::types::lower_tensor_type;
-        use crate::experimental::ops::XlaOperation;
-        use crate::{Error, LowerableOperation, XlaLowerer};
+        use crate::experimental::ops::Operation;
+        use crate::{Error, LowerableOperation, Lowerer};
 
         // Input types are validated before they are split into the state type and the extent operand types.
         let extent = DimensionVariable::new("extent", DimensionBounds::new(1, Some(9)).unwrap());
@@ -459,8 +460,7 @@ mod tests {
             (lower_tensor_type(&ArrayType::scalar(DataType::I64), &context, location).unwrap(), location),
         ]);
         let inputs = vec![block.argument(0).unwrap().as_ref(), block.argument(1).unwrap().as_ref()];
-        let mut lowerer: XlaLowerer<'_, '_, '_, XlaOperation> =
-            XlaLowerer::new(block.as_ref(), &context, location.as_ref());
+        let mut lowerer: Lowerer<'_, '_, '_, Operation> = Lowerer::new(block.as_ref(), &context, location.as_ref());
         let output_types = vec![state_type.into(), ArrayType::new_static(DataType::U32, [3]).into()];
         assert!(matches!(
             operation.lower(&mut lowerer, &inputs, &[], &output_types),
@@ -474,7 +474,7 @@ mod tests {
         // threshold, and broadcast to the input shape before it selects between the scaled input and zero.
         let input_type = ArrayType::new_static(DataType::F32, [2, 3]);
         let state_type = ryft_core::RandomAlgorithm::Philox.state_type();
-        let mut builder = XlaProgramBuilder::new();
+        let mut builder = ProgramBuilder::new();
         let input = builder.add_input(input_type.clone());
         let state = builder.add_input(state_type.clone());
         let outputs = builder
@@ -482,7 +482,7 @@ mod tests {
             .unwrap()
             .to_vec();
         let program = builder
-            .build::<Vec<XlaArrayConstant>, Vec<XlaArrayConstant>>(outputs, vec![Placeholder; 2], vec![Placeholder; 2])
+            .build::<Vec<ArrayConstant>, Vec<ArrayConstant>>(outputs, vec![Placeholder; 2], vec![Placeholder; 2])
             .unwrap();
         let program = unproject_plain_program(program);
         let input_types = vec![input_type.clone(), state_type.clone()];
@@ -514,14 +514,14 @@ mod tests {
         // Without a state, the mask is drawn from the fixed all-zero ThreeFry state, and complex scales and zeros
         // combine real parts with zero imaginary parts.
         let input_type = ArrayType::new_static(DataType::C64, [4]);
-        let mut builder = XlaProgramBuilder::new();
+        let mut builder = ProgramBuilder::new();
         let input = builder.add_input(input_type.clone());
         let outputs = builder
             .add_instruction(DropoutOperation::new(0.5, Axes::default()), Vec::new(), vec![input], None)
             .unwrap()
             .to_vec();
         let program = builder
-            .build::<Vec<XlaArrayConstant>, Vec<XlaArrayConstant>>(outputs, vec![Placeholder], vec![Placeholder])
+            .build::<Vec<ArrayConstant>, Vec<ArrayConstant>>(outputs, vec![Placeholder], vec![Placeholder])
             .unwrap();
         let program = unproject_plain_program(program);
         let types = vec![input_type];
@@ -560,7 +560,7 @@ mod tests {
         let input_type = ArrayType::new_static(DataType::F64, [4, 8]);
         let state_type = ryft_core::RandomAlgorithm::Philox.state_type();
         let values = (0..32).map(|value| f64::from(value) - 7.5).collect::<Vec<_>>();
-        let mut builder = ArrayIrXlaProgramBuilder::new();
+        let mut builder = ArrayIrProgramBuilder::new();
         let input = builder.add_input(input_type.clone().into());
         let odd_input = builder.add_input(ArrayType::new_static(DataType::F64, [3, 5]).into());
         let state = builder
@@ -584,21 +584,21 @@ mod tests {
             .add_instruction(DropoutOperation::new(0.5, Axes::default()), Vec::new(), vec![odd_input], None)
             .unwrap()[0];
         let program = builder
-            .build::<Vec<XlaConstant>, Vec<XlaConstant>>(
+            .build::<Vec<Constant>, Vec<Constant>>(
                 vec![outputs[0], advanced_state, broadcast, odd],
                 vec![Placeholder; 2],
                 vec![Placeholder; 4],
             )
             .unwrap();
         let odd_values = (0..15).map(|value| f64::from(value) + 0.5).collect::<Vec<_>>();
-        let odd_output = Array::from_elements(ArrayType::new_static(DataType::F64, [3, 5]), &odd_values)
+        let odd_output = CoreArray::from_elements(ArrayType::new_static(DataType::F64, [3, 5]), &odd_values)
             .unwrap()
             .dropout(0.5, None)
             .unwrap()
             .0;
-        let input = Array::from_elements(input_type, &values).unwrap();
+        let input = CoreArray::from_elements(input_type, &values).unwrap();
         let (output, advanced_state) =
-            input.dropout(0.5, Some(&Array::from_elements(state_type, &[0u64; 3]).unwrap())).unwrap();
+            input.dropout(0.5, Some(&CoreArray::from_elements(state_type, &[0u64; 3]).unwrap())).unwrap();
         let (broadcast, _) = input.dropout_with_broadcast_axes(0.25, [0], None).unwrap();
         let advanced_state =
             advanced_state.unwrap().elements::<u64>().unwrap().into_iter().map(|value| value as f64).collect();

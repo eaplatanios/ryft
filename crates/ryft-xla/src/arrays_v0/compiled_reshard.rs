@@ -5,9 +5,9 @@ use ryft_pjrt::extensions::cross_host_transfers::{CrossHostTransferKey, GlobalDe
 use ryft_pjrt::{Buffer, DeviceId};
 
 use crate::arrays_v0::transfers::{cross_host_global_device_id, exact_shard_transfer_key};
-use crate::{ArrayError, Error, ToPjrt, XlaArray, XlaDomain, XlaOptions};
+use crate::{Array, ArrayError, Domain, Error, Options, ToPjrt};
 
-/// Performs the compiled-XLA resharding path for [`XlaArray::to_placement`](crate::XlaArray::to_placement).
+/// Performs the compiled-XLA resharding path for [`Array::to_placement`](crate::Array::to_placement).
 ///
 /// This is the `ryft` analogue of how JAX's `jax.device_put(arr, new_sharding)` lowers a reshard
 /// of a committed `jax.Array`: an `identity(x) = x` program annotated with input and output
@@ -40,34 +40,34 @@ use crate::{ArrayError, Error, ToPjrt, XlaArray, XlaDomain, XlaOptions};
 ///
 /// # Parameters
 ///
-///   - `source`: [`XlaArray`] to reshard.
-///   - `engine`: [`XlaDomain`] providing the PJRT client and the compile-program cache.
+///   - `source`: [`Array`] to reshard.
+///   - `engine`: [`Domain`] providing the PJRT client and the compile-program cache.
 ///   - `dst_mesh`: Destination [`DeviceMesh`].
 ///   - `dst_sharding`: Destination [`Sharding`].
 pub(crate) fn reshard<'o>(
-    source: &XlaArray<'o>,
-    engine: &XlaDomain<'o>,
+    source: &Array<'o>,
+    engine: &Domain<'o>,
     dst_mesh: &DeviceMesh,
     dst_sharding: &Sharding,
-) -> Result<XlaArray<'o>, Error> {
+) -> Result<Array<'o>, Error> {
     reshard_with_donation(source, engine, dst_mesh, dst_sharding, false)
 }
 
 /// Same as [`reshard`] but allows the caller to opt into donating the source array's input
 /// buffers to the compiled SPMD program. With `donate=true`, PJRT may reuse the source's
 /// device-side memory for output buffers; the caller must guarantee the source is not read again
-/// after this call. [`XlaArray::into_placement`](crate::XlaArray::into_placement) sets `donate=true`
+/// after this call. [`Array::into_placement`](crate::Array::into_placement) sets `donate=true`
 /// because it consumes its `self`.
 pub(crate) fn reshard_with_donation<'o>(
-    source: &XlaArray<'o>,
-    engine: &XlaDomain<'o>,
+    source: &Array<'o>,
+    engine: &Domain<'o>,
     dst_mesh: &DeviceMesh,
     dst_sharding: &Sharding,
     donate: bool,
-) -> Result<XlaArray<'o>, Error> {
+) -> Result<Array<'o>, Error> {
     if source.data_type().is_zero() {
         let r#type = source.r#type().into_owned().with_sharding(dst_sharding.clone())?;
-        let mut output = XlaArray::from_zero_space(engine, r#type, dst_mesh.clone())?;
+        let mut output = Array::from_zero_space(engine, r#type, dst_mesh.clone())?;
         if let Some(fence) = source.execution_fence() {
             output = output.with_execution_fence(fence.clone());
         }
@@ -111,22 +111,22 @@ pub(crate) fn reshard_with_donation<'o>(
 /// The compilation cache is keyed by the complete lowered computation, including its input/output sharding
 /// annotations and PJRT options.
 fn try_same_mesh<'o>(
-    source: &XlaArray<'o>,
-    engine: &XlaDomain<'o>,
+    source: &Array<'o>,
+    engine: &Domain<'o>,
     dst_mesh: &DeviceMesh,
     dst_sharding: &Sharding,
     donate: bool,
-) -> Result<XlaArray<'o>, Error> {
+) -> Result<Array<'o>, Error> {
     let element_type = source.data_type();
     let shape = source.shape();
     let src_sharding = source.sharding().clone();
     let dst_sharding = dst_sharding.clone();
 
     // Build the bare input type for tracing (no sharding); the in/out shardings are attached as
-    // `sdy.sharding` attributes via `XlaOptions::{input_shardings, output_shardings}`.
+    // `sdy.sharding` attributes via `Options::{input_shardings, output_shardings}`.
     let bare_input_type = ArrayType::new(element_type, shape.clone().into());
 
-    let xla_options = XlaOptions {
+    let options = Options {
         kernel_compiler: None,
         mesh: dst_mesh.clone(),
         input_shardings: Some(vec![src_sharding.clone()]),
@@ -137,8 +137,8 @@ fn try_same_mesh<'o>(
         ragged_dot_lowering_strategy: Default::default(),
     };
 
-    let staged: crate::jit::StagedXlaFunction<'_, ArrayType, ArrayType> =
-        crate::jit::stage(|input| input, bare_input_type, xla_options)?;
+    let staged: crate::jit::StagedFunction<'_, ArrayType, ArrayType> =
+        crate::jit::stage(|input| input, bare_input_type, options)?;
     let compiled = engine.compile_staged_function(staged)?;
     engine.interpret(&compiled.executable_function(), source.clone())
 }
@@ -146,11 +146,11 @@ fn try_same_mesh<'o>(
 /// Broadcasts a fully-replicated `source` onto every device in `dst_mesh` via intra-host D2D
 /// copies, then defers to [`try_same_mesh`] to perform the on-`dst_mesh` reshard.
 fn try_replicated_cross_mesh<'o>(
-    source: &XlaArray<'o>,
-    engine: &XlaDomain<'o>,
+    source: &Array<'o>,
+    engine: &Domain<'o>,
     dst_mesh: &DeviceMesh,
     dst_sharding: &Sharding,
-) -> Result<XlaArray<'o>, Error> {
+) -> Result<Array<'o>, Error> {
     let client = engine.client();
     let client_process_index = client.process_index()?;
     let addressable_devices = client.addressable_devices()?;
@@ -273,7 +273,7 @@ fn try_replicated_cross_mesh<'o>(
     let element_type = source.data_type();
     let replicated_on_dst = Sharding::replicated(dst_mesh.logical_mesh().clone(), shape.rank());
     let intermediate_type = ArrayType::new(element_type, shape.into()).with_sharding(replicated_on_dst)?;
-    let intermediate = XlaArray::from_addressable_buffers(engine, intermediate_type, dst_mesh.clone(), buffers)?;
+    let intermediate = Array::from_addressable_buffers(engine, intermediate_type, dst_mesh.clone(), buffers)?;
 
     // The intermediate is owned exclusively by this function and is never observed by callers.
     // Donating its buffers lets PJRT reuse their memory for the output of the final SPMD reshard.
@@ -292,12 +292,12 @@ fn try_replicated_cross_mesh<'o>(
 /// Both compiled programs go through `cache`'s LRU, so repeated calls with the same input/output
 /// shardings pay the compile cost once.
 fn try_sharded_cross_mesh<'o>(
-    source: &XlaArray<'o>,
-    engine: &XlaDomain<'o>,
+    source: &Array<'o>,
+    engine: &Domain<'o>,
     src_mesh: &DeviceMesh,
     dst_mesh: &DeviceMesh,
     dst_sharding: &Sharding,
-) -> Result<XlaArray<'o>, Error> {
+) -> Result<Array<'o>, Error> {
     let shape = source.shape();
     let replicated_on_src = Sharding::replicated(src_mesh.logical_mesh().clone(), shape.rank());
     // Source is owned externally, so we do not donate it during the all-gather. The gathered

@@ -1,5 +1,5 @@
 use ryft_core::macros::check_count;
-use ryft_core::{ArrayType, Dimension};
+use ryft_core::{ArrayType, Dimension as CoreDimension};
 use ryft_mlir::dialects::stable_hlo;
 use ryft_mlir::dialects::stable_hlo::Accuracy;
 use ryft_mlir::{
@@ -165,7 +165,7 @@ where
         .shape()
         .dimensions()
         .iter()
-        .filter(|dimension| matches!(dimension, Dimension::Dynamic(_)))
+        .filter(|dimension| matches!(dimension, CoreDimension::Dynamic(_)))
         .count()
         > 1;
     let mut inputs = [input_values[0], input_values[1]];
@@ -225,23 +225,27 @@ mod tests {
         OrOperation, Placeholder, SelectOperation, Shape, SinOperation, TypedProgram, XorOperation,
     };
 
-    use crate::experimental::lowering::tests::{PlainXlaProgram, XlaProgramBuilder, lowered_unary_module};
+    use crate::experimental::lowering::tests::{PlainProgram, ProgramBuilder, lowered_unary_module};
     use crate::experimental::lowering::to_mlir_module_for_plain_program;
-    use crate::experimental::ops::{XlaArrayConstant, XlaConstant, XlaOperation};
+    use crate::experimental::ops::{ArrayConstant, Constant, Operation};
     use crate::to_mlir_module_for_program;
 
     use super::*;
 
-    fn xla_elementwise_normalization_program() -> PlainXlaProgram {
-        let mut builder = XlaProgramBuilder::new();
+    fn elementwise_normalization_program() -> PlainProgram {
+        let mut builder = ProgramBuilder::new();
         let scalar = builder.add_input(ArrayType::scalar(DataType::F32));
-        let left = builder
-            .add_input(ArrayType::new(DataType::F32, Shape::new(vec![Dimension::Static(3), Dimension::Static(1)])));
-        let right = builder
-            .add_input(ArrayType::new(DataType::F64, Shape::new(vec![Dimension::Static(1), Dimension::Static(4)])));
+        let left = builder.add_input(ArrayType::new(
+            DataType::F32,
+            Shape::new(vec![CoreDimension::Static(3), CoreDimension::Static(1)]),
+        ));
+        let right = builder.add_input(ArrayType::new(
+            DataType::F64,
+            Shape::new(vec![CoreDimension::Static(1), CoreDimension::Static(4)]),
+        ));
         let condition = builder.add_input(ArrayType::scalar(DataType::Boolean));
         let boolean_vector =
-            builder.add_input(ArrayType::new(DataType::Boolean, Shape::new(vec![Dimension::Static(4)])));
+            builder.add_input(ArrayType::new(DataType::Boolean, Shape::new(vec![CoreDimension::Static(4)])));
         let divide = builder.add_instruction(DivOperation::new(), Vec::new(), vec![left, right], None).unwrap()[0];
         let atan2 = builder.add_instruction(Atan2Operation::new(), Vec::new(), vec![right, left], None).unwrap()[0];
         let compare = builder
@@ -265,7 +269,7 @@ mod tests {
             .add_instruction(XorOperation::new(), Vec::new(), vec![condition, boolean_vector], None)
             .unwrap()[0];
         builder
-            .build::<Vec<XlaArrayConstant>, Vec<XlaArrayConstant>>(
+            .build::<Vec<ArrayConstant>, Vec<ArrayConstant>>(
                 vec![divide, atan2, compare, select, and, or, xor],
                 vec![Placeholder; 5],
                 vec![Placeholder; 7],
@@ -285,17 +289,17 @@ mod tests {
 
     #[test]
     fn test_plain_elementwise_lowering_normalizes_all_implicit_operands() {
-        let program = xla_elementwise_normalization_program();
+        let program = elementwise_normalization_program();
         let stablehlo = to_mlir_module_for_plain_program(&program, "main").unwrap();
         assert_elementwise_operands_are_normalized(&stablehlo);
     }
 
     #[test]
     fn test_traced_elementwise_lowering_normalizes_all_implicit_operands() {
-        let plain_program = xla_elementwise_normalization_program();
+        let plain_program = elementwise_normalization_program();
         let input_types = plain_program.input_types().into_owned();
         let output_types = plain_program.output_types().into_owned();
-        let program = plain_program.into_unprojected::<XlaConstant, XlaOperation>().unwrap();
+        let program = plain_program.into_unprojected::<Constant, Operation>().unwrap();
         let stablehlo =
             to_mlir_module_for_program(&program, &[], &input_types, &output_types, "main", None, None).unwrap();
         assert_elementwise_operands_are_normalized(&stablehlo);
@@ -303,12 +307,12 @@ mod tests {
 
     #[test]
     fn test_elementwise_lowering_normalizes_zero_sized_operands() {
-        let mut builder = XlaProgramBuilder::new();
+        let mut builder = ProgramBuilder::new();
         let scalar = builder.add_input(ArrayType::scalar(DataType::F32));
-        let empty = builder.add_input(ArrayType::new(DataType::F64, Shape::new(vec![Dimension::Static(0)])));
+        let empty = builder.add_input(ArrayType::new(DataType::F64, Shape::new(vec![CoreDimension::Static(0)])));
         let output = builder.add_instruction(DivOperation::new(), Vec::new(), vec![scalar, empty], None).unwrap()[0];
         let program = builder
-            .build::<Vec<XlaArrayConstant>, Vec<XlaArrayConstant>>(
+            .build::<Vec<ArrayConstant>, Vec<ArrayConstant>>(
                 vec![output],
                 vec![Placeholder, Placeholder],
                 vec![Placeholder],

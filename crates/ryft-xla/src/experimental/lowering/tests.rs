@@ -3,20 +3,21 @@ use std::sync::Arc;
 use indoc::indoc;
 use pretty_assertions::assert_eq;
 use ryft_core::{
-    AddOperation, AtomId, CaptureReference, CastOperation, ConditionOperation, Context, Cos, Differentiate, Dimension,
-    DimensionBounds, DimensionType, DimensionValue, DimensionVariable, Dot, DotDimensionNumbers, EagerContext,
-    EffectClasses, MeshAxis, MeshAxisType, NegOperation, OneLike, ParameterizedFamily, Placeholder, Program,
-    ProgramBuilder, ProvenanceScope, ReduceOperation, ReductionKind, ReshapeOperation, ReverseModeDifferentiate,
-    ShardMap, ShardMapContext, ShardMapOptions, Sin, Transpose, TypedProgram, ZeroLike,
+    AddOperation, Array as CoreArray, AtomId, CaptureReference, CastOperation, ConditionOperation, Context, Cos,
+    Differentiate, Dimension as CoreDimension, DimensionBounds, DimensionType, DimensionValue, DimensionVariable, Dot,
+    DotDimensionNumbers, EagerContext, EffectClasses, MeshAxis, MeshAxisType, NegOperation, OneLike,
+    ParameterizedFamily, Placeholder, Program as CoreProgram, ProgramBuilder as CoreProgramBuilder, ProvenanceScope,
+    ReduceOperation, ReductionKind, ReshapeOperation, ReverseModeDifferentiate, ShardMap, ShardMapContext,
+    ShardMapOptions, Sin, Transpose, TypedProgram, ZeroLike,
 };
 use ryft_mlir::{Attribute, Operation as MlirOperation, Region, Size as MlirSize};
 use ryft_pjrt::{BufferType, ExecutionDeviceInputs, ExecutionInput, Program as PjrtProgram};
 
-use crate::experimental::domains::XlaDomain;
+use crate::Domain;
 use crate::experimental::lowering::LoweringError;
 use crate::experimental::lowering::types::lower_array_ir_type;
-use crate::experimental::ops::{FlatXlaProgram, XlaProgramBuilder as ArrayIrXlaProgramBuilder};
-use crate::experimental::tracing::{TracedXlaProgram, XlaArrayTracer, trace_with_context};
+use crate::experimental::ops::{FlatProgram, ProgramBuilder as ArrayIrProgramBuilder};
+use crate::experimental::tracing::{ArrayTracer, TracedProgram, trace_with_context};
 use crate::operations::assertions::ensure_assertion_handler_registered;
 use crate::operations::jit_call::JitCallOperation;
 use crate::tests::{values_from_bytes, values_to_bytes};
@@ -24,27 +25,27 @@ use crate::tests::{values_from_bytes, values_to_bytes};
 use super::*;
 
 /// Homogeneous builder retained only for tests of the test-only plain-program lowering helper.
-pub(crate) type XlaProgramBuilder = ProgramBuilder<XlaArrayConstant, ArrayOperation<XlaArrayConstant>>;
+pub(crate) type ProgramBuilder = CoreProgramBuilder<ArrayConstant, ArrayOperation<ArrayConstant>>;
 
 /// Homogeneous program retained only for tests of the test-only plain-program lowering helper.
-pub(crate) type PlainXlaProgram =
-    Program<XlaArrayConstant, ArrayOperation<XlaArrayConstant>, Vec<XlaArrayConstant>, Vec<XlaArrayConstant>>;
+pub(crate) type PlainProgram =
+    CoreProgram<ArrayConstant, ArrayOperation<ArrayConstant>, Vec<ArrayConstant>, Vec<ArrayConstant>>;
 
 pub(crate) fn test_manual_mesh(axis_name: &str, axis_size: usize) -> LogicalMesh {
     LogicalMesh::new(vec![MeshAxis::new(axis_name, axis_size, MeshAxisType::Manual).unwrap()]).unwrap()
 }
 
 pub(crate) fn test_vector_type(length: usize) -> ArrayType {
-    ArrayType::new(DataType::F32, Shape::new(vec![Dimension::Static(length)]))
+    ArrayType::new(DataType::F32, Shape::new(vec![CoreDimension::Static(length)]))
 }
 
 pub(crate) fn test_matrix_type(rows: usize, cols: usize) -> ArrayType {
-    ArrayType::new(DataType::F32, Shape::new(vec![Dimension::Static(rows), Dimension::Static(cols)]))
+    ArrayType::new(DataType::F32, Shape::new(vec![CoreDimension::Static(rows), CoreDimension::Static(cols)]))
 }
 
 /// Global array type of `data_type` with the static `global_shape`, placed by `sharding`.
 pub(crate) fn static_sharded_array_type(data_type: DataType, global_shape: &[usize], sharding: Sharding) -> ArrayType {
-    ArrayType::new(data_type, Shape::new(global_shape.iter().copied().map(Dimension::Static).collect()))
+    ArrayType::new(data_type, Shape::new(global_shape.iter().copied().map(CoreDimension::Static).collect()))
         .with_sharding(sharding)
         .unwrap()
 }
@@ -72,15 +73,13 @@ pub(crate) fn shard_map_module<F, Input, Output>(
 ) -> Result<String, Error>
 where
     Input: Parameterized<ArrayType>,
-    Input::Family:
-        ParameterizedFamily<XlaConstant> + ParameterizedFamily<XlaArrayTracer> + ParameterizedFamily<Sharding>,
+    Input::Family: ParameterizedFamily<Constant> + ParameterizedFamily<ArrayTracer> + ParameterizedFamily<Sharding>,
     Output: Parameterized<ArrayType>,
-    Output::Family:
-        ParameterizedFamily<XlaConstant> + ParameterizedFamily<XlaArrayTracer> + ParameterizedFamily<Sharding>,
+    Output::Family: ParameterizedFamily<Constant> + ParameterizedFamily<ArrayTracer> + ParameterizedFamily<Sharding>,
     F: FnOnce(
-        &ShardMapContext<XlaDomain<'static>>,
-        Input::To<XlaArrayTracer>,
-    ) -> Result<Output::To<XlaArrayTracer>, ProgramError>,
+        &ShardMapContext<Domain<'static>>,
+        Input::To<ArrayTracer>,
+    ) -> Result<Output::To<ArrayTracer>, ProgramError>,
 {
     let input_structure = global_input_types.parameter_structure();
     let output_structure = output_shardings.parameter_structure();
@@ -94,11 +93,11 @@ where
             .map(|(r#type, sharding)| r#type.with_sharding(sharding.without_auto_axes()))
             .collect::<Result<Vec<_>, _>>()?,
     )?;
-    let traced: TracedXlaProgram<Input, Output> = trace_with_context(
+    let traced: TracedProgram<Input, Output> = trace_with_context(
         |context, inputs| {
             let outputs = context.shard_map(
-                |body_context, local_inputs: Vec<XlaArrayTracer>| {
-                    let local_inputs = Input::To::<XlaArrayTracer>::from_parameters(input_structure, local_inputs)?;
+                |body_context, local_inputs: Vec<ArrayTracer>| {
+                    let local_inputs = Input::To::<ArrayTracer>::from_parameters(input_structure, local_inputs)?;
                     Ok(function(body_context, local_inputs)?.into_parameters().collect::<Vec<_>>())
                 },
                 inputs.into_parameters().collect::<Vec<_>>(),
@@ -107,7 +106,7 @@ where
                 output_shardings,
                 options,
             )?;
-            Ok(Output::To::<XlaArrayTracer>::from_parameters(output_structure, outputs)?)
+            Ok(Output::To::<ArrayTracer>::from_parameters(output_structure, outputs)?)
         },
         global_input_types,
     )?;
@@ -141,7 +140,7 @@ pub(crate) fn test_spmd_compilation_options(partition_count: usize) -> ryft_pjrt
     }
 }
 
-pub(crate) fn dynamic_dimension(name: &str, exclusive_upper_bound: Option<usize>) -> Dimension {
+pub(crate) fn dynamic_dimension(name: &str, exclusive_upper_bound: Option<usize>) -> CoreDimension {
     DimensionVariable::new(name, DimensionBounds::non_negative(exclusive_upper_bound).unwrap()).into()
 }
 
@@ -166,7 +165,7 @@ pub(crate) enum MixedValue {
 /// and every bounded dynamic input axis then receives its runtime extent from `extents` in boundary order.
 pub(crate) fn execute_mixed_program(
     client: &ryft_pjrt::Client<'_>,
-    program: &FlatXlaProgram,
+    program: &FlatProgram,
     inputs: &[MixedValue],
     extents: &[i32],
 ) -> Result<Vec<MixedValue>, Error> {
@@ -267,22 +266,22 @@ pub(crate) fn execute_mixed_program(
         .collect()
 }
 
-pub(crate) fn xla_identity_branch(input_type: ArrayType) -> PlainXlaProgram {
-    let mut builder = XlaProgramBuilder::new();
+pub(crate) fn identity_branch(input_type: ArrayType) -> PlainProgram {
+    let mut builder = ProgramBuilder::new();
     let input = builder.add_input(input_type);
     builder.build(vec![input], vec![Placeholder], vec![Placeholder]).unwrap()
 }
 
-pub(crate) fn xla_neg_branch(input_type: ArrayType) -> PlainXlaProgram {
-    let mut builder = XlaProgramBuilder::new();
+pub(crate) fn neg_branch(input_type: ArrayType) -> PlainProgram {
+    let mut builder = ProgramBuilder::new();
     let input = builder.add_input(input_type);
     let output = builder.add_instruction(NegOperation::new(), Vec::new(), vec![input], None).unwrap()[0];
     builder.build(vec![output], vec![Placeholder], vec![Placeholder]).unwrap()
 }
 
 /// Lifts an array-only test fixture into the production array IR XLA program representation.
-pub(crate) fn unproject_plain_program(program: PlainXlaProgram) -> FlatXlaProgram {
-    program.into_unprojected::<XlaConstant, XlaOperation>().unwrap()
+pub(crate) fn unproject_plain_program(program: PlainProgram) -> FlatProgram {
+    program.into_unprojected::<Constant, Operation>().unwrap()
 }
 
 #[test]
@@ -404,11 +403,11 @@ fn test_collect_nested_sharding_mesh() {
     let mesh = LogicalMesh::new(vec![MeshAxis::new("x", 2, MeshAxisType::Explicit).unwrap()]).unwrap();
     let sharding = Sharding::replicated(mesh.clone(), 2);
     let input_type = test_vector_type(4);
-    let mut builder = XlaProgramBuilder::new();
+    let mut builder = ProgramBuilder::new();
     let input = builder.add_input(input_type.clone());
     builder
         .add_instruction(
-            ReshapeOperation::new(Shape::new(vec![Dimension::Static(2), Dimension::Static(2)]))
+            ReshapeOperation::new(Shape::new(vec![CoreDimension::Static(2), CoreDimension::Static(2)]))
                 .with_output_sharding(sharding),
             Vec::new(),
             vec![input],
@@ -416,21 +415,21 @@ fn test_collect_nested_sharding_mesh() {
         )
         .unwrap();
     let program = builder
-        .build::<Vec<XlaArrayConstant>, Vec<XlaArrayConstant>>(vec![], vec![Placeholder], vec![])
+        .build::<Vec<ArrayConstant>, Vec<ArrayConstant>>(vec![], vec![Placeholder], vec![])
         .unwrap()
-        .into_unprojected::<XlaConstant, XlaOperation>()
+        .into_unprojected::<Constant, Operation>()
         .unwrap();
     assert_eq!(collect_nested_sharding_mesh(&program, None).unwrap(), Some(mesh.clone()));
     // The mesh exists only on an internal value. Lowering must still declare the symbol referenced by its
     // reshape constraint, even though neither the signature nor an explicit sharding operation supplies it.
     to_mlir_module_for_program(&program, &[], &vec![input_type.clone()], &Vec::<ArrayType>::new(), "main", None, None)
         .unwrap();
-    let mut builder = XlaProgramBuilder::new();
+    let mut builder = ProgramBuilder::new();
     builder.add_input(input_type.clone().with_sharding(Sharding::replicated(mesh, 1)).unwrap());
     let metadata_only = builder
-        .build::<Vec<XlaArrayConstant>, Vec<XlaArrayConstant>>(vec![], vec![Placeholder], vec![])
+        .build::<Vec<ArrayConstant>, Vec<ArrayConstant>>(vec![], vec![Placeholder], vec![])
         .unwrap()
-        .into_unprojected::<XlaConstant, XlaOperation>()
+        .into_unprojected::<Constant, Operation>()
         .unwrap();
     assert_eq!(collect_nested_sharding_mesh(&metadata_only, None).unwrap(), None);
     let incompatible = LogicalMesh::new(vec![MeshAxis::new("x", 3, MeshAxisType::Explicit).unwrap()]).unwrap();
@@ -461,14 +460,12 @@ fn test_collect_nested_sharding_mesh() {
         CastOperation::<ArrayIrType>::checked(output_type.clone().into(), vec![input_type.clone().into()])
             .unwrap()
             .into(),
-        XlaOperation::Array(ArrayOperation::Cast(
-            CastOperation::checked(output_type, vec![input_type.clone()]).unwrap(),
-        )),
+        Operation::Array(ArrayOperation::Cast(CastOperation::checked(output_type, vec![input_type.clone()]).unwrap())),
     ] {
-        let mut builder = ArrayIrXlaProgramBuilder::new();
+        let mut builder = ArrayIrProgramBuilder::new();
         let input = builder.add_input(input_type.clone().into());
         builder.add_instruction(operation, vec![], vec![input], None).unwrap();
-        let program = builder.build::<Vec<XlaConstant>, Vec<XlaConstant>>(vec![], vec![Placeholder], vec![]).unwrap();
+        let program = builder.build::<Vec<Constant>, Vec<Constant>>(vec![], vec![Placeholder], vec![]).unwrap();
         assert_eq!(collect_nested_sharding_mesh(&program, None).unwrap(), Some(mesh.clone()));
         assert_eq!(
             to_mlir_module_for_program(
@@ -510,9 +507,9 @@ fn test_array_ir_lowering_rejects_unresolved_reference_type() {
 
 #[test]
 fn test_array_ir_lowering_rejects_bound_manual_output_placement() {
-    // An array IR `XlaOperation::Cast` (i.e., a `CastOperation<ArrayIrType>` rather than a projected
+    // An array IR `Operation::Cast` (i.e., a `CastOperation<ArrayIrType>` rather than a projected
     // `ArrayOperation::Cast`) lowers without passing through `ArrayOperation::lower`, so only the family-level validation
-    // of `XlaOperation::lower` sees its output placement. Its first output requests a mesh that redefines the bound manual
+    // of `Operation::lower` sees its output placement. Its first output requests a mesh that redefines the bound manual
     // axis `x` as explicit and shards a local dimension over it, which only the region boundary may do.
     let vector_type = test_vector_type(4);
     let explicit_mesh = LogicalMesh::new(vec![MeshAxis::new("x", 2, MeshAxisType::Explicit).unwrap()]).unwrap();
@@ -521,17 +518,15 @@ fn test_array_ir_lowering_rejects_bound_manual_output_placement() {
         .with_sharding(Sharding::new(explicit_mesh, vec![ShardingDimension::sharded(["x"])]).unwrap())
         .unwrap();
     let cast = |output_type: &ArrayType, input_type: &ArrayType| {
-        XlaOperation::Cast(
-            CastOperation::unchecked(output_type.clone().into(), vec![input_type.clone().into()]).unwrap(),
-        )
+        Operation::Cast(CastOperation::unchecked(output_type.clone().into(), vec![input_type.clone().into()]).unwrap())
     };
-    let mut builder = ArrayIrXlaProgramBuilder::new();
+    let mut builder = ArrayIrProgramBuilder::new();
     let input = builder.add_input(vector_type.clone().into());
     let placed = builder.add_instruction(cast(&explicit_type, &vector_type), Vec::new(), vec![input], None).unwrap()[0];
     let output =
         builder.add_instruction(cast(&vector_type, &explicit_type), Vec::new(), vec![placed], None).unwrap()[0];
     let body = builder
-        .build::<Vec<XlaConstant>, Vec<XlaConstant>>(vec![output], vec![Placeholder], vec![Placeholder])
+        .build::<Vec<Constant>, Vec<Constant>>(vec![output], vec![Placeholder], vec![Placeholder])
         .unwrap();
     assert!(matches!(
         lower_replicated_shard_map_body(body, 2),
@@ -541,7 +536,7 @@ fn test_array_ir_lowering_rejects_bound_manual_output_placement() {
 }
 
 #[test]
-fn test_xla_lowering_rejects_unresolved_reference_state_before_token_threading() {
+fn test_lowering_rejects_unresolved_reference_state_before_token_threading() {
     use ryft_core::{ReferenceFreezeOperation, ReferenceNewOperation, ReferenceWriteOperation};
 
     assert_eq!(token_threaded_effects(EffectClasses::single(EffectClass::OrderedState)).next(), None);
@@ -549,29 +544,24 @@ fn test_xla_lowering_rejects_unresolved_reference_state_before_token_threading()
     // The artifact-wide reference scan catches the reference atoms and intrinsic semantics before token threading,
     // so two representative reference operations are enough to pin the diagnostic.
     let array_type = ArrayType::scalar(DataType::F32);
-    let mut builder = crate::experimental::ops::XlaProgramBuilder::new();
+    let mut builder = crate::experimental::ops::ProgramBuilder::new();
     let input = builder.add_input(ArrayIrType::Array(array_type.clone()));
     let reference = builder
-        .add_instruction(XlaOperation::ReferenceNew(ReferenceNewOperation::new()), Vec::new(), vec![input], None)
+        .add_instruction(Operation::ReferenceNew(ReferenceNewOperation::new()), Vec::new(), vec![input], None)
         .unwrap()[0];
     builder
         .add_instruction(
-            XlaOperation::ReferenceWrite(ReferenceWriteOperation::new()),
+            Operation::ReferenceWrite(ReferenceWriteOperation::new()),
             Vec::new(),
             vec![reference, input],
             None,
         )
         .unwrap();
     let output = builder
-        .add_instruction(
-            XlaOperation::ReferenceFreeze(ReferenceFreezeOperation::new()),
-            Vec::new(),
-            vec![reference],
-            None,
-        )
+        .add_instruction(Operation::ReferenceFreeze(ReferenceFreezeOperation::new()), Vec::new(), vec![reference], None)
         .unwrap()[0];
     let program = builder
-        .build::<Vec<XlaConstant>, Vec<XlaConstant>>(vec![output], vec![Placeholder], vec![Placeholder])
+        .build::<Vec<Constant>, Vec<Constant>>(vec![output], vec![Placeholder], vec![Placeholder])
         .unwrap();
 
     // The reference scan runs before the generic state scan at the module entry, so a program whose state comes
@@ -598,13 +588,13 @@ fn test_reference_state_aliases_use_physical_indices_and_preserve_shardings() {
     use ryft_core::ReferenceSource;
 
     let mesh = LogicalMesh::new(vec![MeshAxis::new("x", 2, MeshAxisType::Explicit).unwrap()]).unwrap();
-    let zero_type = ArrayType::new(DataType::Zero, Shape::new(vec![Dimension::Static(3)]));
+    let zero_type = ArrayType::new(DataType::Zero, Shape::new(vec![CoreDimension::Static(3)]));
     let state_type = ArrayType::new_static(DataType::F32, [4]);
-    let mut builder = crate::experimental::ops::XlaProgramBuilder::new();
+    let mut builder = crate::experimental::ops::ProgramBuilder::new();
     let _zero = builder.add_input(ArrayIrType::Array(zero_type.clone()));
     let mutated = builder.add_input(ArrayIrType::Array(state_type.clone()));
     let _read_only = builder.add_input(ArrayIrType::Array(state_type.clone()));
-    let program: FlatXlaProgram = builder.build(vec![mutated], vec![Placeholder; 3], vec![Placeholder]).unwrap();
+    let program: FlatProgram = builder.build(vec![mutated], vec![Placeholder; 3], vec![Placeholder]).unwrap();
     let input_types = vec![zero_type.clone(), state_type.clone(), state_type.clone()];
     let output_types = vec![state_type.clone()];
     let argument_shardings = vec![
@@ -720,12 +710,12 @@ fn test_bounded_dynamic_reference_state_alias_is_rejected_before_lowering() {
     use ryft_core::ReferenceSource;
 
     let extent = DimensionVariable::new("length", DimensionBounds::new(0, Some(5)).unwrap());
-    let state_type = ArrayType::new(DataType::F32, Shape::new(vec![Dimension::Dynamic(extent)]));
+    let state_type = ArrayType::new(DataType::F32, Shape::new(vec![CoreDimension::Dynamic(extent)]));
     let mesh = LogicalMesh::new(vec![MeshAxis::new("x", 1, MeshAxisType::Explicit).unwrap()]).unwrap();
     let sharding = Sharding::replicated(mesh, 1);
-    let mut builder = crate::experimental::ops::XlaProgramBuilder::new();
+    let mut builder = crate::experimental::ops::ProgramBuilder::new();
     let state = builder.add_input(ArrayIrType::Array(state_type.clone()));
-    let program: FlatXlaProgram = builder.build(vec![state], vec![Placeholder], vec![Placeholder]).unwrap();
+    let program: FlatProgram = builder.build(vec![state], vec![Placeholder], vec![Placeholder]).unwrap();
     let reference_state = ExternalReferenceBinding::new(ReferenceSource::Input { index: 0 }, Some(0));
 
     assert!(matches!(
@@ -877,11 +867,11 @@ fn test_to_mlir_module_for_program_preserves_boundary_layouts() {
     let array_type =
         ArrayType::new_static(DataType::F32, [2, 3]).with_layout(Layout::Tiled(TiledLayout::new(vec![0, 1], vec![])));
     let zero_type = ArrayType::new_static(DataType::Zero, [2, 3]);
-    let mut builder = ArrayIrXlaProgramBuilder::new();
+    let mut builder = ArrayIrProgramBuilder::new();
     let input = builder.add_input(array_type.clone().into());
     let zero = builder.add_input(zero_type.clone().into());
     let program = builder
-        .build::<Vec<XlaConstant>, Vec<XlaConstant>>(vec![zero, input], vec![Placeholder; 2], vec![Placeholder; 2])
+        .build::<Vec<Constant>, Vec<Constant>>(vec![zero, input], vec![Placeholder; 2], vec![Placeholder; 2])
         .unwrap();
     assert_eq!(
         to_mlir_module_for_program(
@@ -910,12 +900,12 @@ fn test_to_mlir_module_for_program_preserves_boundary_layouts() {
 #[test]
 fn test_to_mlir_module_for_program_lowers_captures_as_hidden_arguments() {
     let array_type = test_vector_type(4);
-    let mut builder = ArrayIrXlaProgramBuilder::new();
+    let mut builder = ArrayIrProgramBuilder::new();
     let input = builder.add_input(array_type.clone().into());
-    let capture = builder.add_constant(XlaConstant::Captured(CaptureReference::new(0, array_type.clone().into())));
+    let capture = builder.add_constant(Constant::Captured(CaptureReference::new(0, array_type.clone().into())));
     let output = builder.add_instruction(AddOperation::new(), Vec::new(), vec![input, capture], None).unwrap()[0];
     let program = builder
-        .build::<Vec<XlaConstant>, Vec<XlaConstant>>(vec![output], vec![Placeholder], vec![Placeholder])
+        .build::<Vec<Constant>, Vec<Constant>>(vec![output], vec![Placeholder], vec![Placeholder])
         .unwrap();
     let capture_types = vec![array_type.clone()];
     let input_types = vec![array_type.clone()];
@@ -940,12 +930,10 @@ fn test_to_mlir_module_for_program_lowers_immediate_dimension_constants_in_place
     // capture argument. That is exactly what makes first-class extents usable where no capture table is
     // reachable, such as inside a `shard_map` manual region.
     let extent_type = DimensionType::new("extent", DimensionBounds::positive(Some(8)).unwrap());
-    let mut builder = ArrayIrXlaProgramBuilder::new();
-    let extent = builder.add_constant(XlaConstant::Dimension(DimensionValue::new(extent_type, 4).unwrap()));
+    let mut builder = ArrayIrProgramBuilder::new();
+    let extent = builder.add_constant(Constant::Dimension(DimensionValue::new(extent_type, 4).unwrap()));
     let output = builder.add_instruction(DimensionToScalarOperation, Vec::new(), vec![extent], None).unwrap()[0];
-    let program = builder
-        .build::<Vec<XlaConstant>, Vec<XlaConstant>>(vec![output], Vec::new(), vec![Placeholder])
-        .unwrap();
+    let program = builder.build::<Vec<Constant>, Vec<Constant>>(vec![output], Vec::new(), vec![Placeholder]).unwrap();
     let input_types: [ArrayType; 0] = [];
     let stablehlo = to_mlir_module_for_program(
         &program,
@@ -965,11 +953,9 @@ fn test_to_mlir_module_for_program_lowers_immediate_dimension_constants_in_place
 #[test]
 fn test_to_mlir_module_for_program_lowers_capture_output_as_a_hidden_argument() {
     let array_type = test_vector_type(4);
-    let mut builder = ArrayIrXlaProgramBuilder::new();
-    let output = builder.add_constant(XlaConstant::Captured(CaptureReference::new(0, array_type.clone().into())));
-    let program = builder
-        .build::<Vec<XlaConstant>, Vec<XlaConstant>>(vec![output], Vec::new(), vec![Placeholder])
-        .unwrap();
+    let mut builder = ArrayIrProgramBuilder::new();
+    let output = builder.add_constant(Constant::Captured(CaptureReference::new(0, array_type.clone().into())));
+    let program = builder.build::<Vec<Constant>, Vec<Constant>>(vec![output], Vec::new(), vec![Placeholder]).unwrap();
     let input_types: [ArrayType; 0] = [];
     let output_types = vec![array_type.clone()];
     let stablehlo = to_mlir_module_for_program(
@@ -992,26 +978,24 @@ fn test_to_mlir_module_for_program_lowers_capture_output_as_a_hidden_argument() 
 fn test_to_mlir_module_for_program_forwards_capture_into_nested_regions() {
     let array_type = test_vector_type(4);
     let branch = || {
-        let mut builder = ArrayIrXlaProgramBuilder::new();
-        let output = builder.add_constant(XlaConstant::Captured(CaptureReference::new(0, array_type.clone().into())));
-        builder
-            .build::<Vec<XlaConstant>, Vec<XlaConstant>>(vec![output], Vec::new(), vec![Placeholder])
-            .unwrap()
+        let mut builder = ArrayIrProgramBuilder::new();
+        let output = builder.add_constant(Constant::Captured(CaptureReference::new(0, array_type.clone().into())));
+        builder.build::<Vec<Constant>, Vec<Constant>>(vec![output], Vec::new(), vec![Placeholder]).unwrap()
     };
-    let mut builder = ArrayIrXlaProgramBuilder::new();
+    let mut builder = ArrayIrProgramBuilder::new();
     let true_region = builder.import_program(branch());
     let false_region = builder.import_program(branch());
     let predicate = builder.add_input(ArrayType::scalar(DataType::Boolean).into());
     let output = builder
         .add_instruction(
-            XlaOperation::Condition(ConditionOperation::new()),
+            Operation::Condition(ConditionOperation::new()),
             vec![true_region, false_region],
             vec![predicate],
             None,
         )
         .unwrap()[0];
     let program = builder
-        .build::<Vec<XlaConstant>, Vec<XlaConstant>>(vec![output], vec![Placeholder], vec![Placeholder])
+        .build::<Vec<Constant>, Vec<Constant>>(vec![output], vec![Placeholder], vec![Placeholder])
         .unwrap();
     let output_types = vec![array_type.clone()];
     let stablehlo = to_mlir_module_for_program(
@@ -1034,22 +1018,19 @@ fn test_to_mlir_module_for_program_forwards_capture_into_nested_regions() {
 }
 
 /// Stages one `jit_call` to `callee` (interned as a shared callee root region) over `inputs` in `builder`.
-pub(crate) fn add_xla_jit_call(
-    builder: &mut ArrayIrXlaProgramBuilder,
-    callee: &Arc<FlatXlaProgram>,
+pub(crate) fn add_jit_call(
+    builder: &mut ArrayIrProgramBuilder,
+    callee: &Arc<FlatProgram>,
     inputs: Vec<AtomId>,
 ) -> AtomId {
     let callee_region = builder.intern_callee(callee, None).unwrap();
     builder
-        .add_instruction(XlaOperation::JitCall(JitCallOperation::new(0)), vec![callee_region], inputs, None)
+        .add_instruction(Operation::JitCall(JitCallOperation::new(0)), vec![callee_region], inputs, None)
         .unwrap()[0]
 }
 
 /// Wraps one flat vector program in a replicated manual `shard_map` and lowers the enclosing program.
-pub(crate) fn lower_replicated_shard_map_body(
-    body_program: FlatXlaProgram,
-    device_count: usize,
-) -> Result<String, Error> {
+pub(crate) fn lower_replicated_shard_map_body(body_program: FlatProgram, device_count: usize) -> Result<String, Error> {
     use ryft_core::ShardMapOperation;
 
     let vector_type = test_vector_type(4);
@@ -1061,13 +1042,11 @@ pub(crate) fn lower_replicated_shard_map_body(
         ShardMapBoundary::new(mesh, vec![sharding.clone()], vec![sharding], vec!["x".to_string()]).unwrap(),
     )
     .unwrap();
-    let mut builder = ArrayIrXlaProgramBuilder::new();
+    let mut builder = ArrayIrProgramBuilder::new();
     let input = builder.add_input(vector_type.clone().into());
     let body = builder.import_program(body_program);
-    let output =
-        builder.add_instruction(XlaOperation::ShardMap(Box::new(operation)), vec![body], vec![input], None)?[0];
-    let program =
-        builder.build::<Vec<XlaConstant>, Vec<XlaConstant>>(vec![output], vec![Placeholder], vec![Placeholder])?;
+    let output = builder.add_instruction(Operation::ShardMap(Box::new(operation)), vec![body], vec![input], None)?[0];
+    let program = builder.build::<Vec<Constant>, Vec<Constant>>(vec![output], vec![Placeholder], vec![Placeholder])?;
     let input_types = vec![vector_type.clone()];
     let output_types = vec![vector_type];
     to_mlir_module_for_program(&program, &[], &input_types, &output_types, "main", None, None)
@@ -1210,16 +1189,16 @@ fn test_to_mlir_module_for_program_renders_constants_and_supported_ops() {
 /// Builds a one-instruction program applying the given single-operand operation to an input of the given data
 /// type and dimensions, and returns the result of lowering it to a rendered StableHLO module.
 pub(crate) fn lowered_unary_module(
-    operation: ArrayOperation<XlaArrayConstant>,
+    operation: ArrayOperation<ArrayConstant>,
     data_type: DataType,
     dimensions: Vec<usize>,
 ) -> Result<String, Error> {
-    let input_type = ArrayType::new(data_type, Shape::new(dimensions.into_iter().map(Dimension::Static).collect()));
-    let mut builder = XlaProgramBuilder::new();
+    let input_type = ArrayType::new(data_type, Shape::new(dimensions.into_iter().map(CoreDimension::Static).collect()));
+    let mut builder = ProgramBuilder::new();
     let input = builder.add_input(input_type);
     let output = builder.add_instruction(operation, Vec::new(), vec![input], None).unwrap()[0];
     let program = builder
-        .build::<Vec<XlaArrayConstant>, Vec<XlaArrayConstant>>(vec![output], vec![Placeholder], vec![Placeholder])
+        .build::<Vec<ArrayConstant>, Vec<ArrayConstant>>(vec![output], vec![Placeholder], vec![Placeholder])
         .unwrap();
     to_mlir_module_for_plain_program(&program, "main")
 }
@@ -1278,18 +1257,23 @@ where
     x.clone() * x.clone() * x.clone() * x.clone() + x.sin().unwrap()
 }
 
-static TEST_ARRAY_DOMAIN: EagerContext<Array, ArrayOperation<Array>> =
-    EagerContext::<Array, ArrayOperation<Array>>::new();
+static TEST_ARRAY_DOMAIN: EagerContext<CoreArray, ArrayOperation<CoreArray>> =
+    EagerContext::<CoreArray, ArrayOperation<CoreArray>>::new();
 
 #[test]
 fn test_plain_scalar_bilinear_sin_jit_stablehlo() {
     let (_, compiled): (
-        Array,
-        ryft_core::programs::Program<Array, ryft_core::ArrayOperation<Array>, (Array, Array), Array>,
+        CoreArray,
+        ryft_core::programs::Program<
+            CoreArray,
+            ryft_core::ArrayOperation<CoreArray>,
+            (CoreArray, CoreArray),
+            CoreArray,
+        >,
     ) = TEST_ARRAY_DOMAIN
         .interpret_and_trace(
             |inputs| Ok(scalar_bilinear_sin(inputs)),
-            (Array::scalar(2.0).unwrap(), Array::scalar(3.0).unwrap()),
+            (CoreArray::scalar(2.0).unwrap(), CoreArray::scalar(3.0).unwrap()),
         )
         .unwrap();
 
@@ -1311,19 +1295,21 @@ fn test_plain_scalar_bilinear_sin_jit_stablehlo() {
 
 #[test]
 fn test_plain_scalar_quartic_plus_sin_grad_stablehlo() {
-    let (_, compiled): (Array, ryft_core::programs::Program<Array, ryft_core::ArrayOperation<Array>, Array, Array>) =
-        TEST_ARRAY_DOMAIN
-            .interpret_and_trace(
-                |x| {
-                    let context = x.context().clone();
-                    Ok(context
-                        .differentiate_at(x)
-                        .gradient(scalar_quartic_plus_sin)
-                        .expect("scalar gradient should succeed"))
-                },
-                Array::scalar(2.0).unwrap(),
-            )
-            .unwrap();
+    let (_, compiled): (
+        CoreArray,
+        ryft_core::programs::Program<CoreArray, ryft_core::ArrayOperation<CoreArray>, CoreArray, CoreArray>,
+    ) = TEST_ARRAY_DOMAIN
+        .interpret_and_trace(
+            |x| {
+                let context = x.context().clone();
+                Ok(context
+                    .differentiate_at(x)
+                    .gradient(scalar_quartic_plus_sin)
+                    .expect("scalar gradient should succeed"))
+            },
+            CoreArray::scalar(2.0).unwrap(),
+        )
+        .unwrap();
 
     let stablehlo = to_mlir_module_for_plain_program(&compiled, "main").unwrap();
     println!("=== ryft grad(x^4 + sin(x)) StableHLO ===\n{stablehlo}");
@@ -1347,10 +1333,10 @@ fn test_plain_scalar_bilinear_sin_vjp_pullback_standalone_stablehlo() {
     // backward pass as `stablehlo.multiply`s of the cotangent against those residual inputs rather than baking the
     // primal point in as constants — the analogue of JAX's standalone `vjp_fn`, with the residuals threaded as
     // explicit arguments.
-    let (_, pullback): (Array, _) = EagerContext::<Array, ArrayOperation<Array>>::new()
+    let (_, pullback): (CoreArray, _) = EagerContext::<CoreArray, ArrayOperation<CoreArray>>::new()
         .vjp(
             |inputs, ()| Ok(scalar_bilinear_sin(inputs)),
-            (Array::scalar(2.0).unwrap(), Array::scalar(3.0).unwrap()),
+            (CoreArray::scalar(2.0).unwrap(), CoreArray::scalar(3.0).unwrap()),
             (),
         )
         .unwrap();
@@ -1383,8 +1369,13 @@ fn test_plain_scalar_bilinear_sin_grad_jitted_stablehlo() {
     // grad(f) wrapped in JIT â€” symbolic, like JAX's jit(grad(f)).
     // Uses the traced value-and-gradient path that traces through vjp+pullback.
     let (_, compiled): (
-        (Array, Array),
-        ryft_core::programs::Program<Array, ryft_core::ArrayOperation<Array>, (Array, Array), (Array, Array)>,
+        (CoreArray, CoreArray),
+        ryft_core::programs::Program<
+            CoreArray,
+            ryft_core::ArrayOperation<CoreArray>,
+            (CoreArray, CoreArray),
+            (CoreArray, CoreArray),
+        >,
     ) = TEST_ARRAY_DOMAIN
         .interpret_and_trace(
             |inputs| {
@@ -1394,7 +1385,7 @@ fn test_plain_scalar_bilinear_sin_grad_jitted_stablehlo() {
                     .gradient(scalar_bilinear_sin)
                     .expect("scalar gradient should succeed"))
             },
-            (Array::scalar(2.0).unwrap(), Array::scalar(3.0).unwrap()),
+            (CoreArray::scalar(2.0).unwrap(), CoreArray::scalar(3.0).unwrap()),
         )
         .unwrap();
 
@@ -1410,17 +1401,17 @@ fn test_plain_scalar_bilinear_sin_grad_jitted_stablehlo() {
 }
 
 #[test]
-fn test_xla_lowering_rejects_preserved_reference_entries() {
+fn test_lowering_rejects_preserved_reference_entries() {
     use ryft_core::{ReferenceReadOperation, ReferenceType};
     use ryft_kernels::{KernelBoundaryContract, KernelParameterAccess, validate_kernel_body};
 
-    let mut builder = ArrayIrXlaProgramBuilder::new();
+    let mut builder = ArrayIrProgramBuilder::new();
     let scalar_type = ArrayType::scalar(DataType::F32);
     let reference = builder.add_input(ArrayIrType::Reference(ReferenceType::new(scalar_type.clone())));
     let snapshot =
         builder.add_instruction(ReferenceReadOperation::new(), Vec::new(), vec![reference], None).unwrap()[0];
     let program = builder
-        .build::<Vec<XlaConstant>, Vec<XlaConstant>>(vec![snapshot], vec![Placeholder], vec![Placeholder])
+        .build::<Vec<Constant>, Vec<Constant>>(vec![snapshot], vec![Placeholder], vec![Placeholder])
         .unwrap();
     let contract = KernelBoundaryContract::new(vec![Some(KernelParameterAccess::ReadOnly)]);
     assert!(validate_kernel_body(program.entry_region_ref(), &contract).is_ok());
@@ -1449,7 +1440,7 @@ fn test_mlir_lowerable_value_to_dense_elements_attribute_rejects_symbolic_values
         Err(Error::Core(ryft_core::Error::Program(ProgramError::Concretization { message })))
             if message == "abstract XLA value `f32[]` cannot be materialized as a StableHLO literal",
     ));
-    let captured = XlaArrayConstant::Captured(CaptureReference::new(3, array_type));
+    let captured = ArrayConstant::Captured(CaptureReference::new(3, array_type));
     assert!(matches!(
         captured.to_dense_elements_attribute(tensor_type, &context),
         Err(Error::Core(ryft_core::Error::Program(ProgramError::Concretization { message })))

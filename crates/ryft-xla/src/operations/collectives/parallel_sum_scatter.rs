@@ -1,7 +1,7 @@
 use ryft_core::macros::check_count;
 use ryft_core::{
-    ArrayIrType, ArrayType, CollectiveMode, Dimension, MemberOperation, Operation, ParallelSumScatterOperation,
-    ProgramError, ReductionKind,
+    ArrayIrType, ArrayType, CollectiveMode, Dimension as CoreDimension, MemberOperation, Operation as CoreOperation,
+    ParallelSumScatterOperation, ProgramError, ReductionKind,
 };
 use ryft_mlir::dialects::stable_hlo;
 use ryft_mlir::{
@@ -14,7 +14,7 @@ use crate::operations::collectives::{
     collapse_singleton_axis, collective_replica_groups, refine_collective_result_dimensions,
 };
 use crate::operations::reductions::build_reduce_body_region;
-use crate::{Error, LowerableOperation, LowerableOperationFamily, MemberLowerableOperation, XlaLowerer};
+use crate::{Error, LowerableOperation, LowerableOperationFamily, Lowerer, MemberLowerableOperation};
 
 /// Lowers one traced `parallel_sum_scatter` to a channeled `stablehlo.reduce_scatter` with a sum reduction over the
 /// named mesh axis's replica groups.
@@ -38,7 +38,7 @@ pub(crate) fn lower_parallel_sum_scatter_to_mlir<'b, 'c: 'b, 't: 'c>(
     let native_output_type = match operation.options().mode() {
         CollectiveMode::Tiled => output_array_type.clone(),
         CollectiveMode::Untiled => output_array_type
-            .with_inserted_dimension(operation.scatter_axis(), Dimension::Static(1))
+            .with_inserted_dimension(operation.scatter_axis(), CoreDimension::Static(1))
             .map_err(ProgramError::from)?,
     };
     let output_type = lower_tensor_type(&native_output_type, context, location)?;
@@ -63,7 +63,7 @@ pub(crate) fn lower_parallel_sum_scatter_to_mlir<'b, 'c: 'b, 't: 'c>(
 impl LowerableOperation for ParallelSumScatterOperation {
     fn lower<'b, 'c: 'b, 't: 'c, O: LowerableOperationFamily>(
         &self,
-        lowerer: &mut XlaLowerer<'b, 'c, 't, O>,
+        lowerer: &mut Lowerer<'b, 'c, 't, O>,
         input_values: &[ValueRef<'b, 'c, 't>],
         input_types: &[ArrayType],
         output_types: &[ArrayType],
@@ -100,7 +100,7 @@ impl LowerableOperation for ParallelSumScatterOperation {
 impl MemberLowerableOperation<ArrayIrType> for ParallelSumScatterOperation {
     fn lower_in_parent<'b, 'c: 'b, 't: 'c, O: LowerableOperationFamily>(
         &self,
-        lowerer: &mut XlaLowerer<'b, 'c, 't, O>,
+        lowerer: &mut Lowerer<'b, 'c, 't, O>,
         input_values: &[ValueRef<'b, 'c, 't>],
         input_types: &[ArrayIrType],
         output_types: &[ArrayIrType],

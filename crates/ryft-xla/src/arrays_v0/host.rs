@@ -5,7 +5,7 @@ use ryft_core::{ArrayType, Layout, ProgramError, Typed};
 use ryft_pjrt::{Event, ExecutionFence};
 
 use crate::arrays::ArrayTypeExtension;
-use crate::{Error, ToPjrt, XlaArray, XlaDomain};
+use crate::{Array, Domain, Error, ToPjrt};
 
 use super::*;
 
@@ -152,7 +152,7 @@ impl DenseArrayHostCopy {
 
 /// Starts copies for every addressable shard of `array` without awaiting them. Errors when any global shard is not
 /// addressable from the current process.
-pub(crate) fn begin_materialize_dense_array_bytes(array: &XlaArray<'_>) -> Result<DenseArrayHostCopy, Error> {
+pub(crate) fn begin_materialize_dense_array_bytes(array: &Array<'_>) -> Result<DenseArrayHostCopy, Error> {
     let completion = array.execution_fence().cloned();
     // Empty arrays have no payload either. Avoid asking PJRT for a zero-byte dynamic copy, whose size-query
     // fallback can expose the bound allocation and its trailer instead of the empty logical value.
@@ -219,9 +219,9 @@ pub(crate) fn begin_materialize_dense_array_bytes(array: &XlaArray<'_>) -> Resul
 /// summands that the devices hold along the unreduced axes of its sharding. Errors when any global shard is not
 /// addressable from the current process.
 ///
-/// Used by [`XlaArray::to`](crate::XlaArray::to)'s last-resort host fallback when the fast and compiled paths cannot
+/// Used by [`Array::to`](crate::Array::to)'s last-resort host fallback when the fast and compiled paths cannot
 /// satisfy the requested placement.
-pub(crate) fn materialize_dense_array_bytes(array: &XlaArray<'_>) -> Result<Vec<u8>, Error> {
+pub(crate) fn materialize_dense_array_bytes(array: &Array<'_>) -> Result<Vec<u8>, Error> {
     begin_materialize_dense_array_bytes(array)?.finish()
 }
 
@@ -231,13 +231,13 @@ pub(crate) fn materialize_dense_array_bytes(array: &XlaArray<'_>) -> Result<Vec<
 /// them, and uploading the sum would replace them with a canonical decomposition of it, which an unchecked `shard_map`
 /// body (which observes the summands) could tell apart.
 pub(crate) fn relayout_shards_through_host<'o>(
-    domain: &XlaDomain<'o>,
-    array: &XlaArray<'o>,
+    domain: &Domain<'o>,
+    array: &Array<'o>,
     layout: &Layout,
-) -> Result<XlaArray<'o>, Error> {
+) -> Result<Array<'o>, Error> {
     let r#type = array.r#type().into_owned().with_layout(layout.clone());
     let device_layout = layout.to_pjrt()?;
-    let buffer_type = XlaArray::physical_buffer_type(array.data_type());
+    let buffer_type = Array::physical_buffer_type(array.data_type());
     let client = domain.client();
     let mut buffers = Vec::new();
     for shard in array.addressable_shards() {
@@ -257,14 +257,14 @@ pub(crate) fn relayout_shards_through_host<'o>(
             Some(device_layout.clone()),
         )?);
     }
-    XlaArray::from_addressable_buffers(domain, r#type, array.mesh().clone(), buffers)
+    Array::from_addressable_buffers(domain, r#type, array.mesh().clone(), buffers)
 }
 
 /// Rejects a dense host round trip of `array` for `purpose` (i.e., materializing its logical value on the host and
 /// uploading a value derived from it) when the sharding of `array` has unreduced axes. The devices of such an array
 /// hold separate summands of its value, which the round trip would replace with a canonical decomposition of their sum,
 /// and an unchecked `shard_map` body observes those summands.
-pub(crate) fn reject_unreduced_host_round_trip(array: &XlaArray<'_>, purpose: &str) -> Result<(), Error> {
+pub(crate) fn reject_unreduced_host_round_trip(array: &Array<'_>, purpose: &str) -> Result<(), Error> {
     if array.sharding().unreduced_axes().is_empty() {
         return Ok(());
     }

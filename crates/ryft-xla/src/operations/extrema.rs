@@ -6,12 +6,12 @@ use ryft_mlir::{
 };
 
 use crate::operations::{normalize_binary_elementwise_operands, normalize_elementwise_operand};
-use crate::{Error, LowerableOperation, LowerableOperationFamily, XlaLowerer};
+use crate::{Error, LowerableOperation, LowerableOperationFamily, Lowerer};
 
 impl LowerableOperation for MaxOperation<ArrayType> {
     fn lower<'b, 'c: 'b, 't: 'c, O: LowerableOperationFamily>(
         &self,
-        lowerer: &mut XlaLowerer<'b, 'c, 't, O>,
+        lowerer: &mut Lowerer<'b, 'c, 't, O>,
         input_values: &[ValueRef<'b, 'c, 't>],
         _input_types: &[ArrayType],
         output_types: &[ArrayType],
@@ -41,7 +41,7 @@ impl LowerableOperation for MaxOperation<ArrayType> {
 impl LowerableOperation for MinOperation<ArrayType> {
     fn lower<'b, 'c: 'b, 't: 'c, O: LowerableOperationFamily>(
         &self,
-        lowerer: &mut XlaLowerer<'b, 'c, 't, O>,
+        lowerer: &mut Lowerer<'b, 'c, 't, O>,
         input_values: &[ValueRef<'b, 'c, 't>],
         _input_types: &[ArrayType],
         output_types: &[ArrayType],
@@ -71,7 +71,7 @@ impl LowerableOperation for MinOperation<ArrayType> {
 impl LowerableOperation for ClampOperation<ArrayType> {
     fn lower<'b, 'c: 'b, 't: 'c, O: LowerableOperationFamily>(
         &self,
-        lowerer: &mut XlaLowerer<'b, 'c, 't, O>,
+        lowerer: &mut Lowerer<'b, 'c, 't, O>,
         input_values: &[ValueRef<'b, 'c, 't>],
         _input_types: &[ArrayType],
         output_types: &[ArrayType],
@@ -248,7 +248,7 @@ mod tests {
     use crate::experimental::lowering::tests::{
         MixedValue, dynamic_dimension, execute_mixed_program, lowered_reduce_module,
     };
-    use crate::experimental::ops::{XlaConstant, XlaProgramBuilder as ArrayIrXlaProgramBuilder};
+    use crate::experimental::ops::{Constant, ProgramBuilder as ArrayIrProgramBuilder};
     use crate::tests::execution_client;
 
     use super::*;
@@ -283,17 +283,13 @@ mod tests {
     fn test_to_mlir_module_for_program_extrema_dynamic_differentiation() {
         let client = execution_client();
         let input_type = ArrayType::new(DataType::F64, Shape::new(vec![dynamic_dimension("size", Some(5))]));
-        let mut builder = ArrayIrXlaProgramBuilder::new();
+        let mut builder = ArrayIrProgramBuilder::new();
         let left = builder.add_input(input_type.clone().into());
         let right = builder.add_input(input_type.into());
         let minimum = builder.add_instruction(MinOperation::new(), Vec::new(), vec![left, right], None).unwrap()[0];
         let maximum = builder.add_instruction(MaxOperation::new(), Vec::new(), vec![left, right], None).unwrap()[0];
         let program = builder
-            .build::<Vec<XlaConstant>, Vec<XlaConstant>>(
-                vec![minimum, maximum],
-                vec![Placeholder; 2],
-                vec![Placeholder; 2],
-            )
+            .build::<Vec<Constant>, Vec<Constant>>(vec![minimum, maximum], vec![Placeholder; 2], vec![Placeholder; 2])
             .unwrap()
             .jvp()
             .unwrap();

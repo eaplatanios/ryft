@@ -12,7 +12,7 @@ use ryft_kernels::VerifiedKernel;
 use sha2::{Digest, Sha256};
 
 use crate::kernels::cuda::{CUDA_KERNEL_CUSTOM_CALL_TARGET, CudaKernelEmbedding, CudaKernelParameterBinding};
-use crate::kernels::staging::{XlaKernelExecutionFacts, XlaKernelTarget};
+use crate::kernels::staging::{KernelExecutionFacts, KernelTarget};
 use crate::kernels::{KernelEmbeddingError, KernelOutputEmbedding};
 
 /// Embeds a validated cuTile artifact using the existing session-owned CUDA launcher.
@@ -68,8 +68,8 @@ impl KernelOutputEmbedding<CompiledKernel> for CuTileEmbedding {
     }
 }
 
-impl XlaKernelTarget for Target {
-    fn admit_execution(&self, facts: &XlaKernelExecutionFacts) -> Result<(), KernelEmbeddingError> {
+impl KernelTarget for Target {
+    fn admit_execution(&self, facts: &KernelExecutionFacts) -> Result<(), KernelEmbeddingError> {
         if !facts.platform_name.eq_ignore_ascii_case("cuda")
             || facts.platform_version != "cuda 13020"
             || !facts.has_ffi_extension
@@ -99,19 +99,19 @@ mod tests {
 
     use pretty_assertions::assert_eq;
 
-    use crate::kernels::staging::XlaKernelDeviceFacts;
+    use crate::kernels::staging::KernelDeviceFacts;
 
     use super::*;
 
     /// Exact qualified Spark execution facts, without opening a native client.
-    fn facts() -> XlaKernelExecutionFacts {
-        XlaKernelExecutionFacts {
+    fn facts() -> KernelExecutionFacts {
+        KernelExecutionFacts {
             platform_name: "CUDA".to_owned(),
             platform_version: "cuda 13020".to_owned(),
             pjrt_version: ryft_pjrt::VERSION,
             has_ffi_extension: true,
             attributes: BTreeMap::new(),
-            devices: vec![XlaKernelDeviceFacts {
+            devices: vec![KernelDeviceFacts {
                 kind: "GB10".to_owned(),
                 attributes: BTreeMap::from([(
                     "compute_capability".to_owned(),

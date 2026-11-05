@@ -1,7 +1,7 @@
 use ryft_core::macros::check_count;
 use ryft_core::{
-    ArrayIrType, ArrayType, CollectiveMode, Dimension, MemberOperation, Operation, ParallelAllToAllOperation,
-    ProgramError,
+    ArrayIrType, ArrayType, CollectiveMode, Dimension as CoreDimension, MemberOperation, Operation as CoreOperation,
+    ParallelAllToAllOperation, ProgramError,
 };
 use ryft_mlir::dialects::stable_hlo;
 use ryft_mlir::{
@@ -13,7 +13,7 @@ use crate::experimental::lowering::types::lower_tensor_type;
 use crate::operations::collectives::{
     collapse_singleton_axis, collective_replica_groups, refine_collective_result_dimensions,
 };
-use crate::{Error, LowerableOperation, LowerableOperationFamily, MemberLowerableOperation, XlaLowerer};
+use crate::{Error, LowerableOperation, LowerableOperationFamily, Lowerer, MemberLowerableOperation};
 
 /// Lowers one traced `parallel_all_to_all` to a channeled `stablehlo.all_to_all` over the named mesh axis's replica
 /// groups.
@@ -48,7 +48,7 @@ pub(crate) fn lower_parallel_all_to_all_to_mlir<'b, 'c: 'b, 't: 'c>(
                 split_axis += 1;
             }
             let expanded_type = input_array_type
-                .with_inserted_dimension(concatenation_axis, Dimension::Static(1))
+                .with_inserted_dimension(concatenation_axis, CoreDimension::Static(1))
                 .map_err(ProgramError::from)?;
             let expanded_type = lower_tensor_type(&expanded_type, context, location)?;
             let broadcast_dimensions =
@@ -87,7 +87,7 @@ pub(crate) fn lower_parallel_all_to_all_to_mlir<'b, 'c: 'b, 't: 'c>(
 impl LowerableOperation for ParallelAllToAllOperation {
     fn lower<'b, 'c: 'b, 't: 'c, O: LowerableOperationFamily>(
         &self,
-        lowerer: &mut XlaLowerer<'b, 'c, 't, O>,
+        lowerer: &mut Lowerer<'b, 'c, 't, O>,
         input_values: &[ValueRef<'b, 'c, 't>],
         input_types: &[ArrayType],
         output_types: &[ArrayType],
@@ -125,7 +125,7 @@ impl LowerableOperation for ParallelAllToAllOperation {
 impl MemberLowerableOperation<ArrayIrType> for ParallelAllToAllOperation {
     fn lower_in_parent<'b, 'c: 'b, 't: 'c, O: LowerableOperationFamily>(
         &self,
-        lowerer: &mut XlaLowerer<'b, 'c, 't, O>,
+        lowerer: &mut Lowerer<'b, 'c, 't, O>,
         input_values: &[ValueRef<'b, 'c, 't>],
         input_types: &[ArrayIrType],
         output_types: &[ArrayIrType],

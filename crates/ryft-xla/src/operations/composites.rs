@@ -7,8 +7,8 @@ use ryft_core::operations::attention::{
 };
 use ryft_core::{
     ArrayIrType, ArrayType, COMPOSITE_OPERATION_NAME, COMPOSITE_TRANSPOSE_OPERATION_NAME, CompositeKey,
-    CompositeOperation, CompositeTransposeOperation, CustomRuleSource, DifferentiableType, Operation, Parameter,
-    ProgramError, RematerializationOptimizationBarrier, Typed,
+    CompositeOperation, CompositeTransposeOperation, CustomRuleSource, DifferentiableType, Operation as CoreOperation,
+    Parameter, ProgramError, RematerializationOptimizationBarrier, Typed,
 };
 use ryft_mlir::ValueRef;
 #[cfg(test)]
@@ -19,7 +19,7 @@ use crate::operations::attention::{
     lower_fused_attention, lower_fused_attention_backward, select_attention_implementation,
 };
 use crate::operations::jit_call::{JitCallFunctionMap, lower_shared_function_call};
-use crate::{Error, LowerableOperation, LowerableOperationFamily, LoweringError, XlaLowerer};
+use crate::{Error, LowerableOperation, LowerableOperationFamily, Lowerer, LoweringError};
 
 /// Returns `true` if lowering `operation` at the provided boundary never reads its attached regions, because it is a
 /// named composite call (refer to [`LowerableOperation::composite_key`]) that a backend implementation
@@ -128,7 +128,7 @@ impl NamedCompositeImplementation {
     /// one MLIR value per output.
     fn lower<'b, 'c: 'b, 't: 'c, O: LowerableOperationFamily>(
         &self,
-        lowerer: &mut XlaLowerer<'b, 'c, 't, O>,
+        lowerer: &mut Lowerer<'b, 'c, 't, O>,
         input_values: &[ValueRef<'b, 'c, 't>],
         input_types: &[ArrayIrType],
         output_types: &[ArrayIrType],
@@ -186,7 +186,7 @@ impl<
     S: CustomRuleSource<V, RegionOperation>,
 > LowerableOperation for CompositeOperation<V, RegionOperation, S>
 where
-    Self: Operation<Type = V::Type>,
+    Self: CoreOperation<Type = V::Type>,
 {
     #[inline]
     fn composite_key(&self) -> Option<&CompositeKey> {
@@ -195,7 +195,7 @@ where
 
     fn lower<'b, 'c: 'b, 't: 'c, O: LowerableOperationFamily>(
         &self,
-        lowerer: &mut XlaLowerer<'b, 'c, 't, O>,
+        lowerer: &mut Lowerer<'b, 'c, 't, O>,
         input_values: &[ValueRef<'b, 'c, 't>],
         input_types: &[Self::Type],
         output_types: &[Self::Type],
@@ -282,11 +282,11 @@ where
 
 impl<V: Typed + Parameter, RegionOperation, S> LowerableOperation for CompositeTransposeOperation<V, RegionOperation, S>
 where
-    Self: Operation,
+    Self: CoreOperation,
 {
     fn lower<'b, 'c: 'b, 't: 'c, O: LowerableOperationFamily>(
         &self,
-        _lowerer: &mut XlaLowerer<'b, 'c, 't, O>,
+        _lowerer: &mut Lowerer<'b, 'c, 't, O>,
         _input_values: &[ValueRef<'b, 'c, 't>],
         _input_types: &[Self::Type],
         _output_types: &[Self::Type],
@@ -310,14 +310,12 @@ mod tests {
     use ryft_core::{
         AddOperation, ArrayIrType, ArrayType, CompositeJvpRule, CompositeKey, CompositeOperation,
         CompositeTransposeOperation, CustomRuleDefinition, CustomRuleRegistration, DimensionValue, MulOperation,
-        NamedComposite, Placeholder, PrintOperation, Program, ProgramError,
+        NamedComposite, Placeholder, PrintOperation, Program as CoreProgram, ProgramError,
     };
 
     use crate::experimental::lowering::lower_mlir_module_for_program;
     use crate::experimental::lowering::tests::test_vector_type;
-    use crate::experimental::ops::{
-        FlatXlaProgram, XlaConstant, XlaOperation, XlaProgramBuilder as ArrayIrXlaProgramBuilder,
-    };
+    use crate::experimental::ops::{Constant, FlatProgram, Operation, ProgramBuilder as ArrayIrProgramBuilder};
     use crate::{Error, to_mlir_module_for_program};
 
     #[test]
@@ -327,7 +325,7 @@ mod tests {
         // multiplies on the tangent and cotangent sides) reaches the emitted module.
         let vector_type = test_vector_type(4);
         let primal = {
-            let mut builder = ArrayIrXlaProgramBuilder::new();
+            let mut builder = ArrayIrProgramBuilder::new();
             let input = builder.add_input(vector_type.clone().into());
             let printed = builder
                 .add_instruction(PrintOperation::<ArrayType>::new("primal"), Vec::new(), vec![input], None)
@@ -335,18 +333,18 @@ mod tests {
             let output =
                 builder.add_instruction(AddOperation::new(), Vec::new(), vec![printed, printed], None).unwrap()[0];
             builder
-                .build::<Vec<XlaConstant>, Vec<XlaConstant>>(vec![output], vec![Placeholder], vec![Placeholder])
+                .build::<Vec<Constant>, Vec<Constant>>(vec![output], vec![Placeholder], vec![Placeholder])
                 .unwrap()
         };
         let jvp = {
-            let mut builder = ArrayIrXlaProgramBuilder::new();
+            let mut builder = ArrayIrProgramBuilder::new();
             let input = builder.add_input(vector_type.clone().into());
             let tangent = builder.add_input(vector_type.clone().into());
             let output = builder.add_instruction(AddOperation::new(), Vec::new(), vec![input, input], None).unwrap()[0];
             let output_tangent =
                 builder.add_instruction(MulOperation::new(), Vec::new(), vec![tangent, tangent], None).unwrap()[0];
             builder
-                .build::<Vec<XlaConstant>, Vec<XlaConstant>>(
+                .build::<Vec<Constant>, Vec<Constant>>(
                     vec![output, output_tangent],
                     vec![Placeholder, Placeholder],
                     vec![Placeholder, Placeholder],
@@ -354,11 +352,11 @@ mod tests {
                 .unwrap()
         };
         let forward = {
-            let mut builder = ArrayIrXlaProgramBuilder::new();
+            let mut builder = ArrayIrProgramBuilder::new();
             let input = builder.add_input(vector_type.clone().into());
             let output = builder.add_instruction(AddOperation::new(), Vec::new(), vec![input, input], None).unwrap()[0];
             builder
-                .build::<Vec<XlaConstant>, Vec<XlaConstant>>(
+                .build::<Vec<Constant>, Vec<Constant>>(
                     vec![output, input],
                     vec![Placeholder],
                     vec![Placeholder, Placeholder],
@@ -366,13 +364,13 @@ mod tests {
                 .unwrap()
         };
         let backward = {
-            let mut builder = ArrayIrXlaProgramBuilder::new();
+            let mut builder = ArrayIrProgramBuilder::new();
             let residual = builder.add_input(vector_type.clone().into());
             let cotangent = builder.add_input(vector_type.clone().into());
             let input_cotangent =
                 builder.add_instruction(MulOperation::new(), Vec::new(), vec![residual, cotangent], None).unwrap()[0];
             builder
-                .build::<Vec<XlaConstant>, Vec<XlaConstant>>(
+                .build::<Vec<Constant>, Vec<Constant>>(
                     vec![input_cotangent],
                     vec![Placeholder, Placeholder],
                     vec![Placeholder],
@@ -384,14 +382,14 @@ mod tests {
             (CompositeOperation::from_rule_regions(CompositeJvpRule::Absent, true), vec![&forward, &backward]),
             (CompositeOperation::from_rule_regions(CompositeJvpRule::Explicit, true), vec![&jvp, &forward, &backward]),
         ] {
-            let mut builder = ArrayIrXlaProgramBuilder::new();
+            let mut builder = ArrayIrProgramBuilder::new();
             let mut regions = vec![builder.import_region(primal.entry_region_ref())];
             regions.extend(rules.into_iter().map(|rule| builder.import_region(rule.entry_region_ref())));
             let input = builder.add_input(vector_type.clone().into());
             let output =
-                builder.add_instruction(XlaOperation::Composite(operation), regions, vec![input], None).unwrap()[0];
+                builder.add_instruction(Operation::Composite(operation), regions, vec![input], None).unwrap()[0];
             let program = builder
-                .build::<Vec<XlaConstant>, Vec<XlaConstant>>(vec![output], vec![Placeholder], vec![Placeholder])
+                .build::<Vec<Constant>, Vec<Constant>>(vec![output], vec![Placeholder], vec![Placeholder])
                 .unwrap();
             let input_types = vec![vector_type.clone()];
             let output_types = vec![vector_type.clone()];
@@ -418,28 +416,28 @@ mod tests {
     fn test_custom_rule_lowering_inlines_only_the_primal_program() {
         // A custom rule call lowers only its primal program: its derivative rules are retained callbacks, not regions.
         let vector_type = test_vector_type(4);
-        let rules = CustomRuleRegistration::new(CustomRuleDefinition::<XlaConstant, XlaOperation>::new("doubled"));
+        let rules = CustomRuleRegistration::new(CustomRuleDefinition::<Constant, Operation>::new("doubled"));
         let primal = {
-            let mut builder = ArrayIrXlaProgramBuilder::new();
+            let mut builder = ArrayIrProgramBuilder::new();
             let input = builder.add_input(vector_type.clone().into());
             let output = builder.add_instruction(AddOperation::new(), Vec::new(), vec![input, input], None).unwrap()[0];
             builder
-                .build::<Vec<XlaConstant>, Vec<XlaConstant>>(vec![output], vec![Placeholder], vec![Placeholder])
+                .build::<Vec<Constant>, Vec<Constant>>(vec![output], vec![Placeholder], vec![Placeholder])
                 .unwrap()
         };
-        let mut builder = ArrayIrXlaProgramBuilder::new();
+        let mut builder = ArrayIrProgramBuilder::new();
         let primal_region = builder.import_region(primal.entry_region_ref());
         let input = builder.add_input(vector_type.clone().into());
         let output = builder
             .add_instruction(
-                XlaOperation::Composite(CompositeOperation::new(rules.reference())),
+                Operation::Composite(CompositeOperation::new(rules.reference())),
                 vec![primal_region],
                 vec![input],
                 None,
             )
             .unwrap()[0];
         let program = builder
-            .build::<Vec<XlaConstant>, Vec<XlaConstant>>(vec![output], vec![Placeholder], vec![Placeholder])
+            .build::<Vec<Constant>, Vec<Constant>>(vec![output], vec![Placeholder], vec![Placeholder])
             .unwrap();
         let input_types = vec![vector_type.clone()];
         let output_types = vec![vector_type.clone()];
@@ -456,7 +454,7 @@ mod tests {
         );
 
         // An unresolved reverse-mode carrier has no forward program to lower.
-        let mut builder = ArrayIrXlaProgramBuilder::new();
+        let mut builder = ArrayIrProgramBuilder::new();
         let input = builder.add_input(vector_type.clone().into());
         let carrier = CompositeTransposeOperation::new(
             rules.reference(),
@@ -465,10 +463,10 @@ mod tests {
             vec![vector_type.clone().into()],
         );
         let output = builder
-            .add_instruction(XlaOperation::CompositeTranspose(carrier), Vec::new(), vec![input], None)
+            .add_instruction(Operation::CompositeTranspose(carrier), Vec::new(), vec![input], None)
             .unwrap()[0];
         let program = builder
-            .build::<Vec<XlaConstant>, Vec<XlaConstant>>(vec![output], vec![Placeholder], vec![Placeholder])
+            .build::<Vec<Constant>, Vec<Constant>>(vec![output], vec![Placeholder], vec![Placeholder])
             .unwrap();
         assert_eq!(
             to_mlir_module_for_program(&program, &[], &input_types, &output_types, "main", None, None)
@@ -485,42 +483,34 @@ mod tests {
         // lowering, so lowering it is rejected.
         let vector_type = test_vector_type(4);
         let backward = {
-            let mut builder = ArrayIrXlaProgramBuilder::new();
+            let mut builder = ArrayIrProgramBuilder::new();
             let residual = builder.add_input(vector_type.clone().into());
             let cotangent = builder.add_input(vector_type.clone().into());
             let output =
                 builder.add_instruction(MulOperation::new(), Vec::new(), vec![residual, cotangent], None).unwrap()[0];
             builder
-                .build::<Vec<XlaConstant>, Vec<XlaConstant>>(
-                    vec![output],
-                    vec![Placeholder, Placeholder],
-                    vec![Placeholder],
-                )
+                .build::<Vec<Constant>, Vec<Constant>>(vec![output], vec![Placeholder, Placeholder], vec![Placeholder])
                 .unwrap()
         };
-        let operation = CompositeTransposeOperation::<XlaConstant, XlaOperation>::from_backward_region(
+        let operation = CompositeTransposeOperation::<Constant, Operation>::from_backward_region(
             1,
             vec![ArrayIrType::Array(vector_type.clone())],
             vec![ArrayIrType::Array(vector_type.clone())],
         );
-        let mut builder = ArrayIrXlaProgramBuilder::new();
+        let mut builder = ArrayIrProgramBuilder::new();
         let backward_region = builder.import_region(backward.entry_region_ref());
         let tangent = builder.add_input(vector_type.clone().into());
         let residual = builder.add_input(vector_type.clone().into());
         let output = builder
             .add_instruction(
-                XlaOperation::CompositeTranspose(operation),
+                Operation::CompositeTranspose(operation),
                 vec![backward_region],
                 vec![tangent, residual],
                 None,
             )
             .unwrap()[0];
         let program = builder
-            .build::<Vec<XlaConstant>, Vec<XlaConstant>>(
-                vec![output],
-                vec![Placeholder, Placeholder],
-                vec![Placeholder],
-            )
+            .build::<Vec<Constant>, Vec<Constant>>(vec![output], vec![Placeholder, Placeholder], vec![Placeholder])
             .unwrap();
         let input_types = vec![vector_type.clone(), vector_type.clone()];
         let output_types = vec![vector_type];
@@ -536,32 +526,32 @@ mod tests {
     /// Returns a program that applies `calls` named composite calls of `rules` to the same input, each attaching the
     /// interned `body`, and returns their outputs.
     fn named_calls_program(
-        rules: &CustomRuleRegistration<XlaConstant, XlaOperation>,
-        body: &Arc<Program<XlaConstant, XlaOperation, Vec<XlaConstant>, Vec<XlaConstant>>>,
+        rules: &CustomRuleRegistration<Constant, Operation>,
+        body: &Arc<CoreProgram<Constant, Operation, Vec<Constant>, Vec<Constant>>>,
         calls: usize,
-    ) -> FlatXlaProgram {
+    ) -> FlatProgram {
         let vector_type = test_vector_type(4);
-        let mut builder = ArrayIrXlaProgramBuilder::new();
+        let mut builder = ArrayIrProgramBuilder::new();
         let input = builder.add_input(vector_type.clone().into());
         let outputs = (0..calls)
             .map(|_| {
-                let operation = XlaOperation::Composite(CompositeOperation::new(rules.reference()));
+                let operation = Operation::Composite(CompositeOperation::new(rules.reference()));
                 let regions = vec![builder.intern_callee(body, None).unwrap()];
                 builder.add_instruction(operation, regions, vec![input], None).unwrap()[0]
             })
             .collect::<Vec<_>>();
         builder
-            .build::<Vec<XlaConstant>, Vec<XlaConstant>>(outputs, vec![Placeholder], vec![Placeholder; calls])
+            .build::<Vec<Constant>, Vec<Constant>>(outputs, vec![Placeholder], vec![Placeholder; calls])
             .unwrap()
     }
 
     /// Returns a registration of a named composite with the provided key, whose body doubles its input.
-    fn named_rules(key: &str) -> CustomRuleRegistration<XlaConstant, XlaOperation> {
+    fn named_rules(key: &str) -> CustomRuleRegistration<Constant, Operation> {
         named_rules_with_version(key, 1)
     }
 
     /// Returns a named composite definition `x ↦ x + x` with the provided key name and version.
-    fn named_rules_with_version(key: &str, version: u32) -> CustomRuleRegistration<XlaConstant, XlaOperation> {
+    fn named_rules_with_version(key: &str, version: u32) -> CustomRuleRegistration<Constant, Operation> {
         let key = CompositeKey::new(key.to_string(), version);
         let output_types = |types: &[ArrayIrType]| Ok(types.to_vec());
         let named = NamedComposite::new(key, output_types, |inputs| Ok(vec![inputs[0].clone() + inputs[0].clone()]));
@@ -569,8 +559,8 @@ mod tests {
     }
 
     /// Returns the program `x ↦ x + x` over the test vector type, shared as a named composite body.
-    fn doubled_body() -> Arc<Program<XlaConstant, XlaOperation, Vec<XlaConstant>, Vec<XlaConstant>>> {
-        let mut builder = ArrayIrXlaProgramBuilder::new();
+    fn doubled_body() -> Arc<CoreProgram<Constant, Operation, Vec<Constant>, Vec<Constant>>> {
+        let mut builder = ArrayIrProgramBuilder::new();
         let input = builder.add_input(test_vector_type(4).into());
         let output = builder.add_instruction(AddOperation::new(), Vec::new(), vec![input, input], None).unwrap()[0];
         Arc::new(builder.build(vec![output], vec![Placeholder], vec![Placeholder]).unwrap())
@@ -578,7 +568,7 @@ mod tests {
 
     /// Lowers `program`, whose outputs all have the test vector type, for `target_platform`.
     fn lower_named_calls(
-        program: &crate::experimental::ops::FlatXlaProgram,
+        program: &crate::experimental::ops::FlatProgram,
         target_platform: Option<&str>,
     ) -> Result<String, Error> {
         let input_types = vec![test_vector_type(4)];
@@ -682,23 +672,23 @@ mod tests {
         let second = named_rules("ryft.tests.xla_named_conflict");
         let doubled = doubled_body();
         let squared = {
-            let mut builder = ArrayIrXlaProgramBuilder::new();
+            let mut builder = ArrayIrProgramBuilder::new();
             let input = builder.add_input(test_vector_type(4).into());
             let output = builder.add_instruction(MulOperation::new(), Vec::new(), vec![input, input], None).unwrap()[0];
             Arc::new(builder.build(vec![output], vec![Placeholder], vec![Placeholder]).unwrap())
         };
-        let mut builder = ArrayIrXlaProgramBuilder::new();
+        let mut builder = ArrayIrProgramBuilder::new();
         let input = builder.add_input(test_vector_type(4).into());
         let outputs = [(&first, &doubled), (&second, &squared), (&first, &doubled), (&second, &squared)]
             .into_iter()
             .map(|(rules, body)| {
-                let operation = XlaOperation::Composite(CompositeOperation::new(rules.reference()));
+                let operation = Operation::Composite(CompositeOperation::new(rules.reference()));
                 let regions = vec![builder.intern_callee(body, None).unwrap()];
                 builder.add_instruction(operation, regions, vec![input], None).unwrap()[0]
             })
             .collect::<Vec<_>>();
         let program = builder
-            .build::<Vec<XlaConstant>, Vec<XlaConstant>>(outputs, vec![Placeholder], vec![Placeholder; 4])
+            .build::<Vec<Constant>, Vec<Constant>>(outputs, vec![Placeholder], vec![Placeholder; 4])
             .unwrap();
         assert_eq!(
             lower_named_calls(&program, None).unwrap(),
@@ -732,10 +722,10 @@ mod tests {
         let inner_body = doubled_body();
         let outer_body = |version: u32| {
             let inner = named_rules_with_version("ryft.tests.xla_named_inner", version);
-            let mut builder = ArrayIrXlaProgramBuilder::new();
+            let mut builder = ArrayIrProgramBuilder::new();
             let input = builder.add_input(test_vector_type(4).into());
             let regions = vec![builder.intern_callee(&inner_body, None).unwrap()];
-            let operation = XlaOperation::Composite(CompositeOperation::new(inner.reference()));
+            let operation = Operation::Composite(CompositeOperation::new(inner.reference()));
             let output = builder.add_instruction(operation, regions, vec![input], None).unwrap()[0];
             (inner, Arc::new(builder.build(vec![output], vec![Placeholder], vec![Placeholder]).unwrap()))
         };
@@ -744,18 +734,18 @@ mod tests {
         assert_ne!(first_body.to_string(), second_body.to_string());
         let first = named_rules("ryft.tests.xla_named_outer");
         let second = named_rules("ryft.tests.xla_named_outer");
-        let mut builder = ArrayIrXlaProgramBuilder::new();
+        let mut builder = ArrayIrProgramBuilder::new();
         let input = builder.add_input(test_vector_type(4).into());
         let outputs = [(&first, &first_body), (&second, &second_body), (&first, &first_body), (&second, &second_body)]
             .into_iter()
             .map(|(rules, body)| {
-                let operation = XlaOperation::Composite(CompositeOperation::new(rules.reference()));
+                let operation = Operation::Composite(CompositeOperation::new(rules.reference()));
                 let regions = vec![builder.intern_callee(body, None).unwrap()];
                 builder.add_instruction(operation, regions, vec![input], None).unwrap()[0]
             })
             .collect::<Vec<_>>();
         let program = builder
-            .build::<Vec<XlaConstant>, Vec<XlaConstant>>(outputs, vec![Placeholder], vec![Placeholder; 4])
+            .build::<Vec<Constant>, Vec<Constant>>(outputs, vec![Placeholder], vec![Placeholder; 4])
             .unwrap();
         assert_eq!(
             lower_named_calls(&program, None).unwrap(),
@@ -793,18 +783,18 @@ mod tests {
         let replaced = named_rules_with_version("ryft.tests.xla_named_square", 1);
         let lowered = named_rules_with_version("ryft.tests.xla_named_square", 2);
         let body = doubled_body();
-        let mut builder = ArrayIrXlaProgramBuilder::new();
+        let mut builder = ArrayIrProgramBuilder::new();
         let input = builder.add_input(test_vector_type(4).into());
         let outputs = [&replaced, &lowered, &lowered]
             .into_iter()
             .map(|rules| {
-                let operation = XlaOperation::Composite(CompositeOperation::new(rules.reference()));
+                let operation = Operation::Composite(CompositeOperation::new(rules.reference()));
                 let regions = vec![builder.intern_callee(&body, None).unwrap()];
                 builder.add_instruction(operation, regions, vec![input], None).unwrap()[0]
             })
             .collect::<Vec<_>>();
         let program = builder
-            .build::<Vec<XlaConstant>, Vec<XlaConstant>>(outputs, vec![Placeholder], vec![Placeholder; 3])
+            .build::<Vec<Constant>, Vec<Constant>>(outputs, vec![Placeholder], vec![Placeholder; 3])
             .unwrap();
         assert_eq!(
             lower_named_calls(&program, Some("cuda")).unwrap(),
@@ -832,25 +822,25 @@ mod tests {
         let first = named_rules("ryft.tests.xla_named_unshareable");
         let second = named_rules("ryft.tests.xla_named_unshareable");
         let unshareable = {
-            let mut builder = ArrayIrXlaProgramBuilder::new();
+            let mut builder = ArrayIrProgramBuilder::new();
             let input = builder.add_input(test_vector_type(4).into());
-            builder.add_constant(XlaConstant::Dimension(DimensionValue::constant(3).unwrap()));
+            builder.add_constant(Constant::Dimension(DimensionValue::constant(3).unwrap()));
             let output = builder.add_instruction(MulOperation::new(), Vec::new(), vec![input, input], None).unwrap()[0];
             Arc::new(builder.build(vec![output], vec![Placeholder], vec![Placeholder]).unwrap())
         };
         let doubled = doubled_body();
-        let mut builder = ArrayIrXlaProgramBuilder::new();
+        let mut builder = ArrayIrProgramBuilder::new();
         let input = builder.add_input(test_vector_type(4).into());
         let outputs = [(&first, &unshareable), (&second, &doubled), (&first, &unshareable), (&second, &doubled)]
             .into_iter()
             .map(|(rules, body)| {
-                let operation = XlaOperation::Composite(CompositeOperation::new(rules.reference()));
+                let operation = Operation::Composite(CompositeOperation::new(rules.reference()));
                 let regions = vec![builder.intern_callee(body, None).unwrap()];
                 builder.add_instruction(operation, regions, vec![input], None).unwrap()[0]
             })
             .collect::<Vec<_>>();
         let program = builder
-            .build::<Vec<XlaConstant>, Vec<XlaConstant>>(outputs, vec![Placeholder], vec![Placeholder; 4])
+            .build::<Vec<Constant>, Vec<Constant>>(outputs, vec![Placeholder], vec![Placeholder; 4])
             .unwrap();
         assert_eq!(
             lower_named_calls(&program, None).unwrap(),

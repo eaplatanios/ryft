@@ -3,22 +3,15 @@ use crate::kernels::KernelEmbeddingError;
 
 // TODO(eaplatanios): Review this module.
 
-/// Backend token used for traced XLA staging and PJRT-backed execution.
-pub mod domains;
 /// StableHLO and Shardy lowering helpers for traced XLA programs.
 pub mod lowering;
 /// Backend-owned staged operation types for traced XLA programs.
 pub mod ops;
-/// General XLA program tracing: the [`trace`] entry point, its [`TracedXlaProgram`] result, which lowers the traced
+/// General XLA program tracing: the [`trace`] entry point, its [`TracedProgram`] result, which lowers the traced
 /// program to StableHLO/Shardy MLIR for compilation and execution, and the [`Error`](crate::Error) of both stages.
 pub mod tracing;
 
-pub use domains::{
-    CompilationError, ExecutionError, XlaAnalysisValue, XlaCompilationAnalysis, XlaDomain, XlaFeedbackDirectedProfile,
-    XlaMemoryAnalysis, XlaOptimizedProgram, XlaSession,
-};
-
-pub use tracing::{TracedXlaProgram, XlaArrayTracer, trace, trace_with_context};
+pub use tracing::{ArrayTracer, TracedProgram, trace, trace_with_context};
 
 // Experimental kernel integrations retain their concrete error payloads in the common custom carrier.
 impl From<ryft_kernels::KernelError> for Error {
