@@ -25,6 +25,8 @@ use crate::experimental::lowering::{contains_unresolved_references, contains_unr
 use crate::experimental::ops::{Constant, FlatProgram, Operation};
 use crate::{Error, Value};
 
+// TODO(eaplatanios): Review this module.
+
 /// XLA option, executable compatibility, persistence, and analysis failures.
 #[derive(Clone, Debug, thiserror::Error)]
 pub enum CompilationError {
@@ -728,13 +730,40 @@ fn apply_input_shardings(input_types: Vec<ArrayIrType>, options: &Options) -> Re
     apply_signature_shardings(input_types, Some(input_shardings), "input")
 }
 
-/// Returns the structured `input_types` with the input sharding overrides of `options` applied (refer to
-/// [`apply_input_shardings`]). Call this before [`StagedFunction::stage`](ryft_core::StagedFunction::stage) when
-/// staging with options that may carry input sharding overrides.
-pub(crate) fn with_input_shardings<In: Parameterized<ArrayIrType>>(
-    input_types: In,
-    options: &Options,
-) -> Result<In, Error> {
+/// Applies [`Options::input_shardings`] to `input_types`, preserving their parameter structure. Returns the input
+/// types unchanged when no overrides are configured.
+///
+/// Call this before [`ryft_core::StagedFunction::stage`] when using the generic core staging API with XLA sharding
+/// overrides. Tracing must see the effective input shardings, and lowering rejects staged input types that disagree
+/// with the overrides. The staging entry points in [`crate::jit`] already apply this normalization.
+///
+/// # Errors
+///
+/// Returns an error if the number of overrides differs from the number of flat inputs, an override cannot be applied
+/// to an input type, or overrides are requested for external reference inputs. The reference ABI determines the
+/// effective sharding of external state, so it does not accept input sharding overrides.
+///
+/// # Examples
+///
+/// ```
+/// use ryft_core::{
+///     ArrayIrType, ArrayType, DataType, Device, DeviceMesh, LogicalMesh, MeshAxis, MeshAxisType, Sharding,
+///     ShardingDimension,
+/// };
+/// use ryft_xla::Options;
+/// use ryft_xla::domains::with_input_shardings;
+///
+/// let logical_mesh = LogicalMesh::new(vec![MeshAxis::new("x", 2, MeshAxisType::Auto)?])?;
+/// let mesh = DeviceMesh::new(logical_mesh, vec![Device::new(0, 0), Device::new(1, 0)])?;
+/// let sharding = Sharding::new(mesh.logical_mesh().clone(), vec![ShardingDimension::sharded(["x"])])?;
+/// let options = Options::new(mesh).with_input_shardings(vec![sharding.clone()]);
+/// let input_type = ArrayType::new_static(DataType::F32, [4]);
+/// let input_types = (ArrayIrType::Array(input_type.clone()),);
+/// let input_types = with_input_shardings(input_types, &options)?;
+/// assert_eq!(input_types, (ArrayIrType::Array(input_type.with_sharding(sharding)?),));
+/// # Ok::<(), Box<dyn std::error::Error>>(())
+/// ```
+pub fn with_input_shardings<In: Parameterized<ArrayIrType>>(input_types: In, options: &Options) -> Result<In, Error> {
     if options.input_shardings.is_none() {
         return Ok(input_types);
     }

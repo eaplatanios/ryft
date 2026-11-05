@@ -42,7 +42,9 @@ Use this file as the single detailed reference for `ryft` testing conventions.
 - Use `TestRegionOperation` for tests that specifically isolate region-carrying program machinery.
 - Keep test-only instrumentation out of production types and functions. Prefer observing existing behavior through
   test fixtures (e.g., counting operation queries) and inspecting actual caches in colocated tests instead of adding
-  conditional counter fields or increments to production analysis.
+  conditional counter fields or increments to production analysis. Define shared test-only types, state, and injection
+  setters directly in the owning inline `tests` module, and let any required `cfg(test)` execution hooks call those
+  helpers. Keep test support out of production facade re-exports and inherent APIs.
 
 ## Structure
 

@@ -9,11 +9,13 @@ use crate::domains::Domain;
 use crate::domains::eager::{EAGER_DISPATCH_CACHE_CAPACITY, EagerDispatchKey};
 use crate::domains::effects::EffectScope;
 use crate::domains::programs::CompiledProgram;
-use crate::domains::target::Target;
+use crate::domains::targets::Target;
 use crate::kernels::CudaKernelRuntime;
 #[cfg(feature = "rocm")]
 use crate::kernels::RocmKernelRuntime;
 use crate::{Array, Error};
+
+// TODO(eaplatanios): Review this module.
 
 /// Shared compilation and effect resources for execution on one externally owned PJRT [`Client`].
 ///

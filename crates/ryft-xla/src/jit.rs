@@ -97,6 +97,7 @@ use ryft_core::{
 };
 use ryft_pjrt::Execution;
 
+use crate::domains::execution::{validate_input_type, validate_runtime_outputs};
 use crate::domains::{CompiledProgram, with_input_shardings};
 use crate::experimental::ops::{Constant, Operation};
 use crate::{
@@ -875,7 +876,7 @@ impl<'c> Domain<'c> {
         let flat_inputs = lift_arrays::<In>(inputs)?.into_parameters().collect::<Vec<_>>();
         executable.function.validate_input_count(flat_inputs.len())?;
         for (expected, actual) in executable.function.input_types().iter().zip(flat_inputs.iter().map(Typed::r#type)) {
-            crate::domains::validate_input_type(
+            validate_input_type(
                 <&ArrayType>::try_from(expected).map_err(ProgramError::from)?,
                 <&ArrayType>::try_from(actual.as_ref()).map_err(ProgramError::from)?,
             )?;
@@ -890,10 +891,7 @@ impl<'c> Domain<'c> {
             .map_err(ProgramError::from)?;
         let execution = self.execute_compiled_async(executable.function.compiled_program(), inputs)?;
         let (flat_outputs, fence) = execution.into_parts();
-        crate::domains::validate_runtime_outputs(
-            executable.function.compiled_program().output_types(),
-            flat_outputs.as_slice(),
-        )?;
+        validate_runtime_outputs(executable.function.compiled_program().output_types(), flat_outputs.as_slice())?;
         let outputs = ProgramParameterValues::<Out, Value<'c>>::from_parameters(
             executable.function.output_structure().clone(),
             flat_outputs.into_iter().map(Value::Array),
@@ -1749,7 +1747,7 @@ mod tests {
     };
     use ryft_pjrt::{ClientOptions, CpuClientOptions, load_cpu_plugin};
 
-    use crate::domains::StatefulFailureInjection;
+    use crate::domains::tests::{StatefulFailureInjection, inject_stateful_completion, inject_stateful_failure};
     use crate::experimental::ops::{Constant, Operation};
     use crate::jit::{
         CompileTracer, CompiledFunction, ExecutableFunction, JittedFunction, StagedFunction, StatefulCompileTracer,
@@ -3368,11 +3366,11 @@ mod tests {
         // blocks on first instead of silently depending on the order the transaction awaits its leases.
         let (await_started, await_observed) = mpsc::channel();
         let first_gate = ControlledReferenceCompletion::with_await_notification("first read", await_started.clone());
-        Domain::inject_stateful_completion_for_test(CoreReferenceCompletion::new(first_gate.clone()));
+        inject_stateful_completion(CoreReferenceCompletion::new(first_gate.clone()));
         let first_read =
             read.call_statefully_async(&domain, Value::Reference(Reference::new(reference.clone(), domain.clone())));
         let second_gate = ControlledReferenceCompletion::with_await_notification("second read", await_started);
-        Domain::inject_stateful_completion_for_test(CoreReferenceCompletion::new(second_gate.clone()));
+        inject_stateful_completion(CoreReferenceCompletion::new(second_gate.clone()));
         let second_read =
             read.call_statefully_async(&domain, Value::Reference(Reference::new(reference.clone(), domain.clone())));
 
@@ -3461,7 +3459,7 @@ mod tests {
                 .unwrap(),
         );
         let predecessor = ControlledReferenceCompletion::new();
-        Domain::inject_stateful_completion_for_test(CoreReferenceCompletion::new(predecessor.clone()));
+        inject_stateful_completion(CoreReferenceCompletion::new(predecessor.clone()));
         let first_update =
             Array::from_host_buffer(&domain, array_type.clone(), mesh.clone(), 2.0f32.to_ne_bytes().as_slice())
                 .unwrap();
@@ -3514,7 +3512,7 @@ mod tests {
                 .unwrap(),
         );
         let completion = ControlledReferenceCompletion::new();
-        Domain::inject_stateful_completion_for_test(CoreReferenceCompletion::new(completion.clone()));
+        inject_stateful_completion(CoreReferenceCompletion::new(completion.clone()));
         let update = Array::from_host_buffer(&domain, array_type, mesh, 2.0f32.to_ne_bytes().as_slice()).unwrap();
         drop(compiled.call_statefully_async(
             &domain,
@@ -4610,7 +4608,7 @@ mod tests {
         let update =
             Array::from_host_buffer(&domain, array_type.clone(), mesh.clone(), 2.0f32.to_ne_bytes().as_slice())
                 .unwrap();
-        Domain::inject_stateful_failure_for_test(StatefulFailureInjection::BeforeSubmission);
+        inject_stateful_failure(StatefulFailureInjection::BeforeSubmission);
         assert!(matches!(
             compiled.call_statefully(
                 &domain,
@@ -4636,7 +4634,7 @@ mod tests {
         let update =
             Array::from_host_buffer(&domain, array_type.clone(), mesh.clone(), 2.0f32.to_ne_bytes().as_slice())
                 .unwrap();
-        Domain::inject_stateful_failure_for_test(StatefulFailureInjection::AfterHandoff);
+        inject_stateful_failure(StatefulFailureInjection::AfterHandoff);
         assert!(matches!(
             compiled.call_statefully(
                 &domain,
@@ -4670,7 +4668,7 @@ mod tests {
         let update =
             Array::from_host_buffer(&domain, array_type.clone(), mesh.clone(), 2.0f32.to_ne_bytes().as_slice())
                 .unwrap();
-        Domain::inject_stateful_failure_for_test(StatefulFailureInjection::BeforeHiddenReplacementCommit);
+        inject_stateful_failure(StatefulFailureInjection::BeforeHiddenReplacementCommit);
         assert!(matches!(
             compiled.call_statefully(
                 &domain,
@@ -4700,7 +4698,7 @@ mod tests {
         let committed_second = reference_new(10.0);
         let committed_read_only = reference_new(20.0);
         let update = Array::from_host_buffer(&domain, array_type, mesh, 2.0f32.to_ne_bytes().as_slice()).unwrap();
-        Domain::inject_stateful_failure_for_test(StatefulFailureInjection::BeforePublicReconstruction);
+        inject_stateful_failure(StatefulFailureInjection::BeforePublicReconstruction);
         assert!(matches!(
             compiled.call_statefully(
                 &domain,

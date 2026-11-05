@@ -16,6 +16,8 @@ use crate::domains::options::FeedbackDirectedProfile;
 use crate::domains::persistence::canonical_boundary_types;
 use crate::experimental::lowering::signature::ExecutableSignature;
 
+// TODO(eaplatanios): Review this module.
+
 /// StableHLO lowering and call-boundary metadata produced before PJRT compilation.
 #[derive(Clone, Debug)]
 pub struct LoweredProgram {

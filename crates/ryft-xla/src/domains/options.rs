@@ -9,6 +9,8 @@ use sha2::{Digest, Sha256};
 
 use crate::{Error, RaggedDotLoweringStrategy};
 
+// TODO(eaplatanios): Review this module.
+
 /// Opaque XLA feedback-directed optimization profile used for profile-guided latency estimation.
 ///
 /// XLA defines the binary payload consumed by `ExecutableCompilationOptions::fdo_profile`; Ryft intentionally does

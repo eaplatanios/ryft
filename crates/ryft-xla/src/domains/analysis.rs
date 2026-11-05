@@ -13,6 +13,8 @@ use crate::domains::Domain;
 use crate::domains::compilation::CompilationError;
 use crate::domains::programs::CompiledProgram;
 
+// TODO(eaplatanios): Review this module.
+
 /// Typed value returned for a plugin-specific PJRT cost-analysis property.
 #[derive(Clone, Debug, Serialize, PartialEq)]
 #[serde(tag = "type", content = "value", rename_all = "snake_case")]

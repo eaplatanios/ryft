@@ -23,10 +23,12 @@ use crate::domains::Domain;
 use crate::domains::effects::ensure_effect_dispatch_allowed;
 use crate::domains::options::Options;
 use crate::domains::programs::CompiledProgram;
-use crate::domains::target::Target;
+use crate::domains::targets::Target;
 use crate::experimental::ops::{Constant, FlatProgram, Operation, ProgramBuilder};
 use crate::operations::composites::NamedCompositeImplementation;
 use crate::{Array, ArrayError, Dimension, Error, FromPjrt, ShardDescriptor, ShardLayout, ToPjrt, Value};
+
+// TODO(eaplatanios): Review this module.
 
 impl<'c> Context for Domain<'c> {
     /// Immediate dimension extents materialize directly; Boolean literals upload a replicated scalar. A

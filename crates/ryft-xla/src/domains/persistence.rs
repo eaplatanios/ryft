@@ -20,6 +20,8 @@ use crate::domains::execution::{ExecutionPlan, flatten_device_assignment};
 use crate::domains::programs::{CompiledProgram, LoweredProgram};
 use crate::experimental::lowering::signature::ExecutableSignature;
 
+// TODO(eaplatanios): Review this module.
+
 const PERSISTENT_EXECUTABLE_MAGIC: &[u8; 8] = b"RYFTXLA8";
 const PERSISTENT_EXECUTABLE_SCHEMA_VERSION: u32 = 8;
 const PERSISTENT_EXECUTABLE_FEATURE_FLAGS: u64 = 15;

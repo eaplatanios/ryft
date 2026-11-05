@@ -19,6 +19,7 @@ use ryft_pjrt::extensions::ffi::{
 };
 use ryft_pjrt::{Client, Error as PjrtError};
 
+use crate::domains::effects::EffectCallbackGuard;
 use crate::experimental::lowering::types::{
     lower_physical_bound_value, lower_runtime_dimension_size_i64, lower_static_index_constants, lower_tensor_type,
 };
@@ -476,7 +477,7 @@ unsafe fn assertion_handler_for_memory(
     call_frame: *mut XLA_FFI_CallFrame,
     memory: impl FnOnce(&FfiCallFrame<'_>) -> Result<AssertionBufferMemory, FfiError>,
 ) -> *mut XLA_FFI_Error {
-    let _callback_guard = crate::domains::EffectCallbackGuard::enter();
+    let _callback_guard = EffectCallbackGuard::enter();
     // SAFETY: XLA owns the call frame for this invocation. All access is localized in `FfiCallFrame` and the checked
     // scalar-buffer readers below.
     unsafe {

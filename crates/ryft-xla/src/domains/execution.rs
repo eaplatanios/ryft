@@ -28,11 +28,17 @@ use crate::domains::Domain;
 use crate::domains::compilation::CompilationError;
 use crate::domains::effects::{ensure_effect_dispatch_allowed, format_effect_failures};
 use crate::domains::programs::CompiledProgram;
+#[cfg(test)]
+use crate::domains::tests::{
+    StatefulFailureInjection, take_stateful_completion_injection, take_stateful_failure_injection,
+};
 use crate::experimental::lowering::signature::ExecutableSignature;
 use crate::kernels::CudaKernelRuntime;
 #[cfg(feature = "rocm")]
 use crate::kernels::RocmKernelRuntime;
 use crate::{Array, ArrayError, Error, FromPjrt, ToPjrt, Value};
+
+// TODO(eaplatanios): Review this module.
 
 /// XLA invocation, runtime capability, completion, and effect-recovery failures.
 #[derive(Clone, Debug, thiserror::Error)]
@@ -153,64 +159,6 @@ impl<'c> PreparedExecution<'c> {
             self.donation_flags.as_slice(),
         )?;
         Ok((arguments, self.input_refinements, self.physical_output_count))
-    }
-}
-
-/// Deterministic stateful-runtime failure point used by transaction protocol regressions.
-#[cfg(test)]
-#[derive(Copy, Clone, Debug, PartialEq, Eq)]
-pub(crate) enum StatefulFailureInjection {
-    /// Fails immediately before PJRT submission, after argument preparation but before publication.
-    BeforeSubmission,
-
-    /// Fails after mutable inputs cross the execution handoff boundary.
-    AfterHandoff,
-
-    /// Fails after state publication but before hidden final-state replacements are reconstructed and committed.
-    BeforeHiddenReplacementCommit,
-
-    /// Fails after hidden final-state replacements are committed but before public outputs are reconstructed.
-    BeforePublicReconstruction,
-}
-
-#[cfg(test)]
-std::thread_local! {
-    /// One-shot failure injection scoped to the invoking test thread.
-    static STATEFUL_FAILURE_INJECTION: std::cell::Cell<Option<StatefulFailureInjection>> = const {
-        std::cell::Cell::new(None)
-    };
-
-    /// One-shot backend-neutral dependency joined into the next stateful execution on the current test thread.
-    static STATEFUL_COMPLETION_INJECTION: RefCell<Option<CoreReferenceCompletion>> = const { RefCell::new(None) };
-}
-
-#[cfg(test)]
-fn take_stateful_failure_injection(expected: StatefulFailureInjection) -> bool {
-    STATEFUL_FAILURE_INJECTION.with(|injection| {
-        if injection.get() != Some(expected) {
-            return false;
-        }
-        injection.set(None);
-        true
-    })
-}
-
-#[cfg(test)]
-fn take_stateful_completion_injection() -> Option<CoreReferenceCompletion> {
-    STATEFUL_COMPLETION_INJECTION.with(|injection| injection.borrow_mut().take())
-}
-
-impl<'c> Domain<'c> {
-    /// Injects one deterministic failure into the next stateful call on the current test thread.
-    #[cfg(test)]
-    pub(crate) fn inject_stateful_failure_for_test(failure: StatefulFailureInjection) {
-        STATEFUL_FAILURE_INJECTION.with(|injection| injection.set(Some(failure)));
-    }
-
-    /// Joins one deterministic dependency into the next stateful call on the current test thread.
-    #[cfg(test)]
-    pub(crate) fn inject_stateful_completion_for_test(completion: CoreReferenceCompletion) {
-        STATEFUL_COMPLETION_INJECTION.with(|injection| *injection.borrow_mut() = Some(completion));
     }
 }
 

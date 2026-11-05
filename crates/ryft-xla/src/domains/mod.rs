@@ -1,4 +1,45 @@
-//! XLA domains, sessions, compilation, and execution through the shared domain interfaces.
+//! XLA execution domains and the shared resources used to stage, compile, and execute array programs.
+//!
+//! A [`Domain`] implements [`ryft_core::Domain`] over [`ArrayIrType`], with [`Value`]s that hold device arrays,
+//! checked dimensions, or mutable references. Values retain their domain, so eager operations and transforms recover
+//! the execution context from their inputs. [`Constant`] and [`Operation`] provide the corresponding stored-constant
+//! and operation families for traced programs.
+//!
+//! # Sessions and Domains
+//!
+//! A [`Session`] borrows one PJRT [`Client`] and owns its compilation cache, default effect scope, and kernel runtime
+//! resources. Create a session with [`Session::new`] or one of its cache-configuring constructors, then obtain a
+//! domain through [`Session::domain`]. Domains derived from the same session share those resources. Creating another
+//! session gives an independent cache and effect scope, even when it borrows the same client.
+//!
+//! [`Options`] supplies the execution [`DeviceMesh`], sharding overrides, donation flags, and backend compilation
+//! policies for a staged function. The domain's [`CompilationOptions`] supplies the underlying PJRT compiler settings.
+//! [`Target`] describes the client's platform and devices without retaining live device handles.
+//!
+//! # Compilation and Execution
+//!
+//! Use [`compile`](crate::compile) for a compiled function or [`jitted`](crate::jitted) for a retained dispatcher that
+//! specializes on its runtime inputs. The backend also implements the generic lifecycle in
+//! [`ryft_core::compilation`]. When staging directly through [`ryft_core::StagedFunction::stage`], apply
+//! [`with_input_shardings`] to the input types first if the options specify input sharding overrides.
+//!
+//! [`LoweredProgram`] contains StableHLO and the metadata needed for compilation. [`CompiledProgram`] contains the
+//! loaded executable and its invocation contract. These flat artifacts are distinct from the typed function handles
+//! in [`crate::jit`], which also retain input and output container structures. The session's [`CompilationContext`]
+//! coordinates artifact reuse, and [`CompilationKey`] records the exact computation and compilation configuration.
+//! [`CompilationAnalysis`] and [`OptimizedProgram`] expose compiler diagnostics for a compiled program.
+//!
+//! # Effects and Completion
+//!
+//! Cloned domains share effect ordering. [`Domain::fork_effect_scope`] starts an independent sequence while retaining
+//! the session and its cache. Cached programs contain no session or effect scope, so execution uses the invoking
+//! domain's scope. Mutable references also retain their own identity-based coordination across calls.
+//!
+//! Array readiness observes completion of the work that produced that array. [`Domain::effects_barrier`] observes
+//! previously submitted effects, including work whose outputs were discarded. Call it before dropping the client
+//! when those effects must be observed. Sessions, domains, and their values borrow the client and cannot outlive it.
+
+// TODO(eaplatanios): Review this module.
 
 use std::sync::{Arc, LazyLock};
 
@@ -21,21 +62,15 @@ pub mod options;
 pub mod persistence;
 pub mod programs;
 pub mod sessions;
-pub mod target;
+pub mod targets;
 
 pub use analysis::{AnalysisValue, CompilationAnalysis, MemoryAnalysis, OptimizedProgram};
-pub use compilation::{CompilationError, CompilationKey, DispatchKey};
+pub use compilation::{CompilationError, CompilationKey, DispatchKey, with_input_shardings};
 pub use execution::ExecutionError;
 pub use options::{FeedbackDirectedProfile, InputBoundBucketing, Options};
 pub use programs::{CompiledProgram, LoweredProgram};
 pub use sessions::Session;
-pub use target::{Target, TargetDevice};
-
-pub(crate) use compilation::with_input_shardings;
-pub(crate) use effects::EffectCallbackGuard;
-#[cfg(test)]
-pub(crate) use execution::StatefulFailureInjection;
-pub(crate) use execution::{validate_input_type, validate_runtime_outputs};
+pub use targets::{Target, TargetDevice};
 
 /// Stateful backend that materializes, lowers, compiles, and executes traced XLA programs
 /// against a live PJRT [`Client`].
@@ -228,12 +263,14 @@ impl ryft_core::NamedAxes for Domain<'_> {
 
 #[cfg(test)]
 pub(crate) mod tests {
+    use std::cell::RefCell;
     use std::sync::Arc;
 
     use pretty_assertions::assert_eq;
     use ryft_core::{
         ArrayIrType, ArrayType, DataType, Device, DeviceMesh, Dimension as CoreDimension, LogicalMesh, MeshAxis,
-        MeshAxisType, Placeholder, ProjectedContext, ReferenceReadOperation, ReferenceType, Shape, Sharding,
+        MeshAxisType, Placeholder, ProjectedContext, ReferenceCompletion as CoreReferenceCompletion,
+        ReferenceReadOperation, ReferenceType, Shape, Sharding,
     };
     use ryft_pjrt::protos::CompilationOptions;
     use ryft_pjrt::{Client, ClientOptions, CpuClientOptions, load_cpu_plugin};
@@ -244,6 +281,58 @@ pub(crate) mod tests {
     use crate::{Array, FromPjrt, Value};
 
     use super::*;
+
+    /// Deterministic stateful-runtime failure point used by transaction protocol regressions.
+    #[derive(Copy, Clone, Debug, PartialEq, Eq)]
+    pub(crate) enum StatefulFailureInjection {
+        /// Fails immediately before PJRT submission, after argument preparation but before publication.
+        BeforeSubmission,
+
+        /// Fails after mutable inputs cross the execution handoff boundary.
+        AfterHandoff,
+
+        /// Fails after state publication but before hidden final-state replacements are reconstructed and committed.
+        BeforeHiddenReplacementCommit,
+
+        /// Fails after hidden final-state replacements are committed but before public outputs are reconstructed.
+        BeforePublicReconstruction,
+    }
+
+    std::thread_local! {
+        /// One-shot failure injection scoped to the invoking test thread.
+        static STATEFUL_FAILURE_INJECTION: std::cell::Cell<Option<StatefulFailureInjection>> = const {
+            std::cell::Cell::new(None)
+        };
+
+        /// One-shot backend-neutral dependency joined into the next stateful execution on the current test thread.
+        static STATEFUL_COMPLETION_INJECTION: RefCell<Option<CoreReferenceCompletion>> = const { RefCell::new(None) };
+    }
+
+    /// Consumes the pending failure only when execution reaches its selected injection point.
+    pub(super) fn take_stateful_failure_injection(expected: StatefulFailureInjection) -> bool {
+        STATEFUL_FAILURE_INJECTION.with(|injection| {
+            if injection.get() != Some(expected) {
+                return false;
+            }
+            injection.set(None);
+            true
+        })
+    }
+
+    /// Takes the dependency to join into the next stateful execution on the current test thread.
+    pub(super) fn take_stateful_completion_injection() -> Option<CoreReferenceCompletion> {
+        STATEFUL_COMPLETION_INJECTION.with(|injection| injection.borrow_mut().take())
+    }
+
+    /// Injects one deterministic failure into the next stateful call on the current test thread.
+    pub(crate) fn inject_stateful_failure(failure: StatefulFailureInjection) {
+        STATEFUL_FAILURE_INJECTION.with(|injection| injection.set(Some(failure)));
+    }
+
+    /// Joins one deterministic dependency into the next stateful call on the current test thread.
+    pub(crate) fn inject_stateful_completion(completion: CoreReferenceCompletion) {
+        STATEFUL_COMPLETION_INJECTION.with(|injection| *injection.borrow_mut() = Some(completion));
+    }
 
     pub(crate) fn domain_mesh(client: &Client<'_>, axis: &str, axis_size: usize) -> DeviceMesh {
         let logical_mesh = LogicalMesh::new(vec![MeshAxis::new(axis, axis_size, MeshAxisType::Auto).unwrap()]).unwrap();

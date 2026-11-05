@@ -15,6 +15,7 @@ use ryft_pjrt::extensions::ffi::{
 };
 use ryft_pjrt::{Client, Error as PjrtError};
 
+use crate::domains::effects::EffectCallbackGuard;
 use crate::experimental::lowering::{EffectTokens, current_or_new_token};
 use crate::{Error, LowerableOperation, LowerableOperationFamily, Lowerer};
 
@@ -236,7 +237,7 @@ unsafe fn print_handler_for_memory(
     call_frame: *mut XLA_FFI_CallFrame,
     memory: impl FnOnce(&FfiCallFrame<'_>) -> Result<PrintBufferMemory, FfiError>,
 ) -> *mut XLA_FFI_Error {
-    let _callback_guard = crate::domains::EffectCallbackGuard::enter();
+    let _callback_guard = EffectCallbackGuard::enter();
     // SAFETY: The XLA runtime passes a call frame that is valid for the duration of this invocation, and all
     // further unsafe access to it is localized in the safe `FfiCallFrame` wrapper and `handle_print_call_frame`.
     unsafe {

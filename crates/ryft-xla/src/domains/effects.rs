@@ -9,6 +9,8 @@ use ryft_pjrt::Buffer;
 use crate::Error;
 use crate::domains::execution::ExecutionError;
 
+// TODO(eaplatanios): Review this module.
+
 /// Renders the failures observed by an effect barrier in their original submission order.
 pub(super) fn format_effect_failures(failures: &[(u64, Arc<str>)]) -> String {
     failures
