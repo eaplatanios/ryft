@@ -60,8 +60,8 @@ use crate::arrays::{
     Array, ArrayAddressing, ArrayBatch, ArrayBatchingPolicy, ArrayElement, ArrayExtentBatchingPolicy, ArrayIrContext,
     ArrayIrType, ArrayType, DataType, Dimension, DimensionOperation, DimensionType, DimensionValue,
     FloatingPointArrayElement, LinearResiduals, MeshAxisType, NumericArrayElement, Shape, Sharding, ShardingDimension,
-    f4e2m1fn, f6e2m3fn, f6e3m2fn, f8e3m4, f8e4m3, f8e4m3b11fnuz, f8e4m3fn, f8e4m3fnuz, f8e5m2, f8e5m2fnuz, f8e8m0fnu,
-    i1, i2, i4, u1, u2, u4,
+    UnreducedKind, f4e2m1fn, f6e2m3fn, f6e3m2fn, f8e3m4, f8e4m3, f8e4m3b11fnuz, f8e4m3fn, f8e4m3fnuz, f8e5m2,
+    f8e5m2fnuz, f8e8m0fnu, i1, i2, i4, u1, u2, u4,
 };
 use crate::axes::Axis;
 use crate::batching::{
@@ -248,22 +248,41 @@ impl ReductionKind {
         Ok(())
     }
 
-    /// Validates that a reduction of this kind can reduce `input_type` while it carries unreduced axes (i.e., while a
-    /// cross-device sum over those mesh axes is still pending), reporting a violation as an error that names
-    /// `operation_name`. Only a sum and a floating-point mean commute with that pending sum. A product, a logarithmic
-    /// sum of exponentials, an extremum, or a truncating integer mean of partial contributions differs from the same
-    /// reduction of their total.
-    pub(crate) fn validate_unreduced_axes(self, operation_name: &str, input_type: &ArrayType) -> Result<(), TypeError> {
-        let data_type = input_type.data_type();
-        if (matches!(self, Self::Product | Self::Max | Self::Min | Self::LogSumExp)
-            || (self == Self::Mean && data_type.is_integer()))
-            && input_type.sharding().is_some_and(|sharding| !sharding.unreduced_axes().is_empty())
-        {
-            return Err(TypeError::invalid(format!(
-                "`{operation_name}` with kind `{self}` cannot reduce inputs with unreduced axes",
-            )));
+    /// Returns the [`UnreducedKind`] whose pending cross-device reduction a reduction of this kind over `data_type`
+    /// elements commutes with, or `None` when it commutes with none. A sum and a floating-point mean commute with a
+    /// pending sum, and a maximum (respectively, minimum) commutes with a pending maximum (respectively, minimum), as
+    /// in JAX's `reduce_sum`, `reduce_max`, and `reduce_min`. A product, a logarithmic sum of exponentials, a Boolean
+    /// reduction, or a truncating integer mean of the per-device values differs from the same reduction of their
+    /// combination.
+    pub(crate) fn commuting_unreduced_kind(self, data_type: DataType) -> Option<UnreducedKind> {
+        match self {
+            Self::Sum => Some(UnreducedKind::Sum),
+            Self::Mean if !data_type.is_integer() => Some(UnreducedKind::Sum),
+            Self::Max => Some(UnreducedKind::Max),
+            Self::Min => Some(UnreducedKind::Min),
+            _ => None,
         }
-        Ok(())
+    }
+
+    /// Validates that a reduction of this kind can reduce `input_type` while it carries unreduced axes (i.e., while a
+    /// cross-device reduction over those mesh axes is still pending), reporting a violation as an error that names
+    /// `operation_name`. The reduction must commute with that pending reduction (refer to
+    /// [`Self::commuting_unreduced_kind`]), and its output keeps the input's unreduced axes and kind.
+    pub(crate) fn validate_unreduced_axes(self, operation_name: &str, input_type: &ArrayType) -> Result<(), TypeError> {
+        if input_type.unreduced_axes().is_empty() {
+            return Ok(());
+        }
+        let input_kind = input_type.unreduced_kind();
+        match self.commuting_unreduced_kind(input_type.data_type()) {
+            Some(kind) if kind == input_kind => Ok(()),
+            Some(kind) => Err(TypeError::invalid(format!(
+                "`{operation_name}` with kind `{self}` supports only unreduced inputs of kind `{kind}` but got kind \
+                 `{input_kind}`",
+            ))),
+            None => Err(TypeError::invalid(format!(
+                "`{operation_name}` with kind `{self}` cannot reduce inputs with unreduced axes",
+            ))),
+        }
     }
 }
 
@@ -271,6 +290,18 @@ impl Display for ReductionKind {
     #[inline]
     fn fmt(&self, formatter: &mut std::fmt::Formatter<'_>) -> std::fmt::Result {
         write!(formatter, "{}", self.name())
+    }
+}
+
+impl From<UnreducedKind> for ReductionKind {
+    /// Returns the reduction that combines the per-device values of a value that is unreduced with `kind`.
+    #[inline]
+    fn from(kind: UnreducedKind) -> Self {
+        match kind {
+            UnreducedKind::Sum => Self::Sum,
+            UnreducedKind::Max => Self::Max,
+            UnreducedKind::Min => Self::Min,
+        }
     }
 }
 
@@ -297,24 +328,30 @@ impl ReduceOperation {
         Self { axes, kind, output_sharding: None }
     }
 
-    /// Returns this [`ReduceOperation`] with the requested output sharding, or without a requested output sharding
-    /// when `output_sharding` is [`None`]. Only [`ReductionKind::Sum`] reductions support a requested output sharding.
+    /// Returns this [`ReduceOperation`] with the requested output sharding, or without a requested output
+    /// sharding when `output_sharding` is [`None`]. Only [`ReductionKind::Sum`], [`ReductionKind::Max`], and
+    /// [`ReductionKind::Min`] reductions support a requested output sharding, as JAX's `reduce_sum`,
+    /// `reduce_max`, and `reduce_min` do.
     ///
     /// The rest of the request depends on the input type, so type inference validates it. Specifically, it must match
     /// the output rank and the input mesh and cannot reference automatic mesh axes. Requested unreduced axes defer
-    /// cross-device sums and must be explicit axes that shard a reduced dimension or are already unreduced on the
-    /// input. Reduced axes cannot be requested, because inference preserves the input's reduced state and manual
-    /// variation independently of placement, and an explicit manual-variation request must match the input.
+    /// cross-device reductions and must be explicit axes that shard a reduced dimension or are already unreduced on the
+    /// input, and their [`UnreducedKind`] must be the one that this reduction defers (e.g., [`UnreducedKind::Max`] for
+    /// [`ReductionKind::Max`]). Reduced axes cannot be requested, because inference preserves the input's reduced state
+    /// and manual variation independently of placement, and an explicit manual-variation request must match the input.
     ///
     /// # Errors
     ///
     /// Returns a [`TypeError`] if `output_sharding` requests a sharding and this reduction's kind is not
-    /// [`ReductionKind::Sum`].
+    /// [`ReductionKind::Sum`], [`ReductionKind::Max`], or [`ReductionKind::Min`].
     pub fn with_output_sharding<S: Into<Option<Sharding>>>(mut self, output_sharding: S) -> Result<Self, TypeError> {
         let output_sharding = output_sharding.into();
-        if output_sharding.is_some() && self.kind != ReductionKind::Sum {
+        if output_sharding.is_some()
+            && !matches!(self.kind, ReductionKind::Sum | ReductionKind::Max | ReductionKind::Min)
+        {
             return Err(TypeError::invalid(format!(
-                "`{}` with kind `{}` does not support a requested output sharding (only kind `sum` does)",
+                "`{}` with kind `{}` does not support a requested output sharding \
+                 (only kinds `sum`, `max`, and `min` do)",
                 REDUCE_OPERATION_NAME, self.kind,
             )));
         }
@@ -368,9 +405,9 @@ impl Operation for ReduceOperation {
             return Ok(vec![output]);
         };
 
-        // Only sums carry a requested output placement (refer to `with_output_sharding`), and the request must agree
-        // with the inferred output in rank and with the input in mesh. Reduced state and manual variation belong to
-        // the input's semantics, so the request can neither ask for reduced axes nor change manual variation.
+        // Only sums and extrema carry a requested output placement (refer to `with_output_sharding`), and the request
+        // must agree with the inferred output in rank and with the input in mesh. Reduced state and manual variation
+        // belong to the input's semantics, so the request can neither ask for reduced axes nor change manual variation.
         if output_sharding.rank() != output.rank() {
             return Err(TypeError::invalid(format!(
                 "`{}` output sharding rank ({}) does not match the output rank ({})",
@@ -444,6 +481,16 @@ impl Operation for ReduceOperation {
                 return Err(TypeError::invalid(format!(
                     "`{REDUCE_OPERATION_NAME}` output sharding unreduced axes must be among the explicit axes \
                      sharding the reduced dimensions or the input's unreduced axes",
+                )));
+            }
+            let expected_kind = self.kind.commuting_unreduced_kind(input.data_type());
+            if expected_kind != Some(output_sharding.unreduced_kind()) {
+                return Err(TypeError::invalid(format!(
+                    "`{}` with kind `{}` output sharding unreduced axes must have kind `{}` but got kind `{}`",
+                    REDUCE_OPERATION_NAME,
+                    self.kind,
+                    expected_kind.map_or_else(|| "none".to_string(), |kind| kind.to_string()),
+                    output_sharding.unreduced_kind(),
                 )));
             }
         }
@@ -1117,16 +1164,17 @@ pub trait Reduce<T = <Self as Capability>::Universe>: Capability + Sized {
     /// # Errors
     ///
     /// Returns a [`ProgramError`] if an axis is out of bounds or repeated, if `kind` does not support the data
-    /// type of `self`, if `kind` cannot reduce the unreduced mesh axes of `self` (i.e., [`ReductionKind::Product`],
-    /// [`ReductionKind::Max`], [`ReductionKind::Min`], [`ReductionKind::LogSumExp`], and integer
-    /// [`ReductionKind::Mean`] reductions), or if the context of `self` fails to bind the reduction.
+    /// type of `self`, if `kind` does not commute with the pending reduction along the unreduced mesh axes of `self`
+    /// (refer to [`UnreducedKind`]; e.g., a [`ReductionKind::Product`], or a [`ReductionKind::Max`] of a partial sum),
+    /// or if the context of `self` fails to bind the reduction.
     fn reduce(&self, axes: &[usize], kind: ReductionKind) -> Result<Self, ProgramError>;
 
-    /// Sums `self` along `axes` using [`ReductionKind::Sum`], optionally requesting `output_sharding` for the output.
-    /// Sums are the only reductions that support a requested output sharding, which is why this is the only shortcut
-    /// function that takes one. For example, requesting an unreduced mesh axis that shards a reduced dimension defers
-    /// the cross-device part of the sum. Refer to [`ReduceOperation::with_output_sharding`] for the complete set of
-    /// valid requests.
+    /// Reduces `self` along `axes` using the reduction selected by `kind`, optionally requesting `output_sharding` for
+    /// the output. Only [`ReductionKind::Sum`], [`ReductionKind::Max`], and [`ReductionKind::Min`] reductions support
+    /// a requested output sharding. For example, requesting an unreduced mesh axis that shards a reduced dimension
+    /// defers the cross-device part of the reduction, whose output is then unreduced along that axis with the
+    /// [`UnreducedKind`] of `kind`. Refer to [`ReduceOperation::with_output_sharding`] for the complete set of valid
+    /// requests.
     ///
     /// Every value validates a requested sharding and derives the output type through the type inference of the
     /// corresponding [`ReduceOperation`]. Context-carrying values attach the request to the staged [`ReduceOperation`],
@@ -1137,14 +1185,28 @@ pub trait Reduce<T = <Self as Capability>::Universe>: Capability + Sized {
     /// # Parameters
     ///
     ///   - `axes`: Distinct axes of `self` to collapse, with the same semantics as in [`Self::reduce`].
+    ///   - `kind`: [`ReductionKind`] that determines how the elements along `axes` are combined.
     ///   - `output_sharding`: Requested [`Sharding`] of the output, which must match the output rank and the mesh
     ///     of `self`, or [`None`] to infer the output sharding from the input.
     ///
     /// # Errors
     ///
     /// Returns a [`ProgramError`] under the same conditions as [`Self::reduce`] or if `output_sharding` is not a valid
-    /// request for the type of `self`.
-    fn reduce_sum(&self, axes: &[usize], output_sharding: Option<Sharding>) -> Result<Self, ProgramError>;
+    /// request for `kind` and the type of `self`.
+    fn reduce_with_output_sharding(
+        &self,
+        axes: &[usize],
+        kind: ReductionKind,
+        output_sharding: Option<Sharding>,
+    ) -> Result<Self, ProgramError>;
+
+    /// Sums `self` along `axes` using [`ReductionKind::Sum`], optionally requesting `output_sharding` for the output.
+    /// Refer to [`Self::reduce_with_output_sharding`] for the semantics of its parameters and for the errors that this
+    /// function may return.
+    #[inline]
+    fn reduce_sum(&self, axes: &[usize], output_sharding: Option<Sharding>) -> Result<Self, ProgramError> {
+        self.reduce_with_output_sharding(axes, ReductionKind::Sum, output_sharding)
+    }
 
     /// Multiplies `self` along `axes` using [`ReductionKind::Product`]. Refer to [`Self::reduce`] for the semantics
     /// of `axes` and for the errors that this function may return. An empty reduced extent produces `1`.
@@ -1338,19 +1400,24 @@ impl Reduce for Array {
         }
     }
 
-    fn reduce_sum(&self, axes: &[usize], output_sharding: Option<Sharding>) -> Result<Self, ProgramError> {
+    fn reduce_with_output_sharding(
+        &self,
+        axes: &[usize],
+        kind: ReductionKind,
+        output_sharding: Option<Sharding>,
+    ) -> Result<Self, ProgramError> {
         // A concrete array lives on a single device, so a requested sharding cannot change its elements and no data has
         // to move. Its type still records the requested sharding, and that output type comes from the type inference of
         // the same `ReduceOperation`, so that eager evaluation validates the request and produces exactly the output
-        // type of a staged sum. Sharding does not affect storage, and so the sum's bytes can be reused.
+        // type of a staged reduction. Sharding does not affect storage, and so the reduction's bytes can be reused.
         let Some(output_sharding) = output_sharding else {
-            return self.reduce(axes, ReductionKind::Sum);
+            return self.reduce(axes, kind);
         };
-        let mut output_types = ReduceOperation::new(axes.to_vec(), ReductionKind::Sum)
+        let mut output_types = ReduceOperation::new(axes.to_vec(), kind)
             .with_output_sharding(output_sharding)?
             .infer_output_types(&[self.r#type().into_owned()], &[])?;
         check_count!("output", output_types, 1, ProgramError);
-        let output = self.reduce(axes, ReductionKind::Sum)?;
+        let output = self.reduce(axes, kind)?;
         Ok(Self::new_unchecked(output_types.remove(0), output.shared_storage_bytes().clone()))
     }
 }
@@ -1378,14 +1445,19 @@ impl<
         Ok(outputs.remove(0))
     }
 
-    fn reduce_sum(&self, axes: &[usize], output_sharding: Option<Sharding>) -> Result<Self, ProgramError> {
-        // Without a requested sharding, a sum is an ordinary reduction. A requested sharding is staged even when no
-        // axes are reduced, because it may still change how the output is distributed.
+    fn reduce_with_output_sharding(
+        &self,
+        axes: &[usize],
+        kind: ReductionKind,
+        output_sharding: Option<Sharding>,
+    ) -> Result<Self, ProgramError> {
+        // Without a requested sharding, this is an ordinary reduction. A requested sharding is staged even when no axes
+        // are reduced, because it may still change how the output is distributed.
         if output_sharding.is_none() {
-            return self.reduce(axes, ReductionKind::Sum);
+            return self.reduce(axes, kind);
         }
         let mut outputs = self.domain().bind(
-            ReduceOperation::new(axes.to_vec(), ReductionKind::Sum).with_output_sharding(output_sharding)?,
+            ReduceOperation::new(axes.to_vec(), kind).with_output_sharding(output_sharding)?,
             Vec::new(),
             std::slice::from_ref(self),
         )?;
@@ -1457,6 +1529,7 @@ impl ArrayType {
                     .collect::<Vec<_>>();
                 Sharding::new(sharding.mesh().clone(), dimensions)
                     .and_then(|output| output.with_unreduced_axes(sharding.unreduced_axes().clone()))
+                    .and_then(|output| output.with_unreduced_kind(sharding.unreduced_kind()))
                     .and_then(|output| output.with_reduced_axes(sharding.reduced_axes().clone()))
                     .and_then(|output| output.with_varying_manual_axes(sharding.varying_manual_axes().clone()))
                     .map_err(|error| {

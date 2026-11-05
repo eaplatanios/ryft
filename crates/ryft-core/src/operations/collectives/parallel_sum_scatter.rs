@@ -1084,7 +1084,7 @@ mod tests {
 
     use crate::arrays::{
         ArrayIrOperation, ArrayOperation, DimensionBounds, Layout, Memory, MeshAxis, MeshAxisType, ShardingDimension,
-        StridedLayout,
+        StridedLayout, UnreducedKind,
     };
     use crate::axes::NamedAxis;
     use crate::batching::{BatchAxisSpecification, BatchingTracer, batch};
@@ -1315,6 +1315,21 @@ mod tests {
                         .with_sharding(sharding.clone().with_unreduced_axes(["x", "y"]).unwrap()).unwrap()],
                     output_types = [ArrayType::new_static(DataType::F32, [2])
                         .with_sharding(varying.clone().with_unreduced_axes(["y"]).unwrap()).unwrap()],
+                },
+                // Summing commutes only with pending sums, whether over the operation's own axis or over others.
+                {
+                    input_types = [ArrayType::new_static(DataType::F32, [4])
+                        .with_sharding(sharding.clone().with_unreduced_axes(["x"]).unwrap()
+                            .with_unreduced_kind(UnreducedKind::Max).unwrap())
+                        .unwrap()],
+                    error = "`parallel_sum_scatter` supports only unreduced inputs of kind `sum` but got kind `max`",
+                },
+                {
+                    input_types = [ArrayType::new_static(DataType::F32, [4])
+                        .with_sharding(varying.clone().with_unreduced_axes(["y"]).unwrap()
+                            .with_unreduced_kind(UnreducedKind::Min).unwrap())
+                        .unwrap()],
+                    error = "`parallel_sum_scatter` supports only unreduced inputs of kind `sum` but got kind `min`",
                 },
                 {
                     input_types = [ArrayType::new_static(DataType::F32, [4])],

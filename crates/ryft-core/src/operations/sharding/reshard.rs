@@ -186,6 +186,17 @@ impl Operation for ReshardOperation {
             )));
         }
 
+        // The target restates the kind of the pending reduction along with its axes. That kind also covers the manual
+        // unreduced axes carried forward below, because a sharding records one kind for all of its unreduced axes.
+        if !self.sharding.unreduced_axes().is_empty() && self.sharding.unreduced_kind() != input.unreduced_kind() {
+            return Err(TypeError::invalid(format!(
+                "`{}` cannot change the unreduced kind from `{}` to `{}`",
+                RESHARD_OPERATION_NAME,
+                input.unreduced_kind(),
+                self.sharding.unreduced_kind(),
+            )));
+        }
+
         // Explicit redistribution preserves manual variation and reduction obligations. Their transitions belong
         // to manual collectives, including when a cotangent dual swaps reduced and unreduced state.
         let input_sharding = input.sharding();
@@ -211,6 +222,7 @@ impl Operation for ReshardOperation {
             .sharding
             .clone()
             .with_unreduced_axes(self.sharding.unreduced_axes().iter().cloned().chain(manual_unreduced))
+            .and_then(|sharding| sharding.with_unreduced_kind(input.unreduced_kind()))
             .and_then(|sharding| {
                 sharding.with_reduced_axes(self.sharding.reduced_axes().iter().cloned().chain(manual_reduced))
             })
@@ -471,7 +483,7 @@ mod tests {
     use crate::arrays::{
         Array, ArrayIrOperation, ArrayIrValue, ArrayOperation, ArrayReference, DataType, Dimension, DimensionBounds,
         DimensionType, DimensionValue, DimensionVariable, DynamicArrayExtentBatchingPolicy, LogicalMesh, MeshAxis,
-        Shape, f8e8m0fnu,
+        Shape, UnreducedKind, f8e8m0fnu,
     };
     use crate::batching::{BatchAxis, batch};
     use crate::contexts::{EagerContext, ProjectedContext, StagingContext};
@@ -751,6 +763,37 @@ mod tests {
                 error = error.clone(),
             }],
         );
+
+        // The target restates the kind of a pending explicit reduction as well, and manual reduction state carried
+        // forward keeps the input's kind.
+        let max_kind = |sharding: Sharding| sharding.with_unreduced_kind(UnreducedKind::Max).unwrap();
+        let unreduced_max_input_type =
+            with_sharding(max_kind(replicated.clone().with_unreduced_axes(["x", "m"]).unwrap()));
+        check_operation_type_inference!(
+            operation = ReshardOperation::new(max_kind(placed.clone().with_unreduced_axes(["x"]).unwrap())),
+            cases = [{
+                input_types = [unreduced_max_input_type.clone()],
+                output_types = [with_sharding(max_kind(placed.clone().with_unreduced_axes(["x", "m"]).unwrap()))],
+            }, {
+                input_types = [unreduced_input_type.clone()],
+                error = format!("`{RESHARD_OPERATION_NAME}` cannot change the unreduced kind from `sum` to `max`"),
+            }],
+        );
+        check_operation_type_inference!(
+            operation = ReshardOperation::new(placed.clone().with_unreduced_axes(["x"]).unwrap()),
+            cases = [{
+                input_types = [unreduced_max_input_type],
+                error = format!("`{RESHARD_OPERATION_NAME}` cannot change the unreduced kind from `max` to `sum`"),
+            }],
+        );
+        check_operation_type_inference!(
+            operation = ReshardOperation::new(placed.clone()),
+            cases = [{
+                input_types = [with_sharding(max_kind(replicated.clone().with_unreduced_axes(["m"]).unwrap()))],
+                output_types = [with_sharding(max_kind(placed.clone().with_unreduced_axes(["m"]).unwrap()))],
+            }],
+        );
+
         check_operation_type_inference!(
             operation = ReshardOperation::new(placed),
             cases = [{
@@ -986,7 +1029,7 @@ mod tests {
                 operation => panic!("unexpected operation `{operation}`"),
             })
             .collect::<Vec<_>>();
-        assert_eq!(shardings, vec![input_sharding.cotangent()]);
+        assert_eq!(shardings, vec![input_sharding.cotangent().unwrap()]);
     }
 
     #[test]

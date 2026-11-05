@@ -1849,7 +1849,7 @@ mod tests {
         Array, ArrayIrBatchingPolicy, ArrayIrOperation, ArrayIrType, ArrayIrValue, ArrayOperation, ArrayType, DataType,
         Dimension, DimensionBounds, DimensionError, DimensionOperation, DimensionType, DimensionValue, Layout,
         LogicalMesh, MAX_DIMENSION_EXTENT, Memory, MeshAxis, MeshAxisType, Shape, Sharding, ShardingDimension,
-        StridedLayout, f4e2m1fn, f8e4m3fn, f8e8m0fnu, i2, i4,
+        StridedLayout, UnreducedKind, f4e2m1fn, f8e4m3fn, f8e8m0fnu, i2, i4,
     };
     use crate::axes::NamedAxis;
     use crate::batching::{BatchAxis, BatchAxisSpecification, BatchingTracer, batch};
@@ -2119,12 +2119,24 @@ mod tests {
                     .unwrap(),
             )
             .unwrap();
+
+        // Negating the per-device values negates their sum but not their maximum or minimum.
+        let unreduced_max = unreduced
+            .clone()
+            .with_sharding(unreduced.sharding().unwrap().clone().with_unreduced_kind(UnreducedKind::Max).unwrap())
+            .unwrap();
         check_operation_type_inference!(
             operation = NegOperation::<ArrayType>::new(),
-            cases = [{
-                input_types = [unreduced.clone()],
-                output_types = [unreduced],
-            }],
+            cases = [
+                {
+                    input_types = [unreduced.clone()],
+                    output_types = [unreduced],
+                },
+                {
+                    input_types = [unreduced_max],
+                    error = "`neg` supports only unreduced inputs of kind `sum` but got kind `max`",
+                },
+            ],
         );
 
         let reduced = ArrayType::new(DataType::F32, Shape::new(vec![Dimension::Static(8)]))
@@ -2639,6 +2651,25 @@ mod tests {
                 {
                     input_types = [plain.clone(), unreduced.clone()],
                     error = "`add` inputs must be unreduced over the same axes",
+                },
+            ],
+        );
+
+        // Only pending sums can be added, and both inputs must carry the same kind of pending reduction.
+        let unreduced_max = unreduced
+            .clone()
+            .with_sharding(unreduced.sharding().unwrap().clone().with_unreduced_kind(UnreducedKind::Max).unwrap())
+            .unwrap();
+        check_operation_type_inference!(
+            operation = AddOperation::<ArrayType>::new(),
+            cases = [
+                {
+                    input_types = [unreduced_max.clone(), unreduced_max.clone()],
+                    error = "`add` supports only unreduced inputs of kind `sum` but got kind `max`",
+                },
+                {
+                    input_types = [unreduced.clone(), unreduced_max],
+                    error = "`add` inputs must be unreduced with the same kind but got `sum` and `max`",
                 },
             ],
         );
@@ -3172,6 +3203,26 @@ mod tests {
                 },
             ],
         );
+
+        // Only pending sums can be subtracted, and both inputs must carry the same kind of pending reduction.
+        let unreduced_max = unreduced
+            .clone()
+            .with_sharding(unreduced.sharding().unwrap().clone().with_unreduced_kind(UnreducedKind::Max).unwrap())
+            .unwrap();
+        check_operation_type_inference!(
+            operation = SubOperation::<ArrayType>::new(),
+            cases = [
+                {
+                    input_types = [unreduced_max.clone(), unreduced_max.clone()],
+                    error = "`sub` supports only unreduced inputs of kind `sum` but got kind `max`",
+                },
+                {
+                    input_types = [unreduced.clone(), unreduced_max],
+                    error = "`sub` inputs must be unreduced with the same kind but got `sum` and `max`",
+                },
+            ],
+        );
+
         check_operation_type_inference!(
             @reject @mismatched_reduced,
             operation = SubOperation::<ArrayType>::new(),
@@ -3961,6 +4012,29 @@ mod tests {
                 error = format!("`{MUL_OPERATION_NAME}` inputs must be reduced over the same axes"),
             }],
         );
+
+        // Scaling distributes over a pending sum but not over a pending maximum (e.g., for negative factors).
+        let unreduced_max_x = unreduced_x
+            .clone()
+            .with_sharding(unreduced_x.sharding().unwrap().clone().with_unreduced_kind(UnreducedKind::Max).unwrap())
+            .unwrap();
+        check_operation_type_inference!(
+            operation = MulOperation::<ArrayType>::new(),
+            cases = [
+                {
+                    input_types = [unreduced_max_x.clone(), reduced_x.clone()],
+                    error = format!(
+                        "`{MUL_OPERATION_NAME}` supports only unreduced inputs of kind `sum` but got kind `max`",
+                    ),
+                },
+                {
+                    input_types = [reduced_x.clone(), unreduced_max_x],
+                    error = format!(
+                        "`{MUL_OPERATION_NAME}` supports only unreduced inputs of kind `sum` but got kind `max`",
+                    ),
+                },
+            ],
+        );
     }
 
     #[test]
@@ -4476,8 +4550,20 @@ mod tests {
                     error = "`div` denominator must not be unreduced",
                 },
                 {
-                    input_types = [unreduced.clone(), reduced],
-                    output_types = [unreduced],
+                    input_types = [unreduced.clone(), reduced.clone()],
+                    output_types = [unreduced.clone()],
+                },
+                {
+                    input_types = [
+                        unreduced
+                            .clone()
+                            .with_sharding(
+                                unreduced.sharding().unwrap().clone().with_unreduced_kind(UnreducedKind::Min).unwrap(),
+                            )
+                            .unwrap(),
+                        reduced,
+                    ],
+                    error = "`div` supports only unreduced inputs of kind `sum` but got kind `min`",
                 },
             ],
         );

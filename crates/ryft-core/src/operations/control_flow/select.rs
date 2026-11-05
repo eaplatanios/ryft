@@ -564,7 +564,7 @@ mod tests {
 
     use crate::arrays::{
         Dimension, DimensionBounds, DimensionType, DimensionValue, DimensionVariable, Layout, LogicalMesh, MeshAxis,
-        MeshAxisType, Shape, StridedLayout, i4,
+        MeshAxisType, Shape, StridedLayout, UnreducedKind, i4,
     };
     use crate::contexts::EagerContext;
     use crate::differentiation::{
@@ -702,6 +702,9 @@ mod tests {
         let unreduced = Sharding::replicated(mesh.clone(), 1).with_unreduced_axes(["x"]).unwrap();
         let reduced = Sharding::replicated(mesh.clone(), 1).with_reduced_axes(["x"]).unwrap();
         let unreduced_branch = ArrayType::new_static(DataType::F32, [2]).with_sharding(unreduced.clone()).unwrap();
+        let unreduced_max_branch = ArrayType::new_static(DataType::F32, [2])
+            .with_sharding(unreduced.clone().with_unreduced_kind(UnreducedKind::Max).unwrap())
+            .unwrap();
         let reduced_branch = ArrayType::new_static(DataType::F32, [2]).with_sharding(reduced.clone()).unwrap();
         let condition = ArrayType::new_static(DataType::Boolean, [2]);
         check_operation_type_inference!(
@@ -715,6 +718,10 @@ mod tests {
                 {
                     input_types = [condition.clone(), reduced_branch.clone(), reduced_branch.clone()],
                     output_types = [reduced_branch.clone()],
+                },
+                {
+                    input_types = [condition.clone(), unreduced_max_branch.clone(), unreduced_max_branch.clone()],
+                    output_types = [unreduced_max_branch.clone()],
                 },
                 {
                     input_types = [
@@ -736,6 +743,10 @@ mod tests {
                 {
                     input_types = [condition.clone(), unreduced_branch.clone(), reduced_branch],
                     error = "`select` branches must carry identical reduction state",
+                },
+                {
+                    input_types = [condition.clone(), unreduced_branch.clone(), unreduced_max_branch],
+                    error = "`select` branches must be unreduced with the same kind but got `sum` and `max`",
                 },
                 {
                     input_types = [

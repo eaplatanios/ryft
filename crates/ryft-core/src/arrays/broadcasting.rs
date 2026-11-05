@@ -896,6 +896,32 @@ mod tests {
                 rhs: sharded_singleton.sharding().cloned().map(Box::new)
             }),
         );
+
+        // The kind of a pending reduction is carried along with its axes, and differing kinds conflict.
+        let unreduced_sum = Sharding::replicated(manual_mesh, 1).with_unreduced_axes(["y"]).unwrap();
+        let unreduced_max = unreduced_sum.clone().with_unreduced_kind(UnreducedKind::Max).unwrap();
+        let unreduced_sum_vector =
+            ArrayType::new(F32, Shape::new(vec![8.into()])).with_sharding(unreduced_sum).unwrap();
+        let unreduced_max_vector =
+            ArrayType::new(F32, Shape::new(vec![8.into()])).with_sharding(unreduced_max.clone()).unwrap();
+        assert_eq!(
+            unreduced_max_vector.broadcast(&unreduced_max_vector).map(|output| output.sharding().cloned()),
+            Ok(Some(unreduced_max.clone())),
+        );
+        assert_eq!(
+            unreduced_max_vector
+                .broadcast(&unsharded_matrix)
+                .map(|output| output.sharding().unwrap().unreduced_kind()),
+            Ok(UnreducedKind::Max),
+        );
+        assert_eq!(
+            unreduced_sum_vector.broadcast(&unreduced_max_vector),
+            Err(BroadcastingError::IncompatibleShardings {
+                lhs: unreduced_max_vector.sharding().cloned().map(Box::new),
+                rhs: unreduced_sum_vector.sharding().cloned().map(Box::new)
+            }),
+        );
+        assert!(!unreduced_sum_vector.is_broadcastable_to(&unreduced_max_vector));
     }
 
     #[test]

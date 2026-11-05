@@ -619,7 +619,7 @@ mod tests {
     use crate::arrays::{
         Array, ArrayIrValue, ArrayOperation, DataType, Dimension, DimensionBounds, DimensionValue, DimensionVariable,
         Layout, LogicalMesh, Memory, MeshAxis, MeshAxisType, Sharding, ShardingDimension, StridedLayout, Tile,
-        TileDimension, TiledLayout, f8e8m0fnu,
+        TileDimension, TiledLayout, UnreducedKind, f8e8m0fnu,
     };
     use crate::contexts::{EagerContext, StagingContext};
     use crate::differentiation::{
@@ -818,7 +818,8 @@ mod tests {
         ])
         .unwrap();
 
-        // The first input dimension is sharded over `x`; reduction and manual-axis state rides along untouched.
+        // The first input dimension is sharded over `x`; reduction and manual-axis state (including the kind of the
+        // pending reduction) rides along untouched.
         let input_sharding = Sharding::new(
             mesh.clone(),
             vec![
@@ -831,6 +832,8 @@ mod tests {
         .with_reduced_axes(["r"])
         .unwrap()
         .with_unreduced_axes(["u"])
+        .unwrap()
+        .with_unreduced_kind(UnreducedKind::Max)
         .unwrap()
         .with_varying_manual_axes(["v"])
         .unwrap();
@@ -860,6 +863,8 @@ mod tests {
             .with_reduced_axes(["r"])
             .unwrap()
             .with_unreduced_axes(["u"])
+            .unwrap()
+            .with_unreduced_kind(UnreducedKind::Max)
             .unwrap()
             .with_varying_manual_axes(["v"])
             .unwrap(),

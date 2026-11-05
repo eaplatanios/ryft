@@ -1,5 +1,7 @@
 use ryft_core::macros::check_count;
-use ryft_core::{ArrayType, ConstrainShardingOperation, LogicalMesh, ProgramError, Sharding, ShardingDimension};
+use ryft_core::{
+    ArrayType, ConstrainShardingOperation, LogicalMesh, ProgramError, Sharding, ShardingDimension, UnreducedKind,
+};
 use ryft_mlir::dialects::shardy;
 use ryft_mlir::{Block, BlockRef, LocationRef, Operation as MlirOperation, Value as MlirValue, ValueRef};
 
@@ -42,8 +44,16 @@ pub(crate) fn lower_sharding_constraint<'b, 'c: 'b, 't: 'c>(
                     dimension => dimension.clone(),
                 })
                 .collect();
-            Sharding::new(mesh, dimensions)?
-                .with_unreduced_axes(sharding.unreduced_axes().iter().filter(|axis| retain(axis)).cloned())?
+            let projected_sharding = Sharding::new(mesh, dimensions)?
+                .with_unreduced_axes(sharding.unreduced_axes().iter().filter(|axis| retain(axis)).cloned())?;
+            // The pending reduction keeps its kind unless the projection drops all of its axes.
+            let unreduced_kind = if projected_sharding.unreduced_axes().is_empty() {
+                UnreducedKind::Sum
+            } else {
+                sharding.unreduced_kind()
+            };
+            projected_sharding
+                .with_unreduced_kind(unreduced_kind)?
                 .with_reduced_axes(sharding.reduced_axes().iter().filter(|axis| retain(axis)).cloned())?
                 .with_varying_manual_axes(sharding.varying_manual_axes().iter().filter(|axis| retain(axis)).cloned())
         };

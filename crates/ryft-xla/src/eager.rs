@@ -53,8 +53,9 @@ fn shard_host_bytes(shard: &ArrayShard<'_>) -> Result<Vec<u8>, ProgramError> {
 }
 
 /// Copies the dense payload bytes of the rank-zero `array` to the host from its addressable `shard`, unless the
-/// sharding of `array` has unreduced axes, along which the devices hold summands of the value, in which case every
-/// shard is copied and the summands are added (refer to `materialize_dense_array_bytes`).
+/// sharding of `array` has unreduced axes, along which the devices hold per-device values (e.g., summands) of the
+/// value, in which case every shard is copied and those values are combined with the unreduced kind of the sharding
+/// (refer to `materialize_dense_array_bytes`).
 fn scalar_host_bytes(array: &Array<'_>, shard: &ArrayShard<'_>) -> Result<Vec<u8>, ProgramError> {
     if array.sharding().unreduced_axes().is_empty() {
         shard_host_bytes(shard)

@@ -7,7 +7,7 @@ use prost::Message;
 use ryft_core::{
     ArrayType, DataType, Device, DeviceMesh, Dimension as CoreDimension, DimensionBounds, DimensionVariable,
     ExternalReferenceBinding, Layout, LogicalMesh, Memory, MeshAxis, MeshAxisType, ReferenceSource, Shape, Sharding,
-    ShardingDimension, StridedLayout, Tile, TileDimension, TiledLayout,
+    ShardingDimension, StridedLayout, Tile, TileDimension, TiledLayout, UnreducedKind,
 };
 use ryft_pjrt::protos::CompilationOptions;
 use ryft_pjrt::{BufferType, LoadOptions};
@@ -221,8 +221,47 @@ struct PersistentShardingV1 {
     mesh: PersistentLogicalMeshV1,
     dimensions: Vec<PersistentShardingDimensionV1>,
     unreduced_axes: Vec<String>,
+    // A sum is omitted, so that payloads written before unreduced kinds existed still decode, and the keys of
+    // shardings without other kinds are unchanged.
+    #[serde(default, skip_serializing_if = "PersistentUnreducedKindV1::is_sum")]
+    unreduced_kind: PersistentUnreducedKindV1,
     reduced_axes: Vec<String>,
     varying_manual_axes: Vec<String>,
+}
+
+#[derive(Clone, Copy, Default, PartialEq, Eq, Serialize, Deserialize)]
+#[serde(rename_all = "snake_case")]
+enum PersistentUnreducedKindV1 {
+    #[default]
+    Sum,
+    Max,
+    Min,
+}
+
+impl PersistentUnreducedKindV1 {
+    fn is_sum(&self) -> bool {
+        *self == Self::Sum
+    }
+}
+
+impl From<UnreducedKind> for PersistentUnreducedKindV1 {
+    fn from(value: UnreducedKind) -> Self {
+        match value {
+            UnreducedKind::Sum => Self::Sum,
+            UnreducedKind::Max => Self::Max,
+            UnreducedKind::Min => Self::Min,
+        }
+    }
+}
+
+impl From<PersistentUnreducedKindV1> for UnreducedKind {
+    fn from(value: PersistentUnreducedKindV1) -> Self {
+        match value {
+            PersistentUnreducedKindV1::Sum => Self::Sum,
+            PersistentUnreducedKindV1::Max => Self::Max,
+            PersistentUnreducedKindV1::Min => Self::Min,
+        }
+    }
 }
 
 #[derive(Serialize, Deserialize)]
@@ -433,6 +472,7 @@ impl From<&Sharding> for PersistentShardingV1 {
                 })
                 .collect(),
             unreduced_axes: value.unreduced_axes().iter().cloned().collect(),
+            unreduced_kind: value.unreduced_kind().into(),
             reduced_axes: value.reduced_axes().iter().cloned().collect(),
             varying_manual_axes: value.varying_manual_axes().iter().cloned().collect(),
         }
@@ -456,6 +496,7 @@ impl TryFrom<PersistentShardingV1> for Sharding {
                 .collect(),
         )
         .and_then(|sharding| sharding.with_unreduced_axes(value.unreduced_axes))
+        .and_then(|sharding| sharding.with_unreduced_kind(value.unreduced_kind.into()))
         .and_then(|sharding| sharding.with_reduced_axes(value.reduced_axes))
         .and_then(|sharding| sharding.with_varying_manual_axes(value.varying_manual_axes))
         .map_err(|error| persistent_error(error.to_string()))
@@ -1923,6 +1964,30 @@ pub(super) mod tests {
                 assert!(matches!(unsupported, Some(ryft_pjrt::Error::Unimplemented { .. })));
             }
         }
+    }
+
+    #[test]
+    fn test_persistent_sharding_unreduced_kinds() {
+        let mesh = LogicalMesh::new(vec![MeshAxis::new("x", 2, MeshAxisType::Explicit).unwrap()]).unwrap();
+        let sum = Sharding::replicated(mesh, 1).with_unreduced_axes(["x"]).unwrap();
+        let encode = |sharding: &Sharding| serde_json::to_string(&PersistentShardingV1::from(sharding)).unwrap();
+        let decode =
+            |payload: &str| Sharding::try_from(serde_json::from_str::<PersistentShardingV1>(payload).unwrap()).unwrap();
+
+        // A sum is omitted from the payload, so the payloads (and cache keys) of sums are unchanged, while other kinds
+        // round trip through their names.
+        assert!(!encode(&sum).contains("unreduced_kind"));
+        assert_eq!(decode(&encode(&sum)), sum);
+        for kind in [UnreducedKind::Max, UnreducedKind::Min] {
+            let sharding = sum.clone().with_unreduced_kind(kind).unwrap();
+            assert!(encode(&sharding).contains(&format!("\"unreduced_kind\":\"{kind}\"")));
+            assert_eq!(decode(&encode(&sharding)), sharding);
+        }
+
+        // A kind without unreduced axes is malformed.
+        let malformed = encode(&Sharding::replicated(sum.mesh().clone(), 1))
+            .replace("\"reduced_axes\"", "\"unreduced_kind\":\"max\",\"reduced_axes\"");
+        assert!(Sharding::try_from(serde_json::from_str::<PersistentShardingV1>(&malformed).unwrap()).is_err());
     }
 
     #[test]

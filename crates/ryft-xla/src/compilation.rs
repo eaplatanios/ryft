@@ -3998,7 +3998,7 @@ mod tests {
         let (program, referent_type) = doubling_reduced_reference_program(mesh.logical_mesh());
         let pullback = program.transpose_with_respect_to(&[0], &[CotangentDestinationKind::Reference]).unwrap();
         let cotangent_type =
-            referent_type.clone().with_sharding(referent_type.sharding().unwrap().cotangent()).unwrap();
+            referent_type.clone().with_sharding(referent_type.sharding().unwrap().cotangent().unwrap()).unwrap();
         let cotangent_reference_type = ArrayIrType::Reference(ReferenceType::new(cotangent_type.clone()));
         let compiled = compile_statefully::<_, Vec<ArrayIrType>, Vec<ArrayIrType>>(
             |inputs| {

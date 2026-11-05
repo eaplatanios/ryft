@@ -535,7 +535,7 @@ mod tests {
     use crate::arrays::{
         ArrayIrValue, ArrayReference, DataType, Dimension, DimensionBounds, DimensionType, DimensionValue,
         DimensionVariable, DynamicArrayExtentBatchingPolicy, Layout, LogicalMesh, Memory, MeshAxis, Shape,
-        ShardingDimension, StridedLayout,
+        ShardingDimension, StridedLayout, UnreducedKind,
     };
     use crate::batching::BatchAxis;
     use crate::contexts::{EagerContext, ProjectedContext, StagingContext};
@@ -864,6 +864,38 @@ mod tests {
         check_operation_type_inference!(
             operation = ParallelCastOperation::new("m".to_string(), ParallelCastTarget::Unreduced),
             cases = [{ input_types = [varying], output_types = [unreduced] }],
+        );
+    }
+
+    #[test]
+    fn test_parallel_cast_type_inference_rejects_non_sum_unreduced_state() {
+        // Every cast is one side of a cross-device sum, so pending reductions over other axes must be sums.
+        let mesh = LogicalMesh::new(vec![
+            MeshAxis::new("m", 2, MeshAxisType::Manual).unwrap(),
+            MeshAxis::new("unreduced", 2, MeshAxisType::Manual).unwrap(),
+        ])
+        .unwrap();
+        let sharding = Sharding::replicated(mesh, 1)
+            .with_unreduced_axes(["unreduced"])
+            .unwrap()
+            .with_unreduced_kind(UnreducedKind::Max)
+            .unwrap();
+        let invariant = ArrayType::new_static(DataType::F32, [4]).with_sharding(sharding.clone()).unwrap();
+        let reduced = invariant.clone().with_sharding(sharding.clone().with_reduced_axes(["m"]).unwrap()).unwrap();
+        let varying = invariant.clone().with_sharding(sharding.with_varying_manual_axes(["m"]).unwrap()).unwrap();
+        let error =
+            format!("`{PARALLEL_CAST_OPERATION_NAME}` supports only unreduced inputs of kind `sum` but got kind `max`");
+        check_operation_type_inference!(
+            operation = ParallelCastOperation::new("m".to_string(), ParallelCastTarget::Reduced),
+            cases = [{ input_types = [invariant], error = error.clone() }],
+        );
+        check_operation_type_inference!(
+            operation = ParallelCastOperation::new("m".to_string(), ParallelCastTarget::Varying),
+            cases = [{ input_types = [reduced], error = error.clone() }],
+        );
+        check_operation_type_inference!(
+            operation = ParallelCastOperation::new("m".to_string(), ParallelCastTarget::Unreduced),
+            cases = [{ input_types = [varying], error = error }],
         );
     }
 

@@ -1479,7 +1479,7 @@ mod tests {
     use crate::arrays::{
         Array, ArrayIrBatch, ArrayIrBatchingPolicy, ArrayIrOperation, ArrayIrValue, ArrayOperation, DataType,
         DimensionBounds, DimensionType, DimensionValue, DimensionVariable, Layout, LogicalMesh, Memory, MeshAxis,
-        MeshAxisType, Sharding, ShardingDimension, StridedLayout,
+        MeshAxisType, Sharding, ShardingDimension, StridedLayout, UnreducedKind,
     };
     use crate::batching::{BatchAxis, BatchableOperation, BatchingContext, BatchingTracer, RecursiveBatchingDriver};
     use crate::contexts::{EagerContext, StagingContext};
@@ -1819,6 +1819,23 @@ mod tests {
             ),
             Err(TypeError::invalid(format!(
                 "`{CONCATENATE_OPERATION_NAME}` output sharding is invalid: mesh axis name `m` appears more than once"
+            ))),
+        );
+
+        // The kind of a pending reduction propagates with its axes, and inputs pending different kinds conflict.
+        let unreduced_sum = replicated.clone().with_unreduced_axes(["m"]).unwrap();
+        let unreduced_max = unreduced_sum.clone().with_unreduced_kind(UnreducedKind::Max).unwrap();
+        assert_eq!(
+            operation
+                .infer_output_types(&[row(Some(unreduced_max.clone())), row(Some(unreduced_max.clone()))], &[])
+                .unwrap()[0]
+                .sharding(),
+            Some(&unreduced_max),
+        );
+        assert_eq!(
+            operation.infer_output_types(&[row(Some(unreduced_sum)), row(Some(unreduced_max))], &[]),
+            Err(TypeError::invalid(format!(
+                "`{CONCATENATE_OPERATION_NAME}` inputs must be unreduced with the same kind but got `sum` and `max`",
             ))),
         );
 

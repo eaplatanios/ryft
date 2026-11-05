@@ -67,7 +67,8 @@ impl ConstrainShardingOperation {
     /// its axes and gains the constraint's auto axes after them, or stays as is where the constraint is replicated or
     /// unconstrained, whereas a tracked replicated dimension takes the constraint's entry, since a tracked type is
     /// only replicated over the axes the type system governs and leaves the auto axes to the compiler). The tracked
-    /// unreduced, reduced, and varying manual axes are carried over as well.
+    /// unreduced, reduced, and varying manual axes are carried over as well, and an input and a constraint that are
+    /// both unreduced must agree on their [`UnreducedKind`](crate::UnreducedKind).
     ///
     /// # Parameters
     ///
@@ -113,11 +114,27 @@ impl ConstrainShardingOperation {
             })
             .collect();
 
+        // A sharding records one kind for all of its unreduced axes, so a constraint can only extend a pending
+        // reduction of the same kind.
+        let unreduced_kind = match (tracked.unreduced_axes().is_empty(), self.sharding.unreduced_axes().is_empty()) {
+            (false, false) if tracked.unreduced_kind() != self.sharding.unreduced_kind() => {
+                return Err(TypeError::invalid(format!(
+                    "`{}` cannot constrain a value that is unreduced with kind `{}` to kind `{}`",
+                    CONSTRAIN_SHARDING_OPERATION_NAME,
+                    tracked.unreduced_kind(),
+                    self.sharding.unreduced_kind(),
+                )));
+            }
+            (false, _) => tracked.unreduced_kind(),
+            (true, _) => self.sharding.unreduced_kind(),
+        };
+
         self.sharding
             .with_dimensions(dimensions)
             .and_then(|sharding| {
                 sharding.with_unreduced_axes(tracked.unreduced_axes().union(self.sharding.unreduced_axes()).cloned())
             })
+            .and_then(|sharding| sharding.with_unreduced_kind(unreduced_kind))
             .and_then(|sharding| {
                 sharding.with_reduced_axes(tracked.reduced_axes().union(self.sharding.reduced_axes()).cloned())
             })

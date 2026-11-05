@@ -257,7 +257,7 @@ use crate::arrays::{
     Array, ArrayAddressing, ArrayIrBatch, ArrayIrBatchingPolicy, ArrayIrOperation, ArrayIrType, ArrayIrValue,
     ArrayOperation, ArrayReference, ArrayReferenceTransform, ArraySliceAxis, ArrayType, DataType, Dimension,
     DimensionType, DimensionValue, DimensionVariable, LogicalMesh, MeshAxisType, ReductionStateKind, Shape, Sharding,
-    ShardingDimension, ShardingError,
+    ShardingDimension, ShardingError, UnreducedKind,
 };
 use crate::axes::{NamedAxes, NamedAxis};
 use crate::batching::{
@@ -476,6 +476,17 @@ pub enum ShardMapError {
         state_kind: ReductionStateKind,
         expected: Vec<String>,
         actual: Vec<String>,
+    },
+
+    #[error(
+        "`{SHARD_MAP_OPERATION_NAME}` {value_kind} type #{value_index} is unreduced with kind `{actual}`, but its \
+         boundary sharding requires kind `{expected}`"
+    )]
+    UnreducedKindMismatch {
+        value_kind: ShardMapValueKind,
+        value_index: usize,
+        expected: UnreducedKind,
+        actual: UnreducedKind,
     },
 
     #[error("integer overflow in `{SHARD_MAP_OPERATION_NAME}` while {context}")]
@@ -1086,6 +1097,20 @@ impl ShardMapBoundary {
             .chain(boundary.reduced_axes())
             .map(String::as_str)
             .collect::<HashSet<_>>();
+        // One kind covers every unreduced axis of a sharding, so a value that is unreduced along any axis must have
+        // the kind of a boundary sharding that names unreduced axes, and its carried unreduced axes keep its kind.
+        let actual_kind = actual.map_or(UnreducedKind::Sum, Sharding::unreduced_kind);
+        if !boundary.unreduced_axes().is_empty()
+            && actual.is_some_and(|actual| !actual.unreduced_axes().is_empty())
+            && actual_kind != boundary.unreduced_kind()
+        {
+            return Err(ShardMapError::UnreducedKindMismatch {
+                value_kind,
+                value_index,
+                expected: boundary.unreduced_kind(),
+                actual: actual_kind,
+            });
+        }
         let no_axes = BTreeSet::new();
         let split =
             |state_kind: ReductionStateKind, actual_axes: &BTreeSet<String>, expected_axes: &BTreeSet<String>| {
@@ -1108,6 +1133,7 @@ impl ShardMapBoundary {
                 actual.map_or(&no_axes, Sharding::unreduced_axes),
                 boundary.unreduced_axes(),
             )?,
+            unreduced_kind: actual_kind,
             reduced_axes: split(
                 ReductionStateKind::Reduced,
                 actual.map_or(&no_axes, Sharding::reduced_axes),
@@ -3518,6 +3544,10 @@ struct CarriedReductionState {
     /// Unreduced axes carried through the boundary.
     unreduced_axes: BTreeSet<String>,
 
+    /// [`UnreducedKind`] of the value, which its carried unreduced axes keep and which equals the kind of the boundary
+    /// sharding when that sharding also names unreduced axes.
+    unreduced_kind: UnreducedKind,
+
     /// Reduced axes carried through the boundary.
     reduced_axes: BTreeSet<String>,
 }
@@ -3525,9 +3555,14 @@ struct CarriedReductionState {
 impl CarriedReductionState {
     /// Adds the carried reduction state to `sharding`, which already holds the state along the governed axes.
     fn apply(self, sharding: Sharding) -> Result<Sharding, ShardingError> {
+        let unreduced_kind =
+            if self.unreduced_axes.is_empty() { sharding.unreduced_kind() } else { self.unreduced_kind };
         let unreduced_axes = sharding.unreduced_axes().iter().cloned().chain(self.unreduced_axes).collect::<Vec<_>>();
         let reduced_axes = sharding.reduced_axes().iter().cloned().chain(self.reduced_axes).collect::<Vec<_>>();
-        sharding.with_unreduced_axes(unreduced_axes)?.with_reduced_axes(reduced_axes)
+        sharding
+            .with_unreduced_axes(unreduced_axes)?
+            .with_unreduced_kind(unreduced_kind)?
+            .with_reduced_axes(reduced_axes)
     }
 }
 
@@ -4616,8 +4651,8 @@ struct TransposedShardMap<V: Value, O> {
 
 /// Returns `true` when two `shard_map` boundary types agree apart from carried placement metadata, which is when their
 /// element types, shapes, and layouts are equal, and they vary along exactly the same mesh axes, including axes that
-/// are not manual axes of the mesh of `expected`, and have the same unreduced and reduced axes (a type without a
-/// sharding varies along none and has none). Dimension shardings and memory kinds are tolerated. Refer to the
+/// are not manual axes of the mesh of `expected`, and have the same unreduced axes and kind and the same reduced axes (a
+/// type without a sharding varies along none and has none). Dimension shardings and memory kinds are tolerated. Refer to the
 /// `# Boundary Validation` section of the documentation of [`ShardMapOperation`] for the rationale.
 fn shard_map_boundary_types_match(actual: &ArrayType, expected: &ArrayType) -> bool {
     let no_axes = BTreeSet::new();
@@ -4629,6 +4664,7 @@ fn shard_map_boundary_types_match(actual: &ArrayType, expected: &ArrayType) -> b
         && actual_varying_axes == expected_varying_axes
         && actual.sharding().map_or(&no_axes, Sharding::unreduced_axes)
             == expected.sharding().map_or(&no_axes, Sharding::unreduced_axes)
+        && actual.unreduced_kind() == expected.unreduced_kind()
         && actual.sharding().map_or(&no_axes, Sharding::reduced_axes)
             == expected.sharding().map_or(&no_axes, Sharding::reduced_axes)
 }
@@ -4889,8 +4925,10 @@ fn manual_block_offsets(
 }
 
 /// Returns the shard of global input `input_index` that the device at `coordinates` of the local `grid` (i.e., of the
-/// active manual axes) receives, at type `local_type`. A device whose coordinate along an unreduced active manual axis
-/// is non-zero receives zeros, so that the shards sum to the logical value that the global [`Array`] stores.
+/// active manual axes) receives, at type `local_type`. Along an active manual axis that the input is unreduced along
+/// with kind [`UnreducedKind::Sum`], a device whose coordinate is non-zero receives zeros, so that the shards sum to
+/// the logical value that the global [`Array`] stores. With kind [`UnreducedKind::Max`] or [`UnreducedKind::Min`],
+/// every device receives its shard of the logical value, whose extremum is that value.
 fn split_global_input(
     boundary: &ShardMapBoundary,
     input_index: usize,
@@ -4900,10 +4938,11 @@ fn split_global_input(
     coordinates: &[usize],
 ) -> Result<Array, ProgramError> {
     let sharding = &boundary.input_shardings()[input_index];
-    if sharding
-        .unreduced_axes()
-        .iter()
-        .any(|axis_name| grid.axis(axis_name).is_some_and(|axis| coordinates[axis] != 0))
+    if sharding.unreduced_kind() == UnreducedKind::Sum
+        && sharding
+            .unreduced_axes()
+            .iter()
+            .any(|axis_name| grid.axis(axis_name).is_some_and(|axis| coordinates[axis] != 0))
     {
         return EagerContext::<Array, ArrayOperation<Array>>::new().zero(local_type);
     }
@@ -4915,8 +4954,9 @@ fn split_global_input(
 /// Assembles a global boundary value of type `global_type` (i.e., a global output or the referent of a reference
 /// input) from the local `values` of the devices of `grid` (i.e., of the local grid of one enclosing device), which
 /// `sharding` places. Every device places its value at its tile of `sharding`. Along an active manual axis that
-/// `sharding` does not tile, the devices hold partial summands when the axis is unreduced, which are summed, and
-/// otherwise hold the same value, of which the device at coordinate zero contributes.
+/// `sharding` does not tile, the devices hold per-device values when the axis is unreduced, which are combined with
+/// the [`Sharding::unreduced_kind`] of `sharding` (e.g., summed), and otherwise hold the same value, of which the
+/// device at coordinate zero contributes.
 fn assemble_global_value(
     sharding: &Sharding,
     global_type: &ArrayType,
@@ -4953,7 +4993,7 @@ fn assemble_global_value(
         let tile = if summands.len() == 1 {
             summands[0].clone()
         } else {
-            reduce_participants(SHARD_MAP_OPERATION_NAME, &summands, ReductionKind::Sum)?
+            reduce_participants(SHARD_MAP_OPERATION_NAME, &summands, sharding.unreduced_kind().into())?
         };
         output = output.replace_block(&tile, &offsets);
     }
@@ -6573,7 +6613,7 @@ where
         if output_type.is_reference() || *zero_output_cotangents.next().unwrap() {
             continue;
         }
-        input_shardings.push(sharding.cotangent());
+        input_shardings.push(sharding.cotangent().map_err(TypeError::from)?);
         global_input_types.push(output_type.cotangent()?);
     }
     let mut destination_positions = vec![None; input_linearity.len()];
@@ -6582,7 +6622,7 @@ where
             continue;
         }
         destination_positions[index] = Some(global_input_types.len());
-        input_shardings.push(boundary.input_shardings()[index].cotangent());
+        input_shardings.push(boundary.input_shardings()[index].cotangent().map_err(TypeError::from)?);
         let cotangent_type = operation.input_types[index].cotangent()?;
         global_input_types.push(if operation.input_types[index].is_reference() {
             cotangent_type
@@ -6607,7 +6647,7 @@ where
         match destination_kinds[index] {
             CotangentDestinationKind::Return if zero_input_cotangents[index] => {}
             CotangentDestinationKind::Return => {
-                output_shardings.push(boundary.input_shardings()[index].cotangent());
+                output_shardings.push(boundary.input_shardings()[index].cotangent().map_err(TypeError::from)?);
                 output_input_indices.push(index);
                 global_output_types.push(operation.input_types[index].cotangent()?);
                 output_forwarding.push(None);
@@ -6615,7 +6655,7 @@ where
             CotangentDestinationKind::Reference
                 if operation.input_types[index].is_reference() || local_accumulators[index] =>
             {
-                output_shardings.push(boundary.input_shardings()[index].cotangent());
+                output_shardings.push(boundary.input_shardings()[index].cotangent().map_err(TypeError::from)?);
                 output_input_indices.push(index);
                 let cotangent_type = operation.input_types[index].cotangent()?;
                 if local_accumulators[index] {
@@ -6816,6 +6856,7 @@ fn inferred_input_sharding(
     }
     Ok(Sharding::new(mesh.clone(), sharding.dimensions().to_vec())?
         .with_unreduced_axes(sharding.unreduced_axes().clone())?
+        .with_unreduced_kind(sharding.unreduced_kind())?
         .with_reduced_axes(sharding.reduced_axes().clone())?)
 }
 

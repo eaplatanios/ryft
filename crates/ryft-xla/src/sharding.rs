@@ -1,4 +1,4 @@
-use ryft_core::{Device, DeviceMesh, LogicalMesh, Sharding, ShardingDimension};
+use ryft_core::{Device, DeviceMesh, LogicalMesh, Sharding, ShardingDimension, UnreducedKind};
 use ryft_mlir::Location;
 use ryft_mlir::dialects::shardy;
 use ryft_pjrt::Device as PjrtDevice;
@@ -97,8 +97,11 @@ impl ToMlir for Sharding {
             dimensions.as_slice(),
             replicated_axes.as_slice(),
             unreduced_axes.as_slice(),
-            // TODO(eaplatanios): Should this be configurable?
-            shardy::ReductionOperation::Sum,
+            match self.unreduced_kind() {
+                UnreducedKind::Sum => shardy::ReductionOperation::Sum,
+                UnreducedKind::Max => shardy::ReductionOperation::Max,
+                UnreducedKind::Min => shardy::ReductionOperation::Min,
+            },
         )
     }
 }
@@ -107,7 +110,7 @@ impl ToMlir for Sharding {
 mod tests {
     use pretty_assertions::assert_eq;
 
-    use ryft_core::{LogicalMesh, MeshAxis, MeshAxisType};
+    use ryft_core::{LogicalMesh, MeshAxis, MeshAxisType, UnreducedKind};
     use ryft_mlir::{Block, Context as MlirContext};
 
     use crate::tests::{device_mesh_2x2, logical_mesh_3x2x1};
@@ -162,5 +165,14 @@ mod tests {
             sharding.to_mlir(context.unknown_location()).unwrap().to_string(),
             "#sdy.sharding<@mesh, [{\"x\"}, {}], unreduced={\"y\"}>",
         );
+
+        // Kinds other than a sum lower to the reduction operation of the unreduced axes.
+        let attribute = sharding.clone().with_unreduced_kind(UnreducedKind::Max).unwrap();
+        let attribute = attribute.to_mlir(context.unknown_location()).unwrap();
+        assert_eq!(attribute.reduction_operation().unwrap(), shardy::ReductionOperation::Max);
+        assert_eq!(attribute.to_string(), "");
+        let attribute = sharding.with_unreduced_kind(UnreducedKind::Min).unwrap();
+        let attribute = attribute.to_mlir(context.unknown_location()).unwrap();
+        assert_eq!(attribute.reduction_operation().unwrap(), shardy::ReductionOperation::Min);
     }
 }

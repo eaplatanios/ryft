@@ -1572,22 +1572,22 @@ mod tests {
 
     #[test]
     fn test_to_mlir_module_for_program_with_parallel_cast_gradient_executes_on_cpu() {
-        // Each device computes exp(w), casts it to a pending sum, and sums across x. The reverse pass must propagate
-        // through all three cast adjoints and sum the two device contributions, so the gradient at w=0 is 2.
+        // Each device computes exp(input), casts it to a pending sum, and sums across x. The reverse pass must
+        // propagate through all three cast adjoints and sum the two device contributions, so the gradient at zero is 2.
         let mesh = test_manual_mesh("x", 2);
         let replicated = Sharding::replicated(mesh.clone(), 0);
         let traced: TracedProgram<ArrayType, ArrayType> = trace_with_context(
-            |_, w: ArrayTracer| {
-                let gradient = differentiate_at(w.into_value()).gradient(|w| {
-                    let w = ValueProjection::<ArrayType>::into_projected(w)?;
+            |_, input: ArrayTracer| {
+                let gradient = differentiate_at(input.into_value()).gradient(|input| {
+                    let input = ValueProjection::<ArrayType>::into_projected(input)?;
                     let output = shard_map(
-                        |w| {
-                            let w = w.parallel_cast("x", ParallelCastTarget::Reduced)?;
-                            let w = w.parallel_cast("x", ParallelCastTarget::Varying)?;
-                            let summand = w.exp()?.parallel_cast("x", ParallelCastTarget::Unreduced)?;
+                        |input| {
+                            let reduced = input.parallel_cast("x", ParallelCastTarget::Reduced)?;
+                            let varying = reduced.parallel_cast("x", ParallelCastTarget::Varying)?;
+                            let summand = varying.exp()?.parallel_cast("x", ParallelCastTarget::Unreduced)?;
                             Ok(summand.parallel_reduce(ReductionKind::Sum, "x")?)
                         },
-                        w,
+                        input,
                         mesh.clone(),
                         replicated.clone(),
                         replicated.clone(),
@@ -1597,11 +1597,45 @@ mod tests {
                 })?;
                 Ok(ValueProjection::<ArrayType>::into_projected(gradient)?)
             },
-            ArrayType::scalar(DataType::F32).with_sharding(replicated).unwrap(),
+            ArrayType::scalar(DataType::F32).with_sharding(replicated.clone()).unwrap(),
         )
         .unwrap();
         let module = traced.to_mlir_module("main").unwrap();
-        assert_eq!(module, indoc! {"REPLACE_WITH_PARALLEL_CAST_GRADIENT_MLIR"});
+        assert_eq!(
+            module,
+            indoc! {"
+                module {
+                  sdy.mesh @mesh = <[\"x\"=2]>
+                  func.func @main(%arg0: tensor<f32> {sdy.sharding = #sdy.sharding<@mesh, [], replicated={\"x\"}>}) -> \
+                      (tensor<f32> {sdy.sharding = #sdy.sharding<@mesh, [], replicated={\"x\"}>}) {
+                    %cst = stablehlo.constant dense<1.000000e+00> : tensor<f32>
+                    %0 = sdy.manual_computation(%arg0) in_shardings=[<@mesh, [], replicated={\"x\"}>] \
+                        out_shardings=[<@mesh, [{\"x\"}]>] manual_axes={\"x\"} (%arg1: tensor<f32>) {
+                      %2 = stablehlo.exponential %arg1 : tensor<f32>
+                      %3 = stablehlo.reshape %2 : (tensor<f32>) -> tensor<1xf32>
+                      %4 = sdy.sharding_constraint %3 <@mesh, [{}]> : tensor<1xf32>
+                      sdy.return %4 : tensor<1xf32>
+                    } : (tensor<f32>) -> tensor<2xf32>
+                    %1 = sdy.manual_computation(%cst, %0) in_shardings=[<@mesh, [], replicated={\"x\"}>, <@mesh, [{\"x\"}]>] \
+                        out_shardings=[<@mesh, [], replicated={\"x\"}>] manual_axes={\"x\"} \
+                        (%arg1: tensor<f32>, %arg2: tensor<1xf32>) {
+                      %2 = stablehlo.reshape %arg2 : (tensor<1xf32>) -> tensor<f32>
+                      %3 = sdy.sharding_constraint %2 <@mesh, []> : tensor<f32>
+                      %4 = stablehlo.multiply %3, %arg1 : tensor<f32>
+                      %5 = \"stablehlo.all_reduce\"(%4) <{channel_handle = \
+                          #stablehlo.channel_handle<handle = 1, type = 1>, replica_groups = \
+                          dense<[[0, 1]]> : tensor<1x2xi64>, use_global_device_ids}> ({
+                      ^bb0(%arg3: tensor<f32>, %arg4: tensor<f32>):
+                        %6 = stablehlo.add %arg3, %arg4 : tensor<f32>
+                        stablehlo.return %6 : tensor<f32>
+                      }) : (tensor<f32>) -> tensor<f32>
+                      sdy.return %5 : tensor<f32>
+                    } : (tensor<f32>, tensor<2xf32>) -> tensor<f32>
+                    return %1 : tensor<f32>
+                  }
+                }
+            "},
+        );
         assert_eq!(execute_on_two_cpu_devices(module, &[], [&[0.0], &[0.0]]), vec![vec![2.0]; 2]);
     }
 

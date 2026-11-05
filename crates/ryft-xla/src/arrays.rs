@@ -1,5 +1,5 @@
 use std::borrow::Cow;
-use std::collections::{HashMap, HashSet, VecDeque};
+use std::collections::{BTreeSet, HashMap, HashSet, VecDeque};
 use std::fmt::{Debug, Display};
 use std::ops::Range;
 use std::sync::{Arc, Mutex, OnceLock};
@@ -7,7 +7,7 @@ use std::sync::{Arc, Mutex, OnceLock};
 use ryft_core::{
     ArrayType, DataType, Device, DeviceId, DeviceMesh, DimensionError, Layout, LayoutError, Memory, Parameter,
     Parameterized, ProjectedContext, Shape, Sharding, ShardingDimension, ShardingError, StaticShape, Typed,
-    Value as CoreValue, ValueDomainDispatch, check_sharding,
+    UnreducedKind, Value as CoreValue, ValueDomainDispatch, check_sharding,
 };
 use ryft_macros::Parameter;
 use ryft_pjrt::{Buffer, BufferType, Client, Error as PjrtError, ExecutionFence};
@@ -420,8 +420,10 @@ impl<'o> Array<'o> {
     /// Each addressable shard is uploaded to the memory requested by `r#type`. [`Memory::Device`] uses the device's
     /// default memory; host placements select its `pinned_host` or `unpinned_host` memory. A device without the requested
     /// host space produces [`ArrayError::UnsupportedMemory`]. Bufferless structural-zero arrays require no allocation.
-    /// Along an unreduced axis of the sharding, the devices hold summands of the logical value, so the devices at
-    /// coordinate zero along every unreduced axis receive their shards of the host value and the others receive zeros.
+    /// Along an unreduced axis of a sharding of kind [`UnreducedKind::Sum`], the devices hold summands of the logical
+    /// value, so the devices at coordinate zero along every unreduced axis receive their shards of the host value and
+    /// the others receive zeros. With kind [`UnreducedKind::Max`] or [`UnreducedKind::Min`], every device receives its
+    /// shard of the host value, whose extremum is that value.
     ///
     /// # Parameters
     ///
@@ -475,14 +477,18 @@ impl<'o> Array<'o> {
             .ok_or_else(|| Error::from(ArrayError::DynamicShape { shape: r#type.shape().clone() }))?;
         let sharding = r#type.sharding().unwrap();
         let layout = ShardLayout::new(&shape, &mesh, &sharding)?;
-        // Along an unreduced axis, the devices hold summands of the logical value. The devices at coordinate zero along
-        // every unreduced axis receive the host value and the others receive zeros, so the summands add up to it.
+        let no_axes = BTreeSet::new();
+        // Along an unreduced axis of kind sum, the devices hold summands of the logical value. The devices at coordinate
+        // zero along every unreduced axis receive the host value and the others receive zeros, so the summands add up
+        // to it. Copies of the host value are their own maximum and minimum, so the other kinds need no zeros.
+        let summed_axes =
+            if sharding.unreduced_kind() == UnreducedKind::Sum { sharding.unreduced_axes() } else { &no_axes };
         let unreduced_axis_indices = mesh
             .logical_mesh()
             .axes()
             .iter()
             .enumerate()
-            .filter(|(_, axis)| sharding.unreduced_axes().contains(axis.name()))
+            .filter(|(_, axis)| summed_axes.contains(axis.name()))
             .map(|(axis_index, _)| axis_index)
             .collect::<Vec<_>>();
         let mut addressable_buffers = Vec::new();

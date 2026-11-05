@@ -1,7 +1,7 @@
 use std::ops::Range;
 use std::sync::Arc;
 
-use ryft_core::{ArrayType, Layout, ProgramError, Typed};
+use ryft_core::{ArrayType, Layout, ProgramError, Typed, UnreducedKind};
 use ryft_pjrt::{Event, ExecutionFence};
 
 use crate::arrays::ArrayTypeExtension;
@@ -46,7 +46,8 @@ struct PendingDenseShardHostCopy {
 
     /// Coordinates of the shard's device along the unreduced axes of the array's sharding, in mesh order, which are
     /// empty for an array without unreduced axes. Shards that cover the same slices but differ in these coordinates
-    /// hold separate summands of that tile, while shards that also agree on them are replicas of one summand.
+    /// hold separate per-device values (e.g., summands) of that tile, while shards that also agree on them are
+    /// replicas of one per-device value.
     unreduced_coordinates: Vec<usize>,
 }
 
@@ -61,6 +62,9 @@ pub(crate) struct DenseArrayHostCopy {
 
     /// Element type of the source array.
     element_type: DataType,
+
+    /// [`UnreducedKind`] that combines the per-device values of the source array along its unreduced axes.
+    unreduced_kind: UnreducedKind,
 
     /// Total byte count of the global dense representation.
     total_byte_count: usize,
@@ -111,7 +115,7 @@ impl DenseArrayHostCopy {
                 Ok((shard_index, slices, unreduced_coordinates, bytes))
             })
             .collect::<Result<Vec<_>, Error>>()?;
-        let mut shards = sum_unreduced_summands(shards, self.element_type)?;
+        let mut shards = combine_unreduced_values(shards, self.element_type, self.unreduced_kind)?;
 
         if shards.len() == 1 {
             let (shard_index, slices, bytes) = shards.pop().unwrap();
@@ -160,6 +164,7 @@ pub(crate) fn begin_materialize_dense_array_bytes(array: &Array<'_>) -> Result<D
         return Ok(DenseArrayHostCopy {
             global_shape: array.shape(),
             element_type: array.data_type(),
+            unreduced_kind: array.sharding().unreduced_kind(),
             total_byte_count: 0,
             shards: Vec::new(),
             completion: Some(match completion {
@@ -212,11 +217,13 @@ pub(crate) fn begin_materialize_dense_array_bytes(array: &Array<'_>) -> Result<D
             })
         })
         .collect::<Result<Vec<_>, Error>>()?;
-    Ok(DenseArrayHostCopy { global_shape, element_type, total_byte_count, shards, completion })
+    let unreduced_kind = array.sharding().unreduced_kind();
+    Ok(DenseArrayHostCopy { global_shape, element_type, unreduced_kind, total_byte_count, shards, completion })
 }
 
-/// Copies every addressable shard of `array` to host and merges them into one dense row-major byte buffer, adding the
-/// summands that the devices hold along the unreduced axes of its sharding. Errors when any global shard is not
+/// Copies every addressable shard of `array` to host and merges them into one dense row-major byte buffer, combining
+/// the per-device values that the devices hold along the unreduced axes of its sharding with its unreduced kind (e.g.,
+/// adding summands). Errors when any global shard is not
 /// addressable from the current process.
 ///
 /// Used by [`Array::to`](crate::Array::to)'s last-resort host fallback when the fast and compiled paths cannot
@@ -282,11 +289,13 @@ pub(crate) fn reject_unreduced_host_round_trip(array: &Array<'_>, purpose: &str)
 /// holds the logical value of that tile, and returns the copies of an array without unreduced axes unchanged. Each
 /// copy carries its shard index, the global slices that it covers, its device's coordinates along the unreduced axes,
 /// and its dense row-major bytes. Copies that cover the same slices and agree on those coordinates are replicas of
-/// one summand and must hold the same bytes, and the summands of a tile (i.e., the copies of its slices that differ in
-/// those coordinates) are added elementwise.
-fn sum_unreduced_summands(
+/// one per-device value and must hold the same bytes, and the per-device values of a tile (i.e., the copies of its
+/// slices that differ in those coordinates) are combined elementwise with `unreduced_kind` (i.e., added, or reduced
+/// to their maximum or minimum).
+fn combine_unreduced_values(
     shards: Vec<(ShardIndex, Vec<Range<usize>>, Vec<usize>, Vec<u8>)>,
     element_type: DataType,
+    unreduced_kind: UnreducedKind,
 ) -> Result<Vec<(ShardIndex, Vec<Range<usize>>, Vec<u8>)>, Error> {
     if shards.iter().all(|(_, _, unreduced_coordinates, _)| unreduced_coordinates.is_empty()) {
         return Ok(shards.into_iter().map(|(shard_index, slices, _, bytes)| (shard_index, slices, bytes)).collect());
@@ -308,7 +317,13 @@ fn sum_unreduced_summands(
         let shape = slices.iter().map(|slice| slice.len()).collect::<Vec<_>>();
         let summand = ryft_core::Array::new(ArrayType::new_static(element_type, shape), bytes)?;
         match tiles.iter_mut().find(|(_, tile_slices, _)| *tile_slices == slices) {
-            Some((_, _, tile)) => *tile = ryft_core::Add::add(&*tile, &summand)?,
+            Some((_, _, tile)) => {
+                *tile = match unreduced_kind {
+                    UnreducedKind::Sum => ryft_core::Add::add(&*tile, &summand)?,
+                    UnreducedKind::Max => ryft_core::Max::max(&*tile, &summand)?,
+                    UnreducedKind::Min => ryft_core::Min::min(&*tile, &summand)?,
+                }
+            }
             None => tiles.push((shard_index, slices, summand)),
         }
     }
