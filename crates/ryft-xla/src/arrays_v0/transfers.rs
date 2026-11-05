@@ -244,7 +244,7 @@ fn cross_host_shape(plan: &CrossHostShardReceivePlan) -> Result<Vec<i64>, Error>
         .enumerate()
         .map(|(dimension, &size)| {
             i64::try_from(size).map_err(|_| {
-                Error::Array(ArrayError::InvalidShardDimension {
+                Error::from(ArrayError::InvalidShardDimension {
                     shard_index: plan.destination_shard_index(),
                     dimension,
                     source: ryft_core::DimensionError::ExtentExceedsBackendWidth {
@@ -398,10 +398,12 @@ pub(crate) fn copy_addressable_destination_shards_from_exact_source_shards<'o>(
         for send_plan in plan.cross_host_sends() {
             let source_buffer = array
                 .addressable_device_shard(send_plan.source_device_id())
-                .ok_or(Error::Array(ArrayError::MissingShardBuffer {
-                    shard_index: send_plan.source_shard_index(),
-                    device_id: send_plan.source_device_id(),
-                }))?
+                .ok_or_else(|| {
+                    Error::from(ArrayError::MissingShardBuffer {
+                        shard_index: send_plan.source_shard_index(),
+                        device_id: send_plan.source_device_id(),
+                    })
+                })?
                 .buffer()
                 .map(|buffer| buffer.as_ref())
                 .expect("addressable shard lookups should always return a local buffer");
@@ -421,19 +423,22 @@ pub(crate) fn copy_addressable_destination_shards_from_exact_source_shards<'o>(
     for local_copy_plan in plan.local_copies() {
         let source_buffer = array
             .addressable_device_shard(local_copy_plan.source_device_id())
-            .ok_or(Error::Array(ArrayError::MissingShardBuffer {
-                shard_index: local_copy_plan.source_shard_index(),
-                device_id: local_copy_plan.source_device_id(),
-            }))?
+            .ok_or_else(|| {
+                Error::from(ArrayError::MissingShardBuffer {
+                    shard_index: local_copy_plan.source_shard_index(),
+                    device_id: local_copy_plan.source_device_id(),
+                })
+            })?
             .buffer()
             .map(|buffer| buffer.as_ref())
             .expect("addressable shard lookups should always return a local buffer");
-        let destination_device = addressable_device_by_id.get(&local_copy_plan.destination_device_id()).ok_or(
-            Error::Array(ArrayError::NonAddressableDevice {
-                device_id: local_copy_plan.destination_device_id(),
-                process_index: client_process_index,
-            }),
-        )?;
+        let destination_device =
+            addressable_device_by_id.get(&local_copy_plan.destination_device_id()).ok_or_else(|| {
+                Error::from(ArrayError::NonAddressableDevice {
+                    device_id: local_copy_plan.destination_device_id(),
+                    process_index: client_process_index,
+                })
+            })?;
         // Always copy via PJRT, even when source and destination are on the same device. Bitcast
         // would alias the source buffer's underlying storage, which interacts badly with later
         // `copy_to_device` calls issued from the same source in the same pass (PJRT marks the
@@ -452,13 +457,12 @@ pub(crate) fn copy_addressable_destination_shards_from_exact_source_shards<'o>(
         let receive_plans = receive_plans_by_device
             .get(&receive_device_id)
             .expect("grouped receive plans should exist for every grouped destination device");
-        let destination_device =
-            addressable_device_by_id
-                .get(&receive_device_id)
-                .ok_or(Error::Array(ArrayError::NonAddressableDevice {
-                    device_id: receive_device_id,
-                    process_index: client_process_index,
-                }))?;
+        let destination_device = addressable_device_by_id.get(&receive_device_id).ok_or_else(|| {
+            Error::from(ArrayError::NonAddressableDevice {
+                device_id: receive_device_id,
+                process_index: client_process_index,
+            })
+        })?;
         let element_types = receive_plans.iter().map(|_| array.data_type().to_pjrt()).collect::<Vec<_>>();
         let dimensions = receive_plans
             .iter()
@@ -526,11 +530,13 @@ mod tests {
         let error = cross_host_shape(&plan).unwrap_err();
         assert!(matches!(
             &error,
-            Error::Array(ArrayError::InvalidShardDimension {
-                shard_index: 2,
-                dimension: 0,
-                source: DimensionError::ExtentExceedsBackendWidth { value, maximum },
-            }) if *value == usize::MAX && *maximum == i64::MAX as usize,
+            Error::Array(error) if matches!(error.as_ref(),
+                ArrayError::InvalidShardDimension {
+                    shard_index: 2,
+                    dimension: 0,
+                    source: DimensionError::ExtentExceedsBackendWidth { value, maximum },
+                } if *value == usize::MAX && *maximum == i64::MAX as usize,
+            ),
         ));
         assert_eq!(
             error.to_string(),

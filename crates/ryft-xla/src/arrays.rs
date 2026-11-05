@@ -308,15 +308,15 @@ impl<'o> XlaArray<'o> {
             Some(_) => r#type,
             None if buffers.len() == 1 => r#type.replicated(&mesh)?,
             None => {
-                return Err(Error::Array(ArrayError::MissingSharding));
+                return Err(Error::from(ArrayError::MissingSharding));
             }
         };
 
         // Compute the global `ShardLayout` implied by the normalized array type and concrete device mesh.
         let shape = r#type
             .static_shape()
-            .ok_or_else(|| Error::Array(ArrayError::DynamicShape { shape: r#type.shape().clone() }))?;
-        let sharding = r#type.sharding().ok_or(Error::Array(ArrayError::MissingSharding))?;
+            .ok_or_else(|| Error::from(ArrayError::DynamicShape { shape: r#type.shape().clone() }))?;
+        let sharding = r#type.sharding().ok_or_else(|| Error::from(ArrayError::MissingSharding))?;
         let layout = ShardLayout::new(&shape, &mesh, sharding)?;
         let (descriptors, shard_index_by_device) = layout.into_parts();
 
@@ -333,7 +333,7 @@ impl<'o> XlaArray<'o> {
                 validate_zero_carriers,
             )?;
             if buffers_by_device.contains_key(&device_id) {
-                return Err(Error::Array(ArrayError::MultipleBuffersOnDevice { device_id }));
+                return Err(Error::from(ArrayError::MultipleBuffersOnDevice { device_id }));
             }
             buffers_by_device.insert(device_id, Arc::new(buffer));
         }
@@ -378,8 +378,8 @@ impl<'o> XlaArray<'o> {
         };
         let shape = r#type
             .static_shape()
-            .ok_or_else(|| Error::Array(ArrayError::DynamicShape { shape: r#type.shape().clone() }))?;
-        let sharding = r#type.sharding().ok_or(Error::Array(ArrayError::MissingSharding))?;
+            .ok_or_else(|| Error::from(ArrayError::DynamicShape { shape: r#type.shape().clone() }))?;
+        let sharding = r#type.sharding().ok_or_else(|| Error::from(ArrayError::MissingSharding))?;
         let layout = ShardLayout::new(&shape, &mesh, sharding)?;
         let (descriptors, shard_index_by_device) = layout.into_parts();
         let client = domain.client();
@@ -391,7 +391,7 @@ impl<'o> XlaArray<'o> {
             .map(|descriptor| -> Result<_, Error> {
                 if descriptor.device().process_index() == process_index {
                     if !addressable_device_ids.contains(&descriptor.device().id()) {
-                        return Err(Error::Array(ArrayError::NonAddressableDevice {
+                        return Err(Error::from(ArrayError::NonAddressableDevice {
                             device_id: descriptor.device().id(),
                             process_index,
                         }));
@@ -447,7 +447,7 @@ impl<'o> XlaArray<'o> {
         let buffer = buffer.as_ref();
         let expected_byte_count = r#type.size_in_bytes()?;
         if buffer.len() != expected_byte_count {
-            return Err(Error::Array(ArrayError::ByteCountMismatch {
+            return Err(Error::from(ArrayError::ByteCountMismatch {
                 expected: expected_byte_count,
                 actual: buffer.len(),
             })
@@ -472,7 +472,7 @@ impl<'o> XlaArray<'o> {
         let device_layout = r#type.layout().map(ToPjrt::to_pjrt).transpose()?;
         let shape = r#type
             .static_shape()
-            .ok_or_else(|| Error::Array(ArrayError::DynamicShape { shape: r#type.shape().clone() }))?;
+            .ok_or_else(|| Error::from(ArrayError::DynamicShape { shape: r#type.shape().clone() }))?;
         let sharding = r#type.sharding().unwrap();
         let layout = ShardLayout::new(&shape, &mesh, &sharding)?;
         // Along an unreduced axis, the devices hold summands of the logical value. The devices at coordinate zero along
@@ -493,9 +493,12 @@ impl<'o> XlaArray<'o> {
             }
 
             let shard_device_id = shard_device.id();
-            let device = addressable_device_by_id.get(&shard_device_id).ok_or(Error::Array(
-                ArrayError::NonAddressableDevice { device_id: shard_device_id, process_index: client_process_index },
-            ))?;
+            let device = addressable_device_by_id.get(&shard_device_id).ok_or_else(|| {
+                Error::from(ArrayError::NonAddressableDevice {
+                    device_id: shard_device_id,
+                    process_index: client_process_index,
+                })
+            })?;
 
             // Resolve the requested space explicitly; passing the device itself would always upload to its default
             // memory and could silently mislabel a host-resident array as pinned or unpinned memory.
@@ -510,10 +513,9 @@ impl<'o> XlaArray<'o> {
                             break;
                         }
                     }
-                    selected.ok_or(Error::Array(ArrayError::UnsupportedMemory {
-                        device_id: shard_device_id,
-                        memory: requested,
-                    }))?
+                    selected.ok_or_else(|| {
+                        Error::from(ArrayError::UnsupportedMemory { device_id: shard_device_id, memory: requested })
+                    })?
                 }
             };
 
@@ -937,13 +939,13 @@ impl<'o> XlaArray<'o> {
 
         let shard_index = shard_index_by_device
             .get(&device_id)
-            .ok_or(Error::Array(ArrayError::DeviceNotInMesh { device_id }))?;
+            .ok_or_else(|| Error::from(ArrayError::DeviceNotInMesh { device_id }))?;
         let descriptor = descriptors.get(*shard_index).unwrap();
 
         // Validate that each buffer is owned by the process expected for the corresponding mesh device.
         let process_index = device.process_index();
         if process_index != descriptor.device().process_index() {
-            return Err(Error::Array(ArrayError::DeviceProcessIndexMismatch {
+            return Err(Error::from(ArrayError::DeviceProcessIndexMismatch {
                 device_id,
                 expected_process_index: descriptor.device().process_index(),
                 actual_process_index: process_index,
@@ -960,7 +962,7 @@ impl<'o> XlaArray<'o> {
             Memory::Host { pinned: false } => buffer_memory.kind()? == "unpinned_host",
         };
         if !memory_matches {
-            return Err(Error::Array(ArrayError::BufferMemoryMismatch {
+            return Err(Error::from(ArrayError::BufferMemoryMismatch {
                 device_id,
                 expected: r#type.memory(),
                 actual: buffer_memory.kind()?.to_string(),
@@ -1001,7 +1003,7 @@ impl<'o> XlaArray<'o> {
                 .collect::<Result<Vec<_>, _>>()?,
         );
         if buffer_type != expected_buffer_type && matches!(r#type.data_type(), DataType::I1 | DataType::U1) {
-            return Err(Error::Array(ArrayError::BufferTypeMismatch {
+            return Err(Error::from(ArrayError::BufferTypeMismatch {
                 expected: ArrayType::new(DataType::Boolean, shape.clone().into()),
                 actual: ArrayType::new(data_type, shape.into()),
             }));
@@ -1009,7 +1011,7 @@ impl<'o> XlaArray<'o> {
         let array_type = ArrayType::new(data_type, shape.into());
         let expected_array_type = ArrayType::new(r#type.data_type(), descriptor.shape().into());
         if array_type != expected_array_type {
-            return Err(Error::Array(ArrayError::BufferTypeMismatch {
+            return Err(Error::from(ArrayError::BufferTypeMismatch {
                 expected: expected_array_type,
                 actual: array_type,
             }));
@@ -1018,7 +1020,7 @@ impl<'o> XlaArray<'o> {
             && r#type.data_type().is_zero()
             && buffer.copy_to_host(None)?.r#await()?.iter().any(|value| *value != 0)
         {
-            return Err(Error::Array(ArrayError::NonCanonicalZeroBuffer { device_id }));
+            return Err(Error::from(ArrayError::NonCanonicalZeroBuffer { device_id }));
         }
         Ok(device_id)
     }
@@ -1128,8 +1130,8 @@ impl ArrayOutputLayout {
     ) -> Result<Self, Error> {
         let shape = r#type
             .static_shape()
-            .ok_or_else(|| Error::Array(ArrayError::DynamicShape { shape: r#type.shape().clone() }))?;
-        let sharding = r#type.sharding().ok_or(Error::Array(ArrayError::MissingSharding))?;
+            .ok_or_else(|| Error::from(ArrayError::DynamicShape { shape: r#type.shape().clone() }))?;
+        let sharding = r#type.sharding().ok_or_else(|| Error::from(ArrayError::MissingSharding))?;
         let (descriptors, shard_index_by_device) = ShardLayout::new(&shape, &mesh, sharding)?.into_parts();
         let buffer_positions = descriptors
             .iter()
@@ -1362,10 +1364,7 @@ impl ShardDescriptor {
         let rank = self.slice.len();
 
         if shape.rank() != rank {
-            return Err(Error::Array(ArrayError::ShardSliceRankMismatch {
-                shape_rank: shape.rank(),
-                slice_rank: rank,
-            }));
+            return Err(Error::from(ArrayError::ShardSliceRankMismatch { shape_rank: shape.rank(), slice_rank: rank }));
         }
 
         if rank == 0 {
@@ -1540,7 +1539,7 @@ impl ArrayTypeExtension for ArrayType {
         }
         let element_count = self
             .element_count()?
-            .ok_or_else(|| Error::Array(ArrayError::DynamicShape { shape: self.shape().clone() }))?;
+            .ok_or_else(|| Error::from(ArrayError::DynamicShape { shape: self.shape().clone() }))?;
         let element_size_in_bytes = self.data_type().to_pjrt().element_size_in_bytes()?;
         element_count.checked_mul(element_size_in_bytes).ok_or_else(|| Error::SizeLimitExceeded {
             message: format!(
@@ -1735,11 +1734,13 @@ mod tests {
                 vec![buffer],
             )
             ,
-            Err(Error::Array(ArrayError::BufferMemoryMismatch {
-                device_id,
-                expected: Memory::Host { pinned: true },
-                actual: reported,
-            })) if device_id == device.id().unwrap() && reported == actual,
+            Err(Error::Array(error)) if matches!(error.as_ref(),
+                ArrayError::BufferMemoryMismatch {
+                    device_id,
+                    expected: Memory::Host { pinned: true },
+                    actual: reported,
+                } if *device_id == device.id().unwrap() && reported == &actual,
+            ),
         ));
     }
 
@@ -2068,7 +2069,9 @@ mod tests {
 
         let error = XlaArray::from_addressable_buffers(&domain, r#type, mesh, vec![buffer]).unwrap_err();
 
-        assert!(matches!(error, Error::Array(ArrayError::NonCanonicalZeroBuffer { .. })));
+        assert!(matches!(error,
+            Error::Array(error) if matches!(error.as_ref(), ArrayError::NonCanonicalZeroBuffer { .. }),
+        ));
     }
 
     #[test]
@@ -2130,8 +2133,10 @@ mod tests {
             let buffer = client.buffer(&[1], data_type.to_pjrt(), [], None, device.clone(), None).unwrap();
             assert!(matches!(
                 XlaArray::from_addressable_buffers(&domain, array_type, mesh.clone(), vec![buffer]),
-                Err(Error::Array(ArrayError::BufferTypeMismatch { expected, actual }))
-                    if expected == ArrayType::scalar(DataType::Boolean) && actual == ArrayType::scalar(data_type),
+                Err(Error::Array(error)) if matches!(error.as_ref(),
+                    ArrayError::BufferTypeMismatch { expected, actual }
+                        if expected == &ArrayType::scalar(DataType::Boolean) && actual == &ArrayType::scalar(data_type),
+                ),
             ));
         }
     }
@@ -2335,7 +2340,9 @@ mod tests {
         // A shape whose rank does not match the descriptor's slice rank reports a rank-mismatch error.
         assert!(matches!(
             descriptor.contiguous_inner_block(&StaticShape::new(vec![8, 4, 2])),
-            Err(Error::Array(ArrayError::ShardSliceRankMismatch { shape_rank: 3, slice_rank: 2 })),
+            Err(Error::Array(error)) if matches!(error.as_ref(),
+                ArrayError::ShardSliceRankMismatch { shape_rank: 3, slice_rank: 2 },
+            ),
         ));
 
         // A rank-one descriptor always reports a single block over its slice.
@@ -2529,7 +2536,11 @@ mod tests {
             Shape::new(vec![DimensionVariable::new("dynamic", DimensionBounds::unbounded()).into()]),
         );
         let error = dynamic_type.size_in_bytes().unwrap_err();
-        assert!(matches!(&error, Error::Array(ArrayError::DynamicShape { shape }) if shape == dynamic_type.shape()));
+        assert!(matches!(&error,
+            Error::Array(error) if matches!(error.as_ref(),
+                ArrayError::DynamicShape { shape } if shape == dynamic_type.shape(),
+            ),
+        ));
         assert_eq!(error.to_string(), "expected static shape but got [dynamic]");
 
         let oversized_type = ArrayType::new(DataType::U16, Shape::new(vec![Dimension::Static(usize::MAX)]));

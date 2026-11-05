@@ -80,6 +80,8 @@
 //! custom-derivative rule references, and preserved references outside the experimental kernel boundary are rejected
 //! explicitly.
 
+// TODO(eaplatanios): Review this module.
+
 use std::borrow::Cow;
 use std::fmt::Debug;
 use std::hash::Hash;
@@ -5146,8 +5148,10 @@ mod tests {
                 assert!(!available);
                 assert!(matches!(
                     XlaArray::from_host_buffer(&engine, host_type, mesh.clone(), values_to_bytes(&values).as_slice()),
-                    Err(Error::Array(ArrayError::UnsupportedMemory { device_id: actual_device, memory: actual_memory }))
-                        if actual_device == device_id && actual_memory == memory,
+                    Err(Error::Array(error)) if matches!(error.as_ref(),
+                        ArrayError::UnsupportedMemory { device_id: actual_device, memory: actual_memory }
+                            if *actual_device == device_id && *actual_memory == memory,
+                    ),
                 ));
                 continue;
             }

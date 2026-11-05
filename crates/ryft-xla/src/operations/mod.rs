@@ -11,6 +11,8 @@ use crate::experimental::lowering::types::{lower_restore_dynamic_dimensions, low
 use crate::operations::constants::lower_layout_constraint;
 use crate::{Error, LoweringError};
 
+// TODO(eaplatanios): Review this module.
+
 /// StableHLO lowering of arithmetic operations.
 pub(crate) mod arithmetic;
 /// Runtime assertions: their StableHLO lowering to the `ryft.assert` XLA FFI custom call and the host-side handler that

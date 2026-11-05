@@ -14,6 +14,8 @@ use ryft_pjrt::{Buffer, Client, DeviceId, Error as PjrtError, ExecutionDeviceInp
 
 use crate::{ArrayError, Error, ExecutionError};
 
+// TODO(eaplatanios): Review this module.
+
 pub mod array;
 pub mod compiled_reshard;
 pub mod device_put;

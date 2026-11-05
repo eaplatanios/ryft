@@ -21,6 +21,8 @@
 //! observations, and the reference handle lifecycle) delegate to the generic [`ArrayIrValue`] implementations in
 //! `ryft-core` through a lossless conversion, so that both array IR value types share one source of truth.
 
+// TODO(eaplatanios): Review this module.
+
 use std::borrow::{Borrow, Cow};
 use std::fmt::{Debug, Display};
 

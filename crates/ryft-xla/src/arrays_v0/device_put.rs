@@ -48,7 +48,7 @@ impl<'c, T: DenseHostDevicePutLeaf + Parameter> DevicePutLeaf<'c> for T {
                     .addressable_devices()?
                     .into_iter()
                     .next()
-                    .ok_or(Error::Array(ArrayError::MissingDefaultDevice))?;
+                    .ok_or_else(|| Error::from(ArrayError::MissingDefaultDevice))?;
                 DevicePutTarget::device(Device::from_pjrt(device)?).resolve(shape.len())?
             }
         };
@@ -72,7 +72,7 @@ impl<'c> DevicePutLeaf<'c> for XlaArray<'c> {
         if let Some(src) = src {
             let (expected_mesh, expected_sharding) = src.resolve(current_sharding.rank())?;
             if expected_mesh != current_mesh || expected_sharding != current_sharding {
-                return Err(Error::Array(ArrayError::SourcePlacementMismatch {
+                return Err(Error::from(ArrayError::SourcePlacementMismatch {
                     expected_mesh,
                     expected_sharding,
                     actual_mesh: current_mesh.clone(),

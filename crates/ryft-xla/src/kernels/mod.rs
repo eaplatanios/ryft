@@ -32,6 +32,8 @@
 //! binding with recorded compiler configuration; it still requires a compatible runtime and device. AMD hardware
 //! execution remains unqualified, and unsupported portable operations fail before native compilation.
 
+// TODO(eaplatanios): Review this module.
+
 use std::collections::{BTreeMap, BTreeSet};
 
 use ryft_core::{

@@ -101,7 +101,7 @@ impl DenseArrayHostCopy {
                 } = shard;
                 let bytes = event.r#await()?;
                 if bytes.len() != expected_byte_count {
-                    return Err(Error::Array(ArrayError::ShardByteCountMismatch {
+                    return Err(Error::from(ArrayError::ShardByteCountMismatch {
                         shard_index,
                         device_id,
                         expected_byte_count,
@@ -196,7 +196,7 @@ pub(crate) fn begin_materialize_dense_array_bytes(array: &XlaArray<'_>) -> Resul
             let buffer = shard
                 .buffer()
                 .map(|buffer| buffer.as_ref())
-                .ok_or(Error::Array(ArrayError::MissingShardBuffer { shard_index, device_id: device.id() }))?;
+                .ok_or_else(|| Error::from(ArrayError::MissingShardBuffer { shard_index, device_id: device.id() }))?;
             let shard_shape = shard.shape();
             Ok(PendingDenseShardHostCopy {
                 // The merge consumes row-major bytes even when the device buffer has another physical layout.
@@ -242,9 +242,9 @@ pub(crate) fn relayout_shards_through_host<'o>(
     let mut buffers = Vec::new();
     for shard in array.addressable_shards() {
         let shard_index = shard.index();
-        let buffer = shard
-            .buffer()
-            .ok_or(Error::Array(ArrayError::MissingShardBuffer { shard_index, device_id: shard.device().id() }))?;
+        let buffer = shard.buffer().ok_or_else(|| {
+            Error::from(ArrayError::MissingShardBuffer { shard_index, device_id: shard.device().id() })
+        })?;
         let shape = shard.shape();
         let bytes = buffer.copy_to_host(Some(ryft_pjrt::Layout::dense_major_to_minor(shape.rank())))?.r#await()?;
         let dimensions = shape.as_slice().iter().map(|&dimension| dimension as u64).collect::<Vec<_>>();
@@ -297,7 +297,7 @@ fn sum_unreduced_summands(
             *summand_slices == slices && *summand_coordinates == unreduced_coordinates
         }) {
             Some((_, _, _, summand_bytes)) if *summand_bytes != bytes => {
-                return Err(Error::Array(ArrayError::InconsistentOverlappingShardData { shard_index }));
+                return Err(Error::from(ArrayError::InconsistentOverlappingShardData { shard_index }));
             }
             Some(_) => {}
             None => summands.push((slices, unreduced_coordinates, shard_index, bytes)),
@@ -433,7 +433,7 @@ fn merge_dense_byte_segment(
         if overlap.start < overlap.end {
             let source_offset = overlap.start - range.start;
             if global_bytes[overlap.clone()] != source_bytes[source_offset..source_offset + overlap.len()] {
-                return Err(Error::Array(ArrayError::InconsistentOverlappingShardData { shard_index }));
+                return Err(Error::from(ArrayError::InconsistentOverlappingShardData { shard_index }));
             }
         }
         overlap_index += 1;

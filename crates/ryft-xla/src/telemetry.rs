@@ -6,6 +6,8 @@
 //! checks: the values are eventually consistent under concurrent writers and may be off by a
 //! small amount during rapid construction / destruction.
 
+// TODO(eaplatanios): Review this module.
+
 use std::sync::atomic::{AtomicUsize, Ordering};
 
 /// Cumulative count of [`XlaArray`](crate::XlaArray) constructions (including [`Clone::clone`]) over

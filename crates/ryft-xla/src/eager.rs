@@ -10,6 +10,8 @@ use crate::arrays_v0::host::materialize_dense_array_bytes;
 use crate::experimental::ops::XlaArrayConstant;
 use crate::{XlaArray, XlaArrayShard};
 
+// TODO(eaplatanios): Review from here onwards.
+
 /// Eagerly executes one `operation` over `inputs` through the first input's recovered
 /// [`XlaDomain`](crate::XlaDomain) and extracts the operation's single output.
 ///

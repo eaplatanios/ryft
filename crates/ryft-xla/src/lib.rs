@@ -7,7 +7,6 @@ pub mod experimental;
 pub mod jit;
 pub mod kernels;
 pub mod mlir;
-/// Backend-owned per-operation code (e.g., StableHLO lowering), organized to mirror [`ryft_core::operations`].
 pub mod operations;
 pub mod pjrt;
 pub mod profile_guided;
@@ -45,6 +44,8 @@ pub use profile_guided::{
 };
 pub use telemetry::{constructed_array_count, dropped_array_count, live_array_count};
 pub use values::{XlaDimension, XlaReference, XlaValue};
+
+// TODO(eaplatanios): Review this module.
 
 #[cfg(test)]
 pub(crate) mod tests {

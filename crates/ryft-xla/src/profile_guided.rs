@@ -5,6 +5,8 @@
 //! dispatching without waiting, and compilation occurs outside all adaptive-state and dispatch locks. A compatible
 //! optimized executable is published only after compilation succeeds; every failure path is bounded and observable.
 
+// TODO(eaplatanios): Review this module.
+
 use std::sync::atomic::{AtomicUsize, Ordering};
 use std::sync::{Arc, Mutex, RwLock};
 

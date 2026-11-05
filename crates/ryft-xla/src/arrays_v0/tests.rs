@@ -56,7 +56,7 @@ fn test_array_new_requires_sharding_without_single_buffer() {
 
     assert!(matches!(
         XlaArray::from_addressable_buffers(&domain, array_type, mesh, Vec::new()),
-        Err(Error::Array(ArrayError::MissingSharding)),
+        Err(Error::Array(error)) if matches!(error.as_ref(), ArrayError::MissingSharding),
     ));
 }
 
@@ -111,7 +111,9 @@ fn test_array_new_rejects_dynamic_shape() {
 
     assert!(matches!(
         XlaArray::from_addressable_buffers(&domain, array_type, mesh, Vec::new()),
-        Err(Error::Array(ArrayError::DynamicShape { shape })) if shape == Shape::new(vec![Dimension::Dynamic(dynamic)]),
+        Err(Error::Array(error)) if matches!(error.as_ref(),
+            ArrayError::DynamicShape { shape } if shape == &Shape::new(vec![Dimension::Dynamic(dynamic)]),
+        ),
     ));
 }
 
@@ -463,7 +465,9 @@ fn test_array_put_rejects_non_addressable_source_shards() {
             &engine,
             crate::arrays_v0::DevicePutTarget::Placement { mesh: target_mesh, sharding: target_sharding }
         ),
-        Err(Error::Array(ArrayError::MissingShardBuffer { shard_index: 0, device_id: 0 })),
+        Err(Error::Array(error)) if matches!(error.as_ref(),
+            ArrayError::MissingShardBuffer { shard_index: 0, device_id: 0 },
+        ),
     ));
 }
 
@@ -701,15 +705,17 @@ fn test_device_put_rejects_mismatched_src_for_array_leaf() {
                 Option::<Option<bool>>::None,
             ),
         ),
-        Err(Error::Array(ArrayError::SourcePlacementMismatch {
-            expected_mesh: reported_expected_mesh,
-            expected_sharding: reported_expected_sharding,
-            actual_mesh: reported_actual_mesh,
-            actual_sharding: reported_actual_sharding,
-        })) if &reported_expected_mesh == &expected_src.0
-            && &reported_expected_sharding == &expected_src.1
-            && &reported_actual_mesh == &actual_src.0
-            && &reported_actual_sharding == &actual_src.1,
+        Err(Error::Array(error)) if matches!(error.as_ref(),
+            ArrayError::SourcePlacementMismatch {
+                expected_mesh: reported_expected_mesh,
+                expected_sharding: reported_expected_sharding,
+                actual_mesh: reported_actual_mesh,
+                actual_sharding: reported_actual_sharding,
+            } if reported_expected_mesh == &expected_src.0
+                && reported_expected_sharding == &expected_src.1
+                && reported_actual_mesh == &actual_src.0
+                && reported_actual_sharding == &actual_src.1,
+        ),
     ));
 }
 

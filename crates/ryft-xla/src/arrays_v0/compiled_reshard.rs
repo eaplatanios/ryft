@@ -86,7 +86,7 @@ pub(crate) fn reshard_with_donation<'o>(
     let client_process_index = engine.client().process_index()?;
     for shard in source.shards() {
         if shard.device().process_index() == client_process_index && shard.buffer().is_none() {
-            return Err(Error::Array(ArrayError::MissingShardBuffer {
+            return Err(Error::from(ArrayError::MissingShardBuffer {
                 shard_index: shard.index(),
                 device_id: shard.device().id(),
             }));
@@ -204,10 +204,9 @@ fn try_replicated_cross_mesh<'o>(
                     .push((canonical_src_global_id, transfer_key));
             }
         } else if this_process_is_canonical_sender {
-            let local_source = local_source_buffer.as_ref().ok_or(Error::Array(ArrayError::MissingShardBuffer {
-                shard_index: 0,
-                device_id: canonical_src_device.id(),
-            }))?;
+            let local_source = local_source_buffer.as_ref().ok_or_else(|| {
+                Error::from(ArrayError::MissingShardBuffer { shard_index: 0, device_id: canonical_src_device.id() })
+            })?;
             send_buffers.push(local_source.as_ref());
             send_dst_devices.push(dst_global_id);
             send_transfer_keys.push(transfer_key);

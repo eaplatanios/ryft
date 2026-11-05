@@ -368,7 +368,7 @@ pub(crate) fn static_dimensions(array_type: &ArrayType) -> Result<Vec<usize>, Er
         .iter()
         .map(|size| match size {
             Dimension::Static(value) => Ok(*value),
-            Dimension::Dynamic(_) => Err(Error::Array(ArrayError::DynamicShape { shape: array_type.shape().clone() })),
+            Dimension::Dynamic(_) => Err(Error::from(ArrayError::DynamicShape { shape: array_type.shape().clone() })),
         })
         .collect()
 }
@@ -916,7 +916,9 @@ mod tests {
         let dynamic_type = ArrayType::new(DataType::F32, Shape::new(vec![dimension.into()]));
         assert!(matches!(
             static_dimensions(&dynamic_type),
-            Err(Error::Array(ArrayError::DynamicShape { shape })) if &shape == dynamic_type.shape(),
+            Err(Error::Array(error)) if matches!(error.as_ref(),
+                ArrayError::DynamicShape { shape } if shape == dynamic_type.shape(),
+            ),
         ));
     }
 

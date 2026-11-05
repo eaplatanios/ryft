@@ -1080,7 +1080,7 @@ impl<'c> XlaDomain<'c> {
     /// domain was constructed without a mesh; eager binds derive their mesh from the inputs in that case.
     #[inline]
     pub fn mesh(&self) -> Result<&DeviceMesh, Error> {
-        self.mesh.as_ref().ok_or(Error::Array(ArrayError::MissingMesh))
+        self.mesh.as_ref().ok_or_else(|| Error::from(ArrayError::MissingMesh))
     }
 
     /// Returns the base [`CompilationOptions`] template that the compile path forwards to PJRT.
@@ -1738,7 +1738,7 @@ impl<'c> XlaDomain<'c> {
     /// Materializes a concrete [`XlaArray`] whose addressable shards are filled with a constant.
     fn constant(&self, array_type: &ArrayType, kind: ConstantKind) -> Result<XlaArray<'c>, Error> {
         let client = self.client();
-        let mesh = self.mesh.as_ref().ok_or_else(|| Error::Array(ArrayError::MissingMesh))?;
+        let mesh = self.mesh.as_ref().ok_or_else(|| Error::from(ArrayError::MissingMesh))?;
         static_dimensions_or_panic(array_type);
         let effective_type = match array_type.sharding() {
             Some(_) => array_type.clone(),
@@ -1765,10 +1765,12 @@ impl<'c> XlaDomain<'c> {
                 .addressable_devices()?
                 .into_iter()
                 .find(|device| device.id().map(|id| id == shard_device_id).unwrap_or(false))
-                .ok_or(Error::Array(ArrayError::NonAddressableDevice {
-                    device_id: shard_device_id,
-                    process_index: shard_device.process_index(),
-                }))?;
+                .ok_or_else(|| {
+                    Error::from(ArrayError::NonAddressableDevice {
+                        device_id: shard_device_id,
+                        process_index: shard_device.process_index(),
+                    })
+                })?;
             let buffer = client.buffer(
                 bytes.as_slice(),
                 XlaArray::physical_buffer_type(array_type.data_type()),
@@ -1902,10 +1904,10 @@ fn addressable_device_ids(client: &Client<'_>, mesh: &DeviceMesh) -> Result<Vec<
 
 /// Returns the shard descriptors implied by `array_type` and `mesh`.
 fn shards_for_type(array_type: &ArrayType, mesh: &DeviceMesh) -> Result<Vec<ShardDescriptor>, Error> {
-    let sharding = array_type.sharding().ok_or(Error::Array(ArrayError::MissingSharding))?;
+    let sharding = array_type.sharding().ok_or_else(|| Error::from(ArrayError::MissingSharding))?;
     let global_shape = array_type
         .static_shape()
-        .ok_or_else(|| Error::Array(ArrayError::DynamicShape { shape: array_type.shape().clone() }))?;
+        .ok_or_else(|| Error::from(ArrayError::DynamicShape { shape: array_type.shape().clone() }))?;
     let (descriptors, _) = ShardLayout::new(&global_shape, mesh, sharding)?.into_parts();
     Ok(descriptors)
 }
