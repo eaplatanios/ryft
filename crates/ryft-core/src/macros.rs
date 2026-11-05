@@ -56,7 +56,11 @@ macro_rules! check_count {
 ///   - `@float`: Accepts floating-point and complex [`DataType`](crate::DataType)s.
 ///   - `@real`: Excludes complex [`DataType`](crate::DataType)s and is intended to refine `@numeric` or `@float`.
 ///   - `@no_unreduced`: Rejects [`ArrayType`](crate::ArrayType)s carrying any unreduced mesh axes.
-///   - `@same_unreduced_axes`: Requires exactly two [`ArrayType`](crate::ArrayType)s with matching unreduced-axis sets.
+///   - `@same_unreduced_axes`: Requires exactly two [`ArrayType`](crate::ArrayType)s with matching unreduced-axis sets
+///     and matching [`UnreducedKind`](crate::UnreducedKind)s.
+///   - `@sum_unreduced`, `@max_unreduced`, and `@min_unreduced`: Reject [`ArrayType`](crate::ArrayType)s carrying
+///     unreduced mesh axes of any [`UnreducedKind`](crate::UnreducedKind) other than the named one (e.g., the inputs
+///     of an operation that is linear only in sums, or that commutes only with maxima).
 ///   - `@same_reduced_axes`: Requires exactly two [`ArrayType`](crate::ArrayType)s with matching reduced-axis sets.
 ///
 /// # Examples
@@ -115,6 +119,46 @@ macro_rules! check_types {
         }
         if types[0].unreduced_axes() != types[1].unreduced_axes() {
             return Err($crate::TypeError::invalid(format!("`{descriptor}` inputs must be unreduced over the same axes"))
+            .into());
+        }
+        if types[0].unreduced_kind() != types[1].unreduced_kind() {
+            return Err($crate::TypeError::invalid(format!(
+                "`{}` inputs must be unreduced with the same kind but got `{}` and `{}`",
+                descriptor,
+                types[0].unreduced_kind(),
+                types[1].unreduced_kind(),
+            ))
+            .into());
+        }
+    }};
+
+    // The following branches reject array types whose unreduced mesh axes carry a kind other than the named one.
+    (@sum_unreduced, $descriptor:expr, $types:expr $(,)?) => {{
+        $crate::check_types!(@unreduced_kind Sum, $descriptor, $types);
+    }};
+
+    (@max_unreduced, $descriptor:expr, $types:expr $(,)?) => {{
+        $crate::check_types!(@unreduced_kind Max, $descriptor, $types);
+    }};
+
+    (@min_unreduced, $descriptor:expr, $types:expr $(,)?) => {{
+        $crate::check_types!(@unreduced_kind Min, $descriptor, $types);
+    }};
+
+    (@unreduced_kind $kind:ident, $descriptor:expr, $types:expr $(,)?) => {{
+        let descriptor = $descriptor;
+        let types = &$types[..];
+        let expected = $crate::UnreducedKind::$kind;
+        if let Some(r#type) = types
+            .iter()
+            .find(|r#type| !r#type.unreduced_axes().is_empty() && r#type.unreduced_kind() != expected)
+        {
+            return Err($crate::TypeError::invalid(format!(
+                "`{}` supports only unreduced inputs of kind `{}` but got kind `{}`",
+                descriptor,
+                expected,
+                r#type.unreduced_kind(),
+            ))
             .into());
         }
     }};

@@ -7,7 +7,7 @@ use ryft_macros::Parameter;
 use crate::arrays::addressing::ArrayAddressing;
 use crate::arrays::broadcasting::Broadcastable;
 use crate::arrays::sharding::meshes::{DeviceMesh, MeshAxisType};
-use crate::arrays::sharding::shardings::{Sharding, ShardingDimension};
+use crate::arrays::sharding::shardings::{Sharding, ShardingDimension, UnreducedKind};
 use crate::arrays::sharding::{ShardableType, ShardingError};
 use crate::arrays::types::data::DataType;
 use crate::arrays::types::dimensions::{
@@ -184,6 +184,7 @@ impl ArrayType {
                     .map(|sharding| {
                         Sharding::replicated(sharding.mesh().clone(), 0)
                             .with_unreduced_axes(sharding.unreduced_axes().clone())
+                            .and_then(|output| output.with_unreduced_kind(sharding.unreduced_kind()))
                             .and_then(|output| output.with_reduced_axes(sharding.reduced_axes().clone()))
                             .and_then(|output| output.with_varying_manual_axes(sharding.varying_manual_axes().clone()))
                             .map_err(|error| {
@@ -285,6 +286,13 @@ impl ArrayType {
     #[inline]
     pub fn unreduced_axes(&self) -> &BTreeSet<String> {
         self.sharding.as_ref().map(|sharding| sharding.unreduced_axes()).unwrap_or(&EMPTY_BATCH_AXES)
+    }
+
+    /// Returns the [`UnreducedKind`] of this array type's [`Sharding`] (i.e., [`Sharding::unreduced_kind`]),
+    /// or [`UnreducedKind::Sum`] when the array type carries no [`Sharding`].
+    #[inline]
+    pub fn unreduced_kind(&self) -> UnreducedKind {
+        self.sharding.as_ref().map(Sharding::unreduced_kind).unwrap_or_default()
     }
 
     /// Returns the mesh axes over which this array type's [`Sharding`] is *reduced* (i.e.,

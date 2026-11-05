@@ -241,14 +241,16 @@ impl Operation for ParallelReduceOperation {
                     )));
                 }
 
-                // An input that is unreduced along the axis holds one summand of the logical value on every device,
-                // so only a sum completes it (JAX's `unreduced_psum`), and the output is invariant over the axis.
+                // An input that is unreduced along the axis holds one per-device value of its logical value on every
+                // device, so only the reduction of the input's unreduced kind completes it (JAX's `unreduced_psum`,
+                // `unreduced_pmax`, and `unreduced_pmin`), and the output is invariant over the axis.
                 let sharding = if sharding.unreduced_axes().contains(axis_name) {
-                    if self.kind != ReductionKind::Sum {
+                    let unreduced_kind = sharding.unreduced_kind();
+                    if self.kind.commuting_unreduced_kind(input.data_type()) != Some(unreduced_kind) {
                         return Err(TypeError::invalid(format!(
-                            "`{}` with kind `{}` cannot reduce an input that is unreduced along manual axis `{}`; \
-                             only a sum completes its pending sum",
-                            PARALLEL_REDUCE_OPERATION_NAME, self.kind, axis_name,
+                            "`{}` with kind `{}` cannot reduce an input that is unreduced along manual axis `{}` \
+                             with kind `{}`; only a reduction of that kind completes it",
+                            PARALLEL_REDUCE_OPERATION_NAME, self.kind, axis_name, unreduced_kind,
                         )));
                     }
                     let mut axes = sharding.unreduced_axes().clone();
@@ -269,7 +271,7 @@ impl Operation for ParallelReduceOperation {
             }
         };
 
-        // Only a sum and a floating-point mean commute with the pending cross-device sum of an unreduced input.
+        // The reduction must commute with the pending cross-device reduction along the input's other unreduced axes.
         self.kind.validate_unreduced_axes(PARALLEL_REDUCE_OPERATION_NAME, input)?;
 
         Ok(vec![output])
@@ -769,7 +771,7 @@ mod tests {
 
     use crate::arrays::{
         ArrayIrOperation, ArrayIrValue, ArrayOperation, DataType, Dimension, DimensionBounds, DimensionType,
-        DimensionVariable, DynamicArrayExtentBatchingPolicy, MeshAxis, MeshAxisType, Shape, Sharding,
+        DimensionVariable, DynamicArrayExtentBatchingPolicy, MeshAxis, MeshAxisType, Shape, Sharding, UnreducedKind,
     };
     use crate::axes::NamedAxis;
     use crate::batching::{BatchAxisSpecification, BatchingTracer, batch};
@@ -1187,23 +1189,73 @@ mod tests {
             ],
         );
 
-        // Only a sum completes the pending sum of an input that is unreduced along the axis.
-        for kind in [ReductionKind::Product, ReductionKind::Max, ReductionKind::Min] {
+        // Only the reduction of an input's unreduced kind completes it along the axis (JAX's `unreduced_psum`,
+        // `unreduced_pmax`, and `unreduced_pmin`), and the remaining unreduced axes keep that kind.
+        let unreduced_with_kind = |axes: &[&str], kind: UnreducedKind| {
+            ArrayType::scalar(DataType::F32)
+                .with_sharding(
+                    sharding.clone().with_unreduced_axes(axes.to_vec()).unwrap().with_unreduced_kind(kind).unwrap(),
+                )
+                .unwrap()
+        };
+        for (kind, unreduced_kind) in [
+            (ReductionKind::Sum, UnreducedKind::Sum),
+            (ReductionKind::Max, UnreducedKind::Max),
+            (ReductionKind::Min, UnreducedKind::Min),
+        ] {
+            check_operation_type_inference!(
+                operation = ParallelReduceOperation::new(kind, "m".to_string()).with_mesh(mesh.clone()),
+                cases = [
+                    {
+                        input_types = [unreduced_with_kind(&["m"], unreduced_kind)],
+                        output_types = [ArrayType::scalar(DataType::F32).with_sharding(sharding.clone()).unwrap()],
+                    },
+                    {
+                        input_types = [unreduced_with_kind(&["m", "outer"], unreduced_kind)],
+                        output_types = [unreduced_with_kind(&["outer"], unreduced_kind)],
+                    },
+                ],
+            );
+        }
+        for (kind, unreduced_kind) in [
+            (ReductionKind::Product, UnreducedKind::Sum),
+            (ReductionKind::Max, UnreducedKind::Sum),
+            (ReductionKind::Sum, UnreducedKind::Max),
+            (ReductionKind::Min, UnreducedKind::Max),
+            (ReductionKind::Max, UnreducedKind::Min),
+        ] {
             check_operation_type_inference!(
                 operation = ParallelReduceOperation::new(kind, "m".to_string()).with_mesh(mesh.clone()),
                 cases = [{
-                    input_types = [
-                        ArrayType::scalar(DataType::F32)
-                            .with_sharding(sharding.clone().with_unreduced_axes(["m"]).unwrap())
-                            .unwrap(),
-                    ],
+                    input_types = [unreduced_with_kind(&["m"], unreduced_kind)],
                     error = format!(
                         "`parallel_reduce` with kind `{kind}` cannot reduce an input that is unreduced along manual \
-                         axis `m`; only a sum completes its pending sum",
+                         axis `m` with kind `{unreduced_kind}`; only a reduction of that kind completes it",
                     ),
                 }],
             );
         }
+
+        // A reduction along a varying axis must also commute with the input's pending reduction along other axes.
+        check_operation_type_inference!(
+            operation = ParallelReduceOperation::new(ReductionKind::Sum, "m".to_string()).with_mesh(mesh.clone()),
+            cases = [{
+                input_types = [
+                    ArrayType::scalar(DataType::F32)
+                        .with_sharding(
+                            unreduced_with_kind(&["outer"], UnreducedKind::Max)
+                                .sharding()
+                                .unwrap()
+                                .clone()
+                                .with_varying_manual_axes(["m"])
+                                .unwrap(),
+                        )
+                        .unwrap(),
+                ],
+                error = "`parallel_reduce` with kind `sum` supports only unreduced inputs of kind `sum` \
+                         but got kind `max`",
+            }],
+        );
 
         // The operation's mesh must be the input's mesh, its axis must be manual, and it cannot also be grouped.
         let other_mesh = LogicalMesh::new(vec![MeshAxis::new("m", 4, MeshAxisType::Manual).unwrap()]).unwrap();
@@ -2352,9 +2404,41 @@ mod tests {
             )
             .map(|_| ()),
             Err(ProgramError::Type(TypeError::invalid(
-                "`parallel_reduce` with kind `max` cannot reduce an input that is unreduced along manual axis `m`; \
-                 only a sum completes its pending sum",
+                "`parallel_reduce` with kind `max` cannot reduce an input that is unreduced along manual axis `m` \
+                 with kind `sum`; only a reduction of that kind completes it",
             ))),
+        );
+
+        // An input that is unreduced with kind `max` holds one candidate maximum per device, which a maximum completes.
+        let unreduced_max = invariant
+            .clone()
+            .with_sharding(
+                invariant
+                    .sharding()
+                    .unwrap()
+                    .clone()
+                    .with_unreduced_axes(["m"])
+                    .unwrap()
+                    .with_unreduced_kind(UnreducedKind::Max)
+                    .unwrap(),
+            )
+            .unwrap();
+        let (output, program) = TracingContext::<Array, ArrayOperation<Array>>::trace_with_named_axes(
+            |input| input.parallel_reduce(ReductionKind::Max, "m"),
+            unreduced_max.clone(),
+            manual_mesh_axes(&mesh),
+        )
+        .unwrap();
+        assert_eq!(output, invariant);
+        assert_eq!(
+            program.to_string(),
+            indoc! {"
+                lambda %0:f32[][sharding={mesh<['m'=4:manual, 'outer'=2:manual]>, [], unreduced={'m'}, \
+                        unreduced_kind=max}] .
+                let %1:f32[][sharding={mesh<['m'=4:manual, 'outer'=2:manual]>, []}] = \
+                        parallel_reduce [kind=max, axis_name=\"m\", mesh=['m'=4:manual, 'outer'=2:manual]] %0
+                in (%1)"
+            },
         );
     }
 

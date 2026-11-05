@@ -350,7 +350,7 @@ impl<A: Value<Type = ArrayType>> From<ParallelCastOperation> for ArrayIrOperatio
 /// values, which a later sum completes. A _reduced_ value is invariant but its reverse mode cotangent is unreduced.
 /// [`parallel_cast`](Self::parallel_cast) changes that state without changing any local value, so it lowers to
 /// nothing. It is the Ryft analogue of JAX's
-/// [`jax.lax.pcast`](https://docs.jax.dev/en/latest/_autosummary/jax.lax.pcast.html),
+/// [`jax.lax.pcast`](https://docs.jax.dev/en/latest/301/sharding-ad.html),
 /// and, with manual variation checking enabled, supports the same four transitions.
 ///
 ///   - Invariant to [`Varying`](ParallelCastTarget::Varying) stages a
@@ -1126,7 +1126,7 @@ mod tests {
             );
             let differentiated = program.to_flat_program().jvp_with_respect_to(&[]).unwrap();
             assert_eq!(differentiated.output_types(), vec![case.output_type.clone(), case.output_type]);
-            let expected = if target == ParallelCastTarget::Varying {
+            let expected = if target != ParallelCastTarget::Reduced {
                 formatdoc! {"
                     lambda %0:{source} .
                     let %1:{output} = parallel_cast [axis_name=\"m\", target={target}] %0

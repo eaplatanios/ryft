@@ -201,6 +201,7 @@ define_elementwise_operation!(
         }
         Ok(vec![input_type])
     },
+    check_array_types = [@sum_unreduced],
 );
 
 impl_differentiable_elementwise_operation! {
@@ -490,7 +491,7 @@ define_elementwise_operation!(
     Add,
     add,
     check_data_types = [@numeric],
-    check_array_types = [@same_unreduced_axes, @same_reduced_axes],
+    check_array_types = [@same_unreduced_axes, @sum_unreduced, @same_reduced_axes],
 );
 
 impl_differentiable_elementwise_operation! {
@@ -552,7 +553,7 @@ impl_array_elementwise_operation!(
     add,
     operation = "add",
     inputs = @numeric,
-    checks = [@same_unreduced_axes, @same_reduced_axes],
+    checks = [@same_unreduced_axes, @sum_unreduced, @same_reduced_axes],
     |left, right| NumericArrayElement::add(left, right),
 );
 
@@ -624,7 +625,7 @@ define_elementwise_operation!(
     Sub,
     sub,
     check_data_types = [@numeric],
-    check_array_types = [@same_unreduced_axes, @same_reduced_axes],
+    check_array_types = [@same_unreduced_axes, @sum_unreduced, @same_reduced_axes],
 );
 
 impl_differentiable_elementwise_operation! {
@@ -649,7 +650,7 @@ impl_array_elementwise_operation!(
     sub,
     operation = "sub",
     inputs = @numeric,
-    checks = [@same_unreduced_axes, @same_reduced_axes],
+    checks = [@same_unreduced_axes, @sum_unreduced, @same_reduced_axes],
     |left, right| NumericArrayElement::sub(left, right),
 );
 
@@ -901,6 +902,10 @@ define_elementwise_operation!(
         // bilinear rule rather than the congruent rule used by generic elementwise broadcasting. The reduction state
         // is combined independently of per-dimension placement, so the placement is broadcast with that state stripped
         // and the recomputed state is reattached afterward.
+
+        // Only partial sums distribute over a product, so unreduced inputs of any other kind are rejected.
+        check_types!(@sum_unreduced, MUL_OPERATION_NAME, input_types);
+
         let stripped = [input_types[0].without_reduction_axes(), input_types[1].without_reduction_axes()];
         let output = MulOperation::<ArrayType>::new().infer_elementwise_broadcast_type(&stripped)?;
         let left_unreduced = input_types[0].unreduced_axes();
@@ -1212,6 +1217,7 @@ define_elementwise_operation!(
         if !denominator.unreduced_axes().is_empty() {
             return Err(TypeError::invalid(format!("`{DIV_OPERATION_NAME}` denominator must not be unreduced")));
         }
+        check_types!(@sum_unreduced, DIV_OPERATION_NAME, [numerator]);
 
         let unreduced = numerator.unreduced_axes();
         if !unreduced.is_subset(denominator.reduced_axes()) {

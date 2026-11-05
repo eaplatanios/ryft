@@ -7,7 +7,7 @@ pub mod shardings;
 pub mod visualizations;
 
 pub use meshes::{Device, DeviceId, DeviceMesh, LogicalMesh, MeshAxis, MeshAxisType, ProcessIndex};
-pub use shardings::{ReductionStateKind, Sharding, ShardingDimension};
+pub use shardings::{ReductionStateKind, Sharding, ShardingDimension, UnreducedKind};
 pub use visualizations::ShardingVisualization;
 
 /// Represents sharding-related errors.
@@ -36,6 +36,15 @@ pub enum ShardingError {
 
     #[error("manual axis `{name}` cannot be both varying and reduced")]
     ConflictingVaryingAndReducedMeshAxis { name: String },
+
+    #[error("unreduced kind `{kind}` requires at least one unreduced mesh axis")]
+    UnreducedKindWithoutUnreducedAxes { kind: UnreducedKind },
+
+    #[error(
+        "a value that is unreduced with kind `{kind}` has no cotangent, because reverse mode supports only `sum` \
+         unreduced axes"
+    )]
+    UndefinedUnreducedCotangent { kind: UnreducedKind },
 
     #[error("device ID `{id}` appears more than once")]
     DuplicateDeviceId { id: DeviceId },

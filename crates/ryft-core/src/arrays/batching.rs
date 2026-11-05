@@ -2874,12 +2874,10 @@ fn normalized_batch_axis_type(
     let mut dimensions = sharding.dimensions().to_vec();
     dimensions[position] = axis_sharding.clone();
 
-    // `Sharding::new` validates the new per-dimension placement and starts with empty auxiliary axis state. Reapply the
-    // input's reduction state and manual variation, which a placement never changes (refer to `Sharding::batched`).
-    let sharding = Sharding::new(sharding.mesh().clone(), dimensions)
-        .and_then(|normalized| normalized.with_unreduced_axes(sharding.unreduced_axes().clone()))
-        .and_then(|normalized| normalized.with_reduced_axes(sharding.reduced_axes().clone()))
-        .and_then(|normalized| normalized.with_varying_manual_axes(sharding.varying_manual_axes().clone()))
+    // `Sharding::with_dimensions` validates the new per-dimension placement and keeps the input's reduction state and
+    // manual variation, which a placement never changes (refer to `Sharding::batched`).
+    let sharding = sharding
+        .with_dimensions(dimensions)
         .map_err(|error| BatchingError::MisalignedBatchAxes { message: error.to_string() })?;
 
     // Install the validated sharding on a cloned packed type. Returning `Some` tells the caller that it must

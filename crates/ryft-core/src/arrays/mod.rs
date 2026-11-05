@@ -56,7 +56,7 @@ pub use references::{
 };
 pub use sharding::{
     Device, DeviceId, DeviceMesh, LogicalMesh, MeshAxis, MeshAxisType, ProcessIndex, ReductionStateKind, ShardableType,
-    Sharding, ShardingDimension, ShardingError, ShardingVisualization,
+    Sharding, ShardingDimension, ShardingError, ShardingVisualization, UnreducedKind,
 };
 pub use types::{
     ArrayIrType, ArrayIrTypeRefinements, ArrayMemberType, ArrayType, ArrayTypeRefinements, DataType, DataTypeError,

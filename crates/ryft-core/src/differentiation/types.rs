@@ -143,10 +143,18 @@ impl DifferentiableType for ArrayType {
     #[inline]
     fn cotangent(&self) -> Result<Self, DifferentiationError> {
         // Use the element cotangent representation, clear explicit layout when that representation changes element
-        // width, swap the unreduced and reduced sharding axes, and keep all other type metadata unchanged.
+        // width, swap the unreduced and reduced sharding axes, and keep all other type metadata unchanged. A value
+        // that is unreduced with a kind other than a sum has no cotangent. Refer to `Sharding::cotangent` for more
+        // information.
         let data_type = self.data_type().cotangent()?;
         let layout = if data_type == self.data_type() { self.layout.clone() } else { None };
-        Ok(Self { data_type, layout, sharding: self.sharding.as_ref().map(Sharding::cotangent), ..self.clone() })
+        let sharding = self
+            .sharding
+            .as_ref()
+            .map(Sharding::cotangent)
+            .transpose()
+            .map_err(|_| DifferentiationError::UndefinedCotangentType { primal_type: self.to_string() })?;
+        Ok(Self { data_type, layout, sharding, ..self.clone() })
     }
 }
 

@@ -101,6 +101,7 @@ impl Display for ShardingDimension {
 ///         ShardingDimension::replicated(),
 ///     ],
 ///     unreduced_axes: std::collections::BTreeSet::from(["model".to_string()]),
+///     unreduced_kind: UnreducedKind::Sum,
 ///     reduced_axes: std::collections::BTreeSet::new(),
 ///     varying_manual_axes: std::collections::BTreeSet::new(),
 /// };
@@ -131,6 +132,10 @@ pub struct Sharding {
     /// Refer to the documentation of [`Self::unreduced_axes`] for information on this field.
     unreduced_axes: BTreeSet<String>,
 
+    /// Refer to the documentation of [`Self::unreduced_kind`] for information on this field. It is always
+    /// [`UnreducedKind::Sum`] when [`Self::unreduced_axes`] is empty, so that equal shardings compare equal.
+    unreduced_kind: UnreducedKind,
+
     /// Refer to the documentation of [`Self::reduced_axes`] for information on this field.
     reduced_axes: BTreeSet<String>,
 
@@ -147,6 +152,7 @@ impl Sharding {
             mesh,
             dimensions,
             unreduced_axes: BTreeSet::new(),
+            unreduced_kind: UnreducedKind::Sum,
             reduced_axes: BTreeSet::new(),
             varying_manual_axes: BTreeSet::new(),
         };
@@ -183,6 +189,7 @@ impl Sharding {
             mesh,
             dimensions: vec![ShardingDimension::Replicated; rank],
             unreduced_axes: BTreeSet::new(),
+            unreduced_kind: UnreducedKind::Sum,
             reduced_axes: BTreeSet::new(),
             varying_manual_axes: BTreeSet::new(),
         }
@@ -223,6 +230,16 @@ impl Sharding {
     #[inline]
     pub fn unreduced_axes(&self) -> &BTreeSet<String> {
         &self.unreduced_axes
+    }
+
+    /// Returns the [`UnreducedKind`] that combines the per-device values along [`Self::unreduced_axes`] into the
+    /// logical value (e.g., [`UnreducedKind::Max`] for a value whose logical value is the maximum of the values that
+    /// the devices along those axes hold). One kind covers every unreduced axis, as in JAX's
+    /// [`PartitionSpec`](https://docs.jax.dev/en/latest/jax.sharding.html#jax.sharding.PartitionSpec), and it is
+    /// [`UnreducedKind::Sum`] for a sharding without unreduced axes.
+    #[inline]
+    pub fn unreduced_kind(&self) -> UnreducedKind {
+        self.unreduced_kind
     }
 
     /// Returns the mesh axes across which values are known to have already been reduced. This is the dual of
@@ -397,13 +414,16 @@ impl Sharding {
             }
         }
         sharding.unreduced_axes = self.unreduced_axes.clone();
+        sharding.unreduced_kind = self.unreduced_kind;
         sharding.reduced_axes = self.reduced_axes.clone();
         sharding.varying_manual_axes = self.varying_manual_axes.clone();
         Ok(sharding)
     }
 
     /// Returns this [`Sharding`] with its unreduced mesh axes replaced by `unreduced_axes`. Use this when the
-    /// sharding carries partial results along mesh axes that still need cross-device reduction.
+    /// sharding carries partial results along mesh axes that still need cross-device reduction. The
+    /// [`Self::unreduced_kind`] is kept, unless `unreduced_axes` is empty, in which case it becomes
+    /// [`UnreducedKind::Sum`].
     pub fn with_unreduced_axes<A: Into<String>, I: IntoIterator<Item = A>>(
         mut self,
         unreduced_axes: I,
@@ -420,7 +440,21 @@ impl Sharding {
                 return Err(ShardingError::ConflictingVaryingAndUnreducedMeshAxis { name: axis_name.clone() });
             }
         }
+        if unreduced_axes.is_empty() {
+            self.unreduced_kind = UnreducedKind::Sum;
+        }
         self.unreduced_axes = unreduced_axes;
+        Ok(self)
+    }
+
+    /// Returns this [`Sharding`] with its [`Self::unreduced_kind`] replaced by `unreduced_kind`. Set the unreduced
+    /// axes first (e.g., with [`Self::with_unreduced_axes`]), because a sharding without unreduced axes only admits
+    /// [`UnreducedKind::Sum`] and this function returns [`ShardingError::UnreducedKindWithoutUnreducedAxes`] otherwise.
+    pub fn with_unreduced_kind(mut self, unreduced_kind: UnreducedKind) -> Result<Self, ShardingError> {
+        if self.unreduced_axes.is_empty() && unreduced_kind != UnreducedKind::Sum {
+            return Err(ShardingError::UnreducedKindWithoutUnreducedAxes { kind: unreduced_kind });
+        }
+        self.unreduced_kind = unreduced_kind;
         Ok(self)
     }
 
@@ -495,10 +529,21 @@ impl Sharding {
     /// value that still carries per-device partial results along an axis is the same value on every device along that
     /// axis (i.e., marked reduced), while the cotangent of an already-reduced value carries per-device partial results
     /// that still need a reduction (i.e., marked unreduced). The swap is an **involution**, so that
-    /// `sharding.cotangent().cotangent()` recovers `sharding`.
+    /// `sharding.cotangent()?.cotangent()?` recovers `sharding`.
+    ///
+    /// Only sums have this duality, so the cotangent of a sharding whose [`Self::unreduced_kind`] is not
+    /// [`UnreducedKind::Sum`] is undefined and this function returns [`ShardingError::UndefinedUnreducedCotangent`]
+    /// for it, as JAX's `PartitionSpec.to_ct_spec` does. The unreduced axes of a cotangent are always sums.
     #[inline]
-    pub fn cotangent(&self) -> Self {
-        Self { unreduced_axes: self.reduced_axes.clone(), reduced_axes: self.unreduced_axes.clone(), ..self.clone() }
+    pub fn cotangent(&self) -> Result<Self, ShardingError> {
+        if self.unreduced_kind != UnreducedKind::Sum {
+            return Err(ShardingError::UndefinedUnreducedCotangent { kind: self.unreduced_kind });
+        }
+        Ok(Self {
+            unreduced_axes: self.reduced_axes.clone(),
+            reduced_axes: self.unreduced_axes.clone(),
+            ..self.clone()
+        })
     }
 
     /// Returns a [`Sharding`] with all of its [`MeshAxisType::Auto`] mesh axes removed.
@@ -537,7 +582,7 @@ impl Sharding {
             .filter(|name| matches!(self.mesh.axis_type(name), Some(MeshAxisType::Explicit | MeshAxisType::Manual)))
             .cloned()
             .collect();
-        Self { dimensions, unreduced_axes, reduced_axes, ..self.clone() }
+        Self { dimensions, unreduced_axes, reduced_axes, ..self.clone() }.with_canonical_unreduced_kind()
     }
 
     /// Returns a [`Sharding`] with every [`MeshAxisType::Manual`] mesh axis removed from its reduction state (i.e.,
@@ -551,7 +596,7 @@ impl Sharding {
         let is_not_manual = |name: &&String| self.mesh.axis_type(name) != Some(MeshAxisType::Manual);
         let unreduced_axes = self.unreduced_axes.iter().filter(is_not_manual).cloned().collect();
         let reduced_axes = self.reduced_axes.iter().filter(is_not_manual).cloned().collect();
-        Self { unreduced_axes, reduced_axes, ..self.clone() }
+        Self { unreduced_axes, reduced_axes, ..self.clone() }.with_canonical_unreduced_kind()
     }
 
     /// Returns a [`Sharding`] with the provided [`ShardingDimension`] inserted at dimension `index`, shifting all
@@ -567,6 +612,7 @@ impl Sharding {
         dimensions.insert(index, dimension);
         Self::new(self.mesh.clone(), dimensions)?
             .with_unreduced_axes(self.unreduced_axes.clone())?
+            .with_unreduced_kind(self.unreduced_kind)?
             .with_reduced_axes(self.reduced_axes.clone())?
             .with_varying_manual_axes(self.varying_manual_axes.clone())
     }
@@ -608,6 +654,7 @@ impl Sharding {
         }
         Self::new(self.mesh.clone(), dimensions)?
             .with_unreduced_axes(self.unreduced_axes.clone())?
+            .with_unreduced_kind(self.unreduced_kind)?
             .with_reduced_axes(self.reduced_axes.clone())?
             .with_varying_manual_axes(self.varying_manual_axes.clone())
     }
@@ -636,6 +683,7 @@ impl Sharding {
         }
         Self::new(self.mesh.clone(), dimensions)?
             .with_unreduced_axes(self.unreduced_axes.clone())?
+            .with_unreduced_kind(self.unreduced_kind)?
             .with_reduced_axes(self.reduced_axes.clone())?
             .with_varying_manual_axes(self.varying_manual_axes.clone())
     }
@@ -660,8 +708,20 @@ impl Sharding {
             left.symmetric_difference(right)
                 .any(|name| self.mesh.axis_type(name) == Some(MeshAxisType::Explicit))
         };
+        let is_explicit = |name: &String| self.mesh.axis_type(name) == Some(MeshAxisType::Explicit);
         symmetric_difference_contains_explicit(&self.unreduced_axes, &other.unreduced_axes)
             || symmetric_difference_contains_explicit(&self.reduced_axes, &other.reduced_axes)
+            || (self.unreduced_kind != other.unreduced_kind
+                && self.unreduced_axes.iter().chain(&other.unreduced_axes).any(is_explicit))
+    }
+
+    /// Returns this [`Sharding`] with its [`Self::unreduced_kind`] reset to [`UnreducedKind::Sum`] when it has no
+    /// unreduced axes, which keeps the kind canonical after a projection removes unreduced axes.
+    fn with_canonical_unreduced_kind(mut self) -> Self {
+        if self.unreduced_axes.is_empty() {
+            self.unreduced_kind = UnreducedKind::Sum;
+        }
+        self
     }
 
     /// Returns `true` if any ranked dimension of this [`Sharding`] uses `axis_name` for sharding.
@@ -715,6 +775,9 @@ impl Display for Sharding {
         if !self.unreduced_axes.is_empty() {
             write!(formatter, ", unreduced=")?;
             write_names(formatter, self.unreduced_axes.iter())?;
+            if self.unreduced_kind != UnreducedKind::Sum {
+                write!(formatter, ", unreduced_kind={}", self.unreduced_kind)?;
+            }
         }
 
         if !self.reduced_axes.is_empty() {
@@ -761,6 +824,41 @@ impl Display for ReductionStateKind {
         match self {
             Self::Unreduced => write!(formatter, "unreduced"),
             Self::Reduced => write!(formatter, "reduced"),
+        }
+    }
+}
+
+/// Reduction kind that combines the values that the devices hold along the [`Sharding::unreduced_axes`] of a sharding
+/// into its logical value, mirroring JAX's [`UnreducedKind`](
+/// https://docs.jax.dev/en/latest/jax.sharding.html#jax.sharding.PartitionSpec) and Shardy's reduction operation of
+/// unreduced axes. For example, a scalar on a mesh with one axis `x` of size `2` whose devices hold `1` and `5` has
+/// the logical value `6` when it is unreduced along `x` with kind [`Self::Sum`], and `5` with kind [`Self::Max`].
+///
+/// Only [`Self::Sum`] is linear, so operations follow JAX's rules for the other kinds: an operation that is linear in
+/// its unreduced inputs (e.g., an addition or a multiplication by a value reduced along the same axes) accepts only
+/// sums, an operation that commutes with the kind's reduction accepts that kind (e.g., a maximum of two values
+/// unreduced with kind [`Self::Max`]), and structural operations (e.g., reshaping or slicing) keep any kind.
+/// Reverse mode differentiation only supports sums. Refer to [`Sharding::cotangent`] for more information.
+#[derive(Copy, Clone, Debug, Default, PartialEq, Eq, Hash)]
+pub enum UnreducedKind {
+    /// The logical value is the sum of the values along the unreduced axes. This is the default kind.
+    #[default]
+    Sum,
+
+    /// The logical value is the elementwise maximum of the values along the unreduced axes.
+    Max,
+
+    /// The logical value is the elementwise minimum of the values along the unreduced axes.
+    Min,
+}
+
+impl Display for UnreducedKind {
+    #[inline]
+    fn fmt(&self, formatter: &mut Formatter<'_>) -> std::fmt::Result {
+        match self {
+            Self::Sum => write!(formatter, "sum"),
+            Self::Max => write!(formatter, "max"),
+            Self::Min => write!(formatter, "min"),
         }
     }
 }
