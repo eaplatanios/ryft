@@ -145,7 +145,7 @@ impl Plan {
                             ArrayAddressing::new(value.r#type().into_owned())?.element_count()
                         }
                         ArrayIrValue::Dimension(_) => 1,
-                        ArrayIrValue::Reference(_) => 0,
+                        ArrayIrValue::Reference(_) | ArrayIrValue::Future(_) => 0,
                     };
                     work = checked_work(work, count, options.maximum_instructions())?;
                 }
