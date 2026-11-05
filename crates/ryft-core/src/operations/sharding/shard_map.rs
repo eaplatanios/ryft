@@ -419,11 +419,9 @@ pub enum ShardMapError {
     #[error("dimension #{dimension} of `{SHARD_MAP_OPERATION_NAME}` {value_kind} type #{value_index} must be static")]
     DynamicShapeNotSupported { value_kind: ShardMapValueKind, value_index: usize, dimension: usize },
 
-    /// Boundary shapes are static, and an extent defined inside the body cannot be named outside it when sharing a
-    /// residual between split bodies.
     #[error(
-        "dimension #{dimension} of residual #{residual_index} must be static to pass between the split bodies of a \
-         `{SHARD_MAP_OPERATION_NAME}`"
+        "dimension #{dimension} of residual #{residual_index} must be static to pass \
+         between the split bodies of a `{SHARD_MAP_OPERATION_NAME}`"
     )]
     DynamicResidualNotSupported { residual_index: usize, dimension: usize },
 
@@ -439,9 +437,6 @@ pub enum ShardMapError {
     )]
     OutputVaryingAlongUntiledManualAxis { output_index: usize, axis_name: String },
 
-    /// A reference input of a boundary without manual-variation checking reaches its body without its reduction state
-    /// along the active manual axes, and its final state leaves the map through a reference output of the same
-    /// sharding, so the per-device summands of such a reference would have no well-defined final state.
     #[error(
         "`{SHARD_MAP_OPERATION_NAME}` reference input #{input_index} is {state_kind} along active manual axis \
          `{axis_name}`, which is not supported without manual-variation checking"
@@ -452,11 +447,6 @@ pub enum ShardMapError {
         axis_name: String,
     },
 
-    /// An input of a boundary without manual-variation checking that is unreduced along an active manual axis reaches
-    /// each device as its own physical summand, which the body can observe (e.g., by squaring it, `[1, 2]` and `[3, 0]`
-    /// have the same sum but give `5` and `9`). The reference backend stores one logical value per array, so it cannot
-    /// recover the summands of the caller and rejects such inputs when it interprets the map. Compiled backends whose
-    /// arrays keep one buffer per device (e.g., XLA) support them.
     #[error(
         "the reference backend does not support `{SHARD_MAP_OPERATION_NAME}` input #{input_index} without \
          manual-variation checking, because the input is unreduced along active manual axis `{axis_name}` and \
@@ -464,11 +454,9 @@ pub enum ShardMapError {
     )]
     UnreducedInputEmulationNotSupported { input_index: usize, axis_name: String },
 
-    /// The boundary governs reduction state along its active manual axes and the axes its sharding names. State along
-    /// other axes crosses the boundary unchanged.
     #[error(
-        "`{SHARD_MAP_OPERATION_NAME}` {value_kind} type #{value_index} has {state_kind} axes [{}], but its boundary \
-         sharding requires [{}]",
+        "`{SHARD_MAP_OPERATION_NAME}` {value_kind} type #{value_index} has {state_kind} axes [{}], \
+         but its boundary sharding requires [{}]",
         .actual.iter().map(|axis_name| format!("`{axis_name}`")).collect::<Vec<_>>().join(", "),
         .expected.iter().map(|axis_name| format!("`{axis_name}`")).collect::<Vec<_>>().join(", "),
     )]
@@ -516,8 +504,8 @@ pub enum ShardMapError {
     /// An axis is used when any body value varies along it or a collective or `axis_index` names it, including in a
     /// nested region. A permutation of invariant values can use an axis without producing a varying value.
     #[error(
-        "batching a `{SHARD_MAP_OPERATION_NAME}` places the batch axis on active manual axis `{axis_name}`, which \
-         the `{SHARD_MAP_OPERATION_NAME}` body uses"
+        "batching a `{SHARD_MAP_OPERATION_NAME}` places the batch axis on active manual axis `{axis_name}`, \
+         which the `{SHARD_MAP_OPERATION_NAME}` body uses"
     )]
     BatchAxisPlacedOnUsedManualAxis { axis_name: String },
 
