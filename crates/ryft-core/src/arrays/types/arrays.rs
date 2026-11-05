@@ -356,9 +356,9 @@ impl ArrayType {
     /// dimension. Rank-changing operations clear explicit [`Layout`] information because [`Layout`]s do not carry
     /// enough information to infer a correct stride or tiling after removing a logical axis. [`Sharding`] information
     /// is preserved when the removed dimension is replicated or unconstrained. When the removed dimension is sharded
-    /// over manual mesh axes, those axes become varying manual axes because the value can still differ across shards
-    /// even though the ranked array dimension is gone. Removing a dimension sharded over non-manual axes is rejected
-    /// because there is no equivalent rank-independent metadata field for those axes.
+    /// over manual mesh axes, that placement is dropped without adding manual variation (e.g., via
+    /// [`Sharding::without_dimension`]). Removing a dimension sharded over non-manual axes is
+    /// rejected because there is no equivalent rank-independent metadata field for those axes.
     pub fn without_dimension(&self, index: usize) -> Result<(Self, Dimension), TypeError> {
         if index >= self.rank() {
             return Err(TypeError::invalid(format!(
@@ -370,7 +370,7 @@ impl ArrayType {
         let mut dimensions = self.shape.dimensions().to_vec();
         let dimension = dimensions.remove(index);
 
-        // Delegate the per-dimension sharding bookkeeping (i.e., manual axes become varying and non-manual sharded
+        // Delegate the per-dimension sharding bookkeeping (i.e., manual placements are dropped and non-manual sharded
         // dimensions cannot be dropped) to the sharding itself. For more information, refer to the documentation of
         // `Sharding::without_dimension`.
         let sharding = self
@@ -1168,9 +1168,10 @@ mod tests {
         let (t10, removed_dimension) = t9.without_dimension(0).unwrap();
         let s3 = t10.sharding().unwrap();
 
+        // Removing a dimension placed on a manual axis drops that placement without adding variation along the axis.
         assert_eq!(removed_dimension, Dimension::Static(8));
         assert_eq!(s3.dimensions(), &Vec::<ShardingDimension>::new());
-        assert_eq!(s3.varying_manual_axes(), &["x".to_string()].into_iter().collect());
+        assert!(s3.varying_manual_axes().is_empty());
 
         let m1 = LogicalMesh::new(vec![MeshAxis::new("x", 4, MeshAxisType::Explicit).unwrap()]).unwrap();
         let t11 = ArrayType::new(F32, Shape::new(vec![8.into()]))

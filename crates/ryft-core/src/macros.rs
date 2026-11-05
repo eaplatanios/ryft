@@ -186,8 +186,9 @@ macro_rules! check_types {
     };
 }
 
-/// Checks that a concrete [`DeviceMesh`](crate::DeviceMesh) and a [`Sharding`](crate::Sharding) refer to the same
-/// [`LogicalMesh`](crate::LogicalMesh). If the logical meshes differ, the macro returns a
+/// Checks that a concrete [`DeviceMesh`](crate::DeviceMesh) and a [`Sharding`](crate::Sharding) refer to the same mesh
+/// topology (i.e., computed via [`LogicalMesh::has_same_topology`](crate::LogicalMesh::has_same_topology)), so axis
+/// types may differ. If the topologies differ, the macro returns a
 /// [`ShardingError::MeshMismatch`](crate::ShardingError::MeshMismatch) converted into the enclosing function's error
 /// type using [`Into::into`]. Use this macro in functions that return a [`Result`] whose error type can be constructed
 /// from [`ShardingError`](crate::ShardingError).
@@ -202,7 +203,7 @@ macro_rules! check_sharding {
     ($mesh:expr, $sharding:expr $(,)?) => {{
         let mesh = &$mesh;
         let sharding = &$sharding;
-        if mesh.logical_mesh() != sharding.mesh() {
+        if !mesh.logical_mesh().has_same_topology(sharding.mesh()) {
             return Err($crate::arrays::ShardingError::MeshMismatch {
                 expected: mesh.logical_mesh().clone(),
                 actual: sharding.mesh().clone(),
@@ -6888,13 +6889,16 @@ mod tests {
         let expected_mesh = LogicalMesh::new(vec![MeshAxis::new("x", 1, MeshAxisType::Auto).unwrap()]).unwrap();
         let actual_mesh = LogicalMesh::new(vec![MeshAxis::new("y", 1, MeshAxisType::Auto).unwrap()]).unwrap();
         let device_mesh = DeviceMesh::new(expected_mesh.clone(), vec![Device::new(0, 0)]).unwrap();
+        let retyped_mesh = LogicalMesh::new(vec![MeshAxis::new("x", 1, MeshAxisType::Manual).unwrap()]).unwrap();
         let matching = Sharding::new(expected_mesh.clone(), vec![]).unwrap();
+        let retyped = Sharding::new(retyped_mesh, vec![]).unwrap();
         let mismatching = Sharding::new(actual_mesh.clone(), vec![]).unwrap();
         let check = |sharding: &Sharding| -> Result<(), ShardingError> {
             check_sharding!(&device_mesh, sharding);
             Ok(())
         };
         assert_eq!(check(&matching), Ok(()));
+        assert_eq!(check(&retyped), Ok(()));
         assert_eq!(
             check(&mismatching),
             Err(ShardingError::MeshMismatch { expected: expected_mesh, actual: actual_mesh }),

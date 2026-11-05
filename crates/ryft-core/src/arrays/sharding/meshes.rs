@@ -188,6 +188,22 @@ impl LogicalMesh {
     pub fn device_count(&self) -> usize {
         self.0.axes.iter().fold(1usize, |count, axis| count * axis.size)
     }
+
+    /// Returns `true` when this [`LogicalMesh`] and `other` define the same topology (i.e., the same axes, with the
+    /// same names and sizes in the same order, irrespective of their [`MeshAxisType`]s). Axis types describe how values
+    /// are typed over the mesh rather than which devices it arranges (e.g., the mesh of a `shard_map` types the axes
+    /// that it makes manual as [`Manual`](MeshAxisType::Manual), while its callers may type them as
+    /// [`Explicit`](MeshAxisType::Explicit)), so values whose meshes differ only in axis types
+    /// share device placements.
+    #[inline]
+    pub fn has_same_topology(&self, other: &Self) -> bool {
+        self.axes().len() == other.axes().len()
+            && self
+                .axes()
+                .iter()
+                .zip(other.axes())
+                .all(|(left, right)| left.name == right.name && left.size == right.size)
+    }
 }
 
 impl Display for LogicalMesh {
@@ -409,6 +425,21 @@ mod tests {
         assert_eq!(mesh.axis_type("z"), Some(MeshAxisType::Explicit));
         assert_eq!(mesh.axis_type("w"), None);
         assert_eq!(mesh.device_count(), 6);
+        let retyped = LogicalMesh::new(vec![
+            MeshAxis::new("x", 2, MeshAxisType::Explicit).unwrap(),
+            MeshAxis::new("y", 3, MeshAxisType::Explicit).unwrap(),
+            MeshAxis::new("z", 1, MeshAxisType::Manual).unwrap(),
+        ])
+        .unwrap();
+        let reordered = LogicalMesh::new(vec![
+            MeshAxis::new("y", 3, MeshAxisType::Manual).unwrap(),
+            MeshAxis::new("x", 2, MeshAxisType::Auto).unwrap(),
+            MeshAxis::new("z", 1, MeshAxisType::Explicit).unwrap(),
+        ])
+        .unwrap();
+        assert!(mesh.has_same_topology(&retyped));
+        assert!(!mesh.has_same_topology(&reordered));
+        assert!(!mesh.has_same_topology(&LogicalMesh::new(Vec::new()).unwrap()));
         assert_eq!(mesh.to_string(), "['x'=2:auto, 'y'=3:manual, 'z'=1:explicit]");
         assert_eq!(LogicalMesh::new(Vec::new()).unwrap().to_string(), "[]");
         assert_eq!(

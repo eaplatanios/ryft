@@ -119,6 +119,9 @@ ownership, and synchronization. These shared rules also apply to test code; deta
   - Facade `pub use` statements refer to their own child modules by relative path (e.g., `pub use types::{...}`
     inside `arrays/mod.rs`), matching the existing facade files; the rules above govern item *imports*, not the
     re-export statements that define the facades.
+  - Public API module facades (e.g., `ryft_core::compilation` and `ryft_xla::domains`) declare their owned API
+    submodules with `pub mod` and re-export their public items with `pub use`. Keep internal helpers and fields at
+    their narrowest visibility independently of the module's public visibility.
   - Test modules follow the same rules for their `crate::...` imports; `use super::*` remains the standard way to
     bring in the owning module's items.
   - `rustfmt.toml` sets `imports_granularity = "Module"`, which enforces the grouping rule under nightly `rustfmt`

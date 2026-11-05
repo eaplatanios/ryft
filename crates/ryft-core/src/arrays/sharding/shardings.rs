@@ -614,32 +614,30 @@ impl Sharding {
 
     /// Returns a [`Sharding`] with its `index`-th dimension removed, shifting subsequent dimensions one position to the
     /// left. This is the sharding analogue of [`ArrayType::without_dimension`](crate::ArrayType::without_dimension).
-    /// The reduction axis sets are unchanged, but the removed entry's placement is reconciled with the manual-axis
-    /// model. A dimension sharded over [`MeshAxisType::Manual`] axes moves those axes into the varying set (i.e., the
-    /// value now varies across them rather than being placed along a ranked dimension), while a dimension sharded over
-    /// a non-manual (e.g., a [`MeshAxisType::Explicit`]) axis cannot be dropped structurally (that would silently
-    /// discard an explicit placement that only a reduction or collective can remove), and yields a
-    /// [`ShardingError::NonManualShardedDimensionRemoval`]. [`ShardingDimension::Replicated`] and
-    /// [`ShardingDimension::Unconstrained`] entries are dropped without any further effect.
+    /// The reduction axis sets and the manual variation are unchanged. A dimension sharded over
+    /// [`MeshAxisType::Manual`] axes is dropped together with that placement, which adds no variation: a dimension can
+    /// only name a manual axis where no enclosing manual region binds it (a local dimension of such a region cannot
+    /// name it), and there the axis only describes how the value is distributed, as for a batch placement (refer to
+    /// [`Sharding::batched`]). A dimension sharded over a non-manual (e.g., a [`MeshAxisType::Explicit`]) axis cannot
+    /// be dropped structurally (that would silently discard an explicit placement that only a reduction or collective
+    /// can remove), and yields a [`ShardingError::NonManualShardedDimensionRemoval`]. [`ShardingDimension::Replicated`]
+    /// and [`ShardingDimension::Unconstrained`] entries are dropped without any further effect.
     pub fn without_dimension(&self, index: usize) -> Result<Self, ShardingError> {
         if index >= self.dimensions.len() {
             return Err(ShardingError::DimensionOutOfBounds { dimension: index, rank: self.rank() });
         }
         let mut dimensions = self.dimensions.clone();
-        let removed_dimension = dimensions.remove(index);
-        let mut varying_manual_axes = self.varying_manual_axes.clone();
-        if let ShardingDimension::Sharded(axis_names) = removed_dimension {
-            for axis_name in axis_names {
-                if self.mesh.axis_type(&axis_name) != Some(MeshAxisType::Manual) {
-                    return Err(ShardingError::NonManualShardedDimensionRemoval { dimension: index, name: axis_name });
-                }
-                varying_manual_axes.insert(axis_name);
-            }
+        if let ShardingDimension::Sharded(axis_names) = dimensions.remove(index)
+            && let Some(axis_name) = axis_names
+                .into_iter()
+                .find(|axis_name| self.mesh.axis_type(axis_name) != Some(MeshAxisType::Manual))
+        {
+            return Err(ShardingError::NonManualShardedDimensionRemoval { dimension: index, name: axis_name });
         }
         Self::new(self.mesh.clone(), dimensions)?
             .with_unreduced_axes(self.unreduced_axes.clone())?
             .with_reduced_axes(self.reduced_axes.clone())?
-            .with_varying_manual_axes(varying_manual_axes)
+            .with_varying_manual_axes(self.varying_manual_axes.clone())
     }
 
     /// Returns `true` if this [`Sharding`] and `other`, which must share this sharding's mesh, disagree on any state
@@ -1329,12 +1327,9 @@ mod tests {
             Err(ShardingError::DimensionOutOfBounds { dimension: 2, rank: 2 }),
         ));
 
-        // Dropping a dimension sharded over a manual axis moves that axis into the varying set.
+        // Dropping a dimension sharded over a manual axis drops that placement and keeps the variation unchanged.
         let manual = Sharding::new(mesh.clone(), vec![ShardingDimension::sharded(["model"])]).unwrap();
-        assert_eq!(
-            manual.without_dimension(0),
-            Sharding::new(mesh.clone(), vec![]).unwrap().with_varying_manual_axes(["model"]),
-        );
+        assert_eq!(manual.without_dimension(0), Sharding::new(mesh.clone(), vec![]));
     }
 
     #[test]
