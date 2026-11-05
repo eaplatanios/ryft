@@ -3,6 +3,7 @@ use std::fmt::{Debug, Display};
 use std::iter::Peekable;
 use std::marker::PhantomData;
 use std::mem::{ManuallyDrop, MaybeUninit};
+use std::ops::Range;
 use std::str::Chars;
 use std::sync::{Arc, Mutex};
 
@@ -1171,7 +1172,6 @@ impl Buffer<'_> {
     /// is the strongest form of client recovery that a [`Buffer`] can offer. It is primarily useful for validating
     /// that a caller-supplied [`Client`] is the one that owns a buffer (e.g., before executing a compiled program
     /// with that buffer as an input).
-    #[inline]
     pub fn is_owned_by(&self, client: &Client<'_>) -> bool {
         self.client.get() == unsafe { client.to_c_api() }
     }
@@ -2661,6 +2661,151 @@ impl<'s> Client<'s> {
     }
 }
 
+/// Host allocation that several concurrent device-to-host copies fill in place, each through its own disjoint
+/// [`HostDestinationSlice`] (e.g., the shards of one array, each copied directly to its position in the array's
+/// dense host representation instead of into its own buffer followed by a merge).
+///
+/// [`Self::split`] hands out the slices, which are ordinary owned destinations for [`Buffer::copy_to_host_buffer`] and
+/// [`Buffer::copy_raw_to_host_buffer`], and so each is retained until its copy completes, even when its [`Event`] is
+/// dropped first. The bytes become accessible again through [`Self::into_bytes`] only once every slice has been dropped
+/// (e.g., returned by its completed [`Event`] and discarded), so no copy can still write into them and no two copies
+/// (or the caller and a copy) ever access the same bytes.
+///
+/// # Example
+///
+/// The following example copies two device buffers, which hold the two halves of a `[2, 2]` array of `u8`s, directly
+/// into their positions in the dense row-major representation of that array, without any intermediate host buffers:
+///
+/// ```rust
+/// # use ryft_pjrt::{BufferType, ClientOptions, CpuClientOptions, Error, HostDestination, load_cpu_plugin};
+/// # fn main() -> Result<(), Error> {
+/// let plugin = load_cpu_plugin()?;
+/// let client = plugin.client(ClientOptions::CPU(CpuClientOptions::default()))?;
+/// let device = client.addressable_devices()?.remove(0);
+/// let top = client.buffer([1u8, 2].as_slice(), BufferType::U8, [1, 2], None, device.clone(), None)?;
+/// let bottom = client.buffer([3u8, 4].as_slice(), BufferType::U8, [1, 2], None, device, None)?;
+///
+/// // Each half occupies one contiguous byte range of the dense array, and both copies run concurrently.
+/// let mut destination = HostDestination::new(4);
+/// let mut slices = destination.split(&[0..2, 2..4])?.into_iter();
+/// let top_copy = top.copy_to_host_buffer(None, slices.next().unwrap())?;
+/// let bottom_copy = bottom.copy_to_host_buffer(None, slices.next().unwrap())?;
+///
+/// // Each completed copy returns its slice, and dropping every slice makes the bytes accessible.
+/// drop(top_copy.r#await()?);
+/// drop(bottom_copy.r#await()?);
+/// let bytes = destination.into_bytes().ok().unwrap();
+/// assert_eq!(bytes, vec![1, 2, 3, 4]);
+/// # Ok(())
+/// # }
+/// ```
+pub struct HostDestination {
+    /// Allocation shared with the slices handed out by [`Self::split`].
+    storage: Arc<HostDestinationStorage>,
+}
+
+impl HostDestination {
+    /// Creates a zero-initialized [`HostDestination`] of `size` bytes.
+    pub fn new(size: usize) -> Self {
+        let bytes = Box::into_raw(vec![0u8; size].into_boxed_slice());
+        let pointer = unsafe { std::ptr::NonNull::new_unchecked(bytes.cast::<u8>()) };
+        Self { storage: Arc::new(HostDestinationStorage { pointer, length: size }) }
+    }
+
+    /// Returns the size of this [`HostDestination`] in bytes.
+    pub fn len(&self) -> usize {
+        self.storage.length
+    }
+
+    /// Returns `true` if this [`HostDestination`] holds no bytes.
+    pub fn is_empty(&self) -> bool {
+        self.len() == 0
+    }
+
+    /// Splits off one [`HostDestinationSlice`] per range in `ranges`, which must be in bounds and pairwise disjoint
+    /// (empty ranges are allowed). Slices can only be split once, so that no two slices ever overlap. Returns an
+    /// [`Error`] if a range is out of bounds, two ranges overlap, or slices were already split off.
+    pub fn split(&mut self, ranges: &[Range<usize>]) -> Result<Vec<HostDestinationSlice>, Error> {
+        if Arc::strong_count(&self.storage) != 1 {
+            return Err(Error::failed_precondition("host destination slices were already split off"));
+        }
+        let length = self.len();
+        let mut sorted = ranges.iter().filter(|range| !range.is_empty()).collect::<Vec<_>>();
+        sorted.sort_by_key(|range| range.start);
+        for range in &sorted {
+            if range.end > length {
+                return Err(Error::invalid_argument(format!(
+                    "host destination slice {range:?} is out of bounds for a destination of {length} bytes",
+                )));
+            }
+        }
+        if let Some(pair) = sorted.windows(2).find(|pair| pair[0].end > pair[1].start) {
+            return Err(Error::invalid_argument(format!(
+                "host destination slices {:?} and {:?} overlap",
+                pair[0], pair[1],
+            )));
+        }
+        Ok(ranges
+            .iter()
+            .map(|range| HostDestinationSlice { storage: Arc::clone(&self.storage), range: range.clone() })
+            .collect())
+    }
+
+    /// Returns the bytes of this [`HostDestination`] once every slice split off from it has been dropped, and returns
+    /// this [`HostDestination`] back otherwise.
+    pub fn into_bytes(self) -> Result<Vec<u8>, Self> {
+        match Arc::try_unwrap(self.storage) {
+            Ok(storage) => {
+                let storage = ManuallyDrop::new(storage);
+                let bytes = std::ptr::slice_from_raw_parts_mut(storage.pointer.as_ptr(), storage.length);
+                Ok(unsafe { Box::from_raw(bytes) }.into_vec())
+            }
+            Err(storage) => Err(Self { storage }),
+        }
+    }
+}
+
+/// Disjoint range of a [`HostDestination`] that one device-to-host copy owns as its destination.
+/// Refer to the documentation of [`HostDestination`] for more information.
+pub struct HostDestinationSlice {
+    /// Allocation of the [`HostDestination`] that this slice was split off from.
+    storage: Arc<HostDestinationStorage>,
+
+    /// Byte range of the allocation that this slice owns exclusively.
+    range: Range<usize>,
+}
+
+impl AsMut<[u8]> for HostDestinationSlice {
+    fn as_mut(&mut self) -> &mut [u8] {
+        // SAFETY: `HostDestination::split` hands out pairwise disjoint, in-bounds ranges once, and the destination
+        // itself reads its bytes only after every slice has been dropped, so this range is accessed only through this
+        // slice, whose exclusive borrow covers the returned reference.
+        unsafe { std::slice::from_raw_parts_mut(self.storage.pointer.as_ptr().add(self.range.start), self.range.len()) }
+    }
+}
+
+/// Shared allocation of a [`HostDestination`], held as a raw pointer so that each [`HostDestinationSlice`]
+/// derives a reference to only its own range rather than to the whole allocation.
+struct HostDestinationStorage {
+    /// Start of the allocation, which came from a boxed slice of [`Self::length`] bytes.
+    pointer: std::ptr::NonNull<u8>,
+
+    /// Length of the allocation in bytes.
+    length: usize,
+}
+
+impl Drop for HostDestinationStorage {
+    fn drop(&mut self) {
+        // SAFETY: the allocation came from a boxed slice of `length` bytes and is released exactly once, here.
+        drop(unsafe { Box::from_raw(std::ptr::slice_from_raw_parts_mut(self.pointer.as_ptr(), self.length)) });
+    }
+}
+
+// SAFETY: the allocation is mutated only through the disjoint ranges of `HostDestinationSlice`s (each accessed through
+// an exclusive borrow of its slice) and read by `HostDestination` only once it is the sole owner of the allocation.
+unsafe impl Send for HostDestinationStorage {}
+unsafe impl Sync for HostDestinationStorage {}
+
 /// Places `buffer` into the shared storage that the [`Event`] of a device-to-host copy into it retains, before its
 /// address is handed to PJRT, so that the address stays stable until the copy completes even when `buffer` stores its
 /// bytes inline. Returns that storage together with the address and length of the destination bytes. Refer to
@@ -3726,13 +3871,10 @@ mod tests {
     use std::collections::HashMap;
     use std::sync::Arc;
 
+    use crate::Error;
     use crate::tests::{TestPlatform, test_cpu_client, test_for_each_platform};
-    use crate::{
-        Buffer, BufferSpecification, BufferType, Error, HostBuffer, HostBufferData, HostBufferSemantics, Layout,
-        StridedLayout, Tile, TileDimension, TiledLayout,
-    };
 
-    use super::ffi;
+    use super::*;
 
     fn assert_send_sync<T: Send + Sync>() {}
 
@@ -4103,6 +4245,37 @@ mod tests {
                     if message == "the destination host buffer holds 3 bytes, but the copy needs 4",
             ));
         });
+    }
+
+    #[test]
+    fn test_host_destination() {
+        // Two shards of one array are copied concurrently into disjoint ranges of one destination, whose bytes become
+        // accessible once both slices are dropped.
+        let client = test_cpu_client();
+        let device = client.addressable_devices().unwrap().remove(0);
+        let first = client.buffer([1u8, 2, 3].as_slice(), BufferType::U8, [3], None, device.clone(), None).unwrap();
+        let second = client.buffer([4u8, 5].as_slice(), BufferType::U8, [2], None, device, None).unwrap();
+        let mut destination = HostDestination::new(5);
+        assert_eq!(destination.len(), 5);
+        let mut slices = destination.split(&[3..5, 0..3]).unwrap().into_iter();
+        let second_copy = second.copy_to_host_buffer(None, slices.next().unwrap()).unwrap();
+        let first_copy = first.copy_to_host_buffer(None, slices.next().unwrap()).unwrap();
+        let destination = destination.into_bytes().unwrap_err();
+        drop(first_copy.r#await().unwrap());
+        drop(second_copy.r#await().unwrap());
+        assert_eq!(destination.into_bytes().ok().unwrap(), vec![1, 2, 3, 4, 5]);
+
+        // Out-of-bounds, overlapping, and repeated splits are rejected.
+        let mut destination = HostDestination::new(4);
+        assert!(matches!(destination.split(&[2..5]), Err(Error::InvalidArgument { .. })));
+        assert!(matches!(
+            destination.split(&[0..3, 2..4]),
+            Err(Error::InvalidArgument { message, .. }) if message == "host destination slices 0..3 and 2..4 overlap",
+        ));
+        let slices = destination.split(&[0..2, 2..2, 2..4]).unwrap();
+        assert!(matches!(destination.split(&[0..1]), Err(Error::FailedPrecondition { .. })));
+        drop(slices);
+        assert_eq!(destination.into_bytes().ok().unwrap(), vec![0; 4]);
     }
 
     #[test]

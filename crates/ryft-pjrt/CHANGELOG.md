@@ -49,6 +49,9 @@ and this project adheres to [Semantic Versioning](https://semver.org/).
 - Added adapters from CUDA PJRT clients and XLA FFI streams/buffers to the producer-neutral `ryft-cuda` artifact
   launcher behind the `cuda-12` and `cuda-13` features.
 - Added `Error::MissingFunction`.
+- Added `HostDestination` and `HostDestinationSlice`, a host allocation that several concurrent device-to-host copies
+  fill in place through disjoint owned slices (e.g., every shard of an array copied directly into its range of the
+  array's dense host representation), whose bytes become accessible once every slice has been released.
 - Added per-execution `custom_options` to `LoadedExecutable::execute` and `FfiExecutionContext::custom_options` for
   reading them from an XLA FFI invocation, separately from static call attributes.
 - Added optional recording handlers to `GpuCustomCallTypedHandler` and explicit recording capability detection for
