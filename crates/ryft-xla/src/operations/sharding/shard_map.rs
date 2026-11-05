@@ -3,7 +3,7 @@ use std::collections::HashSet;
 use ryft_core::{
     ArrayIrType, ArrayType, PARALLEL_ALL_GATHER_OPERATION_NAME, ParallelAllGatherOperation,
     ParallelAllGatherOutputVariance, Parameterized, ProgramError, SHARD_MAP_OPERATION_NAME, ShardMapBoundary,
-    ShardMapError, ShardMapOperation, Sharding, ShardingDimension, Typed, TypedProgram,
+    ShardMapError, ShardMapOperation, ShardMapValueKind, Sharding, ShardingDimension, Typed, TypedProgram,
 };
 use ryft_mlir::dialects::shardy;
 use ryft_mlir::dialects::shardy::{
@@ -91,7 +91,11 @@ where
     }
     // For the same reason, an input or output sharding must not name such an axis (the closure entry points reject
     // these shardings too), so it is rejected here rather than silently dropped from the Shardy shardings.
-    for (value_kind, shardings) in [("input", boundary.input_shardings()), ("output", boundary.output_shardings())] {
+    let shardings = [
+        (ShardMapValueKind::Input, boundary.input_shardings()),
+        (ShardMapValueKind::Output, boundary.output_shardings()),
+    ];
+    for (value_kind, shardings) in shardings {
         for (value_index, sharding) in shardings.iter().enumerate() {
             let axis_name = sharding
                 .dimensions()
@@ -400,7 +404,7 @@ mod tests {
     use crate::experimental::ops::XlaProgramBuilder as ArrayIrXlaProgramBuilder;
     use crate::operations::debugging::PRINT_CUSTOM_CALL_TARGET;
     use crate::tests::{values_from_bytes, values_to_bytes};
-    use crate::{FromPjrt, ToMlir, XlaArray, XlaDomain, XlaSession};
+    use crate::{FromPjrt, ToMlir, XlaArray, XlaDomain, XlaSession, XlaValue};
 
     use super::*;
 
@@ -823,7 +827,7 @@ mod tests {
             ShardMapOptions::new().with_manual_axes(["x"]),
         );
         let expected = ShardMapError::ShardingNamesEnclosingManualAxis {
-            value_kind: "input",
+            value_kind: ShardMapValueKind::Input,
             value_index: 0,
             axis_name: "x".to_string(),
         };
@@ -1452,6 +1456,78 @@ mod tests {
             .map(|output| values_from_bytes::<f32>(&output.outputs[0].copy_to_host(None).unwrap().r#await().unwrap()))
             .collect::<Vec<_>>();
         assert_eq!(summands, vec![vec![1.0], vec![4.0]]);
+    }
+
+    #[test]
+    fn test_eager_shard_map_without_manual_variation_passes_unreduced_summands_between_maps_on_cpu() {
+        /// Binds an unchecked map from `input_sharding` to `output_sharding` on `input` eagerly in `domain`, whose body
+        /// squares its local input when `square` is `true` and returns it unchanged otherwise.
+        fn bind_map<'c>(
+            domain: &XlaDomain<'c>,
+            input: XlaArray<'c>,
+            input_sharding: Sharding,
+            output_sharding: &Sharding,
+            square: bool,
+        ) -> XlaArray<'c> {
+            let boundary = ShardMapBoundary::new(
+                input_sharding.mesh().clone(),
+                vec![input_sharding],
+                vec![output_sharding.clone()],
+                Vec::new(),
+            )
+            .unwrap()
+            .with_check_manual_variation(false);
+            let global_type = input.r#type().into_owned();
+            let local_type = boundary.local_input_type(0, &global_type).unwrap();
+            let (_, body) = DomainTracingContext::<XlaDomain<'static>>::trace(
+                |inputs: Vec<XlaTracer<'static>>| {
+                    let x = ValueProjection::<ArrayType>::into_projected(inputs[0].clone())?;
+                    Ok(vec![if square { x.clone() * x } else { x }.into_value()])
+                },
+                vec![ArrayIrType::Array(local_type)],
+            )
+            .unwrap();
+            let operation = ShardMapOperation::from_program(&body, vec![global_type.into()], boundary).unwrap();
+            let mut outputs = domain.bind(operation, vec![body], &[XlaValue::Array(input)]).unwrap();
+            let XlaValue::Array(output) = outputs.remove(0) else {
+                panic!("the eager map returned a dimension");
+            };
+            output
+        }
+
+        // The pipeline of the previous test, with each map bound eagerly by the domain on concrete arrays: the first
+        // map returns each device's shard of `x = [1, 2]` as its summand of an unreduced output, and the second map
+        // squares each summand of that unreduced input. The devices return `[1]` and `[4]`, whose sum (`5`) host
+        // materialization recovers.
+        let plugin = load_cpu_plugin().unwrap();
+        let client = plugin
+            .client(ClientOptions::CPU(CpuClientOptions { device_count: Some(2), ..Default::default() }))
+            .unwrap();
+        let domain = XlaSession::new(&client).domain();
+        let logical_mesh = test_manual_mesh("x", 2);
+        let devices = client.addressable_devices().unwrap();
+        let mesh = DeviceMesh::new(
+            logical_mesh.clone(),
+            devices.iter().map(|device| Device::from_pjrt(device).unwrap()).collect(),
+        )
+        .unwrap();
+        let sharded = Sharding::new(logical_mesh.clone(), vec![ShardingDimension::sharded(["x"])]).unwrap();
+        let unreduced = Sharding::replicated(logical_mesh.clone(), 1).with_unreduced_axes(["x"]).unwrap();
+        let input_type = ArrayType::new_static(DataType::F32, [2]).with_sharding(sharded.clone()).unwrap();
+        let input = XlaArray::from_host_buffer(&domain, input_type, mesh, values_to_bytes(&[1f32, 2.])).unwrap();
+        let summands = bind_map(&domain, input, sharded, &unreduced, false);
+        let squares = bind_map(&domain, summands, unreduced.clone(), &unreduced, true);
+        assert_eq!(squares.r#type().sharding(), Some(&unreduced));
+        let device_values = squares
+            .addressable_shards()
+            .map(|shard| {
+                let bytes = shard.buffer().unwrap().copy_to_host(None).unwrap().r#await().unwrap();
+                values_from_bytes::<f32>(bytes.as_slice())
+            })
+            .collect::<Vec<_>>();
+        assert_eq!(device_values, vec![vec![1.0], vec![4.0]]);
+        let materialized = crate::arrays_v0::host::materialize_dense_array_bytes(&squares).unwrap();
+        assert_eq!(values_from_bytes::<f32>(materialized.as_slice()), vec![5.0]);
     }
 
     #[test]

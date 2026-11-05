@@ -103,8 +103,8 @@ pub use constrain_sharding::{
 };
 pub use reshard::{RESHARD_OPERATION_NAME, Reshard, ReshardDispatch, ReshardOperation};
 pub use shard_map::{
-    SHARD_MAP_OPERATION_NAME, ShardMap, ShardMapBoundary, ShardMapContext, ShardMapError, ShardMapOperation,
-    ShardMapOptions, ShardMapTracer, shard_map,
+    ReductionStateKind, SHARD_MAP_OPERATION_NAME, ShardMap, ShardMapBoundary, ShardMapContext, ShardMapError,
+    ShardMapOperation, ShardMapOptions, ShardMapTracer, ShardMapValueKind, shard_map,
 };
 
 /// Group of the sharding-control capabilities [`Reshard`] and [`ConstrainSharding`]. It is implemented automatically

@@ -349,7 +349,7 @@ mod tests {
         FfiCallFrame, FfiError, FfiExecutionStage, FfiHandler, FfiHandlerTraits, FfiInput, FfiOutput, FfiTypeId,
         XLA_FFI_CallFrame, XLA_FFI_Error, XLA_FFI_Handler,
     };
-    use ryft_pjrt::{Client, ClientOptions, CpuClientOptions, load_cpu_plugin};
+    use ryft_pjrt::{BufferType, Client, ClientOptions, CpuClientOptions, load_cpu_plugin};
 
     use crate::tests::{
         ADD_ONE_CUSTOM_CALL_TARGET, ensure_add_one_handler_registered, execution_client, values_from_bytes,
@@ -4497,6 +4497,40 @@ mod tests {
                 if message
                     == "`dimension_from_scalar` scalar input must be a nonnegative host-representable extent but is -1",
         ));
+    }
+
+    #[test]
+    fn test_eager_scalar_reads_of_unreduced_arrays() {
+        // The two devices hold the summands `3` and `4` of a scalar that is unreduced along `x`, so every host read
+        // observes their sum, `7`, rather than the summand of the first addressable shard.
+        let plugin = load_cpu_plugin().unwrap();
+        let client = plugin
+            .client(ClientOptions::CPU(CpuClientOptions { device_count: Some(2), ..Default::default() }))
+            .unwrap();
+        let domain = XlaSession::new(&client).domain();
+        let devices = client.addressable_devices().unwrap();
+        let logical_mesh = LogicalMesh::new(vec![MeshAxis::new("x", 2, MeshAxisType::Explicit).unwrap()]).unwrap();
+        let mesh = DeviceMesh::new(
+            logical_mesh.clone(),
+            devices.iter().map(|device| Device::from_pjrt(device).unwrap()).collect(),
+        )
+        .unwrap();
+        let sharding = Sharding::replicated(logical_mesh, 0).with_unreduced_axes(["x"]).unwrap();
+        let r#type = ArrayType::new_static(DataType::I32, []).with_sharding(sharding).unwrap();
+        let buffers = [3_i32, 4]
+            .iter()
+            .zip(&devices)
+            .map(|(value, device)| {
+                client
+                    .buffer(value.to_ne_bytes().as_slice(), BufferType::I32, [], None, device.clone(), None)
+                    .unwrap()
+            })
+            .collect();
+        let array = XlaArray::from_addressable_buffers(&domain, r#type, mesh, buffers).unwrap();
+        assert_eq!(Concretizable::<i128>::concretize(&array), Ok(7));
+        assert_eq!(array.assertion_observation(), Ok("7".to_string()));
+        let variable = DimensionVariable::new("extent", DimensionBounds::new(1, Some(9)).unwrap());
+        assert_eq!(array.to_dimension(variable).unwrap().extent(), 7);
     }
 
     #[test]

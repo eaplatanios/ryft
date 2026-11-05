@@ -7039,11 +7039,14 @@ mod tests {
         StagedFunction, StagingContext, StaticShape, SubOperation, TracingContext, Value, WhileOperation,
         ZeroOperation, batch, shard_map,
     };
-    use ryft_pjrt::{ClientOptions, CpuClientOptions, load_cpu_plugin};
+    use ryft_pjrt::{
+        ClientOptions, CpuClientOptions, ExecutionDeviceInputs, ExecutionInput, Program as PjrtProgram, load_cpu_plugin,
+    };
     #[cfg(feature = "cuda-13")]
     use ryft_pjrt::{GpuClientOptions, GpuMemoryAllocator, GpuPlatform, load_cuda_13_plugin};
 
     use crate::XlaReference;
+    use crate::experimental::lowering::tests::test_spmd_compilation_options;
     use crate::experimental::tracing::XlaArrayTracer;
     use crate::tests::{execution_client, hash_of, values_from_bytes, values_to_bytes};
 
@@ -11471,6 +11474,54 @@ mod tests {
     }
 
     #[test]
+    fn test_bounded_materialization_rejects_unreduced_inputs() {
+        // Padding copies a bounded input through the host as one dense array, which would replace the separate
+        // summands `[1, 2]` and `[3, 4]` that the two devices of this unreduced input hold, so it is rejected.
+        let plugin = load_cpu_plugin().unwrap();
+        let client = plugin
+            .client(ClientOptions::CPU(CpuClientOptions { device_count: Some(2), ..Default::default() }))
+            .unwrap();
+        let devices = client.addressable_devices().unwrap();
+        let logical_mesh = LogicalMesh::new(vec![MeshAxis::new("x", 2, MeshAxisType::Explicit).unwrap()]).unwrap();
+        let mesh = DeviceMesh::new(
+            logical_mesh.clone(),
+            devices.iter().map(|device| Device::from_pjrt(device).unwrap()).collect(),
+        )
+        .unwrap();
+        let domain = XlaSession::new(&client).domain();
+        let sharding = Sharding::replicated(logical_mesh, 1).with_unreduced_axes(["x"]).unwrap();
+        let declared_type = ArrayType::new(
+            DataType::F32,
+            Shape::new(vec![DimensionVariable::new("extent", DimensionBounds::new(0, Some(9)).unwrap()).into()]),
+        )
+        .with_sharding(sharding.clone())
+        .unwrap();
+        let actual_type = ArrayType::new_static(DataType::F32, [2]).with_sharding(sharding).unwrap();
+        let buffers = [[1f32, 2.], [3., 4.]]
+            .iter()
+            .zip(&devices)
+            .map(|(values, device)| {
+                client
+                    .buffer(values_to_bytes(values).as_slice(), BufferType::F32, [2], None, device.clone(), None)
+                    .unwrap()
+            })
+            .collect();
+        let source = XlaArray::from_addressable_buffers(&domain, actual_type.clone(), mesh, buffers).unwrap();
+        let signature = XlaExecutableSignature::new(std::slice::from_ref(&declared_type), &[]);
+        let Err(error) =
+            materialize_bounded_dynamic_inputs(&domain, &signature, &[declared_type], &[actual_type], vec![source])
+        else {
+            panic!("bounded materialization unexpectedly padded an unreduced input");
+        };
+        assert_eq!(
+            error.to_string(),
+            "cannot pad an array of type `f32[2][sharding={mesh<['x'=2:explicit]>, [{}], unreduced={'x'}}]` through \
+             the host, because its devices hold separate summands along its unreduced axes, which a dense host copy \
+             would not preserve",
+        );
+    }
+
+    #[test]
     fn test_bounded_dynamic_program_executes_on_multiple_cpu_devices() {
         let plugin = load_cpu_plugin().unwrap();
         let client = plugin
@@ -14864,6 +14915,121 @@ mod tests {
             })
             .collect::<Vec<_>>();
         assert_eq!(shards, vec![vec![1.0, 2.0], vec![3.0, 4.0], vec![5.0, 6.0], vec![7.0, 8.0]]);
+    }
+
+    #[test]
+    fn test_xla_lowering_executes_shard_maps_batched_along_every_manual_axis() {
+        // The caller maps the leading dimension of its input, which it places along `x`, over a map whose only active
+        // manual axis is `x`. Batching releases `x`, which leaves a manual computation without manual axes that runs
+        // the batched body once on the global values, while the boundary keeps the batch dimension placed along `x`,
+        // so each of the two devices holds one batch item. The caller types its values over an `Explicit` copy of the
+        // mesh, so its batch placement adds no manual variation, and the lowered module is compiled directly because
+        // domain compilation requires the outputs to use the caller's mesh.
+        let map_mesh = LogicalMesh::new(vec![MeshAxis::new("x", 2, MeshAxisType::Manual).unwrap()]).unwrap();
+        let caller_mesh = LogicalMesh::new(vec![MeshAxis::new("x", 2, MeshAxisType::Explicit).unwrap()]).unwrap();
+        let replicated = Sharding::replicated(map_mesh.clone(), 1);
+        let caller_sharding = Sharding::new(
+            caller_mesh.clone(),
+            vec![ShardingDimension::sharded(["x"]), ShardingDimension::replicated()],
+        )
+        .unwrap();
+        let caller_type = ArrayType::new_static(DataType::F32, [2, 3]).with_sharding(caller_sharding).unwrap();
+        let (_, program) = DomainTracingContext::<XlaDomain<'static>>::trace(
+            |inputs: Vec<XlaTracer<'static>>| {
+                let output = batch(
+                    |item| {
+                        let item = ValueProjection::<ArrayType>::into_projected(item)?;
+                        let output = shard_map(
+                            |x| Ok(x.clone() + x),
+                            item,
+                            map_mesh.clone(),
+                            replicated.clone(),
+                            replicated.clone(),
+                            ShardMapOptions::new(),
+                        )?;
+                        Ok(output.into_value())
+                    },
+                    inputs[0].clone(),
+                    BatchAxis::new(0),
+                    BatchAxis::new(0),
+                    None,
+                )?;
+                Ok(vec![output])
+            },
+            vec![ArrayIrType::Array(caller_type)],
+        )
+        .unwrap();
+        let plugin = load_cpu_plugin().unwrap();
+        let client = plugin
+            .client(ClientOptions::CPU(CpuClientOptions { device_count: Some(2), ..Default::default() }))
+            .unwrap();
+        let devices = client
+            .addressable_devices()
+            .unwrap()
+            .into_iter()
+            .map(|device| Device::from_pjrt(device).unwrap())
+            .collect::<Vec<_>>();
+        let mesh = DeviceMesh::new(caller_mesh, devices).unwrap();
+        let domain = XlaSession::new(&client).domain();
+        let lowered = domain.lower_xla_program(&program, 0, &XlaOptions::new(mesh)).unwrap();
+        assert_eq!(
+            &*lowered.stable_hlo,
+            indoc! {"
+                module {
+                  sdy.mesh @mesh = <[\"x\"=2]>
+                  func.func @main(%arg0: tensor<2x3xf32> {sdy.sharding = #sdy.sharding<@mesh, [{\"x\"}, {}]>}) -> \
+                      (tensor<2x3xf32> {sdy.sharding = #sdy.sharding<@mesh, [{\"x\"}, {}]>}) {
+                    %0 = sdy.manual_computation(%arg0) in_shardings=[<@mesh, [{\"x\", ?}, {}]>] \
+                        out_shardings=[<@mesh, [{\"x\", ?}, {}]>] manual_axes={} (%arg1: tensor<2x3xf32>) {
+                      %1 = stablehlo.add %arg1, %arg1 : tensor<2x3xf32>
+                      sdy.return %1 : tensor<2x3xf32>
+                    } : (tensor<2x3xf32>) -> tensor<2x3xf32>
+                    return %0 : tensor<2x3xf32>
+                  }
+                }
+            "},
+        );
+        let executable = client
+            .compile(
+                &PjrtProgram::Mlir { bytecode: lowered.stable_hlo.as_bytes().to_vec() },
+                &test_spmd_compilation_options(2),
+            )
+            .unwrap();
+        let inputs = executable
+            .addressable_devices()
+            .unwrap()
+            .into_iter()
+            .zip([[1f32, 2., 3.], [4., 5., 6.]])
+            .map(|(device, item)| {
+                vec![ExecutionInput {
+                    buffer: Arc::new(
+                        client
+                            .buffer(values_to_bytes(&item).as_slice(), BufferType::F32, [1, 3], None, device, None)
+                            .unwrap(),
+                    ),
+                    donatable: false,
+                }]
+            })
+            .collect::<Vec<_>>();
+        let outputs = executable
+            .execute(
+                inputs.iter().map(|inputs| ExecutionDeviceInputs { inputs, ..Default::default() }).collect(),
+                Vec::new(),
+                0,
+                None,
+                None,
+                None,
+                None,
+                &[],
+            )
+            .unwrap()
+            .block_until_ready()
+            .unwrap();
+        let items = outputs
+            .into_iter()
+            .map(|output| values_from_bytes::<f32>(&output.outputs[0].copy_to_host(None).unwrap().r#await().unwrap()))
+            .collect::<Vec<_>>();
+        assert_eq!(items, vec![vec![2.0, 4.0, 6.0], vec![8.0, 10.0, 12.0]]);
     }
 
     #[test]

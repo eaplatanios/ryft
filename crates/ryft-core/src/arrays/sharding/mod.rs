@@ -25,7 +25,7 @@ pub enum ShardingError {
     #[error("mesh axis `{name}` must have size > 0")]
     EmptyMeshAxis { name: String },
 
-    #[error("mesh axis `{name}` must have type manual")]
+    #[error("mesh axis `{name}` must have type `manual`")]
     ExpectedManualMeshAxis { name: String },
 
     #[error("cannot remove dimension {dimension} because it is sharded over the non-manual mesh axis `{name}`")]

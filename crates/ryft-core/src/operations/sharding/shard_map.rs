@@ -320,9 +320,9 @@ use crate::tracing::{DomainTracer, DomainTracingContext, Tracer, TracingContext}
 
 // TODO(eaplatanios): Review from here onwards.
 
-/// Logical error type for `shard_map` boundaries, covering mesh and sharding validation, global and local
-/// boundary derivation, manual variation, and the semantic restrictions on `shard_map` bodies. It carries no backend
-/// state, so backend tracing and lowering errors can wrap it.
+/// Error type related to [`ShardMapOperation`], covering mesh and sharding validation, global and local boundary
+/// derivation, manual variation, and the semantic restrictions on `shard_map` bodies. It carries no backend state,
+/// so backend tracing and lowering errors can wrap it.
 ///
 /// It converts into [`ProgramError`] for operation and transform rules. Its [`Program`](ShardMapError::Program) variant
 /// passes through unchanged, and every other variant becomes [`ProgramError::custom`], from which callers can recover
@@ -334,7 +334,7 @@ use crate::tracing::{DomainTracer, DomainTracingContext, Tracer, TracingContext}
 /// tracing or binding a nested `shard_map`) is reported as itself rather than wrapped in a [`ProgramError`].
 #[derive(Clone, Debug, PartialEq, Eq, Hash, Error)]
 pub enum ShardMapError {
-    #[error("{0}")]
+    #[error(transparent)]
     Sharding(#[from] ShardingError),
 
     #[error("`{SHARD_MAP_OPERATION_NAME}` requires at least one mesh axis with type `manual`")]
@@ -353,10 +353,10 @@ pub enum ShardMapError {
     AxisAlreadyManual { axis_name: String },
 
     #[error(
-        "{value_kind} sharding #{value_index} names mesh axis `{axis_name}`, which is already manual in an \
-         enclosing manual region"
+        "`{SHARD_MAP_OPERATION_NAME}` {value_kind} sharding #{value_index} names mesh axis `{axis_name}`, which is \
+         already manual in an enclosing manual region"
     )]
-    ShardingNamesEnclosingManualAxis { value_kind: &'static str, value_index: usize, axis_name: String },
+    ShardingNamesEnclosingManualAxis { value_kind: ShardMapValueKind, value_index: usize, axis_name: String },
 
     #[error(
         "mesh axis `{axis_name}` is manual in an enclosing manual region, but the `{SHARD_MAP_OPERATION_NAME}` mesh \
@@ -371,25 +371,24 @@ pub enum ShardMapError {
     EnclosingManualAxisMeshMismatch { axis_name: String, enclosing_mesh: LogicalMesh, mesh: LogicalMesh },
 
     #[error(
-        "input type #{input_index} already varies along manual axis `{axis_name}` of the \
-         `{SHARD_MAP_OPERATION_NAME}`, which an enclosing manual region therefore already made manual"
+        "`{SHARD_MAP_OPERATION_NAME}` input #{input_index} varies along mesh axis `{axis_name}`, so that axis is \
+         already manual in an enclosing manual region and the `{SHARD_MAP_OPERATION_NAME}` cannot make it manual again"
     )]
     InputVariesAlongManualAxis { input_index: usize, axis_name: String },
 
-    /// Mesh axis names, sizes, and order must agree. Axis types may differ, because the boundary makes selected axes
-    /// manual. Transposition restores the caller's placement over that same device mesh.
     #[error(
-        "input type #{input_index} is placed over mesh `{actual}`, whose axes differ from those of the \
-         `{SHARD_MAP_OPERATION_NAME}` mesh `{expected}`"
+        "`{SHARD_MAP_OPERATION_NAME}` input #{input_index} is placed over mesh `{actual}`, whose axes differ from \
+         those of the `{SHARD_MAP_OPERATION_NAME}` mesh `{expected}`"
     )]
     InputMeshMismatch { input_index: usize, expected: LogicalMesh, actual: LogicalMesh },
 
     #[error(
-        "{value_kind} sharding #{value_index} dimension #{dimension} uses free axis `{free_axis_name}` \
-         more major than manual axis `{manual_axis_name}`"
+        "`{SHARD_MAP_OPERATION_NAME}` {value_kind} sharding #{value_index} lists axis `{free_axis_name}` before \
+         active manual axis `{manual_axis_name}` in dimension #{dimension}, but the active manual axes of a \
+         `{SHARD_MAP_OPERATION_NAME}` must precede its other axes"
     )]
-    ManualAxisMustPrecedeFreeAxis {
-        value_kind: &'static str,
+    FreeAxisPrecedesManualAxis {
+        value_kind: ShardMapValueKind,
         value_index: usize,
         dimension: usize,
         free_axis_name: String,
@@ -397,65 +396,46 @@ pub enum ShardMapError {
     },
 
     #[error(
-        "{value_kind} sharding #{value_index} has rank {sharding_rank}, but the provided shape \
-         has rank {shape_rank}"
+        "`{SHARD_MAP_OPERATION_NAME}` {value_kind} sharding #{value_index} has rank {sharding_rank}, but the \
+         {value_kind} type has rank {shape_rank}"
     )]
-    RankMismatch { value_kind: &'static str, value_index: usize, sharding_rank: usize, shape_rank: usize },
+    ShardingRankMismatch { value_kind: ShardMapValueKind, value_index: usize, sharding_rank: usize, shape_rank: usize },
 
     #[error(
-        "input sharding #{input_index} dimension #{dimension} has size {dimension_size}, which is not divisible by \
-         manual partition count {manual_partition_count}"
+        "`{SHARD_MAP_OPERATION_NAME}` input sharding #{input_index} splits dimension #{dimension} of size \
+         {dimension_size} into {manual_partition_count} manual partitions, which do not divide it evenly"
     )]
-    ManualAxisIntroducesPadding {
-        input_index: usize,
-        dimension: usize,
-        dimension_size: usize,
-        manual_partition_count: usize,
-    },
+    UnevenManualPartition { input_index: usize, dimension: usize, dimension_size: usize, manual_partition_count: usize },
 
-    #[error("got {actual} global input type(s), but `{SHARD_MAP_OPERATION_NAME}` expects {expected}")]
+    #[error("`{SHARD_MAP_OPERATION_NAME}` expects {expected} global input type(s) but got {actual}")]
     InputTypeCountMismatch { expected: usize, actual: usize },
 
-    #[error("got {actual} output type(s), but `{SHARD_MAP_OPERATION_NAME}` expects {expected}")]
+    #[error("`{SHARD_MAP_OPERATION_NAME}` expects {expected} global output type(s) but got {actual}")]
     OutputTypeCountMismatch { expected: usize, actual: usize },
 
-    #[error("got {actual} output forwarding(s), but `{SHARD_MAP_OPERATION_NAME}` expects {expected}")]
+    #[error("`{SHARD_MAP_OPERATION_NAME}` expects {expected} output forwarding entries but got {actual}")]
     OutputForwardingCountMismatch { expected: usize, actual: usize },
 
-    #[error(
-        "{value_kind} type #{value_index} dimension #{dimension} must be static at a `{SHARD_MAP_OPERATION_NAME}` \
-         boundary"
-    )]
-    DynamicShapeNotSupported { value_kind: &'static str, value_index: usize, dimension: usize },
+    #[error("dimension #{dimension} of `{SHARD_MAP_OPERATION_NAME}` {value_kind} type #{value_index} must be static")]
+    DynamicShapeNotSupported { value_kind: ShardMapValueKind, value_index: usize, dimension: usize },
 
     /// Boundary shapes are static, and an extent defined inside the body cannot be named outside it when sharing a
     /// residual between split bodies.
     #[error(
-        "residual #{residual_index} dimension #{dimension} must be static to cross a `{SHARD_MAP_OPERATION_NAME}` \
-         boundary; dynamically shaped intermediates cannot be shared between split `{SHARD_MAP_OPERATION_NAME}` bodies"
+        "dimension #{dimension} of residual #{residual_index} must be static to pass between the split bodies of a \
+         `{SHARD_MAP_OPERATION_NAME}`"
     )]
     DynamicResidualNotSupported { residual_index: usize, dimension: usize },
 
-    /// This guards against residual references to state that the body does not own. Every reference of a valid body
-    /// is an input or an allocation, so checked construction cannot reach this error. The only other root the reference
-    /// analysis can report is an external constant, which program builders reject, and the primal program's explicitly
-    /// empty capture scope rejects unbound captures. The check covers programs assembled without those validations.
     #[error(
-        "residual #{residual_index} is a reference that is neither a `{SHARD_MAP_OPERATION_NAME}` body input nor \
-         allocated in the body; only such references can be passed from the primal `{SHARD_MAP_OPERATION_NAME}` to \
-         the tangent `{SHARD_MAP_OPERATION_NAME}`"
-    )]
-    ReferenceResidualNotSupported { residual_index: usize },
-
-    #[error(
-        "`{SHARD_MAP_OPERATION_NAME}` body output #{output_index} must vary along tiled manual axis `{axis_name}`; \
-         insert `parallel_vary` before returning the output"
+        "`{SHARD_MAP_OPERATION_NAME}` body output #{output_index} does not vary along active manual axis \
+         `{axis_name}`, which its output sharding tiles (insert `parallel_vary` before returning it)"
     )]
     OutputNotVaryingAlongTiledManualAxis { output_index: usize, axis_name: String },
 
     #[error(
-        "output type #{output_index} still varies along manual axis `{axis_name}`, but its output sharding does not \
-         mention it"
+        "`{SHARD_MAP_OPERATION_NAME}` body output #{output_index} varies along active manual axis `{axis_name}`, \
+         which its output sharding does not tile"
     )]
     OutputVaryingAlongUntiledManualAxis { output_index: usize, axis_name: String },
 
@@ -463,11 +443,14 @@ pub enum ShardMapError {
     /// along the active manual axes, and its final state leaves the map through a reference output of the same
     /// sharding, so the per-device summands of such a reference would have no well-defined final state.
     #[error(
-        "reference input #{input_index} of a `{SHARD_MAP_OPERATION_NAME}` without manual-variation checking is \
-         {state_kind} along active manual axis `{axis_name}`, but such a `{SHARD_MAP_OPERATION_NAME}` does not \
-         support reduction state on references along its active manual axes"
+        "`{SHARD_MAP_OPERATION_NAME}` reference input #{input_index} is {state_kind} along active manual axis \
+         `{axis_name}`, which is not supported without manual-variation checking"
     )]
-    UncheckedReferenceReductionStateNotSupported { input_index: usize, state_kind: &'static str, axis_name: String },
+    UncheckedReferenceReductionStateNotSupported {
+        input_index: usize,
+        state_kind: ReductionStateKind,
+        axis_name: String,
+    },
 
     /// An input of a boundary without manual-variation checking that is unreduced along an active manual axis reaches
     /// each device as its own physical summand, which the body can observe (e.g., by squaring it, `[1, 2]` and `[3, 0]`
@@ -475,46 +458,46 @@ pub enum ShardMapError {
     /// recover the summands of the caller and rejects such inputs when it interprets the map. Compiled backends whose
     /// arrays keep one buffer per device (e.g., XLA) support them.
     #[error(
-        "the reference backend cannot interpret input #{input_index} of a `{SHARD_MAP_OPERATION_NAME}` without \
-         manual-variation checking, which is unreduced along active manual axis `{axis_name}`, because its arrays \
-         store logical values rather than the per-device summands that the body observes; use a backend whose arrays \
-         keep per-device buffers (e.g., XLA) instead"
+        "the reference backend does not support `{SHARD_MAP_OPERATION_NAME}` input #{input_index} without \
+         manual-variation checking, because the input is unreduced along active manual axis `{axis_name}` and \
+         reference arrays do not keep per-device summands (XLA arrays do)"
     )]
     UnreducedInputEmulationNotSupported { input_index: usize, axis_name: String },
 
     /// The boundary governs reduction state along its active manual axes and the axes its sharding names. State along
     /// other axes crosses the boundary unchanged.
     #[error(
-        "{value_kind} type #{value_index} has {state_kind} [{}], but `{SHARD_MAP_OPERATION_NAME}` expects [{}]",
+        "`{SHARD_MAP_OPERATION_NAME}` {value_kind} type #{value_index} has {state_kind} axes [{}], but its boundary \
+         sharding requires [{}]",
         .actual.iter().map(|axis_name| format!("`{axis_name}`")).collect::<Vec<_>>().join(", "),
         .expected.iter().map(|axis_name| format!("`{axis_name}`")).collect::<Vec<_>>().join(", "),
     )]
-    ShardingStateMismatch {
-        value_kind: &'static str,
+    ReductionStateMismatch {
+        value_kind: ShardMapValueKind,
         value_index: usize,
-        state_kind: &'static str,
+        state_kind: ReductionStateKind,
         expected: Vec<String>,
         actual: Vec<String>,
     },
 
-    #[error("overflow while {context}")]
-    Overflow { context: String },
+    #[error("integer overflow in `{SHARD_MAP_OPERATION_NAME}` while {context}")]
+    ArithmeticOverflow { context: String },
 
     #[error(
-        "`{SHARD_MAP_OPERATION_NAME}` requires an input value to recover its context from; use the `shard_map` \
-         function of `ShardMap` to provide the context explicitly"
+        "`{SHARD_MAP_OPERATION_NAME}` requires at least one input to recover its context from, so call \
+         `ShardMap::shard_map` on a context instead"
     )]
     MissingInputContext,
 
     #[error(
-        "`{SHARD_MAP_OPERATION_NAME}` bodies require `DeviceOrderedIo` because `OrderedIo` demands one order across \
-         devices"
+        "`{SHARD_MAP_OPERATION_NAME}` bodies cannot have the `OrderedIo` effect, which orders I/O across devices, so \
+         use `DeviceOrderedIo` instead"
     )]
     OrderedIoNotSupported,
 
     #[error(
         "`{SHARD_MAP_OPERATION_NAME}` reference inputs #{first_input_index} and #{second_input_index} denote the same \
-         allocation; pass distinct allocations"
+         allocation, but every reference input must denote its own"
     )]
     RepeatedReferenceInputAllocation { first_input_index: usize, second_input_index: usize },
 
@@ -533,36 +516,22 @@ pub enum ShardMapError {
     /// An axis is used when any body value varies along it or a collective or `axis_index` names it, including in a
     /// nested region. A permutation of invariant values can use an axis without producing a varying value.
     #[error(
-        "batching a `{SHARD_MAP_OPERATION_NAME}` places the batch axis on manual axis `{axis_name}`, which the \
-         `{SHARD_MAP_OPERATION_NAME}` body uses"
+        "batching a `{SHARD_MAP_OPERATION_NAME}` places the batch axis on active manual axis `{axis_name}`, which \
+         the `{SHARD_MAP_OPERATION_NAME}` body uses"
     )]
     BatchAxisPlacedOnUsedManualAxis { axis_name: String },
 
     #[error(
-        "batching a `{SHARD_MAP_OPERATION_NAME}` places the batch axis on every manual axis of the \
-         `{SHARD_MAP_OPERATION_NAME}`, so no manual axis would remain"
-    )]
-    BatchAxisPlacedOnEveryManualAxis,
-
-    #[error(
-        "batching a `{SHARD_MAP_OPERATION_NAME}` places the batch axis on manual axis `{axis_name}`, but the \
-         `{SHARD_MAP_OPERATION_NAME}` body has the `DeviceOrderedIo` effect, which requires every manual axis to \
-         remain manual"
+        "batching a `{SHARD_MAP_OPERATION_NAME}` places the batch axis on active manual axis `{axis_name}`, but the \
+         `{SHARD_MAP_OPERATION_NAME}` body has the `DeviceOrderedIo` effect, which requires every active manual axis \
+         to remain manual"
     )]
     BatchAxisPlacedOnManualAxisWithDeviceOrderedIo { axis_name: String },
 
-    /// This guards a transposition invariant. Boundary validation and transposed assembly preserve element types,
-    /// shapes, layouts, mesh axes, manual variation, and reduction state, so a well-formed boundary cannot reach it.
-    #[error(
-        "`{SHARD_MAP_OPERATION_NAME}` transposition produced cotangent type `{actual}` for input #{input_index}, \
-         which cannot be reconciled with the expected cotangent type `{expected}`"
-    )]
-    CotangentTypeMismatch { input_index: usize, expected: Box<ArrayIrType>, actual: Box<ArrayIrType> },
-
-    #[error("{0}")]
+    #[error(transparent)]
     Program(ProgramError),
 
-    #[error("{0}")]
+    #[error(transparent)]
     Parameter(#[from] ParameterError),
 }
 
@@ -581,6 +550,46 @@ impl From<ShardMapError> for ProgramError {
         match error {
             ShardMapError::Program(error) => error,
             error => ProgramError::custom(error),
+        }
+    }
+}
+
+/// Kind of `shard_map` boundary value that a [`ShardMapError`] refers to.
+#[derive(Copy, Clone, Debug, PartialEq, Eq, Hash)]
+pub enum ShardMapValueKind {
+    /// Global input of a `shard_map`, which its input sharding places.
+    Input,
+
+    /// Global output of a `shard_map`, which its output sharding places.
+    Output,
+}
+
+impl Display for ShardMapValueKind {
+    fn fmt(&self, formatter: &mut std::fmt::Formatter<'_>) -> std::fmt::Result {
+        match self {
+            Self::Input => write!(formatter, "input"),
+            Self::Output => write!(formatter, "output"),
+        }
+    }
+}
+
+/// Kind of reduction state that a [`ShardMapError`] refers to.
+#[derive(Copy, Clone, Debug, PartialEq, Eq, Hash)]
+pub enum ReductionStateKind {
+    /// State along the unreduced axes of a sharding (refer to [`Sharding::unreduced_axes`]), along which the devices
+    /// hold summands of the value.
+    Unreduced,
+
+    /// State along the reduced axes of a sharding (refer to [`Sharding::reduced_axes`]), along which the value is
+    /// replicated but its cotangent is unreduced.
+    Reduced,
+}
+
+impl Display for ReductionStateKind {
+    fn fmt(&self, formatter: &mut std::fmt::Formatter<'_>) -> std::fmt::Result {
+        match self {
+            Self::Unreduced => write!(formatter, "unreduced"),
+            Self::Reduced => write!(formatter, "reduced"),
         }
     }
 }
@@ -698,14 +707,14 @@ impl ShardMapBoundary {
     ///
     /// Returns [`ShardMapError::Sharding`] when `manual_axes` names an unknown or non-manual mesh axis or when a
     /// sharding is defined over a different mesh, [`ShardMapError::MeshHasNoManualAxes`] when `mesh` has no manual
-    /// axis, and [`ShardMapError::ManualAxisMustPrecedeFreeAxis`] when a free axis precedes an active manual axis.
+    /// axis, and [`ShardMapError::FreeAxisPrecedesManualAxis`] when a free axis precedes an active manual axis.
     pub fn new(
         mesh: LogicalMesh,
         input_shardings: Vec<Sharding>,
         output_shardings: Vec<Sharding>,
         manual_axes: Vec<String>,
     ) -> Result<Self, ShardMapError> {
-        Self::new_within(mesh, input_shardings, output_shardings, manual_axes, &HashSet::new())
+        Self::new_within(mesh, input_shardings, output_shardings, manual_axes.into(), &HashSet::new())
     }
 
     /// Creates a new [`ShardMapBoundary`] like [`Self::new`] for a manual region nested in enclosing manual regions
@@ -717,12 +726,13 @@ impl ShardMapBoundary {
     /// names an already manual axis is rejected with [`ShardMapError::ShardingNamesEnclosingManualAxis`]. Making
     /// an axis manual twice would drop the variation that the values of the enclosing region carry along it, so a
     /// per-device value could leave the nested region typed as replicated, and backends could not represent the nested
-    /// manual computation either.
+    /// manual computation either. A [`ManualAxisSelection::Listed`] selection is used exactly, so an empty one leaves
+    /// the boundary without active manual axes.
     fn new_within(
         mesh: LogicalMesh,
         input_shardings: Vec<Sharding>,
         output_shardings: Vec<Sharding>,
-        manual_axes: Vec<String>,
+        manual_axes: ManualAxisSelection,
         enclosing_manual_axes: &HashSet<&str>,
     ) -> Result<Self, ShardMapError> {
         if let Some(axis) = mesh
@@ -733,10 +743,20 @@ impl ShardMapBoundary {
             return Err(ShardMapError::EnclosingManualAxisNotManual { axis_name: axis.name().to_string() });
         }
         let manual_axes = Self::normalize_manual_axes(&mesh, manual_axes, enclosing_manual_axes)?;
-        let input_shardings =
-            Self::build_shardings(&mesh, &manual_axes, enclosing_manual_axes, input_shardings, "input")?;
-        let output_shardings =
-            Self::build_shardings(&mesh, &manual_axes, enclosing_manual_axes, output_shardings, "output")?;
+        let input_shardings = Self::build_shardings(
+            &mesh,
+            &manual_axes,
+            enclosing_manual_axes,
+            input_shardings,
+            ShardMapValueKind::Input,
+        )?;
+        let output_shardings = Self::build_shardings(
+            &mesh,
+            &manual_axes,
+            enclosing_manual_axes,
+            output_shardings,
+            ShardMapValueKind::Output,
+        )?;
         Ok(Self {
             mesh,
             input_shardings,
@@ -863,7 +883,7 @@ impl ShardMapBoundary {
     /// # Errors
     ///
     /// Returns [`ShardMapError::InputMeshMismatch`] when `input_type` carries a sharding over a mesh whose axes differ
-    /// from those of [`Self::mesh`], [`ShardMapError::ShardingStateMismatch`] when the unreduced or reduced axes of
+    /// from those of [`Self::mesh`], [`ShardMapError::ReductionStateMismatch`] when the unreduced or reduced axes of
     /// `input_type` along the axes that the input sharding governs differ from those of the input sharding, and the
     /// sharding errors of applying the input sharding otherwise.
     ///
@@ -873,7 +893,8 @@ impl ShardMapBoundary {
     pub fn global_input_type(&self, input_index: usize, input_type: &ArrayType) -> Result<ArrayType, ShardMapError> {
         let sharding = &self.input_shardings[input_index];
         self.validate_input_mesh(input_type.sharding(), input_index)?;
-        let carried_state = self.carried_reduction_state(sharding, input_type.sharding(), "input", input_index)?;
+        let carried_state =
+            self.carried_reduction_state(sharding, input_type.sharding(), ShardMapValueKind::Input, input_index)?;
         let varying_axes =
             input_type.sharding().map(|sharding| sharding.varying_manual_axes().clone()).unwrap_or_default();
         Ok(ArrayType::new(input_type.data_type(), input_type.shape().clone())
@@ -895,9 +916,9 @@ impl ShardMapBoundary {
     ///
     /// # Errors
     ///
-    /// Returns [`ShardMapError::ShardingStateMismatch`] when the unreduced or reduced axes of `global_input_type` along
-    /// the axes that the input sharding governs differ from those of the input sharding (the local type takes its
-    /// reduction state along those axes from the input sharding, so such a global type is not one that the input
+    /// Returns [`ShardMapError::ReductionStateMismatch`] when the unreduced or reduced axes of `global_input_type`
+    /// along the axes that the input sharding governs differ from those of the input sharding (the local type takes
+    /// its reduction state along those axes from the input sharding, so such a global type is not one that the input
     /// sharding places), [`ShardMapError::DynamicShapeNotSupported`] for a dynamic global shape, and the rank,
     /// divisibility, and sharding errors of the derivation otherwise.
     ///
@@ -910,9 +931,13 @@ impl ShardMapBoundary {
         global_input_type: &ArrayType,
     ) -> Result<ArrayType, ShardMapError> {
         let boundary_sharding = &self.input_shardings[input_index];
-        let carried_state =
-            self.carried_reduction_state(boundary_sharding, global_input_type.sharding(), "input", input_index)?;
-        let global_shape = Self::static_dimensions(global_input_type, "input", input_index)?;
+        let carried_state = self.carried_reduction_state(
+            boundary_sharding,
+            global_input_type.sharding(),
+            ShardMapValueKind::Input,
+            input_index,
+        )?;
+        let global_shape = Self::static_dimensions(global_input_type, ShardMapValueKind::Input, input_index)?;
         let local_shape = self.local_input_shape(input_index, &global_shape)?;
         let local_sharding =
             self.without_unchecked_reduction_state(boundary_sharding.local_sharding(self.manual_axes())?)?;
@@ -969,31 +994,32 @@ impl ShardMapBoundary {
             .collect()
     }
 
-    /// Returns the active manual axes in mesh order, which are those named by `manual_axes`, or every manual mesh axis
-    /// that is not in `enclosing_manual_axes` (i.e., that no enclosing manual region already made manual) when
-    /// `manual_axes` is empty. Explicitly requesting an axis in `enclosing_manual_axes` is rejected.
+    /// Returns the active manual axes in mesh order, which are those that `manual_axes` lists, or every manual mesh
+    /// axis that is not in `enclosing_manual_axes` (i.e., that no enclosing manual region already made manual) for
+    /// [`ManualAxisSelection::Remaining`]. Explicitly requesting an axis in `enclosing_manual_axes` is rejected.
     fn normalize_manual_axes(
         mesh: &LogicalMesh,
-        manual_axes: Vec<String>,
+        manual_axes: ManualAxisSelection,
         enclosing_manual_axes: &HashSet<&str>,
     ) -> Result<Vec<String>, ShardMapError> {
-        let selected_manual_axes = if manual_axes.is_empty() {
-            None
-        } else {
-            let mut selected_manual_axes = HashSet::new();
-            for axis_name in manual_axes {
-                if mesh.axis_index(axis_name.as_str()).is_none() {
-                    return Err(ShardMapError::Sharding(ShardingError::UnknownMeshAxisName { name: axis_name }));
+        let selected_manual_axes = match manual_axes {
+            ManualAxisSelection::Remaining => None,
+            ManualAxisSelection::Listed(manual_axes) => {
+                let mut selected_manual_axes = HashSet::new();
+                for axis_name in manual_axes {
+                    if mesh.axis_index(axis_name.as_str()).is_none() {
+                        return Err(ShardMapError::Sharding(ShardingError::UnknownMeshAxisName { name: axis_name }));
+                    }
+                    if mesh.axis_type(axis_name.as_str()) != Some(MeshAxisType::Manual) {
+                        return Err(ShardMapError::Sharding(ShardingError::ExpectedManualMeshAxis { name: axis_name }));
+                    }
+                    if enclosing_manual_axes.contains(axis_name.as_str()) {
+                        return Err(ShardMapError::AxisAlreadyManual { axis_name });
+                    }
+                    selected_manual_axes.insert(axis_name);
                 }
-                if mesh.axis_type(axis_name.as_str()) != Some(MeshAxisType::Manual) {
-                    return Err(ShardMapError::Sharding(ShardingError::ExpectedManualMeshAxis { name: axis_name }));
-                }
-                if enclosing_manual_axes.contains(axis_name.as_str()) {
-                    return Err(ShardMapError::AxisAlreadyManual { axis_name });
-                }
-                selected_manual_axes.insert(axis_name);
+                Some(selected_manual_axes)
             }
-            Some(selected_manual_axes)
         };
         let manual_axes = mesh
             .axes()
@@ -1007,7 +1033,7 @@ impl ShardMapBoundary {
                 .then(|| axis.name().to_string())
             })
             .collect::<Vec<_>>();
-        if manual_axes.is_empty() {
+        if selected_manual_axes.is_none() && manual_axes.is_empty() {
             return Err(if mesh.axes().iter().any(|axis| axis.r#type() == MeshAxisType::Manual) {
                 ShardMapError::AllManualAxesAlreadyManual
             } else {
@@ -1025,7 +1051,7 @@ impl ShardMapBoundary {
         manual_axes: &[String],
         enclosing_manual_axes: &HashSet<&str>,
         shardings: Vec<Sharding>,
-        value_kind: &'static str,
+        value_kind: ShardMapValueKind,
     ) -> Result<Vec<Sharding>, ShardMapError> {
         let manual_axis_names = manual_axes.iter().map(String::as_str).collect::<HashSet<_>>();
         shardings
@@ -1067,7 +1093,7 @@ impl ShardMapBoundary {
     fn validate_manual_axis_order(
         sharding: &Sharding,
         manual_axes: &HashSet<&str>,
-        value_kind: &'static str,
+        value_kind: ShardMapValueKind,
         value_index: usize,
     ) -> Result<(), ShardMapError> {
         for (dimension, sharding_dimension) in sharding.dimensions().iter().enumerate() {
@@ -1076,7 +1102,7 @@ impl ShardMapBoundary {
                 for axis_name in axis_names {
                     if manual_axes.contains(axis_name.as_str()) {
                         if let Some(free_axis_name) = first_free_axis {
-                            return Err(ShardMapError::ManualAxisMustPrecedeFreeAxis {
+                            return Err(ShardMapError::FreeAxisPrecedesManualAxis {
                                 value_kind,
                                 value_index,
                                 dimension,
@@ -1123,7 +1149,7 @@ impl ShardMapBoundary {
         &self,
         boundary: &Sharding,
         actual: Option<&Sharding>,
-        value_kind: &'static str,
+        value_kind: ShardMapValueKind,
         value_index: usize,
     ) -> Result<CarriedReductionState, ShardMapError> {
         let governed_axes = self
@@ -1138,28 +1164,29 @@ impl ShardMapBoundary {
             .map(String::as_str)
             .collect::<HashSet<_>>();
         let no_axes = BTreeSet::new();
-        let split = |state_kind: &'static str, actual_axes: &BTreeSet<String>, expected_axes: &BTreeSet<String>| {
-            let (governed, carried): (BTreeSet<_>, BTreeSet<_>) =
-                actual_axes.iter().cloned().partition(|axis_name| governed_axes.contains(axis_name.as_str()));
-            if governed != *expected_axes {
-                return Err(ShardMapError::ShardingStateMismatch {
-                    value_kind,
-                    value_index,
-                    state_kind,
-                    expected: expected_axes.iter().cloned().collect(),
-                    actual: governed.into_iter().collect(),
-                });
-            }
-            Ok(carried)
-        };
+        let split =
+            |state_kind: ReductionStateKind, actual_axes: &BTreeSet<String>, expected_axes: &BTreeSet<String>| {
+                let (governed, carried): (BTreeSet<_>, BTreeSet<_>) =
+                    actual_axes.iter().cloned().partition(|axis_name| governed_axes.contains(axis_name.as_str()));
+                if governed != *expected_axes {
+                    return Err(ShardMapError::ReductionStateMismatch {
+                        value_kind,
+                        value_index,
+                        state_kind,
+                        expected: expected_axes.iter().cloned().collect(),
+                        actual: governed.into_iter().collect(),
+                    });
+                }
+                Ok(carried)
+            };
         Ok(CarriedReductionState {
             unreduced_axes: split(
-                "unreduced axes",
+                ReductionStateKind::Unreduced,
                 actual.map_or(&no_axes, Sharding::unreduced_axes),
                 boundary.unreduced_axes(),
             )?,
             reduced_axes: split(
-                "reduced axes",
+                ReductionStateKind::Reduced,
                 actual.map_or(&no_axes, Sharding::reduced_axes),
                 boundary.reduced_axes(),
             )?,
@@ -1172,14 +1199,15 @@ impl ShardMapBoundary {
     /// view.
     fn local_input_shape(&self, input_index: usize, global_shape: &[usize]) -> Result<Vec<usize>, ShardMapError> {
         let sharding = &self.input_shardings[input_index];
-        let partition_counts = self.manual_partition_counts(sharding, global_shape.len(), "input", input_index)?;
+        let partition_counts =
+            self.manual_partition_counts(sharding, global_shape.len(), ShardMapValueKind::Input, input_index)?;
         global_shape
             .iter()
             .zip(partition_counts)
             .enumerate()
             .map(|(dimension, (&dimension_size, manual_partition_count))| {
                 if dimension_size % manual_partition_count != 0 {
-                    return Err(ShardMapError::ManualAxisIntroducesPadding {
+                    return Err(ShardMapError::UnevenManualPartition {
                         input_index,
                         dimension,
                         dimension_size,
@@ -1268,7 +1296,7 @@ impl ShardMapBoundary {
         local_output_type: &ArrayType,
     ) -> Result<ArrayType, ShardMapError> {
         let manual_axis_names = self.manual_axis_names();
-        let local_shape = Self::static_dimensions(local_output_type, "output", output_index)?;
+        let local_shape = Self::static_dimensions(local_output_type, ShardMapValueKind::Output, output_index)?;
         let output_sharding = &self.output_shardings[output_index];
         let expected_current_varying_axes = Self::sharded_manual_axes(output_sharding, &manual_axis_names);
         let effective_local_varying_axes = local_output_type
@@ -1288,7 +1316,7 @@ impl ShardMapBoundary {
         let carried_state = self.carried_reduction_state(
             &self.without_unchecked_reduction_state(output_sharding.clone())?,
             local_output_type.sharding(),
-            "output",
+            ShardMapValueKind::Output,
             output_index,
         )?;
         for axis_name in &effective_local_varying_axes {
@@ -1321,14 +1349,17 @@ impl ShardMapBoundary {
     /// its manual partition count under the output sharding.
     fn global_output_shape(&self, output_index: usize, local_shape: Vec<usize>) -> Result<Vec<usize>, ShardMapError> {
         let sharding = &self.output_shardings[output_index];
-        let partition_counts = self.manual_partition_counts(sharding, local_shape.len(), "output", output_index)?;
+        let partition_counts =
+            self.manual_partition_counts(sharding, local_shape.len(), ShardMapValueKind::Output, output_index)?;
         local_shape
             .into_iter()
             .zip(partition_counts)
             .enumerate()
             .map(|(dimension, (local_dimension_size, manual_partition_count))| {
-                local_dimension_size.checked_mul(manual_partition_count).ok_or_else(|| ShardMapError::Overflow {
-                    context: format!("computing the global size of output #{output_index} dimension #{dimension}"),
+                local_dimension_size.checked_mul(manual_partition_count).ok_or_else(|| {
+                    ShardMapError::ArithmeticOverflow {
+                        context: format!("computing the global size of output #{output_index} dimension #{dimension}"),
+                    }
                 })
             })
             .collect()
@@ -1341,11 +1372,11 @@ impl ShardMapBoundary {
         &self,
         sharding: &Sharding,
         rank: usize,
-        value_kind: &'static str,
+        value_kind: ShardMapValueKind,
         value_index: usize,
     ) -> Result<Vec<usize>, ShardMapError> {
         if sharding.rank() != rank {
-            return Err(ShardMapError::RankMismatch {
+            return Err(ShardMapError::ShardingRankMismatch {
                 value_kind,
                 value_index,
                 sharding_rank: sharding.rank(),
@@ -1363,7 +1394,7 @@ impl ShardMapBoundary {
                     .filter(|axis_name| manual_axis_names.contains(axis_name.as_str()))
                     .try_fold(1usize, |partition_count, axis_name| {
                         partition_count.checked_mul(self.mesh.axis_size(axis_name).unwrap()).ok_or_else(|| {
-                            ShardMapError::Overflow {
+                            ShardMapError::ArithmeticOverflow {
                                 context: format!(
                                     "computing the manual partition count of {value_kind} #{value_index} dimension \
                                      #{dimension}",
@@ -1400,7 +1431,7 @@ impl ShardMapBoundary {
     /// Returns the static dimensions of a boundary type, rejecting a dynamic dimension.
     fn static_dimensions(
         array_type: &ArrayType,
-        value_kind: &'static str,
+        value_kind: ShardMapValueKind,
         value_index: usize,
     ) -> Result<Vec<usize>, ShardMapError> {
         if let Some(shape) = array_type.static_shape() {
@@ -1422,16 +1453,16 @@ impl ShardMapBoundary {
     /// be an axis of the mesh. [`Auto`](MeshAxisType::Auto) axes are dropped, as the boundary drops them from every
     /// sharding, while free axes (i.e., axes that are not active manual axes) are kept. Active manual axes are kept as
     /// well, but they are no longer active in the batched map, which is only correct when `body` (the local body of
-    /// this map) neither varies along them nor communicates along them, when another active manual axis remains, and
-    /// when `body` has no [`EffectClass::DeviceOrderedIo`] effect. An unchecked body carries no variation labels, so
-    /// only its communication and effects are checked, which suffices because no input or output sharding names a
-    /// released axis.
+    /// this map) neither varies along them nor communicates along them, and when `body` has no
+    /// [`EffectClass::DeviceOrderedIo`] effect. An unchecked body carries no variation labels, so only its
+    /// communication and effects are checked, which suffices because no input or output sharding names a released
+    /// axis. A placement on every active manual axis leaves the batched map without active manual axes, so its body
+    /// runs once on the global values, which is what each device along the released axes computed already.
     ///
     /// # Errors
     ///
     /// Returns [`ShardMapError::Sharding`] for a placement axis that is not an axis of the mesh,
     /// [`ShardMapError::BatchAxisPlacedOnSpecifiedAxis`] for a placement axis that an input or output sharding names,
-    /// [`ShardMapError::BatchAxisPlacedOnEveryManualAxis`] when the placement names every active manual axis,
     /// [`ShardMapError::BatchAxisPlacedOnUsedManualAxis`] for an active manual placement axis that some value of a
     /// checked `body` (including the values of its nested regions) varies along or that a collective or an `axis_index`
     /// of `body` (again including its nested regions) names, and
@@ -1477,9 +1508,6 @@ impl ShardMapBoundary {
             .cloned()
             .collect::<Vec<_>>();
         if let Some(released_axis) = released_axes.first() {
-            if manual_axes.is_empty() {
-                return Err(ShardMapError::BatchAxisPlacedOnEveryManualAxis);
-            }
             // An unchecked body carries no variation labels, so only the syntactic checks below apply to it. They
             // suffice, because no boundary sharding names a released axis (every input is replicated along it), the
             // body captures no reference, and so only a collective or an `axis_index` naming the axis, or a
@@ -1549,6 +1577,23 @@ impl CarriedReductionState {
     }
 }
 
+/// Active manual axes requested for a [`ShardMapBoundary`].
+enum ManualAxisSelection {
+    /// Every manual mesh axis that no enclosing manual region already made manual, which is what an empty list of
+    /// manual axes requests from [`ShardMapBoundary::new`] and [`shard_map`](fn@shard_map).
+    Remaining,
+
+    /// Exactly the listed manual mesh axes. Only the batching rule of [`ShardMapOperation`] lists none, when it places
+    /// the batch axis on every active manual axis of the source map.
+    Listed(Vec<String>),
+}
+
+impl From<Vec<String>> for ManualAxisSelection {
+    fn from(manual_axes: Vec<String>) -> Self {
+        if manual_axes.is_empty() { Self::Remaining } else { Self::Listed(manual_axes) }
+    }
+}
+
 /// Canonical operation name for [`ShardMapOperation`]. Program statistics and their cross-language test cases match
 /// this name, so it must not change.
 pub const SHARD_MAP_OPERATION_NAME: &str = "shard_map";
@@ -1576,10 +1621,10 @@ pub const SHARD_MAP_OPERATION_NAME: &str = "shard_map";
 /// level preserves the boundary when all inputs are unbatched. The batch dimension is unpartitioned for a
 /// replicated batch axis and is otherwise placed on the mesh axes that the batching level places the batch axis on.
 /// Those axes are free in the batched map, so the batch dimension keeps its global extent inside the body, and an
-/// active manual axis among them (the analogue of JAX's `spmd_axis_name`) stops being manual. Batching a map with
-/// mapped inputs or outputs therefore rejects a placement axis that an input or output sharding names
-/// ([`ShardMapError::BatchAxisPlacedOnSpecifiedAxis`]), a placement on every active manual axis
-/// ([`ShardMapError::BatchAxisPlacedOnEveryManualAxis`]), and a placement on an active manual axis along which the body
+/// active manual axis among them (the analogue of JAX's `spmd_axis_name`) stops being manual, which leaves a map
+/// without active manual axes when the placement names all of them. Batching a map with mapped inputs or outputs
+/// therefore rejects a placement axis that an input or output sharding names
+/// ([`ShardMapError::BatchAxisPlacedOnSpecifiedAxis`]) and a placement on an active manual axis along which the body
 /// varies or communicates ([`ShardMapError::BatchAxisPlacedOnUsedManualAxis`]) or of a body with the
 /// [`EffectClass::DeviceOrderedIo`] effect ([`ShardMapError::BatchAxisPlacedOnManualAxisWithDeviceOrderedIo`]). With
 /// manual-variation checking disabled, the body carries no variation labels, so a placement on an active manual axis is
@@ -1695,14 +1740,15 @@ impl ShardMapOperation {
     /// Returns [`ShardMapError::InputTypeCountMismatch`] or [`ShardMapError::OutputTypeCountMismatch`] when the number
     /// of global input types or body outputs differs from the number of input or output shardings,
     /// [`ShardMapError::InputMeshMismatch`] when a global input type carries a sharding over a mesh whose axes differ
-    /// from those of the mesh of `shard_map`, [`ShardMapError::ShardingStateMismatch`] when the reduction state of a
+    /// from those of the mesh of `shard_map`, [`ShardMapError::ReductionStateMismatch`] when the reduction state of a
     /// global input type along the axes that its input sharding governs differs from that of the input sharding,
     /// [`ShardMapError::Sharding`] when a global input type cannot be placed by its input sharding, the errors of
     /// [`ShardMapBoundary::local_input_type`] for the declared global input types (e.g.,
-    /// [`ShardMapError::DynamicShapeNotSupported`] or [`ShardMapError::ManualAxisIntroducesPadding`]), the global
+    /// [`ShardMapError::DynamicShapeNotSupported`] or [`ShardMapError::UnevenManualPartition`]), the global
     /// output derivation errors for the body outputs (i.e., [`ShardMapError::OutputNotVaryingAlongTiledManualAxis`],
-    /// [`ShardMapError::OutputVaryingAlongUntiledManualAxis`], [`ShardMapError::ShardingStateMismatch`],
-    /// [`ShardMapError::RankMismatch`], [`ShardMapError::DynamicShapeNotSupported`], or [`ShardMapError::Overflow`]),
+    /// [`ShardMapError::OutputVaryingAlongUntiledManualAxis`], [`ShardMapError::ReductionStateMismatch`],
+    /// [`ShardMapError::ShardingRankMismatch`], [`ShardMapError::DynamicShapeNotSupported`], or
+    /// [`ShardMapError::ArithmeticOverflow`]),
     /// [`ShardMapError::OrderedIoNotSupported`] for a body with the [`EffectClass::OrderedIo`] effect, and
     /// [`ShardMapError::Program`] when the body's arity or input types do not match the local shards of the declared
     /// global input types, or when the body violates the reference contract (e.g., a reference output that does not
@@ -1732,7 +1778,10 @@ impl ShardMapOperation {
         if !boundary.check_manual_variation() {
             for (input_index, _) in global_input_types.iter().enumerate().filter(|(_, r#type)| r#type.is_reference()) {
                 let sharding = &boundary.input_shardings()[input_index];
-                let states = [("unreduced", sharding.unreduced_axes()), ("reduced", sharding.reduced_axes())];
+                let states = [
+                    (ReductionStateKind::Unreduced, sharding.unreduced_axes()),
+                    (ReductionStateKind::Reduced, sharding.reduced_axes()),
+                ];
                 for (state_kind, axes) in states {
                     if let Some(axis_name) = boundary.manual_axes().iter().find(|axis_name| axes.contains(*axis_name)) {
                         return Err(ShardMapError::UncheckedReferenceReductionStateNotSupported {
@@ -2611,33 +2660,33 @@ where
 // dimension of every mapped input and output. An `Auto` placement axis is dropped, as the boundary drops `Auto` axes
 // from every sharding, and an unconstrained placement leaves the batch dimension unpartitioned, as a missing
 // `spmd_axis_name` does in JAX. When some input is mapped, the placement is validated before the body is batched. A
-// placement axis that an input
-// or output sharding names is rejected (`ShardMapError::BatchAxisPlacedOnSpecifiedAxis`), as JAX rejects a
-// `spmd_axis_name` that its specifications mention, because the batch dimension would then be partitioned along an axis
-// that already partitions another dimension of a boundary value or that describes its reduction state. Every other
-// placement axis is free in the batched map, so the batch dimension keeps its global extent inside the body (as JAX
-// keeps the placement of an explicit axis in the outer sharding only), and collectives over the batch axis inside the
-// body still see every batch item. An `Explicit` axis or a manual axis that is not active in this map is free already.
-// An active manual axis is the analogue of JAX's `spmd_axis_name`, but JAX's design (a local batch dimension that
-// varies along that axis inside the body) needs batching rules at the operation level that align manual variation,
-// which this rule cannot provide. Instead, the rule removes such an axis from the active manual axes of the batched
-// map, so that it becomes free and carries the batch dimension. That leaves the semantics of the body unchanged when
-// every device along the axis computes the same values, which holds when no input or output sharding names the axis (so
-// every input is replicated along it and every output must be invariant along it), when no value of the body varies
-// along it and no collective or `axis_index` of the body names it (which excludes communication along it even between
-// invariant values, such as a meshless permutation, whose output is typed by its input), and when the body has no
-// `DeviceOrderedIo` effect, whose per-device executions would change. Recognizing those collectives is why the
-// operation family must support payload projection. An unchecked body carries no variation labels, so the variation
-// condition is skipped for it, which is sound because its inputs are replicated along the axis and only the other two
-// conditions could make its devices diverge. Each violation is rejected with its own `ShardMapError`, as is a
-// placement on every active manual axis, because the batched map must keep one. (Binding the batched body inline would
-// avoid that rejection, but region replay requires the caller's values to carry exactly the declared input shardings of
-// the body, which the batch placement changes.) No manual placement axis is manual
-// inside the batched body, but a batched value placed on a manual axis would vary along it, so the body is batched with
-// a context whose placement keeps only the `Explicit` placement axes (boundary validation compares local types up to
-// their placement, so the local types still match). The batched boundary is validated through
-// `ShardMapBoundary::new_within` against the enclosing manual axes that the inputs witness by varying along them, which
-// rejects a placement on such an axis whenever an input varies along it.
+// placement axis that an input or output sharding names is rejected (`ShardMapError::BatchAxisPlacedOnSpecifiedAxis`),
+// as JAX rejects a `spmd_axis_name` that its specifications mention, because the batch dimension would then be
+// partitioned along an axis that already partitions another dimension of a boundary value or that describes its
+// reduction state. Every other placement axis is free in the batched map, so the batch dimension keeps its global
+// extent inside the body (as JAX keeps the placement of an explicit axis in the outer sharding only), and collectives
+// over the batch axis inside the body still see every batch item. An `Explicit` axis or a manual axis that is not
+// active in this map is free already. An active manual axis is the analogue of JAX's `spmd_axis_name`, but JAX's design
+// (a local batch dimension that varies along that axis inside the body) needs batching rules at the operation level
+// that align manual variation, which this rule cannot provide. Instead, the rule removes such an axis from the active
+// manual axes of the batched map, so that it becomes free and carries the batch dimension. That leaves the semantics of
+// the body unchanged when every device along the axis computes the same values, which holds when no input or output
+// sharding names the axis (so every input is replicated along it and every output must be invariant along it), when no
+// value of the body varies along it and no collective or `axis_index` of the body names it (which excludes
+// communication along it even between invariant values, such as a meshless permutation, whose output is typed by its
+// input), and when the body has no `DeviceOrderedIo` effect, whose per-device executions would change. Recognizing
+// those collectives is why the operation family must support payload projection. An unchecked body carries no variation
+// labels, so the variation condition is skipped for it, which is sound because its inputs are replicated along the axis
+// and only the other two conditions could make its devices diverge. Each violation is rejected with its own
+// `ShardMapError`. A placement on every active manual axis leaves the batched map without active manual axes (requested
+// explicitly with `ManualAxisSelection::Listed`, because an empty list of manual axes otherwise selects all of them),
+// so its body runs once on the global values. That keeps the boundary types of the release design unchanged, whereas
+// binding the batched body inline would need its caller's values to carry exactly the body's declared shardings. No
+// manual placement axis is manual inside the batched body, but a batched value placed on a manual axis would vary along
+// it, so the body is batched with a context whose placement keeps only the `Explicit` placement axes (boundary
+// validation compares local types up to their placement, so the local types still match). The batched boundary is
+// validated through `ShardMapBoundary::new_within` against the enclosing manual axes that the inputs witness by varying
+// along them, which rejects a placement on such an axis whenever an input varies along it.
 //
 // `shard_map` boundaries are static (refer to the `# Static Boundaries` section of the documentation of
 // `ShardMapOperation`), so the batch extent must be static whenever a boundary position is mapped or the body uses it,
@@ -2853,7 +2902,7 @@ where
                 mesh.clone(),
                 input_shardings,
                 output_shardings,
-                manual_axes,
+                ManualAxisSelection::Listed(manual_axes),
                 &enclosing_manual_axes,
             )
             .map_err(to_batching_error)?
@@ -3267,7 +3316,7 @@ pub trait ShardMap: Context + NamedAxes {
     /// such an axis, [`ShardMapError::EnclosingManualAxisNotManual`] when `mesh` does not type such an axis
     /// [`Manual`](MeshAxisType::Manual), [`ShardMapError::EnclosingManualAxisMeshMismatch`] when such an axis belongs
     /// to another device mesh, the boundary derivation errors (e.g., [`ShardMapError::InputMeshMismatch`],
-    /// [`ShardMapError::DynamicShapeNotSupported`], or [`ShardMapError::ManualAxisIntroducesPadding`]), the errors of
+    /// [`ShardMapError::DynamicShapeNotSupported`], or [`ShardMapError::UnevenManualPartition`]), the errors of
     /// [`ShardMapOperation::from_program`] for the traced body (e.g., [`ShardMapError::OrderedIoNotSupported`]), and
     /// [`ShardMapError::Program`] when `function`, tracing the body, or binding the operation fails (e.g., when an
     /// input does not belong to this context, which binding validates where the context tracks value ownership).
@@ -4800,9 +4849,10 @@ struct ResidualEdge {
 ///
 /// Returns [`ShardMapError::DynamicResidualNotSupported`] when the edge has a dynamic dimension, which would carry a
 /// dimension identity defined inside the body across the static `shard_map` boundary (refer to the
-/// `# Static Boundaries` section of the documentation of [`ShardMapOperation`]), [`ShardMapError::Overflow`] when the
-/// global extent of the tiled dimension overflows `usize`, and [`ShardMapError::Sharding`] or
-/// [`ShardMapError::Program`] when the global type or its sharding cannot be constructed.
+/// `# Static Boundaries` section of the documentation of [`ShardMapOperation`]),
+/// [`ShardMapError::ArithmeticOverflow`] when the global extent of the tiled dimension overflows `usize`, and
+/// [`ShardMapError::Sharding`] or [`ShardMapError::Program`] when the global type or its sharding cannot be
+/// constructed.
 fn residual_edge(
     residual_index: usize,
     local_type: &ArrayIrType,
@@ -4866,9 +4916,11 @@ fn residual_edge(
     let sharding = boundary_sharding(&global_sharding)?;
     let mut shape = boundary_type.static_shape().unwrap().dimensions().to_vec();
     shape[0] = axes.iter().try_fold(shape[0], |extent, axis| {
-        extent.checked_mul(boundary.mesh().axis_size(axis).unwrap()).ok_or_else(|| ShardMapError::Overflow {
-            context: format!("computing the global extent of residual #{residual_index}"),
-        })
+        extent
+            .checked_mul(boundary.mesh().axis_size(axis).unwrap())
+            .ok_or_else(|| ShardMapError::ArithmeticOverflow {
+                context: format!("computing the global extent of residual #{residual_index}"),
+            })
     })?;
     let shape = Shape::new(shape.into_iter().map(Dimension::Static).collect());
     let global_type = boundary_type.clone().with_shape(shape).with_sharding(global_sharding)?;
@@ -5235,7 +5287,7 @@ where
 /// remaining residuals become residual edges of the primal boundary, and a reference residual crosses either by
 /// identity, as the reference input that it denotes (directly or through an alias), or as a snapshot of its final
 /// state, when the body allocates it. Any other reference residual is rejected with
-/// [`ShardMapError::ReferenceResidualNotSupported`].
+/// [`ProgramError::MalformedProgram`], because every reference of a valid body is an input or an allocation.
 #[derive(Copy, Clone, Debug, PartialEq, Eq)]
 enum ShardMapResidual {
     /// Residual that is primal body input `index` itself. The tangent `shard_map` receives it directly from the
@@ -5409,8 +5461,9 @@ where
     // the documentation of `Linearization::tangent`), so the reference analysis of the primal program resolves the
     // input that it denotes or the allocation whose final state it snapshots, with one edge per allocation. The
     // analysis resolves constants, so that any other reference residual (i.e., one that refers to state outside the
-    // body, which no valid body does) is rejected precisely, which is a defensive check (refer to the documentation of
-    // `ShardMapError::ReferenceResidualNotSupported`).
+    // body, which no valid body does) is rejected precisely. That is a defensive check for programs assembled without
+    // the usual validations, because the only other root that the analysis can report is an external constant, which
+    // program builders reject, and the primal program's explicitly empty capture scope rejects unbound captures.
     let primal_input_ids = primal_program.input_ids();
     let primal_output_ids = primal_program.output_ids();
     let primal_output_types = primal_program.output_types();
@@ -5457,8 +5510,11 @@ where
                     }
                     _ => {
                         let residual_index = position - output_count;
-                        let error = ShardMapError::ReferenceResidualNotSupported { residual_index };
-                        return Err(ProgramError::from(error).into());
+                        return Err(ProgramError::MalformedProgram(format!(
+                            "`{SHARD_MAP_OPERATION_NAME}` residual #{residual_index} is a reference that is neither a \
+                             body input nor allocated in the body",
+                        ))
+                        .into());
                     }
                 }
             }
@@ -6034,10 +6090,10 @@ fn local_accumulator_destinations<V: Value<Type = ArrayIrType>, O: Operation<Typ
 ///
 /// # Errors
 ///
-/// Returns [`ShardMapError::CotangentTypeMismatch`] when `contribution` differs from `target` in more than its
-/// placement and memory kind (i.e., in its element type, shape, layout, reference kind, mesh axes, manual variation, or
-/// reduction state), which no well-formed boundary produces (refer to the documentation of that variant), and the
-/// errors of staging the reconciling operations otherwise.
+/// Returns [`ProgramError::MalformedProgram`] when `contribution` differs from `target` in more than its placement and
+/// memory kind (i.e., in its element type, shape, layout, reference kind, mesh axes, manual variation, or reduction
+/// state), which no well-formed boundary produces, because boundary validation and transposed assembly preserve all of
+/// them, and the errors of staging the reconciling operations otherwise.
 fn reconcile_input_cotangent<V: Value<Type = ArrayIrType>, O>(
     context: &TracingContext<V, O>,
     input_index: usize,
@@ -6056,13 +6112,14 @@ where
     if actual == *target {
         return Ok(contribution);
     }
-    let mismatch = || ShardMapError::CotangentTypeMismatch {
-        input_index,
-        expected: Box::new(target.clone()),
-        actual: Box::new(actual.clone()),
+    let mismatch = || {
+        ProgramError::MalformedProgram(format!(
+            "`{SHARD_MAP_OPERATION_NAME}` transposition produced cotangent type `{actual}` for input #{input_index}, \
+             which cannot be reconciled with the expected cotangent type `{target}`",
+        ))
     };
     let (ArrayIrType::Array(actual_array), ArrayIrType::Array(target_array)) = (&actual, target) else {
-        return Err(mismatch().into());
+        return Err(mismatch());
     };
     let compatible = actual_array.data_type() == target_array.data_type()
         && actual_array.shape() == target_array.shape()
@@ -6082,7 +6139,7 @@ where
             (None, None) => true,
         };
     if !compatible {
-        return Err(mismatch().into());
+        return Err(mismatch());
     }
 
     // Step 1: `reshard` to the caller's placement over `Explicit` axes, in the frame of the caller's mesh, unless the
@@ -6633,8 +6690,13 @@ fn shard_map_within_named_axes(
         }
     }
     let enclosing_manual_axes = enclosing_named_axes.iter().map(|(name, _)| name.as_str()).collect::<HashSet<_>>();
-    let boundary =
-        ShardMapBoundary::new_within(mesh, input_shardings, output_shardings, manual_axes, &enclosing_manual_axes)?;
+    let boundary = ShardMapBoundary::new_within(
+        mesh,
+        input_shardings,
+        output_shardings,
+        manual_axes.into(),
+        &enclosing_manual_axes,
+    )?;
     let mut visited_names = HashSet::new();
     for (name, binding) in named_axes {
         if visited_names.insert(name.as_str())
@@ -7888,7 +7950,7 @@ mod tests {
             result,
             Err(ShardMapError::Sharding(ShardingError::ExpectedManualMeshAxis { name: "model".to_string() })),
         );
-        assert_eq!(result.unwrap_err().to_string(), "mesh axis `model` must have type manual");
+        assert_eq!(result.unwrap_err().to_string(), "mesh axis `model` must have type `manual`");
     }
 
     #[test]
@@ -7921,8 +7983,8 @@ mod tests {
         );
         assert_eq!(
             result,
-            Err(ShardMapError::ManualAxisMustPrecedeFreeAxis {
-                value_kind: "input",
+            Err(ShardMapError::FreeAxisPrecedesManualAxis {
+                value_kind: ShardMapValueKind::Input,
                 value_index: 0,
                 dimension: 0,
                 free_axis_name: "model".to_string(),
@@ -7931,7 +7993,8 @@ mod tests {
         );
         assert_eq!(
             result.unwrap_err().to_string(),
-            "input sharding #0 dimension #0 uses free axis `model` more major than manual axis `data`",
+            "`shard_map` input sharding #0 lists axis `model` before active manual axis `data` in dimension #0, but \
+             the active manual axes of a `shard_map` must precede its other axes",
         );
     }
 
@@ -8105,17 +8168,17 @@ mod tests {
         let result = boundary.global_input_type(0, &input_type);
         assert_eq!(
             result,
-            Err(ShardMapError::ShardingStateMismatch {
-                value_kind: "input",
+            Err(ShardMapError::ReductionStateMismatch {
+                value_kind: ShardMapValueKind::Input,
                 value_index: 0,
-                state_kind: "reduced axes",
+                state_kind: ReductionStateKind::Reduced,
                 expected: vec!["x".to_string()],
                 actual: vec!["y".to_string()],
             }),
         );
         assert_eq!(
             result.unwrap_err().to_string(),
-            "input type #0 has reduced axes [`y`], but `shard_map` expects [`x`]",
+            "`shard_map` input type #0 has reduced axes [`y`], but its boundary sharding requires [`x`]",
         );
     }
 
@@ -8140,8 +8203,8 @@ mod tests {
         );
         assert_eq!(
             result.unwrap_err().to_string(),
-            "input type #0 is placed over mesh `['x'=2:manual, 'y'=2:explicit]`, whose axes differ from those of the \
-             `shard_map` mesh `['x'=2:manual]`",
+            "`shard_map` input #0 is placed over mesh `['x'=2:manual, 'y'=2:explicit]`, whose axes differ from those \
+             of the `shard_map` mesh `['x'=2:manual]`",
         );
     }
 
@@ -8182,17 +8245,17 @@ mod tests {
         let result = boundary.global_input_type(0, &input_type);
         assert_eq!(
             result,
-            Err(ShardMapError::ShardingStateMismatch {
-                value_kind: "input",
+            Err(ShardMapError::ReductionStateMismatch {
+                value_kind: ShardMapValueKind::Input,
                 value_index: 0,
-                state_kind: "unreduced axes",
+                state_kind: ReductionStateKind::Unreduced,
                 expected: Vec::new(),
                 actual: vec!["x".to_string()],
             }),
         );
         assert_eq!(
             result.unwrap_err().to_string(),
-            "input type #0 has unreduced axes [`x`], but `shard_map` expects []",
+            "`shard_map` input type #0 has unreduced axes [`x`], but its boundary sharding requires []",
         );
     }
 
@@ -8310,7 +8373,7 @@ mod tests {
         let result = boundary.local_input_type(0, &f32_vector_type(10));
         assert_eq!(
             result,
-            Err(ShardMapError::ManualAxisIntroducesPadding {
+            Err(ShardMapError::UnevenManualPartition {
                 input_index: 0,
                 dimension: 0,
                 dimension_size: 10,
@@ -8319,7 +8382,8 @@ mod tests {
         );
         assert_eq!(
             result.unwrap_err().to_string(),
-            "input sharding #0 dimension #0 has size 10, which is not divisible by manual partition count 3",
+            "`shard_map` input sharding #0 splits dimension #0 of size 10 into 3 manual partitions, which do not \
+             divide it evenly",
         );
     }
 
@@ -8335,13 +8399,13 @@ mod tests {
         let result = boundary.local_input_type(0, &f32_vector_type(8));
         assert_eq!(
             result,
-            Err(ShardMapError::Overflow {
+            Err(ShardMapError::ArithmeticOverflow {
                 context: "computing the manual partition count of input #0 dimension #0".to_string(),
             }),
         );
         assert_eq!(
             result.unwrap_err().to_string(),
-            "overflow while computing the manual partition count of input #0 dimension #0",
+            "integer overflow in `shard_map` while computing the manual partition count of input #0 dimension #0",
         );
     }
 
@@ -8358,9 +8422,17 @@ mod tests {
         let result = boundary.local_input_type(0, &ArrayType::new_static(DataType::F32, [8, 4]));
         assert_eq!(
             result,
-            Err(ShardMapError::RankMismatch { value_kind: "input", value_index: 0, sharding_rank: 1, shape_rank: 2 }),
+            Err(ShardMapError::ShardingRankMismatch {
+                value_kind: ShardMapValueKind::Input,
+                value_index: 0,
+                sharding_rank: 1,
+                shape_rank: 2
+            }),
         );
-        assert_eq!(result.unwrap_err().to_string(), "input sharding #0 has rank 1, but the provided shape has rank 2");
+        assert_eq!(
+            result.unwrap_err().to_string(),
+            "`shard_map` input sharding #0 has rank 1, but the input type has rank 2",
+        );
     }
 
     #[test]
@@ -8380,12 +8452,13 @@ mod tests {
         let result = boundary.local_input_type(0, &dynamic_type);
         assert_eq!(
             result,
-            Err(ShardMapError::DynamicShapeNotSupported { value_kind: "input", value_index: 0, dimension: 0 }),
+            Err(ShardMapError::DynamicShapeNotSupported {
+                value_kind: ShardMapValueKind::Input,
+                value_index: 0,
+                dimension: 0
+            }),
         );
-        assert_eq!(
-            result.unwrap_err().to_string(),
-            "input type #0 dimension #0 must be static at a `shard_map` boundary",
-        );
+        assert_eq!(result.unwrap_err().to_string(), "dimension #0 of `shard_map` input type #0 must be static");
     }
 
     #[test]
@@ -8403,17 +8476,17 @@ mod tests {
         let result = boundary.local_input_type(0, &unreduced_type);
         assert_eq!(
             result,
-            Err(ShardMapError::ShardingStateMismatch {
-                value_kind: "input",
+            Err(ShardMapError::ReductionStateMismatch {
+                value_kind: ShardMapValueKind::Input,
                 value_index: 0,
-                state_kind: "unreduced axes",
+                state_kind: ReductionStateKind::Unreduced,
                 expected: Vec::new(),
                 actual: vec!["x".to_string()],
             }),
         );
         assert_eq!(
             result.unwrap_err().to_string(),
-            "input type #0 has unreduced axes [`x`], but `shard_map` expects []",
+            "`shard_map` input type #0 has unreduced axes [`x`], but its boundary sharding requires []",
         );
     }
 
@@ -8545,17 +8618,17 @@ mod tests {
         let result = boundary.global_output_type(0, &local_output_type);
         assert_eq!(
             result,
-            Err(ShardMapError::ShardingStateMismatch {
-                value_kind: "output",
+            Err(ShardMapError::ReductionStateMismatch {
+                value_kind: ShardMapValueKind::Output,
                 value_index: 0,
-                state_kind: "unreduced axes",
+                state_kind: ReductionStateKind::Unreduced,
                 expected: vec!["y".to_string()],
                 actual: Vec::new(),
             }),
         );
         assert_eq!(
             result.unwrap_err().to_string(),
-            "output type #0 has unreduced axes [], but `shard_map` expects [`y`]",
+            "`shard_map` output type #0 has unreduced axes [], but its boundary sharding requires [`y`]",
         );
 
         // A body output that is unreduced along `y` itself is assembled as the pending sum that the sharding declares.
@@ -8595,17 +8668,17 @@ mod tests {
         let result = boundary.global_output_type(0, &local_output_type);
         assert_eq!(
             result,
-            Err(ShardMapError::ShardingStateMismatch {
-                value_kind: "output",
+            Err(ShardMapError::ReductionStateMismatch {
+                value_kind: ShardMapValueKind::Output,
                 value_index: 0,
-                state_kind: "unreduced axes",
+                state_kind: ReductionStateKind::Unreduced,
                 expected: Vec::new(),
                 actual: vec!["y".to_string()],
             }),
         );
         assert_eq!(
             result.unwrap_err().to_string(),
-            "output type #0 has unreduced axes [`y`], but `shard_map` expects []",
+            "`shard_map` output type #0 has unreduced axes [`y`], but its boundary sharding requires []",
         );
     }
 
@@ -8625,17 +8698,17 @@ mod tests {
         );
         assert_eq!(
             result,
-            Err(ShardMapError::ShardingStateMismatch {
-                value_kind: "output",
+            Err(ShardMapError::ReductionStateMismatch {
+                value_kind: ShardMapValueKind::Output,
                 value_index: 0,
-                state_kind: "reduced axes",
+                state_kind: ReductionStateKind::Reduced,
                 expected: vec!["x".to_string()],
                 actual: Vec::new(),
             }),
         );
         assert_eq!(
             result.unwrap_err().to_string(),
-            "output type #0 has reduced axes [], but `shard_map` expects [`x`]",
+            "`shard_map` output type #0 has reduced axes [], but its boundary sharding requires [`x`]",
         );
     }
 
@@ -8659,7 +8732,7 @@ mod tests {
         );
         assert_eq!(
             result.unwrap_err().to_string(),
-            "output type #0 still varies along manual axis `x`, but its output sharding does not mention it",
+            "`shard_map` body output #0 varies along active manual axis `x`, which its output sharding does not tile",
         );
         assert_eq!(
             boundary.with_check_output_replication(false).global_output_type(0, &local_output_type),
@@ -8705,17 +8778,17 @@ mod tests {
         let result = boundary.global_output_type(0, &local_output_type);
         assert_eq!(
             result,
-            Err(ShardMapError::ShardingStateMismatch {
-                value_kind: "output",
+            Err(ShardMapError::ReductionStateMismatch {
+                value_kind: ShardMapValueKind::Output,
                 value_index: 0,
-                state_kind: "unreduced axes",
+                state_kind: ReductionStateKind::Unreduced,
                 expected: Vec::new(),
                 actual: vec!["x".to_string()],
             }),
         );
         assert_eq!(
             result.unwrap_err().to_string(),
-            "output type #0 has unreduced axes [`x`], but `shard_map` expects []",
+            "`shard_map` output type #0 has unreduced axes [`x`], but its boundary sharding requires []",
         );
     }
 
@@ -8728,9 +8801,17 @@ mod tests {
         let result = boundary.global_output_type(0, &local_output_type);
         assert_eq!(
             result,
-            Err(ShardMapError::RankMismatch { value_kind: "output", value_index: 0, sharding_rank: 1, shape_rank: 2 }),
+            Err(ShardMapError::ShardingRankMismatch {
+                value_kind: ShardMapValueKind::Output,
+                value_index: 0,
+                sharding_rank: 1,
+                shape_rank: 2
+            }),
         );
-        assert_eq!(result.unwrap_err().to_string(), "output sharding #0 has rank 1, but the provided shape has rank 2");
+        assert_eq!(
+            result.unwrap_err().to_string(),
+            "`shard_map` output sharding #0 has rank 1, but the output type has rank 2",
+        );
     }
 
     #[test]
@@ -8744,12 +8825,13 @@ mod tests {
         let result = boundary.global_output_type(0, &dynamic_type);
         assert_eq!(
             result,
-            Err(ShardMapError::DynamicShapeNotSupported { value_kind: "output", value_index: 0, dimension: 0 }),
+            Err(ShardMapError::DynamicShapeNotSupported {
+                value_kind: ShardMapValueKind::Output,
+                value_index: 0,
+                dimension: 0
+            }),
         );
-        assert_eq!(
-            result.unwrap_err().to_string(),
-            "output type #0 dimension #0 must be static at a `shard_map` boundary",
-        );
+        assert_eq!(result.unwrap_err().to_string(), "dimension #0 of `shard_map` output type #0 must be static");
     }
 
     #[test]
@@ -8769,13 +8851,13 @@ mod tests {
         let result = boundary.global_output_type(0, &local_output_type);
         assert_eq!(
             result,
-            Err(ShardMapError::Overflow {
+            Err(ShardMapError::ArithmeticOverflow {
                 context: "computing the manual partition count of output #0 dimension #0".to_string(),
             }),
         );
         assert_eq!(
             result.unwrap_err().to_string(),
-            "overflow while computing the manual partition count of output #0 dimension #0",
+            "integer overflow in `shard_map` while computing the manual partition count of output #0 dimension #0",
         );
 
         // Scaling a huge local extent by its manual partition count overflows as well.
@@ -8788,11 +8870,13 @@ mod tests {
         let result = boundary.global_output_type(0, &local_output_type);
         assert_eq!(
             result,
-            Err(ShardMapError::Overflow { context: "computing the global size of output #0 dimension #0".to_string() }),
+            Err(ShardMapError::ArithmeticOverflow {
+                context: "computing the global size of output #0 dimension #0".to_string()
+            }),
         );
         assert_eq!(
             result.unwrap_err().to_string(),
-            "overflow while computing the global size of output #0 dimension #0",
+            "integer overflow in `shard_map` while computing the global size of output #0 dimension #0",
         );
     }
 
@@ -9038,8 +9122,8 @@ mod tests {
             &result,
             Err(error @ ShardMapError::OutputNotVaryingAlongTiledManualAxis { output_index: 0, axis_name })
                 if axis_name == "x"
-                    && error.to_string() == "`shard_map` body output #0 must vary along tiled manual axis `x`; \
-                        insert `parallel_vary` before returning the output",
+                    && error.to_string() == "`shard_map` body output #0 does not vary along active manual axis `x`, \
+                     which its output sharding tiles (insert `parallel_vary` before returning it)",
         ));
     }
 
@@ -9048,7 +9132,7 @@ mod tests {
         let body = identity_body(f32_scalar_type());
         let result = ShardMapOperation::from_program(&body, Vec::new(), single_input_test_shard_map());
         assert_eq!(result, Err(ShardMapError::InputTypeCountMismatch { expected: 1, actual: 0 }));
-        assert_eq!(result.unwrap_err().to_string(), "got 0 global input type(s), but `shard_map` expects 1");
+        assert_eq!(result.unwrap_err().to_string(), "`shard_map` expects 1 global input type(s) but got 0");
     }
 
     #[test]
@@ -9060,7 +9144,7 @@ mod tests {
             ShardMapBoundary::new(mesh.clone(), vec![Sharding::replicated(mesh, 0)], Vec::new(), Vec::new()).unwrap();
         let result = ShardMapOperation::from_program(&body, vec![f32_scalar_type().into()], boundary);
         assert_eq!(result, Err(ShardMapError::OutputTypeCountMismatch { expected: 0, actual: 1 }));
-        assert_eq!(result.unwrap_err().to_string(), "got 1 output type(s), but `shard_map` expects 0");
+        assert_eq!(result.unwrap_err().to_string(), "`shard_map` expects 0 global output type(s) but got 1");
     }
 
     #[test]
@@ -9152,7 +9236,7 @@ mod tests {
             ShardMapOperation::from_program(&body, vec![ReferenceType::new(global_type).into()], boundary),
             Err(ShardMapError::UncheckedReferenceReductionStateNotSupported {
                 input_index: 0,
-                state_kind: "reduced",
+                state_kind: ReductionStateKind::Reduced,
                 axis_name: "x".to_string(),
             }),
         );
@@ -9322,7 +9406,7 @@ mod tests {
     fn test_shard_map_operation_with_output_forwarding_rejects_output_forwarding_count_mismatch() {
         let result = forwarding_reference_shard_map().0.with_output_forwarding(vec![None]);
         assert_eq!(result, Err(ShardMapError::OutputForwardingCountMismatch { expected: 2, actual: 1 }));
-        assert_eq!(result.unwrap_err().to_string(), "got 1 output forwarding(s), but `shard_map` expects 2");
+        assert_eq!(result.unwrap_err().to_string(), "`shard_map` expects 2 output forwarding entries but got 1");
     }
 
     #[test]
@@ -9539,8 +9623,8 @@ mod tests {
         );
         assert_eq!(
             result.unwrap_err().to_string(),
-            "`shard_map` body output #0 must vary along tiled manual axis `x`; insert `parallel_vary` before \
-             returning the output",
+            "`shard_map` body output #0 does not vary along active manual axis `x`, which its output sharding tiles \
+             (insert `parallel_vary` before returning it)",
         );
 
         // Attaching the body through a program builder runs the same validation.
@@ -9596,7 +9680,8 @@ mod tests {
         assert_eq!(result, Err(ShardMapError::OrderedIoNotSupported));
         assert_eq!(
             result.unwrap_err().to_string(),
-            "`shard_map` bodies require `DeviceOrderedIo` because `OrderedIo` demands one order across devices",
+            "`shard_map` bodies cannot have the `OrderedIo` effect, which orders I/O across devices, so use \
+             `DeviceOrderedIo` instead",
         );
         let operation = ShardMapOperation::from_program(
             &device_ordered_body,
@@ -9656,8 +9741,8 @@ mod tests {
         );
         assert_eq!(
             expected.to_string(),
-            "input type #0 already varies along manual axis `x` of the `shard_map`, which an enclosing manual region \
-             therefore already made manual",
+            "`shard_map` input #0 varies along mesh axis `x`, so that axis is already manual in an enclosing manual \
+             region and the `shard_map` cannot make it manual again",
         );
 
         // A map built from its boundary (e.g., as a transformation could) bypasses the checks of the frontend against
@@ -11072,7 +11157,8 @@ mod tests {
         let expected = ShardMapError::RepeatedReferenceInputAllocation { first_input_index: 0, second_input_index: 1 };
         assert_eq!(
             expected.to_string(),
-            "`shard_map` reference inputs #0 and #1 denote the same allocation; pass distinct allocations",
+            "`shard_map` reference inputs #0 and #1 denote the same allocation, but every reference input must denote \
+             its own",
         );
         assert!(matches!(
             program.discharge_references(0),
@@ -13192,10 +13278,9 @@ mod tests {
         assert_eq!(program.interpret(vec![f32_value(global_type, &[3.0])]), Err(ProgramError::from(expected.clone())));
         assert_eq!(
             expected.to_string(),
-            "the reference backend cannot interpret input #0 of a `shard_map` without manual-variation checking, which \
-             is unreduced along active manual axis `x`, because its arrays store logical values rather than the \
-             per-device summands that the body observes; use a backend whose arrays keep per-device buffers (e.g., \
-             XLA) instead",
+            "the reference backend does not support `shard_map` input #0 without manual-variation checking, because \
+             the input is unreduced along active manual axis `x` and reference arrays do not keep per-device summands \
+             (XLA arrays do)",
         );
     }
 
@@ -13948,8 +14033,7 @@ mod tests {
         assert_eq!(result, Err(ShardMapError::DynamicResidualNotSupported { residual_index: 3, dimension: 1 }));
         assert_eq!(
             result.unwrap_err().to_string(),
-            "residual #3 dimension #1 must be static to cross a `shard_map` boundary; dynamically shaped \
-             intermediates cannot be shared between split `shard_map` bodies",
+            "dimension #1 of residual #3 must be static to pass between the split bodies of a `shard_map`",
         );
     }
     #[test]
@@ -17083,7 +17167,7 @@ mod tests {
         ));
         assert_eq!(
             expected.to_string(),
-            "batching a `shard_map` places the batch axis on manual axis `y`, which the `shard_map` body uses",
+            "batching a `shard_map` places the batch axis on active manual axis `y`, which the `shard_map` body uses",
         );
     }
 
@@ -17158,44 +17242,100 @@ mod tests {
     }
 
     #[test]
-    fn test_shard_map_batching_rejects_batch_axes_placed_on_every_manual_axis() {
-        // A batch axis placed on every active manual axis would leave the batched map without a manual axis, so it is
-        // rejected even though no sharding names `x` and the body does not use it.
+    fn test_shard_map_batching_places_batch_axes_on_every_manual_axis() {
+        // A batch axis placed on the only active manual axis `x` releases it, which leaves the batched map without
+        // active manual axes, so its body runs once on the global values, which is what every device along `x`
+        // computed before, because no sharding names `x` and the body does not use it.
         let mesh = manual_mesh();
         let replicated = Sharding::replicated(mesh.clone(), 1);
-        let program = trace_test_program(
-            |inputs| {
-                vec![
-                    shard_map(
-                        |x: TestTracer| Ok(x.clone() + x),
-                        inputs[0].clone(),
-                        mesh.clone(),
-                        replicated.clone(),
-                        replicated.clone(),
-                        ShardMapOptions::new(),
-                    )
-                    .unwrap(),
-                ]
-            },
-            vec![f32_vector_type(4)],
-            Vec::new(),
-        );
-        let result = program.batched_with_threaded_extent(
-            DimensionValue::constant(3).unwrap().r#type().into_owned(),
-            ShardingDimension::sharded(["x"]),
-            &[BatchAxis::new(0)],
-            ProgramBatchingOutputAxesPolicy::Natural,
-        );
-        let expected = ShardMapError::BatchAxisPlacedOnEveryManualAxis;
-        assert!(matches!(
-            &result,
-            Err(BatchingError::Program(error)) if error.downcast_custom::<ShardMapError>() == Some(&expected),
-        ));
-        assert_eq!(
-            expected.to_string(),
-            "batching a `shard_map` places the batch axis on every manual axis of the `shard_map`, so no manual axis \
-             would remain",
-        );
+        for check_manual_variation in [true, false] {
+            let program = trace_test_program(
+                |inputs| {
+                    vec![
+                        shard_map(
+                            |x: TestTracer| Ok(x.clone() + x),
+                            inputs[0].clone(),
+                            mesh.clone(),
+                            replicated.clone(),
+                            replicated.clone(),
+                            ShardMapOptions::new().with_check_manual_variation(check_manual_variation),
+                        )
+                        .unwrap(),
+                    ]
+                },
+                vec![f32_vector_type(4)],
+                Vec::new(),
+            );
+            let batched = program
+                .batched_with_threaded_extent(
+                    DimensionValue::constant(2).unwrap().r#type().into_owned(),
+                    ShardingDimension::sharded(["x"]),
+                    &[BatchAxis::new(0)],
+                    ProgramBatchingOutputAxesPolicy::Natural,
+                )
+                .unwrap()
+                .into_parts()
+                .0;
+            let sharding = "{mesh<['x'=2:manual]>, [{'x'}, {}]}";
+            let global = format!("f32[2, 4][sharding={sharding}]");
+            let local = "f32[2, 4][sharding={mesh<['x'=2:manual]>, [{}, {}]}]";
+            let check = if check_manual_variation { "" } else { "\n    check_manual_variation=false," };
+            assert_eq!(
+                batched.to_string(),
+                formatdoc! {"
+                    lambda %0:dimension<2>, %1:f32[2, 4] .
+                    let %2:{global} = shard_map [
+                        mesh=['x'=2:manual],
+                        input_shardings=[{sharding}],
+                        output_shardings=[{sharding}],
+                        manual_axes=[],{check}
+                        global_input_types=[{global}],
+                        global_output_types=[{global}],
+                    ] %1 [
+                        body={{
+                            lambda %0:{local} .
+                            let %1:{local} = add %0 %0
+                            in (%1)
+                        }},
+                    ]
+                    in (%0, %2)"
+                },
+            );
+            let elements = (0..8).map(|element| element as f32).collect::<Vec<_>>();
+            let outputs = batched
+                .interpret(vec![
+                    TestValue::Dimension(DimensionValue::constant(2).unwrap()),
+                    f32_value(ArrayType::new_static(DataType::F32, [2, 4]), &elements),
+                ])
+                .unwrap();
+            let expected = elements.iter().map(|element| 2.0 * f64::from(*element)).collect::<Vec<_>>();
+            assert_eq!(arrays_f64(outputs[1..].to_vec()), vec![expected]);
+
+            // The transposed map has no active manual axes either, so it neither divides the cotangent nor sums it.
+            let pullback = batched.transpose_with_respect_to(&[1], &[CotangentDestinationKind::Return]).unwrap();
+            assert_eq!(
+                pullback.to_string(),
+                formatdoc! {"
+                    lambda %0:zero[], %1:{global}, %2:dimension<2> .
+                    let %3:{global} = shard_map [
+                        mesh=['x'=2:manual],
+                        input_shardings=[{sharding}],
+                        output_shardings=[{sharding}],
+                        manual_axes=[],{check}
+                        global_input_types=[{global}],
+                        global_output_types=[{global}],
+                    ] %1 [
+                        body={{
+                            lambda %0:{local} .
+                            let %1:{local} = add %0 %0
+                            in (%1)
+                        }},
+                    ]
+                        %4:f32[2, 4] = broadcast [output_type=f32[2, 4], output_axes=[0, 1]] %3
+                    in (%4)"
+                },
+            );
+        }
     }
 
     #[test]
@@ -17234,8 +17374,8 @@ mod tests {
         ));
         assert_eq!(
             expected.to_string(),
-            "batching a `shard_map` places the batch axis on manual axis `y`, but the `shard_map` body has the \
-             `DeviceOrderedIo` effect, which requires every manual axis to remain manual",
+            "batching a `shard_map` places the batch axis on active manual axis `y`, but the `shard_map` body has the \
+             `DeviceOrderedIo` effect, which requires every active manual axis to remain manual",
         );
     }
 
@@ -17303,7 +17443,7 @@ mod tests {
         // A batch axis placed on `y` would partition the boundary values along an axis along which they are already
         // the per-device shards of the enclosing region.
         let expected = ShardMapError::ShardingNamesEnclosingManualAxis {
-            value_kind: "input",
+            value_kind: ShardMapValueKind::Input,
             value_index: 0,
             axis_name: "y".to_string(),
         };
@@ -21223,30 +21363,21 @@ mod tests {
             .unwrap();
         let result =
             reconcile_input_cotangent(&context, 0, context.input(sharded.clone().into()), &reduced.clone().into());
-        let expected = ShardMapError::CotangentTypeMismatch {
-            input_index: 0,
-            expected: Box::new(reduced.clone().into()),
-            actual: Box::new(sharded.clone().into()),
-        };
-        assert!(matches!(result, Err(error) if error.downcast_custom::<ShardMapError>() == Some(&expected)));
-        assert_eq!(
-            expected.to_string(),
-            format!(
-                "`shard_map` transposition produced cotangent type `{sharded}` for input #0, which cannot be \
-                 reconciled with the expected cotangent type `{reduced}`",
-            ),
+        let expected = format!(
+            "`shard_map` transposition produced cotangent type `{sharded}` for input #0, which cannot be reconciled \
+             with the expected cotangent type `{reduced}`",
         );
+        assert!(matches!(result, Err(ProgramError::MalformedProgram(message)) if message == expected));
 
         // So are cotangents of another shape or placed over another mesh.
         let longer = f32_vector_type(8).with_sharding(sharded_along_x()).unwrap();
         let result =
             reconcile_input_cotangent(&context, 1, context.input(sharded.clone().into()), &longer.clone().into());
-        let expected = ShardMapError::CotangentTypeMismatch {
-            input_index: 1,
-            expected: Box::new(longer.into()),
-            actual: Box::new(sharded.clone().into()),
-        };
-        assert!(matches!(result, Err(error) if error.downcast_custom::<ShardMapError>() == Some(&expected)));
+        let expected = format!(
+            "`shard_map` transposition produced cotangent type `{sharded}` for input #1, which cannot be reconciled \
+             with the expected cotangent type `{longer}`",
+        );
+        assert!(matches!(result, Err(ProgramError::MalformedProgram(message)) if message == expected));
         let other_mesh = LogicalMesh::new(vec![
             MeshAxis::new("x", 2, MeshAxisType::Manual).unwrap(),
             MeshAxis::new("y", 2, MeshAxisType::Explicit).unwrap(),
@@ -21257,12 +21388,11 @@ mod tests {
             .unwrap();
         let result =
             reconcile_input_cotangent(&context, 2, context.input(sharded.clone().into()), &other.clone().into());
-        let expected = ShardMapError::CotangentTypeMismatch {
-            input_index: 2,
-            expected: Box::new(other.into()),
-            actual: Box::new(sharded.into()),
-        };
-        assert!(matches!(result, Err(error) if error.downcast_custom::<ShardMapError>() == Some(&expected)));
+        let expected = format!(
+            "`shard_map` transposition produced cotangent type `{sharded}` for input #2, which cannot be reconciled \
+             with the expected cotangent type `{other}`",
+        );
+        assert!(matches!(result, Err(ProgramError::MalformedProgram(message)) if message == expected));
     }
 
     #[test]
@@ -23153,8 +23283,8 @@ mod tests {
         assert_eq!(result, Err(ShardMapError::MissingInputContext));
         assert_eq!(
             result.unwrap_err().to_string(),
-            "`shard_map` requires an input value to recover its context from; use the `shard_map` function of \
-             `ShardMap` to provide the context explicitly",
+            "`shard_map` requires at least one input to recover its context from, so call `ShardMap::shard_map` on a \
+             context instead",
         );
         let result = shard_map(
             |_: Vec<TestTracer>| -> Result<Vec<TestTracer>, ProgramError> {
@@ -23413,15 +23543,15 @@ mod tests {
                                 ShardMapOptions::new(),
                             );
                             let expected = ShardMapError::ShardingNamesEnclosingManualAxis {
-                                value_kind: "input",
+                                value_kind: ShardMapValueKind::Input,
                                 value_index: 0,
                                 axis_name: "x".to_string(),
                             };
                             assert_eq!(result, Err(expected));
                             assert_eq!(
                                 result.unwrap_err().to_string(),
-                                "input sharding #0 names mesh axis `x`, which is already manual in an enclosing manual \
-                                 region",
+                                "`shard_map` input sharding #0 names mesh axis `x`, which is already manual in an \
+                                 enclosing manual region",
                             );
                             Ok(x)
                         },
