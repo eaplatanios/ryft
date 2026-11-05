@@ -7,7 +7,7 @@ pub mod shardings;
 pub mod visualizations;
 
 pub use meshes::{Device, DeviceId, DeviceMesh, LogicalMesh, MeshAxis, MeshAxisType, ProcessIndex};
-pub use shardings::{Sharding, ShardingDimension};
+pub use shardings::{ReductionStateKind, Sharding, ShardingDimension};
 pub use visualizations::ShardingVisualization;
 
 /// Represents sharding-related errors.

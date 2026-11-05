@@ -738,6 +738,28 @@ impl Display for Sharding {
     }
 }
 
+/// Kind of reduction state that a [`Sharding`] carries along a mesh axis, which diagnostics use to name the set of axes
+/// that they refer to.
+#[derive(Copy, Clone, Debug, PartialEq, Eq, Hash)]
+pub enum ReductionStateKind {
+    /// State along the [`Sharding::unreduced_axes`] of a sharding, along which the devices hold summands of the value.
+    Unreduced,
+
+    /// State along the [`Sharding::reduced_axes`] of a sharding, along which the value is replicated but its cotangent
+    /// is unreduced.
+    Reduced,
+}
+
+impl Display for ReductionStateKind {
+    #[inline]
+    fn fmt(&self, formatter: &mut Formatter<'_>) -> std::fmt::Result {
+        match self {
+            Self::Unreduced => write!(formatter, "unreduced"),
+            Self::Reduced => write!(formatter, "reduced"),
+        }
+    }
+}
+
 #[cfg(test)]
 mod tests {
     use pretty_assertions::assert_eq;
