@@ -48,9 +48,9 @@ pub const RESHARD_OPERATION_NAME: &str = "reshard";
 /// Interpretation passes the value through and records the target on its type. Batching inserts the mapped axis's
 /// sharding into the target at the new batch axis, without the axes that are auto in the target mesh (which the target
 /// cannot name). Differentiation reshards the tangent to the same target, and transposition reshards the cotangent to
-/// the dual of the input's sharding, so that the input cotangent is distributed like the input. That dual must not
-/// name auto axes either, so an input whose type records a placement along auto axes (e.g., the placement of a
-/// concrete input) cannot be transposed.
+/// the explicit part of the dual of the input's sharding, so that the input cotangent is distributed like the input.
+/// The target cannot name auto axes, so placement along auto axes that the input's type records (e.g., that of a
+/// concrete input) is restored by a placement-only broadcast to the input's cotangent type.
 #[derive(Clone, Debug, PartialEq, Eq, Hash)]
 pub struct ReshardOperation {
     /// Target [`Sharding`] that the input is resharded to.
@@ -275,21 +275,25 @@ where
         _driver: &D,
         inputs: &[ArrayBatch<C::Value>],
     ) -> Result<Vec<ArrayBatch<C::Value>>, BatchingError> {
-        // The lifted reshard's target sharding gains the mapped axis's sharding (derived from the batched inputs via
-        // `ArrayBatch::sharding_for_inputs`) at the new batch dimension. A target can only name the axes that the type
-        // system governs, so the mapped axis loses its placement along the axes that are auto in the target mesh (e.g.,
-        // when `auto_axes` switches the axis that the batch is placed along), which leaves that placement to the
-        // compiler. Lifting needs only the batch axis's position and placement, never its extent, so mapped axes
-        // with dynamic extents lift as well.
+        // The lifted reshard's target sharding gains the placement of this batching level at the new batch dimension,
+        // as JAX's reshard batching rule places it along the level's `explicit_mesh_axis`. The level's placement rather
+        // than that of the input is used so that a batch dimension whose placement an earlier reshard left to the
+        // compiler (e.g., inside `auto_axes` that switches the axis that the batch is placed along) is placed along
+        // that axis again once the axis is explicit. A target can only name the axes that the type system governs, so
+        // the batch dimension loses its placement along the axes that are auto in (or absent from) the target mesh,
+        // which leaves that placement to the compiler. Lifting needs only the batch axis's position and placement,
+        // never its extent, so mapped axes with dynamic extents lift as well.
         check_count!("input", inputs, 1, ProgramError);
         let lifted_sharding = match inputs[0].batch_axis_position() {
             Some(batch_axis) => {
                 let target_mesh = self.sharding().mesh();
-                let batch_axis_sharding = match ArrayBatch::sharding_for_inputs(inputs)? {
+                let batch_axis_sharding = match context.axis_sharding().clone() {
                     ShardingDimension::Sharded(axis_names) => {
                         let axis_names = axis_names
                             .into_iter()
-                            .filter(|axis_name| target_mesh.axis_type(axis_name) != Some(MeshAxisType::Auto))
+                            .filter(|axis_name| {
+                                target_mesh.axis_type(axis_name).is_some_and(|r#type| r#type != MeshAxisType::Auto)
+                            })
                             .collect::<Vec<_>>();
                         if axis_names.is_empty() {
                             ShardingDimension::Replicated
@@ -354,7 +358,19 @@ impl_differentiable_operation! {
                         Some(input_cotangent_sharding) => {
                             // The operation carries only explicit placement; the input cotangent already carries
                             // the preserved manual reduction state, so it must not be requested as a transition.
-                            cotangent.reshard(&input_cotangent_sharding.without_manual_reduction_axes())?
+                            // A reshard cannot name auto axes either, so placement along auto axes that the input's
+                            // type records (e.g., that of a concrete input) is restored by a placement-only broadcast,
+                            // as `shard_map` transposition does for caller placements over auto axes.
+                            let target = input_cotangent_sharding.without_manual_reduction_axes().without_auto_axes();
+                            let resharded = cotangent.reshard(&target)?;
+                            if resharded.r#type().as_ref() == &input_cotangent_type {
+                                resharded
+                            } else {
+                                resharded.broadcast(
+                                    input_cotangent_type.clone(),
+                                    &(0..input_cotangent_type.shape().rank()).collect::<Vec<_>>(),
+                                )?
+                            }
                         },
                         None => cotangent.broadcast(
                             input_cotangent_type.clone(),

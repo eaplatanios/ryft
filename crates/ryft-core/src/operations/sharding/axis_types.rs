@@ -1171,11 +1171,23 @@ mod tests {
         assert_close(&program.interpret(matrix(Some(input_sharding.clone()))).unwrap(), &SINE);
 
         // A batch dimension placed along the switched axis loses that placement inside the switch, which leaves it to
-        // the compiler, and stays replicated over the original mesh afterwards, since batching derives its placement
-        // from the inputs of each reshard. JAX instead places it along `x` again on exit (`float32[4@x,2@y]`), because
-        // its batching rules remember the axis that the batch was placed along, with the same values.
+        // the compiler, and is placed along `x` again on exit, since the batching level remembers the placement of
+        // its batch, as in the JAX oracle `vmap auto_axes(x) over x-placed batch` (`float32[4@x,2@y]`).
         let (output_type, program) = trace("x").unwrap();
-        assert_eq!(output_type.sharding(), Some(&sharding(&mesh, &[None, Some("y")])));
+        assert_eq!(output_type.sharding(), Some(&input_sharding));
+        assert_eq!(
+            program.to_string(),
+            indoc! {"
+                lambda %0:f32[4, 2][sharding={mesh<['x'=2:explicit, 'y'=2:explicit]>, [{'x'}, {'y'}]}] .
+                let %1:f32[4, 2][sharding={mesh<['x'=2:auto, 'y'=2:explicit]>, [{}, {'y'}]}] = reshard \
+                        [sharding={mesh<['x'=2:auto, 'y'=2:explicit]>, [{}, {'y'}]}] %0
+                    %2:f32[4, 2][sharding={mesh<['x'=2:auto, 'y'=2:explicit]>, [{}, {'y'}]}] = sin %1
+                    %3:f32[4, 2][sharding={mesh<['x'=2:explicit, 'y'=2:explicit]>, [{'x'}, {'y'}]}] = reshard \
+                        [sharding={mesh<['x'=2:explicit, 'y'=2:explicit]>, [{'x'}, {'y'}]}] %2
+                in (%3)
+            "}
+            .trim_end(),
+        );
         assert_close(&program.interpret(matrix(Some(input_sharding.clone()))).unwrap(), &SINE);
     }
 

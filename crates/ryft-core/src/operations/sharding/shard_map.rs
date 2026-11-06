@@ -272,12 +272,13 @@ use crate::differentiation::{
 use crate::interpretation::{InterpretableOperation, InterpretationDriver};
 use crate::macros::check_count;
 use crate::operations::arithmetic::{AddOperation, DivOperation};
+use crate::operations::assertions::Assert;
 use crate::operations::collectives::axis_index::AxisIndexOperation;
 use crate::operations::collectives::parallel_all_gather::{
     PARALLEL_ALL_GATHER_OPERATION_NAME, ParallelAllGatherOperation, ParallelAllGatherOutputVariance,
 };
 use crate::operations::collectives::parallel_all_to_all::ParallelAllToAllOperation;
-use crate::operations::collectives::parallel_broadcast::ParallelBroadcastOperation;
+use crate::operations::collectives::parallel_broadcast::{ParallelBroadcastOperation, ParallelBroadcastSource};
 use crate::operations::collectives::parallel_cast::ParallelCastOperation;
 use crate::operations::collectives::parallel_permute::ParallelPermuteOperation;
 use crate::operations::collectives::parallel_ragged_all_to_all::ParallelRaggedAllToAllOperation;
@@ -4448,10 +4449,47 @@ where
             })?
         } else if let Some(payload) = operation.projected_payload::<ParallelBroadcastOperation>() {
             validate_axis_size(payload.axis_size())?;
+            let dynamic = payload.source() == ParallelBroadcastSource::Dynamic(());
+            check_count!("input", inputs, if dynamic { 2 } else { 1 }, ProgramError);
             self.grid.map_devices(|device| {
-                // Every device receives the value of the device at the source position of its group.
-                let output_type = collective_output_type(payload, arrays[device], extents, device)?;
-                with_array_type(arrays[self.grid.device_at(device, &axes, payload.source())], &output_type)
+                // Runtime roots are ordinary per-device inputs. Validate their types before decoding them and
+                // require agreement within this participant group before selecting its source.
+                let mut input_types = vec![arrays[device].r#type().into_owned()];
+                if dynamic {
+                    input_types.push(array_value(&inputs[1][device], name)?.r#type().into_owned());
+                }
+                let output_type = payload.infer_output_types(&input_types, &[])?.remove(0);
+                let source = match payload.source() {
+                    ParallelBroadcastSource::Static(source) => source,
+                    ParallelBroadcastSource::Dynamic(()) => {
+                        let (participants, _) = self.grid.participants(device, &axes, None)?;
+                        let sources = participants
+                            .iter()
+                            .map(|participant| {
+                                let source = array_value(&inputs[1][*participant], name)?;
+                                payload.infer_output_types(
+                                    &[arrays[*participant].r#type().into_owned(), source.r#type().into_owned()],
+                                    &[],
+                                )?;
+                                Ok(source.elements::<u64>()?[0])
+                            })
+                            .collect::<Result<Vec<_>, ProgramError>>()?;
+                        let minimum = sources.iter().copied().min().unwrap();
+                        let maximum = sources.iter().copied().max().unwrap();
+                        let minimum_value = Array::scalar(minimum)?;
+                        let maximum_value = Array::scalar(maximum)?;
+                        Array::scalar(minimum == maximum)?.assert(
+                            &format!("`{name}` runtime sources must agree across participants"),
+                            &[("minimum", minimum_value.clone()), ("maximum", maximum_value)],
+                        )?;
+                        Array::scalar(maximum < axis_size as u64)?.assert(
+                            &format!("`{name}` runtime source must be smaller than axis size {axis_size}"),
+                            &[("source", minimum_value)],
+                        )?;
+                        minimum as usize
+                    }
+                };
+                with_array_type(arrays[self.grid.device_at(device, &axes, source)], &output_type)
             })?
         } else {
             // `parallel_permute` is the only remaining collective that `collective_axis_name` recognizes.
@@ -7537,12 +7575,13 @@ mod tests {
         differentiate_at, rematerialize,
     };
     use crate::operations::arithmetic::{AddOperation, MulOperation, NegOperation, SubOperation};
+    use crate::operations::assertions::AssertionError;
     use crate::operations::collectives::CollectiveOptions;
     use crate::operations::collectives::axis_index::AxisIndex;
     use crate::operations::collectives::parallel_all_gather::ParallelAllGather;
     use crate::operations::collectives::parallel_all_to_all::ParallelAllToAll;
     use crate::operations::collectives::parallel_arg_extrema::ParallelArgExtrema;
-    use crate::operations::collectives::parallel_broadcast::ParallelBroadcast;
+    use crate::operations::collectives::parallel_broadcast::{PARALLEL_BROADCAST_OPERATION_NAME, ParallelBroadcast};
     use crate::operations::collectives::parallel_cast::{ParallelCast, ParallelCastTarget};
     use crate::operations::collectives::parallel_permute::ParallelPermute;
     use crate::operations::collectives::parallel_ragged_all_to_all::ParallelRaggedAllToAll;
@@ -14272,6 +14311,114 @@ mod tests {
             let cotangent = f32_value(cotangent_type, &[1.0, 2.0, 3.0, 4.0]);
             assert_eq!(arrays_f64(pullback.interpret(vec![cotangent]).unwrap()), vec![expected_gradient.to_vec()]);
         }
+    }
+
+    #[test]
+    fn test_shard_map_interpretation_parallel_broadcast_dynamic_source() {
+        let mesh = LogicalMesh::new(vec![MeshAxis::new("x", 2, MeshAxisType::Manual).unwrap()]).unwrap();
+        let sharded = Sharding::new(mesh.clone(), vec![ShardingDimension::sharded(["x"])]).unwrap();
+        let replicated = Sharding::replicated(mesh.clone(), 0);
+        let (_, program) = TracingContext::<ArrayIrValue<Array>, ArrayIrOperation<Array>>::trace(
+            |inputs: Vec<Tracer<TracingContext<ArrayIrValue<Array>, ArrayIrOperation<Array>>>>| {
+                let data = ValueProjection::<ArrayType>::into_projected(inputs[0].clone())?;
+                let source = ValueProjection::<ArrayType>::into_projected(inputs[1].clone())?;
+                Ok(vec![
+                    shard_map(
+                        |(data, source)| data.parallel_broadcast("x", &source),
+                        (data, source),
+                        mesh.clone(),
+                        (sharded.clone(), replicated.clone()),
+                        sharded.clone(),
+                        ShardMapOptions::new(),
+                    )?
+                    .into_value(),
+                ])
+            },
+            vec![
+                ArrayIrType::from(ArrayType::new_static(DataType::F32, [4])),
+                ArrayIrType::from(ArrayType::scalar(DataType::U64)),
+            ],
+        )
+        .unwrap();
+        assert_eq!(
+            program.to_string(),
+            indoc! {"
+                lambda %0:f32[4], %1:u64[] .
+                let %2:f32[4][sharding={mesh<['x'=2:manual]>, [{'x'}]}] = shard_map [
+                    mesh=['x'=2:manual],
+                    input_shardings=[{mesh<['x'=2:manual]>, [{'x'}]}, {mesh<['x'=2:manual]>, []}],
+                    output_shardings=[{mesh<['x'=2:manual]>, [{'x'}]}],
+                    manual_axes=['x'],
+                    global_input_types=[f32[4][sharding={mesh<['x'=2:manual]>, [{'x'}]}], \
+                        u64[][sharding={mesh<['x'=2:manual]>, []}]],
+                    global_output_types=[f32[4][sharding={mesh<['x'=2:manual]>, [{'x'}]}]],
+                ] %0 %1 [
+                    body={
+                        lambda %0:f32[2][sharding={mesh<['x'=2:manual]>, [{}], varying_manual={'x'}}], \
+                            %1:u64[][sharding={mesh<['x'=2:manual]>, []}] .
+                        let %2:f32[2][sharding={mesh<['x'=2:manual]>, [{}], varying_manual={'x'}}] = \
+                            parallel_broadcast [axes=\"x\", axis_size=2, source=dynamic, mesh=['x'=2:manual]] %0 %1
+                        in (%2)
+                    },
+                ]
+                in (%2)"
+            }
+        );
+        let rows = Array::vector(vec![1f32, 2.0, 3.0, 4.0]).unwrap();
+        assert_eq!(
+            program
+                .interpret(vec![ArrayIrValue::Array(rows.clone()), ArrayIrValue::Array(Array::scalar(1u64).unwrap())]),
+            Ok(vec![ArrayIrValue::Array(
+                Array::from_elements(
+                    ArrayType::new_static(DataType::F32, [4]).with_sharding(sharded.clone()).unwrap(),
+                    &[3f32, 4.0, 3.0, 4.0],
+                )
+                .unwrap()
+            )])
+        );
+        let error = program
+            .interpret(vec![ArrayIrValue::Array(rows), ArrayIrValue::Array(Array::scalar(u64::MAX).unwrap())])
+            .unwrap_err();
+        assert!(matches!(error.downcast_custom::<AssertionError>(),
+            Some(AssertionError::Failed { message, .. })
+                if message == &format!(
+                    "`{PARALLEL_BROADCAST_OPERATION_NAME}` runtime source must be smaller than axis size 2",
+                ),
+        ));
+    }
+
+    #[test]
+    fn test_shard_map_interpretation_parallel_broadcast_dynamic_source_differentiation() {
+        let mesh = LogicalMesh::new(vec![MeshAxis::new("x", 2, MeshAxisType::Manual).unwrap()]).unwrap();
+        let sharded = Sharding::new(mesh.clone(), vec![ShardingDimension::sharded(["x"])]).unwrap();
+        let replicated = Sharding::replicated(mesh.clone(), 0);
+        let (value, gradient) = differentiate_at((
+            ArrayIrValue::Array(Array::vector(vec![1f32, 2.0, 3.0, 4.0]).unwrap()),
+            ArrayIrValue::Array(Array::scalar(1u64).unwrap()),
+        ))
+        .value_and_gradient(|(data, source)| {
+            let data = ValueProjection::<ArrayType>::into_projected(data)?;
+            let source = ValueProjection::<ArrayType>::into_projected(source)?;
+            let output = shard_map(
+                |(data, source)| data.parallel_broadcast("x", &source),
+                (data, source),
+                mesh.clone(),
+                (sharded.clone(), replicated.clone()),
+                sharded.clone(),
+                ShardMapOptions::new(),
+            )?;
+            Ok(output.reduce(&[0], ReductionKind::Sum)?.into_value())
+        })
+        .unwrap();
+        assert_eq!(
+            value,
+            ArrayIrValue::Array(
+                Array::from_elements(ArrayType::scalar(DataType::F32).with_sharding(replicated).unwrap(), &[14f32])
+                    .unwrap()
+            )
+        );
+        assert_eq!(gradient.0, ArrayIrValue::Array(Array::vector(vec![0f32, 0.0, 2.0, 2.0]).unwrap()));
+        assert_eq!(gradient.1.r#type(), Cow::Owned(ArrayIrType::from(ArrayType::scalar(DataType::Zero))));
     }
 
     #[test]

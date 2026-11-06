@@ -31,14 +31,20 @@
 //!     operation, a `shard_map` is traced without values by invoking it on tracers (e.g., through
 //!     [`trace`](crate::trace)). Refer to the [`shard_map`](mod@shard_map) module for its complete
 //!     semantics, including the ownership contract for references that cross its boundary.
+//!   - The global [`auto_axes()`](fn@auto_axes) and [`explicit_axes()`](fn@explicit_axes) functions, which switch
+//!     selected mesh axes to [`Auto`](MeshAxisType::Auto) or [`Explicit`](MeshAxisType::Explicit) for the duration of
+//!     a function, mirroring JAX's `jax.sharding.auto_axes` and `jax.sharding.explicit_axes`. They retype the inputs
+//!     and outputs of the function through reshards and run the function inline, so they add no operation of their
+//!     own. Refer to the [`axis_types`](mod@axis_types) module for their conceptual model.
 //!
-//! Batching lifts the reshard and the sharding constraint by inserting an entry for the new batch axis into the
-//! target sharding (i.e., a reshard takes the mapped axis's own sharding, whereas a constraint leaves the new axis
-//! unconstrained for the compiler to fill). Backends lower both to the same sharding-constraint construct (e.g.,
-//! `sdy.sharding_constraint` in the XLA backend). A reshard lowers its target as is, since that target is the tracked
-//! output sharding, whereas a constraint lowers the merge of the input's tracked placement with its own auto-axis
-//! placement (refer to the documentation of [`ConstrainShardingOperation::lowered_sharding`] for more information),
-//! so that the emitted constraint never contradicts the type the program was checked against.
+//! Batching lifts the reshard and the sharding constraint by inserting an entry for the new batch axis into the target
+//! sharding (i.e., a reshard takes the mapped axis's own sharding without the axes that are auto in its target mesh,
+//! whereas a constraint leaves the new axis unconstrained for the compiler to fill). Backends lower both to the same
+//! sharding-constraint construct (e.g., `sdy.sharding_constraint` in the XLA backend). A reshard lowers its target,
+//! since that target is the tracked output sharding, whereas a constraint lowers the merge of the input's tracked
+//! placement with its own auto-axis placement (refer to the documentation of
+//! [`ConstrainShardingOperation::lowered_sharding`] for more information), so that the emitted constraint never
+//! contradicts the type the program was checked against.
 //!
 //! The [`Reshard`] and [`ConstrainSharding`] capabilities apply resharding and sharding constraints to every leaf
 //! of a structured value through primitive value dispatch, preserving its structure and static fields.
@@ -96,10 +102,12 @@ use crate::parameters::Parameter;
 #[cfg(doc)]
 use crate::arrays::{ArrayIrType, ArrayType, MeshAxisType, Sharding};
 
+pub mod axis_types;
 pub mod constrain_sharding;
 pub mod reshard;
 pub mod shard_map;
 
+pub use axis_types::{AxisTypesError, auto_axes, explicit_axes};
 pub use constrain_sharding::{
     CONSTRAIN_SHARDING_OPERATION_NAME, ConstrainSharding, ConstrainShardingDispatch, ConstrainShardingOperation,
 };
