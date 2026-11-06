@@ -993,8 +993,6 @@ where
     }
 }
 
-// TODO(eaplatanios): Review from here onwards.
-
 /// Interprets a runtime broadcast, including a packed unrelated batch of scalar roots when `source_batch_axis`
 /// is present. Primal interpretation validates roots; derived linear instructions reuse selection without effects.
 fn interpret_dynamic_parallel_broadcast<C: Domain<Type = ArrayType> + Fill<u64, C::Value>>(
@@ -1465,8 +1463,8 @@ mod tests {
 
     #[test]
     fn test_parallel_broadcast_interpretation() {
-        // Outside any binder, the single participant of a degenerate axis is its own source and keeps its value, while
-        // a larger axis has no per-item semantics.
+        // Outside any binder, the single participant of a degenerate axis is its own source and keeps its value,
+        // while a larger axis has no per-item semantics.
         let context = EagerContext::<Array, ArrayOperation<Array>>::new();
         let input = Array::vector(vec![1.0f32, 2.0]).unwrap();
         assert_eq!(
