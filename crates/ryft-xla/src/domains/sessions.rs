@@ -1,15 +1,23 @@
-use std::sync::{Arc, OnceLock};
+use std::sync::atomic::{AtomicU64, Ordering};
+use std::sync::{Arc, Mutex, OnceLock, Weak};
 
-use ryft_core::{ArrayType, CompilationContext, DeviceMesh, DiskCache, SpecializationCache};
+use ryft_core::{
+    ArrayType, CapturingContext, CompilationContext, Context, DeviceMesh, DiskCache, ImportingContext,
+    NestedTracingContext, ProgramError, SpecializationCache, TracingContext, TypeError,
+};
 use ryft_pjrt::Client;
 
+use crate::arrays::RetainedArray;
 use crate::domains::Domain;
-use crate::domains::eager::{EAGER_DISPATCH_CACHE_CAPACITY, EagerDispatchKey};
+use crate::domains::eager::{EAGER_DISPATCH_CACHE_CAPACITY, EagerDispatchKey, EagerDispatchProgram};
 use crate::domains::effects::EffectScope;
-use crate::domains::programs::CompiledProgram;
 use crate::domains::runtimes::{RuntimeExtensions, RuntimeRegistry};
 use crate::domains::targets::Target;
-use crate::{Array, Error};
+use crate::experimental::ops::{Constant, Operation, SessionConstant, SessionConstantOwner};
+use crate::{Array, Error, Value};
+
+/// Source of the process-unique [`Session::id`]s.
+static NEXT_SESSION_ID: AtomicU64 = AtomicU64::new(0);
 
 // TODO(eaplatanios): Review this module.
 
@@ -63,6 +71,9 @@ use crate::{Array, Error};
 /// }
 /// ```
 pub struct Session<'c> {
+    /// Process-unique identifier of this session, which [`SessionConstant`] handles use to refer to it.
+    id: u64,
+
     /// Externally owned client, which outlives cached executables and effect carriers.
     client: &'c Client<'c>,
 
@@ -75,13 +86,18 @@ pub struct Session<'c> {
 
     /// Compiled programs of eager operation applications, keyed in front of tracing and lowering. Refer to the
     /// documentation of [`EagerDispatchKey`] for information on what the key captures.
-    pub(super) eager_dispatch_cache: SpecializationCache<EagerDispatchKey, Arc<CompiledProgram<'c>>>,
+    pub(super) eager_dispatch_cache: SpecializationCache<EagerDispatchKey, EagerDispatchProgram<'c>>,
 
     /// Default ordering and completion scope shared by domains and arrays created through this session.
     pub(super) default_effect_scope: Arc<EffectScope<'c>>,
 
     /// Client-associated runtime extensions and ownership of launches borrowing their resources.
     pub(super) runtimes: RuntimeRegistry<'c>,
+
+    /// Arrays that [`SessionConstant`] handles refer to, indexed by [`SessionConstant::index`]. A [`None`] entry was
+    /// reclaimed and may be reused. Refer to [`Self::retain_constant`] for information on how arrays enter and leave
+    /// this table.
+    constants: Mutex<Vec<Option<RetainedConstant<'c>>>>,
 }
 
 impl<'c> Session<'c> {
@@ -105,12 +121,14 @@ impl<'c> Session<'c> {
         extensions: RuntimeExtensions<'c>,
     ) -> Arc<Self> {
         Arc::new(Self {
+            id: NEXT_SESSION_ID.fetch_add(1, Ordering::Relaxed),
             client,
             target: OnceLock::new(),
             cache,
             eager_dispatch_cache: SpecializationCache::new(EAGER_DISPATCH_CACHE_CAPACITY),
             default_effect_scope: Arc::new(EffectScope::default()),
             runtimes: RuntimeRegistry::new(client, extensions),
+            constants: Mutex::new(Vec::new()),
         })
     }
 
@@ -188,20 +206,138 @@ impl<'c> Session<'c> {
     pub fn acknowledge_effect_errors(&self) -> Result<(), Error> {
         self.default_effect_scope.acknowledge()
     }
+
+    /// Retains the storage of `array` and returns a [`SessionConstant`] handle that refers to it. The storage stays
+    /// retained for as long as any handle to it exists (refer to [`SessionConstant`]). Retaining an array whose storage
+    /// a live handle already refers to returns a handle to the same entry, so that repeatedly importing the same
+    /// captured array (e.g., the weights that a compiled function captures) does not grow the table. Entries without
+    /// handles are reclaimed here, which releases their storage and makes their positions reusable.
+    pub(crate) fn retain_constant(&self, array: &Array<'c>) -> SessionConstant {
+        let mut constants = self.constants.lock().unwrap_or_else(std::sync::PoisonError::into_inner);
+        for constant in constants.iter_mut() {
+            if constant.as_ref().is_some_and(|constant| constant.owner.strong_count() == 0) {
+                *constant = None;
+            }
+        }
+        let existing = constants.iter().enumerate().find_map(|(index, constant)| {
+            let constant = constant.as_ref().filter(|constant| constant.storage.retains(array))?;
+            Some((index, constant.owner.upgrade()?, constant.storage.r#type().clone()))
+        });
+        if let Some((index, owner, r#type)) = existing {
+            return SessionConstant::new(self.id, index, r#type, owner);
+        }
+        let owner = Arc::new(SessionConstantOwner);
+        let constant = RetainedConstant { owner: Arc::downgrade(&owner), storage: array.retain() };
+        let r#type = constant.storage.r#type().clone();
+        let index = match constants.iter().position(Option::is_none) {
+            Some(index) => {
+                constants[index] = Some(constant);
+                index
+            }
+            None => {
+                constants.push(Some(constant));
+                constants.len() - 1
+            }
+        };
+        SessionConstant::new(self.id, index, r#type, owner)
+    }
+
+    /// Returns a new [`Array`] that belongs to `domain` and shares the storage that `constant` refers to.
+    ///
+    /// # Errors
+    ///
+    /// Returns a [`TypeError`] if `constant` was not retained by this session.
+    pub(crate) fn constant(&self, domain: &Domain<'c>, constant: &SessionConstant) -> Result<Array<'c>, ProgramError> {
+        if constant.session() != self.id {
+            return Err(TypeError::invalid(format!(
+                "session constant {constant} belongs to session #{} but was resolved by session #{}",
+                constant.session(),
+                self.id,
+            ))
+            .into());
+        }
+        let constants = self.constants.lock().unwrap_or_else(std::sync::PoisonError::into_inner);
+        let retained = constants
+            .get(constant.index())
+            .and_then(Option::as_ref)
+            .filter(|retained| std::ptr::eq(retained.owner.as_ptr(), Arc::as_ptr(constant.owner())))
+            .ok_or_else(|| {
+                TypeError::invalid(format!("session constant {constant} is not in the constant table of its session"))
+            })?;
+        Ok(retained.storage.to_array(domain))
+    }
+
+    /// Returns the number of arrays that this session currently retains for [`SessionConstant`] handles, including
+    /// arrays whose last handle was released but that the session has not reclaimed yet.
+    #[cfg(test)]
+    pub(crate) fn retained_constant_count(&self) -> usize {
+        let constants = self.constants.lock().unwrap_or_else(std::sync::PoisonError::into_inner);
+        constants.iter().filter(|constant| constant.is_some()).count()
+    }
+}
+
+/// Entry of the constant table of a [`Session`].
+struct RetainedConstant<'c> {
+    /// Weak reference to the token that every [`SessionConstant`] handle to this entry shares. The entry may be
+    /// reclaimed once the token is released.
+    owner: Weak<SessionConstantOwner>,
+
+    /// Retained storage of the array.
+    storage: RetainedArray<'c>,
+}
+
+/// Import path of [`ImportingContext`] through which a trace whose capture table holds constants rather than runtime
+/// values (i.e., one whose [`CapturingContext::Capture`] is [`Constant`], such as the body of a
+/// [`rematerialize`](ryft_core::rematerialize) or [`composite`](ryft_core::composite) call) imports runtime XLA
+/// [`Value`]s. Arrays are retained by their [`Session`] for as long as a handle to them exists (once per distinct
+/// storage) and enter the trace as [`Constant::Session`] handles, dimensions enter as immediate [`Constant::Dimension`]s, and references are
+/// rejected because their state cannot be shared with a trace that outlives the current transform.
+pub struct ThroughSession;
+
+/// Converts `value` into the immediate [`Constant`] that a constant-capturing trace stages for it.
+fn session_constant<'c>(value: Value<'c>) -> Result<Constant, ProgramError> {
+    match value {
+        Value::Array(array) => Ok(Constant::Session(array.backend_domain().session().retain_constant(&array))),
+        Value::Dimension(dimension) => Ok(Constant::Dimension(dimension.into_value())),
+        Value::Reference(_) => {
+            Err(TypeError::invalid("cannot import an xla reference into a trace whose capture table holds constants")
+                .into())
+        }
+    }
+}
+
+impl<'c> ImportingContext<Domain<'c>, ThroughSession> for TracingContext<Constant, Operation, Constant> {
+    #[inline]
+    fn import(&self, value: Value<'c>) -> Result<Self::Value, ProgramError> {
+        self.lift(session_constant(value)?)
+    }
+}
+
+impl<'c, C: CapturingContext<Capture = Constant>> ImportingContext<Domain<'c>, ThroughSession>
+    for NestedTracingContext<C>
+where
+    Self: Context<Constant = Constant>,
+{
+    #[inline]
+    fn import(&self, value: Value<'c>) -> Result<Self::Value, ProgramError> {
+        self.lift(session_constant(value)?)
+    }
 }
 
 #[cfg(test)]
 mod tests {
     #[cfg(feature = "cuda-13")]
     use pretty_assertions::assert_eq;
+    use ryft_core::DataType;
     #[cfg(feature = "cuda-13")]
-    use ryft_core::{DataType, EffectClass, ReferenceRead, ReferenceWrite, TracingContext};
+    use ryft_core::{EffectClass, ReferenceRead, ReferenceWrite, TracingContext};
     use ryft_pjrt::{ClientOptions, CpuClientOptions, load_cpu_plugin};
     #[cfg(feature = "cuda-13")]
     use ryft_pjrt::{GpuClientOptions, GpuMemoryAllocator, GpuPlatform, load_cuda_13_plugin};
 
     #[cfg(feature = "cuda-13")]
     use crate::domains::options::Options;
+    use crate::domains::tests::domain_mesh;
     #[cfg(feature = "cuda-13")]
     use crate::domains::tests::*;
     #[cfg(feature = "cuda-13")]
@@ -425,5 +561,36 @@ mod tests {
         drop(another);
         drop(fork);
         assert!(retained.upgrade().is_none());
+    }
+
+    #[test]
+    fn test_session_retain_constant() {
+        let plugin = load_cpu_plugin().unwrap();
+        let client = plugin
+            .client(ClientOptions::CPU(CpuClientOptions { device_count: Some(1), ..Default::default() }))
+            .unwrap();
+        let mesh = domain_mesh(&client, "x", 1);
+        let session = Session::new(&client);
+        let domain = session.domain();
+        let array = |value: f32| session.array(ArrayType::scalar(DataType::F32), mesh.clone(), value.to_ne_bytes());
+
+        // Retaining one array twice shares one entry and one ownership token, and the handles keep the array alive
+        // after the array itself is dropped.
+        let first = array(1.0).unwrap();
+        let handle = session.retain_constant(&first);
+        let duplicate = session.retain_constant(&first);
+        assert_eq!(duplicate, handle);
+        assert!(Arc::ptr_eq(duplicate.owner(), handle.owner()));
+        drop((first, duplicate));
+        assert_eq!(session.retained_constant_count(), 1);
+        assert_eq!(session.constant(&domain, &handle).unwrap(), session.constant(&domain, &handle).unwrap());
+
+        // Once every handle is released, the next retention reclaims the entry and reuses its position.
+        drop(handle);
+        let second = array(2.0).unwrap();
+        let handle = session.retain_constant(&second);
+        assert_eq!(session.retained_constant_count(), 1);
+        assert_eq!(handle.index(), 0);
+        assert!(session.constant(&domain, &handle).is_ok());
     }
 }

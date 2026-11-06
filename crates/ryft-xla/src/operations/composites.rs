@@ -261,17 +261,18 @@ where
         // they can never legally reference the enclosing function's captures (the trace boundary rejects bodies that
         // register captures). Lowering the primal region with an empty capture namespace turns any capture-referencing
         // constant that still sneaks in into a loud `MissingCapturedConstant` error instead of silently aliasing
-        // whatever value occupies the referenced slot of the enclosing capture prefix. Only the primal region is
-        // lowered: attached rule regions are dormant under lowering, and retained rules are callbacks rather than
-        // regions. Nested-traced regions (`while`/`scan`/`condition`/`linear_call`) share the enclosing capture scope
-        // and keep inheriting it.
+        // whatever value occupies the referenced slot of the enclosing capture prefix. Runtime arrays that such a body
+        // refers to are session constants instead, whose module-scoped values the empty namespace keeps reachable.
+        // Only the primal region is lowered: attached rule regions are dormant under lowering, and retained rules are
+        // callbacks rather than regions. Nested-traced regions (`while`/`scan`/`condition`/`linear_call`) share the
+        // enclosing capture scope and keep inheriting it.
         lower_nested_program_inline(
             primal,
             input_values,
             &mut lowerer.block,
             lowerer.context,
             lowerer.location,
-            &[],
+            lowerer.collective_state.session_values(lowerer.captured_values.as_slice()),
             &RematerializationOptimizationBarrier::None,
             lowerer.nested_functions.as_ref(),
             &lowerer.collective_state,

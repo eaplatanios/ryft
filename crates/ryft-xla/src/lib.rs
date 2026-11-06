@@ -27,6 +27,7 @@ pub use distributed::DistributedRuntime;
 pub use domains::{
     AnalysisValue, CompilationAnalysis, CompilationError, Domain, ExecutionError, FeedbackDirectedProfile,
     InputBoundBucketing, MemoryAnalysis, OptimizedProgram, Options, RuntimeError, Session, Target, TargetDevice,
+    ThroughSession,
 };
 pub use errors::Error;
 pub use experimental::lowering::{

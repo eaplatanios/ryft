@@ -87,7 +87,7 @@ impl LowerableOperation for RematerializeOperation<ArrayIrType> {
             &mut lowerer.block,
             lowerer.context,
             lowerer.location,
-            &[],
+            lowerer.collective_state.session_values(lowerer.captured_values.as_slice()),
             optimization_barrier,
             lowerer.nested_functions.as_ref(),
             &lowerer.collective_state,

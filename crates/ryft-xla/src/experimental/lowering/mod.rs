@@ -32,7 +32,7 @@ use crate::experimental::lowering::types::{
     lower_boundary_layout, lower_captured_constant, lower_literal_value, lower_runtime_dimension_size_i64,
     lower_tensor_type, lower_unplaced_constant_output,
 };
-use crate::experimental::ops::{ArrayConstant, Constant, FlatProgram, Operation, Program};
+use crate::experimental::ops::{ArrayConstant, Constant, FlatProgram, Operation, Program, SessionConstant};
 use crate::operations::collectives::collective_replica_groups;
 use crate::operations::jit_call::{JitCallFunctionMap, collect_jit_call_functions, emit_jit_call_function};
 use crate::operations::manipulation::broadcasting::broadcast_changes_explicit_sharding;
@@ -59,6 +59,11 @@ pub enum LoweringError {
     /// A captured constant has no binding in the capture namespace available to this lowering.
     #[error("missing captured constant #{index} during XLA lowering")]
     MissingCapturedConstant { index: usize },
+
+    /// A session constant appears where no hidden argument of the entry function is reachable (e.g., inside a
+    /// `shard_map` body or a shared private function).
+    #[error("session constant `{constant}` cannot be referenced in this lowering scope")]
+    UnreachableSessionConstant { constant: String },
 
     /// References reached a lowering boundary that requires their discharge.
     #[error("unresolved reference construct `{construct}` must be discharged before XLA lowering")]
@@ -823,6 +828,12 @@ pub(crate) struct CollectiveLoweringState {
 
     /// Runtime contracts declared by emitted operations across every nested lowering scope.
     runtime_requirements: Rc<RefCell<Vec<RuntimeRequirement>>>,
+
+    /// Distinct [`SessionConstant`]s of the module, in the order of the hidden entry arguments that carry them (refer
+    /// to [`collect_session_constants`]). Their values form the suffix of every `captured_values` table that can reach
+    /// the entry function's arguments. Scopes that cannot reach them (i.e., `sdy.manual_computation` bodies) carry no
+    /// session constants.
+    session_constants: Rc<[SessionConstant]>,
 }
 
 impl CollectiveLoweringState {
@@ -838,7 +849,40 @@ impl CollectiveLoweringState {
             has_provenance: Rc::new(Cell::new(false)),
             has_assertions: Rc::new(Cell::new(false)),
             runtime_requirements: Rc::new(RefCell::new(Vec::new())),
+            session_constants: Rc::from([]),
         }
+    }
+
+    /// Returns a copy of this state whose scope reaches the hidden entry arguments carrying `session_constants`.
+    pub(crate) fn with_session_constants(mut self, session_constants: Rc<[SessionConstant]>) -> Self {
+        self.session_constants = session_constants;
+        self
+    }
+
+    /// Returns the suffix of `captured_values` that holds the values of the session constants reachable in this scope.
+    /// A scope whose `captured_values` table cannot hold them (e.g., a shared private function) has no such values.
+    pub(crate) fn session_values<'v, V>(&self, captured_values: &'v [V]) -> &'v [V] {
+        captured_values
+            .len()
+            .checked_sub(self.session_constants.len())
+            .map_or(&[], |start| &captured_values[start..])
+    }
+
+    /// Returns the value of `constant` in a scope whose captured values are `captured_values`.
+    pub(crate) fn lower_session_constant<'b, 'c: 'b, 't: 'c>(
+        &self,
+        constant: &SessionConstant,
+        captured_values: &[ValueRef<'b, 'c, 't>],
+    ) -> Result<ValueRef<'b, 'c, 't>, Error> {
+        let values = self.session_values(captured_values);
+        self.session_constants
+            .iter()
+            .position(|candidate| candidate == constant)
+            .filter(|_| values.len() == self.session_constants.len())
+            .map(|index| values[index])
+            .ok_or_else(|| {
+                Error::Lowering(LoweringError::UnreachableSessionConstant { constant: constant.to_string() })
+            })
     }
 
     /// Returns a copy of this state carrying the PJRT platform name of the compilation target.
@@ -892,6 +936,8 @@ impl CollectiveLoweringState {
             has_provenance: self.has_provenance.clone(),
             has_assertions: self.has_assertions.clone(),
             runtime_requirements: self.runtime_requirements.clone(),
+            // `sdy.manual_computation` bodies are isolated from above, so they cannot use entry function arguments.
+            session_constants: Rc::from([]),
         }
     }
 
@@ -1252,6 +1298,29 @@ where
     )
 }
 
+/// Returns the distinct [`SessionConstant`]s that `program` references in any of its regions, in the order of their
+/// first occurrence in the region arena. Lowering passes their arrays as hidden entry arguments that follow the lifted
+/// captures, in this order, and so the caller that assembles the executable arguments must use the same order.
+pub(crate) fn collect_session_constants<ProgramInput, ProgramOutput, O: CoreOperation<Type = ArrayIrType>>(
+    program: &Program<ProgramInput, ProgramOutput, O>,
+) -> Vec<SessionConstant>
+where
+    ProgramInput: Parameterized<Constant>,
+    ProgramOutput: Parameterized<Constant>,
+{
+    let mut session_constants = Vec::<SessionConstant>::new();
+    for region in program.regions().iter() {
+        for atom in region.atoms() {
+            if let Some(Constant::Session(constant)) = atom.as_constant()
+                && !session_constants.contains(constant)
+            {
+                session_constants.push(constant.clone());
+            }
+        }
+    }
+    session_constants
+}
+
 /// Expands optional shardings of every value of a signature with `count` values into one optional sharding per value.
 /// Provided shardings are kept as they are, so that a count mismatch is still reported when the module is lowered.
 fn value_shardings(shardings: Option<&[Sharding]>, count: usize) -> Vec<Option<Sharding>> {
@@ -1297,6 +1366,22 @@ where
         return Err(Error::Lowering(LoweringError::UnresolvedState { construct: "program".to_string() }));
     }
     let function_name = normalize_function_name(function_name.as_ref())?;
+    // Session constants are carried by hidden arguments that form the suffix of the capture arguments. The caller
+    // declares them through the trailing `capture_types`, in the order of `collect_session_constants`.
+    let session_constants: Rc<[SessionConstant]> = collect_session_constants(program).into();
+    let session_count = session_constants.len();
+    if session_count > 0
+        && (capture_types.len() < session_count
+            || !capture_types[capture_types.len() - session_count..]
+                .iter()
+                .eq(session_constants.iter().map(|constant| constant.r#type().into_owned()).collect::<Vec<_>>().iter()))
+    {
+        return Err(ProgramError::MalformedProgram(format!(
+            "the trailing capture types of the entry function must be the types of its {session_count} session \
+             constant(s)",
+        ))
+        .into());
+    }
     let global_input_types = global_input_types.parameters().cloned().collect::<Vec<_>>();
     let global_output_types = global_output_types.parameters().cloned().collect::<Vec<_>>();
     let logical_argument_types =
@@ -1440,7 +1525,8 @@ where
     let collective_state = CollectiveLoweringState::new()
         .with_target_platform(target_platform)
         .with_ragged_dot_lowering_strategy(ragged_dot_lowering_strategy)
-        .with_named_compositions(named_compositions.clone());
+        .with_named_compositions(named_compositions.clone())
+        .with_session_constants(session_constants);
 
     // Deduplicate `jit_call` callees that occur more than once into shared private `func.func`s, so repeated nested
     // programs (identical transformer blocks, or the per-block primal and pullback programs produced by `grad`) lower
@@ -1642,12 +1728,21 @@ where
             // lowering observe the same arena; in that form the complete logical argument list is also the entry
             // input list, while the leading prefix still serves attached `CaptureReference` constants. No third
             // boundary form exists, so the entry input count must match one of those two shapes exactly.
+            // Session constants are not program inputs, so the lifted form omits the trailing session arguments of the
+            // capture prefix from the entry inputs, while `capture_values` keeps them as its suffix for
+            // `CollectiveLoweringState::lower_session_constant`.
             debug_assert!(
-                program.input_count() == logical_argument_values.len()
+                program.input_count() + session_count == logical_argument_values.len()
                     || program.input_count() == public_input_values.len(),
             );
-            let input_values = if program.input_count() == logical_argument_values.len() {
-                logical_argument_values.as_slice()
+            let lifted_input_values: Vec<_>;
+            let input_values = if program.input_count() + session_count == logical_argument_values.len() {
+                lifted_input_values = capture_values[..capture_values.len() - session_count]
+                    .iter()
+                    .chain(public_input_values)
+                    .copied()
+                    .collect();
+                lifted_input_values.as_slice()
             } else {
                 public_input_values
             };
@@ -1776,6 +1871,10 @@ impl MlirLowerableValue for ArrayConstant {
                 ),
             }
             .into()),
+            Self::Session(value) => Err(ProgramError::Concretization {
+                message: format!("session constant {value} cannot be materialized as a literal"),
+            }
+            .into()),
             Self::Boolean(value) => CoreArray::scalar(*value)?.to_dense_elements_attribute(tensor_type, context),
         }
     }
@@ -1793,6 +1892,9 @@ impl MlirLowerableValue for ArrayConstant {
     {
         match self {
             Self::Captured(value) => lower_captured_constant(value, captured_values),
+            Self::Session(value) => {
+                Err(Error::Lowering(LoweringError::UnreachableSessionConstant { constant: value.to_string() }))
+            }
             Self::Boolean(_) => lower_literal_value(self, block, context, location),
         }
     }

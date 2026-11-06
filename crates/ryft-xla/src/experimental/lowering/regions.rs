@@ -118,7 +118,7 @@ fn lower_nested_region_inline<'b, 'c: 'b, 't: 'c, O: LowerableOperationFamily>(
         context,
         location,
         |atom_id, value, block, context, location| {
-            lower_constant(atom_id, value, captured_values, block, context, location)
+            lower_constant(atom_id, value, captured_values, collective_state, block, context, location)
         },
         |instruction, inputs, block, context, location| {
             let input_types = instruction
@@ -370,7 +370,7 @@ where
         context,
         location,
         |atom_id, value, block, context, location| {
-            let lowered = lower_constant(atom_id, value, captured_values, block, context, location)?;
+            let lowered = lower_constant(atom_id, value, captured_values, collective_state, block, context, location)?;
             atom_values.borrow_mut()[atom_id.index()] = Some(lowered);
             Ok(lowered)
         },

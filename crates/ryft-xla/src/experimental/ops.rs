@@ -1,6 +1,7 @@
 use std::borrow::Cow;
 use std::fmt::Display;
 use std::hash::{Hash, Hasher};
+use std::sync::Arc;
 
 use ryft_core::{
     AbsOperation, AddOperation, AndOperation, ArgMaxOperation, ArgMinOperation, Array as CoreArray, ArrayIrOperation,
@@ -38,6 +39,119 @@ use ryft_macros::Parameter;
 use crate::kernels::KernelOperation;
 use crate::operations::jit_call::JitCallOperation;
 
+/// Lifetime-free handle to an array that a [`Session`](crate::Session) retains on behalf of a trace whose capture table
+/// cannot hold runtime arrays. Such a trace (e.g., the body of a [`rematerialize`](ryft_core::rematerialize) call or of
+/// a [`composite`](ryft_core::composite) and its rules, which are traced over constants alone) still needs to refer to
+/// the runtime arrays that a compiled function it calls has captured. Importing such an array (refer to
+/// [`ThroughSession`](crate::domains::ThroughSession)) registers it in the session and stages this handle as an
+/// immediate constant, which can appear in any region of any program, including lazily traced derivative rules.
+///
+/// The handle resolves to the retained array through the session that registered it. An eager domain resolves it when
+/// lifting it, and lowering turns every distinct handle of a program into a hidden executable argument that follows the
+/// captures of the program, so that compiled executables depend only on the array's type and never on its data.
+///
+/// # Ownership
+///
+/// Every handle co-owns its table entry through a shared ownership token, and so the programs, regions,
+/// derivative rules, and caches that hold a handle (or a clone of it) keep the array alive. The session reclaims an
+/// entry once no handle to it remains, and only then may it reuse its position for another array. Handles compare and
+/// hash by their session, position, and type, which therefore identify one array for as long as any handle exists.
+#[derive(Clone, Debug, Parameter)]
+pub struct SessionConstant {
+    /// Identifier of the [`Session`](crate::Session) that retains the array.
+    session: u64,
+
+    /// Position of the array in the constant table of that session.
+    index: usize,
+
+    /// [`ArrayType`] of the retained array.
+    r#type: ArrayType,
+
+    /// Token shared by every handle to the retained array, whose last release lets the session reclaim it.
+    owner: Arc<SessionConstantOwner>,
+}
+
+/// Ownership token that every [`SessionConstant`] handle to one retained array shares. The session keeps only a weak
+/// reference to it, so the token is released together with the last handle.
+#[derive(Debug)]
+pub(crate) struct SessionConstantOwner;
+
+impl SessionConstant {
+    /// Creates a new [`SessionConstant`] for the array at `index` in the constant table of session `session`, which
+    /// co-owns that entry through `owner`.
+    #[inline]
+    pub(crate) fn new(session: u64, index: usize, r#type: ArrayType, owner: Arc<SessionConstantOwner>) -> Self {
+        Self { session, index, r#type, owner }
+    }
+
+    /// Returns the identifier of the session that retains the array.
+    #[inline]
+    pub fn session(&self) -> u64 {
+        self.session
+    }
+
+    /// Returns the position of the array in the constant table of its session.
+    #[inline]
+    pub fn index(&self) -> usize {
+        self.index
+    }
+
+    /// Returns the ownership token that this handle shares with every other handle to the same retained array.
+    #[inline]
+    pub(crate) fn owner(&self) -> &Arc<SessionConstantOwner> {
+        &self.owner
+    }
+
+    /// Returns this handle with the identities of its type renamed by `renaming`.
+    fn rename_type_identities(
+        &self,
+        renaming: &TypeIdentityRenaming<<ArrayType as Type>::Identity>,
+    ) -> Result<Self, TypeError> {
+        Ok(Self {
+            session: self.session,
+            index: self.index,
+            r#type: self.r#type.rename_identities(renaming)?,
+            owner: Arc::clone(&self.owner),
+        })
+    }
+}
+
+// Handles are identified by their session, position, and type. The ownership token is shared by every handle to one
+// array and carries no identity of its own.
+impl PartialEq for SessionConstant {
+    #[inline]
+    fn eq(&self, other: &Self) -> bool {
+        self.session == other.session && self.index == other.index && self.r#type == other.r#type
+    }
+}
+
+impl Eq for SessionConstant {}
+
+impl Hash for SessionConstant {
+    #[inline]
+    fn hash<H: Hasher>(&self, state: &mut H) {
+        self.session.hash(state);
+        self.index.hash(state);
+        self.r#type.hash(state);
+    }
+}
+
+impl Display for SessionConstant {
+    #[inline]
+    fn fmt(&self, formatter: &mut std::fmt::Formatter<'_>) -> std::fmt::Result {
+        write!(formatter, "session#{}:{}", self.index, self.r#type)
+    }
+}
+
+impl Typed for SessionConstant {
+    type Type = ArrayType;
+
+    #[inline]
+    fn r#type(&self) -> Cow<'_, ArrayType> {
+        Cow::Borrowed(&self.r#type)
+    }
+}
+
 /// Array constants retained by staged XLA programs. Captures refer to the enclosing capture table; Boolean
 /// literals preserve dimension-comparison proofs without allocating device storage or introducing a capture.
 /// Projection onto [`ArrayType`] is the identity and preserves both representations unchanged.
@@ -45,6 +159,9 @@ use crate::operations::jit_call::JitCallOperation;
 pub enum ArrayConstant {
     /// A reference to array data in the enclosing capture table.
     Captured(CaptureReference<ArrayType>),
+
+    /// A handle to array data that the session retains (refer to [`SessionConstant`]).
+    Session(SessionConstant),
 
     /// An immediate scalar Boolean predicate.
     Boolean(bool),
@@ -68,6 +185,7 @@ impl Display for ArrayConstant {
     fn fmt(&self, formatter: &mut std::fmt::Formatter<'_>) -> std::fmt::Result {
         match self {
             Self::Captured(value) => Display::fmt(value, formatter),
+            Self::Session(value) => Display::fmt(value, formatter),
             Self::Boolean(value) => Display::fmt(value, formatter),
         }
     }
@@ -79,6 +197,7 @@ impl Typed for ArrayConstant {
     fn r#type(&self) -> Cow<'_, ArrayType> {
         match self {
             Self::Captured(value) => value.r#type(),
+            Self::Session(value) => value.r#type(),
             Self::Boolean(_) => Cow::Owned(ArrayType::scalar(DataType::Boolean)),
         }
     }
@@ -98,6 +217,7 @@ impl CoreValue for ArrayConstant {
     ) -> Result<Self, TypeError> {
         match self {
             Self::Captured(value) => Ok(Self::Captured(value.rename_type_identities(renaming)?)),
+            Self::Session(value) => Ok(Self::Session(value.rename_type_identities(renaming)?)),
             Self::Boolean(value) => Ok(Self::Boolean(*value)),
         }
     }
@@ -105,7 +225,7 @@ impl CoreValue for ArrayConstant {
     fn capture_index(&self) -> Option<usize> {
         match self {
             Self::Captured(value) => Some(value.index()),
-            Self::Boolean(_) => None,
+            Self::Session(_) | Self::Boolean(_) => None,
         }
     }
 }
@@ -137,6 +257,7 @@ impl CaptureConstant for ArrayConstant {
     fn map_capture_index<F: FnOnce(usize) -> usize>(&self, map: F) -> Self {
         match self {
             Self::Captured(value) => Self::Captured(value.map_capture_index(map)),
+            Self::Session(value) => Self::Session(value.clone()),
             Self::Boolean(value) => Self::Boolean(*value),
         }
     }
@@ -146,6 +267,9 @@ impl Concretizable<bool> for ArrayConstant {
     fn concretize(&self) -> Result<bool, ProgramError> {
         match self {
             Self::Captured(value) => value.concretize(),
+            Self::Session(_) => Err(ProgramError::Concretization {
+                message: "cannot extract a concrete boolean from a session constant handle".to_string(),
+            }),
             Self::Boolean(value) => Ok(*value),
         }
     }
@@ -155,6 +279,9 @@ impl AssertionValue for ArrayConstant {
     fn assertion_array(&self) -> Result<Option<CoreArray>, ProgramError> {
         match self {
             Self::Captured(value) => value.assertion_array(),
+            Self::Session(_) => Err(ProgramError::Concretization {
+                message: "cannot inspect a session constant assertion array before execution".to_owned(),
+            }),
             Self::Boolean(value) => Ok(Some(CoreArray::scalar(*value)?)),
         }
     }
@@ -162,6 +289,9 @@ impl AssertionValue for ArrayConstant {
     fn assertion_observation(&self) -> Result<String, ProgramError> {
         match self {
             Self::Captured(value) => value.assertion_observation(),
+            Self::Session(_) => Err(ProgramError::Concretization {
+                message: "cannot inspect a session constant assertion observation before execution".to_owned(),
+            }),
             Self::Boolean(value) => Ok(value.to_string()),
         }
     }
@@ -183,10 +313,16 @@ impl AssertionValue for ArrayConstant {
 ///     against a manual region's shard-local values.
 ///   - **Immediate Boolean predicates:** static dimension proofs remain concrete through array projection, logical
 ///     composition, and assertion folding without requiring a captured device buffer.
+///   - **Session arrays:** a [`SessionConstant`] is a lifetime-free handle to an array that the session retains for a
+///     trace whose capture table cannot hold runtime arrays (e.g., the body of a rematerialized function or of a
+///     composite). Lowering turns it into a hidden executable argument, as it does for a capture.
 #[derive(Clone, Debug, PartialEq, Eq, Hash, Parameter)]
 pub enum Constant {
     /// Reference to a value held in the surrounding compiled function's capture table.
     Captured(CaptureReference<ArrayIrType>),
+
+    /// Handle to an array that the session retains.
+    Session(SessionConstant),
 
     /// Immediate checked host-side first-class dimension extent.
     Dimension(DimensionValue),
@@ -200,6 +336,7 @@ impl Display for Constant {
     fn fmt(&self, formatter: &mut std::fmt::Formatter<'_>) -> std::fmt::Result {
         match self {
             Self::Captured(value) => Display::fmt(value, formatter),
+            Self::Session(value) => Display::fmt(value, formatter),
             Self::Dimension(value) => Display::fmt(value, formatter),
             Self::Boolean(value) => Display::fmt(value, formatter),
         }
@@ -227,6 +364,7 @@ impl Typed for Constant {
     fn r#type(&self) -> Cow<'_, ArrayIrType> {
         match self {
             Self::Captured(value) => value.r#type(),
+            Self::Session(value) => Cow::Owned(ArrayIrType::Array(value.r#type().into_owned())),
             Self::Dimension(value) => Cow::Owned(ArrayIrType::Dimension(value.r#type().into_owned())),
             Self::Boolean(_) => Cow::Owned(ArrayType::scalar(DataType::Boolean).into()),
         }
@@ -249,6 +387,7 @@ impl CoreValue for Constant {
     ) -> Result<Self, TypeError> {
         match self {
             Self::Captured(value) => Ok(Self::Captured(value.rename_type_identities(renaming)?)),
+            Self::Session(value) => Ok(Self::Session(value.rename_type_identities(renaming)?)),
             Self::Dimension(value) => Ok(Self::Dimension(value.rename_type_identities(renaming)?)),
             Self::Boolean(value) => Ok(Self::Boolean(*value)),
         }
@@ -258,7 +397,7 @@ impl CoreValue for Constant {
     fn capture_index(&self) -> Option<usize> {
         match self {
             Self::Captured(value) => Some(value.index()),
-            Self::Dimension(_) | Self::Boolean(_) => None,
+            Self::Session(_) | Self::Dimension(_) | Self::Boolean(_) => None,
         }
     }
 }
@@ -268,6 +407,7 @@ impl CaptureConstant for Constant {
     fn map_capture_index<F: FnOnce(usize) -> usize>(&self, map: F) -> Self {
         match self {
             Self::Captured(value) => Self::Captured(value.map_capture_index(map)),
+            Self::Session(value) => Self::Session(value.clone()),
             Self::Dimension(value) => Self::Dimension(value.clone()),
             Self::Boolean(value) => Self::Boolean(*value),
         }
@@ -282,6 +422,7 @@ impl ValueProjection<ArrayType> for Constant {
     fn from_projected(value: ArrayConstant) -> Self {
         match value {
             ArrayConstant::Captured(value) => Self::Captured(ValueProjection::<ArrayType>::from_projected(value)),
+            ArrayConstant::Session(value) => Self::Session(value),
             ArrayConstant::Boolean(value) => Self::Boolean(value),
         }
     }
@@ -298,6 +439,7 @@ impl ValueProjection<ArrayType> for Constant {
     fn into_projected(self) -> Result<ArrayConstant, TypeError> {
         match self {
             Self::Captured(value) => value.into_projected().map(ArrayConstant::Captured),
+            Self::Session(value) => Ok(ArrayConstant::Session(value)),
             Self::Boolean(value) => Ok(ArrayConstant::Boolean(value)),
             Self::Dimension(_) => Err(TypeError::invalid("expected array type but got dimension type")),
         }
@@ -320,6 +462,7 @@ impl ValueProjection<DimensionType> for Constant {
     {
         match self {
             Self::Captured(_) => Err(TypeError::invalid("expected an immediate dimension but got a captured value")),
+            Self::Session(_) => Err(TypeError::invalid("expected an immediate dimension but got a session array")),
             Self::Boolean(_) => Err(TypeError::invalid("expected a dimension but got a Boolean array")),
             Self::Dimension(value) => Ok(value),
         }
@@ -329,6 +472,7 @@ impl ValueProjection<DimensionType> for Constant {
     fn into_projected(self) -> Result<DimensionValue, TypeError> {
         match self {
             Self::Captured(_) => Err(TypeError::invalid("expected an immediate dimension but got a captured value")),
+            Self::Session(_) => Err(TypeError::invalid("expected an immediate dimension but got a session array")),
             Self::Boolean(_) => Err(TypeError::invalid("expected a dimension but got a Boolean array")),
             Self::Dimension(value) => Ok(value),
         }
@@ -376,6 +520,9 @@ impl AssertionValue for Constant {
             Self::Captured(_) => Err(ProgramError::Concretization {
                 message: "cannot read an assertion array from a captured constant reference".to_owned(),
             }),
+            Self::Session(_) => Err(ProgramError::Concretization {
+                message: "cannot read an assertion array from a session constant handle".to_owned(),
+            }),
         }
     }
 
@@ -385,6 +532,9 @@ impl AssertionValue for Constant {
             Self::Boolean(value) => Ok(value.to_string()),
             Self::Captured(_) => Err(ProgramError::Concretization {
                 message: "cannot read an assertion observation from a captured constant reference".to_owned(),
+            }),
+            Self::Session(_) => Err(ProgramError::Concretization {
+                message: "cannot read an assertion observation from a session constant handle".to_owned(),
             }),
         }
     }

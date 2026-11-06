@@ -30,7 +30,7 @@ use ryft_mlir::{
 
 use crate::experimental::lowering::regions::lower_nested_program_inline;
 use crate::experimental::lowering::types::lower_array_ir_type;
-use crate::experimental::lowering::{CollectiveLoweringState, EffectTokens};
+use crate::experimental::lowering::{CollectiveLoweringState, EffectTokens, collect_session_constants};
 use crate::experimental::ops::{Constant, FlatProgram, Operation, Program};
 use crate::operations::composites::NamedCompositeImplementation;
 use crate::operations::control_flow::lowered_effect_classes;
@@ -472,8 +472,10 @@ where
         let (count, program) = counts.remove(&key).expect("every ordered key was counted");
         // Effectful callees always inline (even when repeated) so their effectful instructions chain onto the
         // caller's effect token in program order; a shared token-free function could not preserve that ordering. That
-        // includes the entry guards that lowering synthesizes for the callee's nested control flow.
-        if count < 2 || !lowered_effect_classes(&program)?.is_empty() {
+        // includes the entry guards that lowering synthesizes for the callee's nested control flow. Callees that
+        // reference session constants also inline, because only the entry function receives their hidden arguments.
+        if count < 2 || !lowered_effect_classes(&program)?.is_empty() || !collect_session_constants(&program).is_empty()
+        {
             continue;
         }
         let symbol = match names.get(&key) {
@@ -588,11 +590,15 @@ pub(crate) fn emit_jit_call_function<'b, 'c: 'b, 't: 'c, O: LowerableOperationFa
 ///
 /// `input_values` are the lowered call operands in callee-input order. `capture_count` is the operation payload's
 /// exact leading lifted-capture prefix length; deriving it from capture-constant indices instead would conflate the
-/// independent capture namespaces of nested calls inside the callee arena.
+/// independent capture namespaces of nested calls inside the callee arena. `caller_captured_values` are the captured
+/// values of the calling scope, whose session-constant suffix the inlined callee inherits (refer to
+/// [`CollectiveLoweringState::session_values`]).
+#[allow(clippy::too_many_arguments)]
 pub(crate) fn lower_jit_call<'b, 'c: 'b, 't: 'c, O: LowerableOperationFamily>(
     program: &FlatProgram<O>,
     capture_count: usize,
     input_values: &[ValueRef<'b, 'c, 't>],
+    caller_captured_values: &[ValueRef<'b, 'c, 't>],
     block: &mut BlockRef<'b, 'c, 't>,
     context: &'c MlirContext<'t>,
     location: LocationRef<'c, 't>,
@@ -622,7 +628,9 @@ pub(crate) fn lower_jit_call<'b, 'c: 'b, 't: 'c, O: LowerableOperationFamily>(
     if input_values.len() < capture_count {
         return Err(Error::Lowering(LoweringError::MissingCapturedConstant { index: capture_count.saturating_sub(1) }));
     }
-    let captured_values = input_values[..capture_count].to_vec();
+    // The callee's capture references name its own leading inputs, while session constants remain module-scoped.
+    let mut captured_values = input_values[..capture_count].to_vec();
+    captured_values.extend_from_slice(collective_state.session_values(caller_captured_values));
     lower_nested_program_inline(
         program,
         input_values,
@@ -1348,7 +1356,10 @@ where
         inputs: &[ArrayIrBatch<C::Value>],
     ) -> Result<Vec<ArrayIrBatch<C::Value>>, BatchingError> {
         let axes = inputs.iter().map(ArrayIrBatch::batch_axis).collect::<Vec<_>>();
-        if axes.iter().all(BatchAxis::is_replicated) {
+        // Only an all-replicated call at an anonymous level can bind its original callee unchanged. A named level must
+        // rebatch the callee even then, because the callee may read that level by name (e.g., through `axis_index`),
+        // and binding it unchanged would let that read escape the level that binds it.
+        if axes.iter().all(BatchAxis::is_replicated) && context.axis_name().is_none() {
             return Ok(context
                 .parent()
                 .bind(
@@ -1360,18 +1371,21 @@ where
                 .map(ArrayIrBatch::replicated)
                 .collect::<Vec<_>>());
         }
-        // The canonical array IR transform threads one leading dimension through the callee. Treat it as an
-        // additional explicit capture and remove only its bookkeeping output; the original capture order remains.
+        // The canonical array IR transform threads one leading dimension through the callee as its first input and
+        // first output. Treat the input as an additional explicit capture, so that the original capture order remains,
+        // and drop the bookkeeping output from the callee itself rather than after the call. The output only forwards
+        // the extent input, and an eager parent compiles the call as a standalone program, whose results must be
+        // arrays.
         let (callee, axes) = driver
             .batch_program(context, driver.region(0)?, &axes, ProgramBatchingOutputAxesPolicy::Natural)?
             .into_parts();
+        let callee = callee.with_outputs(&(1..callee.output_count()).collect::<Vec<_>>())?;
         let mut values = vec![context.axis_extent().clone()];
         values.extend(inputs.iter().map(|input| input.value().clone()));
         let operation = Self::new(self.capture_count() + 1)
             .with_callee_type_signature(&callee.input_types(), &callee.output_types())?;
-        let mut outputs = context.parent().bind(operation, vec![callee], &values)?;
-        check_count!("output", outputs, axes.len() + 1, ProgramError);
-        outputs.remove(0);
+        let outputs = context.parent().bind(operation, vec![callee], &values)?;
+        check_count!("output", outputs, axes.len(), ProgramError);
         Ok(outputs
             .into_iter()
             .zip(axes)
@@ -1395,15 +1409,13 @@ where
         // Rebatch the callee when inputs are mapped or when it can address the batching level by name. Only an
         // all-replicated call at an anonymous level can bind its original callee unchanged.
         //
-        // Unlike the forward-mode and transpose rules below, this rebatching is deliberately not served from the
-        // callee region's retained transform cache: the batched program depends on live `BatchingContext` state (the
-        // batch extent, the axis name, and the surrounding nesting) whose complete key surface is not yet explicit,
-        // so caching it against the callee region and its input axes alone would risk exactly the unsound key reuse
-        // that cache is designed to avoid. The decided follow-up is to specify that key material when array IR
-        // batching lands behind the `CompiledFunction::batch` stub, which has to define it anyway: batching then
-        // joins the region transform cache behind a gate measurement, through a batching-policy hook returning
-        // `Option<key>` where `None` keeps a policy uncached, so soundness stays opt-in per policy. See
-        // `.tasks/plan_general_transform_caching_analysis.md`.
+        // Unlike the forward mode and transpose rules below, this rebatching is deliberately not served from the
+        // callee region's retained transform cache. The batched program depends on live `BatchingContext` state (i.e.,
+        // the batch extent, the axis name, and the surrounding nesting), so caching it against the callee region and
+        // its input axes alone would risk exactly the unsound key reuse that the cache is designed to avoid. Caching it
+        // needs a complete key and a measured benefit, which `.tasks/plan_compilation_transform_composition.md` gates
+        // (refer to its gate G8), through a batching-policy hook returning `Option<key>` where `None` keeps a policy
+        // uncached, so that soundness stays opt-in per policy.
         let batch_callee = ArrayBatch::common_batch_size(inputs)?.is_some() || context.axis_name().is_some();
         let (batched_callee, output_axes) = if batch_callee {
             let input_batch_axes =
@@ -1842,6 +1854,7 @@ impl LowerableOperation for JitCallOperation<ArrayIrType> {
             callee,
             self.capture_count(),
             input_values,
+            lowerer.captured_values.as_slice(),
             &mut lowerer.block,
             lowerer.context,
             lowerer.location,
@@ -2870,9 +2883,12 @@ mod tests {
             panic!("expected jit_call");
         };
         assert_eq!(call.capture_count(), 1);
+
+        // The batched callee receives the extent as its leading input, and it does not return the extent, because that
+        // bookkeeping output would only forward the input and an eager parent cannot return it from a compiled call.
         let body = program.region_ref(program.instructions()[0].regions()[0]).unwrap();
         assert_eq!(body.input_types().len(), 2);
-        assert_eq!(body.output_ids()[0], body.input_ids()[0]);
+        assert_eq!(body.output_ids(), &[body.input_ids()[1]]);
     }
 
     #[test]

@@ -2,7 +2,7 @@ use std::borrow::Cow;
 use std::collections::{BTreeSet, HashMap, HashSet, VecDeque};
 use std::fmt::{Debug, Display};
 use std::ops::Range;
-use std::sync::{Arc, Mutex, OnceLock};
+use std::sync::{Arc, Mutex, OnceLock, Weak};
 
 use ryft_core::{
     ArrayType, DataType, Device, DeviceId, DeviceMesh, DimensionError, Layout, LayoutError, Memory, Parameter,
@@ -203,6 +203,62 @@ impl<'o> ArrayParts<'o> {
             mesh,
             bounded_materializations: OnceLock::new(),
             logical_extent_scalars: Mutex::new(VecDeque::new()),
+        }
+    }
+}
+
+/// Domain-free storage of an [`Array`] that a [`Session`](crate::Session) retains on behalf of
+/// [`SessionConstant`](crate::experimental::ops::SessionConstant) handles. It holds the array's shards and completion
+/// fence but neither its [`Domain`] nor its value-local caches, because both can (transitively) retain the session that
+/// retains this storage and would otherwise form a reference cycle. Resolving it through [`Self::to_array`] associates
+/// a fresh [`Array`] with the resolving domain.
+pub(crate) struct RetainedArray<'o> {
+    /// Identity of the storage of the [`Array`] that was retained, used to deduplicate repeated retentions of the same
+    /// array. Holding a [`Weak`] reference keeps the allocation (and hence its address) reserved without keeping the
+    /// original storage (or its caches) alive.
+    identity: Weak<ArrayParts<'o>>,
+
+    /// [`ArrayType`] of the retained array.
+    r#type: Arc<ArrayType>,
+
+    /// [`ArrayShard`]s of the retained array.
+    shards: Vec<ArrayShard<'o>>,
+
+    /// Lookup table mapping [`DeviceId`]s to [`ShardIndex`]es of [`Self::shards`].
+    shard_index_by_device: Arc<HashMap<DeviceId, ShardIndex>>,
+
+    /// Concrete [`DeviceMesh`] implied by the global shard placement.
+    mesh: Arc<DeviceMesh>,
+
+    /// Whole-execution completion fence of the launch that produced the retained array, if any.
+    execution_fence: Option<ExecutionFence>,
+}
+
+impl<'o> RetainedArray<'o> {
+    /// Returns the [`ArrayType`] of the retained array.
+    #[inline]
+    pub(crate) fn r#type(&self) -> &ArrayType {
+        &self.r#type
+    }
+
+    /// Returns `true` if `array` shares the storage of the retained array.
+    #[inline]
+    pub(crate) fn retains(&self, array: &Array<'o>) -> bool {
+        std::ptr::eq(self.identity.as_ptr(), Arc::as_ptr(&array.parts))
+    }
+
+    /// Returns a new [`Array`] that shares the retained storage and belongs to `domain`.
+    pub(crate) fn to_array(&self, domain: &Domain<'o>) -> Array<'o> {
+        crate::telemetry::array_constructed();
+        Array {
+            parts: Arc::new(ArrayParts::new(
+                Arc::clone(&self.r#type),
+                self.shards.clone(),
+                Arc::clone(&self.shard_index_by_device),
+                Arc::clone(&self.mesh),
+            )),
+            execution_fence: self.execution_fence.clone(),
+            domain: domain.clone(),
         }
     }
 }
@@ -717,6 +773,18 @@ impl<'o> Array<'o> {
         }
         self.domain = domain.clone();
         Ok(self)
+    }
+
+    /// Returns a [`RetainedArray`] that shares the storage of this array without retaining its domain or caches.
+    pub(crate) fn retain(&self) -> RetainedArray<'o> {
+        RetainedArray {
+            identity: Arc::downgrade(&self.parts),
+            r#type: Arc::clone(&self.parts.r#type),
+            shards: self.parts.shards.clone(),
+            shard_index_by_device: Arc::clone(&self.parts.shard_index_by_device),
+            mesh: Arc::clone(&self.parts.mesh),
+            execution_fence: self.execution_fence.clone(),
+        }
     }
 
     /// Attaches the whole-execution completion fence that produced this array. This never waits and is used by the

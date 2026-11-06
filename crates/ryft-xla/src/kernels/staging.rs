@@ -796,7 +796,7 @@ fn definition_from_body(
                         Atom::Constant(Constant::Boolean(value)) => {
                             Atom::Constant(ArrayIrValue::Array(CoreArray::scalar(*value)?))
                         }
-                        Atom::Constant(Constant::Captured(_)) => {
+                        Atom::Constant(Constant::Captured(_) | Constant::Session(_)) => {
                             return Err(ProgramError::MalformedProgram(
                                 "kernel body cannot capture an external XLA value".to_owned(),
                             ));

@@ -78,7 +78,7 @@ pub use runtimes::{
     RuntimeExtensions, RuntimeProvider, RuntimeRequirement, named_ffi_type_id, normalize_runtime_requirements,
     runtime_requirements, with_runtime_requirements,
 };
-pub use sessions::Session;
+pub use sessions::{Session, ThroughSession};
 pub use targets::{Target, TargetDevice};
 
 /// Stateful backend that materializes, lowers, compiles, and executes traced XLA programs

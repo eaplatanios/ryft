@@ -97,12 +97,14 @@ use std::hash::Hash;
 use std::sync::{Arc, Mutex};
 
 use ryft_core::{
-    ArrayIrType, ArrayType, CapturingContext, ClosedProgram, Compile, CompiledFunction as CoreCompiledFunction,
-    CompiledFunctionDispatcher as CoreCompiledFunctionDispatcher, Constant as CoreConstant, Context, DeviceMesh,
-    DifferentiableType, DispatcherStatistics, DomainTracingContext, ExecutableFunction as CoreExecutableFunction,
-    ForwardModeDifferentiate, Parameterized, ParameterizedFamily, ProgramError, ProjectedContext, ProjectedValue,
-    ReverseModeDifferentiate, StagedFunction as CoreStagedFunction, StatefulExecution, Tracer as CoreTracer, Typed,
-    Value as CoreValue, ValueProjection,
+    ArrayIrBatchingPolicy, ArrayIrType, ArrayType, Batch, BatchAxis, BatchAxisSpecification, BatchingError,
+    BatchingTracer, ClosedProgram, Compile, CompiledFunction as CoreCompiledFunction,
+    CompiledFunctionDispatcher as CoreCompiledFunctionDispatcher, Context, ContextProjection, DeviceMesh,
+    DifferentiableType, Dimension as CoreDimension, DimensionValue, DispatcherStatistics, DomainTracingContext,
+    ExecutableFunction as CoreExecutableFunction, ForwardModeDifferentiate, ImportingContext, MeshContext, NamedAxes,
+    Parameter, Parameterized, ParameterizedFamily, ProgramError, ProjectedContext, ProjectedValue,
+    ReverseModeDifferentiate, ShardingDimension, StagedFunction as CoreStagedFunction, StatefulExecution,
+    Tracer as CoreTracer, Typed, Value as CoreValue, ValueProjection,
 };
 use ryft_pjrt::Execution;
 
@@ -207,6 +209,25 @@ where
         .map_err(Into::into)
 }
 
+/// Projects one array IR output tree of any context to the `ArrayType` projection of its values.
+fn project_values<P, V>(
+    values: ProgramParameterValues<P, V>,
+) -> Result<P::To<<V as ValueProjection<ArrayType>>::Projected>, ProgramError>
+where
+    P: Parameterized<ArrayType>,
+    P::Family: ParameterizedFamily<ArrayIrType>
+        + ParameterizedFamily<V>
+        + ParameterizedFamily<<V as ValueProjection<ArrayType>>::Projected>,
+    V: CoreValue<Type = ArrayIrType> + ValueProjection<ArrayType, Projected: Parameter>,
+{
+    let structure = values.parameter_structure();
+    let parameters = values
+        .into_parameters()
+        .map(|value| ValueProjection::<ArrayType>::into_projected(value).map_err(ProgramError::from))
+        .collect::<Result<Vec<_>, _>>()?;
+    Ok(P::To::<<V as ValueProjection<ArrayType>>::Projected>::from_parameters(structure, parameters)?)
+}
+
 /// Retained array-only XLA JIT dispatcher with explicit host-side static parameters.
 ///
 /// A first call for each `(static parameters, dynamic parameter structure, dynamic abstract types)` specialization
@@ -281,6 +302,74 @@ where
     {
         let inputs = lift_arrays::<In>(inputs)?;
         project_arrays::<Out>(self.function.execute(static_parameters, inputs)?)
+    }
+
+    /// Calls the specialization of this dispatcher for `static_parameters` and the abstract types of `inputs` as a
+    /// `jit_call` operation in the active context recovered from `inputs`. Unlike [`Self::execute`], it works under any
+    /// context, including traces and transforms, so this dispatcher's closure composes with enclosing transforms and
+    /// compilations. Inputs and outputs are `ArrayType` values of a [`ProjectedContext`] over that context (e.g.,
+    /// [`Array`]s under the eager [`Domain`] and [`ProjectedValue`]s under traces and transforms), as for
+    /// [`StagedFunction::call`]. Refer to [`CoreCompiledFunctionDispatcher::call_in_context`] for how source
+    /// specializations are traced and retained.
+    #[inline]
+    pub fn call<L, C, Path>(&self, static_parameters: Static, inputs: In::To<L>) -> Result<Out::To<L>, Error>
+    where
+        Options: Clone,
+        F: Fn(
+            Static,
+            ProgramParameterValues<In, StatefulCompileTracer<'c>>,
+        ) -> Result<ProgramParameterValues<Out, StatefulCompileTracer<'c>>, Error>,
+        L: CoreValue<Type = ArrayType, Domain = ProjectedContext<C, ArrayType>>,
+        C: Context<Type = ArrayIrType, Constant = Constant, Operation = Operation>
+            + ContextProjection<ArrayType>
+            + ImportingContext<Domain<'c>, Path>
+            + NamedAxes
+            + MeshContext,
+        C::Value: ValueProjection<ArrayType, Projected = L>,
+        In::Family: ParameterizedFamily<C::Value> + ParameterizedFamily<L>,
+        Out::Family: ParameterizedFamily<C::Value> + ParameterizedFamily<L>,
+    {
+        let context = inputs
+            .parameters()
+            .next()
+            .ok_or(ProgramError::InvalidInputCount { expected: 1, actual: 0 })?
+            .domain();
+        self.call_in_context(context.parent(), static_parameters, inputs)
+    }
+
+    /// Calls like [`Self::call`] in the provided array IR `context`, whose `ArrayType` projection the inputs and
+    /// outputs use. An explicit context also serves nullary calls.
+    #[inline]
+    pub fn call_in_context<C, Path>(
+        &self,
+        context: &C,
+        static_parameters: Static,
+        inputs: In::To<<C::Value as ValueProjection<ArrayType>>::Projected>,
+    ) -> Result<Out::To<<C::Value as ValueProjection<ArrayType>>::Projected>, Error>
+    where
+        Options: Clone,
+        F: Fn(
+            Static,
+            ProgramParameterValues<In, StatefulCompileTracer<'c>>,
+        ) -> Result<ProgramParameterValues<Out, StatefulCompileTracer<'c>>, Error>,
+        C: Context<Type = ArrayIrType, Constant = Constant, Operation = Operation>
+            + ImportingContext<Domain<'c>, Path>
+            + NamedAxes
+            + MeshContext,
+        C::Value: ValueProjection<ArrayType, Projected: Parameter>,
+        In::Family:
+            ParameterizedFamily<C::Value> + ParameterizedFamily<<C::Value as ValueProjection<ArrayType>>::Projected>,
+        Out::Family:
+            ParameterizedFamily<C::Value> + ParameterizedFamily<<C::Value as ValueProjection<ArrayType>>::Projected>,
+    {
+        let input_structure = inputs.parameter_structure();
+        let inputs = ProgramParameterValues::<In, C::Value>::from_parameters(
+            input_structure,
+            inputs.into_parameters().map(<C::Value as ValueProjection<ArrayType>>::from_projected),
+        )
+        .map_err(ProgramError::from)?;
+        let outputs = self.function.call_in_context(context, static_parameters, inputs)?;
+        Ok(project_values::<Out, C::Value>(outputs)?)
     }
 
     /// Returns a snapshot of this dispatcher's frontend activity (refer to [`DispatcherStatistics`]).
@@ -713,39 +802,65 @@ where
         self.function.source_program()
     }
 
-    /// Stages a call to this function into an active trace as a `jit_call` operation.
+    /// Calls this function as a `jit_call` operation in the active context recovered from `inputs`.
     ///
-    /// This does not execute anything. It records a trace boundary carrying this function's retained source program
-    /// so enclosing transforms can rewrite the boundary through the ordinary XLA operation rules. The call is
-    /// value-generic: `V` is a plain [`CoreTracer`](ryft_core::Tracer) under an ordinary trace, and a transform tracer (e.g. a
-    /// forward-mode dual) when an enclosing transform differentiates or otherwise rewrites the boundary through the
-    /// `jit_call` operation's own rules. Errors surface when capture registration or structured output reassembly
-    /// fails in the active context.
+    /// The call records a boundary that carries this function's retained source program, so enclosing transforms
+    /// rewrite it through the ordinary rules of the `jit_call` operation. Inputs and outputs are `ArrayType` values of
+    /// a [`ProjectedContext`] over an array IR context `C`, which the call recovers from the first input and calls the
+    /// function in. Under the eager [`Domain`], they are [`Array`]s and the call executes immediately. Under a trace or
+    /// a transform (e.g., forward mode differentiation), they are [`ProjectedValue`]s of its tracers and the call is
+    /// recorded or rewritten there. The function's captured runtime arrays enter `C` through
+    /// [`ImportingContext`](ryft_core::ImportingContext). Use [`Self::call_in_context`] for nullary functions, because
+    /// no input exists from which to recover the context.
+    ///
+    /// # Errors
+    ///
+    /// Returns [`ProgramError::InvalidInputCount`] when `inputs` has no leaves, and an error when importing a capture,
+    /// binding the call, or reassembling the structured outputs fails.
     #[inline]
-    pub fn call<V>(
-        &self,
-        inputs: In::To<ProjectedValue<ArrayType, V>>,
-    ) -> Result<Out::To<ProjectedValue<ArrayType, V>>, ProgramError>
+    pub fn call<L, C, Path>(&self, inputs: In::To<L>) -> Result<Out::To<L>, ProgramError>
     where
-        V: CoreValue<Type = ArrayIrType> + ValueProjection<ArrayType, Projected = ProjectedValue<ArrayType, V>>,
-        V::Domain: Context<Type = ArrayIrType, Constant = Constant, Operation = Operation>
-            + CapturingContext<Capture = StatefulValue<'c>>
-            + CoreConstant<V, Constant>,
-        In::Family: ParameterizedFamily<V> + ParameterizedFamily<ProjectedValue<ArrayType, V>>,
-        Out::Family: ParameterizedFamily<V> + ParameterizedFamily<ProjectedValue<ArrayType, V>>,
+        L: CoreValue<Type = ArrayType, Domain = ProjectedContext<C, ArrayType>>,
+        C: Context<Type = ArrayIrType, Constant = Constant, Operation = Operation>
+            + ContextProjection<ArrayType>
+            + ImportingContext<Domain<'c>, Path>,
+        C::Value: ValueProjection<ArrayType, Projected = L>,
+        In::Family: ParameterizedFamily<C::Value> + ParameterizedFamily<L>,
+        Out::Family: ParameterizedFamily<C::Value> + ParameterizedFamily<L>,
+    {
+        let context = inputs
+            .parameters()
+            .next()
+            .ok_or(ProgramError::InvalidInputCount { expected: 1, actual: 0 })?
+            .domain();
+        self.call_in_context(context.parent(), inputs)
+    }
+
+    /// Calls this function like [`Self::call`] in the provided array IR `context`, whose `ArrayType` projection the
+    /// inputs and outputs use. An explicit context also serves nullary functions.
+    ///
+    /// # Errors
+    ///
+    /// Returns an error when importing a capture, binding the call, or reassembling the structured outputs fails.
+    pub fn call_in_context<C, Path>(
+        &self,
+        context: &C,
+        inputs: In::To<<C::Value as ValueProjection<ArrayType>>::Projected>,
+    ) -> Result<Out::To<<C::Value as ValueProjection<ArrayType>>::Projected>, ProgramError>
+    where
+        C: Context<Type = ArrayIrType, Constant = Constant, Operation = Operation> + ImportingContext<Domain<'c>, Path>,
+        C::Value: ValueProjection<ArrayType, Projected: Parameter>,
+        In::Family:
+            ParameterizedFamily<C::Value> + ParameterizedFamily<<C::Value as ValueProjection<ArrayType>>::Projected>,
+        Out::Family:
+            ParameterizedFamily<C::Value> + ParameterizedFamily<<C::Value as ValueProjection<ArrayType>>::Projected>,
     {
         let input_structure = inputs.parameter_structure();
-        let inputs = ProgramParameterValues::<In, V>::from_parameters(
+        let inputs = ProgramParameterValues::<In, C::Value>::from_parameters(
             input_structure,
-            inputs.into_parameters().map(ProjectedValue::into_value),
+            inputs.into_parameters().map(<C::Value as ValueProjection<ArrayType>>::from_projected),
         )?;
-        let outputs = self.function.call(inputs)?;
-        let output_structure = outputs.parameter_structure();
-        let outputs = outputs
-            .into_parameters()
-            .map(|value| ValueProjection::<ArrayType>::into_projected(value).map_err(ProgramError::from))
-            .collect::<Result<Vec<_>, _>>()?;
-        Out::To::<ProjectedValue<ArrayType, V>>::from_parameters(output_structure, outputs).map_err(ProgramError::from)
+        project_values::<Out, C::Value>(self.function.call_in_context(context, inputs)?)
     }
 
     /// Consumes this facade and returns its array IR staged artifact for crate-internal verification.
@@ -1108,23 +1223,41 @@ where
         self.function.compiled_program().mesh()
     }
 
-    /// Stages a call to this compiled function into an active trace as a `jit_call` operation.
+    /// Calls this compiled function as a `jit_call` operation in the active context recovered from `inputs`. Use
+    /// [`ExecutableFunction::execute`] to run the retained executable directly on concrete arrays.
     ///
     /// Refer to the documentation of [`StagedFunction::call`] for more information.
     #[inline]
-    pub fn call<V>(
-        &self,
-        inputs: In::To<ProjectedValue<ArrayType, V>>,
-    ) -> Result<Out::To<ProjectedValue<ArrayType, V>>, ProgramError>
+    pub fn call<L, C, Path>(&self, inputs: In::To<L>) -> Result<Out::To<L>, ProgramError>
     where
-        V: CoreValue<Type = ArrayIrType> + ValueProjection<ArrayType, Projected = ProjectedValue<ArrayType, V>>,
-        V::Domain: Context<Type = ArrayIrType, Constant = Constant, Operation = Operation>
-            + CapturingContext<Capture = StatefulValue<'c>>
-            + CoreConstant<V, Constant>,
-        In::Family: ParameterizedFamily<V> + ParameterizedFamily<ProjectedValue<ArrayType, V>>,
-        Out::Family: ParameterizedFamily<V> + ParameterizedFamily<ProjectedValue<ArrayType, V>>,
+        L: CoreValue<Type = ArrayType, Domain = ProjectedContext<C, ArrayType>>,
+        C: Context<Type = ArrayIrType, Constant = Constant, Operation = Operation>
+            + ContextProjection<ArrayType>
+            + ImportingContext<Domain<'c>, Path>,
+        C::Value: ValueProjection<ArrayType, Projected = L>,
+        In::Family: ParameterizedFamily<C::Value> + ParameterizedFamily<L>,
+        Out::Family: ParameterizedFamily<C::Value> + ParameterizedFamily<L>,
     {
         self.staged().call(inputs)
+    }
+
+    /// Calls this compiled function like [`Self::call`] in the provided array IR `context`. Refer to the
+    /// documentation of [`StagedFunction::call_in_context`] for more information.
+    #[inline]
+    pub fn call_in_context<C, Path>(
+        &self,
+        context: &C,
+        inputs: In::To<<C::Value as ValueProjection<ArrayType>>::Projected>,
+    ) -> Result<Out::To<<C::Value as ValueProjection<ArrayType>>::Projected>, ProgramError>
+    where
+        C: Context<Type = ArrayIrType, Constant = Constant, Operation = Operation> + ImportingContext<Domain<'c>, Path>,
+        C::Value: ValueProjection<ArrayType, Projected: Parameter>,
+        In::Family:
+            ParameterizedFamily<C::Value> + ParameterizedFamily<<C::Value as ValueProjection<ArrayType>>::Projected>,
+        Out::Family:
+            ParameterizedFamily<C::Value> + ParameterizedFamily<<C::Value as ValueProjection<ArrayType>>::Projected>,
+    {
+        self.staged().call_in_context(context, inputs)
     }
 }
 
@@ -1195,15 +1328,8 @@ where
         )
         .map_err(ProgramError::from)?;
         let mesh = self.mesh().clone();
-        let captures = self
-            .source_program()
-            .captures()
-            .iter()
-            .cloned()
-            .map(|value| ValueProjection::<ArrayType>::into_projected(value).map_err(ProgramError::from))
-            .collect::<Result<Vec<_>, _>>()?;
         let compiled = compile_with_flat_captures(
-            move |capture_references, _, primals| {
+            move |_, _, primals| {
                 let primals = primals.into_parameters().map(ProjectedValue::into_value).collect::<Vec<_>>();
                 let context = primals
                     .first()
@@ -1212,8 +1338,14 @@ where
                     .clone();
                 let (output, pullback) = context.vjp(
                     move |inputs, ()| {
-                        let mut outputs =
-                            staged.call_flat_with_capture_references(capture_references.as_slice(), inputs)?;
+                        // The call imports the captures of this function into the trace, where they become captures of
+                        // the derived function.
+                        let context = inputs
+                            .first()
+                            .ok_or(ProgramError::InvalidInputCount { expected: 1, actual: 0 })?
+                            .context()
+                            .clone();
+                        let mut outputs = staged.call_flat_in_context(&context, inputs)?;
                         if outputs.len() != 1 {
                             return Err(ProgramError::InvalidOutputCount { expected: 1, actual: outputs.len() });
                         }
@@ -1233,7 +1365,7 @@ where
                     .map_err(ProgramError::from)
                     .map_err(Into::into)
             },
-            captures,
+            Vec::new(),
             input_signature,
             domain,
             Options::new(mesh),
@@ -1320,15 +1452,8 @@ where
         .map_err(ProgramError::from)?;
         let tangent_signature = input_signature.clone().try_map_parameters(|r#type| r#type.tangent())?;
         let mesh = self.mesh().clone();
-        let captures = self
-            .source_program()
-            .captures()
-            .iter()
-            .cloned()
-            .map(|value| ValueProjection::<ArrayType>::into_projected(value).map_err(ProgramError::from))
-            .collect::<Result<Vec<_>, _>>()?;
         let compiled = compile_with_flat_captures(
-            move |capture_references, _, (primals, tangents)| {
+            move |_, _, (primals, tangents)| {
                 let output_structure = staged.output_structure().clone();
                 let primals = primals.into_parameters().map(ProjectedValue::into_value).collect::<Vec<_>>();
                 let tangents = tangents.into_parameters().map(ProjectedValue::into_value).collect::<Vec<_>>();
@@ -1338,7 +1463,16 @@ where
                     .context()
                     .clone();
                 let (primal_outputs, tangent_outputs) = context.jvp(
-                    move |inputs, ()| staged.call_flat_with_capture_references(capture_references.as_slice(), inputs),
+                    move |inputs, ()| {
+                        // The call imports the captures of this function into the trace, where they become captures of
+                        // the derived function.
+                        let context = inputs
+                            .first()
+                            .ok_or(ProgramError::InvalidInputCount { expected: 1, actual: 0 })?
+                            .context()
+                            .clone();
+                        staged.call_flat_in_context(&context, inputs)
+                    },
                     primals,
                     tangents,
                     (),
@@ -1357,7 +1491,7 @@ where
                     Out::To::<_>::from_parameters(output_structure, tangent_outputs).map_err(ProgramError::from)?;
                 Ok((primal_tree, tangent_tree))
             },
-            captures,
+            Vec::new(),
             (input_signature, tangent_signature),
             domain,
             Options::new(mesh),
@@ -1366,44 +1500,151 @@ where
             Some((DomainWitness::new(domain), compiled.function.clone()));
         Ok(compiled)
     }
+}
 
-    /// Returns a new compiled function that runs `self` in parallel over `axis_size` batch items
-    /// along a new leading axis of each input and output. Mirrors `jax.vmap(f)` with default
-    /// `in_axes=0` / `out_axes=0`. Every input leaf gets a new leading axis of size `axis_size`;
-    /// every output leaf is materialized with the batched axis at position 0. The batched
-    /// leading axis is replicated for now.
+/// Batched tracer of one array IR batching level directly inside an XLA compilation trace.
+type CompileBatchTracer<'c> = BatchingTracer<DomainTracingContext<Domain<'c>, Value<'c>>, ArrayIrBatchingPolicy>;
+
+// Batching packaged as a function. Mirrors `jax.jit(jax.vmap(f))` for a static batch extent.
+impl<'c, In: Parameterized<ArrayType, To<ArrayType> = In>, Out: Parameterized<ArrayType>> CompiledFunction<'c, In, Out>
+where
+    In::Family: ParameterizedFamily<ArrayType, To = In>
+        + ParameterizedFamily<ArrayIrType>
+        + ParameterizedFamily<Constant>
+        + ParameterizedFamily<BatchAxis>
+        + ParameterizedFamily<CompileTracer<'c>>
+        + ParameterizedFamily<StatefulCompileTracer<'c>>
+        + ParameterizedFamily<CompileBatchTracer<'c>>,
+    In::ParameterStructure: Hash,
+    Out::Family: ParameterizedFamily<ArrayType>
+        + ParameterizedFamily<ArrayIrType>
+        + ParameterizedFamily<Constant>
+        + ParameterizedFamily<BatchAxis>
+        + ParameterizedFamily<CompileTracer<'c>>
+        + ParameterizedFamily<StatefulCompileTracer<'c>>
+        + ParameterizedFamily<CompileBatchTracer<'c>>,
+    Out::To<CompileTracer<'c>>: Parameterized<CompileTracer<'c>, To<ArrayType> = Out, To<Constant> = Out::To<Constant>>,
+    ProgramParameterValues<Out, StatefulCompileTracer<'c>>: Parameterized<
+            StatefulCompileTracer<'c>,
+            To<ArrayIrType> = ProgramParameters<Out>,
+            To<Constant> = ProgramConstants<Out>,
+        >,
+{
+    /// Returns a new compiled function that runs `self` once over a whole batch of `batch_axis.extent()` items instead
+    /// of once per item. Mirrors `jax.jit(jax.vmap(f))`. The returned function stages [`batch`](ryft_core::batch)
+    /// around a [`Self::call`] of this function and compiles the result, so the batched function is ordinary staged
+    /// source that composes with further transforms and compilations, and this function's captures become its
+    /// captures.
     ///
-    /// Array IR compiled-function batching is not implemented. This method returns a precise unsupported-operation
-    /// diagnostic instead of reinterpreting projected batching values.
+    /// The arguments follow [`batch`](ryft_core::batch). `input_batch_axes` and `output_batch_axes` are broadcast into
+    /// the input and output structures of this function. A mapped input leaf gains a batch axis of the requested extent
+    /// at its position, and its new axis is replicated across the mesh, while a replicated input leaf keeps its type.
+    /// `batch_axis` must carry an explicit static extent, which also drives batches whose inputs are all replicated.
+    /// Its axis name, if any, is visible to the function, so that collectives and [`AxisIndex`](ryft_core::AxisIndex)
+    /// reads inside it can address the batch. Runtime batch extents are available by calling
+    /// [`batch`](ryft_core::batch) directly inside a function that is staged with an explicit extent input.
     ///
-    /// Homogeneous static-extent array regions already retain structurally batched programs through
-    /// `ryft_core::programs::transforms::Transform`. Array IR XLA batching must additionally define how its live
-    /// first-class extent crosses the transformed boundary: only the extent's static type/identity contract belongs in
-    /// the transform key, while the current extent value remains an explicit runtime operand. The axis name, mapped
-    /// sharding, normalized input axes, and output policy likewise complete that array IR marker's structural key.
+    /// # Errors
     ///
-    /// # Limitation
-    ///
-    /// Even once array IR batching is available, a [`ShardMapOperation`](ryft_core::ShardMapOperation) batches mapped
-    /// inputs only for a static batch extent, because its batching rule turns the batch axis into a dimension of its
-    /// static boundary types, so a runtime extent operand makes its mapped batching fail with
-    /// [`ShardMapError::DynamicBatchExtentNotSupported`](ryft_core::ShardMapError::DynamicBatchExtentNotSupported).
-    /// Every other operation, including the `reshard` and `constrain_sharding` sharding-control operations, batches
-    /// through its own batching rule.
+    /// Returns an error when `batch_axis` has no extent, when this function has no inputs, when the batch axes do not
+    /// fit the input or output structures, or when batching or compiling the function fails.
     #[track_caller]
-    pub fn batch<'domain>(
-        &'domain self,
-        domain: &'domain Domain<'c>,
-        axis_size: usize,
-    ) -> Result<CompiledFunction<'c, In, Out>, Error>
-    where
-        'c: 'domain,
-    {
-        let _ = (self, domain, axis_size);
-        Err(ProgramError::UnsupportedOperation {
-            message: "compiled XLA batching does not support array IR region boundaries".to_string(),
-        }
-        .into())
+    pub fn batch<InputBatchAxes: Parameterized<BatchAxis>, OutputBatchAxes: Parameterized<BatchAxis>>(
+        &self,
+        domain: &Domain<'c>,
+        input_batch_axes: InputBatchAxes,
+        output_batch_axes: OutputBatchAxes,
+        batch_axis: BatchAxisSpecification<usize>,
+    ) -> Result<CompiledFunction<'c, In, Out>, Error> {
+        let extent = *batch_axis.extent().ok_or_else(|| ProgramError::InvalidArgument {
+            message: "compiled function batching requires an explicit static batch extent".to_string(),
+        })?;
+        let axis_name = batch_axis.name().map(str::to_string);
+        let staged = self.function.staged().clone();
+        let input_structure = staged.input_structure().clone();
+        let output_structure = staged.output_structure().clone();
+        let input_types = In::from_parameters(
+            input_structure.clone(),
+            staged
+                .input_types()
+                .iter()
+                .map(|r#type| <&ArrayType>::try_from(r#type).cloned().map_err(ProgramError::from))
+                .collect::<Result<Vec<_>, _>>()?,
+        )
+        .map_err(ProgramError::from)?;
+        let input_batch_axes = input_batch_axes
+            .broadcast_to_parameter_structure::<In::To<BatchAxis>>(input_structure.clone())
+            .map_err(ProgramError::from)?
+            .into_parameters()
+            .collect::<Vec<_>>();
+        let output_batch_axes = output_batch_axes
+            .broadcast_to_parameter_structure::<Out::To<BatchAxis>>(output_structure.clone())
+            .map_err(ProgramError::from)?
+            .into_parameters()
+            .collect::<Vec<_>>();
+
+        // Insert the batch axis into the type of every mapped input leaf, normalizing it against the batched rank as
+        // `batch` does for its inputs.
+        let batched_input_types = input_types
+            .into_parameters()
+            .zip(&input_batch_axes)
+            .map(|(r#type, batch_axis)| match batch_axis.axis() {
+                None => Ok(r#type),
+                Some(axis) => {
+                    let position = axis.normalize(r#type.rank() + 1).map_err(ProgramError::from)?;
+                    Ok(r#type.batched(position, CoreDimension::Static(extent), ShardingDimension::replicated())?)
+                }
+            })
+            .collect::<Result<Vec<_>, BatchingError>>()
+            .map_err(ProgramError::from)?;
+        let batched_input_types =
+            In::from_parameters(input_structure.clone(), batched_input_types).map_err(ProgramError::from)?;
+
+        compile_with_flat_captures::<_, In, Out>(
+            move |_, _, inputs| {
+                let inputs = inputs.into_parameters().map(ProjectedValue::into_value).collect::<Vec<_>>();
+                let context =
+                    inputs.first().ok_or(ProgramError::InvalidInputCount { expected: 1, actual: 0 })?.context().clone();
+
+                // An explicit first-class extent also defines the batch when every input is replicated.
+                let extent = context.lift(Constant::Dimension(DimensionValue::constant(extent)?))?;
+                let batch_axis = match axis_name {
+                    Some(axis_name) => BatchAxisSpecification::new(extent, axis_name),
+                    None => BatchAxisSpecification::with_extent(extent),
+                };
+                let outputs = context
+                    .batch(
+                        |inputs: Vec<CompileBatchTracer<'c>>| {
+                            let context = inputs
+                                .first()
+                                .ok_or(ProgramError::InvalidInputCount { expected: 1, actual: 0 })?
+                                .context()
+                                .clone();
+                            let inputs = ProgramParameterValues::<In, CompileBatchTracer<'c>>::from_parameters(
+                                input_structure,
+                                inputs,
+                            )?;
+                            let outputs = staged.call_in_context::<CompileBatchTracer<'c>, _, _>(&context, inputs)?;
+                            Ok(outputs.into_parameters().collect::<Vec<CompileBatchTracer<'c>>>())
+                        },
+                        inputs,
+                        input_batch_axes,
+                        output_batch_axes,
+                        batch_axis,
+                    )
+                    .map_err(ProgramError::from)?;
+                let outputs = outputs
+                    .into_iter()
+                    .map(|value| ValueProjection::<ArrayType>::into_projected(value).map_err(ProgramError::from))
+                    .collect::<Result<Vec<_>, _>>()?;
+                Ok(Out::To::<CompileTracer<'c>>::from_parameters(output_structure, outputs)
+                    .map_err(ProgramError::from)?)
+            },
+            Vec::new(),
+            batched_input_types,
+            domain,
+            Options::new(self.mesh().clone()),
+        )
     }
 }
 
@@ -1751,21 +1992,22 @@ pub(crate) mod tests {
 
     use ryft_core::{
         Add, AddOperation, ArgMax, Array as CoreArray, ArrayIrType, ArrayOperation, ArrayReference,
-        ArrayReferenceTransform, ArrayReferenceTransformIndex, ArrayType, Atan2, AttachedRegions, Broadcast,
-        CaptureReference, Compare, ComparisonDirection, Condition, ConstrainSharding, Context, ConvertElementType, Cos,
-        CotangentDestinationKind, Cumulative, CustomCall, CustomCallOperation, DataType, Device, DeviceMesh,
-        DifferentiableType, Differentiate, Dimension as CoreDimension, DimensionBounds, DimensionSizeOperation,
-        DimensionVariable, Div, DomainTracer, DomainTracingContext, Dot, DotDimensionNumbers, DynamicSlice,
-        DynamicUpdateSlice, EagerContext, Exp, Fill, ForwardModeDifferentiate, Hessian, Iota, Jacobian, LogicalMesh,
-        Logistic, Memory, MeshAxis, MeshAxisType, Mul, MulOperation, OneLike, ParallelVaryOperation, Placeholder,
+        ArrayReferenceTransform, ArrayReferenceTransformIndex, ArrayType, Atan2, AttachedRegions, AxisIndex, BatchAxis,
+        BatchAxisSpecification, Broadcast, CaptureReference, Compare, ComparisonDirection, Condition,
+        ConstrainSharding, Context, ConvertElementType, Cos, CotangentDestinationKind, Cumulative, CustomCall,
+        CustomCallOperation, DataType, Device, DeviceMesh, DifferentiableType, Differentiate,
+        Dimension as CoreDimension, DimensionBounds, DimensionSize, DimensionSizeOperation, DimensionVariable, Div,
+        DomainTracer, DomainTracingContext, Dot, DotDimensionNumbers, DynamicSlice, DynamicUpdateSlice, EagerContext,
+        Error as CoreError, Exp, Fill, ForwardModeDifferentiate, Hessian, Iota, Jacobian, LogicalMesh, Logistic,
+        MaybeZero, Memory, MeshAxis, MeshAxisType, Mul, MulOperation, OneLike, ParallelVaryOperation, Placeholder,
         ProgramBuilder as CoreProgramBuilder, ProgramError, ProjectedValue, Random, Reduce, ReductionKind,
         ReferenceAddUpdate, ReferenceAddUpdateOperation, ReferenceCompletion as CoreReferenceCompletion,
         ReferenceCompletionBackend, ReferenceError, ReferenceFreeze, ReferenceFreezeOperation, ReferenceNew,
         ReferenceNewOperation, ReferenceRead, ReferenceReadOperation, ReferenceType, Reshape, Reshard, ScanOperation,
-        Select, Shape, ShardMapBoundary, ShardMapOperation, Sharding, ShardingDimension, Sin, Softmax,
-        StagedFunction as CoreStagedFunction, StopGradient, StopGradientOperation, Sub, Tanh, TopK, Trace,
-        TransferToMemory, Typed, TypedProgram, Value as CoreValue, ValueProjection, WhileOperation, ZeroLike,
-        differentiate_at,
+        ScanOptions, Select, Shape, ShardMapBoundary, ShardMapOperation, Sharding, ShardingDimension, Sin, Softmax,
+        StagedFunction as CoreStagedFunction, StopGradient, StopGradientOperation, Sub, Tanh, TopK, Trace, Tracer,
+        TracingContext, TransferToMemory, Typed, TypedProgram, Value as CoreValue, ValueProjection, WhileOperation,
+        ZeroLike, batch, batch_in_parent, composite, differentiate_at, differentiate_in_parent_at, rematerialize, scan,
     };
     use ryft_pjrt::{ClientOptions, CpuClientOptions, load_cpu_plugin};
 
@@ -3108,7 +3350,7 @@ pub(crate) mod tests {
             |capture_references, _, input| {
                 // Capture metadata cannot recover the enclosing trace when the callee has no public input leaves.
                 assert!(matches!(
-                    inner.call::<StatefulCompileTracer<'_>>(()),
+                    inner.call::<StatefulCompileTracer<'_>, _>(()),
                     Err(ProgramError::InvalidInputCount { expected: 1, actual: 0 }),
                 ));
                 assert!(matches!(
@@ -4796,6 +5038,62 @@ pub(crate) mod tests {
             Err(Error::Core(ryft_core::Error::Reference(ReferenceError::Frozen))),
         ));
         assert_eq!(read_f32_array(&client, &first.read().unwrap()), vec![1.0]);
+    }
+
+    #[test]
+    fn test_dense_differentiation_of_array_ir_values() {
+        let client = execution_client();
+        let mesh = single_device_mesh(&client);
+        let engine = Session::new(&client).domain();
+        let vector_type = ArrayType::new_static(DataType::F32, [2])
+            .with_sharding(Sharding::replicated(mesh.logical_mesh().clone(), 1))
+            .unwrap();
+
+        // The dense builders run directly on array IR values (rather than on their array projections), whose packed
+        // replay batches the derivative program in the array IR universe.
+        let function: CompiledFunction<'_, ArrayType, (ArrayType, ArrayType, ArrayType)> = compile(
+            |x| {
+                let x = x.into_value();
+                let context = x.context().clone();
+                // Both cube closures differentiate `x ↦ x³`, and the Hessian differentiates `x ↦ x²`, elementwise.
+                let forward = context
+                    .differentiate_at(x.clone())
+                    .jacobian_forward(|x| {
+                        let x = ValueProjection::<ArrayType>::into_projected(x)?;
+                        Ok(x.mul(&x)?.mul(&x)?.into_value())
+                    })
+                    .unwrap();
+                let reverse = context
+                    .differentiate_at(x.clone())
+                    .jacobian_reverse(|x| {
+                        let x = ValueProjection::<ArrayType>::into_projected(x)?;
+                        Ok(x.mul(&x)?.mul(&x)?.into_value())
+                    })
+                    .unwrap();
+                let hessian = context
+                    .differentiate_at(x)
+                    .hessian(|x| {
+                        let x = ValueProjection::<ArrayType>::into_projected(x)?;
+                        Ok(x.mul(&x)?.into_value())
+                    })
+                    .unwrap();
+                (
+                    ValueProjection::<ArrayType>::into_projected(forward.values()[0].clone()).unwrap(),
+                    ValueProjection::<ArrayType>::into_projected(reverse.values()[0].clone()).unwrap(),
+                    ValueProjection::<ArrayType>::into_projected(hessian.values()[0].clone()).unwrap(),
+                )
+            },
+            vector_type.clone(),
+            &engine,
+            mesh.clone(),
+        )
+        .unwrap();
+        let x = Array::from_host_buffer(&engine, vector_type, mesh, values_to_bytes::<f32>(&[1.0, -2.0]).as_slice())
+            .unwrap();
+        let (forward, reverse, hessian) = function.executable().execute(&engine, x).unwrap();
+        assert_eq!(read_f32_array(&client, &forward), vec![3.0, 0.0, 0.0, 12.0]);
+        assert_eq!(read_f32_array(&client, &reverse), vec![3.0, 0.0, 0.0, 12.0]);
+        assert_eq!(read_f32_array(&client, &hessian), vec![2.0, 0.0, 0.0, 0.0, 0.0, 0.0, 0.0, 2.0]);
     }
 
     #[test]
@@ -6675,26 +6973,83 @@ pub(crate) mod tests {
     }
 
     #[test]
-    fn test_batch_method_rejects_array_ir_region_boundaries() {
-        // Compiled-function batching reports its unsupported array IR region boundary directly.
-        let plugin = load_cpu_plugin().unwrap();
-        let client = plugin
-            .client(ClientOptions::CPU(CpuClientOptions { device_count: Some(1), ..Default::default() }))
-            .unwrap();
+    fn test_compiled_function_batch() {
+        let client = execution_client();
         let mesh = single_device_mesh(&client);
         let engine = Session::new(&client).domain();
-
-        let scalar_sharding = Sharding::replicated(mesh.logical_mesh().clone(), 0);
-        let scalar_input_type =
-            ArrayType::new(DataType::F32, Shape::new(Vec::new())).with_sharding(scalar_sharding).unwrap();
-
-        let inner: CompiledFunction<'_, ArrayType, ArrayType> =
-            compile(|x| x.sin().unwrap(), scalar_input_type, &engine, mesh.clone()).unwrap();
-        let error = match inner.batch(&engine, 4) {
-            Ok(_) => panic!("compiled batching should reject unsupported array IR region boundaries"),
-            Err(error) => error,
+        let replicated = |rank| Sharding::replicated(mesh.logical_mesh().clone(), rank);
+        let vector_type = ArrayType::new_static(DataType::F32, [2]).with_sharding(replicated(1)).unwrap();
+        let array = |r#type: ArrayType, values: &[f32]| {
+            Array::from_host_buffer(&engine, r#type, mesh.clone(), values_to_bytes::<f32>(values).as_slice()).unwrap()
         };
-        assert_eq!(error.to_string(), "compiled XLA batching does not support array IR region boundaries");
+
+        // `f(x, y) = x * y + c` with a captured `c`, so the batched function also inherits a capture.
+        let function: CompiledFunction<'_, (ArrayType, ArrayType), ArrayType> = compile_with_captures(
+            |captures, (x, y)| x * y + captures[0].clone(),
+            vec![array(vector_type.clone(), &[10.0, 20.0])],
+            (vector_type.clone(), vector_type.clone()),
+            &engine,
+            mesh.clone(),
+        )
+        .unwrap();
+
+        // `x` is mapped along its leading axis and `y` is replicated, so the batched function takes a `[3, 2]` array
+        // and a `[2]` array, and its output gains the batch axis at the requested trailing position.
+        let batched = function
+            .batch(
+                &engine,
+                (BatchAxis::new(0), BatchAxis::replicated()),
+                BatchAxis::new(-1),
+                BatchAxisSpecification::with_extent(3),
+            )
+            .unwrap();
+        assert_eq!(batched.source_program().captures().len(), 1);
+        let matrix_type = ArrayType::new_static(DataType::F32, [3, 2]).with_sharding(replicated(2)).unwrap();
+        let output = batched
+            .executable()
+            .execute(
+                &engine,
+                (array(matrix_type, &[1.0, 2.0, 3.0, 4.0, 5.0, 6.0]), array(vector_type.clone(), &[1.0, -1.0])),
+            )
+            .unwrap();
+        assert_eq!(output.shape().dimensions(), &[2, 3]);
+        assert_eq!(read_f32_array(&client, &output), vec![11.0, 13.0, 15.0, 18.0, 16.0, 14.0]);
+
+        // The batched function is ordinary staged source, so it can be differentiated in turn.
+        let jvp = batched.jvp(&engine).unwrap();
+        let matrix_type = ArrayType::new_static(DataType::F32, [3, 2]).with_sharding(replicated(2)).unwrap();
+        let (primal, tangent) = jvp
+            .executable()
+            .execute(
+                &engine,
+                (
+                    (
+                        array(matrix_type.clone(), &[1.0, 2.0, 3.0, 4.0, 5.0, 6.0]),
+                        array(vector_type.clone(), &[1.0, -1.0]),
+                    ),
+                    (array(matrix_type, &[1.0; 6]), array(vector_type, &[0.0, 0.0])),
+                ),
+            )
+            .unwrap();
+        assert_eq!(read_f32_array(&client, &primal), vec![11.0, 13.0, 15.0, 18.0, 16.0, 14.0]);
+        assert_eq!(read_f32_array(&client, &tangent), vec![1.0, 1.0, 1.0, -1.0, -1.0, -1.0]);
+    }
+
+    #[test]
+    fn test_compiled_function_batch_requires_static_extent() {
+        let client = execution_client();
+        let mesh = single_device_mesh(&client);
+        let engine = Session::new(&client).domain();
+        let scalar_type = ArrayType::scalar(DataType::F32)
+            .with_sharding(Sharding::replicated(mesh.logical_mesh().clone(), 0))
+            .unwrap();
+        let function: CompiledFunction<'_, ArrayType, ArrayType> =
+            compile(|x| x.sin().unwrap(), scalar_type, &engine, mesh).unwrap();
+        assert!(matches!(
+            function.batch(&engine, BatchAxis::new(0), BatchAxis::new(0), BatchAxisSpecification::named("i")),
+            Err(Error::Core(CoreError::Program(ProgramError::InvalidArgument { message })))
+                if message == "compiled function batching requires an explicit static batch extent",
+        ));
     }
 
     #[test]
@@ -7306,6 +7661,549 @@ pub(crate) mod tests {
         assert_eq!(observed.len(), 1);
         let expected = (input_value + 0.25).sin().cos();
         assert!((observed[0] - expected).abs() < 1e-5, "expected cos(sin(x + bias)) = {expected}, got {}", observed[0]);
+    }
+
+    #[test]
+    fn test_compiled_function_call_under_eager_parents() {
+        let client = execution_client();
+        let mesh = single_device_mesh(&client);
+        let engine = Session::new(&client).domain();
+        let vector_type = ArrayType::new_static(DataType::F32, [3])
+            .with_sharding(Sharding::replicated(mesh.logical_mesh().clone(), 1))
+            .unwrap();
+        let matrix_type = ArrayType::new_static(DataType::F32, [2, 3])
+            .with_sharding(Sharding::replicated(mesh.logical_mesh().clone(), 2))
+            .unwrap();
+        let array = |r#type: &ArrayType, values: &[f32]| {
+            Array::from_host_buffer(&engine, r#type.clone(), mesh.clone(), values_to_bytes::<f32>(values).as_slice())
+                .unwrap()
+        };
+        let read =
+            |value: Value<'_>| read_f32_array(&client, &ValueProjection::<ArrayType>::into_projected(value).unwrap());
+
+        // `f(x) = x * c` captures the runtime array `c`, so every call below also imports a capture into its parent.
+        let function: CompiledFunction<'_, ArrayType, ArrayType> = compile_with_captures(
+            |captures, x| x * captures[0].clone(),
+            vec![array(&vector_type, &[2.0, -1.0, 0.5])],
+            vector_type.clone(),
+            &engine,
+            mesh.clone(),
+        )
+        .unwrap();
+
+        // An eager parent executes the call immediately on concrete arrays.
+        let output = function.call(array(&vector_type, &[1.0, 2.0, 3.0])).unwrap();
+        assert_eq!(read_f32_array(&client, &output), vec![2.0, -2.0, 1.5]);
+
+        // Eager forward mode differentiation treats the capture as a constant, so the tangent of `x * c` is `t * c`.
+        let (primal, tangent) = engine
+            .differentiate_at(Value::Array(array(&vector_type, &[1.0, 2.0, 3.0])))
+            .jvp(Value::Array(array(&vector_type, &[1.0, 1.0, 2.0])), |x| {
+                Ok(function.call(ValueProjection::<ArrayType>::into_projected(x)?)?.into_value())
+            })
+            .unwrap();
+        assert_eq!(read(primal), vec![2.0, -2.0, 1.5]);
+        assert_eq!(read(tangent), vec![2.0, -1.0, 1.0]);
+
+        // Eager batching treats the capture as replicated and batches the call itself.
+        let batched = batch(
+            |x| Ok(function.call(ValueProjection::<ArrayType>::into_projected(x)?)?.into_value()),
+            Value::Array(array(&matrix_type, &[1.0, 2.0, 3.0, 4.0, 5.0, 6.0])),
+            BatchAxis::new(0),
+            BatchAxis::new(0),
+            BatchAxisSpecification::default(),
+        )
+        .unwrap();
+        assert_eq!(read(batched), vec![2.0, -2.0, 1.5, 8.0, -5.0, 3.0]);
+    }
+
+    #[test]
+    fn test_compiled_function_call_inside_rematerialize_and_composite() {
+        type Body = Tracer<TracingContext<Constant, Operation>>;
+        // Composite rules must be `'static`, and so the compiled function that they call must outlive every borrow.
+        let client = Box::leak(Box::new(execution_client()));
+        let mesh = single_device_mesh(client);
+        let engine = Session::new(client).domain();
+        let vector_type = ArrayType::new_static(DataType::F32, [3])
+            .with_sharding(Sharding::replicated(mesh.logical_mesh().clone(), 1))
+            .unwrap();
+        let array = |values: &[f32]| {
+            Array::from_host_buffer(
+                &engine,
+                vector_type.clone(),
+                mesh.clone(),
+                values_to_bytes::<f32>(values).as_slice(),
+            )
+            .unwrap()
+        };
+
+        // `f(x) = x * c` captures the runtime array `c`. Rematerialized and composite bodies are traced over constants
+        // alone, so calling `f` inside them imports `c` as a session constant.
+        let function: CompiledFunction<'_, ArrayType, ArrayType> = compile_with_captures(
+            |captures, x| x * captures[0].clone(),
+            vec![array(&[2.0, -1.0, 0.5])],
+            vector_type.clone(),
+            &engine,
+            mesh.clone(),
+        )
+        .unwrap();
+        let rematerialized =
+            rematerialize(|x: Body| Ok(function.call(ValueProjection::<ArrayType>::into_projected(x)?)?.into_value()));
+        let composed = composite({
+            let function = function.clone();
+            move |x: Body| Ok(function.call(ValueProjection::<ArrayType>::into_projected(x)?)?.into_value())
+        });
+
+        // The pullbacks of both bodies scale the cotangent by `c`, which reaches the outer executable as a hidden
+        // argument rather than as a literal.
+        let outer: CompiledFunction<'_, (ArrayType, ArrayType), (ArrayType, ArrayType, ArrayType)> = compile(
+            |(x, cotangent)| {
+                let x = x.into_value();
+                let cotangent = cotangent.into_value();
+                let context = x.context().clone();
+                let (output, pullback) = context.differentiate_at(x.clone()).vjp(|x| rematerialized.call(x)).unwrap();
+                let rematerialized_gradient = pullback.apply_materialized(cotangent.clone()).unwrap();
+                let (_, pullback) = context.differentiate_at(x).vjp(|x| composed.call(x)).unwrap();
+                let composed_gradient = pullback.apply_materialized(cotangent).unwrap();
+                (
+                    ValueProjection::<ArrayType>::into_projected(output).unwrap(),
+                    ValueProjection::<ArrayType>::into_projected(rematerialized_gradient).unwrap(),
+                    ValueProjection::<ArrayType>::into_projected(composed_gradient).unwrap(),
+                )
+            },
+            (vector_type.clone(), vector_type.clone()),
+            &engine,
+            mesh.clone(),
+        )
+        .unwrap();
+        let (output, rematerialized_gradient, composed_gradient) =
+            outer.executable().execute(&engine, (array(&[1.0, 2.0, 3.0]), array(&[1.0, 1.0, 2.0]))).unwrap();
+        assert_eq!(read_f32_array(client, &output), vec![2.0, -2.0, 1.5]);
+        assert_eq!(read_f32_array(client, &rematerialized_gradient), vec![2.0, -1.0, 1.0]);
+        assert_eq!(read_f32_array(client, &composed_gradient), vec![2.0, -1.0, 1.0]);
+
+        // Eager parents resolve the session constant when lifting it, and eager dispatch passes its array to the
+        // executables of the rematerialized and composite applications.
+        let read =
+            |value: Value<'_>| read_f32_array(client, &ValueProjection::<ArrayType>::into_projected(value).unwrap());
+        assert_eq!(read(rematerialized.call(Value::Array(array(&[1.0, 2.0, 3.0]))).unwrap()), vec![2.0, -2.0, 1.5]);
+        assert_eq!(read(composed.call(Value::Array(array(&[1.0, 2.0, 3.0]))).unwrap()), vec![2.0, -2.0, 1.5]);
+    }
+
+    #[test]
+    fn test_compiled_function_call_inside_nested_body_regions_and_custom_rules() {
+        type Body = Tracer<TracingContext<Constant, Operation>>;
+        let client = Box::leak(Box::new(execution_client()));
+        let mesh = single_device_mesh(client);
+        let engine = Session::new(client).domain();
+        let vector_type = ArrayType::new_static(DataType::F32, [3])
+            .with_sharding(Sharding::replicated(mesh.logical_mesh().clone(), 1))
+            .unwrap();
+        let array = |values: &[f32]| {
+            Array::from_host_buffer(
+                &engine,
+                vector_type.clone(),
+                mesh.clone(),
+                values_to_bytes::<f32>(values).as_slice(),
+            )
+            .unwrap()
+        };
+        let function: CompiledFunction<'_, ArrayType, ArrayType> = compile_with_captures(
+            |captures, x| x * captures[0].clone(),
+            vec![array(&[2.0, -1.0, 0.5])],
+            vector_type.clone(),
+            &engine,
+            mesh.clone(),
+        )
+        .unwrap();
+
+        // A `scan` nested in a rematerialized body imports the capture of `f` through its own trace, so its session
+        // constant lives in a region attached to the rematerialized body: `x ↦ x * c³`.
+        let rematerialized = rematerialize(|x: Body| {
+            let (carry, ()) = scan(
+                |_, carry, _| {
+                    Ok((function.call(ValueProjection::<ArrayType>::into_projected(carry)?)?.into_value(), ()))
+                },
+                x.clone(),
+                x,
+                ScanOptions::new(),
+            )?;
+            Ok(carry)
+        });
+
+        // A custom forward-mode rule that calls `f` on the tangent is traced lazily, after the primal body.
+        let composed = composite({
+            let function = function.clone();
+            move |x: Body| Ok(function.call(ValueProjection::<ArrayType>::into_projected(x)?)?.into_value())
+        })
+        .with_jvp({
+            let function = function.clone();
+            move |x: Body, tangent: Body| {
+                let call = |value: Body| -> Result<Body, ProgramError> {
+                    Ok(function.call(ValueProjection::<ArrayType>::into_projected(value)?)?.into_value())
+                };
+                Ok((call(x)?, call(tangent)?))
+            }
+        });
+
+        let outer: CompiledFunction<'_, (ArrayType, ArrayType), (ArrayType, ArrayType)> = compile(
+            |(x, tangent)| {
+                let x = x.into_value();
+                let tangent = tangent.into_value();
+                let context = x.context().clone();
+                let (_, pullback) = context.differentiate_at(x.clone()).vjp(|x| rematerialized.call(x)).unwrap();
+                let gradient = pullback.apply_materialized(tangent.clone()).unwrap();
+                let (_, tangent) = context.differentiate_at(x).jvp(tangent, |x| composed.call(x)).unwrap();
+                (
+                    ValueProjection::<ArrayType>::into_projected(gradient).unwrap(),
+                    ValueProjection::<ArrayType>::into_projected(tangent).unwrap(),
+                )
+            },
+            (vector_type.clone(), vector_type.clone()),
+            &engine,
+            mesh.clone(),
+        )
+        .unwrap();
+        let (gradient, tangent) =
+            outer.executable().execute(&engine, (array(&[1.0, 2.0, 3.0]), array(&[1.0, 1.0, 2.0]))).unwrap();
+        assert_eq!(read_f32_array(client, &gradient), vec![8.0, -1.0, 0.25]);
+        assert_eq!(read_f32_array(client, &tangent), vec![2.0, -1.0, 1.0]);
+    }
+
+    #[test]
+    fn test_compiled_function_call_inside_batch_in_parent() {
+        let client = execution_client();
+        let mesh = single_device_mesh(&client);
+        let engine = Session::new(&client).domain();
+        let vector_type = ArrayType::new_static(DataType::F32, [3])
+            .with_sharding(Sharding::replicated(mesh.logical_mesh().clone(), 1))
+            .unwrap();
+        let matrix_type = ArrayType::new_static(DataType::F32, [2, 3])
+            .with_sharding(Sharding::replicated(mesh.logical_mesh().clone(), 2))
+            .unwrap();
+        let array = |r#type: &ArrayType, values: &[f32]| {
+            Array::from_host_buffer(&engine, r#type.clone(), mesh.clone(), values_to_bytes::<f32>(values).as_slice())
+                .unwrap()
+        };
+        let function: CompiledFunction<'_, ArrayType, ArrayType> = compile_with_captures(
+            |captures, x| x * captures[0].clone(),
+            vec![array(&vector_type, &[2.0, -1.0, 0.5])],
+            vector_type.clone(),
+            &engine,
+            mesh.clone(),
+        )
+        .unwrap();
+
+        // Batching array leaves in their array IR parent lets the batched closure call compiled functions, both on
+        // eager arrays and on the array leaves of an enclosing compilation.
+        let batched = batch_in_parent(
+            |x| Ok(function.call(x)?),
+            array(&matrix_type, &[1.0, 2.0, 3.0, 4.0, 5.0, 6.0]),
+            BatchAxis::new(0),
+            BatchAxis::new(0),
+            BatchAxisSpecification::default(),
+        )
+        .unwrap();
+        assert_eq!(read_f32_array(&client, &batched), vec![2.0, -2.0, 1.5, 8.0, -5.0, 3.0]);
+        let outer: CompiledFunction<'_, ArrayType, ArrayType> = compile(
+            |xs| {
+                batch_in_parent(
+                    |x| Ok(function.call(x)?),
+                    xs,
+                    BatchAxis::new(0),
+                    BatchAxis::new(1),
+                    BatchAxisSpecification::default(),
+                )
+                .unwrap()
+            },
+            matrix_type.clone(),
+            &engine,
+            mesh.clone(),
+        )
+        .unwrap();
+        let output = outer.executable().execute(&engine, array(&matrix_type, &[1.0, 2.0, 3.0, 4.0, 5.0, 6.0])).unwrap();
+        assert_eq!(read_f32_array(&client, &output), vec![2.0, 8.0, -2.0, -5.0, 1.5, 3.0]);
+    }
+
+    #[test]
+    fn test_compiled_function_call_inside_differentiate_in_parent_at() {
+        let client = execution_client();
+        let mesh = single_device_mesh(&client);
+        let engine = Session::new(&client).domain();
+        let vector_type = ArrayType::new_static(DataType::F32, [3])
+            .with_sharding(Sharding::replicated(mesh.logical_mesh().clone(), 1))
+            .unwrap();
+        let array = |values: &[f32]| {
+            Array::from_host_buffer(
+                &engine,
+                vector_type.clone(),
+                mesh.clone(),
+                values_to_bytes::<f32>(values).as_slice(),
+            )
+            .unwrap()
+        };
+        let read = |array: &Array<'_>| read_f32_array(&client, array);
+        let dimensions = DotDimensionNumbers::new(vec![0], vec![0], vec![], vec![]);
+        let function: CompiledFunction<'_, ArrayType, ArrayType> = compile_with_captures(
+            |captures, x| x * captures[0].clone(),
+            vec![array(&[2.0, -1.0, 0.5])],
+            vector_type.clone(),
+            &engine,
+            mesh.clone(),
+        )
+        .unwrap();
+
+        // Differentiating array leaves in their array IR parent lets the differentiated closures call compiled
+        // functions, and every derivative result keeps arrays at its boundary. `f(x) = x * c` has the Jacobian
+        // `diag(c)`, and `x ↦ f(x) · x` has the gradient `2 * c * x`.
+        let (output, tangent) = differentiate_in_parent_at(array(&[1.0, 2.0, 3.0]))
+            .jvp(array(&[1.0, 1.0, 2.0]), |x| Ok(function.call(x)?))
+            .unwrap();
+        assert_eq!((read(&output), read(&tangent)), (vec![2.0, -2.0, 1.5], vec![2.0, -1.0, 1.0]));
+        let (_, pushforward) =
+            differentiate_in_parent_at(array(&[1.0, 2.0, 3.0])).linearize(|x| Ok(function.call(x)?)).unwrap();
+        assert_eq!(read(&pushforward.apply(array(&[1.0, 1.0, 2.0])).unwrap()), vec![2.0, -1.0, 1.0]);
+        let (_, pullback) = differentiate_in_parent_at(array(&[1.0, 2.0, 3.0])).vjp(|x| Ok(function.call(x)?)).unwrap();
+        assert_eq!(read(&pullback.apply_materialized(array(&[1.0, 1.0, 2.0])).unwrap()), vec![2.0, -1.0, 1.0]);
+        let MaybeZero::Value(cotangent) = pullback.apply(array(&[1.0, 1.0, 2.0])).unwrap() else {
+            panic!("the cotangent of a connected input should not be a structural zero");
+        };
+        assert_eq!(read(&cotangent), vec![2.0, -1.0, 1.0]);
+
+        // Derivative results apply in descendant contexts too, such as a batching level over their own context.
+        let matrix_type = ArrayType::new_static(DataType::F32, [2, 3])
+            .with_sharding(Sharding::replicated(mesh.logical_mesh().clone(), 2))
+            .unwrap();
+        let matrix = |values: &[f32]| {
+            Array::from_host_buffer(
+                &engine,
+                matrix_type.clone(),
+                mesh.clone(),
+                values_to_bytes::<f32>(values).as_slice(),
+            )
+            .unwrap()
+        };
+        let tangents = batch_in_parent(
+            |tangent| pushforward.apply_in_context(&tangent.domain().parent().clone(), tangent),
+            matrix(&[1.0, 1.0, 2.0, 2.0, 2.0, 2.0]),
+            BatchAxis::new(0),
+            BatchAxis::new(0),
+            BatchAxisSpecification::default(),
+        )
+        .unwrap();
+        assert_eq!(read(&tangents), vec![2.0, -1.0, 1.0, 4.0, -2.0, 1.0]);
+        let cotangents = batch_in_parent(
+            |cotangent| pullback.apply_materialized_in_context(&cotangent.domain().parent().clone(), cotangent),
+            matrix(&[1.0, 1.0, 2.0, 2.0, 2.0, 2.0]),
+            BatchAxis::new(0),
+            BatchAxis::new(0),
+            BatchAxisSpecification::default(),
+        )
+        .unwrap();
+        assert_eq!(read(&cotangents), vec![2.0, -1.0, 1.0, 4.0, -2.0, 1.0]);
+        let gradient = differentiate_in_parent_at(array(&[1.0, 2.0, 3.0]))
+            .gradient(|x| Ok(function.call(x.clone())?.dot(&x, &dimensions)?))
+            .unwrap();
+        assert_eq!(read(&gradient), vec![4.0, -4.0, 3.0]);
+        let jacobian = differentiate_in_parent_at(array(&[1.0, 2.0, 3.0]))
+            .jacobian_forward(|x| Ok(function.call(x)?))
+            .unwrap();
+        assert_eq!(read(&jacobian.values()[0]), vec![2.0, 0.0, 0.0, 0.0, -1.0, 0.0, 0.0, 0.0, 0.5]);
+
+        // The same entry point serves the array leaves of an enclosing compilation.
+        let outer: CompiledFunction<'_, ArrayType, (ArrayType, ArrayType)> = compile(
+            |x| {
+                let jacobian =
+                    differentiate_in_parent_at(x.clone()).jacobian_reverse(|x| Ok(function.call(x)?)).unwrap();
+                let hessian = differentiate_in_parent_at(x)
+                    .hessian(|x| Ok(function.call(x.clone())?.dot(&x, &dimensions)?))
+                    .unwrap();
+                (jacobian.into_values().remove(0), hessian.into_values().remove(0))
+            },
+            vector_type.clone(),
+            &engine,
+            mesh.clone(),
+        )
+        .unwrap();
+        let (jacobian, hessian) = outer.executable().execute(&engine, array(&[1.0, 2.0, 3.0])).unwrap();
+        assert_eq!(read(&jacobian), vec![2.0, 0.0, 0.0, 0.0, -1.0, 0.0, 0.0, 0.0, 0.5]);
+        assert_eq!(read(&hessian), vec![4.0, 0.0, 0.0, 0.0, -2.0, 0.0, 0.0, 0.0, 1.0]);
+    }
+
+    #[test]
+    fn test_compile_applies_trace_local_pushforward_under_batch() {
+        let client = execution_client();
+        let mesh = single_device_mesh(&client);
+        let engine = Session::new(&client).domain();
+        let vector_type = ArrayType::new_static(DataType::F32, [2])
+            .with_sharding(Sharding::replicated(mesh.logical_mesh().clone(), 1))
+            .unwrap();
+        let matrix_type = ArrayType::new_static(DataType::F32, [3, 2])
+            .with_sharding(Sharding::replicated(mesh.logical_mesh().clone(), 2))
+            .unwrap();
+
+        // `x ↦ sin(x) * x` is linearized inside the compilation, so its residuals are tracers of that trace. Applying
+        // the pushforward under a batching level of the same trace imports them as replicated values of that level.
+        let function: CompiledFunction<'_, (ArrayType, ArrayType), ArrayType> = compile(
+            |(x, tangents)| {
+                let x = x.into_value();
+                let context = x.context().clone();
+                let (_, pushforward) = context
+                    .differentiate_at(x)
+                    .linearize(|x| {
+                        let x = ValueProjection::<ArrayType>::into_projected(x)?;
+                        Ok(x.sin()?.mul(&x)?.into_value())
+                    })
+                    .unwrap();
+                let output = batch(
+                    |tangent| {
+                        let context = tangent.context().clone();
+                        pushforward.apply_in_context(&context, tangent)
+                    },
+                    tangents.into_value(),
+                    BatchAxis::new(0),
+                    BatchAxis::new(0),
+                    BatchAxisSpecification::default(),
+                )
+                .unwrap();
+                ValueProjection::<ArrayType>::into_projected(output).unwrap()
+            },
+            (vector_type.clone(), matrix_type.clone()),
+            &engine,
+            mesh.clone(),
+        )
+        .unwrap();
+        let x = [0.5f32, -1.0];
+        let tangents = [1.0f32, 0.0, 0.0, 1.0, 2.0, -1.0];
+        let output = function
+            .executable()
+            .execute(
+                &engine,
+                (
+                    Array::from_host_buffer(&engine, vector_type, mesh.clone(), values_to_bytes::<f32>(&x).as_slice())
+                        .unwrap(),
+                    Array::from_host_buffer(&engine, matrix_type, mesh, values_to_bytes::<f32>(&tangents).as_slice())
+                        .unwrap(),
+                ),
+            )
+            .unwrap();
+        let derivative = x.map(|x| x.cos() * x + x.sin());
+        let expected = tangents.iter().enumerate().map(|(index, tangent)| tangent * derivative[index % 2]);
+        assert!(
+            read_f32_array(&client, &output)
+                .iter()
+                .zip(expected)
+                .all(|(observed, expected)| (observed - expected).abs() < 1e-5)
+        );
+    }
+
+    #[test]
+    fn test_compiled_function_dispatcher_call() {
+        let client = execution_client();
+        let mesh = single_device_mesh(&client);
+        let engine = Session::new(&client).domain();
+        let input_type = ArrayType::new_static(DataType::F32, [2])
+            .with_sharding(Sharding::replicated(mesh.logical_mesh().clone(), 1))
+            .unwrap();
+        let function: CompiledFunctionDispatcher<'_, _, (), ArrayType, ArrayType> =
+            jit(|(), x: CompileTracer<'_>| Ok::<_, Error>(x.sin()?), &engine, mesh.clone());
+
+        // A source call traces the closure into the calling trace, and neither lowers, compiles, nor executes it.
+        let outer: CompiledFunction<'_, ArrayType, ArrayType> =
+            compile(|x| function.call((), x).unwrap().cos().unwrap(), input_type.clone(), &engine, mesh.clone())
+                .unwrap();
+        let statistics = function.statistics();
+        assert_eq!((statistics.source_hits, statistics.source_misses, statistics.traces), (0, 1, 1));
+        assert_eq!((statistics.dispatch_misses, statistics.lowerings, statistics.compilation_requests), (0, 0, 0));
+        let input = Array::from_host_buffer(
+            &engine,
+            input_type.clone(),
+            mesh.clone(),
+            values_to_bytes::<f32>(&[0.5, -1.0]).as_slice(),
+        )
+        .unwrap();
+        let observed = read_f32_array(&client, &outer.executable().execute(&engine, input).unwrap());
+        assert!(observed.iter().zip([0.5f32, -1.0]).all(|(observed, x)| (observed - x.sin().cos()).abs() < 1e-6));
+
+        // Another source call with the same types and scope reuses the source specialization.
+        compile::<_, ArrayType, ArrayType>(|x| function.call((), x).unwrap(), input_type, &engine, mesh).unwrap();
+        let statistics = function.statistics();
+        assert_eq!((statistics.source_hits, statistics.source_misses, statistics.traces), (1, 1, 1));
+    }
+
+    #[test]
+    fn test_compiled_function_dispatcher_call_with_named_axes() {
+        let client = execution_client();
+        let mesh = single_device_mesh(&client);
+        let engine = Session::new(&client).domain();
+        let matrix_type = ArrayType::new_static(DataType::F32, [3, 2])
+            .with_sharding(Sharding::replicated(mesh.logical_mesh().clone(), 2))
+            .unwrap();
+
+        // The closure reads the index along the named batch axis `i` of the level that calls it. The source call traces
+        // it in that level's scope, and batching the resulting call resolves the axis once per batch item.
+        let function: CompiledFunctionDispatcher<'_, _, (), ArrayType, ArrayType> = jit(
+            |(), x: CompileTracer<'_>| {
+                let index = x.into_value().context().axis_index("i")?;
+                Ok::<_, Error>(
+                    ValueProjection::<ArrayType>::into_projected(index)
+                        .map_err(ProgramError::from)?
+                        .convert_element_type(DataType::F32)?,
+                )
+            },
+            &engine,
+            mesh.clone(),
+        );
+        let outer: CompiledFunction<'_, ArrayType, ArrayType> = compile(
+            |x| {
+                let output = batch(
+                    |x| Ok(function.call((), ValueProjection::<ArrayType>::into_projected(x)?).unwrap().into_value()),
+                    x.into_value(),
+                    BatchAxis::new(0),
+                    BatchAxis::new(0),
+                    BatchAxisSpecification::named("i"),
+                )
+                .unwrap();
+                ValueProjection::<ArrayType>::into_projected(output).unwrap()
+            },
+            matrix_type.clone(),
+            &engine,
+            mesh.clone(),
+        )
+        .unwrap();
+        let input = Array::from_host_buffer(
+            &engine,
+            matrix_type.clone(),
+            mesh.clone(),
+            values_to_bytes::<f32>(&[0.0; 6]).as_slice(),
+        )
+        .unwrap();
+        assert_eq!(read_f32_array(&client, &outer.executable().execute(&engine, input).unwrap()), vec![0.0, 1.0, 2.0]);
+
+        // With only replicated inputs and an explicit extent, the call must still be rebatched at the named level,
+        // because its callee reads that level by name. Binding the callee unchanged would let `axis_index` escape it.
+        let outer: CompiledFunction<'_, ArrayType, ArrayType> = compile(
+            |x| {
+                let x = x.into_value();
+                let extent = x.dimension_size(0).unwrap();
+                let output = batch(
+                    |x| Ok(function.call((), ValueProjection::<ArrayType>::into_projected(x)?).unwrap().into_value()),
+                    x,
+                    BatchAxis::replicated(),
+                    BatchAxis::new(0),
+                    BatchAxisSpecification::new(extent, "i"),
+                )
+                .unwrap();
+                ValueProjection::<ArrayType>::into_projected(output).unwrap()
+            },
+            matrix_type.clone(),
+            &engine,
+            mesh.clone(),
+        )
+        .unwrap();
+        let input =
+            Array::from_host_buffer(&engine, matrix_type, mesh, values_to_bytes::<f32>(&[0.0; 6]).as_slice()).unwrap();
+        assert_eq!(read_f32_array(&client, &outer.executable().execute(&engine, input).unwrap()), vec![0.0, 1.0, 2.0]);
     }
 
     /// Input sharding overrides change the input types before tracing begins.

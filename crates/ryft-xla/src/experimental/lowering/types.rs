@@ -10,7 +10,7 @@ use ryft_mlir::{
     Value as MlirValue, ValueRef,
 };
 
-use crate::experimental::lowering::{LoweringError, MlirLowerableValue};
+use crate::experimental::lowering::{CollectiveLoweringState, LoweringError, MlirLowerableValue};
 use crate::experimental::ops::{ArrayConstant, Constant};
 use crate::operations::comparisons::lower_compare_to_mlir;
 use crate::operations::manipulation::memory::annotate_output_memory;
@@ -429,12 +429,14 @@ where
 }
 
 /// Lowers a traced constant atom to a StableHLO value and returns it. A captured constant forwards the hidden capture
-/// argument that carries its runtime value, while an immediate dimension extent is materialized in place — which is
-/// exactly what makes extents usable inside a `shard_map` manual region, where no capture table is reachable.
+/// argument that carries its runtime value, and a session constant forwards the hidden entry argument that
+/// `collective_state` assigns to it, while an immediate dimension extent is materialized in place — which is exactly
+/// what makes extents usable inside a `shard_map` manual region, where no capture table is reachable.
 pub(crate) fn lower_constant<'b, 'c: 'b, 't: 'c, B, L>(
     _atom_id: AtomId,
     value: &Constant,
     captured_values: &[ValueRef<'b, 'c, 't>],
+    collective_state: &CollectiveLoweringState,
     block: &mut B,
     context: &'c MlirContext<'t>,
     location: L,
@@ -445,6 +447,7 @@ where
 {
     match value {
         Constant::Captured(value) => lower_captured_constant(value, captured_values),
+        Constant::Session(value) => collective_state.lower_session_constant(value, captured_values),
         Constant::Dimension(value) => lower_dimension_extent(value, block, context, location),
         Constant::Boolean(value) => lower_literal_value(&ArrayConstant::Boolean(*value), block, context, location),
     }

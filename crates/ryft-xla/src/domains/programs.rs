@@ -14,6 +14,7 @@ use crate::domains::options::FeedbackDirectedProfile;
 use crate::domains::persistence::canonical_boundary_types;
 use crate::domains::runtimes::RuntimeRequirement;
 use crate::experimental::lowering::signature::ExecutableSignature;
+use crate::experimental::ops::SessionConstant;
 
 // TODO(eaplatanios): Review this module.
 
@@ -60,8 +61,13 @@ pub struct LoweredProgram {
     /// Donation declarations for public inputs. Captures are always non-donatable.
     pub(super) donation_flags: Arc<[bool]>,
 
-    /// Number of leading logical inputs supplied by the staged capture table.
+    /// Number of leading logical inputs supplied by the staged capture table, followed by the hidden arguments that
+    /// carry [`Self::session_constants`].
     pub(super) capture_count: usize,
+
+    /// Session constants of the lowered program, whose arrays the trailing [`Self::session_constants`]`.len()` of the
+    /// [`Self::capture_count`] capture arguments carry, in order.
+    pub(super) session_constants: Arc<[SessionConstant]>,
 
     /// Effective sharding expected for every physical executable argument, including materialized captures first.
     pub(super) expected_argument_shardings: Arc<[Sharding]>,

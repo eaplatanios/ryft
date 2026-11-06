@@ -22,7 +22,7 @@ use crate::domains::effects::ensure_effect_dispatch_allowed;
 use crate::domains::options::Options;
 use crate::domains::programs::CompiledProgram;
 use crate::domains::targets::Target;
-use crate::experimental::ops::{Constant, FlatProgram, Operation, ProgramBuilder};
+use crate::experimental::ops::{Constant, FlatProgram, Operation, ProgramBuilder, SessionConstant};
 use crate::operations::composites::NamedCompositeImplementation;
 use crate::{Array, ArrayError, Dimension, Error, FromPjrt, ShardDescriptor, ShardLayout, ToPjrt, Value};
 
@@ -197,6 +197,17 @@ impl<'o> std::borrow::Borrow<dyn EagerDispatchKeyView + 'o> for EagerDispatchKey
     }
 }
 
+/// Compiled program that the eager dispatch cache retains for one [`EagerDispatchKey`].
+#[derive(Clone)]
+pub(super) struct EagerDispatchProgram<'c> {
+    /// Compiled program of the eager application.
+    program: Arc<CompiledProgram<'c>>,
+
+    /// Session constants whose arrays the compiled program receives as hidden arguments ahead of the array inputs of
+    /// the application (refer to [`SessionConstant`]). Their handles are part of the key, through its regions.
+    session_constants: Arc<[SessionConstant]>,
+}
+
 /// Borrowed [`EagerDispatchKey`] over the arguments of one eager application, used to look up cache hits without
 /// building an owned key.
 struct EagerDispatchQuery<'o, 'c> {
@@ -247,7 +258,8 @@ impl EagerDispatchKeyView for EagerDispatchQuery<'_, '_> {
 }
 
 impl<'c> Context for Domain<'c> {
-    /// Immediate dimension extents materialize directly; Boolean literals upload a replicated scalar. A
+    /// Immediate dimension extents materialize directly; Boolean literals upload a replicated scalar, and a
+    /// [`Constant::Session`] handle resolves to the array that this domain's session retains for it. A
     /// [`Constant::Captured`] payload is a symbolic index into a compiled function's capture table carrying only a
     /// type and no data, so there is nothing to materialize without the surrounding capture table and lifting it is
     /// always rejected.
@@ -257,6 +269,7 @@ impl<'c> Context for Domain<'c> {
                 "xla captured constant {constant} requires a captured program capture table"
             ))
             .into()),
+            Constant::Session(constant) => Ok(Value::Array(self.session().constant(self, &constant)?)),
             Constant::Dimension(value) => Ok(Value::Dimension(Dimension::new(value, self.clone()))),
             Constant::Boolean(value) => Ok(Value::Array(self.eager_scalar(DataType::Boolean, &[u8::from(value)])?)),
         }
@@ -670,9 +683,15 @@ impl<'c> Domain<'c> {
         };
 
         // Execution produces outputs that belong to this domain, so chained eager operations and transforms over them
-        // keep executing in the same session and effect scope.
+        // keep executing in the same session and effect scope. Arrays of session constants precede the inputs.
+        let mut arguments = compiled
+            .session_constants
+            .iter()
+            .map(|constant| self.session.constant(self, constant))
+            .collect::<Result<Vec<_>, _>>()?;
+        arguments.extend(array_inputs);
         let outputs = self
-            .execute_program(&compiled, array_inputs)
+            .execute_program(&compiled.program, arguments)
             .map_err(|error| ProgramError::InvalidArgument { message: error.to_string() })?;
         Ok(outputs.into_iter().map(Value::Array).collect())
     }
@@ -686,7 +705,7 @@ impl<'c> Domain<'c> {
         regions: AttachedRegions<'_, Constant, Operation>,
         inputs: &[Value<'c>],
         array_inputs: &[Array<'c>],
-    ) -> Result<Arc<CompiledProgram<'c>>, ProgramError> {
+    ) -> Result<EagerDispatchProgram<'c>, ProgramError> {
         // Trace the single-instruction program, attaching the provided region bodies to that instruction.
         let region_input_types = vec![None; regions.region_count()];
         let builder = Rc::new(RefCell::new(ProgramBuilder::new()));
@@ -737,9 +756,11 @@ impl<'c> Domain<'c> {
         let lowered = self
             .lower_program(&program, 0, &options)
             .map_err(|error| ProgramError::InvalidArgument { message: error.to_string() })?;
-        self.compilation_context()
+        let program = self
+            .compilation_context()
             .compile(self, &lowered)
-            .map_err(|error| ProgramError::InvalidArgument { message: error.to_string() })
+            .map_err(|error| ProgramError::InvalidArgument { message: error.to_string() })?;
+        Ok(EagerDispatchProgram { program, session_constants: Arc::clone(&lowered.session_constants) })
     }
 
     /// Validates that every input lives on this domain's PJRT client and that all inputs share one device placement,

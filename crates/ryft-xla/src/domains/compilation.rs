@@ -5,9 +5,10 @@ use std::time::Instant;
 use prost::Message;
 use ryft_core::{
     ArrayIrType, ArrayOperation, ArrayType, CompilationCacheDomain, CompilationDomain, Dimension as CoreDimension,
-    DimensionBounds, DimensionVariable, ExternalReferenceBinding, FlatProgram as CoreFlatProgram, Memory,
-    Operation as CoreOperation, Parameterized, ProgramError, ReductionKind, ReferenceDischargeResult, ScatterMode,
-    ScatterReductionKind, Shape, Sharding, SortDirection, StagedProgram, Type, TypeError, Typed, TypedProgram,
+    DimensionBounds, DimensionVariable, DispatchPurpose, ExternalReferenceBinding, FlatProgram as CoreFlatProgram,
+    Memory, Operation as CoreOperation, Parameterized, ProgramError, ReductionKind, ReferenceDischargeResult,
+    ScatterMode, ScatterReductionKind, Shape, Sharding, SortDirection, StagedProgram, Type, TypeError, Typed,
+    TypedProgram,
 };
 use ryft_pjrt::Program as PjrtProgram;
 use ryft_pjrt::protos::CompilationOptions;
@@ -17,7 +18,9 @@ use crate::domains::execution::{ExecutionError, ExecutionPlan};
 use crate::domains::options::{FeedbackDirectedProfile, InputBoundBucketing, Options};
 use crate::domains::persistence::COMPILER_IDENTITY;
 use crate::domains::programs::{CompiledProgram, InvocationMetadata, LoweredProgram};
-use crate::experimental::lowering::{contains_unresolved_references, contains_unresolved_state};
+use crate::experimental::lowering::{
+    collect_session_constants, contains_unresolved_references, contains_unresolved_state,
+};
 use crate::experimental::ops::{Constant, FlatProgram, Operation};
 use crate::{Error, Value};
 
@@ -163,13 +166,19 @@ impl<'c> CompilationDomain for Domain<'c> {
     type Options = Options;
     type Error = Error;
 
+    // Input shardings declared by the options change the staged types of both purposes. Input-bound bucketing applies
+    // only to independently dispatched executables, because a source call is lowered within its enclosing computation.
     fn dispatch_signature(
-        &self,
         input_types: Vec<ArrayIrType>,
         options: &Self::Options,
+        purpose: DispatchPurpose,
     ) -> Result<(Self::DispatchKey, Arc<[ArrayIrType]>), Self::Error> {
         let input_types = apply_input_shardings(input_types, options)?;
-        let Some(bucketing) = options.input_bound_bucketing else {
+        let bucketing = match purpose {
+            DispatchPurpose::Source => None,
+            DispatchPurpose::Executable => options.input_bound_bucketing,
+        };
+        let Some(bucketing) = bucketing else {
             let input_types: Arc<[ArrayIrType]> = input_types.into();
             return Ok((DispatchKey(DispatchKeyKind::Exact(input_types.clone())), input_types));
         };
@@ -258,8 +267,15 @@ impl<'c> CompilationDomain for Domain<'c> {
         Ok(lowered_program)
     }
 
-    fn compile(&self, program: &LoweredProgram) -> Result<Arc<CompiledProgram<'c>>, Self::Error> {
-        self.compilation_context().compile(self, program)
+    // The cached executable depends only on the types of the session constants of `program`, so their arrays are
+    // resolved through this domain's session for every request, including cache hits (refer to `SessionConstant`).
+    fn compile(&self, program: &LoweredProgram) -> Result<(Arc<CompiledProgram<'c>>, Vec<Value<'c>>), Self::Error> {
+        let session_arrays = program
+            .session_constants
+            .iter()
+            .map(|constant| Ok(Value::Array(self.session().constant(self, constant)?)))
+            .collect::<Result<Vec<_>, Error>>()?;
+        Ok((self.compilation_context().compile(self, program)?, session_arrays))
     }
 
     fn execute(&self, program: &CompiledProgram<'c>, inputs: Vec<Value<'c>>) -> Result<Vec<Value<'c>>, Self::Error> {
@@ -389,11 +405,17 @@ impl<'c> Domain<'c> {
         let mut donation_flags =
             options.donation_flags.clone().unwrap_or_else(|| vec![false; public_input_types.len()]);
 
-        let effective_capture_types = capture_types
+        let mut effective_capture_types = capture_types
             .iter()
             .map(|r#type| <&ArrayType>::try_from(r#type).cloned())
             .collect::<Result<Vec<_>, _>>()
             .map_err(ProgramError::from)?;
+        // Arrays that session constants refer to enter the executable as hidden arguments that follow the captures, so
+        // that the executable depends only on their types. Execution supplies them with the captures (refer to
+        // `CompilationDomain::compile`).
+        let session_constants = collect_session_constants(program);
+        effective_capture_types.extend(session_constants.iter().map(|constant| constant.r#type().into_owned()));
+        let lowered_capture_count = effective_capture_types.len();
         let effective_public_input_types = public_input_types
             .iter()
             .map(|r#type| <&ArrayType>::try_from(r#type).cloned())
@@ -406,7 +428,7 @@ impl<'c> Domain<'c> {
             .collect::<Vec<_>>();
         let reference_state_input_indices = reference_states
             .iter()
-            .map(|state| state.source().flat_input_index(capture_count))
+            .map(|state| state.source().flat_input_index(lowered_capture_count))
             .collect::<Result<Vec<_>, _>>()?;
         if reference_state_input_indices.windows(2).any(|indices| indices[0] >= indices[1]) {
             return Err(ProgramError::MalformedProgram(
@@ -592,7 +614,9 @@ impl<'c> Domain<'c> {
             options.ragged_dot_lowering_strategy,
         )?;
         let (stable_hlo, signature, requires_assertion_handler, runtime_requirements) = lowered_module.into_parts();
-        for (mapping, donation) in signature.input_mapping()[capture_count..].iter().zip(donation_flags.iter_mut()) {
+        for (mapping, donation) in
+            signature.input_mapping()[lowered_capture_count..].iter().zip(donation_flags.iter_mut())
+        {
             if mapping.is_none() {
                 *donation = false;
             }
@@ -610,7 +634,8 @@ impl<'c> Domain<'c> {
             requires_assertion_handler,
             runtime_requirements,
             donation_flags: donation_flags.into(),
-            capture_count,
+            capture_count: lowered_capture_count,
+            session_constants: session_constants.into(),
             expected_argument_shardings: expected_argument_shardings.into(),
             mesh: options.mesh.clone(),
             platform_name: target.platform_name().into(),
@@ -2840,10 +2865,10 @@ mod tests {
         let single_device_domain = Session::new(&single_device_client).domain().with_mesh(single_device_mesh.clone());
         let dimension_type = DimensionType::new("extent", DimensionBounds::new(1, Some(5)).unwrap());
         assert!(matches!(
-            single_device_domain.dispatch_signature(
+            Domain::dispatch_signature(
                 vec![dimension_type.clone().into()],
                 &Options::new(single_device_mesh.clone())
-                    .with_input_bound_bucketing(InputBoundBucketing::PowerOfTwo),
+                    .with_input_bound_bucketing(InputBoundBucketing::PowerOfTwo),DispatchPurpose::Executable,
             ),
             Err(Error::Compilation(CompilationError::InvalidOptions { reason }))
                 if reason == format!(
@@ -2856,16 +2881,19 @@ mod tests {
         let reference_type = ReferenceType::new(ArrayType::scalar(DataType::F32));
         let reference_input_types: Arc<[ArrayIrType]> = vec![ArrayIrType::Reference(reference_type.clone())].into();
         assert_eq!(
-            single_device_domain
-                .dispatch_signature(reference_input_types.to_vec(), &Options::new(single_device_mesh.clone()))
-                .unwrap(),
+            Domain::dispatch_signature(
+                reference_input_types.to_vec(),
+                &Options::new(single_device_mesh.clone()),
+                DispatchPurpose::Executable
+            )
+            .unwrap(),
             (DispatchKey(DispatchKeyKind::Exact(reference_input_types.clone())), reference_input_types,),
         );
         assert!(matches!(
-            single_device_domain.dispatch_signature(
+            Domain::dispatch_signature(
                 vec![ArrayIrType::Reference(reference_type.clone())],
                 &Options::new(single_device_mesh.clone())
-                    .with_input_bound_bucketing(InputBoundBucketing::PowerOfTwo),
+                    .with_input_bound_bucketing(InputBoundBucketing::PowerOfTwo),DispatchPurpose::Executable,
             ),
             Err(Error::Compilation(CompilationError::UnsupportedReferenceAbi { reason }))
                 if reason == "external reference input 0 does not support input-bound bucketing",
@@ -2885,12 +2913,11 @@ mod tests {
             .client(ClientOptions::CPU(CpuClientOptions { device_count: Some(2), ..Default::default() }))
             .unwrap();
         let multi_device_mesh = domain_mesh(&multi_device_client, "x", 2);
-        let multi_device_domain = Session::new(&multi_device_client).domain().with_mesh(multi_device_mesh.clone());
         assert!(matches!(
-            multi_device_domain.dispatch_signature(
+            Domain::dispatch_signature(
                 vec![ArrayType::new(DataType::F32, Shape::new(vec![CoreDimension::Static(3)])).into()],
-                &Options::new(multi_device_mesh)
-                    .with_input_bound_bucketing(InputBoundBucketing::PowerOfTwo),
+                &Options::new(multi_device_mesh).with_input_bound_bucketing(InputBoundBucketing::PowerOfTwo),
+                DispatchPurpose::Executable,
             ),
             Err(Error::Compilation(CompilationError::InvalidOptions { reason }))
                 if reason == "input-bound bucketing is unsupported on multi-device meshes because bucketed dynamic \
@@ -2899,10 +2926,10 @@ mod tests {
 
         // Multi-device bucketing is rejected before inspecting individual input kinds.
         assert!(matches!(
-            multi_device_domain.dispatch_signature(
+            Domain::dispatch_signature(
                 vec![ArrayIrType::Reference(reference_type.clone())],
                 &Options::new(domain_mesh(&multi_device_client, "x", 2))
-                    .with_input_bound_bucketing(InputBoundBucketing::PowerOfTwo),
+                    .with_input_bound_bucketing(InputBoundBucketing::PowerOfTwo),DispatchPurpose::Executable,
             ),
             Err(Error::Compilation(CompilationError::InvalidOptions { reason }))
                 if reason == "input-bound bucketing is unsupported on multi-device meshes because bucketed dynamic \
@@ -2917,17 +2944,22 @@ mod tests {
             .client(ClientOptions::CPU(CpuClientOptions { device_count: Some(1), ..Default::default() }))
             .unwrap();
         let mesh = domain_mesh(&client, "x", 1);
-        let domain = Session::new(&client).domain().with_mesh(mesh.clone());
         let options = Options::new(mesh).with_input_bound_bucketing(InputBoundBucketing::PowerOfTwo);
         let bounds = DimensionBounds::new(0, Some(5)).unwrap();
         let vector_type =
             |dimension: CoreDimension| ArrayIrType::from(ArrayType::new(DataType::F32, Shape::new(vec![dimension])));
-        let key = |input_types: Vec<ArrayIrType>| domain.dispatch_signature(input_types, &options).unwrap().0;
+        let key = |input_types: Vec<ArrayIrType>| {
+            Domain::dispatch_signature(input_types, &options, DispatchPurpose::Executable).unwrap().0
+        };
 
         // Two runtime signatures landing in the same power-of-two bucket share one key, and the effective staged
         // types carry the generated per-axis variable names that the key itself excludes.
-        let (three_key, three_types) =
-            domain.dispatch_signature(vec![vector_type(CoreDimension::Static(3))], &options).unwrap();
+        let (three_key, three_types) = Domain::dispatch_signature(
+            vec![vector_type(CoreDimension::Static(3))],
+            &options,
+            DispatchPurpose::Executable,
+        )
+        .unwrap();
         assert_eq!(three_key, key(vec![vector_type(CoreDimension::Static(4))]));
         assert_ne!(three_key, key(vec![vector_type(CoreDimension::Static(5))]));
         let [ArrayIrType::Array(three_type)] = three_types.as_ref() else {
@@ -2938,6 +2970,12 @@ mod tests {
         };
         assert_eq!(variable.name(), "input_0_axis_0");
         assert_eq!(variable.bounds(), bounds);
+
+        // Source calls are staged within their callers, so bucketing never changes their types.
+        let (_, source_types) =
+            Domain::dispatch_signature(vec![vector_type(CoreDimension::Static(3))], &options, DispatchPurpose::Source)
+                .unwrap();
+        assert_eq!(source_types.as_ref(), &[vector_type(CoreDimension::Static(3))]);
 
         // Dimension variables are keyed by their bounds and first-occurrence sharing pattern, not by their names, so
         // renaming a variable preserves the key while resharing it across inputs does not.
