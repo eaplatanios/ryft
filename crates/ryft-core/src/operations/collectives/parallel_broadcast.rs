@@ -793,8 +793,6 @@ impl<A: Value<Type = ArrayType>> From<ParallelBroadcastOperation> for ArrayIrOpe
     }
 }
 
-// TODO(eaplatanios): Review from here onwards.
-
 /// Represents the ability to replicate the value of one participant of a named axis to every participant. Refer to the
 /// documentation of [`ParallelBroadcastOperation`] for the semantics of this operation and its transformation rules.
 ///
@@ -976,6 +974,7 @@ impl<
             }
             operation = operation.with_mesh(mesh);
         }
+
         // Source variation on unrelated axes must also be reflected by the selected data.
         let source_type = source.r#type();
         for axis in source_type.sharding().map(|source| source.varying_manual_axes()).into_iter().flatten() {
@@ -1019,6 +1018,8 @@ where
         ))
     }
 }
+
+// TODO(eaplatanios): Review from here onwards.
 
 /// Interprets a runtime broadcast, including a packed unrelated batch of scalar roots when `source_batch_axis`
 /// is present. Primal interpretation validates roots; derived linear instructions reuse selection without effects.
