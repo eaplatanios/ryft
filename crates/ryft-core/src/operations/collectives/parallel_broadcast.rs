@@ -39,7 +39,6 @@ use crate::operations::constants::zero_like::{ZeroLike, ZeroLikeOperation};
 use crate::operations::control_flow::select::{Select, SelectOperation};
 use crate::operations::manipulation::broadcasting::{Broadcast, BroadcastOperation};
 use crate::operations::manipulation::concatenation::Concatenate;
-use crate::operations::manipulation::conversions::{ConvertElementType, ConvertElementTypeOperation};
 use crate::operations::manipulation::memory::{TransferToMemory, TransferToMemoryOperation};
 use crate::operations::manipulation::reshaping::Reshape;
 use crate::operations::manipulation::slicing::Slice;
@@ -63,7 +62,7 @@ pub enum ParallelBroadcastSource {
     /// The operation stores the source's zero-based coordinate along its combined named axis.
     Static(usize),
 
-    /// A second instruction input supplies the source as a non-differentiable `i32` scalar.
+    /// A second instruction input supplies the source as a non-differentiable `u64` scalar.
     Dynamic,
 }
 
@@ -83,8 +82,6 @@ impl Display for ParallelBroadcastSource {
         }
     }
 }
-
-// TODO(eaplatanios): Review from here onwards.
 
 /// Canonical operation name for [`ParallelBroadcastOperation`].
 pub const PARALLEL_BROADCAST_OPERATION_NAME: &str = "parallel_broadcast";
@@ -120,12 +117,11 @@ pub const PARALLEL_BROADCAST_OPERATION_NAME: &str = "parallel_broadcast";
 /// which is staged as a [`ParallelReduceOperation`] sum followed by a [`ParallelPermuteOperation`] whose only pair
 /// sends the source's sum to itself (over a manual mesh axis, with a [`ParallelVaryOperation`] in between that restores
 /// the input cotangent's variation). JAX instead selects the sum with an `axis_index` comparison, which computes the
-/// same values but
-/// needs a mask and zeros of the cotangent's shape. Outside any binder, the single participant of a degenerate axis
-/// keeps its value, and a larger axis has no per-item semantics.
+/// same values but needs a mask and zeros of the cotangent's shape. Outside any binder, the single participant of a
+/// degenerate axis keeps its value, and a larger axis has no per-item semantics.
 ///
-/// [`ParallelBroadcastSource::Dynamic`] supplies the source through a second input, an `i32` scalar. All participants
-/// of a group must supply the same coordinate in `0..axis_size`. The operation carries an
+/// [`ParallelBroadcastSource::Dynamic`] supplies the source through a second input, a `u64` scalar.
+/// All participants of a group must supply the same coordinate in `0..axis_size`. The operation carries an
 /// [`EffectClass::OrderedAssertion`] so agreement and bounds checks remain observable even when its result is unused.
 /// The source cannot carry reduction state and has no tangent or cotangent. Differentiation checks the primal and
 /// records the same operation with validation discharged in the tangent, retaining the source as a known residual
@@ -160,6 +156,8 @@ pub struct ParallelBroadcastOperation {
     mesh: Option<LogicalMesh>,
 }
 
+// TODO(eaplatanios): Review from here onwards.
+
 impl ParallelBroadcastOperation {
     /// Creates a new [`ParallelBroadcastOperation`] over the axis with the provided name and resolved axis size.
     /// Construction preserves the supplied source, while type inference validates it.
@@ -169,7 +167,7 @@ impl ParallelBroadcastOperation {
     ///   - `axes`: Name of the axis, or names of the axes, along which the source's input is replicated.
     ///   - `axis_size`: Number of participants along `axes`, resolved when the operation is staged.
     ///   - `source`: Static coordinate in `0..axis_size`, or [`ParallelBroadcastSource::Dynamic`] to consume an
-    ///     additional `i32` scalar input. A `usize` converts to [`ParallelBroadcastSource::Static`].
+    ///     additional `u64` scalar input. A `usize` converts to [`ParallelBroadcastSource::Static`].
     #[inline]
     pub fn new<A: Into<CollectiveAxes>, S: Into<ParallelBroadcastSource>>(
         axes: A,
@@ -299,9 +297,9 @@ impl Operation for ParallelBroadcastOperation {
 
         if self.source == ParallelBroadcastSource::Dynamic {
             let source = &input_types[1];
-            if source.data_type() != DataType::I32 || source.rank() != 0 {
+            if source.data_type() != DataType::U64 || source.rank() != 0 {
                 return Err(TypeError::invalid(format!(
-                    "`{PARALLEL_BROADCAST_OPERATION_NAME}` runtime source must be an `i32` scalar but got `{source}`",
+                    "`{PARALLEL_BROADCAST_OPERATION_NAME}` runtime source must be a `u64` scalar but got `{source}`",
                 )));
             }
             if !source.unreduced_axes().is_empty() || !source.reduced_axes().is_empty() {
@@ -400,7 +398,7 @@ impl LinearCollectiveOperation for ParallelBroadcastOperation {
     }
 }
 
-impl<C: Domain<Type = ArrayType> + Fill<i32, C::Value>> InterpretableOperation<C> for ParallelBroadcastOperation
+impl<C: Domain<Type = ArrayType> + Fill<u64, C::Value>> InterpretableOperation<C> for ParallelBroadcastOperation
 where
     C::Value:
         ParallelAllGather + ParallelReduce + Compare + Select + Slice + Reshape + TransferToMemory + Assert + Broadcast,
@@ -456,7 +454,7 @@ impl<C: Context<Type = ArrayType, Operation: From<ParallelBroadcastOperation>>> 
 }
 
 impl<
-    C: Context<Type = ArrayType, Operation: From<ParallelBroadcastOperation>> + Fill<i32, C::Value>,
+    C: Context<Type = ArrayType, Operation: From<ParallelBroadcastOperation>> + Fill<u64, C::Value>,
     P: ArrayExtentBatchingPolicy<C>,
 > BatchableOperation<C, ArrayBatchingPolicy<P>> for ParallelBroadcastOperation
 where
@@ -647,7 +645,6 @@ impl<
         + From<CompareOperation<ArrayType>>
         + From<SelectOperation<ArrayType>>
         + From<BroadcastOperation>
-        + From<ConvertElementTypeOperation<ArrayType>>
         + From<TransferToMemoryOperation>
         + From<ZeroLikeOperation<ArrayType>>,
 > TransposableOperation<V, O> for ParallelBroadcastOperation
@@ -733,7 +730,6 @@ where
                              as a known primal",
                         ),
                     })?;
-                    let source = source.convert_element_type(DataType::U64)?;
                     let input_type = inputs[0].r#type();
                     let mesh = self.mesh.as_ref().or_else(|| input_type.sharding().map(|sharding| sharding.mesh()));
                     let mut position: Option<Tracer<TracingContext<V, O>>> = None;
@@ -764,7 +760,7 @@ where
                             index
                         });
                     }
-                    let mask = position.unwrap().equal(&source)?;
+                    let mask = position.unwrap().equal(source)?;
                     contribution = mask.select(&contribution, &contribution.zero_like()?)?;
                 }
             }
@@ -820,7 +816,7 @@ impl<A: Value<Type = ArrayType>> From<ParallelBroadcastOperation> for ArrayIrOpe
 /// # };
 /// # fn main() -> Result<(), Box<dyn std::error::Error>> {
 /// let rows = Array::matrix(3, 2, vec![1f32, 2.0, 3.0, 4.0, 5.0, 6.0])?;
-/// let source = Array::scalar(1i32)?;
+/// let source = Array::scalar(1u64)?;
 /// let broadcast = batch(
 ///     |(row, source): (
 ///         BatchingTracer<EagerContext<Array, ArrayOperation<Array>>, ArrayBatchingPolicy>,
@@ -856,8 +852,9 @@ pub trait ParallelBroadcast<T = <Self as Capability>::Universe>: Capability + Si
     fn parallel_broadcast<Axes: Into<CollectiveAxes>>(&self, axes: Axes, source: usize) -> Result<Self, ProgramError>;
 
     /// Copies participant `source`'s value to every participant along `axes`. The source is a non-differentiable
-    /// `i32` scalar and may differ between groups formed by unrelated axes. The output follows the data's shape,
-    /// memory, reduction state, and the manual variation of the data and source, varying over the selected manual axes.
+    /// `u64` scalar, matching [`AxisIndex`](crate::AxisIndex), and may differ between groups formed by unrelated axes.
+    /// The output follows the data's shape, memory, reduction state, and the manual variation of the data and source,
+    /// varying over the selected manual axes.
     ///
     /// # Parameters
     ///
@@ -1006,7 +1003,7 @@ where
 
 /// Interprets a runtime broadcast, including a packed unrelated batch of scalar roots when `source_batch_axis`
 /// is present. Primal interpretation validates roots; derived linear instructions reuse selection without effects.
-fn interpret_dynamic_parallel_broadcast<C: Domain<Type = ArrayType> + Fill<i32, C::Value>>(
+fn interpret_dynamic_parallel_broadcast<C: Domain<Type = ArrayType> + Fill<u64, C::Value>>(
     operation: &ParallelBroadcastOperation,
     context: &C,
     inputs: &[C::Value],
@@ -1042,7 +1039,7 @@ where
 }
 
 /// Validates scalar roots, or a rectangular packed batch of scalar roots, without depending on the payload values.
-fn validate_runtime_broadcast_source<C: Domain<Type = ArrayType> + Fill<i32, C::Value>>(
+fn validate_runtime_broadcast_source<C: Domain<Type = ArrayType> + Fill<u64, C::Value>>(
     context: &C,
     minimum: &C::Value,
     maximum: &C::Value,
@@ -1064,31 +1061,24 @@ where
             condition.assert_with_limit(message, observations, NonZeroUsize::new(1).unwrap())
         }
     }
-    let zero = context.fill(&ArrayType::scalar(DataType::I32).with_memory(source.r#type().memory()), 0i32)?;
     assert(
         minimum.equal(maximum)?,
         &format!("`{PARALLEL_BROADCAST_OPERATION_NAME}` runtime sources must agree across participants"),
         &[("minimum", minimum.clone()), ("maximum", maximum.clone())],
     )?;
+    let limit =
+        context.fill(&ArrayType::scalar(DataType::U64).with_memory(source.r#type().memory()), axis_size as u64)?;
     assert(
-        minimum.greater_than_or_equal(&zero)?,
-        &format!("`{PARALLEL_BROADCAST_OPERATION_NAME}` runtime source must be non-negative"),
+        maximum.less_than(&limit)?,
+        &format!("`{PARALLEL_BROADCAST_OPERATION_NAME}` runtime source must be smaller than axis size {axis_size}"),
         &[("source", source.clone())],
     )?;
-    if let Ok(limit) = i32::try_from(axis_size) {
-        let limit = context.fill(&ArrayType::scalar(DataType::I32).with_memory(source.r#type().memory()), limit)?;
-        assert(
-            maximum.less_than(&limit)?,
-            &format!("`{PARALLEL_BROADCAST_OPERATION_NAME}` runtime source must be smaller than axis size {axis_size}"),
-            &[("source", source.clone())],
-        )?;
-    }
     Ok(())
 }
 
 /// Selects exact participant slices from the leading gathered axis. A packed root vector selects independently
 /// along `source_batch_axis` of each candidate, so singleton dimensions align it with the remaining item dimensions.
-fn select_runtime_broadcast_source<C: Domain<Type = ArrayType> + Fill<i32, C::Value>>(
+fn select_runtime_broadcast_source<C: Domain<Type = ArrayType> + Fill<u64, C::Value>>(
     context: &C,
     gathered: &C::Value,
     source: &C::Value,
@@ -1099,10 +1089,10 @@ where
     C::Value: Compare + Select + Slice + Reshape,
 {
     let mut selected = gathered.slice_axis(0, 0, 1, 1)?.squeeze(&[0])?;
-    for index in 1..axis_size.min(i32::MAX as usize + 1) {
+    for index in 1..axis_size {
         let candidate = gathered.slice_axis(0, index, index + 1, 1)?.squeeze(&[0])?;
         let index =
-            context.fill(&ArrayType::scalar(DataType::I32).with_memory(source.r#type().memory()), index as i32)?;
+            context.fill(&ArrayType::scalar(DataType::U64).with_memory(source.r#type().memory()), index as u64)?;
         let mut condition = source.equal(&index)?;
         if let Some(axis) = source_batch_axis {
             let mut dimensions = vec![Dimension::Static(1); candidate.r#type().rank()];
@@ -1132,6 +1122,7 @@ mod tests {
     use crate::differentiation::differentiate_at;
     use crate::macros::{check_gradient, check_operation_partial_evaluation, check_operation_type_inference};
     use crate::operations::assertions::AssertionError;
+    use crate::operations::collectives::axis_index::AxisIndex;
     use crate::operations::collectives::tests::{batch_collective, collective_program};
     use crate::operations::reductions::Reduce;
     use crate::parameters::Placeholder;
@@ -1161,7 +1152,7 @@ mod tests {
     fn runtime_broadcast_program(axis_size: usize) -> Program<Array, ArrayOperation<Array>, Vec<Array>, Vec<Array>> {
         let mut builder = ProgramBuilder::<Array, ArrayOperation<Array>>::new();
         let data = builder.add_input(ArrayType::scalar(DataType::F32));
-        let source = builder.add_input(ArrayType::scalar(DataType::I32));
+        let source = builder.add_input(ArrayType::scalar(DataType::U64));
         let outputs = builder
             .add_instruction(
                 ParallelBroadcastOperation::new("x", axis_size, ParallelBroadcastSource::Dynamic),
@@ -1389,18 +1380,18 @@ mod tests {
     #[test]
     fn test_parallel_broadcast_type_inference_dynamic_source() {
         let data = ArrayType::new_static(DataType::F32, [3]);
-        let source = ArrayType::scalar(DataType::I32);
+        let source = ArrayType::scalar(DataType::U64);
         check_operation_type_inference!(
             operation = ParallelBroadcastOperation::new("x", 2, ParallelBroadcastSource::Dynamic),
             cases = [
                 { input_types = [data.clone(), source], output_types = [data.clone()] },
-                { input_types = [data.clone(), ArrayType::scalar(DataType::U64)], error = format!(
-                    "`{PARALLEL_BROADCAST_OPERATION_NAME}` runtime source must be an `i32` scalar but got `u64[]`",
+                { input_types = [data.clone(), ArrayType::scalar(DataType::I32)], error = format!(
+                    "`{PARALLEL_BROADCAST_OPERATION_NAME}` runtime source must be a `u64` scalar but got `i32[]`",
                 ) },
-                { input_types = [data.clone(), ArrayType::new_static(DataType::I32, [1])], error = format!(
-                    "`{PARALLEL_BROADCAST_OPERATION_NAME}` runtime source must be an `i32` scalar but got `i32[1]`",
+                { input_types = [data.clone(), ArrayType::new_static(DataType::U64, [1])], error = format!(
+                    "`{PARALLEL_BROADCAST_OPERATION_NAME}` runtime source must be a `u64` scalar but got `u64[1]`",
                 ) },
-                { input_types = [data, ArrayType::scalar(DataType::I32).with_memory(Memory::Host { pinned: true })],
+                { input_types = [data, ArrayType::scalar(DataType::U64).with_memory(Memory::Host { pinned: true })],
                     error = format!(
                         "`{PARALLEL_BROADCAST_OPERATION_NAME}` runtime source must use the data's memory",
                     ) },
@@ -1510,10 +1501,10 @@ mod tests {
         let operation = ParallelBroadcastOperation::new("x", 1, ParallelBroadcastSource::Dynamic);
         let value = Array::scalar(7f32).unwrap();
         assert_eq!(
-            context.bind(operation.clone(), Vec::new(), &[value.clone(), Array::scalar(0i32).unwrap()]),
+            context.bind(operation.clone(), Vec::new(), &[value.clone(), Array::scalar(0u64).unwrap()]),
             Ok(vec![value.clone()]),
         );
-        let error = context.bind(operation, Vec::new(), &[value, Array::scalar(1i32).unwrap()]).unwrap_err();
+        let error = context.bind(operation, Vec::new(), &[value, Array::scalar(1u64).unwrap()]).unwrap_err();
         assert!(matches!(error.downcast_custom::<AssertionError>(),
             Some(AssertionError::Failed { message, .. }) if message == &format!(
                 "`{PARALLEL_BROADCAST_OPERATION_NAME}` runtime source must be smaller than axis size 1",
@@ -1531,7 +1522,7 @@ mod tests {
                     .interpret(&data.domain(), &EmptyRegionDriver, &[data, source])?
                     .remove(0))
             },
-            (data_type.clone(), ArrayType::scalar(DataType::I32)),
+            (data_type.clone(), ArrayType::scalar(DataType::U64)),
             vec![("x".to_string(), NamedAxis::Batched { size: Some(2) })],
         )
         .unwrap();
@@ -1539,43 +1530,37 @@ mod tests {
         assert_eq!(
             program.to_string(),
             indoc! {"
-                lambda %0:f32[2][layout=strided{8}], %1:i32[] .
-                let %2:i32[] = parallel_reduce [kind=min, axis_name=\"x\"] %1
-                    %3:i32[] = parallel_reduce [kind=max, axis_name=\"x\"] %1
-                    %4:i32[] = constant [value=0]
-                    %5:bool[] = compare [direction=Equal] %2 %3
+                lambda %0:f32[2][layout=strided{8}], %1:u64[] .
+                let %2:u64[] = parallel_reduce [kind=min, axis_name=\"x\"] %1
+                    %3:u64[] = parallel_reduce [kind=max, axis_name=\"x\"] %1
+                    %4:bool[] = compare [direction=Equal] %2 %3
                     () = assert [
                         message=\"`parallel_broadcast` runtime sources must agree across participants\",
                         labels=[\"minimum\", \"maximum\"],
-                    ] %5 %2 %3
-                    %6:bool[] = compare [direction=GreaterThanOrEqual] %2 %4
-                    () = assert [
-                        message=\"`parallel_broadcast` runtime source must be non-negative\",
-                        labels=[\"source\"],
-                    ] %6 %1
-                    %7:i32[] = constant [value=2]
-                    %8:bool[] = compare [direction=LessThan] %3 %7
+                    ] %4 %2 %3
+                    %5:u64[] = constant [value=2]
+                    %6:bool[] = compare [direction=LessThan] %3 %5
                     () = assert [
                         message=\"`parallel_broadcast` runtime source must be smaller than axis size 2\",
                         labels=[\"source\"],
-                    ] %8 %1
-                    %9:f32[2, 2] = parallel_all_gather [
+                    ] %6 %1
+                    %7:f32[2, 2] = parallel_all_gather [
                         axes=\"x\",
                         axis_size=2,
                         concatenation_axis=0,
                         options=Untiled,
                         output_variance=Varying,
                     ] %0
-                    %10:f32[1, 2] = slice [start_indices=[0, 0], limits=[1, 2]] %9
+                    %8:f32[1, 2] = slice [start_indices=[0, 0], limits=[1, 2]] %7
+                    %9:f32[2] = reshape [shape=[2]] %8
+                    %10:f32[1, 2] = slice [start_indices=[1, 0], limits=[2, 2]] %7
                     %11:f32[2] = reshape [shape=[2]] %10
-                    %12:f32[1, 2] = slice [start_indices=[1, 0], limits=[2, 2]] %9
-                    %13:f32[2] = reshape [shape=[2]] %12
-                    %14:i32[] = constant [value=1]
-                    %15:bool[] = compare [direction=Equal] %1 %14
-                    %16:f32[2] = select %15 %13 %11
-                    %17:f32[2][layout=strided{8}] = broadcast [output_type=f32[2][layout=strided{8}], \
-                        output_axes=[0]] %16
-                in (%17)"
+                    %12:u64[] = constant [value=1]
+                    %13:bool[] = compare [direction=Equal] %1 %12
+                    %14:f32[2] = select %13 %11 %9
+                    %15:f32[2][layout=strided{8}] = broadcast [output_type=f32[2][layout=strided{8}], \
+                        output_axes=[0]] %14
+                in (%15)"
             }
         );
     }
@@ -1638,11 +1623,11 @@ mod tests {
         let evaluation = program
             .partially_evaluate(&[
                 PartialValue::Known(Array::scalar(7f32).unwrap()),
-                PartialValue::Known(Array::scalar(1i32).unwrap()),
+                PartialValue::Known(Array::scalar(1u64).unwrap()),
             ])
             .unwrap();
         let expected = indoc! {"
-            lambda %0:f32[], %1:i32[] .
+            lambda %0:f32[], %1:u64[] .
             let %2:f32[] = parallel_broadcast [axes=\"x\", axis_size=2, source=dynamic] %0 %1
             in (%2)"
         };
@@ -1658,14 +1643,14 @@ mod tests {
                 let _ = data.dynamic_parallel_broadcast("x", &source)?;
                 Ok(data)
             },
-            (ArrayType::scalar(DataType::F32), ArrayType::scalar(DataType::I32)),
+            (ArrayType::scalar(DataType::F32), ArrayType::scalar(DataType::U64)),
             vec![("x".to_string(), NamedAxis::Batched { size: Some(1) })],
         )
         .unwrap();
         assert_eq!(
             program.to_string(),
             indoc! {"
-            lambda %0:f32[], %1:i32[] .
+            lambda %0:f32[], %1:u64[] .
             let %2:f32[] = parallel_broadcast [axes=\"x\", axis_size=1, source=dynamic] %0 %1
             in (%0)"
             }
@@ -1674,18 +1659,18 @@ mod tests {
             .to_flat_program()
             .partially_evaluate(&[
                 PartialValue::Known(Array::scalar(7f32).unwrap()),
-                PartialValue::Unknown(ArrayType::scalar(DataType::I32)),
+                PartialValue::Unknown(ArrayType::scalar(DataType::U64)),
             ])
             .unwrap();
         assert_eq!(
             evaluation.program().to_string(),
             indoc! {"
-            lambda %0:i32[], %1:f32[] .
+            lambda %0:u64[], %1:f32[] .
             let %2:f32[] = parallel_broadcast [axes=\"x\", axis_size=1, source=dynamic] %1 %0
             in ()"
             }
         );
-        let error = program.interpret((Array::scalar(7f32).unwrap(), Array::scalar(1i32).unwrap())).unwrap_err();
+        let error = program.interpret((Array::scalar(7f32).unwrap(), Array::scalar(1u64).unwrap())).unwrap_err();
         assert!(matches!(error.downcast_custom::<AssertionError>(),
             Some(AssertionError::Failed { message, .. }) if message == &format!(
                 "`{PARALLEL_BROADCAST_OPERATION_NAME}` runtime source must be smaller than axis size 1",
@@ -1968,7 +1953,7 @@ mod tests {
         assert_eq!(
             program.jvp().unwrap().to_string(),
             indoc! {"
-            lambda %0:f32[], %1:i32[], %2:f32[] .
+            lambda %0:f32[], %1:u64[], %2:f32[] .
             let %3:f32[] = parallel_broadcast [axes=\"x\", axis_size=2, source=dynamic] %0 %1
                 %4:f32[] = parallel_broadcast [axes=\"x\", axis_size=2, source=dynamic, source_validated=true] %2 %1
             in (%3, %4)"
@@ -1978,7 +1963,7 @@ mod tests {
         assert_eq!(
             linearization.primal().to_string(),
             indoc! {"
-            lambda %0:f32[], %1:i32[] .
+            lambda %0:f32[], %1:u64[] .
             let %2:f32[] = parallel_broadcast [axes=\"x\", axis_size=2, source=dynamic] %0 %1
             in (%2, %1)"
             }
@@ -1986,7 +1971,7 @@ mod tests {
         assert_eq!(
             linearization.tangent().to_string(),
             indoc! {"
-            lambda %0:f32[], %1:i32[] .
+            lambda %0:f32[], %1:u64[] .
             let %2:f32[] = parallel_broadcast [axes=\"x\", axis_size=2, source=dynamic, source_validated=true] %0 %1
             in (%2)"
             }
@@ -2438,15 +2423,31 @@ mod tests {
     fn test_parallel_broadcast_dynamic_parallel_broadcast() {
         let rows = Array::matrix(3, 2, vec![1f32, 2.0, 3.0, 4.0, 5.0, 6.0]).unwrap();
         assert_eq!(
-            broadcast_runtime_source(rows, Array::scalar(1i32).unwrap(), BatchAxis::replicated()),
+            broadcast_runtime_source(rows, Array::scalar(1u64).unwrap(), BatchAxis::replicated()),
             Ok(Array::matrix(3, 2, vec![3f32, 4.0, 3.0, 4.0, 3.0, 4.0]).unwrap()),
         );
     }
 
     #[test]
+    fn test_parallel_broadcast_dynamic_parallel_broadcast_axis_index() {
+        // The largest participant coordinate elects one agreed root without an integer conversion.
+        let output = batch(
+            |value: TestTracer| {
+                let source = value.domain().axis_index("x")?.parallel_reduce(ReductionKind::Max, "x")?;
+                value.dynamic_parallel_broadcast("x", &source)
+            },
+            Array::vector(vec![1f32, 2.0]).unwrap(),
+            BatchAxis::new(0),
+            BatchAxis::new(0),
+            BatchAxisSpecification::named("x"),
+        );
+        assert_eq!(output, Ok(Array::vector(vec![2f32, 2.0]).unwrap()));
+    }
+
+    #[test]
     fn test_parallel_broadcast_dynamic_parallel_broadcast_unbound_axis() {
         let value = Array::scalar(1f32).unwrap();
-        let source = Array::scalar(0i32).unwrap();
+        let source = Array::scalar(0u64).unwrap();
         assert_eq!(
             value.dynamic_parallel_broadcast("x", &source),
             Err(ProgramError::Axis(AxisError::UnboundAxisName { name: "x".to_string() })),
@@ -2462,7 +2463,7 @@ mod tests {
     fn test_parallel_broadcast_dynamic_parallel_broadcast_exact_payloads() {
         let nan = f32::from_bits(0x7fc01234);
         let rows = Array::matrix(2, 2, vec![1f32, 2.0, -0.0, nan]).unwrap();
-        let output = broadcast_runtime_source(rows, Array::scalar(1i32).unwrap(), BatchAxis::replicated()).unwrap();
+        let output = broadcast_runtime_source(rows, Array::scalar(1u64).unwrap(), BatchAxis::replicated()).unwrap();
         assert_eq!(output.r#type().as_ref(), &ArrayType::new_static(DataType::F32, [2, 2]));
         assert_eq!(
             output.elements::<f32>().unwrap().into_iter().map(f32::to_bits).collect::<Vec<_>>(),
@@ -2470,12 +2471,12 @@ mod tests {
         );
         let rows = Array::vector(vec![u64::MAX - 1, u64::MAX]).unwrap();
         assert_eq!(
-            broadcast_runtime_source(rows, Array::scalar(1i32).unwrap(), BatchAxis::replicated()),
+            broadcast_runtime_source(rows, Array::scalar(1u64).unwrap(), BatchAxis::replicated()),
             Ok(Array::vector(vec![u64::MAX; 2]).unwrap()),
         );
         let rows = Array::vector(vec![false, true]).unwrap();
         assert_eq!(
-            broadcast_runtime_source(rows, Array::scalar(1i32).unwrap(), BatchAxis::replicated()),
+            broadcast_runtime_source(rows, Array::scalar(1u64).unwrap(), BatchAxis::replicated()),
             Ok(Array::vector(vec![true; 2]).unwrap()),
         );
         let first = Complex::new(1f32, 2.0);
@@ -2483,7 +2484,7 @@ mod tests {
         assert_eq!(
             broadcast_runtime_source(
                 Array::vector(vec![first, second]).unwrap(),
-                Array::scalar(1i32).unwrap(),
+                Array::scalar(1u64).unwrap(),
                 BatchAxis::replicated()
             ),
             Ok(Array::vector(vec![second; 2]).unwrap()),
@@ -2495,7 +2496,7 @@ mod tests {
         assert_eq!(
             broadcast_runtime_source(
                 Array::vector(vec![5f32]).unwrap(),
-                Array::scalar(0i32).unwrap(),
+                Array::scalar(0u64).unwrap(),
                 BatchAxis::replicated()
             ),
             Ok(Array::vector(vec![5f32]).unwrap()),
@@ -2503,7 +2504,7 @@ mod tests {
         assert_eq!(
             broadcast_runtime_source(
                 Array::matrix(2, 0, Vec::<f32>::new()).unwrap(),
-                Array::scalar(1i32).unwrap(),
+                Array::scalar(1u64).unwrap(),
                 BatchAxis::replicated()
             ),
             Ok(Array::matrix(2, 0, Vec::<f32>::new()).unwrap()),
@@ -2511,7 +2512,7 @@ mod tests {
         assert_eq!(
             batch(
                 |(value, source): (TestTracer, TestTracer)| value.dynamic_parallel_broadcast("x", &source),
-                (Array::vector(vec![7f32, 8.0]).unwrap(), Array::scalar(1i32).unwrap()),
+                (Array::vector(vec![7f32, 8.0]).unwrap(), Array::scalar(1u64).unwrap()),
                 (BatchAxis::replicated(), BatchAxis::replicated()),
                 BatchAxis::replicated(),
                 BatchAxisSpecification::new(2, "x"),
@@ -2527,7 +2528,7 @@ mod tests {
             Sharding::new(mesh, vec![ShardingDimension::sharded(["devices"]), ShardingDimension::Replicated]).unwrap();
         let rows = Array::matrix(2, 2, vec![1f32, 2.0, 3.0, 4.0]).unwrap().reshard(&sharding).unwrap();
         assert_eq!(
-            broadcast_runtime_source(rows, Array::scalar(1i32).unwrap(), BatchAxis::replicated()),
+            broadcast_runtime_source(rows, Array::scalar(1u64).unwrap(), BatchAxis::replicated()),
             Ok(Array::matrix(2, 2, vec![3f32, 4.0, 3.0, 4.0]).unwrap().reshard(&sharding).unwrap()),
         );
     }
@@ -2537,7 +2538,7 @@ mod tests {
         let row_major = Array::matrix(2, 2, vec![1f32, 2.0, 3.0, 4.0]).unwrap();
         let column_major = row_major.r#type().into_owned().with_layout(Layout::Strided(StridedLayout::new(vec![4, 8])));
         let rows = Array::from_logical_bytes(column_major, &row_major.logical_bytes()).unwrap();
-        let output = broadcast_runtime_source(rows, Array::scalar(1i32).unwrap(), BatchAxis::replicated()).unwrap();
+        let output = broadcast_runtime_source(rows, Array::scalar(1u64).unwrap(), BatchAxis::replicated()).unwrap();
         assert_eq!(output.elements::<f32>().unwrap(), vec![3f32, 4.0, 3.0, 4.0]);
     }
 
@@ -2546,7 +2547,7 @@ mod tests {
         let memory = Memory::Host { pinned: true };
         let rows = Array::vector(vec![1f32, 2.0]).unwrap().transfer_to_memory(memory).unwrap();
         assert_eq!(
-            broadcast_runtime_source(rows, Array::scalar(1i32).unwrap(), BatchAxis::replicated()),
+            broadcast_runtime_source(rows, Array::scalar(1u64).unwrap(), BatchAxis::replicated()),
             Ok(Array::vector(vec![2f32, 2.0]).unwrap().transfer_to_memory(memory).unwrap()),
         );
     }
@@ -2555,14 +2556,8 @@ mod tests {
     fn test_parallel_broadcast_dynamic_parallel_broadcast_invalid_source() {
         let rows = Array::vector(vec![1f32, 2.0]).unwrap();
         let error = ProgramError::from(
-            broadcast_runtime_source(rows.clone(), Array::scalar(-1i32).unwrap(), BatchAxis::replicated()).unwrap_err(),
-        );
-        assert!(matches!(error.downcast_custom::<AssertionError>(),
-            Some(AssertionError::Failed { message, .. })
-                if message == &format!("`{PARALLEL_BROADCAST_OPERATION_NAME}` runtime source must be non-negative"),
-        ));
-        let error = ProgramError::from(
-            broadcast_runtime_source(rows.clone(), Array::scalar(2i32).unwrap(), BatchAxis::replicated()).unwrap_err(),
+            broadcast_runtime_source(rows.clone(), Array::scalar(1u64 << 32).unwrap(), BatchAxis::replicated())
+                .unwrap_err(),
         );
         assert!(matches!(error.downcast_custom::<AssertionError>(),
             Some(AssertionError::Failed { message, .. })
@@ -2570,19 +2565,37 @@ mod tests {
                     "`{PARALLEL_BROADCAST_OPERATION_NAME}` runtime source must be smaller than axis size 2",
                 ),
         ));
+        let error = ProgramError::from(
+            broadcast_runtime_source(rows.clone(), Array::scalar(2u64).unwrap(), BatchAxis::replicated()).unwrap_err(),
+        );
+        assert!(matches!(error.downcast_custom::<AssertionError>(),
+            Some(AssertionError::Failed { message, .. })
+                if message == &format!(
+                    "`{PARALLEL_BROADCAST_OPERATION_NAME}` runtime source must be smaller than axis size 2",
+                ),
+        ));
+        let error = ProgramError::from(
+            broadcast_runtime_source(rows.clone(), Array::scalar(u64::MAX).unwrap(), BatchAxis::replicated())
+                .unwrap_err(),
+        );
+        assert!(matches!(error.downcast_custom::<AssertionError>(),
+            Some(AssertionError::Failed { message, .. }) if message == &format!(
+                "`{PARALLEL_BROADCAST_OPERATION_NAME}` runtime source must be smaller than axis size 2",
+            ),
+        ));
         assert_eq!(
-            broadcast_runtime_source(rows.clone(), Array::scalar(1u64).unwrap(), BatchAxis::replicated())
+            broadcast_runtime_source(rows.clone(), Array::scalar(1i32).unwrap(), BatchAxis::replicated())
                 .map_err(ProgramError::from),
             Err(TypeError::invalid(format!(
-                "`{PARALLEL_BROADCAST_OPERATION_NAME}` runtime source must be an `i32` scalar but got `u64[]`"
+                "`{PARALLEL_BROADCAST_OPERATION_NAME}` runtime source must be a `u64` scalar but got `i32[]`"
             ))
             .into()),
         );
         assert_eq!(
-            broadcast_runtime_source(rows, Array::vector(vec![1i32]).unwrap(), BatchAxis::replicated())
+            broadcast_runtime_source(rows, Array::vector(vec![1u64]).unwrap(), BatchAxis::replicated())
                 .map_err(ProgramError::from),
             Err(TypeError::invalid(format!(
-                "`{PARALLEL_BROADCAST_OPERATION_NAME}` runtime source must be an `i32` scalar but got `i32[1]`",
+                "`{PARALLEL_BROADCAST_OPERATION_NAME}` runtime source must be a `u64` scalar but got `u64[1]`",
             ))
             .into()),
         );
@@ -2594,7 +2607,7 @@ mod tests {
         let data_type = ArrayType::scalar(DataType::F32)
             .with_sharding(sharding.clone().with_varying_manual_axes(["x"]).unwrap())
             .unwrap();
-        let source_type = ArrayType::scalar(DataType::I32)
+        let source_type = ArrayType::scalar(DataType::U64)
             .with_sharding(sharding.clone().with_unreduced_axes(["x"]).unwrap())
             .unwrap();
         assert_eq!(
@@ -2610,7 +2623,7 @@ mod tests {
             .into()),
         );
         let source_type =
-            ArrayType::scalar(DataType::I32).with_sharding(sharding.with_reduced_axes(["x"]).unwrap()).unwrap();
+            ArrayType::scalar(DataType::U64).with_sharding(sharding.with_reduced_axes(["x"]).unwrap()).unwrap();
         assert_eq!(
             TracingContext::<Array, ArrayOperation<Array>>::trace_with_named_axes(
                 |(value, source)| value.dynamic_parallel_broadcast("x", &source),
@@ -2629,11 +2642,11 @@ mod tests {
     fn test_parallel_broadcast_dynamic_parallel_broadcast_participant_sources() {
         let rows = Array::vector(vec![1f32, 2.0]).unwrap();
         assert_eq!(
-            broadcast_runtime_source(rows.clone(), Array::vector(vec![1i32, 1]).unwrap(), BatchAxis::new(0)),
+            broadcast_runtime_source(rows.clone(), Array::vector(vec![1u64, 1]).unwrap(), BatchAxis::new(0)),
             Ok(Array::vector(vec![2f32; 2]).unwrap()),
         );
         let error = ProgramError::from(
-            broadcast_runtime_source(rows, Array::vector(vec![0i32, 1]).unwrap(), BatchAxis::new(0)).unwrap_err(),
+            broadcast_runtime_source(rows, Array::vector(vec![0u64, 1]).unwrap(), BatchAxis::new(0)).unwrap_err(),
         );
         assert!(matches!(error.downcast_custom::<AssertionError>(),
             Some(AssertionError::Failed { message, .. })
@@ -2660,7 +2673,7 @@ mod tests {
                 },
                 (
                     Array::matrix(2, 3, vec![1f32, 2.0, 3.0, 4.0, 5.0, 6.0]).unwrap(),
-                    Array::vector(vec![0i32, 2]).unwrap(),
+                    Array::vector(vec![0u64, 2]).unwrap(),
                 ),
                 (BatchAxis::new(0), BatchAxis::new(0)),
                 BatchAxis::new(0),
@@ -2673,7 +2686,7 @@ mod tests {
     #[test]
     fn test_parallel_broadcast_dynamic_parallel_broadcast_partial_evaluation_unused_result() {
         let data_type = ArrayType::new_static(DataType::F32, [2]);
-        let source_type = ArrayType::scalar(DataType::I32);
+        let source_type = ArrayType::scalar(DataType::U64);
         let (_, program) = TracingContext::<Array, ArrayOperation<Array>>::trace(
             |(value, source)| {
                 let _ = batch(
@@ -2691,32 +2704,26 @@ mod tests {
         assert_eq!(
             program.to_string(),
             indoc! {"
-                lambda %0:f32[2], %1:i32[] .
-                let %2:i32[] = constant [value=0]
-                    %3:bool[] = compare [direction=Equal] %1 %1
+                lambda %0:f32[2], %1:u64[] .
+                let %2:bool[] = compare [direction=Equal] %1 %1
                     () = assert [
                         message=\"`parallel_broadcast` runtime sources must agree across participants\",
                         labels=[\"minimum\", \"maximum\"],
-                    ] %3 %1 %1
-                    %4:bool[] = compare [direction=GreaterThanOrEqual] %1 %2
-                    () = assert [
-                        message=\"`parallel_broadcast` runtime source must be non-negative\",
-                        labels=[\"source\"],
-                    ] %4 %1
-                    %5:i32[] = constant [value=2]
-                    %6:bool[] = compare [direction=LessThan] %1 %5
+                    ] %2 %1 %1
+                    %3:u64[] = constant [value=2]
+                    %4:bool[] = compare [direction=LessThan] %1 %3
                     () = assert [
                         message=\"`parallel_broadcast` runtime source must be smaller than axis size 2\",
                         labels=[\"source\"],
-                    ] %6 %1
-                    %7:f32[1] = slice [start_indices=[0], limits=[1]] %0
+                    ] %4 %1
+                    %5:f32[1] = slice [start_indices=[0], limits=[1]] %0
+                    %6:f32[] = reshape [shape=[]] %5
+                    %7:f32[1] = slice [start_indices=[1], limits=[2]] %0
                     %8:f32[] = reshape [shape=[]] %7
-                    %9:f32[1] = slice [start_indices=[1], limits=[2]] %0
-                    %10:f32[] = reshape [shape=[]] %9
-                    %11:i32[] = constant [value=1]
-                    %12:bool[] = compare [direction=Equal] %1 %11
-                    %13:f32[] = select %12 %10 %8
-                    %14:f32[2] = broadcast [output_type=f32[2], output_axes=[]] %13
+                    %9:u64[] = constant [value=1]
+                    %10:bool[] = compare [direction=Equal] %1 %9
+                    %11:f32[] = select %10 %8 %6
+                    %12:f32[2] = broadcast [output_type=f32[2], output_axes=[]] %11
                 in (%0)"
             }
         );
@@ -2729,22 +2736,17 @@ mod tests {
         assert_eq!(
             evaluation.program().to_string(),
             indoc! {"
-                lambda %0:i32[], %1:i32[], %2:i32[], %3:i32[], %4:f32[], %5:f32[] .
-                let %6:bool[] = compare [direction=Equal] %0 %0
+                lambda %0:u64[], %1:u64[], %2:u64[], %3:f32[], %4:f32[] .
+                let %5:bool[] = compare [direction=Equal] %0 %0
                     () = assert [
                         message=\"`parallel_broadcast` runtime sources must agree across participants\",
                         labels=[\"minimum\", \"maximum\"],
-                    ] %6 %0 %0
-                    %7:bool[] = compare [direction=GreaterThanOrEqual] %0 %1
-                    () = assert [
-                        message=\"`parallel_broadcast` runtime source must be non-negative\",
-                        labels=[\"source\"],
-                    ] %7 %0
-                    %8:bool[] = compare [direction=LessThan] %0 %2
+                    ] %5 %0 %0
+                    %6:bool[] = compare [direction=LessThan] %0 %1
                     () = assert [
                         message=\"`parallel_broadcast` runtime source must be smaller than axis size 2\",
                         labels=[\"source\"],
-                    ] %8 %0
+                    ] %6 %0
                 in ()"
             }
         );
@@ -2755,7 +2757,7 @@ mod tests {
                 PartialEvaluationInput::Known(value) => value.clone(),
                 PartialEvaluationInput::Unknown(index) => {
                     assert_eq!(*index, 1);
-                    Array::scalar(2i32).unwrap()
+                    Array::scalar(2u64).unwrap()
                 }
             })
             .collect::<Vec<_>>();
@@ -2771,7 +2773,7 @@ mod tests {
     #[test]
     fn test_parallel_broadcast_dynamic_parallel_broadcast_differentiation() {
         let rows = Array::vector(vec![1f64, 2.0, 3.0]).unwrap();
-        let source = Array::scalar(1i32).unwrap();
+        let source = Array::scalar(1u64).unwrap();
         let (value, gradient) = differentiate_at((rows, source))
             .value_and_gradient(|inputs| {
                 let output = batch(
@@ -2798,7 +2800,7 @@ mod tests {
                     .value_and_gradient(|(value, source)| value.dynamic_parallel_broadcast("x", &source))?;
                 Ok((value, gradient.0))
             },
-            (Array::vector(vec![1f64, 2.0]).unwrap(), Array::scalar(1i32).unwrap()),
+            (Array::vector(vec![1f64, 2.0]).unwrap(), Array::scalar(1u64).unwrap()),
             (BatchAxis::new(0), BatchAxis::replicated()),
             (BatchAxis::new(0), BatchAxis::new(0)),
             BatchAxisSpecification::named("x"),
@@ -2813,7 +2815,7 @@ mod tests {
             .with_sharding(Sharding::replicated(mesh.clone(), 0).with_varying_manual_axes(["x"]).unwrap())
             .unwrap();
         let source_type =
-            ArrayType::scalar(DataType::I32).with_sharding(Sharding::replicated(mesh.clone(), 0)).unwrap();
+            ArrayType::scalar(DataType::U64).with_sharding(Sharding::replicated(mesh.clone(), 0)).unwrap();
         let (output, program) = TracingContext::<ArrayIrValue<Array>, ArrayIrOperation<Array>>::trace_with_named_axes(
             |(value, source)| value.dynamic_parallel_broadcast("x", &source),
             (ArrayIrType::from(data_type.clone()), ArrayIrType::from(source_type)),
@@ -2825,7 +2827,7 @@ mod tests {
             program.to_string(),
             indoc! {"
                 lambda %0:f32[][sharding={mesh<['x'=2:manual]>, [], varying_manual={'x'}}], \
-                    %1:i32[][sharding={mesh<['x'=2:manual]>, []}] .
+                    %1:u64[][sharding={mesh<['x'=2:manual]>, []}] .
                 let %2:f32[][sharding={mesh<['x'=2:manual]>, [], varying_manual={'x'}}] = parallel_broadcast \
                     [axes=\"x\", axis_size=2, source=dynamic, mesh=['x'=2:manual]] %0 %1
                 in (%2)"
@@ -2857,55 +2859,49 @@ mod tests {
                 )
                 .map_err(ProgramError::from)
             },
-            (ArrayIrType::from(data_type.clone()), ArrayIrType::from(ArrayType::scalar(DataType::I32))),
+            (ArrayIrType::from(data_type.clone()), ArrayIrType::from(ArrayType::scalar(DataType::U64))),
         )
         .unwrap();
         assert_eq!(output_type, ArrayIrType::from(data_type));
         assert_eq!(
             program.to_string(),
             indoc! {"
-                lambda %0:f32[2, length], %1:i32[] .
+                lambda %0:f32[2, length], %1:u64[] .
                 let %2:dimension<2> = constant [value=2]
-                    %3:i32[] = constant [value=0]
-                    %4:bool[] = compare [direction=Equal] %1 %1
+                    %3:bool[] = compare [direction=Equal] %1 %1
                     () = assert [
                         message=\"`parallel_broadcast` runtime sources must agree across participants\",
                         labels=[\"minimum\", \"maximum\"],
-                    ] %4 %1 %1
-                    %5:bool[] = compare [direction=GreaterThanOrEqual] %1 %3
-                    () = assert [
-                        message=\"`parallel_broadcast` runtime source must be non-negative\",
-                        labels=[\"source\"],
-                    ] %5 %1
-                    %6:i32[] = constant [value=2]
-                    %7:bool[] = compare [direction=LessThan] %1 %6
+                    ] %3 %1 %1
+                    %4:u64[] = constant [value=2]
+                    %5:bool[] = compare [direction=LessThan] %1 %4
                     () = assert [
                         message=\"`parallel_broadcast` runtime source must be smaller than axis size 2\",
                         labels=[\"source\"],
-                    ] %7 %1
-                    %8:f32[1, length] = slice [start_indices=[0, 0], limits=[1, length]] %0
+                    ] %5 %1
+                    %6:f32[1, length] = slice [start_indices=[0, 0], limits=[1, length]] %0
+                    %7:f32[length] = reshape [shape=[length]] %6
+                    %8:f32[1, length] = slice [start_indices=[1, 0], limits=[2, length]] %0
                     %9:f32[length] = reshape [shape=[length]] %8
-                    %10:f32[1, length] = slice [start_indices=[1, 0], limits=[2, length]] %0
-                    %11:f32[length] = reshape [shape=[length]] %10
-                    %12:i32[] = constant [value=1]
-                    %13:bool[] = compare [direction=Equal] %1 %12
-                    %14:f32[length] = select %13 %11 %9
-                    %15:dimension<length ∈ [0, 4)> = dimension_size [axis=0] %14
-                    %16:f32[2, length] = broadcast [output_axes=[1]] %14 %2 %15
-                in (%16)"
+                    %10:u64[] = constant [value=1]
+                    %11:bool[] = compare [direction=Equal] %1 %10
+                    %12:f32[length] = select %11 %9 %7
+                    %13:dimension<length ∈ [0, 4)> = dimension_size [axis=0] %12
+                    %14:f32[2, length] = broadcast [output_axes=[1]] %12 %2 %13
+                in (%14)"
             }
         );
         assert_eq!(
             program.interpret((
                 ArrayIrValue::Array(Array::matrix(2, 3, vec![1f32, 2.0, 3.0, 4.0, 5.0, 6.0]).unwrap()),
-                ArrayIrValue::Array(Array::scalar(1i32).unwrap()),
+                ArrayIrValue::Array(Array::scalar(1u64).unwrap()),
             )),
             Ok(ArrayIrValue::Array(Array::matrix(2, 3, vec![4f32, 5.0, 6.0, 4.0, 5.0, 6.0]).unwrap())),
         );
         assert_eq!(
             program.interpret((
                 ArrayIrValue::Array(Array::matrix(2, 0, Vec::<f32>::new()).unwrap()),
-                ArrayIrValue::Array(Array::scalar(1i32).unwrap()),
+                ArrayIrValue::Array(Array::scalar(1u64).unwrap()),
             )),
             Ok(ArrayIrValue::Array(Array::matrix(2, 0, Vec::<f32>::new()).unwrap())),
         );
