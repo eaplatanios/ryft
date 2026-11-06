@@ -562,6 +562,8 @@ pub enum ShardMapError {
     BatchAxisPlacedOnManualAxisWithDeviceOrderedIo { axis_name: String },
 }
 
+// TODO(eaplatanios): Review from here onwards.
+
 impl From<ProgramError> for ShardMapError {
     fn from(error: ProgramError) -> Self {
         let shard_map_error = match &error {
@@ -580,8 +582,6 @@ impl From<ShardMapError> for ProgramError {
         }
     }
 }
-
-// TODO(eaplatanios): Review from here onwards.
 
 /// Kind of `shard_map` boundary value that a [`ShardMapError`] refers to.
 #[derive(Copy, Clone, Debug, PartialEq, Eq, Hash)]
@@ -614,6 +614,11 @@ impl Display for ShardMapValueKind {
 /// and backends may let their compilers propagate placements over free axes across the manual region (e.g., by
 /// lowering the dimension shardings of the boundary as open dimension shardings).
 ///
+/// The global outputs are typed over the [caller's mesh](Self::caller_mesh), which is the mesh of the computation
+/// unless the map was bound by a caller whose values are typed over that mesh with other types for the axes that the
+/// map makes manual (e.g., [`Explicit`](MeshAxisType::Explicit)). Like JAX's `shard_map`, which retypes the caller's
+/// mesh only inside of its body, the outputs of such a map are then typed like the values of its caller.
+///
 /// This type is the logical boundary model only and carries no backend state. Backends lower it, for example, to the
 /// `in_shardings`, `out_shardings`, and `manual_axes` attributes of Shardy's
 /// [`sdy.manual_computation`](https://openxla.org/shardy/sdy_dialect#sdymanual_computation-sdymanualcomputationop)
@@ -623,6 +628,10 @@ impl Display for ShardMapValueKind {
 pub struct ShardMapBoundary {
     /// Logical mesh that the manual computation is defined over.
     mesh: LogicalMesh,
+
+    /// Mesh over which the global outputs are typed when it differs from [`Self::mesh`], or [`None`] otherwise (refer
+    /// to [`Self::caller_mesh`]).
+    caller_mesh: Option<LogicalMesh>,
 
     /// Validated shardings for each global input leaf.
     input_shardings: Vec<Sharding>,
@@ -718,6 +727,7 @@ impl ShardMapBoundary {
         )?;
         Ok(Self {
             mesh,
+            caller_mesh: None,
             input_shardings,
             output_shardings,
             manual_axes,
@@ -736,6 +746,7 @@ impl ShardMapBoundary {
     ) -> Self {
         Self {
             mesh,
+            caller_mesh: None,
             input_shardings,
             output_shardings,
             manual_axes,
@@ -746,6 +757,17 @@ impl ShardMapBoundary {
     /// Restores the complete checking policy while rebuilding a derived boundary.
     fn with_manual_variation_checks(mut self, checks: ManualVariationChecks) -> Self {
         self.manual_variation_checks = checks;
+        self
+    }
+
+    /// Returns this boundary with its global outputs typed over `caller_mesh` (refer to [`Self::caller_mesh`]), which
+    /// [`shard_map_caller_mesh`] selects and validates, and which transform rules carry over from the boundary that
+    /// they derive a boundary from when the derived outputs include outputs of the original map. Their internal
+    /// residual edges stay typed over [`Self::mesh`], and transposition, whose outputs are input cotangents that it
+    /// reconciles with the types of the caller's inputs, does not carry it over. A `caller_mesh` equal to
+    /// [`Self::mesh`] is normalized to [`None`], so that equal boundaries compare equal.
+    fn with_caller_mesh(mut self, caller_mesh: Option<LogicalMesh>) -> Self {
+        self.caller_mesh = caller_mesh.filter(|caller_mesh| caller_mesh != &self.mesh);
         self
     }
 
@@ -787,6 +809,17 @@ impl ShardMapBoundary {
     #[inline]
     pub fn mesh(&self) -> &LogicalMesh {
         &self.mesh
+    }
+
+    /// Returns the mesh over which the global outputs of this manual computation are typed. It has the topology of
+    /// [`Self::mesh`] and types the axes that enclosing manual regions made manual as
+    /// [`Manual`](MeshAxisType::Manual), but it may type the active manual axes as the caller of the map types them
+    /// (e.g., as [`Explicit`](MeshAxisType::Explicit)), so that the outputs can be used like the other values of the
+    /// caller (e.g., switched with [`auto_axes`](crate::auto_axes)) without first being resharded. It is
+    /// [`Self::mesh`] unless the map was bound by the [`ShardMap`] capability for such a caller.
+    #[inline]
+    pub fn caller_mesh(&self) -> &LogicalMesh {
+        self.caller_mesh.as_ref().unwrap_or(&self.mesh)
     }
 
     /// Returns the per-input shardings, one per global input, in input order. They are defined over [`Self::mesh`],
@@ -1256,7 +1289,7 @@ impl ShardMapBoundary {
 
     /// Returns the global type of output `output_index` whose body produces `local_output_type`, which is the local
     /// shape scaled by the manual partition counts of the output sharding, under that sharding with the variation along
-    /// active manual axes dropped. The body output must vary along every active manual axis that the output sharding
+    /// active manual axes dropped, re-expressed over [`Self::caller_mesh`]. The body output must vary along every active manual axis that the output sharding
     /// tiles and, when [`Self::check_output_replication`] is enabled, along no other active manual axis. Its unreduced
     /// and reduced axes along the axes that the output sharding governs must equal those of the output sharding, while
     /// its state along every other axis is carried into
@@ -1315,7 +1348,9 @@ impl ShardMapBoundary {
         )
         .with_layout(local_output_type.layout().cloned())
         .with_sharding(
-            carried_state.apply(output_sharding.clone().with_varying_manual_axes(surviving_varying_axes)?)?,
+            carried_state
+                .apply(output_sharding.clone().with_varying_manual_axes(surviving_varying_axes)?)?
+                .with_mesh(self.caller_mesh().clone())?,
         )?)
     }
 
@@ -2215,6 +2250,7 @@ impl Operation for ShardMapOperation {
                 output_indices.iter().map(|&index| self.boundary.output_shardings()[index].clone()).collect(),
                 self.boundary.manual_axes().to_vec(),
             )
+            .with_caller_mesh(self.boundary.caller_mesh.clone())
             .with_manual_variation_checks(self.boundary.manual_variation_checks),
             input_indices.iter().map(|&index| self.input_types[index].clone()),
             output_indices.iter().map(|&index| self.output_types[index].clone()),
@@ -2256,6 +2292,9 @@ impl Operation for ShardMapOperation {
             // The mesh is redundant with any rendered sharding, which embeds it, but a boundary may have no
             // shardings at all, so it is rendered unconditionally.
             operation.list("mesh", self.boundary.mesh().axes())?;
+            if self.boundary.caller_mesh() != self.boundary.mesh() {
+                operation.list("caller_mesh", self.boundary.caller_mesh().axes())?;
+            }
             operation.list("input_shardings", self.boundary.input_shardings())?;
             operation.list("output_shardings", self.boundary.output_shardings())?;
             operation.list("manual_axes", manual_axes)?;
@@ -2426,6 +2465,7 @@ where
             output_shardings,
             self.boundary.manual_axes().to_vec(),
         )
+        .with_caller_mesh(self.boundary.caller_mesh.clone())
         .with_manual_variation_checks(self.boundary.manual_variation_checks);
         let operation = ShardMapOperation::from_boundary(boundary, input_types, output_types);
         let mut outputs = context.parent().bind(operation, vec![program], &boundary_inputs)?;
@@ -2557,6 +2597,7 @@ where
                 kept_outputs.iter().map(|&index| self.boundary.output_shardings()[index].clone()).collect(),
                 self.boundary.manual_axes().to_vec(),
             )
+            .with_caller_mesh(self.boundary.caller_mesh.clone())
             .with_manual_variation_checks(self.boundary.manual_variation_checks),
             input_types: self.input_types.clone(),
             output_types: kept_outputs.iter().map(|&index| self.output_types[index].clone()).collect(),
@@ -2896,6 +2937,7 @@ where
                 &enclosing_manual_axes,
             )
             .map_err(to_batching_error)?
+            .with_caller_mesh(self.boundary.caller_mesh.clone())
             .with_manual_variation_checks(self.boundary.manual_variation_checks);
         }
         let operation = ShardMapOperation::from_boundary(boundary, input_types, output_types)
@@ -5742,6 +5784,7 @@ where
                 known_output_shardings,
                 operation.boundary.manual_axes().to_vec(),
             )
+            .with_caller_mesh(operation.boundary.caller_mesh.clone())
             .with_manual_variation_checks(operation.boundary.manual_variation_checks);
             let known_operation =
                 ShardMapOperation::from_boundary(known_boundary, known_global_input_types, known_global_output_types);
@@ -5754,6 +5797,7 @@ where
                 staged_output_shardings,
                 operation.boundary.manual_axes().to_vec(),
             )
+            .with_caller_mesh(operation.boundary.caller_mesh.clone())
             .with_manual_variation_checks(operation.boundary.manual_variation_checks);
             let staged_operation = ShardMapOperation::from_boundary(
                 staged_boundary,
@@ -6207,6 +6251,7 @@ where
             boundary.output_shardings().iter().cloned().chain(edge_shardings.iter().cloned()).collect(),
             boundary.manual_axes().to_vec(),
         )
+        .with_caller_mesh(boundary.caller_mesh.clone())
         .with_manual_variation_checks(boundary.manual_variation_checks),
         operation.input_types.clone(),
         operation.output_types.iter().cloned().chain(edge_global_types.iter().cloned()).collect::<Vec<_>>(),
@@ -6266,6 +6311,7 @@ where
             tangent_output_shardings,
             boundary.manual_axes().to_vec(),
         )
+        .with_caller_mesh(boundary.caller_mesh.clone())
         .with_manual_variation_checks(boundary.manual_variation_checks),
         tangent_input_types,
         tangent_output_types,
@@ -6366,6 +6412,7 @@ where
             output_shardings,
             boundary.manual_axes().to_vec(),
         )
+        .with_caller_mesh(boundary.caller_mesh.clone())
         .with_manual_variation_checks(boundary.manual_variation_checks),
         input_types,
         output_types,
@@ -7264,7 +7311,8 @@ fn resolve_shard_map_mesh<C: MeshContext>(
 /// Traces `function` as the local body of a `shard_map` over `mesh` on `inputs` in `context` and binds it there,
 /// which is the shared implementation of the `shard_map` and `shard_map_along` functions of [`ShardMap`]. The boundary
 /// of a map whose output shardings are [`ShardMapOutputShardings::Along`] starts without outputs, since the output
-/// ranks are only known once the body is traced, and is rebuilt from the output types of the body.
+/// ranks are only known once the body is traced, and is rebuilt from the output types of the body. The outputs are
+/// typed over the caller's mesh that [`shard_map_caller_mesh`] selects.
 fn bind_shard_map<C, F, Input, Output>(
     context: &C,
     function: F,
@@ -7277,7 +7325,9 @@ fn bind_shard_map<C, F, Input, Output>(
 where
     TracingContext<C::Constant, C::Operation>:
         StagingContext<Type = ArrayIrType, Constant = C::Constant, Operation = C::Operation>,
-    C: Context<Type = ArrayIrType, Operation: From<ShardMapOperation> + OperationPayloadProjection> + NamedAxes,
+    C: Context<Type = ArrayIrType, Operation: From<ShardMapOperation> + OperationPayloadProjection>
+        + NamedAxes
+        + MeshContext,
     C::Value: ValueProjection<ArrayType, Projected: Parameter>,
     ShardMapTracer<C>: ParallelVary,
     Input: Parameterized<ShardMapValue<C>>,
@@ -7303,7 +7353,8 @@ where
         options.manual_axes.clone(),
         &named_axes,
     )?;
-    let boundary = boundary.with_manual_variation_checks(checks);
+    let caller_mesh = shard_map_caller_mesh(&boundary, &global_input_types, context.default_mesh(), &outer_named_axes);
+    let boundary = boundary.with_caller_mesh(caller_mesh.clone()).with_manual_variation_checks(checks);
     let rebuild_boundary = output_axes.map(|(axis_name, axes)| {
         move |output_types: &[ArrayType]| -> Result<ShardMapBoundary, ShardMapError> {
             let output_shardings = axes
@@ -7322,7 +7373,7 @@ where
                 options.manual_axes.clone(),
                 &named_axes,
             )?;
-            Ok(boundary.with_manual_variation_checks(checks))
+            Ok(boundary.with_caller_mesh(caller_mesh.clone()).with_manual_variation_checks(checks))
         }
     });
     let (operation, body) = trace_shard_map_body::<C, _>(
@@ -7343,6 +7394,43 @@ where
         .map(|output| ValueProjection::<ArrayType>::into_projected(output).map_err(ProgramError::from))
         .collect::<Result<Vec<_>, _>>()?;
     Ok(Output::To::<ShardMapValue<C>>::from_parameters(output_structure, outputs)?)
+}
+
+/// Returns the caller's mesh over which a closure-traced `shard_map` with boundary `boundary` types its outputs (refer to
+/// [`ShardMapBoundary::caller_mesh`]), or [`None`] to type them over the mesh of the map. The caller's values carry
+/// their meshes in their types, so the candidate is the mesh that every sharded input in `global_input_types` is placed
+/// over, and the default mesh `default_mesh` of the binding context (JAX's context mesh) when no input is sharded.
+/// Inputs placed over different meshes leave no candidate. The candidate is used only when it describes the caller of
+/// this map, which requires the topology of the mesh of the map, the axes that enclosing manual regions made manual
+/// (i.e., the [`NamedAxis::Mesh`] bindings in `enclosing_named_axes`) typed as [`Manual`](MeshAxisType::Manual), and
+/// the axes that the map makes manual typed otherwise. The other axes are free and may have any type.
+fn shard_map_caller_mesh(
+    boundary: &ShardMapBoundary,
+    global_input_types: &[ArrayType],
+    default_mesh: Option<LogicalMesh>,
+    enclosing_named_axes: &[(String, NamedAxis)],
+) -> Option<LogicalMesh> {
+    let mut input_meshes = global_input_types.iter().filter_map(|r#type| r#type.sharding().map(Sharding::mesh));
+    let candidate = match input_meshes.next() {
+        Some(mesh) if input_meshes.all(|other| other == mesh) => mesh.clone(),
+        Some(_) => return None,
+        None => default_mesh?,
+    };
+    let is_valid = candidate.has_same_topology(boundary.mesh())
+        && candidate.axes().iter().all(|axis| {
+            let is_manual = axis.r#type() == MeshAxisType::Manual;
+            if boundary.manual_axes().iter().any(|name| name == axis.name()) {
+                !is_manual
+            } else if enclosing_named_axes
+                .iter()
+                .any(|(name, binding)| name == axis.name() && matches!(binding, NamedAxis::Mesh { .. }))
+            {
+                is_manual
+            } else {
+                true
+            }
+        });
+    is_valid.then_some(candidate)
 }
 
 /// Builds the [`ShardMapBoundary`] of a closure-traced `shard_map` that is bound in the scope of named axes
@@ -23820,9 +23908,10 @@ mod tests {
     #[test]
     fn test_shard_map_transposition_reconciles_placements_across_axis_type_variants() {
         // A caller may place its input along the axis `x` of a mesh in which `x` is explicit, while the shard map uses
-        // the same mesh axes with `x` manual. The assembled input cotangent is reconciled in the frame of the caller's
-        // mesh, in which it already has the caller's placement along `x`, so no `reshard` is needed, and a
-        // placement-only `broadcast` re-places the cotangent over the caller's mesh.
+        // the same mesh axes with `x` manual. The output of the map is typed over the caller's mesh, and so is its
+        // cotangent. The assembled input cotangent is reconciled in the frame of the caller's mesh, in which it already
+        // has the caller's placement along `x`, so no `reshard` is needed, and a placement-only `broadcast` re-places
+        // the cotangent over the caller's mesh.
         let explicit_mesh = LogicalMesh::new(vec![MeshAxis::new("x", 2, MeshAxisType::Explicit).unwrap()]).unwrap();
         let caller_type = f32_vector_type(8)
             .with_sharding(Sharding::new(explicit_mesh, vec![ShardingDimension::sharded(["x"])]).unwrap())
@@ -23852,13 +23941,13 @@ mod tests {
         assert_eq!(
             program.transpose_with_respect_to(&[0], &[CotangentDestinationKind::Return]).unwrap().to_string(),
             formatdoc! {"
-                lambda %0:{global_type} .
+                lambda %0:{caller_type} .
                 let %1:{global_type} = shard_map [
                     mesh=['x'=2:manual],
                     input_shardings=[{sharding}],
                     output_shardings=[{sharding}],
                     manual_axes=['x'],
-                    global_input_types=[{global_type}],
+                    global_input_types=[{caller_type}],
                     global_output_types=[{global_type}],
                 ] %0 [
                     body={{
@@ -26201,7 +26290,8 @@ mod tests {
     fn test_shard_map_with_inferred_input_shardings() {
         // The inputs are typed over an `Explicit` copy of the mesh of the map, as under JAX's explicit sharding mode, and
         // their shardings are re-expressed over the mesh of the map as its input shardings. The body adds the local
-        // shard of the sharded input to the whole replicated input.
+        // shard of the sharded input to the whole replicated input, and the output is typed over the caller's mesh,
+        // as JAX types the outputs of `shard_map` over its context mesh.
         let mesh = manual_mesh();
         let caller_mesh = LogicalMesh::new(vec![MeshAxis::new("x", 2, MeshAxisType::Explicit).unwrap()]).unwrap();
         let sharded_type = f32_vector_type(4)
@@ -26231,13 +26321,14 @@ mod tests {
             program.to_string(),
             formatdoc! {"
                 lambda %0:{sharded_type}, %1:{replicated_type} .
-                let %2:f32[4][sharding={sharded}] = shard_map [
+                let %2:{sharded_type} = shard_map [
                     mesh=['x'=2:manual],
+                    caller_mesh=['x'=2:explicit],
                     input_shardings=[{sharded}, {replicated}],
                     output_shardings=[{sharded}],
                     manual_axes=['x'],
                     global_input_types=[f32[4][sharding={sharded}], f32[2][sharding={replicated}]],
-                    global_output_types=[f32[4][sharding={sharded}]],
+                    global_output_types=[{sharded_type}],
                 ] %0 %1 [
                     body={{
                         lambda %0:{local}, %1:f32[2][sharding={replicated}] .
@@ -26259,6 +26350,149 @@ mod tests {
                     .unwrap(),
             ),
             vec![vec![11.0, 22.0, 13.0, 24.0]],
+        );
+    }
+
+    #[test]
+    fn test_shard_map_types_outputs_over_the_callers_mesh() {
+        // A caller that types its values over an `Explicit` copy of the mesh of the map receives outputs typed over
+        // that mesh, as JAX types the outputs of `shard_map` over its context mesh, so they combine with its other
+        // values, whose mesh must match exactly. Transforms preserve those types, so the output tangents, the batched
+        // outputs, and the input cotangents of the transposed map are typed like the caller's values as well.
+        let caller_mesh = LogicalMesh::new(vec![MeshAxis::new("x", 2, MeshAxisType::Explicit).unwrap()]).unwrap();
+        let caller_type = f32_vector_type(8)
+            .with_sharding(Sharding::new(caller_mesh.clone(), vec![ShardingDimension::sharded(["x"])]).unwrap())
+            .unwrap();
+        let program = trace_test_program(
+            |inputs| {
+                let input = inputs[0].clone();
+                let output = shard_map(
+                    |x: TestTracer| Ok(x.clone() + x),
+                    input.clone(),
+                    manual_mesh(),
+                    sharded_along_x(),
+                    sharded_along_x(),
+                    ShardMapOptions::new(),
+                )
+                .unwrap();
+                vec![output + input]
+            },
+            vec![caller_type.clone()],
+            Vec::new(),
+        );
+        let global_type = f32_vector_type(8).with_sharding(sharded_along_x()).unwrap();
+        let local_type = f32_vector_type(4)
+            .with_sharding(Sharding::replicated(manual_mesh(), 1).with_varying_manual_axes(["x"]).unwrap())
+            .unwrap();
+        assert_eq!(
+            program.to_string(),
+            formatdoc! {"
+                lambda %0:{caller_type} .
+                let %1:{caller_type} = shard_map [
+                    mesh=['x'=2:manual],
+                    caller_mesh=['x'=2:explicit],
+                    input_shardings=[{sharding}],
+                    output_shardings=[{sharding}],
+                    manual_axes=['x'],
+                    global_input_types=[{global_type}],
+                    global_output_types=[{caller_type}],
+                ] %0 [
+                    body={{
+                        lambda %0:{local_type} .
+                        let %1:{local_type} = add %0 %0
+                        in (%1)
+                    }},
+                ]
+                    %2:{caller_type} = add %1 %0
+                in (%2)",
+                sharding = sharded_along_x(),
+            },
+        );
+        let input = f32_value(caller_type.clone(), &[1.0, 2.0, 3.0, 4.0, 5.0, 6.0, 7.0, 8.0]);
+        assert_eq!(
+            arrays_f64(program.interpret(vec![input]).unwrap()),
+            vec![vec![3.0, 6.0, 9.0, 12.0, 15.0, 18.0, 21.0, 24.0]],
+        );
+
+        let caller = ArrayIrType::Array(caller_type.clone());
+        assert_eq!(program.jvp().unwrap().output_types().into_owned(), vec![caller.clone(), caller.clone()]);
+        let linearization = program.linearize().unwrap();
+        assert_eq!(linearization.primal().output_types()[0], caller);
+        assert_eq!(linearization.tangent().output_types().into_owned(), vec![caller.clone()]);
+        let transposed = program.transpose_with_respect_to(&[0], &[CotangentDestinationKind::Return]).unwrap();
+        assert_eq!(transposed.input_types().into_owned(), vec![caller.clone()]);
+        assert_eq!(transposed.output_types().into_owned(), vec![caller]);
+        let (batched, _) = program
+            .batched_with_threaded_extent(
+                DimensionValue::constant(3).unwrap().r#type().into_owned(),
+                ShardingDimension::Replicated,
+                &[BatchAxis::new(0)],
+                ProgramBatchingOutputAxesPolicy::Natural,
+            )
+            .unwrap()
+            .into_parts();
+        let batched_type = ArrayType::new_static(DataType::F32, [3, 8])
+            .with_sharding(
+                Sharding::new(caller_mesh, vec![ShardingDimension::Replicated, ShardingDimension::sharded(["x"])])
+                    .unwrap(),
+            )
+            .unwrap();
+        assert_eq!(batched.output_types()[1], ArrayIrType::Array(batched_type));
+    }
+
+    #[test]
+    fn test_nested_shard_map_types_outputs_over_the_enclosing_body_mesh() {
+        // The body of a map that makes `x` manual over a mesh whose `y` is explicit types its values over that mesh,
+        // so a nested map over the fully manual mesh that makes `y` manual returns outputs typed over the mesh of the
+        // enclosing body (with `x` manual and `y` explicit), which the body combines with its other values.
+        let caller_mesh = LogicalMesh::new(vec![
+            MeshAxis::new("x", 2, MeshAxisType::Explicit).unwrap(),
+            MeshAxis::new("y", 2, MeshAxisType::Explicit).unwrap(),
+        ])
+        .unwrap();
+        let outer_mesh = caller_mesh.with_axis_types(["x"], MeshAxisType::Manual).unwrap();
+        let inner_mesh = manual_mesh_2x2();
+        let caller_type = f32_vector_type(8)
+            .with_sharding(Sharding::new(caller_mesh, vec![ShardingDimension::sharded(["x"])]).unwrap())
+            .unwrap();
+        let outer_sharding = Sharding::new(outer_mesh.clone(), vec![ShardingDimension::sharded(["x"])]).unwrap();
+        let inner_sharding = Sharding::replicated(inner_mesh.clone(), 1);
+        let body_type = f32_vector_type(4)
+            .with_sharding(Sharding::replicated(outer_mesh.clone(), 1).with_varying_manual_axes(["x"]).unwrap())
+            .unwrap();
+        let program = trace_test_program(
+            |inputs| {
+                vec![
+                    shard_map(
+                        |x: TestTracer| {
+                            let nested = shard_map(
+                                |x: TestTracer| Ok(x.clone() + x),
+                                x.clone(),
+                                inner_mesh.clone(),
+                                inner_sharding.clone(),
+                                inner_sharding.clone(),
+                                ShardMapOptions::new().with_manual_axes(["y"]),
+                            )?;
+                            assert_eq!(nested.r#type().as_ref(), &body_type);
+                            Ok(nested + x)
+                        },
+                        inputs[0].clone(),
+                        outer_mesh.clone(),
+                        outer_sharding.clone(),
+                        outer_sharding.clone(),
+                        ShardMapOptions::new().with_manual_axes(["x"]),
+                    )
+                    .unwrap(),
+                ]
+            },
+            vec![caller_type.clone()],
+            Vec::new(),
+        );
+        assert_eq!(program.output_types().into_owned(), vec![ArrayIrType::Array(caller_type.clone())]);
+        let input = f32_value(caller_type, &[1.0, 2.0, 3.0, 4.0, 5.0, 6.0, 7.0, 8.0]);
+        assert_eq!(
+            arrays_f64(program.interpret(vec![input]).unwrap()),
+            vec![vec![3.0, 6.0, 9.0, 12.0, 15.0, 18.0, 21.0, 24.0]],
         );
     }
 

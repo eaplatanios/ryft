@@ -11,9 +11,10 @@
 //!
 //! Every Ryft [`Sharding`] carries its [`LogicalMesh`], and so the types of the mesh axes belong to each value's type
 //! rather than to some ambient context. A switch therefore works on values only. It takes its mesh from the shardings
-//! that it is given (i.e., the output shardings of [`auto_axes`] and the input shardings of [`explicit_axes`]), retypes
-//! the selected axes of that mesh (refer to [`LogicalMesh::with_axis_types`]), and runs the function inline between two
-//! sets of [`Reshard`]s:
+//! that it is given (i.e., the output shardings of [`auto_axes`] and the input shardings of [`explicit_axes`]), or from
+//! the [`default_mesh`](MeshContext::default_mesh) of the context of its inputs when [`auto_axes`] is given none (i.e.,
+//! for a function without outputs), retypes the selected axes of that mesh (refer to [`LogicalMesh::with_axis_types`]),
+//! and runs the function inline between two sets of [`Reshard`]s:
 //!
 //! ```text
 //!               entry reshards                 function                 exit reshards
@@ -32,18 +33,6 @@
 //!
 //! The switch is not recorded in the context of the function, so the [`default_mesh`](crate::MeshContext::default_mesh)
 //! of a context, which a nested `shard_map` without a mesh uses, keeps the original axis types inside the function.
-//!
-//! # Differences from JAX
-//!
-//! - A switch has no context mesh to fall back on, so it requires at least one sharding (JAX uses the context mesh
-//!   when it is given none), and it rejects values placed over any mesh other than its mesh and the switched mesh.
-//! - Reduction state along a switched axis is rejected rather than reduced implicitly (JAX's implicit reduction
-//!   fails when it is lowered).
-//! - Batching a switch along a dimension placed along a switched axis leaves the batch dimension replicated over the
-//!   original mesh, since Ryft derives the placement of a batch dimension from the inputs of each operation, whereas
-//!   JAX places it along that axis again on exit.
-//! - The outputs of a `shard_map` are typed over its mesh, which types the axes that it made manual as
-//!   [`Manual`](MeshAxisType::Manual), so they must be resharded onto the caller's mesh before they can be switched.
 
 // TODO(eaplatanios): Review from here onwards.
 
@@ -52,6 +41,7 @@ use std::collections::BTreeSet;
 use thiserror::Error;
 
 use crate::arrays::{ArrayMemberType, LogicalMesh, MeshAxisType, Sharding, ShardingError};
+use crate::axes::MeshContext;
 use crate::operations::sharding::reshard::Reshard;
 use crate::parameters::{Parameter, ParameterError, ParameterPath, Parameterized, ParameterizedFamily};
 use crate::programs::{ProgramError, Value};
@@ -83,8 +73,12 @@ pub enum AxisTypesError {
     #[error(transparent)]
     Sharding(#[from] ShardingError),
 
-    /// Error raised when the switch is given no sharding to take its mesh from.
-    #[error("switching mesh axes to `{axis_type}` requires at least one sharding to take the mesh from")]
+    /// Error raised when the switch is given no sharding to take its mesh from and, for [`auto_axes`], the context of
+    /// its inputs has no default mesh either (refer to [`MeshContext::default_mesh`]).
+    #[error(
+        "switching mesh axes to `{axis_type}` requires at least one sharding or a default mesh of the context of its \
+         inputs to take the mesh from"
+    )]
     MissingMesh { axis_type: MeshAxisType },
 
     /// Error raised when the shardings that the switch is given are over different meshes.
@@ -151,13 +145,14 @@ impl From<AxisTypesError> for ProgramError {
 /// [`jax.sharding.auto_axes`](https://docs.jax.dev/en/latest/jax.sharding.html), whose `out_sharding` it takes as
 /// `output_shardings`.
 ///
-/// The switch is defined over the mesh of `output_shardings`, which must all share one mesh, and `axes` of [`None`]
-/// selects every axis of that mesh. Each sharded input is resharded onto the switched mesh with its placement along
-/// [`Auto`](MeshAxisType::Auto) axes (i.e., the switched axes as well as the axes that are already auto) removed,
-/// `function` runs inline on the resharded inputs, and each output is resharded to its output sharding. Inputs without
-/// a sharding pass through unchanged. When the selected axes are exactly the auto axes of the mesh, nothing is
-/// switched and `function` runs directly on `inputs`, without resharding its outputs (as in JAX, which also skips the
-/// switch only in that case).
+/// The switch is defined over the mesh of `output_shardings`, which must all share one mesh, or over the default mesh
+/// of the context of `inputs` when `output_shardings` has no leaves (refer to [`MeshContext::default_mesh`]), and
+/// `axes` of [`None`] selects every axis of that mesh. Each sharded input is resharded onto the switched mesh with its
+/// placement along [`Auto`](MeshAxisType::Auto) axes (i.e., the switched axes as well as the axes that are already
+/// auto) removed, `function` runs inline on the resharded inputs, and each output is resharded to its output sharding.
+/// Inputs without a sharding pass through unchanged. When the selected axes are exactly the auto axes of the mesh,
+/// nothing is switched and `function` runs directly on `inputs`, without resharding its outputs (as in JAX, which also
+/// skips the switch only in that case).
 ///
 /// The inputs and outputs may be concrete arrays (e.g., the arrays of the XLA backend, which then reshard eagerly)
 /// as well as tracers, since a switch only reshards them. The function is not traced separately, so transforms apply
@@ -175,18 +170,18 @@ impl From<AxisTypesError> for ProgramError {
 ///
 /// # Errors
 ///
-/// Returns [`AxisTypesError::MissingMesh`] when `output_shardings` has no leaves, [`AxisTypesError::MeshMismatch`] when
-/// its leaves are over different meshes, [`AxisTypesError::Sharding`] when `axes` names an axis that the mesh does not
-/// have, [`AxisTypesError::ManualAxis`] when `axes` selects a [`Manual`](MeshAxisType::Manual) axis (which includes
-/// `axes` of [`None`] inside a manual region), [`AxisTypesError::InputMeshMismatch`] or
-/// [`AxisTypesError::OutputMeshMismatch`] for an input or an output of `function` placed over a mesh that is neither
-/// the mesh of the switch nor that mesh with the switched axes retyped (e.g., the mesh of a `shard_map` body when the
-/// output shardings are over the mesh outside of it), [`AxisTypesError::InputReductionState`] for an input that is
-/// unreduced or reduced along a switched axis (which JAX would reduce implicitly, but its lowering of that reduction
-/// fails), [`AxisTypesError::Parameter`] when the outputs of `function` do not have the structure of
-/// `output_shardings`, and [`AxisTypesError::Program`] for the errors of `function`, of non-array leaves, and of the
-/// reshards (e.g., an output sharding that names an [`Auto`](MeshAxisType::Auto) axis or that does not restate the
-/// reduction state of its output).
+/// Returns [`AxisTypesError::MissingMesh`] when `output_shardings` has no leaves and the context of `inputs` has no
+/// default mesh, [`AxisTypesError::MeshMismatch`] when its leaves are over different meshes,
+/// [`AxisTypesError::Sharding`] when `axes` names an axis that the mesh does not have, [`AxisTypesError::ManualAxis`]
+/// when `axes` selects a [`Manual`](MeshAxisType::Manual) axis (which includes `axes` of [`None`] inside a manual
+/// region), [`AxisTypesError::InputMeshMismatch`] or [`AxisTypesError::OutputMeshMismatch`] for an input or an output
+/// of `function` placed over a mesh that is neither the mesh of the switch nor that mesh with the switched axes retyped
+/// (e.g., the mesh of a `shard_map` body when the output shardings are over the mesh outside of it),
+/// [`AxisTypesError::InputReductionState`] for an input that is unreduced or reduced along a switched axis (which JAX
+/// would reduce implicitly, but its lowering of that reduction fails), [`AxisTypesError::Parameter`] when the outputs
+/// of `function` do not have the structure of `output_shardings`, and [`AxisTypesError::Program`] for the errors of
+/// `function`, of non-array leaves, and of the reshards (e.g., an output sharding that names an
+/// [`Auto`](MeshAxisType::Auto) axis or that does not restate the reduction state of its output).
 ///
 /// # Example
 ///
@@ -238,13 +233,14 @@ pub fn auto_axes<V, F, Input, Output>(
     output_shardings: Output::To<Sharding>,
 ) -> Result<Output, AxisTypesError>
 where
-    V: Value<Type: ArrayMemberType> + Reshard,
+    V: Value<Type: ArrayMemberType, Domain: MeshContext> + Reshard,
     Input: Parameterized<V>,
     Output: Parameterized<V>,
     Output::Family: ParameterizedFamily<Sharding>,
     F: FnOnce(Input) -> Result<Output, ProgramError>,
 {
-    let switch = AxisTypeSwitch::new(output_shardings.parameters(), axes, MeshAxisType::Auto)?;
+    let default_mesh = || inputs.parameters().next().and_then(|input| input.domain().default_mesh());
+    let switch = AxisTypeSwitch::new(output_shardings.parameters(), default_mesh, axes, MeshAxisType::Auto)?;
 
     // Inputs must be placed over the mesh of the switch even when nothing is switched, which rejects, for example,
     // output shardings over a mesh that already types the selected axes as auto while the inputs do not.
@@ -374,7 +370,9 @@ where
     Output: Parameterized<V>,
     F: FnOnce(Input) -> Result<Output, ProgramError>,
 {
-    let switch = AxisTypeSwitch::new(input_shardings.parameters(), axes, MeshAxisType::Explicit)?;
+    // The input shardings have the structure of the inputs, so there is no context to take a default mesh from when
+    // there are none.
+    let switch = AxisTypeSwitch::new(input_shardings.parameters(), || None, axes, MeshAxisType::Explicit)?;
     validate_parameter_structure(&inputs.parameter_paths().collect::<Vec<_>>(), &input_shardings)?;
 
     // Each input is resharded to its input sharding over the switched mesh, which may name the switched axes.
@@ -392,7 +390,7 @@ where
                     actual,
                 })?;
             }
-            Ok(input.reshard(&sharding_over(&sharding, &switch.switched_mesh)?)?)
+            Ok(input.reshard(&sharding.with_mesh(switch.switched_mesh.clone())?)?)
         })
         .collect::<Result<Vec<_>, AxisTypesError>>()?;
     let outputs = function(Input::from_parameters(structure, inputs)?)?;
@@ -450,9 +448,10 @@ struct AxisTypeSwitch {
 
 impl AxisTypeSwitch {
     /// Creates the switch of the axes `axes` (or of every axis when [`None`]) to `axis_type` over the common mesh of
-    /// `shardings`.
+    /// `shardings`, or over the mesh that `default_mesh` returns when there are no shardings.
     fn new<'o>(
         shardings: impl Iterator<Item = &'o Sharding>,
+        default_mesh: impl FnOnce() -> Option<LogicalMesh>,
         axes: Option<&[&str]>,
         axis_type: MeshAxisType,
     ) -> Result<Self, AxisTypesError> {
@@ -470,7 +469,7 @@ impl AxisTypeSwitch {
                 Some(_) => {}
             }
         }
-        let mesh = mesh.cloned().ok_or(AxisTypesError::MissingMesh { axis_type })?;
+        let mesh = mesh.cloned().or_else(default_mesh).ok_or(AxisTypesError::MissingMesh { axis_type })?;
         let axis_names = match axes {
             Some(axes) => axes.iter().map(ToString::to_string).collect::<BTreeSet<_>>(),
             None => mesh.axes().iter().map(|axis| axis.name().to_string()).collect(),
@@ -503,21 +502,11 @@ impl AxisTypeSwitch {
     }
 }
 
-/// Returns `sharding` re-expressed over `mesh`, which has the same topology as the mesh of `sharding` (i.e., the same
-/// placement, reduction state, and manual variation, interpreted with the axis types of `mesh`).
-fn sharding_over(sharding: &Sharding, mesh: &LogicalMesh) -> Result<Sharding, ShardingError> {
-    Sharding::new(mesh.clone(), sharding.dimensions().to_vec())?
-        .with_unreduced_axes(sharding.unreduced_axes().clone())?
-        .with_unreduced_kind(sharding.unreduced_kind())?
-        .with_reduced_axes(sharding.reduced_axes().clone())?
-        .with_varying_manual_axes(sharding.varying_manual_axes().clone())
-}
-
 /// Returns the [`Reshard`] target that retypes a value placed by `sharding` over `mesh`, which keeps its placement and
 /// reduction state along the axes that are not [`Auto`](MeshAxisType::Auto) in `mesh` and leaves its manual variation
 /// and manual reduction state to the reshard, which carries them over from its input.
 fn reshard_target(sharding: &Sharding, mesh: &LogicalMesh) -> Result<Sharding, ShardingError> {
-    let mut target = sharding_over(sharding, mesh)?.without_auto_axes().without_manual_reduction_axes();
+    let mut target = sharding.with_mesh(mesh.clone())?.without_auto_axes().without_manual_reduction_axes();
     target.clear_varying_manual_axes();
     Ok(target)
 }
@@ -542,6 +531,8 @@ fn validate_parameter_structure<P: Parameter, S: Parameterized<P>>(
 
 #[cfg(test)]
 mod tests {
+    use std::cell::RefCell;
+
     use indoc::indoc;
     use pretty_assertions::assert_eq;
 
@@ -807,7 +798,8 @@ mod tests {
         let other_mesh = LogicalMesh::new(vec![MeshAxis::new("z", 4, MeshAxisType::Explicit).unwrap()]).unwrap();
         let replicated = Sharding::replicated(mesh.clone(), 2);
 
-        // The mesh comes from the output shardings, which must exist and share one mesh.
+        // The mesh comes from the output shardings, which must share one mesh, or, without output shardings, from the
+        // default mesh of the context of the inputs, which an eager context does not have.
         assert_eq!(
             auto_axes(|_: Array| Ok(Vec::<Array>::new()), matrix(None), None, Vec::new()),
             Err(AxisTypesError::MissingMesh { axis_type: MeshAxisType::Auto }),
@@ -1027,6 +1019,120 @@ mod tests {
                 expected: outer_mesh,
                 actual: mesh,
             }),
+        );
+    }
+
+    #[test]
+    fn test_auto_axes_of_shard_map_outputs() {
+        // The outputs of a `shard_map` are typed over the mesh of its caller, so they can be switched directly, as in
+        // JAX, rather than first being resharded off of the mesh of the map, which types `x` as manual.
+        let mesh = explicit_mesh();
+        let map_mesh = mesh.with_axis_types(["x"], MeshAxisType::Manual).unwrap();
+        let input_sharding = sharding(&mesh, &[Some("x"), Some("y")]);
+        let map_sharding = sharding(&map_mesh, &[Some("x"), Some("y")]);
+        let (output_type, program) = ArrayIrTracingContext::trace(
+            |input: Tracer<ArrayIrTracingContext>| {
+                let input = ValueProjection::<ArrayType>::into_projected(input).map_err(ProgramError::from)?;
+                let output = shard_map(
+                    |input: ShardMapTracer<ArrayIrTracingContext>| Ok(input.clone() + input),
+                    input,
+                    map_mesh.clone(),
+                    map_sharding.clone(),
+                    map_sharding.clone(),
+                    ShardMapOptions::new(),
+                )?;
+                let output = auto_axes(
+                    |output: ShardMapTracer<ArrayIrTracingContext>| output.sin(),
+                    output,
+                    Some(&["y"]),
+                    input_sharding.clone(),
+                )?;
+                Ok(ProjectedValue::into_value(output))
+            },
+            ArrayIrType::Array(matrix_type(Some(input_sharding.clone()))),
+        )
+        .unwrap();
+        assert_eq!(output_type, ArrayIrType::Array(matrix_type(Some(input_sharding.clone()))));
+        assert_eq!(
+            program.to_string(),
+            indoc! {"
+                lambda %0:f32[4, 2][sharding={mesh<['x'=2:explicit, 'y'=2:explicit]>, [{'x'}, {'y'}]}] .
+                let %1:f32[4, 2][sharding={mesh<['x'=2:explicit, 'y'=2:explicit]>, [{'x'}, {'y'}]}] = shard_map [
+                    mesh=['x'=2:manual, 'y'=2:explicit],
+                    caller_mesh=['x'=2:explicit, 'y'=2:explicit],
+                    input_shardings=[{mesh<['x'=2:manual, 'y'=2:explicit]>, [{'x'}, {'y'}]}],
+                    output_shardings=[{mesh<['x'=2:manual, 'y'=2:explicit]>, [{'x'}, {'y'}]}],
+                    manual_axes=['x'],
+                    global_input_types=[f32[4, 2][sharding={mesh<['x'=2:manual, 'y'=2:explicit]>, [{'x'}, {'y'}]}]],
+                    global_output_types=[f32[4, 2][sharding={mesh<['x'=2:explicit, 'y'=2:explicit]>, [{'x'}, {'y'}]}]],
+                ] %0 [
+                    body={
+                        lambda \
+                            %0:f32[2, 2][sharding={mesh<['x'=2:manual, 'y'=2:explicit]>, [{}, {'y'}], varying_manual={'x'}}] .
+                        let %1:f32[2, 2][sharding={mesh<['x'=2:manual, 'y'=2:explicit]>, [{}, {'y'}], varying_manual={'x'}}] = \
+                                add %0 %0
+                        in (%1)
+                    },
+                ]
+                    %2:f32[4, 2][sharding={mesh<['x'=2:explicit, 'y'=2:auto]>, [{'x'}, {}]}] = reshard \
+                        [sharding={mesh<['x'=2:explicit, 'y'=2:auto]>, [{'x'}, {}]}] %1
+                    %3:f32[4, 2][sharding={mesh<['x'=2:explicit, 'y'=2:auto]>, [{'x'}, {}]}] = sin %2
+                    %4:f32[4, 2][sharding={mesh<['x'=2:explicit, 'y'=2:explicit]>, [{'x'}, {'y'}]}] = reshard \
+                        [sharding={mesh<['x'=2:explicit, 'y'=2:explicit]>, [{'x'}, {'y'}]}] %3
+                in (%4)
+            "}
+            .trim_end(),
+        );
+        let ArrayIrValue::Array(output) = program.interpret(ArrayIrValue::Array(matrix(Some(input_sharding)))).unwrap()
+        else {
+            panic!("expected an array output");
+        };
+        assert_close(
+            &output,
+            &[0.0, 0.9092974, -0.7568025, -0.2794155, 0.98935825, -0.54402111, -0.53657292, 0.99060736],
+        );
+    }
+
+    #[test]
+    fn test_auto_axes_without_outputs_takes_the_default_mesh_of_its_context() {
+        // Inside a `shard_map` body, whose context has the mesh of the map as its default mesh, a switch without
+        // output shardings takes its mesh from that context, as JAX's `auto_axes` uses its context mesh, while a switch
+        // whose inputs have no context mesh needs output shardings (refer to `test_auto_axes_rejects_invalid_switches`).
+        let mesh = explicit_mesh().with_axis_types(["x"], MeshAxisType::Manual).unwrap();
+        let global_sharding = sharding(&mesh, &[Some("x"), Some("y")]);
+        let switched_type = RefCell::new(None);
+        ArrayIrTracingContext::trace(
+            |input: Tracer<ArrayIrTracingContext>| {
+                let input = ValueProjection::<ArrayType>::into_projected(input).map_err(ProgramError::from)?;
+                let output = shard_map(
+                    |input: ShardMapTracer<ArrayIrTracingContext>| {
+                        auto_axes(
+                            |input: ShardMapTracer<ArrayIrTracingContext>| {
+                                *switched_type.borrow_mut() = Some(input.r#type().into_owned());
+                                Ok(Vec::<ShardMapTracer<ArrayIrTracingContext>>::new())
+                            },
+                            input.clone(),
+                            Some(&["y"]),
+                            Vec::new(),
+                        )?;
+                        Ok(input)
+                    },
+                    input,
+                    mesh.clone(),
+                    global_sharding.clone(),
+                    global_sharding.clone(),
+                    ShardMapOptions::new(),
+                )?;
+                Ok(ProjectedValue::into_value(output))
+            },
+            ArrayIrType::Array(matrix_type(None)),
+        )
+        .unwrap();
+        let switched_mesh = mesh.with_axis_types(["y"], MeshAxisType::Auto).unwrap();
+        let switched_sharding = Sharding::replicated(switched_mesh, 2).with_varying_manual_axes(["x"]).unwrap();
+        assert_eq!(
+            switched_type.into_inner(),
+            Some(ArrayType::new_static(DataType::F32, [2, 2]).with_sharding(switched_sharding).unwrap()),
         );
     }
 
