@@ -511,15 +511,132 @@ where
     }
 }
 
+/// Capability for resolving the default [`LogicalMesh`] of a context. Functions that need a mesh but are not
+/// given one (e.g., [`shard_map`](fn@crate::shard_map) called with [`None`] for its mesh) use it.
+///
+/// The default mesh is owned explicitly by the contexts that introduce it rather than derived from their
+/// [named axes](NamedAxes::named_axes). Root traces are seeded with it (e.g., a `shard_map` body is seeded with
+/// the mesh of its map), nested traces without a mesh of their own and transform contexts (e.g., batching and
+/// differentiation) delegate to their parent, and eager contexts have none. A derived default mesh would be wrong
+/// in two ways. A named batching level that shadows a manual mesh axis hides the binding of that axis although the
+/// computation is still inside the manual region of its mesh (and with several enclosing meshes, the shadowing may
+/// expose an outer mesh instead), and a context may have a default mesh without binding any manual axes. Concrete
+/// device meshes stay with backend domains and compilation options.
+pub trait MeshContext: Context {
+    /// Returns the default [`LogicalMesh`] of this context, or [`None`] when it has none.
+    fn default_mesh(&self) -> Option<LogicalMesh>;
+}
+
+impl<V: Value, O: Operation<Type = V::Type>> MeshContext for EagerContext<V, O>
+where
+    Self: Context,
+{
+    #[inline]
+    fn default_mesh(&self) -> Option<LogicalMesh> {
+        None
+    }
+}
+
+impl<T: Type, C: MeshContext + DomainProjection<T>> MeshContext for ProjectedContext<C, T>
+where
+    Self: Context,
+{
+    #[inline]
+    fn default_mesh(&self) -> Option<LogicalMesh> {
+        self.parent().default_mesh()
+    }
+}
+
+impl<V: Value, O: Operation<Type = V::Type>, Capture> MeshContext for TracingContext<V, O, Capture>
+where
+    Self: Context,
+{
+    #[inline]
+    fn default_mesh(&self) -> Option<LogicalMesh> {
+        self.local_default_mesh().cloned()
+    }
+}
+
+impl<C: MeshContext> MeshContext for NestedTracingContext<C>
+where
+    Self: Context,
+{
+    #[inline]
+    fn default_mesh(&self) -> Option<LogicalMesh> {
+        self.local_default_mesh().cloned().or_else(|| self.parent().default_mesh())
+    }
+}
+
+impl<C: MeshContext> MeshContext for PartialEvaluationContext<C>
+where
+    Self: Context,
+{
+    #[inline]
+    fn default_mesh(&self) -> Option<LogicalMesh> {
+        self.parent().default_mesh()
+    }
+}
+
+impl<C: MeshContext, P: RecursiveBatchingPolicy<C>> MeshContext for BatchingContext<C, P>
+where
+    Self: Context,
+{
+    #[inline]
+    fn default_mesh(&self) -> Option<LogicalMesh> {
+        // A batching level binds a named axis but never a mesh, so it does not change the default mesh even when its
+        // axis shadows a manual mesh axis.
+        self.parent().default_mesh()
+    }
+}
+
+impl<C: MeshContext, P: DifferentiationPolicy<C>> MeshContext for DifferentiationContext<C, P>
+where
+    Self: Context,
+{
+    #[inline]
+    fn default_mesh(&self) -> Option<LogicalMesh> {
+        self.primal().default_mesh()
+    }
+}
+
 #[cfg(test)]
 mod tests {
     use std::collections::HashSet;
 
+    use indoc::indoc;
     use pretty_assertions::assert_eq;
 
-    use crate::arrays::{MeshAxis, MeshAxisType};
+    use crate::arrays::{ArrayType, DataType, MeshAxis, MeshAxisType};
+    use crate::tests::{TestArrayContext, TestArrayTracingContext};
+    use crate::tracing::Tracer;
 
     use super::*;
+
+    /// Runs context assertions in a seeded trace and checks that resolving mesh metadata stages no work.
+    fn with_mesh_context(
+        mesh: Option<LogicalMesh>,
+        named_axes: Vec<(String, NamedAxis)>,
+        check: impl FnOnce(&TestArrayTracingContext),
+    ) {
+        let (_, program) = TestArrayTracingContext::trace_with_context_named_axes_and_default_mesh(
+            |context, ()| {
+                check(context);
+                Ok(())
+            },
+            (),
+            named_axes,
+            mesh,
+        )
+        .unwrap();
+        assert_eq!(
+            program.to_string(),
+            indoc! {"
+                lambda  .
+                in ()
+            "}
+            .trim_end(),
+        );
+    }
 
     #[test]
     fn test_axis_error_renders_unbound_axis_name() {
@@ -642,5 +759,107 @@ mod tests {
                 .checks_manual_variation()
         );
         assert!(!NamedAxis::Mesh { mesh, axis: 0, size: 2, checks_manual_variation: false }.checks_manual_variation());
+    }
+
+    #[test]
+    fn test_mesh_context_default_mesh() {
+        assert_eq!(TestArrayContext::new().default_mesh(), None);
+    }
+
+    #[test]
+    fn test_mesh_context_default_mesh_projected_context() {
+        assert_eq!(ProjectedContext::<_, ArrayType>::new(TestArrayContext::new()).default_mesh(), None);
+
+        let mesh = LogicalMesh::new(vec![MeshAxis::new("x", 2, MeshAxisType::Manual).unwrap()]).unwrap();
+        with_mesh_context(Some(mesh.clone()), Vec::new(), |context| {
+            let projected = ProjectedContext::<_, ArrayType>::new(context.clone());
+            assert_eq!(projected.default_mesh(), Some(mesh.clone()));
+        });
+    }
+
+    #[test]
+    fn test_mesh_context_default_mesh_tracing_context() {
+        assert_eq!(TestArrayTracingContext::new().default_mesh(), None);
+
+        // Named mesh axes do not supply a default mesh, and an explicit default needs no named axis bindings.
+        let mesh = LogicalMesh::new(vec![MeshAxis::new("x", 2, MeshAxisType::Manual).unwrap()]).unwrap();
+        let binding = NamedAxis::Mesh { mesh: mesh.clone(), axis: 0, size: 2, checks_manual_variation: true };
+        with_mesh_context(None, vec![("x".to_string(), binding)], |context| {
+            assert_eq!(context.default_mesh(), None);
+        });
+        with_mesh_context(Some(mesh.clone()), Vec::new(), |context| {
+            assert_eq!(context.default_mesh(), Some(mesh.clone()));
+        });
+    }
+
+    #[test]
+    fn test_mesh_context_default_mesh_nested_tracing_context() {
+        assert_eq!(NestedTracingContext::new(TestArrayContext::new()).default_mesh(), None);
+
+        let outer_mesh = LogicalMesh::new(vec![MeshAxis::new("x", 2, MeshAxisType::Manual).unwrap()]).unwrap();
+        let inner_mesh = LogicalMesh::new(vec![MeshAxis::new("y", 3, MeshAxisType::Manual).unwrap()]).unwrap();
+        with_mesh_context(Some(outer_mesh.clone()), Vec::new(), |parent| {
+            let inherited = NestedTracingContext::new(parent.clone());
+            assert_eq!(inherited.default_mesh(), Some(outer_mesh.clone()));
+
+            let (_, program) = NestedTracingContext::trace_with_named_axes_and_default_mesh(
+                inherited,
+                |inputs: Vec<Tracer<_>>| {
+                    let context = inputs[0].context();
+                    assert_eq!(context.default_mesh(), Some(inner_mesh.clone()));
+                    assert_eq!(NestedTracingContext::new(context.clone()).default_mesh(), Some(inner_mesh.clone()));
+                    Ok(inputs)
+                },
+                vec![ArrayType::scalar(DataType::F64)],
+                Vec::new(),
+                Some(inner_mesh.clone()),
+            )
+            .unwrap();
+            assert_eq!(
+                program.to_string(),
+                indoc! {"
+                    lambda %0:f64[] .
+                    in (%0)
+                "}
+                .trim_end(),
+            );
+            assert_eq!(parent.default_mesh(), Some(outer_mesh.clone()));
+        });
+    }
+
+    #[test]
+    fn test_mesh_context_default_mesh_partial_evaluation_context() {
+        assert_eq!(PartialEvaluationContext::new(TestArrayContext::new()).default_mesh(), None);
+
+        let mesh = LogicalMesh::new(vec![MeshAxis::new("x", 2, MeshAxisType::Manual).unwrap()]).unwrap();
+        with_mesh_context(Some(mesh.clone()), Vec::new(), |context| {
+            assert_eq!(PartialEvaluationContext::new(context.clone()).default_mesh(), Some(mesh.clone()));
+        });
+    }
+
+    #[test]
+    fn test_mesh_context_default_mesh_batching_context() {
+        assert_eq!(BatchingContext::new(TestArrayContext::new(), 3).default_mesh(), None);
+
+        // Shadowing the manual axis with a batching axis must not hide the enclosing default mesh.
+        let mesh = LogicalMesh::new(vec![MeshAxis::new("x", 2, MeshAxisType::Manual).unwrap()]).unwrap();
+        let binding = NamedAxis::Mesh { mesh: mesh.clone(), axis: 0, size: 2, checks_manual_variation: true };
+        with_mesh_context(Some(mesh.clone()), vec![("x".to_string(), binding)], |context| {
+            let batched = BatchingContext::new(context.clone(), 3).with_axis_name(Some("x".to_string()));
+            assert_eq!(batched.named_axis("x"), Some(NamedAxis::Batched { size: Some(3) }));
+            assert_eq!(batched.default_mesh(), Some(mesh.clone()));
+        });
+    }
+
+    #[test]
+    fn test_mesh_context_default_mesh_differentiation_context() {
+        assert_eq!(DifferentiationContext::fused(TestArrayContext::new()).default_mesh(), None);
+
+        let mesh = LogicalMesh::new(vec![MeshAxis::new("x", 2, MeshAxisType::Manual).unwrap()]).unwrap();
+        with_mesh_context(Some(mesh.clone()), Vec::new(), |context| {
+            assert_eq!(DifferentiationContext::fused(context.clone()).default_mesh(), Some(mesh.clone()));
+            let primal = PartialEvaluationContext::new(context.clone());
+            assert_eq!(DifferentiationContext::partitioned(primal).default_mesh(), Some(mesh.clone()));
+        });
     }
 }

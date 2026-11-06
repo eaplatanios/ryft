@@ -39,7 +39,7 @@ pub use arrays::{
     f4e2m1fn, f6e2m3fn, f6e3m2fn, f8e3m4, f8e4m3, f8e4m3b11fnuz, f8e4m3fn, f8e4m3fnuz, f8e5m2, f8e5m2fnuz, f8e8m0fnu,
     f16, i1, i2, i4, materialize_array_tangent, u1, u2, u4,
 };
-pub use axes::{Axes, Axis, AxisError, NamedAxes, NamedAxis};
+pub use axes::{Axes, Axis, AxisError, MeshContext, NamedAxes, NamedAxis};
 pub use batching::{
     Batch, BatchAxis, BatchAxisSpecification, BatchableOperation, BatchableType, BatchedProgram, BatchingContext,
     BatchingDriver, BatchingEntrypointPolicy, BatchingError, BatchingLevel, BatchingLevelExtent, BatchingPolicy,
@@ -142,11 +142,12 @@ pub use operations::{
     NOT_OPERATION_NAME, NamedComposite, Neg, NegOperation, Not, NotOperation, ONE_LIKE_OPERATION_NAME,
     ONE_OPERATION_NAME, OR_OPERATION_NAME, One, OneLike, OneLikeOperation, OneOperation, Or, OrOperation,
     PAD_OPERATION_NAME, PARALLEL_ALL_GATHER_OPERATION_NAME, PARALLEL_ALL_TO_ALL_OPERATION_NAME,
-    PARALLEL_CAST_OPERATION_NAME, PARALLEL_PERMUTE_OPERATION_NAME, PARALLEL_RAGGED_ALL_TO_ALL_OPERATION_NAME,
-    PARALLEL_REDUCE_OPERATION_NAME, PARALLEL_SUM_SCATTER_OPERATION_NAME, PARALLEL_VARY_OPERATION_NAME,
-    POW_OPERATION_NAME, PRINT_OPERATION_NAME, Pad, PadOperation, ParallelAllGather, ParallelAllGatherOperation,
-    ParallelAllGatherOutputVariance, ParallelAllToAll, ParallelAllToAllOperation, ParallelArgExtrema, ParallelCast,
-    ParallelCastOperation, ParallelCastTarget, ParallelPermute, ParallelPermuteOperation, ParallelRaggedAllToAll,
+    PARALLEL_BROADCAST_OPERATION_NAME, PARALLEL_CAST_OPERATION_NAME, PARALLEL_PERMUTE_OPERATION_NAME,
+    PARALLEL_RAGGED_ALL_TO_ALL_OPERATION_NAME, PARALLEL_REDUCE_OPERATION_NAME, PARALLEL_SUM_SCATTER_OPERATION_NAME,
+    PARALLEL_VARY_OPERATION_NAME, POW_OPERATION_NAME, PRINT_OPERATION_NAME, Pad, PadOperation, ParallelAllGather,
+    ParallelAllGatherOperation, ParallelAllGatherOutputVariance, ParallelAllToAll, ParallelAllToAllOperation,
+    ParallelArgExtrema, ParallelBroadcast, ParallelBroadcastOperation, ParallelCast, ParallelCastOperation,
+    ParallelCastTarget, ParallelPermute, ParallelPermuteOperation, ParallelRaggedAllToAll,
     ParallelRaggedAllToAllOperation, ParallelReduce, ParallelReduceOperation, ParallelSumScatter,
     ParallelSumScatterOperation, ParallelVary, ParallelVaryOperation, Permutation, Pow, PowOperation, Print,
     PrintOperation, RAGGED_DOT_OPERATION_NAME, REAL_OPERATION_NAME, REDUCE_OPERATION_NAME,
