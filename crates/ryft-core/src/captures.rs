@@ -1,5 +1,5 @@
-//! Represents runtime values captured by staged [`Program`]s without embedding those values in reusable intermediate
-//! representation.
+//! Represents runtime values captured by staged [`Program`]s and brings them into calling contexts without embedding
+//! those values in reusable intermediate representation.
 //!
 //! A captured program has two coordinated parts. Constant atoms in the staged program carry lifetime-free, typed
 //! [`CaptureReference`] indices, while the concrete values they name live in a side table owned by [`ClosedProgram`].
@@ -18,6 +18,20 @@
 //!
 //! Multiple program atoms may refer to the same slot, and references may appear in any region of the program. The table
 //! order is registration order and becomes the capture-argument order used by compilation.
+//!
+//! # Importing Captures into a Caller
+//!
+//! Calling a staged or compiled function requires bringing its captured runtime values into the calling context, where
+//! they become inputs to the call operation. [`ImportingContext::import`] performs this adaptation and returns a value
+//! flowing in the caller. [`CapturingContext::capture`] instead registers a value in the capture table and returns a
+//! staged constant payload. These capabilities live together because importing connects a captured program's runtime
+//! environment to the context that invokes it.
+//!
+//! A capture-owning trace imports a runtime value by registering it through [`CapturingContext::capture`] and lifting
+//! the resulting payload through [`Context::lift`]. Transform contexts import through their parent and then wrap the
+//! result as a replicated batch, a value with a structural zero tangent, or a known partial evaluation value. A value
+//! that already belongs to the caller is returned unchanged. Importing can also follow a backend-specific route, so
+//! [`ImportingContext`] does not require [`CapturingContext`] or a capture table.
 //!
 //! # Constant Families
 //!
@@ -58,14 +72,17 @@
 
 use std::borrow::Cow;
 use std::fmt::{Debug, Display};
+use std::marker::PhantomData;
 
 use ryft_macros::Parameter;
 
-use crate::batching::{BatchingContext, BatchingPolicy};
-use crate::contexts::{Context, ContextProjection, EagerContext, ProjectedContext};
-use crate::differentiation::{DifferentiationContext, DifferentiationPolicy};
+use crate::batching::{BatchingContext, BatchingPolicy, BatchingTracer};
+use crate::contexts::{Context, ContextProjection, Domain, EagerContext, ProjectedContext};
+use crate::differentiation::{
+    DifferentiableType, DifferentiationContext, DifferentiationDual, DifferentiationPolicy, DifferentiationTracer,
+};
 use crate::parameters::{Parameter, Parameterized, Placeholder};
-use crate::partial::PartialEvaluationContext;
+use crate::partial::{PartialEvaluationContext, PartialEvaluationValue, PartialTracer};
 use crate::programs::{
     Atom, AtomId, Instruction, Operation, Program, ProgramBuilder, ProgramError, ProjectedValue, RegionArena, Type,
     TypeError, TypeIdentityRenaming, Typed, Value, ValueDirectDispatch, ValueProjection,
@@ -308,6 +325,114 @@ where
     #[inline]
     fn capture(&self, value: Self::Capture) -> Result<Self::Constant, ProgramError> {
         self.primal().capture(value)
+    }
+}
+
+/// Import path of a value that already belongs to the importing [`Context`].
+/// Refer to the documentation of [`ImportingContext`] for more information.
+pub struct SameContext;
+
+/// Import path of a value that belongs to an ancestor of the importing [`Context`], which is reached through the
+/// importing context's parent along `Path`. Refer to the documentation of [`ImportingContext`] for more information.
+pub struct ThroughParent<Path>(PhantomData<Path>);
+
+/// Import path of a runtime value of the root eager domain, which a root trace registers in its capture table.
+/// Refer to the documentation of [`ImportingContext`] for more information.
+pub struct ThroughCapture;
+
+/// [`Context`] that can bring an existing value of the `Source` domain into itself as a value flowing in this context.
+/// Calls of staged and compiled functions use it to bring their captured runtime values into the calling context, and
+/// it is what lets those calls work under an eager parent, a staging parent, and any stack of transforms over either.
+///
+/// Importing differs from [`Context::lift`], which turns a staged constant payload into a value. An import takes a
+/// value that already exists elsewhere and gives it the meaning that every transform assigns to values it did not
+/// produce. An eager context uses the value itself. A root trace registers it in its capture table, as
+/// [`CapturingContext::capture`] does, and lifts the resulting constant. Transform contexts import it through their
+/// parent and then wrap it the way they wrap constants (i.e., as a replicated batch, with a structurally zero tangent,
+/// or as a known partial evaluation value).
+///
+/// `Path` records how the value reaches this context. It is [`SameContext`] when the value already belongs to this
+/// context, [`ThroughCapture`] when a root trace captures a runtime value of `Source`, and [`ThroughParent`] when a
+/// transform context imports it through its parent. Each importing context implements this trait once per path, so the
+/// implementations never overlap, and callers never name `Path` because inference finds the unique route from `Source`
+/// to the importing context. Implementors of custom contexts implement the trait for the [`ThroughParent`] path when
+/// their values can wrap values of their parent.
+pub trait ImportingContext<Source: Domain, Path>: Context {
+    /// Brings `value`, a value of the `Source` domain, into this [`Context`].
+    fn import(&self, value: Source::Value) -> Result<Self::Value, ProgramError>;
+}
+
+impl<C: Context> ImportingContext<C, SameContext> for C {
+    #[inline]
+    fn import(&self, value: C::Value) -> Result<C::Value, ProgramError> {
+        Ok(value)
+    }
+}
+
+impl<S: Domain<Value = Capture>, T: Type, V: Value<Type = T>, O: Operation<Type = T>, Capture: Value<Type = T>>
+    ImportingContext<S, ThroughCapture> for TracingContext<V, O, Capture>
+where
+    Self: Context<Type = T, Constant = V> + CapturingContext<Capture = Capture>,
+{
+    #[inline]
+    fn import(&self, value: Capture) -> Result<Self::Value, ProgramError> {
+        // A root trace registers the runtime value in its capture table and stages the reference to that slot as
+        // a constant, which is how a staged function's captures enter an enclosing trace without becoming literals.
+        let constant = self.capture(value)?;
+        self.lift(constant)
+    }
+}
+
+impl<S: Domain<Value = C::Capture>, C: CapturingContext> ImportingContext<S, ThroughCapture> for NestedTracingContext<C>
+where
+    Self: Context<Type = C::Type, Constant = C::Constant> + CapturingContext<Capture = C::Capture>,
+{
+    #[inline]
+    fn import(&self, value: C::Capture) -> Result<Self::Value, ProgramError> {
+        // A nested trace (e.g., a control-flow body) registers runtime values in the capture table of the root trace
+        // that owns it, exactly as its `CapturingContext` implementation does, and lifts the resulting constant into
+        // its own trace.
+        let constant = self.capture(value)?;
+        self.lift(constant)
+    }
+}
+
+impl<S: Domain, Path, C: ImportingContext<S, Path>> ImportingContext<S, ThroughParent<Path>>
+    for PartialEvaluationContext<C>
+where
+    Self: Context<Type = C::Type, Value = PartialTracer<C>>,
+{
+    #[inline]
+    fn import(&self, value: S::Value) -> Result<Self::Value, ProgramError> {
+        // An imported value is available to the known side, so it enters as a known value of the parent's import.
+        Ok(PartialTracer::new(self.clone(), PartialEvaluationValue::known(self.parent().import(value)?)))
+    }
+}
+
+impl<S: Domain, Path, C: ImportingContext<S, Path>, P: BatchingPolicy<C>> ImportingContext<S, ThroughParent<Path>>
+    for BatchingContext<C, P>
+where
+    Self: Context<Type = C::Type, Value = BatchingTracer<C, P>>,
+{
+    #[inline]
+    fn import(&self, value: S::Value) -> Result<Self::Value, ProgramError> {
+        // An imported value does not vary across the batch, so it enters as a replicated batch of the parent's import.
+        Ok(BatchingTracer::new(self.clone(), P::replicated(self.parent().import(value)?)))
+    }
+}
+
+impl<S: Domain, Path, C: ImportingContext<S, Path>, P: DifferentiationPolicy<C>>
+    ImportingContext<S, ThroughParent<Path>> for DifferentiationContext<C, P>
+where
+    C::Type: DifferentiableType,
+    Self: Context<Type = C::Type, Value = DifferentiationTracer<C, P>>,
+{
+    #[inline]
+    fn import(&self, value: S::Value) -> Result<Self::Value, ProgramError> {
+        // An imported value is not a function of the differentiated inputs, so it enters with a structurally
+        // zero tangent.
+        let primal = self.primal().import(value)?;
+        Ok(DifferentiationTracer::new(DifferentiationDual::new_with_zero_tangent(primal)?, self.clone()))
     }
 }
 
@@ -679,8 +804,8 @@ mod tests {
     use pretty_assertions::assert_eq;
 
     use crate::arrays::{
-        Array, ArrayIrOperation, ArrayIrType, ArrayIrValue, ArrayOperation, ArrayType, DataType, Dimension,
-        DimensionBounds, DimensionType, DimensionValue, DimensionVariable, Shape,
+        Array, ArrayBatchingPolicy, ArrayIrOperation, ArrayIrType, ArrayIrValue, ArrayOperation, ArrayType, DataType,
+        Dimension, DimensionBounds, DimensionType, DimensionValue, DimensionVariable, Shape,
     };
     use crate::contexts::StagingContext;
     use crate::interpretation::InterpretableOperation;
@@ -689,8 +814,8 @@ mod tests {
     };
     use crate::parameters::Placeholder;
     use crate::programs::{
-        EmptyRegionDriver, ProgramBuilder, ProgramError, ReferenceType, RegionId, RegionSlot, TypeIdentityRenaming,
-        TypedProgram, ValueDirectDispatch, ValueProjection,
+        EmptyRegionDriver, MaybeZero, ProgramBuilder, ProgramError, ReferenceType, RegionId, RegionSlot,
+        TypeIdentityRenaming, TypedProgram, ValueDirectDispatch, ValueProjection,
     };
     use crate::tests::{TestArrayContext, TestRegionOperation};
     use crate::tracing::{NestedTracingContext, Tracer, TracingContext};
@@ -798,6 +923,36 @@ mod tests {
             parent.captures().borrow().as_slice(),
             &[ArrayIrValue::Array(array), ArrayIrValue::Dimension(dimension),],
         );
+    }
+
+    #[test]
+    fn test_importing_context_import() {
+        type Root = TracingContext<CaptureReference<ArrayType>, ArrayOperation<CaptureReference<ArrayType>>, Array>;
+        let array = Array::scalar(3.0).unwrap();
+
+        // A value of the importing context itself is returned unchanged.
+        let eager = TestArrayContext::new();
+        assert_eq!(ImportingContext::<TestArrayContext, SameContext>::import(&eager, array.clone()), Ok(array.clone()));
+
+        // A root trace registers a runtime value in its capture table and stages a reference to that slot.
+        let root = Root::new();
+        let captured = ImportingContext::<TestArrayContext, _>::import(&root, array.clone()).unwrap();
+        assert_eq!(captured.r#type().as_ref(), array.r#type().as_ref());
+        assert_eq!(root.captures().borrow().as_slice(), std::slice::from_ref(&array));
+
+        // Transform contexts import through their parent and wrap the result like a constant: replicated under
+        // batching, with a structurally zero tangent under differentiation, and as a known value under partial
+        // evaluation. Each import registers one more capture in the root trace.
+        let batching = BatchingContext::<Root, ArrayBatchingPolicy>::new(root.clone(), 2);
+        let batched = ImportingContext::<TestArrayContext, _>::import(&batching, array.clone()).unwrap();
+        assert_eq!(batched.batch().batch_axis_position(), None);
+        let differentiation = DifferentiationContext::<Root>::new(root.clone());
+        let differentiated = ImportingContext::<TestArrayContext, _>::import(&differentiation, array.clone()).unwrap();
+        assert!(matches!(differentiated.tangent(), MaybeZero::Zero(_)));
+        let partial = PartialEvaluationContext::new(root.clone());
+        let partially_evaluated = ImportingContext::<TestArrayContext, _>::import(&partial, array.clone()).unwrap();
+        assert!(partially_evaluated.value().unwrap().is_known());
+        assert_eq!(root.captures().borrow().len(), 4);
     }
 
     #[test]

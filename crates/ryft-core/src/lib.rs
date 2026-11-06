@@ -45,10 +45,13 @@ pub use batching::{
     BatchingDriver, BatchingEntrypointPolicy, BatchingError, BatchingLevel, BatchingLevelExtent, BatchingPolicy,
     BatchingPolicyProjection, BatchingTracer, BoundaryPreservingBatchedProgram, DiagonalBatchingPolicy,
     InterpretableBatchableOperation, MemberBatchableOperation, ProgramBatchingOutputAxesPolicy,
-    RecursiveBatchingDriver, RecursiveBatchingPolicy, ReplicatedBatchingPolicyProjection, batch,
+    RecursiveBatchingDriver, RecursiveBatchingPolicy, ReplicatedBatchingPolicyProjection, batch, batch_in_parent,
     check_batching_rule_consistency,
 };
-pub use captures::{CaptureConstant, CaptureReference, CapturingContext, ClosedProgram};
+pub use captures::{
+    CaptureConstant, CaptureReference, CapturingContext, ClosedProgram, ImportingContext, SameContext, ThroughCapture,
+    ThroughParent,
+};
 pub use compilation::{
     AnalyzableCompilationDomain, CompilationArtifactExchange, CompilationArtifactExchangeError,
     CompilationArtifactExchangePolicy, CompilationCacheDomain, CompilationCacheStatistics, CompilationCacheTier,
@@ -75,16 +78,17 @@ pub use differentiation::{
     HessianBlock, HolomorphicLinearity, Jacobian, JacobianBlock, Linearization, LinearizationContext,
     LinearizationTracer, MemberDifferentiableOperation, MemberTransposableOperation, MemoryTransferStorage,
     NOTHING_SAVABLE_POLICY_NAME, NothingSavable, OFFLOAD_DOTS_WITH_NO_BATCH_DIMENSIONS_POLICY_NAME,
-    OffloadDotsWithNoBatchDimensions, PartitionedDifferentiationPolicy, ProjectedDifferentiationPolicy, Pullback,
-    Pushforward, REMATERIALIZATION_POLICY_FN_POLICY_NAME, RealLinearity, RematerializationPolicyFn,
-    RematerializedFunction, ResidualSource, ResidualZeroProvider, ReverseModeDifferentiate,
-    SAVE_AND_OFFLOAD_ONLY_THESE_NAMES_POLICY_NAME, SAVE_ANY_NAMES_BUT_THESE_POLICY_NAME,
-    SAVE_ANYTHING_EXCEPT_THESE_NAMES_POLICY_NAME, SAVE_FROM_BOTH_POLICIES_POLICY_NAME,
-    SAVE_ONLY_THESE_NAMES_POLICY_NAME, SaveAndOffloadOnlyTheseNames, SaveAnyNamesButThese,
-    SaveAnythingExceptTheseNames, SaveFromBothPolicies, SaveOnlyTheseNames, SavedResidual, TangentActivity,
-    TransposableOperation, TransposedProgram, TransposedProgramCotangent, TranspositionContext, TranspositionDriver,
-    UnaryElementwiseJvpInputs, WithAuxiliaryOutput, WithCapture, WithContext, WithoutAuxiliaryOutput, WithoutCapture,
-    WithoutContext, binary_elementwise_jvp, differentiate_at, rematerialize, saved_residuals, unary_elementwise_jvp,
+    OffloadDotsWithNoBatchDimensions, ParentDifferentiationBuilder, ParentPullback, ParentPushforward,
+    PartitionedDifferentiationPolicy, ProjectedDifferentiationPolicy, Pullback, Pushforward,
+    REMATERIALIZATION_POLICY_FN_POLICY_NAME, RealLinearity, RematerializationPolicyFn, RematerializedFunction,
+    ResidualSource, ResidualZeroProvider, ReverseModeDifferentiate, SAVE_AND_OFFLOAD_ONLY_THESE_NAMES_POLICY_NAME,
+    SAVE_ANY_NAMES_BUT_THESE_POLICY_NAME, SAVE_ANYTHING_EXCEPT_THESE_NAMES_POLICY_NAME,
+    SAVE_FROM_BOTH_POLICIES_POLICY_NAME, SAVE_ONLY_THESE_NAMES_POLICY_NAME, SaveAndOffloadOnlyTheseNames,
+    SaveAnyNamesButThese, SaveAnythingExceptTheseNames, SaveFromBothPolicies, SaveOnlyTheseNames, SavedResidual,
+    TangentActivity, TransposableOperation, TransposedProgram, TransposedProgramCotangent, TranspositionContext,
+    TranspositionDriver, UnaryElementwiseJvpInputs, WithAuxiliaryOutput, WithCapture, WithContext,
+    WithoutAuxiliaryOutput, WithoutCapture, WithoutContext, binary_elementwise_jvp, differentiate_at,
+    differentiate_in_parent_at, rematerialize, saved_residuals, unary_elementwise_jvp,
 };
 pub use errors::{CustomError, Error, MaybeFallible};
 pub use interpretation::{
