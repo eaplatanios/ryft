@@ -737,7 +737,7 @@ trait LinearCollectiveOperation: Operation<Type = ArrayType> {
             return Ok(());
         };
 
-        if inputs[0].is_known() {
+        if inputs[0].is_known() || !accumulators[0].is_needed() {
             return Ok(());
         }
 
@@ -1816,6 +1816,7 @@ mod tests {
     };
     use crate::batching::BatchableOperation;
     use crate::contexts::{EagerContext, StagingContext};
+    use crate::differentiation::{DifferentiableType, TransposableOperation, TranspositionContext};
     use crate::operations::assertions::AssertionError;
     use crate::operations::constants::constant::DimensionConstant;
     use crate::parameters::Placeholder;
@@ -1856,6 +1857,35 @@ mod tests {
     {
         let context = eager_collective_context(axis_name, axis_size);
         operation.batch(&context, &EmptyRegionDriver, &[input])
+    }
+
+    /// Applies a valid unary operation's transpose with a live seed and an ignored input cotangent.
+    /// Returns the complete program, which must retain the seed input without staging any contribution.
+    pub(super) fn transpose_ignored_collective<O: TransposableOperation<Array, ArrayOperation<Array>>>(
+        operation: O,
+        input_type: ArrayType,
+    ) -> String {
+        let cotangent_type =
+            operation.infer_output_types(&[input_type.clone()], &[]).unwrap().remove(0).cotangent().unwrap();
+        let trace = TracingContext::<Array, ArrayOperation<Array>>::new();
+        let mut context = TranspositionContext::new(trace.clone());
+        let inputs = [PartialValue::Unknown(input_type.clone())];
+        let accumulators = context.cotangent_accumulators(&inputs, &[false]).unwrap();
+        let seed = context.input(cotangent_type);
+        operation
+            .transpose(&mut context, &EmptyRegionDriver, &inputs, &[MaybeZero::Value(seed)], &accumulators)
+            .unwrap();
+        assert_eq!(
+            context.take_cotangents(&accumulators).unwrap(),
+            vec![MaybeZero::Zero(input_type.cotangent().unwrap())]
+        );
+        trace
+            .builder()
+            .borrow()
+            .clone()
+            .build::<Vec<Array>, Vec<Array>>(Vec::new(), vec![Placeholder], Vec::new())
+            .unwrap()
+            .to_string()
     }
 
     /// Creates an eager array IR batching level that binds the axis `"x"` and whose mapped extent is a first-class
@@ -2869,6 +2899,20 @@ mod tests {
                 |_| Ok(()),
             ),
             Err(TypeError::invalid("`parallel_all_gather` output axis 1 extent 2 must equal unchanged extent 3")),
+        );
+    }
+
+    #[test]
+    fn test_linear_collective_operation_linear_collective_transpose_ignored_cotangent() {
+        assert_eq!(
+            transpose_ignored_collective(
+                ParallelPermuteOperation::new("x", 2, vec![(0, 1), (1, 0)]),
+                ArrayType::scalar(DataType::F32),
+            ),
+            indoc! {"
+                lambda %0:f32[] .
+                in ()"
+            },
         );
     }
 

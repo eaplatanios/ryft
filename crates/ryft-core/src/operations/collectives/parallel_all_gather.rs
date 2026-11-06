@@ -1479,7 +1479,7 @@ mod tests {
         check_gradient, check_operation_partial_evaluation, check_operation_transposition,
         check_operation_type_inference,
     };
-    use crate::operations::collectives::tests::{batch_collective, collective_program};
+    use crate::operations::collectives::tests::{batch_collective, collective_program, transpose_ignored_collective};
     use crate::operations::manipulation::slicing::Slice;
     use crate::operations::reductions::{Reduce, ReductionKind};
     use crate::parameters::Placeholder;
@@ -3611,6 +3611,29 @@ mod tests {
                           current participant's chunk"
                     .to_string(),
             }),
+        );
+    }
+
+    #[test]
+    fn test_parallel_all_gather_transposition_ignored_cotangent() {
+        let mesh = LogicalMesh::new(vec![MeshAxis::new("x", 2, MeshAxisType::Manual).unwrap()]).unwrap();
+        let input_type = ArrayType::scalar(DataType::F32)
+            .with_sharding(Sharding::replicated(mesh.clone(), 0).with_varying_manual_axes(["x"]).unwrap())
+            .unwrap();
+        let operation = ParallelAllGatherOperation::new(
+            "x",
+            2,
+            0,
+            CollectiveOptions::default(),
+            ParallelAllGatherOutputVariance::Invariant,
+        )
+        .with_mesh(mesh);
+        assert_eq!(
+            transpose_ignored_collective(operation, input_type),
+            indoc! {"
+            lambda %0:f32[2][sharding={mesh<['x'=2:manual]>, [{}]}] .
+            in ()"
+            }
         );
     }
 

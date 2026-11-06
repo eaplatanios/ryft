@@ -224,7 +224,7 @@ impl_differentiable_operation! {
             check_count!("output", outputs, 1, ProgramError);
             check_count!("accumulator", accumulators, 1, DifferentiationError);
 
-            if inputs[0].is_known() {
+            if inputs[0].is_known() || !accumulators[0].is_needed() {
                 return Ok(());
             }
 
@@ -672,7 +672,7 @@ mod tests {
     use crate::batching::{BatchAxis, BatchingTracer};
     use crate::contexts::{EagerContext, ProjectedContext, StagingContext};
     use crate::macros::check_operation_type_inference;
-    use crate::operations::collectives::tests::eager_collective_context;
+    use crate::operations::collectives::tests::{eager_collective_context, transpose_ignored_collective};
     use crate::parameters::Placeholder;
     use crate::partial::{PartialEvaluationContext, PartialEvaluationOutput, PartialEvaluationValue, PartialValue};
     use crate::programs::{EmptyRegionDriver, ProgramBuilder, ReferenceType, TypedProgram};
@@ -1081,6 +1081,19 @@ mod tests {
         );
         let transposed_twice = transposed.transpose_with_respect_to(&[0], &[]).unwrap();
         assert_eq!(transposed_twice.to_string(), program.to_string());
+    }
+
+    #[test]
+    fn test_parallel_vary_transposition_ignored_cotangent() {
+        let mesh = LogicalMesh::new(vec![MeshAxis::new("x", 2, MeshAxisType::Manual).unwrap()]).unwrap();
+        let input_type = ArrayType::scalar(DataType::F32).with_sharding(Sharding::replicated(mesh, 0)).unwrap();
+        assert_eq!(
+            transpose_ignored_collective(ParallelVaryOperation::new("x".to_string()), input_type),
+            indoc! {"
+            lambda %0:f32[][sharding={mesh<['x'=2:manual]>, [], varying_manual={'x'}}] .
+            in ()"
+            }
+        );
     }
 
     #[test]
