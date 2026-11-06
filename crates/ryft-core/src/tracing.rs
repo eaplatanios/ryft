@@ -74,6 +74,7 @@ use std::rc::Rc;
 
 use ryft_macros::Parameter;
 
+use crate::arrays::LogicalMesh;
 use crate::axes::NamedAxis;
 use crate::contexts::{Context, Domain, StagingContext, ValueResolution};
 use crate::macros::{check_builders, check_count};
@@ -373,6 +374,12 @@ pub struct TracingContext<V: Value, O: Operation<Type = V::Type>, C = V> {
     /// the [`TracingContext`]'s lifetime and shared across cloned contexts.
     named_axes: Rc<Vec<(String, NamedAxis)>>,
 
+    /// Default [`LogicalMesh`] this [`TracingContext`] was seeded with, resolved by its
+    /// [`MeshContext`](crate::MeshContext) implementation. It is owned explicitly rather than derived from
+    /// [`Self::named_axes`] (refer to [`MeshContext`](crate::MeshContext) for the rationale). Ordinary traces
+    /// are seeded with none, and traces of a `shard_map` body are seeded with the mesh of that map.
+    default_mesh: Option<Rc<LogicalMesh>>,
+
     /// Active [`ProvenanceState`] recording the non-semantic provenance scopes and origins that staged
     /// [`Instruction`](crate::Instruction)s snapshot. It is shared behind an [`Rc`] (separately from [`Self::builder`]
     /// so that [`ProvenanceScope`] transitions never hold a builder borrow) so that every cloned context observes the
@@ -393,6 +400,7 @@ impl<V: Value, O: Operation<Type = V::Type>, C> TracingContext<V, O, C> {
             builder: Rc::new(RefCell::new(ProgramBuilder::<V, O>::new())),
             captures: Rc::new(RefCell::new(Vec::new())),
             named_axes: Rc::new(Vec::new()),
+            default_mesh: None,
             provenance: Rc::new(ProvenanceState::new()),
         }
     }
@@ -416,6 +424,12 @@ impl<V: Value, O: Operation<Type = V::Type>, C> TracingContext<V, O, C> {
     #[inline]
     pub(crate) fn local_named_axes(&self) -> &[(String, NamedAxis)] {
         self.named_axes.as_slice()
+    }
+
+    /// Returns the default [`LogicalMesh`] this trace was seeded with, if any.
+    #[inline]
+    pub(crate) fn local_default_mesh(&self) -> Option<&LogicalMesh> {
+        self.default_mesh.as_deref()
     }
 }
 
@@ -506,6 +520,7 @@ where
     /// foreign output tracers, [`ProgramError::EscapedProgramBuilder`] if the callback retains the tracing context
     /// or a tracer, and [`ProgramError::DiscardedCaptures`] if the trace registers captures.
     #[allow(clippy::type_complexity)]
+    #[inline]
     pub fn trace_with_context_and_named_axes<
         F: FnOnce(&Self, Input::To<Tracer<Self>>) -> Result<Output, ProgramError>,
         Input: Parameterized<V::Type, Family: ParameterizedFamily<V> + ParameterizedFamily<Tracer<Self>>>,
@@ -515,8 +530,52 @@ where
         input_type: Input,
         named_axes: Vec<(String, NamedAxis)>,
     ) -> Result<(Output::To<V::Type>, Program<V, O, Input::To<V>, Output::To<V>>), ProgramError> {
+        Self::trace_with_context_named_axes_and_default_mesh(function, input_type, named_axes, None)
+    }
+
+    /// Traces `function` against `input_type` like [`trace_with_named_axes`](Self::trace_with_named_axes),
+    /// but additionally seeds the trace's context with `default_mesh`. This is the counterpart of
+    /// [`trace_with_context_named_axes_and_default_mesh`](Self::trace_with_context_named_axes_and_default_mesh)
+    /// for callbacks that do not need the trace's context.
+    #[allow(clippy::type_complexity)]
+    #[inline]
+    pub fn trace_with_named_axes_and_default_mesh<
+        F: FnOnce(Input::To<Tracer<Self>>) -> Result<Output, ProgramError>,
+        Input: Parameterized<V::Type, Family: ParameterizedFamily<V> + ParameterizedFamily<Tracer<Self>>>,
+        Output: Parameterized<Tracer<Self>, Family: ParameterizedFamily<V::Type> + ParameterizedFamily<V>>,
+    >(
+        function: F,
+        input_type: Input,
+        named_axes: Vec<(String, NamedAxis)>,
+        default_mesh: Option<LogicalMesh>,
+    ) -> Result<(Output::To<V::Type>, Program<V, O, Input::To<V>, Output::To<V>>), ProgramError> {
+        Self::trace_with_context_named_axes_and_default_mesh(
+            |_, input| function(input),
+            input_type,
+            named_axes,
+            default_mesh,
+        )
+    }
+
+    /// Traces `function` against `input_type` like
+    /// [`trace_with_context_and_named_axes`](Self::trace_with_context_and_named_axes), but additionally seeds the
+    /// trace's context with `default_mesh`, which its [`MeshContext`](crate::MeshContext) implementation returns.
+    /// Functions that trace code in a fresh trace instead of in the context that they are called in seed that trace
+    /// with the default mesh of the calling context, like they seed it with its named axes, and a `shard_map` body
+    /// is seeded with the mesh of its map.
+    #[allow(clippy::type_complexity)]
+    pub fn trace_with_context_named_axes_and_default_mesh<
+        F: FnOnce(&Self, Input::To<Tracer<Self>>) -> Result<Output, ProgramError>,
+        Input: Parameterized<V::Type, Family: ParameterizedFamily<V> + ParameterizedFamily<Tracer<Self>>>,
+        Output: Parameterized<Tracer<Self>, Family: ParameterizedFamily<V::Type> + ParameterizedFamily<V>>,
+    >(
+        function: F,
+        input_type: Input,
+        named_axes: Vec<(String, NamedAxis)>,
+        default_mesh: Option<LogicalMesh>,
+    ) -> Result<(Output::To<V::Type>, Program<V, O, Input::To<V>, Output::To<V>>), ProgramError> {
         let (output_types, program, capture_count) =
-            Self::trace_with_named_axes_counting_captures(function, input_type, named_axes)?;
+            Self::trace_with_named_axes_counting_captures(function, input_type, named_axes, default_mesh)?;
         if capture_count > 0 {
             return Err(ProgramError::DiscardedCaptures { count: capture_count });
         }
@@ -537,7 +596,7 @@ where
         function: F,
         input_type: Input,
     ) -> Result<Output::To<V::Type>, ProgramError> {
-        Ok(Self::trace_with_named_axes_counting_captures(|_, input| function(input), input_type, Vec::new())?.0)
+        Ok(Self::trace_with_named_axes_counting_captures(|_, input| function(input), input_type, Vec::new(), None)?.0)
     }
 
     /// Traces like [`trace_with_named_axes`](Self::trace_with_named_axes) but additionally reports the number of
@@ -556,6 +615,7 @@ where
         function: F,
         input_type: Input,
         named_axes: Vec<(String, NamedAxis)>,
+        default_mesh: Option<LogicalMesh>,
     ) -> Result<(Output::To<V::Type>, Program<V, O, Input::To<V>, Output::To<V>>, usize), ProgramError> {
         /// Internal helper that traces like
         /// [`trace_with_named_axes_counting_captures`](Self::trace_with_named_axes_counting_captures) with the callback
@@ -583,6 +643,7 @@ where
             ) -> Result<Output, ProgramError>,
             input_type: Input,
             named_axes: Vec<(String, NamedAxis)>,
+            default_mesh: Option<LogicalMesh>,
         ) -> Result<(Output::To<V::Type>, Program<V, O, Input::To<V>, Output::To<V>>, usize), ProgramError>
         where
             TracingContext<V, O, C>: StagingContext<Type = V::Type, Constant = V, Operation = O>,
@@ -596,6 +657,7 @@ where
                     builder: builder.clone(),
                     captures: captures.clone(),
                     named_axes: Rc::new(named_axes),
+                    default_mesh: default_mesh.map(Rc::new),
                     provenance: Rc::new(ProvenanceState::new()),
                 };
                 let input = input_type.map_parameters(|t| context.input(t)).map_err(ProgramError::from)?;
@@ -624,6 +686,7 @@ where
             &mut |context: &Self, input: Input::To<Tracer<Self>>| function.take().unwrap()(context, input),
             input_type,
             named_axes,
+            default_mesh,
         )
     }
 }
@@ -635,6 +698,7 @@ impl<V: Value, O: Operation<Type = V::Type>, C> Clone for TracingContext<V, O, C
             builder: self.builder.clone(),
             captures: self.captures.clone(),
             named_axes: self.named_axes.clone(),
+            default_mesh: self.default_mesh.clone(),
             provenance: self.provenance.clone(),
         }
     }
@@ -768,6 +832,11 @@ pub struct NestedTracingContext<C: Context> {
     /// [`NestedTracingContext`]'s lifetime and shared across cloned contexts.
     named_axes: Rc<Vec<(String, NamedAxis)>>,
 
+    /// Default [`LogicalMesh`] this [`NestedTracingContext`] was seeded with, resolved by its
+    /// [`MeshContext`](crate::MeshContext) implementation. When it is [`None`], the default mesh
+    /// of the parent context applies.
+    default_mesh: Option<Rc<LogicalMesh>>,
+
     /// Active [`ProvenanceState`] for the nested program, shared across cloned contexts and independent of the
     /// parent's state. It is seeded with the parent context's current provenance at depth zero, so that instructions
     /// staged in the nested program record where the nested program itself came from, while later replaying them
@@ -783,6 +852,7 @@ impl<C: Context> NestedTracingContext<C> {
             parent,
             builder: Rc::new(RefCell::new(ProgramBuilder::new())),
             named_axes: Rc::new(Vec::new()),
+            default_mesh: None,
             provenance,
         }
     }
@@ -804,6 +874,12 @@ impl<C: Context> NestedTracingContext<C> {
     #[inline]
     pub(crate) fn local_named_axes(&self) -> &[(String, NamedAxis)] {
         self.named_axes.as_slice()
+    }
+
+    /// Returns the default [`LogicalMesh`] this trace was seeded with, if any.
+    #[inline]
+    pub(crate) fn local_default_mesh(&self) -> Option<&LogicalMesh> {
+        self.default_mesh.as_deref()
     }
 
     /// Traces `function` into a flat [`Program`] expressed in the enclosing context `parent`'s universe. This is the
@@ -850,7 +926,31 @@ impl<C: Context> NestedTracingContext<C> {
         Output: Parameterized<Tracer<Self>>,
         Self: StagingContext<Type = C::Type, Constant = C::Constant, Operation = C::Operation>,
     {
-        /// Internal helper that traces like [`trace_with_named_axes`](Self::trace_with_named_axes) with the callback
+        Self::trace_with_named_axes_and_default_mesh(parent, function, input_types, named_axes, None)
+    }
+
+    /// Traces `function` against `input_types` like [`trace_with_named_axes`](Self::trace_with_named_axes), but
+    /// additionally seeds the nested trace's context with `default_mesh`, which shadows the default mesh of `parent`
+    /// when it is not [`None`]. This is the nested-tracing counterpart of
+    /// [`TracingContext::trace_with_context_named_axes_and_default_mesh`].
+    #[allow(clippy::type_complexity)]
+    pub fn trace_with_named_axes_and_default_mesh<F, Output>(
+        parent: C,
+        function: F,
+        input_types: Vec<C::Type>,
+        named_axes: Vec<(String, NamedAxis)>,
+        default_mesh: Option<LogicalMesh>,
+    ) -> Result<
+        (Output::ParameterStructure, Program<C::Constant, C::Operation, Vec<C::Constant>, Vec<C::Constant>>),
+        ProgramError,
+    >
+    where
+        F: FnOnce(Vec<Tracer<Self>>) -> Result<Output, ProgramError>,
+        Output: Parameterized<Tracer<Self>>,
+        Self: StagingContext<Type = C::Type, Constant = C::Constant, Operation = C::Operation>,
+    {
+        /// Internal helper that traces like
+        /// [`trace_with_named_axes_and_default_mesh`](Self::trace_with_named_axes_and_default_mesh) with the callback
         /// type erased. This is the body of that function, which only wraps its callback, so that this body is compiled
         /// once per output structure rather than once per callback type. The callback is invoked exactly once.
         #[allow(clippy::type_complexity)]
@@ -859,6 +959,7 @@ impl<C: Context> NestedTracingContext<C> {
             function: &mut dyn FnMut(Vec<Tracer<NestedTracingContext<C>>>) -> Result<Output, ProgramError>,
             input_types: Vec<C::Type>,
             named_axes: Vec<(String, NamedAxis)>,
+            default_mesh: Option<LogicalMesh>,
         ) -> Result<
             (Output::ParameterStructure, Program<C::Constant, C::Operation, Vec<C::Constant>, Vec<C::Constant>>),
             ProgramError,
@@ -871,7 +972,8 @@ impl<C: Context> NestedTracingContext<C> {
             let builder = Rc::new(RefCell::new(ProgramBuilder::new()));
             let named_axes = Rc::new(named_axes);
             let provenance = Rc::new(ProvenanceState::seeded(parent.provenance()));
-            let context = NestedTracingContext { parent, builder, named_axes, provenance };
+            let default_mesh = default_mesh.map(Rc::new);
+            let context = NestedTracingContext { parent, builder, named_axes, default_mesh, provenance };
 
             let (output_structure, output_atoms) = {
                 let input_tracers = input_types.into_iter().map(|r#type| context.input(r#type)).collect::<Vec<_>>();
@@ -906,7 +1008,8 @@ impl<C: Context> NestedTracingContext<C> {
         }
 
         let mut function = Some(function);
-        inner(parent, &mut |inputs: Vec<Tracer<Self>>| function.take().unwrap()(inputs), input_types, named_axes)
+        let function = &mut |inputs: Vec<Tracer<Self>>| function.take().unwrap()(inputs);
+        inner(parent, function, input_types, named_axes, default_mesh)
     }
 }
 
@@ -917,6 +1020,7 @@ impl<C: Context> Clone for NestedTracingContext<C> {
             parent: self.parent.clone(),
             builder: self.builder.clone(),
             named_axes: self.named_axes.clone(),
+            default_mesh: self.default_mesh.clone(),
             provenance: self.provenance.clone(),
         }
     }
