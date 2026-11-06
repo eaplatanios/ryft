@@ -24,8 +24,9 @@
 //!     their own or are tiled into an existing one, and optional participant groups restrict every exchange to the
 //!     members of one group.
 //!   - **Routing Values:** [`ParallelPermute`] sends the value of every participant to another participant along
-//!     source-target pairs, and [`ParallelRaggedAllToAll`] exchanges variable-length segments of the leading axis
-//!     whose offsets and sizes are runtime metadata.
+//!     source-target pairs, [`ParallelBroadcast`] replicates the value of one source participant to every participant,
+//!     and [`ParallelRaggedAllToAll`] exchanges variable-length segments of the leading axis whose offsets and sizes
+//!     are runtime metadata.
 //!
 //! A collective references its axis by name, and the enclosing binder determines how it executes. Staging resolves the
 //! name against the active [`NamedAxes`] environment and fails with [`AxisError::UnboundAxisName`] when no binder binds
@@ -39,14 +40,14 @@
 //! The single-input exchanges (e.g., [`ParallelPermuteOperation`], [`ParallelAllGatherOperation`],
 //! [`ParallelSumScatterOperation`], and [`ParallelAllToAllOperation`]) are linear, so their tangents ride the same
 //! collective and their transposes are other collectives over the same axis (e.g., an all-gather transposes to a
-//! sum-scatter). This module owns the machinery that provides those rules: the private `LinearCollectiveOperation`
-//! trait captures the hooks that they need (e.g., the adjoint collective and the forwarding of a collective past an
-//! unrelated mapped batch axis), and each operation's explicit trait implementations delegate to it. The collectives
-//! that resize an array axis also share the private `ShapeChangingCollectiveOperation` trait, whose [`ArrayIrType`]
-//! form passes one explicit extent per output axis as an additional dimension input, so that result extents unknown at
-//! trace time remain available as values, and the private `CollectiveArrayExtentBatchingPolicy` boundary, which lets
-//! one batching kernel per collective serve both static and first-class extents ([`ParallelRaggedAllToAllOperation`]
-//! reuses it as well).
+//! sum-scatter), or compositions of collectives for a broadcast and an invariant all-gather. This module owns the
+//! machinery that provides those rules: the private `LinearCollectiveOperation` trait captures the hooks that they need
+//! (e.g., the adjoint collective and the forwarding of a collective past an unrelated mapped batch axis), and each
+//! operation's explicit trait implementations delegate to it. The collectives that resize an array axis also share the
+//! private `ShapeChangingCollectiveOperation` trait, whose [`ArrayIrType`] form passes one explicit extent per output
+//! axis as an additional dimension input, so that result extents unknown at trace time remain available as values, and
+//! the private `CollectiveArrayExtentBatchingPolicy` boundary, which lets one batching kernel per collective serve both
+//! static and first-class extents ([`ParallelRaggedAllToAllOperation`] reuses it as well).
 //!
 //! # Examples
 //!
@@ -149,7 +150,7 @@ use std::fmt::{Debug, Display};
 use crate::arrays::{
     ArrayBatch, ArrayBatchingPolicy, ArrayExtentBatchingPolicy, ArrayIrBatch, ArrayIrBatchingPolicy, ArrayIrType,
     ArrayType, Dimension, DimensionType, DimensionValue, DynamicArrayExtentBatchingPolicy, LinearResiduals,
-    LogicalMesh, MeshAxisType, Shape, Sharding, StaticArrayExtentBatchingPolicy,
+    LogicalMesh, MeshAxisType, Shape, Sharding, ShardingDimension, StaticArrayExtentBatchingPolicy,
 };
 use crate::axes::{AxisError, NamedAxes, NamedAxis};
 use crate::batching::{BatchAxis, BatchingContext, BatchingError, BatchingPolicy, BatchingTracer};
@@ -164,12 +165,16 @@ use crate::operations::arithmetic::{AddOperation, Div, Mul, Rem};
 use crate::operations::assertions::Assert;
 use crate::operations::comparisons::{Compare, ComparisonDirection};
 use crate::operations::constants::constant::ConstantOperation;
+use crate::operations::constants::zero_like::ZeroLike;
 use crate::operations::differentiation::linear_call::LinearCallOperation;
 use crate::operations::dimensions::dimension_max::DimensionMax;
 use crate::operations::dimensions::dimension_size::{DimensionSize, DimensionSizeOperation};
 use crate::operations::manipulation::broadcasting::{Broadcast, DynamicBroadcast, DynamicBroadcastOperation};
+use crate::operations::manipulation::concatenation::Concatenate;
 use crate::operations::manipulation::reshaping::{DynamicReshapeOperation, Reshape};
+use crate::operations::manipulation::slicing::Slice;
 use crate::operations::manipulation::transposition::Transpose;
+use crate::operations::sharding::reshard::Reshard;
 use crate::partial::PartialValue;
 use crate::programs::{
     MaybeZero, Operation, OperationProjection, ProgramError, RegionInterface, TypeError, Typed, Value, ValueProjection,
@@ -180,6 +185,7 @@ pub mod axis_index;
 pub mod parallel_all_gather;
 pub mod parallel_all_to_all;
 pub mod parallel_arg_extrema;
+pub mod parallel_broadcast;
 pub mod parallel_cast;
 pub mod parallel_permute;
 pub mod parallel_ragged_all_to_all;
@@ -193,6 +199,7 @@ pub use parallel_all_gather::{
 };
 pub use parallel_all_to_all::{PARALLEL_ALL_TO_ALL_OPERATION_NAME, ParallelAllToAll, ParallelAllToAllOperation};
 pub use parallel_arg_extrema::ParallelArgExtrema;
+pub use parallel_broadcast::{PARALLEL_BROADCAST_OPERATION_NAME, ParallelBroadcast, ParallelBroadcastOperation};
 pub use parallel_cast::{PARALLEL_CAST_OPERATION_NAME, ParallelCast, ParallelCastOperation, ParallelCastTarget};
 pub use parallel_permute::{PARALLEL_PERMUTE_OPERATION_NAME, ParallelPermute, ParallelPermuteOperation};
 pub use parallel_ragged_all_to_all::{
@@ -510,13 +517,55 @@ impl<C: Context, P: DifferentiationPolicy<C>> ShapeChangingCollectiveValue for D
 {
 }
 
+/// Group of the value-level collective capabilities [`ParallelReduce`], [`ParallelVary`], [`ParallelAllGather`],
+/// [`ParallelSumScatter`], [`ParallelPermute`], [`ParallelBroadcast`], [`ParallelAllToAll`],
+/// [`ParallelRaggedAllToAll`], [`ParallelCast`], and [`ParallelArgExtrema`]. It is implemented automatically for every
+/// type that implements all of its members. The context-side [`AxisIndex`] is implemented by contexts rather than
+/// values and is therefore not a member.
+///
+/// The universe parameter `T` defaults to the [`Capability`] universe of the implementor and is passed to every member,
+/// so that homogeneous array values implement this bundle for [`ArrayType`] and array IR values implement it for
+/// [`ArrayIrType`].
+pub trait CollectiveOperations<T = <Self as Capability>::Universe>:
+    Capability
+    + ParallelReduce<T>
+    + ParallelVary<T>
+    + ParallelAllGather<T>
+    + ParallelSumScatter<T>
+    + ParallelPermute<T>
+    + ParallelBroadcast<T>
+    + ParallelAllToAll<T>
+    + ParallelRaggedAllToAll<T>
+    + ParallelCast<T>
+    + ParallelArgExtrema<T>
+{
+}
+
+impl<
+    T,
+    V: ParallelReduce<T>
+        + ParallelVary<T>
+        + ParallelAllGather<T>
+        + ParallelSumScatter<T>
+        + ParallelPermute<T>
+        + ParallelBroadcast<T>
+        + ParallelAllToAll<T>
+        + ParallelRaggedAllToAll<T>
+        + ParallelCast<T>
+        + ParallelArgExtrema<T>,
+> CollectiveOperations<T> for V
+{
+}
+
 /// Single-input linear collective operation over a named axis (i.e., [`ParallelPermuteOperation`],
-/// [`ParallelAllGatherOperation`], [`ParallelSumScatterOperation`], or [`ParallelAllToAllOperation`]). Each carries
-/// the referenced axis name, the participant count resolved from the active [`NamedAxes`] environment, and, when it
-/// exchanges values over a manual mesh axis, that axis's mesh. Its tangent rides the same collective, and its transpose
-/// is another collective over the same axis, so this trait captures the hooks that the transformation rules of every
-/// such collective need and provides those rules on top of them. The collectives keep explicit trait implementations
-/// that delegate to the provided functions, so that every operation module reads the same way.
+/// [`ParallelBroadcastOperation`], [`ParallelAllGatherOperation`], [`ParallelSumScatterOperation`], or
+/// [`ParallelAllToAllOperation`]). Each carries the referenced axis name, the participant count resolved from the
+/// active [`NamedAxes`] environment, and, when it exchanges values over a manual mesh axis, that axis's mesh. Its
+/// tangent rides the same collective, and its transpose is usually another collective over the same axis, so this
+/// trait captures the hooks that the transformation rules of every such collective need and provides those rules on top
+/// of them. A collective whose transpose composes several operations (i.e., a broadcast and an invariant all-gather)
+/// stages it in its own transposition rule instead. The collectives keep explicit trait implementations that delegate
+/// to the provided functions, so that every operation module reads the same way.
 ///
 /// The hooks named after a public accessor of the operation (e.g., [`axes`](Self::axes)) return the same
 /// values. They are repeated here because this trait is private, while the accessors are part of the public API.
@@ -1545,6 +1594,89 @@ fn infer_array_ir_shape_changing_collective_output_type(
     Ok(vec![base_output_type.with_shape(Shape::new(output_extents)).into()])
 }
 
+/// Returns `value` with its slices along `axis` routed from their source positions to their target positions.
+/// Specifically, slice `target` of the result is slice `sources[target]` of `value`, or a slice of zeros when
+/// `sources[target]` is `None`. The result has `sources.len()` slices along `axis` and otherwise the shape of
+/// `value`. For example, routing the rows `[a, b, c]` with `sources = [None, Some(0), Some(1)]` yields `[0, a, b]`.
+///
+/// The batching rules of [`ParallelPermuteOperation`] and [`ParallelBroadcastOperation`] apply this function along
+/// the batch axis, where every slice is one batch item and untargeted items receive zero-filled values.
+///
+/// # Errors
+///
+/// Returns a [`BatchingError`] naming `operation_name` if `value` is not statically shaped, or if staging one of the
+/// slices, the zero slice, or the concatenation fails.
+fn route_axis_slices<V: Value<Type = ArrayType> + ZeroLike + Concatenate + Slice + Transpose + Reshard>(
+    operation_name: &str,
+    value: &V,
+    axis: usize,
+    sources: &[Option<usize>],
+) -> Result<V, BatchingError> {
+    let value = if axis == 0 { value.clone() } else { value.clone().move_axis(axis, 0)? };
+    let Some(shape) = value.r#type().static_shape() else {
+        return Err(BatchingError::UnsupportedOperation {
+            message: format!("`{operation_name}` batching requires statically shaped inputs"),
+        });
+    };
+    let dimensions = shape.dimensions().to_vec();
+    let output_sharding = value.r#type().sharding().cloned();
+
+    // Extent-one slices cannot retain an explicit mesh placement whose axis product exceeds one.
+    // Route slices with this axis replicated, then restore its placement once on the complete result.
+    let value = if let Some(sharding) = &output_sharding
+        && matches!(sharding.dimensions().first(), Some(ShardingDimension::Sharded(axes)) if axes.iter().any(|axis| {
+            sharding.mesh().axis_type(axis) == Some(MeshAxisType::Explicit)
+                && sharding.mesh().axis_size(axis).is_some_and(|size| size > 1)
+        })) {
+        let mut dimensions = sharding.dimensions().to_vec();
+        dimensions[0] = ShardingDimension::Replicated;
+        let replicated = sharding.with_dimensions(dimensions).map_err(TypeError::from)?;
+        value.reshard(&replicated)?
+    } else {
+        value
+    };
+
+    let rank = dimensions.len();
+    let strides = vec![1; rank];
+    let slice_item = |item: usize| -> Result<V, ProgramError> {
+        let mut start_indices = vec![0; rank];
+        let mut limit_indices = dimensions.clone();
+        start_indices[0] = item;
+        limit_indices[0] = item + 1;
+        value.slice(&start_indices, &limit_indices, &strides)
+    };
+
+    // Every source item is sliced once, even when several targets receive it (e.g., in a broadcast).
+    let mut source_items = vec![None; dimensions[0]];
+    let mut zero_item = None;
+    let mut items = Vec::with_capacity(sources.len());
+    for source in sources {
+        match source {
+            Some(source) => {
+                if source_items[*source].is_none() {
+                    source_items[*source] = Some(slice_item(*source)?);
+                }
+                items.push(source_items[*source].clone().unwrap());
+            }
+            None => {
+                if zero_item.is_none() {
+                    zero_item = Some(slice_item(0)?.zero_like()?);
+                }
+                items.push(zero_item.clone().unwrap());
+            }
+        }
+    }
+
+    let mut routed = Concatenate::concatenate(&items, 0)?;
+    if let Some(sharding) = output_sharding
+        && routed.r#type().sharding() != Some(&sharding)
+    {
+        routed = routed.reshard(&sharding)?;
+    }
+
+    if axis == 0 { Ok(routed) } else { Ok(routed.move_axis(0, axis)?) }
+}
+
 impl<C: Context<Type = ArrayType>, P: ArrayExtentBatchingPolicy<C>> BatchingContext<C, ArrayBatchingPolicy<P>> {
     /// Forwards a linear collective over an axis that the active batching level does not bind to the parent context.
     /// An input without a mapped batch axis forwards the collective unchanged. A mapped input instead forwards the
@@ -1669,51 +1801,14 @@ impl<C: Context<Type = ArrayIrType>> BatchingContext<C, ArrayIrBatchingPolicy> {
     }
 }
 
-/// Group of the value-level collective capabilities [`ParallelReduce`], [`ParallelVary`], [`ParallelAllGather`],
-/// [`ParallelSumScatter`], [`ParallelPermute`], [`ParallelAllToAll`], [`ParallelRaggedAllToAll`], [`ParallelCast`],
-/// and [`ParallelArgExtrema`]. It is implemented automatically for every type that implements all of its members.
-/// The context-side [`AxisIndex`] is implemented by contexts rather than values and is therefore not a member.
-///
-/// The universe parameter `T` defaults to the [`Capability`] universe of the implementor and is passed to every member,
-/// so that homogeneous array values implement this bundle for [`ArrayType`] and array IR values implement it for
-/// [`ArrayIrType`].
-pub trait CollectiveOperations<T = <Self as Capability>::Universe>:
-    Capability
-    + ParallelReduce<T>
-    + ParallelVary<T>
-    + ParallelAllGather<T>
-    + ParallelSumScatter<T>
-    + ParallelPermute<T>
-    + ParallelAllToAll<T>
-    + ParallelRaggedAllToAll<T>
-    + ParallelCast<T>
-    + ParallelArgExtrema<T>
-{
-}
-
-impl<
-    T,
-    V: ParallelReduce<T>
-        + ParallelVary<T>
-        + ParallelAllGather<T>
-        + ParallelSumScatter<T>
-        + ParallelPermute<T>
-        + ParallelAllToAll<T>
-        + ParallelRaggedAllToAll<T>
-        + ParallelCast<T>
-        + ParallelArgExtrema<T>,
-> CollectiveOperations<T> for V
-{
-}
-
 #[cfg(test)]
 mod tests {
     use indoc::indoc;
     use pretty_assertions::assert_eq;
 
     use crate::arrays::{
-        Array, ArrayIrOperation, ArrayIrValue, ArrayOperation, DataType, DimensionBounds, Layout, Memory, MeshAxis,
-        ShardingDimension, StridedLayout,
+        Array, ArrayIrOperation, ArrayIrValue, ArrayOperation, DataType, DimensionBounds, DimensionVariable, Layout,
+        Memory, MeshAxis, StridedLayout,
     };
     use crate::batching::BatchableOperation;
     use crate::contexts::{EagerContext, StagingContext};
@@ -1721,6 +1816,7 @@ mod tests {
     use crate::operations::constants::constant::DimensionConstant;
     use crate::parameters::Placeholder;
     use crate::programs::{EffectClasses, EmptyRegionDriver, Program, ProgramBuilder};
+    use crate::tests::TestArrayTracingContext;
 
     use super::*;
 
@@ -2770,6 +2866,51 @@ mod tests {
             ),
             Err(TypeError::invalid("`parallel_all_gather` output axis 1 extent 2 must equal unchanged extent 3")),
         );
+    }
+
+    #[test]
+    fn test_route_axis_slices() {
+        let input = Array::matrix(2, 3, vec![1f32, 2.0, 3.0, 4.0, 5.0, 6.0]).unwrap();
+        assert_eq!(
+            route_axis_slices(PARALLEL_PERMUTE_OPERATION_NAME, &input, 0, &[Some(1), None, Some(1), Some(0)]),
+            Ok(Array::matrix(4, 3, vec![4f32, 5.0, 6.0, 0.0, 0.0, 0.0, 4.0, 5.0, 6.0, 1.0, 2.0, 3.0]).unwrap()),
+        );
+        assert_eq!(
+            route_axis_slices(PARALLEL_BROADCAST_OPERATION_NAME, &input, 1, &[Some(2), None, Some(2), Some(0)]),
+            Ok(Array::matrix(2, 4, vec![3f32, 0.0, 3.0, 1.0, 6.0, 0.0, 6.0, 4.0]).unwrap()),
+        );
+    }
+
+    #[test]
+    fn test_route_axis_slices_sharding() {
+        // Singleton slices use replicated placement, and the complete result restores the original sharding.
+        let mesh = LogicalMesh::new(vec![MeshAxis::new("devices", 2, MeshAxisType::Explicit).unwrap()]).unwrap();
+        let sharding =
+            Sharding::new(mesh, vec![ShardingDimension::sharded(["devices"]), ShardingDimension::Replicated]).unwrap();
+        let value = |values: Vec<f64>| Array::matrix(2, 3, values).unwrap().reshard(&sharding).unwrap();
+        let input = value(vec![1.0, 2.0, 3.0, 4.0, 5.0, 6.0]);
+        assert_eq!(
+            route_axis_slices(PARALLEL_PERMUTE_OPERATION_NAME, &input, 0, &[Some(1), Some(0)]),
+            Ok(value(vec![4.0, 5.0, 6.0, 1.0, 2.0, 3.0])),
+        );
+        assert_eq!(
+            route_axis_slices(PARALLEL_PERMUTE_OPERATION_NAME, &input, 0, &[None, Some(0)]),
+            Ok(value(vec![0.0, 0.0, 0.0, 1.0, 2.0, 3.0])),
+        );
+    }
+
+    #[test]
+    fn test_route_axis_slices_requires_static_shape() {
+        let trace = TestArrayTracingContext::new();
+        let length = DimensionVariable::new("length", DimensionBounds::new(0, Some(4)).unwrap());
+        let input_type =
+            ArrayType::new(DataType::F32, Shape::new(vec![Dimension::Static(2), Dimension::Dynamic(length)]));
+        let input = trace.input(input_type);
+        assert!(matches!(
+            route_axis_slices(PARALLEL_BROADCAST_OPERATION_NAME, &input, 0, &[Some(1), Some(0)]),
+            Err(BatchingError::UnsupportedOperation { message })
+                if message == "`parallel_broadcast` batching requires statically shaped inputs",
+        ));
     }
 
     #[test]
