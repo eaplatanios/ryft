@@ -44,76 +44,57 @@ use crate::operations::sharding::reshard::Reshard;
 use crate::parameters::{Parameter, ParameterError, ParameterPath, Parameterized, ParameterizedFamily};
 use crate::programs::{ProgramError, Value};
 
-// TODO(eaplatanios): Review from here onwards.
-
-/// Error returned by [`auto_axes`] and [`explicit_axes`].
-///
-/// It converts into [`ProgramError`] so that functions traced by other operations (e.g., the body of a `shard_map`)
-/// can switch axes with the `?` operator. Its [`Program`](AxisTypesError::Program) variant passes through unchanged,
-/// and every other variant becomes [`ProgramError::custom`], from which callers can recover it with
-/// [`ProgramError::downcast_custom`]. The conversion from [`ProgramError`] is its inverse on custom errors. A
-/// [`ProgramError::Custom`] that holds an [`AxisTypesError`] converts back into that [`AxisTypesError`], and every
-/// other [`ProgramError`] becomes the [`Program`](AxisTypesError::Program) variant. The two conversions therefore form
-/// a normalizing cycle, so an error of a nested switch is reported as itself rather than wrapped in a [`ProgramError`].
+/// Error returned by [`auto_axes`] and [`explicit_axes`]. It converts into [`ProgramError`] so that functions
+/// traced by other operations (e.g., the body of a `shard_map`) can switch axes with the `?` operator. Its
+/// [`Program`](AxisTypesError::Program) variant passes through unchanged, and every other variant becomes
+/// [`ProgramError::custom`], from which callers can recover it with [`ProgramError::downcast_custom`]. The conversion
+/// from [`ProgramError`] is its inverse on custom errors. A [`ProgramError::Custom`] that holds an [`AxisTypesError`]
+/// converts back into that [`AxisTypesError`], and every other [`ProgramError`] becomes the
+/// [`Program`](AxisTypesError::Program) variant. The two conversions therefore form a normalizing cycle,
+/// so an error of a nested switch is reported as itself rather than wrapped in a [`ProgramError`].
 #[derive(Clone, Debug, PartialEq, Eq, Hash, Error)]
 pub enum AxisTypesError {
-    /// Error raised by the function, by type inference of a reshard, or by a leaf that is not an array.
     #[error(transparent)]
     Program(ProgramError),
 
-    /// Error raised when shardings do not have the structure of the values that they describe.
     #[error(transparent)]
     Parameter(#[from] ParameterError),
 
-    /// Error raised when the selected axes are not axes of the mesh, or when a sharding cannot be re-expressed over
-    /// the switched mesh.
     #[error(transparent)]
     Sharding(#[from] ShardingError),
 
-    /// Error raised when the switch is given no sharding to take its mesh from and, for [`auto_axes`], the context of
-    /// its inputs has no default mesh either (refer to [`MeshContext::default_mesh`]).
     #[error(
         "switching mesh axes to `{axis_type}` requires at least one sharding or a default mesh of the context of its \
          inputs to take the mesh from"
     )]
     MissingMesh { axis_type: MeshAxisType },
 
-    /// Error raised when the shardings that the switch is given are over different meshes.
     #[error(
         "the shardings of a switch to `{axis_type}` mesh axes must share one mesh, but got `{expected}` and `{actual}`"
     )]
     MeshMismatch { axis_type: MeshAxisType, expected: LogicalMesh, actual: LogicalMesh },
 
-    /// Error raised when the switch selects a [`Manual`](MeshAxisType::Manual) mesh axis.
     #[error("cannot switch manual mesh axis `{axis_name}` to `{axis_type}`")]
     ManualAxis { axis_type: MeshAxisType, axis_name: String },
 
-    /// Error raised when an input is placed over a mesh that is neither the mesh of the switch nor that mesh with the
-    /// switched axes retyped.
     #[error(
         "input #{input_index} is placed over mesh `{actual}`, which is neither the mesh `{expected}` of the switch to \
          `{axis_type}` mesh axes nor that mesh with the switched axes retyped"
     )]
     InputMeshMismatch { axis_type: MeshAxisType, input_index: usize, expected: LogicalMesh, actual: LogicalMesh },
 
-    /// Error raised when an output is placed over a mesh that is neither the mesh of the switch nor that mesh with the
-    /// switched axes retyped.
     #[error(
         "output #{output_index} is placed over mesh `{actual}`, which is neither the mesh `{expected}` of the switch \
          to `{axis_type}` mesh axes nor that mesh with the switched axes retyped"
     )]
     OutputMeshMismatch { axis_type: MeshAxisType, output_index: usize, expected: LogicalMesh, actual: LogicalMesh },
 
-    /// Error raised when an input of [`auto_axes`] carries reduction state along an axis that the switch makes
-    /// [`Auto`](MeshAxisType::Auto).
     #[error(
         "input #{input_index} carries reduction state along mesh axis `{axis_name}`, which the switch makes `auto`, \
          so it must be reduced before the switch"
     )]
     InputReductionState { input_index: usize, axis_name: String },
 
-    /// Error raised when an output of [`explicit_axes`] carries reduction state along an axis that is
-    /// [`Auto`](MeshAxisType::Auto) outside of the switch.
     #[error(
         "output #{output_index} carries reduction state along mesh axis `{axis_name}`, which is `auto` outside of \
          the switch, so it must be reduced before the switch ends"
@@ -122,12 +103,14 @@ pub enum AxisTypesError {
 }
 
 impl From<ProgramError> for AxisTypesError {
+    #[inline]
     fn from(error: ProgramError) -> Self {
         error.downcast_custom::<AxisTypesError>().cloned().unwrap_or(AxisTypesError::Program(error))
     }
 }
 
 impl From<AxisTypesError> for ProgramError {
+    #[inline]
     fn from(error: AxisTypesError) -> Self {
         match error {
             AxisTypesError::Program(error) => error,
@@ -135,6 +118,8 @@ impl From<AxisTypesError> for ProgramError {
         }
     }
 }
+
+// TODO(eaplatanios): Review from here onwards.
 
 /// Runs `function` on `inputs` with the mesh axes `axes` switched to [`Auto`](MeshAxisType::Auto), so that the backend
 /// compiler rather than the type system decides the placement of the values of `function` along them, and reshards
