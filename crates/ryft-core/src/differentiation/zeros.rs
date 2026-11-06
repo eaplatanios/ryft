@@ -308,6 +308,7 @@ const OUTPUT_TANGENT_BOUNDARY: &str = "output tangent boundary";
 
 /// Reconstruction metadata for one zero leaf omitted from a compact derivative boundary.
 /// This is only used as part of [`ZeroBoundaryReconstruction`].
+#[derive(Clone)]
 pub(crate) struct ZeroBoundaryLeaf<T: Type> {
     /// Position of the omitted zero in the complete public differential boundary.
     index: usize,
@@ -429,6 +430,20 @@ impl<V: Value<Type: DifferentiableType>> ZeroBoundaryReconstruction<V> {
                 .iter()
                 .map(|leaf| leaf.index)
                 .eq((0..self.boundary_size).filter(|&index| !tangent_output_slots[index]))
+    }
+
+    /// Returns this reconstruction with every retained residual replaced by the result of `map_fn`, so that the
+    /// omitted zeros can be rebuilt in another context (e.g., after importing the residuals into a descendant context).
+    /// The reconstruction plan is unchanged.
+    pub(crate) fn try_map_residuals<W: Value<Type = V::Type>, F: FnMut(V) -> Result<W, ProgramError>>(
+        &self,
+        map_fn: F,
+    ) -> Result<ZeroBoundaryReconstruction<W>, ProgramError> {
+        Ok(ZeroBoundaryReconstruction {
+            residuals: self.residuals.iter().cloned().map(map_fn).collect::<Result<Vec<_>, _>>()?,
+            boundary_size: self.boundary_size,
+            zero_leaves: self.zero_leaves.clone(),
+        })
     }
 
     /// Rebuilds the complete output tangent boundary described by this instance, interleaving materialized omitted

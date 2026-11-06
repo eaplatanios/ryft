@@ -7,6 +7,7 @@ use std::sync::Arc;
 
 use ryft_macros::Parameter;
 
+use crate::captures::{ImportingContext, SameContext};
 use crate::contexts::{Context, ContextProjection, Domain, ProjectedContext, StagingContext, ValueResolution};
 use crate::differentiation::reverse::{TransposableOperation, TransposedProgram};
 use crate::differentiation::types::DifferentiableType;
@@ -892,7 +893,7 @@ impl<
     /// at that vector in the context that this pushforward was built in (i.e., the single replay path for both context
     /// flavors: an eager context interprets the pushforward immediately, while a staging context stages it into the
     /// enclosing trace and returns tracers), and the flat tangent outputs are reshaped against the closure's output
-    /// structure.
+    /// structure. This is [`Self::apply_in_context`] in that context.
     ///
     /// A reference-typed primal leaf takes a concrete tangent reference, which the tangent program mutates in place.
     /// It must denote an allocation distinct from every reference bound at the primal boundary and from every other
@@ -901,6 +902,34 @@ impl<
     #[inline]
     pub fn apply(&self, tangents: Input::To<C::Value>) -> Result<Output::To<C::Value>, ProgramError>
     where
+        C::Operation: ResidualZeroProvider<C::Type, Operation = C::Operation>,
+        TracingContext<C::Constant, C::Operation>:
+            StagingContext<Type = C::Type, Constant = C::Constant, Operation = C::Operation>,
+    {
+        self.apply_in_context::<C, SameContext>(&self.context, tangents)
+    }
+
+    /// Pushes the structured tangents `tangents` through the linearized Jacobian in `context`, which may be a
+    /// descendant of the context that this pushforward was built in (e.g., a batching level over it, which applies
+    /// the pushforward to a whole batch of tangents) or, for a pushforward built eagerly, a trace that captures its
+    /// residuals. Every value that this pushforward retained from its linearization (i.e., its residuals and the
+    /// extents of its omitted zero outputs) enters `context` through [`ImportingContext`], so it is replicated under
+    /// batching, has a structurally zero tangent under differentiation, and is known under partial evaluation. The
+    /// pushforward program is then replayed in `context` exactly as [`Self::apply`] replays it in its own context,
+    /// with the same validation.
+    ///
+    /// # Errors
+    ///
+    /// Returns the errors of [`Self::apply`], and errors from importing the retained values into `context`.
+    pub fn apply_in_context<X, Path>(
+        &self,
+        context: &X,
+        tangents: Input::To<X::Value>,
+    ) -> Result<Output::To<X::Value>, ProgramError>
+    where
+        X: Context<Type = C::Type, Constant = C::Constant, Operation = C::Operation> + ImportingContext<C, Path>,
+        Input::Family: ParameterizedFamily<X::Value>,
+        Output::Family: ParameterizedFamily<X::Value>,
         C::Operation: ResidualZeroProvider<C::Type, Operation = C::Operation>,
         TracingContext<C::Constant, C::Operation>:
             StagingContext<Type = C::Type, Constant = C::Constant, Operation = C::Operation>,
@@ -919,7 +948,7 @@ impl<
         // allocation. Identity is what is compared here and not reference generation: a primal reference that advanced
         // generations after the differentiated closure ran is still the same allocation and is thus still rejected.
         self.primal_references.validate_differentiation_arguments(
-            &self.context,
+            context,
             public_tangents
                 .iter()
                 .enumerate()
@@ -944,21 +973,25 @@ impl<
             }
         }
 
-        // Close the compact tangent boundary over the primal residuals and replay it in the originating context.
-        program_inputs.extend(self.residuals.iter().cloned());
-        let tangent_outputs = self.program.interpret_in_context(&self.context, program_inputs)?.into_iter();
+        // Close the compact tangent boundary over the imported primal residuals and replay it in `context`.
+        for residual in &self.residuals {
+            program_inputs.push(context.import(residual.clone())?);
+        }
+        let tangent_outputs = self.program.interpret_in_context(context, program_inputs)?.into_iter();
 
         // Reconstruct the complete flattened public output boundary. Consume one program result for each tangent output
-        // slot and materialize a typed zero, sized from the retained extents, for every omitted leaf.
+        // slot and materialize a typed zero, sized from the imported retained extents, for every omitted leaf.
         let Some(tangent_reconstruction) = &self.tangent_reconstruction else {
             return Err(ProgramError::MalformedProgram(
                 "a pushforward linearized for transposition cannot be applied".to_string(),
             ));
         };
-        let outputs = tangent_reconstruction.rebuild(&self.context, tangent_outputs)?;
+        let outputs = tangent_reconstruction
+            .try_map_residuals(|residual| context.import(residual))?
+            .rebuild(context, tangent_outputs)?;
 
         // Restore the closure's original structured output shape after rebuilding every flattened tangent leaf.
-        Ok(Output::To::<C::Value>::from_parameters(self.output_structure.clone(), outputs)?)
+        Ok(Output::To::<X::Value>::from_parameters(self.output_structure.clone(), outputs)?)
     }
 }
 
@@ -4424,7 +4457,7 @@ pub(crate) mod tests {
         ArrayReferenceTransformIndex, ArrayType, DataType, Dimension, DimensionBounds, DimensionOperation,
         DimensionType, DimensionValue, DimensionVariable, Shape, ShardingDimension,
     };
-    use crate::batching::{BatchAxis, BatchedProgram, ProgramBatchingOutputAxesPolicy};
+    use crate::batching::{BatchAxis, BatchedProgram, ProgramBatchingOutputAxesPolicy, batch};
     use crate::contexts::{Context, EagerContext};
     use crate::differentiation::differentiate_at;
     use crate::differentiation::reverse::{
@@ -5259,6 +5292,33 @@ pub(crate) mod tests {
             pushforward.apply((Array::scalar(0.0).unwrap(), Array::scalar(1.0).unwrap())).unwrap().to_f64s()[0],
             0.5,
             epsilon = 1e-9,
+        );
+    }
+
+    #[test]
+    fn test_pushforward_apply_in_context() {
+        // `f(x) = x * x` is linearized once. Applied under a batching level, the pushforward imports its residual `x`
+        // as a replicated value and pushes a whole batch of tangents through at once.
+        let (_, pushforward) = differentiate_at(Array::scalar(3.0f64).unwrap())
+            .linearize(|x: LinearizationTracer<EagerContext<Array, ArrayOperation<Array>>>| Ok(x.clone() * x))
+            .unwrap();
+        let batched = batch(
+            |tangent| {
+                let context = tangent.context().clone();
+                pushforward.apply_in_context(&context, tangent)
+            },
+            Array::vector(vec![1.0f64, 2.0, -1.0]).unwrap(),
+            BatchAxis::new(0),
+            BatchAxis::new(0),
+            None,
+        );
+        assert_eq!(batched, Ok(Array::vector(vec![6.0f64, 12.0, -6.0]).unwrap()));
+
+        // In the context that it was built in, the pushforward applies exactly as `apply` does.
+        assert_eq!(
+            pushforward
+                .apply_in_context(&EagerContext::<Array, ArrayOperation<Array>>::new(), Array::scalar(2.0).unwrap()),
+            pushforward.apply(Array::scalar(2.0).unwrap()),
         );
     }
 
