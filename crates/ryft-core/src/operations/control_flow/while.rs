@@ -3416,7 +3416,7 @@ mod tests {
         DimensionValue, DimensionVariable, Layout, LogicalMesh, MeshAxis, MeshAxisType, Shape, Sharding,
         ShardingDimension, StridedLayout,
     };
-    use crate::axes::{NamedAxes, NamedAxis};
+    use crate::axes::{MeshContext, NamedAxes, NamedAxis};
     use crate::batching::{Batch, batch};
     use crate::captures::ClosedProgram;
     use crate::contexts::{Domain, EagerContext, StagingContext, ValueResolution};
@@ -16701,6 +16701,12 @@ mod tests {
 
             fn named_axes(&self) -> Vec<(String, NamedAxis)> {
                 vec![("m".to_string(), self.named_axis("m").unwrap())]
+            }
+        }
+
+        impl MeshContext for RecordingContext {
+            fn default_mesh(&self) -> Option<LogicalMesh> {
+                self.named_axis("m").and_then(|axis| axis.mesh().cloned())
             }
         }
 

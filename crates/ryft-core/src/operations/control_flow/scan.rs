@@ -4409,7 +4409,7 @@ mod tests {
         DataType, DimensionBounds, DimensionError, DimensionType, DimensionValue, DimensionVariable, LogicalMesh,
         Memory, MeshAxis, MeshAxisType, Sharding, ShardingDimension,
     };
-    use crate::axes::{NamedAxes, NamedAxis};
+    use crate::axes::{MeshContext, NamedAxes, NamedAxis};
     use crate::batching::{BatchingTracer, ProgramBatchingOutputAxesPolicy, RecursiveBatchingDriver, batch};
     use crate::captures::{CapturingContext, ClosedProgram};
     use crate::contexts::{EagerContext, StagingContext, ValueResolution};
@@ -24166,6 +24166,12 @@ mod tests {
 
             fn named_axes(&self) -> Vec<(String, NamedAxis)> {
                 vec![("m".to_string(), self.named_axis("m").unwrap())]
+            }
+        }
+
+        impl MeshContext for RecordingContext {
+            fn default_mesh(&self) -> Option<LogicalMesh> {
+                self.named_axis("m").and_then(|axis| axis.mesh().cloned())
             }
         }
 

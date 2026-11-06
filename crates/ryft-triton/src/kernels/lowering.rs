@@ -627,9 +627,6 @@ impl<'c, 't> Lowering<'c, 't> {
                     ArrayIrValue::Reference(_) => {
                         return Err(unsupported("constant", "captured references are unsupported"));
                     }
-                    ArrayIrValue::Future(_) => {
-                        return Err(unsupported("constant", "future constants are unsupported"));
-                    }
                 }));
             }
         }

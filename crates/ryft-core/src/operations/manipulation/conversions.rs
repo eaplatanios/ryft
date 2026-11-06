@@ -445,6 +445,18 @@ impl ElementType for ArrayType {
             )));
         }
 
+        // Reinterpreting bits commutes with no cross-device reduction (e.g., the summands, or the candidate maxima,
+        // of the bits of a value are not the bits of its summands or candidates), so a value whose reduction along some
+        // axes is still pending cannot be bitcast to another element type, as in JAX, whose `bitcast_convert_type` has
+        // no unreduced rule. A bitcast to the same element type is the identity on every summand or candidate and
+        // therefore preserves the pending reduction exactly.
+        if source != data_type && !self.unreduced_axes().is_empty() {
+            return Err(TypeError::invalid(format!(
+                "`{CONVERT_ELEMENT_TYPE_OPERATION_NAME}` in bitcast mode does not support unreduced inputs \
+                 unless the source and destination element types match",
+            )));
+        }
+
         if source != data_type
             && (source == DataType::Boolean
                 || data_type == DataType::Boolean
@@ -2442,8 +2454,8 @@ mod tests {
         Array, ArrayBatch, ArrayElement, ArrayIrBatch, ArrayIrOperation, ArrayIrValue, ArrayOperation, ArrayReference,
         ArrayType, DataType, Dimension, DimensionBounds, DimensionError, DimensionType, DimensionValue,
         DimensionVariable, Layout, LogicalMesh, MAX_DIMENSION_EXTENT, Memory, MeshAxis, MeshAxisType, Shape, Sharding,
-        ShardingDimension, StridedLayout, Tile, TileDimension, TiledLayout, bf16, f8e4m3fn, f8e5m2, f8e8m0fnu, i4, u2,
-        u4,
+        ShardingDimension, StridedLayout, Tile, TileDimension, TiledLayout, UnreducedKind, bf16, f8e4m3fn, f8e5m2,
+        f8e8m0fnu, i4, u2, u4,
     };
     use crate::batching::{BatchAxis, BatchedProgram, BatchingTracer, ProgramBatchingOutputAxesPolicy};
     use crate::captures::CaptureReference;
@@ -2701,8 +2713,36 @@ mod tests {
         );
         assert_eq!(
             ConvertElementTypeOperation::<ArrayType>::new(DataType::U32, true).infer_output_types(&[output], &[]),
-            Ok(vec![input]),
+            Ok(vec![input.clone()]),
         );
+
+        // Reinterpreting the bits of per-device summands or candidate extrema does not reinterpret their combination,
+        // so unreduced inputs of every kind are rejected unless the element type is unchanged, in which case the
+        // bitcast is the identity and preserves the pending reduction.
+        for kind in [UnreducedKind::Sum, UnreducedKind::Max] {
+            let unreduced = ArrayType::new_static(DataType::U32, [4])
+                .with_sharding(
+                    Sharding::replicated(input.sharding().unwrap().mesh().clone(), 1)
+                        .with_unreduced_axes(["x"])
+                        .unwrap()
+                        .with_unreduced_kind(kind)
+                        .unwrap(),
+                )
+                .unwrap();
+            assert_eq!(
+                ConvertElementTypeOperation::<ArrayType>::new(DataType::U32, true)
+                    .infer_output_types(std::slice::from_ref(&unreduced), &[]),
+                Ok(vec![unreduced.clone()]),
+            );
+            assert_eq!(
+                ConvertElementTypeOperation::<ArrayType>::new(DataType::F32, true)
+                    .infer_output_types(&[unreduced], &[]),
+                Err(TypeError::invalid(
+                    "`convert_element_type` in bitcast mode does not support unreduced inputs unless the source and \
+                     destination element types match",
+                )),
+            );
+        }
     }
 
     #[test]

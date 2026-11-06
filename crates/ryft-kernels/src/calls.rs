@@ -945,9 +945,6 @@ impl<Extension: Operation<Type = ArrayIrType>> KernelDefinition<Extension> {
                 Atom::Constant(ArrayIrValue::Reference(_)) => {
                     return Err(TypeError::invalid("reference constants have no persistent kernel semantic identity"));
                 }
-                Atom::Constant(ArrayIrValue::Future(_)) => {
-                    return Err(TypeError::invalid("future constants have no persistent kernel semantic identity"));
-                }
             }
         }
         Self::semantic_field(key, "end atoms");
@@ -1236,8 +1233,6 @@ impl<Extension: Operation<Type = ArrayIrType>> KernelDefinition<Extension> {
             | ArrayIrOperation::ParallelSumScatter(_)
             | ArrayIrOperation::ParallelAllToAll(_)
             | ArrayIrOperation::ParallelRaggedAllToAll(_)
-            | ArrayIrOperation::ParallelStart(_)
-            | ArrayIrOperation::ParallelDone(_)
             | ArrayIrOperation::Condition(_)
             | ArrayIrOperation::While(_)
             | ArrayIrOperation::Scan(_)

@@ -467,9 +467,9 @@ pub(super) fn validate<Extension: KernelExtension + Into<GpuOperation>>(
                     body.input_ids().iter().zip(body.output_ids()).all(|(input, output)| {
                         match body.atoms()[input.index()].r#type().as_ref() {
                             ryft_core::ArrayIrType::Array(_) => true,
-                            ryft_core::ArrayIrType::Reference(_)
-                            | ryft_core::ArrayIrType::Dimension(_)
-                            | ryft_core::ArrayIrType::Future(_) => input == output,
+                            ryft_core::ArrayIrType::Reference(_) | ryft_core::ArrayIrType::Dimension(_) => {
+                                input == output
+                            }
                         }
                     });
                 operation.iteration_bound().is_some_and(|bound| bound <= i64::MAX as usize)
@@ -945,12 +945,6 @@ impl<'c, 't> Lowering<'c, 't> {
                         return Err(Error::Unsupported {
                             operation: "constant",
                             reason: "captured references are not kernel arguments".to_owned(),
-                        });
-                    }
-                    ArrayIrValue::Future(_) => {
-                        return Err(Error::Unsupported {
-                            operation: "constant",
-                            reason: "future constants are not kernel values".to_owned(),
                         });
                     }
                 });
