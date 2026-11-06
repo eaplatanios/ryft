@@ -161,7 +161,7 @@ use std::fmt::{Debug, Display, Formatter};
 
 use thiserror::Error;
 
-use crate::contexts::{Context, ContextProjection, Domain, ProjectedContext, StagingContext};
+use crate::contexts::{Context, Domain, StagingContext};
 use crate::differentiation::hessian::hessian_in_context;
 use crate::differentiation::jacobian::{jacobian_forward_in_context, jacobian_reverse_in_context};
 use crate::differentiation::reverse::{value_and_gradient_auxiliary_in_context, value_and_gradient_in_context};
@@ -173,17 +173,20 @@ use crate::operations::{
 use crate::parameters::{ParameterError, Parameterized, ParameterizedFamily};
 use crate::partial::{PartialEvaluationContext, PartiallyEvaluatableOperation};
 use crate::programs::{
-    EmptyRegionDriver, MaybeZero, Operation, OperationProvider, ProgramError, ReferenceAccessOperation,
-    ReferenceBoundary, ReferenceBoundaryError, ReferenceMemberType, ReferenceTransform, TypeError, Value,
-    ValueProjection,
+    Operation, OperationProvider, ProgramError, ReferenceAccessOperation, ReferenceBoundary, ReferenceBoundaryError,
+    ReferenceMemberType, ReferenceTransform, TypeError, Value,
 };
 use crate::tracing::TracingContext;
+
+#[cfg(doc)]
+use crate::programs::MaybeZero;
 
 pub mod batching;
 pub mod elementwise;
 pub mod forward;
 pub mod hessian;
 pub mod jacobian;
+pub mod projections;
 pub mod rematerialization;
 pub mod reverse;
 pub mod types;
@@ -197,11 +200,14 @@ pub use elementwise::{
 pub use forward::{
     DifferentiableOperation, DifferentiationContext, DifferentiationDriver, DifferentiationDual, DifferentiationPolicy,
     DifferentiationTracer, ForwardModeDifferentiate, FusedDifferentiationPolicy, Linearization, LinearizationContext,
-    LinearizationTracer, MemberDifferentiableOperation, PartitionedDifferentiationPolicy,
-    ProjectedDifferentiationPolicy, Pushforward, TangentActivity,
+    LinearizationTracer, PartitionedDifferentiationPolicy, Pushforward, TangentActivity,
 };
 pub use hessian::{Hessian, HessianBlock};
 pub use jacobian::{Jacobian, JacobianBlock};
+pub use projections::{
+    MemberDifferentiableOperation, MemberTransposableOperation, ParentDifferentiationBuilder, ParentPullback,
+    ParentPushforward, ProjectedDifferentiationPolicy, differentiate_in_parent_at,
+};
 pub use rematerialization::{
     DOTS_SAVABLE_POLICY_NAME, DOTS_WITH_NO_BATCH_DIMENSIONS_SAVABLE_POLICY_NAME, DotsSavable,
     DotsWithNoBatchDimensionsSavable, EVERYTHING_SAVABLE_POLICY_NAME, EverythingSavable, MemoryTransferStorage,
@@ -215,8 +221,8 @@ pub use rematerialization::{
 };
 pub use reverse::{
     CotangentAccumulator, CotangentDestination, CotangentDestinationKind, CotangentDestinations,
-    CotangentReferenceAccumulator, CotangentSeed, MemberTransposableOperation, Pullback, ReverseModeDifferentiate,
-    TransposableOperation, TransposedProgram, TransposedProgramCotangent, TranspositionContext, TranspositionDriver,
+    CotangentReferenceAccumulator, CotangentSeed, Pullback, ReverseModeDifferentiate, TransposableOperation,
+    TransposedProgram, TransposedProgramCotangent, TranspositionContext, TranspositionDriver,
 };
 pub use types::{DenseDifferentiableType, DifferentiableType};
 pub use zeros::ResidualZeroProvider;
@@ -432,79 +438,6 @@ impl DifferentiationRule {
             Self::Jvp => operation.jvp(context, driver, inputs),
             Self::JvpForTranspose => operation.jvp_for_transpose(context, driver, inputs),
         }
-    }
-
-    /// Dispatches the selected parent-universe member rule without changing the context or recursive driver.
-    #[inline]
-    pub(crate) fn apply_member<
-        O: MemberDifferentiableOperation<C>,
-        C: Context,
-        D: DifferentiationDriver<C>,
-        P: DifferentiationPolicy<C>,
-    >(
-        self,
-        operation: &O,
-        context: &DifferentiationContext<C, P>,
-        driver: &D,
-        inputs: &[DifferentiationDual<C::Value>],
-    ) -> Result<Vec<DifferentiationDual<C::Value>>, DifferentiationError> {
-        match self {
-            Self::Jvp => operation.jvp_in_parent(context, driver, inputs),
-            Self::JvpForTranspose => operation.jvp_for_transpose_in_parent(context, driver, inputs),
-        }
-    }
-
-    /// Projects inputs, applies the explicitly selected member rule, and lifts its outputs into the parent universe.
-    pub(crate) fn apply_projected<
-        T: DifferentiableType,
-        O: Operation<Type = T> + DifferentiableOperation<ProjectedContext<C, T>>,
-        C: ContextProjection<T, Type: DifferentiableType>,
-        P: DifferentiationPolicy<C>,
-    >(
-        self,
-        context: &DifferentiationContext<C, P>,
-        operation: &O,
-        inputs: &[DifferentiationDual<C::Value>],
-    ) -> Result<Vec<DifferentiationDual<C::Value>>, DifferentiationError> {
-        if !operation.region_slots().is_empty() {
-            return Err(ProgramError::UnsupportedOperation {
-                message: format!(
-                    "projected operation `{}` carries regions and cannot be differentiated through its member family; \
-                     differentiate it through a family-level carrier for that operation instead",
-                    operation.name(),
-                ),
-            }
-            .into());
-        }
-        let projected_inputs = inputs
-            .iter()
-            .map(|input| {
-                let primal = <C::Value as ValueProjection<T>>::into_projected(input.primal().clone())?;
-                match input.tangent() {
-                    MaybeZero::Zero(_) => DifferentiationDual::new_with_zero_tangent(primal),
-                    MaybeZero::Value(value) => {
-                        let tangent = <C::Value as ValueProjection<T>>::into_projected(value.clone())?;
-                        DifferentiationDual::new(primal, tangent)
-                    }
-                }
-            })
-            .collect::<Result<Vec<_>, DifferentiationError>>()?;
-        let projected_context = context.project::<T>();
-        let outputs = self.apply(operation, &projected_context, &EmptyRegionDriver, &projected_inputs)?;
-        outputs
-            .into_iter()
-            .map(|output| {
-                let (primal, tangent) = output.into_parts();
-                let primal = <C::Value as ValueProjection<T>>::from_projected(primal);
-                let tangent = match tangent {
-                    MaybeZero::Zero(r#type) => MaybeZero::Zero(r#type.into()),
-                    MaybeZero::Value(value) => {
-                        MaybeZero::Value(<C::Value as ValueProjection<T>>::from_projected(value))
-                    }
-                };
-                DifferentiationDual::new(primal, tangent)
-            })
-            .collect::<Result<Vec<_>, _>>()
     }
 }
 

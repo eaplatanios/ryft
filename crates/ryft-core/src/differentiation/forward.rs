@@ -8,7 +8,7 @@ use std::sync::Arc;
 use ryft_macros::Parameter;
 
 use crate::captures::{ImportingContext, SameContext};
-use crate::contexts::{Context, ContextProjection, Domain, ProjectedContext, StagingContext, ValueResolution};
+use crate::contexts::{Context, Domain, StagingContext, ValueResolution};
 use crate::differentiation::reverse::{TransposableOperation, TransposedProgram};
 use crate::differentiation::types::DifferentiableType;
 use crate::differentiation::zeros::{
@@ -16,7 +16,7 @@ use crate::differentiation::zeros::{
 };
 use crate::differentiation::{DifferentiationBoundaryPosition, DifferentiationError, DifferentiationRule};
 use crate::macros::check_count;
-use crate::operations::{AddOperation, ReferenceAddUpdateOperation, ReferenceNewOperation, Zero, ZeroOperation};
+use crate::operations::{AddOperation, ReferenceAddUpdateOperation, ReferenceNewOperation, Zero};
 use crate::parameters::{Parameter, ParameterError, Parameterized, ParameterizedFamily, Placeholder};
 use crate::partial::residuals::ResidualPlacement;
 use crate::partial::{
@@ -27,10 +27,10 @@ use crate::partial::{
 use crate::programs::transforms::{Transform, TransformArtifact};
 use crate::programs::{
     Atom, AtomId, AttachedRegions, EmptyRegionDriver, FlatProgram, MaybeZero, Operation, OperationPayloadProjection,
-    OperationProvider, Program, ProgramBuilder, ProgramError, ProjectedValue, Provenance, ProvenanceScope,
-    ReferenceAccessOperation, ReferenceBoundary, ReferenceIdentity, ReferenceMemberType, ReferenceRoot,
-    ReferenceTransform, Region, RegionDriver, RegionRef, RegionReplayMappings, ReplayRegionDriver, Type, TypeError,
-    TypeIdentityPosition, Typed, TypedProgram, Value, ValueDomainDispatch, ValueProjection,
+    OperationProvider, Program, ProgramBuilder, ProgramError, Provenance, ProvenanceScope, ReferenceAccessOperation,
+    ReferenceBoundary, ReferenceIdentity, ReferenceMemberType, ReferenceRoot, ReferenceTransform, Region, RegionDriver,
+    RegionRef, RegionReplayMappings, ReplayRegionDriver, Type, TypeError, TypeIdentityPosition, Typed, TypedProgram,
+    Value, ValueDomainDispatch,
 };
 use crate::tracing::{Tracer, TracerState, TracingContext};
 
@@ -1034,9 +1034,9 @@ impl<C: Context> Pushforward<C, Vec<C::Value>, Vec<C::Value>> {
 /// coefficients needed by tangent work through [`DifferentiationContext::primal_to_tangent`].
 ///
 /// Policies are stateless types, like the structural policies used by the batching transform. When a rule runs through
-/// a projected member context, [`ProjectedDifferentiationPolicy`] preserves the enclosing policy's context creation
-/// and value transfer. Projection therefore changes the value family visible to the rule while retaining the choice
-/// of fused or partitioned computation.
+/// a projected member context, [`ProjectedDifferentiationPolicy`](crate::ProjectedDifferentiationPolicy) preserves
+/// the enclosing policy's context creation and value transfer. Projection therefore changes the value family visible
+/// to the rule while retaining the choice of fused or partitioned computation.
 pub trait DifferentiationPolicy<C: Context>: Copy + Clone + Debug {
     /// Whether the whole primal computation finishes before any tangent work executes. This holds for
     /// [`PartitionedDifferentiationPolicy`], whose tangent program runs only after the primal program has produced
@@ -1248,48 +1248,6 @@ where
                 std::iter::once(primal),
             )?),
         }
-    }
-}
-
-/// Adapts an existing [`DifferentiationPolicy`] `P` to a [`ProjectedContext`] while preserving how it separates
-/// primal and tangent work. This wraps a policy such as [`FusedDifferentiationPolicy`]
-/// or [`PartitionedDifferentiationPolicy`], rather than another choice of how to execute differentiation.
-///
-/// [`DifferentiationContext::project`] preserves existing contexts. When used with [`DifferentiationContext::new`],
-/// the wrapper asks `P` to create a tangent context for the enclosing context, then projects that
-/// context into the member family. If `P` shares the primal context, the projected rule shares its primal context too.
-/// To transfer a value, the wrapper lifts it into the enclosing value family, applies `P`'s transfer, then projects
-/// the result back. For example, an array-only rule inside a heterogeneous context retains partitioned known value
-/// imports even though it sees only array values. All of these calls use static dispatch through `P`.
-#[derive(Copy, Clone, Debug)]
-pub struct ProjectedDifferentiationPolicy<P>(PhantomData<P>);
-
-impl<T: Type, C: ContextProjection<T>, P: DifferentiationPolicy<C>> DifferentiationPolicy<ProjectedContext<C, T>>
-    for ProjectedDifferentiationPolicy<P>
-{
-    const PRIMAL_COMPLETES_BEFORE_TANGENT: bool = P::PRIMAL_COMPLETES_BEFORE_TANGENT;
-
-    #[inline]
-    fn tangent_context(primal: &ProjectedContext<C, T>) -> Option<ProjectedContext<C, T>> {
-        P::tangent_context(primal.parent()).map(ProjectedContext::new)
-    }
-
-    #[inline]
-    fn primal_to_tangent(
-        tangent: &ProjectedContext<C, T>,
-        value: <C::Value as ValueProjection<T>>::Projected,
-    ) -> Result<<C::Value as ValueProjection<T>>::Projected, DifferentiationError> {
-        let value = <C::Value as ValueProjection<T>>::from_projected(value);
-        P::primal_to_tangent(tangent.parent(), value)?.into_projected().map_err(Into::into)
-    }
-
-    #[inline]
-    fn tangent_to_primal(
-        primal: &ProjectedContext<C, T>,
-        value: <C::Value as ValueProjection<T>>::Projected,
-    ) -> Result<<C::Value as ValueProjection<T>>::Projected, DifferentiationError> {
-        let value = <C::Value as ValueProjection<T>>::from_projected(value);
-        P::tangent_to_primal(primal.parent(), value)?.into_projected().map_err(Into::into)
     }
 }
 
@@ -1772,60 +1730,6 @@ pub trait DifferentiableOperation<C: Context>: Operation<Type = C::Type> {
     }
 }
 
-/// Derivative rules for a homogeneous member [`Operation`] whose [`jvp`](DifferentiableOperation::jvp) or
-/// [`jvp_for_transpose`](DifferentiableOperation::jvp_for_transpose) rule must execute in the parent [`Context`]
-/// enclosing its projection. If this operation has member type `T` and the enclosing context has type `U`,
-/// [`jvp_projected_operation`](DifferentiationContext::jvp_projected_operation) converts every input from
-/// the enclosing value type to the member value type, applies the ordinary member rule in
-/// [`ProjectedContext<C, T>`](ProjectedContext), and converts its outputs back. A rule executed that way can work only
-/// with values of member type `T`. This trait instead gives the rule the original values and the projected context's
-/// parent `C` itself, allowing the rule to use values from other members of `U` when constructing the derivative.
-///
-/// This distinction matters whenever the primal operation belongs to one projected member but its linearization must
-/// retain values belonging to another member of the enclosing type universe. Implementing [`DifferentiableOperation`]
-/// directly cannot express that relationship because its [`jvp`](DifferentiableOperation::jvp) function deliberately
-/// requires `Self::Type = C::Type`. This trait preserves that same-universe invariant while making member
-/// differentiation in the parent universe explicit.
-///
-/// Implementations bound the parent context by the projection vocabulary they
-/// actually use (typically [`ValueProjection<T>`](ValueProjection) for values and constants,
-/// [`OperationProjection<T>`](crate::OperationProjection) for the member operation family, and the member and
-/// mixed operations they stage) rather than this trait imposing one fixed vocabulary on every implementation.
-/// Operation-family dispatchers should use this trait only for projected members whose derivative requires
-/// parent-universe values. Members whose inputs, outputs, and derivative all remain within `T` should use
-/// [`jvp_projected_operation`](DifferentiationContext::jvp_projected_operation) and
-/// [`jvp_for_transpose_projected_operation`](DifferentiationContext::jvp_for_transpose_projected_operation)
-/// in their respective named hooks. A parent dispatcher must forward both hooks to preserve member overrides.
-pub trait MemberDifferentiableOperation<C: Context>: Operation<Type: DifferentiableType> {
-    /// Applies this projected member's Jacobian-Vector Product (JVP) rule (i.e., its [`DifferentiableOperation::jvp`])
-    /// in the parent context enclosing the member's projection, using that parent's own values.
-    ///
-    /// # Parameters
-    ///
-    ///   - `context`: Parent [`Context`] through which the rule stages member and mixed operations.
-    ///   - `driver`: Instruction-scoped [`DifferentiationDriver`] that exposes any attached [`Region`]s.
-    ///   - `inputs`: Parent-universe primal/tangent pairs aligned with this operation's inputs.
-    fn jvp_in_parent<D: DifferentiationDriver<C>, P: DifferentiationPolicy<C>>(
-        &self,
-        context: &DifferentiationContext<C, P>,
-        driver: &D,
-        inputs: &[DifferentiationDual<C::Value>],
-    ) -> Result<Vec<DifferentiationDual<C::Value>>, DifferentiationError>;
-
-    /// Applies this projected member's derivative rule for subsequent transposition in the parent context enclosing
-    /// its projection, using that parent's own values. The default delegates to [`Self::jvp_in_parent`]. Overrides
-    /// follow the primal, residual, and transposition contract of [`DifferentiableOperation::jvp_for_transpose`].
-    #[inline]
-    fn jvp_for_transpose_in_parent<D: DifferentiationDriver<C>, P: DifferentiationPolicy<C>>(
-        &self,
-        context: &DifferentiationContext<C, P>,
-        driver: &D,
-        inputs: &[DifferentiationDual<C::Value>],
-    ) -> Result<Vec<DifferentiationDual<C::Value>>, DifferentiationError> {
-        self.jvp_in_parent(context, driver, inputs)
-    }
-}
-
 /// [`DifferentiationDual`] flowing through a forward mode [`DifferentiationContext`]. The function being differentiated
 /// operates on [`DifferentiationTracer`]s directly, so each operation the closure performs (e.g., `x + y`, `x.sin()`,
 /// etc.) dispatches its [`jvp`](DifferentiableOperation::jvp) rule through [`Context::bind`] on the stamped
@@ -1929,37 +1833,6 @@ impl<C: Context, P: DifferentiationPolicy<C>> Value for DifferentiationTracer<C,
     }
 }
 
-impl<C: Context, T: Type, P: DifferentiationPolicy<C>> ValueProjection<T> for DifferentiationTracer<C, P>
-where
-    for<'t> &'t T: TryFrom<&'t C::Type, Error = TypeError>,
-{
-    type Projected = ProjectedValue<T, Self>;
-    type ProjectedRef<'v>
-        = ProjectedValue<T, &'v Self>
-    where
-        Self: 'v,
-        T: 'v;
-
-    #[inline]
-    fn from_projected(value: Self::Projected) -> Self {
-        value.into_value()
-    }
-
-    #[inline]
-    fn projected<'v>(&'v self) -> Result<Self::ProjectedRef<'v>, TypeError>
-    where
-        T: 'v,
-    {
-        Ok(ProjectedValue::new(self, <&T>::try_from(self.r#type().as_ref())?.clone()))
-    }
-
-    #[inline]
-    fn into_projected(self) -> Result<Self::Projected, TypeError> {
-        let r#type = <&T>::try_from(self.r#type().as_ref())?.clone();
-        Ok(ProjectedValue::new(self, r#type))
-    }
-}
-
 /// [`DifferentiationContext`] used to linearize a function in `C`. Its [`PartialEvaluationContext`]s execute primal
 /// work once and retain tangent work for subsequent pushforward calls, preserving specialization of pure known values.
 /// The values flowing through this context are [`LinearizationTracer<C>`].
@@ -2036,7 +1909,15 @@ impl<C: Context, P: DifferentiationPolicy<C>> DifferentiationContext<C, P> {
     #[inline]
     pub fn new(primal: C) -> Self {
         let tangent = P::tangent_context(&primal);
-        Self { primal, tangent, rule: DifferentiationRule::Jvp, policy: PhantomData }
+        Self::from_parts(primal, tangent, DifferentiationRule::Jvp)
+    }
+
+    /// Creates a context from existing primal and optional tangent contexts and the provided `rule`, without invoking
+    /// [`DifferentiationPolicy::tangent_context`]. The supplied contexts must preserve the separation and transfer
+    /// state expected by policy `P`. Projected views use this constructor to retain work already recorded in them.
+    #[inline]
+    pub(super) fn from_parts(primal: C, tangent: Option<C>, rule: DifferentiationRule) -> Self {
+        Self { primal, tangent, rule, policy: PhantomData }
     }
 
     /// Returns this [`DifferentiationContext`] with the provided [`DifferentiationRule`] for subsequent derivative
@@ -2048,8 +1929,7 @@ impl<C: Context, P: DifferentiationPolicy<C>> DifferentiationContext<C, P> {
         self
     }
 
-    /// Returns the [`Context`] that computes primal values and also computes tangent values when using the
-    /// [`FusedDifferentiationPolicy`] (i.e., when [`tangent`](Self::tangent) is [`None`]).
+    /// Returns the [`Context`] that computes primal values and, under [`FusedDifferentiationPolicy`], tangent values.
     #[inline]
     pub fn primal(&self) -> &C {
         &self.primal
@@ -2060,6 +1940,13 @@ impl<C: Context, P: DifferentiationPolicy<C>> DifferentiationContext<C, P> {
     #[inline]
     pub fn tangent(&self) -> &C {
         self.tangent.as_ref().unwrap_or(&self.primal)
+    }
+
+    /// Returns the separate tangent context, or [`None`] when tangent work shares the primal context.
+    /// Projected views use the optional form to preserve that separation.
+    #[inline]
+    pub(super) fn separate_tangent(&self) -> Option<&C> {
+        self.tangent.as_ref()
     }
 
     /// Returns the [`DifferentiationRule`] selected by this transform and its recursive region driver. A default
@@ -2073,26 +1960,6 @@ impl<C: Context, P: DifferentiationPolicy<C>> DifferentiationContext<C, P> {
     #[inline]
     pub fn rule(&self) -> DifferentiationRule {
         self.rule
-    }
-
-    /// Returns a projected view of this [`DifferentiationContext`] for a member type, preserving its primal/tangent
-    /// separation and value transfer policy. The projected contexts share the existing contexts' state (i.e.,
-    /// projection does not create a new tangent computation or discard values already transferred to it).
-    ///
-    /// When using the [`FusedDifferentiationPolicy`], [`primal`](Self::primal) and [`tangent`](Self::tangent) still
-    /// return the same projected context. When using [`PartitionedDifferentiationPolicy`], rules append to the original
-    /// primal and tangent programs through their projected contexts.
-    pub fn project<T: Type>(&self) -> DifferentiationContext<ProjectedContext<C, T>, ProjectedDifferentiationPolicy<P>>
-    where
-        C: ContextProjection<T>,
-    {
-        // Reuse the existing contexts instead of invoking the policy's tangent context constructor again.
-        DifferentiationContext {
-            primal: ProjectedContext::new(self.primal().clone()),
-            tangent: self.tangent.as_ref().map(|tangent| ProjectedContext::new(tangent.clone())),
-            rule: self.rule,
-            policy: PhantomData,
-        }
     }
 
     /// Transfers the provided primal value to the tangent context without forcing residual materialization.
@@ -4032,207 +3899,6 @@ impl<C: Context<Type: DifferentiableType>> TangentActivity<C> {
     }
 }
 
-// The following functions are the forward mode rules that operation family dispatchers (e.g., the ones generated by
-// `#[derive(Operation)]`) apply to member operations whose rules run through a projected or structural view.
-impl<C: Context, P: DifferentiationPolicy<C>> DifferentiationContext<C, P> {
-    /// Applies a member operation's Jacobian-Vector Product (JVP) rule through a projected view of this heterogeneous
-    /// [`DifferentiationContext`]. Use this function from a family-level operation dispatcher when the operation is
-    /// [`Region`]-free and every input and output belongs to the same projectable member type `T`. It projects primal
-    /// values and live tangent values into the member value family, carries structural-zero tangents as types without
-    /// materializing values, runs the member's existing [`DifferentiableOperation`] rule, and lifts the resulting duals
-    /// back into the heterogeneous value family. This named adapter always selects [`DifferentiableOperation::jvp`],
-    /// including when the context is constructing a reverse derivative. Use
-    /// [`jvp_for_transpose_projected_operation`](Self::jvp_for_transpose_projected_operation) to select the reverse
-    /// rule explicitly.
-    ///
-    /// Operations whose derivative crosses member types or whose rule needs attached regions require an explicit
-    /// family-level Jacobian-Vector Product (JVP) rule instead. A member operation that declares
-    /// [`RegionSlot`](crate::RegionSlot)s is rejected with an exact diagnostic naming it, because projection reaches
-    /// the member rule with no region access: the attached regions are programs in the heterogeneous universe, and no
-    /// projected driver can present them in the member universe.
-    ///
-    /// # Parameters
-    ///
-    ///   - `operation`: Region-free operation expressed in the projected member operation family.
-    ///   - `inputs`: Heterogeneous [`DifferentiationDual`]s corresponding to the operation's inputs.
-    #[inline]
-    pub fn jvp_projected_operation<
-        T: DifferentiableType,
-        O: Operation<Type = T> + DifferentiableOperation<ProjectedContext<C, T>>,
-    >(
-        &self,
-        operation: &O,
-        inputs: &[DifferentiationDual<C::Value>],
-    ) -> Result<Vec<DifferentiationDual<C::Value>>, DifferentiationError>
-    where
-        C: ContextProjection<T, Type: DifferentiableType>,
-    {
-        DifferentiationRule::Jvp.apply_projected(self, operation, inputs)
-    }
-
-    /// Applies a member operation's [`jvp_for_transpose`](DifferentiableOperation::jvp_for_transpose) rule through a
-    /// projected view of this heterogeneous [`DifferentiationContext`]. It has the same projection requirements and
-    /// diagnostics as [`jvp_projected_operation`](Self::jvp_projected_operation), but the resulting tangent computation
-    /// need only support transposition. The named adapter selects the reverse rule even when
-    /// [`DifferentiationContext::rule`] is `Jvp`. It does not change the context's selection
-    /// for recursive differentiation.
-    ///
-    /// # Errors
-    ///
-    /// Returns an error if the operation carries regions, an input cannot be projected into the member family, or the
-    /// selected member rule fails. Callers must retain the resulting tangent computation for transposition rather than
-    /// execute it as a pushforward.
-    #[inline]
-    pub fn jvp_for_transpose_projected_operation<
-        T: DifferentiableType,
-        O: Operation<Type = T> + DifferentiableOperation<ProjectedContext<C, T>>,
-    >(
-        &self,
-        operation: &O,
-        inputs: &[DifferentiationDual<C::Value>],
-    ) -> Result<Vec<DifferentiationDual<C::Value>>, DifferentiationError>
-    where
-        C: ContextProjection<T, Type: DifferentiableType>,
-    {
-        DifferentiationRule::JvpForTranspose.apply_projected(self, operation, inputs)
-    }
-
-    /// Applies the forward mode rule of a structural operation, which stages the operation on the primal inputs and
-    /// pairs every output with a structural zero tangent. Structural operations are bookkeeping (e.g., the first-class
-    /// dimension operations of a heterogeneous operation family), and so they have no derivative to compute.
-    /// `#[derive(Operation)]` uses this function for the `#[ryft(projected(U, structural))]` variants of the
-    /// operation families that it derives.
-    ///
-    /// # Parameters
-    ///
-    ///   - `operation`: Structural operation in the operation family of this context.
-    ///   - `inputs`: [`DifferentiationDual`]s that correspond to the inputs of `operation`.
-    ///
-    /// # Errors
-    ///
-    /// Returns an error if `operation` declares regions, because it is staged again without them,
-    /// or if staging it fails.
-    pub fn jvp_structural_operation(
-        &self,
-        operation: C::Operation,
-        inputs: &[DifferentiationDual<C::Value>],
-    ) -> Result<Vec<DifferentiationDual<C::Value>>, DifferentiationError>
-    where
-        C::Type: DifferentiableType,
-    {
-        validate_region_free_structural_operation(&operation)?;
-        let primal_inputs = inputs.iter().map(|input| input.primal().clone()).collect::<Vec<_>>();
-        self.primal()
-            .bind(operation, Vec::new(), primal_inputs.as_slice())?
-            .into_iter()
-            .map(DifferentiationDual::new_with_zero_tangent)
-            .collect()
-    }
-
-    /// Applies the forward mode rule of a structural operation with a mixed boundary,
-    /// which stages the operation on the primal inputs and pairs every output with a zero tangent. Unlike
-    /// [`jvp_structural_operation`](Self::jvp_structural_operation), this function stages an explicit zero tangent for
-    /// every output that belongs to a computational member universe, over the same primal inputs, so that the runtime
-    /// extents that those inputs carry stay available to the tangent computation (e.g., for a zero-filled array whose
-    /// shape is given by first-class dimension inputs). Outputs that belong to no such universe (e.g., first-class
-    /// dimensions) have a zero differential space and receive structural zero tangents instead. `#[derive(Operation)]`
-    /// uses this function for the `#[ryft(mixed(U, structural))]` variants of the operation families that it derives.
-    ///
-    /// # Parameters
-    ///
-    ///   - `operation`: Structural operation in the operation family of this context.
-    ///   - `inputs`: [`DifferentiationDual`]s that correspond to the inputs of `operation`.
-    ///   - `member_zero_tangent`: Function that receives this context, the primal inputs, and the type of one output,
-    ///     and that returns the zero tangent which it staged for that output, or [`None`] if the output belongs to no
-    ///     computational member universe. It is typically implemented by trying
-    ///     [`stage_member_zero_tangent`](Self::stage_member_zero_tangent) for every computational member universe of
-    ///     the operation family.
-    ///
-    /// # Errors
-    ///
-    /// Returns an error if `operation` declares regions, because it is staged again without them, if its output types
-    /// cannot be inferred, or if staging any primal or tangent operation fails.
-    pub fn jvp_structural_mixed_operation<
-        F: Fn(&Self, &[C::Value], &C::Type) -> Result<Option<C::Value>, DifferentiationError>,
-    >(
-        &self,
-        operation: C::Operation,
-        inputs: &[DifferentiationDual<C::Value>],
-        member_zero_tangent: F,
-    ) -> Result<Vec<DifferentiationDual<C::Value>>, DifferentiationError>
-    where
-        C::Type: DifferentiableType,
-    {
-        validate_region_free_structural_operation(&operation)?;
-        let primal_inputs = inputs.iter().map(|input| input.primal().clone()).collect::<Vec<_>>();
-        let input_types = primal_inputs.iter().map(|input| input.r#type().into_owned()).collect::<Vec<_>>();
-        let output_types = operation.infer_output_types(input_types.as_slice(), &[])?;
-        let primals = self.primal().bind(operation, Vec::new(), primal_inputs.as_slice())?;
-        check_count!("output", primals, output_types.len(), ProgramError);
-        primals
-            .into_iter()
-            .zip(output_types)
-            .map(|(primal, output_type)| match member_zero_tangent(self, primal_inputs.as_slice(), &output_type)? {
-                Some(tangent) => DifferentiationDual::new(primal, MaybeZero::Value(tangent)),
-                None => DifferentiationDual::new_with_zero_tangent(primal),
-            })
-            .collect()
-    }
-
-    /// Stages a zero tangent for an output of the provided type if that type belongs to member universe `U`, and
-    /// returns [`None`] otherwise. The zero is staged in the tangent context of this context over the tangent views of
-    /// the provided primal inputs, so that it can read the runtime extents that they carry. This is meant to be used as
-    /// part of the `member_zero_tangent` function of
-    /// [`jvp_structural_mixed_operation`](Self::jvp_structural_mixed_operation).
-    ///
-    /// # Parameters
-    ///
-    ///   - `primal_inputs`: Primal inputs of the structural operation whose output tangent is being staged.
-    ///   - `output_type`: Type of the output whose tangent is being staged.
-    ///
-    /// # Errors
-    ///
-    /// Returns an error if the output type has no tangent representation, if the primal inputs cannot be converted to
-    /// tangent values, or if staging the zero fails.
-    pub fn stage_member_zero_tangent<U: DifferentiableType>(
-        &self,
-        primal_inputs: &[C::Value],
-        output_type: &C::Type,
-    ) -> Result<Option<C::Value>, DifferentiationError>
-    where
-        C::Type: DifferentiableType,
-        C::Operation: From<ZeroOperation<U>>,
-        for<'t> &'t U: TryFrom<&'t C::Type, Error = TypeError>,
-    {
-        let Ok(output_type) = <&U>::try_from(output_type) else {
-            return Ok(None);
-        };
-        let tangent_type = output_type.tangent()?;
-        let tangent_inputs = primal_inputs
-            .iter()
-            .map(|value| self.primal_to_tangent(value.clone()))
-            .collect::<Result<Vec<_>, _>>()?;
-        let mut tangents =
-            self.tangent().bind(ZeroOperation::new(tangent_type), Vec::new(), tangent_inputs.as_slice())?;
-        check_count!("output", tangents, 1, ProgramError);
-        Ok(Some(tangents.remove(0)))
-    }
-}
-
-/// Validates that the provided structural operation declares no regions, which
-/// [`DifferentiationContext::jvp_structural_operation`] and [`DifferentiationContext::jvp_structural_mixed_operation`]
-/// require because they stage the operation again without regions. The check runs before anything else, so that
-/// region-carrying operations are reported as such rather than through a downstream inference or region count error.
-fn validate_region_free_structural_operation<O: Operation>(operation: &O) -> Result<(), ProgramError> {
-    if operation.region_slots().is_empty() {
-        Ok(())
-    } else {
-        Err(ProgramError::UnsupportedOperation {
-            message: format!("structural operation `{}` must not declare regions", operation.name()),
-        })
-    }
-}
-
 /// Captures the program atoms needed to materialize a zero of `r#type` and verifies the provider's declaration.
 /// [`ResidualZeroProvider::zero_residual_types`] declares the runtime values required to construct the zero, while
 /// [`ResidualZeroProvider::capture_zero_residuals`] stages the operations that obtain those values from `source`. This
@@ -4461,6 +4127,7 @@ pub(crate) mod tests {
     use crate::batching::{BatchAxis, BatchedProgram, ProgramBatchingOutputAxesPolicy, batch};
     use crate::contexts::{Context, EagerContext};
     use crate::differentiation::differentiate_at;
+    use crate::differentiation::projections::MemberDifferentiableOperation;
     use crate::differentiation::reverse::{
         CotangentDestinationKind, ReverseModeDifferentiate, TransposedProgramCotangent,
     };
@@ -4476,7 +4143,7 @@ pub(crate) mod tests {
     use crate::parameters::{ParameterError, Placeholder};
     use crate::programs::{
         Concretizable, Operation, OperationProvider, ProgramBuilder, ReferenceError, ReferenceType, ReferenceView,
-        RegionId, RegionInterface,
+        RegionId, RegionInterface, ValueProjection,
     };
     use crate::tests::{
         ProjectedMemberOperation, ProjectedMemberType, ProjectedMemberValue, ProjectedProgramOperation,

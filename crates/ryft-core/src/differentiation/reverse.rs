@@ -27,10 +27,10 @@ use crate::programs::references::LocalReferenceLifecycles;
 use crate::programs::transforms::{Transform, TransformArtifact};
 use crate::programs::{
     Atom, AtomId, AttachedRegions, EffectClass, EmptyRegionDriver, Instruction, InstructionId, MaybeZero, Operation,
-    OperationProjection, OperationProvider, Program, ProgramBuilder, ProgramError, Provenance, ReferenceAccessMode,
+    OperationProvider, Program, ProgramBuilder, ProgramError, Provenance, ReferenceAccessMode,
     ReferenceAccessOperation, ReferenceAnalysis, ReferenceBoundary, ReferenceMemberType, ReferenceRoot,
     ReferenceTransform, ReferenceType, Region, RegionDriver, RegionRef, RegionReplayMappings, ReplayRegionDriver, Type,
-    TypeError, TypeIdentityPosition, Typed, Value, ValueId, ValueProjection,
+    TypeError, Typed, Value, ValueId,
 };
 use crate::tracing::{Tracer, TracingContext};
 
@@ -1122,6 +1122,19 @@ where
         Ok(match self.reference_accumulators.remove(&root) {
             Some(CotangentReferenceAccumulator::Allocated { reference }) => Some(reference),
             Some(CotangentReferenceAccumulator::Unallocated { .. }) | None => None,
+        })
+    }
+
+    /// Returns the running sum of the value contributions that `accumulator` has received, together with their combined
+    /// provenance, or [`None`] if it has received none or adds its contributions into a caller-supplied buffer. Returns
+    /// an error if `accumulator` belongs to another [`TranspositionContext`].
+    pub(super) fn accumulated_value(
+        &self,
+        accumulator: &CotangentAccumulator,
+    ) -> Result<Option<(&Tracer<TracingContext<V, O>>, &Provenance)>, DifferentiationError> {
+        Ok(match self.cotangent_storage(accumulator)? {
+            CotangentStorage::Value { value: Some((value, provenance)), .. } => Some((value, provenance)),
+            CotangentStorage::Value { value: None, .. } | CotangentStorage::Buffer { .. } => None,
         })
     }
 
@@ -2673,56 +2686,6 @@ where
     ///     Known, ignored, and reference-state inputs have unneeded handles. Contributions must have the input's
     ///     cotangent type and belong to this context's builder, including when the handle is unneeded.
     fn transpose<D: TranspositionDriver<V, O>>(
-        &self,
-        context: &mut TranspositionContext<V, O>,
-        driver: &D,
-        inputs: &[PartialValue<Tracer<TracingContext<V, O>>>],
-        outputs: &[MaybeZero<Tracer<TracingContext<V, O>>>],
-        accumulators: &[CotangentAccumulator],
-    ) -> Result<(), DifferentiationError>;
-}
-
-/// Transpose rule for a member operation that runs in its enclosing operation family's [`TranspositionContext`].
-/// Unlike [`TransposableOperation`], this trait permits the operation's [`Type`] to differ from the context's type.
-/// For example, an array slice operates on arrays, but its parent context may also represent references. Its member
-/// rule can then add a cotangent into a reference slice without trying to project that reference into the array family.
-///
-/// This is the reverse mode counterpart of [`MemberDifferentiableOperation`](crate::MemberDifferentiableOperation).
-/// Generated operation family dispatchers call it for computational projected members. A member family delegates to
-/// its individual operations when they need parent family capabilities, and can use
-/// [`transpose_projected_operation`](TranspositionContext::transpose_projected_operation) for region-free rules that
-/// remain within the member family. Implementations specify the projection and operation capabilities they need; this
-/// trait does not require every enclosing family to support references.
-///
-/// Accumulators remain owned by the enclosing context. The contribution, ownership, and deterministic staging
-/// requirements of [`TransposableOperation::transpose`] apply unchanged, including when a rule delegates to projection.
-pub trait MemberTransposableOperation<V: Value, O: Operation<Type = V::Type>>:
-    Operation<Type: DifferentiableType>
-where
-    TracingContext<V, O>: StagingContext<Type = V::Type, Constant = V, Operation = O>,
-{
-    /// Applies this member's transpose rule using the enclosing family's values and cotangent accumulators.
-    ///
-    /// # Parameters
-    ///
-    ///   - `context`: Active [`TranspositionContext`] for the enclosing operation family, which dereferences to the
-    ///     [`TracingContext`] in which rules stage additional linear operations. Reference-state rules access the
-    ///     instruction's reference inputs through this context; their state updates do not use the `accumulators`
-    ///     handles.
-    ///   - `driver`: Call-scoped nested-region [`TranspositionDriver`] for the current instruction, exposing attached
-    ///     regions in the enclosing operation family.
-    ///   - `inputs`: Per-input [`PartialValue`] knowledge, in operation input order, expressed using the enclosing
-    ///     family's types and tracers. As in [`TransposableOperation::transpose`], a [`PartialValue::Unknown`] entry
-    ///     marks a linear input that receives a cotangent contribution, while a [`Known`](PartialValue::Known) entry
-    ///     supplies a runtime value in the pullback and receives no contribution. Each input's [`Type`] is available
-    ///     either way through the [`Typed`] trait.
-    ///   - `outputs`: Symbolic cotangents for the instruction's outputs, in operation output order, expressed using
-    ///     the enclosing family's tracers. A reference-typed output never carries a live cotangent (its state cotangent
-    ///     lives in the accumulator of the root it forwards) and always arrives as a structural zero.
-    ///   - `accumulators`: [`CotangentAccumulator`]s, one per input in operation input order, owned by `context`.
-    ///     Known, ignored, and reference-state inputs have unneeded handles. Contributions must have the input's
-    ///     cotangent type and belong to this context's builder, including when the handle is unneeded.
-    fn transpose_in_parent<D: TranspositionDriver<V, O>>(
         &self,
         context: &mut TranspositionContext<V, O>,
         driver: &D,
@@ -4385,239 +4348,6 @@ where
     Ok(((output, auxiliary), gradient))
 }
 
-// The following functions are the transposition rules that operation family dispatchers (e.g., the ones generated by
-// `#[derive(Operation)]`) apply to member operations whose rules run through a projected view.
-impl<V: Value, O: Operation<Type = V::Type>> TranspositionContext<V, O>
-where
-    TracingContext<V, O>: StagingContext<Type = V::Type, Constant = V, Operation = O>,
-{
-    /// Applies a member operation's transpose rule through a projected view of this heterogeneous
-    /// [`TranspositionContext`]. Use this function from a family-level operation dispatcher when the linear operation
-    /// is [`Region`]-free and every input and output belongs to the same projectable member type `T`. Because
-    /// [`TransposableOperation`] rules stage through a member-typed [`TracingContext`], this function records the rule
-    /// in a short-lived member program, converts that program to the heterogeneous type, and splices it into the active
-    /// trace. Known primal inputs and live output cotangents become splice inputs in encounter order; structural zeros
-    /// remain types and do not materialize values. The member rule receives the enclosing handles' cotangent mask but
-    /// accumulates values locally, because its type family may not represent reference buffers. Each resulting
-    /// contribution is lifted and submitted to the corresponding enclosing handle. Family-level rules that can update
-    /// reference views directly should bypass this dense fallback.
-    ///
-    /// Operations whose transpose crosses member types or whose rule needs attached regions require an explicit
-    /// family-level transpose rule instead. A member operation that declares [`RegionSlot`](crate::RegionSlot)s is
-    /// rejected with an exact diagnostic naming it, because projection reaches the member rule with no region access:
-    /// the attached regions are programs in the _heterogeneous_ universe, and no projected driver can present them in
-    /// the member universe.
-    ///
-    /// # Parameters
-    ///
-    ///   - `operation`: Region-free linear operation expressed in the projected member operation family.
-    ///   - `inputs`: Per-input primal knowledge, preserving whether each primal is known or is a linear unknown.
-    ///   - `outputs`: Heterogeneous output cotangents, represented as live traced values or structural zeros.
-    ///   - `accumulators`: Enclosing value cotangent handles, aligned with `inputs` and owned by this context.
-    pub fn transpose_projected_operation<T: DifferentiableType, P: Operation<Type = T>>(
-        &mut self,
-        operation: &P,
-        inputs: &[PartialValue<Tracer<TracingContext<V, O>>>],
-        outputs: &[MaybeZero<Tracer<TracingContext<V, O>>>],
-        accumulators: &[CotangentAccumulator],
-    ) -> Result<(), DifferentiationError>
-    where
-        V: ValueProjection<T, Projected: Value<Type = T>>,
-        V::Type: DifferentiableType + From<T>,
-        P: TransposableOperation<<V as ValueProjection<T>>::Projected, P>,
-        O: OperationProjection<T, Projected = P> + OperationProvider<V::Type, AddOperation<V::Type>, Operation = O>,
-        for<'t> &'t T: TryFrom<&'t V::Type, Error = TypeError>,
-        TracingContext<<V as ValueProjection<T>>::Projected, P>:
-            StagingContext<Type = T, Constant = <V as ValueProjection<T>>::Projected, Operation = P>,
-    {
-        if !operation.region_slots().is_empty() {
-            return Err(ProgramError::UnsupportedOperation {
-                message: format!(
-                    "projected operation `{}` carries regions and cannot be transposed through its member family; \
-                     transpose it through a family-level carrier for that operation instead",
-                    operation.name(),
-                ),
-            }
-            .into());
-        }
-
-        check_count!("accumulator", accumulators, inputs.len(), DifferentiationError);
-        accumulators.iter().try_for_each(|accumulator| self.cotangent_storage(accumulator).map(|_| ()))?;
-
-        // Stage the native member rule in an isolated member-typed trace. The completed rule program is converted back
-        // to the heterogeneous type before it is attached to this context, so primitive transpose rules never need
-        // heterogeneous types. The trace is detached from any region, so the member rule cannot reach reference
-        // accumulators, which is what this helper's region-free, reference-free contract requires.
-        let mut rule_context =
-            TranspositionContext::<<V as ValueProjection<T>>::Projected, P>::new(TracingContext::new());
-
-        // Build the member rule's boundary and the matching source atoms together. Unknown primals contribute only
-        // their projected types. Known primals become leading member-program inputs and their heterogeneous atoms
-        // become the leading splice inputs, preserving the transposition rule's input order. Validate builder ownership
-        // before taking atom IDs: the same index in another trace names an unrelated value.
-        let mut splice_inputs = Vec::new();
-        let rule_inputs = inputs
-            .iter()
-            .map(|input| -> Result<_, DifferentiationError> {
-                match input {
-                    PartialValue::Unknown(r#type) => Ok(PartialValue::Unknown(<&T>::try_from(r#type)?.clone())),
-                    PartialValue::Known(value) => {
-                        check_builders!(self.builder(), value.builder())?;
-                        splice_inputs.push(value.atom_id()?);
-                        Ok(PartialValue::Known(rule_context.input(<&T>::try_from(value.r#type().as_ref())?.clone())))
-                    }
-                }
-            })
-            .collect::<Result<Vec<_>, _>>()?;
-
-        // Live output cotangents follow known primals in both boundaries. Structural zeros remain type-only and
-        // therefore consume neither a member-program input nor a heterogeneous splice input.
-        let rule_outputs = outputs
-            .iter()
-            .map(|output| -> Result<_, DifferentiationError> {
-                match output {
-                    MaybeZero::Zero(r#type) => Ok(MaybeZero::Zero(<&T>::try_from(r#type)?.clone())),
-                    MaybeZero::Value(value) => {
-                        check_builders!(self.builder(), value.builder())?;
-                        splice_inputs.push(value.atom_id()?);
-                        Ok(MaybeZero::Value(rule_context.input(<&T>::try_from(value.r#type().as_ref())?.clone())))
-                    }
-                }
-            })
-            .collect::<Result<Vec<_>, _>>()?;
-
-        // Apply the native transpose rule to the member boundary. Any operations synthesized by the rule are recorded
-        // in `rule_context`. `EmptyRegionDriver` enforces this helper's region-free contract.
-        let cotangent_mask = accumulators.iter().map(CotangentAccumulator::is_needed).collect::<Vec<_>>();
-        let rule_accumulators = rule_context.cotangent_accumulators(&rule_inputs, &cotangent_mask)?;
-        (*rule_context).clone().invoke_with_provenance_origin(self.provenance(), || {
-            operation.transpose(&mut rule_context, &EmptyRegionDriver, &rule_inputs, &rule_outputs, &rule_accumulators)
-        })?;
-
-        // Export each accumulated member cotangent. Its additions are part of the member program, while reference
-        // updates remain the responsibility of the enclosing self.
-        let (contribution_inputs, output_ids): (Vec<_>, Vec<_>) = rule_accumulators
-            .iter()
-            .enumerate()
-            .filter_map(|(index, accumulator)| match &rule_context.cotangent_storage[accumulator.storage_index] {
-                CotangentStorage::Value { value: Some((value, provenance)), .. } => Some((index, value, provenance)),
-                _ => None,
-            })
-            .map(|(index, value, provenance)| Ok(((index, provenance.clone()), value.atom_id()?)))
-            .collect::<Result<_, DifferentiationError>>()?;
-
-        // Convert the complete member program into the heterogeneous universe, then splice it with the source atoms
-        // collected in precisely the same order as the temporary member-program inputs.
-        let rule_program = rule_context
-            .builder()
-            .borrow()
-            .clone()
-            .build::<Vec<<V as ValueProjection<T>>::Projected>, Vec<<V as ValueProjection<T>>::Projected>>(
-                output_ids,
-                vec![Placeholder; splice_inputs.len()],
-                vec![Placeholder; contribution_inputs.len()],
-            )?
-            .into_unprojected::<V, O>()?;
-        let splice_outputs = self.builder().borrow_mut().splice_program(&rule_program, splice_inputs.as_slice())?;
-        check_count!("output", splice_outputs, contribution_inputs.len(), ProgramError);
-        contribution_inputs.into_iter().zip(splice_outputs).try_for_each(|((input, provenance), output)| {
-            // Preserve scopes entered inside the member rule when outer storage later combines its contributions.
-            let contribution = MaybeZero::Value(self.tracer(output, None));
-            (**self)
-                .clone()
-                .invoke_with_provenance_origin(provenance, || accumulators[input].accumulate(self, contribution))
-        })
-    }
-
-    /// Applies a member operation's transpose rule to an instruction whose parent boundary is _mixed_, meaning that the
-    /// instruction consumes its `T`-typed member inputs together with inputs belonging to other members of the parent
-    /// type universe (e.g., the first-class dimensions that supply a dynamic result shape), in any arrangement. Use
-    /// this function from a family-level operation dispatcher for a [`Region`]-free payload that keeps its native
-    /// member operation type while its instruction crosses member kinds.
-    ///
-    /// Each instruction input is classified individually rather than by position. An input whose type projects into `T`
-    /// is a _data_ input and every other input is a parent-universe shape input. The data inputs, in input order, are
-    /// delegated to the payload's homogeneous [`TransposableOperation`] rule through
-    /// [`transpose_projected_operation`](Self::transpose_projected_operation), together with their corresponding
-    /// accumulator handles. Shape inputs only select the result shape and carry no differential contribution, so they
-    /// receive no contribution. This classification makes the helper independent of how the two input kinds are
-    /// arranged, so it handles interleaved signatures exactly like the "data-inputs-first" arrangement every current
-    /// payload uses. A payload with no data inputs at all (i.e., a dynamic constructor whose inputs are all extents) is
-    /// a constant linear map, so no member rule runs.
-    ///
-    /// Delegating reconstructs the member instruction from type metadata alone, so a mixed instruction whose inputs
-    /// carry runtime (i.e., [`Reference`](TypeIdentityPosition::Reference)-position) identities is rejected. Recovering
-    /// that runtime-dependent type metadata requires linearization, which retains the relevant primal information as
-    /// explicit residuals.
-    ///
-    /// # Parameters
-    ///
-    ///   - `operation`: Region-free linear member operation whose instruction has a mixed parent boundary. Its
-    ///     homogeneous rule sees exactly the data inputs, in the order they appear in the mixed instruction.
-    ///   - `inputs`: Per-input primal knowledge in the mixed instruction's input order.
-    ///   - `outputs`: Heterogeneous output cotangents, represented as live traced values or structural zeros.
-    ///   - `accumulators`: Enclosing value cotangent handles, aligned with `inputs` and owned by this context.
-    pub fn transpose_mixed_operation<T: DifferentiableType, P: Operation<Type = T>>(
-        &mut self,
-        operation: &P,
-        inputs: &[PartialValue<Tracer<TracingContext<V, O>>>],
-        outputs: &[MaybeZero<Tracer<TracingContext<V, O>>>],
-        accumulators: &[CotangentAccumulator],
-    ) -> Result<(), DifferentiationError>
-    where
-        V: ValueProjection<T, Projected: Value<Type = T>>,
-        V::Type: DifferentiableType + From<T>,
-        O: OperationProjection<T> + OperationProvider<V::Type, AddOperation<V::Type>, Operation = O>,
-        <O as OperationProjection<T>>::Projected: From<P>
-            + TransposableOperation<<V as ValueProjection<T>>::Projected, <O as OperationProjection<T>>::Projected>,
-        for<'t> &'t T: TryFrom<&'t V::Type, Error = TypeError>,
-        TracingContext<<V as ValueProjection<T>>::Projected, <O as OperationProjection<T>>::Projected>: StagingContext<
-                Type = T,
-                Constant = <V as ValueProjection<T>>::Projected,
-                Operation = <O as OperationProjection<T>>::Projected,
-            >,
-    {
-        check_count!("accumulator", accumulators, inputs.len(), DifferentiationError);
-        accumulators.iter().try_for_each(|accumulator| self.cotangent_storage(accumulator).map(|_| ()))?;
-
-        // Classify each input by whether its type projects into the member universe. Data inputs keep their input order
-        // so the delegated member rule sees the same boundary it would see in a homogeneous instruction. Filter handles
-        // alongside inputs to preserve the association between each input and its enclosing storage.
-        let (data_inputs, data_accumulators): (Vec<_>, Vec<_>) = inputs
-            .iter()
-            .zip(accumulators)
-            .filter(|(input, _)| <&T>::try_from(input.r#type().as_ref()).is_ok())
-            .map(|(input, accumulator)| (input.clone(), accumulator.clone()))
-            .unzip();
-
-        // A mixed instruction with no member-typed inputs stages a value that does not depend on any of them, so every
-        // input receives a structural zero and the member rule is never consulted.
-        if data_inputs.is_empty() {
-            return Ok(());
-        }
-
-        // The delegated member rule sees only the member-typed inputs, so it must be able to derive every cotangent
-        // shape from those inputs alone. A runtime identity anywhere in the mixed signature means the runtime shape
-        // information lives in the parent-universe inputs instead, and only linearization can retain it.
-        if inputs
-            .iter()
-            .any(|input| input.r#type().identities().any(|(position, _)| position == TypeIdentityPosition::Reference))
-        {
-            return Err(ProgramError::UnsupportedOperation {
-                message: format!(
-                    "direct `{}` transposition with runtime-dependent type metadata requires linearization so that the \
-                     relevant primal information can be retained as residuals",
-                    operation.name(),
-                ),
-            }
-            .into());
-        }
-
-        let member_operation: <O as OperationProjection<T>>::Projected = operation.clone().into();
-        self.transpose_projected_operation(&member_operation, &data_inputs, outputs, &data_accumulators)
-    }
-}
-
 /// [`Region`] [`Transform`] marker for retained transposed [`Program`]s.
 struct TranspositionTransform;
 
@@ -4826,8 +4556,8 @@ pub(crate) mod tests {
     use crate::contexts::{EagerContext, ProjectedContext, StagingContext};
     use crate::differentiation::forward::{
         DifferentiationContext, DifferentiationDriver, DifferentiationDual, DifferentiationPolicy, LinearizationTracer,
-        MemberDifferentiableOperation,
     };
+    use crate::differentiation::projections::{MemberDifferentiableOperation, MemberTransposableOperation};
     use crate::differentiation::{Differentiate, differentiate_at};
     use crate::macros::{check_count, check_types, impl_guardless_operation};
     use crate::operations::{
@@ -4845,7 +4575,7 @@ pub(crate) mod tests {
     use crate::programs::{
         AtomId, Concretizable, EffectClass, EffectClasses, Effects, MaybeZero, NoReferenceTransform, NoReferent,
         Operation, Program, ProgramBuilder, ProgramError, ProvenanceScope, ReferenceAccessDescriptor, ReferenceError,
-        ReferenceType, RegionInterface, RegionSlot, TypeError, Typed, TypedProgram, Value,
+        ReferenceType, RegionInterface, RegionSlot, TypeError, Typed, TypedProgram, Value, ValueProjection,
     };
     use crate::specialization::SpecializationCacheStatistics;
     use crate::tests::{
