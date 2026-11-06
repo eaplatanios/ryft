@@ -156,8 +156,6 @@ pub struct ParallelBroadcastOperation {
     mesh: Option<LogicalMesh>,
 }
 
-// TODO(eaplatanios): Review from here onwards.
-
 impl ParallelBroadcastOperation {
     /// Creates a new [`ParallelBroadcastOperation`] over the axis with the provided name and resolved axis size.
     /// Construction preserves the supplied source, while type inference validates it.
@@ -184,9 +182,9 @@ impl ParallelBroadcastOperation {
         }
     }
 
-    /// Returns this [`ParallelBroadcastOperation`] configured to broadcast over manual axes of `mesh`. The input must
-    /// vary over [`axes`](Self::axes) on that mesh, whose size must equal [`axis_size`](Self::axis_size). Type
-    /// inference validates these requirements. [`ParallelBroadcast::parallel_broadcast`] supplies the mesh
+    /// Returns this [`ParallelBroadcastOperation`] configured to broadcast over manual axes of `mesh`. The input
+    /// must vary over [`axes`](Self::axes) on that mesh, whose size must equal [`axis_size`](Self::axis_size).
+    /// Type inference validates these requirements. [`ParallelBroadcast::parallel_broadcast`] supplies the mesh
     /// automatically from the enclosing manual region.
     #[inline]
     pub fn with_mesh(mut self, mesh: LogicalMesh) -> Self {
@@ -251,6 +249,7 @@ impl Operation for ParallelBroadcastOperation {
                 "`{PARALLEL_BROADCAST_OPERATION_NAME}` axis size must be greater than zero"
             )));
         }
+
         let expected_input_count = if self.source == ParallelBroadcastSource::Dynamic { 2 } else { 1 };
         check_count!("input", input_types, expected_input_count, TypeError);
         let input_type = &input_types[0];
@@ -302,16 +301,19 @@ impl Operation for ParallelBroadcastOperation {
                     "`{PARALLEL_BROADCAST_OPERATION_NAME}` runtime source must be a `u64` scalar but got `{source}`",
                 )));
             }
+
             if !source.unreduced_axes().is_empty() || !source.reduced_axes().is_empty() {
                 return Err(TypeError::invalid(format!(
                     "`{PARALLEL_BROADCAST_OPERATION_NAME}` runtime source must not carry reduction state",
                 )));
             }
+
             if source.memory() != input_type.memory() {
                 return Err(TypeError::invalid(format!(
                     "`{PARALLEL_BROADCAST_OPERATION_NAME}` runtime source must use the data's memory",
                 )));
             }
+
             // Source-dependent selection cannot introduce variation beyond the result's declared variation.
             if source.sharding().is_some_and(|source| {
                 source
@@ -324,6 +326,7 @@ impl Operation for ParallelBroadcastOperation {
                      the data's variation",
                 )));
             }
+
             if let (Some(data), Some(source)) = (input_type.sharding(), source.sharding())
                 && data.mesh() != source.mesh()
             {
@@ -332,9 +335,11 @@ impl Operation for ParallelBroadcastOperation {
                 )));
             }
         }
+
         Ok(vec![input_type.clone()])
     }
 
+    #[inline]
     fn effects(&self) -> Cow<'_, Effects> {
         if self.requires_source_validation {
             Cow::Owned(Effects::explicit(EffectClasses::single(EffectClass::OrderedAssertion)))
@@ -377,6 +382,7 @@ impl LinearCollectiveOperation for ParallelBroadcastOperation {
         self.mesh.as_ref()
     }
 
+    #[inline]
     fn adjoint(&self, _input_type: &ArrayType) -> Result<ParallelBroadcastOperation, ProgramError> {
         // The transpose hands the sum of every participant's cotangent to the source, which is a composition of
         // collectives rather than one adjoint collective, so the `TransposableOperation` implementation stages it
@@ -489,12 +495,12 @@ where
                 if batch_size != self.axis_size {
                     return Err(BatchingError::UnsupportedOperation {
                         message: format!(
-                            "`{PARALLEL_BROADCAST_OPERATION_NAME}` over axis `{}` resolved axis size {} but \
-                             the mapped batch axis has size {batch_size}",
-                            self.axes, self.axis_size,
+                            "`{}` over axis `{}` resolved axis size {} but the mapped batch axis has size {}",
+                            PARALLEL_BROADCAST_OPERATION_NAME, self.axes, self.axis_size, batch_size,
                         ),
                     });
                 }
+
                 // This level owns the participants. Reduce a mapped root over its physical batch dimension,
                 // checking agreement before replacing the participant dimension by a replicated selected item.
                 let minimum = if let Some(axis) = source.batch_axis_position() {
@@ -502,6 +508,7 @@ where
                 } else {
                     source.value().clone()
                 };
+
                 let maximum = if self.requires_source_validation
                     && let Some(axis) = source.batch_axis_position()
                 {
@@ -509,12 +516,15 @@ where
                 } else {
                     minimum.clone()
                 };
+
                 if self.requires_source_validation {
                     validate_runtime_broadcast_source(context.parent(), &minimum, &maximum, &minimum, self.axis_size)?;
                 }
+
                 let Some(axis) = data.batch_axis_position() else {
                     return Ok(vec![data.clone()]);
                 };
+
                 let mut gathered = data.value().move_axis(axis, 0)?;
                 if let Some(sharding) = gathered.r#type().sharding().cloned()
                     && sharding.dimensions()[0] != ShardingDimension::Replicated
@@ -525,6 +535,7 @@ where
                     dimensions[0] = ShardingDimension::Replicated;
                     gathered = gathered.reshard(&sharding.with_dimensions(dimensions).map_err(TypeError::from)?)?;
                 }
+
                 let mut selected =
                     select_runtime_broadcast_source(context.parent(), &gathered, &minimum, self.axis_size, None)?;
                 let output_type = data.unbatched_type();
@@ -533,6 +544,7 @@ where
                 }
                 return Ok(vec![ArrayBatch::replicated(selected)]);
             }
+
             if source.batch_axis_position().is_none() {
                 // An unrelated mapped data dimension is simply part of each participant's payload. A replicated
                 // scalar root stays scalar, so the same operation can run in the parent without changing its arity.
@@ -541,6 +553,7 @@ where
                 check_count!("output", outputs, 1, ProgramError);
                 return Ok(vec![ArrayBatch::new(outputs.remove(0), data.batch_axis())?]);
             }
+
             // A root mapped over an unrelated axis selects independently in each group. Canonicalize that batch
             // dimension to the front and interpret the vector of scalar roots over parent-owned packed arrays.
             let data = P::match_axis(context, data, 0.into())?;
@@ -593,6 +606,8 @@ where
         Ok(vec![ArrayBatch::new(broadcast, BatchAxis::from_position(batch_axis))?])
     }
 }
+
+// TODO(eaplatanios): Review from here onwards.
 
 impl<C: Context<Type = ArrayType, Operation: From<ParallelBroadcastOperation>>> DifferentiableOperation<C>
     for ParallelBroadcastOperation
