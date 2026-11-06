@@ -659,16 +659,17 @@ mod tests {
         assert_eq!(
             program.to_string(),
             indoc! {"
-                lambda %0:f32[4, 2][sharding={mesh<['x'=2:explicit, 'y'=2:explicit]>, [{'x'}, {'y'}]}] .
-                let %1:f32[4, 2][sharding={mesh<['x'=2:auto, 'y'=2:explicit]>, [{}, {'y'}]}] = reshard \
-                        [sharding={mesh<['x'=2:auto, 'y'=2:explicit]>, [{}, {'y'}]}] %0
-                    %2:f32[4, 2][sharding={mesh<['x'=2:auto, 'y'=2:explicit]>, [{}, {'y'}]}] = sin %1
-                    %3:f32[4, 2][sharding={mesh<['x'=2:auto, 'y'=2:explicit]>, [{}, {'y'}]}] = add %2 %2
-                    %4:f32[4][sharding={mesh<['x'=2:auto, 'y'=2:explicit]>, [{}]}] = reduce [kind=sum, axes=[1]] %3
-                    %5:f32[4][sharding={mesh<['x'=2:explicit, 'y'=2:explicit]>, [{'x'}]}] = reshard \
-                        [sharding={mesh<['x'=2:explicit, 'y'=2:explicit]>, [{'x'}]}] %4
-                in (%5)
-            "}
+                        lambda %0:f32[4, 2][sharding={mesh<['x'=2:explicit, 'y'=2:explicit]>, [{'x'}, {'y'}]}] .
+                        let %1:f32[4, 2][sharding={mesh<['x'=2:auto, 'y'=2:explicit]>, [{}, {'y'}]}] = \
+                                reshard [sharding={mesh<['x'=2:auto, 'y'=2:explicit]>, [{}, {'y'}]}] %0
+                            %2:f32[4, 2][sharding={mesh<['x'=2:auto, 'y'=2:explicit]>, [{}, {'y'}]}] = sin %1
+                            %3:f32[4, 2][sharding={mesh<['x'=2:auto, 'y'=2:explicit]>, [{}, {'y'}]}] = add %2 %2
+                            %4:f32[4][sharding={mesh<['x'=2:auto, 'y'=2:explicit]>, [{}]}] = \
+                                reduce [kind=sum, axes=[1]] %3
+                            %5:f32[4][sharding={mesh<['x'=2:explicit, 'y'=2:explicit]>, [{'x'}]}] = \
+                                reshard [sharding={mesh<['x'=2:explicit, 'y'=2:explicit]>, [{'x'}]}] %4
+                        in (%5)
+                    "}
             .trim_end(),
         );
 
@@ -713,14 +714,14 @@ mod tests {
         assert_eq!(
             program.to_string(),
             indoc! {"
-                lambda %0:f32[4, 2][sharding={mesh<['x'=2:explicit, 'y'=2:explicit]>, [{'x'}, {'y'}]}] .
-                let %1:f32[4, 2][sharding={mesh<['x'=2:auto, 'y'=2:auto]>, [{}, {}]}] = reshard \
-                        [sharding={mesh<['x'=2:auto, 'y'=2:auto]>, [{}, {}]}] %0
-                    %2:f32[4, 2][sharding={mesh<['x'=2:auto, 'y'=2:auto]>, [{}, {}]}] = add %1 %1
-                    %3:f32[4, 2][sharding={mesh<['x'=2:explicit, 'y'=2:explicit]>, [{'y'}, {'x'}]}] = reshard \
-                        [sharding={mesh<['x'=2:explicit, 'y'=2:explicit]>, [{'y'}, {'x'}]}] %2
-                in (%3)
-            "}
+                        lambda %0:f32[4, 2][sharding={mesh<['x'=2:explicit, 'y'=2:explicit]>, [{'x'}, {'y'}]}] .
+                        let %1:f32[4, 2][sharding={mesh<['x'=2:auto, 'y'=2:auto]>, [{}, {}]}] = \
+                                reshard [sharding={mesh<['x'=2:auto, 'y'=2:auto]>, [{}, {}]}] %0
+                            %2:f32[4, 2][sharding={mesh<['x'=2:auto, 'y'=2:auto]>, [{}, {}]}] = add %1 %1
+                            %3:f32[4, 2][sharding={mesh<['x'=2:explicit, 'y'=2:explicit]>, [{'y'}, {'x'}]}] = \
+                                reshard [sharding={mesh<['x'=2:explicit, 'y'=2:explicit]>, [{'y'}, {'x'}]}] %2
+                        in (%3)
+                    "}
             .trim_end(),
         );
         assert_eq!(
@@ -1064,6 +1065,33 @@ mod tests {
             ArrayIrType::Array(matrix_type(None)),
         )
         .unwrap();
+        assert_eq!(
+            program.to_string(),
+            indoc! {"
+                lambda %0:f32[4, 2] .
+                let %1:f32[2, 2][sharding={mesh<['x'=2:manual, 'y'=2:explicit]>, [{}, {'y'}]}] = shard_map [
+                    mesh=['x'=2:manual, 'y'=2:explicit],
+                    input_shardings=[{mesh<['x'=2:manual, 'y'=2:explicit]>, [{'x'}, {'y'}]}],
+                    output_shardings=[{mesh<['x'=2:manual, 'y'=2:explicit]>, [{}, {'y'}]}],
+                    manual_axes=['x'],
+                    global_input_types=[f32[4, 2][sharding={mesh<['x'=2:manual, 'y'=2:explicit]>, [{'x'}, {'y'}]}]],
+                    global_output_types=[f32[2, 2][sharding={mesh<['x'=2:manual, 'y'=2:explicit]>, [{}, {'y'}]}]],
+                ] %0 [
+                    body={
+                        lambda %0:f32[2, 2][sharding={mesh<['x'=2:manual, 'y'=2:explicit]>, [{}, {'y'}], \
+                        varying_manual={'x'}}] .
+                        let %1:f32[2, 2][sharding={mesh<['x'=2:manual, 'y'=2:auto]>, [{}, {}], varying_manual={'x'}}] \
+                        = reshard [sharding={mesh<['x'=2:manual, 'y'=2:auto]>, [{}, {}]}] %0
+                            %2:f32[2, 2][sharding={mesh<['x'=2:manual, 'y'=2:auto]>, [{}, {}]}] = parallel_reduce \
+                        [kind=sum, axis_name=\"x\", mesh=['x'=2:manual, 'y'=2:auto]] %1
+                            %3:f32[2, 2][sharding={mesh<['x'=2:manual, 'y'=2:explicit]>, [{}, {'y'}]}] = reshard \
+                        [sharding={mesh<['x'=2:manual, 'y'=2:explicit]>, [{}, {'y'}]}] %2
+                        in (%3)
+                    },
+                ]
+                in (%1)"
+            },
+        );
         let switched_mesh = mesh.with_axis_types(["y"], MeshAxisType::Auto).unwrap();
         assert_eq!(
             reduced_type.into_inner(),
@@ -1119,7 +1147,12 @@ mod tests {
                             Some(&["y"]),
                             local_sharding.clone(),
                         );
-                        assert!(failure.is_err());
+                        assert_eq!(
+                            failure,
+                            Err(AxisTypesError::Program(ProgramError::InvalidArgument {
+                                message: "failure".to_string()
+                            })),
+                        );
                         default_meshes.borrow_mut().push(context.default_mesh());
                         Ok(output)
                     },
@@ -1134,6 +1167,38 @@ mod tests {
             ArrayIrType::Array(matrix_type(None)),
         )
         .unwrap();
+        assert_eq!(
+            program.to_string(),
+            indoc! {"
+                lambda %0:f32[4, 2] .
+                let %1:f32[4, 2][sharding={mesh<['x'=2:manual, 'y'=2:explicit]>, [{'x'}, {'y'}]}] = shard_map [
+                    mesh=['x'=2:manual, 'y'=2:explicit],
+                    input_shardings=[{mesh<['x'=2:manual, 'y'=2:explicit]>, [{'x'}, {'y'}]}],
+                    output_shardings=[{mesh<['x'=2:manual, 'y'=2:explicit]>, [{'x'}, {'y'}]}],
+                    manual_axes=['x'],
+                    global_input_types=[f32[4, 2][sharding={mesh<['x'=2:manual, 'y'=2:explicit]>, [{'x'}, {'y'}]}]],
+                    global_output_types=[f32[4, 2][sharding={mesh<['x'=2:manual, 'y'=2:explicit]>, [{'x'}, {'y'}]}]],
+                ] %0 [
+                    body={
+                        lambda %0:f32[2, 2][sharding={mesh<['x'=2:manual, 'y'=2:explicit]>, [{}, {'y'}], \
+                        varying_manual={'x'}}] .
+                        let %1:f32[2, 2][sharding={mesh<['x'=2:manual, 'y'=2:auto]>, [{}, {}], varying_manual={'x'}}] \
+                        = reshard [sharding={mesh<['x'=2:manual, 'y'=2:auto]>, [{}, {}]}] %0
+                            %2:u64[][sharding={mesh<['x'=2:manual, 'y'=2:auto]>, [], varying_manual={'x'}}] = \
+                        axis_index [axis_name=\"x\", mesh=['x'=2:manual, 'y'=2:auto]]
+                            %3:f32[][sharding={mesh<['x'=2:manual, 'y'=2:auto]>, [], varying_manual={'x'}}] = \
+                        convert_element_type [data_type=f32] %2
+                            %4:f32[2, 2][sharding={mesh<['x'=2:manual, 'y'=2:auto]>, [{}, {}], varying_manual={'x'}}] \
+                        = add %1 %3
+                            %5:f32[2, 2][sharding={mesh<['x'=2:manual, 'y'=2:explicit]>, [{}, {'y'}], \
+                        varying_manual={'x'}}] = reshard [sharding={mesh<['x'=2:manual, 'y'=2:explicit]>, [{}, \
+                        {'y'}]}] %4
+                        in (%5)
+                    },
+                ]
+                in (%1)"
+            },
+        );
         let index_sharding = Sharding::replicated(switched_mesh.clone(), 0).with_varying_manual_axes(["x"]).unwrap();
         assert_eq!(
             index_type.into_inner(),
@@ -1180,11 +1245,98 @@ mod tests {
             ArrayIrType::Array(matrix_type(None)),
         )
         .unwrap();
+        assert_eq!(
+            program.to_string(),
+            indoc! {"
+                lambda %0:f32[4, 2] .
+                let %1:f32[4, 2][sharding={mesh<['x'=2:manual, 'y'=2:explicit]>, [{'x'}, {'y'}]}] = shard_map [
+                    mesh=['x'=2:manual, 'y'=2:explicit],
+                    input_shardings=[{mesh<['x'=2:manual, 'y'=2:explicit]>, [{'x'}, {'y'}]}],
+                    output_shardings=[{mesh<['x'=2:manual, 'y'=2:explicit]>, [{'x'}, {'y'}]}],
+                    manual_axes=['x'],
+                    global_input_types=[f32[4, 2][sharding={mesh<['x'=2:manual, 'y'=2:explicit]>, [{'x'}, {'y'}]}]],
+                    global_output_types=[f32[4, 2][sharding={mesh<['x'=2:manual, 'y'=2:explicit]>, [{'x'}, {'y'}]}]],
+                ] %0 [
+                    body={
+                        lambda %0:f32[2, 2][sharding={mesh<['x'=2:manual, 'y'=2:explicit]>, [{}, {'y'}], \
+                        varying_manual={'x'}}] .
+                        let %1:f32[2, 2][sharding={mesh<['x'=2:manual, 'y'=2:auto]>, [{}, {}], varying_manual={'x'}}] \
+                        = reshard [sharding={mesh<['x'=2:manual, 'y'=2:auto]>, [{}, {}]}] %0
+                            %2:dimension<2> = constant [value=2]
+                            %3:dimension<2> = constant [value=2]
+                            %4:dimension<2> = constant [value=2]
+                            %5:f32[2, 2, 2][sharding={mesh<['x'=2:manual, 'y'=2:auto]>, [{}, {}, {}], \
+                        varying_manual={'x'}}] = parallel_all_gather [
+                                axes=\"x\",
+                                axis_size=2,
+                                concatenation_axis=0,
+                                options=Untiled,
+                                output_variance=Varying,
+                                mesh=['x'=2:manual, 'y'=2:auto],
+                            ] %1 %2 %3 %4
+                            %6:f32[2, 2][sharding={mesh<['x'=2:manual, 'y'=2:auto]>, [{}, {}], varying_manual={'x'}}] \
+                        = reduce [kind=sum, axes=[0]] %5
+                            %7:f32[2, 2][sharding={mesh<['x'=2:manual, 'y'=2:explicit]>, [{}, {'y'}], \
+                        varying_manual={'x'}}] = reshard [sharding={mesh<['x'=2:manual, 'y'=2:explicit]>, [{}, \
+                        {'y'}]}] %6
+                        in (%7)
+                    },
+                ]
+                in (%1)"
+            },
+        );
         let ArrayIrValue::Array(output) = program.interpret(ArrayIrValue::Array(matrix(None))).unwrap() else {
             panic!("expected an array output");
         };
         assert_eq!(output.to_f64s(), vec![4.0, 6.0, 8.0, 10.0, 4.0, 6.0, 8.0, 10.0]);
         let transposed = program.transpose_with_respect_to(&[0], &[CotangentDestinationKind::Return]).unwrap();
+        assert_eq!(
+            transposed.to_string(),
+            indoc! {"
+                lambda %0:f32[4, 2][sharding={mesh<['x'=2:manual, 'y'=2:explicit]>, [{'x'}, {'y'}]}] .
+                let %1:f32[4, 2][sharding={mesh<['x'=2:manual, 'y'=2:explicit]>, [{'x'}, {'y'}]}] = shard_map [
+                    mesh=['x'=2:manual, 'y'=2:explicit],
+                    input_shardings=[{mesh<['x'=2:manual, 'y'=2:explicit]>, [{'x'}, {'y'}]}],
+                    output_shardings=[{mesh<['x'=2:manual, 'y'=2:explicit]>, [{'x'}, {'y'}]}],
+                    manual_axes=['x'],
+                    global_input_types=[f32[4, 2][sharding={mesh<['x'=2:manual, 'y'=2:explicit]>, [{'x'}, {'y'}]}]],
+                    global_output_types=[f32[4, 2][sharding={mesh<['x'=2:manual, 'y'=2:explicit]>, [{'x'}, {'y'}]}]],
+                ] %0 [
+                    body={
+                        lambda %0:f32[2, 2][sharding={mesh<['x'=2:manual, 'y'=2:explicit]>, [{}, {'y'}], \
+                        varying_manual={'x'}}] .
+                        let %1:f32[2, 2][sharding={mesh<['x'=2:manual, 'y'=2:auto]>, [{}, {}], varying_manual={'x'}}] \
+                        = reshard [sharding={mesh<['x'=2:manual, 'y'=2:auto]>, [{}, {}], varying_manual={'x'}}] %0
+                            %2:f32[2, 2, 2][sharding={mesh<['x'=2:manual, 'y'=2:auto]>, [{}, {}, {}], \
+                        varying_manual={'x'}}] = broadcast [
+                                output_type=f32[2, 2, 2][sharding={mesh<['x'=2:manual, 'y'=2:auto]>, [{}, {}, {}], \
+                        varying_manual={'x'}}],
+                                output_axes=[1, 2],
+                            ] %1
+                            %3:dimension<2> = constant [value=2]
+                            %4:dimension<2> = constant [value=2]
+                            %5:dimension<2> = constant [value=2]
+                            %6:f32[2, 2][sharding={mesh<['x'=2:manual, 'y'=2:auto]>, [{}, {}], varying_manual={'x'}}] \
+                        = parallel_sum_scatter [
+                                axes=\"x\",
+                                axis_size=2,
+                                scatter_axis=0,
+                                options=Untiled,
+                                mesh=['x'=2:manual, 'y'=2:auto],
+                            ] %2
+                            %7:f32[2, 2][sharding={mesh<['x'=2:manual, 'y'=2:explicit]>, [{}, {'y'}], \
+                        varying_manual={'x'}}] = reshard [
+                                sharding={mesh<['x'=2:manual, 'y'=2:explicit]>, [{}, {'y'}], varying_manual={'x'}},
+                            ] %6
+                        in (%7)
+                    },
+                ]
+                    %2:f32[4, 2][sharding={mesh<['x'=2:manual, 'y'=2:explicit]>, [{}, {}]}] = reshard \
+                        [sharding={mesh<['x'=2:manual, 'y'=2:explicit]>, [{}, {}]}] %1
+                    %3:f32[4, 2] = broadcast [output_type=f32[4, 2], output_axes=[0, 1]] %2
+                in (%3)"
+            },
+        );
         let cotangent = Array::from_elements(matrix_type(Some(input_sharding)), &[1.0f32; 8]).unwrap();
         let outputs = transposed.interpret(vec![ArrayIrValue::Array(cotangent)]).unwrap();
         let [ArrayIrValue::Array(input_cotangent)] = outputs.as_slice() else {
@@ -1435,14 +1587,14 @@ mod tests {
         assert_eq!(
             program.to_string(),
             indoc! {"
-                lambda %0:f32[4, 2][sharding={mesh<['x'=2:explicit, 'y'=2:explicit]>, [{'x'}, {'y'}]}] .
-                let %1:f32[4, 2][sharding={mesh<['x'=2:explicit, 'y'=2:auto]>, [{'x'}, {}]}] = reshard \
-                        [sharding={mesh<['x'=2:explicit, 'y'=2:auto]>, [{'x'}, {}]}] %0
-                    %2:f32[4, 2][sharding={mesh<['x'=2:explicit, 'y'=2:auto]>, [{'x'}, {}]}] = sin %1
-                    %3:f32[4, 2][sharding={mesh<['x'=2:explicit, 'y'=2:explicit]>, [{'x'}, {'y'}]}] = reshard \
-                        [sharding={mesh<['x'=2:explicit, 'y'=2:explicit]>, [{'x'}, {'y'}]}] %2
-                in (%3)
-            "}
+                        lambda %0:f32[4, 2][sharding={mesh<['x'=2:explicit, 'y'=2:explicit]>, [{'x'}, {'y'}]}] .
+                        let %1:f32[4, 2][sharding={mesh<['x'=2:explicit, 'y'=2:auto]>, [{'x'}, {}]}] = reshard \
+                                [sharding={mesh<['x'=2:explicit, 'y'=2:auto]>, [{'x'}, {}]}] %0
+                            %2:f32[4, 2][sharding={mesh<['x'=2:explicit, 'y'=2:auto]>, [{'x'}, {}]}] = sin %1
+                            %3:f32[4, 2][sharding={mesh<['x'=2:explicit, 'y'=2:explicit]>, [{'x'}, {'y'}]}] = reshard \
+                                [sharding={mesh<['x'=2:explicit, 'y'=2:explicit]>, [{'x'}, {'y'}]}] %2
+                        in (%3)
+                    "}
             .trim_end(),
         );
         assert_close(&program.interpret(matrix(Some(input_sharding.clone()))).unwrap(), &SINE);
@@ -1455,14 +1607,14 @@ mod tests {
         assert_eq!(
             program.to_string(),
             indoc! {"
-                lambda %0:f32[4, 2][sharding={mesh<['x'=2:explicit, 'y'=2:explicit]>, [{'x'}, {'y'}]}] .
-                let %1:f32[4, 2][sharding={mesh<['x'=2:auto, 'y'=2:explicit]>, [{}, {'y'}]}] = reshard \
-                        [sharding={mesh<['x'=2:auto, 'y'=2:explicit]>, [{}, {'y'}]}] %0
-                    %2:f32[4, 2][sharding={mesh<['x'=2:auto, 'y'=2:explicit]>, [{}, {'y'}]}] = sin %1
-                    %3:f32[4, 2][sharding={mesh<['x'=2:explicit, 'y'=2:explicit]>, [{'x'}, {'y'}]}] = reshard \
-                        [sharding={mesh<['x'=2:explicit, 'y'=2:explicit]>, [{'x'}, {'y'}]}] %2
-                in (%3)
-            "}
+                        lambda %0:f32[4, 2][sharding={mesh<['x'=2:explicit, 'y'=2:explicit]>, [{'x'}, {'y'}]}] .
+                        let %1:f32[4, 2][sharding={mesh<['x'=2:auto, 'y'=2:explicit]>, [{}, {'y'}]}] = reshard \
+                                [sharding={mesh<['x'=2:auto, 'y'=2:explicit]>, [{}, {'y'}]}] %0
+                            %2:f32[4, 2][sharding={mesh<['x'=2:auto, 'y'=2:explicit]>, [{}, {'y'}]}] = sin %1
+                            %3:f32[4, 2][sharding={mesh<['x'=2:explicit, 'y'=2:explicit]>, [{'x'}, {'y'}]}] = reshard \
+                                [sharding={mesh<['x'=2:explicit, 'y'=2:explicit]>, [{'x'}, {'y'}]}] %2
+                        in (%3)
+                    "}
             .trim_end(),
         );
         assert_close(&program.interpret(matrix(Some(input_sharding.clone()))).unwrap(), &SINE);
@@ -1490,17 +1642,17 @@ mod tests {
         assert_eq!(
             program.to_string(),
             indoc! {"
-                lambda %0:f32[4, 2][sharding={mesh<['x'=2:auto, 'y'=2:auto]>, [{}, {}]}] .
-                let %1:f32[4, 2][sharding={mesh<['x'=2:explicit, 'y'=2:auto]>, [{'x'}, {}]}] = reshard \
-                        [sharding={mesh<['x'=2:explicit, 'y'=2:auto]>, [{'x'}, {}]}] %0
-                    %2:f32[4, 2][sharding={mesh<['x'=2:explicit, 'y'=2:auto]>, [{'x'}, {}]}] = cos %1
-                    %3:f32[4][sharding={mesh<['x'=2:explicit, 'y'=2:auto]>, [{'x'}]}] = reduce [kind=sum, axes=[1]] %2
-                    %4:f32[4][sharding={mesh<['x'=2:auto, 'y'=2:auto]>, [{}]}] = reshard \
-                        [sharding={mesh<['x'=2:auto, 'y'=2:auto]>, [{}]}] %3
-                in (%4)
-            "}
-            .trim_end(),
-        );
+                        lambda %0:f32[4, 2][sharding={mesh<['x'=2:auto, 'y'=2:auto]>, [{}, {}]}] .
+                        let %1:f32[4, 2][sharding={mesh<['x'=2:explicit, 'y'=2:auto]>, [{'x'}, {}]}] = reshard \
+                                [sharding={mesh<['x'=2:explicit, 'y'=2:auto]>, [{'x'}, {}]}] %0
+                            %2:f32[4, 2][sharding={mesh<['x'=2:explicit, 'y'=2:auto]>, [{'x'}, {}]}] = cos %1
+                            %3:f32[4][sharding={mesh<['x'=2:explicit, 'y'=2:auto]>, [{'x'}]}] = reduce [kind=sum, axes=[1]] %2
+                            %4:f32[4][sharding={mesh<['x'=2:auto, 'y'=2:auto]>, [{}]}] = reshard \
+                                [sharding={mesh<['x'=2:auto, 'y'=2:auto]>, [{}]}] %3
+                        in (%4)
+                    "}
+                    .trim_end(),
+                );
         let output = explicit_axes(
             |input: Array| input.cos()?.reduce_sum(&[1], None),
             matrix(Some(input_sharding.clone())),
@@ -1689,19 +1841,19 @@ mod tests {
         assert_eq!(
             program.to_string(),
             indoc! {"
-                lambda %0:f32[4, 2][sharding={mesh<['x'=2:explicit, 'y'=2:explicit]>, [{'x'}, {'y'}]}] .
-                let %1:f32[4, 2][sharding={mesh<['x'=2:auto, 'y'=2:auto]>, [{}, {}]}] = reshard \
-                        [sharding={mesh<['x'=2:auto, 'y'=2:auto]>, [{}, {}]}] %0
-                    %2:f32[4, 2][sharding={mesh<['x'=2:explicit, 'y'=2:auto]>, [{'x'}, {}]}] = reshard \
-                        [sharding={mesh<['x'=2:explicit, 'y'=2:auto]>, [{'x'}, {}]}] %1
-                    %3:f32[4, 2][sharding={mesh<['x'=2:explicit, 'y'=2:auto]>, [{'x'}, {}]}] = add %2 %2
-                    %4:f32[4, 2][sharding={mesh<['x'=2:auto, 'y'=2:auto]>, [{}, {}]}] = reshard \
-                        [sharding={mesh<['x'=2:auto, 'y'=2:auto]>, [{}, {}]}] %3
-                    %5:f32[4, 2][sharding={mesh<['x'=2:auto, 'y'=2:auto]>, [{}, {}]}] = add %4 %1
-                    %6:f32[4, 2][sharding={mesh<['x'=2:explicit, 'y'=2:explicit]>, [{'x'}, {'y'}]}] = reshard \
-                        [sharding={mesh<['x'=2:explicit, 'y'=2:explicit]>, [{'x'}, {'y'}]}] %5
-                in (%6)
-            "}
+                        lambda %0:f32[4, 2][sharding={mesh<['x'=2:explicit, 'y'=2:explicit]>, [{'x'}, {'y'}]}] .
+                        let %1:f32[4, 2][sharding={mesh<['x'=2:auto, 'y'=2:auto]>, [{}, {}]}] = \
+                                reshard [sharding={mesh<['x'=2:auto, 'y'=2:auto]>, [{}, {}]}] %0
+                            %2:f32[4, 2][sharding={mesh<['x'=2:explicit, 'y'=2:auto]>, [{'x'}, {}]}] = \
+                                reshard [sharding={mesh<['x'=2:explicit, 'y'=2:auto]>, [{'x'}, {}]}] %1
+                            %3:f32[4, 2][sharding={mesh<['x'=2:explicit, 'y'=2:auto]>, [{'x'}, {}]}] = add %2 %2
+                            %4:f32[4, 2][sharding={mesh<['x'=2:auto, 'y'=2:auto]>, [{}, {}]}] = \
+                                reshard [sharding={mesh<['x'=2:auto, 'y'=2:auto]>, [{}, {}]}] %3
+                            %5:f32[4, 2][sharding={mesh<['x'=2:auto, 'y'=2:auto]>, [{}, {}]}] = add %4 %1
+                            %6:f32[4, 2][sharding={mesh<['x'=2:explicit, 'y'=2:explicit]>, [{'x'}, {'y'}]}] = \
+                                reshard [sharding={mesh<['x'=2:explicit, 'y'=2:explicit]>, [{'x'}, {'y'}]}] %5
+                        in (%6)
+                    "}
             .trim_end(),
         );
         assert_eq!(
