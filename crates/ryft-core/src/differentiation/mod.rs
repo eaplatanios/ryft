@@ -2537,17 +2537,88 @@ mod tests {
     use ryft_macros::Parameterized;
 
     use crate::arrays::{
-        Array, ArrayIrOperation, ArrayIrValue, ArrayOperation, ArrayReference, ArrayType, DataType, LogicalMesh,
+        Array, ArrayIrOperation, ArrayIrType, ArrayIrValue, ArrayOperation, ArrayReference, ArrayType, DataType,
+        LogicalMesh,
     };
     use crate::axes::{MeshContext, NamedAxes, NamedAxis};
     use crate::batching::{BatchAxis, batch};
     use crate::contexts::{Context, Domain, EagerContext, StagingContext, ValueResolution};
     use crate::operations::{Complex, One, Real, Reduce, ReductionKind};
     use crate::parameters::Parameter;
-    use crate::programs::{AttachedRegions, Provenance, ProvenanceScope, ReferenceType};
+    use crate::programs::{
+        AttachedRegions, Operation, Provenance, ProvenanceScope, ReferenceType, RegionInterface, TypeError,
+    };
     use crate::tracing::DomainTracingContext;
 
     use super::*;
+
+    /// Reports the named rule and inherited recursion selection without performing derivative work.
+    #[derive(Clone, Debug)]
+    pub(super) struct RuleProbeOperation;
+
+    impl Operation for RuleProbeOperation {
+        type Type = ArrayType;
+
+        fn name(&self) -> &'static str {
+            "rule_probe"
+        }
+
+        fn infer_output_types(
+            &self,
+            inputs: &[ArrayType],
+            _regions: &[RegionInterface<ArrayType>],
+        ) -> Result<Vec<ArrayType>, TypeError> {
+            Ok(inputs.to_vec())
+        }
+    }
+
+    impl<C: Context<Type = ArrayType>> DifferentiableOperation<C> for RuleProbeOperation {
+        fn jvp<D: DifferentiationDriver<C>, P: DifferentiationPolicy<C>>(
+            &self,
+            context: &DifferentiationContext<C, P>,
+            _driver: &D,
+            _inputs: &[DifferentiationDual<C::Value>],
+        ) -> Result<Vec<DifferentiationDual<C::Value>>, DifferentiationError> {
+            Err(ProgramError::UnsupportedOperation { message: format!("forward with rule `{:?}`", context.rule()) }
+                .into())
+        }
+
+        fn jvp_for_transpose<D: DifferentiationDriver<C>, P: DifferentiationPolicy<C>>(
+            &self,
+            context: &DifferentiationContext<C, P>,
+            _driver: &D,
+            _inputs: &[DifferentiationDual<C::Value>],
+        ) -> Result<Vec<DifferentiationDual<C::Value>>, DifferentiationError> {
+            Err(ProgramError::UnsupportedOperation { message: format!("reverse with rule `{:?}`", context.rule()) }
+                .into())
+        }
+    }
+
+    impl<C: Context<Type = ArrayIrType>> MemberDifferentiableOperation<C> for RuleProbeOperation {
+        fn jvp_in_parent<D: DifferentiationDriver<C>, P: DifferentiationPolicy<C>>(
+            &self,
+            context: &DifferentiationContext<C, P>,
+            _driver: &D,
+            _inputs: &[DifferentiationDual<C::Value>],
+        ) -> Result<Vec<DifferentiationDual<C::Value>>, DifferentiationError> {
+            Err(ProgramError::UnsupportedOperation {
+                message: format!("parent forward with rule `{:?}`", context.rule()),
+            }
+            .into())
+        }
+
+        fn jvp_for_transpose_in_parent<D: DifferentiationDriver<C>, P: DifferentiationPolicy<C>>(
+            &self,
+            context: &DifferentiationContext<C, P>,
+            _driver: &D,
+            _inputs: &[DifferentiationDual<C::Value>],
+        ) -> Result<Vec<DifferentiationDual<C::Value>>, DifferentiationError> {
+            Err(ProgramError::UnsupportedOperation {
+                message: format!("parent reverse with rule `{:?}`", context.rule()),
+            }
+            .into())
+        }
+    }
 
     #[derive(Clone, Parameterized)]
     struct StructuredCaptures<P: Parameter> {
