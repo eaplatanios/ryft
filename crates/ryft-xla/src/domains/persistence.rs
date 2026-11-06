@@ -1266,9 +1266,9 @@ impl<'c> Domain<'c> {
             })
         })?;
         let reference_states = decode_persistent_reference_states(metadata.reference_states, capture_count)?;
-        if !reference_states.is_empty() && !target.is_fully_addressable_single_process_mesh(&mesh) {
+        if !reference_states.is_empty() && !target.is_participating_mesh(&mesh) {
             return Err(Error::Compilation(CompilationError::InvalidPersistentExecutable {
-                reason: "reference-state mesh is not fully addressable by this process".into(),
+                reason: "reference-state mesh does not include an addressable device of this process".into(),
             }));
         }
         if metadata.device_kinds != target.mesh_device_kinds(&mesh)? {
@@ -2135,7 +2135,7 @@ mod tests {
         assert!(matches!(
             domain.deserialize_compiled_program(corrupted.as_slice()),
             Err(Error::Compilation(CompilationError::InvalidPersistentExecutable { reason }))
-                if reason == "reference-state mesh is not fully addressable by this process",
+                if reason == "reference-state mesh does not include an addressable device of this process",
         ));
 
         let mut mismatched_expected_sharding: PersistentExecutableMetadataV9 =

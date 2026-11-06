@@ -399,12 +399,13 @@ mod tests {
     use indoc::indoc;
     use pretty_assertions::assert_eq;
     use ryft_core::{
-        AxisIndexOperation, BatchAxis, Context, ConvertElementType, ConvertElementTypeOperation, CustomCallOperation,
-        DataType, Device, DeviceMesh, Dimension as CoreDimension, DomainTracingContext, Dot, DotDimensionNumbers,
-        EffectClass, Exp, LogicalMesh, MeshAxis, MeshAxisType, ParallelAllGather, ParallelAllToAll, ParallelArgExtrema,
-        ParallelCast, ParallelCastTarget, ParallelPermute, ParallelReduce, ParallelSumScatter, Placeholder,
-        ReductionKind, Shape, ShardMapOptions, ShardMapTracer, Typed, UnreducedKind, ValueProjection, batch,
-        current_mesh, differentiate_at, shard_map, shard_map_along, shard_map_with_inferred_input_shardings, with_mesh,
+        AxisIndexOperation, BatchAxis, BatchAxisSpecification, Context, ConvertElementType,
+        ConvertElementTypeOperation, CotangentDestinationKind, CustomCallOperation, DataType, Device, DeviceMesh,
+        Dimension as CoreDimension, DomainTracingContext, Dot, DotDimensionNumbers, EffectClass, Exp, LogicalMesh,
+        MeshAxis, MeshAxisType, PARALLEL_BROADCAST_OPERATION_NAME, ParallelAllGather, ParallelAllToAll,
+        ParallelArgExtrema, ParallelBroadcast, ParallelCast, ParallelCastTarget, ParallelPermute, ParallelReduce,
+        ParallelSumScatter, Placeholder, ReductionKind, Shape, ShardMapOptions, ShardMapTracer, Typed, UnreducedKind,
+        ValueProjection, batch, differentiate_at, shard_map, shard_map_along, shard_map_with_inferred_input_shardings,
     };
     use ryft_mlir::Block;
     use ryft_pjrt::{BufferType, ClientOptions, CpuClientOptions, Program as PjrtProgram, load_cpu_plugin};
@@ -415,6 +416,7 @@ mod tests {
         lower_replicated_shard_map_body, shard_map_module, static_sharded_array_type, test_manual_mesh, test_sharding,
         test_spmd_compilation_options, test_vector_type,
     };
+    use crate::experimental::lowering::{lower_mlir_module_for_program, to_mlir_module_for_program};
     use crate::experimental::ops::ProgramBuilder as ArrayIrProgramBuilder;
     use crate::experimental::tracing::{TracedProgram, trace_with_context};
     use crate::operations::debugging::PRINT_CUSTOM_CALL_TARGET;
@@ -1743,6 +1745,249 @@ mod tests {
     }
 
     #[test]
+    fn test_to_mlir_module_for_program_with_parallel_broadcast_rejected_on_cpu() {
+        // Every device receives the shard of the device at the source position. The replica group is reordered so that
+        // the source comes first, which yields the module that JAX's GPU lowering of `pbroadcast` emits
+        // (`.tasks/shard_map_jax_parity_gaps/m8/pbroadcast.mlir`).
+        let mesh = test_manual_mesh("x", 2);
+        let sharded = Sharding::new(mesh.clone(), vec![ShardingDimension::sharded(["x"])]).unwrap();
+        let global_type = ArrayType::new_static(DataType::F32, [4]).with_sharding(sharded.clone()).unwrap();
+        let (_, program) = DomainTracingContext::<Domain<'static>>::trace(
+            |inputs: Vec<Tracer<'static>>| {
+                let input = ValueProjection::<ArrayType>::into_projected(inputs[0].clone())?;
+                let output = shard_map(
+                    |input: ArrayTracer| Ok(input.parallel_broadcast("x", 1)?),
+                    input,
+                    mesh.clone(),
+                    sharded.clone(),
+                    sharded.clone(),
+                    ShardMapOptions::new(),
+                )?;
+                Ok(vec![output.into_value()])
+            },
+            vec![ArrayIrType::Array(global_type.clone())],
+        )
+        .unwrap();
+        let types = [global_type];
+        let shardings = [sharded];
+        let module =
+            to_mlir_module_for_program(&program, &[], &types, &types, "main", Some(&shardings), Some(&shardings))
+                .unwrap();
+        assert_eq!(
+            module,
+            indoc! {"
+                module {
+                  sdy.mesh @mesh = <[\"x\"=2]>
+                  func.func @main(%arg0: tensor<4xf32> {sdy.sharding = #sdy.sharding<@mesh, [{\"x\"}]>}) -> \
+                      (tensor<4xf32> {sdy.sharding = #sdy.sharding<@mesh, [{\"x\"}]>}) {
+                    %0 = sdy.manual_computation(%arg0) in_shardings=[<@mesh, [{\"x\"}]>] \
+                        out_shardings=[<@mesh, [{\"x\"}]>] manual_axes={\"x\"} (%arg1: tensor<2xf32>) {
+                      %1 = \"stablehlo.collective_broadcast\"(%arg1) <{channel_handle = \
+                          #stablehlo.channel_handle<handle = 1, type = 1>, replica_groups = \
+                          dense<[[1, 0]]> : tensor<1x2xi64>}> : (tensor<2xf32>) -> tensor<2xf32>
+                      sdy.return %1 : tensor<2xf32>
+                    } : (tensor<4xf32>) -> tensor<4xf32>
+                    return %0 : tensor<4xf32>
+                  }
+                }
+            "},
+        );
+
+        // The XLA CPU backend cannot compile `collective-broadcast`, so compiling the module fails in XLA, and lowering
+        // for a CPU target fails earlier with a precise error.
+        let plugin = load_cpu_plugin().unwrap();
+        let client = plugin
+            .client(ClientOptions::CPU(CpuClientOptions { device_count: Some(2), ..Default::default() }))
+            .unwrap();
+        assert!(matches!(
+            client.compile(&PjrtProgram::Mlir { bytecode: module.into_bytes() }, &test_spmd_compilation_options(2)),
+            Err(ryft_pjrt::Error::Unimplemented { message, .. })
+                if message.contains("HLO opcode `collective-broadcast` is not supported by XLA:CPU"),
+        ));
+        assert!(matches!(
+            lower_mlir_module_for_program(
+                &program,
+                &[],
+                &types,
+                &types,
+                "main",
+                Some(&shardings),
+                Some(&shardings),
+                Some("cpu"),
+            ),
+            Err(Error::Core(ryft_core::Error::Program(ProgramError::UnsupportedOperation { message })))
+                if message == format!("`{PARALLEL_BROADCAST_OPERATION_NAME}` is not supported by the XLA CPU backend"),
+        ));
+    }
+
+    #[test]
+    fn test_to_mlir_module_for_program_with_degenerate_parallel_broadcast_executes_on_cpu() {
+        // A broadcast over the single device of axis `y` is the identity, so it lowers to nothing and also executes on
+        // the CPU backend, which cannot compile `collective-broadcast`.
+        let mesh = LogicalMesh::new(vec![
+            MeshAxis::new("x", 2, MeshAxisType::Manual).unwrap(),
+            MeshAxis::new("y", 1, MeshAxisType::Manual).unwrap(),
+        ])
+        .unwrap();
+        let sharded = Sharding::new(mesh.clone(), vec![ShardingDimension::sharded(["x", "y"])]).unwrap();
+        let global_type = ArrayType::new_static(DataType::F32, [4]).with_sharding(sharded.clone()).unwrap();
+        let (_, program) = DomainTracingContext::<Domain<'static>>::trace(
+            |inputs: Vec<Tracer<'static>>| {
+                let input = ValueProjection::<ArrayType>::into_projected(inputs[0].clone())?;
+                let output = shard_map(
+                    |input: ArrayTracer| Ok(input.parallel_broadcast("y", 0)?),
+                    input,
+                    mesh.clone(),
+                    sharded.clone(),
+                    sharded.clone(),
+                    ShardMapOptions::new(),
+                )?;
+                Ok(vec![output.into_value()])
+            },
+            vec![ArrayIrType::Array(global_type.clone())],
+        )
+        .unwrap();
+        let types = [global_type];
+        let shardings = [sharded];
+        let module = lower_mlir_module_for_program(
+            &program,
+            &[],
+            &types,
+            &types,
+            "main",
+            Some(&shardings),
+            Some(&shardings),
+            Some("cpu"),
+        )
+        .unwrap()
+        .stable_hlo;
+        assert_eq!(
+            execute_on_two_cpu_devices(module, &[2], [&[1.0, 2.0], &[3.0, 4.0]]),
+            vec![vec![1.0, 2.0], vec![3.0, 4.0]],
+        );
+    }
+
+    #[test]
+    fn test_to_mlir_module_for_program_with_multi_axis_parallel_broadcast() {
+        // On a 2x2 mesh, device `(x, y)` has ID `2x + y`. Source 2 along `("x", "y")` is device `(1, 0)`, whose ID is 2,
+        // and along `("y", "x")` it is device `(0, 1)`, whose ID is 1, so each single replica group starts with that
+        // device. Along `y` alone, every row of the mesh forms its own group, which starts with its device at `y = 1`.
+        let mesh = test_logical_mesh_2x2();
+        let sharded = Sharding::new(mesh.clone(), vec![ShardingDimension::sharded(["x", "y"])]).unwrap();
+        let traced: TracedProgram<ArrayType, ArrayType> = trace_with_context(
+            |_, x: ArrayTracer| {
+                Ok(shard_map(
+                    |x: ArrayTracer| {
+                        let x = x.parallel_broadcast(["x", "y"], 2)?;
+                        let x = x.parallel_broadcast(["y", "x"], 2)?;
+                        Ok(x.parallel_broadcast("y", 1)?)
+                    },
+                    x,
+                    mesh.clone(),
+                    sharded.clone(),
+                    sharded.clone(),
+                    ShardMapOptions::new(),
+                )?)
+            },
+            ArrayType::new_static(DataType::F32, [4]).with_sharding(sharded.clone()).unwrap(),
+        )
+        .unwrap();
+        assert_eq!(
+            traced.to_mlir_module("main").unwrap(),
+            indoc! {"
+                module {
+                  sdy.mesh @mesh = <[\"x\"=2, \"y\"=2]>
+                  func.func @main(%arg0: tensor<4xf32> {sdy.sharding = #sdy.sharding<@mesh, [{\"x\", \"y\"}]>}) -> \
+                      (tensor<4xf32> {sdy.sharding = #sdy.sharding<@mesh, [{\"x\", \"y\"}]>}) {
+                    %0 = sdy.manual_computation(%arg0) in_shardings=[<@mesh, [{\"x\", \"y\"}]>] \
+                        out_shardings=[<@mesh, [{\"x\", \"y\"}]>] manual_axes={\"x\", \"y\"} (%arg1: tensor<1xf32>) {
+                      %1 = \"stablehlo.collective_broadcast\"(%arg1) <{channel_handle = \
+                          #stablehlo.channel_handle<handle = 1, type = 1>, replica_groups = \
+                          dense<[[2, 0, 1, 3]]> : tensor<1x4xi64>}> : (tensor<1xf32>) -> tensor<1xf32>
+                      %2 = \"stablehlo.collective_broadcast\"(%1) <{channel_handle = \
+                          #stablehlo.channel_handle<handle = 2, type = 1>, replica_groups = \
+                          dense<[[1, 0, 2, 3]]> : tensor<1x4xi64>}> : (tensor<1xf32>) -> tensor<1xf32>
+                      %3 = \"stablehlo.collective_broadcast\"(%2) <{channel_handle = \
+                          #stablehlo.channel_handle<handle = 3, type = 1>, replica_groups = \
+                          dense<[[1, 0], [3, 2]]> : tensor<2x2xi64>}> : (tensor<1xf32>) -> tensor<1xf32>
+                      sdy.return %3 : tensor<1xf32>
+                    } : (tensor<4xf32>) -> tensor<4xf32>
+                    return %0 : tensor<4xf32>
+                  }
+                }
+            "},
+        );
+    }
+
+    #[test]
+    fn test_to_mlir_module_for_program_transposes_parallel_broadcast_on_cpu() {
+        // The transpose hands the sum of every device's cotangent to the source device and zeros to the other device,
+        // through an all-reduce and a collective permute whose only pair sends the source's sum to itself, so it
+        // executes on the CPU backend, unlike the broadcast itself. With the cotangent `[1, 2, 3, 4]` and source 1, the
+        // gradient is `[0, 0, 4, 6]`, as JAX computes it (`.tasks/shard_map_jax_parity_gaps/m8_oracles.py`).
+        let mesh = test_manual_mesh("x", 2);
+        let sharded = Sharding::new(mesh.clone(), vec![ShardingDimension::sharded(["x"])]).unwrap();
+        let global_type = ArrayType::new_static(DataType::F32, [4]).with_sharding(sharded.clone()).unwrap();
+        let (_, program) = DomainTracingContext::<Domain<'static>>::trace(
+            |inputs: Vec<Tracer<'static>>| {
+                let input = ValueProjection::<ArrayType>::into_projected(inputs[0].clone())?;
+                let output = shard_map(
+                    |input: ArrayTracer| Ok(input.parallel_broadcast("x", 1)?),
+                    input,
+                    mesh.clone(),
+                    sharded.clone(),
+                    sharded.clone(),
+                    ShardMapOptions::new(),
+                )?;
+                Ok(vec![output.into_value()])
+            },
+            vec![ArrayIrType::Array(global_type.clone())],
+        )
+        .unwrap();
+        let pullback = program.transpose_with_respect_to(&[0], &[CotangentDestinationKind::Return]).unwrap();
+        let module = to_mlir_module_for_program(
+            &pullback,
+            &[],
+            &[global_type.clone()],
+            &[global_type],
+            "main",
+            Some(&[sharded.clone()]),
+            Some(&[sharded]),
+        )
+        .unwrap();
+        assert_eq!(
+            module,
+            indoc! {"
+                module {
+                  sdy.mesh @mesh = <[\"x\"=2]>
+                  func.func @main(%arg0: tensor<4xf32> {sdy.sharding = #sdy.sharding<@mesh, [{\"x\"}]>}) -> \
+                      (tensor<4xf32> {sdy.sharding = #sdy.sharding<@mesh, [{\"x\"}]>}) {
+                    %0 = sdy.manual_computation(%arg0) in_shardings=[<@mesh, [{\"x\"}]>] \
+                        out_shardings=[<@mesh, [{\"x\"}]>] manual_axes={\"x\"} (%arg1: tensor<2xf32>) {
+                      %1 = \"stablehlo.all_reduce\"(%arg1) <{channel_handle = \
+                          #stablehlo.channel_handle<handle = 1, type = 1>, replica_groups = \
+                          dense<[[0, 1]]> : tensor<1x2xi64>, use_global_device_ids}> ({
+                      ^bb0(%arg2: tensor<f32>, %arg3: tensor<f32>):
+                        %3 = stablehlo.add %arg2, %arg3 : tensor<f32>
+                        stablehlo.return %3 : tensor<f32>
+                      }) : (tensor<2xf32>) -> tensor<2xf32>
+                      %2 = \"stablehlo.collective_permute\"(%1) <{channel_handle = \
+                          #stablehlo.channel_handle<handle = 2, type = 1>, source_target_pairs = \
+                          dense<1> : tensor<1x2xi64>}> : (tensor<2xf32>) -> tensor<2xf32>
+                      sdy.return %2 : tensor<2xf32>
+                    } : (tensor<4xf32>) -> tensor<4xf32>
+                    return %0 : tensor<4xf32>
+                  }
+                }
+            "},
+        );
+        assert_eq!(
+            execute_on_two_cpu_devices(module, &[2], [&[1.0, 2.0], &[3.0, 4.0]]),
+            vec![vec![0.0, 0.0], vec![4.0, 6.0]],
+        );
+    }
+
+    #[test]
     fn test_to_mlir_module_for_program_with_multi_axis_collectives_executes_on_cpu() {
         // Over several manual axes, the participants are positioned along the combined axis, which linearizes the axes
         // in the given order with the first axis major. Every device holds its tile of `0..n`, sharded along `("x", "y")`
@@ -2098,16 +2343,20 @@ mod tests {
     }
 
     #[test]
-    fn test_eager_shard_map_uses_the_current_mesh_on_cpu() {
-        // Within a mesh scope, a map without a mesh is defined over the mesh in scope and its body sees that mesh as
-        // the current mesh, compilation options default to the device mesh in scope, and a given mesh must have its
-        // topology (JAX's `jax.set_mesh` with `shard_map(mesh=None)`).
+    fn test_eager_shard_map_uses_the_default_mesh_of_its_context_on_cpu() {
+        // An eager map over `x` of a `2x2` mesh runs a nested map without a mesh, which is defined over the mesh of the
+        // enclosing map (its context's default mesh) and makes the remaining axis `y` manual, as JAX's
+        // `shard_map(mesh=None)` does inside a `shard_map` body. Outside of every manual region, a map needs a mesh.
         let plugin = load_cpu_plugin().unwrap();
         let client = plugin
-            .client(ClientOptions::CPU(CpuClientOptions { device_count: Some(2), ..Default::default() }))
+            .client(ClientOptions::CPU(CpuClientOptions { device_count: Some(4), ..Default::default() }))
             .unwrap();
         let domain = Session::new(&client).domain();
-        let logical_mesh = test_manual_mesh("x", 2);
+        let logical_mesh = LogicalMesh::new(vec![
+            MeshAxis::new("x", 2, MeshAxisType::Manual).unwrap(),
+            MeshAxis::new("y", 2, MeshAxisType::Manual).unwrap(),
+        ])
+        .unwrap();
         let devices = client.addressable_devices().unwrap();
         let mesh = DeviceMesh::new(
             logical_mesh.clone(),
@@ -2115,36 +2364,54 @@ mod tests {
         )
         .unwrap();
         let sharded = Sharding::new(logical_mesh.clone(), vec![ShardingDimension::sharded(["x"])]).unwrap();
+        let replicated = Sharding::replicated(logical_mesh.clone(), 1);
         let r#type = ArrayType::new_static(DataType::F32, [4]).with_sharding(sharded.clone()).unwrap();
         let input =
-            Array::from_host_buffer(&domain, r#type, mesh.clone(), values_to_bytes(&[1f32, 2., 3., 4.])).unwrap();
-        let double = |mesh: Option<LogicalMesh>| {
-            shard_map(
-                |x: ShardMapTracer<Domain<'_>>| {
-                    assert_eq!(current_mesh(), Some(test_manual_mesh("x", 2)));
-                    Ok(x.clone() + x)
-                },
-                input.clone(),
-                mesh,
-                sharded.clone(),
-                sharded.clone(),
-                ShardMapOptions::new(),
-            )
-        };
+            Array::from_host_buffer(&domain, r#type.clone(), mesh.clone(), values_to_bytes(&[1f32, 2., 3., 4.])).unwrap();
+        let doubled = shard_map(
+            |x: ShardMapTracer<Domain<'_>>| {
+                Ok(shard_map(
+                    |x: ShardMapTracer<Domain<'_>>| Ok(x.clone() + x),
+                    x,
+                    None,
+                    replicated.clone(),
+                    replicated.clone(),
+                    ShardMapOptions::new(),
+                )?)
+            },
+            input.clone(),
+            logical_mesh,
+            sharded.clone(),
+            sharded.clone(),
+            ShardMapOptions::new().with_manual_axes(["x"]),
+        )
+        .unwrap();
+        assert_eq!(read_device_f32s(&doubled), vec![vec![2.0, 4.0], vec![2.0, 4.0], vec![6.0, 8.0], vec![6.0, 8.0]]);
+        let missing = shard_map(
+            |x: ShardMapTracer<Domain<'_>>| Ok(x),
+            input,
+            None,
+            sharded.clone(),
+            sharded.clone(),
+            ShardMapOptions::new(),
+        );
+        assert!(matches!(missing, Err(ShardMapError::MissingMesh)));
 
-        assert!(matches!(double(None), Err(ShardMapError::MissingMesh)));
-        assert!(Options::from_current_mesh().is_err());
-        with_mesh(mesh.clone(), || {
-            assert_eq!(Options::from_current_mesh().unwrap(), Options::new(mesh.clone()));
-            let doubled = double(None).unwrap();
-            assert_eq!(read_device_f32s(&doubled), vec![vec![2.0, 4.0], vec![6.0, 8.0]]);
-            let other_mesh = test_manual_mesh("y", 2);
-            assert!(matches!(
-                double(Some(other_mesh.clone())),
-                Err(ShardMapError::CurrentMeshMismatch { current, actual })
-                    if current == logical_mesh && actual == other_mesh,
-            ));
-        });
+        // A domain that was given a device mesh owns its logical view as the default mesh, so a top-level map in it
+        // can omit the mesh, as under JAX's `jax.set_mesh`.
+        let meshed_domain = domain.with_mesh(mesh.clone());
+        let input =
+            Array::from_host_buffer(&meshed_domain, r#type, mesh, values_to_bytes(&[1f32, 2., 3., 4.])).unwrap();
+        let doubled = shard_map(
+            |x: ShardMapTracer<Domain<'_>>| Ok(x.clone() + x),
+            input,
+            None,
+            sharded.clone(),
+            sharded,
+            ShardMapOptions::new().with_manual_axes(["x"]),
+        )
+        .unwrap();
+        assert_eq!(read_device_f32s(&doubled), vec![vec![2.0, 4.0], vec![2.0, 4.0], vec![6.0, 8.0], vec![6.0, 8.0]]);
     }
 
     #[test]
@@ -2215,6 +2482,76 @@ mod tests {
             })
             .collect::<Vec<_>>();
         assert_eq!(items, vec![vec![2.0, 4.0, 6.0], vec![8.0, 10.0, 12.0]]);
+    }
+
+    #[test]
+    fn test_shard_map_batched_along_a_used_manual_axis_executes_with_gathered_batches_on_cpu() {
+        // The caller maps the items `[1, 2, 3, 4]` along `b`, which its input places on `x`, through a map over `x` whose
+        // body reduces over both `b` and `x`. The body uses `x`, so the batch is gathered along `x` on entry, every
+        // device computes `sum_b(a) + sum_x(a) = 10 + 2 * a` for every item, and each device keeps the block of items
+        // that the output sharding assigns to it along `x`. Splitting the batch along `x` instead (as JAX's
+        // `spmd_axis_name` does) would make the reduction over `x` add different items.
+        let plugin = load_cpu_plugin().unwrap();
+        let client = plugin
+            .client(ClientOptions::CPU(CpuClientOptions { device_count: Some(2), ..Default::default() }))
+            .unwrap();
+        let map_mesh = test_manual_mesh("x", 2);
+        let caller_mesh = LogicalMesh::new(vec![MeshAxis::new("x", 2, MeshAxisType::Explicit).unwrap()]).unwrap();
+        let devices = client.addressable_devices().unwrap();
+        let mesh = DeviceMesh::new(
+            caller_mesh.clone(),
+            devices.iter().map(|device| Device::from_pjrt(device).unwrap()).collect(),
+        )
+        .unwrap();
+        let domain = Session::new(&client).domain();
+        let replicated = Sharding::replicated(map_mesh.clone(), 0);
+        let input_type = ArrayType::new_static(DataType::F32, [4])
+            .with_sharding(Sharding::new(caller_mesh, vec![ShardingDimension::sharded(["x"])]).unwrap())
+            .unwrap();
+        let staged = crate::stage::<_, ArrayType, ArrayType>(
+            |input| {
+                let output = batch(
+                    |item| {
+                        let item = ValueProjection::<ArrayType>::into_projected(item)?;
+                        let output = shard_map(
+                            |a| {
+                                Ok(a.parallel_reduce(ReductionKind::Sum, "b")?
+                                    + a.parallel_reduce(ReductionKind::Sum, "x")?)
+                            },
+                            item,
+                            map_mesh.clone(),
+                            replicated.clone(),
+                            replicated.clone(),
+                            ShardMapOptions::new(),
+                        )?;
+                        Ok(output.into_value())
+                    },
+                    input.into_value(),
+                    BatchAxis::new(0),
+                    BatchAxis::new(0),
+                    BatchAxisSpecification::named("b"),
+                )
+                .unwrap();
+                ValueProjection::<ArrayType>::into_projected(output).unwrap()
+            },
+            input_type.clone(),
+            Options::new(mesh.clone()),
+        )
+        .unwrap()
+        .into_inner();
+        let compiled = staged.lower(&domain).unwrap().compile(&domain).unwrap();
+        let input = Array::from_host_buffer(&domain, input_type, mesh, values_to_bytes(&[1f32, 2., 3., 4.])).unwrap();
+        let Value::Array(output) = compiled.executable().execute(&domain, Value::Array(input)).unwrap() else {
+            panic!("the compiled function returned a dimension");
+        };
+        let blocks = output
+            .addressable_shards()
+            .map(|shard| {
+                let bytes = shard.buffer().unwrap().copy_to_host(None).unwrap().r#await().unwrap();
+                values_from_bytes::<f32>(bytes.as_slice())
+            })
+            .collect::<Vec<_>>();
+        assert_eq!(blocks, vec![vec![12.0, 14.0], vec![16.0, 18.0]]);
     }
 
     #[test]

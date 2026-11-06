@@ -189,6 +189,25 @@ impl Target {
                 && self.device(mesh_device.id()).is_some_and(|device| device.addressable)
         })
     }
+
+    /// Returns whether this target's process participates in executions over `mesh`: every device in `mesh` must be a
+    /// captured device with the process index that the mesh assigns it, the devices of this process must be
+    /// addressable while those of other processes are not, and at least one device must belong to this process. An
+    /// unknown device identifier, a mismatched process index, or a mesh entirely of other processes makes the result
+    /// `false`. Execution with reference state uses this check, because each process binds, executes, and commits only
+    /// its addressable shards of a reference (refer to the stateful execution protocol in
+    /// [`compilation`](crate::compilation)).
+    pub fn is_participating_mesh(&self, mesh: &DeviceMesh) -> bool {
+        let mut participates = false;
+        let consistent = mesh.devices().iter().all(|mesh_device| {
+            self.device(mesh_device.id()).is_some_and(|device| {
+                let local = mesh_device.process_index() == self.process_index;
+                participates |= local;
+                device.device == *mesh_device && device.addressable == local
+            })
+        });
+        consistent && participates
+    }
 }
 
 impl TargetDevice {
@@ -264,6 +283,43 @@ mod tests {
         )
         .unwrap();
         assert!(!target.is_fully_addressable_single_process_mesh(&remote_mesh));
+        assert!(target.is_participating_mesh(&mesh));
+        assert!(!target.is_participating_mesh(&remote_mesh));
+
+        // A target of process 0 that also sees a device of process 1 participates in a mesh over both devices, but not
+        // in a mesh of only the remote device, nor in meshes that misattribute a device to a process or name an
+        // unknown device.
+        let mut two_process_target = target.clone();
+        two_process_target.devices.truncate(1);
+        let local_device = two_process_target.devices[0].device;
+        let remote_device = Device::new(local_device.id() + 2048, target.process_index() + 1);
+        two_process_target.devices.push(TargetDevice {
+            device: remote_device,
+            kind: two_process_target.devices[0].kind.clone(),
+            attributes: BTreeMap::new(),
+            addressable: false,
+        });
+        let two_device_mesh = |devices: Vec<Device>| {
+            DeviceMesh::new(
+                LogicalMesh::new(vec![MeshAxis::new("x", devices.len(), MeshAxisType::Manual).unwrap()]).unwrap(),
+                devices,
+            )
+            .unwrap()
+        };
+        assert!(two_process_target.is_participating_mesh(&two_device_mesh(vec![local_device, remote_device])));
+        assert!(
+            !two_process_target
+                .is_fully_addressable_single_process_mesh(&two_device_mesh(vec![local_device, remote_device,]))
+        );
+        assert!(!two_process_target.is_participating_mesh(&two_device_mesh(vec![remote_device])));
+        assert!(!two_process_target.is_participating_mesh(&two_device_mesh(vec![
+            local_device,
+            Device::new(remote_device.id(), target.process_index()),
+        ])));
+        assert!(!two_process_target.is_participating_mesh(&two_device_mesh(vec![
+            local_device,
+            Device::new(usize::MAX, target.process_index() + 1),
+        ])));
         let mut builder = ProgramBuilder::new();
         let input = builder.add_input(ArrayIrType::Array(replicated_vector_type(&mesh, 2)));
         let output = builder

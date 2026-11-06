@@ -478,23 +478,33 @@ mod tests {
     use std::thread;
     use std::time::{Duration, Instant};
 
+    #[cfg(feature = "cuda-13")]
+    use indoc::indoc;
+    use pretty_assertions::assert_eq;
+    #[cfg(feature = "cuda-13")]
+    use ryft_core::ParallelBroadcast;
     use ryft_core::{
         ArrayIrType, ArrayReference, ArrayType, BatchAxis, CompilationArtifactExchange,
         CompilationArtifactExchangeError, DataType, Device, DeviceMesh, LogicalMesh, MeshAxis, MeshAxisType,
         ParallelReduce, ReductionKind, ReferenceType, ShardMapOptions, ShardMapTracer, Sharding, ShardingDimension,
         UnreducedKind, ValueProjection, batch, shard_map,
     };
+    #[cfg(feature = "cuda-13")]
+    use ryft_pjrt::{
+        BufferType, ExecutionDeviceInputs, ExecutionInput, GpuClientOptions, GpuMemoryAllocator, GpuPlatform,
+        Program as PjrtProgram, load_cuda_13_plugin,
+    };
     use ryft_pjrt::{
         Client, ClientOptions, CpuClientOptions, DistributedRuntimeClientOptions, DistributedRuntimeServiceOptions,
         KeyValueStore, load_cpu_plugin,
     };
-    #[cfg(feature = "cuda-13")]
-    use ryft_pjrt::{GpuClientOptions, GpuMemoryAllocator, GpuPlatform, load_cuda_13_plugin};
     use sha2::{Digest, Sha256};
 
     use crate::arrays_v0::host::materialize_dense_array_bytes;
     use crate::compilation::compile_statefully;
     use crate::compilation::tests::doubling_reduced_reference_program;
+    #[cfg(feature = "cuda-13")]
+    use crate::experimental::lowering::tests::test_spmd_compilation_options;
     use crate::tests::{values_from_bytes, values_to_bytes};
     use crate::{Array, ArrayError, Domain, Error, FromPjrt, Options, Reference, Session, Value};
 
@@ -566,9 +576,9 @@ mod tests {
             local_positions.iter().map(|&position| tiles[position].clone()).collect::<Vec<_>>(),
         );
 
-        // Dense host materialization needs every shard, so it succeeds only in a process that addresses both devices
-        // and otherwise names a shard of the other process, as JAX rejects fetching arrays that span non-addressable
-        // devices.
+        // Dense host materialization of a sharded array needs every tile, so it succeeds only in a process that addresses
+        // both devices and otherwise names a shard of the other process before issuing any copy, as JAX rejects fetching
+        // arrays whose value spans non-addressable devices.
         if local_positions.len() == 2 {
             let materialized = materialize_dense_array_bytes(&input).unwrap();
             assert_eq!(values_from_bytes::<f32>(materialized.as_slice()), vec![1.0, 2.0, 3.0, 4.0]);
@@ -613,6 +623,11 @@ mod tests {
         assert_eq!(read_addressable_f32s(&sum), vec![vec![4.0, 6.0]; local_positions.len()]);
         let maximum = complete(UnreducedKind::Max, ReductionKind::Max);
         assert_eq!(read_addressable_f32s(&maximum), vec![vec![3.0, 4.0]; local_positions.len()]);
+
+        // A replicated array spans every process, but each process holds its whole value, so dense host reads succeed
+        // in every process, as JAX reads a value that the current process holds in full.
+        let materialized = materialize_dense_array_bytes(&sum).unwrap();
+        assert_eq!(values_from_bytes::<f32>(materialized.as_slice()), vec![4.0, 6.0]);
 
         // Batching a map along its only manual axis for a caller over an `Explicit` copy of the mesh places one item on
         // each device, so each device holds its own item doubled.
@@ -666,7 +681,9 @@ mod tests {
         );
 
         // An unchecked stateful map doubles every device's copy of a reference that is reduced along `x` and writes it
-        // back, so each process reads `[2, 4]` from its own shards of the referent afterwards.
+        // back, so each process reads `[2, 4]` from its own shards of the referent afterwards. Over a mesh that spans
+        // processes, each process calls with its own reference, binds and commits only its addressable shards, and,
+        // because the referent is replicated, can read the whole final state densely.
         let (program, referent_type) = doubling_reduced_reference_program(&manual_mesh);
         let compiled = compile_statefully::<_, Vec<ArrayIrType>, Vec<ArrayIrType>>(
             |inputs| {
@@ -689,6 +706,8 @@ mod tests {
             )
             .unwrap();
         assert_eq!(read_addressable_f32s(&reference.read().unwrap()), vec![vec![2.0, 4.0]; local_positions.len()]);
+        let materialized = materialize_dense_array_bytes(&reference.read().unwrap()).unwrap();
+        assert_eq!(values_from_bytes::<f32>(materialized.as_slice()), vec![2.0, 4.0]);
     }
 
     #[test]
@@ -1023,15 +1042,11 @@ mod tests {
         check_shard_map_multi_host_scenarios(&client);
     }
 
-    /// Worker of `test_shard_map_multi_host_scenarios_on_two_cuda_processes`, which returns immediately unless that
-    /// test launched it as one of its two ranks.
+    /// Joins the two-process CUDA job that launched this process as rank `process_index` (refer to
+    /// [`run_cuda_rank_pair`]), runs `check` with a client whose two global devices are the ranks' shares of CUDA device
+    /// 0, and then shuts the job down in order.
     #[cfg(feature = "cuda-13")]
-    #[test]
-    fn test_shard_map_multi_host_scenarios_cuda_process_helper() {
-        let Ok(role) = std::env::var(MULTI_HOST_TEST_ROLE) else {
-            return;
-        };
-        let process_index = role.parse::<usize>().unwrap();
+    fn run_as_cuda_rank(process_index: usize, check: impl FnOnce(&Client<'_>)) {
         let address = std::env::var(MULTI_HOST_TEST_ADDRESS).unwrap();
         let timeout = Duration::from_secs(60);
         let plugin = load_cuda_13_plugin().unwrap();
@@ -1082,9 +1097,9 @@ mod tests {
             assert_eq!(client.process_index().unwrap(), process_index);
             assert_eq!(client.devices().unwrap().len(), 2);
             assert_eq!(client.addressable_devices().unwrap().len(), 1);
-            check_shard_map_multi_host_scenarios(&client);
+            check(&client);
         }
-        let completed = |rank: usize| format!("ryft/test/multi-host-scenarios/completed/{rank}");
+        let completed = |rank: usize| format!("ryft/test/cuda-ranks/completed/{rank}");
         runtime.key_value_store().put(completed(process_index).as_bytes(), b"ready").unwrap();
         for rank in 0..2 {
             assert_eq!(runtime.key_value_store().get(completed(rank).as_bytes(), timeout).unwrap(), b"ready");
@@ -1092,16 +1107,16 @@ mod tests {
         runtime.key_value_store().client().shutdown().unwrap();
     }
 
+    /// Runs the test `helper` (a path within this test binary) as the two ranks of a CUDA job that share CUDA device 0,
+    /// asserts that both ranks pass, and returns their standard outputs, or returns `None` when local-port binding is
+    /// denied in this environment.
+    ///
+    /// The CPU plugin cannot host such jobs, because a CPU client that joins a distributed runtime sees only its own
+    /// devices (e.g., process 1 sees just device 2048), so it has no cross-process topology for collectives. Instead,
+    /// both ranks share CUDA device 0 through NCCL's multiple ranks per GPU, with CUDA MPS for concurrent progress, which
+    /// mirrors the `cuda-distributed-collectives` differential suite (refer to `python/README.md`).
     #[cfg(feature = "cuda-13")]
-    #[test]
-    #[ignore = "requires one CUDA GPU with NCCL multi-rank support and CUDA MPS"]
-    fn test_shard_map_multi_host_scenarios_on_two_cuda_processes() {
-        // The multi-host scenarios run in two processes that address one device each. The CPU plugin cannot host them,
-        // because a CPU client that joins a distributed runtime sees only its own devices (e.g., process 1 sees just
-        // device 2048), so it has no cross-process topology for collectives. Instead, both ranks share CUDA device 0
-        // through NCCL's multiple ranks per GPU, with CUDA MPS for concurrent progress, which mirrors the
-        // `cuda-distributed-collectives` differential suite (refer to `python/README.md`).
-
+    fn run_cuda_rank_pair(helper: &str) -> Option<[String; 2]> {
         /// Private MPS control daemon, which is shut down on drop.
         struct MpsDaemon {
             environment: Vec<(&'static str, String)>,
@@ -1124,9 +1139,7 @@ mod tests {
             }
         }
 
-        let Some(address) = loopback_address() else {
-            return;
-        };
+        let address = loopback_address()?;
         let directory = tempfile::tempdir().unwrap();
         let mut environment = vec![
             ("NCCL_MULTI_RANK_GPU_ENABLE", "1".to_string()),
@@ -1163,12 +1176,7 @@ mod tests {
         let mut children = (0..2)
             .map(|rank| {
                 Command::new(&executable)
-                    .args([
-                        "--exact",
-                        "distributed::tests::test_shard_map_multi_host_scenarios_cuda_process_helper",
-                        "--nocapture",
-                        "--test-threads=1",
-                    ])
+                    .args(["--exact", helper, "--nocapture", "--test-threads=1"])
                     .envs(environment.iter().map(|(name, value)| (*name, value)))
                     .env(MULTI_HOST_TEST_ROLE, rank.to_string())
                     .env(MULTI_HOST_TEST_ADDRESS, &address)
@@ -1198,12 +1206,352 @@ mod tests {
                 *status = Some(child.wait().unwrap());
             }
         }
-        for (rank, status) in statuses.into_iter().enumerate() {
-            let status = status.unwrap();
+        let outputs = [0, 1].map(|rank| {
+            let status = statuses[rank].unwrap();
             let stderr = std::fs::read_to_string(directory.path().join(format!("rank-{rank}.stderr"))).unwrap();
             let stdout = std::fs::read_to_string(directory.path().join(format!("rank-{rank}.stdout"))).unwrap();
             assert!(status.success(), "rank {rank} failed with {status}\nstdout:\n{stdout}\nstderr:\n{stderr}");
-            assert!(stdout.contains("1 passed"), "rank {rank} did not run its scenarios:\n{stdout}");
-        }
+            assert!(stdout.contains("1 passed"), "rank {rank} did not run `{helper}`:\n{stdout}");
+            stdout
+        });
+        Some(outputs)
+    }
+
+    /// Worker of `test_shard_map_multi_host_scenarios_on_two_cuda_processes`, which returns immediately unless that
+    /// test launched it as one of its two ranks.
+    #[cfg(feature = "cuda-13")]
+    #[test]
+    fn test_shard_map_multi_host_scenarios_cuda_process_helper() {
+        let Ok(role) = std::env::var(MULTI_HOST_TEST_ROLE) else {
+            return;
+        };
+        run_as_cuda_rank(role.parse().unwrap(), |client| check_shard_map_multi_host_scenarios(client));
+    }
+
+    #[cfg(feature = "cuda-13")]
+    #[test]
+    #[ignore = "requires one CUDA GPU with NCCL multi-rank support and CUDA MPS"]
+    fn test_shard_map_multi_host_scenarios_on_two_cuda_processes() {
+        // The multi-host scenarios run in two processes that address one device each.
+        run_cuda_rank_pair("distributed::tests::test_shard_map_multi_host_scenarios_cuda_process_helper");
+    }
+
+    /// Worker of `test_gpu_only_collectives_on_two_cuda_processes`, which returns immediately unless that test launched
+    /// it as one of its two ranks. It compiles and executes each probe module with this rank's tile of `[1, 2, 3, 4]`
+    /// and prints one `probe:` line per module with its outputs or the first line of its compilation or execution
+    /// error.
+    #[cfg(feature = "cuda-13")]
+    #[test]
+    fn test_gpu_only_collectives_cuda_process_helper() {
+        // JAX's CUDA lowerings of `shard_map` over a mesh `x = 2` whose input `f32[4]` is sharded along `x`, produced
+        // by `.tasks/shard_map_jax_parity_gaps/m8_lower.py` with JAX 0.12.1.dev20261103 over jaxlib 0.12.0.1 and kept
+        // verbatim. They cover `pbroadcast` (`collective_broadcast`), the asynchronous `*-start`/`*-done` custom calls
+        // whose configuration is in the `async_collective_config` frontend attribute, and token-threaded `send`/`recv`.
+        // The send/recv modules run last, because a mismatched point-to-point transfer would hang both ranks.
+        let send_recv = r##"
+module @jit_send_recv attributes {mhlo.num_partitions = 2 : i32, mhlo.num_replicas = 1 : i32} {
+  sdy.mesh @mesh = <["x"=2]> {stablehlo.mesh = {axes = [{name = "x", size = 2 : i64}]}}
+  func.func public @main(%arg0: tensor<4xf32> {sdy.sharding = #sdy.sharding<@mesh, [{"x"}]>}) -> (tensor<4xf32> {jax.result_info = "result", sdy.sharding = #sdy.sharding<@mesh, [{"x"}]>}) {
+    %0 = sdy.manual_computation(%arg0) in_shardings=[<@mesh, [{"x"}]>] out_shardings=[<@mesh, [{"x"}]>] manual_axes={"x"} (%arg1: tensor<2xf32>) {
+      %2 = stablehlo.create_token : !stablehlo.token
+      %3 = "stablehlo.send"(%arg1, %2) <{channel_handle = #stablehlo.channel_handle<handle = 1, type = 1>, source_target_pairs = dense<[[0, 1], [1, 0]]> : tensor<2x2xi64>}> : (tensor<2xf32>, !stablehlo.token) -> !stablehlo.token
+      %4:2 = "stablehlo.recv"(%3) <{channel_handle = #stablehlo.channel_handle<handle = 1, type = 1>, source_target_pairs = dense<[[0, 1], [1, 0]]> : tensor<2x2xi64>}> : (!stablehlo.token) -> (tensor<2xf32>, !stablehlo.token)
+      sdy.return %4#0 : tensor<2xf32>
+    } : (tensor<4xf32>) -> tensor<4xf32>
+    %1 = sdy.sharding_constraint %0 <@mesh, [{"x"}]> : tensor<4xf32>
+    return %1 : tensor<4xf32>
+  }
+}
+"##;
+        // XLA's HLO verifier rejects the cyclic source-target pairs of the swap above, so a variant whose only pair is
+        // `0 -> 1` (the module's only change) checks whether point-to-point transfers work at all.
+        let cyclic_pairs = "dense<[[0, 1], [1, 0]]> : tensor<2x2xi64>";
+        assert_eq!(send_recv.matches(cyclic_pairs).count(), 2);
+        let acyclic_send_recv = send_recv.replace(cyclic_pairs, "dense<[[0, 1]]> : tensor<1x2xi64>");
+        let modules = [
+            (
+                "pbroadcast",
+                r##"
+module @jit__lambda attributes {mhlo.num_partitions = 2 : i32, mhlo.num_replicas = 1 : i32} {
+  sdy.mesh @mesh = <["x"=2]> {stablehlo.mesh = {axes = [{name = "x", size = 2 : i64}]}}
+  func.func public @main(%arg0: tensor<4xf32> {sdy.sharding = #sdy.sharding<@mesh, [{"x"}]>}) -> (tensor<4xf32> {jax.result_info = "result", sdy.sharding = #sdy.sharding<@mesh, [{"x"}]>}) {
+    %0 = sdy.manual_computation(%arg0) in_shardings=[<@mesh, [{"x"}]>] out_shardings=[<@mesh, [{"x"}]>] manual_axes={"x"} (%arg1: tensor<2xf32>) {
+      %2 = "stablehlo.collective_broadcast"(%arg1) <{channel_handle = #stablehlo.channel_handle<handle = 1, type = 1>, replica_groups = dense<[[1, 0]]> : tensor<1x2xi64>}> : (tensor<2xf32>) -> tensor<2xf32>
+      sdy.return %2 : tensor<2xf32>
+    } : (tensor<4xf32>) -> tensor<4xf32>
+    %1 = sdy.sharding_constraint %0 <@mesh, [{"x"}]> : tensor<4xf32>
+    return %1 : tensor<4xf32>
+  }
+}
+"##,
+            ),
+            (
+                "ppermute_start_done",
+                r##"
+module @jit__lambda attributes {mhlo.num_partitions = 2 : i32, mhlo.num_replicas = 1 : i32} {
+  sdy.mesh @mesh = <["x"=2]> {stablehlo.mesh = {axes = [{name = "x", size = 2 : i64}]}}
+  func.func public @main(%arg0: tensor<4xf32> {sdy.sharding = #sdy.sharding<@mesh, [{"x"}]>}) -> (tensor<4xf32> {jax.result_info = "result", sdy.sharding = #sdy.sharding<@mesh, [{"x"}]>}) {
+    %0 = sdy.manual_computation(%arg0) in_shardings=[<@mesh, [{"x"}]>] out_shardings=[<@mesh, [{"x"}]>] manual_axes={"x"} (%arg1: tensor<2xf32>) {
+      %2 = stablehlo.custom_call @"collective-permute-start"(%arg1) {backend_config = "", mhlo.frontend_attributes = {async_collective_config = "{\22permutation\22: [[0, 1], [1, 0]], \22channel_id\22: 1}"}} : (tensor<2xf32>) -> tensor<2xf32>
+      %3 = stablehlo.custom_call @"collective-permute-done"(%2) {backend_config = ""} : (tensor<2xf32>) -> tensor<2xf32>
+      sdy.return %3 : tensor<2xf32>
+    } : (tensor<4xf32>) -> tensor<4xf32>
+    %1 = sdy.sharding_constraint %0 <@mesh, [{"x"}]> : tensor<4xf32>
+    return %1 : tensor<4xf32>
+  }
+}
+"##,
+            ),
+            (
+                "all_gather_start_done",
+                r##"
+module @jit__lambda attributes {mhlo.num_partitions = 2 : i32, mhlo.num_replicas = 1 : i32} {
+  sdy.mesh @mesh = <["x"=2]> {stablehlo.mesh = {axes = [{name = "x", size = 2 : i64}]}}
+  func.func public @main(%arg0: tensor<4xf32> {sdy.sharding = #sdy.sharding<@mesh, [{"x"}]>}) -> (tensor<8xf32> {jax.result_info = "result", sdy.sharding = #sdy.sharding<@mesh, [{"x"}]>}) {
+    %0 = sdy.manual_computation(%arg0) in_shardings=[<@mesh, [{"x"}]>] out_shardings=[<@mesh, [{"x"}]>] manual_axes={"x"} (%arg1: tensor<2xf32>) {
+      %2 = stablehlo.custom_call @"all-gather-start"(%arg1) {backend_config = "", mhlo.frontend_attributes = {async_collective_config = "{\22all_gather_dimension\22: 0, \22replica_groups\22: [[0, 1]], \22use_global_device_ids\22: true, \22channel_id\22: 1}"}} : (tensor<2xf32>) -> tensor<4xf32>
+      %3 = stablehlo.custom_call @"all-gather-done"(%2) {backend_config = ""} : (tensor<4xf32>) -> tensor<4xf32>
+      sdy.return %3 : tensor<4xf32>
+    } : (tensor<4xf32>) -> tensor<8xf32>
+    %1 = sdy.sharding_constraint %0 <@mesh, [{"x"}]> : tensor<8xf32>
+    return %1 : tensor<8xf32>
+  }
+}
+"##,
+            ),
+            (
+                "psum_scatter_start_done",
+                r##"
+module @jit__lambda attributes {mhlo.num_partitions = 2 : i32, mhlo.num_replicas = 1 : i32} {
+  sdy.mesh @mesh = <["x"=2]> {stablehlo.mesh = {axes = [{name = "x", size = 2 : i64}]}}
+  func.func private @add_float32_reducer(%arg0: tensor<f32>, %arg1: tensor<f32>) -> tensor<f32> {
+    %0 = stablehlo.add %arg0, %arg1 : tensor<f32>
+    return %0 : tensor<f32>
+  }
+  func.func public @main(%arg0: tensor<4xf32> {sdy.sharding = #sdy.sharding<@mesh, [{"x"}]>}) -> (tensor<2xf32> {jax.result_info = "result", sdy.sharding = #sdy.sharding<@mesh, [{"x"}]>}) {
+    %0 = sdy.manual_computation(%arg0) in_shardings=[<@mesh, [{"x"}]>] out_shardings=[<@mesh, [{"x"}]>] manual_axes={"x"} (%arg1: tensor<2xf32>) {
+      %2 = stablehlo.custom_call @"reduce-scatter-start"(%arg1) {backend_config = "", called_computations = [@add_float32_reducer], mhlo.frontend_attributes = {async_collective_config = "{\22scatter_dimension\22: 0, \22replica_groups\22: [[0, 1]], \22tiled\22: true, \22use_global_device_ids\22: true, \22channel_id\22: 1}"}} : (tensor<2xf32>) -> tensor<1xf32>
+      %3 = stablehlo.custom_call @"reduce-scatter-done"(%2) {backend_config = ""} : (tensor<1xf32>) -> tensor<1xf32>
+      sdy.return %3 : tensor<1xf32>
+    } : (tensor<4xf32>) -> tensor<2xf32>
+    %1 = sdy.sharding_constraint %0 <@mesh, [{"x"}]> : tensor<2xf32>
+    return %1 : tensor<2xf32>
+  }
+}
+"##,
+            ),
+            (
+                "all_to_all_start_done",
+                r##"
+module @jit__lambda attributes {mhlo.num_partitions = 2 : i32, mhlo.num_replicas = 1 : i32} {
+  sdy.mesh @mesh = <["x"=2]> {stablehlo.mesh = {axes = [{name = "x", size = 2 : i64}]}}
+  func.func public @main(%arg0: tensor<4xf32> {sdy.sharding = #sdy.sharding<@mesh, [{"x"}]>}) -> (tensor<4xf32> {jax.result_info = "result", sdy.sharding = #sdy.sharding<@mesh, [{"x"}]>}) {
+    %0 = sdy.manual_computation(%arg0) in_shardings=[<@mesh, [{"x"}]>] out_shardings=[<@mesh, [{"x"}]>] manual_axes={"x"} (%arg1: tensor<2xf32>) {
+      %2 = stablehlo.custom_call @"all-to-all-start"(%arg1) {backend_config = "", mhlo.frontend_attributes = {async_collective_config = "{\22split_dimension\22: 0, \22concat_dimension\22: 0, \22split_count\22: 2, \22replica_groups\22: [[0, 1]], \22channel_id\22: 1}"}} : (tensor<2xf32>) -> tensor<2xf32>
+      %3 = stablehlo.custom_call @"all-to-all-done"(%2) {backend_config = ""} : (tensor<2xf32>) -> tensor<2xf32>
+      sdy.return %3 : tensor<2xf32>
+    } : (tensor<4xf32>) -> tensor<4xf32>
+    %1 = sdy.sharding_constraint %0 <@mesh, [{"x"}]> : tensor<4xf32>
+    return %1 : tensor<4xf32>
+  }
+}
+"##,
+            ),
+            ("psend_precv", send_recv),
+            ("psend_precv_acyclic", acyclic_send_recv.as_str()),
+        ];
+        let Ok(role) = std::env::var(MULTI_HOST_TEST_ROLE) else {
+            return;
+        };
+        run_as_cuda_rank(role.parse().unwrap(), |client| {
+            let rank = client.process_index().unwrap();
+            let device = client.addressable_devices().unwrap().remove(0);
+            for (name, module) in modules {
+                let compiled = client.compile(
+                    &PjrtProgram::Mlir { bytecode: module.trim_start().as_bytes().to_vec() },
+                    &test_spmd_compilation_options(2),
+                );
+                let executable = match compiled {
+                    Ok(executable) => executable,
+                    Err(error) => {
+                        // XLA's verifier messages end with the offending instruction, whose generated names change
+                        // between XLA versions, so the probe keeps only the stable part of the first line.
+                        let message = error.to_string();
+                        let message = message.lines().next().unwrap_or("").split(", but found").next().unwrap();
+                        println!("probe: rank {rank} {name}: compilation failed: {message}");
+                        continue;
+                    }
+                };
+                let tile = values_to_bytes(&[2.0 * rank as f32 + 1.0, 2.0 * rank as f32 + 2.0]);
+                let buffer =
+                    client.buffer(tile.as_slice(), BufferType::F32, [2u64], None, device.clone(), None).unwrap();
+                let inputs = vec![ExecutionInput { buffer: Arc::new(buffer), donatable: false }];
+                let executed = executable
+                    .execute(
+                        vec![ExecutionDeviceInputs { inputs: &inputs, ..Default::default() }],
+                        Vec::new(),
+                        0,
+                        None,
+                        None,
+                        None,
+                        None,
+                        &[],
+                    )
+                    .and_then(|execution| execution.block_until_ready())
+                    .and_then(|mut outputs| outputs.remove(0).outputs.remove(0).copy_to_host(None)?.r#await());
+                match executed {
+                    Ok(bytes) => {
+                        println!("probe: rank {rank} {name}: {:?}", values_from_bytes::<f32>(bytes.as_slice()))
+                    }
+                    Err(error) => {
+                        println!(
+                            "probe: rank {rank} {name}: execution failed: {}",
+                            error.to_string().lines().next().unwrap_or("")
+                        )
+                    }
+                }
+            }
+        });
+    }
+
+    #[cfg(feature = "cuda-13")]
+    #[test]
+    #[ignore = "requires one CUDA GPU with NCCL multi-rank support and CUDA MPS"]
+    fn test_gpu_only_collectives_on_two_cuda_processes() {
+        // Pins what Ryft's pinned XLA supports of JAX's GPU-only collectives across two processes, as each rank observes
+        // it. Following JAX's semantics, `pbroadcast` from source 1 gives both ranks `[3, 4]`, the swapping `ppermute`
+        // gives `[3, 4]` and `[1, 2]`, the tiled all-gather gives both ranks `[1, 2, 3, 4]`, the tiled sum scatter of the
+        // sum `[4, 6]` gives `[4]` and `[6]`, and the all-to-all gives `[1, 3]` and `[2, 4]`. XLA rejects the swapping
+        // send/recv, whose pairs form a cycle, while the acyclic variant delivers `[1, 2]` to rank 1 and leaves the
+        // received value of rank 0, which no pair targets, zero.
+        let Some(outputs) = run_cuda_rank_pair("distributed::tests::test_gpu_only_collectives_cuda_process_helper")
+        else {
+            return;
+        };
+        // libtest prints `test <name> ... ` without a line break before the helper runs, so the first probe line of each
+        // rank follows that prefix.
+        let probes = outputs
+            .iter()
+            .flat_map(|output| output.lines().filter_map(|line| line.split_once("probe: ").map(|(_, probe)| probe)))
+            .collect::<Vec<_>>()
+            .join("\n");
+        assert_eq!(
+            probes,
+            indoc! {"
+                rank 0 pbroadcast: [3.0, 4.0]
+                rank 0 ppermute_start_done: [3.0, 4.0]
+                rank 0 all_gather_start_done: [1.0, 2.0, 3.0, 4.0]
+                rank 0 psum_scatter_start_done: [4.0]
+                rank 0 all_to_all_start_done: [1.0, 3.0]
+                rank 0 psend_precv: compilation failed: during context [hlo verifier]: Expected send and recv \
+                    instructions to have non-cyclical source-target pairs
+                rank 0 psend_precv_acyclic: [0.0, 0.0]
+                rank 1 pbroadcast: [3.0, 4.0]
+                rank 1 ppermute_start_done: [1.0, 2.0]
+                rank 1 all_gather_start_done: [1.0, 2.0, 3.0, 4.0]
+                rank 1 psum_scatter_start_done: [6.0]
+                rank 1 all_to_all_start_done: [2.0, 4.0]
+                rank 1 psend_precv: compilation failed: during context [hlo verifier]: Expected send and recv \
+                    instructions to have non-cyclical source-target pairs
+                rank 1 psend_precv_acyclic: [1.0, 2.0]"},
+        );
+    }
+
+    /// Worker of `test_parallel_broadcast_on_two_cuda_processes`, which returns immediately unless that test launched
+    /// it as one of its two ranks. It stages a `shard_map` of `parallel_broadcast` over a mesh `x = 2` whose input
+    /// `f32[4]` is sharded along `x`, lowers it for this CUDA client through Ryft, executes it with this rank's tile of
+    /// `[1, 2, 3, 4]`, and prints a `probe:` line with this rank's output shard and the custom call targets of the
+    /// lowered module.
+    #[cfg(feature = "cuda-13")]
+    #[test]
+    fn test_parallel_broadcast_cuda_process_helper() {
+        let Ok(role) = std::env::var(MULTI_HOST_TEST_ROLE) else {
+            return;
+        };
+        run_as_cuda_rank(role.parse().unwrap(), |client| {
+            let rank = client.process_index().unwrap();
+            let devices = client
+                .devices()
+                .unwrap()
+                .iter()
+                .map(|device| Device::from_pjrt(device).unwrap())
+                .collect::<Vec<_>>();
+            let domain = Session::new(client).domain();
+            let manual_mesh = LogicalMesh::new(vec![MeshAxis::new("x", 2, MeshAxisType::Manual).unwrap()]).unwrap();
+            let mesh = DeviceMesh::new(manual_mesh.clone(), devices).unwrap();
+            let sharded = Sharding::new(manual_mesh.clone(), vec![ShardingDimension::sharded(["x"])]).unwrap();
+            let input_type = ArrayType::new_static(DataType::F32, [4]).with_sharding(sharded.clone()).unwrap();
+            let input = Array::from_host_buffer(
+                &domain,
+                input_type.clone(),
+                mesh.clone(),
+                values_to_bytes(&[1f32, 2., 3., 4.]),
+            )
+            .unwrap();
+
+            // Stages, lowers, compiles, and executes the `shard_map` of `$body` with the output sharding
+            // `$output_sharding`, and prints its probe line.
+            macro_rules! probe {
+                ($name:literal, $output_sharding:expr, $body:expr $(,)?) => {{
+                    let output_sharding = $output_sharding;
+                    let staged = crate::stage::<_, ArrayType, ArrayType>(
+                        |x| {
+                            shard_map(
+                                $body,
+                                x,
+                                manual_mesh.clone(),
+                                sharded.clone(),
+                                output_sharding.clone(),
+                                ShardMapOptions::new(),
+                            )
+                            .unwrap()
+                        },
+                        input_type.clone(),
+                        Options::new(mesh.clone()),
+                    )
+                    .unwrap()
+                    .into_inner();
+                    let lowered = staged.lower(&domain).unwrap();
+                    let targets = lowered
+                        .lowered_program()
+                        .stable_hlo()
+                        .split("stablehlo.custom_call @")
+                        .skip(1)
+                        .map(|call| call.split('(').next().unwrap().trim_matches('"').to_string())
+                        .collect::<Vec<_>>();
+                    let compiled = lowered.compile(&domain).unwrap();
+                    let output = compiled.executable().execute(&domain, Value::Array(input.clone())).unwrap();
+                    let Value::Array(output) = output else {
+                        panic!("the compiled function returned a dimension");
+                    };
+                    println!("probe: rank {rank} {}: {:?} {:?}", $name, read_addressable_f32s(&output)[0], targets);
+                }};
+            }
+
+            probe!("parallel_broadcast", sharded.clone(), |x| Ok(x.parallel_broadcast("x", 1)?));
+        });
+    }
+
+    #[cfg(feature = "cuda-13")]
+    #[test]
+    #[ignore = "requires one CUDA GPU with NCCL multi-rank support and CUDA MPS"]
+    fn test_parallel_broadcast_on_two_cuda_processes() {
+        // Ryft's CUDA lowering of `parallel_broadcast` (i.e., `collective_broadcast`) executes across two processes
+        // with JAX's values (refer to `test_gpu_only_collectives_on_two_cuda_processes`).
+        let Some(outputs) = run_cuda_rank_pair("distributed::tests::test_parallel_broadcast_cuda_process_helper")
+        else {
+            return;
+        };
+        let probes = outputs
+            .iter()
+            .flat_map(|output| output.lines().filter_map(|line| line.split_once("probe: ").map(|(_, probe)| probe)))
+            .collect::<Vec<_>>()
+            .join("\n");
+        assert_eq!(
+            probes,
+            indoc! {"
+                rank 0 parallel_broadcast: [3.0, 4.0] []
+                rank 1 parallel_broadcast: [3.0, 4.0] []"},
+        );
     }
 }

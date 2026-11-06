@@ -195,7 +195,7 @@ mod tests {
     #[cfg(feature = "cuda-13")]
     use pretty_assertions::assert_eq;
     #[cfg(feature = "cuda-13")]
-    use ryft_core::{DataType, EffectClass, TracingContext, Value as CoreValue};
+    use ryft_core::{DataType, EffectClass, ReferenceRead, ReferenceWrite, TracingContext};
     use ryft_pjrt::{ClientOptions, CpuClientOptions, load_cpu_plugin};
     #[cfg(feature = "cuda-13")]
     use ryft_pjrt::{GpuClientOptions, GpuMemoryAllocator, GpuPlatform, load_cuda_13_plugin};

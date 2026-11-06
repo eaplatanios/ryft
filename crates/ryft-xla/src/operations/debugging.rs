@@ -459,7 +459,7 @@ fn copy_value_to_outputs(
             PrintBufferMemory::Host => {}
             #[cfg(any(feature = "cuda-12", feature = "cuda-13"))]
             PrintBufferMemory::Cuda(_) => {
-                return Err(FfiPjrtError::unimplemented(format!(
+                return Err(FfiError::unimplemented(format!(
                     "the `{PRINT_CUSTOM_CALL_TARGET}` custom call cannot copy its value to a CUDA device output buffer"
                 )));
             }

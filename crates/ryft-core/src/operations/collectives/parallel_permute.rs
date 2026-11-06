@@ -352,7 +352,7 @@ where
         }
 
         let input = P::match_axis(context, input, 0.into())?;
-        let permuted = route_axis_slices(input.value(), 0, sources.as_slice())?;
+        let permuted = route_axis_slices(PARALLEL_PERMUTE_OPERATION_NAME, input.value(), 0, sources.as_slice())?;
         Ok(vec![ArrayBatch::new(permuted, Some(0))?])
     }
 }
@@ -582,17 +582,19 @@ where
 
 /// Returns `value` with its slices along `axis` routed from their source positions to their target positions.
 /// Specifically, slice `target` of the result is slice `sources[target]` of `value`, or a slice of zeros when
-/// `sources[target]` is `None`. The result has `sources.len()` slices along `axis` and otherwise the shape of `value`.
-/// For example, routing the rows `[a, b, c]` with `sources = [None, Some(0), Some(1)]` yields `[0, a, b]`.
+/// `sources[target]` is `None`. The result has `sources.len()` slices along `axis` and otherwise the shape of
+/// `value`. For example, routing the rows `[a, b, c]` with `sources = [None, Some(0), Some(1)]` yields `[0, a, b]`.
 ///
-/// The batching rule of [`ParallelPermuteOperation`] applies this function along the batch axis, where every slice is
-/// one batch item and untargeted items receive zero-filled values.
+/// The batching rules of [`ParallelPermuteOperation`] and
+/// [`ParallelBroadcastOperation`](crate::ParallelBroadcastOperation) apply this function along the batch axis,
+/// where every slice is one batch item and untargeted items receive zero-filled values.
 ///
 /// # Errors
 ///
-/// Returns a [`BatchingError`] if `value` is not statically shaped, or if staging one of the slices, the zero slice,
-/// or the concatenation fails.
-fn route_axis_slices<V: Value<Type = ArrayType> + ZeroLike + Concatenate + Slice + Transpose + Reshard>(
+/// Returns a [`BatchingError`] naming `operation_name` if `value` is not statically shaped, or if staging one of the
+/// slices, the zero slice, or the concatenation fails.
+pub(super) fn route_axis_slices<V: Value<Type = ArrayType> + ZeroLike + Concatenate + Slice + Transpose + Reshard>(
+    operation_name: &str,
     value: &V,
     axis: usize,
     sources: &[Option<usize>],
@@ -600,7 +602,7 @@ fn route_axis_slices<V: Value<Type = ArrayType> + ZeroLike + Concatenate + Slice
     let value = if axis == 0 { value.clone() } else { value.clone().move_axis(axis, 0)? };
     let Some(shape) = value.r#type().static_shape() else {
         return Err(BatchingError::UnsupportedOperation {
-            message: format!("`{PARALLEL_PERMUTE_OPERATION_NAME}` batching requires statically shaped inputs"),
+            message: format!("`{operation_name}` batching requires statically shaped inputs"),
         });
     };
     let dimensions = shape.dimensions().to_vec();
@@ -631,11 +633,18 @@ fn route_axis_slices<V: Value<Type = ArrayType> + ZeroLike + Concatenate + Slice
         value.slice(&start_indices, &limit_indices, &strides)
     };
 
+    // Every source item is sliced once, even when several targets receive it (e.g., in a broadcast).
+    let mut source_items = vec![None; dimensions[0]];
     let mut zero_item = None;
     let mut items = Vec::with_capacity(sources.len());
     for source in sources {
         match source {
-            Some(source) => items.push(slice_item(*source)?),
+            Some(source) => {
+                if source_items[*source].is_none() {
+                    source_items[*source] = Some(slice_item(*source)?);
+                }
+                items.push(source_items[*source].clone().unwrap());
+            }
             None => {
                 if zero_item.is_none() {
                     zero_item = Some(slice_item(0)?.zero_like()?);

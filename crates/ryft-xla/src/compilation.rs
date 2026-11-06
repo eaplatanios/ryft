@@ -36,11 +36,15 @@
 //! returned final value. Read snapshots and retained initializers consequently remain immutable even when a backend
 //! chooses to reuse storage.
 //!
-//! Calls reject unsupported state before launch. The admitted boundary is device-memory state on a fully addressable,
-//! single-process mesh: static references may be replicated or sharded with identical input/final-state sharding;
-//! finite bounded-dynamic references are read-only and replicated. Zero-space, host-memory, unbounded-dynamic,
-//! dynamic nonreplicated, input-bucketed, foreign/non-addressable-mesh, multi-host, and bounded-dynamic mutation cases
-//! are rejected. Reference arguments must be distinct root handles. Internal accesses carry transform paths and dynamic
+//! Calls reject unsupported state before launch. The admitted boundary is device-memory state on a mesh in which the
+//! calling process participates (i.e., every device is visible to its client under the process that owns it, and at
+//! least one is addressable by this process): static references may be replicated or sharded with identical
+//! input/final-state sharding; finite bounded-dynamic references are read-only and replicated, and only on a fully
+//! addressable, single-process mesh. Over a mesh that spans processes (multi-host execution), every process calls with
+//! its own reference over the same mesh, binds and commits only its addressable shards, and so each process commits its
+//! own part of the final state; as for any multi-controller output, a failure on one process does not roll back the
+//! commits of the others. Zero-space, host-memory, unbounded-dynamic, dynamic nonreplicated, input-bucketed,
+//! foreign/unknown-device or non-participating-mesh, and bounded-dynamic mutation cases are rejected. Reference arguments must be distinct root handles. Internal accesses carry transform paths and dynamic
 //! indices, which discharge rewrites as array operations before compilation. Views are not separate program values
 //! and cannot cross this boundary.
 //!

@@ -2211,7 +2211,9 @@ mod tests {
         )
         .unwrap();
         assert_eq!(cold.report.device_to_host_shard_copies, 4);
-        assert_eq!(cold.report.host_merge_buffer_allocations, 1);
+        // Each shard of the leading dimension is a contiguous range of the dense source, so the shards are copied
+        // directly into one destination and no merge buffer is allocated.
+        assert_eq!(cold.report.host_merge_buffer_allocations, 0);
         assert_eq!(cold.report.host_padding_payload_allocations, 1);
         assert_eq!(cold.report.host_to_device_shard_uploads, 4);
         let retained = cold.inputs[0].clone();

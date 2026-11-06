@@ -2603,8 +2603,10 @@ mod tests {
 
     use ryft_macros::Parameterized;
 
-    use crate::arrays::{Array, ArrayIrOperation, ArrayIrValue, ArrayOperation, ArrayReference, ArrayType, DataType};
-    use crate::axes::{NamedAxes, NamedAxis};
+    use crate::arrays::{
+        Array, ArrayIrOperation, ArrayIrValue, ArrayOperation, ArrayReference, ArrayType, DataType, LogicalMesh,
+    };
+    use crate::axes::{MeshContext, NamedAxes, NamedAxis};
     use crate::batching::{BatchAxis, batch};
     use crate::contexts::{Context, Domain, EagerContext, StagingContext, ValueResolution};
     use crate::operations::{Complex, One, Real, Reduce, ReductionKind};
@@ -3121,6 +3123,12 @@ mod tests {
 
             fn named_axes(&self) -> Vec<(String, NamedAxis)> {
                 self.0.named_axes()
+            }
+        }
+
+        impl MeshContext for ExplicitContext {
+            fn default_mesh(&self) -> Option<LogicalMesh> {
+                self.0.default_mesh()
             }
         }
 

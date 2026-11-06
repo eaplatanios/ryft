@@ -31,25 +31,8 @@ pub(crate) fn lower_parallel_all_gather_to_mlir<'b, 'c: 'b, 't: 'c>(
         operation.options().axis_index_groups(),
     )?;
     let replica_groups: Vec<&[usize]> = replica_groups.iter().map(Vec::as_slice).collect();
-    let input_value = match operation.options().mode() {
-        CollectiveMode::Tiled => input_value,
-        CollectiveMode::Untiled => {
-            let mut dimensions = output_array_type.shape().dimensions().to_vec();
-            dimensions[operation.concatenation_axis()] = CoreDimension::Static(1);
-            let input_type =
-                lower_tensor_type(&output_array_type.clone().with_shape(Shape::new(dimensions)), context, location)?;
-            let broadcast_dimensions = (0..output_array_type.rank())
-                .filter(|&axis| axis != operation.concatenation_axis())
-                .collect::<Vec<_>>();
-            let broadcast = block.append_operation(stable_hlo::broadcast(
-                input_value,
-                input_type,
-                broadcast_dimensions.as_slice(),
-                location,
-            )?)?;
-            broadcast.result(0).expect("stablehlo.broadcast_in_dim should return one result").as_ref()
-        }
-    };
+    let input_value =
+        insert_untiled_all_gather_axis(operation, input_value, output_array_type, block, context, location)?;
     let output_type = lower_tensor_type(output_array_type, context, location)?;
     let result = block.append_operation(stable_hlo::all_gather(
         &[input_value],
@@ -62,6 +45,35 @@ pub(crate) fn lower_parallel_all_gather_to_mlir<'b, 'c: 'b, 't: 'c>(
         location,
     )?)?;
     Ok(vec![result.result(0).expect("stablehlo.all_gather should return one result").as_ref()])
+}
+
+/// Returns `input_value` with the unit participant axis that an untiled all-gather inserts at its concatenation axis,
+/// so that the all-gather of the result along that axis is tiled, or `input_value` itself for a tiled all-gather.
+pub(crate) fn insert_untiled_all_gather_axis<'b, 'c: 'b, 't: 'c>(
+    operation: &ParallelAllGatherOperation,
+    input_value: ValueRef<'b, 'c, 't>,
+    output_array_type: &ArrayType,
+    block: &mut BlockRef<'b, 'c, 't>,
+    context: &'c MlirContext<'t>,
+    location: LocationRef<'c, 't>,
+) -> Result<ValueRef<'b, 'c, 't>, Error> {
+    if operation.options().mode() == CollectiveMode::Tiled {
+        return Ok(input_value);
+    }
+    let mut dimensions = output_array_type.shape().dimensions().to_vec();
+    dimensions[operation.concatenation_axis()] = CoreDimension::Static(1);
+    let input_type =
+        lower_tensor_type(&output_array_type.clone().with_shape(Shape::new(dimensions)), context, location)?;
+    let broadcast_dimensions = (0..output_array_type.rank())
+        .filter(|&axis| axis != operation.concatenation_axis())
+        .collect::<Vec<_>>();
+    let broadcast = block.append_operation(stable_hlo::broadcast(
+        input_value,
+        input_type,
+        broadcast_dimensions.as_slice(),
+        location,
+    )?)?;
+    Ok(broadcast.result(0).expect("stablehlo.broadcast_in_dim should return one result").as_ref())
 }
 
 impl LowerableOperation for ParallelAllGatherOperation {

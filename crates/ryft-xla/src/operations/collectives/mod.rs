@@ -14,6 +14,8 @@ pub(crate) mod axis_index;
 pub(crate) mod parallel_all_gather;
 /// StableHLO lowering of `parallel_all_to_all`.
 pub(crate) mod parallel_all_to_all;
+/// StableHLO lowering of `parallel_broadcast`.
+pub(crate) mod parallel_broadcast;
 /// StableHLO lowering of `parallel_cast`.
 pub(crate) mod parallel_cast;
 /// StableHLO lowering of `parallel_permute`.

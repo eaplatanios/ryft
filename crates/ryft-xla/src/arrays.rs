@@ -1855,6 +1855,46 @@ mod tests {
     }
 
     #[test]
+    fn test_dense_host_materialization_copies_contiguous_tiles_in_place() {
+        // On a `2x2` mesh, a `[4, 2]` array whose rows are sharded along `x` has two distinct tiles, each one contiguous
+        // range of the dense array, so one replica of each is copied directly into place without a merge. Sharding its
+        // columns makes the tiles non-contiguous, so every shard is copied into its own buffer and merged, and a
+        // replicated array needs a single copy.
+        let plugin = load_cpu_plugin().unwrap();
+        let client = plugin
+            .client(ClientOptions::CPU(CpuClientOptions { device_count: Some(4), ..Default::default() }))
+            .unwrap();
+        let domain = Session::new(&client).domain();
+        let logical_mesh = LogicalMesh::new(vec![
+            MeshAxis::new("x", 2, MeshAxisType::Explicit).unwrap(),
+            MeshAxis::new("y", 2, MeshAxisType::Explicit).unwrap(),
+        ])
+        .unwrap();
+        let devices = client.addressable_devices().unwrap();
+        let mesh = DeviceMesh::new(
+            logical_mesh.clone(),
+            devices.iter().map(|device| Device::from_pjrt(device).unwrap()).collect(),
+        )
+        .unwrap();
+        let values = [1f32, 2., 3., 4., 5., 6., 7., 8.];
+        let materialize = |dimensions: Vec<ShardingDimension>| {
+            let sharding = Sharding::new(logical_mesh.clone(), dimensions).unwrap();
+            let r#type = ArrayType::new_static(DataType::F32, [4, 2]).with_sharding(sharding).unwrap();
+            let array = Array::from_host_buffer(&domain, r#type, mesh.clone(), values_to_bytes(&values)).unwrap();
+            let copy = crate::arrays_v0::host::begin_materialize_dense_array_bytes(&array).unwrap();
+            let shard_copy_count = copy.shard_copy_count();
+            let (bytes, merged) = copy.finish_with_measurements().unwrap();
+            (values_from_bytes::<f32>(bytes.as_slice()), shard_copy_count, merged)
+        };
+        let rows = vec![ShardingDimension::sharded(["x"]), ShardingDimension::replicated()];
+        let columns = vec![ShardingDimension::replicated(), ShardingDimension::sharded(["x"])];
+        let replicated = vec![ShardingDimension::replicated(), ShardingDimension::replicated()];
+        assert_eq!(materialize(rows), (values.to_vec(), 2, false));
+        assert_eq!(materialize(columns), (values.to_vec(), 4, true));
+        assert_eq!(materialize(replicated), (values.to_vec(), 1, false));
+    }
+
+    #[test]
     fn test_unreduced_array_host_transfers() {
         // Along the unreduced axis `x`, the devices hold summands of the logical value, and `y` tiles its only
         // dimension. A host upload places the whole value on the devices at coordinate zero along `x` and zeros on the

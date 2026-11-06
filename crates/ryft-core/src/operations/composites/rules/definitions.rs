@@ -7,7 +7,7 @@ use std::sync::atomic::{AtomicU64, Ordering};
 use std::sync::{Arc, Mutex, Weak};
 use std::thread::ThreadId;
 
-use crate::arrays::{ArrayType, DataType, ShardingDimension};
+use crate::arrays::{ArrayType, DataType, LogicalMesh, ShardingDimension};
 use crate::axes::NamedAxis;
 use crate::batching::{
     BatchAxis, BatchableType, BatchedProgram, BatchingError, BatchingLevel, BatchingPolicy, DiagonalBatchingPolicy,
@@ -1032,6 +1032,9 @@ pub struct CustomRuleDefinition<V: Typed + Parameter, O> {
     /// Named axes with which every rule is traced.
     named_axes: Vec<(String, NamedAxis)>,
 
+    /// Default mesh with which every rule is traced (refer to [`MeshContext`](crate::MeshContext)).
+    default_mesh: Option<LogicalMesh>,
+
     /// Optional named computation that the calls of this definition compute, which definitions derived from
     /// this definition never inherit because they describe other computations.
     named_composite: Option<NamedComposite<V, O>>,
@@ -1117,6 +1120,7 @@ impl<V: Typed<Type: Eq + Hash> + Parameter, O> CustomRuleDefinition<V, O> {
             id: NEXT_CUSTOM_RULE_DEFINITION_ID.fetch_add(1, Ordering::Relaxed),
             name: name.into(),
             named_axes: Vec::new(),
+            default_mesh: None,
             named_composite: None,
             jvp: None,
             vjp: None,
@@ -1131,12 +1135,13 @@ impl<V: Typed<Type: Eq + Hash> + Parameter, O> CustomRuleDefinition<V, O> {
         }
     }
 
-    /// Creates a definition derived from this definition, inheriting its named axes and transform support. The derived
-    /// definition uses its primal region for forward mode and the provided derived batching rule, with no reverse
-    /// mode rules or explicit output batch axes of its own.
+    /// Creates a definition derived from this definition, inheriting its named axes, default mesh, and transform
+    /// support. The derived definition uses its primal region for forward mode and the provided derived batching rule,
+    /// with no reverse mode rules or explicit output batch axes of its own.
     pub(super) fn new_derived(&self, name: String, batching_rule: Option<CustomRuleBatching<V, O>>) -> Self {
         Self {
             named_axes: self.named_axes.clone(),
+            default_mesh: self.default_mesh.clone(),
             jvp: Some(CustomRuleJvp::Derived),
             structural_batcher: self.structural_batcher.clone(),
             sequential_batching_scan: self.sequential_batching_scan.clone(),
@@ -1153,6 +1158,16 @@ impl<V: Typed<Type: Eq + Hash> + Parameter, O> CustomRuleDefinition<V, O> {
     #[inline]
     pub fn with_named_axes(mut self, named_axes: Vec<(String, NamedAxis)>) -> Self {
         self.named_axes = named_axes;
+        self
+    }
+
+    /// Returns this [`CustomRuleDefinition`] with the provided default mesh (refer to
+    /// [`MeshContext`](crate::MeshContext)), with which every rule is traced, for the same reason as
+    /// [`Self::with_named_axes`]. The definitions that are derived from this definition trace their rules with the
+    /// same default mesh.
+    #[inline]
+    pub fn with_default_mesh(mut self, default_mesh: Option<LogicalMesh>) -> Self {
+        self.default_mesh = default_mesh;
         self
     }
 
@@ -1640,6 +1655,12 @@ impl<V: Typed<Type: Eq + Hash> + Parameter, O> CustomRuleDefinition<V, O> {
     #[inline]
     pub fn named_axes(&self) -> &[(String, NamedAxis)] {
         &self.named_axes
+    }
+
+    /// Returns the default mesh with which the rules of this [`CustomRuleDefinition`] are traced.
+    #[inline]
+    pub fn default_mesh(&self) -> Option<&LogicalMesh> {
+        self.default_mesh.as_ref()
     }
 
     /// Returns the named computation that the calls of this [`CustomRuleDefinition`] compute, or [`None`]

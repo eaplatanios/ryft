@@ -193,15 +193,6 @@ impl<'c> CompilationDomain for Domain<'c> {
                         ),
                     }));
                 }
-                ArrayIrType::Future(_) => {
-                    return Err(Error::Compilation(CompilationError::InvalidOptions {
-                        reason: format!(
-                            "input-bound bucketing only supports array inputs, but input {input_index} has future type \
-                             {type}",
-                            type = r#type,
-                        ),
-                    }));
-                }
                 ArrayIrType::Reference(_) => {
                     return Err(Error::Compilation(CompilationError::UnsupportedReferenceAbi {
                         reason: format!(
@@ -370,9 +361,14 @@ impl<'c> Domain<'c> {
             ))
             .into());
         }
-        if !reference_states.is_empty() && !self.target()?.is_fully_addressable_single_process_mesh(&options.mesh) {
+        // Each process binds, executes, and commits only its addressable shards of a reference, so a mesh that spans
+        // processes is admitted as long as this process participates in it (refer to `Target::is_participating_mesh`).
+        if !reference_states.is_empty() && !self.target()?.is_participating_mesh(&options.mesh) {
             return Err(Error::Compilation(CompilationError::UnsupportedReferenceAbi {
-                reason: "external reference state requires a fully addressable single-process mesh".to_string(),
+                reason:
+                    "external reference state requires a mesh of devices that this client sees under the processes \
+                         that own them, at least one of which this process addresses"
+                        .to_string(),
             }));
         }
         if !reference_states.is_empty() && options.input_bound_bucketing.is_some() {
@@ -500,6 +496,15 @@ impl<'c> Domain<'c> {
                     return Err(Error::Compilation(CompilationError::UnsupportedReferenceAbi {
                         reason: format!(
                             "bounded-dynamic external state input {logical_input_index} must use replicated sharding",
+                        ),
+                    }));
+                }
+                // Bounded-dynamic inputs are padded through host copies, which have not been verified across processes.
+                if !self.target()?.is_fully_addressable_single_process_mesh(&options.mesh) {
+                    return Err(Error::Compilation(CompilationError::UnsupportedReferenceAbi {
+                        reason: format!(
+                            "bounded-dynamic external state input {logical_input_index} requires a fully addressable \
+                             single-process mesh",
                         ),
                     }));
                 }
@@ -863,7 +868,7 @@ fn apply_signature_shardings(
     for (r#type, sharding) in types.iter_mut().zip(shardings) {
         *r#type = match r#type {
             ArrayIrType::Array(array_type) => array_type.clone().with_sharding(sharding.clone())?.into(),
-            ArrayIrType::Dimension(_) | ArrayIrType::Reference(_) | ArrayIrType::Future(_) => {
+            ArrayIrType::Dimension(_) | ArrayIrType::Reference(_) => {
                 return Err(ProgramError::from(TypeError::invalid(format!(
                     "cannot apply an array sharding to type `{type}`",
                 )))
@@ -887,7 +892,6 @@ fn has_only_static_array_types(program: &FlatProgram) -> bool {
             // firing first: a dynamically shaped referent counts as dynamic so that partitioner selection and its
             // guards stay correct even for programs whose only dynamic type is a reference referent.
             ArrayIrType::Reference(reference_type) => reference_type.referent().static_shape().is_some(),
-            ArrayIrType::Future(future_type) => future_type.eventual().static_shape().is_some(),
         })
     })
 }
@@ -1166,8 +1170,6 @@ fn data_dependent_padding_discipline(operation: &Operation) -> DataDependentPadd
         | Operation::ParallelAllGather(_)
         | Operation::ParallelSumScatter(_)
         | Operation::ParallelAllToAll(_)
-        | Operation::ParallelStart(_)
-        | Operation::ParallelDone(_)
         | Operation::Condition(_)
         | Operation::While(_)
         | Operation::Scan(_)
@@ -3322,7 +3324,8 @@ mod tests {
                 &Options::new(foreign_mesh),
             ),
             Err(Error::Compilation(CompilationError::UnsupportedReferenceAbi { reason }))
-                if reason == "external reference state requires a fully addressable single-process mesh",
+                if reason == "external reference state requires a mesh of devices that this client sees under the processes \
+                     that own them, at least one of which this process addresses",
         ));
 
         let non_addressable_mesh = DeviceMesh::new(
@@ -3340,7 +3343,8 @@ mod tests {
                 &Options::new(non_addressable_mesh),
             ),
             Err(Error::Compilation(CompilationError::UnsupportedReferenceAbi { reason }))
-                if reason == "external reference state requires a fully addressable single-process mesh",
+                if reason == "external reference state requires a mesh of devices that this client sees under the processes \
+                     that own them, at least one of which this process addresses",
         ));
     }
 

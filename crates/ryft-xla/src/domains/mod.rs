@@ -270,6 +270,15 @@ impl ryft_core::NamedAxes for Domain<'_> {
     }
 }
 
+impl ryft_core::MeshContext for Domain<'_> {
+    fn default_mesh(&self) -> Option<ryft_core::LogicalMesh> {
+        // A domain that was given a device mesh (refer to `Domain::with_mesh`) owns the logical view of that mesh as its
+        // default, so eager code bound in it can omit meshes (e.g., `shard_map(.., None, ..)`), as under JAX's
+        // `jax.set_mesh`. A domain without a mesh has no default.
+        self.mesh.as_ref().map(|mesh| mesh.logical_mesh().clone())
+    }
+}
+
 #[cfg(test)]
 pub(crate) mod tests {
     use std::cell::RefCell;
