@@ -482,8 +482,6 @@ impl AxisTypeSwitch {
     }
 }
 
-// TODO(eaplatanios): Review from here onwards.
-
 /// Returns the [`Reshard`] target that retypes a value placed by `sharding` over `mesh`, which keeps its placement and
 /// reduction state along the axes that are not [`Auto`](MeshAxisType::Auto) in `mesh` and leaves its manual variation
 /// and manual reduction state to the reshard, which carries them over from its input.
