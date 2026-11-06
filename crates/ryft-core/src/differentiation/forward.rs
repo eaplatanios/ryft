@@ -921,15 +921,16 @@ impl<
     /// # Errors
     ///
     /// Returns the errors of [`Self::apply`], and errors from importing the retained values into `context`.
-    pub fn apply_in_context<X, Path>(
+    pub fn apply_in_context<CallerContext, Path>(
         &self,
-        context: &X,
-        tangents: Input::To<X::Value>,
-    ) -> Result<Output::To<X::Value>, ProgramError>
+        context: &CallerContext,
+        tangents: Input::To<CallerContext::Value>,
+    ) -> Result<Output::To<CallerContext::Value>, ProgramError>
     where
-        X: Context<Type = C::Type, Constant = C::Constant, Operation = C::Operation> + ImportingContext<C, Path>,
-        Input::Family: ParameterizedFamily<X::Value>,
-        Output::Family: ParameterizedFamily<X::Value>,
+        CallerContext:
+            Context<Type = C::Type, Constant = C::Constant, Operation = C::Operation> + ImportingContext<C, Path>,
+        Input::Family: ParameterizedFamily<CallerContext::Value>,
+        Output::Family: ParameterizedFamily<CallerContext::Value>,
         C::Operation: ResidualZeroProvider<C::Type, Operation = C::Operation>,
         TracingContext<C::Constant, C::Operation>:
             StagingContext<Type = C::Type, Constant = C::Constant, Operation = C::Operation>,
@@ -991,7 +992,7 @@ impl<
             .rebuild(context, tangent_outputs)?;
 
         // Restore the closure's original structured output shape after rebuilding every flattened tangent leaf.
-        Ok(Output::To::<X::Value>::from_parameters(self.output_structure.clone(), outputs)?)
+        Ok(Output::To::<CallerContext::Value>::from_parameters(self.output_structure.clone(), outputs)?)
     }
 }
 

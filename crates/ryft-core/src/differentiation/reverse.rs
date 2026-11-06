@@ -1596,17 +1596,18 @@ impl<
     ///
     /// Returns the errors of [`Self::materialize_cotangents`], and errors from importing the retained values
     /// into `context`.
-    pub fn materialize_cotangents_in_context<X, Path>(
+    pub fn materialize_cotangents_in_context<CallerContext, Path>(
         &self,
-        context: &X,
-        cotangents: Input::To<MaybeZero<X::Value>>,
-    ) -> Result<Input::To<X::Value>, ProgramError>
+        context: &CallerContext,
+        cotangents: Input::To<MaybeZero<CallerContext::Value>>,
+    ) -> Result<Input::To<CallerContext::Value>, ProgramError>
     where
-        X: Context<Type = C::Type, Constant = C::Constant, Operation = C::Operation> + ImportingContext<C, Path>,
-        Input::Family: ParameterizedFamily<X::Value>,
-        X: Zero<X::Value>,
+        CallerContext:
+            Context<Type = C::Type, Constant = C::Constant, Operation = C::Operation> + ImportingContext<C, Path>,
+        Input::Family: ParameterizedFamily<CallerContext::Value>,
+        CallerContext: Zero<CallerContext::Value>,
         C::Operation: ResidualZeroProvider<C::Type, Operation = C::Operation>,
-        Input::Family: ParameterizedFamily<MaybeZero<X::Value>>,
+        Input::Family: ParameterizedFamily<MaybeZero<CallerContext::Value>>,
     {
         let cotangents = cotangents.into_parameters().collect::<Vec<_>>();
         let expected = self.primal_input_types.len();
@@ -1649,7 +1650,7 @@ impl<
                 C::Operation::materialize_zero_from_residual_sources(context, cotangent, source.iter())
             })
             .collect::<Result<Vec<_>, _>>()?;
-        Ok(Input::To::<X::Value>::from_parameters(self.input_structure.clone(), values)?)
+        Ok(Input::To::<CallerContext::Value>::from_parameters(self.input_structure.clone(), values)?)
     }
 
     /// Applies this pullback and materializes its structural zeros from its retained zero sources. This combines
@@ -1699,16 +1700,17 @@ impl<
     /// Returns the errors of [`Self::apply_materialized`], and errors from importing the retained values
     /// into `context`.
     #[inline]
-    pub fn apply_materialized_in_context<X, Path>(
+    pub fn apply_materialized_in_context<CallerContext, Path>(
         &self,
-        context: &X,
-        cotangents: Output::To<X::Value>,
-    ) -> Result<Input::To<X::Value>, ProgramError>
+        context: &CallerContext,
+        cotangents: Output::To<CallerContext::Value>,
+    ) -> Result<Input::To<CallerContext::Value>, ProgramError>
     where
-        X: Context<Type = C::Type, Constant = C::Constant, Operation = C::Operation> + ImportingContext<C, Path>,
-        Output::Family: ParameterizedFamily<X::Value>,
-        Input::Family: ParameterizedFamily<X::Value>,
-        X: Zero<X::Value>,
+        CallerContext:
+            Context<Type = C::Type, Constant = C::Constant, Operation = C::Operation> + ImportingContext<C, Path>,
+        Output::Family: ParameterizedFamily<CallerContext::Value>,
+        Input::Family: ParameterizedFamily<CallerContext::Value>,
+        CallerContext: Zero<CallerContext::Value>,
         C::Operation: TransposableOperation<C::Constant, C::Operation>
             + ResidualZeroProvider<C::Type, Operation = C::Operation>
             + ReferenceAccessOperation<
@@ -1726,7 +1728,7 @@ impl<
                 >,
                 Operation = C::Operation,
             > + OperationProvider<C::Type, AddOperation<C::Type>, Operation = C::Operation>,
-        Input::Family: ParameterizedFamily<MaybeZero<X::Value>>,
+        Input::Family: ParameterizedFamily<MaybeZero<CallerContext::Value>>,
         TracingContext<C::Constant, C::Operation>:
             StagingContext<Type = C::Type, Constant = C::Constant, Operation = C::Operation>,
     {
@@ -1783,14 +1785,15 @@ impl<
     /// # Errors
     ///
     /// Returns the errors of [`Self::apply`], and errors from importing the retained values into `context`.
-    pub fn apply_in_context<X, Path>(
+    pub fn apply_in_context<CallerContext, Path>(
         &self,
-        context: &X,
-        cotangents: Output::To<X::Value>,
-    ) -> Result<Input::To<MaybeZero<X::Value>>, ProgramError>
+        context: &CallerContext,
+        cotangents: Output::To<CallerContext::Value>,
+    ) -> Result<Input::To<MaybeZero<CallerContext::Value>>, ProgramError>
     where
-        X: Context<Type = C::Type, Constant = C::Constant, Operation = C::Operation> + ImportingContext<C, Path>,
-        Output::Family: ParameterizedFamily<X::Value>,
+        CallerContext:
+            Context<Type = C::Type, Constant = C::Constant, Operation = C::Operation> + ImportingContext<C, Path>,
+        Output::Family: ParameterizedFamily<CallerContext::Value>,
         C::Operation: TransposableOperation<C::Constant, C::Operation>
             + ResidualZeroProvider<C::Type, Operation = C::Operation>
             + ReferenceAccessOperation<
@@ -1808,7 +1811,7 @@ impl<
                 >,
                 Operation = C::Operation,
             > + OperationProvider<C::Type, AddOperation<C::Type>, Operation = C::Operation>,
-        Input::Family: ParameterizedFamily<MaybeZero<X::Value>>,
+        Input::Family: ParameterizedFamily<MaybeZero<CallerContext::Value>>,
         TracingContext<C::Constant, C::Operation>:
             StagingContext<Type = C::Type, Constant = C::Constant, Operation = C::Operation>,
     {
@@ -1826,7 +1829,7 @@ impl<
             .collect::<Result<Vec<_>, _>>()?;
 
         // Restore the closure's original structured input shape after rebuilding every flattened cotangent leaf.
-        Ok(Input::To::<MaybeZero<X::Value>>::from_parameters(self.input_structure.clone(), cotangents)?)
+        Ok(Input::To::<MaybeZero<CallerContext::Value>>::from_parameters(self.input_structure.clone(), cotangents)?)
     }
 
     /// Pulls the provided structured output cotangent `seeds` back to the closure's inputs under the provided
@@ -1920,15 +1923,16 @@ impl<
     ///
     /// Returns the errors of [`Self::apply_with_destinations`], and errors from importing the retained values into
     /// `context`.
-    pub fn apply_with_destinations_in_context<X, Path>(
+    pub fn apply_with_destinations_in_context<CallerContext, Path>(
         &self,
-        context: &X,
-        seeds: Output::To<CotangentSeed<X::Value>>,
-        destinations: Input::To<CotangentDestination<X::Value>>,
-    ) -> Result<Input::To<Option<MaybeZero<X::Value>>>, ProgramError>
+        context: &CallerContext,
+        seeds: Output::To<CotangentSeed<CallerContext::Value>>,
+        destinations: Input::To<CotangentDestination<CallerContext::Value>>,
+    ) -> Result<Input::To<Option<MaybeZero<CallerContext::Value>>>, ProgramError>
     where
-        X: Context<Type = C::Type, Constant = C::Constant, Operation = C::Operation> + ImportingContext<C, Path>,
-        Output::Family: ParameterizedFamily<X::Value>,
+        CallerContext:
+            Context<Type = C::Type, Constant = C::Constant, Operation = C::Operation> + ImportingContext<C, Path>,
+        Output::Family: ParameterizedFamily<CallerContext::Value>,
         C::Operation: TransposableOperation<C::Constant, C::Operation>
             + ResidualZeroProvider<C::Type, Operation = C::Operation>
             + ReferenceAccessOperation<
@@ -1946,16 +1950,19 @@ impl<
                 >,
                 Operation = C::Operation,
             > + OperationProvider<C::Type, AddOperation<C::Type>, Operation = C::Operation>,
-        Input::Family:
-            ParameterizedFamily<CotangentDestination<X::Value>> + ParameterizedFamily<Option<MaybeZero<X::Value>>>,
-        Output::Family: ParameterizedFamily<CotangentSeed<X::Value>>,
+        Input::Family: ParameterizedFamily<CotangentDestination<CallerContext::Value>>
+            + ParameterizedFamily<Option<MaybeZero<CallerContext::Value>>>,
+        Output::Family: ParameterizedFamily<CotangentSeed<CallerContext::Value>>,
         TracingContext<C::Constant, C::Operation>:
             StagingContext<Type = C::Type, Constant = C::Constant, Operation = C::Operation>,
     {
         let seeds = seeds.into_parameters().collect::<Vec<_>>();
         let destinations = destinations.into_parameters().collect::<Vec<_>>();
         let cotangents = self.apply_impl(context, seeds, &destinations)?;
-        Ok(Input::To::<Option<MaybeZero<X::Value>>>::from_parameters(self.input_structure.clone(), cotangents)?)
+        Ok(Input::To::<Option<MaybeZero<CallerContext::Value>>>::from_parameters(
+            self.input_structure.clone(),
+            cotangents,
+        )?)
     }
 
     /// Replays a scalar gradient pullback and returns non-reference values at every input position. Reference
@@ -2037,14 +2044,15 @@ impl<
     /// [`Reference`](CotangentDestination::Reference) destinations are updated during replay, and
     /// [`Ignore`](CotangentDestination::Ignore) inputs expose no result. The transposed program is
     /// replayed in `context`, into which the retained residuals are imported.
-    fn apply_impl<X, Path>(
+    fn apply_impl<CallerContext, Path>(
         &self,
-        context: &X,
-        seeds: Vec<CotangentSeed<X::Value>>,
-        destinations: &[CotangentDestination<X::Value>],
-    ) -> Result<Vec<Option<MaybeZero<X::Value>>>, ProgramError>
+        context: &CallerContext,
+        seeds: Vec<CotangentSeed<CallerContext::Value>>,
+        destinations: &[CotangentDestination<CallerContext::Value>],
+    ) -> Result<Vec<Option<MaybeZero<CallerContext::Value>>>, ProgramError>
     where
-        X: Context<Type = C::Type, Constant = C::Constant, Operation = C::Operation> + ImportingContext<C, Path>,
+        CallerContext:
+            Context<Type = C::Type, Constant = C::Constant, Operation = C::Operation> + ImportingContext<C, Path>,
         C::Operation: TransposableOperation<C::Constant, C::Operation>
             + ResidualZeroProvider<C::Type, Operation = C::Operation>
             + ReferenceAccessOperation<
