@@ -23,18 +23,16 @@
 //! ```
 //!
 //! The entry reshards retype the inputs over the switched mesh, and the exit reshards retype the outputs back over the
-//! original mesh. Both are ordinary [`ReshardOperation`]s, so a switch adds no operation of its own, transforms (e.g.,
-//! differentiation and batching) see through it, and backends lower it as the reshards that it consists of (e.g., the
-//! XLA backend lowers each reshard as a sharding constraint whose dimensions stay open over auto axes, so that the
-//! compiler chooses the placement along them, as JAX does). Values that the function closes over keep their types
-//! over the original mesh, so operations that require the meshes of their inputs to match reject combining them with
-//! switched values (as JAX rejects them because the context mesh does not match the mesh of their types), whereas
-//! values without a sharding combine with values of either mesh.
+//! original mesh. Both are ordinary [`ReshardOperation`](crate::ReshardOperation)s, so a switch adds no operation of
+//! its own, transforms (e.g., differentiation and batching) see through it, and backends lower it as the reshards that
+//! it consists of (e.g., the XLA backend lowers each reshard as a sharding constraint whose dimensions stay open over
+//! auto axes, so that the compiler chooses the placement along them, as JAX does). Values that the function closes
+//! over keep their types over the original mesh, so operations that require the meshes of their inputs to match reject
+//! combining them with switched values (as JAX rejects them because the context mesh does not match the mesh of their
+//! types), whereas values without a sharding combine with values of either mesh.
 //!
-//! The switch is not recorded in the context of the function, so the [`default_mesh`](crate::MeshContext::default_mesh)
+//! The switch is not recorded in the context of the function, so the [`default_mesh`](MeshContext::default_mesh)
 //! of a context, which a nested `shard_map` without a mesh uses, keeps the original axis types inside the function.
-
-// TODO(eaplatanios): Review from here onwards.
 
 use std::collections::BTreeSet;
 
@@ -46,8 +44,7 @@ use crate::operations::sharding::reshard::Reshard;
 use crate::parameters::{Parameter, ParameterError, ParameterPath, Parameterized, ParameterizedFamily};
 use crate::programs::{ProgramError, Value};
 
-#[cfg(doc)]
-use crate::operations::sharding::reshard::ReshardOperation;
+// TODO(eaplatanios): Review from here onwards.
 
 /// Error returned by [`auto_axes`] and [`explicit_axes`].
 ///
