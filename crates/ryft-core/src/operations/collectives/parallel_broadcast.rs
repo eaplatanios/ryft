@@ -55,31 +55,42 @@ use crate::programs::{
 };
 use crate::tracing::{Tracer, TracingContext};
 
-/// Selects the source representation of a [`ParallelBroadcastOperation`]. Runtime values are instruction inputs,
-/// so this metadata describes their presence without storing a tracer or array inside the operation.
+/// Selects the participant whose value a parallel broadcast copies. [`ParallelBroadcast::parallel_broadcast`] accepts
+/// a static [`usize`], a borrowed runtime value, or an explicit selection through this enum. The value parameter `V`
+/// is a borrowed value in the frontend and `()` in operation metadata. [`ParallelBroadcastOperation`]
+/// stores only [`ParallelBroadcastSource<()>`], whose dynamic variant marks a second instruction input without
+/// storing its array or tracer in the operation.
 #[derive(Copy, Clone, Debug, PartialEq, Eq, Hash)]
-pub enum ParallelBroadcastSource {
-    /// The operation stores the source's zero-based coordinate along its combined named axis.
+pub enum ParallelBroadcastSource<V> {
+    /// The source's zero-based coordinate along the combined named axis.
     Static(usize),
 
-    /// A second instruction input supplies the source as a non-differentiable `u64` scalar.
-    Dynamic,
+    /// A runtime source represented by `V`. The frontend borrows a non-differentiable `u64` scalar, while operation
+    /// metadata uses `()` and receives that scalar as a second instruction input.
+    Dynamic(V),
 }
 
-impl From<usize> for ParallelBroadcastSource {
+impl<V> Display for ParallelBroadcastSource<V> {
+    #[inline]
+    fn fmt(&self, formatter: &mut std::fmt::Formatter<'_>) -> std::fmt::Result {
+        match self {
+            Self::Static(source) => source.fmt(formatter),
+            Self::Dynamic(_) => formatter.write_str("dynamic"),
+        }
+    }
+}
+
+impl<V> From<usize> for ParallelBroadcastSource<V> {
     #[inline]
     fn from(source: usize) -> Self {
         Self::Static(source)
     }
 }
 
-impl Display for ParallelBroadcastSource {
+impl<'o, V> From<&'o V> for ParallelBroadcastSource<&'o V> {
     #[inline]
-    fn fmt(&self, formatter: &mut std::fmt::Formatter<'_>) -> std::fmt::Result {
-        match self {
-            Self::Static(source) => source.fmt(formatter),
-            Self::Dynamic => formatter.write_str("dynamic"),
-        }
+    fn from(source: &'o V) -> Self {
+        Self::Dynamic(source)
     }
 }
 
@@ -146,7 +157,7 @@ pub struct ParallelBroadcastOperation {
     axis_size: usize,
 
     /// Static coordinate or declaration of the runtime source input. Refer to [`ParallelBroadcastSource`].
-    source: ParallelBroadcastSource,
+    source: ParallelBroadcastSource<()>,
 
     /// Whether runtime source validation is still a primal obligation. Constructors require it for dynamic roots.
     /// Only derivative rules clear it after retaining the checked primal, so linear programs remain effect-free.
@@ -167,7 +178,7 @@ impl ParallelBroadcastOperation {
     ///   - `source`: Static coordinate in `0..axis_size`, or [`ParallelBroadcastSource::Dynamic`] to consume an
     ///     additional `u64` scalar input. A `usize` converts to [`ParallelBroadcastSource::Static`].
     #[inline]
-    pub fn new<A: Into<CollectiveAxes>, S: Into<ParallelBroadcastSource>>(
+    pub fn new<A: Into<CollectiveAxes>, S: Into<ParallelBroadcastSource<()>>>(
         axes: A,
         axis_size: usize,
         source: S,
@@ -177,7 +188,7 @@ impl ParallelBroadcastOperation {
             axes: axes.into(),
             axis_size,
             source,
-            requires_source_validation: source == ParallelBroadcastSource::Dynamic,
+            requires_source_validation: source == ParallelBroadcastSource::Dynamic(()),
             mesh: None,
         }
     }
@@ -188,7 +199,7 @@ impl ParallelBroadcastOperation {
     /// automatically from the enclosing manual region.
     #[inline]
     pub fn with_mesh(mut self, mesh: LogicalMesh) -> Self {
-        if self.source == ParallelBroadcastSource::Dynamic && self.mesh.as_ref() != Some(&mesh) {
+        if self.source == ParallelBroadcastSource::Dynamic(()) && self.mesh.as_ref() != Some(&mesh) {
             self.requires_source_validation = true;
         }
         self.mesh = Some(mesh);
@@ -209,7 +220,7 @@ impl ParallelBroadcastOperation {
 
     /// Returns the static coordinate or runtime input declaration of this [`ParallelBroadcastOperation`].
     #[inline]
-    pub fn source(&self) -> ParallelBroadcastSource {
+    pub fn source(&self) -> ParallelBroadcastSource<()> {
         self.source
     }
 
@@ -250,7 +261,7 @@ impl Operation for ParallelBroadcastOperation {
             )));
         }
 
-        let expected_input_count = if self.source == ParallelBroadcastSource::Dynamic { 2 } else { 1 };
+        let expected_input_count = if self.source == ParallelBroadcastSource::Dynamic(()) { 2 } else { 1 };
         check_count!("input", input_types, expected_input_count, TypeError);
         let input_type = &input_types[0];
         if let ParallelBroadcastSource::Static(source) = self.source
@@ -294,7 +305,7 @@ impl Operation for ParallelBroadcastOperation {
             }
         }
 
-        if self.source == ParallelBroadcastSource::Dynamic {
+        if self.source == ParallelBroadcastSource::Dynamic(()) {
             let source = &input_types[1];
             if source.data_type() != DataType::U64 || source.rank() != 0 {
                 return Err(TypeError::invalid(format!(
@@ -353,7 +364,7 @@ impl Operation for ParallelBroadcastOperation {
             operation.field("axes", format_args!("{:?}", self.axes))?;
             operation.field("axis_size", self.axis_size)?;
             operation.field("source", self.source)?;
-            if self.source == ParallelBroadcastSource::Dynamic && !self.requires_source_validation {
+            if self.source == ParallelBroadcastSource::Dynamic(()) && !self.requires_source_validation {
                 operation.field("source_validated", true)?;
             }
             if let Some(value) = &self.mesh {
@@ -441,7 +452,7 @@ impl<C: Context<Type = ArrayType, Operation: From<ParallelBroadcastOperation>>> 
         let regions = driver.region_programs();
         match context.fold_or_residualize(self.clone(), regions.clone(), inputs) {
             Err(error)
-                if self.source == ParallelBroadcastSource::Dynamic
+                if self.source == ParallelBroadcastSource::Dynamic(())
                     && self.axis_size > 1
                     && context.parent().is_eager() =>
             {
@@ -485,7 +496,7 @@ where
         _driver: &D,
         inputs: &[ArrayBatch<<C as Domain>::Value>],
     ) -> Result<Vec<ArrayBatch<C::Value>>, BatchingError> {
-        if self.source == ParallelBroadcastSource::Dynamic {
+        if self.source == ParallelBroadcastSource::Dynamic(()) {
             check_count!("input", inputs, 2, ProgramError);
             self.infer_output_types(&inputs.iter().map(|input| input.unbatched_type()).collect::<Vec<_>>(), &[])?;
             let (data, source) = (&inputs[0], &inputs[1]);
@@ -690,7 +701,7 @@ where
         // Every participant's output is the source's input, so the input cotangent of the source is the sum of every
         // participant's output cotangent, and every other participant's input cotangent is zero. A known input and a
         // structural zero output cotangent contribute nothing.
-        let input_count = if self.source == ParallelBroadcastSource::Dynamic { 2 } else { 1 };
+        let input_count = if self.source == ParallelBroadcastSource::Dynamic(()) { 2 } else { 1 };
         check_count!("input", inputs, input_count, ProgramError);
         check_count!("output", outputs, 1, ProgramError);
         check_count!("accumulator", accumulators, input_count, DifferentiationError);
@@ -737,7 +748,7 @@ where
                     }
                     contribution = bind_single_output(context, operation.into(), contribution)?;
                 }
-                ParallelBroadcastSource::Dynamic => {
+                ParallelBroadcastSource::Dynamic(()) => {
                     let source = inputs[1].as_known().ok_or_else(|| ProgramError::UnsupportedOperation {
                         message: format!(
                             "`{PARALLEL_BROADCAST_OPERATION_NAME}` transpose requires the runtime source \
@@ -838,7 +849,7 @@ impl<A: Value<Type = ArrayType>> From<ParallelBroadcastOperation> for ArrayIrOpe
 ///     |(row, source): (
 ///         BatchingTracer<EagerContext<Array, ArrayOperation<Array>>, ArrayBatchingPolicy>,
 ///         BatchingTracer<EagerContext<Array, ArrayOperation<Array>>, ArrayBatchingPolicy>,
-///     )| row.dynamic_parallel_broadcast("rows", &source),
+///     )| row.parallel_broadcast("rows", &source),
 ///     (rows, source),
 ///     (BatchAxis::new(0), BatchAxis::replicated()),
 ///     BatchAxis::new(0),
@@ -850,61 +861,43 @@ impl<A: Value<Type = ArrayType>> From<ParallelBroadcastOperation> for ArrayIrOpe
 /// ```
 #[capability]
 pub trait ParallelBroadcast<T = <Self as Capability>::Universe>: Capability + Sized {
-    /// Returns the value of participant `source` along the named axes `axes`, which every participant receives. Over
-    /// a manual mesh axis, an input that does not vary over the axis is first made varying through [`ParallelVary`],
-    /// because the broadcast output keeps its input's variation. JAX's `pbroadcast` rejects such an input instead,
-    /// so this is a deliberate extension that mirrors how [`ParallelPermute`](crate::ParallelPermute) stages it.
+    /// Returns the value of participant `source` along the named axes `axes`, which every participant receives.
+    /// A static source is a [`usize`], while a runtime source borrows a non-differentiable `u64` scalar, matching
+    /// [`AxisIndex`](crate::AxisIndex). Both forms also accept an explicit [`ParallelBroadcastSource`] selection.
+    /// Runtime sources must agree within each participant group and may differ between groups formed by unrelated axes.
     ///
-    /// # Parameters
-    ///
-    ///   - `axes`: Name of an axis bound by an enclosing `batch` level or manual region, or names of several
-    ///     manual mesh axes along whose combined axis the value is broadcast.
-    ///   - `source`: Position along the named axis of the participant whose value every participant receives.
-    ///
-    /// # Errors
-    ///
-    /// Returns a [`ProgramError::Axis`] error wrapping [`AxisError::UnboundAxisName`](crate::axes::AxisError) when no
-    /// enclosing binder binds `axes`, and a [`ProgramError`] if `source` is outside the axis or if this value carries
-    /// a pending sum over the participating manual mesh axis.
-    fn parallel_broadcast<Axes: Into<CollectiveAxes>>(&self, axes: Axes, source: usize) -> Result<Self, ProgramError>;
-
-    /// Copies participant `source`'s value to every participant along `axes`. The source is a non-differentiable
-    /// `u64` scalar, matching [`AxisIndex`](crate::AxisIndex), and may differ between groups formed by unrelated axes.
-    /// The output follows the data's shape, memory, reduction state, and the manual variation of the data and source,
-    /// varying over the selected manual axes.
+    /// Over a manual mesh axis, an input that does not vary over the axis is first made varying through
+    /// [`ParallelVary`], because the output keeps its input's variation. The data also acquires any variation
+    /// of a runtime source on unrelated axes. The output preserves the data's shape, memory, and reduction state.
+    /// JAX's `pbroadcast` rejects invariant data instead, so the automatic variation transition is a deliberate
+    /// extension that mirrors how [`ParallelPermute`](crate::ParallelPermute) stages it.
     ///
     /// # Parameters
     ///
     ///   - `axes`: One named batch or manual mesh axis, or several manual mesh axes in major-to-minor order.
-    ///   - `source`: Runtime scalar giving the source's position along the combined axis.
+    ///   - `source`: Static coordinate or borrowed runtime scalar giving the source's position along the combined axis.
     ///
     /// # Errors
     ///
-    /// Returns a [`ProgramError`] for invalid source types or reduction state, invalid or unbound axes, incompatible
-    /// meshes, or unsupported delegated operations. Executed assertions reject out-of-range or inconsistent sources.
-    fn dynamic_parallel_broadcast<Axes: Into<CollectiveAxes>>(
-        &self,
+    /// Returns a [`ProgramError::Axis`] wrapping [`AxisError::UnboundAxisName`](crate::AxisError) for an unbound
+    /// axis, and a [`ProgramError`] for invalid axes, source types, reduction state, incompatible meshes, unsupported
+    /// delegated operations, or an out-of-range static source. Runtime assertions reject out-of-range or inconsistent
+    /// runtime sources, including when the broadcast result is unused.
+    fn parallel_broadcast<'o, Axes: Into<CollectiveAxes>, Source: Into<ParallelBroadcastSource<&'o Self>>>(
+        &'o self,
         axes: Axes,
-        source: &Self,
+        source: Source,
     ) -> Result<Self, ProgramError>;
 }
 
 impl ParallelBroadcast<ArrayType> for Array {
-    // A concrete `Array` never executes inside an axis binder, because the values under a `batch` level or inside
-    // a manual region are tracers, so every axis name is unbound for it.
-
     #[inline]
-    fn parallel_broadcast<Axes: Into<CollectiveAxes>>(&self, axes: Axes, _source: usize) -> Result<Self, ProgramError> {
-        let axes = axes.into();
-        axes.validate(PARALLEL_BROADCAST_OPERATION_NAME)?;
-        Err(AxisError::UnboundAxisName { name: axes.names()[0].clone() }.into())
-    }
-
-    fn dynamic_parallel_broadcast<Axes: Into<CollectiveAxes>>(
-        &self,
+    fn parallel_broadcast<'o, Axes: Into<CollectiveAxes>, Source: Into<ParallelBroadcastSource<&'o Self>>>(
+        &'o self,
         axes: Axes,
-        _source: &Self,
+        _source: Source,
     ) -> Result<Self, ProgramError> {
+        // A concrete array has no axis binder. Batches and manual regions receive context-carrying values instead.
         let axes = axes.into();
         axes.validate(PARALLEL_BROADCAST_OPERATION_NAME)?;
         Err(AxisError::UnboundAxisName { name: axes.names()[0].clone() }.into())
@@ -920,51 +913,28 @@ impl<
         + TransferToMemory,
 > ParallelBroadcast<ArrayType> for V
 {
-    fn parallel_broadcast<Axes: Into<CollectiveAxes>>(&self, axes: Axes, source: usize) -> Result<Self, ProgramError> {
-        // Any context-carrying value broadcasts by resolving the axis size from the active `NamedAxes` environment and
-        // binding a `ParallelBroadcastOperation` through its own context. Over manual mesh axes, the operation records
-        // the mesh, and an input that is still invariant over an axis is first made varying, as `parallel_permute`
-        // does. JAX's `pbroadcast` rejects such an input instead of inserting this transition.
-        let axes = axes.into();
-        let context = self.domain();
-        let (axis_size, mesh) = resolve_collective_axes(&context, PARALLEL_BROADCAST_OPERATION_NAME, &axes)?;
-        let mut operation = ParallelBroadcastOperation::new(axes.clone(), axis_size, source);
-        let mut input = self.clone();
-        if let Some(mesh) = mesh {
-            for axis_name in axes.names() {
-                if input.r#type().unreduced_axes().contains(axis_name) {
-                    return Err(TypeError::invalid(format!(
-                        "`{PARALLEL_BROADCAST_OPERATION_NAME}` does not support unreduced inputs",
-                    ))
-                    .into());
-                }
-                if !input.r#type().sharding().is_some_and(|sharding| sharding.varying_manual_axes().contains(axis_name))
-                {
-                    input = input.parallel_vary(axis_name)?;
-                }
-            }
-            operation = operation.with_mesh(mesh);
-        }
-        let mut outputs = context.bind(operation, Vec::new(), &[input])?;
-        check_count!("output", outputs, 1, ProgramError);
-        Ok(outputs.remove(0))
-    }
-
-    fn dynamic_parallel_broadcast<Axes: Into<CollectiveAxes>>(
-        &self,
+    fn parallel_broadcast<'o, Axes: Into<CollectiveAxes>, Source: Into<ParallelBroadcastSource<&'o Self>>>(
+        &'o self,
         axes: Axes,
-        source: &Self,
+        source: Source,
     ) -> Result<Self, ProgramError> {
         let axes = axes.into();
         let context = self.domain();
         let (axis_size, mesh) = resolve_collective_axes(&context, PARALLEL_BROADCAST_OPERATION_NAME, &axes)?;
-        let mut operation = ParallelBroadcastOperation::new(axes.clone(), axis_size, ParallelBroadcastSource::Dynamic);
+        let (source_metadata, source) = match source.into() {
+            ParallelBroadcastSource::Static(source) => (ParallelBroadcastSource::Static(source), None),
+            ParallelBroadcastSource::Dynamic(source) => (ParallelBroadcastSource::Dynamic(()), Some(source)),
+        };
+        let mut operation = ParallelBroadcastOperation::new(axes.clone(), axis_size, source_metadata);
+
+        // Resolve manual variation once for both source forms. An invariant input first becomes varying,
+        // as in `parallel_permute`, while pending sums over the participating axes cannot be broadcast.
         let mut value = self.clone();
         if let Some(mesh) = mesh {
             for axis in axes.names() {
                 if value.r#type().unreduced_axes().contains(axis) {
                     return Err(TypeError::invalid(format!(
-                        "`{PARALLEL_BROADCAST_OPERATION_NAME}` does not support unreduced inputs"
+                        "`{PARALLEL_BROADCAST_OPERATION_NAME}` does not support unreduced inputs",
                     ))
                     .into());
                 }
@@ -975,20 +945,26 @@ impl<
             operation = operation.with_mesh(mesh);
         }
 
-        // Source variation on unrelated axes must also be reflected by the selected data.
-        let source_type = source.r#type();
-        for axis in source_type.sharding().map(|source| source.varying_manual_axes()).into_iter().flatten() {
-            if !value.r#type().sharding().is_some_and(|data| data.varying_manual_axes().contains(axis)) {
-                value = value.parallel_vary(axis)?;
+        let inputs = if let Some(source) = source {
+            // Source-dependent selection must also reflect variation on unrelated axes in its result.
+            for axis in source.r#type().sharding().map(|source| source.varying_manual_axes()).into_iter().flatten() {
+                if !value.r#type().sharding().is_some_and(|data| data.varying_manual_axes().contains(axis)) {
+                    value = value.parallel_vary(axis)?;
+                }
             }
-        }
-        let source = if source.r#type().memory() == value.r#type().memory() {
-            source.clone()
+            let source = if source.r#type().memory() == value.r#type().memory() {
+                source.clone()
+            } else {
+                source.transfer_to_memory(value.r#type().memory())?
+            };
+            let inputs = vec![value, source];
+            operation
+                .infer_output_types(&inputs.iter().map(|input| input.r#type().into_owned()).collect::<Vec<_>>(), &[])?;
+            inputs
         } else {
-            source.transfer_to_memory(value.r#type().memory())?
+            vec![value]
         };
-        operation.infer_output_types(&[value.r#type().into_owned(), source.r#type().into_owned()], &[])?;
-        let mut outputs = context.bind(operation, Vec::new(), &[value, source])?;
+        let mut outputs = context.bind(operation, Vec::new(), &inputs)?;
         check_count!("output", outputs, 1, ProgramError);
         Ok(outputs.remove(0))
     }
@@ -999,23 +975,21 @@ where
     V::Projected: ParallelBroadcast<ArrayType>,
 {
     #[inline]
-    fn parallel_broadcast<Axes: Into<CollectiveAxes>>(&self, axes: Axes, source: usize) -> Result<Self, ProgramError> {
-        // An array IR value broadcasts through its array view, which owns named-axis resolution and manual-axis
-        // variation, so that every broadcast shares one staging path.
-        Ok(V::from_projected(
-            ValueProjection::<ArrayType>::into_projected(self.clone())?.parallel_broadcast(axes, source)?,
-        ))
-    }
-
-    fn dynamic_parallel_broadcast<Axes: Into<CollectiveAxes>>(
-        &self,
+    fn parallel_broadcast<'o, Axes: Into<CollectiveAxes>, Source: Into<ParallelBroadcastSource<&'o Self>>>(
+        &'o self,
         axes: Axes,
-        source: &Self,
+        source: Source,
     ) -> Result<Self, ProgramError> {
-        Ok(V::from_projected(
-            ValueProjection::<ArrayType>::into_projected(self.clone())?
-                .dynamic_parallel_broadcast(axes, &ValueProjection::<ArrayType>::into_projected(source.clone())?)?,
-        ))
+        // Project borrowed runtime sources alongside the data. Only the array view resolves axes and stages inputs.
+        let value = ValueProjection::<ArrayType>::into_projected(self.clone())?;
+        let output = match source.into() {
+            ParallelBroadcastSource::Static(source) => value.parallel_broadcast(axes, source)?,
+            ParallelBroadcastSource::Dynamic(source) => {
+                let source = ValueProjection::<ArrayType>::into_projected(source.clone())?;
+                value.parallel_broadcast(axes, &source)?
+            }
+        };
+        Ok(V::from_projected(output))
     }
 }
 
@@ -1160,7 +1134,7 @@ mod tests {
     /// Broadcasts rows along "x" using either one shared runtime source or one source per participant.
     fn broadcast_runtime_source(rows: Array, source: Array, source_axis: BatchAxis) -> Result<Array, BatchingError> {
         batch(
-            |(value, source): (TestTracer, TestTracer)| value.dynamic_parallel_broadcast("x", &source),
+            |(value, source): (TestTracer, TestTracer)| value.parallel_broadcast("x", &source),
             (rows, source),
             (BatchAxis::new(0), source_axis),
             BatchAxis::new(0),
@@ -1175,7 +1149,7 @@ mod tests {
         let source = builder.add_input(ArrayType::scalar(DataType::U64));
         let outputs = builder
             .add_instruction(
-                ParallelBroadcastOperation::new("x", axis_size, ParallelBroadcastSource::Dynamic),
+                ParallelBroadcastOperation::new("x", axis_size, ParallelBroadcastSource::Dynamic(())),
                 Vec::new(),
                 vec![data, source],
                 None,
@@ -1207,15 +1181,26 @@ mod tests {
         assert_eq!(format!("{source:?}"), "Static(2)");
         assert_eq!(ParallelBroadcastSource::from(2usize), source);
         assert_eq!(source, ParallelBroadcastSource::Static(2));
-        assert_eq!(hash_of(&source), hash_of(&ParallelBroadcastSource::Static(2)));
+        assert_eq!(hash_of(&source), hash_of(&ParallelBroadcastSource::<()>::Static(2)));
         assert_ne!(source, ParallelBroadcastSource::Static(1));
-        assert_ne!(source, ParallelBroadcastSource::Dynamic);
-        let sources = HashMap::from([(source, 0), (ParallelBroadcastSource::Dynamic, 1)]);
+        assert_ne!(source, ParallelBroadcastSource::Dynamic(()));
+        let sources = HashMap::from([(source, 0), (ParallelBroadcastSource::Dynamic(()), 1)]);
         assert_eq!(sources.get(&ParallelBroadcastSource::Static(2)), Some(&0));
-        assert_eq!(sources.get(&ParallelBroadcastSource::Dynamic), Some(&1));
+        assert_eq!(sources.get(&ParallelBroadcastSource::Dynamic(())), Some(&1));
         assert_eq!(sources.get(&ParallelBroadcastSource::Static(1)), None);
-        assert_eq!(ParallelBroadcastSource::Dynamic.to_string(), "dynamic");
-        assert_eq!(format!("{:?}", ParallelBroadcastSource::Dynamic), "Dynamic");
+        assert_eq!(ParallelBroadcastSource::Dynamic(()).to_string(), "dynamic");
+        assert_eq!(format!("{:?}", ParallelBroadcastSource::Dynamic(())), "Dynamic(())");
+    }
+
+    #[test]
+    fn test_parallel_broadcast_source_from() {
+        let source: ParallelBroadcastSource<&Array> = 2usize.into();
+        assert_eq!(source, ParallelBroadcastSource::Static(2));
+
+        let value = Array::scalar(1u64).unwrap();
+        let source = ParallelBroadcastSource::from(&value);
+        assert_eq!(source, ParallelBroadcastSource::Dynamic(&value));
+        assert_eq!(source.to_string(), "dynamic");
     }
 
     #[test]
@@ -1236,8 +1221,8 @@ mod tests {
 
     #[test]
     fn test_parallel_broadcast_dynamic_source() {
-        let operation = ParallelBroadcastOperation::new("x", 2, ParallelBroadcastSource::Dynamic);
-        assert_eq!(operation.source(), ParallelBroadcastSource::Dynamic);
+        let operation = ParallelBroadcastOperation::new("x", 2, ParallelBroadcastSource::Dynamic(()));
+        assert_eq!(operation.source(), ParallelBroadcastSource::Dynamic(()));
         assert_eq!(operation.to_string(), "parallel_broadcast [axes=\"x\", axis_size=2, source=dynamic]");
         assert_ne!(operation, ParallelBroadcastOperation::new("x", 2, 0));
     }
@@ -1402,7 +1387,7 @@ mod tests {
         let data = ArrayType::new_static(DataType::F32, [3]);
         let source = ArrayType::scalar(DataType::U64);
         check_operation_type_inference!(
-            operation = ParallelBroadcastOperation::new("x", 2, ParallelBroadcastSource::Dynamic),
+            operation = ParallelBroadcastOperation::new("x", 2, ParallelBroadcastSource::Dynamic(())),
             cases = [
                 { input_types = [data.clone(), source], output_types = [data.clone()] },
                 { input_types = [data.clone(), ArrayType::scalar(DataType::I32)], error = format!(
@@ -1473,7 +1458,7 @@ mod tests {
     fn test_parallel_broadcast_effects() {
         assert_eq!(ParallelBroadcastOperation::new("x", 2, 1).effects().classes(), EffectClasses::NONE);
         assert_eq!(
-            ParallelBroadcastOperation::new("x", 2, ParallelBroadcastSource::Dynamic).effects().classes(),
+            ParallelBroadcastOperation::new("x", 2, ParallelBroadcastSource::Dynamic(())).effects().classes(),
             EffectClasses::single(EffectClass::OrderedAssertion),
         );
     }
@@ -1518,7 +1503,7 @@ mod tests {
     #[test]
     fn test_parallel_broadcast_interpretation_dynamic_source() {
         let context = EagerContext::<Array, ArrayOperation<Array>>::new();
-        let operation = ParallelBroadcastOperation::new("x", 1, ParallelBroadcastSource::Dynamic);
+        let operation = ParallelBroadcastOperation::new("x", 1, ParallelBroadcastSource::Dynamic(()));
         let value = Array::scalar(7f32).unwrap();
         assert_eq!(
             context.bind(operation.clone(), Vec::new(), &[value.clone(), Array::scalar(0u64).unwrap()]),
@@ -1538,7 +1523,7 @@ mod tests {
             ArrayType::new_static(DataType::F32, [2]).with_layout(Layout::Strided(StridedLayout::new(vec![8])));
         let (output_type, program) = TracingContext::<Array, ArrayOperation<Array>>::trace_with_named_axes(
             |(data, source)| {
-                Ok(ParallelBroadcastOperation::new("x", 2, ParallelBroadcastSource::Dynamic)
+                Ok(ParallelBroadcastOperation::new("x", 2, ParallelBroadcastSource::Dynamic(()))
                     .interpret(&data.domain(), &EmptyRegionDriver, &[data, source])?
                     .remove(0))
             },
@@ -1660,7 +1645,7 @@ mod tests {
     fn test_parallel_broadcast_partial_evaluation_dynamic_unused_result() {
         let (_, program) = TracingContext::<Array, ArrayOperation<Array>>::trace_with_named_axes(
             |(data, source)| {
-                let _ = data.dynamic_parallel_broadcast("x", &source)?;
+                let _ = data.parallel_broadcast("x", &source)?;
                 Ok(data)
             },
             (ArrayType::scalar(DataType::F32), ArrayType::scalar(DataType::U64)),
@@ -2303,6 +2288,32 @@ mod tests {
     }
 
     #[test]
+    fn test_parallel_broadcast_parallel_broadcast_source_selection() {
+        // Explicit selectors and the borrowed-value conversion select the same participant.
+        let output = batch(
+            |(value, source): (TestTracer, TestTracer)| {
+                Ok((
+                    value.parallel_broadcast("x", ParallelBroadcastSource::Static(1))?,
+                    value.parallel_broadcast("x", ParallelBroadcastSource::Dynamic(&source))?,
+                    value.parallel_broadcast("x", &source)?,
+                ))
+            },
+            (Array::vector(vec![1f32, 2.0]).unwrap(), Array::scalar(1u64).unwrap()),
+            (BatchAxis::new(0), BatchAxis::replicated()),
+            (BatchAxis::new(0), BatchAxis::new(0), BatchAxis::new(0)),
+            BatchAxisSpecification::named("x"),
+        );
+        assert_eq!(
+            output,
+            Ok((
+                Array::vector(vec![2f32, 2.0]).unwrap(),
+                Array::vector(vec![2f32, 2.0]).unwrap(),
+                Array::vector(vec![2f32, 2.0]).unwrap(),
+            ))
+        );
+    }
+
+    #[test]
     fn test_parallel_broadcast_parallel_broadcast_unbound_axis() {
         // A name that no enclosing binder binds fails fast instead of silently acting as the identity.
         assert_eq!(
@@ -2440,7 +2451,7 @@ mod tests {
     }
 
     #[test]
-    fn test_parallel_broadcast_dynamic_parallel_broadcast() {
+    fn test_parallel_broadcast_parallel_broadcast_dynamic_source() {
         let rows = Array::matrix(3, 2, vec![1f32, 2.0, 3.0, 4.0, 5.0, 6.0]).unwrap();
         assert_eq!(
             broadcast_runtime_source(rows, Array::scalar(1u64).unwrap(), BatchAxis::replicated()),
@@ -2449,12 +2460,12 @@ mod tests {
     }
 
     #[test]
-    fn test_parallel_broadcast_dynamic_parallel_broadcast_axis_index() {
+    fn test_parallel_broadcast_parallel_broadcast_dynamic_source_axis_index() {
         // The largest participant coordinate elects one agreed root without an integer conversion.
         let output = batch(
             |value: TestTracer| {
                 let source = value.domain().axis_index("x")?.parallel_reduce(ReductionKind::Max, "x")?;
-                value.dynamic_parallel_broadcast("x", &source)
+                value.parallel_broadcast("x", &source)
             },
             Array::vector(vec![1f32, 2.0]).unwrap(),
             BatchAxis::new(0),
@@ -2465,22 +2476,22 @@ mod tests {
     }
 
     #[test]
-    fn test_parallel_broadcast_dynamic_parallel_broadcast_unbound_axis() {
+    fn test_parallel_broadcast_parallel_broadcast_dynamic_source_unbound_axis() {
         let value = Array::scalar(1f32).unwrap();
         let source = Array::scalar(0u64).unwrap();
         assert_eq!(
-            value.dynamic_parallel_broadcast("x", &source),
+            value.parallel_broadcast("x", &source),
             Err(ProgramError::Axis(AxisError::UnboundAxisName { name: "x".to_string() })),
         );
         assert_eq!(
-            value.dynamic_parallel_broadcast(Vec::<String>::new(), &source),
+            value.parallel_broadcast(Vec::<String>::new(), &source),
             Err(TypeError::invalid(format!("`{PARALLEL_BROADCAST_OPERATION_NAME}` requires at least one axis name",))
                 .into()),
         );
     }
 
     #[test]
-    fn test_parallel_broadcast_dynamic_parallel_broadcast_exact_payloads() {
+    fn test_parallel_broadcast_parallel_broadcast_dynamic_source_exact_payloads() {
         let nan = f32::from_bits(0x7fc01234);
         let rows = Array::matrix(2, 2, vec![1f32, 2.0, -0.0, nan]).unwrap();
         let output = broadcast_runtime_source(rows, Array::scalar(1u64).unwrap(), BatchAxis::replicated()).unwrap();
@@ -2512,7 +2523,7 @@ mod tests {
     }
 
     #[test]
-    fn test_parallel_broadcast_dynamic_parallel_broadcast_degenerate_shapes() {
+    fn test_parallel_broadcast_parallel_broadcast_dynamic_source_degenerate_shapes() {
         assert_eq!(
             broadcast_runtime_source(
                 Array::vector(vec![5f32]).unwrap(),
@@ -2531,7 +2542,7 @@ mod tests {
         );
         assert_eq!(
             batch(
-                |(value, source): (TestTracer, TestTracer)| value.dynamic_parallel_broadcast("x", &source),
+                |(value, source): (TestTracer, TestTracer)| value.parallel_broadcast("x", &source),
                 (Array::vector(vec![7f32, 8.0]).unwrap(), Array::scalar(1u64).unwrap()),
                 (BatchAxis::replicated(), BatchAxis::replicated()),
                 BatchAxis::replicated(),
@@ -2542,7 +2553,7 @@ mod tests {
     }
 
     #[test]
-    fn test_parallel_broadcast_dynamic_parallel_broadcast_sharding() {
+    fn test_parallel_broadcast_parallel_broadcast_dynamic_source_sharding() {
         let mesh = LogicalMesh::new(vec![MeshAxis::new("devices", 2, MeshAxisType::Explicit).unwrap()]).unwrap();
         let sharding =
             Sharding::new(mesh, vec![ShardingDimension::sharded(["devices"]), ShardingDimension::Replicated]).unwrap();
@@ -2554,7 +2565,7 @@ mod tests {
     }
 
     #[test]
-    fn test_parallel_broadcast_dynamic_parallel_broadcast_strided_items() {
+    fn test_parallel_broadcast_parallel_broadcast_dynamic_source_strided_items() {
         let row_major = Array::matrix(2, 2, vec![1f32, 2.0, 3.0, 4.0]).unwrap();
         let column_major = row_major.r#type().into_owned().with_layout(Layout::Strided(StridedLayout::new(vec![4, 8])));
         let rows = Array::from_logical_bytes(column_major, &row_major.logical_bytes()).unwrap();
@@ -2563,7 +2574,7 @@ mod tests {
     }
 
     #[test]
-    fn test_parallel_broadcast_dynamic_parallel_broadcast_host_memory() {
+    fn test_parallel_broadcast_parallel_broadcast_dynamic_source_host_memory() {
         let memory = Memory::Host { pinned: true };
         let rows = Array::vector(vec![1f32, 2.0]).unwrap().transfer_to_memory(memory).unwrap();
         assert_eq!(
@@ -2573,7 +2584,7 @@ mod tests {
     }
 
     #[test]
-    fn test_parallel_broadcast_dynamic_parallel_broadcast_invalid_source() {
+    fn test_parallel_broadcast_parallel_broadcast_dynamic_source_invalid_source() {
         let rows = Array::vector(vec![1f32, 2.0]).unwrap();
         let error = ProgramError::from(
             broadcast_runtime_source(rows.clone(), Array::scalar(1u64 << 32).unwrap(), BatchAxis::replicated())
@@ -2622,7 +2633,7 @@ mod tests {
     }
 
     #[test]
-    fn test_parallel_broadcast_dynamic_parallel_broadcast_source_reduction_state() {
+    fn test_parallel_broadcast_parallel_broadcast_dynamic_source_source_reduction_state() {
         let sharding = Sharding::replicated(manual_mesh(), 0);
         let data_type = ArrayType::scalar(DataType::F32)
             .with_sharding(sharding.clone().with_varying_manual_axes(["x"]).unwrap())
@@ -2632,7 +2643,7 @@ mod tests {
             .unwrap();
         assert_eq!(
             TracingContext::<Array, ArrayOperation<Array>>::trace_with_named_axes(
-                |(value, source)| value.dynamic_parallel_broadcast("x", &source),
+                |(value, source)| value.parallel_broadcast("x", &source),
                 (data_type.clone(), source_type),
                 manual_axes(true),
             )
@@ -2646,7 +2657,7 @@ mod tests {
             ArrayType::scalar(DataType::U64).with_sharding(sharding.with_reduced_axes(["x"]).unwrap()).unwrap();
         assert_eq!(
             TracingContext::<Array, ArrayOperation<Array>>::trace_with_named_axes(
-                |(value, source)| value.dynamic_parallel_broadcast("x", &source),
+                |(value, source)| value.parallel_broadcast("x", &source),
                 (data_type, source_type),
                 manual_axes(true),
             )
@@ -2659,7 +2670,7 @@ mod tests {
     }
 
     #[test]
-    fn test_parallel_broadcast_dynamic_parallel_broadcast_participant_sources() {
+    fn test_parallel_broadcast_parallel_broadcast_dynamic_source_participant_sources() {
         let rows = Array::vector(vec![1f32, 2.0]).unwrap();
         assert_eq!(
             broadcast_runtime_source(rows.clone(), Array::vector(vec![1u64, 1]).unwrap(), BatchAxis::new(0)),
@@ -2677,13 +2688,13 @@ mod tests {
     }
 
     #[test]
-    fn test_parallel_broadcast_dynamic_parallel_broadcast_unrelated_batch_axis() {
+    fn test_parallel_broadcast_parallel_broadcast_dynamic_source_unrelated_batch_axis() {
         // Each outer batch item is a separate collective group and can select a different source.
         assert_eq!(
             batch(
                 |inputs| {
                     batch(
-                        |(value, source)| value.dynamic_parallel_broadcast("x", &source),
+                        |(value, source)| value.parallel_broadcast("x", &source),
                         inputs,
                         (BatchAxis::new(0), BatchAxis::replicated()),
                         BatchAxis::new(0),
@@ -2704,13 +2715,13 @@ mod tests {
     }
 
     #[test]
-    fn test_parallel_broadcast_dynamic_parallel_broadcast_partial_evaluation_unused_result() {
+    fn test_parallel_broadcast_parallel_broadcast_dynamic_source_partial_evaluation_unused_result() {
         let data_type = ArrayType::new_static(DataType::F32, [2]);
         let source_type = ArrayType::scalar(DataType::U64);
         let (_, program) = TracingContext::<Array, ArrayOperation<Array>>::trace(
             |(value, source)| {
                 let _ = batch(
-                    |(value, source)| value.dynamic_parallel_broadcast("x", &source),
+                    |(value, source)| value.parallel_broadcast("x", &source),
                     (value.clone(), source),
                     (BatchAxis::new(0), BatchAxis::replicated()),
                     BatchAxis::new(0),
@@ -2791,13 +2802,13 @@ mod tests {
     }
 
     #[test]
-    fn test_parallel_broadcast_dynamic_parallel_broadcast_differentiation() {
+    fn test_parallel_broadcast_parallel_broadcast_dynamic_source_differentiation() {
         let rows = Array::vector(vec![1f64, 2.0, 3.0]).unwrap();
         let source = Array::scalar(1u64).unwrap();
         let (value, gradient) = differentiate_at((rows, source))
             .value_and_gradient(|inputs| {
                 let output = batch(
-                    |(value, source)| value.dynamic_parallel_broadcast("x", &source),
+                    |(value, source)| value.parallel_broadcast("x", &source),
                     inputs,
                     (BatchAxis::new(0), BatchAxis::replicated()),
                     BatchAxis::new(0),
@@ -2812,12 +2823,12 @@ mod tests {
     }
 
     #[test]
-    fn test_parallel_broadcast_dynamic_parallel_broadcast_batched_differentiation() {
+    fn test_parallel_broadcast_parallel_broadcast_dynamic_source_batched_differentiation() {
         // Differentiation inside the binder executes known collective work in the eager batching parent.
         let result = batch(
             |inputs| {
                 let (value, gradient) = differentiate_at(inputs)
-                    .value_and_gradient(|(value, source)| value.dynamic_parallel_broadcast("x", &source))?;
+                    .value_and_gradient(|(value, source)| value.parallel_broadcast("x", &source))?;
                 Ok((value, gradient.0))
             },
             (Array::vector(vec![1f64, 2.0]).unwrap(), Array::scalar(1u64).unwrap()),
@@ -2829,7 +2840,7 @@ mod tests {
     }
 
     #[test]
-    fn test_parallel_broadcast_dynamic_parallel_broadcast_array_ir_manual_axis() {
+    fn test_parallel_broadcast_parallel_broadcast_dynamic_source_array_ir_manual_axis() {
         let mesh = LogicalMesh::new(vec![MeshAxis::new("x", 2, MeshAxisType::Manual).unwrap()]).unwrap();
         let data_type = ArrayType::scalar(DataType::F32)
             .with_sharding(Sharding::replicated(mesh.clone(), 0).with_varying_manual_axes(["x"]).unwrap())
@@ -2837,7 +2848,7 @@ mod tests {
         let source_type =
             ArrayType::scalar(DataType::U64).with_sharding(Sharding::replicated(mesh.clone(), 0)).unwrap();
         let (output, program) = TracingContext::<ArrayIrValue<Array>, ArrayIrOperation<Array>>::trace_with_named_axes(
-            |(value, source)| value.dynamic_parallel_broadcast("x", &source),
+            |(value, source)| value.parallel_broadcast("x", ParallelBroadcastSource::Dynamic(&source)),
             (ArrayIrType::from(data_type.clone()), ArrayIrType::from(source_type)),
             vec![("x".to_string(), NamedAxis::Mesh { mesh, axis: 0, size: 2, checks_manual_variation: true })],
         )
@@ -2856,22 +2867,22 @@ mod tests {
     }
 
     #[test]
-    fn test_parallel_broadcast_dynamic_parallel_broadcast_array_ir_non_array() {
+    fn test_parallel_broadcast_parallel_broadcast_dynamic_source_array_ir_non_array() {
         let dimension = ArrayIrValue::<Array>::Dimension(DimensionValue::constant(1).unwrap());
         assert_eq!(
-            dimension.dynamic_parallel_broadcast("x", &dimension),
+            dimension.parallel_broadcast("x", &dimension),
             Err(TypeError::invalid("expected array type but got dimension type").into()),
         );
     }
 
     #[test]
-    fn test_parallel_broadcast_dynamic_parallel_broadcast_array_ir_dynamic_items() {
+    fn test_parallel_broadcast_parallel_broadcast_dynamic_source_array_ir_dynamic_items() {
         let length = Dimension::Dynamic(DimensionVariable::new("length", DimensionBounds::new(0, Some(4)).unwrap()));
         let data_type = ArrayType::new(DataType::F32, Shape::new(vec![Dimension::Static(2), length]));
         let (output_type, program) = TracingContext::<ArrayIrValue<Array>, ArrayIrOperation<Array>>::trace(
             |inputs| {
                 batch(
-                    |(value, source)| value.dynamic_parallel_broadcast("x", &source),
+                    |(value, source)| value.parallel_broadcast("x", &source),
                     inputs,
                     (BatchAxis::new(0), BatchAxis::replicated()),
                     BatchAxis::new(0),
