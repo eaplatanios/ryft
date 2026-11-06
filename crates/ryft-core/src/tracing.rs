@@ -75,7 +75,7 @@ use std::rc::Rc;
 use ryft_macros::Parameter;
 
 use crate::arrays::LogicalMesh;
-use crate::axes::NamedAxis;
+use crate::axes::{MeshRetypings, NamedAxis};
 use crate::contexts::{Context, Domain, StagingContext, ValueResolution};
 use crate::macros::{check_builders, check_count};
 use crate::operations::GuardOperation;
@@ -380,6 +380,12 @@ pub struct TracingContext<V: Value, O: Operation<Type = V::Type>, C = V> {
     /// are seeded with none, and traces of a `shard_map` body are seeded with the mesh of that map.
     default_mesh: Option<Rc<LogicalMesh>>,
 
+    /// Mesh retypings that are active in this trace (added via
+    /// [`MeshContext::with_retyped_mesh`](crate::MeshContext::with_retyped_mesh)), which its
+    /// [`NamedAxes`](crate::NamedAxes) and [`MeshContext`](crate::MeshContext) implementations apply
+    /// to the bindings and the default mesh that they report. They are shared across cloned contexts.
+    mesh_retypings: MeshRetypings,
+
     /// Active [`ProvenanceState`] recording the non-semantic provenance scopes and origins that staged
     /// [`Instruction`](crate::Instruction)s snapshot. It is shared behind an [`Rc`] (separately from [`Self::builder`]
     /// so that [`ProvenanceScope`] transitions never hold a builder borrow) so that every cloned context observes the
@@ -401,8 +407,25 @@ impl<V: Value, O: Operation<Type = V::Type>, C> TracingContext<V, O, C> {
             captures: Rc::new(RefCell::new(Vec::new())),
             named_axes: Rc::new(Vec::new()),
             default_mesh: None,
+            mesh_retypings: MeshRetypings::default(),
             provenance: Rc::new(ProvenanceState::new()),
         }
+    }
+
+    /// Returns this fresh [`TracingContext`] seeded with `named_axes` and `default_mesh`, which its
+    /// [`NamedAxes`](crate::NamedAxes) and [`MeshContext`](crate::MeshContext) implementations resolve. Staging uses
+    /// it to trace a function in the named axis scope and default mesh of the context that calls it, so that the
+    /// function resolves them as it would if it were inlined there. Seed a context before tracing anything into it,
+    /// because the named axes and the default mesh are fixed for its lifetime and shared by its clones.
+    #[inline]
+    pub(crate) fn with_named_axes_and_default_mesh(
+        mut self,
+        named_axes: Vec<(String, NamedAxis)>,
+        default_mesh: Option<LogicalMesh>,
+    ) -> Self {
+        self.named_axes = Rc::new(named_axes);
+        self.default_mesh = default_mesh.map(Rc::new);
+        self
     }
 
     /// Returns the [`ProgramBuilder`] that this [`TracingContext`] stages into.
@@ -430,6 +453,12 @@ impl<V: Value, O: Operation<Type = V::Type>, C> TracingContext<V, O, C> {
     #[inline]
     pub(crate) fn local_default_mesh(&self) -> Option<&LogicalMesh> {
         self.default_mesh.as_deref()
+    }
+
+    /// Returns this trace's own mesh retyping stack, shared across its clones.
+    #[inline]
+    pub(crate) fn local_mesh_retypings(&self) -> &MeshRetypings {
+        &self.mesh_retypings
     }
 }
 
@@ -658,6 +687,7 @@ where
                     captures: captures.clone(),
                     named_axes: Rc::new(named_axes),
                     default_mesh: default_mesh.map(Rc::new),
+                    mesh_retypings: MeshRetypings::default(),
                     provenance: Rc::new(ProvenanceState::new()),
                 };
                 let input = input_type.map_parameters(|t| context.input(t)).map_err(ProgramError::from)?;
@@ -699,6 +729,7 @@ impl<V: Value, O: Operation<Type = V::Type>, C> Clone for TracingContext<V, O, C
             captures: self.captures.clone(),
             named_axes: self.named_axes.clone(),
             default_mesh: self.default_mesh.clone(),
+            mesh_retypings: self.mesh_retypings.clone(),
             provenance: self.provenance.clone(),
         }
     }
@@ -837,6 +868,13 @@ pub struct NestedTracingContext<C: Context> {
     /// of the parent context applies.
     default_mesh: Option<Rc<LogicalMesh>>,
 
+    /// Mesh retypings that are active in this nested trace (refer to
+    /// [`MeshContext::with_retyped_mesh`](crate::MeshContext::with_retyped_mesh)), which its
+    /// [`NamedAxes`](crate::NamedAxes) and [`MeshContext`](crate::MeshContext) implementations apply to the bindings
+    /// and the default mesh that they report, including those of the parent context. They are shared across cloned
+    /// contexts.
+    mesh_retypings: MeshRetypings,
+
     /// Active [`ProvenanceState`] for the nested program, shared across cloned contexts and independent of the
     /// parent's state. It is seeded with the parent context's current provenance at depth zero, so that instructions
     /// staged in the nested program record where the nested program itself came from, while later replaying them
@@ -853,6 +891,7 @@ impl<C: Context> NestedTracingContext<C> {
             builder: Rc::new(RefCell::new(ProgramBuilder::new())),
             named_axes: Rc::new(Vec::new()),
             default_mesh: None,
+            mesh_retypings: MeshRetypings::default(),
             provenance,
         }
     }
@@ -880,6 +919,13 @@ impl<C: Context> NestedTracingContext<C> {
     #[inline]
     pub(crate) fn local_default_mesh(&self) -> Option<&LogicalMesh> {
         self.default_mesh.as_deref()
+    }
+
+    /// Returns this nested trace's own mesh retyping stack, shared across its clones. These retypings also apply to
+    /// bindings inherited from the parent context.
+    #[inline]
+    pub(crate) fn local_mesh_retypings(&self) -> &MeshRetypings {
+        &self.mesh_retypings
     }
 
     /// Traces `function` into a flat [`Program`] expressed in the enclosing context `parent`'s universe. This is the
@@ -973,7 +1019,9 @@ impl<C: Context> NestedTracingContext<C> {
             let named_axes = Rc::new(named_axes);
             let provenance = Rc::new(ProvenanceState::seeded(parent.provenance()));
             let default_mesh = default_mesh.map(Rc::new);
-            let context = NestedTracingContext { parent, builder, named_axes, default_mesh, provenance };
+            let mesh_retypings = MeshRetypings::default();
+            let context =
+                NestedTracingContext { parent, builder, named_axes, default_mesh, mesh_retypings, provenance };
 
             let (output_structure, output_atoms) = {
                 let input_tracers = input_types.into_iter().map(|r#type| context.input(r#type)).collect::<Vec<_>>();
@@ -1021,6 +1069,7 @@ impl<C: Context> Clone for NestedTracingContext<C> {
             builder: self.builder.clone(),
             named_axes: self.named_axes.clone(),
             default_mesh: self.default_mesh.clone(),
+            mesh_retypings: self.mesh_retypings.clone(),
             provenance: self.provenance.clone(),
         }
     }
