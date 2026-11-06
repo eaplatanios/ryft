@@ -42,8 +42,10 @@
 //! name to the parent. Transparent wrappers should delegate all names unchanged. New named-axis operations should use
 //! [`NamedAxes`] for scope validation and leave per-value dimension handling to the transform that owns that metadata.
 
+use std::cell::RefCell;
 use std::fmt::Display;
 use std::ops::Deref;
+use std::rc::Rc;
 
 use thiserror::Error;
 
@@ -403,7 +405,7 @@ where
         self.local_named_axes()
             .iter()
             .find(|(axis_name, _)| axis_name == name)
-            .map(|(_, axis)| axis.clone())
+            .map(|(_, axis)| self.local_mesh_retypings().retype_named_axis(axis.clone()))
     }
 
     fn named_axes(&self) -> Vec<(String, NamedAxis)> {
@@ -411,7 +413,7 @@ where
         let mut axes = Vec::<(String, NamedAxis)>::new();
         for (name, axis) in self.local_named_axes() {
             if !axes.iter().any(|(visible, _)| visible == name) {
-                axes.push((name.clone(), axis.clone()));
+                axes.push((name.clone(), self.local_mesh_retypings().retype_named_axis(axis.clone())));
             }
         }
         axes
@@ -433,6 +435,7 @@ where
             .find(|(axis_name, _)| axis_name == name)
             .map(|(_, axis)| axis.clone())
             .or_else(|| self.parent().named_axis(name))
+            .map(|axis| self.local_mesh_retypings().retype_named_axis(axis))
     }
 
     fn named_axes(&self) -> Vec<(String, NamedAxis)> {
@@ -441,7 +444,7 @@ where
         let mut axes = Vec::<(String, NamedAxis)>::new();
         for (name, axis) in self.local_named_axes().iter().cloned().chain(self.parent().named_axes()) {
             if !axes.iter().any(|(visible, _)| visible == &name) {
-                axes.push((name, axis));
+                axes.push((name, self.local_mesh_retypings().retype_named_axis(axis)));
             }
         }
         axes
@@ -525,6 +528,25 @@ where
 pub trait MeshContext: Context {
     /// Returns the default [`LogicalMesh`] of this context, or [`None`] when it has none.
     fn default_mesh(&self) -> Option<LogicalMesh>;
+
+    /// Runs `function` with `mesh` retyped to `retyped_mesh` in this context, which must have the topology of `mesh`,
+    /// and returns its result. While `function` runs, this context (and every clone of it, including those that its
+    /// values hold) reports every named-axis binding over `mesh` (refer to [`NamedAxes`]) and a default mesh equal to
+    /// `mesh` with `retyped_mesh` instead, so that the values that operations create from those bindings (e.g.,
+    /// [`axis_index`](crate::AxisIndex::axis_index) and the payload meshes of collectives) are typed over
+    /// `retyped_mesh`. Retypings nest, and each one ends when `function` returns or unwinds. This is how
+    /// [`auto_axes`](crate::auto_axes) and [`explicit_axes`](crate::explicit_axes) retype the mesh of
+    /// the context that their function runs in, as JAX's `use_abstract_mesh` retypes its context mesh.
+    ///
+    /// The retyping is owned by the contexts that own named-axis bindings or default meshes (i.e., tracing contexts),
+    /// and wrapper contexts (e.g., batching, differentiation, partial evaluation, and projection) forward it to their
+    /// parents. The default implementation runs `function` unchanged, which is correct for contexts that own neither
+    /// (e.g., eager contexts).
+    #[inline]
+    fn with_retyped_mesh<R, F: FnOnce() -> R>(&self, mesh: &LogicalMesh, retyped_mesh: &LogicalMesh, function: F) -> R {
+        let _ = (mesh, retyped_mesh);
+        function()
+    }
 }
 
 impl<V: Value, O: Operation<Type = V::Type>> MeshContext for EagerContext<V, O>
@@ -545,6 +567,11 @@ where
     fn default_mesh(&self) -> Option<LogicalMesh> {
         self.parent().default_mesh()
     }
+
+    #[inline]
+    fn with_retyped_mesh<R, F: FnOnce() -> R>(&self, mesh: &LogicalMesh, retyped_mesh: &LogicalMesh, function: F) -> R {
+        self.parent().with_retyped_mesh(mesh, retyped_mesh, function)
+    }
 }
 
 impl<V: Value, O: Operation<Type = V::Type>, Capture> MeshContext for TracingContext<V, O, Capture>
@@ -553,7 +580,12 @@ where
 {
     #[inline]
     fn default_mesh(&self) -> Option<LogicalMesh> {
-        self.local_default_mesh().cloned()
+        self.local_default_mesh().cloned().map(|mesh| self.local_mesh_retypings().retype_mesh(mesh))
+    }
+
+    #[inline]
+    fn with_retyped_mesh<R, F: FnOnce() -> R>(&self, mesh: &LogicalMesh, retyped_mesh: &LogicalMesh, function: F) -> R {
+        self.local_mesh_retypings().with_retyped_mesh(mesh, retyped_mesh, function)
     }
 }
 
@@ -563,7 +595,15 @@ where
 {
     #[inline]
     fn default_mesh(&self) -> Option<LogicalMesh> {
-        self.local_default_mesh().cloned().or_else(|| self.parent().default_mesh())
+        self.local_default_mesh()
+            .cloned()
+            .or_else(|| self.parent().default_mesh())
+            .map(|mesh| self.local_mesh_retypings().retype_mesh(mesh))
+    }
+
+    #[inline]
+    fn with_retyped_mesh<R, F: FnOnce() -> R>(&self, mesh: &LogicalMesh, retyped_mesh: &LogicalMesh, function: F) -> R {
+        self.local_mesh_retypings().with_retyped_mesh(mesh, retyped_mesh, function)
     }
 }
 
@@ -574,6 +614,11 @@ where
     #[inline]
     fn default_mesh(&self) -> Option<LogicalMesh> {
         self.parent().default_mesh()
+    }
+
+    #[inline]
+    fn with_retyped_mesh<R, F: FnOnce() -> R>(&self, mesh: &LogicalMesh, retyped_mesh: &LogicalMesh, function: F) -> R {
+        self.parent().with_retyped_mesh(mesh, retyped_mesh, function)
     }
 }
 
@@ -587,6 +632,11 @@ where
         // axis shadows a manual mesh axis.
         self.parent().default_mesh()
     }
+
+    #[inline]
+    fn with_retyped_mesh<R, F: FnOnce() -> R>(&self, mesh: &LogicalMesh, retyped_mesh: &LogicalMesh, function: F) -> R {
+        self.parent().with_retyped_mesh(mesh, retyped_mesh, function)
+    }
 }
 
 impl<C: MeshContext, P: DifferentiationPolicy<C>> MeshContext for DifferentiationContext<C, P>
@@ -596,6 +646,65 @@ where
     #[inline]
     fn default_mesh(&self) -> Option<LogicalMesh> {
         self.primal().default_mesh()
+    }
+
+    #[inline]
+    fn with_retyped_mesh<R, F: FnOnce() -> R>(&self, mesh: &LogicalMesh, retyped_mesh: &LogicalMesh, function: F) -> R {
+        self.primal().with_retyped_mesh(mesh, retyped_mesh, function)
+    }
+}
+
+/// Stack of the mesh retypings that are active in a tracing context (refer to [`MeshContext::with_retyped_mesh`]),
+/// innermost last. It is shared by every clone of the context that owns it, like that context's program builder, so
+/// that the values of the context observe a retyping while it is active.
+#[derive(Clone, Debug, Default)]
+pub(crate) struct MeshRetypings {
+    /// Active retypings, each from its original mesh to its retyped mesh.
+    retypings: Rc<RefCell<Vec<(LogicalMesh, LogicalMesh)>>>,
+}
+
+impl MeshRetypings {
+    /// Runs `function` with the retyping from `mesh` to `retyped_mesh` active, removing it again once `function`
+    /// returns or unwinds.
+    pub(crate) fn with_retyped_mesh<R, F: FnOnce() -> R>(
+        &self,
+        mesh: &LogicalMesh,
+        retyped_mesh: &LogicalMesh,
+        function: F,
+    ) -> R {
+        /// Removes the innermost retyping when dropped.
+        struct Guard<'r>(&'r RefCell<Vec<(LogicalMesh, LogicalMesh)>>);
+
+        impl Drop for Guard<'_> {
+            fn drop(&mut self) {
+                self.0.borrow_mut().pop();
+            }
+        }
+
+        self.retypings.borrow_mut().push((mesh.clone(), retyped_mesh.clone()));
+        let _guard = Guard(&self.retypings);
+        function()
+    }
+
+    /// Returns `mesh` with the active retypings applied, outermost first, so that a retyping registered inside another
+    /// one applies to the mesh that the outer one produced.
+    pub(crate) fn retype_mesh(&self, mut mesh: LogicalMesh) -> LogicalMesh {
+        for (original, retyped) in self.retypings.borrow().iter() {
+            if &mesh == original {
+                mesh = retyped.clone();
+            }
+        }
+        mesh
+    }
+
+    /// Returns `axis` with the active retypings applied to the mesh of a [`NamedAxis::Mesh`] binding.
+    pub(crate) fn retype_named_axis(&self, axis: NamedAxis) -> NamedAxis {
+        match axis {
+            NamedAxis::Mesh { mesh, axis, size, checks_manual_variation } => {
+                NamedAxis::Mesh { mesh: self.retype_mesh(mesh), axis, size, checks_manual_variation }
+            }
+            axis => axis,
+        }
     }
 }
 
