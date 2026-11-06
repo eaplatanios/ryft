@@ -711,8 +711,9 @@ trait LinearCollectiveOperation: Operation<Type = ArrayType> {
     }
 
     /// Implements [`TransposableOperation::transpose`](crate::TransposableOperation::transpose) for this collective
-    /// by staging its [`adjoint`](Self::adjoint) on the output cotangent. A known input and a structural-zero output
-    /// cotangent contribute nothing, which leaves the input cotangent a structural zero.
+    /// by staging its [`adjoint`](Self::adjoint) on the output cotangent. A known input or a structural zero output
+    /// cotangent contributes nothing, which leaves the input cotangent a structural zero. An ignored input cotangent
+    /// also needs no adjoint instructions.
     fn linear_collective_transpose<
         V: Value<Type = ArrayType>,
         O: Operation<Type = ArrayType> + From<AddOperation<ArrayType>> + From<Self::Adjoint>,
@@ -730,8 +731,10 @@ trait LinearCollectiveOperation: Operation<Type = ArrayType> {
         check_count!("output", outputs, 1, ProgramError);
         check_count!("accumulator", accumulators, 1, DifferentiationError);
 
-        // The adjoint is resolved first, so that a configuration without one is rejected regardless of the cotangent,
-        // and only a live output cotangent of an unknown input then stages it.
+        self.infer_output_types(&[inputs[0].r#type().into_owned()], &[])?;
+
+        // Resolve the adjoint before cotangent early exits, so configurations without an adjoint are always rejected.
+        // Only a live output cotangent of an unknown input with a needed accumulator stages it.
         let adjoint = self.adjoint(inputs[0].r#type().as_ref())?;
         let MaybeZero::Value(cotangent) = &outputs[0] else {
             return Ok(());
@@ -2914,6 +2917,28 @@ mod tests {
                 in ()"
             },
         );
+    }
+
+    #[test]
+    fn test_linear_collective_operation_linear_collective_transpose_invalid_input() {
+        let trace = TracingContext::<Array, ArrayOperation<Array>>::new();
+        let mut context = TranspositionContext::new(trace);
+        let input_type = ArrayType::scalar(DataType::F32);
+        let inputs = [PartialValue::Unknown(input_type.clone())];
+        let accumulators = context.cotangent_accumulators(&inputs, &[false]).unwrap();
+        assert!(matches!(
+            ParallelPermuteOperation::new("x", 2, vec![(2, 0)]).transpose(
+                &mut context,
+                &EmptyRegionDriver,
+                &inputs,
+                &[MaybeZero::Zero(input_type)],
+                &accumulators,
+            ),
+            Err(DifferentiationError::Program(ProgramError::Type(TypeError::Invalid { message, .. })))
+                if message == format!(
+                    "`{PARALLEL_PERMUTE_OPERATION_NAME}` pair (2, 0) is out of bounds for axis size 2",
+                ),
+        ));
     }
 
     #[test]

@@ -714,6 +714,8 @@ where
         check_count!("output", outputs, 1, ProgramError);
         check_count!("accumulator", accumulators, 1, DifferentiationError);
 
+        self.infer_output_types(&[inputs[0].r#type().into_owned()], &[])?;
+
         let MaybeZero::Value(cotangent) = &outputs[0] else {
             return Ok(());
         };
@@ -3631,10 +3633,37 @@ mod tests {
         assert_eq!(
             transpose_ignored_collective(operation, input_type),
             indoc! {"
-            lambda %0:f32[2][sharding={mesh<['x'=2:manual]>, [{}]}] .
-            in ()"
+                lambda %0:f32[2][sharding={mesh<['x'=2:manual]>, [{}]}] .
+                in ()"
             }
         );
+    }
+
+    #[test]
+    fn test_parallel_all_gather_transposition_invalid_input() {
+        let trace = TracingContext::<Array, ArrayOperation<Array>>::new();
+        let mut context = TranspositionContext::new(trace);
+        let input_type = ArrayType::scalar(DataType::F32);
+        let inputs = [PartialValue::Unknown(input_type.clone())];
+        let accumulators = context.cotangent_accumulators(&inputs, &[false]).unwrap();
+        let operation = ParallelAllGatherOperation::new(
+            "x",
+            0,
+            0,
+            CollectiveOptions::default(),
+            ParallelAllGatherOutputVariance::Invariant,
+        );
+        assert!(matches!(
+            operation.transpose(
+                &mut context,
+                &EmptyRegionDriver,
+                &inputs,
+                &[MaybeZero::Zero(input_type)],
+                &accumulators,
+            ),
+            Err(DifferentiationError::Program(ProgramError::Type(TypeError::Invalid { message, .. })))
+                if message == format!("`{PARALLEL_ALL_GATHER_OPERATION_NAME}` axis size must be greater than zero"),
+        ));
     }
 
     #[test]

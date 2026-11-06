@@ -224,6 +224,8 @@ impl_differentiable_operation! {
             check_count!("output", outputs, 1, ProgramError);
             check_count!("accumulator", accumulators, 1, DifferentiationError);
 
+            operation.infer_output_types(&[inputs[0].r#type().into_owned()], &[])?;
+
             if inputs[0].is_known() || !accumulators[0].is_needed() {
                 return Ok(());
             }
@@ -671,6 +673,7 @@ mod tests {
     };
     use crate::batching::{BatchAxis, BatchingTracer};
     use crate::contexts::{EagerContext, ProjectedContext, StagingContext};
+    use crate::differentiation::{DifferentiationError, TransposableOperation, TranspositionContext};
     use crate::macros::check_operation_type_inference;
     use crate::operations::collectives::tests::{eager_collective_context, transpose_ignored_collective};
     use crate::parameters::Placeholder;
@@ -1090,10 +1093,32 @@ mod tests {
         assert_eq!(
             transpose_ignored_collective(ParallelVaryOperation::new("x".to_string()), input_type),
             indoc! {"
-            lambda %0:f32[][sharding={mesh<['x'=2:manual]>, [], varying_manual={'x'}}] .
-            in ()"
+                lambda %0:f32[][sharding={mesh<['x'=2:manual]>, [], varying_manual={'x'}}] .
+                in ()"
             }
         );
+    }
+
+    #[test]
+    fn test_parallel_vary_transposition_invalid_input() {
+        let trace = TracingContext::<Array, ArrayOperation<Array>>::new();
+        let mut context = TranspositionContext::new(trace);
+        let input_type = ArrayType::scalar(DataType::F32);
+        let inputs = [PartialValue::Unknown(input_type.clone())];
+        let accumulators = context.cotangent_accumulators(&inputs, &[false]).unwrap();
+        assert!(matches!(
+            ParallelVaryOperation::new("x".to_string()).transpose(
+                &mut context,
+                &EmptyRegionDriver,
+                &inputs,
+                &[MaybeZero::Zero(input_type)],
+                &accumulators,
+            ),
+            Err(DifferentiationError::Program(ProgramError::Type(TypeError::Invalid { message, .. })))
+                if message == format!(
+                    "`{PARALLEL_VARY_OPERATION_NAME}` input must carry a mesh containing manual axis `x`",
+                ),
+        ));
     }
 
     #[test]

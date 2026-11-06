@@ -4,7 +4,7 @@ use ryft_macros::capability;
 
 use crate::arrays::{
     Array, ArrayBatch, ArrayBatchingPolicy, ArrayExtentBatchingPolicy, ArrayIrOperation, ArrayIrType, ArrayOperation,
-    ArrayType, LogicalMesh,
+    ArrayType, DataType, LogicalMesh,
 };
 use crate::axes::{AxisError, NamedAxes};
 use crate::batching::{BatchAxis, BatchableOperation, BatchingContext, BatchingDriver, BatchingError};
@@ -17,8 +17,10 @@ use crate::interpretation::{InterpretableOperation, InterpretationDriver};
 use crate::macros::check_count;
 use crate::operations::Capability;
 use crate::operations::arithmetic::AddOperation;
+use crate::operations::assertions::Assert;
+use crate::operations::collectives::parallel_all_gather::ParallelAllGather;
 use crate::operations::collectives::parallel_permute::{PARALLEL_PERMUTE_OPERATION_NAME, ParallelPermuteOperation};
-use crate::operations::collectives::parallel_reduce::ParallelReduceOperation;
+use crate::operations::collectives::parallel_reduce::{ParallelReduce, ParallelReduceOperation};
 use crate::operations::collectives::parallel_vary::{
     PARALLEL_VARY_OPERATION_NAME, ParallelVary, ParallelVaryOperation,
 };
@@ -26,8 +28,13 @@ use crate::operations::collectives::{
     CollectiveAxes, LinearCollectiveOperation, resolve_collective_axes, route_axis_slices,
     validate_manual_mesh_axes_input,
 };
+use crate::operations::comparisons::Compare;
+use crate::operations::constants::constant::ConstantOperation;
 use crate::operations::constants::zero_like::ZeroLike;
+use crate::operations::control_flow::select::Select;
 use crate::operations::manipulation::concatenation::Concatenate;
+use crate::operations::manipulation::memory::TransferToMemory;
+use crate::operations::manipulation::reshaping::Reshape;
 use crate::operations::manipulation::slicing::Slice;
 use crate::operations::manipulation::transposition::Transpose;
 use crate::operations::reductions::ReductionKind;
@@ -311,7 +318,7 @@ where
         };
 
         // A batching rule runs before any context infers the operation's output type, so the operation is validated
-        // here, against the physical (i.e., padded) item type, before its source indexes the batch axis.
+        // here, against the logical (i.e., unbatched) input type, before its source indexes the batch axis.
         self.infer_output_types(&[input.value().r#type().unbatched(input.batch_axis())?], &[])?;
 
         let batch_size = P::axis_size(context)?;
@@ -390,11 +397,12 @@ where
         check_count!("input", inputs, 1, ProgramError);
         check_count!("output", outputs, 1, ProgramError);
         check_count!("accumulator", accumulators, 1, DifferentiationError);
+        self.infer_output_types(&[inputs[0].r#type().into_owned()], &[])?;
         let MaybeZero::Value(cotangent) = &outputs[0] else {
             return Ok(());
         };
 
-        if inputs[0].is_known() {
+        if inputs[0].is_known() || !accumulators[0].is_needed() {
             return Ok(());
         }
 
@@ -450,7 +458,7 @@ impl<A: Value<Type = ArrayType>> From<ParallelBroadcastOperation> for ArrayIrOpe
 ///
 /// # Example
 ///
-/// Every batch item receives the row of batch item two:
+/// Every batch item receives the row of batch item two.
 ///
 /// ```rust
 /// # use ryft_core::{
@@ -558,6 +566,187 @@ where
     }
 }
 
+/// Broadcasts from a participant selected by a runtime scalar, complementing [`ParallelBroadcast`]'s static source.
+/// The source is an `i32` scalar position along the named axes, matching JAX's
+/// [`pbroadcast`](https://docs.jax.dev/en/latest/_autosummary/jax.lax.pbroadcast.html). Every participant in a group
+/// must supply the same source in `0..axis_size`. Runtime assertions check both requirements, including for an
+/// unused result. The source must not carry reduced or unreduced state.
+///
+/// This capability gathers the participants' values with [`ParallelAllGather`] and selects the source locally with
+/// [`Select`]. It preserves payloads exactly, including Boolean and integer values, NaNs, and signed zeros.
+/// Unlike a native broadcast, its communication and temporary storage include all participants' values. Rectangular
+/// dynamic item shapes retain their dimension identities under array IR batching, whose policy carries runtime
+/// extents. Homogeneous batching requires static item extents for this composition. A source that varies over a named
+/// batch axis is accepted when its runtime values agree, which extends JAX's rejection of that batching configuration.
+///
+/// The universe parameter `T` defaults to the [`Capability`] universe of the implementor, so that homogeneous array
+/// values implement this capability for [`ArrayType`] and array IR values implement it for [`ArrayIrType`].
+///
+/// # Example
+///
+/// Choose the row at runtime while keeping one source for the whole group.
+///
+/// ```rust
+/// # use ryft_core::{
+/// #     Array, ArrayBatchingPolicy, ArrayOperation, BatchAxis, BatchAxisSpecification, BatchingTracer,
+/// #     DynamicParallelBroadcast, EagerContext, batch,
+/// # };
+/// # fn main() -> Result<(), Box<dyn std::error::Error>> {
+/// let rows = Array::matrix(3, 2, vec![1f32, 2.0, 3.0, 4.0, 5.0, 6.0])?;
+/// let source = Array::scalar(1i32)?;
+/// let broadcast = batch(
+///     |(row, source): (
+///         BatchingTracer<EagerContext<Array, ArrayOperation<Array>>, ArrayBatchingPolicy>,
+///         BatchingTracer<EagerContext<Array, ArrayOperation<Array>>, ArrayBatchingPolicy>,
+///     )| row.dynamic_parallel_broadcast("rows", &source),
+///     (rows, source),
+///     (BatchAxis::new(0), BatchAxis::replicated()),
+///     BatchAxis::new(0),
+///     BatchAxisSpecification::named("rows"),
+/// )?;
+/// assert_eq!(broadcast, Array::matrix(3, 2, vec![3f32, 4.0, 3.0, 4.0, 3.0, 4.0])?);
+/// # Ok(())
+/// # }
+/// ```
+#[capability]
+pub trait DynamicParallelBroadcast<T = <Self as Capability>::Universe>: Capability + Sized {
+    /// Copies participant `source`'s value to every participant along `axes`. The source is a non-differentiable
+    /// `i32` scalar and may differ between groups formed by unrelated axes. The output follows the data's shape,
+    /// memory, reduction state, and the manual variation of the data and source, varying over the selected manual axes.
+    ///
+    /// # Parameters
+    ///
+    ///   - `axes`: One named batch or manual mesh axis, or several manual mesh axes in major-to-minor order.
+    ///   - `source`: Runtime scalar giving the source's position along the combined axis.
+    ///
+    /// # Errors
+    ///
+    /// Returns a [`ProgramError`] for invalid source types or reduction state, invalid or unbound axes, incompatible
+    /// meshes, or unsupported delegated operations. Executed assertions reject out-of-range or inconsistent sources.
+    fn dynamic_parallel_broadcast<Axes: Into<CollectiveAxes>>(
+        &self,
+        axes: Axes,
+        source: &Self,
+    ) -> Result<Self, ProgramError>;
+}
+
+impl DynamicParallelBroadcast<ArrayType> for Array {
+    fn dynamic_parallel_broadcast<Axes: Into<CollectiveAxes>>(
+        &self,
+        axes: Axes,
+        _source: &Self,
+    ) -> Result<Self, ProgramError> {
+        let axes = axes.into();
+        axes.validate(PARALLEL_BROADCAST_OPERATION_NAME)?;
+        Err(AxisError::UnboundAxisName { name: axes.names()[0].clone() }.into())
+    }
+}
+
+impl<V> DynamicParallelBroadcast<ArrayType> for V
+where
+    V: Value<
+            Type = ArrayType,
+            Dispatch = ValueDomainDispatch,
+            Domain: Context<Operation: From<ConstantOperation<Array>>> + NamedAxes,
+        > + ParallelAllGather
+        + ParallelReduce
+        + Compare
+        + Select
+        + Slice
+        + Reshape
+        + TransferToMemory
+        + Assert,
+{
+    fn dynamic_parallel_broadcast<Axes: Into<CollectiveAxes>>(
+        &self,
+        axes: Axes,
+        source: &Self,
+    ) -> Result<Self, ProgramError> {
+        // Constants belong to the data's context, so comparisons also validate that the source belongs to it.
+        fn scalar<V>(value: &V, scalar: i32) -> Result<V, ProgramError>
+        where
+            V: Value<Type = ArrayType, Domain: Context<Operation: From<ConstantOperation<Array>>>>,
+        {
+            let constant = Array::scalar(scalar)?.transfer_to_memory(value.r#type().memory())?;
+            let mut outputs = value.domain().bind(ConstantOperation::new(constant), Vec::new(), &[])?;
+            check_count!("output", outputs, 1, ProgramError);
+            Ok(outputs.remove(0))
+        }
+
+        let axes = axes.into();
+        let (axis_size, _) = resolve_collective_axes(&self.domain(), PARALLEL_BROADCAST_OPERATION_NAME, &axes)?;
+        if source.r#type().data_type() != DataType::I32 || source.r#type().rank() != 0 {
+            return Err(TypeError::invalid(format!(
+                "`{PARALLEL_BROADCAST_OPERATION_NAME}` runtime source must be an `i32` scalar but got `{}`",
+                source.r#type(),
+            ))
+            .into());
+        }
+        if !source.r#type().unreduced_axes().is_empty() || !source.r#type().reduced_axes().is_empty() {
+            return Err(TypeError::invalid(format!(
+                "`{PARALLEL_BROADCAST_OPERATION_NAME}` runtime source must not carry reduction state",
+            ))
+            .into());
+        }
+        let memory = self.r#type().memory();
+        let source =
+            if source.r#type().memory() == memory { source.clone() } else { source.transfer_to_memory(memory)? };
+        let zero = scalar(self, 0)?;
+
+        // An unchecked manual binding and a logical batch cannot prove root agreement from variation metadata.
+        // Check it using integer extrema before gathering data, so inconsistent roots never select different values.
+        let mut minimum = source.clone();
+        let mut maximum = source.clone();
+        for axis_name in axes.names() {
+            minimum = minimum.parallel_reduce(ReductionKind::Min, axis_name)?;
+            maximum = maximum.parallel_reduce(ReductionKind::Max, axis_name)?;
+        }
+        minimum.equal(&maximum)?.assert(
+            &format!("`{PARALLEL_BROADCAST_OPERATION_NAME}` runtime sources must agree across participants"),
+            &[("minimum", minimum.clone()), ("maximum", maximum.clone())],
+        )?;
+
+        minimum.greater_than_or_equal(&zero)?.assert(
+            &format!("`{PARALLEL_BROADCAST_OPERATION_NAME}` runtime source must be non-negative"),
+            &[("source", source.clone())],
+        )?;
+        if let Ok(limit) = i32::try_from(axis_size) {
+            maximum.less_than(&scalar(self, limit)?)?.assert(
+                &format!(
+                    "`{PARALLEL_BROADCAST_OPERATION_NAME}` runtime source must be smaller than axis size {axis_size}"
+                ),
+                &[("source", source.clone())],
+            )?;
+        }
+
+        let gathered = self.parallel_all_gather(axes, 0)?;
+        let mut selected = gathered.slice_axis(0, 0, 1, 1)?.squeeze(&[0])?;
+        // Select slices without summing their contents, preserving signed zeros, NaNs, and exact wide integers.
+        // An i32 source cannot select later participants when the axis is larger than its representable range.
+        for index in 1..axis_size.min(i32::MAX as usize + 1) {
+            let candidate = gathered.slice_axis(0, index, index + 1, 1)?.squeeze(&[0])?;
+            selected = source.equal(&scalar(self, index as i32)?)?.select(&candidate, &selected)?;
+        }
+        Ok(selected)
+    }
+}
+
+impl<V: Value<Type = ArrayIrType> + ValueProjection<ArrayType>> DynamicParallelBroadcast<ArrayIrType> for V
+where
+    V::Projected: DynamicParallelBroadcast<ArrayType>,
+{
+    fn dynamic_parallel_broadcast<Axes: Into<CollectiveAxes>>(
+        &self,
+        axes: Axes,
+        source: &Self,
+    ) -> Result<Self, ProgramError> {
+        Ok(V::from_projected(
+            ValueProjection::<ArrayType>::into_projected(self.clone())?
+                .dynamic_parallel_broadcast(axes, &ValueProjection::<ArrayType>::into_projected(source.clone())?)?,
+        ))
+    }
+}
+
 #[cfg(test)]
 mod tests {
     use std::collections::HashMap;
@@ -566,22 +755,40 @@ mod tests {
     use pretty_assertions::assert_eq;
 
     use crate::arrays::{
-        ArrayIrBatch, ArrayIrBatchingPolicy, ArrayIrValue, DataType, Dimension, DimensionBounds, DimensionValue,
-        DimensionVariable, Layout, Memory, MeshAxis, MeshAxisType, Shape, Sharding, ShardingDimension, StridedLayout,
+        ArrayIrBatch, ArrayIrBatchingPolicy, ArrayIrValue, Complex, DataType, Dimension, DimensionBounds,
+        DimensionValue, DimensionVariable, Layout, Memory, MeshAxis, MeshAxisType, Shape, Sharding, ShardingDimension,
+        StridedLayout,
     };
     use crate::axes::NamedAxis;
     use crate::batching::{BatchAxisSpecification, BatchingTracer, batch};
     use crate::contexts::EagerContext;
     use crate::differentiation::differentiate_at;
     use crate::macros::{check_gradient, check_operation_partial_evaluation, check_operation_type_inference};
+    use crate::operations::assertions::AssertionError;
     use crate::operations::collectives::tests::{batch_collective, collective_program};
     use crate::operations::reductions::Reduce;
     use crate::parameters::Placeholder;
-    use crate::partial::{PartialEvaluationContext, PartialEvaluationOutput, PartialEvaluationValue};
+    use crate::partial::{
+        PartialEvaluationContext, PartialEvaluationInput, PartialEvaluationOutput, PartialEvaluationValue,
+    };
     use crate::programs::{EmptyRegionDriver, Program};
     use crate::tests::hash_of;
 
     use super::*;
+
+    /// Array-valued item of a named eager batch.
+    type TestTracer = BatchingTracer<EagerContext<Array, ArrayOperation<Array>>, ArrayBatchingPolicy>;
+
+    /// Broadcasts rows along "x" using either one shared runtime source or one source per participant.
+    fn broadcast_runtime_source(rows: Array, source: Array, source_axis: BatchAxis) -> Result<Array, BatchingError> {
+        batch(
+            |(value, source): (TestTracer, TestTracer)| value.dynamic_parallel_broadcast("x", &source),
+            (rows, source),
+            (BatchAxis::new(0), source_axis),
+            BatchAxis::new(0),
+            BatchAxisSpecification::named("x"),
+        )
+    }
 
     /// Creates a manual mesh whose axis `"x"` has two participants and whose axis `"y"` has one.
     fn manual_mesh() -> LogicalMesh {
@@ -684,21 +891,21 @@ mod tests {
             operation = ParallelBroadcastOperation::new("x".to_string(), 2, 2),
             cases = [{
                 input_types = [vector.clone()],
-                error = "`parallel_broadcast` source 2 is out of bounds for axis size 2",
+                error = format!("`{PARALLEL_BROADCAST_OPERATION_NAME}` source 2 is out of bounds for axis size 2"),
             }],
         );
         check_operation_type_inference!(
             operation = ParallelBroadcastOperation::new("x".to_string(), 0, 0),
             cases = [{
                 input_types = [vector.clone()],
-                error = "`parallel_broadcast` axis size must be greater than zero",
+                error = format!("`{PARALLEL_BROADCAST_OPERATION_NAME}` axis size must be greater than zero"),
             }],
         );
         check_operation_type_inference!(
             operation = ParallelBroadcastOperation::new(Vec::<String>::new(), 1, 0),
             cases = [{
                 input_types = [vector.clone()],
-                error = "`parallel_broadcast` requires at least one axis name",
+                error = format!("`{PARALLEL_BROADCAST_OPERATION_NAME}` requires at least one axis name"),
             }],
         );
 
@@ -724,18 +931,28 @@ mod tests {
                 { input_types = [bounded_varying.clone()], output_types = [bounded_varying] },
                 {
                     input_types = [invariant],
-                    error = "`parallel_broadcast` input must vary over manual axis `x`; pass an invariant value \
-                             through `parallel_vary` first, because the broadcast output keeps the input's variation",
+                    error = format!(
+                        "`{PARALLEL_BROADCAST_OPERATION_NAME}` input must vary over manual axis `x`; pass an \
+                         invariant value through `{PARALLEL_VARY_OPERATION_NAME}` first, because the broadcast output \
+                         keeps the input's variation",
+                    ),
                 },
                 {
                     input_types = [vector],
-                    error = "`parallel_broadcast` input must carry a mesh containing manual axis `x`",
+                    error = format!(
+                        "`{PARALLEL_BROADCAST_OPERATION_NAME}` input must carry a mesh containing manual axis `x`",
+                    ),
                 },
                 {
                     input_types = [other_varying],
-                    error = "`parallel_broadcast` input mesh does not match the operation mesh",
+                    error = format!(
+                        "`{PARALLEL_BROADCAST_OPERATION_NAME}` input mesh does not match the operation mesh",
+                    ),
                 },
-                { input_types = [unreduced], error = "`parallel_broadcast` does not support unreduced inputs" },
+                {
+                    input_types = [unreduced],
+                    error = format!("`{PARALLEL_BROADCAST_OPERATION_NAME}` does not support unreduced inputs"),
+                },
             ],
         );
 
@@ -743,13 +960,18 @@ mod tests {
         let explicit_mesh = LogicalMesh::new(vec![MeshAxis::new("x", 2, MeshAxisType::Explicit).unwrap()]).unwrap();
         check_operation_type_inference!(
             operation = ParallelBroadcastOperation::new("x".to_string(), 2, 1).with_mesh(explicit_mesh),
-            cases = [{ input_types = [varying.clone()], error = "`parallel_broadcast` mesh axis `x` must be manual" }],
+            cases = [{
+                input_types = [varying.clone()],
+                error = format!("`{PARALLEL_BROADCAST_OPERATION_NAME}` mesh axis `x` must be manual"),
+            }],
         );
         check_operation_type_inference!(
             operation = ParallelBroadcastOperation::new("x".to_string(), 3, 1).with_mesh(mesh),
             cases = [{
                 input_types = [varying],
-                error = "`parallel_broadcast` axis size 3 does not match the size of manual mesh axis `x`",
+                error = format!(
+                    "`{PARALLEL_BROADCAST_OPERATION_NAME}` axis size 3 does not match the size of manual mesh axis `x`",
+                ),
             }],
         );
     }
@@ -777,8 +999,11 @@ mod tests {
                 { input_types = [varying.clone()], output_types = [varying.clone()] },
                 {
                     input_types = [varying_over_x],
-                    error = "`parallel_broadcast` input must vary over manual axis `y`; pass an invariant value \
-                             through `parallel_vary` first, because the broadcast output keeps the input's variation",
+                    error = format!(
+                        "`{PARALLEL_BROADCAST_OPERATION_NAME}` input must vary over manual axis `y`; pass an \
+                         invariant value through `{PARALLEL_VARY_OPERATION_NAME}` first, because the broadcast output \
+                         keeps the input's variation",
+                    ),
                 },
             ],
         );
@@ -786,12 +1011,18 @@ mod tests {
             operation = ParallelBroadcastOperation::new(["x", "y"], 2, 1).with_mesh(mesh.clone()),
             cases = [{
                 input_types = [varying.clone()],
-                error = "`parallel_broadcast` axis size 2 does not match the size 4 of manual mesh axes (x, y)",
+                error = format!(
+                    "`{PARALLEL_BROADCAST_OPERATION_NAME}` axis size 2 does not match the size 4 of manual mesh \
+                     axes (x, y)",
+                ),
             }],
         );
         check_operation_type_inference!(
             operation = ParallelBroadcastOperation::new(["x", "x"], 4, 1).with_mesh(mesh),
-            cases = [{ input_types = [varying], error = "`parallel_broadcast` axis names repeat `x`" }],
+            cases = [{
+                input_types = [varying],
+                error = format!("`{PARALLEL_BROADCAST_OPERATION_NAME}` axis names repeat `x`"),
+            }],
         );
     }
 
@@ -816,17 +1047,19 @@ mod tests {
                 std::slice::from_ref(&input),
             ),
             Err(ProgramError::UnsupportedOperation {
-                message: "cannot interpret `parallel_broadcast` over axis `x` of size 2 without an enclosing binder"
-                    .to_string(),
+                message: format!(
+                    "cannot interpret `{PARALLEL_BROADCAST_OPERATION_NAME}` over axis `x` of size 2 without an \
+                     enclosing binder"
+                ),
             }),
         );
 
         // Even a degenerate broadcast validates its source before interpreting it as the identity.
         assert_eq!(
             context.bind(ParallelBroadcastOperation::new("x".to_string(), 1, 1), Vec::new(), &[input]),
-            Err(ProgramError::Type(TypeError::invalid(
-                "`parallel_broadcast` source 1 is out of bounds for axis size 1",
-            ))),
+            Err(ProgramError::Type(TypeError::invalid(format!(
+                "`{PARALLEL_BROADCAST_OPERATION_NAME}` source 1 is out of bounds for axis size 1"
+            ),))),
         );
     }
 
@@ -845,7 +1078,13 @@ mod tests {
         let input = Array::vector(vec![1.0f32, 2.0]).unwrap();
         let program = collective_program(operation.clone(), ArrayType::new_static(DataType::F32, [2]));
         let evaluation = program.partially_evaluate(&[PartialValue::Known(input)]).unwrap();
-        assert_eq!(evaluation.program().to_string(), program.to_string());
+        let expected = indoc! {"
+            lambda %0:f32[2] .
+            let %1:f32[2] = parallel_broadcast [axes=\"x\", axis_size=2, source=1] %0
+            in (%1)"
+        };
+        assert_eq!(program.to_string(), expected);
+        assert_eq!(evaluation.program().to_string(), expected);
         assert_eq!(evaluation.outputs(), &[PartialEvaluationOutput::Unknown(0)]);
 
         // A known input under a staging parent stays known, because the operation is staged into the parent trace.
@@ -877,9 +1116,7 @@ mod tests {
 
     #[test]
     fn test_parallel_broadcast_batching() {
-        // A level that binds the axis gives every item a copy of the source item, wherever the mapped axis sits, as
-        // JAX's `vmap` of the documented equivalent of `pbroadcast` does, because JAX's own batching rule fails at
-        // its reference commit (refer to `.tasks/shard_map_jax_parity_gaps/m8_oracles.py`).
+        // A level that binds the axis gives every item a copy of the source item, wherever the mapped axis sits.
         assert_eq!(
             batch_collective(
                 &ParallelBroadcastOperation::new("x".to_string(), 3, 2),
@@ -921,8 +1158,10 @@ mod tests {
                 ArrayBatch::new(Array::vector(vec![1.0, 2.0, 3.0]).unwrap(), BatchAxis::new(0)).unwrap(),
             ),
             Err(BatchingError::UnsupportedOperation {
-                message: "`parallel_broadcast` over axis `x` resolved axis size 2 but the mapped batch axis has size 3"
-                    .to_string(),
+                message: format!(
+                    "`{PARALLEL_BROADCAST_OPERATION_NAME}` over axis `x` resolved axis size 2 but the mapped \
+                     batch axis has size 3"
+                ),
             }),
         );
 
@@ -932,29 +1171,19 @@ mod tests {
         assert_eq!(
             batch_collective(&swap.clone().with_mesh(manual_mesh()), "x", 2, vector.clone()),
             Err(BatchingError::UnsupportedOperation {
-                message: "`parallel_broadcast` over a manual mesh axis cannot bind a named batch axis".to_string(),
+                message: format!(
+                    "`{PARALLEL_BROADCAST_OPERATION_NAME}` over a manual mesh axis cannot bind a named batch axis"
+                ),
             }),
         );
         assert_eq!(
             batch_collective(&ParallelBroadcastOperation::new(["x", "y"], 4, 1), "x", 2, vector),
             Err(BatchingError::UnsupportedOperation {
-                message: "`parallel_broadcast` over several axes cannot bind a named batch axis".to_string(),
+                message: format!(
+                    "`{PARALLEL_BROADCAST_OPERATION_NAME}` over several axes cannot bind a named batch axis"
+                ),
             }),
         );
-
-        // Copying the source item slices it by its static extents, so a level that binds the axis rejects an input
-        // whose items have a dynamic dimension.
-        let trace = TracingContext::<Array, ArrayOperation<Array>>::new();
-        let length = DimensionVariable::new("length", DimensionBounds::new(0, Some(4)).unwrap());
-        let input_type =
-            ArrayType::new(DataType::F32, Shape::new(vec![Dimension::Static(2), Dimension::Dynamic(length)]));
-        let input = ArrayBatch::new(trace.input(input_type), BatchAxis::new(0)).unwrap();
-        let context = BatchingContext::<_, ArrayBatchingPolicy>::new(trace, 2).with_axis_name("x".to_string());
-        assert!(matches!(
-            swap.batch(&context, &EmptyRegionDriver, &[input]),
-            Err(BatchingError::UnsupportedOperation { message })
-                if message == "`parallel_broadcast` batching requires statically shaped inputs",
-        ));
 
         // A level that binds another axis forwards the broadcast to its parent and preserves its mapped axis.
         let trace = TracingContext::<Array, ArrayOperation<Array>>::new();
@@ -981,6 +1210,36 @@ mod tests {
                 let %1:f32[2, 3] = parallel_broadcast [axes=\"x\", axis_size=2, source=1] %0
                 in (%1)"
             },
+        );
+    }
+
+    #[test]
+    fn test_parallel_broadcast_batching_dynamic_item_shape() {
+        let length = Dimension::Dynamic(DimensionVariable::new("length", DimensionBounds::new(0, Some(4)).unwrap()));
+        let input_type = ArrayType::new(DataType::F32, Shape::new(vec![Dimension::Static(2), length]));
+        let (output_type, program) = TracingContext::<Array, ArrayOperation<Array>>::trace(
+            |input| {
+                batch(
+                    |item| item.parallel_broadcast("x", 1),
+                    input,
+                    BatchAxis::new(0),
+                    BatchAxis::new(0),
+                    BatchAxisSpecification::named("x"),
+                )
+                .map_err(ProgramError::from)
+            },
+            input_type.clone(),
+        )
+        .unwrap();
+        assert_eq!(output_type, input_type);
+        assert_eq!(
+            program.to_string(),
+            indoc! {"
+            lambda %0:f32[2, length] .
+            let %1:f32[1, length] = slice [start_indices=[1, 0], limits=[2, length]] %0
+                %2:f32[2, length] = concatenate [axis=0] %1 %1
+            in (%2)"
+            }
         );
     }
 
@@ -1231,6 +1490,104 @@ mod tests {
     }
 
     #[test]
+    fn test_parallel_broadcast_transposition_inactive_inputs() {
+        let operation = ParallelBroadcastOperation::new("x", 2, 1);
+        let input_type = ArrayType::new_static(DataType::F32, [2]);
+
+        // Ignored destinations must not stage otherwise valid communication.
+        let trace = TracingContext::<Array, ArrayOperation<Array>>::new();
+        let mut context = TranspositionContext::new(trace.clone());
+        let inputs = [PartialValue::Unknown(input_type.clone())];
+        let accumulators = context.cotangent_accumulators(&inputs, &[false]).unwrap();
+        let cotangent = context.input(input_type.clone());
+        operation
+            .transpose(&mut context, &EmptyRegionDriver, &inputs, &[MaybeZero::Value(cotangent)], &accumulators)
+            .unwrap();
+        assert_eq!(context.take_cotangents(&accumulators).unwrap(), vec![MaybeZero::Zero(input_type.clone())]);
+        let program = trace
+            .builder()
+            .borrow()
+            .clone()
+            .build::<Vec<Array>, Vec<Array>>(Vec::new(), vec![Placeholder], Vec::new())
+            .unwrap();
+        assert_eq!(
+            program.to_string(),
+            indoc! {"
+                lambda %0:f32[2] .
+                in ()"
+            }
+        );
+
+        // A structural zero seed needs no communication even when the input cotangent is requested.
+        let trace = TracingContext::<Array, ArrayOperation<Array>>::new();
+        let mut context = TranspositionContext::new(trace.clone());
+        let accumulators = context.cotangent_accumulators(&inputs, &[true]).unwrap();
+        operation
+            .transpose(&mut context, &EmptyRegionDriver, &inputs, &[MaybeZero::Zero(input_type.clone())], &accumulators)
+            .unwrap();
+        assert_eq!(context.take_cotangents(&accumulators).unwrap(), vec![MaybeZero::Zero(input_type.clone())]);
+        let program = trace
+            .builder()
+            .borrow()
+            .clone()
+            .build::<Vec<Array>, Vec<Array>>(Vec::new(), Vec::new(), Vec::new())
+            .unwrap();
+        assert_eq!(
+            program.to_string(),
+            indoc! {"
+                lambda  .
+                in ()"
+            }
+        );
+
+        // Known primals contribute no input cotangent even with a live output seed.
+        let trace = TracingContext::<Array, ArrayOperation<Array>>::new();
+        let mut context = TranspositionContext::new(trace.clone());
+        let inputs = [PartialValue::Known(context.input(input_type.clone()))];
+        let accumulators = context.cotangent_accumulators(&inputs, &[]).unwrap();
+        let cotangent = context.input(input_type.clone());
+        operation
+            .transpose(&mut context, &EmptyRegionDriver, &inputs, &[MaybeZero::Value(cotangent)], &accumulators)
+            .unwrap();
+        assert_eq!(context.take_cotangents(&accumulators).unwrap(), vec![MaybeZero::Zero(input_type)]);
+        let program = trace
+            .builder()
+            .borrow()
+            .clone()
+            .build::<Vec<Array>, Vec<Array>>(Vec::new(), vec![Placeholder; 2], Vec::new())
+            .unwrap();
+        assert_eq!(
+            program.to_string(),
+            indoc! {"
+                lambda %0:f32[2], %1:f32[2] .
+                in ()"
+            }
+        );
+    }
+
+    #[test]
+    fn test_parallel_broadcast_transposition_invalid_source() {
+        let trace = TracingContext::<Array, ArrayOperation<Array>>::new();
+        let mut context = TranspositionContext::new(trace);
+        let input_type = ArrayType::scalar(DataType::F32);
+        let inputs = [PartialValue::Unknown(input_type.clone())];
+        let accumulators = context.cotangent_accumulators(&inputs, &[false]).unwrap();
+        assert!(matches!(
+            ParallelBroadcastOperation::new("x", 2, 2).transpose(
+                &mut context,
+                &EmptyRegionDriver,
+                &inputs,
+                &[MaybeZero::Zero(input_type)],
+                &accumulators,
+            ),
+            Err(DifferentiationError::Program(ProgramError::Type(TypeError::Invalid { message, .. })))
+                if message == format!(
+                    "`{PARALLEL_BROADCAST_OPERATION_NAME}` source 2 is out of bounds for axis size 2",
+                ),
+        ));
+    }
+
+    #[test]
     fn test_parallel_broadcast_transposition_preserves_unrelated_manual_axes() {
         // An input that also varies over the unrelated manual axis `y` and carries a pending sum over the unrelated
         // manual axis `z` has a cotangent that varies over `y` and is reduced over `z`, which keeps both through the
@@ -1300,21 +1657,7 @@ mod tests {
 
     #[test]
     fn test_parallel_broadcast_parallel_broadcast() {
-        // A name that no enclosing binder binds fails fast instead of silently acting as the identity.
         let inputs = Array::vector(vec![1.0, 2.0, 3.0]).unwrap();
-        assert_eq!(
-            batch(
-                |item: BatchingTracer<EagerContext<Array, ArrayOperation<Array>>, ArrayBatchingPolicy>| {
-                    item.parallel_broadcast("y", 1)
-                },
-                inputs.clone(),
-                BatchAxis::new(0),
-                BatchAxis::new(0),
-                BatchAxisSpecification::named("x"),
-            ),
-            Err::<Array, _>(BatchingError::Axis(AxisError::UnboundAxisName { name: "y".to_string() })),
-        );
-
         // A name that a `batch` level binds resolves the size of that level and broadcasts its source item, and a
         // source outside that level is rejected.
         assert_eq!(
@@ -1335,24 +1678,43 @@ mod tests {
                 BatchAxis::new(0),
                 BatchAxisSpecification::named("x"),
             ),
-            Err::<Array, _>(BatchingError::Type(TypeError::invalid(
-                "`parallel_broadcast` source 3 is out of bounds for axis size 3",
-            ))),
+            Err::<Array, _>(BatchingError::Type(TypeError::invalid(format!(
+                "`{PARALLEL_BROADCAST_OPERATION_NAME}` source 3 is out of bounds for axis size 3"
+            ),))),
         );
+    }
 
-        // An array IR value broadcasts through its array view.
-        let context = BatchingContext::<_, ArrayIrBatchingPolicy>::new(
-            EagerContext::<ArrayIrValue<Array>, ArrayIrOperation<Array>>::new(),
-            ArrayIrValue::Dimension(DimensionValue::constant(3).unwrap()),
-        )
-        .with_axis_name("x".to_string());
-        let input = ArrayIrValue::Array(Array::vector(vec![1.0f32, 2.0, 3.0]).unwrap());
-        let input = BatchingTracer::new(context, ArrayIrBatch::new(input, BatchAxis::new(0)).unwrap());
+    #[test]
+    fn test_parallel_broadcast_parallel_broadcast_unbound_axis() {
+        // A name that no enclosing binder binds fails fast instead of silently acting as the identity.
         assert_eq!(
-            input.parallel_broadcast("x", 0).map(|output| output.into_batch().into_value()),
-            Ok(ArrayIrValue::Array(Array::vector(vec![1.0f32, 1.0, 1.0]).unwrap())),
+            batch(
+                |item: BatchingTracer<EagerContext<Array, ArrayOperation<Array>>, ArrayBatchingPolicy>| {
+                    item.parallel_broadcast("y", 1)
+                },
+                Array::vector(vec![1.0, 2.0, 3.0]).unwrap(),
+                BatchAxis::new(0),
+                BatchAxis::new(0),
+                BatchAxisSpecification::named("x"),
+            ),
+            Err::<Array, _>(BatchingError::Axis(AxisError::UnboundAxisName { name: "y".to_string() })),
         );
+        // A concrete array is never inside an axis binder, so every axis name is unbound for it, and an empty list of
+        // axis names is rejected before any of them is resolved.
+        assert_eq!(
+            Array::vector(vec![1.0, 2.0]).unwrap().parallel_broadcast("i", 0),
+            Err(ProgramError::Axis(AxisError::UnboundAxisName { name: "i".to_string() })),
+        );
+        assert_eq!(
+            Array::vector(vec![1.0, 2.0]).unwrap().parallel_broadcast(Vec::<String>::new(), 0),
+            Err(ProgramError::Type(TypeError::invalid(format!(
+                "`{PARALLEL_BROADCAST_OPERATION_NAME}` requires at least one axis name"
+            )))),
+        );
+    }
 
+    #[test]
+    fn test_parallel_broadcast_parallel_broadcast_manual_mesh_axis() {
         // Over a manual mesh axis, a varying value is broadcast directly, while an invariant value is first made
         // varying, because the broadcast output keeps its input's variation.
         let sharding = Sharding::replicated(manual_mesh(), 0);
@@ -1394,7 +1756,12 @@ mod tests {
                 in (%2)"
             },
         );
+    }
 
+    #[test]
+    fn test_parallel_broadcast_parallel_broadcast_unchecked_manual_mesh_axis() {
+        let sharding = Sharding::replicated(manual_mesh(), 0);
+        let invariant = ArrayType::scalar(DataType::F32).with_sharding(sharding.clone()).unwrap();
         // An unchecked manual binding tracks no variation, so it stages an ordinary broadcast without a mesh.
         let (output, program) = TracingContext::<Array, ArrayOperation<Array>>::trace_with_named_axes(
             |input| input.parallel_broadcast("x", 1),
@@ -1412,7 +1779,11 @@ mod tests {
                 in (%1)"
             },
         );
+    }
 
+    #[test]
+    fn test_parallel_broadcast_parallel_broadcast_unreduced_input() {
+        let sharding = Sharding::replicated(manual_mesh(), 0);
         // Over a manual mesh axis, a value with a pending cross-device sum is rejected before it is made varying.
         assert_eq!(
             TracingContext::<Array, ArrayOperation<Array>>::trace_with_named_axes(
@@ -1423,29 +1794,517 @@ mod tests {
                 manual_axes(true),
             )
             .map(|(output, _)| output),
-            Err(ProgramError::Type(TypeError::invalid("`parallel_broadcast` does not support unreduced inputs"))),
-        );
-
-        // A concrete array is never inside an axis binder, so every axis name is unbound for it, and an empty list of
-        // axis names is rejected before any of them is resolved.
-        assert_eq!(
-            Array::vector(vec![1.0, 2.0]).unwrap().parallel_broadcast("i", 0),
-            Err(ProgramError::Axis(AxisError::UnboundAxisName { name: "i".to_string() })),
-        );
-        assert_eq!(
-            Array::vector(vec![1.0, 2.0]).unwrap().parallel_broadcast(Vec::<String>::new(), 0),
-            Err(ProgramError::Type(TypeError::invalid("`parallel_broadcast` requires at least one axis name"))),
+            Err(ProgramError::Type(TypeError::invalid(format!(
+                "`{PARALLEL_BROADCAST_OPERATION_NAME}` does not support unreduced inputs"
+            )))),
         );
     }
 
     #[test]
     fn test_parallel_broadcast_parallel_broadcast_array_ir() {
-        // Concrete array IR values broadcast through their array members, which for concrete arrays outside a
-        // named-axis environment report the unbound axis.
+        // An array IR value broadcasts through its array view.
+        let context = BatchingContext::<_, ArrayIrBatchingPolicy>::new(
+            EagerContext::<ArrayIrValue<Array>, ArrayIrOperation<Array>>::new(),
+            ArrayIrValue::Dimension(DimensionValue::constant(3).unwrap()),
+        )
+        .with_axis_name("x".to_string());
+        let input = ArrayIrValue::Array(Array::vector(vec![1.0f32, 2.0, 3.0]).unwrap());
+        let input = BatchingTracer::new(context, ArrayIrBatch::new(input, BatchAxis::new(0)).unwrap());
+        assert_eq!(
+            input.parallel_broadcast("x", 0).map(|output| output.into_batch().into_value()),
+            Ok(ArrayIrValue::Array(Array::vector(vec![1.0f32, 1.0, 1.0]).unwrap())),
+        );
         let vector = Array::vector(vec![1.0f32, 2.0]).unwrap();
         assert_eq!(
-            ArrayIrValue::Array(vector.clone()).parallel_broadcast("x", 0),
-            vector.parallel_broadcast("x", 0).map(ArrayIrValue::Array),
+            ArrayIrValue::Array(vector).parallel_broadcast("x", 0),
+            Err(ProgramError::Axis(AxisError::UnboundAxisName { name: "x".to_string() })),
+        );
+    }
+
+    #[test]
+    fn test_dynamic_parallel_broadcast_dynamic_parallel_broadcast() {
+        let rows = Array::matrix(3, 2, vec![1f32, 2.0, 3.0, 4.0, 5.0, 6.0]).unwrap();
+        assert_eq!(
+            broadcast_runtime_source(rows, Array::scalar(1i32).unwrap(), BatchAxis::replicated()),
+            Ok(Array::matrix(3, 2, vec![3f32, 4.0, 3.0, 4.0, 3.0, 4.0]).unwrap()),
+        );
+    }
+
+    #[test]
+    fn test_dynamic_parallel_broadcast_dynamic_parallel_broadcast_unbound_axis() {
+        let value = Array::scalar(1f32).unwrap();
+        let source = Array::scalar(0i32).unwrap();
+        assert_eq!(
+            value.dynamic_parallel_broadcast("x", &source),
+            Err(ProgramError::Axis(AxisError::UnboundAxisName { name: "x".to_string() })),
+        );
+        assert_eq!(
+            value.dynamic_parallel_broadcast(Vec::<String>::new(), &source),
+            Err(TypeError::invalid(format!("`{PARALLEL_BROADCAST_OPERATION_NAME}` requires at least one axis name",))
+                .into()),
+        );
+    }
+
+    #[test]
+    fn test_dynamic_parallel_broadcast_dynamic_parallel_broadcast_exact_payloads() {
+        let nan = f32::from_bits(0x7fc01234);
+        let rows = Array::matrix(2, 2, vec![1f32, 2.0, -0.0, nan]).unwrap();
+        let output = broadcast_runtime_source(rows, Array::scalar(1i32).unwrap(), BatchAxis::replicated()).unwrap();
+        assert_eq!(output.r#type().as_ref(), &ArrayType::new_static(DataType::F32, [2, 2]));
+        assert_eq!(
+            output.elements::<f32>().unwrap().into_iter().map(f32::to_bits).collect::<Vec<_>>(),
+            vec![(-0.0f32).to_bits(), nan.to_bits(), (-0.0f32).to_bits(), nan.to_bits()],
+        );
+        let rows = Array::vector(vec![u64::MAX - 1, u64::MAX]).unwrap();
+        assert_eq!(
+            broadcast_runtime_source(rows, Array::scalar(1i32).unwrap(), BatchAxis::replicated()),
+            Ok(Array::vector(vec![u64::MAX; 2]).unwrap()),
+        );
+        let rows = Array::vector(vec![false, true]).unwrap();
+        assert_eq!(
+            broadcast_runtime_source(rows, Array::scalar(1i32).unwrap(), BatchAxis::replicated()),
+            Ok(Array::vector(vec![true; 2]).unwrap()),
+        );
+        let first = Complex::new(1f32, 2.0);
+        let second = Complex::new(-3.0, 4.0);
+        assert_eq!(
+            broadcast_runtime_source(
+                Array::vector(vec![first, second]).unwrap(),
+                Array::scalar(1i32).unwrap(),
+                BatchAxis::replicated()
+            ),
+            Ok(Array::vector(vec![second; 2]).unwrap()),
+        );
+    }
+
+    #[test]
+    fn test_dynamic_parallel_broadcast_dynamic_parallel_broadcast_degenerate_shapes() {
+        assert_eq!(
+            broadcast_runtime_source(
+                Array::vector(vec![5f32]).unwrap(),
+                Array::scalar(0i32).unwrap(),
+                BatchAxis::replicated()
+            ),
+            Ok(Array::vector(vec![5f32]).unwrap()),
+        );
+        assert_eq!(
+            broadcast_runtime_source(
+                Array::matrix(2, 0, Vec::<f32>::new()).unwrap(),
+                Array::scalar(1i32).unwrap(),
+                BatchAxis::replicated()
+            ),
+            Ok(Array::matrix(2, 0, Vec::<f32>::new()).unwrap()),
+        );
+        assert_eq!(
+            batch(
+                |(value, source): (TestTracer, TestTracer)| value.dynamic_parallel_broadcast("x", &source),
+                (Array::vector(vec![7f32, 8.0]).unwrap(), Array::scalar(1i32).unwrap()),
+                (BatchAxis::replicated(), BatchAxis::replicated()),
+                BatchAxis::replicated(),
+                BatchAxisSpecification::new(2, "x"),
+            ),
+            Ok(Array::vector(vec![7f32, 8.0]).unwrap()),
+        );
+    }
+
+    #[test]
+    fn test_dynamic_parallel_broadcast_dynamic_parallel_broadcast_host_memory() {
+        let memory = Memory::Host { pinned: true };
+        let rows = Array::vector(vec![1f32, 2.0]).unwrap().transfer_to_memory(memory).unwrap();
+        assert_eq!(
+            broadcast_runtime_source(rows, Array::scalar(1i32).unwrap(), BatchAxis::replicated()),
+            Ok(Array::vector(vec![2f32, 2.0]).unwrap().transfer_to_memory(memory).unwrap()),
+        );
+    }
+
+    #[test]
+    fn test_dynamic_parallel_broadcast_dynamic_parallel_broadcast_invalid_source() {
+        let rows = Array::vector(vec![1f32, 2.0]).unwrap();
+        let error = ProgramError::from(
+            broadcast_runtime_source(rows.clone(), Array::scalar(-1i32).unwrap(), BatchAxis::replicated()).unwrap_err(),
+        );
+        assert!(matches!(error.downcast_custom::<AssertionError>(),
+            Some(AssertionError::Failed { message, .. })
+                if message == &format!("`{PARALLEL_BROADCAST_OPERATION_NAME}` runtime source must be non-negative"),
+        ));
+        let error = ProgramError::from(
+            broadcast_runtime_source(rows.clone(), Array::scalar(2i32).unwrap(), BatchAxis::replicated()).unwrap_err(),
+        );
+        assert!(matches!(error.downcast_custom::<AssertionError>(),
+            Some(AssertionError::Failed { message, .. })
+                if message == &format!(
+                    "`{PARALLEL_BROADCAST_OPERATION_NAME}` runtime source must be smaller than axis size 2",
+                ),
+        ));
+        assert_eq!(
+            broadcast_runtime_source(rows.clone(), Array::scalar(1u64).unwrap(), BatchAxis::replicated())
+                .map_err(ProgramError::from),
+            Err(TypeError::invalid(format!(
+                "`{PARALLEL_BROADCAST_OPERATION_NAME}` runtime source must be an `i32` scalar but got `u64[]`"
+            ))
+            .into()),
+        );
+        assert_eq!(
+            broadcast_runtime_source(rows, Array::vector(vec![1i32]).unwrap(), BatchAxis::replicated())
+                .map_err(ProgramError::from),
+            Err(TypeError::invalid(format!(
+                "`{PARALLEL_BROADCAST_OPERATION_NAME}` runtime source must be an `i32` scalar but got `i32[1]`",
+            ))
+            .into()),
+        );
+    }
+
+    #[test]
+    fn test_dynamic_parallel_broadcast_dynamic_parallel_broadcast_source_reduction_state() {
+        let sharding = Sharding::replicated(manual_mesh(), 0);
+        let data_type = ArrayType::scalar(DataType::F32)
+            .with_sharding(sharding.clone().with_varying_manual_axes(["x"]).unwrap())
+            .unwrap();
+        let source_type = ArrayType::scalar(DataType::I32)
+            .with_sharding(sharding.clone().with_unreduced_axes(["x"]).unwrap())
+            .unwrap();
+        assert_eq!(
+            TracingContext::<Array, ArrayOperation<Array>>::trace_with_named_axes(
+                |(value, source)| value.dynamic_parallel_broadcast("x", &source),
+                (data_type.clone(), source_type),
+                manual_axes(true),
+            )
+            .map(|(output, _)| output),
+            Err(TypeError::invalid(format!(
+                "`{PARALLEL_BROADCAST_OPERATION_NAME}` runtime source must not carry reduction state",
+            ))
+            .into()),
+        );
+        let source_type =
+            ArrayType::scalar(DataType::I32).with_sharding(sharding.with_reduced_axes(["x"]).unwrap()).unwrap();
+        assert_eq!(
+            TracingContext::<Array, ArrayOperation<Array>>::trace_with_named_axes(
+                |(value, source)| value.dynamic_parallel_broadcast("x", &source),
+                (data_type, source_type),
+                manual_axes(true),
+            )
+            .map(|(output, _)| output),
+            Err(TypeError::invalid(format!(
+                "`{PARALLEL_BROADCAST_OPERATION_NAME}` runtime source must not carry reduction state",
+            ))
+            .into()),
+        );
+    }
+
+    #[test]
+    fn test_dynamic_parallel_broadcast_dynamic_parallel_broadcast_participant_sources() {
+        let rows = Array::vector(vec![1f32, 2.0]).unwrap();
+        assert_eq!(
+            broadcast_runtime_source(rows.clone(), Array::vector(vec![1i32, 1]).unwrap(), BatchAxis::new(0)),
+            Ok(Array::vector(vec![2f32; 2]).unwrap()),
+        );
+        let error = ProgramError::from(
+            broadcast_runtime_source(rows, Array::vector(vec![0i32, 1]).unwrap(), BatchAxis::new(0)).unwrap_err(),
+        );
+        assert!(matches!(error.downcast_custom::<AssertionError>(),
+            Some(AssertionError::Failed { message, .. })
+                if message == &format!(
+                    "`{PARALLEL_BROADCAST_OPERATION_NAME}` runtime sources must agree across participants",
+                ),
+        ));
+    }
+
+    #[test]
+    fn test_dynamic_parallel_broadcast_dynamic_parallel_broadcast_unrelated_batch_axis() {
+        // Each outer batch item is a separate collective group and can select a different source.
+        assert_eq!(
+            batch(
+                |inputs| {
+                    batch(
+                        |(value, source)| value.dynamic_parallel_broadcast("x", &source),
+                        inputs,
+                        (BatchAxis::new(0), BatchAxis::replicated()),
+                        BatchAxis::new(0),
+                        BatchAxisSpecification::named("x"),
+                    )
+                    .map_err(ProgramError::from)
+                },
+                (
+                    Array::matrix(2, 3, vec![1f32, 2.0, 3.0, 4.0, 5.0, 6.0]).unwrap(),
+                    Array::vector(vec![0i32, 2]).unwrap(),
+                ),
+                (BatchAxis::new(0), BatchAxis::new(0)),
+                BatchAxis::new(0),
+                BatchAxisSpecification::named("groups"),
+            ),
+            Ok(Array::matrix(2, 3, vec![1f32, 1.0, 1.0, 6.0, 6.0, 6.0]).unwrap()),
+        );
+    }
+
+    #[test]
+    fn test_dynamic_parallel_broadcast_dynamic_parallel_broadcast_partial_evaluation_unused_result() {
+        let data_type = ArrayType::new_static(DataType::F32, [2]);
+        let source_type = ArrayType::scalar(DataType::I32);
+        let (_, program) = TracingContext::<Array, ArrayOperation<Array>>::trace(
+            |(value, source)| {
+                let _ = batch(
+                    |(value, source)| value.dynamic_parallel_broadcast("x", &source),
+                    (value.clone(), source),
+                    (BatchAxis::new(0), BatchAxis::replicated()),
+                    BatchAxis::new(0),
+                    BatchAxisSpecification::named("x"),
+                )?;
+                Ok(value)
+            },
+            (data_type, source_type.clone()),
+        )
+        .unwrap();
+        assert_eq!(
+            program.to_string(),
+            indoc! {"
+                lambda %0:f32[2], %1:i32[] .
+                let %2:i32[] = constant [value=0]
+                    %3:bool[] = compare [direction=Equal] %1 %1
+                    () = assert [
+                        message=\"`parallel_broadcast` runtime sources must agree across participants\",
+                        labels=[\"minimum\", \"maximum\"],
+                    ] %3 %1 %1
+                    %4:bool[] = compare [direction=GreaterThanOrEqual] %1 %2
+                    () = assert [
+                        message=\"`parallel_broadcast` runtime source must be non-negative\",
+                        labels=[\"source\"],
+                    ] %4 %1
+                    %5:i32[] = constant [value=2]
+                    %6:bool[] = compare [direction=LessThan] %1 %5
+                    () = assert [
+                        message=\"`parallel_broadcast` runtime source must be smaller than axis size 2\",
+                        labels=[\"source\"],
+                    ] %6 %1
+                    %7:f32[1] = slice [start_indices=[0], limits=[1]] %0
+                    %8:f32[] = reshape [shape=[]] %7
+                    %9:f32[1] = slice [start_indices=[1], limits=[2]] %0
+                    %10:f32[] = reshape [shape=[]] %9
+                    %11:i32[] = constant [value=1]
+                    %12:bool[] = compare [direction=Equal] %1 %11
+                    %13:f32[] = select %12 %10 %8
+                    %14:f32[2] = broadcast [output_type=f32[2], output_axes=[]] %13
+                in (%0)"
+            }
+        );
+        let data = Array::vector(vec![1f32, 2.0]).unwrap();
+        let evaluation = program
+            .to_flat_program()
+            .partially_evaluate(&[PartialValue::Known(data.clone()), PartialValue::Unknown(source_type)])
+            .unwrap();
+        assert_eq!(evaluation.outputs(), &[PartialEvaluationOutput::Known(data)]);
+        assert_eq!(
+            evaluation.program().to_string(),
+            indoc! {"
+                lambda %0:i32[], %1:i32[], %2:i32[], %3:i32[], %4:f32[], %5:f32[] .
+                let %6:bool[] = compare [direction=Equal] %0 %0
+                    () = assert [
+                        message=\"`parallel_broadcast` runtime sources must agree across participants\",
+                        labels=[\"minimum\", \"maximum\"],
+                    ] %6 %0 %0
+                    %7:bool[] = compare [direction=GreaterThanOrEqual] %0 %1
+                    () = assert [
+                        message=\"`parallel_broadcast` runtime source must be non-negative\",
+                        labels=[\"source\"],
+                    ] %7 %0
+                    %8:bool[] = compare [direction=LessThan] %0 %2
+                    () = assert [
+                        message=\"`parallel_broadcast` runtime source must be smaller than axis size 2\",
+                        labels=[\"source\"],
+                    ] %8 %0
+                in ()"
+            }
+        );
+        let inputs = evaluation
+            .inputs()
+            .iter()
+            .map(|input| match input {
+                PartialEvaluationInput::Known(value) => value.clone(),
+                PartialEvaluationInput::Unknown(index) => {
+                    assert_eq!(*index, 1);
+                    Array::scalar(2i32).unwrap()
+                }
+            })
+            .collect::<Vec<_>>();
+        let error = evaluation.program().interpret(inputs).unwrap_err();
+        assert!(matches!(error.downcast_custom::<AssertionError>(),
+            Some(AssertionError::Failed { message, .. })
+                if message == &format!(
+                    "`{PARALLEL_BROADCAST_OPERATION_NAME}` runtime source must be smaller than axis size 2",
+                ),
+        ));
+    }
+
+    #[test]
+    fn test_dynamic_parallel_broadcast_dynamic_parallel_broadcast_differentiation() {
+        let rows = Array::vector(vec![1f64, 2.0, 3.0]).unwrap();
+        let source = Array::scalar(1i32).unwrap();
+        let (value, gradient) = differentiate_at((rows, source))
+            .value_and_gradient(|inputs| {
+                let output = batch(
+                    |(value, source)| value.dynamic_parallel_broadcast("x", &source),
+                    inputs,
+                    (BatchAxis::new(0), BatchAxis::replicated()),
+                    BatchAxis::new(0),
+                    BatchAxisSpecification::named("x"),
+                )?;
+                output.reduce(&[0], ReductionKind::Sum)
+            })
+            .unwrap();
+        assert_eq!(value, Array::scalar(6f64).unwrap());
+        assert_eq!(gradient.0, Array::vector(vec![0f64, 3.0, 0.0]).unwrap());
+        assert_eq!(gradient.1.r#type().data_type(), DataType::Zero);
+    }
+
+    #[test]
+    fn test_dynamic_parallel_broadcast_dynamic_parallel_broadcast_array_ir_manual_axis() {
+        let mesh = LogicalMesh::new(vec![MeshAxis::new("x", 2, MeshAxisType::Manual).unwrap()]).unwrap();
+        let data_type = ArrayType::scalar(DataType::F32)
+            .with_sharding(Sharding::replicated(mesh.clone(), 0).with_varying_manual_axes(["x"]).unwrap())
+            .unwrap();
+        let source_type =
+            ArrayType::scalar(DataType::I32).with_sharding(Sharding::replicated(mesh.clone(), 0)).unwrap();
+        let (output, program) = TracingContext::<ArrayIrValue<Array>, ArrayIrOperation<Array>>::trace_with_named_axes(
+            |(value, source)| value.dynamic_parallel_broadcast("x", &source),
+            (ArrayIrType::from(data_type.clone()), ArrayIrType::from(source_type)),
+            vec![("x".to_string(), NamedAxis::Mesh { mesh, axis: 0, size: 2, checks_manual_variation: true })],
+        )
+        .unwrap();
+        assert_eq!(output, ArrayIrType::from(data_type));
+        assert_eq!(
+            program.to_string(),
+            indoc! {"
+                lambda %0:f32[][sharding={mesh<['x'=2:manual]>, [], varying_manual={'x'}}], \
+                %1:i32[][sharding={mesh<['x'=2:manual]>, []}] .
+                let %2:i32[] = constant [value=0]
+                    %3:i32[][sharding={mesh<['x'=2:manual]>, [], varying_manual={'x'}}] = \
+                        parallel_vary [axis_name=\"x\"] %1
+                    %4:i32[][sharding={mesh<['x'=2:manual]>, []}] = \
+                        parallel_reduce [kind=min, axis_name=\"x\", mesh=['x'=2:manual]] %3
+                    %5:i32[][sharding={mesh<['x'=2:manual]>, [], varying_manual={'x'}}] = \
+                        parallel_vary [axis_name=\"x\"] %1
+                    %6:i32[][sharding={mesh<['x'=2:manual]>, []}] = \
+                        parallel_reduce [kind=max, axis_name=\"x\", mesh=['x'=2:manual]] %5
+                    %7:bool[][sharding={mesh<['x'=2:manual]>, []}] = compare [direction=Equal] %4 %6
+                    () = assert [
+                        message=\"`parallel_broadcast` runtime sources must agree across participants\",
+                        labels=[\"minimum\", \"maximum\"],
+                    ] %7 %4 %6
+                    %8:bool[][sharding={mesh<['x'=2:manual]>, []}] = compare [direction=GreaterThanOrEqual] %4 %2
+                    () = assert [
+                        message=\"`parallel_broadcast` runtime source must be non-negative\",
+                        labels=[\"source\"],
+                    ] %8 %1
+                    %9:i32[] = constant [value=2]
+                    %10:bool[][sharding={mesh<['x'=2:manual]>, []}] = compare [direction=LessThan] %6 %9
+                    () = assert [
+                        message=\"`parallel_broadcast` runtime source must be smaller than axis size 2\",
+                        labels=[\"source\"],
+                    ] %10 %1
+                    %11:dimension<2> = constant [value=2]
+                    %12:f32[2][sharding={mesh<['x'=2:manual]>, [{}], varying_manual={'x'}}] = parallel_all_gather [
+                        axes=\"x\",
+                        axis_size=2,
+                        concatenation_axis=0,
+                        options=Untiled,
+                        output_variance=Varying,
+                        mesh=['x'=2:manual],
+                    ] %0 %11
+                    %13:f32[1][sharding={mesh<['x'=2:manual]>, [{}], varying_manual={'x'}}] = \
+                        slice [start_indices=[0], limits=[1]] %12
+                    %14:f32[][sharding={mesh<['x'=2:manual]>, [], varying_manual={'x'}}] = reshape [shape=[]] %13
+                    %15:f32[1][sharding={mesh<['x'=2:manual]>, [{}], varying_manual={'x'}}] = \
+                        slice [start_indices=[1], limits=[2]] %12
+                    %16:f32[][sharding={mesh<['x'=2:manual]>, [], varying_manual={'x'}}] = reshape [shape=[]] %15
+                    %17:i32[] = constant [value=1]
+                    %18:bool[][sharding={mesh<['x'=2:manual]>, []}] = compare [direction=Equal] %1 %17
+                    %19:bool[][sharding={mesh<['x'=2:manual]>, [], varying_manual={'x'}}] = \
+                        parallel_vary [axis_name=\"x\"] %18
+                    %20:f32[][sharding={mesh<['x'=2:manual]>, [], varying_manual={'x'}}] = select %19 %16 %14
+                in (%20)"
+            }
+        );
+    }
+
+    #[test]
+    fn test_dynamic_parallel_broadcast_dynamic_parallel_broadcast_array_ir_non_array() {
+        let dimension = ArrayIrValue::<Array>::Dimension(DimensionValue::constant(1).unwrap());
+        assert_eq!(
+            dimension.dynamic_parallel_broadcast("x", &dimension),
+            Err(TypeError::invalid("expected array type but got dimension type").into()),
+        );
+    }
+
+    #[test]
+    fn test_dynamic_parallel_broadcast_dynamic_parallel_broadcast_array_ir_dynamic_items() {
+        let length = Dimension::Dynamic(DimensionVariable::new("length", DimensionBounds::new(0, Some(4)).unwrap()));
+        let data_type = ArrayType::new(DataType::F32, Shape::new(vec![Dimension::Static(2), length]));
+        let (output_type, program) = TracingContext::<ArrayIrValue<Array>, ArrayIrOperation<Array>>::trace(
+            |inputs| {
+                batch(
+                    |(value, source)| value.dynamic_parallel_broadcast("x", &source),
+                    inputs,
+                    (BatchAxis::new(0), BatchAxis::replicated()),
+                    BatchAxis::new(0),
+                    BatchAxisSpecification::named("x"),
+                )
+                .map_err(ProgramError::from)
+            },
+            (ArrayIrType::from(data_type.clone()), ArrayIrType::from(ArrayType::scalar(DataType::I32))),
+        )
+        .unwrap();
+        assert_eq!(output_type, ArrayIrType::from(data_type));
+        assert_eq!(
+            program.to_string(),
+            indoc! {"
+                lambda %0:f32[2, length], %1:i32[] .
+                let %2:dimension<2> = constant [value=2]
+                    %3:i32[] = constant [value=0]
+                    %4:bool[] = compare [direction=Equal] %1 %1
+                    () = assert [
+                        message=\"`parallel_broadcast` runtime sources must agree across participants\",
+                        labels=[\"minimum\", \"maximum\"],
+                    ] %4 %1 %1
+                    %5:bool[] = compare [direction=GreaterThanOrEqual] %1 %3
+                    () = assert [
+                        message=\"`parallel_broadcast` runtime source must be non-negative\",
+                        labels=[\"source\"],
+                    ] %5 %1
+                    %6:i32[] = constant [value=2]
+                    %7:bool[] = compare [direction=LessThan] %1 %6
+                    () = assert [
+                        message=\"`parallel_broadcast` runtime source must be smaller than axis size 2\",
+                        labels=[\"source\"],
+                    ] %7 %1
+                    %8:dimension<length ∈ [0, 4)> = dimension_size [axis=1] %0
+                    %9:dimension<2> = constant [value=2]
+                    %10:dimension<2> = constant [value=2]
+                    %11:bool[] = const true
+                    %12:f32[2, length] = reshape %0 %9 %8
+                    %13:f32[1, length] = slice [start_indices=[0, 0], limits=[1, length]] %12
+                    %14:f32[length] = reshape [shape=[length]] %13
+                    %15:f32[1, length] = slice [start_indices=[1, 0], limits=[2, length]] %12
+                    %16:f32[length] = reshape [shape=[length]] %15
+                    %17:i32[] = constant [value=1]
+                    %18:bool[] = compare [direction=Equal] %1 %17
+                    %19:f32[length] = select %18 %16 %14
+                    %20:dimension<length ∈ [0, 4)> = dimension_size [axis=0] %19
+                    %21:f32[2, length] = broadcast [output_axes=[1]] %19 %2 %20
+                in (%21)"
+            }
+        );
+        assert_eq!(
+            program.interpret((
+                ArrayIrValue::Array(Array::matrix(2, 3, vec![1f32, 2.0, 3.0, 4.0, 5.0, 6.0]).unwrap()),
+                ArrayIrValue::Array(Array::scalar(1i32).unwrap()),
+            )),
+            Ok(ArrayIrValue::Array(Array::matrix(2, 3, vec![4f32, 5.0, 6.0, 4.0, 5.0, 6.0]).unwrap())),
+        );
+        assert_eq!(
+            program.interpret((
+                ArrayIrValue::Array(Array::matrix(2, 0, Vec::<f32>::new()).unwrap()),
+                ArrayIrValue::Array(Array::scalar(1i32).unwrap()),
+            )),
+            Ok(ArrayIrValue::Array(Array::matrix(2, 0, Vec::<f32>::new()).unwrap())),
         );
     }
 }
