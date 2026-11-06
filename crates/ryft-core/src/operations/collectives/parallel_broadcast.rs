@@ -598,6 +598,7 @@ where
 
         // Every position along the mapped axis, which stays where it is, receives the slice of the source item.
         let ParallelBroadcastSource::Static(source) = self.source else {
+            // Dynamic sources return from the branch at the start of this rule, so only `Static` can reach here.
             unreachable!();
         };
         let sources = vec![Some(source); batch_size];
@@ -606,8 +607,6 @@ where
         Ok(vec![ArrayBatch::new(broadcast, BatchAxis::from_position(batch_axis))?])
     }
 }
-
-// TODO(eaplatanios): Review from here onwards.
 
 impl<C: Context<Type = ArrayType, Operation: From<ParallelBroadcastOperation>>> DifferentiableOperation<C>
     for ParallelBroadcastOperation
@@ -633,9 +632,9 @@ impl<C: Context<Type = ArrayType, Operation: From<ParallelBroadcastOperation>>> 
         let tangent = match inputs[0].tangent() {
             MaybeZero::Zero(_) => MaybeZero::Zero(primal.r#type().tangent()?),
             MaybeZero::Value(tangent) => {
-                let source = context.primal_to_tangent(inputs[1].primal().clone())?;
                 // The checked primal owns source validation. Keep the tangent pure so linearization can
                 // retain the root as a known residual and transpose this same operation without replaying checks.
+                let source = context.primal_to_tangent(inputs[1].primal().clone())?;
                 let mut operation = self.clone();
                 operation.requires_source_validation = false;
                 let mut tangents = context.tangent().bind(operation, Vec::new(), &[tangent.clone(), source])?;
@@ -765,6 +764,7 @@ where
                                     ),
                                 }
                             })?;
+
                             // This non-differentiable constant is aligned through the value capabilities below.
                             let size =
                                 Array::scalar(size as u64)?.transfer_to_memory(contribution.r#type().memory())?;
@@ -780,6 +780,7 @@ where
                 }
             }
         }
+
         accumulators[0].accumulate(context, MaybeZero::Value(contribution))?;
         Ok(())
     }
@@ -792,6 +793,8 @@ impl<A: Value<Type = ArrayType>> From<ParallelBroadcastOperation> for ArrayIrOpe
     }
 }
 
+// TODO(eaplatanios): Review from here onwards.
+
 /// Represents the ability to replicate the value of one participant of a named axis to every participant. Refer to the
 /// documentation of [`ParallelBroadcastOperation`] for the semantics of this operation and its transformation rules.
 ///
@@ -800,7 +803,7 @@ impl<A: Value<Type = ArrayType>> From<ParallelBroadcastOperation> for ArrayIrOpe
 ///
 /// # Example
 ///
-/// Every batch item receives the row of batch item two.
+/// In the following example, every batch item receives the row of batch item two:
 ///
 /// ```rust
 /// # use ryft_core::{
@@ -822,7 +825,8 @@ impl<A: Value<Type = ArrayType>> From<ParallelBroadcastOperation> for ArrayIrOpe
 /// # Ok(())
 /// # }
 /// ```
-/// A source supplied at runtime is an ordinary scalar input.
+///
+/// A source supplied at runtime is an ordinary scalar input:
 ///
 /// ```rust
 /// # use ryft_core::{
@@ -848,10 +852,10 @@ impl<A: Value<Type = ArrayType>> From<ParallelBroadcastOperation> for ArrayIrOpe
 /// ```
 #[capability]
 pub trait ParallelBroadcast<T = <Self as Capability>::Universe>: Capability + Sized {
-    /// Returns the value of participant `source` along the named axes `axes`, which every participant receives. Over a
-    /// manual mesh axis, an input that does not vary over the axis is first made varying through [`ParallelVary`],
-    /// because the broadcast output keeps its input's variation. JAX's `pbroadcast` rejects such an input instead, so
-    /// this is a deliberate extension that mirrors how [`ParallelPermute`](crate::ParallelPermute) stages it.
+    /// Returns the value of participant `source` along the named axes `axes`, which every participant receives. Over
+    /// a manual mesh axis, an input that does not vary over the axis is first made varying through [`ParallelVary`],
+    /// because the broadcast output keeps its input's variation. JAX's `pbroadcast` rejects such an input instead,
+    /// so this is a deliberate extension that mirrors how [`ParallelPermute`](crate::ParallelPermute) stages it.
     ///
     /// # Parameters
     ///
