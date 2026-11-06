@@ -200,7 +200,7 @@ pub use parallel_all_gather::{
 pub use parallel_all_to_all::{PARALLEL_ALL_TO_ALL_OPERATION_NAME, ParallelAllToAll, ParallelAllToAllOperation};
 pub use parallel_arg_extrema::ParallelArgExtrema;
 pub use parallel_broadcast::{
-    DynamicParallelBroadcast, PARALLEL_BROADCAST_OPERATION_NAME, ParallelBroadcast, ParallelBroadcastOperation,
+    PARALLEL_BROADCAST_OPERATION_NAME, ParallelBroadcast, ParallelBroadcastOperation, ParallelBroadcastSource,
 };
 pub use parallel_cast::{PARALLEL_CAST_OPERATION_NAME, ParallelCast, ParallelCastOperation, ParallelCastTarget};
 pub use parallel_permute::{PARALLEL_PERMUTE_OPERATION_NAME, ParallelPermute, ParallelPermuteOperation};
@@ -520,10 +520,10 @@ impl<C: Context, P: DifferentiationPolicy<C>> ShapeChangingCollectiveValue for D
 }
 
 /// Group of the value-level collective capabilities [`ParallelReduce`], [`ParallelVary`], [`ParallelAllGather`],
-/// [`ParallelSumScatter`], [`ParallelPermute`], [`ParallelBroadcast`], [`DynamicParallelBroadcast`],
-/// [`ParallelAllToAll`], [`ParallelRaggedAllToAll`], [`ParallelCast`], and [`ParallelArgExtrema`]. It is implemented
-/// automatically for every type that implements all of its members. The context-side [`AxisIndex`] is implemented by
-/// contexts rather than values and is therefore not a member.
+/// [`ParallelSumScatter`], [`ParallelPermute`], [`ParallelBroadcast`], [`ParallelAllToAll`],
+/// [`ParallelRaggedAllToAll`], [`ParallelCast`], and [`ParallelArgExtrema`]. It is implemented
+/// automatically for every type that implements all of its members. The context-side [`AxisIndex`]
+/// is implemented by contexts rather than values and is therefore not a member.
 ///
 /// The universe parameter `T` defaults to the [`Capability`] universe of the implementor and is passed to every member,
 /// so that homogeneous array values implement this bundle for [`ArrayType`] and array IR values implement it for
@@ -536,7 +536,6 @@ pub trait CollectiveOperations<T = <Self as Capability>::Universe>:
     + ParallelSumScatter<T>
     + ParallelPermute<T>
     + ParallelBroadcast<T>
-    + DynamicParallelBroadcast<T>
     + ParallelAllToAll<T>
     + ParallelRaggedAllToAll<T>
     + ParallelCast<T>
@@ -552,7 +551,6 @@ impl<
         + ParallelSumScatter<T>
         + ParallelPermute<T>
         + ParallelBroadcast<T>
-        + DynamicParallelBroadcast<T>
         + ParallelAllToAll<T>
         + ParallelRaggedAllToAll<T>
         + ParallelCast<T>
@@ -568,8 +566,10 @@ impl<
 /// tangent rides the same collective, and its transpose is usually another collective over the same axis, so this
 /// trait captures the hooks that the transformation rules of every such collective need and provides those rules on top
 /// of them. A collective whose transpose composes several operations (i.e., a broadcast and an invariant all-gather)
-/// stages it in its own transposition rule instead. The collectives keep explicit trait implementations that delegate
-/// to the provided functions, so that every operation module reads the same way.
+/// stages it in its own transposition rule instead. Only the static-source form of [`ParallelBroadcastOperation`]
+/// uses these unary helpers; its runtime-source form has separate rules for its additional input and validation.
+/// The collectives keep explicit trait implementations that delegate to the provided functions, so that every
+/// operation module reads the same way.
 ///
 /// The hooks named after a public accessor of the operation (e.g., [`axes`](Self::axes)) return the same
 /// values. They are repeated here because this trait is private, while the accessors are part of the public API.
