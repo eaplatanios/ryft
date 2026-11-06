@@ -9,12 +9,11 @@
 //!
 //! # Conceptual Model
 //!
-//! Every Ryft [`Sharding`] carries its [`LogicalMesh`], and so the types of the mesh axes belong to each value's type
-//! rather than to some ambient context. A switch therefore works on values only. It takes its mesh from the shardings
-//! that it is given (i.e., the output shardings of [`auto_axes`] and the input shardings of [`explicit_axes`]), or from
-//! the [`default_mesh`](MeshContext::default_mesh) of the context of its inputs when [`auto_axes`] is given none (i.e.,
-//! for a function without outputs), retypes the selected axes of that mesh (refer to [`LogicalMesh::with_axis_types`]),
-//! and runs the function inline between two sets of [`Reshard`]s:
+//! Every Ryft [`Sharding`] carries its [`LogicalMesh`], and so the types of the mesh axes belong to each value's type.
+//! A switch takes its mesh from the shardings that it is given (i.e., the output shardings of [`auto_axes`] and the
+//! input shardings of [`explicit_axes`]), or from the [`default_mesh`](MeshContext::default_mesh) of the context of its
+//! inputs when [`auto_axes`] is given none (i.e., for a function without outputs), retypes the selected axes of that
+//! mesh (refer to [`LogicalMesh::with_axis_types`]), and runs the function inline between two sets of [`Reshard`]s:
 //!
 //! ```text
 //!               entry reshards                 function                 exit reshards
@@ -31,8 +30,14 @@
 //! combining them with switched values (as JAX rejects them because the context mesh does not match the mesh of their
 //! types), whereas values without a sharding combine with values of either mesh.
 //!
-//! The switch is not recorded in the context of the function, so the [`default_mesh`](MeshContext::default_mesh)
-//! of a context, which a nested `shard_map` without a mesh uses, keeps the original axis types inside the function.
+//! Values that the function creates rather than receives must be typed over the switched mesh as well,
+//! so the switch also retypes the mesh in the context of its inputs while the function runs (refer to
+//! [`MeshContext::with_retyped_mesh`]), as JAX's switches retype their context mesh. The named-axis bindings over
+//! the mesh of the switch and the default mesh of that context then report the switched mesh, so the values that the
+//! function creates from them (e.g., an [`axis_index`](crate::AxisIndex::axis_index) along a manual axis) are typed
+//! over it, and so are the collectives that the function binds, together with the values that their transform rules
+//! create later (e.g., when the traced function is transposed). The retyping ends when the function returns, even
+//! when it fails. A switch without inputs has no context to retype, so its function runs in its original context.
 
 use std::collections::BTreeSet;
 
@@ -250,6 +255,7 @@ where
     // Each sharded input loses its placement along the auto axes of the switched mesh. Its manual variation and manual
     // reduction state are carried by the reshard itself, and reduction state along a switched axis cannot be retyped,
     // since an auto axis cannot carry reduction state.
+    let context = inputs.parameters().next().map(Value::domain);
     let structure = inputs.parameter_structure();
     let inputs = inputs
         .into_parameters()
@@ -275,7 +281,8 @@ where
             }
         })
         .collect::<Result<Vec<_>, AxisTypesError>>()?;
-    let outputs = function(Input::from_parameters(structure, inputs)?)?;
+    let outputs = switch
+        .run(context.as_ref(), || Ok::<_, AxisTypesError>(function(Input::from_parameters(structure, inputs)?)?))?;
 
     validate_parameter_structure(&output_shardings.parameter_paths().collect::<Vec<_>>(), &outputs)?;
     let structure = outputs.parameter_structure();
@@ -344,7 +351,7 @@ pub fn explicit_axes<V, Input, Output, F>(
     input_shardings: Input::To<Sharding>,
 ) -> Result<Output, AxisTypesError>
 where
-    V: Value<Type: ArrayMemberType> + Reshard,
+    V: Value<Type: ArrayMemberType, Domain: MeshContext> + Reshard,
     Input: Parameterized<V>,
     Input::Family: ParameterizedFamily<Sharding>,
     Output: Parameterized<V>,
@@ -356,6 +363,7 @@ where
     validate_parameter_structure(&inputs.parameter_paths().collect::<Vec<_>>(), &input_shardings)?;
 
     // Each input is resharded to its input sharding over the switched mesh, which may name the switched axes.
+    let context = inputs.parameters().next().map(Value::domain);
     let structure = inputs.parameter_structure();
     let inputs = inputs
         .into_parameters()
@@ -373,7 +381,8 @@ where
             Ok(input.reshard(&sharding.with_mesh(switch.switched_mesh.clone())?)?)
         })
         .collect::<Result<Vec<_>, AxisTypesError>>()?;
-    let outputs = function(Input::from_parameters(structure, inputs)?)?;
+    let outputs = switch
+        .run(context.as_ref(), || Ok::<_, AxisTypesError>(function(Input::from_parameters(structure, inputs)?)?))?;
 
     // Each sharded output loses its placement along the axes that are auto in the original mesh, which cannot carry
     // reduction state, while its manual variation and manual reduction state are carried by the reshard itself.
@@ -480,6 +489,19 @@ impl AxisTypeSwitch {
             Err(mismatch(self.mesh.clone(), sharding.mesh().clone()))
         }
     }
+
+    /// Runs `function` with [`Self::mesh`] retyped to [`Self::switched_mesh`] in `context`, the context of the inputs
+    /// of the switch (refer to [`MeshContext::with_retyped_mesh`]), so that the values that `function` creates from the
+    /// named-axis bindings and the default mesh of that context (e.g., with
+    /// [`axis_index`](crate::AxisIndex::axis_index)) are typed over the switched mesh, as are the values that the
+    /// transform rules of its operations create later. A switch without inputs has no context to retype, so its
+    /// `function` runs unchanged.
+    fn run<C: MeshContext, R>(&self, context: Option<&C>, function: impl FnOnce() -> R) -> R {
+        match context {
+            Some(context) => context.with_retyped_mesh(&self.mesh, &self.switched_mesh, function),
+            None => function(),
+        }
+    }
 }
 
 /// Returns the [`Reshard`] target that retypes a value placed by `sharding` over `mesh`, which keeps its placement and
@@ -521,9 +543,12 @@ mod tests {
         ShardingDimension,
     };
     use crate::batching::{BatchAxis, batch};
-    use crate::differentiation::{DifferentiableType, differentiate_at};
+    use crate::differentiation::{CotangentDestinationKind, DifferentiableType, differentiate_at};
     use crate::operations::arithmetic::{Add, Mul};
+    use crate::operations::collectives::axis_index::AxisIndex;
+    use crate::operations::collectives::parallel_all_gather::ParallelAllGather;
     use crate::operations::collectives::parallel_reduce::ParallelReduce;
+    use crate::operations::manipulation::conversions::ConvertElementType;
     use crate::operations::reductions::{Reduce, ReductionKind};
     use crate::operations::sharding::shard_map::{ShardMapOptions, ShardMapTracer, shard_map};
     use crate::operations::trigonometric::{Cos, Sin};
@@ -1052,6 +1077,120 @@ mod tests {
             panic!("expected an array output");
         };
         assert_eq!(output.to_f64s(), vec![4.0, 6.0, 8.0, 10.0]);
+    }
+
+    #[test]
+    fn test_auto_axes_retypes_the_mesh_of_its_context() {
+        // A switch retypes the mesh of the context that its function runs in, as JAX's `auto_axes` retypes its context
+        // mesh, so the values that the function creates from the bindings of that context (here, the index along the
+        // manual axis `x`) are typed over the switched mesh and combine with the switched inputs. So does the default
+        // mesh of the context, which is restored once the function returns, including when it fails.
+        let mesh = explicit_mesh().with_axis_types(["x"], MeshAxisType::Manual).unwrap();
+        let switched_mesh = mesh.with_axis_types(["y"], MeshAxisType::Auto).unwrap();
+        let input_sharding = sharding(&mesh, &[Some("x"), Some("y")]);
+        let local_sharding = sharding(&mesh, &[None, Some("y")]);
+        let index_type = RefCell::new(None);
+        let default_meshes = RefCell::new(Vec::new());
+        let (_, program) = ArrayIrTracingContext::trace(
+            |input: Tracer<ArrayIrTracingContext>| {
+                let input = ValueProjection::<ArrayType>::into_projected(input).map_err(ProgramError::from)?;
+                let output = shard_map(
+                    |input: ShardMapTracer<ArrayIrTracingContext>| {
+                        let context = input.domain();
+                        let output = auto_axes(
+                            |input: ShardMapTracer<ArrayIrTracingContext>| {
+                                default_meshes.borrow_mut().push(input.domain().default_mesh());
+                                let index = input.domain().axis_index("x")?.convert_element_type(DataType::F32)?;
+                                *index_type.borrow_mut() = Some(index.r#type().into_owned());
+                                input.add(&index)
+                            },
+                            input.clone(),
+                            Some(&["y"]),
+                            local_sharding.clone(),
+                        )?;
+                        default_meshes.borrow_mut().push(context.default_mesh());
+                        let failure = auto_axes(
+                            |_: ShardMapTracer<ArrayIrTracingContext>| {
+                                Err::<ShardMapTracer<ArrayIrTracingContext>, _>(ProgramError::InvalidArgument {
+                                    message: "failure".to_string(),
+                                })
+                            },
+                            input,
+                            Some(&["y"]),
+                            local_sharding.clone(),
+                        );
+                        assert!(failure.is_err());
+                        default_meshes.borrow_mut().push(context.default_mesh());
+                        Ok(output)
+                    },
+                    input,
+                    mesh.clone(),
+                    input_sharding.clone(),
+                    input_sharding.clone(),
+                    ShardMapOptions::new(),
+                )?;
+                Ok(ProjectedValue::into_value(output))
+            },
+            ArrayIrType::Array(matrix_type(None)),
+        )
+        .unwrap();
+        let index_sharding = Sharding::replicated(switched_mesh.clone(), 0).with_varying_manual_axes(["x"]).unwrap();
+        assert_eq!(
+            index_type.into_inner(),
+            Some(ArrayType::scalar(DataType::F32).with_sharding(index_sharding).unwrap()),
+        );
+        assert_eq!(default_meshes.into_inner(), vec![Some(switched_mesh), Some(mesh.clone()), Some(mesh)]);
+        let ArrayIrValue::Array(output) = program.interpret(ArrayIrValue::Array(matrix(None))).unwrap() else {
+            panic!("expected an array output");
+        };
+        assert_eq!(output.to_f64s(), vec![0.0, 1.0, 2.0, 3.0, 5.0, 6.0, 7.0, 8.0]);
+    }
+
+    #[test]
+    fn test_auto_axes_types_collectives_over_the_switched_mesh_for_later_transforms() {
+        // A collective bound inside a switch records the switched mesh, so the values that its transform rules create
+        // after the switch has returned (here, by transposing the traced program) are typed over the switched mesh
+        // too. Each device sums the gathered shards, and the cotangent of each shard is the sum of the cotangents of
+        // both devices.
+        let mesh = explicit_mesh().with_axis_types(["x"], MeshAxisType::Manual).unwrap();
+        let input_sharding = sharding(&mesh, &[Some("x"), Some("y")]);
+        let local_sharding = sharding(&mesh, &[None, Some("y")]);
+        let (_, program) = ArrayIrTracingContext::trace(
+            |input: Tracer<ArrayIrTracingContext>| {
+                let input = ValueProjection::<ArrayType>::into_projected(input).map_err(ProgramError::from)?;
+                let output = shard_map(
+                    |input: ShardMapTracer<ArrayIrTracingContext>| {
+                        Ok(auto_axes(
+                            |input: ShardMapTracer<ArrayIrTracingContext>| {
+                                input.parallel_all_gather("x", 0)?.reduce_sum(&[0], None)
+                            },
+                            input,
+                            Some(&["y"]),
+                            local_sharding.clone(),
+                        )?)
+                    },
+                    input,
+                    mesh.clone(),
+                    input_sharding.clone(),
+                    input_sharding.clone(),
+                    ShardMapOptions::new(),
+                )?;
+                Ok(ProjectedValue::into_value(output))
+            },
+            ArrayIrType::Array(matrix_type(None)),
+        )
+        .unwrap();
+        let ArrayIrValue::Array(output) = program.interpret(ArrayIrValue::Array(matrix(None))).unwrap() else {
+            panic!("expected an array output");
+        };
+        assert_eq!(output.to_f64s(), vec![4.0, 6.0, 8.0, 10.0, 4.0, 6.0, 8.0, 10.0]);
+        let transposed = program.transpose_with_respect_to(&[0], &[CotangentDestinationKind::Return]).unwrap();
+        let cotangent = Array::from_elements(matrix_type(Some(input_sharding)), &[1.0f32; 8]).unwrap();
+        let outputs = transposed.interpret(vec![ArrayIrValue::Array(cotangent)]).unwrap();
+        let [ArrayIrValue::Array(input_cotangent)] = outputs.as_slice() else {
+            panic!("expected one array output");
+        };
+        assert_eq!(input_cotangent.to_f64s(), vec![2.0; 8]);
     }
 
     #[test]
