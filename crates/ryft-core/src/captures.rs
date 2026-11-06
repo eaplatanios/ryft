@@ -807,6 +807,7 @@ mod tests {
         Array, ArrayBatchingPolicy, ArrayIrOperation, ArrayIrType, ArrayIrValue, ArrayOperation, ArrayType, DataType,
         Dimension, DimensionBounds, DimensionType, DimensionValue, DimensionVariable, Shape,
     };
+    use crate::batching::BatchAxis;
     use crate::contexts::StagingContext;
     use crate::interpretation::InterpretableOperation;
     use crate::operations::{
@@ -817,10 +818,34 @@ mod tests {
         EmptyRegionDriver, MaybeZero, ProgramBuilder, ProgramError, ReferenceType, RegionId, RegionSlot,
         TypeIdentityRenaming, TypedProgram, ValueDirectDispatch, ValueProjection,
     };
-    use crate::tests::{TestArrayContext, TestRegionOperation};
+    use crate::tests::{TestArrayContext, TestArrayTracingContext, TestRegionOperation};
     use crate::tracing::{NestedTracingContext, Tracer, TracingContext};
 
     use super::*;
+
+    /// Trace whose imported runtime arrays are retained as capture references.
+    type ImportTrace = TracingContext<CaptureReference<ArrayType>, ArrayOperation<CaptureReference<ArrayType>>, Array>;
+
+    /// Finalizes imported outputs and validates their references against the owning trace's capture table.
+    fn finish_imports(
+        context: &ImportTrace,
+        outputs: Vec<Tracer<ImportTrace>>,
+    ) -> ClosedProgram<
+        Array,
+        CaptureReference<ArrayType>,
+        ArrayOperation<CaptureReference<ArrayType>>,
+        Vec<CaptureReference<ArrayType>>,
+        Vec<CaptureReference<ArrayType>>,
+    > {
+        let output_atoms = outputs.iter().map(Tracer::atom_id).collect::<Result<Vec<_>, _>>().unwrap();
+        let program = context
+            .builder()
+            .borrow()
+            .clone()
+            .build(output_atoms, Vec::<Placeholder>::new(), vec![Placeholder; outputs.len()])
+            .unwrap();
+        ClosedProgram::new(program, context.captures().borrow().clone()).unwrap()
+    }
 
     #[test]
     fn test_capture_reference_identity_renaming_preserves_capture_index() {
@@ -927,32 +952,197 @@ mod tests {
 
     #[test]
     fn test_importing_context_import() {
-        type Root = TracingContext<CaptureReference<ArrayType>, ArrayOperation<CaptureReference<ArrayType>>, Array>;
-        let array = Array::scalar(3.0).unwrap();
-
-        // A value of the importing context itself is returned unchanged.
         let eager = TestArrayContext::new();
-        assert_eq!(ImportingContext::<TestArrayContext, SameContext>::import(&eager, array.clone()), Ok(array.clone()));
+        let array = Array::scalar(u64::MAX).unwrap();
+        assert_eq!(ImportingContext::<TestArrayContext, SameContext>::import(&eager, array.clone()), Ok(array));
 
-        // A root trace registers a runtime value in its capture table and stages a reference to that slot.
-        let root = Root::new();
-        let captured = ImportingContext::<TestArrayContext, _>::import(&root, array.clone()).unwrap();
-        assert_eq!(captured.r#type().as_ref(), array.r#type().as_ref());
-        assert_eq!(root.captures().borrow().as_slice(), std::slice::from_ref(&array));
+        let (_, program) = TestArrayTracingContext::trace(
+            |input| {
+                let imported =
+                    ImportingContext::<TestArrayTracingContext, SameContext>::import(input.context(), input.clone())?;
+                assert_eq!(imported.atom_id(), input.atom_id());
+                Ok(imported)
+            },
+            ArrayType::scalar(DataType::F32),
+        )
+        .unwrap();
+        assert_eq!(
+            program.to_string(),
+            indoc! {"
+                lambda %0:f32[] .
+                in (%0)"
+            },
+        );
+    }
 
-        // Transform contexts import through their parent and wrap the result like a constant: replicated under
-        // batching, with a structurally zero tangent under differentiation, and as a known value under partial
-        // evaluation. Each import registers one more capture in the root trace.
-        let batching = BatchingContext::<Root, ArrayBatchingPolicy>::new(root.clone(), 2);
-        let batched = ImportingContext::<TestArrayContext, _>::import(&batching, array.clone()).unwrap();
-        assert_eq!(batched.batch().batch_axis_position(), None);
-        let differentiation = DifferentiationContext::<Root>::new(root.clone());
-        let differentiated = ImportingContext::<TestArrayContext, _>::import(&differentiation, array.clone()).unwrap();
-        assert!(matches!(differentiated.tangent(), MaybeZero::Zero(_)));
+    #[test]
+    fn test_importing_context_import_same_context_preserves_tangent() {
+        let context = DifferentiationContext::<TestArrayContext>::fused(TestArrayContext::new());
+        let dual =
+            DifferentiationDual::new(Array::scalar(3f32).unwrap(), MaybeZero::Value(Array::scalar(5f32).unwrap()))
+                .unwrap();
+        let value = DifferentiationTracer::new(dual, context.clone());
+        let imported = ImportingContext::<_, SameContext>::import(&context, value).unwrap();
+        assert_eq!(imported.primal(), &Array::scalar(3f32).unwrap());
+        assert_eq!(imported.tangent(), &MaybeZero::Value(Array::scalar(5f32).unwrap()));
+    }
+
+    #[test]
+    fn test_importing_context_import_tracing_context() {
+        let context = ImportTrace::new();
+        let array = Array::scalar(3f32).unwrap();
+        let integer = Array::scalar(u64::MAX).unwrap();
+        let first = ImportingContext::<TestArrayContext, _>::import(&context, array.clone()).unwrap();
+        let second = ImportingContext::<TestArrayContext, _>::import(&context, integer.clone()).unwrap();
+        assert_eq!(first.r#type().as_ref(), &ArrayType::scalar(DataType::F32));
+        assert_eq!(second.r#type().as_ref(), &ArrayType::scalar(DataType::U64));
+        let program = finish_imports(&context, vec![first, second]);
+        assert_eq!(program.captures(), &[array, integer]);
+        assert_eq!(
+            program.program().to_string(),
+            indoc! {"
+                lambda  .
+                let %0:f32[] = const capture#0:f32[]
+                    %1:u64[] = const capture#1:u64[]
+                in (%0, %1)"
+            },
+        );
+    }
+
+    #[test]
+    fn test_importing_context_import_nested_tracing_context() {
+        let context = ImportTrace::new();
+        let first_array = Array::scalar(3f32).unwrap();
+        let second_array = Array::scalar(7f32).unwrap();
+        let first = ImportingContext::<TestArrayContext, _>::import(&context, first_array.clone()).unwrap();
+        let (_, nested) = NestedTracingContext::trace(
+            context.clone(),
+            |inputs: Vec<Tracer<_>>| {
+                let imported =
+                    ImportingContext::<TestArrayContext, _>::import(inputs[0].context(), second_array.clone())?;
+                Ok(vec![imported])
+            },
+            vec![ArrayType::scalar(DataType::F32)],
+        )
+        .unwrap();
+        assert_eq!(context.captures().borrow().as_slice(), &[first_array.clone(), second_array.clone()]);
+        let nested = ClosedProgram::new(nested, context.captures().borrow().clone()).unwrap();
+        assert_eq!(
+            nested.program().to_string(),
+            indoc! {"
+                lambda %0:f32[] .
+                let %1:f32[] = const capture#1:f32[]
+                in (%1)"
+            },
+        );
+        let program = finish_imports(&context, vec![first]);
+        assert_eq!(program.captures(), &[first_array, second_array]);
+        assert_eq!(
+            program.program().to_string(),
+            indoc! {"
+                lambda  .
+                let %0:f32[] = const capture#0:f32[]
+                in (%0)"
+            },
+        );
+    }
+
+    #[test]
+    fn test_importing_context_import_partial_evaluation_context() {
+        let root = ImportTrace::new();
+        let context = PartialEvaluationContext::new(root.clone());
+        let array = Array::scalar(3f32).unwrap();
+        let imported = ImportingContext::<TestArrayContext, _>::import(&context, array.clone()).unwrap();
+        assert_eq!(imported.r#type().as_ref(), &ArrayType::scalar(DataType::F32));
+        let known = imported.value().unwrap().as_known().unwrap().clone();
+        let program = finish_imports(&root, vec![known]);
+        assert_eq!(program.captures(), &[array]);
+        assert_eq!(
+            program.program().to_string(),
+            indoc! {"
+                lambda  .
+                let %0:f32[] = const capture#0:f32[]
+                in (%0)"
+            },
+        );
+    }
+
+    #[test]
+    fn test_importing_context_import_batching_context() {
+        let root = ImportTrace::new();
+        let context = BatchingContext::<ImportTrace, ArrayBatchingPolicy>::new(root.clone(), 2);
+        let array = Array::scalar(3f32).unwrap();
+        let imported = ImportingContext::<TestArrayContext, _>::import(&context, array.clone()).unwrap();
+        assert_eq!(imported.r#type().as_ref(), &ArrayType::scalar(DataType::F32));
+        assert_eq!(imported.batch().batch_axis(), BatchAxis::replicated());
+        let program = finish_imports(&root, vec![imported.batch().value().clone()]);
+        assert_eq!(program.captures(), &[array]);
+        assert_eq!(
+            program.program().to_string(),
+            indoc! {"
+                lambda  .
+                let %0:f32[] = const capture#0:f32[]
+                in (%0)"
+            },
+        );
+    }
+
+    #[test]
+    fn test_importing_context_import_differentiation_context() {
+        let root = ImportTrace::new();
+        let context = DifferentiationContext::<ImportTrace>::fused(root.clone());
+        let array = Array::scalar(3f32).unwrap();
+        let imported = ImportingContext::<TestArrayContext, _>::import(&context, array.clone()).unwrap();
+        assert!(matches!(
+            imported.tangent(),
+            MaybeZero::Zero(tangent_type) if tangent_type == &ArrayType::scalar(DataType::F32),
+        ));
+        let program = finish_imports(&root, vec![imported.primal().clone()]);
+        assert_eq!(program.captures(), &[array]);
+        assert_eq!(
+            program.program().to_string(),
+            indoc! {"
+                lambda  .
+                let %0:f32[] = const capture#0:f32[]
+                in (%0)"
+            },
+        );
+    }
+
+    #[test]
+    fn test_importing_context_import_composed_parent_routes() {
+        let root = ImportTrace::new();
         let partial = PartialEvaluationContext::new(root.clone());
-        let partially_evaluated = ImportingContext::<TestArrayContext, _>::import(&partial, array.clone()).unwrap();
-        assert!(partially_evaluated.value().unwrap().is_known());
-        assert_eq!(root.captures().borrow().len(), 4);
+        let batch = BatchingContext::<_, ArrayBatchingPolicy>::new(partial, 2);
+        let context = DifferentiationContext::fused(batch);
+        let array = Array::scalar(3f32).unwrap();
+        let imported = ImportingContext::<TestArrayContext, _>::import(&context, array.clone()).unwrap();
+        assert!(matches!(
+            imported.tangent(),
+            MaybeZero::Zero(tangent_type) if tangent_type == &ArrayType::scalar(DataType::F32),
+        ));
+        assert_eq!(imported.primal().batch().batch_axis(), BatchAxis::replicated());
+        let known = imported.primal().batch().value().value().unwrap().as_known().unwrap().clone();
+        let program = finish_imports(&root, vec![known]);
+        assert_eq!(program.captures(), &[array]);
+        assert_eq!(
+            program.program().to_string(),
+            indoc! {"
+                lambda  .
+                let %0:f32[] = const capture#0:f32[]
+                in (%0)"
+            },
+        );
+    }
+
+    #[test]
+    fn test_importing_context_import_rejects_discarded_capture_table() {
+        let result = ImportTrace::trace_with_context_and_named_axes(
+            |context, ()| ImportingContext::<TestArrayContext, _>::import(context, Array::scalar(3f32).unwrap()),
+            (),
+            Vec::new(),
+        );
+        assert!(matches!(result, Err(ProgramError::DiscardedCaptures { count: 1 })));
     }
 
     #[test]
@@ -1017,11 +1207,11 @@ mod tests {
         assert_eq!(
             pruned.program().to_string(),
             indoc! {"
-                lambda %0:f64[] .
-                let %1:f64[] = const capture#0:f64[]
-                    %2:f64[] = add %0 %1
-                in (%2)
-            "}
+                        lambda %0:f64[] .
+                        let %1:f64[] = const capture#0:f64[]
+                            %2:f64[] = add %0 %1
+                        in (%2)
+                    "}
             .trim_end(),
         );
 
@@ -1241,11 +1431,11 @@ mod tests {
         assert_eq!(
             lifted.to_string(),
             indoc! {"
-                lambda %0:f64[], %1:f64[], %2:f64[] .
-                let %3:f64[] = add %2 %0
-                    %4:f64[] = add %3 %0
-                in (%4)
-            "}
+                        lambda %0:f64[], %1:f64[], %2:f64[] .
+                        let %3:f64[] = add %2 %0
+                            %4:f64[] = add %3 %0
+                        in (%4)
+                    "}
             .trim_end(),
         );
 
@@ -1408,12 +1598,12 @@ mod tests {
         assert_eq!(
             lifted.to_string(),
             indoc! {"
-                lambda %0:f64[], %1:f64[] .
-                let %2:f64[] = const 5.0
-                    %3:f64[] = add %1 %0
-                    %4:f64[] = add %3 %2
-                in (%4)
-            "}
+                        lambda %0:f64[], %1:f64[] .
+                        let %2:f64[] = const 5.0
+                            %3:f64[] = add %1 %0
+                            %4:f64[] = add %3 %2
+                        in (%4)
+                    "}
             .trim_end(),
         );
         let output = lifted

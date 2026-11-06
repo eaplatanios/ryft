@@ -711,11 +711,13 @@ impl MeshRetypings {
 #[cfg(test)]
 mod tests {
     use std::collections::HashSet;
+    use std::panic::{AssertUnwindSafe, catch_unwind};
 
     use indoc::indoc;
     use pretty_assertions::assert_eq;
 
     use crate::arrays::{ArrayType, DataType, MeshAxis, MeshAxisType};
+    use crate::programs::ProgramError;
     use crate::tests::{TestArrayContext, TestArrayTracingContext};
     use crate::tracing::Tracer;
 
@@ -745,6 +747,17 @@ mod tests {
             "}
             .trim_end(),
         );
+    }
+
+    /// Meshes that retain the manual axis `x` while switching the free axis `y` from explicit to auto.
+    fn retyping_meshes() -> (LogicalMesh, LogicalMesh) {
+        let mesh = LogicalMesh::new(vec![
+            MeshAxis::new("x", 2, MeshAxisType::Manual).unwrap(),
+            MeshAxis::new("y", 3, MeshAxisType::Explicit).unwrap(),
+        ])
+        .unwrap();
+        let retyped = mesh.with_axis_types(["y"], MeshAxisType::Auto).unwrap();
+        (mesh, retyped)
     }
 
     #[test]
@@ -969,6 +982,305 @@ mod tests {
             assert_eq!(DifferentiationContext::fused(context.clone()).default_mesh(), Some(mesh.clone()));
             let primal = PartialEvaluationContext::new(context.clone());
             assert_eq!(DifferentiationContext::partitioned(primal).default_mesh(), Some(mesh.clone()));
+        });
+    }
+
+    #[test]
+    fn test_mesh_context_with_retyped_mesh() {
+        let (mesh, retyped) = retyping_meshes();
+        let context = TestArrayContext::new();
+        assert_eq!(
+            context.with_retyped_mesh(&mesh, &retyped, || {
+                assert_eq!(context.default_mesh(), None);
+                assert_eq!(context.named_axes(), Vec::new());
+                7
+            }),
+            7,
+        );
+        assert_eq!(context.default_mesh(), None);
+    }
+
+    #[test]
+    fn test_mesh_context_with_retyped_mesh_projected_context() {
+        let (mesh, retyped) = retyping_meshes();
+        with_mesh_context(Some(mesh.clone()), Vec::new(), |context| {
+            let projected = ProjectedContext::<_, ArrayType>::new(context.clone());
+            projected.with_retyped_mesh(&mesh, &retyped, || {
+                assert_eq!(projected.default_mesh(), Some(retyped.clone()));
+                assert_eq!(context.default_mesh(), Some(retyped.clone()));
+            });
+            assert_eq!(projected.default_mesh(), Some(mesh.clone()));
+            assert_eq!(context.default_mesh(), Some(mesh.clone()));
+        });
+    }
+
+    #[test]
+    fn test_mesh_context_with_retyped_mesh_tracing_context() {
+        let (mesh, retyped) = retyping_meshes();
+        let original_axis = NamedAxis::Mesh { mesh: mesh.clone(), axis: 0, size: 2, checks_manual_variation: true };
+        let retyped_axis = NamedAxis::Mesh { mesh: retyped.clone(), axis: 0, size: 2, checks_manual_variation: true };
+        let axes = vec![("x".to_string(), original_axis.clone())];
+        with_mesh_context(Some(mesh.clone()), axes.clone(), |context| {
+            let cloned = context.clone();
+            // Independent traces stay on their own mesh even when they were seeded with the same bindings.
+            with_mesh_context(Some(mesh.clone()), axes.clone(), |independent| {
+                assert_eq!(
+                    context.with_retyped_mesh(&mesh, &retyped, || {
+                        assert_eq!(context.default_mesh(), Some(retyped.clone()));
+                        assert_eq!(context.named_axis("x"), Some(retyped_axis.clone()));
+                        assert_eq!(context.named_axis("missing"), None);
+                        assert_eq!(context.named_axes(), vec![("x".to_string(), retyped_axis.clone())]);
+                        assert_eq!(cloned.default_mesh(), Some(retyped.clone()));
+                        assert_eq!(cloned.named_axis("x"), Some(retyped_axis.clone()));
+                        assert_eq!(independent.default_mesh(), Some(mesh.clone()));
+                        assert_eq!(independent.named_axes(), axes);
+                        11
+                    }),
+                    11,
+                );
+                assert_eq!(context.default_mesh(), Some(mesh.clone()));
+                assert_eq!(cloned.default_mesh(), Some(mesh.clone()));
+                assert_eq!(cloned.named_axis("x"), Some(original_axis.clone()));
+                assert_eq!(context.named_axes(), axes);
+            });
+        });
+    }
+
+    #[test]
+    fn test_mesh_context_with_retyped_mesh_restores_after_error() {
+        let (mesh, retyped) = retyping_meshes();
+        with_mesh_context(Some(mesh.clone()), Vec::new(), |context| {
+            let result = context.with_retyped_mesh(&mesh, &retyped, || {
+                assert_eq!(context.default_mesh(), Some(retyped.clone()));
+                Err::<(), _>(ProgramError::InvalidArgument { message: "mesh retyping failure".to_string() })
+            });
+            assert_eq!(result, Err(ProgramError::InvalidArgument { message: "mesh retyping failure".to_string() }));
+            assert_eq!(context.default_mesh(), Some(mesh.clone()));
+        });
+    }
+
+    #[test]
+    fn test_mesh_context_with_retyped_mesh_restores_after_unwind() {
+        let (mesh, retyped) = retyping_meshes();
+        let inner_mesh = retyped.with_axis_types(["y"], MeshAxisType::Manual).unwrap();
+        with_mesh_context(Some(mesh.clone()), Vec::new(), |context| {
+            context.with_retyped_mesh(&mesh, &retyped, || {
+                let panic = catch_unwind(AssertUnwindSafe(|| {
+                    context.with_retyped_mesh(&retyped, &inner_mesh, || {
+                        assert_eq!(context.default_mesh(), Some(inner_mesh.clone()));
+                        panic!("mesh retyping panic");
+                    });
+                }))
+                .unwrap_err();
+                assert_eq!(panic.downcast_ref::<&str>(), Some(&"mesh retyping panic"));
+                assert_eq!(context.default_mesh(), Some(retyped.clone()));
+            });
+            assert_eq!(context.default_mesh(), Some(mesh.clone()));
+        });
+    }
+
+    #[test]
+    fn test_mesh_context_with_retyped_mesh_nested_tracing_context() {
+        let (mesh, retyped) = retyping_meshes();
+        let original_axis = NamedAxis::Mesh { mesh: mesh.clone(), axis: 0, size: 2, checks_manual_variation: true };
+        let retyped_axis = NamedAxis::Mesh { mesh: retyped.clone(), axis: 0, size: 2, checks_manual_variation: true };
+        with_mesh_context(Some(mesh.clone()), vec![("x".to_string(), original_axis.clone())], |parent| {
+            let nested = NestedTracingContext::new(parent.clone());
+            let cloned = nested.clone();
+            nested.with_retyped_mesh(&mesh, &retyped, || {
+                assert_eq!(nested.default_mesh(), Some(retyped.clone()));
+                assert_eq!(nested.named_axis("x"), Some(retyped_axis.clone()));
+                assert_eq!(nested.named_axes(), vec![("x".to_string(), retyped_axis.clone())]);
+                assert_eq!(cloned.default_mesh(), Some(retyped.clone()));
+                assert_eq!(parent.default_mesh(), Some(mesh.clone()));
+                assert_eq!(parent.named_axis("x"), Some(original_axis.clone()));
+            });
+            assert_eq!(nested.default_mesh(), Some(mesh.clone()));
+            assert_eq!(cloned.named_axis("x"), Some(original_axis.clone()));
+
+            // A retyping owned by the parent remains visible through an existing nested trace.
+            parent.with_retyped_mesh(&mesh, &retyped, || {
+                assert_eq!(nested.default_mesh(), Some(retyped.clone()));
+                assert_eq!(nested.named_axis("x"), Some(retyped_axis.clone()));
+            });
+            assert_eq!(nested.default_mesh(), Some(mesh.clone()));
+        });
+    }
+
+    #[test]
+    fn test_mesh_context_with_retyped_mesh_nested_tracing_context_local_bindings() {
+        let (mesh, retyped) = retyping_meshes();
+        let parent_axis = NamedAxis::Mesh { mesh: mesh.clone(), axis: 0, size: 2, checks_manual_variation: true };
+        let local_axis = NamedAxis::Mesh { mesh: mesh.clone(), axis: 0, size: 2, checks_manual_variation: false };
+        let retyped_axis = NamedAxis::Mesh { mesh: retyped.clone(), axis: 0, size: 2, checks_manual_variation: false };
+        let rows = NamedAxis::Batched { size: Some(5) };
+        with_mesh_context(
+            Some(mesh.clone()),
+            vec![("x".to_string(), parent_axis.clone()), ("rows".to_string(), rows.clone())],
+            |parent| {
+                let (_, program) = NestedTracingContext::trace_with_named_axes_and_default_mesh(
+                    parent.clone(),
+                    |inputs: Vec<Tracer<_>>| {
+                        let context = inputs[0].context();
+                        context.with_retyped_mesh(&mesh, &retyped, || {
+                            assert_eq!(context.default_mesh(), Some(retyped.clone()));
+                            assert_eq!(context.named_axis("x"), Some(retyped_axis.clone()));
+                            assert_eq!(context.named_axis("rows"), Some(rows.clone()));
+                            assert_eq!(
+                                context.named_axes(),
+                                vec![("x".to_string(), retyped_axis.clone()), ("rows".to_string(), rows.clone())],
+                            );
+                            assert_eq!(parent.default_mesh(), Some(mesh.clone()));
+                            assert_eq!(parent.named_axis("x"), Some(parent_axis.clone()));
+                        });
+                        assert_eq!(context.default_mesh(), Some(mesh.clone()));
+                        assert_eq!(context.named_axis("x"), Some(local_axis.clone()));
+                        Ok(inputs)
+                    },
+                    vec![ArrayType::scalar(DataType::F64)],
+                    vec![("x".to_string(), local_axis.clone()), ("x".to_string(), parent_axis.clone())],
+                    Some(mesh.clone()),
+                )
+                .unwrap();
+                assert_eq!(
+                    program.to_string(),
+                    indoc! {"
+                        lambda %0:f64[] .
+                        in (%0)"
+                    },
+                );
+            },
+        );
+    }
+
+    #[test]
+    fn test_mesh_context_with_retyped_mesh_partial_evaluation_context() {
+        let (mesh, retyped) = retyping_meshes();
+        with_mesh_context(Some(mesh.clone()), Vec::new(), |context| {
+            let partial = PartialEvaluationContext::new(context.clone());
+            partial.with_retyped_mesh(&mesh, &retyped, || {
+                assert_eq!(partial.default_mesh(), Some(retyped.clone()));
+                assert_eq!(context.default_mesh(), Some(retyped.clone()));
+            });
+            assert_eq!(partial.default_mesh(), Some(mesh.clone()));
+            assert_eq!(context.default_mesh(), Some(mesh.clone()));
+        });
+    }
+
+    #[test]
+    fn test_mesh_context_with_retyped_mesh_batching_context() {
+        let (mesh, retyped) = retyping_meshes();
+        let binding = NamedAxis::Mesh { mesh: mesh.clone(), axis: 0, size: 2, checks_manual_variation: true };
+        with_mesh_context(Some(mesh.clone()), vec![("x".to_string(), binding.clone())], |context| {
+            let batched = BatchingContext::new(context.clone(), 3).with_axis_name(Some("x".to_string()));
+            batched.with_retyped_mesh(&mesh, &retyped, || {
+                assert_eq!(batched.default_mesh(), Some(retyped.clone()));
+                assert_eq!(context.default_mesh(), Some(retyped.clone()));
+                assert_eq!(batched.named_axis("x"), Some(NamedAxis::Batched { size: Some(3) }));
+                assert_eq!(batched.named_axes(), vec![("x".to_string(), NamedAxis::Batched { size: Some(3) })]);
+                assert_eq!(
+                    context.named_axis("x"),
+                    Some(NamedAxis::Mesh { mesh: retyped.clone(), axis: 0, size: 2, checks_manual_variation: true }),
+                );
+            });
+            assert_eq!(batched.default_mesh(), Some(mesh.clone()));
+            assert_eq!(context.named_axis("x"), Some(binding.clone()));
+        });
+    }
+
+    #[test]
+    fn test_mesh_context_with_retyped_mesh_differentiation_context() {
+        let (mesh, retyped) = retyping_meshes();
+        with_mesh_context(Some(mesh.clone()), Vec::new(), |context| {
+            let fused = DifferentiationContext::fused(context.clone());
+            fused.with_retyped_mesh(&mesh, &retyped, || {
+                assert_eq!(fused.default_mesh(), Some(retyped.clone()));
+                assert_eq!(context.default_mesh(), Some(retyped.clone()));
+            });
+            assert_eq!(fused.default_mesh(), Some(mesh.clone()));
+            assert_eq!(context.default_mesh(), Some(mesh.clone()));
+
+            let partitioned = DifferentiationContext::partitioned(PartialEvaluationContext::new(context.clone()));
+            partitioned.with_retyped_mesh(&mesh, &retyped, || {
+                assert_eq!(partitioned.default_mesh(), Some(retyped.clone()));
+                assert_eq!(context.default_mesh(), Some(retyped.clone()));
+            });
+            assert_eq!(partitioned.default_mesh(), Some(mesh.clone()));
+            assert_eq!(context.default_mesh(), Some(mesh.clone()));
+        });
+    }
+
+    #[test]
+    fn test_mesh_retypings_with_retyped_mesh() {
+        let (mesh, retyped) = retyping_meshes();
+        let retypings = MeshRetypings::default();
+        let cloned = retypings.clone();
+        let independent = MeshRetypings::default();
+        assert_eq!(
+            retypings.with_retyped_mesh(&mesh, &retyped, || {
+                assert_eq!(cloned.retype_mesh(mesh.clone()), retyped);
+                assert_eq!(independent.retype_mesh(mesh.clone()), mesh);
+                13
+            }),
+            13,
+        );
+        assert_eq!(cloned.retype_mesh(mesh.clone()), mesh);
+    }
+
+    #[test]
+    fn test_mesh_retypings_retype_mesh() {
+        let (mesh, retyped) = retyping_meshes();
+        let inner_mesh = retyped.with_axis_types(["y"], MeshAxisType::Manual).unwrap();
+        let unrelated = mesh.with_axis_types(["x"], MeshAxisType::Explicit).unwrap();
+        let retypings = MeshRetypings::default();
+        assert_eq!(retypings.retype_mesh(mesh.clone()), mesh);
+        retypings.with_retyped_mesh(&mesh, &retyped, || {
+            assert_eq!(retypings.retype_mesh(mesh.clone()), retyped);
+            assert_eq!(retypings.retype_mesh(unrelated.clone()), unrelated);
+            retypings.with_retyped_mesh(&retyped, &inner_mesh, || {
+                assert_eq!(retypings.retype_mesh(mesh.clone()), inner_mesh);
+                assert_eq!(retypings.retype_mesh(retyped.clone()), inner_mesh);
+                assert_eq!(retypings.retype_mesh(unrelated.clone()), unrelated);
+            });
+            assert_eq!(retypings.retype_mesh(mesh.clone()), retyped);
+        });
+        assert_eq!(retypings.retype_mesh(mesh.clone()), mesh);
+    }
+
+    #[test]
+    fn test_mesh_retypings_retype_named_axis() {
+        let (mesh, retyped) = retyping_meshes();
+        let unrelated = LogicalMesh::new(vec![MeshAxis::new("z", 5, MeshAxisType::Manual).unwrap()]).unwrap();
+        let unrelated_axis = NamedAxis::Mesh { mesh: unrelated, axis: 0, size: 5, checks_manual_variation: false };
+        let retypings = MeshRetypings::default();
+        retypings.with_retyped_mesh(&mesh, &retyped, || {
+            assert_eq!(
+                retypings.retype_named_axis(NamedAxis::Mesh {
+                    mesh: mesh.clone(),
+                    axis: 0,
+                    size: 2,
+                    checks_manual_variation: true,
+                }),
+                NamedAxis::Mesh { mesh: retyped.clone(), axis: 0, size: 2, checks_manual_variation: true },
+            );
+            assert_eq!(
+                retypings.retype_named_axis(NamedAxis::Mesh {
+                    mesh: mesh.clone(),
+                    axis: 0,
+                    size: 2,
+                    checks_manual_variation: false,
+                }),
+                NamedAxis::Mesh { mesh: retyped.clone(), axis: 0, size: 2, checks_manual_variation: false },
+            );
+            assert_eq!(retypings.retype_named_axis(unrelated_axis.clone()), unrelated_axis);
+            assert_eq!(
+                retypings.retype_named_axis(NamedAxis::Batched { size: Some(3) }),
+                NamedAxis::Batched { size: Some(3) },
+            );
+            assert_eq!(
+                retypings.retype_named_axis(NamedAxis::Batched { size: None }),
+                NamedAxis::Batched { size: None },
+            );
         });
     }
 }
