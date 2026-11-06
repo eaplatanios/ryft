@@ -2958,7 +2958,8 @@ mod tests {
         // The mesh has the explicit axis `x` of size 1 and the `Auto` axis `y` of size 2. The body passes a replicated
         // carry through and negates each `f32[8]` row of an `f32[4, 8]` stack whose second axis is sharded over `y`, so
         // neither result places anything over the explicit axis. Their mesh has an explicit axis, though, so both
-        // results are still constrained to the placements that their types state.
+        // results are still constrained to the placements that their types state, with the dimensions of the rank-2
+        // result left open over the auto axis.
         let (client, _) = two_device_mesh(MeshAxisType::Auto);
         let logical_mesh = LogicalMesh::new(vec![
             MeshAxis::new("x", 1, MeshAxisType::Explicit).unwrap(),
@@ -3061,7 +3062,7 @@ mod tests {
                 tensor<4x8xf32>
                     }
                     %2 = sdy.sharding_constraint %1#1 <@mesh, [], replicated={\"x\"}> : tensor<f32>
-                    %3 = sdy.sharding_constraint %1#3 <@mesh, [{}, {\"y\"}], replicated={\"x\"}> : tensor<4x8xf32>
+                    %3 = sdy.sharding_constraint %1#3 <@mesh, [{?}, {\"y\", ?}], replicated={\"x\"}> : tensor<4x8xf32>
                     return %2, %3 : tensor<f32>, tensor<4x8xf32>
                   }
                 }

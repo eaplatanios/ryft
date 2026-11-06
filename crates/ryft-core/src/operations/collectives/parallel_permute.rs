@@ -1037,20 +1037,6 @@ mod tests {
             }),
         );
 
-        // Routing slices every batch item by its static extents, so a level that binds the axis rejects an input whose
-        // items have a dynamic dimension.
-        let trace = TracingContext::<Array, ArrayOperation<Array>>::new();
-        let length = DimensionVariable::new("length", DimensionBounds::new(0, Some(4)).unwrap());
-        let input_type =
-            ArrayType::new(DataType::F32, Shape::new(vec![Dimension::Static(2), Dimension::Dynamic(length)]));
-        let input = ArrayBatch::new(trace.input(input_type), BatchAxis::new(0)).unwrap();
-        let context = BatchingContext::<_, ArrayBatchingPolicy>::new(trace, 2).with_axis_name("x".to_string());
-        assert!(matches!(
-            swap.batch(&context, &EmptyRegionDriver, &[input]),
-            Err(BatchingError::UnsupportedOperation { message })
-                if message == "`parallel_permute` batching requires statically shaped inputs",
-        ));
-
         // A level that binds another axis forwards the permutation to its parent and preserves its mapped axis.
         let trace = TracingContext::<Array, ArrayOperation<Array>>::new();
         let input =
@@ -1077,6 +1063,37 @@ mod tests {
                     parallel_permute [axes=\"x\", axis_size=2, source_target_pairs=[(0, 1), (1, 0)]] %0
                 in (%1)"
             },
+        );
+    }
+
+    #[test]
+    fn test_parallel_permute_batching_dynamic_item_shape() {
+        let length = Dimension::Dynamic(DimensionVariable::new("length", DimensionBounds::new(0, Some(4)).unwrap()));
+        let input_type = ArrayType::new(DataType::F32, Shape::new(vec![Dimension::Static(2), length]));
+        let (output_type, program) = TracingContext::<Array, ArrayOperation<Array>>::trace(
+            |input| {
+                batch(
+                    |item| item.parallel_permute("x", vec![(0, 1), (1, 0)]),
+                    input,
+                    BatchAxis::new(0),
+                    BatchAxis::new(0),
+                    BatchAxisSpecification::named("x"),
+                )
+                .map_err(ProgramError::from)
+            },
+            input_type.clone(),
+        )
+        .unwrap();
+        assert_eq!(output_type, input_type);
+        assert_eq!(
+            program.to_string(),
+            indoc! {"
+            lambda %0:f32[2, length] .
+            let %1:f32[1, length] = slice [start_indices=[1, 0], limits=[2, length]] %0
+                %2:f32[1, length] = slice [start_indices=[0, 0], limits=[1, length]] %0
+                %3:f32[2, length] = concatenate [axis=0] %1 %2
+            in (%3)"
+            }
         );
     }
 

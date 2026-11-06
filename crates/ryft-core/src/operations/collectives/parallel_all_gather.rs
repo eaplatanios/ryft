@@ -718,7 +718,7 @@ where
             return Ok(());
         };
 
-        if inputs[0].is_known() {
+        if inputs[0].is_known() || !accumulators[0].is_needed() {
             return Ok(());
         }
 

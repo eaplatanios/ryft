@@ -199,7 +199,9 @@ pub use parallel_all_gather::{
 };
 pub use parallel_all_to_all::{PARALLEL_ALL_TO_ALL_OPERATION_NAME, ParallelAllToAll, ParallelAllToAllOperation};
 pub use parallel_arg_extrema::ParallelArgExtrema;
-pub use parallel_broadcast::{PARALLEL_BROADCAST_OPERATION_NAME, ParallelBroadcast, ParallelBroadcastOperation};
+pub use parallel_broadcast::{
+    DynamicParallelBroadcast, PARALLEL_BROADCAST_OPERATION_NAME, ParallelBroadcast, ParallelBroadcastOperation,
+};
 pub use parallel_cast::{PARALLEL_CAST_OPERATION_NAME, ParallelCast, ParallelCastOperation, ParallelCastTarget};
 pub use parallel_permute::{PARALLEL_PERMUTE_OPERATION_NAME, ParallelPermute, ParallelPermuteOperation};
 pub use parallel_ragged_all_to_all::{
@@ -518,10 +520,10 @@ impl<C: Context, P: DifferentiationPolicy<C>> ShapeChangingCollectiveValue for D
 }
 
 /// Group of the value-level collective capabilities [`ParallelReduce`], [`ParallelVary`], [`ParallelAllGather`],
-/// [`ParallelSumScatter`], [`ParallelPermute`], [`ParallelBroadcast`], [`ParallelAllToAll`],
-/// [`ParallelRaggedAllToAll`], [`ParallelCast`], and [`ParallelArgExtrema`]. It is implemented automatically for every
-/// type that implements all of its members. The context-side [`AxisIndex`] is implemented by contexts rather than
-/// values and is therefore not a member.
+/// [`ParallelSumScatter`], [`ParallelPermute`], [`ParallelBroadcast`], [`DynamicParallelBroadcast`],
+/// [`ParallelAllToAll`], [`ParallelRaggedAllToAll`], [`ParallelCast`], and [`ParallelArgExtrema`]. It is implemented
+/// automatically for every type that implements all of its members. The context-side [`AxisIndex`] is implemented by
+/// contexts rather than values and is therefore not a member.
 ///
 /// The universe parameter `T` defaults to the [`Capability`] universe of the implementor and is passed to every member,
 /// so that homogeneous array values implement this bundle for [`ArrayType`] and array IR values implement it for
@@ -534,6 +536,7 @@ pub trait CollectiveOperations<T = <Self as Capability>::Universe>:
     + ParallelSumScatter<T>
     + ParallelPermute<T>
     + ParallelBroadcast<T>
+    + DynamicParallelBroadcast<T>
     + ParallelAllToAll<T>
     + ParallelRaggedAllToAll<T>
     + ParallelCast<T>
@@ -549,6 +552,7 @@ impl<
         + ParallelSumScatter<T>
         + ParallelPermute<T>
         + ParallelBroadcast<T>
+        + DynamicParallelBroadcast<T>
         + ParallelAllToAll<T>
         + ParallelRaggedAllToAll<T>
         + ParallelCast<T>
@@ -1604,8 +1608,8 @@ fn infer_array_ir_shape_changing_collective_output_type(
 ///
 /// # Errors
 ///
-/// Returns a [`BatchingError`] naming `operation_name` if `value` is not statically shaped, or if staging one of the
-/// slices, the zero slice, or the concatenation fails.
+/// Returns a [`BatchingError`] naming `operation_name` if the routed axis has a dynamic extent, or if staging a slice,
+/// the zero slice, or the concatenation fails. Other dimensions retain their extents and identities.
 fn route_axis_slices<V: Value<Type = ArrayType> + ZeroLike + Concatenate + Slice + Transpose + Reshard>(
     operation_name: &str,
     value: &V,
@@ -1613,12 +1617,12 @@ fn route_axis_slices<V: Value<Type = ArrayType> + ZeroLike + Concatenate + Slice
     sources: &[Option<usize>],
 ) -> Result<V, BatchingError> {
     let value = if axis == 0 { value.clone() } else { value.clone().move_axis(axis, 0)? };
-    let Some(shape) = value.r#type().static_shape() else {
+    let dimensions = value.r#type().shape().dimensions().to_vec();
+    let Dimension::Static(axis_size) = dimensions[0] else {
         return Err(BatchingError::UnsupportedOperation {
-            message: format!("`{operation_name}` batching requires statically shaped inputs"),
+            message: format!("`{operation_name}` batching requires a statically sized routed axis"),
         });
     };
-    let dimensions = shape.dimensions().to_vec();
     let output_sharding = value.r#type().sharding().cloned();
 
     // Extent-one slices cannot retain an explicit mesh placement whose axis product exceeds one.
@@ -1642,12 +1646,12 @@ fn route_axis_slices<V: Value<Type = ArrayType> + ZeroLike + Concatenate + Slice
         let mut start_indices = vec![0; rank];
         let mut limit_indices = dimensions.clone();
         start_indices[0] = item;
-        limit_indices[0] = item + 1;
+        limit_indices[0] = Dimension::Static(item + 1);
         value.slice(&start_indices, &limit_indices, &strides)
     };
 
     // Every source item is sliced once, even when several targets receive it (e.g., in a broadcast).
-    let mut source_items = vec![None; dimensions[0]];
+    let mut source_items = vec![None; axis_size];
     let mut zero_item = None;
     let mut items = Vec::with_capacity(sources.len());
     for source in sources {
@@ -2900,16 +2904,16 @@ mod tests {
     }
 
     #[test]
-    fn test_route_axis_slices_requires_static_shape() {
+    fn test_route_axis_slices_requires_static_routed_axis() {
         let trace = TestArrayTracingContext::new();
         let length = DimensionVariable::new("length", DimensionBounds::new(0, Some(4)).unwrap());
         let input_type =
-            ArrayType::new(DataType::F32, Shape::new(vec![Dimension::Static(2), Dimension::Dynamic(length)]));
+            ArrayType::new(DataType::F32, Shape::new(vec![Dimension::Dynamic(length), Dimension::Static(2)]));
         let input = trace.input(input_type);
         assert!(matches!(
             route_axis_slices(PARALLEL_BROADCAST_OPERATION_NAME, &input, 0, &[Some(1), Some(0)]),
             Err(BatchingError::UnsupportedOperation { message })
-                if message == "`parallel_broadcast` batching requires statically shaped inputs",
+                if message == "`parallel_broadcast` batching requires a statically sized routed axis",
         ));
     }
 

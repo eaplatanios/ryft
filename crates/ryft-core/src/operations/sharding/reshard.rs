@@ -46,9 +46,11 @@ pub const RESHARD_OPERATION_NAME: &str = "reshard";
 /// their corresponding collectives. Refer to the documentation of [`Reshard`] for more information.
 ///
 /// Interpretation passes the value through and records the target on its type. Batching inserts the mapped axis's
-/// sharding into the target at the new batch axis. Differentiation reshards the tangent to the same target, and
-/// transposition reshards the cotangent to the dual of the input's sharding, so that the input cotangent is
-/// distributed like the input.
+/// sharding into the target at the new batch axis, without the axes that are auto in the target mesh (which the target
+/// cannot name). Differentiation reshards the tangent to the same target, and transposition reshards the cotangent to
+/// the dual of the input's sharding, so that the input cotangent is distributed like the input. That dual must not
+/// name auto axes either, so an input whose type records a placement along auto axes (e.g., the placement of a
+/// concrete input) cannot be transposed.
 #[derive(Clone, Debug, PartialEq, Eq, Hash)]
 pub struct ReshardOperation {
     /// Target [`Sharding`] that the input is resharded to.
@@ -274,11 +276,31 @@ where
         inputs: &[ArrayBatch<C::Value>],
     ) -> Result<Vec<ArrayBatch<C::Value>>, BatchingError> {
         // The lifted reshard's target sharding gains the mapped axis's sharding (derived from the batched inputs via
-        // `ArrayBatch::sharding_for_inputs`) at the new batch dimension. Lifting needs only the batch axis's position
-        // and placement, never its extent, so mapped axes with dynamic extents lift as well.
+        // `ArrayBatch::sharding_for_inputs`) at the new batch dimension. A target can only name the axes that the type
+        // system governs, so the mapped axis loses its placement along the axes that are auto in the target mesh (e.g.,
+        // when `auto_axes` switches the axis that the batch is placed along), which leaves that placement to the
+        // compiler. Lifting needs only the batch axis's position and placement, never its extent, so mapped axes
+        // with dynamic extents lift as well.
         check_count!("input", inputs, 1, ProgramError);
         let lifted_sharding = match inputs[0].batch_axis_position() {
-            Some(batch_axis) => self.sharding().batched(batch_axis, ArrayBatch::sharding_for_inputs(inputs)?)?,
+            Some(batch_axis) => {
+                let target_mesh = self.sharding().mesh();
+                let batch_axis_sharding = match ArrayBatch::sharding_for_inputs(inputs)? {
+                    ShardingDimension::Sharded(axis_names) => {
+                        let axis_names = axis_names
+                            .into_iter()
+                            .filter(|axis_name| target_mesh.axis_type(axis_name) != Some(MeshAxisType::Auto))
+                            .collect::<Vec<_>>();
+                        if axis_names.is_empty() {
+                            ShardingDimension::Replicated
+                        } else {
+                            ShardingDimension::Sharded(axis_names)
+                        }
+                    }
+                    dimension => dimension,
+                };
+                self.sharding().batched(batch_axis, batch_axis_sharding)?
+            }
             None => self.sharding().clone(),
         };
 
@@ -902,6 +924,37 @@ mod tests {
             })
             .collect::<Vec<_>>();
         assert_eq!(shardings, vec![expected_lifted]);
+    }
+
+    #[test]
+    fn test_reshard_batching_drops_auto_axes_from_the_batch_dimension() {
+        // The mapped axis is placed along `x`, which the target mesh types as auto, so the lifted target cannot name
+        // it and leaves the batch dimension replicated over the governed axes, as JAX's batching rule does when its
+        // target canonicalization drops auto axes.
+        let source_mesh = LogicalMesh::new(vec![
+            MeshAxis::new("x", 2, MeshAxisType::Explicit).unwrap(),
+            MeshAxis::new("y", 2, MeshAxisType::Explicit).unwrap(),
+        ])
+        .unwrap();
+        let target_mesh = LogicalMesh::new(vec![
+            MeshAxis::new("x", 2, MeshAxisType::Auto).unwrap(),
+            MeshAxis::new("y", 2, MeshAxisType::Explicit).unwrap(),
+        ])
+        .unwrap();
+        let input_sharding =
+            Sharding::new(source_mesh, vec![ShardingDimension::sharded(["x"]), ShardingDimension::sharded(["y"])])
+                .unwrap();
+        let target = Sharding::new(target_mesh, vec![ShardingDimension::sharded(["y"])]).unwrap();
+        let expected_lifted = target.with_inserted_dimension(0, ShardingDimension::Replicated).unwrap();
+        let (output_type, _) = TracingContext::<Array, ArrayOperation<Array>>::trace(
+            |x| {
+                let target = target.clone();
+                Ok(batch(move |item| item.reshard(&target), x, BatchAxis::new(0), BatchAxis::new(0), None)?)
+            },
+            ArrayType::new_static(DataType::F32, [4, 2]).with_sharding(input_sharding).unwrap(),
+        )
+        .unwrap();
+        assert_eq!(output_type.sharding(), Some(&expected_lifted));
     }
 
     #[test]

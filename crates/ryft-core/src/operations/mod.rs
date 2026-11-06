@@ -56,7 +56,7 @@ pub use attention::{
 };
 pub use collectives::{
     AXIS_INDEX_OPERATION_NAME, AxisIndex, AxisIndexOperation, CollectiveAxes, CollectiveMode, CollectiveOperations,
-    CollectiveOptions, ManualVariationAlignment, PARALLEL_ALL_GATHER_OPERATION_NAME,
+    CollectiveOptions, DynamicParallelBroadcast, ManualVariationAlignment, PARALLEL_ALL_GATHER_OPERATION_NAME,
     PARALLEL_ALL_TO_ALL_OPERATION_NAME, PARALLEL_BROADCAST_OPERATION_NAME, PARALLEL_CAST_OPERATION_NAME,
     PARALLEL_PERMUTE_OPERATION_NAME, PARALLEL_RAGGED_ALL_TO_ALL_OPERATION_NAME, PARALLEL_REDUCE_OPERATION_NAME,
     PARALLEL_SUM_SCATTER_OPERATION_NAME, PARALLEL_VARY_OPERATION_NAME, ParallelAllGather, ParallelAllGatherOperation,
@@ -176,11 +176,11 @@ pub use rounding::{
     RoundOperation, RoundingOperations,
 };
 pub use sharding::{
-    CONSTRAIN_SHARDING_OPERATION_NAME, ConstrainSharding, ConstrainShardingDispatch, ConstrainShardingOperation,
-    RESHARD_OPERATION_NAME, Reshard, ReshardDispatch, ReshardOperation, SHARD_MAP_OPERATION_NAME, ShardMap,
-    ShardMapBoundary, ShardMapContext, ShardMapError, ShardMapOperation, ShardMapOptions, ShardMapTracer,
-    ShardMapValue, ShardMapValueKind, ShardingOperations, shard_map, shard_map_along,
-    shard_map_with_inferred_input_shardings,
+    AxisTypesError, CONSTRAIN_SHARDING_OPERATION_NAME, ConstrainSharding, ConstrainShardingDispatch,
+    ConstrainShardingOperation, RESHARD_OPERATION_NAME, Reshard, ReshardDispatch, ReshardOperation,
+    SHARD_MAP_OPERATION_NAME, ShardMap, ShardMapBoundary, ShardMapContext, ShardMapError, ShardMapOperation,
+    ShardMapOptions, ShardMapTracer, ShardMapValue, ShardMapValueKind, ShardingOperations, auto_axes, explicit_axes,
+    shard_map, shard_map_along, shard_map_with_inferred_input_shardings,
 };
 pub use softmax::{Softmax, SoftmaxCrossEntropyWithTargetLogits, softmax_cross_entropy_with_target_logits};
 pub use sorting::{SORT_OPERATION_NAME, Sort, SortDirection, SortOperation, SortOrdering, TopK};
