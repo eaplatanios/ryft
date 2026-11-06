@@ -1064,16 +1064,20 @@ mod tests {
 
     use crate::arrays::DataType::*;
     use crate::arrays::{
-        Array, ArrayBatch, ArrayOperation, ArrayType, Dimension, DimensionBounds, DimensionVariable, Layout,
-        LogicalMesh, Memory, MeshAxis, MeshAxisType, Shape, Sharding, ShardingDimension, ShardingError, StridedLayout,
-        UnreducedKind, f6e2m3fn, f8e8m0fnu,
+        Array, ArrayBatch, ArrayIrOperation, ArrayIrValue, ArrayOperation, ArrayReference, ArrayType, Dimension,
+        DimensionBounds, DimensionVariable, Layout, LogicalMesh, Memory, MeshAxis, MeshAxisType, Shape, Sharding,
+        ShardingDimension, ShardingError, StridedLayout, UnreducedKind, f6e2m3fn, f8e8m0fnu,
     };
     use crate::batching::BatchAxis;
     use crate::contexts::EagerContext;
+    use crate::operations::{ConvertElementType, DimensionToScalar};
     use crate::programs::{Operation, ProgramRenderingMode, Provenance, ReferenceType};
-    use crate::tracing::TracingContext;
+    use crate::tracing::{Tracer, TracingContext};
 
     use super::*;
+
+    /// Eager array IR context for the dense differentiation adapters.
+    type ArrayIrEagerContext = EagerContext<ArrayIrValue<Array>, ArrayIrOperation<Array>>;
 
     #[test]
     fn test_data_type_differential_representations() {
@@ -1295,7 +1299,7 @@ mod tests {
     }
 
     #[test]
-    fn test_dense_array_coordinate_space_dimension() {
+    fn test_array_type_coordinate_space_dimension() {
         let transform = DerivativeTransform::JacobianForward;
         let role = DifferentiationParameterRole::Input;
         let path = ParameterPath::root();
@@ -1373,7 +1377,7 @@ mod tests {
     }
 
     #[test]
-    fn test_dense_array_coordinate_basis_uses_the_requested_value_type() {
+    fn test_array_type_coordinate_basis_uses_the_requested_value_type() {
         let mesh = LogicalMesh::new(vec![MeshAxis::new("x", 2, MeshAxisType::Explicit).unwrap()]).unwrap();
         let coordinate_type = ArrayType::scalar(F32)
             .with_sharding(Sharding::new(mesh, Vec::new()).unwrap().with_unreduced_axes(["x"]).unwrap())
@@ -1392,7 +1396,7 @@ mod tests {
     }
 
     #[test]
-    fn test_dense_array_coordinate_basis_materializes_packed_fragments() {
+    fn test_array_type_coordinate_basis_materializes_packed_fragments() {
         let context = EagerContext::<Array, ArrayOperation<Array>>::new();
 
         // A rank-two value with a nonzero global coordinate offset exercises the rectangular two-iota path.
@@ -1417,7 +1421,7 @@ mod tests {
     }
 
     #[test]
-    fn test_dense_array_coordinate_basis_preserves_non_contiguous_sharding() {
+    fn test_array_type_coordinate_basis_preserves_non_contiguous_sharding() {
         let mesh = LogicalMesh::new(vec![MeshAxis::new("x", 3, MeshAxisType::Explicit).unwrap()]).unwrap();
         let value_type = ArrayType::new(F32, Shape::new(vec![Dimension::Static(2), Dimension::Static(3)]))
             .with_sharding(
@@ -1438,7 +1442,7 @@ mod tests {
     }
 
     #[test]
-    fn test_dense_array_coordinate_basis_stages_ordinary_primitives() {
+    fn test_array_type_coordinate_basis_stages_ordinary_primitives() {
         let value_type = ArrayType::new(F32, Shape::new(vec![Dimension::Static(2), Dimension::Static(3)]));
         let (_, program) = TracingContext::<Array, ArrayOperation<Array>>::trace(
             |input| {
@@ -1504,7 +1508,7 @@ mod tests {
     }
 
     #[test]
-    fn test_dense_array_coordinate_basis_validates_its_coordinate_range() {
+    fn test_array_type_coordinate_basis_validates_its_coordinate_range() {
         let context = EagerContext::<Array, ArrayOperation<Array>>::new();
         let boolean_type = ArrayType::scalar(Boolean);
         assert_eq!(
@@ -1543,7 +1547,7 @@ mod tests {
     }
 
     #[test]
-    fn test_dense_array_coordinate_basis_handles_zero_sized_values_without_coordinate_overflow() {
+    fn test_array_type_coordinate_basis_handles_zero_sized_values_without_coordinate_overflow() {
         let value_type = ArrayType::new(
             F32,
             Shape::new(vec![Dimension::Static(usize::MAX), Dimension::Static(usize::MAX), Dimension::Static(0)]),
@@ -1561,7 +1565,7 @@ mod tests {
     }
 
     #[test]
-    fn test_dense_array_derivative_block_validation_uses_transform_value_types() {
+    fn test_array_type_derivative_block_validation_uses_transform_value_types() {
         let error = <ArrayType as DenseDifferentiableType<
             EagerContext<Array, ArrayOperation<Array>>,
         >>::validate_hessian_block_type(
@@ -1628,6 +1632,278 @@ mod tests {
             .unwrap_err()
             .to_string(),
             "derivative block has type f64[2, 3] but expected f32[2, 3]",
+        );
+    }
+
+    #[test]
+    fn test_array_ir_type_coordinate_space_dimension() {
+        let transform = DerivativeTransform::JacobianReverse;
+        let role = DifferentiationParameterRole::Output;
+        let path = ParameterPath::root().field("weights").index(1);
+        let array = ArrayIrType::Array(ArrayType::new_static(F32, [2, 3]));
+        assert_eq!(
+            <ArrayIrType as DenseDifferentiableType<ArrayIrEagerContext>>::coordinate_space_dimension(
+                &array, transform, role, &path,
+            ),
+            Ok(6),
+        );
+
+        // Non-array leaves retain the transform, role, and parameter path in their diagnostics.
+        let dimension = ArrayIrType::Dimension(DimensionValue::constant(3).unwrap().r#type().into_owned());
+        assert_eq!(
+            <ArrayIrType as DenseDifferentiableType<ArrayIrEagerContext>>::coordinate_space_dimension(
+                &dimension, transform, role, &path,
+            ),
+            Err(DifferentiationError::NonFiniteCoordinateSpace {
+                transform,
+                role,
+                path: "$.weights[1]".to_string(),
+                r#type: dimension.to_string(),
+            }),
+        );
+        let reference = ArrayIrType::Reference(ReferenceType::new(ArrayType::scalar(F32)));
+        assert_eq!(
+            <ArrayIrType as DenseDifferentiableType<ArrayIrEagerContext>>::coordinate_space_dimension(
+                &reference, transform, role, &path,
+            ),
+            Err(DifferentiationError::NonFiniteCoordinateSpace {
+                transform,
+                role,
+                path: "$.weights[1]".to_string(),
+                r#type: reference.to_string(),
+            }),
+        );
+    }
+
+    #[test]
+    fn test_array_ir_type_coordinate_basis() {
+        let mesh = LogicalMesh::new(vec![MeshAxis::new("x", 2, MeshAxisType::Explicit).unwrap()]).unwrap();
+        let coordinate_type = ArrayType::new_static(F32, [2]);
+        let value_type = coordinate_type
+            .clone()
+            .with_data_type(F64)
+            .with_memory(Memory::Host { pinned: true })
+            .with_sharding(Sharding::new(mesh, vec![ShardingDimension::sharded(["x"])]).unwrap())
+            .unwrap();
+        let packed_type = value_type.with_inserted_dimension(0, Dimension::Static(4)).unwrap();
+        let basis = <ArrayIrType as DenseDifferentiableType<ArrayIrEagerContext>>::coordinate_basis(
+            &ArrayIrEagerContext::new(),
+            &ArrayIrType::Array(coordinate_type),
+            &ArrayIrType::Array(value_type.clone()),
+            1,
+            4,
+        )
+        .unwrap();
+        assert_eq!(basis.batch_axis(), BatchAxis::new(0));
+        assert_eq!(basis.unbatched_type(), ArrayIrType::Array(value_type));
+        assert_eq!(
+            basis.value(),
+            &ArrayIrValue::Array(
+                Array::from_elements(packed_type, &[0f64, 0.0, 1.0, 0.0, 0.0, 1.0, 0.0, 0.0]).unwrap(),
+            ),
+        );
+    }
+
+    #[test]
+    fn test_array_ir_type_coordinate_basis_rejects_non_array_types() {
+        let context = ArrayIrEagerContext::new();
+        let array = ArrayIrType::Array(ArrayType::scalar(F32));
+        let dimension = ArrayIrType::Dimension(DimensionValue::constant(3).unwrap().r#type().into_owned());
+        let reference = ArrayIrType::Reference(ReferenceType::new(ArrayType::scalar(F32)));
+        assert_eq!(
+            <ArrayIrType as DenseDifferentiableType<ArrayIrEagerContext>>::coordinate_basis(
+                &context, &dimension, &array, 0, 1,
+            ),
+            Err(TypeError::invalid("dense derivatives require array leaves but got a leaf of type dimension<3>").into()),
+        );
+        assert_eq!(
+            <ArrayIrType as DenseDifferentiableType<ArrayIrEagerContext>>::coordinate_basis(
+                &context, &array, &reference, 0, 1,
+            ),
+            Err(TypeError::invalid("dense derivatives require array leaves but got a leaf of type ref<f32[]>").into()),
+        );
+    }
+
+    #[test]
+    fn test_array_ir_type_replicated() {
+        // A retained reference is shared by identity across directions even though it has no coordinate basis.
+        let value = ArrayIrValue::Reference(ArrayReference::new(Array::scalar(2f32).unwrap()));
+        let packed = <ArrayIrType as DenseDifferentiableType<ArrayIrEagerContext>>::replicated(value.clone());
+        assert_eq!(packed.batch_axis(), BatchAxis::replicated());
+        assert_eq!(packed.value(), &value);
+    }
+
+    #[test]
+    fn test_array_ir_type_replay_derivative_region() {
+        type ArrayIrTracingContext = TracingContext<ArrayIrValue<Array>, ArrayIrOperation<Array>>;
+
+        let dimension = DimensionValue::constant(3).unwrap();
+        let (_, program) = ArrayIrTracingContext::trace(
+            |inputs: Vec<Tracer<ArrayIrTracingContext>>| {
+                let value = ValueProjection::<ArrayType>::into_projected(inputs[0].clone())?;
+                let residual = ValueProjection::<ArrayType>::into_projected(inputs[1].clone())?;
+                let extent = inputs[2].to_scalar()?.convert_element_type(F32)?;
+                let extent = ValueProjection::<ArrayType>::into_projected(extent)?;
+                Ok(vec![value.mul(&residual)?.add(&extent)?.into_value(), inputs[2].clone()])
+            },
+            vec![
+                ArrayIrType::Array(ArrayType::new_static(F32, [3])),
+                ArrayIrType::Array(ArrayType::scalar(F32)),
+                ArrayIrType::Dimension(dimension.r#type().into_owned()),
+            ],
+        )
+        .unwrap();
+        let mapped = ArrayIrBatch::new(
+            ArrayIrValue::Array(Array::matrix(2, 3, vec![1f32, 2.0, 3.0, 4.0, 5.0, 6.0]).unwrap()),
+            BatchAxis::new(0),
+        )
+        .unwrap();
+        let residual = <ArrayIrType as DenseDifferentiableType<ArrayIrEagerContext>>::replicated(ArrayIrValue::Array(
+            Array::scalar(10f32).unwrap(),
+        ));
+        let extent = <ArrayIrType as DenseDifferentiableType<ArrayIrEagerContext>>::replicated(
+            ArrayIrValue::Dimension(dimension.clone()),
+        );
+        let outputs = <ArrayIrType as DenseDifferentiableType<ArrayIrEagerContext>>::replay_derivative_region(
+            &ArrayIrEagerContext::new(),
+            program.entry_region_ref(),
+            2,
+            vec![mapped, residual, extent],
+        )
+        .unwrap();
+        assert_eq!(outputs.len(), 2);
+        assert_eq!(outputs[0].batch_axis(), BatchAxis::new(0));
+        assert_eq!(
+            outputs[0].value(),
+            &ArrayIrValue::Array(Array::matrix(2, 3, vec![13f32, 23.0, 33.0, 43.0, 53.0, 63.0]).unwrap()),
+        );
+        assert_eq!(outputs[1].batch_axis(), BatchAxis::replicated());
+        assert_eq!(outputs[1].value(), &ArrayIrValue::Dimension(dimension));
+    }
+
+    #[test]
+    fn test_array_ir_type_validate_hessian_block_type() {
+        let output = ArrayIrType::Array(ArrayType::new_static(F64, [2]));
+        let first_input = ArrayIrType::Array(ArrayType::new_static(F32, [3]));
+        let second_input = ArrayIrType::Array(ArrayType::new_static(F32, [4]));
+        let block = ArrayIrType::Array(ArrayType::new_static(F32, [2, 3, 4]));
+        assert_eq!(
+            <ArrayIrType as DenseDifferentiableType<ArrayIrEagerContext>>::validate_hessian_block_type(
+                &block,
+                &output,
+                &first_input,
+                &second_input,
+            ),
+            Ok(()),
+        );
+        let wrong_block = ArrayIrType::Array(ArrayType::new_static(F64, [2, 3, 4]));
+        assert_eq!(
+            <ArrayIrType as DenseDifferentiableType<ArrayIrEagerContext>>::validate_hessian_block_type(
+                &wrong_block,
+                &output,
+                &first_input,
+                &second_input,
+            ),
+            Err(TypeError::invalid("derivative block has type f64[2, 3, 4] but expected f32[2, 3, 4]").into()),
+        );
+        let reference = ArrayIrType::Reference(ReferenceType::new(ArrayType::scalar(F32)));
+        assert_eq!(
+            <ArrayIrType as DenseDifferentiableType<ArrayIrEagerContext>>::validate_hessian_block_type(
+                &reference,
+                &output,
+                &first_input,
+                &second_input,
+            ),
+            Err(TypeError::invalid("dense derivatives require array leaves but got a leaf of type ref<f32[]>").into()),
+        );
+    }
+
+    #[test]
+    fn test_array_ir_type_extract_forward_jacobian_block() {
+        // The direction axis is physical axis 1, and directions 1 and 2 form the requested input's columns.
+        let packed = ArrayIrBatch::new(
+            ArrayIrValue::Array(
+                Array::matrix(3, 4, vec![90f32, 1.0, 2.0, 99.0, 80.0, 3.0, 4.0, 88.0, 70.0, 5.0, 6.0, 77.0]).unwrap(),
+            ),
+            BatchAxis::new(1),
+        )
+        .unwrap();
+        let input_type = ArrayIrType::Array(ArrayType::new_static(F32, [2]));
+        let output_type = ArrayIrType::Array(ArrayType::new_static(F32, [3]));
+        assert_eq!(
+            <ArrayIrType as DenseDifferentiableType<ArrayIrEagerContext>>::extract_forward_jacobian_block(
+                &packed,
+                4,
+                1,
+                &input_type,
+                &output_type,
+            ),
+            Ok(ArrayIrValue::Array(Array::matrix(3, 2, vec![1f32, 2.0, 3.0, 4.0, 5.0, 6.0]).unwrap())),
+        );
+
+        // A direction-independent output must be expanded before its coordinates are unpacked.
+        let replicated = <ArrayIrType as DenseDifferentiableType<ArrayIrEagerContext>>::replicated(
+            ArrayIrValue::Array(Array::vector(vec![7f32, 8.0, 9.0]).unwrap()),
+        );
+        assert_eq!(
+            <ArrayIrType as DenseDifferentiableType<ArrayIrEagerContext>>::extract_forward_jacobian_block(
+                &replicated,
+                2,
+                0,
+                &input_type,
+                &output_type,
+            ),
+            Ok(ArrayIrValue::Array(Array::matrix(3, 2, vec![7f32, 7.0, 8.0, 8.0, 9.0, 9.0]).unwrap())),
+        );
+        let dimension = <ArrayIrType as DenseDifferentiableType<ArrayIrEagerContext>>::replicated(
+            ArrayIrValue::Dimension(DimensionValue::constant(3).unwrap()),
+        );
+        assert_eq!(
+            <ArrayIrType as DenseDifferentiableType<ArrayIrEagerContext>>::extract_forward_jacobian_block(
+                &dimension,
+                2,
+                0,
+                &input_type,
+                &output_type,
+            ),
+            Err(TypeError::invalid("expected array type but got dimension type").into()),
+        );
+    }
+
+    #[test]
+    fn test_array_ir_type_extract_reverse_jacobian_block() {
+        // Reverse replay packs output-coordinate rows, whose order survives projection of the non-leading axis.
+        let packed = ArrayIrBatch::new(
+            ArrayIrValue::Array(
+                Array::matrix(3, 4, vec![90f32, 1.0, 2.0, 99.0, 80.0, 3.0, 4.0, 88.0, 70.0, 5.0, 6.0, 77.0]).unwrap(),
+            ),
+            BatchAxis::new(1),
+        )
+        .unwrap();
+        let output_type = ArrayIrType::Array(ArrayType::new_static(F32, [2]));
+        let input_type = ArrayIrType::Array(ArrayType::new_static(F32, [3]));
+        assert_eq!(
+            <ArrayIrType as DenseDifferentiableType<ArrayIrEagerContext>>::extract_reverse_jacobian_block(
+                &packed,
+                4,
+                1,
+                &output_type,
+                &input_type,
+            ),
+            Ok(ArrayIrValue::Array(Array::matrix(2, 3, vec![1f32, 3.0, 5.0, 2.0, 4.0, 6.0]).unwrap())),
+        );
+        let replicated = <ArrayIrType as DenseDifferentiableType<ArrayIrEagerContext>>::replicated(
+            ArrayIrValue::Array(Array::vector(vec![7f32, 8.0, 9.0]).unwrap()),
+        );
+        assert_eq!(
+            <ArrayIrType as DenseDifferentiableType<ArrayIrEagerContext>>::extract_reverse_jacobian_block(
+                &replicated,
+                2,
+                0,
+                &output_type,
+                &input_type,
+            ),
+            Ok(ArrayIrValue::Array(Array::matrix(2, 3, vec![7f32, 8.0, 9.0, 7.0, 8.0, 9.0]).unwrap())),
         );
     }
 }
