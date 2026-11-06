@@ -153,6 +153,30 @@ impl LogicalMesh {
         }
     }
 
+    /// Returns this [`LogicalMesh`] with the axes named `axis_names` retyped as `r#type`, keeping the names, sizes, and
+    /// order of all axes and the types of the other axes, so that the result has the same topology as this mesh (refer
+    /// to [`Self::has_same_topology`]). This is the analogue of JAX's `AbstractMesh.update_axis_types`, which
+    /// [`auto_axes`](crate::auto_axes) and [`explicit_axes`](crate::explicit_axes) use to switch axis types.
+    ///
+    /// # Errors
+    ///
+    /// Returns [`ShardingError::UnknownMeshAxisName`] when a name in `axis_names` is not an axis of this mesh.
+    pub fn with_axis_types<S: AsRef<str>, I: IntoIterator<Item = S>>(
+        &self,
+        axis_names: I,
+        r#type: MeshAxisType,
+    ) -> Result<Self, ShardingError> {
+        let mut axes = self.0.axes.clone();
+        for axis_name in axis_names {
+            let axis_name = axis_name.as_ref();
+            let axis_index = self
+                .axis_index(axis_name)
+                .ok_or_else(|| ShardingError::UnknownMeshAxisName { name: axis_name.to_string() })?;
+            axes[axis_index].r#type = r#type;
+        }
+        Self::new(axes)
+    }
+
     /// Returns the rank (i.e., number of axes) of this [`LogicalMesh`].
     #[inline]
     pub fn rank(&self) -> usize {
@@ -486,6 +510,30 @@ mod tests {
         .unwrap();
         assert!(Arc::ptr_eq(&mesh_0.0, &mesh_1.0));
         assert!(!Arc::ptr_eq(&mesh_0.0, &mesh_2.0));
+    }
+
+    #[test]
+    fn test_logical_mesh_with_axis_types() {
+        let mesh = LogicalMesh::new(vec![
+            MeshAxis::new("x", 2, MeshAxisType::Explicit).unwrap(),
+            MeshAxis::new("y", 3, MeshAxisType::Manual).unwrap(),
+            MeshAxis::new("z", 1, MeshAxisType::Explicit).unwrap(),
+        ])
+        .unwrap();
+
+        // Only the named axes change type, and the result keeps the topology (and is interned like any other mesh).
+        let retyped = mesh.with_axis_types(["x", "z"], MeshAxisType::Auto).unwrap();
+        assert_eq!(retyped.to_string(), "['x'=2:auto, 'y'=3:manual, 'z'=1:auto]");
+        assert!(retyped.has_same_topology(&mesh));
+        assert_eq!(retyped.with_axis_types(["x", "z"], MeshAxisType::Explicit).unwrap(), mesh);
+        assert!(Arc::ptr_eq(&retyped.with_axis_types(["x", "z"], MeshAxisType::Explicit).unwrap().0, &mesh.0));
+        assert_eq!(mesh.with_axis_types(Vec::<String>::new(), MeshAxisType::Auto).unwrap(), mesh);
+        assert_eq!(mesh.with_axis_types(["x"], MeshAxisType::Explicit).unwrap(), mesh);
+
+        assert!(matches!(
+            mesh.with_axis_types(["x", "w"], MeshAxisType::Auto),
+            Err(ShardingError::UnknownMeshAxisName { name }) if name == "w",
+        ));
     }
 
     #[test]
