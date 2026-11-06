@@ -1,13 +1,17 @@
 use ryft_core::macros::check_count;
 use ryft_core::{
-    ArrayType, Operation as CoreOperation, PARALLEL_BROADCAST_OPERATION_NAME, ParallelBroadcastOperation, ProgramError,
+    ArrayIrType, ArrayType, DomainTracingContext, EmptyRegionDriver, InterpretableOperation, NamedAxis,
+    Operation as CoreOperation, PARALLEL_BROADCAST_OPERATION_NAME, ParallelBroadcastOperation, ParallelBroadcastSource,
+    ProgramError, RematerializationOptimizationBarrier, Value as CoreValue, ValueProjection,
 };
 use ryft_mlir::dialects::stable_hlo;
 use ryft_mlir::{Block, BlockRef, LocationRef, Operation as MlirOperation, Value as MlirValue, ValueRef};
 
+use crate::domains::Tracer;
 use crate::experimental::lowering::CollectiveLoweringState;
+use crate::experimental::lowering::regions::lower_nested_program_inline;
 use crate::operations::collectives::collective_replica_groups;
-use crate::{Error, LowerableOperation, LowerableOperationFamily, Lowerer};
+use crate::{Domain, Error, LowerableOperation, LowerableOperationFamily, Lowerer};
 
 /// Lowers one traced `parallel_broadcast` to a channeled `stablehlo.collective_broadcast`. The operation broadcasts
 /// from the first member of every replica group, so each group of the named mesh axes is reordered to start with its
@@ -19,7 +23,7 @@ use crate::{Error, LowerableOperation, LowerableOperationFamily, Lowerer};
 /// compile `collective-broadcast` (its thunk emitter rejects the opcode), so a lowering whose target platform is known
 /// to be the CPU fails here with a precise error, while a lowering without target information emits the operation and
 /// leaves the rejection to XLA's compiler. JAX registers its lowering for GPUs only.
-pub(crate) fn lower_parallel_broadcast_to_mlir<'b, 'c: 'b, 't: 'c>(
+fn lower_static_parallel_broadcast_to_mlir<'b, 'c: 'b, 't: 'c>(
     operation: &ParallelBroadcastOperation,
     collective_state: &CollectiveLoweringState,
     input_value: ValueRef<'b, 'c, 't>,
@@ -37,7 +41,9 @@ pub(crate) fn lower_parallel_broadcast_to_mlir<'b, 'c: 'b, 't: 'c>(
     }
     let (replica_groups, _) =
         collective_replica_groups(collective_state, operation.axes(), operation.axis_size(), None)?;
-    let source = operation.source();
+    let ParallelBroadcastSource::Static(source) = operation.source() else {
+        unreachable!();
+    };
     let replica_groups = replica_groups
         .iter()
         .map(|group| {
@@ -67,7 +73,8 @@ impl LowerableOperation for ParallelBroadcastOperation {
         input_types: &[ArrayType],
         output_types: &[ArrayType],
     ) -> Result<Vec<ValueRef<'b, 'c, 't>>, Error> {
-        check_count!("input", input_values, 1, ProgramError);
+        let input_count = if self.source() == ParallelBroadcastSource::Dynamic(()) { 2 } else { 1 };
+        check_count!("input", input_values, input_count, ProgramError);
         check_count!("output", output_types, 1, ProgramError);
         let collective_state = lowerer.collective_state.clone();
         collective_state.check_manual_collective(
@@ -84,6 +91,58 @@ impl LowerableOperation for ParallelBroadcastOperation {
                 operation.infer_output_types(input_types, &[])
             },
         )?;
-        lower_parallel_broadcast_to_mlir(self, &collective_state, input_values[0], &mut lowerer.block, lowerer.location)
+        if self.source() == ParallelBroadcastSource::Dynamic(()) {
+            // Trace the operation's canonical checked interpretation in the actual manual-axis environment. The
+            // decomposition retains exact copies and assertion tokens on targets without native root support.
+            let axes = collective_state
+                .bound_manual_axes
+                .iter()
+                .map(|name| {
+                    let boundary = collective_state.manual_axis_region(name).unwrap();
+                    let mesh = boundary.mesh().clone();
+                    let axis = mesh.axis_index(name).unwrap();
+                    (
+                        name.clone(),
+                        NamedAxis::Mesh {
+                            size: mesh.axes()[axis].size(),
+                            axis,
+                            mesh,
+                            checks_manual_variation: boundary.check_manual_variation(),
+                        },
+                    )
+                })
+                .collect::<Vec<_>>();
+            let (_, program) = DomainTracingContext::<Domain<'static>>::trace_with_named_axes(
+                |inputs: Vec<Tracer<'static>>| {
+                    let inputs = inputs
+                        .into_iter()
+                        .map(ValueProjection::<ArrayType>::into_projected)
+                        .collect::<Result<Vec<_>, _>>()?;
+                    let outputs = self.interpret(&inputs[0].domain(), &EmptyRegionDriver, &inputs)?;
+                    Ok(outputs.into_iter().map(|value| value.into_value()).collect::<Vec<_>>())
+                },
+                input_types.iter().cloned().map(ArrayIrType::from).collect::<Vec<_>>(),
+                axes,
+            )?;
+            return lower_nested_program_inline(
+                &program.to_flat_program(),
+                input_values,
+                &mut lowerer.block,
+                lowerer.context,
+                lowerer.location,
+                &[],
+                &RematerializationOptimizationBarrier::None,
+                None,
+                &collective_state,
+                &mut lowerer.effect_tokens,
+            );
+        }
+        lower_static_parallel_broadcast_to_mlir(
+            self,
+            &collective_state,
+            input_values[0],
+            &mut lowerer.block,
+            lowerer.location,
+        )
     }
 }

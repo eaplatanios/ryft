@@ -228,6 +228,21 @@ impl LogicalMesh {
                 .zip(other.axes())
                 .all(|(left, right)| left.name == right.name && left.size == right.size)
     }
+
+    /// Returns `true` when this [`LogicalMesh`] and `other` define the same topology (i.e., computed via
+    /// [`Self::has_same_topology`]) and type the same axes as [`Manual`](MeshAxisType::Manual), so that they describe
+    /// the same manual region while possibly typing its free axes differently (e.g., the mesh of a `shard_map` body and
+    /// that mesh with a free axis switched by [`auto_axes`](crate::auto_axes)). Collectives over manual axes accept
+    /// inputs over any such mesh, as JAX's do inside `auto_axes` and `explicit_axes`, which retype its context mesh.
+    #[inline]
+    pub fn has_same_manual_axes(&self, other: &Self) -> bool {
+        self.has_same_topology(other)
+            && self
+                .axes()
+                .iter()
+                .zip(other.axes())
+                .all(|(left, right)| (left.r#type == MeshAxisType::Manual) == (right.r#type == MeshAxisType::Manual))
+    }
 }
 
 impl Display for LogicalMesh {

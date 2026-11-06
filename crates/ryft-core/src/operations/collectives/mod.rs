@@ -1316,13 +1316,15 @@ fn validate_manual_mesh_axis(
 }
 
 /// Validates the manual mesh axis of a collective that carries a mesh, as [`validate_manual_mesh_axis`] does, and that
-/// `input_type` carries sharding over that same mesh. After successful validation, callers can retrieve the input
-/// sharding to apply their collective-specific manual variation and pending-sum contracts.
+/// `input_type` carries sharding over a mesh of the same manual region (i.e., [`LogicalMesh::has_same_manual_axes`]),
+/// which may type its free axes differently (e.g., inside [`auto_axes`](crate::auto_axes)). After successful
+/// validation, callers can retrieve the input sharding to apply their collective-specific manual variation and
+/// pending-sum contracts.
 ///
 /// # Errors
 ///
-/// Returns a [`TypeError`] naming `operation_name` if the mesh axis is invalid, or if the input carries no sharding or
-/// a sharding over a different mesh.
+/// Returns a [`TypeError`] naming `operation_name` if the mesh axis is invalid, or if the input carries no sharding
+/// or a sharding over a mesh of another manual region.
 fn validate_manual_mesh_input(
     operation_name: &str,
     axis_name: &str,
@@ -1336,7 +1338,7 @@ fn validate_manual_mesh_input(
             "`{operation_name}` input must carry a mesh containing manual axis `{axis_name}`",
         )));
     };
-    if sharding.mesh() != mesh {
+    if !sharding.mesh().has_same_manual_axes(mesh) {
         return Err(TypeError::invalid(format!("`{operation_name}` input mesh does not match the operation mesh")));
     }
     Ok(())

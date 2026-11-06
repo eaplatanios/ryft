@@ -5,15 +5,32 @@ use ryft_core::{
 use ryft_mlir::dialects::shardy;
 use ryft_mlir::{Block, BlockRef, LocationRef, Operation as MlirOperation, Value as MlirValue, ValueRef};
 
-use crate::{Error, LowerableOperation, LowerableOperationFamily, Lowerer, ToMlir};
+use crate::sharding::shardy_tensor_sharding_attribute;
+use crate::{Error, LowerableOperation, LowerableOperationFamily, Lowerer};
 
-/// Lowers a tensor placement constraint after excluding mesh axes bound by enclosing manual regions.
+/// Lowers the tracked placement `sharding` of a value's type as a tensor placement constraint after excluding mesh axes
+/// bound by enclosing manual regions. A type does not fully describe the placement along
+/// [`Auto`](ryft_core::MeshAxisType::Auto) axes, so the constraint leaves the compiler free to place the value along
+/// them further (refer to [`shardy_tensor_sharding_attribute`]).
 pub(crate) fn lower_sharding_constraint<'b, 'c: 'b, 't: 'c>(
     input_values: &[ValueRef<'b, 'c, 't>],
     sharding: &Sharding,
     bound_manual_axes: &[String],
     block: &mut BlockRef<'b, 'c, 't>,
     location: LocationRef<'c, 't>,
+) -> Result<Vec<ValueRef<'b, 'c, 't>>, Error> {
+    lower_constraint(input_values, sharding, bound_manual_axes, block, location, true)
+}
+
+/// Lowers a tensor placement constraint after excluding mesh axes bound by enclosing manual regions, whose dimensions
+/// are open over auto axes when `open_over_auto_axes` is set (refer to [`shardy_tensor_sharding_attribute`]).
+fn lower_constraint<'b, 'c: 'b, 't: 'c>(
+    input_values: &[ValueRef<'b, 'c, 't>],
+    sharding: &Sharding,
+    bound_manual_axes: &[String],
+    block: &mut BlockRef<'b, 'c, 't>,
+    location: LocationRef<'c, 't>,
+    open_over_auto_axes: bool,
 ) -> Result<Vec<ValueRef<'b, 'c, 't>>, Error> {
     check_count!("input", input_values, 1, ProgramError);
     // Bound manual axes describe ownership outside this local tensor and cannot appear on constraints inside the
@@ -60,7 +77,7 @@ pub(crate) fn lower_sharding_constraint<'b, 'c: 'b, 't: 'c>(
         local_sharding = projected().map_err(|error| ProgramError::InvalidArgument { message: error.to_string() })?;
         &local_sharding
     };
-    let sharding_attribute = sharding.to_mlir(location)?;
+    let sharding_attribute = shardy_tensor_sharding_attribute(sharding, location, open_over_auto_axes)?;
     let operation =
         block.append_operation(shardy::sharding_constraint(input_values[0], sharding_attribute, location)?)?;
     Ok(vec![operation.result(0).expect("sdy.sharding_constraint should return one result").as_ref()])
@@ -75,15 +92,17 @@ impl LowerableOperation for ConstrainShardingOperation {
         output_types: &[ArrayType],
     ) -> Result<Vec<ValueRef<'b, 'c, 't>>, Error> {
         // The constraint is untracked, so the output type is the input type, and the emitted constraint must
-        // carry the input's tracked placement alongside the constraint's own auto-axis placement.
+        // carry the input's tracked placement alongside the constraint's own auto-axis placement. Unlike a tracked
+        // placement, the constraint does describe the placement along auto axes, so its dimensions stay closed.
         check_count!("output", output_types, 1, ProgramError);
         let sharding = self.lowered_sharding(&output_types[0]).map_err(ProgramError::from)?;
-        lower_sharding_constraint(
+        lower_constraint(
             input_values,
             &sharding,
             &lowerer.collective_state.bound_manual_axes,
             &mut lowerer.block,
             lowerer.location,
+            false,
         )
     }
 }

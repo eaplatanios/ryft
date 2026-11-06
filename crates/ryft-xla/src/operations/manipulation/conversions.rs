@@ -3164,9 +3164,10 @@ mod tests {
 
         // Carrying an existing sharding forward requests no redistribution: a cast that only changes the layout emits
         // no constraint, whereas a changed explicit placement emits the complete output sharding, including the
-        // preserved auto placement, like `reshard`. Explicit axes may only change minor to the auto axis `a`, whose
-        // shards would otherwise hold other blocks of the array. The plain-program entry point declares the mesh of
-        // every sharded atom, so the mesh declaration below does not depend on the cast.
+        // preserved auto placement, like `reshard`, with its dimensions open over the auto axis. Explicit axes may only
+        // change minor to the auto axis `a`, whose shards would otherwise hold other blocks of the array. The
+        // plain-program entry point declares the mesh of every sharded atom, so the mesh declaration below does not
+        // depend on the cast.
         let mesh = LogicalMesh::new(vec![
             MeshAxis::new("x", 2, MeshAxisType::Explicit).unwrap(),
             MeshAxis::new("a", 2, MeshAxisType::Auto).unwrap(),
@@ -3209,7 +3210,7 @@ mod tests {
                     module {
                       sdy.mesh @mesh = <[\"x\"=2, \"a\"=2]>
                       func.func @main(%arg0: tensor<4x4xf64>) -> tensor<4x4xf64> {
-                        %0 = sdy.sharding_constraint %arg0 <@mesh, [{\"a\", \"x\"}, {}]> : tensor<4x4xf64>
+                        %0 = sdy.sharding_constraint %arg0 <@mesh, [{\"a\", \"x\", ?}, {?}]> : tensor<4x4xf64>
                         return %0 : tensor<4x4xf64>
                       }
                     }
@@ -3218,7 +3219,7 @@ mod tests {
                     module {
                       sdy.mesh @mesh = <[\"x\"=2, \"a\"=2]>
                       func.func @main(%arg0: tensor<4x4xf64>) -> tensor<4x4xf64> {
-                        %0 = sdy.sharding_constraint %arg0 <@mesh, [{\"a\", \"x\"}, {}]> : tensor<4x4xf64>
+                        %0 = sdy.sharding_constraint %arg0 <@mesh, [{\"a\", \"x\", ?}, {?}]> : tensor<4x4xf64>
                         return %0 : tensor<4x4xf64>
                       }
                     }

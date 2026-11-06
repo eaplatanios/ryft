@@ -419,6 +419,7 @@ mod tests {
     use crate::experimental::lowering::{lower_mlir_module_for_program, to_mlir_module_for_program};
     use crate::experimental::ops::ProgramBuilder as ArrayIrProgramBuilder;
     use crate::experimental::tracing::{TracedProgram, trace_with_context};
+    use crate::operations::assertions::ensure_assertion_handler_registered;
     use crate::operations::debugging::PRINT_CUSTOM_CALL_TARGET;
     use crate::tests::{values_from_bytes, values_to_bytes};
     use crate::{Array, Domain, FromPjrt, Options, Session, ToMlir, Value};
@@ -1409,6 +1410,7 @@ mod tests {
         let client = plugin
             .client(ClientOptions::CPU(CpuClientOptions { device_count: Some(N), ..Default::default() }))
             .unwrap();
+        ensure_assertion_handler_registered(&client).unwrap();
         let executable = client
             .compile(&PjrtProgram::Mlir { bytecode: module.into_bytes() }, &test_spmd_compilation_options(N))
             .unwrap();
@@ -1864,6 +1866,128 @@ mod tests {
         assert_eq!(
             execute_on_two_cpu_devices(module, &[2], [&[1.0, 2.0], &[3.0, 4.0]]),
             vec![vec![1.0, 2.0], vec![3.0, 4.0]],
+        );
+    }
+
+    #[test]
+    fn test_to_mlir_module_for_program_with_dynamic_parallel_broadcast_executes_on_cpu() {
+        let mesh = test_manual_mesh("x", 2);
+        let sharded = Sharding::new(mesh.clone(), vec![ShardingDimension::sharded(["x"])]).unwrap();
+        let replicated = Sharding::replicated(mesh.clone(), 0);
+        let input_types = [
+            ArrayType::new_static(DataType::F32, [4]).with_sharding(sharded.clone()).unwrap(),
+            ArrayType::scalar(DataType::F32).with_sharding(replicated.clone()).unwrap(),
+        ];
+        let (_, program) = DomainTracingContext::<Domain<'static>>::trace(
+            |inputs: Vec<Tracer<'static>>| {
+                let value = ValueProjection::<ArrayType>::into_projected(inputs[0].clone())?;
+                let source = ValueProjection::<ArrayType>::into_projected(inputs[1].clone())?;
+                let output = shard_map(
+                    |(value, source): (ArrayTracer, ArrayTracer)| {
+                        value.parallel_broadcast("x", &source.convert_element_type(DataType::U64)?)
+                    },
+                    (value, source),
+                    mesh.clone(),
+                    (sharded.clone(), replicated.clone()),
+                    sharded.clone(),
+                    ShardMapOptions::new(),
+                )?;
+                Ok(vec![output.into_value()])
+            },
+            input_types.iter().cloned().map(ArrayIrType::from).collect::<Vec<_>>(),
+        )
+        .unwrap();
+        let module = to_mlir_module_for_program(
+            &program,
+            &[],
+            &input_types,
+            &[input_types[0].clone()],
+            "main",
+            Some(&[sharded.clone(), replicated]),
+            Some(&[sharded]),
+        )
+        .unwrap();
+        assert_eq!(
+            module,
+            indoc! {"
+                module {
+                  sdy.mesh @mesh = <[\"x\"=2]>
+                  func.func @main(%arg0: tensor<4xf32> {sdy.sharding = #sdy.sharding<@mesh, [{\"x\"}]>}, %arg1: \
+                      tensor<f32> {sdy.sharding = #sdy.sharding<@mesh, [], replicated={\"x\"}>}) -> \
+                      (tensor<4xf32> {sdy.sharding = #sdy.sharding<@mesh, [{\"x\"}]>}) {
+                    %0 = stablehlo.after_all  : !stablehlo.token
+                    %1 = stablehlo.after_all  : !stablehlo.token
+                    %2:3 = sdy.manual_computation(%arg0, %arg1, %0, %1) in_shardings=[<@mesh, [{\"x\"}]>, <@mesh, \
+                        [], replicated={\"x\"}>, <@mesh, []>, <@mesh, []>] out_shardings=[<@mesh, [{\"x\"}]>, \
+                        <@mesh, []>, <@mesh, []>] manual_axes={\"x\"} (%arg2: tensor<2xf32>, %arg3: tensor<f32>, \
+                        %arg4: !stablehlo.token, %arg5: !stablehlo.token) {
+                      %3 = stablehlo.convert %arg3 : (tensor<f32>) -> tensor<ui64>
+                      %4 = \"stablehlo.all_reduce\"(%3) <{channel_handle = #stablehlo.channel_handle<handle = 1, \
+                          type = 1>, replica_groups = dense<[[0, 1]]> : tensor<1x2xi64>, use_global_device_ids}> ({
+                      ^bb0(%arg6: tensor<ui64>, %arg7: tensor<ui64>):
+                        %19 = stablehlo.minimum %arg6, %arg7 : tensor<ui64>
+                        stablehlo.return %19 : tensor<ui64>
+                      }) : (tensor<ui64>) -> tensor<ui64>
+                      %5 = \"stablehlo.all_reduce\"(%3) <{channel_handle = #stablehlo.channel_handle<handle = 2, \
+                          type = 1>, replica_groups = dense<[[0, 1]]> : tensor<1x2xi64>, use_global_device_ids}> ({
+                      ^bb0(%arg6: tensor<ui64>, %arg7: tensor<ui64>):
+                        %19 = stablehlo.maximum %arg6, %arg7 : tensor<ui64>
+                        stablehlo.return %19 : tensor<ui64>
+                      }) : (tensor<ui64>) -> tensor<ui64>
+                      %6 = stablehlo.compare EQ, %4, %5, UNSIGNED : (tensor<ui64>, tensor<ui64>) -> tensor<i1>
+                      %7 = stablehlo.custom_call @ryft.assert(%6, %4, %5, %arg4) {api_version = 4 : i32, \
+                          backend_config = {actor = \"assert\", kind = \"generic\", label_0 = \"minimum\", label_1 = \
+                          \"maximum\", label_count = \"2\", message = \"`parallel_broadcast` runtime sources must \
+                          agree across participants\"}, has_side_effect = true} : (tensor<i1>, tensor<ui64>, \
+                          tensor<ui64>, !stablehlo.token) -> !stablehlo.token
+                      %c = stablehlo.constant dense<2> : tensor<ui64>
+                      %8 = stablehlo.compare LT, %5, %c, UNSIGNED : (tensor<ui64>, tensor<ui64>) -> tensor<i1>
+                      %9 = stablehlo.custom_call @ryft.assert(%8, %3, %7) {api_version = 4 : i32, \
+                          backend_config = {actor = \"assert\", kind = \"generic\", label_0 = \"source\", label_count \
+                          = \"1\", message = \"`parallel_broadcast` runtime source must be smaller than axis size \
+                          2\"}, has_side_effect = true} : (tensor<i1>, tensor<ui64>, !stablehlo.token) -> \
+                          !stablehlo.token
+                      %10 = stablehlo.broadcast_in_dim %arg2, dims = [1] : (tensor<2xf32>) -> tensor<1x2xf32>
+                      %11 = \"stablehlo.all_gather\"(%10) <{all_gather_dim = 0 : i64, channel_handle = \
+                          #stablehlo.channel_handle<handle = 3, type = 1>, replica_groups = dense<[[0, 1]]> : \
+                          tensor<1x2xi64>, use_global_device_ids}> : (tensor<1x2xf32>) -> tensor<2x2xf32>
+                      %12 = stablehlo.slice %11 [0:1, 0:2] : (tensor<2x2xf32>) -> tensor<1x2xf32>
+                      %13 = stablehlo.reshape %12 : (tensor<1x2xf32>) -> tensor<2xf32>
+                      %14 = stablehlo.slice %11 [1:2, 0:2] : (tensor<2x2xf32>) -> tensor<1x2xf32>
+                      %15 = stablehlo.reshape %14 : (tensor<1x2xf32>) -> tensor<2xf32>
+                      %c_0 = stablehlo.constant dense<1> : tensor<ui64>
+                      %16 = stablehlo.compare EQ, %3, %c_0, UNSIGNED : (tensor<ui64>, tensor<ui64>) -> tensor<i1>
+                      %17 = stablehlo.broadcast_in_dim %16, dims = [] : (tensor<i1>) -> tensor<2xi1>
+                      %18 = stablehlo.select %17, %15, %13 : tensor<2xi1>, tensor<2xf32>
+                      sdy.return %18, %9, %arg5 : tensor<2xf32>, !stablehlo.token, !stablehlo.token
+                    } : (tensor<4xf32>, tensor<f32>, !stablehlo.token, !stablehlo.token) -> (tensor<4xf32>, \
+                        !stablehlo.token, !stablehlo.token)
+                    return %2#0 : tensor<4xf32>
+                  }
+                }
+            "
+            },
+        );
+        assert_eq!(
+            execute_inputs_on_cpu_devices(
+                module.clone(),
+                &[(&[2], [&[1f32, 2.0], &[3.0, 4.0]]), (&[], [&[0f32], &[0f32]])],
+            ),
+            vec![vec![1f32, 2.0], vec![1.0, 2.0]],
+        );
+        assert_eq!(
+            execute_inputs_on_cpu_devices(
+                module.clone(),
+                &[(&[2], [&[1f32, 2.0], &[3.0, 4.0]]), (&[], [&[1f32], &[1f32]])],
+            ),
+            vec![vec![3f32, 4.0], vec![3.0, 4.0]],
+        );
+        let nan = f32::from_bits(0x7fc01234);
+        let output =
+            execute_inputs_on_cpu_devices(module, &[(&[2], [&[1f32, 2.0], &[-0.0, nan]]), (&[], [&[1f32], &[1f32]])]);
+        assert_eq!(
+            output.into_iter().flatten().map(f32::to_bits).collect::<Vec<_>>(),
+            vec![(-0.0f32).to_bits(), nan.to_bits(), (-0.0f32).to_bits(), nan.to_bits()],
         );
     }
 
@@ -2367,7 +2491,8 @@ mod tests {
         let replicated = Sharding::replicated(logical_mesh.clone(), 1);
         let r#type = ArrayType::new_static(DataType::F32, [4]).with_sharding(sharded.clone()).unwrap();
         let input =
-            Array::from_host_buffer(&domain, r#type.clone(), mesh.clone(), values_to_bytes(&[1f32, 2., 3., 4.])).unwrap();
+            Array::from_host_buffer(&domain, r#type.clone(), mesh.clone(), values_to_bytes(&[1f32, 2., 3., 4.]))
+                .unwrap();
         let doubled = shard_map(
             |x: ShardMapTracer<Domain<'_>>| {
                 Ok(shard_map(

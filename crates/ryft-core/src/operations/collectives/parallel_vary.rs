@@ -442,7 +442,7 @@ impl<
         let mut input = self.clone();
         let input_type = input.r#type().into_owned();
         if let Some(sharding) = input_type.sharding()
-            && sharding.mesh() != mesh
+            && !sharding.mesh().has_same_manual_axes(mesh)
         {
             return Err(TypeError::invalid(format!(
                 "`{PARALLEL_VARY_OPERATION_NAME}` input mesh does not match the mesh of manual axis `{axis_name}`",

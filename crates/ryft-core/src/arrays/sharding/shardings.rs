@@ -404,6 +404,22 @@ impl Sharding {
         self.with_dimensions(dimensions)?.with_varying_manual_axes(varying)
     }
 
+    /// Returns this [`Sharding`] re-expressed over `mesh`, which must have the same topology as [`Self::mesh`] (refer
+    /// to [`LogicalMesh::has_same_topology`]), with the same placement, reduction state, and manual variation, which
+    /// are then interpreted with the axis types of `mesh` and revalidated against them (e.g., manual variation is only
+    /// valid along axes that `mesh` types as [`Manual`](MeshAxisType::Manual)). Since the devices of a topology do not
+    /// depend on axis types, a value placed by this sharding is placed by the returned one too.
+    pub fn with_mesh(&self, mesh: LogicalMesh) -> Result<Self, ShardingError> {
+        if !self.mesh.has_same_topology(&mesh) {
+            return Err(ShardingError::MeshMismatch { expected: self.mesh.clone(), actual: mesh });
+        }
+        Self::new(mesh, self.dimensions.clone())?
+            .with_unreduced_axes(self.unreduced_axes.clone())?
+            .with_unreduced_kind(self.unreduced_kind)?
+            .with_reduced_axes(self.reduced_axes.clone())?
+            .with_varying_manual_axes(self.varying_manual_axes.clone())
+    }
+
     /// Returns this [`Sharding`] with its per-array dimension assignments replaced by `dimensions`, while preserving
     /// its mesh and auxiliary axis state. The resulting sharding is revalidated against all preserved axis sets.
     pub fn with_dimensions(&self, dimensions: Vec<ShardingDimension>) -> Result<Self, ShardingError> {

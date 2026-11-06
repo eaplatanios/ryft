@@ -487,7 +487,7 @@ impl<
             }
         };
         let input_type = self.r#type().into_owned();
-        if input_type.sharding().is_some_and(|sharding| sharding.mesh() != &mesh) {
+        if input_type.sharding().is_some_and(|sharding| !sharding.mesh().has_same_manual_axes(&mesh)) {
             return Err(TypeError::invalid(format!(
                 "`{PARALLEL_CAST_OPERATION_NAME}` input mesh does not match the mesh of manual axis `{axis_name}`",
             ))

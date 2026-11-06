@@ -615,9 +615,9 @@ impl Display for ShardMapValueKind {
 /// lowering the dimension shardings of the boundary as open dimension shardings).
 ///
 /// The global outputs are typed over the [caller's mesh](Self::caller_mesh), which is the mesh of the computation
-/// unless the map was bound by a caller whose values are typed over that mesh with other types for the axes that the
-/// map makes manual (e.g., [`Explicit`](MeshAxisType::Explicit)). Like JAX's `shard_map`, which retypes the caller's
-/// mesh only inside of its body, the outputs of such a map are then typed like the values of its caller.
+/// unless the map was bound by a caller whose values are typed over that mesh with the axes that the map makes manual
+/// typed as [`Explicit`](MeshAxisType::Explicit). Like JAX's `shard_map`, which retypes the caller's mesh only inside
+/// of its body, the outputs of such a map are then typed like the values of its caller.
 ///
 /// This type is the logical boundary model only and carries no backend state. Backends lower it, for example, to the
 /// `in_shardings`, `out_shardings`, and `manual_axes` attributes of Shardy's
@@ -811,12 +811,13 @@ impl ShardMapBoundary {
         &self.mesh
     }
 
-    /// Returns the mesh over which the global outputs of this manual computation are typed. It has the topology of
-    /// [`Self::mesh`] and types the axes that enclosing manual regions made manual as
-    /// [`Manual`](MeshAxisType::Manual), but it may type the active manual axes as the caller of the map types them
-    /// (e.g., as [`Explicit`](MeshAxisType::Explicit)), so that the outputs can be used like the other values of the
-    /// caller (e.g., switched with [`auto_axes`](crate::auto_axes)) without first being resharded. It is
-    /// [`Self::mesh`] unless the map was bound by the [`ShardMap`] capability for such a caller.
+    /// Returns the mesh over which the global outputs of this manual computation are typed. It is either
+    /// [`Self::mesh`] or that mesh with the active manual axes typed as [`Explicit`](MeshAxisType::Explicit), as a
+    /// caller in JAX's explicit sharding mode types them, so that the outputs can be used like the other values of that
+    /// caller (e.g., switched with [`auto_axes`](crate::auto_axes)) without first being resharded. Since every other
+    /// axis keeps its type and the output shardings name no [`Auto`](MeshAxisType::Auto) axes, the output types never
+    /// record placement along auto axes. It is [`Self::mesh`] unless the map was bound by the [`ShardMap`] capability
+    /// for such a caller.
     #[inline]
     pub fn caller_mesh(&self) -> &LogicalMesh {
         self.caller_mesh.as_ref().unwrap_or(&self.mesh)
@@ -1289,14 +1290,14 @@ impl ShardMapBoundary {
 
     /// Returns the global type of output `output_index` whose body produces `local_output_type`, which is the local
     /// shape scaled by the manual partition counts of the output sharding, under that sharding with the variation along
-    /// active manual axes dropped, re-expressed over [`Self::caller_mesh`]. The body output must vary along every active manual axis that the output sharding
-    /// tiles and, when [`Self::check_output_replication`] is enabled, along no other active manual axis. Its unreduced
-    /// and reduced axes along the axes that the output sharding governs must equal those of the output sharding, while
-    /// its state along every other axis is carried into
-    /// the global type (refer to [`Self::carried_reduction_state`] for how this relates to JAX's
-    /// `_unshard_shaped_array`). An output sharding never adopts unreduced axes
-    /// that the body output lacks, because assembling an invariant body output as a pending sum along an axis would
-    /// scale it by the size of that axis, and its cotangent could not be typed in reverse mode.
+    /// active manual axes dropped, re-expressed over [`Self::caller_mesh`]. The body output must vary along every
+    /// active manual axis that the output sharding tiles and, when [`Self::check_output_replication`] is enabled, along
+    /// no other active manual axis. Its unreduced and reduced axes along the axes that the output sharding governs must
+    /// equal those of the output sharding, while its state along every other axis is carried into the global type
+    /// (refer to [`Self::carried_reduction_state`] for how this relates to JAX's `_unshard_shaped_array`). An output
+    /// sharding never adopts unreduced axes that the body output lacks, because assembling an invariant body output as
+    /// a pending sum along an axis would scale it by the size of that axis, and its cotangent could not be typed in
+    /// reverse mode.
     fn global_output_type(
         &self,
         output_index: usize,
@@ -4238,7 +4239,7 @@ where
                     "`{operation_name}` manual axis `{axis_name}` has no enclosing manual binding",
                 ))
             })?;
-        if input_type.sharding().unwrap().mesh() != boundary.mesh() {
+        if !input_type.sharding().unwrap().mesh().has_same_manual_axes(boundary.mesh()) {
             return Err(ProgramError::MalformedProgram(format!(
                 "`{operation_name}` operation mesh does not match the enclosing manual axis `{axis_name}` mesh",
             )));
@@ -7353,7 +7354,7 @@ where
         options.manual_axes.clone(),
         &named_axes,
     )?;
-    let caller_mesh = shard_map_caller_mesh(&boundary, &global_input_types, context.default_mesh(), &outer_named_axes);
+    let caller_mesh = shard_map_caller_mesh(&boundary, &global_input_types, context.default_mesh());
     let boundary = boundary.with_caller_mesh(caller_mesh.clone()).with_manual_variation_checks(checks);
     let rebuild_boundary = output_axes.map(|(axis_name, axes)| {
         move |output_types: &[ArrayType]| -> Result<ShardMapBoundary, ShardMapError> {
@@ -7400,15 +7401,16 @@ where
 /// [`ShardMapBoundary::caller_mesh`]), or [`None`] to type them over the mesh of the map. The caller's values carry
 /// their meshes in their types, so the candidate is the mesh that every sharded input in `global_input_types` is placed
 /// over, and the default mesh `default_mesh` of the binding context (JAX's context mesh) when no input is sharded.
-/// Inputs placed over different meshes leave no candidate. The candidate is used only when it describes the caller of
-/// this map, which requires the topology of the mesh of the map, the axes that enclosing manual regions made manual
-/// (i.e., the [`NamedAxis::Mesh`] bindings in `enclosing_named_axes`) typed as [`Manual`](MeshAxisType::Manual), and
-/// the axes that the map makes manual typed otherwise. The other axes are free and may have any type.
+/// Inputs placed over different meshes leave no candidate. The candidate is used only when it is the mesh of the map
+/// with the axes that the map makes manual typed as [`Explicit`](MeshAxisType::Explicit), which is how a caller in
+/// JAX's explicit sharding mode types them. A caller that types them as [`Auto`](MeshAxisType::Auto) receives outputs
+/// typed over the mesh of the map instead, because types over its mesh could not record the placement of the outputs
+/// along those axes without making it tracked (JAX's types omit it), and dropping it from the types would make backends
+/// whose function signatures follow the types replicate the outputs.
 fn shard_map_caller_mesh(
     boundary: &ShardMapBoundary,
     global_input_types: &[ArrayType],
     default_mesh: Option<LogicalMesh>,
-    enclosing_named_axes: &[(String, NamedAxis)],
 ) -> Option<LogicalMesh> {
     let mut input_meshes = global_input_types.iter().filter_map(|r#type| r#type.sharding().map(Sharding::mesh));
     let candidate = match input_meshes.next() {
@@ -7417,17 +7419,11 @@ fn shard_map_caller_mesh(
         None => default_mesh?,
     };
     let is_valid = candidate.has_same_topology(boundary.mesh())
-        && candidate.axes().iter().all(|axis| {
-            let is_manual = axis.r#type() == MeshAxisType::Manual;
+        && candidate.axes().iter().zip(boundary.mesh().axes()).all(|(axis, map_axis)| {
             if boundary.manual_axes().iter().any(|name| name == axis.name()) {
-                !is_manual
-            } else if enclosing_named_axes
-                .iter()
-                .any(|(name, binding)| name == axis.name() && matches!(binding, NamedAxis::Mesh { .. }))
-            {
-                is_manual
+                axis.r#type() == MeshAxisType::Explicit
             } else {
-                true
+                axis.r#type() == map_axis.r#type()
             }
         });
     is_valid.then_some(candidate)
@@ -26438,6 +26434,31 @@ mod tests {
             )
             .unwrap();
         assert_eq!(batched.output_types()[1], ArrayIrType::Array(batched_type));
+
+        // A caller that types `x` as auto receives outputs typed over the mesh of the map instead, since types over its
+        // mesh could not record their placement along `x`, which JAX's types omit and closed function signatures need.
+        let auto_mesh = LogicalMesh::new(vec![MeshAxis::new("x", 2, MeshAxisType::Auto).unwrap()]).unwrap();
+        let auto_type = f32_vector_type(8)
+            .with_sharding(Sharding::new(auto_mesh, vec![ShardingDimension::sharded(["x"])]).unwrap())
+            .unwrap();
+        let program = trace_test_program(
+            |inputs| {
+                vec![
+                    shard_map(
+                        |x: TestTracer| Ok(x.clone() + x),
+                        inputs[0].clone(),
+                        manual_mesh(),
+                        sharded_along_x(),
+                        sharded_along_x(),
+                        ShardMapOptions::new(),
+                    )
+                    .unwrap(),
+                ]
+            },
+            vec![auto_type],
+            Vec::new(),
+        );
+        assert_eq!(program.output_types().into_owned(), vec![ArrayIrType::Array(global_type)]);
     }
 
     #[test]

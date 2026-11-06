@@ -22,14 +22,16 @@ use crate::operations::Capability;
 use crate::operations::arithmetic::{Add, AddOperation, Mul, MulOperation};
 use crate::operations::assertions::Assert;
 use crate::operations::collectives::axis_index::AxisIndexOperation;
-use crate::operations::collectives::parallel_all_gather::ParallelAllGather;
+use crate::operations::collectives::parallel_all_gather::{
+    ParallelAllGather, ParallelAllGatherOperation, ParallelAllGatherOutputVariance,
+};
 use crate::operations::collectives::parallel_permute::{PARALLEL_PERMUTE_OPERATION_NAME, ParallelPermuteOperation};
 use crate::operations::collectives::parallel_reduce::{ParallelReduce, ParallelReduceOperation};
 use crate::operations::collectives::parallel_vary::{
     PARALLEL_VARY_OPERATION_NAME, ParallelVary, ParallelVaryOperation,
 };
 use crate::operations::collectives::{
-    CollectiveAxes, LinearCollectiveOperation, resolve_collective_axes, route_axis_slices,
+    CollectiveAxes, CollectiveOptions, LinearCollectiveOperation, resolve_collective_axes, route_axis_slices,
     validate_manual_mesh_axes_input,
 };
 use crate::operations::comparisons::{Compare, CompareOperation};
@@ -432,7 +434,9 @@ where
             self.validate_degenerate_interpretation()?;
             return Ok(vec![inputs[0].clone()]);
         }
-        interpret_dynamic_parallel_broadcast(self, context, inputs, None)
+        interpret_dynamic_parallel_broadcast(self, context, inputs, None, |value| {
+            value.parallel_all_gather(self.axes.clone(), 0)
+        })
     }
 }
 
@@ -471,7 +475,12 @@ impl<C: Context<Type = ArrayType, Operation: From<ParallelBroadcastOperation>>> 
 }
 
 impl<
-    C: Context<Type = ArrayType, Operation: From<ParallelBroadcastOperation>> + Fill<u64, C::Value>,
+    C: Context<
+            Type = ArrayType,
+            Operation: From<ParallelBroadcastOperation>
+                           + From<ParallelAllGatherOperation>
+                           + From<ParallelVaryOperation>,
+        > + Fill<u64, C::Value>,
     P: ArrayExtentBatchingPolicy<C>,
 > BatchableOperation<C, ArrayBatchingPolicy<P>> for ParallelBroadcastOperation
 where
@@ -480,7 +489,6 @@ where
         + Slice
         + Transpose
         + Reshard
-        + ParallelAllGather
         + ParallelReduce
         + Compare
         + Select
@@ -569,8 +577,40 @@ where
             // dimension to the front and interpret the vector of scalar roots over parent-owned packed arrays.
             let data = P::match_axis(context, data, 0.into())?;
             let source = source.value().move_axis(source.batch_axis_position().unwrap(), 0)?;
+
+            let parent = context.parent();
             let mut outputs =
-                interpret_dynamic_parallel_broadcast(self, context.parent(), &[data.into_value(), source], Some(0))?;
+                interpret_dynamic_parallel_broadcast(self, parent, &[data.into_value(), source], Some(0), |value| {
+                    // The gather binds through the parent context with the axes that this operation already resolved,
+                    // so the rule does not require a gather capability of parent values (e.g., partial evaluation
+                    // values lack one).
+                    let mut operation = ParallelAllGatherOperation::new(
+                        self.axes.clone(),
+                        self.axis_size,
+                        0,
+                        CollectiveOptions::default(),
+                        ParallelAllGatherOutputVariance::Varying,
+                    );
+                    let mut input = value.clone();
+                    if let Some(mesh) = &self.mesh {
+                        for axis_name in self.axes.names() {
+                            if !input
+                                .r#type()
+                                .sharding()
+                                .is_some_and(|sharding| sharding.varying_manual_axes().contains(axis_name))
+                            {
+                                let mut outputs =
+                                    parent.bind(ParallelVaryOperation::new(axis_name.clone()), Vec::new(), &[input])?;
+                                check_count!("output", outputs, 1, ProgramError);
+                                input = outputs.remove(0);
+                            }
+                        }
+                        operation = operation.with_mesh(mesh.clone());
+                    }
+                    let mut outputs = parent.bind(operation, Vec::new(), &[input])?;
+                    check_count!("output", outputs, 1, ProgramError);
+                    Ok(outputs.remove(0))
+                })?;
             check_count!("output", outputs, 1, ProgramError);
             return Ok(vec![ArrayBatch::new(outputs.remove(0), BatchAxis::new(0))?]);
         }
@@ -995,15 +1035,16 @@ where
 
 /// Interprets a runtime broadcast, including a packed unrelated batch of scalar roots when `source_batch_axis`
 /// is present. Primal interpretation validates roots; derived linear instructions reuse selection without effects.
+/// `gather` gathers a participant payload over the broadcast axes along a new leading axis.
 fn interpret_dynamic_parallel_broadcast<C: Domain<Type = ArrayType> + Fill<u64, C::Value>>(
     operation: &ParallelBroadcastOperation,
     context: &C,
     inputs: &[C::Value],
     source_batch_axis: Option<usize>,
+    gather: impl FnOnce(&C::Value) -> Result<C::Value, ProgramError>,
 ) -> Result<Vec<C::Value>, ProgramError>
 where
-    C::Value:
-        ParallelAllGather + ParallelReduce + Compare + Select + Slice + Reshape + TransferToMemory + Assert + Broadcast,
+    C::Value: ParallelReduce + Compare + Select + Slice + Reshape + TransferToMemory + Assert + Broadcast,
 {
     let (value, source) = (&inputs[0], &inputs[1]);
     if operation.requires_source_validation {
@@ -1020,7 +1061,7 @@ where
     if operation.axis_size == 1 {
         return Ok(vec![value.clone()]);
     }
-    let gathered = value.parallel_all_gather(operation.axes.clone(), 0)?;
+    let gathered = gather(value)?;
     let mut output =
         select_runtime_broadcast_source(context, &gathered, source, operation.axis_size, source_batch_axis)?;
     let output_type = value.r#type().into_owned();

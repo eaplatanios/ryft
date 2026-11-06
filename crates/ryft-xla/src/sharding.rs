@@ -1,4 +1,4 @@
-use ryft_core::{Device, DeviceMesh, LogicalMesh, Sharding, ShardingDimension, UnreducedKind};
+use ryft_core::{Device, DeviceMesh, LogicalMesh, MeshAxisType, Sharding, ShardingDimension, UnreducedKind};
 use ryft_mlir::Location;
 use ryft_mlir::dialects::shardy;
 use ryft_pjrt::Device as PjrtDevice;
@@ -60,46 +60,63 @@ impl ToMlir for DeviceMesh {
 impl ToMlir for Sharding {
     type Output<'c, 't: 'c> = shardy::TensorShardingAttributeRef<'c, 't>;
 
+    #[inline]
     fn to_mlir<'c, 't: 'c, L: Location<'c, 't>>(
         &self,
         location: L,
     ) -> Result<shardy::TensorShardingAttributeRef<'c, 't>, ryft_mlir::Error> {
-        let context = location.context();
-        let mesh_symbol_ref = context.flat_symbol_ref_attribute(SHARDY_MESH_SYMBOL_NAME);
-        let dimensions = self
-            .dimensions()
-            .iter()
-            .map(|dimension| match dimension {
-                ShardingDimension::Replicated => context.shardy_dimension_sharding([], true, None),
-                ShardingDimension::Sharded(axis_names) => context.shardy_dimension_sharding(
-                    axis_names
-                        .iter()
-                        .map(|axis_name| context.shardy_axis_ref(axis_name.as_str(), None))
-                        .collect::<Result<Vec<_>, _>>()?,
-                    true,
-                    None,
-                ),
-                ShardingDimension::Unconstrained => context.shardy_dimension_sharding([], false, None),
-            })
-            .collect::<Result<Vec<_>, _>>()?;
-        let replicated_axes = self
-            .replicated_axes()
-            .iter()
-            .map(|axis_name| context.shardy_axis_ref(*axis_name, None))
-            .collect::<Result<Vec<_>, _>>()?;
-        let unreduced_axes = self
-            .unreduced_axes()
-            .iter()
-            .map(|axis_name| context.shardy_axis_ref(axis_name.as_str(), None))
-            .collect::<Result<Vec<_>, _>>()?;
-        context.shardy_tensor_sharding(
-            mesh_symbol_ref,
-            dimensions.as_slice(),
-            replicated_axes.as_slice(),
-            unreduced_axes.as_slice(),
-            shardy_reduction_operation(self.unreduced_kind()),
-        )
+        shardy_tensor_sharding_attribute(self, location, false)
     }
+}
+
+/// Returns the Shardy attribute of `sharding`. Its replicated and sharded dimensions are closed (i.e., Shardy
+/// cannot shard them along further axes) unless `open_over_auto_axes` is set and the mesh of `sharding` has an
+/// [`Auto`](MeshAxisType::Auto) axis, in which case every dimension is open. The axes that `sharding` governs but does
+/// not use are listed as replicated either way (refer to [`Sharding::replicated_axes`]), so open dimensions can only
+/// gain auto axes. This is how JAX lowers the shardings of types over meshes with auto axes (i.e.,
+/// `NamedSharding._to_sdy_sharding` with `modify_wrt_axis_types=True`), whose placement along
+/// those axes the type does not describe and the compiler chooses.
+pub(crate) fn shardy_tensor_sharding_attribute<'c, 't: 'c, L: Location<'c, 't>>(
+    sharding: &Sharding,
+    location: L,
+    open_over_auto_axes: bool,
+) -> Result<shardy::TensorShardingAttributeRef<'c, 't>, ryft_mlir::Error> {
+    let context = location.context();
+    let closed = !open_over_auto_axes || sharding.mesh().axes().iter().all(|axis| axis.r#type() != MeshAxisType::Auto);
+    let mesh_symbol_ref = context.flat_symbol_ref_attribute(SHARDY_MESH_SYMBOL_NAME);
+    let dimensions = sharding
+        .dimensions()
+        .iter()
+        .map(|dimension| match dimension {
+            ShardingDimension::Replicated => context.shardy_dimension_sharding([], closed, None),
+            ShardingDimension::Sharded(axis_names) => context.shardy_dimension_sharding(
+                axis_names
+                    .iter()
+                    .map(|axis_name| context.shardy_axis_ref(axis_name.as_str(), None))
+                    .collect::<Result<Vec<_>, _>>()?,
+                closed,
+                None,
+            ),
+            ShardingDimension::Unconstrained => context.shardy_dimension_sharding([], false, None),
+        })
+        .collect::<Result<Vec<_>, _>>()?;
+    let replicated_axes = sharding
+        .replicated_axes()
+        .iter()
+        .map(|axis_name| context.shardy_axis_ref(*axis_name, None))
+        .collect::<Result<Vec<_>, _>>()?;
+    let unreduced_axes = sharding
+        .unreduced_axes()
+        .iter()
+        .map(|axis_name| context.shardy_axis_ref(axis_name.as_str(), None))
+        .collect::<Result<Vec<_>, _>>()?;
+    context.shardy_tensor_sharding(
+        mesh_symbol_ref,
+        dimensions.as_slice(),
+        replicated_axes.as_slice(),
+        unreduced_axes.as_slice(),
+        shardy_reduction_operation(sharding.unreduced_kind()),
+    )
 }
 
 /// Returns the Shardy reduction operation of the unreduced axes of a sharding whose [`UnreducedKind`] is `kind`.
@@ -179,5 +196,39 @@ mod tests {
         let attribute = sharding.with_unreduced_kind(UnreducedKind::Min).unwrap();
         let attribute = attribute.to_mlir(context.unknown_location()).unwrap();
         assert_eq!(attribute.reduction_operation().unwrap(), shardy::ReductionOperation::Min);
+    }
+
+    #[test]
+    fn test_shardy_tensor_sharding() {
+        // Over a mesh with an auto axis, an open lowering leaves every dimension open, so the compiler can only add
+        // auto axes, since the unused explicit axes stay replicated. A closed lowering, and an open lowering over a
+        // mesh without auto axes, close every dimension.
+        let mesh = LogicalMesh::new(vec![
+            MeshAxis::new("x", 2, MeshAxisType::Auto).unwrap(),
+            MeshAxis::new("y", 2, MeshAxisType::Explicit).unwrap(),
+            MeshAxis::new("z", 2, MeshAxisType::Explicit).unwrap(),
+        ])
+        .unwrap();
+        let sharding =
+            Sharding::new(mesh, vec![ShardingDimension::replicated(), ShardingDimension::sharded(["y"])]).unwrap();
+        let context = MlirContext::new();
+        let location = context.unknown_location();
+        assert_eq!(
+            shardy_tensor_sharding_attribute(&sharding, location, true).unwrap().to_string(),
+            "#sdy.sharding<@mesh, [{?}, {\"y\", ?}], replicated={\"z\"}>",
+        );
+        assert_eq!(
+            shardy_tensor_sharding_attribute(&sharding, location, false).unwrap().to_string(),
+            "#sdy.sharding<@mesh, [{}, {\"y\"}], replicated={\"z\"}>",
+        );
+        let explicit_sharding = Sharding::new(
+            sharding.mesh().with_axis_types(["x"], MeshAxisType::Explicit).unwrap(),
+            sharding.dimensions().to_vec(),
+        )
+        .unwrap();
+        assert_eq!(
+            shardy_tensor_sharding_attribute(&explicit_sharding, location, true).unwrap().to_string(),
+            "#sdy.sharding<@mesh, [{}, {\"y\"}], replicated={\"x\", \"z\"}>",
+        );
     }
 }
