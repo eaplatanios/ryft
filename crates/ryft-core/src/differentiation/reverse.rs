@@ -8,6 +8,7 @@ use std::sync::Arc;
 
 use ryft_macros::Parameter;
 
+use crate::captures::{ImportingContext, SameContext};
 use crate::contexts::{Context, Domain, StagingContext};
 use crate::differentiation::forward::{
     DifferentiableOperation, ForwardModeDifferentiate, LinearizationTracer, Pushforward, linearize_for_rule,
@@ -1565,11 +1566,13 @@ impl<
     /// alone when that suffices, and otherwise from the zero source that this pullback retained for the corresponding
     /// primal input leaf (refer to the [`Pullback`] documentation). Neither the linearization nor the caller needs to
     /// supply a value from which to materialize a disconnected input's zero.
+    /// This is [`Self::materialize_cotangents_in_context`] in that context.
     ///
     /// # Errors
     ///
     /// Returns [`ProgramError::InvalidArgument`] for a leaf-count mismatch or a cotangent whose type differs from its
     /// primal input's cotangent type, and propagates zero-provider errors.
+    #[inline]
     pub fn materialize_cotangents(
         &self,
         cotangents: Input::To<MaybeZero<C::Value>>,
@@ -1578,6 +1581,32 @@ impl<
         C: Zero<C::Value>,
         C::Operation: ResidualZeroProvider<C::Type, Operation = C::Operation>,
         Input::Family: ParameterizedFamily<MaybeZero<C::Value>>,
+    {
+        self.materialize_cotangents_in_context::<C, SameContext>(&self.context, cotangents)
+    }
+
+    /// Like [`Self::materialize_cotangents`], materializes the structural zeros of `cotangents` in `context`, which
+    /// may be a descendant of the context that this pullback was built in (e.g., a batching level over it) or, for a
+    /// pullback built eagerly, a trace that captures its retained values. Every value that this pullback retained from
+    /// its linearization (i.e., its residuals and its zero sources) enters `context` through [`ImportingContext`], and
+    /// the replay and validation are otherwise those of [`Self::materialize_cotangents`]. Refer to
+    /// [`Pushforward::apply_in_context`] for more information.
+    ///
+    /// # Errors
+    ///
+    /// Returns the errors of [`Self::materialize_cotangents`], and errors from importing the retained values
+    /// into `context`.
+    pub fn materialize_cotangents_in_context<X, Path>(
+        &self,
+        context: &X,
+        cotangents: Input::To<MaybeZero<X::Value>>,
+    ) -> Result<Input::To<X::Value>, ProgramError>
+    where
+        X: Context<Type = C::Type, Constant = C::Constant, Operation = C::Operation> + ImportingContext<C, Path>,
+        Input::Family: ParameterizedFamily<X::Value>,
+        X: Zero<X::Value>,
+        C::Operation: ResidualZeroProvider<C::Type, Operation = C::Operation>,
+        Input::Family: ParameterizedFamily<MaybeZero<X::Value>>,
     {
         let cotangents = cotangents.into_parameters().collect::<Vec<_>>();
         let expected = self.primal_input_types.len();
@@ -1616,14 +1645,16 @@ impl<
             .into_iter()
             .zip(&self.zero_sources)
             .map(|(cotangent, source)| {
-                C::Operation::materialize_zero_from_residual_sources(&self.context, cotangent, source.iter())
+                let source = source.clone().map(|source| context.import(source)).transpose()?;
+                C::Operation::materialize_zero_from_residual_sources(context, cotangent, source.iter())
             })
             .collect::<Result<Vec<_>, _>>()?;
-        Ok(Input::To::<C::Value>::from_parameters(self.input_structure.clone(), values)?)
+        Ok(Input::To::<X::Value>::from_parameters(self.input_structure.clone(), values)?)
     }
 
     /// Applies this pullback and materializes its structural zeros from its retained zero sources. This combines
     /// [`Self::apply`] and [`Self::materialize_cotangents`] for consumers that require value cotangents.
+    /// This is [`Self::apply_materialized_in_context`] in that context.
     ///
     /// # Errors
     ///
@@ -1653,7 +1684,53 @@ impl<
         TracingContext<C::Constant, C::Operation>:
             StagingContext<Type = C::Type, Constant = C::Constant, Operation = C::Operation>,
     {
-        self.materialize_cotangents(self.apply(cotangents)?)
+        self.apply_materialized_in_context::<C, SameContext>(&self.context, cotangents)
+    }
+
+    /// Like [`Self::apply_materialized`], applies this pullback and materializes its structural zeros in `context`,
+    /// which may be a descendant of the context that this pullback was built in (e.g., a batching level over it) or,
+    /// for a pullback built eagerly, a trace that captures its retained values. Every value that this pullback retained
+    /// from its linearization (i.e., its residuals and its zero sources) enters `context` through [`ImportingContext`],
+    /// and the replay and validation are otherwise those of [`Self::apply_materialized`]. Refer to
+    /// [`Pushforward::apply_in_context`] for more information.
+    ///
+    /// # Errors
+    ///
+    /// Returns the errors of [`Self::apply_materialized`], and errors from importing the retained values
+    /// into `context`.
+    #[inline]
+    pub fn apply_materialized_in_context<X, Path>(
+        &self,
+        context: &X,
+        cotangents: Output::To<X::Value>,
+    ) -> Result<Input::To<X::Value>, ProgramError>
+    where
+        X: Context<Type = C::Type, Constant = C::Constant, Operation = C::Operation> + ImportingContext<C, Path>,
+        Output::Family: ParameterizedFamily<X::Value>,
+        Input::Family: ParameterizedFamily<X::Value>,
+        X: Zero<X::Value>,
+        C::Operation: TransposableOperation<C::Constant, C::Operation>
+            + ResidualZeroProvider<C::Type, Operation = C::Operation>
+            + ReferenceAccessOperation<
+                Transform: ReferenceTransform<Referent = <C::Type as ReferenceMemberType>::Referent>,
+            > + OperationProvider<
+                C::Type,
+                ReferenceNewOperation<<C::Type as ReferenceMemberType>::Referent, C::Type>,
+                Operation = C::Operation,
+            > + OperationProvider<
+                C::Type,
+                ReferenceAddUpdateOperation<
+                    <C::Type as ReferenceMemberType>::Referent,
+                    C::Type,
+                    <C::Operation as ReferenceAccessOperation>::Transform,
+                >,
+                Operation = C::Operation,
+            > + OperationProvider<C::Type, AddOperation<C::Type>, Operation = C::Operation>,
+        Input::Family: ParameterizedFamily<MaybeZero<X::Value>>,
+        TracingContext<C::Constant, C::Operation>:
+            StagingContext<Type = C::Type, Constant = C::Constant, Operation = C::Operation>,
+    {
+        self.materialize_cotangents_in_context(context, self.apply_in_context(context, cotangents)?)
     }
 
     /// Pulls the provided structured output cotangents `cotangents` back to the closure's input cotangents.
@@ -1669,6 +1746,8 @@ impl<
     /// late-bound, the first application also reports transposition errors. Disconnected and zero-space input
     /// cotangents remain [`MaybeZero::Zero`]; no value or extent residual is produced merely to return them.
     /// Use [`Self::materialize_cotangents`] or [`Self::apply_materialized`] when value cotangents are required.
+    /// This is [`Self::apply_in_context`] in that context.
+    #[inline]
     pub fn apply(&self, cotangents: Output::To<C::Value>) -> Result<Input::To<MaybeZero<C::Value>>, ProgramError>
     where
         C::Operation: TransposableOperation<C::Constant, C::Operation>
@@ -1692,11 +1771,52 @@ impl<
         TracingContext<C::Constant, C::Operation>:
             StagingContext<Type = C::Type, Constant = C::Constant, Operation = C::Operation>,
     {
+        self.apply_in_context::<C, SameContext>(&self.context, cotangents)
+    }
+
+    /// Like [`Self::apply`], applies this pullback to `cotangents` in `context`, which may be a descendant of the
+    /// context that this pullback was built in (e.g., a batching level over it) or, for a pullback built eagerly, a
+    /// trace that captures its retained values. Every value that this pullback retained from its linearization (i.e.,
+    /// its residuals and its zero sources) enters `context` through [`ImportingContext`], and the replay and validation
+    /// are otherwise those of [`Self::apply`]. Refer to [`Pushforward::apply_in_context`] for more information.
+    ///
+    /// # Errors
+    ///
+    /// Returns the errors of [`Self::apply`], and errors from importing the retained values into `context`.
+    pub fn apply_in_context<X, Path>(
+        &self,
+        context: &X,
+        cotangents: Output::To<X::Value>,
+    ) -> Result<Input::To<MaybeZero<X::Value>>, ProgramError>
+    where
+        X: Context<Type = C::Type, Constant = C::Constant, Operation = C::Operation> + ImportingContext<C, Path>,
+        Output::Family: ParameterizedFamily<X::Value>,
+        C::Operation: TransposableOperation<C::Constant, C::Operation>
+            + ResidualZeroProvider<C::Type, Operation = C::Operation>
+            + ReferenceAccessOperation<
+                Transform: ReferenceTransform<Referent = <C::Type as ReferenceMemberType>::Referent>,
+            > + OperationProvider<
+                C::Type,
+                ReferenceNewOperation<<C::Type as ReferenceMemberType>::Referent, C::Type>,
+                Operation = C::Operation,
+            > + OperationProvider<
+                C::Type,
+                ReferenceAddUpdateOperation<
+                    <C::Type as ReferenceMemberType>::Referent,
+                    C::Type,
+                    <C::Operation as ReferenceAccessOperation>::Transform,
+                >,
+                Operation = C::Operation,
+            > + OperationProvider<C::Type, AddOperation<C::Type>, Operation = C::Operation>,
+        Input::Family: ParameterizedFamily<MaybeZero<X::Value>>,
+        TracingContext<C::Constant, C::Operation>:
+            StagingContext<Type = C::Type, Constant = C::Constant, Operation = C::Operation>,
+    {
         self.validate_reference_boundary()?;
         let seeds = cotangents.into_parameters().map(CotangentSeed::Value).collect::<Vec<_>>();
         let destinations = (0..self.primal_input_types.len()).map(|_| CotangentDestination::Return).collect::<Vec<_>>();
         let cotangents = self
-            .apply_impl(seeds, &destinations)?
+            .apply_impl(context, seeds, &destinations)?
             .into_iter()
             .map(|cotangent| {
                 cotangent.ok_or_else(|| {
@@ -1706,13 +1826,14 @@ impl<
             .collect::<Result<Vec<_>, _>>()?;
 
         // Restore the closure's original structured input shape after rebuilding every flattened cotangent leaf.
-        Ok(Input::To::<MaybeZero<C::Value>>::from_parameters(self.input_structure.clone(), cotangents)?)
+        Ok(Input::To::<MaybeZero<X::Value>>::from_parameters(self.input_structure.clone(), cotangents)?)
     }
 
     /// Pulls the provided structured output cotangent `seeds` back to the closure's inputs under the provided
     /// structured cotangent `destinations`, returning [`Some`] exactly at the [`Return`](CotangentDestination::Return)
     /// positions, preserving structural zeros there. Seeds and destinations are aligned leaf for leaf with the
     /// closure's output and input structures and are validated against this matrix:
+    /// This is [`Self::apply_with_destinations_in_context`] in that context.
     ///
     /// | Primal Boundary Leaf | Legal Seed or Destination                                                    |
     /// |----------------------|------------------------------------------------------------------------------|
@@ -1755,6 +1876,7 @@ impl<
     /// Returns [`ProgramError::InvalidArgument`] for a seed or destination that violates the matrix above or a
     /// destination that aliases a primal reference or another destination, and propagates transposition and replay
     /// errors otherwise.
+    #[inline]
     pub fn apply_with_destinations(
         &self,
         seeds: Output::To<CotangentSeed<C::Value>>,
@@ -1784,10 +1906,56 @@ impl<
         TracingContext<C::Constant, C::Operation>:
             StagingContext<Type = C::Type, Constant = C::Constant, Operation = C::Operation>,
     {
+        self.apply_with_destinations_in_context::<C, SameContext>(&self.context, seeds, destinations)
+    }
+
+    /// Like [`Self::apply_with_destinations`], applies this pullback with explicit seeds and destinations in `context`,
+    /// which may be a descendant of the context that this pullback was built in (e.g., a batching level over it) or,
+    /// for a pullback built eagerly, a trace that captures its retained values. Every value that this pullback retained
+    /// from its linearization (i.e., its residuals and its zero sources) enters `context` through [`ImportingContext`],
+    /// and the replay and validation are otherwise those of [`Self::apply_with_destinations`]. Refer to
+    /// [`Pushforward::apply_in_context`] for more information.
+    ///
+    /// # Errors
+    ///
+    /// Returns the errors of [`Self::apply_with_destinations`], and errors from importing the retained values into
+    /// `context`.
+    pub fn apply_with_destinations_in_context<X, Path>(
+        &self,
+        context: &X,
+        seeds: Output::To<CotangentSeed<X::Value>>,
+        destinations: Input::To<CotangentDestination<X::Value>>,
+    ) -> Result<Input::To<Option<MaybeZero<X::Value>>>, ProgramError>
+    where
+        X: Context<Type = C::Type, Constant = C::Constant, Operation = C::Operation> + ImportingContext<C, Path>,
+        Output::Family: ParameterizedFamily<X::Value>,
+        C::Operation: TransposableOperation<C::Constant, C::Operation>
+            + ResidualZeroProvider<C::Type, Operation = C::Operation>
+            + ReferenceAccessOperation<
+                Transform: ReferenceTransform<Referent = <C::Type as ReferenceMemberType>::Referent>,
+            > + OperationProvider<
+                C::Type,
+                ReferenceNewOperation<<C::Type as ReferenceMemberType>::Referent, C::Type>,
+                Operation = C::Operation,
+            > + OperationProvider<
+                C::Type,
+                ReferenceAddUpdateOperation<
+                    <C::Type as ReferenceMemberType>::Referent,
+                    C::Type,
+                    <C::Operation as ReferenceAccessOperation>::Transform,
+                >,
+                Operation = C::Operation,
+            > + OperationProvider<C::Type, AddOperation<C::Type>, Operation = C::Operation>,
+        Input::Family:
+            ParameterizedFamily<CotangentDestination<X::Value>> + ParameterizedFamily<Option<MaybeZero<X::Value>>>,
+        Output::Family: ParameterizedFamily<CotangentSeed<X::Value>>,
+        TracingContext<C::Constant, C::Operation>:
+            StagingContext<Type = C::Type, Constant = C::Constant, Operation = C::Operation>,
+    {
         let seeds = seeds.into_parameters().collect::<Vec<_>>();
         let destinations = destinations.into_parameters().collect::<Vec<_>>();
-        let cotangents = self.apply_impl(seeds, &destinations)?;
-        Ok(Input::To::<Option<MaybeZero<C::Value>>>::from_parameters(self.input_structure.clone(), cotangents)?)
+        let cotangents = self.apply_impl(context, seeds, &destinations)?;
+        Ok(Input::To::<Option<MaybeZero<X::Value>>>::from_parameters(self.input_structure.clone(), cotangents)?)
     }
 
     /// Replays a scalar gradient pullback and returns non-reference values at every input position. Reference
@@ -1826,7 +1994,7 @@ impl<
         TracingContext<C::Constant, C::Operation>:
             StagingContext<Type = C::Type, Constant = C::Constant, Operation = C::Operation>,
     {
-        let cotangents = self.apply_impl(seeds, &destinations)?;
+        let cotangents = self.apply_impl::<C, SameContext>(&self.context, seeds, &destinations)?;
         let gradients = destinations
             .into_iter()
             .zip(cotangents)
@@ -1866,14 +2034,17 @@ impl<
 
     /// Validates and replays the provided flattened seeds and [`CotangentDestination`].
     /// Only non-reference [`Return`](CotangentDestination::Return) inputs produce values here;
-    /// [`Reference`](CotangentDestination::Reference) destinations are updated during replay,
-    /// and [`Ignore`](CotangentDestination::Ignore) inputs expose no result.
-    fn apply_impl(
+    /// [`Reference`](CotangentDestination::Reference) destinations are updated during replay, and
+    /// [`Ignore`](CotangentDestination::Ignore) inputs expose no result. The transposed program is
+    /// replayed in `context`, into which the retained residuals are imported.
+    fn apply_impl<X, Path>(
         &self,
-        seeds: Vec<CotangentSeed<C::Value>>,
-        destinations: &[CotangentDestination<C::Value>],
-    ) -> Result<Vec<Option<MaybeZero<C::Value>>>, ProgramError>
+        context: &X,
+        seeds: Vec<CotangentSeed<X::Value>>,
+        destinations: &[CotangentDestination<X::Value>],
+    ) -> Result<Vec<Option<MaybeZero<X::Value>>>, ProgramError>
     where
+        X: Context<Type = C::Type, Constant = C::Constant, Operation = C::Operation> + ImportingContext<C, Path>,
         C::Operation: TransposableOperation<C::Constant, C::Operation>
             + ResidualZeroProvider<C::Type, Operation = C::Operation>
             + ReferenceAccessOperation<
@@ -2023,7 +2194,7 @@ impl<
         // other destination. Identity, not generation, is compared: a primal reference that advanced generations after
         // the differentiated closure ran is still the same allocation and still rejected.
         self.primal_references.validate_differentiation_arguments(
-            &self.context,
+            context,
             destination_references
                 .iter()
                 .map(|&(index, reference)| (DifferentiationBoundaryPosition::Cotangent(index), reference)),
@@ -2050,12 +2221,14 @@ impl<
                 program_inputs.push(reference.clone());
             }
         }
-        program_inputs.extend(self.residuals.iter().cloned());
+        for residual in &self.residuals {
+            program_inputs.push(context.import(residual.clone())?);
+        }
         let cotangent_types =
             self.primal_input_types.iter().map(|r#type| r#type.cotangent()).collect::<Result<Vec<_>, _>>()?;
         let live_cotangent_types =
             cotangent_types.iter().filter(|r#type| !r#type.is_zero_space()).cloned().collect::<Vec<_>>();
-        let outputs = program.program().interpret_in_context(&self.context, program_inputs)?;
+        let outputs = program.program().interpret_in_context(context, program_inputs)?;
         let mut program_input_cotangents = program.assemble_cotangents(&live_cotangent_types, outputs)?.into_iter();
 
         // Restore type-omitted leaves without constructing values. Reference identity outputs are consumed by
@@ -6213,6 +6386,29 @@ pub(crate) mod tests {
             pullback.apply(Array::scalar(4.0).unwrap()),
             Ok((MaybeZero::Value(Array::scalar(8.0).unwrap()), MaybeZero::Value(Array::scalar(12.0).unwrap()))),
         );
+    }
+
+    #[test]
+    fn test_pullback_apply_in_context() {
+        // `f(left, right) = left * right` is differentiated once. Applied under a batching level, the pullback imports
+        // its residuals as replicated values and pulls a whole batch of cotangents back at once.
+        let function = |(left, right): (
+            LinearizationTracer<EagerContext<Array, ArrayOperation<Array>>>,
+            LinearizationTracer<EagerContext<Array, ArrayOperation<Array>>>,
+        )| Ok(left * right);
+        let (_, pullback) =
+            differentiate_at((Array::scalar(3.0).unwrap(), Array::scalar(2.0).unwrap())).vjp(function).unwrap();
+        let batched = batch(
+            |cotangent| {
+                let context = cotangent.context().clone();
+                pullback.apply_materialized_in_context(&context, cotangent)
+            },
+            Array::vector(vec![1.0, 4.0]).unwrap(),
+            BatchAxis::new(0),
+            (BatchAxis::new(0), BatchAxis::new(0)),
+            None,
+        );
+        assert_eq!(batched, Ok((Array::vector(vec![2.0, 8.0]).unwrap(), Array::vector(vec![3.0, 12.0]).unwrap())));
     }
 
     #[test]
