@@ -138,7 +138,13 @@ impl ArrayType {
 
     /// Returns this [`ArrayType`] with the provided [`Sharding`] replacing its current sharding metadata (or without
     /// any [`Sharding`] information when [`None`] is provided), after validating that any provided [`Sharding`] has the
-    /// same rank as [`Self::shape`].
+    /// same rank as [`Self::shape`] and references no [`MeshAxisType::Auto`] mesh axis (i.e.,
+    /// [`Sharding::references_auto_axis`] must return `false`).
+    ///
+    /// Array types record placement over explicit and manual mesh axes only. The partitioner owns placement over auto
+    /// mesh axes, so a type cannot promise it: placement over auto axes is either a compiler constraint (i.e.,
+    /// [`ConstrainSharding`](crate::ConstrainSharding)) or runtime metadata of a concrete array. Code that
+    /// derives a type from such a placement uses [`Sharding::without_auto_axes`] explicitly.
     #[inline]
     pub fn with_sharding<S: Into<Option<Sharding>>>(mut self, sharding: S) -> Result<Self, ShardingError> {
         let sharding = sharding.into();
@@ -147,6 +153,9 @@ impl ArrayType {
             let array_rank = self.shape.rank();
             if sharding_rank != array_rank {
                 return Err(ShardingError::ShardingRankMismatch { sharding_rank, array_rank });
+            }
+            if sharding.references_auto_axis() {
+                return Err(ShardingError::AutoAxisInArrayType { sharding: sharding.clone() });
             }
         }
         self.sharding = sharding;

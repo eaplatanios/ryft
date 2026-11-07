@@ -61,6 +61,12 @@ pub enum ShardingError {
     #[error("sharding rank ({sharding_rank}) does not match array rank ({array_rank})")]
     ShardingRankMismatch { sharding_rank: usize, array_rank: usize },
 
+    #[error(
+        "array types cannot record placement over auto mesh axes, but got sharding `{sharding}`; \
+         constrain the placement with `constrain_sharding` or use explicit mesh axes instead"
+    )]
+    AutoAxisInArrayType { sharding: Sharding },
+
     #[error("dimension index {dimension} is out of bounds for a sharding of rank {rank}")]
     DimensionOutOfBounds { dimension: usize, rank: usize },
 

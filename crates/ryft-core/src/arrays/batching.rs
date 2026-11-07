@@ -2695,11 +2695,13 @@ impl ArrayType {
         dimension: Dimension,
         axis_sharding: ShardingDimension,
     ) -> Result<Self, BatchingError> {
-        let mut batched = self.with_inserted_dimension(position, dimension)?;
-        if let Some(sharding) = self.sharding() {
-            batched.sharding = Some(sharding.batched(position, axis_sharding)?);
+        let batched = self.with_inserted_dimension(position, dimension)?;
+        match self.sharding() {
+            Some(sharding) => batched
+                .with_sharding(sharding.batched(position, axis_sharding)?)
+                .map_err(|error| BatchingError::MisalignedBatchAxes { message: error.to_string() }),
+            None => Ok(batched),
         }
-        Ok(batched)
     }
 
     /// Returns the unbatched per-item [`ArrayType`] obtained by removing `batch_axis` from this packed [`ArrayType`].
@@ -7808,21 +7810,14 @@ mod tests {
             )),
         );
 
-        // A non-batch dimension placed on an auto mesh axis passes through normalization untouched, but the resulting
-        // sharding is not a legal reshard target at all, so the swap would turn a placement relabel into a hard error.
-        let input = ArrayType::new(DataType::F32, Shape::new(vec![Dimension::Static(4), Dimension::Static(6)]))
-            .with_sharding(
-                Sharding::new(mesh, vec![ShardingDimension::replicated(), ShardingDimension::sharded(["a"])]).unwrap(),
-            )
-            .unwrap();
-        let normalized = normalized_batch_axis_type(&input, 0, &ShardingDimension::sharded(["m"])).unwrap().unwrap();
+        // Array types never name auto mesh axes, so normalization never produces a placement over them and the reshard
+        // rejection of auto targets is unreachable from here.
+        let sharding = Sharding::new(mesh, vec![ShardingDimension::replicated(), ShardingDimension::sharded(["a"])]);
+        let sharding = sharding.unwrap();
         assert_eq!(
-            ReshardOperation::new(normalized.sharding().unwrap().clone())
-                .infer_output_types(std::slice::from_ref(&input), &[]),
-            Err(TypeError::invalid(
-                "`reshard` cannot target auto mesh axes; use `constrain_sharding` to constrain placement over them"
-                    .to_string(),
-            )),
+            ArrayType::new(DataType::F32, Shape::new(vec![Dimension::Static(4), Dimension::Static(6)]))
+                .with_sharding(sharding.clone()),
+            Err(ShardingError::AutoAxisInArrayType { sharding }),
         );
     }
 
