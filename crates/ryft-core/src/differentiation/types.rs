@@ -4,7 +4,6 @@ use crate::arrays::{
 };
 use crate::batching::{BatchableOperation, BatchingContext, BatchingPolicy, RecursiveBatchingPolicy};
 use crate::contexts::{Context, ContextProjection, ProjectedContext, StagingContext};
-use crate::differentiation::projections::Projected;
 use crate::differentiation::{DerivativeTransform, DifferentiationError, DifferentiationParameterRole};
 use crate::operations::{
     Add, Broadcast, BroadcastOperation, Compare, ComparisonDirection, Fill, Iota, Mul, One, Reshape, Select, Slice,
@@ -495,13 +494,19 @@ where
 impl<C: ContextProjection<ArrayType, Type = ArrayIrType>> DenseDifferentiableType<C> for ArrayIrType
 where
     C::Constant: ValueProjection<DimensionType, Projected = DimensionValue>,
-    Projected<C, ArrayType>:
-        Add + Mul + Compare<Projected<C, ArrayType>> + Select + Broadcast + Reshape + Slice + Transpose,
-    ProjectedContext<C, ArrayType>: Context<Type = ArrayType, Value = Projected<C, ArrayType>>
-        + Zero<Projected<C, ArrayType>>
-        + One<Projected<C, ArrayType>>
-        + Iota<Projected<C, ArrayType>>
-        + Fill<u64, Projected<C, ArrayType>>,
+    <C::Value as ValueProjection<ArrayType>>::Projected: Add
+        + Mul
+        + Compare<<C::Value as ValueProjection<ArrayType>>::Projected>
+        + Select
+        + Broadcast
+        + Reshape
+        + Slice
+        + Transpose,
+    ProjectedContext<C, ArrayType>: Context<Type = ArrayType, Value = <C::Value as ValueProjection<ArrayType>>::Projected>
+        + Zero<<C::Value as ValueProjection<ArrayType>>::Projected>
+        + One<<C::Value as ValueProjection<ArrayType>>::Projected>
+        + Iota<<C::Value as ValueProjection<ArrayType>>::Projected>
+        + Fill<u64, <C::Value as ValueProjection<ArrayType>>::Projected>,
     ArrayIrBatchingPolicy:
         RecursiveBatchingPolicy<C> + BatchingPolicy<C, Batch = ArrayIrBatch<C::Value>, Extent = C::Value>,
 {
