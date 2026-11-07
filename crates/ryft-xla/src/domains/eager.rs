@@ -206,6 +206,21 @@ pub(super) struct EagerDispatchProgram<'c> {
     /// Session constants whose arrays the compiled program receives as hidden arguments ahead of the array inputs of
     /// the application (refer to [`SessionConstant`]). Their handles are part of the key, through its regions.
     session_constants: Arc<[SessionConstant]>,
+
+    /// Outputs of the application, in order. The compiled program returns the [`EagerOutput::Array`] outputs, in order.
+    outputs: Arc<[EagerOutput]>,
+}
+
+/// Output of an eager application.
+#[derive(Clone)]
+enum EagerOutput {
+    /// Array that the compiled program returns.
+    Array,
+
+    /// First-class dimension with a static type. Eager dimensions are host values with exact types, so such an output
+    /// (e.g., the batch extent that a batched loop threads through its carry) is rebuilt from its type on the host
+    /// rather than returned by the compiled program, which can only return arrays.
+    Dimension(DimensionValue),
 }
 
 /// Borrowed [`EagerDispatchKey`] over the arguments of one eager application, used to look up cache hits without
@@ -690,10 +705,20 @@ impl<'c> Domain<'c> {
             .map(|constant| self.session.constant(self, constant))
             .collect::<Result<Vec<_>, _>>()?;
         arguments.extend(array_inputs);
-        let outputs = self
+        let mut arrays = self
             .execute_program(&compiled.program, arguments)
-            .map_err(|error| ProgramError::InvalidArgument { message: error.to_string() })?;
-        Ok(outputs.into_iter().map(Value::Array).collect())
+            .map_err(|error| ProgramError::InvalidArgument { message: error.to_string() })?
+            .into_iter();
+        compiled
+            .outputs
+            .iter()
+            .map(|output| match output {
+                EagerOutput::Array => arrays.next().map(Value::Array).ok_or_else(|| {
+                    ProgramError::MalformedProgram("eager program returned fewer arrays than its outputs".to_string())
+                }),
+                EagerOutput::Dimension(value) => Ok(Value::Dimension(Dimension::new(value.clone(), self.clone()))),
+            })
+            .collect()
     }
 
     /// Traces one eager operation application into a single-instruction program over the inputs' physical types
@@ -738,10 +763,26 @@ impl<'c> Domain<'c> {
             builder.add_instruction(operation, region_ids, input_atoms, None)?.to_vec()
         };
         self.validate_eager_placement(array_inputs)?;
-        let output_count = output_atoms.len();
         let builder = Rc::try_unwrap(builder).map_err(|_| ProgramError::EscapedProgramBuilder)?.into_inner();
+        let outputs = output_atoms
+            .iter()
+            .map(|atom| -> Result<_, ProgramError> {
+                Ok(match builder.atoms()[atom.index()].r#type().as_ref() {
+                    ArrayIrType::Dimension(r#type) if let Some(extent) = r#type.extent() => {
+                        EagerOutput::Dimension(DimensionValue::constant(extent).map_err(TypeError::from)?)
+                    }
+                    _ => EagerOutput::Array,
+                })
+            })
+            .collect::<Result<Arc<[_]>, _>>()?;
+        let array_output_atoms = output_atoms
+            .into_iter()
+            .zip(outputs.iter())
+            .filter_map(|(atom, output)| matches!(output, EagerOutput::Array).then_some(atom))
+            .collect::<Vec<_>>();
+        let output_count = array_output_atoms.len();
         let program: FlatProgram =
-            builder.build(output_atoms, vec![Placeholder; array_inputs.len()], vec![Placeholder; output_count])?;
+            builder.build(array_output_atoms, vec![Placeholder; array_inputs.len()], vec![Placeholder; output_count])?;
 
         // Derive the mesh after tracing so that input-free operations can fall back to their inferred output
         // shardings, and then compile through the domain's compilation cache.
@@ -760,7 +801,7 @@ impl<'c> Domain<'c> {
             .compilation_context()
             .compile(self, &lowered)
             .map_err(|error| ProgramError::InvalidArgument { message: error.to_string() })?;
-        Ok(EagerDispatchProgram { program, session_constants: Arc::clone(&lowered.session_constants) })
+        Ok(EagerDispatchProgram { program, session_constants: Arc::clone(&lowered.session_constants), outputs })
     }
 
     /// Validates that every input lives on this domain's PJRT client and that all inputs share one device placement,

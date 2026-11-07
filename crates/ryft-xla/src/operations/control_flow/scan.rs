@@ -647,7 +647,7 @@ mod tests {
         PrintOperation, ProgramBatchingOutputAxesPolicy, RandomAlgorithm, ReferenceNewOperation,
         ReferenceReadOperation, ReferenceType, RngBitGeneratorOperation, ScanOptions, ShardMapBoundary,
         ShardMapOperation, Sharding, ShardingDimension, TracingContext, TransposedProgramCotangent, TypeError,
-        TypedProgram, WhileOperation, ZeroOperation, scan,
+        TypedProgram, WhileOperation, ZeroOperation, batch, scan,
     };
     use ryft_mlir::Location;
     use ryft_pjrt::{BufferType, ExecutionDeviceInputs, ExecutionInput, Layout, Program as PjrtProgram};
@@ -663,7 +663,8 @@ mod tests {
     use crate::operations::debugging::{ensure_print_handler_registered, with_captured_prints};
     use crate::tests::{execution_client, values_from_bytes, values_to_bytes};
     use crate::{
-        Array, CompiledFunction, FromPjrt, Options, Session, compile, compile_statefully, to_mlir_module_for_program,
+        Array, CompiledFunction, FromPjrt, Options, Session, Value, compile, compile_statefully,
+        to_mlir_module_for_program,
     };
 
     use super::*;
@@ -4104,5 +4105,50 @@ mod tests {
             })
             .collect::<Vec<_>>();
         assert_eq!(outputs, vec![vec![6.0], vec![1.0, 3.0, 6.0]]);
+    }
+
+    #[test]
+    fn test_scan_execution_batched_under_eager_parent() {
+        // Batching over eager array IR values threads the batch extent through the loop carry, so the batched scan that
+        // eager dispatch compiles returns that first-class dimension, which eager dispatch rebuilds on the host.
+        let client = execution_client();
+        let device = Device::from_pjrt(&client.addressable_devices().unwrap()[0]).unwrap();
+        let logical_mesh = LogicalMesh::new(vec![MeshAxis::new("x", 1, MeshAxisType::Auto).unwrap()]).unwrap();
+        let mesh = DeviceMesh::new(logical_mesh, vec![device]).unwrap();
+        let domain = Session::new(&client).domain();
+        let value = |dimensions: &[usize], values: &[f32]| {
+            let r#type = ArrayType::new_static(DataType::F32, dimensions.to_vec())
+                .with_sharding(Sharding::replicated(mesh.logical_mesh().clone(), dimensions.len()))
+                .unwrap();
+            Value::Array(
+                Array::from_host_buffer(&domain, r#type, mesh.clone(), values_to_bytes(values).as_slice()).unwrap(),
+            )
+        };
+        let read = |value: Value<'_>| {
+            let Value::Array(array) = value else { panic!("expected an array result") };
+            let shard = array.addressable_shards().next().unwrap();
+            let bytes = shard.buffer().unwrap().copy_to_host(None).unwrap().r#await().unwrap();
+            (array.shape().dimensions().to_vec(), values_from_bytes::<f32>(bytes.as_slice()))
+        };
+        let (carry, prefixes) = batch(
+            |(carry, items)| {
+                scan(
+                    |_, sum, item| {
+                        let sum = sum.add(&item)?;
+                        Ok((sum.clone(), sum))
+                    },
+                    carry,
+                    items,
+                    ScanOptions::new(),
+                )
+            },
+            (value(&[2], &[0.0, 10.0]), value(&[2, 3], &[1.0, 2.0, 3.0, 4.0, 5.0, 6.0])),
+            (BatchAxis::new(0), BatchAxis::new(0)),
+            (BatchAxis::new(0), BatchAxis::new(0)),
+            None,
+        )
+        .unwrap();
+        assert_eq!(read(carry), (vec![2], vec![6.0, 25.0]));
+        assert_eq!(read(prefixes), (vec![2, 3], vec![1.0, 3.0, 6.0, 14.0, 19.0, 25.0]));
     }
 }

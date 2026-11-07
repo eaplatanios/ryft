@@ -504,10 +504,10 @@ mod tests {
     use indoc::{formatdoc, indoc};
     use pretty_assertions::assert_eq;
     use ryft_core::{
-        AddOperation, AssertOperation, CompareOperation, Dimension as CoreDimension, DimensionBounds,
-        DimensionSizeOperation, DimensionType, DimensionVariable, DynamicBroadcastOperation, MeshAxisType,
-        NegOperation, OneLikeOperation, Placeholder, PrintOperation, Shape, Sharding, ShardingDimension, SubOperation,
-        TypedProgram,
+        Add, AddOperation, AssertOperation, BatchAxis, Compare, CompareOperation, Device, DeviceMesh,
+        Dimension as CoreDimension, DimensionBounds, DimensionSizeOperation, DimensionType, DimensionVariable,
+        DynamicBroadcastOperation, LogicalMesh, MeshAxis, MeshAxisType, NegOperation, OneLikeOperation, Placeholder,
+        PrintOperation, Shape, Sharding, ShardingDimension, SubOperation, TypedProgram, WhileOptions, batch, r#while,
     };
 
     use crate::experimental::lowering::tests::{
@@ -518,8 +518,8 @@ mod tests {
         compare, execute_on_two_devices, lowered_mixed_module, positive, two_device_mesh,
     };
     use crate::operations::debugging::{ensure_print_handler_registered, with_captured_prints};
-    use crate::tests::execution_client;
-    use crate::to_mlir_module_for_program;
+    use crate::tests::{execution_client, values_from_bytes, values_to_bytes};
+    use crate::{Array, FromPjrt, Session, Value, to_mlir_module_for_program};
 
     use super::*;
 
@@ -1558,5 +1558,47 @@ mod tests {
             ),
             vec![vec![vec![-1.0, -2.0, -3.0, -4.0]], vec![vec![-5.0, -6.0, -7.0, -8.0]]],
         );
+    }
+
+    #[test]
+    fn test_while_execution_batched_under_eager_parent() {
+        // Batching over eager array IR values threads the batch extent through the loop state, so the batched loop that
+        // eager dispatch compiles returns that first-class dimension, which eager dispatch rebuilds on the host.
+        let client = execution_client();
+        let device = Device::from_pjrt(&client.addressable_devices().unwrap()[0]).unwrap();
+        let logical_mesh = LogicalMesh::new(vec![MeshAxis::new("x", 1, MeshAxisType::Auto).unwrap()]).unwrap();
+        let mesh = DeviceMesh::new(logical_mesh, vec![device]).unwrap();
+        let domain = Session::new(&client).domain();
+        let value = |dimensions: &[usize], values: &[f32]| {
+            let r#type = ArrayType::new_static(DataType::F32, dimensions.to_vec())
+                .with_sharding(Sharding::replicated(mesh.logical_mesh().clone(), dimensions.len()))
+                .unwrap();
+            Value::Array(
+                Array::from_host_buffer(&domain, r#type, mesh.clone(), values_to_bytes(values).as_slice()).unwrap(),
+            )
+        };
+        let read = |value: Value<'_>| {
+            let Value::Array(array) = value else { panic!("expected an array result") };
+            let shard = array.addressable_shards().next().unwrap();
+            let bytes = shard.buffer().unwrap().copy_to_host(None).unwrap().r#await().unwrap();
+            (array.shape().dimensions().to_vec(), values_from_bytes::<f32>(bytes.as_slice()))
+        };
+        let (state, limit) = batch(
+            |(state, limit)| {
+                r#while(
+                    |(state, limit)| state.less_than(&limit),
+                    |(state, limit)| Ok((state.add(&state)?, limit)),
+                    (state, limit),
+                    WhileOptions::new(),
+                )
+            },
+            (value(&[3], &[1.0, 1.0, 1.0]), value(&[3], &[1.0, 8.0, 20.0])),
+            (BatchAxis::new(0), BatchAxis::new(0)),
+            (BatchAxis::new(0), BatchAxis::new(0)),
+            None,
+        )
+        .unwrap();
+        assert_eq!(read(state), (vec![3], vec![1.0, 8.0, 32.0]));
+        assert_eq!(read(limit), (vec![3], vec![1.0, 8.0, 20.0]));
     }
 }

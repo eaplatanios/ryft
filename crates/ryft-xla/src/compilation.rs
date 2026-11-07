@@ -1335,6 +1335,20 @@ where
         self.function.compiled_program().mesh()
     }
 
+    /// Returns the [`Options`] with which functions derived from this one (e.g., its gradient) are compiled. They keep
+    /// the options that select how programs lower (i.e., the mesh, the kernel compiler, and the ragged dot lowering
+    /// strategy) and drop the ones that describe this function's own signature or executable (i.e., its input and
+    /// output shardings, donation flags, input bound bucketing, and feedback-directed profile), which do not apply to a
+    /// derived function.
+    fn derived_options(&self) -> Options {
+        let options = self.function.staged().options();
+        Options {
+            kernel_compiler: options.kernel_compiler.clone(),
+            ragged_dot_lowering_strategy: options.ragged_dot_lowering_strategy,
+            ..Options::new(self.mesh().clone())
+        }
+    }
+
     /// Calls this compiled function as a `jit_call` operation in the array IR context recovered from `inputs`, exactly
     /// as [`StagedFunction::call`] calls its retained staged function. Under the eager [`Domain`], the call executes
     /// through eager dispatch rather than through the retained executable, so use [`ExecutableFunction::execute`] to
@@ -1489,7 +1503,7 @@ where
             Vec::new(),
             input_signature,
             domain,
-            Options::new(mesh),
+            self.derived_options(),
         )?;
         *self.derived.gradient.lock().expect("derived-gradient retention slot mutex poisoned") =
             Some((DomainWitness::new(domain), compiled.function.clone()));
@@ -1617,7 +1631,7 @@ where
             Vec::new(),
             (input_signature, tangent_signature),
             domain,
-            Options::new(mesh),
+            self.derived_options(),
         )?;
         *self.derived.jvp.lock().expect("derived-jvp retention slot mutex poisoned") =
             Some((DomainWitness::new(domain), compiled.function.clone()));
@@ -1768,7 +1782,7 @@ where
             Vec::new(),
             batched_input_types,
             domain,
-            Options::new(self.mesh().clone()),
+            self.derived_options(),
         )
     }
 }
