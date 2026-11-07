@@ -38,7 +38,7 @@ use crate::operations::jit_call::{JitCallFunctionMap, collect_jit_call_functions
 use crate::operations::manipulation::broadcasting::broadcast_changes_explicit_sharding;
 use crate::operations::manipulation::conversions::cast_changes_explicit_placement;
 use crate::operations::manipulation::memory::memory_placement_kind;
-use crate::sharding::SHARDY_MESH_SYMBOL_NAME;
+use crate::sharding::{SHARDY_MESH_SYMBOL_NAME, shardy_tensor_sharding_attribute};
 use crate::{Error, RaggedDotLoweringStrategy, ToMlir};
 
 #[cfg(test)]
@@ -1199,6 +1199,7 @@ where
         target_platform,
         &[],
         RaggedDotLoweringStrategy::default(),
+        &[],
         false,
     )
 }
@@ -1241,11 +1242,14 @@ where
         None,
         &[],
         RaggedDotLoweringStrategy::default(),
+        &[],
         false,
     )
 }
 
-/// Lowers a discharged program with logical external reference-state aliases on its entry boundary.
+/// Lowers a discharged program with logical external reference-state aliases on its entry boundary. The results
+/// flagged in `open_results` (one flag per logical output, or none at all) are lowered open over auto mesh axes, so that
+/// the compiler chooses their placement over those axes.
 ///
 /// `reference_states` are the discharge artifact's external-state recipes; each must name a distinct logical state
 /// input. Each state input must survive the executable boundary. A mutated state must be a static device array and
@@ -1274,6 +1278,7 @@ pub(crate) fn lower_mlir_module_for_program_with_reference_state<
     target_platform: Option<&str>,
     reference_states: &[ExternalReferenceBinding],
     ragged_dot_lowering_strategy: RaggedDotLoweringStrategy,
+    open_results: &[bool],
 ) -> Result<LoweredModule, Error>
 where
     Input: Parameterized<ArrayType>,
@@ -1294,6 +1299,7 @@ where
         target_platform,
         reference_states,
         ragged_dot_lowering_strategy,
+        open_results,
         true,
     )
 }
@@ -1350,6 +1356,7 @@ fn lower_mlir_module_for_program_with_effect_boundary<
     target_platform: Option<&str>,
     reference_states: &[ExternalReferenceBinding],
     ragged_dot_lowering_strategy: RaggedDotLoweringStrategy,
+    open_results: &[bool],
     export_effects: bool,
 ) -> Result<LoweredModule, Error>
 where
@@ -1581,10 +1588,18 @@ where
         .iter()
         .map(|sharding| sharding.as_ref().map(|sharding| sharding.to_mlir(location)).transpose())
         .collect::<Result<Vec<_>, _>>()?;
+    // Results whose placement over auto mesh axes the compiler chooses are open over those axes, like JAX lowers the
+    // shardings of output types without `out_shardings` (refer to `shardy_tensor_sharding_attribute`).
+    let physical_open_results =
+        if open_results.is_empty() { Vec::new() } else { signature.project_outputs(open_results) };
     let mut result_sharding_attributes = signature
         .physical_optional_output_shardings(result_shardings)
         .iter()
-        .map(|sharding| sharding.as_ref().map(|sharding| sharding.to_mlir(location)).transpose())
+        .enumerate()
+        .map(|(index, sharding)| {
+            let open = physical_open_results.get(index).copied().unwrap_or(false);
+            sharding.as_ref().map(|sharding| shardy_tensor_sharding_attribute(sharding, location, open)).transpose()
+        })
         .collect::<Result<Vec<_>, _>>()?;
     // The effect token of a signature side is annotated when any value of that side is, as each device threads its
     // own token.

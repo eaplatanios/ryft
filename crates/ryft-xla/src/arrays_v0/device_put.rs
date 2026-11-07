@@ -53,9 +53,8 @@ impl<'c, T: DenseHostDevicePutLeaf + Parameter> DevicePutLeaf<'c> for T {
             }
         };
         let r#type =
-            ArrayType::new(element_type, Shape::new(shape.iter().copied().map(CoreDimension::Static).collect()))
-                .with_sharding(sharding)?;
-        Array::from_host_buffer(engine, r#type, mesh, bytes.as_slice())
+            ArrayType::new(element_type, Shape::new(shape.iter().copied().map(CoreDimension::Static).collect()));
+        Array::from_host_buffer_with_sharding(engine, r#type, sharding, mesh, bytes.as_slice())
     }
 }
 

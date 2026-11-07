@@ -511,8 +511,8 @@ mod tests {
     use pretty_assertions::assert_eq;
     use ryft_core::{
         AddOperation, ArrayOperation, AtomId, CompareOperation, ComparisonDirection, ConditionOperation, Device,
-        DeviceMesh, LogicalMesh, MeshAxis, Placeholder, PrintOperation, ScanOperation, TypedProgram, WhileOperation,
-        ZeroLikeOperation,
+        DeviceMesh, LogicalMesh, MeshAxis, Placeholder, PrintOperation, ScanOperation, Sharding, TypedProgram,
+        WhileOperation, ZeroLikeOperation,
     };
     use ryft_mlir::Location;
     use ryft_pjrt::{Client, ClientOptions, CpuClientOptions, Program as PjrtProgram, load_cpu_plugin};
@@ -670,12 +670,13 @@ mod tests {
     }
 
     /// Compiles the SPMD `module` for the devices of a [`two_device_mesh`], executes it on global `f32` inputs of the
-    /// given types and values, and returns the `f32` shard of each output on each device.
+    /// given types, runtime placements (which default to those of the types), and values, and returns the `f32` shard
+    /// of each output on each device.
     pub(super) fn execute_on_two_devices(
         client: &Client<'static>,
         mesh: &DeviceMesh,
         module: &str,
-        inputs: &[(&ArrayType, &[f32])],
+        inputs: &[(&ArrayType, Option<&Sharding>, &[f32])],
     ) -> Vec<Vec<Vec<f32>>> {
         let executable = client
             .compile(&PjrtProgram::Mlir { bytecode: module.as_bytes().to_vec() }, &test_spmd_compilation_options(2))
@@ -689,8 +690,15 @@ mod tests {
             .collect::<Vec<_>>();
         let inputs = inputs
             .iter()
-            .map(|(r#type, values)| {
-                Array::from_host_buffer(&domain, (*r#type).clone(), mesh.clone(), values_to_bytes(values)).unwrap()
+            .map(|(r#type, sharding, values)| {
+                let (r#type, mesh, bytes) = ((*r#type).clone(), mesh.clone(), values_to_bytes(values));
+                match sharding {
+                    Some(sharding) => {
+                        Array::from_host_buffer_with_sharding(&domain, r#type, (*sharding).clone(), mesh, bytes)
+                    }
+                    None => Array::from_host_buffer(&domain, r#type, mesh, bytes),
+                }
+                .unwrap()
             })
             .collect();
         let arguments = Array::into_execute_arguments(inputs, device_ids.as_slice()).unwrap();

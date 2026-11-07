@@ -189,6 +189,7 @@ impl ExecutionPlan {
         executable: &LoadedExecutable<'_>,
         input_types: &[ArrayType],
         output_types: &[ArrayType],
+        output_shardings: &[Sharding],
         signature: &ExecutableSignature,
         donation_flags: &[bool],
         capture_count: usize,
@@ -266,22 +267,23 @@ impl ExecutionPlan {
         // to, so XLA chooses the placement of such outputs. Their buffers are validated by the general constructor
         // instead. Every placement on a single device holds the whole array, so it is always fixed.
         let declared_placement = mesh.devices().len() == 1
-            || output_types.iter().all(|output_type| {
-                output_type.sharding().is_some_and(|sharding| {
+            || output_types.iter().all(|output_type| output_type.sharding().is_some())
+                && output_shardings.iter().all(|sharding| {
                     !sharding.dimensions().iter().any(|dimension| matches!(dimension, ShardingDimension::Unconstrained))
-                })
-            });
+                });
         let output_layouts = if static_outputs && declared_placement {
             let mesh = Arc::new(mesh.clone());
             Some(
                 output_types
                     .iter()
-                    .map(|output_type| {
-                        let output_type = match output_type.sharding() {
-                            Some(_) => output_type.clone(),
-                            None => output_type.replicated(mesh.as_ref())?,
-                        };
-                        Ok(ArrayOutputLayout::new(output_type, Arc::clone(&mesh), &addressable_device_ids)?)
+                    .zip(output_shardings)
+                    .map(|(output_type, sharding)| {
+                        Ok(ArrayOutputLayout::new(
+                            output_type.clone(),
+                            Some(sharding.clone()),
+                            Arc::clone(&mesh),
+                            &addressable_device_ids,
+                        )?)
                     })
                     .collect::<Result<Vec<_>, Error>>()?,
             )
@@ -1599,6 +1601,7 @@ fn reconstruct_compiled_outputs<'c>(
         let scalar = Array::from_canonical_addressable_buffers(
             domain,
             scalar_type.clone(),
+            None,
             program.mesh.clone(),
             physical_output,
         )?
@@ -1644,13 +1647,10 @@ fn reconstruct_compiled_outputs<'c>(
                         })
                         .collect::<Result<Vec<_>, _>>()?;
                     let output_type = output_type.clone().with_shape(Shape::new(dimensions));
-                    let output_type = match output_type.sharding() {
-                        Some(_) => output_type,
-                        None => output_type.replicated(&program.mesh)?,
-                    };
                     Ok(Array::from_canonical_addressable_buffers(
                         domain,
                         output_type,
+                        Some(program.output_shardings[logical_index].clone()),
                         program.mesh.clone(),
                         physical_outputs.get_mut(physical_index).and_then(Option::take).ok_or_else(|| {
                             ProgramError::MalformedProgram(format!(
@@ -1661,7 +1661,12 @@ fn reconstruct_compiled_outputs<'c>(
                     )?
                     .with_execution_fence(fence.clone()))
                 }
-                None => Ok(Array::from_zero_space(domain, output_type.clone(), program.mesh.clone())?
+                None => Ok(Array::from_zero_space(
+                    domain,
+                    output_type.clone(),
+                    Some(program.output_shardings[logical_index].clone()),
+                    program.mesh.clone(),
+                )?
                     .with_execution_fence(fence.clone())),
             }
         })
@@ -2181,7 +2186,13 @@ mod tests {
         let client = plugin
             .client(ClientOptions::CPU(CpuClientOptions { device_count: Some(4), ..Default::default() }))
             .unwrap();
-        let mesh = domain_mesh(&client, "x", 4);
+        // Executable signatures record placement over explicit mesh axes only, so the sharded inputs use an explicit
+        // axis.
+        let mesh = DeviceMesh::new(
+            LogicalMesh::new(vec![MeshAxis::new("x", 4, MeshAxisType::Explicit).unwrap()]).unwrap(),
+            client.addressable_devices().unwrap().iter().map(|device| Device::from_pjrt(device).unwrap()).collect(),
+        )
+        .unwrap();
         let domain = Session::new(&client).domain();
         let sharding = Sharding::new(mesh.logical_mesh().clone(), vec![ShardingDimension::sharded(["x"])]).unwrap();
         let declared_type = ArrayType::new(
@@ -2764,14 +2775,15 @@ mod tests {
             .unwrap();
         let mesh = domain_mesh(&client, "x", 4);
         let domain = Session::new(&client).domain().with_mesh(mesh.clone());
+        // Types record no placement over auto mesh axes, so the placements are input and output sharding overrides.
         let sharding = Sharding::new(mesh.logical_mesh().clone(), vec![ShardingDimension::sharded(["x"])]).unwrap();
-        let input_type = ArrayType::new(DataType::F32, Shape::new(vec![CoreDimension::Static(8)]))
-            .with_sharding(sharding)
-            .unwrap();
+        let input_type = ArrayType::new(DataType::F32, Shape::new(vec![CoreDimension::Static(8)]));
         let staged = crate::stage::<_, ArrayType, ArrayType>(
             |input| input.clone() + input,
             input_type.clone(),
-            Options::new(mesh.clone()),
+            Options::new(mesh.clone())
+                .with_input_shardings(vec![sharding.clone()])
+                .with_output_shardings(vec![sharding.clone()]),
         )
         .unwrap()
         .into_inner();
@@ -2782,9 +2794,10 @@ mod tests {
         // Outputs are built from the program's planned layouts, which place every shard like the validating
         // constructors do and are shared by the outputs of every execution.
         let values = (0..8).map(|value| value as f32).collect::<Vec<_>>();
-        let input = Array::from_host_buffer(
+        let input = Array::from_host_buffer_with_sharding(
             &domain,
-            input_type.clone(),
+            input_type,
+            sharding.clone(),
             mesh.clone(),
             values_to_bytes(values.as_slice()).as_slice(),
         )
@@ -2799,7 +2812,8 @@ mod tests {
         let output = call();
         let other_output = call();
         output.block_until_ready().unwrap();
-        assert_eq!(output.r#type().as_ref(), &input_type);
+        assert_eq!(output.r#type(), input.r#type());
+        assert_eq!(output.sharding(), &sharding);
         assert_eq!(output.mesh(), &mesh);
         assert_eq!(
             output.shards().iter().map(|shard| shard.descriptor()).collect::<Vec<_>>(),
@@ -2993,22 +3007,23 @@ mod tests {
         assert_eq!(domain.program_count(), 1);
 
         // Dynamic tensor partitioning remains an explicit backend limitation rather than silently changing a user's
-        // requested placement to replication.
+        // requested placement to replication. Types record no placement over auto mesh axes, so that placement is an
+        // input sharding override.
         let extent = DimensionVariable::new("extent", DimensionBounds::new(1, Some(8)).unwrap());
-        let sharded_type =
-            ArrayType::new(DataType::F32, Shape::new(vec![CoreDimension::Static(4), CoreDimension::Dynamic(extent)]))
-                .with_sharding(
-                    Sharding::new(
-                        mesh.logical_mesh().clone(),
-                        vec![ShardingDimension::sharded(["x"]), ShardingDimension::replicated()],
-                    )
-                    .unwrap(),
-                )
-                .unwrap();
-        let staged =
-            crate::stage::<_, ArrayType, ArrayType>(|input| input.clone() + input, sharded_type, Options::new(mesh))
-                .unwrap()
-                .into_inner();
+        let dynamic_type =
+            ArrayType::new(DataType::F32, Shape::new(vec![CoreDimension::Static(4), CoreDimension::Dynamic(extent)]));
+        let sharded = Sharding::new(
+            mesh.logical_mesh().clone(),
+            vec![ShardingDimension::sharded(["x"]), ShardingDimension::replicated()],
+        )
+        .unwrap();
+        let staged = crate::stage::<_, ArrayType, ArrayType>(
+            |input| input.clone() + input,
+            dynamic_type,
+            Options::new(mesh).with_input_shardings(vec![sharded]),
+        )
+        .unwrap()
+        .into_inner();
         let Err(error) = staged.lower(&domain) else {
             panic!("bounded-dynamic sharded program unexpectedly lowered");
         };

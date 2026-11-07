@@ -14,18 +14,35 @@ use crate::tracing::DomainTracingContext;
 /// Default number of compiled specializations retained by one [`CompiledFunctionDispatcher`].
 const DEFAULT_JIT_CACHE_CAPACITY: usize = 256;
 
-/// Purpose of a [`CompilationDomain::dispatch_signature`] request, which determines whether dispatch policies that
-/// change the staged types (e.g., bounded shape bucketing) may apply.
-#[derive(Copy, Clone, Debug, PartialEq, Eq, Hash)]
-pub enum DispatchPurpose {
-    /// Signature for an unlowered function called through its caller's context. The callee is lowered and dispatched
-    /// as part of the enclosing computation when compiled. Callers use only the staged types of this signature and
-    /// ignore its dispatch key, because staged specializations are keyed by those types.
-    Staging,
+/// Inputs used to derive a [`CompilationDomain::dispatch_signature`]. [`Self::Types`] requests a staged call within an
+/// enclosing computation. [`Self::Values`] requests an independently dispatched executable and makes runtime metadata
+/// available to its specialization policy. The iterator and its values have separate borrow lifetimes so a short-lived
+/// iterator can visit longer-lived values.
+pub enum DispatchInputs<'o, 'v, V: Value + 'v> {
+    /// Abstract input types of a staged call. Executable policies such as input-bound bucketing do not apply.
+    Types(Vec<V::Type>),
 
-    /// Specialization of an independently dispatched executable (i.e., a call of a retained dispatcher that executes
-    /// its own compiled program).
-    Executable,
+    /// Runtime inputs of an independently dispatched executable and their effective types.
+    Values {
+        /// Runtime input values, in the same order and number as `types`.
+        values: &'o mut dyn Iterator<Item = &'v V>,
+
+        /// Effective types validated by the caller against `values`, including any
+        /// [`declared staging types`](CompiledFunctionDispatcher::with_staged_input_types). A concrete extent may
+        /// therefore be represented by a symbolic dimension here, which extracting raw value types cannot recover.
+        types: Vec<V::Type>,
+    },
+}
+
+impl<V: Value> DispatchInputs<'_, '_, V> {
+    /// Consumes this request and returns its effective input types, discarding any runtime value iterator.
+    /// Backends whose dispatch policies depend only on types can use this function for both request variants.
+    #[inline]
+    pub fn into_types(self) -> Vec<V::Type> {
+        match self {
+            Self::Types(types) | Self::Values { types, .. } => types,
+        }
+    }
 }
 
 /// [`CompilationDomain`]s are [`Domain`]s that support lowering, compiling, and executing staged programs.
@@ -34,7 +51,7 @@ pub enum DispatchPurpose {
 ///   1. [`StagedProgram::stage`] traces a flat closure into a [`StagedProgram`], typically through
 ///      [`StagedFunction::stage`] or [`Compile::stage`] for typed callers.
 ///   2. [`Self::lower`] lowers a [`StagedProgram`] into a [`Self::LoweredProgram`], typically through
-///      [`StagedFunction::lower`](crate::StagedFunction::lower).
+///      [`StagedFunction::lower`](StagedFunction::lower).
 ///   3. [`Self::compile`] compiles a [`Self::LoweredProgram`] into a [`Self::CompiledProgram`], typically
 ///      through [`LoweredFunction::compile`](crate::LoweredFunction::compile).
 ///   4. [`Self::execute`] executes a [`Self::CompiledProgram`] on flat runtime inputs, typically through
@@ -65,30 +82,30 @@ pub trait CompilationDomain: Domain<Constant: CaptureConstant> + Clone {
     /// which is why it requires [`From<ProgramError>`].
     type Error: std::error::Error + From<ProgramError>;
 
-    /// Derives the types at which a function is staged for one runtime input signature, together with their dispatch
-    /// key, for the provided [`DispatchPurpose`]. Both purposes apply the semantic declarations of `options` (e.g., the
-    /// input shardings that they request). A [`DispatchPurpose::Executable`] specialization may additionally apply a
-    /// semantics preserving dispatch policy such as bounded shape bucketing, which changes the types that are traced as
-    /// well as the key. A [`DispatchPurpose::Staging`] specialization is staged within its caller and lowered with the
-    /// enclosing computation, so it never applies such a policy. Its key is unused, because staged specializations
-    /// are keyed by their staged types. Most domains return the input types unchanged for both purposes and use them
-    /// as the key. This function needs no domain instance, because a dispatcher that infers its domain from its inputs
-    /// may not have selected one yet when it stages a call.
+    /// Derives the dispatch key, effective staged input types, and optional specialized options for `inputs`.
+    /// [`DispatchInputs::Types`] requests a staged call that is lowered with its enclosing computation, so its
+    /// signature applies semantic declarations from `options` but no executable policy. Its returned dispatch key
+    /// is unused because staged specializations are keyed by their effective types. [`DispatchInputs::Values`]
+    /// requests an independently dispatched executable, so it may additionally apply a semantics preserving policy
+    /// such as input-bound bucketing or specialize on runtime metadata absent from the types, such as placement over
+    /// auto mesh axes. Such metadata must participate in both the key and the specialized options used for lowering.
     ///
-    /// The returned key must compare equal exactly when the returned types are interchangeable for tracing, lowering,
-    /// compilation, and calls. The types are returned as a shared slice so that key construction on the hot path of
-    /// retained dispatch never clones the type vector deeply. Domains whose key embeds the types (e.g., exact dispatch)
-    /// share one allocation between the key and the returned types, and the caller clones individual types only on a
-    /// specialization miss, when it prepares the staging request.
+    /// Returning [`None`] for the specialized options uses `options` unchanged. Equal keys must identify types
+    /// and options that are interchangeable for tracing, lowering, compilation, and calls. The shared type slice lets
+    /// exact dispatch share one allocation with its key, avoiding deep type clones on specialization hits. Most
+    /// backends preserve the requested types and return no specialized options. For type requests, equal effective
+    /// types must also imply interchangeable specialized options because staged calls are keyed by those types.
+    ///
+    /// This function needs no domain instance because staging a call does not require a retained dispatcher to have
+    /// selected its execution domain.
     ///
     /// # Errors
     ///
-    /// Returns an error when `options` are incompatible with `input_types` or with `purpose`.
+    /// Returns an error when `options` are incompatible with `inputs` or their dispatch policy.
     fn dispatch_signature(
-        input_types: Vec<Self::Type>,
+        inputs: DispatchInputs<'_, '_, Self::Value>,
         options: &Self::Options,
-        purpose: DispatchPurpose,
-    ) -> Result<(Self::DispatchKey, Arc<[Self::Type]>), Self::Error>;
+    ) -> Result<(Self::DispatchKey, Arc<[Self::Type]>, Option<Self::Options>), Self::Error>;
 
     /// Lowers `staged` into the lowered program representation of this backend. Callers typically use
     /// [`StagedFunction::lower`] rather than calling this function directly. The lowered program must capture every
@@ -488,7 +505,7 @@ mod tests {
     use indoc::indoc;
     use pretty_assertions::assert_eq;
 
-    use crate::arrays::{Array, ArrayType, DataType};
+    use crate::arrays::{Array, ArrayType, DataType, Dimension, DimensionBounds, DimensionVariable, Shape};
     use crate::compilation::functions::{CompilationTracer, CompiledFunctionDispatcher};
     use crate::compilation::tests::{
         CarriedArray, CarriedDomain, CarriedOptions, TestDomain, compile_from_one_call_site,
@@ -496,6 +513,33 @@ mod tests {
     use crate::operations::NegOperation;
 
     use super::*;
+
+    #[test]
+    fn test_dispatch_inputs_into_types() {
+        let input = Array::vector(vec![1f32, 2.0]).unwrap();
+        let declared = ArrayType::new(
+            DataType::F32,
+            Shape::new(vec![Dimension::Dynamic(DimensionVariable::new(
+                "items",
+                DimensionBounds::new(0, Some(5)).unwrap(),
+            ))]),
+        );
+        assert_eq!(DispatchInputs::<Array>::Types(vec![declared.clone()]).into_types(), vec![declared.clone()]);
+
+        // Runtime dispatch retains the validated declaration rather than re-extracting a concrete extent of 2.
+        let mut values = std::iter::once(&input);
+        assert_eq!(
+            DispatchInputs::Values { values: &mut values, types: vec![declared.clone()] }.into_types(),
+            vec![declared],
+        );
+        assert_eq!(values.next(), Some(&input));
+
+        assert_eq!(DispatchInputs::<Array>::Types(Vec::new()).into_types(), Vec::<ArrayType>::new());
+        assert_eq!(
+            DispatchInputs::<Array>::Values { values: &mut std::iter::empty(), types: Vec::new() }.into_types(),
+            Vec::<ArrayType>::new(),
+        );
+    }
 
     #[test]
     fn test_compile_stage() {

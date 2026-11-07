@@ -66,8 +66,8 @@ pub(crate) fn reshard_with_donation<'o>(
     donate: bool,
 ) -> Result<Array<'o>, Error> {
     if source.data_type().is_zero() {
-        let r#type = source.r#type().into_owned().with_sharding(dst_sharding.clone())?;
-        let mut output = Array::from_zero_space(engine, r#type, dst_mesh.clone())?;
+        let r#type = source.r#type().into_owned().with_sharding(None)?;
+        let mut output = Array::from_zero_space(engine, r#type, Some(dst_sharding.clone()), dst_mesh.clone())?;
         if let Some(fence) = source.execution_fence() {
             output = output.with_execution_fence(fence.clone());
         }
@@ -126,16 +126,10 @@ fn try_same_mesh<'o>(
     // `sdy.sharding` attributes via `Options::{input_shardings, output_shardings}`.
     let bare_input_type = ArrayType::new(element_type, shape.clone().into());
 
-    let options = Options {
-        kernel_compiler: None,
-        mesh: dst_mesh.clone(),
-        input_shardings: Some(vec![src_sharding.clone()]),
-        output_shardings: Some(vec![dst_sharding.clone()]),
-        donation_flags: Some(vec![donate]),
-        feedback_directed_profile: None,
-        input_bound_bucketing: None,
-        ragged_dot_lowering_strategy: Default::default(),
-    };
+    let options = Options::new(dst_mesh.clone())
+        .with_input_shardings(vec![src_sharding.clone()])
+        .with_output_shardings(vec![dst_sharding.clone()])
+        .with_donate(donate);
 
     let staged: crate::StagedFunction<'_, ArrayType, ArrayType> =
         crate::stage(|input| input, bare_input_type, options)?;

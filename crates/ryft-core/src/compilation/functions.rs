@@ -9,7 +9,7 @@ use std::time::{Duration, Instant};
 
 use crate::axes::{MeshContext, NamedAxes};
 use crate::captures::{CapturingContext, ClosedProgram, ImportingContext};
-use crate::compilation::domains::{CompilationDomain, DispatchPurpose, StatefulCompilationDomain};
+use crate::compilation::domains::{CompilationDomain, DispatchInputs, StatefulCompilationDomain};
 use crate::compilation::operations::StagedCallOperation;
 use crate::contexts::{Context, Domain, StagingContext};
 use crate::macros::{check_builders, check_count};
@@ -1016,13 +1016,15 @@ where
 ///     Keying on the structure rather than on the flattened leaves also distinguishes inputs that differ only in
 ///     _empty_ substructure, which flat leaf paths and flat leaf types cannot see.
 ///   - **Dispatch Key:** The [`CompilationDomain::DispatchKey`] that [`CompilationDomain::dispatch_signature`] derives
-///     from the runtime input types. It may be an exact abstract input signature or a normalized equivalence-class key
-///     such as a shape bucket. Equal dispatch keys must guarantee that the retained executable can safely serve either
-///     call, while unequal keys conservatively separate specializations.
+///     from the runtime inputs and their types. It may be an exact abstract input signature (possibly extended with
+///     runtime facts that types do not record, such as the placement of arrays over auto mesh axes) or a normalized
+///     equivalence-class key such as a shape bucket. Equal dispatch keys must guarantee that the retained executable
+///     can safely serve either call, while unequal keys conservatively separate specializations.
 ///
 /// Equal keys must identify calls that can safely share the same staged [`Program`](crate::Program). Unequal keys
 /// remain separate even if they happen to stage structurally equivalent programs. Everything else that affects staging
-/// (e.g., the closure itself, its captures, the domain, and the compilation options) is fixed by the dispatcher, whose
+/// (e.g., the closure itself, its captures, the domain, and the compilation options, except for what a domain derives
+/// from the dispatch key through [`CompilationDomain::dispatch_signature`]) is fixed by the dispatcher, whose
 /// specialization cache serves exactly one retained closure. That is why this key carries no fragile function-pointer
 /// identity.
 #[derive(Clone, Debug, PartialEq, Eq, Hash)]
@@ -1033,7 +1035,7 @@ struct ExecutableSpecializationKey<Static, Structure, Key> {
     /// Parameter structure of the dynamic input, such as the shape of a nested tuple or named parameter container.
     input_structure: Structure,
 
-    /// Domain-derived dispatch key of the runtime input types (refer to [`CompilationDomain::dispatch_signature`]).
+    /// Domain-derived dispatch key of the runtime inputs (refer to [`CompilationDomain::dispatch_signature`]).
     dispatch_key: Key,
 }
 
@@ -1060,7 +1062,7 @@ impl<Static, Structure, Key> ExecutableSpecializationKey<Static, Structure, Key>
 /// Key of one retained staged specialization of a [`CompiledFunctionDispatcher`] (refer to
 /// [`CompiledFunctionDispatcher::call_in_context`]). Like [`ExecutableSpecializationKey`], it includes static
 /// parameters and input structure. It uses the effective staged input types and calling scope, because the closure
-/// resolves named axes and the default mesh against that scope. These types come from a [`DispatchPurpose::Staging`]
+/// resolves named axes and the default mesh against that scope. These types come from a [`DispatchInputs::Types`]
 /// signature (refer to [`CompilationDomain::dispatch_signature`]). The callee is lowered and dispatched as part of its
 /// enclosing computation, so executable dispatch policies such as shape bucketing do not apply to it.
 #[derive(Clone, PartialEq, Eq, Hash)]
@@ -1466,7 +1468,7 @@ where
     /// executables. The calling scope is the [`TracingScope`] of `context` (i.e., its named axes and default mesh),
     /// and the closure is traced in that scope so that it resolves them as it would if it were inlined. The effective
     /// staged input types are the abstract input types after the declarations of [`Self::with_staged_input_types`] and
-    /// the [`DispatchPurpose::Staging`] signature of [`CompilationDomain::dispatch_signature`], which need no domain
+    /// the [`DispatchInputs::Types`] signature of [`CompilationDomain::dispatch_signature`], which need no domain
     /// instance, so a dispatcher that infers its domain need not have selected one. Host side effects of the closure
     /// therefore run once per staged specialization. [`Self::clear_cache`] and [`Self::invalidate_specializations`]
     /// remove staged specializations together with executable ones.
@@ -1579,8 +1581,11 @@ where
         let mut runtime_input_types = inputs.parameters().map(|input| input.r#type().into_owned()).collect::<Vec<_>>();
         self.apply_staged_input_types(&input_structure, &mut runtime_input_types)?;
 
-        let (dispatch_key, effective_input_types) =
-            C::dispatch_signature(runtime_input_types, &self.state.options, DispatchPurpose::Executable)?;
+        let mut runtime_inputs = inputs.parameters();
+        let (dispatch_key, effective_input_types, specialized_options) = C::dispatch_signature(
+            DispatchInputs::Values { values: &mut runtime_inputs, types: runtime_input_types },
+            &self.state.options,
+        )?;
 
         // Backend normalization can share dispatch keys, but static values and container structures remain distinct.
         let key = ExecutableSpecializationKey::new(static_parameters.clone(), input_structure, dispatch_key);
@@ -1629,7 +1634,7 @@ where
             |_, _, traced_inputs| (self.state.function)(static_parameters, traced_inputs),
             Vec::new(),
             input_types,
-            self.state.options.clone(),
+            specialized_options.unwrap_or_else(|| self.state.options.clone()),
         );
         accumulate_duration(tracing_start.elapsed(), &statistics.tracing_nanoseconds);
         let staged = staged?;
@@ -1665,7 +1670,8 @@ where
             StagingContext<Type = C::Type, Constant = C::Constant, Operation = C::Operation>,
     {
         self.apply_staged_input_types(&input_structure, &mut input_types)?;
-        let (_, input_types) = C::dispatch_signature(input_types, &self.state.options, DispatchPurpose::Staging)?;
+        let (_, input_types, specialized_options) =
+            C::dispatch_signature(DispatchInputs::Types(input_types), &self.state.options)?;
         let input_types = input_types.to_vec();
         let key = StagedSpecializationKey {
             static_parameters: static_parameters.clone(),
@@ -1692,7 +1698,7 @@ where
                     |_, _, traced_inputs| (self.state.function)(static_parameters, traced_inputs),
                     Vec::new(),
                     input_types,
-                    self.state.options.clone(),
+                    specialized_options.unwrap_or_else(|| self.state.options.clone()),
                     scope,
                 );
                 accumulate_duration(tracing_start.elapsed(), &statistics.tracing_nanoseconds);
@@ -2128,12 +2134,12 @@ mod tests {
         type Error = ProgramError;
 
         fn dispatch_signature(
-            input_types: Vec<ArrayIrType>,
+            inputs: DispatchInputs<'_, '_, Self::Value>,
             _options: &Self::Options,
-            _purpose: DispatchPurpose,
-        ) -> Result<(Self::DispatchKey, Arc<[ArrayIrType]>), Self::Error> {
+        ) -> Result<(Self::DispatchKey, Arc<[ArrayIrType]>, Option<Self::Options>), Self::Error> {
+            let input_types = inputs.into_types();
             let input_types: Arc<[ArrayIrType]> = input_types.into();
-            Ok((input_types.clone(), input_types))
+            Ok((input_types.clone(), input_types, None))
         }
 
         fn lower(&self, staged: &StagedProgram<Self>) -> Result<Self::LoweredProgram, ProgramError> {
@@ -2233,12 +2239,12 @@ mod tests {
         type Error = ProgramError;
 
         fn dispatch_signature(
-            input_types: Vec<ArrayType>,
+            inputs: DispatchInputs<'_, '_, Self::Value>,
             _options: &(),
-            _purpose: DispatchPurpose,
-        ) -> Result<(Self::DispatchKey, Arc<[ArrayType]>), ProgramError> {
+        ) -> Result<(Self::DispatchKey, Arc<[ArrayType]>, Option<Self::Options>), ProgramError> {
+            let input_types = inputs.into_types();
             let input_types: Arc<[ArrayType]> = input_types.into();
-            Ok((input_types.clone(), input_types))
+            Ok((input_types.clone(), input_types, None))
         }
 
         fn lower(&self, _staged: &StagedProgram<Self>) -> Result<FlatProgram<Self>, ProgramError> {

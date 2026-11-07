@@ -386,7 +386,13 @@ pub(crate) fn relayout_shards_through_host<'o>(
             Some(device_layout.clone()),
         )?);
     }
-    Array::from_addressable_buffers(domain, r#type, array.mesh().clone(), buffers)
+    Array::from_addressable_buffers_with_sharding(
+        domain,
+        r#type,
+        array.sharding().clone(),
+        array.mesh().clone(),
+        buffers,
+    )
 }
 
 /// Rejects a dense host round trip of `array` for `purpose` (i.e., materializing its logical value on the host and

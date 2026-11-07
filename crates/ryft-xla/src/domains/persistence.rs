@@ -21,17 +21,17 @@ use crate::experimental::lowering::signature::ExecutableSignature;
 
 // TODO(eaplatanios): Review this module.
 
-/// Fixed header identifying the V9 executable envelope.
-const PERSISTENT_EXECUTABLE_MAGIC: &[u8; 8] = b"RYFTXLA9";
+/// Fixed header identifying the V10 executable envelope.
+const PERSISTENT_EXECUTABLE_MAGIC: &[u8; 8] = b"RYFTXL10";
 
 /// Metadata schema emitted by executable serialization.
-const PERSISTENT_EXECUTABLE_SCHEMA_VERSION: u32 = 9;
+const PERSISTENT_EXECUTABLE_SCHEMA_VERSION: u32 = 10;
 
 /// Required features for reference states, dynamic extents, effects, and runtime contracts.
 const PERSISTENT_EXECUTABLE_FEATURE_FLAGS: u64 = 15;
 
 /// Schema used by canonical compilation keys.
-pub(super) const PERSISTENT_KEY_SCHEMA_VERSION: u32 = 9;
+pub(super) const PERSISTENT_KEY_SCHEMA_VERSION: u32 = 10;
 
 /// Build identity shared by lowering, cache keys, and executable compatibility validation.
 pub(super) static COMPILER_IDENTITY: LazyLock<String> = LazyLock::new(|| {
@@ -43,9 +43,9 @@ pub(super) static COMPILER_IDENTITY: LazyLock<String> = LazyLock::new(|| {
     )
 });
 
-/// Stable cache-key payload for the V9 executable and external-reference ABI.
+/// Stable cache-key payload for the V10 executable and external-reference ABI.
 #[derive(Serialize)]
-struct PersistentKeyV9<'o> {
+struct PersistentKeyV10<'o> {
     /// Version of this persistent record schema.
     schema_version: u32,
 
@@ -103,6 +103,9 @@ struct PersistentKeyV9<'o> {
     /// Shardings of all physical executable arguments in argument order.
     expected_argument_shardings: Vec<PersistentShardingV1>,
 
+    /// Runtime placements of all logical outputs, including the auto mesh axes that output types never record.
+    output_shardings: Vec<PersistentShardingV1>,
+
     /// Concrete compilation and execution mesh.
     mesh: PersistentDeviceMeshV1,
 
@@ -125,9 +128,9 @@ struct PersistentKeyV9<'o> {
     xla_flags: &'o str,
 }
 
-/// Stable V9 metadata envelope stored before serialized PJRT executable bytes.
+/// Stable V10 metadata envelope stored before serialized PJRT executable bytes.
 #[derive(Serialize, Deserialize)]
-struct PersistentExecutableMetadataV9 {
+struct PersistentExecutableMetadataV10 {
     /// Version of this persistent record schema.
     schema_version: u32,
 
@@ -184,6 +187,9 @@ struct PersistentExecutableMetadataV9 {
 
     /// Shardings of all physical executable arguments in argument order.
     expected_argument_shardings: Vec<PersistentShardingV1>,
+
+    /// Runtime placements of all logical outputs, including the auto mesh axes that output types never record.
+    output_shardings: Vec<PersistentShardingV1>,
 
     /// Concrete compilation and execution mesh.
     mesh: PersistentDeviceMeshV1,
@@ -1081,7 +1087,7 @@ impl LoweredProgram {
     /// Encodes the complete compilation contract as a deterministic cache key.
     pub(super) fn compilation_key(&self) -> Result<CompilationKey, Error> {
         let compilation_options = canonical_compilation_options_bytes(&self.compilation_options);
-        let key = PersistentKeyV9 {
+        let key = PersistentKeyV10 {
             schema_version: PERSISTENT_KEY_SCHEMA_VERSION,
             stable_hlo: &self.stable_hlo,
             compilation_options: compilation_options.as_slice(),
@@ -1105,6 +1111,7 @@ impl LoweredProgram {
                 .iter()
                 .map(PersistentShardingV1::from)
                 .collect(),
+            output_shardings: self.output_shardings.iter().map(PersistentShardingV1::from).collect(),
             mesh: PersistentDeviceMeshV1::from(&self.mesh),
             device_kinds: &self.device_kinds,
             kernel_execution_facts: self.kernel_execution_facts.as_deref(),
@@ -1137,7 +1144,7 @@ impl CompiledProgram<'_> {
             Err(error) => return Err(error.into()),
         };
         let device_assignment = self.executable.device_assignment()?;
-        let metadata = PersistentExecutableMetadataV9 {
+        let metadata = PersistentExecutableMetadataV10 {
             schema_version: PERSISTENT_EXECUTABLE_SCHEMA_VERSION,
             feature_flags: PERSISTENT_EXECUTABLE_FEATURE_FLAGS,
             compilation_options: self.compilation_options.encode_to_vec(),
@@ -1161,6 +1168,7 @@ impl CompiledProgram<'_> {
                 .iter()
                 .map(PersistentShardingV1::from)
                 .collect(),
+            output_shardings: self.output_shardings.iter().map(PersistentShardingV1::from).collect(),
             mesh: PersistentDeviceMeshV1::from(&self.mesh),
             device_kinds: self.device_kinds.to_vec(),
             kernel_execution_facts: self.kernel_execution_facts.clone(),
@@ -1227,7 +1235,7 @@ impl<'c> Domain<'c> {
                 reason: "persistent executable metadata is truncated".into(),
             })
         })?;
-        let metadata: PersistentExecutableMetadataV9 = serde_json::from_slice(&bytes[header_size..metadata_end])
+        let metadata: PersistentExecutableMetadataV10 = serde_json::from_slice(&bytes[header_size..metadata_end])
             .map_err(|error| {
                 Error::Compilation(CompilationError::InvalidPersistentExecutable {
                     reason: format!("failed to decode metadata: {error}"),
@@ -1416,6 +1424,20 @@ impl<'c> Domain<'c> {
                 reason: "argument sharding mesh does not match executable mesh".into(),
             }));
         }
+        let output_shardings =
+            metadata.output_shardings.into_iter().map(Sharding::try_from).collect::<Result<Vec<_>, _>>()?;
+        if output_shardings.len() != output_types.len()
+            || output_types.iter().zip(&output_shardings).any(|(output_type, sharding)| {
+                !sharding.mesh().has_same_topology(mesh.logical_mesh())
+                    || output_type
+                        .sharding()
+                        .is_some_and(|type_sharding| *type_sharding != sharding.without_auto_axes())
+            })
+        {
+            return Err(Error::Compilation(CompilationError::InvalidPersistentExecutable {
+                reason: "output shardings do not match the output types or the executable mesh".into(),
+            }));
+        }
         let physical_input_count = signature.array_input_count();
         if expected_argument_shardings.len() != physical_input_count {
             return Err(Error::Compilation(CompilationError::InvalidPersistentExecutable {
@@ -1439,7 +1461,7 @@ impl<'c> Domain<'c> {
                 }));
             }
             if expected_sharding.rank() != input_type.rank()
-                || input_type.sharding().is_some_and(|sharding| sharding != expected_sharding)
+                || input_type.sharding().is_some_and(|sharding| *sharding != expected_sharding.without_auto_axes())
             {
                 return Err(Error::Compilation(CompilationError::InvalidPersistentExecutable {
                     reason: format!(
@@ -1455,7 +1477,7 @@ impl<'c> Domain<'c> {
                     })
                 })?;
                 let output_type = &output_types[logical_output_index];
-                if output_type.sharding().is_some_and(|sharding| sharding != expected_sharding) {
+                if output_type.sharding().is_some_and(|sharding| *sharding != expected_sharding.without_auto_axes()) {
                     return Err(Error::Compilation(CompilationError::InvalidPersistentExecutable {
                         reason: format!(
                             "reference-state output {logical_output_index} logical sharding does not match state input \
@@ -1524,6 +1546,7 @@ impl<'c> Domain<'c> {
             &executable,
             &input_types,
             &output_types,
+            &output_shardings,
             &signature,
             &donation_flags,
             capture_count,
@@ -1541,6 +1564,7 @@ impl<'c> Domain<'c> {
             donation_flags: donation_flags.into(),
             capture_count,
             expected_argument_shardings: expected_argument_shardings.into(),
+            output_shardings: output_shardings.into(),
             mesh,
             compilation_options,
             platform_name: metadata.platform_name.into(),
@@ -1578,7 +1602,7 @@ mod tests {
     use crate::domains::tests::*;
     use crate::experimental::ops::{Constant, FlatProgram, ProgramBuilder};
     use crate::tests::values_to_bytes;
-    use crate::{Array, Error, Value};
+    use crate::{Array, Error, FromPjrt, Value};
 
     use super::*;
 
@@ -1638,7 +1662,7 @@ mod tests {
             u64::from_le_bytes(bytes[PERSISTENT_EXECUTABLE_MAGIC.len()..header_size].try_into().unwrap()) as usize;
         let metadata_end = header_size + metadata_size;
         // Reload validates the live facts before handing any native executable bytes to PJRT.
-        let encode = |metadata: PersistentExecutableMetadataV9| {
+        let encode = |metadata: PersistentExecutableMetadataV10| {
             let metadata = serde_json::to_vec(&metadata).unwrap();
             let mut encoded = PERSISTENT_EXECUTABLE_MAGIC.to_vec();
             encoded.extend_from_slice(&(metadata.len() as u64).to_le_bytes());
@@ -1646,33 +1670,33 @@ mod tests {
             encoded.extend_from_slice(&bytes[metadata_end..]);
             encoded
         };
-        let mut matching: PersistentExecutableMetadataV9 =
+        let mut matching: PersistentExecutableMetadataV10 =
             serde_json::from_slice(&bytes[header_size..metadata_end]).unwrap();
         assert_eq!(matching.kernel_execution_facts, None);
         let facts = crate::kernels::KernelExecutionFacts::from_target(domain.target().unwrap(), &mesh).unwrap();
         matching.kernel_execution_facts = Some(facts.configuration_key().unwrap());
         let matching = domain.deserialize_program(&encode(matching)).unwrap().unwrap();
         assert_eq!(matching.kernel_execution_facts, Some(facts.configuration_key().unwrap()));
-        let mut mismatch: PersistentExecutableMetadataV9 =
+        let mut mismatch: PersistentExecutableMetadataV10 =
             serde_json::from_slice(&bytes[header_size..metadata_end]).unwrap();
         let mut changed_facts = facts;
         changed_facts.pjrt_version.minor += 1;
         mismatch.kernel_execution_facts = Some(changed_facts.configuration_key().unwrap());
         assert!(domain.deserialize_program(&encode(mismatch)).unwrap().is_none());
-        let mut corrupt: PersistentExecutableMetadataV9 =
+        let mut corrupt: PersistentExecutableMetadataV10 =
             serde_json::from_slice(&bytes[header_size..metadata_end]).unwrap();
         corrupt.kernel_execution_facts = Some(vec![255]);
         assert!(domain.deserialize_program(&encode(corrupt)).unwrap().is_none());
         let baseline: serde_json::Value = serde_json::from_slice(&bytes[header_size..metadata_end]).unwrap();
         assert_eq!(baseline["runtime_requirements"], serde_json::json!([]));
-        let mut missing: PersistentExecutableMetadataV9 = serde_json::from_value(baseline).unwrap();
+        let mut missing: PersistentExecutableMetadataV10 = serde_json::from_value(baseline).unwrap();
         missing.runtime_requirements = vec![crate::domains::runtimes::builtin_requirement("test.missing-runtime")];
         assert!(matches!(
             domain.deserialize_program(&encode(missing)),
             Err(Error::Runtime(crate::domains::runtimes::RuntimeError::MissingProvider { identifier }))
                 if identifier == "test.missing-runtime"
         ));
-        let mut explicit: PersistentExecutableMetadataV9 =
+        let mut explicit: PersistentExecutableMetadataV10 =
             serde_json::from_slice(&bytes[header_size..metadata_end]).unwrap();
         explicit.runtime_requirements =
             vec![builtin_requirement("ryft.assert"), builtin_requirement("ryft.ordered-io")];
@@ -1684,7 +1708,7 @@ mod tests {
         assert!(!explicit.requires_assertion_handler);
         assert!(!explicit.signature.has_ordered_io());
 
-        let mut invalid_signature_metadata: PersistentExecutableMetadataV9 =
+        let mut invalid_signature_metadata: PersistentExecutableMetadataV10 =
             serde_json::from_slice(&bytes[header_size..metadata_end]).unwrap();
         invalid_signature_metadata.input_mapping[0] = None;
         let invalid_signature_metadata = serde_json::to_vec(&invalid_signature_metadata).unwrap();
@@ -1697,7 +1721,7 @@ mod tests {
             Err(Error::Compilation(CompilationError::InvalidPersistentExecutable { .. })),
         ));
 
-        let mut incompatible_metadata: PersistentExecutableMetadataV9 =
+        let mut incompatible_metadata: PersistentExecutableMetadataV10 =
             serde_json::from_slice(&bytes[header_size..metadata_end]).unwrap();
         incompatible_metadata.platform_version.push_str("-incompatible");
         let incompatible_metadata = serde_json::to_vec(&incompatible_metadata).unwrap();
@@ -1771,7 +1795,7 @@ mod tests {
         let header_size = PERSISTENT_EXECUTABLE_MAGIC.len() + size_of::<u64>();
         let metadata_size = u64::from_le_bytes(bytes[8..header_size].try_into().unwrap()) as usize;
         let metadata_end = header_size + metadata_size;
-        let baseline: PersistentExecutableMetadataV9 =
+        let baseline: PersistentExecutableMetadataV10 =
             serde_json::from_slice(&bytes[header_size..metadata_end]).unwrap();
         assert!(baseline.requires_assertion_handler);
         assert!(baseline.ordered_io);
@@ -1779,7 +1803,7 @@ mod tests {
 
         for identifier in ["ryft.assert", "ryft.ordered-io"] {
             for replacement in [None, Some((2, Vec::new())), Some((1, vec![1]))] {
-                let mut metadata: PersistentExecutableMetadataV9 =
+                let mut metadata: PersistentExecutableMetadataV10 =
                     serde_json::from_slice(&bytes[header_size..metadata_end]).unwrap();
                 metadata.runtime_requirements.retain(|requirement| requirement.identifier() != identifier);
                 if let Some((version, configuration)) = replacement {
@@ -1970,7 +1994,7 @@ mod tests {
         legacy.extend_from_slice(&0u64.to_le_bytes());
         assert!(domain.deserialize_program(legacy.as_slice()).unwrap().is_none());
 
-        let metadata = PersistentExecutableMetadataV9 {
+        let metadata = PersistentExecutableMetadataV10 {
             schema_version: PERSISTENT_EXECUTABLE_SCHEMA_VERSION + 1,
             feature_flags: 0,
             compilation_options: CompilationOptions::default().encode_to_vec(),
@@ -1990,6 +2014,7 @@ mod tests {
             donation_flags: Vec::new(),
             capture_count: 0,
             expected_argument_shardings: Vec::new(),
+            output_shardings: Vec::new(),
             mesh: PersistentDeviceMeshV1 {
                 logical_mesh: PersistentLogicalMeshV1 { axes: Vec::new() },
                 devices: Vec::new(),
@@ -2018,7 +2043,13 @@ mod tests {
         let client = plugin
             .client(ClientOptions::CPU(CpuClientOptions { device_count: Some(1), ..Default::default() }))
             .unwrap();
-        let mesh = domain_mesh(&client, "x", 1);
+        // The corruptions below add unreduced placement to persisted shardings, which types and persisted reference
+        // state checks record over explicit mesh axes only.
+        let mesh = DeviceMesh::new(
+            LogicalMesh::new(vec![MeshAxis::new("x", 1, MeshAxisType::Explicit).unwrap()]).unwrap(),
+            vec![Device::from_pjrt(&client.addressable_devices().unwrap()[0]).unwrap()],
+        )
+        .unwrap();
         let domain = Session::new(&client).domain();
         let scalar_type = replicated_scalar_type(&mesh, DataType::F32);
 
@@ -2062,7 +2093,7 @@ mod tests {
         let metadata_size =
             u64::from_le_bytes(bytes[PERSISTENT_EXECUTABLE_MAGIC.len()..header_size].try_into().unwrap()) as usize;
         let metadata_end = header_size + metadata_size;
-        let corrupt = |metadata: PersistentExecutableMetadataV9| {
+        let corrupt = |metadata: PersistentExecutableMetadataV10| {
             let metadata = serde_json::to_vec(&metadata).unwrap();
             let mut corrupted = PERSISTENT_EXECUTABLE_MAGIC.to_vec();
             corrupted.extend_from_slice(&(metadata.len() as u64).to_le_bytes());
@@ -2070,7 +2101,7 @@ mod tests {
             corrupted.extend_from_slice(&bytes[metadata_end..]);
             corrupted
         };
-        let mut metadata: PersistentExecutableMetadataV9 =
+        let mut metadata: PersistentExecutableMetadataV10 =
             serde_json::from_slice(&bytes[header_size..metadata_end]).unwrap();
         assert_eq!(metadata.reference_states[0].source, PersistentReferenceSourceV6::Capture { index: 0 });
         assert_eq!(metadata.reference_states[0].logical_input_index, 0);
@@ -2084,7 +2115,7 @@ mod tests {
                 if reason == "reference-state source does not match its logical input",
         ));
 
-        let mut metadata: PersistentExecutableMetadataV9 =
+        let mut metadata: PersistentExecutableMetadataV10 =
             serde_json::from_slice(&bytes[header_size..metadata_end]).unwrap();
         metadata.reference_states[0].source = PersistentReferenceSourceV6::PublicInput { index: 1 };
         let corrupted = corrupt(metadata);
@@ -2095,7 +2126,7 @@ mod tests {
         ));
 
         // An output count beyond the decoded complete output arity cannot name a hidden final-state suffix at all.
-        let mut invalid_outputs: PersistentExecutableMetadataV9 =
+        let mut invalid_outputs: PersistentExecutableMetadataV10 =
             serde_json::from_slice(&bytes[header_size..metadata_end]).unwrap();
         invalid_outputs.output_count = 3;
         let corrupted = corrupt(invalid_outputs);
@@ -2107,7 +2138,7 @@ mod tests {
 
         // Dropping one expected argument sharding leaves the persisted list shorter than the physical boundary, so
         // no reference-state input could be checked against its own expected sharding.
-        let mut truncated_expected_shardings: PersistentExecutableMetadataV9 =
+        let mut truncated_expected_shardings: PersistentExecutableMetadataV10 =
             serde_json::from_slice(&bytes[header_size..metadata_end]).unwrap();
         assert_eq!(truncated_expected_shardings.expected_argument_shardings.len(), 2);
         truncated_expected_shardings.expected_argument_shardings.pop();
@@ -2118,7 +2149,7 @@ mod tests {
                 if reason == "expected argument shardings do not match the physical input count",
         ));
 
-        let mut reordered: PersistentExecutableMetadataV9 =
+        let mut reordered: PersistentExecutableMetadataV10 =
             serde_json::from_slice(&bytes[header_size..metadata_end]).unwrap();
         reordered.reference_states.swap(0, 1);
         let corrupted = corrupt(reordered);
@@ -2128,7 +2159,7 @@ mod tests {
                 if reason == "reference states are not in canonical logical input order",
         ));
 
-        let mut foreign_process_mesh: PersistentExecutableMetadataV9 =
+        let mut foreign_process_mesh: PersistentExecutableMetadataV10 =
             serde_json::from_slice(&bytes[header_size..metadata_end]).unwrap();
         foreign_process_mesh.mesh.devices[0].process_index += 1;
         let corrupted = corrupt(foreign_process_mesh);
@@ -2138,7 +2169,7 @@ mod tests {
                 if reason == "reference-state mesh does not include an addressable device of this process",
         ));
 
-        let mut mismatched_expected_sharding: PersistentExecutableMetadataV9 =
+        let mut mismatched_expected_sharding: PersistentExecutableMetadataV10 =
             serde_json::from_slice(&bytes[header_size..metadata_end]).unwrap();
         mismatched_expected_sharding.expected_argument_shardings[0].unreduced_axes.push("x".to_string());
         let corrupted = corrupt(mismatched_expected_sharding);
@@ -2148,7 +2179,7 @@ mod tests {
                 if reason == "reference-state input 0 logical sharding does not match its expected argument sharding",
         ));
 
-        let mut mismatched_input: PersistentExecutableMetadataV9 =
+        let mut mismatched_input: PersistentExecutableMetadataV10 =
             serde_json::from_slice(&bytes[header_size..metadata_end]).unwrap();
         mismatched_input.signature.input_types[0]
             .sharding
@@ -2162,6 +2193,7 @@ mod tests {
             .unwrap()
             .unreduced_axes
             .push("x".to_string());
+        mismatched_input.output_shardings[1].unreduced_axes.push("x".to_string());
         let corrupted = corrupt(mismatched_input);
         assert!(matches!(
             domain.deserialize_compiled_program(corrupted.as_slice()),
@@ -2169,7 +2201,7 @@ mod tests {
                 if reason == "reference-state input 0 logical sharding does not match its expected argument sharding",
         ));
 
-        let mut mismatched_output: PersistentExecutableMetadataV9 =
+        let mut mismatched_output: PersistentExecutableMetadataV10 =
             serde_json::from_slice(&bytes[header_size..metadata_end]).unwrap();
         mismatched_output.signature.output_types[1]
             .sharding
@@ -2177,6 +2209,7 @@ mod tests {
             .unwrap()
             .unreduced_axes
             .push("x".to_string());
+        mismatched_output.output_shardings[1].unreduced_axes.push("x".to_string());
         let corrupted = corrupt(mismatched_output);
         assert!(matches!(
             domain.deserialize_compiled_program(corrupted.as_slice()),
@@ -2184,7 +2217,18 @@ mod tests {
                 if reason == "reference-state output 1 logical sharding does not match state input 0",
         ));
 
-        let mut zero_space: PersistentExecutableMetadataV9 =
+        // The runtime placement of every output must agree with its type over the non-auto mesh axes.
+        let mut mismatched_output_sharding: PersistentExecutableMetadataV10 =
+            serde_json::from_slice(&bytes[header_size..metadata_end]).unwrap();
+        mismatched_output_sharding.output_shardings[1].unreduced_axes.push("x".to_string());
+        let corrupted = corrupt(mismatched_output_sharding);
+        assert!(matches!(
+            domain.deserialize_compiled_program(corrupted.as_slice()),
+            Err(Error::Compilation(CompilationError::InvalidPersistentExecutable { reason }))
+                if reason == "output shardings do not match the output types or the executable mesh",
+        ));
+
+        let mut zero_space: PersistentExecutableMetadataV10 =
             serde_json::from_slice(&bytes[header_size..metadata_end]).unwrap();
         zero_space.signature.input_types[0].data_type = encode_data_type(DataType::Zero);
         let corrupted = corrupt(zero_space);
@@ -2194,7 +2238,7 @@ mod tests {
                 if reason == "reference-state input has a zero-space type",
         ));
 
-        let mut host_memory: PersistentExecutableMetadataV9 =
+        let mut host_memory: PersistentExecutableMetadataV10 =
             serde_json::from_slice(&bytes[header_size..metadata_end]).unwrap();
         host_memory.signature.input_types[0].memory = PersistentMemoryV1::Host(true);
         let corrupted = corrupt(host_memory);
@@ -2204,7 +2248,7 @@ mod tests {
                 if reason == "reference-state input is not in device memory",
         ));
 
-        let mut unbounded_dynamic: PersistentExecutableMetadataV9 =
+        let mut unbounded_dynamic: PersistentExecutableMetadataV10 =
             serde_json::from_slice(&bytes[header_size..metadata_end]).unwrap();
         unbounded_dynamic.signature.variables.push(PersistentDimensionVariableV3 {
             name: "unbounded".to_string(),
@@ -2221,7 +2265,7 @@ mod tests {
                 if reason == "reference-state input has an unbounded dynamic dimension",
         ));
 
-        let mut mutated_dynamic: PersistentExecutableMetadataV9 =
+        let mut mutated_dynamic: PersistentExecutableMetadataV10 =
             serde_json::from_slice(&bytes[header_size..metadata_end]).unwrap();
         mutated_dynamic.signature.variables.push(PersistentDimensionVariableV3 {
             name: "bounded_mutation".to_string(),
@@ -2239,7 +2283,7 @@ mod tests {
                               compatibility has not been verified",
         ));
 
-        let mut sharded_dynamic: PersistentExecutableMetadataV9 =
+        let mut sharded_dynamic: PersistentExecutableMetadataV10 =
             serde_json::from_slice(&bytes[header_size..metadata_end]).unwrap();
         sharded_dynamic.signature.variables.push(PersistentDimensionVariableV3 {
             name: "bounded_sharded".to_string(),
@@ -2306,7 +2350,17 @@ mod tests {
         let client = plugin
             .client(ClientOptions::CPU(CpuClientOptions { device_count: Some(2), ..Default::default() }))
             .unwrap();
-        let mesh = domain_mesh(&client, "x", 2);
+        // Types record placement over explicit mesh axes only, so the statically sharded state uses an explicit axis.
+        let mesh = DeviceMesh::new(
+            LogicalMesh::new(vec![MeshAxis::new("x", 2, MeshAxisType::Explicit).unwrap()]).unwrap(),
+            client
+                .addressable_devices()
+                .unwrap()
+                .into_iter()
+                .map(|device| Device::from_pjrt(device).unwrap())
+                .collect(),
+        )
+        .unwrap();
         let domain = Session::new(&client).domain();
         let state_sharding =
             Sharding::new(mesh.logical_mesh().clone(), vec![ShardingDimension::sharded(["x"])]).unwrap();
@@ -2354,6 +2408,22 @@ mod tests {
                 assert!(matches!(unsupported, Some(ryft_pjrt::Error::Unimplemented { .. })));
             }
         }
+    }
+
+    #[test]
+    fn test_persistent_sharding_round_trips_placement_over_auto_axes() {
+        // Persisted output shardings are runtime placements, which may name auto mesh axes that types never record, so
+        // their encoding preserves both the placement and the axis types of the mesh.
+        let mesh = LogicalMesh::new(vec![
+            MeshAxis::new("x", 2, MeshAxisType::Auto).unwrap(),
+            MeshAxis::new("y", 2, MeshAxisType::Explicit).unwrap(),
+        ])
+        .unwrap();
+        let sharding = Sharding::new(mesh, vec![ShardingDimension::sharded(["x"]), ShardingDimension::sharded(["y"])])
+            .unwrap();
+        let payload = serde_json::to_string(&PersistentShardingV1::from(&sharding)).unwrap();
+        let restored = Sharding::try_from(serde_json::from_str::<PersistentShardingV1>(&payload).unwrap()).unwrap();
+        assert_eq!(restored, sharding);
     }
 
     #[test]

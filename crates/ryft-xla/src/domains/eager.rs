@@ -12,7 +12,8 @@ use ryft_core::{
     DimensionOperation, DimensionSize, DimensionType, DimensionValue, EagerContext, EffectClass, EmptyRegionDriver,
     InterpretableOperation, LogicalMesh, MeshAxis, MeshAxisType, ONE_OPERATION_NAME, Operation as CoreOperation,
     OperationProvider, Placeholder, ProgramError, Provenance, ProvenanceScope, RegionDriver, RegionKey, RegionRef,
-    Shape, SpecializationCacheEntry, Type, TypeError, Typed, TypedProgram, ZERO_OPERATION_NAME, Zero, ZeroOperation,
+    Shape, Sharding, SpecializationCacheEntry, Type, TypeError, Typed, TypedProgram, ZERO_OPERATION_NAME, Zero,
+    ZeroOperation,
 };
 use ryft_pjrt::Client;
 use ryft_pjrt::protos::CompilationOptions;
@@ -74,8 +75,9 @@ pub(super) struct EagerDispatchKey {
 /// One input of an [`EagerDispatchKey`].
 #[derive(Clone)]
 enum EagerDispatchInput {
-    /// Array input, keyed by its physical [`ArrayType`] (including its sharding).
-    Array(ArrayType),
+    /// Array input, keyed by its physical [`ArrayType`] (including its sharding) and by its runtime placement, which
+    /// also covers the auto mesh axes that its type never records.
+    Array(ArrayType, Sharding),
 
     /// Dimension input, keyed by its extent, which is how [`DimensionValue`]s compare.
     Dimension(DimensionValue),
@@ -84,8 +86,8 @@ enum EagerDispatchInput {
 /// Borrowed form of one [`EagerDispatchInput`], which owned keys and borrowed queries compare and hash alike.
 #[derive(PartialEq, Eq, Hash)]
 enum EagerDispatchInputRef<'o> {
-    /// Array input, keyed by its physical [`ArrayType`] (including its sharding).
-    Array(Cow<'o, ArrayType>),
+    /// Array input, keyed by its physical [`ArrayType`] (including its sharding) and by its runtime placement.
+    Array(Cow<'o, ArrayType>, &'o Sharding),
 
     /// Dimension input, keyed by its extent, which is how [`DimensionValue`]s compare.
     Dimension(&'o DimensionValue),
@@ -95,7 +97,7 @@ impl EagerDispatchInputRef<'_> {
     /// Returns the owned [`EagerDispatchInput`] that this reference borrows from or describes.
     fn into_owned(self) -> EagerDispatchInput {
         match self {
-            Self::Array(r#type) => EagerDispatchInput::Array(r#type.into_owned()),
+            Self::Array(r#type, sharding) => EagerDispatchInput::Array(r#type.into_owned(), sharding.clone()),
             Self::Dimension(dimension) => EagerDispatchInput::Dimension(dimension.clone()),
         }
     }
@@ -139,7 +141,9 @@ impl EagerDispatchKeyView for EagerDispatchKey {
 
     fn input(&self, index: usize) -> EagerDispatchInputRef<'_> {
         match &self.inputs[index] {
-            EagerDispatchInput::Array(r#type) => EagerDispatchInputRef::Array(Cow::Borrowed(r#type)),
+            EagerDispatchInput::Array(r#type, sharding) => {
+                EagerDispatchInputRef::Array(Cow::Borrowed(r#type), sharding)
+            }
             EagerDispatchInput::Dimension(dimension) => EagerDispatchInputRef::Dimension(dimension),
         }
     }
@@ -257,7 +261,7 @@ impl EagerDispatchKeyView for EagerDispatchQuery<'_, '_> {
 
     fn input(&self, index: usize) -> EagerDispatchInputRef<'_> {
         match &self.inputs[index] {
-            Value::Array(array) => EagerDispatchInputRef::Array(array.r#type()),
+            Value::Array(array) => EagerDispatchInputRef::Array(array.r#type(), array.sharding()),
             Value::Dimension(dimension) => EagerDispatchInputRef::Dimension(dimension.value()),
             Value::Reference(_) => unreachable!("reference inputs are rejected at the `eager_bind` entry guard"),
         }
@@ -781,8 +785,11 @@ impl<'c> Domain<'c> {
             .filter_map(|(atom, output)| matches!(output, EagerOutput::Array).then_some(atom))
             .collect::<Vec<_>>();
         let output_count = array_output_atoms.len();
-        let program: FlatProgram =
-            builder.build(array_output_atoms, vec![Placeholder; array_inputs.len()], vec![Placeholder; output_count])?;
+        let program: FlatProgram = builder.build(
+            array_output_atoms,
+            vec![Placeholder; array_inputs.len()],
+            vec![Placeholder; output_count],
+        )?;
 
         // Derive the mesh after tracing so that input-free operations can fall back to their inferred output
         // shardings, and then compile through the domain's compilation cache.
@@ -793,7 +800,11 @@ impl<'c> Domain<'c> {
             .map(|result| result.cloned())
             .collect::<Result<Vec<_>, _>>()?;
         let mesh = self.eager_mesh(array_inputs, output_types.as_slice())?;
-        let options = Options::new(mesh);
+        let mut options = Options::new(mesh);
+        // Arguments are placed as their runtime arrays are, including over the auto mesh axes that types never record.
+        if array_inputs.iter().any(|array| array.sharding().references_auto_axis()) {
+            options.input_placements = Some(array_inputs.iter().map(|array| Some(array.sharding().clone())).collect());
+        }
         let lowered = self
             .lower_program(&program, 0, &options)
             .map_err(|error| ProgramError::InvalidArgument { message: error.to_string() })?;
@@ -899,7 +910,7 @@ impl<'c> Domain<'c> {
             None => array_type.replicated(mesh)?,
         };
         if array_type.data_type().is_zero() {
-            return Ok(Array::from_zero_space(self, effective_type, mesh.clone())?);
+            return Ok(Array::from_zero_space(self, effective_type, None, mesh.clone())?);
         }
         let addressable_ids = addressable_device_ids(client, mesh)?;
         let element_size_in_bytes = array_type.data_type().to_pjrt().element_size_in_bytes()?;
@@ -938,7 +949,7 @@ impl<'c> Domain<'c> {
 
         // The constant belongs to this domain so that chained eager operations and transforms over it recover a
         // context that keeps the same session, effect scope, and compilation options.
-        Ok(Array::from_canonical_addressable_buffers(self, effective_type, mesh.clone(), addressable_buffers)?)
+        Ok(Array::from_canonical_addressable_buffers(self, effective_type, None, mesh.clone(), addressable_buffers)?)
     }
 }
 
@@ -1129,7 +1140,17 @@ mod tests {
         let client = plugin
             .client(ClientOptions::CPU(CpuClientOptions { device_count: Some(2), ..Default::default() }))
             .unwrap();
-        let mesh = domain_mesh(&client, "x", 2);
+        // Constants take their placement from their types, which record placement over explicit mesh axes only.
+        let mesh = DeviceMesh::new(
+            LogicalMesh::new(vec![MeshAxis::new("x", 2, MeshAxisType::Explicit).unwrap()]).unwrap(),
+            client
+                .addressable_devices()
+                .unwrap()
+                .into_iter()
+                .map(|device| Device::from_pjrt(device).unwrap())
+                .collect(),
+        )
+        .unwrap();
         let sharding = Sharding::new(mesh.logical_mesh().clone(), vec![ShardingDimension::sharded(["x"])]).unwrap();
         let array_type = ArrayType::new(DataType::F32, Shape::new(vec![CoreDimension::Static(4)]))
             .with_sharding(sharding)
@@ -1784,7 +1805,8 @@ mod tests {
         negate(&domain, vector.clone());
         assert_eq!(misses(&domain), 1);
 
-        // A different shape, element type, or sharding is a different key.
+        // A different shape, element type, or sharding is a different key. That includes runtime placements over auto
+        // mesh axes, which array types do not record.
         negate(&domain, f32_vector(&domain, &mesh, &[1.0, 2.0]));
         assert_eq!(misses(&domain), 2);
         let f64_type = ArrayType::new(DataType::F64, Shape::new(vec![CoreDimension::Static(4)]))
@@ -1792,11 +1814,16 @@ mod tests {
             .unwrap();
         negate(&domain, Array::from_host_buffer(&domain, f64_type, mesh.clone(), values_to_bytes(&[1f64; 4])).unwrap());
         assert_eq!(misses(&domain), 3);
-        let sharded_type = ArrayType::new(DataType::F32, Shape::new(vec![CoreDimension::Static(4)]))
-            .with_sharding(Sharding::new(mesh.logical_mesh().clone(), vec![ShardingDimension::sharded(["x"])]).unwrap())
-            .unwrap();
-        let sharded_bytes = values_to_bytes(&[1f32; 4]);
-        negate(&domain, Array::from_host_buffer(&domain, sharded_type, mesh.clone(), sharded_bytes).unwrap());
+        let sharded = Array::from_host_buffer_with_sharding(
+            &domain,
+            ArrayType::new(DataType::F32, Shape::new(vec![CoreDimension::Static(4)])),
+            Sharding::new(mesh.logical_mesh().clone(), vec![ShardingDimension::sharded(["x"])]).unwrap(),
+            mesh.clone(),
+            values_to_bytes(&[1f32; 4]),
+        )
+        .unwrap();
+        assert_eq!(sharded.r#type(), vector.r#type());
+        negate(&domain, sharded);
         assert_eq!(misses(&domain), 4);
 
         // A domain with different compilation options does not reuse the entries of the default domain.
@@ -2382,21 +2409,22 @@ mod tests {
         // A vector sharded over a 2-device mesh executes eagerly through per-operation SPMD compilation: each device
         // adds its own 2-element shard.
         let sharding = Sharding::new(mesh.logical_mesh().clone(), vec![ShardingDimension::sharded(["x"])]).unwrap();
-        let input_type = ArrayType::new(DataType::F32, Shape::new(vec![CoreDimension::Static(4)]))
-            .with_sharding(sharding.clone())
-            .unwrap();
-        let input = Array::from_host_buffer(
+        let input_type = ArrayType::new(DataType::F32, Shape::new(vec![CoreDimension::Static(4)]));
+        let input = Array::from_host_buffer_with_sharding(
             domain.parent(),
             input_type,
+            sharding.clone(),
             mesh.clone(),
             values_to_bytes::<f32>(&[1.0, 2.0, 3.0, 4.0]).as_slice(),
         )
         .unwrap();
-        let outputs = domain.bind(AddOperation::new(), Vec::new(), &[input.clone(), input]).unwrap();
+        let outputs = domain.bind(AddOperation::new(), Vec::new(), &[input.clone(), input.clone()]).unwrap();
 
         assert_eq!(outputs.len(), 1);
         let output = &outputs[0];
-        // The input sharding propagates to the output type, so the result stays sharded over the same mesh axis.
+        // The input placement propagates to the output, so the result stays sharded over the same mesh axis, while
+        // its type, like that of the input, records no placement over that auto mesh axis.
+        assert_eq!(output.r#type(), input.r#type());
         assert_eq!(output.sharding(), &sharding);
         assert_eq!(output.shape(), StaticShape::new(vec![4]));
         assert_eq!(output.shards().len(), 2);
@@ -2633,12 +2661,11 @@ mod tests {
         let scan = ScanOperation::new(1, 4);
 
         let sharding = Sharding::new(mesh.logical_mesh().clone(), vec![ShardingDimension::sharded(["x"])]).unwrap();
-        let xs_type = ArrayType::new(DataType::F32, Shape::new(vec![CoreDimension::Static(4)]))
-            .with_sharding(sharding)
-            .unwrap();
-        let xs = Array::from_host_buffer(
+        let xs_type = ArrayType::new(DataType::F32, Shape::new(vec![CoreDimension::Static(4)]));
+        let xs = Array::from_host_buffer_with_sharding(
             &domain,
             xs_type,
+            sharding,
             mesh.clone(),
             values_to_bytes::<f32>(&[1.0, 2.0, 3.0, 4.0]).as_slice(),
         )

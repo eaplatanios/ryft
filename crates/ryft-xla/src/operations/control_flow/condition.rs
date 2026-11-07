@@ -2236,7 +2236,7 @@ mod tests {
                     &client,
                     &mesh,
                     &module,
-                    &[(&selector_type, &[selector]), (&vector_type, &values)],
+                    &[(&selector_type, None, &[selector]), (&vector_type, None, &values)],
                 ),
                 expected,
                 "selector {selector}",

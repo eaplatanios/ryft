@@ -3160,25 +3160,23 @@ mod tests {
 
     #[test]
     fn test_lower_cast_preserved_placement() {
-        use ryft_core::{Layout, LogicalMesh, MeshAxis, Sharding, ShardingDimension, TiledLayout};
+        use ryft_core::{Layout, LogicalMesh, MeshAxis, Sharding, ShardingDimension, ShardingError, TiledLayout};
 
         // Carrying an existing sharding forward requests no redistribution: a cast that only changes the layout emits
-        // no constraint, whereas a changed explicit placement emits the complete output sharding, including the
-        // preserved auto placement, like `reshard`, with its dimensions open over the auto axis. Explicit axes may only
-        // change minor to the auto axis `a`, whose shards would otherwise hold other blocks of the array. The
-        // plain-program entry point declares the mesh of every sharded atom, so the mesh declaration below does not
-        // depend on the cast.
+        // no constraint, whereas a changed explicit placement emits the complete output sharding like `reshard`, with
+        // its dimensions open over the auto axis `a`. Types record no placement over auto mesh axes, so neither type
+        // places anything over `a`. The plain-program entry point declares the mesh of every sharded atom, so the mesh
+        // declaration below does not depend on the cast.
         let mesh = LogicalMesh::new(vec![
             MeshAxis::new("x", 2, MeshAxisType::Explicit).unwrap(),
             MeshAxis::new("a", 2, MeshAxisType::Auto).unwrap(),
         ])
         .unwrap();
+        let sharding = |dimensions: Vec<ShardingDimension>| Sharding::new(mesh.clone(), dimensions).unwrap();
         let placed = |dimensions: Vec<ShardingDimension>| {
-            ArrayType::new_static(DataType::F64, [4, 4])
-                .with_sharding(Sharding::new(mesh.clone(), dimensions).unwrap())
-                .unwrap()
+            ArrayType::new_static(DataType::F64, [4, 4]).with_sharding(sharding(dimensions)).unwrap()
         };
-        let input_type = placed(vec![ShardingDimension::sharded(["a"]), ShardingDimension::replicated()]);
+        let input_type = placed(vec![ShardingDimension::replicated(), ShardingDimension::replicated()]);
         let cases = [
             (
                 input_type.clone().with_layout(Layout::Tiled(TiledLayout::new(vec![0, 1], vec![]))),
@@ -3205,12 +3203,12 @@ mod tests {
                 "},
             ),
             (
-                placed(vec![ShardingDimension::sharded(["a", "x"]), ShardingDimension::replicated()]),
+                placed(vec![ShardingDimension::sharded(["x"]), ShardingDimension::replicated()]),
                 indoc! {"
                     module {
                       sdy.mesh @mesh = <[\"x\"=2, \"a\"=2]>
                       func.func @main(%arg0: tensor<4x4xf64>) -> tensor<4x4xf64> {
-                        %0 = sdy.sharding_constraint %arg0 <@mesh, [{\"a\", \"x\", ?}, {?}]> : tensor<4x4xf64>
+                        %0 = sdy.sharding_constraint %arg0 <@mesh, [{\"x\", ?}, {?}]> : tensor<4x4xf64>
                         return %0 : tensor<4x4xf64>
                       }
                     }
@@ -3219,7 +3217,7 @@ mod tests {
                     module {
                       sdy.mesh @mesh = <[\"x\"=2, \"a\"=2]>
                       func.func @main(%arg0: tensor<4x4xf64>) -> tensor<4x4xf64> {
-                        %0 = sdy.sharding_constraint %arg0 <@mesh, [{\"a\", \"x\", ?}, {?}]> : tensor<4x4xf64>
+                        %0 = sdy.sharding_constraint %arg0 <@mesh, [{\"x\", ?}, {?}]> : tensor<4x4xf64>
                         return %0 : tensor<4x4xf64>
                       }
                     }
@@ -3266,23 +3264,11 @@ mod tests {
             }
         }
 
-        // An explicit axis major to `a` changes which block of the array each auto shard holds.
-        let mut builder = ProgramBuilder::new();
-        let input = builder.add_input(input_type.clone());
+        // No cast type can place anything over `a`.
         assert!(matches!(
-            builder.add_instruction(
-                CastOperation::unchecked(
-                    placed(vec![ShardingDimension::sharded(["x", "a"]), ShardingDimension::replicated()]),
-                    vec![input_type],
-                )
-                .unwrap(),
-                vec![],
-                vec![input],
-                None,
-            ),
-            Err(ProgramError::Type(TypeError::Invalid { message }))
-                if message == "`cast` cannot change the mesh axes up to the last auto or manual mesh axis of \
-                    dimension 0; only explicit mesh axes minor to every auto and manual axis may change",
+            ArrayType::new_static(DataType::F64, [4, 4])
+                .with_sharding(sharding(vec![ShardingDimension::sharded(["x", "a"]), ShardingDimension::replicated()])),
+            Err(ShardingError::AutoAxisInArrayType { .. }),
         ));
     }
 
@@ -3293,7 +3279,8 @@ mod tests {
         use crate::ToPjrt;
 
         // Carrying the auto and explicit placement forward emits no constraint, so every device keeps its own shard
-        // and only the physical layout of the result changes.
+        // and only the physical layout of the result changes. Types record no placement over the auto axis `a`, so the
+        // placement over it is only an argument and result sharding of the lowered module.
         let mesh = LogicalMesh::new(vec![
             MeshAxis::new("x", 2, MeshAxisType::Explicit).unwrap(),
             MeshAxis::new("a", 2, MeshAxisType::Auto).unwrap(),
@@ -3301,7 +3288,8 @@ mod tests {
         .unwrap();
         let sharding =
             Sharding::new(mesh, vec![ShardingDimension::sharded(["a"]), ShardingDimension::replicated()]).unwrap();
-        let input_type = ArrayType::new_static(DataType::F64, [4, 4]).with_sharding(sharding.clone()).unwrap();
+        let input_type =
+            ArrayType::new_static(DataType::F64, [4, 4]).with_sharding(sharding.without_auto_axes()).unwrap();
         let layout = Layout::Tiled(TiledLayout::new(vec![0, 1], vec![]));
         let output_type = input_type.clone().with_layout(layout.clone());
         let mut builder = ProgramBuilder::new();
@@ -3636,38 +3624,37 @@ mod tests {
         assert!(!cast_changes_explicit_placement(&unsharded, &unsharded));
         assert!(!cast_changes_explicit_placement(&placed(&explicit_mesh, sharded(&["x"])), &unsharded));
 
-        // An unsharded input acquires a tracked placement only when the output mesh has explicit axes.
+        // An unsharded input acquires a tracked placement only when the output mesh has explicit axes. Types record no
+        // placement over auto mesh axes, so the placements below are replicated over them.
         assert!(cast_changes_explicit_placement(&unsharded, &placed(&explicit_mesh, replicated())));
-        assert!(!cast_changes_explicit_placement(&unsharded, &placed(&auto_mesh, sharded(&["a"]))));
+        assert!(!cast_changes_explicit_placement(&unsharded, &placed(&auto_mesh, replicated())));
 
-        // Carrying a mesh forward requests a redistribution only when the placement over explicit axes conflicts. Type
-        // inference only admits changes to the explicit axes minor to every auto and manual axis of a dimension, so
-        // every admitted change of the placement within one mesh is such a conflict.
+        // Carrying a mesh forward requests a redistribution only when the placement over explicit axes conflicts.
         assert!(!cast_changes_explicit_placement(
-            &placed(&explicit_mesh, sharded(&["a", "x"])),
-            &placed(&explicit_mesh, sharded(&["a", "x"])),
+            &placed(&explicit_mesh, sharded(&["x"])),
+            &placed(&explicit_mesh, sharded(&["x"])),
         ));
         assert!(cast_changes_explicit_placement(
-            &placed(&explicit_mesh, sharded(&["a", "x"])),
-            &placed(&explicit_mesh, sharded(&["a", "y"])),
+            &placed(&explicit_mesh, sharded(&["x"])),
+            &placed(&explicit_mesh, sharded(&["y"])),
         ));
         assert!(cast_changes_explicit_placement(
-            &placed(&explicit_mesh, sharded(&["a"])),
-            &placed(&explicit_mesh, sharded(&["a", "x"])),
+            &placed(&explicit_mesh, replicated()),
+            &placed(&explicit_mesh, sharded(&["x"])),
         ));
 
         // A mesh change requests one whenever either mesh has explicit axes, but never between auto-only meshes.
         assert!(cast_changes_explicit_placement(
-            &placed(&explicit_mesh, sharded(&["a"])),
-            &placed(&resized_mesh, sharded(&["a"])),
+            &placed(&explicit_mesh, replicated()),
+            &placed(&resized_mesh, replicated()),
         ));
         assert!(cast_changes_explicit_placement(
-            &placed(&explicit_mesh, sharded(&["a"])),
-            &placed(&auto_mesh, sharded(&["a"])),
+            &placed(&explicit_mesh, replicated()),
+            &placed(&auto_mesh, replicated()),
         ));
         assert!(!cast_changes_explicit_placement(
-            &placed(&auto_mesh, sharded(&["a"])),
-            &placed(&extended_auto_mesh, sharded(&["a"])),
+            &placed(&auto_mesh, replicated()),
+            &placed(&extended_auto_mesh, replicated()),
         ));
     }
 

@@ -1949,7 +1949,7 @@ mod tests {
 
     use crate::arrays::{Array, ArrayOperation, ArrayType, DataType};
     use crate::captures::CaptureReference;
-    use crate::compilation::domains::{CompilationDomain, Compile, DispatchPurpose};
+    use crate::compilation::domains::{CompilationDomain, Compile, DispatchInputs};
     use crate::compilation::functions::{CompilationTracer, StagedFunction, StagedProgram};
     use crate::contexts::Domain;
     use crate::programs::{ProgramError, TypedProgram};
@@ -2049,12 +2049,12 @@ mod tests {
         type Error = ProgramError;
 
         fn dispatch_signature(
-            input_types: Vec<ArrayType>,
+            inputs: DispatchInputs<'_, '_, Self::Value>,
             _options: &Self::Options,
-            _purpose: DispatchPurpose,
-        ) -> Result<(Self::DispatchKey, Arc<[ArrayType]>), Self::Error> {
+        ) -> Result<(Self::DispatchKey, Arc<[ArrayType]>, Option<Self::Options>), Self::Error> {
+            let input_types = inputs.into_types();
             let input_types: Arc<[ArrayType]> = input_types.into();
-            Ok((input_types.clone(), input_types))
+            Ok((input_types.clone(), input_types, None))
         }
 
         fn lower(&self, staged: &StagedProgram<Self>) -> Result<Self::LoweredProgram, Self::Error> {

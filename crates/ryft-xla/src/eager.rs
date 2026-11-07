@@ -4443,11 +4443,15 @@ mod tests {
         ));
 
         let sharding = Sharding::new(mesh.logical_mesh().clone(), vec![ShardingDimension::sharded(["x"])]).unwrap();
-        let sharded_type = ArrayType::new(DataType::F32, Shape::new(vec![CoreDimension::Static(5)]))
-            .with_sharding(sharding)
-            .unwrap();
-        let sharded =
-            Array::from_host_buffer(&domain, sharded_type, mesh.clone(), values_to_bytes::<f32>(&[0.0; 5])).unwrap();
+        let sharded_type = ArrayType::new(DataType::F32, Shape::new(vec![CoreDimension::Static(5)]));
+        let sharded = Array::from_host_buffer_with_sharding(
+            &domain,
+            sharded_type,
+            sharding,
+            mesh.clone(),
+            values_to_bytes::<f32>(&[0.0; 5]),
+        )
+        .unwrap();
         assert_eq!(sharded.dimension_size(0), Ok(5));
 
         let scalar_type = replicated_type(&mesh, DataType::I32, &[]);
@@ -4634,23 +4638,29 @@ mod tests {
         let domain = Session::new(&client).domain();
         let mesh = cpu_mesh_with_axis_size(&client, 2);
         let sharding = Sharding::new(mesh.logical_mesh().clone(), vec![ShardingDimension::sharded(["x"])]).unwrap();
-        let input_type = ArrayType::new(DataType::C64, Shape::new(vec![CoreDimension::Static(4)]))
-            .with_sharding(sharding.clone())
-            .unwrap();
+        let input_type = ArrayType::new(DataType::C64, Shape::new(vec![CoreDimension::Static(4)]));
         let values = [
             num_complex::Complex::new(3.0f32, 4.0),
             num_complex::Complex::new(5.0f32, 12.0),
             num_complex::Complex::new(8.0f32, 15.0),
             num_complex::Complex::new(7.0f32, 24.0),
         ];
-        let input =
-            Array::from_host_buffer(&domain, input_type, mesh.clone(), values_to_bytes(&values).as_slice()).unwrap();
+        let input = Array::from_host_buffer_with_sharding(
+            &domain,
+            input_type,
+            sharding.clone(),
+            mesh.clone(),
+            values_to_bytes(&values).as_slice(),
+        )
+        .unwrap();
 
+        // Types record no placement over the auto mesh axis, which only the runtime placement of the output carries.
         let output: Array<'_> = batch(|input| input.abs(), input, BatchAxis::new(0), BatchAxis::new(0), None).unwrap();
         let expected_type = ArrayType::new(DataType::F32, Shape::new(vec![CoreDimension::Static(4)]))
-            .with_sharding(sharding)
+            .with_sharding(sharding.without_auto_axes())
             .unwrap();
         assert_eq!(output.r#type().as_ref(), &expected_type);
+        assert_eq!(output.sharding(), &sharding);
         for (actual, expected) in read_f64_coordinates(&output).into_iter().zip([5.0, 13.0, 17.0, 25.0]) {
             assert!((actual - expected).abs() < 1e-5, "expected {expected} but got {actual}");
         }
@@ -4815,19 +4825,19 @@ mod tests {
         let domain = Session::new(&client).domain();
         let mesh = cpu_mesh_with_axis_size(&client, 2);
         let sharding = Sharding::new(mesh.logical_mesh().clone(), vec![ShardingDimension::sharded(["x"])]).unwrap();
-        let r#type = ArrayType::new(DataType::F32, Shape::new(vec![CoreDimension::Static(4)]))
-            .with_sharding(sharding.clone())
-            .unwrap();
-        let primal = Array::from_host_buffer(
+        let r#type = ArrayType::new(DataType::F32, Shape::new(vec![CoreDimension::Static(4)]));
+        let primal = Array::from_host_buffer_with_sharding(
             &domain,
             r#type.clone(),
+            sharding.clone(),
             mesh.clone(),
             values_to_bytes::<f32>(&[1.0, 2.0, 3.0, 4.0]).as_slice(),
         )
         .unwrap();
-        let capture = Array::from_host_buffer(
+        let capture = Array::from_host_buffer_with_sharding(
             &domain,
             r#type,
+            sharding.clone(),
             mesh.clone(),
             values_to_bytes::<f32>(&[4.0, 5.0, 6.0, 7.0]).as_slice(),
         )
@@ -5058,11 +5068,10 @@ mod tests {
         let domain = Session::new(&client).domain();
         let mesh = cpu_mesh_with_axis_size(&client, 2);
         let sharding = Sharding::new(mesh.logical_mesh().clone(), vec![ShardingDimension::sharded(["x"])]).unwrap();
-        let r#type = ArrayType::new(DataType::F32, Shape::new(vec![CoreDimension::Static(4)]))
-            .with_sharding(sharding)
-            .unwrap();
+        let r#type = ArrayType::new(DataType::F32, Shape::new(vec![CoreDimension::Static(4)]));
         let bytes = values_to_bytes::<f32>(&[1.0, 2.0, 3.0, 4.0]);
-        let x = Array::from_host_buffer(&domain, r#type, mesh.clone(), bytes.as_slice()).unwrap();
+        let x =
+            Array::from_host_buffer_with_sharding(&domain, r#type, sharding, mesh.clone(), bytes.as_slice()).unwrap();
         let domain = x.domain();
         let jacobian = domain.differentiate_at(x).jacobian_forward(|x| Mul::mul(&x, &x)).unwrap();
 
@@ -5087,11 +5096,10 @@ mod tests {
         let domain = Session::new(&client).domain();
         let mesh = cpu_mesh_with_axis_size(&client, 2);
         let sharding = Sharding::new(mesh.logical_mesh().clone(), vec![ShardingDimension::sharded(["x"])]).unwrap();
-        let r#type = ArrayType::new(DataType::F32, Shape::new(vec![CoreDimension::Static(4)]))
-            .with_sharding(sharding)
-            .unwrap();
+        let r#type = ArrayType::new(DataType::F32, Shape::new(vec![CoreDimension::Static(4)]));
         let bytes = values_to_bytes::<f32>(&[1.0, 2.0, 3.0, 4.0]);
-        let x = Array::from_host_buffer(&domain, r#type, mesh.clone(), bytes.as_slice()).unwrap();
+        let x =
+            Array::from_host_buffer_with_sharding(&domain, r#type, sharding, mesh.clone(), bytes.as_slice()).unwrap();
         let jacobian = differentiate_at(x).jacobian_reverse(|x| Mul::mul(&x, &x)).unwrap();
 
         let block = jacobian.iter_blocks().next().unwrap();

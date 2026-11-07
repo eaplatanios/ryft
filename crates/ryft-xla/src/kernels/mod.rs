@@ -417,7 +417,7 @@ pub(crate) mod tests {
     use pretty_assertions::assert_eq;
     use ryft_core::{
         Array as CoreArray, ArrayIrOperation, ArrayIrValue, Context, DataType, Placeholder,
-        ProgramBuilder as CoreProgramBuilder, ReferenceRead, ReferenceWrite,
+        ProgramBuilder as CoreProgramBuilder, ReferenceRead, ReferenceWrite, ShardingError,
     };
     use ryft_kernels::{
         BlockMapping, BoundaryPolicy, Grid, KernelCallOperation, KernelCompilationError, KernelParameter,
@@ -799,14 +799,12 @@ pub(crate) mod tests {
             Err(KernelEmbeddingError::Invalid { message })
                 if message == "kernel parameter 0 requires a local shard with all partitioned axes bound by `shard_map`",
         ));
+        // Types cannot record placement over auto mesh axes, so no kernel parameter is partitioned over one.
         let mesh = LogicalMesh::new(vec![MeshAxis::new("device", 2, MeshAxisType::Auto).unwrap()]).unwrap();
-        let automatic = ArrayType::new_static(DataType::F32, [8])
-            .with_sharding(Sharding::new(mesh, vec![ShardingDimension::Sharded(vec!["device".to_owned()])]).unwrap())
-            .unwrap();
+        let automatic = Sharding::new(mesh, vec![ShardingDimension::Sharded(vec!["device".to_owned()])]).unwrap();
         assert!(matches!(
-            validate_kernel_sharding(&[automatic], &bound),
-            Err(KernelEmbeddingError::Invalid { message })
-                if message == "kernel parameter 0 requires a local shard with all partitioned axes bound by `shard_map`",
+            ArrayType::new_static(DataType::F32, [8]).with_sharding(automatic),
+            Err(ShardingError::AutoAxisInArrayType { .. }),
         ));
     }
 }

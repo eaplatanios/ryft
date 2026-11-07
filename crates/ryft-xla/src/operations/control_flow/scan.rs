@@ -2769,11 +2769,12 @@ mod tests {
     }
 
     #[test]
-    fn test_scan_lowering_admits_stacks_sharded_over_auto_mesh_axes() {
-        // A stack whose scan axis is sharded over an `Auto` mesh axis has replicated slices, which match a replicated
-        // body declaration. The entry check uses the declared stacked types of core `scan` validation, which omit
-        // shardings, so it accepts such a stack whatever the trip count is.
+    fn test_scan_lowering_admits_stacks_placed_over_auto_mesh_axes() {
+        // A stack whose scan axis is placed over an `Auto` mesh axis has a replicated type, because types record no
+        // placement over auto mesh axes, and so its slices match a replicated body declaration whatever the trip count
+        // is. The placement over the auto mesh axis is only an argument sharding of the lowered module.
         let mesh = LogicalMesh::new(vec![MeshAxis::new("x", 2, MeshAxisType::Auto).unwrap()]).unwrap();
+        let stacked_sharding = vec![Sharding::new(mesh.clone(), vec![ShardingDimension::sharded(["x"])]).unwrap()];
         let slice_type = ArrayType::scalar(DataType::F64).with_sharding(Sharding::replicated(mesh.clone(), 0)).unwrap();
         let body = {
             let mut builder = ArrayIrProgramBuilder::new();
@@ -2788,7 +2789,9 @@ mod tests {
                 0,
                 indoc! {"
                     module {
-                      func.func @main(%arg0: tensor<0xf64>) -> tensor<0xf64> {
+                      sdy.mesh @mesh = <[\"x\"=2]>
+                      func.func @main(%arg0: tensor<0xf64> {sdy.sharding = #sdy.sharding<@mesh, [{\"x\"}]>}) -> \
+                    tensor<0xf64> {
                         %cst = stablehlo.constant dense<0.000000e+00> : tensor<f64>
                         %0 = stablehlo.broadcast_in_dim %cst, dims = [] : (tensor<f64>) -> tensor<0xf64>
                         return %0 : tensor<0xf64>
@@ -2800,7 +2803,9 @@ mod tests {
                 4,
                 indoc! {"
                     module {
-                      func.func @main(%arg0: tensor<4xf64>) -> tensor<4xf64> {
+                      sdy.mesh @mesh = <[\"x\"=2]>
+                      func.func @main(%arg0: tensor<4xf64> {sdy.sharding = #sdy.sharding<@mesh, [{\"x\"}]>}) -> \
+                    tensor<4xf64> {
                         %c = stablehlo.constant dense<0> : tensor<i64>
                         %cst = stablehlo.constant dense<0.000000e+00> : tensor<f64>
                         %0 = stablehlo.broadcast_in_dim %cst, dims = [] : (tensor<f64>) -> tensor<4xf64>
@@ -2828,7 +2833,7 @@ mod tests {
             ),
         ] {
             let stacked_type = ArrayType::new_static(DataType::F64, [length])
-                .with_sharding(Sharding::new(mesh.clone(), vec![ShardingDimension::sharded(["x"])]).unwrap())
+                .with_sharding(Sharding::replicated(mesh.clone(), 1))
                 .unwrap();
             let mut builder = ArrayIrProgramBuilder::new();
             let region = builder.import_region(body.entry_region_ref());
@@ -2847,9 +2852,16 @@ mod tests {
                 .unwrap();
             let output_type = program.output_types().into_owned().remove(0);
             let output_type = <&ArrayType>::try_from(&output_type).unwrap().clone();
-            let module =
-                to_mlir_module_for_program(&program, &[], &[stacked_type.clone()], &[output_type], "main", None, None)
-                    .unwrap();
+            let module = to_mlir_module_for_program(
+                &program,
+                &[],
+                &[stacked_type.clone()],
+                &[output_type],
+                "main",
+                Some(&stacked_sharding),
+                None,
+            )
+            .unwrap();
             assert_eq!(module, expected, "length {length}");
         }
     }
@@ -2951,14 +2963,15 @@ mod tests {
             })
             .collect::<Vec<Vec<Vec<f32>>>>();
         let values = (0..32).map(|value| value as f32).collect::<Vec<_>>();
-        assert_eq!(execute_on_two_devices(&client, &mesh, &module, &[(&stack_type, &values)]), expected);
+        assert_eq!(execute_on_two_devices(&client, &mesh, &module, &[(&stack_type, None, &values)]), expected);
     }
 
     #[test]
     fn test_scan_lowering_constrains_results_of_mixed_explicit_and_auto_meshes() {
         // The mesh has the explicit axis `x` of size 1 and the `Auto` axis `y` of size 2. The body passes a replicated
-        // carry through and negates each `f32[8]` row of an `f32[4, 8]` stack whose second axis is sharded over `y`, so
-        // neither result places anything over the explicit axis. Their mesh has an explicit axis, though, so both
+        // carry through and negates each `f32[8]` row of an `f32[4, 8]` stack whose second axis is placed over `y` by
+        // the argument and result shardings of the module, so neither result places anything over the explicit axis
+        // and their types record no placement over the auto axis. Their mesh has an explicit axis, though, so both
         // results are still constrained to the placements that their types state, with the dimensions of the rank-2
         // result left open over the auto axis.
         let (client, _) = two_device_mesh(MeshAxisType::Auto);
@@ -2980,12 +2993,15 @@ mod tests {
         let carry_sharding = Sharding::replicated(logical_mesh.clone(), 0);
         let carry_type = ArrayType::scalar(DataType::F32).with_sharding(carry_sharding.clone()).unwrap();
         let slice_type = ArrayType::new_static(DataType::F32, [8])
-            .with_sharding(Sharding::new(logical_mesh.clone(), vec![ShardingDimension::sharded(["y"])]).unwrap())
+            .with_sharding(Sharding::replicated(logical_mesh.clone(), 1))
             .unwrap();
-        let stack_sharding =
-            Sharding::new(logical_mesh, vec![ShardingDimension::replicated(), ShardingDimension::sharded(["y"])])
-                .unwrap();
-        let stack_type = ArrayType::new_static(DataType::F32, [4, 8]).with_sharding(stack_sharding.clone()).unwrap();
+        let stack_sharding = Sharding::new(
+            logical_mesh.clone(),
+            vec![ShardingDimension::replicated(), ShardingDimension::sharded(["y"])],
+        )
+        .unwrap();
+        let stack_type =
+            ArrayType::new_static(DataType::F32, [4, 8]).with_sharding(Sharding::replicated(logical_mesh, 2)).unwrap();
         let body = {
             let mut builder = ArrayIrProgramBuilder::new();
             builder.add_input(ArrayType::scalar(DataType::I64).into());
@@ -3021,8 +3037,8 @@ mod tests {
                 ]
                 in (%2, %3)",
                 carry = "f32[][sharding={mesh<['x'=1:explicit, 'y'=2:auto]>, []}]",
-                stack = "f32[4, 8][sharding={mesh<['x'=1:explicit, 'y'=2:auto]>, [{}, {'y'}]}]",
-                slice = "f32[8][sharding={mesh<['x'=1:explicit, 'y'=2:auto]>, [{'y'}]}]",
+                stack = "f32[4, 8][sharding={mesh<['x'=1:explicit, 'y'=2:auto]>, [{}, {}]}]",
+                slice = "f32[8][sharding={mesh<['x'=1:explicit, 'y'=2:auto]>, [{}]}]",
             ),
         );
         let types = vec![carry_type.clone(), stack_type.clone()];
@@ -3063,7 +3079,7 @@ mod tests {
                 tensor<4x8xf32>
                     }
                     %2 = sdy.sharding_constraint %1#1 <@mesh, [], replicated={\"x\"}> : tensor<f32>
-                    %3 = sdy.sharding_constraint %1#3 <@mesh, [{?}, {\"y\", ?}], replicated={\"x\"}> : tensor<4x8xf32>
+                    %3 = sdy.sharding_constraint %1#3 <@mesh, [{?}, {?}], replicated={\"x\"}> : tensor<4x8xf32>
                     return %2, %3 : tensor<f32>, tensor<4x8xf32>
                   }
                 }
@@ -3082,7 +3098,12 @@ mod tests {
             .collect::<Vec<Vec<Vec<f32>>>>();
         let values = (0..32).map(|value| value as f32).collect::<Vec<_>>();
         assert_eq!(
-            execute_on_two_devices(&client, &mesh, &module, &[(&carry_type, &[5.0]), (&stack_type, &values)]),
+            execute_on_two_devices(
+                &client,
+                &mesh,
+                &module,
+                &[(&carry_type, None, &[5.0]), (&stack_type, Some(&shardings[1]), &values)],
+            ),
             expected,
         );
     }
@@ -3246,7 +3267,7 @@ mod tests {
                 &client,
                 &mesh,
                 &module,
-                &[(&sum_type, &[100.0, 200.0]), (&items_type, &[1.0, 10.0, 2.0, 20.0])],
+                &[(&sum_type, None, &[100.0, 200.0]), (&items_type, None, &[1.0, 10.0, 2.0, 20.0])],
             ),
             vec![vec![vec![103.0], vec![101.0, 103.0]], vec![vec![230.0], vec![210.0, 230.0]]],
         );

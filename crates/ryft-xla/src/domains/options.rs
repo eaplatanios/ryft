@@ -93,11 +93,27 @@ pub struct Options {
     /// Concrete device mesh the compiled program runs against.
     pub mesh: DeviceMesh,
 
-    /// Optional override for per-input shardings.
+    /// Optional override for per-input shardings. An override may place an input over auto mesh axes, which the
+    /// staged input type does not record (refer to [`ArrayType::with_sharding`](ryft_core::ArrayType::with_sharding)):
+    /// the type carries the override without its auto mesh axes, and the executable argument is placed as the override
+    /// requests.
     pub input_shardings: Option<Vec<Sharding>>,
 
-    /// Optional override for per-output shardings.
+    /// Optional override for per-output shardings. Like [`Self::input_shardings`], an override may place an output over
+    /// auto mesh axes, which only its runtime placement records.
     pub output_shardings: Option<Vec<Sharding>>,
+
+    /// Runtime placements of the flat public inputs of one executable specialization, which retained dispatch derives
+    /// from the concrete input arrays (refer to
+    /// [`CompilationDomain::dispatch_signature`](ryft_core::CompilationDomain::dispatch_signature)).
+    /// They place the executable arguments of inputs without an override over the auto mesh axes that input types
+    /// never record, like JAX compiles for the shardings of committed input arrays. Entries of non-array inputs are
+    /// [`None`].
+    pub(crate) input_placements: Option<Arc<[Option<Sharding>]>>,
+
+    /// Runtime placements of the captured arrays of a staged program, which lowering derives from its capture table,
+    /// with the same role as [`Self::input_placements`] for the leading capture arguments.
+    pub(crate) capture_placements: Option<Arc<[Option<Sharding>]>>,
 
     /// Optional flat per-input donation flags. `None` donates nothing; a present vector must match the program's
     /// flat public input arity exactly, which lowering validates.
@@ -123,6 +139,8 @@ impl Options {
             mesh,
             input_shardings: None,
             output_shardings: None,
+            input_placements: None,
+            capture_placements: None,
             donation_flags: None,
             feedback_directed_profile: None,
             input_bound_bucketing: None,
@@ -136,17 +154,23 @@ impl Options {
         self
     }
 
-    /// Sets the per-input sharding overrides that the SPMD partitioner reads at lowering time.
-    /// Length must equal the flat input arity once the program is traced; mismatches surface as
-    /// [`CompilationError::ShardingCountMismatch`](crate::CompilationError::ShardingCountMismatch) at compile time.
+    /// Sets the per-input sharding overrides, which replace the shardings of the flat input types before tracing.
+    /// Executions reshard concrete inputs to them, and calls of the staged function bring their inputs to them in the
+    /// calling context (refer to the [`compilation`](crate::compilation) module documentation). Their number must equal
+    /// the flat input arity, and a mismatch surfaces as
+    /// [`CompilationError::ShardingCountMismatch`](crate::CompilationError::ShardingCountMismatch).
     #[inline]
     pub fn with_input_shardings(mut self, input_shardings: Vec<Sharding>) -> Self {
         self.input_shardings = Some(input_shardings);
         self
     }
 
-    /// Sets the per-output sharding overrides for SPMD partitioning. Length must equal the flat
-    /// output arity once the program is traced.
+    /// Sets the per-output sharding overrides. The staging entry points of the [`compilation`](crate::compilation)
+    /// module stage them on the outputs of the traced function, through a `reshard` over explicit mesh axes and a
+    /// `constrain_sharding` over auto mesh axes, so that calls of the staged function return the output types that its
+    /// executions return, and lowering places the executable outputs accordingly. Their number must equal the flat
+    /// output arity, and a mismatch surfaces as
+    /// [`CompilationError::ShardingCountMismatch`](crate::CompilationError::ShardingCountMismatch).
     #[inline]
     pub fn with_output_shardings(mut self, output_shardings: Vec<Sharding>) -> Self {
         self.output_shardings = Some(output_shardings);
@@ -211,6 +235,8 @@ impl std::hash::Hash for Options {
         self.mesh.devices().hash(state);
         self.input_shardings.hash(state);
         self.output_shardings.hash(state);
+        self.input_placements.hash(state);
+        self.capture_placements.hash(state);
         self.donation_flags.hash(state);
         self.feedback_directed_profile.hash(state);
         self.input_bound_bucketing.hash(state);

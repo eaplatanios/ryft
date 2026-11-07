@@ -33,11 +33,11 @@ mod tests {
     };
     use ryft_pjrt::{ClientOptions, CpuClientOptions, load_cpu_plugin};
 
-    use crate::compilation::{CompileTracer, CompiledFunction, compile};
+    use crate::compilation::{CompileTracer, CompiledFunction, compile, compile_with_options};
     use crate::experimental::ArrayTracer;
     use crate::experimental::tracing::{TracedProgram, trace};
     use crate::tests::{values_from_bytes, values_to_bytes};
-    use crate::{Array, Domain, FromPjrt, Session};
+    use crate::{Array, Domain, FromPjrt, Options, Session};
 
     /// Four-device mesh whose axes `x` and `y` are both explicit.
     fn explicit_mesh() -> LogicalMesh {
@@ -245,10 +245,13 @@ mod tests {
         let input_sharding = sharding(&logical_mesh, &[Some("x"), None]);
         let output_sharding = Sharding::replicated(logical_mesh, 1);
 
-        // Every device holds the whole output, with the values of the JAX oracle `explicit_axes(x)`, whether the switch
-        // is compiled as one program or executed eagerly.
-        let expected =
-            vec![vec![1.5403022766113281f32, -1.4061393737792969, -0.36998140811920166, 1.7140724658966064]; 4];
+        // The output has the values of the JAX oracle `explicit_axes(x)`, whether the switch is compiled as one program
+        // or executed eagerly. Its type is replicated, because types record no placement over auto mesh axes, while
+        // the compiler chooses its runtime placement over them.
+        let expected = vec![1.5403022766113281f32, -1.4061393737792969, -0.36998140811920166, 1.7140724658966064];
+        let read = |array: &Array<'_>| {
+            values_from_bytes::<f32>(&crate::arrays_v0::host::materialize_dense_array_bytes(array).unwrap())
+        };
         let compiled: CompiledFunction<'_, ArrayType, ArrayType> = compile(
             {
                 let input_sharding = input_sharding.clone();
@@ -269,12 +272,12 @@ mod tests {
         .unwrap();
         let output = compiled.executable().execute(&domain, input.clone()).unwrap();
         assert_eq!(output.r#type().sharding(), Some(&output_sharding));
-        assert_eq!(read_device_f32s(&output), expected);
+        assert_eq!(read(&output), expected);
         let output =
             explicit_axes(|input: Array<'_>| input.cos()?.reduce_sum(&[1], None), input, Some(&["x"]), input_sharding)
                 .unwrap();
         assert_eq!(output.r#type().sharding(), Some(&output_sharding));
-        assert_eq!(read_device_f32s(&output), expected);
+        assert_eq!(read(&output), expected);
     }
 
     #[test]
@@ -334,10 +337,9 @@ mod tests {
 
     #[test]
     fn test_explicit_axes_gradient_of_inputs_placed_along_auto_axes_executes_on_cpu() {
-        // A concrete input records its placement along the auto axes `x` and `y`. The transposition of the entry
-        // reshard targets only explicit axes and restores that placement with a placement-only broadcast, so the
-        // gradient through `explicit_axes` keeps the input's placement, with the values of the JAX oracle
-        // `grad explicit_axes`.
+        // A concrete input is placed along the auto axes `x` and `y`, which its type does not record, so the compiled
+        // function takes that placement as an input sharding override. The gradient through `explicit_axes` keeps the
+        // input's placement, with the values of the JAX oracle `grad explicit_axes`.
         let plugin = load_cpu_plugin().unwrap();
         let client = plugin
             .client(ClientOptions::CPU(CpuClientOptions { device_count: Some(4), ..Default::default() }))
@@ -351,16 +353,17 @@ mod tests {
         )
         .unwrap();
         let input_placement = sharding(&logical_mesh, &[Some("x"), Some("y")]);
-        let input_type = ArrayType::new_static(DataType::F32, [4, 2]).with_sharding(input_placement.clone()).unwrap();
-        let input = Array::from_host_buffer(
+        let input_type = ArrayType::new_static(DataType::F32, [4, 2]);
+        let input = Array::from_host_buffer_with_sharding(
             &domain,
             input_type.clone(),
+            input_placement.clone(),
             mesh.clone(),
             values_to_bytes(&[0f32, 1.0, 2.0, 3.0, 4.0, 5.0, 6.0, 7.0]),
         )
         .unwrap();
         let input_sharding = sharding(&logical_mesh, &[Some("x"), None]);
-        let compiled: CompiledFunction<'_, ArrayType, ArrayType> = compile(
+        let compiled: CompiledFunction<'_, ArrayType, ArrayType> = compile_with_options(
             move |input: CompileTracer<'_>| {
                 let gradient = differentiate_at(input.into_value())
                     .gradient(|input| {
@@ -378,11 +381,12 @@ mod tests {
             },
             input_type,
             &domain,
-            mesh,
+            Options::new(mesh).with_input_shardings(vec![input_placement.clone()]),
         )
         .unwrap();
-        let gradient = compiled.executable().execute(&domain, input).unwrap();
-        assert_eq!(gradient.r#type().sharding(), Some(&input_placement));
+        let gradient = compiled.executable().execute(&domain, input.clone()).unwrap();
+        assert_eq!(gradient.r#type(), input.r#type());
+        assert_eq!(gradient.sharding(), &input_placement);
         let gradient = crate::arrays_v0::host::materialize_dense_array_bytes(&gradient).unwrap();
         let expected = [1.0f32, -0.30116868, -2.2347417, -1.4133525, 2.3735664, 5.078284, 2.6366632, -3.8450038];
         for (actual, expected) in values_from_bytes::<f32>(gradient.as_slice()).iter().zip(expected) {

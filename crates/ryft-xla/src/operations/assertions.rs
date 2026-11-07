@@ -1657,6 +1657,7 @@ mod tests {
             Some("cpu"),
             &[],
             RaggedDotLoweringStrategy::default(),
+            &[],
         )
         .unwrap();
         assert!(lowered.requires_assertion_handler);

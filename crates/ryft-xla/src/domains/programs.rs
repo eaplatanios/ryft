@@ -72,6 +72,16 @@ pub struct LoweredProgram {
     /// Effective sharding expected for every physical executable argument, including materialized captures first.
     pub(super) expected_argument_shardings: Arc<[Sharding]>,
 
+    /// Runtime placement of every logical output over all mesh axes (including the auto mesh axes that output types
+    /// never record), including hidden final reference states after the public result. The placement of an output
+    /// flagged in [`Self::open_outputs`] is only the placement that its type records, and compilation resolves its
+    /// placement over auto mesh axes from the executable.
+    pub(super) output_shardings: Arc<[Sharding]>,
+
+    /// Whether lowering left each logical output open over auto mesh axes, so that the compiler chooses its placement
+    /// over them (like JAX does for outputs without `out_shardings`).
+    pub(super) open_outputs: Arc<[bool]>,
+
     /// Concrete mesh against which the module was lowered.
     pub(super) mesh: DeviceMesh,
 
@@ -206,6 +216,10 @@ pub struct CompiledProgram<'c> {
 
     /// Effective sharding of every physical executable argument, including materialized captures first.
     pub(super) expected_argument_shardings: Arc<[Sharding]>,
+
+    /// Runtime placement of every logical output over all mesh axes (including the auto mesh axes that output types
+    /// never record), including hidden final reference states after the public result.
+    pub(super) output_shardings: Arc<[Sharding]>,
 
     /// Concrete device mesh used for compilation and execution.
     pub(super) mesh: DeviceMesh,
@@ -382,6 +396,7 @@ impl InvocationMetadata<'_> {
             Some("capture count")
         } else if self.expected_argument_shardings != other.expected_argument_shardings {
             Some("argument shardings")
+
         } else if self.mesh != other.mesh {
             Some("device mesh")
         } else if self.kernel_execution_facts != other.kernel_execution_facts {

@@ -92,8 +92,8 @@ impl<'o> Array<'o> {
         let global_shape = self.shape();
         let global_dimensions = global_shape.as_slice();
         if self.data_type().is_zero() {
-            let r#type = self.r#type().into_owned().with_sharding(target_sharding)?;
-            let mut output = Self::from_zero_space(engine, r#type, target_mesh)?;
+            let r#type = self.r#type().into_owned().with_sharding(None)?;
+            let mut output = Self::from_zero_space(engine, r#type, Some(target_sharding), target_mesh)?;
             if let Some(fence) = self.execution_fence() {
                 output = output.with_execution_fence(fence.clone());
             }
@@ -109,8 +109,14 @@ impl<'o> Array<'o> {
             &target_sharding,
         )? {
             let shape = Shape::new(global_dimensions.iter().copied().map(CoreDimension::Static).collect());
-            let array_type = self.r#type().into_owned().with_shape(shape).with_sharding(target_sharding)?;
-            return Ok(Self::from_addressable_buffers(engine, array_type, target_mesh, addressable_buffers)?);
+            let array_type = self.r#type().into_owned().with_shape(shape).with_sharding(None)?;
+            return Ok(Self::from_addressable_buffers_with_sharding(
+                engine,
+                array_type,
+                target_sharding,
+                target_mesh,
+                addressable_buffers,
+            )?);
         }
 
         // Tier 2: compiled-XLA SPMD path. Captures whatever error the path produces so we can
@@ -136,8 +142,14 @@ impl<'o> Array<'o> {
             Err(_) => return Err(compiled_error),
         };
         let shape = Shape::new(global_dimensions.iter().copied().map(CoreDimension::Static).collect());
-        let host_type = ArrayType::new(self.data_type(), shape).with_sharding(target_sharding.clone())?;
-        match Self::from_host_buffer(engine, host_type, target_mesh, host_bytes.as_slice()) {
+        let host_type = ArrayType::new(self.data_type(), shape);
+        match Self::from_host_buffer_with_sharding(
+            engine,
+            host_type,
+            target_sharding.clone(),
+            target_mesh,
+            host_bytes.as_slice(),
+        ) {
             Ok(array) => Ok(array),
             Err(_) => Err(compiled_error),
         }

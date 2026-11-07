@@ -5,13 +5,13 @@ use std::time::Instant;
 use prost::Message;
 use ryft_core::{
     ArrayIrType, ArrayOperation, ArrayType, CompilationCacheDomain, CompilationDomain, Dimension as CoreDimension,
-    DimensionBounds, DimensionVariable, DispatchPurpose, ExternalReferenceBinding, FlatProgram as CoreFlatProgram,
-    Memory, Operation as CoreOperation, Parameterized, ProgramError, ReductionKind, ReferenceDischargeResult,
-    ScatterMode, ScatterReductionKind, Shape, Sharding, SortDirection, StagedProgram, Type, TypeError, Typed,
-    TypedProgram,
+    DimensionBounds, DimensionVariable, DispatchInputs, ExternalReferenceBinding, FlatProgram as CoreFlatProgram,
+    Memory, MeshAxisType, Operation as CoreOperation, Parameterized, ProgramError, ReductionKind,
+    ReferenceDischargeResult, ScatterMode, ScatterReductionKind, Shape, Sharding, ShardingDimension, SortDirection,
+    StagedProgram, Type, TypeError, Typed, TypedProgram,
 };
-use ryft_pjrt::Program as PjrtProgram;
-use ryft_pjrt::protos::CompilationOptions;
+use ryft_pjrt::protos::{CompilationOptions, OpShardingType};
+use ryft_pjrt::{LoadedExecutable, Program as PjrtProgram};
 
 use crate::domains::Domain;
 use crate::domains::execution::{ExecutionError, ExecutionPlan};
@@ -22,6 +22,7 @@ use crate::experimental::lowering::{
     collect_session_constants, contains_unresolved_references, contains_unresolved_state,
 };
 use crate::experimental::ops::{Constant, FlatProgram, Operation};
+use crate::sharding::sharding_from_op_sharding;
 use crate::{Error, Value};
 
 // TODO(eaplatanios): Review this module.
@@ -62,7 +63,21 @@ pub enum CompilationError {
 /// share one staged and compiled specialization. Bucketed keys exclude diagnostic names, which survive only in the
 /// effective staged types.
 #[derive(Clone, Debug, PartialEq, Eq, Hash)]
-pub struct DispatchKey(DispatchKeyKind);
+pub struct DispatchKey {
+    /// Signature component of this key.
+    kind: DispatchKeyKind,
+
+    /// Runtime placements of the public inputs of an executable specialization whose inputs are placed over auto mesh
+    /// axes, which their types never record (refer to [`Options::input_placements`]), or [`None`] when no input is.
+    placements: Option<Arc<[Option<Sharding>]>>,
+}
+
+impl DispatchKey {
+    /// Creates a [`DispatchKey`] without runtime placements.
+    fn new(kind: DispatchKeyKind) -> Self {
+        Self { kind, placements: None }
+    }
+}
 
 /// Internal representation of [`DispatchKey`].
 #[derive(Clone, Debug, PartialEq, Eq, Hash)]
@@ -166,81 +181,45 @@ impl<'c> CompilationDomain for Domain<'c> {
     type Options = Options;
     type Error = Error;
 
-    // Input shardings declared by the options change the staged types of both purposes. Input-bound bucketing applies
-    // only to independently dispatched executables, because a source call is lowered within its enclosing computation.
     fn dispatch_signature(
-        input_types: Vec<ArrayIrType>,
+        inputs: DispatchInputs<'_, '_, Self::Value>,
         options: &Self::Options,
-        purpose: DispatchPurpose,
-    ) -> Result<(Self::DispatchKey, Arc<[ArrayIrType]>), Self::Error> {
-        let input_types = apply_input_shardings(input_types, options)?;
-        let bucketing = match purpose {
-            DispatchPurpose::Source => None,
-            DispatchPurpose::Executable => options.input_bound_bucketing,
+    ) -> Result<(Self::DispatchKey, Arc<[ArrayIrType]>, Option<Self::Options>), Self::Error> {
+        let (input_types, values) = match inputs {
+            DispatchInputs::Types(input_types) => (input_types, None),
+            DispatchInputs::Values { values, types } => (types, Some(values)),
         };
-        let Some(bucketing) = bucketing else {
-            let input_types: Arc<[ArrayIrType]> = input_types.into();
-            return Ok((DispatchKey(DispatchKeyKind::Exact(input_types.clone())), input_types));
+        let input_count = input_types.len();
+        // Only independent executable requests apply bucketing. Staged calls retain their caller's signature.
+        let bucketing = values.as_ref().and(options.input_bound_bucketing);
+        let (key, input_types) = normalize_dispatch_signature(input_types, options, bucketing)?;
+        let Some(inputs) = values.filter(|_| options.input_shardings.is_none()) else {
+            return Ok((key, input_types, None));
         };
-        if options.mesh.devices().len() > 1 {
-            return Err(Error::Compilation(CompilationError::InvalidOptions {
-                reason: "input-bound bucketing is unsupported on multi-device meshes because bucketed dynamic \
-                         signatures require disabling the Shardy partitioner"
-                    .to_string(),
-            }));
-        }
-        let mut bucketed_array_types = Vec::with_capacity(input_types.len());
-        for (input_index, r#type) in input_types.iter().enumerate() {
-            let array_type = match r#type {
-                ArrayIrType::Array(array_type) => array_type,
-                ArrayIrType::Dimension(_) => {
-                    return Err(Error::Compilation(CompilationError::InvalidOptions {
-                        reason: format!(
-                            "input-bound bucketing only supports array inputs, but input {} has first-class dimension \
-                             type {}",
-                            input_index, r#type,
-                        ),
-                    }));
+
+        // Only placements that name auto mesh axes are missing from the input types, and the placement vector is only
+        // allocated once such an input appears, so that ordinary calls pay for no allocation.
+        let mut placements = None::<Vec<Option<Sharding>>>;
+        for (index, input) in inputs.enumerate() {
+            match input {
+                Value::Array(array) if array.sharding().references_auto_axis() => {
+                    placements.get_or_insert_with(|| vec![None; index]).push(Some(array.sharding().clone()))
                 }
-                ArrayIrType::Reference(_) => {
-                    return Err(Error::Compilation(CompilationError::UnsupportedReferenceAbi {
-                        reason: format!(
-                            "external reference input {input_index} does not support input-bound bucketing"
-                        ),
-                    }));
-                }
-            };
-            let dimensions = array_type
-                .shape()
-                .dimensions()
-                .iter()
-                .enumerate()
-                .map(|(axis, dimension)| match dimension {
-                    CoreDimension::Static(extent) => {
-                        let bound = match bucketing {
-                            InputBoundBucketing::PowerOfTwo => extent.checked_next_power_of_two(),
-                        }
-                        .and_then(|bound| bound.checked_add(1))
-                        .ok_or_else(|| ProgramError::InvalidArgument {
-                            message: format!(
-                                "cannot select a finite input-bound bucket for input {input_index} axis {axis} with \
-                                 extent {extent}",
-                            ),
-                        })?;
-                        let bounds = DimensionBounds::new(0, Some(bound))?;
-                        Ok(CoreDimension::Dynamic(DimensionVariable::new(
-                            format!("input_{input_index}_axis_{axis}"),
-                            bounds,
-                        )))
+                _ => {
+                    if let Some(placements) = &mut placements {
+                        placements.push(None);
                     }
-                    CoreDimension::Dynamic(variable) => Ok(CoreDimension::Dynamic(variable.clone())),
-                })
-                .collect::<Result<Vec<_>, ProgramError>>()?;
-            bucketed_array_types.push(array_type.clone().with_shape(Shape::new(dimensions)));
+                }
+            }
         }
-        let key = BucketedDispatchSignature::new(bucketed_array_types.as_slice());
-        let input_types = bucketed_array_types.into_iter().map(ArrayIrType::Array).collect::<Vec<_>>();
-        Ok((DispatchKey(DispatchKeyKind::Bucketed(key)), input_types.into()))
+        let Some(mut placements) = placements else {
+            return Ok((key, input_types, None));
+        };
+        placements.resize(input_count, None);
+        let placements: Arc<[_]> = placements.into();
+        let mut options = options.clone();
+        options.input_placements = Some(Arc::clone(&placements));
+        Ok((DispatchKey { placements: Some(placements), ..key }, input_types, Some(options)))
     }
 
     fn lower(&self, staged: &StagedProgram<Self>) -> Result<LoweredProgram, Self::Error> {
@@ -257,10 +236,30 @@ impl<'c> CompilationDomain for Domain<'c> {
             }));
         }
         validate_reference_outputs(program.as_ref(), capture_count, output_types)?;
+        validate_output_shardings(output_types, options)?;
+
+        // Captured arrays are placed as they are at runtime, including over the auto mesh axes that their types do not
+        // record, so that executions need not reshard them.
+        let capture_placements = staged
+            .source_program()
+            .captures()
+            .iter()
+            .map(|capture| match capture {
+                Value::Array(array) if array.sharding().references_auto_axis() => Some(array.sharding().clone()),
+                _ => None,
+            })
+            .collect::<Vec<_>>();
+        let placed_options;
+        let options = if capture_placements.iter().any(Option::is_some) {
+            placed_options = Options { capture_placements: Some(capture_placements.into()), ..options.clone() };
+            &placed_options
+        } else {
+            options
+        };
         let lowered_program = self.lower_program(program.as_ref(), capture_count, options)?;
         let lowered_output_types = lowered_program.output_types().to_vec();
-        // Lowering applies the output sharding overrides to the program outputs, so the traced output types of the
-        // staged function are checked against the lowered ones with those same overrides applied.
+        // Lowering gives the program outputs the types of the output sharding overrides without their auto mesh axes,
+        // so the staged output types are checked against the lowered ones with those same overrides applied.
         let declared_output_types =
             apply_signature_shardings(output_types.to_vec(), options.output_shardings.as_deref(), "output")?;
         validate_output_types(&declared_output_types, &lowered_output_types)?;
@@ -496,14 +495,37 @@ impl<'c> Domain<'c> {
             options.output_shardings.as_deref(),
             "output",
         )?;
+        // Executable arguments are placed as their runtime arrays are (or as an input override requests), including
+        // over the auto mesh axes that their types never record. Session constants are placed as their retained arrays.
+        let source_capture_count = lowered_capture_count - session_constants.len();
         let logical_argument_shardings = effective_input_types
             .iter()
-            .map(|array_type| {
-                array_type.sharding().cloned().unwrap_or_else(|| {
+            .enumerate()
+            .map(|(index, array_type)| {
+                let placement = if index < source_capture_count {
+                    options
+                        .capture_placements
+                        .as_deref()
+                        .and_then(|placements| placements.get(index).cloned().flatten())
+                } else if index < lowered_capture_count {
+                    let constant = &session_constants[index - source_capture_count];
+                    Some(self.session().constant(self, constant)?.sharding().clone())
+                } else {
+                    let index = index - lowered_capture_count;
+                    options.input_shardings.as_deref().and_then(|shardings| shardings.get(index).cloned()).or_else(
+                        || {
+                            options
+                                .input_placements
+                                .as_deref()
+                                .and_then(|placements| placements.get(index).cloned().flatten())
+                        },
+                    )
+                };
+                Ok(placement.or_else(|| array_type.sharding().cloned()).unwrap_or_else(|| {
                     Sharding::replicated(options.mesh.logical_mesh().clone(), array_type.shape().rank())
-                })
+                }))
             })
-            .collect::<Vec<_>>();
+            .collect::<Result<Vec<_>, Error>>()?;
         for (state, &logical_input_index) in reference_states.iter().zip(&reference_state_input_indices) {
             if effective_input_types[logical_input_index].static_shape().is_none() {
                 if state.output_index().is_some() {
@@ -537,23 +559,39 @@ impl<'c> Domain<'c> {
             .map(|r#type| <&ArrayType>::try_from(r#type).cloned())
             .collect::<Result<Vec<_>, _>>()
             .map_err(ProgramError::from)?;
-        let result_shardings = if reference_states.is_empty() {
-            output_types.iter().map(|array_type| array_type.sharding().cloned()).collect::<Option<Vec<_>>>()
-        } else {
-            let mut shardings = output_types
-                .iter()
-                .map(|array_type| {
-                    array_type.sharding().cloned().unwrap_or_else(|| {
-                        Sharding::replicated(options.mesh.logical_mesh().clone(), array_type.shape().rank())
-                    })
+        // Outputs are placed as an output override requests, including over auto mesh axes, and otherwise as their
+        // types are.
+        let output_placement = |index: usize, array_type: &ArrayType| {
+            options
+                .output_shardings
+                .as_deref()
+                .and_then(|shardings| shardings.get(index).cloned())
+                .or_else(|| array_type.sharding().cloned())
+        };
+        let mut output_shardings = output_types
+            .iter()
+            .enumerate()
+            .map(|(index, array_type)| {
+                output_placement(index, array_type).unwrap_or_else(|| {
+                    Sharding::replicated(options.mesh.logical_mesh().clone(), array_type.shape().rank())
                 })
-                .collect::<Vec<_>>();
+            })
+            .collect::<Vec<_>>();
+        let result_shardings = if reference_states.is_empty() {
+            output_types
+                .iter()
+                .enumerate()
+                .map(|(index, array_type)| output_placement(index, array_type))
+                .collect::<Option<Vec<_>>>()
+        } else {
+            let mut shardings = output_shardings.clone();
             // Mutated bindings cover the hidden output suffix in order, as validated above. Derive both the hidden
             // state type and its placement from the same input binding in one pass.
             for (state, &logical_input_index) in reference_states.iter().zip(&reference_state_input_indices) {
                 if state.is_mutated() {
                     output_types.push(effective_input_types[logical_input_index].clone());
                     shardings.push(logical_argument_shardings[logical_input_index].clone());
+                    output_shardings.push(logical_argument_shardings[logical_input_index].clone());
                 }
             }
             Some(shardings)
@@ -601,6 +639,25 @@ impl<'c> Domain<'c> {
         // so lower them without Shardy metadata and execute one replica per mesh device instead.
         let lowered_argument_shardings = use_shardy_partitioner.then_some(logical_argument_shardings.as_slice());
         let lowered_result_shardings = if use_shardy_partitioner { result_shardings.as_deref() } else { None };
+        // Public outputs without an override leave their placement over auto mesh axes to the compiler, like JAX
+        // outputs without `out_shardings`, and compilation reads that placement back from the executable. Axes of size
+        // one admit only one placement, so meshes without larger auto axes keep every result closed. Outputs with
+        // reduction state or manual variation, and hidden reference states, are always placed as declared, and outputs
+        // with unconstrained dimensions already leave their whole placement to the compiler (refer to `ExecutionPlan`).
+        let open_outputs = output_shardings
+            .iter()
+            .enumerate()
+            .map(|(index, sharding)| {
+                lowered_result_shardings.is_some()
+                    && index < output_count
+                    && options.output_shardings.is_none()
+                    && sharding.mesh().axes().iter().any(|axis| axis.r#type() == MeshAxisType::Auto && axis.size() > 1)
+                    && sharding.unreduced_axes().is_empty()
+                    && sharding.reduced_axes().is_empty()
+                    && sharding.varying_manual_axes().is_empty()
+                    && !sharding.dimensions().contains(&ShardingDimension::Unconstrained)
+            })
+            .collect::<Vec<_>>();
         let lowered_module = crate::experimental::lowering::lower_mlir_module_for_program_with_reference_state(
             program,
             effective_capture_types.as_slice(),
@@ -612,6 +669,7 @@ impl<'c> Domain<'c> {
             target_platform.as_deref(),
             reference_states,
             options.ragged_dot_lowering_strategy,
+            &open_outputs,
         )?;
         let (stable_hlo, signature, requires_assertion_handler, runtime_requirements) = lowered_module.into_parts();
         for (mapping, donation) in
@@ -637,6 +695,8 @@ impl<'c> Domain<'c> {
             capture_count: lowered_capture_count,
             session_constants: session_constants.into(),
             expected_argument_shardings: expected_argument_shardings.into(),
+            output_shardings: output_shardings.into(),
+            open_outputs: open_outputs.into(),
             mesh: options.mesh.clone(),
             platform_name: target.platform_name().into(),
             platform_version: target.platform_version().into(),
@@ -666,10 +726,12 @@ impl<'c> Domain<'c> {
         let compilation_start = Instant::now();
         let executable = self.client().compile(&pjrt_program, &program.compilation_options)?;
         let compilation_duration = compilation_start.elapsed();
+        let output_shardings = resolve_output_shardings(&executable, program)?;
         let plan = ExecutionPlan::new(
             &executable,
             &program.input_types,
             &program.output_types,
+            &output_shardings,
             &program.signature,
             &program.donation_flags,
             program.capture_count,
@@ -687,6 +749,7 @@ impl<'c> Domain<'c> {
             donation_flags: Arc::clone(&program.donation_flags),
             capture_count: program.capture_count,
             expected_argument_shardings: Arc::clone(&program.expected_argument_shardings),
+            output_shardings,
             mesh: program.mesh.clone(),
             compilation_options: program.compilation_options.clone(),
             platform_name: Arc::clone(&program.platform_name),
@@ -759,6 +822,118 @@ impl<'c> CompilationCacheDomain for Domain<'c> {
     }
 }
 
+/// Applies input sharding declarations and optional executable bucketing, without inspecting runtime values.
+fn normalize_dispatch_signature(
+    input_types: Vec<ArrayIrType>,
+    options: &Options,
+    bucketing: Option<InputBoundBucketing>,
+) -> Result<(DispatchKey, Arc<[ArrayIrType]>), Error> {
+    let input_types = apply_input_shardings(input_types, options)?;
+    let Some(bucketing) = bucketing else {
+        let input_types: Arc<[ArrayIrType]> = input_types.into();
+        return Ok((DispatchKey::new(DispatchKeyKind::Exact(input_types.clone())), input_types));
+    };
+    if options.mesh.devices().len() > 1 {
+        return Err(Error::Compilation(CompilationError::InvalidOptions {
+            reason: "input-bound bucketing is unsupported on multi-device meshes because bucketed dynamic \
+                     signatures require disabling the Shardy partitioner"
+                .to_string(),
+        }));
+    }
+    let mut bucketed_array_types = Vec::with_capacity(input_types.len());
+    for (input_index, r#type) in input_types.iter().enumerate() {
+        let array_type = match r#type {
+            ArrayIrType::Array(array_type) => array_type,
+            ArrayIrType::Dimension(_) => {
+                return Err(Error::Compilation(CompilationError::InvalidOptions {
+                    reason: format!(
+                        "input-bound bucketing only supports array inputs, but input {} has first-class dimension \
+                         type {}",
+                        input_index, r#type,
+                    ),
+                }));
+            }
+            ArrayIrType::Reference(_) => {
+                return Err(Error::Compilation(CompilationError::UnsupportedReferenceAbi {
+                    reason: format!("external reference input {input_index} does not support input-bound bucketing"),
+                }));
+            }
+        };
+        let dimensions = array_type
+            .shape()
+            .dimensions()
+            .iter()
+            .enumerate()
+            .map(|(axis, dimension)| match dimension {
+                CoreDimension::Static(extent) => {
+                    let bound = match bucketing {
+                        InputBoundBucketing::PowerOfTwo => extent.checked_next_power_of_two(),
+                    }
+                    .and_then(|bound| bound.checked_add(1))
+                    .ok_or_else(|| ProgramError::InvalidArgument {
+                        message: format!(
+                            "cannot select a finite input-bound bucket for input {input_index} axis {axis} with \
+                             extent {extent}",
+                        ),
+                    })?;
+                    let bounds = DimensionBounds::new(0, Some(bound))?;
+                    Ok(CoreDimension::Dynamic(DimensionVariable::new(
+                        format!("input_{input_index}_axis_{axis}"),
+                        bounds,
+                    )))
+                }
+                CoreDimension::Dynamic(variable) => Ok(CoreDimension::Dynamic(variable.clone())),
+            })
+            .collect::<Result<Vec<_>, ProgramError>>()?;
+        bucketed_array_types.push(array_type.clone().with_shape(Shape::new(dimensions)));
+    }
+    let key = BucketedDispatchSignature::new(bucketed_array_types.as_slice());
+    let input_types = bucketed_array_types.into_iter().map(ArrayIrType::Array).collect::<Vec<_>>();
+    Ok((DispatchKey::new(DispatchKeyKind::Bucketed(key)), input_types.into()))
+}
+
+/// Returns the runtime placement of every output of `program` compiled as `executable`. The placement of an output
+/// that lowering left open over auto mesh axes (refer to [`LoweredProgram::open_outputs`]) is the placement that the
+/// compiler chose for it, which must agree with the placement that the output type records over the other mesh axes.
+fn resolve_output_shardings(
+    executable: &LoadedExecutable<'_>,
+    program: &LoweredProgram,
+) -> Result<Arc<[Sharding]>, Error> {
+    if !program.open_outputs.iter().any(|open| *open) {
+        return Ok(Arc::clone(&program.output_shardings));
+    }
+    let incompatible = |reason: String| Error::Compilation(CompilationError::IncompatibleExecutable { reason });
+    let op_shardings = executable.executable()?.output_shardings()?.ok_or_else(|| {
+        incompatible("the PJRT plugin does not report the output shardings that the compiler chose".to_string())
+    })?;
+    let op_shardings = match op_shardings.as_slice() {
+        [sharding] if sharding.r#type == OpShardingType::Tuple as i32 => sharding.tuple_shardings.clone(),
+        _ => op_shardings,
+    };
+    program
+        .output_shardings
+        .iter()
+        .zip(program.open_outputs.iter())
+        .enumerate()
+        .map(|(index, (declared, &open))| {
+            let Some(physical_index) = program.signature.output_mapping()[index].filter(|_| open) else {
+                return Ok(declared.clone());
+            };
+            let op_sharding = op_shardings.get(physical_index).ok_or_else(|| {
+                incompatible(format!("the executable reports no sharding for output {physical_index}"))
+            })?;
+            sharding_from_op_sharding(op_sharding, declared.mesh(), declared.rank())
+                .filter(|sharding| sharding.without_auto_axes() == declared.without_auto_axes())
+                .ok_or_else(|| {
+                    incompatible(format!(
+                        "the compiler placed output {index} as {op_sharding:?}, which is not a placement over the mesh \
+                         axes that agrees with its declared sharding `{declared}`",
+                    ))
+                })
+        })
+        .collect()
+}
+
 /// Returns `input_types` with the input sharding overrides of `options` (i.e., [`Options::input_shardings`])
 /// applied, or `input_types` unchanged when `options` has none. The overrides must be applied before tracing, because
 /// tracers carry their input types and sharding-aware operations read them. Retained dispatch applies them through
@@ -820,6 +995,40 @@ pub fn with_input_shardings<In: Parameterized<ArrayIrType>>(input_types: In, opt
     Ok(In::from_parameters(input_structure, input_types).map_err(ProgramError::from)?)
 }
 
+/// Validates that the staged `output_types` carry the output sharding overrides of `options` (i.e.,
+/// [`Options::output_shardings`]). The staging entry points of this crate stage the overrides after tracing (i.e., a
+/// `reshard` over explicit mesh axes and a `constrain_sharding` over auto mesh axes), so that calls of a staged
+/// function return the output types that its executions return. Types never record placement over auto mesh axes
+/// (refer to [`ArrayType::with_sharding`]), so only the placement over the other mesh axes is compared, and lowering
+/// then places the outputs over auto mesh axes as the overrides request. Outputs that are not arrays are left for the
+/// later array-only conversions to reject.
+fn validate_output_shardings(output_types: &[ArrayIrType], options: &Options) -> Result<(), Error> {
+    let Some(output_shardings) = options.output_shardings.as_deref() else {
+        return Ok(());
+    };
+    if output_shardings.len() != output_types.len() {
+        return Err(Error::Compilation(CompilationError::ShardingCountMismatch {
+            kind: "output",
+            expected: output_types.len(),
+            actual: output_shardings.len(),
+        }));
+    }
+    for (index, (r#type, sharding)) in output_types.iter().zip(output_shardings).enumerate() {
+        let ArrayIrType::Array(array_type) = r#type else {
+            continue;
+        };
+        if array_type.sharding() != Some(&sharding.without_auto_axes()) {
+            return Err(Error::Compilation(CompilationError::InvalidOptions {
+                reason: format!(
+                    "staged output {index} has type `{array_type}`, which does not carry the sharding `{sharding}` \
+                     requested by `output_shardings`; reshard the outputs to their overrides before staging them",
+                ),
+            }));
+        }
+    }
+    Ok(())
+}
+
 /// Rejects every reference-typed output of a capture-lifted program before lowering it into an executable. The stateful
 /// XLA ABI opens and commits external input references and has no protocol for turning a backend-created array into a
 /// host reference with persistent identity, nor for handing an entering reference back through an output. The
@@ -870,11 +1079,13 @@ pub(super) fn validate_output_types(declared: &[ArrayIrType], actual: &[ArrayTyp
     Ok(())
 }
 
-/// Applies an optional per-leaf sharding override to a public array IR signature. When overrides are provided, every
-/// overridden leaf must be an array: first-class dimensions are internal SSA values, and references must be discharged
-/// into explicit array state before either kind can cross the PJRT ABI. Note that without overrides the signature
-/// passes through unchecked here; non-array boundary leaves are rejected by the later array-only conversions on the
-/// compile path.
+/// Applies an optional per-leaf sharding override to a public array IR signature, giving each overridden type the
+/// override without its auto mesh axes, which types never record (refer to [`ArrayType::with_sharding`]). The runtime
+/// placement that an override requests over auto mesh axes is applied by lowering instead. When overrides are provided,
+/// every overridden leaf must be an array: first-class dimensions are internal SSA values, and references must be
+/// discharged into explicit array state before either kind can cross the PJRT ABI. Note that without overrides the
+/// signature passes through unchecked here; non-array boundary leaves are rejected by the later array-only conversions
+/// on the compile path.
 fn apply_signature_shardings(
     mut types: Vec<ArrayIrType>,
     shardings: Option<&[Sharding]>,
@@ -892,7 +1103,7 @@ fn apply_signature_shardings(
     }
     for (r#type, sharding) in types.iter_mut().zip(shardings) {
         *r#type = match r#type {
-            ArrayIrType::Array(array_type) => array_type.clone().with_sharding(sharding.clone())?.into(),
+            ArrayIrType::Array(array_type) => array_type.clone().with_sharding(sharding.without_auto_axes())?.into(),
             ArrayIrType::Dimension(_) | ArrayIrType::Reference(_) => {
                 return Err(ProgramError::from(TypeError::invalid(format!(
                     "cannot apply an array sharding to type `{type}`",
@@ -1470,9 +1681,9 @@ mod tests {
         RaggedDotOperation, RandomAlgorithm, ReduceOperation, ReductionKind, ReferenceAddUpdate,
         ReferenceAddUpdateOperation, ReferenceFreeze, ReferenceFreezeOperation, ReferenceNew, ReferenceNewOperation,
         ReferenceRead, ReferenceReadOperation, ReferenceSwapOperation, ReferenceType, ReferenceWrite,
-        ReferenceWriteOperation, ReshapeOperation, RngBitGeneratorOperation, ScaledDotOperation, ScanOperation,
-        ScatterDimensionNumbers, ScatterOperation, ScatterReductionKind, Shape, ShardMapBoundary, ShardMapOperation,
-        ShardMapOptions, Sharding, ShardingDimension, SliceOperation, SortDirection, SortOperation,
+        ReferenceWriteOperation, ReshapeOperation, Reshard, RngBitGeneratorOperation, ScaledDotOperation,
+        ScanOperation, ScatterDimensionNumbers, ScatterOperation, ScatterReductionKind, Shape, ShardMapBoundary,
+        ShardMapOperation, ShardMapOptions, Sharding, ShardingDimension, SliceOperation, SortDirection, SortOperation,
         StagedFunction as CoreStagedFunction, StagingContext, StaticShape, SubOperation, TiledLayout, TracingContext,
         Type, Typed, TypedProgram, Value as CoreValue, ValueProjection, WhileOperation, batch, shard_map,
     };
@@ -2613,7 +2824,17 @@ mod tests {
         let client = plugin
             .client(ClientOptions::CPU(CpuClientOptions { device_count: Some(2), ..Default::default() }))
             .unwrap();
-        let mesh = domain_mesh(&client, "x", 2);
+        // Types record placement over explicit mesh axes only, so the sharded cast type uses an explicit axis.
+        let mesh = DeviceMesh::new(
+            LogicalMesh::new(vec![MeshAxis::new("x", 2, MeshAxisType::Explicit).unwrap()]).unwrap(),
+            client
+                .addressable_devices()
+                .unwrap()
+                .into_iter()
+                .map(|device| Device::from_pjrt(device).unwrap())
+                .collect(),
+        )
+        .unwrap();
         let domain = Session::new(&client).domain().with_mesh(mesh.clone());
         let input_type = ArrayType::new_static(DataType::F64, [4, 3])
             .with_sharding(
@@ -2851,8 +3072,116 @@ mod tests {
         assert_eq!(statistics.traces, 2);
         assert_eq!(statistics.lowerings, 2);
         assert_eq!(statistics.compilation_requests, 2);
-        assert_eq!(function.specialization_count(), 2);
+        assert_eq!(function.executable_specialization_count(), 2);
         assert_eq!(domain.program_count(), 2);
+    }
+
+    #[test]
+    fn test_domain_dispatch_signature() {
+        let client = execution_client();
+        let mesh = domain_mesh(&client, "x", 1);
+        let domain = Session::new(&client).domain();
+        let input = Value::Array(
+            Array::from_host_buffer(
+                &domain,
+                ArrayType::new_static(DataType::F32, [3]),
+                mesh.clone(),
+                values_to_bytes(&[1f32, 2.0, 3.0]),
+            )
+            .unwrap(),
+        );
+        let input_types = vec![input.r#type().into_owned()];
+        let options = Options::new(mesh).with_input_bound_bucketing(InputBoundBucketing::PowerOfTwo);
+
+        let (key, staged_types, specialized_options) =
+            Domain::dispatch_signature(DispatchInputs::Types(input_types.clone()), &options).unwrap();
+        assert_eq!(key, DispatchKey::new(DispatchKeyKind::Exact(input_types.clone().into())));
+        assert_eq!(staged_types.as_ref(), input_types.as_slice());
+        assert_eq!(specialized_options, None);
+
+        let (key, executable_types, specialized_options) = Domain::dispatch_signature(
+            DispatchInputs::Values { values: &mut std::iter::once(&input), types: input_types.clone() },
+            &options,
+        )
+        .unwrap();
+        assert_eq!(key, normalize_dispatch_signature(input_types, &options, options.input_bound_bucketing).unwrap().0);
+        let [ArrayIrType::Array(array_type)] = executable_types.as_ref() else {
+            panic!("the executable signature must contain one array");
+        };
+        let [CoreDimension::Dynamic(extent)] = array_type.shape().dimensions() else {
+            panic!("runtime values must select input-bound bucketing");
+        };
+        assert_eq!(extent.name(), "input_0_axis_0");
+        assert_eq!(extent.bounds(), DimensionBounds::new(0, Some(5)).unwrap());
+        assert_eq!(specialized_options, None);
+    }
+
+    #[test]
+    fn test_domain_dispatch_signature_runtime_placement() {
+        let plugin = load_cpu_plugin().unwrap();
+        let client = plugin
+            .client(ClientOptions::CPU(CpuClientOptions { device_count: Some(2), ..Default::default() }))
+            .unwrap();
+        let mesh = domain_mesh(&client, "x", 2);
+        let domain = Session::new(&client).domain();
+        let replicated = Sharding::replicated(mesh.logical_mesh().clone(), 1);
+        let tiled = Sharding::new(mesh.logical_mesh().clone(), vec![ShardingDimension::sharded(["x"])]).unwrap();
+        let replicated_input = Value::Array(
+            Array::from_host_buffer_with_sharding(
+                &domain,
+                ArrayType::new_static(DataType::F32, [4]),
+                replicated.clone(),
+                mesh.clone(),
+                values_to_bytes(&[1f32, 2.0, 3.0, 4.0]),
+            )
+            .unwrap(),
+        );
+        let tiled_input = Value::Array(
+            Array::from_host_buffer_with_sharding(
+                &domain,
+                ArrayType::new_static(DataType::F32, [4]),
+                tiled.clone(),
+                mesh.clone(),
+                values_to_bytes(&[1f32, 2.0, 3.0, 4.0]),
+            )
+            .unwrap(),
+        );
+        assert_eq!(replicated_input.r#type(), tiled_input.r#type());
+        let input_types = vec![replicated_input.r#type().into_owned()];
+        let options = Options::new(mesh);
+        let (replicated_key, replicated_types, replicated_options) = Domain::dispatch_signature(
+            DispatchInputs::Values { values: &mut std::iter::once(&replicated_input), types: input_types.clone() },
+            &options,
+        )
+        .unwrap();
+        let (tiled_key, tiled_types, tiled_options) = Domain::dispatch_signature(
+            DispatchInputs::Values { values: &mut std::iter::once(&tiled_input), types: input_types.clone() },
+            &options,
+        )
+        .unwrap();
+        assert_ne!(replicated_key, tiled_key);
+        assert_eq!(replicated_types, tiled_types);
+        assert_eq!(replicated_options, None);
+        assert_eq!(
+            tiled_options,
+            Some(Options { input_placements: Some(vec![Some(tiled)].into()), ..options.clone() }),
+        );
+
+        // A declared sharding determines placement instead of the actual placement of either input.
+        let options = options.with_input_shardings(vec![replicated]);
+        let replicated_signature = Domain::dispatch_signature(
+            DispatchInputs::Values { values: &mut std::iter::once(&replicated_input), types: input_types.clone() },
+            &options,
+        )
+        .unwrap();
+        let tiled_signature = Domain::dispatch_signature(
+            DispatchInputs::Values { values: &mut std::iter::once(&tiled_input), types: input_types },
+            &options,
+        )
+        .unwrap();
+        assert_eq!(replicated_signature, tiled_signature);
+        assert_eq!(replicated_signature.0, replicated_key);
+        assert_eq!(replicated_signature.2, None);
     }
 
     #[test]
@@ -2865,11 +3194,8 @@ mod tests {
         let single_device_domain = Session::new(&single_device_client).domain().with_mesh(single_device_mesh.clone());
         let dimension_type = DimensionType::new("extent", DimensionBounds::new(1, Some(5)).unwrap());
         assert!(matches!(
-            Domain::dispatch_signature(
-                vec![dimension_type.clone().into()],
-                &Options::new(single_device_mesh.clone())
-                    .with_input_bound_bucketing(InputBoundBucketing::PowerOfTwo),DispatchPurpose::Executable,
-            ),
+            normalize_dispatch_signature(vec![dimension_type.clone().into()], &Options::new(single_device_mesh.clone())
+                    .with_input_bound_bucketing(InputBoundBucketing::PowerOfTwo), Some(InputBoundBucketing::PowerOfTwo)),
             Err(Error::Compilation(CompilationError::InvalidOptions { reason }))
                 if reason == format!(
                     "input-bound bucketing only supports array inputs, but input 0 has first-class dimension type {}",
@@ -2881,20 +3207,17 @@ mod tests {
         let reference_type = ReferenceType::new(ArrayType::scalar(DataType::F32));
         let reference_input_types: Arc<[ArrayIrType]> = vec![ArrayIrType::Reference(reference_type.clone())].into();
         assert_eq!(
-            Domain::dispatch_signature(
+            normalize_dispatch_signature(
                 reference_input_types.to_vec(),
                 &Options::new(single_device_mesh.clone()),
-                DispatchPurpose::Executable
+                None
             )
             .unwrap(),
-            (DispatchKey(DispatchKeyKind::Exact(reference_input_types.clone())), reference_input_types,),
+            (DispatchKey::new(DispatchKeyKind::Exact(reference_input_types.clone())), reference_input_types,),
         );
         assert!(matches!(
-            Domain::dispatch_signature(
-                vec![ArrayIrType::Reference(reference_type.clone())],
-                &Options::new(single_device_mesh.clone())
-                    .with_input_bound_bucketing(InputBoundBucketing::PowerOfTwo),DispatchPurpose::Executable,
-            ),
+            normalize_dispatch_signature(vec![ArrayIrType::Reference(reference_type.clone())], &Options::new(single_device_mesh.clone())
+                    .with_input_bound_bucketing(InputBoundBucketing::PowerOfTwo), Some(InputBoundBucketing::PowerOfTwo)),
             Err(Error::Compilation(CompilationError::UnsupportedReferenceAbi { reason }))
                 if reason == "external reference input 0 does not support input-bound bucketing",
         ));
@@ -2914,11 +3237,7 @@ mod tests {
             .unwrap();
         let multi_device_mesh = domain_mesh(&multi_device_client, "x", 2);
         assert!(matches!(
-            Domain::dispatch_signature(
-                vec![ArrayType::new(DataType::F32, Shape::new(vec![CoreDimension::Static(3)])).into()],
-                &Options::new(multi_device_mesh).with_input_bound_bucketing(InputBoundBucketing::PowerOfTwo),
-                DispatchPurpose::Executable,
-            ),
+            normalize_dispatch_signature(vec![ArrayType::new(DataType::F32, Shape::new(vec![CoreDimension::Static(3)])).into()], &Options::new(multi_device_mesh).with_input_bound_bucketing(InputBoundBucketing::PowerOfTwo), Some(InputBoundBucketing::PowerOfTwo)),
             Err(Error::Compilation(CompilationError::InvalidOptions { reason }))
                 if reason == "input-bound bucketing is unsupported on multi-device meshes because bucketed dynamic \
                     signatures require disabling the Shardy partitioner",
@@ -2926,11 +3245,8 @@ mod tests {
 
         // Multi-device bucketing is rejected before inspecting individual input kinds.
         assert!(matches!(
-            Domain::dispatch_signature(
-                vec![ArrayIrType::Reference(reference_type.clone())],
-                &Options::new(domain_mesh(&multi_device_client, "x", 2))
-                    .with_input_bound_bucketing(InputBoundBucketing::PowerOfTwo),DispatchPurpose::Executable,
-            ),
+            normalize_dispatch_signature(vec![ArrayIrType::Reference(reference_type.clone())], &Options::new(domain_mesh(&multi_device_client, "x", 2))
+                    .with_input_bound_bucketing(InputBoundBucketing::PowerOfTwo), Some(InputBoundBucketing::PowerOfTwo)),
             Err(Error::Compilation(CompilationError::InvalidOptions { reason }))
                 if reason == "input-bound bucketing is unsupported on multi-device meshes because bucketed dynamic \
                     signatures require disabling the Shardy partitioner",
@@ -2949,15 +3265,15 @@ mod tests {
         let vector_type =
             |dimension: CoreDimension| ArrayIrType::from(ArrayType::new(DataType::F32, Shape::new(vec![dimension])));
         let key = |input_types: Vec<ArrayIrType>| {
-            Domain::dispatch_signature(input_types, &options, DispatchPurpose::Executable).unwrap().0
+            normalize_dispatch_signature(input_types, &options, options.input_bound_bucketing).unwrap().0
         };
 
         // Two runtime signatures landing in the same power-of-two bucket share one key, and the effective staged
         // types carry the generated per-axis variable names that the key itself excludes.
-        let (three_key, three_types) = Domain::dispatch_signature(
+        let (three_key, three_types) = normalize_dispatch_signature(
             vec![vector_type(CoreDimension::Static(3))],
             &options,
-            DispatchPurpose::Executable,
+            options.input_bound_bucketing,
         )
         .unwrap();
         assert_eq!(three_key, key(vec![vector_type(CoreDimension::Static(4))]));
@@ -2971,11 +3287,11 @@ mod tests {
         assert_eq!(variable.name(), "input_0_axis_0");
         assert_eq!(variable.bounds(), bounds);
 
-        // Source calls are staged within their callers, so bucketing never changes their types.
-        let (_, source_types) =
-            Domain::dispatch_signature(vec![vector_type(CoreDimension::Static(3))], &options, DispatchPurpose::Source)
+        // Signatures requested for staging preserve the caller's types without executable dispatch bucketing.
+        let (_, staged_types, _) =
+            Domain::dispatch_signature(DispatchInputs::Types(vec![vector_type(CoreDimension::Static(3))]), &options)
                 .unwrap();
-        assert_eq!(source_types.as_ref(), &[vector_type(CoreDimension::Static(3))]);
+        assert_eq!(staged_types.as_ref(), &[vector_type(CoreDimension::Static(3))]);
 
         // Dimension variables are keyed by their bounds and first-occurrence sharing pattern, not by their names, so
         // renaming a variable preserves the key while resharing it across inputs does not.
@@ -3266,6 +3582,93 @@ mod tests {
     }
 
     #[test]
+    fn test_lower_requires_staged_output_types_to_carry_output_shardings() {
+        let plugin = load_cpu_plugin().unwrap();
+        let client = plugin
+            .client(ClientOptions::CPU(CpuClientOptions { device_count: Some(2), ..Default::default() }))
+            .unwrap();
+        let domain = Session::new(&client).domain();
+        let mesh = |axis_type| {
+            let logical_mesh = LogicalMesh::new(vec![MeshAxis::new("x", 2, axis_type).unwrap()]).unwrap();
+            let devices = client
+                .addressable_devices()
+                .unwrap()
+                .into_iter()
+                .map(|device| Device::from_pjrt(device).unwrap())
+                .collect::<Vec<_>>();
+            DeviceMesh::new(logical_mesh, devices).unwrap()
+        };
+        let input_type = |mesh: &DeviceMesh| {
+            let replicated = Sharding::replicated(mesh.logical_mesh().clone(), 1);
+            ArrayIrType::Array(ArrayType::new_static(DataType::F32, [4]).with_sharding(replicated).unwrap())
+        };
+        let options = |mesh: &DeviceMesh| {
+            let sharded = Sharding::new(mesh.logical_mesh().clone(), vec![ShardingDimension::sharded(["x"])]).unwrap();
+            Options::new(mesh.clone()).with_output_shardings(vec![sharded])
+        };
+
+        fn forward<'c>(
+            _: Vec<Constant>,
+            _: Vec<CompilationTracer<Domain<'c>>>,
+            input: CompilationTracer<Domain<'c>>,
+        ) -> Result<CompilationTracer<Domain<'c>>, Error> {
+            Ok(input)
+        }
+
+        fn reshard<'c>(
+            _: Vec<Constant>,
+            _: Vec<CompilationTracer<Domain<'c>>>,
+            input: CompilationTracer<Domain<'c>>,
+        ) -> Result<CompilationTracer<Domain<'c>>, Error> {
+            let mesh = <&ArrayType>::try_from(input.r#type().as_ref()).unwrap().sharding().unwrap().mesh().clone();
+            Ok(input.reshard(&Sharding::new(mesh, vec![ShardingDimension::sharded(["x"])]).unwrap())?)
+        }
+
+        // Lowering checks rather than overwrites the placement that staged types track, so that calls of a staged
+        // function return the output types of its executions.
+        let mesh_explicit = mesh(MeshAxisType::Explicit);
+        let staged = CoreStagedFunction::<Domain<'_>, ArrayIrType, ArrayIrType>::stage(
+            forward,
+            Vec::new(),
+            input_type(&mesh_explicit),
+            options(&mesh_explicit),
+        )
+        .unwrap();
+        assert!(matches!(
+            staged.lower(&domain).map(|_| ()),
+            Err(Error::Compilation(CompilationError::InvalidOptions { reason }))
+                if reason == "staged output 0 has type `f32[4][sharding={mesh<['x'=2:explicit]>, [{}]}]`, which does \
+                              not carry the sharding `{mesh<['x'=2:explicit]>, [{'x'}]}` requested by \
+                              `output_shardings`; reshard the outputs to their overrides before staging them",
+        ));
+        let staged = CoreStagedFunction::<Domain<'_>, ArrayIrType, ArrayIrType>::stage(
+            reshard,
+            Vec::new(),
+            input_type(&mesh_explicit),
+            options(&mesh_explicit),
+        )
+        .unwrap();
+        assert!(staged.lower(&domain).is_ok());
+
+        // Staged types cannot record placement over auto mesh axes, so lowering applies it to the executable outputs,
+        // whose types keep the staged placement while their runtime placements carry the override.
+        let mesh_auto = mesh(MeshAxisType::Auto);
+        let staged = CoreStagedFunction::<Domain<'_>, ArrayIrType, ArrayIrType>::stage(
+            forward,
+            Vec::new(),
+            input_type(&mesh_auto),
+            options(&mesh_auto),
+        )
+        .unwrap();
+        let lowered = staged.lower(&domain).unwrap();
+        assert_eq!(
+            lowered.lowered_program().output_types()[0].sharding().unwrap().to_string(),
+            "{mesh<['x'=2:auto]>, [{}]}",
+        );
+        assert_eq!(lowered.lowered_program().output_shardings[0].to_string(), "{mesh<['x'=2:auto]>, [{'x'}]}");
+    }
+
+    #[test]
     fn test_lowering_rejects_unsupported_external_reference_storage_classes() {
         let plugin = load_cpu_plugin().unwrap();
         let client = plugin
@@ -3317,16 +3720,16 @@ mod tests {
                 if reason == "external reference state at logical input 0 has an unbounded dynamic dimension",
         ));
 
+        // Types record placement over explicit mesh axes only, so the sharded state type uses an explicit axis.
+        let explicit_logical_mesh =
+            LogicalMesh::new(vec![MeshAxis::new("x", 1, MeshAxisType::Explicit).unwrap()]).unwrap();
+        let explicit_mesh = DeviceMesh::new(explicit_logical_mesh.clone(), mesh.devices().to_vec()).unwrap();
         let bounded = DimensionVariable::new("bounded", DimensionBounds::new(1, Some(5)).unwrap());
         let sharded_type = ArrayType::new(DataType::F32, Shape::new(vec![CoreDimension::Dynamic(bounded)]))
-            .with_sharding(Sharding::new(mesh.logical_mesh().clone(), vec![ShardingDimension::sharded(["x"])]).unwrap())
+            .with_sharding(Sharding::new(explicit_logical_mesh, vec![ShardingDimension::sharded(["x"])]).unwrap())
             .unwrap();
         assert!(matches!(
-            domain.lower_program(
-                &external_reference_read_program(sharded_type),
-                0,
-                &Options::new(mesh.clone()),
-            ),
+            domain.lower_program(&external_reference_read_program(sharded_type), 0, &Options::new(explicit_mesh)),
             Err(Error::Compilation(CompilationError::UnsupportedReferenceAbi { reason }))
                 if reason == "bounded-dynamic external state input 0 must use replicated sharding",
         ));
@@ -5243,7 +5646,7 @@ mod tests {
             ),
             "{error}",
         );
-        assert_eq!(function.specialization_count(), 1);
+        assert_eq!(function.executable_specialization_count(), 1);
         assert_eq!(function.statistics().dispatch_misses, 1);
         assert_eq!(function.statistics().dispatch_hits, 2);
     }
@@ -5298,7 +5701,7 @@ mod tests {
         assert_eq!(statistics.traces, 1);
         assert_eq!(statistics.lowerings, 1);
         assert_eq!(statistics.compilation_requests, 1);
-        assert_eq!(function.specialization_count(), 1);
+        assert_eq!(function.executable_specialization_count(), 1);
         assert_eq!(domain.program_count(), 1);
     }
 

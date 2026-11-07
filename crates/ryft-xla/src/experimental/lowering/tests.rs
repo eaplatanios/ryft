@@ -619,6 +619,7 @@ fn test_reference_state_aliases_use_physical_indices_and_preserve_shardings() {
         None,
         &states,
         RaggedDotLoweringStrategy::default(),
+        &[],
     )
     .unwrap();
     assert_eq!(lowered.signature.input_mapping(), &[None, Some(0), Some(1)]);
@@ -658,6 +659,7 @@ fn test_reference_state_aliases_use_physical_indices_and_preserve_shardings() {
             None,
             std::slice::from_ref(&invalid_state),
             RaggedDotLoweringStrategy::default(),
+            &[],
         ),
         Err(Error::Lowering(LoweringError::InvalidReferenceStateAbi { message }))
             if message == "logical state input 0 is erased from the executable boundary",
@@ -680,6 +682,7 @@ fn test_reference_state_aliases_use_physical_indices_and_preserve_shardings() {
                 None,
                 &states,
                 RaggedDotLoweringStrategy::default(),
+                &[],
             ),
             Err(Error::Lowering(LoweringError::InvalidReferenceStateAbi { message }))
                 if message == asymmetric_sharding_message,
@@ -699,6 +702,7 @@ fn test_reference_state_aliases_use_physical_indices_and_preserve_shardings() {
             None,
             &states,
             RaggedDotLoweringStrategy::default(),
+            &[],
         ),
         Err(Error::Lowering(LoweringError::InvalidReferenceStateAbi { message }))
             if message == "state input 1 and output 0 must use the same sharding",
@@ -730,6 +734,7 @@ fn test_bounded_dynamic_reference_state_alias_is_rejected_before_lowering() {
             None,
             std::slice::from_ref(&reference_state),
             RaggedDotLoweringStrategy::default(),
+            &[],
         ),
         Err(Error::Lowering(LoweringError::InvalidReferenceStateAbi { message }))
             if message == "state input 0 and output 0 must be static because bounded-dynamic mutation alias \

@@ -186,7 +186,7 @@ pub use caching::{
     DiskCache,
 };
 pub use domains::{
-    AnalyzableCompilationDomain, CompilationCacheDomain, CompilationDomain, Compile, DispatchPurpose,
+    AnalyzableCompilationDomain, CompilationCacheDomain, CompilationDomain, Compile, DispatchInputs,
     StatefulCompilationDomain, jit, jit_with_options, jit_with_options_and_capacity, stage,
 };
 pub use exchange::{CompilationArtifactExchange, CompilationArtifactExchangeError, CompilationArtifactExchangePolicy};
@@ -207,7 +207,7 @@ mod tests {
     use crate::captures::CaptureReference;
     use crate::compilation::caching::CompilationContext;
     use crate::compilation::domains::{
-        CompilationCacheDomain, CompilationDomain, Compile, DispatchPurpose, StatefulCompilationDomain,
+        CompilationCacheDomain, CompilationDomain, Compile, DispatchInputs, StatefulCompilationDomain,
     };
     use crate::compilation::functions::{CompiledFunction, StagedProgram, StatefulExecution};
     use crate::contexts::Domain;
@@ -338,15 +338,15 @@ mod tests {
         type Error = ProgramError;
 
         fn dispatch_signature(
-            input_types: Vec<ArrayType>,
+            inputs: DispatchInputs<'_, '_, Self::Value>,
             options: &Self::Options,
-            _purpose: DispatchPurpose,
-        ) -> Result<(Self::DispatchKey, Arc<[ArrayType]>), Self::Error> {
+        ) -> Result<(Self::DispatchKey, Arc<[ArrayType]>, Option<Self::Options>), Self::Error> {
+            let input_types = inputs.into_types();
             let input_types: Arc<[ArrayType]> = match &options.staged_input_type {
                 Some(input_type) => input_types.iter().map(|_| input_type.clone()).collect(),
                 None => input_types.into(),
             };
-            Ok((input_types.clone(), input_types))
+            Ok((input_types.clone(), input_types, None))
         }
 
         fn lower(&self, staged: &StagedProgram<Self>) -> Result<Self::LoweredProgram, Self::Error> {
@@ -476,12 +476,12 @@ mod tests {
         type Error = ProgramError;
 
         fn dispatch_signature(
-            input_types: Vec<ArrayType>,
+            inputs: DispatchInputs<'_, '_, Self::Value>,
             _options: &CarriedOptions,
-            _purpose: DispatchPurpose,
-        ) -> Result<(Self::DispatchKey, Arc<[ArrayType]>), ProgramError> {
+        ) -> Result<(Self::DispatchKey, Arc<[ArrayType]>, Option<Self::Options>), ProgramError> {
+            let input_types = inputs.into_types();
             let input_types: Arc<[ArrayType]> = input_types.into();
-            Ok((input_types.clone(), input_types))
+            Ok((input_types.clone(), input_types, None))
         }
 
         fn lower(&self, staged: &StagedProgram<Self>) -> Result<Self::LoweredProgram, ProgramError> {

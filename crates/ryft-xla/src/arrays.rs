@@ -29,6 +29,12 @@ pub enum ArrayError {
     #[error("missing required sharding metadata")]
     MissingSharding,
 
+    /// The sharding of an array type disagrees with the placement that an array was constructed with.
+    #[error(
+        "array type sharding `{type_sharding}` does not match the placement `{sharding}` over the non-auto mesh axes"
+    )]
+    PlacementTypeMismatch { type_sharding: Sharding, sharding: Sharding },
+
     /// An operation requires a domain with a device mesh.
     #[error("domain was constructed without a device mesh")]
     MissingMesh,
@@ -168,8 +174,12 @@ pub struct Array<'o> {
 
 /// Immutable storage of an [`Array`] that its clones share.
 struct ArrayParts<'o> {
-    /// [`ArrayType`] of the [`Array`], shared with the other outputs of the same compiled program output.
+    /// [`ArrayType`] of the [`Array`], shared with the other outputs of the same compiled program output. Its sharding
+    /// is [`Self::sharding`] without auto mesh axes, because types never record placement over those axes.
     r#type: Arc<ArrayType>,
+
+    /// Runtime placement of the [`Array`] over all mesh axes, including the auto mesh axes that its type omits.
+    sharding: Arc<Sharding>,
 
     /// [`ArrayShard`]s that make up the [`Array`].
     shards: Vec<ArrayShard<'o>>,
@@ -192,12 +202,14 @@ impl<'o> ArrayParts<'o> {
     /// Creates new [`ArrayParts`] with empty value-local caches.
     fn new(
         r#type: Arc<ArrayType>,
+        sharding: Arc<Sharding>,
         shards: Vec<ArrayShard<'o>>,
         shard_index_by_device: Arc<HashMap<DeviceId, ShardIndex>>,
         mesh: Arc<DeviceMesh>,
     ) -> Self {
         Self {
             r#type,
+            sharding,
             shards,
             shard_index_by_device,
             mesh,
@@ -220,6 +232,9 @@ pub(crate) struct RetainedArray<'o> {
 
     /// [`ArrayType`] of the retained array.
     r#type: Arc<ArrayType>,
+
+    /// Runtime placement of the retained array over all mesh axes.
+    sharding: Arc<Sharding>,
 
     /// [`ArrayShard`]s of the retained array.
     shards: Vec<ArrayShard<'o>>,
@@ -253,6 +268,7 @@ impl<'o> RetainedArray<'o> {
         Array {
             parts: Arc::new(ArrayParts::new(
                 Arc::clone(&self.r#type),
+                Arc::clone(&self.sharding),
                 self.shards.clone(),
                 Arc::clone(&self.shard_index_by_device),
                 Arc::clone(&self.mesh),
@@ -274,6 +290,7 @@ impl PartialEq for Array<'_> {
         let (left, right) = (&self.parts, &other.parts);
         Arc::ptr_eq(left, right)
             || (left.r#type == right.r#type
+                && left.sharding == right.sharding
                 && left.shards.len() == right.shards.len()
                 && left.shards.iter().zip(right.shards.iter()).all(|(left, right)| left.storage_eq(right)))
     }
@@ -334,7 +351,22 @@ impl<'o> Array<'o> {
         mesh: DeviceMesh,
         buffers: Vec<Buffer<'o>>,
     ) -> Result<Self, Error> {
-        Self::from_addressable_buffers_internal(domain, r#type, mesh, buffers, true)
+        Self::from_addressable_buffers_internal(domain, r#type, None, mesh, buffers, true)
+    }
+
+    /// Creates an [`Array`] like [`Self::from_addressable_buffers`], but placed according to `sharding`, which may
+    /// also place the array over auto mesh axes. Types never record placement over auto mesh axes, so the type of the
+    /// new array carries `sharding` without its auto mesh axes (refer to [`Sharding::without_auto_axes`]), while
+    /// [`Self::sharding`] returns `sharding` itself. A sharding of `r#type`, if any, must equal that projection, and
+    /// [`ArrayError::PlacementTypeMismatch`] reports one that does not.
+    pub fn from_addressable_buffers_with_sharding(
+        domain: &Domain<'o>,
+        r#type: ArrayType,
+        sharding: Sharding,
+        mesh: DeviceMesh,
+        buffers: Vec<Buffer<'o>>,
+    ) -> Result<Self, Error> {
+        Self::from_addressable_buffers_internal(domain, r#type, Some(sharding), mesh, buffers, true)
     }
 
     /// Creates an [`Array`] from backend-produced buffers whose zero-space carriers are known to be canonical. This
@@ -344,36 +376,31 @@ impl<'o> Array<'o> {
     pub(crate) fn from_canonical_addressable_buffers(
         domain: &Domain<'o>,
         r#type: ArrayType,
+        sharding: Option<Sharding>,
         mesh: DeviceMesh,
         buffers: Vec<Buffer<'o>>,
     ) -> Result<Self, Error> {
-        Self::from_addressable_buffers_internal(domain, r#type, mesh, buffers, false)
+        Self::from_addressable_buffers_internal(domain, r#type, sharding, mesh, buffers, false)
     }
 
     /// Implements addressable-buffer construction with optional validation of private zero-space carrier payloads.
     fn from_addressable_buffers_internal(
         domain: &Domain<'o>,
         r#type: ArrayType,
+        sharding: Option<Sharding>,
         mesh: DeviceMesh,
         buffers: Vec<Buffer<'o>>,
         validate_zero_carriers: bool,
     ) -> Result<Self, Error> {
         // Normalize the provided `r#type` before deriving shard placement. A single buffer with no sharding metadata
         // is treated as an unsharded replicated array over the caller-provided mesh.
-        let r#type = match r#type.sharding() {
-            Some(_) => r#type,
-            None if buffers.len() == 1 => r#type.replicated(&mesh)?,
-            None => {
-                return Err(Error::from(ArrayError::MissingSharding));
-            }
-        };
+        let (r#type, sharding) = placement(r#type, sharding, &mesh, buffers.len() == 1)?;
 
-        // Compute the global `ShardLayout` implied by the normalized array type and concrete device mesh.
+        // Compute the global `ShardLayout` implied by the runtime placement and concrete device mesh.
         let shape = r#type
             .static_shape()
             .ok_or_else(|| Error::from(ArrayError::DynamicShape { shape: r#type.shape().clone() }))?;
-        let sharding = r#type.sharding().ok_or_else(|| Error::from(ArrayError::MissingSharding))?;
-        let layout = ShardLayout::new(&shape, &mesh, sharding)?;
+        let layout = ShardLayout::new(&shape, &mesh, &sharding)?;
         let (descriptors, shard_index_by_device) = layout.into_parts();
 
         // Index the provided `Buffer`s by device while rejecting duplicate local buffers for the same device and
@@ -412,7 +439,13 @@ impl<'o> Array<'o> {
         // TODO(eaplatanios): Review this.
         crate::telemetry::array_constructed();
         Ok(Self {
-            parts: Arc::new(ArrayParts::new(Arc::new(r#type), shards, Arc::new(shard_index_by_device), Arc::new(mesh))),
+            parts: Arc::new(ArrayParts::new(
+                Arc::new(r#type),
+                Arc::new(sharding),
+                shards,
+                Arc::new(shard_index_by_device),
+                Arc::new(mesh),
+            )),
             execution_fence: None,
             domain: domain.clone(),
         })
@@ -420,7 +453,12 @@ impl<'o> Array<'o> {
 
     /// Constructs a bufferless array of the unique value represented by [`DataType::Zero`]. Local shards are marked
     /// addressable without allocating PJRT buffers, while remote shards retain metadata only.
-    pub(crate) fn from_zero_space(domain: &Domain<'o>, r#type: ArrayType, mesh: DeviceMesh) -> Result<Self, Error> {
+    pub(crate) fn from_zero_space(
+        domain: &Domain<'o>,
+        r#type: ArrayType,
+        sharding: Option<Sharding>,
+        mesh: DeviceMesh,
+    ) -> Result<Self, Error> {
         if !r#type.data_type().is_zero() {
             return Err(PjrtError::invalid_argument(format!(
                 "bufferless zero-space construction requires zero element type but got {}",
@@ -428,15 +466,11 @@ impl<'o> Array<'o> {
             ))
             .into());
         }
-        let r#type = match r#type.sharding() {
-            Some(_) => r#type,
-            None => r#type.replicated(&mesh)?,
-        };
+        let (r#type, sharding) = placement(r#type, sharding, &mesh, true)?;
         let shape = r#type
             .static_shape()
             .ok_or_else(|| Error::from(ArrayError::DynamicShape { shape: r#type.shape().clone() }))?;
-        let sharding = r#type.sharding().ok_or_else(|| Error::from(ArrayError::MissingSharding))?;
-        let layout = ShardLayout::new(&shape, &mesh, sharding)?;
+        let layout = ShardLayout::new(&shape, &mesh, &sharding)?;
         let (descriptors, shard_index_by_device) = layout.into_parts();
         let client = domain.client();
         let process_index = client.process_index()?;
@@ -461,7 +495,13 @@ impl<'o> Array<'o> {
 
         crate::telemetry::array_constructed();
         Ok(Self {
-            parts: Arc::new(ArrayParts::new(Arc::new(r#type), shards, Arc::new(shard_index_by_device), Arc::new(mesh))),
+            parts: Arc::new(ArrayParts::new(
+                Arc::new(r#type),
+                Arc::new(sharding),
+                shards,
+                Arc::new(shard_index_by_device),
+                Arc::new(mesh),
+            )),
             execution_fence: None,
             domain: domain.clone(),
         })
@@ -494,15 +534,37 @@ impl<'o> Array<'o> {
         mesh: DeviceMesh,
         buffer: B,
     ) -> Result<Self, Error> {
+        Self::from_host_buffer_internal(domain, r#type, None, mesh, buffer.as_ref())
+    }
+
+    /// Creates an [`Array`] like [`Self::from_host_buffer`], but placed according to `sharding`, which may also place
+    /// the array over auto mesh axes (like `jax.device_put(x, sharding)`). The type of the new array carries `sharding`
+    /// without its auto mesh axes (refer to [`Sharding::without_auto_axes`]), while [`Self::sharding`] returns
+    /// `sharding` itself. A sharding of `r#type`, if any, must equal that projection, and
+    /// [`ArrayError::PlacementTypeMismatch`] reports one that does not.
+    pub fn from_host_buffer_with_sharding<B: AsRef<[u8]>>(
+        domain: &Domain<'o>,
+        r#type: ArrayType,
+        sharding: Sharding,
+        mesh: DeviceMesh,
+        buffer: B,
+    ) -> Result<Self, Error> {
+        Self::from_host_buffer_internal(domain, r#type, Some(sharding), mesh, buffer.as_ref())
+    }
+
+    /// Implements [`Self::from_host_buffer`] and [`Self::from_host_buffer_with_sharding`].
+    fn from_host_buffer_internal(
+        domain: &Domain<'o>,
+        r#type: ArrayType,
+        sharding: Option<Sharding>,
+        mesh: DeviceMesh,
+        buffer: &[u8],
+    ) -> Result<Self, Error> {
         // Normalize missing sharding metadata before any placement-derived work. A dense host buffer with no explicit
         // sharding is interpreted as one replicated logical array over the provided mesh.
-        let r#type = match r#type.sharding() {
-            Some(_) => r#type,
-            None => r#type.replicated(&mesh)?,
-        };
+        let (r#type, sharding) = placement(r#type, sharding, &mesh, true)?;
 
         // Validate that the host buffer contains exactly the dense row-major bytes for the full logical array.
-        let buffer = buffer.as_ref();
         let expected_byte_count = r#type.size_in_bytes()?;
         if buffer.len() != expected_byte_count {
             return Err(Error::from(ArrayError::ByteCountMismatch {
@@ -512,7 +574,7 @@ impl<'o> Array<'o> {
             .into());
         }
         if r#type.data_type().is_zero() {
-            return Ok(Self::from_zero_space(domain, r#type, mesh)?);
+            return Ok(Self::from_zero_space(domain, r#type, Some(sharding), mesh)?);
         }
 
         // Build a lookup table for the PJRT devices that this process can upload to directly.
@@ -531,7 +593,6 @@ impl<'o> Array<'o> {
         let shape = r#type
             .static_shape()
             .ok_or_else(|| Error::from(ArrayError::DynamicShape { shape: r#type.shape().clone() }))?;
-        let sharding = r#type.sharding().unwrap();
         let layout = ShardLayout::new(&shape, &mesh, &sharding)?;
         let no_axes = BTreeSet::new();
         // Along an unreduced axis of kind sum, the devices hold summands of the logical value. The devices at coordinate
@@ -689,7 +750,7 @@ impl<'o> Array<'o> {
         }
 
         // Reuse the buffer-based constructor for final buffer validation and global sharding metadata assembly.
-        Ok(Self::from_canonical_addressable_buffers(domain, r#type, mesh, addressable_buffers)?)
+        Ok(Self::from_canonical_addressable_buffers(domain, r#type, Some(sharding), mesh, addressable_buffers)?)
     }
 
     /// Creates an [`Array`] that belongs to `domain` from the per-device `buffers` that one execution of a compiled
@@ -746,6 +807,7 @@ impl<'o> Array<'o> {
         Self {
             parts: Arc::new(ArrayParts::new(
                 Arc::clone(&layout.r#type),
+                Arc::clone(&layout.sharding),
                 shards,
                 Arc::clone(&layout.shard_index_by_device),
                 Arc::clone(&layout.mesh),
@@ -780,6 +842,7 @@ impl<'o> Array<'o> {
         RetainedArray {
             identity: Arc::downgrade(&self.parts),
             r#type: Arc::clone(&self.parts.r#type),
+            sharding: Arc::clone(&self.parts.sharding),
             shards: self.parts.shards.clone(),
             shard_index_by_device: Arc::clone(&self.parts.shard_index_by_device),
             mesh: Arc::clone(&self.parts.mesh),
@@ -841,13 +904,12 @@ impl<'o> Array<'o> {
         self.parts.r#type.layout()
     }
 
-    /// Returns [`Sharding`] information about this [`Array`].
+    /// Returns the runtime placement of this [`Array`] over all mesh axes (like `jax.Array.sharding`). Unlike the
+    /// sharding of its [`Typed`] type, which records only placement over explicit and manual mesh axes (like
+    /// `jax.typeof(x).sharding`), it also records placement over auto mesh axes.
     #[inline]
     pub fn sharding(&self) -> &Sharding {
-        self.parts
-            .r#type
-            .sharding()
-            .expect("runtime arrays should only be constructed from array types with sharding")
+        &self.parts.sharding
     }
 
     /// Returns the concrete [`DeviceMesh`] implied by this [`Array`]'s global shard placement metadata (i.e., the
@@ -1126,6 +1188,7 @@ impl Debug for Array<'_> {
         formatter
             .debug_struct("Array")
             .field("type", &self.parts.r#type)
+            .field("sharding", &self.parts.sharding)
             .field("shards", &self.shards())
             .finish()
     }
@@ -1135,6 +1198,32 @@ impl Display for Array<'_> {
     fn fmt(&self, formatter: &mut std::fmt::Formatter<'_>) -> std::fmt::Result {
         write!(formatter, "array(type={})", self.parts.r#type)
     }
+}
+
+/// Returns the [`ArrayType`] and runtime placement of an array of type `r#type` that is constructed on `mesh` with the
+/// optional placement `sharding`. Types never record placement over auto mesh axes, so the returned type carries the
+/// placement without its auto mesh axes. Without `sharding`, the placement is the sharding of `r#type`, or, when it
+/// has none and `implicit_replication` holds, the replicated placement over `mesh`.
+fn placement(
+    r#type: ArrayType,
+    sharding: Option<Sharding>,
+    mesh: &DeviceMesh,
+    implicit_replication: bool,
+) -> Result<(ArrayType, Sharding), Error> {
+    let sharding = match (sharding, r#type.sharding()) {
+        (Some(sharding), Some(type_sharding)) if *type_sharding != sharding.without_auto_axes() => {
+            return Err(Error::from(ArrayError::PlacementTypeMismatch {
+                type_sharding: type_sharding.clone(),
+                sharding,
+            }));
+        }
+        (Some(sharding), _) => sharding,
+        (None, Some(type_sharding)) => type_sharding.clone(),
+        (None, None) if implicit_replication => Sharding::replicated(mesh.logical_mesh().clone(), r#type.rank()),
+        (None, None) => return Err(Error::from(ArrayError::MissingSharding)),
+    };
+    let r#type = r#type.with_sharding(sharding.without_auto_axes())?;
+    Ok((r#type, sharding))
 }
 
 impl Typed for Array<'_> {
@@ -1171,6 +1260,9 @@ pub(crate) struct ArrayOutputLayout {
     /// [`ArrayType`] of the output, which has a static shape and sharding metadata.
     r#type: Arc<ArrayType>,
 
+    /// Runtime placement of the output over all mesh axes.
+    sharding: Arc<Sharding>,
+
     /// Shard descriptors of the output, in mesh order.
     descriptors: Vec<ShardDescriptor>,
 
@@ -1186,23 +1278,25 @@ pub(crate) struct ArrayOutputLayout {
 }
 
 impl ArrayOutputLayout {
-    /// Creates the layout of an output of type `r#type` placed on `mesh`, whose buffers an execution returns in the
-    /// order of `addressable_device_ids`.
+    /// Creates the layout of an output of type `r#type` placed on `mesh` according to `sharding` (or according to the
+    /// sharding of `r#type`, which is replicated when absent, when `sharding` is [`None`]), whose buffers an execution
+    /// returns in the order of `addressable_device_ids`.
     ///
     /// # Errors
     ///
-    /// Returns an [`Error`] if `r#type` does not have a static shape and sharding metadata, or if the sharding does not
-    /// describe a valid placement on `mesh`.
+    /// Returns an [`Error`] if `r#type` does not have a static shape, if `sharding` disagrees with the sharding of
+    /// `r#type`, or if the placement is not valid on `mesh`.
     pub(crate) fn new(
         r#type: ArrayType,
+        sharding: Option<Sharding>,
         mesh: Arc<DeviceMesh>,
         addressable_device_ids: &[DeviceId],
     ) -> Result<Self, Error> {
+        let (r#type, sharding) = placement(r#type, sharding, &mesh, true)?;
         let shape = r#type
             .static_shape()
             .ok_or_else(|| Error::from(ArrayError::DynamicShape { shape: r#type.shape().clone() }))?;
-        let sharding = r#type.sharding().ok_or_else(|| Error::from(ArrayError::MissingSharding))?;
-        let (descriptors, shard_index_by_device) = ShardLayout::new(&shape, &mesh, sharding)?.into_parts();
+        let (descriptors, shard_index_by_device) = ShardLayout::new(&shape, &mesh, &sharding)?.into_parts();
         let buffer_positions = descriptors
             .iter()
             .map(|descriptor| {
@@ -1211,6 +1305,7 @@ impl ArrayOutputLayout {
             .collect();
         Ok(Self {
             r#type: Arc::new(r#type),
+            sharding: Arc::new(sharding),
             descriptors,
             buffer_positions,
             shard_index_by_device: Arc::new(shard_index_by_device),
@@ -1679,9 +1774,7 @@ mod tests {
         )
         .unwrap();
         let array_type =
-            ArrayType::new(DataType::F32, Shape::new(vec![CoreDimension::Static(4), CoreDimension::Static(4)]))
-                .with_sharding(sharding.clone())
-                .unwrap();
+            ArrayType::new(DataType::F32, Shape::new(vec![CoreDimension::Static(4), CoreDimension::Static(4)]));
         let shard_buffers = client_devices
             .iter()
             .enumerate()
@@ -1692,10 +1785,21 @@ mod tests {
             })
             .collect::<Vec<_>>();
 
-        // Construct via `Array::from_addressable_buffers` and exercise every canonical `Array` accessor.
-        let array = Array::from_addressable_buffers(&domain, array_type.clone(), mesh.clone(), shard_buffers).unwrap();
+        // Construct via `Array::from_addressable_buffers_with_sharding` and exercise every canonical `Array` accessor.
+        // The placement over the auto mesh axes is runtime state only, so the type of the array records none of it.
+        let array = Array::from_addressable_buffers_with_sharding(
+            &domain,
+            array_type.clone(),
+            sharding.clone(),
+            mesh.clone(),
+            shard_buffers,
+        )
+        .unwrap();
 
-        assert_eq!(array.r#type().as_ref(), &array_type);
+        assert_eq!(
+            array.r#type().as_ref(),
+            &array_type.clone().with_sharding(Sharding::replicated(mesh.logical_mesh().clone(), 2)).unwrap(),
+        );
         assert_eq!(array.data_type(), DataType::F32);
         assert_eq!(array.shape(), StaticShape::new(vec![4, 4]));
         assert_eq!(array.layout(), None);
@@ -1722,24 +1826,54 @@ mod tests {
 
         // Layout metadata stored on the underlying array type is exposed verbatim by `Array::layout`.
         let layout = Layout::Tiled(TiledLayout::new(vec![1, 0], Vec::new()));
-        let layout_type =
-            ArrayType::new(DataType::F32, Shape::new(vec![CoreDimension::Static(4), CoreDimension::Static(4)]))
-                .with_layout(layout.clone())
-                .with_sharding(sharding)
-                .unwrap();
-        let layout_array = Array::from_addressable_buffers(&domain, layout_type, mesh.clone(), Vec::new()).unwrap();
+        let layout_type = array_type.clone().with_layout(layout.clone());
+        let layout_array = Array::from_addressable_buffers_with_sharding(
+            &domain,
+            layout_type,
+            sharding.clone(),
+            mesh.clone(),
+            Vec::new(),
+        )
+        .unwrap();
         assert_eq!(layout_array.layout(), Some(&layout));
         assert_eq!(layout_array.addressable_shards().count(), 0);
         assert!(layout_array.shards().iter().all(|shard| shard.buffer().is_none()));
 
-        // Construct via `Array::from_host_buffer` and verify that it partitions the dense row-major host bytes
-        // over the shard layout implied by the mesh and sharding. With a `[4, 4]` `F32` array sharded over both
+        // A type sharding that disagrees with the placement over the non-auto mesh axes is rejected.
+        let explicit_mesh = LogicalMesh::new(vec![MeshAxis::new("x", 4, MeshAxisType::Explicit).unwrap()]).unwrap();
+        let explicit_sharding = Sharding::new(
+            explicit_mesh.clone(),
+            vec![ShardingDimension::sharded(["x"]), ShardingDimension::replicated()],
+        )
+        .unwrap();
+        let replicated_type =
+            array_type.clone().with_sharding(Sharding::replicated(explicit_mesh.clone(), 2)).unwrap();
+        let explicit_device_mesh = DeviceMesh::new(explicit_mesh, devices.clone()).unwrap();
+        assert!(matches!(
+            Array::from_addressable_buffers_with_sharding(
+                &domain,
+                replicated_type,
+                explicit_sharding,
+                explicit_device_mesh,
+                Vec::new(),
+            ),
+            Err(Error::Array(error)) if matches!(error.as_ref(), ArrayError::PlacementTypeMismatch { .. }),
+        ));
+
+        // Construct via `Array::from_host_buffer_with_sharding` and verify that it partitions the dense row-major host
+        // bytes over the shard layout implied by the mesh and sharding. With a `[4, 4]` `F32` array sharded over both
         // mesh axes, the first mesh device owns the `2x2` block over rows `0..2` and columns `0..2`.
         let values = (0..16).map(|value| value as f32).collect::<Vec<_>>();
-        let host_array =
-            Array::from_host_buffer(&domain, array_type, mesh, values_to_bytes::<f32>(values.as_slice()).as_slice())
-                .unwrap();
+        let host_array = Array::from_host_buffer_with_sharding(
+            &domain,
+            array_type,
+            sharding.clone(),
+            mesh,
+            values_to_bytes::<f32>(values.as_slice()).as_slice(),
+        )
+        .unwrap();
 
+        assert_eq!(host_array.sharding(), &sharding);
         assert_eq!(host_array.shape(), StaticShape::new(vec![4, 4]));
         assert_eq!(host_array.addressable_shards().count(), 4);
         assert!(host_array.shards().iter().all(|shard| shard.is_addressable()));
@@ -2076,9 +2210,7 @@ mod tests {
         )
         .unwrap();
         let array_type =
-            ArrayType::new(DataType::F32, Shape::new(vec![CoreDimension::Static(4), CoreDimension::Static(4)]))
-                .with_sharding(sharding)
-                .unwrap();
+            ArrayType::new(DataType::F32, Shape::new(vec![CoreDimension::Static(4), CoreDimension::Static(4)]));
         let shard_buffers = || {
             client_devices
                 .iter()
@@ -2090,16 +2222,29 @@ mod tests {
                 })
                 .collect::<Vec<_>>()
         };
-        let layout = ArrayOutputLayout::new(array_type.clone(), Arc::new(mesh.clone()), device_ids.as_slice()).unwrap();
+        let layout = ArrayOutputLayout::new(
+            array_type.clone(),
+            Some(sharding.clone()),
+            Arc::new(mesh.clone()),
+            device_ids.as_slice(),
+        )
+        .unwrap();
 
         // Planned outputs describe the same placement as the validating constructor, and every output built from one
-        // layout shares its metadata.
-        let expected =
-            Array::from_addressable_buffers(&domain, array_type.clone(), mesh.clone(), shard_buffers()).unwrap();
+        // layout shares its metadata. Their types record none of the placement over the auto mesh axes.
+        let expected = Array::from_addressable_buffers_with_sharding(
+            &domain,
+            array_type.clone(),
+            sharding.clone(),
+            mesh.clone(),
+            shard_buffers(),
+        )
+        .unwrap();
         let output = Array::from_execution_output(&domain, &layout, shard_buffers(), ExecutionFence::new(Vec::new()));
         let other_output =
             Array::from_execution_output(&domain, &layout, shard_buffers(), ExecutionFence::new(Vec::new()));
-        assert_eq!(output.r#type().as_ref(), &array_type);
+        assert_eq!(output.r#type(), expected.r#type());
+        assert_eq!(output.sharding(), &sharding);
         assert_eq!(output.mesh(), &mesh);
         assert_eq!(
             output.shards().iter().map(ArrayShard::descriptor).collect::<Vec<_>>(),
@@ -2122,10 +2267,12 @@ mod tests {
 
         // Zero-space outputs need no returned carriers.
         let zero_type = array_type.with_data_type(DataType::Zero);
-        let zero_layout = ArrayOutputLayout::new(zero_type.clone(), Arc::new(mesh), device_ids.as_slice()).unwrap();
+        let zero_layout =
+            ArrayOutputLayout::new(zero_type, Some(sharding), Arc::new(mesh), device_ids.as_slice()).unwrap();
         let zero_output =
             Array::from_execution_output(&domain, &zero_layout, Vec::new(), ExecutionFence::new(Vec::new()));
-        assert_eq!(zero_output.r#type().as_ref(), &zero_type);
+        assert_eq!(zero_output.r#type().data_type(), DataType::Zero);
+        assert_eq!(zero_output.r#type().sharding(), output.r#type().sharding());
         assert!(zero_output.shards().iter().all(|shard| shard.is_addressable() && shard.buffer().is_none()));
     }
 
@@ -2144,10 +2291,8 @@ mod tests {
         let logical_mesh = LogicalMesh::new(vec![MeshAxis::new("x", 2, MeshAxisType::Auto).unwrap()]).unwrap();
         let mesh = DeviceMesh::new(logical_mesh, devices).unwrap();
         let sharding = Sharding::new(mesh.logical_mesh().clone(), vec![ShardingDimension::sharded(["x"])]).unwrap();
-        let array_type = ArrayType::new(DataType::F32, Shape::new(vec![CoreDimension::Static(4)]))
-            .with_sharding(sharding)
-            .unwrap();
-        let layout = ArrayOutputLayout::new(array_type, Arc::new(mesh), device_ids.as_slice()).unwrap();
+        let array_type = ArrayType::new(DataType::F32, Shape::new(vec![CoreDimension::Static(4)]));
+        let layout = ArrayOutputLayout::new(array_type, Some(sharding), Arc::new(mesh), device_ids.as_slice()).unwrap();
 
         // Release builds trust XLA to return buffers in addressable-device order, while debug builds still validate
         // that every returned buffer matches its planned shard.
@@ -2291,17 +2436,22 @@ mod tests {
         )
         .unwrap();
         let array_type =
-            ArrayType::new(DataType::F32, Shape::new(vec![CoreDimension::Static(4), CoreDimension::Static(4)]))
-                .with_sharding(sharding)
-                .unwrap();
+            ArrayType::new(DataType::F32, Shape::new(vec![CoreDimension::Static(4), CoreDimension::Static(4)]));
 
-        // Arrays constructed via `Array::from_host_buffer` belong to the provided domain and live on its client,
-        // which transferred their shard buffers. Cloning an array preserves that association.
+        // Arrays constructed from host buffers belong to the provided domain and live on its client, which transferred
+        // their shard buffers. Cloning an array preserves that association.
         let session = Session::new(&client);
         let domain = session.domain();
         let values = (0..16).map(|value| value as f32).collect::<Vec<_>>();
         let bytes = values_to_bytes::<f32>(values.as_slice());
-        let array = Array::from_host_buffer(&domain, array_type.clone(), mesh.clone(), bytes.as_slice()).unwrap();
+        let array = Array::from_host_buffer_with_sharding(
+            &domain,
+            array_type.clone(),
+            sharding.clone(),
+            mesh.clone(),
+            bytes.as_slice(),
+        )
+        .unwrap();
         let recovered_client = array.client();
         assert!(std::ptr::eq(recovered_client, &client));
         assert_eq!(recovered_client.process_index().unwrap(), client.process_index().unwrap());
@@ -2309,8 +2459,8 @@ mod tests {
         assert!(std::ptr::eq(array.clone().client(), &client));
         assert!(Arc::ptr_eq(array.clone().backend_domain().session(), &session));
 
-        // Arrays constructed via `Array::from_addressable_buffers` belong to the provided domain, whose client is
-        // validated to own every addressable shard buffer.
+        // Arrays constructed from addressable buffers belong to the provided domain, whose client is validated to own
+        // every addressable shard buffer.
         let shard_buffers = || {
             client_devices
                 .iter()
@@ -2320,8 +2470,14 @@ mod tests {
                 })
                 .collect::<Vec<_>>()
         };
-        let array =
-            Array::from_addressable_buffers(&domain, array_type.clone(), mesh.clone(), shard_buffers()).unwrap();
+        let array = Array::from_addressable_buffers_with_sharding(
+            &domain,
+            array_type.clone(),
+            sharding.clone(),
+            mesh.clone(),
+            shard_buffers(),
+        )
+        .unwrap();
         assert!(std::ptr::eq(array.client(), &client));
         assert!(Arc::ptr_eq(array.backend_domain().session(), &session));
 
@@ -2331,14 +2487,21 @@ mod tests {
             .client(ClientOptions::CPU(CpuClientOptions { device_count: Some(4), ..Default::default() }))
             .unwrap();
         let other_domain = Session::new(&other_client).domain();
-        let error = Array::from_addressable_buffers(&other_domain, array_type.clone(), mesh.clone(), shard_buffers())
-            .unwrap_err();
+        let error = Array::from_addressable_buffers_with_sharding(
+            &other_domain,
+            array_type.clone(),
+            sharding.clone(),
+            mesh.clone(),
+            shard_buffers(),
+        )
+        .unwrap_err();
         assert!(matches!(&error, Error::Pjrt(PjrtError::InvalidArgument { .. })));
         assert!(error.to_string().starts_with("the domain's client does not own the addressable shard buffer"));
 
         // Metadata-only arrays with no addressable buffers carry no storage to validate, and still belong to (and live
         // on the client of) the provided domain.
-        let array = Array::from_addressable_buffers(&other_domain, array_type, mesh, Vec::new()).unwrap();
+        let array = Array::from_addressable_buffers_with_sharding(&other_domain, array_type, sharding, mesh, Vec::new())
+            .unwrap();
         assert_eq!(array.addressable_shards().count(), 0);
         assert!(std::ptr::eq(array.client(), &other_client));
     }
@@ -2408,17 +2571,23 @@ mod tests {
         let shape = Shape::new(vec![CoreDimension::Static(2)]);
         let logical_mesh = LogicalMesh::new(vec![MeshAxis::new("x", 1, MeshAxisType::Auto).unwrap()]).unwrap();
         let device_mesh = DeviceMesh::new(logical_mesh, vec![Device::new(0, 1)]).unwrap();
-        let sharding = Sharding::replicated(device_mesh.logical_mesh().clone(), 1);
-        let array_type = ArrayType::new(DataType::F32, shape).with_sharding(sharding).unwrap();
-        let array = Array::from_addressable_buffers(&domain, array_type, device_mesh, Vec::new()).unwrap();
+        let sharding =
+            Sharding::new(device_mesh.logical_mesh().clone(), vec![ShardingDimension::sharded(["x"])]).unwrap();
+        let array_type = ArrayType::new(DataType::F32, shape);
+        let array = Array::from_addressable_buffers_with_sharding(&domain, array_type, sharding, device_mesh, Vec::new())
+            .unwrap();
+
+        // The type records no placement over the auto mesh axis, while the runtime placement does.
         assert_eq!(
             format!("{array:?}"),
             concat!(
                 "Array { type: ArrayType { data_type: F32, shape: Shape { dimensions: [Static(2)] }, layout: None, ",
                 "sharding: Some(Sharding { mesh: LogicalMesh { axes: [MeshAxis { name: \"x\", size: 1, type: Auto }] }, ",
                 "dimensions: [Replicated], unreduced_axes: {}, unreduced_kind: Sum, reduced_axes: {}, ",
-                "varying_manual_axes: {} }), memory: Device }, shards: [ArrayShard { index: 0, device_id: 0, ",
-                "process_index: 1, ",
+                "varying_manual_axes: {} }), memory: Device }, ",
+                "sharding: Sharding { mesh: LogicalMesh { axes: [MeshAxis { name: \"x\", size: 1, type: Auto }] }, ",
+                "dimensions: [Sharded([\"x\"])], unreduced_axes: {}, unreduced_kind: Sum, reduced_axes: {}, ",
+                "varying_manual_axes: {} }, shards: [ArrayShard { index: 0, device_id: 0, process_index: 1, ",
                 "shape: StaticShape { dimensions: [2] }, is_addressable: false }] }",
             ),
         );

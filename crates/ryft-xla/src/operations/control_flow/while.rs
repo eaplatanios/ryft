@@ -1554,7 +1554,7 @@ mod tests {
                 &client,
                 &mesh,
                 &module,
-                &[(&scalar_type, &[0.0]), (&scalar_type, &[3.0]), (&vector_type, &values)],
+                &[(&scalar_type, None, &[0.0]), (&scalar_type, None, &[3.0]), (&vector_type, None, &values)],
             ),
             vec![vec![vec![-1.0, -2.0, -3.0, -4.0]], vec![vec![-5.0, -6.0, -7.0, -8.0]]],
         );

@@ -628,6 +628,7 @@ mod tests {
                 Some("cpu"),
                 &[],
                 RaggedDotLoweringStrategy::default(),
+                &[],
             )
             .unwrap();
             assert_eq!(lowered.signature.has_ordered_io(), ordered);
