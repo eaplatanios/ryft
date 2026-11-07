@@ -6870,8 +6870,8 @@ mod tests {
     #[test]
     fn test_check_types_array_types() {
         let mesh = LogicalMesh::new(vec![
-            MeshAxis::new("x", 1, MeshAxisType::Auto).unwrap(),
-            MeshAxis::new("y", 1, MeshAxisType::Auto).unwrap(),
+            MeshAxis::new("x", 1, MeshAxisType::Explicit).unwrap(),
+            MeshAxis::new("y", 1, MeshAxisType::Explicit).unwrap(),
         ])
         .unwrap();
         let plain = ArrayType::scalar(DataType::F32);
@@ -7098,7 +7098,7 @@ mod tests {
             Operation::infer_output_types(&array_operation, &[ArrayType::scalar(DataType::C64)], &[]),
             Err(TypeError::invalid("`test_unary` does not support input data type `c64`".to_string())),
         );
-        let mesh = LogicalMesh::new(vec![MeshAxis::new("x", 1, MeshAxisType::Auto).unwrap()]).unwrap();
+        let mesh = LogicalMesh::new(vec![MeshAxis::new("x", 1, MeshAxisType::Explicit).unwrap()]).unwrap();
         let unreduced_type = ArrayType::scalar(DataType::F32)
             .with_sharding(Sharding::new(mesh, vec![]).unwrap().with_unreduced_axes(["x"]).unwrap())
             .unwrap();
@@ -7176,8 +7176,8 @@ mod tests {
             Err(TypeError::invalid("`test_binary` does not support input data type `c64`".to_string())),
         );
         let mesh = LogicalMesh::new(vec![
-            MeshAxis::new("x", 1, MeshAxisType::Auto).unwrap(),
-            MeshAxis::new("y", 1, MeshAxisType::Auto).unwrap(),
+            MeshAxis::new("x", 1, MeshAxisType::Explicit).unwrap(),
+            MeshAxis::new("y", 1, MeshAxisType::Explicit).unwrap(),
         ])
         .unwrap();
         let unreduced_x = ArrayType::scalar(DataType::F32)

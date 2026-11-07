@@ -30,7 +30,7 @@ use crate::programs::{
     MaybeZero, Operation, Program, ProgramBuilder, ProgramError, Type, TypeError, Typed, TypedProgram, Value,
     ValueProjection,
 };
-use crate::tracing::TracingContext;
+use crate::tracing::{TracingContext, TracingScope};
 
 #[cfg(doc)]
 use crate::batching::DiagonalBatchingPolicy;
@@ -355,7 +355,7 @@ impl<V: Typed<Type: Eq + Hash> + Parameter, O> CustomRuleSpecializer<V, O> for C
                 // The rule's two result partitions are validated separately before they are flattened,
                 // because the flattened types alone cannot tell a missing output from a misplaced tangent.
                 let output_count = key.rule_output_count()?;
-                let (_, program) = TracingContext::<V, O>::trace_with_named_axes_and_default_mesh(
+                let (_, program) = TracingContext::<V, O>::trace_in_scope(
                     |values: Vec<CustomRuleTracer<V, O>>| {
                         let (primals, active_tangents) = values.split_at(key.input_types.len());
                         let mut active_tangents = active_tangents.iter().cloned();
@@ -417,8 +417,10 @@ impl<V: Typed<Type: Eq + Hash> + Parameter, O> CustomRuleSpecializer<V, O> for C
                         Ok(outputs)
                     },
                     rule_input_types,
-                    self.definition().named_axes().to_vec(),
-                    self.definition().default_mesh().cloned(),
+                    TracingScope::new(
+                        self.definition().named_axes().to_vec(),
+                        self.definition().default_mesh().cloned(),
+                    ),
                 )?;
 
                 // A call that keeps only some of the rule's outputs receives only those outputs and their tangents,
@@ -518,7 +520,7 @@ impl<V: Typed<Type: Eq + Hash> + Parameter, O> CustomRuleSpecializer<V, O> for C
             let Some((inner, level)) = inner else {
                 // The primal outputs are validated as their own partition before the residuals are appended,
                 // because a residual whose type matches a missing output would otherwise pass as that output.
-                let (_, program) = TracingContext::<V, O>::trace_with_named_axes_and_default_mesh(
+                let (_, program) = TracingContext::<V, O>::trace_in_scope(
                     |values: Vec<CustomRuleTracer<V, O>>| {
                         let (mut outputs, residuals) = forward.apply(&values)?;
                         if outputs.len() != output_count {
@@ -534,8 +536,10 @@ impl<V: Typed<Type: Eq + Hash> + Parameter, O> CustomRuleSpecializer<V, O> for C
                         Ok(outputs)
                     },
                     key.input_types.clone(),
-                    self.definition().named_axes().to_vec(),
-                    self.definition().default_mesh().cloned(),
+                    TracingScope::new(
+                        self.definition().named_axes().to_vec(),
+                        self.definition().default_mesh().cloned(),
+                    ),
                 )?;
 
                 let kept_output_indices = key.kept_output_indices(output_count);
@@ -755,7 +759,7 @@ impl<V: Typed<Type: Eq + Hash> + Parameter, O> CustomRuleSpecializer<V, O> for C
         self.specialization(CustomRuleSpecializationRequest::BatchingRule(key.clone()), || {
             let boundary_input_count = key.boundary_input_types.len();
             let mut output_axes = Vec::new();
-            let (_, program) = TracingContext::<V, O>::trace_with_named_axes_and_default_mesh(
+            let (_, program) = TracingContext::<V, O>::trace_in_scope(
                 |values: Vec<CustomRuleTracer<V, O>>| {
                     let (boundary_inputs, inputs) = values.split_at(boundary_input_count);
                     let (outputs, axes) = rule.apply(inputs, &key.input_axes, &key.level, boundary_inputs)?;
@@ -772,8 +776,7 @@ impl<V: Typed<Type: Eq + Hash> + Parameter, O> CustomRuleSpecializer<V, O> for C
                     Ok(outputs)
                 },
                 key.boundary_input_types.iter().chain(&key.input_types).cloned().collect::<Vec<_>>(),
-                self.definition().named_axes().to_vec(),
-                self.definition().default_mesh().cloned(),
+                TracingScope::new(self.definition().named_axes().to_vec(), self.definition().default_mesh().cloned()),
             )?;
             let program = self.definition().discharge_if(key.discharged, program)?;
             Ok(Arc::new(CustomRuleSpecialization::new(program, output_axes)))
@@ -1452,7 +1455,7 @@ where
             .map_err(ProgramError::from)?;
 
             // The batched program consumes the level's boundary inputs before the JVP program's own copy of them.
-            let (_, program) = TracingContext::<V, O>::trace_with_named_axes_and_default_mesh(
+            let (_, program) = TracingContext::<V, O>::trace_in_scope(
                 |values: Vec<CustomRuleTracer<V, O>>| {
                     let context = values[0].context().clone();
                     let mut inputs = values[..boundary_input_count].to_vec();
@@ -1460,8 +1463,10 @@ where
                     batched.interpret_in_context(&context, inputs)
                 },
                 program_types,
-                self.source.definition().named_axes().to_vec(),
-                self.source.definition().default_mesh().cloned(),
+                TracingScope::new(
+                    self.source.definition().named_axes().to_vec(),
+                    self.source.definition().default_mesh().cloned(),
+                ),
             )?;
             return Ok(CustomRuleSpecialization::new(program, output_axes));
         }
@@ -1536,7 +1541,7 @@ where
             false => primal_rule.output_axes.iter().copied().chain(tangent_output_axes).collect(),
         };
 
-        let (_, program) = TracingContext::<V, O>::trace_with_named_axes_and_default_mesh(
+        let (_, program) = TracingContext::<V, O>::trace_in_scope(
             |values: Vec<CustomRuleTracer<V, O>>| {
                 let context = values[0].context().clone();
                 let (boundary_inputs, inputs) = values.split_at(boundary_input_count);
@@ -1560,8 +1565,10 @@ where
                 Ok(outputs)
             },
             program_types,
-            self.source.definition().named_axes().to_vec(),
-            self.source.definition().default_mesh().cloned(),
+            TracingScope::new(
+                self.source.definition().named_axes().to_vec(),
+                self.source.definition().default_mesh().cloned(),
+            ),
         )?;
 
         Ok(CustomRuleSpecialization::new(program, output_axes))
@@ -1763,7 +1770,7 @@ where
         };
         all_output_axes.extend(output_axes.iter().copied());
 
-        let (_, program) = TracingContext::<V, O>::trace_with_named_axes_and_default_mesh(
+        let (_, program) = TracingContext::<V, O>::trace_in_scope(
             |values: Vec<CustomRuleTracer<V, O>>| {
                 let context = values[0].context().clone();
                 let (boundary_inputs, inputs) = values.split_at(boundary_input_count);
@@ -1843,8 +1850,10 @@ where
                 Ok(outputs)
             },
             key.boundary_input_types.iter().chain(&key.input_types).cloned().collect::<Vec<_>>(),
-            self.source.definition().named_axes().to_vec(),
-            self.source.definition().default_mesh().cloned(),
+            TracingScope::new(
+                self.source.definition().named_axes().to_vec(),
+                self.source.definition().default_mesh().cloned(),
+            ),
         )?;
 
         Ok(CustomRuleSpecialization::new(program, all_output_axes))
@@ -2050,7 +2059,7 @@ where
         let body = named_composite.body();
         self.body_specialization(input_types, || {
             let output_types = named_composite.output_types(input_types)?;
-            let (_, program) = TracingContext::<V, O>::trace_with_named_axes_and_default_mesh(
+            let (_, program) = TracingContext::<V, O>::trace_in_scope(
                 |values: Vec<CustomRuleTracer<V, O>>| {
                     let outputs = body.apply(&values)?;
                     if outputs.len() != output_types.len() {
@@ -2065,8 +2074,7 @@ where
                     Ok(outputs)
                 },
                 input_types.to_vec(),
-                self.definition().named_axes().to_vec(),
-                self.definition().default_mesh().cloned(),
+                TracingScope::new(self.definition().named_axes().to_vec(), self.definition().default_mesh().cloned()),
             )?;
             let program = align_rule_output_type_identities(self.name(), "body", program, &output_types, None)?;
 

@@ -75,14 +75,11 @@ impl ConstrainShardingOperation {
     ///   - `input_type`: Type of the input this operation is applied to, whose rank and mesh (if it carries a
     ///     sharding) must match those of this constraint.
     pub fn lowered_sharding(&self, input_type: &ArrayType) -> Result<Sharding, TypeError> {
+        // Types never name auto axes (refer to `ArrayType::with_sharding`), so the tracked placement is exactly the
+        // placement that the type system governs, and this constraint adds the auto axes that the compiler decides.
         let Some(tracked) = input_type.sharding() else {
             return Ok(self.sharding.clone());
         };
-
-        // A tracked type may still name auto axes (e.g., the actual placement of a concrete input), but placement
-        // over those axes is the compiler's to decide and exactly what this constraint overrides, so only the
-        // placement the type system governs is carried over.
-        let tracked = tracked.without_auto_axes();
         if tracked.rank() != self.sharding.rank() {
             return Err(TypeError::invalid(format!(
                 "`{}` rank ({}) does not match the input rank ({})",

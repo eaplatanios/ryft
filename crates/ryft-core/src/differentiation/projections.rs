@@ -793,28 +793,7 @@ pub struct ParentDifferentiationBuilder<Input> {
     primal: Input,
 }
 
-// TODO(eaplatanios): Review this module.
-
-/// Returns the parent context of the leaves of `primal`, its parameter structure, and its leaves lifted into that
-/// parent context.
-fn lift_primal<T, C, Input>(
-    primal: Input,
-) -> Result<(C, Input::ParameterStructure, Vec<C::Value>), DifferentiationError>
-where
-    T: Type,
-    C: ContextProjection<T>,
-    <C::Value as ValueProjection<T>>::Projected: Value<Domain = ProjectedContext<C, T>>,
-    Input: Parameterized<<C::Value as ValueProjection<T>>::Projected>,
-{
-    let context = primal.parameters().next().map(|leaf| leaf.domain().parent().clone()).ok_or_else(|| {
-        ProgramError::InvalidArgument {
-            message: "differentiation in a parent context requires at least one active input leaf".to_string(),
-        }
-    })?;
-    let structure = primal.parameter_structure();
-    let leaves = primal.into_parameters().map(<C::Value as ValueProjection<T>>::from_projected).collect();
-    Ok((context, structure, leaves))
-}
+// TODO(eaplatanios): Review from here onwards.
 
 impl<Input> ParentDifferentiationBuilder<Input> {
     /// Projected counterpart of [`DifferentiationBuilder::jvp`](crate::DifferentiationBuilder::jvp), whose `tangent`
@@ -837,7 +816,7 @@ impl<Input> ParentDifferentiationBuilder<Input> {
         TracingContext<C::Constant, C::Operation>:
             StagingContext<Type = C::Type, Constant = C::Constant, Operation = C::Operation>,
     {
-        let (context, structure, primal) = lift_primal::<C, T, Input>(self.primal)?;
+        let (context, structure, primal) = lift_primal::<T, C, Input>(self.primal)?;
         let tangent = tangent.into_parameters().map(<C::Value as ValueProjection<T>>::from_projected).collect();
         let mut output_structure = None;
         let (output, output_tangent) =
@@ -855,12 +834,17 @@ impl<Input> ParentDifferentiationBuilder<Input> {
                 )
             })?;
         let output_structure = output_structure.expect("the differentiated function ran");
-        let output = output.into_iter().map(ValueProjection::<T>::into_projected).collect::<Result<Vec<_>, _>>()?;
+        let output = output
+            .into_iter()
+            .map(ValueProjection::<T>::into_projected)
+            .collect::<Result<Vec<_>, _>>()
+            .map_err(ProgramError::from)?;
         let output = Output::To::<L>::from_parameters(output_structure.clone(), output).map_err(ProgramError::from)?;
         let output_tangent = output_tangent
             .into_iter()
             .map(ValueProjection::<T>::into_projected)
-            .collect::<Result<Vec<_>, _>>()?;
+            .collect::<Result<Vec<_>, _>>()
+            .map_err(ProgramError::from)?;
         let output_tangent =
             Output::To::<L>::from_parameters(output_structure, output_tangent).map_err(ProgramError::from)?;
         Ok((output, output_tangent))
@@ -888,7 +872,7 @@ impl<Input> ParentDifferentiationBuilder<Input> {
         TracingContext<C::Constant, C::Operation>:
             StagingContext<Type = C::Type, Constant = C::Constant, Operation = C::Operation>,
     {
-        let (context, structure, primal) = lift_primal::<C, T, Input>(self.primal)?;
+        let (context, structure, primal) = lift_primal::<T, C, Input>(self.primal)?;
         let mut output_structure = None;
         let (output, pushforward) =
             differentiate_at(primal).in_context(&context).linearize(|input: Vec<LinearizationTracer<C>>| {
@@ -905,7 +889,11 @@ impl<Input> ParentDifferentiationBuilder<Input> {
                 )
             })?;
         let output_structure = output_structure.expect("the differentiated function ran");
-        let output = output.into_iter().map(ValueProjection::<T>::into_projected).collect::<Result<Vec<_>, _>>()?;
+        let output = output
+            .into_iter()
+            .map(ValueProjection::<T>::into_projected)
+            .collect::<Result<Vec<_>, _>>()
+            .map_err(ProgramError::from)?;
         Ok((
             Output::To::<L>::from_parameters(output_structure.clone(), output).map_err(ProgramError::from)?,
             ParentPushforward { inner: pushforward, output_structure, marker: PhantomData },
@@ -932,7 +920,7 @@ impl<Input> ParentDifferentiationBuilder<Input> {
             StagingContext<Type = C::Type, Constant = C::Constant, Operation = C::Operation>,
         <PartialEvaluationContext<C> as Domain>::Operation: DifferentiableOperation<PartialEvaluationContext<C>>,
     {
-        let (context, structure, primal) = lift_primal::<C, T, Input>(self.primal)?;
+        let (context, structure, primal) = lift_primal::<T, C, Input>(self.primal)?;
         let input_structure = structure.clone();
         let mut output_structure = None;
         let (output, pullback) =
@@ -950,7 +938,11 @@ impl<Input> ParentDifferentiationBuilder<Input> {
                 )
             })?;
         let output_structure = output_structure.expect("the differentiated function ran");
-        let output = output.into_iter().map(ValueProjection::<T>::into_projected).collect::<Result<Vec<_>, _>>()?;
+        let output = output
+            .into_iter()
+            .map(ValueProjection::<T>::into_projected)
+            .collect::<Result<Vec<_>, _>>()
+            .map_err(ProgramError::from)?;
         Ok((
             Output::To::<L>::from_parameters(output_structure, output).map_err(ProgramError::from)?,
             ParentPullback { inner: pullback, input_structure, marker: PhantomData },
@@ -985,7 +977,7 @@ impl<Input> ParentDifferentiationBuilder<Input> {
             StagingContext<Type = C::Type, Constant = C::Constant, Operation = C::Operation>,
         <PartialEvaluationContext<C> as Domain>::Operation: DifferentiableOperation<PartialEvaluationContext<C>>,
     {
-        let (context, structure, primal) = lift_primal::<C, T, Input>(self.primal)?;
+        let (context, structure, primal) = lift_primal::<T, C, Input>(self.primal)?;
         let gradient_structure = structure.clone();
         let (value, gradient) = differentiate_at(primal).in_context(&context).value_and_gradient(
             |input: Vec<LinearizationTracer<C>>| {
@@ -995,7 +987,11 @@ impl<Input> ParentDifferentiationBuilder<Input> {
                 Ok::<_, ProgramError>(<LinearizationTracer<C> as ValueProjection<T>>::from_projected(function(input)?))
             },
         )?;
-        let gradient = gradient.into_iter().map(ValueProjection::<T>::into_projected).collect::<Result<Vec<_>, _>>()?;
+        let gradient = gradient
+            .into_iter()
+            .map(ValueProjection::<T>::into_projected)
+            .collect::<Result<Vec<_>, _>>()
+            .map_err(ProgramError::from)?;
         let gradient = Input::To::<L>::from_parameters(gradient_structure, gradient).map_err(ProgramError::from)?;
         Ok((value.into_projected()?, gradient))
     }
@@ -1056,7 +1052,7 @@ impl<Input> ParentDifferentiationBuilder<Input> {
         TracingContext<C::Constant, C::Operation>:
             StagingContext<Type = C::Type, Constant = C::Constant, Operation = C::Operation>,
     {
-        let (context, structure, primal) = lift_primal::<C, T, Input>(self.primal)?;
+        let (context, structure, primal) = lift_primal::<T, C, Input>(self.primal)?;
         let input_types = primal
             .iter()
             .map(|leaf| <&T>::try_from(leaf.r#type().as_ref()).cloned())
@@ -1120,7 +1116,7 @@ impl<Input> ParentDifferentiationBuilder<Input> {
         TracingContext<C::Constant, C::Operation>:
             StagingContext<Type = C::Type, Constant = C::Constant, Operation = C::Operation>,
     {
-        let (context, structure, primal) = lift_primal::<C, T, Input>(self.primal)?;
+        let (context, structure, primal) = lift_primal::<T, C, Input>(self.primal)?;
         let input_types = primal
             .iter()
             .map(|leaf| <&T>::try_from(leaf.r#type().as_ref()).cloned())
@@ -1202,7 +1198,7 @@ impl<Input> ParentDifferentiationBuilder<Input> {
             StagingContext<Type = C::Type, Constant = C::Constant, Operation = C::Operation>,
         PartialEvaluationContext<C>: Context<Type = C::Type, Constant = C::Constant, Operation = C::Operation>,
     {
-        let (context, structure, primal) = lift_primal::<C, T, Input>(self.primal)?;
+        let (context, structure, primal) = lift_primal::<T, C, Input>(self.primal)?;
         let input_types = primal
             .iter()
             .map(|leaf| <&T>::try_from(leaf.r#type().as_ref()).cloned())
@@ -1532,6 +1528,27 @@ where
             cotangents,
         )?)
     }
+}
+
+/// Returns the parent context of the leaves of `primal`, its parameter structure, and its leaves lifted into that
+/// parent context.
+fn lift_primal<T, C, Input>(
+    primal: Input,
+) -> Result<(C, Input::ParameterStructure, Vec<C::Value>), DifferentiationError>
+where
+    T: Type,
+    C: ContextProjection<T>,
+    <C::Value as ValueProjection<T>>::Projected: Value<Domain = ProjectedContext<C, T>>,
+    Input: Parameterized<<C::Value as ValueProjection<T>>::Projected>,
+{
+    let context = primal.parameters().next().map(|leaf| leaf.domain().parent().clone()).ok_or_else(|| {
+        ProgramError::InvalidArgument {
+            message: "differentiation in a parent context requires at least one active input leaf".to_string(),
+        }
+    })?;
+    let structure = primal.parameter_structure();
+    let leaves = primal.into_parameters().map(<C::Value as ValueProjection<T>>::from_projected).collect();
+    Ok((context, structure, leaves))
 }
 
 #[cfg(test)]

@@ -2360,7 +2360,8 @@ mod tests {
     use crate::arrays::{
         Array, ArrayBatch, ArrayIrBatchingPolicy, ArrayIrOperation, ArrayIrType, ArrayIrValue, ArrayOperation,
         ArrayType, DataType, Dimension, DimensionBounds, DimensionValue, DimensionVariable, Layout, LogicalMesh,
-        MeshAxis, MeshAxisType, Shape, Sharding, ShardingDimension, StridedLayout, f8e4m3fn, f8e8m0fnu, i4,
+        MeshAxis, MeshAxisType, Shape, Sharding, ShardingDimension, ShardingError, StridedLayout, f8e4m3fn, f8e8m0fnu,
+        i4,
     };
     use crate::batching::{
         BatchAxis, BatchableOperation, BatchedProgram, BatchingContext, BatchingTracer,
@@ -3024,13 +3025,20 @@ mod tests {
     }
 
     #[test]
-    fn test_dot_type_inference_strips_auto_axes() {
+    fn test_dot_type_inference_over_meshes_with_auto_axes() {
+        // Input types cannot place dimensions over auto mesh axes, and the output follows the explicit placement only.
         let mesh = LogicalMesh::new(vec![
             MeshAxis::new("a", 2, MeshAxisType::Auto).unwrap(),
             MeshAxis::new("m", 2, MeshAxisType::Explicit).unwrap(),
         ])
         .unwrap();
-        let lhs = sharded_array(&mesh, &[4, 8], vec![ShardingDimension::sharded(["a"]), ShardingDimension::Replicated]);
+        let auto_dimensions = vec![ShardingDimension::sharded(["a"]), ShardingDimension::Replicated];
+        let auto_sharding = Sharding::new(mesh.clone(), auto_dimensions).unwrap();
+        assert_eq!(
+            plain_array(&[4, 8]).with_sharding(auto_sharding.clone()),
+            Err(ShardingError::AutoAxisInArrayType { sharding: auto_sharding }),
+        );
+        let lhs = sharded_array(&mesh, &[4, 8], vec![ShardingDimension::Replicated, ShardingDimension::Replicated]);
         let rhs =
             sharded_array(&mesh, &[8, 16], vec![ShardingDimension::Replicated, ShardingDimension::sharded(["m"])]);
         check_operation_type_inference!(

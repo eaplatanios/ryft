@@ -1745,9 +1745,9 @@ mod tests {
         assert_eq!(operation.infer_output_types(&[row(Some(spatial.clone())), row(None)], &[]), Ok(vec![expected]),);
         assert_eq!(operation.infer_output_types(&[row(None), row(None)], &[]).unwrap()[0].sharding(), None);
 
-        // Explicit, manual, and automatic placement differences all conflict; this is intentionally stricter than
-        // checking only explicit mesh axes.
-        for axis_type in [MeshAxisType::Explicit, MeshAxisType::Manual, MeshAxisType::Auto] {
+        // Explicit and manual placement differences both conflict; this is intentionally stricter than checking only
+        // explicit mesh axes. Array types cannot place dimensions over auto mesh axes at all.
+        for axis_type in [MeshAxisType::Explicit, MeshAxisType::Manual] {
             let placement_mesh = LogicalMesh::new(vec![MeshAxis::new("p", 2, axis_type).unwrap()]).unwrap();
             let placed = Sharding::new(
                 placement_mesh.clone(),

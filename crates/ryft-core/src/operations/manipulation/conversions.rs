@@ -4743,8 +4743,8 @@ mod tests {
     #[test]
     fn test_cast_type_inference_placement() {
         // Placement follows the rules of `reshard`: explicit placement may be requested, changed, and dropped from
-        // tracking, whereas the auto and manual axes that each dimension names are carried forward unchanged, together
-        // with every explicit axis major to them.
+        // tracking, whereas the manual axes that each dimension names are carried forward unchanged, together with
+        // every explicit axis major to them. Array types never place dimensions over auto mesh axes.
         let mesh = LogicalMesh::new(vec![
             MeshAxis::new("x", 2, MeshAxisType::Explicit).unwrap(),
             MeshAxis::new("y", 2, MeshAxisType::Explicit).unwrap(),
@@ -4758,9 +4758,10 @@ mod tests {
         };
         let sharded = |axes: &[&str]| ShardingDimension::sharded(axes.iter().copied());
         let replicated = ShardingDimension::replicated;
-        let auto_error = TypeError::invalid(
-            "`cast` cannot change placement over auto mesh axes; use `constrain_sharding` to constrain placement \
-             over them",
+        let auto_sharding = Sharding::new(mesh.clone(), vec![sharded(&["a"]), replicated()]).unwrap();
+        assert_eq!(
+            plain.clone().with_sharding(auto_sharding.clone()),
+            Err(ShardingError::AutoAxisInArrayType { sharding: auto_sharding }),
         );
         let manual_error = TypeError::invalid(
             "`cast` cannot change placement over manual mesh axes; use manual collectives for transitions over them",
@@ -4775,36 +4776,26 @@ mod tests {
             (placed([sharded(&["x"]), replicated()]), plain.clone(), Ok(())),
             // Replicating over a mesh with auto axes names none of them.
             (plain.clone(), placed([replicated(), replicated()]), Ok(())),
-            // Auto placement is carried forward or left untracked, never introduced, dropped, or moved, and the
-            // explicit axes major to it are fixed because they determine which block each auto shard holds.
-            (
-                placed([sharded(&["a"]), replicated()]),
-                placed([sharded(&["x", "a"]), replicated()]),
-                Err(order_error.clone()),
-            ),
-            (
-                placed([sharded(&["x", "a"]), replicated()]),
-                placed([sharded(&["a"]), replicated()]),
-                Err(order_error.clone()),
-            ),
-            (placed([sharded(&["a", "x"]), replicated()]), placed([sharded(&["a", "y"]), replicated()]), Ok(())),
-            (placed([sharded(&["a"]), replicated()]), plain.clone(), Ok(())),
-            (plain.clone(), placed([sharded(&["a"]), replicated()]), Err(auto_error.clone())),
-            (placed([sharded(&["a"]), replicated()]), placed([replicated(), replicated()]), Err(auto_error.clone())),
-            (placed([sharded(&["a"]), replicated()]), placed([replicated(), sharded(&["a"])]), Err(auto_error)),
             // Manual placement is carried forward, never introduced or dropped, and only explicit axes minor to it
-            // may change. Neither manual nor auto axes may be reordered relative to each other or to explicit axes.
+            // may change. The explicit axes major to it are fixed because they determine which block each manual
+            // shard holds, and manual axes may not be reordered relative to explicit axes.
             (placed([sharded(&["m"]), replicated()]), placed([sharded(&["m"]), sharded(&["x"])]), Ok(())),
             (placed([sharded(&["m", "x"]), replicated()]), placed([sharded(&["m"]), replicated()]), Ok(())),
             (placed([sharded(&["m"]), replicated()]), placed([sharded(&["m", "x"]), replicated()]), Ok(())),
+            (placed([sharded(&["m", "x"]), replicated()]), placed([sharded(&["m", "y"]), replicated()]), Ok(())),
             (
-                placed([sharded(&["m", "x"]), replicated()]),
+                placed([sharded(&["m"]), replicated()]),
                 placed([sharded(&["x", "m"]), replicated()]),
                 Err(order_error.clone()),
             ),
             (
-                placed([sharded(&["a", "m"]), replicated()]),
-                placed([sharded(&["m", "a"]), replicated()]),
+                placed([sharded(&["x", "m"]), replicated()]),
+                placed([sharded(&["m"]), replicated()]),
+                Err(order_error.clone()),
+            ),
+            (
+                placed([sharded(&["m", "x"]), replicated()]),
+                placed([sharded(&["x", "m"]), replicated()]),
                 Err(order_error),
             ),
             (plain.clone(), placed([sharded(&["m"]), replicated()]), Err(manual_error.clone())),
@@ -4831,11 +4822,12 @@ mod tests {
 
     #[test]
     fn test_cast_type_inference_mesh_axis_definitions() {
-        // Auto and manual axes that the output carries forward keep their mesh axis definitions (size and type), even
-        // when only their names are compared for placement and manual variation, whereas the output mesh may still add
-        // or drop unrelated axes. Axes that carry reduction state, and explicit axes major to an auto or manual axis in
-        // a dimension (whose sizes fix the blocks of its shards), keep their definitions, whereas explicit axes minor to
-        // every auto and manual axis and referenced only by dimension placement may be redefined or replaced.
+        // Manual axes that the output carries forward keep their mesh axis definitions (size and type), even when only
+        // their names are compared for placement and manual variation, whereas the output mesh may still add or drop
+        // unrelated axes. Axes that carry reduction state, and explicit axes major to a manual axis in a dimension
+        // (whose sizes fix the blocks of its shards), keep their definitions, whereas explicit axes minor to every
+        // manual axis and referenced only by dimension placement may be redefined or replaced. Array types never
+        // place dimensions or reduction state over auto mesh axes.
         let mesh = |axes: &[(&str, usize, MeshAxisType)]| {
             LogicalMesh::new(
                 axes.iter().map(|(name, size, r#type)| MeshAxis::new(*name, *size, *r#type).unwrap()).collect(),
@@ -4867,21 +4859,14 @@ mod tests {
                 .unwrap()
         };
         let sharded = ShardingDimension::sharded(["x"]);
-        let auto = |size: usize| mesh(&[("x", size, MeshAxisType::Auto)]);
         let manual = |size: usize| mesh(&[("x", size, MeshAxisType::Manual)]);
         let explicit = |size: usize| mesh(&[("x", size, MeshAxisType::Explicit)]);
-        let with_explicit = |size: usize| mesh(&[("x", size, MeshAxisType::Auto), ("y", 2, MeshAxisType::Explicit)]);
-        let major_explicit = ShardingDimension::sharded(["x", "a"]);
+        let with_explicit = |size: usize| mesh(&[("x", size, MeshAxisType::Manual), ("y", 2, MeshAxisType::Explicit)]);
         let major_manual = ShardingDimension::sharded(["x", "m"]);
-        let minor_explicit = ShardingDimension::sharded(["a", "x"]);
+        let minor = ShardingDimension::sharded(["m", "x"]);
         let with_minor_explicit =
-            mesh(&[("a", 2, MeshAxisType::Auto), ("x", 2, MeshAxisType::Explicit), ("y", 2, MeshAxisType::Explicit)]);
+            mesh(&[("m", 2, MeshAxisType::Manual), ("x", 2, MeshAxisType::Explicit), ("y", 2, MeshAxisType::Explicit)]);
         let cases = [
-            (
-                placed(auto(2), sharded.clone()),
-                placed(auto(4), sharded.clone()),
-                Err(TypeError::invalid("`cast` cannot redefine preserved auto mesh axis `'x'=2:auto` as `'x'=4:auto`")),
-            ),
             (
                 placed(manual(2), sharded.clone()),
                 placed(manual(4), sharded.clone()),
@@ -4896,8 +4881,8 @@ mod tests {
                     "`cast` cannot redefine preserved manual mesh axis `'x'=2:manual` as `'x'=4:manual`",
                 )),
             ),
-            (placed(auto(2), sharded.clone()), placed(with_explicit(2), sharded.clone()), Ok(())),
-            (placed(with_explicit(2), sharded.clone()), placed(auto(2), sharded.clone()), Ok(())),
+            (placed(manual(2), sharded.clone()), placed(with_explicit(2), sharded.clone()), Ok(())),
+            (placed(with_explicit(2), sharded.clone()), placed(manual(2), sharded.clone()), Ok(())),
             (
                 unreduced(explicit(2)),
                 unreduced(explicit(4)),
@@ -4921,22 +4906,8 @@ mod tests {
             ),
             (
                 unreduced(explicit(2)),
-                unreduced(auto(2)),
-                Err(TypeError::invalid(
-                    "`cast` cannot redefine preserved explicit mesh axis `'x'=2:explicit` as `'x'=2:auto`",
-                )),
-            ),
-            (
-                unreduced(explicit(2)),
                 unreduced(mesh(&[("x", 2, MeshAxisType::Explicit), ("y", 2, MeshAxisType::Explicit)])),
                 Ok(()),
-            ),
-            (
-                placed(mesh(&[("x", 2, MeshAxisType::Explicit), ("a", 2, MeshAxisType::Auto)]), major_explicit.clone()),
-                placed(mesh(&[("x", 4, MeshAxisType::Explicit), ("a", 2, MeshAxisType::Auto)]), major_explicit.clone()),
-                Err(TypeError::invalid(
-                    "`cast` cannot redefine preserved explicit mesh axis `'x'=2:explicit` as `'x'=4:explicit`",
-                )),
             ),
             (
                 placed(mesh(&[("x", 2, MeshAxisType::Explicit), ("m", 2, MeshAxisType::Manual)]), major_manual.clone()),
@@ -4946,13 +4917,13 @@ mod tests {
                 )),
             ),
             (
-                placed(mesh(&[("a", 2, MeshAxisType::Auto), ("x", 2, MeshAxisType::Explicit)]), minor_explicit.clone()),
-                placed(mesh(&[("a", 2, MeshAxisType::Auto), ("x", 4, MeshAxisType::Explicit)]), minor_explicit.clone()),
+                placed(mesh(&[("m", 2, MeshAxisType::Manual), ("x", 2, MeshAxisType::Explicit)]), minor.clone()),
+                placed(mesh(&[("m", 2, MeshAxisType::Manual), ("x", 4, MeshAxisType::Explicit)]), minor.clone()),
                 Ok(()),
             ),
             (
-                placed(with_minor_explicit.clone(), minor_explicit),
-                placed(with_minor_explicit, ShardingDimension::sharded(["a", "y"])),
+                placed(with_minor_explicit.clone(), minor),
+                placed(with_minor_explicit, ShardingDimension::sharded(["m", "y"])),
                 Ok(()),
             ),
             (placed(explicit(2), sharded.clone()), placed(explicit(4), sharded), Ok(())),

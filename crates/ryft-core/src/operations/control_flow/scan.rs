@@ -4407,7 +4407,7 @@ mod tests {
     use crate::arrays::{
         Array, ArrayIrOperation, ArrayOperation, ArrayReference, ArrayReferenceTransform, ArrayReferenceTransformIndex,
         DataType, DimensionBounds, DimensionError, DimensionType, DimensionValue, DimensionVariable, LogicalMesh,
-        Memory, MeshAxis, MeshAxisType, Sharding, ShardingDimension,
+        Memory, MeshAxis, MeshAxisType, Sharding, ShardingDimension, ShardingError,
     };
     use crate::axes::{MeshContext, NamedAxes, NamedAxis};
     use crate::batching::{BatchingTracer, ProgramBatchingOutputAxesPolicy, RecursiveBatchingDriver, batch};
@@ -5385,7 +5385,7 @@ mod tests {
         // exact iteration count fixes.
         let index_type = ArrayType::scalar(DataType::I64);
         let scalar_type = ArrayType::scalar(DataType::F64);
-        let mesh = LogicalMesh::new(vec![MeshAxis::new("x", 1, MeshAxisType::Auto).unwrap()]).unwrap();
+        let mesh = LogicalMesh::new(vec![MeshAxis::new("x", 1, MeshAxisType::Explicit).unwrap()]).unwrap();
         let slice_type = scalar_type.clone().with_sharding(Sharding::replicated(mesh.clone(), 0)).unwrap();
         assert_eq!(
             ArrayType::infer_scan_output_types(
@@ -6043,10 +6043,7 @@ mod tests {
         let interfaces = vec![product_body().interface()];
         let mesh = LogicalMesh::new(vec![MeshAxis::new("x", 2, MeshAxisType::Auto).unwrap()]).unwrap();
         let sharded_carry_type = scalar_type.clone().with_sharding(Sharding::replicated(mesh.clone(), 0)).unwrap();
-        let sharded_stacked_type = stacked_type
-            .clone()
-            .with_sharding(Sharding::new(mesh.clone(), vec![ShardingDimension::sharded(["x"])]).unwrap())
-            .unwrap();
+        let sharded_stacked_type = stacked_type.clone().with_sharding(Sharding::replicated(mesh.clone(), 1)).unwrap();
 
         // The inferred output types stay declared (i.e., metadata-free) rather than inheriting the input shardings,
         // while the body is requested at the refined input types so that the programs derived from it carry the
@@ -6058,8 +6055,6 @@ mod tests {
             ),
             Ok(vec![scalar_type.clone(), stacked_type.clone()]),
         );
-        // The scan axis of the stacked input is sharded over an `Auto` mesh axis, which is only a placement hint, so
-        // each per-iteration slice drops it.
         assert_eq!(
             operation.infer_region_input_types(
                 &[sharded_carry_type.clone(), sharded_stacked_type.clone()],
@@ -6068,8 +6063,16 @@ mod tests {
             Ok(vec![Some(vec![
                 ArrayType::scalar(DataType::I64),
                 sharded_carry_type.clone(),
-                scalar_type.clone().with_sharding(Sharding::replicated(mesh, 0)).unwrap(),
+                scalar_type.clone().with_sharding(Sharding::replicated(mesh.clone(), 0)).unwrap(),
             ])]),
+        );
+
+        // Placement over `Auto` mesh axes is left to the compiler, so a stacked input type cannot place its scan axis
+        // over one in the first place.
+        let auto_sharding = Sharding::new(mesh, vec![ShardingDimension::sharded(["x"])]).unwrap();
+        assert_eq!(
+            stacked_type.clone().with_sharding(auto_sharding.clone()),
+            Err(ShardingError::AutoAxisInArrayType { sharding: auto_sharding }),
         );
 
         // A scan axis sharded over a `Manual` mesh axis only distributes the stack, so each slice drops that placement
@@ -10094,10 +10097,10 @@ mod tests {
             Ok(expected),
         );
 
-        // A stacked input whose scan axis is sharded over an `Auto` mesh axis is sliced like an unsharded one, because
-        // the per-iteration slices drop that placement hint. The slices keep their mesh, so the final carry is placed
-        // on it, and the stacked output keeps it with the declared replicated scan axis.
-        let mesh = LogicalMesh::new(vec![MeshAxis::new("x", 3, MeshAxisType::Auto).unwrap()]).unwrap();
+        // A stacked input whose scan axis is sharded over a `Manual` mesh axis is sliced like an unsharded one, because
+        // that placement only distributes the stack and the per-iteration slices drop it. The slices keep their mesh,
+        // so the final carry is placed on it, and the stacked output keeps it with the declared replicated scan axis.
+        let mesh = LogicalMesh::new(vec![MeshAxis::new("x", 3, MeshAxisType::Manual).unwrap()]).unwrap();
         let sharded_values = Array::from_elements::<f64>(
             ArrayType::new_static(DataType::F64, [3])
                 .with_sharding(Sharding::new(mesh.clone(), vec![ShardingDimension::sharded(["x"])]).unwrap())
@@ -10368,9 +10371,9 @@ mod tests {
 
     #[test]
     fn test_scan_interpretation_places_stacked_outputs() {
-        // A stack is assembled from per-item values with a replicated leading axis and then placed as the scan
-        // declares, so an eager application produces the inferred output types.
-        let mesh = LogicalMesh::new(vec![MeshAxis::new("x", 1, MeshAxisType::Auto).unwrap()]).unwrap();
+        // A stack is placed as the scan declares, so an eager application produces the inferred output types, even when
+        // the body declares unsharded slices and only the actual slices carry the mesh.
+        let mesh = LogicalMesh::new(vec![MeshAxis::new("x", 1, MeshAxisType::Explicit).unwrap()]).unwrap();
         let carry_type = ArrayType::scalar(DataType::F64).with_sharding(Sharding::replicated(mesh.clone(), 0)).unwrap();
         let stack_type = ArrayType::new_static(DataType::F64, [3])
             .with_sharding(Sharding::replicated(mesh.clone(), 1))
@@ -10389,7 +10392,7 @@ mod tests {
         assert_eq!(outputs[1], Array::from_elements::<f64>(placed_type, &[2.0, 6.0, 24.0]).unwrap());
 
         // A placement over an explicit mesh axis enters the stack and each written slice alike, so that the in-place
-        // writes agree on it.
+        // writes agree on it, also when the body declares the explicit mesh.
         let mesh = LogicalMesh::new(vec![MeshAxis::new("e", 1, MeshAxisType::Explicit).unwrap()]).unwrap();
         let scalar_type =
             ArrayType::scalar(DataType::F64).with_sharding(Sharding::replicated(mesh.clone(), 0)).unwrap();
@@ -10481,12 +10484,12 @@ mod tests {
 
     #[test]
     fn test_scan_interpretation_keeps_unsharded_stacks_when_slices_gain_mesh_metadata() {
-        // The body stacks its incoming carry: the first slice is unsharded, and the next has mesh metadata. The
-        // mixed manual/auto placement is only a hint for the update, so the existing stack stays unsharded without
-        // requiring the later slice to vary over the manual axis.
+        // The body stacks its incoming carry: the first slice is unsharded, and the next has mesh metadata. An update
+        // keeps the placement of the stack it writes into, so the existing stack stays unsharded under the mixed
+        // manual/explicit placement without requiring the later slice to vary over the manual axis.
         let mesh = LogicalMesh::new(vec![
             MeshAxis::new("m", 1, MeshAxisType::Manual).unwrap(),
-            MeshAxis::new("a", 1, MeshAxisType::Auto).unwrap(),
+            MeshAxis::new("a", 1, MeshAxisType::Explicit).unwrap(),
         ])
         .unwrap();
         let slice_type = ArrayType::scalar(DataType::F64).with_sharding(Sharding::replicated(mesh, 0)).unwrap();
@@ -10507,7 +10510,7 @@ mod tests {
         assert_eq!(
             program.to_string(),
             indoc! {"
-                lambda %0:f64[], %1:f64[2][sharding={mesh<['m'=1:manual, 'a'=1:auto]>, [{}]}] .
+                lambda %0:f64[], %1:f64[2][sharding={mesh<['m'=1:manual, 'a'=1:explicit]>, [{}]}] .
                 let %2:f64[], %3:f64[2] = scan [
                     carry_count=1,
                     iteration_count=2,
@@ -17299,7 +17302,7 @@ mod tests {
         // The fused scan stacks the tangents of the stacked outputs next to those outputs, and linearization splits
         // it into a primal scan that stacks the outputs and their residuals and a tangent scan that stacks the output
         // tangents, so each derived scan places its stacked axes as the differentiated scan does.
-        let mesh = LogicalMesh::new(vec![MeshAxis::new("x", 1, MeshAxisType::Auto).unwrap()]).unwrap();
+        let mesh = LogicalMesh::new(vec![MeshAxis::new("x", 1, MeshAxisType::Manual).unwrap()]).unwrap();
         let carry_type = ArrayType::scalar(DataType::F64).with_sharding(Sharding::replicated(mesh.clone(), 0)).unwrap();
         let stack_type = ArrayType::new_static(DataType::F64, [3])
             .with_sharding(Sharding::new(mesh, vec![ShardingDimension::sharded(["x"])]).unwrap())
@@ -17307,9 +17310,9 @@ mod tests {
         let operation =
             TestScanOperation::new(1, 3).with_stacked_axis_shardings(vec![ShardingDimension::sharded(["x"])]);
         let program = scan_program(operation, product_body(), vec![carry_type, stack_type]);
-        let scalar = "f64[][sharding={mesh<['x'=1:auto]>, []}]";
-        let stack = "f64[3][sharding={mesh<['x'=1:auto]>, [{'x'}]}]";
-        let residual_stack = "f64[3][sharding={mesh<['x'=1:auto]>, [{}]}]";
+        let scalar = "f64[][sharding={mesh<['x'=1:manual]>, []}]";
+        let stack = "f64[3][sharding={mesh<['x'=1:manual]>, [{'x'}]}]";
+        let residual_stack = "f64[3][sharding={mesh<['x'=1:manual]>, [{}]}]";
 
         // The fused scan stacks the primal output and its tangent at the requested scan-axis sharding.
         assert_eq!(
@@ -20772,9 +20775,9 @@ mod tests {
     fn test_scan_transposition_places_stacked_cotangents_as_the_stacked_inputs() {
         // The reversed scan stacks the cotangents of the stacked inputs, so their scan axes take the placement of the
         // inputs' scan axes rather than the placement that the forward scan declares for its own stacked outputs: a
-        // stack whose scan axis is sharded over the `auto` mesh axis `x` yields a cotangent placed the same way, while
-        // a replicated stack yields a replicated cotangent even though the forward outputs are placed on `x`.
-        let mesh = LogicalMesh::new(vec![MeshAxis::new("x", 1, MeshAxisType::Auto).unwrap()]).unwrap();
+        // stack whose scan axis is sharded over the `manual` mesh axis `x` yields a cotangent placed the same way,
+        // while a replicated stack yields a replicated cotangent even though the forward outputs are placed on `x`.
+        let mesh = LogicalMesh::new(vec![MeshAxis::new("x", 1, MeshAxisType::Manual).unwrap()]).unwrap();
         let carry_type = ArrayType::scalar(DataType::F64).with_sharding(Sharding::replicated(mesh.clone(), 0)).unwrap();
         let replicated_stack_type = ArrayType::new_static(DataType::F64, [3])
             .with_sharding(Sharding::replicated(mesh.clone(), 1))
@@ -20785,9 +20788,9 @@ mod tests {
         let operation =
             TestScanOperation::new(1, 3).with_stacked_axis_shardings(vec![ShardingDimension::sharded(["x"])]);
         let initial = Array::from_elements::<f64>(carry_type.clone(), &[1.0]).unwrap();
-        let scalar = "f64[][sharding={mesh<['x'=1:auto]>, []}]";
-        let sharded_stack = "f64[3][sharding={mesh<['x'=1:auto]>, [{'x'}]}]";
-        let replicated_stack = "f64[3][sharding={mesh<['x'=1:auto]>, [{}]}]";
+        let scalar = "f64[][sharding={mesh<['x'=1:manual]>, []}]";
+        let sharded_stack = "f64[3][sharding={mesh<['x'=1:manual]>, [{'x'}]}]";
+        let replicated_stack = "f64[3][sharding={mesh<['x'=1:manual]>, [{}]}]";
         for (stack_type, stack, sharding_attributes) in [
             (sharded_stack_type.clone(), sharded_stack, ", stacked_axis_shardings=[{'x'}]"),
             (replicated_stack_type.clone(), replicated_stack, ""),
@@ -23601,7 +23604,7 @@ mod tests {
     #[test]
     fn test_scan_scan_with_stacked_axis_shardings() {
         // Each structured output receives its own requested scan-axis sharding, including an implicit replicated tail.
-        let mesh = LogicalMesh::new(vec![MeshAxis::new("x", 1, MeshAxisType::Auto).unwrap()]).unwrap();
+        let mesh = LogicalMesh::new(vec![MeshAxis::new("x", 1, MeshAxisType::Explicit).unwrap()]).unwrap();
         let input_type = ArrayType::new_static(DataType::F32, [2])
             .with_sharding(Sharding::replicated(mesh.clone(), 1))
             .unwrap();
@@ -23623,9 +23626,9 @@ mod tests {
             input_type.clone(),
         )
         .unwrap();
-        let replicated = "f32[2][sharding={mesh<['x'=1:auto]>, [{}]}]";
-        let sharded = "f32[2][sharding={mesh<['x'=1:auto]>, [{'x'}]}]";
-        let slice = "f32[][sharding={mesh<['x'=1:auto]>, []}]";
+        let replicated = "f32[2][sharding={mesh<['x'=1:explicit]>, [{}]}]";
+        let sharded = "f32[2][sharding={mesh<['x'=1:explicit]>, [{'x'}]}]";
+        let slice = "f32[][sharding={mesh<['x'=1:explicit]>, []}]";
         assert_eq!(
             program.to_string(),
             formatdoc! {"
