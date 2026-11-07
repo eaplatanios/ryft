@@ -5546,8 +5546,3 @@ mod tests {
         assert_ne!(rebound.outputs(), first.outputs());
     }
 }
-
-// TODO(G5-SWEEP): temporary sweep hook; remove before handoff.
-#[cfg(test)]
-#[path = "/private/tmp/claude-501/-Users-eaplatanios-Development-Repositories-ryft-1/d1d4acb6-542a-48e8-a2fa-8b9a737fc3e2/scratchpad/g5_sweep.rs"]
-mod g5_sweep;
