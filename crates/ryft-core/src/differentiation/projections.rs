@@ -349,7 +349,15 @@ impl<C: Context, P: DifferentiationPolicy<C>> DifferentiationContext<C, P> {
     where
         C::Type: DifferentiableType,
     {
-        validate_region_free_structural_operation(&operation)?;
+        // This path stages the operation without regions. Reject them first so that downstream inference or region
+        // count errors do not obscure the unsupported operation.
+        if !operation.region_slots().is_empty() {
+            return Err(ProgramError::UnsupportedOperation {
+                message: format!("structural operation `{}` must not declare regions", operation.name()),
+            }
+            .into());
+        }
+
         let primal_inputs = inputs.iter().map(|input| input.primal().clone()).collect::<Vec<_>>();
         self.primal()
             .bind(operation, Vec::new(), primal_inputs.as_slice())?
@@ -392,7 +400,15 @@ impl<C: Context, P: DifferentiationPolicy<C>> DifferentiationContext<C, P> {
     where
         C::Type: DifferentiableType,
     {
-        validate_region_free_structural_operation(&operation)?;
+        // This path stages the operation without regions. Reject them first so that downstream inference or region
+        // count errors do not obscure the unsupported operation.
+        if !operation.region_slots().is_empty() {
+            return Err(ProgramError::UnsupportedOperation {
+                message: format!("structural operation `{}` must not declare regions", operation.name()),
+            }
+            .into());
+        }
+
         let primal_inputs = inputs.iter().map(|input| input.primal().clone()).collect::<Vec<_>>();
         let input_types = primal_inputs.iter().map(|input| input.r#type().into_owned()).collect::<Vec<_>>();
         let output_types = operation.infer_output_types(input_types.as_slice(), &[])?;
@@ -760,27 +776,6 @@ where
     }
 }
 
-// TODO(eaplatanios): Review this module.
-
-/// Validates that the provided structural operation declares no regions, which
-/// [`DifferentiationContext::jvp_structural_operation`] and [`DifferentiationContext::jvp_structural_mixed_operation`]
-/// require because they stage the operation again without regions. The check runs before anything else, so that
-/// region-carrying operations are reported as such rather than through a downstream inference or region count error.
-fn validate_region_free_structural_operation<O: Operation>(operation: &O) -> Result<(), ProgramError> {
-    if operation.region_slots().is_empty() {
-        Ok(())
-    } else {
-        Err(ProgramError::UnsupportedOperation {
-            message: format!("structural operation `{}` must not declare regions", operation.name()),
-        })
-    }
-}
-
-// Projected values in parent contexts.
-
-/// `T`-typed member representation of the parent tracer `X`, which differentiated closures receive.
-type ProjectedTracer<X, T> = ProjectedValue<T, X>;
-
 /// Returns a [`ParentDifferentiationBuilder`] for differentiating functions at `primal`, whose leaves are projections
 /// of values of a parent context, in that parent context. Refer to the [module documentation](self) for more
 /// information, and to [`differentiate_at`] for the semantics of the terminal functions.
@@ -797,6 +792,8 @@ pub struct ParentDifferentiationBuilder<Input> {
     /// Active primal inputs, whose leaves are projections of values of the parent context.
     primal: Input,
 }
+
+// TODO(eaplatanios): Review this module.
 
 /// Returns the parent context of the leaves of `primal`, its parameter structure, and its leaves lifted into that
 /// parent context.
@@ -899,9 +896,9 @@ impl<Input> ParentDifferentiationBuilder<Input> {
         for<'t> &'t T: TryFrom<&'t C::Type, Error = TypeError>,
         L: Value<Type = T, Domain = ProjectedContext<C, T>>,
         C::Value: ValueProjection<T, Projected = L>,
-        Input: Parameterized<L, Family: ParameterizedFamily<ProjectedTracer<DifferentiationTracer<C>, T>>>,
-        Output: Parameterized<ProjectedTracer<DifferentiationTracer<C>, T>, Family: ParameterizedFamily<L>>,
-        F: FnOnce(Input::To<ProjectedTracer<DifferentiationTracer<C>, T>>) -> Result<Output, ProgramError>,
+        Input: Parameterized<L, Family: ParameterizedFamily<ProjectedValue<T, DifferentiationTracer<C>>>>,
+        Output: Parameterized<ProjectedValue<T, DifferentiationTracer<C>>, Family: ParameterizedFamily<L>>,
+        F: FnOnce(Input::To<ProjectedValue<T, DifferentiationTracer<C>>>) -> Result<Output, ProgramError>,
         TracingContext<C::Constant, C::Operation>:
             StagingContext<Type = C::Type, Constant = C::Constant, Operation = C::Operation>,
     {
@@ -944,9 +941,9 @@ impl<Input> ParentDifferentiationBuilder<Input> {
         for<'t> &'t T: TryFrom<&'t C::Type, Error = TypeError>,
         L: Value<Type = T, Domain = ProjectedContext<C, T>>,
         C::Value: ValueProjection<T, Projected = L>,
-        Input: Parameterized<L, Family: ParameterizedFamily<ProjectedTracer<LinearizationTracer<C>, T>>>,
-        Output: Parameterized<ProjectedTracer<LinearizationTracer<C>, T>, Family: ParameterizedFamily<L>>,
-        F: FnOnce(Input::To<ProjectedTracer<LinearizationTracer<C>, T>>) -> Result<Output, ProgramError>,
+        Input: Parameterized<L, Family: ParameterizedFamily<ProjectedValue<T, LinearizationTracer<C>>>>,
+        Output: Parameterized<ProjectedValue<T, LinearizationTracer<C>>, Family: ParameterizedFamily<L>>,
+        F: FnOnce(Input::To<ProjectedValue<T, LinearizationTracer<C>>>) -> Result<Output, ProgramError>,
         TracingContext<C::Constant, C::Operation>:
             StagingContext<Type = C::Type, Constant = C::Constant, Operation = C::Operation>,
     {
@@ -979,9 +976,9 @@ impl<Input> ParentDifferentiationBuilder<Input> {
         for<'t> &'t T: TryFrom<&'t C::Type, Error = TypeError>,
         L: Value<Type = T, Domain = ProjectedContext<C, T>>,
         C::Value: ValueProjection<T, Projected = L>,
-        Input: Parameterized<L, Family: ParameterizedFamily<ProjectedTracer<LinearizationTracer<C>, T>>>,
-        Output: Parameterized<ProjectedTracer<LinearizationTracer<C>, T>, Family: ParameterizedFamily<L>>,
-        F: FnOnce(Input::To<ProjectedTracer<LinearizationTracer<C>, T>>) -> Result<Output, ProgramError>,
+        Input: Parameterized<L, Family: ParameterizedFamily<ProjectedValue<T, LinearizationTracer<C>>>>,
+        Output: Parameterized<ProjectedValue<T, LinearizationTracer<C>>, Family: ParameterizedFamily<L>>,
+        F: FnOnce(Input::To<ProjectedValue<T, LinearizationTracer<C>>>) -> Result<Output, ProgramError>,
         TracingContext<C::Constant, C::Operation>:
             StagingContext<Type = C::Type, Constant = C::Constant, Operation = C::Operation>,
         <PartialEvaluationContext<C> as Domain>::Operation: DifferentiableOperation<PartialEvaluationContext<C>>,
@@ -1023,10 +1020,10 @@ impl<Input> ParentDifferentiationBuilder<Input> {
         for<'t> &'t T: TryFrom<&'t C::Type, Error = TypeError>,
         L: Value<Type = T, Domain = ProjectedContext<C, T>>,
         C::Value: ValueProjection<T, Projected = L>,
-        Input: Parameterized<L, Family: ParameterizedFamily<ProjectedTracer<LinearizationTracer<C>, T>>>,
+        Input: Parameterized<L, Family: ParameterizedFamily<ProjectedValue<T, LinearizationTracer<C>>>>,
         F: FnOnce(
-            Input::To<ProjectedTracer<LinearizationTracer<C>, T>>,
-        ) -> Result<ProjectedTracer<LinearizationTracer<C>, T>, ProgramError>,
+            Input::To<ProjectedValue<T, LinearizationTracer<C>>>,
+        ) -> Result<ProjectedValue<T, LinearizationTracer<C>>, ProgramError>,
         TracingContext<C::Constant, C::Operation>:
             StagingContext<Type = C::Type, Constant = C::Constant, Operation = C::Operation>,
         <PartialEvaluationContext<C> as Domain>::Operation: DifferentiableOperation<PartialEvaluationContext<C>>,
@@ -1035,7 +1032,7 @@ impl<Input> ParentDifferentiationBuilder<Input> {
         let gradient_structure = structure.clone();
         let (value, gradient) = differentiate_at(primal).in_context(&context).value_and_gradient(
             |input: Vec<LinearizationTracer<C>>| {
-                let input = project_and_rebuild::<T, _, Input::To<ProjectedTracer<LinearizationTracer<C>, T>>>(
+                let input = project_and_rebuild::<T, _, Input::To<ProjectedValue<T, LinearizationTracer<C>>>>(
                     structure, input,
                 )?;
                 Ok::<_, ProgramError>(<LinearizationTracer<C> as ValueProjection<T>>::from_projected(function(input)?))
@@ -1064,10 +1061,10 @@ impl<Input> ParentDifferentiationBuilder<Input> {
         for<'t> &'t T: TryFrom<&'t C::Type, Error = TypeError>,
         L: Value<Type = T, Domain = ProjectedContext<C, T>>,
         C::Value: ValueProjection<T, Projected = L>,
-        Input: Parameterized<L, Family: ParameterizedFamily<ProjectedTracer<LinearizationTracer<C>, T>>>,
+        Input: Parameterized<L, Family: ParameterizedFamily<ProjectedValue<T, LinearizationTracer<C>>>>,
         F: FnOnce(
-            Input::To<ProjectedTracer<LinearizationTracer<C>, T>>,
-        ) -> Result<ProjectedTracer<LinearizationTracer<C>, T>, ProgramError>,
+            Input::To<ProjectedValue<T, LinearizationTracer<C>>>,
+        ) -> Result<ProjectedValue<T, LinearizationTracer<C>>, ProgramError>,
         TracingContext<C::Constant, C::Operation>:
             StagingContext<Type = C::Type, Constant = C::Constant, Operation = C::Operation>,
         <PartialEvaluationContext<C> as Domain>::Operation: DifferentiableOperation<PartialEvaluationContext<C>>,
@@ -1094,10 +1091,10 @@ impl<Input> ParentDifferentiationBuilder<Input> {
         C::Value: ValueProjection<T, Projected = L>,
         Input: Parameterized<
                 L,
-                Family: ParameterizedFamily<ProjectedTracer<LinearizationTracer<C>, T>> + ParameterizedFamily<T>,
+                Family: ParameterizedFamily<ProjectedValue<T, LinearizationTracer<C>>> + ParameterizedFamily<T>,
             >,
-        Output: Parameterized<ProjectedTracer<LinearizationTracer<C>, T>, Family: ParameterizedFamily<T>>,
-        F: FnOnce(Input::To<ProjectedTracer<LinearizationTracer<C>, T>>) -> Result<Output, ProgramError>,
+        Output: Parameterized<ProjectedValue<T, LinearizationTracer<C>>, Family: ParameterizedFamily<T>>,
+        F: FnOnce(Input::To<ProjectedValue<T, LinearizationTracer<C>>>) -> Result<Output, ProgramError>,
         TracingContext<C::Constant, C::Operation>:
             StagingContext<Type = C::Type, Constant = C::Constant, Operation = C::Operation>,
     {
@@ -1145,10 +1142,10 @@ impl<Input> ParentDifferentiationBuilder<Input> {
         C::Value: ValueProjection<T, Projected = L>,
         Input: Parameterized<
                 L,
-                Family: ParameterizedFamily<ProjectedTracer<LinearizationTracer<C>, T>> + ParameterizedFamily<T>,
+                Family: ParameterizedFamily<ProjectedValue<T, LinearizationTracer<C>>> + ParameterizedFamily<T>,
             >,
-        Output: Parameterized<ProjectedTracer<LinearizationTracer<C>, T>, Family: ParameterizedFamily<T>>,
-        F: FnOnce(Input::To<ProjectedTracer<LinearizationTracer<C>, T>>) -> Result<Output, ProgramError>,
+        Output: Parameterized<ProjectedValue<T, LinearizationTracer<C>>, Family: ParameterizedFamily<T>>,
+        F: FnOnce(Input::To<ProjectedValue<T, LinearizationTracer<C>>>) -> Result<Output, ProgramError>,
         TracingContext<C::Constant, C::Operation>:
             StagingContext<Type = C::Type, Constant = C::Constant, Operation = C::Operation>,
     {
@@ -1207,15 +1204,15 @@ impl<Input> ParentDifferentiationBuilder<Input> {
         C::Value: ValueProjection<T, Projected = L>,
         Input: Parameterized<
                 L,
-                Family: ParameterizedFamily<ProjectedTracer<LinearizationTracer<LinearizationContext<C>>, T>>
+                Family: ParameterizedFamily<ProjectedValue<T, LinearizationTracer<LinearizationContext<C>>>>
                             + ParameterizedFamily<T>,
             >,
         Output: Parameterized<
-                ProjectedTracer<LinearizationTracer<LinearizationContext<C>>, T>,
+                ProjectedValue<T, LinearizationTracer<LinearizationContext<C>>>,
                 Family: ParameterizedFamily<T>,
             >,
         F: FnOnce(
-            Input::To<ProjectedTracer<LinearizationTracer<LinearizationContext<C>>, T>>,
+            Input::To<ProjectedValue<T, LinearizationTracer<LinearizationContext<C>>>>,
         ) -> Result<Output, ProgramError>,
         TracingContext<C::Constant, C::Operation>:
             StagingContext<Type = C::Type, Constant = C::Constant, Operation = C::Operation>,
@@ -1296,22 +1293,25 @@ where
 
     /// Projected counterpart of [`Pushforward::apply_in_context`], whose tangents are the projected leaves of the
     /// caller context.
-    pub fn apply_in_context<X, Path>(
+    pub fn apply_in_context<CallerContext, Path>(
         &self,
-        context: &X,
-        tangents: Input::To<<X::Value as ValueProjection<T>>::Projected>,
-    ) -> Result<Output::To<<X::Value as ValueProjection<T>>::Projected>, ProgramError>
+        context: &CallerContext,
+        tangents: Input::To<<CallerContext::Value as ValueProjection<T>>::Projected>,
+    ) -> Result<Output::To<<CallerContext::Value as ValueProjection<T>>::Projected>, ProgramError>
     where
-        X: ContextProjection<T, Type = C::Type, Constant = C::Constant, Operation = C::Operation>
+        CallerContext: ContextProjection<T, Type = C::Type, Constant = C::Constant, Operation = C::Operation>
             + ImportingContext<C, Path>,
-        Input::Family: ParameterizedFamily<<X::Value as ValueProjection<T>>::Projected>,
-        Output::Family: ParameterizedFamily<<X::Value as ValueProjection<T>>::Projected>,
+        Input::Family: ParameterizedFamily<<CallerContext::Value as ValueProjection<T>>::Projected>,
+        Output::Family: ParameterizedFamily<<CallerContext::Value as ValueProjection<T>>::Projected>,
         C::Operation: ResidualZeroProvider<C::Type, Operation = C::Operation>,
         TracingContext<C::Constant, C::Operation>:
             StagingContext<Type = C::Type, Constant = C::Constant, Operation = C::Operation>,
     {
-        let tangents = tangents.into_parameters().map(<X::Value as ValueProjection<T>>::from_projected).collect();
-        project_and_rebuild::<T, X::Value, Output::To<_>>(
+        let tangents = tangents
+            .into_parameters()
+            .map(<CallerContext::Value as ValueProjection<T>>::from_projected)
+            .collect();
+        project_and_rebuild::<T, CallerContext::Value, Output::To<_>>(
             self.output_structure.clone(),
             self.inner.apply_in_context(context, tangents)?,
         )
@@ -1379,29 +1379,32 @@ where
 
     /// Projected counterpart of [`Pullback::apply_in_context`], whose cotangents are the projected leaves of the
     /// caller context.
-    pub fn apply_in_context<X, Path>(
+    pub fn apply_in_context<CallerContext, Path>(
         &self,
-        context: &X,
-        cotangents: Output::To<<X::Value as ValueProjection<T>>::Projected>,
-    ) -> Result<Input::To<MaybeZero<<X::Value as ValueProjection<T>>::Projected>>, ProgramError>
+        context: &CallerContext,
+        cotangents: Output::To<<CallerContext::Value as ValueProjection<T>>::Projected>,
+    ) -> Result<Input::To<MaybeZero<<CallerContext::Value as ValueProjection<T>>::Projected>>, ProgramError>
     where
-        X: ContextProjection<T, Type = C::Type, Constant = C::Constant, Operation = C::Operation>
+        CallerContext: ContextProjection<T, Type = C::Type, Constant = C::Constant, Operation = C::Operation>
             + ImportingContext<C, Path>,
         for<'t> &'t T: TryFrom<&'t C::Type, Error = TypeError>,
-        Input::Family: ParameterizedFamily<MaybeZero<<X::Value as ValueProjection<T>>::Projected>>,
-        Output::Family: ParameterizedFamily<<X::Value as ValueProjection<T>>::Projected>,
+        Input::Family: ParameterizedFamily<MaybeZero<<CallerContext::Value as ValueProjection<T>>::Projected>>,
+        Output::Family: ParameterizedFamily<<CallerContext::Value as ValueProjection<T>>::Projected>,
         C::Operation: PullbackOperation<C::Type, C::Constant>,
         TracingContext<C::Constant, C::Operation>:
             StagingContext<Type = C::Type, Constant = C::Constant, Operation = C::Operation>,
     {
-        let cotangents = cotangents.into_parameters().map(<X::Value as ValueProjection<T>>::from_projected).collect();
+        let cotangents = cotangents
+            .into_parameters()
+            .map(<CallerContext::Value as ValueProjection<T>>::from_projected)
+            .collect();
         let cotangents = self
             .inner
             .apply_in_context(context, cotangents)?
             .into_iter()
-            .map(project_maybe_zero::<T, X::Value>)
+            .map(project_maybe_zero::<T, CallerContext::Value>)
             .collect::<Result<Vec<_>, _>>()?;
-        Ok(Input::To::<MaybeZero<<X::Value as ValueProjection<T>>::Projected>>::from_parameters(
+        Ok(Input::To::<MaybeZero<<CallerContext::Value as ValueProjection<T>>::Projected>>::from_parameters(
             self.input_structure.clone(),
             cotangents,
         )?)
@@ -1424,23 +1427,26 @@ where
 
     /// Projected counterpart of [`Pullback::apply_materialized_in_context`], whose cotangents are the projected leaves
     /// of the caller context.
-    pub fn apply_materialized_in_context<X, Path>(
+    pub fn apply_materialized_in_context<CallerContext, Path>(
         &self,
-        context: &X,
-        cotangents: Output::To<<X::Value as ValueProjection<T>>::Projected>,
-    ) -> Result<Input::To<<X::Value as ValueProjection<T>>::Projected>, ProgramError>
+        context: &CallerContext,
+        cotangents: Output::To<<CallerContext::Value as ValueProjection<T>>::Projected>,
+    ) -> Result<Input::To<<CallerContext::Value as ValueProjection<T>>::Projected>, ProgramError>
     where
-        X: ContextProjection<T, Type = C::Type, Constant = C::Constant, Operation = C::Operation>
+        CallerContext: ContextProjection<T, Type = C::Type, Constant = C::Constant, Operation = C::Operation>
             + ImportingContext<C, Path>
-            + Zero<X::Value>,
-        Input::Family: ParameterizedFamily<<X::Value as ValueProjection<T>>::Projected>,
-        Output::Family: ParameterizedFamily<<X::Value as ValueProjection<T>>::Projected>,
+            + Zero<CallerContext::Value>,
+        Input::Family: ParameterizedFamily<<CallerContext::Value as ValueProjection<T>>::Projected>,
+        Output::Family: ParameterizedFamily<<CallerContext::Value as ValueProjection<T>>::Projected>,
         C::Operation: PullbackOperation<C::Type, C::Constant>,
         TracingContext<C::Constant, C::Operation>:
             StagingContext<Type = C::Type, Constant = C::Constant, Operation = C::Operation>,
     {
-        let cotangents = cotangents.into_parameters().map(<X::Value as ValueProjection<T>>::from_projected).collect();
-        project_and_rebuild::<T, X::Value, Input::To<_>>(
+        let cotangents = cotangents
+            .into_parameters()
+            .map(<CallerContext::Value as ValueProjection<T>>::from_projected)
+            .collect();
+        project_and_rebuild::<T, CallerContext::Value, Input::To<_>>(
             self.input_structure.clone(),
             self.inner.apply_materialized_in_context(context, cotangents)?,
         )
@@ -1480,32 +1486,32 @@ where
     /// Projected counterpart of [`Pullback::apply_with_destinations_in_context`], whose seeds and destinations are the
     /// projected leaves of the caller context.
     #[allow(clippy::type_complexity)]
-    pub fn apply_with_destinations_in_context<X, Path>(
+    pub fn apply_with_destinations_in_context<CallerContext, Path>(
         &self,
-        context: &X,
-        seeds: Output::To<CotangentSeed<<X::Value as ValueProjection<T>>::Projected>>,
-        destinations: Input::To<CotangentDestination<<X::Value as ValueProjection<T>>::Projected>>,
-    ) -> Result<Input::To<Option<MaybeZero<<X::Value as ValueProjection<T>>::Projected>>>, ProgramError>
+        context: &CallerContext,
+        seeds: Output::To<CotangentSeed<<CallerContext::Value as ValueProjection<T>>::Projected>>,
+        destinations: Input::To<CotangentDestination<<CallerContext::Value as ValueProjection<T>>::Projected>>,
+    ) -> Result<Input::To<Option<MaybeZero<<CallerContext::Value as ValueProjection<T>>::Projected>>>, ProgramError>
     where
-        X: ContextProjection<T, Type = C::Type, Constant = C::Constant, Operation = C::Operation>
+        CallerContext: ContextProjection<T, Type = C::Type, Constant = C::Constant, Operation = C::Operation>
             + ImportingContext<C, Path>,
-        Input::Family: ParameterizedFamily<CotangentDestination<<X::Value as ValueProjection<T>>::Projected>>
-            + ParameterizedFamily<Option<MaybeZero<<X::Value as ValueProjection<T>>::Projected>>>,
-        Output::Family: ParameterizedFamily<CotangentSeed<<X::Value as ValueProjection<T>>::Projected>>,
+        Input::Family: ParameterizedFamily<CotangentDestination<<CallerContext::Value as ValueProjection<T>>::Projected>>
+            + ParameterizedFamily<Option<MaybeZero<<CallerContext::Value as ValueProjection<T>>::Projected>>>,
+        Output::Family: ParameterizedFamily<CotangentSeed<<CallerContext::Value as ValueProjection<T>>::Projected>>,
         C::Operation: PullbackOperation<C::Type, C::Constant>,
         TracingContext<C::Constant, C::Operation>:
             StagingContext<Type = C::Type, Constant = C::Constant, Operation = C::Operation>,
         for<'t> &'t T: TryFrom<&'t C::Type, Error = TypeError>,
     {
-        let seeds = seeds.into_parameters().map(lift_seed::<T, X::Value>).collect();
-        let destinations = destinations.into_parameters().map(lift_destination::<T, X::Value>).collect();
+        let seeds = seeds.into_parameters().map(lift_seed::<T, CallerContext::Value>).collect();
+        let destinations = destinations.into_parameters().map(lift_destination::<T, CallerContext::Value>).collect();
         let cotangents = self
             .inner
             .apply_with_destinations_in_context(context, seeds, destinations)?
             .into_iter()
-            .map(|cotangent| cotangent.map(project_maybe_zero::<T, X::Value>).transpose())
+            .map(|cotangent| cotangent.map(project_maybe_zero::<T, CallerContext::Value>).transpose())
             .collect::<Result<Vec<_>, _>>()?;
-        Ok(Input::To::<Option<MaybeZero<<X::Value as ValueProjection<T>>::Projected>>>::from_parameters(
+        Ok(Input::To::<Option<MaybeZero<<CallerContext::Value as ValueProjection<T>>::Projected>>>::from_parameters(
             self.input_structure.clone(),
             cotangents,
         )?)
