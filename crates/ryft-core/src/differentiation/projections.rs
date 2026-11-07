@@ -213,7 +213,7 @@ where
     ) -> Result<(), DifferentiationError>;
 }
 
-impl<C: Context, T: Type, P: DifferentiationPolicy<C>> ValueProjection<T> for DifferentiationTracer<C, P>
+impl<T: Type, C: Context, P: DifferentiationPolicy<C>> ValueProjection<T> for DifferentiationTracer<C, P>
 where
     for<'t> &'t T: TryFrom<&'t C::Type, Error = TypeError>,
 {
@@ -869,7 +869,7 @@ impl<Input, ContextState> ParentDifferentiationBuilder<Input, ContextState> {
     pub fn linearize<T: Type, V, C, Output, F>(
         self,
         function: F,
-    ) -> Result<(Output::To<V>, ParentPushforward<C, T, Input, Output::To<V>>), DifferentiationError>
+    ) -> Result<(Output::To<V>, ParentPushforward<T, C, Input, Output::To<V>>), DifferentiationError>
     where
         V: Value<Type = T>,
         C: ContextProjection<T, Type: DifferentiableType>,
@@ -919,7 +919,7 @@ impl<Input, ContextState> ParentDifferentiationBuilder<Input, ContextState> {
     pub fn vjp<T: Type, V, C, Output, F>(
         self,
         function: F,
-    ) -> Result<(Output::To<V>, ParentPullback<C, T, Input, Output::To<V>>), DifferentiationError>
+    ) -> Result<(Output::To<V>, ParentPullback<T, C, Input, Output::To<V>>), DifferentiationError>
     where
         V: Value<Type = T>,
         C: ContextProjection<T, Type: DifferentiableType + ReferenceMemberType> + ReverseModeDifferentiate,
@@ -1265,8 +1265,8 @@ impl<Input, ContextState> ParentDifferentiationBuilder<Input, ContextState> {
 /// parent context `C` and whose applications take and return projected values with the structures `Input` and `Output`
 /// of the linearized function.
 pub struct ParentPushforward<
-    C: ContextProjection<T>,
     T: Type,
+    C: ContextProjection<T>,
     Input: Parameterized<<C::Value as ValueProjection<T>>::Projected>,
     Output: Parameterized<<C::Value as ValueProjection<T>>::Projected>,
 > {
@@ -1281,11 +1281,11 @@ pub struct ParentPushforward<
 }
 
 impl<
-    C: ContextProjection<T>,
     T: Type,
+    C: ContextProjection<T>,
     Input: Parameterized<<C::Value as ValueProjection<T>>::Projected>,
     Output: Parameterized<<C::Value as ValueProjection<T>>::Projected>,
-> ParentPushforward<C, T, Input, Output>
+> ParentPushforward<T, C, Input, Output>
 where
     C::Type: DifferentiableType,
 {
@@ -1348,8 +1348,8 @@ where
 /// context `C` and whose applications take and return projected values with the structures `Input` and `Output` of the
 /// differentiated function.
 pub struct ParentPullback<
-    C: ContextProjection<T>,
     T: Type,
+    C: ContextProjection<T>,
     Input: Parameterized<<C::Value as ValueProjection<T>>::Projected>,
     Output: Parameterized<<C::Value as ValueProjection<T>>::Projected>,
 > {
@@ -1364,11 +1364,11 @@ pub struct ParentPullback<
 }
 
 impl<
-    C: ContextProjection<T>,
     T: Type,
+    C: ContextProjection<T>,
     Input: Parameterized<<C::Value as ValueProjection<T>>::Projected>,
     Output: Parameterized<<C::Value as ValueProjection<T>>::Projected>,
-> ParentPullback<C, T, Input, Output>
+> ParentPullback<T, C, Input, Output>
 where
     C::Type: DifferentiableType + ReferenceMemberType,
 {
@@ -1384,11 +1384,11 @@ where
         cotangents: Output,
     ) -> Result<Input::To<MaybeZero<<C::Value as ValueProjection<T>>::Projected>>, ProgramError>
     where
-        for<'t> &'t T: TryFrom<&'t C::Type, Error = TypeError>,
         Input::Family: ParameterizedFamily<MaybeZero<<C::Value as ValueProjection<T>>::Projected>>,
         C::Operation: PullbackOperation<C::Type, C::Constant>,
         TracingContext<C::Constant, C::Operation>:
             StagingContext<Type = C::Type, Constant = C::Constant, Operation = C::Operation>,
+        for<'t> &'t T: TryFrom<&'t C::Type, Error = TypeError>,
     {
         let cotangents = cotangents.into_parameters().map(<C::Value as ValueProjection<T>>::from_projected).collect();
         let cotangents = self
@@ -1413,12 +1413,12 @@ where
     where
         CallerContext: ContextProjection<T, Type = C::Type, Constant = C::Constant, Operation = C::Operation>
             + ImportingContext<C, Path>,
-        for<'t> &'t T: TryFrom<&'t C::Type, Error = TypeError>,
         Input::Family: ParameterizedFamily<MaybeZero<<CallerContext::Value as ValueProjection<T>>::Projected>>,
         Output::Family: ParameterizedFamily<<CallerContext::Value as ValueProjection<T>>::Projected>,
         C::Operation: PullbackOperation<C::Type, C::Constant>,
         TracingContext<C::Constant, C::Operation>:
             StagingContext<Type = C::Type, Constant = C::Constant, Operation = C::Operation>,
+        for<'t> &'t T: TryFrom<&'t C::Type, Error = TypeError>,
     {
         let cotangents = cotangents
             .into_parameters()
