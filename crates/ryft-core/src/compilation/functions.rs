@@ -7,8 +7,10 @@ use std::sync::atomic::{AtomicU64, Ordering};
 use std::sync::{Arc, OnceLock};
 use std::time::{Duration, Instant};
 
-use crate::captures::{CapturingContext, ClosedProgram};
-use crate::compilation::domains::{CompilationDomain, StatefulCompilationDomain};
+use crate::arrays::LogicalMesh;
+use crate::axes::{MeshContext, NamedAxes, NamedAxis};
+use crate::captures::{CapturingContext, ClosedProgram, ImportingContext};
+use crate::compilation::domains::{CompilationDomain, DispatchPurpose, StatefulCompilationDomain};
 use crate::compilation::operations::StagedCallOperation;
 use crate::contexts::{Context, Domain, StagingContext};
 use crate::macros::{check_builders, check_count};
@@ -67,11 +69,50 @@ impl<C: CompilationDomain> StagedProgram<C> {
     ///
     /// Returns errors from capture validation, the closure, or program construction. Foreign output tracers and handles
     /// that escape the trace are rejected during finalization.
+    #[inline]
     pub fn stage<F>(
         function: F,
         captures: Vec<C::Value>,
         input_types: Vec<C::Type>,
         options: C::Options,
+    ) -> Result<Self, C::Error>
+    where
+        F: FnOnce(
+            Vec<C::Constant>,
+            Vec<CompilationTracer<C>>,
+            Vec<CompilationTracer<C>>,
+        ) -> Result<Vec<CompilationTracer<C>>, C::Error>,
+        DomainTracingContext<C, C::Value>:
+            StagingContext<Type = C::Type, Constant = C::Constant, Operation = C::Operation>,
+    {
+        Self::stage_with_named_axes_and_default_mesh(function, captures, input_types, options, Vec::new(), None)
+    }
+
+    /// Traces like [`Self::stage`] in the scope of `named_axes` and `default_mesh`, which the traced function resolves
+    /// as it would if it were inlined into a context that binds them (e.g., a named batching level or the manual
+    /// region of a `shard_map`). Use it to stage a function that is only ever called inside such a scope. A staged
+    /// program that reads a named axis cannot be lowered on its own, because nothing outside that scope binds the axis,
+    /// so it is meaningful only as the callee of a call in that scope, whose enclosing transforms resolve the axis.
+    ///
+    /// # Parameters
+    ///
+    ///   - `function`: Fallible closure to trace with symbolic captures and flat inputs.
+    ///   - `captures`: Runtime values to register in the source program's capture table.
+    ///   - `input_types`: Flat abstract public input signature.
+    ///   - `options`: Options retained for lowering and compilation.
+    ///   - `named_axes`: Named axes in scope while tracing, in the order that [`NamedAxes::named_axes`] reports them.
+    ///   - `default_mesh`: Default mesh in scope while tracing. Refer to [`MeshContext`] for more information.
+    ///
+    /// # Errors
+    ///
+    /// Returns the same errors as [`Self::stage`].
+    pub fn stage_with_named_axes_and_default_mesh<F>(
+        function: F,
+        captures: Vec<C::Value>,
+        input_types: Vec<C::Type>,
+        options: C::Options,
+        named_axes: Vec<(String, NamedAxis)>,
+        default_mesh: Option<LogicalMesh>,
     ) -> Result<Self, C::Error>
     where
         F: FnOnce(
@@ -89,7 +130,8 @@ impl<C: CompilationDomain> StagedProgram<C> {
 
         // A fresh context isolates this trace. Runtime captures stay in its side table, while the program stores typed
         // references to their slots. The closure receives both those constant payloads and their tracers.
-        let context = DomainTracingContext::<C, C::Value>::new();
+        let context =
+            DomainTracingContext::<C, C::Value>::new().with_named_axes_and_default_mesh(named_axes, default_mesh);
         let capture_table = context.captures().clone();
         let builder = context.builder().clone();
         let capture_constants =
@@ -222,6 +264,7 @@ where
     /// # Errors
     ///
     /// Returns errors from tracing or reconstructing the structured inputs.
+    #[inline]
     pub fn stage<F>(
         function: F,
         captures: Vec<C::Value>,
@@ -239,11 +282,39 @@ where
         DomainTracingContext<C, C::Value>:
             StagingContext<Type = C::Type, Constant = C::Constant, Operation = C::Operation>,
     {
+        Self::stage_with_named_axes_and_default_mesh(function, captures, input_types, options, Vec::new(), None)
+    }
+
+    /// Traces like [`Self::stage`] in the scope of `named_axes` and `default_mesh`. Refer to
+    /// [`StagedProgram::stage_with_named_axes_and_default_mesh`] for when to use it and for its parameters.
+    ///
+    /// # Errors
+    ///
+    /// Returns the same errors as [`Self::stage`].
+    pub fn stage_with_named_axes_and_default_mesh<F>(
+        function: F,
+        captures: Vec<C::Value>,
+        input_types: Input,
+        options: C::Options,
+        named_axes: Vec<(String, NamedAxis)>,
+        default_mesh: Option<LogicalMesh>,
+    ) -> Result<Self, C::Error>
+    where
+        Input::Family: ParameterizedFamily<CompilationTracer<C>>,
+        Output::Family: ParameterizedFamily<CompilationTracer<C>>,
+        F: FnOnce(
+            Vec<C::Constant>,
+            Vec<CompilationTracer<C>>,
+            Input::To<CompilationTracer<C>>,
+        ) -> Result<Output::To<CompilationTracer<C>>, C::Error>,
+        DomainTracingContext<C, C::Value>:
+            StagingContext<Type = C::Type, Constant = C::Constant, Operation = C::Operation>,
+    {
         // Flat arities cannot recover nested empty containers or other structural metadata. Keep the input structure
         // before flattening, and record the output structure while the closure still owns its structured results.
         let input_structure = input_types.parameter_structure();
         let mut output_structure = None;
-        let program = StagedProgram::<C>::stage(
+        let program = StagedProgram::<C>::stage_with_named_axes_and_default_mesh(
             |capture_constants, capture_tracers, inputs| {
                 let inputs = Input::To::<CompilationTracer<C>>::from_parameters(input_structure.clone(), inputs)
                     .map_err(ProgramError::from)?;
@@ -254,6 +325,8 @@ where
             captures,
             input_types.into_parameters().collect(),
             options,
+            named_axes,
+            default_mesh,
         )?;
 
         // The inherent flat staging constructor invokes the closure exactly once on success, so it must have recorded
@@ -330,16 +403,15 @@ where
         Ok(LoweredFunction { program: Arc::new(lowered_program), staged: self.clone() })
     }
 
-    /// Stages a call to this function into the active context recovered from `inputs`. For nullary functions use
+    /// Calls this function in the active context recovered from `inputs`. For nullary functions use
     /// [`Self::call_in_context`], because no input value exists from which to recover the active context.
     #[inline]
-    pub fn call<V>(&self, inputs: Input::To<V>) -> Result<Output::To<V>, ProgramError>
+    pub fn call<V, Path>(&self, inputs: Input::To<V>) -> Result<Output::To<V>, ProgramError>
     where
         C::Operation: StagedCallOperation<C::Constant>,
         V: Value<Type = C::Type>,
-        V::Domain: Context<Type = C::Type, Constant = C::Constant, Operation = C::Operation>
-            + CapturingContext<Capture = C::Value>
-            + Constant<V, C::Constant>,
+        V::Domain:
+            Context<Type = C::Type, Constant = C::Constant, Operation = C::Operation> + ImportingContext<C, Path>,
         Input: Parameterized<C::Type, Family: ParameterizedFamily<V>>,
         Input::To<V>: Parameterized<V>,
         Output: Parameterized<C::Type, Family: ParameterizedFamily<V>>,
@@ -353,8 +425,13 @@ where
         self.call_in_context(&context, inputs)
     }
 
-    /// Stages a call to this function through the provided `context`.
-    pub fn call_in_context<V, CallerContext>(
+    /// Calls this function in the provided `context`, which binds one staged-call operation there. The function's
+    /// captured runtime values enter `context` through [`ImportingContext`], so the call works under an eager parent,
+    /// under a staging parent, and under any stack of transforms over either. An eager parent executes the call
+    /// immediately, a staging parent records it, and a transform parent rewrites it through the call operation's
+    /// own rules.
+    #[inline]
+    pub fn call_in_context<V, CallerContext, Path>(
         &self,
         context: &CallerContext,
         inputs: Input::To<V>,
@@ -363,33 +440,46 @@ where
         C::Operation: StagedCallOperation<C::Constant>,
         V: Value<Type = C::Type>,
         CallerContext: Context<Type = C::Type, Value = V, Constant = C::Constant, Operation = C::Operation>
-            + CapturingContext<Capture = C::Value>
-            + Constant<V, C::Constant>,
+            + ImportingContext<C, Path>,
         Input: Parameterized<C::Type, Family: ParameterizedFamily<V>>,
         Input::To<V>: Parameterized<V>,
         Output: Parameterized<C::Type, Family: ParameterizedFamily<V>>,
         Output::To<V>: Parameterized<V, Family = Output::Family, ParameterStructure = Output::ParameterStructure>,
     {
-        let capture_references = self
+        let outputs = self.call_flat_in_context(context, inputs.into_parameters().collect())?;
+        Output::To::<V>::from_parameters(self.state.output_structure.clone(), outputs).map_err(Into::into)
+    }
+
+    /// Calls this function in the provided `context` with flat `inputs` and returns its flat outputs, binding one
+    /// staged-call operation exactly as [`Self::call_in_context`] does. Use it when the caller holds the flat leaves
+    /// of the input structure rather than the structured inputs. Explicit context selection supports empty `inputs`,
+    /// including nullary and capture-only calls.
+    pub fn call_flat_in_context<V, CallerContext, Path>(
+        &self,
+        context: &CallerContext,
+        inputs: Vec<V>,
+    ) -> Result<Vec<V>, ProgramError>
+    where
+        C::Operation: StagedCallOperation<C::Constant>,
+        V: Value<Type = C::Type>,
+        CallerContext: Context<Type = C::Type, Value = V, Constant = C::Constant, Operation = C::Operation>
+            + ImportingContext<C, Path>,
+    {
+        let mut flat_inputs = self
             .state
             .program
             .source_program()
             .captures()
             .iter()
             .cloned()
-            .map(|capture| context.capture(capture))
+            .map(|capture| context.import(capture))
             .collect::<Result<Vec<_>, _>>()?;
-        let capture_count = capture_references.len();
-        let mut flat_inputs = capture_references
-            .into_iter()
-            .map(|capture| context.constant(capture))
-            .collect::<Result<Vec<_>, _>>()?;
-        flat_inputs.extend(inputs.into_parameters());
+        let capture_count = flat_inputs.len();
+        flat_inputs.extend(inputs);
         let callee = self.callee_program()?;
         let operation =
             C::Operation::staged_call_with_types(capture_count, &callee.input_types(), &callee.output_types())?;
-        let outputs = context.bind(operation, AttachedRegions::Callees(&[callee]), flat_inputs.as_slice())?;
-        Output::To::<V>::from_parameters(self.state.output_structure.clone(), outputs).map_err(Into::into)
+        context.bind(operation, AttachedRegions::Callees(&[callee]), flat_inputs.as_slice())
     }
 
     /// Stages a call with flat `inputs` and returns flat outputs, using `capture_references` already registered in
@@ -565,8 +655,9 @@ where
     ///
     /// Returns the error of `domain`, or a [`ProgramError`] if the compiled output types differ in count from the
     /// lowered output types of this function or do not refine them.
+    #[inline]
     pub fn compile(&self, domain: &C) -> Result<CompiledFunction<C, Input, Output>, C::Error> {
-        let program = domain.compile(self.lowered_program())?;
+        let (program, lowered_captures) = domain.compile(self.lowered_program())?;
         let declared_output_types = self.output_types();
         let output_types = program.output_types();
         check_count!("output", output_types, declared_output_types.len(), ProgramError);
@@ -578,7 +669,56 @@ where
                 .into());
             }
         }
-        Ok(CompiledFunction::from_parts(self.clone(), program))
+        Ok(CompiledFunction::from_parts(self.clone(), program, lowered_captures))
+    }
+
+    /// Calls this function in the active context recovered from `inputs` by delegating to [`StagedFunction::call`]
+    /// on its staged source. The call stages a call boundary that carries the staged source program into the caller's
+    /// trace, so the lowered program itself is not involved. For nullary functions use [`Self::call_in_context`],
+    /// because no input value exists from which to recover the active context.
+    ///
+    /// # Errors
+    ///
+    /// Returns the same errors as [`StagedFunction::call`].
+    #[inline]
+    pub fn call<V, Path>(&self, inputs: Input::To<V>) -> Result<Output::To<V>, ProgramError>
+    where
+        C::Operation: StagedCallOperation<C::Constant>,
+        V: Value<Type = C::Type>,
+        V::Domain:
+            Context<Type = C::Type, Constant = C::Constant, Operation = C::Operation> + ImportingContext<C, Path>,
+        Input: Parameterized<C::Type, Family: ParameterizedFamily<V>>,
+        Input::To<V>: Parameterized<V>,
+        Output: Parameterized<C::Type, Family: ParameterizedFamily<V>>,
+        Output::To<V>: Parameterized<V, Family = Output::Family, ParameterStructure = Output::ParameterStructure>,
+    {
+        self.staged.call(inputs)
+    }
+
+    /// Calls this function in the provided `context` by delegating to [`StagedFunction::call_in_context`] on its
+    /// staged source, which stages a call boundary into the caller's trace exactly as [`Self::call`] does. An explicit
+    /// context also serves nullary functions.
+    ///
+    /// # Errors
+    ///
+    /// Returns the same errors as [`StagedFunction::call_in_context`].
+    #[inline]
+    pub fn call_in_context<V, CallerContext, Path>(
+        &self,
+        context: &CallerContext,
+        inputs: Input::To<V>,
+    ) -> Result<Output::To<V>, ProgramError>
+    where
+        C::Operation: StagedCallOperation<C::Constant>,
+        V: Value<Type = C::Type>,
+        CallerContext: Context<Type = C::Type, Value = V, Constant = C::Constant, Operation = C::Operation>
+            + ImportingContext<C, Path>,
+        Input: Parameterized<C::Type, Family: ParameterizedFamily<V>>,
+        Input::To<V>: Parameterized<V>,
+        Output: Parameterized<C::Type, Family: ParameterizedFamily<V>>,
+        Output::To<V>: Parameterized<V, Family = Output::Family, ParameterStructure = Output::ParameterStructure>,
+    {
+        self.staged.call_in_context(context, inputs)
     }
 }
 
@@ -806,12 +946,20 @@ where
     Output: Parameterized<C::Type>,
     Output::Family: ParameterizedFamily<C::Constant>,
 {
-    /// Assembles a [`CompiledFunction`] from the provided backend-validated parts.
-    fn from_parts(lowered: LoweredFunction<C, Input, Output>, program: Arc<C::CompiledProgram>) -> Self {
+    /// Assembles a [`CompiledFunction`] from the provided backend-validated parts. Execution supplies the
+    /// `lowered_captures` that the backend returned with the program (refer to [`CompilationDomain::compile`])
+    /// after the source captures.
+    fn from_parts(
+        lowered: LoweredFunction<C, Input, Output>,
+        program: Arc<C::CompiledProgram>,
+        lowered_captures: Vec<C::Value>,
+    ) -> Self {
+        let mut captures = lowered.staged.source_program().captures().to_vec();
+        captures.extend(lowered_captures);
         let executable_function = ExecutableFunction {
             state: Arc::new(ExecutableFunctionState {
                 program,
-                captures: lowered.staged.source_program().captures().to_vec(),
+                captures,
                 input_types: lowered.staged.input_types().to_vec(),
                 output_structure: lowered.staged.output_structure().clone(),
                 input: PhantomData,
@@ -862,6 +1010,57 @@ where
     #[inline]
     pub fn output_types(&self) -> Cow<'_, [C::Type]> {
         self.executable.output_types()
+    }
+
+    /// Calls this function in the active context recovered from `inputs` by delegating to [`StagedFunction::call`]
+    /// on its staged source. The call stages a call boundary that carries the staged source program into the
+    /// caller's trace, so the retained executable is not involved, even under an eager context. Use
+    /// [`ExecutableFunction::execute`] to run the retained executable directly on concrete values. For nullary
+    /// functions use [`Self::call_in_context`], because no input value exists from which to recover the active
+    /// context.
+    ///
+    /// # Errors
+    ///
+    /// Returns the same errors as [`StagedFunction::call`].
+    #[inline]
+    pub fn call<V, Path>(&self, inputs: Input::To<V>) -> Result<Output::To<V>, ProgramError>
+    where
+        C::Operation: StagedCallOperation<C::Constant>,
+        V: Value<Type = C::Type>,
+        V::Domain:
+            Context<Type = C::Type, Constant = C::Constant, Operation = C::Operation> + ImportingContext<C, Path>,
+        Input: Parameterized<C::Type, Family: ParameterizedFamily<V>>,
+        Input::To<V>: Parameterized<V>,
+        Output: Parameterized<C::Type, Family: ParameterizedFamily<V>>,
+        Output::To<V>: Parameterized<V, Family = Output::Family, ParameterStructure = Output::ParameterStructure>,
+    {
+        self.staged().call(inputs)
+    }
+
+    /// Calls this function in the provided `context` by delegating to [`StagedFunction::call_in_context`] on its
+    /// staged source, which stages a call boundary into the caller's trace exactly as [`Self::call`] does. An explicit
+    /// context also serves nullary functions.
+    ///
+    /// # Errors
+    ///
+    /// Returns the same errors as [`StagedFunction::call_in_context`].
+    #[inline]
+    pub fn call_in_context<V, CallerContext, Path>(
+        &self,
+        context: &CallerContext,
+        inputs: Input::To<V>,
+    ) -> Result<Output::To<V>, ProgramError>
+    where
+        C::Operation: StagedCallOperation<C::Constant>,
+        V: Value<Type = C::Type>,
+        CallerContext: Context<Type = C::Type, Value = V, Constant = C::Constant, Operation = C::Operation>
+            + ImportingContext<C, Path>,
+        Input: Parameterized<C::Type, Family: ParameterizedFamily<V>>,
+        Input::To<V>: Parameterized<V>,
+        Output: Parameterized<C::Type, Family: ParameterizedFamily<V>>,
+        Output::To<V>: Parameterized<V, Family = Output::Family, ParameterStructure = Output::ParameterStructure>,
+    {
+        self.staged().call_in_context(context, inputs)
     }
 }
 
@@ -929,6 +1128,31 @@ impl<Static, Structure, Key> SpecializationKey<Static, Structure, Key> {
     fn input_structure(&self) -> &Structure {
         &self.input_structure
     }
+}
+
+/// Key of one retained source specialization of a [`CompiledFunctionDispatcher`] (refer to
+/// [`CompiledFunctionDispatcher::call_in_context`]). A source specialization is a function of everything that
+/// [`SpecializationKey`] covers and also of the scope that the calling context gives the traced closure, because
+/// the closure resolves named axes and the default mesh against it. The input types are the staged types of a
+/// [`DispatchPurpose::Source`] signature (refer to [`CompilationDomain::dispatch_signature`]) rather than a dispatch
+/// key, because a source call is lowered and dispatched as part of its enclosing computation, so executable dispatch
+/// policies such as shape bucketing do not apply to it.
+#[derive(Clone, PartialEq, Eq, Hash)]
+struct SourceSpecializationKey<Static, Structure, T> {
+    /// Host values declared static for the keyed specialization.
+    static_parameters: Static,
+
+    /// Parameter structure of the dynamic input.
+    input_structure: Structure,
+
+    /// Effective staged input types.
+    input_types: Vec<T>,
+
+    /// Named axes in scope in the calling context, in the order that [`NamedAxes::named_axes`] reports them.
+    named_axes: Vec<(String, NamedAxis)>,
+
+    /// Default mesh in scope in the calling context (refer to [`MeshContext`]).
+    default_mesh: Option<LogicalMesh>,
 }
 
 /// Retained Just-In-Time (JIT) compilation dispatcher that caches compiled specializations of one Rust closure.
@@ -1057,6 +1281,7 @@ where
                 options,
                 staged_input_types: None,
                 specializations: SpecializationCache::new(capacity),
+                sources: SpecializationCache::new(capacity),
                 statistics: DispatcherStatisticsAccumulator::default(),
             }),
         }
@@ -1145,10 +1370,11 @@ where
         self.state.statistics.clear();
     }
 
-    /// Clears every retained specialization without changing statistics.
+    /// Clears every retained executable and source specialization without changing statistics.
     #[inline]
     pub fn clear_cache(&self) {
         self.state.specializations.clear();
+        self.state.sources.clear();
     }
 
     /// Executes a specialization with explicit host `static_parameters` and dynamic runtime `inputs`, compiling it
@@ -1250,11 +1476,145 @@ where
         executable.execute_statefully_and_wait(domain, inputs)
     }
 
-    /// Invalidates every retained specialization for `static_parameters` across all runtime input signatures and
-    /// returns the number removed. Backend compilation caches remain available for reuse.
+    /// Calls the specialization of this dispatcher for `static_parameters` and the abstract types of `inputs` in the
+    /// active context recovered from `inputs`. Refer to [`Self::call_in_context`] for more information. For nullary
+    /// functions, use [`Self::call_in_context`], because no input value exists from which to recover the active
+    /// context.
+    ///
+    /// # Errors
+    ///
+    /// Returns the errors of [`Self::call_in_context`], and [`ProgramError::InvalidInputCount`] when `inputs` has no
+    /// leaves.
+    #[inline]
+    pub fn call<V, Path>(&self, static_parameters: Static, inputs: Input::To<V>) -> Result<Output::To<V>, C::Error>
+    where
+        C::Options: Clone,
+        C::Operation: StagedCallOperation<C::Constant>,
+        V: Value<Type = C::Type>,
+        V::Domain: Context<Type = C::Type, Constant = C::Constant, Operation = C::Operation>
+            + ImportingContext<C, Path>
+            + NamedAxes
+            + MeshContext,
+        Input::Family: ParameterizedFamily<V> + ParameterizedFamily<CompilationTracer<C>>,
+        Input::To<V>: Parameterized<V, Family = Input::Family, ParameterStructure = Input::ParameterStructure>,
+        Output::Family: ParameterizedFamily<V> + ParameterizedFamily<CompilationTracer<C>>,
+        Output::To<V>: Parameterized<V, Family = Output::Family, ParameterStructure = Output::ParameterStructure>,
+        F: Fn(Static, Input::To<CompilationTracer<C>>) -> Result<Output::To<CompilationTracer<C>>, C::Error>,
+        DomainTracingContext<C, C::Value>:
+            StagingContext<Type = C::Type, Constant = C::Constant, Operation = C::Operation>,
+    {
+        let context = inputs
+            .parameters()
+            .next()
+            .ok_or(ProgramError::InvalidInputCount { expected: 1, actual: 0 })?
+            .domain();
+        self.call_in_context(&context, static_parameters, inputs)
+    }
+
+    /// Calls the specialization of this dispatcher for `static_parameters` and the abstract types of `inputs` in the
+    /// provided `context`, which binds one staged-call operation there, exactly as [`StagedFunction::call_in_context`]
+    /// does. Unlike [`Self::execute`], it works under any context, including staging and transform contexts, so the
+    /// dispatcher's closure composes with enclosing transforms and compilations. Its executable specializations are not
+    /// involved. The call neither lowers nor compiles anything itself, and an eager `context` executes the call as an
+    /// ordinary eager operation.
+    ///
+    /// On the first call for one static value, input structure, effective staged input type list, and calling scope,
+    /// the dispatcher traces its closure into a source specialization and retains it in a cache separate from its
+    /// executables. The calling scope consists of the named axes (refer to [`NamedAxes`]) and the default mesh (refer
+    /// to [`MeshContext`]) of `context`, and the closure is traced in that scope so that it resolves them as it would
+    /// if it were inlined. The effective staged input types are the abstract input types after the declarations of
+    /// [`Self::with_staged_input_types`] and the [`DispatchPurpose::Source`] signature of
+    /// [`CompilationDomain::dispatch_signature`], which need no domain instance, so a dispatcher
+    /// that infers its domain need not have selected one. Host side effects of the closure therefore
+    /// run once per source specialization. [`Self::clear_cache`] and [`Self::invalidate_specializations`]
+    /// remove source specializations together with executable ones.
+    ///
+    /// # Errors
+    ///
+    /// Returns an error when the inputs do not satisfy the declared staged input types, when the domain rejects the
+    /// staged input types, when tracing the closure fails, when the same thread recursively requests a source
+    /// specialization that it is still producing, or when binding the call fails in `context`.
+    pub fn call_in_context<V, CallerContext, Path>(
+        &self,
+        context: &CallerContext,
+        static_parameters: Static,
+        inputs: Input::To<V>,
+    ) -> Result<Output::To<V>, C::Error>
+    where
+        C::Options: Clone,
+        C::Operation: StagedCallOperation<C::Constant>,
+        V: Value<Type = C::Type>,
+        CallerContext: Context<Type = C::Type, Value = V, Constant = C::Constant, Operation = C::Operation>
+            + ImportingContext<C, Path>
+            + NamedAxes
+            + MeshContext,
+        Input::Family: ParameterizedFamily<V> + ParameterizedFamily<CompilationTracer<C>>,
+        Input::To<V>: Parameterized<V, Family = Input::Family, ParameterStructure = Input::ParameterStructure>,
+        Output::Family: ParameterizedFamily<V> + ParameterizedFamily<CompilationTracer<C>>,
+        Output::To<V>: Parameterized<V, Family = Output::Family, ParameterStructure = Output::ParameterStructure>,
+        F: Fn(Static, Input::To<CompilationTracer<C>>) -> Result<Output::To<CompilationTracer<C>>, C::Error>,
+        DomainTracingContext<C, C::Value>:
+            StagingContext<Type = C::Type, Constant = C::Constant, Operation = C::Operation>,
+    {
+        let input_structure = inputs.parameter_structure();
+        let mut input_types = inputs.parameters().map(|input| input.r#type().into_owned()).collect::<Vec<_>>();
+        self.apply_staged_input_types(&input_structure, &mut input_types)?;
+        let (_, input_types) = C::dispatch_signature(input_types, &self.state.options, DispatchPurpose::Source)?;
+        let input_types = input_types.to_vec();
+        let key = SourceSpecializationKey {
+            static_parameters: static_parameters.clone(),
+            input_structure,
+            input_types,
+            named_axes: context.named_axes(),
+            default_mesh: context.default_mesh(),
+        };
+
+        // A hit reuses the retained source. A vacant producer clears its in-flight marker if tracing fails, which
+        // allows retries, and only recursive production of the same key on this thread is rejected.
+        let statistics = &self.state.statistics;
+        let source = match self.state.sources.try_entry(key) {
+            Ok(SpecializationCacheEntry::Occupied(source)) => {
+                statistics.source_hits.fetch_add(1, Ordering::Relaxed);
+                source
+            }
+            Ok(SpecializationCacheEntry::Vacant(producer)) => {
+                statistics.source_misses.fetch_add(1, Ordering::Relaxed);
+                let SourceSpecializationKey { input_structure, input_types, named_axes, default_mesh, .. } =
+                    producer.key().clone();
+                let input_types = Input::from_parameters(input_structure, input_types).map_err(ProgramError::from)?;
+                statistics.traces.fetch_add(1, Ordering::Relaxed);
+                let tracing_start = Instant::now();
+                let source = StagedFunction::<C, Input, Output>::stage_with_named_axes_and_default_mesh(
+                    |_, _, traced_inputs| (self.state.function)(static_parameters, traced_inputs),
+                    Vec::new(),
+                    input_types,
+                    self.state.options.clone(),
+                    named_axes,
+                    default_mesh,
+                );
+                accumulate_duration(tracing_start.elapsed(), &statistics.tracing_nanoseconds);
+                producer.insert(source?)
+            }
+            Err(_) => {
+                statistics.source_misses.fetch_add(1, Ordering::Relaxed);
+                return Err(ProgramError::InvalidArgument {
+                    message: "recursive source call requested a source specialization that is already being produced"
+                        .into(),
+                }
+                .into());
+            }
+        };
+        source.call_in_context(context, inputs).map_err(Into::into)
+    }
+
+    /// Invalidates every retained executable and source specialization for `static_parameters`, across all input
+    /// signatures and calling scopes, and returns the total number of specializations removed from both. Backend
+    /// compilation caches remain available for reuse. A specialization that is still being produced when this
+    /// function runs may be retained once its production completes.
     #[inline]
     pub fn invalidate_specializations(&self, static_parameters: &Static) -> usize {
         self.state.specializations.invalidate_entries_if(|key| key.static_parameters() == static_parameters)
+            + self.state.sources.invalidate_entries_if(|key| &key.static_parameters == static_parameters)
     }
 
     /// Acquires or produces the executable specialization for one runtime input signature and returns it together with
@@ -1310,49 +1670,10 @@ where
 
         let input_structure = inputs.parameter_structure();
         let mut runtime_input_types = inputs.parameters().map(|input| input.r#type().into_owned()).collect::<Vec<_>>();
-        if let Some(StagedInputTypes { structure, types }) = &self.state.staged_input_types {
-            // Equal structures guarantee that declared and runtime leaves align, including empty substructures.
-            if structure != &input_structure {
-                return Err(ProgramError::InvalidArgument {
-                    message: "compilation inputs do not have the structure of their declared staged input types"
-                        .to_string(),
-                }
-                .into());
-            }
-
-            let declared = types
-                .iter()
-                .enumerate()
-                .filter_map(|(index, r#type)| Some((index, r#type.as_ref()?)))
-                .collect::<Vec<_>>();
-            for &(index, staged_type) in &declared {
-                if !staged_type.is_refined_by(&runtime_input_types[index]) {
-                    let (path, _) = structure.named_parameters().nth(index).unwrap();
-                    return Err(ProgramError::from(TypeError::invalid(format!(
-                        "compilation input `{}` has type `{}`, which does not refine its declared staged type `{}`",
-                        path, runtime_input_types[index], staged_type,
-                    )))
-                    .into());
-                }
-            }
-
-            // Check the declarations together before replacing any types. Individual refinement checks cannot detect
-            // conflicting runtime extents for an identity shared by multiple inputs, such as a dimension and an array.
-            <C::Type as Type>::Refinements::new(
-                declared.iter().map(|(_, staged_type)| *staged_type),
-                declared.iter().map(|(index, _)| &runtime_input_types[*index]),
-            )
-            .map_err(ProgramError::from)?;
-
-            // Declared leaves specialize at their staged types so compatible runtime values reuse a trace.
-            // Undeclared leaves keep their runtime types. Validate before lookup so cache hits obey the same contract.
-            for (index, staged_type) in declared {
-                runtime_input_types[index] = staged_type.clone();
-            }
-        }
+        self.apply_staged_input_types(&input_structure, &mut runtime_input_types)?;
 
         let (dispatch_key, effective_input_types) =
-            domain.dispatch_signature(runtime_input_types, &self.state.options)?;
+            C::dispatch_signature(runtime_input_types, &self.state.options, DispatchPurpose::Executable)?;
 
         // Backend normalization can share dispatch keys, but static values and container structures remain distinct.
         let key = SpecializationKey::new(static_parameters.clone(), input_structure, dispatch_key);
@@ -1416,6 +1737,58 @@ where
         // Retain only execution state, allowing the staged and lowered program artifacts to be released.
         Ok((domain, producer.insert(compiled.into_executable())))
     }
+
+    /// Replaces the types of `input_types` that [`Self::with_staged_input_types`] declares with their declared staged
+    /// types, after validating that each replaced type refines its declaration. Execution and source calls share this
+    /// contract, so that a declaration means the same thing for both. Inputs without declarations keep their types.
+    fn apply_staged_input_types(
+        &self,
+        input_structure: &Input::ParameterStructure,
+        input_types: &mut [C::Type],
+    ) -> Result<(), ProgramError> {
+        let Some(StagedInputTypes { structure, types }) = &self.state.staged_input_types else {
+            return Ok(());
+        };
+
+        // Equal structures guarantee that declared and runtime leaves align, including empty substructures.
+        if structure != input_structure {
+            return Err(ProgramError::InvalidArgument {
+                message: "compilation inputs do not have the structure of their declared staged input types"
+                    .to_string(),
+            });
+        }
+
+        let declared = types
+            .iter()
+            .enumerate()
+            .filter_map(|(index, r#type)| Some((index, r#type.as_ref()?)))
+            .collect::<Vec<_>>();
+        for &(index, staged_type) in &declared {
+            if !staged_type.is_refined_by(&input_types[index]) {
+                let (path, _) = structure.named_parameters().nth(index).unwrap();
+                return Err(ProgramError::from(TypeError::invalid(format!(
+                    "compilation input `{}` has type `{}`, which does not refine its declared staged type `{}`",
+                    path, input_types[index], staged_type,
+                ))));
+            }
+        }
+
+        // Check the declarations together before replacing any types. Individual refinement checks cannot detect
+        // conflicting runtime extents for an identity shared by multiple inputs, such as a dimension and an array.
+        <C::Type as Type>::Refinements::new(
+            declared.iter().map(|(_, staged_type)| *staged_type),
+            declared.iter().map(|(index, _)| &input_types[*index]),
+        )
+        .map_err(ProgramError::from)?;
+
+        // Declared leaves specialize at their staged types so compatible runtime values reuse a trace.
+        // Undeclared leaves keep their runtime types. Validate before lookup so cache hits obey the same contract.
+        for (index, staged_type) in declared {
+            input_types[index] = staged_type.clone();
+        }
+
+        Ok(())
+    }
 }
 
 impl<C, Static: Clone + Debug + Eq + Hash, Input, Output, F> Clone
@@ -1463,6 +1836,14 @@ struct CompiledFunctionDispatcherState<
     specializations: SpecializationCache<
         SpecializationKey<Static, Input::ParameterStructure, C::DispatchKey>,
         ExecutableFunction<C, Input, Output>,
+    >,
+
+    /// Bounded Least Recently Used (LRU) cache of staged source specializations that source calls bind into their
+    /// calling contexts. It is separate from [`Self::specializations`], so that source calls never evict executables
+    /// and execution never reads or retains source programs, and every invalidation applies to both caches.
+    sources: SpecializationCache<
+        SourceSpecializationKey<Static, Input::ParameterStructure, C::Type>,
+        StagedFunction<C, Input, Output>,
     >,
 
     /// Dispatch activity counters.
@@ -1586,7 +1967,7 @@ pub struct DispatcherStatistics {
     /// was still being produced and were therefore rejected.
     pub dispatch_misses: u64,
 
-    /// Traces of the dispatcher's closure started after dispatch misses, including traces that failed.
+    /// Traces of the dispatcher's closure started after dispatch misses or source misses, including traces that failed.
     pub traces: u64,
 
     /// Lowerings started after successful traces, including lowerings that failed.
@@ -1604,11 +1985,19 @@ pub struct DispatcherStatistics {
     /// Total host duration spent looking up retained specializations by their specialization keys.
     pub dispatch_lookup_duration: Duration,
 
-    /// Total host duration spent tracing the dispatcher's closure after dispatch misses.
+    /// Total host duration spent tracing the dispatcher's closure after dispatch misses or source misses.
     pub tracing_duration: Duration,
 
     /// Total host duration spent lowering newly traced specializations.
     pub lowering_duration: Duration,
+
+    /// Source calls (i.e., [`CompiledFunctionDispatcher::call`] and [`CompiledFunctionDispatcher::call_in_context`])
+    /// served by a retained source specialization.
+    pub source_hits: u64,
+
+    /// Source calls that found no retained source specialization, including recursive calls that requested a source
+    /// specialization that was still being produced and were therefore rejected.
+    pub source_misses: u64,
 }
 
 /// Lock-free counters underlying [`DispatcherStatistics`]. Durations accumulate in nanoseconds.
@@ -1640,6 +2029,12 @@ struct DispatcherStatisticsAccumulator {
 
     /// Nanoseconds underlying [`DispatcherStatistics::lowering_duration`].
     lowering_nanoseconds: AtomicU64,
+
+    /// Counter underlying [`DispatcherStatistics::source_hits`].
+    source_hits: AtomicU64,
+
+    /// Counter underlying [`DispatcherStatistics::source_misses`].
+    source_misses: AtomicU64,
 }
 
 impl DispatcherStatisticsAccumulator {
@@ -1657,6 +2052,8 @@ impl DispatcherStatisticsAccumulator {
             dispatch_lookup_duration: Duration::from_nanos(self.dispatch_lookup_nanoseconds.load(Ordering::Relaxed)),
             tracing_duration: Duration::from_nanos(self.tracing_nanoseconds.load(Ordering::Relaxed)),
             lowering_duration: Duration::from_nanos(self.lowering_nanoseconds.load(Ordering::Relaxed)),
+            source_hits: self.source_hits.load(Ordering::Relaxed),
+            source_misses: self.source_misses.load(Ordering::Relaxed),
         }
     }
 
@@ -1671,6 +2068,8 @@ impl DispatcherStatisticsAccumulator {
         self.dispatch_lookup_nanoseconds.store(0, Ordering::Relaxed);
         self.tracing_nanoseconds.store(0, Ordering::Relaxed);
         self.lowering_nanoseconds.store(0, Ordering::Relaxed);
+        self.source_hits.store(0, Ordering::Relaxed);
+        self.source_misses.store(0, Ordering::Relaxed);
     }
 }
 
@@ -1698,7 +2097,7 @@ mod tests {
 
     use crate::arrays::{
         Array, ArrayIrOperation, ArrayIrType, ArrayIrValue, ArrayType, DataType, DimensionBounds, DimensionError,
-        DimensionType, DimensionValue, Shape,
+        DimensionType, DimensionValue, MeshAxis, MeshAxisType, Shape,
     };
     use crate::captures::CaptureReference;
     use crate::compilation::domains::{Compile, jit};
@@ -1752,9 +2151,9 @@ mod tests {
         type Error = ProgramError;
 
         fn dispatch_signature(
-            &self,
             input_types: Vec<ArrayIrType>,
             _options: &Self::Options,
+            _purpose: DispatchPurpose,
         ) -> Result<(Self::DispatchKey, Arc<[ArrayIrType]>), Self::Error> {
             let input_types: Arc<[ArrayIrType]> = input_types.into();
             Ok((input_types.clone(), input_types))
@@ -1764,9 +2163,12 @@ mod tests {
             Ok(staged.lifted_program()?.as_ref().clone())
         }
 
-        fn compile(&self, program: &Self::LoweredProgram) -> Result<Arc<Self::CompiledProgram>, ProgramError> {
+        fn compile(
+            &self,
+            program: &Self::LoweredProgram,
+        ) -> Result<(Arc<Self::CompiledProgram>, Vec<Self::Value>), ProgramError> {
             self.compilations.fetch_add(1, Ordering::Relaxed);
-            Ok(Arc::new(program.clone()))
+            Ok((Arc::new(program.clone()), Vec::new()))
         }
 
         fn execute(
@@ -1854,9 +2256,9 @@ mod tests {
         type Error = ProgramError;
 
         fn dispatch_signature(
-            &self,
             input_types: Vec<ArrayType>,
             _options: &(),
+            _purpose: DispatchPurpose,
         ) -> Result<(Self::DispatchKey, Arc<[ArrayType]>), ProgramError> {
             let input_types: Arc<[ArrayType]> = input_types.into();
             Ok((input_types.clone(), input_types))
@@ -1866,7 +2268,7 @@ mod tests {
             Err(ProgramError::UnsupportedOperation { message: "the test call domain does not lower programs".into() })
         }
 
-        fn compile(&self, _program: &FlatProgram<Self>) -> Result<Arc<FlatProgram<Self>>, ProgramError> {
+        fn compile(&self, _program: &FlatProgram<Self>) -> Result<(Arc<FlatProgram<Self>>, Vec<Array>), ProgramError> {
             unreachable!("the test call domain never lowers programs")
         }
 
@@ -1885,6 +2287,20 @@ mod tests {
         )
         .unwrap();
         staged.lower(domain).unwrap().compile(domain).unwrap()
+    }
+
+    /// Assembles a [`CompiledFunction`] of [`TestCallDomain`] from `staged`, whose lowered and compiled programs are
+    /// both its lifted program. The test call domain rejects lowering, so this assembles the handle from its parts,
+    /// which lets the call tests show that calls on lowered and compiled functions use only their staged source.
+    fn assemble_compiled_call_function<Input, Output>(
+        staged: StagedFunction<TestCallDomain, Input, Output>,
+    ) -> CompiledFunction<TestCallDomain, Input, Output>
+    where
+        Input: Parameterized<ArrayType, Family: ParameterizedFamily<CaptureReference<ArrayType>>>,
+        Output: Parameterized<ArrayType, Family: ParameterizedFamily<CaptureReference<ArrayType>>>,
+    {
+        let program = Arc::new(staged.lifted_program().unwrap().as_ref().clone());
+        CompiledFunction::from_parts(LoweredFunction { program: program.clone(), staged }, program, Vec::new())
     }
 
     /// Converts a reference completion failure into the error type of the [`StatefulExecution`] tests.
@@ -1966,6 +2382,29 @@ mod tests {
     }
 
     #[test]
+    fn test_staged_program_stage_with_named_axes_and_default_mesh() {
+        // The traced function observes the seeded scope exactly as a function inlined into that scope would.
+        let named_axes = vec![("items".to_string(), NamedAxis::Batched { size: Some(3) })];
+        let mesh = LogicalMesh::new(vec![MeshAxis::new("devices", 2, MeshAxisType::Manual).unwrap()]).unwrap();
+        let observed = RefCell::new(None);
+        let staged = StagedProgram::<TestDomain>::stage_with_named_axes_and_default_mesh(
+            |_, _, inputs| {
+                let context = inputs[0].context();
+                *observed.borrow_mut() = Some((context.named_axes(), context.default_mesh()));
+                Ok(inputs)
+            },
+            Vec::new(),
+            vec![ArrayType::scalar(DataType::F64)],
+            TestOptions::default(),
+            named_axes.clone(),
+            Some(mesh.clone()),
+        )
+        .unwrap();
+        assert_eq!(observed.into_inner(), Some((named_axes, Some(mesh))));
+        assert_eq!(staged.output_types(), &[ArrayType::scalar(DataType::F64)]);
+    }
+
+    #[test]
     fn test_staged_function_stage() {
         let domain = TestDomain::new();
         let input_types = (vec![Vec::new(), Vec::new()], ArrayType::scalar(DataType::F64));
@@ -2037,7 +2476,7 @@ mod tests {
         )
         .unwrap();
         let caller = StagedFunction::<TestCallDomain, (), ArrayType>::stage(
-            |_, _, ()| callee.call::<CompilationTracer<TestCallDomain>>(()),
+            |_, _, ()| callee.call::<CompilationTracer<TestCallDomain>, _>(()),
             Vec::new(),
             (),
             (),
@@ -2230,6 +2669,75 @@ mod tests {
     }
 
     #[test]
+    fn test_lowered_function_call() {
+        let callee: StagedFunction<TestCallDomain, ArrayType, (ArrayType, ArrayType)> = StagedFunction::stage(
+            |_, mut captures: Vec<CompilationTracer<TestCallDomain>>, input: CompilationTracer<TestCallDomain>| {
+                Ok((captures.remove(0), input.unary(NegOperation::new())))
+            },
+            vec![Array::scalar(7.0).unwrap()],
+            ArrayType::scalar(DataType::F64),
+            (),
+        )
+        .unwrap();
+        let callee = assemble_compiled_call_function(callee).lowered().clone();
+
+        // The call stages the same boundary as a call to the staged source, including its capture inputs.
+        let caller: StagedFunction<TestCallDomain, ArrayType, (ArrayType, ArrayType)> =
+            StagedFunction::stage(|_, _, input| callee.call(input), Vec::new(), ArrayType::scalar(DataType::F64), ())
+                .unwrap();
+        assert_eq!(caller.source_program().captures(), &[Array::scalar(7.0).unwrap()]);
+        assert_eq!(
+            caller.source_program().program().to_string(),
+            indoc! {"
+                lambda %0:f64[] .
+                let %1:f64[] = const capture#0:f64[]
+                    %2:f64[], %3:f64[] = call %1 %0 [
+                        callee={
+                            lambda %0:f64[], %1:f64[] .
+                            let %2:f64[] = neg %1
+                            in (%0, %2)
+                        },
+                    ]
+                in (%2, %3)"},
+        );
+    }
+
+    #[test]
+    fn test_lowered_function_call_in_context() {
+        let callee: StagedFunction<TestCallDomain, (), ArrayType> = StagedFunction::stage(
+            |_, mut captures: Vec<CompilationTracer<TestCallDomain>>, ()| Ok(captures.remove(0)),
+            vec![Array::scalar(7.0).unwrap()],
+            (),
+            (),
+        )
+        .unwrap();
+        let callee = assemble_compiled_call_function(callee).lowered().clone();
+
+        // An explicit context supports calls to functions without inputs, from which no context can be recovered.
+        let caller: StagedFunction<TestCallDomain, ArrayType, ArrayType> = StagedFunction::stage(
+            |_, _, input: CompilationTracer<TestCallDomain>| callee.call_in_context(input.context(), ()),
+            Vec::new(),
+            ArrayType::scalar(DataType::F64),
+            (),
+        )
+        .unwrap();
+        assert_eq!(caller.source_program().captures(), &[Array::scalar(7.0).unwrap()]);
+        assert_eq!(
+            caller.source_program().program().to_string(),
+            indoc! {"
+                lambda %0:f64[] .
+                let %1:f64[] = const capture#0:f64[]
+                    %2:f64[] = call %1 [
+                        callee={
+                            lambda %0:f64[] .
+                            in (%0)
+                        },
+                    ]
+                in (%2)"},
+        );
+    }
+
+    #[test]
     fn test_executable_function_with_compiled_program() {
         let domain = TestDomain::new();
         let identity = compile_from_one_call_site(&domain, false).into_executable();
@@ -2329,6 +2837,76 @@ mod tests {
         assert!(executable.input_types().is_empty());
         assert_eq!(executable.output_types().as_ref(), &[ArrayType::scalar(DataType::F64)]);
         assert_eq!(executable.execute(&domain, ()).unwrap(), Array::scalar(7.0).unwrap());
+    }
+
+    #[test]
+    fn test_compiled_function_call() {
+        let callee: StagedFunction<TestCallDomain, ArrayType, (ArrayType, ArrayType)> = StagedFunction::stage(
+            |_, mut captures: Vec<CompilationTracer<TestCallDomain>>, input: CompilationTracer<TestCallDomain>| {
+                Ok((captures.remove(0), input.unary(NegOperation::new())))
+            },
+            vec![Array::scalar(7.0).unwrap()],
+            ArrayType::scalar(DataType::F64),
+            (),
+        )
+        .unwrap();
+        let callee = assemble_compiled_call_function(callee);
+
+        // The call stages the same boundary as a call to the staged source, including its capture inputs, rather than
+        // invoking the retained executable.
+        let caller: StagedFunction<TestCallDomain, ArrayType, (ArrayType, ArrayType)> =
+            StagedFunction::stage(|_, _, input| callee.call(input), Vec::new(), ArrayType::scalar(DataType::F64), ())
+                .unwrap();
+        assert_eq!(caller.source_program().captures(), &[Array::scalar(7.0).unwrap()]);
+        assert_eq!(
+            caller.source_program().program().to_string(),
+            indoc! {"
+                lambda %0:f64[] .
+                let %1:f64[] = const capture#0:f64[]
+                    %2:f64[], %3:f64[] = call %1 %0 [
+                        callee={
+                            lambda %0:f64[], %1:f64[] .
+                            let %2:f64[] = neg %1
+                            in (%0, %2)
+                        },
+                    ]
+                in (%2, %3)"},
+        );
+    }
+
+    #[test]
+    fn test_compiled_function_call_in_context() {
+        let callee: StagedFunction<TestCallDomain, (), ArrayType> = StagedFunction::stage(
+            |_, mut captures: Vec<CompilationTracer<TestCallDomain>>, ()| Ok(captures.remove(0)),
+            vec![Array::scalar(7.0).unwrap()],
+            (),
+            (),
+        )
+        .unwrap();
+        let callee = assemble_compiled_call_function(callee);
+
+        // An explicit context supports calls to functions without inputs, from which no context can be recovered.
+        let caller: StagedFunction<TestCallDomain, ArrayType, ArrayType> = StagedFunction::stage(
+            |_, _, input: CompilationTracer<TestCallDomain>| callee.call_in_context(input.context(), ()),
+            Vec::new(),
+            ArrayType::scalar(DataType::F64),
+            (),
+        )
+        .unwrap();
+        assert_eq!(caller.source_program().captures(), &[Array::scalar(7.0).unwrap()]);
+        assert_eq!(
+            caller.source_program().program().to_string(),
+            indoc! {"
+                lambda %0:f64[] .
+                let %1:f64[] = const capture#0:f64[]
+                    %2:f64[] = call %1 [
+                        callee={
+                            lambda %0:f64[] .
+                            in (%0)
+                        },
+                    ]
+                in (%2)"},
+        );
     }
 
     #[test]
@@ -3041,6 +3619,91 @@ mod tests {
         assert_eq!(function.domain(), Some(&first_domain));
         assert_eq!(function.execute_statefully_and_wait((), second_domain.scalar(2.0)), Ok(first_domain.scalar(-2.0)));
         assert_eq!(function.statistics().dispatch_hits, 1);
+    }
+
+    #[test]
+    fn test_compiled_function_dispatcher_call() {
+        let function: CompiledFunctionDispatcher<TestCallDomain, (), ArrayType, ArrayType, _> =
+            TestCallDomain.jit(|(), input: CompilationTracer<TestCallDomain>| Ok(input.unary(NegOperation::new())));
+        let stage_caller = || -> StagedFunction<TestCallDomain, ArrayType, ArrayType> {
+            StagedFunction::stage(
+                |_, _, input: CompilationTracer<TestCallDomain>| function.call((), input),
+                Vec::new(),
+                ArrayType::scalar(DataType::F64),
+                (),
+            )
+            .unwrap()
+        };
+
+        // A source call binds the traced closure as a callee. The test call domain rejects lowering, so the call
+        // succeeding also shows that source calls neither lower nor compile anything.
+        let caller = stage_caller();
+        assert_eq!(
+            caller.source_program().program().to_string(),
+            indoc! {"
+                lambda %0:f64[] .
+                let %1:f64[] = call %0 [
+                    callee={
+                        lambda %0:f64[] .
+                        let %1:f64[] = neg %0
+                        in (%1)
+                    },
+                ]
+                in (%1)"},
+        );
+        let statistics = function.statistics();
+        assert_eq!((statistics.source_hits, statistics.source_misses, statistics.traces), (0, 1, 1));
+        assert_eq!((statistics.dispatch_misses, statistics.lowerings, statistics.compilation_requests), (0, 0, 0));
+
+        // Another call with the same types and scope reuses the source specialization.
+        stage_caller();
+        let statistics = function.statistics();
+        assert_eq!((statistics.source_hits, statistics.source_misses, statistics.traces), (1, 1, 1));
+
+        // Clearing the cache removes source specializations too.
+        function.clear_cache();
+        stage_caller();
+        let statistics = function.statistics();
+        assert_eq!((statistics.source_hits, statistics.source_misses, statistics.traces), (1, 2, 2));
+    }
+
+    #[test]
+    fn test_compiled_function_dispatcher_call_in_context() {
+        // The closure records the named axes that each trace sees, which come from the context that calls it.
+        let observed = Rc::new(RefCell::new(Vec::new()));
+        let function: CompiledFunctionDispatcher<TestCallDomain, (), ArrayType, ArrayType, _> = TestCallDomain.jit({
+            let observed = observed.clone();
+            move |(), input: CompilationTracer<TestCallDomain>| {
+                observed.borrow_mut().push(input.context().named_axes());
+                Ok(input.unary(NegOperation::new()))
+            }
+        });
+        let named_axes = vec![("items".to_string(), NamedAxis::Batched { size: Some(3) })];
+        let stage_caller = |named_axes: Vec<(String, NamedAxis)>| {
+            StagedFunction::<TestCallDomain, ArrayType, ArrayType>::stage_with_named_axes_and_default_mesh(
+                |_, _, input: CompilationTracer<TestCallDomain>| {
+                    let context = input.context().clone();
+                    function.call_in_context(&context, (), input)
+                },
+                Vec::new(),
+                ArrayType::scalar(DataType::F64),
+                (),
+                named_axes,
+                None,
+            )
+            .unwrap()
+        };
+
+        // Each calling scope gets its own source specialization, traced in that scope, and repeated scopes reuse it.
+        stage_caller(named_axes.clone());
+        stage_caller(Vec::new());
+        stage_caller(named_axes.clone());
+        assert_eq!(observed.borrow().as_slice(), &[named_axes, Vec::new()]);
+        let statistics = function.statistics();
+        assert_eq!((statistics.source_hits, statistics.source_misses, statistics.traces), (1, 2, 2));
+
+        // Invalidation removes the source specializations of every scope and counts them.
+        assert_eq!(function.invalidate_specializations(&()), 2);
     }
 
     #[test]
