@@ -45,8 +45,10 @@
 //!     domain to bind it when the dispatcher is constructed. The closure is fallible during tracing and returns its
 //!     outputs wrapped in [`Ok`] when it cannot fail. A [`CompiledFunctionDispatcher`] specializes on explicit static
 //!     host parameters, the dynamic input's parameter structure, and the domain's runtime-derived dispatch key. Its
-//!     first call for a specialization stages, lowers, and requests compilation; warm calls dispatch directly to the
-//!     retained executable.
+//!     first execution of a specialization stages, lowers, and requests compilation, and warm executions dispatch
+//!     directly to the retained executable. [`CompiledFunctionDispatcher::call`] and
+//!     [`CompiledFunctionDispatcher::call_in_context`] instead invoke a staged specialization in the active context,
+//!     which composes the dispatcher with enclosing transforms and compilations.
 //!   - Execute an [`ExecutableFunction`] through [`ExecutableFunction::execute`]. Domains with transactional
 //!     external state implement [`StatefulCompilationDomain`], and their executable functions are invoked through
 //!     [`ExecutableFunction::execute_statefully`] or [`ExecutableFunction::execute_statefully_and_wait`]. Retained
@@ -78,8 +80,9 @@
 //!
 //!   1. [`StagedFunction`] pairs a flat [`StagedProgram`] with the exact input and output container structures. The
 //!      artifact owns the source program, captures, public types, and options. It contains no backend lowering or
-//!      executable, and its [`StagedFunction::call`] method stages a nested call into an active context rather than
-//!      executing at runtime.
+//!      executable. Its [`StagedFunction::call`] function binds a call in the active context, which executes it
+//!      immediately under an eager parent, records it under a staging parent, and transforms it under a transform
+//!      parent.
 //!   2. [`LoweredFunction`] owns the backend's [`CompilationDomain::LoweredProgram`], the source handle, and the
 //!      options used to lower it. Compilation computes the domain's exact key and consults its [`CompilationContext`].
 //!   3. [`CompiledFunction`] combines the executable with the staged and lowered metadata required for inspection and
@@ -97,20 +100,28 @@
 //! and execution supplies arguments in the same `[captures..., public inputs...]` order. This keeps IR compact,
 //! preserves device-resident buffers, and lets compilation depend on capture types rather than data.
 //!
-//! [`CapturingContext`](crate::CapturingContext) lets ordinary and transform contexts register captures through their
-//! parent. To embed a staged function in a larger trace, an operation family implements [`StagedCallOperation`], and
-//! that operation then owns how the nested call behaves under lowering, batching, differentiation, partial evaluation,
-//! and interpretation.
+//! [`CapturingContext`](crate::CapturingContext) lets ordinary and transform contexts register captures
+//! through their parent. A nested call brings the captures of its callee into the calling context through
+//! [`ImportingContext`](crate::ImportingContext), so an eager context uses them as they are, a trace captures them,
+//! and a transform context imports them through its parent and wraps them like constants. To embed a staged function
+//! in a larger trace, an operation family implements [`StagedCallOperation`], and that operation then owns how the
+//! nested call behaves under lowering, batching, differentiation, partial evaluation, and interpretation.
 //!
 //! # Specialization and Caching
 //!
-//! [`CompiledFunctionDispatcher`] keeps one bounded LRU cache of compiled specializations, built on the general
+//! [`CompiledFunctionDispatcher`] keeps a bounded LRU cache of compiled specializations, built on the general
 //! [`SpecializationCache`](crate::SpecializationCache) primitive and keyed by the static parameters, the input
 //! parameter structure, and the domain's dispatch key. A hit dispatches directly to the retained executable, while a
 //! miss stages the Rust closure, lowers the staged source, requests compilation, and inserts the resulting executable.
-//! Staging and lowering are cheap relative to backend compilation, so there are no intermediate staging or lowering
-//! caches. After an eviction or failure, the miss path simply reruns those phases, and the shared
+//! Staging and lowering are cheap relative to backend compilation, so execution has no intermediate staging or
+//! lowering caches. After an eviction or failure, the miss path simply reruns those phases, and the shared
 //! [`CompilationContext`] below still deduplicates the expensive backend compilation.
+//!
+//! Calls (i.e., [`CompiledFunctionDispatcher::call_in_context`]) keep their staged functions in a second cache
+//! of the same kind, keyed by the static parameters, the input parameter structure, the staged input types, and the
+//! [`TracingScope`](crate::TracingScope) of the calling context. Calls therefore never evict executables, and
+//! they are counted separately (i.e., by [`DispatcherStatistics::staged_cache_hits`] and
+//! [`DispatcherStatistics::staged_cache_misses`]).
 //!
 //! That argument does not carry over to eager (i.e., operation-by-operation) dispatch, where a compiled program is
 //! reused for every application of the same operation and the relevant comparison is with _executing_ one small

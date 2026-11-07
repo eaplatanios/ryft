@@ -4,21 +4,24 @@ use std::sync::Arc;
 
 use crate::captures::CaptureConstant;
 use crate::compilation::functions::{
-    CompilationTracer, CompiledFunctionDispatcher, DEFAULT_JIT_CACHE_CAPACITY, ExecutableFunction, StagedFunction,
-    StagedProgram, StatefulExecution,
+    CompilationTracer, CompiledFunctionDispatcher, ExecutableFunction, StagedFunction, StagedProgram, StatefulExecution,
 };
 use crate::contexts::{Domain, StagingContext};
 use crate::parameters::{Parameterized, ParameterizedFamily};
 use crate::programs::{ProgramError, TypedProgram, Value};
 use crate::tracing::DomainTracingContext;
 
+/// Default number of compiled specializations retained by one [`CompiledFunctionDispatcher`].
+const DEFAULT_JIT_CACHE_CAPACITY: usize = 256;
+
 /// Purpose of a [`CompilationDomain::dispatch_signature`] request, which determines whether dispatch policies that
 /// change the staged types (e.g., bounded shape bucketing) may apply.
-#[derive(Clone, Copy, Debug, PartialEq, Eq, Hash)]
+#[derive(Copy, Clone, Debug, PartialEq, Eq, Hash)]
 pub enum DispatchPurpose {
-    /// Staging of a function that is called within an enclosing computation (i.e., a source call of a retained
-    /// dispatcher), which is lowered and dispatched as part of that computation.
-    Source,
+    /// Signature for an unlowered function called through its caller's context. The callee is lowered and dispatched
+    /// as part of the enclosing computation when compiled. Callers use only the staged types of this signature and
+    /// ignore its dispatch key, because staged specializations are keyed by those types.
+    Staging,
 
     /// Specialization of an independently dispatched executable (i.e., a call of a retained dispatcher that executes
     /// its own compiled program).
@@ -64,12 +67,13 @@ pub trait CompilationDomain: Domain<Constant: CaptureConstant> + Clone {
 
     /// Derives the types at which a function is staged for one runtime input signature, together with their dispatch
     /// key, for the provided [`DispatchPurpose`]. Both purposes apply the semantic declarations of `options` (e.g., the
-    /// input shardings that they request). An [`DispatchPurpose::Executable`] specialization may additionally apply a
+    /// input shardings that they request). A [`DispatchPurpose::Executable`] specialization may additionally apply a
     /// semantics preserving dispatch policy such as bounded shape bucketing, which changes the types that are traced as
-    /// well as the key. A [`DispatchPurpose::Source`] specialization is staged within its caller and lowered as part of
-    /// the enclosing computation, and so it never applies such a policy. Most domains return the input types unchanged
-    /// for both purposes and use them as the key. This function needs no domain instance, because a dispatcher that
-    /// infers its domain from its inputs may not have selected one yet when it stages a source call.
+    /// well as the key. A [`DispatchPurpose::Staging`] specialization is staged within its caller and lowered with the
+    /// enclosing computation, so it never applies such a policy. Its key is unused, because staged specializations
+    /// are keyed by their staged types. Most domains return the input types unchanged for both purposes and use them
+    /// as the key. This function needs no domain instance, because a dispatcher that infers its domain from its inputs
+    /// may not have selected one yet when it stages a call.
     ///
     /// The returned key must compare equal exactly when the returned types are interchangeable for tracing, lowering,
     /// compilation, and calls. The types are returned as a shared slice so that key construction on the hot path of
@@ -84,9 +88,7 @@ pub trait CompilationDomain: Domain<Constant: CaptureConstant> + Clone {
         input_types: Vec<Self::Type>,
         options: &Self::Options,
         purpose: DispatchPurpose,
-    ) -> Result<(Self::DispatchKey, Arc<[Self::Type]>), Self::Error>
-    where
-        Self: Sized;
+    ) -> Result<(Self::DispatchKey, Arc<[Self::Type]>), Self::Error>;
 
     /// Lowers `staged` into the lowered program representation of this backend. Callers typically use
     /// [`StagedFunction::lower`] rather than calling this function directly. The lowered program must capture every
@@ -241,9 +243,7 @@ pub trait AnalyzableCompilationDomain: CompilationDomain {
     fn analyze<Input: Parameterized<Self::Type>, Output: Parameterized<Self::Type>>(
         &self,
         executable: &ExecutableFunction<Self, Input, Output>,
-    ) -> Result<Self::Analysis, Self::Error>
-    where
-        Self: Sized;
+    ) -> Result<Self::Analysis, Self::Error>;
 }
 
 /// Typed staging and retained compilation through an explicit [`CompilationDomain`]. Retained dispatchers bind to
@@ -583,7 +583,7 @@ mod tests {
         assert_eq!(function.execute(false, domain.scalar(2.0)), Ok(domain.scalar(2.0)));
         assert_eq!(function.execute(true, domain.scalar(2.0)), Ok(domain.scalar(-2.0)));
         assert_eq!(function.execute(false, domain.scalar(2.0)), Ok(domain.scalar(2.0)));
-        assert_eq!(function.specialization_count(), 1);
+        assert_eq!(function.executable_specialization_count(), 1);
         assert_eq!(function.statistics().dispatch_misses, 3);
         assert_eq!(domain.compilation_count(), 3);
     }
