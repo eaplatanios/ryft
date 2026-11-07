@@ -808,11 +808,9 @@ impl<Input> ParentDifferentiationBuilder<Input> {
     }
 }
 
-// TODO(eaplatanios): Review from here onwards.
-
 impl<Input, ContextState> ParentDifferentiationBuilder<Input, ContextState> {
-    /// Projected counterpart of [`DifferentiationBuilder::jvp`](crate::DifferentiationBuilder::jvp), whose `tangent`
-    /// has the structure and leaf type of the active primal.
+    /// Projected counterpart of [`DifferentiationBuilder::jvp`](crate::DifferentiationBuilder::jvp),
+    /// whose `tangent` has the structure and leaf type of the active primal.
     pub fn jvp<T: Type, V, C, Output, F>(
         self,
         tangent: Input,
@@ -823,13 +821,13 @@ impl<Input, ContextState> ParentDifferentiationBuilder<Input, ContextState> {
         C: ContextProjection<T, Type: DifferentiableType>,
         C::Value: ValueProjection<T, Projected = V>,
         C::Operation: DifferentiableOperation<C> + ResidualZeroProvider<C::Type, Operation = C::Operation>,
-        for<'t> &'t T: TryFrom<&'t C::Type, Error = TypeError>,
         Input: Parameterized<V, Family: ParameterizedFamily<ProjectedValue<T, DifferentiationTracer<C>>>>,
         Output: Parameterized<ProjectedValue<T, DifferentiationTracer<C>>, Family: ParameterizedFamily<V>>,
         ContextState: DifferentiationBuilderContext<V, Input, Context = ProjectedContext<C, T>>,
         F: FnOnce(Input::To<ProjectedValue<T, DifferentiationTracer<C>>>) -> Result<Output, ProgramError>,
         TracingContext<C::Constant, C::Operation>:
             StagingContext<Type = C::Type, Constant = C::Constant, Operation = C::Operation>,
+        for<'t> &'t T: TryFrom<&'t C::Type, Error = TypeError>,
     {
         let (context, structure, primal) = lift_primal::<T, V, C, Input, ContextState>(self.primal, self.context)?;
         let tangent = tangent.into_parameters().map(<C::Value as ValueProjection<T>>::from_projected).collect();
@@ -865,8 +863,8 @@ impl<Input, ContextState> ParentDifferentiationBuilder<Input, ContextState> {
         Ok((output, output_tangent))
     }
 
-    /// Projected counterpart of [`DifferentiationBuilder::linearize`](crate::DifferentiationBuilder::linearize), whose
-    /// [`ParentPushforward`] takes and returns projected values.
+    /// Projected counterpart of [`DifferentiationBuilder::linearize`](crate::DifferentiationBuilder::linearize),
+    /// whose [`ParentPushforward`] takes and returns projected values.
     #[allow(clippy::type_complexity)]
     pub fn linearize<T: Type, V, C, Output, F>(
         self,
@@ -879,13 +877,13 @@ impl<Input, ContextState> ParentDifferentiationBuilder<Input, ContextState> {
         C::Operation: PartiallyEvaluatableOperation<C>
             + PartiallyEvaluatableOperation<TracingContext<C::Constant, C::Operation>>
             + ResidualZeroProvider<C::Type, Operation = C::Operation>,
-        for<'t> &'t T: TryFrom<&'t C::Type, Error = TypeError>,
         Input: Parameterized<V, Family: ParameterizedFamily<ProjectedValue<T, LinearizationTracer<C>>>>,
         Output: Parameterized<ProjectedValue<T, LinearizationTracer<C>>, Family: ParameterizedFamily<V>>,
         ContextState: DifferentiationBuilderContext<V, Input, Context = ProjectedContext<C, T>>,
         F: FnOnce(Input::To<ProjectedValue<T, LinearizationTracer<C>>>) -> Result<Output, ProgramError>,
         TracingContext<C::Constant, C::Operation>:
             StagingContext<Type = C::Type, Constant = C::Constant, Operation = C::Operation>,
+        for<'t> &'t T: TryFrom<&'t C::Type, Error = TypeError>,
     {
         let (context, structure, primal) = lift_primal::<T, V, C, Input, ContextState>(self.primal, self.context)?;
         let mut output_structure = None;
@@ -915,8 +913,8 @@ impl<Input, ContextState> ParentDifferentiationBuilder<Input, ContextState> {
         ))
     }
 
-    /// Projected counterpart of [`DifferentiationBuilder::vjp`](crate::DifferentiationBuilder::vjp), whose
-    /// [`ParentPullback`] takes and returns projected values.
+    /// Projected counterpart of [`DifferentiationBuilder::vjp`](crate::DifferentiationBuilder::vjp),
+    /// whose [`ParentPullback`] takes and returns projected values.
     #[allow(clippy::type_complexity)]
     pub fn vjp<T: Type, V, C, Output, F>(
         self,
@@ -926,7 +924,6 @@ impl<Input, ContextState> ParentDifferentiationBuilder<Input, ContextState> {
         V: Value<Type = T>,
         C: ContextProjection<T, Type: DifferentiableType + ReferenceMemberType> + ReverseModeDifferentiate,
         C::Value: ValueProjection<T, Projected = V>,
-        for<'t> &'t T: TryFrom<&'t C::Type, Error = TypeError>,
         Input: Parameterized<V, Family: ParameterizedFamily<ProjectedValue<T, LinearizationTracer<C>>>>,
         Output: Parameterized<ProjectedValue<T, LinearizationTracer<C>>, Family: ParameterizedFamily<V>>,
         ContextState: DifferentiationBuilderContext<V, Input, Context = ProjectedContext<C, T>>,
@@ -934,6 +931,7 @@ impl<Input, ContextState> ParentDifferentiationBuilder<Input, ContextState> {
         TracingContext<C::Constant, C::Operation>:
             StagingContext<Type = C::Type, Constant = C::Constant, Operation = C::Operation>,
         <PartialEvaluationContext<C> as Domain>::Operation: DifferentiableOperation<PartialEvaluationContext<C>>,
+        for<'t> &'t T: TryFrom<&'t C::Type, Error = TypeError>,
     {
         let (context, structure, primal) = lift_primal::<T, V, C, Input, ContextState>(self.primal, self.context)?;
         let input_structure = structure.clone();
@@ -987,7 +985,6 @@ impl<Input, ContextState> ParentDifferentiationBuilder<Input, ContextState> {
                 > + OperationProvider<C::Type, OneOperation<C::Type>, Operation = C::Operation>,
             > + Zero<C::Value>,
         C::Value: ValueProjection<T, Projected = V>,
-        for<'t> &'t T: TryFrom<&'t C::Type, Error = TypeError>,
         Input: Parameterized<V, Family: ParameterizedFamily<ProjectedValue<T, LinearizationTracer<C>>>>,
         Output: MaybeFallible<ProjectedValue<T, LinearizationTracer<C>>, ProgramError>,
         ContextState: DifferentiationBuilderContext<V, Input, Context = ProjectedContext<C, T>>,
@@ -995,6 +992,7 @@ impl<Input, ContextState> ParentDifferentiationBuilder<Input, ContextState> {
         TracingContext<C::Constant, C::Operation>:
             StagingContext<Type = C::Type, Constant = C::Constant, Operation = C::Operation>,
         <PartialEvaluationContext<C> as Domain>::Operation: DifferentiableOperation<PartialEvaluationContext<C>>,
+        for<'t> &'t T: TryFrom<&'t C::Type, Error = TypeError>,
     {
         let (context, structure, primal) = lift_primal::<T, V, C, Input, ContextState>(self.primal, self.context)?;
         let gradient_structure = structure.clone();
@@ -1020,6 +1018,7 @@ impl<Input, ContextState> ParentDifferentiationBuilder<Input, ContextState> {
     /// Projected counterpart of [`DifferentiationBuilder::gradient`](crate::DifferentiationBuilder::gradient). The
     /// closure may return its projected scalar directly or in a [`Result`] whose error type is [`ProgramError`], as
     /// specified by [`MaybeFallible`].
+    #[inline]
     pub fn gradient<T: Type, V, C, Output, F>(self, function: F) -> Result<Input::To<V>, DifferentiationError>
     where
         V: Value<Type = T>,
@@ -1036,7 +1035,6 @@ impl<Input, ContextState> ParentDifferentiationBuilder<Input, ContextState> {
                 > + OperationProvider<C::Type, OneOperation<C::Type>, Operation = C::Operation>,
             > + Zero<C::Value>,
         C::Value: ValueProjection<T, Projected = V>,
-        for<'t> &'t T: TryFrom<&'t C::Type, Error = TypeError>,
         Input: Parameterized<V, Family: ParameterizedFamily<ProjectedValue<T, LinearizationTracer<C>>>>,
         Output: MaybeFallible<ProjectedValue<T, LinearizationTracer<C>>, ProgramError>,
         ContextState: DifferentiationBuilderContext<V, Input, Context = ProjectedContext<C, T>>,
@@ -1044,13 +1042,14 @@ impl<Input, ContextState> ParentDifferentiationBuilder<Input, ContextState> {
         TracingContext<C::Constant, C::Operation>:
             StagingContext<Type = C::Type, Constant = C::Constant, Operation = C::Operation>,
         <PartialEvaluationContext<C> as Domain>::Operation: DifferentiableOperation<PartialEvaluationContext<C>>,
+        for<'t> &'t T: TryFrom<&'t C::Type, Error = TypeError>,
     {
         self.value_and_gradient::<T, V, C, Output, F>(function).map(|(_, gradient)| gradient)
     }
 
     /// Projected counterpart of
-    /// [`DifferentiationBuilder::jacobian_forward`](crate::DifferentiationBuilder::jacobian_forward), whose blocks are
-    /// projected values.
+    /// [`DifferentiationBuilder::jacobian_forward`](crate::DifferentiationBuilder::jacobian_forward),
+    /// whose blocks are projected values.
     #[allow(clippy::type_complexity)]
     pub fn jacobian_forward<T: Type, V, C, Output, F>(
         self,
@@ -1063,7 +1062,6 @@ impl<Input, ContextState> ParentDifferentiationBuilder<Input, ContextState> {
         C::Operation: PartiallyEvaluatableOperation<C>
             + PartiallyEvaluatableOperation<TracingContext<C::Constant, C::Operation>>
             + ResidualZeroProvider<C::Type, Operation = C::Operation>,
-        for<'t> &'t T: TryFrom<&'t C::Type, Error = TypeError>,
         Input: Parameterized<
                 V,
                 Family: ParameterizedFamily<ProjectedValue<T, LinearizationTracer<C>>> + ParameterizedFamily<T>,
@@ -1073,6 +1071,7 @@ impl<Input, ContextState> ParentDifferentiationBuilder<Input, ContextState> {
         F: FnOnce(Input::To<ProjectedValue<T, LinearizationTracer<C>>>) -> Result<Output, ProgramError>,
         TracingContext<C::Constant, C::Operation>:
             StagingContext<Type = C::Type, Constant = C::Constant, Operation = C::Operation>,
+        for<'t> &'t T: TryFrom<&'t C::Type, Error = TypeError>,
     {
         let (context, structure, primal) = lift_primal::<T, V, C, Input, ContextState>(self.primal, self.context)?;
         let input_types = primal
@@ -1115,8 +1114,8 @@ impl<Input, ContextState> ParentDifferentiationBuilder<Input, ContextState> {
     }
 
     /// Projected counterpart of
-    /// [`DifferentiationBuilder::jacobian_reverse`](crate::DifferentiationBuilder::jacobian_reverse), whose blocks are
-    /// projected values.
+    /// [`DifferentiationBuilder::jacobian_reverse`](crate::DifferentiationBuilder::jacobian_reverse),
+    /// whose blocks are projected values.
     #[allow(clippy::type_complexity)]
     pub fn jacobian_reverse<T: Type, V, C, Output, F>(
         self,
@@ -1127,7 +1126,6 @@ impl<Input, ContextState> ParentDifferentiationBuilder<Input, ContextState> {
         C: ContextProjection<T, Type: DenseDifferentiableType<C> + ReferenceMemberType> + ReverseModeDifferentiate,
         C::Value: ValueProjection<T, Projected = V>,
         C::Operation: DifferentiableOperation<PartialEvaluationContext<C>>,
-        for<'t> &'t T: TryFrom<&'t C::Type, Error = TypeError>,
         Input: Parameterized<
                 V,
                 Family: ParameterizedFamily<ProjectedValue<T, LinearizationTracer<C>>> + ParameterizedFamily<T>,
@@ -1137,6 +1135,7 @@ impl<Input, ContextState> ParentDifferentiationBuilder<Input, ContextState> {
         F: FnOnce(Input::To<ProjectedValue<T, LinearizationTracer<C>>>) -> Result<Output, ProgramError>,
         TracingContext<C::Constant, C::Operation>:
             StagingContext<Type = C::Type, Constant = C::Constant, Operation = C::Operation>,
+        for<'t> &'t T: TryFrom<&'t C::Type, Error = TypeError>,
     {
         let (context, structure, primal) = lift_primal::<T, V, C, Input, ContextState>(self.primal, self.context)?;
         let input_types = primal
@@ -1178,8 +1177,8 @@ impl<Input, ContextState> ParentDifferentiationBuilder<Input, ContextState> {
         Ok(Jacobian::new(input_types, output_types, values)?)
     }
 
-    /// Projected counterpart of [`DifferentiationBuilder::hessian`](crate::DifferentiationBuilder::hessian), whose
-    /// blocks are projected values.
+    /// Projected counterpart of [`DifferentiationBuilder::hessian`](crate::DifferentiationBuilder::hessian),
+    /// whose blocks are projected values.
     #[allow(clippy::type_complexity)]
     pub fn hessian<T: Type, V, C, Output, F>(
         self,
@@ -1202,7 +1201,6 @@ impl<Input, ContextState> ParentDifferentiationBuilder<Input, ContextState> {
             + DifferentiableOperation<PartialEvaluationContext<TracingContext<C::Constant, C::Operation>>>
             + DifferentiableOperation<PartialEvaluationContext<LinearizationContext<C>>>
             + PullbackOperation<C::Type, C::Constant>,
-        for<'t> &'t T: TryFrom<&'t C::Type, Error = TypeError>,
         Input: Parameterized<
                 V,
                 Family: ParameterizedFamily<ProjectedValue<T, LinearizationTracer<LinearizationContext<C>>>>
@@ -1219,6 +1217,7 @@ impl<Input, ContextState> ParentDifferentiationBuilder<Input, ContextState> {
         TracingContext<C::Constant, C::Operation>:
             StagingContext<Type = C::Type, Constant = C::Constant, Operation = C::Operation>,
         PartialEvaluationContext<C>: Context<Type = C::Type, Constant = C::Constant, Operation = C::Operation>,
+        for<'t> &'t T: TryFrom<&'t C::Type, Error = TypeError>,
     {
         let (context, structure, primal) = lift_primal::<T, V, C, Input, ContextState>(self.primal, self.context)?;
         let input_types = primal
@@ -1259,6 +1258,8 @@ impl<Input, ContextState> ParentDifferentiationBuilder<Input, ContextState> {
         Ok(Hessian::new(input_types, output_types, values)?)
     }
 }
+
+// TODO(eaplatanios): Review from here onwards.
 
 /// [`Pushforward`] returned by [`ParentDifferentiationBuilder::linearize`], whose program and residuals live in the
 /// parent context `C` and whose applications take and return projected values with the structures `Input` and `Output`
