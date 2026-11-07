@@ -21,7 +21,7 @@ use crate::operations::composites::rules::{
 use crate::operations::custom_call::{CustomCall, CustomCallOperation};
 use crate::parameters::{Parameter, ParameterPath, Parameterized, ParameterizedFamily, Placeholder};
 use crate::programs::{AttachedRegions, MaybeZero, Operation, ProgramError, Type, TypeError, Typed, Value};
-use crate::tracing::{DomainTracingContext, TracingContext};
+use crate::tracing::{DomainTracingContext, TracingContext, TracingScope};
 
 #[cfg(doc)]
 use crate::tracing::DomainTracer;
@@ -1560,11 +1560,10 @@ where
         // are part of the registration key. The same holds for the default mesh of the calling context.
         let named_axes = first.domain().named_axes();
         let default_mesh = first.domain().default_mesh();
-        let (output_types, primal) = DomainTracingContext::<C>::trace_with_named_axes_and_default_mesh(
+        let (output_types, primal) = DomainTracingContext::<C>::trace_in_scope(
             &*self.primal,
             input_types.clone(),
-            named_axes.clone(),
-            default_mesh.clone(),
+            TracingScope::new(named_axes.clone(), default_mesh.clone()),
         )?;
         let input_structure = input_types.parameter_structure();
         let output_structure = output_types.parameter_structure();
@@ -6261,14 +6260,13 @@ mod tests {
             )
         };
         let input_type = ArrayType::new_static(DataType::F64, [2]);
-        DomainTracingContext::<ArrayContext>::trace_with_named_axes_and_default_mesh(
+        DomainTracingContext::<ArrayContext>::trace_in_scope(
             |(x, seed): (ArrayTracer, ArrayTracer)| {
                 let (y, pullback) = differentiate_at(x).vjp(|x| function.call(x))?;
                 Ok((y, pullback.apply_materialized(seed)?))
             },
             (input_type.clone(), input_type),
-            Vec::new(),
-            Some(mesh.clone()),
+            TracingScope::new(Vec::new(), Some(mesh.clone())),
         )
         .unwrap();
         let observed = observed.lock().unwrap().clone();

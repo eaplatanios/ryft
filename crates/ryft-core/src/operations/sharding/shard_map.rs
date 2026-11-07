@@ -6684,16 +6684,17 @@ fn local_accumulator_destinations<V: Value<Type = ArrayIrType>, O: Operation<Typ
 ///   1. A placement difference over [`Explicit`](MeshAxisType::Explicit) mesh axes is a tracked sharding transition, so
 ///      it is undone with `reshard` to the caller's placement over those axes. The axis types of the caller's mesh
 ///      decide which axes are `Explicit` (the mesh of the assembled cotangent may differ from it in its axis types
-///      only), [`Auto`](MeshAxisType::Auto) axes are untracked and therefore dropped from the target, and a caller
-///      without a sharding is treated as replicated over the mesh. `reshard` cannot target manual axes, so this step
+///      only), and a caller without a sharding is treated as replicated over the mesh. The caller's type places
+///      nothing over [`Auto`](MeshAxisType::Auto) axes, because array types cannot record such placement (refer to
+///      [`ArrayType::with_sharding`]), so neither does the target. `reshard` cannot target manual axes, so this step
 ///      is skipped when the caller places a dimension along a manual axis of its mesh, and the next step restores the
 ///      complete placement instead. Resharding to the caller's placement with its manual axes projected away and then
 ///      re-placing the result along those manual axes would replicate the cotangent along them only to slice it again,
 ///      which compiles to an extra round trip of collectives, while one placement-only `broadcast` compiles to local
 ///      slicing.
-///   2. The remaining placement difference (i.e., over manual or `Auto` axes, over `Explicit` axes when the caller also
-///      places a dimension along a manual axis, or the absence of a sharding) is reconciled with a placement-only
-///      `broadcast`, which preserves the manual variation and reduction state.
+///   2. The remaining placement difference (i.e., over manual axes, over `Explicit` axes when the caller also places
+///      a dimension along a manual axis, or the absence of a sharding) is reconciled with a placement-only `broadcast`,
+///      which preserves the manual variation and reduction state.
 ///   3. A memory kind difference is undone with `transfer_to_memory` into the caller's memory kind.
 ///
 /// # Errors
@@ -6778,7 +6779,6 @@ where
         {
             let target_placement = match target_array.sharding() {
                 Some(sharding) => sharding
-                    .without_auto_axes()
                     .without_manual_reduction_axes()
                     .with_varying_manual_axes(Vec::<String>::new())
                     .map_err(TypeError::from)?,
@@ -23703,9 +23703,10 @@ mod tests {
     }
 
     #[test]
-    fn test_shard_map_transposition_keeps_auto_axis_placements_untracked() {
-        // A caller placement over an auto axis is untracked, so it is not a `reshard` target: the assembled cotangent
-        // is re-placed along the auto axis `y` with a placement-only `broadcast` only.
+    fn test_shard_map_transposition_over_meshes_with_auto_axes() {
+        // Array types never place dimensions over auto axes, so a caller type on a mesh with the auto axis `y` places
+        // nothing along it, no `reshard` is needed, and the assembled cotangent is re-placed with a placement-only
+        // `broadcast` only.
         let mesh = LogicalMesh::new(vec![
             MeshAxis::new("x", 2, MeshAxisType::Manual).unwrap(),
             MeshAxis::new("y", 2, MeshAxisType::Auto).unwrap(),
@@ -23713,6 +23714,11 @@ mod tests {
         .unwrap();
         let along_x = Sharding::new(mesh.clone(), vec![ShardingDimension::sharded(["x"])]).unwrap();
         let along_y = Sharding::new(mesh.clone(), vec![ShardingDimension::sharded(["y"])]).unwrap();
+        assert_eq!(
+            f32_vector_type(8).with_sharding(along_y.clone()),
+            Err(ShardingError::AutoAxisInArrayType { sharding: along_y }),
+        );
+        let replicated_type = f32_vector_type(8).with_sharding(Sharding::replicated(mesh.clone(), 1)).unwrap();
         let program = trace_test_program(
             |inputs| {
                 let input = inputs[0].clone();
@@ -23728,14 +23734,13 @@ mod tests {
                     .unwrap(),
                 ]
             },
-            vec![f32_vector_type(8).with_sharding(along_y.clone()).unwrap()],
+            vec![replicated_type.clone()],
             Vec::new(),
         );
         let global_type = f32_vector_type(8).with_sharding(along_x.clone()).unwrap();
         let local_type = f32_vector_type(4)
             .with_sharding(Sharding::replicated(mesh.clone(), 1).with_varying_manual_axes(["x"]).unwrap())
             .unwrap();
-        let along_y_type = f32_vector_type(8).with_sharding(along_y).unwrap();
         assert_eq!(
             program.transpose_with_respect_to(&[0], &[CotangentDestinationKind::Return]).unwrap().to_string(),
             formatdoc! {"
@@ -23753,8 +23758,8 @@ mod tests {
                         in (%0)
                     }},
                 ]
-                    %2:{along_y_type} = broadcast [
-                        output_type={along_y_type},
+                    %2:{replicated_type} = broadcast [
+                        output_type={replicated_type},
                         output_axes=[0],
                     ] %1
                 in (%2)"},
@@ -26437,9 +26442,7 @@ mod tests {
         // A caller that types `x` as auto receives outputs typed over the mesh of the map instead, since types over its
         // mesh could not record their placement along `x`, which JAX's types omit and closed function signatures need.
         let auto_mesh = LogicalMesh::new(vec![MeshAxis::new("x", 2, MeshAxisType::Auto).unwrap()]).unwrap();
-        let auto_type = f32_vector_type(8)
-            .with_sharding(Sharding::new(auto_mesh, vec![ShardingDimension::sharded(["x"])]).unwrap())
-            .unwrap();
+        let auto_type = f32_vector_type(8).with_sharding(Sharding::replicated(auto_mesh, 1)).unwrap();
         let program = trace_test_program(
             |inputs| {
                 vec![

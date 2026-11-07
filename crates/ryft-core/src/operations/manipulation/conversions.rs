@@ -102,7 +102,6 @@ use crate::operations::Capability;
 use crate::operations::arithmetic::AddOperation;
 use crate::operations::dimensions::dimension_size::DimensionSizeOperation;
 use crate::operations::manipulation::transposition::Transpose;
-use crate::operations::sharding::constrain_sharding::CONSTRAIN_SHARDING_OPERATION_NAME;
 use crate::partial::{
     PartialEvaluationContext, PartialEvaluationDriver, PartialEvaluationValue, PartialValue,
     PartiallyEvaluatableOperation,
@@ -1018,17 +1017,18 @@ pub const CAST_OPERATION_NAME: &str = "cast";
 /// types, rank and memory space. Layout may change, as long as the requested layout addresses the output shape (refer
 /// to [`ArrayType::validate_layout`]), and so may placement over [`MeshAxisType::Explicit`] mesh axes under the rules
 /// of [`ReshardOperation`](crate::ReshardOperation): the output requests their new representation. Placement over
-/// [`MeshAxisType::Auto`] and [`MeshAxisType::Manual`] axes is preserved, since the former belongs to backend compilers
-/// (refer to [`ConstrainShardingOperation`](crate::ConstrainShardingOperation)) and the latter only changes through
-/// manual collectives, and so are manual variation and reduction state. The axes that shard a dimension are ordered
-/// from major to minor, so the axes up to and including an auto or manual axis determine which block of the dimension
-/// each of its shards holds. Each dimension therefore keeps its axes up to and including its last auto or manual axis,
-/// and only explicit axes minor to all of them may be added, removed, or reordered (e.g., `[m, x]` may become `[m]` or
-/// `[m, y]` but not `[x, m]`). Since axis sizes fix those blocks, every mesh axis in such a preserved prefix keeps its
-/// definition (i.e., its size and type) in the output mesh, explicit axes included (e.g., an explicit `x` in `[x, a]`
-/// over an auto `a` cannot change its size), and so does every mesh axis that carries manual variation or reduction
-/// state. Explicit axes may therefore be redefined or dropped only when they are minor to every auto and manual axis in
-/// each dimension and carry no such state. Further inputs act as _witnesses_, meaning values whose types make output
+/// [`MeshAxisType::Manual`] axes is preserved, since it only changes through manual collectives, and so are manual
+/// variation and reduction state. Array types never record placement over [`MeshAxisType::Auto`] axes (refer to
+/// [`ArrayType::with_sharding`]), which belongs to backend compilers and is constrained through
+/// [`ConstrainShardingOperation`](crate::ConstrainShardingOperation) instead. The axes that shard a dimension are
+/// ordered from major to minor, so the axes up to and including a manual axis determine which block of the dimension
+/// each of its shards holds. Each dimension therefore keeps its axes up to and including its last manual axis, and only
+/// explicit axes minor to all of them may be added, removed, or reordered (e.g., `[m, x]` may become `[m]` or `[m, y]`
+/// but not `[x, m]`). Since axis sizes fix those blocks, every mesh axis in such a preserved prefix keeps its
+/// definition (i.e., its size and type) in the output mesh, explicit axes included (e.g., an explicit `x` in `[x, m]`
+/// over a manual `m` cannot change its size), and so does every mesh axis that carries manual variation or reduction
+/// state. Explicit axes may therefore be redefined or dropped only when they are minor to every manual axis in each
+/// dimension and carry no such state. Further inputs act as _witnesses_, meaning values whose types make output
 /// identities available to the instruction (e.g., a value of type `f32[n]` lets `f32[2]` widen to `f32[n]`). Witnesses
 /// carry no derivatives. Every output identity must occur in an input declaration, and the output type may not define
 /// an identity. First-class dimension types define their names, so casts of dimension values can only target static
@@ -1880,7 +1880,7 @@ impl CastType for ArrayIrType {
                 let Self::Array(declared) = &operation.input_types[0] else { unreachable!() };
 
                 // Arrays preserve the input value properties and static extents. Layout and explicit placement may
-                // change, while auto/manual placement, manual variation, and reduction state remain constrained.
+                // change, while manual placement, manual variation, and reduction state remain constrained.
                 if declared.unreduced_axes() != input.unreduced_axes()
                     || declared.unreduced_kind() != input.unreduced_kind()
                     || declared.reduced_axes() != input.reduced_axes()
@@ -1925,55 +1925,44 @@ impl CastType for ArrayIrType {
                 }
 
                 // Placement follows the rules of `reshard` (i.e., the type system tracks placement over explicit
-                // mesh axes, so the output may request a new one, whereas placement over auto axes belongs to backend
-                // compilers and transitions over manual axes require manual collectives). The output therefore names
-                // the same auto and manual axes as the input on every dimension, in the same position relative to the
-                // explicit axes (refer to the check below). Carrying them forward requests no redistribution, and an
-                // output without a sharding stays untracked rather than requesting replication.
+                // mesh axes, so the output may request a new one, whereas transitions over manual axes require manual
+                // collectives). The output therefore names the same manual axes as the input on every dimension, in
+                // the same position relative to the explicit axes (refer to the check below). Carrying them forward
+                // requests no redistribution, and an output without a sharding stays untracked rather than requesting
+                // replication. Neither type places a dimension over auto mesh axes, because array types cannot record
+                // such placement (refer to `ArrayType::with_sharding`), so no auto placement needs to be preserved.
                 if let Some(output_sharding) = output.sharding() {
-                    let named_axes = |sharding: &Sharding, dimension: usize, axis_type: MeshAxisType| match &sharding
-                        .dimensions()[dimension]
-                    {
+                    let manual_axes = |sharding: &Sharding, dimension: usize| match &sharding.dimensions()[dimension] {
                         ShardingDimension::Sharded(axis_names) => axis_names
                             .iter()
-                            .filter(|name| sharding.mesh().axis_type(name) == Some(axis_type))
+                            .filter(|name| sharding.mesh().axis_type(name) == Some(MeshAxisType::Manual))
                             .cloned()
                             .collect::<Vec<_>>(),
                         ShardingDimension::Replicated | ShardingDimension::Unconstrained => Vec::new(),
                     };
 
-                    for (axis_type, remedy) in [
-                        (
-                            MeshAxisType::Auto,
-                            format!("use `{CONSTRAIN_SHARDING_OPERATION_NAME}` to constrain placement over them"),
-                        ),
-                        (MeshAxisType::Manual, "use manual collectives for transitions over them".to_owned()),
-                    ] {
-                        if (0..output.rank()).any(|dimension| {
-                            named_axes(output_sharding, dimension, axis_type)
-                                != input
-                                    .sharding()
-                                    .map(|sharding| named_axes(sharding, dimension, axis_type))
-                                    .unwrap_or_default()
-                        }) {
-                            return Err(TypeError::invalid(format!(
-                                "`{CAST_OPERATION_NAME}` cannot change placement over {axis_type} mesh axes; {remedy}",
-                            )));
-                        }
+                    if (0..output.rank()).any(|dimension| {
+                        manual_axes(output_sharding, dimension)
+                            != input.sharding().map(|sharding| manual_axes(sharding, dimension)).unwrap_or_default()
+                    }) {
+                        return Err(TypeError::invalid(format!(
+                            "`{CAST_OPERATION_NAME}` cannot change placement over manual mesh axes; use manual \
+                             collectives for transitions over them",
+                        )));
                     }
 
-                    // Comparing names per axis type is not sufficient, because the axes that shard a dimension are
-                    // ordered from major to minor: the sizes of all axes up to and including an auto or manual axis
-                    // determine which block of the dimension each of its shards holds. Reordering those axes, or
-                    // adding or removing an explicit axis major to one of them, would move data between auto or manual
-                    // shards (i.e., perform an implicit collective). Each dimension must therefore keep its axes up to
-                    // and including its last auto or manual axis, and only explicit axes minor to them may change.
+                    // Comparing manual axis names is not sufficient, because the axes that shard a dimension are
+                    // ordered from major to minor: the sizes of all axes up to and including a manual axis determine
+                    // which block of the dimension each of its shards holds. Reordering those axes, or adding or
+                    // removing an explicit axis major to one of them, would move data between manual shards (i.e.,
+                    // perform an implicit collective). Each dimension must therefore keep its axes up to and including
+                    // its last manual axis, and only explicit axes minor to them may change.
                     fn preserved_prefix(sharding: &Sharding, dimension: usize) -> &[String] {
                         match &sharding.dimensions()[dimension] {
                             ShardingDimension::Sharded(axis_names) => {
                                 let end = axis_names
                                     .iter()
-                                    .rposition(|name| sharding.mesh().axis_type(name) != Some(MeshAxisType::Explicit))
+                                    .rposition(|name| sharding.mesh().axis_type(name) == Some(MeshAxisType::Manual))
                                     .map_or(0, |index| index + 1);
                                 &axis_names[..end]
                             }
@@ -1989,19 +1978,19 @@ impl CastType for ArrayIrType {
                                 .unwrap_or_default()
                     }) {
                         return Err(TypeError::invalid(format!(
-                            "`{CAST_OPERATION_NAME}` cannot change the mesh axes up to the last auto or manual mesh \
-                             axis of dimension {dimension}; only explicit mesh axes minor to every auto and manual \
-                             axis may change",
+                            "`{CAST_OPERATION_NAME}` cannot change the mesh axes up to the last manual mesh \
+                             axis of dimension {dimension}; only explicit mesh axes minor to every manual axis may \
+                             change",
                         )));
                     }
 
                     // The checks above compare axis names only, but the size and type of a mesh axis are semantic:
                     // the sizes of all axes in the preserved prefix of a dimension, explicit axes included, fix the
-                    // blocks of its auto and manual shards. Every axis in such a prefix, and every axis of any type
-                    // that carries manual variation or reduction state, must therefore keep its definition. An
-                    // explicit axis is exempt only when it is minor to every auto and manual axis of each dimension
-                    // that it shards and carries no such state. The output mesh may still add or drop other axes
-                    // (e.g., to request an explicit redistribution).
+                    // blocks of its manual shards. Every axis in such a prefix, and every axis of any type that
+                    // carries manual variation or reduction state, must therefore keep its definition. An explicit
+                    // axis is exempt only when it is minor to every manual axis of each dimension that it shards and
+                    // carries no such state. The output mesh may still add or drop other axes (e.g., to request an
+                    // explicit redistribution).
                     if let Some(input_sharding) = input.sharding() {
                         let input_mesh = input_sharding.mesh();
                         let output_mesh = output_sharding.mesh();
@@ -2258,7 +2247,7 @@ impl CastType for ArrayIrType {
 /// relationship in staged and compiled programs too, whereas [`cast_unchecked`](Self::cast_unchecked) assumes it there.
 ///
 /// Placement over explicit mesh axes may change under the rules of [`Reshard`](crate::Reshard), whereas placement
-/// over auto and manual mesh axes is preserved (refer to [`CastOperation`]). The XLA backend requires finite dimension
+/// over manual mesh axes is preserved (refer to [`CastOperation`]). The XLA backend requires finite dimension
 /// bounds when changing physical allocation bounds, and constrains placement only when the explicit placement changes.
 ///
 /// The universe parameter `T` defaults to the [`Capability`] universe of the implementor, so that homogeneous array
@@ -2454,8 +2443,8 @@ mod tests {
         Array, ArrayBatch, ArrayElement, ArrayIrBatch, ArrayIrOperation, ArrayIrValue, ArrayOperation, ArrayReference,
         ArrayType, DataType, Dimension, DimensionBounds, DimensionError, DimensionType, DimensionValue,
         DimensionVariable, Layout, LogicalMesh, MAX_DIMENSION_EXTENT, Memory, MeshAxis, MeshAxisType, Shape, Sharding,
-        ShardingDimension, StridedLayout, Tile, TileDimension, TiledLayout, UnreducedKind, bf16, f8e4m3fn, f8e5m2,
-        f8e8m0fnu, i4, u2, u4,
+        ShardingDimension, ShardingError, StridedLayout, Tile, TileDimension, TiledLayout, UnreducedKind, bf16,
+        f8e4m3fn, f8e5m2, f8e8m0fnu, i4, u2, u4,
     };
     use crate::batching::{BatchAxis, BatchedProgram, BatchingTracer, ProgramBatchingOutputAxesPolicy};
     use crate::captures::CaptureReference;
@@ -4767,8 +4756,8 @@ mod tests {
             "`cast` cannot change placement over manual mesh axes; use manual collectives for transitions over them",
         );
         let order_error = TypeError::invalid(
-            "`cast` cannot change the mesh axes up to the last auto or manual mesh axis of dimension 0; only explicit \
-             mesh axes minor to every auto and manual axis may change",
+            "`cast` cannot change the mesh axes up to the last manual mesh axis of dimension 0; only explicit \
+             mesh axes minor to every manual axis may change",
         );
         let cases = [
             (plain.clone(), placed([sharded(&["x"]), replicated()]), Ok(())),

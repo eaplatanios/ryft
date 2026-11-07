@@ -4091,9 +4091,10 @@ fn validate_update_slice_inputs(
 
 /// Computes the output [`Sharding`] for an in-place update (i.e., [`UpdateSlice`] or [`DynamicUpdateSlice`]).
 /// Because the update is written into the input without resharding, the two must agree on placement and reduction state
-/// wherever an [`MeshAxisType::Explicit`] mesh axis is involved. Differences confined to [`MeshAxisType::Manual`] and
-/// [`MeshAxisType::Auto`] axes are tolerated (i.e., are left to the underlying backend). Manual variation must already
-/// match after forward input alignment. The output keeps the input's sharding.
+/// wherever an [`MeshAxisType::Explicit`] mesh axis is involved. Differences confined to [`MeshAxisType::Manual`] axes
+/// are tolerated (i.e., are left to the underlying backend), and types never record placement over
+/// [`MeshAxisType::Auto`] axes. Manual variation must already match after forward input alignment. The output keeps
+/// the input's sharding.
 fn infer_update_slice_output_sharding(
     operation_name: &'static str,
     input: &ArrayType,

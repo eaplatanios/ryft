@@ -21,7 +21,7 @@ use crate::operations::control_flow::scan::{ScanOperation, ScanType};
 use crate::parameters::{Parameter, Parameterized, ParameterizedFamily};
 use crate::partial::{PartialEvaluationContext, PartialValue, PartiallyEvaluatableOperation};
 use crate::programs::{MaybeZero, Operation, ProgramError, ReferenceMemberType, Type, TypeError, Typed, Value};
-use crate::tracing::{DomainTracingContext, TracingContext};
+use crate::tracing::{DomainTracingContext, TracingContext, TracingScope};
 
 #[cfg(doc)]
 use crate::operations::composites::builders::{Composite, composite};
@@ -127,11 +127,10 @@ where
                 let input_count = input_types.parameter_count();
                 let input_tangent_types = input_types.clone().try_map_parameters(|r#type| r#type.tangent())?;
                 let ((output_types, tangent_types), program) =
-                    DomainTracingContext::<EagerContext<V, O>>::trace_with_named_axes_and_default_mesh(
+                    DomainTracingContext::<EagerContext<V, O>>::trace_in_scope(
                         |(x, t)| jvp(x, t),
                         (input_types, input_tangent_types),
-                        named_axes,
-                        default_mesh,
+                        TracingScope::new(named_axes, default_mesh),
                     )?;
 
                 // Matching flat types cannot establish the nested output and tangent structures.
@@ -304,73 +303,71 @@ where
                     .map(|(r#type, _)| r#type.clone())
                     .collect::<Vec<_>>();
                 let mut output_tangent_zeros = None;
-                let ((output_types, _), program) =
-                    DomainTracingContext::<EagerContext<V, O>>::trace_with_named_axes_and_default_mesh(
-                        |(inputs, active_tangents): (Input, Vec<CustomRuleTracer<V, O>>)| {
-                            let mut active_tangents = active_tangents.into_iter();
-                            let leaves = tangent_types.iter().enumerate().map(|(index, r#type)| {
-                                let active = index
-                                    .checked_sub(non_differentiated_count)
-                                    .is_some_and(|index| tangent_activity[index]);
-                                match active {
-                                    true => MaybeZero::Value(active_tangents.next().unwrap()),
-                                    false => MaybeZero::Zero(r#type.clone()),
-                                }
-                            });
-                            let (outputs, output_tangents) = jvp(
-                                inputs,
-                                Input::To::<MaybeZero<CustomRuleTracer<V, O>>>::from_parameters(
-                                    input_structure.clone(),
-                                    leaves,
-                                )?,
-                            )?;
-                            let output_tangent_structure = output_tangents.parameter_structure();
-                            if &output_tangent_structure != output_structure {
-                                return Err(TypeError::invalid(format!(
-                                    "{} JVP rule output tangent structure mismatch: expected {:?} but got {:?}",
-                                    describe_composite(COMPOSITE_OPERATION_NAME, name),
-                                    output_structure,
-                                    output_tangent_structure,
-                                ))
-                                .into());
+                let ((output_types, _), program) = DomainTracingContext::<EagerContext<V, O>>::trace_in_scope(
+                    |(inputs, active_tangents): (Input, Vec<CustomRuleTracer<V, O>>)| {
+                        let mut active_tangents = active_tangents.into_iter();
+                        let leaves = tangent_types.iter().enumerate().map(|(index, r#type)| {
+                            let active = index
+                                .checked_sub(non_differentiated_count)
+                                .is_some_and(|index| tangent_activity[index]);
+                            match active {
+                                true => MaybeZero::Value(active_tangents.next().unwrap()),
+                                false => MaybeZero::Zero(r#type.clone()),
                             }
+                        });
+                        let (outputs, output_tangents) = jvp(
+                            inputs,
+                            Input::To::<MaybeZero<CustomRuleTracer<V, O>>>::from_parameters(
+                                input_structure.clone(),
+                                leaves,
+                            )?,
+                        )?;
+                        let output_tangent_structure = output_tangents.parameter_structure();
+                        if &output_tangent_structure != output_structure {
+                            return Err(TypeError::invalid(format!(
+                                "{} JVP rule output tangent structure mismatch: expected {:?} but got {:?}",
+                                describe_composite(COMPOSITE_OPERATION_NAME, name),
+                                output_structure,
+                                output_tangent_structure,
+                            ))
+                            .into());
+                        }
 
-                            // Only the live output tangents become program outputs, while each structural zero must
-                            // have the tangent type of its output, because the replay reinserts it with that type.
-                            let mut zeros = Vec::new();
-                            let mut live_output_tangents = Vec::new();
-                            for (index, (output, tangent)) in
-                                outputs.parameters().zip(output_tangents.into_parameters()).enumerate()
-                            {
-                                match tangent {
-                                    MaybeZero::Value(tangent) => {
-                                        zeros.push(false);
-                                        live_output_tangents.push(tangent);
-                                    }
-                                    MaybeZero::Zero(r#type) => {
-                                        let expected = output.r#type().tangent()?;
-                                        if r#type != expected {
-                                            return Err(TypeError::invalid(format!(
-                                                "{} JVP rule returned a structural-zero tangent of type `{}` \
+                        // Only the live output tangents become program outputs, while each structural zero must
+                        // have the tangent type of its output, because the replay reinserts it with that type.
+                        let mut zeros = Vec::new();
+                        let mut live_output_tangents = Vec::new();
+                        for (index, (output, tangent)) in
+                            outputs.parameters().zip(output_tangents.into_parameters()).enumerate()
+                        {
+                            match tangent {
+                                MaybeZero::Value(tangent) => {
+                                    zeros.push(false);
+                                    live_output_tangents.push(tangent);
+                                }
+                                MaybeZero::Zero(r#type) => {
+                                    let expected = output.r#type().tangent()?;
+                                    if r#type != expected {
+                                        return Err(TypeError::invalid(format!(
+                                            "{} JVP rule returned a structural-zero tangent of type `{}` \
                                              for output {}, whose tangent type is `{}`",
-                                                describe_composite(COMPOSITE_OPERATION_NAME, name),
-                                                r#type,
-                                                index,
-                                                expected,
-                                            ))
-                                            .into());
-                                        }
-                                        zeros.push(true);
+                                            describe_composite(COMPOSITE_OPERATION_NAME, name),
+                                            r#type,
+                                            index,
+                                            expected,
+                                        ))
+                                        .into());
                                     }
+                                    zeros.push(true);
                                 }
                             }
-                            output_tangent_zeros = Some(zeros);
-                            Ok((outputs, live_output_tangents))
-                        },
-                        (input_types, active_tangent_types),
-                        named_axes,
-                        default_mesh,
-                    )?;
+                        }
+                        output_tangent_zeros = Some(zeros);
+                        Ok((outputs, live_output_tangents))
+                    },
+                    (input_types, active_tangent_types),
+                    TracingScope::new(named_axes, default_mesh),
+                )?;
                 let output_type_structure = output_types.parameter_structure();
                 if &output_type_structure != output_structure {
                     return Err(TypeError::invalid(format!(
@@ -554,30 +551,28 @@ where
 
                     // Keep the non-differentiated inputs as unused leading program inputs. The backward
                     // closure obtains required primal values from its residuals.
-                    let (_, program) =
-                        DomainTracingContext::<EagerContext<V, O>>::trace_with_named_axes_and_default_mesh(
-                            |(_, residuals, cotangents): (Vec<CustomRuleTracer<V, O>>, Residual, Output)| {
-                                let cotangents = backward(residuals, cotangents)?;
+                    let (_, program) = DomainTracingContext::<EagerContext<V, O>>::trace_in_scope(
+                        |(_, residuals, cotangents): (Vec<CustomRuleTracer<V, O>>, Residual, Output)| {
+                            let cotangents = backward(residuals, cotangents)?;
 
-                                // Check the full input structure before dropping the non-differentiated prefix.
-                                // Otherwise, a misplaced cotangent could silently become the derivative of a different
-                                // input with the same leaf type.
-                                let cotangent_structure = cotangents.parameter_structure();
-                                if &cotangent_structure != input_structure {
-                                    return Err(TypeError::invalid(format!(
-                                        "{} backward rule cotangent structure mismatch: expected {:?} but got {:?}",
-                                        describe_composite(COMPOSITE_OPERATION_NAME, name),
-                                        input_structure,
-                                        cotangent_structure,
-                                    ))
-                                    .into());
-                                }
-                                Ok(cotangents.into_parameters().skip(non_differentiated_count).collect::<Vec<_>>())
-                            },
-                            (non_differentiated_types, residual_types, output_cotangent_types),
-                            named_axes,
-                            default_mesh,
-                        )?;
+                            // Check the full input structure before dropping the non-differentiated prefix.
+                            // Otherwise, a misplaced cotangent could silently become the derivative of a different
+                            // input with the same leaf type.
+                            let cotangent_structure = cotangents.parameter_structure();
+                            if &cotangent_structure != input_structure {
+                                return Err(TypeError::invalid(format!(
+                                    "{} backward rule cotangent structure mismatch: expected {:?} but got {:?}",
+                                    describe_composite(COMPOSITE_OPERATION_NAME, name),
+                                    input_structure,
+                                    cotangent_structure,
+                                ))
+                                .into());
+                            }
+                            Ok(cotangents.into_parameters().skip(non_differentiated_count).collect::<Vec<_>>())
+                        },
+                        (non_differentiated_types, residual_types, output_cotangent_types),
+                        TracingScope::new(named_axes, default_mesh),
+                    )?;
                     program.into_flat_program()
                 };
                 let mut values = leading_inputs.to_vec();
@@ -712,58 +707,56 @@ where
 
                     // Keep non-differentiated inputs in the boundary even though the closure receives only
                     // residuals and cotangent seeds.
-                    let (_, program) =
-                        DomainTracingContext::<EagerContext<V, O>>::trace_with_named_axes_and_default_mesh(
-                            |(_, residuals, live_seeds): (
-                                Vec<CustomRuleTracer<V, O>>,
-                                Residual,
-                                Vec<CustomRuleTracer<V, O>>,
-                            )| {
-                                let mut live_seeds = live_seeds.into_iter();
-                                let leaves = seeds.iter().map(|seed| match seed {
-                                    MaybeZero::Value(_) => MaybeZero::Value(live_seeds.next().unwrap()),
-                                    MaybeZero::Zero(r#type) => MaybeZero::Zero(r#type.clone()),
-                                });
-                                let seeds = Output::To::<MaybeZero<CustomRuleTracer<V, O>>>::from_parameters(
-                                    output_structure.clone(),
-                                    leaves,
-                                )?;
-                                let cotangents = backward(residuals, seeds)?;
+                    let (_, program) = DomainTracingContext::<EagerContext<V, O>>::trace_in_scope(
+                        |(_, residuals, live_seeds): (
+                            Vec<CustomRuleTracer<V, O>>,
+                            Residual,
+                            Vec<CustomRuleTracer<V, O>>,
+                        )| {
+                            let mut live_seeds = live_seeds.into_iter();
+                            let leaves = seeds.iter().map(|seed| match seed {
+                                MaybeZero::Value(_) => MaybeZero::Value(live_seeds.next().unwrap()),
+                                MaybeZero::Zero(r#type) => MaybeZero::Zero(r#type.clone()),
+                            });
+                            let seeds = Output::To::<MaybeZero<CustomRuleTracer<V, O>>>::from_parameters(
+                                output_structure.clone(),
+                                leaves,
+                            )?;
+                            let cotangents = backward(residuals, seeds)?;
 
-                                // Check the full input structure before dropping the non-differentiated prefix, as for
-                                // materialized seeds.
-                                let cotangent_structure = cotangents.parameter_structure();
-                                if &cotangent_structure != input_structure {
-                                    return Err(TypeError::invalid(format!(
-                                        "{} backward rule cotangent structure mismatch: expected {:?} but got {:?}",
-                                        describe_composite(COMPOSITE_OPERATION_NAME, name),
-                                        input_structure,
-                                        cotangent_structure,
-                                    ))
-                                    .into());
-                                }
+                            // Check the full input structure before dropping the non-differentiated prefix, as for
+                            // materialized seeds.
+                            let cotangent_structure = cotangents.parameter_structure();
+                            if &cotangent_structure != input_structure {
+                                return Err(TypeError::invalid(format!(
+                                    "{} backward rule cotangent structure mismatch: expected {:?} but got {:?}",
+                                    describe_composite(COMPOSITE_OPERATION_NAME, name),
+                                    input_structure,
+                                    cotangent_structure,
+                                ))
+                                .into());
+                            }
 
-                                // Only the live cotangents become program outputs, while the structural zeros are
-                                // recorded by type. This preserves symbolic zeros as in a JAX backward rule returning
-                                // `None` or `SymbolicZero`.
-                                let mut zeros = Vec::new();
-                                let mut live_cotangents = Vec::new();
-                                for cotangent in cotangents.into_parameters().skip(non_differentiated_count) {
-                                    match cotangent {
-                                        MaybeZero::Value(cotangent) => {
-                                            zeros.push(None);
-                                            live_cotangents.push(cotangent);
-                                        }
-                                        MaybeZero::Zero(r#type) => zeros.push(Some(r#type)),
+                            // Only the live cotangents become program outputs, while the structural zeros are
+                            // recorded by type. This preserves symbolic zeros as in a JAX backward rule returning
+                            // `None` or `SymbolicZero`.
+                            let mut zeros = Vec::new();
+                            let mut live_cotangents = Vec::new();
+                            for cotangent in cotangents.into_parameters().skip(non_differentiated_count) {
+                                match cotangent {
+                                    MaybeZero::Value(cotangent) => {
+                                        zeros.push(None);
+                                        live_cotangents.push(cotangent);
                                     }
+                                    MaybeZero::Zero(r#type) => zeros.push(Some(r#type)),
                                 }
-                                cotangent_zeros = Some(zeros);
-                                Ok(live_cotangents)
-                            },
-                            (non_differentiated_types, residual_types, live_seed_types),
-                            named_axes,
-                            default_mesh,
-                        )?;
+                            }
+                            cotangent_zeros = Some(zeros);
+                            Ok(live_cotangents)
+                        },
+                        (non_differentiated_types, residual_types, live_seed_types),
+                        TracingScope::new(named_axes, default_mesh),
+                    )?;
 
                     // The closure ran exactly once, so the structural zeros are always recorded.
                     (program.into_flat_program(), cotangent_zeros.unwrap())
@@ -1274,15 +1267,14 @@ where
             let default_mesh = default_mesh.clone();
             let mut residual_structure = None;
             let ((forward_output_types, residual_types), program) =
-                DomainTracingContext::<EagerContext<V, O>>::trace_with_named_axes_and_default_mesh(
+                DomainTracingContext::<EagerContext<V, O>>::trace_in_scope(
                     |input| {
                         let (outputs, residuals) = forward(input)?;
                         residual_structure = Some(residuals.parameter_structure());
                         Ok((outputs, residuals))
                     },
                     input_types,
-                    named_axes,
-                    default_mesh,
+                    TracingScope::new(named_axes, default_mesh),
                 )?;
 
             // Matching flat types cannot establish the nested output structure.

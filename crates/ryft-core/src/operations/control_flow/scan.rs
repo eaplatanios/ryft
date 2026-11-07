@@ -47,7 +47,7 @@ use std::sync::Arc;
 use crate::arrays::{
     Array, ArrayBatch, ArrayBatchingPolicy, ArrayExtentBatchingPolicy, ArrayIrBatch, ArrayIrBatchingPolicy,
     ArrayIrType, ArrayIrValue, ArrayMemberType, ArrayOperation, ArrayType, DataType, Dimension, DimensionMemberType,
-    DimensionType, DimensionVariable, MAX_DIMENSION_EXTENT, MeshAxisType, Shape, Sharding, ShardingDimension,
+    DimensionType, DimensionVariable, MAX_DIMENSION_EXTENT, Shape, Sharding, ShardingDimension,
 };
 use crate::axes::Axis;
 use crate::batching::{
@@ -515,9 +515,10 @@ pub trait ScanInterpretationDomain: Domain<Type: ScanType> {
     /// array of shape `[4, 2, 3]` returns `stack[2]`, an array of shape `[2, 3]`.
     ///
     /// Removing the leading axis preserves the sharding of the remaining axes and the stack's manual variation.
-    /// Placement of the removed axis over [`Auto`](MeshAxisType::Auto) or [`Manual`](MeshAxisType::Manual) mesh axes is
-    /// dropped without adding manual variation. Placement over [`Explicit`](MeshAxisType::Explicit) mesh axes must be
-    /// removed by resharding before the scan.
+    /// Placement of the removed axis over [`Manual`](crate::MeshAxisType::Manual) mesh axes is dropped without adding
+    /// manual variation. Placement over [`Explicit`](crate::MeshAxisType::Explicit) mesh axes must be removed by
+    /// resharding before the scan. Array types never record placement over [`Auto`](crate::MeshAxisType::Auto)
+    /// mesh axes (refer to [`ArrayType::with_sharding`]).
     ///
     /// A reference input is returned unchanged: the body receives the same reference to the whole stack, preserving
     /// allocation identity and aliasing. It uses its separate index input to select a view of that reference.
@@ -1021,7 +1022,7 @@ impl<T: ScanType> ScanOperation<T> {
     /// is dynamic. Carries keep their types, a reference stack keeps its type, and a stacked array gains the leading
     /// scan axis while keeping only the memory placement of its slice: scan input validation compares the slices of the
     /// actual stacks with the body input types, so a stack may carry any sharding whose slice the body admits (e.g.,
-    /// one whose scan axis is sharded over an `Auto` mesh axis). The iteration count shares its identity with every
+    /// one whose scan axis is sharded over a `Manual` mesh axis). The iteration count shares its identity with every
     /// carry or stack that the body declares with the iteration count's identity, so these types relate the iteration
     /// count to those inputs. Backends that check the entry of a scan whose body they inline (e.g., with a
     /// [`GuardOperation`]) and transform rules that remove or split the scan boundary relate the actual
@@ -3566,29 +3567,13 @@ fn validate_scan_iteration_count<T: ScanType>(
 }
 
 /// Returns the per-iteration slice type of a stacked scan value of type `stacked_type` whose scan axis is `axis`,
-/// together with the scan dimension. A placement over [`Auto`](MeshAxisType::Auto) mesh axes on the scan axis is
-/// only a hint for the compiler, so the slice drops it: each iteration reads a single position of that axis, and the
-/// compiler remains free to place the slice. A placement over [`Manual`](MeshAxisType::Manual) mesh axes only
-/// distributes the stack, so the slice drops it without varying along those axes (refer to
-/// [`ArrayType::without_dimension`]). A scan axis sharded over [`Explicit`](MeshAxisType::Explicit)
-/// mesh axes is rejected, because only an explicit reshard can remove an explicit placement.
+/// together with the scan dimension. A placement over [`Manual`](crate::MeshAxisType::Manual) mesh axes on the
+/// scan axis only distributes the stack, so the slice drops it without varying along those axes (refer to
+/// [`ArrayType::without_dimension`]). A scan axis sharded over [`Explicit`](crate::MeshAxisType::Explicit)
+/// mesh axes is rejected, because only an explicit reshard can remove an explicit placement. Array types never
+/// record placement over [`Auto`](crate::MeshAxisType::Auto) mesh axes (refer to [`ArrayType::with_sharding`]),
+/// so no other placement can occur on the scan axis.
 fn scan_slice_type(stacked_type: &ArrayType, axis: usize) -> Result<(ArrayType, Dimension), TypeError> {
-    let mut stacked_type = stacked_type.clone();
-    if let Some(sharding) = stacked_type.sharding()
-        && let Some(ShardingDimension::Sharded(axis_names)) = sharding.dimensions().get(axis)
-        && axis_names.iter().any(|name| sharding.mesh().axis_type(name) == Some(MeshAxisType::Auto))
-    {
-        let axis_names = axis_names
-            .iter()
-            .filter(|name| sharding.mesh().axis_type(name) != Some(MeshAxisType::Auto))
-            .cloned()
-            .collect::<Vec<_>>();
-        let mut dimensions = sharding.dimensions().to_vec();
-        dimensions[axis] =
-            if axis_names.is_empty() { ShardingDimension::Replicated } else { ShardingDimension::Sharded(axis_names) };
-        let sharding = sharding.with_dimensions(dimensions).map_err(|error| TypeError::invalid(error.to_string()))?;
-        stacked_type = stacked_type.with_sharding(sharding).map_err(|error| TypeError::invalid(error.to_string()))?;
-    }
     stacked_type.without_dimension(axis).map_err(|error| {
         TypeError::invalid(format!(
             "`{SCAN_OPERATION_NAME}` cannot slice a stacked value of type `{stacked_type}` along its scan axis \
@@ -3634,12 +3619,14 @@ fn scan_entry_guard<T: ScanType>(
 }
 
 /// Writes `value` as slice `iteration` of `stack` by prepending a unit axis to `value`. If `value` is sharded, the
-/// unit axis uses `axis_sharding` on the same mesh, retaining explicit and manual placement. An in-place update must
-/// agree with the stack on existing manual variation and explicit placement. Auto placement is a compiler hint that
-/// the update need not repeat and a reshape cannot request.
+/// unit axis uses `axis_sharding` on the same mesh, retaining explicit and manual placement, and a sharded unit axis
+/// is requested explicitly from the reshape. An in-place update must agree with the stack on existing manual variation
+/// and explicit placement. The expanded type never places the unit axis over
+/// [`Auto`](crate::arrays::MeshAxisType::Auto) mesh axes, because array types cannot record such placement (refer to
+/// [`ArrayType::with_sharding`]).
 ///
 /// The domains have different variation rules. A stack that starts unsharded may receive slices with mesh metadata
-/// under mixed auto/manual scan-axis sharding. The homogeneous writer's stricter checks would reject this case.
+/// (e.g., slices that vary over manual mesh axes). The homogeneous writer's stricter checks would reject this case.
 fn write_scan_iteration<V: Value<Type = ArrayType> + UpdateSlice + Reshape>(
     stack: V,
     iteration: usize,
@@ -3648,10 +3635,8 @@ fn write_scan_iteration<V: Value<Type = ArrayType> + UpdateSlice + Reshape>(
 ) -> Result<V, ProgramError> {
     let value_type = value.r#type().into_owned();
     let expanded_type = scan_stack_type(&value_type, 1, axis_sharding)?;
-    let requests_sharding = expanded_type.sharding().is_some_and(|sharding| {
-        matches!(axis_sharding, ShardingDimension::Sharded(axis_names)
-            if axis_names.iter().all(|name| sharding.mesh().axis_type(name) != Some(MeshAxisType::Auto)))
-    });
+    let requests_sharding =
+        expanded_type.sharding().is_some() && matches!(axis_sharding, ShardingDimension::Sharded(_));
     let expanded = if requests_sharding {
         value.reshape_with_output_sharding(expanded_type.shape().clone(), expanded_type.sharding().cloned())?
     } else {

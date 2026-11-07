@@ -3072,7 +3072,8 @@ mod tests {
 
     #[test]
     fn test_array_type_reshape_with_output_sharding() {
-        // Explicit output sharding can request a valid redistribution that inference would not choose.
+        // Explicit output sharding can request a valid redistribution that inference would not choose (i.e., inference
+        // keeps the placement on the major output dimension of the split).
         let mesh = LogicalMesh::new(vec![MeshAxis::new("x", 2, MeshAxisType::Explicit).unwrap()]).unwrap();
         let input_type = ArrayType::new(DataType::F32, Shape::new(vec![Dimension::Static(8)]))
             .with_sharding(Sharding::new(mesh.clone(), vec![ShardingDimension::sharded(["x"])]).unwrap())
@@ -3089,15 +3090,11 @@ mod tests {
                 .with_sharding(requested)
                 .unwrap()),
         );
-        let auto_mesh = LogicalMesh::new(vec![MeshAxis::new("x", 2, MeshAxisType::Auto).unwrap()]).unwrap();
-        let auto_input = ArrayType::new(DataType::F32, Shape::new(vec![Dimension::Static(8)]))
-            .with_sharding(Sharding::new(auto_mesh.clone(), vec![ShardingDimension::sharded(["x"])]).unwrap())
-            .unwrap();
         assert_eq!(
-            auto_input.reshape(Shape::new(vec![Dimension::Static(2), Dimension::Static(4)])),
+            input_type.reshape(Shape::new(vec![Dimension::Static(2), Dimension::Static(4)])),
             Ok(ArrayType::new(DataType::F32, Shape::new(vec![Dimension::Static(2), Dimension::Static(4)]))
                 .with_sharding(
-                    Sharding::new(auto_mesh, vec![ShardingDimension::sharded(["x"]), ShardingDimension::replicated()],)
+                    Sharding::new(mesh, vec![ShardingDimension::sharded(["x"]), ShardingDimension::replicated()])
                         .unwrap(),
                 )
                 .unwrap()),

@@ -446,7 +446,7 @@ mod tests {
     use crate::arrays::{
         Array, ArrayIrOperation, ArrayIrValue, ArrayOperation, ArrayReference, DataType, Dimension, DimensionBounds,
         DimensionType, DimensionValue, DimensionVariable, DynamicArrayExtentBatchingPolicy, LogicalMesh, MeshAxis,
-        Shape,
+        Shape, ShardingError,
     };
     use crate::batching::{BatchAxis, batch};
     use crate::contexts::{EagerContext, ProjectedContext, StagingContext};
@@ -565,23 +565,16 @@ mod tests {
         let tracked = Sharding::new(mesh.clone(), vec![ShardingDimension::unconstrained(); 3]).unwrap();
         assert_eq!(operation.lowered_sharding(&input_type.clone().with_sharding(tracked).unwrap()), Ok(constraint));
 
-        // Tracked placement over auto axes is the compiler's to decide and is overridden by the constraint.
-        let tracked = Sharding::new(
+        // Placement over auto axes is the compiler's to decide, so no tracked type can carry one for the constraint
+        // to override.
+        let auto_placement = Sharding::new(
             mesh.clone(),
             vec![ShardingDimension::replicated(), ShardingDimension::sharded(["a"]), ShardingDimension::replicated()],
         )
         .unwrap();
         assert_eq!(
-            operation.lowered_sharding(&input_type.clone().with_sharding(tracked).unwrap()),
-            Ok(Sharding::new(
-                mesh.clone(),
-                vec![
-                    ShardingDimension::sharded(["a"]),
-                    ShardingDimension::replicated(),
-                    ShardingDimension::unconstrained(),
-                ],
-            )
-            .unwrap()),
+            input_type.clone().with_sharding(auto_placement.clone()),
+            Err(ShardingError::AutoAxisInArrayType { sharding: auto_placement }),
         );
 
         // A tracked sharding on another mesh or of another rank cannot be merged.

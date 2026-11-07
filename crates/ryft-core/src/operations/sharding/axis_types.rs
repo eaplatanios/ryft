@@ -543,7 +543,7 @@ mod tests {
         ShardingDimension,
     };
     use crate::batching::{BatchAxis, batch};
-    use crate::differentiation::{CotangentDestinationKind, DifferentiableType, differentiate_at};
+    use crate::differentiation::{CotangentDestinationKind, differentiate_at};
     use crate::operations::arithmetic::{Add, Mul};
     use crate::operations::collectives::axis_index::AxisIndex;
     use crate::operations::collectives::parallel_all_gather::ParallelAllGather;
@@ -1779,35 +1779,12 @@ mod tests {
             ],
         );
 
-        // The JAX oracle places its input along both auto axes, which JAX types never record. A Ryft type may record
-        // such a placement (e.g., that of a concrete input). The transposition of the entry reshard cannot target auto
-        // axes, so it reshards only the explicit part and restores the auto placement with a placement-only broadcast,
-        // and the gradient has the input's cotangent type with the same values.
-        let placed_input_type = matrix_type(Some(sharding(&mesh, &[Some("x"), Some("y")])));
-        let gradient = differentiate_at(matrix(placed_input_type.sharding().cloned()))
-            .gradient(|input| {
-                Ok(explicit_axes(
-                    |input| input.cos()?.mul(&input)?.reduce_sum(&[0, 1], None),
-                    input,
-                    Some(&["x"]),
-                    sharding(&mesh, &[Some("x"), None]),
-                )?)
-            })
-            .unwrap();
-        assert_eq!(gradient.r#type().into_owned(), placed_input_type.cotangent().unwrap());
-        assert_eq!(gradient.r#type().sharding(), placed_input_type.sharding());
-        assert_close(
-            &gradient,
-            &[
-                1.0,
-                -0.30116868019104004,
-                -2.234741687774658,
-                -1.4133524894714355,
-                2.3735663890838623,
-                5.078283786773682,
-                2.6366631984710693,
-                -3.845003843307495,
-            ],
+        // The JAX oracle places its input along both auto axes, which array types never record (as JAX types do not),
+        // so the replicated input above stands in for it.
+        let auto_sharding = sharding(&mesh, &[Some("x"), Some("y")]);
+        assert_eq!(
+            ArrayType::new_static(DataType::F32, [4, 2]).with_sharding(auto_sharding.clone()),
+            Err(ShardingError::AutoAxisInArrayType { sharding: auto_sharding }),
         );
     }
 

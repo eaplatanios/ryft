@@ -521,7 +521,7 @@ mod tests {
     use crate::arrays::{
         Array, ArrayIrOperation, ArrayIrValue, ArrayOperation, ArrayReference, DataType, Dimension, DimensionBounds,
         DimensionType, DimensionValue, DimensionVariable, DynamicArrayExtentBatchingPolicy, LogicalMesh, MeshAxis,
-        Shape, UnreducedKind, f8e8m0fnu,
+        Shape, ShardingError, UnreducedKind, f8e8m0fnu,
     };
     use crate::batching::{BatchAxis, batch};
     use crate::contexts::{EagerContext, ProjectedContext, StagingContext};
@@ -756,9 +756,8 @@ mod tests {
     #[test]
     fn test_reshard_type_inference_reduction_state() {
         // A reshard changes placement but never reduction state: the target must restate the input's unreduced and
-        // reduced explicit axes exactly, reduction state over auto axes cannot be restated (the target cannot name auto
-        // axes) and is therefore rejected rather than dropped, and manual reduction state is carried forward without
-        // being restated.
+        // reduced explicit axes exactly, and manual reduction state is carried forward without being restated. Array
+        // types never carry reduction state over auto axes, so no input can require restating one.
         let mesh = LogicalMesh::new(vec![
             MeshAxis::new("x", 2, MeshAxisType::Explicit).unwrap(),
             MeshAxis::new("y", 2, MeshAxisType::Explicit).unwrap(),
@@ -772,8 +771,11 @@ mod tests {
         let with_sharding = |sharding: Sharding| input_type.clone().with_sharding(sharding).unwrap();
         let unreduced_input_type = with_sharding(replicated.clone().with_unreduced_axes(["x", "m"]).unwrap());
         let reduced_input_type = with_sharding(replicated.clone().with_reduced_axes(["x"]).unwrap());
-        let auto_unreduced_input_type = with_sharding(replicated.clone().with_unreduced_axes(["a"]).unwrap());
-        let auto_reduced_input_type = with_sharding(replicated.clone().with_reduced_axes(["a"]).unwrap());
+        let auto_unreduced = replicated.clone().with_unreduced_axes(["a"]).unwrap();
+        assert_eq!(
+            input_type.clone().with_sharding(auto_unreduced.clone()),
+            Err(ShardingError::AutoAxisInArrayType { sharding: auto_unreduced }),
+        );
         let error = format!(
             "`{RESHARD_OPERATION_NAME}` cannot change reduction state over explicit or auto mesh axes; use a reduction \
              (or the corresponding collective) instead",
@@ -839,12 +841,6 @@ mod tests {
                 error = error.clone(),
             }, {
                 input_types = [reduced_input_type],
-                error = error.clone(),
-            }, {
-                input_types = [auto_unreduced_input_type],
-                error = error.clone(),
-            }, {
-                input_types = [auto_reduced_input_type],
                 error = error,
             }],
         );

@@ -1974,8 +1974,8 @@ pub(crate) fn validate_common_mapped_dimension<V: Value<Type = ArrayType>>(
 ///   - Contracting dimensions sharded over explicit mesh axes on both inputs are an error. Identically sharded ones
 ///     make the output sharding ambiguous and require an explicit output sharding. A contracting dimension sharded on
 ///     only one input is allowed, and its sharding is dropped from the output.
-///   - Result dimension entries are copied from the owning input, and auto mesh axes are stripped from the final
-///     sharding.
+///   - Result dimension entries are copied from the owning input. Input types never place dimensions or reduction
+///     state over auto mesh axes (refer to [`ArrayType::with_sharding`]), so neither does the inferred sharding.
 pub(crate) fn infer_dot_output_type(
     operation_name: &str,
     lhs: &ArrayType,
@@ -2173,7 +2173,7 @@ pub(crate) fn infer_dot_output_type(
             let right = dimension_of(rhs_sharding, *rhs_axis);
 
             // Only explicit axis sharding of both contracting inputs triggers the ambiguity and consistency errors.
-            // Contracting shardings over only manual or auto axes are left to `shard_map` and the compiler.
+            // Contracting shardings over only manual axes are left to `shard_map`.
             // A contracting dimension sharded on only one input is allowed, and its sharding is dropped from
             // the output, because the partitioner inserts the necessary communication.
             if left.has_explicit_axis(mesh) && right.has_explicit_axis(mesh) {
@@ -2212,8 +2212,8 @@ pub(crate) fn infer_dot_output_type(
                 (ShardingDimension::Sharded(_), ShardingDimension::Sharded(_))
                     if left.has_explicit_axis(mesh) || right.has_explicit_axis(mesh) =>
                 {
-                    // Conflicts over an explicit axis are errors. Conflicts purely over manual or auto axes become
-                    // replicated and are left to `shard_map` and the compiler.
+                    // Conflicts over an explicit axis are errors. Conflicts purely over manual axes become replicated
+                    // and are left to `shard_map`.
                     return Err(TypeError::invalid(format!(
                         "`{operation_name}` batching dimensions must have consistent shardings, but got \
                              `{left}` and `{right}`",
@@ -2251,7 +2251,7 @@ pub(crate) fn infer_dot_output_type(
             .map_err(|error| {
                 TypeError::invalid(format!("`{operation_name}` output sharding construction failed: {error}"))
             })?;
-        Some(sharding.without_auto_axes())
+        Some(sharding)
     } else {
         None
     };

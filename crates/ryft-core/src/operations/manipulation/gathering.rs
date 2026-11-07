@@ -1689,7 +1689,9 @@ impl<Stored: Value<Type = ArrayType>> Gather<Stored> for ArrayType {
                 })
                 .collect();
 
-            // Gather preserves the input reduction state only with the invariant index contract checked above.
+            // Gather preserves the input reduction state only with the invariant index contract checked above. The
+            // placement comes from the input and index types, which never name auto mesh axes (refer to
+            // `ArrayType::with_sharding`), so neither does the inferred sharding.
             let map_sharding_error = |error| {
                 TypeError::invalid(format!("`{GATHER_OPERATION_NAME}` output sharding construction failed: {error}"))
             };
@@ -1703,7 +1705,7 @@ impl<Stored: Value<Type = ArrayType>> Gather<Stored> for ArrayType {
                 .map_err(&map_sharding_error)?
                 .with_varying_manual_axes(varying_manual_axes)
                 .map_err(map_sharding_error)?;
-            Some(sharding.without_auto_axes())
+            Some(sharding)
         } else {
             None
         };
