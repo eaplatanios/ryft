@@ -7,24 +7,19 @@ use std::sync::atomic::{AtomicU64, Ordering};
 use std::sync::{Arc, OnceLock};
 use std::time::{Duration, Instant};
 
-use crate::arrays::LogicalMesh;
-use crate::axes::{MeshContext, NamedAxes, NamedAxis};
+use crate::axes::{MeshContext, NamedAxes};
 use crate::captures::{CapturingContext, ClosedProgram, ImportingContext};
 use crate::compilation::domains::{CompilationDomain, DispatchPurpose, StatefulCompilationDomain};
 use crate::compilation::operations::StagedCallOperation;
 use crate::contexts::{Context, Domain, StagingContext};
 use crate::macros::{check_builders, check_count};
-use crate::operations::Constant;
 use crate::parameters::{Parameterized, ParameterizedFamily, Placeholder};
 use crate::programs::{
     AttachedRegions, FlatProgram, ProgramError, ReferenceCompletion, Type, TypeError, TypeRefinements, Typed,
     TypedProgram, Value, validate_reference_boundary,
 };
 use crate::specialization::{SpecializationCache, SpecializationCacheEntry};
-use crate::tracing::{DomainTracingContext, Tracer};
-
-/// Default number of compiled specializations retained by one [`CompiledFunctionDispatcher`].
-pub(super) const DEFAULT_JIT_CACHE_CAPACITY: usize = 256;
+use crate::tracing::{DomainTracingContext, Tracer, TracingScope};
 
 /// Tracer used while staging a compiled function in the operation universe of `C`.
 pub type CompilationTracer<C> = Tracer<DomainTracingContext<C, <C as Domain>::Value>>;
@@ -85,14 +80,14 @@ impl<C: CompilationDomain> StagedProgram<C> {
         DomainTracingContext<C, C::Value>:
             StagingContext<Type = C::Type, Constant = C::Constant, Operation = C::Operation>,
     {
-        Self::stage_with_named_axes_and_default_mesh(function, captures, input_types, options, Vec::new(), None)
+        Self::stage_in_scope(function, captures, input_types, options, TracingScope::default())
     }
 
-    /// Traces like [`Self::stage`] in the scope of `named_axes` and `default_mesh`, which the traced function resolves
-    /// as it would if it were inlined into a context that binds them (e.g., a named batching level or the manual
-    /// region of a `shard_map`). Use it to stage a function that is only ever called inside such a scope. A staged
-    /// program that reads a named axis cannot be lowered on its own, because nothing outside that scope binds the axis,
-    /// so it is meaningful only as the callee of a call in that scope, whose enclosing transforms resolve the axis.
+    /// Traces like [`Self::stage`] in `scope`, whose named axes and default mesh the traced function resolves as it
+    /// would if it were inlined into a context that binds them (e.g., a named batching level or the manual region of
+    /// a `shard_map`). Use it to stage a function that is only ever called inside such a scope. A staged program that
+    /// reads a named axis cannot be lowered on its own, because nothing outside that scope binds the axis, so it is
+    /// meaningful only as the callee of a call in that scope, whose enclosing transforms resolve the axis.
     ///
     /// # Parameters
     ///
@@ -100,19 +95,17 @@ impl<C: CompilationDomain> StagedProgram<C> {
     ///   - `captures`: Runtime values to register in the source program's capture table.
     ///   - `input_types`: Flat abstract public input signature.
     ///   - `options`: Options retained for lowering and compilation.
-    ///   - `named_axes`: Named axes in scope while tracing, in the order that [`NamedAxes::named_axes`] reports them.
-    ///   - `default_mesh`: Default mesh in scope while tracing. Refer to [`MeshContext`] for more information.
+    ///   - `scope`: [`TracingScope`] to trace in.
     ///
     /// # Errors
     ///
     /// Returns the same errors as [`Self::stage`].
-    pub fn stage_with_named_axes_and_default_mesh<F>(
+    pub fn stage_in_scope<F>(
         function: F,
         captures: Vec<C::Value>,
         input_types: Vec<C::Type>,
         options: C::Options,
-        named_axes: Vec<(String, NamedAxis)>,
-        default_mesh: Option<LogicalMesh>,
+        scope: TracingScope,
     ) -> Result<Self, C::Error>
     where
         F: FnOnce(
@@ -130,8 +123,7 @@ impl<C: CompilationDomain> StagedProgram<C> {
 
         // A fresh context isolates this trace. Runtime captures stay in its side table, while the program stores typed
         // references to their slots. The closure receives both those constant payloads and their tracers.
-        let context =
-            DomainTracingContext::<C, C::Value>::new().with_named_axes_and_default_mesh(named_axes, default_mesh);
+        let context = DomainTracingContext::<C, C::Value>::new().with_scope(scope);
         let capture_table = context.captures().clone();
         let builder = context.builder().clone();
         let capture_constants =
@@ -282,22 +274,21 @@ where
         DomainTracingContext<C, C::Value>:
             StagingContext<Type = C::Type, Constant = C::Constant, Operation = C::Operation>,
     {
-        Self::stage_with_named_axes_and_default_mesh(function, captures, input_types, options, Vec::new(), None)
+        Self::stage_in_scope(function, captures, input_types, options, TracingScope::default())
     }
 
-    /// Traces like [`Self::stage`] in the scope of `named_axes` and `default_mesh`. Refer to
-    /// [`StagedProgram::stage_with_named_axes_and_default_mesh`] for when to use it and for its parameters.
+    /// Traces like [`Self::stage`] in `scope`. Refer to [`StagedProgram::stage_in_scope`] for when to use it and for
+    /// its parameters.
     ///
     /// # Errors
     ///
     /// Returns the same errors as [`Self::stage`].
-    pub fn stage_with_named_axes_and_default_mesh<F>(
+    pub fn stage_in_scope<F>(
         function: F,
         captures: Vec<C::Value>,
         input_types: Input,
         options: C::Options,
-        named_axes: Vec<(String, NamedAxis)>,
-        default_mesh: Option<LogicalMesh>,
+        scope: TracingScope,
     ) -> Result<Self, C::Error>
     where
         Input::Family: ParameterizedFamily<CompilationTracer<C>>,
@@ -314,7 +305,7 @@ where
         // before flattening, and record the output structure while the closure still owns its structured results.
         let input_structure = input_types.parameter_structure();
         let mut output_structure = None;
-        let program = StagedProgram::<C>::stage_with_named_axes_and_default_mesh(
+        let program = StagedProgram::<C>::stage_in_scope(
             |capture_constants, capture_tracers, inputs| {
                 let inputs = Input::To::<CompilationTracer<C>>::from_parameters(input_structure.clone(), inputs)
                     .map_err(ProgramError::from)?;
@@ -325,8 +316,7 @@ where
             captures,
             input_types.into_parameters().collect(),
             options,
-            named_axes,
-            default_mesh,
+            scope,
         )?;
 
         // The inherent flat staging constructor invokes the closure exactly once on success, so it must have recorded
@@ -479,69 +469,6 @@ where
         let callee = self.callee_program()?;
         let operation =
             C::Operation::staged_call_with_types(capture_count, &callee.input_types(), &callee.output_types())?;
-        context.bind(operation, AttachedRegions::Callees(&[callee]), flat_inputs.as_slice())
-    }
-
-    /// Stages a call with flat `inputs` and returns flat outputs, using `capture_references` already registered in
-    /// the caller's capture table in this function's capture order. The first input supplies the active context. Use
-    /// [`Self::call_flat_with_capture_references_in_context`] when `inputs` is empty, because capture references carry
-    /// slot indices and types rather than a context.
-    #[inline]
-    pub fn call_flat_with_capture_references<V>(
-        &self,
-        capture_references: &[C::Constant],
-        inputs: Vec<V>,
-    ) -> Result<Vec<V>, ProgramError>
-    where
-        C::Operation: StagedCallOperation<C::Constant>,
-        V: Value<Type = C::Type>,
-        V::Domain: Context<Type = C::Type, Constant = C::Constant, Operation = C::Operation> + Constant<V, C::Constant>,
-    {
-        let context = inputs
-            .first()
-            .map(|input| input.domain())
-            .ok_or(ProgramError::InvalidInputCount { expected: 1, actual: 0 })?;
-        self.call_flat_with_capture_references_in_context(&context, capture_references, inputs)
-    }
-
-    /// Stages a call through `context` with flat `inputs` and outputs, reusing `capture_references` already registered
-    /// in that context's capture table in this function's capture order. Explicit context selection supports empty
-    /// `inputs`, including nullary and capture-only calls.
-    pub fn call_flat_with_capture_references_in_context<V, CallerContext>(
-        &self,
-        context: &CallerContext,
-        capture_references: &[C::Constant],
-        inputs: Vec<V>,
-    ) -> Result<Vec<V>, ProgramError>
-    where
-        C::Operation: StagedCallOperation<C::Constant>,
-        V: Value<Type = C::Type>,
-        CallerContext: Context<Type = C::Type, Value = V, Constant = C::Constant, Operation = C::Operation>
-            + Constant<V, C::Constant>,
-    {
-        // Capture-reference indices belong to the caller's capture table and may differ from the source program's
-        // local indices, and so only positional arity and types can be validated against the source program's
-        // encapsulated capture table.
-        let captures = self.source_program().captures();
-        check_count!("input", capture_references, captures.len(), ProgramError);
-        for (index, (expected, actual)) in captures.iter().zip(capture_references).enumerate() {
-            let expected_type = expected.r#type();
-            let actual_type = actual.r#type();
-            if expected_type.as_ref() != actual_type.as_ref() {
-                return Err(ProgramError::MalformedProgram(format!(
-                    "capture input #{index} has type {actual_type}, but capture #{index} has type {expected_type}",
-                )));
-            }
-        }
-        let mut flat_inputs = capture_references
-            .iter()
-            .cloned()
-            .map(|capture| context.constant(capture))
-            .collect::<Result<Vec<_>, _>>()?;
-        flat_inputs.extend(inputs);
-        let callee = self.callee_program()?;
-        let operation =
-            C::Operation::staged_call_with_types(captures.len(), &callee.input_types(), &callee.output_types())?;
         context.bind(operation, AttachedRegions::Callees(&[callee]), flat_inputs.as_slice())
     }
 
@@ -1099,7 +1026,7 @@ where
 /// specialization cache serves exactly one retained closure. That is why this key carries no fragile function-pointer
 /// identity.
 #[derive(Clone, Debug, PartialEq, Eq, Hash)]
-struct SpecializationKey<Static, Structure, Key> {
+struct ExecutableSpecializationKey<Static, Structure, Key> {
     /// Host values declared static for the keyed specialization, such as an axis number, mode enum, or boolean option.
     static_parameters: Static,
 
@@ -1110,8 +1037,8 @@ struct SpecializationKey<Static, Structure, Key> {
     dispatch_key: Key,
 }
 
-impl<Static, Structure, Key> SpecializationKey<Static, Structure, Key> {
-    /// Creates a new [`SpecializationKey`].
+impl<Static, Structure, Key> ExecutableSpecializationKey<Static, Structure, Key> {
+    /// Creates a new [`ExecutableSpecializationKey`].
     #[inline]
     fn new(static_parameters: Static, input_structure: Structure, dispatch_key: Key) -> Self {
         Self { static_parameters, input_structure, dispatch_key }
@@ -1130,15 +1057,14 @@ impl<Static, Structure, Key> SpecializationKey<Static, Structure, Key> {
     }
 }
 
-/// Key of one retained source specialization of a [`CompiledFunctionDispatcher`] (refer to
-/// [`CompiledFunctionDispatcher::call_in_context`]). A source specialization is a function of everything that
-/// [`SpecializationKey`] covers and also of the scope that the calling context gives the traced closure, because
-/// the closure resolves named axes and the default mesh against it. The input types are the staged types of a
-/// [`DispatchPurpose::Source`] signature (refer to [`CompilationDomain::dispatch_signature`]) rather than a dispatch
-/// key, because a source call is lowered and dispatched as part of its enclosing computation, so executable dispatch
-/// policies such as shape bucketing do not apply to it.
+/// Key of one retained staged specialization of a [`CompiledFunctionDispatcher`] (refer to
+/// [`CompiledFunctionDispatcher::call_in_context`]). Like [`ExecutableSpecializationKey`], it includes static
+/// parameters and input structure. It uses the effective staged input types and calling scope, because the closure
+/// resolves named axes and the default mesh against that scope. These types come from a [`DispatchPurpose::Staging`]
+/// signature (refer to [`CompilationDomain::dispatch_signature`]). The callee is lowered and dispatched as part of its
+/// enclosing computation, so executable dispatch policies such as shape bucketing do not apply to it.
 #[derive(Clone, PartialEq, Eq, Hash)]
-struct SourceSpecializationKey<Static, Structure, T> {
+struct StagedSpecializationKey<Static, Structure, T> {
     /// Host values declared static for the keyed specialization.
     static_parameters: Static,
 
@@ -1148,11 +1074,8 @@ struct SourceSpecializationKey<Static, Structure, T> {
     /// Effective staged input types.
     input_types: Vec<T>,
 
-    /// Named axes in scope in the calling context, in the order that [`NamedAxes::named_axes`] reports them.
-    named_axes: Vec<(String, NamedAxis)>,
-
-    /// Default mesh in scope in the calling context (refer to [`MeshContext`]).
-    default_mesh: Option<LogicalMesh>,
+    /// Scope of the calling context (i.e., its named axes and default mesh).
+    scope: TracingScope,
 }
 
 /// Retained Just-In-Time (JIT) compilation dispatcher that caches compiled specializations of one Rust closure.
@@ -1218,7 +1141,7 @@ struct SourceSpecializationKey<Static, Structure, T> {
 /// │ Invoke Rust Closure        ├──────▶│ `StagedFunction`   │   │ `CompiledFunction`          │
 /// └────────────────────────────┘       └──┬──────┬──────────┘   └─────────────────────────────┘
 ///     ┌┄┄┄┄┄┄┄┄┄┄┄┄┄┄┄┄┄┄┄┄┄┄┄┄┄┄┄┄┄┄┄┄┄┄┄┘      │ lower            ▲
-///     ▼ `call` inside an outer trace             ▼                  │ restore or compile
+///     ▼ `call` in an active context              ▼                  │ restore or compile
 /// ┌────────────────────────────┐       ┌────────────────────┐   ┌───┴─────────────────────────┐
 /// │ Nested Call Operation      │       │ `LoweredFunction`  ├──▶│ Shared `CompilationContext` │
 /// └────────────────────────────┘       └────────────────────┘   └─────────────────────────────┘
@@ -1226,6 +1149,26 @@ struct SourceSpecializationKey<Static, Structure, T> {
 ///
 /// The cache hit edge skips staging, lowering, and compilation. The dotted edge is the alternative staging path, along
 /// which a staged function becomes a nested call boundary instead of continuing immediately toward an executable.
+///
+/// Calls (i.e., [`Self::call`] and [`Self::call_in_context`]) never touch executables. They retain the staged
+/// functions themselves in a separate staged specialization cache, keyed by the abstract input types and the scope
+/// of the calling context, in which a miss traces the closure and inserts the staged function:
+///
+/// ```text
+/// ┌────────────────────────────────────────┐
+/// │ `CompiledFunctionDispatcher::call`     │
+/// └──────────────┬─────────────────────────┘
+///                │ static parameters, abstract input types, and calling scope
+///                ▼
+/// ┌──────────────────────────────┐           hit            ┌──────────────────────────────┐
+/// │ Staged Specialization Cache  ├─────────────────────────▶│ `StagedFunction`             │
+/// └──────────────┬───────────────┘                          └──────────────┬───────────────┘
+///                │ miss                                         ▲          │ `call_in_context`
+///                ▼                                              │ stage    ▼
+/// ┌──────────────────────────────┐                              │     ┌──────────────────────────────┐
+/// │ Invoke Rust Closure in Scope ├──────────────────────────────┘     │ Nested Call Operation        │
+/// └──────────────────────────────┘                                    └──────────────────────────────┘
+/// ```
 pub struct CompiledFunctionDispatcher<
     C: CompilationDomain<Type: Eq + Hash>,
     Static: Clone + Debug + Eq + Hash,
@@ -1280,8 +1223,8 @@ where
                 function,
                 options,
                 staged_input_types: None,
-                specializations: SpecializationCache::new(capacity),
-                sources: SpecializationCache::new(capacity),
+                executable_specializations: SpecializationCache::new(capacity),
+                staged_specializations: SpecializationCache::new(capacity),
                 statistics: DispatcherStatisticsAccumulator::default(),
             }),
         }
@@ -1346,16 +1289,16 @@ where
         &self.state.options
     }
 
-    /// Returns the number of compiled specializations currently retained by this dispatcher.
+    /// Returns the number of executable specializations currently retained by this dispatcher.
     #[inline]
-    pub fn specialization_count(&self) -> usize {
-        self.state.specializations.len()
+    pub fn executable_specialization_count(&self) -> usize {
+        self.state.executable_specializations.len()
     }
 
-    /// Returns the maximum number of compiled specializations retained by this dispatcher.
+    /// Returns the maximum number of specializations retained in each of this dispatcher's two caches.
     #[inline]
     pub fn cache_capacity(&self) -> usize {
-        self.state.specializations.capacity()
+        self.state.executable_specializations.capacity()
     }
 
     /// Returns a snapshot of this dispatcher's frontend activity.
@@ -1364,17 +1307,17 @@ where
         self.state.statistics.snapshot()
     }
 
-    /// Resets the statistics of this dispatcher and its clones without clearing compiled specializations.
+    /// Resets the statistics of this dispatcher and its clones without clearing either specialization cache.
     #[inline]
     pub fn clear_statistics(&self) {
         self.state.statistics.clear();
     }
 
-    /// Clears every retained executable and source specialization without changing statistics.
+    /// Clears every retained executable and staged specialization without changing statistics.
     #[inline]
     pub fn clear_cache(&self) {
-        self.state.specializations.clear();
-        self.state.sources.clear();
+        self.state.executable_specializations.clear();
+        self.state.staged_specializations.clear();
     }
 
     /// Executes a specialization with explicit host `static_parameters` and dynamic runtime `inputs`, compiling it
@@ -1403,7 +1346,7 @@ where
         DomainTracingContext<C, C::Value>:
             StagingContext<Type = C::Type, Constant = C::Constant, Operation = C::Operation>,
     {
-        let (domain, executable) = self.specialization(static_parameters, &inputs)?;
+        let (domain, executable) = self.executable_specialization(static_parameters, &inputs)?;
         executable.execute(domain, inputs)
     }
 
@@ -1436,7 +1379,7 @@ where
         DomainTracingContext<C, C::Value>:
             StagingContext<Type = C::Type, Constant = C::Constant, Operation = C::Operation>,
     {
-        let (domain, executable) = match self.specialization(static_parameters, &inputs) {
+        let (domain, executable) = match self.executable_specialization(static_parameters, &inputs) {
             Ok(specialization) => specialization,
             Err(error) => return StatefulExecution::ready(Err(error)),
         };
@@ -1472,7 +1415,7 @@ where
         DomainTracingContext<C, C::Value>:
             StagingContext<Type = C::Type, Constant = C::Constant, Operation = C::Operation>,
     {
-        let (domain, executable) = self.specialization(static_parameters, &inputs)?;
+        let (domain, executable) = self.executable_specialization(static_parameters, &inputs)?;
         executable.execute_statefully_and_wait(domain, inputs)
     }
 
@@ -1519,20 +1462,19 @@ where
     /// ordinary eager operation.
     ///
     /// On the first call for one static value, input structure, effective staged input type list, and calling scope,
-    /// the dispatcher traces its closure into a source specialization and retains it in a cache separate from its
-    /// executables. The calling scope consists of the named axes (refer to [`NamedAxes`]) and the default mesh (refer
-    /// to [`MeshContext`]) of `context`, and the closure is traced in that scope so that it resolves them as it would
-    /// if it were inlined. The effective staged input types are the abstract input types after the declarations of
-    /// [`Self::with_staged_input_types`] and the [`DispatchPurpose::Source`] signature of
-    /// [`CompilationDomain::dispatch_signature`], which need no domain instance, so a dispatcher
-    /// that infers its domain need not have selected one. Host side effects of the closure therefore
-    /// run once per source specialization. [`Self::clear_cache`] and [`Self::invalidate_specializations`]
-    /// remove source specializations together with executable ones.
+    /// the dispatcher traces its closure into a staged specialization and retains it in a cache separate from its
+    /// executables. The calling scope is the [`TracingScope`] of `context` (i.e., its named axes and default mesh),
+    /// and the closure is traced in that scope so that it resolves them as it would if it were inlined. The effective
+    /// staged input types are the abstract input types after the declarations of [`Self::with_staged_input_types`] and
+    /// the [`DispatchPurpose::Staging`] signature of [`CompilationDomain::dispatch_signature`], which need no domain
+    /// instance, so a dispatcher that infers its domain need not have selected one. Host side effects of the closure
+    /// therefore run once per staged specialization. [`Self::clear_cache`] and [`Self::invalidate_specializations`]
+    /// remove staged specializations together with executable ones.
     ///
     /// # Errors
     ///
     /// Returns an error when the inputs do not satisfy the declared staged input types, when the domain rejects the
-    /// staged input types, when tracing the closure fails, when the same thread recursively requests a source
+    /// staged input types, when tracing the closure fails, when the same thread recursively requests a staged
     /// specialization that it is still producing, or when binding the call fails in `context`.
     pub fn call_in_context<V, CallerContext, Path>(
         &self,
@@ -1557,69 +1499,34 @@ where
             StagingContext<Type = C::Type, Constant = C::Constant, Operation = C::Operation>,
     {
         let input_structure = inputs.parameter_structure();
-        let mut input_types = inputs.parameters().map(|input| input.r#type().into_owned()).collect::<Vec<_>>();
-        self.apply_staged_input_types(&input_structure, &mut input_types)?;
-        let (_, input_types) = C::dispatch_signature(input_types, &self.state.options, DispatchPurpose::Source)?;
-        let input_types = input_types.to_vec();
-        let key = SourceSpecializationKey {
-            static_parameters: static_parameters.clone(),
+        let input_types = inputs.parameters().map(|input| input.r#type().into_owned()).collect::<Vec<_>>();
+        let staged = self.staged_specialization(
+            static_parameters,
             input_structure,
             input_types,
-            named_axes: context.named_axes(),
-            default_mesh: context.default_mesh(),
-        };
-
-        // A hit reuses the retained source. A vacant producer clears its in-flight marker if tracing fails, which
-        // allows retries, and only recursive production of the same key on this thread is rejected.
-        let statistics = &self.state.statistics;
-        let source = match self.state.sources.try_entry(key) {
-            Ok(SpecializationCacheEntry::Occupied(source)) => {
-                statistics.source_hits.fetch_add(1, Ordering::Relaxed);
-                source
-            }
-            Ok(SpecializationCacheEntry::Vacant(producer)) => {
-                statistics.source_misses.fetch_add(1, Ordering::Relaxed);
-                let SourceSpecializationKey { input_structure, input_types, named_axes, default_mesh, .. } =
-                    producer.key().clone();
-                let input_types = Input::from_parameters(input_structure, input_types).map_err(ProgramError::from)?;
-                statistics.traces.fetch_add(1, Ordering::Relaxed);
-                let tracing_start = Instant::now();
-                let source = StagedFunction::<C, Input, Output>::stage_with_named_axes_and_default_mesh(
-                    |_, _, traced_inputs| (self.state.function)(static_parameters, traced_inputs),
-                    Vec::new(),
-                    input_types,
-                    self.state.options.clone(),
-                    named_axes,
-                    default_mesh,
-                );
-                accumulate_duration(tracing_start.elapsed(), &statistics.tracing_nanoseconds);
-                producer.insert(source?)
-            }
-            Err(_) => {
-                statistics.source_misses.fetch_add(1, Ordering::Relaxed);
-                return Err(ProgramError::InvalidArgument {
-                    message: "recursive source call requested a source specialization that is already being produced"
-                        .into(),
-                }
-                .into());
-            }
-        };
-        source.call_in_context(context, inputs).map_err(Into::into)
+            TracingScope::from_context(context),
+        )?;
+        staged.call_in_context(context, inputs).map_err(Into::into)
     }
 
-    /// Invalidates every retained executable and source specialization for `static_parameters`, across all input
+    /// Invalidates every retained executable and staged specialization for `static_parameters`, across all input
     /// signatures and calling scopes, and returns the total number of specializations removed from both. Backend
     /// compilation caches remain available for reuse. A specialization that is still being produced when this
     /// function runs may be retained once its production completes.
     #[inline]
     pub fn invalidate_specializations(&self, static_parameters: &Static) -> usize {
-        self.state.specializations.invalidate_entries_if(|key| key.static_parameters() == static_parameters)
-            + self.state.sources.invalidate_entries_if(|key| &key.static_parameters == static_parameters)
+        self.state
+            .executable_specializations
+            .invalidate_entries_if(|key| key.static_parameters() == static_parameters)
+            + self
+                .state
+                .staged_specializations
+                .invalidate_entries_if(|key| &key.static_parameters == static_parameters)
     }
 
     /// Acquires or produces the executable specialization for one runtime input signature and returns it together with
     /// the resolved domain that executes it.
-    fn specialization(
+    fn executable_specialization(
         &self,
         static_parameters: Static,
         inputs: &Input::To<C::Value>,
@@ -1676,7 +1583,7 @@ where
             C::dispatch_signature(runtime_input_types, &self.state.options, DispatchPurpose::Executable)?;
 
         // Backend normalization can share dispatch keys, but static values and container structures remain distinct.
-        let key = SpecializationKey::new(static_parameters.clone(), input_structure, dispatch_key);
+        let key = ExecutableSpecializationKey::new(static_parameters.clone(), input_structure, dispatch_key);
 
         // One clock read both ends dispatch preparation and starts the specialization lookup, which keeps the timing
         // of every cached call to three clock reads.
@@ -1686,7 +1593,7 @@ where
             dispatch_lookup_start.duration_since(dispatch_preparation_start),
             &statistics.dispatch_preparation_nanoseconds,
         );
-        let entry = self.state.specializations.try_entry(key);
+        let entry = self.state.executable_specializations.try_entry(key);
         accumulate_duration(dispatch_lookup_start.elapsed(), &statistics.dispatch_lookup_nanoseconds);
 
         // A hit skips all frontend production. A vacant producer clears its in-flight marker if any later phase fails,
@@ -1738,8 +1645,74 @@ where
         Ok((domain, producer.insert(compiled.into_executable())))
     }
 
+    /// Acquires or produces the staged specialization of [`Self::call_in_context`] for `static_parameters`, the
+    /// abstract `input_types` of inputs with `input_structure`, and the calling `scope`. It is independent of the
+    /// caller's context and value types, so every caller of this dispatcher shares one instantiation of its tracing
+    /// and caching code.
+    fn staged_specialization(
+        &self,
+        static_parameters: Static,
+        input_structure: Input::ParameterStructure,
+        mut input_types: Vec<C::Type>,
+        scope: TracingScope,
+    ) -> Result<StagedFunction<C, Input, Output>, C::Error>
+    where
+        C::Options: Clone,
+        Input::Family: ParameterizedFamily<CompilationTracer<C>>,
+        Output::Family: ParameterizedFamily<CompilationTracer<C>>,
+        F: Fn(Static, Input::To<CompilationTracer<C>>) -> Result<Output::To<CompilationTracer<C>>, C::Error>,
+        DomainTracingContext<C, C::Value>:
+            StagingContext<Type = C::Type, Constant = C::Constant, Operation = C::Operation>,
+    {
+        self.apply_staged_input_types(&input_structure, &mut input_types)?;
+        let (_, input_types) = C::dispatch_signature(input_types, &self.state.options, DispatchPurpose::Staging)?;
+        let input_types = input_types.to_vec();
+        let key = StagedSpecializationKey {
+            static_parameters: static_parameters.clone(),
+            input_structure,
+            input_types,
+            scope,
+        };
+
+        // A hit reuses the retained staged function. A vacant producer clears its in-flight marker if tracing fails,
+        // allowing retries. Only recursive production of the same key on this thread is rejected.
+        let statistics = &self.state.statistics;
+        let staged = match self.state.staged_specializations.try_entry(key) {
+            Ok(SpecializationCacheEntry::Occupied(staged)) => {
+                statistics.staged_cache_hits.fetch_add(1, Ordering::Relaxed);
+                staged
+            }
+            Ok(SpecializationCacheEntry::Vacant(producer)) => {
+                statistics.staged_cache_misses.fetch_add(1, Ordering::Relaxed);
+                let StagedSpecializationKey { input_structure, input_types, scope, .. } = producer.key().clone();
+                let input_types = Input::from_parameters(input_structure, input_types).map_err(ProgramError::from)?;
+                statistics.traces.fetch_add(1, Ordering::Relaxed);
+                let tracing_start = Instant::now();
+                let staged = StagedFunction::<C, Input, Output>::stage_in_scope(
+                    |_, _, traced_inputs| (self.state.function)(static_parameters, traced_inputs),
+                    Vec::new(),
+                    input_types,
+                    self.state.options.clone(),
+                    scope,
+                );
+                accumulate_duration(tracing_start.elapsed(), &statistics.tracing_nanoseconds);
+                producer.insert(staged?)
+            }
+            Err(_) => {
+                statistics.staged_cache_misses.fetch_add(1, Ordering::Relaxed);
+                return Err(ProgramError::InvalidArgument {
+                    message: "recursive staged call requested a staged specialization that is already being produced"
+                        .into(),
+                }
+                .into());
+            }
+        };
+
+        Ok(staged)
+    }
+
     /// Replaces the types of `input_types` that [`Self::with_staged_input_types`] declares with their declared staged
-    /// types, after validating that each replaced type refines its declaration. Execution and source calls share this
+    /// types, after validating that each replaced type refines its declaration. Execution and calls share this
     /// contract, so that a declaration means the same thing for both. Inputs without declarations keep their types.
     fn apply_staged_input_types(
         &self,
@@ -1833,16 +1806,16 @@ struct CompiledFunctionDispatcherState<
     staged_input_types: Option<StagedInputTypes<C::Type, Input::ParameterStructure>>,
 
     /// Bounded Least Recently Used (LRU) cache of compiled specializations.
-    specializations: SpecializationCache<
-        SpecializationKey<Static, Input::ParameterStructure, C::DispatchKey>,
+    executable_specializations: SpecializationCache<
+        ExecutableSpecializationKey<Static, Input::ParameterStructure, C::DispatchKey>,
         ExecutableFunction<C, Input, Output>,
     >,
 
-    /// Bounded Least Recently Used (LRU) cache of staged source specializations that source calls bind into their
-    /// calling contexts. It is separate from [`Self::specializations`], so that source calls never evict executables
-    /// and execution never reads or retains source programs, and every invalidation applies to both caches.
-    sources: SpecializationCache<
-        SourceSpecializationKey<Static, Input::ParameterStructure, C::Type>,
+    /// Bounded Least Recently Used (LRU) cache of staged specializations that calls bind into their calling contexts.
+    /// It is separate from [`Self::executable_specializations`], so that calls never evict executables and execution
+    /// never reads or retains staged programs. Every invalidation applies to both caches.
+    staged_specializations: SpecializationCache<
+        StagedSpecializationKey<Static, Input::ParameterStructure, C::Type>,
         StagedFunction<C, Input, Output>,
     >,
 
@@ -1949,25 +1922,28 @@ impl<Output, Error> StatefulExecution<Output, Error> {
 /// and are unaffected by [`CompiledFunctionDispatcher::clear_cache`]. Each field is read independently, so a snapshot
 /// taken during concurrent calls need not correspond to a single point in time.
 ///
-/// Every call that reaches the specialization lookup counts as exactly one of [`Self::dispatch_hits`] and
-/// [`Self::dispatch_misses`]. Calls that fail earlier (e.g., because an inferred domain cannot be recovered, an input
-/// does not refine its declared staged type, or [`CompilationDomain::dispatch_signature`] fails) count as neither. The
-/// production counters record attempts, including failed ones, and concurrent cold misses for one specialization may
-/// each trace, lower, and request compilation. Durations are host durations summed over all calls, so concurrent calls
-/// can make them exceed the elapsed wall-clock time. Backend compilation time is not included, because a compilation
-/// request may be served by a compilation cache. Refer to
+/// Every execution that reaches executable specialization lookup counts as exactly one of
+/// [`Self::dispatch_hits`] and [`Self::dispatch_misses`]. Invocations through [`CompiledFunctionDispatcher::call`]
+/// or [`CompiledFunctionDispatcher::call_in_context`] instead count toward [`Self::staged_cache_hits`] and
+/// [`Self::staged_cache_misses`]. Requests that fail before lookup (e.g., because an inferred domain cannot be
+/// recovered, an input does not refine its declared staged type, or [`CompilationDomain::dispatch_signature`] fails)
+/// count as neither a hit nor a miss. Tracing counts and durations cover both paths. Production counters record
+/// attempts, including failed ones, and concurrent cold misses for one executable specialization may each trace, lower,
+/// and request compilation. Durations are host durations summed over all invocations, so concurrency can make them
+/// exceed elapsed wall-clock time. Backend compilation time is not included, because a compilation request may be
+/// served by a compilation cache. Refer to
 /// [`CompilationCacheStatistics::compilation_duration`](crate::CompilationCacheStatistics::compilation_duration)
 /// for the backend compilation activity of a shared [`CompilationContext`](crate::CompilationContext).
 #[derive(Copy, Clone, Debug, Default, PartialEq, Eq)]
 pub struct DispatcherStatistics {
-    /// Calls served by a retained specialization.
+    /// Executions served by a retained executable specialization.
     pub dispatch_hits: u64,
 
-    /// Calls that found no retained specialization, including recursive calls that requested a specialization that
-    /// was still being produced and were therefore rejected.
+    /// Executions that found no retained executable specialization, including recursive execution requests for
+    /// a specialization that was still being produced and were therefore rejected.
     pub dispatch_misses: u64,
 
-    /// Traces of the dispatcher's closure started after dispatch misses or source misses, including traces that failed.
+    /// Traces of the dispatcher's closure started after executable or staged cache misses, including failed traces.
     pub traces: u64,
 
     /// Lowerings started after successful traces, including lowerings that failed.
@@ -1985,19 +1961,19 @@ pub struct DispatcherStatistics {
     /// Total host duration spent looking up retained specializations by their specialization keys.
     pub dispatch_lookup_duration: Duration,
 
-    /// Total host duration spent tracing the dispatcher's closure after dispatch misses or source misses.
+    /// Total host duration spent tracing the dispatcher's closure after executable or staged cache misses.
     pub tracing_duration: Duration,
 
     /// Total host duration spent lowering newly traced specializations.
     pub lowering_duration: Duration,
 
-    /// Source calls (i.e., [`CompiledFunctionDispatcher::call`] and [`CompiledFunctionDispatcher::call_in_context`])
-    /// served by a retained source specialization.
-    pub source_hits: u64,
+    /// Invocations through [`CompiledFunctionDispatcher::call`] or [`CompiledFunctionDispatcher::call_in_context`]
+    /// served by a retained staged specialization.
+    pub staged_cache_hits: u64,
 
-    /// Source calls that found no retained source specialization, including recursive calls that requested a source
+    /// Calls that found no retained staged specialization, including recursive calls that requested a staged
     /// specialization that was still being produced and were therefore rejected.
-    pub source_misses: u64,
+    pub staged_cache_misses: u64,
 }
 
 /// Lock-free counters underlying [`DispatcherStatistics`]. Durations accumulate in nanoseconds.
@@ -2030,11 +2006,11 @@ struct DispatcherStatisticsAccumulator {
     /// Nanoseconds underlying [`DispatcherStatistics::lowering_duration`].
     lowering_nanoseconds: AtomicU64,
 
-    /// Counter underlying [`DispatcherStatistics::source_hits`].
-    source_hits: AtomicU64,
+    /// Counter underlying [`DispatcherStatistics::staged_cache_hits`].
+    staged_cache_hits: AtomicU64,
 
-    /// Counter underlying [`DispatcherStatistics::source_misses`].
-    source_misses: AtomicU64,
+    /// Counter underlying [`DispatcherStatistics::staged_cache_misses`].
+    staged_cache_misses: AtomicU64,
 }
 
 impl DispatcherStatisticsAccumulator {
@@ -2052,8 +2028,8 @@ impl DispatcherStatisticsAccumulator {
             dispatch_lookup_duration: Duration::from_nanos(self.dispatch_lookup_nanoseconds.load(Ordering::Relaxed)),
             tracing_duration: Duration::from_nanos(self.tracing_nanoseconds.load(Ordering::Relaxed)),
             lowering_duration: Duration::from_nanos(self.lowering_nanoseconds.load(Ordering::Relaxed)),
-            source_hits: self.source_hits.load(Ordering::Relaxed),
-            source_misses: self.source_misses.load(Ordering::Relaxed),
+            staged_cache_hits: self.staged_cache_hits.load(Ordering::Relaxed),
+            staged_cache_misses: self.staged_cache_misses.load(Ordering::Relaxed),
         }
     }
 
@@ -2068,8 +2044,8 @@ impl DispatcherStatisticsAccumulator {
         self.dispatch_lookup_nanoseconds.store(0, Ordering::Relaxed);
         self.tracing_nanoseconds.store(0, Ordering::Relaxed);
         self.lowering_nanoseconds.store(0, Ordering::Relaxed);
-        self.source_hits.store(0, Ordering::Relaxed);
-        self.source_misses.store(0, Ordering::Relaxed);
+        self.staged_cache_hits.store(0, Ordering::Relaxed);
+        self.staged_cache_misses.store(0, Ordering::Relaxed);
     }
 }
 
@@ -2097,8 +2073,9 @@ mod tests {
 
     use crate::arrays::{
         Array, ArrayIrOperation, ArrayIrType, ArrayIrValue, ArrayType, DataType, DimensionBounds, DimensionError,
-        DimensionType, DimensionValue, MeshAxis, MeshAxisType, Shape,
+        DimensionType, DimensionValue, LogicalMesh, MeshAxis, MeshAxisType, Shape,
     };
+    use crate::axes::NamedAxis;
     use crate::captures::CaptureReference;
     use crate::compilation::domains::{Compile, jit};
     use crate::compilation::tests::{
@@ -2382,12 +2359,12 @@ mod tests {
     }
 
     #[test]
-    fn test_staged_program_stage_with_named_axes_and_default_mesh() {
+    fn test_staged_program_stage_in_scope() {
         // The traced function observes the seeded scope exactly as a function inlined into that scope would.
         let named_axes = vec![("items".to_string(), NamedAxis::Batched { size: Some(3) })];
         let mesh = LogicalMesh::new(vec![MeshAxis::new("devices", 2, MeshAxisType::Manual).unwrap()]).unwrap();
         let observed = RefCell::new(None);
-        let staged = StagedProgram::<TestDomain>::stage_with_named_axes_and_default_mesh(
+        let staged = StagedProgram::<TestDomain>::stage_in_scope(
             |_, _, inputs| {
                 let context = inputs[0].context();
                 *observed.borrow_mut() = Some((context.named_axes(), context.default_mesh()));
@@ -2396,8 +2373,7 @@ mod tests {
             Vec::new(),
             vec![ArrayType::scalar(DataType::F64)],
             TestOptions::default(),
-            named_axes.clone(),
-            Some(mesh.clone()),
+            TracingScope::new(named_axes.clone(), Some(mesh.clone())),
         )
         .unwrap();
         assert_eq!(observed.into_inner(), Some((named_axes, Some(mesh))));
@@ -2518,7 +2494,9 @@ mod tests {
     }
 
     #[test]
-    fn test_staged_function_call_flat_with_capture_references() {
+    fn test_staged_function_call_flat_in_context() {
+        // The captures of the callee enter the caller through its context, so the caller captures them and passes them
+        // to the call ahead of the flat inputs.
         let callee: StagedFunction<TestCallDomain, ArrayType, ArrayType> = StagedFunction::stage(
             |_, mut captures: Vec<CompilationTracer<TestCallDomain>>, _input| Ok(captures.remove(0)),
             vec![Array::scalar(7.0).unwrap()],
@@ -2526,17 +2504,17 @@ mod tests {
             (),
         )
         .unwrap();
-
-        // The call passes the given capture references of the caller in place of the captures of the callee, so the
-        // caller only captures its own value.
         let caller = StagedProgram::<TestCallDomain>::stage(
-            |references, _, inputs| callee.call_flat_with_capture_references(&references, inputs),
-            vec![Array::scalar(5.0).unwrap()],
+            |_, _, inputs| {
+                let context = inputs[0].context().clone();
+                callee.call_flat_in_context(&context, inputs)
+            },
+            Vec::new(),
             vec![ArrayType::scalar(DataType::F64)],
             (),
         )
         .unwrap();
-        assert_eq!(caller.source_program().captures(), &[Array::scalar(5.0).unwrap()]);
+        assert_eq!(caller.source_program().captures(), &[Array::scalar(7.0).unwrap()]);
         assert_eq!(
             caller.source_program().program().to_string(),
             indoc! {"
@@ -2549,73 +2527,6 @@ mod tests {
                         },
                     ]
                 in (%2)"},
-        );
-
-        // The capture references must match the captures of the callee in count and type.
-        assert!(matches!(
-            StagedProgram::<TestCallDomain>::stage(
-                |_, _, inputs| callee.call_flat_with_capture_references(&[], inputs),
-                Vec::new(),
-                vec![ArrayType::scalar(DataType::F64)],
-                (),
-            ),
-            Err(ProgramError::InvalidInputCount { expected: 1, actual: 0 }),
-        ));
-        assert!(matches!(
-            StagedProgram::<TestCallDomain>::stage(
-                |references, _, inputs| callee.call_flat_with_capture_references(&references, inputs),
-                vec![Array::scalar(5i64).unwrap()],
-                vec![ArrayType::scalar(DataType::F64)],
-                (),
-            ),
-            Err(ProgramError::MalformedProgram(message))
-                if message == "capture input #0 has type i64[], but capture #0 has type f64[]",
-        ));
-
-        // Without inputs, no context can be recovered.
-        assert!(matches!(
-            StagedProgram::<TestCallDomain>::stage(
-                |references, _, inputs| callee.call_flat_with_capture_references(&references, inputs),
-                vec![Array::scalar(5.0).unwrap()],
-                Vec::new(),
-                (),
-            ),
-            Err(ProgramError::InvalidInputCount { expected: 1, actual: 0 }),
-        ));
-    }
-
-    #[test]
-    fn test_staged_function_call_flat_with_capture_references_in_context() {
-        // An explicit context supports capture-only calls, which have no inputs from which to recover a context.
-        let callee: StagedFunction<TestCallDomain, (), ArrayType> = StagedFunction::stage(
-            |_, mut captures: Vec<CompilationTracer<TestCallDomain>>, ()| Ok(captures.remove(0)),
-            vec![Array::scalar(7.0).unwrap()],
-            (),
-            (),
-        )
-        .unwrap();
-        let caller = StagedProgram::<TestCallDomain>::stage(
-            |references, captures, _| {
-                callee.call_flat_with_capture_references_in_context(captures[0].context(), &references, Vec::new())
-            },
-            vec![Array::scalar(5.0).unwrap()],
-            Vec::new(),
-            (),
-        )
-        .unwrap();
-        assert_eq!(caller.source_program().captures(), &[Array::scalar(5.0).unwrap()]);
-        assert_eq!(
-            caller.source_program().program().to_string(),
-            indoc! {"
-                lambda  .
-                let %0:f64[] = const capture#0:f64[]
-                    %1:f64[] = call %0 [
-                        callee={
-                            lambda %0:f64[] .
-                            in (%0)
-                        },
-                    ]
-                in (%1)"},
         );
     }
 
@@ -2918,17 +2829,17 @@ mod tests {
     }
 
     #[test]
-    fn test_specialization_key() {
-        let key: SpecializationKey<(&str, usize), Vec<()>, &str> =
-            SpecializationKey::new(("training", 4), vec![(), ()], "f32[2,3]");
+    fn test_executable_specialization_key() {
+        let key: ExecutableSpecializationKey<(&str, usize), Vec<()>, &str> =
+            ExecutableSpecializationKey::new(("training", 4), vec![(), ()], "f32[2,3]");
         assert_eq!(key.static_parameters(), &("training", 4));
         assert_eq!(key.input_structure(), &vec![(), ()]);
 
         // Every component participates in equality.
-        assert_eq!(key, SpecializationKey::new(("training", 4), vec![(), ()], "f32[2,3]"));
-        assert_ne!(key, SpecializationKey::new(("inference", 4), vec![(), ()], "f32[2,3]"));
-        assert_ne!(key, SpecializationKey::new(("training", 4), vec![()], "f32[2,3]"));
-        assert_ne!(key, SpecializationKey::new(("training", 4), vec![(), ()], "f32[4,3]"));
+        assert_eq!(key, ExecutableSpecializationKey::new(("training", 4), vec![(), ()], "f32[2,3]"));
+        assert_ne!(key, ExecutableSpecializationKey::new(("inference", 4), vec![(), ()], "f32[2,3]"));
+        assert_ne!(key, ExecutableSpecializationKey::new(("training", 4), vec![()], "f32[2,3]"));
+        assert_ne!(key, ExecutableSpecializationKey::new(("training", 4), vec![(), ()], "f32[4,3]"));
     }
 
     #[test]
@@ -2966,7 +2877,7 @@ mod tests {
             function.execute((), ArrayIrValue::Dimension(DimensionValue::constant(3).unwrap())),
             Ok(three_zeros.clone()),
         );
-        assert_eq!(function.specialization_count(), 2);
+        assert_eq!(function.executable_specialization_count(), 2);
         assert_eq!(function.statistics().dispatch_hits, 1);
         assert_eq!(domain.compilation_count(), 2);
 
@@ -2978,7 +2889,7 @@ mod tests {
         assert_eq!(function.staged_input_types(), Some(Some(extent_type.clone().into())));
         assert_eq!(function.execute((), three), Ok(three_zeros));
         assert_eq!(function.execute((), four), Ok(four_zeros));
-        assert_eq!(function.specialization_count(), 1);
+        assert_eq!(function.executable_specialization_count(), 1);
         let statistics = function.statistics();
         assert_eq!(statistics.dispatch_misses, 1);
         assert_eq!(statistics.dispatch_hits, 1);
@@ -2997,7 +2908,7 @@ mod tests {
             )
             .into()),
         );
-        assert_eq!(function.specialization_count(), 1);
+        assert_eq!(function.executable_specialization_count(), 1);
 
         // Staged input types must be declared before the dispatcher is shared.
         let function: CompiledFunctionDispatcher<TestArrayIrDomain, (), ArrayIrType, ArrayIrType, _> =
@@ -3057,7 +2968,7 @@ mod tests {
             function.execute((), extents(3, 2)),
             Ok(ArrayIrValue::Array(Array::matrix(3, 2, vec![0f32; 6]).unwrap())),
         );
-        assert_eq!(function.specialization_count(), 1);
+        assert_eq!(function.executable_specialization_count(), 1);
 
         // One declared identity shared by both inputs requires their runtime extents to agree.
         let function: CompiledFunctionDispatcher<TestArrayIrDomain, (), Vec<ArrayIrType>, ArrayIrType, _> = domain
@@ -3077,7 +2988,7 @@ mod tests {
             })
             .into()),
         );
-        assert_eq!(function.specialization_count(), 1);
+        assert_eq!(function.executable_specialization_count(), 1);
 
         // A `None` leaf keeps its input exact, so only calls that also agree on that input's extent share one
         // specialization.
@@ -3092,7 +3003,7 @@ mod tests {
                 )),
             );
         }
-        assert_eq!(function.specialization_count(), 2);
+        assert_eq!(function.executable_specialization_count(), 2);
 
         // Inputs must have the structure of the declaration, which otherwise would apply its leaves to other inputs.
         let function: CompiledFunctionDispatcher<TestArrayIrDomain, (), Vec<ArrayIrType>, ArrayIrType, _> =
@@ -3102,7 +3013,7 @@ mod tests {
             Err(ProgramError::InvalidArgument { message })
                 if message == "compilation inputs do not have the structure of their declared staged input types",
         ));
-        assert_eq!(function.specialization_count(), 0);
+        assert_eq!(function.executable_specialization_count(), 0);
     }
 
     #[test]
@@ -3150,12 +3061,12 @@ mod tests {
         // Clearing the cache drops the specializations but keeps the statistics, so the next call produces its
         // specialization again, and the compilation cache of the domain serves the repeated compilation request.
         function.clear_cache();
-        assert_eq!(function.specialization_count(), 0);
+        assert_eq!(function.executable_specialization_count(), 0);
         assert_eq!(function.statistics().traces, 1);
         assert_eq!(function.execute((), Array::scalar(2.0).unwrap()), Ok(Array::scalar(2.0).unwrap()));
         let statistics = function.statistics();
         assert_eq!((statistics.dispatch_misses, statistics.traces, statistics.compilation_requests), (2, 2, 2));
-        assert_eq!(function.specialization_count(), 1);
+        assert_eq!(function.executable_specialization_count(), 1);
         assert_eq!(domain.compilation_count(), 1);
     }
 
@@ -3170,7 +3081,7 @@ mod tests {
         assert_eq!(function.execute(true, Array::scalar(2.0).unwrap()).unwrap(), Array::scalar(-2.0).unwrap());
         assert_eq!(function.execute(true, Array::scalar(3.0).unwrap()).unwrap(), Array::scalar(-3.0).unwrap());
         assert_eq!(function.execute(false, Array::scalar(4.0).unwrap()).unwrap(), Array::scalar(4.0).unwrap());
-        assert_eq!(function.specialization_count(), 2);
+        assert_eq!(function.executable_specialization_count(), 2);
         let statistics = function.statistics();
         assert_eq!(statistics.dispatch_hits, 1);
         assert_eq!(statistics.dispatch_misses, 2);
@@ -3273,7 +3184,7 @@ mod tests {
             function.execute(CollidingStatic(true), Array::scalar(2.0).unwrap()).unwrap(),
             Array::scalar(-2.0).unwrap()
         );
-        assert_eq!(function.specialization_count(), 2);
+        assert_eq!(function.executable_specialization_count(), 2);
         assert_eq!(domain.compilation_count(), 2);
     }
 
@@ -3290,7 +3201,7 @@ mod tests {
             function.execute((), vec![Array::scalar(2.0).unwrap(), Array::scalar(3.0).unwrap()]).unwrap(),
             Array::scalar(2.0).unwrap(),
         );
-        assert_eq!(function.specialization_count(), 2);
+        assert_eq!(function.executable_specialization_count(), 2);
     }
 
     #[test]
@@ -3314,7 +3225,7 @@ mod tests {
             function.execute((), Vec::new()),
             Err(ProgramError::InvalidInputCount { expected: 1, actual: 0 }),
         ));
-        assert_eq!(function.specialization_count(), 1);
+        assert_eq!(function.executable_specialization_count(), 1);
         assert_eq!(function.statistics().traces, 2);
     }
 
@@ -3332,7 +3243,7 @@ mod tests {
         let second = BTreeMap::from([("b", Array::scalar(4.0).unwrap()), ("a", Array::scalar(3.0).unwrap())]);
         assert_eq!(function.execute((), first).unwrap(), Array::scalar(1.0).unwrap());
         assert_eq!(function.execute((), second).unwrap(), Array::scalar(3.0).unwrap());
-        assert_eq!(function.specialization_count(), 1);
+        assert_eq!(function.executable_specialization_count(), 1);
         assert_eq!(function.statistics().dispatch_hits, 1);
     }
 
@@ -3355,7 +3266,7 @@ mod tests {
             ));
         }
         assert_eq!(function.execute(false, Array::scalar(2.0).unwrap()).unwrap(), Array::scalar(2.0).unwrap());
-        assert_eq!(function.specialization_count(), 1);
+        assert_eq!(function.executable_specialization_count(), 1);
         assert_eq!(function.statistics().traces, 3);
     }
 
@@ -3378,7 +3289,7 @@ mod tests {
             Err(ProgramError::InvalidArgument { message }) if message == "expected trace failure",
         ));
         assert_eq!(function.domain(), Some(&first_domain));
-        assert_eq!(function.specialization_count(), 0);
+        assert_eq!(function.executable_specialization_count(), 0);
         assert_eq!(function.execute((), second_domain.scalar(2.0)), Ok(first_domain.scalar(2.0)));
         assert_eq!(first_domain.compilation_count(), 1);
         assert_eq!(second_domain.compilation_count(), 0);
@@ -3396,7 +3307,7 @@ mod tests {
                 Err(ProgramError::InvalidArgument { message }) if message == "expected lowering failure",
             ));
         }
-        assert_eq!(lowering_function.specialization_count(), 0);
+        assert_eq!(lowering_function.executable_specialization_count(), 0);
         let statistics = lowering_function.statistics();
         assert_eq!((statistics.traces, statistics.lowerings, statistics.compilation_requests), (2, 2, 0));
 
@@ -3411,7 +3322,7 @@ mod tests {
                 Err(ProgramError::InvalidArgument { message }) if message == "expected compilation failure",
             ));
         }
-        assert_eq!(compilation_function.specialization_count(), 0);
+        assert_eq!(compilation_function.executable_specialization_count(), 0);
         let statistics = compilation_function.statistics();
         assert_eq!((statistics.traces, statistics.lowerings, statistics.compilation_requests), (2, 2, 2));
         assert_eq!(compilation_domain.compilation_count(), 2);
@@ -3435,7 +3346,7 @@ mod tests {
 
         // The compiled entry is inserted before runtime execution, so an execution failure does not evict it and the
         // second call dispatches directly to the retained specialization.
-        assert_eq!(function.specialization_count(), 1);
+        assert_eq!(function.executable_specialization_count(), 1);
         assert_eq!(function.statistics().traces, 1);
         assert_eq!(function.statistics().dispatch_hits, 1);
     }
@@ -3461,7 +3372,7 @@ mod tests {
                 if message == "recursive compilation dispatch requested a specialization that is already being \
                                produced",
         ));
-        assert_eq!(function.specialization_count(), 0);
+        assert_eq!(function.executable_specialization_count(), 0);
         assert_eq!(function.statistics().dispatch_misses, 2);
     }
 
@@ -3481,7 +3392,7 @@ mod tests {
         *recursive.borrow_mut() = Some(Box::new(move || function_clone.execute(false, Array::scalar(1.0).unwrap())));
 
         assert_eq!(function.execute(true, Array::scalar(2.0).unwrap()).unwrap(), Array::scalar(2.0).unwrap());
-        assert_eq!(function.specialization_count(), 2);
+        assert_eq!(function.executable_specialization_count(), 2);
         assert_eq!(function.statistics().traces, 2);
     }
 
@@ -3495,8 +3406,8 @@ mod tests {
 
         assert_eq!(first.execute((), Array::scalar(1.0).unwrap()).unwrap(), Array::scalar(1.0).unwrap());
         assert_eq!(second.execute((), Array::scalar(2.0).unwrap()).unwrap(), Array::scalar(2.0).unwrap());
-        assert_eq!(first.specialization_count(), 1);
-        assert_eq!(second.specialization_count(), 1);
+        assert_eq!(first.executable_specialization_count(), 1);
+        assert_eq!(second.executable_specialization_count(), 1);
         assert_eq!(first.statistics().traces, 1);
         assert_eq!(second.statistics().traces, 1);
         assert_eq!(domain.compilation_count(), 1);
@@ -3524,7 +3435,7 @@ mod tests {
             }
         });
 
-        assert_eq!(function.specialization_count(), 1);
+        assert_eq!(function.executable_specialization_count(), 1);
         assert_eq!(function.statistics().dispatch_hits, 4);
         assert_eq!(function.statistics().traces, 1);
     }
@@ -3555,7 +3466,7 @@ mod tests {
         // Cross-thread same-key cold misses deliberately race and may duplicate frontend production; both inserts are
         // idempotent and exactly one retained entry remains, while the shared compilation context deduplicates the
         // backend compilation itself.
-        assert_eq!(function.specialization_count(), 1);
+        assert_eq!(function.executable_specialization_count(), 1);
         let statistics = function.statistics();
         assert_eq!(statistics.dispatch_hits + statistics.dispatch_misses, 2);
         assert!(statistics.traces >= 1 && statistics.traces <= 2);
@@ -3592,7 +3503,7 @@ mod tests {
         assert!(selected_domain == &first_domain || selected_domain == &second_domain);
         assert_eq!(first_output, Ok(selected_domain.scalar(1.0)));
         assert_eq!(second_output, Ok(selected_domain.scalar(2.0)));
-        assert_eq!(function.specialization_count(), 1);
+        assert_eq!(function.executable_specialization_count(), 1);
         assert_eq!(selected_domain.compilation_count() as u64, function.statistics().traces);
         assert_eq!(unselected_domain.compilation_count(), 0);
     }
@@ -3635,8 +3546,8 @@ mod tests {
             .unwrap()
         };
 
-        // A source call binds the traced closure as a callee. The test call domain rejects lowering, so the call
-        // succeeding also shows that source calls neither lower nor compile anything.
+        // A call binds the traced closure as a callee. The test call domain rejects lowering, so the call
+        // succeeding also shows that calls neither lower nor compile anything.
         let caller = stage_caller();
         assert_eq!(
             caller.source_program().program().to_string(),
@@ -3652,19 +3563,19 @@ mod tests {
                 in (%1)"},
         );
         let statistics = function.statistics();
-        assert_eq!((statistics.source_hits, statistics.source_misses, statistics.traces), (0, 1, 1));
+        assert_eq!((statistics.staged_cache_hits, statistics.staged_cache_misses, statistics.traces), (0, 1, 1));
         assert_eq!((statistics.dispatch_misses, statistics.lowerings, statistics.compilation_requests), (0, 0, 0));
 
-        // Another call with the same types and scope reuses the source specialization.
+        // Another call with the same types and scope reuses the staged specialization.
         stage_caller();
         let statistics = function.statistics();
-        assert_eq!((statistics.source_hits, statistics.source_misses, statistics.traces), (1, 1, 1));
+        assert_eq!((statistics.staged_cache_hits, statistics.staged_cache_misses, statistics.traces), (1, 1, 1));
 
-        // Clearing the cache removes source specializations too.
+        // Clearing the cache removes staged specializations too.
         function.clear_cache();
         stage_caller();
         let statistics = function.statistics();
-        assert_eq!((statistics.source_hits, statistics.source_misses, statistics.traces), (1, 2, 2));
+        assert_eq!((statistics.staged_cache_hits, statistics.staged_cache_misses, statistics.traces), (1, 2, 2));
     }
 
     #[test]
@@ -3680,7 +3591,7 @@ mod tests {
         });
         let named_axes = vec![("items".to_string(), NamedAxis::Batched { size: Some(3) })];
         let stage_caller = |named_axes: Vec<(String, NamedAxis)>| {
-            StagedFunction::<TestCallDomain, ArrayType, ArrayType>::stage_with_named_axes_and_default_mesh(
+            StagedFunction::<TestCallDomain, ArrayType, ArrayType>::stage_in_scope(
                 |_, _, input: CompilationTracer<TestCallDomain>| {
                     let context = input.context().clone();
                     function.call_in_context(&context, (), input)
@@ -3688,21 +3599,20 @@ mod tests {
                 Vec::new(),
                 ArrayType::scalar(DataType::F64),
                 (),
-                named_axes,
-                None,
+                TracingScope::new(named_axes, None),
             )
             .unwrap()
         };
 
-        // Each calling scope gets its own source specialization, traced in that scope, and repeated scopes reuse it.
+        // Each calling scope gets its own staged specialization, traced in that scope, and repeated scopes reuse it.
         stage_caller(named_axes.clone());
         stage_caller(Vec::new());
         stage_caller(named_axes.clone());
         assert_eq!(observed.borrow().as_slice(), &[named_axes, Vec::new()]);
         let statistics = function.statistics();
-        assert_eq!((statistics.source_hits, statistics.source_misses, statistics.traces), (1, 2, 2));
+        assert_eq!((statistics.staged_cache_hits, statistics.staged_cache_misses, statistics.traces), (1, 2, 2));
 
-        // Invalidation removes the source specializations of every scope and counts them.
+        // Invalidation removes the staged specializations of every scope and counts them.
         assert_eq!(function.invalidate_specializations(&()), 2);
     }
 
@@ -3717,7 +3627,7 @@ mod tests {
         function.execute(false, Array::scalar(2.0).unwrap()).unwrap();
 
         assert_eq!(function.invalidate_specializations(&true), 1);
-        assert_eq!(function.specialization_count(), 1);
+        assert_eq!(function.executable_specialization_count(), 1);
         function.execute(true, Array::scalar(2.0).unwrap()).unwrap();
         assert_eq!(function.statistics().traces, 3);
         assert_eq!(domain.compilation_count(), 2);
