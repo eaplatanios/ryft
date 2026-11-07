@@ -1299,6 +1299,39 @@ impl<V: Value, O: Operation<Type = V::Type>> TransposedProgram<V, O> {
     }
 }
 
+/// Operation family capability that [`Pullback`] application requires (i.e., transposing a linear program over types
+/// `T` with constants `V`, including the reference operations that accumulate cotangents into destinations). It only
+/// bundles those capabilities, and every operation family that has them implements it.
+pub trait PullbackOperation<T: ReferenceMemberType, V: Value<Type = T>>:
+    TransposableOperation<V, Self>
+    + ResidualZeroProvider<T, Operation = Self>
+    + ReferenceAccessOperation<Transform: ReferenceTransform<Referent = T::Referent>>
+    + OperationProvider<T, ReferenceNewOperation<T::Referent, T>, Operation = Self>
+    + OperationProvider<
+        T,
+        ReferenceAddUpdateOperation<T::Referent, T, <Self as ReferenceAccessOperation>::Transform>,
+        Operation = Self,
+    > + OperationProvider<T, AddOperation<T>, Operation = Self>
+where
+    TracingContext<V, Self>: StagingContext<Type = T, Constant = V, Operation = Self>,
+{
+}
+
+impl<T: ReferenceMemberType, V: Value<Type = T>, O> PullbackOperation<T, V> for O
+where
+    O: TransposableOperation<V, O>
+        + ResidualZeroProvider<T, Operation = O>
+        + ReferenceAccessOperation<Transform: ReferenceTransform<Referent = T::Referent>>
+        + OperationProvider<T, ReferenceNewOperation<T::Referent, T>, Operation = O>
+        + OperationProvider<
+            T,
+            ReferenceAddUpdateOperation<T::Referent, T, <O as ReferenceAccessOperation>::Transform>,
+            Operation = O,
+        > + OperationProvider<T, AddOperation<T>, Operation = O>,
+    TracingContext<V, O>: StagingContext<Type = T, Constant = V, Operation = O>,
+{
+}
+
 /// Pullback of a function `f` at a linearization point `x` (i.e., the transposed linear map `ȳ ↦ x̄ = (∂f/∂x)(x)ᵀ · ȳ`),
 /// packaged as a reusable callable. This is the reverse mode dual of [`Pushforward`], whose callable applies the
 /// un-transposed map `ẋ ↦ (∂f/∂x)(x) · ẋ` instead. It retains the linear pushforward [`Program`] `(ẋ, r) ↦ ẏ` together
@@ -1476,23 +1509,7 @@ impl<
         destination_kinds: &[CotangentDestinationKind],
     ) -> Result<TransposedProgram<C::Constant, C::Operation>, DifferentiationError>
     where
-        C::Operation: TransposableOperation<C::Constant, C::Operation>
-            + ResidualZeroProvider<C::Type, Operation = C::Operation>
-            + ReferenceAccessOperation<
-                Transform: ReferenceTransform<Referent = <C::Type as ReferenceMemberType>::Referent>,
-            > + OperationProvider<
-                C::Type,
-                ReferenceNewOperation<<C::Type as ReferenceMemberType>::Referent, C::Type>,
-                Operation = C::Operation,
-            > + OperationProvider<
-                C::Type,
-                ReferenceAddUpdateOperation<
-                    <C::Type as ReferenceMemberType>::Referent,
-                    C::Type,
-                    <C::Operation as ReferenceAccessOperation>::Transform,
-                >,
-                Operation = C::Operation,
-            > + OperationProvider<C::Type, AddOperation<C::Type>, Operation = C::Operation>,
+        C::Operation: PullbackOperation<C::Type, C::Constant>,
         TracingContext<C::Constant, C::Operation>:
             StagingContext<Type = C::Type, Constant = C::Constant, Operation = C::Operation>,
     {
@@ -1549,23 +1566,7 @@ impl<
         self,
     ) -> Result<(TransposedProgram<C::Constant, C::Operation>, Vec<C::Value>), DifferentiationError>
     where
-        C::Operation: TransposableOperation<C::Constant, C::Operation>
-            + ResidualZeroProvider<C::Type, Operation = C::Operation>
-            + OperationProvider<
-                C::Type,
-                ReferenceNewOperation<<C::Type as ReferenceMemberType>::Referent, C::Type>,
-                Operation = C::Operation,
-            > + ReferenceAccessOperation<
-                Transform: ReferenceTransform<Referent = <C::Type as ReferenceMemberType>::Referent>,
-            > + OperationProvider<
-                C::Type,
-                ReferenceAddUpdateOperation<
-                    <C::Type as ReferenceMemberType>::Referent,
-                    C::Type,
-                    <C::Operation as ReferenceAccessOperation>::Transform,
-                >,
-                Operation = C::Operation,
-            > + OperationProvider<C::Type, AddOperation<C::Type>, Operation = C::Operation>,
+        C::Operation: PullbackOperation<C::Type, C::Constant>,
         TracingContext<C::Constant, C::Operation>:
             StagingContext<Type = C::Type, Constant = C::Constant, Operation = C::Operation>,
     {
@@ -1677,23 +1678,7 @@ impl<
     pub fn apply_materialized(&self, cotangents: Output::To<C::Value>) -> Result<Input::To<C::Value>, ProgramError>
     where
         C: Zero<C::Value>,
-        C::Operation: TransposableOperation<C::Constant, C::Operation>
-            + ResidualZeroProvider<C::Type, Operation = C::Operation>
-            + ReferenceAccessOperation<
-                Transform: ReferenceTransform<Referent = <C::Type as ReferenceMemberType>::Referent>,
-            > + OperationProvider<
-                C::Type,
-                ReferenceNewOperation<<C::Type as ReferenceMemberType>::Referent, C::Type>,
-                Operation = C::Operation,
-            > + OperationProvider<
-                C::Type,
-                ReferenceAddUpdateOperation<
-                    <C::Type as ReferenceMemberType>::Referent,
-                    C::Type,
-                    <C::Operation as ReferenceAccessOperation>::Transform,
-                >,
-                Operation = C::Operation,
-            > + OperationProvider<C::Type, AddOperation<C::Type>, Operation = C::Operation>,
+        C::Operation: PullbackOperation<C::Type, C::Constant>,
         Input::Family: ParameterizedFamily<MaybeZero<C::Value>>,
         TracingContext<C::Constant, C::Operation>:
             StagingContext<Type = C::Type, Constant = C::Constant, Operation = C::Operation>,
@@ -1724,23 +1709,7 @@ impl<
         Output::Family: ParameterizedFamily<CallerContext::Value>,
         Input::Family: ParameterizedFamily<CallerContext::Value>,
         CallerContext: Zero<CallerContext::Value>,
-        C::Operation: TransposableOperation<C::Constant, C::Operation>
-            + ResidualZeroProvider<C::Type, Operation = C::Operation>
-            + ReferenceAccessOperation<
-                Transform: ReferenceTransform<Referent = <C::Type as ReferenceMemberType>::Referent>,
-            > + OperationProvider<
-                C::Type,
-                ReferenceNewOperation<<C::Type as ReferenceMemberType>::Referent, C::Type>,
-                Operation = C::Operation,
-            > + OperationProvider<
-                C::Type,
-                ReferenceAddUpdateOperation<
-                    <C::Type as ReferenceMemberType>::Referent,
-                    C::Type,
-                    <C::Operation as ReferenceAccessOperation>::Transform,
-                >,
-                Operation = C::Operation,
-            > + OperationProvider<C::Type, AddOperation<C::Type>, Operation = C::Operation>,
+        C::Operation: PullbackOperation<C::Type, C::Constant>,
         Input::Family: ParameterizedFamily<MaybeZero<CallerContext::Value>>,
         TracingContext<C::Constant, C::Operation>:
             StagingContext<Type = C::Type, Constant = C::Constant, Operation = C::Operation>,
@@ -1765,23 +1734,7 @@ impl<
     #[inline]
     pub fn apply(&self, cotangents: Output::To<C::Value>) -> Result<Input::To<MaybeZero<C::Value>>, ProgramError>
     where
-        C::Operation: TransposableOperation<C::Constant, C::Operation>
-            + ResidualZeroProvider<C::Type, Operation = C::Operation>
-            + ReferenceAccessOperation<
-                Transform: ReferenceTransform<Referent = <C::Type as ReferenceMemberType>::Referent>,
-            > + OperationProvider<
-                C::Type,
-                ReferenceNewOperation<<C::Type as ReferenceMemberType>::Referent, C::Type>,
-                Operation = C::Operation,
-            > + OperationProvider<
-                C::Type,
-                ReferenceAddUpdateOperation<
-                    <C::Type as ReferenceMemberType>::Referent,
-                    C::Type,
-                    <C::Operation as ReferenceAccessOperation>::Transform,
-                >,
-                Operation = C::Operation,
-            > + OperationProvider<C::Type, AddOperation<C::Type>, Operation = C::Operation>,
+        C::Operation: PullbackOperation<C::Type, C::Constant>,
         Input::Family: ParameterizedFamily<MaybeZero<C::Value>>,
         TracingContext<C::Constant, C::Operation>:
             StagingContext<Type = C::Type, Constant = C::Constant, Operation = C::Operation>,
@@ -1807,23 +1760,7 @@ impl<
         CallerContext:
             Context<Type = C::Type, Constant = C::Constant, Operation = C::Operation> + ImportingContext<C, Path>,
         Output::Family: ParameterizedFamily<CallerContext::Value>,
-        C::Operation: TransposableOperation<C::Constant, C::Operation>
-            + ResidualZeroProvider<C::Type, Operation = C::Operation>
-            + ReferenceAccessOperation<
-                Transform: ReferenceTransform<Referent = <C::Type as ReferenceMemberType>::Referent>,
-            > + OperationProvider<
-                C::Type,
-                ReferenceNewOperation<<C::Type as ReferenceMemberType>::Referent, C::Type>,
-                Operation = C::Operation,
-            > + OperationProvider<
-                C::Type,
-                ReferenceAddUpdateOperation<
-                    <C::Type as ReferenceMemberType>::Referent,
-                    C::Type,
-                    <C::Operation as ReferenceAccessOperation>::Transform,
-                >,
-                Operation = C::Operation,
-            > + OperationProvider<C::Type, AddOperation<C::Type>, Operation = C::Operation>,
+        C::Operation: PullbackOperation<C::Type, C::Constant>,
         Input::Family: ParameterizedFamily<MaybeZero<CallerContext::Value>>,
         TracingContext<C::Constant, C::Operation>:
             StagingContext<Type = C::Type, Constant = C::Constant, Operation = C::Operation>,
@@ -1899,23 +1836,7 @@ impl<
         destinations: Input::To<CotangentDestination<C::Value>>,
     ) -> Result<Input::To<Option<MaybeZero<C::Value>>>, ProgramError>
     where
-        C::Operation: TransposableOperation<C::Constant, C::Operation>
-            + ResidualZeroProvider<C::Type, Operation = C::Operation>
-            + ReferenceAccessOperation<
-                Transform: ReferenceTransform<Referent = <C::Type as ReferenceMemberType>::Referent>,
-            > + OperationProvider<
-                C::Type,
-                ReferenceNewOperation<<C::Type as ReferenceMemberType>::Referent, C::Type>,
-                Operation = C::Operation,
-            > + OperationProvider<
-                C::Type,
-                ReferenceAddUpdateOperation<
-                    <C::Type as ReferenceMemberType>::Referent,
-                    C::Type,
-                    <C::Operation as ReferenceAccessOperation>::Transform,
-                >,
-                Operation = C::Operation,
-            > + OperationProvider<C::Type, AddOperation<C::Type>, Operation = C::Operation>,
+        C::Operation: PullbackOperation<C::Type, C::Constant>,
         Input::Family:
             ParameterizedFamily<CotangentDestination<C::Value>> + ParameterizedFamily<Option<MaybeZero<C::Value>>>,
         Output::Family: ParameterizedFamily<CotangentSeed<C::Value>>,
@@ -1946,23 +1867,7 @@ impl<
         CallerContext:
             Context<Type = C::Type, Constant = C::Constant, Operation = C::Operation> + ImportingContext<C, Path>,
         Output::Family: ParameterizedFamily<CallerContext::Value>,
-        C::Operation: TransposableOperation<C::Constant, C::Operation>
-            + ResidualZeroProvider<C::Type, Operation = C::Operation>
-            + ReferenceAccessOperation<
-                Transform: ReferenceTransform<Referent = <C::Type as ReferenceMemberType>::Referent>,
-            > + OperationProvider<
-                C::Type,
-                ReferenceNewOperation<<C::Type as ReferenceMemberType>::Referent, C::Type>,
-                Operation = C::Operation,
-            > + OperationProvider<
-                C::Type,
-                ReferenceAddUpdateOperation<
-                    <C::Type as ReferenceMemberType>::Referent,
-                    C::Type,
-                    <C::Operation as ReferenceAccessOperation>::Transform,
-                >,
-                Operation = C::Operation,
-            > + OperationProvider<C::Type, AddOperation<C::Type>, Operation = C::Operation>,
+        C::Operation: PullbackOperation<C::Type, C::Constant>,
         Input::Family: ParameterizedFamily<CotangentDestination<CallerContext::Value>>
             + ParameterizedFamily<Option<MaybeZero<CallerContext::Value>>>,
         Output::Family: ParameterizedFamily<CotangentSeed<CallerContext::Value>>,
@@ -1994,23 +1899,7 @@ impl<
                 C::Type,
                 ReferenceFreezeOperation<<C::Type as ReferenceMemberType>::Referent, C::Type>,
                 Operation = C::Operation,
-            > + TransposableOperation<C::Constant, C::Operation>
-            + ResidualZeroProvider<C::Type, Operation = C::Operation>
-            + ReferenceAccessOperation<
-                Transform: ReferenceTransform<Referent = <C::Type as ReferenceMemberType>::Referent>,
-            > + OperationProvider<
-                C::Type,
-                ReferenceNewOperation<<C::Type as ReferenceMemberType>::Referent, C::Type>,
-                Operation = C::Operation,
-            > + OperationProvider<
-                C::Type,
-                ReferenceAddUpdateOperation<
-                    <C::Type as ReferenceMemberType>::Referent,
-                    C::Type,
-                    <C::Operation as ReferenceAccessOperation>::Transform,
-                >,
-                Operation = C::Operation,
-            > + OperationProvider<C::Type, AddOperation<C::Type>, Operation = C::Operation>,
+            > + PullbackOperation<C::Type, C::Constant>,
         TracingContext<C::Constant, C::Operation>:
             StagingContext<Type = C::Type, Constant = C::Constant, Operation = C::Operation>,
     {
@@ -2066,23 +1955,7 @@ impl<
     where
         CallerContext:
             Context<Type = C::Type, Constant = C::Constant, Operation = C::Operation> + ImportingContext<C, Path>,
-        C::Operation: TransposableOperation<C::Constant, C::Operation>
-            + ResidualZeroProvider<C::Type, Operation = C::Operation>
-            + ReferenceAccessOperation<
-                Transform: ReferenceTransform<Referent = <C::Type as ReferenceMemberType>::Referent>,
-            > + OperationProvider<
-                C::Type,
-                ReferenceNewOperation<<C::Type as ReferenceMemberType>::Referent, C::Type>,
-                Operation = C::Operation,
-            > + OperationProvider<
-                C::Type,
-                ReferenceAddUpdateOperation<
-                    <C::Type as ReferenceMemberType>::Referent,
-                    C::Type,
-                    <C::Operation as ReferenceAccessOperation>::Transform,
-                >,
-                Operation = C::Operation,
-            > + OperationProvider<C::Type, AddOperation<C::Type>, Operation = C::Operation>,
+        C::Operation: PullbackOperation<C::Type, C::Constant>,
         TracingContext<C::Constant, C::Operation>:
             StagingContext<Type = C::Type, Constant = C::Constant, Operation = C::Operation>,
     {

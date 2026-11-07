@@ -166,15 +166,12 @@ use crate::differentiation::hessian::hessian_in_context;
 use crate::differentiation::jacobian::{jacobian_forward_in_context, jacobian_reverse_in_context};
 use crate::differentiation::reverse::{value_and_gradient_auxiliary_in_context, value_and_gradient_in_context};
 use crate::errors::MaybeFallible;
-use crate::operations::{
-    AddOperation, OneOperation, ReferenceAddUpdateOperation, ReferenceFreezeOperation, ReferenceNewOperation, Zero,
-    ZeroLikeOperation,
-};
+use crate::operations::{OneOperation, ReferenceFreezeOperation, ReferenceNewOperation, Zero, ZeroLikeOperation};
 use crate::parameters::{ParameterError, Parameterized, ParameterizedFamily};
 use crate::partial::{PartialEvaluationContext, PartiallyEvaluatableOperation};
 use crate::programs::{
-    Operation, OperationProvider, ProgramError, ReferenceAccessOperation, ReferenceBoundary, ReferenceBoundaryError,
-    ReferenceMemberType, ReferenceTransform, TypeError, Value,
+    Operation, OperationProvider, ProgramError, ReferenceBoundary, ReferenceBoundaryError, ReferenceMemberType,
+    TypeError, Value,
 };
 use crate::tracing::TracingContext;
 
@@ -221,8 +218,8 @@ pub use rematerialization::{
 };
 pub use reverse::{
     CotangentAccumulator, CotangentDestination, CotangentDestinationKind, CotangentDestinations,
-    CotangentReferenceAccumulator, CotangentSeed, Pullback, ReverseModeDifferentiate, TransposableOperation,
-    TransposedProgram, TransposedProgramCotangent, TranspositionContext, TranspositionDriver,
+    CotangentReferenceAccumulator, CotangentSeed, Pullback, PullbackOperation, ReverseModeDifferentiate,
+    TransposableOperation, TransposedProgram, TransposedProgramCotangent, TranspositionContext, TranspositionDriver,
 };
 pub use types::{DenseDifferentiableType, DifferentiableType};
 pub use zeros::ResidualZeroProvider;
@@ -1152,23 +1149,7 @@ impl<Input, LinearityState: DifferentiationBuilderLinearityMode, ContextState>
         C::Operation: PartiallyEvaluatableOperation<C>
             + PartiallyEvaluatableOperation<TracingContext<C::Constant, C::Operation>>
             + DifferentiableOperation<PartialEvaluationContext<C>>
-            + TransposableOperation<C::Constant, C::Operation>
-            + ResidualZeroProvider<V::Type, Operation = C::Operation>
-            + ReferenceAccessOperation<
-                Transform: ReferenceTransform<Referent = <V::Type as ReferenceMemberType>::Referent>,
-            > + OperationProvider<
-                V::Type,
-                ReferenceNewOperation<<V::Type as ReferenceMemberType>::Referent, V::Type>,
-                Operation = C::Operation,
-            > + OperationProvider<
-                V::Type,
-                ReferenceAddUpdateOperation<
-                    <V::Type as ReferenceMemberType>::Referent,
-                    V::Type,
-                    <C::Operation as ReferenceAccessOperation>::Transform,
-                >,
-                Operation = C::Operation,
-            > + OperationProvider<V::Type, AddOperation<V::Type>, Operation = C::Operation>,
+            + PullbackOperation<V::Type, C::Constant>,
         V: Value,
         V::Type: DenseDifferentiableType<C> + ReferenceMemberType,
         Input: Parameterized<V, To<V> = Input>,
@@ -1232,23 +1213,7 @@ impl<Input, LinearityState: DifferentiationBuilderLinearityMode, ContextState>
             + DifferentiableOperation<TracingContext<C::Constant, C::Operation>>
             + DifferentiableOperation<PartialEvaluationContext<TracingContext<C::Constant, C::Operation>>>
             + DifferentiableOperation<PartialEvaluationContext<LinearizationContext<C>>>
-            + TransposableOperation<C::Constant, C::Operation>
-            + ResidualZeroProvider<V::Type, Operation = C::Operation>
-            + ReferenceAccessOperation<
-                Transform: ReferenceTransform<Referent = <V::Type as ReferenceMemberType>::Referent>,
-            > + OperationProvider<
-                V::Type,
-                ReferenceNewOperation<<V::Type as ReferenceMemberType>::Referent, V::Type>,
-                Operation = C::Operation,
-            > + OperationProvider<
-                V::Type,
-                ReferenceAddUpdateOperation<
-                    <V::Type as ReferenceMemberType>::Referent,
-                    V::Type,
-                    <C::Operation as ReferenceAccessOperation>::Transform,
-                >,
-                Operation = C::Operation,
-            > + OperationProvider<V::Type, AddOperation<V::Type>, Operation = C::Operation>,
+            + PullbackOperation<V::Type, C::Constant>,
         V: Value,
         V::Type: DenseDifferentiableType<C> + DenseDifferentiableType<LinearizationContext<C>> + ReferenceMemberType,
         Input: Parameterized<V, To<V> = Input>,
@@ -1467,23 +1432,7 @@ impl<Input, LinearityState: DifferentiationBuilderLinearityMode, ContextState>
         C::Operation: PartiallyEvaluatableOperation<C>
             + PartiallyEvaluatableOperation<TracingContext<C::Constant, C::Operation>>
             + DifferentiableOperation<PartialEvaluationContext<C>>
-            + TransposableOperation<C::Constant, C::Operation>
-            + ResidualZeroProvider<V::Type, Operation = C::Operation>
-            + ReferenceAccessOperation<
-                Transform: ReferenceTransform<Referent = <V::Type as ReferenceMemberType>::Referent>,
-            > + OperationProvider<
-                V::Type,
-                ReferenceNewOperation<<V::Type as ReferenceMemberType>::Referent, V::Type>,
-                Operation = C::Operation,
-            > + OperationProvider<
-                V::Type,
-                ReferenceAddUpdateOperation<
-                    <V::Type as ReferenceMemberType>::Referent,
-                    V::Type,
-                    <C::Operation as ReferenceAccessOperation>::Transform,
-                >,
-                Operation = C::Operation,
-            > + OperationProvider<V::Type, AddOperation<V::Type>, Operation = C::Operation>,
+            + PullbackOperation<V::Type, C::Constant>,
         V: Value,
         V::Type: DenseDifferentiableType<C> + ReferenceMemberType,
         Input: Parameterized<V, To<V> = Input>,
@@ -1537,23 +1486,7 @@ impl<Input, LinearityState: DifferentiationBuilderLinearityMode, ContextState>
             + DifferentiableOperation<TracingContext<C::Constant, C::Operation>>
             + DifferentiableOperation<PartialEvaluationContext<TracingContext<C::Constant, C::Operation>>>
             + DifferentiableOperation<PartialEvaluationContext<LinearizationContext<C>>>
-            + TransposableOperation<C::Constant, C::Operation>
-            + ResidualZeroProvider<V::Type, Operation = C::Operation>
-            + ReferenceAccessOperation<
-                Transform: ReferenceTransform<Referent = <V::Type as ReferenceMemberType>::Referent>,
-            > + OperationProvider<
-                V::Type,
-                ReferenceNewOperation<<V::Type as ReferenceMemberType>::Referent, V::Type>,
-                Operation = C::Operation,
-            > + OperationProvider<
-                V::Type,
-                ReferenceAddUpdateOperation<
-                    <V::Type as ReferenceMemberType>::Referent,
-                    V::Type,
-                    <C::Operation as ReferenceAccessOperation>::Transform,
-                >,
-                Operation = C::Operation,
-            > + OperationProvider<V::Type, AddOperation<V::Type>, Operation = C::Operation>,
+            + PullbackOperation<V::Type, C::Constant>,
         V: Value,
         V::Type: DenseDifferentiableType<C> + DenseDifferentiableType<LinearizationContext<C>> + ReferenceMemberType,
         Input: Parameterized<V, To<V> = Input>,
@@ -1881,23 +1814,7 @@ impl<Input, Capture, LinearityState: DifferentiationBuilderLinearityMode, Contex
         C::Operation: PartiallyEvaluatableOperation<C>
             + PartiallyEvaluatableOperation<TracingContext<C::Constant, C::Operation>>
             + DifferentiableOperation<PartialEvaluationContext<C>>
-            + TransposableOperation<C::Constant, C::Operation>
-            + ResidualZeroProvider<V::Type, Operation = C::Operation>
-            + ReferenceAccessOperation<
-                Transform: ReferenceTransform<Referent = <V::Type as ReferenceMemberType>::Referent>,
-            > + OperationProvider<
-                V::Type,
-                ReferenceNewOperation<<V::Type as ReferenceMemberType>::Referent, V::Type>,
-                Operation = C::Operation,
-            > + OperationProvider<
-                V::Type,
-                ReferenceAddUpdateOperation<
-                    <V::Type as ReferenceMemberType>::Referent,
-                    V::Type,
-                    <C::Operation as ReferenceAccessOperation>::Transform,
-                >,
-                Operation = C::Operation,
-            > + OperationProvider<V::Type, AddOperation<V::Type>, Operation = C::Operation>,
+            + PullbackOperation<V::Type, C::Constant>,
         V: Value,
         V::Type: DenseDifferentiableType<C> + ReferenceMemberType,
         Input: Parameterized<V, To<V> = Input>,
@@ -1954,23 +1871,7 @@ impl<Input, Capture, LinearityState: DifferentiationBuilderLinearityMode, Contex
             + DifferentiableOperation<TracingContext<C::Constant, C::Operation>>
             + DifferentiableOperation<PartialEvaluationContext<TracingContext<C::Constant, C::Operation>>>
             + DifferentiableOperation<PartialEvaluationContext<LinearizationContext<C>>>
-            + TransposableOperation<C::Constant, C::Operation>
-            + ResidualZeroProvider<V::Type, Operation = C::Operation>
-            + ReferenceAccessOperation<
-                Transform: ReferenceTransform<Referent = <V::Type as ReferenceMemberType>::Referent>,
-            > + OperationProvider<
-                V::Type,
-                ReferenceNewOperation<<V::Type as ReferenceMemberType>::Referent, V::Type>,
-                Operation = C::Operation,
-            > + OperationProvider<
-                V::Type,
-                ReferenceAddUpdateOperation<
-                    <V::Type as ReferenceMemberType>::Referent,
-                    V::Type,
-                    <C::Operation as ReferenceAccessOperation>::Transform,
-                >,
-                Operation = C::Operation,
-            > + OperationProvider<V::Type, AddOperation<V::Type>, Operation = C::Operation>,
+            + PullbackOperation<V::Type, C::Constant>,
         V: Value,
         V::Type: DenseDifferentiableType<C> + DenseDifferentiableType<LinearizationContext<C>> + ReferenceMemberType,
         Input: Parameterized<V, To<V> = Input>,
@@ -2209,23 +2110,7 @@ impl<Input, Capture, LinearityState: DifferentiationBuilderLinearityMode, Contex
         C::Operation: PartiallyEvaluatableOperation<C>
             + PartiallyEvaluatableOperation<TracingContext<C::Constant, C::Operation>>
             + DifferentiableOperation<PartialEvaluationContext<C>>
-            + TransposableOperation<C::Constant, C::Operation>
-            + ResidualZeroProvider<V::Type, Operation = C::Operation>
-            + ReferenceAccessOperation<
-                Transform: ReferenceTransform<Referent = <V::Type as ReferenceMemberType>::Referent>,
-            > + OperationProvider<
-                V::Type,
-                ReferenceNewOperation<<V::Type as ReferenceMemberType>::Referent, V::Type>,
-                Operation = C::Operation,
-            > + OperationProvider<
-                V::Type,
-                ReferenceAddUpdateOperation<
-                    <V::Type as ReferenceMemberType>::Referent,
-                    V::Type,
-                    <C::Operation as ReferenceAccessOperation>::Transform,
-                >,
-                Operation = C::Operation,
-            > + OperationProvider<V::Type, AddOperation<V::Type>, Operation = C::Operation>,
+            + PullbackOperation<V::Type, C::Constant>,
         V: Value,
         V::Type: DenseDifferentiableType<C> + ReferenceMemberType,
         Input: Parameterized<V, To<V> = Input>,
@@ -2284,23 +2169,7 @@ impl<Input, Capture, LinearityState: DifferentiationBuilderLinearityMode, Contex
             + DifferentiableOperation<TracingContext<C::Constant, C::Operation>>
             + DifferentiableOperation<PartialEvaluationContext<TracingContext<C::Constant, C::Operation>>>
             + DifferentiableOperation<PartialEvaluationContext<LinearizationContext<C>>>
-            + TransposableOperation<C::Constant, C::Operation>
-            + ResidualZeroProvider<V::Type, Operation = C::Operation>
-            + ReferenceAccessOperation<
-                Transform: ReferenceTransform<Referent = <V::Type as ReferenceMemberType>::Referent>,
-            > + OperationProvider<
-                V::Type,
-                ReferenceNewOperation<<V::Type as ReferenceMemberType>::Referent, V::Type>,
-                Operation = C::Operation,
-            > + OperationProvider<
-                V::Type,
-                ReferenceAddUpdateOperation<
-                    <V::Type as ReferenceMemberType>::Referent,
-                    V::Type,
-                    <C::Operation as ReferenceAccessOperation>::Transform,
-                >,
-                Operation = C::Operation,
-            > + OperationProvider<V::Type, AddOperation<V::Type>, Operation = C::Operation>,
+            + PullbackOperation<V::Type, C::Constant>,
         V: Value,
         V::Type: DenseDifferentiableType<C> + DenseDifferentiableType<LinearizationContext<C>> + ReferenceMemberType,
         Input: Parameterized<V, To<V> = Input>,

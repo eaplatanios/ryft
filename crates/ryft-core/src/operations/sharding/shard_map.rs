@@ -323,7 +323,7 @@ use crate::programs::{
     RegionInterface, RegionLiveness, RegionRef, RegionReplayMappings, RegionSlot, ReplayRegionDriver, Type, TypeError,
     Typed, TypedProgram, Value, ValueDirectDispatch, ValueProjection,
 };
-use crate::tracing::{DomainTracer, DomainTracingContext, Tracer, TracingContext};
+use crate::tracing::{DomainTracer, DomainTracingContext, Tracer, TracingContext, TracingScope};
 
 /// Error type related to [`ShardMapOperation`], covering mesh and sharding validation, global and local boundary
 /// derivation, manual variation, and the semantic restrictions on `shard_map` bodies. It carries no backend state,
@@ -7577,7 +7577,7 @@ where
 
         // The body's outputs determine the rebuilt boundary, which the checks below then use in place of `boundary`.
         let rebuilt_boundary = OnceCell::new();
-        let (_, body) = DomainTracingContext::<C>::trace_with_context_named_axes_and_default_mesh(
+        let (_, body) = DomainTracingContext::<C>::trace_with_context_in_scope(
             |context: &DomainTracingContext<C>, local_inputs: Vec<DomainTracer<C>>| {
                 let local_inputs = local_inputs
                     .into_iter()
@@ -7617,8 +7617,7 @@ where
                     .collect::<Result<Vec<_>, ProgramError>>()
             },
             local_input_types.iter().cloned().map(ArrayIrType::Array).collect::<Vec<_>>(),
-            outer_named_axes,
-            Some(mesh.clone()),
+            TracingScope::new(outer_named_axes, Some(mesh.clone())),
         )?;
         let boundary = rebuilt_boundary.into_inner().unwrap_or(boundary);
         let body = body.simplified()?;

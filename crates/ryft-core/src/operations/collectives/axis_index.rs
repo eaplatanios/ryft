@@ -29,9 +29,9 @@ pub const AXIS_INDEX_OPERATION_NAME: &str = "axis_index";
 /// such trace-time binder. Its per-device coordinate is known only at execution time, and so the operation stays in the
 /// staged body and lowers, for example, inside a `shard_map` operation manual region to `partition_id`-based coordinate
 /// arithmetic. Only mesh uses therefore reach interpretation, which is why this operation is _not_ eagerly
-/// interpretable and, having no inputs, is [partially evaluated](PartiallyEvaluatableOperation) by residualizing
-/// rather than folding (that is because folding a nullary operation would result in trying to interpret it).
-/// A checked manual binding records its mesh on the operation and gives the result manual variation over the axis.
+/// interpretable. [Partial evaluation](PartiallyEvaluatableOperation) binds it into the known side, where an enclosing
+/// batching level resolves a batched axis, and keeps a mesh coordinate residual when an eager known side cannot produce
+/// it. A checked manual binding records its mesh on the operation and gives the result manual variation over the axis.
 /// An unchecked manual binding retains the physical coordinate reader with no recorded mesh or variation metadata.
 ///
 /// # Examples
@@ -166,9 +166,13 @@ impl<C: Context<Type = ArrayType, Operation: From<AxisIndexOperation>>> Partiall
         _driver: &D,
         inputs: &[PartialEvaluationValue<C::Value>],
     ) -> Result<Vec<PartialEvaluationValue<C::Value>>, ProgramError> {
-        // Partial evaluation always residualizes an `AxisIndexOperation`. Its value depends on the executing device,
-        // and so it is never a foldable constant even though it has no (known) inputs.
-        context.residualize(self.clone(), Vec::new(), inputs)
+        // The index of a batched axis is known to the batching level that binds it, which sits on the known side of
+        // this context (a batching level inside the partially evaluated function would have consumed the operation
+        // before it got here). Binding into the known side lets that level resolve it, which is what a linearized or
+        // differentiated function that reads an enclosing batch axis needs. A device mesh coordinate has no eager
+        // value, so an eager known side reports it as unsupported and the operation stays residual, while a staged
+        // known side (e.g., a `shard_map` body) stages it like any other known work.
+        context.fold_or_residualize(self.clone(), Vec::new(), inputs)
     }
 }
 
@@ -228,11 +232,10 @@ impl<C: Context<Operation: From<AxisIndexOperation>> + NamedAxes> AxisIndex for 
         // batching level that bound `name` consumes it (its batching rule materializes the per-element index), an inner
         // batching level re-binds it into its parent, and a mesh axis survives into the base program to lower during
         // sharded execution (refer to the documentation of `AxisIndexOperation`). Because resolution happens as the
-        // operation is consumed, a batched axis reached across a non-batching wrapper that *interprets* a nested
-        // program (e.g., an outer batch addressed from inside a `jvp` trace, whose primal program is spliced by
-        // interpretation) is not supported. The operation is interpreted before any batching rule can consume it
-        // and reports `ProgramError::UnsupportedOperation`. Mesh axes are unaffected, as they are meant to survive
-        // interpretation.
+        // operation is consumed, every transform between the binding level and this context must forward it outward:
+        // differentiation treats it as non-differentiable primal work and partial evaluation binds it into its known
+        // side, so an outer batch axis can be read from inside `jvp`, `linearize`, `vjp`, and gradient traces,
+        // including inside rematerialized and composite bodies.
         let named_axis = self.named_axis(name).ok_or_else(|| AxisError::UnboundAxisName { name: name.to_string() })?;
         let operation = AxisIndexOperation::new(name.to_string());
         let operation = if named_axis.checks_manual_variation()
@@ -257,11 +260,13 @@ mod tests {
     use crate::axes::NamedAxis;
     use crate::batching::{BatchAxis, BatchAxisSpecification, batch};
     use crate::contexts::EagerContext;
+    use crate::differentiation::{Differentiate, rematerialize};
     use crate::macros::check_operation_type_inference;
+    use crate::operations::{Add, ConvertElementType};
     use crate::parameters::Placeholder;
     use crate::partial::PartialEvaluationOutput;
-    use crate::programs::{EmptyRegionDriver, ProgramBuilder, Typed};
-    use crate::tracing::{DomainTracingContext, TracingContext};
+    use crate::programs::{EmptyRegionDriver, ProgramBuilder, Typed, Value};
+    use crate::tracing::{DomainTracingContext, Tracer, TracingContext};
 
     use super::*;
 
@@ -363,6 +368,33 @@ mod tests {
                         axis_index [axis_name=\"devices\", mesh=['devices'=2:manual]]
                 in (%0)"},
         );
+    }
+
+    #[test]
+    fn test_axis_index_partial_evaluation_under_batching() {
+        // Linearizing or differentiating a function that reads an enclosing batch axis binds `axis_index` into the
+        // known side, where the batching level that binds the axis resolves it. This also holds inside rematerialized
+        // bodies, which are partially evaluated as nested programs. `x + i` has the gradient `1` for every item.
+        type Body = Tracer<TracingContext<Array, ArrayOperation<Array>>>;
+        let function = rematerialize(|x: Body| {
+            let index = x.domain().axis_index("i")?.convert_element_type(DataType::F64)?;
+            x.add(&index)
+        });
+        let (outputs, gradients): (Array, Array) = batch(
+            |x| {
+                let context = x.context().clone();
+                let (output, _) = context.differentiate_at(x.clone()).linearize(|x| function.call(x))?;
+                let gradient = context.differentiate_at(x).gradient(|x| function.call(x))?;
+                Ok((output, gradient))
+            },
+            Array::vector(vec![10.0, 20.0, 30.0]).unwrap(),
+            BatchAxis::new(0),
+            (BatchAxis::new(0), BatchAxis::new(0)),
+            BatchAxisSpecification::named("i"),
+        )
+        .unwrap();
+        assert_eq!(outputs, Array::vector(vec![10.0, 21.0, 32.0]).unwrap());
+        assert_eq!(gradients, Array::vector(vec![1.0, 1.0, 1.0]).unwrap());
     }
 
     #[test]

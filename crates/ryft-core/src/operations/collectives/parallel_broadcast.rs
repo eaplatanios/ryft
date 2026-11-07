@@ -2585,7 +2585,7 @@ mod tests {
                 (Array::vector(vec![7f32, 8.0]).unwrap(), Array::scalar(1u64).unwrap()),
                 (BatchAxis::replicated(), BatchAxis::replicated()),
                 BatchAxis::replicated(),
-                BatchAxisSpecification::new(2, "x"),
+                BatchAxisSpecification::named("x").with_extent(2),
             ),
             Ok(Array::vector(vec![7f32, 8.0]).unwrap()),
         );

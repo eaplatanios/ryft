@@ -344,7 +344,7 @@ mod tests {
                 Array::vector(vec![3f32, 5.0]).unwrap(),
                 BatchAxis::replicated(),
                 BatchAxis::replicated(),
-                BatchAxisSpecification::new(3, "rows"),
+                BatchAxisSpecification::named("rows").with_extent(3),
             ),
             Ok(Array::vector(vec![0u64, 0]).unwrap()),
         );

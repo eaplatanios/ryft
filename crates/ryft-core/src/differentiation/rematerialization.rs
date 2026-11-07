@@ -227,7 +227,7 @@ use crate::partial::{
 use crate::programs::{
     ErasedOperation, Operation, OperationPayloadProjection, ProgramError, Type, TypeError, Typed, Value,
 };
-use crate::tracing::{DomainTracer, DomainTracingContext, Tracer, TracingContext};
+use crate::tracing::{DomainTracer, DomainTracingContext, Tracer, TracingContext, TracingScope};
 
 /// Rematerialized function, which [`rematerialize`] creates from a closure over [`DomainTracer`]s.
 pub struct RematerializedFunction<Input, Output, Body, Policy = NothingSavable> {
@@ -408,11 +408,10 @@ impl<Input, Output, Body, Policy> RematerializedFunction<Input, Output, Body, Po
             StagingContext<Type = C::Type, Constant = C::Constant, Operation = C::Operation>,
     {
         let policy = self.policy.reference::<C::Type>()?;
-        let (output_types, body) = DomainTracingContext::<C>::trace_with_named_axes_and_default_mesh(
+        let (output_types, body) = DomainTracingContext::<C>::trace_in_scope(
             &self.body,
             input_types,
-            context.named_axes(),
-            context.default_mesh(),
+            TracingScope::new(context.named_axes(), context.default_mesh()),
         )?;
         let output_structure = output_types.parameter_structure();
         let operation =

@@ -4,6 +4,7 @@ use crate::arrays::{
 };
 use crate::batching::{BatchableOperation, BatchingContext, BatchingPolicy, RecursiveBatchingPolicy};
 use crate::contexts::{Context, ContextProjection, ProjectedContext, StagingContext};
+use crate::differentiation::projections::Projected;
 use crate::differentiation::{DerivativeTransform, DifferentiationError, DifferentiationParameterRole};
 use crate::operations::{
     Add, Broadcast, BroadcastOperation, Compare, ComparisonDirection, Fill, Iota, Mul, One, Reshape, Select, Slice,
@@ -440,22 +441,17 @@ where
         Ok(ArrayBatchingPolicy::batch_region(&context, region, inputs).map_err(ProgramError::from)?)
     }
 
+    #[inline]
     fn validate_hessian_block_type(
         block_type: &Self,
         output_type: &Self,
         first_input_type: &Self,
         second_input_type: &Self,
     ) -> Result<(), DifferentiationError> {
-        let first_input_cotangent_type = first_input_type.cotangent()?;
-        if first_input_cotangent_type.is_zero_space() {
-            return Err(
-                TypeError::invalid(format!("hessian input type {first_input_type} has no cotangent type")).into()
-            );
-        }
         array_validate_hessian_block_type(
             DerivativeTransform::Hessian,
             block_type,
-            &first_input_cotangent_type,
+            first_input_type,
             &[output_type],
             &[second_input_type],
         )
@@ -478,6 +474,7 @@ where
         )
     }
 
+    #[inline]
     fn extract_reverse_jacobian_block(
         packed_output: &Self::PackedValue,
         packed_direction_count: usize,
@@ -497,21 +494,14 @@ where
 
 impl<C: ContextProjection<ArrayType, Type = ArrayIrType>> DenseDifferentiableType<C> for ArrayIrType
 where
-    <C::Value as ValueProjection<ArrayType>>::Projected: Add
-        + Mul
-        + Compare<<C::Value as ValueProjection<ArrayType>>::Projected>
-        + Select
-        + Broadcast
-        + Reshape
-        + Slice
-        + Transpose,
     C::Constant: ValueProjection<DimensionType, Projected = DimensionValue>,
-    ProjectedContext<C, ArrayType>: Context<Value = <C::Value as ValueProjection<ArrayType>>::Projected>,
-    ProjectedContext<C, ArrayType>: Context<Type = ArrayType>
-        + Zero<<C::Value as ValueProjection<ArrayType>>::Projected>
-        + One<<C::Value as ValueProjection<ArrayType>>::Projected>
-        + Iota<<C::Value as ValueProjection<ArrayType>>::Projected>
-        + Fill<u64, <C::Value as ValueProjection<ArrayType>>::Projected>,
+    Projected<C, ArrayType>:
+        Add + Mul + Compare<Projected<C, ArrayType>> + Select + Broadcast + Reshape + Slice + Transpose,
+    ProjectedContext<C, ArrayType>: Context<Type = ArrayType, Value = Projected<C, ArrayType>>
+        + Zero<Projected<C, ArrayType>>
+        + One<Projected<C, ArrayType>>
+        + Iota<Projected<C, ArrayType>>
+        + Fill<u64, Projected<C, ArrayType>>,
     ArrayIrBatchingPolicy:
         RecursiveBatchingPolicy<C> + BatchingPolicy<C, Batch = ArrayIrBatch<C::Value>, Extent = C::Value>,
 {
@@ -574,25 +564,23 @@ where
         Ok(ArrayIrBatchingPolicy::batch_region(&context, region, inputs).map_err(ProgramError::from)?)
     }
 
+    #[inline]
     fn validate_hessian_block_type(
         block_type: &Self,
         output_type: &Self,
         first_input_type: &Self,
         second_input_type: &Self,
     ) -> Result<(), DifferentiationError> {
+        let block_type = array_member(block_type)?;
+        let output_type = array_member(output_type)?;
         let first_input_type = array_member(first_input_type)?;
-        let first_input_cotangent_type = first_input_type.cotangent()?;
-        if first_input_cotangent_type.is_zero_space() {
-            return Err(
-                TypeError::invalid(format!("hessian input type {first_input_type} has no cotangent type")).into()
-            );
-        }
+        let second_input_type = array_member(second_input_type)?;
         array_validate_hessian_block_type(
             DerivativeTransform::Hessian,
-            array_member(block_type)?,
-            &first_input_cotangent_type,
-            &[array_member(output_type)?],
-            &[array_member(second_input_type)?],
+            block_type,
+            first_input_type,
+            &[output_type],
+            &[second_input_type],
         )
     }
 
@@ -830,20 +818,24 @@ where
 
 /// Validates that `block_type` is the [`ArrayType`] expected for a materialized derivative block. The expected
 /// shape consists of every static coordinate dimension in `prefix_coordinate_types`, followed by the dimensions of
-/// `value_type`, followed by every static coordinate dimension in `suffix_coordinate_types`. The expected type keeps
-/// the element type, memory space, and sharding of `value_type`. Inserted coordinate dimensions are replicated in its
-/// sharding. Layout metadata is ignored because derivative materialization may change physical storage order without
-/// changing the logical block type.
+/// the differential value type, followed by every static coordinate dimension in `suffix_coordinate_types`. For a
+/// Hessian, `value_type` is the first input type, whose nontrivial cotangent type supplies the differential values.
+/// For a Jacobian, `value_type` is already the differential value type. The expected type keeps that differential
+/// type's element type, memory space, and sharding. Inserted coordinate dimensions are replicated in its sharding.
+/// Layout metadata is ignored because derivative materialization may change physical storage order without changing
+/// the logical block type.
 ///
-/// Returns [`DifferentiationError::NonFiniteCoordinateSpace`] if a coordinate type does not have a fully static shape,
-/// or a [`TypeError`] wrapped in [`DifferentiationError`] if `block_type` differs from the expected type after removing
-/// layout metadata.
+/// Returns [`DifferentiationError::NonFiniteCoordinateSpace`] if a coordinate type does not have a fully static
+/// shape, propagates errors from computing a Hessian input's cotangent type, or returns a [`TypeError`] wrapped in
+/// [`DifferentiationError`] if that cotangent type is trivial or `block_type` differs from the expected type after
+/// removing layout metadata.
 ///
 /// # Parameters
 ///
-///   - `transform`: Derivative transform being materialized, used when reporting a non-static coordinate space.
+///   - `transform`: Derivative transform, selecting Hessian cotangent conversion and identifying coordinate-space
+///     errors.
 ///   - `block_type`: Actual type of the materialized derivative block.
-///   - `value_type`: Per-coordinate differential value type whose dimensions form the center of the block.
+///   - `value_type`: First input type for a Hessian, or per-coordinate differential value type for a Jacobian.
 ///   - `prefix_coordinate_types`: Coordinate types whose static dimensions must precede the `value_type` dimensions,
 ///     in slice order.
 ///   - `suffix_coordinate_types`: Coordinate types whose static dimensions must follow the `value_type` dimensions,
@@ -855,7 +847,17 @@ fn array_validate_hessian_block_type(
     prefix_coordinate_types: &[&ArrayType],
     suffix_coordinate_types: &[&ArrayType],
 ) -> Result<(), DifferentiationError> {
-    let mut expected_type = value_type.clone().with_layout(None);
+    let mut expected_type = match transform {
+        DerivativeTransform::Hessian => {
+            let cotangent_type = value_type.cotangent()?;
+            if cotangent_type.is_zero_space() {
+                return Err(TypeError::invalid(format!("hessian input type {value_type} has no cotangent type")).into());
+            }
+            cotangent_type
+        }
+        DerivativeTransform::JacobianForward | DerivativeTransform::JacobianReverse => value_type.clone(),
+    }
+    .with_layout(None);
     let mut prefix_index = 0;
     for (coordinate_type, is_prefix) in prefix_coordinate_types
         .iter()

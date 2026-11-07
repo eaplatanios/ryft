@@ -16,13 +16,14 @@
 //! # Projected Values in Parent Contexts
 //!
 //! [`differentiate_in_parent_at`] is the differentiation counterpart of [`batch_in_parent`](crate::batch_in_parent),
-//! and goes the other way. Its active leaves are projections of values of a richer parent context (i.e., leaves of a
-//! [`ProjectedContext`], such as the [`ArrayType`](crate::ArrayType) views of array IR values), and its terminal
-//! functions differentiate in that parent context rather than in the projected one. The differentiated closures still
-//! receive projected values, but every operation that they bind is differentiated by the rules of the parent's
-//! universe, which can contain operations that the projected one lacks (e.g., calls of compiled functions). Results
-//! are projected back at their boundary: derivative values directly, and the reusable [`ParentPushforward`] and
-//! [`ParentPullback`] functions at every application, so that they take and return projected values as well.
+//! and goes the other way than the member rules above (i.e., from a projected context to its parent). Its active
+//! leaves are projections of values of a richer parent context (i.e., leaves of a [`ProjectedContext`], such as the
+//! [`ArrayType`](crate::ArrayType) views of array IR values), and its terminal functions differentiate in that parent
+//! context rather than in the projected one. The differentiated closures still receive projected values, but every
+//! operation that they bind is differentiated by the rules of the parent's universe, which can contain operations
+//! that the projected one lacks (e.g., calls of compiled functions). Results are projected back at their boundary:
+//! derivative values directly, and the reusable [`ParentPushforward`] and [`ParentPullback`] functions at every
+//! application, so that they take and return projected values as well.
 //!
 //! The terminal functions flatten the active leaves, lift them into the parent context, run the ordinary
 //! [`DifferentiationBuilder`](crate::DifferentiationBuilder) of that context, and rebuild the caller's structures from
@@ -42,23 +43,21 @@ use crate::differentiation::forward::{
 use crate::differentiation::hessian::Hessian;
 use crate::differentiation::jacobian::Jacobian;
 use crate::differentiation::reverse::{
-    CotangentAccumulator, Pullback, ReverseModeDifferentiate, TransposableOperation, TranspositionContext,
-    TranspositionDriver,
+    CotangentAccumulator, CotangentDestination, CotangentSeed, Pullback, PullbackOperation, ReverseModeDifferentiate,
+    TransposableOperation, TranspositionContext, TranspositionDriver,
 };
 use crate::differentiation::types::{DenseDifferentiableType, DifferentiableType};
 use crate::differentiation::zeros::ResidualZeroProvider;
 use crate::differentiation::{DifferentiationError, DifferentiationRule, differentiate_at};
 use crate::macros::{check_builders, check_count};
 use crate::operations::{
-    AddOperation, OneOperation, ReferenceAddUpdateOperation, ReferenceFreezeOperation, ReferenceNewOperation, Zero,
-    ZeroOperation,
+    AddOperation, OneOperation, ReferenceFreezeOperation, ReferenceNewOperation, Zero, ZeroOperation,
 };
 use crate::parameters::{Parameter, Parameterized, ParameterizedFamily, Placeholder};
 use crate::partial::{PartialEvaluationContext, PartialValue, PartiallyEvaluatableOperation};
 use crate::programs::{
     EmptyRegionDriver, MaybeZero, Operation, OperationProjection, OperationProvider, ProgramError, ProjectedValue,
-    ReferenceAccessOperation, ReferenceMemberType, ReferenceTransform, Type, TypeError, TypeIdentityPosition, Typed,
-    Value, ValueProjection,
+    ReferenceMemberType, Type, TypeError, TypeIdentityPosition, Typed, Value, ValueProjection,
 };
 use crate::tracing::{Tracer, TracingContext};
 
@@ -783,7 +782,7 @@ fn validate_region_free_structural_operation<O: Operation>(operation: &O) -> Res
 // Projected values in parent contexts.
 
 /// `T`-typed member representation of the values of the parent context `C`.
-type Projected<C, T> = <<C as Domain>::Value as ValueProjection<T>>::Projected;
+pub(super) type Projected<C, T> = <<C as Domain>::Value as ValueProjection<T>>::Projected;
 
 /// `T`-typed member representation of the parent tracer `X`, which differentiated closures receive.
 type ProjectedTracer<X, T> = ProjectedValue<T, X>;
@@ -868,6 +867,26 @@ where
     match value {
         MaybeZero::Zero(r#type) => Ok(MaybeZero::Zero(project_type(&r#type)?)),
         MaybeZero::Value(value) => Ok(MaybeZero::Value(value.into_projected()?)),
+    }
+}
+
+/// Lifts the value of a projected [`CotangentSeed`] into its parent value `P`.
+fn lift_seed<T: Type, P: ValueProjection<T>>(seed: CotangentSeed<P::Projected>) -> CotangentSeed<P> {
+    match seed {
+        CotangentSeed::Value(value) => CotangentSeed::Value(P::from_projected(value)),
+        CotangentSeed::Zero => CotangentSeed::Zero,
+        CotangentSeed::NoCotangent => CotangentSeed::NoCotangent,
+    }
+}
+
+/// Lifts the reference of a projected [`CotangentDestination`] into its parent value `P`.
+fn lift_destination<T: Type, P: ValueProjection<T>>(
+    destination: CotangentDestination<P::Projected>,
+) -> CotangentDestination<P> {
+    match destination {
+        CotangentDestination::Return => CotangentDestination::Return,
+        CotangentDestination::Reference(reference) => CotangentDestination::Reference(P::from_projected(reference)),
+        CotangentDestination::Ignore => CotangentDestination::Ignore,
     }
 }
 
@@ -1187,23 +1206,7 @@ impl<Input> ParentDifferentiationBuilder<Input> {
             + DifferentiableOperation<TracingContext<C::Constant, C::Operation>>
             + DifferentiableOperation<PartialEvaluationContext<TracingContext<C::Constant, C::Operation>>>
             + DifferentiableOperation<PartialEvaluationContext<LinearizationContext<C>>>
-            + TransposableOperation<C::Constant, C::Operation>
-            + ResidualZeroProvider<C::Type, Operation = C::Operation>
-            + ReferenceAccessOperation<
-                Transform: ReferenceTransform<Referent = <C::Type as ReferenceMemberType>::Referent>,
-            > + OperationProvider<
-                C::Type,
-                ReferenceNewOperation<<C::Type as ReferenceMemberType>::Referent, C::Type>,
-                Operation = C::Operation,
-            > + OperationProvider<
-                C::Type,
-                ReferenceAddUpdateOperation<
-                    <C::Type as ReferenceMemberType>::Referent,
-                    C::Type,
-                    <C::Operation as ReferenceAccessOperation>::Transform,
-                >,
-                Operation = C::Operation,
-            > + OperationProvider<C::Type, AddOperation<C::Type>, Operation = C::Operation>,
+            + PullbackOperation<C::Type, C::Constant>,
         T: Type,
         for<'t> &'t T: TryFrom<&'t C::Type, Error = TypeError>,
         L: Value<Type = T, Domain = ProjectedContext<C, T>>,
@@ -1278,7 +1281,7 @@ where
 {
     /// Returns the [`Pushforward`] in the parent context, over the flattened leaves of the linearized function.
     #[inline]
-    pub fn parent(&self) -> &Pushforward<C, Vec<C::Value>, Vec<C::Value>> {
+    pub fn inner(&self) -> &Pushforward<C, Vec<C::Value>, Vec<C::Value>> {
         &self.inner
     }
 
@@ -1343,7 +1346,7 @@ where
 {
     /// Returns the [`Pullback`] in the parent context, over the flattened leaves of the differentiated function.
     #[inline]
-    pub fn parent(&self) -> &Pullback<C, Vec<C::Value>, Vec<C::Value>> {
+    pub fn inner(&self) -> &Pullback<C, Vec<C::Value>, Vec<C::Value>> {
         &self.inner
     }
 
@@ -1352,23 +1355,7 @@ where
     where
         for<'t> &'t T: TryFrom<&'t C::Type, Error = TypeError>,
         Input::Family: ParameterizedFamily<MaybeZero<Projected<C, T>>>,
-        C::Operation: TransposableOperation<C::Constant, C::Operation>
-            + ResidualZeroProvider<C::Type, Operation = C::Operation>
-            + ReferenceAccessOperation<
-                Transform: ReferenceTransform<Referent = <C::Type as ReferenceMemberType>::Referent>,
-            > + OperationProvider<
-                C::Type,
-                ReferenceNewOperation<<C::Type as ReferenceMemberType>::Referent, C::Type>,
-                Operation = C::Operation,
-            > + OperationProvider<
-                C::Type,
-                ReferenceAddUpdateOperation<
-                    <C::Type as ReferenceMemberType>::Referent,
-                    C::Type,
-                    <C::Operation as ReferenceAccessOperation>::Transform,
-                >,
-                Operation = C::Operation,
-            > + OperationProvider<C::Type, AddOperation<C::Type>, Operation = C::Operation>,
+        C::Operation: PullbackOperation<C::Type, C::Constant>,
         TracingContext<C::Constant, C::Operation>:
             StagingContext<Type = C::Type, Constant = C::Constant, Operation = C::Operation>,
     {
@@ -1395,23 +1382,7 @@ where
         for<'t> &'t T: TryFrom<&'t C::Type, Error = TypeError>,
         Input::Family: ParameterizedFamily<MaybeZero<Projected<X, T>>>,
         Output::Family: ParameterizedFamily<Projected<X, T>>,
-        C::Operation: TransposableOperation<C::Constant, C::Operation>
-            + ResidualZeroProvider<C::Type, Operation = C::Operation>
-            + ReferenceAccessOperation<
-                Transform: ReferenceTransform<Referent = <C::Type as ReferenceMemberType>::Referent>,
-            > + OperationProvider<
-                C::Type,
-                ReferenceNewOperation<<C::Type as ReferenceMemberType>::Referent, C::Type>,
-                Operation = C::Operation,
-            > + OperationProvider<
-                C::Type,
-                ReferenceAddUpdateOperation<
-                    <C::Type as ReferenceMemberType>::Referent,
-                    C::Type,
-                    <C::Operation as ReferenceAccessOperation>::Transform,
-                >,
-                Operation = C::Operation,
-            > + OperationProvider<C::Type, AddOperation<C::Type>, Operation = C::Operation>,
+        C::Operation: PullbackOperation<C::Type, C::Constant>,
         TracingContext<C::Constant, C::Operation>:
             StagingContext<Type = C::Type, Constant = C::Constant, Operation = C::Operation>,
     {
@@ -1429,23 +1400,7 @@ where
     pub fn apply_materialized(&self, cotangents: Output) -> Result<Input, ProgramError>
     where
         C: Zero<C::Value>,
-        C::Operation: TransposableOperation<C::Constant, C::Operation>
-            + ResidualZeroProvider<C::Type, Operation = C::Operation>
-            + ReferenceAccessOperation<
-                Transform: ReferenceTransform<Referent = <C::Type as ReferenceMemberType>::Referent>,
-            > + OperationProvider<
-                C::Type,
-                ReferenceNewOperation<<C::Type as ReferenceMemberType>::Referent, C::Type>,
-                Operation = C::Operation,
-            > + OperationProvider<
-                C::Type,
-                ReferenceAddUpdateOperation<
-                    <C::Type as ReferenceMemberType>::Referent,
-                    C::Type,
-                    <C::Operation as ReferenceAccessOperation>::Transform,
-                >,
-                Operation = C::Operation,
-            > + OperationProvider<C::Type, AddOperation<C::Type>, Operation = C::Operation>,
+        C::Operation: PullbackOperation<C::Type, C::Constant>,
         TracingContext<C::Constant, C::Operation>:
             StagingContext<Type = C::Type, Constant = C::Constant, Operation = C::Operation>,
     {
@@ -1469,23 +1424,7 @@ where
             + Zero<X::Value>,
         Input::Family: ParameterizedFamily<Projected<X, T>>,
         Output::Family: ParameterizedFamily<Projected<X, T>>,
-        C::Operation: TransposableOperation<C::Constant, C::Operation>
-            + ResidualZeroProvider<C::Type, Operation = C::Operation>
-            + ReferenceAccessOperation<
-                Transform: ReferenceTransform<Referent = <C::Type as ReferenceMemberType>::Referent>,
-            > + OperationProvider<
-                C::Type,
-                ReferenceNewOperation<<C::Type as ReferenceMemberType>::Referent, C::Type>,
-                Operation = C::Operation,
-            > + OperationProvider<
-                C::Type,
-                ReferenceAddUpdateOperation<
-                    <C::Type as ReferenceMemberType>::Referent,
-                    C::Type,
-                    <C::Operation as ReferenceAccessOperation>::Transform,
-                >,
-                Operation = C::Operation,
-            > + OperationProvider<C::Type, AddOperation<C::Type>, Operation = C::Operation>,
+        C::Operation: PullbackOperation<C::Type, C::Constant>,
         TracingContext<C::Constant, C::Operation>:
             StagingContext<Type = C::Type, Constant = C::Constant, Operation = C::Operation>,
     {
@@ -1494,6 +1433,65 @@ where
             self.input_structure.clone(),
             self.inner.apply_materialized_in_context(context, cotangents)?,
         )
+    }
+
+    /// Projected counterpart of [`Pullback::apply_with_destinations`], whose seeds, destinations, and returned
+    /// cotangents hold projected values.
+    #[allow(clippy::type_complexity)]
+    pub fn apply_with_destinations(
+        &self,
+        seeds: Output::To<CotangentSeed<Projected<C, T>>>,
+        destinations: Input::To<CotangentDestination<Projected<C, T>>>,
+    ) -> Result<Input::To<Option<MaybeZero<Projected<C, T>>>>, ProgramError>
+    where
+        Input::Family: ParameterizedFamily<CotangentDestination<Projected<C, T>>>
+            + ParameterizedFamily<Option<MaybeZero<Projected<C, T>>>>,
+        Output::Family: ParameterizedFamily<CotangentSeed<Projected<C, T>>>,
+        C::Operation: PullbackOperation<C::Type, C::Constant>,
+        TracingContext<C::Constant, C::Operation>:
+            StagingContext<Type = C::Type, Constant = C::Constant, Operation = C::Operation>,
+        for<'t> &'t T: TryFrom<&'t C::Type, Error = TypeError>,
+    {
+        let seeds = seeds.into_parameters().map(lift_seed::<T, C::Value>).collect();
+        let destinations = destinations.into_parameters().map(lift_destination::<T, C::Value>).collect();
+        let cotangents = self
+            .inner
+            .apply_with_destinations(seeds, destinations)?
+            .into_iter()
+            .map(|cotangent| cotangent.map(project_maybe_zero::<T, C::Value>).transpose())
+            .collect::<Result<Vec<_>, _>>()?;
+        Ok(Input::To::<Option<MaybeZero<Projected<C, T>>>>::from_parameters(self.input_structure.clone(), cotangents)?)
+    }
+
+    /// Projected counterpart of [`Pullback::apply_with_destinations_in_context`], whose seeds and destinations are the
+    /// projected leaves of the caller context.
+    #[allow(clippy::type_complexity)]
+    pub fn apply_with_destinations_in_context<X, Path>(
+        &self,
+        context: &X,
+        seeds: Output::To<CotangentSeed<Projected<X, T>>>,
+        destinations: Input::To<CotangentDestination<Projected<X, T>>>,
+    ) -> Result<Input::To<Option<MaybeZero<Projected<X, T>>>>, ProgramError>
+    where
+        X: ContextProjection<T, Type = C::Type, Constant = C::Constant, Operation = C::Operation>
+            + ImportingContext<C, Path>,
+        Input::Family: ParameterizedFamily<CotangentDestination<Projected<X, T>>>
+            + ParameterizedFamily<Option<MaybeZero<Projected<X, T>>>>,
+        Output::Family: ParameterizedFamily<CotangentSeed<Projected<X, T>>>,
+        C::Operation: PullbackOperation<C::Type, C::Constant>,
+        TracingContext<C::Constant, C::Operation>:
+            StagingContext<Type = C::Type, Constant = C::Constant, Operation = C::Operation>,
+        for<'t> &'t T: TryFrom<&'t C::Type, Error = TypeError>,
+    {
+        let seeds = seeds.into_parameters().map(lift_seed::<T, X::Value>).collect();
+        let destinations = destinations.into_parameters().map(lift_destination::<T, X::Value>).collect();
+        let cotangents = self
+            .inner
+            .apply_with_destinations_in_context(context, seeds, destinations)?
+            .into_iter()
+            .map(|cotangent| cotangent.map(project_maybe_zero::<T, X::Value>).transpose())
+            .collect::<Result<Vec<_>, _>>()?;
+        Ok(Input::To::<Option<MaybeZero<Projected<X, T>>>>::from_parameters(self.input_structure.clone(), cotangents)?)
     }
 }
 
@@ -2344,12 +2342,12 @@ mod tests {
     }
 
     #[test]
-    fn test_parent_pushforward_parent() {
+    fn test_parent_pushforward_inner() {
         let program = trace_arrays(vec![ArrayType::scalar(DataType::F32)], |mut inputs| {
             let x = inputs.remove(0);
             let (_, pushforward) = differentiate_in_parent_at(x.clone()).linearize(|x| Ok(x.clone() * x)).unwrap();
             pushforward
-                .parent()
+                .inner()
                 .apply(vec![x.into_value()])?
                 .into_iter()
                 .map(ValueProjection::<ArrayType>::into_projected)
@@ -2411,11 +2409,11 @@ mod tests {
     }
 
     #[test]
-    fn test_parent_pullback_parent() {
+    fn test_parent_pullback_inner() {
         let program = trace_arrays(vec![ArrayType::scalar(DataType::F32)], |mut inputs| {
             let x = inputs.remove(0);
             let (_, pullback) = differentiate_in_parent_at(x.clone()).vjp(|x| Ok(x.clone() * x)).unwrap();
-            let mut cotangents = pullback.parent().apply(vec![x.into_value()])?;
+            let mut cotangents = pullback.inner().apply(vec![x.into_value()])?;
             let MaybeZero::Value(cotangent) = cotangents.remove(0) else {
                 panic!("a connected input must have a live cotangent");
             };
@@ -2541,6 +2539,83 @@ mod tests {
                 Array::from_elements(vector.clone(), &[6f32, 12.0]).unwrap(),
                 Array::from_elements(vector, &[0f32, 0.0]).unwrap()
             ]
+        );
+    }
+
+    #[test]
+    fn test_parent_pullback_apply_with_destinations() {
+        let scalar = ArrayType::scalar(DataType::F32);
+        let vector = ArrayType::new_static(DataType::F32, [2]);
+        let program = trace_arrays(vec![scalar, vector.clone()], |mut inputs| {
+            let y = inputs.pop().unwrap();
+            let x = inputs.pop().unwrap();
+            let (_, pullback) =
+                differentiate_in_parent_at((x.clone(), vec![y])).vjp(|(x, _)| Ok(x.clone() * x)).unwrap();
+
+            // A returned cotangent keeps its projected type, while an ignored one has no result.
+            let (dx, dys) = pullback.apply_with_destinations(
+                CotangentSeed::Value(x),
+                (CotangentDestination::Return, vec![CotangentDestination::Ignore]),
+            )?;
+            assert_eq!(dys, vec![None]);
+            let Some(MaybeZero::Value(dx)) = dx else {
+                panic!("a connected returned input must have a live cotangent");
+            };
+
+            // A structural zero seed returns a structural zero cotangent of the projected type.
+            let (zero, _) = pullback.apply_with_destinations(
+                CotangentSeed::Zero,
+                (CotangentDestination::Return, vec![CotangentDestination::Ignore]),
+            )?;
+            assert_eq!(zero, Some(MaybeZero::Zero(ArrayType::scalar(DataType::F32))));
+            Ok(vec![dx])
+        });
+        assert_eq!(
+            interpret_arrays(
+                &program,
+                vec![Array::scalar(3f32).unwrap(), Array::from_elements(vector, &[4f32, 5.0]).unwrap()]
+            ),
+            vec![Array::scalar(18f32).unwrap()]
+        );
+    }
+
+    #[test]
+    fn test_parent_pullback_apply_with_destinations_in_context() {
+        let vector = ArrayType::new_static(DataType::F32, [2]);
+        let matrix = ArrayType::new_static(DataType::F32, [2, 2]);
+        let program = trace_arrays(vec![vector.clone(), matrix.clone()], |mut inputs| {
+            let seeds = inputs.pop().unwrap();
+            let x = inputs.pop().unwrap();
+            let (_, pullback) = differentiate_in_parent_at(x).vjp(|x| Ok(x.clone() * x)).unwrap();
+            let cotangents = batch_in_parent(
+                |seed| {
+                    let Some(MaybeZero::Value(cotangent)) = pullback.apply_with_destinations_in_context(
+                        &seed.domain().parent().clone(),
+                        CotangentSeed::Value(seed),
+                        CotangentDestination::Return,
+                    )?
+                    else {
+                        panic!("a connected returned input must have a live cotangent");
+                    };
+                    Ok(cotangent)
+                },
+                seeds,
+                BatchAxis::new(0),
+                BatchAxis::new(0),
+                BatchAxisSpecification::default(),
+            )
+            .unwrap();
+            Ok(vec![cotangents])
+        });
+        assert_eq!(
+            interpret_arrays(
+                &program,
+                vec![
+                    Array::from_elements(vector, &[2f32, 3.0]).unwrap(),
+                    Array::from_elements(matrix.clone(), &[1f32, 2.0, 3.0, 4.0]).unwrap()
+                ]
+            ),
+            vec![Array::from_elements(matrix, &[4f32, 12.0, 12.0, 24.0]).unwrap()]
         );
     }
 }
