@@ -4213,7 +4213,7 @@ mod tests {
             &parent,
             vec![matrix.clone()],
             vec![BatchAxis::new(0)],
-            BatchAxisSpecification::new(2, "items"),
+            BatchAxisSpecification::named("items").with_extent(2),
         )?;
         assert_eq!(*context.axis_extent(), 2);
         assert_eq!(context.axis_name(), Some("items"));
@@ -4222,7 +4222,7 @@ mod tests {
                 &parent,
                 vec![matrix.clone()],
                 vec![BatchAxis::new(0)],
-                BatchAxisSpecification::with_extent(5),
+                BatchAxisSpecification::default().with_extent(5),
             )
             .err(),
             Some(BatchingError::MismatchedBatchSizes { expected: 5, actual: 2 }),
@@ -4234,7 +4234,7 @@ mod tests {
             &parent,
             Vec::new(),
             Vec::new(),
-            BatchAxisSpecification::with_extent(3),
+            BatchAxisSpecification::default().with_extent(3),
         )?;
         assert_eq!(*context.axis_extent(), 3);
         assert_eq!(inputs, Vec::new());
@@ -5085,7 +5085,8 @@ mod tests {
             Some(BatchingError::Program(ProgramError::InvalidInputCount { expected: 1, actual: 2 })),
         );
         assert_eq!(
-            pack_inputs(&trace, Vec::new(), Vec::new(), BatchAxisSpecification::with_extent(mapped.clone())).err(),
+            pack_inputs(&trace, Vec::new(), Vec::new(), BatchAxisSpecification::default().with_extent(mapped.clone()))
+                .err(),
             Some(BatchingError::Type(TypeError::Invalid {
                 message: "expected dimension type but got array type".to_string(),
             })),
@@ -5111,14 +5112,15 @@ mod tests {
             &eager,
             vec![matrix.clone()],
             vec![BatchAxis::new(0)],
-            BatchAxisSpecification::with_extent(extent.clone()),
+            BatchAxisSpecification::default().with_extent(extent.clone()),
         )?;
         assert_eq!(context.axis_extent(), &extent);
         let mismatched = <ArrayIrBatchingPolicy as BatchingEntrypointPolicy<ArrayIrEagerContext>>::pack_inputs(
             &eager,
             vec![matrix],
             vec![BatchAxis::new(0)],
-            BatchAxisSpecification::with_extent(ArrayIrValue::Dimension(DimensionValue::constant(3).unwrap())),
+            BatchAxisSpecification::default()
+                .with_extent(ArrayIrValue::Dimension(DimensionValue::constant(3).unwrap())),
         )
         .unwrap_err();
         assert!(matches!(mismatched, BatchingError::Program(ProgramError::Custom(_))));
@@ -5191,9 +5193,8 @@ mod tests {
                 &trace,
                 vec![reference.clone()],
                 vec![BatchAxis::new(0)],
-                BatchAxisSpecification::with_extent(
-                    trace.constant(ArrayIrValue::Dimension(DimensionValue::constant(2).unwrap())),
-                ),
+                BatchAxisSpecification::default()
+                    .with_extent(trace.constant(ArrayIrValue::Dimension(DimensionValue::constant(2).unwrap()))),
             )
             .err(),
             Some(expected),
@@ -5204,7 +5205,7 @@ mod tests {
             &trace,
             vec![reference],
             vec![BatchAxis::new(0)],
-            BatchAxisSpecification::with_extent(extent.clone()),
+            BatchAxisSpecification::default().with_extent(extent.clone()),
         )?;
         assert_eq!(context.axis_extent(), &extent);
 
@@ -6974,7 +6975,8 @@ mod tests {
 
         // A named array IR specification reaches the policy-selected context, and an explicit first-class extent
         // drives mapped output materialization when every input is replicated.
-        let named_extent = BatchAxisSpecification::new(ArrayIrValue::Dimension(DimensionValue::constant(2)?), "items");
+        let named_extent =
+            BatchAxisSpecification::named("items").with_extent(ArrayIrValue::Dimension(DimensionValue::constant(2)?));
         let explicitly_broadcasted: ArrayIrValue<Array> = batch(
             |replicated| {
                 assert_eq!(replicated.context().axis_name(), Some("items"));
@@ -6991,7 +6993,8 @@ mod tests {
         );
 
         // Exact zero extents use the same first-class extent path and produce an empty mapped dimension.
-        let empty_extent = BatchAxisSpecification::with_extent(ArrayIrValue::Dimension(DimensionValue::constant(0)?));
+        let empty_extent =
+            BatchAxisSpecification::default().with_extent(ArrayIrValue::Dimension(DimensionValue::constant(0)?));
         let empty: ArrayIrValue<Array> = batch(
             |replicated| Ok(replicated),
             ArrayIrValue::Array(Array::vector(vec![7.0_f32, 8.0, 9.0]).unwrap()),
@@ -7030,7 +7033,7 @@ mod tests {
 
         // An explicit first-class extent is checked against every mapped input.
         let mismatched_extent =
-            BatchAxisSpecification::with_extent(ArrayIrValue::Dimension(DimensionValue::constant(3)?));
+            BatchAxisSpecification::default().with_extent(ArrayIrValue::Dimension(DimensionValue::constant(3)?));
         let mismatched: Result<ArrayIrValue<Array>, BatchingError> =
             batch(|row| Ok(row), matrix.clone(), BatchAxis::new(0), BatchAxis::new(0), mismatched_extent);
         let mismatched = mismatched.unwrap_err();

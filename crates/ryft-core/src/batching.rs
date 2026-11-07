@@ -269,8 +269,8 @@ impl<A: Into<Axis>> From<A> for BatchAxis {
     }
 }
 
-/// Specification of a batch axis introduced by the batching transform that contains an optional explicit extent, an
-/// optional axis name that can be referenced by operations that support named axes, and an optional placement of the
+/// Specification of a batch axis introduced by the batching transform that contains an optional axis name that can be
+/// referenced by operations that support named axes, an optional explicit extent, and an optional placement of the
 /// batch dimension. The extent is normally inferred from the inputs that are being batched. An explicit extent can be
 /// provided to either pin it or to drive a broadcasted batching transform whose extent would otherwise be unobservable.
 /// Its representation is selected by the active [`BatchingPolicy`] (e.g., homogeneous arrays use a host `usize`, while
@@ -278,7 +278,8 @@ impl<A: Into<Axis>> From<A> for BatchAxis {
 /// collective operations inside the batched function body. The placement plays the role of JAX's
 /// `vmap(spmd_axis_name=...)`. It places the batch dimension when no mapped input determines a placement and must agree
 /// with the placement that the mapped inputs determine otherwise. The default `usize` form converts from `None`,
-/// `Some(extent)`, and `extent` directly. For example:
+/// `Some(extent)`, and `extent` directly. Use [`Self::named`] to name an axis and [`Self::with_extent`] and
+/// [`Self::with_sharding`] to configure it. An anonymous axis starts with [`Self::default`]. For example:
 ///
 /// ```ignore
 /// domain.batch(f, input, input_axes, output_axes, None)?;                                     // Inferred, anonymous.
@@ -287,40 +288,28 @@ impl<A: Into<Axis>> From<A> for BatchAxis {
 /// ```
 #[derive(Clone, Debug, PartialEq, Eq)]
 pub struct BatchAxisSpecification<E = usize> {
-    /// Explicit batch extent, or `None` to infer it from the inputs that are being batched.
-    extent: Option<E>,
-
     /// Name that operations (e.g., collectives) can use to refer to it, or `None` for an anonymous axis.
     name: Option<String>,
+
+    /// Explicit batch extent, or `None` to infer it from the inputs that are being batched.
+    extent: Option<E>,
 
     /// Explicit placement of the batch dimension, or `None` to infer it from the inputs that are being batched.
     sharding: Option<ShardingDimension>,
 }
 
-impl<E> Default for BatchAxisSpecification<E> {
-    #[inline]
-    fn default() -> Self {
-        Self { extent: None, name: None, sharding: None }
-    }
-}
-
 impl<E> BatchAxisSpecification<E> {
-    /// Creates a named [`BatchAxisSpecification`] with an explicit batch extent.
-    #[inline]
-    pub fn new<N: Into<String>>(extent: E, name: N) -> Self {
-        Self { extent: Some(extent), name: Some(name.into()), sharding: None }
-    }
-
-    /// Creates an anonymous [`BatchAxisSpecification`] with an explicit batch extent.
-    #[inline]
-    pub fn with_extent(extent: E) -> Self {
-        Self { extent: Some(extent), name: None, sharding: None }
-    }
-
     /// Creates a named [`BatchAxisSpecification`] whose batch extent is inferred from the mapped inputs.
     #[inline]
     pub fn named<N: Into<String>>(name: N) -> Self {
-        Self { extent: None, name: Some(name.into()), sharding: None }
+        Self { name: Some(name.into()), extent: None, sharding: None }
+    }
+
+    /// Returns this [`BatchAxisSpecification`] with an explicit batch extent, preserving its name and placement.
+    #[inline]
+    pub fn with_extent(mut self, extent: E) -> Self {
+        self.extent = Some(extent);
+        self
     }
 
     /// Returns this [`BatchAxisSpecification`] with an explicit placement of the batch dimension (e.g.,
@@ -331,17 +320,17 @@ impl<E> BatchAxisSpecification<E> {
         self
     }
 
-    /// Returns the explicit batch extent, or `None` when it is to be inferred from mapped inputs.
-    #[inline]
-    pub fn extent(&self) -> Option<&E> {
-        self.extent.as_ref()
-    }
-
     /// Returns the name of this [`BatchAxisSpecification`] that operations (e.g., collectives) can use to refer
     /// to it, or `None` for an anonymous axis.
     #[inline]
     pub fn name(&self) -> Option<&str> {
         self.name.as_deref()
+    }
+
+    /// Returns the explicit batch extent, or `None` when it is to be inferred from mapped inputs.
+    #[inline]
+    pub fn extent(&self) -> Option<&E> {
+        self.extent.as_ref()
     }
 
     /// Returns the explicit placement of the batch dimension, or `None` when it is to be inferred from mapped inputs.
@@ -374,17 +363,24 @@ impl<E> BatchAxisSpecification<E> {
     }
 }
 
+impl<E> Default for BatchAxisSpecification<E> {
+    #[inline]
+    fn default() -> Self {
+        Self { name: None, extent: None, sharding: None }
+    }
+}
+
 impl<E> From<Option<E>> for BatchAxisSpecification<E> {
     #[inline]
     fn from(extent: Option<E>) -> Self {
-        Self { extent, name: None, sharding: None }
+        Self { name: None, extent, sharding: None }
     }
 }
 
 impl From<usize> for BatchAxisSpecification {
     #[inline]
     fn from(extent: usize) -> Self {
-        Self::with_extent(extent)
+        Self::default().with_extent(extent)
     }
 }
 
@@ -2195,7 +2191,9 @@ where
 /// Batches the flat `inputs` of `parent` with `function`, which receives one [`BatchingTracer`] per input and returns
 /// its flat outputs together with the requested output [`BatchAxis`] of each, and returns the materialized outputs.
 /// This is the structure independent body of [`Batch::batch`] and [`batch_in_parent`], which broadcast the batch axes
-/// of their structured inputs and outputs. `function` is invoked exactly once.
+/// of their structured inputs and outputs. Borrowing the callback as a trait object keeps this body independent of
+/// its concrete closure and parameter structure types, limiting Rust monomorphization to the parent context and its
+/// policy. `function` is invoked exactly once.
 #[allow(clippy::type_complexity)]
 fn batch_erased_and_flattened<C: Batch>(
     parent: &C,
@@ -2802,29 +2800,49 @@ mod tests {
     #[test]
     fn test_batch_axis_specification() {
         assert_eq!(BatchAxisSpecification::from(None::<usize>), BatchAxisSpecification::default());
-        assert_eq!(BatchAxisSpecification::from(Some(4)), BatchAxisSpecification::with_extent(4));
-        assert_eq!(BatchAxisSpecification::from(4), BatchAxisSpecification::with_extent(4));
-        assert_eq!(BatchAxisSpecification::new(4, "i"), BatchAxisSpecification::new(4, "i").clone());
-        assert_ne!(BatchAxisSpecification::with_extent(4), BatchAxisSpecification::with_extent(5));
-        assert_ne!(BatchAxisSpecification::<usize>::named("i"), BatchAxisSpecification::<usize>::named("j"),);
-        assert_ne!(BatchAxisSpecification::<usize>::named("i"), BatchAxisSpecification::default());
-        assert_eq!(BatchAxisSpecification::<usize>::named("i").sharding(), None);
+        assert_eq!(BatchAxisSpecification::from(Some(4)), BatchAxisSpecification::default().with_extent(4));
+        assert_eq!(BatchAxisSpecification::from(4), BatchAxisSpecification::default().with_extent(4));
+    }
+
+    #[test]
+    fn test_batch_axis_specification_named() {
+        let specification = BatchAxisSpecification::<usize>::named("i");
+        assert_eq!(specification.name(), Some("i"));
+        assert_eq!(specification.extent(), None);
+        assert_eq!(specification.sharding(), None);
+        assert_eq!(specification, specification.clone());
+        assert_ne!(specification, BatchAxisSpecification::named("j"));
+        assert_ne!(specification, BatchAxisSpecification::default());
         assert_eq!(
-            format!("{:?}", BatchAxisSpecification::<usize>::named("i")),
-            "BatchAxisSpecification { extent: None, name: Some(\"i\"), sharding: None }",
+            format!("{specification:?}"),
+            "BatchAxisSpecification { name: Some(\"i\"), extent: None, sharding: None }",
+        );
+    }
+
+    #[test]
+    fn test_batch_axis_specification_with_extent() {
+        let sharding = ShardingDimension::sharded(["x"]);
+        let specification = BatchAxisSpecification::named("i").with_sharding(sharding.clone()).with_extent(4);
+        assert_eq!(specification.name(), Some("i"));
+        assert_eq!(specification.extent(), Some(&4));
+        assert_eq!(specification.sharding(), Some(&sharding));
+        assert_eq!(
+            specification.with_extent(5),
+            BatchAxisSpecification::named("i").with_extent(5).with_sharding(sharding),
         );
     }
 
     #[test]
     fn test_batch_axis_specification_with_sharding() {
-        let specification = BatchAxisSpecification::new(4, "i").with_sharding(ShardingDimension::sharded(["x"]));
-        assert_eq!(specification.extent(), Some(&4));
+        let specification =
+            BatchAxisSpecification::named("i").with_extent(4).with_sharding(ShardingDimension::sharded(["x"]));
         assert_eq!(specification.name(), Some("i"));
+        assert_eq!(specification.extent(), Some(&4));
         assert_eq!(specification.sharding(), Some(&ShardingDimension::sharded(["x"])));
-        assert_ne!(specification, BatchAxisSpecification::new(4, "i"));
+        assert_ne!(specification, BatchAxisSpecification::named("i").with_extent(4));
         assert_eq!(
             format!("{:?}", BatchAxisSpecification::<usize>::default().with_sharding(ShardingDimension::Replicated)),
-            "BatchAxisSpecification { extent: None, name: None, sharding: Some(Replicated) }",
+            "BatchAxisSpecification { name: None, extent: None, sharding: Some(Replicated) }",
         );
     }
 
@@ -3418,7 +3436,7 @@ mod tests {
                     input,
                     BatchAxis::replicated(),
                     BatchAxis::new(0),
-                    BatchAxisSpecification::with_extent(extent),
+                    BatchAxisSpecification::default().with_extent(extent),
                 )?;
                 Ok(output.into_value())
             },
@@ -3452,7 +3470,7 @@ mod tests {
                     input,
                     BatchAxis::replicated(),
                     BatchAxis::new(0),
-                    BatchAxisSpecification::with_extent(extent),
+                    BatchAxisSpecification::default().with_extent(extent),
                 )?;
                 Ok(output.into_value())
             },
@@ -3581,7 +3599,7 @@ mod tests {
             Vec::<ProjectedValue<ArrayType, Tracer<ParentBatchContext>>>::new(),
             BatchAxis::replicated(),
             BatchAxis::replicated(),
-            BatchAxisSpecification::with_extent(extent),
+            BatchAxisSpecification::default().with_extent(extent),
         );
         assert!(matches!(result, Err(BatchingError::EmptyBatch)));
         let program = context
