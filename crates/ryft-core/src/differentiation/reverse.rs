@@ -30,7 +30,7 @@ use crate::programs::{
     OperationProvider, Program, ProgramBuilder, ProgramError, Provenance, ReferenceAccessMode,
     ReferenceAccessOperation, ReferenceAnalysis, ReferenceBoundary, ReferenceMemberType, ReferenceRoot,
     ReferenceTransform, ReferenceType, Region, RegionDriver, RegionRef, RegionReplayMappings, ReplayRegionDriver, Type,
-    TypeError, Typed, Value, ValueId,
+    TypeError, Typed, Value, ValueId, ValueProjection,
 };
 use crate::tracing::{Tracer, TracingContext};
 
@@ -54,6 +54,19 @@ pub enum CotangentSeed<V> {
 
     /// No cotangent, for a reference-typed primal output leaf whose state cotangent is owned by an input destination.
     NoCotangent,
+}
+
+impl<V> CotangentSeed<V> {
+    /// Lifts a projected cotangent value into its parent value type through [`ValueProjection::from_projected`],
+    /// preserving [`Zero`](Self::Zero) and [`NoCotangent`](Self::NoCotangent) seeds.
+    #[inline]
+    pub fn lift<T: Type, ParentValue: ValueProjection<T, Projected = V>>(self) -> CotangentSeed<ParentValue> {
+        match self {
+            Self::Value(value) => CotangentSeed::Value(ParentValue::from_projected(value)),
+            Self::Zero => CotangentSeed::Zero,
+            Self::NoCotangent => CotangentSeed::NoCotangent,
+        }
+    }
 }
 
 /// Cotangent _destination_ for one flattened primal input leaf of a [`Pullback`] application, aligned leaf-for-leaf
@@ -92,6 +105,17 @@ impl<V> CotangentDestination<V> {
             Self::Return => CotangentDestinationKind::Return,
             Self::Reference(_) => CotangentDestinationKind::Reference,
             Self::Ignore => CotangentDestinationKind::Ignore,
+        }
+    }
+
+    /// Lifts a projected reference into its parent value type through [`ValueProjection::from_projected`],
+    /// preserving [`Return`](Self::Return) and [`Ignore`](Self::Ignore) destinations.
+    #[inline]
+    pub fn lift<T: Type, ParentValue: ValueProjection<T, Projected = V>>(self) -> CotangentDestination<ParentValue> {
+        match self {
+            Self::Return => CotangentDestination::Return,
+            Self::Reference(reference) => CotangentDestination::Reference(ParentValue::from_projected(reference)),
+            Self::Ignore => CotangentDestination::Ignore,
         }
     }
 }
@@ -4891,11 +4915,44 @@ pub(crate) mod tests {
     }
 
     #[test]
+    fn test_cotangent_seed_lift() {
+        let value = Array::scalar(2f32).unwrap();
+        assert_eq!(
+            CotangentSeed::Value(value.clone()).lift::<ArrayType, ReferenceTestValue>(),
+            CotangentSeed::Value(ArrayIrValue::Array(value)),
+        );
+        assert_eq!(CotangentSeed::<Array>::Zero.lift::<ArrayType, ReferenceTestValue>(), CotangentSeed::Zero);
+        assert_eq!(
+            CotangentSeed::<Array>::NoCotangent.lift::<ArrayType, ReferenceTestValue>(),
+            CotangentSeed::NoCotangent,
+        );
+    }
+
+    #[test]
     fn test_cotangent_destination_kind() {
         let reference = reference_test_scalar(1.0);
         assert_eq!(CotangentDestination::<ReferenceTestValue>::Return.kind(), CotangentDestinationKind::Return);
         assert_eq!(CotangentDestination::Reference(reference).kind(), CotangentDestinationKind::Reference);
         assert_eq!(CotangentDestination::<ReferenceTestValue>::Ignore.kind(), CotangentDestinationKind::Ignore);
+    }
+
+    #[test]
+    fn test_cotangent_destination_lift() {
+        let reference = ArrayReference::new(Array::scalar(2f32).unwrap());
+        assert_eq!(
+            CotangentDestination::Reference(reference.clone()).lift::<ReferenceType<ArrayType>, ReferenceTestValue>(),
+            CotangentDestination::Reference(ArrayIrValue::Reference(reference)),
+        );
+        assert_eq!(
+            CotangentDestination::<ArrayReference<Array>>::Return
+                .lift::<ReferenceType<ArrayType>, ReferenceTestValue>(),
+            CotangentDestination::Return,
+        );
+        assert_eq!(
+            CotangentDestination::<ArrayReference<Array>>::Ignore
+                .lift::<ReferenceType<ArrayType>, ReferenceTestValue>(),
+            CotangentDestination::Ignore,
+        );
     }
 
     #[test]
