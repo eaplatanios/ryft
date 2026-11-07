@@ -175,8 +175,8 @@ pub use caching::{
     DiskCache,
 };
 pub use domains::{
-    AnalyzableCompilationDomain, CompilationCacheDomain, CompilationDomain, Compile, StatefulCompilationDomain, jit,
-    jit_with_options, jit_with_options_and_capacity, stage,
+    AnalyzableCompilationDomain, CompilationCacheDomain, CompilationDomain, Compile, DispatchPurpose,
+    StatefulCompilationDomain, jit, jit_with_options, jit_with_options_and_capacity, stage,
 };
 pub use exchange::{CompilationArtifactExchange, CompilationArtifactExchangeError, CompilationArtifactExchangePolicy};
 pub use functions::{
@@ -195,7 +195,9 @@ mod tests {
     use crate::arrays::{Array, ArrayOperation, ArrayType, DataType};
     use crate::captures::CaptureReference;
     use crate::compilation::caching::CompilationContext;
-    use crate::compilation::domains::{CompilationCacheDomain, CompilationDomain, Compile, StatefulCompilationDomain};
+    use crate::compilation::domains::{
+        CompilationCacheDomain, CompilationDomain, Compile, DispatchPurpose, StatefulCompilationDomain,
+    };
     use crate::compilation::functions::{CompiledFunction, StagedProgram, StatefulExecution};
     use crate::contexts::Domain;
     use crate::macros::check_count;
@@ -325,9 +327,9 @@ mod tests {
         type Error = ProgramError;
 
         fn dispatch_signature(
-            &self,
             input_types: Vec<ArrayType>,
             options: &Self::Options,
+            _purpose: DispatchPurpose,
         ) -> Result<(Self::DispatchKey, Arc<[ArrayType]>), Self::Error> {
             let input_types: Arc<[ArrayType]> = match &options.staged_input_type {
                 Some(input_type) => input_types.iter().map(|_| input_type.clone()).collect(),
@@ -352,8 +354,11 @@ mod tests {
             })
         }
 
-        fn compile(&self, program: &Self::LoweredProgram) -> Result<Arc<Self::CompiledProgram>, Self::Error> {
-            self.cache.compile(self, program)
+        fn compile(
+            &self,
+            program: &Self::LoweredProgram,
+        ) -> Result<(Arc<Self::CompiledProgram>, Vec<Self::Value>), Self::Error> {
+            Ok((self.cache.compile(self, program)?, Vec::new()))
         }
 
         fn execute(&self, program: &Self::CompiledProgram, inputs: Vec<Array>) -> Result<Vec<Array>, Self::Error> {
@@ -460,9 +465,9 @@ mod tests {
         type Error = ProgramError;
 
         fn dispatch_signature(
-            &self,
             input_types: Vec<ArrayType>,
             _options: &CarriedOptions,
+            _purpose: DispatchPurpose,
         ) -> Result<(Self::DispatchKey, Arc<[ArrayType]>), ProgramError> {
             let input_types: Arc<[ArrayType]> = input_types.into();
             Ok((input_types.clone(), input_types))
@@ -472,9 +477,12 @@ mod tests {
             Ok(staged.lifted_program()?.as_ref().clone())
         }
 
-        fn compile(&self, program: &Self::LoweredProgram) -> Result<Arc<Self::CompiledProgram>, ProgramError> {
+        fn compile(
+            &self,
+            program: &Self::LoweredProgram,
+        ) -> Result<(Arc<Self::CompiledProgram>, Vec<Self::Value>), ProgramError> {
             self.compilations.fetch_add(1, Ordering::Relaxed);
-            Ok(Arc::new(program.clone()))
+            Ok((Arc::new(program.clone()), Vec::new()))
         }
 
         fn execute(

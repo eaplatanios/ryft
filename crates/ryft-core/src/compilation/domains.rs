@@ -12,6 +12,19 @@ use crate::parameters::{Parameterized, ParameterizedFamily};
 use crate::programs::{ProgramError, TypedProgram, Value};
 use crate::tracing::DomainTracingContext;
 
+/// Purpose of a [`CompilationDomain::dispatch_signature`] request, which determines whether dispatch policies that
+/// change the staged types (e.g., bounded shape bucketing) may apply.
+#[derive(Clone, Copy, Debug, PartialEq, Eq, Hash)]
+pub enum DispatchPurpose {
+    /// Staging of a function that is called within an enclosing computation (i.e., a source call of a retained
+    /// dispatcher), which is lowered and dispatched as part of that computation.
+    Source,
+
+    /// Specialization of an independently dispatched executable (i.e., a call of a retained dispatcher that executes
+    /// its own compiled program).
+    Executable,
+}
+
 /// [`CompilationDomain`]s are [`Domain`]s that support lowering, compiling, and executing staged programs.
 /// Compilation is deliberately split into four phases:
 ///
@@ -28,7 +41,7 @@ use crate::tracing::DomainTracingContext;
 /// closures, lifts runtime captures into leading program inputs, checks input counts and compiled output types, and
 /// reconstructs structured outputs. Backends implement [`Self::lower`], [`Self::compile`], and [`Self::execute`] over
 /// flat programs, types, and values, including any backend validation, caching, or runtime conversion. Staging traces
-/// exactly the input types that it receives. Backends apply options that change input types before staging (e.g., in
+/// exactly the input types that it receives. Backends apply options that change input types before staging (i.e., in
 /// [`Self::dispatch_signature`] for retained dispatch), apply options that change output types during lowering, and
 /// reject staged functions that they cannot execute during lowering as well.
 pub trait CompilationDomain: Domain<Constant: CaptureConstant> + Clone {
@@ -49,19 +62,31 @@ pub trait CompilationDomain: Domain<Constant: CaptureConstant> + Clone {
     /// which is why it requires [`From<ProgramError>`].
     type Error: std::error::Error + From<ProgramError>;
 
-    /// Derives the effective staged input types and their dispatch key from one runtime input signature. Most domains
-    /// return the input types unchanged and use them as the key. Backends may instead apply a semantics preserving
-    /// dispatch policy such as bounded shape bucketing. The returned key must compare equal exactly when the returned
-    /// effective types are interchangeable for tracing, lowering, compilation, and calls. The effective types are
-    /// returned as a shared slice so that key construction on the hot path of retained dispatch never clones the type
-    /// vector deeply. Domains whose key embeds the effective types (e.g., exact dispatch) share one allocation between
-    /// the key and the returned signature, and the caller clones individual types only on a specialization miss, when
-    /// it prepares the staging request.
+    /// Derives the types at which a function is staged for one runtime input signature, together with their dispatch
+    /// key, for the provided [`DispatchPurpose`]. Both purposes apply the semantic declarations of `options` (e.g., the
+    /// input shardings that they request). An [`DispatchPurpose::Executable`] specialization may additionally apply a
+    /// semantics preserving dispatch policy such as bounded shape bucketing, which changes the types that are traced as
+    /// well as the key. A [`DispatchPurpose::Source`] specialization is staged within its caller and lowered as part of
+    /// the enclosing computation, and so it never applies such a policy. Most domains return the input types unchanged
+    /// for both purposes and use them as the key. This function needs no domain instance, because a dispatcher that
+    /// infers its domain from its inputs may not have selected one yet when it stages a source call.
+    ///
+    /// The returned key must compare equal exactly when the returned types are interchangeable for tracing, lowering,
+    /// compilation, and calls. The types are returned as a shared slice so that key construction on the hot path of
+    /// retained dispatch never clones the type vector deeply. Domains whose key embeds the types (e.g., exact dispatch)
+    /// share one allocation between the key and the returned types, and the caller clones individual types only on a
+    /// specialization miss, when it prepares the staging request.
+    ///
+    /// # Errors
+    ///
+    /// Returns an error when `options` are incompatible with `input_types` or with `purpose`.
     fn dispatch_signature(
-        &self,
         input_types: Vec<Self::Type>,
         options: &Self::Options,
-    ) -> Result<(Self::DispatchKey, Arc<[Self::Type]>), Self::Error>;
+        purpose: DispatchPurpose,
+    ) -> Result<(Self::DispatchKey, Arc<[Self::Type]>), Self::Error>
+    where
+        Self: Sized;
 
     /// Lowers `staged` into the lowered program representation of this backend. Callers typically use
     /// [`StagedFunction::lower`] rather than calling this function directly. The lowered program must capture every
@@ -74,11 +99,23 @@ pub trait CompilationDomain: Domain<Constant: CaptureConstant> + Clone {
     ///     source program with captures lifted into leading inputs.
     fn lower(&self, staged: &StagedProgram<Self>) -> Result<Self::LoweredProgram, Self::Error>;
 
-    /// Compiles a lowered program into an executable program of this backend. Callers use
-    /// [`LoweredFunction::compile`](crate::LoweredFunction::compile) rather than calling this function directly, which
-    /// also checks that the output types of the compiled program refine those of the lowered program. Caching backends
-    /// usually implement this function via [`CompilationContext::compile`](crate::CompilationContext::compile).
-    fn compile(&self, program: &Self::LoweredProgram) -> Result<Arc<Self::CompiledProgram>, Self::Error>;
+    /// Compiles a lowered program into an executable program of this backend, and returns it together with the runtime
+    /// values of the hidden captures that lowering introduced in addition to the captures of its staged source. A
+    /// backend introduces such captures for runtime values that the staged program refers to through lifetime-free
+    /// constants retained outside of it (e.g., by a runtime session), so that the executable depends only on their
+    /// types, and most backends return none. A [`CompiledFunction`](crate::CompiledFunction) supplies them after the
+    /// source captures on every call. Callers use [`LoweredFunction::compile`](crate::LoweredFunction::compile) rather
+    /// than calling this function directly, which also checks that the output types of the compiled program refine
+    /// those of the lowered program.
+    ///
+    /// Caching backends usually obtain the executable through
+    /// [`CompilationContext::compile`](crate::CompilationContext::compile). The cache must store only the executable,
+    /// which callers with different captured values share, while the hidden capture values belong to `program` and are
+    /// resolved for every request, including cache hits.
+    fn compile(
+        &self,
+        program: &Self::LoweredProgram,
+    ) -> Result<(Arc<Self::CompiledProgram>, Vec<Self::Value>), Self::Error>;
 
     /// Executes a compiled program on flat runtime `inputs` and returns its flat outputs. Callers typically use
     /// [`ExecutableFunction::execute`] rather than calling this function directly. The backend retains any declaration

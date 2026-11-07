@@ -1949,7 +1949,7 @@ mod tests {
 
     use crate::arrays::{Array, ArrayOperation, ArrayType, DataType};
     use crate::captures::CaptureReference;
-    use crate::compilation::domains::{CompilationDomain, Compile};
+    use crate::compilation::domains::{CompilationDomain, Compile, DispatchPurpose};
     use crate::compilation::functions::{CompilationTracer, StagedFunction, StagedProgram};
     use crate::contexts::Domain;
     use crate::programs::{ProgramError, TypedProgram};
@@ -2049,9 +2049,9 @@ mod tests {
         type Error = ProgramError;
 
         fn dispatch_signature(
-            &self,
             input_types: Vec<ArrayType>,
             _options: &Self::Options,
+            _purpose: DispatchPurpose,
         ) -> Result<(Self::DispatchKey, Arc<[ArrayType]>), Self::Error> {
             let input_types: Arc<[ArrayType]> = input_types.into();
             Ok((input_types.clone(), input_types))
@@ -2061,8 +2061,11 @@ mod tests {
             Ok(TestLoweredProgram(staged.output_types().to_vec()))
         }
 
-        fn compile(&self, program: &Self::LoweredProgram) -> Result<Arc<Self::CompiledProgram>, Self::Error> {
-            Ok(Arc::new(TestCompiledProgram(program.0.len())))
+        fn compile(
+            &self,
+            program: &Self::LoweredProgram,
+        ) -> Result<(Arc<Self::CompiledProgram>, Vec<Self::Value>), Self::Error> {
+            Ok((Arc::new(TestCompiledProgram(program.0.len())), Vec::new()))
         }
 
         fn execute(&self, _program: &Self::CompiledProgram, _inputs: Vec<Array>) -> Result<Vec<Array>, Self::Error> {

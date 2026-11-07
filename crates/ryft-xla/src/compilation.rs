@@ -1,17 +1,18 @@
 //! XLA function staging, retained JIT dispatch, compilation, and execution.
 //!
 //! This module wraps the lifecycle from [`ryft_core::compilation`] with XLA array projections and options. [`jit`]
-//! creates a [`CompiledFunctionDispatcher`] that selects specializations from runtime inputs. Its first invocation
-//! for a specialization stages, lowers, and requests compilation, while warm invocations reuse the retained executable.
+//! creates a [`CompiledFunctionDispatcher`] that selects specializations from runtime inputs. Its first execution of a
+//! specialization stages, lowers, and requests compilation, while warm executions reuse the retained executable.
 //! [`compile`] stages and obtains a [`CompiledFunction`] for one explicit abstract signature immediately. Both paths
 //! share the domain's [`CompilationContext`](ryft_core::CompilationContext) cache.
 //!
 //! [`stage`] returns a [`StagedFunction`] for functions that are composed into larger programs before compilation.
-//! [`StagedFunction::call`] and [`CompiledFunction::call`] embed a nested call into an outer trace. Runtime invocation
-//! uses [`CompiledFunctionDispatcher::execute`] or an [`ExecutableFunction`] obtained through
-//! [`CompiledFunction::executable`]. [`ExecutableFunction::execute`] returns structured array outputs, and
-//! [`ExecutableFunction::execute_async`] also retains whole-invocation completion. Staged functions register runtime
-//! captures in their retained capture table instead of embedding runtime arrays in the IR.
+//! Staged functions register runtime captures in their retained capture table instead of embedding runtime arrays in
+//! the IR. Runtime invocation uses [`CompiledFunctionDispatcher::execute`] or an [`ExecutableFunction`] obtained
+//! through [`CompiledFunction::executable`]. [`ExecutableFunction::execute`] returns structured array outputs, and
+//! [`ExecutableFunction::execute_async`] also retains whole-invocation completion. Staged functions, compiled
+//! functions, and dispatchers can also be called from any context, which is how they compose with transforms and
+//! with other compilations.
 //!
 //! [`jit_statefully`] and [`compile_statefully`] expose the heterogeneous boundary used by external array
 //! references. Asynchronous stateful calls atomically publish read leases and pending mutation generations immediately
@@ -19,6 +20,85 @@
 //! [`StatefulExecution`] that reports completion failures. [`StatefulCompiledFunctionDispatcher::execute_statefully`]
 //! returns that completion, and [`StatefulCompiledFunctionDispatcher::execute_statefully_and_wait`] waits for it before
 //! returning public outputs. [`StatefulCompiledFunction`] supplies the corresponding fixed-signature entry points.
+//!
+//! # Calling Compiled Functions
+//!
+//! [`StagedFunction::call`], [`CompiledFunction::call`], and [`CompiledFunctionDispatcher::call`] bind a `jit_call`
+//! operation, which carries the retained source program of the called function, in the context that their inputs
+//! belong to. These inputs and outputs are the `ArrayType` leaves of a [`ProjectedContext`] over an array IR context,
+//! which the call recovers from the first input. They are [`Array`]s under the eager [`Domain`] and [`ProjectedValue`]s
+//! of tracers under a trace or a transform (e.g., the [`CompileTracer`]s of an enclosing compilation). The
+//! `call_in_context` variants take the array IR context explicitly, which also serves nullary functions. Every parent
+//! context is supported:
+//!
+//!   - An eager parent executes the call immediately through eager dispatch, which lowers it on its first use rather
+//!     than reusing the retained executable of a [`CompiledFunction`]. [`ExecutableFunction::execute`] and
+//!     [`CompiledFunctionDispatcher::execute`] run a retained executable directly on concrete arrays instead.
+//!   - A staging parent (e.g., the trace of an enclosing [`compile`] or [`stage`]) records the call, and the enclosing
+//!     program lowers it as part of its own computation.
+//!   - Batching, differentiation, and partial evaluation parents rewrite the call through the ordinary rules of the
+//!     `jit_call` operation, so a compilation boundary does not change the meaning of these transforms. Transforms
+//!     nest in any order, and a transformed call can itself be staged and compiled again.
+//!
+//! The captured runtime arrays of the called function enter the calling context through [`ImportingContext`] and
+//! become leading inputs of the call. An eager parent uses the arrays directly. A root trace registers them in its own
+//! capture table, so they become captures of the enclosing program rather than literals. Transform contexts import
+//! them through their parent and then treat them like constants (i.e., as replicated under batching, with a
+//! structurally zero tangent under differentiation, and as known under partial evaluation).
+//!
+//! Some bodies are traced over constants alone (i.e., in a `TracingContext<Constant, Operation>`), such as the bodies
+//! of [`rematerialize`](ryft_core::rematerialize) and [`composite`](ryft_core::composite), the custom rules of
+//! composites, and the regions nested in them. Their capture tables cannot hold runtime arrays, so calls in them
+//! import captures through [`ThroughSession`](crate::ThroughSession) instead. The [`Session`](crate::Session) of each
+//! such array retains it for as long as a handle to it exists, and the body stages a lifetime-free
+//! [`SessionConstant`](crate::experimental::ops::SessionConstant) handle to it, which keeps the callee closed. An
+//! eager parent resolves the handle when it lifts it, and lowering passes every distinct handle of a program as a
+//! hidden argument of the entry function after its captures, so the executable depends only on the types of these
+//! arrays. Composite bodies and rules must be `'static`, so they can only call compiled functions of a `'static`
+//! client (i.e., `CompiledFunction<'static, ..>`).
+//!
+//! A dispatcher retains only executables for its runtime specializations, so [`CompiledFunctionDispatcher::call`]
+//! traces its closure again on demand into a source specialization, which it retains in a separate cache (refer to
+//! [`CoreCompiledFunctionDispatcher::call_in_context`]). The closure is traced with the named axes and default mesh of
+//! the calling context, which also key the source specialization, so that it resolves named batch and mesh axes
+//! (e.g., through [`AxisIndex`](ryft_core::AxisIndex)) as it would if it were inlined. A source call neither lowers
+//! nor compiles anything itself.
+//!
+//! # Transforming Compiled Functions
+//!
+//! [`CompiledFunction::batch`], [`CompiledFunction::gradient`], and [`CompiledFunction::jvp`] are thin conveniences.
+//! Each stages the corresponding [`ryft_core`] transform around a `jit_call` of the function and compiles the result
+//! through the ordinary lifecycle, so the derived function is itself transformable and the captures of the original
+//! function become its captures. [`CompiledFunction::batch`] requires an explicit static batch extent. Runtime extents
+//! are available by calling [`batch`](ryft_core::batch) inside a function that is staged with the extent as an
+//! input.
+//!
+//! General transforms call compiled functions from their closures. Over array IR [`Value`]s, the ordinary
+//! [`batch`](ryft_core::batch) and [`differentiate_at`](ryft_core::differentiate_at) entry points apply directly, and
+//! their closures pass the `ArrayType` projections of their leaves (refer to [`ValueProjection`]) to the call. Over
+//! [`Array`] or [`CompileTracer`] leaves, those entry points transform the [`ProjectedContext`] itself, whose
+//! operation family has no call operation, so their closures cannot call compiled functions.
+//! [`batch_in_parent`](ryft_core::batch_in_parent) and
+//! [`differentiate_in_parent_at`](ryft_core::differentiate_in_parent_at) instead run the transform in the array IR
+//! parent of those leaves, hand the closure projected leaves, and project the results back. The reusable
+//! [`ParentPushforward`](ryft_core::ParentPushforward) and [`ParentPullback`](ryft_core::ParentPullback) results
+//! project at every application as well. Jacobians and Hessians are available on both routes. Reusable derivative
+//! results also apply in descendant contexts of the context that built them through their `apply_in_context`
+//! functions (e.g., under [`batch`](ryft_core::batch) inside the same compilation), which import their residuals the
+//! way calls import captures.
+//!
+//! # Limitations
+//!
+//!   - A compiled function called inside a [`shard_map`](fn@ryft_core::shard_map) body cannot capture runtime arrays,
+//!     because the body is traced as a fresh program whose captures `shard_map` rejects with
+//!     [`ProgramError::DiscardedCaptures`]. Session constants cannot appear in a `shard_map` body either, because
+//!     `sdy.manual_computation` bodies are isolated from the arguments of the entry function. The `shard_map`
+//!     operation also rejects batching with a dynamic batch extent, with or without a compilation boundary.
+//!   - A batch axis named from inside a `jvp` trace that interprets a nested program cannot be read (refer to
+//!     [`AxisIndex`](ryft_core::AxisIndex)). This limitation belongs to `axis_index` and applies equally without a
+//!     compilation boundary.
+//!   - Automatic differentiation of external references and batching over mapped or shared external references are
+//!     unsupported, as the sections below describe.
 //!
 //! # External Reference ABI
 //!
@@ -29,12 +109,11 @@
 //! Reference lowering opens each external reference as an ordinary array input. A read-only reference has no hidden
 //! result. A mutated reference gains one hidden final-state output after the public output prefix, and the runtime
 //! commits that value atomically into the same reference after execution. The entry argument also receives a
-//! `tf.aliasing_output`
-//! relation to the hidden result. That relation is a non-semantic may-alias hint: it permits, but never requires,
-//! backend buffer reuse, and it never promises physical in-place mutation. Reference-state inputs are themselves never
-//! donated, so each reference retains the snapshot it passed in, and correctness always comes from committing the
-//! returned final value. Read snapshots and retained initializers consequently remain immutable even when a backend
-//! chooses to reuse storage.
+//! `tf.aliasing_output` relation to the hidden result. That relation is a non-semantic may-alias hint: it permits, but
+//! never requires, backend buffer reuse, and it never promises physical in-place mutation. Reference-state inputs are
+//! themselves never donated, so each reference retains the snapshot it passed in, and correctness always comes from
+//! committing the returned final value. Read snapshots and retained initializers consequently remain immutable even
+//! when a backend chooses to reuse storage.
 //!
 //! Calls reject unsupported state before launch. The admitted boundary is device-memory state on a mesh in which the
 //! calling process participates (i.e., every device is visible to its client under the process that owns it, and at
@@ -44,9 +123,10 @@
 //! its own reference over the same mesh, binds and commits only its addressable shards, and so each process commits its
 //! own part of the final state; as for any multi-controller output, a failure on one process does not roll back the
 //! commits of the others. Zero-space, host-memory, unbounded-dynamic, dynamic nonreplicated, input-bucketed,
-//! foreign/unknown-device or non-participating-mesh, and bounded-dynamic mutation cases are rejected. Reference arguments must be distinct root handles. Internal accesses carry transform paths and dynamic
-//! indices, which discharge rewrites as array operations before compilation. Views are not separate program values
-//! and cannot cross this boundary.
+//! foreign/unknown-device or non-participating-mesh, and bounded-dynamic mutation cases are rejected. Reference
+//! arguments must be distinct root handles. Internal accesses carry transform paths and dynamic indices, which
+//! discharge rewrites as array operations before compilation. Views are not separate program values and cannot cross
+//! this boundary.
 //!
 //! # Stateful Call Shape
 //!
@@ -230,9 +310,17 @@ where
 
 /// Retained array-only XLA JIT dispatcher with explicit host-side static parameters.
 ///
-/// A first call for each `(static parameters, dynamic parameter structure, dynamic abstract types)` specialization
-/// stages, lowers, and requests compilation. Warm calls dispatch directly to the retained executable. Static values
-/// should be low-cardinality configuration such as axes, shapes, or Boolean branch choices; arrays remain dynamic.
+/// [`Self::execute`] runs the dispatcher on concrete arrays. Its first execution for each `(static parameters, dynamic
+/// parameter structure, dynamic abstract types)` specialization stages, lowers, and requests compilation, and warm
+/// executions dispatch directly to the retained executable. Static values should be low-cardinality configuration such
+/// as axes, shapes, or Boolean branch choices, while arrays remain dynamic.
+///
+/// [`Self::call`] instead calls the closure as a `jit_call` operation in any context, including eager, staging, and
+/// transform contexts. Executables retain no source program, so a call traces the closure again on demand into a source
+/// specialization, which is additionally keyed by the named axes and default mesh of the calling context and retained
+/// in a cache separate from the executables. Transformed calls therefore never evict executables, and warm executions
+/// never trace. Host side effects of the closure run once per executable specialization and once per source
+/// specialization.
 pub struct CompiledFunctionDispatcher<
     'c,
     F,
@@ -304,13 +392,19 @@ where
         project_arrays::<Out>(self.function.execute(static_parameters, inputs)?)
     }
 
-    /// Calls the specialization of this dispatcher for `static_parameters` and the abstract types of `inputs` as a
-    /// `jit_call` operation in the active context recovered from `inputs`. Unlike [`Self::execute`], it works under any
-    /// context, including traces and transforms, so this dispatcher's closure composes with enclosing transforms and
-    /// compilations. Inputs and outputs are `ArrayType` values of a [`ProjectedContext`] over that context (e.g.,
-    /// [`Array`]s under the eager [`Domain`] and [`ProjectedValue`]s under traces and transforms), as for
-    /// [`StagedFunction::call`]. Refer to [`CoreCompiledFunctionDispatcher::call_in_context`] for how source
-    /// specializations are traced and retained.
+    /// Calls the source specialization of this dispatcher for `static_parameters` and the abstract types of `inputs` as
+    /// a `jit_call` operation in the array IR context recovered from `inputs`. Unlike [`Self::execute`], it works under
+    /// any context, including eager, staging, and transform contexts, so this dispatcher's closure composes with
+    /// enclosing transforms and compilations. Inputs and outputs are `ArrayType` values of a [`ProjectedContext`] over
+    /// that context (e.g., [`Array`]s under the eager [`Domain`] and [`ProjectedValue`]s under traces and transforms),
+    /// as for [`StagedFunction::call`]. The closure is traced with the named axes and default mesh of that context, so
+    /// it can read named batch and mesh axes of its caller. Refer to
+    /// [`CoreCompiledFunctionDispatcher::call_in_context`] for how source specializations are traced and retained.
+    ///
+    /// # Errors
+    ///
+    /// Returns [`ProgramError::InvalidInputCount`] when `inputs` has no leaves, and the errors of
+    /// [`Self::call_in_context`] otherwise.
     #[inline]
     pub fn call<L, C, Path>(&self, static_parameters: Static, inputs: In::To<L>) -> Result<Out::To<L>, Error>
     where
@@ -339,6 +433,12 @@ where
 
     /// Calls like [`Self::call`] in the provided array IR `context`, whose `ArrayType` projection the inputs and
     /// outputs use. An explicit context also serves nullary calls.
+    ///
+    /// # Errors
+    ///
+    /// Returns an error when the domain rejects the staged input types, when tracing the closure fails, when the same
+    /// thread recursively requests a source specialization that it is still producing, or when importing a capture,
+    /// binding the call, or reassembling the structured outputs fails.
     #[inline]
     pub fn call_in_context<C, Path>(
         &self,
@@ -379,7 +479,9 @@ where
     }
 }
 
-/// Constructs a retained dispatcher for `function` with explicit options.
+/// Constructs a retained dispatcher for `function` with explicit options. Execute it on concrete arrays through
+/// [`CompiledFunctionDispatcher::execute`], and call it from traces and transforms through
+/// [`CompiledFunctionDispatcher::call`].
 ///
 /// `function` is fallible so that it can reject its inputs while it is traced, and an infallible function returns its
 /// outputs wrapped in [`Ok`].
@@ -419,7 +521,8 @@ where
     CompiledFunctionDispatcher { function: domain.jit_with_options(function, options) }
 }
 
-/// Constructs a retained dispatcher for `function` on `mesh` with otherwise default options.
+/// Constructs a retained dispatcher for `function` on `mesh` with otherwise default options. Refer to
+/// [`jit_with_options`] for more information.
 ///
 /// `function` is fallible so that it can reject its inputs while it is traced, and an infallible function returns its
 /// outputs wrapped in [`Ok`].
@@ -468,8 +571,8 @@ where
 ///
 /// # Stability
 ///
-/// This external-state surface is experimental. Ordinary [`CompiledFunctionDispatcher`] calls remain the stable array-only
-/// boundary.
+/// This external-state surface is experimental. Ordinary [`CompiledFunctionDispatcher`] calls remain the stable
+/// array-only boundary.
 pub struct StatefulCompiledFunctionDispatcher<
     'c,
     F,
@@ -630,11 +733,11 @@ where
 
 /// Compiled heterogeneous XLA function whose invocation may bind external references.
 ///
-/// This is the fixed-signature counterpart of [`StatefulCompiledFunctionDispatcher`] for one fixed signature: reference-typed
-/// input leaves bind unrenamed root [`ryft_core::ArrayReference`] handles whose types refine the effective compiled
-/// boundary, including its declared sharding and memory. Read-only bounded-dynamic references may refine finite
-/// replicated declarations. Each invocation uses the same snapshot, generation-revalidation, asynchronous
-/// publication, and completion protocol as the retained dispatcher.
+/// This is the fixed-signature counterpart of [`StatefulCompiledFunctionDispatcher`]. Its reference-typed input leaves
+/// bind unrenamed root [`ryft_core::ArrayReference`] handles whose types refine the effective compiled boundary,
+/// including its declared sharding and memory. Read-only bounded-dynamic references may refine finite replicated
+/// declarations. Each invocation uses the same snapshot, generation-revalidation, asynchronous publication, and
+/// completion protocol as the retained dispatcher.
 ///
 /// # Stability
 ///
@@ -759,15 +862,15 @@ where
     Ok(StatefulCompiledFunction { function: lowered.compile(&domain)? })
 }
 
-/// Staged-but-uncompiled XLA function handle. Returned by [`stage`] and [`stage_with_captures`].
+/// Staged XLA function that has not been compiled. Returned by [`stage`] and [`stage_with_captures`].
 ///
 /// Holds the traced source [`Program`](ryft_core::programs::Program) of one closure together with its captured
-/// runtime [`Array`]s and input / output type metadata, **without** compiling a PJRT executable. This is the right
-/// entry point for functions that are only ever composed into larger programs: [`Self::call`] embeds the staged
-/// program into an active outer trace as a `jit_call` boundary, and [`Domain::compile_staged_function`] produces a
-/// [`CompiledFunction`] when an executable is actually needed. Executable cache identity is derived from the
-/// complete lowered computation and compile-relevant backend state, so equivalent lowerings can share an executable
-/// even when they were produced at different Rust call sites.
+/// runtime [`Array`]s and input and output type metadata, without compiling a PJRT executable. This is the right
+/// handle for functions that are only composed into larger programs. [`Self::call`] calls it in any context as a
+/// `jit_call` boundary that carries its source program (refer to the [module documentation](crate::compilation)),
+/// and [`Domain::compile_staged_function`] produces a [`CompiledFunction`] when an executable is needed. Executable
+/// cache identity is derived from the complete lowered computation and compile-relevant backend state, so equivalent
+/// lowerings can share an executable even when they were produced at different Rust call sites.
 pub struct StagedFunction<'c, In: Parameterized<ArrayType>, Out: Parameterized<ArrayType>>
 where
     In::Family: ParameterizedFamily<ArrayType> + ParameterizedFamily<ArrayIrType> + ParameterizedFamily<Constant>,
@@ -793,8 +896,9 @@ where
     Out::Family: ParameterizedFamily<ArrayType> + ParameterizedFamily<ArrayIrType> + ParameterizedFamily<Constant>,
 {
     /// Returns the flat staged source [`Program`](ryft_core::Program) together with its captured runtime values.
-    /// Use it for outer transforms (e.g., `grad`, `jvp`, `vjp`, and `batch`), staged `jit_call` payloads, and
-    /// diagnostics such as printed IR, instruction counts, and graph rendering.
+    /// Use it for program-level transforms (e.g., transposition or partial evaluation of the program itself) and for
+    /// diagnostics such as printed IR, instruction counts, and graph rendering. Value-level transforms instead call
+    /// this function through [`Self::call`].
     #[inline]
     pub fn source_program(
         &self,
@@ -802,16 +906,19 @@ where
         self.function.source_program()
     }
 
-    /// Calls this function as a `jit_call` operation in the active context recovered from `inputs`.
+    /// Calls this function as a `jit_call` operation in the array IR context `C` recovered from `inputs`.
     ///
-    /// The call records a boundary that carries this function's retained source program, so enclosing transforms
+    /// The call binds a boundary that carries this function's retained source program, so enclosing transforms
     /// rewrite it through the ordinary rules of the `jit_call` operation. Inputs and outputs are `ArrayType` values of
-    /// a [`ProjectedContext`] over an array IR context `C`, which the call recovers from the first input and calls the
-    /// function in. Under the eager [`Domain`], they are [`Array`]s and the call executes immediately. Under a trace or
-    /// a transform (e.g., forward mode differentiation), they are [`ProjectedValue`]s of its tracers and the call is
-    /// recorded or rewritten there. The function's captured runtime arrays enter `C` through
-    /// [`ImportingContext`](ryft_core::ImportingContext). Use [`Self::call_in_context`] for nullary functions, because
-    /// no input exists from which to recover the context.
+    /// a [`ProjectedContext`] over `C`, which the call recovers from the first input. Under the eager [`Domain`], they
+    /// are [`Array`]s and the call executes immediately through eager dispatch. Under a trace or a transform (e.g.,
+    /// forward mode differentiation), they are [`ProjectedValue`]s of its tracers and the call is recorded or
+    /// rewritten there. The captured runtime arrays of this function enter `C` through [`ImportingContext`], which
+    /// treats them as values that do not vary across a batch, have structurally zero tangents, and are known to partial
+    /// evaluation. Traces over constants alone (e.g., the bodies of [`rematerialize`](ryft_core::rematerialize) and
+    /// [`composite`](ryft_core::composite)) import them as session constants instead (refer to
+    /// [`ThroughSession`](crate::ThroughSession)). Use [`Self::call_in_context`] for nullary functions, because no
+    /// input exists from which to recover the context.
     ///
     /// # Errors
     ///
@@ -885,8 +992,9 @@ where
 /// Runtime-only XLA executable handle.
 ///
 /// Unlike [`CompiledFunction`], this type does not retain the `Arc`-backed staged program or lowering metadata used
-/// by transforms. It can only execute and inspect its runtime signature. Its thread-safety is derived from its
-/// backend state; no unsafe blanket implementation is used.
+/// by transforms. It can only execute and inspect its runtime signature, so it cannot be called inside traces or
+/// transforms, which require [`CompiledFunction::call`] and the source program that it carries. Its thread safety is
+/// derived from its backend state, and no unsafe blanket implementation is used.
 pub struct ExecutableFunction<'c, In: Parameterized<ArrayType>, Out: Parameterized<ArrayType>>
 where
     In::Family: ParameterizedFamily<ArrayIrType> + ParameterizedFamily<Constant>,
@@ -1079,17 +1187,20 @@ impl<'c> Domain<'c> {
     }
 }
 
-/// Compiled XLA function for one explicit abstract signature. Returned by [`compile`], [`compile_with_options`], and
-/// [`Domain::compile_staged_function`].
+/// Compiled XLA function for one explicit abstract signature. Returned by [`compile`], [`compile_with_captures`],
+/// [`compile_with_options`], and [`Domain::compile_staged_function`].
 ///
-/// Holds the cached PJRT-backed [`CompiledProgram`] plus the [`StagedFunction`] it was compiled from, whose
-/// input / output type metadata marshals a [`Parameterized`] tree of [`Array`]s into the executable and reassembles
-/// the outputs back into the user's expected output tree shape.
+/// Holds the cached PJRT-backed [`CompiledProgram`] together with the [`StagedFunction`] it was compiled from, whose
+/// input and output type metadata marshals a [`Parameterized`] tree of [`Array`]s into the executable and reassembles
+/// the outputs into the expected output structure. [`Self::executable`] extracts the runtime-only
+/// [`ExecutableFunction`] that executes this signature directly.
 ///
-/// The retained staged function also keeps the **source [`Program`](ryft_core::Program)** that the execution domain
-/// compiled into, exposed via [`Self::source_program`]. Useful for diagnostics (printing the traced IR, instruction
-/// counts, graph rendering), for outer transforms, and for inner staging via [`Self::call`] with trace inputs, which
-/// emits a `jit_call` boundary carrying the source program into the active outer trace context.
+/// The retained staged function also keeps the source [`Program`](ryft_core::Program) that was compiled, which makes
+/// this handle transformable. [`Self::call`] calls the function in any context as a `jit_call` boundary that carries
+/// this source (refer to the [module documentation](crate::compilation)), so it composes with enclosing transforms and
+/// compilations. [`Self::batch`], [`Self::gradient`], and [`Self::jvp`] compile transformed functions around such a
+/// call, and [`Self::source_program`] exposes the source for program-level transforms and diagnostics (e.g., printed
+/// IR, instruction counts, and graph rendering).
 pub struct CompiledFunction<'c, In: Parameterized<ArrayType>, Out: Parameterized<ArrayType>>
 where
     In::Family: ParameterizedFamily<ArrayType> + ParameterizedFamily<ArrayIrType> + ParameterizedFamily<Constant>,
@@ -1114,8 +1225,8 @@ where
     }
 }
 
-/// Retention slots for the derived functions of one [`CompiledFunction`]: the reverse-mode gradient and the
-/// forward-mode JVP compiled from its retained source program.
+/// Retention slots for the derived functions of one [`CompiledFunction`] (i.e., the reverse mode gradient and the
+/// forward mode JVP compiled around a call of its retained source program).
 type DerivedFunctions<'c, In, Out> = DerivedFunctionSlots<
     'c,
     CoreCompiledFunction<Domain<'c>, ProgramParameters<In>, ProgramParameters<In>>,
@@ -1124,12 +1235,12 @@ type DerivedFunctions<'c, In, Out> = DerivedFunctionSlots<
 
 /// One-entry retention slots for functions derived from a [`CompiledFunction`].
 ///
-/// [`CompiledFunction::gradient`] and [`CompiledFunction::jvp`] take no per-call transform configuration, so
-/// each derived function has exactly one valid form per domain identity: the slot retains the most recently produced
+/// [`CompiledFunction::gradient`] and [`CompiledFunction::jvp`] take no per-call transform configuration, so each
+/// derived function has exactly one valid form per domain identity. The slot retains the most recently produced
 /// artifact together with a witness of the domain that produced it. A later call with a matching domain reuses the
-/// retained artifact and skips source reconstruction, structural differentiation, staging, and lowering entirely; a
-/// call with a different domain identity produces a fresh artifact and replaces the slot. Failed productions are
-/// never stored, so they retry naturally.
+/// retained artifact and skips differentiation, staging, and lowering entirely, while a call with a different domain
+/// identity produces a fresh artifact and replaces the slot. Failed productions are never stored, so they retry
+/// naturally.
 ///
 /// A slot is a retention slot and not a single-flight barrier: its lock is released before the artifact is derived, so
 /// concurrent cold calls may each derive their own copy and the last insert wins. That is sound because the copies are
@@ -1137,10 +1248,10 @@ type DerivedFunctions<'c, In, Out> = DerivedFunctionSlots<
 /// exclusively to the shared [`CompilationContext`](ryft_core::compilation::CompilationContext), which still
 /// deduplicates the backend compilation those duplicate derivations request.
 struct DerivedFunctionSlots<'c, Gradient, Jvp> {
-    /// Retained reverse-mode gradient function, if any.
+    /// Retained reverse mode gradient function, if any.
     gradient: Mutex<Option<(DomainWitness<'c>, Gradient)>>,
 
-    /// Retained forward-mode JVP function, if any.
+    /// Retained forward mode JVP function, if any.
     jvp: Mutex<Option<(DomainWitness<'c>, Jvp)>>,
 }
 
@@ -1206,9 +1317,10 @@ where
         self.function.staged().clone().into()
     }
 
-    /// Returns the flat source [`Program`](ryft_core::Program) that produced the compiled artifact. Useful for outer
-    /// transforms (`grad` / `jvp` / `vjp` / `batch`), staged `jit_call` payloads, and diagnostics (printing the traced
-    /// IR, instruction counts, graph rendering).
+    /// Returns the flat source [`Program`](ryft_core::Program) that produced the compiled artifact. Use it for
+    /// program-level transforms (e.g., transposition or partial evaluation of the program itself) and for diagnostics
+    /// such as printed IR, instruction counts, and graph rendering. Value-level transforms instead call this function
+    /// through [`Self::call`].
     #[inline]
     pub fn source_program(
         &self,
@@ -1223,8 +1335,10 @@ where
         self.function.compiled_program().mesh()
     }
 
-    /// Calls this compiled function as a `jit_call` operation in the active context recovered from `inputs`. Use
-    /// [`ExecutableFunction::execute`] to run the retained executable directly on concrete arrays.
+    /// Calls this compiled function as a `jit_call` operation in the array IR context recovered from `inputs`, exactly
+    /// as [`StagedFunction::call`] calls its retained staged function. Under the eager [`Domain`], the call executes
+    /// through eager dispatch rather than through the retained executable, so use [`ExecutableFunction::execute`] to
+    /// run that executable directly on concrete arrays.
     ///
     /// Refer to the documentation of [`StagedFunction::call`] for more information.
     #[inline]
@@ -1272,21 +1386,28 @@ where
         + ParameterizedFamily<StatefulCompileTracer<'c>>,
     In::ParameterStructure: std::fmt::Debug + Hash + PartialEq,
 {
-    /// Returns a new compiled function that computes the reverse-mode gradient of `self` with
-    /// respect to its input. Mirrors `jax.grad(jax.jit(f))`.
+    /// Returns a new compiled function that computes the reverse mode gradient of `self` with respect to its inputs.
+    /// Mirrors `jax.grad(jax.jit(f))`.
     ///
-    /// `self` must produce a single rank-0 scalar output (encoded by the `Out = ArrayType`
-    /// impl-block constraint above). The returned compiled function has the same input shape
-    /// and produces an output whose leaves carry the partial derivative at each input leaf.
+    /// `self` must produce a single rank-0 output. The `Out = ArrayType` bound of this function requires a single
+    /// output, and seeding the pullback rejects outputs of any other rank. The returned compiled function has the input
+    /// structure of `self`, and each of its output leaves holds the partial derivative with respect to the
+    /// corresponding input leaf.
     ///
-    /// The derived function is retained on this wrapper (shared across its clones): repeated calls with an
-    /// interchangeable `domain` return the retained compiled function without repeating source reconstruction,
-    /// structural differentiation, staging, or lowering, while a call with a different domain identity produces a
-    /// fresh derivative and replaces the retained one. The retained artifact is a compiled program whose residuals
-    /// are runtime values, so reuse across calls with different runtime inputs is sound by construction. Retention is
-    /// not single-flight: concurrent cold calls may each derive a gradient, and because those derivations are
-    /// interchangeable the inserts are idempotent and the last one wins, while the shared
-    /// [`CompilationContext`](ryft_core::compilation::CompilationContext) still deduplicates their backend compilation.
+    /// This function is a thin adapter over the [`ryft_core`] differentiation builder. It stages a compilation that
+    /// applies [`vjp`](ryft_core::ReverseModeDifferentiate::vjp) to a call of this function, seeds and applies the
+    /// resulting pullback, and compiles the result through the ordinary lifecycle. The original closure is therefore
+    /// never traced again, the `jit_call` boundary is differentiated by its ordinary rules, and the captures of `self`
+    /// enter the new trace through [`ImportingContext`] and become captures of the derived function.
+    ///
+    /// The derived function is retained on this wrapper and shared across its clones. Repeated calls with an
+    /// interchangeable `domain` return the retained compiled function without repeating differentiation, staging, or
+    /// lowering, while a call with a different domain identity produces a fresh derivative and replaces the retained
+    /// one. The retained artifact is a compiled program whose residuals are runtime values, so reuse across calls with
+    /// different runtime inputs is sound by construction. Retention is not single-flight. Concurrent cold calls may
+    /// each derive a gradient, and because those derivations are interchangeable, the inserts are idempotent and the
+    /// last one wins, while the shared [`CompilationContext`](ryft_core::compilation::CompilationContext) still
+    /// deduplicates their backend compilation.
     #[track_caller]
     pub fn gradient<'domain>(&'domain self, domain: &'domain Domain<'c>) -> Result<CompiledFunction<'c, In, In>, Error>
     where
@@ -1390,21 +1511,23 @@ where
         + ParameterizedFamily<Constant>
         + ParameterizedFamily<StatefulCompileTracer<'c>>,
 {
-    /// Returns a new compiled function that computes the forward-mode JVP of `self`. Mirrors
-    /// `jax.jvp(f, primals, tangents)` packaged into one compiled function: the returned handle
-    /// takes `(primals, tangents)` and returns `(primal_out, tangent_out)`.
+    /// Returns a new compiled function that computes the forward mode Jacobian-Vector Product (JVP) of `self`. Mirrors
+    /// `jax.jvp(f, primals, tangents)` packaged into one compiled function. The returned function takes
+    /// `(primals, tangents)` and returns `(primal_outputs, tangent_outputs)`.
     ///
-    /// The implementation stages an array IR `jit_call` operation and lets its ordinary JVP rule build the tangent
-    /// call boundary. Public array tracers are projected only at this facade boundary; the transform itself runs over
-    /// the production array IR program.
+    /// This function is a thin adapter over the [`ryft_core`] differentiation builder. It stages a compilation that
+    /// applies [`jvp`](ryft_core::ForwardModeDifferentiate::jvp) to a call of this function and compiles the result
+    /// through the ordinary lifecycle. The ordinary JVP rule of the `jit_call` operation therefore builds the tangent
+    /// call boundary over the array IR program, and array tracers are projected only at the boundary of the returned
+    /// function. The captures of `self` enter the new trace through [`ImportingContext`] and become captures of the
+    /// derived function.
     ///
-    /// The derived function is retained on this wrapper (shared across its clones): repeated calls with an
-    /// interchangeable `domain` return the retained compiled function without repeating source reconstruction,
-    /// structural differentiation, staging, or lowering, while a call with a different domain identity produces a
-    /// fresh derivative and replaces the retained one. Retention is not single-flight: concurrent cold calls may each
-    /// derive a JVP, and because those derivations are interchangeable the inserts are idempotent and the last one
-    /// wins, while the shared [`CompilationContext`](ryft_core::compilation::CompilationContext) still deduplicates
-    /// their backend compilation.
+    /// The derived function is retained on this wrapper and shared across its clones. Repeated calls with an
+    /// interchangeable `domain` return the retained compiled function without repeating differentiation, staging, or
+    /// lowering, while a call with a different domain identity produces a fresh derivative and replaces the retained
+    /// one. Retention is not single-flight. Concurrent cold calls may each derive a JVP, and because those derivations
+    /// are interchangeable, the inserts are idempotent and the last one wins, while the shared
+    /// [`CompilationContext`](ryft_core::compilation::CompilationContext) still deduplicates their backend compilation.
     #[track_caller]
     pub fn jvp<'domain>(
         &'domain self,
@@ -1532,9 +1655,9 @@ where
 {
     /// Returns a new compiled function that runs `self` once over a whole batch of `batch_axis.extent()` items instead
     /// of once per item. Mirrors `jax.jit(jax.vmap(f))`. The returned function stages [`batch`](ryft_core::batch)
-    /// around a [`Self::call`] of this function and compiles the result, so the batched function is ordinary staged
-    /// source that composes with further transforms and compilations, and this function's captures become its
-    /// captures.
+    /// around a call of this function and compiles the result, so the batched function is ordinary staged source that
+    /// composes with further transforms and compilations, and this function's captures become its captures, which
+    /// do not vary across the batch.
     ///
     /// The arguments follow [`batch`](ryft_core::batch). `input_batch_axes` and `output_batch_axes` are broadcast into
     /// the input and output structures of this function. A mapped input leaf gains a batch axis of the requested extent
@@ -1542,7 +1665,9 @@ where
     /// `batch_axis` must carry an explicit static extent, which also drives batches whose inputs are all replicated.
     /// Its axis name, if any, is visible to the function, so that collectives and [`AxisIndex`](ryft_core::AxisIndex)
     /// reads inside it can address the batch. Runtime batch extents are available by calling
-    /// [`batch`](ryft_core::batch) directly inside a function that is staged with an explicit extent input.
+    /// [`batch`](ryft_core::batch) directly inside a function that is staged with an explicit extent input, and
+    /// [`batch_in_parent`](ryft_core::batch_in_parent) batches calls of this function over [`Array`] leaves without
+    /// compiling a batched function.
     ///
     /// # Errors
     ///
@@ -1654,10 +1779,10 @@ where
 ///
 /// Equivalent to [`compile_with_options`] called with [`Options::new(mesh)`](Options::new).
 ///
-/// The function is traced against the supplied `domain`, which lets nested compiled functions register runtime
-/// captures in the same active trace. The resulting program is then compiled and executed against `domain`. Its
-/// [`CompilationContext`](ryft_core::compilation::CompilationContext) structurally shares equivalent lowerings even
-/// when they originate at different Rust call sites.
+/// The function is traced into a fresh XLA program, in which compiled functions that it calls register their runtime
+/// captures as captures of the new program (refer to [`StagedFunction::call`]). The resulting program is then
+/// compiled and executed against `domain`. Its [`CompilationContext`](ryft_core::compilation::CompilationContext)
+/// structurally shares equivalent lowerings even when they originate at different Rust call sites.
 #[track_caller]
 pub fn compile<'domain, 'c: 'domain, F, In: Parameterized<ArrayType>, Out: Parameterized<ArrayType>>(
     function: F,
@@ -1800,10 +1925,11 @@ where
 /// Traces `function` into a staged program and returns a [`StagedFunction`] handle, without compiling a PJRT
 /// executable.
 ///
-/// This is the staging-only counterpart of [`compile`]: use it for functions that are composed into larger programs
-/// via [`StagedFunction::call`] rather than executed directly, so no executable is built for them. Compile the
-/// staged handle later with [`Domain::compile_staged_function`] when direct execution is needed. `options` are
-/// applied to the abstract input signature before tracing and retained for subsequent lowering and compilation.
+/// This is the staging-only counterpart of [`compile`]. Use it for functions that are composed into larger programs
+/// or transforms through [`StagedFunction::call`] rather than executed directly, so that no executable is built for
+/// them. Compile the staged handle later with [`Domain::compile_staged_function`] when direct execution is needed.
+/// `options` are applied to the abstract input signature before tracing and retained for subsequent lowering and
+/// compilation.
 #[track_caller]
 pub fn stage<'c, F, In: Parameterized<ArrayType>, Out: Parameterized<ArrayType>>(
     function: F,
@@ -1836,8 +1962,8 @@ where
 /// Same as [`stage`] but makes runtime arrays explicit captures of the staged program.
 ///
 /// The closure receives capture tracers first and ordinary input tracers second, mirroring
-/// [`compile_with_captures`]. Captures are retained on the staged handle and threaded through `jit_call` boundaries
-/// when the handle is staged into outer traces via [`StagedFunction::call`].
+/// [`compile_with_captures`]. Captures are retained on the staged handle, and every [`StagedFunction::call`] imports
+/// them into the calling context as leading inputs of its `jit_call` boundary.
 #[track_caller]
 pub fn stage_with_captures<'c, F, In: Parameterized<ArrayType>, Out: Parameterized<ArrayType>>(
     function: F,

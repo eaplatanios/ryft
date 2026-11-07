@@ -153,13 +153,13 @@ mod tests {
     use indoc::indoc;
     use pretty_assertions::assert_eq;
     use ryft_core::{
-        AddOperation, ArrayOperation, ArrayType, AssertOperation, BatchAxis, BatchedProgram, CompareOperation,
-        ComparisonDirection, CompositeTransposeOperation, ConditionOperation, DataType, Dimension as CoreDimension,
-        DimensionBounds, DimensionSizeOperation, DimensionType, DimensionVariable, DynamicBroadcastOperation,
-        GuardOperation, MeshAxisType, MulOperation, NegOperation, OneLikeOperation, OneOperation, Placeholder,
-        PrintOperation, ProgramBatchingOutputAxesPolicy, ReduceOperation, ReductionKind, ScanOperation, Shape,
-        Sharding, ShardingDimension, SubOperation, TransposedProgramCotangent, TypedProgram, WhileOperation,
-        ZeroOperation,
+        Add, AddOperation, ArrayOperation, ArrayType, AssertOperation, BatchAxis, BatchedProgram, CompareOperation,
+        ComparisonDirection, CompositeTransposeOperation, Condition, ConditionOperation, DataType, Device, DeviceMesh,
+        Dimension as CoreDimension, DimensionBounds, DimensionSizeOperation, DimensionType, DimensionVariable,
+        DynamicBroadcastOperation, GuardOperation, LogicalMesh, MeshAxis, MeshAxisType, Mul, MulOperation,
+        NegOperation, OneLikeOperation, OneOperation, Placeholder, PrintOperation, ProgramBatchingOutputAxesPolicy,
+        ReduceOperation, ReductionKind, ScanOperation, Shape, Sharding, ShardingDimension, SubOperation,
+        TransposedProgramCotangent, TypedProgram, WhileOperation, ZeroOperation, batch,
     };
     use ryft_mlir::{Context as MlirContext, Location};
     use ryft_pjrt::{BufferType, ExecutionDeviceInputs, ExecutionInput, Program as PjrtProgram};
@@ -174,8 +174,8 @@ mod tests {
         compare, execute_on_two_devices, lowered_mixed_module, positive, two_device_mesh,
     };
     use crate::operations::debugging::{ensure_print_handler_registered, with_captured_prints};
-    use crate::tests::execution_client;
-    use crate::to_mlir_module_for_program;
+    use crate::tests::{execution_client, values_from_bytes, values_to_bytes};
+    use crate::{Array, FromPjrt, Session, Value, to_mlir_module_for_program};
 
     use super::*;
 
@@ -1889,6 +1889,57 @@ mod tests {
             .unwrap(),
             vec![MixedValue::Dimension(3), MixedValue::Array(vec![-1.0, 4.0, -3.0], vec![3])],
         );
+    }
+
+    #[test]
+    fn test_condition_execution_batched_under_eager_parent() {
+        // Batching over eager array IR values binds the batched condition through eager dispatch, which compiles it as
+        // a standalone program whose results must all be arrays. Neither predicate kind may therefore return the batch
+        // extent that array IR batching threads through the batched branches.
+        let client = execution_client();
+        let device = Device::from_pjrt(&client.addressable_devices().unwrap()[0]).unwrap();
+        let logical_mesh = LogicalMesh::new(vec![MeshAxis::new("x", 1, MeshAxisType::Auto).unwrap()]).unwrap();
+        let mesh = DeviceMesh::new(logical_mesh, vec![device]).unwrap();
+        let domain = Session::new(&client).domain();
+        let value = |data_type: DataType, dimensions: &[usize], bytes: &[u8]| {
+            let shape = Shape::new(dimensions.iter().map(|&dimension| CoreDimension::Static(dimension)).collect());
+            let r#type = ArrayType::new(data_type, shape)
+                .with_sharding(Sharding::replicated(mesh.logical_mesh().clone(), dimensions.len()))
+                .unwrap();
+            Value::Array(Array::from_host_buffer(&domain, r#type, mesh.clone(), bytes).unwrap())
+        };
+        let read = |value: Value<'_>| {
+            let Value::Array(array) = value else { panic!("expected an array result") };
+            let shard = array.addressable_shards().next().unwrap();
+            let bytes = shard.buffer().unwrap().copy_to_host(None).unwrap().r#await().unwrap();
+            (array.shape().dimensions().to_vec(), values_from_bytes::<f32>(bytes.as_slice()))
+        };
+        let inputs = value(DataType::F32, &[3], values_to_bytes(&[1f32, 2.0, 3.0]).as_slice());
+
+        // A mapped predicate selects a branch per batch item, doubling the first and last items and squaring the
+        // second one.
+        let predicates = value(DataType::Boolean, &[3], &[1, 0, 1]);
+        let outputs = batch(
+            |(predicate, input)| predicate.condition(|input| input.add(&input), |input| input.mul(&input), input),
+            (predicates, inputs.clone()),
+            (BatchAxis::new(0), BatchAxis::new(0)),
+            BatchAxis::new(0),
+            None,
+        )
+        .unwrap();
+        assert_eq!(read(outputs), (vec![3], vec![2.0, 4.0, 6.0]));
+
+        // A replicated predicate selects the same branch for every batch item.
+        let predicate = value(DataType::Boolean, &[], &[0]);
+        let outputs = batch(
+            |(predicate, input)| predicate.condition(|input| input.add(&input), |input| input.mul(&input), input),
+            (predicate, inputs),
+            (BatchAxis::replicated(), BatchAxis::new(0)),
+            BatchAxis::new(0),
+            None,
+        )
+        .unwrap();
+        assert_eq!(read(outputs), (vec![3], vec![1.0, 4.0, 9.0]));
     }
 
     #[test]
