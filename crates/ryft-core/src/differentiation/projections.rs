@@ -50,7 +50,7 @@ use crate::macros::{check_builders, check_count};
 use crate::operations::{
     AddOperation, OneOperation, ReferenceFreezeOperation, ReferenceNewOperation, Zero, ZeroOperation,
 };
-use crate::parameters::{Parameter, Parameterized, ParameterizedFamily, Placeholder};
+use crate::parameters::{Parameterized, ParameterizedFamily, Placeholder};
 use crate::partial::{PartialEvaluationContext, PartialValue, PartiallyEvaluatableOperation};
 use crate::programs::{
     EmptyRegionDriver, MaybeZero, Operation, OperationProjection, OperationProvider, ProgramError, ProjectedValue,
@@ -797,12 +797,12 @@ pub struct ParentDifferentiationBuilder<Input> {
 
 /// Returns the parent context of the leaves of `primal`, its parameter structure, and its leaves lifted into that
 /// parent context.
-fn lift_primal<C, T, Input>(
+fn lift_primal<T, C, Input>(
     primal: Input,
 ) -> Result<(C, Input::ParameterStructure, Vec<C::Value>), DifferentiationError>
 where
-    C: ContextProjection<T>,
     T: Type,
+    C: ContextProjection<T>,
     <C::Value as ValueProjection<T>>::Projected: Value<Domain = ProjectedContext<C, T>>,
     Input: Parameterized<<C::Value as ValueProjection<T>>::Projected>,
 {
@@ -814,71 +814,6 @@ where
     let structure = primal.parameter_structure();
     let leaves = primal.into_parameters().map(<C::Value as ValueProjection<T>>::from_projected).collect();
     Ok((context, structure, leaves))
-}
-
-/// Flattens `tree` and lifts its leaves into their parent values `P`, returning the parameter structure of `tree` as
-/// well.
-fn flatten_and_lift<T: Type, P: ValueProjection<T>, Tree: Parameterized<P::Projected>>(
-    tree: Tree,
-) -> (Tree::ParameterStructure, Vec<P>)
-where
-    P::Projected: Parameter,
-{
-    let structure = tree.parameter_structure();
-    (structure, tree.into_parameters().map(P::from_projected).collect())
-}
-
-/// Projects the parent values `leaves` and rebuilds the tree with parameter structure `structure` from them.
-fn project_and_rebuild<T: Type, P: ValueProjection<T>, Tree: Parameterized<P::Projected>>(
-    structure: Tree::ParameterStructure,
-    leaves: Vec<P>,
-) -> Result<Tree, ProgramError>
-where
-    P::Projected: Parameter,
-{
-    let leaves = leaves.into_iter().map(P::into_projected).collect::<Result<Vec<_>, _>>()?;
-    Ok(Tree::from_parameters(structure, leaves)?)
-}
-
-/// Returns the projected [`Type`] of a parent type.
-fn project_type<S, T: Type>(r#type: &S) -> Result<T, TypeError>
-where
-    for<'t> &'t T: TryFrom<&'t S, Error = TypeError>,
-{
-    Ok(<&T>::try_from(r#type)?.clone())
-}
-
-/// Projects the value of a possibly structural zero parent value, keeping structural zeros symbolic.
-fn project_maybe_zero<T: Type, V: Value + ValueProjection<T, Projected: Typed<Type = T>>>(
-    value: MaybeZero<V>,
-) -> Result<MaybeZero<V::Projected>, TypeError>
-where
-    for<'t> &'t T: TryFrom<&'t V::Type, Error = TypeError>,
-{
-    match value {
-        MaybeZero::Zero(r#type) => Ok(MaybeZero::Zero(project_type(&r#type)?)),
-        MaybeZero::Value(value) => Ok(MaybeZero::Value(value.into_projected()?)),
-    }
-}
-
-/// Lifts the value of a projected [`CotangentSeed`] into its parent value `P`.
-fn lift_seed<T: Type, P: ValueProjection<T>>(seed: CotangentSeed<P::Projected>) -> CotangentSeed<P> {
-    match seed {
-        CotangentSeed::Value(value) => CotangentSeed::Value(P::from_projected(value)),
-        CotangentSeed::Zero => CotangentSeed::Zero,
-        CotangentSeed::NoCotangent => CotangentSeed::NoCotangent,
-    }
-}
-
-/// Lifts the reference of a projected [`CotangentDestination`] into its parent value `P`.
-fn lift_destination<T: Type, P: ValueProjection<T>>(
-    destination: CotangentDestination<P::Projected>,
-) -> CotangentDestination<P> {
-    match destination {
-        CotangentDestination::Return => CotangentDestination::Return,
-        CotangentDestination::Reference(reference) => CotangentDestination::Reference(P::from_projected(reference)),
-        CotangentDestination::Ignore => CotangentDestination::Ignore,
-    }
 }
 
 impl<Input> ParentDifferentiationBuilder<Input> {
@@ -907,22 +842,28 @@ impl<Input> ParentDifferentiationBuilder<Input> {
         let mut output_structure = None;
         let (output, output_tangent) =
             differentiate_at(primal).in_context(&context).jvp(tangent, |input: Vec<DifferentiationTracer<C>>| {
-                let (structure, output) =
-                    flatten_and_lift::<T, DifferentiationTracer<C>, _>(function(project_and_rebuild::<
-                        T,
-                        _,
-                        Input::To<_>,
-                    >(
-                        structure, input
-                    )?)?);
-                output_structure = Some(structure);
-                Ok(output)
+                let input =
+                    input.into_iter().map(ValueProjection::<T>::into_projected).collect::<Result<Vec<_>, _>>()?;
+                let input = Input::To::<_>::from_parameters(structure, input).map_err(ProgramError::from)?;
+                let output = function(input)?;
+                output_structure = Some(output.parameter_structure());
+                Ok::<_, ProgramError>(
+                    output
+                        .into_parameters()
+                        .map(<DifferentiationTracer<C> as ValueProjection<T>>::from_projected)
+                        .collect::<Vec<_>>(),
+                )
             })?;
         let output_structure = output_structure.expect("the differentiated function ran");
-        Ok((
-            project_and_rebuild::<T, C::Value, Output::To<_>>(output_structure.clone(), output)?,
-            project_and_rebuild::<T, C::Value, Output::To<_>>(output_structure, output_tangent)?,
-        ))
+        let output = output.into_iter().map(ValueProjection::<T>::into_projected).collect::<Result<Vec<_>, _>>()?;
+        let output = Output::To::<L>::from_parameters(output_structure.clone(), output).map_err(ProgramError::from)?;
+        let output_tangent = output_tangent
+            .into_iter()
+            .map(ValueProjection::<T>::into_projected)
+            .collect::<Result<Vec<_>, _>>()?;
+        let output_tangent =
+            Output::To::<L>::from_parameters(output_structure, output_tangent).map_err(ProgramError::from)?;
+        Ok((output, output_tangent))
     }
 
     /// Projected counterpart of [`DifferentiationBuilder::linearize`](crate::DifferentiationBuilder::linearize), whose
@@ -951,14 +892,22 @@ impl<Input> ParentDifferentiationBuilder<Input> {
         let mut output_structure = None;
         let (output, pushforward) =
             differentiate_at(primal).in_context(&context).linearize(|input: Vec<LinearizationTracer<C>>| {
-                let input = project_and_rebuild::<T, _, Input::To<_>>(structure, input)?;
-                let (structure, output) = flatten_and_lift::<T, LinearizationTracer<C>, _>(function(input)?);
-                output_structure = Some(structure);
-                Ok(output)
+                let input =
+                    input.into_iter().map(ValueProjection::<T>::into_projected).collect::<Result<Vec<_>, _>>()?;
+                let input = Input::To::<_>::from_parameters(structure, input).map_err(ProgramError::from)?;
+                let output = function(input)?;
+                output_structure = Some(output.parameter_structure());
+                Ok::<_, ProgramError>(
+                    output
+                        .into_parameters()
+                        .map(<LinearizationTracer<C> as ValueProjection<T>>::from_projected)
+                        .collect::<Vec<_>>(),
+                )
             })?;
         let output_structure = output_structure.expect("the differentiated function ran");
+        let output = output.into_iter().map(ValueProjection::<T>::into_projected).collect::<Result<Vec<_>, _>>()?;
         Ok((
-            project_and_rebuild::<T, C::Value, Output::To<_>>(output_structure.clone(), output)?,
+            Output::To::<L>::from_parameters(output_structure.clone(), output).map_err(ProgramError::from)?,
             ParentPushforward { inner: pushforward, output_structure, marker: PhantomData },
         ))
     }
@@ -988,14 +937,22 @@ impl<Input> ParentDifferentiationBuilder<Input> {
         let mut output_structure = None;
         let (output, pullback) =
             differentiate_at(primal).in_context(&context).vjp(|input: Vec<LinearizationTracer<C>>| {
-                let input = project_and_rebuild::<T, _, Input::To<_>>(structure, input)?;
-                let (structure, output) = flatten_and_lift::<T, LinearizationTracer<C>, _>(function(input)?);
-                output_structure = Some(structure);
-                Ok(output)
+                let input =
+                    input.into_iter().map(ValueProjection::<T>::into_projected).collect::<Result<Vec<_>, _>>()?;
+                let input = Input::To::<_>::from_parameters(structure, input).map_err(ProgramError::from)?;
+                let output = function(input)?;
+                output_structure = Some(output.parameter_structure());
+                Ok::<_, ProgramError>(
+                    output
+                        .into_parameters()
+                        .map(<LinearizationTracer<C> as ValueProjection<T>>::from_projected)
+                        .collect::<Vec<_>>(),
+                )
             })?;
         let output_structure = output_structure.expect("the differentiated function ran");
+        let output = output.into_iter().map(ValueProjection::<T>::into_projected).collect::<Result<Vec<_>, _>>()?;
         Ok((
-            project_and_rebuild::<T, C::Value, Output::To<_>>(output_structure, output)?,
+            Output::To::<L>::from_parameters(output_structure, output).map_err(ProgramError::from)?,
             ParentPullback { inner: pullback, input_structure, marker: PhantomData },
         ))
     }
@@ -1032,13 +989,14 @@ impl<Input> ParentDifferentiationBuilder<Input> {
         let gradient_structure = structure.clone();
         let (value, gradient) = differentiate_at(primal).in_context(&context).value_and_gradient(
             |input: Vec<LinearizationTracer<C>>| {
-                let input = project_and_rebuild::<T, _, Input::To<ProjectedValue<T, LinearizationTracer<C>>>>(
-                    structure, input,
-                )?;
+                let input =
+                    input.into_iter().map(ValueProjection::<T>::into_projected).collect::<Result<Vec<_>, _>>()?;
+                let input = Input::To::<_>::from_parameters(structure, input).map_err(ProgramError::from)?;
                 Ok::<_, ProgramError>(<LinearizationTracer<C> as ValueProjection<T>>::from_projected(function(input)?))
             },
         )?;
-        let gradient = project_and_rebuild::<T, C::Value, Input::To<L>>(gradient_structure, gradient)?;
+        let gradient = gradient.into_iter().map(ValueProjection::<T>::into_projected).collect::<Result<Vec<_>, _>>()?;
+        let gradient = Input::To::<L>::from_parameters(gradient_structure, gradient).map_err(ProgramError::from)?;
         Ok((value.into_projected()?, gradient))
     }
 
@@ -1099,8 +1057,10 @@ impl<Input> ParentDifferentiationBuilder<Input> {
             StagingContext<Type = C::Type, Constant = C::Constant, Operation = C::Operation>,
     {
         let (context, structure, primal) = lift_primal::<C, T, Input>(self.primal)?;
-        let input_types =
-            primal.iter().map(|leaf| project_type(leaf.r#type().as_ref())).collect::<Result<Vec<_>, _>>()?;
+        let input_types = primal
+            .iter()
+            .map(|leaf| <&T>::try_from(leaf.r#type().as_ref()).cloned())
+            .collect::<Result<Vec<_>, _>>()?;
         let input_types =
             Input::To::<T>::from_parameters(structure.clone(), input_types).map_err(ProgramError::from)?;
         let mut output_structure = None;
@@ -1108,13 +1068,24 @@ impl<Input> ParentDifferentiationBuilder<Input> {
             differentiate_at(primal)
                 .in_context(&context)
                 .jacobian_forward(|input: Vec<LinearizationTracer<C>>| {
-                    let input = project_and_rebuild::<T, _, Input::To<_>>(structure, input)?;
-                    let (structure, output) = flatten_and_lift::<T, LinearizationTracer<C>, _>(function(input)?);
-                    output_structure = Some(structure);
-                    Ok(output)
+                    let input =
+                        input.into_iter().map(ValueProjection::<T>::into_projected).collect::<Result<Vec<_>, _>>()?;
+                    let input = Input::To::<_>::from_parameters(structure, input).map_err(ProgramError::from)?;
+                    let output = function(input)?;
+                    output_structure = Some(output.parameter_structure());
+                    Ok::<_, ProgramError>(
+                        output
+                            .into_parameters()
+                            .map(<LinearizationTracer<C> as ValueProjection<T>>::from_projected)
+                            .collect::<Vec<_>>(),
+                    )
                 })?;
         let output_structure = output_structure.expect("the differentiated function ran");
-        let output_types = jacobian.output_type().iter().map(project_type).collect::<Result<Vec<_>, _>>()?;
+        let output_types = jacobian
+            .output_type()
+            .iter()
+            .map(|r#type| <&T>::try_from(r#type).cloned())
+            .collect::<Result<Vec<_>, _>>()?;
         let output_types =
             Output::To::<T>::from_parameters(output_structure, output_types).map_err(ProgramError::from)?;
         let values = jacobian
@@ -1150,8 +1121,10 @@ impl<Input> ParentDifferentiationBuilder<Input> {
             StagingContext<Type = C::Type, Constant = C::Constant, Operation = C::Operation>,
     {
         let (context, structure, primal) = lift_primal::<C, T, Input>(self.primal)?;
-        let input_types =
-            primal.iter().map(|leaf| project_type(leaf.r#type().as_ref())).collect::<Result<Vec<_>, _>>()?;
+        let input_types = primal
+            .iter()
+            .map(|leaf| <&T>::try_from(leaf.r#type().as_ref()).cloned())
+            .collect::<Result<Vec<_>, _>>()?;
         let input_types =
             Input::To::<T>::from_parameters(structure.clone(), input_types).map_err(ProgramError::from)?;
         let mut output_structure = None;
@@ -1159,13 +1132,24 @@ impl<Input> ParentDifferentiationBuilder<Input> {
             differentiate_at(primal)
                 .in_context(&context)
                 .jacobian_reverse(|input: Vec<LinearizationTracer<C>>| {
-                    let input = project_and_rebuild::<T, _, Input::To<_>>(structure, input)?;
-                    let (structure, output) = flatten_and_lift::<T, LinearizationTracer<C>, _>(function(input)?);
-                    output_structure = Some(structure);
-                    Ok(output)
+                    let input =
+                        input.into_iter().map(ValueProjection::<T>::into_projected).collect::<Result<Vec<_>, _>>()?;
+                    let input = Input::To::<_>::from_parameters(structure, input).map_err(ProgramError::from)?;
+                    let output = function(input)?;
+                    output_structure = Some(output.parameter_structure());
+                    Ok::<_, ProgramError>(
+                        output
+                            .into_parameters()
+                            .map(<LinearizationTracer<C> as ValueProjection<T>>::from_projected)
+                            .collect::<Vec<_>>(),
+                    )
                 })?;
         let output_structure = output_structure.expect("the differentiated function ran");
-        let output_types = jacobian.output_type().iter().map(project_type).collect::<Result<Vec<_>, _>>()?;
+        let output_types = jacobian
+            .output_type()
+            .iter()
+            .map(|r#type| <&T>::try_from(r#type).cloned())
+            .collect::<Result<Vec<_>, _>>()?;
         let output_types =
             Output::To::<T>::from_parameters(output_structure, output_types).map_err(ProgramError::from)?;
         let values = jacobian
@@ -1219,22 +1203,34 @@ impl<Input> ParentDifferentiationBuilder<Input> {
         PartialEvaluationContext<C>: Context<Type = C::Type, Constant = C::Constant, Operation = C::Operation>,
     {
         let (context, structure, primal) = lift_primal::<C, T, Input>(self.primal)?;
-        let input_types =
-            primal.iter().map(|leaf| project_type(leaf.r#type().as_ref())).collect::<Result<Vec<_>, _>>()?;
+        let input_types = primal
+            .iter()
+            .map(|leaf| <&T>::try_from(leaf.r#type().as_ref()).cloned())
+            .collect::<Result<Vec<_>, _>>()?;
         let input_types =
             Input::To::<T>::from_parameters(structure.clone(), input_types).map_err(ProgramError::from)?;
         let mut output_structure = None;
         let hessian = differentiate_at(primal).in_context(&context).hessian(
             |input: Vec<LinearizationTracer<LinearizationContext<C>>>| {
-                let input = project_and_rebuild::<T, _, Input::To<_>>(structure, input)?;
-                let (structure, output) =
-                    flatten_and_lift::<T, LinearizationTracer<LinearizationContext<C>>, _>(function(input)?);
-                output_structure = Some(structure);
-                Ok(output)
+                let input =
+                    input.into_iter().map(ValueProjection::<T>::into_projected).collect::<Result<Vec<_>, _>>()?;
+                let input = Input::To::<_>::from_parameters(structure, input).map_err(ProgramError::from)?;
+                let output = function(input)?;
+                output_structure = Some(output.parameter_structure());
+                Ok::<_, ProgramError>(
+                    output
+                        .into_parameters()
+                        .map(<LinearizationTracer<LinearizationContext<C>> as ValueProjection<T>>::from_projected)
+                        .collect::<Vec<_>>(),
+                )
             },
         )?;
         let output_structure = output_structure.expect("the differentiated function ran");
-        let output_types = hessian.output_types().iter().map(project_type).collect::<Result<Vec<_>, _>>()?;
+        let output_types = hessian
+            .output_types()
+            .iter()
+            .map(|r#type| <&T>::try_from(r#type).cloned())
+            .collect::<Result<Vec<_>, _>>()?;
         let output_types =
             Output::To::<T>::from_parameters(output_structure, output_types).map_err(ProgramError::from)?;
         let values = hessian
@@ -1288,7 +1284,14 @@ where
             StagingContext<Type = C::Type, Constant = C::Constant, Operation = C::Operation>,
     {
         let tangents = tangents.into_parameters().map(<C::Value as ValueProjection<T>>::from_projected).collect();
-        project_and_rebuild::<T, C::Value, Output>(self.output_structure.clone(), self.inner.apply(tangents)?)
+        let output_structure = self.output_structure.clone();
+        let outputs = self
+            .inner
+            .apply(tangents)?
+            .into_iter()
+            .map(ValueProjection::<T>::into_projected)
+            .collect::<Result<Vec<_>, _>>()?;
+        Ok(Output::from_parameters(output_structure, outputs)?)
     }
 
     /// Projected counterpart of [`Pushforward::apply_in_context`], whose tangents are the projected leaves of the
@@ -1311,10 +1314,14 @@ where
             .into_parameters()
             .map(<CallerContext::Value as ValueProjection<T>>::from_projected)
             .collect();
-        project_and_rebuild::<T, CallerContext::Value, Output::To<_>>(
-            self.output_structure.clone(),
-            self.inner.apply_in_context(context, tangents)?,
-        )
+        let output_structure = self.output_structure.clone();
+        let outputs = self
+            .inner
+            .apply_in_context(context, tangents)?
+            .into_iter()
+            .map(ValueProjection::<T>::into_projected)
+            .collect::<Result<Vec<_>, _>>()?;
+        Ok(Output::To::<_>::from_parameters(output_structure, outputs)?)
     }
 }
 
@@ -1369,7 +1376,7 @@ where
             .inner
             .apply(cotangents)?
             .into_iter()
-            .map(project_maybe_zero::<T, C::Value>)
+            .map(MaybeZero::project::<T>)
             .collect::<Result<Vec<_>, _>>()?;
         Ok(Input::To::<MaybeZero<<C::Value as ValueProjection<T>>::Projected>>::from_parameters(
             self.input_structure.clone(),
@@ -1402,7 +1409,7 @@ where
             .inner
             .apply_in_context(context, cotangents)?
             .into_iter()
-            .map(project_maybe_zero::<T, CallerContext::Value>)
+            .map(MaybeZero::project::<T>)
             .collect::<Result<Vec<_>, _>>()?;
         Ok(Input::To::<MaybeZero<<CallerContext::Value as ValueProjection<T>>::Projected>>::from_parameters(
             self.input_structure.clone(),
@@ -1419,10 +1426,14 @@ where
             StagingContext<Type = C::Type, Constant = C::Constant, Operation = C::Operation>,
     {
         let cotangents = cotangents.into_parameters().map(<C::Value as ValueProjection<T>>::from_projected).collect();
-        project_and_rebuild::<T, C::Value, Input>(
-            self.input_structure.clone(),
-            self.inner.apply_materialized(cotangents)?,
-        )
+        let input_structure = self.input_structure.clone();
+        let cotangents = self
+            .inner
+            .apply_materialized(cotangents)?
+            .into_iter()
+            .map(ValueProjection::<T>::into_projected)
+            .collect::<Result<Vec<_>, _>>()?;
+        Ok(Input::from_parameters(input_structure, cotangents)?)
     }
 
     /// Projected counterpart of [`Pullback::apply_materialized_in_context`], whose cotangents are the projected leaves
@@ -1446,10 +1457,14 @@ where
             .into_parameters()
             .map(<CallerContext::Value as ValueProjection<T>>::from_projected)
             .collect();
-        project_and_rebuild::<T, CallerContext::Value, Input::To<_>>(
-            self.input_structure.clone(),
-            self.inner.apply_materialized_in_context(context, cotangents)?,
-        )
+        let input_structure = self.input_structure.clone();
+        let cotangents = self
+            .inner
+            .apply_materialized_in_context(context, cotangents)?
+            .into_iter()
+            .map(ValueProjection::<T>::into_projected)
+            .collect::<Result<Vec<_>, _>>()?;
+        Ok(Input::To::<_>::from_parameters(input_structure, cotangents)?)
     }
 
     /// Projected counterpart of [`Pullback::apply_with_destinations`], whose seeds, destinations, and returned
@@ -1469,13 +1484,13 @@ where
             StagingContext<Type = C::Type, Constant = C::Constant, Operation = C::Operation>,
         for<'t> &'t T: TryFrom<&'t C::Type, Error = TypeError>,
     {
-        let seeds = seeds.into_parameters().map(lift_seed::<T, C::Value>).collect();
-        let destinations = destinations.into_parameters().map(lift_destination::<T, C::Value>).collect();
+        let seeds = seeds.into_parameters().map(CotangentSeed::lift::<T, C::Value>).collect();
+        let destinations = destinations.into_parameters().map(CotangentDestination::lift::<T, C::Value>).collect();
         let cotangents = self
             .inner
             .apply_with_destinations(seeds, destinations)?
             .into_iter()
-            .map(|cotangent| cotangent.map(project_maybe_zero::<T, C::Value>).transpose())
+            .map(|cotangent| cotangent.map(MaybeZero::project::<T>).transpose())
             .collect::<Result<Vec<_>, _>>()?;
         Ok(Input::To::<Option<MaybeZero<<C::Value as ValueProjection<T>>::Projected>>>::from_parameters(
             self.input_structure.clone(),
@@ -1503,13 +1518,14 @@ where
             StagingContext<Type = C::Type, Constant = C::Constant, Operation = C::Operation>,
         for<'t> &'t T: TryFrom<&'t C::Type, Error = TypeError>,
     {
-        let seeds = seeds.into_parameters().map(lift_seed::<T, CallerContext::Value>).collect();
-        let destinations = destinations.into_parameters().map(lift_destination::<T, CallerContext::Value>).collect();
+        let seeds = seeds.into_parameters().map(CotangentSeed::lift::<T, CallerContext::Value>).collect();
+        let destinations =
+            destinations.into_parameters().map(CotangentDestination::lift::<T, CallerContext::Value>).collect();
         let cotangents = self
             .inner
             .apply_with_destinations_in_context(context, seeds, destinations)?
             .into_iter()
-            .map(|cotangent| cotangent.map(project_maybe_zero::<T, CallerContext::Value>).transpose())
+            .map(|cotangent| cotangent.map(MaybeZero::project::<T>).transpose())
             .collect::<Result<Vec<_>, _>>()?;
         Ok(Input::To::<Option<MaybeZero<<CallerContext::Value as ValueProjection<T>>::Projected>>>::from_parameters(
             self.input_structure.clone(),
