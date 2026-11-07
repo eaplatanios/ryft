@@ -4920,6 +4920,91 @@ pub(crate) mod tests {
     }
 
     #[test]
+    fn test_pushforward_apply_in_context_repeated_in_different_caller_contexts() {
+        // `f(x) = x * x` is linearized once at `x = 3`, so its pushforward is `ẋ ↦ 6ẋ`. Each application imports the
+        // residual anew into its own caller context, so applications that alternate between a batching level and
+        // forward mode differentiation do not affect each other.
+        let (_, pushforward) = differentiate_at(Array::scalar(3.0f64).unwrap())
+            .linearize(|x: LinearizationTracer<EagerContext<Array, ArrayOperation<Array>>>| Ok(x.clone() * x))
+            .unwrap();
+        let apply_under_batch = || {
+            batch(
+                |tangent| pushforward.apply_in_context(&tangent.domain(), tangent),
+                Array::vector(vec![1.0f64, 2.0, -1.0]).unwrap(),
+                BatchAxis::new(0),
+                BatchAxis::new(0),
+                None,
+            )
+        };
+        let apply_under_jvp = || {
+            differentiate_at(Array::scalar(2.0f64).unwrap())
+                .jvp(Array::scalar(1.0f64).unwrap(), |tangent| pushforward.apply_in_context(&tangent.domain(), tangent))
+        };
+        let batched = Ok(Array::vector(vec![6.0f64, 12.0, -6.0]).unwrap());
+        let differentiated = Ok((Array::scalar(12.0f64).unwrap(), Array::scalar(6.0f64).unwrap()));
+        assert_eq!(apply_under_batch(), batched);
+        assert_eq!(apply_under_jvp(), differentiated);
+        assert_eq!(apply_under_batch(), batched);
+        assert_eq!(apply_under_jvp(), differentiated);
+    }
+
+    #[test]
+    fn test_pushforward_apply_in_context_rebuilds_dynamic_zero_outputs() {
+        // For `f(x, z) = (x * x, stop_gradient(z))` with a dynamic `z`, the pushforward has no output for the zero
+        // tangent of `stop_gradient(z)` and retains the extent of `z` to rebuild it. Applied under a batching level
+        // over the trace that linearized it, the pushforward imports that extent as a replicated value and rebuilds
+        // the zero there, and the batching level then broadcasts it to the requested output batch axis.
+        let n = DimensionVariable::new("n", DimensionBounds::new(1, Some(5)).unwrap());
+        let vector_type = ArrayType::new(DataType::F32, Shape::new(vec![Dimension::Dynamic(n.clone())]));
+        let batched_vector_type =
+            ArrayType::new(DataType::F32, Shape::new(vec![Dimension::Static(3), Dimension::Dynamic(n)]));
+        let (_, program) = TracingContext::<TestValue, TestOperation>::trace(
+            |inputs: Vec<Tracer<TracingContext<TestValue, TestOperation>>>| {
+                let (_, pushforward) = differentiate_at((inputs[0].clone(), inputs[1].clone()))
+                    .linearize(|(x, z)| Ok::<_, ProgramError>((x.clone() * x, z.stop_gradient()?)))?;
+                let (x_tangents, z_tangents) = batch(
+                    |(x_tangent, z_tangent)| {
+                        let context = x_tangent.context().clone();
+                        pushforward.apply_in_context(&context, (x_tangent, z_tangent))
+                    },
+                    (inputs[2].clone(), inputs[3].clone()),
+                    (BatchAxis::new(0), BatchAxis::new(0)),
+                    (BatchAxis::new(0), BatchAxis::new(0)),
+                    None,
+                )?;
+                Ok(vec![x_tangents, z_tangents])
+            },
+            vec![
+                ArrayIrType::from(ArrayType::scalar(DataType::F32)),
+                ArrayIrType::from(vector_type),
+                ArrayIrType::from(ArrayType::new_static(DataType::F32, [3])),
+                ArrayIrType::from(batched_vector_type),
+            ],
+        )
+        .unwrap();
+        assert_eq!(
+            program.into_flat_program().to_string(),
+            indoc! {"
+                lambda %0:f32[], %1:f32[n], %2:f32[3], %3:f32[3, n] .
+                let %4:f32[] = mul %0 %0
+                    %5:f32[n] = stop_gradient %1
+                    %6:dimension<n ∈ [1, 5)> = dimension_size [axis=0] %5
+                    %7:dimension<3> = constant [value=3]
+                    %8:dimension<3> = constant [value=3]
+                    %9:bool[] = const true
+                    %10:f32[3] = broadcast [output_axes=[]] %0 %7
+                    %11:f32[3] = mul %10 %2
+                    %12:f32[3] = broadcast [output_axes=[]] %0 %7
+                    %13:f32[3] = mul %12 %2
+                    %14:f32[3] = add %11 %13
+                    %15:f32[n] = zero [type=f32[n]] %6
+                    %16:dimension<n ∈ [1, 5)> = dimension_size [axis=0] %15
+                    %17:f32[3, n] = broadcast [output_axes=[1]] %15 %7 %16
+                in (%14, %17)"},
+        );
+    }
+
+    #[test]
     fn test_pushforward_omits_structural_zero_output_tangents() {
         // For `f(x, z) = (x * x, stop_gradient(z))`, the tangent of the second output depends on no input tangent, so
         // the pushforward program has no output for it and saves no extent residual to size it. Only an applied

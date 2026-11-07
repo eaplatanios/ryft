@@ -6147,6 +6147,85 @@ pub(crate) mod tests {
     }
 
     #[test]
+    fn test_pullback_apply_in_context_repeated_in_different_caller_contexts() {
+        // `f(left, right) = left * right` is differentiated once at `(3, 2)`, so its pullback is `ȳ ↦ (2ȳ, 3ȳ)`. Each
+        // application imports the residuals anew into its own caller context, so applications that alternate between
+        // a batching level and forward mode differentiation do not affect each other.
+        let function = |(left, right): (
+            LinearizationTracer<EagerContext<Array, ArrayOperation<Array>>>,
+            LinearizationTracer<EagerContext<Array, ArrayOperation<Array>>>,
+        )| Ok(left * right);
+        let (_, pullback) =
+            differentiate_at((Array::scalar(3.0).unwrap(), Array::scalar(2.0).unwrap())).vjp(function).unwrap();
+        let apply_under_batch = || {
+            batch(
+                |cotangent| pullback.apply_materialized_in_context(&cotangent.domain(), cotangent),
+                Array::vector(vec![1.0, 4.0]).unwrap(),
+                BatchAxis::new(0),
+                (BatchAxis::new(0), BatchAxis::new(0)),
+                None,
+            )
+        };
+        let apply_under_jvp = || {
+            differentiate_at(Array::scalar(4.0).unwrap()).jvp(Array::scalar(1.0).unwrap(), |cotangent| {
+                pullback.apply_materialized_in_context(&cotangent.domain(), cotangent)
+            })
+        };
+        let batched = Ok((Array::vector(vec![2.0, 8.0]).unwrap(), Array::vector(vec![3.0, 12.0]).unwrap()));
+        let differentiated = Ok((
+            (Array::scalar(8.0).unwrap(), Array::scalar(12.0).unwrap()),
+            (Array::scalar(2.0).unwrap(), Array::scalar(3.0).unwrap()),
+        ));
+        assert_eq!(apply_under_batch(), batched);
+        assert_eq!(apply_under_jvp(), differentiated);
+        assert_eq!(apply_under_batch(), batched);
+        assert_eq!(apply_under_jvp(), differentiated);
+    }
+
+    #[test]
+    fn test_pullback_apply_in_context_materializes_dynamic_zero_cotangents() {
+        // For `f(x, y) = y` with a dynamic `x`, the cotangent of `x` is a structural zero whose source is `x` itself.
+        // Applied under a batching level over the trace that differentiated it, the pullback imports that source as a
+        // replicated value and materializes the zero there, and the batching level then broadcasts it to the requested
+        // output batch axis.
+        let n = DimensionVariable::new("n", DimensionBounds::new(1, Some(5)).unwrap());
+        let vector_type = ArrayType::new(DataType::F32, Shape::new(vec![Dimension::Dynamic(n)]));
+        let (_, program) = TracingContext::<ArrayIrValue<Array>, ArrayIrOperation<Array>>::trace(
+            |inputs: Vec<Tracer<TracingContext<ArrayIrValue<Array>, ArrayIrOperation<Array>>>>| {
+                let (_, pullback) = differentiate_at((inputs[0].clone(), inputs[1].clone())).vjp(|(_, y)| Ok(y))?;
+                let (x_cotangents, y_cotangents) = batch(
+                    |seed| {
+                        let context = seed.context().clone();
+                        pullback.apply_materialized_in_context(&context, seed)
+                    },
+                    inputs[2].clone(),
+                    BatchAxis::new(0),
+                    (BatchAxis::new(0), BatchAxis::new(0)),
+                    None,
+                )?;
+                Ok(vec![x_cotangents, y_cotangents])
+            },
+            vec![
+                ArrayIrType::from(vector_type),
+                ArrayIrType::from(ArrayType::scalar(DataType::F32)),
+                ArrayIrType::from(ArrayType::new_static(DataType::F32, [3])),
+            ],
+        )
+        .unwrap();
+        assert_eq!(
+            program.into_flat_program().to_string(),
+            indoc! {"
+                lambda %0:f32[n], %1:f32[], %2:f32[3] .
+                let %3:dimension<3> = constant [value=3]
+                    %4:dimension<n ∈ [1, 5)> = dimension_size [axis=0] %0
+                    %5:f32[n] = zero [type=f32[n]] %4
+                    %6:dimension<n ∈ [1, 5)> = dimension_size [axis=0] %5
+                    %7:f32[3, n] = broadcast [output_axes=[1]] %5 %3 %6
+                in (%7, %2)"},
+        );
+    }
+
+    #[test]
     fn test_pullback_apply_with_destinations() {
         // `f(r, x) = { add_update(r, x); read(r) }` over a live reference. Under an `Ignore` destination the pullback
         // accumulates through an internal cotangent reference and returns `x̄ = ȳ` at the `Return` leaf only.
