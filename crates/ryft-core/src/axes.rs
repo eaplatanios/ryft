@@ -719,7 +719,7 @@ mod tests {
     use crate::arrays::{ArrayType, DataType, MeshAxis, MeshAxisType};
     use crate::programs::ProgramError;
     use crate::tests::{TestArrayContext, TestArrayTracingContext};
-    use crate::tracing::Tracer;
+    use crate::tracing::{Tracer, TracingScope};
 
     use super::*;
 
@@ -729,14 +729,13 @@ mod tests {
         named_axes: Vec<(String, NamedAxis)>,
         check: impl FnOnce(&TestArrayTracingContext),
     ) {
-        let (_, program) = TestArrayTracingContext::trace_with_context_named_axes_and_default_mesh(
+        let (_, program) = TestArrayTracingContext::trace_with_context_in_scope(
             |context, ()| {
                 check(context);
                 Ok(())
             },
             (),
-            named_axes,
-            mesh,
+            TracingScope::new(named_axes, mesh),
         )
         .unwrap();
         assert_eq!(
@@ -924,7 +923,7 @@ mod tests {
             let inherited = NestedTracingContext::new(parent.clone());
             assert_eq!(inherited.default_mesh(), Some(outer_mesh.clone()));
 
-            let (_, program) = NestedTracingContext::trace_with_named_axes_and_default_mesh(
+            let (_, program) = NestedTracingContext::trace_in_scope(
                 inherited,
                 |inputs: Vec<Tracer<_>>| {
                     let context = inputs[0].context();
@@ -933,8 +932,7 @@ mod tests {
                     Ok(inputs)
                 },
                 vec![ArrayType::scalar(DataType::F64)],
-                Vec::new(),
-                Some(inner_mesh.clone()),
+                TracingScope::new(Vec::new(), Some(inner_mesh.clone())),
             )
             .unwrap();
             assert_eq!(
@@ -1118,7 +1116,7 @@ mod tests {
             Some(mesh.clone()),
             vec![("x".to_string(), parent_axis.clone()), ("rows".to_string(), rows.clone())],
             |parent| {
-                let (_, program) = NestedTracingContext::trace_with_named_axes_and_default_mesh(
+                let (_, program) = NestedTracingContext::trace_in_scope(
                     parent.clone(),
                     |inputs: Vec<Tracer<_>>| {
                         let context = inputs[0].context();
@@ -1138,8 +1136,10 @@ mod tests {
                         Ok(inputs)
                     },
                     vec![ArrayType::scalar(DataType::F64)],
-                    vec![("x".to_string(), local_axis.clone()), ("x".to_string(), parent_axis.clone())],
-                    Some(mesh.clone()),
+                    TracingScope::new(
+                        vec![("x".to_string(), local_axis.clone()), ("x".to_string(), parent_axis.clone())],
+                        Some(mesh.clone()),
+                    ),
                 )
                 .unwrap();
                 assert_eq!(

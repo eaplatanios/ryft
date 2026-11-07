@@ -79,7 +79,7 @@ pub use differentiation::{
     LinearizationTracer, MemberDifferentiableOperation, MemberTransposableOperation, MemoryTransferStorage,
     NOTHING_SAVABLE_POLICY_NAME, NothingSavable, OFFLOAD_DOTS_WITH_NO_BATCH_DIMENSIONS_POLICY_NAME,
     OffloadDotsWithNoBatchDimensions, ParentDifferentiationBuilder, ParentPullback, ParentPushforward,
-    PartitionedDifferentiationPolicy, ProjectedDifferentiationPolicy, Pullback, Pushforward,
+    PartitionedDifferentiationPolicy, ProjectedDifferentiationPolicy, Pullback, PullbackOperation, Pushforward,
     REMATERIALIZATION_POLICY_FN_POLICY_NAME, RealLinearity, RematerializationPolicyFn, RematerializedFunction,
     ResidualSource, ResidualZeroProvider, ReverseModeDifferentiate, SAVE_AND_OFFLOAD_ONLY_THESE_NAMES_POLICY_NAME,
     SAVE_ANY_NAMES_BUT_THESE_POLICY_NAME, SAVE_ANYTHING_EXCEPT_THESE_NAMES_POLICY_NAME,
@@ -242,7 +242,7 @@ pub use specialization::{
 };
 pub use tracing::{
     DomainTracer, DomainTracingContext, NestedTracer, NestedTracingContext, Trace, Tracer, TracerState, TracingContext,
-    infer_output_type, trace,
+    TracingScope, infer_output_type, trace,
 };
 
 #[cfg(test)]

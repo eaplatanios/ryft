@@ -357,6 +357,11 @@ pub struct ThroughCapture;
 /// implementations never overlap, and callers never name `Path` because inference finds the unique route from `Source`
 /// to the importing context. Implementors of custom contexts implement the trait for the [`ThroughParent`] path when
 /// their values can wrap values of their parent.
+///
+/// A [`ProjectedContext`] imports from the same `Source` as its parent through [`ThroughParent`], then projects the
+/// imported result to its member kind. The source value is still in the parent's import universe, and importing a
+/// different member kind returns a projection error. Calls whose operations require the parent universe (e.g., a
+/// compiled function call with heterogeneous captures) continue to import and bind in the parent context.
 pub trait ImportingContext<Source: Domain, Path>: Context {
     /// Brings `value`, a value of the `Source` domain, into this [`Context`].
     fn import(&self, value: Source::Value) -> Result<Self::Value, ProgramError>;
@@ -366,6 +371,15 @@ impl<C: Context> ImportingContext<C, SameContext> for C {
     #[inline]
     fn import(&self, value: C::Value) -> Result<C::Value, ProgramError> {
         Ok(value)
+    }
+}
+
+impl<T: Type, S: Domain, Path, C: ContextProjection<T> + ImportingContext<S, Path>>
+    ImportingContext<S, ThroughParent<Path>> for ProjectedContext<C, T>
+{
+    #[inline]
+    fn import(&self, value: S::Value) -> Result<Self::Value, ProgramError> {
+        self.parent().import(value)?.into_projected().map_err(Into::into)
     }
 }
 
@@ -804,8 +818,8 @@ mod tests {
     use pretty_assertions::assert_eq;
 
     use crate::arrays::{
-        Array, ArrayBatchingPolicy, ArrayIrOperation, ArrayIrType, ArrayIrValue, ArrayOperation, ArrayType, DataType,
-        Dimension, DimensionBounds, DimensionType, DimensionValue, DimensionVariable, Shape,
+        Array, ArrayBatchingPolicy, ArrayIrBatchingPolicy, ArrayIrOperation, ArrayIrType, ArrayIrValue, ArrayOperation,
+        ArrayType, DataType, Dimension, DimensionBounds, DimensionType, DimensionValue, DimensionVariable, Shape,
     };
     use crate::batching::BatchAxis;
     use crate::contexts::StagingContext;
@@ -825,6 +839,16 @@ mod tests {
 
     /// Trace whose imported runtime arrays are retained as capture references.
     type ImportTrace = TracingContext<CaptureReference<ArrayType>, ArrayOperation<CaptureReference<ArrayType>>, Array>;
+
+    /// Eager source domain of heterogeneous runtime values imported through projected contexts.
+    type ImportArrayIrContext = EagerContext<ArrayIrValue<Array>, ArrayIrOperation<Array>>;
+
+    /// Heterogeneous trace whose projected imports share one capture table.
+    type ImportArrayIrTrace = TracingContext<
+        CaptureReference<ArrayIrType>,
+        ArrayIrOperation<CaptureReference<ArrayType>>,
+        ArrayIrValue<Array>,
+    >;
 
     /// Finalizes imported outputs and validates their references against the owning trace's capture table.
     fn finish_imports(
@@ -985,6 +1009,135 @@ mod tests {
         let imported = ImportingContext::<_, SameContext>::import(&context, value).unwrap();
         assert_eq!(imported.primal(), &Array::scalar(3f32).unwrap());
         assert_eq!(imported.tangent(), &MaybeZero::Value(Array::scalar(5f32).unwrap()));
+    }
+
+    #[test]
+    fn test_importing_context_import_projected_context() {
+        let parent = ImportArrayIrContext::new();
+        let context = ProjectedContext::<_, ArrayType>::new(parent.clone());
+        let array = Array::scalar(u64::MAX).unwrap();
+        assert_eq!(
+            ImportingContext::<ImportArrayIrContext, _>::import(&context, ArrayIrValue::Array(array.clone())),
+            Ok(array),
+        );
+
+        let context = ProjectedContext::<_, DimensionType>::new(parent);
+        let dimension = DimensionValue::constant(7).unwrap();
+        assert_eq!(
+            ImportingContext::<ImportArrayIrContext, _>::import(&context, ArrayIrValue::Dimension(dimension.clone())),
+            Ok(dimension),
+        );
+    }
+
+    #[test]
+    fn test_importing_context_import_projected_context_wrong_member() {
+        let context = ProjectedContext::<_, ArrayType>::new(ImportArrayIrContext::new());
+        assert_eq!(
+            ImportingContext::<ImportArrayIrContext, _>::import(
+                &context,
+                ArrayIrValue::Dimension(DimensionValue::constant(7).unwrap()),
+            ),
+            Err(TypeError::invalid("expected array type but got dimension type").into()),
+        );
+    }
+
+    #[test]
+    fn test_importing_context_import_projected_context_preserves_identity() {
+        let (_, program) = ImportArrayIrTrace::trace(
+            |input| {
+                let context = ProjectedContext::<_, ArrayType>::new(input.domain());
+                let imported = ImportingContext::<ImportArrayIrTrace, _>::import(&context, input.clone())?;
+                assert_eq!(imported.value().atom_id(), input.atom_id());
+
+                // Importing an already projected value still infers the unique same-context route.
+                let imported =
+                    ImportingContext::<ProjectedContext<ImportArrayIrTrace, ArrayType>, _>::import(&context, imported)?;
+                assert_eq!(imported.value().atom_id(), input.atom_id());
+                Ok(imported.into_value())
+            },
+            ArrayIrType::Array(ArrayType::scalar(DataType::F32)),
+        )
+        .unwrap();
+        assert_eq!(
+            program.to_string(),
+            indoc! {"
+                lambda %0:f32[] .
+                in (%0)"
+            },
+        );
+    }
+
+    #[test]
+    fn test_importing_context_import_projected_context_capture_table() {
+        let parent = ImportArrayIrTrace::new();
+        let arrays = ProjectedContext::<_, ArrayType>::new(parent.clone());
+        let dimensions = ProjectedContext::<_, DimensionType>::new(parent.clone());
+        let array = ArrayIrValue::Array(Array::scalar(3f32).unwrap());
+        let dimension = ArrayIrValue::Dimension(DimensionValue::constant(7).unwrap());
+        let imported_array = ImportingContext::<ImportArrayIrContext, _>::import(&arrays, array.clone()).unwrap();
+        let imported_dimension =
+            ImportingContext::<ImportArrayIrContext, _>::import(&dimensions, dimension.clone()).unwrap();
+        assert_eq!(imported_array.r#type().as_ref(), &ArrayType::scalar(DataType::F32));
+        assert_eq!(imported_dimension.r#type().as_ref(), &DimensionType::from(Dimension::Static(7)));
+        let program = parent
+            .builder()
+            .borrow()
+            .clone()
+            .build::<Vec<CaptureReference<ArrayIrType>>, Vec<CaptureReference<ArrayIrType>>>(
+                vec![
+                    imported_array.into_value().atom_id().unwrap(),
+                    imported_dimension.into_value().atom_id().unwrap(),
+                ],
+                Vec::new(),
+                vec![Placeholder; 2],
+            )
+            .unwrap();
+        let closed = ClosedProgram::new(program, parent.captures().borrow().clone()).unwrap();
+        assert_eq!(closed.captures(), &[array, dimension]);
+        assert_eq!(
+            closed.program().to_string(),
+            indoc! {"
+                lambda  .
+                let %0:f32[] = const capture#0:f32[]
+                    %1:dimension<7> = const capture#1:dimension<7>
+                in (%0, %1)"
+            },
+        );
+    }
+
+    #[test]
+    fn test_importing_context_import_projected_context_preserves_live_tangent() {
+        let parent = DifferentiationContext::fused(ImportArrayIrContext::new());
+        let primal = ArrayIrValue::Array(Array::scalar(3f32).unwrap());
+        let tangent = ArrayIrValue::Array(Array::scalar(5f32).unwrap());
+        let value = DifferentiationTracer::new(
+            DifferentiationDual::new(primal.clone(), MaybeZero::Value(tangent.clone())).unwrap(),
+            parent.clone(),
+        );
+        let context = ProjectedContext::<_, ArrayType>::new(parent);
+        let imported =
+            ImportingContext::<DifferentiationContext<ImportArrayIrContext>, _>::import(&context, value).unwrap();
+        let imported = imported.into_value();
+        assert_eq!(imported.primal(), &primal);
+        assert_eq!(imported.tangent(), &MaybeZero::Value(tangent));
+    }
+
+    #[test]
+    fn test_importing_context_import_projected_context_composed_parent_routes() {
+        let partial = PartialEvaluationContext::new(ImportArrayIrContext::new());
+        let extent = PartialTracer::new(
+            partial.clone(),
+            PartialEvaluationValue::known(ArrayIrValue::Dimension(DimensionValue::constant(2).unwrap())),
+        );
+        let batch = BatchingContext::<_, ArrayIrBatchingPolicy>::new(partial, extent);
+        let context = ProjectedContext::<_, ArrayType>::new(DifferentiationContext::fused(batch));
+        let array = ArrayIrValue::Array(Array::scalar(3f32).unwrap());
+        let imported = ImportingContext::<ImportArrayIrContext, _>::import(&context, array.clone()).unwrap();
+        let imported = imported.into_value();
+        assert_eq!(imported.r#type().as_ref(), &ArrayIrType::Array(ArrayType::scalar(DataType::F32)));
+        assert_eq!(imported.tangent(), &MaybeZero::Zero(ArrayIrType::Array(ArrayType::scalar(DataType::F32))));
+        assert_eq!(imported.primal().batch().batch_axis(), BatchAxis::replicated());
+        assert_eq!(imported.primal().batch().value().value().unwrap().as_known(), Some(&array));
     }
 
     #[test]

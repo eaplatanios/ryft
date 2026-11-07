@@ -75,7 +75,7 @@ use std::rc::Rc;
 use ryft_macros::Parameter;
 
 use crate::arrays::LogicalMesh;
-use crate::axes::{MeshRetypings, NamedAxis};
+use crate::axes::{MeshContext, MeshRetypings, NamedAxes, NamedAxis};
 use crate::contexts::{Context, Domain, StagingContext, ValueResolution};
 use crate::macros::{check_builders, check_count};
 use crate::operations::GuardOperation;
@@ -275,6 +275,46 @@ where
     }
 }
 
+/// Scope that a function is being traced in (i.e., the named axes that it can refer to and the default mesh that it
+/// uses when no mesh is given explicitly). A function that is traced in a fresh trace rather than inlined into the
+/// context that calls it (e.g., a staged callee) is traced in the scope of that context, so that it resolves named axes
+/// and the default mesh as it would if it were inlined there. The default scope has no named axes and no default mesh.
+#[derive(Clone, Debug, Default, PartialEq, Eq, Hash)]
+pub struct TracingScope {
+    /// Named axes in scope, in the order that [`NamedAxes::named_axes`] reports them.
+    named_axes: Vec<(String, NamedAxis)>,
+
+    /// Default mesh in scope. Refer to [`MeshContext`] for more information.
+    default_mesh: Option<LogicalMesh>,
+}
+
+impl TracingScope {
+    /// Creates a new [`TracingScope`] with `named_axes` (in the order that [`NamedAxes::named_axes`] reports them)
+    /// and `default_mesh`.
+    #[inline]
+    pub fn new(named_axes: Vec<(String, NamedAxis)>, default_mesh: Option<LogicalMesh>) -> Self {
+        Self { named_axes, default_mesh }
+    }
+
+    /// Creates the [`TracingScope`] of `context` (i.e., the named axes and the default mesh that it has in scope).
+    #[inline]
+    pub fn from_context<C: NamedAxes + MeshContext>(context: &C) -> Self {
+        Self::new(context.named_axes(), context.default_mesh())
+    }
+
+    /// Returns the named axes in this [`TracingScope`].
+    #[inline]
+    pub fn named_axes(&self) -> &[(String, NamedAxis)] {
+        &self.named_axes
+    }
+
+    /// Returns the default mesh in this [`TracingScope`], if any.
+    #[inline]
+    pub fn default_mesh(&self) -> Option<&LogicalMesh> {
+        self.default_mesh.as_ref()
+    }
+}
+
 /// Ordinary active tracing [`Context`] over a [`Type`]/[`Value`]/[`Operation`] universe. [`TracingContext`] pairs
 /// the staged-constant and operation representations `(V, O)` of a program with the [`ProgramBuilder`] used for one
 /// tracing invocation. It presents itself as a [`Domain`] whose [`Value`] is [`Tracer<Self>`](Tracer) and whose
@@ -367,23 +407,22 @@ pub struct TracingContext<V: Value, O: Operation<Type = V::Type>, C = V> {
     /// [`capture`](crate::CapturingContext::capture) needs to push through a shared `&self`.
     captures: Rc<RefCell<Vec<C>>>,
 
-    /// Named axes this [`TracingContext`] was seeded with, resolved by its [`NamedAxes`](crate::NamedAxes)
-    /// implementation. An ordinary trace binds no named axes and this stays empty. Traces that run inside a
-    /// manual parallelism region (e.g., a `shard_map` body) are seeded with that region's device mesh axes so
-    /// that named axis readers (e.g., collectives) can validate and resolve them. The list is immutable for
-    /// the [`TracingContext`]'s lifetime and shared across cloned contexts.
+    /// Named axes this [`TracingContext`] was seeded with, resolved by its [`NamedAxes`] implementation. An ordinary
+    /// trace binds no named axes and this stays empty. Traces that run inside a manual parallelism region (e.g., a
+    /// `shard_map` body) are seeded with that region's device mesh axes so that named axis readers (e.g., collectives)
+    /// can validate and resolve them. The list is immutable for the [`TracingContext`]'s lifetime and shared across
+    /// cloned contexts.
     named_axes: Rc<Vec<(String, NamedAxis)>>,
 
-    /// Default [`LogicalMesh`] this [`TracingContext`] was seeded with, resolved by its
-    /// [`MeshContext`](crate::MeshContext) implementation. It is owned explicitly rather than derived from
-    /// [`Self::named_axes`] (refer to [`MeshContext`](crate::MeshContext) for the rationale). Ordinary traces
-    /// are seeded with none, and traces of a `shard_map` body are seeded with the mesh of that map.
+    /// Default [`LogicalMesh`] this [`TracingContext`] was seeded with, resolved by its [`MeshContext`] implementation.
+    /// It is owned explicitly rather than derived from [`Self::named_axes`] (refer to [`MeshContext`] for the
+    /// rationale). Ordinary traces are seeded with none, and traces of a `shard_map` body are seeded with the
+    /// mesh of that map.
     default_mesh: Option<Rc<LogicalMesh>>,
 
-    /// Mesh retypings that are active in this trace (added via
-    /// [`MeshContext::with_retyped_mesh`](crate::MeshContext::with_retyped_mesh)), which its
-    /// [`NamedAxes`](crate::NamedAxes) and [`MeshContext`](crate::MeshContext) implementations apply
-    /// to the bindings and the default mesh that they report. They are shared across cloned contexts.
+    /// Mesh retypings that are active in this trace (added via [`MeshContext::with_retyped_mesh`]), which its
+    /// [`NamedAxes`] and [`MeshContext`] implementations apply to the bindings and the default mesh that they report.
+    /// They are shared across cloned contexts.
     mesh_retypings: MeshRetypings,
 
     /// Active [`ProvenanceState`] recording the non-semantic provenance scopes and origins that staged
@@ -412,17 +451,14 @@ impl<V: Value, O: Operation<Type = V::Type>, C> TracingContext<V, O, C> {
         }
     }
 
-    /// Returns this fresh [`TracingContext`] seeded with `named_axes` and `default_mesh`, which its
-    /// [`NamedAxes`](crate::NamedAxes) and [`MeshContext`](crate::MeshContext) implementations resolve. Staging uses
-    /// it to trace a function in the named axis scope and default mesh of the context that calls it, so that the
-    /// function resolves them as it would if it were inlined there. Seed a context before tracing anything into it,
-    /// because the named axes and the default mesh are fixed for its lifetime and shared by its clones.
+    /// Returns this fresh [`TracingContext`] seeded with the named axes and the default mesh of `scope`, which its
+    /// [`NamedAxes`] and [`MeshContext`] implementations resolve. Staging uses it to trace a function in the scope
+    /// of the context that calls it, so that the function resolves them as it would if it were inlined there. Seed a
+    /// context before tracing anything into it, because the named axes and the default mesh are fixed for its lifetime
+    /// and shared by its clones.
     #[inline]
-    pub(crate) fn with_named_axes_and_default_mesh(
-        mut self,
-        named_axes: Vec<(String, NamedAxis)>,
-        default_mesh: Option<LogicalMesh>,
-    ) -> Self {
+    pub(crate) fn with_scope(mut self, scope: TracingScope) -> Self {
+        let TracingScope { named_axes, default_mesh } = scope;
         self.named_axes = Rc::new(named_axes);
         self.default_mesh = default_mesh.map(Rc::new);
         self
@@ -442,8 +478,8 @@ impl<V: Value, O: Operation<Type = V::Type>, C> TracingContext<V, O, C> {
         &self.captures
     }
 
-    /// Returns the named axes this trace was seeded with, resolved by its [`NamedAxes`](crate::NamedAxes)
-    /// implementation. Ordinary traces are seeded with no axes.
+    /// Returns the named axes this trace was seeded with, resolved by its [`NamedAxes`] implementation.
+    /// Ordinary traces are seeded with no axes.
     #[inline]
     pub(crate) fn local_named_axes(&self) -> &[(String, NamedAxis)] {
         self.named_axes.as_slice()
@@ -559,52 +595,45 @@ where
         input_type: Input,
         named_axes: Vec<(String, NamedAxis)>,
     ) -> Result<(Output::To<V::Type>, Program<V, O, Input::To<V>, Output::To<V>>), ProgramError> {
-        Self::trace_with_context_named_axes_and_default_mesh(function, input_type, named_axes, None)
+        Self::trace_with_context_in_scope(function, input_type, TracingScope::new(named_axes, None))
     }
 
-    /// Traces `function` against `input_type` like [`trace_with_named_axes`](Self::trace_with_named_axes),
-    /// but additionally seeds the trace's context with `default_mesh`. This is the counterpart of
-    /// [`trace_with_context_named_axes_and_default_mesh`](Self::trace_with_context_named_axes_and_default_mesh)
-    /// for callbacks that do not need the trace's context.
+    /// Traces `function` against `input_type` like [`trace_with_named_axes`](Self::trace_with_named_axes), but
+    /// seeds the trace's context with the named axes and the default mesh of `scope`. This is the counterpart of
+    /// [`trace_with_context_in_scope`](Self::trace_with_context_in_scope) for callbacks that do not need the trace's
+    /// context.
     #[allow(clippy::type_complexity)]
     #[inline]
-    pub fn trace_with_named_axes_and_default_mesh<
+    pub fn trace_in_scope<
         F: FnOnce(Input::To<Tracer<Self>>) -> Result<Output, ProgramError>,
         Input: Parameterized<V::Type, Family: ParameterizedFamily<V> + ParameterizedFamily<Tracer<Self>>>,
         Output: Parameterized<Tracer<Self>, Family: ParameterizedFamily<V::Type> + ParameterizedFamily<V>>,
     >(
         function: F,
         input_type: Input,
-        named_axes: Vec<(String, NamedAxis)>,
-        default_mesh: Option<LogicalMesh>,
+        scope: TracingScope,
     ) -> Result<(Output::To<V::Type>, Program<V, O, Input::To<V>, Output::To<V>>), ProgramError> {
-        Self::trace_with_context_named_axes_and_default_mesh(
-            |_, input| function(input),
-            input_type,
-            named_axes,
-            default_mesh,
-        )
+        Self::trace_with_context_in_scope(|_, input| function(input), input_type, scope)
     }
 
     /// Traces `function` against `input_type` like
-    /// [`trace_with_context_and_named_axes`](Self::trace_with_context_and_named_axes), but additionally seeds the
-    /// trace's context with `default_mesh`, which its [`MeshContext`](crate::MeshContext) implementation returns.
-    /// Functions that trace code in a fresh trace instead of in the context that they are called in seed that trace
-    /// with the default mesh of the calling context, like they seed it with its named axes, and a `shard_map` body
-    /// is seeded with the mesh of its map.
+    /// [`trace_with_context_and_named_axes`](Self::trace_with_context_and_named_axes), but seeds the trace's context
+    /// with the named axes and the default mesh of `scope`, which its [`NamedAxes`] and [`MeshContext`] implementations
+    /// return. Functions that trace code in a fresh trace instead of in the context that they are called in seed that
+    /// trace with the default mesh of the calling context, like they seed it with its named axes, and a `shard_map`
+    /// body is seeded with the mesh of its map.
     #[allow(clippy::type_complexity)]
-    pub fn trace_with_context_named_axes_and_default_mesh<
+    pub fn trace_with_context_in_scope<
         F: FnOnce(&Self, Input::To<Tracer<Self>>) -> Result<Output, ProgramError>,
         Input: Parameterized<V::Type, Family: ParameterizedFamily<V> + ParameterizedFamily<Tracer<Self>>>,
         Output: Parameterized<Tracer<Self>, Family: ParameterizedFamily<V::Type> + ParameterizedFamily<V>>,
     >(
         function: F,
         input_type: Input,
-        named_axes: Vec<(String, NamedAxis)>,
-        default_mesh: Option<LogicalMesh>,
+        scope: TracingScope,
     ) -> Result<(Output::To<V::Type>, Program<V, O, Input::To<V>, Output::To<V>>), ProgramError> {
         let (output_types, program, capture_count) =
-            Self::trace_with_named_axes_counting_captures(function, input_type, named_axes, default_mesh)?;
+            Self::trace_in_scope_counting_captures(function, input_type, scope)?;
         if capture_count > 0 {
             return Err(ProgramError::DiscardedCaptures { count: capture_count });
         }
@@ -625,7 +654,7 @@ where
         function: F,
         input_type: Input,
     ) -> Result<Output::To<V::Type>, ProgramError> {
-        Ok(Self::trace_with_named_axes_counting_captures(|_, input| function(input), input_type, Vec::new(), None)?.0)
+        Ok(Self::trace_in_scope_counting_captures(|_, input| function(input), input_type, TracingScope::default())?.0)
     }
 
     /// Traces like [`trace_with_named_axes`](Self::trace_with_named_axes) but additionally reports the number of
@@ -636,21 +665,20 @@ where
     /// together with its inputs, like [`trace_with_context_and_named_axes`](Self::trace_with_context_and_named_axes).
     #[allow(clippy::type_complexity)]
     #[inline]
-    fn trace_with_named_axes_counting_captures<
+    fn trace_in_scope_counting_captures<
         F: FnOnce(&Self, Input::To<Tracer<Self>>) -> Result<Output, ProgramError>,
         Input: Parameterized<V::Type, Family: ParameterizedFamily<V> + ParameterizedFamily<Tracer<Self>>>,
         Output: Parameterized<Tracer<Self>, Family: ParameterizedFamily<V::Type> + ParameterizedFamily<V>>,
     >(
         function: F,
         input_type: Input,
-        named_axes: Vec<(String, NamedAxis)>,
-        default_mesh: Option<LogicalMesh>,
+        scope: TracingScope,
     ) -> Result<(Output::To<V::Type>, Program<V, O, Input::To<V>, Output::To<V>>, usize), ProgramError> {
         /// Internal helper that traces like
-        /// [`trace_with_named_axes_counting_captures`](Self::trace_with_named_axes_counting_captures) with the callback
-        /// type erased. This is the body of that function, which only wraps its callback, so that this body is compiled
-        /// once per input and output structure rather than once per callback type: every trace of a distinct closure
-        /// would otherwise instantiate this body and every closure and iterator adapter in it again. The callback is
+        /// [`trace_in_scope_counting_captures`](Self::trace_in_scope_counting_captures) with the callback type erased.
+        /// This is the body of that function, which only wraps its callback, so that this body is compiled once per
+        /// input and output structure rather than once per callback type: every trace of a distinct closure would
+        /// otherwise instantiate this body and every closure and iterator adapter in it again. The callback is
         /// invoked exactly once.
         #[allow(clippy::type_complexity)]
         fn inner<
@@ -712,6 +740,7 @@ where
         }
 
         let mut function = Some(function);
+        let TracingScope { named_axes, default_mesh } = scope;
         inner(
             &mut |context: &Self, input: Input::To<Tracer<Self>>| function.take().unwrap()(context, input),
             input_type,
@@ -857,22 +886,19 @@ pub struct NestedTracingContext<C: Context> {
     /// [`ProgramBuilder`] that this [`NestedTracingContext`] stages the nested [`Program`] into.
     builder: Rc<RefCell<ProgramBuilder<C::Constant, C::Operation>>>,
 
-    /// Named axes this [`NestedTracingContext`] was seeded with, resolved by its [`NamedAxes`](crate::NamedAxes)
-    /// implementation ahead of the parent context's bindings. An ordinary nested trace binds no named axes of its
-    /// own and this stays empty, in which case every lookup delegates to the parent. The list is immutable for the
-    /// [`NestedTracingContext`]'s lifetime and shared across cloned contexts.
+    /// Named axes this [`NestedTracingContext`] was seeded with, resolved by its [`NamedAxes`] implementation ahead of
+    /// the parent context's bindings. An ordinary nested trace binds no named axes of its own and this stays empty, in
+    /// which case every lookup delegates to the parent. The list is immutable for the [`NestedTracingContext`]'s
+    /// lifetime and shared across cloned contexts.
     named_axes: Rc<Vec<(String, NamedAxis)>>,
 
-    /// Default [`LogicalMesh`] this [`NestedTracingContext`] was seeded with, resolved by its
-    /// [`MeshContext`](crate::MeshContext) implementation. When it is [`None`], the default mesh
-    /// of the parent context applies.
+    /// Default [`LogicalMesh`] this [`NestedTracingContext`] was seeded with, resolved by its [`MeshContext`]
+    /// implementation. When it is [`None`], the default mesh of the parent context applies.
     default_mesh: Option<Rc<LogicalMesh>>,
 
-    /// Mesh retypings that are active in this nested trace (refer to
-    /// [`MeshContext::with_retyped_mesh`](crate::MeshContext::with_retyped_mesh)), which its
-    /// [`NamedAxes`](crate::NamedAxes) and [`MeshContext`](crate::MeshContext) implementations apply to the bindings
-    /// and the default mesh that they report, including those of the parent context. They are shared across cloned
-    /// contexts.
+    /// Mesh retypings that are active in this nested trace (refer to [`MeshContext::with_retyped_mesh`]), which its
+    /// [`NamedAxes`] and [`MeshContext`] implementations apply to the bindings and the default mesh that they report,
+    /// including those of the parent context. They are shared across cloned contexts.
     mesh_retypings: MeshRetypings,
 
     /// Active [`ProvenanceState`] for the nested program, shared across cloned contexts and independent of the
@@ -908,8 +934,8 @@ impl<C: Context> NestedTracingContext<C> {
         &self.builder
     }
 
-    /// Returns the named axes this nested trace was seeded with, resolved by its [`NamedAxes`](crate::NamedAxes)
-    /// implementation ahead of the parent context's bindings. Ordinary nested traces are seeded with no axes.
+    /// Returns the named axes this nested trace was seeded with, resolved by its [`NamedAxes`] implementation
+    /// ahead of the parent context's bindings. Ordinary nested traces are seeded with no axes.
     #[inline]
     pub(crate) fn local_named_axes(&self) -> &[(String, NamedAxis)] {
         self.named_axes.as_slice()
@@ -972,20 +998,19 @@ impl<C: Context> NestedTracingContext<C> {
         Output: Parameterized<Tracer<Self>>,
         Self: StagingContext<Type = C::Type, Constant = C::Constant, Operation = C::Operation>,
     {
-        Self::trace_with_named_axes_and_default_mesh(parent, function, input_types, named_axes, None)
+        Self::trace_in_scope(parent, function, input_types, TracingScope::new(named_axes, None))
     }
 
-    /// Traces `function` against `input_types` like [`trace_with_named_axes`](Self::trace_with_named_axes), but
-    /// additionally seeds the nested trace's context with `default_mesh`, which shadows the default mesh of `parent`
-    /// when it is not [`None`]. This is the nested-tracing counterpart of
-    /// [`TracingContext::trace_with_context_named_axes_and_default_mesh`].
+    /// Traces `function` against `input_types` like [`trace_with_named_axes`](Self::trace_with_named_axes), but seeds
+    /// the nested trace's context with the named axes and the default mesh of `scope`. That default mesh shadows the
+    /// default mesh of `parent` when it is not [`None`]. This is the nested-tracing counterpart of
+    /// [`TracingContext::trace_with_context_in_scope`].
     #[allow(clippy::type_complexity)]
-    pub fn trace_with_named_axes_and_default_mesh<F, Output>(
+    pub fn trace_in_scope<F, Output>(
         parent: C,
         function: F,
         input_types: Vec<C::Type>,
-        named_axes: Vec<(String, NamedAxis)>,
-        default_mesh: Option<LogicalMesh>,
+        scope: TracingScope,
     ) -> Result<
         (Output::ParameterStructure, Program<C::Constant, C::Operation, Vec<C::Constant>, Vec<C::Constant>>),
         ProgramError,
@@ -995,10 +1020,9 @@ impl<C: Context> NestedTracingContext<C> {
         Output: Parameterized<Tracer<Self>>,
         Self: StagingContext<Type = C::Type, Constant = C::Constant, Operation = C::Operation>,
     {
-        /// Internal helper that traces like
-        /// [`trace_with_named_axes_and_default_mesh`](Self::trace_with_named_axes_and_default_mesh) with the callback
-        /// type erased. This is the body of that function, which only wraps its callback, so that this body is compiled
-        /// once per output structure rather than once per callback type. The callback is invoked exactly once.
+        /// Internal helper that traces like [`trace_in_scope`](Self::trace_in_scope) with the callback type erased.
+        /// This is the body of that function, which only wraps its callback, so that this body is compiled once per
+        /// output structure rather than once per callback type. The callback is invoked exactly once.
         #[allow(clippy::type_complexity)]
         fn inner<C: Context, Output>(
             parent: C,
@@ -1057,6 +1081,7 @@ impl<C: Context> NestedTracingContext<C> {
 
         let mut function = Some(function);
         let function = &mut |inputs: Vec<Tracer<Self>>| function.take().unwrap()(inputs);
+        let TracingScope { named_axes, default_mesh } = scope;
         inner(parent, function, input_types, named_axes, default_mesh)
     }
 }
@@ -1873,6 +1898,21 @@ mod tests {
             builder.borrow().error().cloned(),
             Some(ProgramError::InvalidOutputCount { expected: 1, actual: 0 }),
         );
+    }
+
+    #[test]
+    fn test_tracing_scope() {
+        let named_axes = vec![("items".to_string(), NamedAxis::Batched { size: Some(3) })];
+        let mesh = LogicalMesh::new(vec![MeshAxis::new("devices", 2, MeshAxisType::Manual).unwrap()]).unwrap();
+        let scope = TracingScope::new(named_axes.clone(), Some(mesh.clone()));
+        assert_eq!(scope.named_axes(), named_axes.as_slice());
+        assert_eq!(scope.default_mesh(), Some(&mesh));
+        assert_eq!(TracingScope::default(), TracingScope::new(Vec::new(), None));
+
+        // The scope of a context consists of exactly the named axes and the default mesh that it resolves.
+        let context = TestArrayTracingContext::new().with_scope(scope.clone());
+        assert_eq!(TracingScope::from_context(&context), scope);
+        assert_eq!(TracingScope::from_context(&TestArrayTracingContext::new()), TracingScope::default());
     }
 
     #[test]
