@@ -6,12 +6,11 @@
 //! family) differentiates and transposes those member operations through their own rules. Family dispatchers (e.g.,
 //! the ones that `#[derive(Operation)]` generates) project the inputs of such an operation into the member value
 //! family, apply its [`DifferentiableOperation`] or [`TransposableOperation`] rule in a projected view of the
-//! enclosing [`DifferentiationContext`] or [`TranspositionContext`], and lift its outputs back
-//! (refer to [`DifferentiationContext::jvp_projected_operation`] and
-//! [`TranspositionContext::transpose_projected_operation`]). [`ProjectedDifferentiationPolicy`] keeps the projected
-//! view's primal and tangent separation identical to the enclosing one. Member operations whose rules need
-//! capabilities of the parent family implement [`MemberDifferentiableOperation`] and [`MemberTransposableOperation`]
-//! instead.
+//! enclosing [`DifferentiationContext`] or [`TranspositionContext`], and lift its outputs back. Refer to
+//! [`DifferentiationContext::jvp_projected_operation`] and [`TranspositionContext::transpose_projected_operation`] for
+//! more information on that last part. [`ProjectedDifferentiationPolicy`] keeps the projected view's primal and tangent
+//! separation identical to the enclosing one. Member operations whose rules need capabilities of the parent family
+//! implement [`MemberDifferentiableOperation`] and [`MemberTransposableOperation`] instead.
 //!
 //! # Projected Values in Parent Contexts
 //!
@@ -29,8 +28,6 @@
 //! [`DifferentiationBuilder`](crate::DifferentiationBuilder) of that context, and rebuild the caller's structures from
 //! their [`Parameterized::ParameterStructure`]s, so they accept the same (arbitrarily nested) structures as that
 //! builder.
-
-// TODO(eaplatanios): Review this module.
 
 use std::marker::PhantomData;
 
@@ -66,18 +63,16 @@ use crate::differentiation::forward::{FusedDifferentiationPolicy, PartitionedDif
 #[cfg(doc)]
 use crate::programs::Region;
 
-// Member rules in projected contexts.
-
-/// Adapts an existing [`DifferentiationPolicy`] `P` to a [`ProjectedContext`] while preserving how it separates
-/// primal and tangent work. This wraps a policy such as [`FusedDifferentiationPolicy`]
+/// Adapts an existing [`DifferentiationPolicy`] `P` to a [`ProjectedContext`] while preserving how
+/// it separates primal and tangent work. This wraps a policy such as [`FusedDifferentiationPolicy`]
 /// or [`PartitionedDifferentiationPolicy`], rather than another choice of how to execute differentiation.
 ///
 /// [`DifferentiationContext::project`] preserves existing contexts. When used with [`DifferentiationContext::new`],
-/// the wrapper asks `P` to create a tangent context for the enclosing context, then projects that
-/// context into the member family. If `P` shares the primal context, the projected rule shares its primal context too.
-/// To transfer a value, the wrapper lifts it into the enclosing value family, applies `P`'s transfer, then projects
-/// the result back. For example, an array-only rule inside a heterogeneous context retains partitioned known value
-/// imports even though it sees only array values. All of these calls use static dispatch through `P`.
+/// the wrapper asks `P` to create a tangent context for the enclosing context, then projects that context into the
+/// member family. If `P` shares the primal context, the projected rule shares its primal context too. To transfer a
+/// value, the wrapper lifts it into the enclosing value family, applies `P`'s transfer, then projects the result back.
+/// For example, an array-only rule inside a heterogeneous context retains partitioned known value imports even though
+/// it sees only array values. All of these calls use static dispatch through `P`.
 #[derive(Copy, Clone, Debug)]
 pub struct ProjectedDifferentiationPolicy<P>(PhantomData<P>);
 
@@ -127,8 +122,8 @@ impl<T: Type, C: ContextProjection<T>, P: DifferentiationPolicy<C>> Differentiat
 ///
 /// Implementations bound the parent context by the projection vocabulary they
 /// actually use (typically [`ValueProjection<T>`](ValueProjection) for values and constants,
-/// [`OperationProjection<T>`](crate::OperationProjection) for the member operation family, and the member and
-/// mixed operations they stage) rather than this trait imposing one fixed vocabulary on every implementation.
+/// [`OperationProjection<T>`](OperationProjection) for the member operation family, and the member and mixed
+/// operations they stage) rather than this trait imposing one fixed vocabulary on every implementation.
 /// Operation-family dispatchers should use this trait only for projected members whose derivative requires
 /// parent-universe values. Members whose inputs, outputs, and derivative all remain within `T` should use
 /// [`jvp_projected_operation`](DifferentiationContext::jvp_projected_operation) and
@@ -162,6 +157,56 @@ pub trait MemberDifferentiableOperation<C: Context>: Operation<Type: Differentia
     ) -> Result<Vec<DifferentiationDual<C::Value>>, DifferentiationError> {
         self.jvp_in_parent(context, driver, inputs)
     }
+}
+
+/// Transpose rule for a member operation that runs in its enclosing operation family's [`TranspositionContext`].
+/// Unlike [`TransposableOperation`], this trait permits the operation's [`Type`] to differ from the context's type.
+/// For example, an array slice operates on arrays, but its parent context may also represent references. Its member
+/// rule can then add a cotangent into a reference slice without trying to project that reference into the array family.
+///
+/// This is the reverse mode counterpart of [`MemberDifferentiableOperation`].
+/// Generated operation family dispatchers call it for computational projected members. A member family delegates to
+/// its individual operations when they need parent family capabilities, and can use
+/// [`transpose_projected_operation`](TranspositionContext::transpose_projected_operation) for region-free rules that
+/// remain within the member family. Implementations specify the projection and operation capabilities they need; this
+/// trait does not require every enclosing family to support references.
+///
+/// Accumulators remain owned by the enclosing context. The contribution, ownership, and deterministic staging
+/// requirements of [`TransposableOperation::transpose`] apply unchanged, including when a rule delegates to projection.
+pub trait MemberTransposableOperation<V: Value, O: Operation<Type = V::Type>>:
+    Operation<Type: DifferentiableType>
+where
+    TracingContext<V, O>: StagingContext<Type = V::Type, Constant = V, Operation = O>,
+{
+    /// Applies this member's transpose rule using the enclosing family's values and cotangent accumulators.
+    ///
+    /// # Parameters
+    ///
+    ///   - `context`: Active [`TranspositionContext`] for the enclosing operation family, which dereferences to the
+    ///     [`TracingContext`] in which rules stage additional linear operations. Reference-state rules access the
+    ///     instruction's reference inputs through this context; their state updates do not use the `accumulators`
+    ///     handles.
+    ///   - `driver`: Call-scoped nested-region [`TranspositionDriver`] for the current instruction, exposing attached
+    ///     regions in the enclosing operation family.
+    ///   - `inputs`: Per-input [`PartialValue`] knowledge, in operation input order, expressed using the enclosing
+    ///     family's types and tracers. As in [`TransposableOperation::transpose`], a [`PartialValue::Unknown`] entry
+    ///     marks a linear input that receives a cotangent contribution, while a [`Known`](PartialValue::Known) entry
+    ///     supplies a runtime value in the pullback and receives no contribution. Each input's [`Type`] is available
+    ///     either way through the [`Typed`] trait.
+    ///   - `outputs`: Symbolic cotangents for the instruction's outputs, in operation output order, expressed using
+    ///     the enclosing family's tracers. A reference-typed output never carries a live cotangent (its state cotangent
+    ///     lives in the accumulator of the root it forwards) and always arrives as a structural zero.
+    ///   - `accumulators`: [`CotangentAccumulator`]s, one per input in operation input order, owned by `context`.
+    ///     Known, ignored, and reference-state inputs have unneeded handles. Contributions must have the input's
+    ///     cotangent type and belong to this context's builder, including when the handle is unneeded.
+    fn transpose_in_parent<D: TranspositionDriver<V, O>>(
+        &self,
+        context: &mut TranspositionContext<V, O>,
+        driver: &D,
+        inputs: &[PartialValue<Tracer<TracingContext<V, O>>>],
+        outputs: &[MaybeZero<Tracer<TracingContext<V, O>>>],
+        accumulators: &[CotangentAccumulator],
+    ) -> Result<(), DifferentiationError>;
 }
 
 impl<C: Context, T: Type, P: DifferentiationPolicy<C>> ValueProjection<T> for DifferentiationTracer<C, P>
@@ -478,56 +523,6 @@ impl DifferentiationRule {
     }
 }
 
-/// Transpose rule for a member operation that runs in its enclosing operation family's [`TranspositionContext`].
-/// Unlike [`TransposableOperation`], this trait permits the operation's [`Type`] to differ from the context's type.
-/// For example, an array slice operates on arrays, but its parent context may also represent references. Its member
-/// rule can then add a cotangent into a reference slice without trying to project that reference into the array family.
-///
-/// This is the reverse mode counterpart of [`MemberDifferentiableOperation`].
-/// Generated operation family dispatchers call it for computational projected members. A member family delegates to
-/// its individual operations when they need parent family capabilities, and can use
-/// [`transpose_projected_operation`](TranspositionContext::transpose_projected_operation) for region-free rules that
-/// remain within the member family. Implementations specify the projection and operation capabilities they need; this
-/// trait does not require every enclosing family to support references.
-///
-/// Accumulators remain owned by the enclosing context. The contribution, ownership, and deterministic staging
-/// requirements of [`TransposableOperation::transpose`] apply unchanged, including when a rule delegates to projection.
-pub trait MemberTransposableOperation<V: Value, O: Operation<Type = V::Type>>:
-    Operation<Type: DifferentiableType>
-where
-    TracingContext<V, O>: StagingContext<Type = V::Type, Constant = V, Operation = O>,
-{
-    /// Applies this member's transpose rule using the enclosing family's values and cotangent accumulators.
-    ///
-    /// # Parameters
-    ///
-    ///   - `context`: Active [`TranspositionContext`] for the enclosing operation family, which dereferences to the
-    ///     [`TracingContext`] in which rules stage additional linear operations. Reference-state rules access the
-    ///     instruction's reference inputs through this context; their state updates do not use the `accumulators`
-    ///     handles.
-    ///   - `driver`: Call-scoped nested-region [`TranspositionDriver`] for the current instruction, exposing attached
-    ///     regions in the enclosing operation family.
-    ///   - `inputs`: Per-input [`PartialValue`] knowledge, in operation input order, expressed using the enclosing
-    ///     family's types and tracers. As in [`TransposableOperation::transpose`], a [`PartialValue::Unknown`] entry
-    ///     marks a linear input that receives a cotangent contribution, while a [`Known`](PartialValue::Known) entry
-    ///     supplies a runtime value in the pullback and receives no contribution. Each input's [`Type`] is available
-    ///     either way through the [`Typed`] trait.
-    ///   - `outputs`: Symbolic cotangents for the instruction's outputs, in operation output order, expressed using
-    ///     the enclosing family's tracers. A reference-typed output never carries a live cotangent (its state cotangent
-    ///     lives in the accumulator of the root it forwards) and always arrives as a structural zero.
-    ///   - `accumulators`: [`CotangentAccumulator`]s, one per input in operation input order, owned by `context`.
-    ///     Known, ignored, and reference-state inputs have unneeded handles. Contributions must have the input's
-    ///     cotangent type and belong to this context's builder, including when the handle is unneeded.
-    fn transpose_in_parent<D: TranspositionDriver<V, O>>(
-        &self,
-        context: &mut TranspositionContext<V, O>,
-        driver: &D,
-        inputs: &[PartialValue<Tracer<TracingContext<V, O>>>],
-        outputs: &[MaybeZero<Tracer<TracingContext<V, O>>>],
-        accumulators: &[CotangentAccumulator],
-    ) -> Result<(), DifferentiationError>;
-}
-
 // The following functions are the transposition rules that operation family dispatchers (e.g., the ones generated by
 // `#[derive(Operation)]`) apply to member operations whose rules run through a projected view.
 impl<V: Value, O: Operation<Type = V::Type>> TranspositionContext<V, O>
@@ -569,9 +564,9 @@ where
         V::Type: DifferentiableType + From<T>,
         P: TransposableOperation<<V as ValueProjection<T>>::Projected, P>,
         O: OperationProjection<T, Projected = P> + OperationProvider<V::Type, AddOperation<V::Type>, Operation = O>,
-        for<'t> &'t T: TryFrom<&'t V::Type, Error = TypeError>,
         TracingContext<<V as ValueProjection<T>>::Projected, P>:
             StagingContext<Type = T, Constant = <V as ValueProjection<T>>::Projected, Operation = P>,
+        for<'t> &'t T: TryFrom<&'t V::Type, Error = TypeError>,
     {
         if !operation.region_slots().is_empty() {
             return Err(ProgramError::UnsupportedOperation {
@@ -717,12 +712,12 @@ where
         O: OperationProjection<T> + OperationProvider<V::Type, AddOperation<V::Type>, Operation = O>,
         <O as OperationProjection<T>>::Projected: From<P>
             + TransposableOperation<<V as ValueProjection<T>>::Projected, <O as OperationProjection<T>>::Projected>,
-        for<'t> &'t T: TryFrom<&'t V::Type, Error = TypeError>,
         TracingContext<<V as ValueProjection<T>>::Projected, <O as OperationProjection<T>>::Projected>: StagingContext<
                 Type = T,
                 Constant = <V as ValueProjection<T>>::Projected,
                 Operation = <O as OperationProjection<T>>::Projected,
             >,
+        for<'t> &'t T: TryFrom<&'t V::Type, Error = TypeError>,
     {
         check_count!("accumulator", accumulators, inputs.len(), DifferentiationError);
         accumulators.iter().try_for_each(|accumulator| self.accumulated_value(accumulator).map(|_| ()))?;
@@ -765,6 +760,8 @@ where
     }
 }
 
+// TODO(eaplatanios): Review this module.
+
 /// Validates that the provided structural operation declares no regions, which
 /// [`DifferentiationContext::jvp_structural_operation`] and [`DifferentiationContext::jvp_structural_mixed_operation`]
 /// require because they stage the operation again without regions. The check runs before anything else, so that
@@ -780,9 +777,6 @@ fn validate_region_free_structural_operation<O: Operation>(operation: &O) -> Res
 }
 
 // Projected values in parent contexts.
-
-/// `T`-typed member representation of the values of the parent context `C`.
-pub(super) type Projected<C, T> = <<C as Domain>::Value as ValueProjection<T>>::Projected;
 
 /// `T`-typed member representation of the parent tracer `X`, which differentiated closures receive.
 type ProjectedTracer<X, T> = ProjectedValue<T, X>;
@@ -812,8 +806,8 @@ fn lift_primal<C, T, Input>(
 where
     C: ContextProjection<T>,
     T: Type,
-    Projected<C, T>: Value<Domain = ProjectedContext<C, T>>,
-    Input: Parameterized<Projected<C, T>>,
+    <C::Value as ValueProjection<T>>::Projected: Value<Domain = ProjectedContext<C, T>>,
+    Input: Parameterized<<C::Value as ValueProjection<T>>::Projected>,
 {
     let context = primal.parameters().next().map(|leaf| leaf.domain().parent().clone()).ok_or_else(|| {
         ProgramError::InvalidArgument {
@@ -1261,8 +1255,8 @@ impl<Input> ParentDifferentiationBuilder<Input> {
 pub struct ParentPushforward<
     C: ContextProjection<T>,
     T: Type,
-    Input: Parameterized<Projected<C, T>>,
-    Output: Parameterized<Projected<C, T>>,
+    Input: Parameterized<<C::Value as ValueProjection<T>>::Projected>,
+    Output: Parameterized<<C::Value as ValueProjection<T>>::Projected>,
 > {
     /// Pushforward in the parent context, over the flattened leaves of the linearized function.
     inner: Pushforward<C, Vec<C::Value>, Vec<C::Value>>,
@@ -1274,8 +1268,12 @@ pub struct ParentPushforward<
     marker: PhantomData<fn(Input) -> (T, Output)>,
 }
 
-impl<C: ContextProjection<T>, T: Type, Input: Parameterized<Projected<C, T>>, Output: Parameterized<Projected<C, T>>>
-    ParentPushforward<C, T, Input, Output>
+impl<
+    C: ContextProjection<T>,
+    T: Type,
+    Input: Parameterized<<C::Value as ValueProjection<T>>::Projected>,
+    Output: Parameterized<<C::Value as ValueProjection<T>>::Projected>,
+> ParentPushforward<C, T, Input, Output>
 where
     C::Type: DifferentiableType,
 {
@@ -1301,13 +1299,13 @@ where
     pub fn apply_in_context<X, Path>(
         &self,
         context: &X,
-        tangents: Input::To<Projected<X, T>>,
-    ) -> Result<Output::To<Projected<X, T>>, ProgramError>
+        tangents: Input::To<<X::Value as ValueProjection<T>>::Projected>,
+    ) -> Result<Output::To<<X::Value as ValueProjection<T>>::Projected>, ProgramError>
     where
         X: ContextProjection<T, Type = C::Type, Constant = C::Constant, Operation = C::Operation>
             + ImportingContext<C, Path>,
-        Input::Family: ParameterizedFamily<Projected<X, T>>,
-        Output::Family: ParameterizedFamily<Projected<X, T>>,
+        Input::Family: ParameterizedFamily<<X::Value as ValueProjection<T>>::Projected>,
+        Output::Family: ParameterizedFamily<<X::Value as ValueProjection<T>>::Projected>,
         C::Operation: ResidualZeroProvider<C::Type, Operation = C::Operation>,
         TracingContext<C::Constant, C::Operation>:
             StagingContext<Type = C::Type, Constant = C::Constant, Operation = C::Operation>,
@@ -1326,8 +1324,8 @@ where
 pub struct ParentPullback<
     C: ContextProjection<T>,
     T: Type,
-    Input: Parameterized<Projected<C, T>>,
-    Output: Parameterized<Projected<C, T>>,
+    Input: Parameterized<<C::Value as ValueProjection<T>>::Projected>,
+    Output: Parameterized<<C::Value as ValueProjection<T>>::Projected>,
 > {
     /// Pullback in the parent context, over the flattened leaves of the differentiated function.
     inner: Pullback<C, Vec<C::Value>, Vec<C::Value>>,
@@ -1339,8 +1337,12 @@ pub struct ParentPullback<
     marker: PhantomData<fn(Output) -> (T, Input)>,
 }
 
-impl<C: ContextProjection<T>, T: Type, Input: Parameterized<Projected<C, T>>, Output: Parameterized<Projected<C, T>>>
-    ParentPullback<C, T, Input, Output>
+impl<
+    C: ContextProjection<T>,
+    T: Type,
+    Input: Parameterized<<C::Value as ValueProjection<T>>::Projected>,
+    Output: Parameterized<<C::Value as ValueProjection<T>>::Projected>,
+> ParentPullback<C, T, Input, Output>
 where
     C::Type: DifferentiableType + ReferenceMemberType,
 {
@@ -1351,10 +1353,13 @@ where
     }
 
     /// Projected counterpart of [`Pullback::apply`], whose structural zeros carry projected types.
-    pub fn apply(&self, cotangents: Output) -> Result<Input::To<MaybeZero<Projected<C, T>>>, ProgramError>
+    pub fn apply(
+        &self,
+        cotangents: Output,
+    ) -> Result<Input::To<MaybeZero<<C::Value as ValueProjection<T>>::Projected>>, ProgramError>
     where
         for<'t> &'t T: TryFrom<&'t C::Type, Error = TypeError>,
-        Input::Family: ParameterizedFamily<MaybeZero<Projected<C, T>>>,
+        Input::Family: ParameterizedFamily<MaybeZero<<C::Value as ValueProjection<T>>::Projected>>,
         C::Operation: PullbackOperation<C::Type, C::Constant>,
         TracingContext<C::Constant, C::Operation>:
             StagingContext<Type = C::Type, Constant = C::Constant, Operation = C::Operation>,
@@ -1366,7 +1371,10 @@ where
             .into_iter()
             .map(project_maybe_zero::<T, C::Value>)
             .collect::<Result<Vec<_>, _>>()?;
-        Ok(Input::To::<MaybeZero<Projected<C, T>>>::from_parameters(self.input_structure.clone(), cotangents)?)
+        Ok(Input::To::<MaybeZero<<C::Value as ValueProjection<T>>::Projected>>::from_parameters(
+            self.input_structure.clone(),
+            cotangents,
+        )?)
     }
 
     /// Projected counterpart of [`Pullback::apply_in_context`], whose cotangents are the projected leaves of the
@@ -1374,14 +1382,14 @@ where
     pub fn apply_in_context<X, Path>(
         &self,
         context: &X,
-        cotangents: Output::To<Projected<X, T>>,
-    ) -> Result<Input::To<MaybeZero<Projected<X, T>>>, ProgramError>
+        cotangents: Output::To<<X::Value as ValueProjection<T>>::Projected>,
+    ) -> Result<Input::To<MaybeZero<<X::Value as ValueProjection<T>>::Projected>>, ProgramError>
     where
         X: ContextProjection<T, Type = C::Type, Constant = C::Constant, Operation = C::Operation>
             + ImportingContext<C, Path>,
         for<'t> &'t T: TryFrom<&'t C::Type, Error = TypeError>,
-        Input::Family: ParameterizedFamily<MaybeZero<Projected<X, T>>>,
-        Output::Family: ParameterizedFamily<Projected<X, T>>,
+        Input::Family: ParameterizedFamily<MaybeZero<<X::Value as ValueProjection<T>>::Projected>>,
+        Output::Family: ParameterizedFamily<<X::Value as ValueProjection<T>>::Projected>,
         C::Operation: PullbackOperation<C::Type, C::Constant>,
         TracingContext<C::Constant, C::Operation>:
             StagingContext<Type = C::Type, Constant = C::Constant, Operation = C::Operation>,
@@ -1393,7 +1401,10 @@ where
             .into_iter()
             .map(project_maybe_zero::<T, X::Value>)
             .collect::<Result<Vec<_>, _>>()?;
-        Ok(Input::To::<MaybeZero<Projected<X, T>>>::from_parameters(self.input_structure.clone(), cotangents)?)
+        Ok(Input::To::<MaybeZero<<X::Value as ValueProjection<T>>::Projected>>::from_parameters(
+            self.input_structure.clone(),
+            cotangents,
+        )?)
     }
 
     /// Projected counterpart of [`Pullback::apply_materialized`].
@@ -1416,14 +1427,14 @@ where
     pub fn apply_materialized_in_context<X, Path>(
         &self,
         context: &X,
-        cotangents: Output::To<Projected<X, T>>,
-    ) -> Result<Input::To<Projected<X, T>>, ProgramError>
+        cotangents: Output::To<<X::Value as ValueProjection<T>>::Projected>,
+    ) -> Result<Input::To<<X::Value as ValueProjection<T>>::Projected>, ProgramError>
     where
         X: ContextProjection<T, Type = C::Type, Constant = C::Constant, Operation = C::Operation>
             + ImportingContext<C, Path>
             + Zero<X::Value>,
-        Input::Family: ParameterizedFamily<Projected<X, T>>,
-        Output::Family: ParameterizedFamily<Projected<X, T>>,
+        Input::Family: ParameterizedFamily<<X::Value as ValueProjection<T>>::Projected>,
+        Output::Family: ParameterizedFamily<<X::Value as ValueProjection<T>>::Projected>,
         C::Operation: PullbackOperation<C::Type, C::Constant>,
         TracingContext<C::Constant, C::Operation>:
             StagingContext<Type = C::Type, Constant = C::Constant, Operation = C::Operation>,
@@ -1440,13 +1451,13 @@ where
     #[allow(clippy::type_complexity)]
     pub fn apply_with_destinations(
         &self,
-        seeds: Output::To<CotangentSeed<Projected<C, T>>>,
-        destinations: Input::To<CotangentDestination<Projected<C, T>>>,
-    ) -> Result<Input::To<Option<MaybeZero<Projected<C, T>>>>, ProgramError>
+        seeds: Output::To<CotangentSeed<<C::Value as ValueProjection<T>>::Projected>>,
+        destinations: Input::To<CotangentDestination<<C::Value as ValueProjection<T>>::Projected>>,
+    ) -> Result<Input::To<Option<MaybeZero<<C::Value as ValueProjection<T>>::Projected>>>, ProgramError>
     where
-        Input::Family: ParameterizedFamily<CotangentDestination<Projected<C, T>>>
-            + ParameterizedFamily<Option<MaybeZero<Projected<C, T>>>>,
-        Output::Family: ParameterizedFamily<CotangentSeed<Projected<C, T>>>,
+        Input::Family: ParameterizedFamily<CotangentDestination<<C::Value as ValueProjection<T>>::Projected>>
+            + ParameterizedFamily<Option<MaybeZero<<C::Value as ValueProjection<T>>::Projected>>>,
+        Output::Family: ParameterizedFamily<CotangentSeed<<C::Value as ValueProjection<T>>::Projected>>,
         C::Operation: PullbackOperation<C::Type, C::Constant>,
         TracingContext<C::Constant, C::Operation>:
             StagingContext<Type = C::Type, Constant = C::Constant, Operation = C::Operation>,
@@ -1460,7 +1471,10 @@ where
             .into_iter()
             .map(|cotangent| cotangent.map(project_maybe_zero::<T, C::Value>).transpose())
             .collect::<Result<Vec<_>, _>>()?;
-        Ok(Input::To::<Option<MaybeZero<Projected<C, T>>>>::from_parameters(self.input_structure.clone(), cotangents)?)
+        Ok(Input::To::<Option<MaybeZero<<C::Value as ValueProjection<T>>::Projected>>>::from_parameters(
+            self.input_structure.clone(),
+            cotangents,
+        )?)
     }
 
     /// Projected counterpart of [`Pullback::apply_with_destinations_in_context`], whose seeds and destinations are the
@@ -1469,15 +1483,15 @@ where
     pub fn apply_with_destinations_in_context<X, Path>(
         &self,
         context: &X,
-        seeds: Output::To<CotangentSeed<Projected<X, T>>>,
-        destinations: Input::To<CotangentDestination<Projected<X, T>>>,
-    ) -> Result<Input::To<Option<MaybeZero<Projected<X, T>>>>, ProgramError>
+        seeds: Output::To<CotangentSeed<<X::Value as ValueProjection<T>>::Projected>>,
+        destinations: Input::To<CotangentDestination<<X::Value as ValueProjection<T>>::Projected>>,
+    ) -> Result<Input::To<Option<MaybeZero<<X::Value as ValueProjection<T>>::Projected>>>, ProgramError>
     where
         X: ContextProjection<T, Type = C::Type, Constant = C::Constant, Operation = C::Operation>
             + ImportingContext<C, Path>,
-        Input::Family: ParameterizedFamily<CotangentDestination<Projected<X, T>>>
-            + ParameterizedFamily<Option<MaybeZero<Projected<X, T>>>>,
-        Output::Family: ParameterizedFamily<CotangentSeed<Projected<X, T>>>,
+        Input::Family: ParameterizedFamily<CotangentDestination<<X::Value as ValueProjection<T>>::Projected>>
+            + ParameterizedFamily<Option<MaybeZero<<X::Value as ValueProjection<T>>::Projected>>>,
+        Output::Family: ParameterizedFamily<CotangentSeed<<X::Value as ValueProjection<T>>::Projected>>,
         C::Operation: PullbackOperation<C::Type, C::Constant>,
         TracingContext<C::Constant, C::Operation>:
             StagingContext<Type = C::Type, Constant = C::Constant, Operation = C::Operation>,
@@ -1491,7 +1505,10 @@ where
             .into_iter()
             .map(|cotangent| cotangent.map(project_maybe_zero::<T, X::Value>).transpose())
             .collect::<Result<Vec<_>, _>>()?;
-        Ok(Input::To::<Option<MaybeZero<Projected<X, T>>>>::from_parameters(self.input_structure.clone(), cotangents)?)
+        Ok(Input::To::<Option<MaybeZero<<X::Value as ValueProjection<T>>::Projected>>>::from_parameters(
+            self.input_structure.clone(),
+            cotangents,
+        )?)
     }
 }
 
