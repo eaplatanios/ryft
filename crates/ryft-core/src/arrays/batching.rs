@@ -1254,9 +1254,10 @@ where
             }
         };
 
-        // Select one placement for the batch axis from the original mapped inputs before any normalization.
-        // This prevents a subsequently broadcast replicated input from appearing to constrain the placement.
-        let axis_sharding = ArrayBatch::sharding_for_inputs(inputs.as_slice())?;
+        // Select one placement for the batch axis from the original mapped inputs before any normalization and
+        // reconcile it with the caller's optional placement. This prevents a subsequently broadcast replicated input
+        // from appearing to constrain the placement.
+        let axis_sharding = batch_axis.reconcile_sharding(ArrayBatch::sharding_for_inputs(inputs.as_slice())?)?;
 
         // The batching context carries the reconciled batch extent, optional dynamic-scope name, and common sharding
         // placement that every operation rule at this batching level observes.
@@ -1851,8 +1852,8 @@ where
         let axis_extent = axis_extent.ok_or(BatchingError::EmptyBatch)?;
 
         // A mapped reference's referent is batched like an array, so its batch-axis placement participates in the
-        // sharding join alongside the mapped arrays.
-        let axis_sharding = batch_axis_sharding(batches.iter().filter_map(|batch| {
+        // sharding join alongside the mapped arrays. The caller's optional placement is then reconciled with the join.
+        let inferred_axis_sharding = batch_axis_sharding(batches.iter().filter_map(|batch| {
             let array_type = match batch.value.r#type() {
                 Cow::Borrowed(ArrayIrType::Array(array_type)) => Cow::Borrowed(array_type),
                 Cow::Owned(ArrayIrType::Array(array_type)) => Cow::Owned(array_type),
@@ -1862,6 +1863,7 @@ where
             };
             Some((array_type, batch.batch_axis_position()))
         }))?;
+        let axis_sharding = batch_axis.reconcile_sharding(inferred_axis_sharding)?;
         let batching_context = BatchingContext::new(context.clone(), axis_extent)
             .with_axis_name(batch_axis.name().map(String::from))
             .with_axis_sharding(axis_sharding);
@@ -4320,6 +4322,69 @@ mod tests {
     }
 
     #[test]
+    fn test_array_batching_policy_pack_inputs_with_explicit_sharding() -> Result<(), BatchingError> {
+        let parent = TestArrayContext::new();
+        let mesh = LogicalMesh::new(vec![
+            MeshAxis::new("x", 2, MeshAxisType::Explicit).unwrap(),
+            MeshAxis::new("y", 2, MeshAxisType::Explicit).unwrap(),
+        ])
+        .unwrap();
+        let x_type = ArrayType::new(DataType::F64, Shape::new(vec![Dimension::Static(2)]))
+            .with_sharding(Sharding::new(mesh.clone(), vec![ShardingDimension::sharded(["x"])]).unwrap())
+            .unwrap();
+        let y_type = ArrayType::new(DataType::F64, Shape::new(vec![Dimension::Static(2)]))
+            .with_sharding(Sharding::new(mesh.clone(), vec![ShardingDimension::sharded(["y"])]).unwrap())
+            .unwrap();
+        let replicated_type = ArrayType::new(DataType::F64, Shape::new(vec![Dimension::Static(2)]))
+            .with_sharding(Sharding::replicated(mesh, 1))
+            .unwrap();
+        let x_specification = BatchAxisSpecification::default().with_sharding(ShardingDimension::sharded(["x"]));
+
+        // When no mapped input determines a placement, the explicit placement is used and every mapped input is
+        // normalized onto it.
+        let (context, inputs) = <ArrayBatchingPolicy as BatchingEntrypointPolicy<TestArrayContext>>::pack_inputs(
+            &parent,
+            vec![Array::from_elements::<f64>(replicated_type.clone(), &[1.0, 2.0]).unwrap()],
+            vec![BatchAxis::new(0)],
+            x_specification.clone(),
+        )?;
+        assert_eq!(context.axis_sharding(), &ShardingDimension::sharded(["x"]));
+        assert_eq!(
+            inputs,
+            vec![ArrayBatch::new(Array::from_elements::<f64>(x_type.clone(), &[1.0, 2.0]).unwrap(), Some(0))?],
+        );
+
+        // A placement that the mapped inputs determine is accepted when it agrees with the explicit one.
+        let (context, _) = <ArrayBatchingPolicy as BatchingEntrypointPolicy<TestArrayContext>>::pack_inputs(
+            &parent,
+            vec![
+                Array::from_elements::<f64>(x_type.clone(), &[1.0, 2.0]).unwrap(),
+                Array::from_elements::<f64>(replicated_type, &[3.0, 4.0]).unwrap(),
+            ],
+            vec![BatchAxis::new(0), BatchAxis::new(0)],
+            x_specification.clone(),
+        )?;
+        assert_eq!(context.axis_sharding(), &ShardingDimension::sharded(["x"]));
+
+        // A placement that the mapped inputs determine and that conflicts with the explicit one is rejected.
+        assert_eq!(
+            <ArrayBatchingPolicy as BatchingEntrypointPolicy<TestArrayContext>>::pack_inputs(
+                &parent,
+                vec![Array::from_elements::<f64>(y_type, &[1.0, 2.0]).unwrap()],
+                vec![BatchAxis::new(0)],
+                x_specification,
+            )
+            .err(),
+            Some(BatchingError::MisalignedBatchAxes {
+                message: "the explicit batch axis sharding {'x'} conflicts with the batch axis sharding {'y'} of the \
+                          mapped inputs"
+                    .to_string(),
+            }),
+        );
+        Ok(())
+    }
+
+    #[test]
     fn test_array_batching_policy_materialize_output() -> Result<(), BatchingError> {
         type Parent = EagerContext<Array, ArrayOperation<Array>>;
         let context = BatchingContext::new(Parent::new(), 3);
@@ -5237,6 +5302,59 @@ mod tests {
                     ReferenceType::new(replicated_type),
                     ShardingDimension::sharded(["x"]),
                 ),
+            }),
+        );
+        Ok(())
+    }
+
+    #[test]
+    fn test_array_ir_batching_policy_pack_inputs_with_explicit_sharding() -> Result<(), BatchingError> {
+        let pack_inputs = <ArrayIrBatchingPolicy as BatchingEntrypointPolicy<ArrayIrTraceContext>>::pack_inputs;
+        let mesh = LogicalMesh::new(vec![
+            MeshAxis::new("x", 2, MeshAxisType::Explicit).unwrap(),
+            MeshAxis::new("y", 2, MeshAxisType::Explicit).unwrap(),
+        ])
+        .unwrap();
+        let shape = Shape::new(vec![Dimension::Static(2), Dimension::Static(3)]);
+        let sharded_type = |axis: &str| {
+            ArrayType::new(DataType::F32, shape.clone())
+                .with_sharding(
+                    Sharding::new(
+                        mesh.clone(),
+                        vec![ShardingDimension::sharded([axis]), ShardingDimension::replicated()],
+                    )
+                    .unwrap(),
+                )
+                .unwrap()
+        };
+        let replicated_type = ArrayType::new(DataType::F32, shape.clone())
+            .with_sharding(Sharding::replicated(mesh.clone(), 2))
+            .unwrap();
+        let x_specification = BatchAxisSpecification::default().with_sharding(ShardingDimension::sharded(["x"]));
+
+        // When no mapped input determines a placement, the explicit placement is used and every mapped array is
+        // normalized onto it.
+        let trace = ArrayIrTraceContext::new();
+        let array = trace.input(replicated_type.clone().into());
+        let (context, batches) = pack_inputs(&trace, vec![array], vec![BatchAxis::new(0)], x_specification.clone())?;
+        assert_eq!(context.axis_sharding(), &ShardingDimension::sharded(["x"]));
+        assert_eq!(batches[0].value().r#type().as_ref(), &ArrayIrType::Array(sharded_type("x")));
+
+        // A placement that the mapped inputs determine is accepted when it agrees with the explicit one.
+        let trace = ArrayIrTraceContext::new();
+        let reference = trace.input(ReferenceType::new(sharded_type("x")).into());
+        let (context, _) = pack_inputs(&trace, vec![reference], vec![BatchAxis::new(0)], x_specification.clone())?;
+        assert_eq!(context.axis_sharding(), &ShardingDimension::sharded(["x"]));
+
+        // A placement that the mapped inputs determine and that conflicts with the explicit one is rejected.
+        let trace = ArrayIrTraceContext::new();
+        let array = trace.input(sharded_type("y").into());
+        assert_eq!(
+            pack_inputs(&trace, vec![array], vec![BatchAxis::new(0)], x_specification).err(),
+            Some(BatchingError::MisalignedBatchAxes {
+                message: "the explicit batch axis sharding {'x'} conflicts with the batch axis sharding {'y'} of the \
+                          mapped inputs"
+                    .to_string(),
             }),
         );
         Ok(())
