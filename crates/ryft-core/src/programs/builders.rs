@@ -308,7 +308,7 @@ impl<V: Value, O: Operation<Type = V::Type>> ProgramBuilder<V, O> {
     /// order (region-free operations pass an empty `regions` list) to the provided input [`Atom`]s. The number of
     /// attached regions must match the operation's declared [`Operation::region_slots`] count. Output types are
     /// inferred through [`Operation::infer_output_types`], with the attached regions' [`RegionInterface`]s derived
-    /// from this builder's sealed arena on the spot (i.e., [`RegionInterface`]s are never stored).
+    /// from this builder's immutable sealed arena. Repeated inference can borrow the interface cached by that region.
     ///
     /// This checked "append" also enforces reference lifetimes across the region under construction. An application
     /// that accesses a reference whose alias family an earlier instruction consumed is rejected at the "append" that
@@ -361,9 +361,12 @@ impl<V: Value, O: Operation<Type = V::Type>> ProgramBuilder<V, O> {
         let operation = operation.into();
         let (input_types, region_interfaces, output_types) =
             self.validate_instruction(&operation, &regions, &inputs)?;
-        if regions.is_empty()
-            && let Some(replacements) = operation.resolve_fold::<V>(&input_types, &region_interfaces, &output_types)?
-        {
+        let replacements = if regions.is_empty() {
+            operation.resolve_fold::<V>(&input_types, &region_interfaces, &output_types)?
+        } else {
+            None
+        };
+        if let Some(replacements) = replacements {
             return Ok(replacements
                 .into_iter()
                 .map(|replacement| match replacement {
@@ -553,19 +556,17 @@ impl<V: Value, O: Operation<Type = V::Type>> ProgramBuilder<V, O> {
         }
 
         let source_id = region.id();
-        let mut imported = region.region().clone();
-        for instruction in &mut imported.instructions {
-            for attached in &mut instruction.regions {
+        for instruction in region.instructions() {
+            for attached in instruction.regions() {
                 let nested = region.with_id(*attached).unwrap();
-                *attached = self.import_region_with_remapping(nested, remapping);
+                self.import_region_with_remapping(nested, remapping);
             }
         }
 
-        // Cloning the source region carries its retained transforms along, and sealing preserves them here, which is
-        // sound because the import copies the source body verbatim and renumbers its attached references onto faithful
-        // copies of the very same descendants. That sharing is what lets one shared callee program be linearized or
-        // transposed once across every program that interns it.
-        let id = self.regions.push_preserving_transform_cache(imported).unwrap();
+        // Importing carries the source region's retained transforms and sealed metadata along, which is sound because
+        // only its attached identifiers change, onto faithful copies of the very same descendants. Unchanged bodies
+        // stay shared. That sharing lets a callee be linearized or transposed once across every program importing it.
+        let id = self.regions.push_relocated_region(region, remapping);
         remapping.insert(source_id, id);
         id
     }
@@ -704,12 +705,13 @@ impl<V: Value, O: Operation<Type = V::Type>> ProgramBuilder<V, O> {
     }
 
     /// Validates an operation application before folding or mutating the instruction and atom tables.
+    #[allow(clippy::type_complexity)]
     fn validate_instruction(
         &self,
         operation: &O,
         regions: &[RegionId],
         inputs: &[AtomId],
-    ) -> Result<(Vec<V::Type>, Vec<RegionInterface<V::Type>>, Vec<V::Type>), ProgramError> {
+    ) -> Result<(Vec<V::Type>, Cow<'_, [RegionInterface<V::Type>]>, Vec<V::Type>), ProgramError> {
         self.references.validate(operation, inputs)?;
         for region in regions.iter().copied() {
             if region.index() >= self.regions.len() {
@@ -729,30 +731,32 @@ impl<V: Value, O: Operation<Type = V::Type>> ProgramBuilder<V, O> {
             })
             .collect::<Result<Vec<_>, _>>()?;
 
-        let region_interfaces = if regions.is_empty() {
-            Vec::new()
-        } else {
-            regions
-                .iter()
-                .map(|region_id| {
-                    let region = &self.regions[region_id.index()];
-                    let effects = self.regions.effects(*region_id).unwrap();
-                    RegionInterface::new(region.input_types(), region.output_types(), effects.classes())
-                        .with_deferred_work(effects.has_deferred_work())
-                })
-                .collect()
+        let region_interfaces: Cow<'_, [RegionInterface<V::Type>]> = match regions {
+            [] => Cow::Borrowed(&[]),
+            [region] => Cow::Borrowed(std::slice::from_ref(self.regions.interface(*region).unwrap())),
+            _ => Cow::Owned(
+                regions
+                    .iter()
+                    .map(|region_id| {
+                        let region = &self.regions[region_id.index()];
+                        let effects = self.regions.effects(*region_id).unwrap();
+                        RegionInterface::new(region.input_types(), region.output_types(), effects.classes())
+                            .with_deferred_work(effects.has_deferred_work())
+                    })
+                    .collect::<Vec<_>>(),
+            ),
         };
 
-        operation.validate_region_interfaces(region_interfaces.as_slice())?;
-        let output_types = operation.infer_output_types(input_types.as_slice(), region_interfaces.as_slice())?;
+        operation.validate_region_interfaces(region_interfaces.as_ref())?;
+        let output_types = operation.infer_output_types(input_types.as_slice(), region_interfaces.as_ref())?;
         let effects = operation.effects();
         effects.validate_application(operation.name(), input_types.as_slice(), output_types.as_slice())?;
 
         // A region-carrying operation must state how references cross its boundaries, because reference analysis and
         // discharge resolve reference identity through these hooks rather than by inspecting region bodies. Checking
         // them here reports an inconsistent operation at construction rather than when a transform first needs them.
-        for (region_index, region_id) in regions.iter().copied().enumerate() {
-            let region_input_types = self.regions[region_id.index()].input_types();
+        for (region_index, interface) in region_interfaces.iter().enumerate() {
+            let region_input_types = interface.input_types();
             if let Some(count) = operation.region_capture_input_count(region_index)
                 && count > region_input_types.len()
             {
@@ -1358,6 +1362,59 @@ mod tests {
     }
 
     #[test]
+    fn test_program_builder_import_region_shares_sealed_contents() {
+        let mut leaf_builder = ProgramBuilder::<Array, TestRegionOperation>::new();
+        let input = leaf_builder.add_input(ArrayType::scalar(DataType::F64));
+        let leaf = leaf_builder
+            .build::<Vec<Array>, Vec<Array>>(vec![input], vec![Placeholder], vec![Placeholder])
+            .unwrap();
+        let mut source_builder = ProgramBuilder::<Array, TestRegionOperation>::new();
+        let nested = source_builder.import_program(leaf);
+        let input = source_builder.add_input(ArrayType::scalar(DataType::F64));
+        let output = source_builder
+            .add_instruction(
+                TestRegionOperation::WithRegions(const { &[RegionSlot::computation("body")] }),
+                vec![nested],
+                vec![input],
+                None,
+            )
+            .unwrap()[0];
+        let source = source_builder
+            .build::<Vec<Array>, Vec<Array>>(vec![output], vec![Placeholder], vec![Placeholder])
+            .unwrap();
+        let source_cache = source.entry_region().transform_cache().clone();
+        let leaf_cache = source.regions()[0].transform_cache().clone();
+
+        let mut destination = ProgramBuilder::<Array, TestRegionOperation>::new();
+        let first = destination.import_region(source.entry_region_ref());
+        assert_eq!(first, RegionId::new(1));
+        assert!(std::ptr::eq(source.entry_region(), &destination.regions[1]));
+        assert!(std::ptr::eq(&source.regions()[0], &destination.regions[0]));
+
+        let second = destination.import_region(source.entry_region_ref());
+        assert_eq!(second, RegionId::new(3));
+        assert!(!std::ptr::eq(source.entry_region(), &destination.regions[3]));
+        assert!(std::ptr::eq(&source.regions()[0], &destination.regions[2]));
+        assert_eq!(destination.regions[3].instructions()[0].regions(), &[RegionId::new(2)]);
+        let relocated = RegionRef::new(&destination.regions, second).unwrap();
+        assert_eq!(relocated.input_types(), source.input_types().as_ref());
+        assert_eq!(relocated.output_types(), source.output_types().as_ref());
+        assert_eq!(relocated.effects(), source.effects());
+        assert_eq!(relocated.type_identity_signature(), source.type_identity_signature());
+        assert_eq!(relocated.to_program().to_string(), source.to_string());
+
+        let mut copied = destination.clone();
+        copied.regions.detach_transform_cache(&source_cache);
+        assert!(source.entry_region().transform_cache().ptr_eq(&source_cache));
+        assert!(destination.regions[1].transform_cache().ptr_eq(&source_cache));
+        assert!(destination.regions[3].transform_cache().ptr_eq(&source_cache));
+        assert!(!copied.regions[1].transform_cache().ptr_eq(&source_cache));
+        assert!(!copied.regions[3].transform_cache().ptr_eq(&source_cache));
+        assert!(copied.regions[0].transform_cache().ptr_eq(&leaf_cache));
+        assert_eq!(source.entry_region().instructions()[0].regions(), &[RegionId::new(0)]);
+    }
+
+    #[test]
     fn test_program_builder_type_identity_instantiation_cache_preserves_live_identities() {
         let bounds = DimensionBounds::non_negative(Some(16)).unwrap();
         let formal_first = DimensionVariable::new("formal_first", bounds);
@@ -1756,6 +1813,34 @@ mod tests {
             )
             .unwrap()[0];
         assert_eq!(builder.atoms()[output.index()].r#type().into_owned(), ArrayType::scalar(DataType::I64));
+    }
+
+    #[test]
+    fn test_program_builder_validate_instruction_borrows_single_interface() {
+        let mut region_builder = ProgramBuilder::<Array, TestRegionOperation>::new();
+        let input = region_builder.add_input(ArrayType::scalar(DataType::I64));
+        let region_program = region_builder
+            .build::<Vec<Array>, Vec<Array>>(vec![input], vec![Placeholder], vec![Placeholder])
+            .unwrap();
+        let mut builder = ProgramBuilder::<Array, TestRegionOperation>::new();
+        let region = builder.import_program(region_program);
+        let input = builder.add_input(ArrayType::scalar(DataType::F64));
+        let (_, empty, _) = builder.validate_instruction(&TestRegionOperation::Add, &[], &[input, input]).unwrap();
+        assert!(matches!(empty, Cow::Borrowed([])));
+
+        let operation = TestRegionOperation::WithRegions(const { &[RegionSlot::computation("body")] });
+        let (_, single, outputs) = builder.validate_instruction(&operation, &[region], &[input]).unwrap();
+        assert!(matches!(single, Cow::Borrowed(_)));
+        assert!(std::ptr::eq(&single[0], builder.regions.interface(region).unwrap()));
+        assert_eq!(outputs, vec![ArrayType::scalar(DataType::I64)]);
+
+        let operation = TestRegionOperation::WithRegions(
+            const { &[RegionSlot::computation("first"), RegionSlot::computation("second")] },
+        );
+        let (_, multiple, outputs) = builder.validate_instruction(&operation, &[region, region], &[input]).unwrap();
+        assert!(matches!(multiple, Cow::Owned(_)));
+        assert_eq!(multiple.as_ref(), &[single[0].clone(), single[0].clone()]);
+        assert_eq!(outputs, vec![ArrayType::scalar(DataType::I64)]);
     }
 
     #[test]

@@ -1292,7 +1292,7 @@ mod tests {
             indoc! {"
                 lambda %0:f64[] .
                 let %1:f64[] = with_regions %0 [
-                    rule=^0={
+                    rule={
                         lambda %0:f64[] .
                         in (%0)
                     },

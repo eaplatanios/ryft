@@ -3,7 +3,7 @@ use std::collections::HashMap;
 use std::fmt::{Debug, Display};
 use std::hash::{Hash, Hasher};
 use std::ops::Index;
-use std::sync::Arc;
+use std::sync::{Arc, LazyLock};
 
 use thiserror::Error;
 
@@ -1439,6 +1439,9 @@ pub(crate) enum DimensionComparison {
     IdentityRenaming,
 }
 
+/// Shared immutable dimension slice for scalar shapes, avoiding a fresh allocation for each empty shape.
+static SCALAR_SHAPE_DIMENSIONS: LazyLock<Arc<[Dimension]>> = LazyLock::new(|| Arc::from([]));
+
 // TODO(eaplatanios): If padded, explicitly masked workloads justify revisiting ragged arrays, describe indexed
 //  extents in `Shape` and ordinary `ArrayType` rather than adding a separate array kind or batching carrier. Bounded
 //  nominal dynamic dimensions would record their extent axes in an acyclic graph, independently of physical axis
@@ -1464,13 +1467,14 @@ pub(crate) enum DimensionComparison {
 #[derive(Clone, Debug, PartialEq, Eq, Hash, Parameter)]
 pub struct Shape {
     /// [`Dimension`]s ordered from outermost to innermost.
-    dimensions: Vec<Dimension>,
+    dimensions: Arc<[Dimension]>,
 }
 
 impl Shape {
     /// Constructs a new [`Shape`] with the provided [`Dimension`]s.
     #[inline]
     pub fn new(dimensions: Vec<Dimension>) -> Self {
+        let dimensions = if dimensions.is_empty() { Arc::clone(&SCALAR_SHAPE_DIMENSIONS) } else { dimensions.into() };
         Self { dimensions }
     }
 
@@ -1483,7 +1487,7 @@ impl Shape {
     /// Returns the [`Dimension`]s of this [`Shape`] ordered from outermost to innermost.
     #[inline]
     pub fn dimensions(&self) -> &[Dimension] {
-        self.dimensions.as_slice()
+        self.dimensions.as_ref()
     }
 
     /// Returns the rank (i.e., the number of [`Dimension`]s) of this [`Shape`].
@@ -1527,7 +1531,7 @@ impl Shape {
             return Ok(Some(0));
         }
         let mut count = 1usize;
-        for dimension in &self.dimensions {
+        for dimension in self.dimensions.iter() {
             match dimension {
                 Dimension::Static(extent) => {
                     count = count.checked_mul(*extent).ok_or_else(|| {
@@ -1610,7 +1614,7 @@ impl Shape {
     /// ```
     pub fn is_refined_by(&self, other: &Shape) -> bool {
         self.rank() == other.rank()
-            && self.dimensions.iter().zip(&other.dimensions).enumerate().all(|(axis, (declared, actual))| {
+            && self.dimensions.iter().zip(other.dimensions.iter()).enumerate().all(|(axis, (declared, actual))| {
                 declared.is_refined_by(actual)
                     && declared.variable().is_none_or(|variable| {
                         self.dimensions[..axis].iter().zip(&other.dimensions[..axis]).all(
@@ -2336,6 +2340,51 @@ mod tests {
             DimensionRefinements::derive_identity_renaming(facts),
             Err(TypeError::invalid("type identity `declared` is renamed to both `first` and `second`")),
         );
+    }
+
+    #[test]
+    fn test_shape_new_shares_empty_dimensions() {
+        let scalar = Shape::scalar();
+        let empty = Shape::new(Vec::new());
+        let converted = Shape::from(Vec::<usize>::new());
+        assert!(Arc::ptr_eq(&scalar.dimensions, &empty.dimensions));
+        assert!(Arc::ptr_eq(&scalar.dimensions, &converted.dimensions));
+        assert_eq!(scalar.dimensions(), &[]);
+        assert_eq!(scalar, empty);
+        assert_eq!(HashSet::from([scalar.clone()]).get(&converted), Some(&scalar));
+        assert_eq!(format!("{scalar:?}"), "Shape { dimensions: [] }");
+        assert_eq!(scalar.to_string(), "[]");
+    }
+
+    #[test]
+    fn test_shape_clone_shares_immutable_dimensions() {
+        let rows = DimensionVariable::new("rows", DimensionBounds::positive(Some(8)).unwrap());
+        let dimensions = vec![rows.clone().into(), Dimension::Static(3)];
+        let shape = Shape::new(dimensions.clone());
+        let cloned = shape.clone();
+        assert!(Arc::ptr_eq(&shape.dimensions, &cloned.dimensions));
+        assert_eq!(shape.dimensions(), dimensions.as_slice());
+        assert_eq!(shape, cloned);
+        assert_eq!(cloned.dimension(0).variable(), Some(&rows));
+        assert_eq!(HashSet::from([shape.clone()]).get(&cloned), Some(&shape));
+
+        // Separately constructed equal metadata compares and hashes by value, while independent nominal identities
+        // remain distinct even when their names and bounds agree.
+        let separate = Shape::new(dimensions);
+        assert!(!Arc::ptr_eq(&shape.dimensions, &separate.dimensions));
+        assert_eq!(shape, separate);
+        assert_eq!(HashSet::from([shape.clone()]).get(&separate), Some(&shape));
+        let other_rows = DimensionVariable::new("rows", rows.bounds());
+        assert_ne!(shape, Shape::new(vec![other_rows.clone().into(), Dimension::Static(3)]));
+
+        let mut renaming = TypeIdentityRenaming::new();
+        renaming.insert(rows.clone(), other_rows.clone()).unwrap();
+        let renamed = cloned.rename_type_identities(&renaming);
+        assert!(!Arc::ptr_eq(&cloned.dimensions, &renamed.dimensions));
+        assert_eq!(renamed.dimension(0).variable(), Some(&other_rows));
+        assert_eq!(shape.dimension(0).variable(), Some(&rows));
+        assert_eq!(cloned.dimension(0).variable(), Some(&rows));
+        assert_eq!(Shape::scalar().dimensions(), &[]);
     }
 
     #[test]
