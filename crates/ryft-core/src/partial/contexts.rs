@@ -12,7 +12,9 @@ use crate::parameters::{Parameter, Placeholder};
 use crate::partial::evaluations::PartialEvaluation;
 use crate::partial::operations::{PartiallyEvaluatableOperation, RecursivePartialEvaluationDriver};
 use crate::partial::partitions::{EffectOrdering, PartitionedProgram};
-use crate::partial::residuals::{ResidualPlacement, ResidualPolicyReference};
+use crate::partial::residuals::{
+    ResidualPlacement, ResidualPolicyReference, ResidualRounding, RoundedResidualPlacement,
+};
 use crate::partial::values::{
     PartialEvaluationInput, PartialEvaluationOutput, PartialEvaluationValue, PartialValue, PartialValueMaterialization,
     ResidualInputSource,
@@ -212,8 +214,8 @@ pub struct PartialEvaluationContext<C: Context> {
 
     /// Residual placement with which the partitions that split rules construct through
     /// [`PartialEvaluationDriver::partition_program`](crate::PartialEvaluationDriver::partition_program) place their
-    /// residuals, if a residual policy was set. Refer to [`with_residual_policy`](Self::with_residual_policy) for how
-    /// to do that.
+    /// residuals, if a residual policy was set. Refer to [`with_residual_policy`](Self::with_residual_policy) and
+    /// [`with_rounded_residual_policy`](Self::with_rounded_residual_policy) for how to do that.
     residual_placement: Option<Rc<dyn ResidualPlacement<C::Constant, C::Operation>>>,
 
     /// First binding error retained for finalization, even if the failed operation has no outputs or its poisoned
@@ -281,17 +283,24 @@ impl<C: Context> PartialEvaluationContext<C> {
     /// places the residuals of each such partition according to `policy` (which can be set using
     /// [`PartitionedProgram::with_residual_policy`]) and carries `policy` into the partitions nested within it. This
     /// has implications for various region-carrying operation types. For example, it means that decisions apply per
-    /// iteration of a `scan` operation and per branch of a `condition` operation. When the residuals of an enclosing
-    /// partition are placed, the policy first classifies each demanded output. Replaying a region-carrying operation
-    /// also requires recomputation of every live value needed for that output, so that decisions of a split rule that
-    /// already placed the body's residuals are never undone. Unused sibling outputs and dormant derivative regions
-    /// do not contribute residual demand. An all-known operation whose selected region work is entirely recomputed
-    /// can therefore be replayed even when unrelated primal outputs would be saved or rejected. A `while` loop
-    /// is an exception that saves nothing, because its residual loop re-runs every iteration, and so its split
-    /// rule partitions its regions without the policy.
+    /// iteration of a `scan` operation and per branch of a `condition` operation, and that a `scan` operation
+    /// recomputes the changing known carries that its residual work reads from their initial values instead of saving
+    /// them on every iteration (refer to [`PartitionedProgram::with_residual_policy`]). When the residuals of an
+    /// enclosing partition are placed, the policy first classifies each demanded output. Replaying a region-carrying
+    /// operation also requires recomputation of every live value needed for that output, so that decisions of a split
+    /// rule that already placed the body's residuals are never undone. Unused sibling outputs and dormant derivative
+    /// regions do not contribute residual demand. An all-known operation whose selected region work is entirely
+    /// recomputed can therefore be replayed even when unrelated primal outputs would be saved or rejected. An all-known
+    /// operation whose replay would recompute values that the policy saves is instead split on residual demand when its
+    /// rule supports that (refer to [`PartiallyEvaluatableOperation::split_on_residual_demand`]), so that a `condition`
+    /// or a `scan` saves those values rather than its outputs. A `while` loop is an exception that saves nothing,
+    /// because its residual loop re-runs every iteration, and so its split rule partitions its regions without
+    /// the policy.
     ///
     /// This function changes only the returned context's configuration, without creating a new residual program
-    /// or changing previously emitted work. Existing clones retain their own residual policy.
+    /// or changing previously emitted work. Existing clones retain their own residual policy. The resulting partitions
+    /// keep the values that they save unrounded, unlike the partitions of the rematerialization rules. Refer to
+    /// [`rounds_residuals`](Self::rounds_residuals) for more information on the latter.
     #[inline]
     pub fn with_residual_policy(self, policy: &ResidualPolicyReference<C::Type>) -> Self
     where
@@ -299,6 +308,26 @@ impl<C: Context> PartialEvaluationContext<C> {
         C::Operation: OperationPayloadProjection,
     {
         self.with_residual_placement(Some(Rc::new(policy.clone())))
+    }
+
+    /// Returns this context configured like [`with_residual_policy`](Self::with_residual_policy), except that every
+    /// partition whose residuals it places also rounds the values that it computes and saves with `rounding`, right
+    /// after their producers inside its known program (refer to [`RoundedResidualPlacement`]). This includes the
+    /// partitions of the regions of nested region-carrying operations and the known parts of their splits on residual
+    /// demand, so that the known work inside those regions consumes the same rounded values that the residual work
+    /// receives. The rematerialization rules use this to round saved values whose types a backend may compute at a
+    /// higher precision.
+    #[inline]
+    pub(crate) fn with_rounded_residual_policy<R: 'static + ResidualRounding<C::Type>>(
+        self,
+        policy: &ResidualPolicyReference<C::Type>,
+        rounding: R,
+    ) -> Self
+    where
+        C::Type: 'static,
+        C::Operation: OperationPayloadProjection,
+    {
+        self.with_residual_placement(Some(Rc::new(RoundedResidualPlacement::new(policy.clone(), rounding))))
     }
 
     /// Returns this context without a residual policy, for split rules whose residual programs do not consume
@@ -374,11 +403,24 @@ impl<C: Context> PartialEvaluationContext<C> {
     /// or `None` when no policy is configured. The reference borrows the installed policy without cloning it.
     /// Higher-order rules, including backend call rules, inspect this configuration to expose pure known computations
     /// to the enclosing residual planner when keeping their boundary opaque would prevent the policy from selecting
-    /// interior values. Reading this configuration does not classify a value or establish that an operation can be
-    /// safely inlined. Rules must still preserve effects, references, captures, and type identities.
+    /// interior values (e.g., to key the splits on residual demand that they retain for a shared callee by policy).
+    /// Reading this configuration does not classify a value or establish that an operation can be safely split or
+    /// inlined. Rules must still preserve effects, references, captures, and type identities.
     #[inline]
     pub fn residual_policy(&self) -> Option<&ResidualPolicyReference<C::Type>> {
         self.residual_placement.as_ref().map(|placement| placement.policy())
+    }
+
+    /// Returns whether the partitions whose residuals the [residual policy](Self::residual_policy) of this context
+    /// places also round the values that they save right after their producers, as the partial evaluation and
+    /// differentiation rules of [`RematerializeOperation`](crate::RematerializeOperation) configure them to, so that
+    /// known work and residual work observe the same values even when a backend computes them at a higher precision
+    /// than their types. Rules that retain the partitions of their regions across calls (e.g., backend call rules that
+    /// share the splits of a callee) key them on this configuration together with the policy, because it changes the
+    /// known programs of those partitions.
+    #[inline]
+    pub fn rounds_residuals(&self) -> bool {
+        self.residual_placement.as_ref().is_some_and(|placement| placement.rounds_residuals())
     }
 
     /// Returns whether ordered effects must currently remain residual to preserve execution order, which is the case
@@ -391,7 +433,7 @@ impl<C: Context> PartialEvaluationContext<C> {
     /// Returns the residual placement of this [`PartialEvaluationContext`], if a residual policy was set (refer to
     /// [`with_residual_policy`](Self::with_residual_policy)).
     #[inline]
-    pub(super) fn residual_placement(&self) -> Option<Rc<dyn ResidualPlacement<C::Constant, C::Operation>>> {
+    pub(crate) fn residual_placement(&self) -> Option<Rc<dyn ResidualPlacement<C::Constant, C::Operation>>> {
         self.residual_placement.clone()
     }
 
@@ -745,28 +787,46 @@ impl<C: Context> PartialEvaluationContext<C> {
         if let Some(error) = self.error() {
             return Err(error);
         }
-        self.residualize_operation(operation.into(), regions, inputs)
+        self.residualize_attached_regions(operation.into(), AttachedRegions::from(regions), inputs)
     }
 
-    /// Internal helper that residualizes an already converted [`Operation`]. This is the body of
-    /// [`residualize`](Self::residualize), which only converts its input operation, so that this body
-    /// is compiled once per context rather than once per input operation type.
-    fn residualize_operation(
+    /// Residualizes `operation` like [`Self::residualize`], except that its regions are provided as
+    /// [`AttachedRegions`], so that shared callee regions (i.e., [`AttachedRegions::Callees`]) are interned into the
+    /// residual [`Program`] by [`Arc`](std::sync::Arc) identity instead of being copied into it as owned [`Program`]s.
+    /// Rules that emit the same shared callee from several applications (e.g., the replay half of a `jit_call` split
+    /// on residual demand) use this so that every residual application shares one region.
+    #[inline]
+    pub fn residualize_using_attached_regions<P: Into<C::Operation>>(
+        &self,
+        operation: P,
+        regions: AttachedRegions<'_, C::Constant, C::Operation>,
+        inputs: &[PartialEvaluationValue<C::Value>],
+    ) -> Result<Vec<PartialEvaluationValue<C::Value>>, ProgramError> {
+        if let Some(error) = self.error() {
+            return Err(error);
+        }
+        self.residualize_attached_regions(operation.into(), regions, inputs)
+    }
+
+    /// Internal helper that residualizes an already converted [`Operation`] with its [`AttachedRegions`].
+    /// This is the body of [`residualize`](Self::residualize) and
+    /// [`residualize_using_attached_regions`](Self::residualize_using_attached_regions), which only convert their input
+    /// operation and regions, so that this body is compiled once per context rather than once per input operation type.
+    fn residualize_attached_regions(
         &self,
         operation: C::Operation,
-        regions: Vec<Program<C::Constant, C::Operation, Vec<C::Constant>, Vec<C::Constant>>>,
+        regions: AttachedRegions<'_, C::Constant, C::Operation>,
         inputs: &[PartialEvaluationValue<C::Value>],
     ) -> Result<Vec<PartialEvaluationValue<C::Value>>, ProgramError> {
         // Combine the operation's effect classes with those of its executable computation regions. Dormant
         // derivative rules and other non-computation regions do not contribute effects when this operation runs.
         let effects = regions
-            .iter()
+            .regions()
             .enumerate()
             .filter(|(index, _)| operation.region_role(*index) == Some(RegionRole::Computation))
             .fold(operation.effects().summary(), |effects, (_, region)| effects.union(region.effects()))
             .classes();
-
-        self.residualize_with_effects(operation, AttachedRegions::from(regions), inputs, effects)
+        self.residualize_with_effects(operation, regions, inputs, effects)
     }
 
     /// Residualizes `operation` using its already computed [`EffectClasses`]. This is the emission behind
@@ -864,6 +924,42 @@ impl<C: Context> PartialEvaluationContext<C> {
                 PartialEvaluationValue::variable(r#type, atom)
             })
             .collect())
+    }
+
+    /// Partitions `region` with every input known, like
+    /// [`PartialEvaluationDriver::partition_program`](crate::PartialEvaluationDriver::partition_program), except that
+    /// its residual program also returns the outputs that `demanded_outputs` marks. The resulting partition reports
+    /// the outputs of `region` as known, followed by one residual output per demanded output, in output order, and the
+    /// residual policy of this context decides which values its known program saves for the residual program to
+    /// recompute the demanded outputs from. Operations use this to split an application on residual demand
+    /// (refer to [`PartiallyEvaluatableOperation::split_on_residual_demand`]). Like
+    /// [`partition_program`](crate::PartialEvaluationDriver::partition_program), it stages both programs in fresh
+    /// traces with the effect-folding configuration of this context, without executing effects or changing the
+    /// ordering state of this context.
+    ///
+    /// The bound on the operation family is stated on this function rather than on this implementation block, so that
+    /// rules can call it from [`PartiallyEvaluatableOperation::split_on_residual_demand`], which states the same bound,
+    /// without requiring the partial evaluation of their own family in their implementations, which would be cyclic.
+    ///
+    /// # Errors
+    ///
+    /// Returns [`ProgramError::InvalidArgument`] when this context has no residual policy, and the errors of
+    /// partitioning and placing residuals otherwise.
+    #[inline]
+    pub fn partition_residual_demand(
+        &self,
+        region: RegionRef<'_, C::Constant, C::Operation>,
+        demanded_outputs: &[bool],
+    ) -> Result<PartitionedProgram<C::Constant, C::Operation>, ProgramError>
+    where
+        C::Operation: PartiallyEvaluatableOperation<TracingContext<C::Constant, C::Operation>>,
+    {
+        let Some(residual_placement) = self.residual_placement() else {
+            return Err(ProgramError::InvalidArgument {
+                message: "partitioning a region on residual demand requires a residual policy".to_string(),
+            });
+        };
+        region.partition_with_residual_demand(demanded_outputs, self.allow_effect_folding(), residual_placement)
     }
 
     /// Replays the provided [`Program`] through this context using the provided `inputs` bound to its input
@@ -2072,6 +2168,7 @@ mod tests {
     use std::collections::HashSet;
     use std::fmt::Debug;
     use std::rc::Rc;
+    use std::sync::Arc;
 
     use indoc::indoc;
     use pretty_assertions::assert_eq;
@@ -2227,7 +2324,7 @@ mod tests {
         let planned = configured
             .residual_placement()
             .unwrap()
-            .place_residuals(program.partition(&[true, false]).unwrap())
+            .place_residuals(program.partition(&[true, false]).unwrap(), None)
             .unwrap();
         assert_eq!(
             planned.residual_program().to_string(),
@@ -3121,6 +3218,68 @@ mod tests {
         let left = TestValue::Dimension(DimensionValue::new(left_type, 3).unwrap());
         assert_eq!(evaluation.interpret(&EagerContext::new(), std::slice::from_ref(&left)), Ok(vec![left]),);
         assert_eq!(live.read(), Ok(Array::scalar(7f32).unwrap()));
+    }
+
+    #[test]
+    fn test_partial_evaluation_context_residualize_using_attached_regions() {
+        let scalar_type = ArrayType::scalar(DataType::F32);
+        let mut body = ProgramBuilder::<TestValue, TestOperation>::new();
+        let input = body.add_input(scalar_type.clone().into());
+        let output = body
+            .add_instruction(ArrayOperation::from(NegOperation::new()), Vec::new(), vec![input], None)
+            .unwrap()[0];
+        let body = Arc::new(
+            body.build::<Vec<TestValue>, Vec<TestValue>>(vec![output], vec![Placeholder], vec![Placeholder])
+                .unwrap(),
+        );
+
+        // Two applications of one shared callee with known inputs land in the residual program, where they share one
+        // interned region instead of copying the callee for each application.
+        let context = PartialEvaluationContext::new(EagerContext::<TestValue, TestOperation>::new());
+        let input = PartialEvaluationValue::known(TestValue::Array(Array::scalar(2f32).unwrap()));
+        let operation = RematerializeOperation::new(save_nothing());
+        let first = context
+            .residualize_using_attached_regions(
+                operation.clone(),
+                AttachedRegions::Callees(std::slice::from_ref(&body)),
+                &[input],
+            )
+            .unwrap();
+        assert!(first[0].is_unknown());
+        let second = context
+            .residualize_using_attached_regions(
+                operation,
+                AttachedRegions::Callees(std::slice::from_ref(&body)),
+                &first,
+            )
+            .unwrap();
+        let evaluation = context.into_evaluation(second).unwrap();
+        let instructions = evaluation.program.instructions();
+        assert_eq!(instructions[0].regions(), instructions[1].regions());
+        assert!(
+            evaluation
+                .program
+                .region_ref(instructions[0].regions()[0])
+                .unwrap()
+                .interned_callee()
+                .is_some_and(|callee| Arc::ptr_eq(callee, &body)),
+        );
+        assert_eq!(
+            evaluation.program.to_string(),
+            indoc! {"
+                lambda %0:f32[] .
+                let %1:f32[] = rematerialize [policy=\"save_nothing\"] %0 [
+                    body=^0={
+                        lambda %0:f32[] .
+                        let %1:f32[] = neg %0
+                        in (%1)
+                    },
+                ]
+                    %2:f32[] = rematerialize [policy=\"save_nothing\"] %1 [
+                        body=^0,
+                    ]
+                in (%2)"},
+        );
     }
 
     #[test]

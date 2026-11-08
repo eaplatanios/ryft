@@ -62,6 +62,37 @@ pub trait PartialEvaluationDriver<C: Context>: RegionDriver<C::Constant, C::Oper
         region: RegionRef<'_, C::Constant, C::Operation>,
         input_known: &[bool],
     ) -> Result<PartitionedProgram<C::Constant, C::Operation>, ProgramError>;
+
+    /// Splits the all-known region-carrying instruction at `instruction_index` of `region` on residual demand for the
+    /// outputs that `demanded_outputs` marks, through [`PartiallyEvaluatableOperation::split_on_residual_demand`] of
+    /// its operation and with the residual policy of `context`, and returns the split as a partition of that
+    /// instruction. The partition receives every input of the instruction as a known input. Its known program returns
+    /// the outputs of the instruction followed by its residual edges, and its residual program returns the demanded
+    /// outputs, in output order. Operations use this when they plan residual work over a known program of their own
+    /// (e.g., the carry recomputation of a `scan` under a residual policy), so that the instructions of that program
+    /// are split like those of a partition whose residuals are placed (refer to
+    /// [`PartitionedProgram::with_residual_policy`] for more information). This is a
+    /// driver function rather than a function of [`PartialEvaluationContext`] because such rules run in
+    /// [`partially_evaluate`](PartiallyEvaluatableOperation::partially_evaluate), whose bounds do not include the
+    /// partial evaluation of the operation family in a [`TracingContext`]. The driver carries that capability from
+    /// where it was constructed.
+    ///
+    /// Returns [`None`] when `context` has no residual policy, when this driver does not support such splits, or when
+    /// the rule keeps the instruction whole, in which case the planner saves its demanded outputs instead.
+    ///
+    /// # Errors
+    ///
+    /// Returns the errors of the partial-evaluation rule of the instruction and of partitioning its regions.
+    fn split_instruction_on_residual_demand(
+        &self,
+        context: &PartialEvaluationContext<C>,
+        region: RegionRef<'_, C::Constant, C::Operation>,
+        instruction_index: usize,
+        demanded_outputs: &[bool],
+    ) -> Result<Option<PartitionedProgram<C::Constant, C::Operation>>, ProgramError> {
+        let _ = (context, region, instruction_index, demanded_outputs);
+        Ok(None)
+    }
 }
 
 impl<C: Context> PartialEvaluationDriver<C> for EmptyRegionDriver {
@@ -360,6 +391,21 @@ where
                 .map(|(partition, _)| partition)
         }
     }
+
+    fn split_instruction_on_residual_demand(
+        &self,
+        context: &PartialEvaluationContext<C>,
+        region: RegionRef<'_, C::Constant, C::Operation>,
+        instruction_index: usize,
+        demanded_outputs: &[bool],
+    ) -> Result<Option<PartitionedProgram<C::Constant, C::Operation>>, ProgramError> {
+        match context.residual_placement() {
+            Some(residual_placement) => {
+                region.split_on_residual_demand(instruction_index, demanded_outputs, residual_placement)
+            }
+            None => Ok(None),
+        }
+    }
 }
 
 /// [`Operation`] that supports partial evaluation via [`Program::partially_evaluate`]. This trait lets an individual
@@ -436,6 +482,101 @@ pub trait PartiallyEvaluatableOperation<C: Context>: Clone + Into<C::Operation> 
         inputs: &[PartialEvaluationValue<C::Value>],
     ) -> Result<Vec<PartialEvaluationValue<C::Value>>, ProgramError> {
         context.fold_or_residualize(self.clone(), driver.region_programs(), inputs)
+    }
+
+    /// Splits this [`PartiallyEvaluatableOperation`]'s application, whose inputs are all known, on residual demand for
+    /// the outputs that `demanded_outputs` marks, or returns [`None`] to keep the application whole, which is what the
+    /// default implementation does. The residual planner asks for such a split when the residual program of a partition
+    /// demands an output of an all-known region-carrying application whose regions hold work that the residual policy
+    /// saves (refer to [`PartitionedProgram::with_residual_policy`] for more information). Replaying the application
+    /// whole would recompute that work, and saving its demanded outputs would save more than the policy asks for, so
+    /// a split saves only the interior values that the policy saves, as JAX's `partial_eval_jaxpr_custom` rules for
+    /// `cond`, `scan`, and `pjit` do.
+    ///
+    /// A rule that supports such a split binds a known part in the known-side context and emits a replay part into the
+    /// residual program (refer to [`ResidualDemandSplit`]). [`PartialEvaluationContext::partition_residual_demand`]
+    /// provides the partitions of the regions that such a split needs. A rule must keep an application whole when it
+    /// has effects, accesses references, carries deferred work, or would expose nominal type identities.
+    ///
+    /// # Parameters
+    ///
+    ///   - `context`: Durable [`PartialEvaluationContext`], whose residual policy decides which interior values the
+    ///     known part saves.
+    ///   - `driver`: [`PartialEvaluationDriver`] that provides [`Instruction`](crate::Instruction)-scoped access
+    ///     to the application [`Region`](crate::Region)s.
+    ///   - `inputs`: [`PartialEvaluationValue`] for each of this [`Operation`]'s inputs, in input order, all of which
+    ///     are known.
+    ///   - `demanded_outputs`: Outputs that the residual program demands, marked in output order.
+    #[inline]
+    fn split_on_residual_demand<D: PartialEvaluationDriver<C>>(
+        &self,
+        context: &PartialEvaluationContext<C>,
+        driver: &D,
+        inputs: &[PartialEvaluationValue<C::Value>],
+        demanded_outputs: &[bool],
+    ) -> Result<Option<ResidualDemandSplit<C::Value>>, ProgramError>
+    where
+        C::Operation: PartiallyEvaluatableOperation<TracingContext<C::Constant, C::Operation>>,
+    {
+        let _ = (context, driver, inputs, demanded_outputs);
+        Ok(None)
+    }
+}
+
+/// Split of an [`Operation`] application whose inputs are all known on residual demand, which
+/// [`PartiallyEvaluatableOperation::split_on_residual_demand`] returns. Its _known part_ is bound in the known-side
+/// context and computes every output of the application together with the interior values that the residual policy
+/// saves, and its _replay part_ is emitted into the residual program and recomputes the demanded outputs from those
+/// saved values and from the known inputs that it reads.
+#[derive(Clone)]
+pub struct ResidualDemandSplit<V: Value> {
+    /// Outputs of the known part, which are every output of the application, in output order.
+    known_outputs: Vec<PartialEvaluationValue<V>>,
+
+    /// Outputs of the replay part, which are one residual value per demanded output, in output order.
+    replayed_outputs: Vec<PartialEvaluationValue<V>>,
+}
+
+impl<V: Value> ResidualDemandSplit<V> {
+    /// Creates a new [`ResidualDemandSplit`] from the outputs of its known part and of its replay part.
+    ///
+    /// # Errors
+    ///
+    /// Returns a [`ProgramError::InvalidArgument`] when one of `known_outputs` is unknown or one of `replayed_outputs`
+    /// is known, because the known part computes known values and the replay part computes residual values.
+    pub fn new(
+        known_outputs: Vec<PartialEvaluationValue<V>>,
+        replayed_outputs: Vec<PartialEvaluationValue<V>>,
+    ) -> Result<Self, ProgramError> {
+        if let Some(index) = known_outputs.iter().position(PartialEvaluationValue::is_unknown) {
+            return Err(ProgramError::InvalidArgument {
+                message: format!("output {index} of the known part of a residual demand split is unknown"),
+            });
+        }
+        if let Some(index) = replayed_outputs.iter().position(PartialEvaluationValue::is_known) {
+            return Err(ProgramError::InvalidArgument {
+                message: format!("output {index} of the replay part of a residual demand split is known"),
+            });
+        }
+        Ok(Self { known_outputs, replayed_outputs })
+    }
+
+    /// Returns the outputs of the known part, which are every output of the application, in output order.
+    #[inline]
+    pub fn known_outputs(&self) -> &[PartialEvaluationValue<V>] {
+        &self.known_outputs
+    }
+
+    /// Returns the outputs of the replay part, which are one residual value per demanded output, in output order.
+    #[inline]
+    pub fn replayed_outputs(&self) -> &[PartialEvaluationValue<V>] {
+        &self.replayed_outputs
+    }
+
+    /// Returns the outputs of the known part and of the replay part, in that order.
+    #[inline]
+    pub fn into_parts(self) -> (Vec<PartialEvaluationValue<V>>, Vec<PartialEvaluationValue<V>>) {
+        (self.known_outputs, self.replayed_outputs)
     }
 }
 
