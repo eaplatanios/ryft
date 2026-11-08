@@ -1767,7 +1767,7 @@ mod tests {
             program.to_string(),
             indoc! {"
                 lambda %0:f64[] .
-                let %1:f64[] = zero_like %0
+                let %1:f64[] = zero [type=f64[]]
                     %2:f64[] = one_like %0
                 in (%1, %2)
             "}
@@ -2394,7 +2394,7 @@ mod tests {
             program.to_string(),
             indoc! {"
                 lambda %0:f64[] .
-                let %1:f64[] = zero_like %0
+                let %1:f64[] = zero [type=f64[]]
                     %2:f64[] = one_like %0
                 in (%1, %2)
             "}
