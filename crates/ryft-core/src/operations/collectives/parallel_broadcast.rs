@@ -37,6 +37,7 @@ use crate::operations::collectives::{
 use crate::operations::comparisons::{Compare, CompareOperation};
 use crate::operations::constants::constant::ConstantOperation;
 use crate::operations::constants::fill::Fill;
+use crate::operations::constants::zero::ZeroOperation;
 use crate::operations::constants::zero_like::{ZeroLike, ZeroLikeOperation};
 use crate::operations::control_flow::select::{Select, SelectOperation};
 use crate::operations::manipulation::broadcasting::{Broadcast, BroadcastOperation};
@@ -711,6 +712,7 @@ impl<
         + From<SelectOperation<ArrayType>>
         + From<BroadcastOperation>
         + From<TransferToMemoryOperation>
+        + From<ZeroOperation<ArrayType>>
         + From<ZeroLikeOperation<ArrayType>>,
 > TransposableOperation<V, O> for ParallelBroadcastOperation
 where

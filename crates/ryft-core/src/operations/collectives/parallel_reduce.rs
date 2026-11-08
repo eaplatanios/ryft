@@ -2238,7 +2238,8 @@ mod tests {
                         stop_gradient %0
                     %2:f32[][sharding={mesh<['m'=4:manual, 'outer'=2:manual]>, []}] = \
                         parallel_reduce [kind=max, axis_name=\"m\", mesh=['m'=4:manual, 'outer'=2:manual]] %1
-                    %3:f32[][sharding={mesh<['m'=4:manual, 'outer'=2:manual]>, []}] = zero_like %2
+                    %3:f32[][sharding={mesh<['m'=4:manual, 'outer'=2:manual]>, []}] = \
+                        zero [type=f32[][sharding={mesh<['m'=4:manual, 'outer'=2:manual]>, []}]]
                     %4:f32[][sharding={mesh<['m'=4:manual, 'outer'=2:manual]>, []}] = sub %2 %2
                     %5:bool[][sharding={mesh<['m'=4:manual, 'outer'=2:manual]>, []}] = compare \
                         [direction=Equal] %4 %3
@@ -2277,7 +2278,8 @@ mod tests {
                     %2:f32[][sharding={mesh<['m'=4:manual, 'outer'=2:manual]>, [], varying_manual={'m'}}] = real %1
                     %3:f32[][sharding={mesh<['m'=4:manual, 'outer'=2:manual]>, []}] = \
                         parallel_reduce [kind=max, axis_name=\"m\", mesh=['m'=4:manual, 'outer'=2:manual]] %2
-                    %4:f32[][sharding={mesh<['m'=4:manual, 'outer'=2:manual]>, []}] = zero_like %3
+                    %4:f32[][sharding={mesh<['m'=4:manual, 'outer'=2:manual]>, []}] = \
+                        zero [type=f32[][sharding={mesh<['m'=4:manual, 'outer'=2:manual]>, []}]]
                     %5:f32[][sharding={mesh<['m'=4:manual, 'outer'=2:manual]>, []}] = sub %3 %3
                     %6:bool[][sharding={mesh<['m'=4:manual, 'outer'=2:manual]>, []}] = compare [direction=Equal] %5 %4
                     %7:f32[][sharding={mesh<['m'=4:manual, 'outer'=2:manual]>, []}] = select %6 %3 %4
@@ -2492,7 +2494,7 @@ mod tests {
                 lambda %0:f32[] .
                 let %1:f32[] = stop_gradient %0
                     %2:f32[] = parallel_reduce [kind=max, axis_name=\"m\"] %1
-                    %3:f32[] = zero_like %2
+                    %3:f32[] = zero [type=f32[]]
                     %4:f32[] = sub %2 %2
                     %5:bool[] = compare [direction=Equal] %4 %3
                     %6:f32[] = select %5 %2 %3
@@ -2510,8 +2512,8 @@ mod tests {
     fn test_parallel_reduce_parallel_reduce_log_sum_exp_differentiation() {
         // The composed logarithmic sum over a manual mesh axis is differentiable even though its mesh maximum is not:
         // the maximum only reads the stopped input, so its tangent is a structural zero, and the shift is stopped as
-        // well, which leaves the softmax-weighted average of the input tangents as the output tangent (`%18`). The
-        // materialized zero branch of the selected shift tangent (`%8` and `%9`) is dead.
+        // well, which leaves the softmax-weighted average of the input tangents as the output tangent (`%16`). The
+        // selected shift tangent stays a structural zero, so no dead zero branch is staged for it.
         let (mesh, _, varying) = mesh_scalar_types();
         let (_, program) = TracingContext::<Array, ArrayOperation<Array>>::trace_with_named_axes(
             |inputs: Vec<_>| Ok(vec![inputs[0].parallel_reduce(ReductionKind::LogSumExp, "m")?]),
@@ -2529,27 +2531,25 @@ mod tests {
                         stop_gradient %0
                     %3:f32[][sharding={mesh<['m'=4:manual, 'outer'=2:manual]>, []}] = \
                         parallel_reduce [kind=max, axis_name=\"m\", mesh=['m'=4:manual, 'outer'=2:manual]] %2
-                    %4:f32[][sharding={mesh<['m'=4:manual, 'outer'=2:manual]>, []}] = zero_like %3
+                    %4:f32[][sharding={mesh<['m'=4:manual, 'outer'=2:manual]>, []}] = \
+                        zero [type=f32[][sharding={mesh<['m'=4:manual, 'outer'=2:manual]>, []}]]
                     %5:f32[][sharding={mesh<['m'=4:manual, 'outer'=2:manual]>, []}] = sub %3 %3
                     %6:bool[][sharding={mesh<['m'=4:manual, 'outer'=2:manual]>, []}] = compare [direction=Equal] %5 %4
                     %7:f32[][sharding={mesh<['m'=4:manual, 'outer'=2:manual]>, []}] = select %6 %3 %4
-                    %8:f32[][sharding={mesh<['m'=4:manual, 'outer'=2:manual]>, []}] = \
-                        zero [type=f32[][sharding={mesh<['m'=4:manual, 'outer'=2:manual]>, []}]]
-                    %9:f32[][sharding={mesh<['m'=4:manual, 'outer'=2:manual]>, []}] = select %6 %8 %4
-                    %10:f32[][sharding={mesh<['m'=4:manual, 'outer'=2:manual]>, []}] = stop_gradient %7
-                    %11:f32[][sharding={mesh<['m'=4:manual, 'outer'=2:manual]>, [], varying_manual={'m'}}] = \
-                        parallel_vary [axis_name=\"m\"] %10
-                    %12:f32[][sharding={mesh<['m'=4:manual, 'outer'=2:manual]>, [], varying_manual={'m'}}] = sub %0 %11
-                    %13:f32[][sharding={mesh<['m'=4:manual, 'outer'=2:manual]>, [], varying_manual={'m'}}] = exp %12
-                    %14:f32[][sharding={mesh<['m'=4:manual, 'outer'=2:manual]>, [], varying_manual={'m'}}] = mul %13 %1
-                    %15:f32[][sharding={mesh<['m'=4:manual, 'outer'=2:manual]>, []}] = \
-                        parallel_reduce [kind=sum, axis_name=\"m\", mesh=['m'=4:manual, 'outer'=2:manual]] %13
-                    %16:f32[][sharding={mesh<['m'=4:manual, 'outer'=2:manual]>, []}] = \
-                        parallel_reduce [kind=sum, axis_name=\"m\", mesh=['m'=4:manual, 'outer'=2:manual]] %14
-                    %17:f32[][sharding={mesh<['m'=4:manual, 'outer'=2:manual]>, []}] = log %15
-                    %18:f32[][sharding={mesh<['m'=4:manual, 'outer'=2:manual]>, []}] = div %16 %15
-                    %19:f32[][sharding={mesh<['m'=4:manual, 'outer'=2:manual]>, []}] = add %17 %10
-                in (%19, %18)"
+                    %8:f32[][sharding={mesh<['m'=4:manual, 'outer'=2:manual]>, []}] = stop_gradient %7
+                    %9:f32[][sharding={mesh<['m'=4:manual, 'outer'=2:manual]>, [], varying_manual={'m'}}] = \
+                        parallel_vary [axis_name=\"m\"] %8
+                    %10:f32[][sharding={mesh<['m'=4:manual, 'outer'=2:manual]>, [], varying_manual={'m'}}] = sub %0 %9
+                    %11:f32[][sharding={mesh<['m'=4:manual, 'outer'=2:manual]>, [], varying_manual={'m'}}] = exp %10
+                    %12:f32[][sharding={mesh<['m'=4:manual, 'outer'=2:manual]>, [], varying_manual={'m'}}] = mul %11 %1
+                    %13:f32[][sharding={mesh<['m'=4:manual, 'outer'=2:manual]>, []}] = \
+                        parallel_reduce [kind=sum, axis_name=\"m\", mesh=['m'=4:manual, 'outer'=2:manual]] %11
+                    %14:f32[][sharding={mesh<['m'=4:manual, 'outer'=2:manual]>, []}] = \
+                        parallel_reduce [kind=sum, axis_name=\"m\", mesh=['m'=4:manual, 'outer'=2:manual]] %12
+                    %15:f32[][sharding={mesh<['m'=4:manual, 'outer'=2:manual]>, []}] = log %13
+                    %16:f32[][sharding={mesh<['m'=4:manual, 'outer'=2:manual]>, []}] = div %14 %13
+                    %17:f32[][sharding={mesh<['m'=4:manual, 'outer'=2:manual]>, []}] = add %15 %8
+                in (%17, %16)"
             },
         );
     }

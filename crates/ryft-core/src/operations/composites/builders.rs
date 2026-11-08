@@ -1802,7 +1802,13 @@ pub type BatchedComposite<V, O, Input, Output> =
 ///   - _dead code elimination_ (i.e., [`Program::into_pruned`]) prunes the unused outputs of a call from its primal
 ///     while keeping every input, as JAX does for its custom derivative calls, and the call's rules are projected onto
 ///     its remaining outputs, except that a call whose forward mode rule is derived from its primal and that has a
-///     custom batching rule stays whole.
+///     custom batching rule stays whole, and
+///   - _rematerialization_ (refer to [`rematerialize`](crate::rematerialize)) treats a call that differentiation
+///     leaves intact (e.g., a call whose inputs are all known) as one producer of its outputs, as JAX's residual
+///     policies treat its custom derivative calls. A policy classifies those outputs by the call itself (i.e., by
+///     a producer named [`COMPOSITE_OPERATION_NAME`]), without seeing the work or the tags inside the call, and
+///     the backward pass replays the whole call when the policy does not save them. A call that its rules
+///     differentiate is replaced by those rules, whose operations the policy classifies like any other.
 ///
 /// # Differences from JAX
 ///

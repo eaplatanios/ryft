@@ -266,6 +266,7 @@ impl_differentiable_operation! {
     where
         V: Value<Type = ArrayType>,
         O: Operation<Type = ArrayType>
+            + From<ZeroOperation<ArrayType>>
             + From<ZeroLikeOperation<ArrayType>>
             + From<AddOperation<ArrayType>>
             + From<ConvertElementTypeOperation<ArrayType>>

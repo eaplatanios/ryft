@@ -5042,7 +5042,7 @@ mod tests {
             linearization.primal().to_string(),
             indoc! {"
                 lambda %0:f64[4], %1:f64[2] .
-                let %2:f64[4] = zero_like %0
+                let %2:f64[4] = zero [type=f64[4]]
                     %3:u64[4] = convert_element_type [data_type=u64] %2
                     %4:i32[2, 1] = const [[1], [1]]
                     %5:u64[2] = iota [type=u64[2], dimension=0]
@@ -5055,7 +5055,7 @@ mod tests {
                         indices_are_sorted=true,
                     ] %3 %4 %7
                     %9:bool[4] = compare [direction=Equal] %8 %3
-                    %10:f64[4] = zero_like %0
+                    %10:f64[4] = zero [type=f64[4]]
                     %11:f64[4] = select %9 %0 %10
                     %12:u64[2] = gather [
                         dimensions=(offset=[], collapsed_slice=[0], start_index_map=[0], batching=[]),
@@ -5063,7 +5063,7 @@ mod tests {
                         indices_are_sorted=true,
                     ] %8 %4
                     %13:bool[2] = compare [direction=Equal] %7 %12
-                    %14:f64[2] = zero_like %1
+                    %14:f64[2] = zero [type=f64[2]]
                     %15:f64[2] = select %13 %1 %14
                     %16:f64[4] = scatter [
                         kind=add,
@@ -5143,7 +5143,7 @@ mod tests {
                     operand_batching=[], scatter_indices_batching=[]),
                         unique_indices=true,
                     ] %0 %2 %1
-                    %4:f64[4] = zero_like %0
+                    %4:f64[4] = zero [type=f64[4]]
                     %5:f64[2] = one_like %1
                     %6:f64[4] = scatter [
                         kind=add,
@@ -5151,9 +5151,9 @@ mod tests {
                     operand_batching=[], scatter_indices_batching=[]),
                         unique_indices=true,
                     ] %4 %2 %5
-                    %7:f64[4] = zero_like %6
+                    %7:f64[4] = zero [type=f64[4]]
                     %8:bool[4] = compare [direction=Equal] %6 %7
-                    %9:f64[4] = zero_like %6
+                    %9:f64[4] = zero [type=f64[4]]
                     %10:f64[4] = select %8 %9 %0
                 in (%3, %1, %10)
             "}
@@ -5235,7 +5235,7 @@ mod tests {
                         indices_are_sorted=true,
                         unique_indices=true,
                     ] %0 %2 %1
-                    %4:f64[4] = zero_like %0
+                    %4:f64[4] = zero [type=f64[4]]
                     %5:f64[2] = one_like %1
                     %6:f64[4] = scatter [
                         kind=add,
@@ -5244,7 +5244,7 @@ mod tests {
                         indices_are_sorted=true,
                         unique_indices=true,
                     ] %4 %2 %5
-                    %7:f64[4] = zero_like %6
+                    %7:f64[4] = zero [type=f64[4]]
                     %8:bool[4] = compare [direction=Equal] %6 %7
                     %9:bool[4] = compare [direction=Equal] %0 %3
                     %10:bool[4] = one_like %9
@@ -5265,7 +5265,7 @@ mod tests {
                         indices_are_sorted=true,
                         unique_indices=true,
                     ] %14 %2 %15
-                    %17:f64[4] = zero_like %16
+                    %17:f64[4] = zero [type=f64[4]]
                     %18:bool[4] = compare [direction=Equal] %16 %17
                     %19:f64[4] = one_like %16
                     %20:f64[4] = select %18 %19 %16
@@ -5345,14 +5345,14 @@ mod tests {
                         dimensions=(update_window=[], inserted_window=[0], scatter_to_operand=[0], \
                             operand_batching=[], scatter_indices_batching=[]),
                     ] %0 %2 %1
-                    %4:f64[4] = zero_like %0
+                    %4:f64[4] = zero [type=f64[4]]
                     %5:f64[2] = one_like %1
                     %6:f64[4] = scatter [
                         kind=add,
                         dimensions=(update_window=[], inserted_window=[0], scatter_to_operand=[0], \
                             operand_batching=[], scatter_indices_batching=[]),
                     ] %4 %2 %5
-                    %7:f64[4] = zero_like %6
+                    %7:f64[4] = zero [type=f64[4]]
                     %8:bool[4] = compare [direction=Equal] %6 %7
                     %9:bool[4] = compare [direction=Equal] %0 %3
                     %10:bool[4] = one_like %9
@@ -5369,7 +5369,7 @@ mod tests {
                         dimensions=(update_window=[], inserted_window=[0], scatter_to_operand=[0], \
                             operand_batching=[], scatter_indices_batching=[]),
                     ] %14 %2 %15
-                    %17:f64[4] = zero_like %16
+                    %17:f64[4] = zero [type=f64[4]]
                     %18:bool[4] = compare [direction=Equal] %16 %17
                     %19:f64[4] = one_like %16
                     %20:f64[4] = select %18 %19 %16
@@ -6067,15 +6067,18 @@ mod tests {
                     %2:f64[2][sharding={mesh<['m'=2:manual]>, [{}], varying_manual={'m'}}], \
                     %3:f64[4][sharding={mesh<['m'=2:manual]>, [{}], varying_manual={'m'}}], \
                     %4:f64[2][sharding={mesh<['m'=2:manual]>, [{}], varying_manual={'m'}}] .
-                let %5:f64[4][sharding={mesh<['m'=2:manual]>, [{}], varying_manual={'m'}}] = zero_like %3
-                    %6:f64[2][sharding={mesh<['m'=2:manual]>, [{}], varying_manual={'m'}}] = zero_like %4
+                let %5:f64[4][sharding={mesh<['m'=2:manual]>, [{}], varying_manual={'m'}}] = \
+                        zero [type=f64[4][sharding={mesh<['m'=2:manual]>, [{}], varying_manual={'m'}}]]
+                    %6:f64[2][sharding={mesh<['m'=2:manual]>, [{}], varying_manual={'m'}}] = \
+                        zero [type=f64[2][sharding={mesh<['m'=2:manual]>, [{}], varying_manual={'m'}}]]
                     %7:u64[2][sharding={mesh<['m'=2:manual]>, [{}], varying_manual={'m'}}] = iota [
                         type=u64[2][sharding={mesh<['m'=2:manual]>, [{}], varying_manual={'m'}}],
                         dimension=0,
                     ]
                     %8:u64[2][sharding={mesh<['m'=2:manual]>, [{}], varying_manual={'m'}}] = one_like %7
                     %9:u64[2][sharding={mesh<['m'=2:manual]>, [{}], varying_manual={'m'}}] = add %7 %8
-                    %10:f64[4][sharding={mesh<['m'=2:manual]>, [{}], varying_manual={'m'}}] = zero_like %0
+                    %10:f64[4][sharding={mesh<['m'=2:manual]>, [{}], varying_manual={'m'}}] = \
+                        zero [type=f64[4][sharding={mesh<['m'=2:manual]>, [{}], varying_manual={'m'}}]]
                     %11:u64[4][sharding={mesh<['m'=2:manual]>, [{}], varying_manual={'m'}}] = convert_element_type \
                         [data_type=u64] %10
                     %12:u64[4][sharding={mesh<['m'=2:manual]>, [{}], varying_manual={'m'}}] = scatter [
@@ -6093,9 +6096,11 @@ mod tests {
                         [direction=Equal] %12 %11
                     %15:bool[2][sharding={mesh<['m'=2:manual]>, [{}], varying_manual={'m'}}] = compare \
                         [direction=Equal] %9 %13
-                    %16:f64[4][sharding={mesh<['m'=2:manual]>, [{}], varying_manual={'m'}}] = zero_like %0
+                    %16:f64[4][sharding={mesh<['m'=2:manual]>, [{}], varying_manual={'m'}}] = \
+                        zero [type=f64[4][sharding={mesh<['m'=2:manual]>, [{}], varying_manual={'m'}}]]
                     %17:f64[4][sharding={mesh<['m'=2:manual]>, [{}], varying_manual={'m'}}] = select %14 %0 %16
-                    %18:f64[2][sharding={mesh<['m'=2:manual]>, [{}], varying_manual={'m'}}] = zero_like %2
+                    %18:f64[2][sharding={mesh<['m'=2:manual]>, [{}], varying_manual={'m'}}] = \
+                        zero [type=f64[2][sharding={mesh<['m'=2:manual]>, [{}], varying_manual={'m'}}]]
                     %19:f64[2][sharding={mesh<['m'=2:manual]>, [{}], varying_manual={'m'}}] = select %15 %2 %18
                     %20:f64[4][sharding={mesh<['m'=2:manual]>, [{}], varying_manual={'m'}}] = select %14 %3 %5
                     %21:f64[2][sharding={mesh<['m'=2:manual]>, [{}], varying_manual={'m'}}] = select %15 %4 %6

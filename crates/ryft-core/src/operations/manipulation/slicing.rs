@@ -6763,7 +6763,8 @@ mod tests {
                         output_type=i32[2][sharding={mesh<['m'=2:manual]>, [{}], varying_manual={'m'}}],
                         output_axes=[],
                     ] %4
-                    %6:i32[2][sharding={mesh<['m'=2:manual]>, [{}], varying_manual={'m'}}] = zero_like %1
+                    %6:i32[2][sharding={mesh<['m'=2:manual]>, [{}], varying_manual={'m'}}] = \
+                        zero [type=i32[2][sharding={mesh<['m'=2:manual]>, [{}], varying_manual={'m'}}]]
                     %7:bool[2][sharding={mesh<['m'=2:manual]>, [{}], varying_manual={'m'}}] = compare \
                         [direction=LessThan] %1 %6
                     %8:i32[2][sharding={mesh<['m'=2:manual]>, [{}], varying_manual={'m'}}] = add %1 %5
@@ -6808,7 +6809,8 @@ mod tests {
                         output_type=i32[2][sharding={mesh<['m'=2:manual]>, [{}], varying_manual={'m'}}],
                         output_axes=[],
                     ] %4
-                    %6:i32[2][sharding={mesh<['m'=2:manual]>, [{}], varying_manual={'m'}}] = zero_like %1
+                    %6:i32[2][sharding={mesh<['m'=2:manual]>, [{}], varying_manual={'m'}}] = \
+                        zero [type=i32[2][sharding={mesh<['m'=2:manual]>, [{}], varying_manual={'m'}}]]
                     %7:bool[2][sharding={mesh<['m'=2:manual]>, [{}], varying_manual={'m'}}] = compare \
                         [direction=LessThan] %1 %6
                     %8:i32[2][sharding={mesh<['m'=2:manual]>, [{}], varying_manual={'m'}}] = add %1 %5
@@ -6895,7 +6897,7 @@ mod tests {
                     %3:i32[] = convert_element_type [data_type=i32] %2
                     %4:i32[] = transfer_to_memory [destination=Device] %3
                     %5:i32[2] = broadcast [output_type=i32[2], output_axes=[]] %4
-                    %6:i32[2] = zero_like %1
+                    %6:i32[2] = zero [type=i32[2]]
                     %7:bool[2] = compare [direction=LessThan] %1 %6
                     %8:i32[2] = add %1 %5
                     %9:i32[2] = select %7 %8 %1
@@ -6917,7 +6919,7 @@ mod tests {
                     %3:i32[] = convert_element_type [data_type=i32] %2
                     %4:i32[] = transfer_to_memory [destination=Device] %3
                     %5:i32[256] = broadcast [output_type=i32[256], output_axes=[]] %4
-                    %6:i32[256] = zero_like %1
+                    %6:i32[256] = zero [type=i32[256]]
                     %7:bool[256] = compare [direction=LessThan] %1 %6
                     %8:i32[256] = add %1 %5
                     %9:i32[256] = select %7 %8 %1
@@ -6942,7 +6944,7 @@ mod tests {
                     %3:i32[] = convert_element_type [data_type=i32] %2
                     %4:i32[] = transfer_to_memory [destination=Device] %3
                     %5:i32[2] = broadcast [output_type=i32[2], output_axes=[]] %4
-                    %6:i32[2] = zero_like %1
+                    %6:i32[2] = zero [type=i32[2]]
                     %7:bool[2] = compare [direction=LessThan] %1 %6
                     %8:i32[2] = add %1 %5
                     %9:i32[2] = select %7 %8 %1
@@ -6964,7 +6966,7 @@ mod tests {
                     %3:i32[] = convert_element_type [data_type=i32] %2
                     %4:i32[] = transfer_to_memory [destination=Device] %3
                     %5:i32[256] = broadcast [output_type=i32[256], output_axes=[]] %4
-                    %6:i32[256] = zero_like %1
+                    %6:i32[256] = zero [type=i32[256]]
                     %7:bool[256] = compare [direction=LessThan] %1 %6
                     %8:i32[256] = add %1 %5
                     %9:i32[256] = select %7 %8 %1
@@ -7748,7 +7750,7 @@ mod tests {
             program.to_string(),
             indoc! {"
                 lambda %0:f32[2, 3], %1:i32[] .
-                let %2:i32[] = zero_like %1
+                let %2:i32[] = zero [type=i32[]]
                     %3:f32[2, 2] = dynamic_slice [sizes=[2, 2]] %0 %2 %1
                 in (%3)
             "}

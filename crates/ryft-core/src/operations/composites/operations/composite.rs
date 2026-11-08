@@ -748,7 +748,9 @@ impl<V: Typed<Type: DifferentiableType + Eq + Hash> + Parameter, O, S: CustomRul
 
     #[inline]
     fn region_data_flow(&self) -> RegionDataFlow<'_> {
-        RegionDataFlow::Provenance
+        // The primal region executes once per call, as its provenance declares, but residual policies classify a call
+        // as one producer and replay it whole, as JAX's policies treat `custom_jvp_call` and `custom_vjp_call`.
+        RegionDataFlow::Atomic
     }
 
     fn prune_boundary(
@@ -1022,7 +1024,7 @@ where
             _ => None,
         };
         match callee {
-            Some(callee) => context.fold_or_residualize_using_attached_regions(
+            Some(callee) => context.fold_or_residualize(
                 self.clone(),
                 AttachedRegions::Callees(std::slice::from_ref(&callee)),
                 inputs,
@@ -3731,9 +3733,9 @@ mod tests {
     fn test_composite_region_data_flow() {
         // The primal computation region receives every input at its own position and its outputs are the call's
         // outputs one for one, while the dormant rule regions, which reference analysis does not enter, declare no
-        // input provenance.
+        // input provenance. Residual policies nevertheless see the call itself as the producer of its outputs.
         let operation = ArrayComposite::from_rule_regions(CompositeJvpRule::Explicit, true);
-        assert!(matches!(operation.region_data_flow(), RegionDataFlow::Provenance));
+        assert!(matches!(operation.region_data_flow(), RegionDataFlow::Atomic));
         assert_eq!(operation.input_region_provenance(0, 0), InputRegionProvenance::Input { index: 0 });
         assert_eq!(operation.input_region_provenance(0, 1), InputRegionProvenance::Input { index: 1 });
         assert_eq!(operation.input_region_provenance(1, 1), InputRegionProvenance::None);

@@ -24,8 +24,9 @@
 //!     device coordinate along the active manual axes of a [`ShardMapBoundary`]. Both take [`ShardMapOptions`], which
 //!     select these axes. The body receives the local shards that the input shardings assign to the executing device,
 //!     and the global outputs are assembled from its local outputs through the output shardings. The body function of
-//!     [`ShardMap`] also receives the [`ShardMapContext`] of the body, through which bodies without inputs can create
-//!     values (e.g., device coordinates along manual axes). The global [`shard_map_with_inferred_input_shardings()`]
+//!     [`ShardMap`] also receives the body's array view of its tracing context (refer to
+//!     [`ProjectedContext`](crate::ProjectedContext)), through which bodies without inputs can create values
+//!     (e.g., device coordinates along manual axes). The global [`shard_map_with_inferred_input_shardings()`]
 //!     function takes the input shardings from the input types, and the global [`shard_map_along()`] function maps
 //!     over a single manual axis, placing selected dimensions of its inputs and outputs along it. Like every other
 //!     operation, a `shard_map` is traced without values by invoking it on tracers (e.g., through
@@ -113,9 +114,8 @@ pub use constrain_sharding::{
 };
 pub use reshard::{RESHARD_OPERATION_NAME, Reshard, ReshardDispatch, ReshardOperation};
 pub use shard_map::{
-    SHARD_MAP_OPERATION_NAME, ShardMap, ShardMapBoundary, ShardMapContext, ShardMapError, ShardMapOperation,
-    ShardMapOptions, ShardMapTracer, ShardMapValue, ShardMapValueKind, shard_map, shard_map_along,
-    shard_map_with_inferred_input_shardings,
+    SHARD_MAP_OPERATION_NAME, ShardMap, ShardMapBoundary, ShardMapError, ShardMapOperation, ShardMapOptions,
+    ShardMapValueKind, shard_map, shard_map_along, shard_map_with_inferred_input_shardings,
 };
 
 /// Group of the sharding-control capabilities [`Reshard`] and [`ConstrainSharding`]. It is implemented automatically

@@ -1132,7 +1132,9 @@ mod tests {
                 lambda %0:f32[2][sharding={mesh<['x'=2:manual, 'y'=1:manual]>, [{}], unreduced={'x'}}] .
                 let %1:f32[1][sharding={mesh<['x'=2:manual, 'y'=1:manual]>, [{}], unreduced={'x'}}] = \
                         slice [start_indices=[0], limits=[1]] %0
-                    %2:f32[1][sharding={mesh<['x'=2:manual, 'y'=1:manual]>, [{}], unreduced={'x'}}] = zero_like %1
+                    %2:f32[1][sharding={mesh<['x'=2:manual, 'y'=1:manual]>, [{}], unreduced={'x'}}] = zero [
+                        type=f32[1][sharding={mesh<['x'=2:manual, 'y'=1:manual]>, [{}], unreduced={'x'}}],
+                    ]
                     %3:f32[1][sharding={mesh<['x'=2:manual, 'y'=1:manual]>, [{}], unreduced={'x'}}] = \
                         slice [start_indices=[0], limits=[1]] %0
                     %4:f32[2][sharding={mesh<['x'=2:manual, 'y'=1:manual]>, [{}], unreduced={'x'}}] = \
@@ -1154,7 +1156,9 @@ mod tests {
                 lambda %0:f32[2][sharding={mesh<['x'=2:manual, 'y'=1:manual]>, [{}], varying_manual={'y'}}] .
                 let %1:f32[1][sharding={mesh<['x'=2:manual, 'y'=1:manual]>, [{}], varying_manual={'y'}}] = \
                         slice [start_indices=[0], limits=[1]] %0
-                    %2:f32[1][sharding={mesh<['x'=2:manual, 'y'=1:manual]>, [{}], varying_manual={'y'}}] = zero_like %1
+                    %2:f32[1][sharding={mesh<['x'=2:manual, 'y'=1:manual]>, [{}], varying_manual={'y'}}] = zero [
+                        type=f32[1][sharding={mesh<['x'=2:manual, 'y'=1:manual]>, [{}], varying_manual={'y'}}],
+                    ]
                     %3:f32[1][sharding={mesh<['x'=2:manual, 'y'=1:manual]>, [{}], varying_manual={'y'}}] = \
                         slice [start_indices=[0], limits=[1]] %0
                     %4:f32[2][sharding={mesh<['x'=2:manual, 'y'=1:manual]>, [{}], varying_manual={'y'}}] = \

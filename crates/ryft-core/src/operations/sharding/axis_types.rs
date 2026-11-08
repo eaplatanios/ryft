@@ -550,10 +550,10 @@ mod tests {
     use crate::operations::collectives::parallel_reduce::ParallelReduce;
     use crate::operations::manipulation::conversions::ConvertElementType;
     use crate::operations::reductions::{Reduce, ReductionKind};
-    use crate::operations::sharding::shard_map::{ShardMapOptions, ShardMapTracer, shard_map};
+    use crate::operations::sharding::shard_map::{ShardMapOptions, shard_map};
     use crate::operations::trigonometric::{Cos, Sin};
     use crate::programs::{ProjectedValue, TypeError, Typed, ValueProjection};
-    use crate::tracing::{Tracer, TracingContext};
+    use crate::tracing::{DomainTracer, Tracer, TracingContext};
 
     use super::*;
 
@@ -950,9 +950,11 @@ mod tests {
                 |input: Tracer<ArrayIrTracingContext>| {
                     let input = ValueProjection::<ArrayType>::into_projected(input).map_err(ProgramError::from)?;
                     let output = shard_map(
-                        |input: ShardMapTracer<ArrayIrTracingContext>| {
+                        |input: ProjectedValue<ArrayType, DomainTracer<ArrayIrTracingContext>>| {
                             Ok(auto_axes(
-                                |input: ShardMapTracer<ArrayIrTracingContext>| input.add(&input),
+                                |input: ProjectedValue<ArrayType, DomainTracer<ArrayIrTracingContext>>| {
+                                    input.add(&input)
+                                },
                                 input,
                                 axes,
                                 output_sharding.clone(),
@@ -1042,9 +1044,9 @@ mod tests {
             |input: Tracer<ArrayIrTracingContext>| {
                 let input = ValueProjection::<ArrayType>::into_projected(input).map_err(ProgramError::from)?;
                 let output = shard_map(
-                    |input: ShardMapTracer<ArrayIrTracingContext>| {
+                    |input: ProjectedValue<ArrayType, DomainTracer<ArrayIrTracingContext>>| {
                         Ok(auto_axes(
-                            |input: ShardMapTracer<ArrayIrTracingContext>| {
+                            |input: ProjectedValue<ArrayType, DomainTracer<ArrayIrTracingContext>>| {
                                 let reduced = input.parallel_reduce(ReductionKind::Sum, "x")?;
                                 *reduced_type.borrow_mut() = Some(reduced.r#type().into_owned());
                                 Ok(reduced)
@@ -1123,10 +1125,10 @@ mod tests {
             |input: Tracer<ArrayIrTracingContext>| {
                 let input = ValueProjection::<ArrayType>::into_projected(input).map_err(ProgramError::from)?;
                 let output = shard_map(
-                    |input: ShardMapTracer<ArrayIrTracingContext>| {
+                    |input: ProjectedValue<ArrayType, DomainTracer<ArrayIrTracingContext>>| {
                         let context = input.domain();
                         let output = auto_axes(
-                            |input: ShardMapTracer<ArrayIrTracingContext>| {
+                            |input: ProjectedValue<ArrayType, DomainTracer<ArrayIrTracingContext>>| {
                                 default_meshes.borrow_mut().push(input.domain().default_mesh());
                                 let index = input.domain().axis_index("x")?.convert_element_type(DataType::F32)?;
                                 *index_type.borrow_mut() = Some(index.r#type().into_owned());
@@ -1138,10 +1140,10 @@ mod tests {
                         )?;
                         default_meshes.borrow_mut().push(context.default_mesh());
                         let failure = auto_axes(
-                            |_: ShardMapTracer<ArrayIrTracingContext>| {
-                                Err::<ShardMapTracer<ArrayIrTracingContext>, _>(ProgramError::InvalidArgument {
-                                    message: "failure".to_string(),
-                                })
+                            |_: ProjectedValue<ArrayType, DomainTracer<ArrayIrTracingContext>>| {
+                                Err::<ProjectedValue<ArrayType, DomainTracer<ArrayIrTracingContext>>, _>(
+                                    ProgramError::InvalidArgument { message: "failure".to_string() },
+                                )
                             },
                             input,
                             Some(&["y"]),
@@ -1224,9 +1226,9 @@ mod tests {
             |input: Tracer<ArrayIrTracingContext>| {
                 let input = ValueProjection::<ArrayType>::into_projected(input).map_err(ProgramError::from)?;
                 let output = shard_map(
-                    |input: ShardMapTracer<ArrayIrTracingContext>| {
+                    |input: ProjectedValue<ArrayType, DomainTracer<ArrayIrTracingContext>>| {
                         Ok(auto_axes(
-                            |input: ShardMapTracer<ArrayIrTracingContext>| {
+                            |input: ProjectedValue<ArrayType, DomainTracer<ArrayIrTracingContext>>| {
                                 input.parallel_all_gather("x", 0)?.reduce_sum(&[0], None)
                             },
                             input,
@@ -1357,7 +1359,7 @@ mod tests {
             |input: Tracer<ArrayIrTracingContext>| {
                 let input = ValueProjection::<ArrayType>::into_projected(input).map_err(ProgramError::from)?;
                 let output = shard_map(
-                    |input: ShardMapTracer<ArrayIrTracingContext>| Ok(input.clone() + input),
+                    |input: ProjectedValue<ArrayType, DomainTracer<ArrayIrTracingContext>>| Ok(input.clone() + input),
                     input,
                     map_mesh.clone(),
                     map_sharding.clone(),
@@ -1365,7 +1367,7 @@ mod tests {
                     ShardMapOptions::new(),
                 )?;
                 let output = auto_axes(
-                    |output: ShardMapTracer<ArrayIrTracingContext>| output.sin(),
+                    |output: ProjectedValue<ArrayType, DomainTracer<ArrayIrTracingContext>>| output.sin(),
                     output,
                     Some(&["y"]),
                     input_sharding.clone(),
@@ -1428,11 +1430,11 @@ mod tests {
             |input: Tracer<ArrayIrTracingContext>| {
                 let input = ValueProjection::<ArrayType>::into_projected(input).map_err(ProgramError::from)?;
                 let output = shard_map(
-                    |input: ShardMapTracer<ArrayIrTracingContext>| {
+                    |input: ProjectedValue<ArrayType, DomainTracer<ArrayIrTracingContext>>| {
                         auto_axes(
-                            |input: ShardMapTracer<ArrayIrTracingContext>| {
+                            |input: ProjectedValue<ArrayType, DomainTracer<ArrayIrTracingContext>>| {
                                 *switched_type.borrow_mut() = Some(input.r#type().into_owned());
-                                Ok(Vec::<ShardMapTracer<ArrayIrTracingContext>>::new())
+                                Ok(Vec::<ProjectedValue<ArrayType, DomainTracer<ArrayIrTracingContext>>>::new())
                             },
                             input.clone(),
                             Some(&["y"]),
@@ -1469,9 +1471,9 @@ mod tests {
             |input: Tracer<ArrayIrTracingContext>| {
                 let input = ValueProjection::<ArrayType>::into_projected(input).map_err(ProgramError::from)?;
                 let output = shard_map(
-                    |input: ShardMapTracer<ArrayIrTracingContext>| {
+                    |input: ProjectedValue<ArrayType, DomainTracer<ArrayIrTracingContext>>| {
                         let output = explicit_axes(
-                            |input: ShardMapTracer<ArrayIrTracingContext>| {
+                            |input: ProjectedValue<ArrayType, DomainTracer<ArrayIrTracingContext>>| {
                                 let switched_mesh = mesh.with_axis_types(["y"], MeshAxisType::Explicit).unwrap();
                                 let expected = sharding(&switched_mesh, &[None, Some("y")])
                                     .with_varying_manual_axes(["x"])
