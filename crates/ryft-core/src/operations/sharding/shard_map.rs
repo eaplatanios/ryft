@@ -645,11 +645,9 @@ pub struct ShardMapBoundary {
     manual_variation_checks: ManualVariationChecks,
 }
 
-// TODO(eaplatanios): Review from here onwards.
-
 impl ShardMapBoundary {
     /// Creates a new [`ShardMapBoundary`] after validating and normalizing its input and output shardings (i.e., the
-    /// analogues of the `in_specs` and `out_specs` of JAX's `shard_map`).
+    /// Ryft analogues of the `in_specs` and `out_specs` of JAX's `shard_map`).
     ///
     /// The active manual axes are the mesh axes named by `manual_axes`, each of which must have type
     /// [`Manual`](MeshAxisType::Manual), or every manual mesh axis when `manual_axes` is empty. They are stored in mesh
@@ -684,7 +682,13 @@ impl ShardMapBoundary {
         output_shardings: Vec<Sharding>,
         manual_axes: Vec<String>,
     ) -> Result<Self, ShardMapError> {
-        Self::new_within(mesh, input_shardings, output_shardings, manual_axes.into(), &HashSet::new())
+        Self::new_with_enclosing_manual_axes(
+            mesh,
+            input_shardings,
+            output_shardings,
+            manual_axes.into(),
+            &HashSet::new(),
+        )
     }
 
     /// Creates a new [`ShardMapBoundary`] like [`Self::new`] for a manual region nested in enclosing manual regions
@@ -692,13 +696,13 @@ impl ShardMapBoundary {
     /// [`Manual`](MeshAxisType::Manual) is rejected with [`ShardMapError::EnclosingManualAxisNotManual`]. An empty
     /// `manual_axes` selects only the manual mesh axes that are not already manual (and fails with
     /// [`ShardMapError::AllManualAxesAlreadyManual`] when the mesh has manual axes but none remains), an explicitly
-    /// requested axis that is already manual is rejected with [`ShardMapError::AxisAlreadyManual`], and a sharding that
-    /// names an already manual axis is rejected with [`ShardMapError::ShardingNamesEnclosingManualAxis`]. Making
+    /// requested axis that is already manual is rejected with [`ShardMapError::AxisAlreadyManual`], and a sharding
+    /// that names an already manual axis is rejected with [`ShardMapError::ShardingNamesEnclosingManualAxis`]. Making
     /// an axis manual twice would drop the variation that the values of the enclosing region carry along it, so a
     /// per-device value could leave the nested region typed as replicated, and backends could not represent the nested
     /// manual computation either. A [`ManualAxisSelection::Listed`] selection is used exactly, so an empty one leaves
     /// the boundary without active manual axes.
-    fn new_within(
+    fn new_with_enclosing_manual_axes(
         mesh: LogicalMesh,
         input_shardings: Vec<Sharding>,
         output_shardings: Vec<Sharding>,
@@ -762,9 +766,9 @@ impl ShardMapBoundary {
         self
     }
 
-    /// Returns this boundary with its global outputs typed over `caller_mesh` (refer to [`Self::caller_mesh`]), which
-    /// [`shard_map_caller_mesh`] selects and validates, and which transform rules carry over from the boundary that
-    /// they derive a boundary from when the derived outputs include outputs of the original map. Their internal
+    /// Returns this boundary with its global outputs typed over `caller_mesh` (i.e., setting [`Self::caller_mesh`]),
+    /// which [`shard_map_caller_mesh`] selects and validates, and which transform rules carry over from the boundary
+    /// that they derive a boundary from when the derived outputs include outputs of the original map. Their internal
     /// residual edges stay typed over [`Self::mesh`], and transposition, whose outputs are input cotangents that it
     /// reconciles with the types of the caller's inputs, does not carry it over. A `caller_mesh` equal to
     /// [`Self::mesh`] is normalized to [`None`], so that equal boundaries compare equal.
@@ -772,6 +776,8 @@ impl ShardMapBoundary {
         self.caller_mesh = caller_mesh.filter(|caller_mesh| caller_mesh != &self.mesh);
         self
     }
+
+    // TODO(eaplatanios): Review from here onwards.
 
     /// Selects whether array outputs must be statically proven invariant along active manual axes that their output
     /// shardings do not tile. The default is `true`. With `false`, the caller promises that those devices produce
@@ -2932,7 +2938,7 @@ where
                         && !self.boundary.manual_axes().iter().any(|manual_axis| manual_axis == axis_name)
                 })
                 .collect::<HashSet<_>>();
-            boundary = ShardMapBoundary::new_within(
+            boundary = ShardMapBoundary::new_with_enclosing_manual_axes(
                 mesh.clone(),
                 input_shardings,
                 output_shardings,
@@ -7435,14 +7441,14 @@ fn shard_map_caller_mesh(
 /// `named_axes` (innermost first, as returned by [`NamedAxes::named_axes`]), and returns it together with the enclosing
 /// bindings that its body inherits. These are, first, the [`NamedAxis::Mesh`] bindings of `named_axes` whose names are
 /// axes of `mesh`, in mesh order, which name the axes that enclosing manual regions already made manual (JAX's
-/// `mesh.manual_axes`), so the boundary is validated against them through [`ShardMapBoundary::new_within`], and the map
-/// can make none of them manual again, followed by the [`NamedAxis::Batched`] bindings of `named_axes` whose names are
-/// not axes of `mesh`, in scope order, which name the axes of enclosing `batch` levels, so that collectives inside the
-/// body can refer to them and the batching rule of the level that binds such a name consumes them. Every other binding
-/// (i.e., a mesh binding whose name is not an axis of `mesh`, or a batched binding named like an axis of `mesh`) is not
-/// visible to the body. When several bindings share a name, the first one is used, which is the one that
-/// [`NamedAxes::named_axis`] resolves. A mesh binding whose name is an axis of `mesh` but whose mesh is another device
-/// mesh is rejected with [`ShardMapError::EnclosingManualAxisMeshMismatch`].
+/// `mesh.manual_axes`), so the boundary is validated against them through
+/// [`ShardMapBoundary::new_with_enclosing_manual_axes`], and the map can make none of them manual again, followed by the
+/// [`NamedAxis::Batched`] bindings of `named_axes` whose names are not axes of `mesh`, in scope order, which name the axes
+/// of enclosing `batch` levels, so that collectives inside the body can refer to them and the batching rule of the level
+/// that binds such a name consumes them. Every other binding (i.e., a mesh binding whose name is not an axis of `mesh`,
+/// or a batched binding named like an axis of `mesh`) is not visible to the body. When several bindings share a name, the
+/// first one is used, which is the one that [`NamedAxes::named_axis`] resolves. A mesh binding whose name is an axis of
+/// `mesh` but whose mesh is another device mesh is rejected with [`ShardMapError::EnclosingManualAxisMeshMismatch`].
 fn shard_map_within_named_axes(
     mesh: LogicalMesh,
     input_shardings: Vec<Sharding>,
@@ -7467,7 +7473,7 @@ fn shard_map_within_named_axes(
         }
     }
     let enclosing_manual_axes = enclosing_named_axes.iter().map(|(name, _)| name.as_str()).collect::<HashSet<_>>();
-    let boundary = ShardMapBoundary::new_within(
+    let boundary = ShardMapBoundary::new_with_enclosing_manual_axes(
         mesh,
         input_shardings,
         output_shardings,
