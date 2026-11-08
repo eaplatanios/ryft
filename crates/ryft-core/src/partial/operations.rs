@@ -13,18 +13,12 @@ use crate::programs::{
 };
 use crate::tracing::TracingContext;
 
-#[cfg(doc)]
-use crate::contexts::{Domain, StagingContext, ValueResolution};
-#[cfg(doc)]
-use crate::partial::contexts::PartialTracer;
-#[cfg(doc)]
-use crate::programs::{EffectClasses, Program};
-
 /// [`RegionDriver`] that provides [`Instruction`](crate::Instruction)-scoped access to [`Region`](crate::Region)s
 /// attached to a partially evaluated [`Operation`] application. A [`PartialEvaluationDriver`] borrows the current
 /// instruction's regions and supports recursive partial evaluation. Operation rules receive it separately from their
-/// durable [`PartialEvaluationContext`], so the borrowed region access cannot escape through a [`PartialTracer`].
-/// [`RegionDriver`] provides structural region access, while this trait adds partial-evaluation-specific recursion.
+/// durable [`PartialEvaluationContext`], so the borrowed region access cannot escape through a
+/// [`PartialTracer`](crate::PartialTracer). [`RegionDriver`] provides structural region access,
+/// while this trait adds partial-evaluation-specific recursion.
 pub trait PartialEvaluationDriver<C: Context>: RegionDriver<C::Constant, C::Operation> {
     /// Partially evaluates the [`Region`](crate::Region) at `index` over the provided partial-evaluation values
     /// by re-entering the active partial-evaluation transform.
@@ -71,8 +65,8 @@ pub trait PartialEvaluationDriver<C: Context>: RegionDriver<C::Constant, C::Oper
     /// outputs, in output order. Operations use this when they plan residual work over a known program of their own
     /// (e.g., the carry recomputation of a `scan` under a residual policy), so that the instructions of that program
     /// are split like those of a partition whose residuals are placed (refer to
-    /// [`PartitionedProgram::with_residual_policy`] for more information). This is a
-    /// driver function rather than a function of [`PartialEvaluationContext`] because such rules run in
+    /// [`PartitionedProgram::with_top_level_residual_policy`] for more information). This is a driver function rather
+    /// than a function of [`PartialEvaluationContext`] because such rules run in
     /// [`partially_evaluate`](PartiallyEvaluatableOperation::partially_evaluate), whose bounds do not include the
     /// partial evaluation of the operation family in a [`TracingContext`]. The driver carries that capability from
     /// where it was constructed.
@@ -92,6 +86,18 @@ pub trait PartialEvaluationDriver<C: Context>: RegionDriver<C::Constant, C::Oper
     ) -> Result<Option<PartitionedProgram<C::Constant, C::Operation>>, ProgramError> {
         let _ = (context, region, instruction_index, demanded_outputs);
         Ok(None)
+    }
+
+    /// Returns whether recursive partitioning analyzes one known invocation followed by repeated residual invocations.
+    /// In this mode, allocation and reference-ordering analysis determines effect placement rather than inheriting the
+    /// active context's effect-folding restriction. Rules that retain structural partitions must include this mode in
+    /// their cache key when their regions have effects.
+    ///
+    /// The default is ordinary specialization, which preserves the active context's effect-folding policy. A driver
+    /// that overrides this query must use the reported mode in [`partition_program`](Self::partition_program).
+    #[inline]
+    fn partitions_for_repeated_residual_calls(&self) -> bool {
+        false
     }
 }
 
@@ -129,8 +135,8 @@ impl<C: Context> PartialEvaluationDriver<C> for EmptyRegionDriver {
 
 /// [`PartialEvaluationDriver`] scoped to one [`Operation`] application. It borrows the application's complete
 /// [`AttachedRegions`], preserving the operation-defined ordering of owned [`Region`](crate::Region)s, borrowed
-/// regions, and shared callees without collecting [`Program`]s or region views. Recursive requests re-enter partial
-/// evaluation for a selected region or partition it into known and residual programs.
+/// regions, and shared callees without collecting [`Program`](crate::Program)s or region views. Recursive requests
+/// re-enter partial evaluation for a selected region or partition it into known and residual programs.
 pub(super) struct RecursivePartialEvaluationDriver<'r, V: Value, O: Operation<Type = V::Type>> {
     /// Application-scoped [`AttachedRegions`], in [`Operation`]-defined order.
     pub(super) regions: &'r AttachedRegions<'r, V, O>,
@@ -170,8 +176,8 @@ impl<V: Value, O: Operation<Type = V::Type>> RecursivePartialEvaluationDriver<'_
     ///   - `region`: Source region containing the instruction and its reference identities.
     ///   - `instruction_index`: Instruction index within the source region.
     ///   - `operation`: Operation of the instruction with its type identities renamed for this replay (refer to
-    ///     [`ReplayTypeIdentities::instruction_renaming`]). The source instruction at `instruction_index` still drives
-    ///     the effect and reference analysis.
+    ///     [`ReplayTypeIdentities::instruction_renaming`](crate::ReplayTypeIdentities::instruction_renaming)).
+    ///     The source instruction at `instruction_index` still drives the effect and reference analysis.
     ///   - `inputs`: Partially evaluated instruction inputs in source input order.
     ///   - `deferred_instructions`: Source instructions explicitly required to remain residual, including allocations
     ///     that must be created afresh for each residual call.
@@ -406,12 +412,18 @@ where
             None => Ok(None),
         }
     }
+
+    #[inline]
+    fn partitions_for_repeated_residual_calls(&self) -> bool {
+        self.repeated_residual
+    }
 }
 
-/// [`Operation`] that supports partial evaluation via [`Program::partially_evaluate`]. This trait lets an individual
-/// operation decide how partial evaluation treats it. It can be implemented with an empty implementation block,
-/// deferring to [`PartialEvaluationContext::fold_or_residualize`], which is what most operations do, or its behavior
-/// can be customized by overriding the [`PartiallyEvaluatableOperation::partially_evaluate`] function.
+/// [`Operation`] that supports partial evaluation via
+/// [`Program::partially_evaluate`](crate::Program::partially_evaluate). This trait lets an individual operation
+/// decide how partial evaluation treats it. It can be implemented with an empty implementation block, deferring
+/// to [`PartialEvaluationContext::fold_or_residualize`], which is what most operations do, or its behavior can be
+/// customized by overriding the [`PartiallyEvaluatableOperation::partially_evaluate`] function.
 ///
 /// Inlining and region specialization preserve boundary checks by staging [`GuardOperation`]s through
 /// the guard provider that every [`Context`]'s operation family carries, so neither this trait nor
@@ -420,11 +432,11 @@ where
 /// # Type Parameters
 ///
 ///   - `C`: Known-side [`Context`] that partial evaluation folds known work through. Its
-///     [`Operation`](Domain::Operation) is the operation family of the residual [`Program`] and of any inlined nested
-///     programs (e.g., the enum this operation may belong to). Its [`Constant`](Domain::Constant) is the staged
-///     constant space those programs store. Finally, its [`Value`](Domain::Value) is the space known values flow in
-///     (i.e., concrete values under eager contexts and [`Tracer`](crate::Tracer)s into the outer program under
-///     [`StagingContext`]s).
+///     [`Operation`](crate::Domain::Operation) is the operation family of the residual [`Program`](crate::Program)
+///     and of any inlined nested programs (e.g., the enum this operation may belong to). Its
+///     [`Constant`](crate::Domain::Constant) is the staged constant space those programs store. Finally, its
+///     [`Value`](crate::Domain::Value) is the space known values flow in (i.e., concrete values under eager contexts
+///     and [`Tracer`](crate::Tracer)s into the outer program under [`StagingContext`](crate::StagingContext)s).
 ///
 /// # Deriving Partially Evaluatable Operation Enums
 ///
@@ -442,18 +454,19 @@ pub trait PartiallyEvaluatableOperation<C: Context>: Clone + Into<C::Operation> 
     ///
     ///   - When *all* of the operation's inputs are [`Known`](PartialValue::Known), it **folds** the operation by
     ///     [`bind`](Context::bind)ing it in the known-side context, interpreting it immediately under an eager context,
-    ///     and staging it into the outer program under a [`StagingContext`], so that the operation's outputs become
-    ///     known values and the operation contributes nothing to the residual [`Program`]. Pure regionless operations
-    ///     without references remain residual when eager execution returns [`ProgramError::UnsupportedOperation`].
+    ///     and staging it into the outer program under a [`StagingContext`](crate::StagingContext), so that the
+    ///     operation's outputs become known values and the operation contributes nothing to the residual
+    ///     [`Program`](crate::Program). Pure regionless operations without references remain residual
+    ///     when eager execution returns [`ProgramError::UnsupportedOperation`].
     ///   - Otherwise, it **residualizes** the operation unchanged, meaning that it emits the operation into the
     ///     residual program over its inputs' residual program [`Atom`](crate::Atom)s, materializing each known input as
     ///     a residual input for a known variable or as an inlined residual program constant for a literal, so that the
     ///     operation runs at residual program execution time.
-    ///   - An operation with an ordered effect (i.e., [`EffectClasses::is_ordered`] over the operation and its
-    ///     executable computation regions) also follows the ordering rules on [`PartialEvaluationContext`] where once
-    ///     an ordered operation has been staged, every later ordered operation is staged too, even when all of its
-    ///     inputs are known, and reference operations under an eager known side follow the context's
-    ///     [`ReferencePlacement`].
+    ///   - An operation with an ordered effect (i.e., [`EffectClasses::is_ordered`](crate::EffectClasses::is_ordered)
+    ///     over the operation and its executable computation regions) also follows the ordering rules on
+    ///     [`PartialEvaluationContext`] where once an ordered operation has been staged, every later ordered operation
+    ///     is staged too, even when all of its inputs are known, and reference operations under an eager known side
+    ///     follow the context's [`ReferencePlacement`].
     ///   - An operation that carries deferred work over the same scope is always residualized, even when all of its
     ///     inputs are known. Refer to [`PartialEvaluationContext::fold_or_residualize`] for more information.
     ///
@@ -462,10 +475,10 @@ pub trait PartiallyEvaluatableOperation<C: Context>: Clone + Into<C::Operation> 
     /// [`Known`](PartialValue::Known) and Boolean-concretizable may ask the context to inline the selected branch and
     /// return that branch's output trace values, so that the condition disappears from the residual program and only
     /// the taken branch's work survives. Rules that inspect known *payloads* must gate that inspection on a
-    /// [`Constant`](ValueResolution::Constant) [`Context::resolve`] resolution because a known value under a staging
-    /// known-side context may be a [`Tracer`](crate::Tracer) into the outer program rather than a program constant,
-    /// and partial evaluation should fall back to a conservative rewrite otherwise. Resolving to a constant alone
-    /// does not guarantee that the payload is host-inspectable; rules that inspect it require the corresponding
+    /// [`Constant`](crate::ValueResolution::Constant) [`Context::resolve`] resolution because a known value under a
+    /// staging known-side context may be a [`Tracer`](crate::Tracer) into the outer program rather than a program
+    /// constant, and partial evaluation should fall back to a conservative rewrite otherwise. Resolving to a constant
+    /// alone does not guarantee that the payload is host-inspectable; rules that inspect it require the corresponding
     /// capability separately.
     ///
     /// # Parameters
@@ -488,10 +501,10 @@ pub trait PartiallyEvaluatableOperation<C: Context>: Clone + Into<C::Operation> 
     /// the outputs that `demanded_outputs` marks, or returns [`None`] to keep the application whole, which is what the
     /// default implementation does. The residual planner asks for such a split when the residual program of a partition
     /// demands an output of an all-known region-carrying application whose regions hold work that the residual policy
-    /// saves (refer to [`PartitionedProgram::with_residual_policy`] for more information). Replaying the application
-    /// whole would recompute that work, and saving its demanded outputs would save more than the policy asks for, so
-    /// a split saves only the interior values that the policy saves, as JAX's `partial_eval_jaxpr_custom` rules for
-    /// `cond`, `scan`, and `pjit` do.
+    /// saves (refer to [`PartitionedProgram::with_top_level_residual_policy`] for more information). Replaying the
+    /// application whole would recompute that work, and saving its demanded outputs would save more than the policy
+    /// asks for, so a split saves only the interior values that the policy saves, as JAX's `partial_eval_jaxpr_custom`
+    /// rules for `cond`, `scan`, and `pjit` do.
     ///
     /// A rule that supports such a split binds a known part in the known-side context and emits a replay part into the
     /// residual program (refer to [`ResidualDemandSplit`]). [`PartialEvaluationContext::partition_residual_demand`]
@@ -670,6 +683,18 @@ mod tests {
     }
 
     #[test]
+    fn test_partial_evaluation_driver_partitions_for_repeated_residual_calls() {
+        type TestContext = EagerContext<TestValue, TestOperation>;
+
+        assert!(!PartialEvaluationDriver::<TestContext>::partitions_for_repeated_residual_calls(&EmptyRegionDriver));
+        let regions = AttachedRegions::<TestValue, TestOperation>::Empty;
+        let ordinary = RecursivePartialEvaluationDriver { regions: &regions, repeated_residual: false };
+        let repeated = RecursivePartialEvaluationDriver { regions: &regions, repeated_residual: true };
+        assert!(!PartialEvaluationDriver::<TestContext>::partitions_for_repeated_residual_calls(&ordinary));
+        assert!(PartialEvaluationDriver::<TestContext>::partitions_for_repeated_residual_calls(&repeated));
+    }
+
+    #[test]
     fn test_recursive_partial_evaluation_driver_partition_program() {
         let scalar_type: ArrayIrType = ArrayType::scalar(DataType::F32).into();
         let reference_type: ArrayIrType = ReferenceType::new(ArrayType::scalar(DataType::F32)).into();
@@ -700,6 +725,7 @@ mod tests {
         assert_eq!(partition.outputs(), &[PartialEvaluationOutput::Unknown(0)]);
         assert!(!context.defer_ordered_effects());
     }
+
     #[test]
     fn test_recursive_partial_evaluation_driver_split_instruction_on_residual_demand() {
         let scalar_type: ArrayIrType = ArrayType::scalar(DataType::F32).into();
@@ -754,19 +780,19 @@ mod tests {
                 ]
                 known={
                     lambda %0:bool[], %1:f32[] .
-                    let %2:f32[] = condition %0 %1 [
+                    let %2:f32[], %3:f32[] = condition %0 %1 [
                         true={
                             lambda %0:f32[] .
                             let %1:f32[] = neg %0
-                            in (%1)
+                            in (%1, %0)
                         },
                         false={
                             lambda %0:f32[] .
                             let %1:f32[] = neg %0
-                            in (%1)
+                            in (%1, %0)
                         },
                     ]
-                    in (%2, %0, %1)
+                    in (%2, %0, %3)
                 }
                 residual={
                     lambda %0:bool[], %1:f32[] .
@@ -835,7 +861,7 @@ mod tests {
         .unwrap();
         assert_eq!(
             split.known_outputs().iter().map(PartialEvaluationValue::as_known).collect::<Vec<_>>(),
-            vec![Some(&first), Some(&second)]
+            vec![Some(&first), Some(&second)],
         );
     }
 
@@ -871,7 +897,7 @@ mod tests {
         assert_eq!(known.iter().map(PartialEvaluationValue::as_known).collect::<Vec<_>>(), vec![Some(&value)]);
         assert_eq!(
             replayed[0].materialization(),
-            PartialValueMaterialization::Variable { residual_atom: AtomId::new(3) }
+            PartialValueMaterialization::Variable { residual_atom: AtomId::new(3) },
         );
     }
 }
